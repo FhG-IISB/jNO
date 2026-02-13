@@ -1,0 +1,2218 @@
+"""
+Neural Operator Factory Module
+==============================
+
+This module provides factory methods for creating various neural operator architectures
+for learning mappings between function spaces. Neural operators are particularly suited
+for solving parametric PDEs, where the goal is to learn the solution operator that maps
+input functions (e.g., initial conditions, boundary conditions, coefficients) to output
+functions (e.g., PDE solutions).
+
+Architecture Categories
+-----------------------
+
+**Spectral Methods** (Grid-based, efficient for regular domains):
+    - FNO (1D/2D/3D): Fourier Neural Operator - spectral convolutions via FFT
+    - GeoFNO: Geometry-aware FNO for irregular domains
+    - PCNO: Point Cloud Neural Operator for unstructured data
+
+**Convolutional Methods** (Multi-scale feature extraction):
+    - UNet (1D/2D/3D): Encoder-decoder with skip connections
+    - MgNO (1D/2D): Multigrid-inspired architecture
+
+**Attention-Based Methods** (Flexible, handles irregular data):
+    - Transformer: Standard attention mechanism
+    - PiT: Position-induced Transformer with distance-based attention
+    - ScOT: Scalable Operator Transformer (Swin-based)
+
+**Branch-Trunk Methods** (Separate function and coordinate encoding):
+    - DeepONet: Deep Operator Network with configurable branch/trunk
+
+**Point-Based Methods** (Unstructured point clouds):
+    - PointNet: Permutation-invariant point cloud processing
+
+**Foundation Models** (Pretrained, transfer learning):
+    - Poseidon (T/B/L): Pretrained ScOT variants for fluid dynamics
+
+Quick Selection Guide
+---------------------
+
++---------------------------+------------------------------------------+
+| Use Case                  | Recommended Architecture                 |
++===========================+==========================================+
+| Regular grid, periodic BC | FNO                                      |
+| Regular grid, general BC  | UNet, MgNO                               |
+| Irregular geometry        | GeoFNO, PCNO, PiT                        |
+| Point cloud data          | PointNet, PCNO                           |
+| Super-resolution          | FNO, UNet                                |
+| Time-stepping             | FNO (n_steps>1), ScOT                    |
+| Transfer learning         | Poseidon variants                        |
+| Small data regime         | DeepONet, PiT                            |
++---------------------------+------------------------------------------+
+
+Example Usage
+-------------
+
+>>> import pino as pnp
+>>>
+>>> # 2D Darcy flow with FNO
+>>> model = pnp.nn.fno2d(
+...     hidden_channels=32,
+...     n_modes=12,
+...     n_layers=4,
+...     d_vars=1,
+... )
+>>>
+>>> # Irregular domain with GeoFNO
+>>> model = pnp.nn.geofno2d(
+...     nks=(16, 16),
+...     Ls=(1.0, 1.0),
+...     in_dim=3,
+...     out_dim=1,
+... )
+>>>
+>>> # Custom Flax module
+>>> model = pnp.nn.wrap(MyCustomModule())
+
+References
+----------
+.. [1] Li et al. "Fourier Neural Operator for Parametric PDEs" (2020)
+.. [2] Lu et al. "Learning nonlinear operators via DeepONet" (2021)
+.. [3] Li et al. "Geometry-Informed Neural Operator" (2023)
+.. [4] Herde et al. "Poseidon: Efficient Foundation Models for PDEs" (2024)
+"""
+
+from flax import linen as ln
+from typing import Callable, Optional, Tuple, Sequence, Literal, List, Union
+import jax.numpy as jnp
+from jax_poseidon import ScOT, ScOTConfig
+
+from .mlp import MLP
+from .fno import FNO1D, FNO2D, FNO3D
+from .unet import UNet1D, UNet2D, UNet3D
+from .pointnet import PointNet
+from .deeponet import DeepONet
+from .transformer import Transformer
+from .pcno import PCNO, compute_Fourier_modes
+from .mgno import MgNO, MgNO1D
+from .geofno import GeoFNO, compute_Fourier_modes
+from .pit import PiT, PiTWithCoords
+from .gnot import CGPTNO, GNOT, MoEGPTNO
+from .cno import CNO2D
+
+from ..tuner import ArchSpace
+from ..trace import FlaxModule, TunableModule
+
+
+def parameter(shape: tuple, init: Callable = ln.initializers.zeros, name: str = "value") -> FlaxModule:
+    """
+    Create a trainable parameter tensor.
+
+    Useful for learning scalar or tensor constants during optimization,
+    such as PDE coefficients or normalization factors.
+
+    Args:
+        shape: Shape of the parameter tensor.
+        init: Initializer function. Default: zeros.
+        name: Name of the parameter in the module. Default: "value".
+
+    Returns:
+        FlaxModule: A wrapped module that returns the parameter when called.
+
+    Example:
+        >>> # Learnable diffusion coefficient
+        >>> D = parameter((1,), init=ln.initializers.ones, name="diffusivity")
+        >>>
+        >>> # Learnable 2D tensor
+        >>> K = parameter((3, 3), name="stiffness_matrix")
+    """
+
+    class Parameter(ln.Module):
+        @ln.compact
+        def __call__(self):
+            return self.param(name, init, shape)
+
+    return nn.wrap(Parameter())
+
+
+class nn:
+    """
+    Neural network factory class providing unified interface for model creation.
+
+    This class contains class methods for instantiating various neural operator
+    architectures with sensible defaults. All methods return a `FlaxModule`
+    wrapper that integrates with the pino training pipeline.
+
+    The factory pattern allows:
+    - Consistent API across different architectures
+    - Sensible defaults for common use cases
+    - Easy hyperparameter tuning via keyword arguments
+    - Automatic wrapping for pipeline integration
+
+    Categories of Methods
+    ---------------------
+    - `wrap()`: Wrap arbitrary Flax modules
+    - `mlp()`: Multi-layer perceptrons
+    - `fno1d/2d/3d()`: Fourier Neural Operators
+    - `unet1d/2d/3d()`: U-Net architectures
+    - `geofno/geofno1d/2d/3d()`: Geometry-aware FNO
+    - `pcno()`: Point Cloud Neural Operator
+    - `mgno1d/2d()`: Multigrid Neural Operator
+    - `pit()`: Position-induced Transformer
+    - `deeponet()`: Deep Operator Network
+    - `pointnet()`: PointNet for point clouds
+    - `transformer()`: Standard transformer
+    - `scot()`: Scalable Operator Transformer
+    - `poseidonT/B/L()`: Pretrained foundation models
+
+    """
+
+    # =========================================================================
+    # Core Wrapping Methods
+    # =========================================================================
+
+    @classmethod
+    def wrap(cls, module: Union[ln.Module, type], space: ArchSpace = None, name: str = "", weight_path: str = None) -> Union[FlaxModule, TunableModule]:
+        """
+        Wrap a Flax module for use in the pino pipeline.
+
+        This is the primary method for integrating custom architectures into
+        the pino framework. It handles both standard wrapping and architecture
+        search scenarios.
+
+        Args:
+            module: Either a `ln.Module` instance (for standard use) or a
+                `ln.Module` class (when using architecture search).
+            space: Optional `ArchSpace` for hyperparameter tuning. When provided,
+                `module` must be a class, not an instance.
+
+        Returns:
+            FlaxModule: Standard wrapped module (when space=None).
+            TunableModule: Tunable module for architecture search (when space provided).
+
+        Raises:
+            ValueError: If `space` is provided but `module` is an instance.
+
+        Example:
+            >>> # Standard wrapping of a custom module
+            >>> class MyOperator(ln.Module):
+            ...     @ln.compact
+            ...     def __call__(self, x):
+            ...         return ln.Dense(1)(x)
+            >>>
+            >>> model = nn.wrap(MyOperator())
+            >>>
+            >>> # Architecture search with tunable hyperparameters
+            >>> space = ArchSpace(
+            ...     hidden_dim=Choice([64, 128, 256]),
+            ...     n_layers=Choice([2, 3, 4]),
+            ... )
+            >>> tunable_model = nn.wrap(MyOperator, space=space)  # Note: class, not instance
+        """
+        if space is not None:
+            if isinstance(module, type):
+                return TunableModule(module_cls=module, space=space)
+            else:
+                raise ValueError("When space= is provided, module must be a CLASS (not instance). " "Use: pnp.nn.wrap(MLP, space=space) not pnp.nn.wrap(MLP(), space=space)")
+        else:
+            return FlaxModule(module, name, weight_path)
+
+    # =========================================================================
+    # Basic Architectures
+    # =========================================================================
+
+    @classmethod
+    def mlp(
+        cls,
+        output_dim: int = 1,
+        activation: Callable = ln.tanh,
+        hidden_dims: Union[int, Sequence[int]] = 64,
+        num_layers: int = 2,
+        output_activation: Optional[Callable] = None,
+        use_bias: bool = True,
+        kernel_init: Callable = ln.initializers.lecun_normal(),
+        bias_init: Callable = ln.initializers.zeros,
+        dropout_rate: float = 0.0,
+        batch_norm: bool = False,
+        layer_norm: bool = False,
+        final_layer_bias: bool = True,
+    ) -> FlaxModule:
+        """
+        Create a Multi-Layer Perceptron (MLP).
+
+        A fully-connected feedforward network suitable for learning point-wise
+        mappings. Often used as a baseline or as components within larger
+        architectures (e.g., projection layers in FNO).
+
+        Architecture::
+
+            Input → [Dense → Norm → Activation → Dropout] × N → Dense → Output
+
+        Args:
+            output_dim: Number of output features. Default: 1.
+            activation: Activation function for hidden layers.
+                Common choices: `ln.relu`, `ln.gelu`, `ln.tanh`, `ln.silu`.
+                Default: `ln.tanh`.
+            hidden_dims: Width of hidden layers. Can be:
+                - `int`: All layers have the same width.
+                - `Sequence[int]`: Specify width per layer.
+
+                Default: 64.
+            num_layers: Number of hidden layers. Ignored if `hidden_dims` is
+                a sequence. Default: 2.
+            output_activation: Optional activation for the output layer.
+                Use `ln.sigmoid` for [0,1] outputs, `ln.softplus` for positive
+                outputs. Default: None (linear output).
+            use_bias: Include bias in hidden layers. Default: True.
+            kernel_init: Weight initializer. Default: lecun_normal().
+            bias_init: Bias initializer. Default: zeros.
+            dropout_rate: Dropout probability (0 = disabled). Default: 0.0.
+            batch_norm: Apply batch normalization. Default: False.
+            layer_norm: Apply layer normalization. Default: False.
+            final_layer_bias: Include bias in output layer. Default: True.
+
+        Returns:
+            FlaxModule: Wrapped MLP model.
+
+        Raises:
+            ValueError: If both `batch_norm` and `layer_norm` are True.
+
+        Example:
+            >>> # Simple regression MLP
+            >>> model = nn.mlp(output_dim=1, hidden_dims=64, num_layers=3)
+            >>>
+            >>> # Classification with softmax output
+            >>> model = nn.mlp(
+            ...     output_dim=10,
+            ...     activation=ln.relu,
+            ...     hidden_dims=[256, 128, 64],
+            ...     output_activation=ln.softmax,
+            ...     layer_norm=True,
+            ... )
+            >>>
+            >>> # Positive output (e.g., variance prediction)
+            >>> model = nn.mlp(output_dim=1, output_activation=ln.softplus)
+
+        Note:
+            MLPs concatenate all inputs along the feature axis, making them
+            suitable for conditional models where auxiliary information
+            (e.g., parameters, coordinates) is provided alongside the main input.
+        """
+        if batch_norm and layer_norm:
+            raise ValueError("Cannot use both batch_norm and layer_norm simultaneously.")
+
+        if isinstance(hidden_dims, int):
+            layer_widths = [hidden_dims] * num_layers
+        else:
+            layer_widths = list(hidden_dims)
+            if len(layer_widths) != num_layers and num_layers != 2:
+                raise ValueError(f"Length of hidden_dims ({len(layer_widths)}) must match " f"num_layers ({num_layers}) when both are specified.")
+
+        inst = MLP(output_dim, activation, hidden_dims, num_layers, output_activation, use_bias, kernel_init, bias_init, dropout_rate, batch_norm, layer_norm, final_layer_bias)
+
+        return cls.wrap(inst)
+
+    # =========================================================================
+    # Convolutional Neural Operators
+    # =========================================================================
+
+    @classmethod
+    def cno2d(
+        cls,
+        in_dim: int = 1,
+        out_dim: int = 1,
+        size: int = 64,
+        N_layers: int = 3,
+        N_res: int = 4,
+        N_res_neck: int = 4,
+        channel_multiplier: int = 16,
+        use_bn: bool = True,
+        training: bool = True,
+    ) -> FlaxModule:
+        """
+        Create a 2D Continuous Neural Operator (CNO).
+
+        CNO is a U-Net style architecture that uses continuous convolutions
+        with bicubic interpolation, enabling resolution-invariant learning
+        of operators between function spaces.
+
+        Architecture::
+
+            Input → Lift → [Encoder + ResNet] × N → Bottleneck → [Decoder + Skip] × N → Project → Output
+
+        Key Features:
+            - Resolution-invariant through bicubic interpolation
+            - Activation functions applied at 2x resolution then downsampled
+            - Skip connections for multi-scale information flow
+            - Configurable depth via N_layers
+            - ResNet blocks at each encoder level
+
+        The continuous activation is implemented as:
+            1. Upsample to 2× resolution (bicubic)
+            2. Apply LeakyReLU
+            3. Downsample to target resolution (bicubic)
+
+        This approach helps preserve high-frequency information that might
+        otherwise be lost due to aliasing.
+
+        Args:
+            in_dim: Number of input channels. Default: 1.
+            out_dim: Number of output channels. Default: 1.
+            size: Spatial size of input/output (assumes square). Must be
+                divisible by 2^N_layers. Default: 64.
+            N_layers: Number of encoder/decoder levels. Controls the depth
+                of the U-Net structure. Default: 3.
+            N_res: Number of residual blocks per encoder level. Default: 4.
+            N_res_neck: Number of residual blocks in the bottleneck. Default: 4.
+            channel_multiplier: Base channel count. Channels at level i are
+                2^i × channel_multiplier. Default: 16.
+            use_bn: Whether to use batch normalization. Default: True.
+            training: Training mode flag (affects batch norm). Default: True.
+
+        Returns:
+            FlaxModule: Wrapped CNO2D model.
+
+        Example:
+            >>> # Darcy flow: permeability → pressure
+            >>> model = nn.cno2d(
+            ...     in_dim=1,
+            ...     out_dim=1,
+            ...     size=64,
+            ...     N_layers=3,
+            ...     channel_multiplier=16,
+            ... )
+            >>>
+            >>> # Multi-channel with deeper network
+            >>> model = nn.cno2d(
+            ...     in_dim=3,
+            ...     out_dim=2,
+            ...     size=128,
+            ...     N_layers=4,
+            ...     N_res=6,
+            ...     channel_multiplier=32,
+            ... )
+
+        Note:
+            - Input shape: (batch, H, W, in_dim) - NHWC format
+            - Output shape: (batch, H, W, out_dim) - NHWC format
+            - Spatial size must be divisible by 2^N_layers
+            - Memory scales with channel_multiplier² and 2^N_layers
+
+        Reference:
+            Raonić et al., "Convolutional Neural Operators for robust and
+            accurate learning of PDEs"
+            https://github.com/bogdanraonic3/AI_Science_Engineering
+
+        See Also:
+            - `unet2d`: Similar architecture without continuous activations
+            - `fno2d`: Spectral approach for periodic domains
+
+        """
+        model = CNO2D(
+            in_dim=in_dim,
+            out_dim=out_dim,
+            size=size,
+            N_layers=N_layers,
+            N_res=N_res,
+            N_res_neck=N_res_neck,
+            channel_multiplier=channel_multiplier,
+            use_bn=use_bn,
+            training=training,
+        )
+
+        return cls.wrap(model)
+
+    # =========================================================================
+    # Fourier Neural Operators
+    # =========================================================================
+
+    @classmethod
+    def fno1d(
+        cls,
+        hidden_channels: int,
+        n_modes: int,
+        d_vars: int = 1,
+        linear_conv: bool = True,
+        n_layers: int = 4,
+        n_steps: int = 1,
+        activation: Callable = ln.gelu,
+        norm: Optional[str] = None,
+        training: bool = True,
+        dropout_rate: float = 0.0,
+    ) -> FlaxModule:
+        """
+        Create a 1D Fourier Neural Operator.
+
+        FNO learns operators in Fourier space, where convolutions become
+        efficient element-wise multiplications. Particularly effective for
+        problems with periodic boundary conditions or smooth solutions.
+
+        Architecture::
+
+            Input → Lift → [SpectralConv + Conv1D → Activation] × N → Project → Output
+
+        Args:
+            hidden_channels: Number of channels in spectral layers.
+                Typical values: 32-128.
+            n_modes: Number of Fourier modes to retain. Higher values capture
+                finer details but increase computation. Typical: 16-64.
+            d_vars: Number of output variables/channels. Default: 1.
+            linear_conv: If True, use linear (non-circular) convolution by
+                zero-padding. Set False for periodic domains. Default: True.
+            n_layers: Number of spectral convolution layers. Default: 4.
+            n_steps: Number of output time steps (for autoregressive rollout).
+                Default: 1.
+            activation: Activation function. Default: `ln.gelu`.
+            norm: Normalization type ('layer', 'batch', 'instance', None).
+                Default: None.
+            training: Training mode flag. Default: True.
+            dropout_rate: Dropout probability. Default: 0.0.
+
+        Returns:
+            FlaxModule: Wrapped FNO1D model.
+
+        Example:
+            >>> # Burgers equation: u(x,0) → u(x,T)
+            >>> model = nn.fno1d(
+            ...     hidden_channels=64,
+            ...     n_modes=16,
+            ...     d_vars=1,
+            ...     n_layers=4,
+            ... )
+            >>>
+            >>> # Multi-step prediction
+            >>> model = nn.fno1d(
+            ...     hidden_channels=32,
+            ...     n_modes=24,
+            ...     n_steps=10,  # Predict 10 time steps
+            ... )
+
+        Note:
+            - Input shape: (batch, length, channels)
+            - Output shape: (batch, length, d_vars) or (batch, n_steps, length, d_vars)
+            - For non-periodic BCs, set `linear_conv=True`
+
+        """
+        norm_type = norm[0] if isinstance(norm, tuple) else norm
+
+        model_instance = FNO1D(
+            hidden_channels=hidden_channels,
+            n_modes=n_modes,
+            d_vars=d_vars,
+            linear_conv=linear_conv,
+            n_layers=n_layers,
+            n_steps=n_steps,
+            activation=activation,
+            norm=norm_type,
+            training=training,
+        )
+
+        return cls.wrap(model_instance)
+
+    @classmethod
+    def fno2d(
+        cls,
+        hidden_channels: int = 32,
+        n_modes: int = 16,
+        d_vars: int = 1,
+        n_layers: int = 4,
+        n_steps: int = 1,
+        d_model: Tuple[int, int] = (64, 64),
+        activation: Callable = ln.gelu,
+        norm: Optional[str] = "layer",
+        training: bool = True,
+        use_positions: bool = False,
+        linear_conv: bool = True,
+    ) -> FlaxModule:
+        """
+        Create a 2D Fourier Neural Operator.
+
+        The workhorse architecture for 2D PDE problems on regular grids.
+        Efficiently captures global dependencies through spectral convolutions.
+
+        Architecture::
+
+            Input → Lift → [SpectralConv2D + Conv2D → Norm → Activation] × N → Project → Output
+
+        Args:
+            hidden_channels: Channels in spectral layers. Default: 32.
+            n_modes: Fourier modes per dimension. Total modes = n_modes².
+                Default: 16.
+            d_vars: Output channels. Default: 1.
+            n_layers: Number of spectral layers. Default: 4.
+            n_steps: Output time steps. Default: 1.
+            d_model: Spatial dimensions (H, W). Used for positional encoding.
+                Default: (64, 64).
+            activation: Activation function. Default: `ln.gelu`.
+            norm: Normalization ('layer', 'batch', 'instance', None).
+                Default: 'layer'.
+            training: Training mode. Default: True.
+            use_positions: Concatenate coordinate grid to input. Default: False.
+            linear_conv: Non-circular convolution (for non-periodic BC).
+                Default: True.
+
+        Returns:
+            FlaxModule: Wrapped FNO2D model.
+
+        Example:
+            >>> # Darcy flow: permeability → pressure
+            >>> model = nn.fno2d(
+            ...     hidden_channels=32,
+            ...     n_modes=12,
+            ...     d_vars=1,
+            ...     n_layers=4,
+            ... )
+            >>>
+            >>> # Navier-Stokes: (u, v, p) → (u, v, p) at next time
+            >>> model = nn.fno2d(
+            ...     hidden_channels=64,
+            ...     n_modes=20,
+            ...     d_vars=3,
+            ...     use_positions=True,
+            ... )
+
+        Note:
+            - Input shape: (batch, H, W, channels)
+            - Output shape: (batch, H, W, d_vars)
+            - Memory scales as O(n_modes² × hidden_channels²)
+
+        """
+        fno = FNO2D(
+            hidden_channels=hidden_channels,
+            n_modes=n_modes,
+            d_vars=d_vars,
+            n_layers=n_layers,
+            n_steps=n_steps,
+            d_model=d_model,
+            activation=activation,
+            norm=norm,
+            training=training,
+            use_positions=use_positions,
+            linear_conv=linear_conv,
+        )
+
+        return cls.wrap(fno)
+
+    @classmethod
+    def fno3d(
+        cls,
+        hidden_channels: int = 32,
+        n_modes: int = 12,
+        d_vars: int = 1,
+        n_layers: int = 4,
+        n_steps: int = 1,
+        d_model: Tuple[int, int, int] = (32, 32, 32),
+        activation: Callable = ln.gelu,
+        norm: Optional[str] = "layer",
+        training: bool = True,
+        use_positions: bool = False,
+        linear_conv: bool = True,
+        dropout_rate: float = 0.0,
+    ) -> FlaxModule:
+        """
+        Create a 3D Fourier Neural Operator.
+
+        For spatiotemporal problems or 3D spatial domains. Note that memory
+        requirements scale cubically with resolution.
+
+        Args:
+            hidden_channels: Channels in spectral layers. Default: 32.
+            n_modes: Fourier modes per dimension. Default: 12.
+            d_vars: Output channels. Default: 1.
+            n_layers: Number of spectral layers. Default: 4.
+            n_steps: Output time steps. Default: 1.
+            d_model: Spatial dimensions (D, H, W). Default: (32, 32, 32).
+            activation: Activation function. Default: `ln.gelu`.
+            norm: Normalization type. Default: 'layer'.
+            training: Training mode. Default: True.
+            use_positions: Add coordinate grid to input. Default: False.
+            linear_conv: Non-circular convolution. Default: True.
+            dropout_rate: Dropout probability. Default: 0.0.
+
+        Returns:
+            FlaxModule: Wrapped FNO3D model.
+
+        Example:
+            >>> # 3D elasticity
+            >>> model = nn.fno3d(
+            ...     hidden_channels=24,
+            ...     n_modes=8,
+            ...     d_vars=3,  # displacement (u, v, w)
+            ... )
+
+        Warning:
+            Memory usage is O(n_modes³ × hidden_channels²). For large problems,
+            consider using factorized variants or reducing n_modes.
+        """
+        fno = FNO3D(
+            hidden_channels=hidden_channels,
+            n_modes=n_modes,
+            d_vars=d_vars,
+            n_layers=n_layers,
+            n_steps=n_steps,
+            d_model=d_model,
+            activation=activation,
+            norm=norm,
+            training=training,
+            use_positions=use_positions,
+            linear_conv=linear_conv,
+            dropout_rate=dropout_rate,
+        )
+
+        return cls.wrap(fno)
+
+    # =========================================================================
+    # Geometry-Aware Operators
+    # =========================================================================
+
+    @classmethod
+    def geofno(
+        cls,
+        ndims: int,
+        nks: Sequence[int],
+        Ls: Sequence[float],
+        layers: Sequence[int] = (64, 64, 64, 64),
+        fc_dim: int = 128,
+        in_dim: int = 3,
+        out_dim: int = 1,
+        act: str = "gelu",
+    ) -> FlaxModule:
+        """
+        Create a Geometry-aware Fourier Neural Operator.
+
+        GeoFNO extends FNO to irregular geometries by computing explicit
+        Fourier bases on mesh nodes rather than using FFT. This allows
+        handling of complex domains, unstructured meshes, and varying
+        node counts.
+
+        Architecture::
+
+            Input → Lift → [GeoSpectralConv → Activation] × N → Project → Output
+
+        The spectral convolution uses explicit Fourier transforms:
+            - Forward: F(u) = Σᵢ u(xᵢ) × exp(-i k·xᵢ) × wᵢ
+            - Inverse: u(x) = Σₖ F̂(k) × exp(i k·x)
+
+        Args:
+            ndims: Spatial dimensionality (1, 2, or 3).
+            nks: Fourier modes per dimension. For 2D: [nx, ny].
+            Ls: Domain lengths per dimension. For 2D: [Lx, Ly].
+            layers: Channel dimensions for each layer. Default: (64, 64, 64, 64).
+            fc_dim: Hidden dimension for projection MLPs. 0 = no hidden layer.
+                Default: 128.
+            in_dim: Input channels. Typically ndims + 1 (field + coordinates).
+                Default: 3.
+            out_dim: Output channels. Default: 1.
+            act: Activation function name. Default: 'gelu'.
+
+        Returns:
+            FlaxModule: Wrapped GeoFNO model.
+
+        Example:
+            >>> # 2D problem on irregular domain
+            >>> model = nn.geofno(
+            ...     ndims=2,
+            ...     nks=[12, 12],
+            ...     Ls=[1.0, 1.0],
+            ...     in_dim=3,  # (field, x, y)
+            ...     out_dim=1,
+            ... )
+
+        Note:
+            The model expects auxiliary inputs during forward pass:
+            - `node_mask`: [batch, max_nodes, 1] - Valid node indicator
+            - `nodes`: [batch, max_nodes, ndims] - Node coordinates
+            - `node_weights`: [batch, max_nodes, 1] - Integration weights
+
+        See Also:
+            - `geofno1d`, `geofno2d`, `geofno3d`: Dimension-specific shortcuts
+            - `pcno`: Alternative for point cloud data
+
+        """
+        modes = compute_Fourier_modes(ndims, list(nks), list(Ls))
+        modes = jnp.array(modes)
+
+        model = GeoFNO(
+            ndims=ndims,
+            modes=modes,
+            layers=list(layers),
+            fc_dim=fc_dim,
+            in_dim=in_dim,
+            out_dim=out_dim,
+            act=act,
+        )
+
+        return cls.wrap(model)
+
+    @classmethod
+    def geofno1d(
+        cls,
+        nk: int = 16,
+        L: float = 1.0,
+        layers: Sequence[int] = (64, 64, 64, 64),
+        fc_dim: int = 128,
+        in_dim: int = 2,
+        out_dim: int = 1,
+        act: str = "gelu",
+    ) -> FlaxModule:
+        """
+        Create a 1D Geometry-aware FNO.
+
+        Convenience wrapper for `geofno()` with ndims=1.
+
+        Args:
+            nk: Number of Fourier modes. Default: 16.
+            L: Domain length. Default: 1.0.
+            layers: Channel dimensions. Default: (64, 64, 64, 64).
+            fc_dim: Projection hidden dimension. Default: 128.
+            in_dim: Input channels (typically field + x). Default: 2.
+            out_dim: Output channels. Default: 1.
+            act: Activation function. Default: 'gelu'.
+
+        Returns:
+            FlaxModule: Wrapped 1D GeoFNO model.
+        """
+        return cls.geofno(
+            ndims=1,
+            nks=[nk],
+            Ls=[L],
+            layers=layers,
+            fc_dim=fc_dim,
+            in_dim=in_dim,
+            out_dim=out_dim,
+            act=act,
+        )
+
+    @classmethod
+    def geofno2d(
+        cls,
+        nks: Tuple[int, int] = (12, 12),
+        Ls: Tuple[float, float] = (1.0, 1.0),
+        layers: Sequence[int] = (64, 64, 64, 64),
+        fc_dim: int = 128,
+        in_dim: int = 3,
+        out_dim: int = 1,
+        act: str = "gelu",
+    ) -> FlaxModule:
+        """
+        Create a 2D Geometry-aware FNO.
+
+        Convenience wrapper for `geofno()` with ndims=2.
+
+        Args:
+            nks: Fourier modes (nx, ny). Default: (12, 12).
+            Ls: Domain lengths (Lx, Ly). Default: (1.0, 1.0).
+            layers: Channel dimensions. Default: (64, 64, 64, 64).
+            fc_dim: Projection hidden dimension. Default: 128.
+            in_dim: Input channels. Default: 3.
+            out_dim: Output channels. Default: 1.
+            act: Activation function. Default: 'gelu'.
+
+        Returns:
+            FlaxModule: Wrapped 2D GeoFNO model.
+
+        Example:
+            >>> # Flow around airfoil (irregular mesh)
+            >>> model = nn.geofno2d(
+            ...     nks=(16, 16),
+            ...     Ls=(2.0, 1.0),  # Rectangular domain
+            ...     in_dim=4,  # (rho, u, v, coordinates)
+            ...     out_dim=3,  # (rho, u, v)
+            ... )
+        """
+        return cls.geofno(
+            ndims=2,
+            nks=list(nks),
+            Ls=list(Ls),
+            layers=layers,
+            fc_dim=fc_dim,
+            in_dim=in_dim,
+            out_dim=out_dim,
+            act=act,
+        )
+
+    @classmethod
+    def geofno3d(
+        cls,
+        nks: Tuple[int, int, int] = (8, 8, 8),
+        Ls: Tuple[float, float, float] = (1.0, 1.0, 1.0),
+        layers: Sequence[int] = (64, 64, 64, 64),
+        fc_dim: int = 128,
+        in_dim: int = 4,
+        out_dim: int = 1,
+        act: str = "gelu",
+    ) -> FlaxModule:
+        """
+        Create a 3D Geometry-aware FNO.
+
+        Convenience wrapper for `geofno()` with ndims=3.
+
+        Args:
+            nks: Fourier modes (nx, ny, nz). Default: (8, 8, 8).
+            Ls: Domain lengths (Lx, Ly, Lz). Default: (1.0, 1.0, 1.0).
+            layers: Channel dimensions. Default: (64, 64, 64, 64).
+            fc_dim: Projection hidden dimension. Default: 128.
+            in_dim: Input channels. Default: 4.
+            out_dim: Output channels. Default: 1.
+            act: Activation function. Default: 'gelu'.
+
+        Returns:
+            FlaxModule: Wrapped 3D GeoFNO model.
+        """
+        return cls.geofno(
+            ndims=3,
+            nks=list(nks),
+            Ls=list(Ls),
+            layers=layers,
+            fc_dim=fc_dim,
+            in_dim=in_dim,
+            out_dim=out_dim,
+            act=act,
+        )
+
+    @classmethod
+    def pcno(
+        cls,
+        ndims: int,
+        nks: Sequence[int],
+        Ls: Sequence[float],
+        layers: Sequence[int] = (64, 64, 64, 64),
+        fc_dim: int = 128,
+        in_dim: int = 3,
+        out_dim: int = 1,
+        inv_L_scale_min: float = 0.5,
+        inv_L_scale_max: float = 2.0,
+        train_inv_L_scale: bool = True,
+        act: str = "gelu",
+    ) -> FlaxModule:
+        """
+        Create a Point Cloud Neural Operator.
+
+        PCNO is designed for unstructured point cloud data with varying
+        point counts. It uses explicit Fourier bases with learnable
+        length scales, making it adaptive to different domain sizes.
+
+        Key Features:
+            - Handles variable-size point clouds (with masking)
+            - Learnable domain length scales
+            - Multiple measures for multi-resolution processing
+
+        Args:
+            ndims: Spatial dimensionality (1, 2, or 3).
+            nks: Fourier modes per dimension per measure.
+                Length = ndims × nmeasures.
+            Ls: Domain lengths per dimension per measure.
+                Length = ndims × nmeasures.
+            layers: Channel dimensions per layer. Default: (64, 64, 64, 64).
+            fc_dim: Projection hidden dimension (0 = no hidden layer).
+                Default: 128.
+            in_dim: Input channels. Default: 3.
+            out_dim: Output channels. Default: 1.
+            inv_L_scale_min: Minimum learnable length scale. Default: 0.5.
+            inv_L_scale_max: Maximum learnable length scale. Default: 2.0.
+            train_inv_L_scale: Whether to learn length scales. Default: True.
+            act: Activation function. Default: 'gelu'.
+
+        Returns:
+            FlaxModule: Wrapped PCNO model.
+
+        Example:
+            >>> # 2D point cloud with 16 modes
+            >>> model = nn.pcno(
+            ...     ndims=2,
+            ...     nks=[16, 16],
+            ...     Ls=[1.0, 1.0],
+            ...     in_dim=3,  # (field, x, y)
+            ...     out_dim=1,
+            ... )
+            >>>
+            >>> # Multi-resolution with 2 measures
+            >>> model = nn.pcno(
+            ...     ndims=2,
+            ...     nks=[8, 8, 16, 16],  # coarse + fine
+            ...     Ls=[1.0, 1.0, 1.0, 1.0],
+            ...     train_inv_L_scale=True,
+            ... )
+
+        Reference:
+            "Point Cloud Neural Operator" - PKU-CMEGroup
+            https://github.com/PKU-CMEGroup/NeuralOperator
+        """
+        modes = compute_Fourier_modes(ndims, nks, Ls)
+        modes = jnp.array(modes)
+        nmeasures = len(nks) // ndims
+
+        model = PCNO(
+            ndims=ndims,
+            modes=modes,
+            nmeasures=nmeasures,
+            layers=list(layers),
+            fc_dim=fc_dim,
+            in_dim=in_dim,
+            out_dim=out_dim,
+            inv_L_scale_min=inv_L_scale_min,
+            inv_L_scale_max=inv_L_scale_max,
+            train_inv_L_scale=train_inv_L_scale,
+            act=act,
+        )
+
+        return cls.wrap(model)
+
+    # =========================================================================
+    # General Neural Operator Transformer (GNOT)
+    # =========================================================================
+
+    @classmethod
+    def cgptno(
+        cls,
+        trunk_size: int,
+        branch_sizes: Optional[List[int]] = None,
+        output_size: int = 1,
+        n_layers: int = 2,
+        n_hidden: int = 64,
+        n_head: int = 1,
+        n_inner: int = 4,
+        mlp_layers: int = 2,
+        attn_type: str = "linear",
+        act: str = "gelu",
+        ffn_dropout: float = 0.0,
+        attn_dropout: float = 0.0,
+        horiz_fourier_dim: int = 0,
+        deterministic: bool = True,
+    ) -> "FlaxModule":
+        """
+        Create a Cross-attention GPT Neural Operator (CGPTNO).
+
+        CGPTNO uses linear cross-attention to map from input functions
+        (sampled at sensor points) to output functions (at query points).
+        It handles arbitrary geometries and multiple input functions.
+
+        Architecture::
+
+            Trunk (queries) ──→ MLP ──→ ┐
+                                        ├──→ CrossAttn ──→ SelfAttn ──→ ... ──→ MLP ──→ Output
+            Branch (inputs) ──→ MLP ──→ ┘
+
+        Key Features:
+            - Linear O(n) attention complexity
+            - Multiple input function support
+            - Arbitrary query/sensor point locations
+            - Optional Fourier feature embedding
+
+        Args:
+            trunk_size: Input dimension for trunk (query points).
+                Typically: space_dim + n_parameters.
+            branch_sizes: List of input dimensions for each branch.
+                Each branch represents a different input function.
+                If None, uses self-attention only.
+            output_size: Output dimension. Default: 1.
+            n_layers: Number of transformer layers. Default: 2.
+            n_hidden: Hidden dimension. Default: 64.
+            n_head: Number of attention heads. Default: 1.
+            n_inner: FFN inner dimension multiplier. Default: 4.
+            mlp_layers: Layers in embedding MLPs. Default: 2.
+            attn_type: Attention type ('linear'). Default: 'linear'.
+            act: Activation function. Default: 'gelu'.
+            ffn_dropout: FFN dropout rate. Default: 0.0.
+            attn_dropout: Attention dropout rate. Default: 0.0.
+            horiz_fourier_dim: Fourier embedding octaves (0 = disabled).
+                When > 0, expands features using sin/cos at multiple frequencies.
+                Default: 0.
+            deterministic: Disable dropout (for inference). Default: True.
+
+        Returns:
+            FlaxModule: Wrapped CGPTNO model.
+
+        Example:
+            >>> # 2D Darcy flow with single input
+            >>> model = nn.cgptno(
+            ...     trunk_size=4,  # (x, y, param1, param2)
+            ...     branch_sizes=[3],  # (a(x,y), x, y)
+            ...     output_size=1,
+            ...     n_layers=3,
+            ...     n_hidden=128,
+            ... )
+            >>>
+            >>> # Multi-physics with two inputs
+            >>> model = nn.cgptno(
+            ...     trunk_size=3,
+            ...     branch_sizes=[3, 2],  # Two input functions
+            ...     output_size=2,
+            ... )
+
+        Note:
+            - Input x_trunk: [batch, n_query, trunk_size]
+            - Input x_branches: List of [batch, n_sensors_i, branch_size_i]
+            - Output: [batch, n_query, output_size]
+
+        Reference:
+            Hao et al. "GNOT: A General Neural Operator Transformer" (2023)
+        """
+        model = CGPTNO(
+            trunk_size=trunk_size,
+            branch_sizes=branch_sizes,
+            output_size=output_size,
+            n_layers=n_layers,
+            n_hidden=n_hidden,
+            n_head=n_head,
+            n_inner=n_inner,
+            mlp_layers=mlp_layers,
+            attn_type=attn_type,
+            act=act,
+            ffn_dropout=ffn_dropout,
+            attn_dropout=attn_dropout,
+            horiz_fourier_dim=horiz_fourier_dim,
+            deterministic=deterministic,
+        )
+        return cls.wrap(model)
+
+    @classmethod
+    def gnot(
+        cls,
+        trunk_size: int,
+        branch_sizes: List[int],
+        space_dim: int = 2,
+        output_size: int = 1,
+        n_layers: int = 2,
+        n_hidden: int = 64,
+        n_head: int = 1,
+        n_experts: int = 2,
+        n_inner: int = 4,
+        mlp_layers: int = 2,
+        attn_type: str = "linear",
+        act: str = "gelu",
+        ffn_dropout: float = 0.0,
+        attn_dropout: float = 0.0,
+        horiz_fourier_dim: int = 0,
+        deterministic: bool = True,
+    ) -> "FlaxModule":
+        """
+        Create a General Neural Operator Transformer (GNOT).
+
+        GNOT extends CGPTNO with Mixture-of-Experts (MoE) FFN layers,
+        enabling position-dependent transformations. A gating network
+        routes inputs to different expert networks based on spatial position.
+
+        Architecture::
+
+            Trunk ──→ MLP ──→ ┐
+                              ├──→ CrossAttn ──→ MoE-FFN ──→ SelfAttn ──→ MoE-FFN ──→ ...
+            Branch ──→ MLP ──→ ┘
+                                        ↑
+            Position ──→ GateNet ──→ Expert Weights
+
+        Key Features:
+            - Position-dependent expert routing
+            - Learns spatially-varying transformations
+            - Multiple input function support
+            - Linear attention complexity
+
+        Args:
+            trunk_size: Input dimension for trunk.
+            branch_sizes: List of input dimensions for each branch.
+            space_dim: Spatial dimension for gating (first N columns of trunk).
+                Default: 2.
+            output_size: Output dimension. Default: 1.
+            n_layers: Number of transformer layers. Default: 2.
+            n_hidden: Hidden dimension. Default: 64.
+            n_head: Number of attention heads. Default: 1.
+            n_experts: Number of expert networks in MoE. Default: 2.
+            n_inner: FFN inner dimension multiplier. Default: 4.
+            mlp_layers: Layers in embedding MLPs. Default: 2.
+            attn_type: Attention type. Default: 'linear'.
+            act: Activation function. Default: 'gelu'.
+            ffn_dropout: FFN dropout rate. Default: 0.0.
+            attn_dropout: Attention dropout rate. Default: 0.0.
+            horiz_fourier_dim: Fourier embedding octaves. Default: 0.
+            deterministic: Disable dropout. Default: True.
+
+        Returns:
+            FlaxModule: Wrapped GNOT model.
+
+        Example:
+            >>> # 2D problem with MoE
+            >>> model = nn.gnot(
+            ...     trunk_size=4,  # (x, y, param1, param2)
+            ...     branch_sizes=[3],
+            ...     space_dim=2,  # Use (x, y) for gating
+            ...     n_experts=4,
+            ...     output_size=1,
+            ... )
+            >>>
+            >>> # 3D multi-physics
+            >>> model = nn.gnot(
+            ...     trunk_size=6,  # (x, y, z, t, Re, Ma)
+            ...     branch_sizes=[4, 3],  # velocity field, pressure field
+            ...     space_dim=3,
+            ...     n_experts=8,
+            ...     output_size=4,
+            ... )
+
+        Note:
+            The first `space_dim` columns of trunk input are used for
+            gating. Ensure coordinates are in these positions.
+
+        Reference:
+            Hao et al. "GNOT: A General Neural Operator Transformer" (2023)
+        """
+        model = GNOT(
+            trunk_size=trunk_size,
+            branch_sizes=branch_sizes,
+            space_dim=space_dim,
+            output_size=output_size,
+            n_layers=n_layers,
+            n_hidden=n_hidden,
+            n_head=n_head,
+            n_experts=n_experts,
+            n_inner=n_inner,
+            mlp_layers=mlp_layers,
+            attn_type=attn_type,
+            act=act,
+            ffn_dropout=ffn_dropout,
+            attn_dropout=attn_dropout,
+            horiz_fourier_dim=horiz_fourier_dim,
+            deterministic=deterministic,
+        )
+        return cls.wrap(model)
+
+    @classmethod
+    def moegptno(
+        cls,
+        trunk_size: int,
+        branch_size: int,
+        space_dim: int = 2,
+        output_size: int = 1,
+        n_layers: int = 2,
+        n_hidden: int = 64,
+        n_head: int = 1,
+        n_experts: int = 2,
+        mlp_layers: int = 2,
+        attn_type: str = "linear",
+        act: str = "gelu",
+        ffn_dropout: float = 0.0,
+        attn_dropout: float = 0.0,
+        horiz_fourier_dim: int = 0,
+        deterministic: bool = True,
+    ) -> "FlaxModule":
+        """
+        Create a single-input MoE GPT Neural Operator.
+
+        Simplified variant of GNOT for problems with a single input function.
+        Uses MoE FFN layers with position-based gating.
+
+        Args:
+            trunk_size: Input dimension for trunk.
+            branch_size: Input dimension for single branch.
+            space_dim: Spatial dimension for gating. Default: 2.
+            output_size: Output dimension. Default: 1.
+            n_layers: Number of transformer layers. Default: 2.
+            n_hidden: Hidden dimension. Default: 64.
+            n_head: Number of attention heads. Default: 1.
+            n_experts: Number of expert networks. Default: 2.
+            mlp_layers: Layers in embedding MLPs. Default: 2.
+            attn_type: Attention type. Default: 'linear'.
+            act: Activation function. Default: 'gelu'.
+            ffn_dropout: FFN dropout rate. Default: 0.0.
+            attn_dropout: Attention dropout rate. Default: 0.0.
+            horiz_fourier_dim: Fourier embedding octaves. Default: 0.
+            deterministic: Disable dropout. Default: True.
+
+        Returns:
+            FlaxModule: Wrapped MoEGPTNO model.
+
+        Example:
+            >>> model = nn.moegptno(
+            ...     trunk_size=4,
+            ...     branch_size=3,
+            ...     space_dim=2,
+            ...     n_experts=4,
+            ... )
+        """
+        model = MoEGPTNO(
+            trunk_size=trunk_size,
+            branch_size=branch_size,
+            space_dim=space_dim,
+            output_size=output_size,
+            n_layers=n_layers,
+            n_hidden=n_hidden,
+            n_head=n_head,
+            n_experts=n_experts,
+            mlp_layers=mlp_layers,
+            attn_type=attn_type,
+            act=act,
+            ffn_dropout=ffn_dropout,
+            attn_dropout=attn_dropout,
+            horiz_fourier_dim=horiz_fourier_dim,
+            deterministic=deterministic,
+        )
+        return cls.wrap(model)
+
+    # =========================================================================
+    # U-Net Architectures
+    # =========================================================================
+
+    @classmethod
+    def unet1d(
+        cls,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        depth: int = 4,
+        wf: int = 6,
+        norm: str = "batch",
+        up_mode: str = "upconv",
+        groups: int = 1,
+        activation: Callable = ln.celu,
+        padding_mode: str = "circular",
+        training: bool = True,
+    ) -> FlaxModule:
+        """
+        Create a 1D U-Net.
+
+        U-Net is an encoder-decoder architecture with skip connections,
+        effective for problems requiring multi-scale feature extraction.
+        The skip connections preserve fine-grained information lost during
+        downsampling.
+
+        Architecture::
+
+            Input
+              ↓
+            [Conv → Norm → Act] × 2  ──────────────────┐
+              ↓ (downsample)                           │
+            [Conv → Norm → Act] × 2  ────────────┐     │
+              ↓ (downsample)                     │     │
+            [Conv → Norm → Act] × 2  ──────┐     │     │
+              ↓ (downsample)               │     │     │
+            [Conv → Norm → Act] × 2        │     │     │ (skip connections)
+              ↓ (upsample)                 │     │     │
+            [Conv → Norm → Act] × 2  ←─────┘     │     │
+              ↓ (upsample)                       │     │
+            [Conv → Norm → Act] × 2  ←───────────┘     │
+              ↓ (upsample)                             │
+            [Conv → Norm → Act] × 2  ←─────────────────┘
+              ↓
+            Output
+
+        Args:
+            in_channels: Input channels. Default: 1.
+            out_channels: Output channels. Default: 1.
+            depth: Number of encoder/decoder levels. Default: 4.
+            wf: Width factor. Base channels = 2^wf (wf=6 → 64). Default: 6.
+            norm: Normalization ('batch', 'layer', 'group', None). Default: 'batch'.
+            up_mode: Upsampling method:
+                - 'upconv': Transposed convolution (learnable)
+                - 'upsample': Interpolation + convolution
+
+                Default: 'upconv'.
+            groups: Groups for grouped convolutions. Default: 1.
+            activation: Activation function. Default: `ln.celu`.
+            padding_mode: Padding ('circular', 'reflect'). Default: 'circular'.
+            training: Training mode. Default: True.
+
+        Returns:
+            FlaxModule: Wrapped UNet1D model.
+
+        Example:
+            >>> # 1D signal denoising
+            >>> model = nn.unet1d(
+            ...     in_channels=1,
+            ...     out_channels=1,
+            ...     depth=4,
+            ...     wf=5,  # 32 base channels
+            ... )
+        """
+        unet = UNet1D(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            depth=depth,
+            wf=wf,
+            norm=norm,
+            up_mode=up_mode,
+            groups=groups,
+            activation=activation,
+            padding_mode=padding_mode,
+            training=training,
+        )
+
+        return cls.wrap(unet)
+
+    @classmethod
+    def unet2d(
+        cls,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        depth: int = 4,
+        wf: int = 6,
+        norm: str = "layer",
+        up_mode: str = "upconv",
+        activation: Callable = ln.gelu,
+        padding_mode: str = "circular",
+        training: bool = True,
+    ) -> FlaxModule:
+        """
+        Create a 2D U-Net.
+
+        The standard U-Net architecture for 2D image-to-image tasks.
+        Widely used for segmentation, super-resolution, and PDE solving.
+
+        Args:
+            in_channels: Input channels. Default: 1.
+            out_channels: Output channels. Default: 1.
+            depth: Number of levels. Default: 4.
+            wf: Width factor (base channels = 2^wf). Default: 6.
+            norm: Normalization type. Default: 'layer'.
+            up_mode: Upsampling ('upconv' or 'upsample'). Default: 'upconv'.
+            activation: Activation function. Default: `ln.celu`.
+            padding_mode: Padding mode. Default: 'circular'.
+            training: Training mode. Default: True.
+
+        Returns:
+            FlaxModule: Wrapped UNet2D model.
+
+        Example:
+            >>> # Darcy flow
+            >>> model = nn.unet2d(
+            ...     in_channels=1,  # permeability
+            ...     out_channels=1,  # pressure
+            ...     depth=4,
+            ...     wf=6,
+            ... )
+            >>>
+            >>> # Multi-channel fluid dynamics
+            >>> model = nn.unet2d(
+            ...     in_channels=4,  # (rho, u, v, p)
+            ...     out_channels=4,
+            ...     depth=5,
+            ...     norm='layer',
+            ... )
+
+        Note:
+            - Input/output must have spatial dimensions divisible by 2^depth
+            - For non-periodic BCs, use `padding_mode='reflect'`
+
+        """
+        model = UNet2D(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            depth=depth,
+            wf=wf,
+            norm=norm,
+            up_mode=up_mode,
+            groups=1,
+            activation=activation,
+            padding_mode=padding_mode,
+            training=training,
+        )
+
+        return cls.wrap(model)
+
+    @classmethod
+    def unet3d(
+        cls,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        depth: int = 4,
+        wf: int = 6,
+        norm: str = "batch",
+        up_mode: str = "upconv",
+        activation: str = "celu",
+        padding_mode: str = "circular",
+        training: bool = True,
+    ) -> FlaxModule:
+        """
+        Create a 3D U-Net.
+
+        For volumetric data or spatiotemporal problems.
+
+        Args:
+            in_channels: Input channels. Default: 1.
+            out_channels: Output channels. Default: 1.
+            depth: Number of levels. Default: 4.
+            wf: Width factor. Default: 6.
+            norm: Normalization type. Default: 'batch'.
+            up_mode: Upsampling method. Default: 'upconv'.
+            activation: Activation function. Default: 'celu'.
+            padding_mode: Padding mode. Default: 'circular'.
+            training: Training mode. Default: True.
+
+        Returns:
+            FlaxModule: Wrapped UNet3D model.
+
+        Warning:
+            Memory usage scales as O(2^(3×depth) × 2^(2×wf)). Consider
+            reducing depth or wf for large volumes.
+        """
+        model = UNet3D(
+            in_channels=in_channels,
+            out_channels=out_channels,
+            depth=depth,
+            wf=wf,
+            norm=norm,
+            up_mode=up_mode,
+            groups=1,
+            activation=activation,
+            padding_mode=padding_mode,
+            training=training,
+        )
+
+        return cls.wrap(model)
+
+    # =========================================================================
+    # Multigrid Neural Operators
+    # =========================================================================
+
+    @classmethod
+    def mgno1d(
+        cls,
+        input_length: int,
+        num_layer: int = 5,
+        num_channel_u: int = 24,
+        num_channel_f: int = 3,
+        num_iteration: Optional[List[Tuple[int, int]]] = None,
+        output_dim: int = 1,
+        activation: str = "gelu",
+        padding_mode: str = "CIRCULAR",
+    ) -> FlaxModule:
+        """
+        Create a 1D Multigrid Neural Operator.
+
+        MgNO uses a V-cycle multigrid structure inspired by classical
+        multigrid methods for PDEs. This provides efficient multi-scale
+        processing with linear complexity.
+
+        V-Cycle Structure::
+
+            Fine grid (smoothing)
+                ↓ (restriction)
+            Coarse grid (smoothing)
+                ↓ (restriction)
+            Coarsest grid (solve)
+                ↓ (prolongation)
+            Coarse grid (smoothing)
+                ↓ (prolongation)
+            Fine grid (smoothing)
+
+        Args:
+            input_length: Length of 1D input sequence.
+            num_layer: Number of MgConv layers. Default: 5.
+            num_channel_u: Channels for solution representation. Default: 24.
+            num_channel_f: Input channels. Default: 3.
+            num_iteration: List of (pre_smooth, post_smooth) per level.
+                Default: [[1, 1]] × 5.
+            output_dim: Output channels. Default: 1.
+            activation: Activation function. Default: 'gelu'.
+            padding_mode: Padding mode. Default: 'CIRCULAR'.
+
+        Returns:
+            FlaxModule: Wrapped MgNO1D model.
+
+        Example:
+            >>> # 1D Burgers equation
+            >>> model = nn.mgno1d(
+            ...     input_length=256,
+            ...     num_layer=4,
+            ...     num_channel_u=16,
+            ...     num_channel_f=2,
+            ... )
+        """
+        if num_iteration is None:
+            num_iteration = [[1, 1]] * 5
+
+        model = MgNO1D(
+            input_length=input_length,
+            num_layer=num_layer,
+            num_channel_u=num_channel_u,
+            num_channel_f=num_channel_f,
+            num_iteration=num_iteration,
+            output_dim=output_dim,
+            activation=activation,
+            padding_mode=padding_mode,
+        )
+
+        return cls.wrap(model)
+
+    @classmethod
+    def mgno2d(
+        cls,
+        input_shape: Tuple[int, int],
+        num_layer: int = 5,
+        num_channel_u: int = 24,
+        num_channel_f: int = 3,
+        num_iteration: Optional[List[Tuple[int, int]]] = None,
+        output_dim: int = 1,
+        activation: str = "gelu",
+        padding_mode: str = "CIRCULAR",
+    ) -> FlaxModule:
+        """
+        Create a 2D Multigrid Neural Operator.
+
+        MgNO provides efficient multi-scale learning through multigrid
+        V-cycles. Each layer performs smoothing operations at multiple
+        grid resolutions, enabling both local and global feature capture.
+
+        Args:
+            input_shape: Spatial dimensions (H, W).
+            num_layer: Number of MgConv layers. Default: 5.
+            num_channel_u: Solution representation channels. Default: 24.
+            num_channel_f: Input feature channels. Default: 3.
+            num_iteration: Smoothing iterations per level.
+                Format: [[pre, post], ...] for each multigrid level.
+                Default: [[1, 1]] × 5.
+            output_dim: Output channels. Default: 1.
+            activation: Activation ('gelu', 'relu', 'tanh', 'silu'). Default: 'gelu'.
+            padding_mode: Padding ('CIRCULAR', 'SAME', 'VALID'). Default: 'CIRCULAR'.
+
+        Returns:
+            FlaxModule: Wrapped MgNO model.
+
+        Example:
+            >>> # 2D Darcy flow
+            >>> model = nn.mgno2d(
+            ...     input_shape=(64, 64),
+            ...     num_layer=5,
+            ...     num_channel_u=24,
+            ...     num_channel_f=3,
+            ...     output_dim=1,
+            ... )
+            >>>
+            >>> # Navier-Stokes with more channels
+            >>> model = nn.mgno2d(
+            ...     input_shape=(128, 128),
+            ...     num_layer=4,
+            ...     num_channel_u=32,
+            ...     num_channel_f=4,
+            ...     output_dim=3,
+            ...     activation='silu',
+            ... )
+
+        Note:
+            The number of multigrid levels is determined by `len(num_iteration)`.
+            Input dimensions should be divisible by 2^(num_levels-1).
+        """
+        if num_iteration is None:
+            num_iteration = [[1, 1]] * 5
+
+        model = MgNO(
+            input_shape=input_shape,
+            num_layer=num_layer,
+            num_channel_u=num_channel_u,
+            num_channel_f=num_channel_f,
+            num_iteration=num_iteration,
+            output_dim=output_dim,
+            activation=activation,
+            padding_mode=padding_mode,
+        )
+
+        return cls.wrap(model)
+
+    # =========================================================================
+    # Attention-Based Operators
+    # =========================================================================
+
+    @classmethod
+    def pit(
+        cls,
+        in_channels: int,
+        out_channels: int,
+        hid_channels: int = 256,
+        n_head: int = 8,
+        localities: Sequence[float] = (100, 50, 50, 50, 100),
+        input_res: Optional[Tuple[int, int]] = (64, 64),
+        latent_res: Optional[Tuple[int, int]] = (16, 16),
+        output_res: Optional[Tuple[int, int]] = (64, 64),
+        m_dists: Optional[Sequence[jnp.ndarray]] = None,
+    ) -> FlaxModule:
+        """
+        Create a Position-induced Transformer (PiT).
+
+        PiT uses position-based attention where attention weights are derived
+        from spatial distances rather than learned query-key products. This
+        inductive bias makes it naturally suited for physical problems with
+        spatial structure.
+
+        Key Innovation:
+            Instead of: Attention = softmax(QK^T / √d)
+            PiT uses:   Attention = f(distance(pos_i, pos_j))
+
+        This provides:
+            - Built-in spatial awareness
+            - Better generalization to different resolutions
+            - Locality control via the `localities` parameter
+
+        Architecture::
+
+            Input (H×W) → Encoder → Latent (h×w) → Processor × N → Decoder → Output (H'×W')
+
+        Two Modes of Operation:
+            1. **Regular grids**: Provide resolution parameters; distances
+
+               computed automatically from coordinates.
+            2. **Custom distances**: Provide `m_dists` for irregular grids
+
+               or custom metrics.
+
+        Args:
+            in_channels: Input feature channels.
+            out_channels: Output feature channels.
+            hid_channels: Hidden dimension. Default: 256.
+            n_head: Number of attention heads. Default: 8.
+            localities: Locality percentages for each attention layer.
+                Format: [encoder, *processor_blocks, decoder].
+                - 100 = global attention (all positions attend to all)
+                - <100 = local attention (only nearest X% of positions)
+
+                Default: (100, 50, 50, 50, 100).
+            input_res: Input grid resolution (H, W). Ignored if m_dists provided.
+                Default: (64, 64).
+            latent_res: Latent/processor resolution. Default: (16, 16).
+            output_res: Output grid resolution. Default: (64, 64).
+            m_dists: Precomputed distance matrices for irregular grids.
+                Length = len(localities). Each shape: [n_head, N_query, N_key].
+                Default: None (compute from coordinates).
+
+        Returns:
+            FlaxModule: Wrapped PiT model.
+
+        Example:
+            >>> # Regular grid with local attention in processor
+            >>> model = nn.pit(
+            ...     in_channels=3,
+            ...     out_channels=1,
+            ...     localities=[100, 50, 50, 50, 100],
+            ...     input_res=(64, 64),
+            ...     latent_res=(16, 16),
+            ...     output_res=(64, 64),
+            ... )
+            >>>
+            >>> # Custom distances for irregular mesh
+            >>> m_dists = compute_custom_distances(mesh)
+            >>> model = nn.pit(
+            ...     in_channels=3,
+            ...     out_channels=1,
+            ...     m_dists=m_dists,
+            ... )
+
+        Note:
+            - Number of processor blocks = len(localities) - 2
+            - localities[0] → encoder, localities[-1] → decoder
+            - Lower locality values reduce computation but limit receptive field
+
+        """
+        if m_dists is not None:
+            model = PiT(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                hid_channels=hid_channels,
+                n_head=n_head,
+                localities=list(localities),
+                m_dists=m_dists,
+            )
+        else:
+            model = PiTWithCoords(
+                in_channels=in_channels,
+                out_channels=out_channels,
+                hid_channels=hid_channels,
+                n_head=n_head,
+                localities=list(localities),
+                input_res=input_res,
+                latent_res=latent_res,
+                output_res=output_res,
+            )
+
+        return cls.wrap(model)
+
+    @classmethod
+    def transformer(
+        cls,
+        num_layers: int = 6,
+        embed_dim: int = 512,
+        num_heads: int = 8,
+        mlp_features: int = 2048,
+        dropout_rate: float = 0.1,
+        deterministic: bool = True,
+        vocab_size: int = 10000,
+        max_len: int = 128,
+        dtype=jnp.float32,
+    ) -> FlaxModule:
+        """
+        Create a standard Transformer.
+
+        Encoder-decoder transformer architecture for sequence-to-sequence
+        tasks. Can be adapted for operator learning by treating spatial
+        points as sequence elements.
+
+        Args:
+            num_layers: Layers in encoder and decoder. Default: 6.
+            embed_dim: Embedding/hidden dimension. Default: 512.
+            num_heads: Attention heads. Default: 8.
+            mlp_features: FFN hidden dimension. Default: 2048.
+            dropout_rate: Dropout probability. Default: 0.1.
+            deterministic: Disable dropout (for inference). Default: True.
+            vocab_size: Vocabulary size (for token embeddings). Default: 10000.
+            max_len: Maximum sequence length. Default: 128.
+            dtype: Data type. Default: jnp.float32.
+
+        Returns:
+            FlaxModule: Wrapped Transformer model.
+
+        Note:
+            For continuous operator learning, consider using PiT or ScOT
+            which are specifically designed for spatial data.
+        """
+        model_inst = Transformer(num_layers, num_layers, embed_dim, num_heads, embed_dim, mlp_features, dropout_rate, deterministic, vocab_size, max_len, dtype)
+
+        return cls.wrap(model_inst)
+
+    # =========================================================================
+    # Branch-Trunk Architectures
+    # =========================================================================
+
+    @classmethod
+    def deeponet(
+        cls,
+        branch_type: Literal["mlp", "resmlp", "conv1d", "transformer"] = "mlp",
+        trunk_type: Literal["mlp", "resmlp", "siren"] = "mlp",
+        combination_type: Literal["dot", "bilinear", "mlp", "attention"] = "dot",
+        n_sensors: int = 100,
+        sensor_channels: int = 1,
+        coord_dim: int = 1,
+        n_outputs: int = 1,
+        basis_functions: int = 128,
+        hidden_dim: int = 256,
+        n_layers: int = 4,
+        n_heads: int = 8,
+        coord_embedding: Optional[Literal["fourier", "positional"]] = None,
+        coord_embedding_dim: int = 64,
+        coord_embedding_scale: float = 1.0,
+        activation: Callable = ln.gelu,
+        norm: Optional[str] = None,
+        dropout_rate: float = 0.0,
+        training: bool = True,
+    ) -> FlaxModule:
+        """
+        Create a Deep Operator Network (DeepONet).
+
+        DeepONet learns operators by decomposing them into:
+            - **Branch network**: Encodes the input function (sampled at sensors)
+            - **Trunk network**: Encodes query coordinates
+            - **Combination**: Combines branch and trunk outputs
+
+        Output: G(u)(y) = Σᵢ bᵢ(u) × tᵢ(y)
+
+        Where bᵢ are branch outputs (basis coefficients) and tᵢ are trunk
+        outputs (basis functions evaluated at query point y).
+
+        Architecture Variants:
+            - Branch: MLP, ResMLP, Conv1D, Transformer
+            - Trunk: MLP, ResMLP, SIREN (for high-frequency details)
+            - Combination: Dot product, Bilinear, MLP, Attention
+
+        Args:
+            branch_type: Branch network architecture. Default: 'mlp'.
+            trunk_type: Trunk network architecture. Default: 'mlp'.
+            combination_type: How to combine outputs. Default: 'dot'.
+            n_sensors: Number of sensor points for input function. Default: 100.
+            sensor_channels: Channels per sensor. Default: 1.
+            coord_dim: Query coordinate dimension. Default: 1.
+            n_outputs: Output field channels. Default: 1.
+            basis_functions: Number of basis functions (p). Default: 128.
+            hidden_dim: Hidden dimension for networks. Default: 256.
+            n_layers: Number of layers/blocks. Default: 4.
+            n_heads: Attention heads (for transformer/attention). Default: 8.
+            coord_embedding: Coordinate embedding type. Default: None.
+            coord_embedding_dim: Embedding dimension. Default: 64.
+            coord_embedding_scale: Fourier feature scale. Default: 1.0.
+            activation: Activation function. Default: `ln.gelu`.
+            norm: Normalization type. Default: None.
+            dropout_rate: Dropout rate. Default: 0.0.
+            training: Training mode. Default: True.
+
+        Returns:
+            FlaxModule: Wrapped DeepONet model.
+
+        Example:
+            >>> # Simple DeepONet for 1D problems
+            >>> model = nn.deeponet(
+            ...     n_sensors=100,
+            ...     coord_dim=1,
+            ...     basis_functions=64,
+            ... )
+            >>>
+            >>> # Advanced DeepONet with Fourier features
+            >>> model = nn.deeponet(
+            ...     branch_type='transformer',
+            ...     trunk_type='siren',
+            ...     combination_type='attention',
+            ...     n_sensors=256,
+            ...     coord_dim=2,
+            ...     coord_embedding='fourier',
+            ...     coord_embedding_scale=10.0,
+            ... )
+
+        Note:
+            - Input: (branch_input: [batch, n_sensors, sensor_channels],
+
+                      trunk_input: [batch, n_query, coord_dim])
+            - Output: [batch, n_query, n_outputs]
+
+        """
+        hidden_dims = tuple([hidden_dim] * n_layers)
+
+        model = DeepONet(
+            branch_type=branch_type,
+            trunk_type=trunk_type,
+            combination_type=combination_type,
+            n_sensors=n_sensors,
+            sensor_channels=sensor_channels,
+            coord_dim=coord_dim,
+            n_outputs=n_outputs,
+            basis_functions=basis_functions,
+            branch_hidden_dims=hidden_dims,
+            branch_hidden_dim=hidden_dim,
+            branch_n_blocks=n_layers,
+            branch_n_layers=n_layers,
+            branch_n_heads=n_heads,
+            trunk_hidden_dims=hidden_dims,
+            trunk_hidden_dim=hidden_dim,
+            trunk_n_blocks=n_layers,
+            coord_embedding=coord_embedding,
+            coord_embedding_dim=coord_embedding_dim,
+            coord_embedding_scale=coord_embedding_scale,
+            combination_hidden_dims=(hidden_dim, hidden_dim // 2),
+            combination_d_model=hidden_dim,
+            combination_n_heads=n_heads,
+            activation=activation,
+            norm=norm,
+            dropout_rate=dropout_rate,
+            training=training,
+        )
+
+        return cls.wrap(model)
+
+    # =========================================================================
+    # Point-Based Networks
+    # =========================================================================
+
+    @classmethod
+    def pointnet(
+        cls,
+        output_dim: int,
+        hidden_dims: List[int] = [32, 16, 8, 4, 2, 2, 4, 8, 8],
+        dropout_rate: float = 0.0,
+        feature_transform: Optional[Callable] = None,
+        activation_function: Callable = ln.tanh,
+        use_bias: bool = True,
+    ) -> FlaxModule:
+        """
+        Create a PointNet-style network.
+
+        PointNet processes unordered point sets through shared MLPs and
+        symmetric aggregation (max pooling), achieving permutation invariance.
+
+        Architecture::
+
+            Points → SharedMLP → MaxPool → GlobalFeature → MLP → Output
+                         ↓
+                    PointFeatures → Concat(GlobalFeature) → MLP → PerPointOutput
+
+        Args:
+            output_dim: Output features per point.
+            hidden_dims: Sizes of each of the kernels (List of 9 integers)
+            dropout_rate: Dropout probability. Default: 0.0.
+            feature_transform: Optional input transformation. Default: None.
+            activation_function: Activation function. Default: `ln.tanh`.
+            use_bias: Include bias terms. Default: True.
+
+        Returns:
+            FlaxModule: Wrapped PointNet model.
+
+        Example:
+            >>> # Point cloud regression
+            >>> model = nn.pointnet(
+            ...     output_dim=3,
+            ...     conv_scale=1.0,
+            ... )
+
+        Note:
+            - Input: [batch, n_points, in_features]
+            - Output: [batch, n_points, output_dim]
+            - Permutation invariant to point ordering
+
+        """
+        model = PointNet(
+            output_dim=output_dim,
+            hidden_dims=hidden_dims,
+            dropout_rate=dropout_rate,
+            feature_transform=feature_transform,
+            act=activation_function,
+            use_bias=use_bias,
+        )
+
+        return cls.wrap(model)
+
+    # =========================================================================
+    # Scalable Operator Transformer (ScOT)
+    # =========================================================================
+
+    @classmethod
+    def scot(
+        cls,
+        name: str,
+        image_size: int,
+        patch_size: int = 4,
+        num_channels: int = 4,
+        num_out_channels: int = 4,
+        embed_dim: int = 48,
+        depths: Tuple[int, int, int, int] = (4, 4, 4, 4),
+        num_heads: Tuple[int, int, int, int] = (3, 6, 12, 24),
+        skip_connections: Tuple[int, int, int, int] = (2, 2, 2, 0),
+        window_size: int = 16,
+        mlp_ratio: float = 4.0,
+        qkv_bias: bool = True,
+        hidden_dropout_prob: float = 0.0,
+        attention_probs_dropout_prob: float = 0.0,
+        drop_path_rate: float = 0.0,
+        hidden_act: str = "gelu",
+        use_absolute_embeddings: bool = False,
+        initializer_range: float = 0.02,
+        layer_norm_eps: float = 1e-5,
+        p: int = 1,
+        channel_slice_list_normalized_loss: Optional[List[int]] = None,
+        residual_model: str = "convnext",
+        use_conditioning: bool = True,
+        learn_residual: bool = False,
+        pretrained_window_sizes: Tuple[int, int, int, int] = (0, 0, 0, 0),
+    ) -> FlaxModule:
+        """
+        Create a Scalable Operator Transformer (ScOT).
+
+        ScOT combines Swin Transformer's efficient windowed attention with
+        U-Net-style skip connections for multi-scale operator learning.
+        It forms the backbone of the Poseidon foundation models.
+
+        Architecture::
+
+            Input → PatchEmbed → [SwinBlock × d₁] → Downsample → [SwinBlock × d₂] → ...
+                                       ↓ (skip)                        ↓ (skip)
+            Output ← PatchExpand ← [SwinBlock × d₁] ← Upsample ← [SwinBlock × d₂] ← ...
+
+        Key Features:
+            - Windowed self-attention for O(n) complexity
+            - Shifted windows for cross-window connections
+            - Skip connections for multi-scale information flow
+            - Optional conditioning for time-dependent problems
+
+        Args:
+            name: Model identifier.
+            image_size: Input image size (assumes square).
+            patch_size: Patch size for tokenization. Default: 4.
+            num_channels: Input channels. Default: 4.
+            num_out_channels: Output channels. Default: 4.
+            embed_dim: Base embedding dimension. Default: 48.
+            depths: Blocks per stage. Default: (4, 4, 4, 4).
+            num_heads: Attention heads per stage. Default: (3, 6, 12, 24).
+            skip_connections: Skip connection frequency. Default: (2, 2, 2, 0).
+            window_size: Attention window size. Default: 16.
+            mlp_ratio: FFN expansion ratio. Default: 4.0.
+            qkv_bias: Bias in QKV projections. Default: True.
+            hidden_dropout_prob: Hidden layer dropout. Default: 0.0.
+            attention_probs_dropout_prob: Attention dropout. Default: 0.0.
+            drop_path_rate: Stochastic depth rate. Default: 0.0.
+            hidden_act: Activation function. Default: 'gelu'.
+            use_absolute_embeddings: Add absolute position embeddings. Default: False.
+            initializer_range: Weight init std. Default: 0.02.
+            layer_norm_eps: LayerNorm epsilon. Default: 1e-5.
+            p: Patch merging factor. Default: 1.
+            channel_slice_list_normalized_loss: Channels for normalized loss.
+                Default: [0, 1, 3, 4].
+            residual_model: Residual block type. Default: 'convnext'.
+            use_conditioning: Enable time/parameter conditioning. Default: True.
+            learn_residual: Learn residual instead of full output. Default: False.
+            pretrained_window_sizes: For loading pretrained weights. Default: (0,0,0,0).
+
+        Returns:
+            FlaxModule: Wrapped ScOT model.
+
+        Example:
+            >>> # Custom ScOT for 128x128 images
+            >>> model = nn.scot(
+            ...     name="my_scot",
+            ...     image_size=128,
+            ...     num_channels=3,
+            ...     num_out_channels=1,
+            ...     embed_dim=96,
+            ...     depths=(2, 2, 6, 2),
+            ... )
+
+        See Also:
+            - `poseidonT/B/L`: Pretrained ScOT variants
+
+        """
+        if channel_slice_list_normalized_loss is None:
+            channel_slice_list_normalized_loss = [0, 1, 3, 4]
+
+        config = ScOTConfig(
+            name=name,
+            image_size=image_size,
+            patch_size=patch_size,
+            num_channels=num_channels,
+            num_out_channels=num_out_channels,
+            embed_dim=embed_dim,
+            depths=depths,
+            num_heads=num_heads,
+            skip_connections=skip_connections,
+            window_size=window_size,
+            mlp_ratio=mlp_ratio,
+            qkv_bias=qkv_bias,
+            hidden_dropout_prob=hidden_dropout_prob,
+            attention_probs_dropout_prob=attention_probs_dropout_prob,
+            drop_path_rate=drop_path_rate,
+            hidden_act=hidden_act,
+            use_absolute_embeddings=use_absolute_embeddings,
+            initializer_range=initializer_range,
+            layer_norm_eps=layer_norm_eps,
+            p=p,
+            channel_slice_list_normalized_loss=channel_slice_list_normalized_loss,
+            residual_model=residual_model,
+            use_conditioning=use_conditioning,
+            learn_residual=learn_residual,
+            pretrained_window_sizes=pretrained_window_sizes,
+        )
+
+        model = ScOT(config=config, use_conditioning=use_conditioning)
+
+        return cls.wrap(model, name="poseidon")
+
+    # =========================================================================
+    # Foundation Models (Pretrained)
+    # =========================================================================
+
+    @classmethod
+    def poseidon(cls, weights_path: Optional[str] = None, num_out_channels: int = 4) -> FlaxModule:
+        """
+        Initialize a Poseidon foundation model for PDE solving.
+
+        The number of input channels is automatically inferred from the inputs provided to the model.
+
+        Args:
+            weights_path: Path to the model weights file (.msgpack format).  The model variant (T, B, or L) is automatically detected.
+            num_out_channels: Number of output channels. This must be specified explicitly as it cannot be inferred from the weights.
+
+        Returns:
+            An output tensors
+
+            Example: For 4 output channels, returns: (B, 128, 128, 4)
+
+        Reference:
+            Herde et al., "Poseidon: Efficient Foundation Models for PDEs" (2024)
+            https://arxiv.org/abs/2405.19101
+        """
+
+        from flax.serialization import from_bytes
+        import jax
+
+        with open(weights_path, "rb") as f:
+            layer_params = from_bytes(None, f.read())
+
+        leaves = jax.tree_util.tree_leaves(layer_params)
+        n_params = sum(int(l.size) for l in leaves if hasattr(l, "size") and not isinstance(l, (str, bytes)))
+        del layer_params
+
+        if n_params == 20_774_444:
+            config = ScOTConfig(
+                name="poseidonT",
+                image_size=128,
+                patch_size=4,
+                num_channels=4,
+                num_out_channels=num_out_channels,
+                embed_dim=48,
+                depths=(4, 4, 4, 4),
+                num_heads=(3, 6, 12, 24),
+                skip_connections=(2, 2, 2, 0),
+                window_size=16,
+                mlp_ratio=4.0,
+                qkv_bias=True,
+                hidden_dropout_prob=0.0,
+                attention_probs_dropout_prob=0.0,
+                drop_path_rate=0.0,
+                hidden_act="gelu",
+                use_absolute_embeddings=False,
+                initializer_range=0.02,
+                layer_norm_eps=1e-5,
+                p=1,
+                channel_slice_list_normalized_loss=[0, 1, 3, 4],
+                residual_model="convnext",
+                use_conditioning=True,
+                learn_residual=False,
+                pretrained_window_sizes=(0, 0, 0, 0),
+            )
+        elif n_params == 157_729_988:
+            config = ScOTConfig(
+                name="poseidonB",
+                image_size=128,
+                patch_size=4,
+                num_channels=4,
+                num_out_channels=num_out_channels,
+                embed_dim=96,
+                depths=(8, 8, 8, 8),
+                num_heads=(3, 6, 12, 24),
+                skip_connections=(2, 2, 2, 0),
+                window_size=16,
+                mlp_ratio=4.0,
+                qkv_bias=True,
+                hidden_dropout_prob=0.0,
+                attention_probs_dropout_prob=0.0,
+                drop_path_rate=0.0,
+                hidden_act="gelu",
+                use_absolute_embeddings=False,
+                initializer_range=0.02,
+                layer_norm_eps=1e-5,
+                p=1,
+                channel_slice_list_normalized_loss=[0, 1, 3, 4],
+                residual_model="convnext",
+                use_conditioning=True,
+                learn_residual=False,
+                pretrained_window_sizes=(0, 0, 0, 0),
+                chunk_size_feed_forward=0,
+                output_attentions=False,
+                output_hidden_states=False,
+                use_return_dict=True,
+            )
+        elif n_params == 628_575_524:
+            config = ScOTConfig(
+                name="poseidonL",
+                image_size=128,
+                patch_size=4,
+                num_channels=4,
+                num_out_channels=num_out_channels,
+                embed_dim=192,
+                depths=(8, 8, 8, 8),
+                num_heads=(3, 6, 12, 24),
+                skip_connections=(2, 2, 2, 0),
+                window_size=16,
+                mlp_ratio=4.0,
+                qkv_bias=True,
+                hidden_dropout_prob=0.0,
+                attention_probs_dropout_prob=0.0,
+                drop_path_rate=0.0,
+                hidden_act="gelu",
+                use_absolute_embeddings=False,
+                initializer_range=0.02,
+                layer_norm_eps=1e-5,
+                p=1,
+                channel_slice_list_normalized_loss=[0, 1, 3, 4],
+                residual_model="convnext",
+                use_conditioning=True,
+                learn_residual=False,
+                pretrained_window_sizes=(0, 0, 0, 0),
+                chunk_size_feed_forward=0,
+                output_attentions=False,
+                output_hidden_states=False,
+                use_return_dict=True,
+            )
+        else:
+            raise ValueError("The number of parameters from the msgpack file {n_params} does not equal poseionT,B,L.")
+
+        model = ScOT(config=config, use_conditioning=True)
+
+        return cls.wrap(model, name="poseidon", weight_path=weights_path)
