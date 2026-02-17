@@ -15,143 +15,6 @@ import jax.numpy as jnp
 from jax import vmap
 
 
-class EulerResidualsDiff:
-
-    @staticmethod
-    def compute_euler_residuals(rho: jnp.ndarray, u: jnp.ndarray, v: jnp.ndarray, p: jnp.ndarray, rho_0: jnp.ndarray, u_0: jnp.ndarray, v_0: jnp.ndarray, p_0: jnp.ndarray, n_substeps: int = 4) -> jnp.ndarray:
-        """
-        Compute 2D compressible Euler equation residuals for each time interval.
-
-        For each interval i (from t=i to t=i+1):
-            - Initial condition: (rho_0[i], u_0[i], v_0[i], p_0[i])
-            - Target (prediction): (rho[i], u[i], v[i], p[i])
-            - Linearly interpolate n_substeps between them
-            - Compute residuals at each sub-step
-
-        Args:
-            rho: Predicted density, shape (21, H, W)
-            u: Predicted x-velocity, shape (21, H, W)
-            v: Predicted y-velocity, shape (21, H, W)
-            p: Predicted pressure, shape (21, H, W)
-            rho_0: Initial density, shape (21, H, W)
-            u_0: Initial x-velocity, shape (21, H, W)
-            v_0: Initial y-velocity, shape (21, H, W)
-            p_0: Initial pressure, shape (21, H, W)
-            n_substeps: Number of sub-steps within each interval (>=2)
-
-        Returns:
-            Residuals, shape (21, n_substeps-2, H, W, 4)
-            Or if flattened: (21 * (n_substeps-2), H, W, 4)
-        """
-
-        # Physical parameters
-        dt_interval = 1.0 / 20.0  # Time between consecutive predictions
-        dt = dt_interval / (n_substeps - 1)  # Sub-step size
-        dx = 1.0 / 128.0
-        dy = 1.0 / 128.0
-        gamma = 1.4
-
-        def compute_interval_residuals(rho_start, u_start, v_start, p_start, rho_end, u_end, v_end, p_end):
-            """
-            Compute residuals for a single interval [t, t+1].
-
-            Args:
-                *_start: Initial condition at t, shape (H, W)
-                *_end: Prediction at t+1, shape (H, W)
-
-            Returns:
-                Residuals at interior sub-steps, shape (n_substeps-2, H, W, 4)
-            """
-
-            # Create sub-step interpolation weights: [0, 1/(n-1), 2/(n-1), ..., 1]
-            alphas = jnp.linspace(0.0, 1.0, n_substeps)  # (n_substeps,)
-            alphas = alphas[:, None, None]  # (n_substeps, 1, 1) for broadcasting
-
-            # Linearly interpolate between start and end for each sub-step
-            # Shape: (n_substeps, H, W)
-            rho_sub = (1.0 - alphas) * rho_start + alphas * rho_end
-            u_sub = (1.0 - alphas) * u_start + alphas * u_end
-            v_sub = (1.0 - alphas) * v_start + alphas * v_end
-            p_sub = (1.0 - alphas) * p_start + alphas * p_end
-
-            # Compute derived quantities
-            rho_u = rho_sub * u_sub
-            rho_v = rho_sub * v_sub
-            E = 0.5 * rho_sub * (u_sub**2 + v_sub**2) + p_sub / (gamma - 1.0)
-
-            # Fluxes
-            flux_x_mom_x = rho_u * u_sub + p_sub  # ρu² + p
-            flux_x_mom_y = rho_u * v_sub  # ρuv
-            flux_y_mom_x = rho_v * u_sub  # ρvu
-            flux_y_mom_y = rho_v * v_sub + p_sub  # ρv² + p
-
-            E_plus_p = E + p_sub
-            flux_E_x = E_plus_p * u_sub
-            flux_E_y = E_plus_p * v_sub
-
-            # Finite difference coefficients
-            inv_2dt = 1.0 / (2.0 * dt)
-            inv_2dx = 1.0 / (2.0 * dx)
-            inv_2dy = 1.0 / (2.0 * dy)
-
-            def d_dx(f):
-                return (jnp.roll(f, -1, axis=-1) - jnp.roll(f, 1, axis=-1)) * inv_2dx
-
-            def d_dy(f):
-                return (jnp.roll(f, -1, axis=-2) - jnp.roll(f, 1, axis=-2)) * inv_2dy
-
-            # Time derivatives at interior points (indices 1 to n_substeps-2)
-            # Central difference: (f[i+1] - f[i-1]) / (2*dt)
-            drho_dt = (rho_sub[2:] - rho_sub[:-2]) * inv_2dt
-            drhou_dt = (rho_u[2:] - rho_u[:-2]) * inv_2dt
-            drhov_dt = (rho_v[2:] - rho_v[:-2]) * inv_2dt
-            dE_dt = (E[2:] - E[:-2]) * inv_2dt
-
-            # Spatial derivatives at interior points
-            drhou_dx = d_dx(rho_u[1:-1])
-            drhov_dy = d_dy(rho_v[1:-1])
-
-            dflux_x_mom_x_dx = d_dx(flux_x_mom_x[1:-1])
-            dflux_x_mom_y_dy = d_dy(flux_x_mom_y[1:-1])
-
-            dflux_y_mom_x_dx = d_dx(flux_y_mom_x[1:-1])
-            dflux_y_mom_y_dy = d_dy(flux_y_mom_y[1:-1])
-
-            dflux_E_x_dx = d_dx(flux_E_x[1:-1])
-            dflux_E_y_dy = d_dy(flux_E_y[1:-1])
-
-            # Residuals
-            con1 = drho_dt + drhou_dx + drhov_dy
-            con2 = drhou_dt + dflux_x_mom_x_dx + dflux_x_mom_y_dy
-            con3 = drhov_dt + dflux_y_mom_x_dx + dflux_y_mom_y_dy
-            con4 = dE_dt + dflux_E_x_dx + dflux_E_y_dy
-
-            # Shape: (n_substeps-2, H, W, 4)
-            return jnp.stack([con1, con2, con3, con4], axis=-1)
-
-        # Vectorize over all 21 intervals
-        # Each interval i: from rho_0[i] to rho[i]
-        compute_all_intervals = vmap(compute_interval_residuals)
-
-        residuals = compute_all_intervals(rho_0, u_0, v_0, p_0, rho, u, v, p)  # Start of each interval: (21, H, W)  # End of each interval: (21, H, W)
-
-        # Shape: (21, n_substeps-2, H, W, 4)
-        return residuals
-
-    @staticmethod
-    def compute_euler_residuals_flat(rho: jnp.ndarray, u: jnp.ndarray, v: jnp.ndarray, p: jnp.ndarray, rho_0: jnp.ndarray, u_0: jnp.ndarray, v_0: jnp.ndarray, p_0: jnp.ndarray, n_substeps: int = 4) -> jnp.ndarray:
-        """
-        Same as compute_euler_residuals but returns flattened output.
-
-        Returns:
-            Residuals, shape (21 * (n_substeps-2), H, W, 4)
-        """
-        residuals = EulerResidualsDiff.compute_euler_residuals(rho, u, v, p, rho_0, u_0, v_0, p_0, n_substeps)
-        # Reshape from (21, n_substeps-2, H, W, 4) to (21*(n_substeps-2), H, W, 4)
-        n_intervals, n_interior, H, W, n_eqs = residuals.shape
-        return residuals.reshape(n_intervals * n_interior, H, W, n_eqs)
-
-
 # ============================================================
 # Finite Difference helpers
 # ============================================================
@@ -1016,25 +879,6 @@ class TraceEvaluator:
                 return jax.vmap(hess_single)(points)
 
         # ----------------------------------------------------------
-        # EulerResiduals (Finite Difference for Compressible Euler)
-        # ----------------------------------------------------------
-
-        elif isinstance(expr, EulerResiduals):
-            # Evaluate the four input fields
-            rho_val = self.evaluate(expr.rho, points_by_tag, var_bindings, tensor_tags, key)
-            u_val = self.evaluate(expr.u, points_by_tag, var_bindings, tensor_tags, key)
-            v_val = self.evaluate(expr.v, points_by_tag, var_bindings, tensor_tags, key)
-            p_val = self.evaluate(expr.p, points_by_tag, var_bindings, tensor_tags, key)
-
-            rho_val0 = self.evaluate(expr.rho0, points_by_tag, var_bindings, tensor_tags, key)
-            u_val0 = self.evaluate(expr.u0, points_by_tag, var_bindings, tensor_tags, key)
-            v_val0 = self.evaluate(expr.v0, points_by_tag, var_bindings, tensor_tags, key)
-            p_val0 = self.evaluate(expr.p0, points_by_tag, var_bindings, tensor_tags, key)
-
-            # Compute residuals using finite differences
-            return EulerResidualsDiff.compute_euler_residuals_flat(rho_val, u_val, v_val, p_val, rho_val0, u_val0, v_val0, p_val0, expr.n_substeps)
-
-        # ----------------------------------------------------------
         # OperationDef
         # ----------------------------------------------------------
         elif isinstance(expr, OperationDef):
@@ -1193,11 +1037,6 @@ class TraceEvaluator:
                 visit(node.target)
             elif isinstance(node, Slice):
                 visit(node.target)
-            elif isinstance(node, EulerResiduals):
-                visit(node.rho)
-                visit(node.u)
-                visit(node.v)
-                visit(node.p)
             elif isinstance(node, Reshape):
                 visit(node.target)
 

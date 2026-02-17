@@ -123,6 +123,36 @@ class Placeholder:
     the solver/visualizer.
     """
 
+    def __gt__(self, other):
+        return FunctionCall(jnp.greater, [self, other])
+
+    def __lt__(self, other):
+        return FunctionCall(jnp.less, [self, other])
+
+    def __ge__(self, other):
+        return FunctionCall(jnp.greater_equal, [self, other])
+
+    def __le__(self, other):
+        return FunctionCall(jnp.less_equal, [self, other])
+
+    def __eq__(self, other):
+        return FunctionCall(jnp.equal, [self, other])
+
+    def __ne__(self, other):
+        return FunctionCall(jnp.not_equal, [self, other])
+
+    def __rgt__(self, other):
+        return FunctionCall(jnp.less, [other, self])
+
+    def __rlt__(self, other):
+        return FunctionCall(jnp.greater, [other, self])
+
+    def __rge__(self, other):
+        return FunctionCall(jnp.less_equal, [other, self])
+
+    def __rle__(self, other):
+        return FunctionCall(jnp.greater_equal, [other, self])
+
     def _wrap(self, other):
         """Wrap non-Placeholder types."""
         if isinstance(other, Placeholder):
@@ -177,6 +207,26 @@ class Placeholder:
             self._auto_op = OperationDef(self)
         return self._auto_op(*args)
 
+    def __matmul__(self, other):
+        """Matrix multiplication: self @ other"""
+        other = self._wrap(other)
+
+        # symbolic path
+        if isinstance(other, Placeholder):
+            return FunctionCall(lambda a, b: a @ b, [self, other])
+
+        # eager path (other is ndarray)
+        return FunctionCall(lambda a: a @ other, [self])
+
+    def __rmatmul__(self, other):
+        """Matrix multiplication: other @ self"""
+        other = self._wrap(other)
+
+        if isinstance(other, Placeholder):
+            return FunctionCall(lambda a, b: a @ b, [other, self])
+
+        return FunctionCall(lambda b: other @ b, [self])
+
     def reshape(self, *shape):
         """Reshape this placeholder to a new shape.
 
@@ -190,6 +240,38 @@ class Placeholder:
         if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
             shape = tuple(shape[0])
         return Reshape(self, shape)
+
+    @property
+    def mean(self):
+        return FunctionCall(lambda x: jnp.squeeze(x.mean()), [self], "mean", True)
+
+    @property
+    def sum(self):
+        return FunctionCall(lambda x: jnp.squeeze(jnp.sum(x)), [self], "sum", True)
+
+    @property
+    def min(self):
+        return FunctionCall(lambda x: jnp.squeeze(jnp.min(x)), [self], "min", True)
+
+    @property
+    def max(self):
+        return FunctionCall(lambda x: jnp.squeeze(jnp.max(x)), [self], "max", True)
+
+    @property
+    def std(self):
+        return FunctionCall(lambda x: jnp.squeeze(jnp.std(x)), [self], "std", True)
+
+    @property
+    def mse(self):
+        return FunctionCall(lambda x: jnp.squeeze(jnp.mean(jnp.square(x))), [self], "mse", True)
+
+    @property
+    def mae(self):
+        return FunctionCall(lambda x: jnp.squeeze(jnp.mean(jnp.abs(x))), [self], "mae", True)
+
+    @property
+    def T(self):
+        return FunctionCall(lambda x: x.T, [self], "transpose", True)
 
 
 class Reshape(Placeholder):
@@ -227,22 +309,27 @@ class Concat(Placeholder):
 
 
 class FunctionCall(Placeholder):
-    """Call to a pure function over traced args.
+    """Call to a pure function over traced args."""
 
-    Captures the callable, its inputs, an optional display name, and whether it
-    reduces a specific axis (used for shape inference and visualization).
-    """
-
-    def __init__(self, fn: Callable, args: tuple, name: str = None, reduces_axis: int = None):
+    def __init__(self, fn: Callable, args: tuple, name: str = None, reduces_axis: int = None, kwargs: Dict = None):
         self.fn = fn
-        self.args = args
-        self._name = name  # Optional explicit name for display/inference
-        self.reduces_axis = reduces_axis  # If set, this function reduces along this axis
+        self.args = args if isinstance(args, (list, tuple)) else [args]
+        self._name = name
+        self.reduces_axis = reduces_axis
+        self.kwargs = kwargs
 
     def __repr__(self):
         name = self._name or getattr(self.fn, "__name__", str(self.fn))
         args_str = ", ".join(str(a) for a in self.args)
         return f"{name}({args_str})"
+
+    def copy_with_args(self, new_args):
+        """Create a new instance with different args."""
+        return FunctionCall(fn=self.fn, args=new_args, name=self._name, reduces_axis=self.reduces_axis)
+
+    def __call__(self, args):
+        """Return a new FunctionCall with the given args."""
+        return self.copy_with_args([args])
 
 
 class Literal(Placeholder):
@@ -950,11 +1037,6 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
             visit(node.target)
         elif isinstance(node, Slice):
             visit(node.target)
-        elif isinstance(node, EulerResiduals):
-            visit(node.rho)
-            visit(node.u)
-            visit(node.v)
-            visit(node.p)
 
     visit(expr)
     return ops
@@ -1000,11 +1082,6 @@ def collect_tags(expr: Placeholder) -> set:
                 visit(v)
         elif isinstance(node, Slice):
             visit(node.target)
-        elif isinstance(node, EulerResiduals):  # ADD THIS
-            visit(node.rho)
-            visit(node.u)
-            visit(node.v)
-            visit(node.p)
 
     visit(expr)
     return tags
@@ -1014,39 +1091,3 @@ def get_primary_tag(expr: Placeholder) -> Optional[str]:
     """Get the primary tag for a constraint."""
     tags = collect_tags(expr)
     return next(iter(tags)) if tags else None
-
-
-# =============================================================================
-# Poseidon
-# =============================================================================
-
-
-class EulerResiduals(Placeholder):
-    """
-    Computes 2D compressible Euler equation residuals using finite differences.
-
-    Equations:
-        E = 0.5 * ρ * (u² + v²) + p / (γ - 1)  # Total energy
-
-        con1 = ∂ρ/∂t + ∂(ρu)/∂x + ∂(ρv)/∂y = 0           # Continuity
-        con2 = ∂(ρu)/∂t + ∂(ρu² + p)/∂x + ∂(ρuv)/∂y = 0  # x-momentum
-        con3 = ∂(ρv)/∂t + ∂(ρuv)/∂x + ∂(ρv² + p)/∂y = 0  # y-momentum
-        con4 = ∂E/∂t + ∂((E+p)u)/∂x + ∂((E+p)v)/∂y = 0   # Energy
-
-    Input fields shape: (T, H, W) = (21, 128, 128)
-    Output shape: (T-2, H-2, W-2, 4) for interior points
-    """
-
-    def __init__(self, rho: Placeholder, u: Placeholder, v: Placeholder, p: Placeholder, rho0: Placeholder, u0: Placeholder, v0: Placeholder, p0: Placeholder, n_substeps: int):
-        self.rho = rho
-        self.u = u
-        self.v = v
-        self.p = p
-        self.rho0 = rho0
-        self.u0 = u0
-        self.v0 = v0
-        self.p0 = p0
-        self.n_substeps = n_substeps
-
-    def __repr__(self):
-        return f"EulerResiduals(ρ={self.rho}, u={self.u}, v={self.v}, p={self.p})"

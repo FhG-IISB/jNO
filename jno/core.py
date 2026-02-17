@@ -290,7 +290,7 @@ class core(CoreUtilities):
             losses = []
             for fn in compiled_constraints:
                 residual = fn(params, points_by_tag, tensor_tags, batchsize=batchsize, key=rng)
-                mean_squared_residual = jnp.mean(jnp.square(residual))
+                mean_squared_residual = jnp.mean(residual)
                 losses.append(mean_squared_residual)
 
             losses = jnp.stack(losses)
@@ -308,7 +308,7 @@ class core(CoreUtilities):
                 return jax.lax.cond(
                     epoch % interval == 0,
                     lambda: fn(params, points_by_tag, tensor_tags, batchsize=batchsize, key=rng),
-                    lambda: jnp.zeros(1),  # TODO tracker does not have to be a scaler
+                    lambda: jnp.zeros(batchsize),  # TODO tracker does not have to be a scaler
                 )
 
             return conditional_fn
@@ -330,14 +330,14 @@ class core(CoreUtilities):
             track_fn = self._make_track_fn(compiled_trackers, points_by_tag, tensor_tags, batchsize)
         loss_fn = self._make_loss_fn(compiled_constraints, points_by_tag, tensor_tags, batchsize)
 
-        def print_progress(epoch, individual_losses, track_stats):
+        def print_progress(epoch, individual_losses, track_stats, loss):
             """Host-side callback for progress printing."""
             loss_strs = " | ".join([f"C{i}: {float(l):>10.4e}" for i, l in enumerate(individual_losses)])
             if track_stats is not None:
                 track_strs = " | ".join([f"T{i}: {float(jnp.mean(l)):>10.4e}" for i, l in enumerate(track_stats)])
-                print(f"\rEpoch {int(epoch):>6}/{epochs} | {loss_strs} | {track_strs}", end="\n", flush=True)
+                print(f"\rEpoch {int(epoch):>6}/{epochs}| L:{float(loss):>10.4e} | {loss_strs} | {track_strs}", end="\n", flush=True)
             else:
-                print(f"\rEpoch {int(epoch):>6}/{epochs} | {loss_strs}", end="\n", flush=True)
+                print(f"\rEpoch {int(epoch):>6}/{epochs}| L:{float(loss):>10.4e} | {loss_strs}", end="\n", flush=True)
             return None
 
         def train_n_steps(params, opt_state, rng):
@@ -365,7 +365,7 @@ class core(CoreUtilities):
                 # Progress callback (unordered, works with multi-device)
                 jax.lax.cond(
                     epoch % print_rate == 0,
-                    lambda: jax.experimental.io_callback(print_progress, None, epoch, individual_losses, track_stats, ordered=False),
+                    lambda: jax.experimental.io_callback(print_progress, None, epoch, individual_losses, track_stats, total_loss, ordered=False),
                     lambda: None,
                 )
 
@@ -414,8 +414,11 @@ class core(CoreUtilities):
         self.compiled_trackers = []
         for expr in constraints:
             fn_expr = TraceEvaluator.compile_traced_expression(expr, self.all_ops, self.layer_info)
-            if isinstance(expr.expr, Tracker):
-                self.compiled_trackers.append((expr.expr.interval, fn_expr))
+            if hasattr(expr, "expr"):
+                if isinstance(expr.expr, Tracker):
+                    self.compiled_trackers.append((expr.expr.interval, fn_expr))
+                else:
+                    self.compiled_constraints.append(fn_expr)
             else:
                 self.compiled_constraints.append(fn_expr)
 
@@ -468,6 +471,7 @@ class core(CoreUtilities):
             statistics: Training history with visualization methods.
         """
         n_constraints = len(self.compiled_constraints)
+        batchsize = batchsize if batchsize is not None else self.domain.total_samples
 
         self.learning_rate = learning_rate if learning_rate is not None else LearningRateSchedule(1.0)
         self.constraint_weights = constraint_weights if constraint_weights is not None else WeightSchedule([1.0 for _ in range(n_constraints)])

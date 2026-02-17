@@ -705,7 +705,9 @@ class CoreUtilities:
 
         # Single batch plotting (original behavior)
         points_jax = jnp.array(points)
-        pred = np.array(self.predict(points_jax, operation=operation, tensor_tags={**tensor_tags, **points_by_tag}))
+
+        extra_tags = {**tensor_tags, **points_by_tag} if tensor_tags is not None else {**points_by_tag}
+        pred = np.array(self.predict(points_jax, operation=operation, tensor_tags=extra_tags))
         if pred.ndim > 1:
             pred = np.squeeze(pred)
 
