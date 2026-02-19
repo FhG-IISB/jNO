@@ -63,13 +63,21 @@ class Debug:
             if self._val:
                 jax.debug.print("{name} -> {expr}", name=self.name, expr=expr)
             if self._shape:
-                jax.debug.print("{name}.shape -> {shape}", name=self.name, shape=expr.shape)
+                jax.debug.print(
+                    "{name}.shape -> {shape}", name=self.name, shape=expr.shape
+                )
             if self._mean:
-                jax.debug.print("{name}.mean -> {mean}", name=self.name, mean=jnp.mean(expr))
+                jax.debug.print(
+                    "{name}.mean -> {mean}", name=self.name, mean=jnp.mean(expr)
+                )
             if self._max:
-                jax.debug.print("{name}.max -> {max}", name=self.name, max=jnp.max(expr))
+                jax.debug.print(
+                    "{name}.max -> {max}", name=self.name, max=jnp.max(expr)
+                )
             if self._min:
-                jax.debug.print("{name}.min -> {min}", name=self.name, min=jnp.min(expr))
+                jax.debug.print(
+                    "{name}.min -> {min}", name=self.name, min=jnp.min(expr)
+                )
         else:
             # Multiple options enabled - print name once, then values without name
             jax.debug.print("{name} ->", name=self.name)
@@ -242,6 +250,12 @@ class Placeholder:
         return Reshape(self, shape)
 
     @property
+    def shape(self):
+        return FunctionCall(
+            lambda x: jnp.ones(x.shape, dtype="bool"), [self], "shape", True
+        )
+
+    @property
     def mean(self):
         return FunctionCall(lambda x: jnp.squeeze(x.mean()), [self], "mean", True)
 
@@ -263,11 +277,15 @@ class Placeholder:
 
     @property
     def mse(self):
-        return FunctionCall(lambda x: jnp.squeeze(jnp.mean(jnp.square(x))), [self], "mse", True)
+        return FunctionCall(
+            lambda x: jnp.squeeze(jnp.mean(jnp.square(x))), [self], "mse", True
+        )
 
     @property
     def mae(self):
-        return FunctionCall(lambda x: jnp.squeeze(jnp.mean(jnp.abs(x))), [self], "mae", True)
+        return FunctionCall(
+            lambda x: jnp.squeeze(jnp.mean(jnp.abs(x))), [self], "mae", True
+        )
 
     @property
     def T(self):
@@ -311,7 +329,14 @@ class Concat(Placeholder):
 class FunctionCall(Placeholder):
     """Call to a pure function over traced args."""
 
-    def __init__(self, fn: Callable, args: tuple, name: str = None, reduces_axis: int = None, kwargs: Dict = None):
+    def __init__(
+        self,
+        fn: Callable,
+        args: tuple,
+        name: str = None,
+        reduces_axis: int = None,
+        kwargs: Dict = None,
+    ):
         self.fn = fn
         self.args = args if isinstance(args, (list, tuple)) else [args]
         self._name = name
@@ -325,7 +350,9 @@ class FunctionCall(Placeholder):
 
     def copy_with_args(self, new_args):
         """Create a new instance with different args."""
-        return FunctionCall(fn=self.fn, args=new_args, name=self._name, reduces_axis=self.reduces_axis)
+        return FunctionCall(
+            fn=self.fn, args=new_args, name=self._name, reduces_axis=self.reduces_axis
+        )
 
     def __call__(self, args):
         """Return a new FunctionCall with the given args."""
@@ -401,7 +428,16 @@ class ConstantNamespace:
             # Check if it contains dicts (don't convert to array)
             if any(isinstance(item, dict) for item in value):
                 # Convert each dict to ConstantNamespace, keep others as-is
-                return [ConstantNamespace(f"{key}[{i}]", item, _parent_tag=parent_tag) if isinstance(item, dict) else ConstantNamespace._convert_value(item, f"{key}[{i}]", parent_tag) for i, item in enumerate(value)]
+                return [
+                    (
+                        ConstantNamespace(f"{key}[{i}]", item, _parent_tag=parent_tag)
+                        if isinstance(item, dict)
+                        else ConstantNamespace._convert_value(
+                            item, f"{key}[{i}]", parent_tag
+                        )
+                    )
+                    for i, item in enumerate(value)
+                ]
             # Check if it's numeric (could be nested arrays)
             if ConstantNamespace._is_numeric_sequence(value):
                 return jnp.asarray(value)
@@ -479,7 +515,10 @@ class ConstantNamespace:
             return self._load_npy(path)
 
         else:
-            raise ValueError(f"Unsupported file format: '{suffix}'. " f"Supported formats: .json, .yaml, .yml, .toml, .pkl, .pickle, .npz, .npy")
+            raise ValueError(
+                f"Unsupported file format: '{suffix}'. "
+                f"Supported formats: .json, .yaml, .yml, .toml, .pkl, .pickle, .npz, .npy"
+            )
 
     @staticmethod
     def _load_json(path: Path) -> dict:
@@ -493,7 +532,10 @@ class ConstantNamespace:
         try:
             import yaml
         except ImportError:
-            raise ImportError("PyYAML is required to load .yaml/.yml files. " "Install with: pip install pyyaml")
+            raise ImportError(
+                "PyYAML is required to load .yaml/.yml files. "
+                "Install with: pip install pyyaml"
+            )
 
         with open(path, "r") as f:
             return yaml.safe_load(f)
@@ -514,7 +556,10 @@ class ConstantNamespace:
                 with open(path, "r") as f:
                     return toml.load(f)
             except ImportError:
-                raise ImportError("toml package is required to load .toml files. " "Install with: pip install toml")
+                raise ImportError(
+                    "toml package is required to load .toml files. "
+                    "Install with: pip install toml"
+                )
 
     @staticmethod
     def _load_pickle(path: Path) -> dict:
@@ -524,7 +569,9 @@ class ConstantNamespace:
         with open(path, "rb") as f:
             data = pickle.load(f)
         if not isinstance(data, dict):
-            raise TypeError(f"Pickle file must contain a dict, got {type(data).__name__}")
+            raise TypeError(
+                f"Pickle file must contain a dict, got {type(data).__name__}"
+            )
         return data
 
     @staticmethod
@@ -557,7 +604,10 @@ class ConstantNamespace:
 
         if key not in self._data:
             available = list(self._data.keys())
-            raise AttributeError(f"Constant '{self._full_tag}' has no key '{key}'. " f"Available keys: {available}")
+            raise AttributeError(
+                f"Constant '{self._full_tag}' has no key '{key}'. "
+                f"Available keys: {available}"
+            )
 
         value = self._data[key]
 
@@ -607,7 +657,10 @@ class ConstantNamespace:
             elif isinstance(value, jnp.ndarray):
                 result[key] = value
             elif isinstance(value, list):
-                result[key] = [item.to_dict() if isinstance(item, ConstantNamespace) else item for item in value]
+                result[key] = [
+                    item.to_dict() if isinstance(item, ConstantNamespace) else item
+                    for item in value
+                ]
             else:
                 result[key] = value
         return result
@@ -666,9 +719,17 @@ class Variable(Placeholder):
         self.tag = tag
         self.dim = dim
         if tag in domain.sampled_points.keys():
-            self.size = dim[1] - dim[0] if dim[1] is not None else domain.sampled_points[tag].shape[-1]
+            self.size = (
+                dim[1] - dim[0]
+                if dim[1] is not None
+                else domain.sampled_points[tag].shape[-1]
+            )
         else:
-            self.size = dim[1] - dim[0] if dim[1] is not None else domain.tensor_tags[tag].shape[-1]
+            self.size = (
+                dim[1] - dim[0]
+                if dim[1] is not None
+                else domain.tensor_tags[tag].shape[-1]
+            )
         self._domain = domain  # Reference to parent domain for inference
 
     def __repr__(self):
@@ -893,7 +954,9 @@ class OperationDef(Placeholder):
             elif isinstance(node, Concat):
                 return any(visit(item) for item in node.items)
             elif isinstance(node, FunctionCall):
-                return any(visit(arg) for arg in node.args if isinstance(arg, Placeholder))
+                return any(
+                    visit(arg) for arg in node.args if isinstance(arg, Placeholder)
+                )
             elif isinstance(node, OperationCall):
                 return node.operation.has_trainable
             elif isinstance(node, Slice):
@@ -912,7 +975,10 @@ class OperationDef(Placeholder):
         n_vars = len(self._collected_vars)
         if len(args) > n_vars:
             var_names = [str(v) for v in self._collected_vars]
-            raise ValueError(f"Op[{self.op_id}] has {n_vars} variable(s) {var_names}, " f"but {len(args)} argument(s) were passed: {[str(a) for a in args]}")
+            raise ValueError(
+                f"Op[{self.op_id}] has {n_vars} variable(s) {var_names}, "
+                f"but {len(args)} argument(s) were passed: {[str(a) for a in args]}"
+            )
         # Fill in missing args from original variables
         if len(args) < n_vars:
             args = args + tuple(self._collected_vars[len(args) :])
@@ -940,7 +1006,12 @@ class OperationCall(Placeholder):
 class Laplacian(Placeholder):
     """Laplacian operator on an operation call."""
 
-    def __init__(self, target: OperationCall, variables: List[Variable], scheme: str = "automatic_differentiation"):
+    def __init__(
+        self,
+        target: OperationCall,
+        variables: List[Variable],
+        scheme: str = "automatic_differentiation",
+    ):
         self.target = target
         self.variables = variables
         self.scheme = scheme  # 'automatic_differentiation' or 'finite_difference'
@@ -953,7 +1024,12 @@ class Laplacian(Placeholder):
 class Gradient(Placeholder):
     """Gradient operator on an operation call."""
 
-    def __init__(self, target: OperationCall, variable: Variable, scheme: str = "automatic_differentiation"):
+    def __init__(
+        self,
+        target: OperationCall,
+        variable: Variable,
+        scheme: str = "automatic_differentiation",
+    ):
         self.target = target
         self.variable = variable
         self.scheme = scheme  # 'automatic_differentiation' or 'finite_difference'
@@ -965,7 +1041,12 @@ class Gradient(Placeholder):
 class Hessian(Placeholder):
     """Hessian matrix operator (matrix of second derivatives)."""
 
-    def __init__(self, target: OperationCall, variables: List[Variable], scheme: str = "automatic_differentiation"):
+    def __init__(
+        self,
+        target: OperationCall,
+        variables: List[Variable],
+        scheme: str = "automatic_differentiation",
+    ):
         self.target = target
         self.variables = variables
         self.scheme = scheme  # 'automatic_differentiation' or 'finite_difference'
@@ -978,7 +1059,12 @@ class Hessian(Placeholder):
 class Jacobian(Placeholder):
     """Jacobian matrix operator (matrix of second derivatives)."""
 
-    def __init__(self, target: OperationCall, variables: List[Variable], scheme: str = "automatic_differentiation"):
+    def __init__(
+        self,
+        target: OperationCall,
+        variables: List[Variable],
+        scheme: str = "automatic_differentiation",
+    ):
         self.target = target
         self.variables = variables
         self.scheme = scheme  # 'automatic_differentiation' or 'finite_difference'

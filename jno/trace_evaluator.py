@@ -23,7 +23,9 @@ from jax import vmap
 class DifferentialOperators:
 
     @staticmethod
-    def compute_fd_gradient_2d_simple(u_values: jnp.ndarray, points: jnp.ndarray, triangles: np.ndarray, dim: int) -> jnp.ndarray:
+    def compute_fd_gradient_2d_simple(
+        u_values: jnp.ndarray, points: jnp.ndarray, triangles: np.ndarray, dim: int
+    ) -> jnp.ndarray:
         n_points = len(u_values)
         triangles = jnp.array(triangles)
         i_idx, j_idx, k_idx = triangles[:, 0], triangles[:, 1], triangles[:, 2]
@@ -39,30 +41,97 @@ class DifferentialOperators:
         grads = jnp.where(areas > 1e-12, grads, 0.0)
         area_weights = jnp.where(areas > 1e-12, areas, 0.0)
         contributions = grads * area_weights
-        gradients = jnp.zeros(n_points).at[i_idx].add(contributions).at[j_idx].add(contributions).at[k_idx].add(contributions)
-        weights = jnp.zeros(n_points).at[i_idx].add(area_weights).at[j_idx].add(area_weights).at[k_idx].add(area_weights)
+        gradients = (
+            jnp.zeros(n_points)
+            .at[i_idx]
+            .add(contributions)
+            .at[j_idx]
+            .add(contributions)
+            .at[k_idx]
+            .add(contributions)
+        )
+        weights = (
+            jnp.zeros(n_points)
+            .at[i_idx]
+            .add(area_weights)
+            .at[j_idx]
+            .add(area_weights)
+            .at[k_idx]
+            .add(area_weights)
+        )
         return jnp.where(weights > 1e-12, gradients / weights, 0.0)
 
     @staticmethod
-    def compute_fd_gradient_3d_simple(u_values: jnp.ndarray, points: jnp.ndarray, tetrahedra: np.ndarray, dim: int) -> jnp.ndarray:
+    def compute_fd_gradient_3d_simple(
+        u_values: jnp.ndarray, points: jnp.ndarray, tetrahedra: np.ndarray, dim: int
+    ) -> jnp.ndarray:
         n_points = len(u_values)
         tetrahedra = jnp.array(tetrahedra)
-        i_idx, j_idx, k_idx, l_idx = tetrahedra[:, 0], tetrahedra[:, 1], tetrahedra[:, 2], tetrahedra[:, 3]
+        i_idx, j_idx, k_idx, l_idx = (
+            tetrahedra[:, 0],
+            tetrahedra[:, 1],
+            tetrahedra[:, 2],
+            tetrahedra[:, 3],
+        )
         p0, p1, p2, p3 = points[i_idx], points[j_idx], points[k_idx], points[l_idx]
-        u0, u1, u2, u3 = u_values[i_idx], u_values[j_idx], u_values[k_idx], u_values[l_idx]
+        u0, u1, u2, u3 = (
+            u_values[i_idx],
+            u_values[j_idx],
+            u_values[k_idx],
+            u_values[l_idx],
+        )
         v1, v2, v3 = p1 - p0, p2 - p0, p3 - p0
-        volumes = jnp.abs(v1[:, 0] * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1]) - v1[:, 1] * (v2[:, 0] * v3[:, 2] - v2[:, 2] * v3[:, 0]) + v1[:, 2] * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0])) / 6.0
+        volumes = (
+            jnp.abs(
+                v1[:, 0] * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1])
+                - v1[:, 1] * (v2[:, 0] * v3[:, 2] - v2[:, 2] * v3[:, 0])
+                + v1[:, 2] * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0])
+            )
+            / 6.0
+        )
         if dim == 0:
-            grads = ((u1 - u0) * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1]) + (u2 - u0) * (v3[:, 1] * v1[:, 2] - v3[:, 2] * v1[:, 1]) + (u3 - u0) * (v1[:, 1] * v2[:, 2] - v1[:, 2] * v2[:, 1])) / (6 * volumes + 1e-12)
+            grads = (
+                (u1 - u0) * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1])
+                + (u2 - u0) * (v3[:, 1] * v1[:, 2] - v3[:, 2] * v1[:, 1])
+                + (u3 - u0) * (v1[:, 1] * v2[:, 2] - v1[:, 2] * v2[:, 1])
+            ) / (6 * volumes + 1e-12)
         elif dim == 1:
-            grads = ((u1 - u0) * (v2[:, 2] * v3[:, 0] - v2[:, 0] * v3[:, 2]) + (u2 - u0) * (v3[:, 2] * v1[:, 0] - v3[:, 0] * v1[:, 2]) + (u3 - u0) * (v1[:, 2] * v2[:, 0] - v1[:, 0] * v2[:, 2])) / (6 * volumes + 1e-12)
+            grads = (
+                (u1 - u0) * (v2[:, 2] * v3[:, 0] - v2[:, 0] * v3[:, 2])
+                + (u2 - u0) * (v3[:, 2] * v1[:, 0] - v3[:, 0] * v1[:, 2])
+                + (u3 - u0) * (v1[:, 2] * v2[:, 0] - v1[:, 0] * v2[:, 2])
+            ) / (6 * volumes + 1e-12)
         else:
-            grads = ((u1 - u0) * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0]) + (u2 - u0) * (v3[:, 0] * v1[:, 1] - v3[:, 1] * v1[:, 0]) + (u3 - u0) * (v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0])) / (6 * volumes + 1e-12)
+            grads = (
+                (u1 - u0) * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0])
+                + (u2 - u0) * (v3[:, 0] * v1[:, 1] - v3[:, 1] * v1[:, 0])
+                + (u3 - u0) * (v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0])
+            ) / (6 * volumes + 1e-12)
         grads = jnp.where(volumes > 1e-12, grads, 0.0)
         volume_weights = jnp.where(volumes > 1e-12, volumes, 0.0)
         contributions = grads * volume_weights
-        gradients = jnp.zeros(n_points).at[i_idx].add(contributions).at[j_idx].add(contributions).at[k_idx].add(contributions).at[l_idx].add(contributions)
-        weights = jnp.zeros(n_points).at[i_idx].add(volume_weights).at[j_idx].add(volume_weights).at[k_idx].add(volume_weights).at[l_idx].add(volume_weights)
+        gradients = (
+            jnp.zeros(n_points)
+            .at[i_idx]
+            .add(contributions)
+            .at[j_idx]
+            .add(contributions)
+            .at[k_idx]
+            .add(contributions)
+            .at[l_idx]
+            .add(contributions)
+        )
+        weights = (
+            jnp.zeros(n_points)
+            .at[i_idx]
+            .add(volume_weights)
+            .at[j_idx]
+            .add(volume_weights)
+            .at[k_idx]
+            .add(volume_weights)
+            .at[l_idx]
+            .add(volume_weights)
+        )
         return jnp.where(weights > 1e-12, gradients / weights, 0.0)
 
     @staticmethod
@@ -79,23 +148,33 @@ class DifferentialOperators:
             Laplacian (d²u/dx²) at each point, shape (N,)
         """
         # In 1D, Laplacian is just the second derivative: d²u/dx²
-        grad = DifferentialOperators.compute_fd_gradient_1d_simple(u_values, points, lines)
+        grad = DifferentialOperators.compute_fd_gradient_1d_simple(
+            u_values, points, lines
+        )
         return DifferentialOperators.compute_fd_gradient_1d_simple(grad, points, lines)
 
     @staticmethod
     def compute_fd_laplacian_2d_simple(u_values, points, triangles, dims):
         result = jnp.zeros_like(u_values)
         for dim in dims:
-            grad = DifferentialOperators.compute_fd_gradient_2d_simple(u_values, points, triangles, dim)
-            result = result + DifferentialOperators.compute_fd_gradient_2d_simple(grad, points, triangles, dim)
+            grad = DifferentialOperators.compute_fd_gradient_2d_simple(
+                u_values, points, triangles, dim
+            )
+            result = result + DifferentialOperators.compute_fd_gradient_2d_simple(
+                grad, points, triangles, dim
+            )
         return result
 
     @staticmethod
     def compute_fd_laplacian_3d_simple(u_values, points, tetrahedra, dims):
         result = jnp.zeros_like(u_values)
         for dim in dims:
-            grad = DifferentialOperators.compute_fd_gradient_3d_simple(u_values, points, tetrahedra, dim)
-            result = result + DifferentialOperators.compute_fd_gradient_3d_simple(grad, points, tetrahedra, dim)
+            grad = DifferentialOperators.compute_fd_gradient_3d_simple(
+                u_values, points, tetrahedra, dim
+            )
+            result = result + DifferentialOperators.compute_fd_gradient_3d_simple(
+                grad, points, tetrahedra, dim
+            )
         return result
 
     @staticmethod
@@ -117,16 +196,26 @@ class DifferentialOperators:
         n_vars = int(jnp.sqrt(len(var_dims)))
 
         # First compute gradients
-        grad_x = DifferentialOperators.compute_fd_gradient_2d_simple(u_values, points, triangles, 0)
-        grad_y = DifferentialOperators.compute_fd_gradient_2d_simple(u_values, points, triangles, 1)
+        grad_x = DifferentialOperators.compute_fd_gradient_2d_simple(
+            u_values, points, triangles, 0
+        )
+        grad_y = DifferentialOperators.compute_fd_gradient_2d_simple(
+            u_values, points, triangles, 1
+        )
 
         # Then compute gradients of gradients (second derivatives)
         # d²u/dx² = d/dx(du/dx)
-        d2u_dx2 = DifferentialOperators.compute_fd_gradient_2d_simple(grad_x, points, triangles, 0)
+        d2u_dx2 = DifferentialOperators.compute_fd_gradient_2d_simple(
+            grad_x, points, triangles, 0
+        )
         # d²u/dxdy = d/dy(du/dx)
-        d2u_dxdy = DifferentialOperators.compute_fd_gradient_2d_simple(grad_x, points, triangles, 1)
+        d2u_dxdy = DifferentialOperators.compute_fd_gradient_2d_simple(
+            grad_x, points, triangles, 1
+        )
         # d²u/dy² = d/dy(du/dy)
-        d2u_dy2 = DifferentialOperators.compute_fd_gradient_2d_simple(grad_y, points, triangles, 1)
+        d2u_dy2 = DifferentialOperators.compute_fd_gradient_2d_simple(
+            grad_y, points, triangles, 1
+        )
 
         # Build full Hessian matrix for each point
         # hess_full[i, j, k] = d²u/dx_j dx_k at point i
@@ -162,17 +251,35 @@ class DifferentialOperators:
         n_vars = int(jnp.sqrt(len(var_dims)))
 
         # First compute gradients
-        grad_x = DifferentialOperators.compute_fd_gradient_3d_simple(u_values, points, tetrahedra, 0)
-        grad_y = DifferentialOperators.compute_fd_gradient_3d_simple(u_values, points, tetrahedra, 1)
-        grad_z = DifferentialOperators.compute_fd_gradient_3d_simple(u_values, points, tetrahedra, 2)
+        grad_x = DifferentialOperators.compute_fd_gradient_3d_simple(
+            u_values, points, tetrahedra, 0
+        )
+        grad_y = DifferentialOperators.compute_fd_gradient_3d_simple(
+            u_values, points, tetrahedra, 1
+        )
+        grad_z = DifferentialOperators.compute_fd_gradient_3d_simple(
+            u_values, points, tetrahedra, 2
+        )
 
         # Compute all second derivatives
-        d2u_dx2 = DifferentialOperators.compute_fd_gradient_3d_simple(grad_x, points, tetrahedra, 0)
-        d2u_dxdy = DifferentialOperators.compute_fd_gradient_3d_simple(grad_x, points, tetrahedra, 1)
-        d2u_dxdz = DifferentialOperators.compute_fd_gradient_3d_simple(grad_x, points, tetrahedra, 2)
-        d2u_dy2 = DifferentialOperators.compute_fd_gradient_3d_simple(grad_y, points, tetrahedra, 1)
-        d2u_dydz = DifferentialOperators.compute_fd_gradient_3d_simple(grad_y, points, tetrahedra, 2)
-        d2u_dz2 = DifferentialOperators.compute_fd_gradient_3d_simple(grad_z, points, tetrahedra, 2)
+        d2u_dx2 = DifferentialOperators.compute_fd_gradient_3d_simple(
+            grad_x, points, tetrahedra, 0
+        )
+        d2u_dxdy = DifferentialOperators.compute_fd_gradient_3d_simple(
+            grad_x, points, tetrahedra, 1
+        )
+        d2u_dxdz = DifferentialOperators.compute_fd_gradient_3d_simple(
+            grad_x, points, tetrahedra, 2
+        )
+        d2u_dy2 = DifferentialOperators.compute_fd_gradient_3d_simple(
+            grad_y, points, tetrahedra, 1
+        )
+        d2u_dydz = DifferentialOperators.compute_fd_gradient_3d_simple(
+            grad_y, points, tetrahedra, 2
+        )
+        d2u_dz2 = DifferentialOperators.compute_fd_gradient_3d_simple(
+            grad_z, points, tetrahedra, 2
+        )
 
         # Build full Hessian matrix
         hess_full = jnp.zeros((N, 3, 3))
@@ -194,7 +301,9 @@ class DifferentialOperators:
         return result
 
     @staticmethod
-    def compute_fd_gradient_1d_simple(u_values: jnp.ndarray, points: jnp.ndarray, lines: np.ndarray) -> jnp.ndarray:
+    def compute_fd_gradient_1d_simple(
+        u_values: jnp.ndarray, points: jnp.ndarray, lines: np.ndarray
+    ) -> jnp.ndarray:
         """
         Compute finite difference gradient on a 1D line mesh.
 
@@ -236,8 +345,20 @@ class DifferentialOperators:
         contributions = grads * length_weights
 
         # Accumulate contributions to nodes (each element contributes to both its nodes)
-        gradients = jnp.zeros(n_points).at[i_idx].add(contributions).at[j_idx].add(contributions)
-        weights = jnp.zeros(n_points).at[i_idx].add(length_weights).at[j_idx].add(length_weights)
+        gradients = (
+            jnp.zeros(n_points)
+            .at[i_idx]
+            .add(contributions)
+            .at[j_idx]
+            .add(contributions)
+        )
+        weights = (
+            jnp.zeros(n_points)
+            .at[i_idx]
+            .add(length_weights)
+            .at[j_idx]
+            .add(length_weights)
+        )
 
         # Return weighted average
         return jnp.where(weights > 1e-12, gradients / weights, 0.0)
@@ -262,8 +383,12 @@ class DifferentialOperators:
         N = len(u_values)
 
         # Compute second derivative: d²u/dx²
-        grad_x = DifferentialOperators.compute_fd_gradient_1d_simple(u_values, points, lines)
-        d2u_dx2 = DifferentialOperators.compute_fd_gradient_1d_simple(grad_x, points, lines)
+        grad_x = DifferentialOperators.compute_fd_gradient_1d_simple(
+            u_values, points, lines
+        )
+        d2u_dx2 = DifferentialOperators.compute_fd_gradient_1d_simple(
+            grad_x, points, lines
+        )
 
         # Build Hessian matrix (1x1 in 1D)
         hess_full = jnp.zeros((N, 1, 1))
@@ -305,7 +430,14 @@ class TraceEvaluator:
         self.log = get_logger()
         self._logged_schemes = {}
 
-    def evaluate(self, expr: Placeholder, points_by_tag: Dict[str, jnp.ndarray], var_bindings: Dict = None, tensor_tags: Dict[str, jnp.ndarray] = None, key: jax.random.PRNGKey = None) -> jnp.ndarray:
+    def evaluate(
+        self,
+        expr: Placeholder,
+        points_by_tag: Dict[str, jnp.ndarray],
+        var_bindings: Dict = None,
+        tensor_tags: Dict[str, jnp.ndarray] = None,
+        key: jax.random.PRNGKey = None,
+    ) -> jnp.ndarray:
         """Evaluate expression for a SINGLE batch (no batch dimension)."""
         var_bindings = var_bindings or {}
         tensor_tags = tensor_tags or {}
@@ -327,7 +459,9 @@ class TraceEvaluator:
         # ----------------------------------------------------------
         elif isinstance(expr, TensorTag):
             if expr.tag not in tensor_tags:
-                raise ValueError(f"TensorTag '{expr.tag}' not found. Available:  {list(tensor_tags.keys())}")
+                raise ValueError(
+                    f"TensorTag '{expr.tag}' not found. Available:  {list(tensor_tags.keys())}"
+                )
             tensor = jnp.asarray(tensor_tags[expr.tag])
             if expr.dim_index is not None and tensor.ndim >= 1:
                 # Select one component; result is scalar or (1,)
@@ -362,25 +496,41 @@ class TraceEvaluator:
                 return jnp.asarray(tensor_tags[tag])
 
             else:
-                raise KeyError(f"Variable tag '{tag}' not found. " f"points_by_tag:  {list(points_by_tag.keys())}, " f"tensor_tags: {list(tensor_tags.keys())}")
+                raise KeyError(
+                    f"Variable tag '{tag}' not found. "
+                    f"points_by_tag:  {list(points_by_tag.keys())}, "
+                    f"tensor_tags: {list(tensor_tags.keys())}"
+                )
 
         # ----------------------------------------------------------
         # Concat:  concatenate along last axis
         # ----------------------------------------------------------
         elif isinstance(expr, Concat):
-            items = [self.evaluate(item, points_by_tag, var_bindings, tensor_tags, key) for item in expr.items]
+            items = [
+                self.evaluate(item, points_by_tag, var_bindings, tensor_tags, key)
+                for item in expr.items
+            ]
             items = [i[..., jnp.newaxis] if i.ndim == 1 else i for i in items]
             return jnp.concatenate(items, axis=-1)
 
         elif isinstance(expr, Reshape):
-            target = self.evaluate(expr.target, points_by_tag, var_bindings, tensor_tags, key)
+            target = self.evaluate(
+                expr.target, points_by_tag, var_bindings, tensor_tags, key
+            )
             return target.reshape(expr.shape)
 
         # ----------------------------------------------------------
         # FunctionCall:  evaluate args, call fn
         # ----------------------------------------------------------
         elif isinstance(expr, FunctionCall):
-            args = [self.evaluate(arg, points_by_tag, var_bindings, tensor_tags, key) if isinstance(arg, Placeholder) else arg for arg in expr.args]
+            args = [
+                (
+                    self.evaluate(arg, points_by_tag, var_bindings, tensor_tags, key)
+                    if isinstance(arg, Placeholder)
+                    else arg
+                )
+                for arg in expr.args
+            ]
             # Check if function accepts 'key' parameter
             sig = inspect.signature(expr.fn)
             if "key" in sig.parameters:
@@ -392,7 +542,9 @@ class TraceEvaluator:
         # Slice
         # ----------------------------------------------------------
         elif isinstance(expr, Slice):
-            target = self.evaluate(expr.target, points_by_tag, var_bindings, tensor_tags, key)
+            target = self.evaluate(
+                expr.target, points_by_tag, var_bindings, tensor_tags, key
+            )
 
             # Convert symbolic slice to NumPy-compatible slice
             concrete_key = []
@@ -417,9 +569,19 @@ class TraceEvaluator:
         # BinaryOp
         # ----------------------------------------------------------
         elif isinstance(expr, BinaryOp):
-            left = self.evaluate(expr.left, points_by_tag, var_bindings, tensor_tags, key)
-            right = self.evaluate(expr.right, points_by_tag, var_bindings, tensor_tags, key)
-            ops = {"+": jnp.add, "-": jnp.subtract, "*": jnp.multiply, "/": jnp.divide, "**": jnp.power}
+            left = self.evaluate(
+                expr.left, points_by_tag, var_bindings, tensor_tags, key
+            )
+            right = self.evaluate(
+                expr.right, points_by_tag, var_bindings, tensor_tags, key
+            )
+            ops = {
+                "+": jnp.add,
+                "-": jnp.subtract,
+                "*": jnp.multiply,
+                "/": jnp.divide,
+                "**": jnp.power,
+            }
 
             res = ops[expr.op](left, right)
             expr.debug(res)
@@ -452,7 +614,9 @@ class TraceEvaluator:
                     # nothing to bind; TensorTags are resolved from tensor_tags by tag name
                     pass
                 else:
-                    raise ValueError(f"Unsupported OperationCall argument type: {type(call_arg)}")
+                    raise ValueError(
+                        f"Unsupported OperationCall argument type: {type(call_arg)}"
+                    )
 
             return self.evaluate(op.expr, points_by_tag, new_bindings, tensor_tags, key)
 
@@ -468,7 +632,9 @@ class TraceEvaluator:
             for arg in expr.args:
 
                 if isinstance(arg, (Placeholder, TensorTag)):
-                    val = self.evaluate(arg, points_by_tag, var_bindings, tensor_tags, key)
+                    val = self.evaluate(
+                        arg, points_by_tag, var_bindings, tensor_tags, key
+                    )
                     arg_values.append(val)
 
                     # Check if this argument varies per point (spatial)
@@ -505,7 +671,9 @@ class TraceEvaluator:
 
             if "poseidon" in flax_mod.name:
                 if len(arg_values) < 2:
-                    raise ValueError(f"Poseidon model expects at least 2 arguments (channels and time), got {len(arg_values)}")
+                    raise ValueError(
+                        f"Poseidon model expects at least 2 arguments (channels and time), got {len(arg_values)}"
+                    )
 
                 # Ensure proper shapes - Poseidon expects (B, H, W, 1) or (B, H, W)
                 def ensure_poseidon_shape(arr):
@@ -516,7 +684,9 @@ class TraceEvaluator:
                     elif arr.ndim == 4:
                         return arr
                     else:
-                        raise ValueError(f"Unexpected shape for Poseidon input: {arr.shape}")
+                        raise ValueError(
+                            f"Unexpected shape for Poseidon input: {arr.shape}"
+                        )
 
                 # Time should be (B,)
                 time_val = jnp.asarray(arg_values[1])
@@ -526,7 +696,9 @@ class TraceEvaluator:
                     time_val = time_val[:, 0]  # (B, 1) -> (B,)
 
                 # Call the JIT-compiled apply function
-                result = apply_fn(layer_params, ensure_poseidon_shape(arg_values[0]), time_val, True)
+                result = apply_fn(
+                    layer_params, ensure_poseidon_shape(arg_values[0]), time_val, True
+                )
 
                 return jnp.squeeze(result.output)
 
@@ -554,7 +726,9 @@ class TraceEvaluator:
                         else:
                             return val
 
-                shaped_args = [normalize_arg(v, s) for v, s in zip(arg_values, arg_sources)]
+                shaped_args = [
+                    normalize_arg(v, s) for v, s in zip(arg_values, arg_sources)
+                ]
                 # try:
                 if "poseidon" in flax_mod.name:
                     result = apply_fn(layer_params, shaped_args[:-1], shaped_args[-1])
@@ -572,9 +746,14 @@ class TraceEvaluator:
 
         elif isinstance(expr, TunableModule):
             if expr._current_instance is None:
-                raise ValueError(f"TunableModule {expr} has no current instance.  " "This should be set by core.solve() before evaluation.")
+                raise ValueError(
+                    f"TunableModule {expr} has no current instance.  "
+                    "This should be set by core.solve() before evaluation."
+                )
             # Evaluate as if it were the concrete FlaxModule
-            return self.evaluate(expr._current_instance, points_by_tag, var_bindings, tensor_tags, key)
+            return self.evaluate(
+                expr._current_instance, points_by_tag, var_bindings, tensor_tags, key
+            )
 
         # ----------------------------------------------------------
         # TunableModuleCall: delegate to current instance's call
@@ -584,13 +763,18 @@ class TraceEvaluator:
             tunable = expr.model
 
             if tunable._current_instance is None:
-                raise ValueError(f"TunableModule has no current instance. " "This should be set by core.solve() before evaluation.")
+                raise ValueError(
+                    f"TunableModule has no current instance. "
+                    "This should be set by core.solve() before evaluation."
+                )
 
             # Create equivalent FlaxModuleCall with the concrete instance
             concrete_call = FlaxModuleCall(tunable._current_instance, expr.args)
             concrete_call.op_id = expr.op_id
 
-            return self.evaluate(concrete_call, points_by_tag, var_bindings, tensor_tags, key)
+            return self.evaluate(
+                concrete_call, points_by_tag, var_bindings, tensor_tags, key
+            )
 
         # ----------------------------------------------------------
         # Gradient (AD or FD)
@@ -616,17 +800,26 @@ class TraceEvaluator:
                 def u_at_pts(pts):
                     # Override only the tag we're differentiating; keep all others
                     pts_dict = {**points_by_tag, tag: pts}
-                    return self.evaluate(target, pts_dict, var_bindings, tensor_tags, key)
+                    return self.evaluate(
+                        target, pts_dict, var_bindings, tensor_tags, key
+                    )
 
                 u_full = u_at_pts(mesh_points)
 
                 if mesh_dim == 2:
-                    grad_full = DifferentialOperators.compute_fd_gradient_2d_simple(u_full, mesh_points, domain.mesh_connectivity["triangles"], dim)
+                    grad_full = DifferentialOperators.compute_fd_gradient_2d_simple(
+                        u_full, mesh_points, domain.mesh_connectivity["triangles"], dim
+                    )
                 else:
-                    grad_full = DifferentialOperators.compute_fd_gradient_3d_simple(u_full, mesh_points, domain.mesh_connectivity["tetrahedra"], dim)
+                    grad_full = DifferentialOperators.compute_fd_gradient_3d_simple(
+                        u_full, mesh_points, domain.mesh_connectivity["tetrahedra"], dim
+                    )
 
                 # Map back to sampled points
-                dists = jnp.sum((mesh_points[jnp.newaxis, :, :] - points[:, jnp.newaxis, :]) ** 2, axis=-1)
+                dists = jnp.sum(
+                    (mesh_points[jnp.newaxis, :, :] - points[:, jnp.newaxis, :]) ** 2,
+                    axis=-1,
+                )
                 vertex_indices = jnp.argmin(dists, axis=1)
                 return grad_full[vertex_indices]
 
@@ -634,15 +827,21 @@ class TraceEvaluator:
 
                 def grad_single(idx):
                     """Gradient at point index idx."""
-                    pt = jax.lax.dynamic_slice(points, (idx, 0), (1, points.shape[1]))[0]
+                    pt = jax.lax.dynamic_slice(points, (idx, 0), (1, points.shape[1]))[
+                        0
+                    ]
 
                     # Build local points_by_tag
                     local_points = {}
                     for k, v in points_by_tag.items():
                         if k == tag:
-                            local_points[k] = jax.lax.dynamic_slice(v, (idx, 0), (1, v.shape[1]))
+                            local_points[k] = jax.lax.dynamic_slice(
+                                v, (idx, 0), (1, v.shape[1])
+                            )
                         elif v.ndim >= 2 and v.shape[0] == points.shape[0]:
-                            local_points[k] = jax.lax.dynamic_slice(v, (idx, 0), (1, v.shape[1]))
+                            local_points[k] = jax.lax.dynamic_slice(
+                                v, (idx, 0), (1, v.shape[1])
+                            )
                         else:
                             local_points[k] = v
 
@@ -650,7 +849,9 @@ class TraceEvaluator:
                     local_tensors = {}
                     for k, v in tensor_tags.items():
                         if v.ndim >= 2 and v.shape[0] == points.shape[0]:
-                            local_tensors[k] = jax.lax.dynamic_slice(v, (idx, 0), (1, v.shape[1]))
+                            local_tensors[k] = jax.lax.dynamic_slice(
+                                v, (idx, 0), (1, v.shape[1])
+                            )
                         elif v.ndim == 1 and v.shape[0] == points.shape[0]:
                             local_tensors[k] = jax.lax.dynamic_slice(v, (idx,), (1,))
                         else:
@@ -658,7 +859,9 @@ class TraceEvaluator:
 
                     def u_scalar(p):
                         pts_dict = {**local_points, tag: p[jnp.newaxis, ...]}
-                        result = self.evaluate(target, pts_dict, var_bindings, local_tensors, key)
+                        result = self.evaluate(
+                            target, pts_dict, var_bindings, local_tensors, key
+                        )
                         return jnp.squeeze(result)
 
                     return jax.grad(u_scalar)(pt)[dim]
@@ -696,19 +899,34 @@ class TraceEvaluator:
                 def u_at_pts(pts):
                     # Override only the tag we're differentiating; keep all others
                     pts_dict = {**points_by_tag, tag: pts}
-                    return self.evaluate(target, pts_dict, var_bindings, tensor_tags, key)
+                    return self.evaluate(
+                        target, pts_dict, var_bindings, tensor_tags, key
+                    )
 
                 u_full = u_at_pts(mesh_points)
 
                 if mesh_dim == 1:
-                    lap_full = DifferentialOperators.compute_fd_laplacian_1d_simple(u_full, mesh_points, domain.mesh_connectivity["lines"])
+                    lap_full = DifferentialOperators.compute_fd_laplacian_1d_simple(
+                        u_full, mesh_points, domain.mesh_connectivity["lines"]
+                    )
                 elif mesh_dim == 2:
-                    lap_full = DifferentialOperators.compute_fd_laplacian_2d_simple(u_full, mesh_points, domain.mesh_connectivity["triangles"], dims)
+                    lap_full = DifferentialOperators.compute_fd_laplacian_2d_simple(
+                        u_full, mesh_points, domain.mesh_connectivity["triangles"], dims
+                    )
                 elif mesh_dim == 3:
-                    lap_full = DifferentialOperators.compute_fd_laplacian_3d_simple(u_full, mesh_points, domain.mesh_connectivity["tetrahedra"], dims)
+                    lap_full = DifferentialOperators.compute_fd_laplacian_3d_simple(
+                        u_full,
+                        mesh_points,
+                        domain.mesh_connectivity["tetrahedra"],
+                        dims,
+                    )
 
                 if points is None:
-                    dists = jnp.sum((mesh_points[jnp.newaxis, :, :] - points[:, jnp.newaxis, :]) ** 2, axis=-1)
+                    dists = jnp.sum(
+                        (mesh_points[jnp.newaxis, :, :] - points[:, jnp.newaxis, :])
+                        ** 2,
+                        axis=-1,
+                    )
                     vertex_indices = jnp.argmin(dists, axis=1)
                     return lap_full[vertex_indices]
                 else:
@@ -718,17 +936,23 @@ class TraceEvaluator:
 
                 def lap_single(idx):
                     """Compute Laplacian at point index idx."""
-                    pt = jax.lax.dynamic_slice(points, (idx, 0), (1, points.shape[1]))[0]
+                    pt = jax.lax.dynamic_slice(points, (idx, 0), (1, points.shape[1]))[
+                        0
+                    ]
 
                     # Build local points_by_tag with dynamically sliced values
                     local_points = {}
                     for k, v in points_by_tag.items():
                         if k == tag:
                             # Will be overridden in u_scalar
-                            local_points[k] = jax.lax.dynamic_slice(v, (idx, 0), (1, v.shape[1]))
+                            local_points[k] = jax.lax.dynamic_slice(
+                                v, (idx, 0), (1, v.shape[1])
+                            )
                         elif v.ndim >= 2 and v.shape[0] == points.shape[0]:
                             # This point data varies per point, slice it dynamically
-                            local_points[k] = jax.lax.dynamic_slice(v, (idx, 0), (1, v.shape[1]))
+                            local_points[k] = jax.lax.dynamic_slice(
+                                v, (idx, 0), (1, v.shape[1])
+                            )
                         else:
                             local_points[k] = v
 
@@ -736,7 +960,9 @@ class TraceEvaluator:
                     local_tensors = {}
                     for k, v in tensor_tags.items():
                         if v.ndim >= 2 and v.shape[0] == points.shape[0]:
-                            local_tensors[k] = jax.lax.dynamic_slice(v, (idx, 0), (1, v.shape[1]))
+                            local_tensors[k] = jax.lax.dynamic_slice(
+                                v, (idx, 0), (1, v.shape[1])
+                            )
                         elif v.ndim == 1 and v.shape[0] == points.shape[0]:
                             local_tensors[k] = jax.lax.dynamic_slice(v, (idx,), (1,))
                         else:
@@ -745,7 +971,9 @@ class TraceEvaluator:
                     def u_scalar(p):
                         # Override the differentiation variable with the input point
                         pts_dict = {**local_points, tag: p[jnp.newaxis, :]}
-                        result = self.evaluate(target, pts_dict, var_bindings, local_tensors, key)
+                        result = self.evaluate(
+                            target, pts_dict, var_bindings, local_tensors, key
+                        )
                         return jnp.squeeze(result)
 
                     hess = jax.hessian(u_scalar)(pt)
@@ -781,7 +1009,9 @@ class TraceEvaluator:
 
                 def u_at_pts(pts):
                     pts_dict = {**points_by_tag, tag: pts}
-                    return self.evaluate(target, pts_dict, var_bindings, tensor_tags, key)
+                    return self.evaluate(
+                        target, pts_dict, var_bindings, tensor_tags, key
+                    )
 
                 u_full = u_at_pts(mesh_points)
 
@@ -790,18 +1020,33 @@ class TraceEvaluator:
                 for i, vi_dim in var_dims:
 
                     if mesh_dim == 1:
-                        grad_full = DifferentialOperators.compute_fd_gradient_1d_simple(u_full, mesh_points, domain.mesh_connectivity["lines"])
+                        grad_full = DifferentialOperators.compute_fd_gradient_1d_simple(
+                            u_full, mesh_points, domain.mesh_connectivity["lines"]
+                        )
                     elif mesh_dim == 2:
-                        grad_full = DifferentialOperators.compute_fd_gradient_2d_simple(u_full, mesh_points, domain.mesh_connectivity["triangles"], vi_dim)
+                        grad_full = DifferentialOperators.compute_fd_gradient_2d_simple(
+                            u_full,
+                            mesh_points,
+                            domain.mesh_connectivity["triangles"],
+                            vi_dim,
+                        )
                     elif mesh_dim == 3:
-                        grad_full = DifferentialOperators.compute_fd_gradient_3d_simple(u_full, mesh_points, domain.mesh_connectivity["tetrahedra"], vi_dim)
+                        grad_full = DifferentialOperators.compute_fd_gradient_3d_simple(
+                            u_full,
+                            mesh_points,
+                            domain.mesh_connectivity["tetrahedra"],
+                            vi_dim,
+                        )
                     jac_components.append(grad_full)
 
                 # Stack to form Jacobian: shape (N_mesh, n_vars)
                 jac_full = jnp.stack(jac_components, axis=-1)
 
                 # Map back to sampled points
-                dists = jnp.sum((mesh_points[jnp.newaxis, :, :] - points[:, jnp.newaxis, :]) ** 2, axis=-1)
+                dists = jnp.sum(
+                    (mesh_points[jnp.newaxis, :, :] - points[:, jnp.newaxis, :]) ** 2,
+                    axis=-1,
+                )
                 vertex_indices = jnp.argmin(dists, axis=1)
                 return jac_full[vertex_indices]
 
@@ -809,10 +1054,18 @@ class TraceEvaluator:
 
                 def jac_single(pt):
                     def u_fn(p):
-                        result = self.evaluate(target, {tag: p[jnp.newaxis, :]}, var_bindings, tensor_tags, key)
+                        result = self.evaluate(
+                            target,
+                            {tag: p[jnp.newaxis, :]},
+                            var_bindings,
+                            tensor_tags,
+                            key,
+                        )
                         return jnp.squeeze(result)
 
-                    jac = jax.jacobian(u_fn)(pt)  # Shape: (input_dims,) for scalar output
+                    jac = jax.jacobian(u_fn)(
+                        pt
+                    )  # Shape: (input_dims,) for scalar output
 
                     # Extract only the columns corresponding to our variables
                     result = jnp.zeros((n_vars,))
@@ -836,7 +1089,11 @@ class TraceEvaluator:
             points = points_by_tag[bound_var.tag]
             tag = bound_var.tag
             n = len(variables)
-            var_dims = [(i, vi.dim[0], j, vj.dim[0]) for i, vi in enumerate(variables) for j, vj in enumerate(variables)]
+            var_dims = [
+                (i, vi.dim[0], j, vj.dim[0])
+                for i, vi in enumerate(variables)
+                for j, vj in enumerate(variables)
+            ]
 
             if scheme == "finite_difference":
                 domain = bound_var._domain
@@ -847,19 +1104,36 @@ class TraceEvaluator:
 
                 def u_at_pts(pts):
                     pts_dict = {**points_by_tag, tag: pts}
-                    return self.evaluate(target, pts_dict, var_bindings, tensor_tags, key)
+                    return self.evaluate(
+                        target, pts_dict, var_bindings, tensor_tags, key
+                    )
 
                 u_full = u_at_pts(mesh_points)
 
                 if mesh_dim == 1:
-                    hess_full = DifferentialOperators.compute_fd_hessian_1d_simple(u_full, mesh_points, domain.mesh_connectivity["lines"])
+                    hess_full = DifferentialOperators.compute_fd_hessian_1d_simple(
+                        u_full, mesh_points, domain.mesh_connectivity["lines"]
+                    )
                 elif mesh_dim == 2:
-                    hess_full = DifferentialOperators.compute_fd_hessian_2d_simple(u_full, mesh_points, domain.mesh_connectivity["triangles"], var_dims)
+                    hess_full = DifferentialOperators.compute_fd_hessian_2d_simple(
+                        u_full,
+                        mesh_points,
+                        domain.mesh_connectivity["triangles"],
+                        var_dims,
+                    )
                 elif mesh_dim == 3:
-                    hess_full = DifferentialOperators.compute_fd_hessian_3d_simple(u_full, mesh_points, domain.mesh_connectivity["tetrahedra"], var_dims)
+                    hess_full = DifferentialOperators.compute_fd_hessian_3d_simple(
+                        u_full,
+                        mesh_points,
+                        domain.mesh_connectivity["tetrahedra"],
+                        var_dims,
+                    )
 
                 # Map back to sampled points
-                dists = jnp.sum((mesh_points[jnp.newaxis, :, :] - points[:, jnp.newaxis, :]) ** 2, axis=-1)
+                dists = jnp.sum(
+                    (mesh_points[jnp.newaxis, :, :] - points[:, jnp.newaxis, :]) ** 2,
+                    axis=-1,
+                )
                 vertex_indices = jnp.argmin(dists, axis=1)
                 return hess_full[vertex_indices]
 
@@ -867,7 +1141,13 @@ class TraceEvaluator:
 
                 def hess_single(pt):
                     def u_scalar(p):
-                        result = self.evaluate(target, {tag: p[jnp.newaxis, :]}, var_bindings, tensor_tags, key)
+                        result = self.evaluate(
+                            target,
+                            {tag: p[jnp.newaxis, :]},
+                            var_bindings,
+                            tensor_tags,
+                            key,
+                        )
                         return jnp.squeeze(result)
 
                     hess = jax.hessian(u_scalar)(pt)
@@ -882,13 +1162,19 @@ class TraceEvaluator:
         # OperationDef
         # ----------------------------------------------------------
         elif isinstance(expr, OperationDef):
-            return self.evaluate(expr.expr, points_by_tag, var_bindings, tensor_tags, key)
+            return self.evaluate(
+                expr.expr, points_by_tag, var_bindings, tensor_tags, key
+            )
 
         else:
             raise ValueError(f"Cannot evaluate:  {type(expr)}")
 
     @staticmethod
-    def collect_dense_layers(expr: Placeholder, traverse_calls: bool = False, tensor_dims: Dict[str, int] = None) -> List:
+    def collect_dense_layers(
+        expr: Placeholder,
+        traverse_calls: bool = False,
+        tensor_dims: Dict[str, int] = None,
+    ) -> List:
         """Collect all FlaxModule nodes from expression tree."""
 
         tensor_dims = tensor_dims or {}
@@ -925,12 +1211,18 @@ class TraceEvaluator:
                         result_shape.append(1)
                     elif k is Ellipsis:
                         remaining = len(target_shape) - target_idx
-                        result_shape.extend(target_shape[target_idx : target_idx + remaining])
+                        result_shape.extend(
+                            target_shape[target_idx : target_idx + remaining]
+                        )
                         target_idx += remaining
                     elif isinstance(k, int):
                         target_idx += 1
                     elif isinstance(k, slice):
-                        result_shape.append(target_shape[target_idx] if target_idx < len(target_shape) else 1)
+                        result_shape.append(
+                            target_shape[target_idx]
+                            if target_idx < len(target_shape)
+                            else 1
+                        )
                         target_idx += 1
                     else:
                         if target_idx < len(target_shape):
@@ -968,6 +1260,29 @@ class TraceEvaluator:
                 left_padded = (1,) * (max_ndim - len(left_shape)) + left_shape
                 right_padded = (1,) * (max_ndim - len(right_shape)) + right_shape
                 return tuple(max(l, r) for l, r in zip(left_padded, right_padded))
+
+            elif isinstance(arg, FunctionCall):
+                key = jax.random.PRNGKey(42)
+                sig = inspect.signature(arg.fn)
+
+                # Build arguments list
+                args = []
+                param_names = list(sig.parameters.keys())
+
+                for i, a in enumerate(arg.args):
+                    if i < len(param_names) and param_names[i] == "key":
+                        args.append(key)
+                    else:
+                        args.append(jnp.ones(get_shape(a)))
+
+                # Check if 'key' is a keyword-only parameter not yet provided
+                if (
+                    "key" in sig.parameters
+                    and "key" not in param_names[: len(arg.args)]
+                ):
+                    return arg.fn(*args, key=key).shape
+                else:
+                    return arg.fn(*args).shape
 
             else:
                 return (1,)
@@ -1044,7 +1359,9 @@ class TraceEvaluator:
         return layers
 
     @staticmethod
-    def infer_layer_input_dims(expr: Placeholder, domain_dim: int, tensor_dims: Dict[str, int]) -> Dict[int, int]:
+    def infer_layer_input_dims(
+        expr: Placeholder, domain_dim: int, tensor_dims: Dict[str, int]
+    ) -> Dict[int, int]:
         """Infer input dimension for each layer by tracing the expression tree.
 
         Args:
@@ -1137,7 +1454,9 @@ class TraceEvaluator:
         return layer_input_dims
 
     @staticmethod
-    def merge_pretrained_params(pretrained_params: dict, new_params: dict, logger) -> dict:
+    def merge_pretrained_params(
+        pretrained_params: dict, new_params: dict, logger
+    ) -> dict:
         """
         Merge pretrained weights with new params, replacing embedding/recovery layers
         when shapes don't match (for different channel dimensions).
@@ -1163,7 +1482,10 @@ class TraceEvaluator:
                                 result[key] = pretrained[key]
                                 stats["matched"] += count_params(pretrained[key])
                             else:
-                                logger.info(f"Shape mismatch at {current_path}: " f"{pretrained[key].shape} -> {new[key].shape}, reinitializing")
+                                logger.info(
+                                    f"Shape mismatch at {current_path}: "
+                                    f"{pretrained[key].shape} -> {new[key].shape}, reinitializing"
+                                )
                                 result[key] = new[key]
                                 stats["replaced"] += count_params(new[key])
                     elif key in pretrained:
@@ -1190,12 +1512,21 @@ class TraceEvaluator:
 
         total = stats["matched"] + stats["replaced"]
         pct = 100 * stats["matched"] / total
-        logger.info(f"Pretrained weights: {stats['matched']:,}/{total:,} params matched ({pct:.8f}%), " f"{stats['replaced']:,} reinitialized")
+        logger.info(
+            f"Pretrained weights: {stats['matched']:,}/{total:,} params matched ({pct:.8f}%), "
+            f"{stats['replaced']:,} reinitialized"
+        )
 
         return merged
 
     @staticmethod
-    def load_poseidon_params(module, rng: jax.random.PRNGKey, num_input_channels: int, logger: Logger, weight_path: str) -> Tuple[dict, Callable]:
+    def load_poseidon_params(
+        module,
+        rng: jax.random.PRNGKey,
+        num_input_channels: int,
+        logger: Logger,
+        weight_path: str,
+    ) -> Tuple[dict, Callable]:
         """
         Load Poseidon model parameters, handling channel dimension mismatches.
 
@@ -1235,7 +1566,9 @@ class TraceEvaluator:
                 logger.info(f"Poseidon weights loaded from: {weight_path}")
             except Exception as e:
                 # If direct load fails, load raw and merge
-                logger.info(f"Direct load failed ({e}), attempting merge with channel replacement")
+                logger.info(
+                    f"Direct load failed ({e}), attempting merge with channel replacement"
+                )
 
             # Load pretrained with its original structure
             # Create dummy init for pretrained config (4 channels)
@@ -1249,7 +1582,9 @@ class TraceEvaluator:
             pretrained_params = from_bytes(pretrained_init, pretrained_bytes)
 
             # Merge: keep encoder/decoder, replace mismatched layers
-            layer_params = TraceEvaluator.merge_pretrained_params(pretrained_params, fresh_params, logger)
+            layer_params = TraceEvaluator.merge_pretrained_params(
+                pretrained_params, fresh_params, logger
+            )
         else:
             layer_params = fresh_params
             logger.info("No pretrained path provided, using fresh initialization")
@@ -1266,22 +1601,36 @@ class TraceEvaluator:
 
             if isinstance(layer.module, nn.Module):
                 if n_args is not None:
-                    dummies = [jnp.ones((1,) + dim) if len(dim) == 1 else jnp.ones(dim) for dim in arg_dims]
+                    dummies = [
+                        jnp.ones((1,) + dim) if len(dim) == 1 else jnp.ones(dim)
+                        for dim in arg_dims
+                    ]
 
                     # Check if this is a Poseidon model
                     is_poseidon = False
                     if hasattr(layer.module, "config"):
-                        if layer.module.config.name is not None and "poseidon" in layer.module.config.name:
+                        if (
+                            layer.module.config.name is not None
+                            and "poseidon" in layer.module.config.name
+                        ):
                             is_poseidon = True
 
                     if is_poseidon:
                         # Use the new loading function with channel replacement support
-                        layer_params, apply_fn = TraceEvaluator.load_poseidon_params(module=layer.module, rng=rng, num_input_channels=dummies[0].shape[-1], logger=logger, weight_path=layer.weight_path)  # Exclude time from channel count
+                        layer_params, apply_fn = TraceEvaluator.load_poseidon_params(
+                            module=layer.module,
+                            rng=rng,
+                            num_input_channels=dummies[0].shape[-1],
+                            logger=logger,
+                            weight_path=layer.weight_path,
+                        )  # Exclude time from channel count
 
                         if layer.show:
                             df = jnp.ones((1, 128, 128, dummies[0].shape[-1]))
                             dt = jnp.zeros((1,))
-                            table_str = layer.module.tabulate(jax.random.key(0), df, dt, depth=2)
+                            table_str = layer.module.tabulate(
+                                jax.random.key(0), df, dt, depth=2
+                            )
                             print(table_str)
 
                         return layer_params, apply_fn
@@ -1295,16 +1644,24 @@ class TraceEvaluator:
                             with open(layer.weight_path, "rb") as f:
                                 pretrained_bytes = f.read()
 
-                            pretrained_params = from_bytes(layer_params, pretrained_bytes)
-                            layer_params = TraceEvaluator.merge_pretrained_params(pretrained_params, layer_params, logger)
+                            pretrained_params = from_bytes(
+                                layer_params, pretrained_bytes
+                            )
+                            layer_params = TraceEvaluator.merge_pretrained_params(
+                                pretrained_params, layer_params, logger
+                            )
 
                         if layer.show:
                             rng = jax.random.PRNGKey(0)
                             if len(dummies) > 1:
-                                table_str = layer.module.tabulate(rng, *dummies, depth=2)
+                                table_str = layer.module.tabulate(
+                                    rng, *dummies, depth=2
+                                )
                             else:
-                                table_str = layer.module.tabulate(rng, dummies[0], depth=2)
-                            logger.info(table_str)
+                                table_str = layer.module.tabulate(
+                                    rng, dummies[0], depth=2
+                                )
+                            print(table_str)  # TODO make logger.info compatible
 
                         return layer_params, layer.module.apply
 
@@ -1347,7 +1704,9 @@ class TraceEvaluator:
                         pretrained_bytes = f.read()
 
                     pretrained_params = from_bytes(layer_params, pretrained_bytes)
-                    layer_params = TraceEvaluator.merge_pretrained_params(pretrained_params, layer_params, logger)
+                    layer_params = TraceEvaluator.merge_pretrained_params(
+                        pretrained_params, layer_params, logger
+                    )
 
                 if layer.show:
                     if len(dummies) > 1:
@@ -1362,15 +1721,23 @@ class TraceEvaluator:
             raise ValueError(f"Unknown layer type: {type(layer)}")
 
     @staticmethod
-    def compile_traced_expression(expr: Placeholder, all_ops: List[OperationDef], layer_info) -> Callable:
+    def compile_traced_expression(
+        expr: Placeholder, all_ops: List[OperationDef], layer_info
+    ) -> Callable:
         """Compile traced expression into a JAX-compatible function."""
 
-        def evaluate_single_batch(params, points_by_tag_single, tensor_tags_single, key):
+        def evaluate_single_batch(
+            params, points_by_tag_single, tensor_tags_single, key
+        ):
             """Evaluate for a single batch - no batch dimension."""
             evaluator = TraceEvaluator(params, layer_info)
-            return evaluator.evaluate(expr, points_by_tag_single, {}, tensor_tags_single, key)
+            return evaluator.evaluate(
+                expr, points_by_tag_single, {}, tensor_tags_single, key
+            )
 
-        def compiled_fn(params, points_by_tag, tensor_tags=None, batchsize=None, key=None):
+        def compiled_fn(
+            params, points_by_tag, tensor_tags=None, batchsize=None, key=None
+        ):
             """
             Evaluate the compiled expression.
 
@@ -1391,10 +1758,16 @@ class TraceEvaluator:
                     for var in op._collected_vars:
                         all_tags.add(var.tag)
 
-            tag_order = tuple(sorted(points_by_tag.keys(), key=lambda t: (t not in all_tags, t)))
-            points_tuple = tuple(points_by_tag[tag] for tag in tag_order) if tag_order else ()
+            tag_order = tuple(
+                sorted(points_by_tag.keys(), key=lambda t: (t not in all_tags, t))
+            )
+            points_tuple = (
+                tuple(points_by_tag[tag] for tag in tag_order) if tag_order else ()
+            )
             tensor_order = tuple(sorted(tensor_tags.keys()))
-            tensors_tuple = tuple(tensor_tags[tag] for tag in tensor_order) if tensor_order else ()
+            tensors_tuple = (
+                tuple(tensor_tags[tag] for tag in tensor_order) if tensor_order else ()
+            )
 
             # ============================================================
             # STEP 1: Determine the PRIMARY batch size B
@@ -1426,33 +1799,44 @@ class TraceEvaluator:
             # ============================================================
             if batchsize is not None:
                 if key is None:
-                    raise ValueError("A JAX random key must be provided when batchsize is specified.")
+                    raise ValueError(
+                        "A JAX random key must be provided when batchsize is specified."
+                    )
 
                 if batchsize > B:
-                    raise ValueError(f"Requested batchsize ({batchsize}) exceeds available batch size ({B}).")
+                    print("WARNING: batchsize smaller then sampling -> replace=True")
+                    indices = jax.random.choice(
+                        key, B, shape=(batchsize,), replace=True
+                    )
+                    indices = jnp.sort(indices)
 
                 if batchsize < B:
                     # Randomly select indices
-                    indices = jax.random.choice(key, B, shape=(batchsize,), replace=False)
+                    indices = jax.random.choice(
+                        key, B, shape=(batchsize,), replace=False
+                    )
                     indices = jnp.sort(indices)
 
-                    # Subset points that have THE PRIMARY batch dimension
-                    def subset_point(p):
-                        if hasattr(p, "ndim") and p.ndim == 3 and p.shape[0] == B:
-                            return p[indices]
-                        return p
+                if batchsize == B:
+                    indices = jnp.arange(0, B, 1)
 
-                    # Subset tensors that have THE PRIMARY batch dimension
-                    def subset_tensor(t):
-                        if hasattr(t, "ndim") and t.ndim >= 1 and t.shape[0] == B:
-                            return t[indices]
-                        return t
+                # Subset points that have THE PRIMARY batch dimension
+                def subset_point(p):
+                    if hasattr(p, "ndim") and p.ndim == 3 and p.shape[0] == B:
+                        return p[indices]
+                    return p
 
-                    points_tuple = tuple(subset_point(p) for p in points_tuple)
-                    tensors_tuple = tuple(subset_tensor(t) for t in tensors_tuple)
+                # Subset tensors that have THE PRIMARY batch dimension
+                def subset_tensor(t):
+                    if hasattr(t, "ndim") and t.ndim >= 1 and t.shape[0] == B:
+                        return t[indices]
+                    return t
 
-                    # Update B to the new batch size
-                    B = batchsize
+                points_tuple = tuple(subset_point(p) for p in points_tuple)
+                tensors_tuple = tuple(subset_tensor(t) for t in tensors_tuple)
+
+                # Update B to the new batch size
+                B = batchsize
 
             # ============================================================
             # STEP 2: Normalize points - only vmap over arrays with batch size == B
@@ -1525,22 +1909,36 @@ class TraceEvaluator:
                 # Split the key into B subkeys, one for each batch element
                 keys = jax.random.split(key, B)
 
-                vmapped_fn = jax.vmap(eval_single_batch_tuple, in_axes=(points_in_axes, tensors_in_axes, 0))  # 0 for keys axis
+                vmapped_fn = jax.vmap(
+                    eval_single_batch_tuple,
+                    in_axes=(points_in_axes, tensors_in_axes, 0),
+                )  # 0 for keys axis
                 return vmapped_fn(points_tuple, tensors_tuple, keys)
             else:
                 # No key provided - use original function without key
                 def eval_single_batch_tuple_no_key(points_vals, tensor_vals):
                     pts_dict = dict(zip(tag_order, points_vals))
-                    tens_dict = dict(zip(tensor_order, tensor_vals)) if tensor_order else {}
+                    tens_dict = (
+                        dict(zip(tensor_order, tensor_vals)) if tensor_order else {}
+                    )
                     return evaluate_single_batch(params, pts_dict, tens_dict)
 
-                vmapped_fn = jax.vmap(eval_single_batch_tuple_no_key, in_axes=(points_in_axes, tensors_in_axes))
+                vmapped_fn = jax.vmap(
+                    eval_single_batch_tuple_no_key,
+                    in_axes=(points_in_axes, tensors_in_axes),
+                )
                 return vmapped_fn(points_tuple, tensors_tuple)
 
         return compiled_fn
 
     @staticmethod
-    def init_layer_params(all_ops: List, domain_dim: int, tensor_dims: Dict[str, int], rng: jax.Array, logger) -> Tuple[Dict, Dict, jax.Array]:
+    def init_layer_params(
+        all_ops: List,
+        domain_dim: int,
+        tensor_dims: Dict[str, int],
+        rng: jax.Array,
+        logger,
+    ) -> Tuple[Dict, Dict, jax.Array]:
         """Initialize parameters for all layers, sharing across operations.
 
         Returns:
@@ -1555,11 +1953,15 @@ class TraceEvaluator:
         all_layers = {}  # layer_id -> (layer, layer_input_dims)
 
         for op in all_ops:
-            layers = TraceEvaluator.collect_dense_layers(op.expr, tensor_dims=tensor_dims)
+            layers = TraceEvaluator.collect_dense_layers(
+                op.expr, tensor_dims=tensor_dims
+            )
             if not layers:
                 continue
 
-            layer_input_dims = TraceEvaluator.infer_layer_input_dims(op.expr, domain_dim, tensor_dims)
+            layer_input_dims = TraceEvaluator.infer_layer_input_dims(
+                op.expr, domain_dim, tensor_dims
+            )
 
             for layer in layers:
                 if layer.layer_id not in all_layers:
@@ -1568,7 +1970,9 @@ class TraceEvaluator:
         # Second pass: initialize each unique layer once
         for layer_id, (layer, layer_input_dims) in all_layers.items():
             rng, init_rng = jax.random.split(rng)
-            layer_params, apply_fn = TraceEvaluator.build_single_layer_params(layer, init_rng, logger)
+            layer_params, apply_fn = TraceEvaluator.build_single_layer_params(
+                layer, init_rng, logger
+            )
             all_params[layer_id] = layer_params
             all_layer_info[layer_id] = apply_fn
 

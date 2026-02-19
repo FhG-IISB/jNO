@@ -224,6 +224,6 @@ def init_default_logger(path: Path, log_print: Tuple[bool, bool] = (True, True))
     """Initialize the default logger. Call once at application startup."""
     global _default_logger
     if _default_logger is not None:
-        raise RuntimeError("Default logger already initialized")
+        return _default_logger
     _default_logger = Logger(path=path, log_print=log_print, name="DefaultLogger")
     return _default_logger

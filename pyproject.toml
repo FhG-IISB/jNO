@@ -40,7 +40,7 @@ members = [
 ]
 
 [tool.uv.sources]
-jno = { workspace = true, editable = true }
+jno = { workspace = true}
 
 [dependency-groups]
 dev = [
