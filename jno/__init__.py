@@ -5,7 +5,7 @@ from .domain import domain
 from .resampling import sampler
 from .trace import Variable, Placeholder, OperationDef, OperationCall, FlaxModule
 from .utils.adaptive import LearningRateSchedule, WeightSchedule
-from .utils import callbacks, Logger, init_default_logger as logger
+from .utils import callbacks, Logger, init_default_logger as logger, IREEModel as iree
 from .utils import create_rank_dict
 from .trace_evaluator import TraceEvaluator
 from . import resampling
@@ -71,4 +71,5 @@ __all__ = [
     "logger",
     "TraceEvaluator",
     "create_rank_dict",
+    "iree",
 ]

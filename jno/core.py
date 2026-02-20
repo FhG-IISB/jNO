@@ -9,7 +9,7 @@ import cloudpickle
 import numpy as np
 import time
 from .trace import *
-from .utils import LearningRateSchedule, WeightSchedule, statistics, get_logger
+from .utils import LearningRateSchedule, WeightSchedule, statistics, get_logger, IREEModel
 from .domain import domain, DomainData
 from .trace_evaluator import TraceEvaluator
 from .core_utilities import CoreUtilities
@@ -108,9 +108,7 @@ class core(CoreUtilities):
             mesh_shape = (n_devices, 1)  # Pure data parallelism by default
 
         if mesh_shape[0] * mesh_shape[1] != n_devices:
-            self.log.warning(
-                f"mesh_shape {mesh_shape} doesn't match {n_devices} devices -> default back to (n_devices, 1)"
-            )
+            self.log.warning(f"mesh_shape {mesh_shape} doesn't match {n_devices} devices -> default back to (n_devices, 1)")
             mesh_shape = (n_devices, 1)
 
         self.mesh = Mesh(
@@ -199,9 +197,7 @@ class core(CoreUtilities):
         for expr in constraints:
             if isinstance(expr, (OperationDef, OperationCall)):
                 wrapped.append(expr)
-            elif isinstance(expr, Laplacian) and isinstance(
-                expr.target, (OperationDef, OperationCall)
-            ):
+            elif isinstance(expr, Laplacian) and isinstance(expr.target, (OperationDef, OperationCall)):
                 wrapped.append(expr)
             elif isinstance(expr, Placeholder):
                 wrapped.append(OperationDef(expr))
@@ -241,10 +237,7 @@ class core(CoreUtilities):
             constraint_weights = WeightSchedule([1.0] * n_constraints)
 
         if constraint_weights(0, jnp.array(n_constraints)).size != n_constraints:
-            raise ValueError(
-                f"WeightSchedule has {constraint_weights(0, jnp.array(n_constraints)).size} weights but "
-                f"{n_constraints} constraints were provided."
-            )
+            raise ValueError(f"WeightSchedule has {constraint_weights(0, jnp.array(n_constraints)).size} weights but " f"{n_constraints} constraints were provided.")
 
         return learning_rate, constraint_weights
 
@@ -302,17 +295,13 @@ class core(CoreUtilities):
         )
 
     # Training
-    def _make_loss_fn(
-        self, compiled_constraints, points_by_tag, tensor_tags, batchsize
-    ):
+    def _make_loss_fn(self, compiled_constraints, points_by_tag, tensor_tags, batchsize):
         """Create loss function - rng passed at call time."""
 
         def loss_fn(params, tag_weights, rng):
             losses = []
             for fn in compiled_constraints:
-                residual = fn(
-                    params, points_by_tag, tensor_tags, batchsize=batchsize, key=rng
-                )
+                residual = fn(params, points_by_tag, tensor_tags, batchsize=batchsize, key=rng)
                 mean_squared_residual = jnp.mean(residual)
                 losses.append(mean_squared_residual)
 
@@ -328,9 +317,7 @@ class core(CoreUtilities):
         def make_conditional_tracker(interval, fn):
             def conditional_fn(params, rng, epoch):
                 def compute_and_store():
-                    return fn(
-                        params, points_by_tag, tensor_tags, batchsize=batchsize, key=rng
-                    )
+                    return fn(params, points_by_tag, tensor_tags, batchsize=batchsize, key=rng)
 
                 # Only execute when condition is true
                 return jax.lax.cond(
@@ -341,9 +328,7 @@ class core(CoreUtilities):
 
             return conditional_fn
 
-        conditional_trackers = [
-            make_conditional_tracker(interval, fn) for interval, fn in compiled_trackers
-        ]
+        conditional_trackers = [make_conditional_tracker(interval, fn) for interval, fn in compiled_trackers]
 
         def track_fn(params, rng, epoch):
             return [tracker(params, rng, epoch) for tracker in conditional_trackers]
@@ -365,25 +350,14 @@ class core(CoreUtilities):
         print_rate = int(epochs / 100) if epochs < 100_000 else int(epochs / 1000)
 
         if len(compiled_trackers) > 0:
-            track_fn = self._make_track_fn(
-                compiled_trackers, points_by_tag, tensor_tags, batchsize
-            )
-        loss_fn = self._make_loss_fn(
-            compiled_constraints, points_by_tag, tensor_tags, batchsize
-        )
+            track_fn = self._make_track_fn(compiled_trackers, points_by_tag, tensor_tags, batchsize)
+        loss_fn = self._make_loss_fn(compiled_constraints, points_by_tag, tensor_tags, batchsize)
 
         def print_progress(epoch, individual_losses, track_stats, loss):
             """Host-side callback for progress printing."""
-            loss_strs = " | ".join(
-                [f"C{i}: {float(l):>10.4e}" for i, l in enumerate(individual_losses)]
-            )
+            loss_strs = " | ".join([f"C{i}: {float(l):>10.4e}" for i, l in enumerate(individual_losses)])
             if track_stats is not None:
-                track_strs = " | ".join(
-                    [
-                        f"T{i}: {float(jnp.mean(l)):>10.4e}"
-                        for i, l in enumerate(track_stats)
-                    ]
-                )
+                track_strs = " | ".join([f"T{i}: {float(jnp.mean(l)):>10.4e}" for i, l in enumerate(track_stats)])
                 print(
                     f"\rEpoch {int(epoch):>6}/{epochs}| L:{float(loss):>10.4e} | {loss_strs} | {track_strs}",
                     end="\n",
@@ -402,24 +376,16 @@ class core(CoreUtilities):
 
             def body_fn(_, carry):
                 params, opt_state, rng, total_loss, individual_losses, epoch = carry
-                tag_weights = self.constraint_weights(
-                    self._total_epochs + epoch, individual_losses
-                )
+                tag_weights = self.constraint_weights(self._total_epochs + epoch, individual_losses)
 
                 rng, step_rng = jax.random.split(rng)
 
                 def loss_wrapper(p):
                     return loss_fn(p, tag_weights, step_rng)
 
-                track_stats = (
-                    track_fn(params, step_rng, epoch)
-                    if len(compiled_trackers) > 0
-                    else None
-                )
+                track_stats = track_fn(params, step_rng, epoch) if len(compiled_trackers) > 0 else None
 
-                (total_loss, individual_losses), grads = jax.value_and_grad(
-                    loss_wrapper, has_aux=True
-                )(params)
+                (total_loss, individual_losses), grads = jax.value_and_grad(loss_wrapper, has_aux=True)(params)
                 updates, opt_state = optimizer.update(
                     grads,
                     opt_state,
@@ -430,9 +396,7 @@ class core(CoreUtilities):
                 )
 
                 lr = self.learning_rate(self._total_epochs + epoch, individual_losses)
-                opt_state[-1].hyperparams["step_size"] = jnp.asarray(
-                    lr, dtype=original_lr_dtype
-                )
+                opt_state[-1].hyperparams["step_size"] = jnp.asarray(lr, dtype=original_lr_dtype)
 
                 params = optax.apply_updates(params, updates)
 
@@ -458,9 +422,7 @@ class core(CoreUtilities):
                         "losses": individual_losses,
                         "weights": tag_weights,
                         "total_loss": jnp.sum(individual_losses),
-                        "track_stats": (
-                            track_stats if len(compiled_trackers) > 0 else [0]
-                        ),
+                        "track_stats": (track_stats if len(compiled_trackers) > 0 else [0]),
                     }
                 )
 
@@ -487,9 +449,7 @@ class core(CoreUtilities):
         tensor_dims = self.compute_tensor_dims(self.domain)
 
         # === Initialize parameters ===
-        self.params, self.layer_info, self.rng = TraceEvaluator.init_layer_params(
-            self.all_ops, self.domain_data.dimension, tensor_dims, self.rng, self.log
-        )
+        self.params, self.layer_info, self.rng = TraceEvaluator.init_layer_params(self.all_ops, self.domain_data.dimension, tensor_dims, self.rng, self.log)
 
         # === Apply sharding to params ===
         self.params = self._shard_params(self.params)
@@ -499,9 +459,7 @@ class core(CoreUtilities):
         self.compiled_constraints = []
         self.compiled_trackers = []
         for expr in constraints:
-            fn_expr = TraceEvaluator.compile_traced_expression(
-                expr, self.all_ops, self.layer_info
-            )
+            fn_expr = TraceEvaluator.compile_traced_expression(expr, self.all_ops, self.layer_info)
             if hasattr(expr, "expr"):
                 if isinstance(expr.expr, Tracker):
                     self.compiled_trackers.append((expr.expr.interval, fn_expr))
@@ -510,9 +468,7 @@ class core(CoreUtilities):
             else:
                 self.compiled_constraints.append(fn_expr)
 
-        self.log.info(
-            f"There are a total of {self.count(self.params)} trainable parameters in the network/s."
-        )
+        self.log.info(f"There are a total of {self.count(self.params)} trainable parameters in the network/s.")
         return None
 
     def solve(
@@ -563,25 +519,15 @@ class core(CoreUtilities):
         n_constraints = len(self.compiled_constraints)
         batchsize = batchsize if batchsize is not None else self.domain.total_samples
 
-        self.learning_rate = (
-            learning_rate if learning_rate is not None else LearningRateSchedule(1.0)
-        )
-        self.constraint_weights = (
-            constraint_weights
-            if constraint_weights is not None
-            else WeightSchedule([1.0 for _ in range(n_constraints)])
-        )
+        self.learning_rate = learning_rate if learning_rate is not None else LearningRateSchedule(1.0)
+        self.constraint_weights = constraint_weights if constraint_weights is not None else WeightSchedule([1.0 for _ in range(n_constraints)])
 
         if isinstance(optimizer, Callable):
             optimizer = optimizer(1.0)
         else:
-            self.log.warning(
-                "Optimizer should have learning rate 1.0 -> rates are set via learning_rate argument."
-            )
+            self.log.warning("Optimizer should have learning rate 1.0 -> rates are set via learning_rate argument.")
 
-        scale = optax.inject_hyperparams(optax.scale)(
-            step_size=self.learning_rate(0, jnp.zeros(n_constraints))
-        )
+        scale = optax.inject_hyperparams(optax.scale)(step_size=self.learning_rate(0, jnp.zeros(n_constraints)))
         optimizer = optax.chain(optimizer, scale)
 
         # === LoRA Setup ===
@@ -592,15 +538,11 @@ class core(CoreUtilities):
             self.rng, lora_key = jax.random.split(self.rng)
 
             # Initialize LoRA params
-            self._lora_params, lora_param_count, lora_layer_count = self._lora.init(
-                lora_key, self.params
-            )
+            self._lora_params, lora_param_count, lora_layer_count = self._lora.init(lora_key, self.params)
             self._lora_params = self._shard_params(self._lora_params)
 
             base_count = self.count(self.params)
-            self.log.info(
-                f"LoRA: {lora_layer_count} layers, {lora_param_count:,} params ({100*lora_param_count/base_count:.2f}% of base)"
-            )
+            self.log.info(f"LoRA: {lora_layer_count} layers, {lora_param_count:,} params ({100*lora_param_count/base_count:.2f}% of base)")
 
             # Optimizer on LoRA params only
             trainable_params = self._lora_params
@@ -620,9 +562,7 @@ class core(CoreUtilities):
         domain_data = DomainData(
             tensor_tags=self._replicate_for_devices(domain_data.tensor_tags, n_devices),
             dimension=domain_data.dimension,
-            points_by_tag=self._replicate_for_devices(
-                domain_data.points_by_tag, n_devices
-            ),
+            points_by_tag=self._replicate_for_devices(domain_data.points_by_tag, n_devices),
         )
         domain_data = DomainData(
             tensor_tags=self._shard_data(domain_data.tensor_tags),
@@ -656,9 +596,7 @@ class core(CoreUtilities):
 
         with self.mesh:
             train = jax.jit(lox.spool(train_fn))
-            self.log.info(
-                "Jit Tracing Training Function with mesh sharding - this might take a while"
-            )
+            self.log.info("Jit Tracing Training Function with mesh sharding - this might take a while")
             lowered = train.lower(trainable_params, opt_state, self.rng)
             compiled_train = lowered.compile()
             self._cost_analysis(compiled_train)
@@ -750,18 +688,14 @@ class core(CoreUtilities):
             # Single aggregated result
             flops = cost_analysis_list.get("flops", 0)
             bytes_accessed = cost_analysis_list.get("bytes accessed", 0)
-            self.log.info(
-                f"Performance : megaFLOPS: {flops / 1_000_000:.3f} | megaBYTES: {bytes_accessed / 1_000_000:.3f}"
-            )
+            self.log.info(f"Performance : megaFLOPS: {flops / 1_000_000:.3f} | megaBYTES: {bytes_accessed / 1_000_000:.3f}")
         elif isinstance(cost_analysis_list, list):
             # Per-device results
             for i, cost_analysis in enumerate(cost_analysis_list):
                 device = jax.devices()[i] if i < len(jax.devices()) else f"device_{i}"
                 flops = cost_analysis.get("flops", 0)
                 bytes_accessed = cost_analysis.get("bytes accessed", 0)
-                self.log.info(
-                    f"Performance: {device} | megaFLOPS: {flops / 1_000_000:.3f} | megaBYTES: {bytes_accessed / 1_000_000:.3f}"
-                )
+                self.log.info(f"Performance: {device} | megaFLOPS: {flops / 1_000_000:.3f} | megaBYTES: {bytes_accessed / 1_000_000:.3f}")
 
     def sweep(
         self,
@@ -795,16 +729,11 @@ class core(CoreUtilities):
         """
         Evaluates an operation.
         """
-
-        domain_data = (
-            self.domain_data if domain is None else self.prepare_domain_data(domain)
-        )
+        domain_data = self.domain_data if domain is None else self.prepare_domain_data(domain)
 
         # evaluator = TraceEvaluator(self.params, self.layer_info)
 
-        fn = TraceEvaluator.compile_traced_expression(
-            operation, self.all_ops, self.layer_info
-        )
+        fn = TraceEvaluator.compile_traced_expression(operation, self.all_ops, self.layer_info)
         result = fn(
             self.params,
             domain_data.points_by_tag,
@@ -813,8 +742,6 @@ class core(CoreUtilities):
             key=self.rng,
         )
         return result
-
-    # Save and Load
 
     def __getstate__(self):
         """Prepare state for pickling - remove unpicklable objects."""
