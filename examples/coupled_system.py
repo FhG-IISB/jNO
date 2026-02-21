@@ -43,7 +43,7 @@ jax.config.update("jax_enable_x64", False)  # or even better set $env:JAX_ENABLE
 
 
 import jno
-import jno.numpy as pnp
+import jno.numpy as jnn
 from jno import LearningRateSchedule as lrs
 from jno import WeightSchedule as ws
 from jno import sampler
@@ -53,8 +53,8 @@ import optax
 from flax import linen as nn
 from soap_jax import soap
 
-π = pnp.pi
-sin = pnp.sin
+π = jnn.pi
+sin = jnn.sin
 
 
 dire = "./runs/coupled_system"
@@ -142,7 +142,7 @@ xs, ys = domain.variable("sensor", 0.5 * jnp.ones((2, 1, 2)), point_data=True, s
 # The minimal required dimension is (B, ...).
 # Dimensions of shape 1 will be sqeezed out
 
-(k,) = domain.variable("k", jnp.array([[1.0], [1.0]]))  # shape = (2, 1)
+k = domain.variable("k", jnp.array([[1.0], [1.0]]))  # shape = (2, 1)
 
 # To plot the domain with its normals
 domain.plot(f"{dire}/train_domain.png")
@@ -171,7 +171,10 @@ class MLP(nn.Module):
 
 # Use a predefined MLP model for u.
 # Multiplication by x(1-x)y(1-y) hard-enforces homogeneous Dirichlet BCs.
-u_net = pnp.nn.mlp(hidden_dims=64, num_layers=2)
+u_net = jnn.nn.mlp(hidden_dims=64, num_layers=2)
+
+u_net.dont_show()  # Do not print out the model
+
 u = u_net(x, y) * x * (1 - x) * y * (1 - y)
 
 # Wrapper for flax.debug.print -> use _shape, _min, _val, _max, _mean
@@ -179,7 +182,7 @@ u = u_net(x, y) * x * (1 - x) * y * (1 - y)
 
 
 # Alternatively, wrap a custom Flax nn.Module for v.
-v_net = pnp.nn.wrap(MLP())
+v_net = jnn.nn.wrap(MLP())
 v = v_net(x, y, k)
 
 # The resulting neural networks can be combined freely
@@ -199,8 +202,8 @@ _v = sin(2 * π * x) * sin(π * y)
 
 # Define Laplacian operators.
 # Although the names differ, both currently use finite differences.
-Δfd = lambda inp: pnp.laplacian(inp, [x, y], scheme="finite_difference")
-Δad = lambda inp: pnp.laplacian(inp, [x, y], scheme="automatic_differentiation")
+Δfd = lambda inp: jnn.laplacian(inp, [x, y], scheme="finite_difference")
+Δad = lambda inp: jnn.laplacian(inp, [x, y], scheme="automatic_differentiation")
 
 # Interior PDE residuals
 pde1 = -Δfd(u(x, y)) + v(x, y, k) - (2 * π**2 * _u(x, y) + _v(x, y))
@@ -224,18 +227,21 @@ sens = u(xs, ys) - 1.0
 # pde1.debug._shape = True
 
 # Validation quantities can be tracked during training.
-# By assigning weight = 0.0, they do not contribute to the loss.
+# They do not contribute to the loss.
 # This also allows switching to purely data-driven training by
 # disabling the physics constraints.
-val1 = u(x, y) - _u(x, y)
-val2 = v(x, y, k) - _v(x, y)
+val1 = jnn.tracker(jnn.mean(u(x, y) - _u(x, y)), 100)
+val2 = jnn.tracker(jnn.mean(v(x, y, k) - _v(x, y)), 100)
 
 
 # -----------------------------------------------------------------------------
 # Problem instantiation
 # -----------------------------------------------------------------------------
 
-crux = jno.core([pde1, pde2, boc2, sens, val1, val2], domain)
+
+# To use the mean square error one has to add it manually
+# A mesh can be created for data or model parallelism
+crux = jno.core(constraints=[pde1.mse, pde2.mse, boc2.mse, sens.mse, val1, val2], domain=domain, rng_seed=42, mesh=(len(jax.devices()), 1))
 
 
 # -----------------------------------------------------------------------------
@@ -253,13 +259,19 @@ crux = jno.core([pde1, pde2, boc2, sens, val1, val2], domain)
 # Checkpoints (params, optimizer state, RNG) are saved automatically after every .solve call
 
 # Phase 1: Adam optimizer with warmup + cosine decay
-crux.solve(4000, optax.adam(1), lrs.warmup_cosine(4000, 500, 1e-3, 1e-4), ws([1.0, 1.0, 10.0, 1.0, 0.0, 0.0])).plot(f"{dire}/training_history_adam.png")
+crux.solve(4000, optax.adam(1), lrs.warmup_cosine(4000, 500, 1e-3, 1e-4), ws([1.0, 1.0, 10.0, 1.0])).plot(f"{dire}/training_history_adam.png")
+
+
+# Phase 1: Adam optimizer with gradient clipping
+crux.solve(4000, optax.chain(optax.adam(1), optax.clip_by_global_norm(1e-3)), lrs.warmup_cosine(4000, 500, 1e-3, 1e-4), ws([1.0, 1.0, 10.0, 1.0])).plot(f"{dire}/training_history_adam_with_clip.png")
+
 
 # Phase 2: SOAP optimizer with exponential decay and all weights are 1.0
 crux.solve(1000, soap(1, precondition_frequency=13), lrs(lambda e, _: 1e-4 * (5e-5 / 1e-4) ** (e / 1000))).plot(f"{dire}/training_history_soap.png")
 
+
 # Phase 3: L-BFGS refinement with adaptive boundary weighting
-crux.solve(1000, optax.lbfgs, lrs(5e-5), ws(lambda e, L: [1.0, 1.0, 10.0, 1.0 * L[3], 0.0, 0.0])).plot(f"{dire}/training_history_lbfgs.png")
+crux.solve(1000, optax.lbfgs, lrs(5e-5), ws(lambda e, L: [1.0, 1.0, 10.0, 1.0 * L[3]])).plot(f"{dire}/training_history_lbfgs.png")
 
 
 # -----------------------------------------------------------------------------

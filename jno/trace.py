@@ -63,13 +63,21 @@ class Debug:
             if self._val:
                 jax.debug.print("{name} -> {expr}", name=self.name, expr=expr)
             if self._shape:
-                jax.debug.print("{name}.shape -> {shape}", name=self.name, shape=expr.shape)
+                jax.debug.print(
+                    "{name}.shape -> {shape}", name=self.name, shape=expr.shape
+                )
             if self._mean:
-                jax.debug.print("{name}.mean -> {mean}", name=self.name, mean=jnp.mean(expr))
+                jax.debug.print(
+                    "{name}.mean -> {mean}", name=self.name, mean=jnp.mean(expr)
+                )
             if self._max:
-                jax.debug.print("{name}.max -> {max}", name=self.name, max=jnp.max(expr))
+                jax.debug.print(
+                    "{name}.max -> {max}", name=self.name, max=jnp.max(expr)
+                )
             if self._min:
-                jax.debug.print("{name}.min -> {min}", name=self.name, min=jnp.min(expr))
+                jax.debug.print(
+                    "{name}.min -> {min}", name=self.name, min=jnp.min(expr)
+                )
         else:
             # Multiple options enabled - print name once, then values without name
             jax.debug.print("{name} ->", name=self.name)
@@ -122,6 +130,36 @@ class Placeholder:
     with different inputs. Concrete values are only produced when evaluated by
     the solver/visualizer.
     """
+
+    def __gt__(self, other):
+        return FunctionCall(jnp.greater, [self, other])
+
+    def __lt__(self, other):
+        return FunctionCall(jnp.less, [self, other])
+
+    def __ge__(self, other):
+        return FunctionCall(jnp.greater_equal, [self, other])
+
+    def __le__(self, other):
+        return FunctionCall(jnp.less_equal, [self, other])
+
+    def __eq__(self, other):
+        return FunctionCall(jnp.equal, [self, other])
+
+    def __ne__(self, other):
+        return FunctionCall(jnp.not_equal, [self, other])
+
+    def __rgt__(self, other):
+        return FunctionCall(jnp.less, [other, self])
+
+    def __rlt__(self, other):
+        return FunctionCall(jnp.greater, [other, self])
+
+    def __rge__(self, other):
+        return FunctionCall(jnp.less_equal, [other, self])
+
+    def __rle__(self, other):
+        return FunctionCall(jnp.greater_equal, [other, self])
 
     def _wrap(self, other):
         """Wrap non-Placeholder types."""
@@ -177,6 +215,26 @@ class Placeholder:
             self._auto_op = OperationDef(self)
         return self._auto_op(*args)
 
+    def __matmul__(self, other):
+        """Matrix multiplication: self @ other"""
+        other = self._wrap(other)
+
+        # symbolic path
+        if isinstance(other, Placeholder):
+            return FunctionCall(lambda a, b: a @ b, [self, other])
+
+        # eager path (other is ndarray)
+        return FunctionCall(lambda a: a @ other, [self])
+
+    def __rmatmul__(self, other):
+        """Matrix multiplication: other @ self"""
+        other = self._wrap(other)
+
+        if isinstance(other, Placeholder):
+            return FunctionCall(lambda a, b: a @ b, [other, self])
+
+        return FunctionCall(lambda b: other @ b, [self])
+
     def reshape(self, *shape):
         """Reshape this placeholder to a new shape.
 
@@ -190,6 +248,48 @@ class Placeholder:
         if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
             shape = tuple(shape[0])
         return Reshape(self, shape)
+
+    @property
+    def shape(self):
+        return FunctionCall(
+            lambda x: jnp.ones(x.shape, dtype="bool"), [self], "shape", True
+        )
+
+    @property
+    def mean(self):
+        return FunctionCall(lambda x: jnp.squeeze(x.mean()), [self], "mean", True)
+
+    @property
+    def sum(self):
+        return FunctionCall(lambda x: jnp.squeeze(jnp.sum(x)), [self], "sum", True)
+
+    @property
+    def min(self):
+        return FunctionCall(lambda x: jnp.squeeze(jnp.min(x)), [self], "min", True)
+
+    @property
+    def max(self):
+        return FunctionCall(lambda x: jnp.squeeze(jnp.max(x)), [self], "max", True)
+
+    @property
+    def std(self):
+        return FunctionCall(lambda x: jnp.squeeze(jnp.std(x)), [self], "std", True)
+
+    @property
+    def mse(self):
+        return FunctionCall(
+            lambda x: jnp.squeeze(jnp.mean(jnp.square(x))), [self], "mse", True
+        )
+
+    @property
+    def mae(self):
+        return FunctionCall(
+            lambda x: jnp.squeeze(jnp.mean(jnp.abs(x))), [self], "mae", True
+        )
+
+    @property
+    def T(self):
+        return FunctionCall(lambda x: x.T, [self], "transpose", True)
 
 
 class Reshape(Placeholder):
@@ -227,22 +327,36 @@ class Concat(Placeholder):
 
 
 class FunctionCall(Placeholder):
-    """Call to a pure function over traced args.
+    """Call to a pure function over traced args."""
 
-    Captures the callable, its inputs, an optional display name, and whether it
-    reduces a specific axis (used for shape inference and visualization).
-    """
-
-    def __init__(self, fn: Callable, args: tuple, name: str = None, reduces_axis: int = None):
+    def __init__(
+        self,
+        fn: Callable,
+        args: tuple,
+        name: str = None,
+        reduces_axis: int = None,
+        kwargs: Dict = None,
+    ):
         self.fn = fn
-        self.args = args
-        self._name = name  # Optional explicit name for display/inference
-        self.reduces_axis = reduces_axis  # If set, this function reduces along this axis
+        self.args = args if isinstance(args, (list, tuple)) else [args]
+        self._name = name
+        self.reduces_axis = reduces_axis
+        self.kwargs = kwargs
 
     def __repr__(self):
         name = self._name or getattr(self.fn, "__name__", str(self.fn))
         args_str = ", ".join(str(a) for a in self.args)
         return f"{name}({args_str})"
+
+    def copy_with_args(self, new_args):
+        """Create a new instance with different args."""
+        return FunctionCall(
+            fn=self.fn, args=new_args, name=self._name, reduces_axis=self.reduces_axis
+        )
+
+    def __call__(self, args):
+        """Return a new FunctionCall with the given args."""
+        return self.copy_with_args([args])
 
 
 class Literal(Placeholder):
@@ -314,7 +428,16 @@ class ConstantNamespace:
             # Check if it contains dicts (don't convert to array)
             if any(isinstance(item, dict) for item in value):
                 # Convert each dict to ConstantNamespace, keep others as-is
-                return [ConstantNamespace(f"{key}[{i}]", item, _parent_tag=parent_tag) if isinstance(item, dict) else ConstantNamespace._convert_value(item, f"{key}[{i}]", parent_tag) for i, item in enumerate(value)]
+                return [
+                    (
+                        ConstantNamespace(f"{key}[{i}]", item, _parent_tag=parent_tag)
+                        if isinstance(item, dict)
+                        else ConstantNamespace._convert_value(
+                            item, f"{key}[{i}]", parent_tag
+                        )
+                    )
+                    for i, item in enumerate(value)
+                ]
             # Check if it's numeric (could be nested arrays)
             if ConstantNamespace._is_numeric_sequence(value):
                 return jnp.asarray(value)
@@ -392,7 +515,10 @@ class ConstantNamespace:
             return self._load_npy(path)
 
         else:
-            raise ValueError(f"Unsupported file format: '{suffix}'. " f"Supported formats: .json, .yaml, .yml, .toml, .pkl, .pickle, .npz, .npy")
+            raise ValueError(
+                f"Unsupported file format: '{suffix}'. "
+                f"Supported formats: .json, .yaml, .yml, .toml, .pkl, .pickle, .npz, .npy"
+            )
 
     @staticmethod
     def _load_json(path: Path) -> dict:
@@ -406,7 +532,10 @@ class ConstantNamespace:
         try:
             import yaml
         except ImportError:
-            raise ImportError("PyYAML is required to load .yaml/.yml files. " "Install with: pip install pyyaml")
+            raise ImportError(
+                "PyYAML is required to load .yaml/.yml files. "
+                "Install with: pip install pyyaml"
+            )
 
         with open(path, "r") as f:
             return yaml.safe_load(f)
@@ -427,7 +556,10 @@ class ConstantNamespace:
                 with open(path, "r") as f:
                     return toml.load(f)
             except ImportError:
-                raise ImportError("toml package is required to load .toml files. " "Install with: pip install toml")
+                raise ImportError(
+                    "toml package is required to load .toml files. "
+                    "Install with: pip install toml"
+                )
 
     @staticmethod
     def _load_pickle(path: Path) -> dict:
@@ -437,7 +569,9 @@ class ConstantNamespace:
         with open(path, "rb") as f:
             data = pickle.load(f)
         if not isinstance(data, dict):
-            raise TypeError(f"Pickle file must contain a dict, got {type(data).__name__}")
+            raise TypeError(
+                f"Pickle file must contain a dict, got {type(data).__name__}"
+            )
         return data
 
     @staticmethod
@@ -470,7 +604,10 @@ class ConstantNamespace:
 
         if key not in self._data:
             available = list(self._data.keys())
-            raise AttributeError(f"Constant '{self._full_tag}' has no key '{key}'. " f"Available keys: {available}")
+            raise AttributeError(
+                f"Constant '{self._full_tag}' has no key '{key}'. "
+                f"Available keys: {available}"
+            )
 
         value = self._data[key]
 
@@ -520,7 +657,10 @@ class ConstantNamespace:
             elif isinstance(value, jnp.ndarray):
                 result[key] = value
             elif isinstance(value, list):
-                result[key] = [item.to_dict() if isinstance(item, ConstantNamespace) else item for item in value]
+                result[key] = [
+                    item.to_dict() if isinstance(item, ConstantNamespace) else item
+                    for item in value
+                ]
             else:
                 result[key] = value
         return result
@@ -579,9 +719,17 @@ class Variable(Placeholder):
         self.tag = tag
         self.dim = dim
         if tag in domain.sampled_points.keys():
-            self.size = dim[1] - dim[0] if dim[1] is not None else domain.sampled_points[tag].shape[-1]
+            self.size = (
+                dim[1] - dim[0]
+                if dim[1] is not None
+                else domain.sampled_points[tag].shape[-1]
+            )
         else:
-            self.size = dim[1] - dim[0] if dim[1] is not None else domain.tensor_tags[tag].shape[-1]
+            self.size = (
+                dim[1] - dim[0]
+                if dim[1] is not None
+                else domain.tensor_tags[tag].shape[-1]
+            )
         self._domain = domain  # Reference to parent domain for inference
 
     def __repr__(self):
@@ -806,7 +954,9 @@ class OperationDef(Placeholder):
             elif isinstance(node, Concat):
                 return any(visit(item) for item in node.items)
             elif isinstance(node, FunctionCall):
-                return any(visit(arg) for arg in node.args if isinstance(arg, Placeholder))
+                return any(
+                    visit(arg) for arg in node.args if isinstance(arg, Placeholder)
+                )
             elif isinstance(node, OperationCall):
                 return node.operation.has_trainable
             elif isinstance(node, Slice):
@@ -825,7 +975,10 @@ class OperationDef(Placeholder):
         n_vars = len(self._collected_vars)
         if len(args) > n_vars:
             var_names = [str(v) for v in self._collected_vars]
-            raise ValueError(f"Op[{self.op_id}] has {n_vars} variable(s) {var_names}, " f"but {len(args)} argument(s) were passed: {[str(a) for a in args]}")
+            raise ValueError(
+                f"Op[{self.op_id}] has {n_vars} variable(s) {var_names}, "
+                f"but {len(args)} argument(s) were passed: {[str(a) for a in args]}"
+            )
         # Fill in missing args from original variables
         if len(args) < n_vars:
             args = args + tuple(self._collected_vars[len(args) :])
@@ -853,7 +1006,12 @@ class OperationCall(Placeholder):
 class Laplacian(Placeholder):
     """Laplacian operator on an operation call."""
 
-    def __init__(self, target: OperationCall, variables: List[Variable], scheme: str = "automatic_differentiation"):
+    def __init__(
+        self,
+        target: OperationCall,
+        variables: List[Variable],
+        scheme: str = "automatic_differentiation",
+    ):
         self.target = target
         self.variables = variables
         self.scheme = scheme  # 'automatic_differentiation' or 'finite_difference'
@@ -866,7 +1024,12 @@ class Laplacian(Placeholder):
 class Gradient(Placeholder):
     """Gradient operator on an operation call."""
 
-    def __init__(self, target: OperationCall, variable: Variable, scheme: str = "automatic_differentiation"):
+    def __init__(
+        self,
+        target: OperationCall,
+        variable: Variable,
+        scheme: str = "automatic_differentiation",
+    ):
         self.target = target
         self.variable = variable
         self.scheme = scheme  # 'automatic_differentiation' or 'finite_difference'
@@ -878,7 +1041,12 @@ class Gradient(Placeholder):
 class Hessian(Placeholder):
     """Hessian matrix operator (matrix of second derivatives)."""
 
-    def __init__(self, target: OperationCall, variables: List[Variable], scheme: str = "automatic_differentiation"):
+    def __init__(
+        self,
+        target: OperationCall,
+        variables: List[Variable],
+        scheme: str = "automatic_differentiation",
+    ):
         self.target = target
         self.variables = variables
         self.scheme = scheme  # 'automatic_differentiation' or 'finite_difference'
@@ -891,7 +1059,12 @@ class Hessian(Placeholder):
 class Jacobian(Placeholder):
     """Jacobian matrix operator (matrix of second derivatives)."""
 
-    def __init__(self, target: OperationCall, variables: List[Variable], scheme: str = "automatic_differentiation"):
+    def __init__(
+        self,
+        target: OperationCall,
+        variables: List[Variable],
+        scheme: str = "automatic_differentiation",
+    ):
         self.target = target
         self.variables = variables
         self.scheme = scheme  # 'automatic_differentiation' or 'finite_difference'
@@ -950,11 +1123,6 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
             visit(node.target)
         elif isinstance(node, Slice):
             visit(node.target)
-        elif isinstance(node, EulerResiduals):
-            visit(node.rho)
-            visit(node.u)
-            visit(node.v)
-            visit(node.p)
 
     visit(expr)
     return ops
@@ -1000,11 +1168,6 @@ def collect_tags(expr: Placeholder) -> set:
                 visit(v)
         elif isinstance(node, Slice):
             visit(node.target)
-        elif isinstance(node, EulerResiduals):  # ADD THIS
-            visit(node.rho)
-            visit(node.u)
-            visit(node.v)
-            visit(node.p)
 
     visit(expr)
     return tags
@@ -1014,39 +1177,3 @@ def get_primary_tag(expr: Placeholder) -> Optional[str]:
     """Get the primary tag for a constraint."""
     tags = collect_tags(expr)
     return next(iter(tags)) if tags else None
-
-
-# =============================================================================
-# Poseidon
-# =============================================================================
-
-
-class EulerResiduals(Placeholder):
-    """
-    Computes 2D compressible Euler equation residuals using finite differences.
-
-    Equations:
-        E = 0.5 * ρ * (u² + v²) + p / (γ - 1)  # Total energy
-
-        con1 = ∂ρ/∂t + ∂(ρu)/∂x + ∂(ρv)/∂y = 0           # Continuity
-        con2 = ∂(ρu)/∂t + ∂(ρu² + p)/∂x + ∂(ρuv)/∂y = 0  # x-momentum
-        con3 = ∂(ρv)/∂t + ∂(ρuv)/∂x + ∂(ρv² + p)/∂y = 0  # y-momentum
-        con4 = ∂E/∂t + ∂((E+p)u)/∂x + ∂((E+p)v)/∂y = 0   # Energy
-
-    Input fields shape: (T, H, W) = (21, 128, 128)
-    Output shape: (T-2, H-2, W-2, 4) for interior points
-    """
-
-    def __init__(self, rho: Placeholder, u: Placeholder, v: Placeholder, p: Placeholder, rho0: Placeholder, u0: Placeholder, v0: Placeholder, p0: Placeholder, n_substeps: int):
-        self.rho = rho
-        self.u = u
-        self.v = v
-        self.p = p
-        self.rho0 = rho0
-        self.u0 = u0
-        self.v0 = v0
-        self.p0 = p0
-        self.n_substeps = n_substeps
-
-    def __repr__(self):
-        return f"EulerResiduals(ρ={self.rho}, u={self.u}, v={self.v}, p={self.p})"

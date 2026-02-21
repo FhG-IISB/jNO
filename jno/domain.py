@@ -931,9 +931,10 @@ class MeshUtils:
         _bp = points[non_boundary_indices]
 
         mesh_connectivity["boundary_points"] = bp
-        if dimension > 1:  # TODO temporary fix -> hardencode for 1D geometries
-            bpe = MeshUtils.extract_boundary_edges(mesh.cells_dict["triangle"], len(bp))
-            mesh_connectivity["VM"] = MeshUtils.get_visibility_matrix_raytrace(bp, bpe, _bp[0], 40)
+        # TODO temporary fix -> hardencode for 1D geometries
+        # bpe = MeshUtils.extract_boundary_edges(mesh.cells_dict["triangle"], len(bp))
+        # mesh_connectivity["VM"] = MeshUtils.get_visibility_matrix_raytrace(bp, bpe, _bp[0], 40)
+        mesh_connectivity["VM"] = MeshUtils.get_visibility_matrix_ordered(bp, _bp[0])
 
         msg = f"Preprocessed mesh connectivity: {n_points} points, {len(elements)} {element_type}"
 
@@ -1645,31 +1646,35 @@ class MeshUtils:
 
         n_pts = P.shape[0]
 
-        v = P[None, :, :] - P[:, None, :]  # (N,N,2), x_j - x_i
-        r = jnp.linalg.norm(v, axis=-1)  # (N,N)
+        v = P[None, :, :] - P[:, None, :]
+        r = jnp.linalg.norm(v, axis=-1)
 
-        # avoid divide by zero only on diagonal
         r_safe = r + jnp.eye(n_pts)
-        r_hat = v / r_safe[..., None]  # (N,N,2)
+        r_hat = v / r_safe[..., None]
 
-        # cosines
-        cos_i = jnp.sum(Nrm[:, None, :] * r_hat, axis=-1)  # (N,N)
-        cos_j = -jnp.sum(Nrm[None, :, :] * r_hat, axis=-1)  # (N,N)
+        cos_i = jnp.sum(Nrm[:, None, :] * r_hat, axis=-1)
+        cos_j = -jnp.sum(Nrm[None, :, :] * r_hat, axis=-1)
 
-        # physical clipping
         cos_i = jnp.maximum(0.0, cos_i)
         cos_j = jnp.maximum(0.0, cos_j)
 
-        # kernel
-        F_ij = (cos_i * cos_j) / (2.0 * r_safe)  # 2D formula
-
-        # apply visibility
+        F_ij = (cos_i * cos_j) / (2.0 * r_safe)
         F_ij = F_ij * VM
+        F_ij = F_ij * (1 - jnp.eye(n_pts))
 
-        # total view factor from i
-        F = jnp.sum(F_ij * ds[None, :], axis=1)
+        # include quadrature weights
+        F_op = F_ij * ds[None, :]
 
-        return F
+        # enforce row sum = 1
+        row_sum = jnp.sum(F_op, axis=1, keepdims=True)
+        F_op = F_op / row_sum
+
+        return F_op
+
+    @staticmethod
+    def get_view_factor_1d(P, VM, Nrm, ds):
+        n_pts = P.shape[0]
+        return jnp.ones(n_pts)
 
     @staticmethod
     def precompute_p1_line_geometry(points, elements):
@@ -1939,7 +1944,7 @@ class domain(MeshUtils, Geometries):
             mesh, explicit_dim, ds = geometry_func(geo)
 
             if not isinstance(mesh, meshio.Mesh):
-                mesh = geo.generate_mesh(dim=explicit_dim, algorithm=algorithm, verbose=True)
+                mesh = geo.generate_mesh(dim=explicit_dim, algorithm=algorithm, verbose=False)
 
         self.mesh = mesh
         self.dimension = explicit_dim
@@ -1980,6 +1985,9 @@ class domain(MeshUtils, Geometries):
             right_boundary = np.where(points[:, 0] == np.max(points[:, 0]))[0]
 
             boundary_indices = np.stack([left_boundary, right_boundary]).flatten()
+            index_to_normal_pos = {int(idx): int(pos) for pos, idx in enumerate(boundary_indices)}
+
+            boundary_normals = np.array([[-1], [1]])
 
         if hasattr(mesh, "cell_sets") and mesh.cell_sets:
             for name, cell_data in mesh.cell_sets.items():
@@ -2018,7 +2026,7 @@ class domain(MeshUtils, Geometries):
                     # Map indices_list to positions in boundary_normals
                     # if all indices in indices_list are also in boundary_indices
                     missing = set(indices_list) - set(index_to_normal_pos.keys())
-                    if not missing and self.dimension > 1:
+                    if not missing:
                         normal_positions = np.array([index_to_normal_pos[i] for i in indices_list])
                         self.normals_by_tag[name] = boundary_normals[normal_positions]
 
@@ -2170,16 +2178,12 @@ class domain(MeshUtils, Geometries):
             subset_indices = np.array([point_to_idx[tuple(pt)] for pt in subset_bp])
             subset_VM = all_VM[np.ix_(subset_indices, subset_indices)]
 
+            if self.dimension == 1:
+                VF = self.get_view_factor_1d(P, subset_VM, Nrm, ds)
             if self.dimension == 2:
                 VF = self.get_view_factor_2d(P, subset_VM, Nrm, ds)
             elif self.dimension == 3:
                 VF = self.get_view_factor_3d(P, subset_VM, Nrm, ds)
-
-            import matplotlib.pyplot as plt
-
-            plt.figure()
-            plt.scatter(P[:, 0], P[:, 1], c=VF)
-            plt.savefig("b.png")
 
             # TODO: Fix if used for multiple domains !
             # self.sampled_points[f"v_{tag}"] = VM
@@ -2195,7 +2199,10 @@ class domain(MeshUtils, Geometries):
         if return_indices:
             coord_vars += [idx]
 
-        return tuple(coord_vars)
+        if len(coord_vars) > 1:
+            return tuple(coord_vars)
+        else:
+            return coord_vars[0]
 
     def __getitem__(self, tag: str) -> Tuple[Variable, ...]:
         """Shorthand for domain.variable(tag).

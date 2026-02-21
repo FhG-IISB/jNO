@@ -13,7 +13,6 @@ dependencies = [
     "lox @ git+https://github.com/huterguier/lox",
     "soap_jax @ git+https://github.com/haydn-jones/SOAP_JAX",
     "jaxkan",
-
     "numpy",
     "matplotlib",
     "graphviz",
@@ -30,7 +29,10 @@ cuda = [
 dev = ["pytest>=7.0", "black>=22.0", "flake8>=4.0", "mypy>=0.950"]
 
 [tool.setuptools]
-py-modules = ['jno']
+packages = ["jno"]
+
+[tool.setuptools.package-data]
+jno = ["py.typed"]
 
 [tool.uv.workspace]
 members = [

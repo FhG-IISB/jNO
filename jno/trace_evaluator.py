@@ -15,143 +15,6 @@ import jax.numpy as jnp
 from jax import vmap
 
 
-class EulerResidualsDiff:
-
-    @staticmethod
-    def compute_euler_residuals(rho: jnp.ndarray, u: jnp.ndarray, v: jnp.ndarray, p: jnp.ndarray, rho_0: jnp.ndarray, u_0: jnp.ndarray, v_0: jnp.ndarray, p_0: jnp.ndarray, n_substeps: int = 4) -> jnp.ndarray:
-        """
-        Compute 2D compressible Euler equation residuals for each time interval.
-
-        For each interval i (from t=i to t=i+1):
-            - Initial condition: (rho_0[i], u_0[i], v_0[i], p_0[i])
-            - Target (prediction): (rho[i], u[i], v[i], p[i])
-            - Linearly interpolate n_substeps between them
-            - Compute residuals at each sub-step
-
-        Args:
-            rho: Predicted density, shape (21, H, W)
-            u: Predicted x-velocity, shape (21, H, W)
-            v: Predicted y-velocity, shape (21, H, W)
-            p: Predicted pressure, shape (21, H, W)
-            rho_0: Initial density, shape (21, H, W)
-            u_0: Initial x-velocity, shape (21, H, W)
-            v_0: Initial y-velocity, shape (21, H, W)
-            p_0: Initial pressure, shape (21, H, W)
-            n_substeps: Number of sub-steps within each interval (>=2)
-
-        Returns:
-            Residuals, shape (21, n_substeps-2, H, W, 4)
-            Or if flattened: (21 * (n_substeps-2), H, W, 4)
-        """
-
-        # Physical parameters
-        dt_interval = 1.0 / 20.0  # Time between consecutive predictions
-        dt = dt_interval / (n_substeps - 1)  # Sub-step size
-        dx = 1.0 / 128.0
-        dy = 1.0 / 128.0
-        gamma = 1.4
-
-        def compute_interval_residuals(rho_start, u_start, v_start, p_start, rho_end, u_end, v_end, p_end):
-            """
-            Compute residuals for a single interval [t, t+1].
-
-            Args:
-                *_start: Initial condition at t, shape (H, W)
-                *_end: Prediction at t+1, shape (H, W)
-
-            Returns:
-                Residuals at interior sub-steps, shape (n_substeps-2, H, W, 4)
-            """
-
-            # Create sub-step interpolation weights: [0, 1/(n-1), 2/(n-1), ..., 1]
-            alphas = jnp.linspace(0.0, 1.0, n_substeps)  # (n_substeps,)
-            alphas = alphas[:, None, None]  # (n_substeps, 1, 1) for broadcasting
-
-            # Linearly interpolate between start and end for each sub-step
-            # Shape: (n_substeps, H, W)
-            rho_sub = (1.0 - alphas) * rho_start + alphas * rho_end
-            u_sub = (1.0 - alphas) * u_start + alphas * u_end
-            v_sub = (1.0 - alphas) * v_start + alphas * v_end
-            p_sub = (1.0 - alphas) * p_start + alphas * p_end
-
-            # Compute derived quantities
-            rho_u = rho_sub * u_sub
-            rho_v = rho_sub * v_sub
-            E = 0.5 * rho_sub * (u_sub**2 + v_sub**2) + p_sub / (gamma - 1.0)
-
-            # Fluxes
-            flux_x_mom_x = rho_u * u_sub + p_sub  # ρu² + p
-            flux_x_mom_y = rho_u * v_sub  # ρuv
-            flux_y_mom_x = rho_v * u_sub  # ρvu
-            flux_y_mom_y = rho_v * v_sub + p_sub  # ρv² + p
-
-            E_plus_p = E + p_sub
-            flux_E_x = E_plus_p * u_sub
-            flux_E_y = E_plus_p * v_sub
-
-            # Finite difference coefficients
-            inv_2dt = 1.0 / (2.0 * dt)
-            inv_2dx = 1.0 / (2.0 * dx)
-            inv_2dy = 1.0 / (2.0 * dy)
-
-            def d_dx(f):
-                return (jnp.roll(f, -1, axis=-1) - jnp.roll(f, 1, axis=-1)) * inv_2dx
-
-            def d_dy(f):
-                return (jnp.roll(f, -1, axis=-2) - jnp.roll(f, 1, axis=-2)) * inv_2dy
-
-            # Time derivatives at interior points (indices 1 to n_substeps-2)
-            # Central difference: (f[i+1] - f[i-1]) / (2*dt)
-            drho_dt = (rho_sub[2:] - rho_sub[:-2]) * inv_2dt
-            drhou_dt = (rho_u[2:] - rho_u[:-2]) * inv_2dt
-            drhov_dt = (rho_v[2:] - rho_v[:-2]) * inv_2dt
-            dE_dt = (E[2:] - E[:-2]) * inv_2dt
-
-            # Spatial derivatives at interior points
-            drhou_dx = d_dx(rho_u[1:-1])
-            drhov_dy = d_dy(rho_v[1:-1])
-
-            dflux_x_mom_x_dx = d_dx(flux_x_mom_x[1:-1])
-            dflux_x_mom_y_dy = d_dy(flux_x_mom_y[1:-1])
-
-            dflux_y_mom_x_dx = d_dx(flux_y_mom_x[1:-1])
-            dflux_y_mom_y_dy = d_dy(flux_y_mom_y[1:-1])
-
-            dflux_E_x_dx = d_dx(flux_E_x[1:-1])
-            dflux_E_y_dy = d_dy(flux_E_y[1:-1])
-
-            # Residuals
-            con1 = drho_dt + drhou_dx + drhov_dy
-            con2 = drhou_dt + dflux_x_mom_x_dx + dflux_x_mom_y_dy
-            con3 = drhov_dt + dflux_y_mom_x_dx + dflux_y_mom_y_dy
-            con4 = dE_dt + dflux_E_x_dx + dflux_E_y_dy
-
-            # Shape: (n_substeps-2, H, W, 4)
-            return jnp.stack([con1, con2, con3, con4], axis=-1)
-
-        # Vectorize over all 21 intervals
-        # Each interval i: from rho_0[i] to rho[i]
-        compute_all_intervals = vmap(compute_interval_residuals)
-
-        residuals = compute_all_intervals(rho_0, u_0, v_0, p_0, rho, u, v, p)  # Start of each interval: (21, H, W)  # End of each interval: (21, H, W)
-
-        # Shape: (21, n_substeps-2, H, W, 4)
-        return residuals
-
-    @staticmethod
-    def compute_euler_residuals_flat(rho: jnp.ndarray, u: jnp.ndarray, v: jnp.ndarray, p: jnp.ndarray, rho_0: jnp.ndarray, u_0: jnp.ndarray, v_0: jnp.ndarray, p_0: jnp.ndarray, n_substeps: int = 4) -> jnp.ndarray:
-        """
-        Same as compute_euler_residuals but returns flattened output.
-
-        Returns:
-            Residuals, shape (21 * (n_substeps-2), H, W, 4)
-        """
-        residuals = EulerResidualsDiff.compute_euler_residuals(rho, u, v, p, rho_0, u_0, v_0, p_0, n_substeps)
-        # Reshape from (21, n_substeps-2, H, W, 4) to (21*(n_substeps-2), H, W, 4)
-        n_intervals, n_interior, H, W, n_eqs = residuals.shape
-        return residuals.reshape(n_intervals * n_interior, H, W, n_eqs)
-
-
 # ============================================================
 # Finite Difference helpers
 # ============================================================
@@ -184,9 +47,19 @@ class DifferentialOperators:
     def compute_fd_gradient_3d_simple(u_values: jnp.ndarray, points: jnp.ndarray, tetrahedra: np.ndarray, dim: int) -> jnp.ndarray:
         n_points = len(u_values)
         tetrahedra = jnp.array(tetrahedra)
-        i_idx, j_idx, k_idx, l_idx = tetrahedra[:, 0], tetrahedra[:, 1], tetrahedra[:, 2], tetrahedra[:, 3]
+        i_idx, j_idx, k_idx, l_idx = (
+            tetrahedra[:, 0],
+            tetrahedra[:, 1],
+            tetrahedra[:, 2],
+            tetrahedra[:, 3],
+        )
         p0, p1, p2, p3 = points[i_idx], points[j_idx], points[k_idx], points[l_idx]
-        u0, u1, u2, u3 = u_values[i_idx], u_values[j_idx], u_values[k_idx], u_values[l_idx]
+        u0, u1, u2, u3 = (
+            u_values[i_idx],
+            u_values[j_idx],
+            u_values[k_idx],
+            u_values[l_idx],
+        )
         v1, v2, v3 = p1 - p0, p2 - p0, p3 - p0
         volumes = jnp.abs(v1[:, 0] * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1]) - v1[:, 1] * (v2[:, 0] * v3[:, 2] - v2[:, 2] * v3[:, 0]) + v1[:, 2] * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0])) / 6.0
         if dim == 0:
@@ -442,7 +315,14 @@ class TraceEvaluator:
         self.log = get_logger()
         self._logged_schemes = {}
 
-    def evaluate(self, expr: Placeholder, points_by_tag: Dict[str, jnp.ndarray], var_bindings: Dict = None, tensor_tags: Dict[str, jnp.ndarray] = None, key: jax.random.PRNGKey = None) -> jnp.ndarray:
+    def evaluate(
+        self,
+        expr: Placeholder,
+        points_by_tag: Dict[str, jnp.ndarray],
+        var_bindings: Dict = None,
+        tensor_tags: Dict[str, jnp.ndarray] = None,
+        key: jax.random.PRNGKey = None,
+    ) -> jnp.ndarray:
         """Evaluate expression for a SINGLE batch (no batch dimension)."""
         var_bindings = var_bindings or {}
         tensor_tags = tensor_tags or {}
@@ -499,7 +379,8 @@ class TraceEvaluator:
                 return jnp.asarray(tensor_tags[tag])
 
             else:
-                raise KeyError(f"Variable tag '{tag}' not found. " f"points_by_tag:  {list(points_by_tag.keys())}, " f"tensor_tags: {list(tensor_tags.keys())}")
+                self.log.error(f"Variable tag '{tag}' not found. points_by_tag:  {list(points_by_tag.keys())}, tensor_tags: {list(tensor_tags.keys())}")
+                exit()
 
         # ----------------------------------------------------------
         # Concat:  concatenate along last axis
@@ -517,7 +398,7 @@ class TraceEvaluator:
         # FunctionCall:  evaluate args, call fn
         # ----------------------------------------------------------
         elif isinstance(expr, FunctionCall):
-            args = [self.evaluate(arg, points_by_tag, var_bindings, tensor_tags, key) if isinstance(arg, Placeholder) else arg for arg in expr.args]
+            args = [(self.evaluate(arg, points_by_tag, var_bindings, tensor_tags, key) if isinstance(arg, Placeholder) else arg) for arg in expr.args]
             # Check if function accepts 'key' parameter
             sig = inspect.signature(expr.fn)
             if "key" in sig.parameters:
@@ -556,7 +437,13 @@ class TraceEvaluator:
         elif isinstance(expr, BinaryOp):
             left = self.evaluate(expr.left, points_by_tag, var_bindings, tensor_tags, key)
             right = self.evaluate(expr.right, points_by_tag, var_bindings, tensor_tags, key)
-            ops = {"+": jnp.add, "-": jnp.subtract, "*": jnp.multiply, "/": jnp.divide, "**": jnp.power}
+            ops = {
+                "+": jnp.add,
+                "-": jnp.subtract,
+                "*": jnp.multiply,
+                "/": jnp.divide,
+                "**": jnp.power,
+            }
 
             res = ops[expr.op](left, right)
             expr.debug(res)
@@ -763,7 +650,10 @@ class TraceEvaluator:
                     grad_full = DifferentialOperators.compute_fd_gradient_3d_simple(u_full, mesh_points, domain.mesh_connectivity["tetrahedra"], dim)
 
                 # Map back to sampled points
-                dists = jnp.sum((mesh_points[jnp.newaxis, :, :] - points[:, jnp.newaxis, :]) ** 2, axis=-1)
+                dists = jnp.sum(
+                    (mesh_points[jnp.newaxis, :, :] - points[:, jnp.newaxis, :]) ** 2,
+                    axis=-1,
+                )
                 vertex_indices = jnp.argmin(dists, axis=1)
                 return grad_full[vertex_indices]
 
@@ -842,10 +732,18 @@ class TraceEvaluator:
                 elif mesh_dim == 2:
                     lap_full = DifferentialOperators.compute_fd_laplacian_2d_simple(u_full, mesh_points, domain.mesh_connectivity["triangles"], dims)
                 elif mesh_dim == 3:
-                    lap_full = DifferentialOperators.compute_fd_laplacian_3d_simple(u_full, mesh_points, domain.mesh_connectivity["tetrahedra"], dims)
+                    lap_full = DifferentialOperators.compute_fd_laplacian_3d_simple(
+                        u_full,
+                        mesh_points,
+                        domain.mesh_connectivity["tetrahedra"],
+                        dims,
+                    )
 
                 if points is None:
-                    dists = jnp.sum((mesh_points[jnp.newaxis, :, :] - points[:, jnp.newaxis, :]) ** 2, axis=-1)
+                    dists = jnp.sum(
+                        (mesh_points[jnp.newaxis, :, :] - points[:, jnp.newaxis, :]) ** 2,
+                        axis=-1,
+                    )
                     vertex_indices = jnp.argmin(dists, axis=1)
                     return lap_full[vertex_indices]
                 else:
@@ -929,16 +827,29 @@ class TraceEvaluator:
                     if mesh_dim == 1:
                         grad_full = DifferentialOperators.compute_fd_gradient_1d_simple(u_full, mesh_points, domain.mesh_connectivity["lines"])
                     elif mesh_dim == 2:
-                        grad_full = DifferentialOperators.compute_fd_gradient_2d_simple(u_full, mesh_points, domain.mesh_connectivity["triangles"], vi_dim)
+                        grad_full = DifferentialOperators.compute_fd_gradient_2d_simple(
+                            u_full,
+                            mesh_points,
+                            domain.mesh_connectivity["triangles"],
+                            vi_dim,
+                        )
                     elif mesh_dim == 3:
-                        grad_full = DifferentialOperators.compute_fd_gradient_3d_simple(u_full, mesh_points, domain.mesh_connectivity["tetrahedra"], vi_dim)
+                        grad_full = DifferentialOperators.compute_fd_gradient_3d_simple(
+                            u_full,
+                            mesh_points,
+                            domain.mesh_connectivity["tetrahedra"],
+                            vi_dim,
+                        )
                     jac_components.append(grad_full)
 
                 # Stack to form Jacobian: shape (N_mesh, n_vars)
                 jac_full = jnp.stack(jac_components, axis=-1)
 
                 # Map back to sampled points
-                dists = jnp.sum((mesh_points[jnp.newaxis, :, :] - points[:, jnp.newaxis, :]) ** 2, axis=-1)
+                dists = jnp.sum(
+                    (mesh_points[jnp.newaxis, :, :] - points[:, jnp.newaxis, :]) ** 2,
+                    axis=-1,
+                )
                 vertex_indices = jnp.argmin(dists, axis=1)
                 return jac_full[vertex_indices]
 
@@ -946,7 +857,13 @@ class TraceEvaluator:
 
                 def jac_single(pt):
                     def u_fn(p):
-                        result = self.evaluate(target, {tag: p[jnp.newaxis, :]}, var_bindings, tensor_tags, key)
+                        result = self.evaluate(
+                            target,
+                            {tag: p[jnp.newaxis, :]},
+                            var_bindings,
+                            tensor_tags,
+                            key,
+                        )
                         return jnp.squeeze(result)
 
                     jac = jax.jacobian(u_fn)(pt)  # Shape: (input_dims,) for scalar output
@@ -991,12 +908,25 @@ class TraceEvaluator:
                 if mesh_dim == 1:
                     hess_full = DifferentialOperators.compute_fd_hessian_1d_simple(u_full, mesh_points, domain.mesh_connectivity["lines"])
                 elif mesh_dim == 2:
-                    hess_full = DifferentialOperators.compute_fd_hessian_2d_simple(u_full, mesh_points, domain.mesh_connectivity["triangles"], var_dims)
+                    hess_full = DifferentialOperators.compute_fd_hessian_2d_simple(
+                        u_full,
+                        mesh_points,
+                        domain.mesh_connectivity["triangles"],
+                        var_dims,
+                    )
                 elif mesh_dim == 3:
-                    hess_full = DifferentialOperators.compute_fd_hessian_3d_simple(u_full, mesh_points, domain.mesh_connectivity["tetrahedra"], var_dims)
+                    hess_full = DifferentialOperators.compute_fd_hessian_3d_simple(
+                        u_full,
+                        mesh_points,
+                        domain.mesh_connectivity["tetrahedra"],
+                        var_dims,
+                    )
 
                 # Map back to sampled points
-                dists = jnp.sum((mesh_points[jnp.newaxis, :, :] - points[:, jnp.newaxis, :]) ** 2, axis=-1)
+                dists = jnp.sum(
+                    (mesh_points[jnp.newaxis, :, :] - points[:, jnp.newaxis, :]) ** 2,
+                    axis=-1,
+                )
                 vertex_indices = jnp.argmin(dists, axis=1)
                 return hess_full[vertex_indices]
 
@@ -1004,7 +934,13 @@ class TraceEvaluator:
 
                 def hess_single(pt):
                     def u_scalar(p):
-                        result = self.evaluate(target, {tag: p[jnp.newaxis, :]}, var_bindings, tensor_tags, key)
+                        result = self.evaluate(
+                            target,
+                            {tag: p[jnp.newaxis, :]},
+                            var_bindings,
+                            tensor_tags,
+                            key,
+                        )
                         return jnp.squeeze(result)
 
                     hess = jax.hessian(u_scalar)(pt)
@@ -1016,25 +952,6 @@ class TraceEvaluator:
                 return jax.vmap(hess_single)(points)
 
         # ----------------------------------------------------------
-        # EulerResiduals (Finite Difference for Compressible Euler)
-        # ----------------------------------------------------------
-
-        elif isinstance(expr, EulerResiduals):
-            # Evaluate the four input fields
-            rho_val = self.evaluate(expr.rho, points_by_tag, var_bindings, tensor_tags, key)
-            u_val = self.evaluate(expr.u, points_by_tag, var_bindings, tensor_tags, key)
-            v_val = self.evaluate(expr.v, points_by_tag, var_bindings, tensor_tags, key)
-            p_val = self.evaluate(expr.p, points_by_tag, var_bindings, tensor_tags, key)
-
-            rho_val0 = self.evaluate(expr.rho0, points_by_tag, var_bindings, tensor_tags, key)
-            u_val0 = self.evaluate(expr.u0, points_by_tag, var_bindings, tensor_tags, key)
-            v_val0 = self.evaluate(expr.v0, points_by_tag, var_bindings, tensor_tags, key)
-            p_val0 = self.evaluate(expr.p0, points_by_tag, var_bindings, tensor_tags, key)
-
-            # Compute residuals using finite differences
-            return EulerResidualsDiff.compute_euler_residuals_flat(rho_val, u_val, v_val, p_val, rho_val0, u_val0, v_val0, p_val0, expr.n_substeps)
-
-        # ----------------------------------------------------------
         # OperationDef
         # ----------------------------------------------------------
         elif isinstance(expr, OperationDef):
@@ -1044,7 +961,11 @@ class TraceEvaluator:
             raise ValueError(f"Cannot evaluate:  {type(expr)}")
 
     @staticmethod
-    def collect_dense_layers(expr: Placeholder, traverse_calls: bool = False, tensor_dims: Dict[str, int] = None) -> List:
+    def collect_dense_layers(
+        expr: Placeholder,
+        traverse_calls: bool = False,
+        tensor_dims: Dict[str, int] = None,
+    ) -> List:
         """Collect all FlaxModule nodes from expression tree."""
 
         tensor_dims = tensor_dims or {}
@@ -1125,6 +1046,26 @@ class TraceEvaluator:
                 right_padded = (1,) * (max_ndim - len(right_shape)) + right_shape
                 return tuple(max(l, r) for l, r in zip(left_padded, right_padded))
 
+            elif isinstance(arg, FunctionCall):
+                key = jax.random.PRNGKey(42)
+                sig = inspect.signature(arg.fn)
+
+                # Build arguments list
+                args = []
+                param_names = list(sig.parameters.keys())
+
+                for i, a in enumerate(arg.args):
+                    if i < len(param_names) and param_names[i] == "key":
+                        args.append(key)
+                    else:
+                        args.append(jnp.ones(get_shape(a)))
+
+                # Check if 'key' is a keyword-only parameter not yet provided
+                if "key" in sig.parameters and "key" not in param_names[: len(arg.args)]:
+                    return arg.fn(*args, key=key).shape
+                else:
+                    return arg.fn(*args).shape
+
             else:
                 return (1,)
 
@@ -1193,11 +1134,6 @@ class TraceEvaluator:
                 visit(node.target)
             elif isinstance(node, Slice):
                 visit(node.target)
-            elif isinstance(node, EulerResiduals):
-                visit(node.rho)
-                visit(node.u)
-                visit(node.v)
-                visit(node.p)
             elif isinstance(node, Reshape):
                 visit(node.target)
 
@@ -1356,7 +1292,13 @@ class TraceEvaluator:
         return merged
 
     @staticmethod
-    def load_poseidon_params(module, rng: jax.random.PRNGKey, num_input_channels: int, logger: Logger, weight_path: str) -> Tuple[dict, Callable]:
+    def load_poseidon_params(
+        module,
+        rng: jax.random.PRNGKey,
+        num_input_channels: int,
+        logger: Logger,
+        weight_path: str,
+    ) -> Tuple[dict, Callable]:
         """
         Load Poseidon model parameters, handling channel dimension mismatches.
 
@@ -1437,7 +1379,13 @@ class TraceEvaluator:
 
                     if is_poseidon:
                         # Use the new loading function with channel replacement support
-                        layer_params, apply_fn = TraceEvaluator.load_poseidon_params(module=layer.module, rng=rng, num_input_channels=dummies[0].shape[-1], logger=logger, weight_path=layer.weight_path)  # Exclude time from channel count
+                        layer_params, apply_fn = TraceEvaluator.load_poseidon_params(
+                            module=layer.module,
+                            rng=rng,
+                            num_input_channels=dummies[0].shape[-1],
+                            logger=logger,
+                            weight_path=layer.weight_path,
+                        )  # Exclude time from channel count
 
                         if layer.show:
                             df = jnp.ones((1, 128, 128, dummies[0].shape[-1]))
@@ -1465,7 +1413,7 @@ class TraceEvaluator:
                                 table_str = layer.module.tabulate(rng, *dummies, depth=2)
                             else:
                                 table_str = layer.module.tabulate(rng, dummies[0], depth=2)
-                            logger.info(table_str)
+                            print(table_str)  # TODO make logger.info compatible
 
                         return layer_params, layer.module.apply
 
@@ -1576,7 +1524,7 @@ class TraceEvaluator:
 
             if not batched_sizes:
                 # No batched points or tensors → no vmap needed
-                return evaluate_single_batch(params, points_by_tag, tensor_tags)
+                return evaluate_single_batch(params, points_by_tag, tensor_tags, key=key)
 
             # Use the maximum as the primary batch size
             # Arrays with different sizes won't be vmapped over
@@ -1590,30 +1538,35 @@ class TraceEvaluator:
                     raise ValueError("A JAX random key must be provided when batchsize is specified.")
 
                 if batchsize > B:
-                    raise ValueError(f"Requested batchsize ({batchsize}) exceeds available batch size ({B}).")
+                    print("WARNING: batchsize smaller then sampling -> replace=True")
+                    indices = jax.random.choice(key, B, shape=(batchsize,), replace=True)
+                    indices = jnp.sort(indices)
 
                 if batchsize < B:
                     # Randomly select indices
                     indices = jax.random.choice(key, B, shape=(batchsize,), replace=False)
                     indices = jnp.sort(indices)
 
-                    # Subset points that have THE PRIMARY batch dimension
-                    def subset_point(p):
-                        if hasattr(p, "ndim") and p.ndim == 3 and p.shape[0] == B:
-                            return p[indices]
-                        return p
+                if batchsize == B:
+                    indices = jnp.arange(0, B, 1)
 
-                    # Subset tensors that have THE PRIMARY batch dimension
-                    def subset_tensor(t):
-                        if hasattr(t, "ndim") and t.ndim >= 1 and t.shape[0] == B:
-                            return t[indices]
-                        return t
+                # Subset points that have THE PRIMARY batch dimension
+                def subset_point(p):
+                    if hasattr(p, "ndim") and p.ndim == 3 and p.shape[0] == B:
+                        return p[indices]
+                    return p
 
-                    points_tuple = tuple(subset_point(p) for p in points_tuple)
-                    tensors_tuple = tuple(subset_tensor(t) for t in tensors_tuple)
+                # Subset tensors that have THE PRIMARY batch dimension
+                def subset_tensor(t):
+                    if hasattr(t, "ndim") and t.ndim >= 1 and t.shape[0] == B:
+                        return t[indices]
+                    return t
 
-                    # Update B to the new batch size
-                    B = batchsize
+                points_tuple = tuple(subset_point(p) for p in points_tuple)
+                tensors_tuple = tuple(subset_tensor(t) for t in tensors_tuple)
+
+                # Update B to the new batch size
+                B = batchsize
 
             # ============================================================
             # STEP 2: Normalize points - only vmap over arrays with batch size == B
@@ -1686,7 +1639,10 @@ class TraceEvaluator:
                 # Split the key into B subkeys, one for each batch element
                 keys = jax.random.split(key, B)
 
-                vmapped_fn = jax.vmap(eval_single_batch_tuple, in_axes=(points_in_axes, tensors_in_axes, 0))  # 0 for keys axis
+                vmapped_fn = jax.vmap(
+                    eval_single_batch_tuple,
+                    in_axes=(points_in_axes, tensors_in_axes, 0),
+                )  # 0 for keys axis
                 return vmapped_fn(points_tuple, tensors_tuple, keys)
             else:
                 # No key provided - use original function without key
@@ -1695,13 +1651,22 @@ class TraceEvaluator:
                     tens_dict = dict(zip(tensor_order, tensor_vals)) if tensor_order else {}
                     return evaluate_single_batch(params, pts_dict, tens_dict)
 
-                vmapped_fn = jax.vmap(eval_single_batch_tuple_no_key, in_axes=(points_in_axes, tensors_in_axes))
+                vmapped_fn = jax.vmap(
+                    eval_single_batch_tuple_no_key,
+                    in_axes=(points_in_axes, tensors_in_axes),
+                )
                 return vmapped_fn(points_tuple, tensors_tuple)
 
         return compiled_fn
 
     @staticmethod
-    def init_layer_params(all_ops: List, domain_dim: int, tensor_dims: Dict[str, int], rng: jax.Array, logger) -> Tuple[Dict, Dict, jax.Array]:
+    def init_layer_params(
+        all_ops: List,
+        domain_dim: int,
+        tensor_dims: Dict[str, int],
+        rng: jax.Array,
+        logger,
+    ) -> Tuple[Dict, Dict, jax.Array]:
         """Initialize parameters for all layers, sharing across operations.
 
         Returns:

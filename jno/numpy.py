@@ -1,6 +1,6 @@
 import jax.numpy as jnp
 from typing import Union, List, Sequence, Callable
-from .trace import Placeholder, Variable, FunctionCall, Concat, Laplacian, Gradient, Hessian, Jacobian, Constant, ConstantNamespace, EulerResiduals, Tracker, BinaryOp
+from .trace import Placeholder, Variable, FunctionCall, Concat, Laplacian, Gradient, Hessian, Jacobian, Constant, ConstantNamespace, Tracker, BinaryOp
 
 # Keep import so people can use jno.numpy as jno -> jno.model, jno.tune
 from .tuner import Arch, ArchSpace, tune
@@ -63,7 +63,7 @@ def constant(tag: str, data: Union[dict, str, Path]) -> ConstantNamespace:
     return ConstantNamespace(tag, data)
 
 
-def function(fn, args, name: str = "", reduces_axis: int = None):
+def function(fn, args: list = [], name: str = "", reduces_axis: int = None):
     return FunctionCall(fn, args, name, reduces_axis)
 
 
@@ -375,6 +375,79 @@ def swish(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray
 # ============================================================================
 # Array manipulation
 # ============================================================================
+import jax
+
+
+@jax.tree_util.register_pytree_node_class
+class ViewFactorOp:
+    """
+    Linear boundary radiation operator.
+
+    Supports:
+        F @ x
+        x @ F
+
+    Works with:
+        • jnp.ndarray
+        • Placeholder
+    """
+
+    def __init__(self, F: Union["Placeholder", jnp.ndarray]):
+        self.F = F
+
+    # -----------------------
+    # Matrix multiply: F @ x
+    # -----------------------
+    def __matmul__(self, x: Union["Placeholder", jnp.ndarray]):
+        if isinstance(self.F, Placeholder) or isinstance(x, Placeholder):
+            return FunctionCall(lambda A, b: A @ b, [self.F, x])
+        return self.F @ x
+
+    # -----------------------
+    # Left multiply: x @ F
+    # -----------------------
+    def __rmatmul__(self, x: Union["Placeholder", jnp.ndarray]):
+        if isinstance(self.F, Placeholder) or isinstance(x, Placeholder):
+            return FunctionCall(lambda b, A: b @ A, [x, self.F])
+        return x @ self.F
+
+    # -----------------------
+    # Apply operator explicitly
+    # -----------------------
+    def apply(self, x: Union["Placeholder", jnp.ndarray]):
+        return self @ x
+
+    # -----------------------
+    # Solve (I - αF)x = rhs
+    # -----------------------
+    def solve(self, rhs, alpha):
+        if isinstance(self.F, Placeholder) or isinstance(rhs, Placeholder):
+
+            def solve_fn(A, b, a):
+                I = jnp.eye(A.shape[0])
+                return jnp.linalg.solve(I - a * A, b)
+
+            return FunctionCall(solve_fn, [self.F, rhs, alpha])
+
+        I = jnp.eye(self.F.shape[0])
+        return jnp.linalg.solve(I - alpha * self.F, rhs)
+
+    # -----------------------
+    # PyTree support for JAX
+    # -----------------------
+    def tree_flatten(self):
+        return (self.F,), None
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        return cls(*children)
+
+
+def view_factor(F: Union["Placeholder", jnp.ndarray]) -> Union[ViewFactorOp, jnp.ndarray]:
+    """Create a view factor operator."""
+    if isinstance(F, Placeholder):
+        return ViewFactorOp(F)
+    return ViewFactorOp(F)
 
 
 def concat(items: Sequence[Union[Placeholder, jnp.ndarray]], axis: int = -1) -> Union[Concat, jnp.ndarray]:
@@ -522,7 +595,7 @@ def minimum(x: Union[Placeholder, jnp.ndarray], y: Union[Placeholder, jnp.ndarra
 
 def where(condition, x, y) -> Union[FunctionCall, jnp.ndarray]:
     """Return elements chosen from x or y depending on condition."""
-    if isinstance(condition, Placeholder) or isinstance(x, Placeholder) or isinstance(y, Placeholder):
+    if isinstance(condition, Placeholder) or isinstance(x, (Placeholder, int, float)) or isinstance(y, (Placeholder, int, float)):
         return FunctionCall(jnp.where, [condition, x, y])
     return jnp.where(condition, x, y)
 
@@ -830,77 +903,34 @@ complex64 = jnp.complex64
 complex128 = jnp.complex128
 
 
-def euler_residuals(
-    rho: Union[Placeholder, jnp.ndarray],
-    u: Union[Placeholder, jnp.ndarray],
-    v: Union[Placeholder, jnp.ndarray],
-    p: Union[Placeholder, jnp.ndarray],
-    rho0: Union[Placeholder, jnp.ndarray],
-    u0: Union[Placeholder, jnp.ndarray],
-    v0: Union[Placeholder, jnp.ndarray],
-    p0: Union[Placeholder, jnp.ndarray],
-    n_substeps: int = 1,
-):
-    """
-    Compute 2D compressible Euler equation residuals using central finite differences.
+def _create_linalg_wrapper():
+    """Factory function to create the linalg wrapper class."""
 
-    This function computes the residuals of the conservative form of the
-    2D compressible Euler equations:
+    class _linalg:
+        """Wrapper for jax.numpy.linalg that returns FunctionCall objects."""
 
-    Equations:
-        E = 0.5 * ρ * (u² + v²) + p / (γ - 1)  # Total energy
+        pass
 
-        con1 = ∂ρ/∂t + ∂(ρu)/∂x + ∂(ρv)/∂y = 0           # Continuity
-        con2 = ∂(ρu)/∂t + ∂(ρu² + p)/∂x + ∂(ρuv)/∂y = 0  # x-momentum
-        con3 = ∂(ρv)/∂t + ∂(ρuv)/∂x + ∂(ρv² + p)/∂y = 0  # y-momentum
-        con4 = ∂E/∂t + ∂((E+p)u)/∂x + ∂((E+p)v)/∂y = 0   # Energy
+    # Get all public functions from jnp.linalg
+    for name in dir(jnp.linalg):
+        if name.startswith("_"):
+            continue
 
-    Args:
-        rho: Density field, shape (T, H, W) e.g., (21, 128, 128)
-        u: x-velocity field, shape (T, H, W)
-        v: y-velocity field, shape (T, H, W)
-        p: Pressure field, shape (T, H, W)
-        dt: Time step size (default 1.0)
-        dx: Grid spacing in x/width direction (default 1.0)
-        dy: Grid spacing in y/height direction (default 1.0)
-        gamma: Ratio of specific heats (default 1.4 for air)
+        original = getattr(jnp.linalg, name)
 
-    Returns:
-        Stacked residuals with shape (T-2, H-2, W-2, 4)
-        Channel order: [continuity, x-momentum, y-momentum, energy]
+        if callable(original):
+            # Create wrapper function
+            def make_method(func, func_name):
+                def method(*args, **kwargs):
+                    return FunctionCall(func, list(args), name=func_name, kwargs=kwargs if kwargs else None)
 
-        For perfect solutions, all residuals should be zero.
+                method.__doc__ = func.__doc__
+                method.__name__ = func_name
+                return staticmethod(method)
 
-    Example:
-        >>> import jno.numpy as jnp
-        >>>
-        >>> # Fields with shape (21, 128, 128)
-        >>> rho = ...  # density
-        >>> u = ...    # x-velocity
-        >>> v = ...    # y-velocity
-        >>> p = ...    # pressure
-        >>>
-        >>> # Compute residuals with physical grid spacing
-        >>> residuals = jnp.euler_residuals(rho, u, v, p, dt=0.01, dx=0.1, dy=0.1)
-        >>>
-        >>> # Access individual residuals
-        >>> continuity = residuals[..., 0]
-        >>> x_momentum = residuals[..., 1]
-        >>> y_momentum = residuals[..., 2]
-        >>> energy = residuals[..., 3]
+            setattr(_linalg, name, make_method(original, name))
 
-    Note:
-        The output loses 2 points in each dimension due to central differencing:
-        - Time: T -> T-2 (loses first and last timestep)
-        - Height: H -> H-2 (loses top and bottom row)
-        - Width: W -> W-2 (loses left and right column)
+    return _linalg
 
-    """
-    # Check if any input is a Placeholder (traced computation)
-    if any(isinstance(arg, Placeholder) for arg in [rho, u, v, p, rho0, u0, v0, p0]):
-        return EulerResiduals(rho, u, v, p, rho0, u0, v0, p0, n_substeps)
 
-    # Direct computation for concrete arrays
-    from .trace_evaluator import EulerResidualsDiff
-
-    return EulerResidualsDiff.compute_euler_residuals_flat(rho, u, v, p, rho0, u0, v0, p0, n_substeps)
+linalg = _create_linalg_wrapper()
