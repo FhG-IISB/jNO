@@ -21,6 +21,12 @@ uv sync --extra cuda
 ```
 
 
+Install the following i you get an error
+
+```bash
+sudo apt-get install libglu1
+```
+
 
 
 ## Architectures
