@@ -13,10 +13,16 @@ dire = "./runs/heat_equation"
 jno.logger(dire)
 
 # Domain
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05), time=(0, 1, 10), compute_mesh_connectivity=False)
+domain = jno.domain(
+    constructor=jno.domain.rect(mesh_size=0.05),
+    time=(0, 1, 10),
+    compute_mesh_connectivity=False,
+)
 x, y, t = domain.variable("interior")
 x0, y0, t0 = domain.variable("initial")
-C = jnn.constant("C", {"k": 0.1})  # Or load it from most common file types -> Use during computation (same as a constant python value)
+C = jnn.constant(
+    "C", {"k": 0.1}
+)  # Or load it from most common file types -> Use during computation (same as a constant python value)
 
 # Neural Network
 u = jnn.nn.mlp(hidden_dims=[64, 64])(x, y, t) * x * (1 - x) * y * (1 - y)
@@ -44,7 +50,12 @@ req_params = {"D": 5, "flavor": "exact"}
 
 class _KAN(nnx.Module):
     def __init__(self):
-        self.KAN = KAN(layer_dims=layer_dims, layer_type="chebyshev", required_parameters=req_params, seed=42)
+        self.KAN = KAN(
+            layer_dims=layer_dims,
+            layer_type="chebyshev",
+            required_parameters=req_params,
+            seed=42,
+        )
 
     def __call__(self, x, y, t):
         h = jnp.concat([x, y, t], axis=-1)
@@ -57,15 +68,26 @@ u = jnn.nn.wrap(_KAN())(x, y, t) * x * (1 - x) * y * (1 - y)
 # u = jnn.nn.wrap(MLP(nnx.Rngs(0)))(x, y, t) * x * (1 - x) * y * (1 - y)
 
 # Constraints
-pde = jnn.grad(u(x, y, t), t) - 0.1 * jnn.laplacian(u(x, y, t), [x, y])  # 2D heat equation
+pde = jnn.grad(u(x, y, t), t) - 0.1 * jnn.laplacian(
+    u(x, y, t), [x, y]
+)  # 2D heat equation
 ini = u(x0, y0, t0) - sin(π * x0) * sin(π * y0)  # Sinusoidal Initial Condition
 
 # Solve
 crux = jno.core([pde, ini], domain)
-crux.solve(10_000, optax.adam(1), jno.schedule.learning_rate.exponential(1e-3, 0.8, 10_000, 1e-5), jno.schedule.constraint([1.0, 3.0])).plot(f"{dire}/training_history.png")
+crux.solve(
+    10_000,
+    optax.adam(1),
+    jno.schedule.learning_rate.exponential(1e-3, 0.8, 10_000, 1e-5),
+    jno.schedule.constraint([1.0, 3.0]),
+).plot(f"{dire}/training_history.png")
 
 # Inference
-tst_domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.01), time=(0, 1, 10), compute_mesh_connectivity=False)
+tst_domain = jno.domain(
+    constructor=jno.domain.rect(mesh_size=0.025),
+    time=(0, 1, 10),
+    compute_mesh_connectivity=False,
+)
 crux.plot(operation=u, test_pts=tst_domain).savefig(f"{dire}/u_pred.png", dpi=300)
 
 # Save

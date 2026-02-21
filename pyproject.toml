@@ -42,6 +42,9 @@ members = [
     ".",
 ]
 
+[tool.black]
+line-length = 250
+
 [tool.uv.sources]
 jno = { workspace = true}
 
