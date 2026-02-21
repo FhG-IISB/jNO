@@ -291,11 +291,6 @@ class DifferentialOperators:
         return hess_full
 
 
-# ============================================================
-# TraceEvaluator - NO INNER VMAPS
-# ============================================================
-
-
 class TraceEvaluator:
     """Evaluates traced expressions - designed for JIT compilation.
 

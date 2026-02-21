@@ -783,54 +783,6 @@ def curl_3d(Fx: Placeholder, Fy: Placeholder, Fz: Placeholder, x: Variable, y: V
     return stack([curl_x, curl_y, curl_z], axis=-1)
 
 
-def helmholtz_curlcurl_residuals(p, q, d, x, y, z, alpha=1.0, scheme="automatic_differentiation"):
-    """
-    Build the three residual fields for the vector Helmholtz curl–curl form.
-
-    Optimized: exploits symmetry of mixed partials (∂²f/∂x∂y = ∂²f/∂y∂x)
-
-    Residuals:
-      r_x = (∂²p/∂y² + ∂²p/∂z²) - (∂²q/∂x∂y + ∂²d/∂x∂z) + α·p
-      r_y = (∂²q/∂z² + ∂²q/∂x²) - (∂²d/∂y∂z + ∂²p/∂x∂y) + α·q
-      r_z = (∂²d/∂x² + ∂²d/∂y²) - (∂²p/∂x∂z + ∂²q/∂y∂z) + α·d
-    """
-    # ---- First derivatives (9 total, all needed)
-    jac_p = jacobian(p, [x, y, z], scheme)
-    jac_q = jacobian(q, [x, y, z], scheme)
-    jac_d = jacobian(d, [x, y, z], scheme)
-
-    p_x, p_y, p_z = jac_p[..., 0], jac_p[..., 1], jac_p[..., 2]
-    q_x, q_y, q_z = jac_q[..., 0], jac_q[..., 1], jac_q[..., 2]
-    d_x, d_y, d_z = jac_d[..., 0], jac_d[..., 1], jac_d[..., 2]
-
-    # ---- Second derivatives (optimized: 10 instead of 12)
-    # Pure second derivatives (6)
-    p_yy = grad(p_y, y, scheme)
-    p_zz = grad(p_z, z, scheme)
-    q_xx = grad(q_x, x, scheme)
-    q_zz = grad(q_z, z, scheme)
-    d_xx = grad(d_x, x, scheme)
-    d_yy = grad(d_y, y, scheme)
-
-    # Mixed partials (4 unique, reused)
-    p_xy = grad(p_x, y, scheme)  # used in r_x and r_y
-    p_xz = grad(p_x, z, scheme)  # used in r_z
-    q_yz = grad(q_y, z, scheme)  # used in r_z
-    d_xz = grad(d_x, z, scheme)  # used in r_x
-    d_yz = grad(d_y, z, scheme)  # used in r_y
-
-    # Note: q_xy = grad(q_x, y) = grad(q_y, x) by symmetry
-    # But we need q_xy for r_x, and it's not reused elsewhere
-    q_xy = grad(q_x, y, scheme)
-
-    # ---- Residuals
-    r_x = (p_yy + p_zz) - (q_xy + d_xz) + alpha * p
-    r_y = (q_zz + q_xx) - (d_yz + p_xy) + alpha * q
-    r_z = (d_xx + d_yy) - (p_xz + q_yz) + alpha * d
-
-    return stack([r_x, r_y, r_z], axis=-1)
-
-
 # ============================================================================
 # Array creation (these return JAX arrays, not placeholders)
 # ============================================================================

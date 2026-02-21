@@ -27,7 +27,10 @@ cuda = [
     "jax[cuda]>=0.4.38,<=0.8.1"
 ]
 dev = ["pytest>=7.0", "black>=22.0", "flake8>=4.0", "mypy>=0.950"]
-
+iree = [
+    "iree-base-compiler",
+    "iree-base-runtime"
+]
 [tool.setuptools]
 packages = ["jno"]
 

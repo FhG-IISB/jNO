@@ -9,6 +9,7 @@ from flax.core import freeze, unfreeze
 from flax.traverse_util import flatten_dict, unflatten_dict
 import optax
 import lox
+from .logger import get_logger
 
 
 class LoRA:
@@ -53,6 +54,7 @@ class LoRA:
                        Structure should mirror params with (rank, alpha) tuples.
             params: Full model parameters dict (may have int keys for multi-model).
         """
+        self.log = get_logger()
         self.rank_dict = rank_dict
         self._lora_config: Dict[str, Tuple[int, float]] = {}  # flat path -> (rank, alpha)
 
@@ -222,6 +224,8 @@ class LoRA:
             self._lora_config[path] = (actual_rank, alpha)
             total_lora_params += actual_rank * (in_features + out_features)
             num_layers += 1
+
+            self.log.info(f"  LoRA on {path}: {param.shape} with rank {actual_rank}")
 
         return self._unflatten_params(lora_params), total_lora_params, num_layers
 

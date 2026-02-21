@@ -238,7 +238,6 @@ val2 = jnn.tracker(jnn.mean(v(x, y, k) - _v(x, y)), 100)
 # Problem instantiation
 # -----------------------------------------------------------------------------
 
-
 # To use the mean square error one has to add it manually
 # A mesh can be created for data or model parallelism
 crux = jno.core(constraints=[pde1.mse, pde2.mse, boc2.mse, sens.mse, val1, val2], domain=domain, rng_seed=42, mesh=(len(jax.devices()), 1))
