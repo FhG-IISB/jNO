@@ -789,7 +789,7 @@ class Tuner:
         """
         # Deep copy the solver to avoid state conflicts
         solver_copy = copy.copy(self.core)
-        solver_copy.params = {}
+        solver_copy.models = {}
         solver_copy.layer_info = {}
         solver_copy._total_epochs = 0
         solver_copy._logged_constraint_shapes = False
@@ -797,12 +797,20 @@ class Tuner:
         return solver_copy
 
     def _evaluate_config(self, core_copy, config, space, tunable, has_arch_tuning):
-        """Evaluate a single configuration and return the loss."""
+        """Evaluate a single configuration and return the loss.
+
+        When core_copy is provided (parallel sweeps), only the copy is mutated.
+        When core_copy is None (sequential sweeps), self.core is reset and used.
+        """
         from .trace import FlaxModule
+
+        # Determine which solver instance to use — never mutate self.core
+        # when a copy is provided (parallel execution).
+        solver = core_copy if core_copy is not None else self.core
 
         # Extract training parameters from config
         trial_epochs = config.get("epochs", 2000)
-        trial_optimizer = config.get("optimizer", optax.adam(1e-3))
+        trial_optimizer = config.get("optimizer", optax.adam)
         trial_lr = config.get("learning_rate", LearningRateSchedule(1e-3))
         trial_weights = config.get("constraint_weights", config.get("weight_schedule", WeightSchedule([1.0 for _ in range(len(self.core.constraints))])))
         trial_batchsize = config.get("batchsize", None)
@@ -810,22 +818,23 @@ class Tuner:
         # Set architecture if tunable module exists
         if tunable is not None and has_arch_tuning:
             arch_config = Arch(choices=tuple((name, config(name)) for name in [g.name for g in space.get_architecture_groups()] if config.has(name)))
-            module_instance = tunable.instantiate(arch_config)
+            module_instance = tunable.instantiate(arch_config, key=jax.random.PRNGKey(0))
             tunable._current_instance = FlaxModule(module_instance)
             tunable._current_instance.layer_id = tunable.layer_id
 
-        # Reset state for fresh training
-
-        self.core.params = {}
-        self.core.layer_info = {}
-        self.core._total_epochs = 0
-        self.core._logged_constraint_shapes = False
+        # Reset state for fresh training — only on the solver we will use
+        solver.models = {}
+        solver.layer_info = {}
+        solver._total_epochs = 0
+        solver._logged_constraint_shapes = False
+        solver.compile((1, 1))
 
         try:
-            if core_copy is not None:
-                stats = core_copy.solve(epochs=trial_epochs, optimizer=trial_optimizer, learning_rate=trial_lr, constraint_weights=trial_weights, batchsize=trial_batchsize)
-            else:
-                stats = self.core.solve(epochs=trial_epochs, optimizer=trial_optimizer, learning_rate=trial_lr, constraint_weights=trial_weights, batchsize=trial_batchsize)
+            # Attach optimizer to all models
+            flax_mods = solver._collect_flax_modules()
+            for fm in flax_mods.values():
+                fm.optimizer(trial_optimizer, lr=trial_lr)
+            stats = solver.solve(epochs=trial_epochs, constraint_weights=trial_weights, batchsize=trial_batchsize)
             return float(stats.training_logs[-1]["total_loss"][-1])
         except Exception as e:
             self.core.log.warning(f"Configuration {config} failed: {e}")
@@ -879,12 +888,12 @@ class Tuner:
         # Set best architecture for final training
         if tunable is not None and has_arch_tuning:
             arch_config = Arch(choices=tuple((name, final_config(name)) for name in [g.name for g in space.get_architecture_groups()] if final_config.has(name)))
-            final_module = tunable.instantiate(arch_config)
+            final_module = tunable.instantiate(arch_config, key=jax.random.PRNGKey(0))
             tunable._current_instance = FlaxModule(final_module)
             tunable._current_instance.layer_id = tunable.layer_id
 
         # Reset for final training
-        self.core.params = {}
+        self.core.models = {}
         self.core.layer_info = {}
         self.core._total_epochs = 0
         self.core._logged_constraint_shapes = False
@@ -896,12 +905,15 @@ class Tuner:
         self.core.best_arch = final_config  # For backward compatibility
 
         final_training_epochs = final_config.get("epochs")
-        final_optimizer = final_config.get("optimizer")
-        final_lr = final_config.get("learning_rate")
+        final_optimizer = final_config.get("optimizer", optax.adam)
+        final_lr = final_config.get("learning_rate", LearningRateSchedule(1e-3))
         final_weights = final_config.get("constraint_weights")
 
-        # Run full training with best configuration
-        stats = self.core.solve(epochs=final_training_epochs, optimizer=final_optimizer, learning_rate=final_lr, constraint_weights=final_weights)
+        # Attach optimizer to all models
+        flax_mods = self.core._collect_flax_modules()
+        for fm in flax_mods.values():
+            fm.optimizer(final_optimizer, lr=final_lr)
+        stats = self.core.solve(epochs=final_training_epochs, constraint_weights=final_weights)
 
         return stats
 

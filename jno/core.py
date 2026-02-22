@@ -8,13 +8,44 @@ import lox
 import cloudpickle
 import numpy as np
 import time
-from .trace import *
+from .trace import (
+    Placeholder,
+    Variable,
+    TensorTag,
+    BinaryOp,
+    FlaxModule,
+    TunableModule,
+    TunableModuleCall,
+    FlaxModuleCall,
+    OperationDef,
+    OperationCall,
+    Hessian,
+    Jacobian,
+    FunctionCall,
+    Concat,
+    Slice,
+    Literal,
+    Constant,
+    ConstantNamespace,
+    Reshape,
+    NewAxis,
+    Tracker,
+    collect_operations,
+    collect_tags,
+    get_primary_tag,
+)
 from .utils import LearningRateSchedule, WeightSchedule, statistics, get_logger, IREEModel
+from .utils.monitor import HardwareMonitor
 from .domain import domain, DomainData
 from .trace_evaluator import TraceEvaluator
 from .core_utilities import CoreUtilities
 from .tuner import ArchSpace, DeviceConfig, Tuner
-from .utils.lora import LoRA
+from .architectures.lora_linear import (
+    apply_lora as _apply_lora,
+    merge_lora as _merge_lora,
+    lora_trainable_filter as _lora_trainable_filter,
+)
+import equinox as eqx
 
 
 class core(CoreUtilities):
@@ -76,8 +107,7 @@ class core(CoreUtilities):
         self.constraints: List[BinaryOp] = constraints
 
         self.domain = domain
-        self.params = {}
-        self.layer_info = {}
+        self.models = {}  # full equinox models (pytrees with arrays + static)
         self._trained_ops = {}
         self.training_logs: List[Dict[str, jnp.ndarray]] = []
         self.dots: List = []
@@ -86,7 +116,6 @@ class core(CoreUtilities):
 
         super().__init__()
 
-        self.errors.set_domain(domain)
         self._total_epochs = 0
         self.rng = jax.random.PRNGKey(rng_seed)
 
@@ -129,16 +158,23 @@ class core(CoreUtilities):
 
         model_dim = self.mesh.shape["model"]
 
+        if model_dim > 1:
+            self.log.info("Parameters sharded across devices")
+
+        # Use P() (fully replicated) for all non-sharded arrays.
+        # Important: P() is canonical — JAX's optimizer outputs use P(),
+        # so using P(None,) or P(None, None) here would cause a sharding
+        # mismatch on the next step and trigger a recompilation.
+        replicated = P()
+
         def shard_leaf(x):
             # Handle JAX arrays
             if isinstance(x, (jnp.ndarray, jax.Array)):
                 if model_dim == 1:
-                    spec = P(*([None] * x.ndim))
+                    spec = replicated
                 else:
-                    if x.ndim == 0:
-                        spec = P()
-                    elif x.ndim == 1:
-                        spec = P(None)
+                    if x.ndim <= 1:
+                        spec = replicated
                     else:
                         spec = P(*([None] * (x.ndim - 1)), "model")
                 return jax.device_put(x, NamedSharding(self.mesh, spec))
@@ -146,12 +182,10 @@ class core(CoreUtilities):
             elif isinstance(x, np.ndarray):
                 x = jnp.array(x)
                 if model_dim == 1:
-                    spec = P(*([None] * x.ndim))
+                    spec = replicated
                 else:
-                    if x.ndim == 0:
-                        spec = P()
-                    elif x.ndim == 1:
-                        spec = P(None)
+                    if x.ndim <= 1:
+                        spec = replicated
                     else:
                         spec = P(*([None] * (x.ndim - 1)), "model")
                 return jax.device_put(x, NamedSharding(self.mesh, spec))
@@ -197,7 +231,7 @@ class core(CoreUtilities):
         for expr in constraints:
             if isinstance(expr, (OperationDef, OperationCall)):
                 wrapped.append(expr)
-            elif isinstance(expr, Laplacian) and isinstance(expr.target, (OperationDef, OperationCall)):
+            elif isinstance(expr, Hessian) and isinstance(expr.target, (OperationDef, OperationCall)):
                 wrapped.append(expr)
             elif isinstance(expr, Placeholder):
                 wrapped.append(OperationDef(expr))
@@ -215,6 +249,31 @@ class core(CoreUtilities):
                     seen_ops.add(op.op_id)
                     all_ops.append(op)
         return all_ops
+
+    def _collect_flax_modules(self) -> Dict[int, FlaxModule]:
+        """Return ``{layer_id: FlaxModule}`` for every model in the problem."""
+        from .trace_evaluator import TraceEvaluator
+
+        result = {}
+        for op in self.all_ops:
+            for layer, _ in TraceEvaluator.collect_dense_layers(op.expr):
+                if isinstance(layer, FlaxModule) and layer.layer_id not in result:
+                    result[layer.layer_id] = layer
+        return result
+
+    def set_optimizer(self, opt_fn, *, lr=None):
+        """Set the same optimizer (and LR schedule) on **all** models.
+
+        Useful after ``core.load()`` when original Python variables are
+        no longer connected to the loaded expression tree.
+
+        Args:
+            opt_fn: Optimizer factory, e.g. ``optax.adam``.
+            lr:     ``LearningRateSchedule`` or float.
+        """
+        for fm in self._collect_flax_modules().values():
+            fm.optimizer(opt_fn, lr=lr)
+        return self
 
     def get_constraint_tags(self, constraints: List) -> List[str]:
         """Get the primary tag for each constraint."""
@@ -242,16 +301,11 @@ class core(CoreUtilities):
         return learning_rate, constraint_weights
 
     def compute_tensor_dims(self, domain) -> Dict[str, Tuple]:
-        """Compute input dimensions for each tensor tag."""
+        """Compute input dimensions for each context entry."""
         tensor_dims = {}
-        if hasattr(domain, "tensor_tags"):
-            for name, tensor in domain.tensor_tags.items():
+        if hasattr(domain, "context"):
+            for name, tensor in domain.context.items():
                 tensor_dims[name] = tensor.shape[1:]
-
-        if hasattr(domain, "sampled_points"):
-            for name, tensor in domain.sampled_points.items():
-                tensor_dims[name] = tensor.shape[1:]
-
         return tensor_dims
 
     def prepare_domain_data(self, domain) -> DomainData:
@@ -259,49 +313,51 @@ class core(CoreUtilities):
         if domain is None:
             raise ValueError("domain required")
 
-        points_by_tag = {}
-        n_batches = 1
-
-        if hasattr(domain, "sampled_points"):
-            for tag, pts in domain.sampled_points.items():
-                pts = jnp.asarray(pts)
-                if pts.ndim == 3:
-                    n_batches = max(n_batches, pts.shape[0])
-                    points_by_tag[tag] = pts
+        context = {}
+        if hasattr(domain, "context"):
+            for tag, arr in domain.context.items():
+                arr = jnp.asarray(arr)
+                # Ensure batch dimension exists
+                if arr.ndim >= 2:
+                    context[tag] = arr
                 else:
-                    points_by_tag[tag] = pts[None, ...]
-
-        tensor_tags = {}
-        tensor_batch_size = 1
-        if hasattr(domain, "tensor_tags"):
-            for name, tensor in domain.tensor_tags.items():
-                tensor = jnp.asarray(tensor)
-                tensor_tags[name] = tensor
-                # Track max batch size from tensor tags
-                if tensor.ndim > 0:
-                    tensor_batch_size = max(tensor_batch_size, tensor.shape[0])
-
-        # For operator learning: use the larger batch size but DON'T tile
-        # Let vmap handle broadcasting (in_axes=None) to avoid copies
-        n_batches = max(n_batches, tensor_batch_size)
-
-        ordered_tags = tuple(points_by_tag.keys())
-        points_arrays = tuple(points_by_tag[tag] for tag in ordered_tags)
+                    context[tag] = arr[None, ...]
 
         return DomainData(
-            tensor_tags=tensor_tags,
+            context=context,
             dimension=domain.dimension,
-            points_by_tag=dict(zip(ordered_tags, points_arrays)),
         )
 
     # Training
-    def _make_loss_fn(self, compiled_constraints, points_by_tag, tensor_tags, batchsize):
-        """Create loss function - rng passed at call time."""
+    def _make_loss_fn(self, compiled_constraints, batchsize, frozen, static, checkpoint_gradients=False):
+        """Create loss function — differentiates w.r.t. *trainable* only.
 
-        def loss_fn(params, tag_weights, rng):
+        Context is passed as a parameter (not closed over) so that it can
+        be swapped each step for host-offloaded data.
+
+        Args:
+            checkpoint_gradients: If True, wrap each constraint evaluation
+                in ``jax.checkpoint`` to trade recomputation for lower
+                activation memory.
+        """
+
+        def loss_fn(trainable, context, tag_weights, rng):
+            full_models = eqx.combine(trainable, frozen, static)
             losses = []
             for fn in compiled_constraints:
-                residual = fn(params, points_by_tag, tensor_tags, batchsize=batchsize, key=rng)
+                if checkpoint_gradients:
+                    # Close over fn and batchsize so they are NOT traced
+                    # through the checkpoint boundary (batchsize is used in
+                    # Python-level conditionals inside compiled_fn).
+                    _fn, _bs = fn, batchsize
+
+                    @jax.checkpoint
+                    def _remat_eval(models, ctx, key):
+                        return _fn(models, ctx, batchsize=_bs, key=key)
+
+                    residual = _remat_eval(full_models, context, rng)
+                else:
+                    residual = fn(full_models, context, batchsize=batchsize, key=rng)
                 mean_squared_residual = jnp.mean(residual)
                 losses.append(mean_squared_residual)
 
@@ -311,127 +367,96 @@ class core(CoreUtilities):
 
         return loss_fn
 
-    def _make_track_fn(self, compiled_trackers, points_by_tag, tensor_tags, batchsize):
-        """Create tracking function with conditional evaluation."""
+    def _make_track_fn(self, compiled_trackers, batchsize, frozen, static):
+        """Create tracking function that evaluates monitored expressions.
 
-        def make_conditional_tracker(interval, fn):
-            def conditional_fn(params, rng, epoch):
-                def compute_and_store():
-                    return fn(params, points_by_tag, tensor_tags, batchsize=batchsize, key=rng)
+        Returns a JIT-friendly function that evaluates *all* trackers.
+        Interval-based gating is handled by the Python training loop.
+        """
 
-                # Only execute when condition is true
-                return jax.lax.cond(
-                    epoch % interval == 0,
-                    compute_and_store,
-                    lambda: jnp.nan,  # Sentinel value
-                )
-
-            return conditional_fn
-
-        conditional_trackers = [make_conditional_tracker(interval, fn) for interval, fn in compiled_trackers]
-
-        def track_fn(params, rng, epoch):
-            return [tracker(params, rng, epoch) for tracker in conditional_trackers]
+        def track_fn(trainable, context, rng):
+            full_models = eqx.combine(trainable, frozen, static)
+            results = []
+            for _, fn in compiled_trackers:
+                results.append(jnp.mean(fn(full_models, context, batchsize=batchsize, key=rng)))
+            return results
 
         return track_fn
 
-    def make_train_fn(
+    def make_step_fn(
         self,
-        optimizer,
+        per_model_opts,
         compiled_constraints,
-        compiled_trackers,
-        domain_data,
-        epochs,
+        n_constraints,
         batchsize,
+        frozen,
+        static,
+        lr_schedules,
+        checkpoint_gradients=False,
     ):
-        points_by_tag = domain_data.points_by_tag
-        tensor_tags = domain_data.tensor_tags
-        n_constraints = len(compiled_constraints)
-        print_rate = int(epochs / 100) if epochs < 100_000 else int(epochs / 1000)
+        """Build a single JIT-compiled training step.
 
-        if len(compiled_trackers) > 0:
-            track_fn = self._make_track_fn(compiled_trackers, points_by_tag, tensor_tags, batchsize)
-        loss_fn = self._make_loss_fn(compiled_constraints, points_by_tag, tensor_tags, batchsize)
+        Returns a function with signature::
 
-        def print_progress(epoch, individual_losses, track_stats, loss):
-            """Host-side callback for progress printing."""
-            loss_strs = " | ".join([f"C{i}: {float(l):>10.4e}" for i, l in enumerate(individual_losses)])
-            if track_stats is not None:
-                track_strs = " | ".join([f"T{i}: {float(jnp.mean(l)):>10.4e}" for i, l in enumerate(track_stats)])
-                print(
-                    f"\rEpoch {int(epoch):>6}/{epochs}| L:{float(loss):>10.4e} | {loss_strs} | {track_strs}",
-                    end="\n",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"\rEpoch {int(epoch):>6}/{epochs}| L:{float(loss):>10.4e} | {loss_strs}",
-                    end="\n",
-                    flush=True,
-                )
-            return None
+            step(trainable, opt_states, rng, context, epoch, prev_losses)
+                -> (trainable, opt_states, rng, total_loss, individual_losses, tag_weights)
 
-        def train_n_steps(params, opt_state, rng):
-            original_lr_dtype = opt_state[-1].hyperparams["step_size"].dtype
+        The training loop is a plain Python ``for`` loop which:
+        * enables buffer donation at every step boundary,
+        * allows host-resident data to be streamed per step,
+        * makes progress logging trivial (no ``io_callback``).
 
-            def body_fn(_, carry):
-                params, opt_state, rng, total_loss, individual_losses, epoch = carry
-                tag_weights = self.constraint_weights(self._total_epochs + epoch, individual_losses)
+        Args:
+            per_model_opts: ``{layer_id_str: optax_chain}`` per-model optimizers.
+            lr_schedules:   ``{layer_id_str: LearningRateSchedule}``.
+            checkpoint_gradients: Wrap constraint evaluations in ``jax.checkpoint``.
+        """
+        loss_fn = self._make_loss_fn(
+            compiled_constraints,
+            batchsize,
+            frozen,
+            static,
+            checkpoint_gradients=checkpoint_gradients,
+        )
 
-                rng, step_rng = jax.random.split(rng)
+        lid_keys = sorted(per_model_opts.keys())  # deterministic order
+        base_epoch = self._total_epochs
 
-                def loss_wrapper(p):
-                    return loss_fn(p, tag_weights, step_rng)
+        def step(trainable, opt_states, rng, context, epoch, prev_losses):
+            tag_weights = self.constraint_weights(base_epoch + epoch, prev_losses)
 
-                track_stats = track_fn(params, step_rng, epoch) if len(compiled_trackers) > 0 else None
+            rng, step_rng = jax.random.split(rng)
 
-                (total_loss, individual_losses), grads = jax.value_and_grad(loss_wrapper, has_aux=True)(params)
-                updates, opt_state = optimizer.update(
-                    grads,
-                    opt_state,
-                    params,
+            def loss_wrapper(p):
+                return loss_fn(p, context, tag_weights, step_rng)
+
+            (total_loss, individual_losses), grads = jax.value_and_grad(loss_wrapper, has_aux=True)(trainable)
+
+            # ── per-model optimizer step ──
+            for k in lid_keys:
+                lid = int(k)
+                model_grads = grads[lid]
+                model_params = trainable[lid]
+
+                updates, new_state = per_model_opts[k].update(
+                    model_grads,
+                    opt_states[k],
+                    model_params,
                     value=total_loss,
-                    grad=grads,
-                    value_fn=lambda p: loss_wrapper(p)[0],
+                    grad=model_grads,
+                    value_fn=lambda p, _lid=lid: loss_fn({**trainable, _lid: p}, context, tag_weights, step_rng)[0],
                 )
 
-                lr = self.learning_rate(self._total_epochs + epoch, individual_losses)
-                opt_state[-1].hyperparams["step_size"] = jnp.asarray(lr, dtype=original_lr_dtype)
+                # Update LR for this model
+                lr_val = lr_schedules[k](base_epoch + epoch, individual_losses)
+                new_state[-1].hyperparams["step_size"] = jnp.asarray(lr_val, dtype=opt_states[k][-1].hyperparams["step_size"].dtype)
 
-                params = optax.apply_updates(params, updates)
+                trainable = {**trainable, lid: optax.apply_updates(model_params, updates)}
+                opt_states = {**opt_states, k: new_state}
 
-                # Progress callback (unordered, works with multi-device)
-                jax.lax.cond(
-                    epoch % print_rate == 0,
-                    lambda: jax.experimental.io_callback(
-                        print_progress,
-                        None,
-                        epoch,
-                        individual_losses,
-                        track_stats,
-                        total_loss,
-                        ordered=False,
-                    ),
-                    lambda: None,
-                )
+            return trainable, opt_states, rng, total_loss, individual_losses, tag_weights
 
-                lox.log(
-                    {
-                        "epoch": epoch,
-                        "learning_rate": opt_state[-1].hyperparams["step_size"],
-                        "losses": individual_losses,
-                        "weights": tag_weights,
-                        "total_loss": jnp.sum(individual_losses),
-                        "track_stats": (track_stats if len(compiled_trackers) > 0 else [0]),
-                    }
-                )
-
-                return params, opt_state, rng, total_loss, individual_losses, epoch + 1
-
-            init_carry = (params, opt_state, rng, 0.0, jnp.zeros(n_constraints), 0)
-            return jax.lax.fori_loop(0, epochs, body_fn, init_carry)
-
-        return train_n_steps
+        return step
 
     def compile(self, mesh: tuple = (1, 1)):
 
@@ -448,195 +473,392 @@ class core(CoreUtilities):
         self.domain_data = self.prepare_domain_data(self.domain)
         tensor_dims = self.compute_tensor_dims(self.domain)
 
-        # === Initialize parameters ===
-        self.params, self.layer_info, self.rng = TraceEvaluator.init_layer_params(self.all_ops, self.domain_data.dimension, tensor_dims, self.rng, self.log)
+        # === Initialize models ===
+        self.models, self.rng = TraceEvaluator.init_layer_params(self.all_ops, self.domain_data.dimension, tensor_dims, self.rng, self.log)
 
-        # === Apply sharding to params ===
-        self.params = self._shard_params(self.params)
-        self.log.info("Parameters sharded across devices")
+        # === Apply sharding to model arrays ===
+        self.models = self._shard_params(self.models)
 
-        # === Compile constraints ===
+        # === Compile constraints and trackers ===
         self.compiled_constraints = []
         self.compiled_trackers = []
         for expr in constraints:
-            fn_expr = TraceEvaluator.compile_traced_expression(expr, self.all_ops, self.layer_info)
-            if hasattr(expr, "expr"):
-                if isinstance(expr.expr, Tracker):
-                    self.compiled_trackers.append((expr.expr.interval, fn_expr))
-                else:
-                    self.compiled_constraints.append(fn_expr)
+            # Unwrap Tracker nodes — compile the inner expression,
+            # but route it to the tracker list instead of constraints.
+            inner = expr
+            tracker_interval = None
+            if isinstance(expr, OperationDef) and isinstance(expr.expr, Tracker):
+                tracker_interval = expr.expr.interval
+                inner = OperationDef(expr.expr.expr)
+            elif isinstance(expr, Tracker):
+                tracker_interval = expr.interval
+                inner = expr.expr
+
+            fn_expr = TraceEvaluator.compile_traced_expression(inner, self.all_ops)
+            if tracker_interval is not None:
+                self.compiled_trackers.append((tracker_interval, fn_expr))
             else:
                 self.compiled_constraints.append(fn_expr)
 
-        self.log.info(f"There are a total of {self.count(self.params)} trainable parameters in the network/s.")
+        # self.log.info(f"There are a total of {self.count(self.models)} trainable parameters in the network/s.")
         return None
 
     def solve(
         self,
         epochs: int = 1000,
-        optimizer: optax.GradientTransformation = optax.adam(1.0),
-        learning_rate: LearningRateSchedule = None,
         constraint_weights: WeightSchedule = None,
         batchsize: int = None,
-        lora: Optional[Dict] = None,
+        checkpoint_gradients: bool = False,
+        offload_data: bool = False,
     ):
-        """
-        Solve using traced constraints with optional LoRA fine-tuning.
+        """Train using per-model optimizers attached via ``model.optimizer()``.
+
+        Every model used in the constraints **must** have an optimizer
+        attached before calling ``solve()``.  Models can optionally be
+        frozen (``model.freeze()``) or have LoRA enabled
+        (``model.lora(rank, alpha)``).
 
         Args:
             epochs: Number of training epochs.
-            optimizer: Optax optimizer.
-            learning_rate: Learning rate schedule.
             constraint_weights: Weight schedule for constraints.
-            batchsize: Mini-batch size (None for full-batch).
-            lora: Optional rank dictionary for LoRA fine-tuning.
-                Structure mirrors params with (rank, alpha) tuples at leaves.
-                Use float('nan') to skip a layer.
-
-                For multi-model (params has int keys):
-                    lora = {
-                        0: {  # Model 0
-                            'params': {
-                                'Dense_0': {'kernel': (8, 1.0)},
-                                'Dense_1': {'kernel': float('nan')},
-                            }
-                        },
-                        # Model 1 not included = no LoRA for it
-                    }
-
-                For single model:
-                    lora = {
-                        'params': {
-                            'Dense_0': {'kernel': (8, 1.0)},
-                        }
-                    }
-
-                Use create_rank_dict() helper to generate this automatically.
+            batchsize: Mini-batch size (``None`` for full-batch).
+            checkpoint_gradients: If ``True``, wrap each constraint's
+                forward pass in ``jax.checkpoint`` (gradient
+                checkpointing / activation rematerialisation).  Trades
+                ~30 % extra compute for significantly lower activation
+                memory.  Default ``False``.
+            offload_data: If ``True``, keep the full training dataset in
+                host (CPU) memory and stream only the current mini-batch
+                to the device each step.  Requires ``batchsize`` to be
+                set.  Default ``False``.
 
         Returns:
-            statistics: Training history with visualization methods.
+            statistics: Training history with ``.plot()`` convenience.
         """
         n_constraints = len(self.compiled_constraints)
         batchsize = batchsize if batchsize is not None else self.domain.total_samples
 
-        self.learning_rate = learning_rate if learning_rate is not None else LearningRateSchedule(1.0)
-        self.constraint_weights = constraint_weights if constraint_weights is not None else WeightSchedule([1.0 for _ in range(n_constraints)])
+        self.constraint_weights = constraint_weights if constraint_weights is not None else WeightSchedule([1.0] * n_constraints)
 
-        if isinstance(optimizer, Callable):
-            optimizer = optimizer(1.0)
-        else:
-            self.log.warning("Optimizer should have learning rate 1.0 -> rates are set via learning_rate argument.")
+        # ── 0. Validate offload_data ──
+        if offload_data and (batchsize is None or batchsize >= self.domain.total_samples):
+            self.log.warning("offload_data requires batchsize < total_samples; " "ignoring offload_data for this run.")
+            offload_data = False
 
-        scale = optax.inject_hyperparams(optax.scale)(step_size=self.learning_rate(0, jnp.zeros(n_constraints)))
-        optimizer = optax.chain(optimizer, scale)
+        # ── 1. Collect FlaxModule metadata ──
+        flax_mods = self._collect_flax_modules()  # {layer_id: FlaxModule}
 
-        # === LoRA Setup ===
-        use_lora = lora is not None
+        # Validate: every non-frozen model must have an optimizer
+        for lid, fm in flax_mods.items():
+            if not fm._frozen and fm._opt_fn is None:
+                raise ValueError(f"Model '{fm.name or type(fm.module).__name__}' (layer {lid}) " f"has no optimizer. Call  model.optimizer(optax.adam, lr=...)  " f"before solve(), or freeze it with  model.freeze().")
 
-        if use_lora:
-            self._lora = LoRA(lora, self.params)
-            self.rng, lora_key = jax.random.split(self.rng)
+        # ── 2. Apply LoRA transforms ──
+        models = dict(self.models)
+        for lid, fm in flax_mods.items():
+            if fm._lora_config is not None:
+                rank, alpha = fm._lora_config
+                self.rng, key = jax.random.split(self.rng)
+                models[lid] = _apply_lora(models[lid], rank, alpha, key=key)
+                self.log.info(f"LoRA applied to model {lid} (rank={rank}, alpha={alpha})")
 
-            # Initialize LoRA params
-            self._lora_params, lora_param_count, lora_layer_count = self._lora.init(lora_key, self.params)
-            self._lora_params = self._shard_params(self._lora_params)
+        # ── 3. Build trainable filter ──
+        filter_spec = {}
+        for lid, model in models.items():
+            fm = flax_mods.get(lid)
+            if fm is not None and fm._frozen:
+                # Whole model frozen – every array → False
+                filter_spec[lid] = jax.tree_util.tree_map(lambda l: False if eqx.is_array(l) else l, model)
+            elif fm is not None and fm._lora_config is not None:
+                # LoRA – base frozen, lora_A/B trainable
+                filter_spec[lid] = _lora_trainable_filter(model)
+            else:
+                # Normal – every array trainable
+                filter_spec[lid] = jax.tree_util.tree_map(lambda l: True if eqx.is_array(l) else l, model)
 
-            base_count = self.count(self.params)
-            self.log.info(f"LoRA: {lora_layer_count} layers, {lora_param_count:,} params ({100*lora_param_count/base_count:.2f}% of base)")
+        # ── 4. Three-way partition ──
+        trainable, rest = eqx.partition(models, filter_spec)
+        frozen_arrays, static = eqx.partition(rest, eqx.is_array)
 
-            # Optimizer on LoRA params only
-            trainable_params = self._lora_params
-            opt_state = optimizer.init(trainable_params)
-        else:
-            self._lora = None
-            self._lora_params = None
+        # Shard trainable params
+        trainable = self._shard_params(trainable)
 
-            trainable_params = self.params
-            opt_state = optimizer.init(trainable_params)
+        # ── 5. Build per-model optimizers ──
+        per_model_opts = {}  # {str(lid): optax chain}
+        lr_schedules = {}  # {str(lid): LearningRateSchedule}
+        zeros = jnp.zeros(n_constraints)
+
+        for lid, fm in flax_mods.items():
+            if fm._frozen:
+                continue
+            k = str(lid)
+
+            opt_fn = fm._opt_fn
+            lr_sched = fm._lr
+
+            # Instantiate optimizer (handle callables like optax.adam)
+            if isinstance(opt_fn, Callable) and not isinstance(opt_fn, optax.GradientTransformation):
+                try:
+                    base_opt = opt_fn(1.0)
+                except TypeError:
+                    base_opt = opt_fn
+            else:
+                base_opt = opt_fn
+
+            scale = optax.inject_hyperparams(optax.scale)(step_size=lr_sched(0, zeros))
+            per_model_opts[k] = optax.chain(base_opt, scale)
+            lr_schedules[k] = lr_sched
+
+        # Initialise optimizer states and place on mesh
+        opt_states = {}
+        for k in per_model_opts:
+            lid = int(k)
+            state = per_model_opts[k].init(trainable[lid])
+            # Put every leaf on the mesh with P() so shardings are
+            # canonical and match what the step function will produce.
+            opt_states[k] = jax.tree_util.tree_map(
+                lambda x: jax.device_put(x, NamedSharding(self.mesh, P())) if isinstance(x, (jnp.ndarray, jax.Array)) else x,
+                state,
+            )
 
         self._log_constraint_shapes(batchsize)
 
-        # Prepare data with sharding
-        domain_data = self.domain_data
+        # ── 6. Prepare data ──
         n_devices = len(self.devices)
-        domain_data = DomainData(
-            tensor_tags=self._replicate_for_devices(domain_data.tensor_tags, n_devices),
-            dimension=domain_data.dimension,
-            points_by_tag=self._replicate_for_devices(domain_data.points_by_tag, n_devices),
-        )
-        domain_data = DomainData(
-            tensor_tags=self._shard_data(domain_data.tensor_tags),
-            dimension=domain_data.dimension,
-            points_by_tag=self._shard_data(domain_data.points_by_tag),
+
+        if offload_data:
+            # Keep full dataset as numpy on host — only a mini-batch is
+            # transferred to the device each step.
+            host_context = {k: np.asarray(v) for k, v in self.domain_data.context.items()}
+            total_samples = max(v.shape[0] for v in host_context.values())
+            effective_batchsize = None  # data is already pre-sliced
+            self.log.info(f"Data offloading enabled: {total_samples} total samples, " f"streaming batches of {batchsize} from host")
+        else:
+            # Replicate / shard full dataset on device (original behaviour)
+            domain_data = self.domain_data
+            domain_data = DomainData(
+                context=self._replicate_for_devices(domain_data.context, n_devices),
+                dimension=domain_data.dimension,
+            )
+            domain_data = DomainData(
+                context=self._shard_data(domain_data.context),
+                dimension=domain_data.dimension,
+            )
+            on_device_context = domain_data.context
+            effective_batchsize = batchsize
+
+        # ── 7. Build JIT-compiled step function ──
+        step_fn = self.make_step_fn(
+            per_model_opts=per_model_opts,
+            compiled_constraints=self.compiled_constraints,
+            n_constraints=n_constraints,
+            batchsize=effective_batchsize,
+            frozen=frozen_arrays,
+            static=static,
+            lr_schedules=lr_schedules,
+            checkpoint_gradients=checkpoint_gradients,
         )
 
-        # Select training function
-        if use_lora:
-            train_fn = self._lora.make_train_fn(
-                optimizer=optimizer,
-                compiled_constraints=self.compiled_constraints,
-                compiled_trackers=self.compiled_trackers,
-                domain_data=domain_data,
-                epochs=epochs,
-                batchsize=batchsize,
-                constraint_weights=self.constraint_weights,
-                learning_rate=self.learning_rate,
-                total_epochs=self._total_epochs,
-                all_params=self.params,
-            )
-        else:
-            train_fn = self.make_train_fn(
-                optimizer,
-                self.compiled_constraints,
+        # Optional: build JIT-compiled tracker function
+        has_trackers = len(self.compiled_trackers) > 0
+        if has_trackers:
+            track_fn = self._make_track_fn(
                 self.compiled_trackers,
-                domain_data,
-                epochs,
-                batchsize,
+                effective_batchsize,
+                frozen_arrays,
+                static,
             )
+            tracker_intervals = [intv for intv, _ in self.compiled_trackers]
 
         with self.mesh:
-            train = jax.jit(lox.spool(train_fn))
-            self.log.info("Jit Tracing Training Function with mesh sharding - this might take a while")
-            lowered = train.lower(trainable_params, opt_state, self.rng)
-            compiled_train = lowered.compile()
-            self._cost_analysis(compiled_train)
+            # ── Derive input shardings from actual arrays ──
+            # This tells jax.jit the canonical sharding for every input.
+            # Without this, outputs from step N may carry different
+            # sharding annotations than the original inputs, causing
+            # an expensive recompilation at step N+1.
+            def _leaf_sharding(x):
+                if isinstance(x, jax.Array) and hasattr(x, "sharding"):
+                    return x.sharding
+                return None
 
-            st = time.time()
-            (
-                trainable_params,
-                opt_state,
-                self.rng,
-                loss,
-                individual_losses,
-                _,
-            ), logs = train(trainable_params, opt_state, self.rng)
-            et = time.time()
-
-            # Update params
-            if use_lora:
-                self._lora_params = trainable_params
-                # Merge LoRA into full params for eval/inference
-                self.params = self._lora.get_full_params(self._lora_params, self.params)
+            if offload_data:
+                trace_context = {k: jnp.zeros((batchsize,) + tuple(v.shape[1:])) for k, v in host_context.items()}
+                trace_context = self._shard_data(trace_context)
             else:
-                self.params = trainable_params
+                trace_context = on_device_context
 
-            logs = self._to_plain_dict(logs)
-            logs["training_time"] = et - st
-            logs["lora"] = use_lora
+            # Canonical replicated sharding — must match what the step
+            # function outputs, otherwise JAX will recompile.
+            replicated = NamedSharding(self.mesh, P())
+
+            # Place scalars on the mesh so their output sharding matches.
+            self.rng = jax.device_put(self.rng, replicated)
+            prev_losses = jax.device_put(jnp.zeros(n_constraints), replicated)
+
+            in_shardings = (
+                jax.tree_util.tree_map(_leaf_sharding, trainable),  # trainable
+                jax.tree_util.tree_map(_leaf_sharding, opt_states),  # opt_states
+                replicated,  # rng
+                jax.tree_util.tree_map(_leaf_sharding, trace_context),  # context
+                replicated,  # epoch (scalar)
+                replicated,  # prev_losses
+            )
+
+            # Buffer donation: reuse trainable (0) and opt_states (1)
+            # buffers in-place since the step returns updated versions.
+            # rng (2) is also donated (small but correct).
+            jit_step = jax.jit(
+                step_fn,
+                in_shardings=in_shardings,
+                donate_argnums=(0, 1, 2),
+            )
+
+            if has_trackers:
+                jit_track = jax.jit(track_fn)
+
+            self.log.info("JIT compiling step function with mesh sharding — " "this might take a while")
+
+            # Trigger AOT compilation so the first real step is fast.
+            _ = jit_step.lower(
+                trainable,
+                opt_states,
+                self.rng,
+                trace_context,
+                jax.device_put(jnp.int32(0), replicated),
+                prev_losses,
+            ).compile()
+
+            # ── 8. Training loop ──
+            hw_monitor = HardwareMonitor(log_dir=self.log.path, interval=0.5)
+            hw_monitor.start()
+
+            print_rate = max(1, epochs // 100 if epochs < 100_000 else epochs // 1000)
+            prev_losses = jax.device_put(jnp.zeros(n_constraints), replicated)
+
+            # Log buffers
+            log_epochs = []
+            log_losses = []
+            log_total_loss = []
+            log_weights = []
+            log_timestamps = []
+            log_track_stats = []
+
+            rng_np = np.random.default_rng(int(jax.device_get(self.rng[0])))
+            st = time.time()
+
+            for epoch in range(epochs):
+                # --- prepare context for this step ---
+                if offload_data:
+                    indices = rng_np.choice(total_samples, batchsize, replace=False)
+                    batch_np = {k: v[indices] for k, v in host_context.items()}
+                    context = self._shard_data(jax.device_put(batch_np))
+                else:
+                    context = on_device_context
+
+                epoch_jnp = jax.device_put(jnp.int32(epoch), replicated)
+
+                (
+                    trainable,
+                    opt_states,
+                    self.rng,
+                    total_loss,
+                    individual_losses,
+                    tag_weights,
+                ) = jit_step(
+                    trainable,
+                    opt_states,
+                    self.rng,
+                    context,
+                    epoch_jnp,
+                    prev_losses,
+                )
+
+                prev_losses = individual_losses
+
+                # --- logging (only every print_rate epochs) ---
+                should_log = (epoch % print_rate == 0) or (epoch == epochs - 1)
+                if should_log:
+                    # Synchronise once per log interval
+                    losses_np = np.asarray(jax.device_get(individual_losses))
+                    total_np = float(jax.device_get(total_loss))
+                    weights_np = np.asarray(jax.device_get(tag_weights))
+
+                    log_epochs.append(epoch)
+                    log_losses.append(losses_np)
+                    log_total_loss.append(total_np)
+                    log_weights.append(weights_np)
+                    log_timestamps.append(time.time())
+
+                    # Trackers
+                    track_stats_np = None
+                    if has_trackers and any(epoch % intv == 0 for intv in tracker_intervals):
+                        track_vals = jit_track(trainable, context, self.rng)
+                        track_stats_np = [float(jax.device_get(v)) for v in track_vals]
+                        log_track_stats.append(track_stats_np)
+
+                    # Progress line
+                    loss_strs = " | ".join(f"C{i}: {l:>10.4e}" for i, l in enumerate(losses_np))
+                    if track_stats_np is not None:
+                        track_strs = " | ".join(f"T{i}: {v:>10.4e}" for i, v in enumerate(track_stats_np))
+                        print(
+                            f"\rEpoch {epoch:>6}/{epochs}| " f"L:{total_np:>10.4e} | {loss_strs} | {track_strs}",
+                            end="\n",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"\rEpoch {epoch:>6}/{epochs}| " f"L:{total_np:>10.4e} | {loss_strs}",
+                            end="\n",
+                            flush=True,
+                        )
+
+            et = time.time()
+            hw_monitor.stop(logger=self.log)
+
+            # ── 9. Reconstruct models ──
+            trained_models = eqx.combine(trainable, frozen_arrays, static)
+
+            # Merge LoRA if requested
+            for lid, fm in flax_mods.items():
+                if fm._lora_config is not None:
+                    trained_models[lid] = _merge_lora(trained_models[lid])
+                    self.log.info(f"LoRA merged for model {lid}")
+
+            self.models = trained_models
+
+            # ── 9b. Sync FlaxModule.module refs with trained weights ──
+            # The expression tree (self.constraints / self.all_ops) holds
+            # FlaxModule objects whose .module still points to the
+            # *pre-training* arrays.  Buffer donation deletes those
+            # arrays, so pickling the expression tree would fail.
+            # Update every FlaxModule to point at the trained model.
+            for lid, fm in flax_mods.items():
+                fm.module = trained_models[lid]
+
+            # ── 10. Build log dict ──
+            logs = {
+                "epoch": np.array(log_epochs),
+                "total_loss": np.array(log_total_loss),
+                "losses": np.stack(log_losses) if log_losses else np.array([]),
+                "weights": np.stack(log_weights) if log_weights else np.array([]),
+                "timestamps": np.array(log_timestamps),
+                "training_time": et - st,
+            }
+            if log_track_stats:
+                logs["track_stats"] = np.array(log_track_stats)
             self.training_logs.append(logs)
             self.log.info(f"Training took {(logs['training_time'] / 60):.2f} minutes")
 
         self._total_epochs += epochs
 
         # Checkpoint
-        checkpoint_data = {
-            "params": self.params,
-            "opt_state": opt_state,
-            "rng": self.rng,
-            "lora_params": self._lora_params if use_lora else None,
-        }
-
-        self.checkpoints.append(self.checkpoint(**checkpoint_data))
+        self.checkpoints.append(
+            self.checkpoint(
+                models=self.models,
+                opt_state=opt_states,
+                rng=self.rng,
+            )
+        )
 
         return statistics(self.training_logs)
 
@@ -650,9 +872,8 @@ class core(CoreUtilities):
             # Use jax.eval_shape to get output shape without computation
             out_shape = jax.eval_shape(
                 lambda: fn(
-                    self.params,
-                    self.domain_data.points_by_tag,
-                    self.domain_data.tensor_tags,
+                    self.models,
+                    self.domain_data.context,
                     batchsize=batchsize,
                     key=test_rng,
                 )
@@ -663,9 +884,8 @@ class core(CoreUtilities):
             # Use jax.eval_shape to get output shape without computation
             out_shape = jax.eval_shape(
                 lambda: fn(
-                    self.params,
-                    self.domain_data.points_by_tag,
-                    self.domain_data.tensor_tags,
+                    self.models,
+                    self.domain_data.context,
                     batchsize=batchsize,
                     key=test_rng,
                 )
@@ -676,26 +896,6 @@ class core(CoreUtilities):
                 self.log.info(f"Tracker {i}: {out_shape}")
 
         return None
-
-    def _cost_analysis(self, compiled_train):
-        cost_analysis_list = compiled_train.cost_analysis()
-
-        if cost_analysis_list is None:
-            return
-
-        # Handle both single dict and list of dicts
-        if isinstance(cost_analysis_list, dict):
-            # Single aggregated result
-            flops = cost_analysis_list.get("flops", 0)
-            bytes_accessed = cost_analysis_list.get("bytes accessed", 0)
-            self.log.info(f"Performance : megaFLOPS: {flops / 1_000_000:.3f} | megaBYTES: {bytes_accessed / 1_000_000:.3f}")
-        elif isinstance(cost_analysis_list, list):
-            # Per-device results
-            for i, cost_analysis in enumerate(cost_analysis_list):
-                device = jax.devices()[i] if i < len(jax.devices()) else f"device_{i}"
-                flops = cost_analysis.get("flops", 0)
-                bytes_accessed = cost_analysis.get("bytes accessed", 0)
-                self.log.info(f"Performance: {device} | megaFLOPS: {flops / 1_000_000:.3f} | megaBYTES: {bytes_accessed / 1_000_000:.3f}")
 
     def sweep(
         self,
@@ -731,13 +931,10 @@ class core(CoreUtilities):
         """
         domain_data = self.domain_data if domain is None else self.prepare_domain_data(domain)
 
-        # evaluator = TraceEvaluator(self.params, self.layer_info)
-
-        fn = TraceEvaluator.compile_traced_expression(operation, self.all_ops, self.layer_info)
+        fn = TraceEvaluator.compile_traced_expression(operation, self.all_ops)
         result = fn(
-            self.params,
-            domain_data.points_by_tag,
-            domain_data.tensor_tags,
+            self.models,
+            domain_data.context,
             batchsize=None,
             key=self.rng,
         )

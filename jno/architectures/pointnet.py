@@ -1,80 +1,129 @@
 from typing import Callable, Optional, List
+import jax
 import jax.numpy as jnp
-from flax import linen as nn
-from dataclasses import dataclass, field
+import equinox as eqx
 
 
-class PointNet(nn.Module):
-    """
-    PointNet-style CNN with 1D convolutions, sin activation, and global feature aggregation.
-    """
+class PointNet(eqx.Module):
+    output_dim: int
+    hidden_dims: list
+    fixed_size: bool
+    dropout_rate: float
+    feature_transform: Optional[Callable]
+    act: Callable = eqx.field(static=True)
+    use_bias: bool
 
-    output_dim: int  # Output dimension (dO in original)
-    hidden_dims: list = field(default_factory=[32, 16, 8, 4, 2, 2, 4, 8, 8])
-    fixed_size: bool = True
-    dropout_rate: float = 0.0
-    feature_transform: Optional[Callable] = None  # Optional input transform
-    act: Callable = nn.tanh
-    use_bias: bool = True
+    enc_convs: list
+    dec_convs: list
+    output_conv: eqx.nn.Conv1d
 
-    @nn.compact
-    def __call__(self, *inputs: jnp.ndarray, training: bool = True) -> jnp.ndarray:
-        """
-        Args:
-            x: Input tensor of shape (batch, n_points, features)
-            training: Whether in training mode (affects dropout)
+    def __init__(
+        self,
+        in_features: int,
+        output_dim: int,
+        hidden_dims: list = None,
+        fixed_size: bool = True,
+        dropout_rate: float = 0.0,
+        feature_transform: Optional[Callable] = None,
+        act: Callable = jax.nn.tanh,
+        use_bias: bool = True,
+        *,
+        key: jax.random.PRNGKey,
+        **kwargs,
+    ):
+        if hidden_dims is None:
+            hidden_dims = [32, 16, 8, 4, 2, 2, 4, 8, 8]
+        self.output_dim = output_dim
+        self.hidden_dims = list(hidden_dims)
+        self.fixed_size = fixed_size
+        self.dropout_rate = dropout_rate
+        self.feature_transform = feature_transform
+        self.act = act
+        self.use_bias = use_bias
 
-        Returns:
-            Output tensor of shape (batch, n_points, output_dim)
-        """
+        # Encoder convolutions: in -> h0 -> h1 -> h2 -> h3 -> h4
+        enc_channels = [in_features] + [int(h) for h in hidden_dims[:5]]
+        enc_convs = []
+        for i in range(5):
+            key, subkey = jax.random.split(key)
+            enc_convs.append(
+                eqx.nn.Conv1d(
+                    enc_channels[i],
+                    enc_channels[i + 1],
+                    kernel_size=1,
+                    use_bias=use_bias,
+                    key=subkey,
+                )
+            )
+        self.enc_convs = enc_convs
 
+        # Decoder convolutions: (h1 + h4) -> h5 -> h6 -> h7 -> h8
+        dec_in = int(hidden_dims[1]) + int(hidden_dims[4])
+        dec_channels = [dec_in] + [int(h) for h in hidden_dims[5:9]]
+        dec_convs = []
+        for i in range(4):
+            key, subkey = jax.random.split(key)
+            dec_convs.append(
+                eqx.nn.Conv1d(
+                    dec_channels[i],
+                    dec_channels[i + 1],
+                    kernel_size=1,
+                    use_bias=use_bias,
+                    key=subkey,
+                )
+            )
+        self.dec_convs = dec_convs
+
+        # Output convolution
+        key, subkey = jax.random.split(key)
+        self.output_conv = eqx.nn.Conv1d(
+            int(hidden_dims[8]),
+            output_dim,
+            kernel_size=1,
+            use_bias=use_bias,
+            key=subkey,
+        )
+
+    def __call__(self, *inputs, key=None, **kwargs):
         if len(inputs) == 1:
             h = inputs[0]
         else:
             h = jnp.concatenate(inputs, axis=-1)
-
-        if h.ndim == 1:
-            h = h[:, None]
-
-        # Optional feature transform
         if self.feature_transform is not None:
             c = self.feature_transform(h)
         else:
             c = h
-        n_points = c.shape[0]  # Get actual shape from input, not self.n_tot
+        n_points = c.shape[0]
 
-        # Helper function for Conv1D + sin + Dropout block
-        def conv_dropout(c, features, name):
-            c = nn.Conv(features=int(features), kernel_size=(1,), use_bias=self.use_bias, name=name)(c)
+        dropout = eqx.nn.Dropout(p=self.dropout_rate)
+
+        def conv_dropout(c, conv, key):
+            c = jax.vmap(conv)(c[:, None, :])[:, 0, :]
             c = self.act(c)
-            c = nn.Dropout(rate=self.dropout_rate, deterministic=not training)(c)
-            return c
+            if key is not None:
+                key, subkey = jax.random.split(key)
+                c = dropout(c, key=subkey)
+            return c, key
 
-        # Encoder path
-        c = conv_dropout(c, self.hidden_dims[0], "conv1")
-        c = conv_dropout(c, self.hidden_dims[1], "conv2")
-        seg_part1 = c  # Save for skip connection
+        # Encoder
+        c, key = conv_dropout(c, self.enc_convs[0], key)
+        c, key = conv_dropout(c, self.enc_convs[1], key)
+        seg_part1 = c
+        c, key = conv_dropout(c, self.enc_convs[2], key)
+        c, key = conv_dropout(c, self.enc_convs[3], key)
+        c, key = conv_dropout(c, self.enc_convs[4], key)
 
-        c = conv_dropout(c, self.hidden_dims[2], "conv3")
-        c = conv_dropout(c, self.hidden_dims[3], "conv4")
-        c = conv_dropout(c, self.hidden_dims[4], "conv5")
-
-        # Global feature extraction via max pooling
-        # MaxPool over the points dimension, then tile back
-        global_feature = jnp.max(c, axis=0, keepdims=True)  # (batch, 1, channels)
-        global_feature = jnp.broadcast_to(global_feature, (n_points, global_feature.shape[-1]))  # (batch, n_points, channels)
-
-        # Concatenate local and global features
+        # Global feature
+        global_feature = jnp.max(c, axis=0, keepdims=True)
+        global_feature = jnp.broadcast_to(global_feature, (n_points, global_feature.shape[-1]))
         c = jnp.concatenate([seg_part1, global_feature], axis=-1)
 
-        # Decoder path
-        c = conv_dropout(c, self.hidden_dims[5], "conv6")
-        c = conv_dropout(c, self.hidden_dims[6], "conv7")
-        c = conv_dropout(c, self.hidden_dims[7], "conv8")
-        c = conv_dropout(c, self.hidden_dims[8], "conv9")
+        # Decoder
+        c, key = conv_dropout(c, self.dec_convs[0], key)
+        c, key = conv_dropout(c, self.dec_convs[1], key)
+        c, key = conv_dropout(c, self.dec_convs[2], key)
+        c, key = conv_dropout(c, self.dec_convs[3], key)
 
-        # Final output layer (linear activation)
-        c = c[None, :, :]
-        c = nn.Conv(features=self.output_dim, kernel_size=(1,), use_bias=self.use_bias, name="output_conv")(c)
-        c = c[0]
+        # Output
+        c = jax.vmap(self.output_conv)(c[:, None, :])[:, 0, :]
         return c

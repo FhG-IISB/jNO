@@ -1,25 +1,13 @@
-# pcno.py - JAX/Flax implementation - https://github.com/PKU-CMEGroup/NeuralOperator/tree/main
+# pcno.py - JAX/Equinox implementation - https://github.com/PKU-CMEGroup/NeuralOperator/tree/main
 
-from typing import Callable, Optional, Sequence, Tuple
+from typing import Callable, List, Optional, Sequence, Tuple
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
 import numpy as np
-
-
-def _get_act(act: str) -> Optional[Callable]:
-    """Get activation function by name."""
-    activations = {
-        "tanh": nn.tanh,
-        "gelu": nn.gelu,
-        "relu": nn.relu,
-        "elu": nn.elu,
-        "leaky_relu": nn.leaky_relu,
-        "none": None,
-    }
-    if act not in activations:
-        raise ValueError(f"{act} is not supported")
-    return activations[act]
+import equinox as eqx
+from .linear import Linear
+from .common import get_activation as _get_act
+from .common import compute_Fourier_modes as compute_Fourier_modes_helper
 
 
 def scaled_sigmoid(x: jnp.ndarray, min_val: float, max_val: float) -> jnp.ndarray:
@@ -30,61 +18,6 @@ def scaled_sigmoid(x: jnp.ndarray, min_val: float, max_val: float) -> jnp.ndarra
 def scaled_logit(y: jnp.ndarray, min_val: float, max_val: float) -> jnp.ndarray:
     """Inverse of scaled_sigmoid."""
     return jnp.log((y - min_val) / (max_val - y))
-
-
-def compute_Fourier_modes_helper(ndims: int, nks: Sequence[int], Ls: Sequence[float]) -> np.ndarray:
-    """
-    Compute Fourier modes k for bases cos(kx), sin(kx), 1.
-    We cannot have both k and -k, cannot have 0.
-    """
-    assert len(nks) == len(Ls) == ndims
-
-    if ndims == 1:
-        nk = nks[0]
-        Lx = Ls[0]
-        k_pairs = np.zeros((nk, ndims))
-        k_pair_mag = np.zeros(nk)
-        i = 0
-        for kx in range(1, nk + 1):
-            k_pairs[i, :] = 2 * np.pi / Lx * kx
-            k_pair_mag[i] = np.linalg.norm(k_pairs[i, :])
-            i += 1
-
-    elif ndims == 2:
-        nx, ny = nks
-        Lx, Ly = Ls
-        nk = 2 * nx * ny + nx + ny
-        k_pairs = np.zeros((nk, ndims))
-        k_pair_mag = np.zeros(nk)
-        i = 0
-        for kx in range(-nx, nx + 1):
-            for ky in range(0, ny + 1):
-                if ky == 0 and kx <= 0:
-                    continue
-                k_pairs[i, :] = 2 * np.pi / Lx * kx, 2 * np.pi / Ly * ky
-                k_pair_mag[i] = np.linalg.norm(k_pairs[i, :])
-                i += 1
-
-    elif ndims == 3:
-        nx, ny, nz = nks
-        Lx, Ly, Lz = Ls
-        nk = 4 * nx * ny * nz + 2 * (nx * ny + nx * nz + ny * nz) + nx + ny + nz
-        k_pairs = np.zeros((nk, ndims))
-        k_pair_mag = np.zeros(nk)
-        i = 0
-        for kx in range(-nx, nx + 1):
-            for ky in range(-ny, ny + 1):
-                for kz in range(0, nz + 1):
-                    if kz == 0 and (ky < 0 or (ky == 0 and kx <= 0)):
-                        continue
-                    k_pairs[i, :] = 2 * np.pi / Lx * kx, 2 * np.pi / Ly * ky, 2 * np.pi / Lz * kz
-                    k_pair_mag[i] = np.linalg.norm(k_pairs[i, :])
-                    i += 1
-    else:
-        raise ValueError(f"{ndims} in compute_Fourier_modes is not supported")
-
-    k_pairs = k_pairs[np.argsort(k_pair_mag, kind="stable"), :]
-    return k_pairs
 
 
 def compute_Fourier_modes(ndims: int, nks: Sequence[int], Ls: Sequence[float]) -> np.ndarray:
@@ -161,15 +94,29 @@ def compute_gradient(f: jnp.ndarray, directed_edges: jnp.ndarray, edge_gradient_
     return jnp.transpose(f_gradients, (0, 2, 1))
 
 
-class SpectralConv(nn.Module):
+class SpectralConv(eqx.Module):
     """Spectral convolution layer for PCNO."""
 
-    in_channels: int
-    out_channels: int
-    nmodes: int
-    nmeasures: int
+    in_channels: int = eqx.field(static=True)
+    out_channels: int = eqx.field(static=True)
+    nmodes: int = eqx.field(static=True)
+    nmeasures: int = eqx.field(static=True)
+    weights_c: jnp.ndarray
+    weights_s: jnp.ndarray
+    weights_0: jnp.ndarray
 
-    @nn.compact
+    def __init__(self, in_channels: int, out_channels: int, nmodes: int, nmeasures: int, *, key):
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.nmodes = nmodes
+        self.nmeasures = nmeasures
+
+        scale = 1.0 / (in_channels * out_channels)
+        k1, k2, k3 = jax.random.split(key, 3)
+        self.weights_c = jax.random.uniform(k1, (in_channels, out_channels, nmodes, nmeasures), minval=-scale, maxval=scale)
+        self.weights_s = jax.random.uniform(k2, (in_channels, out_channels, nmodes, nmeasures), minval=-scale, maxval=scale)
+        self.weights_0 = jax.random.uniform(k3, (in_channels, out_channels, 1, nmeasures), minval=-scale, maxval=scale)
+
     def __call__(
         self,
         x: jnp.ndarray,
@@ -193,21 +140,15 @@ class SpectralConv(nn.Module):
         Returns:
             x: float[batch_size, out_channels, nnodes]
         """
-        scale = 1.0 / (self.in_channels * self.out_channels)
-
-        weights_c = self.param("weights_c", nn.initializers.uniform(scale), (self.in_channels, self.out_channels, self.nmodes, self.nmeasures))
-        weights_s = self.param("weights_s", nn.initializers.uniform(scale), (self.in_channels, self.out_channels, self.nmodes, self.nmeasures))
-        weights_0 = self.param("weights_0", nn.initializers.uniform(scale), (self.in_channels, self.out_channels, 1, self.nmeasures))
-
         # Forward Fourier transform
         x_c_hat = jnp.einsum("bix,bxkw->bikw", x, wbases_c)
         x_s_hat = -jnp.einsum("bix,bxkw->bikw", x, wbases_s)
         x_0_hat = jnp.einsum("bix,bxkw->bikw", x, wbases_0)
 
         # Apply weights in Fourier space
-        f_c_hat = jnp.einsum("bikw,iokw->bokw", x_c_hat, weights_c) - jnp.einsum("bikw,iokw->bokw", x_s_hat, weights_s)
-        f_s_hat = jnp.einsum("bikw,iokw->bokw", x_s_hat, weights_c) + jnp.einsum("bikw,iokw->bokw", x_c_hat, weights_s)
-        f_0_hat = jnp.einsum("bikw,iokw->bokw", x_0_hat, weights_0)
+        f_c_hat = jnp.einsum("bikw,iokw->bokw", x_c_hat, self.weights_c) - jnp.einsum("bikw,iokw->bokw", x_s_hat, self.weights_s)
+        f_s_hat = jnp.einsum("bikw,iokw->bokw", x_s_hat, self.weights_c) + jnp.einsum("bikw,iokw->bokw", x_c_hat, self.weights_s)
+        f_0_hat = jnp.einsum("bikw,iokw->bokw", x_0_hat, self.weights_0)
 
         # Inverse Fourier transform
         x = jnp.einsum("bokw,bxkw->box", f_0_hat, bases_0) + 2 * jnp.einsum("bokw,bxkw->box", f_c_hat, bases_c) - 2 * jnp.einsum("bokw,bxkw->box", f_s_hat, bases_s)
@@ -215,7 +156,7 @@ class SpectralConv(nn.Module):
         return x
 
 
-class PCNO(nn.Module):
+class PCNO(eqx.Module):
     """
     Point Cloud Neural Operator.
 
@@ -227,42 +168,118 @@ class PCNO(nn.Module):
        - D: differential operator (self.gws)
     3. Project to output space via fc1 and fc2
 
+    Args:
+        ndims: Dimensionality of the problem (1, 2, or 3)
+        modes: float[nmodes, ndims, nmeasures] - Fourier mode vectors
+        nmeasures: Number of measures
+        layers: List of channel dimensions for each layer
+        fc_dim: Hidden dimension for projection (0 for no hidden layer)
+        in_dim: Number of input channels
+        out_dim: Number of output channels
+        inv_L_scale_min: Minimum value for inverse length scale
+        inv_L_scale_max: Maximum value for inverse length scale
+        train_inv_L_scale: Whether to train the inverse length scale
+        act: Activation function name
+        key: PRNG key for parameter initialization
     """
 
-    ndims: int
-    modes: jnp.ndarray  # float[nmodes, ndims, nmeasures]
-    nmeasures: int
-    layers: Sequence[int]
-    fc_dim: int = 128
-    in_dim: int = 3
-    out_dim: int = 1
-    inv_L_scale_min: float = 0.5
-    inv_L_scale_max: float = 2.0
-    train_inv_L_scale: bool = True
-    act: str = "gelu"
+    ndims: int = eqx.field(static=True)
+    modes: jnp.ndarray  # float[nmodes, ndims, nmeasures] — non-trainable
+    nmeasures: int = eqx.field(static=True)
+    layers: Sequence[int] = eqx.field(static=True)
+    fc_dim: int = eqx.field(static=True)
+    in_dim: int = eqx.field(static=True)
+    out_dim: int = eqx.field(static=True)
+    inv_L_scale_min: float = eqx.field(static=True)
+    inv_L_scale_max: float = eqx.field(static=True)
+    train_inv_L_scale: bool = eqx.field(static=True)
+    act: str = eqx.field(static=True)
+    activation: Callable = eqx.field(static=True)
+    nmodes: int = eqx.field(static=True)
 
-    def setup(self):
-        self.activation = _get_act(self.act)
-        nmodes = self.modes.shape[0]
+    inv_L_scale_latent: jnp.ndarray  # trainable parameter
+    fc0: Linear
+    sp_convs: list
+    ws: list
+    gws: list
+    fc1: Optional[Linear]
+    fc2: Linear
 
-        # Spectral convolution layers
-        self.sp_convs = [
-            SpectralConv(
-                in_channels=in_size,
-                out_channels=out_size,
-                nmodes=nmodes,
-                nmeasures=self.nmeasures,
-            )
-            for in_size, out_size in zip(self.layers[:-1], self.layers[1:])
-        ]
+    def __init__(
+        self,
+        ndims: int,
+        modes: jnp.ndarray,
+        nmeasures: int,
+        layers: Sequence[int],
+        fc_dim: int = 128,
+        in_dim: int = 3,
+        out_dim: int = 1,
+        inv_L_scale_min: float = 0.5,
+        inv_L_scale_max: float = 2.0,
+        train_inv_L_scale: bool = True,
+        act: str = "gelu",
+        *,
+        key,
+    ):
+        self.ndims = ndims
+        self.modes = modes
+        self.nmeasures = nmeasures
+        self.layers = list(layers)
+        self.fc_dim = fc_dim
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.inv_L_scale_min = inv_L_scale_min
+        self.inv_L_scale_max = inv_L_scale_max
+        self.train_inv_L_scale = train_inv_L_scale
+        self.act = act
+        self.activation = _get_act(act)
+        self.nmodes = modes.shape[0]
 
-        # Linear layers (W)
-        self.ws = [nn.Conv(features=out_size, kernel_size=(1,)) for out_size in self.layers[1:]]
+        length = len(layers) - 1
 
-        # Gradient layers (D)
-        self.gws = [nn.Conv(features=out_size, kernel_size=(1,)) for in_size, out_size in zip(self.layers[:-1], self.layers[1:])]
+        # Split keys for all sub-modules:
+        # 1 inv_L_scale_latent + 1 fc0 + length sp_convs + length ws + length gws + up to 2 fc
+        num_keys = 1 + 1 + 3 * length + 2
+        keys = jax.random.split(key, num_keys)
+        key_idx = 0
 
-    @nn.compact
+        # Learnable length scale parameter
+        self.inv_L_scale_latent = jnp.full(
+            (ndims, nmeasures),
+            scaled_logit(jnp.array(1.0), inv_L_scale_min, inv_L_scale_max),
+        )
+        key_idx += 1
+
+        # Lifting layer: Dense(in_dim -> layers[0])
+        self.fc0 = Linear(in_dim, layers[0], key=keys[key_idx])
+        key_idx += 1
+
+        # Spectral convolution layers, linear (W) layers, and gradient (D) layers
+        sp_convs = []
+        ws = []
+        gws = []
+        for i in range(length):
+            in_ch = layers[i]
+            out_ch = layers[i + 1]
+            sp_convs.append(SpectralConv(in_channels=in_ch, out_channels=out_ch, nmodes=self.nmodes, nmeasures=nmeasures, key=keys[key_idx]))
+            key_idx += 1
+            ws.append(Linear(in_ch, out_ch, key=keys[key_idx]))
+            key_idx += 1
+            gws.append(Linear(in_ch * ndims, out_ch, key=keys[key_idx]))
+            key_idx += 1
+        self.sp_convs = sp_convs
+        self.ws = ws
+        self.gws = gws
+
+        # Projection layers
+        if fc_dim > 0:
+            self.fc1 = Linear(layers[-1], fc_dim, key=keys[key_idx])
+            key_idx += 1
+            self.fc2 = Linear(fc_dim, out_dim, key=keys[key_idx])
+        else:
+            self.fc1 = None
+            self.fc2 = Linear(layers[-1], out_dim, key=keys[key_idx])
+
     def __call__(
         self,
         x: jnp.ndarray,
@@ -290,11 +307,8 @@ class PCNO(nn.Module):
         """
         length = len(self.layers) - 1
 
-        # Learnable length scale parameter
-        inv_L_scale_latent = self.param("inv_L_scale_latent", lambda rng, shape: jnp.full(shape, scaled_logit(jnp.array(1.0), self.inv_L_scale_min, self.inv_L_scale_max)), (self.ndims, self.nmeasures))
-
         # Scale the modes
-        inv_L_scale = scaled_sigmoid(inv_L_scale_latent, self.inv_L_scale_min, self.inv_L_scale_max)
+        inv_L_scale = scaled_sigmoid(self.inv_L_scale_latent, self.inv_L_scale_min, self.inv_L_scale_max)
         scaled_modes = self.modes * inv_L_scale
 
         # Compute Fourier bases
@@ -305,26 +319,28 @@ class PCNO(nn.Module):
         wbases_s = jnp.einsum("bxkw,bxw->bxkw", bases_s, node_weights)
         wbases_0 = jnp.einsum("bxkw,bxw->bxkw", bases_0, node_weights)
 
-        # Lifting layer
-        x = nn.Dense(features=self.layers[0], name="fc0")(x)
+        # Lifting layer: apply fc0 on last dim [batch, nodes, in_dim] -> [batch, nodes, layers[0]]
+        x = jax.vmap(jax.vmap(self.fc0))(x)
         x = jnp.transpose(x, (0, 2, 1))  # [batch, channels, nodes]
 
         # Main layers
-        for i, (speconv, w, gw) in enumerate(zip(self.sp_convs, self.ws, self.gws)):
+        for i in range(length):
             # Spectral convolution (integral operator K)
-            x1 = speconv(x, bases_c, bases_s, bases_0, wbases_c, wbases_s, wbases_0)
+            x1 = self.sp_convs[i](x, bases_c, bases_s, bases_0, wbases_c, wbases_s, wbases_0)
 
-            # Linear transform (W)
+            # Linear transform (W) - replaces 1x1 conv
+            # x: [batch, channels, nodes] -> transpose to [batch, nodes, channels],
+            # apply linear on last dim, transpose back
             x_for_w = jnp.transpose(x, (0, 2, 1))  # [batch, nodes, channels]
-            x2 = w(x_for_w)
-            x2 = jnp.transpose(x2, (0, 2, 1))  # [batch, channels, nodes]
+            x2 = jax.vmap(jax.vmap(self.ws[i]))(x_for_w)  # [batch, nodes, out_ch]
+            x2 = jnp.transpose(x2, (0, 2, 1))  # [batch, out_ch, nodes]
 
             # Gradient operator (D)
             grad = compute_gradient(x, directed_edges, edge_gradient_weights)
             grad = jax.nn.soft_sign(grad)
             grad = jnp.transpose(grad, (0, 2, 1))  # [batch, nodes, channels*ndims]
-            x3 = gw(grad)
-            x3 = jnp.transpose(x3, (0, 2, 1))  # [batch, channels, nodes]
+            x3 = jax.vmap(jax.vmap(self.gws[i]))(grad)  # [batch, nodes, out_ch]
+            x3 = jnp.transpose(x3, (0, 2, 1))  # [batch, out_ch, nodes]
 
             x = x1 + x2 + x3
 
@@ -334,11 +350,11 @@ class PCNO(nn.Module):
         x = jnp.transpose(x, (0, 2, 1))  # [batch, nodes, channels]
 
         # Projection layers
-        if self.fc_dim > 0:
-            x = nn.Dense(features=self.fc_dim, name="fc1")(x)
+        if self.fc1 is not None:
+            x = jax.vmap(jax.vmap(self.fc1))(x)
             if self.activation is not None:
                 x = self.activation(x)
 
-        x = nn.Dense(features=self.out_dim, name="fc2")(x)
+        x = jax.vmap(jax.vmap(self.fc2))(x)
 
         return x * node_mask

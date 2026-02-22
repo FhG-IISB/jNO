@@ -6,13 +6,30 @@ import jax.numpy as jnp
 import numpy as np
 import inspect
 
-from .trace import *
-from .utils import get_logger, Logger
-from flax import linen as nn
-from flax.serialization import from_bytes
-
-import jax.numpy as jnp
-from jax import vmap
+from .trace import (
+    Placeholder,
+    NewAxis,
+    Reshape,
+    Slice,
+    Concat,
+    FunctionCall,
+    Literal,
+    ConstantNamespace,
+    Constant,
+    Variable,
+    TensorTag,
+    BinaryOp,
+    FlaxModule,
+    TunableModule,
+    TunableModuleCall,
+    FlaxModuleCall,
+    OperationDef,
+    OperationCall,
+    Hessian,
+    Jacobian,
+)
+from .utils import get_logger
+import equinox as eqx
 
 
 # ============================================================
@@ -298,572 +315,369 @@ class TraceEvaluator:
     The outer vmap in core.py handles the batch dimension B.
 
     Shapes inside evaluate():
-        points_by_tag[tag]:  (N, D)  — N points, D spatial dimensions
-        tensor_tags[tag]:    (F,) or (1, F) — feature vector (already sliced per batch)
+        context[tag]:  (N, D) for spatial points, (F,) or (1, F) for parameters
 
     All intermediate results should be (N,) or (N, K).
+
+    Node handlers are registered via the ``_HANDLERS`` class-level dispatch
+    table.  To add support for a new trace node type, define a method
+    ``_eval_<NodeType>(self, expr, ctx)`` and add an entry in ``_HANDLERS``.
     """
 
-    def __init__(self, params: Dict, layer_info: Dict):
+    def __init__(self, params: Dict):
         self.params = params
-        self.layer_info = layer_info
         self.log = get_logger()
         self._logged_schemes = {}
 
+    # ------------------------------------------------------------------
+    # Evaluation context — lightweight carrier replacing 5 positional args
+    # ------------------------------------------------------------------
+    class _EvalCtx:
+        """Bundles the read-only state that every handler needs."""
+
+        __slots__ = ("context", "var_bindings", "key")
+
+        def __init__(self, context, var_bindings, key):
+            self.context = context
+            self.var_bindings = var_bindings
+            self.key = key
+
+    # ------------------------------------------------------------------
+    # Public entry-point
+    # ------------------------------------------------------------------
     def evaluate(
         self,
-        expr: Placeholder,
-        points_by_tag: Dict[str, jnp.ndarray],
+        expr,
+        context: Dict[str, jnp.ndarray] = None,
         var_bindings: Dict = None,
-        tensor_tags: Dict[str, jnp.ndarray] = None,
-        key: jax.random.PRNGKey = None,
+        key=None,
     ) -> jnp.ndarray:
         """Evaluate expression for a SINGLE batch (no batch dimension)."""
-        var_bindings = var_bindings or {}
-        tensor_tags = tensor_tags or {}
+        ctx = self._EvalCtx(
+            context=context or {},
+            var_bindings=var_bindings or {},
+            key=key,
+        )
+        return self._dispatch(expr, ctx)
 
-        # ----------------------------------------------------------
-        # Constant - value is already stored in the Constant object
-        # ----------------------------------------------------------
-        if isinstance(expr, Constant):
-            return expr.value
+    # Dispatch table — maps node type → handler method name.
+    # ORDER MATTERS: more specific types (Constant, Literal) come first
+    # so they aren't shadowed by their base class (Placeholder).
+    _HANDLERS: List[tuple] = [
+        (Constant, "_eval_constant"),
+        (Literal, "_eval_literal"),
+        (TensorTag, "_eval_tensor_tag"),
+        (Variable, "_eval_variable"),
+        (Concat, "_eval_concat"),
+        (Reshape, "_eval_reshape"),
+        (FunctionCall, "_eval_function_call"),
+        (Slice, "_eval_slice"),
+        (BinaryOp, "_eval_binary_op"),
+        (OperationCall, "_eval_operation_call"),
+        (FlaxModuleCall, "_eval_flax_module_call"),
+        (TunableModule, "_eval_tunable_module"),
+        (TunableModuleCall, "_eval_tunable_module_call"),
+        (Jacobian, "_eval_jacobian"),
+        (Hessian, "_eval_hessian"),
+        (OperationDef, "_eval_operation_def"),
+    ]
 
-        # ----------------------------------------------------------
-        # Constant - python literal
-        # ----------------------------------------------------------
-        if isinstance(expr, Literal):
-            return expr.value
+    def _dispatch(self, expr, ctx):
+        """Look up handler in the dispatch table and call it."""
+        for node_type, method_name in self._HANDLERS:
+            if isinstance(expr, node_type):
+                return getattr(self, method_name)(expr, ctx)
+        raise ValueError(f"Cannot evaluate: {type(expr)}")
 
-        # ----------------------------------------------------------
-        # TensorTag:  return tensor, broadcast-ready
-        # ----------------------------------------------------------
-        elif isinstance(expr, TensorTag):
-            if expr.tag not in tensor_tags:
-                raise ValueError(f"TensorTag '{expr.tag}' not found. Available:  {list(tensor_tags.keys())}")
-            tensor = jnp.asarray(tensor_tags[expr.tag])
-            if expr.dim_index is not None and tensor.ndim >= 1:
-                # Select one component; result is scalar or (1,)
-                tensor = tensor[..., expr.dim_index]
-            # Squeeze to scalar if shape is (1,) or ()
-            tensor = jnp.squeeze(tensor)
-            return tensor
+    # ------------------------------------------------------------------
+    # Helpers shared by differential-operator handlers
+    # ------------------------------------------------------------------
+    def _build_local_context(self, idx, tag, points, context):
+        """Build dynamically-sliced local context for a single point ``idx``.
 
-        # ----------------------------------------------------------
-        # Variable:  slice points -> (N,) or (N, K)
-        # ----------------------------------------------------------
-        elif isinstance(expr, Variable):
-            bound_var = var_bindings.get(id(expr), expr)
-            tag = bound_var.tag
-
-            if tag in points_by_tag:
-                # Spatial coordinates:  (N, D)
-                tag_data = points_by_tag[tag]
-                dim_start, dim_end = bound_var.dim
-                result = tag_data[..., dim_start:dim_end]
-
-                # Squeeze trailing dim if size 1
-                if dim_end is None:
-                    result = jnp.squeeze(result)
-                elif result.ndim >= 1 and result.shape[-1] == 1:
-                    result = result[..., 0]
-                return result
-
-            elif tag in tensor_tags:
-                # Parameter tensor: arbitrary shape (F,) or (F1, F2, ...)
-                # Return as-is; slicing handled by Slice node if needed
-                return jnp.asarray(tensor_tags[tag])
-
-            else:
-                self.log.error(f"Variable tag '{tag}' not found. points_by_tag:  {list(points_by_tag.keys())}, tensor_tags: {list(tensor_tags.keys())}")
-                exit()
-
-        # ----------------------------------------------------------
-        # Concat:  concatenate along last axis
-        # ----------------------------------------------------------
-        elif isinstance(expr, Concat):
-            items = [self.evaluate(item, points_by_tag, var_bindings, tensor_tags, key) for item in expr.items]
-            items = [i[..., jnp.newaxis] if i.ndim == 1 else i for i in items]
-            return jnp.concatenate(items, axis=-1)
-
-        elif isinstance(expr, Reshape):
-            target = self.evaluate(expr.target, points_by_tag, var_bindings, tensor_tags, key)
-            return target.reshape(expr.shape)
-
-        # ----------------------------------------------------------
-        # FunctionCall:  evaluate args, call fn
-        # ----------------------------------------------------------
-        elif isinstance(expr, FunctionCall):
-            args = [(self.evaluate(arg, points_by_tag, var_bindings, tensor_tags, key) if isinstance(arg, Placeholder) else arg) for arg in expr.args]
-            # Check if function accepts 'key' parameter
-            sig = inspect.signature(expr.fn)
-            if "key" in sig.parameters:
-                return expr.fn(*args, key=key)
-            else:
-                return expr.fn(*args)
-
-        # ----------------------------------------------------------
-        # Slice
-        # ----------------------------------------------------------
-        elif isinstance(expr, Slice):
-            target = self.evaluate(expr.target, points_by_tag, var_bindings, tensor_tags, key)
-
-            # Convert symbolic slice to NumPy-compatible slice
-            concrete_key = []
-            for k in expr.key:
-                if isinstance(k, NewAxis):
-                    concrete_key.append(None)  # np.newaxis
+        Used by AD-based Jacobian and Hessian handlers
+        to construct per-point evaluation contexts.
+        """
+        local = {}
+        for k, v in context.items():
+            if v.ndim < 1:
+                local[k] = v
+            elif v.ndim == 1:
+                if k == tag or v.shape[0] == points.shape[0]:
+                    local[k] = jax.lax.dynamic_slice(v, (idx,), (1,))
                 else:
-                    concrete_key.append(k)
+                    local[k] = v
+            else:
+                # v.ndim >= 2
+                if k == tag or v.shape[0] == points.shape[0]:
+                    local[k] = jax.lax.dynamic_slice(v, (idx, 0), (1, v.shape[1]))
+                else:
+                    local[k] = v
 
-            result = target[tuple(concrete_key)]
+        return local
 
-            # Optional scalar squeezing (safe version)
-            # while result.ndim > 0 and result.shape[-1] == 1:
+    def _map_mesh_to_sampled(self, mesh_points, sampled_points, values):
+        """Map values computed at mesh vertices back to sampled points via
+        nearest-neighbour lookup."""
+        dists = jnp.sum(
+            (mesh_points[jnp.newaxis, :, :] - sampled_points[:, jnp.newaxis, :]) ** 2,
+            axis=-1,
+        )
+        vertex_indices = jnp.argmin(dists, axis=1)
+        return values[vertex_indices]
+
+    # ------------------------------------------------------------------
+    # Individual node handlers
+    # ------------------------------------------------------------------
+
+    def _eval_constant(self, expr, ctx):
+        return expr.value
+
+    def _eval_literal(self, expr, ctx):
+        return expr.value
+
+    def _eval_tensor_tag(self, expr, ctx):
+        if expr.tag not in ctx.context:
+            raise ValueError(f"TensorTag '{expr.tag}' not found. Available:  {list(ctx.context.keys())}")
+        tensor = jnp.asarray(ctx.context[expr.tag])
+        if expr.dim_index is not None and tensor.ndim >= 1:
+            tensor = tensor[..., expr.dim_index]
+        return tensor
+
+    def _eval_variable(self, expr, ctx):
+        bound_var = ctx.var_bindings.get(id(expr), expr)
+        tag = bound_var.tag
+
+        if tag in ctx.context:
+            tag_data = ctx.context[tag]
+            dim_start, dim_end = bound_var.dim
+            result = tag_data[..., dim_start:dim_end]
+            if dim_end is None:
+                pass  # keep full shape
+            # elif result.ndim >= 1 and result.shape[-1] == 1:
             #    result = result[..., 0]
-
-            if result.ndim == 0:
-                return result
-
             return result
 
-        # ----------------------------------------------------------
-        # BinaryOp
-        # ----------------------------------------------------------
-        elif isinstance(expr, BinaryOp):
-            left = self.evaluate(expr.left, points_by_tag, var_bindings, tensor_tags, key)
-            right = self.evaluate(expr.right, points_by_tag, var_bindings, tensor_tags, key)
-            ops = {
-                "+": jnp.add,
-                "-": jnp.subtract,
-                "*": jnp.multiply,
-                "/": jnp.divide,
-                "**": jnp.power,
-            }
+        else:
+            self.log.error(f"Variable tag '{tag}' not found. context: {list(ctx.context.keys())}")
+            raise KeyError(f"Variable tag '{tag}' not found in context")
 
-            res = ops[expr.op](left, right)
-            expr.debug(res)
+    def _eval_concat(self, expr, ctx):
+        items = [self._dispatch(item, ctx) for item in expr.items]
+        items = [i[..., jnp.newaxis] if i.ndim == 1 else i for i in items]
+        return jnp.concatenate(items, axis=-1)
 
-            return res
+    def _eval_reshape(self, expr, ctx):
+        target = self._dispatch(expr.target, ctx)
+        return target.reshape(expr.target_shape)
 
-        # ----------------------------------------------------------
-        # Tracker
-        # ----------------------------------------------------------
-        elif isinstance(expr, Tracker):
-            return self.evaluate(expr.op, points_by_tag, var_bindings, tensor_tags, key)
+    def _eval_function_call(self, expr, ctx):
+        args = [(self._dispatch(arg, ctx) if isinstance(arg, Placeholder) else arg) for arg in expr.args]
+        sig = inspect.signature(expr.fn)
+        if "key" in sig.parameters:
+            return expr.fn(*args, key=ctx.key)
+        else:
+            return expr.fn(*args)
 
-        # ----------------------------------------------------------
-        # OperationCall
-        # ----------------------------------------------------------
-
-        elif isinstance(expr, OperationCall):
-            op = expr.operation
-            new_bindings = dict(var_bindings)
-
-            op_vars = op._collected_vars
-
-            # We bind only Variable arguments; TensorTag arguments are left to be resolved
-            # from tensor_tags during evaluation.
-            for op_var, call_arg in zip(op_vars, expr.args):
-                if isinstance(call_arg, Variable):
-                    bound_arg = var_bindings.get(id(call_arg), call_arg)
-                    new_bindings[id(op_var)] = bound_arg
-                elif isinstance(call_arg, TensorTag):
-                    # nothing to bind; TensorTags are resolved from tensor_tags by tag name
-                    pass
-                else:
-                    raise ValueError(f"Unsupported OperationCall argument type: {type(call_arg)}")
-
-            return self.evaluate(op.expr, points_by_tag, new_bindings, tensor_tags, key)
-
-        # ----------------------------------------------------------
-        # FlaxModuleCall:  net(x, y, theta, ...)
-        # ----------------------------------------------------------
-
-        elif isinstance(expr, FlaxModuleCall):
-            # Evaluate all arguments
-            arg_values = []
-            arg_sources = []
-
-            for arg in expr.args:
-
-                if isinstance(arg, (Placeholder, TensorTag)):
-                    val = self.evaluate(arg, points_by_tag, var_bindings, tensor_tags, key)
-                    arg_values.append(val)
-
-                    # Check if this argument varies per point (spatial)
-                    # It's spatial if:
-                    # 1. It's a Variable in points_by_tag, OR
-                    # 2. It's a Variable/TensorTag in tensor_tags with matching point dimension
-                    is_spatial = False
-                    if isinstance(arg, Variable):
-                        if arg.tag in points_by_tag:
-                            is_spatial = True
-                        elif arg.tag in tensor_tags:
-                            # Check if tensor has same leading dimension as points
-                            tensor = tensor_tags[arg.tag]
-                            if hasattr(tensor, "shape") and len(tensor.shape) >= 1:
-                                # It's spatial if it has a point dimension (not just features)
-                                is_spatial = True
-                    elif isinstance(arg, TensorTag):
-                        if arg.tag in tensor_tags:
-                            is_spatial = True
-
-                    arg_sources.append(is_spatial)
-                else:
-
-                    arg_values.append(jnp.asarray(arg))
-                    arg_sources.append(False)
-
-            # Get params and apply_fn
-            flax_mod = expr.model
-            layer_params = self.params.get(flax_mod.layer_id)
-            apply_fn = self.layer_info.get(flax_mod.layer_id)
-
-            if layer_params is None:
-                raise ValueError(f"No params for FlaxModule {flax_mod.layer_id}")
-
-            if "poseidon" in flax_mod.name:
-                if len(arg_values) < 2:
-                    raise ValueError(f"Poseidon model expects at least 2 arguments (channels and time), got {len(arg_values)}")
-
-                # Ensure proper shapes - Poseidon expects (B, H, W, 1) or (B, H, W)
-                def ensure_poseidon_shape(arr):
-                    if arr.ndim == 2:
-                        return arr[None, :, :, None]
-                    elif arr.ndim == 3:
-                        return arr[None, ...]
-                    elif arr.ndim == 4:
-                        return arr
-                    else:
-                        raise ValueError(f"Unexpected shape for Poseidon input: {arr.shape}")
-
-                # Time should be (B,)
-                time_val = jnp.asarray(arg_values[1])
-                if time_val.ndim == 0:
-                    time_val = time_val[None]
-                elif time_val.ndim == 2:
-                    time_val = time_val[:, 0]  # (B, 1) -> (B,)
-
-                # Call the JIT-compiled apply function
-                result = apply_fn(layer_params, ensure_poseidon_shape(arg_values[0]), time_val, True)
-
-                return jnp.squeeze(result.output)
-
+    def _eval_slice(self, expr, ctx):
+        target = self._dispatch(expr.target, ctx)
+        concrete_key = []
+        for k in expr.key:
+            if isinstance(k, NewAxis):
+                concrete_key.append(None)
             else:
-                # Standard FlaxModule handling (existing code)
-                N = 1
-                for val, is_spatial in zip(arg_values, arg_sources):
-                    if is_spatial:
-                        val = jnp.asarray(val)
-                        if val.ndim >= 1:
-                            N = max(N, val.shape[0])
+                concrete_key.append(k)
+        result = target[tuple(concrete_key)]
+        if result.ndim == 0:
+            return result
+        return result
 
-                def normalize_arg(val, is_spatial):
-                    val = jnp.asarray(val)
-                    if is_spatial:
-                        if val.ndim == 0:
-                            return jnp.full((N, 1), val)
-                        elif val.ndim == 1:
-                            return val[:, jnp.newaxis]
-                        else:
-                            return val
-                    else:
-                        if val.ndim == 0:
-                            return val[jnp.newaxis]
-                        else:
-                            return val
+    def _eval_binary_op(self, expr, ctx):
+        left = self._dispatch(expr.left, ctx)
+        right = self._dispatch(expr.right, ctx)
+        _BINARY_FNS = {
+            "+": jnp.add,
+            "-": jnp.subtract,
+            "*": jnp.multiply,
+            "/": jnp.divide,
+            "**": jnp.power,
+        }
+        res = _BINARY_FNS[expr.op](left, right)
+        return res
 
-                shaped_args = [normalize_arg(v, s) for v, s in zip(arg_values, arg_sources)]
-                # try:
-                if "poseidon" in flax_mod.name:
-                    result = apply_fn(layer_params, shaped_args[:-1], shaped_args[-1])
+    def _eval_operation_call(self, expr, ctx):
+        op = expr.operation
+        new_bindings = dict(ctx.var_bindings)
+        op_vars = op._collected_vars
+
+        for op_var, call_arg in zip(op_vars, expr.args):
+            if isinstance(call_arg, Variable):
+                bound_arg = ctx.var_bindings.get(id(call_arg), call_arg)
+                new_bindings[id(op_var)] = bound_arg
+            elif isinstance(call_arg, TensorTag):
+                pass
+            else:
+                raise ValueError(f"Unsupported OperationCall argument type: {type(call_arg)}")
+
+        new_ctx = self._EvalCtx(ctx.context, new_bindings, ctx.key)
+        return self._dispatch(op.expr, new_ctx)
+
+    def _eval_flax_module_call(self, expr, ctx):
+        arg_values = []
+        arg_sources = []
+
+        for arg in expr.args:
+            if isinstance(arg, (Placeholder, TensorTag)):
+                val = self._dispatch(arg, ctx)
+                arg_values.append(val)
+
+                is_spatial = False
+                if isinstance(arg, Variable) and arg.tag in ctx.context:
+                    is_spatial = True
+
+                arg_sources.append(is_spatial)
+            else:
+                arg_values.append(jnp.asarray(arg))
+                arg_sources.append(False)
+
+        flax_mod = expr.model
+        model = self.params.get(flax_mod.layer_id)
+
+        if model is None:
+            raise ValueError(f"No model for FlaxModule {flax_mod.layer_id}")
+
+        N = 1
+        for val, is_spatial in zip(arg_values, arg_sources):
+            if is_spatial:
+                val = jnp.asarray(val)
+                if val.ndim >= 1:
+                    N = max(N, val.shape[0])
+
+        def normalize_arg(val, is_spatial):
+            val = jnp.asarray(val)
+            if is_spatial:
+                if val.ndim == 0:
+                    return jnp.full((N, 1), val)
+                elif val.ndim == 1:
+                    return val[:, jnp.newaxis]
                 else:
-                    result = apply_fn(layer_params, *shaped_args)
-
-                while result.ndim >= 2 and result.shape[-1] == 1:
-                    result = result[..., 0]
-
-                return result
-
-        # ----------------------------------------------------------
-        # TunableModule:  delegate to current instance
-        # ----------------------------------------------------------
-
-        elif isinstance(expr, TunableModule):
-            if expr._current_instance is None:
-                raise ValueError(f"TunableModule {expr} has no current instance.  " "This should be set by core.solve() before evaluation.")
-            # Evaluate as if it were the concrete FlaxModule
-            return self.evaluate(expr._current_instance, points_by_tag, var_bindings, tensor_tags, key)
-
-        # ----------------------------------------------------------
-        # TunableModuleCall: delegate to current instance's call
-        # ----------------------------------------------------------
-
-        elif isinstance(expr, TunableModuleCall):
-            tunable = expr.model
-
-            if tunable._current_instance is None:
-                raise ValueError(f"TunableModule has no current instance. " "This should be set by core.solve() before evaluation.")
-
-            # Create equivalent FlaxModuleCall with the concrete instance
-            concrete_call = FlaxModuleCall(tunable._current_instance, expr.args)
-            concrete_call.op_id = expr.op_id
-
-            return self.evaluate(concrete_call, points_by_tag, var_bindings, tensor_tags, key)
-
-        # ----------------------------------------------------------
-        # Gradient (AD or FD)
-        # ----------------------------------------------------------
-        elif isinstance(expr, Gradient):
-            target = expr.target
-            variable = expr.variable
-            scheme = expr.scheme
-
-            bound_var = var_bindings.get(id(variable), variable)
-            points = points_by_tag[bound_var.tag]  # (N, D)
-            tag = bound_var.tag
-            dim = variable.dim[0]
-
-            if scheme == "finite_difference":
-                domain = bound_var._domain
-                if domain is None or domain.mesh_connectivity is None:
-                    raise ValueError("FD scheme requires domain with mesh connectivity")
-                mesh_points = jnp.array(domain.mesh_connectivity["points"])
-                mesh_dim = domain.mesh_connectivity["dimension"]
-
-                # Evaluate u at all mesh points (still need to iterate, but outside vmap context)
-                def u_at_pts(pts):
-                    # Override only the tag we're differentiating; keep all others
-                    pts_dict = {**points_by_tag, tag: pts}
-                    return self.evaluate(target, pts_dict, var_bindings, tensor_tags, key)
-
-                u_full = u_at_pts(mesh_points)
-
-                if mesh_dim == 2:
-                    grad_full = DifferentialOperators.compute_fd_gradient_2d_simple(u_full, mesh_points, domain.mesh_connectivity["triangles"], dim)
+                    return val
+            else:
+                if val.ndim == 0:
+                    return val[jnp.newaxis]
                 else:
-                    grad_full = DifferentialOperators.compute_fd_gradient_3d_simple(u_full, mesh_points, domain.mesh_connectivity["tetrahedra"], dim)
+                    return val
 
-                # Map back to sampled points
-                dists = jnp.sum(
-                    (mesh_points[jnp.newaxis, :, :] - points[:, jnp.newaxis, :]) ** 2,
-                    axis=-1,
-                )
-                vertex_indices = jnp.argmin(dists, axis=1)
-                return grad_full[vertex_indices]
+        shaped_args = [normalize_arg(v, s) for v, s in zip(arg_values, arg_sources)]
 
-            elif scheme == "automatic_differentiation":
+        # Call equinox model directly (it IS the pytree, no init/apply split)
+        import inspect
+
+        sig = inspect.signature(model.__call__)
+        if "key" in sig.parameters:
+            result = model(*shaped_args, key=ctx.key)
+        else:
+            result = model(*shaped_args)
+
+        # while result.ndim >= 2 and result.shape[-1] == 1:
+        #    result = result[..., 0]
+
+        return result
+
+    def _eval_tunable_module(self, expr, ctx):
+        if expr._current_instance is None:
+            raise ValueError(f"TunableModule {expr} has no current instance.  " "This should be set by core.solve() before evaluation.")
+        return self._dispatch(expr._current_instance, ctx)
+
+    def _eval_tunable_module_call(self, expr, ctx):
+        tunable = expr.model
+        if tunable._current_instance is None:
+            raise ValueError("TunableModule has no current instance. " "This should be set by core.solve() before evaluation.")
+        concrete_call = FlaxModuleCall(tunable._current_instance, expr.args)
+        concrete_call.op_id = expr.op_id
+        return self._dispatch(concrete_call, ctx)
+
+    def _eval_jacobian(self, expr, ctx):
+        """Evaluate Jacobian (first-order derivatives).
+
+        With a single variable this acts as a gradient and the result
+        is squeezed to a scalar per point.
+        """
+        target = expr.target
+        variables = expr.variables
+        scheme = expr.scheme
+
+        first_var = variables[0]
+        bound_var = ctx.var_bindings.get(id(first_var), first_var)
+        points = ctx.context[bound_var.tag]
+        tag = bound_var.tag
+        n_vars = len(variables)
+        var_dims = [(i, vi.dim[0]) for i, vi in enumerate(variables)]
+
+        # Ensure points is 2D (N, D) — after vmap it may be 1D (D,)
+        if points.ndim == 1:
+            points = points[jnp.newaxis, :]
+
+        if scheme == "finite_difference":
+            domain = bound_var._domain
+            if domain is None or domain.mesh_connectivity is None:
+                raise ValueError("FD scheme requires domain with mesh connectivity")
+            mesh_points = jnp.array(domain.mesh_connectivity["points"])
+            mesh_dim = domain.mesh_connectivity["dimension"]
+
+            def u_at_pts(pts):
+                ctx_dict = {**ctx.context, tag: pts}
+                new_ctx = self._EvalCtx(ctx_dict, ctx.var_bindings, ctx.key)
+                return self._dispatch(target, new_ctx)
+
+            u_full = u_at_pts(mesh_points)
+
+            jac_components = []
+            for _i, vi_dim in var_dims:
+                if mesh_dim == 1:
+                    grad_full = DifferentialOperators.compute_fd_gradient_1d_simple(u_full, mesh_points, domain.mesh_connectivity["lines"])
+                elif mesh_dim == 2:
+                    grad_full = DifferentialOperators.compute_fd_gradient_2d_simple(u_full, mesh_points, domain.mesh_connectivity["triangles"], vi_dim)
+                elif mesh_dim == 3:
+                    grad_full = DifferentialOperators.compute_fd_gradient_3d_simple(u_full, mesh_points, domain.mesh_connectivity["tetrahedra"], vi_dim)
+                jac_components.append(grad_full)
+
+            if n_vars == 1:
+                return self._map_mesh_to_sampled(mesh_points, points, jac_components[0])
+            jac_full = jnp.stack(jac_components, axis=-1)
+            return self._map_mesh_to_sampled(mesh_points, points, jac_full)
+
+        elif scheme == "automatic_differentiation":
+            evaluator_self = self
+
+            if n_vars == 1:
+                # Single-variable gradient: use jax.grad for efficiency
+                dim = var_dims[0][1]
 
                 def grad_single(idx):
-                    """Gradient at point index idx."""
                     pt = jax.lax.dynamic_slice(points, (idx, 0), (1, points.shape[1]))[0]
-
-                    # Build local points_by_tag
-                    local_points = {}
-                    for k, v in points_by_tag.items():
-                        if k == tag:
-                            local_points[k] = jax.lax.dynamic_slice(v, (idx, 0), (1, v.shape[1]))
-                        elif v.ndim >= 2 and v.shape[0] == points.shape[0]:
-                            local_points[k] = jax.lax.dynamic_slice(v, (idx, 0), (1, v.shape[1]))
-                        else:
-                            local_points[k] = v
-
-                    # Same for tensor_tags
-                    local_tensors = {}
-                    for k, v in tensor_tags.items():
-                        if v.ndim >= 2 and v.shape[0] == points.shape[0]:
-                            local_tensors[k] = jax.lax.dynamic_slice(v, (idx, 0), (1, v.shape[1]))
-                        elif v.ndim == 1 and v.shape[0] == points.shape[0]:
-                            local_tensors[k] = jax.lax.dynamic_slice(v, (idx,), (1,))
-                        else:
-                            local_tensors[k] = v
+                    local_ctx = evaluator_self._build_local_context(idx, tag, points, ctx.context)
 
                     def u_scalar(p):
-                        pts_dict = {**local_points, tag: p[jnp.newaxis, ...]}
-                        result = self.evaluate(target, pts_dict, var_bindings, local_tensors, key)
-                        return jnp.squeeze(result)
+                        ctx_dict = {**local_ctx, tag: p[jnp.newaxis, ...]}
+                        new_ctx = evaluator_self._EvalCtx(ctx_dict, ctx.var_bindings, ctx.key)
+                        return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
 
                     return jax.grad(u_scalar)(pt)[dim]
 
-                N = points.shape[0]
-                return jax.vmap(grad_single)(jnp.arange(N))
-
-        # ----------------------------------------------------------
-        # Laplacian (AD or FD)
-        # ----------------------------------------------------------
-
-        elif isinstance(expr, Laplacian):
-            target = expr.target
-            variables = expr.variables
-            scheme = expr.scheme
-
-            first_var = variables[0]
-            bound_var = var_bindings.get(id(first_var), first_var)
-
-            points = None
-            if bound_var.tag in points_by_tag:
-                points = points_by_tag[bound_var.tag]
-                dims = tuple(v.dim[0] for v in variables)
+                return jax.vmap(grad_single)(jnp.arange(points.shape[0]))
             else:
-                dims = tuple(0 for v in variables)
-            tag = bound_var.tag
-
-            if scheme == "finite_difference":
-                domain = bound_var._domain
-                if domain is None or domain.mesh_connectivity is None:
-                    raise ValueError("FD scheme requires domain with mesh connectivity")
-                mesh_points = jnp.array(domain.mesh_connectivity["points"])
-                mesh_dim = domain.mesh_connectivity["dimension"]
-
-                def u_at_pts(pts):
-                    # Override only the tag we're differentiating; keep all others
-                    pts_dict = {**points_by_tag, tag: pts}
-                    return self.evaluate(target, pts_dict, var_bindings, tensor_tags, key)
-
-                u_full = u_at_pts(mesh_points)
-
-                if mesh_dim == 1:
-                    lap_full = DifferentialOperators.compute_fd_laplacian_1d_simple(u_full, mesh_points, domain.mesh_connectivity["lines"])
-                elif mesh_dim == 2:
-                    lap_full = DifferentialOperators.compute_fd_laplacian_2d_simple(u_full, mesh_points, domain.mesh_connectivity["triangles"], dims)
-                elif mesh_dim == 3:
-                    lap_full = DifferentialOperators.compute_fd_laplacian_3d_simple(
-                        u_full,
-                        mesh_points,
-                        domain.mesh_connectivity["tetrahedra"],
-                        dims,
-                    )
-
-                if points is None:
-                    dists = jnp.sum(
-                        (mesh_points[jnp.newaxis, :, :] - points[:, jnp.newaxis, :]) ** 2,
-                        axis=-1,
-                    )
-                    vertex_indices = jnp.argmin(dists, axis=1)
-                    return lap_full[vertex_indices]
-                else:
-                    return lap_full
-
-            elif scheme == "automatic_differentiation":
-
-                def lap_single(idx):
-                    """Compute Laplacian at point index idx."""
-                    pt = jax.lax.dynamic_slice(points, (idx, 0), (1, points.shape[1]))[0]
-
-                    # Build local points_by_tag with dynamically sliced values
-                    local_points = {}
-                    for k, v in points_by_tag.items():
-                        if k == tag:
-                            # Will be overridden in u_scalar
-                            local_points[k] = jax.lax.dynamic_slice(v, (idx, 0), (1, v.shape[1]))
-                        elif v.ndim >= 2 and v.shape[0] == points.shape[0]:
-                            # This point data varies per point, slice it dynamically
-                            local_points[k] = jax.lax.dynamic_slice(v, (idx, 0), (1, v.shape[1]))
-                        else:
-                            local_points[k] = v
-
-                    # Same for tensor_tags
-                    local_tensors = {}
-                    for k, v in tensor_tags.items():
-                        if v.ndim >= 2 and v.shape[0] == points.shape[0]:
-                            local_tensors[k] = jax.lax.dynamic_slice(v, (idx, 0), (1, v.shape[1]))
-                        elif v.ndim == 1 and v.shape[0] == points.shape[0]:
-                            local_tensors[k] = jax.lax.dynamic_slice(v, (idx,), (1,))
-                        else:
-                            local_tensors[k] = v
-
-                    def u_scalar(p):
-                        # Override the differentiation variable with the input point
-                        pts_dict = {**local_points, tag: p[jnp.newaxis, :]}
-                        result = self.evaluate(target, pts_dict, var_bindings, local_tensors, key)
-                        return jnp.squeeze(result)
-
-                    hess = jax.hessian(u_scalar)(pt)
-                    return sum(hess[d, d] for d in dims)
-
-                N = points.shape[0]
-                return jax.vmap(lap_single)(jnp.arange(N))
-
-        # ----------------------------------------------------------
-        # Jacobian (AD or FD)
-        # ----------------------------------------------------------
-
-        elif isinstance(expr, Jacobian):
-            target = expr.target
-            variables = expr.variables
-            scheme = expr.scheme
-
-            first_var = variables[0]
-            bound_var = var_bindings.get(id(first_var), first_var)
-            points = points_by_tag[bound_var.tag]
-            tag = bound_var.tag
-            n_vars = len(variables)
-
-            # Map each variable to its dimension index in the input
-            var_dims = [(i, vi.dim[0]) for i, vi in enumerate(variables)]
-
-            if scheme == "finite_difference":
-                domain = bound_var._domain
-                if domain is None or domain.mesh_connectivity is None:
-                    raise ValueError("FD scheme requires domain with mesh connectivity")
-                mesh_points = jnp.array(domain.mesh_connectivity["points"])
-                mesh_dim = domain.mesh_connectivity["dimension"]
-
-                def u_at_pts(pts):
-                    pts_dict = {**points_by_tag, tag: pts}
-                    return self.evaluate(target, pts_dict, var_bindings, tensor_tags, key)
-
-                u_full = u_at_pts(mesh_points)
-
-                # Compute gradient for each variable dimension and stack them
-                jac_components = []
-                for i, vi_dim in var_dims:
-
-                    if mesh_dim == 1:
-                        grad_full = DifferentialOperators.compute_fd_gradient_1d_simple(u_full, mesh_points, domain.mesh_connectivity["lines"])
-                    elif mesh_dim == 2:
-                        grad_full = DifferentialOperators.compute_fd_gradient_2d_simple(
-                            u_full,
-                            mesh_points,
-                            domain.mesh_connectivity["triangles"],
-                            vi_dim,
-                        )
-                    elif mesh_dim == 3:
-                        grad_full = DifferentialOperators.compute_fd_gradient_3d_simple(
-                            u_full,
-                            mesh_points,
-                            domain.mesh_connectivity["tetrahedra"],
-                            vi_dim,
-                        )
-                    jac_components.append(grad_full)
-
-                # Stack to form Jacobian: shape (N_mesh, n_vars)
-                jac_full = jnp.stack(jac_components, axis=-1)
-
-                # Map back to sampled points
-                dists = jnp.sum(
-                    (mesh_points[jnp.newaxis, :, :] - points[:, jnp.newaxis, :]) ** 2,
-                    axis=-1,
-                )
-                vertex_indices = jnp.argmin(dists, axis=1)
-                return jac_full[vertex_indices]
-
-            elif scheme == "automatic_differentiation":  # automatic_differentiation
-
+                # Multi-variable Jacobian
                 def jac_single(pt):
                     def u_fn(p):
-                        result = self.evaluate(
-                            target,
-                            {tag: p[jnp.newaxis, :]},
-                            var_bindings,
-                            tensor_tags,
-                            key,
+                        new_ctx = evaluator_self._EvalCtx(
+                            {**ctx.context, tag: p[jnp.newaxis, :]},
+                            ctx.var_bindings,
+                            ctx.key,
                         )
-                        return jnp.squeeze(result)
+                        return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
 
-                    jac = jax.jacobian(u_fn)(pt)  # Shape: (input_dims,) for scalar output
-
-                    # Extract only the columns corresponding to our variables
+                    jac = jax.jacobian(u_fn)(pt)
                     result = jnp.zeros((n_vars,))
                     for i, vi_dim in var_dims:
                         result = result.at[i].set(jac[vi_dim])
@@ -871,72 +685,96 @@ class TraceEvaluator:
 
                 return jax.vmap(jac_single)(points)
 
-        # ----------------------------------------------------------
-        # Hessian (AD or FD)
-        # ----------------------------------------------------------
+    def _eval_hessian(self, expr, ctx):
+        """Evaluate Hessian (second-order derivatives).
 
-        elif isinstance(expr, Hessian):
-            target = expr.target
-            variables = expr.variables
-            scheme = expr.scheme
+        When ``expr.trace is True`` this computes the Laplacian
+        (sum of diagonal Hessian entries) instead of the full matrix.
+        """
+        target = expr.target
+        variables = expr.variables
+        scheme = expr.scheme
+        compute_trace = getattr(expr, "trace", False)
 
-            first_var = variables[0]
-            bound_var = var_bindings.get(id(first_var), first_var)
-            points = points_by_tag[bound_var.tag]
-            tag = bound_var.tag
-            n = len(variables)
-            var_dims = [(i, vi.dim[0], j, vj.dim[0]) for i, vi in enumerate(variables) for j, vj in enumerate(variables)]
+        first_var = variables[0]
+        bound_var = ctx.var_bindings.get(id(first_var), first_var)
 
-            if scheme == "finite_difference":
-                domain = bound_var._domain
-                if domain is None or domain.mesh_connectivity is None:
-                    raise ValueError("FD scheme requires domain with mesh connectivity")
-                mesh_points = jnp.array(domain.mesh_connectivity["points"])
-                mesh_dim = domain.mesh_connectivity["dimension"]
+        points = None
+        if bound_var.tag in ctx.context:
+            points = ctx.context[bound_var.tag]
+            # Ensure points is 2D (N, D) — after vmap it may be 1D (D,)
+            if points.ndim == 1:
+                points = points[jnp.newaxis, :]
+            dims = tuple(v.dim[0] for v in variables)
+        else:
+            dims = tuple(0 for _ in variables)
+        tag = bound_var.tag
+        n = len(variables)
+        var_dims = [(i, vi.dim[0], j, vj.dim[0]) for i, vi in enumerate(variables) for j, vj in enumerate(variables)]
 
-                def u_at_pts(pts):
-                    pts_dict = {**points_by_tag, tag: pts}
-                    return self.evaluate(target, pts_dict, var_bindings, tensor_tags, key)
+        if scheme == "finite_difference":
+            domain = bound_var._domain
+            if domain is None or domain.mesh_connectivity is None:
+                raise ValueError("FD scheme requires domain with mesh connectivity")
+            mesh_points = jnp.array(domain.mesh_connectivity["points"])
+            mesh_dim = domain.mesh_connectivity["dimension"]
 
-                u_full = u_at_pts(mesh_points)
+            def u_at_pts(pts):
+                ctx_dict = {**ctx.context, tag: pts}
+                new_ctx = self._EvalCtx(ctx_dict, ctx.var_bindings, ctx.key)
+                return self._dispatch(target, new_ctx)
 
+            u_full = u_at_pts(mesh_points)
+
+            if compute_trace:
+                # Laplacian: sum of second derivatives on diagonal
+                if mesh_dim == 1:
+                    lap_full = DifferentialOperators.compute_fd_laplacian_1d_simple(u_full, mesh_points, domain.mesh_connectivity["lines"])
+                elif mesh_dim == 2:
+                    lap_full = DifferentialOperators.compute_fd_laplacian_2d_simple(u_full, mesh_points, domain.mesh_connectivity["triangles"], dims)
+                elif mesh_dim == 3:
+                    lap_full = DifferentialOperators.compute_fd_laplacian_3d_simple(u_full, mesh_points, domain.mesh_connectivity["tetrahedra"], dims)
+                if points is not None:
+                    return self._map_mesh_to_sampled(mesh_points, points, lap_full)
+                return lap_full
+            else:
+                # Full Hessian matrix
                 if mesh_dim == 1:
                     hess_full = DifferentialOperators.compute_fd_hessian_1d_simple(u_full, mesh_points, domain.mesh_connectivity["lines"])
                 elif mesh_dim == 2:
-                    hess_full = DifferentialOperators.compute_fd_hessian_2d_simple(
-                        u_full,
-                        mesh_points,
-                        domain.mesh_connectivity["triangles"],
-                        var_dims,
-                    )
+                    hess_full = DifferentialOperators.compute_fd_hessian_2d_simple(u_full, mesh_points, domain.mesh_connectivity["triangles"], var_dims)
                 elif mesh_dim == 3:
-                    hess_full = DifferentialOperators.compute_fd_hessian_3d_simple(
-                        u_full,
-                        mesh_points,
-                        domain.mesh_connectivity["tetrahedra"],
-                        var_dims,
-                    )
+                    hess_full = DifferentialOperators.compute_fd_hessian_3d_simple(u_full, mesh_points, domain.mesh_connectivity["tetrahedra"], var_dims)
+                return self._map_mesh_to_sampled(mesh_points, points, hess_full)
 
-                # Map back to sampled points
-                dists = jnp.sum(
-                    (mesh_points[jnp.newaxis, :, :] - points[:, jnp.newaxis, :]) ** 2,
-                    axis=-1,
-                )
-                vertex_indices = jnp.argmin(dists, axis=1)
-                return hess_full[vertex_indices]
+        elif scheme == "automatic_differentiation":
+            evaluator_self = self
 
-            elif scheme == "automatic_differentiation":  # automatic_differentiation
+            if compute_trace:
+                # Laplacian via AD
+                def lap_single(idx):
+                    pt = jax.lax.dynamic_slice(points, (idx, 0), (1, points.shape[1]))[0]
+                    local_ctx = evaluator_self._build_local_context(idx, tag, points, ctx.context)
 
+                    def u_scalar(p):
+                        ctx_dict = {**local_ctx, tag: p[jnp.newaxis, :]}
+                        new_ctx = evaluator_self._EvalCtx(ctx_dict, ctx.var_bindings, ctx.key)
+                        return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
+
+                    hess = jax.hessian(u_scalar)(pt)
+                    return sum(hess[d, d] for d in dims)
+
+                return jax.vmap(lap_single)(jnp.arange(points.shape[0]))
+            else:
+                # Full Hessian via AD
                 def hess_single(pt):
                     def u_scalar(p):
-                        result = self.evaluate(
-                            target,
-                            {tag: p[jnp.newaxis, :]},
-                            var_bindings,
-                            tensor_tags,
-                            key,
+                        new_ctx = evaluator_self._EvalCtx(
+                            {**ctx.context, tag: p[jnp.newaxis, :]},
+                            ctx.var_bindings,
+                            ctx.key,
                         )
-                        return jnp.squeeze(result)
+                        return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
 
                     hess = jax.hessian(u_scalar)(pt)
                     result = jnp.zeros((n, n))
@@ -946,166 +784,57 @@ class TraceEvaluator:
 
                 return jax.vmap(hess_single)(points)
 
-        # ----------------------------------------------------------
-        # OperationDef
-        # ----------------------------------------------------------
-        elif isinstance(expr, OperationDef):
-            return self.evaluate(expr.expr, points_by_tag, var_bindings, tensor_tags, key)
-
-        else:
-            raise ValueError(f"Cannot evaluate:  {type(expr)}")
+    def _eval_operation_def(self, expr, ctx):
+        return self._dispatch(expr.expr, ctx)
 
     @staticmethod
-    def collect_dense_layers(
-        expr: Placeholder,
-        traverse_calls: bool = False,
-        tensor_dims: Dict[str, int] = None,
-    ) -> List:
-        """Collect all FlaxModule nodes from expression tree."""
+    def collect_dense_layers(expr: Placeholder) -> List:
+        """Collect all FlaxModule nodes and their call arguments from expression tree.
 
-        tensor_dims = tensor_dims or {}
+        Traverses depth-first so that dependencies (modules whose outputs feed
+        into other modules) are collected before the modules that consume them.
+
+        Returns:
+            List of ``(FlaxModule, call_args | None)`` tuples.
+            ``call_args`` is ``None`` for standalone parameter modules.
+        """
         layers = []
         seen = set()
-
-        def get_shape(arg):
-            """Extract shape from any Placeholder type."""
-            if isinstance(arg, Variable):
-                shape = tensor_dims.get(arg.tag)
-                if shape is None:
-                    return (1,)
-                base_shape = list(shape[:-1]) if len(shape) > 1 else []
-                if arg.dim is not None and arg.dim[1] is not None:
-                    last_dim = arg.dim[1] - arg.dim[0]
-                else:
-                    last_dim = shape[-1] if shape else 1
-                return tuple(base_shape + [last_dim])
-
-            elif isinstance(arg, TensorTag):
-
-                if arg.dim_index is not None:
-                    return tensor_dims[arg.tag][:-1]
-
-                return tensor_dims.get(arg.tag)
-
-            elif isinstance(arg, Slice):
-                target_shape = list(get_shape(arg.target))
-                result_shape = []
-                target_idx = 0
-
-                for k in arg.key:
-                    if isinstance(k, NewAxis):
-                        result_shape.append(1)
-                    elif k is Ellipsis:
-                        remaining = len(target_shape) - target_idx
-                        result_shape.extend(target_shape[target_idx : target_idx + remaining])
-                        target_idx += remaining
-                    elif isinstance(k, int):
-                        target_idx += 1
-                    elif isinstance(k, slice):
-                        result_shape.append(target_shape[target_idx] if target_idx < len(target_shape) else 1)
-                        target_idx += 1
-                    else:
-                        if target_idx < len(target_shape):
-                            result_shape.append(target_shape[target_idx])
-                            target_idx += 1
-
-                result_shape.extend(target_shape[target_idx:])
-                return tuple(result_shape) if result_shape else (1,)
-
-            elif isinstance(arg, Concat):
-                if not arg.items:
-                    return (1,)
-                item_shapes = [get_shape(item) for item in arg.items]
-                max_ndim = max(len(s) for s in item_shapes)
-                axis = arg.axis if arg.axis >= 0 else max_ndim + arg.axis
-
-                padded_shapes = []
-                for s in item_shapes:
-                    if len(s) < max_ndim:
-                        s = (1,) * (max_ndim - len(s)) + s
-                    padded_shapes.append(s)
-
-                result = list(padded_shapes[0])
-                result[axis] = sum(s[axis] for s in padded_shapes)
-                return tuple(result)
-
-            elif isinstance(arg, Literal):
-                val = jnp.asarray(arg.value)
-                return val.shape if val.ndim > 0 else (1,)
-
-            elif isinstance(arg, BinaryOp):
-                left_shape = get_shape(arg.left)
-                right_shape = get_shape(arg.right)
-                max_ndim = max(len(left_shape), len(right_shape))
-                left_padded = (1,) * (max_ndim - len(left_shape)) + left_shape
-                right_padded = (1,) * (max_ndim - len(right_shape)) + right_shape
-                return tuple(max(l, r) for l, r in zip(left_padded, right_padded))
-
-            elif isinstance(arg, FunctionCall):
-                key = jax.random.PRNGKey(42)
-                sig = inspect.signature(arg.fn)
-
-                # Build arguments list
-                args = []
-                param_names = list(sig.parameters.keys())
-
-                for i, a in enumerate(arg.args):
-                    if i < len(param_names) and param_names[i] == "key":
-                        args.append(key)
-                    else:
-                        args.append(jnp.ones(get_shape(a)))
-
-                # Check if 'key' is a keyword-only parameter not yet provided
-                if "key" in sig.parameters and "key" not in param_names[: len(arg.args)]:
-                    return arg.fn(*args, key=key).shape
-                else:
-                    return arg.fn(*args).shape
-
-            else:
-                return (1,)
 
         def visit(node):
             if isinstance(node, FlaxModule):
                 if node.layer_id not in seen:
                     seen.add(node.layer_id)
-                    layers.append(node)
+                    layers.append((node, None))
+
             elif isinstance(node, TunableModule):
                 if node._current_instance is not None:
-                    if node._current_instance.layer_id not in seen:
-                        seen.add(node._current_instance.layer_id)
-                        layers.append(node._current_instance)
+                    inst = node._current_instance
+                    if inst.layer_id not in seen:
+                        seen.add(inst.layer_id)
+                        layers.append((inst, None))
+
             elif isinstance(node, TunableModuleCall):
+                # Visit args first (dependency order)
+                for arg in node.args:
+                    if isinstance(arg, Placeholder):
+                        visit(arg)
                 tunable = node.model
                 if tunable._current_instance is not None:
                     flax_mod = tunable._current_instance
-                    flax_mod._n_args = len(node.args)
-
-                    arg_dims = []
-                    for arg in node.args:
-                        arg_dims.append(get_shape(arg))  # Use the outer get_shape
-                    flax_mod._arg_dims = arg_dims
-
                     if flax_mod.layer_id not in seen:
                         seen.add(flax_mod.layer_id)
-                        layers.append(flax_mod)
-
-                for arg in node.args:
-                    if isinstance(arg, Placeholder):
-                        visit(arg)
+                        layers.append((flax_mod, node.args))
 
             elif isinstance(node, FlaxModuleCall):
-                flax_mod = node.model
-                flax_mod._n_args = len(node.args)
-
-                arg_dims = []
-                for arg in node.args:
-                    arg_dims.append(get_shape(arg))  # Now uses the outer get_shape
-                flax_mod._arg_dims = arg_dims
-
-                visit(flax_mod)
+                # Visit args first (dependency order)
                 for arg in node.args:
                     if isinstance(arg, Placeholder):
                         visit(arg)
+                flax_mod = node.model
+                if flax_mod.layer_id not in seen:
+                    seen.add(flax_mod.layer_id)
+                    layers.append((flax_mod, node.args))
 
             elif isinstance(node, Concat):
                 for item in node.items:
@@ -1118,14 +847,11 @@ class TraceEvaluator:
                     if isinstance(arg, Placeholder):
                         visit(arg)
             elif isinstance(node, OperationCall):
-                if traverse_calls:
-                    visit(node.operation.expr)
+                visit(node.operation.expr)
                 for arg in node.args:
                     if isinstance(arg, Placeholder):
                         visit(arg)
-            elif isinstance(node, Laplacian):
-                visit(node.target)
-            elif isinstance(node, Gradient):
+            elif isinstance(node, (Hessian, Jacobian)):
                 visit(node.target)
             elif isinstance(node, Slice):
                 visit(node.target)
@@ -1136,105 +862,87 @@ class TraceEvaluator:
         return layers
 
     @staticmethod
-    def infer_layer_input_dims(expr: Placeholder, domain_dim: int, tensor_dims: Dict[str, int]) -> Dict[int, int]:
-        """Infer input dimension for each layer by tracing the expression tree.
+    def _infer_arg_shapes(
+        call_args: List,
+        tensor_dims: Dict[str, tuple],
+        existing_params: Dict,
+    ) -> List[tuple]:
+        """Infer the *normalised* argument shapes for a FlaxModuleCall.
 
-        Args:
-            expr: The expression tree to analyze
-            domain_dim: Default dimension for spatial/temporal variables
-            tensor_dims: Dict mapping tensor tag names to their dimensions
-
-        Returns:
-            Dict mapping layer_id -> input_dim
+        Only needed for legacy Flax modules that require dummy inputs
+        for ``module.init()``.  Equinox modules are constructed eagerly
+        and never reach this code path.
         """
-        layer_input_dims = {}
+        abstract_ctx = {tag: jax.ShapeDtypeStruct(tuple(shape), jnp.float32) for tag, shape in tensor_dims.items()}
 
-        def get_output_dim(node) -> int:
-            """Get the output dimension of a node."""
-            if isinstance(node, Variable):
-                return 1  # Each variable is 1D
-            elif isinstance(node, TensorTag):
-                return tensor_dims.get(node.tag, 1)
-            elif isinstance(node, Literal):
-                val = jnp.asarray(node.value)
-                return val.shape[-1] if val.ndim > 0 else 1
-            elif isinstance(node, Concat):
-                return sum(get_output_dim(item) for item in node.items)
-            elif isinstance(node, FlaxModule):
-                # For Flax modules, we can't easily know output dim without running
-                # Return None to indicate it needs to be inferred at init time
-                return None
-            elif isinstance(node, FlaxModuleCall):
-                # FlaxModuleCall output dim is unknown (depends on the module)
-                return None
-            elif isinstance(node, BinaryOp):
-                # For binary ops, output dim is max of left/right (broadcasting)
-                return max(get_output_dim(node.left), get_output_dim(node.right))
-            elif isinstance(node, FunctionCall):
-                # Functions preserve shape, look at first Placeholder arg
-                for arg in node.args:
-                    if isinstance(arg, Placeholder):
-                        return get_output_dim(arg)
-                return 1
-            elif isinstance(node, OperationCall):
-                return get_output_dim(node.operation.expr)
-            elif isinstance(node, OperationDef):
-                return get_output_dim(node.expr)
-            elif isinstance(node, Slice):
-                # Slicing can change dimension, conservatively return 1
-                return 1
-            elif isinstance(node, (Gradient, Laplacian, Hessian)):
-                return 1
-            return domain_dim
+        def eval_and_normalize(context):
+            evaluator = TraceEvaluator(existing_params)
+            ctx = evaluator._EvalCtx(context, {}, jax.random.PRNGKey(0))
 
-        def visit(node, upstream_dim: int):
-            """Visit nodes and record input dims for layers."""
-            if isinstance(node, FlaxModule):
-                # Store input dim for Flax module
-                layer_input_dims[node.layer_id] = node.input_dim or upstream_dim
-            elif isinstance(node, FlaxModuleCall):
-                # For direct FlaxModuleCall, infer input dim from arguments
-                n_args = len(node.args)
-                input_dim = node.model.input_dim or n_args
-                layer_input_dims[node.model.layer_id] = input_dim
-                # Visit arguments
-                for arg in node.args:
-                    if isinstance(arg, Placeholder):
-                        visit(arg, upstream_dim)
-            elif isinstance(node, BinaryOp):
-                visit(node.left, upstream_dim)
-                visit(node.right, upstream_dim)
-            elif isinstance(node, Concat):
-                for item in node.items:
-                    visit(item, upstream_dim)
-            elif isinstance(node, FunctionCall):
-                for arg in node.args:
-                    if isinstance(arg, Placeholder):
-                        visit(arg, upstream_dim)
-            elif isinstance(node, OperationCall):
-                visit(node.operation.expr, upstream_dim)
-                for arg in node.args:
-                    if isinstance(arg, Placeholder):
-                        visit(arg, upstream_dim)
-            elif isinstance(node, OperationDef):
-                visit(node.expr, upstream_dim)
-            elif isinstance(node, (Gradient, Laplacian, Hessian)):
-                visit(node.target, upstream_dim)
-            elif isinstance(node, Slice):
-                visit(node.target, upstream_dim)
-            elif isinstance(node, Reshape):
-                visit(node.target, upstream_dim)
+            arg_values = []
+            arg_sources = []
+            for arg in call_args:
+                val = evaluator._dispatch(arg, ctx)
+                arg_values.append(val)
+                is_spatial = isinstance(arg, Variable) and arg.tag in context
+                arg_sources.append(is_spatial)
 
-        visit(expr, domain_dim)
-        return layer_input_dims
+            N = 1
+            for val, is_spatial in zip(arg_values, arg_sources):
+                if is_spatial:
+                    val = jnp.asarray(val)
+                    if val.ndim >= 1:
+                        N = max(N, val.shape[0])
+
+            def normalize_arg(val, is_spatial):
+                val = jnp.asarray(val)
+                if is_spatial:
+                    if val.ndim == 0:
+                        return jnp.full((N, 1), val)
+                    elif val.ndim == 1:
+                        return val[:, jnp.newaxis]
+                    else:
+                        return val
+                else:
+                    if val.ndim == 0:
+                        return val[jnp.newaxis]
+                    else:
+                        return val
+
+            return tuple(normalize_arg(v, s) for v, s in zip(arg_values, arg_sources))
+
+        abstract_results = jax.eval_shape(eval_and_normalize, abstract_ctx)
+        return [r.shape for r in abstract_results]
+
+    @staticmethod
+    def _cast_model_dtype(model, dtype, logger):
+        """Cast all floating-point arrays in *model* to *dtype*.
+
+        Works for both Equinox modules and ``FlaxModelWrapper`` (which
+        wraps a Flax param dict).  Integer arrays are left unchanged.
+        """
+
+        def cast_leaf(x):
+            if eqx.is_array(x) and jnp.issubdtype(x.dtype, jnp.floating):
+                return x.astype(dtype)
+            return x
+
+        model = jax.tree_util.tree_map(cast_leaf, model)
+        logger.info(f"Cast model parameters to {dtype}")
+        return model
 
     @staticmethod
     def merge_pretrained_params(pretrained_params: dict, new_params: dict, logger) -> dict:
         """
         Merge pretrained weights with new params, replacing embedding/recovery layers
         when shapes don't match (for different channel dimensions).
+
+        A concise summary (counts) is logged to the main logger.  Detailed
+        per-parameter information is written to ``weight_merge.log`` in the
+        same directory as the logger's output path.
         """
         stats = {"matched": 0, "replaced": 0}
+        details: list = []  # collect per-param detail lines
 
         def count_params(arr):
             return arr.size if hasattr(arr, "size") else 0
@@ -1254,18 +962,40 @@ class TraceEvaluator:
                             if pretrained[key].shape == new[key].shape:
                                 result[key] = pretrained[key]
                                 stats["matched"] += count_params(pretrained[key])
+                                details.append(
+                                    f"  MATCHED  {current_path}  "
+                                    f"shape={pretrained[key].shape}  "
+                                    f"params={count_params(pretrained[key]):,}"
+                                )
                             else:
-                                logger.info(f"Shape mismatch at {current_path}: " f"{pretrained[key].shape} -> {new[key].shape}, reinitializing")
                                 result[key] = new[key]
-                                stats["replaced"] += count_params(new[key])
+                                n = count_params(new[key])
+                                stats["replaced"] += n
+                                details.append(
+                                    f"  MISMATCH {current_path}  "
+                                    f"{pretrained[key].shape} -> {new[key].shape}  "
+                                    f"params={n:,}  (reinitialized)"
+                                )
                     elif key in pretrained:
                         result[key] = pretrained[key]
                         if not isinstance(pretrained[key], dict):
-                            stats["matched"] += count_params(pretrained[key])
+                            n = count_params(pretrained[key])
+                            stats["matched"] += n
+                            details.append(
+                                f"  MATCHED  {current_path}  "
+                                f"shape={pretrained[key].shape}  "
+                                f"params={n:,}  (pretrained only)"
+                            )
                     else:
                         result[key] = new[key]
                         if not isinstance(new[key], dict):
-                            stats["replaced"] += count_params(new[key])
+                            n = count_params(new[key])
+                            stats["replaced"] += n
+                            details.append(
+                                f"  NEW      {current_path}  "
+                                f"shape={new[key].shape}  "
+                                f"params={n:,}  (new only)"
+                            )
 
                 return result
             else:
@@ -1281,212 +1011,117 @@ class TraceEvaluator:
         merged = merge(pretrained_params, new_params)
 
         total = stats["matched"] + stats["replaced"]
-        pct = 100 * stats["matched"] / total
-        logger.info(f"Pretrained weights: {stats['matched']:,}/{total:,} params matched ({pct:.8f}%), " f"{stats['replaced']:,} reinitialized")
+        pct = 100 * stats["matched"] / total if total else 0
+        n_mismatch = sum(1 for d in details if "MISMATCH" in d)
+        n_new = sum(1 for d in details if "NEW" in d)
+
+        summary = (
+            f"Pretrained weights: {stats['matched']:,}/{total:,} params matched "
+            f"({pct:.4f}%), {stats['replaced']:,} reinitialized "
+            f"({n_mismatch} shape mismatches, {n_new} new)"
+        )
+        logger.info(summary)
+
+        # Write detailed per-parameter report to a text file next to log.txt
+        from pathlib import Path
+        log_dir = getattr(logger, "path", None)
+        if log_dir is not None:
+            log_dir = Path(log_dir)
+            log_dir.mkdir(parents=True, exist_ok=True)
+            detail_path = log_dir / "weight_merge.log"
+            with open(detail_path, "w") as f:
+                f.write(summary + "\n\n")
+                f.write("\n".join(details) + "\n")
 
         return merged
 
     @staticmethod
-    def load_poseidon_params(
-        module,
-        rng: jax.random.PRNGKey,
-        num_input_channels: int,
-        logger: Logger,
-        weight_path: str,
-    ) -> Tuple[dict, Callable]:
+    def build_single_layer_params(layer, arg_shapes, rng, logger):
+        """Retrieve or construct the model for a single layer.
+
+        The model was already fully constructed at factory time — we just
+        return ``layer.module``, optionally loading pretrained weights.
         """
-        Load Poseidon model parameters, handling channel dimension mismatches.
-
-        Args:
-            module: The Poseidon/ScOT Flax module
-            rng: Random key for initialization
-            num_input_channels: Number of input channels for the target problem
-            image_size: Image resolution (default 128)
-
-        Returns:
-            Tuple of (parameters, apply_function)
-        """
-        logger.info("Poseidon model detected.")
-
-        # Create dummy inputs matching target dimensions
-        dummy_field = jnp.ones((1, 128, 128, num_input_channels))
-        dummy_time = jnp.zeros((1,))
-        # dummy_channels = [dummy_field for _ in range(num_input_channels)]
-
-        # Initialize fresh parameters with target dimensions
-        fresh_params = module.init(
-            {"params": rng, "dropout": rng},
-            pixel_values=dummy_field,
-            time=dummy_time,
-            deterministic=False,
-        )
-
-        # Load pretrained weights if path provided
-        if weight_path is not None:
-            with open(weight_path, "rb") as f:
-                pretrained_bytes = f.read()
-
-            # First, try to load with the fresh params structure as target
-            # This handles the case where channel dims match
-            try:
-                layer_params = from_bytes(fresh_params, pretrained_bytes)
-                logger.info(f"Poseidon weights loaded from: {weight_path}")
-            except Exception as e:
-                # If direct load fails, load raw and merge
-                logger.info(f"Direct load failed ({e}), attempting merge with channel replacement")
-
-            # Load pretrained with its original structure
-            # Create dummy init for pretrained config (4 channels)
-            # pretrained_dummy = [dummy_field for _ in range(4)]  # Original Poseidon has 4 channels
-            pretrained_init = module.init(
-                {"params": rng, "dropout": rng},
-                pixel_values=jnp.ones((1, 128, 128, 4)),
-                time=dummy_time,
-                deterministic=False,
-            )
-            pretrained_params = from_bytes(pretrained_init, pretrained_bytes)
-
-            # Merge: keep encoder/decoder, replace mismatched layers
-            layer_params = TraceEvaluator.merge_pretrained_params(pretrained_params, fresh_params, logger)
-        else:
-            layer_params = fresh_params
-            logger.info("No pretrained path provided, using fresh initialization")
-
-        return layer_params, module.apply
-
-    @staticmethod
-    def build_single_layer_params(layer, rng, logger):
-        """Build Flax parameters for a single layer."""
-
-        if isinstance(layer, FlaxModule):
-            n_args = getattr(layer, "_n_args", None)
-            arg_dims = getattr(layer, "_arg_dims", None)
-
-            if isinstance(layer.module, nn.Module):
-                if n_args is not None:
-                    dummies = [jnp.ones((1,) + dim) if len(dim) == 1 else jnp.ones(dim) for dim in arg_dims]
-
-                    # Check if this is a Poseidon model
-                    is_poseidon = False
-                    if hasattr(layer.module, "config"):
-                        if layer.module.config.name is not None and "poseidon" in layer.module.config.name:
-                            is_poseidon = True
-
-                    if is_poseidon:
-                        # Use the new loading function with channel replacement support
-                        layer_params, apply_fn = TraceEvaluator.load_poseidon_params(
-                            module=layer.module,
-                            rng=rng,
-                            num_input_channels=dummies[0].shape[-1],
-                            logger=logger,
-                            weight_path=layer.weight_path,
-                        )  # Exclude time from channel count
-
-                        if layer.show:
-                            df = jnp.ones((1, 128, 128, dummies[0].shape[-1]))
-                            dt = jnp.zeros((1,))
-                            table_str = layer.module.tabulate(jax.random.key(0), df, dt, depth=2)
-                            print(table_str)
-
-                        return layer_params, apply_fn
-
-                    else:
-                        # Standard Flax linen module initialization
-                        layer_params = layer.module.init(rng, *dummies)
-
-                        if layer.weight_path is not None:
-
-                            with open(layer.weight_path, "rb") as f:
-                                pretrained_bytes = f.read()
-
-                            pretrained_params = from_bytes(layer_params, pretrained_bytes)
-                            layer_params = TraceEvaluator.merge_pretrained_params(pretrained_params, layer_params, logger)
-
-                        if layer.show:
-                            rng = jax.random.PRNGKey(0)
-                            if len(dummies) > 1:
-                                table_str = layer.module.tabulate(rng, *dummies, depth=2)
-                            else:
-                                table_str = layer.module.tabulate(rng, dummies[0], depth=2)
-                            print(table_str)  # TODO make logger.info compatible
-
-                        return layer_params, layer.module.apply
-
-                else:
-                    # For single parameters (pnp.parameter)
-                    layer_params = layer.module.init(rng)
-
-                    return layer_params, layer.module.apply
-
-            else:
-                from flax import nnx
-
-                def make_dummy(dim):
-                    """Create dummy array from shape tuple."""
-                    if not isinstance(dim, tuple):
-                        dim = (dim,)
-                    if len(dim) == 1:
-                        return jnp.ones((1, dim[0]))
-                    else:
-                        return jnp.ones(dim)
-
-                dummies = [make_dummy(dim) for dim in arg_dims]
-
-                def make_nnx_functional(module):
-                    """Convert NNX module to functional style (params, apply_fn)."""
-                    graphdef, params, other_state = nnx.split(module, nnx.Param, ...)
-
-                    @jax.jit
-                    def apply_fn(params, *args, **kwargs):
-                        model = nnx.merge(graphdef, params, other_state)
-                        return model(*args, **kwargs)
-
-                    return params, apply_fn
-
-                layer_params, apply_fn = make_nnx_functional(layer.module)
-
-                if layer.weight_path is not None:
-
-                    with open(layer.weight_path, "rb") as f:
-                        pretrained_bytes = f.read()
-
-                    pretrained_params = from_bytes(layer_params, pretrained_bytes)
-                    layer_params = TraceEvaluator.merge_pretrained_params(pretrained_params, layer_params, logger)
-
-                if layer.show:
-                    if len(dummies) > 1:
-                        table_str = nnx.tabulate(layer.module, *dummies, depth=2)
-                    else:
-                        table_str = nnx.tabulate(layer.module, dummies[0], depth=2)
-                    logger.info(table_str)
-
-                return layer_params, apply_fn
-
-        else:
+        if not isinstance(layer, FlaxModule):
             raise ValueError(f"Unknown layer type: {type(layer)}")
 
+        module = layer.module
+
+        # ---- Flax wrapper path (msgpack weights) --------------------
+        from .architectures.common import FlaxModelWrapper
+
+        if isinstance(module, FlaxModelWrapper) and layer.weight_path is not None:
+            logger.info(f"Loading pretrained Flax weights from {layer.weight_path}")
+            from flax.serialization import from_bytes
+
+            with open(layer.weight_path, "rb") as f:
+                pretrained_params = from_bytes(module.params, f.read())
+
+            # Merge pretrained weights with fresh params
+            merged = TraceEvaluator.merge_pretrained_params(
+                pretrained_params,
+                module.params,
+                logger,
+            )
+            # Return a new FlaxModelWrapper with merged params
+            model = FlaxModelWrapper(
+                module.apply_fn,
+                merged,
+                post_fn=module.post_fn,
+                **module.default_kwargs,
+            )
+
+            # ---- optional dtype cast --------------------------------
+            if getattr(layer, "_dtype", None) is not None:
+                model = TraceEvaluator._cast_model_dtype(model, layer._dtype, logger)
+
+            if layer.show:
+                leaves = jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))
+                total = sum(l.size for l in leaves)
+                logger.info(f"  {type(model).__name__}: {total:,} parameters")
+
+            return model
+
+        # ---- Equinox path (normal) ----------------------------------
+        if isinstance(module, eqx.Module):
+            model = module
+
+            if layer.weight_path is not None:
+                logger.info(f"Loading pretrained weights from {layer.weight_path}")
+                model = eqx.tree_deserialise_leaves(layer.weight_path, model)
+
+            # ---- optional dtype cast --------------------------------
+            if getattr(layer, "_dtype", None) is not None:
+                model = TraceEvaluator._cast_model_dtype(model, layer._dtype, logger)
+
+            if layer.show:
+                leaves = jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))
+                total = sum(l.size for l in leaves)
+                logger.info(f"  {type(model).__name__}: {total:,} parameters")
+
+            return model
+
     @staticmethod
-    def compile_traced_expression(expr: Placeholder, all_ops: List[OperationDef], layer_info) -> Callable:
+    def compile_traced_expression(expr: Placeholder, all_ops: List[OperationDef]) -> Callable:
         """Compile traced expression into a JAX-compatible function."""
 
-        def evaluate_single_batch(params, points_by_tag_single, tensor_tags_single, key):
+        def evaluate_single_batch(params, context_single, key):
             """Evaluate for a single batch - no batch dimension."""
-            evaluator = TraceEvaluator(params, layer_info)
-            return evaluator.evaluate(expr, points_by_tag_single, {}, tensor_tags_single, key)
+            evaluator = TraceEvaluator(params)
+            return evaluator.evaluate(expr, context_single, {}, key)
 
-        def compiled_fn(params, points_by_tag, tensor_tags=None, batchsize=None, key=None):
+        def compiled_fn(params, context=None, batchsize=None, key=None):
             """
             Evaluate the compiled expression.
 
             Args:
                 params: Model parameters
-                points_by_tag: Dictionary of points arrays by tag
-                tensor_tags: Optional dictionary of tensor arrays by tag
+                context: Unified dictionary of all input arrays by tag
                 batchsize: If provided, randomly select this many samples from the batch dimension.
                         If None, use all samples.
                 key: JAX random key for selecting random subset. Required if batchsize is provided.
             """
-            tensor_tags = tensor_tags or {}
+            context = context or {}
 
             # Collect all unique tags from all constraints to standardize ordering
             all_tags = set()
@@ -1495,34 +1130,23 @@ class TraceEvaluator:
                     for var in op._collected_vars:
                         all_tags.add(var.tag)
 
-            tag_order = tuple(sorted(points_by_tag.keys(), key=lambda t: (t not in all_tags, t)))
-            points_tuple = tuple(points_by_tag[tag] for tag in tag_order) if tag_order else ()
-            tensor_order = tuple(sorted(tensor_tags.keys()))
-            tensors_tuple = tuple(tensor_tags[tag] for tag in tensor_order) if tensor_order else ()
+            tag_order = tuple(sorted(context.keys(), key=lambda t: (t not in all_tags, t)))
+            ctx_tuple = tuple(context[tag] for tag in tag_order) if tag_order else ()
 
             # ============================================================
             # STEP 1: Determine the PRIMARY batch size B
-            # Use the MAXIMUM batch size found among ndim=3 points
-            # Arrays with smaller "batch" dimensions are treated as non-batched
+            # First dimension is always batch — check all entries
             # ============================================================
             batched_sizes = []
-
-            # Check points: Only ndim=3 arrays are potentially batched points: (B, N, D)
-            for p in points_tuple:
-                if hasattr(p, "ndim") and p.ndim == 3:
-                    batched_sizes.append(p.shape[0])
-
-            # Check tensors: assume first dimension is batch if ndim >= 1
-            for t in tensors_tuple:
-                if hasattr(t, "ndim") and t.ndim >= 1:
-                    batched_sizes.append(t.shape[0])
+            for arr in ctx_tuple:
+                if hasattr(arr, "ndim") and arr.ndim >= 1:
+                    batched_sizes.append(arr.shape[0])
 
             if not batched_sizes:
-                # No batched points or tensors → no vmap needed
-                return evaluate_single_batch(params, points_by_tag, tensor_tags, key=key)
+                # No batched data → no vmap needed
+                return evaluate_single_batch(params, context, key=key)
 
             # Use the maximum as the primary batch size
-            # Arrays with different sizes won't be vmapped over
             B = max(batched_sizes)
 
             # ============================================================
@@ -1538,119 +1162,69 @@ class TraceEvaluator:
                     indices = jnp.sort(indices)
 
                 if batchsize < B:
-                    # Randomly select indices
                     indices = jax.random.choice(key, B, shape=(batchsize,), replace=False)
                     indices = jnp.sort(indices)
 
                 if batchsize == B:
                     indices = jnp.arange(0, B, 1)
 
-                # Subset points that have THE PRIMARY batch dimension
-                def subset_point(p):
-                    if hasattr(p, "ndim") and p.ndim == 3 and p.shape[0] == B:
-                        return p[indices]
-                    return p
+                def subset_entry(arr):
+                    if hasattr(arr, "ndim") and arr.ndim >= 1 and arr.shape[0] == B:
+                        return arr[indices]
+                    return arr
 
-                # Subset tensors that have THE PRIMARY batch dimension
-                def subset_tensor(t):
-                    if hasattr(t, "ndim") and t.ndim >= 1 and t.shape[0] == B:
-                        return t[indices]
-                    return t
-
-                points_tuple = tuple(subset_point(p) for p in points_tuple)
-                tensors_tuple = tuple(subset_tensor(t) for t in tensors_tuple)
-
-                # Update B to the new batch size
+                ctx_tuple = tuple(subset_entry(a) for a in ctx_tuple)
                 B = batchsize
 
             # ============================================================
-            # STEP 2: Normalize points - only vmap over arrays with batch size == B
+            # STEP 2: Normalize — only vmap over arrays with batch size == B
             # ============================================================
-            def normalize_point(arg, idx: int):
-                if not hasattr(arg, "ndim"):
-                    return arg, None
-
-                if arg.ndim == 3:
-                    bs = arg.shape[0]
-                    if bs == B:
-                        # This array has the primary batch size - vmap over it
-                        return arg, 0
-                    elif bs == 1:
-                        # Squeeze out the singleton batch dimension
-                        return jnp.squeeze(arg, axis=0), None
-                    else:
-                        # Different batch size - DON'T vmap, treat as constant
-                        # This array will be shared across all B evaluations
-                        return arg, None
-                else:
-                    return arg, None
-
-            new_points = []
-            points_in_axes = []
-            for i, p in enumerate(points_tuple):
-                p2, ax = normalize_point(p, i)
-                new_points.append(p2)
-                points_in_axes.append(ax)
-            points_tuple = tuple(new_points)
-            points_in_axes = tuple(points_in_axes)
-
-            # ============================================================
-            # STEP 3: Normalize tensors - only vmap over arrays with batch size == B
-            # ============================================================
-            def normalize_tensor(arg, idx: int):
+            def normalize_entry(arg):
                 if not hasattr(arg, "ndim") or arg.ndim == 0:
                     return arg, None
 
                 bs = arg.shape[0]
                 if bs == B:
-                    # This array has the primary batch size - vmap over it
                     return arg, 0
                 elif bs == 1:
-                    # Squeeze out the singleton batch dimension
                     return jnp.squeeze(arg, axis=0), None
                 else:
-                    # Different batch size - DON'T vmap, treat as constant
                     return arg, None
 
-            new_tensors = []
-            tensors_in_axes = []
-            for i, t in enumerate(tensors_tuple):
-                t2, ax = normalize_tensor(t, i)
-                new_tensors.append(t2)
-                tensors_in_axes.append(ax)
-            tensors_tuple = tuple(new_tensors)
-            tensors_in_axes = tuple(tensors_in_axes)
+            new_ctx = []
+            ctx_in_axes = []
+            for a in ctx_tuple:
+                a2, ax = normalize_entry(a)
+                new_ctx.append(a2)
+                ctx_in_axes.append(ax)
+            ctx_tuple = tuple(new_ctx)
+            ctx_in_axes = tuple(ctx_in_axes)
 
             # ============================================================
-            # STEP 4: vmap - only over axes marked with 0
+            # STEP 3: vmap — only over axes marked with 0
             # ============================================================
-            def eval_single_batch_tuple(points_vals, tensor_vals, rng_key):
-                pts_dict = dict(zip(tag_order, points_vals))
-                tens_dict = dict(zip(tensor_order, tensor_vals)) if tensor_order else {}
-                # Pass rng_key to your evaluation function
-                return evaluate_single_batch(params, pts_dict, tens_dict, key=rng_key)
+            def eval_single_batch_tuple(ctx_vals, rng_key):
+                ctx_dict = dict(zip(tag_order, ctx_vals))
+                return evaluate_single_batch(params, ctx_dict, key=rng_key)
 
             if key is not None:
-                # Split the key into B subkeys, one for each batch element
                 keys = jax.random.split(key, B)
-
                 vmapped_fn = jax.vmap(
                     eval_single_batch_tuple,
-                    in_axes=(points_in_axes, tensors_in_axes, 0),
-                )  # 0 for keys axis
-                return vmapped_fn(points_tuple, tensors_tuple, keys)
+                    in_axes=(ctx_in_axes, 0),
+                )
+                return vmapped_fn(ctx_tuple, keys)
             else:
-                # No key provided - use original function without key
-                def eval_single_batch_tuple_no_key(points_vals, tensor_vals):
-                    pts_dict = dict(zip(tag_order, points_vals))
-                    tens_dict = dict(zip(tensor_order, tensor_vals)) if tensor_order else {}
-                    return evaluate_single_batch(params, pts_dict, tens_dict)
+
+                def eval_single_batch_tuple_no_key(ctx_vals):
+                    ctx_dict = dict(zip(tag_order, ctx_vals))
+                    return evaluate_single_batch(params, ctx_dict, key=None)
 
                 vmapped_fn = jax.vmap(
                     eval_single_batch_tuple_no_key,
-                    in_axes=(points_in_axes, tensors_in_axes),
+                    in_axes=(ctx_in_axes,),
                 )
-                return vmapped_fn(points_tuple, tensors_tuple)
+                return vmapped_fn(ctx_tuple)
 
         return compiled_fn
 
@@ -1661,36 +1235,43 @@ class TraceEvaluator:
         tensor_dims: Dict[str, int],
         rng: jax.Array,
         logger,
-    ) -> Tuple[Dict, Dict, jax.Array]:
-        """Initialize parameters for all layers, sharing across operations.
+    ) -> Tuple[Dict, jax.Array]:
+        """Collect / initialise models for all layers.
+
+        For equinox modules (the normal path), the model was already
+        constructed eagerly at factory time — we just store it directly
+        (with optional pretrained weight loading).
+
+        For legacy Flax modules (ScOT / Poseidon), we fall back to
+        shape inference via ``jax.eval_shape`` and ``module.init``.
 
         Returns:
-            all_params: Dict mapping layer_id -> params (single copy per unique layer)
-            all_layer_info: Dict mapping layer_id -> apply_fn (single copy per unique layer)
+            all_models: Dict mapping layer_id -> callable model
             rng: Updated RNG key
         """
-        all_params = {}  # layer_id -> params
-        all_layer_info = {}  # layer_id -> apply_fn
-
-        # First pass: collect all layers and their input dims from all ops
-        all_layers = {}  # layer_id -> (layer, layer_input_dims)
+        all_models = {}
+        seen = set()
 
         for op in all_ops:
-            layers = TraceEvaluator.collect_dense_layers(op.expr, tensor_dims=tensor_dims)
-            if not layers:
-                continue
+            layers_with_args = TraceEvaluator.collect_dense_layers(op.expr)
+            for layer, call_args in layers_with_args:
+                if layer.layer_id in seen:
+                    continue
+                seen.add(layer.layer_id)
 
-            layer_input_dims = TraceEvaluator.infer_layer_input_dims(op.expr, domain_dim, tensor_dims)
+                rng, init_rng = jax.random.split(rng)
 
-            for layer in layers:
-                if layer.layer_id not in all_layers:
-                    all_layers[layer.layer_id] = (layer, layer_input_dims)
+                # Fast path: equinox modules are already fully constructed
+                if isinstance(layer.module, eqx.Module):
+                    model = TraceEvaluator.build_single_layer_params(layer, None, init_rng, logger)
+                else:
+                    # Legacy Flax: need shape inference first
+                    if call_args is not None:
+                        arg_shapes = TraceEvaluator._infer_arg_shapes(call_args, tensor_dims, all_models)
+                    else:
+                        arg_shapes = None
+                    model = TraceEvaluator.build_single_layer_params(layer, arg_shapes, init_rng, logger)
 
-        # Second pass: initialize each unique layer once
-        for layer_id, (layer, layer_input_dims) in all_layers.items():
-            rng, init_rng = jax.random.split(rng)
-            layer_params, apply_fn = TraceEvaluator.build_single_layer_params(layer, init_rng, logger)
-            all_params[layer_id] = layer_params
-            all_layer_info[layer_id] = apply_fn
+                all_models[layer.layer_id] = model
 
-        return all_params, all_layer_info, rng
+        return all_models, rng

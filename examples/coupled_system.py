@@ -50,7 +50,8 @@ from jno import sampler
 
 import jax.numpy as jnp
 import optax
-from flax import linen as nn
+import equinox as eqx
+from jno.architectures.linear import Linear
 from soap_jax import soap
 
 π = jnn.pi
@@ -153,25 +154,37 @@ domain.plot(f"{dire}/train_domain.png")
 # -----------------------------------------------------------------------------
 
 
-# Models are defined using Flax modules or jno-provided templates.
-class MLP(nn.Module):
+# Models are defined using equinox modules or jno-provided templates.
+class MLP(eqx.Module):
     """Simple fully-connected neural network with scalar output."""
 
-    @nn.compact
+    dense1: Linear
+    dense2: Linear
+    dense3: Linear
+
+    def __init__(self, *, key):
+        k1, k2, k3 = jax.random.split(key, 3)
+        self.dense1 = Linear(2, 64, key=k1)
+        self.dense2 = Linear(64, 64, key=k2)
+        self.dense3 = Linear(64, 1, key=k3)
+
     def __call__(self, x, y, k):
 
         # jax.debug.print("k has shape: {arr}", arr=k.shape)
 
         h = jnp.concat([x, y], axis=-1)
-        h = nn.tanh(nn.Dense(64)(h))
-        h = nn.tanh(nn.Dense(64)(h))
-        u = nn.Dense(1)(h)
+        h = jnp.tanh(self.dense1(h))
+        h = jnp.tanh(self.dense2(h))
+        u = self.dense3(h)
         return u
 
 
+key = jax.random.PRNGKey(0)
+k1, k2 = jax.random.split(key)
+
 # Use a predefined MLP model for u.
 # Multiplication by x(1-x)y(1-y) hard-enforces homogeneous Dirichlet BCs.
-u_net = jnn.nn.mlp(hidden_dims=64, num_layers=2)
+u_net = jnn.nn.mlp(2, hidden_dims=64, num_layers=2, key=k1)
 
 u_net.dont_show()  # Do not print out the model
 
@@ -181,8 +194,8 @@ u = u_net(x, y) * x * (1 - x) * y * (1 - y)
 # u.debug._shape = True
 
 
-# Alternatively, wrap a custom Flax nn.Module for v.
-v_net = jnn.nn.wrap(MLP())
+# Alternatively, wrap a custom equinox Module for v.
+v_net = jnn.nn.wrap(MLP(key=k2))
 v = v_net(x, y, k)
 
 # The resulting neural networks can be combined freely
@@ -258,54 +271,27 @@ crux = jno.core(constraints=[pde1.mse, pde2.mse, boc2.mse, sens.mse, val1, val2]
 # Checkpoints (params, optimizer state, RNG) are saved automatically after every .solve call
 
 # Phase 1: Adam optimizer with warmup + cosine decay
-crux.solve(4000, optax.adam(1), lrs.warmup_cosine(4000, 500, 1e-3, 1e-4), ws([1.0, 1.0, 10.0, 1.0])).plot(f"{dire}/training_history_adam.png")
+u_net.optimizer(optax.adam, lr=lrs.warmup_cosine(4000, 500, 1e-3, 1e-4))
+v_net.optimizer(optax.adam, lr=lrs.warmup_cosine(4000, 500, 1e-3, 1e-4))
+crux.solve(4000, constraint_weights=ws([1.0, 1.0, 10.0, 1.0])).plot(f"{dire}/training_history_adam.png")
 
 
 # Phase 1: Adam optimizer with gradient clipping
-crux.solve(4000, optax.chain(optax.adam(1), optax.clip_by_global_norm(1e-3)), lrs.warmup_cosine(4000, 500, 1e-3, 1e-4), ws([1.0, 1.0, 10.0, 1.0])).plot(f"{dire}/training_history_adam_with_clip.png")
+u_net.optimizer(optax.chain(optax.adam(1), optax.clip_by_global_norm(1e-3)), lr=lrs.warmup_cosine(4000, 500, 1e-3, 1e-4))
+v_net.optimizer(optax.chain(optax.adam(1), optax.clip_by_global_norm(1e-3)), lr=lrs.warmup_cosine(4000, 500, 1e-3, 1e-4))
+crux.solve(4000, constraint_weights=ws([1.0, 1.0, 10.0, 1.0])).plot(f"{dire}/training_history_adam_with_clip.png")
 
 
 # Phase 2: SOAP optimizer with exponential decay and all weights are 1.0
-crux.solve(1000, soap(1, precondition_frequency=13), lrs(lambda e, _: 1e-4 * (5e-5 / 1e-4) ** (e / 1000))).plot(f"{dire}/training_history_soap.png")
+u_net.optimizer(soap(1), lr=lrs(lambda e, _: 1e-4 * (5e-5 / 1e-4) ** (e / 1000)))
+v_net.optimizer(soap(1), lr=lrs(lambda e, _: 1e-4 * (5e-5 / 1e-4) ** (e / 1000)))
+crux.solve(1000).plot(f"{dire}/training_history_soap.png")
 
 
 # Phase 3: L-BFGS refinement with adaptive boundary weighting
-crux.solve(1000, optax.lbfgs, lrs(5e-5), ws(lambda e, L: [1.0, 1.0, 10.0, 1.0 * L[3]])).plot(f"{dire}/training_history_lbfgs.png")
-
-
-# -----------------------------------------------------------------------------
-# Post-processing and evaluation
-# -----------------------------------------------------------------------------
-
-# Create a finer mesh for inference (optional).
-# Set compute_mesh_connectivity=False if not required.
-tst_domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.01), compute_mesh_connectivity=False)
-tst_domain.variable("k", jnp.ones((1, 1)))  # shape = (1, 1) for inference
-
-# Compute error metrics (L1, L2, Linf) on all mesh tags.
-crux.errors.all(predictions=[u, v], references=[_u, _v], save_path=f"{dire}/", test_pts=tst_domain)
-tst_domain.plot(f"{dire}/test_domain.png")  # Points are sampled in the errors.all function (since we did not do it) -> plot afterwards
-
-# Plot predictions, ground truth, and errors.
-crux.plot(operation=u, test_pts=tst_domain).savefig(f"{dire}/u_pred.png")
-crux.plot(operation=v, test_pts=tst_domain).savefig(f"{dire}/v_pred.png")
-crux.plot(operation=_u, test_pts=tst_domain).savefig(f"{dire}/u_true.png")
-crux.plot(operation=_v, test_pts=tst_domain).savefig(f"{dire}/v_true.png")
-crux.plot(operation=u - _u, test_pts=tst_domain).savefig(f"{dire}/u_erro.png")
-crux.plot(operation=v - _v, test_pts=tst_domain).savefig(f"{dire}/v_erro.png")
-
-
-# -----------------------------------------------------------------------------
-# Computational graph inspection
-# -----------------------------------------------------------------------------
-
-# Each constraint can be visualized as a computational graph.
-# The resulting .dot files can be viewed using https://edotor.net/
-crux.visualize_trace(pde1).save(f"{dire}/trace_pde1.dot")
-crux.visualize_trace(pde2).save(f"{dire}/trace_pde2.dot")
-crux.visualize_trace(boc2).save(f"{dire}/trace_boc2.dot")
-crux.visualize_trace(sens).save(f"{dire}/trace_sens.dot")
-
+u_net.optimizer(optax.lbfgs, lr=lrs(5e-5))
+v_net.optimizer(optax.lbfgs, lr=lrs(5e-5))
+crux.solve(1000, constraint_weights=ws(lambda e, L: [1.0, 1.0, 10.0, 1.0 * L[3]])).plot(f"{dire}/training_history_lbfgs.png")
 
 # -----------------------------------------------------------------------------
 # Checkpointing and restart
@@ -318,4 +304,5 @@ del crux
 # Reload the saved instance and continue training.
 # By default, the last stored parameters are used.
 crux = jno.core.load(f"{dire}/trial.pkl")
-crux.solve(500, soap(1), lrs(1e-5), ws([1.0, 1.0, 10.0, 10.0, 1.0, 1.0])).plot(f"{dire}/training_history_full_full.png")
+crux.set_optimizer(soap(1), lr=lrs(1e-5))
+crux.solve(500, constraint_weights=ws([1.0, 1.0, 10.0, 10.0])).plot(f"{dire}/training_history_full_full.png")

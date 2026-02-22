@@ -195,7 +195,7 @@ class WeightSchedule:
             min_weight: minimum weight (clamp)
             max_weight: maximum weight (clamp)
         """
-        self.weight_fns = weight_fns if not isinstance(weight_fns, List) else lambda t, _: weight_fns
+        self.weight_fns = weight_fns if callable(weight_fns) else lambda t, _: jnp.array(weight_fns)
         self.min_weight = float(min_weight)
         self.max_weight = float(max_weight)
 
@@ -210,8 +210,10 @@ class WeightSchedule:
         Returns:
             1D jnp.ndarray of weights, clipped elementwise to [min_weight, max_weight].
         """
-        # Loop over a Python list of functions (static), each returns scalar
+        # Evaluate weight function and ensure result is an array
         weights = self.weight_fns(t, losses)
-        weights = jnp.stack(weights, axis=0)
+        weights = jnp.asarray(weights)
+        if weights.ndim == 0:
+            weights = weights[jnp.newaxis]
         weights = jnp.clip(weights, self.min_weight, self.max_weight)
         return weights

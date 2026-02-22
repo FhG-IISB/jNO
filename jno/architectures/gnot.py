@@ -1,5 +1,5 @@
 """
-General Neural Operator Transformer (GNOT) - JAX/Flax Implementation
+General Neural Operator Transformer (GNOT) - JAX/Equinox Implementation
 =====================================================================
 
 This module implements GNOT and its variants for learning operators on
@@ -38,26 +38,6 @@ References
 ----------
 .. [1] Hao et al. "GNOT: A General Neural Operator Transformer for
        Operator Learning" ICML 2023. https://arxiv.org/abs/2302.14376
-
-Example Usage
--------------
->>> import pino as pnp
->>>
->>> # Basic GNOT for 2D problem
->>> model = pnp.nn.gnot(
-...     trunk_size=4,  # (x, y) + 2 params
-...     branch_sizes=[3, 2],  # Two input functions
-...     output_size=1,
-...     n_layers=3,
-...     n_hidden=128,
-... )
->>>
->>> # Single-input variant
->>> model = pnp.nn.cgptno(
-...     trunk_size=3,
-...     branch_sizes=[3],
-...     output_size=1,
-... )
 """
 
 from typing import Callable, List, Optional
@@ -65,7 +45,9 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
-from flax import linen as ln
+import equinox as eqx
+from .linear import Linear
+from .common import get_activation
 
 
 # =============================================================================
@@ -126,36 +108,8 @@ class MoEGPTConfig(GPTConfig):
 
 
 # =============================================================================
-
 # Utility Functions
-
 # =============================================================================
-
-
-def get_activation(name: str) -> Callable:
-    """
-    Get activation function by name.
-
-    Args:
-        name: Activation name ('gelu', 'relu', 'tanh', 'sigmoid', 'silu').
-
-    Returns:
-        Callable: JAX activation function.
-
-    Raises:
-        ValueError: If activation name is not recognized.
-    """
-    activations = {
-        "gelu": ln.gelu,
-        "relu": ln.relu,
-        "tanh": ln.tanh,
-        "sigmoid": ln.sigmoid,
-        "silu": ln.silu,
-        "swish": ln.swish,
-    }
-    if name.lower() not in activations:
-        raise ValueError(f"Unknown activation '{name}'. " f"Available: {list(activations.keys())}")
-    return activations[name.lower()]
 
 
 def horizontal_fourier_embedding(x: jnp.ndarray, n: int = 3) -> jnp.ndarray:
@@ -165,7 +119,7 @@ def horizontal_fourier_embedding(x: jnp.ndarray, n: int = 3) -> jnp.ndarray:
     Expands input features using sinusoidal functions at multiple frequencies,
     enabling the network to learn high-frequency patterns.
 
-    Transform: x → [x, cos(2^{-n}x), sin(2^{-n}x), ..., cos(2^n x), sin(2^n x)]
+    Transform: x -> [x, cos(2^{-n}x), sin(2^{-n}x), ..., cos(2^n x), sin(2^n x)]
 
     Args:
         x: Input tensor of shape [batch, seq_len, features].
@@ -173,132 +127,103 @@ def horizontal_fourier_embedding(x: jnp.ndarray, n: int = 3) -> jnp.ndarray:
 
     Returns:
         Embedded tensor of shape [batch, seq_len, features * (4n + 3)].
-
-    Example:
-        >>> x = jnp.ones((2, 100, 3))  # [batch, points, features]
-        >>> x_emb = horizontal_fourier_embedding(x, n=3)
-        >>> x_emb.shape  # (2, 100, 45) = 3 * (4*3 + 3)
     """
-    # Frequencies: 2^{-n}, 2^{-n+1}, ..., 2^{n-1}, 2^n
-    freqs = 2.0 ** jnp.linspace(-n, n, 2 * n + 1)  # [2n+1]
-    freqs = freqs[None, None, None, :]  # [1, 1, 1, 2n+1]
+    freqs = 2.0 ** jnp.linspace(-n, n, 2 * n + 1)
+    freqs = freqs[None, None, None, :]
 
-    # Expand x for broadcasting
-    x_expanded = x[..., None]  # [B, T, C, 1]
+    x_expanded = x[..., None]
 
-    # Compute cos and sin at all frequencies
-    x_cos = jnp.cos(freqs * x_expanded)  # [B, T, C, 2n+1]
-    x_sin = jnp.sin(freqs * x_expanded)  # [B, T, C, 2n+1]
+    x_cos = jnp.cos(freqs * x_expanded)
+    x_sin = jnp.sin(freqs * x_expanded)
 
-    # Concatenate: [original, cos, sin]
-    x_embedded = jnp.concatenate([x_expanded, x_cos, x_sin], axis=-1)  # [B, T, C, 4n+3]
+    x_embedded = jnp.concatenate([x_expanded, x_cos, x_sin], axis=-1)
 
-    # Flatten last two dimensions
     batch, seq_len, features, freq_features = x_embedded.shape
     return x_embedded.reshape(batch, seq_len, features * freq_features)
 
 
 # =============================================================================
-
 # MLP Module
-
 # =============================================================================
 
 
-class MLP(ln.Module):
+class MLP(eqx.Module):
     """
     Multi-Layer Perceptron with configurable depth and activation.
 
     Attributes:
-        in_dim: Input dimension.
-        hidden_dim: Hidden layer dimension.
-        out_dim: Output dimension.
-        n_layers: Number of layers (minimum 2).
-        act: Activation function name.
+        layers: List of Linear layers.
+        activation: Activation function.
     """
 
-    in_dim: int
-    hidden_dim: int
-    out_dim: int
-    n_layers: int = 2
-    act: str = "gelu"
+    layers: list
+    activation: Callable = eqx.field(static=True)
 
-    @ln.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        """
-        Forward pass.
+    def __init__(self, in_dim: int, hidden_dim: int, out_dim: int, n_layers: int = 2, act: str = "gelu", *, key, **kwargs):
+        activation = get_activation(act)
+        self.activation = activation
 
-        Args:
-            x: Input tensor of shape [..., in_dim].
-
-        Returns:
-            Output tensor of shape [..., out_dim].
-        """
-        activation = get_activation(self.act)
+        keys = jax.random.split(key, n_layers)
+        self.layers = []
 
         # First layer
-        x = ln.Dense(self.hidden_dim, name="fc_in")(x)
-        x = activation(x)
+        self.layers.append(Linear(in_dim, hidden_dim, key=keys[0]))
 
         # Hidden layers
-        for i in range(self.n_layers - 2):
-            x = ln.Dense(self.hidden_dim, name=f"fc_{i}")(x)
-            x = activation(x)
+        for i in range(1, n_layers - 1):
+            self.layers.append(Linear(hidden_dim, hidden_dim, key=keys[i]))
 
         # Output layer
-        x = ln.Dense(self.out_dim, name="fc_out")(x)
+        self.layers.append(Linear(hidden_dim, out_dim, key=keys[-1]))
+
+    def __call__(self, x: jnp.ndarray, **kwargs) -> jnp.ndarray:
+        for i, layer in enumerate(self.layers[:-1]):
+            x = layer(x)
+            x = self.activation(x)
+        x = self.layers[-1](x)
         return x
 
 
 # =============================================================================
-
 # Attention Modules
-
 # =============================================================================
 
 
-class LinearAttention(ln.Module):
+class LinearAttention(eqx.Module):
     """
     Linear (O(n)) self-attention using kernel approximation.
 
-    Instead of computing the full N×N attention matrix, linear attention
+    Instead of computing the full N*N attention matrix, linear attention
     uses the associativity of matrix multiplication:
 
-        Attention(Q, K, V) = softmax(QK^T)V ≈ φ(Q)(φ(K)^T V)
+        Attention(Q, K, V) = softmax(QK^T)V ~ phi(Q)(phi(K)^T V)
 
-    where φ is a feature map (here, softmax normalization).
+    where phi is a feature map (here, softmax normalization).
 
-    This reduces complexity from O(n²) to O(n).
-
-    Attributes:
-        n_embd: Embedding dimension.
-        n_head: Number of attention heads.
-        attn_pdrop: Attention dropout probability.
-        attn_type: Attention variant ('l1', 'l2', 'galerkin').
+    This reduces complexity from O(n^2) to O(n).
     """
 
-    n_embd: int
-    n_head: int
-    attn_pdrop: float = 0.0
-    attn_type: str = "l1"
-    deterministic: bool = True
+    query: Linear
+    key: Linear
+    value: Linear
+    proj: Linear
+    n_embd: int = eqx.field(static=True)
+    n_head: int = eqx.field(static=True)
+    attn_pdrop: float = eqx.field(static=True)
+    attn_type: str = eqx.field(static=True)
 
-    @ln.compact
-    def __call__(
-        self,
-        x: jnp.ndarray,
-        y: Optional[jnp.ndarray] = None,
-    ) -> jnp.ndarray:
-        """
-        Compute linear attention.
+    def __init__(self, n_embd: int, n_head: int, attn_pdrop: float = 0.0, attn_type: str = "l1", *, key, **kwargs):
+        k1, k2, k3, k4 = jax.random.split(key, 4)
+        self.query = Linear(n_embd, n_embd, key=k1)
+        self.key = Linear(n_embd, n_embd, key=k2)
+        self.value = Linear(n_embd, n_embd, key=k3)
+        self.proj = Linear(n_embd, n_embd, key=k4)
+        self.n_embd = n_embd
+        self.n_head = n_head
+        self.attn_pdrop = attn_pdrop
+        self.attn_type = attn_type
 
-        Args:
-            x: Query tensor [batch, seq_q, n_embd].
-            y: Key/Value tensor [batch, seq_kv, n_embd]. If None, uses x (self-attention).
-
-        Returns:
-            Output tensor [batch, seq_q, n_embd].
-        """
+    def __call__(self, x: jnp.ndarray, y: Optional[jnp.ndarray] = None, *, key=None, **kwargs) -> jnp.ndarray:
         if y is None:
             y = x
 
@@ -306,10 +231,10 @@ class LinearAttention(ln.Module):
         _, T2, _ = y.shape
         head_dim = C // self.n_head
 
-        # Project to Q, K, V
-        q = ln.Dense(C, name="query")(x)
-        k = ln.Dense(C, name="key")(y)
-        v = ln.Dense(C, name="value")(y)
+        # Project Q, K, V
+        q = jax.vmap(jax.vmap(self.query))(x)
+        k = jax.vmap(jax.vmap(self.key))(y)
+        v = jax.vmap(jax.vmap(self.value))(y)
 
         # Reshape for multi-head: [B, T, C] -> [B, n_head, T, head_dim]
         q = q.reshape(B, T1, self.n_head, head_dim).transpose(0, 2, 1, 3)
@@ -318,20 +243,17 @@ class LinearAttention(ln.Module):
 
         # Apply kernel feature map based on attention type
         if self.attn_type == "l1":
-            # L1-normalized softmax kernel
             q = jax.nn.softmax(q, axis=-1)
             k = jax.nn.softmax(k, axis=-1)
             k_sum = k.sum(axis=-2, keepdims=True)
             D_inv = 1.0 / (q * k_sum).sum(axis=-1, keepdims=True)
 
         elif self.attn_type == "galerkin":
-            # Galerkin-style: uniform normalization
             q = jax.nn.softmax(q, axis=-1)
             k = jax.nn.softmax(k, axis=-1)
             D_inv = 1.0 / T2
 
         elif self.attn_type == "l2":
-            # L2-normalized kernel
             q = q / (jnp.linalg.norm(q, ord=1, axis=-1, keepdims=True) + 1e-8)
             k = k / (jnp.linalg.norm(k, ord=1, axis=-1, keepdims=True) + 1e-8)
             k_sum = k.sum(axis=-2, keepdims=True)
@@ -341,70 +263,59 @@ class LinearAttention(ln.Module):
             raise ValueError(f"Unknown attention type: {self.attn_type}")
 
         # Linear attention: O(n) complexity
-        # context = K^T @ V: [B, n_head, head_dim, head_dim]
         context = jnp.einsum("bhnd,bhnv->bhdv", k, v)
-        # output = Q @ context: [B, n_head, T1, head_dim]
         out = jnp.einsum("bhqd,bhdv->bhqv", q, context)
 
         # Apply normalization and residual
         out = out * D_inv + q
 
         # Optional dropout
-        if not self.deterministic and self.attn_pdrop > 0:
-            out = ln.Dropout(rate=self.attn_pdrop)(out, deterministic=False)
+        if self.attn_pdrop > 0 and key is not None:
+            key, subkey = jax.random.split(key)
+            out = eqx.nn.Dropout(p=self.attn_pdrop)(out, key=subkey)
 
         # Reshape back: [B, n_head, T1, head_dim] -> [B, T1, C]
         out = out.transpose(0, 2, 1, 3).reshape(B, T1, C)
 
         # Output projection
-        out = ln.Dense(C, name="proj")(out)
+        out = jax.vmap(jax.vmap(self.proj))(out)
         return out
 
 
-class LinearCrossAttention(ln.Module):
+class LinearCrossAttention(eqx.Module):
     """
     Linear cross-attention for multiple input branches.
 
     Computes attention from query points to multiple key-value sources,
     aggregating information from all input functions.
-
-    For each input branch i:
-        out += Q @ (K_i^T @ V_i) / normalization
-
-    Attributes:
-        n_embd: Embedding dimension.
-        n_head: Number of attention heads.
-        n_inputs: Number of input branches.
-        attn_pdrop: Attention dropout probability.
     """
 
-    n_embd: int
-    n_head: int
-    n_inputs: int
-    attn_pdrop: float = 0.0
-    deterministic: bool = True
+    query_proj: Linear
+    key_projs: list
+    value_projs: list
+    proj: Linear
+    n_embd: int = eqx.field(static=True)
+    n_head: int = eqx.field(static=True)
+    n_inputs: int = eqx.field(static=True)
+    attn_pdrop: float = eqx.field(static=True)
 
-    @ln.compact
-    def __call__(
-        self,
-        x: jnp.ndarray,
-        ys: List[jnp.ndarray],
-    ) -> jnp.ndarray:
-        """
-        Compute cross-attention to multiple inputs.
+    def __init__(self, n_embd: int, n_head: int, n_inputs: int, attn_pdrop: float = 0.0, *, key, **kwargs):
+        keys = jax.random.split(key, 2 * n_inputs + 2)
+        self.query_proj = Linear(n_embd, n_embd, key=keys[0])
+        self.key_projs = [Linear(n_embd, n_embd, key=keys[1 + i]) for i in range(n_inputs)]
+        self.value_projs = [Linear(n_embd, n_embd, key=keys[1 + n_inputs + i]) for i in range(n_inputs)]
+        self.proj = Linear(n_embd, n_embd, key=keys[-1])
+        self.n_embd = n_embd
+        self.n_head = n_head
+        self.n_inputs = n_inputs
+        self.attn_pdrop = attn_pdrop
 
-        Args:
-            x: Query tensor [batch, seq_q, n_embd].
-            ys: List of key/value tensors, each [batch, seq_kv_i, n_embd].
-
-        Returns:
-            Output tensor [batch, seq_q, n_embd].
-        """
+    def __call__(self, x: jnp.ndarray, ys: List[jnp.ndarray], *, key=None, **kwargs) -> jnp.ndarray:
         B, T1, C = x.shape
         head_dim = C // self.n_head
 
-        # Query projection (shared across all inputs)
-        q = ln.Dense(C, name="query")(x)
+        # Query projection
+        q = jax.vmap(jax.vmap(self.query_proj))(x)
         q = q.reshape(B, T1, self.n_head, head_dim).transpose(0, 2, 1, 3)
         q = jax.nn.softmax(q, axis=-1)
 
@@ -416,43 +327,58 @@ class LinearCrossAttention(ln.Module):
             y_i = ys[i]
             _, T2, _ = y_i.shape
 
-            # Per-branch key and value projections
-            k = ln.Dense(C, name=f"key_{i}")(y_i)
-            v = ln.Dense(C, name=f"value_{i}")(y_i)
+            k = jax.vmap(jax.vmap(self.key_projs[i]))(y_i)
+            v = jax.vmap(jax.vmap(self.value_projs[i]))(y_i)
 
             k = k.reshape(B, T2, self.n_head, head_dim).transpose(0, 2, 1, 3)
             v = v.reshape(B, T2, self.n_head, head_dim).transpose(0, 2, 1, 3)
 
-            # Normalize keys
             k = jax.nn.softmax(k, axis=-1)
 
-            # Compute normalization
             k_sum = k.sum(axis=-2, keepdims=True)
             D_inv = 1.0 / ((q * k_sum).sum(axis=-1, keepdims=True) + 1e-8)
 
-            # Linear attention contribution
             context = jnp.einsum("bhnd,bhnv->bhdv", k, v)
             attn_out = jnp.einsum("bhqd,bhdv->bhqv", q, context)
             out = out + attn_out * D_inv
 
         # Optional dropout
-        if not self.deterministic and self.attn_pdrop > 0:
-            out = ln.Dropout(rate=self.attn_pdrop)(out, deterministic=False)
+        if self.attn_pdrop > 0 and key is not None:
+            key, subkey = jax.random.split(key)
+            out = eqx.nn.Dropout(p=self.attn_pdrop)(out, key=subkey)
 
         # Reshape and project
         out = out.transpose(0, 2, 1, 3).reshape(B, T1, C)
-        out = ln.Dense(C, name="proj")(out)
+        out = jax.vmap(jax.vmap(self.proj))(out)
         return out
 
 
 # =============================================================================
-
 # Transformer Blocks
-
 # =============================================================================
 
 
-class CrossAttentionBlock(ln.Module):
+class FFN(eqx.Module):
+    """Simple 2-layer feed-forward network."""
+
+    fc1: Linear
+    fc2: Linear
+    activation: Callable = eqx.field(static=True)
+
+    def __init__(self, in_dim, inner_dim, out_dim, act="gelu", *, key, **kwargs):
+        k1, k2 = jax.random.split(key)
+        self.fc1 = Linear(in_dim, inner_dim, key=k1)
+        self.fc2 = Linear(inner_dim, out_dim, key=k2)
+        self.activation = get_activation(act)
+
+    def __call__(self, x, **kwargs):
+        x = self.fc1(x)
+        x = self.activation(x)
+        x = self.fc2(x)
+        return x
+
+
+class CrossAttentionBlock(eqx.Module):
     """
     Cross-attention block for CGPTNO.
 
@@ -461,87 +387,67 @@ class CrossAttentionBlock(ln.Module):
         x = x + FFN(LN(x))
         x = x + SelfAttn(LN(x))
         x = x + FFN(LN(x))
-
-    Attributes:
-        config: GPTConfig with model hyperparameters.
-        deterministic: Whether to disable dropout.
     """
 
-    config: GPTConfig
-    deterministic: bool = True
+    ln1: eqx.nn.LayerNorm
+    ln2_branches: list
+    ln3: eqx.nn.LayerNorm
+    ln4: eqx.nn.LayerNorm
+    ln5: eqx.nn.LayerNorm
+    cross_attn: LinearCrossAttention
+    self_attn: LinearAttention
+    ffn1: FFN
+    ffn2: FFN
+    resid_pdrop: float = eqx.field(static=True)
 
-    @ln.compact
-    def __call__(
-        self,
-        x: jnp.ndarray,
-        ys: List[jnp.ndarray],
-    ) -> jnp.ndarray:
-        """
-        Forward pass.
+    def __init__(self, config: GPTConfig, *, key, **kwargs):
+        keys = jax.random.split(key, 4)
+        cfg = config
+        n_embd = cfg.n_embd
 
-        Args:
-            x: Query tensor [batch, seq_q, n_embd].
-            ys: List of input tensors.
+        self.ln1 = eqx.nn.LayerNorm(n_embd)
+        self.ln2_branches = [eqx.nn.LayerNorm(n_embd) for _ in range(cfg.n_inputs)]
+        self.ln3 = eqx.nn.LayerNorm(n_embd)
+        self.ln4 = eqx.nn.LayerNorm(n_embd)
+        self.ln5 = eqx.nn.LayerNorm(n_embd)
 
-        Returns:
-            Output tensor [batch, seq_q, n_embd].
-        """
-        cfg = self.config
-        activation = get_activation(cfg.act)
+        self.cross_attn = LinearCrossAttention(n_embd=n_embd, n_head=cfg.n_head, n_inputs=cfg.n_inputs, attn_pdrop=cfg.attn_pdrop, key=keys[0])
+        self.self_attn = LinearAttention(n_embd=n_embd, n_head=cfg.n_head, attn_pdrop=cfg.attn_pdrop, key=keys[1])
+        self.ffn1 = FFN(n_embd, cfg.n_inner, n_embd, act=cfg.act, key=keys[2])
+        self.ffn2 = FFN(n_embd, cfg.n_inner, n_embd, act=cfg.act, key=keys[3])
+        self.resid_pdrop = cfg.resid_pdrop
 
+    def __call__(self, x: jnp.ndarray, ys: List[jnp.ndarray], *, key=None, **kwargs) -> jnp.ndarray:
         # Cross-attention
-        x_norm = ln.LayerNorm(name="ln1")(x)
-        ys_norm = [ln.LayerNorm(name=f"ln2_branch_{i}")(y) for i, y in enumerate(ys)]
+        x_norm = jax.vmap(jax.vmap(self.ln1))(x)
+        ys_norm = [jax.vmap(jax.vmap(self.ln2_branches[i]))(y) for i, y in enumerate(ys)]
 
-        cross_attn = LinearCrossAttention(
-            n_embd=cfg.n_embd,
-            n_head=cfg.n_head,
-            n_inputs=cfg.n_inputs,
-            attn_pdrop=cfg.attn_pdrop,
-            deterministic=self.deterministic,
-            name="cross_attn",
-        )
-        x = x + ln.Dropout(rate=cfg.resid_pdrop, deterministic=self.deterministic)(cross_attn(x_norm, ys_norm))
+        ca_out = self.cross_attn(x_norm, ys_norm, key=key)
+        if self.resid_pdrop > 0 and key is not None:
+            key, subkey = jax.random.split(key)
+            ca_out = eqx.nn.Dropout(p=self.resid_pdrop)(ca_out, key=subkey)
+        x = x + ca_out
 
         # FFN 1
-        x_norm = ln.LayerNorm(name="ln3")(x)
-        ffn1 = ln.Sequential(
-            [
-                ln.Dense(cfg.n_inner),
-                activation,
-                ln.Dense(cfg.n_embd),
-            ],
-            name="ffn1",
-        )
-        x = x + ffn1(x_norm)
+        x_norm = jax.vmap(jax.vmap(self.ln3))(x)
+        x = x + jax.vmap(jax.vmap(self.ffn1))(x_norm)
 
         # Self-attention
-        x_norm = ln.LayerNorm(name="ln4")(x)
-        self_attn = LinearAttention(
-            n_embd=cfg.n_embd,
-            n_head=cfg.n_head,
-            attn_pdrop=cfg.attn_pdrop,
-            deterministic=self.deterministic,
-            name="self_attn",
-        )
-        x = x + ln.Dropout(rate=cfg.resid_pdrop, deterministic=self.deterministic)(self_attn(x_norm))
+        x_norm = jax.vmap(jax.vmap(self.ln4))(x)
+        sa_out = self.self_attn(x_norm, key=key)
+        if self.resid_pdrop > 0 and key is not None:
+            key, subkey = jax.random.split(key)
+            sa_out = eqx.nn.Dropout(p=self.resid_pdrop)(sa_out, key=subkey)
+        x = x + sa_out
 
         # FFN 2
-        x_norm = ln.LayerNorm(name="ln5")(x)
-        ffn2 = ln.Sequential(
-            [
-                ln.Dense(cfg.n_inner),
-                activation,
-                ln.Dense(cfg.n_embd),
-            ],
-            name="ffn2",
-        )
-        x = x + ffn2(x_norm)
+        x_norm = jax.vmap(jax.vmap(self.ln5))(x)
+        x = x + jax.vmap(jax.vmap(self.ffn2))(x_norm)
 
         return x
 
 
-class MoECrossAttentionBlock(ln.Module):
+class MoECrossAttentionBlock(eqx.Module):
     """
     Cross-attention block with Mixture-of-Experts FFN.
 
@@ -549,124 +455,105 @@ class MoECrossAttentionBlock(ln.Module):
         - A gating network routes based on spatial position
         - Multiple expert FFNs process the input
         - Outputs are weighted by gate scores
-
-    This allows the model to learn position-specific transformations,
-    useful for problems with spatially varying behavior.
-
-    Attributes:
-        config: MoEGPTConfig with model hyperparameters.
-        deterministic: Whether to disable dropout.
     """
 
-    config: MoEGPTConfig
-    deterministic: bool = True
+    ln1: eqx.nn.LayerNorm
+    ln2_branches: list
+    ln3: eqx.nn.LayerNorm
+    ln4: eqx.nn.LayerNorm
+    ln5: eqx.nn.LayerNorm
+    cross_attn: LinearCrossAttention
+    self_attn: LinearAttention
+    gate_net: list  # list of Linear layers for gate MLP
+    moe_ffn1_experts: list  # list of FFN
+    moe_ffn2_experts: list  # list of FFN
+    gate_activation: Callable = eqx.field(static=True)
+    resid_pdrop: float = eqx.field(static=True)
+    n_experts: int = eqx.field(static=True)
 
-    @ln.compact
-    def __call__(
-        self,
-        x: jnp.ndarray,
-        ys: List[jnp.ndarray],
-        pos: jnp.ndarray,
-    ) -> jnp.ndarray:
-        """
-        Forward pass with position-dependent MoE.
+    def __init__(self, config: MoEGPTConfig, *, key, **kwargs):
+        cfg = config
+        n_embd = cfg.n_embd
+        keys = jax.random.split(key, 4 + 2 * cfg.n_experts + 3)
 
-        Args:
-            x: Query tensor [batch, seq_q, n_embd].
-            ys: List of input tensors.
-            pos: Position tensor [batch, seq_q, space_dim] for gating.
+        self.ln1 = eqx.nn.LayerNorm(n_embd)
+        self.ln2_branches = [eqx.nn.LayerNorm(n_embd) for _ in range(cfg.n_inputs)]
+        self.ln3 = eqx.nn.LayerNorm(n_embd)
+        self.ln4 = eqx.nn.LayerNorm(n_embd)
+        self.ln5 = eqx.nn.LayerNorm(n_embd)
 
-        Returns:
-            Output tensor [batch, seq_q, n_embd].
-        """
-        cfg = self.config
+        self.cross_attn = LinearCrossAttention(n_embd=n_embd, n_head=cfg.n_head, n_inputs=cfg.n_inputs, attn_pdrop=cfg.attn_pdrop, key=keys[0])
+        self.self_attn = LinearAttention(n_embd=n_embd, n_head=cfg.n_head, attn_pdrop=cfg.attn_pdrop, key=keys[1])
+
         activation = get_activation(cfg.act)
+        self.gate_activation = activation
 
-        # Gating network: position -> expert weights
-        gate_net = ln.Sequential(
-            [
-                ln.Dense(cfg.n_inner),
-                activation,
-                ln.Dense(cfg.n_inner),
-                activation,
-                ln.Dense(cfg.n_experts),
-            ],
-            name="gate_net",
-        )
-        gate_scores = jax.nn.softmax(gate_net(pos), axis=-1)  # [B, T, n_experts]
-        gate_scores = gate_scores[..., None, :]  # [B, T, 1, n_experts]
+        # Gate network: 3 Dense layers
+        self.gate_net = [
+            Linear(cfg.space_dim, cfg.n_inner, key=keys[2]),
+            Linear(cfg.n_inner, cfg.n_inner, key=keys[3]),
+            Linear(cfg.n_inner, cfg.n_experts, key=keys[4]),
+        ]
+
+        # MoE experts
+        self.moe_ffn1_experts = [FFN(n_embd, cfg.n_inner, n_embd, act=cfg.act, key=keys[5 + i]) for i in range(cfg.n_experts)]
+        self.moe_ffn2_experts = [FFN(n_embd, cfg.n_inner, n_embd, act=cfg.act, key=keys[5 + cfg.n_experts + i]) for i in range(cfg.n_experts)]
+
+        self.resid_pdrop = cfg.resid_pdrop
+        self.n_experts = cfg.n_experts
+
+    def _apply_gate(self, pos):
+        """pos: [B, T, space_dim] -> [B, T, 1, n_experts]"""
+        x = pos
+        for i, layer in enumerate(self.gate_net[:-1]):
+            x = jax.vmap(jax.vmap(layer))(x)
+            x = self.gate_activation(x)
+        x = jax.vmap(jax.vmap(self.gate_net[-1]))(x)
+        gate_scores = jax.nn.softmax(x, axis=-1)
+        return gate_scores[..., None, :]  # [B, T, 1, n_experts]
+
+    def __call__(self, x: jnp.ndarray, ys: List[jnp.ndarray], pos: jnp.ndarray, *, key=None, **kwargs) -> jnp.ndarray:
+        gate_scores = self._apply_gate(pos)
 
         # Cross-attention
-        x_norm = ln.LayerNorm(name="ln1")(x)
-        ys_norm = [ln.LayerNorm(name=f"ln2_branch_{i}")(y) for i, y in enumerate(ys)]
+        x_norm = jax.vmap(jax.vmap(self.ln1))(x)
+        ys_norm = [jax.vmap(jax.vmap(self.ln2_branches[i]))(y) for i, y in enumerate(ys)]
 
-        cross_attn = LinearCrossAttention(
-            n_embd=cfg.n_embd,
-            n_head=cfg.n_head,
-            n_inputs=cfg.n_inputs,
-            attn_pdrop=cfg.attn_pdrop,
-            deterministic=self.deterministic,
-            name="cross_attn",
-        )
-        x = x + ln.Dropout(rate=cfg.resid_pdrop, deterministic=self.deterministic)(cross_attn(x_norm, ys_norm))
+        ca_out = self.cross_attn(x_norm, ys_norm, key=key)
+        if self.resid_pdrop > 0 and key is not None:
+            key, subkey = jax.random.split(key)
+            ca_out = eqx.nn.Dropout(p=self.resid_pdrop)(ca_out, key=subkey)
+        x = x + ca_out
 
         # MoE FFN 1
-        expert_outputs_1 = []
-        for i in range(cfg.n_experts):
-            expert = ln.Sequential(
-                [
-                    ln.Dense(cfg.n_inner),
-                    activation,
-                    ln.Dense(cfg.n_embd),
-                ],
-                name=f"moe_ffn1_expert_{i}",
-            )
-            expert_outputs_1.append(expert(x))
-
-        # Stack and weight by gate: [B, T, C, n_experts]
+        expert_outputs_1 = [jax.vmap(jax.vmap(expert))(x) for expert in self.moe_ffn1_experts]
         x_moe1 = jnp.stack(expert_outputs_1, axis=-1)
         x_moe1 = (gate_scores * x_moe1).sum(axis=-1)
-        x = x + ln.LayerNorm(name="ln3")(x_moe1)
+        x = x + jax.vmap(jax.vmap(self.ln3))(x_moe1)
 
         # Self-attention
-        x_norm = ln.LayerNorm(name="ln4")(x)
-        self_attn = LinearAttention(
-            n_embd=cfg.n_embd,
-            n_head=cfg.n_head,
-            attn_pdrop=cfg.attn_pdrop,
-            deterministic=self.deterministic,
-            name="self_attn",
-        )
-        x = x + ln.Dropout(rate=cfg.resid_pdrop, deterministic=self.deterministic)(self_attn(x_norm))
+        x_norm = jax.vmap(jax.vmap(self.ln4))(x)
+        sa_out = self.self_attn(x_norm, key=key)
+        if self.resid_pdrop > 0 and key is not None:
+            key, subkey = jax.random.split(key)
+            sa_out = eqx.nn.Dropout(p=self.resid_pdrop)(sa_out, key=subkey)
+        x = x + sa_out
 
         # MoE FFN 2
-        expert_outputs_2 = []
-        for i in range(cfg.n_experts):
-            expert = ln.Sequential(
-                [
-                    ln.Dense(cfg.n_inner),
-                    activation,
-                    ln.Dense(cfg.n_embd),
-                ],
-                name=f"moe_ffn2_expert_{i}",
-            )
-            expert_outputs_2.append(expert(x))
-
+        expert_outputs_2 = [jax.vmap(jax.vmap(expert))(x) for expert in self.moe_ffn2_experts]
         x_moe2 = jnp.stack(expert_outputs_2, axis=-1)
         x_moe2 = (gate_scores * x_moe2).sum(axis=-1)
-        x = x + ln.LayerNorm(name="ln5")(x_moe2)
+        x = x + jax.vmap(jax.vmap(self.ln5))(x_moe2)
 
         return x
 
 
 # =============================================================================
-
 # Main Model Classes
-
 # =============================================================================
 
 
-class CGPTNO(ln.Module):
+class CGPTNO(eqx.Module):
     """
     Cross-attention GPT Neural Operator.
 
@@ -679,91 +566,93 @@ class CGPTNO(ln.Module):
         2. Branch MLPs: Embed each input function
         3. Cross-Attention Blocks: Query attends to all inputs
         4. Output MLP: Project to output dimension
-
-    Attributes:
-        trunk_size: Input dimension for trunk (query points).
-        branch_sizes: List of input dimensions for each branch.
-        output_size: Output dimension.
-        n_layers: Number of transformer layers.
-        n_hidden: Hidden dimension.
-        n_head: Number of attention heads.
-        n_inner: FFN inner dimension multiplier.
-        mlp_layers: Number of layers in embedding MLPs.
-        attn_type: Attention type ('linear').
-        act: Activation function name.
-        ffn_dropout: FFN dropout rate.
-        attn_dropout: Attention dropout rate.
-        horiz_fourier_dim: Fourier embedding dimension (0 = disabled).
-        deterministic: Whether to disable dropout.
-
-    Example:
-        >>> model = CGPTNO(
-        ...     trunk_size=4,  # (x, y, param1, param2)
-        ...     branch_sizes=[3],  # One input function with 3 features
-        ...     output_size=1,
-        ...     n_layers=3,
-        ...     n_hidden=128,
-        ... )
-        >>> # x_trunk: [batch, n_query, 4]
-        >>> # x_branch: [[batch, n_sensors, 3]]
-        >>> y = model.apply(params, x_trunk, x_branch)  # [batch, n_query, 1]
     """
 
-    trunk_size: int
-    branch_sizes: Optional[List[int]] = None
-    output_size: int = 1
-    n_layers: int = 2
-    n_hidden: int = 64
-    n_head: int = 1
-    n_inner: int = 4
-    mlp_layers: int = 2
-    attn_type: str = "linear"
-    act: str = "gelu"
-    ffn_dropout: float = 0.0
-    attn_dropout: float = 0.0
-    horiz_fourier_dim: int = 0
-    deterministic: bool = True
+    trunk_mlp: MLP
+    branch_mlps: list
+    blocks: list
+    out_mlp: MLP
+    horiz_fourier_dim: int = eqx.field(static=True)
+    _trunk_size: int = eqx.field(static=True)
+    _branch_sizes: list = eqx.field(static=True)
+    _n_inputs: int = eqx.field(static=True)
 
-    def setup(self):
-        """Initialize model components."""
+    def __init__(
+        self,
+        trunk_size: int,
+        branch_sizes: Optional[List[int]] = None,
+        output_size: int = 1,
+        n_layers: int = 2,
+        n_hidden: int = 64,
+        n_head: int = 1,
+        n_inner: int = 4,
+        mlp_layers: int = 2,
+        attn_type: str = "linear",
+        act: str = "gelu",
+        ffn_dropout: float = 0.0,
+        attn_dropout: float = 0.0,
+        horiz_fourier_dim: int = 0,
+        *,
+        key,
+        **kwargs,
+    ):
+        self.horiz_fourier_dim = horiz_fourier_dim
+
         # Compute effective sizes with Fourier embedding
-        if self.horiz_fourier_dim > 0:
-            fourier_mult = 4 * self.horiz_fourier_dim + 3
-            self._trunk_size = self.trunk_size * fourier_mult
-            self._branch_sizes = [bs * fourier_mult for bs in (self.branch_sizes or [])]
+        if horiz_fourier_dim > 0:
+            fourier_mult = 4 * horiz_fourier_dim + 3
+            self._trunk_size = trunk_size * fourier_mult
+            self._branch_sizes = [bs * fourier_mult for bs in (branch_sizes or [])]
         else:
-            self._trunk_size = self.trunk_size
-            self._branch_sizes = self.branch_sizes or []
+            self._trunk_size = trunk_size
+            self._branch_sizes = list(branch_sizes or [])
 
         self._n_inputs = len(self._branch_sizes)
 
         # Build config
-        self._config = GPTConfig(
-            attn_type=self.attn_type,
-            embd_pdrop=self.ffn_dropout,
-            resid_pdrop=self.ffn_dropout,
-            attn_pdrop=self.attn_dropout,
-            n_embd=self.n_hidden,
-            n_head=self.n_head,
-            n_layer=self.n_layers,
-            n_inner=self.n_inner * self.n_hidden,
-            act=self.act,
+        config = GPTConfig(
+            attn_type=attn_type,
+            embd_pdrop=ffn_dropout,
+            resid_pdrop=ffn_dropout,
+            attn_pdrop=attn_dropout,
+            n_embd=n_hidden,
+            n_head=n_head,
+            n_layer=n_layers,
+            n_inner=n_inner * n_hidden,
+            act=act,
             branch_sizes=self._branch_sizes,
-            n_inputs=max(self._n_inputs, 1),  # At least 1 for self-attention
+            n_inputs=max(self._n_inputs, 1),
         )
 
-    @ln.compact
+        # Split keys
+        n_total = 2 + self._n_inputs + n_layers
+        keys = jax.random.split(key, n_total)
+
+        # Trunk MLP
+        self.trunk_mlp = MLP(self._trunk_size, n_hidden, n_hidden, n_layers=mlp_layers, act=act, key=keys[0])
+
+        # Branch MLPs
+        self.branch_mlps = [MLP(self._branch_sizes[i], n_hidden, n_hidden, n_layers=mlp_layers, act=act, key=keys[1 + i]) for i in range(self._n_inputs)]
+
+        # Transformer blocks
+        self.blocks = [CrossAttentionBlock(config, key=keys[1 + self._n_inputs + i]) for i in range(n_layers)]
+
+        # Output MLP
+        self.out_mlp = MLP(n_hidden, n_hidden, output_size, n_layers=mlp_layers, act=act, key=keys[-1])
+
     def __call__(
         self,
         x_trunk: jnp.ndarray,
         x_branches: Optional[List[jnp.ndarray]] = None,
+        *,
+        key=None,
+        **kwargs,
     ) -> jnp.ndarray:
         """
         Forward pass.
 
         Args:
             x_trunk: Query points [batch, n_query, trunk_size].
-                Contains coordinates and optional parameters.
             x_branches: List of input function samples.
                 Each element: [batch, n_sensors_i, branch_size_i].
                 If None, uses self-attention only.
@@ -778,152 +667,115 @@ class CGPTNO(ln.Module):
                 x_branches = [horizontal_fourier_embedding(xb, self.horiz_fourier_dim) for xb in x_branches]
 
         # Trunk embedding
-        trunk_mlp = MLP(
-            in_dim=self._trunk_size,
-            hidden_dim=self.n_hidden,
-            out_dim=self.n_hidden,
-            n_layers=self.mlp_layers,
-            act=self.act,
-            name="trunk_mlp",
-        )
-        x = trunk_mlp(x_trunk)
+        x = jax.vmap(jax.vmap(self.trunk_mlp))(x_trunk)
 
         # Branch embeddings
         if x_branches is not None and len(x_branches) > 0:
-            z_list = []
-            for i, xb in enumerate(x_branches):
-                branch_mlp = MLP(
-                    in_dim=self._branch_sizes[i],
-                    hidden_dim=self.n_hidden,
-                    out_dim=self.n_hidden,
-                    n_layers=self.mlp_layers,
-                    act=self.act,
-                    name=f"branch_mlp_{i}",
-                )
-                z_list.append(branch_mlp(xb))
+            z_list = [jax.vmap(jax.vmap(self.branch_mlps[i]))(xb) for i, xb in enumerate(x_branches)]
         else:
-            # Self-attention only
             z_list = [x]
 
         # Transformer blocks
-        for i in range(self.n_layers):
-            block = CrossAttentionBlock(
-                config=self._config,
-                deterministic=self.deterministic,
-                name=f"block_{i}",
-            )
-            x = block(x, z_list)
+        for block in self.blocks:
+            x = block(x, z_list, key=key)
 
         # Output projection
-        out_mlp = MLP(
-            in_dim=self.n_hidden,
-            hidden_dim=self.n_hidden,
-            out_dim=self.output_size,
-            n_layers=self.mlp_layers,
-            act=self.act,
-            name="out_mlp",
-        )
-        x = out_mlp(x)
+        x = jax.vmap(jax.vmap(self.out_mlp))(x)
 
         return x
 
 
-class GNOT(ln.Module):
+class GNOT(eqx.Module):
     """
     General Neural Operator Transformer with Mixture-of-Experts.
 
     Extends CGPTNO with position-dependent MoE layers, allowing the model
-    to learn spatially-varying transformations. The gating network routes
-    inputs to different expert networks based on spatial position.
+    to learn spatially-varying transformations.
 
     Key Differences from CGPTNO:
         - FFN layers replaced with MoE
         - Requires position input for gating
         - Better for problems with spatially varying behavior
-
-    Attributes:
-        trunk_size: Input dimension for trunk.
-        branch_sizes: List of input dimensions for branches.
-        space_dim: Spatial dimension for position-based gating.
-        output_size: Output dimension.
-        n_layers: Number of transformer layers.
-        n_hidden: Hidden dimension.
-        n_head: Number of attention heads.
-        n_experts: Number of expert networks.
-        n_inner: FFN inner dimension multiplier.
-        mlp_layers: Layers in embedding MLPs.
-        attn_type: Attention type.
-        act: Activation function.
-        ffn_dropout: FFN dropout rate.
-        attn_dropout: Attention dropout rate.
-        horiz_fourier_dim: Fourier embedding dimension.
-        deterministic: Whether to disable dropout.
-
-    Example:
-        >>> model = GNOT(
-        ...     trunk_size=4,
-        ...     branch_sizes=[3, 2],
-        ...     space_dim=2,
-        ...     output_size=1,
-        ...     n_experts=4,
-        ... )
-        >>> # x_trunk: [batch, n_query, 4] where first 2 dims are (x, y)
-        >>> # x_branches: list of input tensors
-        >>> y = model.apply(params, x_trunk, x_branches)
     """
 
-    trunk_size: int
-    branch_sizes: List[int]
-    space_dim: int = 2
-    output_size: int = 1
-    n_layers: int = 2
-    n_hidden: int = 64
-    n_head: int = 1
-    n_experts: int = 2
-    n_inner: int = 4
-    mlp_layers: int = 2
-    attn_type: str = "linear"
-    act: str = "gelu"
-    ffn_dropout: float = 0.0
-    attn_dropout: float = 0.0
-    horiz_fourier_dim: int = 0
-    deterministic: bool = True
+    trunk_mlp: MLP
+    branch_mlps: list
+    blocks: list
+    out_mlp: MLP
+    space_dim: int = eqx.field(static=True)
+    horiz_fourier_dim: int = eqx.field(static=True)
+    _trunk_size: int = eqx.field(static=True)
+    _branch_sizes: list = eqx.field(static=True)
+    _n_inputs: int = eqx.field(static=True)
 
-    def setup(self):
-        """Initialize model components."""
-        # Compute effective sizes
-        if self.horiz_fourier_dim > 0:
-            fourier_mult = 4 * self.horiz_fourier_dim + 3
-            self._trunk_size = self.trunk_size * fourier_mult
-            self._branch_sizes = [bs * fourier_mult for bs in self.branch_sizes]
+    def __init__(
+        self,
+        trunk_size: int,
+        branch_sizes: List[int],
+        space_dim: int = 2,
+        output_size: int = 1,
+        n_layers: int = 2,
+        n_hidden: int = 64,
+        n_head: int = 1,
+        n_experts: int = 2,
+        n_inner: int = 4,
+        mlp_layers: int = 2,
+        attn_type: str = "linear",
+        act: str = "gelu",
+        ffn_dropout: float = 0.0,
+        attn_dropout: float = 0.0,
+        horiz_fourier_dim: int = 0,
+        *,
+        key,
+        **kwargs,
+    ):
+        self.space_dim = space_dim
+        self.horiz_fourier_dim = horiz_fourier_dim
+
+        if horiz_fourier_dim > 0:
+            fourier_mult = 4 * horiz_fourier_dim + 3
+            self._trunk_size = trunk_size * fourier_mult
+            self._branch_sizes = [bs * fourier_mult for bs in branch_sizes]
         else:
-            self._trunk_size = self.trunk_size
-            self._branch_sizes = self.branch_sizes
+            self._trunk_size = trunk_size
+            self._branch_sizes = list(branch_sizes)
 
         self._n_inputs = len(self._branch_sizes)
 
-        # Build config
-        self._config = MoEGPTConfig(
-            attn_type=self.attn_type,
-            embd_pdrop=self.ffn_dropout,
-            resid_pdrop=self.ffn_dropout,
-            attn_pdrop=self.attn_dropout,
-            n_embd=self.n_hidden,
-            n_head=self.n_head,
-            n_layer=self.n_layers,
-            n_inner=self.n_inner * self.n_hidden,
-            act=self.act,
-            n_experts=self.n_experts,
-            space_dim=self.space_dim,
+        config = MoEGPTConfig(
+            attn_type=attn_type,
+            embd_pdrop=ffn_dropout,
+            resid_pdrop=ffn_dropout,
+            attn_pdrop=attn_dropout,
+            n_embd=n_hidden,
+            n_head=n_head,
+            n_layer=n_layers,
+            n_inner=n_inner * n_hidden,
+            act=act,
+            n_experts=n_experts,
+            space_dim=space_dim,
             branch_sizes=self._branch_sizes,
             n_inputs=self._n_inputs,
         )
 
-    @ln.compact
+        n_total = 2 + self._n_inputs + n_layers
+        keys = jax.random.split(key, n_total)
+
+        self.trunk_mlp = MLP(self._trunk_size, n_hidden, n_hidden, n_layers=mlp_layers, act=act, key=keys[0])
+
+        self.branch_mlps = [MLP(self._branch_sizes[i], n_hidden, n_hidden, n_layers=mlp_layers, act=act, key=keys[1 + i]) for i in range(self._n_inputs)]
+
+        self.blocks = [MoECrossAttentionBlock(config, key=keys[1 + self._n_inputs + i]) for i in range(n_layers)]
+
+        self.out_mlp = MLP(n_hidden, n_hidden, output_size, n_layers=mlp_layers, act=act, key=keys[-1])
+
     def __call__(
         self,
         x_trunk: jnp.ndarray,
         x_branches: List[jnp.ndarray],
+        *,
+        key=None,
+        **kwargs,
     ) -> jnp.ndarray:
         """
         Forward pass.
@@ -936,145 +788,85 @@ class GNOT(ln.Module):
         Returns:
             Output values [batch, n_query, output_size].
         """
-        # Extract spatial positions for gating (before any embedding)
         pos = x_trunk[..., : self.space_dim]
 
-        # Apply Fourier embedding if enabled
         if self.horiz_fourier_dim > 0:
             x_trunk = horizontal_fourier_embedding(x_trunk, self.horiz_fourier_dim)
             x_branches = [horizontal_fourier_embedding(xb, self.horiz_fourier_dim) for xb in x_branches]
 
-        # Trunk embedding
-        trunk_mlp = MLP(
-            in_dim=self._trunk_size,
-            hidden_dim=self.n_hidden,
-            out_dim=self.n_hidden,
-            n_layers=self.mlp_layers,
-            act=self.act,
-            name="trunk_mlp",
-        )
-        x = trunk_mlp(x_trunk)
+        x = jax.vmap(jax.vmap(self.trunk_mlp))(x_trunk)
 
-        # Branch embeddings
-        z_list = []
-        for i, xb in enumerate(x_branches):
-            branch_mlp = MLP(
-                in_dim=self._branch_sizes[i],
-                hidden_dim=self.n_hidden,
-                out_dim=self.n_hidden,
-                n_layers=self.mlp_layers,
-                act=self.act,
-                name=f"branch_mlp_{i}",
-            )
-            z_list.append(branch_mlp(xb))
+        z_list = [jax.vmap(jax.vmap(self.branch_mlps[i]))(xb) for i, xb in enumerate(x_branches)]
 
-        # MoE Transformer blocks
-        for i in range(self.n_layers):
-            block = MoECrossAttentionBlock(
-                config=self._config,
-                deterministic=self.deterministic,
-                name=f"block_{i}",
-            )
-            x = block(x, z_list, pos)
+        for block in self.blocks:
+            x = block(x, z_list, pos, key=key)
 
-        # Output projection
-        out_mlp = MLP(
-            in_dim=self.n_hidden,
-            hidden_dim=self.n_hidden,
-            out_dim=self.output_size,
-            n_layers=self.mlp_layers,
-            act=self.act,
-            name="out_mlp",
-        )
-        x = out_mlp(x)
+        x = jax.vmap(jax.vmap(self.out_mlp))(x)
 
         return x
 
 
-class MoEGPTNO(ln.Module):
+class MoEGPTNO(eqx.Module):
     """
     Single-input Mixture-of-Experts GPT Neural Operator.
 
     Simplified variant of GNOT for problems with a single input function.
-    Uses standard cross-attention (not multi-input) with MoE FFN layers.
-
-    Attributes:
-        trunk_size: Input dimension for trunk.
-        branch_size: Input dimension for single branch.
-        space_dim: Spatial dimension for gating.
-        output_size: Output dimension.
-        n_layers: Number of transformer layers.
-        n_hidden: Hidden dimension.
-        n_head: Number of attention heads.
-        n_experts: Number of expert networks.
-        mlp_layers: Layers in embedding MLPs.
-        attn_type: Attention type.
-        act: Activation function.
-        ffn_dropout: FFN dropout rate.
-        attn_dropout: Attention dropout rate.
-        horiz_fourier_dim: Fourier embedding dimension.
-        deterministic: Whether to disable dropout.
     """
 
-    trunk_size: int
-    branch_size: int
-    space_dim: int = 2
-    output_size: int = 1
-    n_layers: int = 2
-    n_hidden: int = 64
-    n_head: int = 1
-    n_experts: int = 2
-    mlp_layers: int = 2
-    attn_type: str = "linear"
-    act: str = "gelu"
-    ffn_dropout: float = 0.0
-    attn_dropout: float = 0.0
-    horiz_fourier_dim: int = 0
-    deterministic: bool = True
+    gnot_inner: GNOT
 
-    @ln.compact
+    def __init__(
+        self,
+        trunk_size: int,
+        branch_size: int,
+        space_dim: int = 2,
+        output_size: int = 1,
+        n_layers: int = 2,
+        n_hidden: int = 64,
+        n_head: int = 1,
+        n_experts: int = 2,
+        mlp_layers: int = 2,
+        attn_type: str = "linear",
+        act: str = "gelu",
+        ffn_dropout: float = 0.0,
+        attn_dropout: float = 0.0,
+        horiz_fourier_dim: int = 0,
+        *,
+        key,
+        **kwargs,
+    ):
+        self.gnot_inner = GNOT(
+            trunk_size=trunk_size,
+            branch_sizes=[branch_size],
+            space_dim=space_dim,
+            output_size=output_size,
+            n_layers=n_layers,
+            n_hidden=n_hidden,
+            n_head=n_head,
+            n_experts=n_experts,
+            n_inner=4,
+            mlp_layers=mlp_layers,
+            attn_type=attn_type,
+            act=act,
+            ffn_dropout=ffn_dropout,
+            attn_dropout=attn_dropout,
+            horiz_fourier_dim=horiz_fourier_dim,
+            key=key,
+        )
+
     def __call__(
         self,
         x_trunk: jnp.ndarray,
         x_branch: jnp.ndarray,
+        *,
+        key=None,
+        **kwargs,
     ) -> jnp.ndarray:
-        """
-        Forward pass.
-
-        Args:
-            x_trunk: Query points [batch, n_query, trunk_size].
-            x_branch: Input function [batch, n_sensors, branch_size].
-
-        Returns:
-            Output values [batch, n_query, output_size].
-        """
-        # Delegate to GNOT with single branch
-        gnot = GNOT(
-            trunk_size=self.trunk_size,
-            branch_sizes=[self.branch_size],
-            space_dim=self.space_dim,
-            output_size=self.output_size,
-            n_layers=self.n_layers,
-            n_hidden=self.n_hidden,
-            n_head=self.n_head,
-            n_experts=self.n_experts,
-            n_inner=4,
-            mlp_layers=self.mlp_layers,
-            attn_type=self.attn_type,
-            act=self.act,
-            ffn_dropout=self.ffn_dropout,
-            attn_dropout=self.attn_dropout,
-            horiz_fourier_dim=self.horiz_fourier_dim,
-            deterministic=self.deterministic,
-            name="gnot_inner",
-        )
-        return gnot(x_trunk, [x_branch])
+        return self.gnot_inner(x_trunk, [x_branch], key=key)
 
 
 # =============================================================================
-
 # Factory Functions (for integration with models.py)
-
 # =============================================================================
 
 
@@ -1092,13 +884,10 @@ def create_cgptno(
     ffn_dropout: float = 0.0,
     attn_dropout: float = 0.0,
     horiz_fourier_dim: int = 0,
-    deterministic: bool = True,
+    *,
+    key,
 ) -> CGPTNO:
-    """
-    Factory function for CGPTNO.
-
-    See CGPTNO class for parameter descriptions.
-    """
+    """Factory function for CGPTNO."""
     return CGPTNO(
         trunk_size=trunk_size,
         branch_sizes=branch_sizes,
@@ -1113,7 +902,7 @@ def create_cgptno(
         ffn_dropout=ffn_dropout,
         attn_dropout=attn_dropout,
         horiz_fourier_dim=horiz_fourier_dim,
-        deterministic=deterministic,
+        key=key,
     )
 
 
@@ -1133,13 +922,10 @@ def create_gnot(
     ffn_dropout: float = 0.0,
     attn_dropout: float = 0.0,
     horiz_fourier_dim: int = 0,
-    deterministic: bool = True,
+    *,
+    key,
 ) -> GNOT:
-    """
-    Factory function for GNOT.
-
-    See GNOT class for parameter descriptions.
-    """
+    """Factory function for GNOT."""
     return GNOT(
         trunk_size=trunk_size,
         branch_sizes=branch_sizes,
@@ -1156,5 +942,5 @@ def create_gnot(
         ffn_dropout=ffn_dropout,
         attn_dropout=attn_dropout,
         horiz_fourier_dim=horiz_fourier_dim,
-        deterministic=deterministic,
+        key=key,
     )

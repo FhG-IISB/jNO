@@ -1,11 +1,11 @@
 import jax.numpy as jnp
 from typing import Union, List, Sequence, Callable
-from .trace import Placeholder, Variable, FunctionCall, Concat, Laplacian, Gradient, Hessian, Jacobian, Constant, ConstantNamespace, Tracker, BinaryOp
+from .trace import Placeholder, Variable, FunctionCall, Concat, Hessian, Jacobian, Constant, ConstantNamespace, BinaryOp
 
 # Keep import so people can use jno.numpy as jno -> jno.model, jno.tune
 from .tuner import Arch, ArchSpace, tune
 from .architectures.models import nn, parameter
-
+from .trace import Tracker
 from pathlib import Path
 
 # ============================================================================
@@ -17,6 +17,20 @@ pi = jnp.pi
 e = jnp.e
 inf = jnp.inf
 nan = jnp.nan
+
+
+def tracker(op: Placeholder, interval: int = 1) -> Tracker:
+    """Mark an expression as a tracked metric.
+
+    Trackers are monitored during training but do NOT contribute to
+    the loss function or gradient computation.
+
+    Args:
+        op: The expression to monitor.
+        interval: Evaluate every *interval* epochs (default: every epoch).
+    """
+
+    return Tracker(op, interval)
 
 
 def constant(tag: str, data: Union[dict, str, Path]) -> ConstantNamespace:
@@ -67,309 +81,76 @@ def function(fn, args: list = [], name: str = "", reduces_axis: int = None):
     return FunctionCall(fn, args, name, reduces_axis)
 
 
-def tracker(op: BinaryOp, interval: int = 1) -> Tracker:
-    return Tracker(op, interval)
-
-
 # ============================================================================
-# Trigonometric functions
+# Factory for simple unary wrappers
 # ============================================================================
 
 
-def sin(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Sine function."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.sin, [x])
-    return jnp.sin(x)
-
-
-def cos(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Cosine function."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.cos, [x])
-    return jnp.cos(x)
-
-
-def tan(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Tangent function."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.tan, [x])
-    return jnp.tan(x)
-
-
-def arcsin(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Inverse sine function."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.arcsin, [x])
-    return jnp.arcsin(x)
-
-
-def arccos(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Inverse cosine function."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.arccos, [x])
-    return jnp.arccos(x)
-
-
-def arctan(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Inverse tangent function."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.arctan, [x])
-    return jnp.arctan(x)
-
-
-def arctan2(y: Union[Placeholder, jnp.ndarray], x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Two-argument arctangent."""
-    if isinstance(y, Placeholder) or isinstance(x, Placeholder):
-        return FunctionCall(jnp.arctan2, [y, x])
-    return jnp.arctan2(y, x)
-
-
-def atan2(y: Union[Placeholder, jnp.ndarray], x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Two-argument arctangent."""
-    return arctan2(y, x)
-
-
-# ============================================================================
-# Hyperbolic functions
-# ============================================================================
-
-
-def sinh(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Hyperbolic sine function."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.sinh, [x])
-    return jnp.sinh(x)
-
-
-def cosh(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Hyperbolic cosine function."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.cosh, [x])
-    return jnp.cosh(x)
-
-
-def tanh(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Hyperbolic tangent function."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.tanh, [x])
-    return jnp.tanh(x)
-
-
-def arcsinh(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Inverse hyperbolic sine function."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.arcsinh, [x])
-    return jnp.arcsinh(x)
-
-
-def arccosh(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Inverse hyperbolic cosine function."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.arccosh, [x])
-    return jnp.arccosh(x)
-
-
-def arctanh(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Inverse hyperbolic tangent function."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.arctanh, [x])
-    return jnp.arctanh(x)
-
-
-# ============================================================================
-# Exponential and logarithmic functions
-# ============================================================================
-
-
-def exp(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Exponential function."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.exp, [x])
-    return jnp.exp(x)
-
-
-def exp2(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """2**x."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.exp2, [x])
-    return jnp.exp2(x)
-
-
-def expm1(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """exp(x) - 1."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.expm1, [x])
-    return jnp.expm1(x)
-
-
-def log(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Natural logarithm."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.log, [x])
-    return jnp.log(x)
-
-
-def log2(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Base-2 logarithm."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.log2, [x])
-    return jnp.log2(x)
-
-
-def log10(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Base-10 logarithm."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.log10, [x])
-    return jnp.log10(x)
-
-
-def log1p(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """log(1 + x)."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.log1p, [x])
-    return jnp.log1p(x)
-
-
-# ============================================================================
-# Power and root functions
-# ============================================================================
-
-
-def sqrt(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Square root."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.sqrt, [x])
-    return jnp.sqrt(x)
-
-
-def cbrt(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Cube root."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.cbrt, [x])
-    return jnp.cbrt(x)
-
-
-def square(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Square."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.square, [x])
-    return jnp.square(x)
-
-
-def power(x: Union[Placeholder, jnp.ndarray], y: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """x**y."""
-    if isinstance(x, Placeholder) or isinstance(y, Placeholder):
-        return FunctionCall(jnp.power, [x, y])
-    return jnp.power(x, y)
-
-
-# ============================================================================
-# Rounding functions
-# ============================================================================
-
-
-def abs(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Absolute value."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.abs, [x])
-    return jnp.abs(x)
-
-
-def floor(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Floor."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.floor, [x])
-    return jnp.floor(x)
-
-
-def ceil(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Ceiling."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.ceil, [x])
-    return jnp.ceil(x)
-
-
-def round(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Round to nearest integer."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.round, [x])
-    return jnp.round(x)
-
-
-def clip(x: Union[Placeholder, jnp.ndarray], min_val=None, max_val=None) -> Union[FunctionCall, jnp.ndarray]:
-    """Clip values to range."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(lambda a: jnp.clip(a, min_val, max_val), [x])
-    return jnp.clip(x, min_val, max_val)
-
-
-# ============================================================================
-# Sign and special functions
-# ============================================================================
-
-
-def sign(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Sign function."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(jnp.sign, [x])
-    return jnp.sign(x)
-
-
-def heaviside(x: Union[Placeholder, jnp.ndarray], h0: float = 0.5) -> Union[FunctionCall, jnp.ndarray]:
-    """Heaviside step function."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(lambda a: jnp.heaviside(a, h0), [x])
-    return jnp.heaviside(x, h0)
-
-
-def sigmoid(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Sigmoid function: 1 / (1 + exp(-x))."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(lambda a: 1 / (1 + jnp.exp(-a)), [x])
-    return 1 / (1 + jnp.exp(-x))
-
-
-def softplus(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Softplus function: log(1 + exp(x))."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(lambda a: jnp.log1p(jnp.exp(a)), [x])
-    return jnp.log1p(jnp.exp(x))
-
-
-def relu(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """ReLU activation."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(lambda a: jnp.maximum(a, 0), [x])
-    return jnp.maximum(x, 0)
-
-
-def leaky_relu(x: Union[Placeholder, jnp.ndarray], negative_slope: float = 0.01) -> Union[FunctionCall, jnp.ndarray]:
-    """Leaky ReLU activation."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(lambda a: jnp.where(a > 0, a, negative_slope * a), [x])
-    return jnp.where(x > 0, x, negative_slope * x)
-
-
-def elu(x: Union[Placeholder, jnp.ndarray], alpha: float = 1.0) -> Union[FunctionCall, jnp.ndarray]:
-    """ELU activation."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(lambda a: jnp.where(a > 0, a, alpha * (jnp.exp(a) - 1)), [x])
-    return jnp.where(x > 0, x, alpha * (jnp.exp(x) - 1))
-
-
-def gelu(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """GELU activation."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(lambda a: 0.5 * a * (1 + jnp.tanh(jnp.sqrt(2 / jnp.pi) * (a + 0.044715 * a**3))), [x])
-    return 0.5 * x * (1 + jnp.tanh(jnp.sqrt(2 / jnp.pi) * (x + 0.044715 * x**3)))
-
-
-def swish(x: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Swish activation: x * sigmoid(x)."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(lambda a: a / (1 + jnp.exp(-a)), [x])
-    return x / (1 + jnp.exp(-x))
+def _unary(jnp_fn):
+    """Create a unary wrapper that handles Placeholder and plain arrays."""
+
+    def wrapper(x):
+        if isinstance(x, Placeholder):
+            return FunctionCall(jnp_fn, [x])
+        return jnp_fn(x)
+
+    wrapper.__name__ = jnp_fn.__name__
+    wrapper.__doc__ = jnp_fn.__doc__
+    return wrapper
+
+
+def _binary(jnp_fn):
+    """Create a binary wrapper that handles Placeholder and plain arrays."""
+
+    def wrapper(x, y):
+        if isinstance(x, Placeholder) or isinstance(y, Placeholder):
+            return FunctionCall(jnp_fn, [x, y])
+        return jnp_fn(x, y)
+
+    wrapper.__name__ = jnp_fn.__name__
+    wrapper.__doc__ = jnp_fn.__doc__
+    return wrapper
+
+
+# Trigonometric
+sin = _unary(jnp.sin)
+cos = _unary(jnp.cos)
+tan = _unary(jnp.tan)
+arcsin = _unary(jnp.arcsin)
+arccos = _unary(jnp.arccos)
+arctan = _unary(jnp.arctan)
+arctan2 = _binary(jnp.arctan2)
+atan2 = arctan2
+
+# Hyperbolic
+sinh = _unary(jnp.sinh)
+cosh = _unary(jnp.cosh)
+tanh = _unary(jnp.tanh)
+arcsinh = _unary(jnp.arcsinh)
+arccosh = _unary(jnp.arccosh)
+arctanh = _unary(jnp.arctanh)
+
+# Exponential / logarithmic
+exp = _unary(jnp.exp)
+exp2 = _unary(jnp.exp2)
+expm1 = _unary(jnp.expm1)
+log = _unary(jnp.log)
+log2 = _unary(jnp.log2)
+log10 = _unary(jnp.log10)
+log1p = _unary(jnp.log1p)
+
+# Power / root
+sqrt = _unary(jnp.sqrt)
+cbrt = _unary(jnp.cbrt)
+square = _unary(jnp.square)
+power = _binary(jnp.power)
+
+# Rounding / absolute
+abs = _unary(jnp.abs)
+floor = _unary(jnp.floor)
+ceil = _unary(jnp.ceil)
+round = _unary(jnp.round)
+sign = _unary(jnp.sign)
 
 
 # ============================================================================
@@ -526,7 +307,7 @@ def mean(x: Union[Placeholder, jnp.ndarray], axis: int = None, keepdims: bool = 
 
 
 def median(x: Union[Placeholder, jnp.ndarray], axis: int = None, keepdims: bool = False) -> Union[FunctionCall, jnp.ndarray]:
-    """Mean of array elements."""
+    """Median of array elements."""
     if isinstance(x, Placeholder):
         return FunctionCall(lambda a: jnp.median(a, axis=axis, keepdims=keepdims), [x], name="median", reduces_axis=axis)
     return jnp.median(x, axis=axis, keepdims=keepdims)
@@ -579,18 +360,8 @@ def norm(x: Union[Placeholder, jnp.ndarray], ord: int = None, axis: int = None, 
 # ============================================================================
 
 
-def maximum(x: Union[Placeholder, jnp.ndarray], y: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Element-wise maximum."""
-    if isinstance(x, Placeholder) or isinstance(y, Placeholder):
-        return FunctionCall(jnp.maximum, [x, y])
-    return jnp.maximum(x, y)
-
-
-def minimum(x: Union[Placeholder, jnp.ndarray], y: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Element-wise minimum."""
-    if isinstance(x, Placeholder) or isinstance(y, Placeholder):
-        return FunctionCall(jnp.minimum, [x, y])
-    return jnp.minimum(x, y)
+maximum = _binary(jnp.maximum)
+minimum = _binary(jnp.minimum)
 
 
 def where(condition, x, y) -> Union[FunctionCall, jnp.ndarray]:
@@ -605,25 +376,9 @@ def where(condition, x, y) -> Union[FunctionCall, jnp.ndarray]:
 # ============================================================================
 
 
-def dot(x: Union[Placeholder, jnp.ndarray], y: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Dot product."""
-    if isinstance(x, Placeholder) or isinstance(y, Placeholder):
-        return FunctionCall(jnp.dot, [x, y])
-    return jnp.dot(x, y)
-
-
-def matmul(x: Union[Placeholder, jnp.ndarray], y: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Matrix multiplication."""
-    if isinstance(x, Placeholder) or isinstance(y, Placeholder):
-        return FunctionCall(jnp.matmul, [x, y])
-    return jnp.matmul(x, y)
-
-
-def cross(x: Union[Placeholder, jnp.ndarray], y: Union[Placeholder, jnp.ndarray]) -> Union[FunctionCall, jnp.ndarray]:
-    """Cross product."""
-    if isinstance(x, Placeholder) or isinstance(y, Placeholder):
-        return FunctionCall(jnp.cross, [x, y])
-    return jnp.cross(x, y)
+dot = _binary(jnp.dot)
+matmul = _binary(jnp.matmul)
+cross = _binary(jnp.cross)
 
 
 # ============================================================================
@@ -631,9 +386,11 @@ def cross(x: Union[Placeholder, jnp.ndarray], y: Union[Placeholder, jnp.ndarray]
 # ============================================================================
 
 
-def grad(target: Placeholder, variable: Variable, scheme: str = "automatic_differentiation") -> Gradient:
+def grad(target: Placeholder, variable: Variable, scheme: str = "automatic_differentiation") -> Jacobian:
     """
     Compute the gradient of target with respect to variable.
+
+    Implemented as a single-variable Jacobian.
 
     Args:
         target: Expression to differentiate
@@ -641,20 +398,19 @@ def grad(target: Placeholder, variable: Variable, scheme: str = "automatic_diffe
         scheme: 'automatic_differentiation' (default) or 'finite_difference'
 
     Returns:
-        Gradient placeholder representing ∂target/∂variable
+        Jacobian placeholder representing ∂target/∂variable
 
     Example:
         u_x = pnp.grad(u(x, y), x)  # ∂u/∂x
-        u_x_fd = pnp.grad(u(x, y), x, scheme='finite_difference')
     """
-    return Gradient(target, variable, scheme)
+    return Jacobian(target, [variable], scheme)
 
 
-def laplacian(target: Placeholder, variables: List[Variable] = None, scheme: str = "automatic_differentiation") -> Laplacian:
+def laplacian(target: Placeholder, variables: List[Variable] = None, scheme: str = "automatic_differentiation") -> Hessian:
     """
     Compute the Laplacian of target with respect to variables.
 
-    The Laplacian is the sum of second derivatives:
+    Implemented as a Hessian with trace=True (sum of diagonal second derivatives):
     ∇²u = ∂²u/∂x² + ∂²u/∂y² + ...
 
     Args:
@@ -663,22 +419,20 @@ def laplacian(target: Placeholder, variables: List[Variable] = None, scheme: str
         scheme: 'automatic_differentiation' (default) or 'finite_difference'
 
     Returns:
-        Laplacian placeholder
+        Hessian placeholder with trace=True
 
     Example:
         lap_u = pnp.laplacian(u(x, y), [x, y])  # ∂²u/∂x² + ∂²u/∂y²
-        lap_u_fd = pnp.laplacian(u(x, y), [x, y], scheme='finite_difference')
     """
-
     if scheme == "finite_difference" and variables is not None:
         print("Variables were selected for the finite difference laplacian which are not used. The finite difference derivatives are computed on the entire spatial grid.")
 
-    return Laplacian(target, variables, scheme)
+    return Hessian(target, variables, scheme, trace=True)
 
 
-def laplace(target: Placeholder, variables: List[Variable], scheme: str = "automatic_differentiation") -> Laplacian:
+def laplace(target: Placeholder, variables: List[Variable], scheme: str = "automatic_differentiation") -> Hessian:
     """Alias for laplacian."""
-    return Laplacian(target, variables, scheme)
+    return Hessian(target, variables, scheme, trace=True)
 
 
 def hessian(target: Placeholder, variables: List[Variable], scheme: str = "automatic_differentiation") -> Hessian:
@@ -703,20 +457,20 @@ def hessian(target: Placeholder, variables: List[Variable], scheme: str = "autom
 
 def jacobian(target: Placeholder, variables: List[Variable], scheme: str = "automatic_differentiation") -> Jacobian:
     """
-    Compute the Jac matrix of target with respect to variables.
+    Compute the Jacobian matrix of target with respect to variables.
 
-    The Jac is the matrix of second derivatives:
-    H[i,j] = ∂²u/∂xᵢ∂xⱼ
+    The Jacobian is the matrix of first derivatives:
+    J[i] = \u2202u/\u2202x\u1d62
 
     Args:
         target: Expression to differentiate
         variables: List of variables
 
     Returns:
-        Jac placeholder representing the full Jac matrix
+        Jacobian placeholder representing the full Jacobian matrix
 
     Example:
-        H = pnp.Jacobian(u(x, y), [x, y])  # 2x2 Jac matrix
+        J = pnp.jacobian(u(x, y), [x, y])  # 2-element Jacobian vector
     """
     return Jacobian(target, variables, scheme)
 
@@ -740,9 +494,9 @@ def divergence(vector_field: List[Placeholder], variables: List[Variable]) -> Pl
     if len(vector_field) != len(variables):
         raise ValueError("vector_field and variables must have same length")
 
-    result = Gradient(vector_field[0], variables[0])
+    result = Jacobian(vector_field[0], [variables[0]])
     for i in range(1, len(vector_field)):
-        result = result + Gradient(vector_field[i], variables[i])
+        result = result + Jacobian(vector_field[i], [variables[i]])
     return result
 
 
@@ -759,7 +513,7 @@ def curl_2d(Fx: Placeholder, Fy: Placeholder, x: Variable, y: Variable) -> Place
     Returns:
         Scalar curl
     """
-    return Gradient(Fy, x) - Gradient(Fx, y)
+    return Jacobian(Fy, [x]) - Jacobian(Fx, [y])
 
 
 def curl_3d(Fx: Placeholder, Fy: Placeholder, Fz: Placeholder, x: Variable, y: Variable, z: Variable) -> Placeholder:
@@ -777,9 +531,9 @@ def curl_3d(Fx: Placeholder, Fy: Placeholder, Fz: Placeholder, x: Variable, y: V
     Returns:
         A 3-component Placeholder representing the curl vector
     """
-    curl_x = Gradient(Fz, y) - Gradient(Fy, z)
-    curl_y = Gradient(Fx, z) - Gradient(Fz, x)
-    curl_z = Gradient(Fy, x) - Gradient(Fx, y)
+    curl_x = Jacobian(Fz, [y]) - Jacobian(Fy, [z])
+    curl_y = Jacobian(Fx, [z]) - Jacobian(Fz, [x])
+    curl_z = Jacobian(Fy, [x]) - Jacobian(Fx, [y])
     return stack([curl_x, curl_y, curl_z], axis=-1)
 
 

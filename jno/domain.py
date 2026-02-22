@@ -14,8 +14,7 @@ from .utils.logger import get_logger, Logger
 class DomainData:
     """Pre-processed domain data for training."""
 
-    points_by_tag: Dict[str, jax.Array]
-    tensor_tags: Dict[str, jax.Array]
+    context: Dict[str, jax.Array]
     dimension: int
 
 
@@ -1766,9 +1765,8 @@ class domain(MeshUtils, Geometries):
     - Time-dependent problems
 
     Attributes:
-        points_by_tag: Dictionary mapping region names to point coordinates
-        sampled_points: Currently sampled points as contiguous array
-        context: Dictionary of sampled arrays for training
+        _mesh_pool: Full mesh vertices per tag (private, used for sampling)
+        context: Unified dict of spatial (B,N,D) and parametric (B,F) arrays for training
     """
 
     def __init__(self, constructor: Union[Callable, str] = None, algorithm: int = 6, time: Optional[Tuple[float, float]] = None, compute_mesh_connectivity: bool = True):
@@ -1786,9 +1784,9 @@ class domain(MeshUtils, Geometries):
 
         # Storage
         self.compute_mesh_connectivity = compute_mesh_connectivity
-        self.points_by_tag: Dict[str, np.ndarray] = {}
-        self.sampled_points: Dict[str, np.ndarray] = {}
-        self.context: Dict[str, np.ndarray] = {}
+        self._mesh_pool: Dict[str, np.ndarray] = {}  # full mesh vertices per tag (M, D)
+        self.context: Dict[str, np.ndarray] = {}  # unified: spatial (B,N,D) + params (B,F)
+        self._param_tags: set = set()  # tags that are parametric (TensorTag)
         self.normals_by_tag: Dict[str, np.ndarray] = {}
 
         # Neural operator storage
@@ -1796,9 +1794,6 @@ class domain(MeshUtils, Geometries):
         self.arrays: Dict[str, np.ndarray] = {}
         self.tag_indices: Dict[str, np.ndarray] = {}
         self.avaiable_mesh_tags: List[str] = []  # names of the tags from the mesh generator
-
-        # Tensor tags for parametric PDEs (shape (1, ...) or (B, ...))
-        self.tensor_tags: Dict[str, np.ndarray] = {}
 
         # Resampling support
         self._mesh_points: Dict[str, np.ndarray] = {}  # Full mesh points for resampling
@@ -1856,9 +1851,9 @@ class domain(MeshUtils, Geometries):
         user_spatial_dims = len(self.spatial)
         if user_spatial_dims < spatial_dims:
             self.dimension = user_spatial_dims + (1 if self._is_time_dependent else 0)
-            for tag, pts in self.points_by_tag.items():
+            for tag, pts in self._mesh_pool.items():
                 if pts.shape[1] > self.dimension:
-                    self.points_by_tag[tag] = pts[..., : self.dimension]
+                    self._mesh_pool[tag] = pts[..., : self.dimension]
 
     def __lt__(self, other: Tuple[str, Any]) -> "domain":
         """Attach parameters or arrays using < operator."""
@@ -1907,17 +1902,17 @@ class domain(MeshUtils, Geometries):
 
     def __add__(self, other: Tuple[str, np.ndarray]) -> "domain":
         """Merge another domain into this one (stacks along batch dimension)."""
-        for tag, points in other.points_by_tag.items():
-            if tag in self.points_by_tag:
-                self.points_by_tag[tag] = np.vstack([self.points_by_tag[tag], points])
+        for tag, points in other._mesh_pool.items():
+            if tag in self._mesh_pool:
+                self._mesh_pool[tag] = np.vstack([self._mesh_pool[tag], points])
             else:
-                self.points_by_tag[tag] = points
+                self._mesh_pool[tag] = points
 
-        for tag, points in other.sampled_points.items():
-            if tag in self.sampled_points:
-                self.sampled_points[tag] = np.concatenate([self.sampled_points[tag], points], axis=0)
+        for tag, data in other.context.items():
+            if tag in self.context:
+                self.context[tag] = np.concatenate([self.context[tag], data], axis=0)
             else:
-                self.sampled_points[tag] = points
+                self.context[tag] = data
 
         if not hasattr(self, "_parameter_list"):
             self._parameter_list = {k: [v] for k, v in self.parameters.items()}
@@ -1974,7 +1969,7 @@ class domain(MeshUtils, Geometries):
         index_to_normal_pos = {}
         points = mesh.points[:, : self.dimension]
         self.points = points
-        self.points_by_tag = {}
+        self._mesh_pool = {}
 
         if self.dimension > 1:
             boundary_normals, boundary_indices = self.get_boundary_normals(mesh)
@@ -2021,7 +2016,7 @@ class domain(MeshUtils, Geometries):
                     indices_list = np.array(list(tag_points)).flatten()
 
                     # Store points
-                    self.points_by_tag[name] = points[indices_list]
+                    self._mesh_pool[name] = points[indices_list]
 
                     # Map indices_list to positions in boundary_normals
                     # if all indices in indices_list are also in boundary_indices
@@ -2035,24 +2030,21 @@ class domain(MeshUtils, Geometries):
     def _add_time_dimension(self, t_start: float, t_end: float, n_time: int = 100):
         """Add time dimension to all point sets."""
         t_points = np.linspace(t_start, t_end, n_time)
-        new_points_by_tag = {}
-        for tag, points in self.points_by_tag.items():
+        new_mesh_pool = {}
+        for tag, points in self._mesh_pool.items():
             n_spatial = len(points)
 
             if tag == "interior":
                 initial_interior = points.copy()
-                new_points_by_tag["initial"] = np.concat([initial_interior, np.zeros((initial_interior.shape[0], 1))], axis=-1)
+                new_mesh_pool["initial"] = np.concat([initial_interior, np.zeros((initial_interior.shape[0], 1))], axis=-1)
 
             repeated_points = np.repeat(points, n_time, axis=0)
             tiled_time = np.tile(t_points, n_spatial).reshape(-1, 1)
-            new_points_by_tag[tag] = np.hstack([repeated_points, tiled_time])
+            new_mesh_pool[tag] = np.hstack([repeated_points, tiled_time])
 
-        self.points_by_tag = new_points_by_tag
+        self._mesh_pool = new_mesh_pool
         self.dimension += 1
 
-        # t_points = np.linspace(t_start, t_end, n_time)
-        # new_points_by_tag = {}
-        # for tag, points in self.points_by_tag.items()
         return None
 
     def add_tensor_tag(self, name: str, tensor: Union[np.ndarray, jnp.ndarray]) -> "domain":
@@ -2084,7 +2076,8 @@ class domain(MeshUtils, Geometries):
         if tensor_batch != batch_count:
             self.log.warning(f"Tensor '{name}' has batch dimension {tensor_batch}, but domain has " f"batch count {batch_count}. Was this intended?")
 
-        self.tensor_tags[name] = tensor
+        self.context[name] = tensor
+        self._param_tags.add(name)
         return self
 
     def variable(
@@ -2120,13 +2113,13 @@ class domain(MeshUtils, Geometries):
         # Optional sampling / tensor-tag attachment
         if sample is not None:
             if isinstance(sample, jnp.ndarray) or isinstance(sample, np.ndarray):
-                # Attach as tensor tag (parameter field)
+                # Attach as tensor tag (parameter field) or point data
                 if point_data:
-                    self.sampled_points[tag] = sample
+                    self.context[tag] = sample
                 else:
                     self.add_tensor_tag(tag, sample)
 
-        if tag in self.points_by_tag.keys() and isinstance(sample, tuple) and len(sample) > 0 and isinstance(sample[0], (int, type(None))):
+        if tag in self._mesh_pool.keys() and isinstance(sample, tuple) and len(sample) > 0 and isinstance(sample[0], (int, type(None))):
             # Sample points for this tag on demand
             # Save sample dict for inference
             self.sample_dict.append([tag, (None, None), resampling_strategy, normals, view_factor])
@@ -2136,21 +2129,21 @@ class domain(MeshUtils, Geometries):
         if resampling_strategy is not None:
             self._resampling_strategies[tag] = resampling_strategy
 
-        # Check if it's a tensor tag first
-        if tag in self.tensor_tags:
+        # Check if it's a parametric (TensorTag) entry
+        if tag in self._param_tags:
             if split:
-                return tuple([TensorTag(tag=tag, dim_index=i, domain=self) for i in range(sample.shape[-1])])
+                return tuple(TensorTag(tag=tag, dim_index=i, domain=self) for i in range(sample.shape[-1]))
             else:
                 return TensorTag(tag=tag, domain=self)
 
         if point_data:
             if split:
-                (Variable(tag=tag, dim=[i, i + 1], domain=self) for i in range(sample.shape[-1]))
+                return tuple(Variable(tag=tag, dim=[i, i + 1], domain=self) for i in range(sample.shape[-1]))
             else:
                 return Variable(tag=tag, dim=[0, None], domain=self)
 
-        if tag not in self.sampled_points:
-            available = list(self.sampled_points.keys()) + list(self.tensor_tags.keys())
+        if tag not in self.context:
+            available = list(self.context.keys())
             raise ValueError(f"Tag '{tag}' not found. Did you call sample() first? Available: {available}")
 
         # Create Variable placeholder for each dimension
@@ -2162,7 +2155,7 @@ class domain(MeshUtils, Geometries):
         if view_factor and hasattr(self, "mesh_connectivity"):
 
             # Only take the first batch index
-            Nrm = -self.sampled_points[f"n_{tag}"][0, ...]  # Reverse the normals
+            Nrm = -self.context[f"n_{tag}"][0, ...]  # Reverse the normals
             P = points[0, ...]
 
             ds = self.mesh_connectivity["nodal_ds"][self.mesh_connectivity["boundary_indices"]]
@@ -2186,11 +2179,10 @@ class domain(MeshUtils, Geometries):
                 VF = self.get_view_factor_3d(P, subset_VM, Nrm, ds)
 
             # TODO: Fix if used for multiple domains !
-            # self.sampled_points[f"v_{tag}"] = VM
-            # self.sampled_points[f"f_{tag}"] = VF
-            self.tensor_tags[f"v_{tag}"] = subset_VM[None, ...]
-            self.tensor_tags[f"f_{tag}"] = VF[None, ...]
-            # coord_vars += [TensorTag(tag=f"v_{tag}", domain=self)]
+            self.context[f"v_{tag}"] = subset_VM[None, ...]
+            self._param_tags.add(f"v_{tag}")
+            self.context[f"f_{tag}"] = VF[None, ...]
+            self._param_tags.add(f"f_{tag}")
             coord_vars += [TensorTag(tag=f"f_{tag}", domain=self)]
 
         # if view_factor and not hasattr(self, "mesh_connectivity"):
@@ -2199,10 +2191,7 @@ class domain(MeshUtils, Geometries):
         if return_indices:
             coord_vars += [idx]
 
-        if len(coord_vars) > 1:
-            return tuple(coord_vars)
-        else:
-            return coord_vars[0]
+        return tuple(coord_vars)
 
     def __getitem__(self, tag: str) -> Tuple[Variable, ...]:
         """Shorthand for domain.variable(tag).
@@ -2231,20 +2220,20 @@ class domain(MeshUtils, Geometries):
 
         for tag, (n_samples, sampler) in sample_spec.items():
             # Handle special "initial" tag for time-dependent problems
-            if tag not in self.points_by_tag:
-                available = list(self.points_by_tag.keys())
+            if tag not in self._mesh_pool:
+                available = list(self._mesh_pool.keys())
                 self.log.error(f"Tag '{tag}' not found. Available: {available}")
 
             normals_avaiable = tag in self.normals_by_tag
 
-            available_points = self.points_by_tag[tag]
+            available_points = self._mesh_pool[tag]
             if normals_avaiable and normals:
                 available_normals = self.normals_by_tag[tag]  # Pull the normals for this tag
             n_available = len(available_points)
 
             ii = 0
             og_tag = tag
-            while tag in self.sampled_points:
+            while tag in self.context and tag not in self._param_tags:
                 tag = og_tag + f"_{ii}"
                 ii += 1
 
@@ -2282,9 +2271,9 @@ class domain(MeshUtils, Geometries):
                         all_normals.append(available_normals[idx])
 
                 # 3. Stack both
-                self.sampled_points[tag] = np.stack(all_samples, axis=0)  # Shape (B, N, D)
+                self.context[tag] = np.stack(all_samples, axis=0)  # Shape (B, N, D)
                 if normals_avaiable and normals:
-                    self.sampled_points[f"n_{tag}"] = np.stack(all_normals, axis=0)  # Shape (B, N, D)
+                    self.context[f"n_{tag}"] = np.stack(all_normals, axis=0)  # Shape (B, N, D)
 
             else:
                 # Sample once -> broadcast to all batches
@@ -2298,21 +2287,21 @@ class domain(MeshUtils, Geometries):
 
                 sampled_pts = available_points[idx]  # Shape (N, D)
                 # Broadcast to (B, N, D)
-                self.sampled_points[tag] = np.broadcast_to(sampled_pts[np.newaxis, :, :], (batch_count, *sampled_pts.shape))  # Add batch dim: (1, N, D)  # Target: (B, N, D)
+                self.context[tag] = np.broadcast_to(sampled_pts[np.newaxis, :, :], (batch_count, *sampled_pts.shape))  # Add batch dim: (1, N, D)  # Target: (B, N, D)
                 if normals_avaiable and normals:
                     sampled_nrm = available_normals[idx]  # Shape (N, D)
-                    self.sampled_points[f"n_{tag}"] = np.broadcast_to(sampled_nrm[np.newaxis, :, :], (batch_count, *sampled_nrm.shape))
+                    self.context[f"n_{tag}"] = np.broadcast_to(sampled_nrm[np.newaxis, :, :], (batch_count, *sampled_nrm.shape))
 
             if self._verbose:
                 if batch_count > 1:
-                    self.log.info(f"Sampled {n_samples} x {batch_count} = {batch_count * n_samples} points for '{tag}' with shape {self.sampled_points[tag].shape}")
+                    self.log.info(f"Sampled {n_samples} x {batch_count} = {batch_count * n_samples} points for '{tag}' with shape {self.context[tag].shape}")
                 else:
                     self.log.info(f"Sampled {n_samples} points for '{tag}'")
 
         if return_indices:
-            return self.sampled_points[tag], idx, tag
+            return self.context[tag], idx, tag
         else:
-            return self.sampled_points[tag], None, tag
+            return self.context[tag], None, tag
 
     # Utilities
 
@@ -2328,7 +2317,7 @@ class domain(MeshUtils, Geometries):
         import matplotlib.pyplot as plt
         from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
-        if not self.sampled_points:
+        if not self.context:
             self.log.warning("No sampled points to plot")
             return
 
@@ -2345,9 +2334,9 @@ class domain(MeshUtils, Geometries):
         colors = plt.cm.tab10.colors
 
         # Plot points by tag
-        for i, (tag, points) in enumerate(self.sampled_points.items()):
-            # Skip normal tags
-            if tag.startswith("n_"):
+        for i, (tag, points) in enumerate(self.context.items()):
+            # Skip normal tags and parameter tags
+            if tag.startswith("n_") or tag in self._param_tags:
                 continue
 
             color = colors[i % len(colors)]
@@ -2361,8 +2350,8 @@ class domain(MeshUtils, Geometries):
                     ax.scatter(points[0, :, 0], np.zeros(n_points), c=[color], s=10, alpha=0.7, label=f"{tag} ({n_points})")
 
                 # Plot normals if available
-                if show_normals and f"n_{tag}" in self.sampled_points:
-                    normals = self.sampled_points[f"n_{tag}"][0]  # (N, 1)
+                if show_normals and f"n_{tag}" in self.context:
+                    normals = self.context[f"n_{tag}"][0]  # (N, 1)
                     for j in range(n_points):
                         if self._is_time_dependent:
                             ax.arrow(
@@ -2396,8 +2385,8 @@ class domain(MeshUtils, Geometries):
                 ax.scatter(points[0, :, 0], points[0, :, 1], c=[color], s=10, alpha=0.7, label=f"{tag} ({n_points})")
 
                 # Plot normals if available
-                if show_normals and f"n_{tag}" in self.sampled_points:
-                    normals = self.sampled_points[f"n_{tag}"][0]  # (N, 2)
+                if show_normals and f"n_{tag}" in self.context:
+                    normals = self.context[f"n_{tag}"][0]  # (N, 2)
                     ax.quiver(
                         points[0, :, 0],
                         points[0, :, 1],
@@ -2423,8 +2412,8 @@ class domain(MeshUtils, Geometries):
                 )
 
                 # Plot normals if available
-                if show_normals and f"n_{tag}" in self.sampled_points:
-                    normals = self.sampled_points[f"n_{tag}"][0]  # (N, 3)
+                if show_normals and f"n_{tag}" in self.context:
+                    normals = self.context[f"n_{tag}"][0]  # (N, 3)
                     ax.quiver(
                         points[0, :, 0],
                         points[0, :, 1],
