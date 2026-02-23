@@ -830,10 +830,8 @@ class Tuner:
         solver.compile((1, 1))
 
         try:
-            # Attach optimizer to all models
-            flax_mods = solver._collect_flax_modules()
-            for fm in flax_mods.values():
-                fm.optimizer(trial_optimizer, lr=trial_lr)
+            # Apply per-model config (freeze, lora, optimizer, lr, dtype)
+            self._apply_model_config(solver, config, trial_optimizer, trial_lr)
             stats = solver.solve(epochs=trial_epochs, constraint_weights=trial_weights, batchsize=trial_batchsize)
             return float(stats.training_logs[-1]["total_loss"][-1])
         except Exception as e:
@@ -844,22 +842,24 @@ class Tuner:
             return float("inf")
 
     def _merge_spaces(self, space, tunable):
-        """Merge architecture space from TunableModule if present."""
-        if tunable is None or not hasattr(tunable, "space") or tunable.space is None:
-            return space
+        """Merge architecture space from TunableModule if present.
 
+        Also injects per-model tunable options declared via
+        :meth:`FlaxModule.tune` into the combined search space.
+        """
         combined_space = ArchSpace()
 
-        # Add architecture params from tunable module's space
-        for g in tunable.space.groups:
-            if isinstance(g, UniqueGroup):
-                combined_space.unique(g.name, g.options, "architecture")
-            elif isinstance(g, FloatGroup):
-                combined_space.float_range(g.name, g.low, g.high, g.log_scale, "architecture")
-            elif isinstance(g, IntGroup):
-                combined_space.int_range(g.name, g.low, g.high, "architecture")
+        # 1. Architecture params from TunableModule
+        if tunable is not None and hasattr(tunable, "space") and tunable.space is not None:
+            for g in tunable.space.groups:
+                if isinstance(g, UniqueGroup):
+                    combined_space.unique(g.name, g.options, "architecture")
+                elif isinstance(g, FloatGroup):
+                    combined_space.float_range(g.name, g.low, g.high, g.log_scale, "architecture")
+                elif isinstance(g, IntGroup):
+                    combined_space.int_range(g.name, g.low, g.high, "architecture")
 
-        # Add training params from provided space
+        # 2. Training params from the user-supplied space
         for g in space.get_training_groups():
             if isinstance(g, UniqueGroup):
                 combined_space.unique(g.name, g.options, g.category)
@@ -868,7 +868,7 @@ class Tuner:
             elif isinstance(g, IntGroup):
                 combined_space.int_range(g.name, g.low, g.high, g.category)
 
-        # Also add any architecture params from provided space
+        # 3. Architecture params from the user-supplied space
         for g in space.get_architecture_groups():
             if g.name not in combined_space._name_to_group:
                 if isinstance(g, UniqueGroup):
@@ -878,7 +878,70 @@ class Tuner:
                 elif isinstance(g, IntGroup):
                     combined_space.int_range(g.name, g.low, g.high, g.category)
 
+        # 4. Per-model tunable options (from FlaxModule.tune())
+        model_opts = self._collect_model_tune_opts()
+        for model_key, opts in model_opts.items():
+            for opt_name, candidates in opts.items():
+                param_name = f"{model_key}__{opt_name}"
+                combined_space.unique(param_name, candidates, category="training")
+            self.core.log.info(f"Per-model tuning for '{model_key}': " f"{', '.join(f'{k}({len(v)} options)' for k, v in opts.items())}")
+
         return combined_space
+
+    def _collect_model_tune_opts(self) -> Dict[str, Dict[str, list]]:
+        """Return ``{model_key: {opt_name: [candidates]}}`` for all
+        FlaxModules that have ``_tunable_opts`` set via ``.tune()``."""
+        result = {}
+        flax_mods = self.core._collect_flax_modules()
+        for fm in flax_mods.values():
+            if getattr(fm, "_tunable_opts", None):
+                result[fm.model_key] = fm._tunable_opts
+        return result
+
+    def _apply_model_config(self, solver, config, fallback_optimizer, fallback_lr):
+        """Apply per-model tunable options and attach optimizers.
+
+        For each FlaxModule in the solver:
+        - If it declared ``.tune()`` options and the config contains
+          matching entries, apply them (freeze, lora, optimizer, lr, dtype).
+        - Otherwise fall back to the global optimizer / LR.
+        """
+        flax_mods = solver._collect_flax_modules()
+        for fm in flax_mods.values():
+            fm.reset()  # clear previous trial state
+            mk = fm.model_key
+            has_tune = bool(getattr(fm, "_tunable_opts", None))
+
+            # --- freeze ---
+            if has_tune and config.has(f"{mk}__freeze"):
+                if config(f"{mk}__freeze"):
+                    fm.freeze()
+
+            # --- lora ---
+            if has_tune and config.has(f"{mk}__lora"):
+                lora_val = config(f"{mk}__lora")
+                if lora_val is not None:
+                    fm.lora(*lora_val)
+
+            # --- dtype ---
+            if has_tune and config.has(f"{mk}__dtype"):
+                fm.dtype(config(f"{mk}__dtype"))
+
+            # --- optimizer + lr ---
+            if fm._frozen:
+                # Frozen models don't need an optimizer, but we still
+                # call fm.optimizer so that solve() can detect it
+                # gracefully.  Actually solve() just skips frozen
+                # models, so we just need _opt_fn to avoid a KeyError.
+                fm.optimizer(fallback_optimizer, lr=fallback_lr)
+            elif has_tune and config.has(f"{mk}__optimizer"):
+                opt = config(f"{mk}__optimizer")
+                lr = config(f"{mk}__lr") if config.has(f"{mk}__lr") else fallback_lr
+                fm.optimizer(opt, lr=lr)
+            elif has_tune and config.has(f"{mk}__lr"):
+                fm.optimizer(fallback_optimizer, lr=config(f"{mk}__lr"))
+            else:
+                fm.optimizer(fallback_optimizer, lr=fallback_lr)
 
     def _run_final_training(self, final_config, space, tunable, has_arch_tuning, tuning_history):
         """Run final training with the best configuration."""
@@ -909,10 +972,8 @@ class Tuner:
         final_lr = final_config.get("learning_rate", LearningRateSchedule(1e-3))
         final_weights = final_config.get("constraint_weights")
 
-        # Attach optimizer to all models
-        flax_mods = self.core._collect_flax_modules()
-        for fm in flax_mods.values():
-            fm.optimizer(final_optimizer, lr=final_lr)
+        # Apply per-model config (freeze, lora, optimizer, lr, dtype)
+        self._apply_model_config(self.core, final_config, final_optimizer, final_lr)
         stats = self.core.solve(epochs=final_training_epochs, constraint_weights=final_weights)
 
         return stats

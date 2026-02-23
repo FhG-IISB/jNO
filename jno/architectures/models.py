@@ -88,6 +88,15 @@ import jax.numpy as jnp
 from typing import Callable, Optional, Tuple, Sequence, Literal, List, Union
 from jax_poseidon import ScOT, ScOTConfig
 from jax_walrus import IsotropicModel as WalrusModel
+from jax_morph import ViT3DRegression as MorphModel
+from jax_mpp import AViT as MPPModel, AVIT_CONFIGS
+from jax_pdeformer2 import (
+    create_pdeformer_from_config,
+    PDEFORMER_SMALL_CONFIG,
+    PDEFORMER_BASE_CONFIG,
+    PDEFORMER_FAST_CONFIG,
+)
+from jax_pdeformer2.utils import create_dummy_inputs as _pdeformer2_dummy_inputs
 
 from .mlp import MLP
 from .fno import FNO1D, FNO2D, FNO3D
@@ -2435,3 +2444,596 @@ class nn:
             deterministic=True,
         )
         return cls.wrap(wrapped, name="walrus")
+
+    # =========================================================================
+    # MORPH Foundation Models
+    # =========================================================================
+
+    @classmethod
+    def _morph(
+        cls,
+        name: str,
+        dim: int,
+        depth: int,
+        heads: int,
+        mlp_dim: int,
+        max_ar: int,
+        model_size: str,
+        spatial_size: int = 128,
+        conv_filter: int = 8,
+        heads_xa: int = 32,
+        max_components: int = 3,
+        max_patches: int = 4096,
+        max_fields: int = 3,
+        dropout: float = 0.0,
+        emb_dropout: float = 0.0,
+    ) -> FlaxModule:
+        """Internal helper that builds a fresh MORPH model.
+
+        jNO's vmap+scan pipeline delivers one sample at a time to the model.
+        For a domain storing ``_f`` as ``(S, 1, 1, H, W, 1)`` (Poseidon layout),
+        each sample arrives as ``(1, H, W, 1)`` after B is vmapped
+        and T is scanned.  MORPH expects ``(B, t, F, C, D, H, W)``
+        (native 7-D volume format).  A ``MorphAdapter`` wrapper reshapes
+        in both directions so the jNO interface is identical to Walrus.
+
+        Args:
+            name: Display name (e.g. ``"morph_Ti"``).
+            dim: Transformer embedding dimension.
+            depth: Number of transformer blocks.
+            heads: Number of attention heads.
+            mlp_dim: MLP hidden dimension.
+            max_ar: Maximum auto-regressive timesteps.
+            model_size: Model variant string (``'Ti'``, ``'S'``, ``'M'``, ``'L'``).
+            spatial_size: Spatial resolution H=W (must be divisible by 8).
+                Used for the dummy init forward pass.  Default: 128.
+            conv_filter: Conv feature extractor output channels. Default: 8.
+            heads_xa: Number of heads for field cross-attention. Default: 32.
+            max_components: Maximum input components. Default: 3.
+            max_patches: Maximum number of patches. Default: 4096.
+            max_fields: Maximum number of fields. Default: 3.
+            dropout: Dropout rate. Default: 0.0.
+            emb_dropout: Embedding dropout rate. Default: 0.0.
+        """
+        flax_model = MorphModel(
+            patch_size=8,
+            dim=dim,
+            depth=depth,
+            heads=heads,
+            heads_xa=heads_xa,
+            mlp_dim=mlp_dim,
+            max_components=max_components,
+            conv_filter=conv_filter,
+            max_ar=max_ar,
+            max_patches=max_patches,
+            max_fields=max_fields,
+            dropout=dropout,
+            emb_dropout=emb_dropout,
+            model_size=model_size,
+        )
+
+        # Init params with the native MORPH shape (B, t, F, C, D, H, W).
+        # D=1 turns a 2-D problem into the 3-D volume MORPH expects.
+        S = spatial_size
+        rng = jax.random.PRNGKey(0)
+        dummy_vol = jnp.ones((1, 1, 1, 1, 1, S, S))  # (B=1, t=1, F=1, C=1, D=1, H, W)
+        params = flax_model.init(rng, dummy_vol, deterministic=True)
+
+        # ── Adapter: jNO ↔ MORPH shape bridge ──────────────────────────
+        # jNO delivers x with shape (1, H, W, 1) per sample
+        # [T-dim peeled by scan, B-dim peeled by vmap].
+        # MORPH needs (B, t, F, C, D, H, W).
+        # Output (B=1, F=1, C=1, D=1, H, W) is mapped back to (1, H, W, 1).
+        #
+        # We bake the reshape into the apply_fn closure so the wrapped
+        # object stays a FlaxModelWrapper — this is required for the
+        # Flax msgpack weight-loading path in jNO's build_single_layer_params.
+        _base_apply = flax_model.apply
+
+        def morph_apply(params, x, **kwargs):
+            # x: (1, H, W, 1) — jNO per-sample input (channels-last 2-D)
+            H, W = x.shape[-3], x.shape[-2]
+            vol = x.reshape(1, 1, 1, 1, 1, H, W)  # → (B,t,F,C,D,H,W)
+            _enc, _z, x_last = _base_apply(params, vol, **kwargs)
+            return x_last.reshape(1, H, W, 1)  # → (1, H, W, 1)
+
+        wrapped = FlaxModelWrapper(
+            morph_apply,
+            params,
+            deterministic=True,
+        )
+        return cls.wrap(wrapped, name=name)
+
+    @classmethod
+    def morphTi(
+        cls,
+        spatial_size: int = 128,
+    ) -> FlaxModule:
+        """
+        MORPH-Ti (Tiny) foundation model.
+
+        Creates a fresh model. To load pretrained weights call
+        ``model.initialize(weight_path)`` afterwards.
+
+        Args:
+            spatial_size: Spatial resolution H=W of the input grid
+                (must be divisible by 8).  Used for the dummy init
+                forward pass.  Default: 128.
+
+        Returns:
+            FlaxModule wrapping the MORPH-Ti model.
+
+        Example::
+
+            u = nn.morphTi()
+            u.initialize("morph-Ti.msgpack")
+
+        Reference:
+            Rautela et al., "MORPH: PDE Foundation Models with Arbitrary
+            Data Modality" (2025)
+        """
+        return cls._morph(
+            "morph_Ti",
+            dim=256,
+            depth=4,
+            heads=4,
+            mlp_dim=1024,
+            max_ar=1,
+            model_size="Ti",
+            spatial_size=spatial_size,
+        )
+
+    @classmethod
+    def morphS(
+        cls,
+        spatial_size: int = 128,
+    ) -> FlaxModule:
+        """
+        MORPH-S (Small) foundation model.
+
+        Creates a fresh model. To load pretrained weights call
+        ``model.initialize(weight_path)`` afterwards.
+
+        Args:
+            spatial_size: Spatial resolution H=W (must be divisible by 8).
+                Default: 128.
+
+        Returns:
+            FlaxModule wrapping the MORPH-S model.
+
+        Example::
+
+            u = nn.morphS()
+            u.initialize("morph-S.msgpack")
+
+        Reference:
+            Rautela et al., "MORPH: PDE Foundation Models with Arbitrary
+            Data Modality" (2025)
+        """
+        return cls._morph(
+            "morph_S",
+            dim=512,
+            depth=4,
+            heads=8,
+            mlp_dim=2048,
+            max_ar=1,
+            model_size="S",
+            spatial_size=spatial_size,
+        )
+
+    @classmethod
+    def morphM(
+        cls,
+        spatial_size: int = 128,
+    ) -> FlaxModule:
+        """
+        MORPH-M (Medium) foundation model.
+
+        Creates a fresh model. To load pretrained weights call
+        ``model.initialize(weight_path)`` afterwards.
+
+        Args:
+            spatial_size: Spatial resolution H=W (must be divisible by 8).
+                Default: 128.
+
+        Returns:
+            FlaxModule wrapping the MORPH-M model.
+
+        Example::
+
+            u = nn.morphM()
+            u.initialize("morph-M.msgpack")
+
+        Reference:
+            Rautela et al., "MORPH: PDE Foundation Models with Arbitrary
+            Data Modality" (2025)
+        """
+        return cls._morph(
+            "morph_M",
+            dim=768,
+            depth=8,
+            heads=12,
+            mlp_dim=3072,
+            max_ar=1,
+            model_size="M",
+            spatial_size=spatial_size,
+        )
+
+    @classmethod
+    def morphL(
+        cls,
+        spatial_size: int = 128,
+    ) -> FlaxModule:
+        """
+        MORPH-L (Large) foundation model.
+
+        Creates a fresh model. To load pretrained weights call
+        ``model.initialize(weight_path)`` afterwards.
+
+        Args:
+            spatial_size: Spatial resolution H=W (must be divisible by 8).
+                Default: 128.
+
+        Returns:
+            FlaxModule wrapping the MORPH-L model.
+
+        Example::
+
+            u = nn.morphL()
+            u.initialize("morph-L.msgpack")
+
+        Reference:
+            Rautela et al., "MORPH: PDE Foundation Models with Arbitrary
+            Data Modality" (2025)
+        """
+        return cls._morph(
+            "morph_L",
+            dim=1024,
+            depth=16,
+            heads=16,
+            mlp_dim=4096,
+            max_ar=16,
+            model_size="L",
+            spatial_size=spatial_size,
+        )
+
+    # =========================================================================
+    # MPP Foundation Models
+    # =========================================================================
+
+    @classmethod
+    def _mpp(
+        cls,
+        name: str,
+        variant: str,
+        spatial_size: int = 128,
+        num_channels: int = 1,
+    ) -> FlaxModule:
+        """Internal helper that builds a fresh MPP/AViT model.
+
+        jNO's vmap+scan pipeline delivers one sample at a time to the model.
+        For a domain storing ``_f`` as ``(S, 1, 1, H, W, 1)`` (Poseidon layout),
+        each sample arrives as ``(1, H, W, 1)`` after B is vmapped
+        and T is scanned.  MPP/AViT expects ``(T, B, C, H, W)``
+        (time-first, channels-first).  An adapter closure reshapes
+        in both directions so the jNO interface is identical to the
+        other foundation models.
+
+        Args:
+            name: Display name (e.g. ``"mpp_Ti"``).
+            variant: One of ``'Ti'``, ``'S'``, ``'B'``, ``'L'``.
+            spatial_size: Spatial resolution H=W. Default: 128.
+            num_channels: Number of active state-variable channels.
+                Default: 1 (suitable for Poisson, heat equation, etc.).
+        """
+        cfg = AVIT_CONFIGS[variant]
+        flax_model = MPPModel(**cfg)
+
+        # Init params with matched dummy input.
+        S = spatial_size
+        rng = jax.random.PRNGKey(0)
+        dummy_x = jnp.ones((1, 1, num_channels, S, S))  # (T=1, B=1, C, H, W)
+        state_labels = jnp.arange(num_channels, dtype=jnp.int32)
+        dummy_bcs = jnp.zeros((1, 2), dtype=jnp.int32)
+        params = flax_model.init(
+            {"params": rng, "drop_path": rng},
+            dummy_x,
+            state_labels,
+            dummy_bcs,
+            deterministic=True,
+        )
+
+        # Store state_labels as tuple for static eqx field.
+        state_labels_tup = tuple(int(s) for s in state_labels)
+
+        # ── Adapter: jNO ↔ MPP shape bridge ─────────────────────────
+        _base_apply = flax_model.apply
+
+        def mpp_apply(params, x, **kwargs):
+            # x: (1, H, W, 1) — jNO per-sample input (channels-last 2-D)
+            H, W = x.shape[-3], x.shape[-2]
+            C = x.shape[-1]
+            # → (T=1, B=1, C, H, W)  channels-first, time-first
+            vol = x.reshape(1, 1, C, H, W)
+            sl = jnp.array(state_labels_tup, dtype=jnp.int32)
+            bcs = jnp.zeros((1, 2), dtype=jnp.int32)
+            out = _base_apply(params, vol, sl, bcs, deterministic=True)
+            # out: (B=1, C, H, W) → (1, H, W, C)
+            return out[0].transpose(1, 2, 0).reshape(1, H, W, C)
+
+        wrapped = FlaxModelWrapper(
+            mpp_apply,
+            params,
+            deterministic=True,
+        )
+        return cls.wrap(wrapped, name=name)
+
+    @classmethod
+    def mppTi(
+        cls,
+        spatial_size: int = 128,
+        num_channels: int = 1,
+    ) -> FlaxModule:
+        """
+        MPP-Ti (Tiny) foundation model (~7.3 M parameters).
+
+        Creates a fresh model. To load pretrained weights call
+        ``model.initialize(weight_path)`` afterwards.
+
+        Args:
+            spatial_size: Spatial resolution H=W. Default: 128.
+            num_channels: Number of active state channels. Default: 1.
+
+        Returns:
+            FlaxModule wrapping the MPP-Ti model.
+
+        Example::
+
+            u = nn.mppTi()
+            u.initialize("mpp-Ti.msgpack")
+
+        Reference:
+            McCabe et al., "Multiple Physics Pretraining for Physical
+            Surrogate Models" (NeurIPS 2024)
+        """
+        return cls._mpp("mpp_Ti", "Ti", spatial_size, num_channels)
+
+    @classmethod
+    def mppS(
+        cls,
+        spatial_size: int = 128,
+        num_channels: int = 1,
+    ) -> FlaxModule:
+        """
+        MPP-S (Small) foundation model.
+
+        See :meth:`mppTi` for full documentation.
+        """
+        return cls._mpp("mpp_S", "S", spatial_size, num_channels)
+
+    @classmethod
+    def mppB(
+        cls,
+        spatial_size: int = 128,
+        num_channels: int = 1,
+    ) -> FlaxModule:
+        """
+        MPP-B (Base) foundation model.
+
+        See :meth:`mppTi` for full documentation.
+        """
+        return cls._mpp("mpp_B", "B", spatial_size, num_channels)
+
+    @classmethod
+    def mppL(
+        cls,
+        spatial_size: int = 128,
+        num_channels: int = 1,
+    ) -> FlaxModule:
+        """
+        MPP-L (Large) foundation model.
+
+        See :meth:`mppTi` for full documentation.
+        """
+        return cls._mpp("mpp_L", "L", spatial_size, num_channels)
+
+    # =========================================================================
+    # PDEformer-2 Foundation Models
+    # =========================================================================
+
+    @staticmethod
+    def _pdeformer2_bake_dag(dag_inputs: dict) -> dict:
+        """Normalise raw DAG arrays into batched ``jnp`` tensors.
+
+        ``build_dag_inputs`` returns unbatched numpy arrays.  This helper
+        converts them to ``jnp`` arrays and adds a leading ``n_graph=1``
+        dimension when missing, so they can be stored in the ``apply_fn``
+        closure as constants.
+        """
+        _expect_ndim = {
+            "node_type": 3,  # (1, n_node, 1)
+            "node_scalar": 3,  # (1, num_scalar, 1)
+            "node_function": 4,  # (1, num_func, pts, 5)
+            "in_degree": 2,  # (1, n_node)
+            "out_degree": 2,  # (1, n_node)
+            "attn_bias": 3,  # (1, n_node, n_node)
+            "spatial_pos": 3,  # (1, n_node, n_node)
+        }
+        out = {}
+        for k, target_ndim in _expect_ndim.items():
+            v = jnp.asarray(dag_inputs[k])
+            if v.ndim == target_ndim - 1:
+                v = v[jnp.newaxis]
+            out[k] = v
+        return out
+
+    @classmethod
+    def _pdeformer2(
+        cls,
+        name: str,
+        config: dict,
+        dag_inputs: Optional[dict],
+        num_points: int,
+    ) -> FlaxModule:
+        """Internal helper that builds a fresh PDEformer-2 model.
+
+        Args:
+            name: Display name (e.g. ``"pdeformer2_small"``).
+            config: One of ``PDEFORMER_SMALL_CONFIG``,
+                ``PDEFORMER_BASE_CONFIG``, ``PDEFORMER_FAST_CONFIG``.
+            dag_inputs: Optional dict from ``build_dag_inputs``.  When
+                provided the static DAG arrays are baked into the model
+                and the user only needs to pass ``coordinate`` at call
+                time.
+            num_points: Number of query coordinates for the INR decoder
+                (used only in the dummy init when *dag_inputs* is
+                ``None``).
+        """
+        flax_model = create_pdeformer_from_config({"model": config})
+
+        # Derive sizes from config
+        func_cfg = config.get("function_encoder", {})
+        num_branches = func_cfg.get("num_branches", 4)
+        resolution = func_cfg.get("resolution", 128)
+
+        dummy = _pdeformer2_dummy_inputs(
+            n_graph=1,
+            num_scalar=80,
+            num_function=6,
+            num_branches=num_branches,
+            num_points_function=resolution**2,
+            num_points=num_points,
+        )
+
+        rng = jax.random.PRNGKey(0)
+        params = flax_model.init(rng, **dummy)
+
+        if dag_inputs is not None:
+            # Bake static DAG arrays into the apply closure so the user
+            # only passes ``coordinate`` at call time.
+            static_dag = cls._pdeformer2_bake_dag(dag_inputs)
+            base_apply = flax_model.apply
+
+            def dag_apply(params, coordinate, **kwargs):
+                # jNO evaluator passes (N, 4); model expects (1, N, 4)
+                coord = coordinate[None] if coordinate.ndim == 2 else coordinate
+                out = base_apply(
+                    params,
+                    **static_dag,
+                    coordinate=coord,
+                    **kwargs,
+                )
+                return out[0]  # (1, N, 1) → (N, 1)
+
+            wrapped = FlaxModelWrapper(dag_apply, params, deterministic=True)
+        else:
+            wrapped = FlaxModelWrapper(
+                flax_model.apply,
+                params,
+                deterministic=True,
+            )
+
+        return cls.wrap(wrapped, name=name)
+
+    @classmethod
+    def pdeformer2_small(
+        cls,
+        dag_inputs: Optional[dict] = None,
+        num_points: int = 1000,
+    ) -> FlaxModule:
+        """PDEformer-2-Small foundation model (~27 M parameters).
+
+        Creates a fresh model.  Call ``.initialize(weight_path)`` to load
+        pretrained weights from a ``.msgpack`` file.
+
+        The model encodes a PDE as a directed acyclic graph (DAG) whose
+        nodes carry scalar coefficients and function data (initial /
+        boundary conditions).  A Graphormer encodes the DAG, and an
+        implicit neural representation (INR) with hyper-networks decodes
+        the solution at arbitrary query coordinates.
+
+        Args:
+            dag_inputs: Optional dict returned by ``build_dag_inputs``
+                containing the 7 static DAG tensors (``node_type``,
+                ``node_scalar``, ``node_function``, ``in_degree``,
+                ``out_degree``, ``attn_bias``, ``spatial_pos``).
+                When provided, the model only requires ``coordinate``
+                as input at call time.  When ``None``, all 8 tensors
+                must be passed as positional arguments.
+            num_points: Number of query coordinates (used only for
+                the dummy forward pass that creates the parameter
+                template).  Default 1 000.
+
+        Returns:
+            FlaxModule wrapping the PDEformer-2-Small model.
+
+        Example::
+
+            # With baked-in DAG (recommended):
+            dag = pde.gen_dag(uf_num_mod=11)
+            u = nn.pdeformer2_small(dag_inputs=dag)
+            u.initialize("pdeformer2-small.msgpack")
+            result = u(coordinate)  # only coordinate needed
+
+            # Without DAG (pass all 8 inputs):
+            u = nn.pdeformer2_small()
+            u.initialize("pdeformer2-small.msgpack")
+            result = u(node_type, node_scalar, node_function,
+                       in_degree, out_degree, attn_bias,
+                       spatial_pos, coordinate)
+
+        Reference:
+            Hao et al., "PDEformer 2" (2024)
+        """
+        return cls._pdeformer2(
+            "pdeformer2_small",
+            PDEFORMER_SMALL_CONFIG,
+            dag_inputs,
+            num_points,
+        )
+
+    @classmethod
+    def pdeformer2_base(
+        cls,
+        dag_inputs: Optional[dict] = None,
+        num_points: int = 1000,
+    ) -> FlaxModule:
+        """PDEformer-2-Base foundation model (~82 M parameters).
+
+        See :meth:`pdeformer2_small` for full documentation.
+
+        Example::
+
+            dag = pde.gen_dag(uf_num_mod=11)
+            u = nn.pdeformer2_base(dag_inputs=dag)
+            u.initialize("pdeformer2-base.msgpack")
+        """
+        return cls._pdeformer2(
+            "pdeformer2_base",
+            PDEFORMER_BASE_CONFIG,
+            dag_inputs,
+            num_points,
+        )
+
+    @classmethod
+    def pdeformer2_fast(
+        cls,
+        dag_inputs: Optional[dict] = None,
+        num_points: int = 1000,
+    ) -> FlaxModule:
+        """PDEformer-2-Fast foundation model (~71 M parameters).
+
+        See :meth:`pdeformer2_small` for full documentation.
+
+        Example::
+
+            dag = pde.gen_dag(uf_num_mod=11)
+            u = nn.pdeformer2_fast(dag_inputs=dag)
+            u.initialize("pdeformer2-fast.msgpack")
+        """
+        return cls._pdeformer2(
+            "pdeformer2_fast",
+            PDEFORMER_FAST_CONFIG,
+            dag_inputs,
+            num_points,
+        )

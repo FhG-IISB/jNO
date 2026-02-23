@@ -33,6 +33,8 @@ from .trace import (
     collect_operations,
     collect_tags,
     get_primary_tag,
+    dump_tree,
+    cse,
 )
 from .utils import LearningRateSchedule, WeightSchedule, statistics, get_logger, IREEModel
 from .utils.monitor import HardwareMonitor
@@ -194,23 +196,27 @@ class core(CoreUtilities):
         return jax.tree_util.tree_map(shard_leaf, params)
 
     def _shard_data(self, data: Dict) -> Dict:
-        """Apply sharding to training data."""
+        """Apply sharding to training data.
 
-        def shard_leaf(x):
+        Spatial arrays ``(B, T, N, D)`` are sharded along the batch axis.
+        The shared ``__time__`` array ``(T, 1)`` is fully replicated.
+        """
+
+        def shard_leaf(key, x):
             if isinstance(x, jnp.ndarray):
                 if x.ndim == 0:
-                    # Scalars: no sharding
                     return x
+                # __time__ is shared across batches — replicate
+                if key == "__time__":
+                    spec = P(*([None] * x.ndim))
                 elif x.ndim == 1:
-                    # 1D arrays: shard along the single axis (batch)
                     spec = P("batch")
                 else:
-                    # 2D+ arrays: shard along first axis (batch), replicate rest
                     spec = P("batch", *([None] * (x.ndim - 1)))
                 return jax.device_put(x, NamedSharding(self.mesh, spec))
             return x
 
-        return jax.tree_util.tree_map(shard_leaf, data)
+        return {k: shard_leaf(k, v) for k, v in data.items()}
 
     def _replicate_for_devices(self, data: Dict, n_devices: int) -> Dict:
         """Tile data to have leading dimension matching device count for data parallelism."""
@@ -458,6 +464,45 @@ class core(CoreUtilities):
 
         return step
 
+    def print_tree(self, file: str = None):
+        """Print the computation tree for every constraint and tracker.
+
+        Call this **after** constructing the ``core`` object (which calls
+        ``compile`` internally) so that ``self.constraints`` is populated.
+
+        Args:
+            file: Optional path.  When given the tree is written to that
+                file; otherwise it is printed to stdout.
+
+        Example::
+
+            crux = jno.core([pde.mse, ini.mse], domain)
+            crux.print_tree("tree.txt")
+        """
+        constraints = self.wrap_constraints(self.constraints)
+        parts: list[str] = []
+        for i, expr in enumerate(constraints):
+            if isinstance(expr, OperationDef) and isinstance(expr.expr, Tracker):
+                parts.append(f"=== Tracker {i} ===")
+                parts.append(dump_tree(expr))
+            elif isinstance(expr, Tracker):
+                parts.append(f"=== Tracker {i} ===")
+                parts.append(dump_tree(expr))
+            else:
+                parts.append(f"=== Constraint {i} ===")
+                parts.append(dump_tree(expr))
+            parts.append("")
+
+        text = "\n".join(parts)
+        if file is not None:
+            from pathlib import Path as _P
+
+            _P(file).parent.mkdir(parents=True, exist_ok=True)
+            _P(file).write_text(text)
+            self.log.info(f"Computation tree written to {file}")
+        else:
+            print(text)
+
     def compile(self, mesh: tuple = (1, 1)):
 
         # === Parallelism ===
@@ -467,6 +512,10 @@ class core(CoreUtilities):
         constraints = self.wrap_constraints(self.constraints)
 
         # === Collect operations and tags ===
+        self.all_ops = self.collect_unique_operations(constraints)
+
+        # === CSE: deduplicate shared sub-expressions ===
+        constraints = [cse(c) for c in constraints]
         self.all_ops = self.collect_unique_operations(constraints)
 
         # === Prepare domain data ===
@@ -482,6 +531,8 @@ class core(CoreUtilities):
         # === Compile constraints and trackers ===
         self.compiled_constraints = []
         self.compiled_trackers = []
+        self._constraint_exprs = []  # raw expressions for shape tracing
+        self._tracker_exprs = []
         for expr in constraints:
             # Unwrap Tracker nodes — compile the inner expression,
             # but route it to the tracker list instead of constraints.
@@ -497,8 +548,10 @@ class core(CoreUtilities):
             fn_expr = TraceEvaluator.compile_traced_expression(inner, self.all_ops)
             if tracker_interval is not None:
                 self.compiled_trackers.append((tracker_interval, fn_expr))
+                self._tracker_exprs.append(inner)
             else:
                 self.compiled_constraints.append(fn_expr)
+                self._constraint_exprs.append(inner)
 
         # self.log.info(f"There are a total of {self.count(self.models)} trainable parameters in the network/s.")
         return None
@@ -559,22 +612,84 @@ class core(CoreUtilities):
             if fm._lora_config is not None:
                 rank, alpha = fm._lora_config
                 self.rng, key = jax.random.split(self.rng)
+                model_before = models[lid]
                 models[lid] = _apply_lora(models[lid], rank, alpha, key=key)
-                self.log.info(f"LoRA applied to model {lid} (rank={rank}, alpha={alpha})")
+                model_after = models[lid]
+
+                # ── LoRA diagnostic logging ──
+                from .architectures.lora_linear import LoRALinear, FlaxLoRAWrapper
+
+                n_arrays_before = sum(1 for l in jax.tree_util.tree_leaves(model_before) if eqx.is_array(l))
+                n_arrays_after = sum(1 for l in jax.tree_util.tree_leaves(model_after) if eqx.is_array(l))
+                n_params_before = sum(l.size for l in jax.tree_util.tree_leaves(model_before) if eqx.is_array(l))
+                n_params_after = sum(l.size for l in jax.tree_util.tree_leaves(model_after) if eqx.is_array(l))
+                n_lora_params = n_params_after - n_params_before
+
+                if isinstance(model_after, FlaxLoRAWrapper):
+                    # Count LoRA layers from the Flax lora_params dict
+                    n_lora_layers = sum(1 for l in jax.tree_util.tree_leaves(model_after.lora_params) if eqx.is_array(l)) // 2  # each layer has lora_a + lora_b
+                    self.log.info(f"LoRA (Flax) applied to model {lid} (rank={rank}, alpha={alpha}): " f"{n_lora_layers} kernel layers adapted, " f"{n_lora_params:,} new LoRA params, " f"base frozen at {n_params_before:,} params")
+                else:
+                    from .architectures.linear import Linear as JNOLinear
+
+                    is_lora = lambda x: isinstance(x, LoRALinear)
+                    lora_leaves_after = [l for l in jax.tree_util.tree_leaves(model_after, is_leaf=is_lora) if isinstance(l, LoRALinear)]
+                    n_lora_layers = len(lora_leaves_after)
+                    self.log.info(f"LoRA applied to model {lid} (rank={rank}, alpha={alpha}): " f"{n_lora_layers} LoRALinear layers, " f"Params: {n_params_before:,}→{n_params_after:,}")
+                    if n_lora_layers == 0:
+                        self.log.warning(f"LoRA: No layers were adapted for model {lid}! " f"LoRA has NO EFFECT on this model.")
+
+                # Write detailed LoRA report to log directory
+                if hasattr(self.log, "path") and self.log.path is not None:
+                    import os
+
+                    lora_report_path = os.path.join(str(self.log.path), "lora_report.txt")
+                    with open(lora_report_path, "w") as f:
+                        f.write(f"LoRA Diagnostic Report for model {lid}\n")
+                        f.write(f"{'='*60}\n")
+                        f.write(f"Requested: rank={rank}, alpha={alpha}\n")
+                        f.write(f"Model type: {type(model_before).__name__}\n")
+                        f.write(f"Wrapper type: {type(model_after).__name__}\n")
+                        f.write(f"LoRA layers adapted:        {n_lora_layers}\n")
+                        f.write(f"Total arrays before LoRA:   {n_arrays_before}\n")
+                        f.write(f"Total arrays after LoRA:    {n_arrays_after}\n")
+                        f.write(f"Total params before LoRA:   {n_params_before:,}\n")
+                        f.write(f"Total params after LoRA:    {n_params_after:,}\n")
+                        f.write(f"New LoRA params:            {n_lora_params:,}\n\n")
+
+                        if isinstance(model_after, FlaxLoRAWrapper):
+                            f.write("Adapted kernels (lora_a / lora_b shapes):\n")
+                            flat, _ = jax.tree_util.tree_flatten_with_path(model_after.lora_params)
+                            for path, leaf in flat:
+                                if eqx.is_array(leaf):
+                                    path_str = "/".join(str(k) for k in path)
+                                    f.write(f"  {path_str}: {leaf.shape} {leaf.dtype}\n")
+                        else:
+                            f.write("Full pytree paths (after LoRA):\n")
+                            flat, _ = jax.tree_util.tree_flatten_with_path(model_after)
+                            for path, leaf in flat:
+                                if eqx.is_array(leaf):
+                                    path_str = "/".join(str(k) for k in path)
+                                    f.write(f"  {path_str}: {leaf.shape} {leaf.dtype}\n")
+
+                    self.log.info(f"LoRA diagnostic report written to {lora_report_path}")
 
         # ── 3. Build trainable filter ──
         filter_spec = {}
         for lid, model in models.items():
             fm = flax_mods.get(lid)
             if fm is not None and fm._frozen:
-                # Whole model frozen – every array → False
-                filter_spec[lid] = jax.tree_util.tree_map(lambda l: False if eqx.is_array(l) else l, model)
+                # Whole model frozen – no arrays trainable
+                filter_spec[lid] = jax.tree_util.tree_map(lambda l: False, model)
             elif fm is not None and fm._lora_config is not None:
                 # LoRA – base frozen, lora_A/B trainable
                 filter_spec[lid] = _lora_trainable_filter(model)
             else:
-                # Normal – every array trainable
-                filter_spec[lid] = jax.tree_util.tree_map(lambda l: True if eqx.is_array(l) else l, model)
+                # Normal – every array trainable, non-arrays (e.g. activation
+                # functions stored as attributes) must be False, not the
+                # original value — equinox interprets callables in the
+                # filter spec as sub-filters.
+                filter_spec[lid] = jax.tree_util.tree_map(lambda l: True if eqx.is_array(l) else False, model)
 
         # ── 4. Three-way partition ──
         trainable, rest = eqx.partition(models, filter_spec)
@@ -750,7 +865,7 @@ class core(CoreUtilities):
                 # --- prepare context for this step ---
                 if offload_data:
                     indices = rng_np.choice(total_samples, batchsize, replace=False)
-                    batch_np = {k: v[indices] for k, v in host_context.items()}
+                    batch_np = {k: np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices] for k, v in host_context.items()}
                     context = self._shard_data(jax.device_put(batch_np))
                 else:
                     context = on_device_context
@@ -863,7 +978,12 @@ class core(CoreUtilities):
         return statistics(self.training_logs)
 
     def _log_constraint_shapes(self, batchsize):
-        """Log the output shape of each constraint by doing a test evaluation."""
+        """Log the output shape of each constraint by doing a test evaluation.
+
+        When the log level is DEBUG, prints a full shape-annotated tree
+        for each constraint so users can see how shapes evolve through
+        every node of the expression.
+        """
 
         # Create dummy inputs for shape inference
         test_rng = jax.random.PRNGKey(0)
@@ -895,7 +1015,96 @@ class core(CoreUtilities):
             else:
                 self.log.info(f"Tracker {i}: {out_shape}")
 
+        # === Detailed shape trace (logged at DEBUG level) ===
+        if hasattr(self.log, "isEnabledFor") and self.log.isEnabledFor(10):
+            self._log_shape_traces()
+
         return None
+
+    def _build_shape_context(self) -> dict:
+        """Build a single-sample, single-timestep context for shape tracing.
+
+        The compiled expression uses ``vmap(B) → scan(T) → eval(...)``.
+        This method strips the B and T axes so that shape tracing sees
+        the same per-sample shapes the evaluator sees at runtime.
+
+        Returns a plain dict mapping tag → array.
+        """
+        ctx_single = {}
+        for tag, arr in self.domain_data.context.items():
+            arr = jnp.asarray(arr)
+            if tag == "__time__":
+                # (T, 1) → first time step → (1,)
+                ctx_single[tag] = arr[0]
+            elif arr.ndim >= 3:
+                # (B, T, ...) → strip batch + time → (...)
+                # Covers (B,T,N,D), (B,T,C,H,W,C_out), etc.
+                ctx_single[tag] = arr[0, 0]
+            elif arr.ndim == 2:
+                # (B, F) parametric → (F,)
+                ctx_single[tag] = arr[0]
+            else:
+                ctx_single[tag] = arr
+        return ctx_single
+
+    def _log_shape_traces(self):
+        """Emit per-node shape trees for constraints and trackers.
+
+        Called automatically when log level is DEBUG, or on demand via
+        ``core.print_shapes()``.
+        """
+        ctx_single = self._build_shape_context()
+        evaluator = TraceEvaluator(self.models)
+
+        all_exprs = getattr(self, "_constraint_exprs", [])
+        all_tracker_exprs = getattr(self, "_tracker_exprs", [])
+
+        for i, expr in enumerate(all_exprs):
+            try:
+                tree = evaluator.trace_shapes(expr, ctx_single, key=jax.random.PRNGKey(0))
+                self.log.debug(f"Constraint {i} shape trace:\n{tree}")
+            except Exception as exc:
+                self.log.debug(f"Constraint {i} shape trace failed: {exc}")
+
+        for i, expr in enumerate(all_tracker_exprs):
+            try:
+                tree = evaluator.trace_shapes(expr, ctx_single, key=jax.random.PRNGKey(0))
+                self.log.debug(f"Tracker {i} shape trace:\n{tree}")
+            except Exception as exc:
+                self.log.debug(f"Tracker {i} shape trace failed: {exc}")
+
+    def print_shapes(self):
+        """Print shape-annotated expression trees to stdout.
+
+        Can be called any time after ``compile()`` or ``solve()`` has
+        run.  Useful for troubleshooting shape mismatches::
+
+            crux = jno.core([pde.mse, ini.mse], domain)
+            crux.print_shapes()
+        """
+        ctx_single = self._build_shape_context()
+        evaluator = TraceEvaluator(self.models)
+
+        all_exprs = getattr(self, "_constraint_exprs", [])
+        all_tracker_exprs = getattr(self, "_tracker_exprs", [])
+
+        for i, expr in enumerate(all_exprs):
+            try:
+                tree = evaluator.trace_shapes(expr, ctx_single, key=jax.random.PRNGKey(0))
+                print(f"═══ Constraint {i} ═══")
+                print(tree)
+                print()
+            except Exception as exc:
+                print(f"═══ Constraint {i} ═══  FAILED: {exc}")
+
+        for i, expr in enumerate(all_tracker_exprs):
+            try:
+                tree = evaluator.trace_shapes(expr, ctx_single, key=jax.random.PRNGKey(0))
+                print(f"═══ Tracker {i} ═══")
+                print(tree)
+                print()
+            except Exception as exc:
+                print(f"═══ Tracker {i} ═══  FAILED: {exc}")
 
     def sweep(
         self,

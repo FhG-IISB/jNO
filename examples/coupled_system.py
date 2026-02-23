@@ -129,11 +129,11 @@ domain = 2 * jno.domain(constructor=rect(mesh_size=0.1))
 # domain = jno.domain('./runs/mesh.msh')
 
 # Sample all points in the mesh tagged as "interior".
-x, y = domain.variable("interior", (None, None))
+x, y, t = domain.variable("interior", (None, None))
 
 # Additional geometric quantities can be extracted from the mesh.
 # Here we request boundary points, outward normals, and view-related operators.
-xb, yb, nx, ny, VF = domain.variable("boundary", (None, None), normals=True, view_factor=True)
+xb, yb, tb, nx, ny, VF = domain.variable("boundary", (None, None), normals=True, view_factor=True)
 
 # Point-like quantities (e.g. sensor locations) can be added as arrays.
 # The required shape is (B, N, dim).

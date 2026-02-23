@@ -39,6 +39,8 @@ __all__ = [
     "collect_operations",
     "collect_tags",
     "get_primary_tag",
+    "dump_tree",
+    "cse",
 ]
 
 # Global counter for unique operation IDs
@@ -215,7 +217,13 @@ class Placeholder:
 
     @property
     def mse(self):
-        return FunctionCall(lambda x: jnp.squeeze(jnp.mean(jnp.square(x))), [self], "mse", True)
+        def fn(x):
+
+            print(f"Shape before .mse {x.shape}")
+
+            return jnp.squeeze(jnp.mean(jnp.square(x)))
+
+        return FunctionCall(fn, [self], "mse", True)
 
     @property
     def mae(self):
@@ -619,11 +627,18 @@ class Variable(Placeholder):
 
     Carries the domain tag and dimension index so the solver can bind sampled
     coordinates when evaluating traced expressions.
+
+    For time-dependent problems, spatial variables (``axis='spatial'``) index
+    into the spatial context array ``context[tag]`` shaped ``(N, D_spatial)``
+    (after the outer B and T vmaps peel off their axes).  The temporal
+    variable (``axis='temporal'``) reads from a separate
+    ``context["__time__"]`` entry that is a scalar (after the T vmap).
     """
 
-    def __init__(self, tag: str, dim: list, domain=None):
+    def __init__(self, tag: str, dim: list, domain=None, axis: str = "spatial"):
         self.tag = tag
         self.dim = dim
+        self.axis = axis  # 'spatial' or 'temporal'
         if tag in domain.context.keys():
             self.size = dim[1] - dim[0] if dim[1] is not None else domain.context[tag].shape[-1]
         else:
@@ -631,6 +646,8 @@ class Variable(Placeholder):
         self._domain = domain  # Reference to parent domain for inference
 
     def __repr__(self):
+        if self.axis == "temporal":
+            return f"Var(t)"
         return f"Var({self.tag}[{self.dim}])"
 
 
@@ -717,6 +734,7 @@ class FlaxModule(Placeholder):
         self._opt_fn = None  # optax optimizer factory / instance
         self._lr = None  # LearningRateSchedule or None
         self._dtype = None  # target dtype (e.g. jnp.bfloat16) or None
+        self._tunable_opts: Dict[str, list] = {}  # per-model tunable options for sweeps
 
     # ── public API ───────────────────────────────────────────
 
@@ -826,8 +844,58 @@ class FlaxModule(Placeholder):
         self._dtype = dtype
         return self
 
+    @property
+    def model_key(self) -> str:
+        """Stable key identifying this model in a sweep space."""
+        return self.name if self.name else f"model_{self.layer_id}"
+
+    def tune(self, *, freeze=None, lora=None, optimizer=None, lr=None, dtype=None):
+        """Declare per-model tunable options for hyperparameter sweeps.
+
+        Each argument accepts a list of candidate values.  During a sweep
+        the tuner searches over all combinations.
+
+        Args:
+            freeze: List of bool, e.g. ``[True, False]``.
+            lora: List of ``(rank, alpha)`` tuples **or** ``None`` values,
+                e.g. ``[(4, 1.0), (8, 1.0), None]``.
+            optimizer: List of optax factories, e.g. ``[optax.adam]``.
+            lr: List of :class:`LearningRateSchedule` objects.
+            dtype: List of dtypes, e.g. ``[jnp.float32, jnp.bfloat16]``.
+
+        Returns:
+            self (for chaining).
+
+        Example::
+
+            backbone = nn.poseidon(...)
+            backbone.initialize("weights.msgpack")
+            backbone.tune(
+                freeze=[True, False],
+                lora=[(4, 1.0), None],
+                optimizer=[optax.adam],
+                lr=[lrs.constant(1e-4), lrs.constant(1e-5)],
+            )
+        """
+        self._tunable_opts = {}
+        if freeze is not None:
+            self._tunable_opts["freeze"] = list(freeze)
+        if lora is not None:
+            self._tunable_opts["lora"] = list(lora)
+        if optimizer is not None:
+            self._tunable_opts["optimizer"] = list(optimizer)
+        if lr is not None:
+            self._tunable_opts["lr"] = list(lr)
+        if dtype is not None:
+            self._tunable_opts["dtype"] = list(dtype)
+        return self
+
     def reset(self):
-        """Reset all training configuration to defaults."""
+        """Reset all training configuration to defaults.
+
+        .. note:: This does **not** clear ``_tunable_opts`` — those
+           persist across trials so that the tuner can re-apply them.
+        """
         self._frozen = False
         self._lora_config = None
         self._opt_fn = None
@@ -897,7 +965,11 @@ class FlaxModuleCall(Placeholder):
         uv_net = pnp.nn.wrap(MLP())
         result = uv_net(x, y)  # Creates FlaxModuleCall
 
-    Call .dont_show to not display the model
+    All training-configuration methods (``freeze``, ``lora``, ``optimizer``,
+    ``dtype``, ``initialize``, ``tune``) are proxied to the underlying
+    :class:`FlaxModule` so you can chain them after the call::
+
+        u = nn.mlp(2, 64, 1)(x, y).freeze()
     """
 
     def __init__(self, model: FlaxModule, args: list):
@@ -909,9 +981,40 @@ class FlaxModuleCall(Placeholder):
         args_str = ", ".join(str(a) for a in self.args)
         return f"{self.model}({args_str})"
 
+    # ── proxied helpers (delegate to FlaxModule) ─────────────
+
     def dont_show(self):
         """If called will NOT display the network architecture."""
         self.model.show = False
+        return self
+
+    def freeze(self):
+        self.model.freeze()
+        return self
+
+    def unfreeze(self):
+        self.model.unfreeze()
+        return self
+
+    def lora(self, rank: int = 4, alpha: float = 1.0):
+        self.model.lora(rank, alpha)
+        return self
+
+    def optimizer(self, opt_fn, *, lr=None):
+        self.model.optimizer(opt_fn, lr=lr)
+        return self
+
+    def initialize(self, weight_path: str):
+        self.model.initialize(weight_path)
+        return self
+
+    def dtype(self, dtype):
+        self.model.dtype(dtype)
+        return self
+
+    def tune(self, **kwargs):
+        """Proxy for :meth:`FlaxModule.tune`."""
+        self.model.tune(**kwargs)
         return self
 
 
@@ -1075,6 +1178,147 @@ class Jacobian(Placeholder):
 
 
 # =============================================================================
+# Tree optimisation — Common Sub-expression Elimination (CSE)
+# =============================================================================
+
+
+def cse(expr: Placeholder) -> Placeholder:
+    """Eliminate common sub-expressions in a traced computation tree.
+
+    Walks *expr* bottom-up and replaces structurally identical sub-trees
+    with a single shared Python object.  Two nodes are considered
+    identical when they have the same type, the same static attributes
+    (operator, function identity, op_id, …) **and** the same children
+    (by ``id``).
+
+    The pass is safe to run multiple times and never changes semantics.
+
+    What gets deduplicated:
+
+    * ``OperationCall`` — same ``OperationDef`` + same argument
+      ``Variable``/``TensorTag`` objects (by identity).
+    * ``BinaryOp`` — same operator + same (already-deduped) children.
+    * ``FunctionCall`` — same ``fn`` + same (already-deduped) args.
+    * ``Jacobian`` / ``Hessian`` — same target + same variables.
+    * ``FlaxModuleCall`` — same model + same args.
+
+    Returns:
+        A (possibly shared) tree with duplicates collapsed.
+    """
+    # Maps a structural key → canonical node that was already built.
+    _canon: dict = {}
+
+    def _key(node):
+        """Return a hashable key for *node* assuming children are already canonical."""
+        if isinstance(node, Variable):
+            return ("Var", id(node))
+        if isinstance(node, TensorTag):
+            return ("Tag", id(node))
+        if isinstance(node, (Constant, Literal)):
+            return ("Const", id(node))
+        if isinstance(node, BinaryOp):
+            return ("Bin", node.op, id(node.left), id(node.right))
+        if isinstance(node, FunctionCall):
+            arg_ids = tuple(id(a) for a in node.args)
+            return ("Fn", id(node.fn), node._name, arg_ids)
+        if isinstance(node, FlaxModuleCall):
+            arg_ids = tuple(id(a) for a in node.args)
+            return ("Call", node.model.layer_id, arg_ids)
+        if isinstance(node, OperationCall):
+            arg_ids = tuple(id(a) for a in node.args)
+            return ("OpCall", node.operation.op_id, arg_ids)
+        if isinstance(node, OperationDef):
+            return ("OpDef", node.op_id, id(node.expr))
+        if isinstance(node, Jacobian):
+            var_ids = tuple(id(v) for v in node.variables)
+            return ("Jac", id(node.target), var_ids, node.scheme)
+        if isinstance(node, Hessian):
+            var_ids = tuple(id(v) for v in node.variables)
+            return ("Hess", id(node.target), var_ids, node.trace, node.scheme)
+        if isinstance(node, Concat):
+            return ("Cat", node.axis, tuple(id(i) for i in node.items))
+        if isinstance(node, Tracker):
+            return ("Track", id(node.expr), node.interval)
+        if isinstance(node, Slice):
+            return ("Slice", id(node.target), repr(node.key))
+        if isinstance(node, Reshape):
+            return ("Reshape", id(node.target), node.target_shape)
+        # Fallback — use object identity (no dedup possible)
+        return ("?", id(node))
+
+    def _visit(node):
+        """Post-order walk: canonicalise children first, then self."""
+        # Leaves — always canonical
+        if isinstance(node, (Variable, TensorTag, Constant, Literal)):
+            return node
+
+        # ── recurse into children and rebuild if anything changed ──
+        if isinstance(node, BinaryOp):
+            l = _visit(node.left)
+            r = _visit(node.right)
+            if l is not node.left or r is not node.right:
+                node = BinaryOp(node.op, l, r)
+        elif isinstance(node, FunctionCall):
+            new_args = [_visit(a) if isinstance(a, Placeholder) else a for a in node.args]
+            if any(n is not o for n, o in zip(new_args, node.args)):
+                node = FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
+        elif isinstance(node, FlaxModuleCall):
+            new_args = [_visit(a) if isinstance(a, Placeholder) else a for a in node.args]
+            if any(n is not o for n, o in zip(new_args, node.args)):
+                new_node = FlaxModuleCall(node.model, new_args)
+                new_node.op_id = node.op_id
+                node = new_node
+        elif isinstance(node, OperationDef):
+            new_expr = _visit(node.expr)
+            if new_expr is not node.expr:
+                new_node = OperationDef.__new__(OperationDef)
+                new_node.expr = new_expr
+                new_node.input_vars = node.input_vars
+                new_node.op_id = node.op_id
+                new_node._collected_vars = node._collected_vars
+                new_node.has_trainable = node.has_trainable
+                node = new_node
+        elif isinstance(node, OperationCall):
+            new_op = _visit(node.operation)
+            new_args = tuple(_visit(a) if isinstance(a, Placeholder) else a for a in node.args)
+            if new_op is not node.operation or any(n is not o for n, o in zip(new_args, node.args)):
+                node = OperationCall(new_op, new_args)
+        elif isinstance(node, Jacobian):
+            new_target = _visit(node.target)
+            if new_target is not node.target:
+                node = Jacobian(new_target, node.variables, node.scheme)
+        elif isinstance(node, Hessian):
+            new_target = _visit(node.target)
+            if new_target is not node.target:
+                node = Hessian(new_target, node.variables, node.scheme, node.trace)
+        elif isinstance(node, Concat):
+            new_items = [_visit(i) for i in node.items]
+            if any(n is not o for n, o in zip(new_items, node.items)):
+                node = Concat(new_items, node.axis)
+        elif isinstance(node, Tracker):
+            new_expr = _visit(node.expr)
+            if new_expr is not node.expr:
+                node = Tracker(new_expr, node.interval)
+        elif isinstance(node, Slice):
+            new_target = _visit(node.target)
+            if new_target is not node.target:
+                node = Slice(new_target, node.key)
+        elif isinstance(node, Reshape):
+            new_target = _visit(node.target)
+            if new_target is not node.target:
+                node = Reshape(new_target, node.target_shape)
+
+        # ── dedup: if we've seen an identical node, return the earlier one ──
+        k = _key(node)
+        if k in _canon:
+            return _canon[k]
+        _canon[k] = node
+        return node
+
+    return _visit(expr)
+
+
+# =============================================================================
 # Evaluation engine
 # =============================================================================
 
@@ -1179,3 +1423,128 @@ def get_primary_tag(expr: Placeholder) -> str:
     """Return the first Variable tag found in the expression tree."""
     tags = collect_tags(expr)
     return next(iter(tags)) if tags else None
+
+
+def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
+    """Return a human-readable indented string of the expression tree.
+
+    Args:
+        expr:   Any trace node (Placeholder subclass).
+        indent: Current indentation level (used by recursion).
+        seen:   Set of already-visited ``OperationDef.op_id`` values to
+                avoid infinite recursion on shared sub-graphs.
+
+    Returns:
+        Multi-line string with the full computation tree.
+
+    Example::
+
+        tree_str = dump_tree(pde)
+        print(tree_str)
+        # or
+        with open("tree.txt", "w") as f:
+            f.write(tree_str)
+    """
+    if seen is None:
+        seen = set()
+    pad = "  " * indent
+    lines: list[str] = []
+
+    def _node_label(node) -> str:
+        """One-line label for a node (no children)."""
+        if isinstance(node, Variable):
+            return f"Variable({node.tag}[{node.dim}])"
+        if isinstance(node, TensorTag):
+            return f"TensorTag({node.tag})"
+        if isinstance(node, Constant):
+            val = node.value
+            if hasattr(val, "shape") and val.shape == ():
+                val = float(val)
+            return f"Constant({node.tag}.{node.key}={val})"
+        if isinstance(node, Literal):
+            return f"Literal({node.value})"
+        if isinstance(node, FlaxModule):
+            return f"FlaxModule(id={node.layer_id}, {type(node.module).__name__})"
+        if isinstance(node, (int, float)):
+            return str(node)
+        return type(node).__name__
+
+    def _visit(node, depth):
+        p = "  " * depth
+        if isinstance(node, Variable):
+            lines.append(f"{p}{_node_label(node)}")
+        elif isinstance(node, TensorTag):
+            lines.append(f"{p}{_node_label(node)}")
+        elif isinstance(node, (Constant, Literal)):
+            lines.append(f"{p}{_node_label(node)}")
+        elif isinstance(node, BinaryOp):
+            lines.append(f"{p}BinaryOp({node.op})")
+            _visit(node.left, depth + 1)
+            _visit(node.right, depth + 1)
+        elif isinstance(node, FunctionCall):
+            name = node._name or getattr(node.fn, "__name__", "fn")
+            lines.append(f"{p}FunctionCall({name})")
+            for arg in node.args:
+                if isinstance(arg, Placeholder):
+                    _visit(arg, depth + 1)
+                else:
+                    lines.append(f"{p}  {arg}")
+        elif isinstance(node, Concat):
+            lines.append(f"{p}Concat(axis={node.axis})")
+            for item in node.items:
+                _visit(item, depth + 1)
+        elif isinstance(node, FlaxModuleCall):
+            lines.append(f"{p}FlaxModuleCall({_node_label(node.model)})")
+            for arg in node.args:
+                if isinstance(arg, Placeholder):
+                    _visit(arg, depth + 1)
+                else:
+                    lines.append(f"{p}  {arg}")
+        elif isinstance(node, TunableModuleCall):
+            lines.append(f"{p}TunableModuleCall(id={node.model.layer_id})")
+            for arg in node.args:
+                if isinstance(arg, Placeholder):
+                    _visit(arg, depth + 1)
+        elif isinstance(node, OperationDef):
+            if node.op_id in seen:
+                vars_str = ", ".join(str(v) for v in node._collected_vars)
+                lines.append(f"{p}Op[{node.op_id}]({vars_str})  [already shown]")
+                return
+            seen.add(node.op_id)
+            vars_str = ", ".join(str(v) for v in node._collected_vars)
+            lines.append(f"{p}OperationDef[{node.op_id}] vars=({vars_str})")
+            _visit(node.expr, depth + 1)
+        elif isinstance(node, OperationCall):
+            args_str = ", ".join(str(a) for a in node.args)
+            lines.append(f"{p}OperationCall[{node.operation.op_id}]({args_str})")
+            _visit(node.operation, depth + 1)
+        elif isinstance(node, Hessian):
+            kind = "Laplacian" if node.trace else "Hessian"
+            vars_str = ", ".join(str(v) for v in node.variables)
+            lines.append(f"{p}{kind}([{vars_str}])")
+            _visit(node.target, depth + 1)
+        elif isinstance(node, Jacobian):
+            vars_str = ", ".join(str(v) for v in node.variables)
+            lines.append(f"{p}Jacobian([{vars_str}])")
+            _visit(node.target, depth + 1)
+        elif isinstance(node, Tracker):
+            lines.append(f"{p}Tracker(interval={node.interval})")
+            _visit(node.expr, depth + 1)
+        elif isinstance(node, Slice):
+            lines.append(f"{p}Slice({node.key})")
+            _visit(node.target, depth + 1)
+        elif isinstance(node, Reshape):
+            lines.append(f"{p}Reshape({node.target_shape})")
+            _visit(node.target, depth + 1)
+        elif isinstance(node, NewAxis):
+            lines.append(f"{p}NewAxis")
+        elif isinstance(node, ConstantNamespace):
+            lines.append(f"{p}ConstantNamespace({node._full_tag})")
+        elif isinstance(node, Placeholder):
+            # Fallback for any unknown Placeholder subclass
+            lines.append(f"{p}{repr(node)}")
+        else:
+            lines.append(f"{p}{node}")
+
+    _visit(expr, indent)
+    return "\n".join(lines)

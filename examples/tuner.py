@@ -13,13 +13,13 @@ dire = "./runs/tuner"
 jno.logger(dire)
 
 domain = jno.domain(constructor=jno.domain.disk(mesh_size=0.05))
-x, y = domain.variable("interior")
+x, y, t = domain.variable("interior")
 domain.plot(f"{dire}/train_domain.png")
 
 # Architecture space for the model
 a_space = jnn.tune.space()
 a_space.unique("act", [jnp.tanh, jax.nn.selu, jax.nn.gelu, jnp.sin], category="architecture")
-a_space.unique("hid", [32, 64, 128], category="architecture")
+a_space.unique("hid", [4, 8, 16], category="architecture")
 a_space.unique("dep", [2, 3, 4], category="architecture")
 
 
@@ -64,16 +64,50 @@ t_space.unique("optimizer", [optax.adam, optax.adamw])
 t_space.unique("learning_rate", [lrs.exponential(1e-3, 0.8, 10000, 1e-5), lrs.exponential(1e-2, 0.9, 5000, 1e-5), lrs.constant(1e-3)])
 t_space.unique("weight_schedule", [ws([1.0])])
 t_space.unique("batchsize", [1, 1])
-crux.sweep(space=t_space, optimizer=ng.optimizers.NGOpt, budget=4).plot(f"{dire}/best_training_history.png")
 
-
-# One training sweep, define extra space, optimizer and budget -> returns eval of best run
-crux.sweep(space=t_space, optimizer=ng.optimizers.NGOpt, budget=10).plot(f"{dire}/best_training_history.png")
-crux.sweep(space=t_space, optimizer=None, budget=None).plot(f"{dire}/best_training_history.png")
+crux.sweep(space=t_space, optimizer=ng.optimizers.NGOpt, budget=2).plot(f"{dire}/best_training_history.png")
 
 print(f"Best configuration: {crux.best_config}")
-
-# Inference
-tst_domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.01))
-crux.plot(operation=u, test_pts=tst_domain).savefig(f"{dire}/u_pred.png", dpi=300)
 crux.save(f"{dire}/crux.pkl")
+
+# ═══════════════════════════════════════════════════════════════════════
+# Per-model tuning with .tune()
+# ═══════════════════════════════════════════════════════════════════════
+#
+# Instead of (or in addition to) a global training space, you can attach
+# tunable options directly to each model.  The tuner will search over all
+# per-model combinations automatically.
+#
+# Example: two-model problem where we tune whether the backbone is
+# frozen, which LoRA rank to use, and the per-model LR.
+
+print("\n\n=== Per-model .tune() demo ===\n")
+
+domain2 = jno.domain(constructor=jno.domain.disk(mesh_size=0.05))
+x2, y2 = domain2.variable("interior")
+
+# Model A — a small "backbone" that we might freeze or LoRA
+key2 = jax.random.PRNGKey(42)
+backbone = jnn.nn.mlp(2, output_dim=1, hidden_dims=16, num_layers=3, activation=jnp.tanh, key=key2)(x2, y2)
+backbone.dont_show()
+
+# Declare per-model tunable options
+backbone.tune(
+    freeze=[True, False],
+    lora=[(4, 1.0), None],  # try LoRA rank 4 or no LoRA
+    optimizer=[optax.adam],
+    lr=[lrs.constant(1e-3), lrs.constant(1e-4)],
+)
+
+_u2 = backbone * x2 * (1 - x2) * y2 * (1 - y2)
+pde2 = -jnn.laplacian(_u2, [x2, y2]) - 1.0
+
+crux2 = jno.core([pde2.mse], domain2)
+
+# Global space — only epochs
+space2 = jnn.tune.space()
+space2.unique("epochs", [200, 500])
+
+stats2 = crux2.sweep(space=space2, optimizer=ng.optimizers.NGOpt, budget=4)
+stats2.plot(f"{dire}/per_model_tune.png")
+print(f"Best config (per-model): {crux2.best_config}")

@@ -219,12 +219,19 @@ class Geometries:
         return constructor
 
     @staticmethod
-    def poseidon():
+    def poseidon(nx: int = 128, ny: int = 128):
         """
-        Create a structured grid needed for using the poseidon foundation model
+        Create a structured 2-D grid for foundation models (Poseidon, Walrus, …).
+
+        The grid has exactly ``nx × ny`` vertices on [0, 1]×[0, 1], matching
+        the pixel resolution that these models expect.  Triangulation and
+        boundary edge connectivity are built so that ``scheme='finite_difference'``
+        works out of the box with ``jnn.laplacian`` / ``jnn.grad``.
+
+        Args:
+            nx: Number of grid points along x.  Default 128.
+            ny: Number of grid points along y.  Default 128.
         """
-        nx = 128
-        ny = 128
         x_range = (0, 1)
         y_range = (0, 1)
 
@@ -235,24 +242,24 @@ class Geometries:
             y0 = y_range[0]
             y1 = y_range[1]
 
-            # Create structured grid points
-            x = np.linspace(x0, x1, nx + 1)
-            y = np.linspace(y0, y1, ny + 1)
+            # Create structured grid points — exactly nx × ny vertices
+            x = np.linspace(x0, x1, nx)
+            y = np.linspace(y0, y1, ny)
             xx, yy = np.meshgrid(x, y, indexing="ij")
 
-            # Flatten to create points array
-            points = np.column_stack([xx.ravel(), yy.ravel(), np.zeros((nx + 1) * (ny + 1))])
+            # Flatten to create points array (N = nx*ny, 3)
+            points = np.column_stack([xx.ravel(), yy.ravel(), np.zeros(nx * ny)])
 
             # Helper function to get point index
             def idx(i, j):
-                return i * (ny + 1) + j
+                return i * ny + j
 
             # =========================================================================
-            # Create triangles (2D cells)
+            # Create triangles (2D cells) — (nx-1)*(ny-1)*2 triangles
             # =========================================================================
             triangles = []
-            for i in range(nx):
-                for j in range(ny):
+            for i in range(nx - 1):
+                for j in range(ny - 1):
                     p0 = idx(i, j)
                     p1 = idx(i + 1, j)
                     p2 = idx(i + 1, j + 1)
@@ -272,20 +279,20 @@ class Geometries:
             right_edges = []
 
             # Bottom boundary (j = 0)
-            for i in range(nx):
+            for i in range(nx - 1):
                 bottom_edges.append([idx(i, 0), idx(i + 1, 0)])
 
-            # Top boundary (j = ny)
-            for i in range(nx):
-                top_edges.append([idx(i, ny), idx(i + 1, ny)])
+            # Top boundary (j = ny - 1)
+            for i in range(nx - 1):
+                top_edges.append([idx(i, ny - 1), idx(i + 1, ny - 1)])
 
             # Left boundary (i = 0)
-            for j in range(ny):
+            for j in range(ny - 1):
                 left_edges.append([idx(0, j), idx(0, j + 1)])
 
-            # Right boundary (i = nx)
-            for j in range(ny):
-                right_edges.append([idx(nx, j), idx(nx, j + 1)])
+            # Right boundary (i = nx - 1)
+            for j in range(ny - 1):
+                right_edges.append([idx(nx - 1, j), idx(nx - 1, j + 1)])
 
             bottom_edges = np.array(bottom_edges)
             top_edges = np.array(top_edges)
@@ -1836,23 +1843,25 @@ class domain(MeshUtils, Geometries):
         # Add time dimension if needed
         if self._is_time_dependent:
             self._add_time_dimension(time[0], time[1], time[2])
+        else:
+            # Stationary problems: store a constant time = 1 so that
+            # variable() always returns (x, y, t) consistently.
+            self.context["__time__"] = np.ones((1, 1))
 
         # Set up independent variable names
-        spatial_dims = self.dimension - (1 if self._is_time_dependent else 0)
+        # dimension is now purely spatial (time is a separate axis)
+        spatial_dims = self.dimension
         default_spatial = ["x", "y", "z"][:spatial_dims]
-        default_indep = default_spatial + (["t"] if self._is_time_dependent else [])
+        default_indep = default_spatial + ["t"]
 
         self.indep = default_indep
-        if self._is_time_dependent:
-            self.spatial = [i for i in self.indep if i != "t"]
-        else:
-            self.spatial = list(self.indep)
+        self.spatial = [i for i in self.indep if i != "t"]
 
         user_spatial_dims = len(self.spatial)
         if user_spatial_dims < spatial_dims:
-            self.dimension = user_spatial_dims + (1 if self._is_time_dependent else 0)
+            self.dimension = user_spatial_dims
             for tag, pts in self._mesh_pool.items():
-                if pts.shape[1] > self.dimension:
+                if pts.shape[-1] > self.dimension:
                     self._mesh_pool[tag] = pts[..., : self.dimension]
 
     def __lt__(self, other: Tuple[str, Any]) -> "domain":
@@ -1901,14 +1910,23 @@ class domain(MeshUtils, Geometries):
         return self.__rmul__(n)
 
     def __add__(self, other: Tuple[str, np.ndarray]) -> "domain":
-        """Merge another domain into this one (stacks along batch dimension)."""
+        """Merge another domain into this one (stacks along batch dimension).
+
+        For time-dependent problems, ``_mesh_pool`` entries have shape
+        ``(T, N, D_spatial)`` and do **not** get stacked (they represent the
+        same spatial mesh).  ``context`` entries are concatenated along the
+        batch axis (axis 0).  ``"__time__"`` is shared and not stacked.
+        """
         for tag, points in other._mesh_pool.items():
-            if tag in self._mesh_pool:
-                self._mesh_pool[tag] = np.vstack([self._mesh_pool[tag], points])
-            else:
+            if tag not in self._mesh_pool:
                 self._mesh_pool[tag] = points
+            # else: keep self's mesh pool (same mesh)
 
         for tag, data in other.context.items():
+            if tag == "__time__":
+                # Time array is shared, not batched
+                self.context[tag] = data
+                continue
             if tag in self.context:
                 self.context[tag] = np.concatenate([self.context[tag], data], axis=0)
             else:
@@ -2028,22 +2046,39 @@ class domain(MeshUtils, Geometries):
         return boundary_indices
 
     def _add_time_dimension(self, t_start: float, t_end: float, n_time: int = 100):
-        """Add time dimension to all point sets."""
-        t_points = np.linspace(t_start, t_end, n_time)
+        """Add time dimension to all point sets.
+
+        After this call the mesh pool stores arrays with shape
+        ``(T, N, D_spatial)`` — spatial coordinates tiled across T time
+        steps.  A separate ``_time_points`` array of shape ``(T,)`` holds
+        the time values.  The ``"initial"`` tag is a special case with
+        ``T=1`` at ``t=t_start``.
+
+        ``self.dimension`` is **not** incremented because time is handled
+        as a separate axis, not as an extra spatial column.
+        """
+        self._time_points = np.linspace(t_start, t_end, n_time)  # (T,)
+        self._n_time = n_time
         new_mesh_pool = {}
         for tag, points in self._mesh_pool.items():
-            n_spatial = len(points)
+            # points has shape (N, D_spatial)
 
             if tag == "interior":
-                initial_interior = points.copy()
-                new_mesh_pool["initial"] = np.concat([initial_interior, np.zeros((initial_interior.shape[0], 1))], axis=-1)
+                # Initial tag: spatial points at t=0 → (1, N, D_spatial)
+                new_mesh_pool["initial"] = points[np.newaxis, :, :]  # T=1
 
-            repeated_points = np.repeat(points, n_time, axis=0)
-            tiled_time = np.tile(t_points, n_spatial).reshape(-1, 1)
-            new_mesh_pool[tag] = np.hstack([repeated_points, tiled_time])
+            # Tile spatial points across T time steps → (T, N, D_spatial)
+            new_mesh_pool[tag] = np.broadcast_to(
+                points[np.newaxis, :, :],  # (1, N, D_spatial)
+                (n_time, *points.shape),  # (T, N, D_spatial)
+            ).copy()  # copy so it's contiguous
 
         self._mesh_pool = new_mesh_pool
-        self.dimension += 1
+        # NOTE: self.dimension stays as D_spatial — time is a separate axis
+
+        # Store time array in context so Variable("__time__") can be created.
+        # Shape: (T, 1) — will be broadcast to (B, T, 1) during sample().
+        self.context["__time__"] = self._time_points[:, np.newaxis]  # (T, 1)
 
         return None
 
@@ -2146,8 +2181,11 @@ class domain(MeshUtils, Geometries):
             available = list(self.context.keys())
             raise ValueError(f"Tag '{tag}' not found. Did you call sample() first? Available: {available}")
 
-        # Create Variable placeholder for each dimension
-        coord_vars = [Variable(tag=tag, dim=[i, i + 1], domain=self) for i in range(self.dimension)]
+        # Create Variable placeholder for each spatial dimension
+        coord_vars = [Variable(tag=tag, dim=[i, i + 1], domain=self, axis="spatial") for i in range(self.dimension)]
+
+        # Always add temporal variable (constant 1 for stationary problems)
+        coord_vars.append(Variable(tag="__time__", dim=[0, 1], domain=self, axis="temporal"))
 
         if normals:
             coord_vars += [Variable(tag=f"n_{tag}", dim=[i, i + 1], domain=self) for i in range(len(self.spatial))]
@@ -2214,9 +2252,17 @@ class domain(MeshUtils, Geometries):
 
         If domain was batched (e.g., 10 * domain), samples n_samples for each
         batch independently and concatenates results.
+
+        Shapes stored in ``self.context``:
+
+        * **Always**: ``(B, T, N, D_spatial)`` for spatial tags.
+          For steady-state problems T=1.
+        * **Time-dependent only**: ``(T, 1)`` for ``"__time__"``
+          (shared across batches).
         """
 
         batch_count = getattr(self, "_batch_count", 1)
+        is_time_dep = self._is_time_dependent
 
         for tag, (n_samples, sampler) in sample_spec.items():
             # Handle special "initial" tag for time-dependent problems
@@ -2229,7 +2275,14 @@ class domain(MeshUtils, Geometries):
             available_points = self._mesh_pool[tag]
             if normals_avaiable and normals:
                 available_normals = self.normals_by_tag[tag]  # Pull the normals for this tag
-            n_available = len(available_points)
+
+            # n_available is the number of *spatial* points
+            if is_time_dep:
+                # _mesh_pool[tag] has shape (T, N, D_spatial)
+                n_available = available_points.shape[1]
+            else:
+                # _mesh_pool[tag] has shape (N, D_spatial)
+                n_available = available_points.shape[0]
 
             ii = 0
             og_tag = tag
@@ -2254,8 +2307,6 @@ class domain(MeshUtils, Geometries):
             if not self.same_domain:
                 for _ in range(batch_count):
                     if sampler is not None:
-                        # If your sampler needs the points, pass them,
-                        # but ensure it returns the chosen INDICES.
                         if isinstance(sampler, Callable):
                             idx = sampler(available_points, n_samples)
                         elif isinstance(sampler, np.ndarray):
@@ -2266,14 +2317,28 @@ class domain(MeshUtils, Geometries):
                         else:
                             idx = np.arange(n_available)
 
-                    all_samples.append(available_points[idx])
+                    if is_time_dep:
+                        # Index spatial axis: (T, N, D) → (T, n_samples, D)
+                        all_samples.append(available_points[:, idx, :])
+                    else:
+                        # (N, D) → (n_samples, D)
+                        all_samples.append(available_points[idx])
+
                     if normals_avaiable and normals:
                         all_normals.append(available_normals[idx])
 
-                # 3. Stack both
-                self.context[tag] = np.stack(all_samples, axis=0)  # Shape (B, N, D)
+                # Stack → (B, T, N, D) for time-dep, (B, N, D) for steady
+                stacked = np.stack(all_samples, axis=0)
+                if not is_time_dep:
+                    # (B, N, D) → (B, 1, N, D)  — T=1 for steady-state
+                    stacked = stacked[:, np.newaxis, :, :]
+                self.context[tag] = stacked
+
                 if normals_avaiable and normals:
-                    self.context[f"n_{tag}"] = np.stack(all_normals, axis=0)  # Shape (B, N, D)
+                    nrm_stacked = np.stack(all_normals, axis=0)
+                    if not is_time_dep:
+                        nrm_stacked = nrm_stacked[:, np.newaxis, :, :]
+                    self.context[f"n_{tag}"] = nrm_stacked
 
             else:
                 # Sample once -> broadcast to all batches
@@ -2285,12 +2350,26 @@ class domain(MeshUtils, Geometries):
                     else:
                         idx = np.arange(n_available)
 
-                sampled_pts = available_points[idx]  # Shape (N, D)
-                # Broadcast to (B, N, D)
-                self.context[tag] = np.broadcast_to(sampled_pts[np.newaxis, :, :], (batch_count, *sampled_pts.shape))  # Add batch dim: (1, N, D)  # Target: (B, N, D)
+                if is_time_dep:
+                    # (T, N, D) → (T, n_samples, D) → broadcast to (B, T, n_samples, D)
+                    sampled_pts = available_points[:, idx, :]
+                else:
+                    # (N, D) → (1, n_samples, D)  — T=1 for steady-state
+                    sampled_pts = available_points[idx][np.newaxis, :, :]
+
+                self.context[tag] = np.broadcast_to(
+                    sampled_pts[np.newaxis, ...],
+                    (batch_count, *sampled_pts.shape),
+                )
+
                 if normals_avaiable and normals:
-                    sampled_nrm = available_normals[idx]  # Shape (N, D)
-                    self.context[f"n_{tag}"] = np.broadcast_to(sampled_nrm[np.newaxis, :, :], (batch_count, *sampled_nrm.shape))
+                    sampled_nrm = available_normals[idx]
+                    if not is_time_dep:
+                        sampled_nrm = sampled_nrm[np.newaxis, :, :]
+                    self.context[f"n_{tag}"] = np.broadcast_to(
+                        sampled_nrm[np.newaxis, ...],
+                        (batch_count, *sampled_nrm.shape),
+                    )
 
             if self._verbose:
                 if batch_count > 1:
@@ -2335,61 +2414,54 @@ class domain(MeshUtils, Geometries):
 
         # Plot points by tag
         for i, (tag, points) in enumerate(self.context.items()):
-            # Skip normal tags and parameter tags
-            if tag.startswith("n_") or tag in self._param_tags:
+            # Skip normal tags, parameter tags, and time tags
+            if tag.startswith("n_") or tag in self._param_tags or tag == "__time__":
                 continue
 
             color = colors[i % len(colors)]
-            n_points = points.shape[1]
+
+            # Extract spatial points at batch=0, time=0 for plotting
+            # Arrays are always (B, T, N, D) — T=1 for steady-state
+            if points.ndim == 4:
+                pts = points[0, 0]  # (N, D_spatial)
+            elif points.ndim >= 2:
+                # Parametric / other 2D arrays
+                pts = points[0]  # (N, D)
+            else:
+                continue
+            n_points = pts.shape[0]
 
             if spatial_dim == 1:
                 # 1D: plot as points on a line
-                if self._is_time_dependent:
-                    ax.scatter(points[0, :, 0], points[0, :, 1], c=[color], s=10, alpha=0.7, label=f"{tag} ({n_points})")
-                else:
-                    ax.scatter(points[0, :, 0], np.zeros(n_points), c=[color], s=10, alpha=0.7, label=f"{tag} ({n_points})")
+                ax.scatter(pts[:, 0], np.zeros(n_points), c=[color], s=10, alpha=0.7, label=f"{tag} ({n_points})")
 
                 # Plot normals if available
                 if show_normals and f"n_{tag}" in self.context:
                     normals = self.context[f"n_{tag}"][0]  # (N, 1)
                     for j in range(n_points):
-                        if self._is_time_dependent:
-                            ax.arrow(
-                                points[0, j, 0],
-                                points[0, j, 1],
-                                normals[j, 0] * arrow_scale,
-                                0,
-                                head_width=0.02,
-                                head_length=0.01,
-                                fc=color,
-                                ec=color,
-                                alpha=0.8,
-                                linewidth=1.5,
-                            )
-                        else:
-                            ax.arrow(
-                                points[0, j, 0],
-                                0,
-                                normals[j, 0] * arrow_scale,
-                                0,
-                                head_width=0.02,
-                                head_length=0.01,
-                                fc=color,
-                                ec=color,
-                                alpha=0.8,
-                                linewidth=1.5,
-                            )
+                        ax.arrow(
+                            pts[j, 0],
+                            0,
+                            normals[j, 0] * arrow_scale,
+                            0,
+                            head_width=0.02,
+                            head_length=0.01,
+                            fc=color,
+                            ec=color,
+                            alpha=0.8,
+                            linewidth=1.5,
+                        )
 
             elif spatial_dim == 2:
                 # 2D: scatter plot
-                ax.scatter(points[0, :, 0], points[0, :, 1], c=[color], s=10, alpha=0.7, label=f"{tag} ({n_points})")
+                ax.scatter(pts[:, 0], pts[:, 1], c=[color], s=10, alpha=0.7, label=f"{tag} ({n_points})")
 
                 # Plot normals if available
                 if show_normals and f"n_{tag}" in self.context:
                     normals = self.context[f"n_{tag}"][0]  # (N, 2)
                     ax.quiver(
-                        points[0, :, 0],
-                        points[0, :, 1],
+                        pts[:, 0],
+                        pts[:, 1],
                         normals[:, 0],
                         normals[:, 1],
                         color=color,
@@ -2402,9 +2474,9 @@ class domain(MeshUtils, Geometries):
             elif spatial_dim == 3:
                 # 3D: scatter plot
                 ax.scatter(
-                    points[0, :, 0],
-                    points[0, :, 1],
-                    points[0, :, 2],
+                    pts[:, 0],
+                    pts[:, 1],
+                    pts[:, 2],
                     c=[color],
                     s=10,
                     alpha=0.7,
@@ -2415,9 +2487,9 @@ class domain(MeshUtils, Geometries):
                 if show_normals and f"n_{tag}" in self.context:
                     normals = self.context[f"n_{tag}"][0]  # (N, 3)
                     ax.quiver(
-                        points[0, :, 0],
-                        points[0, :, 1],
-                        points[0, :, 2],
+                        pts[:, 0],
+                        pts[:, 1],
+                        pts[:, 2],
                         normals[:, 0],
                         normals[:, 1],
                         normals[:, 2],

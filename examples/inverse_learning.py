@@ -16,7 +16,7 @@ jno.logger(dire)
 
 # Domain
 domain = jno.domain(constructor=jno.domain.line(mesh_size=0.01))
-(x,) = domain.variable("interior")
+x, t = domain.variable("interior")
 
 # Trainable Parameters
 key = jax.random.PRNGKey(0)

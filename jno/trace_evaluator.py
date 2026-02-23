@@ -360,6 +360,238 @@ class TraceEvaluator:
         )
         return self._dispatch(expr, ctx)
 
+    # ------------------------------------------------------------------
+    # Shape tracing — walk the expression tree and record output shapes
+    # ------------------------------------------------------------------
+    def trace_shapes(
+        self,
+        expr,
+        context: Dict[str, jnp.ndarray],
+        var_bindings: Dict = None,
+        key=None,
+    ) -> str:
+        """Return a human-readable tree showing the output shape at every node.
+
+        This wraps :meth:`_dispatch` so that each handler's output
+        shape is captured and printed alongside a concise node label.
+        The tree is indented to reflect nesting.
+
+        Typical usage (called from ``core._log_constraint_shapes``)::
+
+            evaluator = TraceEvaluator(params)
+            print(evaluator.trace_shapes(expr, ctx_dict))
+
+        The output looks like::
+
+            BinaryOp(-)                                  → (513, 1)
+              Jacobian([Var(t)], fd)                      → (513, 1)
+                BinaryOp(*)                               → (513, 1)
+                  FlaxModuleCall(DeepONet)                 → (513, 1)
+                    Variable(__time__[0:1])                → (1,)
+                    Concat(axis=-1)                        → (513, 2)
+                      Variable(interior[0:1])              → (513, 1)
+                      Variable(interior[1:2])              → (513, 1)
+                  Variable(interior[0:1])                  → (513, 1)
+              BinaryOp(*)                                  → (513, 1)
+                Literal(0.1)                               → scalar
+                Laplacian([Var(x), Var(y)], fd)            → (513, 1)
+                  ...
+        """
+        ctx = self._EvalCtx(
+            context=context or {},
+            var_bindings=var_bindings or {},
+            key=key,
+        )
+        lines: list = []
+        self._trace_visit(expr, ctx, depth=0, lines=lines, seen=set())
+        return "\n".join(lines)
+
+    def _trace_visit(self, node, ctx, depth, lines, seen):
+        """Recursively visit *node*, evaluate it, and record its shape."""
+        pad = "  " * depth
+        label = self._node_label(node)
+
+        # Use jax.eval_shape to get the abstract shape without computation.
+        # This avoids triggering actual AD / vmap inside Jacobian/Hessian.
+        try:
+            abstract = jax.eval_shape(lambda: self._dispatch(node, ctx))
+            shape_str = str(abstract.shape) if hasattr(abstract, "shape") else "scalar"
+        except Exception:
+            # eval_shape can fail for AD derivatives (jax.hessian inside
+            # jax.eval_shape with closures over traced values).  Fall back
+            # to shape inference from the node's children.
+            shape_str = self._infer_shape_from_children(node, ctx)
+
+        # Emit this node
+        # Right-align shape annotation at column 60
+        entry = f"{pad}{label}"
+        shape_col = max(60, len(entry) + 2)
+        entry = entry.ljust(shape_col) + f"→ {shape_str}"
+        lines.append(entry)
+
+        # Recurse into children so the user sees the full tree
+        self._trace_children(node, ctx, depth, lines, seen)
+
+    def _trace_children(self, node, ctx, depth, lines, seen):
+        """Descend into the children of *node* for shape tracing."""
+        if isinstance(node, BinaryOp):
+            self._trace_visit(node.left, ctx, depth + 1, lines, seen)
+            self._trace_visit(node.right, ctx, depth + 1, lines, seen)
+        elif isinstance(node, FunctionCall):
+            for arg in node.args:
+                if isinstance(arg, Placeholder):
+                    self._trace_visit(arg, ctx, depth + 1, lines, seen)
+        elif isinstance(node, Concat):
+            for item in node.items:
+                self._trace_visit(item, ctx, depth + 1, lines, seen)
+        elif isinstance(node, FlaxModuleCall):
+            for arg in node.args:
+                if isinstance(arg, Placeholder):
+                    self._trace_visit(arg, ctx, depth + 1, lines, seen)
+        elif isinstance(node, TunableModuleCall):
+            for arg in node.args:
+                if isinstance(arg, Placeholder):
+                    self._trace_visit(arg, ctx, depth + 1, lines, seen)
+        elif isinstance(node, OperationDef):
+            if node.op_id not in seen:
+                seen.add(node.op_id)
+                self._trace_visit(node.expr, ctx, depth + 1, lines, seen)
+        elif isinstance(node, OperationCall):
+            # Build rebound context then trace the inner OperationDef
+            self._trace_visit(node.operation, ctx, depth + 1, lines, seen)
+        elif isinstance(node, (Jacobian, Hessian)):
+            self._trace_visit(node.target, ctx, depth + 1, lines, seen)
+        elif isinstance(node, Slice):
+            self._trace_visit(node.target, ctx, depth + 1, lines, seen)
+        elif isinstance(node, Reshape):
+            self._trace_visit(node.target, ctx, depth + 1, lines, seen)
+        # Leaf nodes (Variable, TensorTag, Constant, Literal) — no children
+
+    def _infer_shape_from_children(self, node, ctx):
+        """Best-effort shape inference when jax.eval_shape fails.
+
+        Falls back to simple broadcast / passthrough rules based on the
+        node type and its children's shapes.
+        """
+
+        def _child_shape(child):
+            try:
+                a = jax.eval_shape(lambda: self._dispatch(child, ctx))
+                return a.shape if hasattr(a, "shape") else ()
+            except Exception:
+                return None
+
+        if isinstance(node, BinaryOp):
+            ls = _child_shape(node.left)
+            rs = _child_shape(node.right)
+            if ls is not None and rs is not None:
+                try:
+                    out = jnp.broadcast_shapes(ls, rs)
+                    return str(out)
+                except Exception:
+                    return f"broadcast({ls}, {rs}) ??"
+            return f"({ls} {node.op} {rs}) ??"
+
+        if isinstance(node, (Jacobian, Hessian)):
+            # Derivative output typically has the same leading shape as
+            # the target expression.
+            ts = _child_shape(node.target)
+            if ts is not None:
+                return f"~{ts}  (derivative)"
+            return "??"
+
+        if isinstance(node, FunctionCall):
+            # Reductions like .mse produce ()
+            name = node._name or getattr(node.fn, "__name__", "")
+            if name in ("mse", "mean", "sum", "max", "min"):
+                return "()"
+            # Element-wise functions keep input shape
+            if node.args:
+                cs = _child_shape(node.args[0])
+                if cs is not None:
+                    return str(cs)
+            return "??"
+
+        if isinstance(node, FlaxModuleCall):
+            # Try to get the model output shape by actually running the
+            # forward pass.  Model calls are cheap; it is only AD
+            # derivatives that are expensive.
+            try:
+                result = self._dispatch(node, ctx)
+                return str(result.shape) if hasattr(result, "shape") else "scalar"
+            except Exception:
+                return "??"
+
+        if isinstance(node, OperationDef):
+            cs = _child_shape(node.expr)
+            if cs is not None:
+                return str(cs)
+            # Try running the whole OperationDef
+            try:
+                result = self._dispatch(node, ctx)
+                return str(result.shape) if hasattr(result, "shape") else "()"
+            except Exception:
+                return "??"
+
+        return "??"
+
+    @staticmethod
+    def _node_label(node) -> str:
+        """Concise one-line label for a trace node."""
+        if isinstance(node, Variable):
+            tag = node.tag
+            dim = node.dim
+            axis = getattr(node, "axis", "spatial")
+            axis_str = f", {axis}" if axis != "spatial" else ""
+            return f"Variable({tag}[{dim[0]}:{dim[1]}]{axis_str})"
+        if isinstance(node, TensorTag):
+            return f"TensorTag({node.tag})"
+        if isinstance(node, Constant):
+            val = node.value
+            if hasattr(val, "shape") and val.shape == ():
+                val = float(val)
+            return f"Constant({node.tag}.{node.key}={val})"
+        if isinstance(node, Literal):
+            v = node.value
+            if hasattr(v, "shape"):
+                if v.shape == ():
+                    v = float(v)
+                else:
+                    v = v.shape
+            return f"Literal({v})"
+        if isinstance(node, BinaryOp):
+            return f"BinaryOp({node.op})"
+        if isinstance(node, FunctionCall):
+            name = node._name or getattr(node.fn, "__name__", "fn")
+            return f"FunctionCall({name})"
+        if isinstance(node, Concat):
+            return f"Concat(axis={node.axis})"
+        if isinstance(node, FlaxModuleCall):
+            mod = node.model
+            mod_name = type(mod.module).__name__ if hasattr(mod, "module") else str(mod)
+            return f"FlaxModuleCall({mod_name})"
+        if isinstance(node, TunableModuleCall):
+            return f"TunableModuleCall(id={node.model.layer_id})"
+        if isinstance(node, OperationDef):
+            vars_str = ", ".join(str(v) for v in node._collected_vars)
+            return f"OperationDef[{node.op_id}]({vars_str})"
+        if isinstance(node, OperationCall):
+            return f"OperationCall[{node.operation.op_id}]"
+        if isinstance(node, Jacobian):
+            vars_str = ", ".join(str(v) for v in node.variables)
+            scheme_str = f", {node.scheme[:2]}" if node.scheme else ""
+            return f"Jacobian([{vars_str}]{scheme_str})"
+        if isinstance(node, Hessian):
+            kind = "Laplacian" if node.trace else "Hessian"
+            vars_str = ", ".join(str(v) for v in node.variables)
+            scheme_str = f", {node.scheme[:2]}" if node.scheme else ""
+            return f"{kind}([{vars_str}]{scheme_str})"
+        if isinstance(node, Slice):
+            return f"Slice({node.key})"
+        if isinstance(node, Reshape):
+            return f"Reshape({node.target_shape})"
+        return type(node).__name__
+
     # Dispatch table — maps node type → handler method name.
     # ORDER MATTERS: more specific types (Constant, Literal) come first
     # so they aren't shadowed by their base class (Placeholder).
@@ -418,7 +650,23 @@ class TraceEvaluator:
 
     def _map_mesh_to_sampled(self, mesh_points, sampled_points, values):
         """Map values computed at mesh vertices back to sampled points via
-        nearest-neighbour lookup."""
+        nearest-neighbour lookup.  If the point sets have the same size
+        and are identical (common when n_samples == n_mesh), return
+        values directly to avoid a costly O(N×M) distance matrix."""
+        if mesh_points.shape == sampled_points.shape:
+            # Fast path: when shapes match, check if points are identical
+            # (this is the common case when all mesh points are sampled).
+            same = jnp.all(jnp.abs(mesh_points - sampled_points) < 1e-8)
+            return jax.lax.cond(
+                same,
+                lambda _: values,
+                lambda _: self._nearest_neighbour_lookup(mesh_points, sampled_points, values),
+                operand=None,
+            )
+        return self._nearest_neighbour_lookup(mesh_points, sampled_points, values)
+
+    @staticmethod
+    def _nearest_neighbour_lookup(mesh_points, sampled_points, values):
         dists = jnp.sum(
             (mesh_points[jnp.newaxis, :, :] - sampled_points[:, jnp.newaxis, :]) ** 2,
             axis=-1,
@@ -447,6 +695,7 @@ class TraceEvaluator:
     def _eval_variable(self, expr, ctx):
         bound_var = ctx.var_bindings.get(id(expr), expr)
         tag = bound_var.tag
+        axis = getattr(bound_var, "axis", "spatial")
 
         if tag in ctx.context:
             tag_data = ctx.context[tag]
@@ -454,10 +703,14 @@ class TraceEvaluator:
             result = tag_data[..., dim_start:dim_end]
             if dim_end is None:
                 pass  # keep full shape
-            # elif result.ndim >= 1 and result.shape[-1] == 1:
-            #    result = result[..., 0]
             return result
-
+        elif axis == "temporal" and "__time__" in ctx.context:
+            # Temporal variable reads from the shared time context.
+            # After T-scan peels the T axis this is a scalar (1,).
+            tag_data = ctx.context["__time__"]
+            dim_start, dim_end = bound_var.dim
+            result = tag_data[..., dim_start:dim_end]
+            return result
         else:
             self.log.error(f"Variable tag '{tag}' not found. context: {list(ctx.context.keys())}")
             raise KeyError(f"Variable tag '{tag}' not found in context")
@@ -532,8 +785,14 @@ class TraceEvaluator:
                 arg_values.append(val)
 
                 is_spatial = False
-                if isinstance(arg, Variable) and arg.tag in ctx.context:
-                    is_spatial = True
+                if isinstance(arg, Variable):
+                    bound_arg = ctx.var_bindings.get(id(arg), arg)
+                    axis = getattr(bound_arg, "axis", "spatial")
+                    if axis == "spatial" and bound_arg.tag in ctx.context:
+                        is_spatial = True
+                    elif axis == "temporal":
+                        # Temporal variable — will be broadcast to (N, 1)
+                        is_spatial = False
 
                 arg_sources.append(is_spatial)
             else:
@@ -546,27 +805,22 @@ class TraceEvaluator:
         if model is None:
             raise ValueError(f"No model for FlaxModule {flax_mod.layer_id}")
 
-        N = 1
-        for val, is_spatial in zip(arg_values, arg_sources):
-            if is_spatial:
-                val = jnp.asarray(val)
-                if val.ndim >= 1:
-                    N = max(N, val.shape[0])
-
         def normalize_arg(val, is_spatial):
+            """Minimal normalization: scalars → (1,), 1-D spatial → (N,1).
+
+            No cross-argument broadcasting — that is the network's job.
+            """
             val = jnp.asarray(val)
             if is_spatial:
                 if val.ndim == 0:
-                    return jnp.full((N, 1), val)
+                    return val.reshape(1, 1)
                 elif val.ndim == 1:
-                    return val[:, jnp.newaxis]
-                else:
-                    return val
+                    return val[:, jnp.newaxis]  # (N,) → (N, 1)
+                return val
             else:
                 if val.ndim == 0:
-                    return val[jnp.newaxis]
-                else:
-                    return val
+                    return val.reshape(1)  # scalar → (1,)
+                return val
 
         shaped_args = [normalize_arg(v, s) for v, s in zip(arg_values, arg_sources)]
 
@@ -579,8 +833,11 @@ class TraceEvaluator:
         else:
             result = model(*shaped_args)
 
-        # while result.ndim >= 2 and result.shape[-1] == 1:
-        #    result = result[..., 0]
+        # Ensure result is (N, 1) when model flattens to (N,).
+        # Networks like DeepONet squeeze n_outputs=1 → (N,), but the
+        # expression tree expects (N, 1) to match variable shapes.
+        if result.ndim == 1 and result.shape[0] > 1:
+            result = result[:, jnp.newaxis]
 
         return result
 
@@ -602,6 +859,12 @@ class TraceEvaluator:
 
         With a single variable this acts as a gradient and the result
         is squeezed to a scalar per point.
+
+        Handles both spatial and temporal variables:
+        - Spatial variables: differentiate w.r.t. columns of the spatial
+          context ``(N, D_spatial)`` using either AD or FD.
+        - Temporal variables: differentiate w.r.t. the scalar time value
+          using AD (default) or central FD when scheme='finite_difference'.
         """
         target = expr.target
         variables = expr.variables
@@ -609,8 +872,69 @@ class TraceEvaluator:
 
         first_var = variables[0]
         bound_var = ctx.var_bindings.get(id(first_var), first_var)
-        points = ctx.context[bound_var.tag]
+        first_axis = getattr(bound_var, "axis", "spatial")
+
+        # ── Temporal derivative ──
+        if first_axis == "temporal":
+            evaluator_self = self
+            time_key = "__time__"
+            time_val = ctx.context.get(time_key)  # (1,)
+
+            if scheme == "finite_difference":
+                # Central difference: (u(t+eps) - u(t-eps)) / (2*eps)
+                # Two forward passes through the network — much cheaper
+                # than N jax.grad calls for AD.
+                eps = jnp.float32(1e-3)
+                t_fwd = time_val + eps
+                t_bwd = time_val - eps
+
+                ctx_fwd = {**ctx.context, time_key: t_fwd}
+                ctx_bwd = {**ctx.context, time_key: t_bwd}
+
+                u_fwd = self._dispatch(target, self._EvalCtx(ctx_fwd, ctx.var_bindings, ctx.key))
+                u_bwd = self._dispatch(target, self._EvalCtx(ctx_bwd, ctx.var_bindings, ctx.key))
+
+                result = (u_fwd - u_bwd) / (2.0 * eps)
+                # Ensure (N, 1) shape
+                if result.ndim == 1:
+                    result = result[:, jnp.newaxis]
+                return result
+
+            # ── Temporal derivative via AD (default) ──
+            # Find any spatial tag to determine N
+            N = 1
+            for k, v in ctx.context.items():
+                if k != time_key and hasattr(v, "ndim") and v.ndim >= 1:
+                    N = max(N, v.shape[0])
+
+            def grad_time_single(idx):
+                """Grad w.r.t. time for spatial point idx."""
+                # Build local context with point idx sliced out of spatial arrays
+                local_ctx = {}
+                for k, v in ctx.context.items():
+                    if k == time_key:
+                        continue  # will be replaced by differentiable t
+                    if hasattr(v, "ndim") and v.ndim >= 2 and v.shape[0] == N:
+                        local_ctx[k] = jax.lax.dynamic_slice(v, (idx, 0), (1, v.shape[1]))
+                    elif hasattr(v, "ndim") and v.ndim == 1 and v.shape[0] == N:
+                        local_ctx[k] = jax.lax.dynamic_slice(v, (idx,), (1,))
+                    else:
+                        local_ctx[k] = v
+
+                def u_of_t(t_arr):
+                    new_ctx_dict = {**local_ctx, time_key: t_arr}
+                    new_ctx = evaluator_self._EvalCtx(new_ctx_dict, ctx.var_bindings, ctx.key)
+                    return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
+
+                return jax.grad(u_of_t)(time_val)[0]
+
+            result = jax.vmap(grad_time_single)(jnp.arange(N))
+            # Ensure (N,) → (N, 1) to match variable / model-output shapes
+            return result[:, jnp.newaxis]
+
+        # ── Spatial derivative ──
         tag = bound_var.tag
+        points = ctx.context[bound_var.tag]
         n_vars = len(variables)
         var_dims = [(i, vi.dim[0]) for i, vi in enumerate(variables)]
 
@@ -631,19 +955,39 @@ class TraceEvaluator:
                 return self._dispatch(target, new_ctx)
 
             u_full = u_at_pts(mesh_points)
+            N_mesh = mesh_points.shape[0]
+
+            # FD operators expect flat 1-D (N,) values.  Operator-learning
+            # models (Poseidon, FNO, …) return image-shaped tensors whose
+            # total size equals N_mesh.  Auto-flatten them and remember the
+            # original shape so we can restore it afterwards.
+            u_squeezed = u_full.squeeze(-1) if (u_full.ndim > 1 and u_full.shape[-1] == 1) else u_full
+            image_shape = None
+            if u_squeezed.ndim > 1 and u_squeezed.size == N_mesh:
+                image_shape = u_full.shape
+                u_full_1d = u_squeezed.ravel()
+            else:
+                u_full_1d = u_squeezed if u_squeezed.ndim == 1 else u_squeezed.ravel()
 
             jac_components = []
             for _i, vi_dim in var_dims:
                 if mesh_dim == 1:
-                    grad_full = DifferentialOperators.compute_fd_gradient_1d_simple(u_full, mesh_points, domain.mesh_connectivity["lines"])
+                    grad_full = DifferentialOperators.compute_fd_gradient_1d_simple(u_full_1d, mesh_points, domain.mesh_connectivity["lines"])
                 elif mesh_dim == 2:
-                    grad_full = DifferentialOperators.compute_fd_gradient_2d_simple(u_full, mesh_points, domain.mesh_connectivity["triangles"], vi_dim)
+                    grad_full = DifferentialOperators.compute_fd_gradient_2d_simple(u_full_1d, mesh_points, domain.mesh_connectivity["triangles"], vi_dim)
                 elif mesh_dim == 3:
-                    grad_full = DifferentialOperators.compute_fd_gradient_3d_simple(u_full, mesh_points, domain.mesh_connectivity["tetrahedra"], vi_dim)
+                    grad_full = DifferentialOperators.compute_fd_gradient_3d_simple(u_full_1d, mesh_points, domain.mesh_connectivity["tetrahedra"], vi_dim)
                 jac_components.append(grad_full)
 
+            if image_shape is not None:
+                # Return in the same image shape as the model output
+                if n_vars == 1:
+                    return jac_components[0].reshape(image_shape)
+                return jnp.stack(jac_components, axis=-1).reshape(*image_shape[:-1], n_vars)
+
             if n_vars == 1:
-                return self._map_mesh_to_sampled(mesh_points, points, jac_components[0])
+                result = self._map_mesh_to_sampled(mesh_points, points, jac_components[0])
+                return result[:, jnp.newaxis] if result.ndim == 1 else result
             jac_full = jnp.stack(jac_components, axis=-1)
             return self._map_mesh_to_sampled(mesh_points, points, jac_full)
 
@@ -690,6 +1034,12 @@ class TraceEvaluator:
 
         When ``expr.trace is True`` this computes the Laplacian
         (sum of diagonal Hessian entries) instead of the full matrix.
+
+        Hessian/Laplacian is expected to be purely spatial.  After the
+        T-scan peels the time axis, context entries are ``(N, D_spatial)``
+        and ``__time__`` is ``(1,)`` — the FD path can now safely
+        replace the spatial context with the full mesh points without
+        losing the time value.
         """
         target = expr.target
         variables = expr.variables
@@ -720,31 +1070,51 @@ class TraceEvaluator:
             mesh_dim = domain.mesh_connectivity["dimension"]
 
             def u_at_pts(pts):
+                # Replace only the spatial tag — __time__ stays intact
                 ctx_dict = {**ctx.context, tag: pts}
                 new_ctx = self._EvalCtx(ctx_dict, ctx.var_bindings, ctx.key)
                 return self._dispatch(target, new_ctx)
 
             u_full = u_at_pts(mesh_points)
+            N_mesh = mesh_points.shape[0]
+
+            # Auto-flatten image-shaped model outputs to (N_mesh,).
+            # See the Jacobian FD path for the same logic.
+            u_squeezed = u_full.squeeze(-1) if (u_full.ndim > 1 and u_full.shape[-1] == 1) else u_full
+            image_shape = None
+            if u_squeezed.ndim > 1 and u_squeezed.size == N_mesh:
+                image_shape = u_full.shape
+                u_full_1d = u_squeezed.ravel()
+            else:
+                u_full_1d = u_squeezed if u_squeezed.ndim == 1 else u_squeezed.ravel()
 
             if compute_trace:
                 # Laplacian: sum of second derivatives on diagonal
                 if mesh_dim == 1:
-                    lap_full = DifferentialOperators.compute_fd_laplacian_1d_simple(u_full, mesh_points, domain.mesh_connectivity["lines"])
+                    lap_full = DifferentialOperators.compute_fd_laplacian_1d_simple(u_full_1d, mesh_points, domain.mesh_connectivity["lines"])
                 elif mesh_dim == 2:
-                    lap_full = DifferentialOperators.compute_fd_laplacian_2d_simple(u_full, mesh_points, domain.mesh_connectivity["triangles"], dims)
+                    lap_full = DifferentialOperators.compute_fd_laplacian_2d_simple(u_full_1d, mesh_points, domain.mesh_connectivity["triangles"], dims)
                 elif mesh_dim == 3:
-                    lap_full = DifferentialOperators.compute_fd_laplacian_3d_simple(u_full, mesh_points, domain.mesh_connectivity["tetrahedra"], dims)
+                    lap_full = DifferentialOperators.compute_fd_laplacian_3d_simple(u_full_1d, mesh_points, domain.mesh_connectivity["tetrahedra"], dims)
+
+                if image_shape is not None:
+                    # Return in the same image shape as the model output
+                    return lap_full.reshape(image_shape)
+
                 if points is not None:
-                    return self._map_mesh_to_sampled(mesh_points, points, lap_full)
-                return lap_full
+                    result = self._map_mesh_to_sampled(mesh_points, points, lap_full)
+                    return result[:, jnp.newaxis] if result.ndim == 1 else result
+                return lap_full[:, jnp.newaxis] if lap_full.ndim == 1 else lap_full
             else:
                 # Full Hessian matrix
                 if mesh_dim == 1:
-                    hess_full = DifferentialOperators.compute_fd_hessian_1d_simple(u_full, mesh_points, domain.mesh_connectivity["lines"])
+                    hess_full = DifferentialOperators.compute_fd_hessian_1d_simple(u_full_1d, mesh_points, domain.mesh_connectivity["lines"])
                 elif mesh_dim == 2:
-                    hess_full = DifferentialOperators.compute_fd_hessian_2d_simple(u_full, mesh_points, domain.mesh_connectivity["triangles"], var_dims)
+                    hess_full = DifferentialOperators.compute_fd_hessian_2d_simple(u_full_1d, mesh_points, domain.mesh_connectivity["triangles"], var_dims)
                 elif mesh_dim == 3:
-                    hess_full = DifferentialOperators.compute_fd_hessian_3d_simple(u_full, mesh_points, domain.mesh_connectivity["tetrahedra"], var_dims)
+                    hess_full = DifferentialOperators.compute_fd_hessian_3d_simple(u_full_1d, mesh_points, domain.mesh_connectivity["tetrahedra"], var_dims)
+                if image_shape is not None:
+                    return hess_full.reshape(*image_shape[:-1], n, n)
                 return self._map_mesh_to_sampled(mesh_points, points, hess_full)
 
         elif scheme == "automatic_differentiation":
@@ -962,40 +1332,24 @@ class TraceEvaluator:
                             if pretrained[key].shape == new[key].shape:
                                 result[key] = pretrained[key]
                                 stats["matched"] += count_params(pretrained[key])
-                                details.append(
-                                    f"  MATCHED  {current_path}  "
-                                    f"shape={pretrained[key].shape}  "
-                                    f"params={count_params(pretrained[key]):,}"
-                                )
+                                details.append(f"  MATCHED  {current_path}  " f"shape={pretrained[key].shape}  " f"params={count_params(pretrained[key]):,}")
                             else:
                                 result[key] = new[key]
                                 n = count_params(new[key])
                                 stats["replaced"] += n
-                                details.append(
-                                    f"  MISMATCH {current_path}  "
-                                    f"{pretrained[key].shape} -> {new[key].shape}  "
-                                    f"params={n:,}  (reinitialized)"
-                                )
+                                details.append(f"  MISMATCH {current_path}  " f"{pretrained[key].shape} -> {new[key].shape}  " f"params={n:,}  (reinitialized)")
                     elif key in pretrained:
                         result[key] = pretrained[key]
                         if not isinstance(pretrained[key], dict):
                             n = count_params(pretrained[key])
                             stats["matched"] += n
-                            details.append(
-                                f"  MATCHED  {current_path}  "
-                                f"shape={pretrained[key].shape}  "
-                                f"params={n:,}  (pretrained only)"
-                            )
+                            details.append(f"  MATCHED  {current_path}  " f"shape={pretrained[key].shape}  " f"params={n:,}  (pretrained only)")
                     else:
                         result[key] = new[key]
                         if not isinstance(new[key], dict):
                             n = count_params(new[key])
                             stats["replaced"] += n
-                            details.append(
-                                f"  NEW      {current_path}  "
-                                f"shape={new[key].shape}  "
-                                f"params={n:,}  (new only)"
-                            )
+                            details.append(f"  NEW      {current_path}  " f"shape={new[key].shape}  " f"params={n:,}  (new only)")
 
                 return result
             else:
@@ -1015,15 +1369,12 @@ class TraceEvaluator:
         n_mismatch = sum(1 for d in details if "MISMATCH" in d)
         n_new = sum(1 for d in details if "NEW" in d)
 
-        summary = (
-            f"Pretrained weights: {stats['matched']:,}/{total:,} params matched "
-            f"({pct:.4f}%), {stats['replaced']:,} reinitialized "
-            f"({n_mismatch} shape mismatches, {n_new} new)"
-        )
+        summary = f"Pretrained weights: {stats['matched']:,}/{total:,} params matched " f"({pct:.4f}%), {stats['replaced']:,} reinitialized " f"({n_mismatch} shape mismatches, {n_new} new)"
         logger.info(summary)
 
         # Write detailed per-parameter report to a text file next to log.txt
         from pathlib import Path
+
         log_dir = getattr(logger, "path", None)
         if log_dir is not None:
             log_dir = Path(log_dir)
@@ -1103,10 +1454,23 @@ class TraceEvaluator:
 
     @staticmethod
     def compile_traced_expression(expr: Placeholder, all_ops: List[OperationDef]) -> Callable:
-        """Compile traced expression into a JAX-compatible function."""
+        """Compile traced expression into a JAX-compatible function.
 
-        def evaluate_single_batch(params, context_single, key):
-            """Evaluate for a single batch - no batch dimension."""
+        The compiled function handles the (B, T, N, D) data layout:
+
+        1. ``vmap`` over B (batch dimension)
+        2. ``jax.lax.scan`` over T (time steps — T=1 for steady-state)
+        3. Evaluate the expression on ``(N, D_spatial)`` context
+
+        The ``"__time__"`` context entry (shape ``(T, 1)``) is **not**
+        batched — it is shared and scanned over T together with the
+        spatial arrays.
+        """
+
+        TIME_TAG = "__time__"
+
+        def evaluate_single_point_set(params, context_single, key):
+            """Evaluate for a single (N, D) context — no batch or time."""
             evaluator = TraceEvaluator(params)
             return evaluator.evaluate(expr, context_single, {}, key)
 
@@ -1116,73 +1480,93 @@ class TraceEvaluator:
 
             Args:
                 params: Model parameters
-                context: Unified dictionary of all input arrays by tag
-                batchsize: If provided, randomly select this many samples from the batch dimension.
-                        If None, use all samples.
-                key: JAX random key for selecting random subset. Required if batchsize is provided.
+                context: Unified dictionary — spatial tags have shape
+                    ``(B, T, N, D)``, ``"__time__"`` has shape ``(T, 1)``
+                    (absent for steady-state), parametric tags ``(B, F)``.
+                batchsize: If provided, randomly select this many samples
+                    from the batch dimension.
+                key: JAX random key for mini-batch and stochastic ops.
             """
             context = context or {}
 
-            # Collect all unique tags from all constraints to standardize ordering
+            # ----- tag ordering (stable across calls) -----------------
             all_tags = set()
             for op in all_ops:
                 if hasattr(op, "_collected_vars"):
                     for var in op._collected_vars:
                         all_tags.add(var.tag)
 
-            tag_order = tuple(sorted(context.keys(), key=lambda t: (t not in all_tags, t)))
+            tag_order = tuple(
+                sorted(
+                    context.keys(),
+                    key=lambda t: (t not in all_tags, t),
+                )
+            )
             ctx_tuple = tuple(context[tag] for tag in tag_order) if tag_order else ()
 
-            # ============================================================
-            # STEP 1: Determine the PRIMARY batch size B
-            # First dimension is always batch — check all entries
-            # ============================================================
+            # ----- determine batch size B -----------------------------
+            # Spatial arrays are (B, T, N, D) — first dim is B.
+            # __time__ is (T, 1) — skip it when finding B.
             batched_sizes = []
-            for arr in ctx_tuple:
+            for tag, arr in zip(tag_order, ctx_tuple):
+                if tag == TIME_TAG:
+                    continue
                 if hasattr(arr, "ndim") and arr.ndim >= 1:
                     batched_sizes.append(arr.shape[0])
 
             if not batched_sizes:
-                # No batched data → no vmap needed
-                return evaluate_single_batch(params, context, key=key)
+                return evaluate_single_point_set(params, context, key=key)
 
-            # Use the maximum as the primary batch size
             B = max(batched_sizes)
 
-            # ============================================================
-            # STEP 1.5: Handle random subset selection if batchsize is provided
-            # ============================================================
+            # ----- mini-batch subset selection ------------------------
             if batchsize is not None:
                 if key is None:
-                    raise ValueError("A JAX random key must be provided when batchsize is specified.")
-
+                    raise ValueError("A JAX random key must be provided when " "batchsize is specified.")
                 if batchsize > B:
-                    print("WARNING: batchsize smaller then sampling -> replace=True")
+                    print("WARNING: batchsize larger than sampling -> replace=True")
                     indices = jax.random.choice(key, B, shape=(batchsize,), replace=True)
                     indices = jnp.sort(indices)
-
-                if batchsize < B:
+                elif batchsize < B:
                     indices = jax.random.choice(key, B, shape=(batchsize,), replace=False)
                     indices = jnp.sort(indices)
-
-                if batchsize == B:
+                else:
                     indices = jnp.arange(0, B, 1)
 
-                def subset_entry(arr):
+                def subset_entry(tag_name, arr):
+                    if tag_name == TIME_TAG:
+                        return arr  # not batched
                     if hasattr(arr, "ndim") and arr.ndim >= 1 and arr.shape[0] == B:
                         return arr[indices]
                     return arr
 
-                ctx_tuple = tuple(subset_entry(a) for a in ctx_tuple)
+                ctx_tuple = tuple(subset_entry(t, a) for t, a in zip(tag_order, ctx_tuple))
                 B = batchsize
 
-            # ============================================================
-            # STEP 2: Normalize — only vmap over arrays with batch size == B
-            # ============================================================
+            # ----- separate __time__ from batched arrays ---------------
+            # After vmap peels B, spatial arrays become (T, N, D).
+            # __time__ is (T, 1) and must NOT be vmapped — pass via
+            # closure instead.
+            time_arr = None  # will be set if __time__ is present
+            time_idx_in_order = None
+
+            spatial_tag_order = []
+            spatial_ctx = []
+            for i, (tag, arr) in enumerate(zip(tag_order, ctx_tuple)):
+                if tag == TIME_TAG:
+                    time_arr = jnp.asarray(arr)  # (T, 1)
+                    time_idx_in_order = i
+                else:
+                    spatial_tag_order.append(tag)
+                    spatial_ctx.append(arr)
+
+            spatial_tag_order = tuple(spatial_tag_order)
+            spatial_ctx = tuple(spatial_ctx)
+
+            # ----- normalize for vmap (batch axis) --------------------
             def normalize_entry(arg):
                 if not hasattr(arg, "ndim") or arg.ndim == 0:
                     return arg, None
-
                 bs = arg.shape[0]
                 if bs == B:
                     return arg, 0
@@ -1193,38 +1577,78 @@ class TraceEvaluator:
 
             new_ctx = []
             ctx_in_axes = []
-            for a in ctx_tuple:
+            for a in spatial_ctx:
                 a2, ax = normalize_entry(a)
                 new_ctx.append(a2)
                 ctx_in_axes.append(ax)
-            ctx_tuple = tuple(new_ctx)
+            spatial_ctx = tuple(new_ctx)
             ctx_in_axes = tuple(ctx_in_axes)
 
-            # ============================================================
-            # STEP 3: vmap — only over axes marked with 0
-            # ============================================================
-            def eval_single_batch_tuple(ctx_vals, rng_key):
-                ctx_dict = dict(zip(tag_order, ctx_vals))
-                return evaluate_single_batch(params, ctx_dict, key=rng_key)
+            # ----- inner: scan over T then evaluate -------------------
+            def scan_over_time(spatial_vals, rng_key):
+                """Given per-batch spatial arrays (T,N,D) + shared
+                time_arr (T,1), scan over T and evaluate on (N,D)."""
 
+                # Determine T from the first spatial array with a T dim
+                # After vmap peels B, 4-D arrays became (T, N, D)
+                T = None
+                for v in spatial_vals:
+                    if hasattr(v, "ndim") and v.ndim >= 3:
+                        T = v.shape[0]
+                        break
+                if T is None:
+                    # Fallback: all arrays are 2-D (param tags) — no T
+                    T = 1
+
+                def scan_body(carry, t_idx):
+                    """Process a single time step."""
+                    # Build (N, D) context for this time step
+                    ctx_dict = {}
+                    for tag, arr in zip(spatial_tag_order, spatial_vals):
+                        if hasattr(arr, "ndim") and arr.ndim >= 3:
+                            # (T, N, D) → (N, D)
+                            ctx_dict[tag] = arr[t_idx]
+                        else:
+                            # parametric / other — pass through
+                            ctx_dict[tag] = arr
+
+                    # Add time scalar if present
+                    if time_arr is not None:
+                        ctx_dict[TIME_TAG] = time_arr[t_idx]  # (1,)
+
+                    result = evaluate_single_point_set(
+                        params,
+                        ctx_dict,
+                        key=rng_key,
+                    )
+                    return carry, result
+
+                _, results = jax.lax.scan(
+                    scan_body,
+                    init=None,
+                    xs=jnp.arange(T),
+                )
+                # results has shape (T, ...) — e.g. (T,) or (T, N) etc.
+                return results
+
+            # ----- outer: vmap over B ---------------------------------
             if key is not None:
                 keys = jax.random.split(key, B)
                 vmapped_fn = jax.vmap(
-                    eval_single_batch_tuple,
+                    scan_over_time,
                     in_axes=(ctx_in_axes, 0),
                 )
-                return vmapped_fn(ctx_tuple, keys)
+                return vmapped_fn(spatial_ctx, keys)
             else:
 
-                def eval_single_batch_tuple_no_key(ctx_vals):
-                    ctx_dict = dict(zip(tag_order, ctx_vals))
-                    return evaluate_single_batch(params, ctx_dict, key=None)
+                def scan_over_time_no_key(spatial_vals):
+                    return scan_over_time(spatial_vals, rng_key=None)
 
                 vmapped_fn = jax.vmap(
-                    eval_single_batch_tuple_no_key,
+                    scan_over_time_no_key,
                     in_axes=(ctx_in_axes,),
                 )
-                return vmapped_fn(ctx_tuple)
+                return vmapped_fn(spatial_ctx)
 
         return compiled_fn
 

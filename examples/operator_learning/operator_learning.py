@@ -35,8 +35,8 @@ theta_test = theta_all[B_train:, :]  # (B_test, 4)
 # domain
 # ------------------------------------------------------
 domain = B_train * jno.domain(constructor=jno.domain.rect(mesh_size=0.05), compute_mesh_connectivity=True)
-x, y = domain.variable("interior", (None, None))
-xb, yb = domain.variable("boundary", (None, None))
+x, y, t = domain.variable("interior", (None, None))
+xb, yb, tb = domain.variable("boundary", (None, None))
 θ = domain.variable("θ", theta_train)
 domain.plot(f"{dire}/domain.png")
 
