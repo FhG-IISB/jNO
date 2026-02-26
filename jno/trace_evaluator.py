@@ -667,11 +667,12 @@ class TraceEvaluator:
 
     def _eval_function_call(self, expr, ctx):
         args = [(self._dispatch(arg, ctx) if isinstance(arg, Placeholder) else arg) for arg in expr.args]
+        kwargs = expr.kwargs if expr.kwargs else {}
         sig = inspect.signature(expr.fn)
         if "key" in sig.parameters:
-            return expr.fn(*args, key=ctx.key)
+            return expr.fn(*args, key=ctx.key, **kwargs)
         else:
-            return expr.fn(*args)
+            return expr.fn(*args, **kwargs)
 
     def _eval_slice(self, expr, ctx):
         target = self._dispatch(expr.target, ctx)

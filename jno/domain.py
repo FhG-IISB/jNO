@@ -937,10 +937,20 @@ class MeshUtils:
         _bp = points[non_boundary_indices]
 
         mesh_connectivity["boundary_points"] = bp
-        # TODO temporary fix -> hardencode for 1D geometries
-        # bpe = MeshUtils.extract_boundary_edges(mesh.cells_dict["triangle"], len(bp))
-        # mesh_connectivity["VM"] = MeshUtils.get_visibility_matrix_raytrace(bp, bpe, _bp[0], 40)
-        mesh_connectivity["VM"] = MeshUtils.get_visibility_matrix_ordered(bp, _bp[0])
+        # Use raytrace-based visibility for multi-connected domains (holes),
+        # fall back to ordered method for simple single-loop boundaries.
+        if dimension == 2 and "triangle" in mesh.cells_dict:
+            bpe_global = MeshUtils.extract_boundary_edges(mesh.cells_dict["triangle"], len(bp))
+            bpe_global = np.asarray(bpe_global)
+
+            # Re-map edge indices from full-mesh space to boundary-only space
+            global_to_local = {int(gi): li for li, gi in enumerate(boundary_indices)}
+            bpe_local = np.array([[global_to_local[int(e[0])], global_to_local[int(e[1])]] for e in bpe_global if int(e[0]) in global_to_local and int(e[1]) in global_to_local])
+
+            mesh_connectivity["boundary_edges"] = bpe_local
+            mesh_connectivity["VM"] = MeshUtils.get_visibility_matrix_raytrace(bp, bpe_local, _bp[0], n_ray_samples=20)
+        else:
+            mesh_connectivity["VM"] = MeshUtils.get_visibility_matrix_ordered(bp, _bp[0])
 
         msg = f"Preprocessed mesh connectivity: {n_points} points, {len(elements)} {element_type}"
 
@@ -1358,7 +1368,9 @@ class MeshUtils:
                     # Adjacent boundary points are always visible (they share an edge)
                     is_adjacent_point = (j == (i + 1) % n_bnd) | (j == (i - 1 + n_bnd) % n_bnd)
 
-                    visible_ij = jax.lax.cond(is_same, lambda: False, lambda: jax.lax.cond(is_adjacent_point, lambda: True, lambda: seg_visible(i, j)))  # Diagonal is always 0 (can't see itself)  # Adjacent boundary points are always visible
+                    visible_ij = jax.lax.cond(
+                        is_same, lambda: False, lambda: jax.lax.cond(is_adjacent_point, lambda: True, lambda: seg_visible(i, j))
+                    )  # Diagonal is always 0 (can't see itself)  # Adjacent boundary points are always visible
                     row = row.at[j].set(visible_ij)
                     return row
 
@@ -1386,194 +1398,151 @@ class MeshUtils:
         return VM_jax
 
     @staticmethod
-    def get_visibility_matrix_raytrace(boundary_points: jnp.ndarray, boundary_edges: jnp.ndarray, interior_point: jnp.ndarray = None, n_ray_samples: int = 10) -> jnp.ndarray:
+    def get_visibility_matrix_raytrace(boundary_points, boundary_edges, interior_point=None, n_ray_samples: int = 3) -> jnp.ndarray:
         """
-        Compute visibility matrix using ray tracing.
+        Compute visibility matrix using ray tracing (NumPy, fully vectorized).
         Works for arbitrary domains with any number of holes.
 
         Parameters
         ----------
-        boundary_points : jnp.ndarray
+        boundary_points : array-like
             (n_bnd, 2) boundary points.
-        boundary_edges : jnp.ndarray
-            (n_edges, 2) boundary edges as index pairs.
-            Each edge [i, j] connects boundary_points[i] to boundary_points[j].
-        interior_point : jnp.ndarray, optional
-            (2,) a single point known to be inside the domain.
-            Used to determine inside/outside orientation.
+        boundary_edges : array-like
+            (n_edges, 2) boundary edges as index pairs into boundary_points.
+        interior_point : array-like, optional
+            (2,) a point known to be inside the domain.
         n_ray_samples : int
-            Number of sample points along each ray to verify it stays inside.
+            Number of sample points along each segment to verify it stays inside.
 
         Returns
         -------
         jnp.ndarray
-            (n_bnd, n_bnd) visibility matrix.
+            (n_bnd, n_bnd) visibility matrix (float32).
         """
-        n_bnd = boundary_points.shape[0]
-        n_edges = boundary_edges.shape[0]
+        import numpy as np
+        import time
 
-        # Precompute edge geometry
-        E0 = boundary_points[boundary_edges[:, 0]]  # (n_edges, 2)
-        E1 = boundary_points[boundary_edges[:, 1]]  # (n_edges, 2)
+        P = np.asarray(boundary_points, dtype=np.float64)
+        edges = np.asarray(boundary_edges, dtype=np.int32)
+        n_bnd = P.shape[0]
+        n_edges = edges.shape[0]
 
-        @jax.jit
-        def compute(P, E0, E1, edges, interior_pt):
+        E0 = P[edges[:, 0]]  # (n_edges, 2)
+        E1 = P[edges[:, 1]]  # (n_edges, 2)
 
-            def cross2d(a, b):
-                return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
-
-            # =====================================================================
-            # Winding number for inside/outside test
-            # =====================================================================
-            def winding_number(pt):
-                """
-                Compute winding number of pt w.r.t. all boundary edges.
-                |winding| > 0.5 means inside.
-                """
-                v0 = E0 - pt  # (n_edges, 2)
-                v1 = E1 - pt  # (n_edges, 2)
-
-                cross = cross2d(v0, v1)
-                dot = jnp.sum(v0 * v1, axis=-1)
-                angles = jnp.arctan2(cross, dot)
-
-                return jnp.sum(angles) / (2.0 * jnp.pi)
-
-            def is_inside(pt):
-                wn = winding_number(pt)
-                # Use interior_pt to determine sign convention
-                ref_wn = winding_number(interior_pt)
-                # Inside if same sign as reference
-                return (wn * ref_wn) > 0.25
-
-            # =====================================================================
-            # Ray-edge intersection
-            # =====================================================================
-            def ray_intersects_edge(ray_origin, ray_dir, e0, e1, tol=1e-10):
-                """
-                Check if ray from ray_origin in direction ray_dir intersects edge e0-e1.
-                Returns (intersects, t_ray, t_edge)
-                """
-                edge_dir = e1 - e0
-                denom = cross2d(ray_dir, edge_dir)
-
-                parallel = jnp.abs(denom) < tol
-
-                diff = e0 - ray_origin
-                t_ray = cross2d(diff, edge_dir) / (denom + tol)
-                t_edge = cross2d(diff, ray_dir) / (denom + tol)
-
-                # Valid intersection: t_ray > 0 (in front of ray) and t_edge in [0, 1]
-                valid = (~parallel) & (t_ray > tol) & (t_edge > tol) & (t_edge < 1.0 - tol)
-
-                return valid, t_ray, t_edge
-
-            def segment_intersects_edge_proper(A, B, e0, e1, tol=1e-10):
-                """
-                Check if segment AB properly intersects edge e0-e1.
-                Proper = crosses through interior, not at endpoints.
-                """
-                AB = B - A
-                edge = e1 - e0
-                denom = cross2d(AB, edge)
-
-                parallel = jnp.abs(denom) < tol
-
-                diff = e0 - A
-                t_seg = cross2d(diff, edge) / (denom + tol)
-                t_edge = cross2d(diff, AB) / (denom + tol)
-
-                # Proper intersection: both parameters strictly in (0, 1)
-                eps = 1e-12
-                proper = (~parallel) & (t_seg > eps) & (t_seg < 1 - eps) & (t_edge > eps) & (t_edge < 1 - eps)
-
-                return proper
-
-            # =====================================================================
-            # Main visibility check
-            # =====================================================================
-            def check_visibility(i, j):
-                A = P[i]
-                B = P[j]
-
-                # Same point
-                same = i == j
-
-                # ------------------------------------------------------------------
-                # Check 1: Segment doesn't cross any boundary edge
-                # ------------------------------------------------------------------
-                def check_edge_crossing(k):
-                    e0 = E0[k]
-                    e1 = E1[k]
-                    ei0 = edges[k, 0]
-                    ei1 = edges[k, 1]
-
-                    # Skip edges adjacent to our segment endpoints
-                    adjacent = (ei0 == i) | (ei0 == j) | (ei1 == i) | (ei1 == j)
-
-                    crosses = segment_intersects_edge_proper(A, B, e0, e1)
-                    return crosses & (~adjacent)
-
-                edge_crossings = jax.vmap(check_edge_crossing)(jnp.arange(n_edges))
-                any_crossing = jnp.any(edge_crossings)
-
-                # ------------------------------------------------------------------
-                # Check 2: Ray stays inside domain (sample along segment)
-                # ------------------------------------------------------------------
-                t_samples = jnp.linspace(0.1, 0.9, n_ray_samples)
-                sample_points = A[None, :] + t_samples[:, None] * (B - A)[None, :]
-
-                inside_checks = jax.vmap(is_inside)(sample_points)
-                all_inside = jnp.all(inside_checks)
-
-                # ------------------------------------------------------------------
-                # Check 3: No other boundary point blocks the ray
-                # ------------------------------------------------------------------
-                def point_blocks_ray(k):
-                    """Check if boundary point k lies strictly on segment AB."""
-                    Pk = P[k]
-
-                    # Skip endpoints
-                    is_endpoint = (k == i) | (k == j)
-
-                    # Project Pk onto line AB
-                    AB = B - A
-                    AP = Pk - A
-                    AB_len_sq = jnp.dot(AB, AB) + 1e-12
-                    t = jnp.dot(AP, AB) / AB_len_sq
-
-                    # Distance to line
-                    proj = A + t * AB
-                    dist_sq = jnp.sum((Pk - proj) ** 2)
-
-                    # On segment if: close to line AND t in (0, 1)
-                    tol = 1e-6
-                    on_line = dist_sq < tol**2
-                    in_segment = (t > tol) & (t < 1.0 - tol)
-
-                    return (~is_endpoint) & on_line & in_segment
-
-                blocking = jax.vmap(point_blocks_ray)(jnp.arange(n_bnd))
-                any_blocking = jnp.any(blocking)
-
-                # ------------------------------------------------------------------
-                # Combine all checks
-                # ------------------------------------------------------------------
-                visible = (~same) & (~any_crossing) & all_inside & (~any_blocking)
-
-                return visible.astype(jnp.float32)
-
-            # Vectorize over all pairs
-            ii, jj = jnp.meshgrid(jnp.arange(n_bnd), jnp.arange(n_bnd), indexing="ij")
-            VM = jax.vmap(lambda i: jax.vmap(lambda j: check_visibility(i, j))(jnp.arange(n_bnd)))(jnp.arange(n_bnd))
-
-            return VM
-
-        # Default interior point: centroid (works for simple domains)
         if interior_point is None:
-            interior_point = jnp.mean(boundary_points, axis=0)
+            interior_point = np.mean(P, axis=0)
+        else:
+            interior_point = np.asarray(interior_point, dtype=np.float64)
 
-        return compute(boundary_points, E0, E1, boundary_edges, interior_point)
+        t0 = time.time()
+
+        # ==================================================================
+        # Ray-casting point-in-polygon (works with unoriented edges)
+        # ==================================================================
+        def ray_cast_inside(pts):
+            """
+            pts: (M, 2) -> (M,) bool.  True if inside the polygon.
+            Uses horizontal ray casting — no edge orientation needed.
+            """
+            x = pts[:, 0:1]  # (M, 1)
+            y = pts[:, 1:2]  # (M, 1)
+
+            y0 = E0[np.newaxis, :, 1]  # (1, n_edges)
+            y1 = E1[np.newaxis, :, 1]
+            x0 = E0[np.newaxis, :, 0]
+            x1 = E1[np.newaxis, :, 0]
+
+            # Edge straddles the horizontal ray at height y
+            straddles = (y0 > y) != (y1 > y)
+
+            # x-coordinate where the ray intersects the edge
+            dy = y1 - y0
+            dy_safe = np.where(np.abs(dy) < 1e-14, 1.0, dy)
+            x_int = x0 + (x1 - x0) * (y - y0) / dy_safe
+
+            # Count crossings to the right of the test point
+            crossings = straddles & (x < x_int)
+            n_cross = np.sum(crossings.astype(np.int32), axis=1)  # (M,)
+
+            return (n_cross % 2) == 1
+
+        # ==================================================================
+        # Build adjacency matrix: adj_mask[j, k] = True if edge k touches point j
+        # ==================================================================
+        adj_mask = np.zeros((n_bnd, n_edges), dtype=bool)
+        for k in range(n_edges):
+            adj_mask[edges[k, 0], k] = True
+            adj_mask[edges[k, 1], k] = True
+
+        # ==================================================================
+        # Precompute edge direction and cross-product helpers
+        # ==================================================================
+        edge_dir = E1 - E0  # (n_edges, 2)
+
+        def cross2d(a, b):
+            return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
+
+        # ==================================================================
+        # Process one source row at a time (fully vectorized over targets)
+        # ==================================================================
+        VM = np.zeros((n_bnd, n_bnd), dtype=np.float32)
+
+        # Precompute t_samples for inside checks
+        t_vals = np.linspace(0.15, 0.85, n_ray_samples)
+
+        for i in range(n_bnd):
+            A = P[i]  # (2,)
+
+            # ----- Check 1: segment-edge crossings (vectorized) -----
+            # Segments from A to every B = P[j]
+            AB = P - A  # (n_bnd, 2)
+            diff = E0[None, :, :] - A[None, None, :]  # (1, n_edges, 2) broadcast ok
+
+            # Expand for broadcasting: AB -> (n_bnd, 1, 2), edge_dir -> (1, n_edges, 2)
+            AB_exp = AB[:, None, :]  # (n_bnd, 1, 2)
+            edge_exp = edge_dir[None, :, :]  # (1, n_edges, 2)
+
+            # Actually need per-row diff: E0 - A is same for all j since A is fixed
+            diff_row = (E0 - A)[None, :, :]  # (1, n_edges, 2), broadcasts to (n_bnd, n_edges, 2)
+
+            denom = cross2d(AB_exp, edge_exp)  # (n_bnd, n_edges)
+            parallel = np.abs(denom) < 1e-12
+            denom_safe = np.where(parallel, 1.0, denom)
+
+            t_seg = cross2d(diff_row, edge_exp) / denom_safe  # (n_bnd, n_edges)
+            t_edge = cross2d(diff_row, AB_exp) / denom_safe  # (n_bnd, n_edges)
+
+            eps = 1e-10
+            crossings = (~parallel) & (t_seg > eps) & (t_seg < 1 - eps) & (t_edge > eps) & (t_edge < 1 - eps)
+
+            # Mask out edges adjacent to source i or target j (vectorized)
+            crossings[:, adj_mask[i]] = False  # edges touching point i
+            crossings &= ~adj_mask  # edges touching each point j
+
+            any_crossing = np.any(crossings, axis=1)  # (n_bnd,)
+
+            # ----- Check 2: sample points along each segment must be inside -----
+            # sample_pts[j, t, :] = A + t_vals[t] * AB[j]
+            # AB is already (n_bnd, 2) = P - A
+            # (n_bnd, n_samples, 2)
+            sample_pts = A[None, None, :] + t_vals[None, :, None] * AB[:, None, :]
+            sample_pts_flat = sample_pts.reshape(-1, 2)  # (n_bnd * n_samples, 2)
+
+            inside_flat = ray_cast_inside(sample_pts_flat)  # (n_bnd * n_samples,)
+            inside = inside_flat.reshape(n_bnd, n_ray_samples)
+            all_inside = np.all(inside, axis=1)  # (n_bnd,)
+
+            # ----- Combine -----
+            visible = (~any_crossing) & all_inside
+            visible[i] = False  # diagonal = 0
+
+            VM[i, :] = visible.astype(np.float32)
+
+        elapsed = time.time() - t0
+        print(f"  Visibility matrix ({n_bnd} boundary pts, {n_edges} edges): {elapsed:.2f}s")
+
+        return jnp.array(VM)
 
     @staticmethod
     def extract_boundary_edges(triangles: jnp.ndarray, n_points: int) -> jnp.ndarray:
@@ -1647,7 +1616,7 @@ class MeshUtils:
         return F
 
     @staticmethod
-    @jax.jit
+    # @jax.jit
     def get_view_factor_2d(P, VM, Nrm, ds):
 
         n_pts = P.shape[0]
@@ -1672,8 +1641,8 @@ class MeshUtils:
         F_op = F_ij * ds[None, :]
 
         # enforce row sum = 1
-        row_sum = jnp.sum(F_op, axis=1, keepdims=True)
-        F_op = F_op / row_sum
+        # row_sum = jnp.sum(F_op, axis=1, keepdims=True)
+        F_op = F_op  # / row_sum
 
         return F_op
 
@@ -2003,6 +1972,11 @@ class domain(MeshUtils, Geometries):
             boundary_normals = np.array([[-1], [1]])
 
         if hasattr(mesh, "cell_sets") and mesh.cell_sets:
+            # Compute cumulative offsets: cell_sets may use global cell indices
+            block_offsets = [0]
+            for cell_block in mesh.cells:
+                block_offsets.append(block_offsets[-1] + len(cell_block.data))
+
             for name, cell_data in mesh.cell_sets.items():
                 if name.startswith("gmsh:"):
                     continue
@@ -2014,20 +1988,24 @@ class domain(MeshUtils, Geometries):
                 if isinstance(cell_data, dict):
                     for cell_type, indices in cell_data.items():
                         if len(indices) > 0:
-                            for cell_block in mesh.cells:
+                            for b_idx, cell_block in enumerate(mesh.cells):
                                 if cell_block.type == cell_type:
+                                    offset = block_offsets[b_idx]
                                     for idx in indices:
-                                        if idx < len(cell_block.data):
-                                            tag_points.update(cell_block.data[idx].flatten())
+                                        local_idx = idx - offset
+                                        if 0 <= local_idx < len(cell_block.data):
+                                            tag_points.update(cell_block.data[local_idx].flatten())
                 else:
                     for block_idx, indices in enumerate(cell_data):
                         if indices is None:
                             continue
                         if block_idx < len(mesh.cells) and len(indices) > 0:
                             cell_block = mesh.cells[block_idx]
+                            offset = block_offsets[block_idx]
                             for idx in indices:
-                                if idx < len(cell_block.data):
-                                    tag_points.update(cell_block.data[idx].flatten())
+                                local_idx = idx - offset
+                                if 0 <= local_idx < len(cell_block.data):
+                                    tag_points.update(cell_block.data[local_idx].flatten())
 
                 if tag_points:
                     # Convert set to sorted list for consistent indexing
@@ -2037,11 +2015,16 @@ class domain(MeshUtils, Geometries):
                     self._mesh_pool[name] = points[indices_list]
 
                     # Map indices_list to positions in boundary_normals
-                    # if all indices in indices_list are also in boundary_indices
-                    missing = set(indices_list) - set(index_to_normal_pos.keys())
-                    if not missing:
-                        normal_positions = np.array([index_to_normal_pos[i] for i in indices_list])
+                    # Skip any indices that don't have normals computed
+                    normal_positions = np.array([index_to_normal_pos[i] for i in indices_list if i in index_to_normal_pos])
+                    if len(normal_positions) > 0:
                         self.normals_by_tag[name] = boundary_normals[normal_positions]
+                    else:
+                        # For internal boundaries (not on the mesh boundary), compute normals directly
+                        tag_pt_coords = points[indices_list, : self.dimension]
+                        if len(tag_pt_coords) > 1:
+                            tag_normals, _ = self._compute_normals_pca(points, indices_list, self.dimension, k=min(8, len(indices_list)), mesh=mesh)
+                            self.normals_by_tag[name] = tag_normals[:, : self.dimension]
 
         return boundary_indices
 
@@ -2121,6 +2104,7 @@ class domain(MeshUtils, Geometries):
         sample: Tuple[Optional[int], Optional[Callable]] = (None, None),
         resampling_strategy=None,
         normals: bool = False,
+        reverse_normals: bool = False,
         view_factor: bool = False,
         point_data: bool = False,
         split: bool = False,
@@ -2137,6 +2121,7 @@ class domain(MeshUtils, Geometries):
 
             resampling_strategy: Optional ResamplingStrategy for adaptive point selection
             normals: If True, also compute and return normal vectors for this tag
+            reverse_normals: If True, flip the sign of the normal vectors
             return_indices: Wether or not to return the indices of the sampled points
 
         Returns:
@@ -2188,6 +2173,8 @@ class domain(MeshUtils, Geometries):
         coord_vars.append(Variable(tag="__time__", dim=[0, 1], domain=self, axis="temporal"))
 
         if normals:
+            if reverse_normals:
+                self.context[f"n_{tag}"] = -self.context[f"n_{tag}"]
             coord_vars += [Variable(tag=f"n_{tag}", dim=[i, i + 1], domain=self) for i in range(len(self.spatial))]
 
         if view_factor and hasattr(self, "mesh_connectivity"):
@@ -2204,20 +2191,33 @@ class domain(MeshUtils, Geometries):
 
             all_bp = self.mesh_connectivity["boundary_points"]
             all_VM = self.mesh_connectivity["VM"]
-            subset_bp = P
+            subset_bp = P[0]
+
+            # Check if all points are in the global boundary points (outer boundary)
+            # If not, compute a local visibility matrix for internal boundaries
             point_to_idx = {tuple(pt): i for i, pt in enumerate(all_bp)}
-            subset_indices = np.array([point_to_idx[tuple(pt)] for pt in subset_bp])
-            subset_VM = all_VM[np.ix_(subset_indices, subset_indices)]
+            points_in_boundary = [tuple(pt) in point_to_idx for pt in subset_bp]
+
+            if all(points_in_boundary):
+                # All points are on outer boundary, use global visibility matrix
+                subset_indices = np.array([point_to_idx[tuple(pt)] for pt in subset_bp])
+                subset_VM = all_VM[np.ix_(subset_indices, subset_indices)]
+            else:
+                # Internal boundary - compute local visibility matrix
+                # Use ray-tracing for arbitrary internal boundaries
+                from scipy.spatial.distance import pdist, squareform
+
+                subset_VM = self.get_visibility_matrix_raytrace(subset_bp, np.array([[i, (i + 1) % len(subset_bp)] for i in range(len(subset_bp))]), n_ray_samples=3)
 
             if self.dimension == 1:
-                VF = self.get_view_factor_1d(P, subset_VM, Nrm, ds)
+                VF = self.get_view_factor_1d(P[0], subset_VM, Nrm[0], ds)
             if self.dimension == 2:
-                VF = self.get_view_factor_2d(P, subset_VM, Nrm, ds)
+                VF = self.get_view_factor_2d(P[0], subset_VM, Nrm[0], ds)
             elif self.dimension == 3:
-                VF = self.get_view_factor_3d(P, subset_VM, Nrm, ds)
+                VF = self.get_view_factor_3d(P[0], subset_VM, Nrm[0], ds)
 
             # TODO: Fix if used for multiple domains !
-            self.context[f"v_{tag}"] = subset_VM[None, ...]
+            self.context[f"v_{tag}"] = subset_VM[None, None, ...]
             self._param_tags.add(f"v_{tag}")
             self.context[f"f_{tag}"] = VF[None, ...]
             self._param_tags.add(f"f_{tag}")
@@ -2458,7 +2458,7 @@ class domain(MeshUtils, Geometries):
 
                 # Plot normals if available
                 if show_normals and f"n_{tag}" in self.context:
-                    normals = self.context[f"n_{tag}"][0]  # (N, 2)
+                    normals = self.context[f"n_{tag}"][0, 0]  # (N, 2)
                     ax.quiver(
                         pts[:, 0],
                         pts[:, 1],
@@ -2538,6 +2538,121 @@ class domain(MeshUtils, Geometries):
         plt.close()
 
         self.log.info(f"Saved domain plot to {save_path}")
+
+        # --- Visibility fan plots for tags with view factors ---
+        vf_tags = [k[2:] for k in self.context if k.startswith("v_")]
+        if vf_tags and spatial_dim == 2:
+            self._plot_visibility_fans(save_path, vf_tags, figsize=figsize)
+
+    def _plot_visibility_fans(self, base_save_path: str, tags, figsize=(10, 8), n_show: int = 25):
+        """Plot visibility fans for boundary tags that have view factors.
+
+        Combines all boundary tags into a single 5x5 grid. For each source
+        point, draws lines to every visible boundary point across all tags.
+
+        Args:
+            base_save_path: Base path for saving (``_visibility`` is appended)
+            tags: List of tag names that have visibility matrices
+            figsize: Ignored (fixed 5x5 layout)
+            n_show: Total number of source points across all tags (default 25)
+        """
+        import matplotlib.pyplot as plt
+        import os
+
+        # Collect all boundary data across tags
+        tag_data = []  # list of (tag, pts, VM)
+        for tag in tags:
+            vm_key = f"v_{tag}"
+            if vm_key not in self.context or tag not in self.context:
+                continue
+
+            VM = np.asarray(self.context[vm_key])
+            while VM.ndim > 2:
+                VM = VM[0]
+
+            pts = np.asarray(self.context[tag])
+            if pts.ndim == 4:
+                pts = pts[0, 0]
+            elif pts.ndim == 3:
+                pts = pts[0]
+
+            if pts.shape[0] > 0:
+                tag_data.append((tag, pts, VM))
+
+        if not tag_data:
+            return
+
+        # Collect all boundary points for background rendering
+        all_pts = np.concatenate([pts for _, pts, _ in tag_data], axis=0)
+
+        # Distribute n_show slots across tags proportionally to point count
+        total_bnd = sum(pts.shape[0] for _, pts, _ in tag_data)
+        source_specs = []  # list of (tag, pts, VM, local_idx)
+        remaining = n_show
+        for i, (tag, pts, VM) in enumerate(tag_data):
+            if i == len(tag_data) - 1:
+                n_tag = remaining
+            else:
+                n_tag = max(1, int(round(n_show * pts.shape[0] / total_bnd)))
+                remaining -= n_tag
+            n_tag = min(n_tag, pts.shape[0])
+            indices = np.linspace(0, pts.shape[0] - 1, n_tag, dtype=int)
+            for idx in indices:
+                source_specs.append((tag, pts, VM, idx))
+
+        n_total = len(source_specs)
+        ncols, nrows = 5, 5
+        n_total = min(n_total, nrows * ncols)
+        fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 5 * nrows))
+
+        tag_names = ", ".join(t for t, _, _ in tag_data)
+        fig.suptitle(f"Visibility Fans — {tag_names}  ({total_bnd} boundary pts)", fontsize=14, y=1.01)
+
+        colors = plt.cm.tab10.colors
+
+        for i, ax in enumerate(axes.flat):
+            if i >= n_total:
+                ax.set_visible(False)
+                continue
+
+            tag, pts, VM, idx = source_specs[i]
+            n_bnd = pts.shape[0]
+
+            visible = np.where(VM[idx] == 1)[0]
+            not_visible = np.where(VM[idx] == 0)[0]
+            visible = visible[visible != idx]
+
+            # Draw all boundary points from all tags as light background
+            ax.scatter(all_pts[:, 0], all_pts[:, 1], c="lightgrey", s=6, zorder=1, edgecolors="none")
+
+            # Lines to visible points
+            for j in visible:
+                ax.plot(
+                    [pts[idx, 0], pts[j, 0]],
+                    [pts[idx, 1], pts[j, 1]],
+                    color="lime",
+                    alpha=0.15,
+                    lw=0.5,
+                    zorder=2,
+                )
+
+            # Visible points
+            ax.scatter(pts[visible, 0], pts[visible, 1], c="green", s=12, zorder=3, edgecolors="none")
+            # Source point
+            ax.scatter(pts[idx, 0], pts[idx, 1], c="red", marker="*", s=150, zorder=5, edgecolors="k", linewidths=0.5)
+
+            n_vis = len(visible)
+            ax.set_title(f"{tag} i={idx}, sees {n_vis}/{n_bnd - 1}", fontsize=9)
+            ax.set_aspect("equal")
+            ax.tick_params(labelsize=6)
+
+        fig.tight_layout()
+
+        base, ext = os.path.splitext(base_save_path)
+        fan_path = f"{base}_visibility{ext}"
+        fig.savefig(fan_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        self.log.info(f"Saved visibility fan plot to {fan_path}")
 
     def save(self, filepath: str):
         """Save the trained core model to a file.

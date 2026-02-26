@@ -289,7 +289,7 @@ class FunctionCall(Placeholder):
 
     def copy_with_args(self, new_args):
         """Create a new instance with different args."""
-        return FunctionCall(fn=self.fn, args=new_args, name=self._name, reduces_axis=self.reduces_axis)
+        return FunctionCall(fn=self.fn, args=new_args, name=self._name, reduces_axis=self.reduces_axis, kwargs=self.kwargs)
 
     def __call__(self, args):
         """Return a new FunctionCall with the given args."""
