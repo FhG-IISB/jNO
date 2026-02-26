@@ -78,13 +78,21 @@ class DifferentialOperators:
             u_values[l_idx],
         )
         v1, v2, v3 = p1 - p0, p2 - p0, p3 - p0
-        volumes = jnp.abs(v1[:, 0] * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1]) - v1[:, 1] * (v2[:, 0] * v3[:, 2] - v2[:, 2] * v3[:, 0]) + v1[:, 2] * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0])) / 6.0
+        volumes = (
+            jnp.abs(v1[:, 0] * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1]) - v1[:, 1] * (v2[:, 0] * v3[:, 2] - v2[:, 2] * v3[:, 0]) + v1[:, 2] * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0])) / 6.0
+        )
         if dim == 0:
-            grads = ((u1 - u0) * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1]) + (u2 - u0) * (v3[:, 1] * v1[:, 2] - v3[:, 2] * v1[:, 1]) + (u3 - u0) * (v1[:, 1] * v2[:, 2] - v1[:, 2] * v2[:, 1])) / (6 * volumes + 1e-12)
+            grads = ((u1 - u0) * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1]) + (u2 - u0) * (v3[:, 1] * v1[:, 2] - v3[:, 2] * v1[:, 1]) + (u3 - u0) * (v1[:, 1] * v2[:, 2] - v1[:, 2] * v2[:, 1])) / (
+                6 * volumes + 1e-12
+            )
         elif dim == 1:
-            grads = ((u1 - u0) * (v2[:, 2] * v3[:, 0] - v2[:, 0] * v3[:, 2]) + (u2 - u0) * (v3[:, 2] * v1[:, 0] - v3[:, 0] * v1[:, 2]) + (u3 - u0) * (v1[:, 2] * v2[:, 0] - v1[:, 0] * v2[:, 2])) / (6 * volumes + 1e-12)
+            grads = ((u1 - u0) * (v2[:, 2] * v3[:, 0] - v2[:, 0] * v3[:, 2]) + (u2 - u0) * (v3[:, 2] * v1[:, 0] - v3[:, 0] * v1[:, 2]) + (u3 - u0) * (v1[:, 2] * v2[:, 0] - v1[:, 0] * v2[:, 2])) / (
+                6 * volumes + 1e-12
+            )
         else:
-            grads = ((u1 - u0) * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0]) + (u2 - u0) * (v3[:, 0] * v1[:, 1] - v3[:, 1] * v1[:, 0]) + (u3 - u0) * (v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0])) / (6 * volumes + 1e-12)
+            grads = ((u1 - u0) * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0]) + (u2 - u0) * (v3[:, 0] * v1[:, 1] - v3[:, 1] * v1[:, 0]) + (u3 - u0) * (v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0])) / (
+                6 * volumes + 1e-12
+            )
         grads = jnp.where(volumes > 1e-12, grads, 0.0)
         volume_weights = jnp.where(volumes > 1e-12, volumes, 0.0)
         contributions = grads * volume_weights
@@ -667,11 +675,12 @@ class TraceEvaluator:
 
     def _eval_function_call(self, expr, ctx):
         args = [(self._dispatch(arg, ctx) if isinstance(arg, Placeholder) else arg) for arg in expr.args]
+        kwargs = expr.kwargs if expr.kwargs else {}
         sig = inspect.signature(expr.fn)
         if "key" in sig.parameters:
-            return expr.fn(*args, key=ctx.key)
+            return expr.fn(*args, key=ctx.key, **kwargs)
         else:
-            return expr.fn(*args)
+            return expr.fn(*args, **kwargs)
 
     def _eval_slice(self, expr, ctx):
         target = self._dispatch(expr.target, ctx)

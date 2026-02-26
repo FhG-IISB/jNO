@@ -289,7 +289,7 @@ class FunctionCall(Placeholder):
 
     def copy_with_args(self, new_args):
         """Create a new instance with different args."""
-        return FunctionCall(fn=self.fn, args=new_args, name=self._name, reduces_axis=self.reduces_axis)
+        return FunctionCall(fn=self.fn, args=new_args, name=self._name, reduces_axis=self.reduces_axis, kwargs=self.kwargs)
 
     def __call__(self, args):
         """Return a new FunctionCall with the given args."""
@@ -365,7 +365,10 @@ class ConstantNamespace:
             # Check if it contains dicts (don't convert to array)
             if any(isinstance(item, dict) for item in value):
                 # Convert each dict to ConstantNamespace, keep others as-is
-                return [(ConstantNamespace(f"{key}[{i}]", item, _parent_tag=parent_tag) if isinstance(item, dict) else ConstantNamespace._convert_value(item, f"{key}[{i}]", parent_tag)) for i, item in enumerate(value)]
+                return [
+                    (ConstantNamespace(f"{key}[{i}]", item, _parent_tag=parent_tag) if isinstance(item, dict) else ConstantNamespace._convert_value(item, f"{key}[{i}]", parent_tag))
+                    for i, item in enumerate(value)
+                ]
             # Check if it's numeric (could be nested arrays)
             if ConstantNamespace._is_numeric_sequence(value):
                 return jnp.asarray(value)

@@ -4,7 +4,6 @@ import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
 from jax.experimental import mesh_utils
 import optax
-import lox
 import cloudpickle
 import numpy as np
 import time
