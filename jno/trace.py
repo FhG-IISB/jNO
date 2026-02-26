@@ -218,9 +218,6 @@ class Placeholder:
     @property
     def mse(self):
         def fn(x):
-
-            print(f"Shape before .mse {x.shape}")
-
             return jnp.squeeze(jnp.mean(jnp.square(x)))
 
         return FunctionCall(fn, [self], "mse", True)

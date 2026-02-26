@@ -335,39 +335,26 @@ class core(CoreUtilities):
         )
 
     # Training
-    def _make_loss_fn(self, compiled_constraints, batchsize, frozen, static, checkpoint_gradients=False):
-        """Create loss function — differentiates w.r.t. *trainable* only.
-
-        Context is passed as a parameter (not closed over) so that it can
-        be swapped each step for host-offloaded data.
-
-        Args:
-            checkpoint_gradients: If True, wrap each constraint evaluation
-                in ``jax.checkpoint`` to trade recomputation for lower
-                activation memory.
-        """
+    def _make_loss_fn(self, compiled_constraints_fn, n_constraints, batchsize, frozen, static, checkpoint_gradients=False):
+        """Create loss function — evaluates ALL constraints in one combined call."""
 
         def loss_fn(trainable, context, tag_weights, rng):
             full_models = eqx.combine(trainable, frozen, static)
-            losses = []
-            for fn in compiled_constraints:
-                if checkpoint_gradients:
-                    # Close over fn and batchsize so they are NOT traced
-                    # through the checkpoint boundary (batchsize is used in
-                    # Python-level conditionals inside compiled_fn).
-                    _fn, _bs = fn, batchsize
 
-                    @jax.checkpoint
-                    def _remat_eval(models, ctx, key):
-                        return _fn(models, ctx, batchsize=_bs, key=key)
+            if checkpoint_gradients:
+                _fn, _bs = compiled_constraints_fn, batchsize
 
-                    residual = _remat_eval(full_models, context, rng)
-                else:
-                    residual = fn(full_models, context, batchsize=batchsize, key=rng)
-                mean_squared_residual = jnp.mean(residual)
-                losses.append(mean_squared_residual)
+                @jax.checkpoint
+                def _remat_eval(models, ctx, key):
+                    return _fn(models, ctx, batchsize=_bs, key=key)
 
-            losses = jnp.stack(losses)
+                all_residuals = _remat_eval(full_models, context, rng)
+            else:
+                # One call → one JAX function → XLA applies CSE across constraints
+                all_residuals = compiled_constraints_fn(full_models, context, batchsize=batchsize, key=rng)
+
+            # all_residuals is a list of (B, T, ...) arrays — one per constraint
+            losses = jnp.stack([jnp.mean(r) for r in all_residuals])
             weighted_loss = jnp.dot(tag_weights, losses)
             return weighted_loss, losses
 
@@ -392,7 +379,7 @@ class core(CoreUtilities):
     def make_step_fn(
         self,
         per_model_opts,
-        compiled_constraints,
+        compiled_constraints_fn,  # <-- renamed from compiled_constraints
         n_constraints,
         batchsize,
         frozen,
@@ -418,7 +405,8 @@ class core(CoreUtilities):
             checkpoint_gradients: Wrap constraint evaluations in ``jax.checkpoint``.
         """
         loss_fn = self._make_loss_fn(
-            compiled_constraints,
+            self.compiled_constraints_fn,  # combined fn (replaces list)
+            self.n_constraints,
             batchsize,
             frozen,
             static,
@@ -503,6 +491,8 @@ class core(CoreUtilities):
         else:
             print(text)
 
+        return self
+
     def compile(self, mesh: tuple = (1, 1)):
 
         # === Parallelism ===
@@ -529,13 +519,12 @@ class core(CoreUtilities):
         self.models = self._shard_params(self.models)
 
         # === Compile constraints and trackers ===
-        self.compiled_constraints = []
         self.compiled_trackers = []
         self._constraint_exprs = []  # raw expressions for shape tracing
         self._tracker_exprs = []
+        constraint_exprs = []
+
         for expr in constraints:
-            # Unwrap Tracker nodes — compile the inner expression,
-            # but route it to the tracker list instead of constraints.
             inner = expr
             tracker_interval = None
             if isinstance(expr, OperationDef) and isinstance(expr.expr, Tracker):
@@ -545,13 +534,18 @@ class core(CoreUtilities):
                 tracker_interval = expr.interval
                 inner = expr.expr
 
-            fn_expr = TraceEvaluator.compile_traced_expression(inner, self.all_ops)
             if tracker_interval is not None:
+                fn_expr = TraceEvaluator.compile_traced_expression(inner, self.all_ops)
                 self.compiled_trackers.append((tracker_interval, fn_expr))
                 self._tracker_exprs.append(inner)
             else:
-                self.compiled_constraints.append(fn_expr)
+                constraint_exprs.append(inner)
                 self._constraint_exprs.append(inner)
+
+        # Compile all normal constraints in ONE combined function so XLA
+        # can apply CSE across shared sub-expressions.
+        self.compiled_constraints_fn = TraceEvaluator.compile_multi_expression(constraint_exprs, self.all_ops)
+        self.n_constraints = len(constraint_exprs)
 
         # self.log.info(f"There are a total of {self.count(self.models)} trainable parameters in the network/s.")
         return None
@@ -588,10 +582,9 @@ class core(CoreUtilities):
         Returns:
             statistics: Training history with ``.plot()`` convenience.
         """
-        n_constraints = len(self.compiled_constraints)
         batchsize = batchsize if batchsize is not None else self.domain.total_samples
 
-        self.constraint_weights = constraint_weights if constraint_weights is not None else WeightSchedule([1.0] * n_constraints)
+        self.constraint_weights = constraint_weights if constraint_weights is not None else WeightSchedule([1.0] * self.n_constraints)
 
         # ── 0. Validate offload_data ──
         if offload_data and (batchsize is None or batchsize >= self.domain.total_samples):
@@ -608,6 +601,7 @@ class core(CoreUtilities):
 
         # ── 2. Apply LoRA transforms ──
         models = dict(self.models)
+        lora_param_counts = {}  # Track LoRA params per model for logging
         for lid, fm in flax_mods.items():
             if fm._lora_config is not None:
                 rank, alpha = fm._lora_config
@@ -624,6 +618,7 @@ class core(CoreUtilities):
                 n_params_before = sum(l.size for l in jax.tree_util.tree_leaves(model_before) if eqx.is_array(l))
                 n_params_after = sum(l.size for l in jax.tree_util.tree_leaves(model_after) if eqx.is_array(l))
                 n_lora_params = n_params_after - n_params_before
+                lora_param_counts[lid] = n_lora_params
 
                 if isinstance(model_after, FlaxLoRAWrapper):
                     # Count LoRA layers from the Flax lora_params dict
@@ -695,13 +690,31 @@ class core(CoreUtilities):
         trainable, rest = eqx.partition(models, filter_spec)
         frozen_arrays, static = eqx.partition(rest, eqx.is_array)
 
+        # ── 4b. Log parameter counts ──
+        def _count_params(pytree):
+            """Count total parameters in a pytree."""
+            return sum(l.size for l in jax.tree_util.tree_leaves(pytree) if eqx.is_array(l))
+
+        n_trainable_params = _count_params(trainable)
+        n_frozen_params = _count_params(frozen_arrays)
+        n_total_params = n_trainable_params + n_frozen_params
+        n_lora_params_total = sum(lora_param_counts.values())
+
+        self.log.info(f"Parameter summary:")
+        self.log.info(f"  Trainable parameters:  {n_trainable_params:>12,}")
+        self.log.info(f"  Frozen parameters:     {n_frozen_params:>12,}")
+        self.log.info(f"  Total parameters:      {n_total_params:>12,}")
+        if n_lora_params_total > 0:
+            self.log.info(f"  LoRA parameters:       {n_lora_params_total:>12,} (included in trainable)")
+            self.log.info(f"  LoRA % of total:       {100.0 * n_lora_params_total / n_total_params:>11.2f}%")
+
         # Shard trainable params
         trainable = self._shard_params(trainable)
 
         # ── 5. Build per-model optimizers ──
         per_model_opts = {}  # {str(lid): optax chain}
         lr_schedules = {}  # {str(lid): LearningRateSchedule}
-        zeros = jnp.zeros(n_constraints)
+        zeros = jnp.zeros(self.n_constraints)
 
         for lid, fm in flax_mods.items():
             if fm._frozen:
@@ -765,8 +778,8 @@ class core(CoreUtilities):
         # ── 7. Build JIT-compiled step function ──
         step_fn = self.make_step_fn(
             per_model_opts=per_model_opts,
-            compiled_constraints=self.compiled_constraints,
-            n_constraints=n_constraints,
+            compiled_constraints_fn=self.compiled_constraints_fn,  # <-- updated
+            n_constraints=self.n_constraints,
             batchsize=effective_batchsize,
             frozen=frozen_arrays,
             static=static,
@@ -808,7 +821,7 @@ class core(CoreUtilities):
 
             # Place scalars on the mesh so their output sharding matches.
             self.rng = jax.device_put(self.rng, replicated)
-            prev_losses = jax.device_put(jnp.zeros(n_constraints), replicated)
+            prev_losses = jax.device_put(jnp.zeros(self.n_constraints), replicated)
 
             in_shardings = (
                 jax.tree_util.tree_map(_leaf_sharding, trainable),  # trainable
@@ -848,7 +861,7 @@ class core(CoreUtilities):
             hw_monitor.start()
 
             print_rate = max(1, epochs // 100 if epochs < 100_000 else epochs // 1000)
-            prev_losses = jax.device_put(jnp.zeros(n_constraints), replicated)
+            prev_losses = jax.device_put(jnp.zeros(self.n_constraints), replicated)
 
             # Log buffers
             log_epochs = []
@@ -872,21 +885,7 @@ class core(CoreUtilities):
 
                 epoch_jnp = jax.device_put(jnp.int32(epoch), replicated)
 
-                (
-                    trainable,
-                    opt_states,
-                    self.rng,
-                    total_loss,
-                    individual_losses,
-                    tag_weights,
-                ) = jit_step(
-                    trainable,
-                    opt_states,
-                    self.rng,
-                    context,
-                    epoch_jnp,
-                    prev_losses,
-                )
+                (trainable, opt_states, self.rng, total_loss, individual_losses, tag_weights) = jit_step(trainable, opt_states, self.rng, context, epoch_jnp, prev_losses)
 
                 prev_losses = individual_losses
 
@@ -958,6 +957,10 @@ class core(CoreUtilities):
                 "weights": np.stack(log_weights) if log_weights else np.array([]),
                 "timestamps": np.array(log_timestamps),
                 "training_time": et - st,
+                "trainable_params": n_trainable_params,
+                "frozen_params": n_frozen_params,
+                "total_params": n_total_params,
+                "lora_params": n_lora_params_total,
             }
             if log_track_stats:
                 logs["track_stats"] = np.array(log_track_stats)
@@ -988,17 +991,17 @@ class core(CoreUtilities):
         # Create dummy inputs for shape inference
         test_rng = jax.random.PRNGKey(0)
 
-        for i, fn in enumerate(self.compiled_constraints):
-            # Use jax.eval_shape to get output shape without computation
-            out_shape = jax.eval_shape(
-                lambda: fn(
-                    self.models,
-                    self.domain_data.context,
-                    batchsize=batchsize,
-                    key=test_rng,
-                )
+        # Use jax.eval_shape to get output shape without computation
+        out_shape = jax.eval_shape(
+            lambda: self.compiled_constraints_fn(
+                self.models,
+                self.domain_data.context,
+                batchsize=batchsize,
+                key=test_rng,
             )
-            self.log.info(f"Constraint {i}: Shape = {out_shape.shape}")
+        )
+        for i, const in enumerate(out_shape):
+            self.log.info(f"Constraint {i}: Shape = {const.shape}")
 
         for i, (_, fn) in enumerate(self.compiled_trackers):
             # Use jax.eval_shape to get output shape without computation
@@ -1105,6 +1108,8 @@ class core(CoreUtilities):
                 print()
             except Exception as exc:
                 print(f"═══ Tracker {i} ═══  FAILED: {exc}")
+
+        return self
 
     def sweep(
         self,

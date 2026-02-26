@@ -65,8 +65,7 @@ class IREEModel:
                     "--iree-llvmcpu-target-cpu=host",
                     "--iree-llvmcpu-target-cpu-features=host",
                     "--iree-llvmcpu-enable-ukernels=all",
-                    # INCREASE STACK LIMIT (e.g., 256KB or 512KB)
-                    "--iree-llvmcpu-stack-allocation-limit=262144",  # 256KB # "--iree-llvmcpu-stack-allocation-limit=524288",  # 512KB
+                    "--iree-llvmcpu-stack-allocation-limit=524288",  # 512KB
                     # Enable microkernels
                     "--iree-llvmcpu-enable-ukernels=all",
                     # LLVM optimizations

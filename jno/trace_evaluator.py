@@ -409,27 +409,25 @@ class TraceEvaluator:
     def _trace_visit(self, node, ctx, depth, lines, seen):
         """Recursively visit *node*, evaluate it, and record its shape."""
         pad = "  " * depth
-        label = self._node_label(node)
+        uid, label = self._node_label(node)
 
-        # Use jax.eval_shape to get the abstract shape without computation.
-        # This avoids triggering actual AD / vmap inside Jacobian/Hessian.
         try:
             abstract = jax.eval_shape(lambda: self._dispatch(node, ctx))
             shape_str = str(abstract.shape) if hasattr(abstract, "shape") else "scalar"
         except Exception:
-            # eval_shape can fail for AD derivatives (jax.hessian inside
-            # jax.eval_shape with closures over traced values).  Fall back
-            # to shape inference from the node's children.
             shape_str = self._infer_shape_from_children(node, ctx)
 
-        # Emit this node
-        # Right-align shape annotation at column 60
-        entry = f"{pad}{label}"
-        shape_col = max(60, len(entry) + 2)
-        entry = entry.ljust(shape_col) + f"→ {shape_str}"
+        # Layout:
+        #   #3fa2c1  │    BinaryOp(-)                  → (513, 1)
+        #   ^uid^    ^indent + label^                  ^shape^
+        tree_part = f"{pad}{label}"
+        shape_col = max(60, len(tree_part) + 2)
+        tree_part = tree_part.ljust(shape_col) + f"→ {shape_str}"
+
+        # uid column is fixed 10 chars wide, separated by │
+        entry = f"{uid}  │  {tree_part}"
         lines.append(entry)
 
-        # Recurse into children so the user sees the full tree
         self._trace_children(node, ctx, depth, lines, seen)
 
     def _trace_children(self, node, ctx, depth, lines, seen):
@@ -534,63 +532,6 @@ class TraceEvaluator:
                 return "??"
 
         return "??"
-
-    @staticmethod
-    def _node_label(node) -> str:
-        """Concise one-line label for a trace node."""
-        if isinstance(node, Variable):
-            tag = node.tag
-            dim = node.dim
-            axis = getattr(node, "axis", "spatial")
-            axis_str = f", {axis}" if axis != "spatial" else ""
-            return f"Variable({tag}[{dim[0]}:{dim[1]}]{axis_str})"
-        if isinstance(node, TensorTag):
-            return f"TensorTag({node.tag})"
-        if isinstance(node, Constant):
-            val = node.value
-            if hasattr(val, "shape") and val.shape == ():
-                val = float(val)
-            return f"Constant({node.tag}.{node.key}={val})"
-        if isinstance(node, Literal):
-            v = node.value
-            if hasattr(v, "shape"):
-                if v.shape == ():
-                    v = float(v)
-                else:
-                    v = v.shape
-            return f"Literal({v})"
-        if isinstance(node, BinaryOp):
-            return f"BinaryOp({node.op})"
-        if isinstance(node, FunctionCall):
-            name = node._name or getattr(node.fn, "__name__", "fn")
-            return f"FunctionCall({name})"
-        if isinstance(node, Concat):
-            return f"Concat(axis={node.axis})"
-        if isinstance(node, FlaxModuleCall):
-            mod = node.model
-            mod_name = type(mod.module).__name__ if hasattr(mod, "module") else str(mod)
-            return f"FlaxModuleCall({mod_name})"
-        if isinstance(node, TunableModuleCall):
-            return f"TunableModuleCall(id={node.model.layer_id})"
-        if isinstance(node, OperationDef):
-            vars_str = ", ".join(str(v) for v in node._collected_vars)
-            return f"OperationDef[{node.op_id}]({vars_str})"
-        if isinstance(node, OperationCall):
-            return f"OperationCall[{node.operation.op_id}]"
-        if isinstance(node, Jacobian):
-            vars_str = ", ".join(str(v) for v in node.variables)
-            scheme_str = f", {node.scheme[:2]}" if node.scheme else ""
-            return f"Jacobian([{vars_str}]{scheme_str})"
-        if isinstance(node, Hessian):
-            kind = "Laplacian" if node.trace else "Hessian"
-            vars_str = ", ".join(str(v) for v in node.variables)
-            scheme_str = f", {node.scheme[:2]}" if node.scheme else ""
-            return f"{kind}([{vars_str}]{scheme_str})"
-        if isinstance(node, Slice):
-            return f"Slice({node.key})"
-        if isinstance(node, Reshape):
-            return f"Reshape({node.target_shape})"
-        return type(node).__name__
 
     # Dispatch table — maps node type → handler method name.
     # ORDER MATTERS: more specific types (Constant, Literal) come first
@@ -1699,3 +1640,204 @@ class TraceEvaluator:
                 all_models[layer.layer_id] = model
 
         return all_models, rng
+
+    @staticmethod
+    def compile_multi_expression(
+        exprs: List[Placeholder],
+        all_ops: List[OperationDef],
+    ) -> Callable:
+        """Compile multiple constraint expressions into a SINGLE function.
+
+        All expressions are evaluated by the same ``TraceEvaluator`` instance,
+        so JAX/XLA sees them in one compilation unit and can apply CSE across
+        constraints.  Individual residual arrays are returned as a list so
+        ``_make_loss_fn`` can still compute per-constraint losses.
+
+        Mirrors ``compile_traced_expression`` exactly — only
+        ``evaluate_single_point_set`` changes.
+        """
+        TIME_TAG = "__time__"
+
+        def evaluate_single_point_set(params, context_single, key):
+            """Evaluate ALL expressions on one (N, D) context — shared evaluator."""
+            evaluator = TraceEvaluator(params)
+            # One evaluator → one JAX trace → XLA sees all constraints together
+            return [evaluator.evaluate(expr, context_single, {}, key) for expr in exprs]
+
+        # Everything below is identical to compile_traced_expression.
+        # (copy the full compiled_fn body here — see note below)
+        def compiled_fn(params, context=None, batchsize=None, key=None):
+            context = context or {}
+
+            all_tags = set()
+            for op in all_ops:
+                if hasattr(op, "_collected_vars"):
+                    for var in op._collected_vars:
+                        all_tags.add(var.tag)
+
+            tag_order = tuple(sorted(context.keys(), key=lambda t: (t not in all_tags, t)))
+            ctx_tuple = tuple(context[tag] for tag in tag_order) if tag_order else ()
+
+            batched_sizes = []
+            for tag, arr in zip(tag_order, ctx_tuple):
+                if tag == TIME_TAG:
+                    continue
+                if hasattr(arr, "ndim") and arr.ndim >= 1:
+                    batched_sizes.append(arr.shape[0])
+
+            if not batched_sizes:
+                return evaluate_single_point_set(params, context, key=key)
+
+            B = max(batched_sizes)
+
+            if batchsize is not None:
+                if key is None:
+                    raise ValueError("A JAX random key must be provided when batchsize is specified.")
+                if batchsize > B:
+                    print("WARNING: batchsize larger than sampling -> replace=True")
+                    indices = jax.random.choice(key, B, shape=(batchsize,), replace=True)
+                    indices = jnp.sort(indices)
+                elif batchsize < B:
+                    indices = jax.random.choice(key, B, shape=(batchsize,), replace=False)
+                    indices = jnp.sort(indices)
+                else:
+                    indices = jnp.arange(0, B, 1)
+
+                def subset_entry(tag_name, arr):
+                    if tag_name == TIME_TAG:
+                        return arr
+                    if hasattr(arr, "ndim") and arr.ndim >= 1 and arr.shape[0] == B:
+                        return arr[indices]
+                    return arr
+
+                ctx_tuple = tuple(subset_entry(t, a) for t, a in zip(tag_order, ctx_tuple))
+                B = batchsize
+
+            time_arr = None
+            spatial_tag_order = []
+            spatial_ctx = []
+            for tag, arr in zip(tag_order, ctx_tuple):
+                if tag == TIME_TAG:
+                    time_arr = jnp.asarray(arr)
+                else:
+                    spatial_tag_order.append(tag)
+                    spatial_ctx.append(arr)
+
+            spatial_tag_order = tuple(spatial_tag_order)
+            spatial_ctx = tuple(spatial_ctx)
+
+            def normalize_entry(arg):
+                if not hasattr(arg, "ndim") or arg.ndim == 0:
+                    return arg, None
+                bs = arg.shape[0]
+                if bs == B:
+                    return arg, 0
+                elif bs == 1:
+                    return jnp.squeeze(arg, axis=0), None
+                else:
+                    return arg, None
+
+            new_ctx, ctx_in_axes = [], []
+            for a in spatial_ctx:
+                a2, ax = normalize_entry(a)
+                new_ctx.append(a2)
+                ctx_in_axes.append(ax)
+            spatial_ctx = tuple(new_ctx)
+            ctx_in_axes = tuple(ctx_in_axes)
+
+            def scan_over_time(spatial_vals, rng_key):
+                T = None
+                for v in spatial_vals:
+                    if hasattr(v, "ndim") and v.ndim >= 3:
+                        T = v.shape[0]
+                        break
+                if T is None:
+                    T = 1
+
+                def scan_body(carry, t_idx):
+                    ctx_dict = {}
+                    for tag, arr in zip(spatial_tag_order, spatial_vals):
+                        if hasattr(arr, "ndim") and arr.ndim >= 3:
+                            ctx_dict[tag] = arr[t_idx]
+                        else:
+                            ctx_dict[tag] = arr
+                    if time_arr is not None:
+                        ctx_dict[TIME_TAG] = time_arr[t_idx]
+
+                    # Returns a LIST of residuals (one per constraint)
+                    result = evaluate_single_point_set(params, ctx_dict, key=rng_key)
+                    return carry, result
+
+                _, results = jax.lax.scan(scan_body, init=None, xs=jnp.arange(T))
+                # results is a list of (T, ...) arrays
+                return results
+
+            if key is not None:
+                keys = jax.random.split(key, B)
+                vmapped_fn = jax.vmap(scan_over_time, in_axes=(ctx_in_axes, 0))
+                return vmapped_fn(spatial_ctx, keys)
+            else:
+
+                def scan_over_time_no_key(spatial_vals):
+                    return scan_over_time(spatial_vals, rng_key=None)
+
+                vmapped_fn = jax.vmap(scan_over_time_no_key, in_axes=(ctx_in_axes,))
+                return vmapped_fn(spatial_ctx)
+
+        return compiled_fn
+
+    @staticmethod
+    def _node_label(node) -> str:
+        """Return (uid, label) — rendered separately by _trace_visit."""
+        uid = f"#{id(node) % 0xFFFFFF:06x}"
+        if isinstance(node, Variable):
+            tag = node.tag
+            dim = node.dim
+            axis = getattr(node, "axis", "spatial")
+            axis_str = f", {axis}" if axis != "spatial" else ""
+            return uid, f"Variable({tag}[{dim[0]}:{dim[1]}]{axis_str})"
+        if isinstance(node, TensorTag):
+            return uid, f"TensorTag({node.tag})"
+        if isinstance(node, Constant):
+            val = node.value
+            if hasattr(val, "shape") and val.shape == ():
+                val = float(val)
+            return uid, f"Constant({node.tag}.{node.key}={val})"
+        if isinstance(node, Literal):
+            v = node.value
+            if hasattr(v, "shape"):
+                v = float(v) if v.shape == () else v.shape
+            return uid, f"Literal({v})"
+        if isinstance(node, BinaryOp):
+            return uid, f"BinaryOp({node.op})"
+        if isinstance(node, FunctionCall):
+            name = node._name or getattr(node.fn, "__name__", "fn")
+            return uid, f"FunctionCall({name})"
+        if isinstance(node, Concat):
+            return uid, f"Concat(axis={node.axis})"
+        if isinstance(node, FlaxModuleCall):
+            mod = node.model
+            mod_name = type(mod.module).__name__ if hasattr(mod, "module") else str(mod)
+            lid = getattr(mod, "layer_id", "?")
+            return uid, f"FlaxModuleCall({mod_name}, layer={lid})"
+        if isinstance(node, TunableModuleCall):
+            return uid, f"TunableModuleCall(id={node.model.layer_id})"
+        if isinstance(node, OperationDef):
+            vars_str = ", ".join(str(v) for v in node._collected_vars)
+            return uid, f"OperationDef[{node.op_id}]({vars_str})"
+        if isinstance(node, OperationCall):
+            return uid, f"OperationCall[{node.operation.op_id}]"
+        if isinstance(node, Jacobian):
+            vars_str = ", ".join(str(v) for v in node.variables)
+            scheme_str = f", {node.scheme[:2]}" if node.scheme else ""
+            return uid, f"Jacobian([{vars_str}]{scheme_str})"
+        if isinstance(node, Hessian):
+            kind = "Laplacian" if node.trace else "Hessian"
+            vars_str = ", ".join(str(v) for v in node.variables)
+            scheme_str = f", {node.scheme[:2]}" if node.scheme else ""
+            return uid, f"{kind}([{vars_str}]{scheme_str})"
+        if isinstance(node, Slice):
+            return uid, f"Slice({node.key})"
+        if isinstance(node, Reshape):
+            return uid, f"Reshape({node.target_shape})"
+        return uid, type(node).__name__

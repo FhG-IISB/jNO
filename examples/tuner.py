@@ -83,8 +83,9 @@ crux.save(f"{dire}/crux.pkl")
 
 print("\n\n=== Per-model .tune() demo ===\n")
 
-domain2 = jno.domain(constructor=jno.domain.disk(mesh_size=0.05))
-x2, y2 = domain2.variable("interior")
+domain = jno.domain(constructor=jno.domain.disk(mesh_size=0.05))
+x, y = domain.variable("interior")
+C = jnn.constant("C", "/constant.yml")
 
 # Model A — a small "backbone" that we might freeze or LoRA
 key2 = jax.random.PRNGKey(42)
@@ -95,18 +96,26 @@ backbone.dont_show()
 backbone.tune(
     freeze=[True, False],
     lora=[(4, 1.0), None],  # try LoRA rank 4 or no LoRA
-    optimizer=[optax.adam],
+    optimizer=[optax.adam(1), optax.chain(optax.clip_by_global_norm(1e-3), optax.lbfgs(1))],
     lr=[lrs.constant(1e-3), lrs.constant(1e-4)],
 )
 
-_u2 = backbone * x2 * (1 - x2) * y2 * (1 - y2)
-pde2 = -jnn.laplacian(_u2, [x2, y2]) - 1.0
 
-crux2 = jno.core([pde2.mse], domain2)
+def f():
+    return None
+
+
+u = backbone * x * (1 - x) * y * (1 - y)
+pde2 = -C.k * jnn.laplacian(u, [x, y]) - jnn.function(f, [x, y])
+crux2 = jno.core(constraints=[pde2.mse], domain=domain, rng_seed=42, mesh=(1, 1))
 
 # Global space — only epochs
 space2 = jnn.tune.space()
 space2.unique("epochs", [200, 500])
+space2.unique("batchsize", [1, 2])
+
+
+stats = crux.solve(epochs=10_000, batchsize=1, checkpoint_gradients=True, offload_data=True)
 
 stats2 = crux2.sweep(space=space2, optimizer=ng.optimizers.NGOpt, budget=4)
 stats2.plot(f"{dire}/per_model_tune.png")

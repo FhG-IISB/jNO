@@ -8,10 +8,11 @@ authors = [{ name = "Leon Armbruster", email = "leonarmbruster@iisb.fraunhofer.d
 
 dependencies = [
     "jax>=0.4.38,<=0.8.1",
-    "flax",
+    "equinox",
     "optax",
-    "lox @ git+https://github.com/huterguier/lox",
     "soap_jax @ git+https://github.com/haydn-jones/SOAP_JAX",
+    "jax_morph @git+https://github.com/armbrusl/jax_morph",
+    "jax_mpp @git+https://github.com/armbrusl/jax_mpp",
     "jaxkan",
     "numpy",
     "matplotlib",

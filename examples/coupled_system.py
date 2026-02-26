@@ -152,6 +152,8 @@ domain.plot(f"{dire}/train_domain.png")
 # -----------------------------------------------------------------------------
 # Neural network models
 # -----------------------------------------------------------------------------
+key = jax.random.PRNGKey(0)
+k1, k2 = jax.random.split(key)
 
 
 # Models are defined using equinox modules or jno-provided templates.
@@ -179,8 +181,10 @@ class MLP(eqx.Module):
         return u
 
 
-key = jax.random.PRNGKey(0)
-k1, k2 = jax.random.split(key)
+# Alternatively, wrap a custom equinox Module for v.
+v_net = jnn.nn.wrap(MLP(key=k2))
+v = v_net(x, y, k)
+
 
 # Use a predefined MLP model for u.
 # Multiplication by x(1-x)y(1-y) hard-enforces homogeneous Dirichlet BCs.
@@ -193,10 +197,6 @@ u = u_net(x, y) * x * (1 - x) * y * (1 - y)
 # Wrapper for flax.debug.print -> use _shape, _min, _val, _max, _mean
 # u.debug._shape = True
 
-
-# Alternatively, wrap a custom equinox Module for v.
-v_net = jnn.nn.wrap(MLP(key=k2))
-v = v_net(x, y, k)
 
 # The resulting neural networks can be combined freely
 # with jno.numpy differential operators.

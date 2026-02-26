@@ -85,7 +85,7 @@ References
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from typing import Callable, Optional, Tuple, Sequence, Literal, List, Union
+from typing import Callable, Optional, Tuple, Sequence, Literal, List, Union, Any
 from jax_poseidon import ScOT, ScOTConfig
 from jax_walrus import IsotropicModel as WalrusModel
 from jax_morph import ViT3DRegression as MorphModel
@@ -111,6 +111,8 @@ from .pit import PiT, PiTWithCoords
 from .gnot import CGPTNO, GNOT, MoEGPTNO
 from .cno import CNO2D
 from .common import FlaxModelWrapper
+from .linear import Linear
+from .lora_linear import LoRALinear
 
 from ..tuner import ArchSpace
 from ..trace import FlaxModule, TunableModule
@@ -181,6 +183,9 @@ class nn:
     - `poseidonT/B/L()`: Pretrained foundation models
 
     """
+
+    def linear(in_features: int, out_features: int, use_bias: bool = True, *, key: Any):
+        return Linear(in_features, out_features, use_bias, key=key)
 
     # =========================================================================
     # Core Wrapping Methods

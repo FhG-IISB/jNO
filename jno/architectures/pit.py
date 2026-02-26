@@ -407,6 +407,7 @@ class PiTWithCoords(eqx.Module):
         Returns:
             output: float[batch_size, n_points, out_channels]
         """
+
         squeeze_batch = False
         if x.ndim == 2:
             x = x[None, ...]
