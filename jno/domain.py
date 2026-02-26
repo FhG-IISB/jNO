@@ -1400,24 +1400,31 @@ class MeshUtils:
     @staticmethod
     def get_visibility_matrix_raytrace(boundary_points, boundary_edges, interior_point=None, n_ray_samples: int = 3) -> jnp.ndarray:
         """
-        Compute visibility matrix using ray tracing (NumPy, fully vectorized).
-        Works for arbitrary domains with any number of holes.
+        Compute visibility matrix via segment–edge intersection tests.
+
+        Two boundary points see each other if and only if the straight line
+        between them does **not** cross any boundary edge (excluding the
+        edges adjacent to the two endpoints).  This is exact for any closed
+        2-D enclosure and avoids the fragile point-in-polygon sampling that
+        the previous implementation relied on.
+
+        The computation is fully vectorized over target points for each
+        source point, giving O(N · E) work per source row.
 
         Parameters
         ----------
-        boundary_points : array-like
-            (n_bnd, 2) boundary points.
-        boundary_edges : array-like
-            (n_edges, 2) boundary edges as index pairs into boundary_points.
-        interior_point : array-like, optional
-            (2,) a point known to be inside the domain.
-        n_ray_samples : int
-            Number of sample points along each segment to verify it stays inside.
+        boundary_points : array-like, shape (N, 2)
+            Coordinates of the boundary discretisation points.
+        boundary_edges : array-like, shape (E, 2)
+            Index pairs into *boundary_points* defining the boundary segments.
+        interior_point : ignored (kept for API compatibility)
+        n_ray_samples : ignored (kept for API compatibility)
 
         Returns
         -------
-        jnp.ndarray
-            (n_bnd, n_bnd) visibility matrix (float32).
+        jnp.ndarray, shape (N, N)
+            Binary visibility matrix (float32).  ``VM[i, j] = 1`` means
+            point *i* can see point *j*.
         """
         import numpy as np
         import time
@@ -1430,45 +1437,10 @@ class MeshUtils:
         E0 = P[edges[:, 0]]  # (n_edges, 2)
         E1 = P[edges[:, 1]]  # (n_edges, 2)
 
-        if interior_point is None:
-            interior_point = np.mean(P, axis=0)
-        else:
-            interior_point = np.asarray(interior_point, dtype=np.float64)
-
         t0 = time.time()
 
         # ==================================================================
-        # Ray-casting point-in-polygon (works with unoriented edges)
-        # ==================================================================
-        def ray_cast_inside(pts):
-            """
-            pts: (M, 2) -> (M,) bool.  True if inside the polygon.
-            Uses horizontal ray casting — no edge orientation needed.
-            """
-            x = pts[:, 0:1]  # (M, 1)
-            y = pts[:, 1:2]  # (M, 1)
-
-            y0 = E0[np.newaxis, :, 1]  # (1, n_edges)
-            y1 = E1[np.newaxis, :, 1]
-            x0 = E0[np.newaxis, :, 0]
-            x1 = E1[np.newaxis, :, 0]
-
-            # Edge straddles the horizontal ray at height y
-            straddles = (y0 > y) != (y1 > y)
-
-            # x-coordinate where the ray intersects the edge
-            dy = y1 - y0
-            dy_safe = np.where(np.abs(dy) < 1e-14, 1.0, dy)
-            x_int = x0 + (x1 - x0) * (y - y0) / dy_safe
-
-            # Count crossings to the right of the test point
-            crossings = straddles & (x < x_int)
-            n_cross = np.sum(crossings.astype(np.int32), axis=1)  # (M,)
-
-            return (n_cross % 2) == 1
-
-        # ==================================================================
-        # Build adjacency matrix: adj_mask[j, k] = True if edge k touches point j
+        # Build adjacency: adj_mask[j, k] = True if edge k touches point j
         # ==================================================================
         adj_mask = np.zeros((n_bnd, n_edges), dtype=bool)
         for k in range(n_edges):
@@ -1476,7 +1448,7 @@ class MeshUtils:
             adj_mask[edges[k, 1], k] = True
 
         # ==================================================================
-        # Precompute edge direction and cross-product helpers
+        # Precompute edge directions and 2-D cross-product helper
         # ==================================================================
         edge_dir = E1 - E0  # (n_edges, 2)
 
@@ -1484,58 +1456,36 @@ class MeshUtils:
             return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
 
         # ==================================================================
-        # Process one source row at a time (fully vectorized over targets)
+        # For each source point, test all target segments against all edges
         # ==================================================================
         VM = np.zeros((n_bnd, n_bnd), dtype=np.float32)
-
-        # Precompute t_samples for inside checks
-        t_vals = np.linspace(0.15, 0.85, n_ray_samples)
 
         for i in range(n_bnd):
             A = P[i]  # (2,)
 
-            # ----- Check 1: segment-edge crossings (vectorized) -----
-            # Segments from A to every B = P[j]
-            AB = P - A  # (n_bnd, 2)
-            diff = E0[None, :, :] - A[None, None, :]  # (1, n_edges, 2) broadcast ok
-
-            # Expand for broadcasting: AB -> (n_bnd, 1, 2), edge_dir -> (1, n_edges, 2)
+            AB = P - A  # (n_bnd, 2)  — direction vectors to every target
             AB_exp = AB[:, None, :]  # (n_bnd, 1, 2)
             edge_exp = edge_dir[None, :, :]  # (1, n_edges, 2)
-
-            # Actually need per-row diff: E0 - A is same for all j since A is fixed
-            diff_row = (E0 - A)[None, :, :]  # (1, n_edges, 2), broadcasts to (n_bnd, n_edges, 2)
+            diff_row = (E0 - A)[None, :, :]  # (1, n_edges, 2)
 
             denom = cross2d(AB_exp, edge_exp)  # (n_bnd, n_edges)
             parallel = np.abs(denom) < 1e-12
             denom_safe = np.where(parallel, 1.0, denom)
 
-            t_seg = cross2d(diff_row, edge_exp) / denom_safe  # (n_bnd, n_edges)
-            t_edge = cross2d(diff_row, AB_exp) / denom_safe  # (n_bnd, n_edges)
+            t_seg = cross2d(diff_row, edge_exp) / denom_safe  # param on A→B
+            t_edge = cross2d(diff_row, AB_exp) / denom_safe  # param on edge
 
             eps = 1e-10
             crossings = (~parallel) & (t_seg > eps) & (t_seg < 1 - eps) & (t_edge > eps) & (t_edge < 1 - eps)
 
-            # Mask out edges adjacent to source i or target j (vectorized)
-            crossings[:, adj_mask[i]] = False  # edges touching point i
-            crossings &= ~adj_mask  # edges touching each point j
+            # Ignore edges that share an endpoint with source or target
+            crossings[:, adj_mask[i]] = False  # edges touching source i
+            crossings &= ~adj_mask  # edges touching each target j
 
             any_crossing = np.any(crossings, axis=1)  # (n_bnd,)
 
-            # ----- Check 2: sample points along each segment must be inside -----
-            # sample_pts[j, t, :] = A + t_vals[t] * AB[j]
-            # AB is already (n_bnd, 2) = P - A
-            # (n_bnd, n_samples, 2)
-            sample_pts = A[None, None, :] + t_vals[None, :, None] * AB[:, None, :]
-            sample_pts_flat = sample_pts.reshape(-1, 2)  # (n_bnd * n_samples, 2)
-
-            inside_flat = ray_cast_inside(sample_pts_flat)  # (n_bnd * n_samples,)
-            inside = inside_flat.reshape(n_bnd, n_ray_samples)
-            all_inside = np.all(inside, axis=1)  # (n_bnd,)
-
-            # ----- Combine -----
-            visible = (~any_crossing) & all_inside
-            visible[i] = False  # diagonal = 0
+            visible = ~any_crossing
+            visible[i] = False  # no self-visibility
 
             VM[i, :] = visible.astype(np.float32)
 
@@ -1770,6 +1720,8 @@ class domain(MeshUtils, Geometries):
         self.arrays: Dict[str, np.ndarray] = {}
         self.tag_indices: Dict[str, np.ndarray] = {}
         self.avaiable_mesh_tags: List[str] = []  # names of the tags from the mesh generator
+        self._boundary_loop_tags: set = set()  # tags extracted from line cells (boundary loops)
+        self._tag_triangles: Dict[str, np.ndarray] = {}  # triangle cells per volume tag
 
         # Resampling support
         self._mesh_points: Dict[str, np.ndarray] = {}  # Full mesh points for resampling
@@ -1984,6 +1936,8 @@ class domain(MeshUtils, Geometries):
                 self.avaiable_mesh_tags.append(name)
 
                 tag_points = set()
+                tag_edges = []  # store line cell connectivity for this tag
+                tag_tris = []  # store triangle cells for this tag
 
                 if isinstance(cell_data, dict):
                     for cell_type, indices in cell_data.items():
@@ -1994,7 +1948,12 @@ class domain(MeshUtils, Geometries):
                                     for idx in indices:
                                         local_idx = idx - offset
                                         if 0 <= local_idx < len(cell_block.data):
-                                            tag_points.update(cell_block.data[local_idx].flatten())
+                                            cell = cell_block.data[local_idx]
+                                            tag_points.update(cell.flatten())
+                                            if cell_block.type == "line":
+                                                tag_edges.append(tuple(cell))
+                                            elif cell_block.type == "triangle":
+                                                tag_tris.append(tuple(cell))
                 else:
                     for block_idx, indices in enumerate(cell_data):
                         if indices is None:
@@ -2005,13 +1964,25 @@ class domain(MeshUtils, Geometries):
                             for idx in indices:
                                 local_idx = idx - offset
                                 if 0 <= local_idx < len(cell_block.data):
-                                    tag_points.update(cell_block.data[local_idx].flatten())
+                                    cell = cell_block.data[local_idx]
+                                    tag_points.update(cell.flatten())
+                                    if cell_block.type == "line":
+                                        tag_edges.append(tuple(cell))
+                                    elif cell_block.type == "triangle":
+                                        tag_tris.append(tuple(cell))
+
+                if tag_tris:
+                    self._tag_triangles[name] = np.array(tag_tris, dtype=int)
 
                 if tag_points:
-                    # Convert set to sorted list for consistent indexing
-                    indices_list = np.array(list(tag_points)).flatten()
+                    # If we have line edges, chain them into a proper loop ordering
+                    if tag_edges:
+                        self._boundary_loop_tags.add(name)
+                        indices_list = self._chain_edges_to_loop(tag_edges)
+                    else:
+                        indices_list = np.array(sorted(tag_points), dtype=int)
 
-                    # Store points
+                    # Store points (in loop order if available)
                     self._mesh_pool[name] = points[indices_list]
 
                     # Map indices_list to positions in boundary_normals
@@ -2204,10 +2175,14 @@ class domain(MeshUtils, Geometries):
                 subset_VM = all_VM[np.ix_(subset_indices, subset_indices)]
             else:
                 # Internal boundary - compute local visibility matrix
-                # Use ray-tracing for arbitrary internal boundaries
-                from scipy.spatial.distance import pdist, squareform
-
-                subset_VM = self.get_visibility_matrix_raytrace(subset_bp, np.array([[i, (i + 1) % len(subset_bp)] for i in range(len(subset_bp))]), n_ray_samples=3)
+                # Order points into a proper closed polygon first
+                order = self._order_boundary_loop(subset_bp)
+                ordered_bp = subset_bp[order]
+                edges = np.array([[i, (i + 1) % len(ordered_bp)] for i in range(len(ordered_bp))], dtype=np.int32)
+                ordered_VM = self.get_visibility_matrix_raytrace(ordered_bp, edges, n_ray_samples=3)
+                # Map VM back to original point order
+                inv_order = np.argsort(order)
+                subset_VM = np.asarray(ordered_VM)[np.ix_(inv_order, inv_order)]
 
             if self.dimension == 1:
                 VF = self.get_view_factor_1d(P[0], subset_VM, Nrm[0], ds)
@@ -2238,6 +2213,462 @@ class domain(MeshUtils, Geometries):
             x, y = domain['interior']
         """
         return self.variable(tag)
+
+    @staticmethod
+    def _chain_edges_to_loop(edges):
+        """Chain a set of (a, b) edge pairs into an ordered loop.
+
+        Args:
+            edges: List of 2-tuples (global point indices) forming a closed loop.
+
+        Returns:
+            np.ndarray of global point indices in loop order.
+        """
+        from collections import defaultdict
+
+        adj = defaultdict(list)
+        for a, b in edges:
+            adj[a].append(b)
+            adj[b].append(a)
+
+        # Walk the graph
+        start = edges[0][0]
+        visited = {start}
+        order = [start]
+        current = start
+        for _ in range(len(edges) - 1):
+            for nb in adj[current]:
+                if nb not in visited:
+                    visited.add(nb)
+                    order.append(nb)
+                    current = nb
+                    break
+        return np.array(order, dtype=int)
+
+    @staticmethod
+    def _extract_volume_boundary(triangles):
+        """Extract boundary edges from a set of triangles.
+
+        Boundary edges appear in exactly one triangle (interior edges appear
+        in two).
+
+        Args:
+            triangles: (N, 3) array of triangle vertex indices.
+
+        Returns:
+            List of (a, b) edge tuples forming the boundary.
+        """
+        from collections import Counter
+
+        edge_count = Counter()
+        for tri in triangles:
+            for i in range(3):
+                e = tuple(sorted((int(tri[i]), int(tri[(i + 1) % 3]))))
+                edge_count[e] += 1
+        return [e for e, c in edge_count.items() if c == 1]
+
+    @staticmethod
+    def _chain_edges_to_loops(edges):
+        """Chain a set of (a, b) edge pairs into one or more ordered loops.
+
+        Unlike ``_chain_edges_to_loop`` which assumes a single loop, this
+        handles disconnected boundaries (e.g. an annular region has two
+        boundary loops).
+
+        Args:
+            edges: List of 2-tuples (global point indices).
+
+        Returns:
+            List of np.ndarray, each an ordered loop of global point indices.
+        """
+        from collections import defaultdict
+
+        adj = defaultdict(set)
+        for a, b in edges:
+            adj[a].add(b)
+            adj[b].add(a)
+
+        visited_global = set()
+        loops = []
+        for start in adj:
+            if start in visited_global:
+                continue
+            loop = [start]
+            visited_global.add(start)
+            current = start
+            while True:
+                nxt = None
+                for nb in adj[current]:
+                    if nb not in visited_global:
+                        nxt = nb
+                        break
+                if nxt is None:
+                    break
+                visited_global.add(nxt)
+                loop.append(nxt)
+                current = nxt
+            loops.append(np.array(loop, dtype=int))
+        return loops
+
+    @staticmethod
+    def _order_boundary_loop(pts):
+        """Order 2D boundary points into a proper closed polygon.
+
+        Uses angular sorting from the centroid.  This is exact for convex
+        loops (rectangles, circles, etc.) and a good heuristic for mildly
+        non-convex ones.
+
+        Args:
+            pts: (N, 2) array of boundary points.
+
+        Returns:
+            order: (N,) index array such that ``pts[order]`` forms a
+                   proper polygon.
+        """
+        n = len(pts)
+        if n <= 2:
+            return np.arange(n)
+
+        centroid = pts.mean(axis=0)
+        angles = np.arctan2(pts[:, 1] - centroid[1], pts[:, 0] - centroid[0])
+        return np.argsort(angles)
+
+    def compute_enclosure_view_factor(self, tags, opaque_tags=None):
+        """Compute view factors over a combined radiation enclosure.
+
+        All listed tags must have been sampled (with ``normals=True``) before
+        calling this method.  The method combines the points from every tag,
+        computes normals directly from the loop geometry (more reliable than
+        PCA for internal boundaries), auto-orients them to point into the gas
+        region, and then builds the visibility and view-factor matrices.
+
+        Args:
+            tags: List of tag names that form the enclosure, e.g.
+                  ``["interior_boundary", "interior_boundary_outer"]``.
+            opaque_tags: Optional list of tag names whose boundary edges block
+                  rays but whose points do **not** participate in the view-factor
+                  matrix.  Use this for solid obstacles inside the enclosure,
+                  e.g. ``opaque_tags=["solid0", "solid1"]``.
+
+        Returns:
+            Nested list of ``TensorTag`` view-factor matrices.  For *n* tags
+            the result is an *n x n* list-of-lists::
+
+                [[F_AA, F_AB],
+                 [F_BA, F_BB]]
+
+            where ``F_AB`` has shape ``(N_A, N_B)`` and gives the view factor
+            from each point on tag A to points on tag B.
+
+        Example::
+
+            (F00, F01), (F10, F11) = domain.compute_enclosure_view_factor(
+                ["interior_boundary", "interior_boundary_outer"],
+                opaque_tags=["solid0", "solid1"],
+            )
+            bc_rad0 = ... - eps * sigma * (u_b0**4 - jnn.sum(F00 * u_b0**4) - jnn.sum(F01 * u_b1**4))
+        """
+        if opaque_tags is None:
+            opaque_tags = []
+
+        # ----- 1. Gather ordered points per tag -------------------------------
+        tag_pts = []  # list of (N_i, D)
+        tag_sizes = []
+        for tag in tags:
+            if tag not in self.context:
+                raise ValueError(f"Tag '{tag}' not yet sampled.  Call domain.variable('{tag}') first.")
+
+            # Use _mesh_pool directly if available (already in loop order)
+            if tag in self._mesh_pool:
+                pts = np.array(self._mesh_pool[tag], dtype=np.float64)
+                if pts.ndim > 2:
+                    pts = pts[0]  # time-dep: (T, N, D) -> (N, D)
+            else:
+                pts = np.asarray(self.context[tag], dtype=np.float64)
+                while pts.ndim > 2:
+                    pts = pts[0]
+                # Fallback: angular sort
+                order = self._order_boundary_loop(pts)
+                pts = pts[order]
+
+            tag_pts.append(pts)
+            tag_sizes.append(pts.shape[0])
+
+        all_pts = np.concatenate(tag_pts, axis=0)  # (N_total, D)
+        N_total = all_pts.shape[0]
+
+        # ----- 2. Build edge list for ray-tracing (per-tag closed loops) ------
+        edges = []
+        offset = 0
+        for n in tag_sizes:
+            for i in range(n):
+                edges.append([offset + i, offset + (i + 1) % n])
+            offset += n
+
+        # ----- 2b. Gather opaque obstacle edges (block rays, no VF) -----------
+        # Opaque tags add blocking edges.  Two kinds are supported:
+        #   - Boundary-loop tags (line cells): use directly as a closed loop.
+        #   - Volume tags (triangle cells): extract boundary edges of the
+        #     triangulated region automatically.
+        opaque_loop_pts = []
+        for otag in opaque_tags:
+            if otag in self._boundary_loop_tags:
+                # --- Boundary loop tag: already ordered ---
+                if otag in self._mesh_pool:
+                    opts = np.array(self._mesh_pool[otag], dtype=np.float64)
+                    if opts.ndim > 2:
+                        opts = opts[0]
+                else:
+                    self.log.warning(f"Opaque tag '{otag}' not in mesh pool, skipping.")
+                    continue
+                opaque_loop_pts.append(opts)
+            elif otag in self._tag_triangles:
+                # --- Volume tag: extract boundary edges from triangles ---
+                tris = self._tag_triangles[otag]
+                bnd_edges = self._extract_volume_boundary(tris)
+                if len(bnd_edges) == 0:
+                    self.log.warning(f"Opaque tag '{otag}': no boundary edges found. Skipping.")
+                    continue
+                # Chain edges into one or more loops
+                loops = self._chain_edges_to_loops(bnd_edges)
+                pts = np.asarray(self.points, dtype=np.float64)
+                for loop_indices in loops:
+                    opaque_loop_pts.append(pts[loop_indices])
+            else:
+                self.log.warning(
+                    f"Opaque tag '{otag}' has no line or triangle cells. "
+                    f"Available boundary loops: {sorted(self._boundary_loop_tags)}, "
+                    f"volume tags: {sorted(self._tag_triangles.keys())}. Skipping."
+                )
+                continue
+
+        # Append opaque points and their closed-loop edges.
+        #
+        # Subtlety: when a volume tag (e.g. solid0) is opaque, its mesh
+        # boundary edges lie on the *same geometric curve* as one of the
+        # participating tag loops, but they use different point positions
+        # (original mesh vertices vs. resampled boundary points).  If we
+        # add them blindly, the duplicate overlapping edges block all
+        # rays.  Fix: detect and skip any opaque loop whose geometry
+        # coincides with a participating loop (Hausdorff distance < tol).
+        if opaque_loop_pts:
+            from scipy.spatial import cKDTree
+
+            # Build per-tag kd-trees for coincidence testing
+            tag_trees = []
+            for pts in tag_pts:
+                tag_trees.append(cKDTree(pts))
+
+            # Tolerance: use mesh spacing as proxy (average edge length
+            # of the first participating loop)
+            ref = tag_pts[0]
+            edge_lens = np.linalg.norm(np.diff(ref, axis=0, append=ref[:1]), axis=1)
+            tol = edge_lens.mean() * 0.5
+
+            extra_pts = []
+            next_idx = N_total
+            kept_loops = 0
+            skipped_loops = 0
+
+            for loop_coords in opaque_loop_pts:
+                # Check if this loop coincides with ANY participating loop
+                coincides = False
+                for tree_i in tag_trees:
+                    dists, _ = tree_i.query(loop_coords)
+                    if dists.max() < tol:
+                        coincides = True
+                        break
+
+                if coincides:
+                    skipped_loops += 1
+                    continue  # skip – same boundary, different discretisation
+
+                kept_loops += 1
+                n_op = len(loop_coords)
+                # All points are truly new (not on any participating loop)
+                start_idx = next_idx
+                for k in range(n_op):
+                    extra_pts.append(loop_coords[k])
+                next_idx += n_op
+                for k in range(n_op):
+                    edges.append([start_idx + k, start_idx + (k + 1) % n_op])
+
+            if extra_pts:
+                raytrace_pts = np.concatenate([all_pts, np.array(extra_pts, dtype=np.float64)], axis=0)
+            else:
+                raytrace_pts = all_pts
+
+            if skipped_loops:
+                self.log.info(f"Opaque: kept {kept_loops} loop(s), " f"skipped {skipped_loops} coincident loop(s)")
+        else:
+            raytrace_pts = all_pts
+
+        edges = np.array(edges, dtype=np.int32)
+
+        # ----- 3. Compute normals from loop geometry --------------------------
+        # Much more reliable than PCA for internal boundaries.
+        # For each point, average the normals of its two adjacent edges.
+        tag_nrm = []
+        for loop_pts in tag_pts:
+            n = len(loop_pts)
+            normals = np.zeros_like(loop_pts)
+            for i in range(n):
+                # Forward and backward edge tangents
+                t_fwd = loop_pts[(i + 1) % n] - loop_pts[i]
+                t_bwd = loop_pts[i] - loop_pts[(i - 1) % n]
+                # 2D: outward normal for CCW polygon = rotate tangent 90° CW
+                n_fwd = np.array([t_fwd[1], -t_fwd[0]])
+                n_bwd = np.array([t_bwd[1], -t_bwd[0]])
+                avg = n_fwd + n_bwd
+                norm = np.linalg.norm(avg)
+                if norm > 1e-12:
+                    normals[i] = avg / norm
+                else:
+                    normals[i] = n_fwd / (np.linalg.norm(n_fwd) + 1e-30)
+            tag_nrm.append(normals)
+
+        # ----- 4. Orient normals to point INTO the gas region -----------------
+        # Use only the PARTICIPATING edges for the ray-cast test.
+        # Opaque edges must NOT be included here -- they would change the
+        # parity and flip normals for boundaries whose gas side is between
+        # the participating loop and the opaque loop.
+        participating_edges = []
+        offset = 0
+        for n in tag_sizes:
+            for i in range(n):
+                participating_edges.append([offset + i, offset + (i + 1) % n])
+            offset += n
+        participating_edges = np.array(participating_edges, dtype=np.int32)
+
+        E0_p = all_pts[participating_edges[:, 0]]
+        E1_p = all_pts[participating_edges[:, 1]]
+
+        def _ray_cast_inside(test_pts):
+            """Even-odd ray cast over PARTICIPATING enclosure edges only."""
+            x = test_pts[:, 0:1]
+            y = test_pts[:, 1:2]
+            y0 = E0_p[np.newaxis, :, 1]
+            y1 = E1_p[np.newaxis, :, 1]
+            x0 = E0_p[np.newaxis, :, 0]
+            x1 = E1_p[np.newaxis, :, 0]
+            straddles = (y0 > y) != (y1 > y)
+            dy = y1 - y0
+            dy_safe = np.where(np.abs(dy) < 1e-14, 1.0, dy)
+            x_int = x0 + (x1 - x0) * (y - y0) / dy_safe
+            crossings = straddles & (x < x_int)
+            n_cross = np.sum(crossings.astype(np.int32), axis=1)
+            return (n_cross % 2) == 1
+
+        for loop_idx, (pts, nrm) in enumerate(zip(tag_pts, tag_nrm)):
+            # Sample several non-corner points and vote
+            n = len(pts)
+            n_test = min(8, n)
+            test_indices = np.linspace(0, n - 1, n_test + 2, dtype=int)[1:-1]
+            gas_votes = 0
+            for ti in test_indices:
+                test_pt = pts[ti] + 1e-4 * nrm[ti]
+                inside = _ray_cast_inside(test_pt[None, :])
+                gas_votes += 1 if inside[0] else -1
+            if gas_votes < 0:
+                tag_nrm[loop_idx] = -nrm
+
+        all_nrm = np.concatenate(tag_nrm, axis=0)
+
+        # ----- 5. Visibility matrix over combined set -------------------------
+        # Run ray-tracing over ALL points (participating + opaque) so opaque
+        # edges block rays, then slice out only the participating rows/cols.
+        VM_full = np.asarray(self.get_visibility_matrix_raytrace(raytrace_pts, edges, n_ray_samples=3))
+        VM = np.array(VM_full[:N_total, :N_total], copy=True)  # writable copy
+
+        # ----- 5b. Block self-visibility through enclosed solid ---------------
+        # For a convex boundary loop enclosing a solid region, rays between
+        # two points on the same loop pass through the solid interior without
+        # crossing any boundary edge (the adjacency mask skips edges touching
+        # source/target).  Fix: for each boundary loop whose interior is solid
+        # (normals point OUTWARD, away from centroid), test every same-loop
+        # visible pair's midpoint; if it falls inside the polygon, block it.
+        offset = 0
+        for loop_idx, (lpts, nrm, n) in enumerate(zip(tag_pts, tag_nrm, tag_sizes)):
+            centroid = lpts.mean(axis=0)
+            # Use a mid-side sample point (not a corner) to test normal dir
+            sample_idx = n // 4
+            to_centroid = centroid - lpts[sample_idx]
+            dot_val = np.dot(to_centroid, nrm[sample_idx])
+            if dot_val >= 0:
+                # Normals point toward centroid → interior is gas, not solid
+                offset += n
+                continue
+
+            # Interior is solid — block same-loop pairs whose midpoint is inside
+            # Compute all pairwise midpoints (n, n, 2)
+            mid_x = (lpts[:, 0:1] + lpts[:, 0:1].T) / 2  # (n, n)
+            mid_y = (lpts[:, 1:2] + lpts[:, 1:2].T) / 2
+
+            # Even-odd ray-cast point-in-polygon for all midpoints at once
+            loop_e0 = lpts  # (n, 2)
+            loop_e1 = np.roll(lpts, -1, axis=0)  # (n, 2)
+            inside = np.zeros((n, n), dtype=bool)
+            for e in range(n):
+                ey0, ey1 = loop_e0[e, 1], loop_e1[e, 1]
+                ex0, ex1 = loop_e0[e, 0], loop_e1[e, 0]
+                straddle = (ey0 > mid_y) != (ey1 > mid_y)
+                dy = ey1 - ey0
+                if abs(dy) < 1e-14:
+                    continue
+                x_int = ex0 + (ex1 - ex0) * (mid_y - ey0) / dy
+                inside ^= straddle & (mid_x < x_int)
+
+            # Zero out VM entries for through-solid pairs
+            blk = VM[offset : offset + n, offset : offset + n]
+            n_blocked = int((inside & (blk > 0)).sum())
+            blk[inside] = 0
+            if n_blocked:
+                self.log.info(f"Blocked {n_blocked} self-visible pairs through solid " f"interior for loop {loop_idx} ({tags[loop_idx]})")
+            offset += n
+
+        # ----- 6. Element sizes (constant ds assumed for internal boundaries) -
+        ds = self.ds * np.ones(N_total)
+
+        # ----- 7. View-factor matrix ------------------------------------------
+        # Normals now point INTO the gas (the participating medium).  The VF
+        # formula expects exactly this convention:
+        #   cos_i = dot(Nrm_i, r_hat_{i->j})  >0 when j is in the outward
+        #           hemisphere of surface i
+        #   cos_j = -dot(Nrm_j, r_hat_{i->j}) >0 when i is in the outward
+        #           hemisphere of surface j
+        # No negation is needed because the normals already point correctly.
+        if self.dimension == 1:
+            VF = np.asarray(self.get_view_factor_1d(all_pts, VM, all_nrm, ds))
+        elif self.dimension == 2:
+            VF = np.asarray(self.get_view_factor_2d(all_pts, VM, all_nrm, ds))
+        else:
+            VF = np.asarray(self.get_view_factor_3d(all_pts, VM, all_nrm, ds))
+
+        # ----- 8. Store combined VM for plotting ------------------------------
+        enclosure_name = "+".join(tags)
+        self.context[f"v_{enclosure_name}"] = VM[None, None, ...]
+        self._param_tags.add(f"v_{enclosure_name}")
+
+        # ----- 9. Extract per-tag cross-blocks --------------------------------
+        result = []
+        row_offset = 0
+        for i, tag_i in enumerate(tags):
+            row = []
+            col_offset = 0
+            for j, tag_j in enumerate(tags):
+                block = VF[row_offset : row_offset + tag_sizes[i], col_offset : col_offset + tag_sizes[j]]
+                key = f"f_{tag_i}__{tag_j}"
+                self.context[key] = block[None, None, ...]
+                self._param_tags.add(key)
+                row.append(TensorTag(tag=key, domain=self))
+                col_offset += tag_sizes[j]
+            result.append(tuple(row))
+            row_offset += tag_sizes[i]
+
+        opaque_info = f", opaque=[{', '.join(opaque_tags)}]" if opaque_tags else ""
+        self.log.info(f"Computed enclosure view factor for [{', '.join(tags)}]{opaque_info} " f"({N_total} total boundary pts)")
+
+        return tuple(result)
 
     def sample(self, sample_spec: Dict[str, Tuple[int, Optional[Callable]]], normals: bool = False, return_indices: bool = False):
         """
@@ -2560,21 +2991,40 @@ class domain(MeshUtils, Geometries):
         import os
 
         # Collect all boundary data across tags
-        tag_data = []  # list of (tag, pts, VM)
+        tag_data = []  # list of (tag_label, pts, VM)
         for tag in tags:
             vm_key = f"v_{tag}"
-            if vm_key not in self.context or tag not in self.context:
+            if vm_key not in self.context:
                 continue
 
             VM = np.asarray(self.context[vm_key])
             while VM.ndim > 2:
                 VM = VM[0]
 
-            pts = np.asarray(self.context[tag])
-            if pts.ndim == 4:
-                pts = pts[0, 0]
-            elif pts.ndim == 3:
-                pts = pts[0]
+            # Combined enclosure tag (e.g. "interior_boundary+interior_boundary_outer")
+            if "+" in tag:
+                sub_tags = tag.split("+")
+                sub_pts = []
+                for st in sub_tags:
+                    if st not in self.context:
+                        continue
+                    p = np.asarray(self.context[st])
+                    if p.ndim == 4:
+                        p = p[0, 0]
+                    elif p.ndim == 3:
+                        p = p[0]
+                    sub_pts.append(p)
+                if not sub_pts:
+                    continue
+                pts = np.concatenate(sub_pts, axis=0)
+            else:
+                if tag not in self.context:
+                    continue
+                pts = np.asarray(self.context[tag])
+                if pts.ndim == 4:
+                    pts = pts[0, 0]
+                elif pts.ndim == 3:
+                    pts = pts[0]
 
             if pts.shape[0] > 0:
                 tag_data.append((tag, pts, VM))
