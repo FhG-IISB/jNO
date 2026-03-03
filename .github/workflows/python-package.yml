@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-22.04, windows-latest, macos-latest]
+        os: [ubuntu-latest, ubuntu-22.04, ubuntu-20.04, ubuntu-18.04, windows-latest, macos-latest]
         python-version: ["3.11", "3.12", "3.13"]
 
     runs-on: ${{ matrix.os }}
@@ -39,15 +39,15 @@ jobs:
       with:
         python-version: ${{ matrix.python-version }}
 
-    - name: Install dependencies (macOS)
+    - name: Install dependencies (Ubuntu)
 
-      if: matrix.os == 'macos-latest'
-      run: uv sync --all-extras --no-extra cuda
-
-    - name: Install dependencies (other)
-
-      if: matrix.os != 'macos-latest'
+      if: startsWith(matrix.os, 'ubuntu')
       run: uv sync --all-extras
+
+    - name: Install dependencies (macOS/Windows)
+
+      if: matrix.os == 'macos-latest' || matrix.os == 'windows-latest'
+      run: uv sync --all-extras --no-extra cuda
 
     - name: Test with pytest
 
