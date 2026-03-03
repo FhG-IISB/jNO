@@ -1369,7 +1369,9 @@ class MeshUtils:
                     # Adjacent boundary points are always visible (they share an edge)
                     is_adjacent_point = (j == (i + 1) % n_bnd) | (j == (i - 1 + n_bnd) % n_bnd)
 
-                    visible_ij = jax.lax.cond(is_same, lambda: False, lambda: jax.lax.cond(is_adjacent_point, lambda: True, lambda: seg_visible(i, j)))  # Diagonal is always 0 (can't see itself)  # Adjacent boundary points are always visible
+                    visible_ij = jax.lax.cond(
+                        is_same, lambda: False, lambda: jax.lax.cond(is_adjacent_point, lambda: True, lambda: seg_visible(i, j))
+                    )  # Diagonal is always 0 (can't see itself)  # Adjacent boundary points are always visible
                     row = row.at[j].set(visible_ij)
                     return row
 
@@ -1489,7 +1491,6 @@ class MeshUtils:
             VM[i, :] = visible.astype(np.float32)
 
         elapsed = time.time() - t0
-        print(f"  Visibility matrix ({n_bnd} boundary pts, {n_edges} edges): {elapsed:.2f}s")
 
         return jnp.array(VM)
 
@@ -2457,7 +2458,11 @@ class domain(MeshUtils, Geometries):
                 for loop_indices in loops:
                     opaque_loop_pts.append(pts[loop_indices])
             else:
-                self.log.warning(f"Opaque tag '{otag}' has no line or triangle cells. " f"Available boundary loops: {sorted(self._boundary_loop_tags)}, " f"volume tags: {sorted(self._tag_triangles.keys())}. Skipping.")
+                self.log.warning(
+                    f"Opaque tag '{otag}' has no line or triangle cells. "
+                    f"Available boundary loops: {sorted(self._boundary_loop_tags)}, "
+                    f"volume tags: {sorted(self._tag_triangles.keys())}. Skipping."
+                )
                 continue
 
         # Append opaque points and their closed-loop edges.

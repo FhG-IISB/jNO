@@ -923,7 +923,7 @@ class TraceEvaluator:
 
                     return jax.grad(u_scalar)(pt)[dim]
 
-                return jax.vmap(grad_single)(jnp.arange(points.shape[0]))
+                return jax.vmap(grad_single)(jnp.arange(points.shape[0]))[:, jnp.newaxis]
             else:
                 # Multi-variable Jacobian
                 def jac_single(pt):
@@ -1048,7 +1048,7 @@ class TraceEvaluator:
                     hess = jax.hessian(u_scalar)(pt)
                     return sum(hess[d, d] for d in dims)
 
-                return jax.vmap(lap_single)(jnp.arange(points.shape[0]))
+                return jax.vmap(lap_single)(jnp.arange(points.shape[0]))[:, jnp.newaxis]
             else:
                 # Full Hessian via AD
                 def hess_single(pt):

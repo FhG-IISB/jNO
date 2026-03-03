@@ -31,7 +31,7 @@ from .trace import (
     dump_tree,
     cse,
 )
-from .utils import LearningRateSchedule, WeightSchedule, statistics, get_logger, IREEModel, get_seed
+from .utils import LearningRateSchedule, WeightSchedule, statistics, get_logger, get_seed
 from .utils.monitor import HardwareMonitor
 from .domain import domain, DomainData
 from .trace_evaluator import TraceEvaluator
@@ -648,40 +648,30 @@ class core:
                     if n_lora_layers == 0:
                         self.log.warning(f"LoRA: No layers were adapted for model {lid}! " f"LoRA has NO EFFECT on this model.")
 
-                # Write detailed LoRA report to log directory
-                if hasattr(self.log, "path") and self.log.path is not None:
-                    import os
-
-                    lora_report_path = os.path.join(str(self.log.path), "lora_report.txt")
-                    with open(lora_report_path, "w") as f:
-                        f.write(f"LoRA Diagnostic Report for model {lid}\n")
-                        f.write(f"{'='*60}\n")
-                        f.write(f"Requested: rank={rank}, alpha={alpha}\n")
-                        f.write(f"Model type: {type(model_before).__name__}\n")
-                        f.write(f"Wrapper type: {type(model_after).__name__}\n")
-                        f.write(f"LoRA layers adapted:        {n_lora_layers}\n")
-                        f.write(f"Total arrays before LoRA:   {n_arrays_before}\n")
-                        f.write(f"Total arrays after LoRA:    {n_arrays_after}\n")
-                        f.write(f"Total params before LoRA:   {n_params_before:,}\n")
-                        f.write(f"Total params after LoRA:    {n_params_after:,}\n")
-                        f.write(f"New LoRA params:            {n_lora_params:,}\n\n")
-
-                        if isinstance(model_after, FlaxLoRAWrapper):
-                            f.write("Adapted kernels (lora_a / lora_b shapes):\n")
-                            flat, _ = jax.tree_util.tree_flatten_with_path(model_after.lora_params)
-                            for path, leaf in flat:
-                                if eqx.is_array(leaf):
-                                    path_str = "/".join(str(k) for k in path)
-                                    f.write(f"  {path_str}: {leaf.shape} {leaf.dtype}\n")
-                        else:
-                            f.write("Full pytree paths (after LoRA):\n")
-                            flat, _ = jax.tree_util.tree_flatten_with_path(model_after)
-                            for path, leaf in flat:
-                                if eqx.is_array(leaf):
-                                    path_str = "/".join(str(k) for k in path)
-                                    f.write(f"  {path_str}: {leaf.shape} {leaf.dtype}\n")
-
-                    self.log.info(f"LoRA diagnostic report written to {lora_report_path}")
+                # Write detailed LoRA diagnostics to log file (file-only, no console noise)
+                self.log.quiet(f"LoRA Diagnostic Report for model {lid}")
+                self.log.quiet(f"{'='*60}")
+                self.log.quiet(f"Requested: rank={rank}, alpha={alpha}")
+                self.log.quiet(f"Model type: {type(model_before).__name__}")
+                self.log.quiet(f"Wrapper type: {type(model_after).__name__}")
+                self.log.quiet(f"LoRA layers adapted:        {n_lora_layers}")
+                self.log.quiet(f"Total arrays before LoRA:   {n_arrays_before}")
+                self.log.quiet(f"Total arrays after LoRA:    {n_arrays_after}")
+                self.log.quiet(f"Total params before LoRA:   {n_params_before:,}")
+                self.log.quiet(f"Total params after LoRA:    {n_params_after:,}")
+                self.log.quiet(f"New LoRA params:            {n_lora_params:,}")
+                if isinstance(model_after, FlaxLoRAWrapper):
+                    self.log.quiet("Adapted kernels (lora_a / lora_b shapes):")
+                    flat, _ = jax.tree_util.tree_flatten_with_path(model_after.lora_params)
+                    for path, leaf in flat:
+                        if eqx.is_array(leaf):
+                            self.log.quiet(f"  {'/'.join(str(k) for k in path)}: {leaf.shape} {leaf.dtype}")
+                else:
+                    self.log.quiet("Full pytree paths (after LoRA):")
+                    flat, _ = jax.tree_util.tree_flatten_with_path(model_after)
+                    for path, leaf in flat:
+                        if eqx.is_array(leaf):
+                            self.log.quiet(f"  {'/'.join(str(k) for k in path)}: {leaf.shape} {leaf.dtype}")
 
         # ── 3. Build trainable filter ──
         filter_spec = {}
@@ -890,7 +880,7 @@ class core:
             ).compile()
 
             # ── 8. Training loop ──
-            hw_monitor = HardwareMonitor(log_dir=self.log.path, interval=0.5)
+            hw_monitor = HardwareMonitor(logger=self.log, interval=0.5)
             hw_monitor.start()
 
             print_rate = max(1, epochs // 100 if epochs < 100_000 else epochs // 1000)
@@ -1048,8 +1038,39 @@ class core:
                 key=test_rng,
             )
         )
-        for i, const in enumerate(out_shape):
-            self.log.info(f"Constraint {i}: Shape = {const.shape}")
+
+        # For each constraint, also get the shape *before* the final
+        # reduction (e.g. .mse) so the log shows the residual geometry.
+        # Constraints are stored as OperationDef(inner_expr); unwrap first.
+        constraint_exprs = getattr(self, "_constraint_exprs", [])
+
+        def _unwrap(expr):
+            """Unwrap OperationDef to get the inner expression."""
+            inner = expr.expr if isinstance(expr, OperationDef) else expr
+            if isinstance(inner, FunctionCall):
+                return inner.args[0], inner._name
+            return inner, None
+
+        parent_exprs = [_unwrap(expr) for expr in constraint_exprs]
+        # Only compile the parent layer if at least one expr has a parent
+        if any(name is not None for _, name in parent_exprs):
+            parent_fn = TraceEvaluator.compile_multi_expression([e for e, _ in parent_exprs], self.all_ops)
+            parent_shape = jax.eval_shape(
+                lambda: parent_fn(
+                    self.models,
+                    self.domain_data.context,
+                    batchsize=batchsize,
+                    key=test_rng,
+                )
+            )
+        else:
+            parent_shape = [None] * len(out_shape)
+
+        for i, (const, (_, op_name)) in enumerate(zip(out_shape, parent_exprs)):
+            if op_name is not None and parent_shape[i] is not None:
+                self.log.info(f"Constraint {i}: Shape = {parent_shape[i].shape}" f" → .{op_name}() → {const.shape}")
+            else:
+                self.log.info(f"Constraint {i}: Shape = {const.shape}")
 
         for i, (_, fn) in enumerate(self.compiled_trackers):
             # Use jax.eval_shape to get output shape without computation
@@ -1061,8 +1082,34 @@ class core:
                     key=test_rng,
                 )
             )
+
+            # Also get the pre-reduction shape for tracker expressions
+            tracker_exprs = getattr(self, "_tracker_exprs", [])
+            tracker_expr = tracker_exprs[i] if i < len(tracker_exprs) else None
+            # Trackers may also be wrapped in OperationDef
+            if tracker_expr is not None and isinstance(tracker_expr, OperationDef):
+                tracker_expr = tracker_expr.expr
+            if tracker_expr is not None and isinstance(tracker_expr, FunctionCall):
+                t_parent_fn = TraceEvaluator.compile_multi_expression([tracker_expr.args[0]], self.all_ops)
+                t_parent_shape = jax.eval_shape(
+                    lambda: t_parent_fn(
+                        self.models,
+                        self.domain_data.context,
+                        batchsize=batchsize,
+                        key=test_rng,
+                    )
+                )
+                t_shape = t_parent_shape[0]
+                op_name = tracker_expr._name
+            else:
+                t_shape = None
+                op_name = None
+
             if not isinstance(out_shape, tuple):
-                self.log.info(f"Tracker {i}: Shape = {out_shape.shape}")
+                if t_shape is not None:
+                    self.log.info(f"Tracker {i}: Shape = {t_shape.shape}" f" → .{op_name}() → {out_shape.shape}")
+                else:
+                    self.log.info(f"Tracker {i}: Shape = {out_shape.shape}")
             else:
                 self.log.info(f"Tracker {i}: {out_shape}")
 

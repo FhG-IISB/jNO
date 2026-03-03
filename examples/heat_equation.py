@@ -13,15 +13,8 @@ domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05), time=(0, 1, 10)
 x, y, t = domain.variable("interior")
 x0, y0, t0 = domain.variable("initial")
 
-u_net = jnn.nn.deeponet(
-    n_sensors=1,
-    sensor_channels=1,
-    coord_dim=2,
-    basis_functions=64,
-    hidden_dim=64,
-    n_layers=2,
-    key=jax.random.PRNGKey(0),
-).optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 10_000, 1e-5))
+u_net = jnn.nn.deeponet(n_sensors=1, sensor_channels=1, coord_dim=2, basis_functions=64, hidden_dim=64, n_layers=2, key=jax.random.PRNGKey(0))
+u_net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.8, 10_000, 1e-5))
 
 
 u = u_net(t, jnn.concat([x, y])) * x * (1 - x) * y * (1 - y)
@@ -31,9 +24,5 @@ pde = jnn.grad(u, t) - 0.1 * jnn.laplacian(u, [x, y])  # 2D heat equation
 ini = u0 - jnn.sin(π * x0) * jnn.sin(π * y0)  # Sinusoidal Initial Condition
 
 crux = jno.core([pde.mse, ini.mse], domain)
-crux.solve(100).plot(f"{dire}/training_history_v1.png")
-u_net.optimizer(optax.lbfgs(1))
-crux.solve(100).plot(f"{dire}/training_history_v2.png")
-u_net.optimizer(optax.adamw(1))
-crux.solve(100).plot(f"{dire}/training_history_v4.png")
-jno.save(crux, f"{dire}/crux.pkl")
+crux.solve(10_000).plot(f"{dire}/training_history_v1.png")
+jno.save(crux, f"{dire}/crux_v1.pkl")

@@ -334,6 +334,11 @@ def grad(target: Placeholder, variable: Variable, scheme: str = "automatic_diffe
 
     Implemented as a single-variable Jacobian.
 
+    Prefer the method-style shorthand on the target expression::
+
+        u_x  = u.d(x)          # ∂u/∂x
+        u_xx = u.d(x).d(x)     # ∂²u/∂x² (chainable)
+
     Args:
         target: Expression to differentiate
         variable: Variable to differentiate with respect to
@@ -354,6 +359,10 @@ def laplacian(target: Placeholder, variables: List[Variable] = None, scheme: str
 
     Implemented as a Hessian with trace=True (sum of diagonal second derivatives):
     ∇²u = ∂²u/∂x² + ∂²u/∂y² + ...
+
+    Prefer the method-style shorthand::
+
+        lap_u = u.laplacian(x, y)   # ∂²u/∂x² + ∂²u/∂y²
 
     Args:
         target: Expression to differentiate

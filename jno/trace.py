@@ -211,6 +211,75 @@ class Placeholder:
     def T(self):
         return FunctionCall(lambda x: x.T, [self], "transpose", True)
 
+    # ------------------------------------------------------------------
+    # Differential operators — method-style API
+    # ------------------------------------------------------------------
+
+    def d(self, variable: "Variable", scheme: str = "automatic_differentiation") -> "Jacobian":
+        """Return ∂self/∂variable — shorthand for ``jnn.grad(self, variable)``.
+
+        Can be chained for higher-order derivatives::
+
+            u_xx = u.d(x).d(x)   # ∂²u/∂x²
+            u_xy = u.d(x).d(y)   # ∂²u/∂x∂y
+
+        Args:
+            variable: The Variable to differentiate with respect to.
+            scheme: ``'automatic_differentiation'`` (default) or
+                ``'finite_difference'``.
+        """
+        return Jacobian(self, [variable], scheme)
+
+    def diff(self, variable: "Variable", scheme: str = "automatic_differentiation") -> "Jacobian":
+        """Alias for :meth:`d`."""
+        return Jacobian(self, [variable], scheme)
+
+    def laplacian(
+        self,
+        *variables: "Variable",
+        scheme: str = "automatic_differentiation",
+    ) -> "Hessian":
+        """Return ∇²self — shorthand for ``jnn.laplacian(self, list(variables))``.
+
+        Example::
+
+            lap_u = u.laplacian(x, y)   # ∂²u/∂x² + ∂²u/∂y²
+
+        Args:
+            *variables: Variables to include in the Laplacian.
+            scheme: ``'automatic_differentiation'`` (default) or
+                ``'finite_difference'``.
+        """
+        return Hessian(self, list(variables) if variables else None, scheme, trace=True)
+
+    def hessian(
+        self,
+        *variables: "Variable",
+        scheme: str = "automatic_differentiation",
+    ) -> "Hessian":
+        """Return the full Hessian matrix of self w.r.t. *variables*.
+
+        Example::
+
+            H = u.hessian(x, y)   # 2×2 Hessian matrix per point
+
+        Args:
+            *variables: Variables for the Hessian.
+            scheme: ``'automatic_differentiation'`` (default) or
+                ``'finite_difference'``.
+        """
+        return Hessian(self, list(variables), scheme, trace=False)
+
+    def d2(self, variable: "Variable", scheme: str = "automatic_differentiation") -> "Hessian":
+        """Return ∂²self/∂variable² — shorthand for ``jnn.hessian(self, [variable])``.
+
+        Args:
+            variable: The Variable to differentiate with respect to.
+            scheme: ``'automatic_differentiation'`` (default) or
+                ``'finite_difference'``.
+        """
+        return Hessian(self, [variable], scheme, trace=True)
+
 
 class FunctionCall(Placeholder):
     """Call to a pure function over traced args."""

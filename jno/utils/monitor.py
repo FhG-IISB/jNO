@@ -1,32 +1,30 @@
 """Lightweight hardware monitor that runs in a background thread.
 
 Polls GPU (``nvidia-smi``) and CPU/RAM (``psutil``) metrics at a fixed
-interval and writes them to a CSV file.  The monitoring thread only calls
-``subprocess.run`` (for nvidia-smi) and ``psutil`` — neither touches JAX,
-so it cannot interfere with JIT compilation or device execution.
+interval and appends structured lines to the run's ``log.txt`` file via
+``logger.quiet()`` (file-only, no console output).  All hardware data
+therefore ends up in the single log alongside training progress —
+no separate ``hardware_monitor.csv`` is created.
 
 Usage::
 
-    monitor = HardwareMonitor(log_dir="./runs/exp1", interval=2.0)
+    monitor = HardwareMonitor(logger=log, interval=2.0)
     monitor.start()
     # ... training ...
-    monitor.stop()          # writes summary to logger
+    monitor.stop()   # writes peak-usage summary line to log
 """
 
 from __future__ import annotations
 
-import csv
-import os
 import subprocess
 import time
 import threading
-from pathlib import Path
 from typing import Optional
 
 
 # ── nvidia-smi helpers ──────────────────────────────────────────────
 
-_GPU_QUERY = "index,name,utilization.gpu,memory.used,memory.total," "temperature.gpu,power.draw"
+_GPU_QUERY = "index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw"
 
 
 def _query_gpus() -> list[dict]:
@@ -81,105 +79,104 @@ def _query_cpu_ram() -> dict:
         "cpu_pct": psutil.cpu_percent(interval=None),
         "ram_used_gb": vm.used / (1024**3),
         "ram_total_gb": vm.total / (1024**3),
-        "ram_pct": vm.percent,
     }
 
 
-# ── Monitor process target ─────────────────────────────────────────
+def _format_hw_line(cpu_ram: dict, gpus: list[dict]) -> str:
+    """Format one hardware sample as a compact human-readable string."""
+    parts = []
+    if "cpu_pct" in cpu_ram:
+        parts.append(f"CPU {cpu_ram['cpu_pct']:.0f}%")
+    if "ram_used_gb" in cpu_ram:
+        parts.append(f"RAM {cpu_ram['ram_used_gb']:.1f}/{cpu_ram['ram_total_gb']:.1f} GB")
+    for g in gpus:
+        idx = g["gpu_index"]
+        parts.append(
+            f"gpu{idx}: util={g['gpu_util_pct']:.0f}%" f" mem={g['gpu_mem_used_mb']:.0f}/{g['gpu_mem_total_mb']:.0f} MB" f" temp={g['gpu_temp_c']:.0f}\u00b0C" f" power={g['gpu_power_w']:.0f}W"
+        )
+    return "HW | " + " | ".join(parts)
 
 
-def _monitor_loop(csv_path: str, interval: float, stop_event):
-    """Entry-point for the background process."""
-    # Initial psutil call to prime the CPU counter
+# ── Monitor thread ──────────────────────────────────────────────────
+
+
+def _monitor_loop(logger, interval: float, stop_event, peak: dict, lock: threading.Lock):
+    """Entry-point for the background monitoring thread."""
     try:
         import psutil
 
-        psutil.cpu_percent(interval=None)
+        psutil.cpu_percent(interval=None)  # prime the CPU counter
     except ImportError:
         pass
 
-    fieldnames: list[str] | None = None
-    write_header = not os.path.exists(csv_path)
+    while not stop_event.is_set():
+        ts = time.time()
+        cpu_ram = _query_cpu_ram()
+        gpus = _query_gpus()
 
-    with open(csv_path, "a", newline="") as fh:
-        while not stop_event.is_set():
-            ts = time.time()
-            cpu_ram = _query_cpu_ram()
-            gpus = _query_gpus()
+        # Write structured line to log file only (no console output)
+        if logger is not None and hasattr(logger, "quiet"):
+            logger.quiet(_format_hw_line(cpu_ram, gpus))
 
-            if not gpus:
-                # CPU-only row
-                row = {"timestamp": ts, **cpu_ram}
-                if fieldnames is None:
-                    fieldnames = list(row.keys())
-                    writer = csv.DictWriter(fh, fieldnames=fieldnames)
-                    if write_header:
-                        writer.writeheader()
-                        write_header = False
-                writer.writerow(row)
-            else:
-                for g in gpus:
-                    row = {"timestamp": ts, **cpu_ram, **g}
-                    if fieldnames is None:
-                        fieldnames = list(row.keys())
-                        writer = csv.DictWriter(fh, fieldnames=fieldnames)
-                        if write_header:
-                            writer.writeheader()
-                            write_header = False
-                    writer.writerow(row)
+        # Update in-memory peak values
+        with lock:
+            if "cpu_pct" in cpu_ram:
+                peak["cpu_pct"] = max(peak.get("cpu_pct", 0.0), cpu_ram["cpu_pct"])
+            if "ram_used_gb" in cpu_ram:
+                peak["ram_used_gb"] = max(peak.get("ram_used_gb", 0.0), cpu_ram["ram_used_gb"])
+                peak["ram_total_gb"] = cpu_ram["ram_total_gb"]
+            for g in gpus:
+                idx = g["gpu_index"]
+                peak[f"gpu{idx}_util"] = max(peak.get(f"gpu{idx}_util", 0.0), g["gpu_util_pct"])
+                peak[f"gpu{idx}_mem"] = max(peak.get(f"gpu{idx}_mem", 0.0), g["gpu_mem_used_mb"])
+                peak[f"gpu{idx}_mem_total"] = g["gpu_mem_total_mb"]
 
-            fh.flush()
-            # Sleep in small increments so stop_event is checked promptly
-            elapsed = time.time() - ts
-            remaining = max(0.0, interval - elapsed)
-            stop_event.wait(timeout=remaining)
+        elapsed = time.time() - ts
+        stop_event.wait(timeout=max(0.0, interval - elapsed))
 
 
 # ── Public API ──────────────────────────────────────────────────────
 
 
 class HardwareMonitor:
-    """Start a background daemon thread that logs hardware metrics to CSV.
+    """Background daemon thread that appends hardware metrics to ``log.txt``.
 
-    The thread only calls ``subprocess.run`` (nvidia-smi) and ``psutil``,
-    so it never touches JAX and cannot interfere with JIT or device ops.
+    All hardware data is written via ``logger.quiet()`` (file-only, no
+    console output), so it ends up in the same ``log.txt`` used for all
+    other run information — no separate CSV is created.
 
     Args:
-        log_dir: Directory for the CSV file (same as ``logger.path``).
+        logger: The run's Logger instance (must support ``.quiet()``).
         interval: Seconds between samples (default 2).
-        filename: CSV filename (default ``hardware_monitor.csv``).
     """
 
-    def __init__(
-        self,
-        log_dir: str | Path = "./",
-        interval: float = 2.0,
-        filename: str = "hardware_monitor.csv",
-    ):
-        self.log_dir = Path(log_dir)
+    def __init__(self, logger=None, interval: float = 2.0):
+        self._logger = logger
         self.interval = interval
-        self.csv_path = self.log_dir / filename
         self._thread: Optional[threading.Thread] = None
         self._stop_event: Optional[threading.Event] = None
         self._start_time: Optional[float] = None
+        self._peak: dict = {}
+        self._lock = threading.Lock()
 
     def start(self):
         """Start the monitoring thread."""
-        self.log_dir.mkdir(parents=True, exist_ok=True)
         self._stop_event = threading.Event()
+        self._peak = {}
         self._thread = threading.Thread(
             target=_monitor_loop,
-            args=(str(self.csv_path), self.interval, self._stop_event),
+            args=(self._logger, self.interval, self._stop_event, self._peak, self._lock),
             daemon=True,
         )
         self._start_time = time.time()
         self._thread.start()
 
     def stop(self, logger=None):
-        """Stop the monitoring thread and optionally log a summary.
+        """Stop the monitoring thread and log a peak-usage summary.
 
         Args:
-            logger: If provided, a short summary of peak usage is logged.
+            logger: If provided, a short summary is logged as an INFO line
+                    (appears both on console and in the log file).
         """
         if self._thread is None:
             return
@@ -190,52 +187,32 @@ class HardwareMonitor:
 
         duration = time.time() - self._start_time if self._start_time else 0
 
-        if logger is not None:
+        _log = logger or self._logger
+        if _log is not None:
             summary = self._summarize()
             if summary:
-                logger.info(f"Hardware monitor ({duration:.0f}s, {self.csv_path.name}): {summary}")
+                _log.info(f"Hardware monitor ({duration:.0f}s): {summary}")
 
     def _summarize(self) -> str:
-        """Read the CSV and produce a one-line peak-usage summary."""
-        if not self.csv_path.exists():
-            return ""
+        """Return a one-line peak-usage summary from in-memory data."""
+        with self._lock:
+            peak = dict(self._peak)
 
-        peak_gpu_util = 0.0
-        peak_gpu_mem = 0.0
-        gpu_mem_total = 0.0
-        peak_cpu = 0.0
-        peak_ram = 0.0
-        ram_total = 0.0
-        n_rows = 0
-
-        try:
-            with open(self.csv_path, newline="") as fh:
-                reader = csv.DictReader(fh)
-                for row in reader:
-                    n_rows += 1
-                    if "gpu_util_pct" in row:
-                        peak_gpu_util = max(peak_gpu_util, float(row["gpu_util_pct"]))
-                    if "gpu_mem_used_mb" in row:
-                        peak_gpu_mem = max(peak_gpu_mem, float(row["gpu_mem_used_mb"]))
-                    if "gpu_mem_total_mb" in row:
-                        gpu_mem_total = max(gpu_mem_total, float(row["gpu_mem_total_mb"]))
-                    if "cpu_pct" in row:
-                        peak_cpu = max(peak_cpu, float(row["cpu_pct"]))
-                    if "ram_used_gb" in row:
-                        peak_ram = max(peak_ram, float(row["ram_used_gb"]))
-                    if "ram_total_gb" in row:
-                        ram_total = max(ram_total, float(row["ram_total_gb"]))
-        except Exception:
+        if not peak:
             return ""
 
         parts = []
-        if peak_gpu_mem > 0:
-            parts.append(f"GPU peak {peak_gpu_mem:.0f}/{gpu_mem_total:.0f} MB " f"({peak_gpu_util:.0f}% util)")
-        if peak_ram > 0:
-            parts.append(f"RAM peak {peak_ram:.1f}/{ram_total:.1f} GB")
-        if peak_cpu > 0:
-            parts.append(f"CPU peak {peak_cpu:.0f}%")
-        parts.append(f"{n_rows} samples")
+        gpu_indices = sorted({int(k.split("_")[0][3:]) for k in peak if k.startswith("gpu")})
+        for idx in gpu_indices:
+            mem = peak.get(f"gpu{idx}_mem", 0.0)
+            mem_total = peak.get(f"gpu{idx}_mem_total", 0.0)
+            util = peak.get(f"gpu{idx}_util", 0.0)
+            if mem > 0:
+                parts.append(f"GPU peak {mem:.0f}/{mem_total:.0f} MB ({util:.0f}% util)")
+        if "ram_used_gb" in peak:
+            parts.append(f"RAM peak {peak['ram_used_gb']:.1f}/{peak.get('ram_total_gb', 0):.1f} GB")
+        if "cpu_pct" in peak:
+            parts.append(f"CPU peak {peak['cpu_pct']:.0f}%")
 
         return " | ".join(parts)
 
