@@ -10,9 +10,6 @@ from jno.trace import (
     TensorTag,
     BinaryOp,
     FunctionCall,
-    Concat,
-    Reshape,
-    Slice,
     OperationDef,
     OperationCall,
     Model,
@@ -55,7 +52,7 @@ class TestEvalCtx:
 # ======================================================================
 class TestDispatchTable:
     def test_handlers_count(self):
-        assert len(TraceEvaluator._HANDLERS) == 16
+        assert len(TraceEvaluator._HANDLERS) == 13
 
     def test_handlers_are_strings(self):
         for node_type, method_name in TraceEvaluator._HANDLERS:
@@ -205,25 +202,29 @@ class TestEvalFunctionCall:
 
 # ======================================================================
 # Concat evaluation
+# (now via jno.numpy.concat which returns a FunctionCall)
 # ======================================================================
 class TestEvalConcat:
     def test_concat_literals(self):
+        import jno.numpy as pnp
+
         ev = make_evaluator()
         a = Literal(jnp.array([[1.0], [2.0]]))
         b = Literal(jnp.array([[3.0], [4.0]]))
-        expr = Concat([a, b])
+        expr = pnp.concat([a, b])
         result = ev.evaluate(expr, make_points())
-        assert result.shape[1] == 2  # concatenated along axis=1 (after newaxis treatment)
+        assert result.shape[1] == 2  # concatenated along last axis
 
 
 # ======================================================================
 # Reshape evaluation
+# (now via Placeholder.reshape() which returns a FunctionCall)
 # ======================================================================
 class TestEvalReshape:
     def test_reshape(self):
         ev = make_evaluator()
         x = Literal(jnp.arange(6.0))
-        expr = Reshape(x, (2, 3))
+        expr = x.reshape((2, 3))
         result = ev.evaluate(expr, make_points())
         assert result.shape == (2, 3)
 

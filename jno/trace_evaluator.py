@@ -8,10 +8,6 @@ import inspect
 
 from .trace import (
     Placeholder,
-    NewAxis,
-    Reshape,
-    Slice,
-    Concat,
     FunctionCall,
     Literal,
     ConstantNamespace,
@@ -78,13 +74,21 @@ class DifferentialOperators:
             u_values[l_idx],
         )
         v1, v2, v3 = p1 - p0, p2 - p0, p3 - p0
-        volumes = jnp.abs(v1[:, 0] * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1]) - v1[:, 1] * (v2[:, 0] * v3[:, 2] - v2[:, 2] * v3[:, 0]) + v1[:, 2] * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0])) / 6.0
+        volumes = (
+            jnp.abs(v1[:, 0] * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1]) - v1[:, 1] * (v2[:, 0] * v3[:, 2] - v2[:, 2] * v3[:, 0]) + v1[:, 2] * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0])) / 6.0
+        )
         if dim == 0:
-            grads = ((u1 - u0) * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1]) + (u2 - u0) * (v3[:, 1] * v1[:, 2] - v3[:, 2] * v1[:, 1]) + (u3 - u0) * (v1[:, 1] * v2[:, 2] - v1[:, 2] * v2[:, 1])) / (6 * volumes + 1e-12)
+            grads = ((u1 - u0) * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1]) + (u2 - u0) * (v3[:, 1] * v1[:, 2] - v3[:, 2] * v1[:, 1]) + (u3 - u0) * (v1[:, 1] * v2[:, 2] - v1[:, 2] * v2[:, 1])) / (
+                6 * volumes + 1e-12
+            )
         elif dim == 1:
-            grads = ((u1 - u0) * (v2[:, 2] * v3[:, 0] - v2[:, 0] * v3[:, 2]) + (u2 - u0) * (v3[:, 2] * v1[:, 0] - v3[:, 0] * v1[:, 2]) + (u3 - u0) * (v1[:, 2] * v2[:, 0] - v1[:, 0] * v2[:, 2])) / (6 * volumes + 1e-12)
+            grads = ((u1 - u0) * (v2[:, 2] * v3[:, 0] - v2[:, 0] * v3[:, 2]) + (u2 - u0) * (v3[:, 2] * v1[:, 0] - v3[:, 0] * v1[:, 2]) + (u3 - u0) * (v1[:, 2] * v2[:, 0] - v1[:, 0] * v2[:, 2])) / (
+                6 * volumes + 1e-12
+            )
         else:
-            grads = ((u1 - u0) * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0]) + (u2 - u0) * (v3[:, 0] * v1[:, 1] - v3[:, 1] * v1[:, 0]) + (u3 - u0) * (v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0])) / (6 * volumes + 1e-12)
+            grads = ((u1 - u0) * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0]) + (u2 - u0) * (v3[:, 0] * v1[:, 1] - v3[:, 1] * v1[:, 0]) + (u3 - u0) * (v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0])) / (
+                6 * volumes + 1e-12
+            )
         grads = jnp.where(volumes > 1e-12, grads, 0.0)
         volume_weights = jnp.where(volumes > 1e-12, volumes, 0.0)
         contributions = grads * volume_weights
@@ -439,9 +443,6 @@ class TraceEvaluator:
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     self._trace_visit(arg, ctx, depth + 1, lines, seen)
-        elif isinstance(node, Concat):
-            for item in node.items:
-                self._trace_visit(item, ctx, depth + 1, lines, seen)
         elif isinstance(node, ModelCall):
             for arg in node.args:
                 if isinstance(arg, Placeholder):
@@ -458,10 +459,6 @@ class TraceEvaluator:
             # Build rebound context then trace the inner OperationDef
             self._trace_visit(node.operation, ctx, depth + 1, lines, seen)
         elif isinstance(node, (Jacobian, Hessian)):
-            self._trace_visit(node.target, ctx, depth + 1, lines, seen)
-        elif isinstance(node, Slice):
-            self._trace_visit(node.target, ctx, depth + 1, lines, seen)
-        elif isinstance(node, Reshape):
             self._trace_visit(node.target, ctx, depth + 1, lines, seen)
         # Leaf nodes (Variable, TensorTag, Constant, Literal) — no children
 
@@ -541,10 +538,7 @@ class TraceEvaluator:
         (Literal, "_eval_literal"),
         (TensorTag, "_eval_tensor_tag"),
         (Variable, "_eval_variable"),
-        (Concat, "_eval_concat"),
-        (Reshape, "_eval_reshape"),
         (FunctionCall, "_eval_function_call"),
-        (Slice, "_eval_slice"),
         (BinaryOp, "_eval_binary_op"),
         (OperationCall, "_eval_operation_call"),
         (ModelCall, "_eval_flax_module_call"),
@@ -656,15 +650,6 @@ class TraceEvaluator:
             self.log.error(f"Variable tag '{tag}' not found. context: {list(ctx.context.keys())}")
             raise KeyError(f"Variable tag '{tag}' not found in context")
 
-    def _eval_concat(self, expr, ctx):
-        items = [self._dispatch(item, ctx) for item in expr.items]
-        items = [i[..., jnp.newaxis] if i.ndim == 1 else i for i in items]
-        return jnp.concatenate(items, axis=-1)
-
-    def _eval_reshape(self, expr, ctx):
-        target = self._dispatch(expr.target, ctx)
-        return target.reshape(expr.target_shape)
-
     def _eval_function_call(self, expr, ctx):
         args = [(self._dispatch(arg, ctx) if isinstance(arg, Placeholder) else arg) for arg in expr.args]
         kwargs = expr.kwargs if expr.kwargs else {}
@@ -673,19 +658,6 @@ class TraceEvaluator:
             return expr.fn(*args, key=ctx.key, **kwargs)
         else:
             return expr.fn(*args, **kwargs)
-
-    def _eval_slice(self, expr, ctx):
-        target = self._dispatch(expr.target, ctx)
-        concrete_key = []
-        for k in expr.key:
-            if isinstance(k, NewAxis):
-                concrete_key.append(None)
-            else:
-                concrete_key.append(k)
-        result = target[tuple(concrete_key)]
-        if result.ndim == 0:
-            return result
-        return result
 
     def _eval_binary_op(self, expr, ctx):
         left = self._dispatch(expr.left, ctx)
@@ -1148,9 +1120,6 @@ class TraceEvaluator:
                     seen.add(flax_mod.layer_id)
                     layers.append((flax_mod, node.args))
 
-            elif isinstance(node, Concat):
-                for item in node.items:
-                    visit(item)
             elif isinstance(node, BinaryOp):
                 visit(node.left)
                 visit(node.right)
@@ -1164,10 +1133,6 @@ class TraceEvaluator:
                     if isinstance(arg, Placeholder):
                         visit(arg)
             elif isinstance(node, (Hessian, Jacobian)):
-                visit(node.target)
-            elif isinstance(node, Slice):
-                visit(node.target)
-            elif isinstance(node, Reshape):
                 visit(node.target)
 
         visit(expr)
@@ -1814,8 +1779,6 @@ class TraceEvaluator:
         if isinstance(node, FunctionCall):
             name = node._name or getattr(node.fn, "__name__", "fn")
             return uid, f"FunctionCall({name})"
-        if isinstance(node, Concat):
-            return uid, f"Concat(axis={node.axis})"
         if isinstance(node, ModelCall):
             mod = node.model
             mod_name = type(mod.module).__name__ if hasattr(mod, "module") else str(mod)
@@ -1837,8 +1800,4 @@ class TraceEvaluator:
             vars_str = ", ".join(str(v) for v in node.variables)
             scheme_str = f", {node.scheme[:2]}" if node.scheme else ""
             return uid, f"{kind}([{vars_str}]{scheme_str})"
-        if isinstance(node, Slice):
-            return uid, f"Slice({node.key})"
-        if isinstance(node, Reshape):
-            return uid, f"Reshape({node.target_shape})"
         return uid, type(node).__name__

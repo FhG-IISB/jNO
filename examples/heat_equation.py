@@ -7,7 +7,6 @@ from jno import LearningRateSchedule as lrs
 # from soap_jax import soap
 
 π = jnn.pi
-sin = jnn.sin
 dire = jno.setup(__file__)
 
 domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05), time=(0, 1, 10), compute_mesh_connectivity=False)
@@ -29,14 +28,12 @@ u = u_net(t, jnn.concat([x, y])) * x * (1 - x) * y * (1 - y)
 u0 = u_net(t0, jnn.concat([x0, y0])) * x0 * (1 - x0) * y0 * (1 - y0)
 
 pde = jnn.grad(u, t) - 0.1 * jnn.laplacian(u, [x, y])  # 2D heat equation
-ini = u0 - sin(π * x0) * sin(π * y0)  # Sinusoidal Initial Condition
+ini = u0 - jnn.sin(π * x0) * jnn.sin(π * y0)  # Sinusoidal Initial Condition
 
 crux = jno.core([pde.mse, ini.mse], domain)
 crux.solve(100).plot(f"{dire}/training_history_v1.png")
 u_net.optimizer(optax.lbfgs(1))
 crux.solve(100).plot(f"{dire}/training_history_v2.png")
-# u_net.optimizer(soap(1), lr=lrs.cosine(100, 1e-3, 1e-5))
-# crux.solve(100).plot(f"{dire}/training_history_v3.png")
 u_net.optimizer(optax.adamw(1))
 crux.solve(100).plot(f"{dire}/training_history_v4.png")
 jno.save(crux, f"{dire}/crux.pkl")

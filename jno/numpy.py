@@ -1,6 +1,7 @@
+import jax
 import jax.numpy as jnp
-from typing import Union, List, Sequence, Callable
-from .trace import Placeholder, Variable, FunctionCall, Concat, Hessian, Jacobian, Constant, ConstantNamespace, BinaryOp
+from typing import List, Union
+from .trace import Placeholder, Variable, FunctionCall, Hessian, Jacobian, Constant, ConstantNamespace
 
 # Keep import so people can use jno.numpy as jno -> jno.model, jno.tune
 from .tuner import Arch, ArchSpace, tune
@@ -87,12 +88,10 @@ def function(fn, args: list = [], name: str = "", reduces_axis: int = None):
 
 
 def _unary(jnp_fn):
-    """Create a unary wrapper that handles Placeholder and plain arrays."""
+    """Create a unary wrapper for Placeholder args."""
 
     def wrapper(x):
-        if isinstance(x, Placeholder):
-            return FunctionCall(jnp_fn, [x])
-        return jnp_fn(x)
+        return FunctionCall(jnp_fn, [x])
 
     wrapper.__name__ = jnp_fn.__name__
     wrapper.__doc__ = jnp_fn.__doc__
@@ -100,12 +99,10 @@ def _unary(jnp_fn):
 
 
 def _binary(jnp_fn):
-    """Create a binary wrapper that handles Placeholder and plain arrays."""
+    """Create a binary wrapper for Placeholder args."""
 
     def wrapper(x, y):
-        if isinstance(x, Placeholder) or isinstance(y, Placeholder):
-            return FunctionCall(jnp_fn, [x, y])
-        return jnp_fn(x, y)
+        return FunctionCall(jnp_fn, [x, y])
 
     wrapper.__name__ = jnp_fn.__name__
     wrapper.__doc__ = jnp_fn.__doc__
@@ -156,7 +153,6 @@ sign = _unary(jnp.sign)
 # ============================================================================
 # Array manipulation
 # ============================================================================
-import jax
 
 
 @jax.tree_util.register_pytree_node_class
@@ -179,39 +175,30 @@ class ViewFactorOp:
     # -----------------------
     # Matrix multiply: F @ x
     # -----------------------
-    def __matmul__(self, x: Union["Placeholder", jnp.ndarray]):
-        if isinstance(self.F, Placeholder) or isinstance(x, Placeholder):
-            return FunctionCall(lambda A, b: A @ b, [self.F, x])
-        return self.F @ x
+    def __matmul__(self, x):
+        return FunctionCall(lambda A, b: A @ b, [self.F, x])
 
     # -----------------------
     # Left multiply: x @ F
     # -----------------------
-    def __rmatmul__(self, x: Union["Placeholder", jnp.ndarray]):
-        if isinstance(self.F, Placeholder) or isinstance(x, Placeholder):
-            return FunctionCall(lambda b, A: b @ A, [x, self.F])
-        return x @ self.F
+    def __rmatmul__(self, x):
+        return FunctionCall(lambda b, A: b @ A, [x, self.F])
 
     # -----------------------
     # Apply operator explicitly
     # -----------------------
-    def apply(self, x: Union["Placeholder", jnp.ndarray]):
+    def apply(self, x):
         return self @ x
 
     # -----------------------
     # Solve (I - αF)x = rhs
     # -----------------------
     def solve(self, rhs, alpha):
-        if isinstance(self.F, Placeholder) or isinstance(rhs, Placeholder):
+        def solve_fn(A, b, a):
+            I = jnp.eye(A.shape[0])
+            return jnp.linalg.solve(I - a * A, b)
 
-            def solve_fn(A, b, a):
-                I = jnp.eye(A.shape[0])
-                return jnp.linalg.solve(I - a * A, b)
-
-            return FunctionCall(solve_fn, [self.F, rhs, alpha])
-
-        I = jnp.eye(self.F.shape[0])
-        return jnp.linalg.solve(I - alpha * self.F, rhs)
+        return FunctionCall(solve_fn, [self.F, rhs, alpha])
 
     # -----------------------
     # PyTree support for JAX
@@ -224,67 +211,51 @@ class ViewFactorOp:
         return cls(*children)
 
 
-def view_factor(F: Union["Placeholder", jnp.ndarray]) -> Union[ViewFactorOp, jnp.ndarray]:
+def view_factor(F: Union["Placeholder", jnp.ndarray]) -> ViewFactorOp:
     """Create a view factor operator."""
-    if isinstance(F, Placeholder):
-        return ViewFactorOp(F)
     return ViewFactorOp(F)
 
 
-def concat(items: Sequence[Union[Placeholder, jnp.ndarray]], axis: int = -1) -> Union[Concat, jnp.ndarray]:
-    """Concatenate arrays or placeholders along an axis."""
-    has_placeholder = any(isinstance(item, Placeholder) for item in items)
-    if has_placeholder:
-        return Concat(list(items), axis=axis)
-    return jnp.concatenate(items, axis=axis)
+def concat(items, axis: int = -1) -> FunctionCall:
+    """Concatenate placeholders along an axis (always axis=-1 at eval time)."""
+
+    def _fn(*args):
+        expanded = [a[..., jnp.newaxis] if a.ndim == 1 else a for a in args]
+        return jnp.concatenate(expanded, axis=-1)
+
+    return FunctionCall(_fn, list(items), name="concat")
 
 
-def concatenate(items: Sequence[Union[Placeholder, jnp.ndarray]], axis: int = -1) -> Union[Concat, jnp.ndarray]:
+def concatenate(items, axis: int = -1) -> FunctionCall:
     """Alias for concat."""
     return concat(items, axis=axis)
 
 
-def stack(items: Sequence[Union[Placeholder, jnp.ndarray]], axis: int = 0) -> Union[Concat, FunctionCall, jnp.ndarray]:
-    """Stack arrays along a new axis.
-
-    For axis=-1, uses Concat which enables proper dimension inference for neural networks.
-    """
-    has_placeholder = any(isinstance(item, Placeholder) for item in items)
-    if has_placeholder:
-        # For axis=-1 (last axis), use Concat for proper dimension tracking
-        if axis == -1:
-            return Concat(list(items), axis=-1)
-        # For other axes, use FunctionCall
-        return FunctionCall(lambda *args: jnp.stack(args, axis=axis), list(items))
-    return jnp.stack(items, axis=axis)
+def stack(items, axis: int = 0) -> FunctionCall:
+    """Stack placeholders along a new axis."""
+    if axis == -1:
+        return concat(items, axis=-1)
+    return FunctionCall(lambda *args: jnp.stack(args, axis=axis), list(items), name="stack")
 
 
-def reshape(x: Union[Placeholder, jnp.ndarray], shape: tuple) -> Union[FunctionCall, jnp.ndarray]:
-    """Reshape array."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(lambda a: jnp.reshape(a, shape), [x])
-    return jnp.reshape(x, shape)
+def reshape(x, shape: tuple) -> FunctionCall:
+    """Reshape a placeholder to a new shape."""
+    return FunctionCall(lambda a: jnp.reshape(a, shape), [x])
 
 
-def squeeze(x: Union[Placeholder, jnp.ndarray], axis: int = None) -> Union[FunctionCall, jnp.ndarray]:
+def squeeze(x, axis: int = None) -> FunctionCall:
     """Remove single-dimensional entries."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(lambda a: jnp.squeeze(a, axis=axis), [x])
-    return jnp.squeeze(x, axis=axis)
+    return FunctionCall(lambda a: jnp.squeeze(a, axis=axis), [x])
 
 
-def expand_dims(x: Union[Placeholder, jnp.ndarray], axis: int) -> Union[FunctionCall, jnp.ndarray]:
+def expand_dims(x, axis: int) -> FunctionCall:
     """Expand array dimensions."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(lambda a: jnp.expand_dims(a, axis=axis), [x])
-    return jnp.expand_dims(x, axis=axis)
+    return FunctionCall(lambda a: jnp.expand_dims(a, axis=axis), [x])
 
 
-def transpose(x: Union[Placeholder, jnp.ndarray], axes: tuple = None) -> Union[FunctionCall, jnp.ndarray]:
+def transpose(x, axes: tuple = None) -> FunctionCall:
     """Transpose array."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(lambda a: jnp.transpose(a, axes=axes), [x])
-    return jnp.transpose(x, axes=axes)
+    return FunctionCall(lambda a: jnp.transpose(a, axes=axes), [x])
 
 
 # ============================================================================
@@ -292,67 +263,40 @@ def transpose(x: Union[Placeholder, jnp.ndarray], axes: tuple = None) -> Union[F
 # ============================================================================
 
 
-def sum(x: Union[Placeholder, jnp.ndarray], axis: int = None, keepdims: bool = False) -> Union[FunctionCall, jnp.ndarray]:
-    """Sum of array elements."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(lambda a: jnp.sum(a, axis=axis, keepdims=keepdims), [x], name="sum", reduces_axis=axis)
-    return jnp.sum(x, axis=axis, keepdims=keepdims)
+def _reduction(jnp_fn, name):
+    """Create a reduction wrapper for Placeholder args."""
+
+    def wrapper(x, axis=None, keepdims=False):
+        return FunctionCall(
+            lambda a: jnp_fn(a, axis=axis, keepdims=keepdims),
+            [x],
+            name=name,
+            reduces_axis=axis,
+        )
+
+    wrapper.__name__ = name
+    wrapper.__doc__ = jnp_fn.__doc__
+    return wrapper
 
 
-def mean(x: Union[Placeholder, jnp.ndarray], axis: int = None, keepdims: bool = False) -> Union[FunctionCall, jnp.ndarray]:
-    """Mean of array elements."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(lambda a: jnp.mean(a, axis=axis, keepdims=keepdims), [x], name="mean", reduces_axis=axis)
-    return jnp.mean(x, axis=axis, keepdims=keepdims)
+sum = _reduction(jnp.sum, "sum")
+mean = _reduction(jnp.mean, "mean")
+median = _reduction(jnp.median, "median")
+std = _reduction(jnp.std, "std")
+var = _reduction(jnp.var, "var")
+min = _reduction(jnp.min, "min")
+max = _reduction(jnp.max, "max")
+prod = _reduction(jnp.prod, "prod")
 
 
-def median(x: Union[Placeholder, jnp.ndarray], axis: int = None, keepdims: bool = False) -> Union[FunctionCall, jnp.ndarray]:
-    """Median of array elements."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(lambda a: jnp.median(a, axis=axis, keepdims=keepdims), [x], name="median", reduces_axis=axis)
-    return jnp.median(x, axis=axis, keepdims=keepdims)
-
-
-def std(x: Union[Placeholder, jnp.ndarray], axis: int = None, keepdims: bool = False) -> Union[FunctionCall, jnp.ndarray]:
-    """Standard deviation."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(lambda a: jnp.std(a, axis=axis, keepdims=keepdims), [x], name="std", reduces_axis=axis)
-    return jnp.std(x, axis=axis, keepdims=keepdims)
-
-
-def var(x: Union[Placeholder, jnp.ndarray], axis: int = None, keepdims: bool = False) -> Union[FunctionCall, jnp.ndarray]:
-    """Variance."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(lambda a: jnp.var(a, axis=axis, keepdims=keepdims), [x], name="var", reduces_axis=axis)
-    return jnp.var(x, axis=axis, keepdims=keepdims)
-
-
-def min(x: Union[Placeholder, jnp.ndarray], axis: int = None, keepdims: bool = False) -> Union[FunctionCall, jnp.ndarray]:
-    """Minimum value."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(lambda a: jnp.min(a, axis=axis, keepdims=keepdims), [x], name="min", reduces_axis=axis)
-    return jnp.min(x, axis=axis, keepdims=keepdims)
-
-
-def max(x: Union[Placeholder, jnp.ndarray], axis: int = None, keepdims: bool = False) -> Union[FunctionCall, jnp.ndarray]:
-    """Maximum value."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(lambda a: jnp.max(a, axis=axis, keepdims=keepdims), [x], name="max", reduces_axis=axis)
-    return jnp.max(x, axis=axis, keepdims=keepdims)
-
-
-def prod(x: Union[Placeholder, jnp.ndarray], axis: int = None, keepdims: bool = False) -> Union[FunctionCall, jnp.ndarray]:
-    """Product of array elements."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(lambda a: jnp.prod(a, axis=axis, keepdims=keepdims), [x], name="prod", reduces_axis=axis)
-    return jnp.prod(x, axis=axis, keepdims=keepdims)
-
-
-def norm(x: Union[Placeholder, jnp.ndarray], ord: int = None, axis: int = None, keepdims: bool = False) -> Union[FunctionCall, jnp.ndarray]:
+def norm(x, ord=None, axis=None, keepdims=False) -> FunctionCall:
     """Vector/matrix norm."""
-    if isinstance(x, Placeholder):
-        return FunctionCall(lambda a: jnp.linalg.norm(a, ord=ord, axis=axis, keepdims=keepdims), [x], name="norm", reduces_axis=axis)
-    return jnp.linalg.norm(x, ord=ord, axis=axis, keepdims=keepdims)
+    return FunctionCall(
+        lambda a: jnp.linalg.norm(a, ord=ord, axis=axis, keepdims=keepdims),
+        [x],
+        name="norm",
+        reduces_axis=axis,
+    )
 
 
 # ============================================================================
@@ -364,11 +308,9 @@ maximum = _binary(jnp.maximum)
 minimum = _binary(jnp.minimum)
 
 
-def where(condition, x, y) -> Union[FunctionCall, jnp.ndarray]:
+def where(condition, x, y) -> FunctionCall:
     """Return elements chosen from x or y depending on condition."""
-    if isinstance(condition, Placeholder) or isinstance(x, (Placeholder, int, float)) or isinstance(y, (Placeholder, int, float)):
-        return FunctionCall(jnp.where, [condition, x, y])
-    return jnp.where(condition, x, y)
+    return FunctionCall(jnp.where, [condition, x, y])
 
 
 # ============================================================================
@@ -538,86 +480,36 @@ def curl_3d(Fx: Placeholder, Fy: Placeholder, Fz: Placeholder, x: Variable, y: V
 
 
 # ============================================================================
-# Array creation (these return JAX arrays, not placeholders)
+# Array creation and dtypes — plain re-exports from jax.numpy
 # ============================================================================
-
-
-def zeros(shape, dtype=None):
-    """Create array of zeros."""
-    return jnp.zeros(shape, dtype=dtype)
-
-
-def ones(shape, dtype=None):
-    """Create array of ones."""
-    return jnp.ones(shape, dtype=dtype)
-
-
-def ones_like(u):
-    return u * 0.0 + 1.0
-
-
-def full(shape, fill_value, dtype=None):
-    """Create array filled with value."""
-    return jnp.full(shape, fill_value, dtype=dtype)
-
-
-def arange(start, stop=None, step=None, dtype=None):
-    """Create evenly spaced values."""
-    return jnp.arange(start, stop, step, dtype=dtype)
-
-
-def linspace(start, stop, num=50, dtype=None):
-    """Create evenly spaced values over interval."""
-    return jnp.linspace(start, stop, num, dtype=dtype)
-
-
-def meshgrid(*xi, indexing="xy"):
-    """Create coordinate matrices."""
-    return jnp.meshgrid(*xi, indexing=indexing)
-
-
-def eye(n, m=None, dtype=None):
-    """Create identity matrix."""
-    return jnp.eye(n, m, dtype=dtype)
-
-
-# ============================================================================
-# Type conversions
-# ============================================================================
-
-
-def array(x, dtype=None):
-    """Create array from input."""
-    return jnp.array(x, dtype=dtype)
-
-
-def asarray(x, dtype=None):
-    """Convert to array."""
-    return jnp.asarray(x, dtype=dtype)
-
-
-# ============================================================================
-# Data types
-# ============================================================================
-
-float32 = jnp.float32
-float64 = jnp.float64
-int32 = jnp.int32
-int64 = jnp.int64
-bool_ = jnp.bool_
-complex64 = jnp.complex64
-complex128 = jnp.complex128
+from jax.numpy import (
+    zeros,
+    ones,
+    full,
+    eye,
+    arange,
+    linspace,
+    meshgrid,
+    array,
+    asarray,
+    float32,
+    float64,
+    int32,
+    int64,
+    bool_,
+    complex64,
+    complex128,
+)
 
 
 def _create_linalg_wrapper():
     """Factory function to create the linalg wrapper class."""
 
     class _linalg:
-        """Wrapper for jax.numpy.linalg that returns FunctionCall objects."""
+        """Wrapper for jax.numpy.linalg that always returns FunctionCall nodes."""
 
         pass
 
-    # Get all public functions from jnp.linalg
     for name in dir(jnp.linalg):
         if name.startswith("_"):
             continue
@@ -625,10 +517,15 @@ def _create_linalg_wrapper():
         original = getattr(jnp.linalg, name)
 
         if callable(original):
-            # Create wrapper function
+
             def make_method(func, func_name):
                 def method(*args, **kwargs):
-                    return FunctionCall(func, list(args), name=func_name, kwargs=kwargs if kwargs else None)
+                    return FunctionCall(
+                        func,
+                        list(args),
+                        name=func_name,
+                        kwargs=kwargs if kwargs else None,
+                    )
 
                 method.__doc__ = func.__doc__
                 method.__name__ = func_name

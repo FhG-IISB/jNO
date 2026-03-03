@@ -4,11 +4,7 @@ import pytest
 import jax.numpy as jnp
 
 from jno.trace import (
-    NewAxis,
     Placeholder,
-    Reshape,
-    Slice,
-    Concat,
     FunctionCall,
     Literal,
     ConstantNamespace,
@@ -153,20 +149,18 @@ class TestSlicing:
     def test_getitem_int(self):
         a = make_var("x")
         result = a[0]
-        assert isinstance(result, Slice)
+        assert isinstance(result, FunctionCall)
 
     def test_getitem_slice(self):
         a = make_var("x")
         result = a[1:3]
-        assert isinstance(result, Slice)
+        assert isinstance(result, FunctionCall)
 
     def test_getitem_none_becomes_newaxis(self):
         a = make_var("x")
         result = a[None, :]
-        assert isinstance(result, Slice)
-        # Check NewAxis is in the key
-        key = result.key
-        assert any(isinstance(k, NewAxis) for k in key)
+        # None is inlined as None in the concrete key (no NewAxis wrapper)
+        assert isinstance(result, FunctionCall)
 
 
 # ======================================================================
@@ -176,8 +170,7 @@ class TestReshape:
     def test_reshape(self):
         a = make_var("x")
         result = a.reshape(2, 3)
-        assert isinstance(result, Reshape)
-        assert result.target_shape == (2, 3)
+        assert isinstance(result, FunctionCall)
 
 
 # ======================================================================
@@ -185,11 +178,13 @@ class TestReshape:
 # ======================================================================
 class TestConcat:
     def test_concat(self):
+        import jno.numpy as pnp
+
         a = make_var("x")
         b = make_var("y")
-        result = Concat([a, b])
-        assert isinstance(result, Concat)
-        assert len(result.items) == 2
+        result = pnp.concat([a, b])
+        assert isinstance(result, FunctionCall)
+        assert len(result.args) == 2
 
 
 # ======================================================================

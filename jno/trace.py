@@ -15,11 +15,7 @@ from pathlib import Path
 import json
 
 __all__ = [
-    "NewAxis",
     "Placeholder",
-    "Reshape",
-    "Slice",
-    "Concat",
     "FunctionCall",
     "Literal",
     "ConstantNamespace",
@@ -51,11 +47,6 @@ def _next_op_id() -> int:
     global _operation_counter
     _operation_counter += 1
     return _operation_counter
-
-
-class NewAxis:
-    def __repr__(self):
-        return "None"
 
 
 class Placeholder:
@@ -145,10 +136,8 @@ class Placeholder:
     def __getitem__(self, key):
         if not isinstance(key, tuple):
             key = (key,)
-
-        normalized = tuple(NewAxis() if k is None else k for k in key)
-
-        return Slice(self, normalized)
+        concrete_key = tuple(None if k is None else k for k in key)
+        return FunctionCall(lambda x, k=concrete_key: x[k], [self], name="getitem")
 
     def __call__(self, *args):
         """Call this expression with different variables (auto-wraps in operation)."""
@@ -178,18 +167,10 @@ class Placeholder:
         return FunctionCall(lambda b: other @ b, [self])
 
     def reshape(self, *shape):
-        """Reshape this placeholder to a new shape.
-
-        Args:
-            *shape: New shape as separate arguments or a single tuple
-
-        Returns:
-            Reshape node representing the reshaped tensor
-        """
-        # Handle both reshape(2, 3) and reshape((2, 3)) syntax
+        """Reshape this placeholder to a new shape."""
         if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
             shape = tuple(shape[0])
-        return Reshape(self, shape)
+        return FunctionCall(lambda x, s=shape: x.reshape(s), [self], name="reshape")
 
     @property
     def shape(self):
@@ -229,40 +210,6 @@ class Placeholder:
     @property
     def T(self):
         return FunctionCall(lambda x: x.T, [self], "transpose", True)
-
-
-class Reshape(Placeholder):
-    """Reshape a traced tensor to a new shape."""
-
-    def __init__(self, target: Placeholder, shape: tuple):
-        self.target = target
-        self.target_shape = shape
-        self.tag = target.tag if hasattr(target, "tag") else None
-
-    def __repr__(self):
-        return f"{self.target}.reshape({self.target_shape})"
-
-
-class Slice(Placeholder):
-    def __init__(self, target: Placeholder, key):
-        self.target = target
-        self.key = key
-        self.tag = target.tag if hasattr(target, "tag") else None
-
-    def __repr__(self):
-        return f"{self.target}[{', '.join(map(str, self.key))}]"
-
-
-class Concat(Placeholder):
-    """Concatenate multiple traced tensors along a given axis."""
-
-    def __init__(self, items: List, axis: int = -1):
-        self.items = items
-        self.axis = axis
-
-    def __repr__(self):
-        items_str = ", ".join(str(i) for i in self.items)
-        return f"Concat([{items_str}])"
 
 
 class FunctionCall(Placeholder):
@@ -365,7 +312,10 @@ class ConstantNamespace:
             # Check if it contains dicts (don't convert to array)
             if any(isinstance(item, dict) for item in value):
                 # Convert each dict to ConstantNamespace, keep others as-is
-                return [(ConstantNamespace(f"{key}[{i}]", item, _parent_tag=parent_tag) if isinstance(item, dict) else ConstantNamespace._convert_value(item, f"{key}[{i}]", parent_tag)) for i, item in enumerate(value)]
+                return [
+                    (ConstantNamespace(f"{key}[{i}]", item, _parent_tag=parent_tag) if isinstance(item, dict) else ConstantNamespace._convert_value(item, f"{key}[{i}]", parent_tag))
+                    for i, item in enumerate(value)
+                ]
             # Check if it's numeric (could be nested arrays)
             if ConstantNamespace._is_numeric_sequence(value):
                 return jnp.asarray(value)
@@ -1061,9 +1011,6 @@ class OperationDef(Placeholder):
             elif isinstance(node, BinaryOp):
                 visit(node.left)
                 visit(node.right)
-            elif isinstance(node, Concat):
-                for item in node.items:
-                    visit(item)
             elif isinstance(node, FunctionCall):
                 for arg in node.args:
                     if isinstance(arg, Placeholder):
@@ -1071,8 +1018,6 @@ class OperationDef(Placeholder):
             elif isinstance(node, OperationCall):
                 for arg in node.args:
                     visit(arg)
-            elif isinstance(node, Slice):
-                visit(node.target)
 
         visit(expr)
         return vars_found
@@ -1087,14 +1032,10 @@ class OperationDef(Placeholder):
                 return True  # ModelCall contains a trainable Model
             elif isinstance(node, BinaryOp):
                 return visit(node.left) or visit(node.right)
-            elif isinstance(node, Concat):
-                return any(visit(item) for item in node.items)
             elif isinstance(node, FunctionCall):
                 return any(visit(arg) for arg in node.args if isinstance(arg, Placeholder))
             elif isinstance(node, OperationCall):
                 return node.operation.has_trainable
-            elif isinstance(node, Slice):
-                return visit(node.target)
             return False
 
         return visit(expr)
@@ -1243,14 +1184,8 @@ def cse(expr: Placeholder) -> Placeholder:
         if isinstance(node, Hessian):
             var_ids = tuple(id(v) for v in node.variables)
             return ("Hess", id(node.target), var_ids, node.trace, node.scheme)
-        if isinstance(node, Concat):
-            return ("Cat", node.axis, tuple(id(i) for i in node.items))
         if isinstance(node, Tracker):
             return ("Track", id(node.expr), node.interval)
-        if isinstance(node, Slice):
-            return ("Slice", id(node.target), repr(node.key))
-        if isinstance(node, Reshape):
-            return ("Reshape", id(node.target), node.target_shape)
         # Fallback — use object identity (no dedup possible)
         return ("?", id(node))
 
@@ -1299,22 +1234,10 @@ def cse(expr: Placeholder) -> Placeholder:
             new_target = _visit(node.target)
             if new_target is not node.target:
                 node = Hessian(new_target, node.variables, node.scheme, node.trace)
-        elif isinstance(node, Concat):
-            new_items = [_visit(i) for i in node.items]
-            if any(n is not o for n, o in zip(new_items, node.items)):
-                node = Concat(new_items, node.axis)
         elif isinstance(node, Tracker):
             new_expr = _visit(node.expr)
             if new_expr is not node.expr:
                 node = Tracker(new_expr, node.interval)
-        elif isinstance(node, Slice):
-            new_target = _visit(node.target)
-            if new_target is not node.target:
-                node = Slice(new_target, node.key)
-        elif isinstance(node, Reshape):
-            new_target = _visit(node.target)
-            if new_target is not node.target:
-                node = Reshape(new_target, node.target_shape)
 
         # ── dedup: if we've seen an identical node, return the earlier one ──
         k = _key(node)
@@ -1360,9 +1283,6 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
         elif isinstance(node, BinaryOp):
             visit(node.left)
             visit(node.right)
-        elif isinstance(node, Concat):
-            for item in node.items:
-                visit(item)
         elif isinstance(node, FunctionCall):
             for arg in node.args:
                 if isinstance(arg, Placeholder):
@@ -1373,8 +1293,6 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
                 visit(v)
         elif isinstance(node, Tracker):
             visit(node.expr)
-        elif isinstance(node, Slice):
-            visit(node.target)
 
     visit(expr)
     return ops
@@ -1392,9 +1310,6 @@ def collect_tags(expr: Placeholder) -> set:
         elif isinstance(node, BinaryOp):
             visit(node.left)
             visit(node.right)
-        elif isinstance(node, Concat):
-            for item in node.items:
-                visit(item)
         elif isinstance(node, FunctionCall):
             for arg in node.args:
                 if isinstance(arg, Placeholder):
@@ -1420,8 +1335,6 @@ def collect_tags(expr: Placeholder) -> set:
                 visit(v)
         elif isinstance(node, Tracker):
             visit(node.expr)
-        elif isinstance(node, Slice):
-            visit(node.target)
 
     visit(expr)
     return tags
@@ -1497,10 +1410,6 @@ def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
                     _visit(arg, depth + 1)
                 else:
                     lines.append(f"{p}  {arg}")
-        elif isinstance(node, Concat):
-            lines.append(f"{p}Concat(axis={node.axis})")
-            for item in node.items:
-                _visit(item, depth + 1)
         elif isinstance(node, ModelCall):
             lines.append(f"{p}ModelCall({_node_label(node.model)})")
             for arg in node.args:
@@ -1538,14 +1447,6 @@ def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
         elif isinstance(node, Tracker):
             lines.append(f"{p}Tracker(interval={node.interval})")
             _visit(node.expr, depth + 1)
-        elif isinstance(node, Slice):
-            lines.append(f"{p}Slice({node.key})")
-            _visit(node.target, depth + 1)
-        elif isinstance(node, Reshape):
-            lines.append(f"{p}Reshape({node.target_shape})")
-            _visit(node.target, depth + 1)
-        elif isinstance(node, NewAxis):
-            lines.append(f"{p}NewAxis")
         elif isinstance(node, ConstantNamespace):
             lines.append(f"{p}ConstantNamespace({node._full_tag})")
         elif isinstance(node, Placeholder):

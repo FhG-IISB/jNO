@@ -38,15 +38,6 @@ class TestTrigWrappers:
         result = np.tan(x)
         assert isinstance(result, FunctionCall)
 
-    def test_sin_array(self):
-        """When given a plain array, should return actual JAX result."""
-        result = np.sin(jnp.array(0.0))
-        assert float(result) == pytest.approx(0.0, abs=1e-7)
-
-    def test_cos_array(self):
-        result = np.cos(jnp.array(0.0))
-        assert float(result) == pytest.approx(1.0, abs=1e-7)
-
 
 class TestExpLogWrappers:
     def test_exp_placeholder(self):
@@ -60,14 +51,6 @@ class TestExpLogWrappers:
     def test_sqrt_placeholder(self):
         x = make_var("x")
         assert isinstance(np.sqrt(x), FunctionCall)
-
-    def test_exp_array(self):
-        result = np.exp(jnp.array(0.0))
-        assert float(result) == pytest.approx(1.0, abs=1e-7)
-
-    def test_log_array(self):
-        result = np.log(jnp.array(1.0))
-        assert float(result) == pytest.approx(0.0, abs=1e-7)
 
 
 class TestActivationWrappers:
@@ -86,14 +69,6 @@ class TestReductionWrappers:
         x = make_var("x")
         result = np.mean(x)
         assert isinstance(result, FunctionCall)
-
-    def test_sum_array(self):
-        result = np.sum(jnp.array([1.0, 2.0, 3.0]))
-        assert float(result) == pytest.approx(6.0)
-
-    def test_mean_array(self):
-        result = np.mean(jnp.array([2.0, 4.0]))
-        assert float(result) == pytest.approx(3.0)
 
 
 class TestArrayManipulation:
