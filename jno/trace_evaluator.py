@@ -19,10 +19,10 @@ from .trace import (
     Variable,
     TensorTag,
     BinaryOp,
-    FlaxModule,
+    Model,
     TunableModule,
     TunableModuleCall,
-    FlaxModuleCall,
+    ModelCall,
     OperationDef,
     OperationCall,
     Hessian,
@@ -78,21 +78,13 @@ class DifferentialOperators:
             u_values[l_idx],
         )
         v1, v2, v3 = p1 - p0, p2 - p0, p3 - p0
-        volumes = (
-            jnp.abs(v1[:, 0] * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1]) - v1[:, 1] * (v2[:, 0] * v3[:, 2] - v2[:, 2] * v3[:, 0]) + v1[:, 2] * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0])) / 6.0
-        )
+        volumes = jnp.abs(v1[:, 0] * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1]) - v1[:, 1] * (v2[:, 0] * v3[:, 2] - v2[:, 2] * v3[:, 0]) + v1[:, 2] * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0])) / 6.0
         if dim == 0:
-            grads = ((u1 - u0) * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1]) + (u2 - u0) * (v3[:, 1] * v1[:, 2] - v3[:, 2] * v1[:, 1]) + (u3 - u0) * (v1[:, 1] * v2[:, 2] - v1[:, 2] * v2[:, 1])) / (
-                6 * volumes + 1e-12
-            )
+            grads = ((u1 - u0) * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1]) + (u2 - u0) * (v3[:, 1] * v1[:, 2] - v3[:, 2] * v1[:, 1]) + (u3 - u0) * (v1[:, 1] * v2[:, 2] - v1[:, 2] * v2[:, 1])) / (6 * volumes + 1e-12)
         elif dim == 1:
-            grads = ((u1 - u0) * (v2[:, 2] * v3[:, 0] - v2[:, 0] * v3[:, 2]) + (u2 - u0) * (v3[:, 2] * v1[:, 0] - v3[:, 0] * v1[:, 2]) + (u3 - u0) * (v1[:, 2] * v2[:, 0] - v1[:, 0] * v2[:, 2])) / (
-                6 * volumes + 1e-12
-            )
+            grads = ((u1 - u0) * (v2[:, 2] * v3[:, 0] - v2[:, 0] * v3[:, 2]) + (u2 - u0) * (v3[:, 2] * v1[:, 0] - v3[:, 0] * v1[:, 2]) + (u3 - u0) * (v1[:, 2] * v2[:, 0] - v1[:, 0] * v2[:, 2])) / (6 * volumes + 1e-12)
         else:
-            grads = ((u1 - u0) * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0]) + (u2 - u0) * (v3[:, 0] * v1[:, 1] - v3[:, 1] * v1[:, 0]) + (u3 - u0) * (v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0])) / (
-                6 * volumes + 1e-12
-            )
+            grads = ((u1 - u0) * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0]) + (u2 - u0) * (v3[:, 0] * v1[:, 1] - v3[:, 1] * v1[:, 0]) + (u3 - u0) * (v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0])) / (6 * volumes + 1e-12)
         grads = jnp.where(volumes > 1e-12, grads, 0.0)
         volume_weights = jnp.where(volumes > 1e-12, volumes, 0.0)
         contributions = grads * volume_weights
@@ -394,7 +386,7 @@ class TraceEvaluator:
             BinaryOp(-)                                  → (513, 1)
               Jacobian([Var(t)], fd)                      → (513, 1)
                 BinaryOp(*)                               → (513, 1)
-                  FlaxModuleCall(DeepONet)                 → (513, 1)
+                  ModelCall(DeepONet)                 → (513, 1)
                     Variable(__time__[0:1])                → (1,)
                     Concat(axis=-1)                        → (513, 2)
                       Variable(interior[0:1])              → (513, 1)
@@ -450,7 +442,7 @@ class TraceEvaluator:
         elif isinstance(node, Concat):
             for item in node.items:
                 self._trace_visit(item, ctx, depth + 1, lines, seen)
-        elif isinstance(node, FlaxModuleCall):
+        elif isinstance(node, ModelCall):
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     self._trace_visit(arg, ctx, depth + 1, lines, seen)
@@ -518,7 +510,7 @@ class TraceEvaluator:
                     return str(cs)
             return "??"
 
-        if isinstance(node, FlaxModuleCall):
+        if isinstance(node, ModelCall):
             # Try to get the model output shape by actually running the
             # forward pass.  Model calls are cheap; it is only AD
             # derivatives that are expensive.
@@ -555,7 +547,7 @@ class TraceEvaluator:
         (Slice, "_eval_slice"),
         (BinaryOp, "_eval_binary_op"),
         (OperationCall, "_eval_operation_call"),
-        (FlaxModuleCall, "_eval_flax_module_call"),
+        (ModelCall, "_eval_flax_module_call"),
         (TunableModule, "_eval_tunable_module"),
         (TunableModuleCall, "_eval_tunable_module_call"),
         (Jacobian, "_eval_jacobian"),
@@ -753,7 +745,7 @@ class TraceEvaluator:
         model = self.params.get(flax_mod.layer_id)
 
         if model is None:
-            raise ValueError(f"No model for FlaxModule {flax_mod.layer_id}")
+            raise ValueError(f"No model for Model {flax_mod.layer_id}")
 
         def normalize_arg(val, is_spatial):
             """Minimal normalization: scalars → (1,), 1-D spatial → (N,1).
@@ -800,7 +792,7 @@ class TraceEvaluator:
         tunable = expr.model
         if tunable._current_instance is None:
             raise ValueError("TunableModule has no current instance. " "This should be set by core.solve() before evaluation.")
-        concrete_call = FlaxModuleCall(tunable._current_instance, expr.args)
+        concrete_call = ModelCall(tunable._current_instance, expr.args)
         concrete_call.op_id = expr.op_id
         return self._dispatch(concrete_call, ctx)
 
@@ -1109,20 +1101,20 @@ class TraceEvaluator:
 
     @staticmethod
     def collect_dense_layers(expr: Placeholder) -> List:
-        """Collect all FlaxModule nodes and their call arguments from expression tree.
+        """Collect all Model nodes and their call arguments from expression tree.
 
         Traverses depth-first so that dependencies (modules whose outputs feed
         into other modules) are collected before the modules that consume them.
 
         Returns:
-            List of ``(FlaxModule, call_args | None)`` tuples.
+            List of ``(Model, call_args | None)`` tuples.
             ``call_args`` is ``None`` for standalone parameter modules.
         """
         layers = []
         seen = set()
 
         def visit(node):
-            if isinstance(node, FlaxModule):
+            if isinstance(node, Model):
                 if node.layer_id not in seen:
                     seen.add(node.layer_id)
                     layers.append((node, None))
@@ -1146,7 +1138,7 @@ class TraceEvaluator:
                         seen.add(flax_mod.layer_id)
                         layers.append((flax_mod, node.args))
 
-            elif isinstance(node, FlaxModuleCall):
+            elif isinstance(node, ModelCall):
                 # Visit args first (dependency order)
                 for arg in node.args:
                     if isinstance(arg, Placeholder):
@@ -1187,7 +1179,7 @@ class TraceEvaluator:
         tensor_dims: Dict[str, tuple],
         existing_params: Dict,
     ) -> List[tuple]:
-        """Infer the *normalised* argument shapes for a FlaxModuleCall.
+        """Infer the *normalised* argument shapes for a ModelCall.
 
         Only needed for legacy Flax modules that require dummy inputs
         for ``module.init()``.  Equinox modules are constructed eagerly
@@ -1343,7 +1335,7 @@ class TraceEvaluator:
         The model was already fully constructed at factory time — we just
         return ``layer.module``, optionally loading pretrained weights.
         """
-        if not isinstance(layer, FlaxModule):
+        if not isinstance(layer, Model):
             raise ValueError(f"Unknown layer type: {type(layer)}")
 
         module = layer.module
@@ -1824,11 +1816,11 @@ class TraceEvaluator:
             return uid, f"FunctionCall({name})"
         if isinstance(node, Concat):
             return uid, f"Concat(axis={node.axis})"
-        if isinstance(node, FlaxModuleCall):
+        if isinstance(node, ModelCall):
             mod = node.model
             mod_name = type(mod.module).__name__ if hasattr(mod, "module") else str(mod)
             lid = getattr(mod, "layer_id", "?")
-            return uid, f"FlaxModuleCall({mod_name}, layer={lid})"
+            return uid, f"ModelCall({mod_name}, layer={lid})"
         if isinstance(node, TunableModuleCall):
             return uid, f"TunableModuleCall(id={node.model.layer_id})"
         if isinstance(node, OperationDef):

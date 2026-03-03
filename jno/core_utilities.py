@@ -10,7 +10,7 @@ from .trace import (
     Placeholder,
     Variable,
     TensorTag,
-    FlaxModule,
+    Model,
     TunableModule,
     TunableModuleCall,
     OperationDef,

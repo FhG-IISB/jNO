@@ -12,10 +12,10 @@ from .trace import (
     Variable,
     TensorTag,
     BinaryOp,
-    FlaxModule,
+    Model,
     TunableModule,
     TunableModuleCall,
-    FlaxModuleCall,
+    ModelCall,
     OperationDef,
     OperationCall,
     Hessian,
@@ -255,14 +255,14 @@ class core(CoreUtilities):
                     all_ops.append(op)
         return all_ops
 
-    def _collect_flax_modules(self) -> Dict[int, FlaxModule]:
-        """Return ``{layer_id: FlaxModule}`` for every model in the problem."""
+    def _collect_flax_modules(self) -> Dict[int, Model]:
+        """Return ``{layer_id: Model}`` for every model in the problem."""
         from .trace_evaluator import TraceEvaluator
 
         result = {}
         for op in self.all_ops:
             for layer, _ in TraceEvaluator.collect_dense_layers(op.expr):
-                if isinstance(layer, FlaxModule) and layer.layer_id not in result:
+                if isinstance(layer, Model) and layer.layer_id not in result:
                     result[layer.layer_id] = layer
         return result
 
@@ -378,8 +378,6 @@ class core(CoreUtilities):
     def make_step_fn(
         self,
         per_model_opts,
-        compiled_constraints_fn,  # <-- renamed from compiled_constraints
-        n_constraints,
         batchsize,
         frozen,
         static,
@@ -590,8 +588,8 @@ class core(CoreUtilities):
             self.log.warning("offload_data requires batchsize < total_samples; " "ignoring offload_data for this run.")
             offload_data = False
 
-        # ── 1. Collect FlaxModule metadata ──
-        flax_mods = self._collect_flax_modules()  # {layer_id: FlaxModule}
+        # ── 1. Collect Model metadata ──
+        flax_mods = self._collect_flax_modules()  # {layer_id: Model}
 
         # Validate: every non-frozen model must have an optimizer
         for lid, fm in flax_mods.items():
@@ -777,8 +775,6 @@ class core(CoreUtilities):
         # ── 7. Build JIT-compiled step function ──
         step_fn = self.make_step_fn(
             per_model_opts=per_model_opts,
-            compiled_constraints_fn=self.compiled_constraints_fn,  # <-- updated
-            n_constraints=self.n_constraints,
             batchsize=effective_batchsize,
             frozen=frozen_arrays,
             static=static,
@@ -939,12 +935,12 @@ class core(CoreUtilities):
 
             self.models = trained_models
 
-            # ── 9b. Sync FlaxModule.module refs with trained weights ──
+            # ── 9b. Sync Model.module refs with trained weights ──
             # The expression tree (self.constraints / self.all_ops) holds
-            # FlaxModule objects whose .module still points to the
+            # Model objects whose .module still points to the
             # *pre-training* arrays.  Buffer donation deletes those
             # arrays, so pickling the expression tree would fail.
-            # Update every FlaxModule to point at the trained model.
+            # Update every Model to point at the trained model.
             for lid, fm in flax_mods.items():
                 fm.module = trained_models[lid]
 

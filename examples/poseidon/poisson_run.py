@@ -4,6 +4,7 @@ import argparse
 import jno.numpy as jnn
 import jax
 from source_generator import SourceTermGeneratorPoisson
+import jax.numpy as jnp
 
 model_choices = [
     "poseidonT",
@@ -62,8 +63,6 @@ def main():
     x, y, t = domain.variable("interior")
     _u = domain.variable("_u")  # (S, 1, 1, 128, 128, 1)
     _f = domain.variable("_f")  # (S, 1, 1, 128, 128, 1)
-    # _u = (_u - jnn.mean(domain.context["_u"])) / jnn.std(domain.context["_u"])
-    # _f = (_f - jnn.mean(domain.context["_f"])) / jnn.std(domain.context["_f"])
     import numpy as np
 
     GENF = SourceTermGeneratorPoisson(max_amplitude=np.max(domain.context["_f"]))
@@ -161,22 +160,18 @@ def main():
 
     # u.dtype(jnp.bfloat16)
 
-    # if DATA_DRIVEN:
-    #    constraints.append(_u - u(*input))
+    if DATA_DRIVEN:
+        constraints.append(_u - u(*input))
+
     if PHYS_INFORM:
-        import jax.numpy as jnp
 
         @jax.jit
         def fd_kernel_poisson(upred, f):
-            h = 6.200012400024799e-05  # (1.0 / 127.0)^2
             p = jnp.pad(upred, ((1, 1), (1, 1)))  # Pad with zeros (Dirichlet BC)
-            laplacian = (p[2:, 1:-1] + p[:-2, 1:-1] + p[1:-1, 2:] + p[1:-1, :-2] - 4 * upred) / h  # 5-point Laplacian stencil
-            return laplacian + f
+            return ((p[2:, 1:-1] + p[:-2, 1:-1] + p[1:-1, 2:] + p[1:-1, :-2] - 4 * upred) / 6.200012400024799e-05) + f  # 5-point Laplacian stencil
 
         gen_f = jnn.function(GENF.generate_random, [])
-        # constraints.append(jnn.function(fd_kernel_poisson, [u(_f[0, :, :, 0]), _f[0, :, :, 0]]))
         constraints.append(jnn.function(fd_kernel_poisson, [u(gen_f), gen_f]))
-        # constraints.append(jnn.laplacian(u(*input), [x, y], scheme="finite_difference") + _f)
 
     crux = jno.core([con.mse for con in constraints], domain, 42, (len(jax.devices()), 1))
     crux.print_shapes()

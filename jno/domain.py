@@ -1368,9 +1368,7 @@ class MeshUtils:
                     # Adjacent boundary points are always visible (they share an edge)
                     is_adjacent_point = (j == (i + 1) % n_bnd) | (j == (i - 1 + n_bnd) % n_bnd)
 
-                    visible_ij = jax.lax.cond(
-                        is_same, lambda: False, lambda: jax.lax.cond(is_adjacent_point, lambda: True, lambda: seg_visible(i, j))
-                    )  # Diagonal is always 0 (can't see itself)  # Adjacent boundary points are always visible
+                    visible_ij = jax.lax.cond(is_same, lambda: False, lambda: jax.lax.cond(is_adjacent_point, lambda: True, lambda: seg_visible(i, j)))  # Diagonal is always 0 (can't see itself)  # Adjacent boundary points are always visible
                     row = row.at[j].set(visible_ij)
                     return row
 
@@ -1566,7 +1564,7 @@ class MeshUtils:
         return F
 
     @staticmethod
-    # @jax.jit
+    @jax.jit
     def get_view_factor_2d(P, VM, Nrm, ds):
 
         n_pts = P.shape[0]
@@ -1903,8 +1901,6 @@ class domain(MeshUtils, Geometries):
 
     def _extract_points_from_mesh(self, mesh):
         """Extract points and normals from mesh and organize by tag."""
-        # 1. Pre-compute global normals for the entire mesh boundary
-        # This returns an array of shape (N_total_points, 3)
         index_to_normal_pos = {}
         points = mesh.points[:, : self.dimension]
         self.points = points
@@ -1925,9 +1921,18 @@ class domain(MeshUtils, Geometries):
 
         if hasattr(mesh, "cell_sets") and mesh.cell_sets:
             # Compute cumulative offsets: cell_sets may use global cell indices
-            block_offsets = [0]
-            for cell_block in mesh.cells:
-                block_offsets.append(block_offsets[-1] + len(cell_block.data))
+            block_offsets = {}
+            cumulative = 0
+            for b_idx, cell_block in enumerate(mesh.cells):
+                block_offsets[(b_idx, cell_block.type)] = cumulative
+                cumulative += len(cell_block.data)
+
+            # Also build a per-type offset map for easier lookup
+            type_to_blocks = {}
+            for b_idx, cell_block in enumerate(mesh.cells):
+                if cell_block.type not in type_to_blocks:
+                    type_to_blocks[cell_block.type] = []
+                type_to_blocks[cell_block.type].append((b_idx, cell_block))
 
             for name, cell_data in mesh.cell_sets.items():
                 if name.startswith("gmsh:"):
@@ -1936,17 +1941,30 @@ class domain(MeshUtils, Geometries):
                 self.avaiable_mesh_tags.append(name)
 
                 tag_points = set()
-                tag_edges = []  # store line cell connectivity for this tag
-                tag_tris = []  # store triangle cells for this tag
+                tag_edges = []
+                tag_tris = []
 
                 if isinstance(cell_data, dict):
                     for cell_type, indices in cell_data.items():
-                        if len(indices) > 0:
+                        if len(indices) == 0:
+                            continue
+
+                        # Handle vertex (point) cells specially
+                        if cell_type == "vertex":
+                            for b_idx, cell_block in enumerate(mesh.cells):
+                                if cell_block.type == "vertex":
+                                    for idx in indices:
+                                        local_idx = int(idx) - block_offsets.get((b_idx, "vertex"), 0)
+                                        if 0 <= local_idx < len(cell_block.data):
+                                            # vertex data contains the point index
+                                            point_idx = int(cell_block.data[local_idx].flatten()[0])
+                                            tag_points.add(point_idx)
+                        else:
                             for b_idx, cell_block in enumerate(mesh.cells):
                                 if cell_block.type == cell_type:
-                                    offset = block_offsets[b_idx]
+                                    offset = block_offsets.get((b_idx, cell_type), 0)
                                     for idx in indices:
-                                        local_idx = idx - offset
+                                        local_idx = int(idx) - offset
                                         if 0 <= local_idx < len(cell_block.data):
                                             cell = cell_block.data[local_idx]
                                             tag_points.update(cell.flatten())
@@ -1955,43 +1973,46 @@ class domain(MeshUtils, Geometries):
                                             elif cell_block.type == "triangle":
                                                 tag_tris.append(tuple(cell))
                 else:
+                    # Handle list-style cell_data
                     for block_idx, indices in enumerate(cell_data):
-                        if indices is None:
+                        if indices is None or len(indices) == 0:
                             continue
-                        if block_idx < len(mesh.cells) and len(indices) > 0:
+                        if block_idx < len(mesh.cells):
                             cell_block = mesh.cells[block_idx]
-                            offset = block_offsets[block_idx]
-                            for idx in indices:
-                                local_idx = idx - offset
-                                if 0 <= local_idx < len(cell_block.data):
-                                    cell = cell_block.data[local_idx]
-                                    tag_points.update(cell.flatten())
-                                    if cell_block.type == "line":
-                                        tag_edges.append(tuple(cell))
-                                    elif cell_block.type == "triangle":
-                                        tag_tris.append(tuple(cell))
+
+                            if cell_block.type == "vertex":
+                                for idx in indices:
+                                    if 0 <= idx < len(cell_block.data):
+                                        point_idx = int(cell_block.data[idx].flatten()[0])
+                                        tag_points.add(point_idx)
+                            else:
+                                for idx in indices:
+                                    if 0 <= idx < len(cell_block.data):
+                                        cell = cell_block.data[idx]
+                                        tag_points.update(cell.flatten())
+                                        if cell_block.type == "line":
+                                            tag_edges.append(tuple(cell))
+                                        elif cell_block.type == "triangle":
+                                            tag_tris.append(tuple(cell))
 
                 if tag_tris:
                     self._tag_triangles[name] = np.array(tag_tris, dtype=int)
 
                 if tag_points:
-                    # If we have line edges, chain them into a proper loop ordering
                     if tag_edges:
                         self._boundary_loop_tags.add(name)
                         indices_list = self._chain_edges_to_loop(tag_edges)
                     else:
                         indices_list = np.array(sorted(tag_points), dtype=int)
 
-                    # Store points (in loop order if available)
+                    # self.log.info(f"{name} - indices: {indices_list} - points: {points[indices_list].shape}")
+
                     self._mesh_pool[name] = points[indices_list]
 
-                    # Map indices_list to positions in boundary_normals
-                    # Skip any indices that don't have normals computed
                     normal_positions = np.array([index_to_normal_pos[i] for i in indices_list if i in index_to_normal_pos])
                     if len(normal_positions) > 0:
                         self.normals_by_tag[name] = boundary_normals[normal_positions]
                     else:
-                        # For internal boundaries (not on the mesh boundary), compute normals directly
                         tag_pt_coords = points[indices_list, : self.dimension]
                         if len(tag_pt_coords) > 1:
                             tag_normals, _ = self._compute_normals_pca(points, indices_list, self.dimension, k=min(8, len(indices_list)), mesh=mesh)
@@ -2435,11 +2456,7 @@ class domain(MeshUtils, Geometries):
                 for loop_indices in loops:
                     opaque_loop_pts.append(pts[loop_indices])
             else:
-                self.log.warning(
-                    f"Opaque tag '{otag}' has no line or triangle cells. "
-                    f"Available boundary loops: {sorted(self._boundary_loop_tags)}, "
-                    f"volume tags: {sorted(self._tag_triangles.keys())}. Skipping."
-                )
+                self.log.warning(f"Opaque tag '{otag}' has no line or triangle cells. " f"Available boundary loops: {sorted(self._boundary_loop_tags)}, " f"volume tags: {sorted(self._tag_triangles.keys())}. Skipping.")
                 continue
 
         # Append opaque points and their closed-loop edges.
@@ -2812,8 +2829,6 @@ class domain(MeshUtils, Geometries):
             return self.context[tag], idx, tag
         else:
             return self.context[tag], None, tag
-
-    # Utilities
 
     def plot(self, save_path: str = "./runs/domain.png", figsize: Tuple[int, int] = (10, 8), show_normals: bool = True, arrow_scale: float = 0.05):
         """Plot the sampled points and normals.

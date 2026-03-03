@@ -912,6 +912,7 @@ class DeepONet(eqx.Module):
         Returns:
             Output values at query points.
         """
+
         if key is not None:
             k1, k2 = jax.random.split(key)
         else:

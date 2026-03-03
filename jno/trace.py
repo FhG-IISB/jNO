@@ -28,10 +28,10 @@ __all__ = [
     "TensorTag",
     "BinaryOp",
     "Tracker",
-    "FlaxModule",
+    "Model",
     "TunableModule",
     "TunableModuleCall",
-    "FlaxModuleCall",
+    "ModelCall",
     "OperationDef",
     "OperationCall",
     "Hessian",
@@ -365,10 +365,7 @@ class ConstantNamespace:
             # Check if it contains dicts (don't convert to array)
             if any(isinstance(item, dict) for item in value):
                 # Convert each dict to ConstantNamespace, keep others as-is
-                return [
-                    (ConstantNamespace(f"{key}[{i}]", item, _parent_tag=parent_tag) if isinstance(item, dict) else ConstantNamespace._convert_value(item, f"{key}[{i}]", parent_tag))
-                    for i, item in enumerate(value)
-                ]
+                return [(ConstantNamespace(f"{key}[{i}]", item, _parent_tag=parent_tag) if isinstance(item, dict) else ConstantNamespace._convert_value(item, f"{key}[{i}]", parent_tag)) for i, item in enumerate(value)]
             # Check if it's numeric (could be nested arrays)
             if ConstantNamespace._is_numeric_sequence(value):
                 return jnp.asarray(value)
@@ -696,7 +693,7 @@ class Tracker(Placeholder):
         return f"Tracker({self.expr!r}, interval={self.interval})"
 
 
-class FlaxModule(Placeholder):
+class Model(Placeholder):
     """Wrapper for user-defined Equinox models.
 
     Allows using any Equinox module within the PINO tracing system.
@@ -715,7 +712,7 @@ class FlaxModule(Placeholder):
     """
 
     def __init__(self, module, name: str = "", weight_path: str = None):
-        """Create a FlaxModule wrapper.
+        """Create a Model wrapper.
 
         Args:
             module: An Equinox module instance (already constructed), or a
@@ -739,11 +736,11 @@ class FlaxModule(Placeholder):
     # ── public API ───────────────────────────────────────────
 
     def __call__(self, *args):
-        """Call this module with variables - creates a FlaxModuleCall."""
-        return FlaxModuleCall(self, list(args))
+        """Call this module with variables - creates a ModelCall."""
+        return ModelCall(self, list(args))
 
     def __repr__(self):
-        return f"FlaxModule({type(self.module).__name__})"
+        return f"Model({type(self.module).__name__})"
 
     def dont_show(self):
         """If called will NOT display the network architecture."""
@@ -818,6 +815,17 @@ class FlaxModule(Placeholder):
         Args:
             weight_path: Path to the pretrained weights file.
         """
+
+        # if isinstance(weight_path, dict):
+
+        # make a temporary file here to saev the params
+
+        # elif # weight path ends in pkl
+
+        # type(weight_path.models[1])
+        # <class 'jno.architectures.common.FlaxModelWrapper'>
+        # -> crux.models[1].params
+
         self.weight_path = weight_path
         return self
 
@@ -905,20 +913,80 @@ class FlaxModule(Placeholder):
         return self
 
 
+class ModelCall(Placeholder):
+    """Represents a call to a Model with specific arguments.
+
+    This is created when you call a Model directly with variables:
+        uv_net = pnp.nn.wrap(MLP())
+        result = uv_net(x, y)  # Creates ModelCall
+
+    All training-configuration methods (``freeze``, ``lora``, ``optimizer``,
+    ``dtype``, ``initialize``, ``tune``) are proxied to the underlying
+    :class:`Model` so you can chain them after the call::
+
+        u = nn.mlp(2, 64, 1)(x, y).freeze()
+    """
+
+    def __init__(self, model: Model, args: list):
+        self.model = model
+        self.args = args
+        self.op_id = _next_op_id()
+
+    def __repr__(self):
+        args_str = ", ".join(str(a) for a in self.args)
+        return f"{self.model}({args_str})"
+
+    # ── proxied helpers (delegate to Model) ─────────────
+
+    def dont_show(self):
+        """If called will NOT display the network architecture."""
+        self.model.show = False
+        return self
+
+    def freeze(self):
+        self.model.freeze()
+        return self
+
+    def unfreeze(self):
+        self.model.unfreeze()
+        return self
+
+    def lora(self, rank: int = 4, alpha: float = 1.0):
+        self.model.lora(rank, alpha)
+        return self
+
+    def optimizer(self, opt_fn, *, lr=None):
+        self.model.optimizer(opt_fn, lr=lr)
+        return self
+
+    def initialize(self, weight_path: str):
+        self.model.initialize(weight_path)
+        return self
+
+    def dtype(self, dtype):
+        self.model.dtype(dtype)
+        return self
+
+    def tune(self, **kwargs):
+        """Proxy for :meth:`Model.tune`."""
+        self.model.tune(**kwargs)
+        return self
+
+
 class TunableModule(Placeholder):
     """
     Wraps a Flax module CLASS + ArchSpace.
-    Behaves like FlaxModule but with lazy instantiation.
+    Behaves like Model but with lazy instantiation.
     """
 
     def __init__(self, module_cls: Type, space: "ArchSpace"):
         self.module_cls = module_cls
         self.space = space
         self.layer_id = _next_op_id()
-        self._current_instance: Optional[FlaxModule] = None
+        self._current_instance: Optional[Model] = None
 
     def __call__(self, *args):
-        """Call with variables - creates FlaxModuleCall."""
+        """Call with variables - creates ModelCall."""
         # If we have a current instance (during solve), use it
         if self._current_instance is not None:
             return self._current_instance(*args)
@@ -958,66 +1026,6 @@ class TunableModuleCall(Placeholder):
         return self
 
 
-class FlaxModuleCall(Placeholder):
-    """Represents a call to a FlaxModule with specific arguments.
-
-    This is created when you call a FlaxModule directly with variables:
-        uv_net = pnp.nn.wrap(MLP())
-        result = uv_net(x, y)  # Creates FlaxModuleCall
-
-    All training-configuration methods (``freeze``, ``lora``, ``optimizer``,
-    ``dtype``, ``initialize``, ``tune``) are proxied to the underlying
-    :class:`FlaxModule` so you can chain them after the call::
-
-        u = nn.mlp(2, 64, 1)(x, y).freeze()
-    """
-
-    def __init__(self, model: FlaxModule, args: list):
-        self.model = model
-        self.args = args
-        self.op_id = _next_op_id()
-
-    def __repr__(self):
-        args_str = ", ".join(str(a) for a in self.args)
-        return f"{self.model}({args_str})"
-
-    # ── proxied helpers (delegate to FlaxModule) ─────────────
-
-    def dont_show(self):
-        """If called will NOT display the network architecture."""
-        self.model.show = False
-        return self
-
-    def freeze(self):
-        self.model.freeze()
-        return self
-
-    def unfreeze(self):
-        self.model.unfreeze()
-        return self
-
-    def lora(self, rank: int = 4, alpha: float = 1.0):
-        self.model.lora(rank, alpha)
-        return self
-
-    def optimizer(self, opt_fn, *, lr=None):
-        self.model.optimizer(opt_fn, lr=lr)
-        return self
-
-    def initialize(self, weight_path: str):
-        self.model.initialize(weight_path)
-        return self
-
-    def dtype(self, dtype):
-        self.model.dtype(dtype)
-        return self
-
-    def tune(self, **kwargs):
-        """Proxy for :meth:`FlaxModule.tune`."""
-        self.model.tune(**kwargs)
-        return self
-
-
 class OperationDef(Placeholder):
     """An operation definition - traces a computation graph.
 
@@ -1046,7 +1054,7 @@ class OperationDef(Placeholder):
                 if id(node) not in seen_ids:
                     seen_ids.add(id(node))
                     vars_found.append(node)
-            elif isinstance(node, FlaxModuleCall):
+            elif isinstance(node, ModelCall):
                 for arg in node.args:
                     if isinstance(arg, Placeholder):
                         visit(arg)
@@ -1070,13 +1078,13 @@ class OperationDef(Placeholder):
         return vars_found
 
     def _has_trainable_layers(self, expr) -> bool:
-        """Check if expression contains FlaxModule nodes."""
+        """Check if expression contains Model nodes."""
 
         def visit(node):
-            if isinstance(node, FlaxModule):
+            if isinstance(node, Model):
                 return True
-            elif isinstance(node, FlaxModuleCall):
-                return True  # FlaxModuleCall contains a trainable FlaxModule
+            elif isinstance(node, ModelCall):
+                return True  # ModelCall contains a trainable Model
             elif isinstance(node, BinaryOp):
                 return visit(node.left) or visit(node.right)
             elif isinstance(node, Concat):
@@ -1200,7 +1208,7 @@ def cse(expr: Placeholder) -> Placeholder:
     * ``BinaryOp`` — same operator + same (already-deduped) children.
     * ``FunctionCall`` — same ``fn`` + same (already-deduped) args.
     * ``Jacobian`` / ``Hessian`` — same target + same variables.
-    * ``FlaxModuleCall`` — same model + same args.
+    * ``ModelCall`` — same model + same args.
 
     Returns:
         A (possibly shared) tree with duplicates collapsed.
@@ -1221,7 +1229,7 @@ def cse(expr: Placeholder) -> Placeholder:
         if isinstance(node, FunctionCall):
             arg_ids = tuple(id(a) for a in node.args)
             return ("Fn", id(node.fn), node._name, arg_ids)
-        if isinstance(node, FlaxModuleCall):
+        if isinstance(node, ModelCall):
             arg_ids = tuple(id(a) for a in node.args)
             return ("Call", node.model.layer_id, arg_ids)
         if isinstance(node, OperationCall):
@@ -1262,10 +1270,10 @@ def cse(expr: Placeholder) -> Placeholder:
             new_args = [_visit(a) if isinstance(a, Placeholder) else a for a in node.args]
             if any(n is not o for n, o in zip(new_args, node.args)):
                 node = FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
-        elif isinstance(node, FlaxModuleCall):
+        elif isinstance(node, ModelCall):
             new_args = [_visit(a) if isinstance(a, Placeholder) else a for a in node.args]
             if any(n is not o for n, o in zip(new_args, node.args)):
-                new_node = FlaxModuleCall(node.model, new_args)
+                new_node = ModelCall(node.model, new_args)
                 new_node.op_id = node.op_id
                 node = new_node
         elif isinstance(node, OperationDef):
@@ -1341,7 +1349,7 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
             visit(node.operation.expr)
             for arg in node.args:
                 visit(arg)
-        elif isinstance(node, FlaxModuleCall):
+        elif isinstance(node, ModelCall):
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     visit(arg)
@@ -1398,7 +1406,7 @@ def collect_tags(expr: Placeholder) -> set:
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     visit(arg)
-        elif isinstance(node, FlaxModuleCall):
+        elif isinstance(node, ModelCall):
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     visit(arg)
@@ -1463,8 +1471,8 @@ def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
             return f"Constant({node.tag}.{node.key}={val})"
         if isinstance(node, Literal):
             return f"Literal({node.value})"
-        if isinstance(node, FlaxModule):
-            return f"FlaxModule(id={node.layer_id}, {type(node.module).__name__})"
+        if isinstance(node, Model):
+            return f"Model(id={node.layer_id}, {type(node.module).__name__})"
         if isinstance(node, (int, float)):
             return str(node)
         return type(node).__name__
@@ -1493,8 +1501,8 @@ def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
             lines.append(f"{p}Concat(axis={node.axis})")
             for item in node.items:
                 _visit(item, depth + 1)
-        elif isinstance(node, FlaxModuleCall):
-            lines.append(f"{p}FlaxModuleCall({_node_label(node.model)})")
+        elif isinstance(node, ModelCall):
+            lines.append(f"{p}ModelCall({_node_label(node.model)})")
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     _visit(arg, depth + 1)

@@ -3,7 +3,7 @@
 from .core import core
 from .domain import domain
 from .resampling import sampler
-from .trace import Variable, Placeholder, OperationDef, OperationCall, FlaxModule, Hessian, Jacobian
+from .trace import Variable, Placeholder, OperationDef, OperationCall, Model, Hessian, Jacobian
 from .utils.adaptive import LearningRateSchedule, WeightSchedule
 from .utils import callbacks, Logger, init_default_logger as logger, IREEModel as iree
 from .trace_evaluator import TraceEvaluator
@@ -26,7 +26,7 @@ __all__ = [
     "core",
     "sampler",
     "domain",
-    "FlaxModule",
+    "Model",
     "Variable",
     "Placeholder",
     "OperationDef",
