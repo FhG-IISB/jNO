@@ -3,7 +3,7 @@ name = "jNO"
 version = "0.2.0"
 description = "Jax Neural Operators"
 readme = "README.md"
-requires-python = ">=3.11, <3.14"
+requires-python = ">=3.10, <3.14"
 authors = [{ name = "Leon Armbruster", email = "leonarmbruster@iisb.fraunhofer.de" }]
 
 dependencies = [
