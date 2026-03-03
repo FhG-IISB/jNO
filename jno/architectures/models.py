@@ -86,17 +86,6 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 from typing import Callable, Optional, Tuple, Sequence, Literal, List, Union, Any
-from jax_poseidon import ScOT, ScOTConfig
-from jax_walrus import IsotropicModel as WalrusModel
-from jax_morph import ViT3DRegression as MorphModel
-from jax_mpp import AViT as MPPModel, AVIT_CONFIGS
-from jax_pdeformer2 import (
-    create_pdeformer_from_config,
-    PDEFORMER_SMALL_CONFIG,
-    PDEFORMER_BASE_CONFIG,
-    PDEFORMER_FAST_CONFIG,
-)
-from jax_pdeformer2.utils import create_dummy_inputs as _pdeformer2_dummy_inputs
 
 from .mlp import MLP
 from .fno import FNO1D, FNO2D, FNO3D
@@ -2218,6 +2207,8 @@ class nn:
         num_out_channels: int,
     ) -> Model:
         """Internal helper that builds a fresh Poseidon ScOT model."""
+        from jax_poseidon import ScOT, ScOTConfig
+
         config = ScOTConfig(
             name=name,
             image_size=128,
@@ -2406,6 +2397,9 @@ class nn:
             McCabe et al., "Multiple Physics Pretraining for Physical
             Surrogate Models" (2023)
         """
+
+        from jax_walrus import IsotropicModel as WalrusModel
+
         if state_labels is None:
             state_labels = jnp.arange(num_out_channels, dtype=jnp.int32)
         if bcs is None:
@@ -2506,6 +2500,9 @@ class nn:
             dropout: Dropout rate. Default: 0.0.
             emb_dropout: Embedding dropout rate. Default: 0.0.
         """
+
+        from jax_morph import ViT3DRegression as MorphModel
+
         flax_model = MorphModel(
             patch_size=8,
             dim=dim,
@@ -2737,6 +2734,9 @@ class nn:
             num_channels: Number of active state-variable channels.
                 Default: 1 (suitable for Poisson, heat equation, etc.).
         """
+
+        from jax_mpp import AViT as MPPModel, AVIT_CONFIGS
+
         cfg = AVIT_CONFIGS[variant]
         flax_model = MPPModel(**cfg)
 
@@ -2900,6 +2900,14 @@ class nn:
                 (used only in the dummy init when *dag_inputs* is
                 ``None``).
         """
+        from jax_pdeformer2 import (
+            create_pdeformer_from_config,
+            PDEFORMER_SMALL_CONFIG,
+            PDEFORMER_BASE_CONFIG,
+            PDEFORMER_FAST_CONFIG,
+        )
+        from jax_pdeformer2.utils import create_dummy_inputs as _pdeformer2_dummy_inputs
+
         flax_model = create_pdeformer_from_config({"model": config})
 
         # Derive sizes from config

@@ -7,14 +7,9 @@ requires-python = ">=3.11,<=3.12.4"
 authors = [{ name = "Leon Armbruster", email = "leonarmbruster@iisb.fraunhofer.de" }]
 
 dependencies = [
-    "jax>=0.4.38,<=0.8.1",
+    "jax",
     "equinox",
     "optax",
-    "soap_jax @ git+https://github.com/haydn-jones/SOAP_JAX",
-    "jax_morph @git+https://github.com/armbrusl/jax_morph",
-    "jax_mpp @git+https://github.com/armbrusl/jax_mpp",
-    "jaxkan",
-    "numpy",
     "matplotlib",
     "graphviz",
     "pygmsh",
@@ -25,13 +20,19 @@ dependencies = [
 
 [project.optional-dependencies]
 cuda = [
-    "jax[cuda]>=0.4.38,<=0.8.1"
+    "jax[cuda]"
 ]
 dev = ["pytest>=7.0", "black>=22.0", "flake8>=4.0", "mypy>=0.950"]
 iree = [
     "iree-base-compiler",
     "iree-base-runtime"
 ]
+foundation = [
+    "jax_morph @git+https://github.com/armbrusl/jax_morph",
+    "jax_mpp @git+https://github.com/armbrusl/jax_mpp",
+]
+
+
 [tool.setuptools]
 packages = ["jno"]
 
