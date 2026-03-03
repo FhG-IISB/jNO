@@ -9,8 +9,7 @@ from jno.architectures.linear import Linear
 import jax.numpy as jnp
 import nevergrad as ng
 
-dire = "./runs/tuner"
-jno.logger(dire)
+dire = jno.setup(__file__)
 
 domain = jno.domain(constructor=jno.domain.disk(mesh_size=0.05))
 x, y, t = domain.variable("interior")

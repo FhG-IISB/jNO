@@ -12,9 +12,18 @@ from .resampling import sampler
 from .trace import Variable, Placeholder, OperationDef, OperationCall, Model, Hessian, Jacobian
 from .utils.adaptive import LearningRateSchedule, WeightSchedule
 from .utils import callbacks, Logger, init_default_logger as logger, IREEModel as iree
+from .utils.config import (
+    load_config,
+    get_config,
+    get_config_path,
+    get_runs_base_dir,
+    get_rsa_public_key,
+    get_rsa_private_key,
+)
 from .trace_evaluator import TraceEvaluator
 from . import resampling
 from .core_utilities import save, load
+from ._setup import setup
 
 __version__ = "0.1.0"
 
@@ -47,4 +56,10 @@ __all__ = [
     "iree",
     "save",
     "load",
+    "setup",
+    "load_config",
+    "get_config",
+    "get_runs_base_dir",
+    "get_rsa_public_key",
+    "get_rsa_private_key",
 ]

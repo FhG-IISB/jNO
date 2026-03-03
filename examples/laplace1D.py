@@ -7,8 +7,7 @@ from jno import LearningRateSchedule as lrs
 π = jnn.pi
 
 # Logging
-dire = "./runs/laplace1D"
-jno.logger(dire)
+dire = jno.setup(__file__)
 
 # Domain
 domain = jno.domain(constructor=jno.domain.line(mesh_size=0.01))

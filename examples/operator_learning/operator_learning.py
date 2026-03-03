@@ -10,8 +10,7 @@ import numpy as np
 from fem_solution import fem_solver
 
 
-dire = "./runs/operator_learning"
-jno.logger(dire)
+dire = jno.setup(__file__)
 
 π = pnp.pi
 sin = pnp.sin

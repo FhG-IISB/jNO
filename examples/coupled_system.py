@@ -58,7 +58,7 @@ from soap_jax import soap
 sin = jnn.sin
 
 
-dire = "./runs/coupled_system"
+dire = jno.setup(__file__)
 
 
 # Initialize the global logging instance at the top so that all the classes log to this file

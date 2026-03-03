@@ -11,8 +11,7 @@ from jno import LearningRateSchedule as lrs
 sin = jnn.sin
 
 # Logging
-dire = "./runs/inverse_problem"
-jno.logger(dire)
+dire = jno.setup(__file__, name="inverse_problem")
 
 # Domain
 domain = jno.domain(constructor=jno.domain.line(mesh_size=0.01))

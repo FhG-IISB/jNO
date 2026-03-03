@@ -8,9 +8,7 @@ from jno import LearningRateSchedule as lrs
 
 π = jnn.pi
 sin = jnn.sin
-dire = "./runs/heat_equation"
-
-jno.logger(dire)
+dire = jno.setup(__file__)
 
 domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05), time=(0, 1, 10), compute_mesh_connectivity=False)
 x, y, t = domain.variable("interior")
