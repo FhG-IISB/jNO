@@ -29,6 +29,9 @@ iree = [
 foundation = [
     "jax_morph @git+https://github.com/armbrusl/jax_morph",
     "jax_mpp @git+https://github.com/armbrusl/jax_mpp",
+    "jax_walrus @https://github.com/FhG-IISB/jax_walrus.git",
+    "jax_poseidon @https://github.com/FhG-IISB/jax_poseidon.git",
+    "jax_pdeformer2 @https://github.com/FhG-IISB/jax_pdeformer2.git",
 ]
 
 
