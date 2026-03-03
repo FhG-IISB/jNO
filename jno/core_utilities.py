@@ -2,6 +2,7 @@ from typing import List, Callable, Dict, Union
 import jax
 import jax.numpy as jnp
 import numpy as np
+from pylotte.signed_pickle import SignedPickle
 
 from .utils import get_logger
 import time
@@ -24,6 +25,42 @@ from .trace import (
 )
 from .trace_evaluator import TraceEvaluator
 from .domain import domain
+
+
+@staticmethod
+def save(instance, filepath: str, public_key_path: str = None, private_key_path: str = None):
+    """Save an object to a pickle file."""
+
+    if public_key_path is not None and private_key_path is not None:
+
+        signer = SignedPickle(
+            public_key_path=public_key_path,
+            private_key_path=private_key_path,
+            serializer=cloudpickle,
+        )
+        sig_path = f"{filepath.split('.')[:-1]}.sig"
+        signer.dump_and_sign(instance, filepath, f"{filepath.split('.')[:-1]}.sig")
+        instance.log.info(f"Signature saved to: {filepath}")
+    else:
+
+        with open(filepath, "wb") as f:
+            cloudpickle.dump(instance, f)
+
+    instance.log.info(f"Model saved to: {filepath}")
+    return None
+
+
+@staticmethod
+def load(filepath: str, public_key_path: str = None, signature_path: str = None) -> "core":
+    """Load a pickle object."""
+    if public_key_path is not None and signature_path is not None:
+        loader = SignedPickle(public_key_path=public_key_path, serializer=cloudpickle)
+        instance = loader.safe_load(filepath, signature_path)
+    else:
+        with open(filepath, "rb") as f:
+            instance = cloudpickle.load(f)
+
+    return instance
 
 
 class CoreUtilities:

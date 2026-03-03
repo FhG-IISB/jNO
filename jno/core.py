@@ -594,11 +594,7 @@ class core(CoreUtilities):
         # Validate: every non-frozen model must have an optimizer
         for lid, fm in flax_mods.items():
             if not fm._frozen and fm._opt_fn is None:
-                raise ValueError(
-                    f"Model '{fm.name or type(fm.module).__name__}' (layer {lid}) "
-                    f"has no optimizer. Call  model.optimizer(optax.adam, lr=...)  "
-                    f"before solve(), or freeze it with  model.freeze()."
-                )
+                raise ValueError(f"Model '{fm.name or type(fm.module).__name__}' (layer {lid}) " f"has no optimizer. Call  model.optimizer(optax.adam, lr=...)  " f"before solve(), or freeze it with  model.freeze().")
 
         # ── 2. Apply LoRA transforms ──
         models = dict(self.models)
@@ -624,12 +620,7 @@ class core(CoreUtilities):
                 if isinstance(model_after, FlaxLoRAWrapper):
                     # Count LoRA layers from the Flax lora_params dict
                     n_lora_layers = sum(1 for l in jax.tree_util.tree_leaves(model_after.lora_params) if eqx.is_array(l)) // 2  # each layer has lora_a + lora_b
-                    self.log.info(
-                        f"LoRA (Flax) applied to model {lid} (rank={rank}, alpha={alpha}): "
-                        f"{n_lora_layers} kernel layers adapted, "
-                        f"{n_lora_params:,} new LoRA params, "
-                        f"base frozen at {n_params_before:,} params"
-                    )
+                    self.log.info(f"LoRA (Flax) applied to model {lid} (rank={rank}, alpha={alpha}): " f"{n_lora_layers} kernel layers adapted, " f"{n_lora_params:,} new LoRA params, " f"base frozen at {n_params_before:,} params")
                 else:
                     from .architectures.linear import Linear as JNOLinear
 
@@ -1181,17 +1172,3 @@ class core(CoreUtilities):
         # Restore mesh and sharding
         mesh_shape = state.get("_mesh_shape")
         self._setup_parallelism(mesh_shape)
-
-    def save(self, filepath: str):
-        """Save the trained core model to a file."""
-        with open(filepath, "wb") as f:
-            cloudpickle.dump(self, f)
-        self.log.info(f"Model saved to: {filepath}")
-        return None
-
-    @classmethod
-    def load(cls, filepath: str) -> "core":
-        """Load a trained core model from a file."""
-        with open(filepath, "rb") as f:
-            instance = cloudpickle.load(f)
-        return instance

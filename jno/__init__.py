@@ -14,6 +14,7 @@ from .utils.adaptive import LearningRateSchedule, WeightSchedule
 from .utils import callbacks, Logger, init_default_logger as logger, IREEModel as iree
 from .trace_evaluator import TraceEvaluator
 from . import resampling
+from .core_utilities import save, load
 
 __version__ = "0.1.0"
 
@@ -44,4 +45,6 @@ __all__ = [
     "logger",
     "TraceEvaluator",
     "iree",
+    "save",
+    "load",
 ]

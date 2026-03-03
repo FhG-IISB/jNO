@@ -5,6 +5,7 @@ import jax.numpy as jnp
 import jax
 from dataclasses import dataclass
 import meshio
+import cloudpickle
 
 from .trace import Variable, TensorTag
 from .utils.logger import get_logger, Logger
@@ -3118,46 +3119,3 @@ class domain(MeshUtils, Geometries):
         fig.savefig(fan_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         self.log.info(f"Saved visibility fan plot to {fan_path}")
-
-    def save(self, filepath: str):
-        """Save the trained core model to a file.
-
-        Saves all trained parameters, layer info, operations, constraints,
-        domain, and training history in a single file using dill for serialization.
-
-        Args:
-            filepath: Path to save file (e.g., "model.pkl" or "solution.dill")
-
-        Example:
-            sol = pino.solve(...)
-            sol.save("trained_model.pkl")
-        """
-        import cloudpickle
-
-        with open(filepath, "wb") as f:
-            cloudpickle.dump(self, f)
-
-        self.log.info(f"Model saved to: {filepath}")
-
-        return None
-
-    @classmethod
-    def load(cls, filepath: str) -> "domain":
-        """Load a trained core model from a file.
-
-        Restores all trained parameters, operations, domain, and history.
-
-        Args:
-            filepath: Path to saved model file
-
-        Returns:
-            domain instance with trained parameters
-
-        Example:
-            sol = domain.load("trained_model.pkl")
-        """
-        import cloudpickle
-
-        with open(filepath, "rb") as f:
-            domain = cloudpickle.load(f)
-        return domain

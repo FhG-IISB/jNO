@@ -3,7 +3,8 @@ import jno
 import jno.numpy as jnn
 import optax
 from jno import LearningRateSchedule as lrs
-from soap_jax import soap
+
+# from soap_jax import soap
 
 π = jnn.pi
 sin = jnn.sin
@@ -36,8 +37,8 @@ crux = jno.core([pde.mse, ini.mse], domain)
 crux.solve(100).plot(f"{dire}/training_history_v1.png")
 u_net.optimizer(optax.lbfgs(1))
 crux.solve(100).plot(f"{dire}/training_history_v2.png")
-u_net.optimizer(soap(1), lr=lrs.cosine(100, 1e-3, 1e-5))
-crux.solve(100).plot(f"{dire}/training_history_v3.png")
+# u_net.optimizer(soap(1), lr=lrs.cosine(100, 1e-3, 1e-5))
+# crux.solve(100).plot(f"{dire}/training_history_v3.png")
 u_net.optimizer(optax.adamw(1))
 crux.solve(100).plot(f"{dire}/training_history_v4.png")
-crux.save(f"{dire}/crux.pkl")
+jno.save(crux, f"{dire}/crux.pkl")
