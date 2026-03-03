@@ -1,6 +1,8 @@
 # jNO
 JAX-native building blocks for training neural operators.
 
+> **Warning:** This is a research-level repository. It may contain bugs and is subject to continuous change without notice.
+
 ## [Install](https://docs.astral.sh/uv/getting-started/installation/)
 `uv` installs and manages environments in your user directory, so you can typically run everything locally **without sudo**.
 Local execution policies can be overwritten in windows as follows

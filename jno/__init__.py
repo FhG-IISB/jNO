@@ -1,4 +1,10 @@
-"""PINO - Physics-Informed Neural Operators."""
+"""
+jNO: Physics-Informed Neural Operators.
+
+.. warning::
+    This is a research-level repository. It may contain bugs and is subject
+    to continuous change without notice.
+"""
 
 from .core import core
 from .domain import domain
