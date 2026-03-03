@@ -17,3 +17,11 @@ misc/
 runs/
 
 *.**
+!*.md
+!*.toml
+!*.txt
+!*.rst
+!*.cfg
+!*.ini
+!*.yaml
+!*.yml
