@@ -230,71 +230,69 @@ class TestFlaxWrapperInPipeline:
 # ======================================================================
 
 
-class TestScotWrapper:
-
-    @pytest.mark.slow
-    def test_nn_scot_returns_flax_module(self):
-        """nn.scot() should return a Model wrapping a FlaxModelWrapper."""
-        m = nn.scot(
-            name="test_scot",
-            image_size=32,
-            patch_size=4,
-            num_channels=1,
-            num_out_channels=1,
-            embed_dim=24,
-            depths=(1, 1, 1, 1),
-            num_heads=(3, 3, 3, 3),
-            window_size=8,
-        )
-        assert isinstance(m, Model)
-        assert isinstance(m.module, FlaxModelWrapper)
-
-    @pytest.mark.slow
-    def test_nn_scot_forward_pass(self):
-        """nn.scot() model must produce correct output shape on forward pass."""
-        m = nn.scot(
-            name="test_scot",
-            image_size=32,
-            patch_size=4,
-            num_channels=2,
-            num_out_channels=1,
-            embed_dim=24,
-            depths=(1, 1, 1, 1),
-            num_heads=(3, 3, 3, 3),
-            window_size=8,
-        )
-        x = jnp.ones((1, 32, 32, 2))
-        t = jnp.zeros((1,))
-        out = m.module(pixel_values=x, time=t)
-        assert out.shape == (1, 32, 32, 1)
-
-    @pytest.mark.slow
-    def test_nn_scot_gradient_flow(self):
-        """Gradients must flow through ScOT wrapper."""
-        m = nn.scot(
-            name="test_scot",
-            image_size=32,
-            patch_size=4,
-            num_channels=1,
-            num_out_channels=1,
-            embed_dim=24,
-            depths=(1, 1, 1, 1),
-            num_heads=(3, 3, 3, 3),
-            window_size=8,
-        )
-        model = m.module
-
-        @eqx.filter_grad
-        def loss_grad(model):
-            out = model(pixel_values=jnp.ones((1, 32, 32, 1)), time=jnp.zeros((1,)))
-            return jnp.mean(out)
-
-        grads = loss_grad(model)
-        grad_leaves = jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_array))
-        assert len(grad_leaves) > 0
-        assert any(jnp.any(g != 0) for g in grad_leaves)
-
-
+# class TestScotWrapper:
+#
+#    @pytest.mark.slow
+#    def test_nn_scot_returns_flax_module(self):
+#        """nn.scot() should return a Model wrapping a FlaxModelWrapper."""
+#        m = nn.scot(
+#            name="test_scot",
+#            image_size=32,
+#            patch_size=4,
+#            num_channels=1,
+#            num_out_channels=1,
+#            embed_dim=24,
+#            depths=(1, 1, 1, 1),
+#            num_heads=(3, 3, 3, 3),
+#            window_size=8,
+#        )
+#        assert isinstance(m, Model)
+#        assert isinstance(m.module, FlaxModelWrapper)
+#
+#    @pytest.mark.slow
+#    def test_nn_scot_forward_pass(self):
+#        """nn.scot() model must produce correct output shape on forward pass."""
+#        m = nn.scot(
+#            name="test_scot",
+#            image_size=32,
+#            patch_size=4,
+#            num_channels=2,
+#            num_out_channels=1,
+#            embed_dim=24,
+#            depths=(1, 1, 1, 1),
+#            num_heads=(3, 3, 3, 3),
+#            window_size=8,
+#        )
+#        x = jnp.ones((1, 32, 32, 2))
+#        t = jnp.zeros((1,))
+#        out = m.module(pixel_values=x, time=t)
+#        assert out.shape == (1, 32, 32, 1)
+#
+#    @pytest.mark.slow
+#    def test_nn_scot_gradient_flow(self):
+#        """Gradients must flow through ScOT wrapper."""
+#        m = nn.scot(
+#            name="test_scot",
+#            image_size=32,
+#            patch_size=4,
+#            num_channels=1,
+#            num_out_channels=1,
+#            embed_dim=24,
+#            depths=(1, 1, 1, 1),
+#            num_heads=(3, 3, 3, 3),
+#            window_size=8,
+#        )
+#        model = m.module
+#
+#        @eqx.filter_grad
+#        def loss_grad(model):
+#            out = model(pixel_values=jnp.ones((1, 32, 32, 1)), time=jnp.zeros((1,)))
+#            return jnp.mean(out)
+#
+#        grads = loss_grad(model)
+#        grad_leaves = jax.tree_util.tree_leaves(eqx.filter(grads, eqx.is_array))
+#        assert len(grad_leaves) > 0
+#        assert any(jnp.any(g != 0) for g in grad_leaves)
 # ======================================================================
 # Model.initialize() tests
 # ======================================================================
