@@ -594,7 +594,11 @@ class core(CoreUtilities):
         # Validate: every non-frozen model must have an optimizer
         for lid, fm in flax_mods.items():
             if not fm._frozen and fm._opt_fn is None:
-                raise ValueError(f"Model '{fm.name or type(fm.module).__name__}' (layer {lid}) " f"has no optimizer. Call  model.optimizer(optax.adam, lr=...)  " f"before solve(), or freeze it with  model.freeze().")
+                raise ValueError(
+                    f"Model '{fm.name or type(fm.module).__name__}' (layer {lid}) "
+                    f"has no optimizer. Call  model.optimizer(optax.adam, lr=...)  "
+                    f"before solve(), or freeze it with  model.freeze()."
+                )
 
         # ── 2. Apply LoRA transforms ──
         models = dict(self.models)
@@ -620,7 +624,12 @@ class core(CoreUtilities):
                 if isinstance(model_after, FlaxLoRAWrapper):
                     # Count LoRA layers from the Flax lora_params dict
                     n_lora_layers = sum(1 for l in jax.tree_util.tree_leaves(model_after.lora_params) if eqx.is_array(l)) // 2  # each layer has lora_a + lora_b
-                    self.log.info(f"LoRA (Flax) applied to model {lid} (rank={rank}, alpha={alpha}): " f"{n_lora_layers} kernel layers adapted, " f"{n_lora_params:,} new LoRA params, " f"base frozen at {n_params_before:,} params")
+                    self.log.info(
+                        f"LoRA (Flax) applied to model {lid} (rank={rank}, alpha={alpha}): "
+                        f"{n_lora_layers} kernel layers adapted, "
+                        f"{n_lora_params:,} new LoRA params, "
+                        f"base frozen at {n_params_before:,} params"
+                    )
                 else:
                     from .architectures.linear import Linear as JNOLinear
 
@@ -739,10 +748,15 @@ class core(CoreUtilities):
         for k in per_model_opts:
             lid = int(k)
             state = per_model_opts[k].init(trainable[lid])
-            # Put every leaf on the mesh with P() so shardings are
-            # canonical and match what the step function will produce.
+            # Copy every array leaf so that aliased buffers (e.g. from
+            # L-BFGS zero-initialised history arrays that share the same
+            # underlying allocation) become distinct.  Without this,
+            # donate_argnums will fail with "Attempt to donate the same
+            # buffer twice".
+            # Then place on the mesh with P() so shardings are canonical
+            # and match what the step function will produce.
             opt_states[k] = jax.tree_util.tree_map(
-                lambda x: jax.device_put(x, NamedSharding(self.mesh, P())) if isinstance(x, (jnp.ndarray, jax.Array)) else x,
+                lambda x: jax.device_put(jnp.copy(x), NamedSharding(self.mesh, P())) if isinstance(x, (jnp.ndarray, jax.Array)) else x,
                 state,
             )
 
