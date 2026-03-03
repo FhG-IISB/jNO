@@ -8,6 +8,7 @@ __pycache__/
 *.npz
 *.msgpack
 *.npy
+*.pyc
 
 dist/
 build/
@@ -16,8 +17,3 @@ misc/
 runs/
 
 *.**
-
-.jax_cache
-.DS_Store
-
-NS-Gauss
