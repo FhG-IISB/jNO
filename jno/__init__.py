@@ -19,11 +19,11 @@ from .utils.config import (
     get_runs_base_dir,
     get_rsa_public_key,
     get_rsa_private_key,
+    setup,
 )
 from .trace_evaluator import TraceEvaluator
 from . import resampling
-from .core_utilities import save, load
-from ._setup import setup
+from .utils.load_save import save, load
 
 __version__ = "0.1.0"
 

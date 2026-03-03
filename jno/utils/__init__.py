@@ -12,6 +12,7 @@ from .config import (
     get_runs_base_dir,
     get_rsa_public_key,
     get_rsa_private_key,
+    setup,
 )
 
 __all__ = [
@@ -29,4 +30,5 @@ __all__ = [
     "get_runs_base_dir",
     "get_rsa_public_key",
     "get_rsa_private_key",
+    "setup",
 ]

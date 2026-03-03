@@ -39,7 +39,6 @@ from .utils import LearningRateSchedule, WeightSchedule, statistics, get_logger,
 from .utils.monitor import HardwareMonitor
 from .domain import domain, DomainData
 from .trace_evaluator import TraceEvaluator
-from .core_utilities import CoreUtilities
 from .tuner import ArchSpace, DeviceConfig, Tuner
 from .architectures.lora_linear import (
     apply_lora as _apply_lora,
@@ -49,7 +48,7 @@ from .architectures.lora_linear import (
 import equinox as eqx
 
 
-class core(CoreUtilities):
+class core:
     """core solver using traced operations."""
 
     def __init__(
@@ -594,7 +593,11 @@ class core(CoreUtilities):
         # Validate: every non-frozen model must have an optimizer
         for lid, fm in flax_mods.items():
             if not fm._frozen and fm._opt_fn is None:
-                raise ValueError(f"Model '{fm.name or type(fm.module).__name__}' (layer {lid}) " f"has no optimizer. Call  model.optimizer(optax.adam, lr=...)  " f"before solve(), or freeze it with  model.freeze().")
+                raise ValueError(
+                    f"Model '{fm.name or type(fm.module).__name__}' (layer {lid}) "
+                    f"has no optimizer. Call  model.optimizer(optax.adam, lr=...)  "
+                    f"before solve(), or freeze it with  model.freeze()."
+                )
 
         # ── 2. Apply LoRA transforms ──
         models = dict(self.models)
@@ -620,7 +623,12 @@ class core(CoreUtilities):
                 if isinstance(model_after, FlaxLoRAWrapper):
                     # Count LoRA layers from the Flax lora_params dict
                     n_lora_layers = sum(1 for l in jax.tree_util.tree_leaves(model_after.lora_params) if eqx.is_array(l)) // 2  # each layer has lora_a + lora_b
-                    self.log.info(f"LoRA (Flax) applied to model {lid} (rank={rank}, alpha={alpha}): " f"{n_lora_layers} kernel layers adapted, " f"{n_lora_params:,} new LoRA params, " f"base frozen at {n_params_before:,} params")
+                    self.log.info(
+                        f"LoRA (Flax) applied to model {lid} (rank={rank}, alpha={alpha}): "
+                        f"{n_lora_layers} kernel layers adapted, "
+                        f"{n_lora_params:,} new LoRA params, "
+                        f"base frozen at {n_params_before:,} params"
+                    )
                 else:
                     from .architectures.linear import Linear as JNOLinear
 
@@ -979,6 +987,21 @@ class core(CoreUtilities):
         )
 
         return statistics(self.training_logs)
+
+    def checkpoint(self, models, opt_state, rng, lora_params=None):
+        """Snapshot current model weights and optimiser state."""
+        import copy
+
+        payload = {
+            "step": int(self._total_epochs),
+            "time": time.time(),
+            "models": copy.deepcopy(models),
+            "opt_state": copy.deepcopy(opt_state),
+            "rng": copy.deepcopy(rng),
+        }
+        if lora_params is not None:
+            payload["lora_params"] = copy.deepcopy(lora_params)
+        return payload
 
     def _log_constraint_shapes(self, batchsize):
         """Log the output shape of each constraint by doing a test evaluation.
