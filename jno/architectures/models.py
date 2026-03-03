@@ -99,7 +99,7 @@ from .geofno import GeoFNO, compute_Fourier_modes as geofno_compute_Fourier_mode
 from .pit import PiT, PiTWithCoords
 from .gnot import CGPTNO, GNOT, MoEGPTNO
 from .cno import CNO2D
-from .common import FlaxModelWrapper
+from .common import FlaxModelWrapper, FlaxNNXWrapper
 from .linear import Linear
 from .lora_linear import LoRALinear
 
@@ -221,6 +221,15 @@ class nn:
             else:
                 raise ValueError("When space= is provided, module must be a CLASS (not instance). " "Use: pnp.nn.wrap(MLP, space=space) not pnp.nn.wrap(MLP(), space=space)")
         else:
+            # Auto-detect flax.nnx modules and wrap in FlaxNNXWrapper so the
+            # equinox partition / optimizer / LoRA / mask machinery works.
+            try:
+                from flax import nnx as _nnx
+
+                if isinstance(module, _nnx.Module):
+                    module = FlaxNNXWrapper(module)
+            except ImportError:
+                pass
             return Model(module, name, weight_path)
 
     @classmethod

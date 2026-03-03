@@ -1139,11 +1139,7 @@ class TraceEvaluator:
         return layers
 
     @staticmethod
-    def _infer_arg_shapes(
-        call_args: List,
-        tensor_dims: Dict[str, tuple],
-        existing_params: Dict,
-    ) -> List[tuple]:
+    def _infer_arg_shapes(call_args: List, tensor_dims: Dict[str, tuple], existing_params: Dict) -> List[tuple]:
         """Infer the *normalised* argument shapes for a ModelCall.
 
         Only needed for legacy Flax modules that require dummy inputs
@@ -1305,15 +1301,45 @@ class TraceEvaluator:
 
         module = layer.module
 
-        # ---- Flax wrapper path (msgpack weights) --------------------
-        from .architectures.common import FlaxModelWrapper
+        # ---- Flax NNX wrapper path ----------------------------------
+        from .architectures.common import FlaxModelWrapper, FlaxNNXWrapper
 
-        if isinstance(module, FlaxModelWrapper) and layer.weight_path is not None:
-            logger.info(f"Loading pretrained Flax weights from {layer.weight_path}")
-            from flax.serialization import from_bytes
+        if isinstance(module, FlaxNNXWrapper) and getattr(layer, "_weight_tree", None) is not None:
+            pretrained = layer._weight_tree
+            try:
+                from flax import nnx as _nnx
 
-            with open(layer.weight_path, "rb") as f:
-                pretrained_params = from_bytes(module.params, f.read())
+                if isinstance(pretrained, _nnx.Module):
+                    # Extract state from the live NNX module
+                    _, pretrained_state = _nnx.split(pretrained)
+                else:
+                    # Assume it already is an nnx.State (or compatible pytree)
+                    pretrained_state = pretrained
+            except ImportError:
+                pretrained_state = pretrained
+            logger.info("Loading pretrained NNX weights from pytree")
+            module = FlaxNNXWrapper.__new__(FlaxNNXWrapper)
+            object.__setattr__(module, "graphdef", layer.module.graphdef)
+            object.__setattr__(module, "state", jax.tree_util.tree_map(lambda src, _: src, pretrained_state, layer.module.state))
+            object.__setattr__(module, "post_fn", layer.module.post_fn)
+            object.__setattr__(module, "default_kwargs", layer.module.default_kwargs)
+            if layer.show:
+                logger.info(f"  FlaxNNXWrapper: {module._param_count():,} parameters")
+            return module
+
+        # ---- Flax Linen wrapper path (msgpack weights) ---------------
+
+        if isinstance(module, FlaxModelWrapper) and (layer.weight_path is not None or getattr(layer, "_weight_tree", None) is not None):
+            if layer.weight_path is not None:
+                logger.info(f"Loading pretrained Flax weights from {layer.weight_path}")
+                from flax.serialization import from_bytes
+
+                with open(layer.weight_path, "rb") as f:
+                    pretrained_params = from_bytes(module.params, f.read())
+            else:
+                # Pytree supplied directly — must be a dict of Flax params
+                pretrained_params = layer._weight_tree
+                logger.info("Loading pretrained Flax weights from pytree")
 
             # Merge pretrained weights with fresh params
             merged = TraceEvaluator.merge_pretrained_params(
@@ -1347,6 +1373,15 @@ class TraceEvaluator:
             if layer.weight_path is not None:
                 logger.info(f"Loading pretrained weights from {layer.weight_path}")
                 model = eqx.tree_deserialise_leaves(layer.weight_path, model)
+            elif getattr(layer, "_weight_tree", None) is not None:
+                # Pytree supplied directly — copy array leaves from the tree
+                # onto the freshly-initialised model.
+                logger.info("Loading pretrained weights from pytree")
+                model = jax.tree_util.tree_map(
+                    lambda src, _: src,
+                    layer._weight_tree,
+                    model,
+                )
 
             # ---- optional dtype cast --------------------------------
             if getattr(layer, "_dtype", None) is not None:
@@ -1560,13 +1595,7 @@ class TraceEvaluator:
         return compiled_fn
 
     @staticmethod
-    def init_layer_params(
-        all_ops: List,
-        domain_dim: int,
-        tensor_dims: Dict[str, int],
-        rng: jax.Array,
-        logger,
-    ) -> Tuple[Dict, jax.Array]:
+    def init_layer_params(all_ops: List, domain_dim: int, tensor_dims: Dict[str, int], rng: jax.Array, logger) -> Tuple[Dict, jax.Array]:
         """Collect / initialise models for all layers.
 
         For equinox modules (the normal path), the model was already
@@ -1608,10 +1637,7 @@ class TraceEvaluator:
         return all_models, rng
 
     @staticmethod
-    def compile_multi_expression(
-        exprs: List[Placeholder],
-        all_ops: List[OperationDef],
-    ) -> Callable:
+    def compile_multi_expression(exprs: List[Placeholder], all_ops: List[OperationDef]) -> Callable:
         """Compile multiple constraint expressions into a SINGLE function.
 
         All expressions are evaluated by the same ``TraceEvaluator`` instance,

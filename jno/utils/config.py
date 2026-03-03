@@ -7,6 +7,9 @@ jNO looks for a TOML config file in two locations (first match wins):
 
 Example ``.jno.toml``::
 
+    [jno]
+    seed = 42           # global RNG seed (reproducibility)
+
     [runs]
     base_dir = "./runs"
 
@@ -102,6 +105,12 @@ def get_rsa_private_key() -> str | None:
     return os.path.expanduser(raw) if raw else None
 
 
+def get_seed() -> int | None:
+    """Return ``jno.seed`` from config, or ``None`` if not set."""
+    cfg = get_config()
+    return cfg.get("jno", {}).get("seed", None)
+
+
 # ---------------------------------------------------------------------------
 # Project setup
 # ---------------------------------------------------------------------------
@@ -123,6 +132,12 @@ def setup(script_file: str, name: str | None = None) -> str:
     script filename without extension (e.g. ``heat_equation``), and *base_dir*
     comes from ``runs.base_dir`` in the jNO config (default ``"./runs"``).
     Pass an explicit *name* to override the stem.
+
+    A global RNG seed can be set in ``.jno.toml`` under ``[jno] seed`` so that
+    all ``jno.core(...)`` instances use it automatically::
+
+        [jno]
+        seed = 42
 
     Args:
         script_file: Pass ``__file__`` from the calling script.

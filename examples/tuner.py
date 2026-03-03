@@ -106,7 +106,7 @@ def f():
 
 u = backbone * x * (1 - x) * y * (1 - y)
 pde2 = -C.k * jnn.laplacian(u, [x, y]) - jnn.function(f, [x, y])
-crux2 = jno.core(constraints=[pde2.mse], domain=domain, rng_seed=42, mesh=(1, 1))
+crux2 = jno.core(constraints=[pde2.mse], domain=domain, mesh=(1, 1))
 
 # Global space — only epochs
 space2 = jnn.tune.space()

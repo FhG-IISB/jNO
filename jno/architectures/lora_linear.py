@@ -203,8 +203,19 @@ def apply_lora(model: eqx.Module, rank: int, alpha: float, *, key: jax.Array) ->
     * If *model* is a ``FlaxModelWrapper`` → wraps it in a
       ``FlaxLoRAWrapper`` with LoRA adapters for every 2-D kernel.
     * Otherwise → replaces every jNO ``Linear`` layer with ``LoRALinear``.
+
+    .. note::
+        ``FlaxNNXWrapper`` (flax.nnx models) are not yet supported by LoRA.
+        Calling ``.lora()`` on an NNX-wrapped model will have no effect and
+        log a warning.
     """
-    from .common import FlaxModelWrapper
+    from .common import FlaxModelWrapper, FlaxNNXWrapper
+
+    if isinstance(model, FlaxNNXWrapper):
+        import logging
+
+        logging.getLogger(__name__).warning("LoRA is not yet supported for flax.nnx models (FlaxNNXWrapper). " "The .lora() call has no effect on this model.")
+        return model
 
     if isinstance(model, FlaxModelWrapper):
         lora_params, n_layers, n_lora_params = _build_flax_lora_params(

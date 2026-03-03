@@ -31,7 +31,7 @@ from .trace import (
     dump_tree,
     cse,
 )
-from .utils import LearningRateSchedule, WeightSchedule, statistics, get_logger, IREEModel
+from .utils import LearningRateSchedule, WeightSchedule, statistics, get_logger, IREEModel, get_seed
 from .utils.monitor import HardwareMonitor
 from .domain import domain, DomainData
 from .trace_evaluator import TraceEvaluator
@@ -51,7 +51,7 @@ class core:
         self,
         constraints: List[Placeholder],
         domain: domain,
-        rng_seed: int = 21,
+        rng_seed: int | None = None,
         mesh: Optional[Tuple[int, ...]] = (1, 1),
     ):
         """
@@ -68,7 +68,14 @@ class core:
                 along with any tensor data (e.g., input functions for operator learning).
 
             rng_seed: Random seed for reproducibility. Controls parameter initialization
-                and any stochastic operations during training. Default: 21.
+                and any stochastic operations during training.
+                If ``None`` (default), reads ``[jno] seed`` from ``.jno.toml`` (or
+                ``~/.jno/config.toml``); falls back to ``21`` when no config is found.
+
+                To pin the seed for your whole project, add to ``.jno.toml``::
+
+                    [jno]
+                    seed = 42
 
             mesh: Shape of the device mesh for hybrid parallelism as a tuple (batch, model).
                 Controls how computation is distributed across multiple GPUs/TPUs.
@@ -113,7 +120,10 @@ class core:
         super().__init__()
 
         self._total_epochs = 0
-        self.rng = jax.random.PRNGKey(rng_seed)
+        seed = get_seed() if get_seed() is not None else 21
+        self.seed = seed
+        self.rng = jax.random.PRNGKey(seed)
+        self.log.info(f"RNG seed: {seed}")
 
         self.log.info(f"Initializing Model/s and compiling constraints")
 
@@ -586,9 +596,12 @@ class core:
         # ── 1. Collect Model metadata ──
         flax_mods = self._collect_flax_modules()  # {layer_id: Model}
 
-        # Validate: every non-frozen model must have an optimizer
+        # Validate: every non-frozen model must have an optimizer.
+        # A frozen model that has LoRA active is also "effectively trainable"
+        # (LoRA overrides freeze) and therefore also needs an optimizer.
         for lid, fm in flax_mods.items():
-            if not fm._frozen and fm._opt_fn is None:
+            needs_optimizer = (not fm._frozen) or (fm._lora_config is not None)
+            if needs_optimizer and fm._opt_fn is None:
                 raise ValueError(
                     f"Model '{fm.name or type(fm.module).__name__}' (layer {lid}) "
                     f"has no optimizer. Call  model.optimizer(optax.adam, lr=...)  "
@@ -674,12 +687,25 @@ class core:
         filter_spec = {}
         for lid, model in models.items():
             fm = flax_mods.get(lid)
-            if fm is not None and fm._frozen:
+            if fm is not None and fm._lora_config is not None:
+                # LoRA takes highest priority — base frozen by LoRA itself.
+                # Explicitly calling .freeze() before .lora() is therefore a
+                # no-op: LoRA still wins so callers can freely chain
+                # .mask(...).freeze().lora(...) without unexpected behaviour.
+                filter_spec[lid] = _lora_trainable_filter(model)
+            elif fm is not None and fm._frozen:
                 # Whole model frozen – no arrays trainable
                 filter_spec[lid] = jax.tree_util.tree_map(lambda l: False, model)
-            elif fm is not None and fm._lora_config is not None:
-                # LoRA – base frozen, lora_A/B trainable
-                filter_spec[lid] = _lora_trainable_filter(model)
+            elif fm is not None and fm._param_mask is not None:
+                # Partial mask — only leaves marked True in the mask are trained.
+                # Non-array leaves (e.g. activation functions kept as module
+                # attributes) are always False so equinox does not misinterpret
+                # them as sub-filter callables.
+                filter_spec[lid] = jax.tree_util.tree_map(
+                    lambda arr, m: bool(m) if eqx.is_array(arr) else False,
+                    model,
+                    fm._param_mask,
+                )
             else:
                 # Normal – every array trainable, non-arrays (e.g. activation
                 # functions stored as attributes) must be False, not the
@@ -718,7 +744,10 @@ class core:
         zeros = jnp.zeros(self.n_constraints)
 
         for lid, fm in flax_mods.items():
-            if fm._frozen:
+            # Skip only if truly frozen with no LoRA override.
+            # If LoRA is active, we need an optimizer even when _frozen=True
+            # because LoRA takes priority and its adapter params are trainable.
+            if fm._frozen and fm._lora_config is None:
                 continue
             k = str(lid)
 

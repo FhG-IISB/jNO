@@ -137,6 +137,91 @@ class FlaxModelWrapper(eqx.Module):
         return None
 
 
+class FlaxNNXWrapper(eqx.Module):
+    """Wrap a ``flax.nnx`` module as a single Equinox-compatible module.
+
+    ``flax.nnx`` models carry their own parameters as stateful attributes.
+    This wrapper splits the model into:
+
+    * ``graphdef`` — the static computation graph (architecture, shapes,
+      variable types).  Stored as an equinox *static* field so it is never
+      traced by JAX.
+    * ``state`` — an ``nnx.State`` pytree whose leaves are raw JAX arrays.
+      ``eqx.is_array`` returns ``True`` for every leaf, so the full
+      equinox partition / optimizer / LoRA / mask machinery works
+      transparently.
+
+    ``__call__`` reconstructs the live NNX model via ``nnx.merge`` and
+    invokes it, keeping the wrapper itself immutable (as required by JAX).
+
+    Args:
+        model: A ``flax.nnx.Module`` instance.
+        post_fn: Optional callable applied to the model output.
+        default_kwargs: Keyword arguments forwarded to ``model.__call__``
+            on every invocation.
+
+    Example::
+
+        from flax import nnx
+        import jno.numpy as jnn
+
+        class MyNNX(nnx.Module):
+            def __init__(self, rngs):
+                self.l1 = nnx.Linear(2, 64, rngs=rngs)
+                self.l2 = nnx.Linear(64, 1, rngs=rngs)
+            def __call__(self, x):
+                return self.l2(nnx.relu(self.l1(x)))
+
+        net = jnn.nn.wrap(MyNNX(nnx.Rngs(0)))      # auto-detected
+        y   = net(x)
+
+    Partial mask (train only l2, freeze l1)::
+
+        all_false = jax.tree_util.tree_map(lambda _: False, net.module)
+        mask = eqx.tree_at(
+            lambda w: (
+                jax.tree_util.tree_leaves(w.state['l2']['kernel'])[0],
+                jax.tree_util.tree_leaves(w.state['l2']['bias'])[0],
+            ),
+            all_false, (True, True),
+        )
+        net.mask(mask).optimizer(optax.adam, lr=1e-3)
+
+        # Discover state paths:
+        # jax.tree_util.tree_map_with_path(lambda p, _: p, net.module.state)
+    """
+
+    graphdef: Any = eqx.field(static=True)
+    state: Any  # flax.nnx.State — leaves are raw JAX arrays
+    post_fn: Optional[Callable] = eqx.field(static=True)
+    default_kwargs: dict = eqx.field(static=True)
+
+    def __init__(self, model, post_fn=None, **default_kwargs):
+        try:
+            from flax import nnx
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError("flax is required for FlaxNNXWrapper — install with: pip install flax") from exc
+        self.graphdef, self.state = nnx.split(model)
+        self.post_fn = post_fn
+        self.default_kwargs = default_kwargs
+
+    def __call__(self, *args, **kwargs):
+        from flax import nnx
+
+        merged = {**self.default_kwargs, **kwargs}
+        merged.pop("key", None)
+
+        model = nnx.merge(self.graphdef, self.state)
+        result = model(*args, **merged)
+
+        if self.post_fn is not None:
+            result = self.post_fn(result)
+        return result
+
+    def _param_count(self) -> int:
+        return sum(l.size for l in jax.tree_util.tree_leaves(self.state) if eqx.is_array(l))
+
+
 # ---------------------------------------------------------------------------
 # Fourier-mode computation (used by GeoFNO and PCNO)
 # ---------------------------------------------------------------------------

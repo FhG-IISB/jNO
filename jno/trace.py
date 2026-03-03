@@ -681,6 +681,8 @@ class Model(Placeholder):
         self._opt_fn = None  # optax optimizer factory / instance
         self._lr = None  # LearningRateSchedule or None
         self._dtype = None  # target dtype (e.g. jnp.bfloat16) or None
+        self._param_mask = None  # pytree of bool with same structure as model; None = all trainable
+        self._weight_tree = None  # pretrained weights as a pytree (alternative to weight_path file)
         self._tunable_opts: Dict[str, list] = {}  # per-model tunable options for sweeps
 
     # ── public API ───────────────────────────────────────────
@@ -707,6 +709,43 @@ class Model(Placeholder):
     def unfreeze(self):
         """Unfreeze this model so it is trained normally."""
         self._frozen = False
+        return self
+
+    def mask(self, param_mask):
+        """Restrict which parameters are trainable via a boolean pytree mask.
+
+        ``param_mask`` must be a pytree with the **same structure** as the
+        underlying module, but with every leaf replaced by a ``bool``:
+
+        * ``True``  -> the corresponding array is **trainable**.
+        * ``False`` -> the corresponding array is **frozen** (kept in the
+          model but not updated by the optimizer).
+
+        The mask is compatible with all other training helpers — you can
+        chain ``.mask(...).optimizer(...)``, ``.mask(...).lora(...)`` or
+        ``.mask(...).freeze()`` freely.
+
+        A convenient way to build the mask for an Equinox model is::
+
+            import equinox as eqx, jax
+
+            # Freeze everything, then flip specific leaves to True:
+            all_false = jax.tree_util.tree_map(lambda _: False, model.module)
+            param_mask = eqx.tree_at(
+                lambda m: (m.layers[0].weight, m.layers[0].bias),
+                all_false,
+                (True, True),
+            )
+            model.mask(param_mask).optimizer(optax.adam, lr=1e-3)
+
+        Args:
+            param_mask: A pytree matching the structure of the underlying
+                module where every leaf is a ``bool``.
+
+        Returns:
+            self (for chaining).
+        """
+        self._param_mask = param_mask
         return self
 
     def lora(self, rank: int = 4, alpha: float = 1.0):
@@ -751,32 +790,42 @@ class Model(Placeholder):
             self._lr = lr
         return self
 
-    def initialize(self, weight_path: str):
+    def initialize(self, weights):
         """Load pretrained weights into this model at init time.
 
-        For **Equinox** modules the path should point to a file written by
-        ``eqx.tree_serialise_leaves``.
+        Accepts either a **file path** or a **pytree of arrays** directly.
 
-        For **Flax** models wrapped via ``FlaxModelWrapper`` the path should
-        point to a Flax ``.msgpack`` weights file.  Weights are merged with
-        the current (freshly initialised) parameters – shape-mismatched
-        arrays are re-initialised automatically.
+        * **File path** (``str`` / ``Path``) — existing behaviour:
+
+          - *Equinox* modules: path written by
+            ``eqx.tree_serialise_leaves``.
+          - *Flax* ``FlaxModelWrapper``: path to a ``.msgpack`` weights
+            file.  Shape-mismatched arrays are re-initialised automatically.
+
+        * **Pytree** (any non-string value, e.g. an ``eqx.Module`` instance
+          or a plain dict of arrays) — the tree is stored directly and
+          its array leaves replace those of the freshly-initialised model:
+
+          .. code-block:: python
+
+              # Save a model's current params into another model
+              pretrained = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key)
+              new_model = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key2)
+              new_model.initialize(pretrained.module)   # use pytree directly
 
         Args:
-            weight_path: Path to the pretrained weights file.
+            weights: A file path (``str``) *or* a pytree whose leaves are
+                     the pretrained arrays.
+
+        Returns:
+            self (for chaining).
         """
-
-        # if isinstance(weight_path, dict):
-
-        # make a temporary file here to saev the params
-
-        # elif # weight path ends in pkl
-
-        # type(weight_path.models[1])
-        # <class 'jno.architectures.common.FlaxModelWrapper'>
-        # -> crux.models[1].params
-
-        self.weight_path = weight_path
+        if isinstance(weights, (str, Path)):
+            self.weight_path = str(weights)
+            self._weight_tree = None
+        else:
+            self._weight_tree = weights
+            self.weight_path = None
         return self
 
     def dtype(self, dtype):
@@ -859,6 +908,8 @@ class Model(Placeholder):
         self._opt_fn = None
         self._lr = None
         self._dtype = None
+        self._param_mask = None
+        self._weight_tree = None
         self._merge_lora_flag = False
         return self
 
@@ -899,6 +950,11 @@ class ModelCall(Placeholder):
 
     def unfreeze(self):
         self.model.unfreeze()
+        return self
+
+    def mask(self, param_mask):
+        """Proxy for :meth:`Model.mask`."""
+        self.model.mask(param_mask)
         return self
 
     def lora(self, rank: int = 4, alpha: float = 1.0):

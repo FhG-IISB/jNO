@@ -19,6 +19,7 @@ from .utils.config import (
     get_runs_base_dir,
     get_rsa_public_key,
     get_rsa_private_key,
+    get_seed,
     setup,
 )
 from .trace_evaluator import TraceEvaluator
@@ -62,4 +63,5 @@ __all__ = [
     "get_runs_base_dir",
     "get_rsa_public_key",
     "get_rsa_private_key",
+    "get_seed",
 ]

@@ -3,7 +3,6 @@
 import os
 
 import jax
-import jax.numpy as jnp
 import pytest
 
 from cryptography.hazmat.backends import default_backend

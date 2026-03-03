@@ -253,7 +253,7 @@ val2 = jnn.tracker(jnn.mean(v(x, y, k) - _v(x, y)), 100)
 
 # To use the mean square error one has to add it manually
 # A mesh can be created for data or model parallelism
-crux = jno.core(constraints=[pde1.mse, pde2.mse, boc2.mse, sens.mse, val1, val2], domain=domain, rng_seed=42, mesh=(len(jax.devices()), 1))
+crux = jno.core(constraints=[pde1.mse, pde2.mse, boc2.mse, sens.mse, val1, val2], domain=domain, mesh=(len(jax.devices()), 1))
 
 
 # -----------------------------------------------------------------------------
@@ -292,6 +292,127 @@ crux.solve(1000).plot(f"{dire}/training_history_soap.png")
 u_net.optimizer(optax.lbfgs, lr=lrs(5e-5))
 v_net.optimizer(optax.lbfgs, lr=lrs(5e-5))
 crux.solve(1000, constraint_weights=ws(lambda e, L: [1.0, 1.0, 10.0, 1.0 * L[3]])).plot(f"{dire}/training_history_lbfgs.png")
+
+# -----------------------------------------------------------------------------
+# Per-model training control
+# -----------------------------------------------------------------------------
+#
+# Each model in the solver has its own optimizer, learning rate, and
+# trainability settings — they are completely independent.
+#
+# The available controls are:
+#   model.optimizer(opt_fn, lr=...)   — set optimizer (and optionally LR)
+#   model.freeze()                    — freeze all parameters
+#   model.mask(param_mask)            — freeze/unfreeze individual parameters
+#   model.lora(rank=..., alpha=...)   — LoRA fine-tuning
+#   model.initialize(path_or_pytree) — load pretrained weights
+#
+# All of these return the model itself, so they can be chained and re-applied
+# between any two .solve() calls.
+#
+# Flax-wrapped models (jnn.nn.wrap)
+# ----------------------------------
+#   flax.linen models  — pass the initialized (apply_fn, params) pair via nn.flaxwrap().
+#   flax.nnx models    — pass the live nnx.Module instance to nn.wrap(); it is
+#                        auto-detected and wrapped in a FlaxNNXWrapper.
+#
+#   optimizer, freeze, initialize — fully supported for both.
+#   lora                          — supported for Linen; not yet for NNX.
+#   mask                          — supported for both, but dict-key navigation
+#       differs from equinox attribute access.  See "Example 3b" below.
+
+# ── Example 1: different optimizers and learning rates ────────────────────────
+# u_net uses Adam with a fast schedule; v_net uses SGD with a slow schedule.
+u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.9, 1000, 1e-5))
+v_net.optimizer(optax.sgd, lr=lrs.exponential(5e-4, 0.95, 1000, 1e-6))
+crux.solve(200).plot(f"{dire}/training_mixed_opts.png")
+
+# ── Example 2: full freeze — train one model while the other is fixed ─────────
+# Freeze v_net entirely; only u_net updates.
+v_net.freeze()
+u_net.optimizer(optax.adam, lr=lrs(1e-4))
+crux.solve(200).plot(f"{dire}/training_u_only.png")
+
+# Unfreeze v_net by assigning a new optimizer; now both train again.
+v_net.optimizer(optax.adam, lr=lrs(1e-4))
+crux.solve(200).plot(f"{dire}/training_both_unfrozen.png")
+
+# ── Example 3: partial mask — train only the output layer of u_net ────────────
+# Build a boolean pytree with the same structure as the equinox module,
+# then flip the output layer leaves to True.
+all_false = jax.tree_util.tree_map(lambda _: False, u_net.module)
+param_mask = eqx.tree_at(
+    lambda m: (m.dense3.weight, m.dense3.bias),
+    all_false,
+    (True, True),
+)
+u_net.mask(param_mask).optimizer(optax.adam, lr=lrs(5e-4))
+crux.solve(200).plot(f"{dire}/training_output_layer_only.png")
+
+# Reset to full training for u_net (pass an all-True mask or just reassign optimizer)
+u_net.optimizer(optax.adam, lr=lrs(5e-4))
+
+# ── Example 3b: partial mask for a Flax-wrapped model ─────────────────────────
+# For Flax Linen models the parameter pytree is a nested dict under
+# wrapper.module.params.  Navigate it with string keys:
+#
+#   all_false_v = jax.tree_util.tree_map(lambda _: False, v_net.module)
+#   mask_v = eqx.tree_at(
+#       lambda w: w.params['params']['Dense_0']['kernel'],   # Linen dict path
+#       all_false_v, True,
+#   )
+#   v_net.mask(mask_v).optimizer(optax.adam, lr=lrs(5e-4))
+#
+# For flax.nnx models (auto-detected by nn.wrap), navigate the NNX State:
+#
+#   from flax import nnx
+#   class MyNNX(nnx.Module): ...
+#   nnx_net = jnn.nn.wrap(MyNNX(nnx.Rngs(0)))   # FlaxNNXWrapper created
+#
+#   all_false = jax.tree_util.tree_map(lambda _: False, nnx_net.module)
+#   mask = eqx.tree_at(
+#       lambda w: (
+#           jax.tree_util.tree_leaves(w.state['dense3']['kernel'])[0],
+#           jax.tree_util.tree_leaves(w.state['dense3']['bias'])[0],
+#       ),
+#       all_false, (True, True),
+#   )
+#   nnx_net.mask(mask).optimizer(optax.adam, lr=lrs(5e-4))
+#
+# Discover layer names: jax.tree_util.tree_map_with_path(lambda p, _: p, nnx_net.module.state)
+#
+# Note: LoRA is not yet supported for flax.nnx models.
+#
+# Tip: inspect Linen dict keys with
+#   jax.tree_util.tree_map_with_path(lambda p, _: p, v_net.module.params)
+
+# ── Example 4: initialize from a pretrained pytree ────────────────────────────
+# For an equinox model, pass the equinox module directly.
+pretrained_module = u_net.module  # here using the current weights as a stand-in
+u_net.initialize(pretrained_module)
+
+# For a Flax-wrapped model, pass the Flax params dict directly:
+#   v_net.initialize(pretrained_flax_params)   # dict from model.init(...)
+# or from a msgpack file:
+#   v_net.initialize("runs/pretrained_v.msgpack")
+
+# .initialize() also accepts a file path (str or Path) for equinox models:
+# u_net.initialize("runs/pretrained_u.eqx")
+
+# ── Example 5: LoRA — low-rank adaptation while keeping base weights frozen ───
+# .lora() overrides .freeze(), so the pattern .freeze().lora() means:
+#   "freeze the base weights, but let LoRA adapters train."
+# The adapters are merged back into the base weights at the end of .solve().
+(v_net.freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-4)))  # freeze base weights  # add trainable rank-4 adapters
+u_net.optimizer(optax.adam, lr=lrs(1e-4))  # u_net trains normally in parallel
+crux.solve(200).plot(f"{dire}/training_lora.png")
+
+# ── Example 6: combine everything ─────────────────────────────────────────────
+# u_net — only output layer trainable, loaded from pretrained weights:
+u_net.mask(param_mask).initialize(pretrained_module).optimizer(optax.adam, lr=lrs(5e-4))
+# v_net — LoRA fine-tuning with frozen base:
+v_net.freeze().lora(rank=2, alpha=0.5).optimizer(optax.sgd, lr=lrs(1e-4))
+crux.solve(200).plot(f"{dire}/training_combined.png")
 
 # -----------------------------------------------------------------------------
 # Checkpointing and restart

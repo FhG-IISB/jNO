@@ -294,6 +294,130 @@ class TestFlaxModule:
 
 
 # ======================================================================
+# Model.mask / ModelCall.mask
+# ======================================================================
+class TestModelMask:
+    """Tests for the param_mask feature on Model and ModelCall."""
+
+    def _make_eqx_model(self):
+        import jax
+        import jno.numpy as jnn
+
+        key = jax.random.PRNGKey(0)
+        return jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key)
+
+    def test_mask_stores_param_mask(self):
+        """mask() stores the pytree on _param_mask."""
+        import jax
+        import equinox as eqx
+
+        u_net = self._make_eqx_model()
+        all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
+        result = u_net.mask(all_true)
+        assert u_net._param_mask is all_true
+
+    def test_mask_returns_self(self):
+        """mask() returns the Model for chaining."""
+        import jax
+
+        u_net = self._make_eqx_model()
+        all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
+        assert u_net.mask(all_true) is u_net
+
+    def test_mask_then_optimizer_chains(self):
+        """mask().optimizer() sets both _param_mask and _opt_fn."""
+        import jax, optax
+
+        u_net = self._make_eqx_model()
+        all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
+        u_net.mask(all_true).optimizer(optax.adam, lr=1e-3)
+        assert u_net._param_mask is all_true
+        assert u_net._opt_fn is optax.adam
+
+    def test_mask_then_freeze_chains(self):
+        """mask().freeze() sets both _param_mask and _frozen."""
+        import jax
+
+        u_net = self._make_eqx_model()
+        all_false = jax.tree_util.tree_map(lambda _: False, u_net.module)
+        u_net.mask(all_false).freeze()
+        assert u_net._param_mask is all_false
+        assert u_net._frozen is True
+
+    def test_mask_then_lora_chains(self):
+        """mask().lora() sets both _param_mask and _lora_config."""
+        import jax
+
+        u_net = self._make_eqx_model()
+        all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
+        u_net.mask(all_true).lora(rank=4, alpha=1.0)
+        assert u_net._param_mask is all_true
+        assert u_net._lora_config == (4, 1.0)
+
+    def test_mask_reset_clears_param_mask(self):
+        """reset() clears _param_mask back to None."""
+        import jax
+
+        u_net = self._make_eqx_model()
+        all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
+        u_net.mask(all_true)
+        assert u_net._param_mask is not None
+        u_net.reset()
+        assert u_net._param_mask is None
+
+    def test_mask_via_model_call_proxies_to_model(self):
+        """ModelCall.mask() delegates to the underlying Model."""
+        import jax
+
+        u_net = self._make_eqx_model()
+        x = make_var("x")
+        call = u_net(x)  # returns ModelCall
+        assert isinstance(call, ModelCall)
+        all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
+        result = call.mask(all_true)
+        # mask() on ModelCall returns the ModelCall (for chaining)
+        assert result is call
+        # but the mask is stored on the underlying Model
+        assert u_net._param_mask is all_true
+
+    def test_model_call_mask_chains_with_optimizer(self):
+        """ModelCall.mask().optimizer() sets mask and optimizer on the model."""
+        import jax, optax
+
+        u_net = self._make_eqx_model()
+        x = make_var("x")
+        all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
+        u_net(x).mask(all_true).optimizer(optax.adam, lr=1e-3)
+        assert u_net._param_mask is all_true
+        assert u_net._opt_fn is optax.adam
+
+    def test_default_param_mask_is_none(self):
+        """A freshly created Model has _param_mask == None (train everything)."""
+        u_net = self._make_eqx_model()
+        assert u_net._param_mask is None
+
+    def test_partial_mask_structure(self):
+        """A partial mask (some True, some False) is stored as-is."""
+        import jax
+        import equinox as eqx
+
+        u_net = self._make_eqx_model()
+        # Build a mask: only first hidden layer trainable
+        all_false = jax.tree_util.tree_map(lambda _: False, u_net.module)
+        partial_mask = eqx.tree_at(
+            lambda m: (m.hidden_layers[0].weight, m.hidden_layers[0].bias),
+            all_false,
+            (True, True),
+        )
+        u_net.mask(partial_mask)
+        assert u_net._param_mask is partial_mask
+        # Verify the mask has the expected boolean leaves
+        leaves = jax.tree_util.tree_leaves(u_net._param_mask)
+        assert leaves.count(True) == 2
+        assert leaves.count(False) == 4
+
+
+# ======================================================================
 # OperationDef / OperationCall
 # ======================================================================
 class TestOperations:
