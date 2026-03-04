@@ -47,12 +47,12 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            # tag with the release version  e.g.  0.2.0
+            # release: tag with semver e.g. 0.2.0
             type=semver,pattern={{version}}
-            # also tag as "latest"
-            type=raw,value=latest,enable={{is_default_branch}}
-            # tag every release as latest regardless of branch
+            # release: also tag as latest
             type=raw,value=latest,enable=${{ github.event_name == 'release' }}
+            # branch push: tag as edge-<branch>
+            type=raw,value=edge-${{ github.ref_name }},enable=${{ github.event_name == 'push' }}
             # manual dispatch override
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event.inputs.tag != '' }}
 
@@ -61,7 +61,7 @@ jobs:
         with:
           context: .
           file: Dockerfile
-          platforms: linux/amd64,linux/arm64
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta-cpu.outputs.tags }}
           labels: ${{ steps.meta-cpu.outputs.labels }}
@@ -102,6 +102,7 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=raw,value=latest,enable=${{ github.event_name == 'release' }}
+            type=raw,value=edge-${{ github.ref_name }},enable=${{ github.event_name == 'push' }}
             type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event.inputs.tag != '' }}
 
       - name: Build and push CUDA image
