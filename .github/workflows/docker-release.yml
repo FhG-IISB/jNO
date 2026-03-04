@@ -18,11 +18,36 @@ env:
 
 jobs:
   # ------------------------------------------------------------------
+  # Run tests before building images
+  # ------------------------------------------------------------------
+  test:
+    name: Run pytest
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libglu1-mesa
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install dependencies
+        run: uv sync --extra dev
+
+      - name: Run tests
+        run: uv run pytest
+
+  # ------------------------------------------------------------------
   # CPU image  (linux/amd64)
   # ------------------------------------------------------------------
   build-cpu:
     name: Build & push CPU image
     runs-on: ubuntu-latest
+    needs: [test]
+    if: always() && (needs.test.result == 'success' || needs.test.result == 'skipped')
     permissions:
       contents: read
       packages: write
@@ -74,6 +99,8 @@ jobs:
   build-cuda:
     name: Build & push CUDA image
     runs-on: ubuntu-latest
+    needs: [test]
+    if: always() && (needs.test.result == 'success' || needs.test.result == 'skipped')
     permissions:
       contents: read
       packages: write
