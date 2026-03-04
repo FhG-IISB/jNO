@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         build-essential \
         libglu1-mesa \
-        libgl1-mesa-glx \
+        libgl1 \
         libxrender1 \
         libxcursor1 \
         libxft2 \

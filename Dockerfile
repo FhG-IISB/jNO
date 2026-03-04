@@ -9,7 +9,7 @@
 # Pull:     docker pull ghcr.io/<owner>/jno:latest
 # Run:      docker run --rm ghcr.io/<owner>/jno:latest
 # ------------------------------------------------------------
-FROM --platform=linux/amd64 ubuntu:24.04
+FROM ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -22,7 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git \
         build-essential \
         libglu1-mesa \
-        libgl1-mesa-glx \
+        libgl1 \
         libxrender1 \
         libxcursor1 \
         libxft2 \
