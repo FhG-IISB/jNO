@@ -6,6 +6,9 @@ Covers:
   - Parity between method API and jnn.grad / jnn.laplacian / jnn.hessian
   - Chained second-order derivatives  u.d(x).d(x)
   - Full Hessian matrix  u.hessian(x, y)
+  - FD sub-scheme strings: "finite_difference:lsq", ":cotangent", ":uniform",
+    ":inverse_distance" — routed through DifferentialOperators.parse_fd_scheme
+  - Direct unit tests for DifferentialOperators class methods
 
 AD mode summary (from trace_evaluator._eval_jacobian / _eval_hessian):
   .d(x)  single-variable    -- jax.grad (reverse-mode AD), vmapped over N pts
@@ -22,6 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 
 import jno.numpy as jnn
+from jno.differential_operators import DifferentialOperators
 from jno.trace import (
     Jacobian,
     Hessian,
@@ -539,3 +543,329 @@ class TestTemporalDerivative:
         pts = jnp.ones((8, 1))
         result = _eval(u.d(t), {"x": pts, "__time__": jnp.array([1.0])})
         assert result.shape == (8, 1)
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 9. DifferentialOperators.parse_fd_scheme
+# ───────────────────────────────────────────────────────────────────────────────
+
+
+class TestParseFdScheme:
+    """Unit tests for the scheme-string parser."""
+
+    def test_plain_fd_defaults(self):
+        main, gm, lm = DifferentialOperators.parse_fd_scheme("finite_difference")
+        assert main == "finite_difference"
+        assert gm == "area_weighted"
+        assert lm == "gradient_of_gradient"
+
+    def test_ad_returns_nones(self):
+        main, gm, lm = DifferentialOperators.parse_fd_scheme("automatic_differentiation")
+        assert main == "automatic_differentiation"
+        assert gm is None
+        assert lm is None
+
+    def test_lsq_subscheme(self):
+        main, gm, lm = DifferentialOperators.parse_fd_scheme("finite_difference:lsq")
+        assert main == "finite_difference"
+        assert gm == "least_squares"
+        assert lm == "lsq_of_gradient"
+
+    def test_least_squares_subscheme(self):
+        main, gm, lm = DifferentialOperators.parse_fd_scheme("finite_difference:least_squares")
+        assert gm == "least_squares"
+        assert lm == "lsq_of_gradient"
+
+    def test_cotangent_subscheme(self):
+        main, gm, lm = DifferentialOperators.parse_fd_scheme("finite_difference:cotangent")
+        assert main == "finite_difference"
+        assert gm == "area_weighted"
+        assert lm == "cotangent"
+
+    def test_uniform_subscheme(self):
+        main, gm, lm = DifferentialOperators.parse_fd_scheme("finite_difference:uniform")
+        assert gm == "uniform"
+        assert lm == "gradient_of_gradient"
+
+    def test_inverse_distance_subscheme(self):
+        main, gm, lm = DifferentialOperators.parse_fd_scheme("finite_difference:inverse_distance")
+        assert gm == "inverse_distance"
+        assert lm == "gradient_of_gradient"
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 10. DifferentialOperators — direct unit tests on small analytic meshes
+# ───────────────────────────────────────────────────────────────────────────────
+
+# --------------- shared tiny meshes -----------------------------------------
+
+
+def _line_mesh():
+    """5 points on [0, 1], 4 line elements."""
+    pts = jnp.linspace(0.0, 1.0, 5).reshape(5, 1)
+    lines = np.array([[0, 1], [1, 2], [2, 3], [3, 4]])
+    return pts, lines
+
+
+def _square_mesh():
+    """Unit square split into 2 right triangles: (0,1,2) and (0,2,3)."""
+    pts = jnp.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
+    tris = np.array([[0, 1, 2], [0, 2, 3]])
+    return pts, tris
+
+
+def _grid_mesh_3x3():
+    """3×3 regular triangulated unit square — 9 nodes, 8 triangles."""
+    xs = jnp.linspace(0.0, 1.0, 3)
+    ys = jnp.linspace(0.0, 1.0, 3)
+    gx, gy = jnp.meshgrid(xs, ys, indexing="xy")
+    pts = jnp.stack([gx.ravel(), gy.ravel()], axis=-1)
+    # node indices:
+    # 0 1 2
+    # 3 4 5
+    # 6 7 8
+    tris = np.array(
+        [
+            [0, 1, 4],
+            [0, 4, 3],
+            [1, 2, 5],
+            [1, 5, 4],
+            [3, 4, 7],
+            [3, 7, 6],
+            [4, 5, 8],
+            [4, 8, 7],
+        ]
+    )
+    return pts, tris
+
+
+class TestDifferentialOperatorsUnit:
+    """Direct numerical tests of DifferentialOperators static methods.
+
+    Uses simple analytic functions (linear, quadratic) where exact values
+    are known.  All gradient methods must recover the exact gradient of a
+    *linear* function (constant gradient field is within the FE polynomial
+    space of each element).
+    """
+
+    # ── 1-D gradient methods ─────────────────────────────────────────────────
+
+    @pytest.mark.parametrize("method", ["area_weighted", "uniform", "inverse_distance", "least_squares"])
+    def test_1d_gradient_linear_exact(self, method):
+        """All 1-D gradient methods recover slope of a linear function exactly."""
+        pts, lines = _line_mesh()
+        u = 3.0 * pts[:, 0] + 1.0  # u = 3x + 1  →  du/dx = 3 everywhere
+        g = DifferentialOperators.compute_fd_gradient_1d_simple(u, pts, lines, method=method)
+        # Interior nodes only (skip boundary nodes 0 and 4 which have one-sided stencils)
+        assert jnp.allclose(g[1:4], jnp.full(3, 3.0), atol=1e-5), f"method='{method}': interior values {g[1:4]} != 3.0"
+
+    def test_1d_gradient_quadratic_area_weighted(self):
+        """Area-weighted 1-D gradient of x² → 2x (piecewise linear approx)."""
+        pts, lines = _line_mesh()
+        u = pts[:, 0] ** 2
+        g = DifferentialOperators.compute_fd_gradient_1d_simple(u, pts, lines)
+        # At interior midpoints the piecewise gradient should be close to 2x
+        expected = 2.0 * pts[1:4, 0]
+        assert jnp.allclose(g[1:4], expected, atol=0.15)  # O(h) accuracy, h=0.25
+
+    # ── 2-D gradient methods ─────────────────────────────────────────────────
+
+    @pytest.mark.parametrize("method", ["area_weighted", "uniform", "inverse_distance"])
+    def test_2d_gradient_linear_exact(self, method):
+        """All element-averaging gradient methods recover exact linear gradient."""
+        pts, tris = _square_mesh()
+        u = 2.0 * pts[:, 0] + 3.0 * pts[:, 1]  # du/dx=2, du/dy=3
+        gx = DifferentialOperators.compute_fd_gradient_2d_simple(u, pts, tris, 0, method=method)
+        gy = DifferentialOperators.compute_fd_gradient_2d_simple(u, pts, tris, 1, method=method)
+        assert jnp.allclose(gx, jnp.full(4, 2.0), atol=1e-4), f"{method}: gx={gx}"
+        assert jnp.allclose(gy, jnp.full(4, 3.0), atol=1e-4), f"{method}: gy={gy}"
+
+    def test_2d_gradient_lsq_linear_exact(self):
+        """LSQ gradient recovers exact linear gradient at interior nodes.
+
+        Corner/boundary nodes that have only a single incident element produce
+        a rank-deficient 2x2 system; accuracy is only guaranteed where the
+        local patch spans at least two independent directions (interior nodes).
+        """
+        pts, tris = _grid_mesh_3x3()  # 9 nodes, 8 triangles; node 4 is interior
+        u = 2.0 * pts[:, 0] + 3.0 * pts[:, 1]
+        gx = DifferentialOperators.compute_gradient_2d_lsq(u, pts, tris, 0)
+        gy = DifferentialOperators.compute_gradient_2d_lsq(u, pts, tris, 1)
+        # Only check the single interior node (index 4) which has 6 incident triangles
+        assert abs(float(gx[4]) - 2.0) < 1e-4, f"LSQ gx at interior = {gx[4]}"
+        assert abs(float(gy[4]) - 3.0) < 1e-4, f"LSQ gy at interior = {gy[4]}"
+
+    def test_2d_gradient_lsq_matches_area_weighted_on_linear(self):
+        """LSQ and area-weighted agree on a linear function at interior nodes.
+
+        Both methods are exact for linear functions; they should produce
+        identical results at well-supported (interior) nodes.
+        """
+        pts, tris = _grid_mesh_3x3()
+        u = 5.0 * pts[:, 0] - 2.0 * pts[:, 1]
+        aw = DifferentialOperators.compute_fd_gradient_2d_simple(u, pts, tris, 0, method="area_weighted")
+        lsq = DifferentialOperators.compute_gradient_2d_lsq(u, pts, tris, 0)
+        # Compare only at the interior node (index 4)
+        assert abs(float(aw[4]) - float(lsq[4])) < 1e-3, f"Interior node: AW={aw[4]:.6f}, LSQ={lsq[4]:.6f}"
+
+    # ── 2-D Laplacian methods ────────────────────────────────────────────────
+
+    def test_2d_laplacian_linear_zero(self):
+        """∇²(ax + by) = 0 for all three Laplacian methods."""
+        pts, tris = _grid_mesh_3x3()
+        u = 2.0 * pts[:, 0] + 3.0 * pts[:, 1]
+        for method in ["gradient_of_gradient", "cotangent", "lsq_of_gradient"]:
+            lap = DifferentialOperators.compute_fd_laplacian_2d_simple(u, pts, tris, (0, 1), method=method)
+            # Interior nodes (index 4 = centre of 3x3 grid) must be near zero
+            assert abs(float(lap[4])) < 0.1, f"{method}: lap[4]={lap[4]}"
+
+    def test_2d_cotangent_laplacian_constant_function(self):
+        """∇²(c) = 0 for a constant function — cotangent Laplacian."""
+        pts, tris = _grid_mesh_3x3()
+        u = jnp.ones(pts.shape[0])
+        lap = DifferentialOperators.compute_laplacian_2d_cotangent(u, pts, tris)
+        assert jnp.allclose(lap, jnp.zeros_like(lap), atol=1e-6), f"max={jnp.max(jnp.abs(lap))}"
+
+    def test_2d_cotangent_laplacian_linear_function(self):
+        """∇²(ax + by) = 0 — cotangent Laplacian."""
+        pts, tris = _grid_mesh_3x3()
+        u = 2.0 * pts[:, 0] + 3.0 * pts[:, 1]
+        lap = DifferentialOperators.compute_laplacian_2d_cotangent(u, pts, tris)
+        # All interior nodes (index 4) must be essentially zero
+        assert abs(float(lap[4])) < 1e-4, f"cotangent lap of linear at centre = {lap[4]}"
+
+    def test_2d_cotangent_laplacian_quadratic(self):
+        """∇²(x²+y²) ≈ 4 at the interior node — cotangent Laplacian.
+
+        The normalisation uses 2*A_i (barycentric dual area).  On this
+        coarse regular mesh the interior node (index 4) should be exact.
+        """
+        pts, tris = _grid_mesh_3x3()
+        u = pts[:, 0] ** 2 + pts[:, 1] ** 2
+        lap = DifferentialOperators.compute_laplacian_2d_cotangent(u, pts, tris)
+        # Interior node (index 4, at (0.5, 0.5))
+        assert abs(float(lap[4]) - 4.0) < 0.15, f"cotangent lap at centre = {lap[4]}"
+
+    def test_2d_cotangent_vs_gradient_of_gradient_linear(self):
+        """Cotangent and gradient-of-gradient Laplacians agree on linear functions."""
+        pts, tris = _grid_mesh_3x3()
+        u = 3.0 * pts[:, 0] - pts[:, 1]
+        cot = DifferentialOperators.compute_laplacian_2d_cotangent(u, pts, tris)
+        gog = DifferentialOperators.compute_fd_laplacian_2d_simple(u, pts, tris, (0, 1))
+        # Both should give ≈ 0; at the centre node they should be close
+        assert abs(float(cot[4]) - float(gog[4])) < 0.1
+
+    # ── LSQ gradient method parameter on 2D simple function ─────────────────
+
+    def test_2d_gradient_method_lsq_kwarg_dispatches_correctly(self):
+        """compute_fd_gradient_2d_simple with method='least_squares' delegates to compute_gradient_2d_lsq."""
+        pts, tris = _square_mesh()
+        u = 4.0 * pts[:, 0] + pts[:, 1]
+        via_kwarg = DifferentialOperators.compute_fd_gradient_2d_simple(u, pts, tris, 0, method="least_squares")
+        via_direct = DifferentialOperators.compute_gradient_2d_lsq(u, pts, tris, 0)
+        assert jnp.allclose(via_kwarg, via_direct, atol=1e-6)
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 11. FD sub-scheme integration tests on the L-shaped mesh
+#     Exercises the full pipeline: scheme string → parse_fd_scheme → operators
+# ───────────────────────────────────────────────────────────────────────────────
+
+
+class TestFDSubSchemesOnLShape:
+    """Integration tests for 'finite_difference:<method>' scheme strings.
+
+    Uses the same L-shaped mesh as TestFiniteDifferenceOnLShape but exercises
+    the new sub-scheme syntax.  Accuracy expectations are the same: O(h)
+    interior mean error for a coarse mesh.
+    """
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _domain(self, request):
+        dom, x, y, t, pts, interior_mask = _build_l_domain()
+        request.cls.dom = dom
+        request.cls.x = x
+        request.cls.y = y
+        request.cls.pts = pts
+        request.cls.interior_mask = interior_mask
+
+    def _ctx(self):
+        return {"interior": self.pts, "__time__": jnp.array([1.0])}
+
+    # ── scheme node structure ────────────────────────────────────────────────
+
+    def test_lsq_scheme_stored_on_node(self):
+        """u.d(x, scheme='finite_difference:lsq') stores the sub-scheme string."""
+        u = self.x * self.x
+        node = u.d(self.x, scheme="finite_difference:lsq")
+        assert isinstance(node, Jacobian)
+        assert node.scheme == "finite_difference:lsq"
+
+    def test_cotangent_scheme_stored_on_node(self):
+        u = self.x * self.x
+        node = u.laplacian(self.x, self.y, scheme="finite_difference:cotangent")
+        assert isinstance(node, Hessian)
+        assert node.scheme == "finite_difference:cotangent"
+
+    # ── gradient sub-schemes ────────────────────────────────────────────────
+
+    @pytest.mark.parametrize("sub", ["uniform", "inverse_distance", "lsq"])
+    def test_gradient_subscheme_accuracy(self, sub):
+        """∂(x²+y²)/∂x = 2x for all gradient sub-schemes, interior mean error < 0.05."""
+        u = self.x * self.x + self.y * self.y
+        scheme = f"finite_difference:{sub}"
+        du_dx = _eval(u.d(self.x, scheme=scheme), self._ctx())
+        expected = 2.0 * self.pts[:, 0:1]
+        err = float(jnp.mean(jnp.abs(du_dx - expected)[self.interior_mask]))
+        assert err < 0.05, f"scheme='{scheme}': mean interior gradient error = {err:.4f}"
+
+    @pytest.mark.parametrize("sub", ["uniform", "inverse_distance", "lsq"])
+    def test_gradient_subscheme_shape(self, sub):
+        """FD gradient sub-scheme must return (N, 1)."""
+        u = self.x * self.x
+        result = _eval(u.d(self.x, scheme=f"finite_difference:{sub}"), self._ctx())
+        assert result.shape == (self.pts.shape[0], 1)
+
+    def test_lsq_gradient_close_to_area_weighted(self):
+        """LSQ and area-weighted FD gradients should be close on the L-shaped mesh."""
+        u = self.x * self.x + self.y * self.y
+        ctx = self._ctx()
+        aw = _eval(u.d(self.x, scheme="finite_difference"), ctx)
+        lsq = _eval(u.d(self.x, scheme="finite_difference:lsq"), ctx)
+        mean_diff = float(jnp.mean(jnp.abs(aw - lsq)[self.interior_mask]))
+        # They solve the same underlying problem; on a reasonable mesh
+        # the two estimates agree to within a few percent of the gradient magnitude
+        assert mean_diff < 0.1, f"AW vs LSQ mean interior diff = {mean_diff:.4f}"
+
+    # ── Laplacian sub-schemes ────────────────────────────────────────────────
+
+    def test_cotangent_laplacian_accuracy(self):
+        """∇²(x²+y²) = 4: cotangent scheme interior mean error < 0.5."""
+        u = self.x * self.x + self.y * self.y
+        lap = _eval(u.laplacian(self.x, self.y, scheme="finite_difference:cotangent"), self._ctx())
+        err = float(jnp.mean(jnp.abs(lap - 4.0)[self.interior_mask]))
+        assert err < 0.5, f"cotangent laplacian mean error = {err:.4f}"
+
+    def test_cotangent_laplacian_shape(self):
+        """Cotangent Laplacian must return (N, 1)."""
+        u = self.x * self.x + self.y * self.y
+        result = _eval(u.laplacian(self.x, self.y, scheme="finite_difference:cotangent"), self._ctx())
+        assert result.shape == (self.pts.shape[0], 1)
+
+    def test_cotangent_vs_gradient_of_gradient_laplacian(self):
+        """Cotangent and default FD Laplacian estimates must broadly agree."""
+        u = self.x * self.x + self.y * self.y
+        ctx = self._ctx()
+        default_lap = _eval(u.laplacian(self.x, self.y, scheme="finite_difference"), ctx)
+        cot_lap = _eval(u.laplacian(self.x, self.y, scheme="finite_difference:cotangent"), ctx)
+        diff = jnp.abs(default_lap - cot_lap)
+        mean_diff = float(jnp.mean(diff[self.interior_mask]))
+        # Both target ≈ 4; they can differ but should be in the same ballpark
+        assert mean_diff < 2.0, f"default vs cotangent: mean interior diff = {mean_diff:.4f}"
+
+    def test_lsq_laplacian_accuracy(self):
+        """∇²(x²+y²) = 4: 'finite_difference:lsq' interior mean error < 1.0."""
+        u = self.x * self.x + self.y * self.y
+        lap = _eval(u.laplacian(self.x, self.y, scheme="finite_difference:lsq"), self._ctx())
+        err = float(jnp.mean(jnp.abs(lap - 4.0)[self.interior_mask]))
+        assert err < 1.0, f"lsq laplacian mean error = {err:.4f}"

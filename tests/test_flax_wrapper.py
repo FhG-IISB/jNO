@@ -203,7 +203,7 @@ class TestFlaxWrapperInPipeline:
 
     def test_build_single_layer_params_equinox_path(self):
         """FlaxModelWrapper should pass the isinstance(module, eqx.Module) check."""
-        from jno.trace_evaluator import TraceEvaluator
+        from jno.trace_compiler import TraceCompiler
         from jno.utils import get_logger
 
         model = _FlaxMLP(hidden=8, out_dim=1)
@@ -213,7 +213,7 @@ class TestFlaxWrapperInPipeline:
         fm = nn.wrap(wrapped)
 
         logger = get_logger(log_print=(False, False))
-        built = TraceEvaluator.build_single_layer_params(
+        built = TraceCompiler.build_single_layer_params(
             fm,
             arg_shapes=[(5, 3)],
             rng=jax.random.PRNGKey(0),
@@ -369,7 +369,7 @@ class TestDtype:
     def test_cast_model_dtype_flax_wrapper(self):
         """_cast_model_dtype should convert float arrays, leave ints alone."""
         import logging
-        from jno.trace_evaluator import TraceEvaluator
+        from jno.trace_compiler import TraceCompiler
 
         model = _FlaxMLP(hidden=8, out_dim=1)
         rng = jax.random.PRNGKey(0)
@@ -377,7 +377,7 @@ class TestDtype:
         wrapped = FlaxModelWrapper(model.apply, params, deterministic=True)
 
         logger = logging.getLogger("test_dtype")
-        cast = TraceEvaluator._cast_model_dtype(wrapped, jnp.bfloat16, logger)
+        cast = TraceCompiler._cast_model_dtype(wrapped, jnp.bfloat16, logger)
 
         # All float leaves should be bfloat16
         leaves = jax.tree_util.tree_leaves(cast.params)
@@ -388,11 +388,11 @@ class TestDtype:
     def test_cast_model_dtype_equinox(self):
         """_cast_model_dtype should work on plain Equinox modules."""
         import logging
-        from jno.trace_evaluator import TraceEvaluator
+        from jno.trace_compiler import TraceCompiler
 
         model = eqx.nn.Linear(3, 4, key=jax.random.PRNGKey(0))
         logger = logging.getLogger("test_dtype")
-        cast = TraceEvaluator._cast_model_dtype(model, jnp.bfloat16, logger)
+        cast = TraceCompiler._cast_model_dtype(model, jnp.bfloat16, logger)
 
         assert cast.weight.dtype == jnp.bfloat16
         assert cast.bias.dtype == jnp.bfloat16
@@ -400,12 +400,12 @@ class TestDtype:
     def test_dtype_preserves_int_arrays(self):
         """Integer arrays in params must not be cast."""
         import logging
-        from jno.trace_evaluator import TraceEvaluator
+        from jno.trace_compiler import TraceCompiler
 
         params = {"w": jnp.ones((3, 4), dtype=jnp.float32), "idx": jnp.array([1, 2, 3], dtype=jnp.int32)}
         model = FlaxModelWrapper(lambda p, x: x, params)
         logger = logging.getLogger("test_dtype")
-        cast = TraceEvaluator._cast_model_dtype(model, jnp.bfloat16, logger)
+        cast = TraceCompiler._cast_model_dtype(model, jnp.bfloat16, logger)
 
         assert cast.params["w"].dtype == jnp.bfloat16
         assert cast.params["idx"].dtype == jnp.int32

@@ -177,7 +177,7 @@ def laplace1d_solver():
 @pytest.fixture(scope="module")
 def laplace1d_iree(laplace1d_solver):
     """Compile the trained 1-D Laplace PINN to IREEModel."""
-    from jno.trace_evaluator import TraceEvaluator
+    from jno.trace_compiler import TraceCompiler
 
     solver, u = laplace1d_solver
 
@@ -187,7 +187,7 @@ def laplace1d_iree(laplace1d_solver):
     rng = solver.rng
 
     # Build a pure array-in / array-out inference function.
-    fn = TraceEvaluator.compile_traced_expression(u, solver.all_ops)
+    fn = TraceCompiler.compile_traced_expression(u, solver.all_ops)
 
     def infer(x_pts):  # x_pts: (1, 1, N, 1)
         return fn(models, {"interior": x_pts}, batchsize=None, key=rng)

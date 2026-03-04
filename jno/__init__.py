@@ -23,6 +23,8 @@ from .utils.config import (
     setup,
 )
 from .trace_evaluator import TraceEvaluator
+from .trace_compiler import TraceCompiler
+from .differential_operators import DifferentialOperators
 from . import resampling
 from .utils.load_save import save, load
 
@@ -54,6 +56,8 @@ __all__ = [
     "callbacks",
     "logger",
     "TraceEvaluator",
+    "TraceCompiler",
+    "DifferentialOperators",
     "iree",
     "save",
     "load",

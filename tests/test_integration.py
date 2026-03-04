@@ -18,6 +18,7 @@ from jno.trace import (
     collect_operations,
 )
 from jno.trace_evaluator import TraceEvaluator
+from jno.trace_compiler import TraceCompiler
 from tests.conftest import make_var
 
 
@@ -32,7 +33,7 @@ class TestFullPipeline:
         op = OperationDef(expr)
         all_ops = [op]
 
-        compiled = TraceEvaluator.compile_traced_expression(expr, all_ops)
+        compiled = TraceCompiler.compile_traced_expression(expr, all_ops)
         result = compiled({}, {"x": jnp.ones((1, 1))})
         assert jnp.allclose(result, 5.0)
 
@@ -43,7 +44,7 @@ class TestFullPipeline:
         op = OperationDef(expr, [x])
         all_ops = [op]
 
-        compiled = TraceEvaluator.compile_traced_expression(expr, all_ops)
+        compiled = TraceCompiler.compile_traced_expression(expr, all_ops)
         points = {"x": jnp.array([[3.0]])}
         result = compiled({}, points)
         assert jnp.allclose(result, 9.0, atol=0.1)
@@ -62,7 +63,7 @@ class TestFullPipeline:
         # The model is already initialized — just put it in the params dict
         layer_params = {fm.layer_id: module}
 
-        compiled = TraceEvaluator.compile_traced_expression(call, all_ops)
+        compiled = TraceCompiler.compile_traced_expression(call, all_ops)
         points = {"x": jnp.ones((5, 1))}
         result = compiled(layer_params, points)
         # Linear(1,1) output — check last dim or total elements
@@ -77,7 +78,7 @@ class TestFullPipeline:
         op = OperationDef(du_dx, [x])
         all_ops = [op]
 
-        compiled = TraceEvaluator.compile_traced_expression(du_dx, all_ops)
+        compiled = TraceCompiler.compile_traced_expression(du_dx, all_ops)
         points = {"x": jnp.array([[2.0]])}
         result = compiled({}, points)
         assert jnp.allclose(result, 4.0, atol=0.5)
@@ -94,7 +95,7 @@ class TestFullPipeline:
         op = OperationDef(expr, [x])
         all_ops = [op]
 
-        compiled = TraceEvaluator.compile_traced_expression(expr, all_ops)
+        compiled = TraceCompiler.compile_traced_expression(expr, all_ops)
         points = {"x": jnp.array([[5.0]])}
         result = compiled({}, points)
         # 2.0 * 5.0 + 3.0 = 13.0
@@ -109,7 +110,7 @@ class TestFullPipeline:
         op = OperationDef(expr, [x, y])
         all_ops = [op]
 
-        compiled = TraceEvaluator.compile_traced_expression(expr, all_ops)
+        compiled = TraceCompiler.compile_traced_expression(expr, all_ops)
         points = {"x": jnp.array([[1.0]]), "y": jnp.array([[2.0]])}
         result = compiled({}, points)
         assert jnp.allclose(result, 3.0, atol=0.1)

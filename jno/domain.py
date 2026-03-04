@@ -950,8 +950,15 @@ class MeshUtils:
 
             mesh_connectivity["boundary_edges"] = bpe_local
             mesh_connectivity["VM"] = MeshUtils.get_visibility_matrix_raytrace(bp, bpe_local, _bp[0], n_ray_samples=20)
-        else:
+        elif dimension <= 2:
+            # 1-D domains: boundary is just 2 points; ordered visibility still works.
             mesh_connectivity["VM"] = MeshUtils.get_visibility_matrix_ordered(bp, _bp[0])
+        else:
+            # 3-D (and higher): the 2-D ordered visibility algorithm does not
+            # generalise to higher-dimensional boundaries.  Store a trivial
+            # all-visible placeholder so the rest of the pipeline keeps working.
+            n_bp = len(bp)
+            mesh_connectivity["VM"] = np.ones((n_bp, n_bp), dtype=np.float32) - np.eye(n_bp, dtype=np.float32)
 
         msg = f"Preprocessed mesh connectivity: {n_points} points, {len(elements)} {element_type}"
 

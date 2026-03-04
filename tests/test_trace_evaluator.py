@@ -17,6 +17,7 @@ from jno.trace import (
     Hessian,
 )
 from jno.trace_evaluator import TraceEvaluator
+from jno.trace_compiler import TraceCompiler
 from tests.conftest import make_var
 
 
@@ -316,7 +317,7 @@ class TestCompileTracedExpression:
         op = OperationDef(lit)
         all_ops = [op]
 
-        compiled = TraceEvaluator.compile_traced_expression(lit, all_ops)
+        compiled = TraceCompiler.compile_traced_expression(lit, all_ops)
         # compiled(params, context, batchsize, key)
         result = compiled({}, make_points())
         assert jnp.allclose(result, 99.0)
@@ -329,7 +330,7 @@ class TestCompileTracedExpression:
         op = OperationDef(expr)
         all_ops = [op]
 
-        compiled = TraceEvaluator.compile_traced_expression(expr, all_ops)
+        compiled = TraceCompiler.compile_traced_expression(expr, all_ops)
         result = compiled({}, make_points())
         assert jnp.allclose(result, 7.0)
 
@@ -349,7 +350,7 @@ class TestEvalGradient:
         op = OperationDef(grad_u, [x])
         all_ops = [op]
 
-        compiled = TraceEvaluator.compile_traced_expression(grad_u, all_ops)
+        compiled = TraceCompiler.compile_traced_expression(grad_u, all_ops)
         points = {"x": jnp.array([[3.0]])}
         result = compiled({}, points)
         assert jnp.allclose(result, 6.0, atol=0.1)

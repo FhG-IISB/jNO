@@ -35,6 +35,7 @@ from .utils import LearningRateSchedule, WeightSchedule, statistics, get_logger,
 from .utils.monitor import HardwareMonitor
 from .domain import domain, DomainData
 from .trace_evaluator import TraceEvaluator
+from .trace_compiler import TraceCompiler
 from .tuner import ArchSpace, DeviceConfig, Tuner
 from .architectures.lora_linear import (
     apply_lora as _apply_lora,
@@ -262,11 +263,11 @@ class core:
 
     def _collect_flax_modules(self) -> Dict[int, Model]:
         """Return ``{layer_id: Model}`` for every model in the problem."""
-        from .trace_evaluator import TraceEvaluator
+        from .trace_compiler import TraceCompiler
 
         result = {}
         for op in self.all_ops:
-            for layer, _ in TraceEvaluator.collect_dense_layers(op.expr):
+            for layer, _ in TraceCompiler.collect_dense_layers(op.expr):
                 if isinstance(layer, Model) and layer.layer_id not in result:
                     result[layer.layer_id] = layer
         return result
@@ -515,7 +516,7 @@ class core:
         tensor_dims = self.compute_tensor_dims(self.domain)
 
         # === Initialize models ===
-        self.models, self.rng = TraceEvaluator.init_layer_params(self.all_ops, self.domain_data.dimension, tensor_dims, self.rng, self.log)
+        self.models, self.rng = TraceCompiler.init_layer_params(self.all_ops, self.domain_data.dimension, tensor_dims, self.rng, self.log)
 
         # === Apply sharding to model arrays ===
         self.models = self._shard_params(self.models)
@@ -537,7 +538,7 @@ class core:
                 inner = expr.expr
 
             if tracker_interval is not None:
-                fn_expr = TraceEvaluator.compile_traced_expression(inner, self.all_ops)
+                fn_expr = TraceCompiler.compile_traced_expression(inner, self.all_ops)
                 self.compiled_trackers.append((tracker_interval, fn_expr))
                 self._tracker_exprs.append(inner)
             else:
@@ -546,7 +547,7 @@ class core:
 
         # Compile all normal constraints in ONE combined function so XLA
         # can apply CSE across shared sub-expressions.
-        self.compiled_constraints_fn = TraceEvaluator.compile_multi_expression(constraint_exprs, self.all_ops)
+        self.compiled_constraints_fn = TraceCompiler.compile_multi_expression(constraint_exprs, self.all_ops)
         self.n_constraints = len(constraint_exprs)
 
         # self.log.info(f"There are a total of {self.count(self.models)} trainable parameters in the network/s.")
@@ -1054,7 +1055,7 @@ class core:
         parent_exprs = [_unwrap(expr) for expr in constraint_exprs]
         # Only compile the parent layer if at least one expr has a parent
         if any(name is not None for _, name in parent_exprs):
-            parent_fn = TraceEvaluator.compile_multi_expression([e for e, _ in parent_exprs], self.all_ops)
+            parent_fn = TraceCompiler.compile_multi_expression([e for e, _ in parent_exprs], self.all_ops)
             parent_shape = jax.eval_shape(
                 lambda: parent_fn(
                     self.models,
@@ -1090,7 +1091,7 @@ class core:
             if tracker_expr is not None and isinstance(tracker_expr, OperationDef):
                 tracker_expr = tracker_expr.expr
             if tracker_expr is not None and isinstance(tracker_expr, FunctionCall):
-                t_parent_fn = TraceEvaluator.compile_multi_expression([tracker_expr.args[0]], self.all_ops)
+                t_parent_fn = TraceCompiler.compile_multi_expression([tracker_expr.args[0]], self.all_ops)
                 t_parent_shape = jax.eval_shape(
                     lambda: t_parent_fn(
                         self.models,
@@ -1240,7 +1241,7 @@ class core:
         """
         domain_data = self.domain_data if domain is None else self.prepare_domain_data(domain)
 
-        fn = TraceEvaluator.compile_traced_expression(operation, self.all_ops)
+        fn = TraceCompiler.compile_traced_expression(operation, self.all_ops)
         result = fn(
             self.models,
             domain_data.context,
