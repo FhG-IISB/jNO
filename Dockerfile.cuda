@@ -1,0 +1,48 @@
+# syntax=docker/dockerfile:1
+# ------------------------------------------------------------
+# jNO – CUDA image (linux/amd64, Ubuntu 22.04, CUDA 12)
+#
+# Requires NVIDIA GPU + NVIDIA Container Toolkit:
+#   docker run --gpus all ghcr.io/<owner>/jno:latest-cuda
+# ------------------------------------------------------------
+FROM --platform=linux/amd64 nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# ---- system dependencies + Python 3.12 ----
+# Ubuntu 22.04 ships Python 3.10; add deadsnakes PPA for 3.12
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        software-properties-common \
+        curl \
+    && add-apt-repository ppa:deadsnakes/ppa \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 \
+        python3.12-dev \
+        python3.12-venv \
+        git \
+        build-essential \
+        libglu1-mesa \
+        libgl1-mesa-glx \
+        libxrender1 \
+        libxcursor1 \
+        libxft2 \
+        libxinerama1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
+    && update-alternatives --install /usr/bin/python  python  /usr/bin/python3.12 1
+
+# ---- install uv ----
+RUN curl -Ls https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+WORKDIR /app
+
+# ---- copy source + metadata ----
+COPY pyproject.toml README.md ./
+COPY jno/ ./jno/
+
+# ---- install package + CUDA-enabled JAX ----
+RUN uv pip install --system ".[dev]" "jax[cuda12]"
+
+# ---- default entrypoint ----
+CMD ["python", "-c", "import jax; import jno; print('jNO CUDA ready, devices:', jax.devices())"]
