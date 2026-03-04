@@ -12,7 +12,7 @@
             "console": "integratedTerminal",
             "python": "${workspaceFolder}/.venv/bin/python",
             "env": {
-                "CUDA_VISIBLE_DEVICES": "6"
+                "CUDA_VISIBLE_DEVICES": "1"
             }
         }
     ]

@@ -1,50 +1,48 @@
+import jax
 import jno
 import jno.numpy as jnn
-import flax.linen as nn
 import optax
+from jno import LearningRateSchedule as lrs
 
 π = jnn.pi
-sin = jnn.sin
 
 # Logging
-dire = "./runs/laplace1D"
-jno.logger(dire)
+dire = jno.setup(__file__)
 
 # Domain
-tst_domain = jno.domain(constructor=jno.domain.line(mesh_size=0.001))
-domain = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.01))
-(x,) = domain.variable("interior")
+domain = jno.domain(constructor=jno.domain.line(mesh_size=0.01))
+x, t = domain.variable("interior")
 
 # Analytical
-_u = -(1 / (π**2)) * sin(π * x)
+_u = -(1 / (π**2)) * jnn.sin(π * x)
 
 # Neural Network
-u = jnn.nn.mlp(hidden_dims=64, num_layers=3)(x) * x * (1 - x)
+u_net = jnn.nn.mlp(
+    in_features=1,
+    hidden_dims=32,
+    num_layers=3,
+    key=jax.random.PRNGKey(0),
+).optimizer(optax.adamw(1), lr=lrs.exponential(1e-3, 0.3, 1_000, 1e-4))
+
+u = u_net(x) * x * (1 - x)
 
 # Constraints
-pde = jnn.laplacian(u, [x]) - sin(π * x)  # 2D heat equation
+pde = jnn.grad(jnn.grad(u, x), x) - jnn.sin(π * x)  # 1D Laplace equation
 con = jnn.tracker(jnn.mean(u - _u))
 
-
-# Solve
-crux = jno.core([pde, con], domain)
-crux.solve(10_000, optax.adam, jno.schedule.learning_rate.exponential(1e-3, 0.8, 10_000, 1e-5)).plot(f"{dire}/training_history.png")
-
-crux.plot(operation=u - _u, test_pts=tst_domain).savefig(f"{dire}/u_erro.png", dpi=300)
-crux.errors.all([u], [_u], test_pts=tst_domain)
-
-# Finetune using LoRA
-crux.solve(
-    10_000,
-    optax.adam,
-    jno.schedule.learning_rate.exponential(1e-3, 0.8, 10_000, 1e-5),
-    lora=jno.create_rank_dict(crux.params, rank=1, alpha=1.0),
-).plot(f"{dire}/training_history_lora.png")
-
-# pred = crux.eval(u)
-crux.plot(operation=u - _u, test_pts=tst_domain).savefig(f"{dire}/u_erro_lora.png", dpi=300)
-crux.plot(operation=u, test_pts=tst_domain).savefig(f"{dire}/u_pred.png", dpi=300)
-crux.errors.all([u], [_u], test_pts=tst_domain)
-
-# Save
+# Solve & Save
+crux = jno.core([pde.mse, con], domain)
+crux.solve(1_000).plot(f"{dire}/training_history.png")
 crux.save(f"{dire}/crux.pkl")
+
+
+pred = crux.eval(u)
+true = crux.eval(_u)
+
+import matplotlib.pyplot as plt
+
+plt.figure()
+plt.plot(pred[0, :, 0])
+plt.plot(true[0, :, 0])
+
+plt.savefig(f"{dire}/solution.png")

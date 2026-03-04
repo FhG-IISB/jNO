@@ -82,10 +82,10 @@ References
 .. [4] Herde et al. "Poseidon: Efficient Foundation Models for PDEs" (2024)
 """
 
-from flax import linen as ln
-from typing import Callable, Optional, Tuple, Sequence, Literal, List, Union
+import equinox as eqx
+import jax
 import jax.numpy as jnp
-from jax_poseidon import ScOT, ScOTConfig
+from typing import Callable, Optional, Tuple, Sequence, Literal, List, Union, Any
 
 from .mlp import MLP
 from .fno import FNO1D, FNO2D, FNO3D
@@ -93,18 +93,21 @@ from .unet import UNet1D, UNet2D, UNet3D
 from .pointnet import PointNet
 from .deeponet import DeepONet
 from .transformer import Transformer
-from .pcno import PCNO, compute_Fourier_modes
+from .pcno import PCNO, compute_Fourier_modes as pcno_compute_Fourier_modes
 from .mgno import MgNO, MgNO1D
-from .geofno import GeoFNO, compute_Fourier_modes
+from .geofno import GeoFNO, compute_Fourier_modes as geofno_compute_Fourier_modes
 from .pit import PiT, PiTWithCoords
 from .gnot import CGPTNO, GNOT, MoEGPTNO
 from .cno import CNO2D
+from .common import FlaxModelWrapper, FlaxNNXWrapper
+from .linear import Linear
+from .lora_linear import LoRALinear
 
 from ..tuner import ArchSpace
-from ..trace import FlaxModule, TunableModule
+from ..trace import Model, TunableModule
 
 
-def parameter(shape: tuple, init: Callable = ln.initializers.zeros, name: str = "value") -> FlaxModule:
+def parameter(shape: tuple, *, key: jax.Array, init: Callable = jax.nn.initializers.zeros, name: str = "value") -> Model:
     """
     Create a trainable parameter tensor.
 
@@ -113,26 +116,29 @@ def parameter(shape: tuple, init: Callable = ln.initializers.zeros, name: str = 
 
     Args:
         shape: Shape of the parameter tensor.
-        init: Initializer function. Default: zeros.
-        name: Name of the parameter in the module. Default: "value".
+        key: JAX PRNG key for initialization.
+        init: Initializer function ``(key, shape) -> array``. Default: zeros.
+        name: Name of the parameter (used for display). Default: "value".
 
     Returns:
-        FlaxModule: A wrapped module that returns the parameter when called.
+        Model: A wrapped module that returns the parameter when called.
 
     Example:
+        >>> key = jax.random.PRNGKey(0)
         >>> # Learnable diffusion coefficient
-        >>> D = parameter((1,), init=ln.initializers.ones, name="diffusivity")
+        >>> D = parameter((1,), key=key, init=jax.nn.initializers.ones)
         >>>
         >>> # Learnable 2D tensor
-        >>> K = parameter((3, 3), name="stiffness_matrix")
+        >>> K = parameter((3, 3), key=key)
     """
 
-    class Parameter(ln.Module):
-        @ln.compact
-        def __call__(self):
-            return self.param(name, init, shape)
+    class _Parameter(eqx.Module):
+        value: jnp.ndarray
 
-    return nn.wrap(Parameter())
+        def __call__(self):
+            return self.value
+
+    return nn.wrap(_Parameter(value=init(key, shape)))
 
 
 class nn:
@@ -140,7 +146,7 @@ class nn:
     Neural network factory class providing unified interface for model creation.
 
     This class contains class methods for instantiating various neural operator
-    architectures with sensible defaults. All methods return a `FlaxModule`
+    architectures with sensible defaults. All methods return a `Model`
     wrapper that integrates with the pino training pipeline.
 
     The factory pattern allows:
@@ -167,47 +173,47 @@ class nn:
 
     """
 
+    def linear(in_features: int, out_features: int, use_bias: bool = True, *, key: Any):
+        return Linear(in_features, out_features, use_bias, key=key)
+
     # =========================================================================
     # Core Wrapping Methods
     # =========================================================================
 
     @classmethod
-    def wrap(cls, module: Union[ln.Module, type], space: ArchSpace = None, name: str = "", weight_path: str = None) -> Union[FlaxModule, TunableModule]:
+    def wrap(cls, module, space: ArchSpace = None, name: str = "", weight_path: str = None) -> Union[Model, TunableModule]:
         """
-        Wrap a Flax module for use in the pino pipeline.
+        Wrap a module for use in the jno pipeline.
 
         This is the primary method for integrating custom architectures into
-        the pino framework. It handles both standard wrapping and architecture
+        the jno framework. It handles both standard wrapping and architecture
         search scenarios.
 
         Args:
-            module: Either a `ln.Module` instance (for standard use) or a
-                `ln.Module` class (when using architecture search).
-            space: Optional `ArchSpace` for hyperparameter tuning. When provided,
-                `module` must be a class, not an instance.
+            module: An ``eqx.Module`` instance (for standard use), a legacy
+                Flax ``nn.Module``, or a class (for architecture search).
+            space: Optional ``ArchSpace`` for hyperparameter tuning. When
+                provided, ``module`` must be a class, not an instance.
+            name: Optional display name.
+            weight_path: Optional path to pretrained weights.
 
         Returns:
-            FlaxModule: Standard wrapped module (when space=None).
+            Model: Standard wrapped module (when space=None).
             TunableModule: Tunable module for architecture search (when space provided).
 
         Raises:
-            ValueError: If `space` is provided but `module` is an instance.
+            ValueError: If ``space`` is provided but ``module`` is an instance.
 
         Example:
-            >>> # Standard wrapping of a custom module
-            >>> class MyOperator(ln.Module):
-            ...     @ln.compact
+            >>> # Wrap a custom equinox module
+            >>> class MyOperator(eqx.Module):
+            ...     linear: eqx.nn.Linear
+            ...     def __init__(self, in_dim, out_dim, *, key):
+            ...         self.linear = eqx.nn.Linear(in_dim, out_dim, key=key)
             ...     def __call__(self, x):
-            ...         return ln.Dense(1)(x)
+            ...         return self.linear(x)
             >>>
-            >>> model = nn.wrap(MyOperator())
-            >>>
-            >>> # Architecture search with tunable hyperparameters
-            >>> space = ArchSpace(
-            ...     hidden_dim=Choice([64, 128, 256]),
-            ...     n_layers=Choice([2, 3, 4]),
-            ... )
-            >>> tunable_model = nn.wrap(MyOperator, space=space)  # Note: class, not instance
+            >>> model = nn.wrap(MyOperator(2, 1, key=jax.random.PRNGKey(0)))
         """
         if space is not None:
             if isinstance(module, type):
@@ -215,7 +221,22 @@ class nn:
             else:
                 raise ValueError("When space= is provided, module must be a CLASS (not instance). " "Use: pnp.nn.wrap(MLP, space=space) not pnp.nn.wrap(MLP(), space=space)")
         else:
-            return FlaxModule(module, name, weight_path)
+            # Auto-detect flax.nnx modules and wrap in FlaxNNXWrapper so the
+            # equinox partition / optimizer / LoRA / mask machinery works.
+            try:
+                from flax import nnx as _nnx
+
+                if isinstance(module, _nnx.Module):
+                    module = FlaxNNXWrapper(module)
+            except ImportError:
+                pass
+            return Model(module, name, weight_path)
+
+    @classmethod
+    def flaxwrap(cls, module, input, key) -> Model:
+        params = module.init({"params": key}, *input)
+        wrapped = FlaxModelWrapper(module.apply, params)
+        return cls.wrap(wrapped)
 
     # =========================================================================
     # Basic Architectures
@@ -224,19 +245,20 @@ class nn:
     @classmethod
     def mlp(
         cls,
+        in_features: int,
         output_dim: int = 1,
-        activation: Callable = ln.tanh,
+        activation: Callable = jnp.tanh,
         hidden_dims: Union[int, Sequence[int]] = 64,
         num_layers: int = 2,
         output_activation: Optional[Callable] = None,
         use_bias: bool = True,
-        kernel_init: Callable = ln.initializers.lecun_normal(),
-        bias_init: Callable = ln.initializers.zeros,
         dropout_rate: float = 0.0,
         batch_norm: bool = False,
         layer_norm: bool = False,
         final_layer_bias: bool = True,
-    ) -> FlaxModule:
+        *,
+        key: jax.Array,
+    ) -> Model:
         """
         Create a Multi-Layer Perceptron (MLP).
 
@@ -249,49 +271,54 @@ class nn:
             Input → [Dense → Norm → Activation → Dropout] × N → Dense → Output
 
         Args:
+            in_features: Number of input features (last axis of concatenated
+                inputs).
             output_dim: Number of output features. Default: 1.
             activation: Activation function for hidden layers.
-                Common choices: `ln.relu`, `ln.gelu`, `ln.tanh`, `ln.silu`.
-                Default: `ln.tanh`.
+                Common choices: ``jax.nn.relu``, ``jax.nn.gelu``,
+                ``jnp.tanh``, ``jax.nn.silu``.
+                Default: ``jnp.tanh``.
             hidden_dims: Width of hidden layers. Can be:
-                - `int`: All layers have the same width.
-                - `Sequence[int]`: Specify width per layer.
+                - ``int``: All layers have the same width.
+                - ``Sequence[int]``: Specify width per layer.
 
                 Default: 64.
-            num_layers: Number of hidden layers. Ignored if `hidden_dims` is
+            num_layers: Number of hidden layers. Ignored if ``hidden_dims`` is
                 a sequence. Default: 2.
             output_activation: Optional activation for the output layer.
-                Use `ln.sigmoid` for [0,1] outputs, `ln.softplus` for positive
-                outputs. Default: None (linear output).
+                Use ``jax.nn.sigmoid`` for [0,1] outputs, ``jax.nn.softplus``
+                for positive outputs. Default: None (linear output).
             use_bias: Include bias in hidden layers. Default: True.
-            kernel_init: Weight initializer. Default: lecun_normal().
-            bias_init: Bias initializer. Default: zeros.
             dropout_rate: Dropout probability (0 = disabled). Default: 0.0.
             batch_norm: Apply batch normalization. Default: False.
             layer_norm: Apply layer normalization. Default: False.
             final_layer_bias: Include bias in output layer. Default: True.
+            key: JAX PRNG key for weight initialization.
 
         Returns:
-            FlaxModule: Wrapped MLP model.
+            Model: Wrapped MLP model.
 
         Raises:
             ValueError: If both `batch_norm` and `layer_norm` are True.
 
         Example:
+            >>> key = jax.random.PRNGKey(0)
             >>> # Simple regression MLP
-            >>> model = nn.mlp(output_dim=1, hidden_dims=64, num_layers=3)
+            >>> model = nn.mlp(2, output_dim=1, hidden_dims=64, num_layers=3, key=key)
             >>>
             >>> # Classification with softmax output
             >>> model = nn.mlp(
+            ...     10,
             ...     output_dim=10,
-            ...     activation=ln.relu,
+            ...     activation=jax.nn.relu,
             ...     hidden_dims=[256, 128, 64],
-            ...     output_activation=ln.softmax,
+            ...     output_activation=jax.nn.softmax,
             ...     layer_norm=True,
+            ...     key=key,
             ... )
             >>>
             >>> # Positive output (e.g., variance prediction)
-            >>> model = nn.mlp(output_dim=1, output_activation=ln.softplus)
+            >>> model = nn.mlp(2, output_dim=1, output_activation=jax.nn.softplus, key=key)
 
         Note:
             MLPs concatenate all inputs along the feature axis, making them
@@ -308,7 +335,20 @@ class nn:
             if len(layer_widths) != num_layers and num_layers != 2:
                 raise ValueError(f"Length of hidden_dims ({len(layer_widths)}) must match " f"num_layers ({num_layers}) when both are specified.")
 
-        inst = MLP(output_dim, activation, hidden_dims, num_layers, output_activation, use_bias, kernel_init, bias_init, dropout_rate, batch_norm, layer_norm, final_layer_bias)
+        inst = MLP(
+            in_features,
+            output_dim,
+            activation,
+            hidden_dims,
+            num_layers,
+            output_activation,
+            use_bias,
+            dropout_rate,
+            batch_norm,
+            layer_norm,
+            final_layer_bias,
+            key=key,
+        )
 
         return cls.wrap(inst)
 
@@ -327,8 +367,9 @@ class nn:
         N_res_neck: int = 4,
         channel_multiplier: int = 16,
         use_bn: bool = True,
-        training: bool = True,
-    ) -> FlaxModule:
+        *,
+        key: jax.Array,
+    ) -> Model:
         """
         Create a 2D Continuous Neural Operator (CNO).
 
@@ -370,7 +411,7 @@ class nn:
             training: Training mode flag (affects batch norm). Default: True.
 
         Returns:
-            FlaxModule: Wrapped CNO2D model.
+            Model: Wrapped CNO2D model.
 
         Example:
             >>> # Darcy flow: permeability → pressure
@@ -417,7 +458,7 @@ class nn:
             N_res_neck=N_res_neck,
             channel_multiplier=channel_multiplier,
             use_bn=use_bn,
-            training=training,
+            key=key,
         )
 
         return cls.wrap(model)
@@ -429,17 +470,20 @@ class nn:
     @classmethod
     def fno1d(
         cls,
+        in_features: int,
         hidden_channels: int,
         n_modes: int,
         d_vars: int = 1,
         linear_conv: bool = True,
         n_layers: int = 4,
         n_steps: int = 1,
-        activation: Callable = ln.gelu,
+        activation: Callable = jax.nn.gelu,
         norm: Optional[str] = None,
         training: bool = True,
         dropout_rate: float = 0.0,
-    ) -> FlaxModule:
+        *,
+        key: jax.Array,
+    ) -> Model:
         """
         Create a 1D Fourier Neural Operator.
 
@@ -462,14 +506,14 @@ class nn:
             n_layers: Number of spectral convolution layers. Default: 4.
             n_steps: Number of output time steps (for autoregressive rollout).
                 Default: 1.
-            activation: Activation function. Default: `ln.gelu`.
+            activation: Activation function. Default: `jax.nn.gelu`.
             norm: Normalization type ('layer', 'batch', 'instance', None).
                 Default: None.
             training: Training mode flag. Default: True.
             dropout_rate: Dropout probability. Default: 0.0.
 
         Returns:
-            FlaxModule: Wrapped FNO1D model.
+            Model: Wrapped FNO1D model.
 
         Example:
             >>> # Burgers equation: u(x,0) → u(x,T)
@@ -496,6 +540,7 @@ class nn:
         norm_type = norm[0] if isinstance(norm, tuple) else norm
 
         model_instance = FNO1D(
+            in_features=in_features,
             hidden_channels=hidden_channels,
             n_modes=n_modes,
             d_vars=d_vars,
@@ -505,6 +550,8 @@ class nn:
             activation=activation,
             norm=norm_type,
             training=training,
+            dropout_rate=dropout_rate,
+            key=key,
         )
 
         return cls.wrap(model_instance)
@@ -512,18 +559,21 @@ class nn:
     @classmethod
     def fno2d(
         cls,
+        in_features: int,
         hidden_channels: int = 32,
         n_modes: int = 16,
         d_vars: int = 1,
         n_layers: int = 4,
         n_steps: int = 1,
         d_model: Tuple[int, int] = (64, 64),
-        activation: Callable = ln.gelu,
+        activation: Callable = jax.nn.gelu,
         norm: Optional[str] = "layer",
         training: bool = True,
         use_positions: bool = False,
         linear_conv: bool = True,
-    ) -> FlaxModule:
+        *,
+        key: jax.Array,
+    ) -> Model:
         """
         Create a 2D Fourier Neural Operator.
 
@@ -543,7 +593,7 @@ class nn:
             n_steps: Output time steps. Default: 1.
             d_model: Spatial dimensions (H, W). Used for positional encoding.
                 Default: (64, 64).
-            activation: Activation function. Default: `ln.gelu`.
+            activation: Activation function. Default: `jax.nn.gelu`.
             norm: Normalization ('layer', 'batch', 'instance', None).
                 Default: 'layer'.
             training: Training mode. Default: True.
@@ -552,7 +602,7 @@ class nn:
                 Default: True.
 
         Returns:
-            FlaxModule: Wrapped FNO2D model.
+            Model: Wrapped FNO2D model.
 
         Example:
             >>> # Darcy flow: permeability → pressure
@@ -578,6 +628,7 @@ class nn:
 
         """
         fno = FNO2D(
+            in_features=in_features,
             hidden_channels=hidden_channels,
             n_modes=n_modes,
             d_vars=d_vars,
@@ -589,6 +640,7 @@ class nn:
             training=training,
             use_positions=use_positions,
             linear_conv=linear_conv,
+            key=key,
         )
 
         return cls.wrap(fno)
@@ -596,19 +648,22 @@ class nn:
     @classmethod
     def fno3d(
         cls,
+        in_features: int,
         hidden_channels: int = 32,
         n_modes: int = 12,
         d_vars: int = 1,
         n_layers: int = 4,
         n_steps: int = 1,
         d_model: Tuple[int, int, int] = (32, 32, 32),
-        activation: Callable = ln.gelu,
+        activation: Callable = jax.nn.gelu,
         norm: Optional[str] = "layer",
         training: bool = True,
         use_positions: bool = False,
         linear_conv: bool = True,
         dropout_rate: float = 0.0,
-    ) -> FlaxModule:
+        *,
+        key: jax.Array,
+    ) -> Model:
         """
         Create a 3D Fourier Neural Operator.
 
@@ -622,7 +677,7 @@ class nn:
             n_layers: Number of spectral layers. Default: 4.
             n_steps: Output time steps. Default: 1.
             d_model: Spatial dimensions (D, H, W). Default: (32, 32, 32).
-            activation: Activation function. Default: `ln.gelu`.
+            activation: Activation function. Default: `jax.nn.gelu`.
             norm: Normalization type. Default: 'layer'.
             training: Training mode. Default: True.
             use_positions: Add coordinate grid to input. Default: False.
@@ -630,7 +685,7 @@ class nn:
             dropout_rate: Dropout probability. Default: 0.0.
 
         Returns:
-            FlaxModule: Wrapped FNO3D model.
+            Model: Wrapped FNO3D model.
 
         Example:
             >>> # 3D elasticity
@@ -645,6 +700,7 @@ class nn:
             consider using factorized variants or reducing n_modes.
         """
         fno = FNO3D(
+            in_features=in_features,
             hidden_channels=hidden_channels,
             n_modes=n_modes,
             d_vars=d_vars,
@@ -657,6 +713,7 @@ class nn:
             use_positions=use_positions,
             linear_conv=linear_conv,
             dropout_rate=dropout_rate,
+            key=key,
         )
 
         return cls.wrap(fno)
@@ -676,7 +733,9 @@ class nn:
         in_dim: int = 3,
         out_dim: int = 1,
         act: str = "gelu",
-    ) -> FlaxModule:
+        *,
+        key: jax.Array,
+    ) -> Model:
         """
         Create a Geometry-aware Fourier Neural Operator.
 
@@ -706,7 +765,7 @@ class nn:
             act: Activation function name. Default: 'gelu'.
 
         Returns:
-            FlaxModule: Wrapped GeoFNO model.
+            Model: Wrapped GeoFNO model.
 
         Example:
             >>> # 2D problem on irregular domain
@@ -729,7 +788,7 @@ class nn:
             - `pcno`: Alternative for point cloud data
 
         """
-        modes = compute_Fourier_modes(ndims, list(nks), list(Ls))
+        modes = geofno_compute_Fourier_modes(ndims, list(nks), list(Ls))
         modes = jnp.array(modes)
 
         model = GeoFNO(
@@ -740,6 +799,7 @@ class nn:
             in_dim=in_dim,
             out_dim=out_dim,
             act=act,
+            key=key,
         )
 
         return cls.wrap(model)
@@ -754,7 +814,9 @@ class nn:
         in_dim: int = 2,
         out_dim: int = 1,
         act: str = "gelu",
-    ) -> FlaxModule:
+        *,
+        key: jax.Array,
+    ) -> Model:
         """
         Create a 1D Geometry-aware FNO.
 
@@ -770,7 +832,7 @@ class nn:
             act: Activation function. Default: 'gelu'.
 
         Returns:
-            FlaxModule: Wrapped 1D GeoFNO model.
+            Model: Wrapped 1D GeoFNO model.
         """
         return cls.geofno(
             ndims=1,
@@ -781,6 +843,7 @@ class nn:
             in_dim=in_dim,
             out_dim=out_dim,
             act=act,
+            key=key,
         )
 
     @classmethod
@@ -793,7 +856,9 @@ class nn:
         in_dim: int = 3,
         out_dim: int = 1,
         act: str = "gelu",
-    ) -> FlaxModule:
+        *,
+        key: jax.Array,
+    ) -> Model:
         """
         Create a 2D Geometry-aware FNO.
 
@@ -809,7 +874,7 @@ class nn:
             act: Activation function. Default: 'gelu'.
 
         Returns:
-            FlaxModule: Wrapped 2D GeoFNO model.
+            Model: Wrapped 2D GeoFNO model.
 
         Example:
             >>> # Flow around airfoil (irregular mesh)
@@ -829,6 +894,7 @@ class nn:
             in_dim=in_dim,
             out_dim=out_dim,
             act=act,
+            key=key,
         )
 
     @classmethod
@@ -841,7 +907,9 @@ class nn:
         in_dim: int = 4,
         out_dim: int = 1,
         act: str = "gelu",
-    ) -> FlaxModule:
+        *,
+        key: jax.Array,
+    ) -> Model:
         """
         Create a 3D Geometry-aware FNO.
 
@@ -857,7 +925,7 @@ class nn:
             act: Activation function. Default: 'gelu'.
 
         Returns:
-            FlaxModule: Wrapped 3D GeoFNO model.
+            Model: Wrapped 3D GeoFNO model.
         """
         return cls.geofno(
             ndims=3,
@@ -868,6 +936,7 @@ class nn:
             in_dim=in_dim,
             out_dim=out_dim,
             act=act,
+            key=key,
         )
 
     @classmethod
@@ -884,7 +953,9 @@ class nn:
         inv_L_scale_max: float = 2.0,
         train_inv_L_scale: bool = True,
         act: str = "gelu",
-    ) -> FlaxModule:
+        *,
+        key: jax.Array,
+    ) -> Model:
         """
         Create a Point Cloud Neural Operator.
 
@@ -914,7 +985,7 @@ class nn:
             act: Activation function. Default: 'gelu'.
 
         Returns:
-            FlaxModule: Wrapped PCNO model.
+            Model: Wrapped PCNO model.
 
         Example:
             >>> # 2D point cloud with 16 modes
@@ -938,7 +1009,7 @@ class nn:
             "Point Cloud Neural Operator" - PKU-CMEGroup
             https://github.com/PKU-CMEGroup/NeuralOperator
         """
-        modes = compute_Fourier_modes(ndims, nks, Ls)
+        modes = pcno_compute_Fourier_modes(ndims, nks, Ls)
         modes = jnp.array(modes)
         nmeasures = len(nks) // ndims
 
@@ -954,6 +1025,7 @@ class nn:
             inv_L_scale_max=inv_L_scale_max,
             train_inv_L_scale=train_inv_L_scale,
             act=act,
+            key=key,
         )
 
         return cls.wrap(model)
@@ -978,8 +1050,9 @@ class nn:
         ffn_dropout: float = 0.0,
         attn_dropout: float = 0.0,
         horiz_fourier_dim: int = 0,
-        deterministic: bool = True,
-    ) -> "FlaxModule":
+        *,
+        key: jax.Array,
+    ) -> "Model":
         """
         Create a Cross-attention GPT Neural Operator (CGPTNO).
 
@@ -1021,7 +1094,7 @@ class nn:
             deterministic: Disable dropout (for inference). Default: True.
 
         Returns:
-            FlaxModule: Wrapped CGPTNO model.
+            Model: Wrapped CGPTNO model.
 
         Example:
             >>> # 2D Darcy flow with single input
@@ -1062,7 +1135,7 @@ class nn:
             ffn_dropout=ffn_dropout,
             attn_dropout=attn_dropout,
             horiz_fourier_dim=horiz_fourier_dim,
-            deterministic=deterministic,
+            key=key,
         )
         return cls.wrap(model)
 
@@ -1084,8 +1157,9 @@ class nn:
         ffn_dropout: float = 0.0,
         attn_dropout: float = 0.0,
         horiz_fourier_dim: int = 0,
-        deterministic: bool = True,
-    ) -> "FlaxModule":
+        *,
+        key: jax.Array,
+    ) -> "Model":
         """
         Create a General Neural Operator Transformer (GNOT).
 
@@ -1127,7 +1201,7 @@ class nn:
             deterministic: Disable dropout. Default: True.
 
         Returns:
-            FlaxModule: Wrapped GNOT model.
+            Model: Wrapped GNOT model.
 
         Example:
             >>> # 2D problem with MoE
@@ -1171,7 +1245,7 @@ class nn:
             ffn_dropout=ffn_dropout,
             attn_dropout=attn_dropout,
             horiz_fourier_dim=horiz_fourier_dim,
-            deterministic=deterministic,
+            key=key,
         )
         return cls.wrap(model)
 
@@ -1192,8 +1266,9 @@ class nn:
         ffn_dropout: float = 0.0,
         attn_dropout: float = 0.0,
         horiz_fourier_dim: int = 0,
-        deterministic: bool = True,
-    ) -> "FlaxModule":
+        *,
+        key: jax.Array,
+    ) -> "Model":
         """
         Create a single-input MoE GPT Neural Operator.
 
@@ -1218,7 +1293,7 @@ class nn:
             deterministic: Disable dropout. Default: True.
 
         Returns:
-            FlaxModule: Wrapped MoEGPTNO model.
+            Model: Wrapped MoEGPTNO model.
 
         Example:
             >>> model = nn.moegptno(
@@ -1243,7 +1318,7 @@ class nn:
             ffn_dropout=ffn_dropout,
             attn_dropout=attn_dropout,
             horiz_fourier_dim=horiz_fourier_dim,
-            deterministic=deterministic,
+            key=key,
         )
         return cls.wrap(model)
 
@@ -1261,10 +1336,11 @@ class nn:
         norm: str = "batch",
         up_mode: str = "upconv",
         groups: int = 1,
-        activation: Callable = ln.celu,
+        activation: Callable = jax.nn.celu,
         padding_mode: str = "circular",
-        training: bool = True,
-    ) -> FlaxModule:
+        *,
+        key: jax.Array,
+    ) -> Model:
         """
         Create a 1D U-Net.
 
@@ -1305,12 +1381,12 @@ class nn:
 
                 Default: 'upconv'.
             groups: Groups for grouped convolutions. Default: 1.
-            activation: Activation function. Default: `ln.celu`.
+            activation: Activation function. Default: `jax.nn.celu`.
             padding_mode: Padding ('circular', 'reflect'). Default: 'circular'.
             training: Training mode. Default: True.
 
         Returns:
-            FlaxModule: Wrapped UNet1D model.
+            Model: Wrapped UNet1D model.
 
         Example:
             >>> # 1D signal denoising
@@ -1331,7 +1407,7 @@ class nn:
             groups=groups,
             activation=activation,
             padding_mode=padding_mode,
-            training=training,
+            key=key,
         )
 
         return cls.wrap(unet)
@@ -1345,10 +1421,11 @@ class nn:
         wf: int = 6,
         norm: str = "layer",
         up_mode: str = "upconv",
-        activation: Callable = ln.gelu,
+        activation: Callable = jax.nn.gelu,
         padding_mode: str = "circular",
-        training: bool = True,
-    ) -> FlaxModule:
+        *,
+        key: jax.Array,
+    ) -> Model:
         """
         Create a 2D U-Net.
 
@@ -1362,12 +1439,12 @@ class nn:
             wf: Width factor (base channels = 2^wf). Default: 6.
             norm: Normalization type. Default: 'layer'.
             up_mode: Upsampling ('upconv' or 'upsample'). Default: 'upconv'.
-            activation: Activation function. Default: `ln.celu`.
+            activation: Activation function. Default: `jax.nn.celu`.
             padding_mode: Padding mode. Default: 'circular'.
             training: Training mode. Default: True.
 
         Returns:
-            FlaxModule: Wrapped UNet2D model.
+            Model: Wrapped UNet2D model.
 
         Example:
             >>> # Darcy flow
@@ -1401,7 +1478,7 @@ class nn:
             groups=1,
             activation=activation,
             padding_mode=padding_mode,
-            training=training,
+            key=key,
         )
 
         return cls.wrap(model)
@@ -1417,8 +1494,9 @@ class nn:
         up_mode: str = "upconv",
         activation: str = "celu",
         padding_mode: str = "circular",
-        training: bool = True,
-    ) -> FlaxModule:
+        *,
+        key: jax.Array,
+    ) -> Model:
         """
         Create a 3D U-Net.
 
@@ -1436,7 +1514,7 @@ class nn:
             training: Training mode. Default: True.
 
         Returns:
-            FlaxModule: Wrapped UNet3D model.
+            Model: Wrapped UNet3D model.
 
         Warning:
             Memory usage scales as O(2^(3×depth) × 2^(2×wf)). Consider
@@ -1452,7 +1530,7 @@ class nn:
             groups=1,
             activation=activation,
             padding_mode=padding_mode,
-            training=training,
+            key=key,
         )
 
         return cls.wrap(model)
@@ -1472,7 +1550,9 @@ class nn:
         output_dim: int = 1,
         activation: str = "gelu",
         padding_mode: str = "CIRCULAR",
-    ) -> FlaxModule:
+        *,
+        key: jax.Array,
+    ) -> Model:
         """
         Create a 1D Multigrid Neural Operator.
 
@@ -1504,7 +1584,7 @@ class nn:
             padding_mode: Padding mode. Default: 'CIRCULAR'.
 
         Returns:
-            FlaxModule: Wrapped MgNO1D model.
+            Model: Wrapped MgNO1D model.
 
         Example:
             >>> # 1D Burgers equation
@@ -1527,6 +1607,7 @@ class nn:
             output_dim=output_dim,
             activation=activation,
             padding_mode=padding_mode,
+            key=key,
         )
 
         return cls.wrap(model)
@@ -1542,7 +1623,9 @@ class nn:
         output_dim: int = 1,
         activation: str = "gelu",
         padding_mode: str = "CIRCULAR",
-    ) -> FlaxModule:
+        *,
+        key: jax.Array,
+    ) -> Model:
         """
         Create a 2D Multigrid Neural Operator.
 
@@ -1563,7 +1646,7 @@ class nn:
             padding_mode: Padding ('CIRCULAR', 'SAME', 'VALID'). Default: 'CIRCULAR'.
 
         Returns:
-            FlaxModule: Wrapped MgNO model.
+            Model: Wrapped MgNO model.
 
         Example:
             >>> # 2D Darcy flow
@@ -1601,6 +1684,7 @@ class nn:
             output_dim=output_dim,
             activation=activation,
             padding_mode=padding_mode,
+            key=key,
         )
 
         return cls.wrap(model)
@@ -1621,7 +1705,9 @@ class nn:
         latent_res: Optional[Tuple[int, int]] = (16, 16),
         output_res: Optional[Tuple[int, int]] = (64, 64),
         m_dists: Optional[Sequence[jnp.ndarray]] = None,
-    ) -> FlaxModule:
+        *,
+        key: jax.Array,
+    ) -> Model:
         """
         Create a Position-induced Transformer (PiT).
 
@@ -1671,7 +1757,7 @@ class nn:
                 Default: None (compute from coordinates).
 
         Returns:
-            FlaxModule: Wrapped PiT model.
+            Model: Wrapped PiT model.
 
         Example:
             >>> # Regular grid with local attention in processor
@@ -1706,6 +1792,7 @@ class nn:
                 n_head=n_head,
                 localities=list(localities),
                 m_dists=m_dists,
+                key=key,
             )
         else:
             model = PiTWithCoords(
@@ -1717,6 +1804,7 @@ class nn:
                 input_res=input_res,
                 latent_res=latent_res,
                 output_res=output_res,
+                key=key,
             )
 
         return cls.wrap(model)
@@ -1729,11 +1817,11 @@ class nn:
         num_heads: int = 8,
         mlp_features: int = 2048,
         dropout_rate: float = 0.1,
-        deterministic: bool = True,
         vocab_size: int = 10000,
         max_len: int = 128,
-        dtype=jnp.float32,
-    ) -> FlaxModule:
+        *,
+        key: jax.Array,
+    ) -> Model:
         """
         Create a standard Transformer.
 
@@ -1747,19 +1835,29 @@ class nn:
             num_heads: Attention heads. Default: 8.
             mlp_features: FFN hidden dimension. Default: 2048.
             dropout_rate: Dropout probability. Default: 0.1.
-            deterministic: Disable dropout (for inference). Default: True.
             vocab_size: Vocabulary size (for token embeddings). Default: 10000.
             max_len: Maximum sequence length. Default: 128.
-            dtype: Data type. Default: jnp.float32.
+            key: JAX PRNG key for weight initialization.
 
         Returns:
-            FlaxModule: Wrapped Transformer model.
+            Model: Wrapped Transformer model.
 
         Note:
             For continuous operator learning, consider using PiT or ScOT
             which are specifically designed for spatial data.
         """
-        model_inst = Transformer(num_layers, num_layers, embed_dim, num_heads, embed_dim, mlp_features, dropout_rate, deterministic, vocab_size, max_len, dtype)
+        model_inst = Transformer(
+            encoder_num_layers=num_layers,
+            decoder_num_layers=num_layers,
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            qkv_features=embed_dim,
+            mlp_features=mlp_features,
+            vocab_size=vocab_size,
+            dropout_rate=dropout_rate,
+            max_len=max_len,
+            key=key,
+        )
 
         return cls.wrap(model_inst)
 
@@ -1784,11 +1882,12 @@ class nn:
         coord_embedding: Optional[Literal["fourier", "positional"]] = None,
         coord_embedding_dim: int = 64,
         coord_embedding_scale: float = 1.0,
-        activation: Callable = ln.gelu,
+        activation: Callable = jax.nn.gelu,
         norm: Optional[str] = None,
         dropout_rate: float = 0.0,
-        training: bool = True,
-    ) -> FlaxModule:
+        *,
+        key: jax.Array,
+    ) -> Model:
         """
         Create a Deep Operator Network (DeepONet).
 
@@ -1822,13 +1921,13 @@ class nn:
             coord_embedding: Coordinate embedding type. Default: None.
             coord_embedding_dim: Embedding dimension. Default: 64.
             coord_embedding_scale: Fourier feature scale. Default: 1.0.
-            activation: Activation function. Default: `ln.gelu`.
+            activation: Activation function. Default: `jax.nn.gelu`.
             norm: Normalization type. Default: None.
             dropout_rate: Dropout rate. Default: 0.0.
             training: Training mode. Default: True.
 
         Returns:
-            FlaxModule: Wrapped DeepONet model.
+            Model: Wrapped DeepONet model.
 
         Example:
             >>> # Simple DeepONet for 1D problems
@@ -1884,7 +1983,7 @@ class nn:
             activation=activation,
             norm=norm,
             dropout_rate=dropout_rate,
-            training=training,
+            key=key,
         )
 
         return cls.wrap(model)
@@ -1896,13 +1995,16 @@ class nn:
     @classmethod
     def pointnet(
         cls,
+        in_features: int,
         output_dim: int,
         hidden_dims: List[int] = [32, 16, 8, 4, 2, 2, 4, 8, 8],
         dropout_rate: float = 0.0,
         feature_transform: Optional[Callable] = None,
-        activation_function: Callable = ln.tanh,
+        activation_function: Callable = jnp.tanh,
         use_bias: bool = True,
-    ) -> FlaxModule:
+        *,
+        key: jax.Array,
+    ) -> Model:
         """
         Create a PointNet-style network.
 
@@ -1920,11 +2022,11 @@ class nn:
             hidden_dims: Sizes of each of the kernels (List of 9 integers)
             dropout_rate: Dropout probability. Default: 0.0.
             feature_transform: Optional input transformation. Default: None.
-            activation_function: Activation function. Default: `ln.tanh`.
+            activation_function: Activation function. Default: `jnp.tanh`.
             use_bias: Include bias terms. Default: True.
 
         Returns:
-            FlaxModule: Wrapped PointNet model.
+            Model: Wrapped PointNet model.
 
         Example:
             >>> # Point cloud regression
@@ -1940,12 +2042,14 @@ class nn:
 
         """
         model = PointNet(
+            in_features=in_features,
             output_dim=output_dim,
             hidden_dims=hidden_dims,
             dropout_rate=dropout_rate,
             feature_transform=feature_transform,
             act=activation_function,
             use_bias=use_bias,
+            key=key,
         )
 
         return cls.wrap(model)
@@ -1982,7 +2086,7 @@ class nn:
         use_conditioning: bool = True,
         learn_residual: bool = False,
         pretrained_window_sizes: Tuple[int, int, int, int] = (0, 0, 0, 0),
-    ) -> FlaxModule:
+    ) -> Model:
         """
         Create a Scalable Operator Transformer (ScOT).
 
@@ -2031,7 +2135,7 @@ class nn:
             pretrained_window_sizes: For loading pretrained weights. Default: (0,0,0,0).
 
         Returns:
-            FlaxModule: Wrapped ScOT model.
+            Model: Wrapped ScOT model.
 
         Example:
             >>> # Custom ScOT for 128x128 images
@@ -2079,140 +2183,885 @@ class nn:
             pretrained_window_sizes=pretrained_window_sizes,
         )
 
-        model = ScOT(config=config, use_conditioning=use_conditioning)
+        flax_model = ScOT(config=config, use_conditioning=use_conditioning)
 
-        return cls.wrap(model, name="poseidon")
+        rng = jax.random.PRNGKey(0)
+        dummy_pv = jnp.ones((1, image_size, image_size, num_channels))
+        dummy_t = jnp.zeros((1,))
+        params = flax_model.init(
+            {"params": rng, "dropout": rng},
+            pixel_values=dummy_pv,
+            time=dummy_t,
+            deterministic=True,
+        )
+        wrapped = FlaxModelWrapper(
+            flax_model.apply,
+            params,
+            post_fn=lambda x: x.output,
+            deterministic=True,
+        )
+        return cls.wrap(wrapped, name="poseidon")
 
     # =========================================================================
     # Foundation Models (Pretrained)
     # =========================================================================
 
     @classmethod
-    def poseidon(cls, weights_path: Optional[str] = None, num_out_channels: int = 4) -> FlaxModule:
-        """
-        Initialize a Poseidon foundation model for PDE solving.
+    def _poseidon(
+        cls,
+        name: str,
+        embed_dim: int,
+        depths: Tuple[int, ...],
+        num_in_channels: int,
+        num_out_channels: int,
+    ) -> Model:
+        """Internal helper that builds a fresh Poseidon ScOT model."""
+        from jax_poseidon import ScOT, ScOTConfig
 
-        The number of input channels is automatically inferred from the inputs provided to the model.
+        config = ScOTConfig(
+            name=name,
+            image_size=128,
+            patch_size=4,
+            num_channels=num_in_channels,
+            num_out_channels=num_out_channels,
+            embed_dim=embed_dim,
+            depths=depths,
+            num_heads=(3, 6, 12, 24),
+            skip_connections=(2, 2, 2, 0),
+            window_size=16,
+            mlp_ratio=4.0,
+            qkv_bias=True,
+            hidden_dropout_prob=0.0,
+            attention_probs_dropout_prob=0.0,
+            drop_path_rate=0.0,
+            hidden_act="gelu",
+            use_absolute_embeddings=False,
+            initializer_range=0.02,
+            layer_norm_eps=1e-5,
+            p=1,
+            channel_slice_list_normalized_loss=[0, 1, 3, 4],
+            residual_model="convnext",
+            use_conditioning=True,
+            learn_residual=False,
+            pretrained_window_sizes=(0, 0, 0, 0),
+        )
+
+        flax_model = ScOT(config=config, use_conditioning=True)
+
+        rng = jax.random.PRNGKey(0)
+        dummy_pv = jnp.ones((1, 128, 128, num_in_channels))
+        dummy_t = jnp.ones((1, 1))
+        fresh_params = flax_model.init(
+            {"params": rng, "dropout": rng},
+            pixel_values=dummy_pv,
+            time=dummy_t,
+            deterministic=True,
+        )
+
+        wrapped = FlaxModelWrapper(
+            flax_model.apply,
+            fresh_params,
+            post_fn=lambda x: x.output,
+            deterministic=True,
+        )
+        return cls.wrap(wrapped, name=name)
+
+    @classmethod
+    def poseidonT(
+        cls,
+        num_in_channels: int = 4,
+        num_out_channels: int = 4,
+    ) -> Model:
+        """
+        Poseidon-T (Tiny) foundation model (~20.8M parameters).
+
+        Creates a fresh model. To load pretrained weights call
+        ``model.initialize(weight_path)`` afterwards.
 
         Args:
-            weights_path: Path to the model weights file (.msgpack format).  The model variant (T, B, or L) is automatically detected.
-            num_out_channels: Number of output channels. This must be specified explicitly as it cannot be inferred from the weights.
+            num_in_channels: Number of input channels.  Default: 4.
+            num_out_channels: Number of output channels.  Default: 4.
 
         Returns:
-            An output tensors
+            Model wrapping the Poseidon ScOT model.
 
-            Example: For 4 output channels, returns: (B, 128, 128, 4)
+        Example:
+            >>> u = nn.poseidonT(num_in_channels=1, num_out_channels=1)
+            >>> u.initialize("poseidonT.msgpack")
 
         Reference:
             Herde et al., "Poseidon: Efficient Foundation Models for PDEs" (2024)
-            https://arxiv.org/abs/2405.19101
+        """
+        return cls._poseidon("poseidonT", embed_dim=48, depths=(4, 4, 4, 4), num_in_channels=num_in_channels, num_out_channels=num_out_channels)
+
+    @classmethod
+    def poseidonB(
+        cls,
+        num_in_channels: int = 4,
+        num_out_channels: int = 4,
+    ) -> Model:
+        """
+        Poseidon-B (Base) foundation model (~157.7M parameters).
+
+        Creates a fresh model. To load pretrained weights call
+        ``model.initialize(weight_path)`` afterwards.
+
+        Args:
+            num_in_channels: Number of input channels.  Default: 4.
+            num_out_channels: Number of output channels.  Default: 4.
+
+        Returns:
+            Model wrapping the Poseidon ScOT model.
+
+        Example:
+            >>> u = nn.poseidonB(num_in_channels=1, num_out_channels=1)
+            >>> u.initialize("poseidonB.msgpack")
+
+        Reference:
+            Herde et al., "Poseidon: Efficient Foundation Models for PDEs" (2024)
+        """
+        return cls._poseidon("poseidonB", embed_dim=96, depths=(8, 8, 8, 8), num_in_channels=num_in_channels, num_out_channels=num_out_channels)
+
+    @classmethod
+    def poseidonL(
+        cls,
+        num_in_channels: int = 4,
+        num_out_channels: int = 4,
+    ) -> Model:
+        """
+        Poseidon-L (Large) foundation model (~628.6M parameters).
+
+        Creates a fresh model. To load pretrained weights call
+        ``model.initialize(weight_path)`` afterwards.
+
+        Args:
+            num_in_channels: Number of input channels.  Default: 4.
+            num_out_channels: Number of output channels.  Default: 4.
+
+        Returns:
+            Model wrapping the Poseidon ScOT model.
+
+        Example:
+            >>> u = nn.poseidonL(num_in_channels=1, num_out_channels=1)
+            >>> u.initialize("poseidonL.msgpack")
+
+        Reference:
+            Herde et al., "Poseidon: Efficient Foundation Models for PDEs" (2024)
+        """
+        return cls._poseidon("poseidonL", embed_dim=192, depths=(8, 8, 8, 8), num_in_channels=num_in_channels, num_out_channels=num_out_channels)
+
+    @classmethod
+    def walrus(
+        cls,
+        input_shape: Tuple[int, ...],
+        num_out_channels: int = 1,
+        state_labels: Optional[jnp.ndarray] = None,
+        bcs: Optional[List] = None,
+        dim_key: int = 2,
+        remat: bool = True,
+    ) -> Model:
+        """
+        Initialize a Walrus foundation model (1.29 B parameters).
+
+        Walrus uses a *SpaceBag* encoder that selects input channels at
+        runtime via ``field_indices``, so the weight file is architecture-
+        independent — the same checkpoint works for any PDE.
+
+        The model expects channels-last input ``(B, T, H, [W, [D]], C)``
+        and returns ``(B, T_out, H, [W, [D]], C_out)``.
+
+        Call ``.initialize(weight_path)`` on the returned module to load
+        pretrained weights (deferred until training starts).
+
+        Args:
+            input_shape: Shape of a single input tensor, e.g.
+                ``(1, 1, 128, 128, 1)`` for a 2-D problem with one channel.
+                Used to run a dummy forward pass that creates the parameter
+                template.
+            num_out_channels: Number of output channels.  ``state_labels``
+                is built as ``jnp.arange(num_out_channels)`` when not
+                given explicitly.
+            state_labels: Explicit output-channel indices for the decoder.
+                Overrides ``num_out_channels`` when provided.
+            bcs: Boundary conditions per spatial dim, each
+                ``[bc_left, bc_right]``.  ``2`` = periodic, ``0`` = open.
+                Default: periodic in H & W, singleton in D
+                (``[[2,2],[2,2],[0,0]]``).
+            dim_key: Spatial dimensionality of the data (2 or 3).
+                Default: 2.
+            remat: If ``True`` (default), wrap each processor block with
+                ``nn.remat`` (gradient checkpointing) to reduce peak
+                memory at the cost of recomputing activations during
+                the backward pass.
+
+        Returns:
+            Model wrapping the Walrus model.
+
+        Example::
+
+            u = nn.walrus((1, 1, 128, 128, 1), num_out_channels=1)
+            u.initialize("walrus.msgpack")
+
+        Reference:
+            McCabe et al., "Multiple Physics Pretraining for Physical
+            Surrogate Models" (2023)
         """
 
-        from flax.serialization import from_bytes
-        import jax
+        from jax_walrus import IsotropicModel as WalrusModel
 
-        with open(weights_path, "rb") as f:
-            layer_params = from_bytes(None, f.read())
+        if state_labels is None:
+            state_labels = jnp.arange(num_out_channels, dtype=jnp.int32)
+        if bcs is None:
+            bcs = [[2, 2], [2, 2], [0, 0]]
 
-        leaves = jax.tree_util.tree_leaves(layer_params)
-        n_params = sum(int(l.size) for l in leaves if hasattr(l, "size") and not isinstance(l, (str, bytes)))
-        del layer_params
+        # Store as a plain Python tuple so it can live in a static eqx field
+        # without the "JAX array set as static" warning.  The Flax model
+        # converts it back to an array at the top of __call__.
+        state_labels_tup = tuple(int(s) for s in state_labels)
 
-        if n_params == 20_774_444:
-            config = ScOTConfig(
-                name="poseidonT",
-                image_size=128,
-                patch_size=4,
-                num_channels=4,
-                num_out_channels=num_out_channels,
-                embed_dim=48,
-                depths=(4, 4, 4, 4),
-                num_heads=(3, 6, 12, 24),
-                skip_connections=(2, 2, 2, 0),
-                window_size=16,
-                mlp_ratio=4.0,
-                qkv_bias=True,
-                hidden_dropout_prob=0.0,
-                attention_probs_dropout_prob=0.0,
-                drop_path_rate=0.0,
-                hidden_act="gelu",
-                use_absolute_embeddings=False,
-                initializer_range=0.02,
-                layer_norm_eps=1e-5,
-                p=1,
-                channel_slice_list_normalized_loss=[0, 1, 3, 4],
-                residual_model="convnext",
-                use_conditioning=True,
-                learn_residual=False,
-                pretrained_window_sizes=(0, 0, 0, 0),
-            )
-        elif n_params == 157_729_988:
-            config = ScOTConfig(
-                name="poseidonB",
-                image_size=128,
-                patch_size=4,
-                num_channels=4,
-                num_out_channels=num_out_channels,
-                embed_dim=96,
-                depths=(8, 8, 8, 8),
-                num_heads=(3, 6, 12, 24),
-                skip_connections=(2, 2, 2, 0),
-                window_size=16,
-                mlp_ratio=4.0,
-                qkv_bias=True,
-                hidden_dropout_prob=0.0,
-                attention_probs_dropout_prob=0.0,
-                drop_path_rate=0.0,
-                hidden_act="gelu",
-                use_absolute_embeddings=False,
-                initializer_range=0.02,
-                layer_norm_eps=1e-5,
-                p=1,
-                channel_slice_list_normalized_loss=[0, 1, 3, 4],
-                residual_model="convnext",
-                use_conditioning=True,
-                learn_residual=False,
-                pretrained_window_sizes=(0, 0, 0, 0),
-                chunk_size_feed_forward=0,
-                output_attentions=False,
-                output_hidden_states=False,
-                use_return_dict=True,
-            )
-        elif n_params == 628_575_524:
-            config = ScOTConfig(
-                name="poseidonL",
-                image_size=128,
-                patch_size=4,
-                num_channels=4,
-                num_out_channels=num_out_channels,
-                embed_dim=192,
-                depths=(8, 8, 8, 8),
-                num_heads=(3, 6, 12, 24),
-                skip_connections=(2, 2, 2, 0),
-                window_size=16,
-                mlp_ratio=4.0,
-                qkv_bias=True,
-                hidden_dropout_prob=0.0,
-                attention_probs_dropout_prob=0.0,
-                drop_path_rate=0.0,
-                hidden_act="gelu",
-                use_absolute_embeddings=False,
-                initializer_range=0.02,
-                layer_norm_eps=1e-5,
-                p=1,
-                channel_slice_list_normalized_loss=[0, 1, 3, 4],
-                residual_model="convnext",
-                use_conditioning=True,
-                learn_residual=False,
-                pretrained_window_sizes=(0, 0, 0, 0),
-                chunk_size_feed_forward=0,
-                output_attentions=False,
-                output_hidden_states=False,
-                use_return_dict=True,
-            )
+        # ── Build model with pretrained hyperparameters ──
+        flax_model = WalrusModel(
+            hidden_dim=1408,
+            intermediate_dim=352,
+            n_states=67,
+            processor_blocks=40,
+            num_heads=16,
+            groups=16,
+            causal_in_time=True,
+            bias_type="rel",
+            base_kernel_size=((8, 4), (8, 4), (8, 4)),
+            use_spacebag=True,
+            use_silu=True,
+            include_d=(2, 3),
+            encoder_groups=16,
+            remat=remat,
+        )
+
+        # ── Create fresh (random) params via a dummy forward pass ──
+        rng = jax.random.PRNGKey(0)
+        dummy_x = jnp.ones(input_shape)
+        params = flax_model.init(
+            {"params": rng, "dropout": rng, "drop_path": rng, "jitter": rng},
+            x=dummy_x,
+            state_labels=state_labels,
+            bcs=bcs,
+            dim_key=dim_key,
+            deterministic=True,
+        )
+
+        wrapped = FlaxModelWrapper(
+            flax_model.apply,
+            params,
+            state_labels=state_labels_tup,
+            bcs=bcs,
+            dim_key=dim_key,
+            deterministic=True,
+        )
+        return cls.wrap(wrapped, name="walrus")
+
+    # =========================================================================
+    # MORPH Foundation Models
+    # =========================================================================
+
+    @classmethod
+    def _morph(
+        cls,
+        name: str,
+        dim: int,
+        depth: int,
+        heads: int,
+        mlp_dim: int,
+        max_ar: int,
+        model_size: str,
+        spatial_size: int = 128,
+        conv_filter: int = 8,
+        heads_xa: int = 32,
+        max_components: int = 3,
+        max_patches: int = 4096,
+        max_fields: int = 3,
+        dropout: float = 0.0,
+        emb_dropout: float = 0.0,
+    ) -> Model:
+        """Internal helper that builds a fresh MORPH model.
+
+        jNO's vmap+scan pipeline delivers one sample at a time to the model.
+        For a domain storing ``_f`` as ``(S, 1, 1, H, W, 1)`` (Poseidon layout),
+        each sample arrives as ``(1, H, W, 1)`` after B is vmapped
+        and T is scanned.  MORPH expects ``(B, t, F, C, D, H, W)``
+        (native 7-D volume format).  A ``MorphAdapter`` wrapper reshapes
+        in both directions so the jNO interface is identical to Walrus.
+
+        Args:
+            name: Display name (e.g. ``"morph_Ti"``).
+            dim: Transformer embedding dimension.
+            depth: Number of transformer blocks.
+            heads: Number of attention heads.
+            mlp_dim: MLP hidden dimension.
+            max_ar: Maximum auto-regressive timesteps.
+            model_size: Model variant string (``'Ti'``, ``'S'``, ``'M'``, ``'L'``).
+            spatial_size: Spatial resolution H=W (must be divisible by 8).
+                Used for the dummy init forward pass.  Default: 128.
+            conv_filter: Conv feature extractor output channels. Default: 8.
+            heads_xa: Number of heads for field cross-attention. Default: 32.
+            max_components: Maximum input components. Default: 3.
+            max_patches: Maximum number of patches. Default: 4096.
+            max_fields: Maximum number of fields. Default: 3.
+            dropout: Dropout rate. Default: 0.0.
+            emb_dropout: Embedding dropout rate. Default: 0.0.
+        """
+
+        from jax_morph import ViT3DRegression as MorphModel
+
+        flax_model = MorphModel(
+            patch_size=8,
+            dim=dim,
+            depth=depth,
+            heads=heads,
+            heads_xa=heads_xa,
+            mlp_dim=mlp_dim,
+            max_components=max_components,
+            conv_filter=conv_filter,
+            max_ar=max_ar,
+            max_patches=max_patches,
+            max_fields=max_fields,
+            dropout=dropout,
+            emb_dropout=emb_dropout,
+            model_size=model_size,
+        )
+
+        # Init params with the native MORPH shape (B, t, F, C, D, H, W).
+        # D=1 turns a 2-D problem into the 3-D volume MORPH expects.
+        S = spatial_size
+        rng = jax.random.PRNGKey(0)
+        dummy_vol = jnp.ones((1, 1, 1, 1, 1, S, S))  # (B=1, t=1, F=1, C=1, D=1, H, W)
+        params = flax_model.init(rng, dummy_vol, deterministic=True)
+
+        # ── Adapter: jNO ↔ MORPH shape bridge ──────────────────────────
+        # jNO delivers x with shape (1, H, W, 1) per sample
+        # [T-dim peeled by scan, B-dim peeled by vmap].
+        # MORPH needs (B, t, F, C, D, H, W).
+        # Output (B=1, F=1, C=1, D=1, H, W) is mapped back to (1, H, W, 1).
+        #
+        # We bake the reshape into the apply_fn closure so the wrapped
+        # object stays a FlaxModelWrapper — this is required for the
+        # Flax msgpack weight-loading path in jNO's build_single_layer_params.
+        _base_apply = flax_model.apply
+
+        def morph_apply(params, x, **kwargs):
+            # x: (1, H, W, 1) — jNO per-sample input (channels-last 2-D)
+            H, W = x.shape[-3], x.shape[-2]
+            vol = x.reshape(1, 1, 1, 1, 1, H, W)  # → (B,t,F,C,D,H,W)
+            _enc, _z, x_last = _base_apply(params, vol, **kwargs)
+            return x_last.reshape(1, H, W, 1)  # → (1, H, W, 1)
+
+        wrapped = FlaxModelWrapper(
+            morph_apply,
+            params,
+            deterministic=True,
+        )
+        return cls.wrap(wrapped, name=name)
+
+    @classmethod
+    def morphTi(
+        cls,
+        spatial_size: int = 128,
+    ) -> Model:
+        """
+        MORPH-Ti (Tiny) foundation model.
+
+        Creates a fresh model. To load pretrained weights call
+        ``model.initialize(weight_path)`` afterwards.
+
+        Args:
+            spatial_size: Spatial resolution H=W of the input grid
+                (must be divisible by 8).  Used for the dummy init
+                forward pass.  Default: 128.
+
+        Returns:
+            Model wrapping the MORPH-Ti model.
+
+        Example::
+
+            u = nn.morphTi()
+            u.initialize("morph-Ti.msgpack")
+
+        Reference:
+            Rautela et al., "MORPH: PDE Foundation Models with Arbitrary
+            Data Modality" (2025)
+        """
+        return cls._morph(
+            "morph_Ti",
+            dim=256,
+            depth=4,
+            heads=4,
+            mlp_dim=1024,
+            max_ar=1,
+            model_size="Ti",
+            spatial_size=spatial_size,
+        )
+
+    @classmethod
+    def morphS(
+        cls,
+        spatial_size: int = 128,
+    ) -> Model:
+        """
+        MORPH-S (Small) foundation model.
+
+        Creates a fresh model. To load pretrained weights call
+        ``model.initialize(weight_path)`` afterwards.
+
+        Args:
+            spatial_size: Spatial resolution H=W (must be divisible by 8).
+                Default: 128.
+
+        Returns:
+            Model wrapping the MORPH-S model.
+
+        Example::
+
+            u = nn.morphS()
+            u.initialize("morph-S.msgpack")
+
+        Reference:
+            Rautela et al., "MORPH: PDE Foundation Models with Arbitrary
+            Data Modality" (2025)
+        """
+        return cls._morph(
+            "morph_S",
+            dim=512,
+            depth=4,
+            heads=8,
+            mlp_dim=2048,
+            max_ar=1,
+            model_size="S",
+            spatial_size=spatial_size,
+        )
+
+    @classmethod
+    def morphM(
+        cls,
+        spatial_size: int = 128,
+    ) -> Model:
+        """
+        MORPH-M (Medium) foundation model.
+
+        Creates a fresh model. To load pretrained weights call
+        ``model.initialize(weight_path)`` afterwards.
+
+        Args:
+            spatial_size: Spatial resolution H=W (must be divisible by 8).
+                Default: 128.
+
+        Returns:
+            Model wrapping the MORPH-M model.
+
+        Example::
+
+            u = nn.morphM()
+            u.initialize("morph-M.msgpack")
+
+        Reference:
+            Rautela et al., "MORPH: PDE Foundation Models with Arbitrary
+            Data Modality" (2025)
+        """
+        return cls._morph(
+            "morph_M",
+            dim=768,
+            depth=8,
+            heads=12,
+            mlp_dim=3072,
+            max_ar=1,
+            model_size="M",
+            spatial_size=spatial_size,
+        )
+
+    @classmethod
+    def morphL(
+        cls,
+        spatial_size: int = 128,
+    ) -> Model:
+        """
+        MORPH-L (Large) foundation model.
+
+        Creates a fresh model. To load pretrained weights call
+        ``model.initialize(weight_path)`` afterwards.
+
+        Args:
+            spatial_size: Spatial resolution H=W (must be divisible by 8).
+                Default: 128.
+
+        Returns:
+            Model wrapping the MORPH-L model.
+
+        Example::
+
+            u = nn.morphL()
+            u.initialize("morph-L.msgpack")
+
+        Reference:
+            Rautela et al., "MORPH: PDE Foundation Models with Arbitrary
+            Data Modality" (2025)
+        """
+        return cls._morph(
+            "morph_L",
+            dim=1024,
+            depth=16,
+            heads=16,
+            mlp_dim=4096,
+            max_ar=16,
+            model_size="L",
+            spatial_size=spatial_size,
+        )
+
+    # =========================================================================
+    # MPP Foundation Models
+    # =========================================================================
+
+    @classmethod
+    def _mpp(
+        cls,
+        name: str,
+        variant: str,
+        spatial_size: int = 128,
+        num_channels: int = 1,
+    ) -> Model:
+        """Internal helper that builds a fresh MPP/AViT model.
+
+        jNO's vmap+scan pipeline delivers one sample at a time to the model.
+        For a domain storing ``_f`` as ``(S, 1, 1, H, W, 1)`` (Poseidon layout),
+        each sample arrives as ``(1, H, W, 1)`` after B is vmapped
+        and T is scanned.  MPP/AViT expects ``(T, B, C, H, W)``
+        (time-first, channels-first).  An adapter closure reshapes
+        in both directions so the jNO interface is identical to the
+        other foundation models.
+
+        Args:
+            name: Display name (e.g. ``"mpp_Ti"``).
+            variant: One of ``'Ti'``, ``'S'``, ``'B'``, ``'L'``.
+            spatial_size: Spatial resolution H=W. Default: 128.
+            num_channels: Number of active state-variable channels.
+                Default: 1 (suitable for Poisson, heat equation, etc.).
+        """
+
+        from jax_mpp import AViT as MPPModel, AVIT_CONFIGS
+
+        cfg = AVIT_CONFIGS[variant]
+        flax_model = MPPModel(**cfg)
+
+        # Init params with matched dummy input.
+        S = spatial_size
+        rng = jax.random.PRNGKey(0)
+        dummy_x = jnp.ones((1, 1, num_channels, S, S))  # (T=1, B=1, C, H, W)
+        state_labels = jnp.arange(num_channels, dtype=jnp.int32)
+        dummy_bcs = jnp.zeros((1, 2), dtype=jnp.int32)
+        params = flax_model.init(
+            {"params": rng, "drop_path": rng},
+            dummy_x,
+            state_labels,
+            dummy_bcs,
+            deterministic=True,
+        )
+
+        # Store state_labels as tuple for static eqx field.
+        state_labels_tup = tuple(int(s) for s in state_labels)
+
+        # ── Adapter: jNO ↔ MPP shape bridge ─────────────────────────
+        _base_apply = flax_model.apply
+
+        def mpp_apply(params, x, **kwargs):
+            # x: (1, H, W, 1) — jNO per-sample input (channels-last 2-D)
+            H, W = x.shape[-3], x.shape[-2]
+            C = x.shape[-1]
+            # → (T=1, B=1, C, H, W)  channels-first, time-first
+            vol = x.reshape(1, 1, C, H, W)
+            sl = jnp.array(state_labels_tup, dtype=jnp.int32)
+            bcs = jnp.zeros((1, 2), dtype=jnp.int32)
+            out = _base_apply(params, vol, sl, bcs, deterministic=True)
+            # out: (B=1, C, H, W) → (1, H, W, C)
+            return out[0].transpose(1, 2, 0).reshape(1, H, W, C)
+
+        wrapped = FlaxModelWrapper(
+            mpp_apply,
+            params,
+            deterministic=True,
+        )
+        return cls.wrap(wrapped, name=name)
+
+    @classmethod
+    def mppTi(
+        cls,
+        spatial_size: int = 128,
+        num_channels: int = 1,
+    ) -> Model:
+        """
+        MPP-Ti (Tiny) foundation model (~7.3 M parameters).
+
+        Creates a fresh model. To load pretrained weights call
+        ``model.initialize(weight_path)`` afterwards.
+
+        Args:
+            spatial_size: Spatial resolution H=W. Default: 128.
+            num_channels: Number of active state channels. Default: 1.
+
+        Returns:
+            Model wrapping the MPP-Ti model.
+
+        Example::
+
+            u = nn.mppTi()
+            u.initialize("mpp-Ti.msgpack")
+
+        Reference:
+            McCabe et al., "Multiple Physics Pretraining for Physical
+            Surrogate Models" (NeurIPS 2024)
+        """
+        return cls._mpp("mpp_Ti", "Ti", spatial_size, num_channels)
+
+    @classmethod
+    def mppS(
+        cls,
+        spatial_size: int = 128,
+        num_channels: int = 1,
+    ) -> Model:
+        """
+        MPP-S (Small) foundation model.
+
+        See :meth:`mppTi` for full documentation.
+        """
+        return cls._mpp("mpp_S", "S", spatial_size, num_channels)
+
+    @classmethod
+    def mppB(
+        cls,
+        spatial_size: int = 128,
+        num_channels: int = 1,
+    ) -> Model:
+        """
+        MPP-B (Base) foundation model.
+
+        See :meth:`mppTi` for full documentation.
+        """
+        return cls._mpp("mpp_B", "B", spatial_size, num_channels)
+
+    @classmethod
+    def mppL(
+        cls,
+        spatial_size: int = 128,
+        num_channels: int = 1,
+    ) -> Model:
+        """
+        MPP-L (Large) foundation model.
+
+        See :meth:`mppTi` for full documentation.
+        """
+        return cls._mpp("mpp_L", "L", spatial_size, num_channels)
+
+    # =========================================================================
+    # PDEformer-2 Foundation Models
+    # =========================================================================
+
+    @staticmethod
+    def _pdeformer2_bake_dag(dag_inputs: dict) -> dict:
+        """Normalise raw DAG arrays into batched ``jnp`` tensors.
+
+        ``build_dag_inputs`` returns unbatched numpy arrays.  This helper
+        converts them to ``jnp`` arrays and adds a leading ``n_graph=1``
+        dimension when missing, so they can be stored in the ``apply_fn``
+        closure as constants.
+        """
+        _expect_ndim = {
+            "node_type": 3,  # (1, n_node, 1)
+            "node_scalar": 3,  # (1, num_scalar, 1)
+            "node_function": 4,  # (1, num_func, pts, 5)
+            "in_degree": 2,  # (1, n_node)
+            "out_degree": 2,  # (1, n_node)
+            "attn_bias": 3,  # (1, n_node, n_node)
+            "spatial_pos": 3,  # (1, n_node, n_node)
+        }
+        out = {}
+        for k, target_ndim in _expect_ndim.items():
+            v = jnp.asarray(dag_inputs[k])
+            if v.ndim == target_ndim - 1:
+                v = v[jnp.newaxis]
+            out[k] = v
+        return out
+
+    @classmethod
+    def _pdeformer2(
+        cls,
+        name: str,
+        config: dict,
+        dag_inputs: Optional[dict],
+        num_points: int,
+    ) -> Model:
+        """Internal helper that builds a fresh PDEformer-2 model.
+
+        Args:
+            name: Display name (e.g. ``"pdeformer2_small"``).
+            config: One of ``PDEFORMER_SMALL_CONFIG``,
+                ``PDEFORMER_BASE_CONFIG``, ``PDEFORMER_FAST_CONFIG``.
+            dag_inputs: Optional dict from ``build_dag_inputs``.  When
+                provided the static DAG arrays are baked into the model
+                and the user only needs to pass ``coordinate`` at call
+                time.
+            num_points: Number of query coordinates for the INR decoder
+                (used only in the dummy init when *dag_inputs* is
+                ``None``).
+        """
+        from jax_pdeformer2 import (
+            create_pdeformer_from_config,
+            PDEFORMER_SMALL_CONFIG,
+            PDEFORMER_BASE_CONFIG,
+            PDEFORMER_FAST_CONFIG,
+        )
+        from jax_pdeformer2.utils import create_dummy_inputs as _pdeformer2_dummy_inputs
+
+        flax_model = create_pdeformer_from_config({"model": config})
+
+        # Derive sizes from config
+        func_cfg = config.get("function_encoder", {})
+        num_branches = func_cfg.get("num_branches", 4)
+        resolution = func_cfg.get("resolution", 128)
+
+        dummy = _pdeformer2_dummy_inputs(
+            n_graph=1,
+            num_scalar=80,
+            num_function=6,
+            num_branches=num_branches,
+            num_points_function=resolution**2,
+            num_points=num_points,
+        )
+
+        rng = jax.random.PRNGKey(0)
+        params = flax_model.init(rng, **dummy)
+
+        if dag_inputs is not None:
+            # Bake static DAG arrays into the apply closure so the user
+            # only passes ``coordinate`` at call time.
+            static_dag = cls._pdeformer2_bake_dag(dag_inputs)
+            base_apply = flax_model.apply
+
+            def dag_apply(params, coordinate, **kwargs):
+                # jNO evaluator passes (N, 4); model expects (1, N, 4)
+                coord = coordinate[None] if coordinate.ndim == 2 else coordinate
+                out = base_apply(
+                    params,
+                    **static_dag,
+                    coordinate=coord,
+                    **kwargs,
+                )
+                return out[0]  # (1, N, 1) → (N, 1)
+
+            wrapped = FlaxModelWrapper(dag_apply, params, deterministic=True)
         else:
-            raise ValueError("The number of parameters from the msgpack file {n_params} does not equal poseionT,B,L.")
+            wrapped = FlaxModelWrapper(
+                flax_model.apply,
+                params,
+                deterministic=True,
+            )
 
-        model = ScOT(config=config, use_conditioning=True)
+        return cls.wrap(wrapped, name=name)
 
-        return cls.wrap(model, name="poseidon", weight_path=weights_path)
+    @classmethod
+    def pdeformer2_small(
+        cls,
+        dag_inputs: Optional[dict] = None,
+        num_points: int = 1000,
+    ) -> Model:
+        """PDEformer-2-Small foundation model (~27 M parameters).
+
+        Creates a fresh model.  Call ``.initialize(weight_path)`` to load
+        pretrained weights from a ``.msgpack`` file.
+
+        The model encodes a PDE as a directed acyclic graph (DAG) whose
+        nodes carry scalar coefficients and function data (initial /
+        boundary conditions).  A Graphormer encodes the DAG, and an
+        implicit neural representation (INR) with hyper-networks decodes
+        the solution at arbitrary query coordinates.
+
+        Args:
+            dag_inputs: Optional dict returned by ``build_dag_inputs``
+                containing the 7 static DAG tensors (``node_type``,
+                ``node_scalar``, ``node_function``, ``in_degree``,
+                ``out_degree``, ``attn_bias``, ``spatial_pos``).
+                When provided, the model only requires ``coordinate``
+                as input at call time.  When ``None``, all 8 tensors
+                must be passed as positional arguments.
+            num_points: Number of query coordinates (used only for
+                the dummy forward pass that creates the parameter
+                template).  Default 1 000.
+
+        Returns:
+            Model wrapping the PDEformer-2-Small model.
+
+        Example::
+
+            # With baked-in DAG (recommended):
+            dag = pde.gen_dag(uf_num_mod=11)
+            u = nn.pdeformer2_small(dag_inputs=dag)
+            u.initialize("pdeformer2-small.msgpack")
+            result = u(coordinate)  # only coordinate needed
+
+            # Without DAG (pass all 8 inputs):
+            u = nn.pdeformer2_small()
+            u.initialize("pdeformer2-small.msgpack")
+            result = u(node_type, node_scalar, node_function,
+                       in_degree, out_degree, attn_bias,
+                       spatial_pos, coordinate)
+
+        Reference:
+            Hao et al., "PDEformer 2" (2024)
+        """
+        return cls._pdeformer2(
+            "pdeformer2_small",
+            PDEFORMER_SMALL_CONFIG,
+            dag_inputs,
+            num_points,
+        )
+
+    @classmethod
+    def pdeformer2_base(
+        cls,
+        dag_inputs: Optional[dict] = None,
+        num_points: int = 1000,
+    ) -> Model:
+        """PDEformer-2-Base foundation model (~82 M parameters).
+
+        See :meth:`pdeformer2_small` for full documentation.
+
+        Example::
+
+            dag = pde.gen_dag(uf_num_mod=11)
+            u = nn.pdeformer2_base(dag_inputs=dag)
+            u.initialize("pdeformer2-base.msgpack")
+        """
+        return cls._pdeformer2(
+            "pdeformer2_base",
+            PDEFORMER_BASE_CONFIG,
+            dag_inputs,
+            num_points,
+        )
+
+    @classmethod
+    def pdeformer2_fast(
+        cls,
+        dag_inputs: Optional[dict] = None,
+        num_points: int = 1000,
+    ) -> Model:
+        """PDEformer-2-Fast foundation model (~71 M parameters).
+
+        See :meth:`pdeformer2_small` for full documentation.
+
+        Example::
+
+            dag = pde.gen_dag(uf_num_mod=11)
+            u = nn.pdeformer2_fast(dag_inputs=dag)
+            u.initialize("pdeformer2-fast.msgpack")
+        """
+        return cls._pdeformer2(
+            "pdeformer2_fast",
+            PDEFORMER_FAST_CONFIG,
+            dag_inputs,
+            num_points,
+        )

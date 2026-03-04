@@ -5,6 +5,8 @@ from typing import Optional, Dict, Callable, List, Tuple
 import jax.numpy as jnp
 import jax
 
+from ..trace import get_primary_tag
+
 
 class ResamplingStrategy(ABC):
     """Base class for collocation point resampling strategies.
@@ -63,52 +65,50 @@ class ResamplingStrategy(ABC):
         """Update internal epoch tracking."""
         self._last_resample_epoch = epoch
 
-    def apply_resampling(
-        self, domain, constraints: List, tags: List[str], compiled: List[Callable], params: Dict, layer_info: Dict, points_by_tag: Dict[str, jax.Array], tensor_tags: Dict[str, jax.Array], epoch: int, rng: jax.Array
-    ) -> Tuple[Dict[str, jax.Array], jax.Array]:
+    def apply_resampling(self, domain, constraints: List, tags: List[str], compiled: List[Callable], params: Dict, layer_info: Dict, context: Dict[str, jax.Array], epoch: int, rng: jax.Array) -> Tuple[Dict[str, jax.Array], jax.Array]:
         """Apply resampling strategies if configured."""
         import numpy as np
 
         if not hasattr(domain, "_resampling_strategies"):
-            return points_by_tag, rng
+            return context, rng
 
         for tag, strategy in domain._resampling_strategies.items():
             if not strategy.should_resample(epoch):
                 continue
 
             # Compute residuals for constraints on this tag
-            tag_residuals = self.compute_tag_residuals(tag, constraints, tags, compiled, params, points_by_tag, tensor_tags)
+            tag_residuals = self.compute_tag_residuals(tag, constraints, tags, compiled, params, context)
 
             if not tag_residuals:
                 continue
 
             # Combine and resample
             combined_residuals = jnp.mean(jnp.stack(tag_residuals, axis=0), axis=0)
-            current_points = points_by_tag[tag]
+            current_points = context[tag]
 
             rng, resample_key = jax.random.split(rng)
             new_points = self.resample_all_batches(strategy, current_points, combined_residuals, domain, tag, epoch, resample_key)
 
             # Update domain
-            domain.sampled_points[tag] = np.array(new_points)
-            points_by_tag[tag] = new_points
+            domain.context[tag] = np.array(new_points)
+            context[tag] = new_points
 
             strategy.update_epoch(epoch)
             self.log.info(f"Resampled {tag} points (epoch {epoch+1})")
 
-        return points_by_tag, rng
+        return context, rng
 
-    def compute_tag_residuals(self, tag: str, constraints: List, tags: List[str], compiled: List[Callable], params: Dict, points_by_tag: Dict[str, jax.Array], tensor_tags: Dict[str, jax.Array]) -> List[jax.Array]:
+    def compute_tag_residuals(self, tag: str, constraints: List, tags: List[str], compiled: List[Callable], params: Dict, context: Dict[str, jax.Array]) -> List[jax.Array]:
         """Compute residuals for constraints evaluated on a specific tag."""
         tag_residuals = []
-        expected_n_points = points_by_tag[tag].shape[1]
+        expected_n_points = context[tag].shape[1]
 
         for i, expr in enumerate(constraints):
             expr_tag = get_primary_tag(expr)
             if expr_tag != tag:
                 continue
 
-            residual = compiled[i](params, points_by_tag, tensor_tags)
+            residual = compiled[i](params, context)
 
             if residual.shape[-1] == expected_n_points:
                 tag_residuals.append(residual)

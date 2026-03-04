@@ -1,92 +1,12 @@
-# geofno.py - JAX/Flax implementation
+# geofno.py - JAX/Equinox implementation
 
 from typing import Callable, List, Optional, Sequence, Tuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import linen as nn
-
-
-def _get_act(act: str) -> Optional[Callable]:
-    """Get activation function by name."""
-    activations = {
-        "tanh": nn.tanh,
-        "gelu": nn.gelu,
-        "relu": nn.relu,
-        "elu": nn.elu,
-        "leaky_relu": nn.leaky_relu,
-        "none": None,
-    }
-    if act not in activations:
-        raise ValueError(f"{act} is not supported")
-    return activations[act]
-
-
-def compute_Fourier_modes(ndims: int, nks: Sequence[int], Ls: Sequence[float]) -> np.ndarray:
-    """
-    Compute Fourier modes number k.
-    Fourier bases are cos(kx), sin(kx), 1.
-    We cannot have both k and -k.
-
-    Args:
-        ndims: Number of spatial dimensions
-        nks: Number of modes per dimension
-        Ls: Domain lengths per dimension
-
-    Returns:
-        k_pairs: float[nmodes, ndims] - Fourier mode vectors
-    """
-    if ndims == 1:
-        nk = nks[0]
-        Lx = Ls[0]
-        k_pairs = np.zeros((nk, ndims))
-        k_pair_mag = np.zeros(nk)
-        i = 0
-        for kx in range(1, nk + 1):
-            k_pairs[i, :] = 2 * np.pi / Lx * kx
-            k_pair_mag[i] = np.linalg.norm(k_pairs[i, :])
-            i += 1
-
-    elif ndims == 2:
-        nx, ny = nks
-        Lx, Ly = Ls
-        nk = 2 * nx * ny + nx + ny
-        k_pairs = np.zeros((nk, ndims))
-        k_pair_mag = np.zeros(nk)
-        i = 0
-        for kx in range(-nx, nx + 1):
-            for ky in range(0, ny + 1):
-                if ky == 0 and kx <= 0:
-                    continue
-                k_pairs[i, :] = 2 * np.pi / Lx * kx, 2 * np.pi / Ly * ky
-                k_pair_mag[i] = np.linalg.norm(k_pairs[i, :])
-                i += 1
-
-    elif ndims == 3:
-        nx, ny, nz = nks
-        Lx, Ly, Lz = Ls
-        nk = 4 * nx * ny * nz + 2 * (nx * ny + nx * nz + ny * nz) + nx + ny + nz
-        k_pairs = np.zeros((nk, ndims))
-        k_pair_mag = np.zeros(nk)
-        i = 0
-        for kx in range(-nx, nx + 1):
-            for ky in range(-ny, ny + 1):
-                for kz in range(0, nz + 1):
-                    if kz == 0 and (ky < 0 or (ky == 0 and kx <= 0)):
-                        continue
-                    k_pairs[i, :] = (
-                        2 * np.pi / Lx * kx,
-                        2 * np.pi / Ly * ky,
-                        2 * np.pi / Lz * kz,
-                    )
-                    k_pair_mag[i] = np.linalg.norm(k_pairs[i, :])
-                    i += 1
-    else:
-        raise ValueError(f"{ndims} in compute_Fourier_modes is not supported")
-
-    # Sort by magnitude
-    k_pairs = k_pairs[np.argsort(k_pair_mag, kind="stable"), :]
-    return k_pairs
+import equinox as eqx
+from .linear import Linear
+from .common import get_activation as _get_act, compute_Fourier_modes
 
 
 def compute_Fourier_bases(nodes: jnp.ndarray, modes: jnp.ndarray, node_mask: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -114,18 +34,31 @@ def compute_Fourier_bases(nodes: jnp.ndarray, modes: jnp.ndarray, node_mask: jnp
     return bases_c, bases_s, bases_0
 
 
-class SpectralConvGeo(nn.Module):
+class SpectralConvGeo(eqx.Module):
     """
     Spectral convolution layer for GeoFNO.
 
     Operates in Fourier space using precomputed bases for arbitrary geometries.
     """
 
-    in_channels: int
-    out_channels: int
-    nmodes: int
+    in_channels: int = eqx.field(static=True)
+    out_channels: int = eqx.field(static=True)
+    nmodes: int = eqx.field(static=True)
+    weights_c: jnp.ndarray
+    weights_s: jnp.ndarray
+    weights_0: jnp.ndarray
 
-    @nn.compact
+    def __init__(self, in_channels: int, out_channels: int, nmodes: int, *, key):
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.nmodes = nmodes
+
+        scale = 1.0 / (in_channels * out_channels)
+        k1, k2, k3 = jax.random.split(key, 3)
+        self.weights_c = jax.random.uniform(k1, (in_channels, out_channels, nmodes), minval=-scale, maxval=scale)
+        self.weights_s = jax.random.uniform(k2, (in_channels, out_channels, nmodes), minval=-scale, maxval=scale)
+        self.weights_0 = jax.random.uniform(k3, (in_channels, out_channels, 1), minval=-scale, maxval=scale)
+
     def __call__(
         self,
         x: jnp.ndarray,
@@ -149,22 +82,15 @@ class SpectralConvGeo(nn.Module):
         Returns:
             x: float[batch_size, out_channels, nnodes]
         """
-        scale = 1.0 / (self.in_channels * self.out_channels)
-
-        # Learnable weights for Fourier coefficients
-        weights_c = self.param("weights_c", nn.initializers.uniform(scale), (self.in_channels, self.out_channels, self.nmodes))
-        weights_s = self.param("weights_s", nn.initializers.uniform(scale), (self.in_channels, self.out_channels, self.nmodes))
-        weights_0 = self.param("weights_0", nn.initializers.uniform(scale), (self.in_channels, self.out_channels, 1))
-
         # Forward Fourier transform (projection onto bases)
         x_c_hat = jnp.einsum("bix,bxk->bik", x, wbases_c)
         x_s_hat = -jnp.einsum("bix,bxk->bik", x, wbases_s)
         x_0_hat = jnp.einsum("bix,bxk->bik", x, wbases_0)
 
         # Apply weights in Fourier space (complex multiplication)
-        f_c_hat = jnp.einsum("bik,iok->bok", x_c_hat, weights_c) - jnp.einsum("bik,iok->bok", x_s_hat, weights_s)
-        f_s_hat = jnp.einsum("bik,iok->bok", x_s_hat, weights_c) + jnp.einsum("bik,iok->bok", x_c_hat, weights_s)
-        f_0_hat = jnp.einsum("bik,iok->bok", x_0_hat, weights_0)
+        f_c_hat = jnp.einsum("bik,iok->bok", x_c_hat, self.weights_c) - jnp.einsum("bik,iok->bok", x_s_hat, self.weights_s)
+        f_s_hat = jnp.einsum("bik,iok->bok", x_s_hat, self.weights_c) + jnp.einsum("bik,iok->bok", x_c_hat, self.weights_s)
+        f_0_hat = jnp.einsum("bik,iok->bok", x_0_hat, self.weights_0)
 
         # Inverse Fourier transform
         x = jnp.einsum("bok,bxk->box", f_0_hat, bases_0) + 2 * jnp.einsum("bok,bxk->box", f_c_hat, bases_c) - 2 * jnp.einsum("bok,bxk->box", f_s_hat, bases_s)
@@ -172,7 +98,7 @@ class SpectralConvGeo(nn.Module):
         return x
 
 
-class GeoFNO(nn.Module):
+class GeoFNO(eqx.Module):
     """
     Geometry-aware Fourier Neural Operator.
 
@@ -191,21 +117,79 @@ class GeoFNO(nn.Module):
         in_dim: Number of input channels
         out_dim: Number of output channels
         act: Activation function name
+        key: PRNG key for parameter initialization
     """
 
-    ndims: int
-    modes: jnp.ndarray  # float[nmodes, ndims]
-    layers: Sequence[int]
-    fc_dim: int = 128
-    in_dim: int = 3
-    out_dim: int = 1
-    act: str = "gelu"
+    ndims: int = eqx.field(static=True)
+    modes: jnp.ndarray  # float[nmodes, ndims] — non-trainable
+    layers: Sequence[int] = eqx.field(static=True)
+    fc_dim: int = eqx.field(static=True)
+    in_dim: int = eqx.field(static=True)
+    out_dim: int = eqx.field(static=True)
+    act: str = eqx.field(static=True)
+    activation: Callable = eqx.field(static=True)
+    nmodes: int = eqx.field(static=True)
 
-    def setup(self):
-        self.activation = _get_act(self.act)
-        self.nmodes = self.modes.shape[0]
+    fc0: Linear
+    sp_convs: list
+    ws: list
+    fc1: Optional[Linear]
+    fc2: Linear
 
-    @nn.compact
+    def __init__(
+        self,
+        ndims: int,
+        modes: jnp.ndarray,
+        layers: Sequence[int],
+        fc_dim: int = 128,
+        in_dim: int = 3,
+        out_dim: int = 1,
+        act: str = "gelu",
+        *,
+        key,
+    ):
+        self.ndims = ndims
+        self.modes = modes
+        self.layers = list(layers)
+        self.fc_dim = fc_dim
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.act = act
+        self.activation = _get_act(act)
+        self.nmodes = modes.shape[0]
+
+        length = len(layers) - 1
+
+        # Split keys for all sub-modules
+        keys = jax.random.split(key, 2 * length + 3)
+        key_idx = 0
+
+        # Lifting layer: Dense(in_dim -> layers[0])
+        self.fc0 = Linear(in_dim, layers[0], key=keys[key_idx])
+        key_idx += 1
+
+        # Spectral convolution layers and linear (1x1 conv) layers
+        sp_convs = []
+        ws = []
+        for i in range(length):
+            in_ch = layers[i]
+            out_ch = layers[i + 1]
+            sp_convs.append(SpectralConvGeo(in_channels=in_ch, out_channels=out_ch, nmodes=self.nmodes, key=keys[key_idx]))
+            key_idx += 1
+            ws.append(Linear(in_ch, out_ch, key=keys[key_idx]))
+            key_idx += 1
+        self.sp_convs = sp_convs
+        self.ws = ws
+
+        # Projection layers
+        if fc_dim > 0:
+            self.fc1 = Linear(layers[-1], fc_dim, key=keys[key_idx])
+            key_idx += 1
+            self.fc2 = Linear(fc_dim, out_dim, key=keys[key_idx])
+        else:
+            self.fc1 = None
+            self.fc2 = Linear(layers[-1], out_dim, key=keys[key_idx])
+
     def __call__(
         self,
         x: jnp.ndarray,
@@ -242,21 +226,21 @@ class GeoFNO(nn.Module):
         wbases_s = bases_s * node_weights
         wbases_0 = bases_0 * node_weights
 
-        # Lifting layer
-        x = nn.Dense(features=self.layers[0], name="fc0")(x)
+        # Lifting layer: apply fc0 on last dim [batch, nodes, in_dim] -> [batch, nodes, layers[0]]
+        x = jax.vmap(jax.vmap(self.fc0))(x)
         x = jnp.transpose(x, (0, 2, 1))  # [batch, channels, nodes]
 
         # Fourier layers
         for i in range(length):
-            in_ch = self.layers[i]
-            out_ch = self.layers[i + 1]
-
             # Spectral convolution (integral operator K)
-            x1 = SpectralConvGeo(in_channels=in_ch, out_channels=out_ch, nmodes=self.nmodes, name=f"sp_conv_{i}")(x, bases_c, bases_s, bases_0, wbases_c, wbases_s, wbases_0)
+            x1 = self.sp_convs[i](x, bases_c, bases_s, bases_0, wbases_c, wbases_s, wbases_0)
 
-            # Linear transform (W) - 1x1 convolution
-            x2 = nn.Conv(features=out_ch, kernel_size=(1,), use_bias=True, name=f"w_{i}")(jnp.transpose(x, (0, 2, 1)))
-            x2 = jnp.transpose(x2, (0, 2, 1))
+            # Linear transform (W) - replaces 1x1 conv
+            # x: [batch, channels, nodes] -> transpose to [batch, nodes, channels],
+            # apply linear on last dim, transpose back
+            x_t = jnp.transpose(x, (0, 2, 1))  # [batch, nodes, channels]
+            x2 = jax.vmap(jax.vmap(self.ws[i]))(x_t)  # [batch, nodes, out_ch]
+            x2 = jnp.transpose(x2, (0, 2, 1))  # [batch, out_ch, nodes]
 
             x = x1 + x2
 
@@ -267,12 +251,12 @@ class GeoFNO(nn.Module):
         x = jnp.transpose(x, (0, 2, 1))  # [batch, nodes, channels]
 
         # Projection layers
-        if self.fc_dim > 0:
-            x = nn.Dense(features=self.fc_dim, name="fc1")(x)
+        if self.fc1 is not None:
+            x = jax.vmap(jax.vmap(self.fc1))(x)
             if self.activation is not None:
                 x = self.activation(x)
 
-        x = nn.Dense(features=self.out_dim, name="fc2")(x)
+        x = jax.vmap(jax.vmap(self.fc2))(x)
 
         # Apply mask to output
         masked = x * node_mask

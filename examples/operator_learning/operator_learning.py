@@ -1,15 +1,16 @@
+import jax
 import jno
 import jno.numpy as pnp
 from jno import LearningRateSchedule as lrs
 import optax
-from flax import linen as nn
+import equinox as eqx
+from jno.architectures.linear import Linear
 import jax.numpy as jnp
 import numpy as np
 from fem_solution import fem_solver
 
 
-dire = "./runs/operator_learning"
-jno.logger(dire)
+dire = jno.setup(__file__)
 
 π = pnp.pi
 sin = pnp.sin
@@ -20,8 +21,8 @@ exp = pnp.exp  # if pnp.exp is unavailable, replace with (1.0 + 0.2*...) and cla
 # Training data: κ-parameter vectors (batch dimension first)
 # Each row defines one κ field via a parametric form κ(x,y;θ)
 # ------------------------------------------------------
-B_train = 2
-B_test = 1
+B_train = 40
+B_test = 3
 
 # θ = [θ0, θ1, θ2, θ3]  (simple deterministic spread; you can randomize with jax.random if you want)
 key = jnp.arange(B_train + B_test)[:, None]
@@ -33,9 +34,9 @@ theta_test = theta_all[B_train:, :]  # (B_test, 4)
 # domain
 # ------------------------------------------------------
 domain = B_train * jno.domain(constructor=jno.domain.rect(mesh_size=0.05), compute_mesh_connectivity=True)
-x, y = domain.variable("interior", (None, None))
-xb, yb = domain.variable("boundary", (None, None))
-(θ,) = domain.variable("θ", theta_train)
+x, y, t = domain.variable("interior", (None, None))
+xb, yb, tb = domain.variable("boundary", (None, None))
+θ = domain.variable("θ", theta_train)
 domain.plot(f"{dire}/domain.png")
 
 
@@ -44,30 +45,57 @@ domain.plot(f"{dire}/domain.png")
 # branch takes θ (per-sample), trunk takes (x,y) (per-point)
 # output u(x,y;θ)
 # ------------------------------------------------------
-class DeepONet(nn.Module):
+class DeepONet(eqx.Module):
     width: int
     depth: int
     p: int
+    trunk_layers: list
+    trunk_out: Linear
+    branch_layers: list
+    branch_out: Linear
 
-    @nn.compact
+    def __init__(self, width: int, depth: int, p: int, *, key):
+        self.width = width
+        self.depth = depth
+        self.p = p
+
+        keys = jax.random.split(key, 2 * depth + 2)
+
+        # Trunk: first layer takes 2 inputs (x, y)
+        self.trunk_layers = []
+        in_dim = 2
+        for i in range(depth):
+            self.trunk_layers.append(Linear(in_dim, width, key=keys[i]))
+            in_dim = width
+        self.trunk_out = Linear(width, p, key=keys[depth])
+
+        # Branch: first layer takes 4 inputs (θ)
+        self.branch_layers = []
+        in_dim = 4
+        for i in range(depth):
+            self.branch_layers.append(Linear(in_dim, width, key=keys[depth + 1 + i]))
+            in_dim = width
+        self.branch_out = Linear(width, p, key=keys[2 * depth + 1])
+
     def __call__(self, x, y, θ):
-        # x:  (N, 1), y: (N, 1), b: (N, 4)
+        # x:  (N, 1), y: (N, 1), θ: (N, 4)
 
         # Trunk
         t = jnp.concatenate([x, y], axis=-1)  # (N, 2)
-        for _ in range(self.depth):
-            t = nn.tanh(nn.Dense(self.width)(t))
-        t = nn.Dense(self.p)(t)
+        for layer in self.trunk_layers:
+            t = jnp.tanh(layer(t))
+        t = self.trunk_out(t)
 
         # Branch
-        for _ in range(self.depth):
-            θ = nn.tanh(nn.Dense(self.width)(θ))
-        θ = nn.Dense(self.p)(θ)
+        b = θ
+        for layer in self.branch_layers:
+            b = jnp.tanh(layer(b))
+        b = self.branch_out(b)
 
-        return jnp.sum(t * θ, axis=-1)  # (N,1) -> but this will get sqeezed
+        return jnp.sum(t * b, axis=-1)  # (N,1) -> but this will get squeezed
 
 
-net = pnp.nn.wrap(DeepONet(width=64, depth=4, p=32))
+net = pnp.nn.wrap(DeepONet(width=64, depth=4, p=32, key=jax.random.PRNGKey(0)))
 u = net(x, y, θ) * x * (1 - x) * y * (1 - y)
 
 # ------------------------------------------------------
@@ -85,8 +113,9 @@ ux = pnp.grad(u(x, y, θ), x)
 uy = pnp.grad(u(x, y, θ), y)
 pde = -(pnp.grad(κ * ux, x) + pnp.grad(κ * uy, y)) - (2 * π**2 * sin(π * x) * sin(π * y))
 
-crux = jno.core([pde], domain)
-crux.solve(1_000, optax.adam(1), lrs.warmup_cosine(1_000, 1_00, 1e-3, 1e-5)).plot(f"{dire}/training_history.png")
+crux = jno.core([pde.mse], domain)
+net.optimizer(optax.adam, lr=lrs.warmup_cosine(1_000, 1_00, 1e-3, 1e-5))
+crux.solve(1_000).plot(f"{dire}/training_history.png")
 
 # ------------------------------------------------------
 # Inference / testing
@@ -94,12 +123,11 @@ crux.solve(1_000, optax.adam(1), lrs.warmup_cosine(1_000, 1_00, 1e-3, 1e-5)).plo
 # ------------------------------------------------------
 tst_domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.01), compute_mesh_connectivity=False)
 tst_domain.variable("θ", theta_test)
-crux.plot(operation=u, test_pts=tst_domain).savefig(f"{dire}/deeponet_u_test.png", dpi=300)
 crux.save(f"{dire}/crux.pkl")
 
 
 # Inference
-pred = np.array(crux.predict(points=np.tile(tst_domain.points[None, ...], (B_test, 1, 1)), operation=u, tensor_tags=tst_domain.tensor_tags))
+pred = np.array(crux.predict(points=np.tile(tst_domain.points[None, ...], (B_test, 1, 1)), operation=u, context=tst_domain.context))
 true = fem_solver(tst_domain)(theta_test)
 
 

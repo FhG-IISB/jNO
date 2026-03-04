@@ -1,15 +1,32 @@
-"""PINO - Physics-Informed Neural Operators."""
+"""
+jNO: Physics-Informed Neural Operators.
+
+.. warning::
+    This is a research-level repository. It may contain bugs and is subject
+    to continuous change without notice.
+"""
 
 from .core import core
 from .domain import domain
 from .resampling import sampler
-from .trace import Variable, Placeholder, OperationDef, OperationCall, FlaxModule
+from .trace import Variable, Placeholder, OperationDef, OperationCall, Model, Hessian, Jacobian
 from .utils.adaptive import LearningRateSchedule, WeightSchedule
 from .utils import callbacks, Logger, init_default_logger as logger, IREEModel as iree
-from .utils import create_rank_dict
+from .utils.config import (
+    load_config,
+    get_config,
+    get_config_path,
+    get_runs_base_dir,
+    get_rsa_public_key,
+    get_rsa_private_key,
+    get_seed,
+    setup,
+)
 from .trace_evaluator import TraceEvaluator
+from .trace_compiler import TraceCompiler
+from .differential_operators import DifferentialOperators
 from . import resampling
-from contextlib import contextmanager
+from .utils.load_save import save, load
 
 __version__ = "0.1.0"
 
@@ -23,53 +40,32 @@ class ScheduleWrapper:
 schedule = ScheduleWrapper()
 
 
-@contextmanager
-def operations():
-    """Context manager for defining pino operations.
-
-    Operations defined within this block can use the simpler syntax
-    without explicit pino.operation() wrapping. The wrapping happens
-    automatically when expressions are called or passed to solve().
-
-    Example:
-        with pino.operations():
-            u = pnp.concat([x, y]) >> pino.dense(64) >> pino.dense(1)
-            pde = pnp.laplacian(u(x, y), [x, y]) - f(x, y)
-
-        sol = pino.solve([pde], ...)
-    """
-    yield
-
-
 __all__ = [
-    "ParallelConfig",
-    "VmapConfig",
     "schedule",
-    "tuner",
     "core",
     "sampler",
-    "solve",
     "domain",
-    "operation",
-    "operations",
-    "dense",
-    "model",
-    "FlaxModule",
-    "laplace",
-    "grad",
-    "concat",
+    "Model",
     "Variable",
     "Placeholder",
     "OperationDef",
     "OperationCall",
-    "variable",
     "resampling",
     "LearningRateSchedule",
     "WeightSchedule",
-    "Inferer",
     "callbacks",
     "logger",
     "TraceEvaluator",
-    "create_rank_dict",
+    "TraceCompiler",
+    "DifferentialOperators",
     "iree",
+    "save",
+    "load",
+    "setup",
+    "load_config",
+    "get_config",
+    "get_runs_base_dir",
+    "get_rsa_public_key",
+    "get_rsa_private_key",
+    "get_seed",
 ]

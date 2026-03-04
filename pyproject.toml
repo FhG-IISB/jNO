@@ -3,34 +3,37 @@ name = "jNO"
 version = "0.2.0"
 description = "Jax Neural Operators"
 readme = "README.md"
-requires-python = ">=3.11,<=3.12.4"
+requires-python = ">=3.11, <3.14"
 authors = [{ name = "Leon Armbruster", email = "leonarmbruster@iisb.fraunhofer.de" }]
 
 dependencies = [
-    "jax>=0.4.38,<=0.8.1",
-    "flax",
+    "jax",
+    "equinox",
     "optax",
-    "lox @ git+https://github.com/huterguier/lox",
-    "soap_jax @ git+https://github.com/haydn-jones/SOAP_JAX",
-    "jaxkan",
-    "numpy",
     "matplotlib",
     "graphviz",
     "pygmsh",
     "cloudpickle",
+    "pylotte",
     "nevergrad",
     "einops"
 ]
 
 [project.optional-dependencies]
 cuda = [
-    "jax[cuda]>=0.4.38,<=0.8.1"
+    "jax[cuda]"
 ]
 dev = ["pytest>=7.0", "black>=22.0", "flake8>=4.0", "mypy>=0.950"]
 iree = [
     "iree-base-compiler",
     "iree-base-runtime"
 ]
+foundation = [
+    "jax_morph @git+https://github.com/armbrusl/jax_morph",
+    "jax_mpp @git+https://github.com/armbrusl/jax_mpp",
+]
+
+
 [tool.setuptools]
 packages = ["jno"]
 

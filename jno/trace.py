@@ -10,9 +10,34 @@ from dataclasses import dataclass, field
 from .tuner import Arch, ArchSpace
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
+import equinox as eqx
 from pathlib import Path
 import json
+
+__all__ = [
+    "Placeholder",
+    "FunctionCall",
+    "Literal",
+    "ConstantNamespace",
+    "Constant",
+    "Variable",
+    "TensorTag",
+    "BinaryOp",
+    "Tracker",
+    "Model",
+    "TunableModule",
+    "TunableModuleCall",
+    "ModelCall",
+    "OperationDef",
+    "OperationCall",
+    "Hessian",
+    "Jacobian",
+    "collect_operations",
+    "collect_tags",
+    "get_primary_tag",
+    "dump_tree",
+    "cse",
+]
 
 # Global counter for unique operation IDs
 _operation_counter = 0
@@ -24,103 +49,6 @@ def _next_op_id() -> int:
     return _operation_counter
 
 
-class Debug:
-
-    def __init__(self, name):
-        """
-        This is the debugger
-        """
-        self.name: str = name
-        self._val: bool = False
-        self._shape: bool = False
-        self._mean: bool = False
-        self._max: bool = False
-        self._min: bool = False
-        self._flops: bool = True
-
-    def count(self):
-        cou = 0
-        if self._val:
-            cou += 1
-        if self._shape:
-            cou += 1
-        if self._mean:
-            cou += 1
-        if self._max:
-            cou += 1
-        if self._min:
-            cou += 1
-        return cou
-
-    def __call__(self, expr):
-        num = self.count()
-
-        if num == 0:
-            return expr
-
-        # If only one option is enabled, print with name
-        if num == 1:
-            if self._val:
-                jax.debug.print("{name} -> {expr}", name=self.name, expr=expr)
-            if self._shape:
-                jax.debug.print(
-                    "{name}.shape -> {shape}", name=self.name, shape=expr.shape
-                )
-            if self._mean:
-                jax.debug.print(
-                    "{name}.mean -> {mean}", name=self.name, mean=jnp.mean(expr)
-                )
-            if self._max:
-                jax.debug.print(
-                    "{name}.max -> {max}", name=self.name, max=jnp.max(expr)
-                )
-            if self._min:
-                jax.debug.print(
-                    "{name}.min -> {min}", name=self.name, min=jnp.min(expr)
-                )
-        else:
-            # Multiple options enabled - print name once, then values without name
-            jax.debug.print("{name} ->", name=self.name)
-            if self._val:
-                jax.debug.print("  value: {expr}", expr=expr)
-            if self._shape:
-                jax.debug.print("  shape: {shape}", shape=expr.shape)
-            if self._mean:
-                jax.debug.print("  mean: {mean}", mean=jnp.mean(expr))
-            if self._max:
-                jax.debug.print("  max: {max}", max=jnp.max(expr))
-            if self._min:
-                jax.debug.print("  min: {min}", min=jnp.min(expr))
-
-        return expr
-
-    # Builder methods for fluent API
-    def print(self):
-        self._print = True
-        return self
-
-    def shape(self):
-        self._shape = True
-        return self
-
-    def mean(self):
-        self._mean = True
-        return self
-
-    def max(self):
-        self._max = True
-        return self
-
-    def min(self):
-        self._min = True
-        return self
-
-
-class NewAxis:
-    def __repr__(self):
-        return "None"
-
-
 class Placeholder:
     """Base node for the traced DSL graph.
 
@@ -129,7 +57,30 @@ class Placeholder:
     placeholder (`u(x)`) auto-wraps it in an `OperationDef` so it can be reused
     with different inputs. Concrete values are only produced when evaluated by
     the solver/visualizer.
+
+    Note: ``__eq__`` and ``__hash__`` use object identity so that Placeholder
+    instances can safely be stored in sets and used as dict keys.  For
+    element-wise symbolic equality comparisons use ``Placeholder.equal(other)``.
     """
+
+    # -- identity-based equality so Placeholders work in sets/dicts -----------
+    def __eq__(self, other):
+        return self is other
+
+    def __ne__(self, other):
+        return self is not other
+
+    def __hash__(self):
+        return id(self)
+
+    # -- symbolic comparison operators (return traced FunctionCall nodes) ------
+    def equal(self, other):
+        """Element-wise symbolic equality (traced, not Python ``==``)."""
+        return FunctionCall(jnp.equal, [self, other])
+
+    def not_equal(self, other):
+        """Element-wise symbolic inequality (traced, not Python ``!=``)."""
+        return FunctionCall(jnp.not_equal, [self, other])
 
     def __gt__(self, other):
         return FunctionCall(jnp.greater, [self, other])
@@ -142,24 +93,6 @@ class Placeholder:
 
     def __le__(self, other):
         return FunctionCall(jnp.less_equal, [self, other])
-
-    def __eq__(self, other):
-        return FunctionCall(jnp.equal, [self, other])
-
-    def __ne__(self, other):
-        return FunctionCall(jnp.not_equal, [self, other])
-
-    def __rgt__(self, other):
-        return FunctionCall(jnp.less, [other, self])
-
-    def __rlt__(self, other):
-        return FunctionCall(jnp.greater, [other, self])
-
-    def __rge__(self, other):
-        return FunctionCall(jnp.less_equal, [other, self])
-
-    def __rle__(self, other):
-        return FunctionCall(jnp.greater_equal, [other, self])
 
     def _wrap(self, other):
         """Wrap non-Placeholder types."""
@@ -203,10 +136,8 @@ class Placeholder:
     def __getitem__(self, key):
         if not isinstance(key, tuple):
             key = (key,)
-
-        normalized = tuple(NewAxis() if k is None else k for k in key)
-
-        return Slice(self, normalized)
+        concrete_key = tuple(None if k is None else k for k in key)
+        return FunctionCall(lambda x, k=concrete_key: x[k], [self], name="getitem")
 
     def __call__(self, *args):
         """Call this expression with different variables (auto-wraps in operation)."""
@@ -236,24 +167,14 @@ class Placeholder:
         return FunctionCall(lambda b: other @ b, [self])
 
     def reshape(self, *shape):
-        """Reshape this placeholder to a new shape.
-
-        Args:
-            *shape: New shape as separate arguments or a single tuple
-
-        Returns:
-            Reshape node representing the reshaped tensor
-        """
-        # Handle both reshape(2, 3) and reshape((2, 3)) syntax
+        """Reshape this placeholder to a new shape."""
         if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
             shape = tuple(shape[0])
-        return Reshape(self, shape)
+        return FunctionCall(lambda x, s=shape: x.reshape(s), [self], name="reshape")
 
     @property
     def shape(self):
-        return FunctionCall(
-            lambda x: jnp.ones(x.shape, dtype="bool"), [self], "shape", True
-        )
+        return FunctionCall(lambda x: jnp.ones(x.shape, dtype="bool"), [self], "shape", True)
 
     @property
     def mean(self):
@@ -277,53 +198,87 @@ class Placeholder:
 
     @property
     def mse(self):
-        return FunctionCall(
-            lambda x: jnp.squeeze(jnp.mean(jnp.square(x))), [self], "mse", True
-        )
+        def fn(x):
+            return jnp.squeeze(jnp.mean(jnp.square(x)))
+
+        return FunctionCall(fn, [self], "mse", True)
 
     @property
     def mae(self):
-        return FunctionCall(
-            lambda x: jnp.squeeze(jnp.mean(jnp.abs(x))), [self], "mae", True
-        )
+        return FunctionCall(lambda x: jnp.squeeze(jnp.mean(jnp.abs(x))), [self], "mae", True)
 
     @property
     def T(self):
         return FunctionCall(lambda x: x.T, [self], "transpose", True)
 
+    # ------------------------------------------------------------------
+    # Differential operators — method-style API
+    # ------------------------------------------------------------------
 
-class Reshape(Placeholder):
-    """Reshape a traced tensor to a new shape."""
+    def d(self, variable: "Variable", scheme: str = "automatic_differentiation") -> "Jacobian":
+        """Return ∂self/∂variable — shorthand for ``jnn.grad(self, variable)``.
 
-    def __init__(self, target: Placeholder, shape: tuple):
-        self.target = target
-        self.shape = shape
-        self.tag = target.tag if hasattr(target, "tag") else None
+        Can be chained for higher-order derivatives::
 
-    def __repr__(self):
-        return f"{self.target}.reshape({self.shape})"
+            u_xx = u.d(x).d(x)   # ∂²u/∂x²
+            u_xy = u.d(x).d(y)   # ∂²u/∂x∂y
 
+        Args:
+            variable: The Variable to differentiate with respect to.
+            scheme: ``'automatic_differentiation'`` (default) or
+                ``'finite_difference'``.
+        """
+        return Jacobian(self, [variable], scheme)
 
-class Slice(Placeholder):
-    def __init__(self, target: Placeholder, key):
-        self.target = target
-        self.key = key
-        self.tag = target.tag if hasattr(target, "tag") else None
+    def diff(self, variable: "Variable", scheme: str = "automatic_differentiation") -> "Jacobian":
+        """Alias for :meth:`d`."""
+        return Jacobian(self, [variable], scheme)
 
-    def __repr__(self):
-        return f"{self.target}[{', '.join(map(str, self.key))}]"
+    def laplacian(
+        self,
+        *variables: "Variable",
+        scheme: str = "automatic_differentiation",
+    ) -> "Hessian":
+        """Return ∇²self — shorthand for ``jnn.laplacian(self, list(variables))``.
 
+        Example::
 
-class Concat(Placeholder):
-    """Concatenate multiple traced tensors along a given axis."""
+            lap_u = u.laplacian(x, y)   # ∂²u/∂x² + ∂²u/∂y²
 
-    def __init__(self, items: List, axis: int = -1):
-        self.items = items
-        self.axis = axis
+        Args:
+            *variables: Variables to include in the Laplacian.
+            scheme: ``'automatic_differentiation'`` (default) or
+                ``'finite_difference'``.
+        """
+        return Hessian(self, list(variables) if variables else None, scheme, trace=True)
 
-    def __repr__(self):
-        items_str = ", ".join(str(i) for i in self.items)
-        return f"Concat([{items_str}])"
+    def hessian(
+        self,
+        *variables: "Variable",
+        scheme: str = "automatic_differentiation",
+    ) -> "Hessian":
+        """Return the full Hessian matrix of self w.r.t. *variables*.
+
+        Example::
+
+            H = u.hessian(x, y)   # 2×2 Hessian matrix per point
+
+        Args:
+            *variables: Variables for the Hessian.
+            scheme: ``'automatic_differentiation'`` (default) or
+                ``'finite_difference'``.
+        """
+        return Hessian(self, list(variables), scheme, trace=False)
+
+    def d2(self, variable: "Variable", scheme: str = "automatic_differentiation") -> "Hessian":
+        """Return ∂²self/∂variable² — shorthand for ``jnn.hessian(self, [variable])``.
+
+        Args:
+            variable: The Variable to differentiate with respect to.
+            scheme: ``'automatic_differentiation'`` (default) or
+                ``'finite_difference'``.
+        """
+        return Hessian(self, [variable], scheme, trace=True)
 
 
 class FunctionCall(Placeholder):
@@ -350,9 +305,7 @@ class FunctionCall(Placeholder):
 
     def copy_with_args(self, new_args):
         """Create a new instance with different args."""
-        return FunctionCall(
-            fn=self.fn, args=new_args, name=self._name, reduces_axis=self.reduces_axis
-        )
+        return FunctionCall(fn=self.fn, args=new_args, name=self._name, reduces_axis=self.reduces_axis, kwargs=self.kwargs)
 
     def __call__(self, args):
         """Return a new FunctionCall with the given args."""
@@ -429,13 +382,7 @@ class ConstantNamespace:
             if any(isinstance(item, dict) for item in value):
                 # Convert each dict to ConstantNamespace, keep others as-is
                 return [
-                    (
-                        ConstantNamespace(f"{key}[{i}]", item, _parent_tag=parent_tag)
-                        if isinstance(item, dict)
-                        else ConstantNamespace._convert_value(
-                            item, f"{key}[{i}]", parent_tag
-                        )
-                    )
+                    (ConstantNamespace(f"{key}[{i}]", item, _parent_tag=parent_tag) if isinstance(item, dict) else ConstantNamespace._convert_value(item, f"{key}[{i}]", parent_tag))
                     for i, item in enumerate(value)
                 ]
             # Check if it's numeric (could be nested arrays)
@@ -515,10 +462,7 @@ class ConstantNamespace:
             return self._load_npy(path)
 
         else:
-            raise ValueError(
-                f"Unsupported file format: '{suffix}'. "
-                f"Supported formats: .json, .yaml, .yml, .toml, .pkl, .pickle, .npz, .npy"
-            )
+            raise ValueError(f"Unsupported file format: '{suffix}'. " f"Supported formats: .json, .yaml, .yml, .toml, .pkl, .pickle, .npz, .npy")
 
     @staticmethod
     def _load_json(path: Path) -> dict:
@@ -532,10 +476,7 @@ class ConstantNamespace:
         try:
             import yaml
         except ImportError:
-            raise ImportError(
-                "PyYAML is required to load .yaml/.yml files. "
-                "Install with: pip install pyyaml"
-            )
+            raise ImportError("PyYAML is required to load .yaml/.yml files. " "Install with: pip install pyyaml")
 
         with open(path, "r") as f:
             return yaml.safe_load(f)
@@ -556,10 +497,7 @@ class ConstantNamespace:
                 with open(path, "r") as f:
                     return toml.load(f)
             except ImportError:
-                raise ImportError(
-                    "toml package is required to load .toml files. "
-                    "Install with: pip install toml"
-                )
+                raise ImportError("toml package is required to load .toml files. " "Install with: pip install toml")
 
     @staticmethod
     def _load_pickle(path: Path) -> dict:
@@ -569,9 +507,7 @@ class ConstantNamespace:
         with open(path, "rb") as f:
             data = pickle.load(f)
         if not isinstance(data, dict):
-            raise TypeError(
-                f"Pickle file must contain a dict, got {type(data).__name__}"
-            )
+            raise TypeError(f"Pickle file must contain a dict, got {type(data).__name__}")
         return data
 
     @staticmethod
@@ -604,10 +540,7 @@ class ConstantNamespace:
 
         if key not in self._data:
             available = list(self._data.keys())
-            raise AttributeError(
-                f"Constant '{self._full_tag}' has no key '{key}'. "
-                f"Available keys: {available}"
-            )
+            raise AttributeError(f"Constant '{self._full_tag}' has no key '{key}'. " f"Available keys: {available}")
 
         value = self._data[key]
 
@@ -657,10 +590,7 @@ class ConstantNamespace:
             elif isinstance(value, jnp.ndarray):
                 result[key] = value
             elif isinstance(value, list):
-                result[key] = [
-                    item.to_dict() if isinstance(item, ConstantNamespace) else item
-                    for item in value
-                ]
+                result[key] = [item.to_dict() if isinstance(item, ConstantNamespace) else item for item in value]
             else:
                 result[key] = value
         return result
@@ -713,26 +643,27 @@ class Variable(Placeholder):
 
     Carries the domain tag and dimension index so the solver can bind sampled
     coordinates when evaluating traced expressions.
+
+    For time-dependent problems, spatial variables (``axis='spatial'``) index
+    into the spatial context array ``context[tag]`` shaped ``(N, D_spatial)``
+    (after the outer B and T vmaps peel off their axes).  The temporal
+    variable (``axis='temporal'``) reads from a separate
+    ``context["__time__"]`` entry that is a scalar (after the T vmap).
     """
 
-    def __init__(self, tag: str, dim: list, domain=None):
+    def __init__(self, tag: str, dim: list, domain=None, axis: str = "spatial"):
         self.tag = tag
         self.dim = dim
-        if tag in domain.sampled_points.keys():
-            self.size = (
-                dim[1] - dim[0]
-                if dim[1] is not None
-                else domain.sampled_points[tag].shape[-1]
-            )
+        self.axis = axis  # 'spatial' or 'temporal'
+        if tag in domain.context.keys():
+            self.size = dim[1] - dim[0] if dim[1] is not None else domain.context[tag].shape[-1]
         else:
-            self.size = (
-                dim[1] - dim[0]
-                if dim[1] is not None
-                else domain.tensor_tags[tag].shape[-1]
-            )
+            raise KeyError(f"Variable tag '{tag}' not found in domain.context. Available: {list(domain.context.keys())}")
         self._domain = domain  # Reference to parent domain for inference
 
     def __repr__(self):
+        if self.axis == "temporal":
+            return f"Var(t)"
         return f"Var({self.tag}[{self.dim}])"
 
 
@@ -765,47 +696,46 @@ class BinaryOp(Placeholder):
         self.op = op
         self.left = left
         self.right = right
-        self.debug = Debug(f"({self.left} {self.op} {self.right})")
 
     def __repr__(self):
         return f"({self.left} {self.op} {self.right})"
 
 
 class Tracker(Placeholder):
-    def __init__(self, op: BinaryOp, interval: int):
-        self.op = op
+    """Wraps an expression to be monitored during training without contributing to the loss."""
+
+    def __init__(self, expr: Placeholder, interval: int = 1):
+        self.expr = expr
         self.interval = interval
 
     def __repr__(self):
-        return f"tracked_BinaryOp[{self.interval}]"
+        return f"Tracker({self.expr!r}, interval={self.interval})"
 
 
-class FlaxModule(Placeholder):
-    """Wrapper for user-defined Flax nn.Module models.
+class Model(Placeholder):
+    """Wrapper for user-defined Equinox models.
 
-    Allows using any Flax model within the PINO tracing system.
+    Allows using any Equinox module within the PINO tracing system.
     The module is initialized lazily when the input dimension is known.
 
-    Example 2 - Direct call style (module takes separate arguments):
-        class MLP(nn.Module):
-            @nn.compact
-            def __call__(self, x, y):
+    Example - Direct call style (module takes separate arguments):
+        class MLP(eqx.Module):
+            ...
+            def __call__(self, x, y, *, key=None):
                 z = jnp.concat([x, y], axis=-1)
-                z = nn.Dense(64)(z)
-                z = nn.tanh(z)
-                z = nn.Dense(2)(z)
+                ...
                 return z
 
-        uv_net = pnp.nn.wrap(MLP())
+        uv_net = pnp.nn.wrap(MLP(..., key=key))
         u = uv_net(x, y)[..., 0]
     """
 
-    def __init__(self, module: nn.Module, name: str = "", weight_path: str = None):
-        """Create a FlaxModule wrapper.
+    def __init__(self, module, name: str = "", weight_path: str = None):
+        """Create a Model wrapper.
 
         Args:
-            module: A Flax nn.Module instance (already constructed)
-            input_dim: Optional input dimension. If None, inferred from arguments.
+            module: An Equinox module instance (already constructed), or a
+                    callable / Flax nn.Module for backward compatibility.
         """
         self.module = module
         self.name = name
@@ -814,41 +744,342 @@ class FlaxModule(Placeholder):
         self.layer_id = _next_op_id()
         self.show = True  # Wether or not to print the model
 
+        # ── training config (plain Python, not JAX arrays) ──
+        self._frozen: bool = False
+        self._lora_config = None  # (rank, alpha) or None
+        self._opt_fn = None  # optax optimizer factory / instance
+        self._lr = None  # LearningRateSchedule or None
+        self._dtype = None  # target dtype (e.g. jnp.bfloat16) or None
+        self._param_mask = None  # pytree of bool with same structure as model; None = all trainable
+        self._weight_tree = None  # pretrained weights as a pytree (alternative to weight_path file)
+        self._tunable_opts: Dict[str, list] = {}  # per-model tunable options for sweeps
+
+    # ── public API ───────────────────────────────────────────
+
     def __call__(self, *args):
-        """Call this module with variables - creates a FlaxModuleCall."""
-        return FlaxModuleCall(self, list(args))
+        """Call this module with variables - creates a ModelCall."""
+        return ModelCall(self, list(args))
 
     def __repr__(self):
-        return f"FlaxModule({type(self.module).__name__})"
+        return f"Model({type(self.module).__name__})"
 
     def dont_show(self):
         """If called will NOT display the network architecture."""
         self.show = False
         return self
 
+    # ── finetuning helpers ───────────────────────────────────
+
+    def freeze(self):
+        """Mark this model as frozen (not trained)."""
+        self._frozen = True
+        return self
+
+    def unfreeze(self):
+        """Unfreeze this model so it is trained normally."""
+        self._frozen = False
+        return self
+
+    def mask(self, param_mask):
+        """Restrict which parameters are trainable via a boolean pytree mask.
+
+        ``param_mask`` must be a pytree with the **same structure** as the
+        underlying module, but with every leaf replaced by a ``bool``:
+
+        * ``True``  -> the corresponding array is **trainable**.
+        * ``False`` -> the corresponding array is **frozen** (kept in the
+          model but not updated by the optimizer).
+
+        The mask is compatible with all other training helpers — you can
+        chain ``.mask(...).optimizer(...)``, ``.mask(...).lora(...)`` or
+        ``.mask(...).freeze()`` freely.
+
+        A convenient way to build the mask for an Equinox model is::
+
+            import equinox as eqx, jax
+
+            # Freeze everything, then flip specific leaves to True:
+            all_false = jax.tree_util.tree_map(lambda _: False, model.module)
+            param_mask = eqx.tree_at(
+                lambda m: (m.layers[0].weight, m.layers[0].bias),
+                all_false,
+                (True, True),
+            )
+            model.mask(param_mask).optimizer(optax.adam, lr=1e-3)
+
+        Args:
+            param_mask: A pytree matching the structure of the underlying
+                module where every leaf is a ``bool``.
+
+        Returns:
+            self (for chaining).
+        """
+        self._param_mask = param_mask
+        return self
+
+    def lora(self, rank: int = 4, alpha: float = 1.0):
+        """Enable LoRA fine-tuning for this model.
+
+        Only the low-rank adapters are trained; base weights are frozen.
+
+        Args:
+            rank:  LoRA rank.
+            alpha: LoRA scaling factor.
+        """
+        self._lora_config = (rank, alpha)
+        return self
+
+    def merge_lora(self):
+        """Merge LoRA adapters into base weights and disable LoRA."""
+        from .architectures.lora_linear import merge_lora as _merge_lora
+
+        # The actual merge is done by core.solve() after training;
+        # calling this just sets a flag.
+        self._lora_config = None
+        self._merge_lora_flag = True
+        return self
+
+    def optimizer(self, opt_fn, *, lr=None):
+        """Attach an optimizer (and optional LR schedule) to this model.
+
+        Args:
+            opt_fn: An optax optimizer factory, e.g. ``optax.adam``,
+                    or an already-constructed transform.
+            lr:     A ``LearningRateSchedule`` (or float) for this model.
+                    If *None*, a constant schedule of 1e-3 is used.
+        """
+        from .utils.adaptive import LearningRateSchedule
+
+        self._opt_fn = opt_fn
+        if lr is None:
+            self._lr = LearningRateSchedule(1e-3)
+        elif isinstance(lr, (int, float)):
+            self._lr = LearningRateSchedule(float(lr))
+        else:
+            self._lr = lr
+        return self
+
+    def initialize(self, weights):
+        """Load pretrained weights into this model at init time.
+
+        Accepts either a **file path** or a **pytree of arrays** directly.
+
+        * **File path** (``str`` / ``Path``) — existing behaviour:
+
+          - *Equinox* modules: path written by
+            ``eqx.tree_serialise_leaves``.
+          - *Flax* ``FlaxModelWrapper``: path to a ``.msgpack`` weights
+            file.  Shape-mismatched arrays are re-initialised automatically.
+
+        * **Pytree** (any non-string value, e.g. an ``eqx.Module`` instance
+          or a plain dict of arrays) — the tree is stored directly and
+          its array leaves replace those of the freshly-initialised model:
+
+          .. code-block:: python
+
+              # Save a model's current params into another model
+              pretrained = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key)
+              new_model = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key2)
+              new_model.initialize(pretrained.module)   # use pytree directly
+
+        Args:
+            weights: A file path (``str``) *or* a pytree whose leaves are
+                     the pretrained arrays.
+
+        Returns:
+            self (for chaining).
+        """
+        if isinstance(weights, (str, Path)):
+            self.weight_path = str(weights)
+            self._weight_tree = None
+        else:
+            self._weight_tree = weights
+            self.weight_path = None
+        return self
+
+    def dtype(self, dtype):
+        """Cast all floating-point parameters to *dtype* before training.
+
+        Reduces memory usage (e.g. ``jnp.bfloat16`` halves float32 memory)
+        while maintaining training stability for many models.
+
+        The cast is applied **after** pretrained weights are loaded (if any)
+        and before the training loop starts.  Integer arrays (e.g. indices)
+        are left unchanged.
+
+        Args:
+            dtype: Target JAX dtype, e.g. ``jnp.bfloat16`` or
+                ``jnp.float16``.
+
+        Example::
+
+            u = nn.walrus((1,1,128,128,1), num_out_channels=1)
+            u.initialize("walrus.msgpack")
+            u.dtype(jnp.bfloat16)
+        """
+        self._dtype = dtype
+        return self
+
+    @property
+    def model_key(self) -> str:
+        """Stable key identifying this model in a sweep space."""
+        return self.name if self.name else f"model_{self.layer_id}"
+
+    def tune(self, *, freeze=None, lora=None, optimizer=None, lr=None, dtype=None):
+        """Declare per-model tunable options for hyperparameter sweeps.
+
+        Each argument accepts a list of candidate values.  During a sweep
+        the tuner searches over all combinations.
+
+        Args:
+            freeze: List of bool, e.g. ``[True, False]``.
+            lora: List of ``(rank, alpha)`` tuples **or** ``None`` values,
+                e.g. ``[(4, 1.0), (8, 1.0), None]``.
+            optimizer: List of optax factories, e.g. ``[optax.adam]``.
+            lr: List of :class:`LearningRateSchedule` objects.
+            dtype: List of dtypes, e.g. ``[jnp.float32, jnp.bfloat16]``.
+
+        Returns:
+            self (for chaining).
+
+        Example::
+
+            backbone = nn.poseidon(...)
+            backbone.initialize("weights.msgpack")
+            backbone.tune(
+                freeze=[True, False],
+                lora=[(4, 1.0), None],
+                optimizer=[optax.adam],
+                lr=[lrs.constant(1e-4), lrs.constant(1e-5)],
+            )
+        """
+        self._tunable_opts = {}
+        if freeze is not None:
+            self._tunable_opts["freeze"] = list(freeze)
+        if lora is not None:
+            self._tunable_opts["lora"] = list(lora)
+        if optimizer is not None:
+            self._tunable_opts["optimizer"] = list(optimizer)
+        if lr is not None:
+            self._tunable_opts["lr"] = list(lr)
+        if dtype is not None:
+            self._tunable_opts["dtype"] = list(dtype)
+        return self
+
+    def reset(self):
+        """Reset all training configuration to defaults.
+
+        .. note:: This does **not** clear ``_tunable_opts`` — those
+           persist across trials so that the tuner can re-apply them.
+        """
+        self._frozen = False
+        self._lora_config = None
+        self._opt_fn = None
+        self._lr = None
+        self._dtype = None
+        self._param_mask = None
+        self._weight_tree = None
+        self._merge_lora_flag = False
+        return self
+
+
+class ModelCall(Placeholder):
+    """Represents a call to a Model with specific arguments.
+
+    This is created when you call a Model directly with variables:
+        uv_net = pnp.nn.wrap(MLP())
+        result = uv_net(x, y)  # Creates ModelCall
+
+    All training-configuration methods (``freeze``, ``lora``, ``optimizer``,
+    ``dtype``, ``initialize``, ``tune``) are proxied to the underlying
+    :class:`Model` so you can chain them after the call::
+
+        u = nn.mlp(2, 64, 1)(x, y).freeze()
+    """
+
+    def __init__(self, model: Model, args: list):
+        self.model = model
+        self.args = args
+        self.op_id = _next_op_id()
+
+    def __repr__(self):
+        args_str = ", ".join(str(a) for a in self.args)
+        return f"{self.model}({args_str})"
+
+    # ── proxied helpers (delegate to Model) ─────────────
+
+    def dont_show(self):
+        """If called will NOT display the network architecture."""
+        self.model.show = False
+        return self
+
+    def freeze(self):
+        self.model.freeze()
+        return self
+
+    def unfreeze(self):
+        self.model.unfreeze()
+        return self
+
+    def mask(self, param_mask):
+        """Proxy for :meth:`Model.mask`."""
+        self.model.mask(param_mask)
+        return self
+
+    def lora(self, rank: int = 4, alpha: float = 1.0):
+        self.model.lora(rank, alpha)
+        return self
+
+    def optimizer(self, opt_fn, *, lr=None):
+        self.model.optimizer(opt_fn, lr=lr)
+        return self
+
+    def initialize(self, weight_path: str):
+        self.model.initialize(weight_path)
+        return self
+
+    def dtype(self, dtype):
+        self.model.dtype(dtype)
+        return self
+
+    def tune(self, **kwargs):
+        """Proxy for :meth:`Model.tune`."""
+        self.model.tune(**kwargs)
+        return self
+
 
 class TunableModule(Placeholder):
     """
     Wraps a Flax module CLASS + ArchSpace.
-    Behaves like FlaxModule but with lazy instantiation.
+    Behaves like Model but with lazy instantiation.
     """
 
     def __init__(self, module_cls: Type, space: "ArchSpace"):
         self.module_cls = module_cls
         self.space = space
         self.layer_id = _next_op_id()
-        self._current_instance: Optional[FlaxModule] = None
+        self._current_instance: Optional[Model] = None
 
     def __call__(self, *args):
-        """Call with variables - creates FlaxModuleCall."""
+        """Call with variables - creates ModelCall."""
         # If we have a current instance (during solve), use it
         if self._current_instance is not None:
             return self._current_instance(*args)
         # Otherwise create a placeholder call
         return TunableModuleCall(self, list(args))
 
-    def instantiate(self, arch: "Arch"):
-        """Create module instance with given architecture."""
+    def instantiate(self, arch: "Arch", *, key=None):
+        """Create module instance with given architecture.
+
+        For equinox modules, pass ``key`` for random initialization.
+        Falls back to ``module_cls(arch=arch)`` if the constructor
+        does not accept a ``key`` keyword.
+        """
+        if key is not None:
+            try:
+                return self.module_cls(arch=arch, key=key)
+            except TypeError:
+                return self.module_cls(arch=arch)
         return self.module_cls(arch=arch)
 
 
@@ -864,29 +1095,9 @@ class TunableModuleCall(Placeholder):
         args_str = ", ".join(str(a) for a in self.args)
         return f"{self.model}({args_str})"
 
-
-class FlaxModuleCall(Placeholder):
-    """Represents a call to a FlaxModule with specific arguments.
-
-    This is created when you call a FlaxModule directly with variables:
-        uv_net = pnp.nn.wrap(MLP())
-        result = uv_net(x, y)  # Creates FlaxModuleCall
-
-    Call .dont_show to not display the model
-    """
-
-    def __init__(self, model: FlaxModule, args: list):
-        self.model = model
-        self.args = args
-        self.op_id = _next_op_id()
-
-    def __repr__(self):
-        args_str = ", ".join(str(a) for a in self.args)
-        return f"{self.model}({args_str})"
-
     def dont_show(self):
         """If called will NOT display the network architecture."""
-        self.model.show = False
+        self.model._show = False
         return self
 
 
@@ -918,16 +1129,13 @@ class OperationDef(Placeholder):
                 if id(node) not in seen_ids:
                     seen_ids.add(id(node))
                     vars_found.append(node)
-            elif isinstance(node, FlaxModuleCall):
+            elif isinstance(node, ModelCall):
                 for arg in node.args:
                     if isinstance(arg, Placeholder):
                         visit(arg)
             elif isinstance(node, BinaryOp):
                 visit(node.left)
                 visit(node.right)
-            elif isinstance(node, Concat):
-                for item in node.items:
-                    visit(item)
             elif isinstance(node, FunctionCall):
                 for arg in node.args:
                     if isinstance(arg, Placeholder):
@@ -935,32 +1143,24 @@ class OperationDef(Placeholder):
             elif isinstance(node, OperationCall):
                 for arg in node.args:
                     visit(arg)
-            elif isinstance(node, Slice):
-                visit(node.target)
 
         visit(expr)
         return vars_found
 
     def _has_trainable_layers(self, expr) -> bool:
-        """Check if expression contains FlaxModule nodes."""
+        """Check if expression contains Model nodes."""
 
         def visit(node):
-            if isinstance(node, FlaxModule):
+            if isinstance(node, Model):
                 return True
-            elif isinstance(node, FlaxModuleCall):
-                return True  # FlaxModuleCall contains a trainable FlaxModule
+            elif isinstance(node, ModelCall):
+                return True  # ModelCall contains a trainable Model
             elif isinstance(node, BinaryOp):
                 return visit(node.left) or visit(node.right)
-            elif isinstance(node, Concat):
-                return any(visit(item) for item in node.items)
             elif isinstance(node, FunctionCall):
-                return any(
-                    visit(arg) for arg in node.args if isinstance(arg, Placeholder)
-                )
+                return any(visit(arg) for arg in node.args if isinstance(arg, Placeholder))
             elif isinstance(node, OperationCall):
                 return node.operation.has_trainable
-            elif isinstance(node, Slice):
-                return visit(node.target)
             return False
 
         return visit(expr)
@@ -975,10 +1175,7 @@ class OperationDef(Placeholder):
         n_vars = len(self._collected_vars)
         if len(args) > n_vars:
             var_names = [str(v) for v in self._collected_vars]
-            raise ValueError(
-                f"Op[{self.op_id}] has {n_vars} variable(s) {var_names}, "
-                f"but {len(args)} argument(s) were passed: {[str(a) for a in args]}"
-            )
+            raise ValueError(f"Op[{self.op_id}] has {n_vars} variable(s) {var_names}, " f"but {len(args)} argument(s) were passed: {[str(a) for a in args]}")
         # Fill in missing args from original variables
         if len(args) < n_vars:
             args = args + tuple(self._collected_vars[len(args) :])
@@ -1003,61 +1200,41 @@ class OperationCall(Placeholder):
         return f"{self.operation}({args_str})"
 
 
-class Laplacian(Placeholder):
-    """Laplacian operator on an operation call."""
-
-    def __init__(
-        self,
-        target: OperationCall,
-        variables: List[Variable],
-        scheme: str = "automatic_differentiation",
-    ):
-        self.target = target
-        self.variables = variables
-        self.scheme = scheme  # 'automatic_differentiation' or 'finite_difference'
-
-    def __repr__(self):
-        vars_str = ", ".join(str(v) for v in self.variables)
-        return f"∇²({self.target}, [{vars_str}])"
-
-
-class Gradient(Placeholder):
-    """Gradient operator on an operation call."""
-
-    def __init__(
-        self,
-        target: OperationCall,
-        variable: Variable,
-        scheme: str = "automatic_differentiation",
-    ):
-        self.target = target
-        self.variable = variable
-        self.scheme = scheme  # 'automatic_differentiation' or 'finite_difference'
-
-    def __repr__(self):
-        return f"∇({self.target}, {self.variable})"
-
-
 class Hessian(Placeholder):
-    """Hessian matrix operator (matrix of second derivatives)."""
+    """Second-order differential operator.
+
+    When ``trace=False`` (default), computes the full Hessian matrix
+    H[i,j] = d²u / (dxᵢ dxⱼ).
+
+    When ``trace=True``, computes the Laplacian (trace of the Hessian):
+    ∇²u = Σᵢ d²u/dxᵢ².
+    """
 
     def __init__(
         self,
         target: OperationCall,
         variables: List[Variable],
         scheme: str = "automatic_differentiation",
+        trace: bool = False,
     ):
         self.target = target
-        self.variables = variables
-        self.scheme = scheme  # 'automatic_differentiation' or 'finite_difference'
+        self.variables = variables if isinstance(variables, list) else [variables]
+        self.scheme = scheme
+        self.trace = trace  # True → Laplacian (sum of diagonal)
 
     def __repr__(self):
         var_names = ", ".join(str(v) for v in self.variables)
-        return f"Hessian({self.target}, [{var_names}])"
+        kind = "∇²" if self.trace else "Hessian"
+        return f"{kind}({self.target}, [{var_names}])"
 
 
 class Jacobian(Placeholder):
-    """Jacobian matrix operator (matrix of second derivatives)."""
+    """First-order differential operator.
+
+    Computes J[i] = du/dxᵢ for each variable xᵢ.  When only one
+    variable is supplied this is equivalent to a partial derivative
+    (gradient), and the result is squeezed to a scalar per point.
+    """
 
     def __init__(
         self,
@@ -1066,12 +1243,135 @@ class Jacobian(Placeholder):
         scheme: str = "automatic_differentiation",
     ):
         self.target = target
-        self.variables = variables
-        self.scheme = scheme  # 'automatic_differentiation' or 'finite_difference'
+        self.variables = variables if isinstance(variables, list) else [variables]
+        self.scheme = scheme
 
     def __repr__(self):
         var_names = ", ".join(str(v) for v in self.variables)
         return f"Jacobian({self.target}, [{var_names}])"
+
+
+# =============================================================================
+# Tree optimisation — Common Sub-expression Elimination (CSE)
+# =============================================================================
+
+
+def cse(expr: Placeholder) -> Placeholder:
+    """Eliminate common sub-expressions in a traced computation tree.
+
+    Walks *expr* bottom-up and replaces structurally identical sub-trees
+    with a single shared Python object.  Two nodes are considered
+    identical when they have the same type, the same static attributes
+    (operator, function identity, op_id, …) **and** the same children
+    (by ``id``).
+
+    The pass is safe to run multiple times and never changes semantics.
+
+    What gets deduplicated:
+
+    * ``OperationCall`` — same ``OperationDef`` + same argument
+      ``Variable``/``TensorTag`` objects (by identity).
+    * ``BinaryOp`` — same operator + same (already-deduped) children.
+    * ``FunctionCall`` — same ``fn`` + same (already-deduped) args.
+    * ``Jacobian`` / ``Hessian`` — same target + same variables.
+    * ``ModelCall`` — same model + same args.
+
+    Returns:
+        A (possibly shared) tree with duplicates collapsed.
+    """
+    # Maps a structural key → canonical node that was already built.
+    _canon: dict = {}
+
+    def _key(node):
+        """Return a hashable key for *node* assuming children are already canonical."""
+        if isinstance(node, Variable):
+            return ("Var", id(node))
+        if isinstance(node, TensorTag):
+            return ("Tag", id(node))
+        if isinstance(node, (Constant, Literal)):
+            return ("Const", id(node))
+        if isinstance(node, BinaryOp):
+            return ("Bin", node.op, id(node.left), id(node.right))
+        if isinstance(node, FunctionCall):
+            arg_ids = tuple(id(a) for a in node.args)
+            return ("Fn", id(node.fn), node._name, arg_ids)
+        if isinstance(node, ModelCall):
+            arg_ids = tuple(id(a) for a in node.args)
+            return ("Call", node.model.layer_id, arg_ids)
+        if isinstance(node, OperationCall):
+            arg_ids = tuple(id(a) for a in node.args)
+            return ("OpCall", node.operation.op_id, arg_ids)
+        if isinstance(node, OperationDef):
+            return ("OpDef", node.op_id, id(node.expr))
+        if isinstance(node, Jacobian):
+            var_ids = tuple(id(v) for v in node.variables)
+            return ("Jac", id(node.target), var_ids, node.scheme)
+        if isinstance(node, Hessian):
+            var_ids = tuple(id(v) for v in node.variables)
+            return ("Hess", id(node.target), var_ids, node.trace, node.scheme)
+        if isinstance(node, Tracker):
+            return ("Track", id(node.expr), node.interval)
+        # Fallback — use object identity (no dedup possible)
+        return ("?", id(node))
+
+    def _visit(node):
+        """Post-order walk: canonicalise children first, then self."""
+        # Leaves — always canonical
+        if isinstance(node, (Variable, TensorTag, Constant, Literal)):
+            return node
+
+        # ── recurse into children and rebuild if anything changed ──
+        if isinstance(node, BinaryOp):
+            l = _visit(node.left)
+            r = _visit(node.right)
+            if l is not node.left or r is not node.right:
+                node = BinaryOp(node.op, l, r)
+        elif isinstance(node, FunctionCall):
+            new_args = [_visit(a) if isinstance(a, Placeholder) else a for a in node.args]
+            if any(n is not o for n, o in zip(new_args, node.args)):
+                node = FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
+        elif isinstance(node, ModelCall):
+            new_args = [_visit(a) if isinstance(a, Placeholder) else a for a in node.args]
+            if any(n is not o for n, o in zip(new_args, node.args)):
+                new_node = ModelCall(node.model, new_args)
+                new_node.op_id = node.op_id
+                node = new_node
+        elif isinstance(node, OperationDef):
+            new_expr = _visit(node.expr)
+            if new_expr is not node.expr:
+                new_node = OperationDef.__new__(OperationDef)
+                new_node.expr = new_expr
+                new_node.input_vars = node.input_vars
+                new_node.op_id = node.op_id
+                new_node._collected_vars = node._collected_vars
+                new_node.has_trainable = node.has_trainable
+                node = new_node
+        elif isinstance(node, OperationCall):
+            new_op = _visit(node.operation)
+            new_args = tuple(_visit(a) if isinstance(a, Placeholder) else a for a in node.args)
+            if new_op is not node.operation or any(n is not o for n, o in zip(new_args, node.args)):
+                node = OperationCall(new_op, new_args)
+        elif isinstance(node, Jacobian):
+            new_target = _visit(node.target)
+            if new_target is not node.target:
+                node = Jacobian(new_target, node.variables, node.scheme)
+        elif isinstance(node, Hessian):
+            new_target = _visit(node.target)
+            if new_target is not node.target:
+                node = Hessian(new_target, node.variables, node.scheme, node.trace)
+        elif isinstance(node, Tracker):
+            new_expr = _visit(node.expr)
+            if new_expr is not node.expr:
+                node = Tracker(new_expr, node.interval)
+
+        # ── dedup: if we've seen an identical node, return the earlier one ──
+        k = _key(node)
+        if k in _canon:
+            return _canon[k]
+        _canon[k] = node
+        return node
+
+    return _visit(expr)
 
 
 # =============================================================================
@@ -1097,7 +1397,7 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
             visit(node.operation.expr)
             for arg in node.args:
                 visit(arg)
-        elif isinstance(node, FlaxModuleCall):
+        elif isinstance(node, ModelCall):
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     visit(arg)
@@ -1108,72 +1408,177 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
         elif isinstance(node, BinaryOp):
             visit(node.left)
             visit(node.right)
-        elif isinstance(node, Concat):
-            for item in node.items:
-                visit(item)
         elif isinstance(node, FunctionCall):
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     visit(arg)
-        elif isinstance(node, Laplacian):
+        elif isinstance(node, (Hessian, Jacobian)):
             visit(node.target)
-        elif isinstance(node, Gradient):
-            visit(node.target)
-        elif isinstance(node, Hessian):
-            visit(node.target)
-        elif isinstance(node, Slice):
-            visit(node.target)
+            for v in node.variables:
+                visit(v)
+        elif isinstance(node, Tracker):
+            visit(node.expr)
 
     visit(expr)
     return ops
 
 
 def collect_tags(expr: Placeholder) -> set:
-    """Collect all tags from Variable placeholders."""
+    """Collect all unique tags from Variables in the expression tree."""
     tags = set()
 
     def visit(node):
         if isinstance(node, Variable):
             tags.add(node.tag)
-        elif isinstance(node, OperationDef):
-            visit(node.expr)
-        elif isinstance(node, FlaxModuleCall):
-            for arg in node.args:
-                if isinstance(arg, Placeholder):
-                    visit(arg)
+        elif isinstance(node, TensorTag):
+            tags.add(node.tag)
         elif isinstance(node, BinaryOp):
             visit(node.left)
             visit(node.right)
-        elif isinstance(node, Concat):
-            for item in node.items:
-                visit(item)
         elif isinstance(node, FunctionCall):
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     visit(arg)
+        elif isinstance(node, OperationDef):
+            visit(node.expr)
         elif isinstance(node, OperationCall):
-            for arg in node.args:
-                visit(arg)
             visit(node.operation.expr)
-        elif isinstance(node, Laplacian):
+            for arg in node.args:
+                if isinstance(arg, Placeholder):
+                    visit(arg)
+        elif isinstance(node, ModelCall):
+            for arg in node.args:
+                if isinstance(arg, Placeholder):
+                    visit(arg)
+        elif isinstance(node, TunableModuleCall):
+            for arg in node.args:
+                if isinstance(arg, Placeholder):
+                    visit(arg)
+        elif isinstance(node, (Hessian, Jacobian)):
             visit(node.target)
             for v in node.variables:
                 visit(v)
-        elif isinstance(node, Gradient):
-            visit(node.target)
-            visit(node.variable)
-        elif isinstance(node, Hessian):
-            visit(node.target)
-            for v in node.variables:
-                visit(v)
-        elif isinstance(node, Slice):
-            visit(node.target)
+        elif isinstance(node, Tracker):
+            visit(node.expr)
 
     visit(expr)
     return tags
 
 
-def get_primary_tag(expr: Placeholder) -> Optional[str]:
-    """Get the primary tag for a constraint."""
+def get_primary_tag(expr: Placeholder) -> str:
+    """Return the first Variable tag found in the expression tree."""
     tags = collect_tags(expr)
     return next(iter(tags)) if tags else None
+
+
+def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
+    """Return a human-readable indented string of the expression tree.
+
+    Args:
+        expr:   Any trace node (Placeholder subclass).
+        indent: Current indentation level (used by recursion).
+        seen:   Set of already-visited ``OperationDef.op_id`` values to
+                avoid infinite recursion on shared sub-graphs.
+
+    Returns:
+        Multi-line string with the full computation tree.
+
+    Example::
+
+        tree_str = dump_tree(pde)
+        print(tree_str)
+        # or
+        with open("tree.txt", "w") as f:
+            f.write(tree_str)
+    """
+    if seen is None:
+        seen = set()
+    pad = "  " * indent
+    lines: list[str] = []
+
+    def _node_label(node) -> str:
+        """One-line label for a node (no children)."""
+        if isinstance(node, Variable):
+            return f"Variable({node.tag}[{node.dim}])"
+        if isinstance(node, TensorTag):
+            return f"TensorTag({node.tag})"
+        if isinstance(node, Constant):
+            val = node.value
+            if hasattr(val, "shape") and val.shape == ():
+                val = float(val)
+            return f"Constant({node.tag}.{node.key}={val})"
+        if isinstance(node, Literal):
+            return f"Literal({node.value})"
+        if isinstance(node, Model):
+            return f"Model(id={node.layer_id}, {type(node.module).__name__})"
+        if isinstance(node, (int, float)):
+            return str(node)
+        return type(node).__name__
+
+    def _visit(node, depth):
+        p = "  " * depth
+        if isinstance(node, Variable):
+            lines.append(f"{p}{_node_label(node)}")
+        elif isinstance(node, TensorTag):
+            lines.append(f"{p}{_node_label(node)}")
+        elif isinstance(node, (Constant, Literal)):
+            lines.append(f"{p}{_node_label(node)}")
+        elif isinstance(node, BinaryOp):
+            lines.append(f"{p}BinaryOp({node.op})")
+            _visit(node.left, depth + 1)
+            _visit(node.right, depth + 1)
+        elif isinstance(node, FunctionCall):
+            name = node._name or getattr(node.fn, "__name__", "fn")
+            lines.append(f"{p}FunctionCall({name})")
+            for arg in node.args:
+                if isinstance(arg, Placeholder):
+                    _visit(arg, depth + 1)
+                else:
+                    lines.append(f"{p}  {arg}")
+        elif isinstance(node, ModelCall):
+            lines.append(f"{p}ModelCall({_node_label(node.model)})")
+            for arg in node.args:
+                if isinstance(arg, Placeholder):
+                    _visit(arg, depth + 1)
+                else:
+                    lines.append(f"{p}  {arg}")
+        elif isinstance(node, TunableModuleCall):
+            lines.append(f"{p}TunableModuleCall(id={node.model.layer_id})")
+            for arg in node.args:
+                if isinstance(arg, Placeholder):
+                    _visit(arg, depth + 1)
+        elif isinstance(node, OperationDef):
+            if node.op_id in seen:
+                vars_str = ", ".join(str(v) for v in node._collected_vars)
+                lines.append(f"{p}Op[{node.op_id}]({vars_str})  [already shown]")
+                return
+            seen.add(node.op_id)
+            vars_str = ", ".join(str(v) for v in node._collected_vars)
+            lines.append(f"{p}OperationDef[{node.op_id}] vars=({vars_str})")
+            _visit(node.expr, depth + 1)
+        elif isinstance(node, OperationCall):
+            args_str = ", ".join(str(a) for a in node.args)
+            lines.append(f"{p}OperationCall[{node.operation.op_id}]({args_str})")
+            _visit(node.operation, depth + 1)
+        elif isinstance(node, Hessian):
+            kind = "Laplacian" if node.trace else "Hessian"
+            vars_str = ", ".join(str(v) for v in node.variables)
+            lines.append(f"{p}{kind}([{vars_str}])")
+            _visit(node.target, depth + 1)
+        elif isinstance(node, Jacobian):
+            vars_str = ", ".join(str(v) for v in node.variables)
+            lines.append(f"{p}Jacobian([{vars_str}])")
+            _visit(node.target, depth + 1)
+        elif isinstance(node, Tracker):
+            lines.append(f"{p}Tracker(interval={node.interval})")
+            _visit(node.expr, depth + 1)
+        elif isinstance(node, ConstantNamespace):
+            lines.append(f"{p}ConstantNamespace({node._full_tag})")
+        elif isinstance(node, Placeholder):
+            # Fallback for any unknown Placeholder subclass
+            lines.append(f"{p}{repr(node)}")
+        else:
+            lines.append(f"{p}{node}")
+
+    _visit(expr, indent)
+    return "\n".join(lines)
