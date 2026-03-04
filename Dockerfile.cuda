@@ -37,12 +37,17 @@ ENV PATH="/root/.local/bin:$PATH"
 
 WORKDIR /app
 
-# ---- copy source + metadata ----
-COPY pyproject.toml README.md ./
+# ---- copy lockfile + metadata first (cache layer) ----
+COPY pyproject.toml uv.lock README.md ./
+
+# ---- copy source ----
 COPY jno/ ./jno/
 
-# ---- install package + CUDA-enabled JAX ----
-RUN uv pip install --system ".[dev]" "jax[cuda12]"
+# ---- install using the lockfile ----
+RUN uv sync --extra iree --extra dev --extra cuda
+
+# ---- put the uv-managed venv on PATH ----
+ENV PATH="/app/.venv/bin:$PATH"
 
 # ---- default entrypoint ----
 CMD ["python", "-c", "import jax; import jno; print('jNO CUDA ready, devices:', jax.devices())"]

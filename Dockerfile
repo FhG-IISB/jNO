@@ -38,12 +38,17 @@ ENV PATH="/root/.local/bin:$PATH"
 
 WORKDIR /app
 
-# ---- copy source + metadata ----
-COPY pyproject.toml README.md ./
+# ---- copy lockfile + metadata first (cache layer) ----
+COPY pyproject.toml uv.lock README.md ./
+
+# ---- copy source ----
 COPY jno/ ./jno/
 
-# ---- install package + all dependencies ----
-RUN uv pip install --system ".[dev]"
+# ---- install using the lockfile ----
+RUN uv sync --extra iree --extra dev
+
+# ---- put the uv-managed venv on PATH ----
+ENV PATH="/app/.venv/bin:$PATH"
 
 # ---- default entrypoint ----
 CMD ["python", "-c", "import jno; print('jNO ready')"]
