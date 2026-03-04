@@ -1,0 +1,30 @@
+name: Type Check
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  typecheck:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        python-version: "3.12"
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libglu1-mesa
+
+    - name: Install dependencies
+      run: uv sync --all-extras --no-extra cuda
+
+    - name: Run mypy
+      run: uv run mypy jno/ --ignore-missing-imports --no-strict-optional

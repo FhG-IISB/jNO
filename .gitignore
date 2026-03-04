@@ -16,7 +16,6 @@ scripts/
 misc/
 runs/
 
-*.**
 !*.md
 !*.toml
 !*.txt
