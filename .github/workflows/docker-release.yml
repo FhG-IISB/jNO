@@ -3,6 +3,9 @@ name: Docker Release
 on:
   release:
     types: [published]
+  push:
+    branches:
+      - dockerfile_support
   workflow_dispatch:
     inputs:
       tag:
