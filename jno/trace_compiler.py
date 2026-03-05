@@ -18,7 +18,7 @@ The hot-path **evaluation** code lives in :mod:`jno.trace_evaluator`
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -410,7 +410,7 @@ class TraceCompiler:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def init_layer_params(all_ops: List, domain_dim: int, tensor_dims: Dict[str, int], rng: jax.Array, logger) -> Tuple[Dict, jax.Array]:
+    def init_layer_params(all_ops: List, domain_dim: int, tensor_dims: Dict[str, Tuple], rng: jax.Array, logger) -> Tuple[Dict, jax.Array]:
         """Collect / initialise models for all layers.
 
         For equinox modules (the normal path), the model was already
@@ -424,7 +424,7 @@ class TraceCompiler:
             all_models: Dict mapping layer_id -> callable model
             rng: Updated RNG key
         """
-        all_models = {}
+        all_models: Dict[int, Any] = {}
         seen = set()
 
         for op in all_ops:

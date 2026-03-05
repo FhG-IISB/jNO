@@ -287,7 +287,7 @@ class FunctionCall(Placeholder):
     def __init__(
         self,
         fn: Callable,
-        args: tuple,
+        args: Union[list, tuple],
         name: str = None,
         reduces_axis: int = None,
         kwargs: Dict = None,
@@ -337,7 +337,7 @@ class ConstantNamespace:
         self._tag = tag
         self._full_tag = f"{_parent_tag}.{tag}" if _parent_tag else tag
         self._data = self._load_and_convert(data)
-        self._constants = {}
+        self._constants: Dict[str, Any] = {}
 
     def _load_and_convert(self, data: Union[dict, str, Path]) -> dict:
         """Load data from dict or file path and convert values to JAX arrays."""
@@ -474,7 +474,7 @@ class ConstantNamespace:
     def _load_yaml(path: Path) -> dict:
         """Load YAML file."""
         try:
-            import yaml
+            import yaml  # type: ignore[import-untyped]
         except ImportError:
             raise ImportError("PyYAML is required to load .yaml/.yml files. " "Install with: pip install pyyaml")
 
@@ -492,7 +492,7 @@ class ConstantNamespace:
                 return tomllib.load(f)
         except ImportError:
             try:
-                import toml
+                import toml  # type: ignore[import-untyped]
 
                 with open(path, "r") as f:
                     return toml.load(f)
@@ -583,7 +583,7 @@ class ConstantNamespace:
 
     def to_dict(self) -> dict:
         """Recursively convert back to a plain dictionary."""
-        result = {}
+        result: Dict[str, Any] = {}
         for key, value in self._data.items():
             if isinstance(value, ConstantNamespace):
                 result[key] = value.to_dict()
@@ -826,17 +826,7 @@ class Model(Placeholder):
             rank:  LoRA rank.
             alpha: LoRA scaling factor.
         """
-        self._lora_config = (rank, alpha)
-        return self
-
-    def merge_lora(self):
-        """Merge LoRA adapters into base weights and disable LoRA."""
-        from .architectures.lora_linear import merge_lora as _merge_lora
-
-        # The actual merge is done by core.solve() after training;
-        # calling this just sets a flag.
-        self._lora_config = None
-        self._merge_lora_flag = True
+        self._lora_config = (rank, alpha)  # type: ignore[assignment]
         return self
 
     def optimizer(self, opt_fn, *, lr=None):
@@ -1212,7 +1202,7 @@ class Hessian(Placeholder):
 
     def __init__(
         self,
-        target: OperationCall,
+        target: "Placeholder",
         variables: List[Variable],
         scheme: str = "automatic_differentiation",
         trace: bool = False,
@@ -1238,7 +1228,7 @@ class Jacobian(Placeholder):
 
     def __init__(
         self,
-        target: OperationCall,
+        target: "Placeholder",
         variables: List[Variable],
         scheme: str = "automatic_differentiation",
     ):

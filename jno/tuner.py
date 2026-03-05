@@ -1,7 +1,7 @@
 # arch_tuner.py
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Sequence, Tuple, Union, Callable, Literal, Optional
 import nevergrad as ng
 import copy
@@ -23,6 +23,7 @@ class Arch:
     """
 
     choices: Tuple[Tuple, ...]
+    _lookup: Dict[str, Any] = field(default_factory=dict, init=False, repr=False, compare=False)
 
     def __post_init__(self):
         object.__setattr__(self, "_lookup", dict(self.choices))
@@ -388,7 +389,7 @@ class DeviceConfig:
         elif isinstance(spec, int):
             return cls.auto_detect(max_workers=spec)
         elif isinstance(spec, str):
-            return cls.auto_detect(device_type=spec)
+            return cls.auto_detect(device_type=spec)  # type: ignore[arg-type]
         elif isinstance(spec, list):
             all_devices = jax.devices()
             devices = [all_devices[i] for i in spec]
@@ -1016,7 +1017,7 @@ class tune:
             Best Arch found.
         """
         tuner = Tuner(space)
-        return tuner.solve(loss_fn, budget=budget, optimizer=optimizer, verbose=verbose)
+        return tuner.solve(loss_fn, budget=budget, optimizer=optimizer, verbose=verbose)  # type: ignore[attr-defined]
 
     Arch = Arch
     ArchSpace = ArchSpace

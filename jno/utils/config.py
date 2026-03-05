@@ -150,5 +150,5 @@ def setup(script_file: str, name: str | None = None) -> str:
 
     stem = name or Path(script_file).stem
     dire = str(Path(get_runs_base_dir()) / stem)
-    init_default_logger(dire)
+    init_default_logger(Path(dire))
     return dire

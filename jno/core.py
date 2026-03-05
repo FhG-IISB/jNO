@@ -1,4 +1,4 @@
-from typing import List, Callable, Dict, Optional, Tuple, Union
+from typing import List, Callable, Dict, Optional, Tuple, Union, Any
 import jax
 import jax.numpy as jnp
 from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
@@ -108,15 +108,15 @@ class core:
                 data parallelism when multiple devices are available.
         """
         self.log = get_logger()
-        self.constraints: List[BinaryOp] = constraints
+        self.constraints: List[Placeholder] = constraints
 
         self.domain = domain
-        self.models = {}  # full equinox models (pytrees with arrays + static)
-        self._trained_ops = {}
+        self.models: Dict[int, Any] = {}  # full equinox models (pytrees with arrays + static)
+        self._trained_ops: Dict[int, Any] = {}
         self.training_logs: List[Dict[str, jnp.ndarray]] = []
         self.dots: List = []
         self.checkpoints: List[Dict] = []
-        self.all_ops: List[BinaryOp] = []
+        self.all_ops: List[OperationDef] = []
 
         super().__init__()
 
@@ -431,25 +431,25 @@ class core:
 
             # ── per-model optimizer step ──
             for k in lid_keys:
-                lid = int(k)
-                model_grads = grads[lid]
-                model_params = trainable[lid]
+                    lid = int(k)
+                    model_grads = grads[lid]
+                    model_params = trainable[lid]
 
-                updates, new_state = per_model_opts[k].update(
-                    model_grads,
-                    opt_states[k],
-                    model_params,
-                    value=total_loss,
-                    grad=model_grads,
-                    value_fn=lambda p, _lid=lid: loss_fn({**trainable, _lid: p}, context, tag_weights, step_rng)[0],
-                )
+                    updates, new_state = per_model_opts[k].update(
+                        model_grads,
+                        opt_states[k],
+                        model_params,
+                        value=total_loss,
+                        grad=model_grads,
+                        value_fn=lambda p, _lid=lid: loss_fn({**trainable, _lid: p}, context, tag_weights, step_rng)[0],
+                    )
 
-                # Update LR for this model
-                lr_val = lr_schedules[k](base_epoch + epoch, individual_losses)
-                new_state[-1].hyperparams["step_size"] = jnp.asarray(lr_val, dtype=opt_states[k][-1].hyperparams["step_size"].dtype)
+                    # Update LR for this model
+                    lr_val = lr_schedules[k](base_epoch + epoch, individual_losses)
+                    new_state[-1].hyperparams["step_size"] = jnp.asarray(lr_val, dtype=opt_states[k][-1].hyperparams["step_size"].dtype)
 
-                trainable = {**trainable, lid: optax.apply_updates(model_params, updates)}
-                opt_states = {**opt_states, k: new_state}
+                    trainable = {**trainable, lid: optax.apply_updates(model_params, updates)}
+                    opt_states = {**opt_states, k: new_state}
 
             return trainable, opt_states, rng, total_loss, individual_losses, tag_weights
 
@@ -560,6 +560,7 @@ class core:
         batchsize: int = None,
         checkpoint_gradients: bool = False,
         offload_data: bool = False,
+        inner_steps: int = 1,
     ):
         """Train using per-model optimizers attached via ``model.optimizer()``.
 
@@ -585,6 +586,11 @@ class core:
         Returns:
             statistics: Training history with ``.plot()`` convenience.
         """
+        from contextlib import nullcontext
+        from jax._src import profiler as _jax_profiler
+        _profiling = _jax_profiler._profile_state.profile_session is not None
+        _trace = jax.profiler.TraceAnnotation if _profiling else lambda name, **_: nullcontext()
+
         batchsize = batchsize if batchsize is not None else self.domain.total_samples
 
         self.constraint_weights = constraint_weights if constraint_weights is not None else WeightSchedule([1.0] * self.n_constraints)
@@ -611,7 +617,7 @@ class core:
 
         # ── 2. Apply LoRA transforms ──
         models = dict(self.models)
-        lora_param_counts = {}  # Track LoRA params per model for logging
+        lora_param_counts: Dict[int, Any] = {}  # Track LoRA params per model for logging
         for lid, fm in flax_mods.items():
             if fm._lora_config is not None:
                 rank, alpha = fm._lora_config
@@ -731,7 +737,7 @@ class core:
 
         # ── 5. Build per-model optimizers ──
         per_model_opts = {}  # {str(lid): optax chain}
-        lr_schedules = {}  # {str(lid): LearningRateSchedule}
+        lr_schedules: Dict[str, Any] = {}  # {str(lid): LearningRateSchedule}
         zeros = jnp.zeros(self.n_constraints)
 
         for lid, fm in flax_mods.items():
@@ -746,15 +752,15 @@ class core:
             lr_sched = fm._lr
 
             # Instantiate optimizer (handle callables like optax.adam)
-            if isinstance(opt_fn, Callable) and not isinstance(opt_fn, optax.GradientTransformation):
+            if callable(opt_fn) and not isinstance(opt_fn, optax.GradientTransformation):
                 try:
-                    base_opt = opt_fn(1.0)
+                    base_opt = opt_fn(1.0)  # type: ignore[call-arg]
                 except TypeError:
                     base_opt = opt_fn
             else:
                 base_opt = opt_fn
 
-            scale = optax.inject_hyperparams(optax.scale)(step_size=lr_sched(0, zeros))
+            scale = optax.inject_hyperparams(optax.scale)(step_size=lr_sched(0, zeros))  # type: ignore[call-arg]
             per_model_opts[k] = optax.chain(base_opt, scale)
             lr_schedules[k] = lr_sched
 
@@ -811,6 +817,35 @@ class core:
             checkpoint_gradients=checkpoint_gradients,
         )
 
+        # Optionally amortise Python dispatch overhead by running multiple
+        # gradient steps inside a single XLA program via fori_loop.
+        # Only valid when context is fixed on-device (offload_data=False).
+        if inner_steps > 1:
+            if offload_data:
+                self.log.warning(
+                    "inner_steps > 1 is not compatible with offload_data=True; "
+                    "falling back to inner_steps=1"
+                )
+                inner_steps = 1
+            else:
+                _K = inner_steps
+                _nc = self.n_constraints
+                _single = step_fn
+
+                def step_fn(trainable, opt_states, rng, context, start_epoch, prev_losses):
+                    def body(i, carry):
+                        tr, opt, rn, _total, _indv, _weights = carry
+                        tr, opt, rn, total, indv, weights = _single(
+                            tr, opt, rn, context, start_epoch + i, _indv
+                        )
+                        return tr, opt, rn, total, indv, weights
+
+                    init = (
+                        trainable, opt_states, rng,
+                        jnp.zeros(()), prev_losses, jnp.zeros((_nc,)),
+                    )
+                    return jax.lax.fori_loop(0, _K, body, init)
+
         # Optional: build JIT-compiled tracker function
         has_trackers = len(self.compiled_trackers) > 0
         if has_trackers:
@@ -859,9 +894,25 @@ class core:
             # Buffer donation: reuse trainable (0) and opt_states (1)
             # buffers in-place since the step returns updated versions.
             # rng (2) is also donated (small but correct).
+            #
+            # out_shardings mirrors the in_shardings for the three outputs
+            # that are fed back as inputs (trainable, opt_states, rng), and
+            # pins the remaining scalars to replicated.  Without this, JAX
+            # returns outputs with SingleDeviceSharding which mismatches the
+            # NamedSharding in in_shardings, triggering a device_put on every
+            # call to fix the sharding before dispatch.
+            out_shardings = (
+                jax.tree_util.tree_map(_leaf_sharding, trainable),  # trainable
+                jax.tree_util.tree_map(_leaf_sharding, opt_states),  # opt_states
+                replicated,  # rng
+                replicated,  # total_loss
+                replicated,  # individual_losses  (→ prev_losses next step)
+                replicated,  # tag_weights
+            )
             jit_step = jax.jit(
                 step_fn,
                 in_shardings=in_shardings,
+                out_shardings=out_shardings,
                 donate_argnums=(0, 1, 2),
             )
 
@@ -871,20 +922,21 @@ class core:
             self.log.info("JIT compiling step function with mesh sharding — " "this might take a while")
 
             # Trigger AOT compilation so the first real step is fast.
-            _ = jit_step.lower(
-                trainable,
-                opt_states,
-                self.rng,
-                trace_context,
-                jax.device_put(jnp.int32(0), replicated),
-                prev_losses,
-            ).compile()
+            with _trace("jno/aot_compile"):
+                _ = jit_step.lower(
+                    trainable,
+                    opt_states,
+                    self.rng,
+                    trace_context,
+                    jax.device_put(jnp.int32(0), replicated),
+                    prev_losses,
+                ).compile()
 
             # ── 8. Training loop ──
             hw_monitor = HardwareMonitor(logger=self.log, interval=0.5)
             hw_monitor.start()
 
-            print_rate = max(1, epochs // 100 if epochs < 100_000 else epochs // 1000)
+            print_rate = max(1, epochs // 10 if epochs < 100_000 else epochs // 1000)
             prev_losses = jax.device_put(jnp.zeros(self.n_constraints), replicated)
 
             # Log buffers
@@ -897,31 +949,46 @@ class core:
 
             rng_np = np.random.default_rng(int(jax.device_get(self.rng[0])))
             st = time.time()
+            epoch_jnp = jax.device_put(jnp.int32(0), replicated)
+            _epoch_step = jax.device_put(jnp.int32(inner_steps), replicated)
 
-            for epoch in range(epochs):
+            n_outer = epochs // inner_steps
+            if epochs % inner_steps != 0:
+                self.log.warning(
+                    f"epochs={epochs} is not divisible by inner_steps={inner_steps}; "
+                    f"running {n_outer * inner_steps} epochs instead."
+                )
+            print_rate = max(1, n_outer // 10 if n_outer < 100_000 else n_outer // 1000)
+
+            for outer_epoch in range(n_outer):
+                epoch = outer_epoch * inner_steps  # first epoch of this outer step
                 # --- prepare context for this step ---
-                if offload_data:
-                    indices = rng_np.choice(total_samples, batchsize, replace=False)
-                    batch_np = {k: np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices] for k, v in host_context.items()}
-                    context = self._shard_data(jax.device_put(batch_np))
-                else:
-                    context = on_device_context
+                with _trace("jno/load_data"):
+                    if offload_data:
+                        indices = rng_np.choice(total_samples, batchsize, replace=False)
+                        batch_np = {k: np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices] for k, v in host_context.items()}
+                        context = self._shard_data(jax.device_put(batch_np))
+                    else:
+                        context = on_device_context
 
-                epoch_jnp = jax.device_put(jnp.int32(epoch), replicated)
+                with _trace("jno/training_step"):
+                    (trainable, opt_states, self.rng, total_loss, individual_losses, tag_weights) = jit_step(trainable, opt_states, self.rng, context, epoch_jnp, prev_losses)
 
-                (trainable, opt_states, self.rng, total_loss, individual_losses, tag_weights) = jit_step(trainable, opt_states, self.rng, context, epoch_jnp, prev_losses)
-
+                epoch_jnp = epoch_jnp + _epoch_step
                 prev_losses = individual_losses
 
-                # --- logging (only every print_rate epochs) ---
-                should_log = (epoch % print_rate == 0) or (epoch == epochs - 1)
+                # --- logging (only every print_rate outer_epochs) ---
+                should_log = (outer_epoch % print_rate == 0) or (outer_epoch == n_outer - 1)
                 if should_log:
-                    # Synchronise once per log interval
-                    losses_np = np.asarray(jax.device_get(individual_losses))
-                    total_np = float(jax.device_get(total_loss))
-                    weights_np = np.asarray(jax.device_get(tag_weights))
+                    # Single synchronisation point — one device_get on a tuple
+                    # is one host/device barrier instead of three separate stalls.
+                    losses_np, total_np_arr, weights_np = jax.device_get((individual_losses, total_loss, tag_weights))
+                    losses_np = np.asarray(losses_np)
+                    total_np = float(total_np_arr)
+                    weights_np = np.asarray(weights_np)
 
-                    log_epochs.append(epoch)
+                    displayed_epoch = epoch + inner_steps - 1  # last epoch completed
+                    log_epochs.append(displayed_epoch)
                     log_losses.append(losses_np)
                     log_total_loss.append(total_np)
                     log_weights.append(weights_np)
@@ -929,9 +996,9 @@ class core:
 
                     # Trackers
                     track_stats_np = None
-                    if has_trackers and any(epoch % intv == 0 for intv in tracker_intervals):
+                    if has_trackers and any(outer_epoch % (max(1, intv // inner_steps)) == 0 for intv in tracker_intervals):
                         track_vals = jit_track(trainable, context, self.rng)
-                        track_stats_np = [float(jax.device_get(v)) for v in track_vals]
+                        track_stats_np = [float(v) for v in jax.device_get(track_vals)]
                         log_track_stats.append(track_stats_np)
 
                     # Progress line
@@ -939,13 +1006,13 @@ class core:
                     if track_stats_np is not None:
                         track_strs = " | ".join(f"T{i}: {v:>10.4e}" for i, v in enumerate(track_stats_np))
                         print(
-                            f"\rEpoch {epoch:>6}/{epochs}| " f"L:{total_np:>10.4e} | {loss_strs} | {track_strs}",
+                            f"\rEpoch {displayed_epoch:>6}/{epochs}| " f"L:{total_np:>10.4e} | {loss_strs} | {track_strs}",
                             end="\n",
                             flush=True,
                         )
                     else:
                         print(
-                            f"\rEpoch {epoch:>6}/{epochs}| " f"L:{total_np:>10.4e} | {loss_strs}",
+                            f"\rEpoch {displayed_epoch:>6}/{epochs}| " f"L:{total_np:>10.4e} | {loss_strs}",
                             end="\n",
                             flush=True,
                         )

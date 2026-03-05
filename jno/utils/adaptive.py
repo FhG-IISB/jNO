@@ -38,7 +38,7 @@ class LearningRateSchedule:
         self.min_lr = float(min_lr)
         self.max_lr = float(max_lr)
 
-    def __call__(self, t: int, losses: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, t, losses: jnp.ndarray) -> jnp.ndarray:
         lr = self.fn(t, losses)
         lr = jnp.asarray(lr)
         lr = jnp.clip(lr, self.min_lr, self.max_lr)
@@ -128,7 +128,7 @@ class LearningRateSchedule:
         """
         lr0 = float(lr0)
         decay_rate = float(decay_rate)
-        decay_steps = float(decay_steps)
+        decay_steps = float(decay_steps)  # type: ignore[assignment]
         lr_end = float(lr_end)
 
         def fn(t, losses):

@@ -209,7 +209,7 @@ class PiT(eqx.Module):
         self.out_channels = out_channels
         self.hid_channels = hid_channels
         self.n_head = n_head
-        self.localities = tuple(localities)
+        self.localities = tuple(localities)  # type: ignore[assignment]
         self.m_dists = m_dists
         self.n_blocks = len(localities) - 2
 

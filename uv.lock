@@ -541,7 +541,7 @@ wheels = [
 ]
 
 [package.optional-dependencies]
-cuda = [
+cuda12 = [
     { name = "jax-cuda12-plugin", extra = ["with-cuda"] },
     { name = "jaxlib" },
 ]
@@ -671,7 +671,7 @@ dependencies = [
 
 [package.optional-dependencies]
 cuda = [
-    { name = "jax", extra = ["cuda"] },
+    { name = "jax", extra = ["cuda12"] },
 ]
 dev = [
     { name = "black" },
@@ -705,7 +705,7 @@ requires-dist = [
     { name = "iree-base-compiler", marker = "extra == 'iree'" },
     { name = "iree-base-runtime", marker = "extra == 'iree'" },
     { name = "jax" },
-    { name = "jax", extras = ["cuda"], marker = "extra == 'cuda'" },
+    { name = "jax", extras = ["cuda12"], marker = "extra == 'cuda'" },
     { name = "jax-morph", marker = "extra == 'foundation'", git = "https://github.com/armbrusl/jax_morph" },
     { name = "jax-mpp", marker = "extra == 'foundation'", git = "https://github.com/armbrusl/jax_mpp" },
     { name = "matplotlib" },

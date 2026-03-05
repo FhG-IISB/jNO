@@ -1536,9 +1536,9 @@ class MeshUtils:
         edge_count = Counter(edges)
 
         # Boundary edges appear exactly once
-        boundary_edges = [list(e) for e, c in edge_count.items() if c == 1]
+        boundary_edges = [list(e) for e, c in edge_count.items() if c == 1]  # type: ignore[misc]
 
-        return jnp.array(boundary_edges)
+        return jnp.array(boundary_edges)  # type: ignore[return-value]
 
     @staticmethod
     @jax.jit
@@ -1702,7 +1702,7 @@ class domain(MeshUtils, Geometries):
         context: Unified dict of spatial (B,N,D) and parametric (B,F) arrays for training
     """
 
-    def __init__(self, constructor: Union[Callable, str] = None, algorithm: int = 6, time: Optional[Tuple[float, float]] = None, compute_mesh_connectivity: bool = True):
+    def __init__(self, constructor: Union[Callable, str] = None, algorithm: int = 6, time: Optional[Tuple[float, float, int]] = None, compute_mesh_connectivity: bool = True):
         """
         Initialize the domain.
 
@@ -1713,21 +1713,22 @@ class domain(MeshUtils, Geometries):
             mesh_connectivity: Wether or not to compute the some hyperparameters about the mesh (needed for finite_difference methods)
         """
         super().__init__()
-        self.log: Logger = get_logger()
+        self.log = get_logger()
 
         # Storage
         self.compute_mesh_connectivity = compute_mesh_connectivity
         self._mesh_pool: Dict[str, np.ndarray] = {}  # full mesh vertices per tag (M, D)
-        self.context: Dict[str, np.ndarray] = {}  # unified: spatial (B,N,D) + params (B,F)
+        self.context: Dict[str, Any] = {}  # unified: spatial (B,N,D) + params (B,F)
         self._param_tags: set = set()  # tags that are parametric (TensorTag)
         self.normals_by_tag: Dict[str, np.ndarray] = {}
 
         # Neural operator storage
-        self.parameters: Dict[str, Union[float, int]] = {}
+        self.parameters: Dict[str, Any] = {}
         self.arrays: Dict[str, np.ndarray] = {}
         self.tag_indices: Dict[str, np.ndarray] = {}
         self.avaiable_mesh_tags: List[str] = []  # names of the tags from the mesh generator
         self._boundary_loop_tags: set = set()  # tags extracted from line cells (boundary loops)
+        self.mesh_connectivity: Optional[Dict[str, Any]] = None  # precomputed mesh connectivity data
         self._tag_triangles: Dict[str, np.ndarray] = {}  # triangle cells per volume tag
 
         # Resampling support
@@ -1754,10 +1755,10 @@ class domain(MeshUtils, Geometries):
         # Generate or load mesh
         if isinstance(constructor, str):
             self._load_mesh(constructor)
-            self.log.info(f"Loaded mesh from the constructor function: {len(self.mesh.points)} points")
-        elif isinstance(constructor, Callable):
+            self.log.info(f"Loaded mesh from the constructor function: {len(self.mesh.points)} points")  # type: ignore[attr-defined]
+        elif callable(constructor):
             self._generate_mesh(constructor, algorithm)
-            self.log.info(f"Loaded mesh from {constructor}: {len(self.mesh.points)} points")
+            self.log.info(f"Loaded mesh from {constructor}: {len(self.mesh.points)} points")  # type: ignore[attr-defined]
         else:
             raise ValueError("Must provide either geometry_func or mesh_file")
 
@@ -1837,7 +1838,7 @@ class domain(MeshUtils, Geometries):
         """Batch the domain n times: domain * 2 samples 2x independently."""
         return self.__rmul__(n)
 
-    def __add__(self, other: Tuple[str, np.ndarray]) -> "domain":
+    def __add__(self, other: "domain") -> "domain":
         """Merge another domain into this one (stacks along batch dimension).
 
         For time-dependent problems, ``_mesh_pool`` entries have shape
@@ -1902,7 +1903,7 @@ class domain(MeshUtils, Geometries):
 
         self.mesh = meshio.read(mesh_file)
 
-        points = self.mesh.points
+        points = self.mesh.points  # type: ignore[attr-defined]
         if points.shape[1] == 3 and np.allclose(points[:, 2], 0):
             self.dimension = 2
         else:
@@ -2110,7 +2111,7 @@ class domain(MeshUtils, Geometries):
         point_data: bool = False,
         split: bool = False,
         return_indices=False,
-    ) -> Tuple[Variable, ...]:
+    ) -> Any:
         """Create Variable placeholders for a tagged point set or tensor.
 
         Args:
@@ -2153,13 +2154,13 @@ class domain(MeshUtils, Geometries):
         # Check if it's a parametric (TensorTag) entry
         if tag in self._param_tags:
             if split:
-                return tuple(TensorTag(tag=tag, dim_index=i, domain=self) for i in range(sample.shape[-1]))
+                return tuple(TensorTag(tag=tag, dim_index=i, domain=self) for i in range(sample.shape[-1]))  # type: ignore[attr-defined]
             else:
                 return TensorTag(tag=tag, domain=self)
 
         if point_data:
             if split:
-                return tuple(Variable(tag=tag, dim=[i, i + 1], domain=self) for i in range(sample.shape[-1]))
+                return tuple(Variable(tag=tag, dim=[i, i + 1], domain=self) for i in range(sample.shape[-1]))  # type: ignore[attr-defined]
             else:
                 return Variable(tag=tag, dim=[0, None], domain=self)
 
@@ -2168,7 +2169,7 @@ class domain(MeshUtils, Geometries):
             raise ValueError(f"Tag '{tag}' not found. Did you call sample() first? Available: {available}")
 
         # Create Variable placeholder for each spatial dimension
-        coord_vars = [Variable(tag=tag, dim=[i, i + 1], domain=self, axis="spatial") for i in range(self.dimension)]
+        coord_vars: List[Any] = [Variable(tag=tag, dim=[i, i + 1], domain=self, axis="spatial") for i in range(self.dimension)]
 
         # Always add temporal variable (constant 1 for stationary problems)
         coord_vars.append(Variable(tag="__time__", dim=[0, 1], domain=self, axis="temporal"))
@@ -2768,7 +2769,7 @@ class domain(MeshUtils, Geometries):
             if not self.same_domain:
                 for _ in range(batch_count):
                     if sampler is not None:
-                        if isinstance(sampler, Callable):
+                        if callable(sampler):
                             idx = sampler(available_points, n_samples)
                         elif isinstance(sampler, np.ndarray):
                             idx = sampler
@@ -2869,7 +2870,7 @@ class domain(MeshUtils, Geometries):
         else:
             fig, ax = plt.subplots(figsize=figsize)
 
-        colors = plt.cm.tab10.colors
+        colors = plt.cm.tab10.colors  # type: ignore[attr-defined]
 
         # Plot points by tag
         for i, (tag, points) in enumerate(self.context.items()):
@@ -3086,7 +3087,7 @@ class domain(MeshUtils, Geometries):
         tag_names = ", ".join(t for t, _, _ in tag_data)
         fig.suptitle(f"Visibility Fans — {tag_names}  ({total_bnd} boundary pts)", fontsize=14, y=1.01)
 
-        colors = plt.cm.tab10.colors
+        colors = plt.cm.tab10.colors  # type: ignore[attr-defined]
 
         for i, ax in enumerate(axes.flat):
             if i >= n_total:

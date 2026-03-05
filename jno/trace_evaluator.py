@@ -49,7 +49,7 @@ class TraceEvaluator:
     def __init__(self, params: Dict):
         self.params = params
         self.log = get_logger()
-        self._logged_schemes = {}
+        self._logged_schemes: Dict[str, str] = {}
 
     # ------------------------------------------------------------------
     # Evaluation context — lightweight carrier replacing 5 positional args
@@ -793,7 +793,7 @@ class TraceEvaluator:
         return self._dispatch(expr.expr, ctx)
 
     @staticmethod
-    def _node_label(node) -> str:
+    def _node_label(node) -> Tuple[str, str]:
         """Return (uid, label) — rendered separately by _trace_visit."""
         uid = f"#{id(node) % 0xFFFFFF:06x}"
         if isinstance(node, Variable):

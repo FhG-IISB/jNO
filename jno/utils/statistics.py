@@ -143,7 +143,7 @@ class statistics:
         return self
 
     @classmethod
-    def load(cls, filepath: str) -> "core":
+    def load(cls, filepath: str) -> "statistics":  # type: ignore[name-defined]
         """Load a trained core model from a file.
 
         Restores all trained parameters, operations, domain, and history.

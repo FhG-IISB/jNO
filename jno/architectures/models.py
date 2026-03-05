@@ -85,7 +85,7 @@ References
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from typing import Callable, Optional, Tuple, Sequence, Literal, List, Union, Any
+from typing import Callable, Optional, Tuple, Sequence, Literal, List, Union, Any, overload
 
 from .mlp import MLP
 from .fno import FNO1D, FNO2D, FNO3D
@@ -180,8 +180,15 @@ class nn:
     # Core Wrapping Methods
     # =========================================================================
 
+    @overload
     @classmethod
-    def wrap(cls, module, space: ArchSpace = None, name: str = "", weight_path: str = None) -> Union[Model, TunableModule]:
+    def wrap(cls, module, space: None = ..., name: str = ..., weight_path: str = ...) -> "Model": ...
+    @overload
+    @classmethod
+    def wrap(cls, module, space: "ArchSpace", name: str = ..., weight_path: str = ...) -> "TunableModule": ...
+
+    @classmethod
+    def wrap(cls, module, space: "ArchSpace" = None, name: str = "", weight_path: str = None) -> Union["Model", "TunableModule"]:
         """
         Wrap a module for use in the jno pipeline.
 
@@ -537,7 +544,7 @@ class nn:
             - For non-periodic BCs, set `linear_conv=True`
 
         """
-        norm_type = norm[0] if isinstance(norm, tuple) else norm
+        norm_type = norm[0] if isinstance(norm, tuple) else norm  # type: ignore[index]
 
         model_instance = FNO1D(
             in_features=in_features,
@@ -789,11 +796,11 @@ class nn:
 
         """
         modes = geofno_compute_Fourier_modes(ndims, list(nks), list(Ls))
-        modes = jnp.array(modes)
+        modes = jnp.array(modes)  # type: ignore[assignment]
 
         model = GeoFNO(
             ndims=ndims,
-            modes=modes,
+            modes=modes,  # type: ignore[arg-type]
             layers=list(layers),
             fc_dim=fc_dim,
             in_dim=in_dim,
@@ -1010,12 +1017,12 @@ class nn:
             https://github.com/PKU-CMEGroup/NeuralOperator
         """
         modes = pcno_compute_Fourier_modes(ndims, nks, Ls)
-        modes = jnp.array(modes)
+        modes = jnp.array(modes)  # type: ignore[assignment]
         nmeasures = len(nks) // ndims
 
         model = PCNO(
             ndims=ndims,
-            modes=modes,
+            modes=modes,  # type: ignore[arg-type]
             nmeasures=nmeasures,
             layers=list(layers),
             fc_dim=fc_dim,
@@ -1596,7 +1603,7 @@ class nn:
             ... )
         """
         if num_iteration is None:
-            num_iteration = [[1, 1]] * 5
+            num_iteration = [(1, 1)] * 5
 
         model = MgNO1D(
             input_length=input_length,
@@ -1673,7 +1680,7 @@ class nn:
             Input dimensions should be divisible by 2^(num_levels-1).
         """
         if num_iteration is None:
-            num_iteration = [[1, 1]] * 5
+            num_iteration = [(1, 1)] * 5
 
         model = MgNO(
             input_shape=input_shape,
@@ -1795,7 +1802,7 @@ class nn:
                 key=key,
             )
         else:
-            model = PiTWithCoords(
+            model = PiTWithCoords(  # type: ignore[assignment]
                 in_channels=in_channels,
                 out_channels=out_channels,
                 hid_channels=hid_channels,
@@ -2154,6 +2161,8 @@ class nn:
         """
         if channel_slice_list_normalized_loss is None:
             channel_slice_list_normalized_loss = [0, 1, 3, 4]
+
+        from jax_poseidon import ScOT, ScOTConfig
 
         config = ScOTConfig(
             name=name,
@@ -3013,6 +3022,8 @@ class nn:
         Reference:
             Hao et al., "PDEformer 2" (2024)
         """
+        from jax_pdeformer2 import PDEFORMER_SMALL_CONFIG
+
         return cls._pdeformer2(
             "pdeformer2_small",
             PDEFORMER_SMALL_CONFIG,
@@ -3036,6 +3047,8 @@ class nn:
             u = nn.pdeformer2_base(dag_inputs=dag)
             u.initialize("pdeformer2-base.msgpack")
         """
+        from jax_pdeformer2 import PDEFORMER_BASE_CONFIG
+
         return cls._pdeformer2(
             "pdeformer2_base",
             PDEFORMER_BASE_CONFIG,
@@ -3059,6 +3072,8 @@ class nn:
             u = nn.pdeformer2_fast(dag_inputs=dag)
             u.initialize("pdeformer2-fast.msgpack")
         """
+        from jax_pdeformer2 import PDEFORMER_FAST_CONFIG
+
         return cls._pdeformer2(
             "pdeformer2_fast",
             PDEFORMER_FAST_CONFIG,

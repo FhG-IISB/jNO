@@ -92,11 +92,11 @@ class IREEModel:
 
     def __call__(self, *args) -> np.ndarray:
         """Run inference and return a numpy array."""
-        return np.asarray(self._module.main(*args))
+        return np.asarray(self._module.main(*args))  # type: ignore[attr-defined]
 
     def infer_raw(self, *args):
         """Run inference and return an IREE DeviceArray (no host copy)."""
-        return self._module.main(*args)
+        return self._module.main(*args)  # type: ignore[attr-defined]
 
     # ── Compile ───────────────────────────────────────────────────────────────
 

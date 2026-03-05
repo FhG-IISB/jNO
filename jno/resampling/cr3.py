@@ -64,7 +64,7 @@ class CR3(ResamplingStrategy):
         self.delta_max = delta_max
         self.min_keep_frac = min_keep_frac
         self.max_keep_frac = max_keep_frac
-        self.gamma_history = []
+        self.gamma_history: list[float] = []
 
     def _compute_gate(self, t_values: jnp.ndarray) -> jnp.ndarray:
         """Compute time gate: g(t) = 0.5 * (1 - tanh(α * (t_norm - γ)))

@@ -7,7 +7,6 @@ from ..domain import domain
 from typing import Union
 
 
-@staticmethod
 def save(instance, filepath: str, public_key_path: str = None, private_key_path: str = None):
     """Save an object to a pickle file.
 
@@ -41,7 +40,6 @@ def save(instance, filepath: str, public_key_path: str = None, private_key_path:
     return None
 
 
-@staticmethod
 def load(filepath: str, public_key_path: str = None, signature_path: str = None) -> Union[core, domain]:
     """Load a pickle object.
 
