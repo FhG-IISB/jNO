@@ -603,11 +603,7 @@ class core:
         for lid, fm in flax_mods.items():
             needs_optimizer = (not fm._frozen) or (fm._lora_config is not None)
             if needs_optimizer and fm._opt_fn is None:
-                raise ValueError(
-                    f"Model '{fm.name or type(fm.module).__name__}' (layer {lid}) "
-                    f"has no optimizer. Call  model.optimizer(optax.adam, lr=...)  "
-                    f"before solve(), or freeze it with  model.freeze()."
-                )
+                raise ValueError(f"Model '{fm.name or type(fm.module).__name__}' (layer {lid}) " f"has no optimizer. Call  model.optimizer(optax.adam, lr=...)  " f"before solve(), or freeze it with  model.freeze().")
 
         # ── 2. Apply LoRA transforms ──
         models = dict(self.models)
@@ -633,12 +629,7 @@ class core:
                 if isinstance(model_after, FlaxLoRAWrapper):
                     # Count LoRA layers from the Flax lora_params dict
                     n_lora_layers = sum(1 for l in jax.tree_util.tree_leaves(model_after.lora_params) if eqx.is_array(l)) // 2  # each layer has lora_a + lora_b
-                    self.log.info(
-                        f"LoRA (Flax) applied to model {lid} (rank={rank}, alpha={alpha}): "
-                        f"{n_lora_layers} kernel layers adapted, "
-                        f"{n_lora_params:,} new LoRA params, "
-                        f"base frozen at {n_params_before:,} params"
-                    )
+                    self.log.info(f"LoRA (Flax) applied to model {lid} (rank={rank}, alpha={alpha}): " f"{n_lora_layers} kernel layers adapted, " f"{n_lora_params:,} new LoRA params, " f"base frozen at {n_params_before:,} params")
                 else:
                     from .architectures.linear import Linear as JNOLinear
 
@@ -881,8 +872,8 @@ class core:
             ).compile()
 
             # ── 8. Training loop ──
-            hw_monitor = HardwareMonitor(logger=self.log, interval=0.5)
-            hw_monitor.start()
+            # hw_monitor = HardwareMonitor(logger=self.log, interval=0.5)
+            # hw_monitor.start()
 
             print_rate = max(1, epochs // 100 if epochs < 100_000 else epochs // 1000)
             prev_losses = jax.device_put(jnp.zeros(self.n_constraints), replicated)
@@ -951,7 +942,7 @@ class core:
                         )
 
             et = time.time()
-            hw_monitor.stop(logger=self.log)
+            # hw_monitor.stop(logger=self.log)
 
             # ── 9. Reconstruct models ──
             trained_models = eqx.combine(trainable, frozen_arrays, static)

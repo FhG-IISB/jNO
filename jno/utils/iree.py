@@ -8,7 +8,6 @@ from typing import Callable
 import numpy as np
 import jax
 from jax import export
-import iree.runtime as ireert
 
 log = logging.getLogger(__name__)
 
@@ -32,6 +31,7 @@ class IREEModel:
     """
 
     def __init__(self, vmfb_bytes: bytes, module_name: str, device: str = "local-sync"):
+
         self.vmfb_bytes = vmfb_bytes
         self.module_name = module_name
         self.device = device
@@ -47,6 +47,8 @@ class IREEModel:
 
     def _load_model(self):
         """Write vmfb bytes to a temp file and mmap into IREE."""
+        import iree.runtime as ireert
+
         # iree-runtime's mmap requires a real file path, so we write once.
         fd, path = tempfile.mkstemp(suffix=".vmfb")
         try:

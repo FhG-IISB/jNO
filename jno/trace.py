@@ -5,14 +5,12 @@ Variables are placeholders that get filled during solve iterations.
 Operations trace computations and return callable placeholders.
 """
 
-from typing import List, Callable, Any, Union, Dict, Tuple, Optional, Type
-from dataclasses import dataclass, field
+from typing import List, Callable, Any, Union, Dict, Optional, Type
 from .tuner import Arch, ArchSpace
-import jax
 import jax.numpy as jnp
-import equinox as eqx
 from pathlib import Path
 import json
+from .utils.adaptive import LearningRateSchedule
 
 __all__ = [
     "Placeholder",
@@ -381,10 +379,7 @@ class ConstantNamespace:
             # Check if it contains dicts (don't convert to array)
             if any(isinstance(item, dict) for item in value):
                 # Convert each dict to ConstantNamespace, keep others as-is
-                return [
-                    (ConstantNamespace(f"{key}[{i}]", item, _parent_tag=parent_tag) if isinstance(item, dict) else ConstantNamespace._convert_value(item, f"{key}[{i}]", parent_tag))
-                    for i, item in enumerate(value)
-                ]
+                return [(ConstantNamespace(f"{key}[{i}]", item, _parent_tag=parent_tag) if isinstance(item, dict) else ConstantNamespace._convert_value(item, f"{key}[{i}]", parent_tag)) for i, item in enumerate(value)]
             # Check if it's numeric (could be nested arrays)
             if ConstantNamespace._is_numeric_sequence(value):
                 return jnp.asarray(value)
@@ -748,7 +743,7 @@ class Model(Placeholder):
         self._frozen: bool = False
         self._lora_config = None  # (rank, alpha) or None
         self._opt_fn = None  # optax optimizer factory / instance
-        self._lr = None  # LearningRateSchedule or None
+        self._lr = LearningRateSchedule(1.0)
         self._dtype = None  # target dtype (e.g. jnp.bfloat16) or None
         self._param_mask = None  # pytree of bool with same structure as model; None = all trainable
         self._weight_tree = None  # pretrained weights as a pytree (alternative to weight_path file)
@@ -831,32 +826,28 @@ class Model(Placeholder):
 
     def merge_lora(self):
         """Merge LoRA adapters into base weights and disable LoRA."""
-        from .architectures.lora_linear import merge_lora as _merge_lora
-
-        # The actual merge is done by core.solve() after training;
-        # calling this just sets a flag.
         self._lora_config = None
         self._merge_lora_flag = True
         return self
 
-    def optimizer(self, opt_fn, *, lr=None):
-        """Attach an optimizer (and optional LR schedule) to this model.
+    def optimizer(self, opt_fn):
+        """Attach an optimizer to this model.
 
         Args:
             opt_fn: An optax optimizer factory, e.g. ``optax.adam``,
                     or an already-constructed transform.
+        """
+        self._opt_fn = opt_fn
+        return self
+
+    def lr(self, lr):
+        """Attach an LR schedule to this model.
+
+        Args:
             lr:     A ``LearningRateSchedule`` (or float) for this model.
                     If *None*, a constant schedule of 1e-3 is used.
         """
-        from .utils.adaptive import LearningRateSchedule
-
-        self._opt_fn = opt_fn
-        if lr is None:
-            self._lr = LearningRateSchedule(1e-3)
-        elif isinstance(lr, (int, float)):
-            self._lr = LearningRateSchedule(float(lr))
-        else:
-            self._lr = lr
+        self._lr = lr
         return self
 
     def initialize(self, weights):
