@@ -22,6 +22,8 @@ from .trace import (
     OperationCall,
     Hessian,
     Jacobian,
+    TestFunction, 
+    Assembly,
 )
 from .utils import get_logger
 import equinox as eqx
@@ -178,6 +180,8 @@ class TraceEvaluator:
             self._trace_visit(node.operation, ctx, depth + 1, lines, seen)
         elif isinstance(node, (Jacobian, Hessian)):
             self._trace_visit(node.target, ctx, depth + 1, lines, seen)
+        elif isinstance(node, Assembly):
+            self._trace_visit(node.expr, ctx, depth + 1, lines, seen)
         # Leaf nodes (Variable, TensorTag, Constant, Literal) — no children
 
     def _infer_shape_from_children(self, node, ctx):
@@ -212,7 +216,8 @@ class TraceEvaluator:
             if ts is not None:
                 return f"~{ts}  (derivative)"
             return "??"
-
+        if isinstance(node, Assembly):
+            return f"({node.num_total_nodes},)"
         if isinstance(node, FunctionCall):
             # Reductions like .mse produce ()
             name = node._name or getattr(node.fn, "__name__", "")
@@ -265,6 +270,8 @@ class TraceEvaluator:
         (Jacobian, "_eval_jacobian"),
         (Hessian, "_eval_hessian"),
         (OperationDef, "_eval_operation_def"),
+        (TestFunction, "_eval_test_function"), 
+        (Assembly, "_eval_assembly"),
     ]
 
     def _dispatch(self, expr, ctx):
@@ -285,6 +292,10 @@ class TraceEvaluator:
         """
         local = {}
         for k, v in context.items():
+            # ---Safely pass through FEM dictionaries and scalars ---
+            if isinstance(v, dict) or not hasattr(v, "ndim"):
+                local[k] = v
+                continue
             if v.ndim < 1:
                 local[k] = v
             elif v.ndim == 1:
@@ -501,6 +512,15 @@ class TraceEvaluator:
         target = expr.target
         variables = expr.variables
         scheme = expr.scheme
+        if isinstance(target, TestFunction):
+            # dim[0] tells us if we are differentiating w.r.t x (0), y (1), or z (2)
+            dim_idx = variables[0].dim[0] 
+            
+            if target.tag == "fem_gauss":
+                # Returns shape (num_cells * num_quads, num_local_nodes)
+                return ctx.context["dN_dx_flat"][..., dim_idx]
+            else:
+                raise ValueError(f"Gradients of surface test functions (tag={target.tag}) are not supported.")
 
         first_var = variables[0]
         bound_var = ctx.var_bindings.get(id(first_var), first_var)
@@ -841,3 +861,73 @@ class TraceEvaluator:
             scheme_str = f", {node.scheme[:2]}" if node.scheme else ""
             return uid, f"{kind}([{vars_str}]{scheme_str})"
         return uid, type(node).__name__
+
+    def _eval_test_function(self, expr, ctx):
+        """Returns the precomputed shape function values."""
+        if expr.tag == "fem_gauss":
+            # Volume shape functions: (num_cells * num_quads, num_local_nodes)
+            return ctx.context["N_flat"]
+        else:
+            # Surface shape functions for Neumann boundaries
+            if expr.tag not in ctx.context.get("surface_data", {}):
+                raise KeyError(f"Surface tag '{expr.tag}' not found in fem_context['surface_data'].")
+            return ctx.context["surface_data"][expr.tag]["face_shape_vals"]
+
+    def _eval_assembly(self, expr, ctx):
+        """Multiplies by quadrature weights, integrates over cells, and scatters to global nodes."""
+        integrand = self._dispatch(expr.expr, ctx)
+        
+        if expr.tag == "fem_gauss":
+            # Volume integral
+            JxW = ctx.context["JxW"].flatten()[:, None]
+            local_residuals = integrand * JxW
+            flat_cells = ctx.context["flat_cells"]
+        else:
+            # Surface integral
+            surf_data = ctx.context["surface_data"][expr.tag]
+            nanson = surf_data["nanson_scale"].flatten()[:, None]
+            local_residuals = integrand * nanson
+            flat_cells = surf_data["flat_parent_nodes"]
+            
+        num_local_nodes = integrand.shape[-1]
+        num_entities = flat_cells.shape[0] // num_local_nodes
+        num_quads = local_residuals.shape[0] // num_entities
+        
+        # Integrate (sum) over quadrature points per cell
+        local_residuals = local_residuals.reshape(num_entities, num_quads, num_local_nodes)
+        cell_residuals = jnp.sum(local_residuals, axis=1) 
+        
+        num_total_nodes = expr.num_total_nodes
+        
+        # Scatter-add to global nodes
+        global_residual = jax.ops.segment_sum(
+            cell_residuals.flatten(), 
+            flat_cells, 
+            num_segments=num_total_nodes
+        )
+
+        # --- DYNAMIC VOLUME NORMALIZATION ---
+        if expr.tag == "fem_gauss":
+            # 1. Get exact cell areas by summing JxW
+            local_areas = JxW.reshape(num_entities, num_quads, 1)
+            cell_areas = jnp.sum(local_areas, axis=1) # Shape: (Cells, 1)
+            
+            # 2. Broadcast the cell area to its local nodes
+            cell_areas_broadcast = jnp.broadcast_to(cell_areas, (num_entities, num_local_nodes))
+            
+            # 3. Scatter-sum to get exact lumped Nodal Areas
+            nodal_areas = jax.ops.segment_sum(
+                cell_areas_broadcast.flatten(), 
+                flat_cells, 
+                num_segments=num_total_nodes
+            )
+            # Normalize to restore O(1) gradient flow!
+            global_residual = global_residual / (nodal_areas + 1e-12)
+
+        # --- GALERKIN PROJECTION ---
+        if "dirichlet_nodes" in ctx.context:
+            d_nodes = jnp.asarray(ctx.context["dirichlet_nodes"]).flatten().astype(jnp.int32)
+            if d_nodes.size > 0:
+                global_residual = global_residual.at[d_nodes].set(0.0)
+
+        return global_residual

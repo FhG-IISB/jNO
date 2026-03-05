@@ -37,6 +37,8 @@ __all__ = [
     "get_primary_tag",
     "dump_tree",
     "cse",
+    "TestFunction",
+    "Assembly",
 ]
 
 # Global counter for unique operation IDs
@@ -171,6 +173,17 @@ class Placeholder:
         if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
             shape = tuple(shape[0])
         return FunctionCall(lambda x, s=shape: x.reshape(s), [self], name="reshape")
+    
+    def assemble(self, domain,tag="fem_gauss"):
+        """
+        Triggers the FEM local-to-global assembly for this expression.
+        Args:
+            tag: The domain tag to integrate over (e.g., "fem_gauss" for volume, 
+                 or "top" for a Neumann surface boundary).
+        Returns:
+            An Assembly node representing the global residual vector.
+        """
+        return Assembly(self, domain,tag)
 
     @property
     def shape(self):
@@ -1250,7 +1263,38 @@ class Jacobian(Placeholder):
         var_names = ", ".join(str(v) for v in self.variables)
         return f"Jacobian({self.target}, [{var_names}])"
 
+class TestFunction(Placeholder):
+    """
+    Represents an FEM shape function (test function) evaluated at quadrature points.
+    During evaluation, this maps to the precomputed jax-fem shape values/gradients
+    for the specified tag.
+    """
+    def __init__(self, tag="fem_gauss", name="phi"):
+        self.tag = tag
+        self.name = name
+        self.op_id = _next_op_id()
 
+    def __repr__(self):
+        return f"TestFunction({self.name}, tag={self.tag})"
+
+
+class Assembly(Placeholder):
+    """
+    Represents the FEM numerical integration and local-to-global scatter-add.
+    """
+    def __init__(self, expr: Placeholder, domain_or_nodes, tag: str):
+        self.expr = expr
+        self.tag = tag
+        # Safely extract the static integer, whether passed a domain or raw int
+        if hasattr(domain_or_nodes, "context"):
+            self.num_total_nodes = int(domain_or_nodes.context["num_total_nodes"])
+        else:
+            self.num_total_nodes = int(domain_or_nodes)
+            
+        self.op_id = _next_op_id()
+
+    def __repr__(self):
+        return f"Assemble({self.expr}, tag={self.tag}, nodes={self.num_total_nodes})"
 # =============================================================================
 # Tree optimisation — Common Sub-expression Elimination (CSE)
 # =============================================================================
@@ -1311,13 +1355,17 @@ def cse(expr: Placeholder) -> Placeholder:
             return ("Hess", id(node.target), var_ids, node.trace, node.scheme)
         if isinstance(node, Tracker):
             return ("Track", id(node.expr), node.interval)
+        if isinstance(node, TestFunction):
+            return ("TestFn", node.tag, id(node))
+        if isinstance(node, Assembly):
+            return ("Assembly", node.tag, node.num_total_nodes, id(node.expr))
         # Fallback — use object identity (no dedup possible)
         return ("?", id(node))
 
     def _visit(node):
         """Post-order walk: canonicalise children first, then self."""
         # Leaves — always canonical
-        if isinstance(node, (Variable, TensorTag, Constant, Literal)):
+        if isinstance(node, (Variable, TensorTag, Constant, Literal,TestFunction)):
             return node
 
         # ── recurse into children and rebuild if anything changed ──
@@ -1363,7 +1411,10 @@ def cse(expr: Placeholder) -> Placeholder:
             new_expr = _visit(node.expr)
             if new_expr is not node.expr:
                 node = Tracker(new_expr, node.interval)
-
+        elif isinstance(node, Assembly):
+            new_expr = _visit(node.expr)
+            if new_expr is not node.expr:
+                node = Assembly(new_expr, node.num_total_nodes, node.tag)
         # ── dedup: if we've seen an identical node, return the earlier one ──
         k = _key(node)
         if k in _canon:
@@ -1418,7 +1469,8 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
                 visit(v)
         elif isinstance(node, Tracker):
             visit(node.expr)
-
+        elif isinstance(node, Assembly):
+            visit(node.expr)
     visit(expr)
     return ops
 
@@ -1460,7 +1512,10 @@ def collect_tags(expr: Placeholder) -> set:
                 visit(v)
         elif isinstance(node, Tracker):
             visit(node.expr)
-
+        elif isinstance(node, TestFunction):
+            tags.add(node.tag)
+        elif isinstance(node, Assembly):
+            visit(node.expr)
     visit(expr)
     return tags
 
@@ -1509,6 +1564,8 @@ def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
             return f"Constant({node.tag}.{node.key}={val})"
         if isinstance(node, Literal):
             return f"Literal({node.value})"
+        if isinstance(node, TestFunction):
+            return f"TestFunction({node.name}, tag={node.tag})"
         if isinstance(node, Model):
             return f"Model(id={node.layer_id}, {type(node.module).__name__})"
         if isinstance(node, (int, float)):
@@ -1571,6 +1628,11 @@ def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
             _visit(node.target, depth + 1)
         elif isinstance(node, Tracker):
             lines.append(f"{p}Tracker(interval={node.interval})")
+            _visit(node.expr, depth + 1)
+        elif isinstance(node, TestFunction):
+            lines.append(f"{p}{_node_label(node)}")
+        elif isinstance(node, Assembly):
+            lines.append(f"{p}Assembly(tag={node.tag})")
             _visit(node.expr, depth + 1)
         elif isinstance(node, ConstantNamespace):
             lines.append(f"{p}ConstantNamespace({node._full_tag})")

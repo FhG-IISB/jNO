@@ -37,6 +37,7 @@ from .trace import (
     TunableModule,
     TunableModuleCall,
     Variable,
+    Assembly,
 )
 
 
@@ -138,6 +139,8 @@ class TraceCompiler:
                         visit(arg)
             elif isinstance(node, (Hessian, Jacobian)):
                 visit(node.target)
+            elif isinstance(node, Assembly):
+                visit(node.expr)
 
         visit(expr)
         return layers

@@ -1874,6 +1874,117 @@ class domain(MeshUtils, Geometries):
         return self
 
     # Generators
+    def init_fem(self, element_type: str = "TRI3", quad_degree: int = 2, neumann_tags: List[str] = [], dirichlet_tags: List[str] = []) -> "domain":
+        if self.mesh is None:
+            raise ValueError("Mesh must be loaded before initializing FEM context.")
+
+        import jax.numpy as jnp
+        import numpy as onp
+        from jax_fem.problem import Problem
+        from jax_fem.generate_mesh import Mesh
+        from scipy.spatial import KDTree # Ensuring this is available locally
+
+        meshio_type_map = {"TRI3": "triangle", "QUAD4": "quad"}
+        meshio_type = meshio_type_map.get(element_type)
+        jax_mesh = Mesh(self.mesh.points[:, :self.dimension], self.mesh.cells_dict[meshio_type])
+
+        # --- Location functions for Neumann ---
+        location_fns = []
+        valid_tags = []
+        for tag in neumann_tags:
+            if tag in self.self._mesh_pool:
+                valid_tags.append(tag)
+                tag_pts = jnp.asarray(self._mesh_pool[tag]) 
+                
+                def make_loc_fn(pts):
+                    def loc_fn(p):
+                        return jnp.any(jnp.linalg.norm(pts - p, axis=-1) < 1e-5)
+                    return loc_fn
+                
+                location_fns.append(make_loc_fn(tag_pts))
+
+        class DummyProblem(Problem):
+            def get_tensor_map(self): 
+                return lambda x: x
+            
+            def get_mass_map(self): 
+                return lambda x: x
+            
+            def get_surface_maps(self):
+                return [lambda u, x: jnp.zeros((1,))] * len(location_fns)
+        
+        prob = DummyProblem(jax_mesh, vec=1, dim=self.dimension, ele_type=element_type,
+                            gauss_order=quad_degree, dirichlet_bc_info=[[lambda p: False], [0], [lambda p: 0.0]],
+                            location_fns=location_fns) 
+        fe = prob.fes[0]
+
+        # --- Identify Dirichlet node indices ---
+        dirichlet_nodes = []
+        if dirichlet_tags:
+            tree = KDTree(fe.points)
+            for tag in dirichlet_tags:
+                if tag in self._mesh_pool:
+                    # Query the global indices of the points belonging to this Dirichlet tag
+                    _, inds = tree.query(self._mesh_pool[tag])
+                    dirichlet_nodes.extend(inds)
+        
+        # Ensure unique integer indices
+        dirichlet_nodes = jnp.array(list(set(dirichlet_nodes)), dtype=jnp.int32) if dirichlet_nodes else jnp.array([], dtype=jnp.int32)
+        # --- Precompute Constants for Fast Assembly ---
+        shape_vals_jax = jnp.asarray(fe.shape_vals)
+        shape_grads_jax = jnp.asarray(fe.shape_grads)
+        JxW_jax = jnp.asarray(fe.JxW)
+        cells_jax = jnp.asarray(fe.cells, dtype=jnp.int32)
+        flat_cells = cells_jax.flatten()
+        
+        # Precompute Volume Normalization Areas (runs ONLY ONCE!)
+        local_areas = jnp.einsum('cq,qa->ca', JxW_jax, shape_vals_jax)
+        global_areas = jax.ops.segment_sum(local_areas.flatten(), flat_cells, num_segments=fe.num_total_nodes)
+        num_cells, num_quads, num_local_nodes, dim = shape_grads_jax.shape
+        N_flat = jnp.tile(shape_vals_jax[None, ...], (num_cells, 1, 1)).reshape(-1, num_local_nodes)
+        dN_dx_flat = shape_grads_jax.reshape(-1, num_local_nodes, dim)
+
+        # Extract standard Volume Context
+        self.fem_context = {
+            "cells": cells_jax,
+            "flat_cells": flat_cells,               
+            "global_areas": global_areas,           
+            "N_flat": N_flat,                      
+            "dN_dx_flat": dN_dx_flat,               
+            "JxW": JxW_jax,
+            "num_total_nodes": fe.num_total_nodes,
+            "boundary_nodes": jnp.asarray(self._extract_points_from_mesh(self.mesh), dtype=jnp.int32),
+            "dirichlet_nodes": dirichlet_nodes, 
+            "surface_data": {}
+        }
+        self._mesh_pool["fem_gauss"] = jnp.asarray(fe.get_physical_quad_points()).reshape(-1, self.dimension)
+
+        # --- Extract Native jax-fem Nanson Scales for Neumann ---
+        for i, tag in enumerate(valid_tags):
+            inds = prob.boundary_inds_list[i] 
+            if len(inds) > 0:
+                _, nanson_scale = fe.get_face_shape_grads(inds) 
+                
+                parent_cells = fe.cells[inds[:, 0]]
+                face_ids = inds[:, 1]
+                face_shape_vals = fe.face_shape_vals[face_ids]
+
+                physical_coos = onp.take(fe.points, fe.cells, axis=0)
+                selected_coos = physical_coos[inds[:, 0]]
+                physical_face_quads = onp.einsum('fqn,fnd->fqd', face_shape_vals, selected_coos)
+
+                self.fem_context["surface_data"][tag] = {
+                    "flat_parent_nodes": jnp.asarray(parent_cells, dtype=jnp.int32).flatten(),
+                    "face_shape_vals": jnp.asarray(face_shape_vals),
+                    "nanson_scale": jnp.asarray(nanson_scale) 
+                }
+                self._mesh_pool[f"gauss_{tag}"] = jnp.asarray(physical_face_quads).reshape(-1, self.dimension)
+                self.log.info(f"jax-fem Nanson extraction: Matched {len(inds)} faces for '{tag}'")
+
+                # Expose the integration arrays to jNO's trace evaluator
+        self.context.update(self.fem_context)
+            
+        return self
 
     def _generate_mesh(self, geometry_func: Callable, algorithm: int):
         """Generate mesh using PyGmsh."""
