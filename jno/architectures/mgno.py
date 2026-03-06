@@ -184,11 +184,11 @@ class MgConv(eqx.Module):
                 key, subkey = jax.random.split(key)
                 prolongate_layers.append(Prolongate(num_channel_u, kernel_sizes[level], key=subkey))
 
-        self.init_layers = tuple(init_layers)
-        self.pre_smooth_layers = tuple(pre_smooth_layers)
-        self.restrict_layers = tuple(restrict_layers)
-        self.prolongate_layers = tuple(prolongate_layers)
-        self.post_smooth_layers = tuple(post_smooth_layers)
+        self.init_layers = tuple(init_layers)  # type: ignore[assignment]
+        self.pre_smooth_layers = tuple(pre_smooth_layers)  # type: ignore[assignment]
+        self.restrict_layers = tuple(restrict_layers)  # type: ignore[assignment]
+        self.prolongate_layers = tuple(prolongate_layers)  # type: ignore[assignment]
+        self.post_smooth_layers = tuple(post_smooth_layers)  # type: ignore[assignment]
 
     def __call__(self, f: jnp.ndarray) -> jnp.ndarray:
         """
@@ -276,7 +276,7 @@ class MgNO(eqx.Module):
         key,
     ):
         if num_iteration is None:
-            num_iteration = [[1, 1]] * 5
+            num_iteration = [(1, 1)] * 5
 
         self.activation = activation
 
@@ -320,7 +320,7 @@ class MgNO(eqx.Module):
         for mg, lin in zip(self.mgconv_layers, self.linear_layers):
             mg_out = mg(u)
             lin_out = lin(u)
-            u = act(mg_out + lin_out)
+            u = act(mg_out + lin_out)  # type: ignore[operator]
 
         output = self.output_proj(u)
 
@@ -344,10 +344,20 @@ class MgNO1D(eqx.Module):
     mgno: MgNO
 
     def __init__(
-        self, input_length: int, num_layer: int = 5, num_channel_u: int = 24, num_channel_f: int = 3, num_iteration: Optional[List[Tuple[int, int]]] = None, output_dim: int = 1, activation: str = "gelu", padding_mode: str = "CIRCULAR", *, key
+        self,
+        input_length: int,
+        num_layer: int = 5,
+        num_channel_u: int = 24,
+        num_channel_f: int = 3,
+        num_iteration: Optional[List[Tuple[int, int]]] = None,
+        output_dim: int = 1,
+        activation: str = "gelu",
+        padding_mode: str = "CIRCULAR",
+        *,
+        key,
     ):
         if num_iteration is None:
-            num_iteration = [[1, 1]] * 5
+            num_iteration = [(1, 1)] * 5
         self.mgno = MgNO(
             input_shape=(input_length, 1),
             num_layer=num_layer,

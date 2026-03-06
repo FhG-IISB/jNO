@@ -251,7 +251,7 @@ class LinearAttention(eqx.Module):
         elif self.attn_type == "galerkin":
             q = jax.nn.softmax(q, axis=-1)
             k = jax.nn.softmax(k, axis=-1)
-            D_inv = 1.0 / T2
+            D_inv = jnp.array(1.0 / T2)
 
         elif self.attn_type == "l2":
             q = q / (jnp.linalg.norm(q, ord=1, axis=-1, keepdims=True) + 1e-8)

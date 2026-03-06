@@ -62,7 +62,7 @@ def get_activation(name: str) -> Optional[Callable]:
     key = name.lower()
     if key not in activations:
         raise ValueError(f"Unknown activation '{name}'. Available: {list(activations.keys())}")
-    return activations[key]
+    return activations[key]  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------

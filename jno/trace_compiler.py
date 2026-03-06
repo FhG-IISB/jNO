@@ -18,7 +18,7 @@ The hot-path **evaluation** code lives in :mod:`jno.trace_evaluator`
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Dict, List, Tuple
+from typing import Any, Callable, Dict, List, Tuple
 
 import jax
 import jax.numpy as jnp
@@ -314,6 +314,7 @@ class TraceCompiler:
             raise ValueError(f"Unknown layer type: {type(layer)}")
 
         module = layer.module
+        init_mask = getattr(layer, "_initialize_mask", None)
 
         # ---- Flax NNX wrapper path ----------------------------------
         from .architectures.common import FlaxModelWrapper, FlaxNNXWrapper
@@ -334,7 +335,17 @@ class TraceCompiler:
             logger.info("Loading pretrained NNX weights from pytree")
             module = FlaxNNXWrapper.__new__(FlaxNNXWrapper)
             object.__setattr__(module, "graphdef", layer.module.graphdef)
-            object.__setattr__(module, "state", jax.tree_util.tree_map(lambda src, _: src, pretrained_state, layer.module.state))
+            if init_mask is not None:
+                state_mask = init_mask.state if hasattr(init_mask, "state") else init_mask
+                state = jax.tree_util.tree_map(
+                    lambda src, dst, m: src if bool(m) else dst,
+                    pretrained_state,
+                    layer.module.state,
+                    state_mask,
+                )
+            else:
+                state = jax.tree_util.tree_map(lambda src, _: src, pretrained_state, layer.module.state)
+            object.__setattr__(module, "state", state)
             object.__setattr__(module, "post_fn", layer.module.post_fn)
             object.__setattr__(module, "default_kwargs", layer.module.default_kwargs)
             if layer.show:
@@ -361,6 +372,18 @@ class TraceCompiler:
                 module.params,
                 logger,
             )
+            # Optional masked initialise: copy only selected leaves from
+            # pretrained params; keep fresh init elsewhere.
+            if init_mask is not None:
+                params_mask = init_mask.params if hasattr(init_mask, "params") else init_mask
+                merged = jax.tree_util.tree_map(
+                    lambda pre, fresh, m: pre if bool(m) else fresh,
+                    merged,
+                    module.params,
+                    params_mask,
+                )
+                logger.info("Applied masked initialise (Flax): loaded target subset only")
+
             # Return a new FlaxModelWrapper with merged params
             model = FlaxModelWrapper(
                 module.apply_fn,
@@ -397,6 +420,15 @@ class TraceCompiler:
                     model,
                 )
 
+            if init_mask is not None:
+                model = jax.tree_util.tree_map(
+                    lambda pre, fresh, m: pre if bool(m) else fresh,
+                    model,
+                    module,
+                    init_mask,
+                )
+                logger.info("Applied masked initialise: loaded target subset only")
+
             # ---- optional dtype cast --------------------------------
             if getattr(layer, "_dtype", None) is not None:
                 model = TraceCompiler._cast_model_dtype(model, layer._dtype, logger)
@@ -413,7 +445,7 @@ class TraceCompiler:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def init_layer_params(all_ops: List, domain_dim: int, tensor_dims: Dict[str, int], rng: jax.Array, logger) -> Tuple[Dict, jax.Array]:
+    def init_layer_params(all_ops: List, domain_dim: int, tensor_dims: Dict[str, Tuple], rng: jax.Array, logger) -> Tuple[Dict, jax.Array]:
         """Collect / initialise models for all layers.
 
         For equinox modules (the normal path), the model was already
@@ -427,7 +459,7 @@ class TraceCompiler:
             all_models: Dict mapping layer_id -> callable model
             rng: Updated RNG key
         """
-        all_models = {}
+        all_models: Dict[int, Any] = {}
         seen = set()
 
         for op in all_ops:
@@ -480,7 +512,7 @@ class TraceCompiler:
             evaluator = TraceEvaluator(params)
             return evaluator.evaluate(expr, context_single, {}, key)
 
-        def compiled_fn(params, context=None, batchsize=None, key=None):
+        def compiled_fn(params, context=None, batchsize=None, key=None, min_consecutive=1):
             """
             Evaluate the compiled expression.
 
@@ -492,6 +524,11 @@ class TraceCompiler:
                 batchsize: If provided, randomly select this many samples
                     from the batch dimension.
                 key: JAX random key for mini-batch and stochastic ops.
+                min_consecutive: Minimum number of consecutive time steps
+                    passed to the evaluator in one call.  Setting this >= T
+                    passes all time steps at once (no loop, 2 AD passes).
+                    Values > 1 require the model to accept a leading time
+                    dimension (shape ``(W, N, D)`` instead of ``(N, D)``).
             """
             context = context or {}
 
@@ -530,7 +567,6 @@ class TraceCompiler:
                 if key is None:
                     raise ValueError("A JAX random key must be provided when " "batchsize is specified.")
                 if batchsize > B:
-                    print("WARNING: batchsize larger than sampling -> replace=True")
                     indices = jax.random.choice(key, B, shape=(batchsize,), replace=True)
                     indices = jnp.sort(indices)
                 elif batchsize < B:
@@ -590,52 +626,66 @@ class TraceCompiler:
             spatial_ctx = tuple(new_ctx)
             ctx_in_axes = tuple(ctx_in_axes)
 
-            # ----- inner: scan over T then evaluate -------------------
+            # ----- inner: single sampled temporal window per sample ----------
             def scan_over_time(spatial_vals, rng_key):
-                """Given per-batch spatial arrays (T,N,D) + shared
-                time_arr (T,1), scan over T and evaluate on (N,D)."""
+                """Evaluate one consecutive W-step window for this sample.
 
-                # Determine T from the first spatial array with a T dim
-                # After vmap peels B, 4-D arrays became (T, N, D)
-                T = None
+                W is controlled by ``min_consecutive`` and clamped to ``T``.
+                When ``T > W``, we sample a random start index per sample (using
+                ``rng_key``) and evaluate only that window. This keeps temporal
+                context while avoiding a full pass over all windows each step.
+                """
+                # T and W are static Python ints — resolved from shapes at trace time
+                T = 1
                 for v in spatial_vals:
                     if hasattr(v, "ndim") and v.ndim >= 3:
-                        T = v.shape[0]
-                        break
-                if T is None:
-                    # Fallback: all arrays are 2-D (param tags) — no T
-                    T = 1
+                        T = max(T, v.shape[0])
 
-                def scan_body(carry, t_idx):
-                    """Process a single time step."""
-                    # Build (N, D) context for this time step
+                W = max(1, min(min_consecutive, T))  # window size
+
+                if T > W:
+                    if rng_key is None:
+                        start = jnp.asarray(0, dtype=jnp.int32)
+                    else:
+                        start = jax.random.randint(rng_key, shape=(), minval=0, maxval=T - W + 1)
+                else:
+                    start = jnp.asarray(0, dtype=jnp.int32)
+
+                def eval_window(windowed_ctx, t_wind):
+                    """Evaluate on one window of W steps.
+                    windowed_ctx: tuple of (W, N, D) or non-spatial arrays.
+                    t_wind: (W, 1) time slice, or dummy scalar when time_arr is None.
+                    """
                     ctx_dict = {}
-                    for tag, arr in zip(spatial_tag_order, spatial_vals):
-                        if hasattr(arr, "ndim") and arr.ndim >= 3:
-                            # (T, N, D) → (N, D)
-                            ctx_dict[tag] = arr[t_idx]
+                    for tag, arr in zip(spatial_tag_order, windowed_ctx):
+                        if W == 1 and hasattr(arr, "ndim") and arr.ndim >= 2:
+                            ctx_dict[tag] = arr[0]  # (1, N, D) → (N, D) — scalar-step compat
                         else:
-                            # parametric / other — pass through
-                            ctx_dict[tag] = arr
-
-                    # Add time scalar if present
+                            ctx_dict[tag] = arr  # (W, N, D)
                     if time_arr is not None:
-                        ctx_dict[TIME_TAG] = time_arr[t_idx]  # (1,)
+                        ctx_dict[TIME_TAG] = t_wind[0] if W == 1 else t_wind
+                    return evaluate_single_point_set(params, ctx_dict, key=rng_key)
 
-                    result = evaluate_single_point_set(
-                        params,
-                        ctx_dict,
-                        key=rng_key,
-                    )
-                    return carry, result
+                # Slice one temporal window: (T, ...) → (W, ...)
+                windowed_list = []
+                for arr in spatial_vals:
+                    if hasattr(arr, "ndim") and arr.ndim >= 3 and arr.shape[0] == T:
+                        slice_sizes = (W,) + tuple(arr.shape[1:])
+                        start_idx = (start,) + (0,) * (arr.ndim - 1)
+                        windowed_list.append(jax.lax.dynamic_slice(arr, start_idx, slice_sizes))
+                    elif hasattr(arr, "ndim") and arr.ndim >= 3 and arr.shape[0] < T:
+                        # Broadcast static/short temporal inputs (e.g. initial condition)
+                        # to the selected window length.
+                        windowed_list.append(jnp.broadcast_to(arr, (W, *arr.shape[1:])))
+                    else:
+                        windowed_list.append(arr)
 
-                _, results = jax.lax.scan(
-                    scan_body,
-                    init=None,
-                    xs=jnp.arange(T),
-                )
-                # results has shape (T, ...) — e.g. (T,) or (T, N) etc.
-                return results
+                if time_arr is not None:
+                    t_windowed = jax.lax.dynamic_slice(time_arr, (start, 0), (W, 1))
+                else:
+                    t_windowed = jnp.zeros((W, 1))  # dummy — never read when time_arr is None
+
+                return eval_window(tuple(windowed_list), t_windowed)
 
             # ----- outer: vmap over B ---------------------------------
             if key is not None:
@@ -680,7 +730,7 @@ class TraceCompiler:
             return [evaluator.evaluate(expr, context_single, {}, key) for expr in exprs]
 
         # Everything below is identical to compile_traced_expression.
-        def compiled_fn(params, context=None, batchsize=None, key=None):
+        def compiled_fn(params, context=None, batchsize=None, key=None, min_consecutive=1):
             context = context or {}
 
             all_tags = set()
@@ -708,7 +758,6 @@ class TraceCompiler:
                 if key is None:
                     raise ValueError("A JAX random key must be provided when batchsize is specified.")
                 if batchsize > B:
-                    print("WARNING: batchsize larger than sampling -> replace=True")
                     indices = jax.random.choice(key, B, shape=(batchsize,), replace=True)
                     indices = jnp.sort(indices)
                 elif batchsize < B:
@@ -760,31 +809,49 @@ class TraceCompiler:
             ctx_in_axes = tuple(ctx_in_axes)
 
             def scan_over_time(spatial_vals, rng_key):
-                T = None
+                T = 1
                 for v in spatial_vals:
                     if hasattr(v, "ndim") and v.ndim >= 3:
-                        T = v.shape[0]
-                        break
-                if T is None:
-                    T = 1
+                        T = max(T, v.shape[0])
 
-                def scan_body(carry, t_idx):
+                W = max(1, min(min_consecutive, T))
+
+                if T > W:
+                    if rng_key is None:
+                        start = jnp.asarray(0, dtype=jnp.int32)
+                    else:
+                        start = jax.random.randint(rng_key, shape=(), minval=0, maxval=T - W + 1)
+                else:
+                    start = jnp.asarray(0, dtype=jnp.int32)
+
+                def eval_window(windowed_ctx, t_wind):
                     ctx_dict = {}
-                    for tag, arr in zip(spatial_tag_order, spatial_vals):
-                        if hasattr(arr, "ndim") and arr.ndim >= 3:
-                            ctx_dict[tag] = arr[t_idx]
+                    for tag, arr in zip(spatial_tag_order, windowed_ctx):
+                        if W == 1 and hasattr(arr, "ndim") and arr.ndim >= 2:
+                            ctx_dict[tag] = arr[0]
                         else:
                             ctx_dict[tag] = arr
                     if time_arr is not None:
-                        ctx_dict[TIME_TAG] = time_arr[t_idx]
+                        ctx_dict[TIME_TAG] = t_wind[0] if W == 1 else t_wind
+                    return evaluate_single_point_set(params, ctx_dict, key=rng_key)
 
-                    # Returns a LIST of residuals (one per constraint)
-                    result = evaluate_single_point_set(params, ctx_dict, key=rng_key)
-                    return carry, result
+                windowed_list = []
+                for arr in spatial_vals:
+                    if hasattr(arr, "ndim") and arr.ndim >= 3 and arr.shape[0] == T:
+                        slice_sizes = (W,) + tuple(arr.shape[1:])
+                        start_idx = (start,) + (0,) * (arr.ndim - 1)
+                        windowed_list.append(jax.lax.dynamic_slice(arr, start_idx, slice_sizes))
+                    elif hasattr(arr, "ndim") and arr.ndim >= 3 and arr.shape[0] < T:
+                        windowed_list.append(jnp.broadcast_to(arr, (W, *arr.shape[1:])))
+                    else:
+                        windowed_list.append(arr)
 
-                _, results = jax.lax.scan(scan_body, init=None, xs=jnp.arange(T))
-                # results is a list of (T, ...) arrays
-                return results
+                if time_arr is not None:
+                    t_windowed = jax.lax.dynamic_slice(time_arr, (start, 0), (W, 1))
+                else:
+                    t_windowed = jnp.zeros((W, 1))
+
+                return eval_window(tuple(windowed_list), t_windowed)
 
             if key is not None:
                 keys = jax.random.split(key, B)

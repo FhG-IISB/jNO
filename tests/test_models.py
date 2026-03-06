@@ -40,6 +40,9 @@ class TestNNWrap:
         module = eqx.nn.Linear(4, 2, key=key)
         wrapped = nn.wrap(module)
         assert isinstance(wrapped, Model)
+        y = wrapped.module(jnp.ones((4,)))
+        assert y.shape == (2,)
+        assert jnp.all(jnp.isfinite(y))
 
     def test_wrap_with_name(self):
         key = jax.random.PRNGKey(0)
@@ -56,6 +59,9 @@ class TestNNMLP:
         key = jax.random.PRNGKey(0)
         m = nn.mlp(3, output_dim=1, hidden_dims=16, num_layers=2, key=key)
         assert isinstance(m, Model)
+        y = m.module(jnp.ones((2, 3)))
+        assert y.shape == (2, 1)
+        assert jnp.all(jnp.isfinite(y))
 
     def test_different_configs(self):
         k1, k2 = jax.random.split(jax.random.PRNGKey(0))
@@ -80,6 +86,10 @@ class TestFNO1D:
         key = jax.random.PRNGKey(0)
         m = nn.fno1d(1, hidden_channels=8, n_modes=4, d_vars=1, key=key)
         assert isinstance(m, Model)
+        y = m.module(jnp.ones((1, 8, 1)), key=key)
+        assert y.shape[0] == 1
+        assert y.shape[1] == 8
+        assert jnp.all(jnp.isfinite(y))
 
     @pytest.mark.slow
     def test_forward_shape(self):
@@ -108,6 +118,11 @@ class TestDeepONet:
             key=key,
         )
         assert isinstance(m, Model)
+        u = jnp.ones((16, 1))
+        y_query = jnp.ones((7, 1))
+        out = m.module(u, y_query, key=key)
+        assert out.shape == (7,)
+        assert jnp.all(jnp.isfinite(out))
 
 
 # ======================================================================

@@ -30,7 +30,7 @@ class PointNet(eqx.Module):
         act: Callable = jax.nn.tanh,
         use_bias: bool = True,
         *,
-        key: jax.random.PRNGKey,
+        key: jax.Array,
         **kwargs,
     ):
         """

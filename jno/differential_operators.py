@@ -75,7 +75,7 @@ class DifferentialOperators:
     def compute_fd_gradient_1d_simple(
         u_values: jnp.ndarray,
         points: jnp.ndarray,
-        lines: np.ndarray,
+        lines,
         method: str = "area_weighted",
     ) -> jnp.ndarray:
         """Gradient on a 1-D line mesh.
@@ -190,7 +190,7 @@ class DifferentialOperators:
     def compute_fd_gradient_2d_simple(
         u_values: jnp.ndarray,
         points: jnp.ndarray,
-        triangles: np.ndarray,
+        triangles,
         dim: int,
         method: str = "area_weighted",
     ) -> jnp.ndarray:
@@ -244,7 +244,7 @@ class DifferentialOperators:
     def compute_gradient_2d_lsq(
         u_values: jnp.ndarray,
         points: jnp.ndarray,
-        triangles: np.ndarray,
+        triangles,
         dim: int,
     ) -> jnp.ndarray:
         """Least-squares gradient on a 2-D triangular mesh.
@@ -349,7 +349,7 @@ class DifferentialOperators:
     def compute_laplacian_2d_cotangent(
         u_values: jnp.ndarray,
         points: jnp.ndarray,
-        triangles: np.ndarray,
+        triangles,
     ) -> jnp.ndarray:
         """Cotangent-weight (Laplace–Beltrami) Laplacian on a 2-D mesh.
 
@@ -468,7 +468,7 @@ class DifferentialOperators:
     def compute_fd_gradient_3d_simple(
         u_values: jnp.ndarray,
         points: jnp.ndarray,
-        tetrahedra: np.ndarray,
+        tetrahedra,
         dim: int,
         method: str = "area_weighted",
     ) -> jnp.ndarray:
@@ -548,7 +548,7 @@ class DifferentialOperators:
     def compute_gradient_3d_lsq(
         u_values: jnp.ndarray,
         points: jnp.ndarray,
-        tetrahedra: np.ndarray,
+        tetrahedra,
         dim: int,
     ) -> jnp.ndarray:
         """Least-squares gradient on a 3-D tetrahedral mesh.

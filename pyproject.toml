@@ -17,7 +17,9 @@ dependencies = [
     "cloudpickle",
     "pylotte",
     "nevergrad",
-    "einops"
+    "einops",
+    "xprof",
+    "paramax"
 ]
 
 [project.optional-dependencies]

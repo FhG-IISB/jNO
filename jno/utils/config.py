@@ -131,6 +131,8 @@ def setup(script_file: str, name: str | None = None) -> str:
     The run directory is derived as ``<base_dir>/<stem>`` where *stem* is the
     script filename without extension (e.g. ``heat_equation``), and *base_dir*
     comes from ``runs.base_dir`` in the jNO config (default ``"./runs"``).
+    Relative ``base_dir`` values are resolved against ``script_file``'s parent
+    directory so output paths are stable regardless of current shell cwd.
     Pass an explicit *name* to override the stem.
 
     A global RNG seed can be set in ``.jno.toml`` under ``[jno] seed`` so that
@@ -146,9 +148,27 @@ def setup(script_file: str, name: str | None = None) -> str:
     Returns:
         The path of the run directory (created if absent).
     """
-    from .logger import init_default_logger
+    from . import logger as _logger_mod
 
-    stem = name or Path(script_file).stem
-    dire = str(Path(get_runs_base_dir()) / stem)
-    init_default_logger(dire)
-    return dire
+    script_path = Path(script_file).resolve()
+    stem = name or script_path.stem
+
+    base_dir = Path(os.path.expanduser(get_runs_base_dir()))
+    if not base_dir.is_absolute():
+        base_dir = script_path.parent / base_dir
+
+    dire = (base_dir / stem).resolve()
+
+    # Always bind a fresh concrete logger for this run directory.
+    # This avoids stale singleton state where console logging is active
+    # but file logging is not attached.
+    try:
+        old_logger = getattr(_logger_mod, "_default_logger", None)
+        if old_logger is not None and hasattr(old_logger, "close"):
+            old_logger.close()
+    except Exception:
+        pass
+
+    _logger_mod._default_logger = _logger_mod.get_logger(path=dire, log_print=(True, True), use_default=False)
+
+    return str(dire)
