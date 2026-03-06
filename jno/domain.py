@@ -1980,7 +1980,25 @@ class domain(MeshUtils, Geometries):
                 }
                 self._mesh_pool[f"gauss_{tag}"] = jnp.asarray(physical_face_quads).reshape(-1, self.dimension)
                 self.log.info(f"jax-fem Nanson extraction: Matched {len(inds)} faces for '{tag}'")
+        # ====================================================================
+        # THE FIX: Pad FEM arrays with Batch (B=1) and Time (T=1) dimensions 
+        # This prevents trace_compiler from mistaking the spatial/node 
+        # dimensions for the Batch dimension during vmap.
+        # ====================================================================
 
+        keys_to_pad = [
+            "cells", "flat_cells", "global_areas", "N_flat", 
+            "dN_dx_flat", "JxW", "boundary_nodes", "dirichlet_nodes"
+        ]
+        for key in keys_to_pad:
+            if key in self.fem_context and hasattr(self.fem_context[key], "ndim"):
+                self.fem_context[key] = jnp.expand_dims(self.fem_context[key], axis=(0, 1))
+
+        # Also pad the nested jax-fem surface/neumann arrays if they exist
+        for tag_name, s_data in self.fem_context.get("surface_data", {}).items():
+            for skey, s_arr in s_data.items():
+                if hasattr(s_arr, "ndim"):
+                    s_data[skey] = jnp.expand_dims(s_arr, axis=(0, 1))
                 # Expose the integration arrays to jNO's trace evaluator
         self.context.update(self.fem_context)
             

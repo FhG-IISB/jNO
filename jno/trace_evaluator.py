@@ -304,11 +304,14 @@ class TraceEvaluator:
                 else:
                     local[k] = v
             else:
-                # v.ndim >= 2
-                if k == tag or v.shape[0] == points.shape[0]:
-                    local[k] = jax.lax.dynamic_slice(v, (idx, 0), (1, v.shape[1]))
-                else:
-                    local[k] = v
+                    # v.ndim >= 2
+                    if k == tag or v.shape[0] == points.shape[0]:
+                        # Handle N-dimensional arrays by padding start_indices and slice_sizes
+                        start_indices = (idx,) + (0,) * (v.ndim - 1)
+                        slice_sizes = (1,) + v.shape[1:]
+                        local[k] = jax.lax.dynamic_slice(v, start_indices, slice_sizes)
+                    else:
+                        local[k] = v
 
         return local
 
@@ -513,14 +516,20 @@ class TraceEvaluator:
         variables = expr.variables
         scheme = expr.scheme
         if isinstance(target, TestFunction):
-            # dim[0] tells us if we are differentiating w.r.t x (0), y (1), or z (2)
             dim_idx = variables[0].dim[0] 
-            
             if target.tag == "fem_gauss":
-                # Returns shape (num_cells * num_quads, num_local_nodes)
-                return ctx.context["dN_dx_flat"][..., dim_idx]
-            else:
-                raise ValueError(f"Gradients of surface test functions (tag={target.tag}) are not supported.")
+                dN = ctx.context["dN_dx_flat"]
+                if dN.ndim == 2 and dN.shape[1] > 3:
+                    num_nodes = ctx.context["N_flat"].shape[-1]
+                    dim = dN.shape[1] // num_nodes
+                    
+                    # 1. Reshape to jax_fem's native (dim, num_nodes) layout
+                    dN = dN.reshape(dN.shape[0], dim, num_nodes)
+                    
+                    # 2. Swap axes to (num_nodes, dim) so dim_idx slices correctly!
+                    dN = jnp.swapaxes(dN, 1, 2)
+                    
+                return dN[..., dim_idx]
 
         first_var = variables[0]
         bound_var = ctx.var_bindings.get(id(first_var), first_var)
@@ -871,7 +880,11 @@ class TraceEvaluator:
             # Surface shape functions for Neumann boundaries
             if expr.tag not in ctx.context.get("surface_data", {}):
                 raise KeyError(f"Surface tag '{expr.tag}' not found in fem_context['surface_data'].")
-            return ctx.context["surface_data"][expr.tag]["face_shape_vals"]
+            
+            vals = ctx.context["surface_data"][expr.tag]["face_shape_vals"]
+            # FIX: Reshape to (N_faces * N_quads, num_local_nodes) to guarantee 
+            # safe broadcasting with the network's predictions
+            return vals.reshape(-1, vals.shape[-1])
 
     def _eval_assembly(self, expr, ctx):
         """Multiplies by quadrature weights, integrates over cells, and scatters to global nodes."""
@@ -881,13 +894,13 @@ class TraceEvaluator:
             # Volume integral
             JxW = ctx.context["JxW"].flatten()[:, None]
             local_residuals = integrand * JxW
-            flat_cells = ctx.context["flat_cells"]
+            flat_cells = ctx.context["flat_cells"].flatten()
         else:
             # Surface integral
             surf_data = ctx.context["surface_data"][expr.tag]
             nanson = surf_data["nanson_scale"].flatten()[:, None]
             local_residuals = integrand * nanson
-            flat_cells = surf_data["flat_parent_nodes"]
+            flat_cells = surf_data["flat_parent_nodes"].flatten()
             
         num_local_nodes = integrand.shape[-1]
         num_entities = flat_cells.shape[0] // num_local_nodes
@@ -906,28 +919,36 @@ class TraceEvaluator:
             num_segments=num_total_nodes
         )
 
-        # --- DYNAMIC VOLUME NORMALIZATION ---
+        # --- EXACT GALERKIN VOLUME NORMALIZATION ---
         if expr.tag == "fem_gauss":
-            # 1. Get exact cell areas by summing JxW
-            local_areas = JxW.reshape(num_entities, num_quads, 1)
-            cell_areas = jnp.sum(local_areas, axis=1) # Shape: (Cells, 1)
+            # Calculate the exact Lumped Mass Matrix dynamically
+            # Area_i = \int N_i d\Omega = \sum w_q |J| N_i(q)
+            N_flat_reshaped = ctx.context["N_flat"].reshape(num_entities, num_quads, num_local_nodes)
+            local_weights = JxW.reshape(num_entities, num_quads, 1)
             
-            # 2. Broadcast the cell area to its local nodes
-            cell_areas_broadcast = jnp.broadcast_to(cell_areas, (num_entities, num_local_nodes))
+            # Integrate the shape functions over each cell
+            cell_node_areas = jnp.sum(N_flat_reshaped * local_weights, axis=1)
             
-            # 3. Scatter-sum to get exact lumped Nodal Areas
-            nodal_areas = jax.ops.segment_sum(
-                cell_areas_broadcast.flatten(), 
+            # Scatter-sum to get exact lumped nodal areas
+            exact_nodal_areas = jax.ops.segment_sum(
+                cell_node_areas.flatten(), 
                 flat_cells, 
                 num_segments=num_total_nodes
             )
-            # Normalize to restore O(1) gradient flow!
-            global_residual = global_residual / (nodal_areas + 1e-12)
-
+            # Normalize!
+            global_residual = global_residual / (exact_nodal_areas + 1e-12)
+        # if "global_areas" in ctx.context:
+        #     # Flatten to safely strip the (B, T) dummy dimensions
+        #     areas = ctx.context["global_areas"].flatten()
+        #     global_residual = global_residual / (areas + 1e-12)
         # --- GALERKIN PROJECTION ---
         if "dirichlet_nodes" in ctx.context:
             d_nodes = jnp.asarray(ctx.context["dirichlet_nodes"]).flatten().astype(jnp.int32)
             if d_nodes.size > 0:
                 global_residual = global_residual.at[d_nodes].set(0.0)
+
+        # Expected output shape for JNO compatibility is (N, 1)
+        if global_residual.ndim == 1:
+            global_residual = global_residual[:, jnp.newaxis]
 
         return global_residual

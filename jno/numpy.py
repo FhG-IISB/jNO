@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 from typing import List, Union
-from .trace import Placeholder, Variable, FunctionCall, Hessian, Jacobian, Constant, ConstantNamespace
+from .trace import Placeholder, Variable, FunctionCall, Hessian, Jacobian, Constant, ConstantNamespace, TestFunction
 
 # Keep import so people can use jno.numpy as jno -> jno.model, jno.tune
 from .tuner import Arch, ArchSpace, tune
@@ -487,6 +487,9 @@ def curl_3d(Fx: Placeholder, Fy: Placeholder, Fz: Placeholder, x: Variable, y: V
     curl_z = Jacobian(Fy, [x]) - Jacobian(Fx, [y])
     return stack([curl_x, curl_y, curl_z], axis=-1)
 
+def test(tag: str = "fem_gauss", name: str = "phi") -> TestFunction:
+    """Returns the FEM shape function (test function) evaluated at quadrature points."""
+    return TestFunction(tag=tag, name=name)
 
 # ============================================================================
 # Array creation and dtypes — plain re-exports from jax.numpy
