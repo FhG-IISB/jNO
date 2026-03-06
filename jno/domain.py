@@ -1376,9 +1376,7 @@ class MeshUtils:
                     # Adjacent boundary points are always visible (they share an edge)
                     is_adjacent_point = (j == (i + 1) % n_bnd) | (j == (i - 1 + n_bnd) % n_bnd)
 
-                    visible_ij = jax.lax.cond(
-                        is_same, lambda: False, lambda: jax.lax.cond(is_adjacent_point, lambda: True, lambda: seg_visible(i, j))
-                    )  # Diagonal is always 0 (can't see itself)  # Adjacent boundary points are always visible
+                    visible_ij = jax.lax.cond(is_same, lambda: False, lambda: jax.lax.cond(is_adjacent_point, lambda: True, lambda: seg_visible(i, j)))  # Diagonal is always 0 (can't see itself)  # Adjacent boundary points are always visible
                     row = row.at[j].set(visible_ij)
                     return row
 
@@ -1792,6 +1790,42 @@ class domain(MeshUtils, Geometries):
             for tag, pts in self._mesh_pool.items():
                 if pts.shape[-1] > self.dimension:
                     self._mesh_pool[tag] = pts[..., : self.dimension]
+
+    def summary(self) -> "domain":
+        """Log a human-readable summary of the domain configuration.
+
+        Returns:
+            Self for method chaining.
+        """
+        lines = ["─── Domain Summary ───"]
+        lines.append(f"  Spatial dimension : {self.dimension}D  ({', '.join(self.spatial)})")
+        lines.append(f"  Time-dependent    : {self._is_time_dependent}")
+        if self._is_time_dependent and self.time is not None:
+            t0, t1, nt = self.time
+            lines.append(f"  Time range        : [{t0}, {t1}]  ({nt} steps)")
+        lines.append(f"  Batch / samples   : {self.total_samples}")
+
+        if self._mesh_pool:
+            lines.append(f"  Mesh tags ({len(self._mesh_pool)}):")
+            for tag, pts in self._mesh_pool.items():
+                lines.append(f"    • {tag:20s}  shape {pts.shape}")
+
+        if self._param_tags:
+            lines.append(f"  Tensor tags ({len(self._param_tags)}):")
+            for tag in sorted(self._param_tags):
+                arr = self.context.get(tag)
+                shape_str = str(arr.shape) if arr is not None else "(not set)"
+                lines.append(f"    • {tag:20s}  shape {shape_str}")
+
+        if self.parameters:
+            lines.append(f"  Scalar parameters ({len(self.parameters)}):")
+            for k, v in self.parameters.items():
+                lines.append(f"    • {k} = {v}")
+
+        lines.append("──────────────────────")
+        msg = "\n".join(lines)
+        self.log.info(msg)
+        return self
 
     def __lt__(self, other: Tuple[str, Any]) -> "domain":
         """Attach parameters or arrays using < operator."""
@@ -2466,11 +2500,7 @@ class domain(MeshUtils, Geometries):
                 for loop_indices in loops:
                     opaque_loop_pts.append(pts[loop_indices])
             else:
-                self.log.warning(
-                    f"Opaque tag '{otag}' has no line or triangle cells. "
-                    f"Available boundary loops: {sorted(self._boundary_loop_tags)}, "
-                    f"volume tags: {sorted(self._tag_triangles.keys())}. Skipping."
-                )
+                self.log.warning(f"Opaque tag '{otag}' has no line or triangle cells. " f"Available boundary loops: {sorted(self._boundary_loop_tags)}, " f"volume tags: {sorted(self._tag_triangles.keys())}. Skipping.")
                 continue
 
         # Append opaque points and their closed-loop edges.

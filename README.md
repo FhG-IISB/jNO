@@ -4,23 +4,23 @@
 
 ## 📖 Documentation
 
-For comprehensive documentation, see the **[Wiki](wiki/Home.md)**.
+For comprehensive documentation, see the **[Docs Home](docs/Home.md)**.
 
 | Page | Description |
 |------|-------------|
-| [Installation](wiki/Installation.md) | Setup guide |
-| [Architecture Guide](wiki/Architecture-Guide.md) | All supported neural operator architectures |
-| [Domain and Meshing](wiki/Domain-and-Meshing.md) | Domain definition and mesh construction |
-| [Training and Solving](wiki/Training-and-Solving.md) | Core solver, optimizers, schedules |
-| [jno.numpy API](wiki/jno.numpy-API.md) | Math functions and differential operators |
-| [Operator Learning](wiki/Operator-Learning.md) | Operator learning with tensor data |
-| [Custom Models](wiki/Custom-Models.md) | Wrapping Flax modules and KAN networks |
-| [LoRA and Fine-Tuning](wiki/LoRA-and-Fine-Tuning.md) | Parameter-efficient fine-tuning |
-| [Architecture Search](wiki/Architecture-Search.md) | Automated hyperparameter tuning |
-| [Logging and Callbacks](wiki/Logging-and-Callbacks.md) | Logger, callbacks, debugging |
-| [Parallelism](wiki/Parallelism.md) | Multi-GPU data and model parallelism |
-| [Examples](wiki/Examples.md) | Walkthrough of included examples |
-| [FAQ](wiki/FAQ.md) | Troubleshooting and common questions |
+| [Installation](docs/wiki/Installation.md) | Setup guide |
+| [Architecture Guide](docs/wiki/Architecture-Guide.md) | All supported neural operator architectures |
+| [Domain and Meshing](docs/wiki/Domain-and-Meshing.md) | Domain definition and mesh construction |
+| [Training and Solving](docs/wiki/Training-and-Solving.md) | Core solver, optimizers, schedules |
+| [jno.numpy API](docs/wiki/jno.numpy-API.md) | Math functions and differential operators |
+| [Operator Learning](docs/wiki/Operator-Learning.md) | Operator learning with tensor data |
+| [Custom Models](docs/wiki/Custom-Models.md) | Wrapping Flax modules and KAN networks |
+| [LoRA and Fine-Tuning](docs/wiki/LoRA-and-Fine-Tuning.md) | Parameter-efficient fine-tuning |
+| [Architecture Search](docs/wiki/Architecture-Search.md) | Automated hyperparameter tuning |
+| [Logging and Callbacks](docs/wiki/Logging-and-Callbacks.md) | Logger, callbacks, debugging |
+| [Parallelism](docs/wiki/Parallelism.md) | Multi-GPU data and model parallelism |
+| [Examples](docs/wiki/Examples.md) | Walkthrough of included examples |
+| [FAQ](docs/wiki/FAQ.md) | Troubleshooting and common questions |
 
 ## [Install](https://docs.astral.sh/uv/getting-started/installation/)
 `uv` installs and manages environments in your user directory, so you can typically run everything locally **without sudo**.

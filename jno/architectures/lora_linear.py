@@ -130,26 +130,35 @@ class FlaxLoRAWrapper(eqx.Module):
 # ── Flax LoRA helpers ────────────────────────────────────────────────
 
 
-def _build_flax_lora_params(params, rank: int, key: jax.Array):
+def _build_flax_lora_params(params, rank: int, key: jax.Array, target: str = None):
     """Build a nested LoRA-param dict mirroring the Flax ``params`` structure.
 
     For every ``kernel`` leaf with ``ndim == 2`` a sibling dict
     ``{'lora_a': (rank, in), 'lora_b': (out, rank)}`` is created.
 
+    If ``target`` is given (a ``re.search`` pattern), only kernels whose
+    full path (slash-joined dict keys) match the pattern receive adapters.
+
     Returns:
         (lora_dict, n_layers, n_lora_params)
     """
+    import re as _re
+
     n_layers = 0
     n_params = 0
 
-    def _recurse(d):
+    def _recurse(d, path=""):
         nonlocal key, n_layers, n_params
         if not isinstance(d, dict):
             return None
         result = {}
         for k in sorted(d.keys()):
             v = d[k]
+            child_path = f"{path}/{k}" if path else k
             if k == "kernel" and hasattr(v, "ndim") and v.ndim == 2:
+                if target is not None and not _re.search(target, child_path):
+                    key, _ = jax.random.split(key)  # keep RNG state deterministic
+                    continue  # skip — not in target
                 in_dim, out_dim = v.shape
                 eff_rank = min(rank, min(in_dim, out_dim))
                 key, k1 = jax.random.split(key)
@@ -160,7 +169,7 @@ def _build_flax_lora_params(params, rank: int, key: jax.Array):
                 n_layers += 1
                 n_params += a.size + b.size
             else:
-                sub = _recurse(v)
+                sub = _recurse(v, child_path)
                 if sub is not None:
                     result[k] = sub
                     key, _ = jax.random.split(key)
@@ -197,7 +206,7 @@ def _merge_lora_into_flax_params(params, lora_params, scale: float):
 # =====================================================================
 
 
-def apply_lora(model: eqx.Module, rank: int, alpha: float, *, key: jax.Array) -> eqx.Module:
+def apply_lora(model: eqx.Module, rank: int, alpha: float, *, key: jax.Array, target: str = None) -> eqx.Module:
     """Apply LoRA to *model*.
 
     * If *model* is a ``FlaxModelWrapper`` → wraps it in a
@@ -222,6 +231,7 @@ def apply_lora(model: eqx.Module, rank: int, alpha: float, *, key: jax.Array) ->
             model.params,
             rank,
             key,
+            target=target,
         )
         return FlaxLoRAWrapper(model, lora_params, rank, alpha)
 
@@ -278,13 +288,38 @@ def merge_lora(model: eqx.Module) -> eqx.Module:
     return jax.tree_util.tree_unflatten(treedef, [_merge(l) for l in leaves])
 
 
-def lora_trainable_filter(model: eqx.Module) -> object:
-    """Return a filter-spec pytree: ``True`` for trainable LoRA arrays,
-    ``False`` for frozen base arrays.
+def lora_trainable_filter(
+    model: eqx.Module,
+    *,
+    base_param_mask: Optional[object] = None,
+    freeze_base: bool = True,
+) -> object:
+    """Return a filter-spec pytree for LoRA training.
 
-    Works for both ``FlaxLoRAWrapper`` and Equinox models with
-    ``LoRALinear`` layers.
+    Args:
+        model: LoRA-wrapped model.
+        base_param_mask: Optional bool pytree on ``model.base`` where
+            ``True`` marks target leaves. Used only when ``freeze_base=False``.
+        freeze_base: If ``True`` (default), only LoRA arrays are trainable and
+            all base arrays are frozen. If ``False``, base arrays are trainable
+            except leaves marked ``True`` in ``base_param_mask``.
     """
+
+    def _key_str(k):
+        if hasattr(k, "key"):
+            return str(k.key)
+        if hasattr(k, "idx"):
+            return str(k.idx)
+        if hasattr(k, "name"):
+            return k.name
+        return str(k)
+
+    base_mask_lookup = {}
+    if base_param_mask is not None:
+        mask_flat, _ = jax.tree_util.tree_flatten_with_path(base_param_mask)
+        for m_path, m_leaf in mask_flat:
+            base_mask_lookup[tuple(_key_str(k) for k in m_path)] = bool(m_leaf)
+
     flat, treedef = jax.tree_util.tree_flatten_with_path(model)
     specs = []
     for path, leaf in flat:
@@ -293,12 +328,30 @@ def lora_trainable_filter(model: eqx.Module) -> object:
             continue
 
         if isinstance(model, FlaxLoRAWrapper):
-            # Trainable iff inside ``lora_params``
             in_lora = any(isinstance(k, jax.tree_util.GetAttrKey) and k.name == "lora_params" for k in path)
-            specs.append(in_lora)
+            if in_lora:
+                specs.append(True)
+                continue
+
+            in_base = any(isinstance(k, jax.tree_util.GetAttrKey) and k.name == "base" for k in path)
+            if not in_base:
+                specs.append(False)
+                continue
+
+            if freeze_base:
+                specs.append(False)
+            elif base_param_mask is None:
+                specs.append(True)
+            else:
+                base_i = next(i for i, k in enumerate(path) if isinstance(k, jax.tree_util.GetAttrKey) and k.name == "base")
+                rel = tuple(_key_str(k) for k in path[base_i + 1 :])
+                is_target = base_mask_lookup.get(rel, False)
+                specs.append(not is_target)
         else:
-            # Original LoRALinear logic: frozen iff inside ``base``
+            # LoRALinear wrappers (Eqx): by default freeze the original base
+            # and train adapters only. Non-frozen-base mode is currently
+            # intended for Flax wrappers.
             frozen = any(isinstance(k, jax.tree_util.GetAttrKey) and k.name == "base" for k in path)
-            specs.append(not frozen)
+            specs.append(not frozen if freeze_base else True)
 
     return jax.tree_util.tree_unflatten(treedef, specs)

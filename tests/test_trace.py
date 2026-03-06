@@ -352,7 +352,67 @@ class TestModelMask:
         all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
         u_net.mask(all_true).lora(rank=4, alpha=1.0)
         assert u_net._param_mask is all_true
-        assert u_net._lora_config == (4, 1.0)
+        assert u_net._lora_config == (4, 1.0, None)
+
+    def test_mask_target_then_lora_consumes_target(self):
+        """mask(target=...).lora(...) stores target in _lora_config and clears _mask_target."""
+        u_net = self._make_eqx_model()
+
+        u_net.mask(target="output_layer").lora(rank=4, alpha=1.0)
+
+        assert u_net._lora_config == (4, 1.0, "output_layer")
+        assert u_net._mask_target is None
+
+    def test_mask_target_then_initialize_consumes_target(self):
+        """mask(target=...).initialize(...) stores _initialize_mask and clears transient target state."""
+        u_net = self._make_eqx_model()
+
+        # Any non-string object takes the pytree initialize path.
+        weights = u_net.module
+        u_net.mask(target="output_layer").initialize(weights)
+
+        assert u_net._initialize_mask is not None
+        assert u_net._mask_target is None
+        assert u_net._param_mask is None
+
+    def test_mask_target_then_freeze_is_partial(self):
+        """mask(target=...).freeze() should freeze target only (not set global _frozen)."""
+        import jax
+
+        u_net = self._make_eqx_model()
+        u_net.mask(target="output_layer").freeze()
+
+        assert u_net._frozen is False
+        assert u_net._mask_target is None
+        leaves = jax.tree_util.tree_leaves(u_net._param_mask)
+        assert any(v is True for v in leaves)
+        assert any(v is False for v in leaves)
+
+    def test_mask_target_optimizer_and_lr_use_same_group(self):
+        """mask(target).optimizer(...).lr(...) should write one parameter group."""
+        import optax
+
+        u_net = self._make_eqx_model()
+        u_net.mask(target="output_layer").optimizer(optax.adam).lr(1e-3)
+
+        assert len(u_net._param_groups) == 1
+        group = u_net._param_groups[0]
+        assert group["target"] == "output_layer"
+        assert group["opt_fn"] is optax.adam
+        assert group["lr"] == 1e-3
+
+    def test_mask_target_optimizer_lr_shorthand_sets_group_lr(self):
+        """mask(target).optimizer(opt, lr=...) should set group LR directly."""
+        import optax
+
+        u_net = self._make_eqx_model()
+        u_net.mask(target="output_layer").optimizer(optax.adam, lr=5e-4)
+
+        assert len(u_net._param_groups) == 1
+        group = u_net._param_groups[0]
+        assert group["target"] == "output_layer"
+        assert group["opt_fn"] is optax.adam
+        assert group["lr"] == 5e-4
 
     def test_mask_reset_clears_param_mask(self):
         """reset() clears _param_mask back to None."""
@@ -415,6 +475,31 @@ class TestModelMask:
         leaves = jax.tree_util.tree_leaves(u_net._param_mask)
         assert leaves.count(True) == 2
         assert leaves.count(False) == 4
+
+    def test_paramax_wrapper_can_live_in_model_tree(self):
+        """Model module can carry Paramax wrappers inside parameter fields."""
+        import equinox as eqx
+
+        paramax = pytest.importorskip("paramax", reason="paramax not installed")
+
+        u_net = self._make_eqx_model()
+        base_bias = u_net.module.output_layer.bias
+        wrapped_bias = paramax.Parameterize(jnp.exp, jnp.log(jnp.abs(base_bias) + 1e-6))
+        u_net.module = eqx.tree_at(lambda m: m.output_layer.bias, u_net.module, wrapped_bias)
+
+        assert paramax.contains_unwrappables(u_net.module)
+
+    def test_model_summary_returns_self(self):
+        """summary() should be chainable on Model."""
+        u_net = self._make_eqx_model()
+        assert u_net.summary() is u_net
+
+    def test_modelcall_summary_returns_self(self):
+        """summary() should be chainable on ModelCall."""
+        u_net = self._make_eqx_model()
+        x = make_var("x")
+        call = u_net(x)
+        assert call.summary() is call
 
 
 # ======================================================================

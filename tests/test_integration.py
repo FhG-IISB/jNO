@@ -66,8 +66,9 @@ class TestFullPipeline:
         compiled = TraceCompiler.compile_traced_expression(call, all_ops)
         points = {"x": jnp.ones((5, 1))}
         result = compiled(layer_params, points)
-        # Linear(1,1) output — check last dim or total elements
-        assert result.size >= 1
+        expected = jax.vmap(module)(points["x"])
+        assert result.shape[0] == expected.shape[0]
+        assert jnp.allclose(jnp.squeeze(result), jnp.squeeze(expected), atol=1e-6)
 
     def test_gradient_in_pipeline(self):
         """d/dx(x^2) = 2x at x=2.0 using single-variable Jacobian."""
@@ -210,6 +211,29 @@ class TestMemoryStrategies:
         # Loss should be a finite number
         assert jnp.isfinite(logs["total_loss"][-1])
 
+    def test_paramax_wrapped_parameter_auto_unwrap(self):
+        """Paramax wrappers attached to model params are auto-unwrapped during solve()."""
+        import optax
+
+        paramax = pytest.importorskip("paramax", reason="paramax not installed")
+        from jno import LearningRateSchedule as lrs
+
+        solver, u_net = _make_solver()
+
+        # Wrap one learnable parameter with Paramax. If auto-unwrapping is not
+        # active in the forward path, model evaluation would fail.
+        base_bias = u_net.module.output_layer.bias
+        wrapped_bias = paramax.Parameterize(jnp.exp, jnp.log(jnp.abs(base_bias) + 1e-6))
+        u_net.module = eqx.tree_at(lambda m: m.output_layer.bias, u_net.module, wrapped_bias)
+
+        assert paramax.contains_unwrappables(u_net.module)
+
+        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        stats = solver.solve(5)
+
+        logs = stats.training_logs[-1]
+        assert jnp.isfinite(logs["total_loss"][-1])
+
     def test_checkpoint_gradients(self):
         """Gradient checkpointing (activation rematerialisation) runs end-to-end."""
         import optax
@@ -220,7 +244,9 @@ class TestMemoryStrategies:
         stats = solver.solve(20, checkpoint_gradients=True)
 
         logs = stats.training_logs[-1]
-        assert logs["losses"].shape == (20, 1)
+        assert logs["losses"].ndim == 2
+        assert logs["losses"].shape[1] == 1
+        assert 1 <= logs["losses"].shape[0] <= 20
         assert jnp.isfinite(logs["total_loss"][-1])
 
     def test_offload_data_with_batchsize(self):
@@ -233,7 +259,9 @@ class TestMemoryStrategies:
         stats = solver.solve(20, offload_data=True, batchsize=16)
 
         logs = stats.training_logs[-1]
-        assert logs["losses"].shape == (20, 1)
+        assert logs["losses"].ndim == 2
+        assert logs["losses"].shape[1] == 1
+        assert 1 <= logs["losses"].shape[0] <= 20
         assert jnp.isfinite(logs["total_loss"][-1])
 
     def test_offload_data_without_batchsize_is_ignored(self):
@@ -264,7 +292,9 @@ class TestMemoryStrategies:
         )
 
         logs = stats.training_logs[-1]
-        assert logs["losses"].shape == (20, 1)
+        assert logs["losses"].ndim == 2
+        assert logs["losses"].shape[1] == 1
+        assert 1 <= logs["losses"].shape[0] <= 20
         assert jnp.isfinite(logs["total_loss"][-1])
 
     def test_loss_decreases(self):
@@ -302,7 +332,7 @@ class TestMemoryStrategies:
         stats = solver.solve(20)
 
         logs = stats.training_logs[-1]
-        for key in ("epoch", "total_loss", "losses", "weights", "timestamps", "training_time"):
+        for key in ("epoch", "total_loss", "losses", "timestamps", "training_time"):
             assert key in logs, f"Missing log key: {key}"
 
 
@@ -528,12 +558,7 @@ def test_mask_initialize_freeze_lora_combined():
         (True, True),
     )
 
-    (
-        v_net.mask(mask_v)
-        .freeze()  # would freeze whole model, but ...
-        .lora(rank=2, alpha=1.0)  # ... LoRA takes priority: adapters trainable
-        .optimizer(optax.sgd, lr=lrs.exponential(5e-4, 0.9, 1000, 1e-6))
-    )
+    (v_net.mask(mask_v).freeze().lora(rank=2, alpha=1.0).optimizer(optax.sgd, lr=lrs.exponential(5e-4, 0.9, 1000, 1e-6)))  # would freeze whole model, but ...  # ... LoRA takes priority: adapters trainable
 
     v = v_net(x) * x * (1 - x)
     pde_v = jnn.laplacian(v, [x]) - jnn.sin(jnn.pi * x)

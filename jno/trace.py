@@ -10,7 +10,10 @@ from .tuner import Arch, ArchSpace
 import jax.numpy as jnp
 from pathlib import Path
 import json
+import jax
+import equinox as eqx
 from .utils.adaptive import LearningRateSchedule
+from .utils.logger import get_logger
 
 __all__ = [
     "Placeholder",
@@ -170,6 +173,82 @@ class Placeholder:
             shape = tuple(shape[0])
         return FunctionCall(lambda x, s=shape: x.reshape(s), [self], name="reshape")
 
+    def print(self, what: Union[str, Callable[[jnp.ndarray], Any]] = "shape", label: Optional[str] = None):
+        """Emit runtime debug info for this placeholder and pass it through.
+
+        Args:
+            what: Either a preset string or a callable:
+                - ``"shape"``: print array shape only.
+                - ``"stats"``: print shape + min/max/mean/std.
+                - ``"value"``: print full value.
+                - ``"all"``: print shape + stats + value.
+                - ``callable``: called as ``what(x)`` and the result is printed.
+            label: Optional message prefix in the log output.
+
+        Returns:
+            A traced node that prints at runtime and returns the unchanged input.
+
+        Example:
+            ``constraints.append((NN(*inpt) - u).print("stats", "residual"))``
+            ``constraints.append((NN(*inpt) - u).print(lambda x: x.shape, "residual"))``
+        """
+        prefix = "Placeholder" if label is None else label
+        allowed = {"shape", "stats", "value", "all"}
+
+        if callable(what):
+
+            def _debug_print_custom(x, _fn=what, _prefix=prefix):
+                arr = jnp.asarray(x)
+                value = _fn(arr)
+                jax.debug.print("{p}: {v}", p=_prefix, v=value)
+                return x
+
+            return FunctionCall(_debug_print_custom, [self], name="print")
+
+        mode = str(what).lower().strip()
+        if mode not in allowed:
+            raise ValueError(f"Unsupported print mode '{what}'. Use one of {sorted(allowed)} or pass a callable.")
+
+        def _debug_print(x, _mode=mode, _prefix=prefix):
+            arr = jnp.asarray(x)
+
+            if _mode in ("shape", "all"):
+                jax.debug.print("{p}: shape={s}", p=_prefix, s=arr.shape)
+
+            if _mode in ("stats", "all"):
+                arr_f = arr.astype(jnp.float32)
+                jax.debug.print(
+                    "{p}: min={mn}, max={mx}, mean={mu}, std={sd}",
+                    p=_prefix,
+                    mn=jnp.min(arr_f),
+                    mx=jnp.max(arr_f),
+                    mu=jnp.mean(arr_f),
+                    sd=jnp.std(arr_f),
+                )
+
+            if _mode in ("value", "all"):
+                jax.debug.print("{p}: value={v}", p=_prefix, v=arr)
+
+            return x
+
+        return FunctionCall(_debug_print, [self], name="print")
+
+    def tracker(self, interval: int = 1) -> "Tracker":
+        """Mark this expression as a tracked metric.
+
+        Trackers are evaluated during training logs but do not contribute to
+        the optimization loss.
+
+        Args:
+            interval: Evaluate every ``interval`` epochs (must be >= 1).
+
+        Returns:
+            ``Tracker`` wrapper for this expression.
+        """
+        if not isinstance(interval, int) or interval < 1:
+            raise ValueError(f"interval must be an integer >= 1, got {interval}")
+        return Tracker(self, interval)
+
     @property
     def shape(self):
         return FunctionCall(lambda x: jnp.ones(x.shape, dtype="bool"), [self], "shape", True)
@@ -286,7 +365,7 @@ class FunctionCall(Placeholder):
         self,
         fn: Callable,
         args: Union[list, tuple],
-        name: str = None,
+        name: str | None = None,
         reduces_axis: int = None,
         kwargs: Dict = None,
     ):
@@ -331,7 +410,7 @@ class ConstantNamespace:
     Nested dictionaries become nested ConstantNamespace objects.
     """
 
-    def __init__(self, tag: str, data: Union[dict, str, Path], _parent_tag: str = None):
+    def __init__(self, tag: str | None, data: Union[dict, str, Path], _parent_tag: str | None = None):
         self._tag = tag
         self._full_tag = f"{_parent_tag}.{tag}" if _parent_tag else tag
         self._data = self._load_and_convert(data)
@@ -343,7 +422,7 @@ class ConstantNamespace:
         return self._convert_to_jax(raw_data, self._full_tag)
 
     @staticmethod
-    def _convert_to_jax(data: dict, parent_tag: str = None) -> dict:
+    def _convert_to_jax(data: dict, parent_tag: str | None = None) -> dict:
         """Recursively convert all numeric values to JAX arrays and dicts to namespaces."""
         converted = {}
         for key, value in data.items():
@@ -351,7 +430,7 @@ class ConstantNamespace:
         return converted
 
     @staticmethod
-    def _convert_value(value: Any, key: str = None, parent_tag: str = None) -> Any:
+    def _convert_value(value: Any, key: str | None = None, parent_tag: str | None = None) -> Any:
         """Convert a single value to JAX array if numeric, or ConstantNamespace if dict."""
         # Nested dictionary -> nested ConstantNamespace
         if isinstance(value, dict):
@@ -614,7 +693,7 @@ class Constant(Placeholder):
     Values are pre-converted to JAX arrays at creation time.
     """
 
-    def __init__(self, tag: str, key: str, value: Any):
+    def __init__(self, tag: str | None, key: str | None, value: Any):
         self.tag = tag
         self.key = key
         self.value = value  # Already a jnp.ndarray from ConstantNamespace
@@ -646,7 +725,7 @@ class Variable(Placeholder):
     ``context["__time__"]`` entry that is a scalar (after the T vmap).
     """
 
-    def __init__(self, tag: str, dim: list, domain=None, axis: str = "spatial"):
+    def __init__(self, tag: str, dim: list, domain: Any, axis: str = "spatial"):
         self.tag = tag
         self.dim = dim
         self.axis = axis  # 'spatial' or 'temporal'
@@ -669,7 +748,7 @@ class TensorTag(Placeholder):
     along the batch dimension.
     """
 
-    def __init__(self, tag: str, domain=None, dim_index: int = None):
+    def __init__(self, tag: str, domain=None, dim_index: int | None = None):
         self.tag = tag
         self._domain = domain
         self.dim_index = dim_index  # For slicing multi-dimensional tensors
@@ -725,7 +804,7 @@ class Model(Placeholder):
         u = uv_net(x, y)[..., 0]
     """
 
-    def __init__(self, module, name: str = "", weight_path: str = None):
+    def __init__(self, module, name: str = "", weight_path: str | None = None):
         """Create a Model wrapper.
 
         Args:
@@ -741,12 +820,16 @@ class Model(Placeholder):
 
         # ── training config (plain Python, not JAX arrays) ──
         self._frozen: bool = False
-        self._lora_config = None  # (rank, alpha) or None
+        self._lora_config = None  # (rank, alpha, target_str | None) or None
         self._opt_fn = None  # optax optimizer factory / instance
         self._lr = LearningRateSchedule(1.0)
         self._dtype = None  # target dtype (e.g. jnp.bfloat16) or None
         self._param_mask = None  # pytree of bool with same structure as model; None = all trainable
+        self._mask_target: str | None = None  # last regex string passed to mask(), consumed by initialize()/lora()/freeze()
+        self._param_groups: list = []  # [{target, mask, opt_fn, lr}] for per-group optimizer config
         self._weight_tree = None  # pretrained weights as a pytree (alternative to weight_path file)
+        self._initialize_mask = None  # optional bool pytree consumed by initialize() for partial preload
+        self._mask_meta = None  # diagnostics for last mask(target=...): {target, matched, total_arrays, sample_paths}
         self._tunable_opts: Dict[str, list] = {}  # per-model tunable options for sweeps
 
     # ── public API ───────────────────────────────────────────
@@ -763,11 +846,136 @@ class Model(Placeholder):
         self.show = False
         return self
 
+    def summary(self):
+        """Print and persist a complete model-control summary.
+
+        The summary is always printed to stdout. If a default jNO logger is
+        active, the same content is appended to ``<logger.path>/log.txt``.
+
+        Returns:
+            self (for chaining).
+        """
+        log = get_logger(use_default=True)
+
+        # Basic identity
+        module_name = type(self.module).__name__
+        lines = [
+            f"Model Summary (layer {self.layer_id})",
+            "=" * 60,
+            f"name:                 {self.name or module_name}",
+            f"module_type:          {module_name}",
+            f"show_architecture:    {self.show}",
+            "",
+            "Training Controls",
+            "-" * 60,
+            f"frozen:               {self._frozen}",
+            f"dtype:                {self._dtype}",
+            f"optimizer:            {getattr(self._opt_fn, '__name__', str(self._opt_fn))}",
+            f"lr_schedule:          {self._lr}",
+            f"lora_config:          {self._lora_config}",
+            f"mask_target_pending:  {self._mask_target}",
+            "",
+            "Initialization",
+            "-" * 60,
+            f"weight_path:          {self.weight_path}",
+            f"weight_tree_set:      {self._weight_tree is not None}",
+            f"initialize_mask_set:  {self._initialize_mask is not None}",
+            "",
+            "Mask Diagnostics",
+            "-" * 60,
+            f"mask_meta:            {self._mask_meta}",
+            "",
+            "Parameter Groups",
+            "-" * 60,
+            f"num_groups:           {len(self._param_groups)}",
+        ]
+
+        for i, g in enumerate(self._param_groups):
+            target = g.get("target")
+            opt_fn = g.get("opt_fn")
+            lr = g.get("lr")
+            mask = g.get("mask")
+            n_true = None
+            try:
+                leaves = jax.tree_util.tree_leaves(mask) if mask is not None else []
+                n_true = sum(1 for x in leaves if isinstance(x, bool) and x)
+            except Exception:
+                n_true = None
+            lines.append(f"  [{i}] target={target!r}, opt={getattr(opt_fn, '__name__', str(opt_fn))}, " f"lr={lr}, matched_leaves={n_true}")
+
+        # Param summary
+        try:
+            leaves = jax.tree_util.tree_leaves(self.module)
+            arr_leaves = [l for l in leaves if eqx.is_array(l)]
+            n_params = int(sum(int(l.size) for l in arr_leaves))
+            lines.extend(
+                [
+                    "",
+                    "Parameters",
+                    "-" * 60,
+                    f"array_leaves:         {len(arr_leaves)}",
+                    f"total_parameters:     {n_params}",
+                ]
+            )
+        except Exception as exc:
+            lines.extend(
+                [
+                    "",
+                    "Parameters",
+                    "-" * 60,
+                    f"count_failed:         {exc}",
+                ]
+            )
+
+        # Always print summary to stdout.
+        for line in lines:
+            print(line)
+
+        # Also append to files under the active logger path when available.
+        summary_file = None
+        try:
+            if getattr(log, "path", None) is not None:
+                summary_file = Path(log.path) / "mode_summary.txt"
+        except Exception:
+            summary_file = None
+
+        if summary_file is not None:
+            try:
+                summary_file.parent.mkdir(parents=True, exist_ok=True)
+                with open(summary_file, "a", encoding="utf-8") as f:
+                    for line in lines:
+                        f.write(f"{line}\n")
+                    f.write("\n")
+                print(f"Model summary appended to {summary_file}")
+            except Exception as exc:
+                print(f"Model summary could not be written to summary file: {exc}")
+
+        return self
+
     # ── finetuning helpers ───────────────────────────────────
 
     def freeze(self):
-        """Mark this model as frozen (not trained)."""
-        self._frozen = True
+        """Mark this model as frozen (not trained).
+
+        When preceded by ``mask(target=...)``, only the targeted parameters
+        are frozen and everything else remains trainable::
+
+            NN.mask(target="encoder").freeze()  # encoder frozen, rest trainable
+            NN.freeze()                          # whole model frozen
+
+        Order matters: ``mask()`` must be called before ``freeze()``.
+        """
+        if self._mask_target is not None:
+            # mask(target).freeze(): invert _param_mask so target=False (frozen),
+            # non-target=True (trainable). _frozen stays False — partial freeze
+            # is expressed entirely through _param_mask.
+            self._param_mask = jax.tree_util.tree_map(
+                lambda x: (not x) if isinstance(x, bool) else False,
+                self._param_mask,
+            )
+            self._mask_target = None  # consumed
+        else:
+            self._frozen = True
         return self
 
     def unfreeze(self):
@@ -775,74 +983,179 @@ class Model(Placeholder):
         self._frozen = False
         return self
 
-    def mask(self, param_mask):
-        """Restrict which parameters are trainable via a boolean pytree mask.
+    def mask(self, param_mask=None, *, target: str | None = None):
+        """Restrict which parameters are trainable via a boolean pytree mask
+        or a regex pattern matched against parameter path strings.
 
-        ``param_mask`` must be a pytree with the **same structure** as the
-        underlying module, but with every leaf replaced by a ``bool``:
+        **String / regex usage** (recommended)::
 
-        * ``True``  -> the corresponding array is **trainable**.
-        * ``False`` -> the corresponding array is **frozen** (kept in the
-          model but not updated by the optimizer).
+            # Train only attention query/key/value kernels
+            NN.mask(target="query|key|value")
 
-        The mask is compatible with all other training helpers — you can
-        chain ``.mask(...).optimizer(...)``, ``.mask(...).lora(...)`` or
-        ``.mask(...).freeze()`` freely.
+            # Train only decoder kernels
+            NN.mask(target="decoder.*kernel")
 
-        A convenient way to build the mask for an Equinox model is::
+            # Positional shorthand — string as first argument
+            NN.mask("decoder.*kernel")
+
+        The ``target`` pattern is matched with ``re.search`` against each
+        parameter's full path, formed by joining its pytree key segments
+        with ``/``.  For a Flax params dict the path looks like::
+
+            encoder/layers_0/SelfAttention_0/query/kernel
+
+        **Manual pytree usage** (advanced)::
 
             import equinox as eqx, jax
 
-            # Freeze everything, then flip specific leaves to True:
             all_false = jax.tree_util.tree_map(lambda _: False, model.module)
             param_mask = eqx.tree_at(
                 lambda m: (m.layers[0].weight, m.layers[0].bias),
-                all_false,
-                (True, True),
+                all_false, (True, True),
             )
             model.mask(param_mask).optimizer(optax.adam, lr=1e-3)
 
         Args:
-            param_mask: A pytree matching the structure of the underlying
-                module where every leaf is a ``bool``.
+            param_mask: A pytree of ``bool`` matching the module structure,
+                **or** a regex string (shorthand for ``target=``).
+            target: Regex matched against each parameter's path string.
+                Matched leaves are trainable; everything else is frozen.
 
         Returns:
             self (for chaining).
         """
-        self._param_mask = param_mask
+        import re as _re
+
+        # Allow string as positional arg: NN.mask("query|key")
+        if isinstance(param_mask, str):
+            target = param_mask
+            param_mask = None
+
+        if target is not None:
+            # Build a boolean pytree from the current module by matching paths.
+            def _key_str(k):
+                if hasattr(k, "key"):
+                    return str(k.key)  # DictKey
+                if hasattr(k, "idx"):
+                    return str(k.idx)  # SequenceKey
+                if hasattr(k, "name"):
+                    return k.name  # GetAttrKey
+                return str(k)
+
+            leaves_with_paths, treedef = jax.tree_util.tree_flatten_with_path(self.module)
+            bool_leaves = []
+            matched_paths = []
+            total_arrays = 0
+            for path, leaf in leaves_with_paths:
+                path_str = "/".join(_key_str(k) for k in path)
+                if eqx.is_array(leaf):
+                    total_arrays += 1
+                    is_match = bool(_re.search(target, path_str))
+                    bool_leaves.append(is_match)
+                    if is_match:
+                        matched_paths.append(path_str)
+                else:
+                    bool_leaves.append(False)
+            self._param_mask = jax.tree_util.tree_unflatten(treedef, bool_leaves)
+            self._mask_target = target  # capture for lora() to consume
+            self._mask_meta = {
+                "target": target,
+                "matched": int(len(matched_paths)),
+                "total_arrays": int(total_arrays),
+                "sample_paths": matched_paths[:8],
+            }
+        else:
+            self._param_mask = param_mask
+            self._mask_target = None
+            self._mask_meta = None
         return self
 
     def lora(self, rank: int = 4, alpha: float = 1.0):
         """Enable LoRA fine-tuning for this model.
 
-        Only the low-rank adapters are trained; base weights are frozen.
+        By default only the low-rank adapters are trained; base weights are
+        frozen.
+
+        If ``mask(target=...)`` was called immediately before this method,
+        LoRA adapters are created only for matching kernels and those
+        matching base parameters are frozen, while non-target base
+        parameters remain trainable.
+
+        Call ``freeze()`` before ``lora()`` to freeze all base parameters::
+
+            NN.freeze().mask("decoder").lora(rank=8, alpha=16)
 
         Args:
             rank:  LoRA rank.
             alpha: LoRA scaling factor.
         """
-        self._lora_config = (rank, alpha)  # type: ignore[assignment]
+        lora_target = self._mask_target  # may be None
+        self._mask_target = None  # consumed
+        self._lora_config = (rank, alpha, lora_target)
         return self
 
-    def optimizer(self, opt_fn):
+    def optimizer(self, opt_fn, *, lr=None):
         """Attach an optimizer to this model.
+
+        When preceded by ``mask(target=...)``, the optimizer applies only
+        to matching parameters; everything else uses the global optimizer
+        (set via a bare ``optimizer()`` call)::
+
+            NN.mask("decoder").optimizer(optax.adam)   # decoder group
+            NN.mask("encoder").optimizer(optax.sgd)    # encoder group
+            NN.optimizer(optax.adam)                   # global fallback
+
+        Chaining with ``.lr()`` works because ``mask()`` target is kept
+        alive until the next ``mask()`` / ``freeze()`` / ``lora()`` call::
+
+            NN.mask("decoder").optimizer(optax.adam).lr(my_schedule)
+
+        The ``lr`` keyword is a convenience shorthand for ``.lr(lr)``.
 
         Args:
             opt_fn: An optax optimizer factory, e.g. ``optax.adam``,
                     or an already-constructed transform.
+            lr: Optional LR schedule/value shorthand (equivalent to chaining
+                ``.lr(lr)``).
         """
-        self._opt_fn = opt_fn
+        if self._mask_target is not None:
+            self._get_or_create_group()["opt_fn"] = opt_fn
+        else:
+            self._opt_fn = opt_fn
+
+        # Convenience shorthand: optimizer(opt_fn, lr=...) == optimizer(opt_fn).lr(...)
+        if lr is not None:
+            self.lr(lr)
         return self
 
     def lr(self, lr):
         """Attach an LR schedule to this model.
 
+        When preceded by ``mask(target=...)``, the schedule applies only to
+        that parameter group::
+
+            NN.mask("decoder").optimizer(optax.adam).lr(my_schedule)
+
         Args:
             lr:     A ``LearningRateSchedule`` (or float) for this model.
                     If *None*, a constant schedule of 1e-3 is used.
         """
-        self._lr = lr
+        if self._mask_target is not None:
+            self._get_or_create_group()["lr"] = lr
+            # Keep _mask_target alive
+        else:
+            self._lr = lr
         return self
+
+    def _get_or_create_group(self):
+        """Return the param group dict for the current _mask_target, creating it if needed."""
+        for g in self._param_groups:
+            if g["target"] == self._mask_target:
+                g["mask"] = self._param_mask  # refresh in case mask() was called again
+                return g
+        g = {"target": self._mask_target, "mask": self._param_mask, "opt_fn": None, "lr": None}
+        self._param_groups.append(g)
+        return g
 
     def initialize(self, weights):
         """Load pretrained weights into this model at init time.
@@ -867,6 +1180,10 @@ class Model(Placeholder):
               new_model = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key2)
               new_model.initialize(pretrained.module)   # use pytree directly
 
+        If ``mask(target=...)`` was called immediately before this method,
+        only matching parameters are loaded from pretrained weights; all
+        non-matching parameters keep their fresh initialisation.
+
         Args:
             weights: A file path (``str``) *or* a pytree whose leaves are
                      the pretrained arrays.
@@ -874,6 +1191,14 @@ class Model(Placeholder):
         Returns:
             self (for chaining).
         """
+        # mask(target=...).initialize(...): consume target for partial load.
+        if self._mask_target is not None:
+            self._initialize_mask = self._param_mask
+            self._mask_target = None
+            self._param_mask = None
+        else:
+            self._initialize_mask = None
+
         if isinstance(weights, (str, Path)):
             self.weight_path = str(weights)
             self._weight_tree = None
@@ -964,6 +1289,8 @@ class Model(Placeholder):
         self._dtype = None
         self._param_mask = None
         self._weight_tree = None
+        self._initialize_mask = None
+        self._mask_meta = None
         self._merge_lora_flag = False
         return self
 
@@ -1006,9 +1333,9 @@ class ModelCall(Placeholder):
         self.model.unfreeze()
         return self
 
-    def mask(self, param_mask):
+    def mask(self, param_mask=None, *, target: str | None = None):
         """Proxy for :meth:`Model.mask`."""
-        self.model.mask(param_mask)
+        self.model.mask(param_mask, target=target)
         return self
 
     def lora(self, rank: int = 4, alpha: float = 1.0):
@@ -1025,6 +1352,11 @@ class ModelCall(Placeholder):
 
     def dtype(self, dtype):
         self.model.dtype(dtype)
+        return self
+
+    def summary(self):
+        """Proxy for :meth:`Model.summary`."""
+        self.model.summary()
         return self
 
     def tune(self, **kwargs):
@@ -1082,7 +1414,7 @@ class TunableModuleCall(Placeholder):
 
     def dont_show(self):
         """If called will NOT display the network architecture."""
-        self.model._show = False
+        self.model.module_cls._show = False
         return self
 
 
@@ -1093,7 +1425,7 @@ class OperationDef(Placeholder):
     evaluated during solve iterations.
     """
 
-    def __init__(self, expr: Placeholder, input_vars: List[Variable] = None):
+    def __init__(self, expr: Placeholder, input_vars: List[Variable] | None = None):
         self.expr = expr
         self.input_vars = input_vars or []
         self.op_id = _next_op_id()
@@ -1198,7 +1530,7 @@ class Hessian(Placeholder):
     def __init__(
         self,
         target: "Placeholder",
-        variables: List[Variable],
+        variables: List[Union[Variable, None]],
         scheme: str = "automatic_differentiation",
         trace: bool = False,
     ):
@@ -1224,7 +1556,7 @@ class Jacobian(Placeholder):
     def __init__(
         self,
         target: "Placeholder",
-        variables: List[Variable],
+        variables: List[Union[Variable, None]],
         scheme: str = "automatic_differentiation",
     ):
         self.target = target

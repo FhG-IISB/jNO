@@ -195,7 +195,7 @@ class PrintFallback:
         pass
 
 
-def get_logger(path: Path = None, log_print: Tuple[bool, bool] = (True, True), use_default: bool = True) -> Union[Logger, PrintFallback]:
+def get_logger(path: Optional[Path] = None, log_print: Tuple[bool, bool] = (True, True), use_default: bool = True) -> Union[Logger, PrintFallback]:
     """
     Get a Logger instance.
 
@@ -220,10 +220,42 @@ def get_logger(path: Path = None, log_print: Tuple[bool, bool] = (True, True), u
             return PrintFallback()
 
 
-def init_default_logger(path: Path, log_print: Tuple[bool, bool] = (True, True)) -> Logger:
-    """Initialize the default logger. Call once at application startup."""
+def init_default_logger(path: Path, log_print: Tuple[bool, bool] = (True, True), force: bool = False) -> Logger:
+    """Initialize (or rebind) the default logger.
+
+    Args:
+        path: Directory where ``log.txt`` will be written.
+        log_print: Tuple ``(log_to_file, print_to_console)``.
+        force: If ``True``, always recreate the singleton logger for *path*.
+    """
     global _default_logger
+
+    path = Path(path)
+
     if _default_logger is not None:
-        return _default_logger
-    _default_logger = Logger(path=path, log_print=log_print, name="DefaultLogger")
+        current_path = getattr(_default_logger, "path", None)
+        current_cfg = getattr(_default_logger, "log_print", None)
+        rebind = bool(force)
+
+        if current_path is None:
+            rebind = True
+        else:
+            try:
+                rebind = rebind or (Path(current_path).resolve() != path.resolve())
+            except Exception:
+                rebind = True
+
+        if current_cfg is not None:
+            rebind = rebind or (current_cfg != log_print)
+
+        if rebind:
+            try:
+                _default_logger.close()
+            except Exception:
+                pass
+            _default_logger = None
+
+    if _default_logger is None:
+        _default_logger = Logger(path=path, log_print=log_print, name="DefaultLogger")
+
     return _default_logger

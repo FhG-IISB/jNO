@@ -123,16 +123,25 @@ s = sampler.pinnfluence(
 
 ## Usage
 
-Pass the sampler to `domain.set_sampler()` before constructing the solver, or supply it directly when constructing the domain:
+Attach the strategy when creating variables from a tagged point set using
+`resampling_strategy=...`:
 
 ```python
 from jno import sampler
 
 domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05))
-domain.set_sampler(sampler.rad(resample_every=100, resample_fraction=0.1, start_epoch=1000))
+x, y = domain.variable(
+    "interior",
+    sample=(None, None),
+    resampling_strategy=sampler.rad(
+        resample_every=100,
+        resample_fraction=0.1,
+        start_epoch=1000,
+    ),
+)
 ```
 
-The solver calls the sampler automatically during training.
+The solver applies configured strategies automatically during `solve()`.
 
 ---
 

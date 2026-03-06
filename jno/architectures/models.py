@@ -2223,6 +2223,7 @@ class nn:
         depths: Tuple[int, ...],
         num_in_channels: int,
         num_out_channels: int,
+        compute_dtype=None,
     ) -> Model:
         """Internal helper that builds a fresh Poseidon ScOT model."""
         from jax_poseidon import ScOT, ScOTConfig
@@ -2253,6 +2254,7 @@ class nn:
             use_conditioning=True,
             learn_residual=False,
             pretrained_window_sizes=(0, 0, 0, 0),
+            compute_dtype=compute_dtype,  # None → float32 (or float64 if JAX_ENABLE_X64=1)
         )
 
         flax_model = ScOT(config=config, use_conditioning=True)
@@ -2280,6 +2282,7 @@ class nn:
         cls,
         num_in_channels: int = 4,
         num_out_channels: int = 4,
+        compute_dtype=None,
     ) -> Model:
         """
         Poseidon-T (Tiny) foundation model (~20.8M parameters).
@@ -2301,13 +2304,14 @@ class nn:
         Reference:
             Herde et al., "Poseidon: Efficient Foundation Models for PDEs" (2024)
         """
-        return cls._poseidon("poseidonT", embed_dim=48, depths=(4, 4, 4, 4), num_in_channels=num_in_channels, num_out_channels=num_out_channels)
+        return cls._poseidon("poseidonT", embed_dim=48, depths=(4, 4, 4, 4), num_in_channels=num_in_channels, num_out_channels=num_out_channels, compute_dtype=compute_dtype)
 
     @classmethod
     def poseidonB(
         cls,
         num_in_channels: int = 4,
         num_out_channels: int = 4,
+        compute_dtype=None,
     ) -> Model:
         """
         Poseidon-B (Base) foundation model (~157.7M parameters).
@@ -2329,13 +2333,14 @@ class nn:
         Reference:
             Herde et al., "Poseidon: Efficient Foundation Models for PDEs" (2024)
         """
-        return cls._poseidon("poseidonB", embed_dim=96, depths=(8, 8, 8, 8), num_in_channels=num_in_channels, num_out_channels=num_out_channels)
+        return cls._poseidon("poseidonB", embed_dim=96, depths=(8, 8, 8, 8), num_in_channels=num_in_channels, num_out_channels=num_out_channels, compute_dtype=compute_dtype)
 
     @classmethod
     def poseidonL(
         cls,
         num_in_channels: int = 4,
         num_out_channels: int = 4,
+        compute_dtype=None,
     ) -> Model:
         """
         Poseidon-L (Large) foundation model (~628.6M parameters).
@@ -2357,7 +2362,7 @@ class nn:
         Reference:
             Herde et al., "Poseidon: Efficient Foundation Models for PDEs" (2024)
         """
-        return cls._poseidon("poseidonL", embed_dim=192, depths=(8, 8, 8, 8), num_in_channels=num_in_channels, num_out_channels=num_out_channels)
+        return cls._poseidon("poseidonL", embed_dim=192, depths=(8, 8, 8, 8), num_in_channels=num_in_channels, num_out_channels=num_out_channels, compute_dtype=compute_dtype)
 
     @classmethod
     def walrus(
@@ -2546,10 +2551,11 @@ class nn:
         params = flax_model.init(rng, dummy_vol, deterministic=True)
 
         # ── Adapter: jNO ↔ MORPH shape bridge ──────────────────────────
-        # jNO delivers x with shape (1, H, W, 1) per sample
-        # [T-dim peeled by scan, B-dim peeled by vmap].
-        # MORPH needs (B, t, F, C, D, H, W).
-        # Output (B=1, F=1, C=1, D=1, H, W) is mapped back to (1, H, W, 1).
+        # jNO may deliver either a single frame ``(H, W, C)`` or a time window
+        # ``(T, H, W, C)`` per sample, depending on temporal scanning.
+        # MORPH expects ``(B, t, F, C, D, H, W)``.
+        # For the common single-step case, output ``(B=1, F=1, C=1, D=1, H, W)``
+        # is mapped back to ``(1, H, W, C)``.
         #
         # We bake the reshape into the apply_fn closure so the wrapped
         # object stays a FlaxModelWrapper — this is required for the
@@ -2557,11 +2563,26 @@ class nn:
         _base_apply = flax_model.apply
 
         def morph_apply(params, x, **kwargs):
-            # x: (1, H, W, 1) — jNO per-sample input (channels-last 2-D)
-            H, W = x.shape[-3], x.shape[-2]
-            vol = x.reshape(1, 1, 1, 1, 1, H, W)  # → (B,t,F,C,D,H,W)
+            # x is channels-last 2-D data with optional leading time axis.
+            if x.ndim == 3:
+                h, w, c = x.shape
+                vol = jnp.transpose(x, (2, 0, 1))[None, None, None, :, None, :, :]
+                time_steps = 1
+            elif x.ndim == 4:
+                time_steps, h, w, c = x.shape
+                vol = jnp.transpose(x, (0, 3, 1, 2))[None, :, None, :, None, :, :]
+            else:
+                raise ValueError(f"MORPH adapter expected (H,W,C) or (T,H,W,C), got {x.shape}")
+
             _enc, _z, x_last = _base_apply(params, vol, **kwargs)
-            return x_last.reshape(1, H, W, 1)  # → (1, H, W, 1)
+
+            # Current MORPH variants used here emit the latest frame only as
+            # (B, F, C, D, H, W); map back to jNO's channels-last layout.
+            if x_last.ndim != 6:
+                raise ValueError(f"Unexpected MORPH output shape: {x_last.shape}")
+            y = jnp.squeeze(x_last, axis=(0, 1, 3))  # (C, H, W)
+            y = jnp.transpose(y, (1, 2, 0))  # (H, W, C)
+            return y[None, ...] if time_steps == 1 else y[None, ...]
 
         wrapped = FlaxModelWrapper(
             morph_apply,

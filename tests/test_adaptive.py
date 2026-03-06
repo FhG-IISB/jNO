@@ -51,10 +51,13 @@ class TestLearningRateSchedule:
         lr_0 = float(schedule(jnp.array(0), jnp.array([1.0])))
         lr_50 = float(schedule(jnp.array(50), jnp.array([1.0])))
         lr_100 = float(schedule(jnp.array(100), jnp.array([1.0])))
-        # During warmup, lr should increase
-        assert lr_50 > lr_0 or abs(lr_50 - lr_0) < 0.01  # some tolerance
-        # At end of warmup, should be close to lr0
-        assert lr_100 == pytest.approx(0.1, abs=0.02)
+        # Warmup should be strictly increasing for sampled warmup steps.
+        assert lr_0 < lr_50 < lr_100
+        # warm(t) = lr0 * (t + 1) / W for t < W.
+        assert lr_0 == pytest.approx(0.001, abs=1e-6)
+        assert lr_50 == pytest.approx(0.051, abs=1e-6)
+        # At t=W it enters cosine phase with frac=0, returning lr0.
+        assert lr_100 == pytest.approx(0.1, abs=1e-6)
 
 
 # ======================================================================

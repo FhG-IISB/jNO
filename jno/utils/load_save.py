@@ -4,10 +4,14 @@ from pylotte.signed_pickle import SignedPickle
 import cloudpickle
 from ..core import core
 from ..domain import domain
-from typing import Union
+from .iree import IREEModel
+from typing import Union, TypeVar, Type, overload, Any
 
 
-def save(instance, filepath: str, public_key_path: str = None, private_key_path: str = None):
+TLoaded = TypeVar("TLoaded", core, domain, IREEModel)
+
+
+def save(instance, filepath: str, public_key_path: str | None = None, private_key_path: str | None = None):
     """Save an object to a pickle file.
 
     If *public_key_path* / *private_key_path* are not provided, jNO checks
@@ -40,7 +44,33 @@ def save(instance, filepath: str, public_key_path: str = None, private_key_path:
     return None
 
 
-def load(filepath: str, public_key_path: str = None, signature_path: str = None) -> Union[core, domain]:
+@overload
+def load(
+    filepath: str,
+    public_key_path: str | None = None,
+    signature_path: str | None = None,
+    *,
+    expected_type: Type[TLoaded],
+) -> TLoaded: ...
+
+
+@overload
+def load(
+    filepath: str,
+    public_key_path: str | None = None,
+    signature_path: str | None = None,
+    *,
+    expected_type: None = None,
+) -> Union[core, domain, IREEModel]: ...
+
+
+def load(
+    filepath: str,
+    public_key_path: str | None = None,
+    signature_path: str | None = None,
+    *,
+    expected_type: Type[TLoaded] | None = None,
+) -> Union[core, domain, IREEModel, TLoaded]:
     """Load a pickle object.
 
     If *public_key_path* is not provided, jNO checks whether an RSA public
@@ -65,6 +95,14 @@ def load(filepath: str, public_key_path: str = None, signature_path: str = None)
                 f.read(length)
             else:
                 f.seek(0)
-            instance = cloudpickle.load(f)
+            instance: Any = cloudpickle.load(f)
+
+    if not isinstance(instance, (core, domain, IREEModel)):
+        raise TypeError(f"Loaded object has unsupported type: {type(instance).__name__}")
+
+    if expected_type is not None:
+        if not isinstance(instance, expected_type):
+            raise TypeError(f"Expected {expected_type.__name__} from load(), got {type(instance).__name__}")
+        return instance
 
     return instance
