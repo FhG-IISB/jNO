@@ -16,6 +16,7 @@ build/
 scripts/
 misc/
 runs/
+traces/
 
 !*.md
 !*.toml
