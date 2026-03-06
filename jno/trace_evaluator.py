@@ -910,37 +910,25 @@ class TraceEvaluator:
         local_residuals = local_residuals.reshape(num_entities, num_quads, num_local_nodes)
         cell_residuals = jnp.sum(local_residuals, axis=1) 
         
-        num_total_nodes = expr.num_total_nodes
-        
         # Scatter-add to global nodes
         global_residual = jax.ops.segment_sum(
             cell_residuals.flatten(), 
             flat_cells, 
-            num_segments=num_total_nodes
+            num_segments=expr.num_total_nodes
         )
 
-        # --- EXACT GALERKIN VOLUME NORMALIZATION ---
-        if expr.tag == "fem_gauss":
-            # Calculate the exact Lumped Mass Matrix dynamically
-            # Area_i = \int N_i d\Omega = \sum w_q |J| N_i(q)
-            N_flat_reshaped = ctx.context["N_flat"].reshape(num_entities, num_quads, num_local_nodes)
-            local_weights = JxW.reshape(num_entities, num_quads, 1)
-            
-            # Integrate the shape functions over each cell
-            cell_node_areas = jnp.sum(N_flat_reshaped * local_weights, axis=1)
-            
-            # Scatter-sum to get exact lumped nodal areas
-            exact_nodal_areas = jax.ops.segment_sum(
-                cell_node_areas.flatten(), 
-                flat_cells, 
-                num_segments=num_total_nodes
-            )
-            # Normalize!
-            global_residual = global_residual / (exact_nodal_areas + 1e-12)
-        # if "global_areas" in ctx.context:
-        #     # Flatten to safely strip the (B, T) dummy dimensions
-        #     areas = ctx.context["global_areas"].flatten()
-        #     global_residual = global_residual / (areas + 1e-12)
+        # --- FAST & EXACT VOLUME NORMALIZATION ---
+        # Unconditionally divide EVERY assembly by the pre-computed lumped mass matrix.
+        # if expr.tag == "fem_gauss":
+        #     if "global_areas" in ctx.context:
+        #         areas = ctx.context["global_areas"].flatten()
+        #         global_residual = global_residual / (areas + 1e-12)
+        # else:
+        #     surf_data = ctx.context["surface_data"][expr.tag]
+        #     if "global_boundary_areas" in surf_data:
+        #         areas = surf_data["global_boundary_areas"].flatten()
+        #         global_residual = global_residual / (areas + 1e-12)
+
         # --- GALERKIN PROJECTION ---
         if "dirichlet_nodes" in ctx.context:
             d_nodes = jnp.asarray(ctx.context["dirichlet_nodes"]).flatten().astype(jnp.int32)

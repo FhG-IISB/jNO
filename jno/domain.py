@@ -1892,7 +1892,7 @@ class domain(MeshUtils, Geometries):
         location_fns = []
         valid_tags = []
         for tag in neumann_tags:
-            if tag in self.self._mesh_pool:
+            if tag in self._mesh_pool:
                 valid_tags.append(tag)
                 tag_pts = jnp.asarray(self._mesh_pool[tag]) 
                 
@@ -1961,10 +1961,10 @@ class domain(MeshUtils, Geometries):
 
         # --- Extract Native jax-fem Nanson Scales for Neumann ---
         for i, tag in enumerate(valid_tags):
-            inds = prob.boundary_inds_list[i] 
+            inds = prob.boundary_inds_list[i]
             if len(inds) > 0:
-                _, nanson_scale = fe.get_face_shape_grads(inds) 
-                
+                _, nanson_scale = fe.get_face_shape_grads(inds)
+
                 parent_cells = fe.cells[inds[:, 0]]
                 face_ids = inds[:, 1]
                 face_shape_vals = fe.face_shape_vals[face_ids]
@@ -1973,10 +1973,19 @@ class domain(MeshUtils, Geometries):
                 selected_coos = physical_coos[inds[:, 0]]
                 physical_face_quads = onp.einsum('fqn,fnd->fqd', face_shape_vals, selected_coos)
 
+                # Precompute boundary normalization areas for this Neumann tag
+                local_boundary_areas = jnp.einsum('fq,fqn->fn', jnp.asarray(nanson_scale), jnp.asarray(face_shape_vals))
+                global_boundary_areas = jax.ops.segment_sum(
+                    local_boundary_areas.flatten(),
+                    jnp.asarray(parent_cells, dtype=jnp.int32).flatten(),
+                    num_segments=fe.num_total_nodes
+                )
+
                 self.fem_context["surface_data"][tag] = {
                     "flat_parent_nodes": jnp.asarray(parent_cells, dtype=jnp.int32).flatten(),
                     "face_shape_vals": jnp.asarray(face_shape_vals),
-                    "nanson_scale": jnp.asarray(nanson_scale) 
+                    "nanson_scale": jnp.asarray(nanson_scale),
+                    "global_boundary_areas": global_boundary_areas
                 }
                 self._mesh_pool[f"gauss_{tag}"] = jnp.asarray(physical_face_quads).reshape(-1, self.dimension)
                 self.log.info(f"jax-fem Nanson extraction: Matched {len(inds)} faces for '{tag}'")
