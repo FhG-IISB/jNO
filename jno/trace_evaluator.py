@@ -516,19 +516,17 @@ class TraceEvaluator:
         variables = expr.variables
         scheme = expr.scheme
         if isinstance(target, TestFunction):
-            dim_idx = variables[0].dim[0] 
+            var = variables[0]
+            dim_idx = 0
+            if hasattr(var, "dim") and isinstance(var.dim, (list, tuple)):
+                ints = [d for d in var.dim if isinstance(d, int)]
+                if ints:
+                    dim_idx = ints[0]
             if target.tag == "fem_gauss":
                 dN = ctx.context["dN_dx_flat"]
-                if dN.ndim == 2 and dN.shape[1] > 3:
-                    num_nodes = ctx.context["N_flat"].shape[-1]
-                    dim = dN.shape[1] // num_nodes
-                    
-                    # 1. Reshape to jax_fem's native (dim, num_nodes) layout
-                    dN = dN.reshape(dN.shape[0], dim, num_nodes)
-                    
-                    # 2. Swap axes to (num_nodes, dim) so dim_idx slices correctly!
-                    dN = jnp.swapaxes(dN, 1, 2)
-                    
+                
+                #print(f"TRACING {target.tag} - dN native shape: {dN.shape}")
+                #print(f"TRACING {target.tag} - Extracting dim {dim_idx}")
                 return dN[..., dim_idx]
 
         first_var = variables[0]
@@ -821,6 +819,73 @@ class TraceEvaluator:
     def _eval_operation_def(self, expr, ctx):
         return self._dispatch(expr.expr, ctx)
 
+    def _eval_test_function(self, expr, ctx):
+        """Returns the precomputed shape function values for volume or surface."""
+        if expr.tag == "fem_gauss":
+            # Volume shape functions: (N_quads_total, 3)
+            return ctx.context["N_flat"]
+        else:
+            if "surface_data" not in ctx.context or expr.tag not in ctx.context["surface_data"]:
+                raise KeyError(f"Surface tag '{expr.tag}' not found in fem_context.")
+            
+            vals = ctx.context["surface_data"][expr.tag]["face_shape_vals"]
+            # reshape(-1, ...) is safe whether vals is (F, Q, 3) or (1, F, Q, 3)
+            return vals.reshape(-1, vals.shape[-1])
+
+    def _eval_assembly(self, expr, ctx):
+        integrand = self._dispatch(expr.expr, ctx)
+        
+        if expr.tag == "fem_gauss":
+            weights = ctx.context["JxW"] 
+            flat_cells = ctx.context["flat_cells"].flatten()
+        else:
+            surf_data = ctx.context["surface_data"][expr.tag]
+            weights = surf_data["nanson_scale"]
+            flat_cells = surf_data["flat_parent_nodes"].flatten()
+
+        num_entities, num_quads = weights.shape[-2], weights.shape[-1]
+        weights_flat = weights.flatten()[:, jnp.newaxis]
+
+        local_residuals = integrand * weights_flat
+        num_local_nodes = integrand.shape[-1]
+        
+        # This reshape is the ultimate safeguard. If num_local_nodes is 
+        # wrong (like the Jacobian bug), this will CRASH instead of cheating.
+        local_residuals = local_residuals.reshape(num_entities, num_quads, num_local_nodes)
+        cell_residuals = jnp.sum(local_residuals, axis=1) 
+        
+        global_residual = jax.ops.segment_sum(
+            cell_residuals.flatten(), 
+            flat_cells, 
+            num_segments=expr.num_total_nodes
+        )
+        if global_residual.ndim == 1:
+            global_residual = global_residual[:, jnp.newaxis]
+
+        # NORMALIZATION FIX
+        if "global_areas" in ctx.context:
+            areas = ctx.context["global_areas"].reshape(-1,1)
+            global_residual = global_residual / (areas + 1e-12)
+
+        # GALERKIN FIX: If using Hard BCs, zeroing residuals is optional but 
+        # standard. If you want maximum accuracy, try commenting this out!
+        if "dirichlet_nodes" in ctx.context:
+            d_nodes = jnp.asarray(ctx.context["dirichlet_nodes"]).flatten().astype(jnp.int32)
+            if d_nodes.size > 0:
+                global_residual = global_residual.at[d_nodes].set(0.0)
+
+        if global_residual.ndim == 1:
+            global_residual = global_residual[:, jnp.newaxis]
+        # jax.debug.print(
+        #     "[{tag}] Max: {max_val:.2e} | Mean abs: {mean_val:.2e} | Non-zero nodes: {nnz}",
+        #     tag=getattr(expr, "tag", "unknown_tag"),
+        #     max_val=jnp.max(jnp.abs(global_residual)),
+        #     mean_val=jnp.mean(jnp.abs(global_residual)),
+        #     nnz=jnp.sum(jnp.abs(global_residual) > 1e-8)
+        # )
+
+        return global_residual
+   
     @staticmethod
     def _node_label(node) -> Tuple[str, str]:
         """Return (uid, label) — rendered separately by _trace_visit."""
@@ -870,73 +935,5 @@ class TraceEvaluator:
             scheme_str = f", {node.scheme[:2]}" if node.scheme else ""
             return uid, f"{kind}([{vars_str}]{scheme_str})"
         return uid, type(node).__name__
-
-    def _eval_test_function(self, expr, ctx):
-        """Returns the precomputed shape function values."""
-        if expr.tag == "fem_gauss":
-            # Volume shape functions: (num_cells * num_quads, num_local_nodes)
-            return ctx.context["N_flat"]
-        else:
-            # Surface shape functions for Neumann boundaries
-            if expr.tag not in ctx.context.get("surface_data", {}):
-                raise KeyError(f"Surface tag '{expr.tag}' not found in fem_context['surface_data'].")
-            
-            vals = ctx.context["surface_data"][expr.tag]["face_shape_vals"]
-            # FIX: Reshape to (N_faces * N_quads, num_local_nodes) to guarantee 
-            # safe broadcasting with the network's predictions
-            return vals.reshape(-1, vals.shape[-1])
-
-    def _eval_assembly(self, expr, ctx):
-        """Multiplies by quadrature weights, integrates over cells, and scatters to global nodes."""
-        integrand = self._dispatch(expr.expr, ctx)
-        
-        if expr.tag == "fem_gauss":
-            # Volume integral
-            JxW = ctx.context["JxW"].flatten()[:, None]
-            local_residuals = integrand * JxW
-            flat_cells = ctx.context["flat_cells"].flatten()
-        else:
-            # Surface integral
-            surf_data = ctx.context["surface_data"][expr.tag]
-            nanson = surf_data["nanson_scale"].flatten()[:, None]
-            local_residuals = integrand * nanson
-            flat_cells = surf_data["flat_parent_nodes"].flatten()
-            
-        num_local_nodes = integrand.shape[-1]
-        num_entities = flat_cells.shape[0] // num_local_nodes
-        num_quads = local_residuals.shape[0] // num_entities
-        
-        # Integrate (sum) over quadrature points per cell
-        local_residuals = local_residuals.reshape(num_entities, num_quads, num_local_nodes)
-        cell_residuals = jnp.sum(local_residuals, axis=1) 
-        
-        # Scatter-add to global nodes
-        global_residual = jax.ops.segment_sum(
-            cell_residuals.flatten(), 
-            flat_cells, 
-            num_segments=expr.num_total_nodes
-        )
-
-        # --- FAST & EXACT VOLUME NORMALIZATION ---
-        # Unconditionally divide EVERY assembly by the pre-computed lumped mass matrix.
-        # if expr.tag == "fem_gauss":
-        #     if "global_areas" in ctx.context:
-        #         areas = ctx.context["global_areas"].flatten()
-        #         global_residual = global_residual / (areas + 1e-12)
-        # else:
-        #     surf_data = ctx.context["surface_data"][expr.tag]
-        #     if "global_boundary_areas" in surf_data:
-        #         areas = surf_data["global_boundary_areas"].flatten()
-        #         global_residual = global_residual / (areas + 1e-12)
-
-        # --- GALERKIN PROJECTION ---
-        if "dirichlet_nodes" in ctx.context:
-            d_nodes = jnp.asarray(ctx.context["dirichlet_nodes"]).flatten().astype(jnp.int32)
-            if d_nodes.size > 0:
-                global_residual = global_residual.at[d_nodes].set(0.0)
-
-        # Expected output shape for JNO compatibility is (N, 1)
-        if global_residual.ndim == 1:
-            global_residual = global_residual[:, jnp.newaxis]
-
-        return global_residual
+    
+    

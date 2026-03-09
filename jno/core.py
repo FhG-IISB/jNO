@@ -341,8 +341,13 @@ class core:
                     continue
                     # Standard behavior for everything else (preserves backward compatibility)
                 arr = jnp.asarray(arr)
-                # Ensure batch dimension exists
-                if hasattr(arr, "ndim") and arr.ndim >= 2:
+                
+                # List of tags that are MESH METADATA and should never be batched
+                metadata_tags = ["JxW", "flat_cells", "global_areas", "N_flat", "dN_dx_flat", "dirichlet_nodes", "__time__"]
+                
+                if tag in metadata_tags:
+                    context[tag] = arr
+                elif hasattr(arr, "ndim") and arr.ndim >= 2:
                     context[tag] = arr
                 else:
                     context[tag] = arr[None, ...]
