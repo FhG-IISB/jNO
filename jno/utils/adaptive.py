@@ -1,6 +1,12 @@
 from typing import Callable, List, Union, Sequence
 import jax.numpy as jnp
 
+
+def _default_float_dtype():
+    """Return JAX's current default floating dtype (float32 or float64)."""
+    return jnp.asarray(0.0).dtype
+
+
 LRFunction = Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]
 WeightFunction = Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]
 
@@ -69,7 +75,7 @@ class LearningRateSchedule:
         lr_end = float(lr_end)
 
         def fn(t, losses):
-            t = jnp.asarray(t, dtype=jnp.float32)
+            t = jnp.asarray(t, dtype=_default_float_dtype())
             frac = jnp.clip(t / T, 0.0, 1.0)
             # cosine from 1 -> 0
             cos = 0.5 * (1.0 + jnp.cos(jnp.pi * frac))
@@ -95,7 +101,7 @@ class LearningRateSchedule:
         lr_end = float(lr_end)
 
         def fn(t, losses):
-            t = jnp.asarray(t, dtype=jnp.float32)
+            t = jnp.asarray(t, dtype=_default_float_dtype())
 
             warm = lr0 * (t + 1.0) / jnp.maximum(1.0, float(W))
 
@@ -132,7 +138,7 @@ class LearningRateSchedule:
         lr_end = float(lr_end)
 
         def fn(t, losses):
-            t = jnp.asarray(t, dtype=jnp.float32)
+            t = jnp.asarray(t, dtype=_default_float_dtype())
             p = t / decay_steps
             if staircase:
                 p = jnp.floor(p)
@@ -157,7 +163,7 @@ class LearningRateSchedule:
         values: len(boundaries)+1 values, e.g. [5e-4, 2e-4, 5e-5]
         """
         b = jnp.asarray(list(boundaries), dtype=jnp.int32)
-        v = jnp.asarray(list(values), dtype=jnp.float32)
+        v = jnp.asarray(list(values), dtype=_default_float_dtype())
         if len(values) != len(boundaries) + 1:
             raise ValueError("values must have length len(boundaries)+1")
 

@@ -5,6 +5,7 @@ Variables are placeholders that get filled during solve iterations.
 Operations trace computations and return callable placeholders.
 """
 
+from __future__ import annotations
 from typing import List, Callable, Any, Union, Dict, Optional, Type
 from .tuner import Arch, ArchSpace
 import jax.numpy as jnp
@@ -14,6 +15,14 @@ import jax
 import equinox as eqx
 from .utils.adaptive import LearningRateSchedule
 from .utils.logger import get_logger
+
+try:
+    import maskx
+except ImportError:
+    maskx = None
+
+
+_DEFAULT_MASKX_LEAF_TYPE = object()
 
 __all__ = [
     "Placeholder",
@@ -67,76 +76,76 @@ class Placeholder:
     """
 
     # -- identity-based equality so Placeholders work in sets/dicts -----------
-    def __eq__(self, other):
+    def __eq__(self, other) -> bool:
         return self is other
 
-    def __ne__(self, other):
+    def __ne__(self, other) -> bool:
         return self is not other
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         return id(self)
 
     # -- symbolic comparison operators (return traced FunctionCall nodes) ------
-    def equal(self, other):
+    def equal(self, other) -> FunctionCall:
         """Element-wise symbolic equality (traced, not Python ``==``)."""
         return FunctionCall(jnp.equal, [self, other])
 
-    def not_equal(self, other):
+    def not_equal(self, other) -> FunctionCall:
         """Element-wise symbolic inequality (traced, not Python ``!=``)."""
         return FunctionCall(jnp.not_equal, [self, other])
 
-    def __gt__(self, other):
+    def __gt__(self, other) -> FunctionCall:
         return FunctionCall(jnp.greater, [self, other])
 
-    def __lt__(self, other):
+    def __lt__(self, other) -> FunctionCall:
         return FunctionCall(jnp.less, [self, other])
 
-    def __ge__(self, other):
+    def __ge__(self, other) -> FunctionCall:
         return FunctionCall(jnp.greater_equal, [self, other])
 
-    def __le__(self, other):
+    def __le__(self, other) -> FunctionCall:
         return FunctionCall(jnp.less_equal, [self, other])
 
-    def _wrap(self, other):
+    def _wrap(self, other) -> Literal:
         """Wrap non-Placeholder types."""
         if isinstance(other, Placeholder):
             return other
         return Literal(other)
 
-    def __add__(self, other):
+    def __add__(self, other) -> BinaryOp:
         return BinaryOp("+", self, self._wrap(other))
 
-    def __radd__(self, other):
+    def __radd__(self, other) -> BinaryOp:
         return BinaryOp("+", self._wrap(other), self)
 
-    def __sub__(self, other):
+    def __sub__(self, other) -> BinaryOp:
         return BinaryOp("-", self, self._wrap(other))
 
-    def __rsub__(self, other):
+    def __rsub__(self, other) -> BinaryOp:
         return BinaryOp("-", self._wrap(other), self)
 
-    def __mul__(self, other):
+    def __mul__(self, other) -> BinaryOp:
         return BinaryOp("*", self, self._wrap(other))
 
-    def __rmul__(self, other):
+    def __rmul__(self, other) -> BinaryOp:
         return BinaryOp("*", self._wrap(other), self)
 
-    def __truediv__(self, other):
+    def __truediv__(self, other) -> BinaryOp:
         return BinaryOp("/", self, self._wrap(other))
 
-    def __rtruediv__(self, other):
+    def __rtruediv__(self, other) -> BinaryOp:
         return BinaryOp("/", self._wrap(other), self)
 
-    def __neg__(self):
+    def __neg__(self) -> BinaryOp:
         return BinaryOp("*", Literal(-1.0), self)
 
-    def __pow__(self, other):
+    def __pow__(self, other) -> BinaryOp:
         return BinaryOp("**", self, self._wrap(other))
 
-    def __rpow__(self, other):
+    def __rpow__(self, other) -> BinaryOp:
         return BinaryOp("**", self._wrap(other), self)
 
-    def __getitem__(self, key):
+    def __getitem__(self, key) -> FunctionCall:
         if not isinstance(key, tuple):
             key = (key,)
         concrete_key = tuple(None if k is None else k for k in key)
@@ -149,7 +158,7 @@ class Placeholder:
             self._auto_op = OperationDef(self)
         return self._auto_op(*args)
 
-    def __matmul__(self, other):
+    def __matmul__(self, other) -> FunctionCall:
         """Matrix multiplication: self @ other"""
         other = self._wrap(other)
 
@@ -160,7 +169,7 @@ class Placeholder:
         # eager path (other is ndarray)
         return FunctionCall(lambda a: a @ other, [self])
 
-    def __rmatmul__(self, other):
+    def __rmatmul__(self, other) -> FunctionCall:
         """Matrix multiplication: other @ self"""
         other = self._wrap(other)
 
@@ -169,7 +178,7 @@ class Placeholder:
 
         return FunctionCall(lambda b: other @ b, [self])
 
-    def reshape(self, *shape):
+    def reshape(self, *shape) -> FunctionCall:
         """Reshape this placeholder to a new shape."""
         if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
             shape = tuple(shape[0])
@@ -263,42 +272,42 @@ class Placeholder:
         return Tracker(self, interval)
 
     @property
-    def shape(self):
+    def shape(self) -> FunctionCall:
         return FunctionCall(lambda x: jnp.ones(x.shape, dtype="bool"), [self], "shape", True)
 
     @property
-    def mean(self):
+    def mean(self) -> FunctionCall:
         return FunctionCall(lambda x: jnp.squeeze(x.mean()), [self], "mean", True)
 
     @property
-    def sum(self):
+    def sum(self) -> FunctionCall:
         return FunctionCall(lambda x: jnp.squeeze(jnp.sum(x)), [self], "sum", True)
 
     @property
-    def min(self):
+    def min(self) -> FunctionCall:
         return FunctionCall(lambda x: jnp.squeeze(jnp.min(x)), [self], "min", True)
 
     @property
-    def max(self):
+    def max(self) -> FunctionCall:
         return FunctionCall(lambda x: jnp.squeeze(jnp.max(x)), [self], "max", True)
 
     @property
-    def std(self):
+    def std(self) -> FunctionCall:
         return FunctionCall(lambda x: jnp.squeeze(jnp.std(x)), [self], "std", True)
 
     @property
-    def mse(self):
+    def mse(self) -> FunctionCall:
         def fn(x):
             return jnp.squeeze(jnp.mean(jnp.square(x)))
 
         return FunctionCall(fn, [self], "mse", True)
 
     @property
-    def mae(self):
+    def mae(self) -> FunctionCall:
         return FunctionCall(lambda x: jnp.squeeze(jnp.mean(jnp.abs(x))), [self], "mae", True)
 
     @property
-    def T(self):
+    def T(self) -> FunctionCall:
         return FunctionCall(lambda x: x.T, [self], "transpose", True)
 
     # ------------------------------------------------------------------
@@ -371,6 +380,16 @@ class Placeholder:
         return Hessian(self, [variable], scheme, trace=True)
 
 
+class Literal(Placeholder):
+    """Concrete scalar/array embedded in the trace (no trainable params)."""
+
+    def __init__(self, value):
+        self.value = jnp.asarray(value)
+
+    def __repr__(self):
+        return f"Literal({self.value})"
+
+
 class FunctionCall(Placeholder):
     """Call to a pure function over traced args."""
 
@@ -400,16 +419,6 @@ class FunctionCall(Placeholder):
     def __call__(self, args):
         """Return a new FunctionCall with the given args."""
         return self.copy_with_args([args])
-
-
-class Literal(Placeholder):
-    """Concrete scalar/array embedded in the trace (no trainable params)."""
-
-    def __init__(self, value):
-        self.value = jnp.asarray(value)
-
-    def __repr__(self):
-        return f"Literal({self.value})"
 
 
 class ConstantNamespace:
@@ -996,9 +1005,21 @@ class Model(Placeholder):
         self._frozen = False
         return self
 
-    def mask(self, param_mask=None, *, target: str | None = None):
+    def mask(
+        self,
+        param_mask=None,
+        *,
+        target: str | None = None,
+        where: Callable[[str, Any], bool] | None = None,
+        leaf_type: Any = _DEFAULT_MASKX_LEAF_TYPE,
+        shape: tuple[int, ...] | None = None,
+        dtype: Any | None = None,
+        ndim: int | None = None,
+        path_prefix: str | tuple[str, ...] | list[str] | None = None,
+        path_in: list[str] | tuple[str, ...] | None = None,
+    ):
         """Restrict which parameters are trainable via a boolean pytree mask
-        or a regex pattern matched against parameter path strings.
+        or by delegating selectors to ``maskx.select``.
 
         **String / regex usage** (recommended)::
 
@@ -1010,6 +1031,17 @@ class Model(Placeholder):
 
             # Positional shorthand — string as first argument
             NN.mask("decoder.*kernel")
+
+        **Additional maskx selectors**::
+
+            # Train only leaves under a prefix
+            NN.mask(path_prefix="encoder")
+
+            # Train only 2D array leaves
+            NN.mask(ndim=2)
+
+            # Select an exact set of paths
+            NN.mask(path_in=["output_layer/weight", "output_layer/bias"])
 
         The ``target`` pattern is matched with ``re.search`` against each
         parameter's full path, formed by joining its pytree key segments
@@ -1030,53 +1062,70 @@ class Model(Placeholder):
 
         Args:
             param_mask: A pytree of ``bool`` matching the module structure,
-                **or** a regex string (shorthand for ``target=``).
+                a ``maskx.Mask`` object, **or** a regex string (shorthand
+                for ``target=``).
             target: Regex matched against each parameter's path string.
                 Matched leaves are trainable; everything else is frozen.
+                This is the only selector that keeps the existing transient
+                chaining behaviour for ``freeze()``, ``initialize()``,
+                per-group ``optimizer()``, and targeted Flax ``lora()``.
+            where: Optional ``maskx`` predicate receiving ``(path, leaf)``.
+            leaf_type: Optional ``maskx`` leaf type filter. When any selector
+                kwargs are used and ``leaf_type`` is left unspecified,
+                selection defaults to array leaves only via ``eqx.is_array``.
+                Pass ``leaf_type=None`` to disable that default.
+            shape: Optional exact shape filter.
+            dtype: Optional exact dtype filter.
+            ndim: Optional exact ndim filter.
+            path_prefix: Optional prefix string or sequence of prefixes.
+            path_in: Optional exact leaf paths to include.
 
         Returns:
             self (for chaining).
         """
-        import re as _re
-
         # Allow string as positional arg: NN.mask("query|key")
         if isinstance(param_mask, str):
             target = param_mask
             param_mask = None
 
-        if target is not None:
-            # Build a boolean pytree from the current module by matching paths.
-            def _key_str(k):
-                if hasattr(k, "key"):
-                    return str(k.key)  # DictKey
-                if hasattr(k, "idx"):
-                    return str(k.idx)  # SequenceKey
-                if hasattr(k, "name"):
-                    return k.name  # GetAttrKey
-                return str(k)
+        if maskx is not None and isinstance(param_mask, maskx.Mask):
+            param_mask = param_mask.tree
 
-            leaves_with_paths, treedef = jax.tree_util.tree_flatten_with_path(self.module)
-            bool_leaves = []
-            matched_paths = []
-            total_arrays = 0
-            for path, leaf in leaves_with_paths:
-                path_str = "/".join(_key_str(k) for k in path)
-                if eqx.is_array(leaf):
-                    total_arrays += 1
-                    is_match = bool(_re.search(target, path_str))
-                    bool_leaves.append(is_match)
-                    if is_match:
-                        matched_paths.append(path_str)
-                else:
-                    bool_leaves.append(False)
-            self._param_mask = jax.tree_util.tree_unflatten(treedef, bool_leaves)
-            self._mask_target = target  # capture for lora() to consume
-            self._mask_meta = {
-                "target": target,
-                "matched": int(len(matched_paths)),
-                "total_arrays": int(total_arrays),
-                "sample_paths": matched_paths[:8],
-            }
+        selector_requested = any(value is not None for value in (target, where, shape, dtype, ndim, path_prefix, path_in)) or leaf_type is not _DEFAULT_MASKX_LEAF_TYPE
+
+        if selector_requested:
+            if maskx is None:
+                raise ImportError("maskx is required for selector-based mask(...). Install the 'maskx' package to use parameter selection helpers.")
+
+            if param_mask is not None:
+                raise ValueError("mask() accepts either a manual param_mask/maskx.Mask or selector kwargs, not both.")
+
+            selected = maskx.select(
+                self.module,
+                target=target,
+                where=where,
+                leaf_type=(eqx.is_array if leaf_type is _DEFAULT_MASKX_LEAF_TYPE else leaf_type),
+                shape=shape,
+                dtype=dtype,
+                ndim=ndim,
+                path_prefix=path_prefix,
+                path_in=path_in,
+            )
+            matched_paths = selected.paths()
+
+            self._param_mask = selected.tree
+            if target is not None:
+                total_arrays = sum(1 for _, leaf in maskx.leaf_paths(self.module) if eqx.is_array(leaf))
+                self._mask_target = target  # capture for lora() to consume
+                self._mask_meta = {
+                    "target": target,
+                    "matched": int(len(matched_paths)),
+                    "total_arrays": int(total_arrays),
+                    "sample_paths": matched_paths[:8],
+                }
+            else:
+                self._mask_target = None
+                self._mask_meta = None
         else:
             self._param_mask = param_mask
             self._mask_target = None
@@ -1346,9 +1395,31 @@ class ModelCall(Placeholder):
         self.model.unfreeze()
         return self
 
-    def mask(self, param_mask=None, *, target: str | None = None):
+    def mask(
+        self,
+        param_mask=None,
+        *,
+        target: str | None = None,
+        where: Callable[[str, Any], bool] | None = None,
+        leaf_type: Any = _DEFAULT_MASKX_LEAF_TYPE,
+        shape: tuple[int, ...] | None = None,
+        dtype: Any | None = None,
+        ndim: int | None = None,
+        path_prefix: str | tuple[str, ...] | list[str] | None = None,
+        path_in: list[str] | tuple[str, ...] | None = None,
+    ):
         """Proxy for :meth:`Model.mask`."""
-        self.model.mask(param_mask, target=target)
+        self.model.mask(
+            param_mask,
+            target=target,
+            where=where,
+            leaf_type=leaf_type,
+            shape=shape,
+            dtype=dtype,
+            ndim=ndim,
+            path_prefix=path_prefix,
+            path_in=path_in,
+        )
         return self
 
     def lora(self, rank: int = 4, alpha: float = 1.0):

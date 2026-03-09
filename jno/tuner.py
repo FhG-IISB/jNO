@@ -1,9 +1,6 @@
-# arch_tuner.py
-
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Sequence, Tuple, Union, Callable, Literal, Optional
-import nevergrad as ng
 import copy
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -233,13 +230,15 @@ class ArchSpace:
         """Check if space has training parameters to tune."""
         return len(self.get_training_groups()) > 0
 
-    def parametrization(self, categories: List[str] = None) -> ng.p.Instrumentation:
+    def parametrization(self, categories: List[str] = None):
         """Build Nevergrad parametrization.
 
         Args:
             categories: Optional list of categories to include.
                        If None, includes all categories.
         """
+        import nevergrad as ng
+
         params = {}
         for g in self._groups:
             if categories is not None and g.category not in categories:
@@ -471,6 +470,8 @@ class Tuner:
         instrum = space.parametrization()
 
         if isinstance(optimizer, str):
+            import nevergrad as ng
+
             opt_cls = getattr(ng.optimizers, optimizer, None)
             if opt_cls is None:
                 raise ValueError(f"Unknown Nevergrad optimizer: {optimizer}")

@@ -50,6 +50,11 @@ def _get_evaluator_class():
     return TraceEvaluator
 
 
+def _default_float_dtype():
+    """Return JAX's current default floating dtype (float32 or float64)."""
+    return jnp.asarray(0.0).dtype
+
+
 class TraceCompiler:
     """One-time graph-compilation and parameter-initialisation utilities.
 
@@ -158,7 +163,7 @@ class TraceCompiler:
         and never reach this code path.
         """
         TraceEvaluator = _get_evaluator_class()
-        abstract_ctx = {tag: jax.ShapeDtypeStruct(tuple(shape), jnp.float32) for tag, shape in tensor_dims.items()}
+        abstract_ctx = {tag: jax.ShapeDtypeStruct(tuple(shape), _default_float_dtype()) for tag, shape in tensor_dims.items()}
 
         def eval_and_normalize(context):
             evaluator = TraceEvaluator(existing_params)
@@ -642,14 +647,17 @@ class TraceCompiler:
                         T = max(T, v.shape[0])
 
                 W = max(1, min(min_consecutive, T))  # window size
+                idx_dtype = jnp.int64 if jax.config.jax_enable_x64 else jnp.int32
+                zero_idx = jnp.asarray(0, dtype=idx_dtype)
 
                 if T > W:
                     if rng_key is None:
-                        start = jnp.asarray(0, dtype=jnp.int32)
+                        start = zero_idx
                     else:
                         start = jax.random.randint(rng_key, shape=(), minval=0, maxval=T - W + 1)
+                        start = start.astype(idx_dtype)
                 else:
-                    start = jnp.asarray(0, dtype=jnp.int32)
+                    start = zero_idx
 
                 def eval_window(windowed_ctx, t_wind):
                     """Evaluate on one window of W steps.
@@ -671,7 +679,7 @@ class TraceCompiler:
                 for arr in spatial_vals:
                     if hasattr(arr, "ndim") and arr.ndim >= 3 and arr.shape[0] == T:
                         slice_sizes = (W,) + tuple(arr.shape[1:])
-                        start_idx = (start,) + (0,) * (arr.ndim - 1)
+                        start_idx = (start,) + (zero_idx,) * (arr.ndim - 1)
                         windowed_list.append(jax.lax.dynamic_slice(arr, start_idx, slice_sizes))
                     elif hasattr(arr, "ndim") and arr.ndim >= 3 and arr.shape[0] < T:
                         # Broadcast static/short temporal inputs (e.g. initial condition)
@@ -681,7 +689,7 @@ class TraceCompiler:
                         windowed_list.append(arr)
 
                 if time_arr is not None:
-                    t_windowed = jax.lax.dynamic_slice(time_arr, (start, 0), (W, 1))
+                    t_windowed = jax.lax.dynamic_slice(time_arr, (start, zero_idx), (W, 1))
                 else:
                     t_windowed = jnp.zeros((W, 1))  # dummy — never read when time_arr is None
 
@@ -815,14 +823,17 @@ class TraceCompiler:
                         T = max(T, v.shape[0])
 
                 W = max(1, min(min_consecutive, T))
+                idx_dtype = jnp.int64 if jax.config.jax_enable_x64 else jnp.int32
+                zero_idx = jnp.asarray(0, dtype=idx_dtype)
 
                 if T > W:
                     if rng_key is None:
-                        start = jnp.asarray(0, dtype=jnp.int32)
+                        start = zero_idx
                     else:
                         start = jax.random.randint(rng_key, shape=(), minval=0, maxval=T - W + 1)
+                        start = start.astype(idx_dtype)
                 else:
-                    start = jnp.asarray(0, dtype=jnp.int32)
+                    start = zero_idx
 
                 def eval_window(windowed_ctx, t_wind):
                     ctx_dict = {}
@@ -839,7 +850,7 @@ class TraceCompiler:
                 for arr in spatial_vals:
                     if hasattr(arr, "ndim") and arr.ndim >= 3 and arr.shape[0] == T:
                         slice_sizes = (W,) + tuple(arr.shape[1:])
-                        start_idx = (start,) + (0,) * (arr.ndim - 1)
+                        start_idx = (start,) + (zero_idx,) * (arr.ndim - 1)
                         windowed_list.append(jax.lax.dynamic_slice(arr, start_idx, slice_sizes))
                     elif hasattr(arr, "ndim") and arr.ndim >= 3 and arr.shape[0] < T:
                         windowed_list.append(jnp.broadcast_to(arr, (W, *arr.shape[1:])))
@@ -847,7 +858,7 @@ class TraceCompiler:
                         windowed_list.append(arr)
 
                 if time_arr is not None:
-                    t_windowed = jax.lax.dynamic_slice(time_arr, (start, 0), (W, 1))
+                    t_windowed = jax.lax.dynamic_slice(time_arr, (start, zero_idx), (W, 1))
                 else:
                     t_windowed = jnp.zeros((W, 1))
 

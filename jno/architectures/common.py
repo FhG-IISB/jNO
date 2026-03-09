@@ -12,6 +12,11 @@ import numpy as np
 import equinox as eqx
 
 
+def _default_float_dtype():
+    """Return JAX's current default floating dtype (float32 or float64)."""
+    return jnp.asarray(0.0).dtype
+
+
 # ---------------------------------------------------------------------------
 # BatchNorm  (stateless / instance-norm style)
 # ---------------------------------------------------------------------------
@@ -120,10 +125,11 @@ class FlaxModelWrapper(eqx.Module):
         if self.post_fn is not None:
             result = self.post_fn(result)
 
-        # Cast output back to float32 for loss computation
-        if param_dtype is not None and param_dtype != jnp.float32:
+        # Cast output back to JAX default float for stable downstream losses.
+        out_dtype = _default_float_dtype()
+        if param_dtype is not None and param_dtype != out_dtype:
             result = jax.tree_util.tree_map(
-                lambda x: x.astype(jnp.float32) if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating) else x,
+                lambda x: x.astype(out_dtype) if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating) else x,
                 result,
             )
         return result

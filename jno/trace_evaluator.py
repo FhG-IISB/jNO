@@ -25,6 +25,13 @@ from .trace import (
     TestFunction, 
     Assembly,
 )
+
+
+def _default_float_dtype():
+    """Return JAX's current default floating dtype (float32 or float64)."""
+    return jnp.asarray(0.0).dtype
+
+
 from .utils import get_logger
 import equinox as eqx
 
@@ -543,7 +550,7 @@ class TraceEvaluator:
                 # Central difference: (u(t+eps) - u(t-eps)) / (2*eps)
                 # Two forward passes through the network — much cheaper
                 # than N jax.grad calls for AD.
-                eps = jnp.float32(1e-3)
+                eps = jnp.asarray(1e-3, dtype=_default_float_dtype())
                 t_fwd = time_val + eps
                 t_bwd = time_val - eps
 

@@ -363,6 +363,59 @@ class TestModelMask:
         assert u_net._lora_config == (4, 1.0, "output_layer")
         assert u_net._mask_target is None
 
+    def test_mask_target_matches_maskx_selection(self):
+        """mask(target=...) uses maskx selection and only marks array leaves."""
+        import maskx
+        import equinox as eqx
+        import jax
+
+        u_net = self._make_eqx_model()
+        expected = maskx.select(u_net.module, target="output_layer", leaf_type=eqx.is_array)
+
+        u_net.mask(target="output_layer")
+
+        assert jax.tree_util.tree_leaves(u_net._param_mask) == jax.tree_util.tree_leaves(expected.tree)
+        assert u_net._mask_meta["matched"] == expected.count()
+        assert all(path.startswith("output_layer/") for path in u_net._mask_meta["sample_paths"])
+
+    def test_mask_path_prefix_matches_maskx_selection(self):
+        """mask(path_prefix=...) materializes the same tree as maskx.select."""
+        import maskx
+        import equinox as eqx
+        import jax
+
+        u_net = self._make_eqx_model()
+        expected = maskx.select(u_net.module, path_prefix="output_layer", leaf_type=eqx.is_array)
+
+        u_net.mask(path_prefix="output_layer")
+
+        assert jax.tree_util.tree_leaves(u_net._param_mask) == jax.tree_util.tree_leaves(expected.tree)
+        assert u_net._mask_target is None
+        assert u_net._mask_meta is None
+
+    def test_mask_accepts_maskx_mask_object(self):
+        """mask() accepts a direct maskx.Mask object as param_mask input."""
+        import maskx
+        import equinox as eqx
+        import jax
+
+        u_net = self._make_eqx_model()
+        expected = maskx.select(u_net.module, path_prefix="output_layer", leaf_type=eqx.is_array)
+
+        u_net.mask(expected)
+
+        assert jax.tree_util.tree_leaves(u_net._param_mask) == jax.tree_util.tree_leaves(expected.tree)
+
+    def test_mask_selector_kwargs_reject_manual_mask(self):
+        """mask() should reject mixing a manual mask with selector kwargs."""
+        import jax
+
+        u_net = self._make_eqx_model()
+        all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
+
+        with pytest.raises(ValueError, match="either a manual param_mask"):
+            u_net.mask(all_true, path_prefix="output_layer")
+
     def test_mask_target_then_initialize_consumes_target(self):
         """mask(target=...).initialize(...) stores _initialize_mask and clears transient target state."""
         u_net = self._make_eqx_model()

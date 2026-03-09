@@ -8,25 +8,21 @@ authors = [{ name = "Leon Armbruster", email = "leonarmbruster@iisb.fraunhofer.d
 
 dependencies = [
     "jax",
-    "flax",
     "equinox",
+
+    "maskx",
     "optax",
-    "matplotlib",
-    "graphviz",
+
     "pygmsh",
     "cloudpickle",
-    "pylotte",
-    "nevergrad",
     "einops",
-    "xprof",
-    "paramax"
 ]
 
 [project.optional-dependencies]
 cuda = [
     "jax[cuda12]"
 ]
-dev = ["pytest>=7.0", "black>=22.0", "flake8>=4.0", "mypy>=0.950"]
+dev = ["pytest>=7.0", "black>=22.0", "flake8>=4.0", "mypy>=0.950", "matplotlib", "paramax", "flax", "xprof", "pylotte", "nevergrad"]
 iree = [
     "iree-base-compiler",
     "iree-base-runtime"

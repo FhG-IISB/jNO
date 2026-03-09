@@ -3,14 +3,6 @@ name: Docker Release
 on:
   release:
     types: [published]
-  push:
-    branches:
-      - dockerfile_support
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Image tag override (defaults to the git tag)"
-        required: false
 
 env:
   REGISTRY: ghcr.io
@@ -76,10 +68,6 @@ jobs:
             type=semver,pattern={{version}}
             # release: also tag as latest
             type=raw,value=latest,enable=${{ github.event_name == 'release' }}
-            # branch push: tag as edge-<branch>
-            type=raw,value=edge-${{ github.ref_name }},enable=${{ github.event_name == 'push' }}
-            # manual dispatch override
-            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event.inputs.tag != '' }}
 
       - name: Build and push CPU image
         uses: docker/build-push-action@v5
@@ -129,8 +117,6 @@ jobs:
           tags: |
             type=semver,pattern={{version}}
             type=raw,value=latest,enable=${{ github.event_name == 'release' }}
-            type=raw,value=edge-${{ github.ref_name }},enable=${{ github.event_name == 'push' }}
-            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event.inputs.tag != '' }}
 
       - name: Build and push CUDA image
         uses: docker/build-push-action@v5

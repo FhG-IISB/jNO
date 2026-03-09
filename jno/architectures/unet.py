@@ -5,6 +5,11 @@ from typing import Callable, Sequence, Optional, Tuple
 from .common import BatchNorm, Conv2d as _Conv2dBase, ConvTranspose2d
 
 
+def _default_float_dtype():
+    """Return JAX's current default floating dtype (float32 or float64)."""
+    return jnp.asarray(0.0).dtype
+
+
 # ============================================================
 # Helper functions and conv wrappers
 # ============================================================
@@ -21,7 +26,7 @@ class Conv1dNHWC(eqx.Module):
 
     def __init__(self, in_ch, out_ch, kernel_size, strides=(1,), padding="SAME", use_bias=True, groups=1, *, key):
         fan_in = (in_ch // groups) * kernel_size
-        std = 1.0 / jnp.sqrt(jnp.array(fan_in, dtype=jnp.float32))
+        std = 1.0 / jnp.sqrt(jnp.array(fan_in, dtype=_default_float_dtype()))
         k1, k2 = jax.random.split(key)
         self.weight = jax.random.normal(k1, (kernel_size, in_ch, out_ch)) * std
         self.bias = jnp.zeros(out_ch) if use_bias else None
@@ -51,7 +56,7 @@ class ConvTranspose1d(eqx.Module):
 
     def __init__(self, in_ch, out_ch, kernel_size, strides=(2,), padding="SAME", use_bias=False, *, key):
         fan_in = in_ch * kernel_size
-        std = 1.0 / jnp.sqrt(jnp.array(fan_in, dtype=jnp.float32))
+        std = 1.0 / jnp.sqrt(jnp.array(fan_in, dtype=_default_float_dtype()))
         self.weight = jax.random.normal(key, (kernel_size, out_ch, in_ch)) * std
         self.bias = jnp.zeros(out_ch) if use_bias else None
         self.strides = strides
@@ -81,7 +86,7 @@ class Conv2dNHWC(eqx.Module):
     def __init__(self, in_ch, out_ch, kernel_size, strides=(1, 1), padding="SAME", use_bias=True, groups=1, *, key):
         kh = kw = kernel_size if isinstance(kernel_size, int) else kernel_size[0]
         fan_in = (in_ch // groups) * kh * kw
-        std = 1.0 / jnp.sqrt(jnp.array(fan_in, dtype=jnp.float32))
+        std = 1.0 / jnp.sqrt(jnp.array(fan_in, dtype=_default_float_dtype()))
         k1, k2 = jax.random.split(key)
         self.weight = jax.random.normal(k1, (kh, kw, in_ch, out_ch)) * std
         self.bias = jnp.zeros(out_ch) if use_bias else None
@@ -113,7 +118,7 @@ class Conv3dNHWC(eqx.Module):
     def __init__(self, in_ch, out_ch, kernel_size, strides=(1, 1, 1), padding="SAME", use_bias=True, groups=1, *, key):
         ks = kernel_size if isinstance(kernel_size, int) else kernel_size[0]
         fan_in = (in_ch // groups) * ks**3
-        std = 1.0 / jnp.sqrt(jnp.array(fan_in, dtype=jnp.float32))
+        std = 1.0 / jnp.sqrt(jnp.array(fan_in, dtype=_default_float_dtype()))
         self.weight = jax.random.normal(key, (ks, ks, ks, in_ch, out_ch)) * std
         self.bias = jnp.zeros(out_ch) if use_bias else None
         self.padding = padding
@@ -141,7 +146,7 @@ class ConvTranspose3d(eqx.Module):
     def __init__(self, in_ch, out_ch, kernel_size, strides=(2, 2, 2), padding="SAME", use_bias=False, *, key):
         ks = kernel_size if isinstance(kernel_size, int) else kernel_size[0]
         fan_in = in_ch * ks**3
-        std = 1.0 / jnp.sqrt(jnp.array(fan_in, dtype=jnp.float32))
+        std = 1.0 / jnp.sqrt(jnp.array(fan_in, dtype=_default_float_dtype()))
         self.weight = jax.random.normal(key, (ks, ks, ks, out_ch, in_ch)) * std
         self.bias = jnp.zeros(out_ch) if use_bias else None
         self.strides = strides

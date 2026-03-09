@@ -27,6 +27,11 @@ import equinox as eqx
 from .linear import Linear
 
 
+def _default_float_dtype():
+    """Return JAX's current default floating dtype (float32 or float64)."""
+    return jnp.asarray(0.0).dtype
+
+
 # =====================================================================
 # Equinox LoRA (for jNO Linear layers)
 # =====================================================================
@@ -116,9 +121,10 @@ class FlaxLoRAWrapper(eqx.Module):
         if self.base.post_fn is not None:
             result = self.base.post_fn(result)
 
-        if param_dtype is not None and param_dtype != jnp.float32:
+        out_dtype = _default_float_dtype()
+        if param_dtype is not None and param_dtype != out_dtype:
             result = jax.tree_util.tree_map(
-                lambda x: x.astype(jnp.float32) if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating) else x,
+                lambda x: x.astype(out_dtype) if hasattr(x, "dtype") and jnp.issubdtype(x.dtype, jnp.floating) else x,
                 result,
             )
         return result
