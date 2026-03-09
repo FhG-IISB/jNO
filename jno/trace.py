@@ -5,6 +5,7 @@ Variables are placeholders that get filled during solve iterations.
 Operations trace computations and return callable placeholders.
 """
 
+from __future__ import annotations
 from typing import List, Callable, Any, Union, Dict, Optional, Type
 from .tuner import Arch, ArchSpace
 import jax.numpy as jnp
@@ -73,76 +74,76 @@ class Placeholder:
     """
 
     # -- identity-based equality so Placeholders work in sets/dicts -----------
-    def __eq__(self, other):
+    def __eq__(self, other) -> bool:
         return self is other
 
-    def __ne__(self, other):
+    def __ne__(self, other) -> bool:
         return self is not other
 
-    def __hash__(self):
+    def __hash__(self) -> int:
         return id(self)
 
     # -- symbolic comparison operators (return traced FunctionCall nodes) ------
-    def equal(self, other):
+    def equal(self, other) -> FunctionCall:
         """Element-wise symbolic equality (traced, not Python ``==``)."""
         return FunctionCall(jnp.equal, [self, other])
 
-    def not_equal(self, other):
+    def not_equal(self, other) -> FunctionCall:
         """Element-wise symbolic inequality (traced, not Python ``!=``)."""
         return FunctionCall(jnp.not_equal, [self, other])
 
-    def __gt__(self, other):
+    def __gt__(self, other) -> FunctionCall:
         return FunctionCall(jnp.greater, [self, other])
 
-    def __lt__(self, other):
+    def __lt__(self, other) -> FunctionCall:
         return FunctionCall(jnp.less, [self, other])
 
-    def __ge__(self, other):
+    def __ge__(self, other) -> FunctionCall:
         return FunctionCall(jnp.greater_equal, [self, other])
 
-    def __le__(self, other):
+    def __le__(self, other) -> FunctionCall:
         return FunctionCall(jnp.less_equal, [self, other])
 
-    def _wrap(self, other):
+    def _wrap(self, other) -> Literal:
         """Wrap non-Placeholder types."""
         if isinstance(other, Placeholder):
             return other
         return Literal(other)
 
-    def __add__(self, other):
+    def __add__(self, other) -> BinaryOp:
         return BinaryOp("+", self, self._wrap(other))
 
-    def __radd__(self, other):
+    def __radd__(self, other) -> BinaryOp:
         return BinaryOp("+", self._wrap(other), self)
 
-    def __sub__(self, other):
+    def __sub__(self, other) -> BinaryOp:
         return BinaryOp("-", self, self._wrap(other))
 
-    def __rsub__(self, other):
+    def __rsub__(self, other) -> BinaryOp:
         return BinaryOp("-", self._wrap(other), self)
 
-    def __mul__(self, other):
+    def __mul__(self, other) -> BinaryOp:
         return BinaryOp("*", self, self._wrap(other))
 
-    def __rmul__(self, other):
+    def __rmul__(self, other) -> BinaryOp:
         return BinaryOp("*", self._wrap(other), self)
 
-    def __truediv__(self, other):
+    def __truediv__(self, other) -> BinaryOp:
         return BinaryOp("/", self, self._wrap(other))
 
-    def __rtruediv__(self, other):
+    def __rtruediv__(self, other) -> BinaryOp:
         return BinaryOp("/", self._wrap(other), self)
 
-    def __neg__(self):
+    def __neg__(self) -> BinaryOp:
         return BinaryOp("*", Literal(-1.0), self)
 
-    def __pow__(self, other):
+    def __pow__(self, other) -> BinaryOp:
         return BinaryOp("**", self, self._wrap(other))
 
-    def __rpow__(self, other):
+    def __rpow__(self, other) -> BinaryOp:
         return BinaryOp("**", self._wrap(other), self)
 
-    def __getitem__(self, key):
+    def __getitem__(self, key) -> FunctionCall:
         if not isinstance(key, tuple):
             key = (key,)
         concrete_key = tuple(None if k is None else k for k in key)
@@ -155,7 +156,7 @@ class Placeholder:
             self._auto_op = OperationDef(self)
         return self._auto_op(*args)
 
-    def __matmul__(self, other):
+    def __matmul__(self, other) -> FunctionCall:
         """Matrix multiplication: self @ other"""
         other = self._wrap(other)
 
@@ -166,7 +167,7 @@ class Placeholder:
         # eager path (other is ndarray)
         return FunctionCall(lambda a: a @ other, [self])
 
-    def __rmatmul__(self, other):
+    def __rmatmul__(self, other) -> FunctionCall:
         """Matrix multiplication: other @ self"""
         other = self._wrap(other)
 
@@ -175,7 +176,7 @@ class Placeholder:
 
         return FunctionCall(lambda b: other @ b, [self])
 
-    def reshape(self, *shape):
+    def reshape(self, *shape) -> FunctionCall:
         """Reshape this placeholder to a new shape."""
         if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
             shape = tuple(shape[0])
@@ -258,42 +259,42 @@ class Placeholder:
         return Tracker(self, interval)
 
     @property
-    def shape(self):
+    def shape(self) -> FunctionCall:
         return FunctionCall(lambda x: jnp.ones(x.shape, dtype="bool"), [self], "shape", True)
 
     @property
-    def mean(self):
+    def mean(self) -> FunctionCall:
         return FunctionCall(lambda x: jnp.squeeze(x.mean()), [self], "mean", True)
 
     @property
-    def sum(self):
+    def sum(self) -> FunctionCall:
         return FunctionCall(lambda x: jnp.squeeze(jnp.sum(x)), [self], "sum", True)
 
     @property
-    def min(self):
+    def min(self) -> FunctionCall:
         return FunctionCall(lambda x: jnp.squeeze(jnp.min(x)), [self], "min", True)
 
     @property
-    def max(self):
+    def max(self) -> FunctionCall:
         return FunctionCall(lambda x: jnp.squeeze(jnp.max(x)), [self], "max", True)
 
     @property
-    def std(self):
+    def std(self) -> FunctionCall:
         return FunctionCall(lambda x: jnp.squeeze(jnp.std(x)), [self], "std", True)
 
     @property
-    def mse(self):
+    def mse(self) -> FunctionCall:
         def fn(x):
             return jnp.squeeze(jnp.mean(jnp.square(x)))
 
         return FunctionCall(fn, [self], "mse", True)
 
     @property
-    def mae(self):
+    def mae(self) -> FunctionCall:
         return FunctionCall(lambda x: jnp.squeeze(jnp.mean(jnp.abs(x))), [self], "mae", True)
 
     @property
-    def T(self):
+    def T(self) -> FunctionCall:
         return FunctionCall(lambda x: x.T, [self], "transpose", True)
 
     # ------------------------------------------------------------------
@@ -366,6 +367,16 @@ class Placeholder:
         return Hessian(self, [variable], scheme, trace=True)
 
 
+class Literal(Placeholder):
+    """Concrete scalar/array embedded in the trace (no trainable params)."""
+
+    def __init__(self, value):
+        self.value = jnp.asarray(value)
+
+    def __repr__(self):
+        return f"Literal({self.value})"
+
+
 class FunctionCall(Placeholder):
     """Call to a pure function over traced args."""
 
@@ -395,16 +406,6 @@ class FunctionCall(Placeholder):
     def __call__(self, args):
         """Return a new FunctionCall with the given args."""
         return self.copy_with_args([args])
-
-
-class Literal(Placeholder):
-    """Concrete scalar/array embedded in the trace (no trainable params)."""
-
-    def __init__(self, value):
-        self.value = jnp.asarray(value)
-
-    def __repr__(self):
-        return f"Literal({self.value})"
 
 
 class ConstantNamespace:

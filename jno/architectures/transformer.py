@@ -6,6 +6,11 @@ from .linear import Linear
 from typing import Any, Optional
 
 
+def _default_float_dtype():
+    """Return JAX's current default floating dtype (float32 or float64)."""
+    return jnp.asarray(0.0).dtype
+
+
 class PositionalEncoding(eqx.Module):
     max_len: int = eqx.field(static=True)
     embed_dim: int = eqx.field(static=True)
@@ -16,7 +21,7 @@ class PositionalEncoding(eqx.Module):
 
     def __call__(self, inputs: jnp.ndarray, **kwargs) -> jnp.ndarray:
         seq_len = inputs.shape[1]
-        position = jnp.arange(self.max_len, dtype=jnp.float32)[jnp.newaxis, :]
+        position = jnp.arange(self.max_len, dtype=_default_float_dtype())[jnp.newaxis, :]
         div_term = jnp.exp(jnp.arange(0, self.embed_dim, 2) * -(jnp.log(10000.0) / self.embed_dim))
         pe = jnp.zeros((self.max_len, self.embed_dim))
         pe = pe.at[:, 0::2].set(jnp.sin(position.T * div_term))

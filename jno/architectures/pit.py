@@ -7,6 +7,11 @@ import equinox as eqx
 from .linear import Linear
 
 
+def _default_float_dtype():
+    """Return JAX's current default floating dtype (float32 or float64)."""
+    return jnp.asarray(0.0).dtype
+
+
 def pairwise_dist(res1x: int, res1y: int, res2x: int, res2y: int) -> jnp.ndarray:
     """
     Compute pairwise squared distances between two grids.
@@ -36,7 +41,7 @@ def pairwise_dist(res1x: int, res1y: int, res2x: int, res2y: int) -> jnp.ndarray
     diff = grid1[:, None, :] - grid2[None, :, :]
     dist = jnp.sum(diff**2, axis=-1)  # [N1, N2]
 
-    return (dist / 2.0).astype(jnp.float32)
+    return (dist / 2.0).astype(_default_float_dtype())
 
 
 def pairwise_dist_from_coords(coords1: jnp.ndarray, coords2: jnp.ndarray) -> jnp.ndarray:
@@ -52,7 +57,7 @@ def pairwise_dist_from_coords(coords1: jnp.ndarray, coords2: jnp.ndarray) -> jnp
     """
     diff = coords1[:, None, :] - coords2[None, :, :]
     dist = jnp.sum(diff**2, axis=-1)
-    return (dist / 2.0).astype(jnp.float32)
+    return (dist / 2.0).astype(_default_float_dtype())
 
 
 class PiTMLP(eqx.Module):
