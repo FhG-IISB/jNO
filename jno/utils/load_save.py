@@ -1,6 +1,5 @@
 from __future__ import annotations
 import struct
-from pylotte.signed_pickle import SignedPickle
 import cloudpickle
 from ..core import core
 from ..domain import domain
@@ -26,7 +25,10 @@ def save(instance, filepath: str, public_key_path: str | None = None, private_ke
         private_key_path = get_rsa_private_key()
 
     if public_key_path is not None and private_key_path is not None:
-
+        try:
+            from pylotte.signed_pickle import SignedPickle
+        except ImportError as e:
+            raise ImportError("pylotte is required for signed save/load functionality. " "Install with `pip install pylotte` or `pip install jno[dev]`") from e
         signer = SignedPickle(
             public_key_path=public_key_path,
             private_key_path=private_key_path,
@@ -82,6 +84,10 @@ def load(
     if public_key_path is None and signature_path is not None:
         public_key_path = get_rsa_public_key()
     if public_key_path is not None and signature_path is not None:
+        try:
+            from pylotte.signed_pickle import SignedPickle
+        except ImportError as e:
+            raise ImportError("pylotte is required for signed save/load functionality. " "Install with `pip install pylotte` or `pip install jno[dev]`") from e
         loader = SignedPickle(public_key_path=public_key_path, serializer=cloudpickle)
         instance = loader.safe_load(filepath, signature_path)
     else:

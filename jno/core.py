@@ -405,7 +405,7 @@ class core:
         Returns a function with signature::
 
             step(trainable, opt_states, rng, context, epoch, prev_losses)
-                -> (trainable, opt_states, rng, total_loss, individual_losses)
+                -> (trainable, opt_states, rng, next_epoch, total_loss, individual_losses)
 
         The training loop is a plain Python ``for`` loop which:
         * enables buffer donation at every step boundary,
@@ -468,7 +468,8 @@ class core:
                 trainable = {**trainable, lid: optax.apply_updates(model_params, updates)}
                 opt_states = {**opt_states, k: new_state}
 
-            return trainable, opt_states, rng, total_loss, individual_losses
+            next_epoch = start_epoch + jnp.asarray(1, dtype=start_epoch.dtype)
+            return trainable, opt_states, rng, next_epoch, total_loss, individual_losses
 
         return step
 
@@ -1049,16 +1050,15 @@ class core:
                 inner_steps = 1
             else:
                 _K = inner_steps
-                _nc = self.n_constraints
                 _single = step_fn
 
                 def step_fn(trainable, opt_states, rng, context, start_epoch, prev_losses):
                     def body(i, carry):
-                        tr, opt, rn, _total, _indv = carry
-                        tr, opt, rn, total, indv = _single(tr, opt, rn, context, start_epoch + i, _indv)
-                        return tr, opt, rn, total, indv
+                        tr, opt, rn, ep, _total, _indv = carry
+                        tr, opt, rn, ep_next, total, indv = _single(tr, opt, rn, context, ep, _indv)
+                        return tr, opt, rn, ep_next, total, indv
 
-                    init = (trainable, opt_states, rng, jnp.zeros(()), prev_losses)
+                    init = (trainable, opt_states, rng, start_epoch, jnp.zeros(()), prev_losses)
                     return jax.lax.fori_loop(0, _K, body, init)
 
         # Optional: build JIT-compiled tracker function
@@ -1120,6 +1120,7 @@ class core:
                 jax.tree_util.tree_map(_leaf_sharding, trainable),  # trainable
                 jax.tree_util.tree_map(_leaf_sharding, opt_states),  # opt_states
                 replicated,  # rng
+                replicated,  # epoch (scalar)
                 replicated,  # total_loss
                 replicated,  # individual_losses  (→ prev_losses next step)
             )
@@ -1157,6 +1158,11 @@ class core:
                 prev_losses,
             ).compile()
 
+            # Pre-compile tracker JIT as well so profile windows focus on
+            # steady-state train-step behavior instead of one-time compile work.
+            if has_trackers:
+                _ = jit_track.lower(trainable, trace_context, self.rng).compile()
+
             # Warmup: run a few real dispatches on throw-away copies so
             # the GPU's buffer allocator, CUDA kernel instruction cache,
             # and cuDNN workspaces are fully initialised before any
@@ -1165,12 +1171,16 @@ class core:
             _tw = jax.tree_util.tree_map(jnp.copy, trainable)
             _ow = jax.tree_util.tree_map(jnp.copy, opt_states)
             _rw = jnp.copy(self.rng)
+            _ew = jax.device_put(jnp.int32(0), replicated)
             _pl = jax.device_put(jnp.zeros(self.n_constraints), replicated)
-            _ep0 = jax.device_put(jnp.int32(0), replicated)
             for _ in range(3):
-                _tw, _ow, _rw, _, _pl = jit_step(_tw, _ow, _rw, trace_context, _ep0, _pl)
+                _tw, _ow, _rw, _ew, _, _pl = jit_step(_tw, _ow, _rw, trace_context, _ew, _pl)
+
+            if has_trackers:
+                _ = jit_track(_tw, trace_context, _rw)
+
             jax.effects_barrier()
-            del _tw, _ow, _rw, _pl, _ep0
+            del _tw, _ow, _rw, _ew, _pl
 
             # ── 8. Training loop ──
             # hw_monitor = HardwareMonitor(logger=self.log, interval=0.5)
@@ -1189,7 +1199,6 @@ class core:
             rng_np = np.random.default_rng(int(jax.device_get(self.rng[0])))
             st = time.time()
             epoch_jnp = jax.device_put(jnp.int32(0), replicated)
-            _epoch_step = jax.device_put(jnp.int32(inner_steps), replicated)
 
             n_outer = epochs // inner_steps
             if epochs % inner_steps != 0:
@@ -1203,156 +1212,169 @@ class core:
             gc.disable()  # prevent cyclic GC from interrupting the hot loop;
             # JAX pytrees/dicts are acyclic so refcounting handles them correctly
 
-            _profile_steps = 50 if profile else 0  # number of outer steps to profile; 0 = disabled
-            _profiling_active = _profile_steps > 0
-            _profile_ctx = jax.profiler.trace(f"{self.log.path}/traces") if _profiling_active else nullcontext()
-            # Re-evaluate _trace now that we know whether we'll open a session
-            # if _profiling_active:
-            #    _trace = jax.profiler.TraceAnnotation
-            # (else: _trace is already nullcontext lambda from above)
+            # Profile a short steady-state window: skip the very first outer
+            # step (which can still include one-time runtime setup), then
+            # capture a handful of outer steps to keep traces focused.
+            _profile_skip_steps = 1 if profile else 0
+            _profile_steps = min(50, max(0, n_outer - _profile_skip_steps)) if profile else 0
+            _profile_start = _profile_skip_steps
+            _profile_stop = _profile_start + _profile_steps
+            _profile_active = False
+            _profile_ctx = nullcontext()
 
-            with _profile_ctx:
-                for outer_epoch in range(n_outer):
-                    epoch = outer_epoch * inner_steps  # first epoch of this outer step
+            for outer_epoch in range(n_outer):
+                if (not _profile_active) and _profile_steps > 0 and outer_epoch == _profile_start:
+                    _profile_ctx = jax.profiler.trace(f"{self.log.path}/traces")
+                    _profile_ctx.__enter__()
+                    _profile_active = True
 
-                    # --- adaptive host-side resampling at outer-step boundaries ---
-                    if has_resampling and strategies:
-                        due = [(tag, strat) for tag, strat in strategies.items() if strat.should_resample(epoch)]
-                        if due:
-                            full_models = eqx.combine(trainable, frozen_arrays, static)
-                            if _paramax is not None:
-                                full_models = _paramax.unwrap(full_models)
+                epoch = outer_epoch * inner_steps  # first epoch of this outer step
 
-                            residuals_all = self.compiled_resample_constraints_fn(
-                                full_models,
-                                full_context,
-                                batchsize=None,
-                                key=self.rng,
-                                min_consecutive=min_consecutive,
-                            )
+                # --- adaptive host-side resampling at outer-step boundaries ---
+                if has_resampling and strategies:
+                    due = [(tag, strat) for tag, strat in strategies.items() if strat.should_resample(epoch)]
+                    if due:
+                        full_models = eqx.combine(trainable, frozen_arrays, static)
+                        if _paramax is not None:
+                            full_models = _paramax.unwrap(full_models)
 
-                            updated = False
-                            for tag, strategy in due:
-                                tag_points = full_context.get(tag, None)
-                                if tag_points is None:
-                                    self.log.warning(f"Resampling skipped for tag '{tag}': tag not found in context")
-                                    continue
+                        residuals_all = self.compiled_resample_constraints_fn(
+                            full_models,
+                            full_context,
+                            batchsize=None,
+                            key=self.rng,
+                            min_consecutive=min_consecutive,
+                        )
 
-                                # Current strategies are designed for steady-state point
-                                # sets represented as (B, 1, N, D). Keep T fixed at 1.
-                                if not hasattr(tag_points, "ndim") or tag_points.ndim != 4 or tag_points.shape[1] != 1:
-                                    self.log.warning(f"Resampling skipped for tag '{tag}': expected point shape (B, 1, N, D), " f"got {tuple(tag_points.shape)}")
-                                    continue
+                        updated = False
+                        for tag, strategy in due:
+                            tag_points = full_context.get(tag, None)
+                            if tag_points is None:
+                                self.log.warning(f"Resampling skipped for tag '{tag}': tag not found in context")
+                                continue
 
-                                points_bn = jnp.asarray(tag_points[:, 0, :, :])
-                                n_batch, n_points = points_bn.shape[0], points_bn.shape[1]
+                            # Current strategies are designed for steady-state point
+                            # sets represented as (B, 1, N, D). Keep T fixed at 1.
+                            if not hasattr(tag_points, "ndim") or tag_points.ndim != 4 or tag_points.shape[1] != 1:
+                                self.log.warning(f"Resampling skipped for tag '{tag}': expected point shape (B, 1, N, D), " f"got {tuple(tag_points.shape)}")
+                                continue
 
-                                idxs = tag_to_constraint_indices.get(tag, [])
-                                if not idxs:
-                                    self.log.warning(f"Resampling skipped for tag '{tag}': no constraints associated with this tag")
-                                    continue
+                            points_bn = jnp.asarray(tag_points[:, 0, :, :])
+                            n_batch, n_points = points_bn.shape[0], points_bn.shape[1]
 
-                                scored = []
-                                for idx in idxs:
-                                    collapsed = _collapse_residual_for_tag(residuals_all[idx], n_points, n_batch)
-                                    if collapsed is not None:
-                                        scored.append(collapsed)
+                            idxs = tag_to_constraint_indices.get(tag, [])
+                            if not idxs:
+                                self.log.warning(f"Resampling skipped for tag '{tag}': no constraints associated with this tag")
+                                continue
 
-                                if not scored:
-                                    self.log.warning(f"Resampling skipped for tag '{tag}': no compatible pointwise residuals")
-                                    continue
+                            scored = []
+                            for idx in idxs:
+                                collapsed = _collapse_residual_for_tag(residuals_all[idx], n_points, n_batch)
+                                if collapsed is not None:
+                                    scored.append(collapsed)
 
-                                combined = jnp.mean(jnp.stack(scored, axis=0), axis=0)  # (B, N)
+                            if not scored:
+                                self.log.warning(f"Resampling skipped for tag '{tag}': no compatible pointwise residuals")
+                                continue
 
-                                new_batches = []
-                                for b in range(n_batch):
-                                    self.rng, rs_key = jax.random.split(self.rng)
-                                    b_key = jax.random.fold_in(rs_key, b)
-                                    new_batches.append(
-                                        strategy.resample(
-                                            points_bn[b],
-                                            combined[b],
-                                            self.domain,
-                                            tag,
-                                            epoch,
-                                            b_key,
-                                        )
+                            combined = jnp.mean(jnp.stack(scored, axis=0), axis=0)  # (B, N)
+
+                            new_batches = []
+                            for b in range(n_batch):
+                                self.rng, rs_key = jax.random.split(self.rng)
+                                b_key = jax.random.fold_in(rs_key, b)
+                                new_batches.append(
+                                    strategy.resample(
+                                        points_bn[b],
+                                        combined[b],
+                                        self.domain,
+                                        tag,
+                                        epoch,
+                                        b_key,
                                     )
-
-                                new_points_bn = jnp.stack(new_batches, axis=0)
-                                full_context[tag] = new_points_bn[:, None, :, :]
-                                self.domain.context[tag] = np.asarray(full_context[tag])
-                                strategy.update_epoch(epoch)
-                                self.log.info(f"Resampled {tag} points (epoch {epoch + 1})")
-                                updated = True
-
-                            if updated:
-                                # Keep canonical domain_data in sync with updated points.
-                                self.domain_data = self.prepare_domain_data(self.domain)
-                                full_context = self.domain_data.context
-
-                                host_context_new, on_device_context_new, total_samples = _rebuild_runtime_contexts(
-                                    full_context,
-                                    offload_data,
-                                    n_devices,
-                                    total_samples if offload_data else 0,
                                 )
-                                if offload_data:
-                                    host_context = host_context_new
-                                else:
-                                    on_device_context = on_device_context_new
 
-                    # --- prepare context for this step ---
+                            new_points_bn = jnp.stack(new_batches, axis=0)
+                            full_context[tag] = new_points_bn[:, None, :, :]
+                            self.domain.context[tag] = np.asarray(full_context[tag])
+                            strategy.update_epoch(epoch)
+                            self.log.info(f"Resampled {tag} points (epoch {epoch + 1})")
+                            updated = True
 
-                    if offload_data:
-                        if host_context is None:
-                            raise RuntimeError("offload_data=True but host_context is not available")
-                        indices = rng_np.choice(total_samples, batchsize, replace=False)
-                        batch_np = {k: (v if k == "__time__" else (np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices])) for k, v in host_context.items()}
-                        context = self._shard_data(jax.device_put(batch_np))
+                        if updated:
+                            # Keep canonical domain_data in sync with updated points.
+                            self.domain_data = self.prepare_domain_data(self.domain)
+                            full_context = self.domain_data.context
+
+                            host_context_new, on_device_context_new, total_samples = _rebuild_runtime_contexts(
+                                full_context,
+                                offload_data,
+                                n_devices,
+                                total_samples if offload_data else 0,
+                            )
+                            if offload_data:
+                                host_context = host_context_new
+                            else:
+                                on_device_context = on_device_context_new
+
+                # --- prepare context for this step ---
+                if offload_data:
+                    if host_context is None:
+                        raise RuntimeError("offload_data=True but host_context is not available")
+                    indices = rng_np.choice(total_samples, batchsize, replace=False)
+                    batch_np = {k: (v if k == "__time__" else (np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices])) for k, v in host_context.items()}
+                    context = self._shard_data(jax.device_put(batch_np))
+                else:
+                    context = on_device_context
+
+                # --- step ---
+                (trainable, opt_states, self.rng, epoch_jnp, total_loss, individual_losses) = jit_step(
+                    trainable,
+                    opt_states,
+                    self.rng,
+                    context,
+                    epoch_jnp,
+                    prev_losses,
+                )
+
+                prev_losses = individual_losses
+
+                # Stop profiling after the requested steady-state window.
+                if _profile_active and outer_epoch + 1 >= _profile_stop:
+                    _profile_ctx.__exit__(None, None, None)
+                    _profile_active = False
+                    _profile_ctx = nullcontext()
+
+                # --- logging: sync only at print interval ---
+                should_print = (outer_epoch % print_rate == 0) or (outer_epoch == n_outer - 1)
+                if should_print:
+                    losses_np, total_np_arr = jax.device_get((individual_losses, total_loss))
+                    losses_np = np.asarray(losses_np)
+                    total_np = float(total_np_arr)
+
+                    displayed_epoch = epoch + inner_steps - 1  # last epoch completed in this outer step
+                    log_epochs.append(displayed_epoch)
+                    log_losses.append(losses_np)
+                    log_total_loss.append(total_np)
+                    log_timestamps.append(time.time())
+
+                    # Trackers
+                    track_stats_np = None
+                    if has_trackers and any(outer_epoch % (max(1, intv // inner_steps)) == 0 for intv in tracker_intervals):
+                        track_vals = jit_track(trainable, context, self.rng)
+                        track_stats_np = [float(v) for v in jax.device_get(track_vals)]
+                        log_track_stats.append(track_stats_np)
+
+                    # Progress line
+                    loss_strs = " | ".join(f"C{i}: {l:>10.4e}" for i, l in enumerate(losses_np))
+                    if track_stats_np is not None:
+                        track_strs = " | ".join(f"T{i}: {v:>10.4e}" for i, v in enumerate(track_stats_np))
+                        self.log.info(f"Epoch {displayed_epoch:>6}/{epochs}| " f"L:{total_np:>10.4e} | {loss_strs} | {track_strs}")
                     else:
-                        context = on_device_context
+                        self.log.info(f"Epoch {displayed_epoch:>6}/{epochs}| " f"L:{total_np:>10.4e} | {loss_strs}")
 
-                    (trainable, opt_states, self.rng, total_loss, individual_losses) = jit_step(trainable, opt_states, self.rng, context, epoch_jnp, prev_losses)
-
-                    epoch_jnp = epoch_jnp + _epoch_step
-                    prev_losses = individual_losses
-
-                    # Stop profiling after the requested number of steps to avoid
-                    # the in-memory trace buffer growing and adding per-step overhead.
-                    if _profiling_active and outer_epoch + 1 >= _profile_steps:
-                        _profiling_active = False
-                        _trace = lambda name, **_: nullcontext()  # noqa: E731
-                        _profile_ctx.__exit__(None, None, None)
-                        _profile_ctx = nullcontext()
-
-                    # --- logging: sync only at print interval ---
-                    should_print = (outer_epoch % print_rate == 0) or (outer_epoch == n_outer - 1)
-                    if should_print:
-                        losses_np, total_np_arr = jax.device_get((individual_losses, total_loss))
-                        losses_np = np.asarray(losses_np)
-                        total_np = float(total_np_arr)
-
-                        displayed_epoch = epoch + inner_steps - 1  # last epoch completed in this outer step
-                        log_epochs.append(displayed_epoch)
-                        log_losses.append(losses_np)
-                        log_total_loss.append(total_np)
-                        log_timestamps.append(time.time())
-
-                        # Trackers
-                        track_stats_np = None
-                        if has_trackers and any(outer_epoch % (max(1, intv // inner_steps)) == 0 for intv in tracker_intervals):
-                            track_vals = jit_track(trainable, context, self.rng)
-                            track_stats_np = [float(v) for v in jax.device_get(track_vals)]
-                            log_track_stats.append(track_stats_np)
-
-                        # Progress line
-                        loss_strs = " | ".join(f"C{i}: {l:>10.4e}" for i, l in enumerate(losses_np))
-                        if track_stats_np is not None:
-                            track_strs = " | ".join(f"T{i}: {v:>10.4e}" for i, v in enumerate(track_stats_np))
-                            self.log.info(f"Epoch {displayed_epoch:>6}/{epochs}| " f"L:{total_np:>10.4e} | {loss_strs} | {track_strs}")
-                        else:
-                            self.log.info(f"Epoch {displayed_epoch:>6}/{epochs}| " f"L:{total_np:>10.4e} | {loss_strs}")
+            if _profile_active:
+                _profile_ctx.__exit__(None, None, None)
 
             et = time.time()
             # hw_monitor.stop(logger=self.log)
