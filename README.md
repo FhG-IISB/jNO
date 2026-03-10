@@ -6,12 +6,21 @@
     <a href="https://fhg-iisb.github.io/jNO_docs/">
         <img src="https://img.shields.io/badge/docs-GitHub%20Pages-0aa?style=for-the-badge" alt="Docs"/>
     </a>
+    <a href="https://github.com/FhG-IISB/jno/actions/workflows/python-package.yml">
+        <img src="https://img.shields.io/github/actions/workflow/status/FhG-IISB/jno/python-package.yml?branch=main&style=for-the-badge&label=tests" alt="Tests"/>
+    </a>
     <a href="LICENSE">
         <img src="https://img.shields.io/badge/license-MIT-2ea44f?style=for-the-badge" alt="License"/>
     </a>
     <a href="CITATION.cff">
         <img src="https://img.shields.io/badge/cite-CITATION.cff-6b5b95?style=for-the-badge" alt="Citation"/>
     </a>
+</p>
+
+<p align="left">
+    <img src="https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue?style=for-the-badge" alt="Python 3.10 3.11 3.12"/>
+    <img src="https://img.shields.io/badge/platform-ubuntu%20%7C%20windows%20%7C%20macOS-1f6feb?style=for-the-badge" alt="Linux Windows macOS"/>
+    <img src="https://img.shields.io/badge/docker-image%20available-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker image available"/>
 </p>
 
 ## Install
