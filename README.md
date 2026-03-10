@@ -2,25 +2,31 @@
   <img src="assets/logo.png" alt="jNO logo" width="200"/>
 </p>
 
+<p align="center">
+    <a href="https://fhg-iisb.github.io/jNO_docs/">
+        <img src="https://img.shields.io/badge/docs-GitHub%20Pages-0aa?style=for-the-badge" alt="Docs"/>
+    </a>
+</p>
+
 ## 📖 Documentation
 
-For comprehensive documentation, see the **[Docs Home](docs/Home.md)**.
+For comprehensive documentation, see the **[Docs Home](https://fhg-iisb.github.io/jNO_docs/)**.
 
 | Page | Description |
 |------|-------------|
-| [Installation](docs/wiki/Installation.md) | Setup guide |
-| [Architecture Guide](docs/wiki/Architecture-Guide.md) | All supported neural operator architectures |
-| [Domain and Meshing](docs/wiki/Domain-and-Meshing.md) | Domain definition and mesh construction |
-| [Training and Solving](docs/wiki/Training-and-Solving.md) | Core solver, optimizers, schedules |
-| [jno.numpy API](docs/wiki/jno.numpy-API.md) | Math functions and differential operators |
-| [Operator Learning](docs/wiki/Operator-Learning.md) | Operator learning with tensor data |
-| [Custom Models](docs/wiki/Custom-Models.md) | Wrapping Flax modules and KAN networks |
-| [LoRA and Fine-Tuning](docs/wiki/LoRA-and-Fine-Tuning.md) | Parameter-efficient fine-tuning |
-| [Architecture Search](docs/wiki/Architecture-Search.md) | Automated hyperparameter tuning |
-| [Logging and Callbacks](docs/wiki/Logging-and-Callbacks.md) | Logger, callbacks, debugging |
-| [Parallelism](docs/wiki/Parallelism.md) | Multi-GPU data and model parallelism |
-| [Examples](docs/wiki/Examples.md) | Walkthrough of included examples |
-| [FAQ](docs/wiki/FAQ.md) | Troubleshooting and common questions |
+| [Installation](https://fhg-iisb.github.io/jNO_docs/wiki/Installation.html) | Setup guide |
+| [Architecture Guide](https://fhg-iisb.github.io/jNO_docs/wiki/Architecture-Guide.html) | All supported neural operator architectures |
+| [Domain and Meshing](https://fhg-iisb.github.io/jNO_docs/wiki/Domain-and-Meshing.html) | Domain definition and mesh construction |
+| [Training and Solving](https://fhg-iisb.github.io/jNO_docs/wiki/Training-and-Solving.html) | Core solver, optimizers, schedules |
+| [jno.numpy API](https://fhg-iisb.github.io/jNO_docs/wiki/jno.numpy-API.html) | Math functions and differential operators |
+| [Operator Learning](https://fhg-iisb.github.io/jNO_docs/wiki/Operator-Learning.html) | Operator learning with tensor data |
+| [Custom Models](https://fhg-iisb.github.io/jNO_docs/wiki/Custom-Models.html) | Wrapping Flax modules and KAN networks |
+| [LoRA and Fine-Tuning](https://fhg-iisb.github.io/jNO_docs/wiki/LoRA-and-Fine-Tuning.html) | Parameter-efficient fine-tuning |
+| [Architecture Search](https://fhg-iisb.github.io/jNO_docs/wiki/Architecture-Search.html) | Automated hyperparameter tuning |
+| [Logging and Callbacks](https://fhg-iisb.github.io/jNO_docs/wiki/Logging-and-Callbacks.html) | Logger, callbacks, debugging |
+| [Parallelism](https://fhg-iisb.github.io/jNO_docs/wiki/Parallelism.html) | Multi-GPU data and model parallelism |
+| [Examples](https://fhg-iisb.github.io/jNO_docs/wiki/Examples.html) | Walkthrough of included examples |
+| [FAQ](https://fhg-iisb.github.io/jNO_docs/wiki/FAQ.html) | Troubleshooting and common questions |
 
 ## [Install](https://docs.astral.sh/uv/getting-started/installation/)
 `uv` installs and manages environments in your user directory, so you can typically run everything locally **without sudo**.
