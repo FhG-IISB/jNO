@@ -14,10 +14,6 @@
     </a>
 </p>
 
-## jNO
-
-JAX library for neural operator and foundation model training.
-
 ## Install
 
 ```bash
