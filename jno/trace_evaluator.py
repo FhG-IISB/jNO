@@ -66,12 +66,13 @@ class TraceEvaluator:
     class _EvalCtx:
         """Bundles the read-only state that every handler needs."""
 
-        __slots__ = ("context", "var_bindings", "key")
+        __slots__ = ("context", "var_bindings", "key","active_region")
 
-        def __init__(self, context, var_bindings, key):
+        def __init__(self, context, var_bindings, key, active_region=None):
             self.context = context
             self.var_bindings = var_bindings
             self.key = key
+            self.active_region = active_region
 
     # ------------------------------------------------------------------
     # Public entry-point
@@ -82,12 +83,14 @@ class TraceEvaluator:
         context: Dict[str, jnp.ndarray] = None,
         var_bindings: Dict = None,
         key=None,
+        active_region=None,
     ) -> jnp.ndarray:
         """Evaluate expression for a SINGLE batch (no batch dimension)."""
         ctx = self._EvalCtx(
             context=context or {},
             var_bindings=var_bindings or {},
             key=key,
+            active_region=None,
         )
         return self._dispatch(expr, ctx)
 
@@ -132,6 +135,7 @@ class TraceEvaluator:
             context=context or {},
             var_bindings=var_bindings or {},
             key=key,
+            active_region=None,
         )
         lines: list = []
         self._trace_visit(expr, ctx, depth=0, lines=lines, seen=set())
@@ -285,7 +289,13 @@ class TraceEvaluator:
         """Look up handler in the dispatch table and call it."""
         for node_type, method_name in self._HANDLERS:
             if isinstance(expr, node_type):
+                # Assembly defines the active variational bucket for its subtree.
+                if isinstance(expr, Assembly):
+                    new_ctx = self._EvalCtx(ctx.context, ctx.var_bindings, ctx.key, active_region={"support": expr.support, "region_id": expr.region_id,},)
+                    return getattr(self, method_name)(expr, new_ctx)
+
                 return getattr(self, method_name)(expr, ctx)
+
         raise ValueError(f"Cannot evaluate: {type(expr)}")
 
     # ------------------------------------------------------------------
@@ -425,7 +435,7 @@ class TraceEvaluator:
             else:
                 raise ValueError(f"Unsupported OperationCall argument type: {type(call_arg)}")
 
-        new_ctx = self._EvalCtx(ctx.context, new_bindings, ctx.key)
+        new_ctx = self._EvalCtx(ctx.context, new_bindings, ctx.key, active_region=ctx.active_region)
         return self._dispatch(op.expr, new_ctx)
 
     def _eval_flax_module_call(self, expr, ctx):
@@ -523,18 +533,47 @@ class TraceEvaluator:
         variables = expr.variables
         scheme = expr.scheme
         if isinstance(target, TestFunction):
+            if ctx.active_region is None:
+                raise ValueError(
+                    "Jacobian of TestFunction requires an active_region. "
+                    "Use grad(phi, x) only inside Assembly(...)."
+                )
+
             var = variables[0]
             dim_idx = 0
             if hasattr(var, "dim") and isinstance(var.dim, (list, tuple)):
                 ints = [d for d in var.dim if isinstance(d, int)]
                 if ints:
                     dim_idx = ints[0]
-            if target.tag == "fem_gauss":
+
+            support = ctx.active_region["support"]
+            region_id = ctx.active_region["region_id"]
+
+            if support == "volume":
                 dN = ctx.context["dN_dx_flat"]
-                
-                #print(f"TRACING {target.tag} - dN native shape: {dN.shape}")
-                #print(f"TRACING {target.tag} - Extracting dim {dim_idx}")
                 return dN[..., dim_idx]
+
+            if support == "boundary":
+                if "surface_data" not in ctx.context or region_id not in ctx.context["surface_data"]:
+                    raise KeyError(
+                        f"Boundary region '{region_id}' not found in fem_context['surface_data']."
+                    )
+
+                surf_data = ctx.context["surface_data"][region_id]
+
+                if "face_shape_grads" not in surf_data:
+                    raise NotImplementedError(
+                        f"Boundary TestFunction gradients requested on region '{region_id}', "
+                        "but 'face_shape_grads' is not stored in fem_context['surface_data']'. "
+                        "Add boundary shape gradients in domain.init_fem() first."
+                    )
+
+                dN_face = surf_data["face_shape_grads"]
+                # Expected shape after padding/reshape path:
+                #   (..., n_faces, n_quads, n_local_nodes, dim)
+                return dN_face.reshape(-1, dN_face.shape[-2], dN_face.shape[-1])[..., dim_idx]
+
+            raise ValueError(f"Unknown active support '{support}'")
 
         first_var = variables[0]
         bound_var = ctx.var_bindings.get(id(first_var), first_var)
@@ -557,8 +596,8 @@ class TraceEvaluator:
                 ctx_fwd = {**ctx.context, time_key: t_fwd}
                 ctx_bwd = {**ctx.context, time_key: t_bwd}
 
-                u_fwd = self._dispatch(target, self._EvalCtx(ctx_fwd, ctx.var_bindings, ctx.key))
-                u_bwd = self._dispatch(target, self._EvalCtx(ctx_bwd, ctx.var_bindings, ctx.key))
+                u_fwd = self._dispatch(target, self._EvalCtx(ctx_fwd, ctx.var_bindings, ctx.key, active_region=ctx.active_region))
+                u_bwd = self._dispatch(target, self._EvalCtx(ctx_bwd, ctx.var_bindings, ctx.key, active_region=ctx.active_region))
 
                 result = (u_fwd - u_bwd) / (2.0 * eps)
                 # Ensure (N, 1) shape
@@ -589,7 +628,7 @@ class TraceEvaluator:
 
                 def u_of_t(t_arr):
                     new_ctx_dict = {**local_ctx, time_key: t_arr}
-                    new_ctx = evaluator_self._EvalCtx(new_ctx_dict, ctx.var_bindings, ctx.key)
+                    new_ctx = evaluator_self._EvalCtx(new_ctx_dict, ctx.var_bindings, ctx.key, active_region=ctx.active_region)
                     return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
 
                 return jax.grad(u_of_t)(time_val)[0]
@@ -617,7 +656,7 @@ class TraceEvaluator:
 
             def u_at_pts(pts):
                 ctx_dict = {**ctx.context, tag: pts}
-                new_ctx = self._EvalCtx(ctx_dict, ctx.var_bindings, ctx.key)
+                new_ctx = self._EvalCtx(ctx_dict, ctx.var_bindings, ctx.key, active_region=ctx.active_region)
                 return self._dispatch(target, new_ctx)
 
             u_full = u_at_pts(mesh_points)
@@ -671,7 +710,7 @@ class TraceEvaluator:
 
                     def u_scalar(p):
                         ctx_dict = {**local_ctx, tag: p[jnp.newaxis, ...]}
-                        new_ctx = evaluator_self._EvalCtx(ctx_dict, ctx.var_bindings, ctx.key)
+                        new_ctx = evaluator_self._EvalCtx(ctx_dict, ctx.var_bindings, ctx.key, active_region=ctx.active_region)
                         return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
 
                     return jax.grad(u_scalar)(pt)[dim]
@@ -685,6 +724,7 @@ class TraceEvaluator:
                             {**ctx.context, tag: p[jnp.newaxis, :]},
                             ctx.var_bindings,
                             ctx.key,
+                            active_region=ctx.active_region,
                         )
                         return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
 
@@ -739,7 +779,7 @@ class TraceEvaluator:
             def u_at_pts(pts):
                 # Replace only the spatial tag — __time__ stays intact
                 ctx_dict = {**ctx.context, tag: pts}
-                new_ctx = self._EvalCtx(ctx_dict, ctx.var_bindings, ctx.key)
+                new_ctx = self._EvalCtx(ctx_dict, ctx.var_bindings, ctx.key, active_region=ctx.active_region)
                 return self._dispatch(target, new_ctx)
 
             u_full = u_at_pts(mesh_points)
@@ -797,7 +837,7 @@ class TraceEvaluator:
 
                     def u_scalar(p):
                         ctx_dict = {**local_ctx, tag: p[jnp.newaxis, :]}
-                        new_ctx = evaluator_self._EvalCtx(ctx_dict, ctx.var_bindings, ctx.key)
+                        new_ctx = evaluator_self._EvalCtx(ctx_dict, ctx.var_bindings, ctx.key, active_region=ctx.active_region)
                         return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
 
                     hess = jax.hessian(u_scalar)(pt)
@@ -812,6 +852,7 @@ class TraceEvaluator:
                             {**ctx.context, tag: p[jnp.newaxis, :]},
                             ctx.var_bindings,
                             ctx.key,
+                            active_region=ctx.active_region
                         )
                         return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
 
@@ -827,69 +868,86 @@ class TraceEvaluator:
         return self._dispatch(expr.expr, ctx)
 
     def _eval_test_function(self, expr, ctx):
-        """Returns the precomputed shape function values for volume or surface."""
-        if expr.tag == "fem_gauss":
-            # Volume shape functions: (N_quads_total, 3)
+        """
+        Resolve the generic TestFunction against the currently active variational region.
+        """
+        if ctx.active_region is None:
+            raise ValueError(
+                "TestFunction evaluation requires an active_region. "
+                "Use it inside Assembly(...)."
+            )
+
+        support = ctx.active_region["support"]
+        region_id = ctx.active_region["region_id"]
+
+        if support == "volume":
+            # Volume shape functions: (N_quads_total, n_local_nodes)
             return ctx.context["N_flat"]
-        else:
-            if "surface_data" not in ctx.context or expr.tag not in ctx.context["surface_data"]:
-                raise KeyError(f"Surface tag '{expr.tag}' not found in fem_context.")
-            
-            vals = ctx.context["surface_data"][expr.tag]["face_shape_vals"]
-            # reshape(-1, ...) is safe whether vals is (F, Q, 3) or (1, F, Q, 3)
+
+        if support == "boundary":
+            if "surface_data" not in ctx.context or region_id not in ctx.context["surface_data"]:
+                raise KeyError(
+                    f"Boundary region '{region_id}' not found in fem_context['surface_data']."
+                )
+
+            vals = ctx.context["surface_data"][region_id]["face_shape_vals"]
+            # Safe for both (F,Q,nloc) and padded (1,1,F,Q,nloc)
             return vals.reshape(-1, vals.shape[-1])
+
+        raise ValueError(f"Unknown active support '{support}'")
 
     def _eval_assembly(self, expr, ctx):
         integrand = self._dispatch(expr.expr, ctx)
-        
-        if expr.tag == "fem_gauss":
-            weights = ctx.context["JxW"] 
+
+        if expr.support == "volume":
+            weights = ctx.context["JxW"]
             flat_cells = ctx.context["flat_cells"].flatten()
-        else:
-            surf_data = ctx.context["surface_data"][expr.tag]
+
+        elif expr.support == "boundary":
+            if "surface_data" not in ctx.context or expr.region_id not in ctx.context["surface_data"]:
+                raise KeyError(
+                    f"Boundary region '{expr.region_id}' not found in fem_context['surface_data']."
+                )
+            surf_data = ctx.context["surface_data"][expr.region_id]
             weights = surf_data["nanson_scale"]
             flat_cells = surf_data["flat_parent_nodes"].flatten()
+
+        else:
+            raise ValueError(f"Unknown assembly support '{expr.support}'")
 
         num_entities, num_quads = weights.shape[-2], weights.shape[-1]
         weights_flat = weights.flatten()[:, jnp.newaxis]
 
         local_residuals = integrand * weights_flat
         num_local_nodes = integrand.shape[-1]
-        
-        # This reshape is the ultimate safeguard. If num_local_nodes is 
-        # wrong (like the Jacobian bug), this will CRASH instead of cheating.
+
+        # Safety reshape
         local_residuals = local_residuals.reshape(num_entities, num_quads, num_local_nodes)
-        cell_residuals = jnp.sum(local_residuals, axis=1) 
-        
+        cell_residuals = jnp.sum(local_residuals, axis=1)
+
         global_residual = jax.ops.segment_sum(
-            cell_residuals.flatten(), 
-            flat_cells, 
-            num_segments=expr.num_total_nodes
+            cell_residuals.flatten(),
+            flat_cells,
+            num_segments=expr.num_total_nodes,
         )
+
         if global_residual.ndim == 1:
             global_residual = global_residual[:, jnp.newaxis]
 
-        # NORMALIZATION FIX
-        if "global_areas" in ctx.context:
-            areas = ctx.context["global_areas"].reshape(-1,1)
+        # Volume normalization only
+        if expr.support == "volume" and "global_areas" in ctx.context:
+            areas = ctx.context["global_areas"].reshape(-1, 1)
             global_residual = global_residual / (areas + 1e-12)
 
-        # GALERKIN FIX: If using Hard BCs, zeroing residuals is optional but 
-        # standard. If you want maximum accuracy, try commenting this out!
+        # Optional boundary normalization if you want it later:
+        # elif expr.support == "boundary":
+        #     b_areas = ctx.context["surface_data"][expr.region_id]["global_boundary_areas"].reshape(-1, 1)
+        #     global_residual = global_residual / (b_areas + 1e-12)
+
         if "dirichlet_nodes" in ctx.context:
             d_nodes = jnp.asarray(ctx.context["dirichlet_nodes"]).flatten().astype(jnp.int32)
             if d_nodes.size > 0:
                 global_residual = global_residual.at[d_nodes].set(0.0)
-
-        if global_residual.ndim == 1:
-            global_residual = global_residual[:, jnp.newaxis]
-        # jax.debug.print(
-        #     "[{tag}] Max: {max_val:.2e} | Mean abs: {mean_val:.2e} | Non-zero nodes: {nnz}",
-        #     tag=getattr(expr, "tag", "unknown_tag"),
-        #     max_val=jnp.max(jnp.abs(global_residual)),
-        #     mean_val=jnp.mean(jnp.abs(global_residual)),
-        #     nnz=jnp.sum(jnp.abs(global_residual) > 1e-8)
-        # )
 
         return global_residual
    

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import meshio
 import cloudpickle
 
-from .trace import Variable, TensorTag
+from .trace import Variable, TensorTag, Literal, BinaryOp, FunctionCall, Jacobian, TestFunction, TrialFunction, Constant, FemLinearSystem, Assembly
 from .utils.logger import get_logger, Logger
 
 
@@ -1909,10 +1909,112 @@ class domain(MeshUtils, Geometries):
         return self
 
     # Generators
-    def init_fem(self, element_type: str = "TRI3", quad_degree: int = 2, neumann_tags: List[str] = [], dirichlet_tags: List[str] = []) -> "domain":
+    def _build_dirichlet_bc_info(self, dirichlet_tags):
+        """
+        Build JAX-FEM dirichlet_bc_info = [location_fns, vec_ids, value_fns]
+        from mesh tags stored in self._mesh_pool.
+
+        Current version is scalar-only (vec=1).
+        """
+        import jax.numpy as jnp
+
+        loc_fns = []
+        vec_ids = []
+        val_fns = []
+
+        tol = 1e-5
+
+        for tag in dirichlet_tags:
+            if tag not in self._mesh_pool:
+                continue
+
+            tag_pts = jnp.asarray(self._mesh_pool[tag])
+
+            def make_loc_fn(pts):
+                def loc_fn(p):
+                    return jnp.any(jnp.linalg.norm(pts - p, axis=-1) < tol)
+                return loc_fn
+
+            # Default scalar component
+            vec_ids.append(0)
+            loc_fns.append(make_loc_fn(tag_pts))
+
+            # ----------------------------
+            # Boundary value functions
+            # ----------------------------
+            # For your Poisson example:
+            #   left   : u = 0
+            #   bottom : u = sin(pi*x)
+            # Everything else defaults to zero.
+            if tag == "left":
+                val_fns.append(lambda p: 0.0)
+
+            elif tag == "bottom":
+                val_fns.append(lambda p: jnp.sin(jnp.pi * p[0]))
+
+            else:
+                val_fns.append(lambda p: 0.0)
+
+        if len(loc_fns) == 0:
+            return [[lambda p: False], [0], [lambda p: 0.0]]
+
+        return [loc_fns, vec_ids, val_fns]
+   
+    def variational_symbols(self):
+        """
+        Return generic variational symbols.
+
+        u   : unknown / trial-like symbol
+        phi : test symbol
+
+        They stay symbolic. The backend decides later how to interpret them:
+          - target="vpinn"      -> u is evaluated through u_net/model
+          - target="fem_system" -> u is treated as FE trial function
+        """
+        return TrialFunction(name="u"), TestFunction(name="phi")
+
+    def fem_symbols(self):
+        """
+        Backward-compatible alias for variational_symbols().
+        """
+        return self.variational_symbols()
+    
+    def _register_variational_sample(
+        self,
+        sample_tag: str,
+        support: str,
+        region_id: str,
+        context_tag: str | None = None,
+    ):
+        """
+        Register one sampled quadrature/surface tag as a variational region.
+
+        Parameters
+        ----------
+        sample_tag : str
+            User-facing / variable-facing tag used in domain.variable(...)
+            e.g. "fem_gauss", "gauss_right", "gauss_wall_3"
+        support : str
+            "volume" or "boundary"
+        region_id : str
+            Geometry-level region id, e.g. "volume", "right", "wall_3", ...
+        context_tag : str | None
+            Internal context key if different from sample_tag.
+        """
+        if not hasattr(self, "_variational_sampling_registry"):
+            self._variational_sampling_registry = {}
+
+        self._variational_sampling_registry[sample_tag] = {
+            "support": support,
+            "region_id": region_id,
+            "context_tag": context_tag if context_tag is not None else sample_tag,
+        }
+
+    def init_fem(self, element_type: str = "TRI3", quad_degree: int = 2, neumann_tags: List[str] = [], dirichlet_tags: List[str] = [], fem_solver: bool = False) -> "domain":
         if self.mesh is None:
             raise ValueError("Mesh must be loaded before initializing FEM context.")
-
+        self._variational_initialized = True
+        self._variational_sampling_registry = {}
         import jax.numpy as jnp
         import numpy as onp
         from jax_fem.problem import Problem
@@ -1937,6 +2039,7 @@ class domain(MeshUtils, Geometries):
                     return loc_fn
                 
                 location_fns.append(make_loc_fn(tag_pts))
+        dirichlet_bc_info = self._build_dirichlet_bc_info(dirichlet_tags)
 
         class DummyProblem(Problem):
             def get_tensor_map(self): 
@@ -1948,9 +2051,28 @@ class domain(MeshUtils, Geometries):
             def get_surface_maps(self):
                 return [lambda u, x: jnp.zeros((1,))] * len(location_fns)
         
-        prob = DummyProblem(jax_mesh, vec=1, dim=self.dimension, ele_type=element_type,
-                            gauss_order=quad_degree, dirichlet_bc_info=[[lambda p: False], [0], [lambda p: 0.0]],
-                            location_fns=location_fns) 
+        prob = DummyProblem(
+                jax_mesh,
+                vec=1,
+                dim=self.dimension,
+                ele_type=element_type,
+                gauss_order=quad_degree,
+                dirichlet_bc_info=dirichlet_bc_info,
+                location_fns=location_fns,
+            )
+        self._fem_solver_enabled = bool(fem_solver)
+        self._jaxfem_solver_context = {
+            "mesh": jax_mesh,
+            "element_type": element_type,
+            "quad_degree": quad_degree,
+            "location_fns": location_fns,
+            "valid_neumann_tags": list(valid_tags),
+            "dirichlet_tags": list(dirichlet_tags),
+            "dirichlet_bc_info": dirichlet_bc_info,
+            "dummy_problem": prob,
+            "dim": self.dimension,
+        }
+
         fe = prob.fes[0]
 
         # --- Identify Dirichlet node indices ---
@@ -1993,7 +2115,12 @@ class domain(MeshUtils, Geometries):
             "surface_data": {}
         }
         self._mesh_pool["fem_gauss"] = jnp.asarray(fe.get_physical_quad_points()).reshape(-1, self.dimension)
-
+        self._register_variational_sample(
+            sample_tag="fem_gauss",
+            support="volume",
+            region_id="volume",
+            context_tag="fem_gauss",
+        )
         # --- Extract Native jax-fem Nanson Scales for Neumann ---
         for i, tag in enumerate(valid_tags):
             inds = prob.boundary_inds_list[i]
@@ -2023,6 +2150,12 @@ class domain(MeshUtils, Geometries):
                     "global_boundary_areas": global_boundary_areas
                 }
                 self._mesh_pool[f"gauss_{tag}"] = jnp.asarray(physical_face_quads).reshape(-1, self.dimension)
+                self._register_variational_sample(
+                    sample_tag=f"gauss_{tag}",
+                    support="boundary",
+                    region_id=tag,
+                    context_tag=f"gauss_{tag}",
+                )
                 self.log.info(f"jax-fem Nanson extraction: Matched {len(inds)} faces for '{tag}'")
         # ====================================================================
         # THE FIX: Pad FEM arrays with Batch (B=1) and Time (T=1) dimensions 
@@ -2047,6 +2180,612 @@ class domain(MeshUtils, Geometries):
         self.context.update(self.fem_context)
             
         return self
+
+    def _collect_variational_metas(self, node, out):
+        """
+        Walk an expression tree and collect fem_meta from Variable nodes.
+        """
+        if node is None:
+            return
+
+        if isinstance(node, Variable) and getattr(node, "fem_meta", None) is not None:
+            out.append(node.fem_meta)
+            return
+
+        for attr in ("left", "right", "target", "expr"):
+            child = getattr(node, attr, None)
+            if child is not None:
+                self._collect_variational_metas(child, out)
+
+        for attr in ("args", "variables"):
+            vals = getattr(node, attr, None)
+            if vals is None:
+                continue
+            for v in vals:
+                if isinstance(v, (list, tuple)):
+                    for vv in v:
+                        self._collect_variational_metas(vv, out)
+                else:
+                    self._collect_variational_metas(v, out)
+    
+    def _infer_term_bucket(self, term):
+        """
+        Infer whether a term belongs to:
+          - ("volume", "volume")
+          - ("boundary", "<region_id>")
+        based on the sampled variables appearing inside the term.
+        """
+        metas = []
+        self._collect_variational_metas(term, metas)
+
+        if len(metas) == 0:
+            raise ValueError(
+                "Could not infer variational bucket for term. "
+                "Each assembled term must contain at least one sampled FEM/variational variable."
+            )
+
+        supports = {m["support"] for m in metas}
+        region_ids = {m["region_id"] for m in metas}
+
+        if len(supports) != 1:
+            raise ValueError(
+                f"Mixed supports inside one term are not allowed. Found supports={supports}"
+            )
+
+        if len(region_ids) != 1:
+            raise ValueError(
+                f"Mixed region ids inside one term are not allowed. Found region_ids={region_ids}"
+            )
+
+        support = next(iter(supports))
+        region_id = next(iter(region_ids))
+        return support, region_id
+   
+    def _split_additive_terms(self, node, sign=1.0):
+        """
+        Split an expression into additive terms:
+            a - b + c  ->  [(+1,a), (-1,b), (+1,c)]
+        """
+        if isinstance(node, BinaryOp) and node.op == "+":
+            return self._split_additive_terms(node.left, sign) + self._split_additive_terms(node.right, sign)
+
+        if isinstance(node, BinaryOp) and node.op == "-":
+            return self._split_additive_terms(node.left, sign) + self._split_additive_terms(node.right, -sign)
+
+        return [(sign, node)]
+
+    def _apply_sign(self, sign, term):
+        if sign == 1.0:
+            return term
+        return Literal(sign) * term
+
+    def _sum_terms(self, terms):
+        if len(terms) == 0:
+            return None
+        out = terms[0]
+        for t in terms[1:]:
+            out = out + t
+        return out
+
+    def assemble_weak_form(self, expr, target="vpinn", **kwargs):
+        """
+        Unified front-end for weak-form assembly.
+
+        Parameters
+        ----------
+        expr : traced weak expression
+        target : str
+            "vpinn"      -> grouped VPINN weak assembly
+            "fem_system" -> grouped FEM matrix/vector assembly
+
+        Returns
+        -------
+        target="vpinn"      -> assembled weak object
+        target="fem_system" -> (A, b)
+        """
+        expr_for_target = expr
+
+        if target == "vpinn":
+            trial_value = kwargs.get("u_net", None)
+            if trial_value is not None:
+                expr_for_target = self._substitute_trial_for_vpinn(expr, trial_value)
+
+        terms = self._split_additive_terms(expr_for_target)
+
+        volume_terms = []
+        boundary_terms = {}
+
+        for sign, term in terms:
+            support, region_id = self._infer_term_bucket(term)
+            signed_term = self._apply_sign(sign, term)
+
+            if support == "volume":
+                volume_terms.append(signed_term)
+            elif support == "boundary":
+                boundary_terms.setdefault(region_id, []).append(signed_term)
+            else:
+                raise ValueError(f"Unknown support '{support}'")
+
+        if target == "vpinn":
+            return self._assemble_vpinn_grouped(volume_terms, boundary_terms, **kwargs)
+
+        if target == "fem_system":
+            return self._assemble_fem_system_grouped(volume_terms, boundary_terms, **kwargs)
+
+        raise ValueError(
+            f"Unknown assembly target '{target}'. Supported: 'vpinn', 'fem_system'"
+        )
+
+    def _substitute_trial_for_vpinn(self, node, trial_value):
+        from .trace import (
+            TrialFunction,
+            TestFunction,
+            Variable,
+            TensorTag,
+            Constant,
+            Literal,
+            BinaryOp,
+            FunctionCall,
+            ModelCall,
+            OperationDef,
+            OperationCall,
+            Jacobian,
+            Hessian,
+            Tracker,
+            Assembly,
+            Placeholder,
+        )
+
+        if node is None:
+            return None
+
+        # Leaves that stay unchanged
+        if isinstance(node, (Variable, TestFunction, TensorTag, Constant, Literal)):
+            return node
+
+        # Replace the symbolic unknown by the provided VPINN expression
+        if isinstance(node, TrialFunction):
+            return trial_value
+
+        if isinstance(node, BinaryOp):
+            left = self._substitute_trial_for_vpinn(node.left, trial_value)
+            right = self._substitute_trial_for_vpinn(node.right, trial_value)
+            if left is not node.left or right is not node.right:
+                return BinaryOp(node.op, left, right)
+            return node
+
+        if isinstance(node, FunctionCall):
+            new_args = [
+                self._substitute_trial_for_vpinn(a, trial_value) if isinstance(a, Placeholder) else a
+                for a in node.args
+            ]
+            if any(n is not o for n, o in zip(new_args, node.args)):
+                return FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
+            return node
+
+        if isinstance(node, ModelCall):
+            new_args = [
+                self._substitute_trial_for_vpinn(a, trial_value) if isinstance(a, Placeholder) else a
+                for a in node.args
+            ]
+            if any(n is not o for n, o in zip(new_args, node.args)):
+                new_node = ModelCall(node.model, new_args)
+                new_node.op_id = node.op_id
+                return new_node
+            return node
+
+        if isinstance(node, OperationDef):
+            new_expr = self._substitute_trial_for_vpinn(node.expr, trial_value)
+            if new_expr is not node.expr:
+                new_node = OperationDef.__new__(OperationDef)
+                new_node.expr = new_expr
+                new_node.input_vars = node.input_vars
+                new_node.op_id = node.op_id
+                new_node._collected_vars = node._collected_vars
+                new_node.has_trainable = node.has_trainable
+                return new_node
+            return node
+
+        if isinstance(node, OperationCall):
+            new_op = self._substitute_trial_for_vpinn(node.operation, trial_value)
+            new_args = tuple(
+                self._substitute_trial_for_vpinn(a, trial_value) if isinstance(a, Placeholder) else a
+                for a in node.args
+            )
+            if new_op is not node.operation or any(n is not o for n, o in zip(new_args, node.args)):
+                return OperationCall(new_op, new_args)
+            return node
+
+        if isinstance(node, Jacobian):
+            new_target = self._substitute_trial_for_vpinn(node.target, trial_value)
+            if new_target is not node.target:
+                return Jacobian(new_target, node.variables, node.scheme)
+            return node
+
+        if isinstance(node, Hessian):
+            new_target = self._substitute_trial_for_vpinn(node.target, trial_value)
+            if new_target is not node.target:
+                return Hessian(new_target, node.variables, node.scheme, node.trace)
+            return node
+
+        if isinstance(node, Tracker):
+            new_expr = self._substitute_trial_for_vpinn(node.expr, trial_value)
+            if new_expr is not node.expr:
+                return Tracker(new_expr, node.interval)
+            return node
+
+        if isinstance(node, Assembly):
+            new_expr = self._substitute_trial_for_vpinn(node.expr, trial_value)
+            if new_expr is not node.expr:
+                return Assembly(
+                    new_expr,
+                    node.num_total_nodes,
+                    support=node.support,
+                    region_id=node.region_id,
+                )
+            return node
+
+        return node
+    
+    def _assemble_vpinn_grouped(self, volume_terms, boundary_terms, **kwargs):
+        """
+        Grouped VPINN assembly:
+          - one Assembly for volume
+          - one Assembly per boundary region
+          - add them together
+        """
+        from .trace import Assembly
+
+        assembled_parts = []
+
+        if len(volume_terms) > 0:
+            vol_expr = self._sum_terms(volume_terms)
+            assembled_parts.append(
+                Assembly(vol_expr, self, support="volume", region_id="volume")
+            )
+
+        for region_id, terms in boundary_terms.items():
+            bnd_expr = self._sum_terms(terms)
+            assembled_parts.append(
+                Assembly(bnd_expr, self, support="boundary", region_id=region_id)
+            )
+
+        if len(assembled_parts) == 0:
+            raise ValueError("No terms found for VPINN assembly.")
+
+        out = assembled_parts[0]
+        for part in assembled_parts[1:]:
+            out = out + part
+        return out
+
+    def _assemble_fem_system_grouped(self, volume_terms, boundary_terms, **kwargs):
+        """
+        Grouped FEM assembly:
+          - assemble volume contribution
+          - assemble one contribution per boundary region
+          - sum into one FemLinearSystem
+          - return (A, b)
+        """
+        system = None
+
+        if len(volume_terms) > 0:
+            vol_expr = self._sum_terms(volume_terms)
+            vol_sys = self._fem_assemble_bucket(
+                vol_expr,
+                support="volume",
+                region_id="volume",
+            )
+            system = vol_sys if system is None else (system + vol_sys)
+
+        for region_id, terms in boundary_terms.items():
+            bnd_expr = self._sum_terms(terms)
+            bnd_sys = self._fem_assemble_bucket(
+                bnd_expr,
+                support="boundary",
+                region_id=region_id,
+            )
+            system = bnd_sys if system is None else (system + bnd_sys)
+
+        if system is None:
+            raise ValueError("No terms found for FEM assembly.")
+
+        return system.A, system.b
+
+    def _fem_assemble_bucket(self, expr, support: str, region_id: str):
+        """Assemble a linear system contribution using JAX-FEM kernels.
+
+        Returns a FemLinearSystem which can be combined with + / - and
+        unpacked as A, b = ...
+        """
+        if not getattr(self, "_fem_solver_enabled", False):
+            raise ValueError("Call init_fem(..., fem_solver=True) to enable the FEM solver route.")
+
+        try:
+            from jax_fem.problem import Problem
+        except Exception as exc:
+            raise ImportError("jax_fem is required for fem_solver=True, but it could not be imported.") from exc
+
+        import scipy.sparse as sp
+        import numpy as onp
+        import jax.numpy as jnp
+
+        if support == "volume":
+            tag = "fem_gauss"
+        elif support == "boundary":
+            tag = region_id
+        else:
+            raise ValueError(f"Unknown support '{support}'")
+
+        compiled = self._compile_weakform_for_jaxfem(expr, tag=tag)
+        solver_ctx = self._jaxfem_solver_context
+
+        active_surface_idx = None
+        if support == "boundary":
+            try:
+                active_surface_idx = solver_ctx["valid_neumann_tags"].index(tag)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Unknown FEM boundary region '{tag}'. Known tags: {solver_ctx['valid_neumann_tags']}"
+                ) from exc
+
+        parent = self
+
+        class GeneratedProblem(Problem):
+            def get_universal_kernel(self_nonlocal):
+                if support != "volume":
+                    return lambda cell_sol_flat, physical_quad_points, cell_shape_grads, cell_JxW, cell_v_grads_JxW: jnp.zeros_like(cell_sol_flat)
+
+                def kernel(cell_sol_flat, physical_quad_points, cell_shape_grads, cell_JxW, cell_v_grads_JxW):
+                    return parent._eval_compiled_volume_integrand(
+                        compiled,
+                        cell_sol_flat,
+                        physical_quad_points,
+                        cell_shape_grads,
+                        cell_JxW,
+                        cell_v_grads_JxW,
+                    )
+
+                return kernel
+
+            def get_universal_kernels_surface(self_nonlocal):
+                kernels = []
+                n_surfaces = len(solver_ctx["location_fns"])
+                for i in range(n_surfaces):
+                    if support == "boundary" and i == active_surface_idx:
+                        kernels.append(
+                            lambda cell_sol_flat, physical_surface_quad_points, face_shape_vals, face_shape_grads, face_nanson_scale, _i=i:
+                                parent._eval_compiled_surface_integrand(
+                                    compiled,
+                                    cell_sol_flat,
+                                    physical_surface_quad_points,
+                                    face_shape_vals,
+                                    face_shape_grads,
+                                    face_nanson_scale,
+                                )
+                        )
+                    else:
+                        kernels.append(
+                            lambda cell_sol_flat, physical_surface_quad_points, face_shape_vals, face_shape_grads, face_nanson_scale, _i=i:
+                                jnp.zeros_like(cell_sol_flat)
+                        )
+                return kernels
+
+        problem = GeneratedProblem(
+            solver_ctx["mesh"],
+            vec=1,
+            dim=solver_ctx["dim"],
+            ele_type=solver_ctx["element_type"],
+            gauss_order=solver_ctx["quad_degree"],
+            dirichlet_bc_info=solver_ctx["dirichlet_bc_info"],
+            location_fns=solver_ctx["location_fns"],
+        )
+        print("Dirichlet node count:", len(problem.fes[0].node_inds_list[0]) if getattr(problem.fes[0], "node_inds_list", None) else 0)
+        zero_sol = [jnp.zeros((problem.fes[0].num_total_nodes, 1), dtype=jnp.float64)]
+
+        # JAX-FEM assembles residual and tangent around zero state
+        res_list = problem.newton_update(zero_sol)
+        b = -onp.asarray(res_list[0]).reshape(-1)
+
+        A = sp.coo_matrix(
+            (problem.V, (problem.I, problem.J)),
+            shape=(problem.num_total_dofs_all_vars, problem.num_total_dofs_all_vars),
+        ).tocsr()
+
+        # Optional strong Dirichlet elimination for scalar single-field case
+        dirichlet_nodes = onp.asarray(
+            problem.fes[0].node_inds_list[0] if getattr(problem.fes[0], "node_inds_list", None) else [],
+            dtype=onp.int64,
+        )
+
+        dirichlet_vals = onp.asarray(
+            problem.fes[0].vals_list[0] if getattr(problem.fes[0], "vals_list", None) else [],
+            dtype=onp.float64,
+        ).reshape(-1)
+
+        if dirichlet_nodes.size > 0:
+            A = A.tolil()
+            for node, val in zip(dirichlet_nodes, dirichlet_vals):
+                A[node, :] = 0.0
+                A[:, node] = 0.0
+                A[node, node] = 1.0
+                b[node] = val
+            A = A.tocsr()
+
+        return FemLinearSystem(A, b)
+
+    def fem_assemble(self, expr, tag: str = "fem_gauss"):
+        """
+        Temporary compatibility wrapper for old code.
+        """
+        if tag == "fem_gauss":
+            return self._fem_assemble_bucket(expr, support="volume", region_id="volume")
+        return self._fem_assemble_bucket(expr, support="boundary", region_id=tag)
+
+    def _compile_weakform_for_jaxfem(self, expr, tag: str = "fem_gauss") -> Dict[str, Any]:
+        trial_nodes = {}
+
+        def walk(node):
+            if node is None:
+                return
+
+            if isinstance(node, TrialFunction):
+                # Deduplicate by op_id so repeated uses of the same trial field
+                # (e.g. grad(u,x) and grad(u,y)) count as one unknown.
+                trial_nodes[node.op_id] = node
+                return
+
+            for attr in ("left", "right", "target", "expr"):
+                child = getattr(node, attr, None)
+                if child is not None:
+                    walk(child)
+
+            for attr in ("args", "variables"):
+                vals = getattr(node, attr, None)
+                if vals is None:
+                    continue
+                for v in vals:
+                    if isinstance(v, (list, tuple)):
+                        for vv in v:
+                            walk(vv)
+                    else:
+                        walk(v)
+
+        walk(expr)
+
+        unique_trials = list(trial_nodes.values())
+
+        if len(unique_trials) > 1:
+            raise NotImplementedError(
+                "fem_solver=True currently supports a single scalar TrialFunction only."
+            )
+
+        return {
+            "expr": expr,
+            "tag": tag,
+            "has_trial": len(unique_trials) == 1,
+            "trial": unique_trials[0] if unique_trials else None,
+        }
+
+    def _eval_compiled_volume_integrand(
+                self,
+                compiled: Dict[str, Any],
+                cell_sol_flat,
+                physical_quad_points,
+                cell_shape_grads,
+                cell_JxW,
+                cell_v_grads_JxW,
+            ):
+            import jax
+            import jax.numpy as jnp
+
+            num_nodes = cell_shape_grads.shape[1]
+            cell_sol = cell_sol_flat.reshape(num_nodes, 1)
+            shape_vals = self._jaxfem_solver_context["dummy_problem"].fes[0].shape_vals
+
+            local = {
+                "physical_quad_points": physical_quad_points,
+                "shape_vals": shape_vals,
+                "shape_grads": cell_shape_grads,
+                "cell_sol": cell_sol,
+                "tag": compiled["tag"],
+                "surface": False,
+            }
+
+            val = self._eval_expr_for_jaxfem(compiled["expr"], local)
+
+            return jax.flatten_util.ravel_pytree(jnp.sum(val * cell_JxW[0][:, None], axis=0))[0]
+
+    def _eval_compiled_surface_integrand(
+        self,
+        compiled: Dict[str, Any],
+        cell_sol_flat,
+        physical_surface_quad_points,
+        face_shape_vals,
+        face_shape_grads,
+        face_nanson_scale,
+    ):
+        import jax
+        import jax.numpy as jnp
+
+        num_nodes = face_shape_vals.shape[1]
+        cell_sol = cell_sol_flat.reshape(num_nodes, 1)
+
+        local = {
+            "physical_quad_points": physical_surface_quad_points,
+            "shape_vals": face_shape_vals,
+            "shape_grads": face_shape_grads,
+            "cell_sol": cell_sol,
+            "tag": compiled["tag"],
+            "surface": True,
+        }
+
+        val = self._eval_expr_for_jaxfem(compiled["expr"], local)
+        weights = face_nanson_scale[0]
+
+        return jax.flatten_util.ravel_pytree(jnp.sum(val * weights[:, None], axis=0))[0]
+
+    
+
+    def _eval_expr_for_jaxfem(self, node, local):
+            import jax.numpy as jnp
+
+            if isinstance(node, Literal):
+                return jnp.asarray(node.value)
+
+            if isinstance(node, Constant):
+                return jnp.asarray(node.value)
+
+            if isinstance(node, Variable):
+                pts = local["physical_quad_points"]
+                dim0 = node.dim[0]
+                return pts[:, dim0:dim0 + 1]
+
+            if isinstance(node, TestFunction):
+                return local["shape_vals"]
+
+            if isinstance(node, TrialFunction):
+                vals = local["shape_vals"]
+                return jnp.sum(vals[:, :, None] * local["cell_sol"][None, :, :], axis=1)
+
+            if isinstance(node, Jacobian):
+                var = node.variables[0]
+                dim0 = var.dim[0] if isinstance(var, Variable) else 0
+
+                if isinstance(node.target, TestFunction):
+                    return local["shape_grads"][..., dim0]
+
+                if isinstance(node.target, TrialFunction):
+                    grads = local["shape_grads"]
+                    return jnp.sum(grads[:, :, dim0:dim0 + 1] * local["cell_sol"][None, :, :], axis=1)
+
+                raise NotImplementedError(
+                    "fem_solver=True currently supports gradients of TrialFunction/TestFunction only."
+                )
+
+            if isinstance(node, BinaryOp):
+                a = self._eval_expr_for_jaxfem(node.left, local)
+                b = self._eval_expr_for_jaxfem(node.right, local)
+
+                if node.op == "+":
+                    return a + b
+                if node.op == "-":
+                    return a - b
+                if node.op == "*":
+                    return a * b
+                if node.op == "/":
+                    return a / b
+                if node.op == "**":
+                    return a ** b
+
+                raise NotImplementedError(f"Unsupported binary operator: {node.op}")
+
+            if isinstance(node, FunctionCall):
+                args = [self._eval_expr_for_jaxfem(arg, local) for arg in node.args]
+                return node.fn(*args)
+
+            raise NotImplementedError(
+                f"Unsupported weak-form node for fem_solver=True: {type(node).__name__}"
+            )
 
     def _generate_mesh(self, geometry_func: Callable, algorithm: int):
         """Generate mesh using PyGmsh."""
@@ -2340,11 +3079,15 @@ class domain(MeshUtils, Geometries):
             available = list(self.context.keys())
             raise ValueError(f"Tag '{tag}' not found. Did you call sample() first? Available: {available}")
 
+        fem_meta = None
+        if getattr(self, "_variational_initialized", False):
+            fem_meta = getattr(self, "_variational_sampling_registry", {}).get(tag, None)
+
         # Create Variable placeholder for each spatial dimension
-        coord_vars: List[Any] = [Variable(tag=tag, dim=[i, i + 1], domain=self, axis="spatial") for i in range(self.dimension)]
+        coord_vars: List[Any] = [Variable(tag=tag, dim=[i, i + 1], domain=self, axis="spatial",fem_meta=fem_meta) for i in range(self.dimension)]
 
         # Always add temporal variable (constant 1 for stationary problems)
-        coord_vars.append(Variable(tag="__time__", dim=[0, 1], domain=self, axis="temporal"))
+        coord_vars.append(Variable(tag="__time__", dim=[0, 1], domain=self, axis="temporal", fem_meta=None,))
 
         if normals:
             if reverse_normals:

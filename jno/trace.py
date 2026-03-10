@@ -49,6 +49,8 @@ __all__ = [
     "cse",
     "TestFunction",
     "Assembly",
+    "TrialFunction",
+    "FemLinearSystem",
 ]
 
 # Global counter for unique operation IDs
@@ -184,16 +186,16 @@ class Placeholder:
             shape = tuple(shape[0])
         return FunctionCall(lambda x, s=shape: x.reshape(s), [self], name="reshape")
     
-    def assemble(self, domain,tag="fem_gauss"):
+    def assemble(self, domain, target="vpinn", **kwargs):
         """
-        Triggers the FEM local-to-global assembly for this expression.
-        Args:
-            tag: The domain tag to integrate over (e.g., "fem_gauss" for volume, 
-                 or "top" for a Neumann surface boundary).
-        Returns:
-            An Assembly node representing the global residual vector.
+        Unified variational assembly entry point.
+
+        target="vpinn"      -> assemble weak residual / VPINN quantity
+        target="fem_system" -> assemble FEM matrices (A, b)
+
+        Additional kwargs can carry backend-specific options, e.g. model=u_net.
         """
-        return Assembly(self, domain,tag)
+        return domain.assemble_weak_form(self, target=target, **kwargs)
 
     def print(self, what: Union[str, Callable[[jnp.ndarray], Any]] = "shape", label: Optional[str] = None):
         """Emit runtime debug info for this placeholder and pass it through.
@@ -747,10 +749,11 @@ class Variable(Placeholder):
     ``context["__time__"]`` entry that is a scalar (after the T vmap).
     """
 
-    def __init__(self, tag: str, dim: list, domain: Any, axis: str = "spatial"):
+    def __init__(self, tag: str, dim: list, domain: Any, axis: str = "spatial", fem_meta: dict | None = None):
         self.tag = tag
         self.dim = dim
         self.axis = axis  # 'spatial' or 'temporal'
+        self.fem_meta = fem_meta  # Optional dict for FEM-specific metadata (e.g., element type, node positions)
         if tag in domain.context.keys():
             self.size = dim[1] - dim[0] if dim[1] is not None else domain.context[tag].shape[-1]
         else:
@@ -760,6 +763,10 @@ class Variable(Placeholder):
     def __repr__(self):
         if self.axis == "temporal":
             return f"Var(t)"
+        if self.fem_meta is not None:
+            support = self.fem_meta.get("support")
+            region = self.fem_meta.get("region_id")
+            return f"Var({self.tag}[{self.dim}], support={support}, region={region})"
         return f"Var({self.tag}[{self.dim}])"
 
 
@@ -1651,38 +1658,83 @@ class Jacobian(Placeholder):
         var_names = ", ".join(str(v) for v in self.variables)
         return f"Jacobian({self.target}, [{var_names}])"
 
-class TestFunction(Placeholder):
+class FemLinearSystem:
+    """Container for a linear FEM contribution A x = b.
+
+    Supports addition/subtraction so separate volume and boundary contributions
+    can be combined naturally before unpacking.
     """
-    Represents an FEM shape function (test function) evaluated at quadrature points.
-    During evaluation, this maps to the precomputed jax-fem shape values/gradients
-    for the specified tag.
+
+    def __init__(self, A, b):
+        self.A = A
+        self.b = b
+
+    def __iter__(self):
+        yield self.A
+        yield self.b
+
+    def __add__(self, other):
+        if not isinstance(other, FemLinearSystem):
+            return NotImplemented
+        return FemLinearSystem(self.A + other.A, self.b + other.b)
+
+    def __sub__(self, other):
+        if not isinstance(other, FemLinearSystem):
+            return NotImplemented
+        return FemLinearSystem(self.A - other.A, self.b - other.b)
+
+    def __repr__(self):
+        shape = getattr(self.A, "shape", None)
+        return f"FemLinearSystem(shape={shape}, b_shape={getattr(self.b, 'shape', None)})"
+
+
+class TrialFunction(Placeholder):
     """
-    def __init__(self, tag="fem_gauss", name="phi"):
-        self.tag = tag
+    Generic variational unknown symbol.
+    Interpretation depends on assembly target:
+      - vpinn      -> interpreted via model/u_net
+      - fem_system -> interpreted as FE trial function
+    """
+    def __init__(self, name="u"):
         self.name = name
         self.op_id = _next_op_id()
 
     def __repr__(self):
-        return f"TestFunction({self.name}, tag={self.tag})"
+        return f"TrialFunction({self.name})"
+
+class TestFunction(Placeholder):
+    """
+    Generic variational test function.
+    It is resolved against the active bucket (volume or boundary region)
+    during evaluation/assembly.
+    """
+    def __init__(self, name="phi"):
+        self.name = name
+        self.op_id = _next_op_id()
+
+    def __repr__(self):
+        return f"TestFunction({self.name})"
 
 
 class Assembly(Placeholder):
     """
-    Represents the FEM numerical integration and local-to-global scatter-add.
+    Internal assembly node for one already-bucketed variational contribution.
     """
-    def __init__(self, expr: Placeholder, domain_or_nodes, tag: str):
+    def __init__(self, expr: Placeholder, domain_or_nodes, support: str, region_id: str):
         self.expr = expr
-        self.tag = tag
-        # Safely extract the static integer, whether passed a domain or raw int
+        self.support = support          # "volume" | "boundary"
+        self.region_id = region_id      # e.g. "cells", "right", "wall_3", ...
         if hasattr(domain_or_nodes, "context"):
             self.num_total_nodes = int(domain_or_nodes.context["num_total_nodes"])
         else:
             self.num_total_nodes = int(domain_or_nodes)
-            
         self.op_id = _next_op_id()
 
     def __repr__(self):
-        return f"Assemble({self.expr}, tag={self.tag}, nodes={self.num_total_nodes})"
+        return (
+            f"Assemble({self.expr}, support={self.support}, "
+            f"region={self.region_id}, nodes={self.num_total_nodes})"
+        )
 # =============================================================================
 # Tree optimisation — Common Sub-expression Elimination (CSE)
 # =============================================================================
@@ -1743,17 +1795,23 @@ def cse(expr: Placeholder) -> Placeholder:
             return ("Hess", id(node.target), var_ids, node.trace, node.scheme)
         if isinstance(node, Tracker):
             return ("Track", id(node.expr), node.interval)
+        if isinstance(node, TrialFunction):
+            return ("TrialFn", node.name, id(node))
         if isinstance(node, TestFunction):
-            return ("TestFn", node.tag, id(node))
+            return ("TestFn", node.name, id(node))
         if isinstance(node, Assembly):
-            return ("Assembly", node.tag, node.num_total_nodes, id(node.expr))
-        # Fallback — use object identity (no dedup possible)
-        return ("?", id(node))
+            return (
+                "Assembly",
+                node.support,
+                node.region_id,
+                node.num_total_nodes,
+                id(node.expr),
+            )
 
     def _visit(node):
         """Post-order walk: canonicalise children first, then self."""
         # Leaves — always canonical
-        if isinstance(node, (Variable, TensorTag, Constant, Literal,TestFunction)):
+        if isinstance(node, (Variable, TensorTag, Constant, Literal,TestFunction, TestFunction)):
             return node
 
         # ── recurse into children and rebuild if anything changed ──
@@ -1802,7 +1860,7 @@ def cse(expr: Placeholder) -> Placeholder:
         elif isinstance(node, Assembly):
             new_expr = _visit(node.expr)
             if new_expr is not node.expr:
-                node = Assembly(new_expr, node.num_total_nodes, node.tag)
+                node = Assembly(new_expr,node.num_total_nodes, support=node.support, region_id=node.region_id,)
         # ── dedup: if we've seen an identical node, return the earlier one ──
         k = _key(node)
         if k in _canon:
@@ -1900,8 +1958,8 @@ def collect_tags(expr: Placeholder) -> set:
                 visit(v)
         elif isinstance(node, Tracker):
             visit(node.expr)
-        elif isinstance(node, TestFunction):
-            tags.add(node.tag)
+        elif isinstance(node, (TrialFunction, TestFunction)):
+            pass
         elif isinstance(node, Assembly):
             visit(node.expr)
     visit(expr)
@@ -1952,8 +2010,10 @@ def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
             return f"Constant({node.tag}.{node.key}={val})"
         if isinstance(node, Literal):
             return f"Literal({node.value})"
+        if isinstance(node, TrialFunction):
+            return f"TrialFunction({node.name})"
         if isinstance(node, TestFunction):
-            return f"TestFunction({node.name}, tag={node.tag})"
+            return f"TestFunction({node.name})"
         if isinstance(node, Model):
             return f"Model(id={node.layer_id}, {type(node.module).__name__})"
         if isinstance(node, (int, float)):
@@ -2017,10 +2077,12 @@ def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
         elif isinstance(node, Tracker):
             lines.append(f"{p}Tracker(interval={node.interval})")
             _visit(node.expr, depth + 1)
-        elif isinstance(node, TestFunction):
+        elif isinstance(node, (TrialFunction, TestFunction)):
             lines.append(f"{p}{_node_label(node)}")
         elif isinstance(node, Assembly):
-            lines.append(f"{p}Assembly(tag={node.tag})")
+            lines.append(
+                f"{p}Assembly(support={node.support}, region={node.region_id})"
+            )
             _visit(node.expr, depth + 1)
         elif isinstance(node, ConstantNamespace):
             lines.append(f"{p}ConstantNamespace({node._full_tag})")
