@@ -1909,49 +1909,189 @@ class domain(MeshUtils, Geometries):
         return self
 
     # Generators
-    def _build_dirichlet_bc_info(self, dirichlet_tags):
-        """
-        Build JAX-FEM dirichlet_bc_info = [location_fns, vec_ids, value_fns]
-        from mesh tags stored in self._mesh_pool.
+    def _contains_node_type(self, expr, node_type):
+        """Recursively check whether expr contains a node of type node_type."""
+        if isinstance(expr, node_type):
+            return True
 
-        Current version is scalar-only (vec=1).
+        for attr in ("left", "right", "operand", "args", "expr", "integrand"):
+            if hasattr(expr, attr):
+                child = getattr(expr, attr)
+                if isinstance(child, (list, tuple)):
+                    for c in child:
+                        if self._contains_node_type(c, node_type):
+                            return True
+                elif child is not None:
+                    if self._contains_node_type(child, node_type):
+                        return True
+
+        return False
+
+
+    def _strip_test_function_factor(self, expr):
         """
+        Extract the scalar coefficient from a product containing exactly one
+        TestFunction factor.
+
+        Examples handled:
+        phi * g
+        g * phi
+        (-1) * (g * phi)
+        (a * b) * phi
+        phi * (a * b)
+
+        Returns:
+            coeff_expr  (with TestFunction removed)
+            or None if expr is not a pure multiplicative term with exactly one TestFunction.
+        """
+        from .trace import BinaryOp, TestFunction, Literal
+
+        factors = []
+
+        def collect_mul_factors(node):
+            if isinstance(node, BinaryOp) and node.op == "*":
+                collect_mul_factors(node.left)
+                collect_mul_factors(node.right)
+            else:
+                factors.append(node)
+
+        collect_mul_factors(expr)
+
+        test_factors = [f for f in factors if isinstance(f, TestFunction)]
+        if len(test_factors) != 1:
+            return None
+
+        coeff_factors = [f for f in factors if not isinstance(f, TestFunction)]
+        if len(coeff_factors) == 0:
+            return Literal(1.0)
+
+        coeff = coeff_factors[0]
+        for f in coeff_factors[1:]:
+            coeff = BinaryOp("*", coeff, f)
+
+        return coeff
+
+
+    def _is_simple_neumann_load(self, expr):
+        """
+        True for a pure boundary load term scalar(x)*phi with:
+        - contains TestFunction
+        - no TrialFunction
+        - no grad(phi)
+        - no grad(u)
+        """
+        from .trace import TestFunction, TrialFunction, Jacobian  # adapt if needed
+
+        if not self._contains_node_type(expr, TestFunction):
+            return False
+        if self._contains_node_type(expr, TrialFunction):
+            return False
+        if self._contains_node_type(expr, Jacobian):
+            return False
+
+        coeff = self._strip_test_function_factor(expr)
+        return coeff is not None
+    
+    def _make_native_surface_map_from_expr(self, coeff_expr, tag):
         import jax.numpy as jnp
+
+        def surface_map(u, x):
+            local = {
+                "physical_quad_points": x[None, :],
+                "shape_vals": jnp.ones((1, 1)),   # not used by coeff_expr
+                "shape_grads": jnp.zeros((1, 1, x.shape[0])),
+                "cell_sol": jnp.zeros((1, 1)),
+                "tag": tag,
+                "surface": True,
+            }
+
+            coeff_val = self._eval_expr_for_jaxfem(coeff_expr, local)
+            coeff_val = jnp.asarray(coeff_val).reshape(())
+            return jnp.array([coeff_val])
+
+        return surface_map
+    
+    def _build_dirichlet_bc_info(self, dirichlet_tags, dirichlet_value_fns=None):
+        """
+        Build JAX-FEM dirichlet_bc_info = [location_fns, vec_ids, value_fns].
+
+        For standard rectangular boundary names, use geometric predicates directly
+        so corner nodes are included reliably:
+        - left   -> x = xmin
+        - right  -> x = xmax
+        - bottom -> y = ymin
+        - top    -> y = ymax
+
+        Fallback for other tags: use proximity to self._mesh_pool[tag].
+        """
+        import numpy as np
+
+        if dirichlet_value_fns is None:
+            dirichlet_value_fns = {}
+
+        tol = 1e-8
+        pts = np.asarray(self.mesh.points)
+        xy = pts[:, :2]
+
+        xmin = float(np.min(xy[:, 0]))
+        xmax = float(np.max(xy[:, 0]))
+        ymin = float(np.min(xy[:, 1]))
+        ymax = float(np.max(xy[:, 1]))
+
+        def make_left_fn(xmin_val):
+            def loc_fn(p):
+                return jnp.isclose(p[0], xmin_val, atol=tol)
+            return loc_fn
+
+        def make_right_fn(xmax_val):
+            def loc_fn(p):
+                return jnp.isclose(p[0], xmax_val, atol=tol)
+            return loc_fn
+
+        def make_bottom_fn(ymin_val):
+            def loc_fn(p):
+                return jnp.isclose(p[1], ymin_val, atol=tol)
+            return loc_fn
+
+        def make_top_fn(ymax_val):
+            def loc_fn(p):
+                return jnp.isclose(p[1], ymax_val, atol=tol)
+            return loc_fn
+
+        def make_pool_loc_fn(tag_pts_local):
+            tag_pts_local = jnp.asarray(np.asarray(tag_pts_local))
+
+            def loc_fn(p):
+                if tag_pts_local.size == 0:
+                    return False
+                dim = p.shape[0]
+                return jnp.any(jnp.linalg.norm(tag_pts_local[:, :dim] - p[None, :], axis=1) < 1e-6)
+
+            return loc_fn
 
         loc_fns = []
         vec_ids = []
         val_fns = []
 
-        tol = 1e-5
-
         for tag in dirichlet_tags:
-            if tag not in self._mesh_pool:
-                continue
-
-            tag_pts = jnp.asarray(self._mesh_pool[tag])
-
-            def make_loc_fn(pts):
-                def loc_fn(p):
-                    return jnp.any(jnp.linalg.norm(pts - p, axis=-1) < tol)
-                return loc_fn
-
-            # Default scalar component
-            vec_ids.append(0)
-            loc_fns.append(make_loc_fn(tag_pts))
-
-            # ----------------------------
-            # Boundary value functions
-            # ----------------------------
-            # For your Poisson example:
-            #   left   : u = 0
-            #   bottom : u = sin(pi*x)
-            # Everything else defaults to zero.
             if tag == "left":
-                val_fns.append(lambda p: 0.0)
-
+                loc_fn = make_left_fn(xmin)
+            elif tag == "right":
+                loc_fn = make_right_fn(xmax)
             elif tag == "bottom":
-                val_fns.append(lambda p: jnp.sin(jnp.pi * p[0]))
+                loc_fn = make_bottom_fn(ymin)
+            elif tag == "top":
+                loc_fn = make_top_fn(ymax)
+            else:
+                if tag not in self._mesh_pool:
+                    continue
+                loc_fn = make_pool_loc_fn(self._mesh_pool[tag])
 
+            loc_fns.append(loc_fn)
+            vec_ids.append(0)
+
+            if tag in dirichlet_value_fns:
+                val_fns.append(dirichlet_value_fns[tag])
             else:
                 val_fns.append(lambda p: 0.0)
 
@@ -1959,7 +2099,7 @@ class domain(MeshUtils, Geometries):
             return [[lambda p: False], [0], [lambda p: 0.0]]
 
         return [loc_fns, vec_ids, val_fns]
-   
+    
     def variational_symbols(self):
         """
         Return generic variational symbols.
@@ -2010,7 +2150,7 @@ class domain(MeshUtils, Geometries):
             "context_tag": context_tag if context_tag is not None else sample_tag,
         }
 
-    def init_fem(self, element_type: str = "TRI3", quad_degree: int = 2, neumann_tags: List[str] = [], dirichlet_tags: List[str] = [], fem_solver: bool = False) -> "domain":
+    def init_fem(self, element_type: str = "TRI3", quad_degree: int = 2, neumann_tags: List[str] = [], dirichlet_tags: List[str] = [], dirichlet_value_fns: dict | None = None, fem_solver: bool = False) -> "domain":
         if self.mesh is None:
             raise ValueError("Mesh must be loaded before initializing FEM context.")
         self._variational_initialized = True
@@ -2029,17 +2169,23 @@ class domain(MeshUtils, Geometries):
         location_fns = []
         valid_tags = []
         for tag in neumann_tags:
-            if tag in self._mesh_pool:
+            loc_fn = self._make_standard_boundary_location_fn(tag)
+            if loc_fn is None:
+                if tag in self._mesh_pool:
+                    valid_tags.append(tag)
+                    tag_pts = jnp.asarray(self._mesh_pool[tag])
+
+                    def make_loc_fn(pts):
+                        def loc_fn(p):
+                            return jnp.any(jnp.linalg.norm(pts - p, axis=-1) < 1e-5)
+                        return loc_fn
+
+                    location_fns.append(make_loc_fn(tag_pts))
+            else:
                 valid_tags.append(tag)
-                tag_pts = jnp.asarray(self._mesh_pool[tag]) 
-                
-                def make_loc_fn(pts):
-                    def loc_fn(p):
-                        return jnp.any(jnp.linalg.norm(pts - p, axis=-1) < 1e-5)
-                    return loc_fn
-                
-                location_fns.append(make_loc_fn(tag_pts))
-        dirichlet_bc_info = self._build_dirichlet_bc_info(dirichlet_tags)
+                location_fns.append(loc_fn)
+                print("[ELSE BLOCK]")
+        dirichlet_bc_info = self._build_dirichlet_bc_info(dirichlet_tags, dirichlet_value_fns)
 
         class DummyProblem(Problem):
             def get_tensor_map(self): 
@@ -2077,16 +2223,13 @@ class domain(MeshUtils, Geometries):
 
         # --- Identify Dirichlet node indices ---
         dirichlet_nodes = []
-        if dirichlet_tags:
-            tree = KDTree(fe.points)
-            for tag in dirichlet_tags:
-                if tag in self._mesh_pool:
-                    # Query the global indices of the points belonging to this Dirichlet tag
-                    _, inds = tree.query(self._mesh_pool[tag])
-                    dirichlet_nodes.extend(inds)
-        
-        # Ensure unique integer indices
-        dirichlet_nodes = jnp.array(list(set(dirichlet_nodes)), dtype=jnp.int32) if dirichlet_nodes else jnp.array([], dtype=jnp.int32)
+        for node_inds in getattr(fe, "node_inds_list", []):
+            dirichlet_nodes.extend(np.asarray(node_inds).reshape(-1).tolist())
+
+        dirichlet_nodes = (
+            jnp.array(sorted(set(dirichlet_nodes)), dtype=jnp.int32)
+            if dirichlet_nodes else jnp.array([], dtype=jnp.int32)
+        )
         # --- Precompute Constants for Fast Assembly ---
         shape_vals_jax = jnp.asarray(fe.shape_vals)
         shape_grads_jax = jnp.asarray(fe.shape_grads)
@@ -2121,6 +2264,9 @@ class domain(MeshUtils, Geometries):
             region_id="volume",
             context_tag="fem_gauss",
         )
+        self._fem_dirichlet_tags = list(dirichlet_tags)
+        self._fem_neumann_tags = list(neumann_tags)
+        self._fem_dirichlet_value_fns = dirichlet_value_fns if dirichlet_value_fns is not None else {}
         # --- Extract Native jax-fem Nanson Scales for Neumann ---
         for i, tag in enumerate(valid_tags):
             inds = prob.boundary_inds_list[i]
@@ -2333,6 +2479,7 @@ class domain(MeshUtils, Geometries):
             Hessian,
             Tracker,
             Assembly,
+            GroupedAssembly,
             Placeholder,
         )
 
@@ -2424,72 +2571,250 @@ class domain(MeshUtils, Geometries):
                     region_id=node.region_id,
                 )
             return node
+        if isinstance(node, GroupedAssembly):
+            new_volume = (
+                self._substitute_trial_for_vpinn(node.volume_expr, trial_value)
+                if node.volume_expr is not None
+                else None
+            )
 
+            new_boundary = {}
+            changed = (new_volume is not node.volume_expr)
+
+            for region_id, bnd_expr in node.boundary_exprs.items():
+                new_expr = self._substitute_trial_for_vpinn(bnd_expr, trial_value)
+                new_boundary[region_id] = new_expr
+                if new_expr is not bnd_expr:
+                    changed = True
+
+            if changed:
+                return GroupedAssembly(
+                    new_volume,
+                    new_boundary,
+                    node.num_total_nodes,
+                )
+            return node
         return node
     
     def _assemble_vpinn_grouped(self, volume_terms, boundary_terms, **kwargs):
         """
-        Grouped VPINN assembly:
-          - one Assembly for volume
-          - one Assembly per boundary region
-          - add them together
+        Grouped VPINN assembly in one internal node.
         """
-        from .trace import Assembly
+        from .trace import GroupedAssembly
 
-        assembled_parts = []
+        vol_expr = self._sum_terms(volume_terms) if len(volume_terms) > 0 else None
+        boundary_exprs = {
+            region_id: self._sum_terms(terms)
+            for region_id, terms in boundary_terms.items()
+        }
 
-        if len(volume_terms) > 0:
-            vol_expr = self._sum_terms(volume_terms)
-            assembled_parts.append(
-                Assembly(vol_expr, self, support="volume", region_id="volume")
-            )
-
-        for region_id, terms in boundary_terms.items():
-            bnd_expr = self._sum_terms(terms)
-            assembled_parts.append(
-                Assembly(bnd_expr, self, support="boundary", region_id=region_id)
-            )
-
-        if len(assembled_parts) == 0:
+        if vol_expr is None and len(boundary_exprs) == 0:
             raise ValueError("No terms found for VPINN assembly.")
 
-        out = assembled_parts[0]
-        for part in assembled_parts[1:]:
-            out = out + part
-        return out
+        return GroupedAssembly(vol_expr, boundary_exprs, self)
+
+    def _make_standard_boundary_location_fn(self, tag):
+        import numpy as np
+        import jax.numpy as jnp
+
+        pts = np.asarray(self.mesh.points)[:, :2]
+        xmin = float(np.min(pts[:, 0]))
+        xmax = float(np.max(pts[:, 0]))
+        ymin = float(np.min(pts[:, 1]))
+        ymax = float(np.max(pts[:, 1]))
+        tol = 1e-8
+
+        if tag == "left":
+            def loc_fn(p):
+                return jnp.isclose(p[0], xmin, atol=tol)
+            return loc_fn
+
+        if tag == "right":
+            def loc_fn(p):
+                return jnp.isclose(p[0], xmax, atol=tol)
+            return loc_fn
+
+        if tag == "bottom":
+            def loc_fn(p):
+                return jnp.isclose(p[1], ymin, atol=tol)
+            return loc_fn
+
+        if tag == "top":
+            def loc_fn(p):
+                return jnp.isclose(p[1], ymax, atol=tol)
+            return loc_fn
+
+        return None
 
     def _assemble_fem_system_grouped(self, volume_terms, boundary_terms, **kwargs):
         """
-        Grouped FEM assembly:
-          - assemble volume contribution
-          - assemble one contribution per boundary region
-          - sum into one FemLinearSystem
-          - return (A, b)
+        Grouped FEM assembly in ONE JAX-FEM Problem:
+        - grouped volume term through universal kernel
+        - simple Neumann loads through native surface_maps
+        - non-simple boundary terms through universal surface kernels
+        - one BC-aware A,b extracted from JAX-FEM
         """
-        system = None
+        if not getattr(self, "_fem_solver_enabled", False):
+            raise ValueError("Call init_fem(..., fem_solver=True) to enable the FEM solver route.")
 
-        if len(volume_terms) > 0:
-            vol_expr = self._sum_terms(volume_terms)
-            vol_sys = self._fem_assemble_bucket(
-                vol_expr,
-                support="volume",
-                region_id="volume",
-            )
-            system = vol_sys if system is None else (system + vol_sys)
+        try:
+            from jax_fem.problem import Problem
+            from jax_fem.solver import get_A, apply_bc_vec
+        except Exception as exc:
+            raise ImportError(
+                "jax_fem and jax_fem.solver.get_A/apply_bc_vec are required for fem_solver=True."
+            ) from exc
 
-        for region_id, terms in boundary_terms.items():
-            bnd_expr = self._sum_terms(terms)
-            bnd_sys = self._fem_assemble_bucket(
-                bnd_expr,
-                support="boundary",
-                region_id=region_id,
-            )
-            system = bnd_sys if system is None else (system + bnd_sys)
+        import numpy as onp
+        import jax
+        import jax.numpy as jnp
+        import scipy.sparse as sp
+        solver_ctx = self._jaxfem_solver_context
 
-        if system is None:
+        vol_expr = self._sum_terms(volume_terms) if len(volume_terms) > 0 else None
+        boundary_exprs = {
+            region_id: self._sum_terms(terms)
+            for region_id, terms in boundary_terms.items()
+        }
+
+        if vol_expr is None and len(boundary_exprs) == 0:
             raise ValueError("No terms found for FEM assembly.")
 
-        return system.A, system.b
+        compiled_volume_expr = None
+        if vol_expr is not None:
+            compiled_volume_expr = self._compile_weakform_for_jaxfem(vol_expr, tag="fem_gauss")
+
+        active_boundary_tags = list(boundary_exprs.keys())
+
+        native_surface_maps = []
+        universal_surface_kernels = []
+
+        print(">>> ENTERED _assemble_fem_system_grouped", flush=True)
+        print("active_boundary_tags =", active_boundary_tags, flush=True)
+        for tag in active_boundary_tags:
+            expr = boundary_exprs[tag]
+
+            is_simple = self._is_simple_neumann_load(expr)
+            print(f"[FEM] tag={tag}, simple_neumann={is_simple}", flush=True)
+
+            if is_simple:
+                coeff_expr = self._strip_test_function_factor(expr)
+                native_surface_maps.append(self._make_native_surface_map_from_expr(coeff_expr, tag))
+
+                def zero_surface_kernel(cell_sol_flat, physical_surface_quad_points,
+                                        face_shape_vals, face_shape_grads, face_nanson_scale,
+                                        *cell_internal_vars_surface):
+                    return jnp.zeros_like(cell_sol_flat)
+
+                universal_surface_kernels.append(zero_surface_kernel)
+
+            else:
+                def zero_surface_map(u, x):
+                    return jnp.array([0.0])
+
+                native_surface_maps.append(zero_surface_map)
+
+                compiled_expr = self._compile_weakform_for_jaxfem(expr, tag=tag)
+
+                def make_surface_kernel(compiled_expr_local):
+                    def kernel(cell_sol_flat, physical_surface_quad_points,
+                            face_shape_vals, face_shape_grads, face_nanson_scale,
+                            *cell_internal_vars_surface):
+                        return self._eval_compiled_surface_integrand(
+                            compiled_expr_local,
+                            cell_sol_flat,
+                            physical_surface_quad_points,
+                            face_shape_vals,
+                            face_shape_grads,
+                            face_nanson_scale,
+                        )
+                    return kernel
+
+                universal_surface_kernels.append(make_surface_kernel(compiled_expr))
+
+        parent = self
+        dirichlet_bc_info = self._build_dirichlet_bc_info(
+            solver_ctx["dirichlet_tags"],
+            getattr(self, "_fem_dirichlet_value_fns", None),
+        )
+
+        # Important: use the same ordering as active_boundary_tags
+        location_fns = []
+        for tag in active_boundary_tags:
+            loc_fn = self._make_standard_boundary_location_fn(tag)
+
+            if loc_fn is None:
+                # fallback for non-standard tags
+                tag_pts = jnp.asarray(self._mesh_pool[tag])
+
+                def make_loc_fn(pts):
+                    def loc_fn(p):
+                        return jnp.any(jnp.linalg.norm(pts - p, axis=-1) < 1e-5)
+                    return loc_fn
+
+                loc_fn = make_loc_fn(tag_pts)
+
+            location_fns.append(loc_fn)
+
+        class GeneratedProblem(Problem):
+            def get_universal_kernel(self_inner):
+                if compiled_volume_expr is None:
+                    return None
+
+                def kernel(cell_sol_flat, physical_quad_points, cell_shape_grads,
+                        cell_JxW, cell_v_grads_JxW, *cell_internal_vars):
+                    return parent._eval_compiled_volume_integrand(
+                        compiled_volume_expr,
+                        cell_sol_flat,
+                        physical_quad_points,
+                        cell_shape_grads,
+                        cell_JxW,
+                        cell_v_grads_JxW,
+                    )
+                return kernel
+
+            def get_surface_maps(self_inner):
+                return native_surface_maps
+
+            def get_universal_kernels_surface(self_inner):
+                return universal_surface_kernels
+
+        problem = GeneratedProblem(
+            solver_ctx["mesh"],
+            vec=1,
+            dim=solver_ctx["dim"],
+            ele_type=solver_ctx["element_type"],
+            gauss_order=solver_ctx["quad_degree"],
+            dirichlet_bc_info=dirichlet_bc_info,
+            location_fns=location_fns,
+        )
+
+        node_inds_list = getattr(problem.fes[0], "node_inds_list", None)
+        if node_inds_list is None:
+            print("Dirichlet node count: 0")
+        else:
+            total_dirichlet_nodes = sum(len(onp.asarray(inds).reshape(-1)) for inds in node_inds_list)
+            print("Dirichlet node count (raw, all groups):", total_dirichlet_nodes)
+
+        zero_sol = [jnp.zeros((problem.fes[0].num_total_nodes, 1), dtype=jnp.float64)]
+
+        res_list = problem.newton_update(zero_sol)
+
+        dofs0 = jax.flatten_util.ravel_pytree(zero_sol)[0]
+        raw_res_vec = jax.flatten_util.ravel_pytree(res_list)[0]
+
+        res_vec_bc = apply_bc_vec(raw_res_vec, dofs0, problem)
+        A = get_A(problem)
+
+        b = -onp.asarray(res_vec_bc)
+
+        if hasattr(A, "getValuesCSR"):
+            indptr, indices, data = A.getValuesCSR()
+            A = sp.csr_matrix((data, indices, indptr), shape=A.getSize())
+        else:
+            A = A.tocsr() if hasattr(A, "tocsr") else A
+
+        return A, b
 
     def _fem_assemble_bucket(self, expr, support: str, region_id: str):
         """Assemble a linear system contribution using JAX-FEM kernels.
@@ -2505,9 +2830,16 @@ class domain(MeshUtils, Geometries):
         except Exception as exc:
             raise ImportError("jax_fem is required for fem_solver=True, but it could not be imported.") from exc
 
-        import scipy.sparse as sp
         import numpy as onp
+        import jax
         import jax.numpy as jnp
+
+        try:
+            from jax_fem.solver import get_A, apply_bc_vec
+        except Exception as exc:
+            raise ImportError(
+                "Could not import get_A/apply_bc_vec from jax_fem.solver."
+            ) from exc
 
         if support == "volume":
             tag = "fem_gauss"
@@ -2579,37 +2911,38 @@ class domain(MeshUtils, Geometries):
             dirichlet_bc_info=solver_ctx["dirichlet_bc_info"],
             location_fns=solver_ctx["location_fns"],
         )
-        print("Dirichlet node count:", len(problem.fes[0].node_inds_list[0]) if getattr(problem.fes[0], "node_inds_list", None) else 0)
+        node_inds_list = getattr(problem.fes[0], "node_inds_list", None)
+        if node_inds_list is None:
+            print("Dirichlet node count: 0")
+        else:
+            total_dirichlet_nodes = sum(len(onp.asarray(inds).reshape(-1)) for inds in node_inds_list)
+            print("Dirichlet node count (raw, all groups):", total_dirichlet_nodes)
         zero_sol = [jnp.zeros((problem.fes[0].num_total_nodes, 1), dtype=jnp.float64)]
 
-        # JAX-FEM assembles residual and tangent around zero state
+        # Assemble raw residual/tangent around zero state
         res_list = problem.newton_update(zero_sol)
-        b = -onp.asarray(res_list[0]).reshape(-1)
 
-        A = sp.coo_matrix(
-            (problem.V, (problem.I, problem.J)),
-            shape=(problem.num_total_dofs_all_vars, problem.num_total_dofs_all_vars),
-        ).tocsr()
+        # Flatten dofs and residual in the same format JAX-FEM solver expects
+        dofs0 = jax.flatten_util.ravel_pytree(zero_sol)[0]
+        raw_res_vec = jax.flatten_util.ravel_pytree(res_list)[0]
 
-        # Optional strong Dirichlet elimination for scalar single-field case
-        dirichlet_nodes = onp.asarray(
-            problem.fes[0].node_inds_list[0] if getattr(problem.fes[0], "node_inds_list", None) else [],
-            dtype=onp.int64,
-        )
+        # Let JAX-FEM apply its own Dirichlet row-elimination formulation
+        res_vec_bc = apply_bc_vec(raw_res_vec, dofs0, problem)
+        A = get_A(problem)
 
-        dirichlet_vals = onp.asarray(
-            problem.fes[0].vals_list[0] if getattr(problem.fes[0], "vals_list", None) else [],
-            dtype=onp.float64,
-        ).reshape(-1)
+        # For a linear problem at zero state:
+        #   A u + res_vec_bc = 0   =>   A u = -res_vec_bc
+        b = -onp.asarray(res_vec_bc)
 
-        if dirichlet_nodes.size > 0:
-            A = A.tolil()
-            for node, val in zip(dirichlet_nodes, dirichlet_vals):
-                A[node, :] = 0.0
-                A[:, node] = 0.0
-                A[node, node] = 1.0
-                b[node] = val
-            A = A.tocsr()
+        # Normalize matrix type for downstream use with Lineax / SciPy conversions
+        if hasattr(A, "getValuesCSR"):
+            # PETSc-like matrix from jax_fem path
+            indptr, indices, data = A.getValuesCSR()
+            import scipy.sparse as sp
+            A = sp.csr_matrix((data, indices, indptr), shape=A.getSize())
+        else:
+            # SciPy path from jax_fem.get_A pure-scipy bypass
+            A = A.tocsr() if hasattr(A, "tocsr") else A
 
         return FemLinearSystem(A, b)
 

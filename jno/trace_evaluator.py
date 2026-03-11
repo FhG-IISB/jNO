@@ -24,6 +24,7 @@ from .trace import (
     Jacobian,
     TestFunction, 
     Assembly,
+    GroupedAssembly,
 )
 
 
@@ -193,6 +194,11 @@ class TraceEvaluator:
             self._trace_visit(node.target, ctx, depth + 1, lines, seen)
         elif isinstance(node, Assembly):
             self._trace_visit(node.expr, ctx, depth + 1, lines, seen)
+        elif isinstance(node, GroupedAssembly):
+            if node.volume_expr is not None:
+                self._trace_visit(node.volume_expr, ctx, depth + 1, lines, seen)
+            for bnd_expr in node.boundary_exprs.values():
+                self._trace_visit(bnd_expr, ctx, depth + 1, lines, seen)
         # Leaf nodes (Variable, TensorTag, Constant, Literal) — no children
 
     def _infer_shape_from_children(self, node, ctx):
@@ -228,6 +234,8 @@ class TraceEvaluator:
                 return f"~{ts}  (derivative)"
             return "??"
         if isinstance(node, Assembly):
+            return f"({node.num_total_nodes},)"
+        if isinstance(node, GroupedAssembly):
             return f"({node.num_total_nodes},)"
         if isinstance(node, FunctionCall):
             # Reductions like .mse produce ()
@@ -283,6 +291,7 @@ class TraceEvaluator:
         (OperationDef, "_eval_operation_def"),
         (TestFunction, "_eval_test_function"), 
         (Assembly, "_eval_assembly"),
+        (GroupedAssembly, "_eval_grouped_assembly"),
     ]
 
     def _dispatch(self, expr, ctx):
@@ -934,12 +943,12 @@ class TraceEvaluator:
         if global_residual.ndim == 1:
             global_residual = global_residual[:, jnp.newaxis]
 
-        # Volume normalization only
-        if expr.support == "volume" and "global_areas" in ctx.context:
-            areas = ctx.context["global_areas"].reshape(-1, 1)
-            global_residual = global_residual / (areas + 1e-12)
+        # # Volume normalization only
+        # if expr.support == "volume" and "global_areas" in ctx.context:
+        #     areas = ctx.context["global_areas"].reshape(-1, 1)
+        #     global_residual = global_residual / (areas + 1e-12)
 
-        # Optional boundary normalization if you want it later:
+        # # Optional boundary normalization if you want it later:
         # elif expr.support == "boundary":
         #     b_areas = ctx.context["surface_data"][expr.region_id]["global_boundary_areas"].reshape(-1, 1)
         #     global_residual = global_residual / (b_areas + 1e-12)
@@ -951,6 +960,95 @@ class TraceEvaluator:
 
         return global_residual
    
+    def _eval_grouped_assembly(self, expr, ctx):
+        total = None
+
+        # -------------------------
+        # Volume contribution
+        # -------------------------
+        if expr.volume_expr is not None:
+            vol_ctx = self._EvalCtx(
+                ctx.context,
+                ctx.var_bindings,
+                ctx.key,
+                active_region={"support": "volume", "region_id": "volume"},
+            )
+
+            integrand = self._dispatch(expr.volume_expr, vol_ctx)
+
+            weights = ctx.context["JxW"]
+            flat_cells = ctx.context["flat_cells"].flatten()
+
+            num_entities, num_quads = weights.shape[-2], weights.shape[-1]
+            weights_flat = weights.flatten()[:, jnp.newaxis]
+
+            local_residuals = integrand * weights_flat
+            num_local_nodes = integrand.shape[-1]
+
+            local_residuals = local_residuals.reshape(num_entities, num_quads, num_local_nodes)
+            cell_residuals = jnp.sum(local_residuals, axis=1)
+
+            vol_res = jax.ops.segment_sum(
+                cell_residuals.flatten(),
+                flat_cells,
+                num_segments=expr.num_total_nodes,
+            )
+
+            if vol_res.ndim == 1:
+                vol_res = vol_res[:, jnp.newaxis]
+
+            total = vol_res if total is None else (total + vol_res)
+
+        # -------------------------
+        # Boundary contributions
+        # -------------------------
+        for region_id, bnd_expr in expr.boundary_exprs.items():
+            bnd_ctx = self._EvalCtx(
+                ctx.context,
+                ctx.var_bindings,
+                ctx.key,
+                active_region={"support": "boundary", "region_id": region_id},
+            )
+
+            integrand = self._dispatch(bnd_expr, bnd_ctx)
+
+            surf_data = ctx.context["surface_data"][region_id]
+            weights = surf_data["nanson_scale"]
+            flat_cells = surf_data["flat_parent_nodes"].flatten()
+
+            num_entities, num_quads = weights.shape[-2], weights.shape[-1]
+            weights_flat = weights.flatten()[:, jnp.newaxis]
+
+            local_residuals = integrand * weights_flat
+            num_local_nodes = integrand.shape[-1]
+
+            local_residuals = local_residuals.reshape(num_entities, num_quads, num_local_nodes)
+            cell_residuals = jnp.sum(local_residuals, axis=1)
+
+            bnd_res = jax.ops.segment_sum(
+                cell_residuals.flatten(),
+                flat_cells,
+                num_segments=expr.num_total_nodes,
+            )
+
+            if bnd_res.ndim == 1:
+                bnd_res = bnd_res[:, jnp.newaxis]
+
+            total = bnd_res if total is None else (total + bnd_res)
+
+        if total is None:
+            raise ValueError("GroupedAssembly has neither volume nor boundary expressions.")
+        if "global_areas" in ctx.context:
+            areas = jnp.asarray(ctx.context["global_areas"]).reshape(-1, 1)
+            total = total / (areas + 1e-12)
+        # Keep the current optional Dirichlet zeroing behavior
+        if "dirichlet_nodes" in ctx.context:
+            d_nodes = jnp.asarray(ctx.context["dirichlet_nodes"]).flatten().astype(jnp.int32)
+            if d_nodes.size > 0:
+                total = total.at[d_nodes].set(0.0)
+
+        return total
+    
     @staticmethod
     def _node_label(node) -> Tuple[str, str]:
         """Return (uid, label) — rendered separately by _trace_visit."""

@@ -49,6 +49,7 @@ __all__ = [
     "cse",
     "TestFunction",
     "Assembly",
+    "GroupedAssembly",
     "TrialFunction",
     "FemLinearSystem",
 ]
@@ -1551,6 +1552,13 @@ class OperationDef(Placeholder):
             elif isinstance(node, OperationCall):
                 for arg in node.args:
                     visit(arg)
+            elif isinstance(node, GroupedAssembly):
+                if node.volume_expr is not None:
+                    visit(node.volume_expr)
+                for bnd_expr in node.boundary_exprs.values():
+                    visit(bnd_expr)
+            elif isinstance(node, Assembly):
+                visit(node.expr)
 
         visit(expr)
         return vars_found
@@ -1569,6 +1577,12 @@ class OperationDef(Placeholder):
                 return any(visit(arg) for arg in node.args if isinstance(arg, Placeholder))
             elif isinstance(node, OperationCall):
                 return node.operation.has_trainable
+            elif isinstance(node, Assembly):
+                return visit(node.expr)
+            elif isinstance(node, GroupedAssembly):
+                vol_has = visit(node.volume_expr) if node.volume_expr is not None else False
+                bnd_has = any(visit(expr) for expr in node.boundary_exprs.values())
+                return vol_has or bnd_has
             return False
 
         return visit(expr)
@@ -1735,6 +1749,29 @@ class Assembly(Placeholder):
             f"Assemble({self.expr}, support={self.support}, "
             f"region={self.region_id}, nodes={self.num_total_nodes})"
         )
+
+class GroupedAssembly(Placeholder):
+    """
+    Internal node for a grouped variational assembly:
+      - optional volume expression
+      - optional boundary expressions by region
+    Evaluated in one pass by the trace evaluator.
+    """
+    def __init__(self, volume_expr, boundary_exprs, domain_or_nodes):
+        self.volume_expr = volume_expr                  # Placeholder | None
+        self.boundary_exprs = boundary_exprs or {}      # dict[str, Placeholder]
+        if hasattr(domain_or_nodes, "context"):
+            self.num_total_nodes = int(domain_or_nodes.context["num_total_nodes"])
+        else:
+            self.num_total_nodes = int(domain_or_nodes)
+        self.op_id = _next_op_id()
+
+    def __repr__(self):
+        bkeys = list(self.boundary_exprs.keys())
+        return (
+            f"GroupedAssembly(volume={'yes' if self.volume_expr is not None else 'no'}, "
+            f"boundaries={bkeys}, nodes={self.num_total_nodes})"
+        )
 # =============================================================================
 # Tree optimisation — Common Sub-expression Elimination (CSE)
 # =============================================================================
@@ -1807,6 +1844,13 @@ def cse(expr: Placeholder) -> Placeholder:
                 node.num_total_nodes,
                 id(node.expr),
             )
+        if isinstance(node, GroupedAssembly):
+            return (
+                "GroupedAssembly",
+                id(node.volume_expr) if node.volume_expr is not None else None,
+                tuple((k, id(v)) for k, v in sorted(node.boundary_exprs.items())),
+                node.num_total_nodes,
+            )
 
     def _visit(node):
         """Post-order walk: canonicalise children first, then self."""
@@ -1861,6 +1905,23 @@ def cse(expr: Placeholder) -> Placeholder:
             new_expr = _visit(node.expr)
             if new_expr is not node.expr:
                 node = Assembly(new_expr,node.num_total_nodes, support=node.support, region_id=node.region_id,)
+        elif isinstance(node, GroupedAssembly):
+            new_volume = _visit(node.volume_expr) if node.volume_expr is not None else None
+            new_boundary = {}
+            changed = (new_volume is not node.volume_expr)
+
+            for region_id, bnd_expr in node.boundary_exprs.items():
+                new_expr = _visit(bnd_expr)
+                new_boundary[region_id] = new_expr
+                if new_expr is not bnd_expr:
+                    changed = True
+
+            if changed:
+                node = GroupedAssembly(
+                    new_volume,
+                    new_boundary,
+                    node.num_total_nodes,
+                )
         # ── dedup: if we've seen an identical node, return the earlier one ──
         k = _key(node)
         if k in _canon:
@@ -1917,6 +1978,11 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
             visit(node.expr)
         elif isinstance(node, Assembly):
             visit(node.expr)
+        elif isinstance(node, GroupedAssembly):
+            if node.volume_expr is not None:
+                visit(node.volume_expr)
+            for bnd_expr in node.boundary_exprs.values():
+                visit(bnd_expr)
     visit(expr)
     return ops
 
@@ -1962,6 +2028,11 @@ def collect_tags(expr: Placeholder) -> set:
             pass
         elif isinstance(node, Assembly):
             visit(node.expr)
+        elif isinstance(node, GroupedAssembly):
+            if node.volume_expr is not None:
+                visit(node.volume_expr)
+            for bnd_expr in node.boundary_exprs.values():
+                visit(bnd_expr)
     visit(expr)
     return tags
 
@@ -2084,6 +2155,14 @@ def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
                 f"{p}Assembly(support={node.support}, region={node.region_id})"
             )
             _visit(node.expr, depth + 1)
+        elif isinstance(node, GroupedAssembly):
+            lines.append(f"{p}GroupedAssembly(nodes={node.num_total_nodes})")
+            if node.volume_expr is not None:
+                lines.append(f"{p}  volume:")
+                _visit(node.volume_expr, depth + 2)
+            for region_id, bnd_expr in node.boundary_exprs.items():
+                lines.append(f"{p}  boundary[{region_id}]:")
+                _visit(bnd_expr, depth + 2)
         elif isinstance(node, ConstantNamespace):
             lines.append(f"{p}ConstantNamespace({node._full_tag})")
         elif isinstance(node, Placeholder):
