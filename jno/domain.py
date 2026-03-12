@@ -1685,6 +1685,76 @@ class MeshUtils:
         return area, grad_phi
 
 
+@dataclass
+class BoundaryRegion:
+    tag: str
+    dim: int
+    points: np.ndarray
+    edges: Optional[np.ndarray] = None
+    triangles: Optional[np.ndarray] = None
+    tol: float = 1e-8
+
+    def contains(self, p):
+        import jax.numpy as jnp
+
+        p = jnp.asarray(p)[: self.dim]
+
+        # 2D: segment membership
+        if self.dim == 2 and self.edges is not None and len(self.edges) > 0:
+            a = jnp.asarray(self.edges[:, 0, :])   # (E,2)
+            b = jnp.asarray(self.edges[:, 1, :])   # (E,2)
+
+            ab = b - a
+            ap = p[None, :] - a
+
+            ab_len2 = jnp.sum(ab * ab, axis=1)
+            ab_len2 = jnp.maximum(ab_len2, 1e-30)
+
+            t = jnp.sum(ap * ab, axis=1) / ab_len2
+            t = jnp.clip(t, 0.0, 1.0)
+
+            proj = a + t[:, None] * ab
+            dist2 = jnp.sum((proj - p[None, :]) ** 2, axis=1)
+            return jnp.any(dist2 <= self.tol * self.tol)
+
+        # 3D: triangle membership
+        if self.dim == 3 and self.triangles is not None and len(self.triangles) > 0:
+            a = jnp.asarray(self.triangles[:, 0, :])   # (T,3)
+            b = jnp.asarray(self.triangles[:, 1, :])
+            c = jnp.asarray(self.triangles[:, 2, :])
+
+            ab = b - a
+            ac = c - a
+            ap = p[None, :] - a
+
+            n = jnp.cross(ab, ac)
+            n_norm = jnp.linalg.norm(n, axis=1)
+            n_norm = jnp.maximum(n_norm, 1e-30)
+
+            plane_dist = jnp.abs(jnp.sum(ap * n, axis=1)) / n_norm
+
+            d00 = jnp.sum(ab * ab, axis=1)
+            d01 = jnp.sum(ab * ac, axis=1)
+            d11 = jnp.sum(ac * ac, axis=1)
+            d20 = jnp.sum(ap * ab, axis=1)
+            d21 = jnp.sum(ap * ac, axis=1)
+
+            denom = d00 * d11 - d01 * d01
+            denom = jnp.maximum(denom, 1e-30)
+
+            v = (d11 * d20 - d01 * d21) / denom
+            w = (d00 * d21 - d01 * d20) / denom
+            u = 1.0 - v - w
+
+            inside = (u >= -1e-8) & (v >= -1e-8) & (w >= -1e-8)
+            return jnp.any((plane_dist <= self.tol) & inside)
+
+        # fallback only if no explicit entities are available
+        pts = jnp.asarray(self.points[:, : self.dim])
+        d = jnp.linalg.norm(pts - p[None, :], axis=1)
+        return jnp.any(d <= self.tol)
+
+
 class domain(MeshUtils, Geometries):
     """
     Mesh-based domain class for defining computational domains and sampling collocation points.
@@ -1719,6 +1789,11 @@ class domain(MeshUtils, Geometries):
         self.context: Dict[str, Any] = {}  # unified: spatial (B,N,D) + params (B,F)
         self._param_tags: set = set()  # tags that are parametric (TensorTag)
         self.normals_by_tag: Dict[str, np.ndarray] = {}
+        self._boundary_registry: Dict[str, Dict[str, Any]] = {}
+        self._tag_edges: Dict[str, np.ndarray] = {}
+        self._tag_triangles: Dict[str, np.ndarray] = {}
+        self._boundary_regions: Dict[str, BoundaryRegion] = {}
+        #self._boundary_predicates: Dict[str, Callable] = {}
 
         # Neural operator storage
         self.parameters: Dict[str, Any] = {}
@@ -1909,6 +1984,27 @@ class domain(MeshUtils, Geometries):
         return self
 
     # Generators
+
+    # def register_boundary_predicate(self, tag: str, predicate: Callable):
+    #     """
+    #     Optional exact boundary predicate override for FEM/VPINN boundary handling.
+    #     Does not affect ordinary JNO mesh/tag behavior.
+    #     """
+    #     self._boundary_predicates[tag] = predicate
+    #     if tag in self._boundary_regions:
+    #         self._boundary_regions[tag].predicate = predicate
+    #     return self
+
+
+    def _estimate_boundary_tol(self, pts: np.ndarray) -> float:
+        pts = np.asarray(pts)
+        if pts.size == 0:
+            return 1e-8
+        bbox_min = np.min(pts, axis=0)
+        bbox_max = np.max(pts, axis=0)
+        diag = float(np.linalg.norm(bbox_max - bbox_min))
+        return max(1e-8, 1e-10 * max(diag, 1.0))
+    
     def _contains_node_type(self, expr, node_type):
         """Recursively check whether expr contains a node of type node_type."""
         if isinstance(expr, node_type):
@@ -1971,6 +2067,8 @@ class domain(MeshUtils, Geometries):
 
         return coeff
 
+    def boundary_tags(self):
+        return sorted(self._boundary_registry.keys())
 
     def _is_simple_neumann_load(self, expr):
         """
@@ -1993,16 +2091,60 @@ class domain(MeshUtils, Geometries):
         return coeff is not None
     
     def _make_native_surface_map_from_expr(self, coeff_expr, tag):
+        import numpy as np
         import jax.numpy as jnp
 
+        def _contains_normal_variable(node):
+            from .trace import Variable, BinaryOp, FunctionCall, Jacobian, TestFunction, TrialFunction, Literal, Constant
+
+            if isinstance(node, Variable):
+                return isinstance(node.tag, str) and node.tag.startswith("n_")
+            if isinstance(node, (Literal, Constant, TestFunction, TrialFunction)):
+                return False
+            if isinstance(node, Jacobian):
+                return _contains_normal_variable(node.target) or any(_contains_normal_variable(v) for v in node.variables)
+            if isinstance(node, BinaryOp):
+                return _contains_normal_variable(node.left) or _contains_normal_variable(node.right)
+            if isinstance(node, FunctionCall):
+                return any(_contains_normal_variable(arg) for arg in node.args)
+            return False
+
+        # Only prepare normals if the user expression explicitly uses them.
+        needs_normals = _contains_normal_variable(coeff_expr)
+
+        normal_pts_jax = None
+        normal_vals_jax = None
+
+        if needs_normals:
+            # Prefer quadrature-tag normals if available, otherwise fall back to boundary-tag normals
+            normal_lookup_tag = f"gauss_{tag}" if f"gauss_{tag}" in self.normals_by_tag else tag
+
+            if normal_lookup_tag in self.normals_by_tag and normal_lookup_tag in self._mesh_pool:
+                normal_pts = np.asarray(self._mesh_pool[normal_lookup_tag])[:, : self.dimension]
+                normal_vals = np.asarray(self.normals_by_tag[normal_lookup_tag])[:, : self.dimension]
+
+                if len(normal_pts) > 0 and len(normal_pts) == len(normal_vals):
+                    normal_pts_jax = jnp.asarray(normal_pts)
+                    normal_vals_jax = jnp.asarray(normal_vals)
+
         def surface_map(u, x):
+            boundary_normals = None
+
+            if needs_normals and normal_pts_jax is not None:
+                # Pure JAX nearest-neighbor lookup (safe under tracing)
+                x_use = x[: self.dimension]
+                d2 = jnp.sum((normal_pts_jax - x_use[None, :]) ** 2, axis=1)
+                idx = jnp.argmin(d2)
+                boundary_normals = normal_vals_jax[idx:idx + 1]
+
             local = {
                 "physical_quad_points": x[None, :],
-                "shape_vals": jnp.ones((1, 1)),   # not used by coeff_expr
+                "shape_vals": jnp.ones((1, 1)),
                 "shape_grads": jnp.zeros((1, 1, x.shape[0])),
                 "cell_sol": jnp.zeros((1, 1)),
                 "tag": tag,
                 "surface": True,
+                "boundary_normals": boundary_normals,
             }
 
             coeff_val = self._eval_expr_for_jaxfem(coeff_expr, local)
@@ -2015,77 +2157,22 @@ class domain(MeshUtils, Geometries):
         """
         Build JAX-FEM dirichlet_bc_info = [location_fns, vec_ids, value_fns].
 
-        For standard rectangular boundary names, use geometric predicates directly
-        so corner nodes are included reliably:
-        - left   -> x = xmin
-        - right  -> x = xmax
-        - bottom -> y = ymin
-        - top    -> y = ymax
-
-        Fallback for other tags: use proximity to self._mesh_pool[tag].
+        Fully tag-based:
+        - no hardcoded left/right/top/bottom logic
+        - works for arbitrary 2D/3D geometry if the mesh has boundary tags
         """
-        import numpy as np
-
         if dirichlet_value_fns is None:
             dirichlet_value_fns = {}
-
-        tol = 1e-8
-        pts = np.asarray(self.mesh.points)
-        xy = pts[:, :2]
-
-        xmin = float(np.min(xy[:, 0]))
-        xmax = float(np.max(xy[:, 0]))
-        ymin = float(np.min(xy[:, 1]))
-        ymax = float(np.max(xy[:, 1]))
-
-        def make_left_fn(xmin_val):
-            def loc_fn(p):
-                return jnp.isclose(p[0], xmin_val, atol=tol)
-            return loc_fn
-
-        def make_right_fn(xmax_val):
-            def loc_fn(p):
-                return jnp.isclose(p[0], xmax_val, atol=tol)
-            return loc_fn
-
-        def make_bottom_fn(ymin_val):
-            def loc_fn(p):
-                return jnp.isclose(p[1], ymin_val, atol=tol)
-            return loc_fn
-
-        def make_top_fn(ymax_val):
-            def loc_fn(p):
-                return jnp.isclose(p[1], ymax_val, atol=tol)
-            return loc_fn
-
-        def make_pool_loc_fn(tag_pts_local):
-            tag_pts_local = jnp.asarray(np.asarray(tag_pts_local))
-
-            def loc_fn(p):
-                if tag_pts_local.size == 0:
-                    return False
-                dim = p.shape[0]
-                return jnp.any(jnp.linalg.norm(tag_pts_local[:, :dim] - p[None, :], axis=1) < 1e-6)
-
-            return loc_fn
 
         loc_fns = []
         vec_ids = []
         val_fns = []
 
         for tag in dirichlet_tags:
-            if tag == "left":
-                loc_fn = make_left_fn(xmin)
-            elif tag == "right":
-                loc_fn = make_right_fn(xmax)
-            elif tag == "bottom":
-                loc_fn = make_bottom_fn(ymin)
-            elif tag == "top":
-                loc_fn = make_top_fn(ymax)
-            else:
-                if tag not in self._mesh_pool:
-                    continue
-                loc_fn = make_pool_loc_fn(self._mesh_pool[tag])
+            loc_fn = self._make_tag_location_fn(tag)
+            if loc_fn is None:
+                self.log.warning(f"Dirichlet tag '{tag}' not found in mesh tags. Skipping.")
+                continue
 
             loc_fns.append(loc_fn)
             vec_ids.append(0)
@@ -2161,30 +2248,22 @@ class domain(MeshUtils, Geometries):
         from jax_fem.generate_mesh import Mesh
         from scipy.spatial import KDTree # Ensuring this is available locally
 
-        meshio_type_map = {"TRI3": "triangle", "QUAD4": "quad"}
+        meshio_type_map = {"TRI3": "triangle", "QUAD4": "quad", "TET4": "tetra",}
         meshio_type = meshio_type_map.get(element_type)
         jax_mesh = Mesh(self.mesh.points[:, :self.dimension], self.mesh.cells_dict[meshio_type])
 
         # --- Location functions for Neumann ---
         location_fns = []
         valid_tags = []
+
         for tag in neumann_tags:
-            loc_fn = self._make_standard_boundary_location_fn(tag)
+            loc_fn = self._make_tag_location_fn(tag)
             if loc_fn is None:
-                if tag in self._mesh_pool:
-                    valid_tags.append(tag)
-                    tag_pts = jnp.asarray(self._mesh_pool[tag])
+                self.log.warning(f"Neumann tag '{tag}' not found in mesh tags. Skipping.")
+                continue
 
-                    def make_loc_fn(pts):
-                        def loc_fn(p):
-                            return jnp.any(jnp.linalg.norm(pts - p, axis=-1) < 1e-5)
-                        return loc_fn
-
-                    location_fns.append(make_loc_fn(tag_pts))
-            else:
-                valid_tags.append(tag)
-                location_fns.append(loc_fn)
-                print("[ELSE BLOCK]")
+            valid_tags.append(tag)
+            location_fns.append(loc_fn)
         dirichlet_bc_info = self._build_dirichlet_bc_info(dirichlet_tags, dirichlet_value_fns)
 
         class DummyProblem(Problem):
@@ -2289,13 +2368,34 @@ class domain(MeshUtils, Geometries):
                     num_segments=fe.num_total_nodes
                 )
 
+                quad_pts_flat_np = onp.asarray(physical_face_quads).reshape(-1, self.dimension)
+                quad_pts_flat = jnp.asarray(quad_pts_flat_np)
+
+                # Map quadrature points to boundary normals using nearest tagged boundary point.
+                quad_normals = None
+                if tag in self.normals_by_tag and tag in self._mesh_pool:
+                    tag_pts_np = onp.asarray(self._mesh_pool[tag])[:, : self.dimension]
+                    tag_nrm_np = onp.asarray(self.normals_by_tag[tag])[:, : self.dimension]
+
+                    if len(tag_pts_np) == len(tag_nrm_np) and len(tag_pts_np) > 0:
+                        tree = KDTree(tag_pts_np)
+                        _, nn_idx = tree.query(quad_pts_flat_np)
+                        quad_normals_np = tag_nrm_np[onp.asarray(nn_idx, dtype=int)]
+                        quad_normals = jnp.asarray(quad_normals_np)
+
+                        # expose normals on the quadrature tag so domain.variable("gauss_tag", normals=True) works
+                        self.normals_by_tag[f"gauss_{tag}"] = quad_normals_np
+
                 self.fem_context["surface_data"][tag] = {
                     "flat_parent_nodes": jnp.asarray(parent_cells, dtype=jnp.int32).flatten(),
                     "face_shape_vals": jnp.asarray(face_shape_vals),
                     "nanson_scale": jnp.asarray(nanson_scale),
-                    "global_boundary_areas": global_boundary_areas
+                    "global_boundary_areas": global_boundary_areas,
+                    "quad_points": quad_pts_flat,
+                    "quad_normals": quad_normals,
                 }
-                self._mesh_pool[f"gauss_{tag}"] = jnp.asarray(physical_face_quads).reshape(-1, self.dimension)
+
+                self._mesh_pool[f"gauss_{tag}"] = quad_pts_flat
                 self._register_variational_sample(
                     sample_tag=f"gauss_{tag}",
                     support="boundary",
@@ -2613,38 +2713,83 @@ class domain(MeshUtils, Geometries):
 
         return GroupedAssembly(vol_expr, boundary_exprs, self)
 
-    def _make_standard_boundary_location_fn(self, tag):
+    def _estimate_boundary_locator_tol(self, pts: np.ndarray) -> float:
+        """
+        Robust tolerance for matching mesh nodes to a tagged boundary point set.
+
+        This stays geometry-agnostic:
+        - works for arbitrary 2D/3D tagged boundaries
+        - does not assume left/right/top/bottom
+        """
         import numpy as np
-        import jax.numpy as jnp
 
-        pts = np.asarray(self.mesh.points)[:, :2]
-        xmin = float(np.min(pts[:, 0]))
-        xmax = float(np.max(pts[:, 0]))
-        ymin = float(np.min(pts[:, 1]))
-        ymax = float(np.max(pts[:, 1]))
-        tol = 1e-8
+        pts = np.asarray(pts)
+        if pts.size == 0:
+            return 1e-8
 
-        if tag == "left":
-            def loc_fn(p):
-                return jnp.isclose(p[0], xmin, atol=tol)
-            return loc_fn
+        bbox_min = np.min(pts, axis=0)
+        bbox_max = np.max(pts, axis=0)
+        diag = float(np.linalg.norm(bbox_max - bbox_min))
 
-        if tag == "right":
-            def loc_fn(p):
-                return jnp.isclose(p[0], xmax, atol=tol)
-            return loc_fn
+        # exact mesh-node matching should usually work; this just guards roundoff
+        return max(1e-8, 1e-10 * max(diag, 1.0))
 
-        if tag == "bottom":
-            def loc_fn(p):
-                return jnp.isclose(p[1], ymin, atol=tol)
-            return loc_fn
+    # def _register_default_box_boundary_predicates(self):
+    #     if self.mesh is None:
+    #         return
 
-        if tag == "top":
-            def loc_fn(p):
-                return jnp.isclose(p[1], ymax, atol=tol)
-            return loc_fn
+    #     pts = np.asarray(self.mesh.points)[:, : self.dimension]
+    #     tol = 1e-8
 
-        return None
+    #     xmin = float(np.min(pts[:, 0]))
+    #     xmax = float(np.max(pts[:, 0]))
+
+    #     if self.dimension == 2:
+    #         ymin = float(np.min(pts[:, 1]))
+    #         ymax = float(np.max(pts[:, 1]))
+
+    #         defaults = {
+    #             "left":   lambda p: jnp.isclose(p[0], xmin, atol=tol),
+    #             "right":  lambda p: jnp.isclose(p[0], xmax, atol=tol),
+    #             "bottom": lambda p: jnp.isclose(p[1], ymin, atol=tol),
+    #             "top":    lambda p: jnp.isclose(p[1], ymax, atol=tol),
+    #         }
+
+    #     elif self.dimension == 3:
+    #         ymin = float(np.min(pts[:, 1]))
+    #         ymax = float(np.max(pts[:, 1]))
+    #         zmin = float(np.min(pts[:, 2]))
+    #         zmax = float(np.max(pts[:, 2]))
+
+    #         defaults = {
+    #             "left":   lambda p: jnp.isclose(p[0], xmin, atol=tol),
+    #             "right":  lambda p: jnp.isclose(p[0], xmax, atol=tol),
+    #             "front":  lambda p: jnp.isclose(p[1], ymin, atol=tol),
+    #             "back":   lambda p: jnp.isclose(p[1], ymax, atol=tol),
+    #             "bottom": lambda p: jnp.isclose(p[2], zmin, atol=tol),
+    #             "top":    lambda p: jnp.isclose(p[2], zmax, atol=tol),
+    #         }
+
+    #     else:
+    #         defaults = {}
+
+    #     for tag, fn in defaults.items():
+    #         if tag in self._boundary_regions and tag not in self._boundary_predicates:
+    #             self._boundary_regions[tag].predicate = fn
+
+    def _make_tag_location_fn(self, tag):
+        region = self._boundary_regions.get(tag, None)
+        if region is None:
+            return None
+        return lambda p: region.contains(p)
+
+    def _make_standard_boundary_location_fn(self, tag):
+        """
+        Backward-compatible alias.
+        Older code paths may still call this name.
+        Now it simply delegates to the generic tag-based locator.
+        """
+        return self._make_tag_location_fn(tag)
 
     def _assemble_fem_system_grouped(self, volume_terms, boundary_terms, **kwargs):
         """
@@ -2691,6 +2836,7 @@ class domain(MeshUtils, Geometries):
 
         print(">>> ENTERED _assemble_fem_system_grouped", flush=True)
         print("active_boundary_tags =", active_boundary_tags, flush=True)
+
         for tag in active_boundary_tags:
             expr = boundary_exprs[tag]
 
@@ -2741,18 +2887,11 @@ class domain(MeshUtils, Geometries):
         # Important: use the same ordering as active_boundary_tags
         location_fns = []
         for tag in active_boundary_tags:
-            loc_fn = self._make_standard_boundary_location_fn(tag)
+            loc_fn = self._make_tag_location_fn(tag)
 
             if loc_fn is None:
-                # fallback for non-standard tags
-                tag_pts = jnp.asarray(self._mesh_pool[tag])
-
-                def make_loc_fn(pts):
-                    def loc_fn(p):
-                        return jnp.any(jnp.linalg.norm(pts - p, axis=-1) < 1e-5)
-                    return loc_fn
-
-                loc_fn = make_loc_fn(tag_pts)
+                self.log.warning(f"Boundary tag '{tag}' not found while building FEM surface locations. Skipping.")
+                continue
 
             location_fns.append(loc_fn)
 
@@ -2788,6 +2927,13 @@ class domain(MeshUtils, Geometries):
             dirichlet_bc_info=dirichlet_bc_info,
             location_fns=location_fns,
         )
+
+        try:
+            for i, tag in enumerate(active_boundary_tags):
+                inds = problem.boundary_inds_list[i]
+                print(f"[FEM DEBUG] grouped assembly matched {len(inds)} faces for '{tag}'", flush=True)
+        except Exception as exc:
+            print(f"[FEM DEBUG] could not inspect grouped boundary face counts: {exc}", flush=True)
 
         node_inds_list = getattr(problem.fes[0], "node_inds_list", None)
         if node_inds_list is None:
@@ -3060,66 +3206,76 @@ class domain(MeshUtils, Geometries):
     
 
     def _eval_expr_for_jaxfem(self, node, local):
-            import jax.numpy as jnp
+        import jax.numpy as jnp
 
-            if isinstance(node, Literal):
-                return jnp.asarray(node.value)
+        if isinstance(node, Literal):
+            return jnp.asarray(node.value)
 
-            if isinstance(node, Constant):
-                return jnp.asarray(node.value)
+        if isinstance(node, Constant):
+            return jnp.asarray(node.value)
 
-            if isinstance(node, Variable):
-                pts = local["physical_quad_points"]
+        if isinstance(node, Variable):
+            # Optional boundary normals, e.g. tag == "n_gauss_wall"
+            if isinstance(node.tag, str) and node.tag.startswith("n_"):
+                if "boundary_normals" not in local or local["boundary_normals"] is None:
+                    raise ValueError(
+                        f"Normal variable '{node.tag}' requested, but no boundary_normals "
+                        f"were provided in the local FEM surface context."
+                    )
                 dim0 = node.dim[0]
-                return pts[:, dim0:dim0 + 1]
+                return local["boundary_normals"][:, dim0:dim0 + 1]
 
-            if isinstance(node, TestFunction):
-                return local["shape_vals"]
+            pts = local["physical_quad_points"]
+            dim0 = node.dim[0]
+            return pts[:, dim0:dim0 + 1]
 
-            if isinstance(node, TrialFunction):
-                vals = local["shape_vals"]
-                return jnp.sum(vals[:, :, None] * local["cell_sol"][None, :, :], axis=1)
+        if isinstance(node, TestFunction):
+            return local["shape_vals"]
 
-            if isinstance(node, Jacobian):
-                var = node.variables[0]
-                dim0 = var.dim[0] if isinstance(var, Variable) else 0
+        if isinstance(node, TrialFunction):
+            vals = local["shape_vals"]
+            return jnp.sum(vals[:, :, None] * local["cell_sol"][None, :, :], axis=1)
 
-                if isinstance(node.target, TestFunction):
-                    return local["shape_grads"][..., dim0]
+        if isinstance(node, Jacobian):
+            var = node.variables[0]
+            dim0 = var.dim[0] if isinstance(var, Variable) else 0
 
-                if isinstance(node.target, TrialFunction):
-                    grads = local["shape_grads"]
-                    return jnp.sum(grads[:, :, dim0:dim0 + 1] * local["cell_sol"][None, :, :], axis=1)
+            if isinstance(node.target, TestFunction):
+                return local["shape_grads"][..., dim0]
 
-                raise NotImplementedError(
-                    "fem_solver=True currently supports gradients of TrialFunction/TestFunction only."
-                )
-
-            if isinstance(node, BinaryOp):
-                a = self._eval_expr_for_jaxfem(node.left, local)
-                b = self._eval_expr_for_jaxfem(node.right, local)
-
-                if node.op == "+":
-                    return a + b
-                if node.op == "-":
-                    return a - b
-                if node.op == "*":
-                    return a * b
-                if node.op == "/":
-                    return a / b
-                if node.op == "**":
-                    return a ** b
-
-                raise NotImplementedError(f"Unsupported binary operator: {node.op}")
-
-            if isinstance(node, FunctionCall):
-                args = [self._eval_expr_for_jaxfem(arg, local) for arg in node.args]
-                return node.fn(*args)
+            if isinstance(node.target, TrialFunction):
+                grads = local["shape_grads"]
+                return jnp.sum(grads[:, :, dim0:dim0 + 1] * local["cell_sol"][None, :, :], axis=1)
 
             raise NotImplementedError(
-                f"Unsupported weak-form node for fem_solver=True: {type(node).__name__}"
+                "fem_solver=True currently supports gradients of TrialFunction/TestFunction only."
             )
 
+        if isinstance(node, BinaryOp):
+            a = self._eval_expr_for_jaxfem(node.left, local)
+            b = self._eval_expr_for_jaxfem(node.right, local)
+
+            if node.op == "+":
+                return a + b
+            if node.op == "-":
+                return a - b
+            if node.op == "*":
+                return a * b
+            if node.op == "/":
+                return a / b
+            if node.op == "**":
+                return a ** b
+
+            raise NotImplementedError(f"Unsupported binary operator: {node.op}")
+
+        if isinstance(node, FunctionCall):
+            args = [self._eval_expr_for_jaxfem(arg, local) for arg in node.args]
+            return node.fn(*args)
+
+        raise NotImplementedError(
+            f"Unsupported weak-form node for fem_solver=True: {type(node).__name__}"
+        )
+    
     def _generate_mesh(self, geometry_func: Callable, algorithm: int):
         """Generate mesh using PyGmsh."""
         import pygmsh
@@ -3159,6 +3315,11 @@ class domain(MeshUtils, Geometries):
         points = mesh.points[:, : self.dimension]
         self.points = points
         self._mesh_pool = {}
+        self._boundary_registry = {}
+        self.tag_indices = {}
+        self._tag_edges = {}
+        self._tag_triangles = {}
+        self._boundary_regions = {}
 
         if self.dimension > 1:
             boundary_normals, boundary_indices = self.get_boundary_normals(mesh)
@@ -3251,6 +3412,8 @@ class domain(MeshUtils, Geometries):
 
                 if tag_tris:
                     self._tag_triangles[name] = np.array(tag_tris, dtype=int)
+                if tag_edges:
+                    self._tag_edges[name] = np.array(tag_edges, dtype=int)
 
                 if tag_points:
                     if tag_edges:
@@ -3259,8 +3422,8 @@ class domain(MeshUtils, Geometries):
                     else:
                         indices_list = np.array(sorted(tag_points), dtype=int)
 
-                    # self.log.info(f"{name} - indices: {indices_list} - points: {points[indices_list].shape}")
-
+                    indices_list = np.asarray(indices_list, dtype=int)
+                    self.tag_indices[name] = indices_list
                     self._mesh_pool[name] = points[indices_list]
 
                     normal_positions = np.array([index_to_normal_pos[i] for i in indices_list if i in index_to_normal_pos])
@@ -3269,9 +3432,61 @@ class domain(MeshUtils, Geometries):
                     else:
                         tag_pt_coords = points[indices_list, : self.dimension]
                         if len(tag_pt_coords) > 1:
-                            tag_normals, _ = self._compute_normals_pca(points, indices_list, self.dimension, k=min(8, len(indices_list)), mesh=mesh)
+                            tag_normals, _ = self._compute_normals_pca(
+                                points,
+                                indices_list,
+                                self.dimension,
+                                k=min(8, len(tag_pt_coords)),
+                                mesh=mesh,
+                            )
                             self.normals_by_tag[name] = tag_normals[:, : self.dimension]
 
+                    # --- Generic boundary registry entry ---
+                    is_boundary_tag = False
+                    entity_kind = None
+
+                    if self.dimension == 2 and len(tag_edges) > 0:
+                        is_boundary_tag = True
+                        entity_kind = "line"
+                    elif self.dimension == 3 and len(tag_tris) > 0:
+                        is_boundary_tag = True
+                        entity_kind = "triangle"
+                    elif name in self.normals_by_tag:
+                        # fallback: still treat as a boundary-like tag if normals exist
+                        is_boundary_tag = True
+                        entity_kind = "boundary_points"
+
+                    if is_boundary_tag:
+                        edge_coords = None
+                        tri_coords = None
+
+                        if len(tag_edges) > 0:
+                            edge_arr = np.asarray(tag_edges, dtype=int)
+                            edge_coords = points[edge_arr][:, :, : self.dimension]
+
+                        if len(tag_tris) > 0:
+                            tri_arr = np.asarray(tag_tris, dtype=int)
+                            tri_coords = points[tri_arr][:, :, : self.dimension]
+
+                        #pred = self._boundary_predicates.get(name, None)
+                        tol = self._estimate_boundary_tol(points[indices_list][:, : self.dimension])
+
+                        self._boundary_regions[name] = BoundaryRegion(
+                            tag=name,
+                            dim=self.dimension,
+                            points=points[indices_list][:, : self.dimension],
+                            edges=edge_coords,
+                            triangles=tri_coords,
+                            tol=tol,
+                        )
+
+                        self._boundary_registry[name] = {
+                            "tag": name,
+                            "entity_kind": entity_kind,
+                            "point_indices": indices_list,
+                            "points": points[indices_list],
+                        }
+        #self._register_default_box_boundary_predicates()
         return boundary_indices
 
     def _add_time_dimension(self, t_start: float, t_end: float, n_time: int = 100):
