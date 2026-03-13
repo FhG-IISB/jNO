@@ -1,6 +1,6 @@
 import jax
 import jax.numpy as jnp
-from typing import List, Union
+from typing import List, Union, Sequence
 from .trace import Placeholder, Variable, FunctionCall, Hessian, Jacobian, Constant, ConstantNamespace, TestFunction, TrialFunction
 
 # Keep import so people can use jno.numpy as jno -> jno.model, jno.tune
@@ -326,7 +326,61 @@ cross = _binary(jnp.cross)
 # ============================================================================
 # Differential operators (pino-specific)
 # ============================================================================
+def inner(x, y, n_contract: int = 1, keepdims: bool = False) -> FunctionCall:
+    """
+    Generalized inner product / contraction over the last ``n_contract`` axes.
 
+    This is intentionally shape-friendly for weak forms. It pads the lower-rank
+    operand with singleton axes *before* the contracted trailing axes so common
+    patterns like
+
+        inner(grad_u, grad_phi)
+
+    work both in pointwise mode and FEM mode, where ``grad_phi`` usually carries
+    an extra local basis-function axis.
+
+    Examples:
+        inner(a, b)               -> vector inner product over last axis
+        inner(A, B, n_contract=2) -> Frobenius product
+    """
+
+    def _fn(a, b, _n=n_contract, _keep=keepdims):
+        a = jnp.asarray(a)
+        b = jnp.asarray(b)
+
+        if _n < 1:
+            return a * b
+        if a.ndim < _n or b.ndim < _n:
+            raise ValueError("inner(...): n_contract exceeds operand rank")
+
+        a_prefix_ndim = a.ndim - _n
+        b_prefix_ndim = b.ndim - _n
+
+        if a_prefix_ndim < b_prefix_ndim:
+            pad = (1,) * (b_prefix_ndim - a_prefix_ndim)
+            a = jnp.reshape(a, a.shape[:-_n] + pad + a.shape[-_n:])
+        elif b_prefix_ndim < a_prefix_ndim:
+            pad = (1,) * (a_prefix_ndim - b_prefix_ndim)
+            b = jnp.reshape(b, b.shape[:-_n] + pad + b.shape[-_n:])
+
+        axes = tuple(range(-_n, 0))
+        return jnp.sum(a * b, axis=axes, keepdims=_keep)
+
+    return FunctionCall(_fn, [x, y], name="inner", reduces_axis=-1)
+
+
+def einsum(subscripts: str, *operands) -> FunctionCall:
+    """Traced jnp.einsum wrapper for compact tensor/vector contractions."""
+    return FunctionCall(
+        lambda *args, _subs=subscripts: jnp.einsum(_subs, *args),
+        list(operands),
+        name="einsum",
+    )
+
+
+def div(vector_field: List[Placeholder], variables: List[Variable]) -> Placeholder:
+    """Alias for divergence."""
+    return divergence(vector_field, variables)
 
 def grad(target: Placeholder, variable: Variable, scheme: str = "automatic_differentiation") -> Jacobian:
     """
@@ -350,6 +404,10 @@ def grad(target: Placeholder, variable: Variable, scheme: str = "automatic_diffe
     Example:
         u_x = pnp.grad(u(x, y), x)  # ∂u/∂x
     """
+    if isinstance(variable, (list, tuple)):
+        if len(variable) == 0:
+            raise ValueError("grad(..., variables) requires at least one variable")
+        return Jacobian(target, list(variable), scheme)
     return Jacobian(target, [variable], scheme)
 
 

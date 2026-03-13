@@ -2023,7 +2023,6 @@ class domain(MeshUtils, Geometries):
 
         return False
 
-
     def _strip_test_function_factor(self, expr):
         """
         Extract the scalar coefficient from a product containing exactly one
@@ -2487,6 +2486,180 @@ class domain(MeshUtils, Geometries):
         region_id = next(iter(region_ids))
         return support, region_id
    
+    def _get_variational_region_meta(self, support: str, region_id: str):
+        """
+        Find the registered variational-sampling metadata for one region.
+        Returns the registry entry, e.g. for ("boundary", "right") -> gauss_right meta.
+        """
+        registry = getattr(self, "_variational_sampling_registry", {})
+        for sample_tag, meta in registry.items():
+            if meta.get("support") == support and meta.get("region_id") == region_id:
+                return meta
+        raise KeyError(
+            f"No variational sampling meta found for support={support!r}, region_id={region_id!r}. "
+            f"Available: {registry}"
+        )
+
+
+    def _rebind_variational_variables(self, node, target_support: str, target_region_id: str):
+        """
+        Rebind variational coordinate variables inside an expression to a specific
+        variational region.
+
+        This is needed for VPINN boundary bilinear terms such as alpha(xr,yr) * u * phi,
+        where the supplied trial expression u_net was originally built on fem_gauss
+        but must be evaluated on gauss_right / gauss_top / ... for boundary assembly.
+
+        Only Variable nodes carrying fem_meta are rewritten. Ordinary non-variational
+        variables and tensor tags are left untouched.
+        """
+        from .trace import (
+            Variable,
+            TensorTag,
+            Constant,
+            Literal,
+            BinaryOp,
+            FunctionCall,
+            ModelCall,
+            OperationDef,
+            OperationCall,
+            Jacobian,
+            Hessian,
+            Tracker,
+            Assembly,
+            GroupedAssembly,
+            Placeholder,
+            TrialFunction,
+            TestFunction,
+        )
+
+        if node is None:
+            return None
+
+        target_meta = self._get_variational_region_meta(target_support, target_region_id)
+        target_tag = target_meta["context_tag"]
+
+        # Rewrite only spatial variational coordinate variables
+        if isinstance(node, Variable) and getattr(node, "fem_meta", None) is not None:
+            if node.axis == "temporal":
+                return node
+            return Variable(
+                tag=target_tag,
+                dim=list(node.dim),
+                domain=self,
+                axis=node.axis,
+                fem_meta=target_meta,
+            )
+
+        # Leaves that stay unchanged
+        if isinstance(node, (TensorTag, Constant, Literal, TrialFunction, TestFunction)):
+            return node
+
+        if isinstance(node, BinaryOp):
+            left = self._rebind_variational_variables(node.left, target_support, target_region_id)
+            right = self._rebind_variational_variables(node.right, target_support, target_region_id)
+            if left is not node.left or right is not node.right:
+                return BinaryOp(node.op, left, right)
+            return node
+
+        if isinstance(node, FunctionCall):
+            new_args = [
+                self._rebind_variational_variables(a, target_support, target_region_id)
+                if isinstance(a, Placeholder) else a
+                for a in node.args
+            ]
+            if any(n is not o for n, o in zip(new_args, node.args)):
+                return FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
+            return node
+
+        if isinstance(node, ModelCall):
+            new_args = [
+                self._rebind_variational_variables(a, target_support, target_region_id)
+                if isinstance(a, Placeholder) else a
+                for a in node.args
+            ]
+            if any(n is not o for n, o in zip(new_args, node.args)):
+                new_node = ModelCall(node.model, new_args)
+                new_node.op_id = node.op_id
+                return new_node
+            return node
+
+        if isinstance(node, OperationDef):
+            new_expr = self._rebind_variational_variables(node.expr, target_support, target_region_id)
+            if new_expr is not node.expr:
+                new_node = OperationDef.__new__(OperationDef)
+                new_node.expr = new_expr
+                new_node.input_vars = node.input_vars
+                new_node.name = getattr(node, "name", None)
+                new_node.op_id = node.op_id
+                return new_node
+            return node
+
+        if isinstance(node, OperationCall):
+            new_args = [
+                self._rebind_variational_variables(a, target_support, target_region_id)
+                if isinstance(a, Placeholder) else a
+                for a in node.args
+            ]
+            if any(n is not o for n, o in zip(new_args, node.args)):
+                new_node = OperationCall(node.op_def, new_args)
+                new_node.op_id = node.op_id
+                return new_node
+            return node
+
+        if isinstance(node, Jacobian):
+            new_target = self._rebind_variational_variables(node.target, target_support, target_region_id)
+            new_vars = [
+                self._rebind_variational_variables(v, target_support, target_region_id)
+                if isinstance(v, Placeholder) else v
+                for v in node.variables
+            ]
+            if new_target is not node.target or any(n is not o for n, o in zip(new_vars, node.variables)):
+                return Jacobian(new_target, new_vars, node.scheme)
+            return node
+
+        if isinstance(node, Hessian):
+            new_target = self._rebind_variational_variables(node.target, target_support, target_region_id)
+            new_vars = [
+                self._rebind_variational_variables(v, target_support, target_region_id)
+                if isinstance(v, Placeholder) else v
+                for v in node.variables
+            ]
+            if new_target is not node.target or any(n is not o for n, o in zip(new_vars, node.variables)):
+                return Hessian(new_target, new_vars, node.scheme)
+            return node
+
+        if isinstance(node, Tracker):
+            new_expr = self._rebind_variational_variables(node.expr, target_support, target_region_id)
+            if new_expr is not node.expr:
+                new_node = Tracker(new_expr, interval=node.interval)
+                new_node.op_id = node.op_id
+                return new_node
+            return node
+
+        if isinstance(node, Assembly):
+            new_expr = self._rebind_variational_variables(node.expr, target_support, target_region_id)
+            if new_expr is not node.expr:
+                new_node = Assembly(new_expr)
+                new_node.op_id = node.op_id
+                return new_node
+            return node
+
+        if isinstance(node, GroupedAssembly):
+            vol_expr = self._rebind_variational_variables(node.volume_expr, target_support, target_region_id) \
+                if node.volume_expr is not None else None
+            bnd_exprs = {
+                k: self._rebind_variational_variables(v, target_support, target_region_id)
+                for k, v in node.boundary_exprs.items()
+            }
+            if vol_expr is not node.volume_expr or any(bnd_exprs[k] is not node.boundary_exprs[k] for k in bnd_exprs):
+                new_node = GroupedAssembly(vol_expr, bnd_exprs, node.domain)
+                new_node.op_id = node.op_id
+                return new_node
+            return node
+
+        return node
+
     def _split_additive_terms(self, node, sign=1.0):
         """
         Split an expression into additive terms:
@@ -2529,21 +2702,30 @@ class domain(MeshUtils, Geometries):
         target="vpinn"      -> assembled weak object
         target="fem_system" -> (A, b)
         """
-        expr_for_target = expr
+        trial_value = kwargs.get("u_net", None) if target == "vpinn" else None
 
-        if target == "vpinn":
-            trial_value = kwargs.get("u_net", None)
-            if trial_value is not None:
-                expr_for_target = self._substitute_trial_for_vpinn(expr, trial_value)
-
-        terms = self._split_additive_terms(expr_for_target)
+        # IMPORTANT:
+        # Split and bucket on the ORIGINAL symbolic weak form first.
+        # This avoids boundary Robin terms becoming "mixed support" after
+        # TrialFunction -> u_net substitution when u_net was built on fem_gauss.
+        terms = self._split_additive_terms(expr)
 
         volume_terms = []
         boundary_terms = {}
 
         for sign, term in terms:
             support, region_id = self._infer_term_bucket(term)
-            signed_term = self._apply_sign(sign, term)
+
+            term_for_target = term
+            if target == "vpinn" and trial_value is not None:
+                term_for_target = self._substitute_trial_for_vpinn(
+                    term,
+                    trial_value,
+                    target_support=support,
+                    target_region_id=region_id,
+                )
+
+            signed_term = self._apply_sign(sign, term_for_target)
 
             if support == "volume":
                 volume_terms.append(signed_term)
@@ -2562,7 +2744,13 @@ class domain(MeshUtils, Geometries):
             f"Unknown assembly target '{target}'. Supported: 'vpinn', 'fem_system'"
         )
 
-    def _substitute_trial_for_vpinn(self, node, trial_value):
+    def _substitute_trial_for_vpinn(
+        self,
+        node,
+        trial_value,
+        target_support: str | None = None,
+        target_region_id: str | None = None,
+    ):
         from .trace import (
             TrialFunction,
             TestFunction,
@@ -2590,20 +2778,27 @@ class domain(MeshUtils, Geometries):
         if isinstance(node, (Variable, TestFunction, TensorTag, Constant, Literal)):
             return node
 
-        # Replace the symbolic unknown by the provided VPINN expression
+        # Replace the symbolic unknown by the provided VPINN expression.
+        # If the current term belongs to a boundary bucket, first rebind the
+        # variational coordinates inside the supplied trial expression from
+        # fem_gauss -> gauss_<region>.
         if isinstance(node, TrialFunction):
-            return trial_value
+            out = trial_value
+            if target_support is not None and target_region_id is not None:
+                out = self._rebind_variational_variables(out, target_support, target_region_id)
+            return out
 
         if isinstance(node, BinaryOp):
-            left = self._substitute_trial_for_vpinn(node.left, trial_value)
-            right = self._substitute_trial_for_vpinn(node.right, trial_value)
+            left = self._substitute_trial_for_vpinn(node.left, trial_value, target_support, target_region_id)
+            right = self._substitute_trial_for_vpinn(node.right, trial_value, target_support, target_region_id)
             if left is not node.left or right is not node.right:
                 return BinaryOp(node.op, left, right)
             return node
 
         if isinstance(node, FunctionCall):
             new_args = [
-                self._substitute_trial_for_vpinn(a, trial_value) if isinstance(a, Placeholder) else a
+                self._substitute_trial_for_vpinn(a, trial_value, target_support, target_region_id)
+                if isinstance(a, Placeholder) else a
                 for a in node.args
             ]
             if any(n is not o for n, o in zip(new_args, node.args)):
@@ -2612,7 +2807,8 @@ class domain(MeshUtils, Geometries):
 
         if isinstance(node, ModelCall):
             new_args = [
-                self._substitute_trial_for_vpinn(a, trial_value) if isinstance(a, Placeholder) else a
+                self._substitute_trial_for_vpinn(a, trial_value, target_support, target_region_id)
+                if isinstance(a, Placeholder) else a
                 for a in node.args
             ]
             if any(n is not o for n, o in zip(new_args, node.args)):
@@ -2622,78 +2818,81 @@ class domain(MeshUtils, Geometries):
             return node
 
         if isinstance(node, OperationDef):
-            new_expr = self._substitute_trial_for_vpinn(node.expr, trial_value)
+            new_expr = self._substitute_trial_for_vpinn(node.expr, trial_value, target_support, target_region_id)
             if new_expr is not node.expr:
                 new_node = OperationDef.__new__(OperationDef)
                 new_node.expr = new_expr
                 new_node.input_vars = node.input_vars
+                new_node.name = getattr(node, "name", None)
                 new_node.op_id = node.op_id
-                new_node._collected_vars = node._collected_vars
-                new_node.has_trainable = node.has_trainable
                 return new_node
             return node
 
         if isinstance(node, OperationCall):
-            new_op = self._substitute_trial_for_vpinn(node.operation, trial_value)
-            new_args = tuple(
-                self._substitute_trial_for_vpinn(a, trial_value) if isinstance(a, Placeholder) else a
+            new_args = [
+                self._substitute_trial_for_vpinn(a, trial_value, target_support, target_region_id)
+                if isinstance(a, Placeholder) else a
                 for a in node.args
-            )
-            if new_op is not node.operation or any(n is not o for n, o in zip(new_args, node.args)):
-                return OperationCall(new_op, new_args)
+            ]
+            if any(n is not o for n, o in zip(new_args, node.args)):
+                new_node = OperationCall(node.op_def, new_args)
+                new_node.op_id = node.op_id
+                return new_node
             return node
 
         if isinstance(node, Jacobian):
-            new_target = self._substitute_trial_for_vpinn(node.target, trial_value)
-            if new_target is not node.target:
-                return Jacobian(new_target, node.variables, node.scheme)
+            new_target = self._substitute_trial_for_vpinn(node.target, trial_value, target_support, target_region_id)
+            new_vars = [
+                self._substitute_trial_for_vpinn(v, trial_value, target_support, target_region_id)
+                if isinstance(v, Placeholder) else v
+                for v in node.variables
+            ]
+            if new_target is not node.target or any(n is not o for n, o in zip(new_vars, node.variables)):
+                return Jacobian(new_target, new_vars, node.scheme)
             return node
 
         if isinstance(node, Hessian):
-            new_target = self._substitute_trial_for_vpinn(node.target, trial_value)
-            if new_target is not node.target:
-                return Hessian(new_target, node.variables, node.scheme, node.trace)
+            new_target = self._substitute_trial_for_vpinn(node.target, trial_value, target_support, target_region_id)
+            new_vars = [
+                self._substitute_trial_for_vpinn(v, trial_value, target_support, target_region_id)
+                if isinstance(v, Placeholder) else v
+                for v in node.variables
+            ]
+            if new_target is not node.target or any(n is not o for n, o in zip(new_vars, node.variables)):
+                return Hessian(new_target, new_vars, node.scheme)
             return node
 
         if isinstance(node, Tracker):
-            new_expr = self._substitute_trial_for_vpinn(node.expr, trial_value)
+            new_expr = self._substitute_trial_for_vpinn(node.expr, trial_value, target_support, target_region_id)
             if new_expr is not node.expr:
-                return Tracker(new_expr, node.interval)
+                new_node = Tracker(new_expr, interval=node.interval)
+                new_node.op_id = node.op_id
+                return new_node
             return node
 
         if isinstance(node, Assembly):
-            new_expr = self._substitute_trial_for_vpinn(node.expr, trial_value)
+            new_expr = self._substitute_trial_for_vpinn(node.expr, trial_value, target_support, target_region_id)
             if new_expr is not node.expr:
-                return Assembly(
-                    new_expr,
-                    node.num_total_nodes,
-                    support=node.support,
-                    region_id=node.region_id,
-                )
+                new_node = Assembly(new_expr)
+                new_node.op_id = node.op_id
+                return new_node
             return node
+
         if isinstance(node, GroupedAssembly):
-            new_volume = (
-                self._substitute_trial_for_vpinn(node.volume_expr, trial_value)
-                if node.volume_expr is not None
-                else None
+            vol_expr = (
+                self._substitute_trial_for_vpinn(node.volume_expr, trial_value, target_support, target_region_id)
+                if node.volume_expr is not None else None
             )
-
-            new_boundary = {}
-            changed = (new_volume is not node.volume_expr)
-
-            for region_id, bnd_expr in node.boundary_exprs.items():
-                new_expr = self._substitute_trial_for_vpinn(bnd_expr, trial_value)
-                new_boundary[region_id] = new_expr
-                if new_expr is not bnd_expr:
-                    changed = True
-
-            if changed:
-                return GroupedAssembly(
-                    new_volume,
-                    new_boundary,
-                    node.num_total_nodes,
-                )
+            bnd_exprs = {
+                k: self._substitute_trial_for_vpinn(v, trial_value, target_support, target_region_id)
+                for k, v in node.boundary_exprs.items()
+            }
+            if vol_expr is not node.volume_expr or any(bnd_exprs[k] is not node.boundary_exprs[k] for k in bnd_exprs):
+                new_node = GroupedAssembly(vol_expr, bnd_exprs, node.domain)
+                new_node.op_id = node.op_id
+                return new_node
             return node
+
         return node
     
     def _assemble_vpinn_grouped(self, volume_terms, boundary_terms, **kwargs):
@@ -2734,48 +2933,6 @@ class domain(MeshUtils, Geometries):
         # exact mesh-node matching should usually work; this just guards roundoff
         return max(1e-8, 1e-10 * max(diag, 1.0))
 
-    # def _register_default_box_boundary_predicates(self):
-    #     if self.mesh is None:
-    #         return
-
-    #     pts = np.asarray(self.mesh.points)[:, : self.dimension]
-    #     tol = 1e-8
-
-    #     xmin = float(np.min(pts[:, 0]))
-    #     xmax = float(np.max(pts[:, 0]))
-
-    #     if self.dimension == 2:
-    #         ymin = float(np.min(pts[:, 1]))
-    #         ymax = float(np.max(pts[:, 1]))
-
-    #         defaults = {
-    #             "left":   lambda p: jnp.isclose(p[0], xmin, atol=tol),
-    #             "right":  lambda p: jnp.isclose(p[0], xmax, atol=tol),
-    #             "bottom": lambda p: jnp.isclose(p[1], ymin, atol=tol),
-    #             "top":    lambda p: jnp.isclose(p[1], ymax, atol=tol),
-    #         }
-
-    #     elif self.dimension == 3:
-    #         ymin = float(np.min(pts[:, 1]))
-    #         ymax = float(np.max(pts[:, 1]))
-    #         zmin = float(np.min(pts[:, 2]))
-    #         zmax = float(np.max(pts[:, 2]))
-
-    #         defaults = {
-    #             "left":   lambda p: jnp.isclose(p[0], xmin, atol=tol),
-    #             "right":  lambda p: jnp.isclose(p[0], xmax, atol=tol),
-    #             "front":  lambda p: jnp.isclose(p[1], ymin, atol=tol),
-    #             "back":   lambda p: jnp.isclose(p[1], ymax, atol=tol),
-    #             "bottom": lambda p: jnp.isclose(p[2], zmin, atol=tol),
-    #             "top":    lambda p: jnp.isclose(p[2], zmax, atol=tol),
-    #         }
-
-    #     else:
-    #         defaults = {}
-
-    #     for tag, fn in defaults.items():
-    #         if tag in self._boundary_regions and tag not in self._boundary_predicates:
-    #             self._boundary_regions[tag].predicate = fn
 
     def _make_tag_location_fn(self, tag):
         region = self._boundary_regions.get(tag, None)
@@ -3168,8 +3325,8 @@ class domain(MeshUtils, Geometries):
                 "cell_sol": cell_sol,
                 "tag": compiled["tag"],
                 "surface": False,
+                "domain_context": self.context,
             }
-
             val = self._eval_expr_for_jaxfem(compiled["expr"], local)
 
             return jax.flatten_util.ravel_pytree(jnp.sum(val * cell_JxW[0][:, None], axis=0))[0]
@@ -3196,6 +3353,7 @@ class domain(MeshUtils, Geometries):
             "cell_sol": cell_sol,
             "tag": compiled["tag"],
             "surface": True,
+            "domain_context": self.context,
         }
 
         val = self._eval_expr_for_jaxfem(compiled["expr"], local)
@@ -3213,6 +3371,29 @@ class domain(MeshUtils, Geometries):
 
         if isinstance(node, Constant):
             return jnp.asarray(node.value)
+
+        if isinstance(node, TensorTag):
+            if node.tag not in local["domain_context"]:
+                raise KeyError(
+                    f"TensorTag '{node.tag}' not found in FEM domain context. "
+                    f"Available: {list(local['domain_context'].keys())}"
+                )
+
+            tensor = jnp.asarray(local["domain_context"][node.tag])
+
+            # FEM assembly currently works on a single concrete domain instance.
+            # Accept plain tensors (...) or a singleton batch (1, ...).
+            if tensor.ndim >= 1 and tensor.shape[0] == 1:
+                tensor = tensor[0]
+            elif tensor.ndim >= 1 and tensor.shape[0] > 1:
+                raise NotImplementedError(
+                    "fem_solver=True currently supports only singleton-batch TensorTag "
+                    f"coefficients. Got shape {tensor.shape} for tag '{node.tag}'."
+                )
+
+            if node.dim_index is not None and tensor.ndim >= 1:
+                tensor = tensor[..., node.dim_index]
+            return tensor
 
         if isinstance(node, Variable):
             # Optional boundary normals, e.g. tag == "n_gauss_wall"
@@ -3237,15 +3418,32 @@ class domain(MeshUtils, Geometries):
             return jnp.sum(vals[:, :, None] * local["cell_sol"][None, :, :], axis=1)
 
         if isinstance(node, Jacobian):
-            var = node.variables[0]
-            dim0 = var.dim[0] if isinstance(var, Variable) else 0
+            dims = []
+            for var in node.variables:
+                if not isinstance(var, Variable):
+                    raise NotImplementedError(
+                        "fem_solver=True currently expects Jacobian variables to be "
+                        "domain.variable(...) placeholders."
+                    )
+                dims.append(var.dim[0])
+
+            if len(dims) == 0:
+                raise ValueError("Jacobian node has no differentiation variables")
 
             if isinstance(node.target, TestFunction):
-                return local["shape_grads"][..., dim0]
+                comps = [local["shape_grads"][..., dim0] for dim0 in dims]
+                return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
 
             if isinstance(node.target, TrialFunction):
                 grads = local["shape_grads"]
-                return jnp.sum(grads[:, :, dim0:dim0 + 1] * local["cell_sol"][None, :, :], axis=1)
+                comps = [
+                    jnp.sum(
+                        grads[:, :, dim0:dim0 + 1] * local["cell_sol"][None, :, :],
+                        axis=1,
+                    )
+                    for dim0 in dims
+                ]
+                return comps[0] if len(comps) == 1 else jnp.concatenate(comps, axis=-1)
 
             raise NotImplementedError(
                 "fem_solver=True currently supports gradients of TrialFunction/TestFunction only."
@@ -3270,7 +3468,8 @@ class domain(MeshUtils, Geometries):
 
         if isinstance(node, FunctionCall):
             args = [self._eval_expr_for_jaxfem(arg, local) for arg in node.args]
-            return node.fn(*args)
+            kwargs = node.kwargs if node.kwargs else {}
+            return node.fn(*args, **kwargs)
 
         raise NotImplementedError(
             f"Unsupported weak-form node for fem_solver=True: {type(node).__name__}"
