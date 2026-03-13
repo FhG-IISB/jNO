@@ -125,6 +125,19 @@ def _matrix_to_jax_bcoo(A):
     )
 
     return BCOO((data, indices), shape=A_coo.shape)
+
+def _get_problem_vec(problem) -> int:
+    """
+    Robustly extract the field component count from a JAX-FEM Problem.
+    """
+    vec = getattr(problem, "vec", 1)
+
+    if isinstance(vec, (list, tuple)):
+        if len(vec) == 0:
+            return 1
+        return int(vec[0])
+
+    return int(vec)
 # --------------------------------
 # jax-fem lowering helpers
 # --------------------------------
@@ -186,6 +199,90 @@ def _make_native_surface_map_from_expr(domain, coeff_expr, tag):
 
     return surface_map
 
+def _value_shape_num_components(value_shape) -> int:
+    """
+    Flatten a value_shape tuple into the number of components.
+
+    Examples
+    --------
+    ()    -> 1
+    (2,)  -> 2
+    (3,)  -> 3
+    (2,2) -> 4
+    """
+    if value_shape is None or len(value_shape) == 0:
+        return 1
+
+    n = 1
+    for s in value_shape:
+        n *= int(s)
+    return n
+
+
+def _reshape_components_last(arr, value_shape):
+    """
+    Reshape a trailing flattened component axis into value_shape.
+
+    Parameters
+    ----------
+    arr : jax array
+        Shape (..., n_comp)
+    value_shape : tuple
+        Desired trailing value shape.
+
+    Returns
+    -------
+    jax array
+        Shape (...,) + value_shape
+    """
+    if value_shape is None or len(value_shape) == 0:
+        return arr
+
+    return jnp.reshape(arr, arr.shape[:-1] + tuple(value_shape))
+
+
+def _infer_trial_vec_from_compiled(compiled_expr):
+    """
+    Infer JAX-FEM vec from the compiled trial symbol metadata.
+    """
+    trial = compiled_expr.get("trial", None)
+    if trial is None:
+        return 1
+    return _value_shape_num_components(getattr(trial, "value_shape", ()))
+
+
+def _expand_test_shape_vals(shape_vals, n_comp):
+    """
+    Expand scalar FE basis values into vector-valued test basis values.
+
+    Input
+    -----
+    shape_vals : (n_quad, n_local_nodes)
+    n_comp     : int
+
+    Output
+    ------
+    scalar case:
+        (n_quad, n_local_nodes)
+
+    vector case:
+        (n_quad, n_local_nodes, n_comp, n_comp)
+
+    Interpretation
+    --------------
+    The last two axes are:
+      - basis component index
+      - physical field component index
+
+    Using an identity in those axes preserves the test-function component
+    axis during tensor contractions.
+    """
+    if n_comp == 1:
+        return shape_vals
+
+    eye = jnp.eye(n_comp, dtype=shape_vals.dtype)          # (n_comp, n_comp)
+    return shape_vals[:, :, None, None] * eye[None, None, :, :]
+
 def _compile_weakform_for_jaxfem(domain, expr, tag: str = "fem_gauss") -> Dict[str, Any]:
     trial_nodes = {}
 
@@ -221,14 +318,21 @@ def _compile_weakform_for_jaxfem(domain, expr, tag: str = "fem_gauss") -> Dict[s
 
     if len(unique_trials) > 1:
         raise NotImplementedError(
-            "fem_solver=True currently supports a single scalar TrialFunction only."
+            "fem_solver=True currently supports exactly one TrialFunction "
+            "(scalar or vector valued). Multiple coupled FEM unknowns are not yet supported."
         )
+
+    trial = unique_trials[0] if unique_trials else None
+    value_shape = getattr(trial, "value_shape", ()) if trial is not None else ()
+    vec = _value_shape_num_components(value_shape)
 
     return {
         "expr": expr,
         "tag": tag,
         "has_trial": len(unique_trials) == 1,
-        "trial": unique_trials[0] if unique_trials else None,
+        "trial": trial,
+        "value_shape": value_shape,
+        "vec": vec,
     }
 
 def _eval_compiled_volume_integrand(
@@ -241,7 +345,9 @@ def _eval_compiled_volume_integrand(
     cell_v_grads_JxW,
 ):
     num_nodes = cell_shape_grads.shape[1]
-    cell_sol = cell_sol_flat.reshape(num_nodes, 1)
+    vec = int(compiled.get("vec", 1))
+
+    cell_sol = cell_sol_flat.reshape(num_nodes, vec)
     shape_vals = domain._jaxfem_solver_context["dummy_problem"].fes[0].shape_vals
 
     local = {
@@ -252,10 +358,15 @@ def _eval_compiled_volume_integrand(
         "tag": compiled["tag"],
         "surface": False,
         "domain_context": domain.context,
+        "trial_value_shape": compiled.get("value_shape", ()),
+        "trial_vec": vec,
     }
 
     val = _eval_expr_for_jaxfem(domain, compiled["expr"], local)
-    return jax.flatten_util.ravel_pytree(jnp.sum(val * cell_JxW[0][:, None], axis=0))[0]
+    weights = cell_JxW[0]
+    wshape = (weights.shape[0],) + (1,) * (val.ndim - 1)
+    weighted = val * weights.reshape(wshape)
+    return jax.flatten_util.ravel_pytree(jnp.sum(weighted, axis=0))[0]
 
 def _eval_compiled_surface_integrand(
     domain,
@@ -266,10 +377,10 @@ def _eval_compiled_surface_integrand(
     face_shape_grads,
     face_nanson_scale,
 ):
-
-
     num_nodes = face_shape_vals.shape[1]
-    cell_sol = cell_sol_flat.reshape(num_nodes, 1)
+    vec = int(compiled.get("vec", 1))
+
+    cell_sol = cell_sol_flat.reshape(num_nodes, vec)
 
     local = {
         "physical_quad_points": physical_surface_quad_points,
@@ -279,14 +390,36 @@ def _eval_compiled_surface_integrand(
         "tag": compiled["tag"],
         "surface": True,
         "domain_context": domain.context,
+        "trial_value_shape": compiled.get("value_shape", ()),
+        "trial_vec": vec,
     }
 
     val = _eval_expr_for_jaxfem(domain, compiled["expr"], local)
     weights = face_nanson_scale[0]
-
-    return jax.flatten_util.ravel_pytree(jnp.sum(val * weights[:, None], axis=0))[0]
+    wshape = (weights.shape[0],) + (1,) * (val.ndim - 1)
+    weighted = val * weights.reshape(wshape)
+    return jax.flatten_util.ravel_pytree(jnp.sum(weighted, axis=0))[0]
 
 def _eval_expr_for_jaxfem(domain, node, local):
+
+    if not isinstance(
+            node,
+            (
+                Literal,
+                Constant,
+                TensorTag,
+                Variable,
+                TestFunction,
+                TrialFunction,
+                Jacobian,
+                BinaryOp,
+                FunctionCall,
+            ),
+        ):
+            try:
+                return jnp.asarray(node)
+            except Exception:
+                pass
 
     if isinstance(node, Literal):
         return jnp.asarray(node.value)
@@ -294,6 +427,7 @@ def _eval_expr_for_jaxfem(domain, node, local):
     if isinstance(node, Constant):
         return jnp.asarray(node.value)
 
+    
     if isinstance(node, TensorTag):
         if node.tag not in local["domain_context"]:
             raise KeyError(
@@ -333,11 +467,18 @@ def _eval_expr_for_jaxfem(domain, node, local):
         return pts[:, dim0:dim0 + 1]
 
     if isinstance(node, TestFunction):
-        return local["shape_vals"]
+        n_comp = _value_shape_num_components(getattr(node, "value_shape", ()))
+        return _expand_test_shape_vals(local["shape_vals"], n_comp)
 
     if isinstance(node, TrialFunction):
-        vals = local["shape_vals"]
-        return jnp.sum(vals[:, :, None] * local["cell_sol"][None, :, :], axis=1)
+        vals = local["shape_vals"]  # (n_quad, n_local_nodes)
+        flat_interp = jnp.sum(vals[:, :, None] * local["cell_sol"][None, :, :], axis=1)  # (n_quad, vec)
+
+        value_shape = getattr(node, "value_shape", ())
+        if len(value_shape) == 0:
+            return flat_interp
+
+        return _reshape_components_last(flat_interp, value_shape)
 
     if isinstance(node, Jacobian):
         dims = []
@@ -353,19 +494,70 @@ def _eval_expr_for_jaxfem(domain, node, local):
             raise ValueError("Jacobian node has no differentiation variables")
 
         if isinstance(node.target, TestFunction):
-            comps = [local["shape_grads"][..., dim0] for dim0 in dims]
-            return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
+            n_comp = _value_shape_num_components(getattr(node.target, "value_shape", ()))
+            grads = local["shape_grads"]  # (n_quad, n_local_nodes, dim)
 
-        if isinstance(node.target, TrialFunction):
-            grads = local["shape_grads"]
+            # scalar test case
+            if n_comp == 1:
+                comps = [grads[..., dim0] for dim0 in dims]
+                return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
+
+            # vector-valued test case:
+            # return shape with explicit basis-component axis preserved
+            #
+            # one derivative:
+            #   (n_quad, n_local_nodes, n_comp, n_comp)
+            #
+            # many derivatives:
+            #   (n_quad, n_local_nodes, n_comp, n_comp, n_dim_requested)
+            #
+            # axes are:
+            #   quad, local_node, basis_comp, physical_comp, derivative_dim
+            eye = jnp.eye(n_comp, dtype=grads.dtype)  # (n_comp, n_comp)
+
             comps = [
-                jnp.sum(
-                    grads[:, :, dim0:dim0 + 1] * local["cell_sol"][None, :, :],
-                    axis=1,
-                )
+                grads[..., dim0][:, :, None, None] * eye[None, None, :, :]
                 for dim0 in dims
             ]
-            return comps[0] if len(comps) == 1 else jnp.concatenate(comps, axis=-1)
+
+            if len(comps) == 1:
+                return comps[0]
+
+            return jnp.stack(comps, axis=-1)
+
+        if isinstance(node.target, TrialFunction):
+            grads = local["shape_grads"]   # (n_quad, n_local_nodes, dim)
+            cell_sol = local["cell_sol"]   # (n_local_nodes, vec)
+
+            grad_list = [
+                jnp.sum(
+                    grads[:, :, dim0:dim0 + 1] * cell_sol[None, :, :],
+                    axis=1,
+                )  # (n_quad, vec)
+                for dim0 in dims
+            ]
+
+            if len(dims) == 1:
+                flat = grad_list[0]  # (n_quad, vec)
+            else:
+                flat = jnp.stack(grad_list, axis=-1)  # (n_quad, vec, n_dim_requested)
+
+            value_shape = getattr(node.target, "value_shape", ())
+
+            # scalar
+            if len(value_shape) == 0:
+                if len(dims) == 1:
+                    return flat
+                return flat
+
+            # vector/tensor-valued unknown
+            if len(dims) == 1:
+                return _reshape_components_last(flat, value_shape)
+            else:
+                return jnp.reshape(
+                    flat,
+                    flat.shape[:1] + tuple(value_shape) + (len(dims),)
+                )
 
         raise NotImplementedError(
             "fem_solver=True currently supports gradients of TrialFunction/TestFunction only."
@@ -424,7 +616,45 @@ def _build_grouped_problem(domain, volume_terms, boundary_terms):
         compiled_volume_expr = _compile_weakform_for_jaxfem(domain, vol_expr, tag="fem_gauss")
 
     active_boundary_tags = list(boundary_exprs.keys())
+    # --------------------------------------------------
+    # infer vec FIRST
+    # --------------------------------------------------
+    vec = 1
+    if compiled_volume_expr is not None:
+        vec = int(compiled_volume_expr.get("vec", 1))
+    elif len(active_boundary_tags) > 0:
+        first_tag = active_boundary_tags[0]
+        trial_nodes = {}
 
+        def walk_boundary(node):
+            if node is None:
+                return
+            if isinstance(node, TrialFunction):
+                trial_nodes[node.op_id] = node
+                return
+            for attr in ("left", "right", "target", "expr"):
+                child = getattr(node, attr, None)
+                if child is not None:
+                    walk_boundary(child)
+            for attr in ("args", "variables"):
+                vals = getattr(node, attr, None)
+                if vals is None:
+                    continue
+                for v in vals:
+                    if isinstance(v, (list, tuple)):
+                        for vv in v:
+                            walk_boundary(vv)
+                    else:
+                        walk_boundary(v)
+
+        walk_boundary(boundary_exprs[first_tag])
+        if len(trial_nodes) == 1:
+            only_trial = list(trial_nodes.values())[0]
+            vec = _value_shape_num_components(getattr(only_trial, "value_shape", ()))
+        else:
+            vec = int(solver_ctx.get("default_vec", 1))
+    else:
+        vec = int(solver_ctx.get("default_vec", 1))
     native_surface_maps = []
     universal_surface_kernels = []
 
@@ -478,9 +708,13 @@ def _build_grouped_problem(domain, volume_terms, boundary_terms):
 
             universal_surface_kernels.append(make_surface_kernel(compiled_expr))
 
+     # --------------------------------------------------
+    # build dirichlet BC info using inferred vec
+    # --------------------------------------------------
     dirichlet_bc_info = domain._build_dirichlet_bc_info(
         solver_ctx["dirichlet_tags"],
         getattr(domain, "_fem_dirichlet_value_fns", None),
+        vec=vec,
     )
 
     location_fns = []
@@ -524,9 +758,10 @@ def _build_grouped_problem(domain, volume_terms, boundary_terms):
         def get_universal_kernels_surface(self_inner):
             return universal_surface_kernels
 
+
     problem = GeneratedProblem(
         solver_ctx["mesh"],
-        vec=1,
+        vec=vec,
         dim=solver_ctx["dim"],
         ele_type=solver_ctx["element_type"],
         gauss_order=solver_ctx["quad_degree"],
@@ -537,12 +772,18 @@ def _build_grouped_problem(domain, volume_terms, boundary_terms):
     return problem, solver_ctx
 
 def _flat_to_sol_list(problem, u_flat, dtype=jnp.float64):
-    """Convert a flat DOF vector into JAX-FEM's expected [array(num_nodes,1)] format."""
+    """
+    Convert a flat DOF vector into JAX-FEM's expected [array(num_nodes, vec)] format.
+    """
     u_flat = jnp.asarray(u_flat, dtype=dtype)
     n = problem.fes[0].num_total_nodes
-    if u_flat.ndim != 1 or u_flat.shape[0] != n:
-        raise ValueError(f"Expected flat state of shape ({n},), got {u_flat.shape}")
-    return [u_flat.reshape(n, 1)]
+    vec = _get_problem_vec(problem)
+    expected = n * vec
+
+    if u_flat.ndim != 1 or u_flat.shape[0] != expected:
+        raise ValueError(f"Expected flat state of shape ({expected},), got {u_flat.shape}")
+
+    return [u_flat.reshape(n, vec)]
 
 # --------------------------------
 # grouped fem assembly
@@ -563,7 +804,7 @@ def _assemble_fem_residual_grouped(domain, volume_terms, boundary_terms, **kwarg
         ) from exc
 
     problem, solver_ctx = _build_grouped_problem(domain, volume_terms, boundary_terms)
-    n_dofs = problem.fes[0].num_total_nodes
+    n_dofs = problem.fes[0].num_total_nodes * _get_problem_vec(problem)
 
     def residual_fn(u_flat):
         sol_list = _flat_to_sol_list(problem, u_flat)
@@ -604,7 +845,8 @@ def _assemble_fem_system_grouped(domain, volume_terms, boundary_terms, **kwargs)
 
     problem, solver_ctx = _build_grouped_problem(domain, volume_terms, boundary_terms)
 
-    zero_sol = [jnp.zeros((problem.fes[0].num_total_nodes, 1), dtype=jnp.float64)]
+    vec = _get_problem_vec(problem)
+    zero_sol = [jnp.zeros((problem.fes[0].num_total_nodes, vec), dtype=jnp.float64)]
 
     res_list = problem.newton_update(zero_sol)
 

@@ -1744,31 +1744,75 @@ class FemResidualOperator:
 class TrialFunction(Placeholder):
     """
     Generic variational unknown symbol.
+
     Interpretation depends on assembly target:
-      - vpinn      -> interpreted via model/u_net
-      - fem_system -> interpreted as FE trial function
-      - fem_residual -> interpreted as FE unknown in a nonlinear residual operator
+      - vpinn         -> interpreted via model/u_net
+      - fem_system    -> interpreted as FE trial function
+      - fem_residual  -> interpreted as FE unknown in a nonlinear residual operator
+
+    Parameters
+    ----------
+    name : str
+        Symbol name used for printing/debugging.
+    value_shape : tuple
+        Shape of the field value at one spatial point:
+          ()    -> scalar
+          (2,)  -> 2D vector
+          (3,)  -> 3D vector
+          (2,2) -> second-order tensor, etc.
     """
-    def __init__(self, name="u"):
+    def __init__(self, name="u", value_shape=()):
         self.name = name
+        self.value_shape = tuple(value_shape)
         self.op_id = _next_op_id()
 
+    @property
+    def num_components(self) -> int:
+        if len(self.value_shape) == 0:
+            return 1
+        n = 1
+        for s in self.value_shape:
+            n *= int(s)
+        return n
+
     def __repr__(self):
-        return f"TrialFunction({self.name})"
+        return f"TrialFunction({self.name}, value_shape={self.value_shape})"
+
 
 class TestFunction(Placeholder):
     """
     Generic variational test function.
+
     It is resolved against the active bucket (volume or boundary region)
     during evaluation/assembly.
+
+    Parameters
+    ----------
+    name : str
+        Symbol name used for printing/debugging.
+    value_shape : tuple
+        Shape of the field value at one spatial point:
+          ()    -> scalar
+          (2,)  -> 2D vector
+          (3,)  -> 3D vector
+          (2,2) -> second-order tensor, etc.
     """
-    def __init__(self, name="phi"):
+    def __init__(self, name="phi", value_shape=()):
         self.name = name
+        self.value_shape = tuple(value_shape)
         self.op_id = _next_op_id()
 
-    def __repr__(self):
-        return f"TestFunction({self.name})"
+    @property
+    def num_components(self) -> int:
+        if len(self.value_shape) == 0:
+            return 1
+        n = 1
+        for s in self.value_shape:
+            n *= int(s)
+        return n
 
+    def __repr__(self):
+        return f"TestFunction({self.name}, value_shape={self.value_shape})"
 
 class Assembly(Placeholder):
     """

@@ -1999,13 +1999,23 @@ class domain(MeshUtils, Geometries):
         return sorted(self._boundary_registry.keys())
 
     
-    def _build_dirichlet_bc_info(self, dirichlet_tags, dirichlet_value_fns=None):
+    def _build_dirichlet_bc_info(self, dirichlet_tags, dirichlet_value_fns=None, vec: int = 1):
         """
         Build JAX-FEM dirichlet_bc_info = [location_fns, vec_ids, value_fns].
 
-        Fully tag-based:
-        - no hardcoded left/right/top/bottom logic
-        - works for arbitrary 2D/3D geometry if the mesh has boundary tags
+        Supports:
+        - scalar BCs:  {"left": lambda p: 0.0}
+        - vector BCs:  {"left": [fn_x, fn_y]}
+        - vector BCs:  {"left": {0: fn_x, 1: fn_y}}
+
+        Parameters
+        ----------
+        dirichlet_tags : list[str]
+            Boundary tags to constrain.
+        dirichlet_value_fns : dict | None
+            Per-tag value specification.
+        vec : int
+            Number of field components.
         """
         if dirichlet_value_fns is None:
             dirichlet_value_fns = {}
@@ -2014,43 +2024,121 @@ class domain(MeshUtils, Geometries):
         vec_ids = []
         val_fns = []
 
+        def zero_fn(p):
+            return 0.0
+
         for tag in dirichlet_tags:
             loc_fn = self._make_tag_location_fn(tag)
             if loc_fn is None:
                 self.log.warning(f"Dirichlet tag '{tag}' not found in mesh tags. Skipping.")
                 continue
 
-            loc_fns.append(loc_fn)
-            vec_ids.append(0)
+            spec = dirichlet_value_fns.get(tag, None)
 
-            if tag in dirichlet_value_fns:
-                val_fns.append(dirichlet_value_fns[tag])
-            else:
-                val_fns.append(lambda p: 0.0)
+            # Case 1: no user-specified BC -> zero on all components
+            if spec is None:
+                for c in range(vec):
+                    loc_fns.append(loc_fn)
+                    vec_ids.append(c)
+                    val_fns.append(zero_fn)
+                continue
+
+            # Case 2: scalar callable -> apply only to component 0
+            # (keeps old scalar behaviour unchanged)
+            if callable(spec):
+                loc_fns.append(loc_fn)
+                vec_ids.append(0)
+                val_fns.append(spec)
+                continue
+
+            # Case 3: list/tuple of callables, one per component
+            if isinstance(spec, (list, tuple)):
+                if len(spec) != vec:
+                    raise ValueError(
+                        f"Dirichlet BC for tag '{tag}' has {len(spec)} component functions, "
+                        f"but vec={vec}."
+                    )
+                for c, fn in enumerate(spec):
+                    if not callable(fn):
+                        raise TypeError(
+                            f"Dirichlet BC entry for tag '{tag}', component {c} is not callable."
+                        )
+                    loc_fns.append(loc_fn)
+                    vec_ids.append(c)
+                    val_fns.append(fn)
+                continue
+
+            # Case 4: dict {component_id: callable}
+            if isinstance(spec, dict):
+                for c in sorted(spec.keys()):
+                    fn = spec[c]
+                    if not callable(fn):
+                        raise TypeError(
+                            f"Dirichlet BC entry for tag '{tag}', component {c} is not callable."
+                        )
+                    loc_fns.append(loc_fn)
+                    vec_ids.append(int(c))
+                    val_fns.append(fn)
+                continue
+
+            raise TypeError(
+                f"Unsupported Dirichlet BC specification for tag '{tag}': {type(spec).__name__}"
+            )
 
         if len(loc_fns) == 0:
             return [[lambda p: False], [0], [lambda p: 0.0]]
 
         return [loc_fns, vec_ids, val_fns]
     
-    def variational_symbols(self):
+    def variational_symbols(self, value_shape=(), names=("u", "phi")):
         """
         Return generic variational symbols.
 
-        u   : unknown / trial-like symbol
-        phi : test symbol
+        Parameters
+        ----------
+        value_shape : tuple, default=()
+            Shape of the field value at one spatial point:
+            ()    -> scalar
+            (2,)  -> 2D vector
+            (3,)  -> 3D vector
+        names : tuple[str, str]
+            Names of the trial and test symbols.
 
-        They stay symbolic. The backend decides later how to interpret them:
-          - target="vpinn"      -> u is evaluated through u_net/model
-          - target="fem_system" -> u is treated as FE trial function
+        Returns
+        -------
+        (trial, test)
+            Symbolic variational placeholders carrying shape metadata.
+
+        Examples
+        --------
+        Scalar Poisson:
+            u, phi = domain.fem_symbols()
+
+        2D vector elasticity:
+            u, v = domain.fem_symbols(value_shape=(2,))
+
+        3D vector elasticity:
+            u, v = domain.fem_symbols(value_shape=(3,))
         """
-        return TrialFunction(name="u"), TestFunction(name="phi")
+        trial_name, test_name = names
+        return (
+            TrialFunction(name=trial_name, value_shape=value_shape),
+            TestFunction(name=test_name, value_shape=value_shape),
+        )
 
-    def fem_symbols(self):
+    def fem_symbols(self, value_shape=(), names=("u", "phi")):
         """
         Backward-compatible alias for variational_symbols().
+
+        Examples
+        --------
+        Scalar:
+            u, phi = domain.fem_symbols()
+
+        Vector:
+            u, v = domain.fem_symbols(value_shape=(2,))
         """
-        return self.variational_symbols()
+        return self.variational_symbols(value_shape=value_shape, names=names)
     
     def _register_variational_sample(
         self,
@@ -2083,7 +2171,7 @@ class domain(MeshUtils, Geometries):
             "context_tag": context_tag if context_tag is not None else sample_tag,
         }
 
-    def init_fem(self, element_type: str = "TRI3", quad_degree: int = 2, neumann_tags: List[str] = [], dirichlet_tags: List[str] = [], dirichlet_value_fns: dict | None = None, fem_solver: bool = False) -> "domain":
+    def init_fem(self, element_type: str = "TRI3", quad_degree: int = 2, neumann_tags: List[str] = [], dirichlet_tags: List[str] = [], dirichlet_value_fns: dict | None = None, fem_solver: bool = False, vec: int =1,) -> "domain":
         if self.mesh is None:
             raise ValueError("Mesh must be loaded before initializing FEM context.")
         self._variational_initialized = True
@@ -2110,7 +2198,7 @@ class domain(MeshUtils, Geometries):
 
             valid_tags.append(tag)
             location_fns.append(loc_fn)
-        dirichlet_bc_info = self._build_dirichlet_bc_info(dirichlet_tags, dirichlet_value_fns)
+        dirichlet_bc_info = self._build_dirichlet_bc_info(dirichlet_tags, dirichlet_value_fns, vec=vec,)
 
         class DummyProblem(Problem):
             def get_tensor_map(self): 
@@ -2123,14 +2211,14 @@ class domain(MeshUtils, Geometries):
                 return [lambda u, x: jnp.zeros((1,))] * len(location_fns)
         
         prob = DummyProblem(
-                jax_mesh,
-                vec=1,
-                dim=self.dimension,
-                ele_type=element_type,
-                gauss_order=quad_degree,
-                dirichlet_bc_info=dirichlet_bc_info,
-                location_fns=location_fns,
-            )
+            jax_mesh,
+            vec=vec,
+            dim=self.dimension,
+            ele_type=element_type,
+            gauss_order=quad_degree,
+            dirichlet_bc_info=dirichlet_bc_info,
+            location_fns=location_fns,
+        )
         self._fem_solver_enabled = bool(fem_solver)
         self._jaxfem_solver_context = {
             "mesh": jax_mesh,
@@ -2142,6 +2230,7 @@ class domain(MeshUtils, Geometries):
             "dirichlet_bc_info": dirichlet_bc_info,
             "dummy_problem": prob,
             "dim": self.dimension,
+            "default_vec": vec,
         }
 
         fe = prob.fes[0]
@@ -2313,6 +2402,7 @@ class domain(MeshUtils, Geometries):
     def assemble_weak_form(self, expr, target="vpinn", **kwargs):
         from .weak_form import assemble_weak_form
         return assemble_weak_form(self, expr, target=target, **kwargs)
+   
     # Generators
     def _generate_mesh(self, geometry_func: Callable, algorithm: int):
         """Generate mesh using PyGmsh."""

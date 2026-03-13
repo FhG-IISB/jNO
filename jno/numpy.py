@@ -257,7 +257,92 @@ def transpose(x, axes: tuple = None) -> FunctionCall:
     """Transpose array."""
     return FunctionCall(lambda a: jnp.transpose(a, axes=axes), [x])
 
+def trace(x) -> FunctionCall:
+    """
+    Trace of a matrix/tensor over the last two axes.
 
+    Examples
+    --------
+    trace(A)              -> scalar trace for (..., n, n)
+    trace(symgrad(u))     -> volumetric strain
+    """
+    return FunctionCall(
+        lambda a: jnp.trace(a, axis1=-2, axis2=-1),
+        [x],
+        name="trace",
+    )
+
+
+def sym(x) -> FunctionCall:
+    """
+    Symmetric part of a second-order tensor over the last two axes.
+
+    sym(A) = 0.5 * (A + A^T)
+    """
+    return FunctionCall(
+        lambda a: 0.5 * (a + jnp.swapaxes(a, -1, -2)),
+        [x],
+        name="sym",
+    )
+
+
+def antisym(x) -> FunctionCall:
+    """
+    Skew-symmetric part of a second-order tensor over the last two axes.
+
+    antisym(A) = 0.5 * (A - A^T)
+    """
+    return FunctionCall(
+        lambda a: 0.5 * (a - jnp.swapaxes(a, -1, -2)),
+        [x],
+        name="antisym",
+    )
+
+
+def identity(n: int) -> FunctionCall:
+    """
+    Symbolic identity matrix helper.
+
+    This returns a traced constant-like FunctionCall so it composes naturally
+    inside symbolic expressions.
+
+    Example
+    -------
+    I = jnn.identity(2)
+    sigma = lam * jnn.trace(eps) * I + 2.0 * mu * eps
+    """
+    return FunctionCall(
+        lambda: jnp.eye(n),
+        [],
+        name="identity",
+    )
+
+
+def symgrad(target: Placeholder, variables: List[Variable], scheme: str = "automatic_differentiation") -> FunctionCall:
+    """
+    Symmetric gradient of a vector/tensor-valued field.
+
+    For a vector field u in R^dim:
+        grad(u)    -> (..., n_comp, dim)
+        symgrad(u) -> 0.5 * (grad(u) + grad(u)^T)
+
+    In small-strain elasticity:
+        eps(u) = symgrad(u, [x, y])   # 2D
+        eps(u) = symgrad(u, [x, y, z])# 3D
+
+    Notes
+    -----
+    This assumes the Jacobian convention used by jno:
+        jacobian(u, [x, y]) has trailing shape (..., value_shape, dim)
+    so the last axis is the derivative direction and the second-last block
+    corresponds to field components.
+    """
+    G = jacobian(target, variables, scheme=scheme)
+    return FunctionCall(
+        lambda a: 0.5 * (a + jnp.swapaxes(a, -1, -2)),
+        [G],
+        name="symgrad",
+    )
 # ============================================================================
 # Reduction operations
 # ============================================================================
@@ -368,6 +453,14 @@ def inner(x, y, n_contract: int = 1, keepdims: bool = False) -> FunctionCall:
 
     return FunctionCall(_fn, [x, y], name="inner", reduces_axis=-1)
 
+def double_dot(x, y) -> FunctionCall:
+    """
+    Double contraction / Frobenius product.
+
+    Equivalent to:
+        inner(x, y, n_contract=2)
+    """
+    return inner(x, y, n_contract=2)
 
 def einsum(subscripts: str, *operands) -> FunctionCall:
     """Traced jnp.einsum wrapper for compact tensor/vector contractions."""

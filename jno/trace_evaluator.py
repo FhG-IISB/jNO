@@ -548,19 +548,38 @@ class TraceEvaluator:
                     "Use grad(phi, x) only inside Assembly(...)."
                 )
 
-            var = variables[0]
-            dim_idx = 0
-            if hasattr(var, "dim") and isinstance(var.dim, (list, tuple)):
-                ints = [d for d in var.dim if isinstance(d, int)]
-                if ints:
-                    dim_idx = ints[0]
+            requested_dims = []
+            for var in variables:
+                dim_idx = 0
+                if hasattr(var, "dim") and isinstance(var.dim, (list, tuple)):
+                    ints = [d for d in var.dim if isinstance(d, int)]
+                    if ints:
+                        dim_idx = ints[0]
+                requested_dims.append(dim_idx)
 
             support = ctx.active_region["support"]
             region_id = ctx.active_region["region_id"]
+            value_shape = getattr(target, "value_shape", ())
+            n_comp = self._value_shape_num_components(value_shape)
 
             if support == "volume":
-                dN = ctx.context["dN_dx_flat"]
-                return dN[..., dim_idx]
+                dN = ctx.context["dN_dx_flat"]  # (Nq_total, nloc, dim)
+
+                if n_comp == 1:
+                    comps = [dN[..., dim_idx] for dim_idx in requested_dims]
+                    return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
+
+                eye = jnp.eye(n_comp, dtype=dN.dtype)
+                comps = [
+                    dN[..., dim_idx][:, :, None, None] * eye[None, None, :, :]
+                    for dim_idx in requested_dims
+                ]
+
+                # one derivative:
+                #   (Nq_total, nloc, basis_comp, phys_comp)
+                # many derivatives:
+                #   (Nq_total, nloc, basis_comp, phys_comp, n_vars)
+                return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
 
             if support == "boundary":
                 if "surface_data" not in ctx.context or region_id not in ctx.context["surface_data"]:
@@ -578,9 +597,19 @@ class TraceEvaluator:
                     )
 
                 dN_face = surf_data["face_shape_grads"]
-                # Expected shape after padding/reshape path:
-                #   (..., n_faces, n_quads, n_local_nodes, dim)
-                return dN_face.reshape(-1, dN_face.shape[-2], dN_face.shape[-1])[..., dim_idx]
+                # flatten to (Nq_total, nloc, dim)
+                dN_face = dN_face.reshape(-1, dN_face.shape[-2], dN_face.shape[-1])
+
+                if n_comp == 1:
+                    comps = [dN_face[..., dim_idx] for dim_idx in requested_dims]
+                    return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
+
+                eye = jnp.eye(n_comp, dtype=dN_face.dtype)
+                comps = [
+                    dN_face[..., dim_idx][:, :, None, None] * eye[None, None, :, :]
+                    for dim_idx in requested_dims
+                ]
+                return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
 
             raise ValueError(f"Unknown active support '{support}'")
 
@@ -709,41 +738,58 @@ class TraceEvaluator:
         elif scheme == "automatic_differentiation":
             evaluator_self = self
 
+            def make_u_fn(local_ctx):
+                def u_fn(p):
+                    ctx_dict = {**local_ctx, tag: p[jnp.newaxis, :]}
+                    new_ctx = evaluator_self._EvalCtx(
+                        ctx_dict,
+                        ctx.var_bindings,
+                        ctx.key,
+                        active_region=ctx.active_region,
+                    )
+                    return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
+                return u_fn
+
             if n_vars == 1:
-                # Single-variable gradient: use jax.grad for efficiency
                 dim = var_dims[0][1]
 
-                def grad_single(idx):
+                def jac_single(idx):
                     pt = jax.lax.dynamic_slice(points, (idx, 0), (1, points.shape[1]))[0]
                     local_ctx = evaluator_self._build_local_context(idx, tag, points, ctx.context)
+                    u_fn = make_u_fn(local_ctx)
 
-                    def u_scalar(p):
-                        ctx_dict = {**local_ctx, tag: p[jnp.newaxis, ...]}
-                        new_ctx = evaluator_self._EvalCtx(ctx_dict, ctx.var_bindings, ctx.key, active_region=ctx.active_region)
-                        return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
-
-                    return jax.grad(u_scalar)(pt)[dim]
-
-                return jax.vmap(grad_single)(jnp.arange(points.shape[0]))[:, jnp.newaxis]
-            else:
-                # Multi-variable Jacobian
-                def jac_single(pt):
-                    def u_fn(p):
-                        new_ctx = evaluator_self._EvalCtx(
-                            {**ctx.context, tag: p[jnp.newaxis, :]},
-                            ctx.var_bindings,
-                            ctx.key,
-                            active_region=ctx.active_region,
-                        )
-                        return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
-
+                    val0 = u_fn(pt)
                     jac = jax.jacobian(u_fn)(pt)
-                    result = jnp.zeros((n_vars,))
-                    for i, vi_dim in var_dims:
-                        result = result.at[i].set(jac[vi_dim])
-                    return result
 
-                return jax.vmap(jac_single)(points)
+                    # scalar output -> shape (1,)
+                    if jnp.ndim(val0) == 0:
+                        return jnp.asarray(jac[dim])[jnp.newaxis]
+
+                    # vector/tensor output -> keep output shape, select derivative dim
+                    return jac[..., dim]
+
+                return jax.vmap(jac_single)(jnp.arange(points.shape[0]))
+
+            else:
+                def jac_single(idx):
+                    pt = jax.lax.dynamic_slice(points, (idx, 0), (1, points.shape[1]))[0]
+                    local_ctx = evaluator_self._build_local_context(idx, tag, points, ctx.context)
+                    u_fn = make_u_fn(local_ctx)
+
+                    val0 = u_fn(pt)
+                    jac = jax.jacobian(u_fn)(pt)
+
+                    # scalar output -> (n_vars,)
+                    if jnp.ndim(val0) == 0:
+                        return jnp.stack([jac[vi_dim] for _, vi_dim in var_dims], axis=-1)
+
+                    # vector/tensor output:
+                    # jac shape is value_shape + (input_dim,)
+                    # collect requested derivative directions on the last axis
+                    comps = [jac[..., vi_dim] for _, vi_dim in var_dims]
+                    return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
+
+                return jax.vmap(jac_single)(jnp.arange(points.shape[0]))
 
     def _eval_hessian(self, expr, ctx):
         """Evaluate Hessian (second-order derivatives).
@@ -876,9 +922,112 @@ class TraceEvaluator:
     def _eval_operation_def(self, expr, ctx):
         return self._dispatch(expr.expr, ctx)
 
+
+    @staticmethod
+    def _value_shape_num_components(value_shape) -> int:
+        if value_shape is None or len(value_shape) == 0:
+            return 1
+        n = 1
+        for s in value_shape:
+            n *= int(s)
+        return n
+
+
+    @staticmethod
+    def _expand_test_basis(shape_vals, value_shape):
+        """
+        Scalar test:
+            shape_vals -> (Nq, nloc)
+
+        Vector test (e.g. value_shape=(2,)):
+            -> (Nq, nloc, ncomp, ncomp)
+
+        Last two axes are:
+        - basis component index
+        - physical component index
+
+        This preserves the test-component axis under contractions like
+        inner(f, phi) or inner(sigma, eps(phi), n_contract=2).
+        """
+        n_comp = TraceEvaluator._value_shape_num_components(value_shape)
+
+        if n_comp == 1:
+            return shape_vals
+
+        eye = jnp.eye(n_comp, dtype=shape_vals.dtype)
+        return shape_vals[:, :, None, None] * eye[None, None, :, :]
+
+
+    @staticmethod
+    def _assemble_basis_integrand(integrand, weights, flat_cells, num_total_nodes):
+        """
+        Assemble a grouped VPINN integrand into nodal residuals while preserving any
+        trailing component axes.
+
+        Supported shapes
+        ----------------
+        scalar:
+            integrand = (Nq_total, nloc)
+
+        vector:
+            integrand = (Nq_total, nloc, ncomp)
+
+        more generally:
+            integrand = (Nq_total, nloc, ...)
+        """
+        integrand = jnp.asarray(integrand)
+        weights = jnp.asarray(weights)
+        flat_cells = jnp.asarray(flat_cells).flatten().astype(jnp.int32)
+
+        num_entities, num_quads = weights.shape[-2], weights.shape[-1]
+        n_local_nodes = integrand.shape[1]
+        trailing_shape = integrand.shape[2:]
+
+        # broadcast weights over all trailing axes
+        wshape = (weights.size,) + (1,) * (integrand.ndim - 1)
+        local_residuals = integrand * weights.reshape(wshape)
+
+        # restore entity/quad structure
+        local_residuals = local_residuals.reshape(
+            (num_entities, num_quads, n_local_nodes) + trailing_shape
+        )
+
+        # integrate over quadrature
+        cell_residuals = jnp.sum(local_residuals, axis=1)  # (entities, nloc, ...)
+
+        if len(trailing_shape) == 0:
+            data = cell_residuals.reshape(-1)
+            global_residual = jax.ops.segment_sum(
+                data,
+                flat_cells,
+                num_segments=num_total_nodes,
+            )
+            return global_residual[:, jnp.newaxis]
+
+        flat_comp = 1
+        for s in trailing_shape:
+            flat_comp *= int(s)
+
+        data = cell_residuals.reshape(-1, flat_comp)
+        global_residual = jax.ops.segment_sum(
+            data,
+            flat_cells,
+            num_segments=num_total_nodes,
+        )
+
+        return global_residual.reshape((num_total_nodes,) + trailing_shape)
+
     def _eval_test_function(self, expr, ctx):
         """
         Resolve the generic TestFunction against the currently active variational region.
+
+        Scalar test:
+            volume   -> (Nq_total, nloc)
+            boundary -> (Nq_total, nloc)
+
+        Vector test:
+            volume   -> (Nq_total, nloc, ncomp, ncomp)
+            boundary -> (Nq_total, nloc, ncomp, ncomp)
         """
         if ctx.active_region is None:
             raise ValueError(
@@ -888,10 +1037,11 @@ class TraceEvaluator:
 
         support = ctx.active_region["support"]
         region_id = ctx.active_region["region_id"]
+        value_shape = getattr(expr, "value_shape", ())
 
         if support == "volume":
-            # Volume shape functions: (N_quads_total, n_local_nodes)
-            return ctx.context["N_flat"]
+            vals = ctx.context["N_flat"]  # (Nq_total, nloc)
+            return self._expand_test_basis(vals, value_shape)
 
         if support == "boundary":
             if "surface_data" not in ctx.context or region_id not in ctx.context["surface_data"]:
@@ -900,8 +1050,8 @@ class TraceEvaluator:
                 )
 
             vals = ctx.context["surface_data"][region_id]["face_shape_vals"]
-            # Safe for both (F,Q,nloc) and padded (1,1,F,Q,nloc)
-            return vals.reshape(-1, vals.shape[-1])
+            vals = vals.reshape(-1, vals.shape[-1])  # (Nq_total, nloc)
+            return self._expand_test_basis(vals, value_shape)
 
         raise ValueError(f"Unknown active support '{support}'")
 
@@ -924,34 +1074,12 @@ class TraceEvaluator:
         else:
             raise ValueError(f"Unknown assembly support '{expr.support}'")
 
-        num_entities, num_quads = weights.shape[-2], weights.shape[-1]
-        weights_flat = weights.flatten()[:, jnp.newaxis]
-
-        local_residuals = integrand * weights_flat
-        num_local_nodes = integrand.shape[-1]
-
-        # Safety reshape
-        local_residuals = local_residuals.reshape(num_entities, num_quads, num_local_nodes)
-        cell_residuals = jnp.sum(local_residuals, axis=1)
-
-        global_residual = jax.ops.segment_sum(
-            cell_residuals.flatten(),
+        global_residual = self._assemble_basis_integrand(
+            integrand,
+            weights,
             flat_cells,
-            num_segments=expr.num_total_nodes,
+            expr.num_total_nodes,
         )
-
-        if global_residual.ndim == 1:
-            global_residual = global_residual[:, jnp.newaxis]
-
-        # # Volume normalization only
-        # if expr.support == "volume" and "global_areas" in ctx.context:
-        #     areas = ctx.context["global_areas"].reshape(-1, 1)
-        #     global_residual = global_residual / (areas + 1e-12)
-
-        # # Optional boundary normalization if you want it later:
-        # elif expr.support == "boundary":
-        #     b_areas = ctx.context["surface_data"][expr.region_id]["global_boundary_areas"].reshape(-1, 1)
-        #     global_residual = global_residual / (b_areas + 1e-12)
 
         if "dirichlet_nodes" in ctx.context:
             d_nodes = jnp.asarray(ctx.context["dirichlet_nodes"]).flatten().astype(jnp.int32)
@@ -976,26 +1104,12 @@ class TraceEvaluator:
 
             integrand = self._dispatch(expr.volume_expr, vol_ctx)
 
-            weights = ctx.context["JxW"]
-            flat_cells = ctx.context["flat_cells"].flatten()
-
-            num_entities, num_quads = weights.shape[-2], weights.shape[-1]
-            weights_flat = weights.flatten()[:, jnp.newaxis]
-
-            local_residuals = integrand * weights_flat
-            num_local_nodes = integrand.shape[-1]
-
-            local_residuals = local_residuals.reshape(num_entities, num_quads, num_local_nodes)
-            cell_residuals = jnp.sum(local_residuals, axis=1)
-
-            vol_res = jax.ops.segment_sum(
-                cell_residuals.flatten(),
-                flat_cells,
-                num_segments=expr.num_total_nodes,
+            vol_res = self._assemble_basis_integrand(
+                integrand,
+                ctx.context["JxW"],
+                ctx.context["flat_cells"].flatten(),
+                expr.num_total_nodes,
             )
-
-            if vol_res.ndim == 1:
-                vol_res = vol_res[:, jnp.newaxis]
 
             total = vol_res if total is None else (total + vol_res)
 
@@ -1013,35 +1127,22 @@ class TraceEvaluator:
             integrand = self._dispatch(bnd_expr, bnd_ctx)
 
             surf_data = ctx.context["surface_data"][region_id]
-            weights = surf_data["nanson_scale"]
-            flat_cells = surf_data["flat_parent_nodes"].flatten()
-
-            num_entities, num_quads = weights.shape[-2], weights.shape[-1]
-            weights_flat = weights.flatten()[:, jnp.newaxis]
-
-            local_residuals = integrand * weights_flat
-            num_local_nodes = integrand.shape[-1]
-
-            local_residuals = local_residuals.reshape(num_entities, num_quads, num_local_nodes)
-            cell_residuals = jnp.sum(local_residuals, axis=1)
-
-            bnd_res = jax.ops.segment_sum(
-                cell_residuals.flatten(),
-                flat_cells,
-                num_segments=expr.num_total_nodes,
+            bnd_res = self._assemble_basis_integrand(
+                integrand,
+                surf_data["nanson_scale"],
+                surf_data["flat_parent_nodes"].flatten(),
+                expr.num_total_nodes,
             )
-
-            if bnd_res.ndim == 1:
-                bnd_res = bnd_res[:, jnp.newaxis]
 
             total = bnd_res if total is None else (total + bnd_res)
 
         if total is None:
             raise ValueError("GroupedAssembly has neither volume nor boundary expressions.")
+
         if "global_areas" in ctx.context:
             areas = jnp.asarray(ctx.context["global_areas"]).reshape(-1, 1)
             total = total / (areas + 1e-12)
-        # Keep the current optional Dirichlet zeroing behavior
+
         if "dirichlet_nodes" in ctx.context:
             d_nodes = jnp.asarray(ctx.context["dirichlet_nodes"]).flatten().astype(jnp.int32)
             if d_nodes.size > 0:
