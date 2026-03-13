@@ -52,6 +52,7 @@ __all__ = [
     "GroupedAssembly",
     "TrialFunction",
     "FemLinearSystem",
+    "FemResidualOperator",
 ]
 
 # Global counter for unique operation IDs
@@ -1692,6 +1693,14 @@ class FemLinearSystem:
             return NotImplemented
         return FemLinearSystem(self.A + other.A, self.b + other.b)
 
+    def todense(self):
+        A_dense = self.A.todense() if hasattr(self.A, "todense") else self.A
+        return A_dense, self.b
+    
+    def todense(self):
+        A_dense = self.A.todense() if hasattr(self.A, "todense") else self.A
+        return A_dense, self.b
+    
     def __sub__(self, other):
         if not isinstance(other, FemLinearSystem):
             return NotImplemented
@@ -1702,12 +1711,43 @@ class FemLinearSystem:
         return f"FemLinearSystem(shape={shape}, b_shape={getattr(self.b, 'shape', None)})"
 
 
+class FemResidualOperator:
+    """Container for a nonlinear FEM residual operator R(u)=0.
+
+    Parameters
+    ----------
+    residual_fn : callable
+        Function taking a flat DOF vector and returning the residual vector.
+    jacobian_fn : callable | None
+        Optional function taking a flat DOF vector and returning the tangent/Jacobian.
+    size : int | None
+        Number of scalar DOFs.
+    """
+
+    def __init__(self, residual_fn, jacobian_fn=None, size=None):
+        self.residual = residual_fn
+        self.jacobian = jacobian_fn
+        self.size = size
+
+    def __call__(self, u):
+        return self.residual(u)
+    
+    def linearize(self, u):
+        if self.jacobian is None:
+            raise ValueError("No jacobian function available.")
+        return self.jacobian(u), -self.residual(u)
+
+    def __repr__(self):
+        return f"FemResidualOperator(size={self.size}, has_jacobian={self.jacobian is not None})"
+    
+
 class TrialFunction(Placeholder):
     """
     Generic variational unknown symbol.
     Interpretation depends on assembly target:
       - vpinn      -> interpreted via model/u_net
       - fem_system -> interpreted as FE trial function
+      - fem_residual -> interpreted as FE unknown in a nonlinear residual operator
     """
     def __init__(self, name="u"):
         self.name = name
