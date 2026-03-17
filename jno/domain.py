@@ -2171,7 +2171,17 @@ class domain(MeshUtils, Geometries):
             "context_tag": context_tag if context_tag is not None else sample_tag,
         }
 
-    def init_fem(self, element_type: str = "TRI3", quad_degree: int = 2, neumann_tags: List[str] = [], dirichlet_tags: List[str] = [], dirichlet_value_fns: dict | None = None, fem_solver: bool = False, vec: int =1,) -> "domain":
+    def init_fem(
+                self,
+                element_type: str = "TRI3",
+                quad_degree: int = 2,
+                neumann_tags: List[str] = [],
+                dirichlet_tags: List[str] = [],
+                dirichlet_value_fns: dict | None = None,
+                fem_solver: bool = False,
+                vec: int = 1,
+                bcs=None,
+            ) -> "domain":
         if self.mesh is None:
             raise ValueError("Mesh must be loaded before initializing FEM context.")
         self._variational_initialized = True
@@ -2181,7 +2191,15 @@ class domain(MeshUtils, Geometries):
         from jax_fem.problem import Problem
         from jax_fem.generate_mesh import Mesh
         from scipy.spatial import KDTree # Ensuring this is available locally
+        from .fem_route import expand_bcs
+        if bcs is not None:
+            if dirichlet_tags or neumann_tags or dirichlet_value_fns is not None:
+                raise ValueError(
+                    "Use either 'bcs=[...]' or the legacy "
+                    "'dirichlet_tags/neumann_tags/dirichlet_value_fns' arguments, not both."
+                )
 
+            dirichlet_tags, dirichlet_value_fns, neumann_tags = expand_bcs(bcs, vec=vec)
         meshio_type_map = {"TRI3": "triangle", "QUAD4": "quad", "TET4": "tetra",}
         meshio_type = meshio_type_map.get(element_type)
         jax_mesh = Mesh(self.mesh.points[:, :self.dimension], self.mesh.cells_dict[meshio_type])
@@ -2363,41 +2381,12 @@ class domain(MeshUtils, Geometries):
         return self
 
 
-    def _estimate_boundary_locator_tol(self, pts: np.ndarray) -> float:
-        """
-        Robust tolerance for matching mesh nodes to a tagged boundary point set.
-
-        This stays geometry-agnostic:
-        - works for arbitrary 2D/3D tagged boundaries
-        - does not assume left/right/top/bottom
-        """
-        import numpy as np
-
-        pts = np.asarray(pts)
-        if pts.size == 0:
-            return 1e-8
-
-        bbox_min = np.min(pts, axis=0)
-        bbox_max = np.max(pts, axis=0)
-        diag = float(np.linalg.norm(bbox_max - bbox_min))
-
-        # exact mesh-node matching should usually work; this just guards roundoff
-        return max(1e-8, 1e-10 * max(diag, 1.0))
-
-
     def _make_tag_location_fn(self, tag):
         region = self._boundary_regions.get(tag, None)
         if region is None:
             return None
         return lambda p: region.contains(p)
 
-    def _make_standard_boundary_location_fn(self, tag):
-        """
-        Backward-compatible alias.
-        Older code paths may still call this name.
-        Now it simply delegates to the generic tag-based locator.
-        """
-        return self._make_tag_location_fn(tag)
 
     def assemble_weak_form(self, expr, target="vpinn", **kwargs):
         from .weak_form import assemble_weak_form

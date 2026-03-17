@@ -8,6 +8,7 @@ jNO: Physics-Informed Neural Operators.
 
 from .core import core
 from .domain import domain
+from .fem_route import dirichlet, neumann
 from .resampling import sampler
 from .trace import Variable, Placeholder, OperationDef, OperationCall, Model, Hessian, Jacobian, TestFunction, TrialFunction, Assembly, FemLinearSystem, GroupedAssembly, FemResidualOperator
 from .utils.adaptive import LearningRateSchedule, WeightSchedule
@@ -74,4 +75,6 @@ __all__ = [
     "FemLinearSystem",
     "GroupedAssembly",
     "FemResidualOperator",
+    "dirichlet",
+    "neumann",
 ]

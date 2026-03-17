@@ -1,6 +1,7 @@
 from __future__ import annotations
+from dataclasses import dataclass
 
-from typing import Any, Dict
+from typing import Any, Dict, Sequence
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -22,6 +23,196 @@ from .weak_form import _sum_terms
 import numpy as onp
 import scipy.sparse as sp
 from .weak_form import _contains_node_type
+
+# --------------------------------
+# FEM boundary-condition helpers
+# --------------------------------
+def _default_float_dtype():
+    """Return JAX's current default floating dtype (float32 or float64)."""
+    return jnp.asarray(0.0).dtype
+
+@dataclass(frozen=True)
+class DirichletBC:
+    tags: tuple[str, ...]
+    values: object = None
+
+
+@dataclass(frozen=True)
+class NeumannBC:
+    tags: tuple[str, ...]
+
+
+def _as_tags(tags) -> tuple[str, ...]:
+    if isinstance(tags, str):
+        return (tags,)
+    if isinstance(tags, Sequence):
+        out = tuple(str(t) for t in tags)
+        if len(out) == 0:
+            raise ValueError("Boundary tag list cannot be empty.")
+        return out
+    raise TypeError(
+        f"Boundary tags must be a string or a sequence of strings, got {type(tags).__name__}."
+    )
+
+
+def dirichlet(tags, values=None):
+    """
+    Create a Dirichlet BC spec.
+
+    Examples
+    --------
+    dirichlet("left")
+    dirichlet("left", 0.0)
+    dirichlet(["left", "right"], (0.0, 0.0))
+    dirichlet("left", {"x": 0.0})
+    """
+    return DirichletBC(tags=_as_tags(tags), values=values)
+
+
+def neumann(tags):
+    """
+    Create a Neumann boundary-region spec.
+
+    Examples
+    --------
+    neumann("right")
+    neumann(["top", "right"])
+    """
+    return NeumannBC(tags=_as_tags(tags))
+
+
+def _const_bc_fn(value):
+    value = float(value)
+    return lambda p, c=value: c
+
+
+def _normalize_dirichlet_value(value, vec: int):
+    """
+    Normalize the new BC value syntax into the legacy format already expected by
+    domain._build_dirichlet_bc_info(...):
+
+    scalar field (vec=1):
+        callable
+
+    vector field (vec>1):
+        [fn0, fn1, ...]
+
+    Supported inputs
+    ----------------
+    None
+        -> zero on all components
+
+    scalar
+        -> broadcast constant to all components
+
+    callable
+        -> scalar: fn
+           vector: [fn, fn, ..., fn]
+
+    list/tuple
+        -> explicit componentwise values/callables
+
+    dict
+        -> sparse componentwise specification with keys 0/1/2 or x/y/z
+           unspecified components default to zero
+    """
+    if value is None:
+        value = 0.0
+
+    if vec < 1:
+        raise ValueError(f"'vec' must be >= 1, got {vec}.")
+
+    # callable
+    if callable(value):
+        if vec == 1:
+            return value
+        return [value for _ in range(vec)]
+
+    # scalar constant
+    if np.isscalar(value):
+        fn = _const_bc_fn(value)
+        if vec == 1:
+            return fn
+        return [fn for _ in range(vec)]
+
+    # explicit componentwise list/tuple
+    if isinstance(value, (list, tuple)):
+        if len(value) != vec:
+            raise ValueError(
+                f"Dirichlet BC has {len(value)} entries, but vec={vec}."
+            )
+
+        out = []
+        for v in value:
+            if callable(v):
+                out.append(v)
+            elif np.isscalar(v):
+                out.append(_const_bc_fn(v))
+            else:
+                raise TypeError(
+                    "Dirichlet list/tuple entries must be callables or scalars."
+                )
+
+        if vec == 1:
+            return out[0]
+        return out
+
+    # sparse dict by component
+    if isinstance(value, dict):
+        keymap = {"x": 0, "y": 1, "z": 2}
+        out = [_const_bc_fn(0.0) for _ in range(vec)]
+
+        for k, v in value.items():
+            c = keymap[k.lower()] if isinstance(k, str) else int(k)
+            if c < 0 or c >= vec:
+                raise ValueError(f"Component index {c} out of range for vec={vec}.")
+
+            if callable(v):
+                out[c] = v
+            elif np.isscalar(v):
+                out[c] = _const_bc_fn(v)
+            else:
+                raise TypeError(
+                    "Dirichlet dict entries must be callables or scalars."
+                )
+
+        if vec == 1:
+            return out[0]
+        return out
+
+    raise TypeError(
+        f"Unsupported Dirichlet BC value type: {type(value).__name__}"
+    )
+
+
+def expand_bcs(bcs, vec: int):
+    """
+    Convert the new BC API into the legacy init_fem inputs:
+        dirichlet_tags, dirichlet_value_fns, neumann_tags
+    """
+    dirichlet_tags = []
+    dirichlet_value_fns = {}
+    neumann_tags = []
+
+    for bc in bcs:
+        if isinstance(bc, DirichletBC):
+            for tag in bc.tags:
+                if tag not in dirichlet_tags:
+                    dirichlet_tags.append(tag)
+                dirichlet_value_fns[tag] = _normalize_dirichlet_value(bc.values, vec)
+
+        elif isinstance(bc, NeumannBC):
+            for tag in bc.tags:
+                if tag not in neumann_tags:
+                    neumann_tags.append(tag)
+
+        else:
+            raise TypeError(
+                f"Unsupported BC entry '{type(bc).__name__}'. "
+                "Use dirichlet(...) or neumann(...)."
+            )
+
+    return dirichlet_tags, dirichlet_value_fns, neumann_tags
 # --------------------------------
 # small expression-inspection helpers
 # --------------------------------
@@ -771,11 +962,13 @@ def _build_grouped_problem(domain, volume_terms, boundary_terms):
 
     return problem, solver_ctx
 
-def _flat_to_sol_list(problem, u_flat, dtype=jnp.float64):
+def _flat_to_sol_list(problem, u_flat, dtype=None):
     """
     Convert a flat DOF vector into JAX-FEM's expected [array(num_nodes, vec)] format.
+
+    If dtype is None, preserve the dtype of u_flat / script-level JAX defaults.
     """
-    u_flat = jnp.asarray(u_flat, dtype=dtype)
+    u_flat = jnp.asarray(u_flat) if dtype is None else jnp.asarray(u_flat, dtype=dtype)
     n = problem.fes[0].num_total_nodes
     vec = _get_problem_vec(problem)
     expected = n * vec
@@ -846,7 +1039,8 @@ def _assemble_fem_system_grouped(domain, volume_terms, boundary_terms, **kwargs)
     problem, solver_ctx = _build_grouped_problem(domain, volume_terms, boundary_terms)
 
     vec = _get_problem_vec(problem)
-    zero_sol = [jnp.zeros((problem.fes[0].num_total_nodes, vec), dtype=jnp.float64)]
+    dtype = _default_float_dtype()
+    zero_sol = [jnp.zeros((problem.fes[0].num_total_nodes, vec), dtype=dtype)]
 
     res_list = problem.newton_update(zero_sol)
 
@@ -860,144 +1054,3 @@ def _assemble_fem_system_grouped(domain, volume_terms, boundary_terms, **kwargs)
     b_jax = jnp.asarray(-res_vec_bc)
 
     return A_jax, b_jax
-# --------------------------------
-# temporary legacy wrapper (delete later)
-# --------------------------------
-# def _fem_assemble_bucket(self, expr, support: str, region_id: str):
-#     """Assemble a linear system contribution using JAX-FEM kernels.
-
-#     Returns a FemLinearSystem which can be combined with + / - and
-#     unpacked as A, b = ...
-#     """
-#     if not getattr(self, "_fem_solver_enabled", False):
-#         raise ValueError("Call init_fem(..., fem_solver=True) to enable the FEM solver route.")
-
-#     try:
-#         from jax_fem.problem import Problem
-#     except Exception as exc:
-#         raise ImportError("jax_fem is required for fem_solver=True, but it could not be imported.") from exc
-
-#     import numpy as onp
-#     import jax
-#     import jax.numpy as jnp
-
-#     try:
-#         from jax_fem.solver import get_A, apply_bc_vec
-#     except Exception as exc:
-#         raise ImportError(
-#             "Could not import get_A/apply_bc_vec from jax_fem.solver."
-#         ) from exc
-
-#     if support == "volume":
-#         tag = "fem_gauss"
-#     elif support == "boundary":
-#         tag = region_id
-#     else:
-#         raise ValueError(f"Unknown support '{support}'")
-
-#     compiled = self._compile_weakform_for_jaxfem(expr, tag=tag)
-#     solver_ctx = self._jaxfem_solver_context
-
-#     active_surface_idx = None
-#     if support == "boundary":
-#         try:
-#             active_surface_idx = solver_ctx["valid_neumann_tags"].index(tag)
-#         except ValueError as exc:
-#             raise ValueError(
-#                 f"Unknown FEM boundary region '{tag}'. Known tags: {solver_ctx['valid_neumann_tags']}"
-#             ) from exc
-
-#     parent = self
-
-#     class GeneratedProblem(Problem):
-#         def get_universal_kernel(self_nonlocal):
-#             if support != "volume":
-#                 return lambda cell_sol_flat, physical_quad_points, cell_shape_grads, cell_JxW, cell_v_grads_JxW: jnp.zeros_like(cell_sol_flat)
-
-#             def kernel(cell_sol_flat, physical_quad_points, cell_shape_grads, cell_JxW, cell_v_grads_JxW):
-#                 return parent._eval_compiled_volume_integrand(
-#                     compiled,
-#                     cell_sol_flat,
-#                     physical_quad_points,
-#                     cell_shape_grads,
-#                     cell_JxW,
-#                     cell_v_grads_JxW,
-#                 )
-
-#             return kernel
-
-#         def get_universal_kernels_surface(self_nonlocal):
-#             kernels = []
-#             n_surfaces = len(solver_ctx["location_fns"])
-#             for i in range(n_surfaces):
-#                 if support == "boundary" and i == active_surface_idx:
-#                     kernels.append(
-#                         lambda cell_sol_flat, physical_surface_quad_points, face_shape_vals, face_shape_grads, face_nanson_scale, _i=i:
-#                             parent._eval_compiled_surface_integrand(
-#                                 compiled,
-#                                 cell_sol_flat,
-#                                 physical_surface_quad_points,
-#                                 face_shape_vals,
-#                                 face_shape_grads,
-#                                 face_nanson_scale,
-#                             )
-#                     )
-#                 else:
-#                     kernels.append(
-#                         lambda cell_sol_flat, physical_surface_quad_points, face_shape_vals, face_shape_grads, face_nanson_scale, _i=i:
-#                             jnp.zeros_like(cell_sol_flat)
-#                     )
-#             return kernels
-
-#     problem = GeneratedProblem(
-#         solver_ctx["mesh"],
-#         vec=1,
-#         dim=solver_ctx["dim"],
-#         ele_type=solver_ctx["element_type"],
-#         gauss_order=solver_ctx["quad_degree"],
-#         dirichlet_bc_info=solver_ctx["dirichlet_bc_info"],
-#         location_fns=solver_ctx["location_fns"],
-#     )
-#     node_inds_list = getattr(problem.fes[0], "node_inds_list", None)
-#     if node_inds_list is None:
-#         print("Dirichlet node count: 0")
-#     else:
-#         total_dirichlet_nodes = sum(len(onp.asarray(inds).reshape(-1)) for inds in node_inds_list)
-#         print("Dirichlet node count (raw, all groups):", total_dirichlet_nodes)
-#     zero_sol = [jnp.zeros((problem.fes[0].num_total_nodes, 1), dtype=jnp.float64)]
-
-#     # Assemble raw residual/tangent around zero state
-#     res_list = problem.newton_update(zero_sol)
-
-#     # Flatten dofs and residual in the same format JAX-FEM solver expects
-#     dofs0 = jax.flatten_util.ravel_pytree(zero_sol)[0]
-#     raw_res_vec = jax.flatten_util.ravel_pytree(res_list)[0]
-
-#     # Let JAX-FEM apply its own Dirichlet row-elimination formulation
-#     res_vec_bc = apply_bc_vec(raw_res_vec, dofs0, problem)
-#     A = get_A(problem)
-
-#     # For a linear problem at zero state:
-#     #   A u + res_vec_bc = 0   =>   A u = -res_vec_bc
-#     b = -onp.asarray(res_vec_bc)
-
-#     # Normalize matrix type for downstream use with Lineax / SciPy conversions
-#     if hasattr(A, "getValuesCSR"):
-#         # PETSc-like matrix from jax_fem path
-#         indptr, indices, data = A.getValuesCSR()
-#         import scipy.sparse as sp
-#         A = sp.csr_matrix((data, indices, indptr), shape=A.getSize())
-#     else:
-#         # SciPy path from jax_fem.get_A pure-scipy bypass
-#         A = A.tocsr() if hasattr(A, "tocsr") else A
-
-#     return FemLinearSystem(A, b)
-
-# def fem_assemble(self, expr, tag: str = "fem_gauss"):
-#     """
-#     Temporary compatibility wrapper for old code.
-#     """
-#     if tag == "fem_gauss":
-#         return self._fem_assemble_bucket(expr, support="volume", region_id="volume")
-#     return self._fem_assemble_bucket(expr, support="boundary", region_id=tag)
-

@@ -1939,7 +1939,7 @@ def cse(expr: Placeholder) -> Placeholder:
     def _visit(node):
         """Post-order walk: canonicalise children first, then self."""
         # Leaves — always canonical
-        if isinstance(node, (Variable, TensorTag, Constant, Literal,TestFunction, TestFunction)):
+        if isinstance(node, (Variable, TensorTag, Constant, Literal, TrialFunction, TestFunction)):
             return node
 
         # ── recurse into children and rebuild if anything changed ──
