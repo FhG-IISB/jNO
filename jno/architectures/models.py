@@ -2254,7 +2254,7 @@ class nn:
             use_conditioning=True,
             learn_residual=False,
             pretrained_window_sizes=(0, 0, 0, 0),
-            compute_dtype=compute_dtype,  # None → float32 (or float64 if JAX_ENABLE_X64=1)
+            # compute_dtype=compute_dtype,  # None → float32 (or float64 if JAX_ENABLE_X64=1)
         )
 
         flax_model = ScOT(config=config, use_conditioning=True)

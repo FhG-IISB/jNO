@@ -17,6 +17,7 @@ from .trace import (
     Model,
     TunableModule,
     TunableModuleCall,
+    Choice,
     ModelCall,
     OperationDef,
     OperationCall,
@@ -176,6 +177,10 @@ class TraceEvaluator:
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     self._trace_visit(arg, ctx, depth + 1, lines, seen)
+        elif isinstance(node, Choice):
+            for opt in node.options:
+                if isinstance(opt, Placeholder):
+                    self._trace_visit(opt, ctx, depth + 1, lines, seen)
         elif isinstance(node, OperationDef):
             if node.op_id not in seen:
                 seen.add(node.op_id)
@@ -269,6 +274,7 @@ class TraceEvaluator:
         (ModelCall, "_eval_flax_module_call"),
         (TunableModule, "_eval_tunable_module"),
         (TunableModuleCall, "_eval_tunable_module_call"),
+        (Choice, "_eval_choice"),
         (Jacobian, "_eval_jacobian"),
         (Hessian, "_eval_hessian"),
         (OperationDef, "_eval_operation_def"),
@@ -492,6 +498,12 @@ class TraceEvaluator:
         concrete_call = ModelCall(tunable._current_instance, expr.args)
         concrete_call.op_id = expr.op_id
         return self._dispatch(concrete_call, ctx)
+
+    def _eval_choice(self, expr, ctx):
+        idx = int(expr.selected)
+        if not (0 <= idx < len(expr.options)):
+            raise ValueError(f"Choice index {idx} out of range for '{expr.name}'")
+        return self._dispatch(expr.options[idx], ctx)
 
     def _eval_jacobian(self, expr, ctx):
         """Evaluate Jacobian (first-order derivatives).
@@ -833,6 +845,8 @@ class TraceEvaluator:
             return uid, f"ModelCall({mod_name}, layer={lid})"
         if isinstance(node, TunableModuleCall):
             return uid, f"TunableModuleCall(id={node.model.layer_id})"
+        if isinstance(node, Choice):
+            return uid, f"Choice(name={node.name}, selected={node.selected})"
         if isinstance(node, OperationDef):
             vars_str = ", ".join(str(v) for v in node._collected_vars)
             return uid, f"OperationDef[{node.op_id}]({vars_str})"

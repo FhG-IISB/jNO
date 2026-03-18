@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 from typing import List, Union
-from .trace import Placeholder, Variable, FunctionCall, Hessian, Jacobian, Constant, ConstantNamespace
+from .trace import Placeholder, Variable, FunctionCall, Hessian, Jacobian, Constant, ConstantNamespace, Choice
 
 # Keep import so people can use jno.numpy as jno -> jno.model, jno.tune
 from .tuner import Arch, ArchSpace, tune
@@ -80,6 +80,15 @@ def constant(tag: str, data: Union[dict, str, Path]) -> ConstantNamespace:
 
 def function(fn, args: list = [], name: str = "", reduces_axis: int = None):
     return FunctionCall(fn, args, name, reduces_axis)
+
+
+def choice(options, name: str | None = None, default: int = 0) -> Choice:
+    """Create a tunable categorical choice over traced expressions.
+
+    Example:
+        u = jnn.choice([net(inp) * x * (1 - x), net(inp)], name="bc_form")
+    """
+    return Choice(options=options, name=name, default=default)
 
 
 # ============================================================================

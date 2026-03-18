@@ -168,6 +168,32 @@ class TestRegressions:
         result = ws(jnp.array(0), jnp.array([1.0]))
         assert result.shape == (1,)
 
+    def test_choice_is_sweepable(self):
+        """A jnn.choice(...) branch index is exposed to core.sweep()."""
+        import jno
+        import jno.numpy as jnn
+        import optax
+        from jno.tuner import ArchSpace
+
+        dom = jno.domain(constructor=jno.domain.rect(mesh_size=0.5))
+        x, y, _ = dom.variable("interior")
+
+        net = jnn.nn.mlp(in_features=2, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(0))
+        net.optimizer(optax.adam(1e-3))
+
+        raw = net(jnn.concat([x, y], axis=-1))
+        u = jnn.choice([raw, raw * 0.0], name="bc_form", default=0)
+        crux = jno.core([u.mse], dom)
+
+        # Grid-search mode (optimizer=None) over one training param; the
+        # choice node is auto-injected into the architecture space.
+        space = ArchSpace().unique("epochs", [1], category="training")
+        crux.sweep(space=space, optimizer=None, budget=0, devices=1)
+
+        assert hasattr(crux, "best_config")
+        assert crux.best_config.has("bc_form")
+        assert crux.best_config("bc_form") in (0, 1)
+
 
 # ======================================================================
 # Memory management strategy tests (solve loop)

@@ -4,6 +4,9 @@ import pytest
 import jax
 import jax.numpy as jnp
 import equinox as eqx
+import optax
+import jno
+import jno.numpy as jnn
 
 from jno.trace import Model, TunableModule
 from jno.architectures.models import nn, parameter
@@ -138,3 +141,37 @@ class TestImportShadowing:
         )
 
         assert pcno_compute_Fourier_modes is not geofno_compute_Fourier_modes
+
+
+# ======================================================================
+# jaxKAN integration smoke test
+# ======================================================================
+class TestJaxKANWrap:
+    def test_jaxkan_wrapped_model_solves_one_epoch(self):
+        # Optional dependency in some environments
+        pytest.importorskip("flax.nnx")
+        pytest.importorskip("jaxkan.models.KAN")
+
+        from jaxkan.models.KAN import KAN as _KAN
+
+        model = _KAN(
+            layer_dims=[2, 6, 1],
+            layer_type="chebyshev",
+            required_parameters={"D": 3, "flavor": "exact"},
+            seed=0,
+        )
+
+        domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.5))
+        x, y, _ = domain.variable("interior")
+
+        net = jnn.nn.wrap(model)
+        net.optimizer(optax.adam(1e-3))
+
+        u = net(jnn.concat([x, y], axis=-1))
+        zero = (u * 0.0).mse
+
+        crux = jno.core([zero], domain)
+
+        # Regression target: this used to fail with
+        # "grad requires real- or complex-valued inputs ... got uint32".
+        crux.solve(epochs=5)

@@ -27,6 +27,7 @@ _DEFAULT_MASKX_LEAF_TYPE = object()
 __all__ = [
     "Placeholder",
     "FunctionCall",
+    "Choice",
     "Literal",
     "ConstantNamespace",
     "Constant",
@@ -406,6 +407,32 @@ class FunctionCall(Placeholder):
     def __call__(self, args):
         """Return a new FunctionCall with the given args."""
         return self.copy_with_args([args])
+
+
+class Choice(Placeholder):
+    """Tunable categorical choice between multiple traced expressions."""
+
+    def __init__(self, options: Union[list, tuple], name: str | None = None, default: int = 0):
+        if not isinstance(options, (list, tuple)) or len(options) == 0:
+            raise ValueError("Choice requires a non-empty list/tuple of options")
+
+        self.options = [opt if isinstance(opt, Placeholder) else Literal(opt) for opt in options]
+        self.op_id = _next_op_id()
+        self.name = name or f"choice_{self.op_id}"
+        self.selected = int(default)
+
+        if not (0 <= self.selected < len(self.options)):
+            raise ValueError(f"Choice default index {self.selected} out of range for {len(self.options)} option(s)")
+
+    def select(self, index: int) -> "Choice":
+        idx = int(index)
+        if not (0 <= idx < len(self.options)):
+            raise ValueError(f"Choice index {idx} out of range for {len(self.options)} option(s)")
+        self.selected = idx
+        return self
+
+    def __repr__(self):
+        return f"Choice(name={self.name!r}, selected={self.selected}, n={len(self.options)})"
 
 
 class ConstantNamespace:
@@ -1683,6 +1710,9 @@ def cse(expr: Placeholder) -> Placeholder:
         if isinstance(node, FunctionCall):
             arg_ids = tuple(id(a) for a in node.args)
             return ("Fn", id(node.fn), node._name, arg_ids)
+        if isinstance(node, Choice):
+            opt_ids = tuple(id(a) for a in node.options)
+            return ("Choice", node.name, node.selected, opt_ids)
         if isinstance(node, ModelCall):
             arg_ids = tuple(id(a) for a in node.args)
             return ("Call", node.model.layer_id, arg_ids)
@@ -1718,6 +1748,12 @@ def cse(expr: Placeholder) -> Placeholder:
             new_args = [_visit(a) if isinstance(a, Placeholder) else a for a in node.args]
             if any(n is not o for n, o in zip(new_args, node.args)):
                 node = FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
+        elif isinstance(node, Choice):
+            new_opts = [_visit(a) if isinstance(a, Placeholder) else a for a in node.options]
+            if any(n is not o for n, o in zip(new_opts, node.options)):
+                new_node = Choice(new_opts, name=node.name, default=node.selected)
+                new_node.op_id = node.op_id
+                node = new_node
         elif isinstance(node, ModelCall):
             new_args = [_visit(a) if isinstance(a, Placeholder) else a for a in node.args]
             if any(n is not o for n, o in zip(new_args, node.args)):
@@ -1793,6 +1829,10 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     visit(arg)
+        elif isinstance(node, Choice):
+            for opt in node.options:
+                if isinstance(opt, Placeholder):
+                    visit(opt)
         elif isinstance(node, BinaryOp):
             visit(node.left)
             visit(node.right)
@@ -1842,6 +1882,10 @@ def collect_tags(expr: Placeholder) -> set:
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     visit(arg)
+        elif isinstance(node, Choice):
+            for opt in node.options:
+                if isinstance(opt, Placeholder):
+                    visit(opt)
         elif isinstance(node, (Hessian, Jacobian)):
             visit(node.target)
             for v in node.variables:
@@ -1935,6 +1979,11 @@ def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     _visit(arg, depth + 1)
+        elif isinstance(node, Choice):
+            lines.append(f"{p}Choice(name={node.name}, selected={node.selected})")
+            for i, opt in enumerate(node.options):
+                lines.append(f"{p}  option[{i}]")
+                _visit(opt, depth + 2)
         elif isinstance(node, OperationDef):
             if node.op_id in seen:
                 vars_str = ", ".join(str(v) for v in node._collected_vars)
