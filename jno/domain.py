@@ -1997,7 +1997,26 @@ class domain(MeshUtils, Geometries):
  
     def boundary_tags(self):
         return sorted(self._boundary_registry.keys())
+    
+    def dirichlet(self, tags, values=None):
+        try:
+            from .fem_route import dirichlet as _dirichlet_bc
+        except ImportError as e:
+            raise ImportError(
+                "FEM support is not available. Install the FEM/dev extras to use "
+                "domain.dirichlet(...) and init_fem(...)."
+            ) from e
+        return _dirichlet_bc(tags, values)
 
+    def neumann(self, tags):
+        try:
+            from .fem_route import neumann as _neumann_bc
+        except ImportError as e:
+            raise ImportError(
+                "FEM support is not available. Install the FEM/dev extras to use "
+                "domain.neumann(...) and init_fem(...)."
+            ) from e
+        return _neumann_bc(tags)
     
     def _build_dirichlet_bc_info(self, dirichlet_tags, dirichlet_value_fns=None, vec: int = 1):
         """
@@ -2193,6 +2212,13 @@ class domain(MeshUtils, Geometries):
         from scipy.spatial import KDTree # Ensuring this is available locally
         from .fem_route import expand_bcs
         if bcs is not None:
+            try:
+                from .fem_route import expand_bcs
+            except ImportError as e:
+                raise ImportError(
+                    "FEM support is not available. Install the FEM/dev extras to use init_fem(...)."
+                ) from e
+
             if dirichlet_tags or neumann_tags or dirichlet_value_fns is not None:
                 raise ValueError(
                     "Use either 'bcs=[...]' or the legacy "
