@@ -1996,11 +1996,35 @@ class domain(MeshUtils, Geometries):
         return max(1e-8, 1e-10 * max(diag, 1.0))
  
     def boundary_tags(self):
+        """
+        Return the available boundary tag names on the mesh.
+
+        Returns
+        -------
+        list[str]
+            Registered boundary tags that can be used for Dirichlet or
+            Neumann conditions.
+        """
         return sorted(self._boundary_registry.keys())
     
     def dirichlet(self, tags, values=None):
+        """
+        Create a symbolic Dirichlet boundary-condition descriptor.
+
+        Parameters
+        ----------
+        tags : str | list[str]
+            Boundary tag or tags where the condition is applied.
+        values : callable | list[callable] | dict[int, callable] | None, optional
+            Prescribed boundary values. ``None`` gives a homogeneous condition.
+
+        Returns
+        -------
+        object
+            Boundary-condition descriptor for use with ``init_fem(..., bcs=...)``.
+        """
         try:
-            from .fem_route import dirichlet as _dirichlet_bc
+            from .utils.fem_route import dirichlet as _dirichlet_bc
         except ImportError as e:
             raise ImportError(
                 "FEM support is not available. Install the FEM/dev extras to use "
@@ -2009,8 +2033,21 @@ class domain(MeshUtils, Geometries):
         return _dirichlet_bc(tags, values)
 
     def neumann(self, tags):
+        """
+        Create a symbolic Neumann boundary-condition descriptor.
+
+        Parameters
+        ----------
+        tags : str | list[str]
+            Boundary tag or tags where the condition is active.
+
+        Returns
+        -------
+        object
+            Boundary-condition descriptor for use with ``init_fem(..., bcs=...)``.
+        """
         try:
-            from .fem_route import neumann as _neumann_bc
+            from .utils.fem_route import neumann as _neumann_bc
         except ImportError as e:
             raise ImportError(
                 "FEM support is not available. Install the FEM/dev extras to use "
@@ -2020,21 +2057,22 @@ class domain(MeshUtils, Geometries):
     
     def _build_dirichlet_bc_info(self, dirichlet_tags, dirichlet_value_fns=None, vec: int = 1):
         """
-        Build JAX-FEM dirichlet_bc_info = [location_fns, vec_ids, value_fns].
-
-        Supports:
-        - scalar BCs:  {"left": lambda p: 0.0}
-        - vector BCs:  {"left": [fn_x, fn_y]}
-        - vector BCs:  {"left": {0: fn_x, 1: fn_y}}
+        Build JAX-FEM Dirichlet boundary data from tagged user input.
 
         Parameters
         ----------
         dirichlet_tags : list[str]
-            Boundary tags to constrain.
-        dirichlet_value_fns : dict | None
-            Per-tag value specification.
-        vec : int
+            Boundary tags with Dirichlet constraints.
+        dirichlet_value_fns : dict | None, optional
+            Mapping from tag to value function definition.
+        vec : int, default=1
             Number of field components.
+
+        Returns
+        -------
+        list
+            JAX-FEM ``dirichlet_bc_info`` in the form
+            ``[location_fns, vec_ids, value_fns]``.
         """
         if dirichlet_value_fns is None:
             dirichlet_value_fns = {}
@@ -2201,6 +2239,36 @@ class domain(MeshUtils, Geometries):
                 vec: int = 1,
                 bcs=None,
             ) -> "domain":
+        """
+        Initialize the JAX-FEM data associated with this domain.
+
+        This sets up the FEM mesh, boundary-condition data, quadrature data,
+        and cached tensors needed for weak-form assembly and FEM solves.
+
+        Parameters
+        ----------
+        element_type : str, default="TRI3"
+            Finite-element type used by JAX-FEM.
+        quad_degree : int, default=2
+            Quadrature degree for volume and boundary integration.
+        neumann_tags : list[str], optional
+            Boundary tags used for Neumann or surface terms.
+        dirichlet_tags : list[str], optional
+            Boundary tags with Dirichlet constraints.
+        dirichlet_value_fns : dict | None, optional
+            Prescribed Dirichlet value functions by boundary tag.
+        fem_solver : bool, default=False
+            Whether to enable FEM-solver mode.
+        vec : int, default=1
+            Number of field components.
+        bcs : list | None, optional
+            New-style boundary-condition descriptors.
+
+        Returns
+        -------
+        domain
+            The current domain with FEM context initialized.
+        """
         if self.mesh is None:
             raise ValueError("Mesh must be loaded before initializing FEM context.")
         self._variational_initialized = True
@@ -2210,10 +2278,10 @@ class domain(MeshUtils, Geometries):
         from jax_fem.problem import Problem
         from jax_fem.generate_mesh import Mesh
         from scipy.spatial import KDTree # Ensuring this is available locally
-        from .fem_route import expand_bcs
+        from .utils.fem_route import expand_bcs
         if bcs is not None:
             try:
-                from .fem_route import expand_bcs
+                from .utils.fem_route import expand_bcs
             except ImportError as e:
                 raise ImportError(
                     "FEM support is not available. Install the FEM/dev extras to use init_fem(...)."
@@ -2408,6 +2476,20 @@ class domain(MeshUtils, Geometries):
 
 
     def _make_tag_location_fn(self, tag):
+        """
+        Build a point-membership function for a boundary tag.
+
+        Parameters
+        ----------
+        tag : str
+            Boundary tag name.
+
+        Returns
+        -------
+        callable | None
+            Function returning whether a point belongs to the tagged region,
+            or ``None`` if the tag is unknown.
+        """
         region = self._boundary_regions.get(tag, None)
         if region is None:
             return None
@@ -2415,7 +2497,24 @@ class domain(MeshUtils, Geometries):
 
 
     def assemble_weak_form(self, expr, target="vpinn", **kwargs):
-        from .weak_form import assemble_weak_form
+        """
+        Assemble a symbolic weak form for the requested backend.
+
+        Parameters
+        ----------
+        expr : object
+            Symbolic weak-form expression.
+        target : str, default="vpinn"
+            Assembly backend or lowering target.
+        **kwargs
+            Additional backend-specific options.
+
+        Returns
+        -------
+        object
+            Assembled backend-specific representation of the weak form.
+        """
+        from .utils.weak_form import assemble_weak_form
         return assemble_weak_form(self, expr, target=target, **kwargs)
    
     # Generators

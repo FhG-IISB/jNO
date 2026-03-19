@@ -40,8 +40,8 @@ class TestFemInit:
             element_type="TRI3",
             quad_degree=2,
             bcs=[
-                dirichlet("left"),
-                neumann(["right", "top"]),
+                dom.dirichlet("left"),
+                dom.neumann(["right", "top"]),
             ],
             fem_solver=True,
         )
@@ -132,7 +132,7 @@ class TestFemLinearAssembly:
         dom.init_fem(
             element_type="TRI3",
             quad_degree=2,
-            bcs=[dirichlet(["left", "right", "top", "bottom"])],
+            bcs=[dom.dirichlet(["left", "right", "top", "bottom"])],
             fem_solver=True,
         )
 
@@ -169,7 +169,7 @@ class TestFemVectorAssembly:
         dom.init_fem(
             element_type="TRI3",
             quad_degree=2,
-            bcs=[dirichlet(["left", "right", "top", "bottom"], (0.0, 0.0))],
+            bcs=[dom.dirichlet(["left", "right", "top", "bottom"], (0.0, 0.0))],
             fem_solver=True,
             vec=2,   # keep if your current init_fem still needs it
         )
@@ -206,8 +206,8 @@ class TestFemBoundaryAssembly:
             element_type="TRI3",
             quad_degree=2,
             bcs=[
-                dirichlet("left"),
-                neumann("right"),
+                dom.dirichlet("left"),
+                dom.neumann("right"),
             ],
             fem_solver=True,
         )
@@ -247,7 +247,7 @@ class TestFemResidualRoute:
         dom.init_fem(
             element_type="TRI3",
             quad_degree=2,
-            bcs=[dirichlet(["left", "right", "top", "bottom"])],
+            bcs=[dom.dirichlet(["left", "right", "top", "bottom"])],
             fem_solver=True,
         )
 
@@ -287,8 +287,8 @@ class TestFemBCNormalization:
             quad_degree=2,
             vec=2,
             bcs=[
-                dirichlet("left", {"x": 0.0}),
-                dirichlet("bottom", {"y": 0.0}),
+                dom.dirichlet("left", {"x": 0.0}),
+                dom.dirichlet("bottom", {"y": 0.0}),
             ],
             fem_solver=True,
         )
@@ -309,7 +309,7 @@ class TestFemBCValidation:
                 quad_degree=2,
                 vec=2,
                 bcs=[
-                    dirichlet("left", (0.0, 0.0, 0.0)),
+                    dom.dirichlet("left", (0.0, 0.0, 0.0)),
                 ],
                 fem_solver=True,
             )
@@ -334,8 +334,8 @@ class TestFemSurfaceRegistration:
             element_type="TRI3",
             quad_degree=2,
             bcs=[
-                dirichlet("left"),
-                neumann(["right", "top"]),
+                dom.dirichlet("left"),
+                dom.neumann(["right", "top"]),
             ],
             fem_solver=True,
         )

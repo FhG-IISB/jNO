@@ -5,7 +5,7 @@ from typing import Any, Dict, Sequence
 import numpy as np
 import jax
 import jax.numpy as jnp
-from .trace import (
+from ..trace import (
     Literal,
     Constant,
     TensorTag,
@@ -33,16 +33,37 @@ def _default_float_dtype():
 
 @dataclass(frozen=True)
 class DirichletBC:
+    """
+    Dirichlet boundary-condition specification.
+
+    Attributes
+    ----------
+    tags : tuple[str, ...]
+        Boundary tags where the condition is applied.
+    values : object, optional
+        Prescribed boundary values or value functions.
+    """
     tags: tuple[str, ...]
     values: object = None
 
 
 @dataclass(frozen=True)
 class NeumannBC:
+    """
+    Neumann boundary-condition specification.
+
+    Attributes
+    ----------
+    tags : tuple[str, ...]
+        Boundary tags where the condition is active.
+    """
     tags: tuple[str, ...]
 
 
 def _as_tags(tags) -> tuple[str, ...]:
+    """
+    Normalize a boundary-tag input into a non-empty tuple of strings.
+    """
     if isinstance(tags, str):
         return (tags,)
     if isinstance(tags, Sequence):
@@ -333,6 +354,12 @@ def _get_problem_vec(problem) -> int:
 # jax-fem lowering helpers
 # --------------------------------
 def _make_native_surface_map_from_expr(domain, coeff_expr, tag):
+    """
+    Build a JAX-FEM surface map from a symbolic boundary-load expression.
+
+    The returned callable evaluates the scalar boundary coefficient at a
+    boundary quadrature point, optionally using boundary normals.
+    """
     def _contains_normal_variable(node):
         if isinstance(node, Variable):
             return isinstance(node.tag, str) and node.tag.startswith("n_")
@@ -475,6 +502,12 @@ def _expand_test_shape_vals(shape_vals, n_comp):
     return shape_vals[:, :, None, None] * eye[None, None, :, :]
 
 def _compile_weakform_for_jaxfem(domain, expr, tag: str = "fem_gauss") -> Dict[str, Any]:
+    """
+    Compile symbolic weak-form metadata for JAX-FEM assembly.
+
+    Returns basic information about the expression, including whether it
+    contains a trial function and the inferred field shape.
+    """
     trial_nodes = {}
 
     def walk(node):
@@ -534,7 +567,11 @@ def _eval_compiled_volume_integrand(
     cell_shape_grads,
     cell_JxW,
     cell_v_grads_JxW,
-):
+    ):
+    """
+    Evaluate a compiled volume integrand on one cell and return its flattened
+    contribution.
+    """
     num_nodes = cell_shape_grads.shape[1]
     vec = int(compiled.get("vec", 1))
 
@@ -568,6 +605,10 @@ def _eval_compiled_surface_integrand(
     face_shape_grads,
     face_nanson_scale,
 ):
+    """
+    Evaluate a compiled surface integrand on one boundary face and return its
+    flattened contribution.
+    """
     num_nodes = face_shape_vals.shape[1]
     vec = int(compiled.get("vec", 1))
 
@@ -592,7 +633,12 @@ def _eval_compiled_surface_integrand(
     return jax.flatten_util.ravel_pytree(jnp.sum(weighted, axis=0))[0]
 
 def _eval_expr_for_jaxfem(domain, node, local):
+    """
+    Evaluate a symbolic weak-form expression inside a local JAX-FEM context.
 
+    Supports literals, variables, trial/test functions, gradients, binary
+    operations, and function calls.
+    """
     if not isinstance(
             node,
             (
@@ -987,7 +1033,7 @@ def _assemble_fem_residual_grouped(domain, volume_terms, boundary_terms, **kwarg
     """
     import jax
     import jax.numpy as jnp
-    from .trace import FemResidualOperator
+    from ..trace import FemResidualOperator
 
     try:
         from jax_fem.solver import apply_bc_vec, get_A

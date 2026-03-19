@@ -1,7 +1,7 @@
 
 from __future__ import annotations
 
-from .trace import (
+from ..trace import (
     Placeholder,
     Literal,
     BinaryOp,
@@ -320,7 +320,13 @@ def _substitute_trial_for_vpinn(
     target_region_id: str | None = None,
 ):
     
+    """
+    Replace symbolic ``TrialFunction`` nodes with a concrete VPINN trial
+    expression.
 
+    Boundary terms may also trigger a rebind of sampled variational
+    coordinates to the target region.
+    """
     if node is None:
         return None
 
@@ -450,6 +456,25 @@ def _substitute_trial_for_vpinn(
 # --------------------------------
 
 def assemble_weak_form(domain, expr, target="vpinn", **kwargs):
+    """
+    Assemble a symbolic weak form for the requested backend.
+
+    Parameters
+    ----------
+    domain : object
+        Domain providing geometry and variational metadata.
+    expr : object
+        Symbolic weak-form expression.
+    target : {"vpinn", "fem_system", "fem_residual"}, default="vpinn"
+        Assembly target.
+    **kwargs
+        Backend-specific options.
+
+    Returns
+    -------
+    object
+        Backend-specific assembled representation.
+    """
     trial_value = kwargs.get("u_net", None) if target == "vpinn" else None
 
     terms = _split_additive_terms(domain, expr)
@@ -496,7 +521,7 @@ def assemble_weak_form(domain, expr, target="vpinn", **kwargs):
 
 def _assemble_vpinn_grouped(domain, volume_terms, boundary_terms, **kwargs):
     """
-    Grouped VPINN assembly in one internal node.
+    Assemble grouped VPINN volume and boundary terms into one internal node.
     """
 
 
