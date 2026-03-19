@@ -6,6 +6,7 @@ import jax.numpy as jnp
 from jno.trace import (
     Placeholder,
     FunctionCall,
+    Choice,
     Literal,
     ConstantNamespace,
     Constant,
@@ -185,6 +186,30 @@ class TestConcat:
         result = pnp.concat([a, b])
         assert isinstance(result, FunctionCall)
         assert len(result.args) == 2
+
+
+# ======================================================================
+# Choice
+# ======================================================================
+class TestChoice:
+    def test_choice_constructs(self):
+        import jno.numpy as jnn
+
+        a = make_var("x")
+        b = make_var("y")
+        ch = jnn.choice([a, b], name="my_choice", default=1)
+        assert isinstance(ch, Choice)
+        assert ch.name == "my_choice"
+        assert ch.selected == 1
+
+    def test_choice_select_updates_index(self):
+        import jno.numpy as jnn
+
+        a = make_var("x")
+        b = make_var("y")
+        ch = jnn.choice([a, b], default=0)
+        ch.select(1)
+        assert ch.selected == 1
 
 
 # ======================================================================

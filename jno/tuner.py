@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Sequence, Tuple, Union, Callable, Literal, Optional
 import copy
+import inspect
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import jax
@@ -433,8 +434,9 @@ class Tuner:
 
         self.core.log.info(f"Using {num_workers} device(s): {device_config.devices}")
 
-        # Find tunable modules in constraints
+        # Find tunable modules and explicit choice nodes in constraints
         tunable_modules = self.core._find_tunable_modules()
+        choice_nodes = self.core._find_choice_nodes()
 
         # Determine if we have architecture tuning
         has_arch_tuning = space.has_architecture_params() and len(tunable_modules) > 0
@@ -454,6 +456,7 @@ class Tuner:
             return self._sweep_grid(
                 space=space,
                 tunable=tunable,
+                choices=choice_nodes,
                 has_arch_tuning=has_arch_tuning,
                 has_training_tuning=has_training_tuning,
                 device_config=device_config,
@@ -463,6 +466,7 @@ class Tuner:
         self.core.log.info(f"Hyperparameter tuning enabled: {space}")
         self.core.log.info(f"Budget: {budget} configurations")
         self.core.log.info(f"Architecture tuning: {has_arch_tuning}")
+        self.core.log.info(f"Choice tuning nodes: {len(choice_nodes)}")
         self.core.log.info(f"Training param tuning: {has_training_tuning}")
         self.core.log.info(f"Parallel workers: {num_workers}")
 
@@ -483,9 +487,9 @@ class Tuner:
 
         # Run the sweep
         if num_workers == 1:
-            tuning_history, best_loss, best_config = self._sweep_sequential(ng_optim, space, budget, tunable, has_arch_tuning, device_config.devices[0])
+            tuning_history, best_loss, best_config = self._sweep_sequential(ng_optim, space, budget, tunable, choice_nodes, has_arch_tuning, device_config.devices[0])
         else:
-            tuning_history, best_loss, best_config = self._sweep_parallel(ng_optim, space, budget, tunable, has_arch_tuning, device_config)
+            tuning_history, best_loss, best_config = self._sweep_parallel(ng_optim, space, budget, tunable, choice_nodes, has_arch_tuning, device_config)
 
         # Get final recommendation
         rec = ng_optim.provide_recommendation()
@@ -497,7 +501,7 @@ class Tuner:
         self.core.log.info(f"Running final training...")
 
         # Run final training with best config
-        stats = self._run_final_training(final_config, space, tunable, has_arch_tuning, tuning_history)
+        stats = self._run_final_training(final_config, space, tunable, choice_nodes, has_arch_tuning, tuning_history)
 
         return stats
 
@@ -505,6 +509,7 @@ class Tuner:
         self,
         space: ArchSpace,
         tunable,
+        choices,
         has_arch_tuning: bool,
         has_training_tuning: bool,
         device_config: DeviceConfig,
@@ -531,7 +536,7 @@ class Tuner:
                 self.core.log.info(f"[{i+1}/{total_configs}] {config}")
 
                 try:
-                    loss = self._evaluate_config(None, config, space, tunable, has_arch_tuning)
+                    loss = self._evaluate_config(None, config, space, tunable, choices, has_arch_tuning)
                     tuning_history.append({"iteration": i + 1, "config": config, "loss": loss})
 
                     if loss < best_loss:
@@ -546,7 +551,7 @@ class Tuner:
                     tuning_history.append({"iteration": i + 1, "config": config, "loss": float("inf"), "error": str(e)})
         else:
             # Parallel grid search
-            tuning_history, best_loss, best_config = self._sweep_grid_parallel(grid, space, tunable, has_arch_tuning, device_config)
+            tuning_history, best_loss, best_config = self._sweep_grid_parallel(grid, space, tunable, choices, has_arch_tuning, device_config)
 
         self.core.log.info(f"\n=== Grid search complete ===")
         self.core.log.info(f"Evaluated: {total_configs} configurations")
@@ -555,7 +560,7 @@ class Tuner:
         self.core.log.info(f"Running final training...")
 
         # Run final training with best config
-        stats = self._run_final_training(best_config, space, tunable, has_arch_tuning, tuning_history)
+        stats = self._run_final_training(best_config, space, tunable, choices, has_arch_tuning, tuning_history)
 
         return stats
 
@@ -564,6 +569,7 @@ class Tuner:
         grid: List[Arch],
         space: ArchSpace,
         tunable,
+        choices,
         has_arch_tuning: bool,
         device_config: DeviceConfig,
     ):
@@ -583,7 +589,7 @@ class Tuner:
             try:
                 with jax.default_device(device):
                     solver_copy = self._create_trial_solver()
-                    loss = self._evaluate_config(solver_copy, config, space, tunable, has_arch_tuning)
+                    loss = self._evaluate_config(solver_copy, config, space, tunable, choices, has_arch_tuning)
                 return config, iteration, loss, None
             except Exception as e:
                 import traceback
@@ -652,7 +658,7 @@ class Tuner:
         tuning_history.sort(key=lambda x: x["iteration"])
         return tuning_history, best_loss, best_config
 
-    def _sweep_sequential(self, ng_optim, space, budget, tunable, has_arch_tuning, device):
+    def _sweep_sequential(self, ng_optim, space, budget, tunable, choices, has_arch_tuning, device):
         """Original sequential sweep implementation."""
         best_loss = float("inf")
         best_config = None
@@ -665,7 +671,7 @@ class Tuner:
             self.core.log.info(f"[{i+1}/{budget}] Trying: {config}")
 
             with jax.default_device(device):
-                final_loss = self._evaluate_config(None, config, space, tunable, has_arch_tuning)
+                final_loss = self._evaluate_config(None, config, space, tunable, choices, has_arch_tuning)
 
             ng_optim.tell(candidate, final_loss)
             tuning_history.append({"iteration": i + 1, "config": config, "loss": final_loss})
@@ -679,7 +685,7 @@ class Tuner:
 
         return tuning_history, best_loss, best_config
 
-    def _sweep_parallel(self, ng_optim, space, budget, tunable, has_arch_tuning, device_config):
+    def _sweep_parallel(self, ng_optim, space, budget, tunable, choices, has_arch_tuning, device_config):
         """Parallel sweep implementation using ThreadPoolExecutor."""
         best_loss = float("inf")
         best_config = None
@@ -700,7 +706,7 @@ class Tuner:
                     # Create a fresh solver copy for this trial
                     solver_copy = self._create_trial_solver()
 
-                    loss = self._evaluate_config(solver_copy, config, space, tunable, has_arch_tuning)
+                    loss = self._evaluate_config(solver_copy, config, space, tunable, choices, has_arch_tuning)
 
                 return candidate, config, iteration, loss, None
             except Exception as e:
@@ -798,14 +804,12 @@ class Tuner:
         solver_copy.compile((1, 1))
         return solver_copy
 
-    def _evaluate_config(self, core_copy, config, space, tunable, has_arch_tuning):
+    def _evaluate_config(self, core_copy, config, space, tunable, choices, has_arch_tuning):
         """Evaluate a single configuration and return the loss.
 
         When core_copy is provided (parallel sweeps), only the copy is mutated.
         When core_copy is None (sequential sweeps), self.core is reset and used.
         """
-        from .trace import FlaxModule
-
         # Determine which solver instance to use — never mutate self.core
         # when a copy is provided (parallel execution).
         solver = core_copy if core_copy is not None else self.core
@@ -819,10 +823,17 @@ class Tuner:
 
         # Set architecture if tunable module exists
         if tunable is not None and has_arch_tuning:
+            from .trace import Model
+
             arch_config = Arch(choices=tuple((name, config(name)) for name in [g.name for g in space.get_architecture_groups()] if config.has(name)))
             module_instance = tunable.instantiate(arch_config, key=jax.random.PRNGKey(0))
-            tunable._current_instance = FlaxModule(module_instance)
+            tunable._current_instance = Model(module_instance)
             tunable._current_instance.layer_id = tunable.layer_id
+
+        # Set explicit Choice node selections from this trial config.
+        for ch in choices or []:
+            if config.has(ch.name):
+                ch.select(int(config(ch.name)))
 
         # Reset state for fresh training — only on the solver we will use
         solver.models = {}
@@ -834,7 +845,14 @@ class Tuner:
         try:
             # Apply per-model config (freeze, lora, optimizer, lr, dtype)
             self._apply_model_config(solver, config, trial_optimizer, trial_lr)
-            stats = solver.solve(epochs=trial_epochs, constraint_weights=trial_weights, batchsize=trial_batchsize)
+            solve_kwargs = {"epochs": trial_epochs}
+            sig = inspect.signature(solver.solve)
+            if "constraint_weights" in sig.parameters:
+                solve_kwargs["constraint_weights"] = trial_weights
+            if "batchsize" in sig.parameters:
+                solve_kwargs["batchsize"] = trial_batchsize
+
+            stats = solver.solve(**solve_kwargs)
             return float(stats.training_logs[-1]["total_loss"][-1])
         except Exception as e:
             self.core.log.warning(f"Configuration {config} failed: {e}")
@@ -879,6 +897,11 @@ class Tuner:
                     combined_space.float_range(g.name, g.low, g.high, g.log_scale, g.category)
                 elif isinstance(g, IntGroup):
                     combined_space.int_range(g.name, g.low, g.high, g.category)
+
+        # 3b. Architecture params from explicit Choice(...) nodes.
+        for ch in self.core._find_choice_nodes():
+            if ch.name not in combined_space._name_to_group:
+                combined_space.unique(ch.name, list(range(len(ch.options))), category="architecture")
 
         # 4. Per-model tunable options (from FlaxModule.tune())
         model_opts = self._collect_model_tune_opts()
@@ -945,17 +968,24 @@ class Tuner:
             else:
                 fm.optimizer(fallback_optimizer, lr=fallback_lr)
 
-    def _run_final_training(self, final_config, space, tunable, has_arch_tuning, tuning_history):
+    def _run_final_training(self, final_config, space, tunable, choices, has_arch_tuning, tuning_history):
         """Run final training with the best configuration."""
 
-        from .trace import FlaxModule
+        if final_config is None:
+            raise RuntimeError("All sweep configurations failed; no valid final configuration found.")
 
         # Set best architecture for final training
         if tunable is not None and has_arch_tuning:
+            from .trace import Model
+
             arch_config = Arch(choices=tuple((name, final_config(name)) for name in [g.name for g in space.get_architecture_groups()] if final_config.has(name)))
             final_module = tunable.instantiate(arch_config, key=jax.random.PRNGKey(0))
-            tunable._current_instance = FlaxModule(final_module)
+            tunable._current_instance = Model(final_module)
             tunable._current_instance.layer_id = tunable.layer_id
+
+        for ch in choices or []:
+            if final_config.has(ch.name):
+                ch.select(int(final_config(ch.name)))
 
         # Reset for final training
         self.core.models = {}
@@ -976,7 +1006,11 @@ class Tuner:
 
         # Apply per-model config (freeze, lora, optimizer, lr, dtype)
         self._apply_model_config(self.core, final_config, final_optimizer, final_lr)
-        stats = self.core.solve(epochs=final_training_epochs, constraint_weights=final_weights)
+        solve_kwargs = {"epochs": final_training_epochs}
+        sig = inspect.signature(self.core.solve)
+        if "constraint_weights" in sig.parameters:
+            solve_kwargs["constraint_weights"] = final_weights
+        stats = self.core.solve(**solve_kwargs)
 
         return stats
 

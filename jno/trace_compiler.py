@@ -36,6 +36,7 @@ from .trace import (
     Placeholder,
     TunableModule,
     TunableModuleCall,
+    Choice,
     Variable,
     Assembly,
     GroupedAssembly,
@@ -130,6 +131,11 @@ class TraceCompiler:
                 if flax_mod.layer_id not in seen:
                     seen.add(flax_mod.layer_id)
                     layers.append((flax_mod, node.args))
+
+            elif isinstance(node, Choice):
+                for opt in node.options:
+                    if isinstance(opt, Placeholder):
+                        visit(opt)
 
             elif isinstance(node, BinaryOp):
                 visit(node.left)

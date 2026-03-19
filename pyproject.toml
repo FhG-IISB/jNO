@@ -34,7 +34,10 @@ foundation = [
 
 
 [tool.setuptools]
-packages = ["jno"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["jno*"]
 
 [tool.setuptools.package-data]
 jno = ["py.typed"]

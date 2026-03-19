@@ -16,6 +16,7 @@ from .trace import (
     Model,
     TunableModule,
     TunableModuleCall,
+    Choice,
     ModelCall,
     OperationDef,
     OperationCall,
@@ -837,7 +838,9 @@ class core:
                 # attributes) are always False so equinox does not misinterpret
                 # them as sub-filter callables.
                 filter_spec[lid] = jax.tree_util.tree_map(
-                    lambda arr, m: bool(m) if eqx.is_array(arr) else False,
+                    # Only train floating/complex arrays; integer/bool arrays
+                    # (e.g. RNG/state tensors in wrapped modules) must stay frozen.
+                    lambda arr, m: bool(m) if eqx.is_inexact_array(arr) else False,
                     model,
                     fm._param_mask,
                 )
@@ -846,7 +849,11 @@ class core:
                 # functions stored as attributes) must be False, not the
                 # original value — equinox interprets callables in the
                 # filter spec as sub-filters.
-                filter_spec[lid] = jax.tree_util.tree_map(lambda l: True if eqx.is_array(l) else False, model)
+                filter_spec[lid] = jax.tree_util.tree_map(
+                    # Gradients are defined only for inexact dtypes.
+                    lambda l: True if eqx.is_inexact_array(l) else False,
+                    model,
+                )
 
         # ── 4. Three-way partition ──
         trainable, rest = eqx.partition(models, filter_spec)
@@ -1699,6 +1706,103 @@ class core:
         tuner = Tuner(self)
         stats = tuner.sweep(space, optimizer, budget, devices)
         return stats
+
+    def _find_tunable_modules(self):
+        """Collect unique TunableModule instances from constraints/trackers."""
+        modules = []
+        seen = set()
+
+        def visit(node):
+            if isinstance(node, TunableModule):
+                if id(node) not in seen:
+                    seen.add(id(node))
+                    modules.append(node)
+            elif isinstance(node, TunableModuleCall):
+                tm = node.model
+                if id(tm) not in seen:
+                    seen.add(id(tm))
+                    modules.append(tm)
+                for arg in node.args:
+                    if isinstance(arg, Placeholder):
+                        visit(arg)
+            elif isinstance(node, Choice):
+                for opt in node.options:
+                    if isinstance(opt, Placeholder):
+                        visit(opt)
+            elif isinstance(node, BinaryOp):
+                visit(node.left)
+                visit(node.right)
+            elif isinstance(node, FunctionCall):
+                for arg in node.args:
+                    if isinstance(arg, Placeholder):
+                        visit(arg)
+            elif isinstance(node, OperationDef):
+                visit(node.expr)
+            elif isinstance(node, OperationCall):
+                visit(node.operation.expr)
+                for arg in node.args:
+                    if isinstance(arg, Placeholder):
+                        visit(arg)
+            elif isinstance(node, (Hessian, Jacobian)):
+                visit(node.target)
+                for v in node.variables:
+                    if isinstance(v, Placeholder):
+                        visit(v)
+            elif isinstance(node, Tracker):
+                visit(node.expr)
+
+        for expr in getattr(self, "_constraint_exprs", []):
+            visit(expr)
+        for expr in getattr(self, "_tracker_exprs", []):
+            visit(expr)
+
+        return modules
+
+    def _find_choice_nodes(self):
+        """Collect unique Choice nodes from constraints/trackers."""
+        choices = []
+        seen = set()
+
+        def visit(node):
+            if isinstance(node, Choice):
+                if id(node) not in seen:
+                    seen.add(id(node))
+                    choices.append(node)
+                for opt in node.options:
+                    if isinstance(opt, Placeholder):
+                        visit(opt)
+            elif isinstance(node, TunableModuleCall):
+                for arg in node.args:
+                    if isinstance(arg, Placeholder):
+                        visit(arg)
+            elif isinstance(node, BinaryOp):
+                visit(node.left)
+                visit(node.right)
+            elif isinstance(node, FunctionCall):
+                for arg in node.args:
+                    if isinstance(arg, Placeholder):
+                        visit(arg)
+            elif isinstance(node, OperationDef):
+                visit(node.expr)
+            elif isinstance(node, OperationCall):
+                visit(node.operation.expr)
+                for arg in node.args:
+                    if isinstance(arg, Placeholder):
+                        visit(arg)
+            elif isinstance(node, (Hessian, Jacobian)):
+                visit(node.target)
+                for v in node.variables:
+                    if isinstance(v, Placeholder):
+                        visit(v)
+            elif isinstance(node, Tracker):
+                visit(node.expr)
+
+        for expr in getattr(self, "_constraint_exprs", []):
+            visit(expr)
+        for expr in getattr(self, "_tracker_exprs", []):
+            visit(expr)
+
+        return choices
 
     def eval(self, operation: BinaryOp, domain: Optional[domain] = None, min_consecutive: int = 1, key=None):
         """
