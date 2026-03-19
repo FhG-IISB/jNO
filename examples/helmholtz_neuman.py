@@ -124,7 +124,7 @@ weak = vol_integrand - neumann_right - neumann_top
 pde = weak.assemble(train_domain, u_net=u_gauss, target="vpinn")
 A_coarse, b_coarse = weak.assemble(train_domain, target="fem_system")
 
-A_coarse_dense = jnp.asarray(A_coarse.toarray())
+A_coarse_dense = jnp.asarray(A_coarse.todense())
 b_coarse_dense = jnp.asarray(b_coarse)
 
 op = lx.MatrixLinearOperator(A_coarse_dense)
@@ -193,7 +193,7 @@ weak_fem = vol_integrand_fem - neumann_right_fem - neumann_top_fem
 
 A_fine, b_fine = weak_fem.assemble(fem_domain, target="fem_system")
 
-A_fine_dense = jnp.asarray(A_fine.toarray())
+A_fine_dense = jnp.asarray(A_fine.todense())
 b_fine_dense = jnp.asarray(b_fine)
 
 op_fine = lx.MatrixLinearOperator(A_fine_dense)

@@ -173,7 +173,7 @@ weak = (
 pde = weak.assemble(train_domain, u_net=u_gauss, target="vpinn")
 A_coarse, b_coarse = weak.assemble(train_domain, target="fem_system")
 
-A_coarse_dense = jnp.asarray(A_coarse.toarray())
+A_coarse_dense = jnp.asarray(A_coarse.todense())
 b_coarse_dense = jnp.asarray(b_coarse)
 
 op = lx.MatrixLinearOperator(A_coarse_dense)
@@ -254,7 +254,7 @@ weak_fem = (
 
 A_fine, b_fine = weak_fem.assemble(fem_domain, target="fem_system")
 
-A_fine_dense = jnp.asarray(A_fine.toarray())
+A_fine_dense = jnp.asarray(A_fine.todense())
 b_fine_dense = jnp.asarray(b_fine)
 
 op_fine = lx.MatrixLinearOperator(A_fine_dense)
@@ -390,4 +390,4 @@ plot_mesh_field(axes[3], x_mesh, y_mesh, tri_eval, u_fem_np, "Fine FEM solution"
 plot_mesh_field(axes[4], x_mesh, y_mesh, tri_eval, abs_err_fem, "FEM abs error", cmap="magma")
 
 plt.tight_layout()
-plt.savefig("helmholtz_Lshape_manufactured.png", dpi=300)
+plt.savefig("helmholtz_Lshape_manufactured_2.png", dpi=300)

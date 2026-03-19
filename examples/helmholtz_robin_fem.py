@@ -25,20 +25,32 @@ alpha_top = 3.0
 def exact_u(x, y):
     return x * sin(pi * y) + y
 
+
 def exact_u_num(x, y):
     return x * jnp.sin(jnp.pi * y) + y
 
+
 def source_f(x, y):
     return x * (pi**2) * sin(pi * y) - (k_val**2) * (x * sin(pi * y) + y)
+
 
 def robin_rhs_right(x, y):
     # du/dn + alpha u on x=1
     return sin(pi * y) + alpha_right * (sin(pi * y) + y)
 
+
 def robin_rhs_top(x, y):
     # du/dn + alpha u on y=1
     # u_y(x,1)=1-pi x, u(x,1)=1
     return 1.0 - pi * x + alpha_top
+
+
+def to_dense(A):
+    if hasattr(A, "todense"):
+        return jnp.asarray(A.todense())
+    if hasattr(A, "toarray"):
+        return jnp.asarray(A.toarray())
+    return jnp.asarray(A)
 
 
 # ============================================================
@@ -58,7 +70,10 @@ domain.init_fem(
 
 u, phi = domain.fem_symbols()
 
+# Volume quadrature
 xg, yg, _ = domain.variable("fem_gauss", split=True)
+
+# Boundary quadrature
 xr, yr, _ = domain.variable("gauss_right", split=True)
 xt, yt, _ = domain.variable("gauss_top", split=True)
 
@@ -71,9 +86,20 @@ k_sq = 0.0 * xg + k_val**2
 alpha_r = 0.0 * xr + alpha_right
 alpha_t = 0.0 * xt + alpha_top
 
-# ------------------------------------------------------------
-# Volume term
-# ------------------------------------------------------------
+# ============================================================
+# Unified weak form
+#
+# Strong form:
+#   -Δu - k^2 u = f
+#
+# Robin on Γ_R:
+#   du/dn + α u = r
+#
+# Weak form:
+#   ∫Ω (∇u·∇phi - k^2 u phi - f phi) dΩ
+# + ∫Γ_R (α u phi - r phi) dΓ
+# = 0
+# ============================================================
 vol_integrand = (
     du_dx * phi_x
     + du_dy * phi_y
@@ -81,25 +107,14 @@ vol_integrand = (
     - source_f(xg, yg) * phi
 )
 
-# ------------------------------------------------------------
-# Robin boundary terms
-# weak form:
-# ∫Ω(...) dΩ + ∫Γ alpha u phi dΓ - ∫Γ r phi dΓ = 0
-# ------------------------------------------------------------
 robin_right = alpha_r * u * phi - robin_rhs_right(xr, yr) * phi
 robin_top = alpha_t * u * phi - robin_rhs_top(xt, yt) * phi
 
-# ------------------------------------------------------------
-# Assemble term-by-term to bypass mixed-support bucket inference
-# ------------------------------------------------------------
-A_vol, b_vol = domain._fem_assemble_bucket(vol_integrand, support="volume", region_id="volume")
-A_right, b_right = domain._fem_assemble_bucket(robin_right, support="boundary", region_id="right")
-A_top, b_top = domain._fem_assemble_bucket(robin_top, support="boundary", region_id="top")
+weak = vol_integrand + robin_right + robin_top
 
-A = A_vol + A_right + A_top
-b = b_vol + b_right + b_top
+A, b = weak.assemble(domain, target="fem_system")
 
-A_dense = jnp.asarray(A.toarray())
+A_dense = to_dense(A)
 b_dense = jnp.asarray(b)
 
 op = lx.MatrixLinearOperator(A_dense)
@@ -117,7 +132,7 @@ x = jnp.asarray(coords[:, 0:1])
 y = jnp.asarray(coords[:, 1:2])
 
 u_exact = exact_u_num(x, y).reshape(-1)
-rel_l2 = jnp.linalg.norm(u_exact - u_fem) / jnp.linalg.norm(u_exact)
+rel_l2 = jnp.linalg.norm(u_exact - u_fem) / (jnp.linalg.norm(u_exact) + 1e-14)
 max_abs = jnp.max(jnp.abs(u_exact - u_fem))
 
 print(f"Robin FEM Relative L2 Error: {rel_l2:.6e}")
@@ -145,4 +160,3 @@ plot_field(axes[2], abs_err, "FEM abs error", cmap="magma")
 
 plt.tight_layout()
 plt.savefig("helmholtz_robin_fem_only.png", dpi=300)
-plt.show()

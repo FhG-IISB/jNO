@@ -101,7 +101,7 @@ print("VPINN assembled object:", pde)
 print("A shape:", A.shape)
 print("b shape:", b.shape)
 
-A_dense = jnp.asarray(A.toarray())
+A_dense = jnp.asarray(A.todense())
 b_dense = jnp.asarray(b)
 # solve usign jax lineax
 op = lx.MatrixLinearOperator(A_dense)

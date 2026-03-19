@@ -123,7 +123,7 @@ vol_integrand_fem = (
 weak_fem = vol_integrand_fem
 A, b = weak_fem.assemble(fem_domain, target="fem_system")
 
-A_dense = jnp.asarray(A.toarray())
+A_dense = jnp.asarray(A.todense())
 b_dense = jnp.asarray(b)
 
 op = lx.MatrixLinearOperator(A_dense)
