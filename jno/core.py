@@ -318,6 +318,8 @@ class core:
         tensor_dims = {}
         if hasattr(domain, "context"):
             for name, tensor in domain.context.items():
+                if isinstance(tensor, dict) or not hasattr(tensor, "shape"):
+                    continue
                 tensor_dims[name] = tensor.shape[1:]
         return tensor_dims
 
@@ -329,9 +331,23 @@ class core:
         context = {}
         if hasattr(domain, "context"):
             for tag, arr in domain.context.items():
+                # If it's a nested dictionary (like our VPINN surface_data), map safely
+                if isinstance(arr, dict):
+                    # 1. Convert leaves to arrays
+                    arr = jax.tree_util.tree_map(jnp.asarray, arr)
+                    # 2. Add the batch dimension [None, ...] to every array in the dict
+                    context[tag] = jax.tree_util.tree_map(lambda x: x[None, ...], arr)
+                    # 3. Skip the rest of the loop for dictionaries!
+                    continue
+                    # Standard behavior for everything else (preserves backward compatibility)
                 arr = jnp.asarray(arr)
-                # Ensure batch dimension exists
-                if arr.ndim >= 2:
+                
+                # List of tags that are MESH METADATA and should never be batched
+                metadata_tags = ["JxW", "flat_cells", "global_areas", "N_flat", "dN_dx_flat", "dirichlet_nodes", "__time__"]
+                
+                if tag in metadata_tags:
+                    context[tag] = arr
+                elif hasattr(arr, "ndim") and arr.ndim >= 2:
                     context[tag] = arr
                 else:
                     context[tag] = arr[None, ...]

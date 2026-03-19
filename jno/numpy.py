@@ -1,7 +1,8 @@
 import jax
 import jax.numpy as jnp
-from typing import List, Union
-from .trace import Placeholder, Variable, FunctionCall, Hessian, Jacobian, Constant, ConstantNamespace, Choice
+
+from typing import List, Union, Sequence
+from .trace import Placeholder, Variable, FunctionCall, Hessian, Jacobian, Constant, ConstantNamespace, TestFunction, TrialFunction, Choice
 
 # Keep import so people can use jno.numpy as jno -> jno.model, jno.tune
 from .tuner import Arch, ArchSpace, tune
@@ -266,7 +267,92 @@ def transpose(x, axes: tuple = None) -> FunctionCall:
     """Transpose array."""
     return FunctionCall(lambda a: jnp.transpose(a, axes=axes), [x])
 
+def trace(x) -> FunctionCall:
+    """
+    Trace of a matrix/tensor over the last two axes.
 
+    Examples
+    --------
+    trace(A)              -> scalar trace for (..., n, n)
+    trace(symgrad(u))     -> volumetric strain
+    """
+    return FunctionCall(
+        lambda a: jnp.trace(a, axis1=-2, axis2=-1),
+        [x],
+        name="trace",
+    )
+
+
+def sym(x) -> FunctionCall:
+    """
+    Symmetric part of a second-order tensor over the last two axes.
+
+    sym(A) = 0.5 * (A + A^T)
+    """
+    return FunctionCall(
+        lambda a: 0.5 * (a + jnp.swapaxes(a, -1, -2)),
+        [x],
+        name="sym",
+    )
+
+
+def antisym(x) -> FunctionCall:
+    """
+    Skew-symmetric part of a second-order tensor over the last two axes.
+
+    antisym(A) = 0.5 * (A - A^T)
+    """
+    return FunctionCall(
+        lambda a: 0.5 * (a - jnp.swapaxes(a, -1, -2)),
+        [x],
+        name="antisym",
+    )
+
+
+def identity(n: int) -> FunctionCall:
+    """
+    Symbolic identity matrix helper.
+
+    This returns a traced constant-like FunctionCall so it composes naturally
+    inside symbolic expressions.
+
+    Example
+    -------
+    I = jnn.identity(2)
+    sigma = lam * jnn.trace(eps) * I + 2.0 * mu * eps
+    """
+    return FunctionCall(
+        lambda: jnp.eye(n),
+        [],
+        name="identity",
+    )
+
+
+def symgrad(target: Placeholder, variables: List[Variable], scheme: str = "automatic_differentiation") -> FunctionCall:
+    """
+    Symmetric gradient of a vector/tensor-valued field.
+
+    For a vector field u in R^dim:
+        grad(u)    -> (..., n_comp, dim)
+        symgrad(u) -> 0.5 * (grad(u) + grad(u)^T)
+
+    In small-strain elasticity:
+        eps(u) = symgrad(u, [x, y])   # 2D
+        eps(u) = symgrad(u, [x, y, z])# 3D
+
+    Notes
+    -----
+    This assumes the Jacobian convention used by jno:
+        jacobian(u, [x, y]) has trailing shape (..., value_shape, dim)
+    so the last axis is the derivative direction and the second-last block
+    corresponds to field components.
+    """
+    G = jacobian(target, variables, scheme=scheme)
+    return FunctionCall(
+        lambda a: 0.5 * (a + jnp.swapaxes(a, -1, -2)),
+        [G],
+        name="symgrad",
+    )
 # ============================================================================
 # Reduction operations
 # ============================================================================
@@ -335,7 +421,69 @@ cross = _binary(jnp.cross)
 # ============================================================================
 # Differential operators (pino-specific)
 # ============================================================================
+def inner(x, y, n_contract: int = 1, keepdims: bool = False) -> FunctionCall:
+    """
+    Generalized inner product / contraction over the last ``n_contract`` axes.
 
+    This is intentionally shape-friendly for weak forms. It pads the lower-rank
+    operand with singleton axes *before* the contracted trailing axes so common
+    patterns like
+
+        inner(grad_u, grad_phi)
+
+    work both in pointwise mode and FEM mode, where ``grad_phi`` usually carries
+    an extra local basis-function axis.
+
+    Examples:
+        inner(a, b)               -> vector inner product over last axis
+        inner(A, B, n_contract=2) -> Frobenius product
+    """
+
+    def _fn(a, b, _n=n_contract, _keep=keepdims):
+        a = jnp.asarray(a)
+        b = jnp.asarray(b)
+
+        if _n < 1:
+            return a * b
+        if a.ndim < _n or b.ndim < _n:
+            raise ValueError("inner(...): n_contract exceeds operand rank")
+
+        a_prefix_ndim = a.ndim - _n
+        b_prefix_ndim = b.ndim - _n
+
+        if a_prefix_ndim < b_prefix_ndim:
+            pad = (1,) * (b_prefix_ndim - a_prefix_ndim)
+            a = jnp.reshape(a, a.shape[:-_n] + pad + a.shape[-_n:])
+        elif b_prefix_ndim < a_prefix_ndim:
+            pad = (1,) * (a_prefix_ndim - b_prefix_ndim)
+            b = jnp.reshape(b, b.shape[:-_n] + pad + b.shape[-_n:])
+
+        axes = tuple(range(-_n, 0))
+        return jnp.sum(a * b, axis=axes, keepdims=_keep)
+
+    return FunctionCall(_fn, [x, y], name="inner", reduces_axis=-1)
+
+def double_dot(x, y) -> FunctionCall:
+    """
+    Double contraction / Frobenius product.
+
+    Equivalent to:
+        inner(x, y, n_contract=2)
+    """
+    return inner(x, y, n_contract=2)
+
+def einsum(subscripts: str, *operands) -> FunctionCall:
+    """Traced jnp.einsum wrapper for compact tensor/vector contractions."""
+    return FunctionCall(
+        lambda *args, _subs=subscripts: jnp.einsum(_subs, *args),
+        list(operands),
+        name="einsum",
+    )
+
+
+def div(vector_field: List[Placeholder], variables: List[Variable]) -> Placeholder:
+    """Alias for divergence."""
+    return divergence(vector_field, variables)
 
 def grad(target: Placeholder, variable: Variable, scheme: str = "automatic_differentiation") -> Jacobian:
     """
@@ -359,6 +507,10 @@ def grad(target: Placeholder, variable: Variable, scheme: str = "automatic_diffe
     Example:
         u_x = pnp.grad(u(x, y), x)  # ∂u/∂x
     """
+    if isinstance(variable, (list, tuple)):
+        if len(variable) == 0:
+            raise ValueError("grad(..., variables) requires at least one variable")
+        return Jacobian(target, list(variable), scheme)
     return Jacobian(target, [variable], scheme)
 
 
@@ -496,6 +648,13 @@ def curl_3d(Fx: Placeholder, Fy: Placeholder, Fz: Placeholder, x: Variable, y: V
     curl_z = Jacobian(Fy, [x]) - Jacobian(Fx, [y])
     return stack([curl_x, curl_y, curl_z], axis=-1)
 
+def test(name: str = "phi") -> TestFunction:
+    """Create a generic variational test function symbol."""
+    return TestFunction(name=name)
+
+def trial(name: str = "u") -> TrialFunction:
+    """Create a generic variational unknown symbol."""
+    return TrialFunction(name=name)
 
 # ============================================================================
 # Array creation and dtypes — plain re-exports from jax.numpy
