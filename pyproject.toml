@@ -22,7 +22,7 @@ dependencies = [
 cuda = [
     "jax[cuda12]"
 ]
-dev = ["pytest>=7.0", "black>=22.0", "flake8>=4.0", "mypy>=0.950", "matplotlib", "paramax", "flax", "xprof", "pylotte", "nevergrad"]
+dev = ["pytest>=7.0", "black>=22.0", "flake8>=4.0", "mypy>=0.950", "matplotlib", "paramax", "flax", "xprof", "pylotte", "nevergrad", "lineax", "jax-fem @git+https://github.com/FhG-IISB/jax-fem"]
 iree = [
     "iree-base-compiler",
     "iree-base-runtime"
@@ -30,6 +30,10 @@ iree = [
 foundation = [
     "jax_morph @git+https://github.com/armbrusl/jax_morph",
     "jax_mpp @git+https://github.com/armbrusl/jax_mpp",
+]
+fem = [
+    "lineax",
+    "jax-fem @git+https://github.com/FhG-IISB/jax-fem"
 ]
 
 
