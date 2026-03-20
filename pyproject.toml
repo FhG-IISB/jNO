@@ -1,10 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel", "build"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "jNO"
-version = "0.2.0"
+version = "0.1.0"
 description = "Jax Neural Operators"
 readme = "README.md"
 requires-python = ">=3.11, <3.14"
 authors = [{ name = "Leon Armbruster", email = "leonarmbruster@iisb.fraunhofer.de" }]
+license = "MIT"
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
 
 dependencies = [
     "jax",
@@ -17,6 +31,12 @@ dependencies = [
     "cloudpickle",
     "einops",
 ]
+
+[project.urls]
+Homepage = "https://github.com/FhG-IISB/jno"
+Documentation = "https://fhg-iisb.github.io/jNO_docs/"
+Source = "https://github.com/FhG-IISB/jno"
+Issues = "https://github.com/FhG-IISB/jno/issues"
 
 [project.optional-dependencies]
 cuda = [

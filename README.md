@@ -1,10 +1,13 @@
 <p align="center">
-  <img src="assets/logo.png" alt="jNO logo" width="200"/>
+  <img src="assets/logo.png" alt="jNO logo" width="500"/>
 </p>
 
 <p align="center">
     <a href="https://fhg-iisb.github.io/jNO_docs/">
         <img src="https://img.shields.io/badge/docs-GitHub%20Pages-0aa?style=for-the-badge" alt="Docs"/>
+    </a>
+    <a href="https://fhg-iisb.github.io/jNO_docs/Tutorials/">
+        <img src="https://img.shields.io/badge/tutorials-step_by_step-0b8f7a?style=for-the-badge" alt="Tutorials"/>
     </a>
     <a href="https://github.com/FhG-IISB/jno/actions/workflows/python-package.yml">
         <img src="https://img.shields.io/github/actions/workflow/status/FhG-IISB/jno/python-package.yml?branch=main&style=for-the-badge&label=tests" alt="Tests"/>
@@ -15,39 +18,57 @@
     <a href="CITATION.cff">
         <img src="https://img.shields.io/badge/cite-CITATION.cff-6b5b95?style=for-the-badge" alt="Citation"/>
     </a>
-</p>
-
-<p align="left">
-    <img src="https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue?style=for-the-badge" alt="Python 3.10 3.11 3.12"/>
-    <img src="https://img.shields.io/badge/platform-ubuntu%20%7C%20windows%20%7C%20macOS-1f6feb?style=for-the-badge" alt="Linux Windows macOS"/>
     <img src="https://img.shields.io/badge/docker-image%20available-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker image available"/>
 </p>
 
-## Install
+
+# Install
 
 ```bash
 pip install jno
 ```
 
-## Citation
+### Foundation Models
 
-If you use jNO in your work, please cite:
+These models are maintained as separate repositories so they can also be used independently.
+If installed, you can access them via:
 
-```text
-Leon Armbruster. jNO: A JAX Library for Neural Operator and Foundation Model Training. 2026. Version 0.1.0. (arXiv preprint)
+```python
+jno.nn.<model_name>
 ```
 
-See [CITATION.cff](CITATION.cff) for structured metadata.
+to use a foundation model.
+
+<p>
+    <a href="https://github.com/FhG-IISB/jax_poseidon">
+        <img src="https://img.shields.io/badge/jax_poseidon-1f6feb?style=for-the-badge" alt="jax_poseidon"/>
+    </a>
+    <a href="https://github.com/FhG-IISB/jax_walrus">
+        <img src="https://img.shields.io/badge/jax_walrus-1f6feb?style=for-the-badge" alt="jax_walrus"/>
+    </a>
+    <a href="https://github.com/FhG-IISB/jax_pdeformer2">
+        <img src="https://img.shields.io/badge/jax_pdeformer2-1f6feb?style=for-the-badge" alt="jax_pdeformer2"/>
+    </a>
+    <a href="https://github.com/armbrusl/jax_morph">
+        <img src="https://img.shields.io/badge/jax_morph-1f6feb?style=for-the-badge" alt="jax_morph"/>
+    </a>
+    <a href="https://github.com/armbrusl/jax_mpp">
+        <img src="https://img.shields.io/badge/jax_mpp-1f6feb?style=for-the-badge" alt="jax_mpp"/>
+    </a>
+</p>
 
 
-## Dependencies (thank you!)
 
-This project stands on the shoulders of some fantastic open-source libraries:
+## Citation
 
-- Backbone → [JAX](https://github.com/jax-ml/jax)
-- Optimizers → [Optax](https://github.com/google-deepmind/optax) and/or [SOAP](https://github.com/haydn-jones/SOAP_JAX)
-- Neural Network → [Equinox](https://github.com/patrick-kidger/equinox) and/or [Flax](https://github.com/google/flax)
-- Mesh generation → [pygmsh](https://github.com/nschloe/pygmsh) + [meshio](https://github.com/nschloe/meshio)
-- Hyperparameter search → [Nevergrad](https://github.com/facebookresearch/nevergrad)
-- Signed serialisation → [pylotte](https://github.com/FhG-IISB/pylotte)
-- Einsum notation → [einops](https://github.com/arogozhnikov/einops)
+If jNO is used we would appreciate to cite the following paper:
+
+```text
+@article{armbruster2026jNO,
+  author  = {Armbruster, Leon, ....},
+  title   = {{jNO}: A JAX Library for Neural Operator and Foundation Model Training},
+  journal = {},
+  year    = {},
+}
+```
+

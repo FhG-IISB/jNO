@@ -42,7 +42,7 @@ def save(instance, filepath: str, public_key_path: str | None = None, private_ke
         with open(filepath, "wb") as f:
             cloudpickle.dump(instance, f)
 
-    instance.log.info(f"Model saved to: {filepath}")
+    instance.log.info(f"Model/Domain saved to: {filepath}")
     return None
 
 

@@ -729,13 +729,13 @@ wheels = [
 
 [[package]]
 name = "gmsh"
-version = "4.15.0"
+version = "4.15.1"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/d6/95/01df2f928b4498bd4705c5cf81b0ed191b6d3b6ce4eaa6fddf6890f4f7cd/gmsh-4.15.0-py2.py3-none-macosx_10_15_x86_64.whl", hash = "sha256:1a7951836982f97e21e8b2de106fe1e8455cde53719191a3950784b56e2606af", size = 40170061, upload-time = "2025-10-26T20:30:21.097Z" },
-    { url = "https://files.pythonhosted.org/packages/29/a4/b1e9b4997c6f4a29fb8a9736851430bf306701e5f7f1266eafc1f860cbfe/gmsh-4.15.0-py2.py3-none-macosx_12_0_arm64.whl", hash = "sha256:042f76562244dfbad46edfeacaa092c8c95a9df8fb4fd7611771477f0031be0d", size = 36425180, upload-time = "2025-10-26T20:30:25.241Z" },
-    { url = "https://files.pythonhosted.org/packages/63/22/27f88a5a1c48b833c5893a23b71cf74b5270fac82d88e337ec2c138e8853/gmsh-4.15.0-py2.py3-none-manylinux_2_24_x86_64.whl", hash = "sha256:998527cb172f2529c6beca7334a6ca788fa54fbb3d4f817deb0903005d49344d", size = 40003017, upload-time = "2025-10-26T20:30:28.718Z" },
-    { url = "https://files.pythonhosted.org/packages/23/51/21175eb9c6a592431a5c87f288ce447af1cea68a6ad4169765dc7ab7a9e7/gmsh-4.15.0-py2.py3-none-win_amd64.whl", hash = "sha256:a5b9867f88af59aff269a93abbd009551fbc263eb94a165a25a0c8072bae13db", size = 42233991, upload-time = "2025-10-26T20:30:32.722Z" },
+    { url = "https://files.pythonhosted.org/packages/ba/8a/41ebc8bb301b2958a543e03fbaf9b963cc107a22f35307bbfcdabfa91797/gmsh-4.15.1-py2.py3-none-macosx_10_15_x86_64.whl", hash = "sha256:3821378cb5b4c60f00994bce6aa9d2d3e28de935e21ded31821c5a66853789c6", size = 40170499, upload-time = "2026-02-16T20:05:23.869Z" },
+    { url = "https://files.pythonhosted.org/packages/a6/b0/a5c659d2b5180c037ff2304e459e0c142015de510ac68d4f100770c7d89d/gmsh-4.15.1-py2.py3-none-macosx_12_0_arm64.whl", hash = "sha256:d9b0d3923730a0b50ecf73e3429d24731362ed76227f80019d8e9420d5851f09", size = 36425511, upload-time = "2026-02-16T20:05:27.635Z" },
+    { url = "https://files.pythonhosted.org/packages/bc/5d/339b995273c25a79bad5144ffb4fe57f4428d9ad2603942c851a66376afd/gmsh-4.15.1-py2.py3-none-manylinux_2_24_x86_64.whl", hash = "sha256:f2e6bcabacbba0146c35edeb8af3e351b4cfec1a9662ebe523d0e39767a168ec", size = 40005091, upload-time = "2026-02-16T20:05:32.802Z" },
+    { url = "https://files.pythonhosted.org/packages/82/64/3d83f2dc1d7cb5e0150a16d2a6e6cd60ec8fe45c061c157a1e1250677b5e/gmsh-4.15.1-py2.py3-none-win_amd64.whl", hash = "sha256:be3a8c9e4e8203438e4e352fe3e5083ba82584ee7b4a09c8f368887a93b5fff1", size = 42235265, upload-time = "2026-02-16T20:05:37.389Z" },
 ]
 
 [[package]]
@@ -1202,7 +1202,7 @@ wheels = [
 [[package]]
 name = "jno"
 version = "0.2.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
     { name = "cloudpickle" },
     { name = "einops" },
@@ -1289,7 +1289,7 @@ requires-dist = [
 provides-extras = ["cuda", "dev", "iree", "foundation", "fem"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "jno", virtual = "." }]
+dev = [{ name = "jno", editable = "." }]
 
 [[package]]
 name = "joblib"
