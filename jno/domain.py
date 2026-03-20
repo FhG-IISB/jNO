@@ -1701,8 +1701,8 @@ class BoundaryRegion:
 
         # 2D: segment membership
         if self.dim == 2 and self.edges is not None and len(self.edges) > 0:
-            a = jnp.asarray(self.edges[:, 0, :])   # (E,2)
-            b = jnp.asarray(self.edges[:, 1, :])   # (E,2)
+            a = jnp.asarray(self.edges[:, 0, :])  # (E,2)
+            b = jnp.asarray(self.edges[:, 1, :])  # (E,2)
 
             ab = b - a
             ap = p[None, :] - a
@@ -1719,7 +1719,7 @@ class BoundaryRegion:
 
         # 3D: triangle membership
         if self.dim == 3 and self.triangles is not None and len(self.triangles) > 0:
-            a = jnp.asarray(self.triangles[:, 0, :])   # (T,3)
+            a = jnp.asarray(self.triangles[:, 0, :])  # (T,3)
             b = jnp.asarray(self.triangles[:, 1, :])
             c = jnp.asarray(self.triangles[:, 2, :])
 
@@ -1755,7 +1755,298 @@ class BoundaryRegion:
         return jnp.any(d <= self.tol)
 
 
-class domain(MeshUtils, Geometries):
+class MeshIOMixin(MeshUtils):
+    """Mesh loading and export helpers shared by domain-like classes."""
+
+    def _load_mesh(self, mesh_file: str):
+        """Load mesh from file using Meshio."""
+        import meshio
+
+        from pathlib import Path
+
+        if not Path(mesh_file).exists():
+            raise FileNotFoundError(f"Mesh file not found: {mesh_file}")
+
+        self.mesh = meshio.read(mesh_file)
+
+        points = self.mesh.points  # type: ignore[attr-defined]
+        if points.shape[1] == 3 and np.allclose(points[:, 2], 0):
+            self.dimension = 2
+        else:
+            self.dimension = points.shape[1]
+
+    def _write_meshio_safely(self, save_path: str, file_format: Optional[str] = None):
+        """Write mesh with meshio, falling back to a cell_set-free copy if needed."""
+        import os
+
+        if self.mesh is None:
+            raise ValueError("No mesh available to export")
+
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        try:
+            meshio.write(save_path, self.mesh, file_format=file_format)
+        except IndexError as e:
+            # Some meshio VTK writers can fail when converting cell_sets to
+            # cell_data if set indices are malformed or global-indexed.
+            # Fallback: export geometry/cells without cell_sets.
+            msg = str(e)
+            if "cell_sets" not in msg and "out of bounds" not in msg:
+                raise
+
+            sanitized_mesh = meshio.Mesh(
+                points=self.mesh.points,
+                cells=self.mesh.cells,
+                point_data=getattr(self.mesh, "point_data", None),
+                cell_data=getattr(self.mesh, "cell_data", None),
+                field_data=getattr(self.mesh, "field_data", None),
+            )
+            meshio.write(save_path, sanitized_mesh, file_format=file_format)
+            self.log.warning("Mesh export dropped cell_sets due to meshio conversion issue")
+
+    def export_vtk(self, save_path: str = "./runs/domain.vtk", file_format: Optional[str] = None):
+        """Export the current mesh to a VTK file for external viewers.
+
+        The output can be opened in ParaView, PyVista, or many browser-based
+        viewers that support VTK-compatible formats.
+        """
+        self._write_meshio_safely(save_path, file_format=file_format)
+        self.log.info(f"Saved mesh to {save_path}")
+
+    def export_msh(self, save_path: str = "./runs/domain.msh", file_format: str = "gmsh22"):
+        """Export the current mesh to Gmsh .msh format."""
+        self._write_meshio_safely(save_path, file_format=file_format)
+        self.log.info(f"Saved mesh to {save_path}")
+
+    def export(self, save_path: str, fmt: Optional[str] = None, show_sampled: bool = True, figsize: Tuple[int, int] = (10, 8)):
+        """Unified export helper.
+
+        Supported formats:
+        - png/jpg/jpeg/svg/pdf: static mesh image via ``plot_mesh``
+        - vtk/vtu: VTK mesh export
+        - msh: Gmsh mesh export
+        - html/htm: interactive browser view via Plotly
+        """
+        import os
+
+        _fmt = (fmt or os.path.splitext(save_path)[1].lower().lstrip(".")).lower()
+        if _fmt in {"png", "jpg", "jpeg", "svg", "pdf"}:
+            self.plot_mesh(save_path=save_path, figsize=figsize, show_sampled=show_sampled)
+        elif _fmt in {"vtk", "vtu"}:
+            self.export_vtk(save_path=save_path, file_format=_fmt)
+        elif _fmt in {"msh", "gmsh"}:
+            self.export_msh(save_path=save_path, file_format="gmsh22")
+        elif _fmt in {"html", "htm"}:
+            self.export_interactive_html(save_path=save_path, show_sampled=show_sampled)
+        else:
+            raise ValueError(f"Unsupported export format '{_fmt}'. Supported: png, jpg, svg, pdf, vtk, vtu, msh, html")
+
+    @staticmethod
+    def _set_3d_equal_axes(ax, points: np.ndarray):
+        """Set equal scaling on all 3D axes for better shape perception."""
+        mins = points.min(axis=0)
+        maxs = points.max(axis=0)
+        center = 0.5 * (mins + maxs)
+        radius = 0.5 * np.max(maxs - mins)
+        ax.set_xlim(center[0] - radius, center[0] + radius)
+        ax.set_ylim(center[1] - radius, center[1] + radius)
+        ax.set_zlim(center[2] - radius, center[2] + radius)
+
+    def plot_mesh(self, save_path: str = "./runs/domain_mesh.png", figsize: Tuple[int, int] = (10, 8), show_sampled: bool = True):
+        """Plot the actual mesh (elements), optionally overlaying sampled points."""
+        import os
+        import matplotlib.pyplot as plt
+
+        if self.mesh is None:
+            raise ValueError("No mesh available to plot")
+
+        points = np.asarray(self.mesh.points[:, : self.dimension])
+        spatial_dim = self.dimension
+
+        if spatial_dim == 3:
+            from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+            fig = plt.figure(figsize=figsize)
+            ax = fig.add_subplot(111, projection="3d")
+
+            if "tetra" in self.mesh.cells_dict:
+                boundary_faces = self._get_boundary_elements(self.mesh.cells_dict["tetra"], "tetra")
+                face_xyz = points[boundary_faces]
+                poly = Poly3DCollection(face_xyz, facecolor=(0.2, 0.55, 0.9, 0.12), edgecolor=(0.15, 0.15, 0.2, 0.35), linewidth=0.25)
+                ax.add_collection3d(poly)
+            elif "triangle" in self.mesh.cells_dict:
+                tri = self.mesh.cells_dict["triangle"]
+                face_xyz = points[tri]
+                poly = Poly3DCollection(face_xyz, facecolor=(0.2, 0.55, 0.9, 0.12), edgecolor=(0.15, 0.15, 0.2, 0.35), linewidth=0.25)
+                ax.add_collection3d(poly)
+
+            if show_sampled and self.context:
+                for tag, data in self.context.items():
+                    if tag.startswith("n_") or tag in self._param_tags or tag == "__time__":
+                        continue
+                    arr = np.asarray(data)
+                    if arr.ndim >= 4:
+                        pts = arr[0, 0]
+                        if pts.shape[-1] >= 3:
+                            ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=4, alpha=0.5)
+
+            self._set_3d_equal_axes(ax, points)
+            ax.set_xlabel(self.spatial[0])
+            ax.set_ylabel(self.spatial[1])
+            ax.set_zlabel(self.spatial[2])
+            ax.set_title("Mesh")
+        else:
+            fig, ax = plt.subplots(figsize=figsize)
+            if "triangle" in self.mesh.cells_dict and points.shape[1] >= 2:
+                import matplotlib.tri as mtri
+
+                tri = np.asarray(self.mesh.cells_dict["triangle"])
+                triang = mtri.Triangulation(points[:, 0], points[:, 1], tri)
+                ax.triplot(triang, color="0.3", linewidth=0.45, alpha=0.8)
+            elif "line" in self.mesh.cells_dict and points.shape[1] >= 1:
+                for e in np.asarray(self.mesh.cells_dict["line"]):
+                    p0, p1 = points[e[0]], points[e[1]]
+                    x0, x1 = p0[0], p1[0]
+                    y0 = p0[1] if points.shape[1] > 1 else 0.0
+                    y1 = p1[1] if points.shape[1] > 1 else 0.0
+                    ax.plot([x0, x1], [y0, y1], color="0.3", linewidth=0.8)
+
+            if show_sampled and self.context:
+                for tag, data in self.context.items():
+                    if tag.startswith("n_") or tag in self._param_tags or tag == "__time__":
+                        continue
+                    arr = np.asarray(data)
+                    if arr.ndim >= 4:
+                        pts = arr[0, 0]
+                    elif arr.ndim >= 2:
+                        pts = arr[0]
+                    else:
+                        continue
+                    if pts.shape[-1] >= 2:
+                        ax.scatter(pts[:, 0], pts[:, 1], s=8, alpha=0.5, label=tag)
+
+            if spatial_dim >= 2:
+                ax.set_aspect("equal")
+                ax.set_xlabel(self.spatial[0])
+                ax.set_ylabel(self.spatial[1])
+            else:
+                ax.set_xlabel(self.spatial[0])
+                ax.set_yticks([])
+            ax.set_title("Mesh")
+            if show_sampled and self.context:
+                ax.legend(loc="best", fontsize=8)
+
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        plt.tight_layout()
+        plt.savefig(save_path, dpi=180, bbox_inches="tight")
+        plt.close()
+        self.log.info(f"Saved mesh plot to {save_path}")
+
+    def export_interactive_html(self, save_path: str = "./runs/domain_mesh.html", show_sampled: bool = True):
+        """Export an interactive mesh visualization as HTML (Plotly).
+
+        Open the generated HTML in any browser to rotate/pan/zoom.
+        """
+        import os
+
+        if self.mesh is None:
+            raise ValueError("No mesh available to export")
+
+        try:
+            import plotly.graph_objects as go
+        except Exception as e:
+            raise ImportError("plotly is required for interactive HTML export") from e
+
+        points = np.asarray(self.mesh.points[:, : self.dimension])
+        traces = []
+
+        if self.dimension == 3:
+            if "tetra" in self.mesh.cells_dict:
+                faces = self._get_boundary_elements(self.mesh.cells_dict["tetra"], "tetra")
+            elif "triangle" in self.mesh.cells_dict:
+                faces = np.asarray(self.mesh.cells_dict["triangle"])
+            else:
+                faces = None
+
+            if faces is not None and len(faces) > 0:
+                traces.append(
+                    go.Mesh3d(
+                        x=points[:, 0],
+                        y=points[:, 1],
+                        z=points[:, 2],
+                        i=faces[:, 0],
+                        j=faces[:, 1],
+                        k=faces[:, 2],
+                        opacity=0.25,
+                        color="royalblue",
+                        name="mesh",
+                    )
+                )
+
+            if show_sampled and self.context:
+                for tag, data in self.context.items():
+                    if tag.startswith("n_") or tag in self._param_tags or tag == "__time__":
+                        continue
+                    arr = np.asarray(data)
+                    if arr.ndim >= 4:
+                        pts = arr[0, 0]
+                        if pts.shape[-1] >= 3:
+                            traces.append(
+                                go.Scatter3d(
+                                    x=pts[:, 0],
+                                    y=pts[:, 1],
+                                    z=pts[:, 2],
+                                    mode="markers",
+                                    marker=dict(size=2),
+                                    name=tag,
+                                )
+                            )
+        else:
+            if "triangle" in self.mesh.cells_dict and points.shape[1] >= 2:
+                tri = np.asarray(self.mesh.cells_dict["triangle"])
+                edge_segments = []
+                for a, b, c in tri:
+                    edge_segments.extend(
+                        [
+                            (points[a, 0], points[a, 1]),
+                            (points[b, 0], points[b, 1]),
+                            (None, None),
+                            (points[b, 0], points[b, 1]),
+                            (points[c, 0], points[c, 1]),
+                            (None, None),
+                            (points[c, 0], points[c, 1]),
+                            (points[a, 0], points[a, 1]),
+                            (None, None),
+                        ]
+                    )
+                xe = [p[0] for p in edge_segments]
+                ye = [p[1] for p in edge_segments]
+                traces.append(go.Scatter(x=xe, y=ye, mode="lines", line=dict(width=1, color="rgba(70,70,70,0.5)"), name="mesh"))
+
+            if show_sampled and self.context:
+                for tag, data in self.context.items():
+                    if tag.startswith("n_") or tag in self._param_tags or tag == "__time__":
+                        continue
+                    arr = np.asarray(data)
+                    if arr.ndim >= 4:
+                        pts = arr[0, 0]
+                    elif arr.ndim >= 2:
+                        pts = arr[0]
+                    else:
+                        continue
+                    if pts.shape[-1] >= 2:
+                        traces.append(go.Scatter(x=pts[:, 0], y=pts[:, 1], mode="markers", marker=dict(size=4), name=tag))
+
+        fig = go.Figure(data=traces)
+        fig.update_layout(title="Interactive Mesh", template="plotly_white")
+        if self.dimension == 2:
+            fig.update_yaxes(scaleanchor="x", scaleratio=1)
+
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        fig.write_html(save_path, include_plotlyjs="cdn")
+        self.log.info(f"Saved interactive mesh HTML to {save_path}")
+
+
+class domain(MeshIOMixin, Geometries):
     """
     Mesh-based domain class for defining computational domains and sampling collocation points.
 
@@ -1793,7 +2084,7 @@ class domain(MeshUtils, Geometries):
         self._tag_edges: Dict[str, np.ndarray] = {}
         self._tag_triangles: Dict[str, np.ndarray] = {}
         self._boundary_regions: Dict[str, BoundaryRegion] = {}
-        #self._boundary_predicates: Dict[str, Callable] = {}
+        # self._boundary_predicates: Dict[str, Callable] = {}
 
         # Neural operator storage
         self.parameters: Dict[str, Any] = {}
@@ -1983,8 +2274,7 @@ class domain(MeshUtils, Geometries):
 
         return self
 
-    
-# FEM/ variational interface
+    # FEM/ variational interface
 
     def _estimate_boundary_tol(self, pts: np.ndarray) -> float:
         pts = np.asarray(pts)
@@ -1994,7 +2284,7 @@ class domain(MeshUtils, Geometries):
         bbox_max = np.max(pts, axis=0)
         diag = float(np.linalg.norm(bbox_max - bbox_min))
         return max(1e-8, 1e-10 * max(diag, 1.0))
- 
+
     def boundary_tags(self):
         """
         Return the available boundary tag names on the mesh.
@@ -2006,7 +2296,7 @@ class domain(MeshUtils, Geometries):
             Neumann conditions.
         """
         return sorted(self._boundary_registry.keys())
-    
+
     def dirichlet(self, tags, values=None):
         """
         Create a symbolic Dirichlet boundary-condition descriptor.
@@ -2026,10 +2316,7 @@ class domain(MeshUtils, Geometries):
         try:
             from .utils.fem_route import dirichlet as _dirichlet_bc
         except ImportError as e:
-            raise ImportError(
-                "FEM support is not available. Install the FEM/dev extras to use "
-                "domain.dirichlet(...) and init_fem(...)."
-            ) from e
+            raise ImportError("FEM support is not available. Install the FEM/dev extras to use " "domain.dirichlet(...) and init_fem(...).") from e
         return _dirichlet_bc(tags, values)
 
     def neumann(self, tags):
@@ -2049,12 +2336,9 @@ class domain(MeshUtils, Geometries):
         try:
             from .utils.fem_route import neumann as _neumann_bc
         except ImportError as e:
-            raise ImportError(
-                "FEM support is not available. Install the FEM/dev extras to use "
-                "domain.neumann(...) and init_fem(...)."
-            ) from e
+            raise ImportError("FEM support is not available. Install the FEM/dev extras to use " "domain.neumann(...) and init_fem(...).") from e
         return _neumann_bc(tags)
-    
+
     def _build_dirichlet_bc_info(self, dirichlet_tags, dirichlet_value_fns=None, vec: int = 1):
         """
         Build JAX-FEM Dirichlet boundary data from tagged user input.
@@ -2111,15 +2395,10 @@ class domain(MeshUtils, Geometries):
             # Case 3: list/tuple of callables, one per component
             if isinstance(spec, (list, tuple)):
                 if len(spec) != vec:
-                    raise ValueError(
-                        f"Dirichlet BC for tag '{tag}' has {len(spec)} component functions, "
-                        f"but vec={vec}."
-                    )
+                    raise ValueError(f"Dirichlet BC for tag '{tag}' has {len(spec)} component functions, " f"but vec={vec}.")
                 for c, fn in enumerate(spec):
                     if not callable(fn):
-                        raise TypeError(
-                            f"Dirichlet BC entry for tag '{tag}', component {c} is not callable."
-                        )
+                        raise TypeError(f"Dirichlet BC entry for tag '{tag}', component {c} is not callable.")
                     loc_fns.append(loc_fn)
                     vec_ids.append(c)
                     val_fns.append(fn)
@@ -2130,23 +2409,19 @@ class domain(MeshUtils, Geometries):
                 for c in sorted(spec.keys()):
                     fn = spec[c]
                     if not callable(fn):
-                        raise TypeError(
-                            f"Dirichlet BC entry for tag '{tag}', component {c} is not callable."
-                        )
+                        raise TypeError(f"Dirichlet BC entry for tag '{tag}', component {c} is not callable.")
                     loc_fns.append(loc_fn)
                     vec_ids.append(int(c))
                     val_fns.append(fn)
                 continue
 
-            raise TypeError(
-                f"Unsupported Dirichlet BC specification for tag '{tag}': {type(spec).__name__}"
-            )
+            raise TypeError(f"Unsupported Dirichlet BC specification for tag '{tag}': {type(spec).__name__}")
 
         if len(loc_fns) == 0:
             return [[lambda p: False], [0], [lambda p: 0.0]]
 
         return [loc_fns, vec_ids, val_fns]
-    
+
     def variational_symbols(self, value_shape=(), names=("u", "phi")):
         """
         Return generic variational symbols.
@@ -2196,7 +2471,7 @@ class domain(MeshUtils, Geometries):
             u, v = domain.fem_symbols(value_shape=(2,))
         """
         return self.variational_symbols(value_shape=value_shape, names=names)
-    
+
     def _register_variational_sample(
         self,
         sample_tag: str,
@@ -2229,16 +2504,16 @@ class domain(MeshUtils, Geometries):
         }
 
     def init_fem(
-                self,
-                element_type: str = "TRI3",
-                quad_degree: int = 2,
-                neumann_tags: List[str] = [],
-                dirichlet_tags: List[str] = [],
-                dirichlet_value_fns: dict | None = None,
-                fem_solver: bool = False,
-                vec: int = 1,
-                bcs=None,
-            ) -> "domain":
+        self,
+        element_type: str = "TRI3",
+        quad_degree: int = 2,
+        neumann_tags: List[str] = [],
+        dirichlet_tags: List[str] = [],
+        dirichlet_value_fns: dict | None = None,
+        fem_solver: bool = False,
+        vec: int = 1,
+        bcs=None,
+    ) -> "domain":
         """
         Initialize the JAX-FEM data associated with this domain.
 
@@ -2277,26 +2552,26 @@ class domain(MeshUtils, Geometries):
         import numpy as onp
         from jax_fem.problem import Problem
         from jax_fem.generate_mesh import Mesh
-        from scipy.spatial import KDTree # Ensuring this is available locally
+        from scipy.spatial import KDTree  # Ensuring this is available locally
         from .utils.fem_route import expand_bcs
+
         if bcs is not None:
             try:
                 from .utils.fem_route import expand_bcs
             except ImportError as e:
-                raise ImportError(
-                    "FEM support is not available. Install the FEM/dev extras to use init_fem(...)."
-                ) from e
+                raise ImportError("FEM support is not available. Install the FEM/dev extras to use init_fem(...).") from e
 
             if dirichlet_tags or neumann_tags or dirichlet_value_fns is not None:
-                raise ValueError(
-                    "Use either 'bcs=[...]' or the legacy "
-                    "'dirichlet_tags/neumann_tags/dirichlet_value_fns' arguments, not both."
-                )
+                raise ValueError("Use either 'bcs=[...]' or the legacy " "'dirichlet_tags/neumann_tags/dirichlet_value_fns' arguments, not both.")
 
             dirichlet_tags, dirichlet_value_fns, neumann_tags = expand_bcs(bcs, vec=vec)
-        meshio_type_map = {"TRI3": "triangle", "QUAD4": "quad", "TET4": "tetra",}
+        meshio_type_map = {
+            "TRI3": "triangle",
+            "QUAD4": "quad",
+            "TET4": "tetra",
+        }
         meshio_type = meshio_type_map.get(element_type)
-        jax_mesh = Mesh(self.mesh.points[:, :self.dimension], self.mesh.cells_dict[meshio_type])
+        jax_mesh = Mesh(self.mesh.points[:, : self.dimension], self.mesh.cells_dict[meshio_type])
 
         # --- Location functions for Neumann ---
         location_fns = []
@@ -2310,18 +2585,22 @@ class domain(MeshUtils, Geometries):
 
             valid_tags.append(tag)
             location_fns.append(loc_fn)
-        dirichlet_bc_info = self._build_dirichlet_bc_info(dirichlet_tags, dirichlet_value_fns, vec=vec,)
+        dirichlet_bc_info = self._build_dirichlet_bc_info(
+            dirichlet_tags,
+            dirichlet_value_fns,
+            vec=vec,
+        )
 
         class DummyProblem(Problem):
-            def get_tensor_map(self): 
+            def get_tensor_map(self):
                 return lambda x: x
-            
-            def get_mass_map(self): 
+
+            def get_mass_map(self):
                 return lambda x: x
-            
+
             def get_surface_maps(self):
                 return [lambda u, x: jnp.zeros((1,))] * len(location_fns)
-        
+
         prob = DummyProblem(
             jax_mesh,
             vec=vec,
@@ -2352,19 +2631,16 @@ class domain(MeshUtils, Geometries):
         for node_inds in getattr(fe, "node_inds_list", []):
             dirichlet_nodes.extend(np.asarray(node_inds).reshape(-1).tolist())
 
-        dirichlet_nodes = (
-            jnp.array(sorted(set(dirichlet_nodes)), dtype=jnp.int32)
-            if dirichlet_nodes else jnp.array([], dtype=jnp.int32)
-        )
+        dirichlet_nodes = jnp.array(sorted(set(dirichlet_nodes)), dtype=jnp.int32) if dirichlet_nodes else jnp.array([], dtype=jnp.int32)
         # --- Precompute Constants for Fast Assembly ---
         shape_vals_jax = jnp.asarray(fe.shape_vals)
         shape_grads_jax = jnp.asarray(fe.shape_grads)
         JxW_jax = jnp.asarray(fe.JxW)
         cells_jax = jnp.asarray(fe.cells, dtype=jnp.int32)
         flat_cells = cells_jax.flatten()
-        
+
         # Precompute Volume Normalization Areas (runs ONLY ONCE!)
-        local_areas = jnp.einsum('cq,qa->ca', JxW_jax, shape_vals_jax)
+        local_areas = jnp.einsum("cq,qa->ca", JxW_jax, shape_vals_jax)
         global_areas = jax.ops.segment_sum(local_areas.flatten(), flat_cells, num_segments=fe.num_total_nodes)
         num_cells, num_quads, num_local_nodes, dim = shape_grads_jax.shape
         N_flat = jnp.tile(shape_vals_jax[None, ...], (num_cells, 1, 1)).reshape(-1, num_local_nodes)
@@ -2373,15 +2649,15 @@ class domain(MeshUtils, Geometries):
         # Extract standard Volume Context
         self.fem_context = {
             "cells": cells_jax,
-            "flat_cells": flat_cells,               
-            "global_areas": global_areas,           
-            "N_flat": N_flat,                      
-            "dN_dx_flat": dN_dx_flat,               
+            "flat_cells": flat_cells,
+            "global_areas": global_areas,
+            "N_flat": N_flat,
+            "dN_dx_flat": dN_dx_flat,
             "JxW": JxW_jax,
             "num_total_nodes": fe.num_total_nodes,
             "boundary_nodes": jnp.asarray(self._extract_points_from_mesh(self.mesh), dtype=jnp.int32),
-            "dirichlet_nodes": dirichlet_nodes, 
-            "surface_data": {}
+            "dirichlet_nodes": dirichlet_nodes,
+            "surface_data": {},
         }
         self._mesh_pool["fem_gauss"] = jnp.asarray(fe.get_physical_quad_points()).reshape(-1, self.dimension)
         self._register_variational_sample(
@@ -2405,15 +2681,11 @@ class domain(MeshUtils, Geometries):
 
                 physical_coos = onp.take(fe.points, fe.cells, axis=0)
                 selected_coos = physical_coos[inds[:, 0]]
-                physical_face_quads = onp.einsum('fqn,fnd->fqd', face_shape_vals, selected_coos)
+                physical_face_quads = onp.einsum("fqn,fnd->fqd", face_shape_vals, selected_coos)
 
                 # Precompute boundary normalization areas for this Neumann tag
-                local_boundary_areas = jnp.einsum('fq,fqn->fn', jnp.asarray(nanson_scale), jnp.asarray(face_shape_vals))
-                global_boundary_areas = jax.ops.segment_sum(
-                    local_boundary_areas.flatten(),
-                    jnp.asarray(parent_cells, dtype=jnp.int32).flatten(),
-                    num_segments=fe.num_total_nodes
-                )
+                local_boundary_areas = jnp.einsum("fq,fqn->fn", jnp.asarray(nanson_scale), jnp.asarray(face_shape_vals))
+                global_boundary_areas = jax.ops.segment_sum(local_boundary_areas.flatten(), jnp.asarray(parent_cells, dtype=jnp.int32).flatten(), num_segments=fe.num_total_nodes)
 
                 quad_pts_flat_np = onp.asarray(physical_face_quads).reshape(-1, self.dimension)
                 quad_pts_flat = jnp.asarray(quad_pts_flat_np)
@@ -2451,15 +2723,12 @@ class domain(MeshUtils, Geometries):
                 )
                 self.log.info(f"jax-fem Nanson extraction: Matched {len(inds)} faces for '{tag}'")
         # ====================================================================
-        # THE FIX: Pad FEM arrays with Batch (B=1) and Time (T=1) dimensions 
-        # This prevents trace_compiler from mistaking the spatial/node 
+        # THE FIX: Pad FEM arrays with Batch (B=1) and Time (T=1) dimensions
+        # This prevents trace_compiler from mistaking the spatial/node
         # dimensions for the Batch dimension during vmap.
         # ====================================================================
 
-        keys_to_pad = [
-            "cells", "flat_cells", "global_areas", "N_flat", 
-            "dN_dx_flat", "JxW", "boundary_nodes", "dirichlet_nodes"
-        ]
+        keys_to_pad = ["cells", "flat_cells", "global_areas", "N_flat", "dN_dx_flat", "JxW", "boundary_nodes", "dirichlet_nodes"]
         for key in keys_to_pad:
             if key in self.fem_context and hasattr(self.fem_context[key], "ndim"):
                 self.fem_context[key] = jnp.expand_dims(self.fem_context[key], axis=(0, 1))
@@ -2471,9 +2740,8 @@ class domain(MeshUtils, Geometries):
                     s_data[skey] = jnp.expand_dims(s_arr, axis=(0, 1))
                 # Expose the integration arrays to jNO's trace evaluator
         self.context.update(self.fem_context)
-            
-        return self
 
+        return self
 
     def _make_tag_location_fn(self, tag):
         """
@@ -2495,7 +2763,6 @@ class domain(MeshUtils, Geometries):
             return None
         return lambda p: region.contains(p)
 
-
     def assemble_weak_form(self, expr, target="vpinn", **kwargs):
         """
         Assemble a symbolic weak form for the requested backend.
@@ -2515,8 +2782,9 @@ class domain(MeshUtils, Geometries):
             Assembled backend-specific representation of the weak form.
         """
         from .utils.weak_form import assemble_weak_form
+
         return assemble_weak_form(self, expr, target=target, **kwargs)
-   
+
     # Generators
     def _generate_mesh(self, geometry_func: Callable, algorithm: int):
         """Generate mesh using PyGmsh."""
@@ -2533,23 +2801,6 @@ class domain(MeshUtils, Geometries):
         self.mesh = mesh
         self.dimension = explicit_dim
         self.ds = ds
-
-    def _load_mesh(self, mesh_file: str):
-        """Load mesh from file using Meshio."""
-        import meshio
-
-        from pathlib import Path
-
-        if not Path(mesh_file).exists():
-            raise FileNotFoundError(f"Mesh file not found: {mesh_file}")
-
-        self.mesh = meshio.read(mesh_file)
-
-        points = self.mesh.points  # type: ignore[attr-defined]
-        if points.shape[1] == 3 and np.allclose(points[:, 2], 0):
-            self.dimension = 2
-        else:
-            self.dimension = points.shape[1]
 
     def _extract_points_from_mesh(self, mesh):
         """Extract points and normals from mesh and organize by tag."""
@@ -2710,7 +2961,7 @@ class domain(MeshUtils, Geometries):
                             tri_arr = np.asarray(tag_tris, dtype=int)
                             tri_coords = points[tri_arr][:, :, : self.dimension]
 
-                        #pred = self._boundary_predicates.get(name, None)
+                        # pred = self._boundary_predicates.get(name, None)
                         tol = self._estimate_boundary_tol(points[indices_list][:, : self.dimension])
 
                         self._boundary_regions[name] = BoundaryRegion(
@@ -2728,7 +2979,7 @@ class domain(MeshUtils, Geometries):
                             "point_indices": indices_list,
                             "points": points[indices_list],
                         }
-        #self._register_default_box_boundary_predicates()
+        # self._register_default_box_boundary_predicates()
         return boundary_indices
 
     def _add_time_dimension(self, t_start: float, t_end: float, n_time: int = 100):
@@ -2874,10 +3125,18 @@ class domain(MeshUtils, Geometries):
             fem_meta = getattr(self, "_variational_sampling_registry", {}).get(tag, None)
 
         # Create Variable placeholder for each spatial dimension
-        coord_vars: List[Any] = [Variable(tag=tag, dim=[i, i + 1], domain=self, axis="spatial",fem_meta=fem_meta) for i in range(self.dimension)]
+        coord_vars: List[Any] = [Variable(tag=tag, dim=[i, i + 1], domain=self, axis="spatial", fem_meta=fem_meta) for i in range(self.dimension)]
 
         # Always add temporal variable (constant 1 for stationary problems)
-        coord_vars.append(Variable(tag="__time__", dim=[0, 1], domain=self, axis="temporal", fem_meta=None,))
+        coord_vars.append(
+            Variable(
+                tag="__time__",
+                dim=[0, 1],
+                domain=self,
+                axis="temporal",
+                fem_meta=None,
+            )
+        )
 
         if normals:
             if reverse_normals:
