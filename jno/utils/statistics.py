@@ -1,4 +1,3 @@
-import matplotlib.pyplot as plt
 import numpy as np
 from .logger import get_logger
 
@@ -23,6 +22,7 @@ class statistics:
         Returns:
             self (for chaining)
         """
+        import matplotlib.pyplot as plt
 
         if not self.training_logs:
             self.log.warning("No training logs available. Run solve() first.")
