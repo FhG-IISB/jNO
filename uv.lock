@@ -538,6 +538,27 @@ epy = [
 ]
 
 [[package]]
+name = "fenics-basix"
+version = "0.10.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6c/4b/58d5367547014e0e728febb5e1e4f284252ac23c44de7c19b3b0ce8574df/fenics_basix-0.10.0.tar.gz", hash = "sha256:ce235edba8a6c38b0c84f7ae288286dde728df38e5626948c29e495b1f393a5a", size = 644097, upload-time = "2025-10-22T15:32:50.795Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/51/eb/1fba66377c66917a50664fc2f159283cf8a2a21f605473f7d4be79d1fe93/fenics_basix-0.10.0-cp311-cp311-macosx_10_14_x86_64.whl", hash = "sha256:63adf8e95691e556f8fbaaa2a3fda79e1e26b6de8ddf1c96043c0ef882edb388", size = 946894, upload-time = "2025-10-22T15:32:33.342Z" },
+    { url = "https://files.pythonhosted.org/packages/4a/48/fc00533ec730f4808a5d89585343a0d2bc0e01445f42ac98ea5252a64fd5/fenics_basix-0.10.0-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:2870fe63144b3cd47782e5db8c5d92f81ddb0277e51bcab7fc13f8b169e6778c", size = 793450, upload-time = "2025-10-22T15:32:34.901Z" },
+    { url = "https://files.pythonhosted.org/packages/36/d6/e38029cfe8c247ef4d59b19f7d64a7cc3e7bdea2d6011d3790731ee72486/fenics_basix-0.10.0-cp311-cp311-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:9ffd21951047e32816e3f6820cf33edabf5fdc40d7862b4db70301efc370014b", size = 5958297, upload-time = "2025-10-22T15:32:36.486Z" },
+    { url = "https://files.pythonhosted.org/packages/55/08/7114f634cf58a870857178c6b2b038d7f072cb42f7d7d970d1fda63480bf/fenics_basix-0.10.0-cp311-cp311-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:fc0a464eac7d42e815956397c3f1febec8e3d498826e9df01b1cff2b7737f1a9", size = 13040808, upload-time = "2025-10-22T15:32:38.181Z" },
+    { url = "https://files.pythonhosted.org/packages/3f/e9/847cfb98293186227b3cf1a827443026044dbb0c222cc8362071d97dd544/fenics_basix-0.10.0-cp311-cp311-win_amd64.whl", hash = "sha256:e84380852d8b6635f58d8e830d4e2ddacba3d14ffe9a7d5afa2f9e0992753f71", size = 6358642, upload-time = "2025-10-22T15:32:40.405Z" },
+    { url = "https://files.pythonhosted.org/packages/71/47/2688bd1351bec43b1f21699f246ad9f4f16aba0fad8646a5d0e7cf236cf6/fenics_basix-0.10.0-cp312-abi3-macosx_10_14_x86_64.whl", hash = "sha256:f070a6ba52b3e95be742cfa8ff9bbb1baac2710bd9fbb6d26d51f80a3ce1dee2", size = 946245, upload-time = "2025-10-22T15:32:42.412Z" },
+    { url = "https://files.pythonhosted.org/packages/48/6e/abdc698c8ac68cb1f18e4ee62690b6f671bdc519c14082a2a15d3abe0676/fenics_basix-0.10.0-cp312-abi3-macosx_11_0_arm64.whl", hash = "sha256:7913aacc5d2533e33ac34e6a251ea5f6c249a5d8f3f12c21e1026ccc918b604b", size = 792521, upload-time = "2025-10-22T15:32:43.667Z" },
+    { url = "https://files.pythonhosted.org/packages/16/7e/514616b208e0d7dd33ff7a514065bdb5f23114a998f65cabffac7022e383/fenics_basix-0.10.0-cp312-abi3-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:a80211f28dd2abc3b69de9e0c18de4e775244315648a1fd3e120f78db86d968b", size = 5954523, upload-time = "2025-10-22T15:32:45.009Z" },
+    { url = "https://files.pythonhosted.org/packages/f7/18/0c4060f99abfbdf4caa72ee6492d726801d5b1daf31d48e899ecdb306035/fenics_basix-0.10.0-cp312-abi3-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:bb8f303117eea3c56b2724e846afd0a88c629a9c06c121b26ce1b19e82005be2", size = 13036876, upload-time = "2025-10-22T15:32:47.327Z" },
+    { url = "https://files.pythonhosted.org/packages/86/c9/69e1566469d8198f85e616e40ec0ec3617406d13b6a642beb44530766a36/fenics_basix-0.10.0-cp312-abi3-win_amd64.whl", hash = "sha256:f624fe004c97d65fca54bde4782063b0a1be401d5d9f4f6550e7f157149cee00", size = 6356838, upload-time = "2025-10-22T15:32:49.315Z" },
+]
+
+[[package]]
 name = "flake8"
 version = "7.3.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1112,6 +1133,11 @@ with-cuda = [
 ]
 
 [[package]]
+name = "jax-fem"
+version = "0.0.11"
+source = { git = "https://github.com/FhG-IISB/jax-fem#f673d51488ff62998e7f68014343dafaac62dd07" }
+
+[[package]]
 name = "jax-morph"
 version = "0.1.0"
 source = { git = "https://github.com/armbrusl/jax_morph#45ba0485c61bba2bc51b1bda85e2f6f2aa0d25a6" }
@@ -1193,15 +1219,25 @@ cuda = [
 ]
 dev = [
     { name = "black" },
+    { name = "fenics-basix" },
     { name = "flake8" },
     { name = "flax" },
+    { name = "jax-fem" },
+    { name = "lineax" },
     { name = "matplotlib" },
     { name = "mypy" },
     { name = "nevergrad" },
     { name = "paramax" },
+    { name = "pyfiglet" },
     { name = "pylotte" },
     { name = "pytest" },
     { name = "xprof" },
+]
+fem = [
+    { name = "fenics-basix" },
+    { name = "jax-fem" },
+    { name = "lineax" },
+    { name = "pyfiglet" },
 ]
 foundation = [
     { name = "jax-morph" },
@@ -1223,26 +1259,34 @@ requires-dist = [
     { name = "cloudpickle" },
     { name = "einops" },
     { name = "equinox" },
+    { name = "fenics-basix", marker = "extra == 'dev'" },
+    { name = "fenics-basix", marker = "extra == 'fem'" },
     { name = "flake8", marker = "extra == 'dev'", specifier = ">=4.0" },
     { name = "flax", marker = "extra == 'dev'" },
     { name = "iree-base-compiler", marker = "extra == 'iree'" },
     { name = "iree-base-runtime", marker = "extra == 'iree'" },
     { name = "jax" },
     { name = "jax", extras = ["cuda12"], marker = "extra == 'cuda'" },
+    { name = "jax-fem", marker = "extra == 'dev'", git = "https://github.com/FhG-IISB/jax-fem" },
+    { name = "jax-fem", marker = "extra == 'fem'", git = "https://github.com/FhG-IISB/jax-fem" },
     { name = "jax-morph", marker = "extra == 'foundation'", git = "https://github.com/armbrusl/jax_morph" },
     { name = "jax-mpp", marker = "extra == 'foundation'", git = "https://github.com/armbrusl/jax_mpp" },
+    { name = "lineax", marker = "extra == 'dev'" },
+    { name = "lineax", marker = "extra == 'fem'" },
     { name = "maskx" },
     { name = "matplotlib", marker = "extra == 'dev'" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=0.950" },
     { name = "nevergrad", marker = "extra == 'dev'" },
     { name = "optax" },
     { name = "paramax", marker = "extra == 'dev'" },
+    { name = "pyfiglet", marker = "extra == 'dev'" },
+    { name = "pyfiglet", marker = "extra == 'fem'" },
     { name = "pygmsh" },
     { name = "pylotte", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "xprof", marker = "extra == 'dev'" },
 ]
-provides-extras = ["cuda", "dev", "iree", "foundation"]
+provides-extras = ["cuda", "dev", "iree", "foundation", "fem"]
 
 [package.metadata.requires-dev]
 dev = [{ name = "jno", virtual = "." }]
@@ -1359,6 +1403,21 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/d9/83/b2cfe8e76ff5c1c77f8a53da3d5de62d04b5ebf7cf913e37f8bca43b5d07/librt-0.7.8-cp313-cp313-win32.whl", hash = "sha256:b09c52ed43a461994716082ee7d87618096851319bf695d57ec123f2ab708951", size = 44126, upload-time = "2026-01-14T12:55:31.44Z" },
     { url = "https://files.pythonhosted.org/packages/a9/0b/c59d45de56a51bd2d3a401fc63449c0ac163e4ef7f523ea8b0c0dee86ec5/librt-0.7.8-cp313-cp313-win_amd64.whl", hash = "sha256:f8f4a901a3fa28969d6e4519deceab56c55a09d691ea7b12ca830e2fa3461e34", size = 50262, upload-time = "2026-01-14T12:55:33.01Z" },
     { url = "https://files.pythonhosted.org/packages/fc/b9/973455cec0a1ec592395250c474164c4a58ebf3e0651ee920fef1a2623f1/librt-0.7.8-cp313-cp313-win_arm64.whl", hash = "sha256:43d4e71b50763fcdcf64725ac680d8cfa1706c928b844794a7aa0fa9ac8e5f09", size = 43600, upload-time = "2026-01-14T12:55:34.054Z" },
+]
+
+[[package]]
+name = "lineax"
+version = "0.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "equinox" },
+    { name = "jax" },
+    { name = "jaxtyping" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/35/d6/4e28416a6fe58dd6bc7565b1ffa330f4d0ba7d74212642b1b734c511299e/lineax-0.1.0.tar.gz", hash = "sha256:5f1a8f060142af2cdbf7d66b99e8d3071c3aa734b677df6339df4b4c4c0554d2", size = 50209, upload-time = "2026-01-27T21:17:26.652Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/80/0c/2ed47112fc1958a0a81c9b015d4e1861953a1ec3a17b081c0180a25ce82c/lineax-0.1.0-py3-none-any.whl", hash = "sha256:f00911c6b07d427c4835db46856970c8348bc82a035b51f4386ad09382af957a", size = 74600, upload-time = "2026-01-27T21:17:25.33Z" },
 ]
 
 [[package]]
@@ -2310,6 +2369,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/1b/7d/92392ff7815c21062bea51aa7b87d45576f649f16458d78b7cf94b9ab2e6/pycparser-3.0.tar.gz", hash = "sha256:600f49d217304a5902ac3c37e1281c9fe94e4d0489de643a9504c5cdfdfc6b29", size = 103492, upload-time = "2026-01-21T14:26:51.89Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/0c/c3/44f3fbbfa403ea2a7c779186dc20772604442dde72947e7d01069cbe98e3/pycparser-3.0-py3-none-any.whl", hash = "sha256:b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992", size = 48172, upload-time = "2026-01-21T14:26:50.693Z" },
+]
+
+[[package]]
+name = "pyfiglet"
+version = "1.0.4"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c8/e3/0a86276ad2c383ce08d76110a8eec2fe22e7051c4b8ba3fa163a0b08c428/pyfiglet-1.0.4.tar.gz", hash = "sha256:db9c9940ed1bf3048deff534ed52ff2dafbbc2cd7610b17bb5eca1df6d4278ef", size = 1560615, upload-time = "2025-08-15T18:32:47.302Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9f/5c/fe9f95abd5eaedfa69f31e450f7e2768bef121dbdf25bcddee2cd3087a16/pyfiglet-1.0.4-py3-none-any.whl", hash = "sha256:65b57b7a8e1dff8a67dc8e940a117238661d5e14c3e49121032bd404d9b2b39f", size = 1806118, upload-time = "2025-08-15T18:32:45.556Z" },
 ]
 
 [[package]]
