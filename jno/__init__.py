@@ -8,8 +8,9 @@ jNO: Physics-Informed Neural Operators.
 
 from .core import core
 from .domain import domain
+from .utils.fem_route import dirichlet, neumann
 from .resampling import sampler
-from .trace import Variable, Placeholder, OperationDef, OperationCall, Model, Hessian, Jacobian
+from .trace import Variable, Placeholder, OperationDef, OperationCall, Model, Hessian, Jacobian, TestFunction, TrialFunction, Assembly, FemLinearSystem, GroupedAssembly, FemResidualOperator
 from .utils.adaptive import LearningRateSchedule, WeightSchedule
 from .utils import callbacks, Logger, init_default_logger as logger, IREEModel as iree
 from .utils.config import (
@@ -68,4 +69,12 @@ __all__ = [
     "get_rsa_public_key",
     "get_rsa_private_key",
     "get_seed",
+    "TestFunction",
+    "TrialFunction",
+    "Assembly",
+    "FemLinearSystem",
+    "GroupedAssembly",
+    "FemResidualOperator",
+    "dirichlet",
+    "neumann",
 ]

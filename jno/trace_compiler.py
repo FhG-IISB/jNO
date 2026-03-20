@@ -38,6 +38,8 @@ from .trace import (
     TunableModuleCall,
     Choice,
     Variable,
+    Assembly,
+    GroupedAssembly,
 )
 
 
@@ -149,6 +151,13 @@ class TraceCompiler:
                         visit(arg)
             elif isinstance(node, (Hessian, Jacobian)):
                 visit(node.target)
+            elif isinstance(node, Assembly):
+                visit(node.expr)
+            elif isinstance(node, GroupedAssembly):
+                if node.volume_expr is not None:
+                    visit(node.volume_expr)
+                for bnd_expr in node.boundary_exprs.values():
+                    visit(bnd_expr)
 
         visit(expr)
         return layers

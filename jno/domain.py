@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import meshio
 import cloudpickle
 
-from .trace import Variable, TensorTag
+from .trace import Variable, TensorTag, Literal, BinaryOp, FunctionCall, Jacobian, TestFunction, TrialFunction, Constant, FemLinearSystem, Assembly
 from .utils.logger import get_logger, Logger
 
 
@@ -1685,6 +1685,76 @@ class MeshUtils:
         return area, grad_phi
 
 
+@dataclass
+class BoundaryRegion:
+    tag: str
+    dim: int
+    points: np.ndarray
+    edges: Optional[np.ndarray] = None
+    triangles: Optional[np.ndarray] = None
+    tol: float = 1e-8
+
+    def contains(self, p):
+        import jax.numpy as jnp
+
+        p = jnp.asarray(p)[: self.dim]
+
+        # 2D: segment membership
+        if self.dim == 2 and self.edges is not None and len(self.edges) > 0:
+            a = jnp.asarray(self.edges[:, 0, :])  # (E,2)
+            b = jnp.asarray(self.edges[:, 1, :])  # (E,2)
+
+            ab = b - a
+            ap = p[None, :] - a
+
+            ab_len2 = jnp.sum(ab * ab, axis=1)
+            ab_len2 = jnp.maximum(ab_len2, 1e-30)
+
+            t = jnp.sum(ap * ab, axis=1) / ab_len2
+            t = jnp.clip(t, 0.0, 1.0)
+
+            proj = a + t[:, None] * ab
+            dist2 = jnp.sum((proj - p[None, :]) ** 2, axis=1)
+            return jnp.any(dist2 <= self.tol * self.tol)
+
+        # 3D: triangle membership
+        if self.dim == 3 and self.triangles is not None and len(self.triangles) > 0:
+            a = jnp.asarray(self.triangles[:, 0, :])  # (T,3)
+            b = jnp.asarray(self.triangles[:, 1, :])
+            c = jnp.asarray(self.triangles[:, 2, :])
+
+            ab = b - a
+            ac = c - a
+            ap = p[None, :] - a
+
+            n = jnp.cross(ab, ac)
+            n_norm = jnp.linalg.norm(n, axis=1)
+            n_norm = jnp.maximum(n_norm, 1e-30)
+
+            plane_dist = jnp.abs(jnp.sum(ap * n, axis=1)) / n_norm
+
+            d00 = jnp.sum(ab * ab, axis=1)
+            d01 = jnp.sum(ab * ac, axis=1)
+            d11 = jnp.sum(ac * ac, axis=1)
+            d20 = jnp.sum(ap * ab, axis=1)
+            d21 = jnp.sum(ap * ac, axis=1)
+
+            denom = d00 * d11 - d01 * d01
+            denom = jnp.maximum(denom, 1e-30)
+
+            v = (d11 * d20 - d01 * d21) / denom
+            w = (d00 * d21 - d01 * d20) / denom
+            u = 1.0 - v - w
+
+            inside = (u >= -1e-8) & (v >= -1e-8) & (w >= -1e-8)
+            return jnp.any((plane_dist <= self.tol) & inside)
+
+        # fallback only if no explicit entities are available
+        pts = jnp.asarray(self.points[:, : self.dim])
+        d = jnp.linalg.norm(pts - p[None, :], axis=1)
+        return jnp.any(d <= self.tol)
+
+
 class MeshIOMixin(MeshUtils):
     """Mesh loading and export helpers shared by domain-like classes."""
 
@@ -2010,6 +2080,11 @@ class domain(MeshIOMixin, Geometries):
         self.context: Dict[str, Any] = {}  # unified: spatial (B,N,D) + params (B,F)
         self._param_tags: set = set()  # tags that are parametric (TensorTag)
         self.normals_by_tag: Dict[str, np.ndarray] = {}
+        self._boundary_registry: Dict[str, Dict[str, Any]] = {}
+        self._tag_edges: Dict[str, np.ndarray] = {}
+        self._tag_triangles: Dict[str, np.ndarray] = {}
+        self._boundary_regions: Dict[str, BoundaryRegion] = {}
+        # self._boundary_predicates: Dict[str, Callable] = {}
 
         # Neural operator storage
         self.parameters: Dict[str, Any] = {}
@@ -2199,8 +2274,518 @@ class domain(MeshIOMixin, Geometries):
 
         return self
 
-    # Generators
+    # FEM/ variational interface
 
+    def _estimate_boundary_tol(self, pts: np.ndarray) -> float:
+        pts = np.asarray(pts)
+        if pts.size == 0:
+            return 1e-8
+        bbox_min = np.min(pts, axis=0)
+        bbox_max = np.max(pts, axis=0)
+        diag = float(np.linalg.norm(bbox_max - bbox_min))
+        return max(1e-8, 1e-10 * max(diag, 1.0))
+
+    def boundary_tags(self):
+        """
+        Return the available boundary tag names on the mesh.
+
+        Returns
+        -------
+        list[str]
+            Registered boundary tags that can be used for Dirichlet or
+            Neumann conditions.
+        """
+        return sorted(self._boundary_registry.keys())
+
+    def dirichlet(self, tags, values=None):
+        """
+        Create a symbolic Dirichlet boundary-condition descriptor.
+
+        Parameters
+        ----------
+        tags : str | list[str]
+            Boundary tag or tags where the condition is applied.
+        values : callable | list[callable] | dict[int, callable] | None, optional
+            Prescribed boundary values. ``None`` gives a homogeneous condition.
+
+        Returns
+        -------
+        object
+            Boundary-condition descriptor for use with ``init_fem(..., bcs=...)``.
+        """
+        try:
+            from .utils.fem_route import dirichlet as _dirichlet_bc
+        except ImportError as e:
+            raise ImportError("FEM support is not available. Install the FEM/dev extras to use " "domain.dirichlet(...) and init_fem(...).") from e
+        return _dirichlet_bc(tags, values)
+
+    def neumann(self, tags):
+        """
+        Create a symbolic Neumann boundary-condition descriptor.
+
+        Parameters
+        ----------
+        tags : str | list[str]
+            Boundary tag or tags where the condition is active.
+
+        Returns
+        -------
+        object
+            Boundary-condition descriptor for use with ``init_fem(..., bcs=...)``.
+        """
+        try:
+            from .utils.fem_route import neumann as _neumann_bc
+        except ImportError as e:
+            raise ImportError("FEM support is not available. Install the FEM/dev extras to use " "domain.neumann(...) and init_fem(...).") from e
+        return _neumann_bc(tags)
+
+    def _build_dirichlet_bc_info(self, dirichlet_tags, dirichlet_value_fns=None, vec: int = 1):
+        """
+        Build JAX-FEM Dirichlet boundary data from tagged user input.
+
+        Parameters
+        ----------
+        dirichlet_tags : list[str]
+            Boundary tags with Dirichlet constraints.
+        dirichlet_value_fns : dict | None, optional
+            Mapping from tag to value function definition.
+        vec : int, default=1
+            Number of field components.
+
+        Returns
+        -------
+        list
+            JAX-FEM ``dirichlet_bc_info`` in the form
+            ``[location_fns, vec_ids, value_fns]``.
+        """
+        if dirichlet_value_fns is None:
+            dirichlet_value_fns = {}
+
+        loc_fns = []
+        vec_ids = []
+        val_fns = []
+
+        def zero_fn(p):
+            return 0.0
+
+        for tag in dirichlet_tags:
+            loc_fn = self._make_tag_location_fn(tag)
+            if loc_fn is None:
+                self.log.warning(f"Dirichlet tag '{tag}' not found in mesh tags. Skipping.")
+                continue
+
+            spec = dirichlet_value_fns.get(tag, None)
+
+            # Case 1: no user-specified BC -> zero on all components
+            if spec is None:
+                for c in range(vec):
+                    loc_fns.append(loc_fn)
+                    vec_ids.append(c)
+                    val_fns.append(zero_fn)
+                continue
+
+            # Case 2: scalar callable -> apply only to component 0
+            # (keeps old scalar behaviour unchanged)
+            if callable(spec):
+                loc_fns.append(loc_fn)
+                vec_ids.append(0)
+                val_fns.append(spec)
+                continue
+
+            # Case 3: list/tuple of callables, one per component
+            if isinstance(spec, (list, tuple)):
+                if len(spec) != vec:
+                    raise ValueError(f"Dirichlet BC for tag '{tag}' has {len(spec)} component functions, " f"but vec={vec}.")
+                for c, fn in enumerate(spec):
+                    if not callable(fn):
+                        raise TypeError(f"Dirichlet BC entry for tag '{tag}', component {c} is not callable.")
+                    loc_fns.append(loc_fn)
+                    vec_ids.append(c)
+                    val_fns.append(fn)
+                continue
+
+            # Case 4: dict {component_id: callable}
+            if isinstance(spec, dict):
+                for c in sorted(spec.keys()):
+                    fn = spec[c]
+                    if not callable(fn):
+                        raise TypeError(f"Dirichlet BC entry for tag '{tag}', component {c} is not callable.")
+                    loc_fns.append(loc_fn)
+                    vec_ids.append(int(c))
+                    val_fns.append(fn)
+                continue
+
+            raise TypeError(f"Unsupported Dirichlet BC specification for tag '{tag}': {type(spec).__name__}")
+
+        if len(loc_fns) == 0:
+            return [[lambda p: False], [0], [lambda p: 0.0]]
+
+        return [loc_fns, vec_ids, val_fns]
+
+    def variational_symbols(self, value_shape=(), names=("u", "phi")):
+        """
+        Return generic variational symbols.
+
+        Parameters
+        ----------
+        value_shape : tuple, default=()
+            Shape of the field value at one spatial point:
+            ()    -> scalar
+            (2,)  -> 2D vector
+            (3,)  -> 3D vector
+        names : tuple[str, str]
+            Names of the trial and test symbols.
+
+        Returns
+        -------
+        (trial, test)
+            Symbolic variational placeholders carrying shape metadata.
+
+        Examples
+        --------
+        Scalar Poisson:
+            u, phi = domain.fem_symbols()
+
+        2D vector elasticity:
+            u, v = domain.fem_symbols(value_shape=(2,))
+
+        3D vector elasticity:
+            u, v = domain.fem_symbols(value_shape=(3,))
+        """
+        trial_name, test_name = names
+        return (
+            TrialFunction(name=trial_name, value_shape=value_shape),
+            TestFunction(name=test_name, value_shape=value_shape),
+        )
+
+    def fem_symbols(self, value_shape=(), names=("u", "phi")):
+        """
+        Backward-compatible alias for variational_symbols().
+
+        Examples
+        --------
+        Scalar:
+            u, phi = domain.fem_symbols()
+
+        Vector:
+            u, v = domain.fem_symbols(value_shape=(2,))
+        """
+        return self.variational_symbols(value_shape=value_shape, names=names)
+
+    def _register_variational_sample(
+        self,
+        sample_tag: str,
+        support: str,
+        region_id: str,
+        context_tag: str | None = None,
+    ):
+        """
+        Register one sampled quadrature/surface tag as a variational region.
+
+        Parameters
+        ----------
+        sample_tag : str
+            User-facing / variable-facing tag used in domain.variable(...)
+            e.g. "fem_gauss", "gauss_right", "gauss_wall_3"
+        support : str
+            "volume" or "boundary"
+        region_id : str
+            Geometry-level region id, e.g. "volume", "right", "wall_3", ...
+        context_tag : str | None
+            Internal context key if different from sample_tag.
+        """
+        if not hasattr(self, "_variational_sampling_registry"):
+            self._variational_sampling_registry = {}
+
+        self._variational_sampling_registry[sample_tag] = {
+            "support": support,
+            "region_id": region_id,
+            "context_tag": context_tag if context_tag is not None else sample_tag,
+        }
+
+    def init_fem(
+        self,
+        element_type: str = "TRI3",
+        quad_degree: int = 2,
+        neumann_tags: List[str] = [],
+        dirichlet_tags: List[str] = [],
+        dirichlet_value_fns: dict | None = None,
+        fem_solver: bool = False,
+        vec: int = 1,
+        bcs=None,
+    ) -> "domain":
+        """
+        Initialize the JAX-FEM data associated with this domain.
+
+        This sets up the FEM mesh, boundary-condition data, quadrature data,
+        and cached tensors needed for weak-form assembly and FEM solves.
+
+        Parameters
+        ----------
+        element_type : str, default="TRI3"
+            Finite-element type used by JAX-FEM.
+        quad_degree : int, default=2
+            Quadrature degree for volume and boundary integration.
+        neumann_tags : list[str], optional
+            Boundary tags used for Neumann or surface terms.
+        dirichlet_tags : list[str], optional
+            Boundary tags with Dirichlet constraints.
+        dirichlet_value_fns : dict | None, optional
+            Prescribed Dirichlet value functions by boundary tag.
+        fem_solver : bool, default=False
+            Whether to enable FEM-solver mode.
+        vec : int, default=1
+            Number of field components.
+        bcs : list | None, optional
+            New-style boundary-condition descriptors.
+
+        Returns
+        -------
+        domain
+            The current domain with FEM context initialized.
+        """
+        if self.mesh is None:
+            raise ValueError("Mesh must be loaded before initializing FEM context.")
+        self._variational_initialized = True
+        self._variational_sampling_registry = {}
+        import jax.numpy as jnp
+        import numpy as onp
+        from jax_fem.problem import Problem
+        from jax_fem.generate_mesh import Mesh
+        from scipy.spatial import KDTree  # Ensuring this is available locally
+        from .utils.fem_route import expand_bcs
+
+        if bcs is not None:
+            try:
+                from .utils.fem_route import expand_bcs
+            except ImportError as e:
+                raise ImportError("FEM support is not available. Install the FEM/dev extras to use init_fem(...).") from e
+
+            if dirichlet_tags or neumann_tags or dirichlet_value_fns is not None:
+                raise ValueError("Use either 'bcs=[...]' or the legacy " "'dirichlet_tags/neumann_tags/dirichlet_value_fns' arguments, not both.")
+
+            dirichlet_tags, dirichlet_value_fns, neumann_tags = expand_bcs(bcs, vec=vec)
+        meshio_type_map = {
+            "TRI3": "triangle",
+            "QUAD4": "quad",
+            "TET4": "tetra",
+        }
+        meshio_type = meshio_type_map.get(element_type)
+        jax_mesh = Mesh(self.mesh.points[:, : self.dimension], self.mesh.cells_dict[meshio_type])
+
+        # --- Location functions for Neumann ---
+        location_fns = []
+        valid_tags = []
+
+        for tag in neumann_tags:
+            loc_fn = self._make_tag_location_fn(tag)
+            if loc_fn is None:
+                self.log.warning(f"Neumann tag '{tag}' not found in mesh tags. Skipping.")
+                continue
+
+            valid_tags.append(tag)
+            location_fns.append(loc_fn)
+        dirichlet_bc_info = self._build_dirichlet_bc_info(
+            dirichlet_tags,
+            dirichlet_value_fns,
+            vec=vec,
+        )
+
+        class DummyProblem(Problem):
+            def get_tensor_map(self):
+                return lambda x: x
+
+            def get_mass_map(self):
+                return lambda x: x
+
+            def get_surface_maps(self):
+                return [lambda u, x: jnp.zeros((1,))] * len(location_fns)
+
+        prob = DummyProblem(
+            jax_mesh,
+            vec=vec,
+            dim=self.dimension,
+            ele_type=element_type,
+            gauss_order=quad_degree,
+            dirichlet_bc_info=dirichlet_bc_info,
+            location_fns=location_fns,
+        )
+        self._fem_solver_enabled = bool(fem_solver)
+        self._jaxfem_solver_context = {
+            "mesh": jax_mesh,
+            "element_type": element_type,
+            "quad_degree": quad_degree,
+            "location_fns": location_fns,
+            "valid_neumann_tags": list(valid_tags),
+            "dirichlet_tags": list(dirichlet_tags),
+            "dirichlet_bc_info": dirichlet_bc_info,
+            "dummy_problem": prob,
+            "dim": self.dimension,
+            "default_vec": vec,
+        }
+
+        fe = prob.fes[0]
+
+        # --- Identify Dirichlet node indices ---
+        dirichlet_nodes = []
+        for node_inds in getattr(fe, "node_inds_list", []):
+            dirichlet_nodes.extend(np.asarray(node_inds).reshape(-1).tolist())
+
+        dirichlet_nodes = jnp.array(sorted(set(dirichlet_nodes)), dtype=jnp.int32) if dirichlet_nodes else jnp.array([], dtype=jnp.int32)
+        # --- Precompute Constants for Fast Assembly ---
+        shape_vals_jax = jnp.asarray(fe.shape_vals)
+        shape_grads_jax = jnp.asarray(fe.shape_grads)
+        JxW_jax = jnp.asarray(fe.JxW)
+        cells_jax = jnp.asarray(fe.cells, dtype=jnp.int32)
+        flat_cells = cells_jax.flatten()
+
+        # Precompute Volume Normalization Areas (runs ONLY ONCE!)
+        local_areas = jnp.einsum("cq,qa->ca", JxW_jax, shape_vals_jax)
+        global_areas = jax.ops.segment_sum(local_areas.flatten(), flat_cells, num_segments=fe.num_total_nodes)
+        num_cells, num_quads, num_local_nodes, dim = shape_grads_jax.shape
+        N_flat = jnp.tile(shape_vals_jax[None, ...], (num_cells, 1, 1)).reshape(-1, num_local_nodes)
+        dN_dx_flat = shape_grads_jax.reshape(-1, num_local_nodes, dim)
+
+        # Extract standard Volume Context
+        self.fem_context = {
+            "cells": cells_jax,
+            "flat_cells": flat_cells,
+            "global_areas": global_areas,
+            "N_flat": N_flat,
+            "dN_dx_flat": dN_dx_flat,
+            "JxW": JxW_jax,
+            "num_total_nodes": fe.num_total_nodes,
+            "boundary_nodes": jnp.asarray(self._extract_points_from_mesh(self.mesh), dtype=jnp.int32),
+            "dirichlet_nodes": dirichlet_nodes,
+            "surface_data": {},
+        }
+        self._mesh_pool["fem_gauss"] = jnp.asarray(fe.get_physical_quad_points()).reshape(-1, self.dimension)
+        self._register_variational_sample(
+            sample_tag="fem_gauss",
+            support="volume",
+            region_id="volume",
+            context_tag="fem_gauss",
+        )
+        self._fem_dirichlet_tags = list(dirichlet_tags)
+        self._fem_neumann_tags = list(neumann_tags)
+        self._fem_dirichlet_value_fns = dirichlet_value_fns if dirichlet_value_fns is not None else {}
+        # --- Extract Native jax-fem Nanson Scales for Neumann ---
+        for i, tag in enumerate(valid_tags):
+            inds = prob.boundary_inds_list[i]
+            if len(inds) > 0:
+                _, nanson_scale = fe.get_face_shape_grads(inds)
+
+                parent_cells = fe.cells[inds[:, 0]]
+                face_ids = inds[:, 1]
+                face_shape_vals = fe.face_shape_vals[face_ids]
+
+                physical_coos = onp.take(fe.points, fe.cells, axis=0)
+                selected_coos = physical_coos[inds[:, 0]]
+                physical_face_quads = onp.einsum("fqn,fnd->fqd", face_shape_vals, selected_coos)
+
+                # Precompute boundary normalization areas for this Neumann tag
+                local_boundary_areas = jnp.einsum("fq,fqn->fn", jnp.asarray(nanson_scale), jnp.asarray(face_shape_vals))
+                global_boundary_areas = jax.ops.segment_sum(local_boundary_areas.flatten(), jnp.asarray(parent_cells, dtype=jnp.int32).flatten(), num_segments=fe.num_total_nodes)
+
+                quad_pts_flat_np = onp.asarray(physical_face_quads).reshape(-1, self.dimension)
+                quad_pts_flat = jnp.asarray(quad_pts_flat_np)
+
+                # Map quadrature points to boundary normals using nearest tagged boundary point.
+                quad_normals = None
+                if tag in self.normals_by_tag and tag in self._mesh_pool:
+                    tag_pts_np = onp.asarray(self._mesh_pool[tag])[:, : self.dimension]
+                    tag_nrm_np = onp.asarray(self.normals_by_tag[tag])[:, : self.dimension]
+
+                    if len(tag_pts_np) == len(tag_nrm_np) and len(tag_pts_np) > 0:
+                        tree = KDTree(tag_pts_np)
+                        _, nn_idx = tree.query(quad_pts_flat_np)
+                        quad_normals_np = tag_nrm_np[onp.asarray(nn_idx, dtype=int)]
+                        quad_normals = jnp.asarray(quad_normals_np)
+
+                        # expose normals on the quadrature tag so domain.variable("gauss_tag", normals=True) works
+                        self.normals_by_tag[f"gauss_{tag}"] = quad_normals_np
+
+                self.fem_context["surface_data"][tag] = {
+                    "flat_parent_nodes": jnp.asarray(parent_cells, dtype=jnp.int32).flatten(),
+                    "face_shape_vals": jnp.asarray(face_shape_vals),
+                    "nanson_scale": jnp.asarray(nanson_scale),
+                    "global_boundary_areas": global_boundary_areas,
+                    "quad_points": quad_pts_flat,
+                    "quad_normals": quad_normals,
+                }
+
+                self._mesh_pool[f"gauss_{tag}"] = quad_pts_flat
+                self._register_variational_sample(
+                    sample_tag=f"gauss_{tag}",
+                    support="boundary",
+                    region_id=tag,
+                    context_tag=f"gauss_{tag}",
+                )
+                self.log.info(f"jax-fem Nanson extraction: Matched {len(inds)} faces for '{tag}'")
+        # ====================================================================
+        # THE FIX: Pad FEM arrays with Batch (B=1) and Time (T=1) dimensions
+        # This prevents trace_compiler from mistaking the spatial/node
+        # dimensions for the Batch dimension during vmap.
+        # ====================================================================
+
+        keys_to_pad = ["cells", "flat_cells", "global_areas", "N_flat", "dN_dx_flat", "JxW", "boundary_nodes", "dirichlet_nodes"]
+        for key in keys_to_pad:
+            if key in self.fem_context and hasattr(self.fem_context[key], "ndim"):
+                self.fem_context[key] = jnp.expand_dims(self.fem_context[key], axis=(0, 1))
+
+        # Also pad the nested jax-fem surface/neumann arrays if they exist
+        for tag_name, s_data in self.fem_context.get("surface_data", {}).items():
+            for skey, s_arr in s_data.items():
+                if hasattr(s_arr, "ndim"):
+                    s_data[skey] = jnp.expand_dims(s_arr, axis=(0, 1))
+                # Expose the integration arrays to jNO's trace evaluator
+        self.context.update(self.fem_context)
+
+        return self
+
+    def _make_tag_location_fn(self, tag):
+        """
+        Build a point-membership function for a boundary tag.
+
+        Parameters
+        ----------
+        tag : str
+            Boundary tag name.
+
+        Returns
+        -------
+        callable | None
+            Function returning whether a point belongs to the tagged region,
+            or ``None`` if the tag is unknown.
+        """
+        region = self._boundary_regions.get(tag, None)
+        if region is None:
+            return None
+        return lambda p: region.contains(p)
+
+    def assemble_weak_form(self, expr, target="vpinn", **kwargs):
+        """
+        Assemble a symbolic weak form for the requested backend.
+
+        Parameters
+        ----------
+        expr : object
+            Symbolic weak-form expression.
+        target : str, default="vpinn"
+            Assembly backend or lowering target.
+        **kwargs
+            Additional backend-specific options.
+
+        Returns
+        -------
+        object
+            Assembled backend-specific representation of the weak form.
+        """
+        from .utils.weak_form import assemble_weak_form
+
+        return assemble_weak_form(self, expr, target=target, **kwargs)
+
+    # Generators
     def _generate_mesh(self, geometry_func: Callable, algorithm: int):
         """Generate mesh using PyGmsh."""
         import pygmsh
@@ -2223,6 +2808,11 @@ class domain(MeshIOMixin, Geometries):
         points = mesh.points[:, : self.dimension]
         self.points = points
         self._mesh_pool = {}
+        self._boundary_registry = {}
+        self.tag_indices = {}
+        self._tag_edges = {}
+        self._tag_triangles = {}
+        self._boundary_regions = {}
 
         if self.dimension > 1:
             boundary_normals, boundary_indices = self.get_boundary_normals(mesh)
@@ -2315,6 +2905,8 @@ class domain(MeshIOMixin, Geometries):
 
                 if tag_tris:
                     self._tag_triangles[name] = np.array(tag_tris, dtype=int)
+                if tag_edges:
+                    self._tag_edges[name] = np.array(tag_edges, dtype=int)
 
                 if tag_points:
                     if tag_edges:
@@ -2323,8 +2915,8 @@ class domain(MeshIOMixin, Geometries):
                     else:
                         indices_list = np.array(sorted(tag_points), dtype=int)
 
-                    # self.log.info(f"{name} - indices: {indices_list} - points: {points[indices_list].shape}")
-
+                    indices_list = np.asarray(indices_list, dtype=int)
+                    self.tag_indices[name] = indices_list
                     self._mesh_pool[name] = points[indices_list]
 
                     normal_positions = np.array([index_to_normal_pos[i] for i in indices_list if i in index_to_normal_pos])
@@ -2333,9 +2925,61 @@ class domain(MeshIOMixin, Geometries):
                     else:
                         tag_pt_coords = points[indices_list, : self.dimension]
                         if len(tag_pt_coords) > 1:
-                            tag_normals, _ = self._compute_normals_pca(points, indices_list, self.dimension, k=min(8, len(indices_list)), mesh=mesh)
+                            tag_normals, _ = self._compute_normals_pca(
+                                points,
+                                indices_list,
+                                self.dimension,
+                                k=min(8, len(tag_pt_coords)),
+                                mesh=mesh,
+                            )
                             self.normals_by_tag[name] = tag_normals[:, : self.dimension]
 
+                    # --- Generic boundary registry entry ---
+                    is_boundary_tag = False
+                    entity_kind = None
+
+                    if self.dimension == 2 and len(tag_edges) > 0:
+                        is_boundary_tag = True
+                        entity_kind = "line"
+                    elif self.dimension == 3 and len(tag_tris) > 0:
+                        is_boundary_tag = True
+                        entity_kind = "triangle"
+                    elif name in self.normals_by_tag:
+                        # fallback: still treat as a boundary-like tag if normals exist
+                        is_boundary_tag = True
+                        entity_kind = "boundary_points"
+
+                    if is_boundary_tag:
+                        edge_coords = None
+                        tri_coords = None
+
+                        if len(tag_edges) > 0:
+                            edge_arr = np.asarray(tag_edges, dtype=int)
+                            edge_coords = points[edge_arr][:, :, : self.dimension]
+
+                        if len(tag_tris) > 0:
+                            tri_arr = np.asarray(tag_tris, dtype=int)
+                            tri_coords = points[tri_arr][:, :, : self.dimension]
+
+                        # pred = self._boundary_predicates.get(name, None)
+                        tol = self._estimate_boundary_tol(points[indices_list][:, : self.dimension])
+
+                        self._boundary_regions[name] = BoundaryRegion(
+                            tag=name,
+                            dim=self.dimension,
+                            points=points[indices_list][:, : self.dimension],
+                            edges=edge_coords,
+                            triangles=tri_coords,
+                            tol=tol,
+                        )
+
+                        self._boundary_registry[name] = {
+                            "tag": name,
+                            "entity_kind": entity_kind,
+                            "point_indices": indices_list,
+                            "points": points[indices_list],
+                        }
+        # self._register_default_box_boundary_predicates()
         return boundary_indices
 
     def _add_time_dimension(self, t_start: float, t_end: float, n_time: int = 100):
@@ -2476,11 +3120,23 @@ class domain(MeshIOMixin, Geometries):
             available = list(self.context.keys())
             raise ValueError(f"Tag '{tag}' not found. Did you call sample() first? Available: {available}")
 
+        fem_meta = None
+        if getattr(self, "_variational_initialized", False):
+            fem_meta = getattr(self, "_variational_sampling_registry", {}).get(tag, None)
+
         # Create Variable placeholder for each spatial dimension
-        coord_vars: List[Any] = [Variable(tag=tag, dim=[i, i + 1], domain=self, axis="spatial") for i in range(self.dimension)]
+        coord_vars: List[Any] = [Variable(tag=tag, dim=[i, i + 1], domain=self, axis="spatial", fem_meta=fem_meta) for i in range(self.dimension)]
 
         # Always add temporal variable (constant 1 for stationary problems)
-        coord_vars.append(Variable(tag="__time__", dim=[0, 1], domain=self, axis="temporal"))
+        coord_vars.append(
+            Variable(
+                tag="__time__",
+                dim=[0, 1],
+                domain=self,
+                axis="temporal",
+                fem_meta=None,
+            )
+        )
 
         if normals:
             if reverse_normals:

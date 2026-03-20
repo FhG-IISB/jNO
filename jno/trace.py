@@ -48,6 +48,12 @@ __all__ = [
     "get_primary_tag",
     "dump_tree",
     "cse",
+    "TestFunction",
+    "Assembly",
+    "GroupedAssembly",
+    "TrialFunction",
+    "FemLinearSystem",
+    "FemResidualOperator",
 ]
 
 # Global counter for unique operation IDs
@@ -182,6 +188,17 @@ class Placeholder:
         if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
             shape = tuple(shape[0])
         return FunctionCall(lambda x, s=shape: x.reshape(s), [self], name="reshape")
+    
+    def assemble(self, domain, target="vpinn", **kwargs):
+        """
+        Unified variational assembly entry point.
+
+        target="vpinn"      -> assemble weak residual / VPINN quantity
+        target="fem_system" -> assemble FEM matrices (A, b)
+
+        Additional kwargs can carry backend-specific options, e.g. model=u_net.
+        """
+        return domain.assemble_weak_form(self, target=target, **kwargs)
 
     def print(self, what: Union[str, Callable[[jnp.ndarray], Any]] = "shape", label: Optional[str] = None):
         """Emit runtime debug info for this placeholder and pass it through.
@@ -761,10 +778,11 @@ class Variable(Placeholder):
     ``context["__time__"]`` entry that is a scalar (after the T vmap).
     """
 
-    def __init__(self, tag: str, dim: list, domain: Any, axis: str = "spatial"):
+    def __init__(self, tag: str, dim: list, domain: Any, axis: str = "spatial", fem_meta: dict | None = None):
         self.tag = tag
         self.dim = dim
         self.axis = axis  # 'spatial' or 'temporal'
+        self.fem_meta = fem_meta  # Optional dict for FEM-specific metadata (e.g., element type, node positions)
         if tag in domain.context.keys():
             self.size = dim[1] - dim[0] if dim[1] is not None else domain.context[tag].shape[-1]
         else:
@@ -774,6 +792,10 @@ class Variable(Placeholder):
     def __repr__(self):
         if self.axis == "temporal":
             return f"Var(t)"
+        if self.fem_meta is not None:
+            support = self.fem_meta.get("support")
+            region = self.fem_meta.get("region_id")
+            return f"Var({self.tag}[{self.dim}], support={support}, region={region})"
         return f"Var({self.tag}[{self.dim}])"
 
 
@@ -1558,6 +1580,13 @@ class OperationDef(Placeholder):
             elif isinstance(node, OperationCall):
                 for arg in node.args:
                     visit(arg)
+            elif isinstance(node, GroupedAssembly):
+                if node.volume_expr is not None:
+                    visit(node.volume_expr)
+                for bnd_expr in node.boundary_exprs.values():
+                    visit(bnd_expr)
+            elif isinstance(node, Assembly):
+                visit(node.expr)
 
         visit(expr)
         return vars_found
@@ -1576,6 +1605,12 @@ class OperationDef(Placeholder):
                 return any(visit(arg) for arg in node.args if isinstance(arg, Placeholder))
             elif isinstance(node, OperationCall):
                 return node.operation.has_trainable
+            elif isinstance(node, Assembly):
+                return visit(node.expr)
+            elif isinstance(node, GroupedAssembly):
+                vol_has = visit(node.volume_expr) if node.volume_expr is not None else False
+                bnd_has = any(visit(expr) for expr in node.boundary_exprs.values())
+                return vol_has or bnd_has
             return False
 
         return visit(expr)
@@ -1665,7 +1700,189 @@ class Jacobian(Placeholder):
         var_names = ", ".join(str(v) for v in self.variables)
         return f"Jacobian({self.target}, [{var_names}])"
 
+class FemLinearSystem:
+    """Container for a linear FEM contribution A x = b.
 
+    Supports addition/subtraction so separate volume and boundary contributions
+    can be combined naturally before unpacking.
+    """
+
+    def __init__(self, A, b):
+        self.A = A
+        self.b = b
+
+    def __iter__(self):
+        yield self.A
+        yield self.b
+
+    def __add__(self, other):
+        if not isinstance(other, FemLinearSystem):
+            return NotImplemented
+        return FemLinearSystem(self.A + other.A, self.b + other.b)
+
+    def todense(self):
+        A_dense = self.A.todense() if hasattr(self.A, "todense") else self.A
+        return A_dense, self.b
+    
+    def todense(self):
+        A_dense = self.A.todense() if hasattr(self.A, "todense") else self.A
+        return A_dense, self.b
+    
+    def __sub__(self, other):
+        if not isinstance(other, FemLinearSystem):
+            return NotImplemented
+        return FemLinearSystem(self.A - other.A, self.b - other.b)
+
+    def __repr__(self):
+        shape = getattr(self.A, "shape", None)
+        return f"FemLinearSystem(shape={shape}, b_shape={getattr(self.b, 'shape', None)})"
+
+
+class FemResidualOperator:
+    """Container for a nonlinear FEM residual operator R(u)=0.
+
+    Parameters
+    ----------
+    residual_fn : callable
+        Function taking a flat DOF vector and returning the residual vector.
+    jacobian_fn : callable | None
+        Optional function taking a flat DOF vector and returning the tangent/Jacobian.
+    size : int | None
+        Number of scalar DOFs.
+    """
+
+    def __init__(self, residual_fn, jacobian_fn=None, size=None):
+        self.residual = residual_fn
+        self.jacobian = jacobian_fn
+        self.size = size
+
+    def __call__(self, u):
+        return self.residual(u)
+    
+    def linearize(self, u):
+        if self.jacobian is None:
+            raise ValueError("No jacobian function available.")
+        return self.jacobian(u), -self.residual(u)
+
+    def __repr__(self):
+        return f"FemResidualOperator(size={self.size}, has_jacobian={self.jacobian is not None})"
+    
+
+class TrialFunction(Placeholder):
+    """
+    Generic variational unknown symbol.
+
+    Interpretation depends on assembly target:
+      - vpinn         -> interpreted via model/u_net
+      - fem_system    -> interpreted as FE trial function
+      - fem_residual  -> interpreted as FE unknown in a nonlinear residual operator
+
+    Parameters
+    ----------
+    name : str
+        Symbol name used for printing/debugging.
+    value_shape : tuple
+        Shape of the field value at one spatial point:
+          ()    -> scalar
+          (2,)  -> 2D vector
+          (3,)  -> 3D vector
+          (2,2) -> second-order tensor, etc.
+    """
+    def __init__(self, name="u", value_shape=()):
+        self.name = name
+        self.value_shape = tuple(value_shape)
+        self.op_id = _next_op_id()
+
+    @property
+    def num_components(self) -> int:
+        if len(self.value_shape) == 0:
+            return 1
+        n = 1
+        for s in self.value_shape:
+            n *= int(s)
+        return n
+
+    def __repr__(self):
+        return f"TrialFunction({self.name}, value_shape={self.value_shape})"
+
+
+class TestFunction(Placeholder):
+    """
+    Generic variational test function.
+
+    It is resolved against the active bucket (volume or boundary region)
+    during evaluation/assembly.
+
+    Parameters
+    ----------
+    name : str
+        Symbol name used for printing/debugging.
+    value_shape : tuple
+        Shape of the field value at one spatial point:
+          ()    -> scalar
+          (2,)  -> 2D vector
+          (3,)  -> 3D vector
+          (2,2) -> second-order tensor, etc.
+    """
+    def __init__(self, name="phi", value_shape=()):
+        self.name = name
+        self.value_shape = tuple(value_shape)
+        self.op_id = _next_op_id()
+
+    @property
+    def num_components(self) -> int:
+        if len(self.value_shape) == 0:
+            return 1
+        n = 1
+        for s in self.value_shape:
+            n *= int(s)
+        return n
+
+    def __repr__(self):
+        return f"TestFunction({self.name}, value_shape={self.value_shape})"
+
+class Assembly(Placeholder):
+    """
+    Internal assembly node for one already-bucketed variational contribution.
+    """
+    def __init__(self, expr: Placeholder, domain_or_nodes, support: str, region_id: str):
+        self.expr = expr
+        self.support = support          # "volume" | "boundary"
+        self.region_id = region_id      # e.g. "cells", "right", "wall_3", ...
+        if hasattr(domain_or_nodes, "context"):
+            self.num_total_nodes = int(domain_or_nodes.context["num_total_nodes"])
+        else:
+            self.num_total_nodes = int(domain_or_nodes)
+        self.op_id = _next_op_id()
+
+    def __repr__(self):
+        return (
+            f"Assemble({self.expr}, support={self.support}, "
+            f"region={self.region_id}, nodes={self.num_total_nodes})"
+        )
+
+class GroupedAssembly(Placeholder):
+    """
+    Internal node for a grouped variational assembly:
+      - optional volume expression
+      - optional boundary expressions by region
+    Evaluated in one pass by the trace evaluator.
+    """
+    def __init__(self, volume_expr, boundary_exprs, domain_or_nodes):
+        self.volume_expr = volume_expr                  # Placeholder | None
+        self.boundary_exprs = boundary_exprs or {}      # dict[str, Placeholder]
+        if hasattr(domain_or_nodes, "context"):
+            self.num_total_nodes = int(domain_or_nodes.context["num_total_nodes"])
+        else:
+            self.num_total_nodes = int(domain_or_nodes)
+        self.op_id = _next_op_id()
+
+    def __repr__(self):
+        bkeys = list(self.boundary_exprs.keys())
+        return (
+            f"GroupedAssembly(volume={'yes' if self.volume_expr is not None else 'no'}, "
+            f"boundaries={bkeys}, nodes={self.num_total_nodes})"
+        )
 # =============================================================================
 # Tree optimisation — Common Sub-expression Elimination (CSE)
 # =============================================================================
@@ -1729,13 +1946,30 @@ def cse(expr: Placeholder) -> Placeholder:
             return ("Hess", id(node.target), var_ids, node.trace, node.scheme)
         if isinstance(node, Tracker):
             return ("Track", id(node.expr), node.interval)
-        # Fallback — use object identity (no dedup possible)
-        return ("?", id(node))
+        if isinstance(node, TrialFunction):
+            return ("TrialFn", node.name, id(node))
+        if isinstance(node, TestFunction):
+            return ("TestFn", node.name, id(node))
+        if isinstance(node, Assembly):
+            return (
+                "Assembly",
+                node.support,
+                node.region_id,
+                node.num_total_nodes,
+                id(node.expr),
+            )
+        if isinstance(node, GroupedAssembly):
+            return (
+                "GroupedAssembly",
+                id(node.volume_expr) if node.volume_expr is not None else None,
+                tuple((k, id(v)) for k, v in sorted(node.boundary_exprs.items())),
+                node.num_total_nodes,
+            )
 
     def _visit(node):
         """Post-order walk: canonicalise children first, then self."""
         # Leaves — always canonical
-        if isinstance(node, (Variable, TensorTag, Constant, Literal)):
+        if isinstance(node, (Variable, TensorTag, Constant, Literal, TrialFunction, TestFunction)):
             return node
 
         # ── recurse into children and rebuild if anything changed ──
@@ -1787,7 +2021,27 @@ def cse(expr: Placeholder) -> Placeholder:
             new_expr = _visit(node.expr)
             if new_expr is not node.expr:
                 node = Tracker(new_expr, node.interval)
+        elif isinstance(node, Assembly):
+            new_expr = _visit(node.expr)
+            if new_expr is not node.expr:
+                node = Assembly(new_expr,node.num_total_nodes, support=node.support, region_id=node.region_id,)
+        elif isinstance(node, GroupedAssembly):
+            new_volume = _visit(node.volume_expr) if node.volume_expr is not None else None
+            new_boundary = {}
+            changed = (new_volume is not node.volume_expr)
 
+            for region_id, bnd_expr in node.boundary_exprs.items():
+                new_expr = _visit(bnd_expr)
+                new_boundary[region_id] = new_expr
+                if new_expr is not bnd_expr:
+                    changed = True
+
+            if changed:
+                node = GroupedAssembly(
+                    new_volume,
+                    new_boundary,
+                    node.num_total_nodes,
+                )
         # ── dedup: if we've seen an identical node, return the earlier one ──
         k = _key(node)
         if k in _canon:
@@ -1846,7 +2100,13 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
                 visit(v)
         elif isinstance(node, Tracker):
             visit(node.expr)
-
+        elif isinstance(node, Assembly):
+            visit(node.expr)
+        elif isinstance(node, GroupedAssembly):
+            if node.volume_expr is not None:
+                visit(node.volume_expr)
+            for bnd_expr in node.boundary_exprs.values():
+                visit(bnd_expr)
     visit(expr)
     return ops
 
@@ -1892,7 +2152,15 @@ def collect_tags(expr: Placeholder) -> set:
                 visit(v)
         elif isinstance(node, Tracker):
             visit(node.expr)
-
+        elif isinstance(node, (TrialFunction, TestFunction)):
+            pass
+        elif isinstance(node, Assembly):
+            visit(node.expr)
+        elif isinstance(node, GroupedAssembly):
+            if node.volume_expr is not None:
+                visit(node.volume_expr)
+            for bnd_expr in node.boundary_exprs.values():
+                visit(bnd_expr)
     visit(expr)
     return tags
 
@@ -1941,6 +2209,10 @@ def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
             return f"Constant({node.tag}.{node.key}={val})"
         if isinstance(node, Literal):
             return f"Literal({node.value})"
+        if isinstance(node, TrialFunction):
+            return f"TrialFunction({node.name})"
+        if isinstance(node, TestFunction):
+            return f"TestFunction({node.name})"
         if isinstance(node, Model):
             return f"Model(id={node.layer_id}, {type(node.module).__name__})"
         if isinstance(node, (int, float)):
@@ -2009,6 +2281,21 @@ def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
         elif isinstance(node, Tracker):
             lines.append(f"{p}Tracker(interval={node.interval})")
             _visit(node.expr, depth + 1)
+        elif isinstance(node, (TrialFunction, TestFunction)):
+            lines.append(f"{p}{_node_label(node)}")
+        elif isinstance(node, Assembly):
+            lines.append(
+                f"{p}Assembly(support={node.support}, region={node.region_id})"
+            )
+            _visit(node.expr, depth + 1)
+        elif isinstance(node, GroupedAssembly):
+            lines.append(f"{p}GroupedAssembly(nodes={node.num_total_nodes})")
+            if node.volume_expr is not None:
+                lines.append(f"{p}  volume:")
+                _visit(node.volume_expr, depth + 2)
+            for region_id, bnd_expr in node.boundary_exprs.items():
+                lines.append(f"{p}  boundary[{region_id}]:")
+                _visit(bnd_expr, depth + 2)
         elif isinstance(node, ConstantNamespace):
             lines.append(f"{p}ConstantNamespace({node._full_tag})")
         elif isinstance(node, Placeholder):
