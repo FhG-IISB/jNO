@@ -23,7 +23,7 @@ from .trace import (
     OperationCall,
     Hessian,
     Jacobian,
-    TestFunction, 
+    TestFunction,
     Assembly,
     GroupedAssembly,
 )
@@ -68,7 +68,7 @@ class TraceEvaluator:
     class _EvalCtx:
         """Bundles the read-only state that every handler needs."""
 
-        __slots__ = ("context", "var_bindings", "key","active_region")
+        __slots__ = ("context", "var_bindings", "key", "active_region")
 
         def __init__(self, context, var_bindings, key, active_region=None):
             self.context = context
@@ -295,7 +295,7 @@ class TraceEvaluator:
         (Jacobian, "_eval_jacobian"),
         (Hessian, "_eval_hessian"),
         (OperationDef, "_eval_operation_def"),
-        (TestFunction, "_eval_test_function"), 
+        (TestFunction, "_eval_test_function"),
         (Assembly, "_eval_assembly"),
         (GroupedAssembly, "_eval_grouped_assembly"),
     ]
@@ -306,7 +306,15 @@ class TraceEvaluator:
             if isinstance(expr, node_type):
                 # Assembly defines the active variational bucket for its subtree.
                 if isinstance(expr, Assembly):
-                    new_ctx = self._EvalCtx(ctx.context, ctx.var_bindings, ctx.key, active_region={"support": expr.support, "region_id": expr.region_id,},)
+                    new_ctx = self._EvalCtx(
+                        ctx.context,
+                        ctx.var_bindings,
+                        ctx.key,
+                        active_region={
+                            "support": expr.support,
+                            "region_id": expr.region_id,
+                        },
+                    )
                     return getattr(self, method_name)(expr, new_ctx)
 
                 return getattr(self, method_name)(expr, ctx)
@@ -336,14 +344,14 @@ class TraceEvaluator:
                 else:
                     local[k] = v
             else:
-                    # v.ndim >= 2
-                    if k == tag or v.shape[0] == points.shape[0]:
-                        # Handle N-dimensional arrays by padding start_indices and slice_sizes
-                        start_indices = (idx,) + (0,) * (v.ndim - 1)
-                        slice_sizes = (1,) + v.shape[1:]
-                        local[k] = jax.lax.dynamic_slice(v, start_indices, slice_sizes)
-                    else:
-                        local[k] = v
+                # v.ndim >= 2
+                if k == tag or v.shape[0] == points.shape[0]:
+                    # Handle N-dimensional arrays by padding start_indices and slice_sizes
+                    start_indices = (idx,) + (0,) * (v.ndim - 1)
+                    slice_sizes = (1,) + v.shape[1:]
+                    local[k] = jax.lax.dynamic_slice(v, start_indices, slice_sizes)
+                else:
+                    local[k] = v
 
         return local
 
@@ -555,10 +563,7 @@ class TraceEvaluator:
         scheme = expr.scheme
         if isinstance(target, TestFunction):
             if ctx.active_region is None:
-                raise ValueError(
-                    "Jacobian of TestFunction requires an active_region. "
-                    "Use grad(phi, x) only inside Assembly(...)."
-                )
+                raise ValueError("Jacobian of TestFunction requires an active_region. " "Use grad(phi, x) only inside Assembly(...).")
 
             requested_dims = []
             for var in variables:
@@ -582,10 +587,7 @@ class TraceEvaluator:
                     return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
 
                 eye = jnp.eye(n_comp, dtype=dN.dtype)
-                comps = [
-                    dN[..., dim_idx][:, :, None, None] * eye[None, None, :, :]
-                    for dim_idx in requested_dims
-                ]
+                comps = [dN[..., dim_idx][:, :, None, None] * eye[None, None, :, :] for dim_idx in requested_dims]
 
                 # one derivative:
                 #   (Nq_total, nloc, basis_comp, phys_comp)
@@ -595,18 +597,12 @@ class TraceEvaluator:
 
             if support == "boundary":
                 if "surface_data" not in ctx.context or region_id not in ctx.context["surface_data"]:
-                    raise KeyError(
-                        f"Boundary region '{region_id}' not found in fem_context['surface_data']."
-                    )
+                    raise KeyError(f"Boundary region '{region_id}' not found in fem_context['surface_data'].")
 
                 surf_data = ctx.context["surface_data"][region_id]
 
                 if "face_shape_grads" not in surf_data:
-                    raise NotImplementedError(
-                        f"Boundary TestFunction gradients requested on region '{region_id}', "
-                        "but 'face_shape_grads' is not stored in fem_context['surface_data']'. "
-                        "Add boundary shape gradients in domain.init_fem() first."
-                    )
+                    raise NotImplementedError(f"Boundary TestFunction gradients requested on region '{region_id}', " "but 'face_shape_grads' is not stored in fem_context['surface_data']'. " "Add boundary shape gradients in domain.init_fem() first.")
 
                 dN_face = surf_data["face_shape_grads"]
                 # flatten to (Nq_total, nloc, dim)
@@ -617,10 +613,7 @@ class TraceEvaluator:
                     return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
 
                 eye = jnp.eye(n_comp, dtype=dN_face.dtype)
-                comps = [
-                    dN_face[..., dim_idx][:, :, None, None] * eye[None, None, :, :]
-                    for dim_idx in requested_dims
-                ]
+                comps = [dN_face[..., dim_idx][:, :, None, None] * eye[None, None, :, :] for dim_idx in requested_dims]
                 return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
 
             raise ValueError(f"Unknown active support '{support}'")
@@ -760,6 +753,7 @@ class TraceEvaluator:
                         active_region=ctx.active_region,
                     )
                     return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
+
                 return u_fn
 
             if n_vars == 1:
@@ -783,6 +777,7 @@ class TraceEvaluator:
                 return jax.vmap(jac_single)(jnp.arange(points.shape[0]))
 
             else:
+
                 def jac_single(idx):
                     pt = jax.lax.dynamic_slice(points, (idx, 0), (1, points.shape[1]))[0]
                     local_ctx = evaluator_self._build_local_context(idx, tag, points, ctx.context)
@@ -915,12 +910,7 @@ class TraceEvaluator:
                 # Full Hessian via AD
                 def hess_single(pt):
                     def u_scalar(p):
-                        new_ctx = evaluator_self._EvalCtx(
-                            {**ctx.context, tag: p[jnp.newaxis, :]},
-                            ctx.var_bindings,
-                            ctx.key,
-                            active_region=ctx.active_region
-                        )
+                        new_ctx = evaluator_self._EvalCtx({**ctx.context, tag: p[jnp.newaxis, :]}, ctx.var_bindings, ctx.key, active_region=ctx.active_region)
                         return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
 
                     hess = jax.hessian(u_scalar)(pt)
@@ -934,7 +924,6 @@ class TraceEvaluator:
     def _eval_operation_def(self, expr, ctx):
         return self._dispatch(expr.expr, ctx)
 
-
     @staticmethod
     def _value_shape_num_components(value_shape) -> int:
         if value_shape is None or len(value_shape) == 0:
@@ -943,7 +932,6 @@ class TraceEvaluator:
         for s in value_shape:
             n *= int(s)
         return n
-
 
     @staticmethod
     def _expand_test_basis(shape_vals, value_shape):
@@ -968,7 +956,6 @@ class TraceEvaluator:
 
         eye = jnp.eye(n_comp, dtype=shape_vals.dtype)
         return shape_vals[:, :, None, None] * eye[None, None, :, :]
-
 
     @staticmethod
     def _assemble_basis_integrand(integrand, weights, flat_cells, num_total_nodes):
@@ -1000,9 +987,7 @@ class TraceEvaluator:
         local_residuals = integrand * weights.reshape(wshape)
 
         # restore entity/quad structure
-        local_residuals = local_residuals.reshape(
-            (num_entities, num_quads, n_local_nodes) + trailing_shape
-        )
+        local_residuals = local_residuals.reshape((num_entities, num_quads, n_local_nodes) + trailing_shape)
 
         # integrate over quadrature
         cell_residuals = jnp.sum(local_residuals, axis=1)  # (entities, nloc, ...)
@@ -1042,10 +1027,7 @@ class TraceEvaluator:
             boundary -> (Nq_total, nloc, ncomp, ncomp)
         """
         if ctx.active_region is None:
-            raise ValueError(
-                "TestFunction evaluation requires an active_region. "
-                "Use it inside Assembly(...)."
-            )
+            raise ValueError("TestFunction evaluation requires an active_region. " "Use it inside Assembly(...).")
 
         support = ctx.active_region["support"]
         region_id = ctx.active_region["region_id"]
@@ -1057,9 +1039,7 @@ class TraceEvaluator:
 
         if support == "boundary":
             if "surface_data" not in ctx.context or region_id not in ctx.context["surface_data"]:
-                raise KeyError(
-                    f"Boundary region '{region_id}' not found in fem_context['surface_data']."
-                )
+                raise KeyError(f"Boundary region '{region_id}' not found in fem_context['surface_data'].")
 
             vals = ctx.context["surface_data"][region_id]["face_shape_vals"]
             vals = vals.reshape(-1, vals.shape[-1])  # (Nq_total, nloc)
@@ -1076,9 +1056,7 @@ class TraceEvaluator:
 
         elif expr.support == "boundary":
             if "surface_data" not in ctx.context or expr.region_id not in ctx.context["surface_data"]:
-                raise KeyError(
-                    f"Boundary region '{expr.region_id}' not found in fem_context['surface_data']."
-                )
+                raise KeyError(f"Boundary region '{expr.region_id}' not found in fem_context['surface_data'].")
             surf_data = ctx.context["surface_data"][expr.region_id]
             weights = surf_data["nanson_scale"]
             flat_cells = surf_data["flat_parent_nodes"].flatten()
@@ -1099,7 +1077,7 @@ class TraceEvaluator:
                 global_residual = global_residual.at[d_nodes].set(0.0)
 
         return global_residual
-   
+
     def _eval_grouped_assembly(self, expr, ctx):
         total = None
 
@@ -1161,7 +1139,7 @@ class TraceEvaluator:
                 total = total.at[d_nodes].set(0.0)
 
         return total
-    
+
     @staticmethod
     def _node_label(node) -> Tuple[str, str]:
         """Return (uid, label) — rendered separately by _trace_visit."""
@@ -1213,5 +1191,3 @@ class TraceEvaluator:
             scheme_str = f", {node.scheme[:2]}" if node.scheme else ""
             return uid, f"{kind}([{vars_str}]{scheme_str})"
         return uid, type(node).__name__
-    
-    

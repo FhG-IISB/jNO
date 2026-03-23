@@ -12,6 +12,7 @@ from jno.trace import dump_tree
 # Helpers
 # ============================================================
 
+
 def make_domain(mesh_size=0.25):
     """Create a small rectangular domain for fast VPINN tests."""
     return jno.domain(constructor=jno.domain.rect(mesh_size=mesh_size))
@@ -65,6 +66,7 @@ def make_vector_net():
 # VPINN variable / tag access
 # ============================================================
 
+
 class TestVpinnVariables:
     def test_fem_gauss_and_boundary_quadrature_variables_exist(self):
         dom = make_domain()
@@ -97,6 +99,7 @@ class TestVpinnVariables:
 # ============================================================
 # Scalar VPINN assembly
 # ============================================================
+
 
 class TestVpinnScalarAssembly:
     def test_scalar_volume_weak_form_assembles(self):
@@ -148,6 +151,7 @@ class TestVpinnScalarAssembly:
 # Boundary-tagged VPINN assembly
 # ============================================================
 
+
 class TestVpinnBoundaryAssembly:
     def test_volume_plus_boundary_weak_form_assembles(self):
         dom = make_domain()
@@ -180,6 +184,7 @@ class TestVpinnBoundaryAssembly:
 # Vector VPINN assembly
 # ============================================================
 
+
 class TestVpinnVectorAssembly:
     def test_vector_weak_form_assembles(self):
         dom = make_domain()
@@ -206,6 +211,7 @@ class TestVpinnVectorAssembly:
 # Validation / error behavior
 # ============================================================
 
+
 class TestVpinnValidation:
     def test_invalid_tag_raises(self):
         dom = make_domain()
@@ -217,6 +223,7 @@ class TestVpinnValidation:
 # ============================================================
 # Symbolic weak-form display
 # ============================================================
+
 
 def test_dump_tree_on_vpinn_weak_form():
     dom = make_domain()

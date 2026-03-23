@@ -50,13 +50,13 @@ def _make_2d_mesh(nx: int = 4, ny: int = 4, x_range=(0.0, 1.0), y_range=(0.0, 1.
     def idx(i, j):
         return i * (ny + 1) + j
 
-    triangles = []
+    triangle_rows = []
     for i in range(nx):
         for j in range(ny):
             p0, p1 = idx(i, j), idx(i + 1, j)
             p2, p3 = idx(i + 1, j + 1), idx(i, j + 1)
-            triangles += [[p0, p1, p2], [p0, p2, p3]]
-    triangles = np.array(triangles)
+            triangle_rows += [[p0, p1, p2], [p0, p2, p3]]
+    triangles = np.array(triangle_rows)
 
     bot = np.array([[idx(i, 0), idx(i + 1, 0)] for i in range(nx)])
     top = np.array([[idx(i, ny), idx(i + 1, ny)] for i in range(nx)])

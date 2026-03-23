@@ -5,6 +5,7 @@ from typing import Any, Dict, Sequence
 import numpy as np
 import jax
 import jax.numpy as jnp
+from jax.flatten_util import ravel_pytree
 from ..trace import (
     Literal,
     Constant,
@@ -24,12 +25,14 @@ import numpy as onp
 import scipy.sparse as sp
 from .weak_form import _contains_node_type
 
+
 # --------------------------------
 # FEM boundary-condition helpers
 # --------------------------------
 def _default_float_dtype():
     """Return JAX's current default floating dtype (float32 or float64)."""
     return jnp.asarray(0.0).dtype
+
 
 @dataclass(frozen=True)
 class DirichletBC:
@@ -43,6 +46,7 @@ class DirichletBC:
     values : object, optional
         Prescribed boundary values or value functions.
     """
+
     tags: tuple[str, ...]
     values: object = None
 
@@ -57,6 +61,7 @@ class NeumannBC:
     tags : tuple[str, ...]
         Boundary tags where the condition is active.
     """
+
     tags: tuple[str, ...]
 
 
@@ -71,9 +76,7 @@ def _as_tags(tags) -> tuple[str, ...]:
         if len(out) == 0:
             raise ValueError("Boundary tag list cannot be empty.")
         return out
-    raise TypeError(
-        f"Boundary tags must be a string or a sequence of strings, got {type(tags).__name__}."
-    )
+    raise TypeError(f"Boundary tags must be a string or a sequence of strings, got {type(tags).__name__}.")
 
 
 def dirichlet(tags, values=None):
@@ -159,9 +162,7 @@ def _normalize_dirichlet_value(value, vec: int):
     # explicit componentwise list/tuple
     if isinstance(value, (list, tuple)):
         if len(value) != vec:
-            raise ValueError(
-                f"Dirichlet BC has {len(value)} entries, but vec={vec}."
-            )
+            raise ValueError(f"Dirichlet BC has {len(value)} entries, but vec={vec}.")
 
         out = []
         for v in value:
@@ -170,9 +171,7 @@ def _normalize_dirichlet_value(value, vec: int):
             elif np.isscalar(v):
                 out.append(_const_bc_fn(v))
             else:
-                raise TypeError(
-                    "Dirichlet list/tuple entries must be callables or scalars."
-                )
+                raise TypeError("Dirichlet list/tuple entries must be callables or scalars.")
 
         if vec == 1:
             return out[0]
@@ -193,17 +192,13 @@ def _normalize_dirichlet_value(value, vec: int):
             elif np.isscalar(v):
                 out[c] = _const_bc_fn(v)
             else:
-                raise TypeError(
-                    "Dirichlet dict entries must be callables or scalars."
-                )
+                raise TypeError("Dirichlet dict entries must be callables or scalars.")
 
         if vec == 1:
             return out[0]
         return out
 
-    raise TypeError(
-        f"Unsupported Dirichlet BC value type: {type(value).__name__}"
-    )
+    raise TypeError(f"Unsupported Dirichlet BC value type: {type(value).__name__}")
 
 
 def expand_bcs(bcs, vec: int):
@@ -228,15 +223,15 @@ def expand_bcs(bcs, vec: int):
                     neumann_tags.append(tag)
 
         else:
-            raise TypeError(
-                f"Unsupported BC entry '{type(bc).__name__}'. "
-                "Use dirichlet(...) or neumann(...)."
-            )
+            raise TypeError(f"Unsupported BC entry '{type(bc).__name__}'. " "Use dirichlet(...) or neumann(...).")
 
     return dirichlet_tags, dirichlet_value_fns, neumann_tags
+
+
 # --------------------------------
 # small expression-inspection helpers
 # --------------------------------
+
 
 def _strip_test_function_factor(domain, expr):
     """
@@ -254,7 +249,7 @@ def _strip_test_function_factor(domain, expr):
         coeff_expr  (with TestFunction removed)
         or None if expr is not a pure multiplicative term with exactly one TestFunction.
     """
-  
+
     factors = []
 
     def collect_mul_factors(node):
@@ -280,6 +275,7 @@ def _strip_test_function_factor(domain, expr):
 
     return coeff
 
+
 def _is_simple_neumann_load(domain, expr):
     """
     True for a pure boundary load term scalar(x)*phi with:
@@ -288,7 +284,6 @@ def _is_simple_neumann_load(domain, expr):
     - no grad(phi)
     - no grad(u)
     """
-    
 
     if not _contains_node_type(domain, expr, TestFunction):
         return False
@@ -299,6 +294,7 @@ def _is_simple_neumann_load(domain, expr):
 
     coeff = _strip_test_function_factor(domain, expr)
     return coeff is not None
+
 
 def _matrix_to_jax_bcoo(A):
     """
@@ -321,9 +317,7 @@ def _matrix_to_jax_bcoo(A):
         A_csr = A.tocsr()
 
     else:
-        raise TypeError(
-            f"Unsupported matrix type from get_A(problem): {type(A)}"
-        )
+        raise TypeError(f"Unsupported matrix type from get_A(problem): {type(A)}")
 
     A_coo = A_csr.tocoo()
 
@@ -338,6 +332,7 @@ def _matrix_to_jax_bcoo(A):
 
     return BCOO((data, indices), shape=A_coo.shape)
 
+
 def _get_problem_vec(problem) -> int:
     """
     Robustly extract the field component count from a JAX-FEM Problem.
@@ -350,6 +345,8 @@ def _get_problem_vec(problem) -> int:
         return int(vec[0])
 
     return int(vec)
+
+
 # --------------------------------
 # jax-fem lowering helpers
 # --------------------------------
@@ -360,15 +357,14 @@ def _make_native_surface_map_from_expr(domain, coeff_expr, tag):
     The returned callable evaluates the scalar boundary coefficient at a
     boundary quadrature point, optionally using boundary normals.
     """
+
     def _contains_normal_variable(node):
         if isinstance(node, Variable):
             return isinstance(node.tag, str) and node.tag.startswith("n_")
         if isinstance(node, (Literal, Constant, TestFunction, TrialFunction)):
             return False
         if isinstance(node, Jacobian):
-            return _contains_normal_variable(node.target) or any(
-                _contains_normal_variable(v) for v in node.variables
-            )
+            return _contains_normal_variable(node.target) or any(_contains_normal_variable(v) for v in node.variables)
         if isinstance(node, BinaryOp):
             return _contains_normal_variable(node.left) or _contains_normal_variable(node.right)
         if isinstance(node, FunctionCall):
@@ -398,7 +394,7 @@ def _make_native_surface_map_from_expr(domain, coeff_expr, tag):
             x_use = x[: domain.dimension]
             d2 = jnp.sum((normal_pts_jax - x_use[None, :]) ** 2, axis=1)
             idx = jnp.argmin(d2)
-            boundary_normals = normal_vals_jax[idx:idx + 1]
+            boundary_normals = normal_vals_jax[idx : idx + 1]
 
         local = {
             "physical_quad_points": x[None, :],
@@ -416,6 +412,7 @@ def _make_native_surface_map_from_expr(domain, coeff_expr, tag):
         return jnp.array([coeff_val])
 
     return surface_map
+
 
 def _value_shape_num_components(value_shape) -> int:
     """
@@ -498,8 +495,9 @@ def _expand_test_shape_vals(shape_vals, n_comp):
     if n_comp == 1:
         return shape_vals
 
-    eye = jnp.eye(n_comp, dtype=shape_vals.dtype)          # (n_comp, n_comp)
+    eye = jnp.eye(n_comp, dtype=shape_vals.dtype)  # (n_comp, n_comp)
     return shape_vals[:, :, None, None] * eye[None, None, :, :]
+
 
 def _compile_weakform_for_jaxfem(domain, expr, tag: str = "fem_gauss") -> Dict[str, Any]:
     """
@@ -541,10 +539,7 @@ def _compile_weakform_for_jaxfem(domain, expr, tag: str = "fem_gauss") -> Dict[s
     unique_trials = list(trial_nodes.values())
 
     if len(unique_trials) > 1:
-        raise NotImplementedError(
-            "fem_solver=True currently supports exactly one TrialFunction "
-            "(scalar or vector valued). Multiple coupled FEM unknowns are not yet supported."
-        )
+        raise NotImplementedError("fem_solver=True currently supports exactly one TrialFunction " "(scalar or vector valued). Multiple coupled FEM unknowns are not yet supported.")
 
     trial = unique_trials[0] if unique_trials else None
     value_shape = getattr(trial, "value_shape", ()) if trial is not None else ()
@@ -559,6 +554,7 @@ def _compile_weakform_for_jaxfem(domain, expr, tag: str = "fem_gauss") -> Dict[s
         "vec": vec,
     }
 
+
 def _eval_compiled_volume_integrand(
     domain,
     compiled: Dict[str, Any],
@@ -567,7 +563,7 @@ def _eval_compiled_volume_integrand(
     cell_shape_grads,
     cell_JxW,
     cell_v_grads_JxW,
-    ):
+):
     """
     Evaluate a compiled volume integrand on one cell and return its flattened
     contribution.
@@ -594,7 +590,8 @@ def _eval_compiled_volume_integrand(
     weights = cell_JxW[0]
     wshape = (weights.shape[0],) + (1,) * (val.ndim - 1)
     weighted = val * weights.reshape(wshape)
-    return jax.flatten_util.ravel_pytree(jnp.sum(weighted, axis=0))[0]
+    return ravel_pytree(jnp.sum(weighted, axis=0))[0]
+
 
 def _eval_compiled_surface_integrand(
     domain,
@@ -630,7 +627,8 @@ def _eval_compiled_surface_integrand(
     weights = face_nanson_scale[0]
     wshape = (weights.shape[0],) + (1,) * (val.ndim - 1)
     weighted = val * weights.reshape(wshape)
-    return jax.flatten_util.ravel_pytree(jnp.sum(weighted, axis=0))[0]
+    return ravel_pytree(jnp.sum(weighted, axis=0))[0]
+
 
 def _eval_expr_for_jaxfem(domain, node, local):
     """
@@ -640,23 +638,23 @@ def _eval_expr_for_jaxfem(domain, node, local):
     operations, and function calls.
     """
     if not isinstance(
-            node,
-            (
-                Literal,
-                Constant,
-                TensorTag,
-                Variable,
-                TestFunction,
-                TrialFunction,
-                Jacobian,
-                BinaryOp,
-                FunctionCall,
-            ),
-        ):
-            try:
-                return jnp.asarray(node)
-            except Exception:
-                pass
+        node,
+        (
+            Literal,
+            Constant,
+            TensorTag,
+            Variable,
+            TestFunction,
+            TrialFunction,
+            Jacobian,
+            BinaryOp,
+            FunctionCall,
+        ),
+    ):
+        try:
+            return jnp.asarray(node)
+        except Exception:
+            pass
 
     if isinstance(node, Literal):
         return jnp.asarray(node.value)
@@ -664,13 +662,9 @@ def _eval_expr_for_jaxfem(domain, node, local):
     if isinstance(node, Constant):
         return jnp.asarray(node.value)
 
-    
     if isinstance(node, TensorTag):
         if node.tag not in local["domain_context"]:
-            raise KeyError(
-                f"TensorTag '{node.tag}' not found in FEM domain context. "
-                f"Available: {list(local['domain_context'].keys())}"
-            )
+            raise KeyError(f"TensorTag '{node.tag}' not found in FEM domain context. " f"Available: {list(local['domain_context'].keys())}")
 
         tensor = jnp.asarray(local["domain_context"][node.tag])
 
@@ -679,10 +673,7 @@ def _eval_expr_for_jaxfem(domain, node, local):
         if tensor.ndim >= 1 and tensor.shape[0] == 1:
             tensor = tensor[0]
         elif tensor.ndim >= 1 and tensor.shape[0] > 1:
-            raise NotImplementedError(
-                "fem_solver=True currently supports only singleton-batch TensorTag "
-                f"coefficients. Got shape {tensor.shape} for tag '{node.tag}'."
-            )
+            raise NotImplementedError("fem_solver=True currently supports only singleton-batch TensorTag " f"coefficients. Got shape {tensor.shape} for tag '{node.tag}'.")
 
         if node.dim_index is not None and tensor.ndim >= 1:
             tensor = tensor[..., node.dim_index]
@@ -692,16 +683,13 @@ def _eval_expr_for_jaxfem(domain, node, local):
         # Optional boundary normals, e.g. tag == "n_gauss_wall"
         if isinstance(node.tag, str) and node.tag.startswith("n_"):
             if "boundary_normals" not in local or local["boundary_normals"] is None:
-                raise ValueError(
-                    f"Normal variable '{node.tag}' requested, but no boundary_normals "
-                    f"were provided in the local FEM surface context."
-                )
+                raise ValueError(f"Normal variable '{node.tag}' requested, but no boundary_normals " f"were provided in the local FEM surface context.")
             dim0 = node.dim[0]
-            return local["boundary_normals"][:, dim0:dim0 + 1]
+            return local["boundary_normals"][:, dim0 : dim0 + 1]
 
         pts = local["physical_quad_points"]
         dim0 = node.dim[0]
-        return pts[:, dim0:dim0 + 1]
+        return pts[:, dim0 : dim0 + 1]
 
     if isinstance(node, TestFunction):
         n_comp = _value_shape_num_components(getattr(node, "value_shape", ()))
@@ -721,10 +709,7 @@ def _eval_expr_for_jaxfem(domain, node, local):
         dims = []
         for var in node.variables:
             if not isinstance(var, Variable):
-                raise NotImplementedError(
-                    "fem_solver=True currently expects Jacobian variables to be "
-                    "domain.variable(...) placeholders."
-                )
+                raise NotImplementedError("fem_solver=True currently expects Jacobian variables to be " "domain.variable(...) placeholders.")
             dims.append(var.dim[0])
 
         if len(dims) == 0:
@@ -752,10 +737,7 @@ def _eval_expr_for_jaxfem(domain, node, local):
             #   quad, local_node, basis_comp, physical_comp, derivative_dim
             eye = jnp.eye(n_comp, dtype=grads.dtype)  # (n_comp, n_comp)
 
-            comps = [
-                grads[..., dim0][:, :, None, None] * eye[None, None, :, :]
-                for dim0 in dims
-            ]
+            comps = [grads[..., dim0][:, :, None, None] * eye[None, None, :, :] for dim0 in dims]
 
             if len(comps) == 1:
                 return comps[0]
@@ -763,12 +745,12 @@ def _eval_expr_for_jaxfem(domain, node, local):
             return jnp.stack(comps, axis=-1)
 
         if isinstance(node.target, TrialFunction):
-            grads = local["shape_grads"]   # (n_quad, n_local_nodes, dim)
-            cell_sol = local["cell_sol"]   # (n_local_nodes, vec)
+            grads = local["shape_grads"]  # (n_quad, n_local_nodes, dim)
+            cell_sol = local["cell_sol"]  # (n_local_nodes, vec)
 
             grad_list = [
                 jnp.sum(
-                    grads[:, :, dim0:dim0 + 1] * cell_sol[None, :, :],
+                    grads[:, :, dim0 : dim0 + 1] * cell_sol[None, :, :],
                     axis=1,
                 )  # (n_quad, vec)
                 for dim0 in dims
@@ -791,14 +773,9 @@ def _eval_expr_for_jaxfem(domain, node, local):
             if len(dims) == 1:
                 return _reshape_components_last(flat, value_shape)
             else:
-                return jnp.reshape(
-                    flat,
-                    flat.shape[:1] + tuple(value_shape) + (len(dims),)
-                )
+                return jnp.reshape(flat, flat.shape[:1] + tuple(value_shape) + (len(dims),))
 
-        raise NotImplementedError(
-            "fem_solver=True currently supports gradients of TrialFunction/TestFunction only."
-        )
+        raise NotImplementedError("fem_solver=True currently supports gradients of TrialFunction/TestFunction only.")
 
     if isinstance(node, BinaryOp):
         a = _eval_expr_for_jaxfem(domain, node.left, local)
@@ -813,7 +790,7 @@ def _eval_expr_for_jaxfem(domain, node, local):
         if node.op == "/":
             return a / b
         if node.op == "**":
-            return a ** b
+            return a**b
 
         raise NotImplementedError(f"Unsupported binary operator: {node.op}")
 
@@ -822,9 +799,8 @@ def _eval_expr_for_jaxfem(domain, node, local):
         kwargs = node.kwargs if node.kwargs else {}
         return node.fn(*args, **kwargs)
 
-    raise NotImplementedError(
-        f"Unsupported weak-form node for fem_solver=True: {type(node).__name__}"
-    )
+    raise NotImplementedError(f"Unsupported weak-form node for fem_solver=True: {type(node).__name__}")
+
 
 def _build_grouped_problem(domain, volume_terms, boundary_terms):
     """
@@ -840,10 +816,7 @@ def _build_grouped_problem(domain, volume_terms, boundary_terms):
     solver_ctx = domain._jaxfem_solver_context
 
     vol_expr = _sum_terms(domain, volume_terms) if len(volume_terms) > 0 else None
-    boundary_exprs = {
-        region_id: _sum_terms(domain, terms)
-        for region_id, terms in boundary_terms.items()
-    }
+    boundary_exprs = {region_id: _sum_terms(domain, terms) for region_id, terms in boundary_terms.items()}
 
     if vol_expr is None and len(boundary_exprs) == 0:
         raise ValueError("No terms found for FEM assembly.")
@@ -916,6 +889,7 @@ def _build_grouped_problem(domain, volume_terms, boundary_terms):
             universal_surface_kernels.append(zero_surface_kernel)
 
         else:
+
             def zero_surface_map(u, x):
                 return jnp.array([0.0])
 
@@ -941,11 +915,12 @@ def _build_grouped_problem(domain, volume_terms, boundary_terms):
                         face_shape_grads,
                         face_nanson_scale,
                     )
+
                 return kernel
 
             universal_surface_kernels.append(make_surface_kernel(compiled_expr))
 
-     # --------------------------------------------------
+    # --------------------------------------------------
     # build dirichlet BC info using inferred vec
     # --------------------------------------------------
     dirichlet_bc_info = domain._build_dirichlet_bc_info(
@@ -958,9 +933,7 @@ def _build_grouped_problem(domain, volume_terms, boundary_terms):
     for tag in active_boundary_tags:
         loc_fn = domain._make_tag_location_fn(tag)
         if loc_fn is None:
-            domain.log.warning(
-                f"Boundary tag '{tag}' not found while building FEM surface locations. Skipping."
-            )
+            domain.log.warning(f"Boundary tag '{tag}' not found while building FEM surface locations. Skipping.")
             continue
         location_fns.append(loc_fn)
 
@@ -995,7 +968,6 @@ def _build_grouped_problem(domain, volume_terms, boundary_terms):
         def get_universal_kernels_surface(self_inner):
             return universal_surface_kernels
 
-
     problem = GeneratedProblem(
         solver_ctx["mesh"],
         vec=vec,
@@ -1007,6 +979,7 @@ def _build_grouped_problem(domain, volume_terms, boundary_terms):
     )
 
     return problem, solver_ctx
+
 
 def _flat_to_sol_list(problem, u_flat, dtype=None):
     """
@@ -1024,6 +997,7 @@ def _flat_to_sol_list(problem, u_flat, dtype=None):
 
     return [u_flat.reshape(n, vec)]
 
+
 # --------------------------------
 # grouped fem assembly
 # --------------------------------
@@ -1038,9 +1012,7 @@ def _assemble_fem_residual_grouped(domain, volume_terms, boundary_terms, **kwarg
     try:
         from jax_fem.solver import apply_bc_vec, get_A
     except Exception as exc:
-        raise ImportError(
-            "jax_fem and jax_fem.solver.apply_bc_vec/get_A are required for fem_residual."
-        ) from exc
+        raise ImportError("jax_fem and jax_fem.solver.apply_bc_vec/get_A are required for fem_residual.") from exc
 
     problem, solver_ctx = _build_grouped_problem(domain, volume_terms, boundary_terms)
     n_dofs = problem.fes[0].num_total_nodes * _get_problem_vec(problem)
@@ -1048,8 +1020,8 @@ def _assemble_fem_residual_grouped(domain, volume_terms, boundary_terms, **kwarg
     def residual_fn(u_flat):
         sol_list = _flat_to_sol_list(problem, u_flat)
         raw_res_list = problem.newton_update(sol_list)
-        raw_res_vec = jax.flatten_util.ravel_pytree(raw_res_list)[0]
-        dofs_vec = jax.flatten_util.ravel_pytree(sol_list)[0]
+        raw_res_vec = ravel_pytree(raw_res_list)[0]
+        dofs_vec = ravel_pytree(sol_list)[0]
         res_vec_bc = apply_bc_vec(raw_res_vec, dofs_vec, problem)
         return jnp.asarray(res_vec_bc)
 
@@ -1078,9 +1050,7 @@ def _assemble_fem_system_grouped(domain, volume_terms, boundary_terms, **kwargs)
     try:
         from jax_fem.solver import get_A, apply_bc_vec
     except Exception as exc:
-        raise ImportError(
-            "jax_fem and jax_fem.solver.get_A/apply_bc_vec are required for fem_system."
-        ) from exc
+        raise ImportError("jax_fem and jax_fem.solver.get_A/apply_bc_vec are required for fem_system.") from exc
 
     problem, solver_ctx = _build_grouped_problem(domain, volume_terms, boundary_terms)
 
@@ -1090,8 +1060,8 @@ def _assemble_fem_system_grouped(domain, volume_terms, boundary_terms, **kwargs)
 
     res_list = problem.newton_update(zero_sol)
 
-    dofs0 = jax.flatten_util.ravel_pytree(zero_sol)[0]
-    raw_res_vec = jax.flatten_util.ravel_pytree(res_list)[0]
+    dofs0 = ravel_pytree(zero_sol)[0]
+    raw_res_vec = ravel_pytree(res_list)[0]
 
     res_vec_bc = apply_bc_vec(raw_res_vec, dofs0, problem)
     A = get_A(problem)

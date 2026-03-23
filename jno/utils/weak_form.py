@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from ..trace import (
@@ -38,10 +37,12 @@ def _split_additive_terms(domain, node, sign=1.0):
 
     return [(sign, node)]
 
+
 def _apply_sign(domain, sign, term):
     if sign == 1.0:
         return term
     return Literal(sign) * term
+
 
 def _sum_terms(domain, terms):
     if len(terms) == 0:
@@ -50,6 +51,7 @@ def _sum_terms(domain, terms):
     for t in terms[1:]:
         out = out + t
     return out
+
 
 # --------------------------------
 # variational region helpers
@@ -71,6 +73,7 @@ def _contains_node_type(domain, expr, node_type):
                     return True
 
     return False
+
 
 def _collect_variational_metas(domain, node, out):
     """
@@ -97,8 +100,9 @@ def _collect_variational_metas(domain, node, out):
                 for vv in v:
                     _collect_variational_metas(domain, vv, out)
             else:
-                _collect_variational_metas(domain,v, out)
-    
+                _collect_variational_metas(domain, v, out)
+
+
 def _infer_term_bucket(domain, term):
     """
     Infer whether a term belongs to:
@@ -121,14 +125,10 @@ def _infer_term_bucket(domain, term):
         region_ids = {m["region_id"] for m in metas}
 
         if len(supports) != 1:
-            raise ValueError(
-                f"Mixed supports inside one term are not allowed. Found supports={supports}"
-            )
+            raise ValueError(f"Mixed supports inside one term are not allowed. Found supports={supports}")
 
         if len(region_ids) != 1:
-            raise ValueError(
-                f"Mixed region ids inside one term are not allowed. Found region_ids={region_ids}"
-            )
+            raise ValueError(f"Mixed region ids inside one term are not allowed. Found region_ids={region_ids}")
 
         support = next(iter(supports))
         region_id = next(iter(region_ids))
@@ -136,7 +136,7 @@ def _infer_term_bucket(domain, term):
 
     # Fallback path: no sampled FEM variables, but still a variational term.
     # Example: (u**3 - u) * phi
-    has_trial = _contains_node_type(domain,term, TrialFunction)
+    has_trial = _contains_node_type(domain, term, TrialFunction)
     has_test = _contains_node_type(domain, term, TestFunction)
 
     if has_trial or has_test:
@@ -148,7 +148,8 @@ def _infer_term_bucket(domain, term):
         "  (a) at least one sampled FEM/variational variable, or\n"
         "  (b) a TrialFunction/TestFunction-only variational term, which is "
         "then assumed to be a volume term."
-    )  
+    )
+
 
 def _get_variational_region_meta(domain, support: str, region_id: str):
     """
@@ -159,15 +160,13 @@ def _get_variational_region_meta(domain, support: str, region_id: str):
     for sample_tag, meta in registry.items():
         if meta.get("support") == support and meta.get("region_id") == region_id:
             return meta
-    raise KeyError(
-        f"No variational sampling meta found for support={support!r}, region_id={region_id!r}. "
-        f"Available: {registry}"
-    )
+    raise KeyError(f"No variational sampling meta found for support={support!r}, region_id={region_id!r}. " f"Available: {registry}")
 
 
 # --------------------------------
 # trial substitution / rebind
 # --------------------------------
+
 
 def _rebind_variational_variables(domain, node, target_support: str, target_region_id: str):
     """
@@ -181,7 +180,6 @@ def _rebind_variational_variables(domain, node, target_support: str, target_regi
     Only Variable nodes carrying fem_meta are rewritten. Ordinary non-variational
     variables and tensor tags are left untouched.
     """
-
 
     if node is None:
         return None
@@ -213,68 +211,48 @@ def _rebind_variational_variables(domain, node, target_support: str, target_regi
         return node
 
     if isinstance(node, FunctionCall):
-        new_args = [
-            _rebind_variational_variables(domain, a, target_support, target_region_id)
-            if isinstance(a, Placeholder) else a
-            for a in node.args
-        ]
+        new_args = [_rebind_variational_variables(domain, a, target_support, target_region_id) if isinstance(a, Placeholder) else a for a in node.args]
         if any(n is not o for n, o in zip(new_args, node.args)):
             return FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
         return node
 
     if isinstance(node, ModelCall):
-        new_args = [
-            _rebind_variational_variables(domain, a, target_support, target_region_id)
-            if isinstance(a, Placeholder) else a
-            for a in node.args
-        ]
+        new_args = [_rebind_variational_variables(domain, a, target_support, target_region_id) if isinstance(a, Placeholder) else a for a in node.args]
         if any(n is not o for n, o in zip(new_args, node.args)):
-            new_node = ModelCall(node.model, new_args)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_model_call = ModelCall(node.model, new_args)
+            rebuilt_model_call.op_id = node.op_id
+            return rebuilt_model_call
         return node
 
     if isinstance(node, OperationDef):
         new_expr = _rebind_variational_variables(domain, node.expr, target_support, target_region_id)
         if new_expr is not node.expr:
-            new_node = OperationDef.__new__(OperationDef)
-            new_node.expr = new_expr
-            new_node.input_vars = node.input_vars
-            new_node.name = getattr(node, "name", None)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_operation_def = OperationDef.__new__(OperationDef)
+            rebuilt_operation_def.expr = new_expr
+            rebuilt_operation_def.input_vars = node.input_vars
+            rebuilt_operation_def.name = getattr(node, "name", None)
+            rebuilt_operation_def.op_id = node.op_id
+            return rebuilt_operation_def
         return node
 
     if isinstance(node, OperationCall):
-        new_args = [
-            _rebind_variational_variables(domain, a, target_support, target_region_id)
-            if isinstance(a, Placeholder) else a
-            for a in node.args
-        ]
+        new_args = [_rebind_variational_variables(domain, a, target_support, target_region_id) if isinstance(a, Placeholder) else a for a in node.args]
         if any(n is not o for n, o in zip(new_args, node.args)):
-            new_node = OperationCall(node.op_def, new_args)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_operation_call = OperationCall(node.operation, tuple(new_args))
+            rebuilt_operation_call.op_id = node.op_id
+            return rebuilt_operation_call
         return node
 
     if isinstance(node, Jacobian):
         new_target = _rebind_variational_variables(domain, node.target, target_support, target_region_id)
-        new_vars = [
-            _rebind_variational_variables(domain, v, target_support, target_region_id)
-            if isinstance(v, Placeholder) else v
-            for v in node.variables
-        ]
+        new_vars = [_rebind_variational_variables(domain, v, target_support, target_region_id) if isinstance(v, Placeholder) else v for v in node.variables]
         if new_target is not node.target or any(n is not o for n, o in zip(new_vars, node.variables)):
             return Jacobian(new_target, new_vars, node.scheme)
         return node
 
     if isinstance(node, Hessian):
         new_target = _rebind_variational_variables(domain, node.target, target_support, target_region_id)
-        new_vars = [
-            _rebind_variational_variables(domain, v, target_support, target_region_id)
-            if isinstance(v, Placeholder) else v
-            for v in node.variables
-        ]
+        new_vars = [_rebind_variational_variables(domain, v, target_support, target_region_id) if isinstance(v, Placeholder) else v for v in node.variables]
         if new_target is not node.target or any(n is not o for n, o in zip(new_vars, node.variables)):
             return Hessian(new_target, new_vars, node.scheme)
         return node
@@ -282,34 +260,29 @@ def _rebind_variational_variables(domain, node, target_support: str, target_regi
     if isinstance(node, Tracker):
         new_expr = _rebind_variational_variables(domain, node.expr, target_support, target_region_id)
         if new_expr is not node.expr:
-            new_node = Tracker(new_expr, interval=node.interval)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_tracker = Tracker(new_expr, interval=node.interval)
+            rebuilt_tracker.op_id = node.op_id
+            return rebuilt_tracker
         return node
 
     if isinstance(node, Assembly):
         new_expr = _rebind_variational_variables(domain, node.expr, target_support, target_region_id)
         if new_expr is not node.expr:
-            new_node = Assembly(new_expr)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_assembly = Assembly(new_expr, node.num_total_nodes, node.support, node.region_id)
+            rebuilt_assembly.op_id = node.op_id
+            return rebuilt_assembly
         return node
 
     if isinstance(node, GroupedAssembly):
-        vol_expr = _rebind_variational_variables(domain, node.volume_expr, target_support, target_region_id) \
-            if node.volume_expr is not None else None
-        bnd_exprs = {
-            k: _rebind_variational_variables(domain, v, target_support, target_region_id)
-            for k, v in node.boundary_exprs.items()
-        }
+        vol_expr = _rebind_variational_variables(domain, node.volume_expr, target_support, target_region_id) if node.volume_expr is not None else None
+        bnd_exprs = {k: _rebind_variational_variables(domain, v, target_support, target_region_id) for k, v in node.boundary_exprs.items()}
         if vol_expr is not node.volume_expr or any(bnd_exprs[k] is not node.boundary_exprs[k] for k in bnd_exprs):
-            new_node = GroupedAssembly(vol_expr, bnd_exprs, node.domain)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_grouped_assembly = GroupedAssembly(vol_expr, bnd_exprs, node.num_total_nodes)
+            rebuilt_grouped_assembly.op_id = node.op_id
+            return rebuilt_grouped_assembly
         return node
 
     return node
-
 
 
 def _substitute_trial_for_vpinn(
@@ -319,7 +292,6 @@ def _substitute_trial_for_vpinn(
     target_support: str | None = None,
     target_region_id: str | None = None,
 ):
-    
     """
     Replace symbolic ``TrialFunction`` nodes with a concrete VPINN trial
     expression.
@@ -352,68 +324,48 @@ def _substitute_trial_for_vpinn(
         return node
 
     if isinstance(node, FunctionCall):
-        new_args = [
-            _substitute_trial_for_vpinn(domain, a, trial_value, target_support, target_region_id)
-            if isinstance(a, Placeholder) else a
-            for a in node.args
-        ]
+        new_args = [_substitute_trial_for_vpinn(domain, a, trial_value, target_support, target_region_id) if isinstance(a, Placeholder) else a for a in node.args]
         if any(n is not o for n, o in zip(new_args, node.args)):
             return FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
         return node
 
     if isinstance(node, ModelCall):
-        new_args = [
-            _substitute_trial_for_vpinn(domain, a, trial_value, target_support, target_region_id)
-            if isinstance(a, Placeholder) else a
-            for a in node.args
-        ]
+        new_args = [_substitute_trial_for_vpinn(domain, a, trial_value, target_support, target_region_id) if isinstance(a, Placeholder) else a for a in node.args]
         if any(n is not o for n, o in zip(new_args, node.args)):
-            new_node = ModelCall(node.model, new_args)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_model_call = ModelCall(node.model, new_args)
+            rebuilt_model_call.op_id = node.op_id
+            return rebuilt_model_call
         return node
 
     if isinstance(node, OperationDef):
         new_expr = _substitute_trial_for_vpinn(domain, node.expr, trial_value, target_support, target_region_id)
         if new_expr is not node.expr:
-            new_node = OperationDef.__new__(OperationDef)
-            new_node.expr = new_expr
-            new_node.input_vars = node.input_vars
-            new_node.name = getattr(node, "name", None)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_operation_def = OperationDef.__new__(OperationDef)
+            rebuilt_operation_def.expr = new_expr
+            rebuilt_operation_def.input_vars = node.input_vars
+            rebuilt_operation_def.name = getattr(node, "name", None)
+            rebuilt_operation_def.op_id = node.op_id
+            return rebuilt_operation_def
         return node
 
     if isinstance(node, OperationCall):
-        new_args = [
-            _substitute_trial_for_vpinn(domain, a, trial_value, target_support, target_region_id)
-            if isinstance(a, Placeholder) else a
-            for a in node.args
-        ]
+        new_args = [_substitute_trial_for_vpinn(domain, a, trial_value, target_support, target_region_id) if isinstance(a, Placeholder) else a for a in node.args]
         if any(n is not o for n, o in zip(new_args, node.args)):
-            new_node = OperationCall(node.op_def, new_args)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_operation_call = OperationCall(node.operation, tuple(new_args))
+            rebuilt_operation_call.op_id = node.op_id
+            return rebuilt_operation_call
         return node
 
     if isinstance(node, Jacobian):
         new_target = _substitute_trial_for_vpinn(domain, node.target, trial_value, target_support, target_region_id)
-        new_vars = [
-            _substitute_trial_for_vpinn(domain, v, trial_value, target_support, target_region_id)
-            if isinstance(v, Placeholder) else v
-            for v in node.variables
-        ]
+        new_vars = [_substitute_trial_for_vpinn(domain, v, trial_value, target_support, target_region_id) if isinstance(v, Placeholder) else v for v in node.variables]
         if new_target is not node.target or any(n is not o for n, o in zip(new_vars, node.variables)):
             return Jacobian(new_target, new_vars, node.scheme)
         return node
 
     if isinstance(node, Hessian):
         new_target = _substitute_trial_for_vpinn(domain, node.target, trial_value, target_support, target_region_id)
-        new_vars = [
-            _substitute_trial_for_vpinn(domain, v, trial_value, target_support, target_region_id)
-            if isinstance(v, Placeholder) else v
-            for v in node.variables
-        ]
+        new_vars = [_substitute_trial_for_vpinn(domain, v, trial_value, target_support, target_region_id) if isinstance(v, Placeholder) else v for v in node.variables]
         if new_target is not node.target or any(n is not o for n, o in zip(new_vars, node.variables)):
             return Hessian(new_target, new_vars, node.scheme)
         return node
@@ -421,39 +373,35 @@ def _substitute_trial_for_vpinn(
     if isinstance(node, Tracker):
         new_expr = _substitute_trial_for_vpinn(domain, node.expr, trial_value, target_support, target_region_id)
         if new_expr is not node.expr:
-            new_node = Tracker(new_expr, interval=node.interval)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_tracker = Tracker(new_expr, interval=node.interval)
+            rebuilt_tracker.op_id = node.op_id
+            return rebuilt_tracker
         return node
 
     if isinstance(node, Assembly):
         new_expr = _substitute_trial_for_vpinn(domain, node.expr, trial_value, target_support, target_region_id)
         if new_expr is not node.expr:
-            new_node = Assembly(new_expr)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_assembly = Assembly(new_expr, node.num_total_nodes, node.support, node.region_id)
+            rebuilt_assembly.op_id = node.op_id
+            return rebuilt_assembly
         return node
 
     if isinstance(node, GroupedAssembly):
-        vol_expr = (
-            _substitute_trial_for_vpinn(domain, node.volume_expr, trial_value, target_support, target_region_id)
-            if node.volume_expr is not None else None
-        )
-        bnd_exprs = {
-            k: _substitute_trial_for_vpinn(domain, v, trial_value, target_support, target_region_id)
-            for k, v in node.boundary_exprs.items()
-        }
+        vol_expr = _substitute_trial_for_vpinn(domain, node.volume_expr, trial_value, target_support, target_region_id) if node.volume_expr is not None else None
+        bnd_exprs = {k: _substitute_trial_for_vpinn(domain, v, trial_value, target_support, target_region_id) for k, v in node.boundary_exprs.items()}
         if vol_expr is not node.volume_expr or any(bnd_exprs[k] is not node.boundary_exprs[k] for k in bnd_exprs):
-            new_node = GroupedAssembly(vol_expr, bnd_exprs, node.domain)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_grouped_assembly = GroupedAssembly(vol_expr, bnd_exprs, node.num_total_nodes)
+            rebuilt_grouped_assembly.op_id = node.op_id
+            return rebuilt_grouped_assembly
         return node
 
     return node
 
+
 # --------------------------------
 # grouped weak-form assembly
 # --------------------------------
+
 
 def assemble_weak_form(domain, expr, target="vpinn", **kwargs):
     """
@@ -509,31 +457,26 @@ def assemble_weak_form(domain, expr, target="vpinn", **kwargs):
 
     if target == "fem_system":
         from .fem_route import _assemble_fem_system_grouped
+
         return _assemble_fem_system_grouped(domain, volume_terms, boundary_terms, **kwargs)
 
     if target == "fem_residual":
         from .fem_route import _assemble_fem_residual_grouped
+
         return _assemble_fem_residual_grouped(domain, volume_terms, boundary_terms, **kwargs)
 
-    raise ValueError(
-        f"Unknown assembly target '{target}'. Supported: 'vpinn', 'fem_system', 'fem_residual'"
-    )
+    raise ValueError(f"Unknown assembly target '{target}'. Supported: 'vpinn', 'fem_system', 'fem_residual'")
+
 
 def _assemble_vpinn_grouped(domain, volume_terms, boundary_terms, **kwargs):
     """
     Assemble grouped VPINN volume and boundary terms into one internal node.
     """
 
-
-    vol_expr = _sum_terms(domain,volume_terms) if len(volume_terms) > 0 else None
-    boundary_exprs = {
-        region_id: _sum_terms(domain, terms)
-        for region_id, terms in boundary_terms.items()
-    }
+    vol_expr = _sum_terms(domain, volume_terms) if len(volume_terms) > 0 else None
+    boundary_exprs = {region_id: _sum_terms(domain, terms) for region_id, terms in boundary_terms.items()}
 
     if vol_expr is None and len(boundary_exprs) == 0:
         raise ValueError("No terms found for VPINN assembly.")
 
     return GroupedAssembly(vol_expr, boundary_exprs, domain)
-
-

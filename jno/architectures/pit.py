@@ -191,7 +191,7 @@ class PiT(eqx.Module):
     up: MultiHeadPosAtt
     de_fc1: Linear
     de_fc2: Linear
-    m_dists: jnp.ndarray
+    m_dists: Sequence[jnp.ndarray]
     in_channels: int = eqx.field(static=True)
     out_channels: int = eqx.field(static=True)
     hid_channels: int = eqx.field(static=True)
@@ -214,7 +214,7 @@ class PiT(eqx.Module):
         self.out_channels = out_channels
         self.hid_channels = hid_channels
         self.n_head = n_head
-        self.localities = tuple(localities)  # type: ignore[assignment]
+        self.localities = tuple(localities)
         self.m_dists = m_dists
         self.n_blocks = len(localities) - 2
 

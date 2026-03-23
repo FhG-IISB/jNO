@@ -101,7 +101,7 @@ def load(
                 f.read(length)
             else:
                 f.seek(0)
-            instance: Any = cloudpickle.load(f)
+            instance = cloudpickle.load(f)
 
     if not isinstance(instance, (core, domain, IREEModel)):
         raise TypeError(f"Loaded object has unsupported type: {type(instance).__name__}")

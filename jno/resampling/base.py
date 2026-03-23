@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import jax
 
 from ..trace import get_primary_tag
+from ..utils.logger import Logger, PrintFallback, get_logger
 
 
 class ResamplingStrategy(ABC):
@@ -28,6 +29,7 @@ class ResamplingStrategy(ABC):
         self.resample_fraction = resample_fraction
         self.start_epoch = start_epoch
         self._last_resample_epoch = -1
+        self.log: Logger | PrintFallback = get_logger()
 
     def should_resample(self, epoch: int) -> bool:
         """Check if resampling should occur at this epoch.
