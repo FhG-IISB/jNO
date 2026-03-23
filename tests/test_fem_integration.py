@@ -14,6 +14,7 @@ from jno import dirichlet, neumann
 # Helpers
 # ============================================================
 
+
 def make_domain(mesh_size=0.25):
     """Create a small rectangular domain for fast FEM tests."""
     return jno.domain(constructor=jno.domain.rect(mesh_size=mesh_size))
@@ -31,6 +32,7 @@ def to_dense(A):
 # ============================================================
 # FEM init / context
 # ============================================================
+
 
 class TestFemInit:
     def test_init_fem_registers_volume_and_boundary_quadrature(self):
@@ -105,6 +107,7 @@ class TestFemInit:
 # Symbolic FEM symbols
 # ============================================================
 
+
 class TestFemSymbols:
     def test_scalar_fem_symbols(self):
         dom = make_domain()
@@ -124,6 +127,7 @@ class TestFemSymbols:
 # ============================================================
 # Linear scalar FEM assembly
 # ============================================================
+
 
 class TestFemLinearAssembly:
     def test_scalar_poisson_fem_system_assembles(self):
@@ -162,6 +166,7 @@ class TestFemLinearAssembly:
 # Linear vector FEM assembly
 # ============================================================
 
+
 class TestFemVectorAssembly:
     def test_linear_elasticity_like_system_assembles(self):
         dom = make_domain()
@@ -171,7 +176,7 @@ class TestFemVectorAssembly:
             quad_degree=2,
             bcs=[dom.dirichlet(["left", "right", "top", "bottom"], (0.0, 0.0))],
             fem_solver=True,
-            vec=2,   # keep if your current init_fem still needs it
+            vec=2,  # keep if your current init_fem still needs it
         )
 
         u, phi = dom.fem_symbols(value_shape=(2,))
@@ -197,6 +202,7 @@ class TestFemVectorAssembly:
 # ============================================================
 # Boundary-tagged weak forms
 # ============================================================
+
 
 class TestFemBoundaryAssembly:
     def test_neumann_boundary_quadrature_tag_is_usable(self):
@@ -239,6 +245,7 @@ class TestFemBoundaryAssembly:
 # ============================================================
 # Nonlinear FEM residual route
 # ============================================================
+
 
 class TestFemResidualRoute:
     def test_nonlinear_residual_operator_builds(self):
@@ -299,6 +306,7 @@ class TestFemBCNormalization:
         assert "left" in dom._fem_dirichlet_value_fns
         assert "bottom" in dom._fem_dirichlet_value_fns
 
+
 class TestFemBCValidation:
     def test_dirichlet_tuple_length_mismatch_raises(self):
         dom = make_domain()
@@ -325,6 +333,7 @@ class TestFemBCValidation:
                 bcs=[dirichlet("right")],
                 fem_solver=True,
             )
+
 
 class TestFemSurfaceRegistration:
     def test_multiple_neumann_tags_register_surface_data(self):

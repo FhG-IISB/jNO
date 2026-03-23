@@ -267,6 +267,7 @@ def transpose(x, axes: tuple = None) -> FunctionCall:
     """Transpose array."""
     return FunctionCall(lambda a: jnp.transpose(a, axes=axes), [x])
 
+
 def trace(x) -> FunctionCall:
     """
     Trace of a matrix/tensor over the last two axes.
@@ -353,6 +354,8 @@ def symgrad(target: Placeholder, variables: List[Variable], scheme: str = "autom
         [G],
         name="symgrad",
     )
+
+
 # ============================================================================
 # Reduction operations
 # ============================================================================
@@ -463,6 +466,7 @@ def inner(x, y, n_contract: int = 1, keepdims: bool = False) -> FunctionCall:
 
     return FunctionCall(_fn, [x, y], name="inner", reduces_axis=-1)
 
+
 def double_dot(x, y) -> FunctionCall:
     """
     Double contraction / Frobenius product.
@@ -471,6 +475,7 @@ def double_dot(x, y) -> FunctionCall:
         inner(x, y, n_contract=2)
     """
     return inner(x, y, n_contract=2)
+
 
 def einsum(subscripts: str, *operands) -> FunctionCall:
     """Traced jnp.einsum wrapper for compact tensor/vector contractions."""
@@ -484,6 +489,7 @@ def einsum(subscripts: str, *operands) -> FunctionCall:
 def div(vector_field: List[Placeholder], variables: List[Variable]) -> Placeholder:
     """Alias for divergence."""
     return divergence(vector_field, variables)
+
 
 def grad(target: Placeholder, variable: Variable, scheme: str = "automatic_differentiation") -> Jacobian:
     """
@@ -648,13 +654,16 @@ def curl_3d(Fx: Placeholder, Fy: Placeholder, Fz: Placeholder, x: Variable, y: V
     curl_z = Jacobian(Fy, [x]) - Jacobian(Fx, [y])
     return stack([curl_x, curl_y, curl_z], axis=-1)
 
+
 def test(name: str = "phi") -> TestFunction:
     """Create a generic variational test function symbol."""
     return TestFunction(name=name)
 
+
 def trial(name: str = "u") -> TrialFunction:
     """Create a generic variational unknown symbol."""
     return TrialFunction(name=name)
+
 
 # ============================================================================
 # Array creation and dtypes — plain re-exports from jax.numpy

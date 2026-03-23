@@ -407,21 +407,7 @@ class DifferentialOperators:
         cot2 = jnp.clip(cot2, -10.0, 10.0)
 
         # Accumulate: edge (i,j) opposite k → weight cot2, etc.
-        lap = (
-            jnp.zeros(N)
-            .at[i_idx]
-            .add(cot2 * (u1 - u0))
-            .at[j_idx]
-            .add(cot2 * (u0 - u1))
-            .at[j_idx]
-            .add(cot0 * (u2 - u1))
-            .at[k_idx]
-            .add(cot0 * (u1 - u2))
-            .at[i_idx]
-            .add(cot1 * (u2 - u0))
-            .at[k_idx]
-            .add(cot1 * (u0 - u2))
-        )
+        lap = jnp.zeros(N).at[i_idx].add(cot2 * (u1 - u0)).at[j_idx].add(cot2 * (u0 - u1)).at[j_idx].add(cot0 * (u2 - u1)).at[k_idx].add(cot0 * (u1 - u2)).at[i_idx].add(cot1 * (u2 - u0)).at[k_idx].add(cot1 * (u0 - u2))
 
         # A_i = 2 * (barycentric dual area) because the standard cotangent
         # Laplacian formula is  (Δu)_i = (1/(2*A_i)) * Σ_j (cot α + cot β)(u_j-u_i)
@@ -504,22 +490,14 @@ class DifferentialOperators:
             u_values[l_idx],
         )
         v1, v2, v3 = p1 - p0, p2 - p0, p3 - p0
-        volumes = (
-            jnp.abs(v1[:, 0] * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1]) - v1[:, 1] * (v2[:, 0] * v3[:, 2] - v2[:, 2] * v3[:, 0]) + v1[:, 2] * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0])) / 6.0
-        )
+        volumes = jnp.abs(v1[:, 0] * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1]) - v1[:, 1] * (v2[:, 0] * v3[:, 2] - v2[:, 2] * v3[:, 0]) + v1[:, 2] * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0])) / 6.0
 
         if dim == 0:
-            grads = ((u1 - u0) * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1]) + (u2 - u0) * (v3[:, 1] * v1[:, 2] - v3[:, 2] * v1[:, 1]) + (u3 - u0) * (v1[:, 1] * v2[:, 2] - v1[:, 2] * v2[:, 1])) / (
-                6 * volumes + 1e-12
-            )
+            grads = ((u1 - u0) * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1]) + (u2 - u0) * (v3[:, 1] * v1[:, 2] - v3[:, 2] * v1[:, 1]) + (u3 - u0) * (v1[:, 1] * v2[:, 2] - v1[:, 2] * v2[:, 1])) / (6 * volumes + 1e-12)
         elif dim == 1:
-            grads = ((u1 - u0) * (v2[:, 2] * v3[:, 0] - v2[:, 0] * v3[:, 2]) + (u2 - u0) * (v3[:, 2] * v1[:, 0] - v3[:, 0] * v1[:, 2]) + (u3 - u0) * (v1[:, 2] * v2[:, 0] - v1[:, 0] * v2[:, 2])) / (
-                6 * volumes + 1e-12
-            )
+            grads = ((u1 - u0) * (v2[:, 2] * v3[:, 0] - v2[:, 0] * v3[:, 2]) + (u2 - u0) * (v3[:, 2] * v1[:, 0] - v3[:, 0] * v1[:, 2]) + (u3 - u0) * (v1[:, 2] * v2[:, 0] - v1[:, 0] * v2[:, 2])) / (6 * volumes + 1e-12)
         else:
-            grads = ((u1 - u0) * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0]) + (u2 - u0) * (v3[:, 0] * v1[:, 1] - v3[:, 1] * v1[:, 0]) + (u3 - u0) * (v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0])) / (
-                6 * volumes + 1e-12
-            )
+            grads = ((u1 - u0) * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0]) + (u2 - u0) * (v3[:, 0] * v1[:, 1] - v3[:, 1] * v1[:, 0]) + (u3 - u0) * (v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0])) / (6 * volumes + 1e-12)
 
         grads = jnp.where(volumes > 1e-12, grads, 0.0)
 

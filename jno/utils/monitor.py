@@ -91,9 +91,7 @@ def _format_hw_line(cpu_ram: dict, gpus: list[dict]) -> str:
         parts.append(f"RAM {cpu_ram['ram_used_gb']:.1f}/{cpu_ram['ram_total_gb']:.1f} GB")
     for g in gpus:
         idx = g["gpu_index"]
-        parts.append(
-            f"gpu{idx}: util={g['gpu_util_pct']:.0f}%" f" mem={g['gpu_mem_used_mb']:.0f}/{g['gpu_mem_total_mb']:.0f} MB" f" temp={g['gpu_temp_c']:.0f}\u00b0C" f" power={g['gpu_power_w']:.0f}W"
-        )
+        parts.append(f"gpu{idx}: util={g['gpu_util_pct']:.0f}%" f" mem={g['gpu_mem_used_mb']:.0f}/{g['gpu_mem_total_mb']:.0f} MB" f" temp={g['gpu_temp_c']:.0f}\u00b0C" f" power={g['gpu_power_w']:.0f}W")
     return "HW | " + " | ".join(parts)
 
 

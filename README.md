@@ -25,7 +25,7 @@
 # Install
 
 ```bash
-pip install jno
+pip install jax-neural-operators
 ```
 
 ### Foundation Models
