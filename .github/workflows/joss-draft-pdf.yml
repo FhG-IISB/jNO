@@ -1,0 +1,42 @@
+name: JOSS Draft PDF
+
+on:
+  push:
+    paths:
+      - paper.md
+      - references.bib
+      - assets/**
+      - .github/workflows/joss-draft-pdf.yml
+  pull_request:
+    paths:
+      - paper.md
+      - references.bib
+      - assets/**
+      - .github/workflows/joss-draft-pdf.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  paper:
+    name: Build JOSS Draft
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build draft PDF
+        uses: openjournals/openjournals-draft-action@v1.0
+        with:
+          journal: joss
+          paper-path: paper.md
+
+      - name: Upload draft PDF
+        uses: actions/upload-artifact@v4
+        with:
+          name: joss-paper-draft
+          path: paper.pdf
+          if-no-files-found: error
