@@ -21,6 +21,9 @@ jobs:
     - name: Install dependencies
       run: uv sync --all-extras --no-extra cuda
 
+    - name: Format with Black
+      run: uv run black --line-length 250 jno/ tests/
+
     - name: Check formatting with black
       run: uv run black --check --line-length 250 jno/ tests/
 
