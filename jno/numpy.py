@@ -612,7 +612,7 @@ def divergence(vector_field: List[Placeholder], variables: List[Variable]) -> Pl
     if len(vector_field) != len(variables):
         raise ValueError("vector_field and variables must have same length")
 
-    result = Jacobian(vector_field[0], [variables[0]])
+    result: Placeholder = Jacobian(vector_field[0], [variables[0]])
     for i in range(1, len(vector_field)):
         result = result + Jacobian(vector_field[i], [variables[i]])
     return result

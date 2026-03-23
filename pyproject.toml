@@ -86,6 +86,9 @@ members = [
 [tool.black]
 line-length = 250
 
+[tool.mypy]
+exclude = '^(build/|jNO\.egg-info/|runs/)'
+
 [tool.uv.sources]
 jno = { workspace = true}
 

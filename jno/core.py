@@ -245,7 +245,7 @@ class core:
 
     def wrap_constraints(self, constraints: List) -> List:
         """Auto-wrap raw expressions in OperationDef."""
-        wrapped = []
+        wrapped: List[Any] = []
         for expr in constraints:
             if isinstance(expr, (OperationDef, OperationCall)):
                 wrapped.append(expr)
@@ -881,7 +881,7 @@ class core:
         trainable = self._shard_params(trainable)
 
         # ── 5. Build per-model optimizers ──
-        per_model_opts = {}  # {str(lid): optax chain}
+        per_model_opts: Dict[str, optax.GradientTransformation] = {}  # {str(lid): optax chain}
         lr_schedules: Dict[str, Any] = {}  # {str(lid): LearningRateSchedule} — global only
         group_lr_schedules: Dict[str, Any] = {}  # {str(lid): [sched_per_masked_group]} — when groups present
         zeros = jnp.zeros(self.n_constraints)
@@ -1242,7 +1242,7 @@ class core:
             _profile_start = _profile_skip_steps
             _profile_stop = _profile_start + _profile_steps
             _profile_active = False
-            _profile_ctx = nullcontext()
+            _profile_ctx: Any = nullcontext()
 
             for outer_epoch in range(n_outer):
                 if (not _profile_active) and _profile_steps > 0 and outer_epoch == _profile_start:

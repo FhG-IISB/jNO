@@ -8,7 +8,7 @@ import meshio
 import cloudpickle
 
 from .trace import Variable, TensorTag, Literal, BinaryOp, FunctionCall, Jacobian, TestFunction, TrialFunction, Constant, FemLinearSystem, Assembly
-from .utils.logger import get_logger, Logger
+from .utils.logger import get_logger, Logger, PrintFallback
 
 
 @dataclass
@@ -1519,11 +1519,11 @@ class MeshUtils:
         """
         import numpy as np
 
-        triangles = np.asarray(triangles)
+        triangles_np = np.asarray(triangles)
 
         # Collect all edges (sorted to make undirected)
         edges = []
-        for tri in triangles:
+        for tri in triangles_np:
             for k in range(3):
                 e = tuple(sorted([tri[k], tri[(k + 1) % 3]]))
                 edges.append(e)
@@ -1757,6 +1757,13 @@ class BoundaryRegion:
 
 class MeshIOMixin(MeshUtils):
     """Mesh loading and export helpers shared by domain-like classes."""
+
+    log: Logger | PrintFallback
+    context: Dict[str, Any]
+    _param_tags: set[str]
+    spatial: List[str]
+    mesh: meshio.Mesh | None
+    dimension: int
 
     def _load_mesh(self, mesh_file: str):
         """Load mesh from file using Meshio."""
@@ -2076,7 +2083,7 @@ class domain(MeshIOMixin, Geometries):
 
         # Storage
         self.compute_mesh_connectivity = compute_mesh_connectivity
-        self._mesh_pool: Dict[str, np.ndarray] = {}  # full mesh vertices per tag (M, D)
+        self._mesh_pool: Dict[str, Any] = {}  # full mesh vertices per tag (M, D)
         self.context: Dict[str, Any] = {}  # unified: spatial (B,N,D) + params (B,F)
         self._param_tags: set = set()  # tags that are parametric (TensorTag)
         self.normals_by_tag: Dict[str, np.ndarray] = {}
@@ -2093,8 +2100,6 @@ class domain(MeshIOMixin, Geometries):
         self.avaiable_mesh_tags: List[str] = []  # names of the tags from the mesh generator
         self._boundary_loop_tags: set = set()  # tags extracted from line cells (boundary loops)
         self.mesh_connectivity: Optional[Dict[str, Any]] = None  # precomputed mesh connectivity data
-        self._tag_triangles: Dict[str, np.ndarray] = {}  # triangle cells per volume tag
-
         # Resampling support
         self._mesh_points: Dict[str, np.ndarray] = {}  # Full mesh points for resampling
         self._resampling_strategies: Dict[str, Any] = {}  # Tag -> ResamplingStrategy
@@ -2627,11 +2632,11 @@ class domain(MeshIOMixin, Geometries):
         fe = prob.fes[0]
 
         # --- Identify Dirichlet node indices ---
-        dirichlet_nodes = []
+        dirichlet_node_ids: List[int] = []
         for node_inds in getattr(fe, "node_inds_list", []):
-            dirichlet_nodes.extend(np.asarray(node_inds).reshape(-1).tolist())
+            dirichlet_node_ids.extend(np.asarray(node_inds).reshape(-1).tolist())
 
-        dirichlet_nodes = jnp.array(sorted(set(dirichlet_nodes)), dtype=jnp.int32) if dirichlet_nodes else jnp.array([], dtype=jnp.int32)
+        dirichlet_nodes = jnp.array(sorted(set(dirichlet_node_ids)), dtype=jnp.int32) if dirichlet_node_ids else jnp.array([], dtype=jnp.int32)
         # --- Precompute Constants for Fast Assembly ---
         shape_vals_jax = jnp.asarray(fe.shape_vals)
         shape_grads_jax = jnp.asarray(fe.shape_grads)

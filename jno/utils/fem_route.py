@@ -5,6 +5,7 @@ from typing import Any, Dict, Sequence
 import numpy as np
 import jax
 import jax.numpy as jnp
+from jax.flatten_util import ravel_pytree
 from ..trace import (
     Literal,
     Constant,
@@ -589,7 +590,7 @@ def _eval_compiled_volume_integrand(
     weights = cell_JxW[0]
     wshape = (weights.shape[0],) + (1,) * (val.ndim - 1)
     weighted = val * weights.reshape(wshape)
-    return jax.flatten_util.ravel_pytree(jnp.sum(weighted, axis=0))[0]
+    return ravel_pytree(jnp.sum(weighted, axis=0))[0]
 
 
 def _eval_compiled_surface_integrand(
@@ -626,7 +627,7 @@ def _eval_compiled_surface_integrand(
     weights = face_nanson_scale[0]
     wshape = (weights.shape[0],) + (1,) * (val.ndim - 1)
     weighted = val * weights.reshape(wshape)
-    return jax.flatten_util.ravel_pytree(jnp.sum(weighted, axis=0))[0]
+    return ravel_pytree(jnp.sum(weighted, axis=0))[0]
 
 
 def _eval_expr_for_jaxfem(domain, node, local):
@@ -1019,8 +1020,8 @@ def _assemble_fem_residual_grouped(domain, volume_terms, boundary_terms, **kwarg
     def residual_fn(u_flat):
         sol_list = _flat_to_sol_list(problem, u_flat)
         raw_res_list = problem.newton_update(sol_list)
-        raw_res_vec = jax.flatten_util.ravel_pytree(raw_res_list)[0]
-        dofs_vec = jax.flatten_util.ravel_pytree(sol_list)[0]
+        raw_res_vec = ravel_pytree(raw_res_list)[0]
+        dofs_vec = ravel_pytree(sol_list)[0]
         res_vec_bc = apply_bc_vec(raw_res_vec, dofs_vec, problem)
         return jnp.asarray(res_vec_bc)
 
@@ -1059,8 +1060,8 @@ def _assemble_fem_system_grouped(domain, volume_terms, boundary_terms, **kwargs)
 
     res_list = problem.newton_update(zero_sol)
 
-    dofs0 = jax.flatten_util.ravel_pytree(zero_sol)[0]
-    raw_res_vec = jax.flatten_util.ravel_pytree(res_list)[0]
+    dofs0 = ravel_pytree(zero_sol)[0]
+    raw_res_vec = ravel_pytree(res_list)[0]
 
     res_vec_bc = apply_bc_vec(raw_res_vec, dofs0, problem)
     A = get_A(problem)

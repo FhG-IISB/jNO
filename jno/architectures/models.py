@@ -173,6 +173,7 @@ class nn:
 
     """
 
+    @staticmethod
     def linear(in_features: int, out_features: int, use_bias: bool = True, *, key: Any):
         return Linear(in_features, out_features, use_bias, key=key)
 

@@ -219,28 +219,28 @@ def _rebind_variational_variables(domain, node, target_support: str, target_regi
     if isinstance(node, ModelCall):
         new_args = [_rebind_variational_variables(domain, a, target_support, target_region_id) if isinstance(a, Placeholder) else a for a in node.args]
         if any(n is not o for n, o in zip(new_args, node.args)):
-            new_node = ModelCall(node.model, new_args)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_model_call = ModelCall(node.model, new_args)
+            rebuilt_model_call.op_id = node.op_id
+            return rebuilt_model_call
         return node
 
     if isinstance(node, OperationDef):
         new_expr = _rebind_variational_variables(domain, node.expr, target_support, target_region_id)
         if new_expr is not node.expr:
-            new_node = OperationDef.__new__(OperationDef)
-            new_node.expr = new_expr
-            new_node.input_vars = node.input_vars
-            new_node.name = getattr(node, "name", None)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_operation_def = OperationDef.__new__(OperationDef)
+            rebuilt_operation_def.expr = new_expr
+            rebuilt_operation_def.input_vars = node.input_vars
+            rebuilt_operation_def.name = getattr(node, "name", None)
+            rebuilt_operation_def.op_id = node.op_id
+            return rebuilt_operation_def
         return node
 
     if isinstance(node, OperationCall):
         new_args = [_rebind_variational_variables(domain, a, target_support, target_region_id) if isinstance(a, Placeholder) else a for a in node.args]
         if any(n is not o for n, o in zip(new_args, node.args)):
-            new_node = OperationCall(node.op_def, new_args)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_operation_call = OperationCall(node.operation, tuple(new_args))
+            rebuilt_operation_call.op_id = node.op_id
+            return rebuilt_operation_call
         return node
 
     if isinstance(node, Jacobian):
@@ -260,26 +260,26 @@ def _rebind_variational_variables(domain, node, target_support: str, target_regi
     if isinstance(node, Tracker):
         new_expr = _rebind_variational_variables(domain, node.expr, target_support, target_region_id)
         if new_expr is not node.expr:
-            new_node = Tracker(new_expr, interval=node.interval)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_tracker = Tracker(new_expr, interval=node.interval)
+            rebuilt_tracker.op_id = node.op_id
+            return rebuilt_tracker
         return node
 
     if isinstance(node, Assembly):
         new_expr = _rebind_variational_variables(domain, node.expr, target_support, target_region_id)
         if new_expr is not node.expr:
-            new_node = Assembly(new_expr)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_assembly = Assembly(new_expr, node.num_total_nodes, node.support, node.region_id)
+            rebuilt_assembly.op_id = node.op_id
+            return rebuilt_assembly
         return node
 
     if isinstance(node, GroupedAssembly):
         vol_expr = _rebind_variational_variables(domain, node.volume_expr, target_support, target_region_id) if node.volume_expr is not None else None
         bnd_exprs = {k: _rebind_variational_variables(domain, v, target_support, target_region_id) for k, v in node.boundary_exprs.items()}
         if vol_expr is not node.volume_expr or any(bnd_exprs[k] is not node.boundary_exprs[k] for k in bnd_exprs):
-            new_node = GroupedAssembly(vol_expr, bnd_exprs, node.domain)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_grouped_assembly = GroupedAssembly(vol_expr, bnd_exprs, node.num_total_nodes)
+            rebuilt_grouped_assembly.op_id = node.op_id
+            return rebuilt_grouped_assembly
         return node
 
     return node
@@ -332,28 +332,28 @@ def _substitute_trial_for_vpinn(
     if isinstance(node, ModelCall):
         new_args = [_substitute_trial_for_vpinn(domain, a, trial_value, target_support, target_region_id) if isinstance(a, Placeholder) else a for a in node.args]
         if any(n is not o for n, o in zip(new_args, node.args)):
-            new_node = ModelCall(node.model, new_args)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_model_call = ModelCall(node.model, new_args)
+            rebuilt_model_call.op_id = node.op_id
+            return rebuilt_model_call
         return node
 
     if isinstance(node, OperationDef):
         new_expr = _substitute_trial_for_vpinn(domain, node.expr, trial_value, target_support, target_region_id)
         if new_expr is not node.expr:
-            new_node = OperationDef.__new__(OperationDef)
-            new_node.expr = new_expr
-            new_node.input_vars = node.input_vars
-            new_node.name = getattr(node, "name", None)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_operation_def = OperationDef.__new__(OperationDef)
+            rebuilt_operation_def.expr = new_expr
+            rebuilt_operation_def.input_vars = node.input_vars
+            rebuilt_operation_def.name = getattr(node, "name", None)
+            rebuilt_operation_def.op_id = node.op_id
+            return rebuilt_operation_def
         return node
 
     if isinstance(node, OperationCall):
         new_args = [_substitute_trial_for_vpinn(domain, a, trial_value, target_support, target_region_id) if isinstance(a, Placeholder) else a for a in node.args]
         if any(n is not o for n, o in zip(new_args, node.args)):
-            new_node = OperationCall(node.op_def, new_args)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_operation_call = OperationCall(node.operation, tuple(new_args))
+            rebuilt_operation_call.op_id = node.op_id
+            return rebuilt_operation_call
         return node
 
     if isinstance(node, Jacobian):
@@ -373,26 +373,26 @@ def _substitute_trial_for_vpinn(
     if isinstance(node, Tracker):
         new_expr = _substitute_trial_for_vpinn(domain, node.expr, trial_value, target_support, target_region_id)
         if new_expr is not node.expr:
-            new_node = Tracker(new_expr, interval=node.interval)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_tracker = Tracker(new_expr, interval=node.interval)
+            rebuilt_tracker.op_id = node.op_id
+            return rebuilt_tracker
         return node
 
     if isinstance(node, Assembly):
         new_expr = _substitute_trial_for_vpinn(domain, node.expr, trial_value, target_support, target_region_id)
         if new_expr is not node.expr:
-            new_node = Assembly(new_expr)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_assembly = Assembly(new_expr, node.num_total_nodes, node.support, node.region_id)
+            rebuilt_assembly.op_id = node.op_id
+            return rebuilt_assembly
         return node
 
     if isinstance(node, GroupedAssembly):
         vol_expr = _substitute_trial_for_vpinn(domain, node.volume_expr, trial_value, target_support, target_region_id) if node.volume_expr is not None else None
         bnd_exprs = {k: _substitute_trial_for_vpinn(domain, v, trial_value, target_support, target_region_id) for k, v in node.boundary_exprs.items()}
         if vol_expr is not node.volume_expr or any(bnd_exprs[k] is not node.boundary_exprs[k] for k in bnd_exprs):
-            new_node = GroupedAssembly(vol_expr, bnd_exprs, node.domain)
-            new_node.op_id = node.op_id
-            return new_node
+            rebuilt_grouped_assembly = GroupedAssembly(vol_expr, bnd_exprs, node.num_total_nodes)
+            rebuilt_grouped_assembly.op_id = node.op_id
+            return rebuilt_grouped_assembly
         return node
 
     return node

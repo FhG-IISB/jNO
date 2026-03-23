@@ -169,6 +169,6 @@ def setup(script_file: str, name: str | None = None) -> str:
     except Exception:
         pass
 
-    _logger_mod._default_logger = _logger_mod.get_logger(path=dire, log_print=(True, True), use_default=False)
+    _logger_mod._default_logger = _logger_mod.Logger(path=dire, log_print=(True, True), name="DefaultLogger")
 
     return str(dire)

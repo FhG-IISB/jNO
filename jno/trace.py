@@ -111,7 +111,7 @@ class Placeholder:
     def __le__(self, other) -> FunctionCall:
         return FunctionCall(jnp.less_equal, [self, other])
 
-    def _wrap(self, other) -> Literal:
+    def _wrap(self, other) -> Placeholder:
         """Wrap non-Placeholder types."""
         if isinstance(other, Placeholder):
             return other
@@ -839,6 +839,7 @@ class Tracker(Placeholder):
     def __init__(self, expr: Placeholder, interval: int = 1):
         self.expr = expr
         self.interval = interval
+        self.op_id = _next_op_id()
 
     def __repr__(self):
         return f"Tracker({self.expr!r}, interval={self.interval})"
@@ -878,7 +879,7 @@ class Model(Placeholder):
 
         # ── training config (plain Python, not JAX arrays) ──
         self._frozen: bool = False
-        self._lora_config = None  # (rank, alpha, target_str | None) or None
+        self._lora_config: tuple[int, float, str | None] | None = None  # (rank, alpha, target_str | None) or None
         self._opt_fn = None  # optax optimizer factory / instance
         self._lr = LearningRateSchedule(1.0)
         self._dtype = None  # target dtype (e.g. jnp.bfloat16) or None
@@ -887,7 +888,7 @@ class Model(Placeholder):
         self._param_groups: list = []  # [{target, mask, opt_fn, lr}] for per-group optimizer config
         self._weight_tree = None  # pretrained weights as a pytree (alternative to weight_path file)
         self._initialize_mask = None  # optional bool pytree consumed by initialize() for partial preload
-        self._mask_meta = None  # diagnostics for last mask(target=...): {target, matched, total_arrays, sample_paths}
+        self._mask_meta: dict[str, object] | None = None  # diagnostics for last mask(target=...): {target, matched, total_arrays, sample_paths}
         self._tunable_opts: Dict[str, list] = {}  # per-model tunable options for sweeps
 
     # ── public API ───────────────────────────────────────────
@@ -1548,6 +1549,7 @@ class OperationDef(Placeholder):
     def __init__(self, expr: Placeholder, input_vars: List[Variable] | None = None):
         self.expr = expr
         self.input_vars = input_vars or []
+        self.name: str | None = None
         self.op_id = _next_op_id()
 
         # Collect all variables from the expression to determine input signature
@@ -1644,6 +1646,7 @@ class OperationCall(Placeholder):
     def __init__(self, operation: OperationDef, args: tuple):
         self.operation = operation
         self.args = args  # Variables or other OperationCalls
+        self.op_id = _next_op_id()
 
     def __repr__(self):
         args_str = ", ".join(str(a) for a in self.args)
@@ -1720,10 +1723,6 @@ class FemLinearSystem:
         if not isinstance(other, FemLinearSystem):
             return NotImplemented
         return FemLinearSystem(self.A + other.A, self.b + other.b)
-
-    def todense(self):
-        A_dense = self.A.todense() if hasattr(self.A, "todense") else self.A
-        return A_dense, self.b
 
     def todense(self):
         A_dense = self.A.todense() if hasattr(self.A, "todense") else self.A
