@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from typing import Dict, List, Tuple, Optional, Callable, Any, Union
 
-import cloudpickle
 import jax
 import jax.numpy as jnp
 import meshio
@@ -11,7 +10,6 @@ import numpy as np
 from ..trace import Variable, TensorTag, Literal, BinaryOp, FunctionCall, Jacobian, TestFunction, TrialFunction, Constant, FemLinearSystem, Assembly
 from ..utils.logger import get_logger
 from .boundary_region import BoundaryRegion
-from .domain_data import DomainData
 from .geometries import Geometries
 from .meshio_mixin import MeshIOMixin
 

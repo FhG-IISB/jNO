@@ -15,6 +15,7 @@ import jax
 import equinox as eqx
 from .utils.adaptive import LearningRateSchedule
 from .utils.logger import get_logger
+from .utils.iree import IREEModel
 
 __all__ = [
     "Placeholder",
@@ -1339,6 +1340,53 @@ class Model(Placeholder):
         self._merge_lora_flag = False
         return self
 
+    def to_iree(
+        self,
+        sample_inputs: tuple,
+        *,
+        target_backend: str = "llvm-cpu",
+        optimization_level: int = 3,
+    ) -> IREEModel:
+        """Compile this model to an :class:`IREEModel` for deployment.
+
+        The Equinox module's current weights are baked into the compiled
+        artefact as constants.  The result is serialisable via
+        ``jno.save`` / ``jno.load``.
+
+        Args:
+            sample_inputs: Tuple of arrays (NumPy, JAX, or jno.numpy) whose
+                shapes match the positional arguments of this call.
+            target_backend: IREE target backend (default ``"llvm-cpu"``).
+            optimization_level: IREE optimisation level 0–3 (default ``3``).
+
+        Returns:
+            A compiled :class:`IREEModel` ready for inference.
+
+        Example::
+
+            iree_m = net.to_iree(
+                (jnp.ones((1, 100, 1)), jnp.ones((1, 100, 1)))
+            )
+            jno.save(iree_m, "model.pkl")
+            output = iree_m(x_np, y_np)
+        """
+        module = self.module
+        module_name = type(module).__name__.lower()
+
+        # Convert all inputs to JAX arrays (handles numpy, jnp, jno.numpy)
+        jax_inputs = tuple(jnp.asarray(inp) for inp in sample_inputs)
+
+        def infer(*args):
+            return module(*args)
+
+        infer.__name__ = module_name
+
+        return IREEModel.compile(
+            infer,
+            jax_inputs,
+            target_backend=target_backend,
+            optimization_level=optimization_level,
+        )
 
 class ModelCall(Placeholder):
     """Represents a call to a Model with specific arguments.
