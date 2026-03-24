@@ -814,5 +814,3 @@ class Geometries:
             return geo, 2, mesh_size
 
         return constructor
-
-

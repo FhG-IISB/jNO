@@ -305,5 +305,3 @@ class MeshIOMixin(MeshUtils):
         os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
         fig.write_html(save_path, include_plotlyjs="cdn")
         self.log.info(f"Saved interactive mesh HTML to {save_path}")
-
-
