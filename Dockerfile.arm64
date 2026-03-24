@@ -1,0 +1,52 @@
+# syntax=docker/dockerfile:1
+# ------------------------------------------------------------
+# jNO – native ARM64 image (linux/arm64)
+#
+# Why this exists:
+# - PyPI does not publish gmsh wheels for linux/aarch64.
+# - Cross-building linux/amd64 on ARM via QEMU can segfault.
+#
+# Strategy:
+# - Build natively for ARM64.
+# - Install gmsh Python bindings from Ubuntu packages.
+# - Install pygmsh without pulling the PyPI gmsh dependency.
+# ------------------------------------------------------------
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        python3.12 \
+        python3.12-dev \
+        python3.12-venv \
+        python3-pip \
+        python3-gmsh \
+        gmsh \
+        git \
+        build-essential \
+        libglu1-mesa \
+        libgl1 \
+        libxrender1 \
+        libxcursor1 \
+        libxft2 \
+        libxinerama1 \
+    && rm -rf /var/lib/apt/lists/* \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
+    && update-alternatives --install /usr/bin/python  python  /usr/bin/python3.12 1
+
+WORKDIR /app
+
+RUN python -m venv --system-site-packages /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+COPY pyproject.toml README.md ./
+COPY jno/ ./jno/
+
+# Use pip here to avoid uv binary execution under QEMU/cross-emulation.
+# Install project deps explicitly and keep pygmsh from pulling PyPI gmsh.
+RUN python -m pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    python -m pip install --no-cache-dir jax equinox optax cloudpickle einops meshio numpy && \
+    python -m pip install --no-cache-dir --no-deps pygmsh && \
+    python -m pip install --no-cache-dir --no-deps -e .
+
+CMD ["python", "-c", "import jno; print('jNO ready')"]

@@ -9,7 +9,7 @@
 # Pull:     docker pull ghcr.io/<owner>/jno:latest
 # Run:      docker run --rm ghcr.io/<owner>/jno:latest
 # ------------------------------------------------------------
-FROM ubuntu:24.04
+FROM --platform=linux/amd64 ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -45,7 +45,7 @@ COPY pyproject.toml uv.lock README.md ./
 COPY jno/ ./jno/
 
 # ---- install using the lockfile ----
-RUN uv sync --extra iree --extra dev
+RUN uv sync --all-extras --no-extra cuda
 
 # ---- put the uv-managed venv on PATH ----
 ENV PATH="/app/.venv/bin:$PATH"
