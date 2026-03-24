@@ -1208,7 +1208,6 @@ dependencies = [
     { name = "einops" },
     { name = "equinox" },
     { name = "jax" },
-    { name = "maskx" },
     { name = "optax" },
     { name = "pygmsh" },
 ]
@@ -1273,7 +1272,6 @@ requires-dist = [
     { name = "jax-mpp", marker = "extra == 'foundation'", git = "https://github.com/armbrusl/jax_mpp" },
     { name = "lineax", marker = "extra == 'dev'" },
     { name = "lineax", marker = "extra == 'fem'" },
-    { name = "maskx" },
     { name = "matplotlib", marker = "extra == 'dev'" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=0.950" },
     { name = "nevergrad", marker = "extra == 'dev'" },
@@ -1482,18 +1480,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/80/d6/2d1b89f6ca4bff1036499b1e29a1d02d282259f3681540e16563f27ebc23/markupsafe-3.0.3-cp313-cp313t-win32.whl", hash = "sha256:69c0b73548bc525c8cb9a251cddf1931d1db4d2258e9599c28c07ef3580ef354", size = 14612, upload-time = "2025-09-27T18:37:02.639Z" },
     { url = "https://files.pythonhosted.org/packages/2b/98/e48a4bfba0a0ffcf9925fe2d69240bfaa19c6f7507b8cd09c70684a53c1e/markupsafe-3.0.3-cp313-cp313t-win_amd64.whl", hash = "sha256:1b4b79e8ebf6b55351f0d91fe80f893b4743f104bff22e90697db1590e47a218", size = 15200, upload-time = "2025-09-27T18:37:03.582Z" },
     { url = "https://files.pythonhosted.org/packages/0e/72/e3cc540f351f316e9ed0f092757459afbc595824ca724cbc5a5d4263713f/markupsafe-3.0.3-cp313-cp313t-win_arm64.whl", hash = "sha256:ad2cf8aa28b8c020ab2fc8287b0f823d0a7d8630784c31e9ee5edea20f406287", size = 13973, upload-time = "2025-09-27T18:37:04.929Z" },
-]
-
-[[package]]
-name = "maskx"
-version = "0.1.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "jax" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/d8/bd/3735a05fb9d6c43f67de58682e1cabdeaf668309f6d81b08393f61564804/maskx-0.1.1.tar.gz", hash = "sha256:90497858afcfdb0853866fa1cde14bd7d652b99f5c3d3a27b64e7dacadec1c30", size = 57587, upload-time = "2026-03-06T18:39:44.384Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/98/07/4a45675b1638ddf47fe7f1505bd5a36772b2a5be686c2ded672887b662ab/maskx-0.1.1-py3-none-any.whl", hash = "sha256:3d9415f2b5630331b33b8eaa73680f662a13daf161a3d59b0cb480702138a011", size = 5577, upload-time = "2026-03-06T18:39:43.077Z" },
 ]
 
 [[package]]

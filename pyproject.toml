@@ -23,8 +23,6 @@ classifiers = [
 dependencies = [
     "jax",
     "equinox",
-
-    "maskx",
     "optax",
 
     "pygmsh",

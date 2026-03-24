@@ -9,6 +9,45 @@ Mesh sizes are kept deliberately coarse to keep the suite fast.
 
 import pytest
 import jno
+import inspect
+
+
+def test_geometry_shortcut_returns_domain_instance():
+    dom = jno.domain.rect(mesh_size=0.3, compute_mesh_connectivity=True)
+
+    assert isinstance(dom, jno.domain)
+    assert dom.dimension == 2
+    assert dom.mesh is not None
+
+
+def test_geometry_shortcut_routes_domain_kwargs():
+    dom = jno.domain.line(mesh_size=0.2, time=(0, 1, 5), compute_mesh_connectivity=False)
+
+    assert isinstance(dom, jno.domain)
+    assert dom._is_time_dependent is True
+    assert dom.mesh_connectivity is None
+
+
+@pytest.mark.parametrize(
+    ("shape_name", "expected_parameters"),
+    [
+        ("line", {"x_range", "mesh_size", "algorithm", "time", "compute_mesh_connectivity"}),
+        ("rect", {"x_range", "y_range", "mesh_size", "algorithm", "time", "compute_mesh_connectivity"}),
+        ("equi_distant_rect", {"x_range", "y_range", "nx", "ny", "algorithm", "time", "compute_mesh_connectivity"}),
+        ("poseidon", {"nx", "ny", "algorithm", "time", "compute_mesh_connectivity"}),
+        ("cube", {"x_range", "y_range", "z_range", "mesh_size", "algorithm", "time", "compute_mesh_connectivity"}),
+        ("disk", {"center", "radius", "mesh_size", "num_points", "algorithm", "time", "compute_mesh_connectivity"}),
+        ("l_shape", {"size", "mesh_size", "separate_boundary", "algorithm", "time", "compute_mesh_connectivity"}),
+        ("rectangle_with_hole", {"outer_size", "hole_size", "mesh_size", "separate_boundary", "algorithm", "time", "compute_mesh_connectivity"}),
+        ("rect_pml", {"x_range", "y_range", "mesh_size", "pml_thickness_top", "pml_thickness_bottom", "algorithm", "time", "compute_mesh_connectivity"}),
+        ("rectangle_with_holes", {"outer_size", "holes", "mesh_size", "separate_boundary", "algorithm", "time", "compute_mesh_connectivity"}),
+    ],
+)
+def test_geometry_shortcuts_expose_explicit_signatures(shape_name, expected_parameters):
+    signature = inspect.signature(getattr(jno.domain, shape_name))
+
+    assert expected_parameters.issubset(signature.parameters)
+    assert "constructor" not in signature.parameters
 
 
 # ---------------------------------------------------------------------------

@@ -173,6 +173,16 @@ class nn:
 
     """
 
+    def __new__(cls, module=None, *args, **kwargs):
+        """Alias ``nn(module, ...)`` to ``nn.wrap(module, ...)``.
+
+        This keeps the fluent factory API while allowing direct callable usage.
+        Calling ``nn()`` with no arguments still creates an instance.
+        """
+        if module is None and not args and not kwargs:
+            return super().__new__(cls)
+        return cls.wrap(module, *args, **kwargs)
+
     @staticmethod
     def linear(in_features: int, out_features: int, use_bias: bool = True, *, key: Any):
         return Linear(in_features, out_features, use_bias, key=key)

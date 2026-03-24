@@ -237,6 +237,44 @@ class TestMemoryStrategies:
         # Loss should be a finite number
         assert jnp.isfinite(logs["total_loss"][-1])
 
+    def test_masked_optimizer_scope_does_not_freeze_unmasked_params(self):
+        """mask(...).optimizer(...) scopes optimizer groups but keeps full trainability."""
+        import optax
+
+        solver, u_net = _make_solver()
+        all_false = jax.tree_util.tree_map(lambda _: False, u_net.module)
+        param_mask = eqx.tree_at(
+            lambda m: (m.hidden_layers[0].weight, m.hidden_layers[0].bias),
+            all_false,
+            (True, True),
+        )
+
+        u_net.optimizer(optax.adam(1e-3))
+        u_net.mask(param_mask).optimizer(optax.adam(1e-10))
+
+        stats = solver.solve(1)
+        logs = stats.training_logs[-1]
+        assert logs["trainable_params"] == logs["total_params"]
+
+    def test_mask_then_freeze_restricts_trainable_params(self):
+        """mask(...).freeze() should partially freeze parameters."""
+        import optax
+
+        solver, u_net = _make_solver()
+        all_false = jax.tree_util.tree_map(lambda _: False, u_net.module)
+        param_mask = eqx.tree_at(
+            lambda m: (m.hidden_layers[0].weight, m.hidden_layers[0].bias),
+            all_false,
+            (True, True),
+        )
+
+        u_net.optimizer(optax.adam(1e-3))
+        u_net.mask(param_mask).freeze()
+
+        stats = solver.solve(1)
+        logs = stats.training_logs[-1]
+        assert 0 < logs["trainable_params"] < logs["total_params"]
+
     def test_paramax_wrapped_parameter_auto_unwrap(self):
         """Paramax wrappers attached to model params are auto-unwrapped during solve()."""
         import optax
@@ -422,16 +460,19 @@ class TestParamMask:
         from jno import LearningRateSchedule as lrs
 
         def make_mask(module):
-            # Train only the output layer; freeze everything else
+            # Freeze hidden layer 0 via mask(...).freeze().
             all_false = jax.tree_util.tree_map(lambda _: False, module)
             return eqx.tree_at(
-                lambda m: (m.output_layer.weight, m.output_layer.bias),
+                lambda m: (m.hidden_layers[0].weight, m.hidden_layers[0].bias),
                 all_false,
                 (True, True),
             )
 
         solver, u_net = self._make_masked_solver(make_mask)
         lid = u_net.layer_id
+
+        # mask(...).freeze() activates partial freezing semantics.
+        u_net.freeze()
 
         # Save the first hidden layer weights before training
         pre_w0 = jnp.array(solver.models[lid].hidden_layers[0].weight)
@@ -440,7 +481,7 @@ class TestParamMask:
         u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         solver.solve(20)
 
-        # Hidden layer 0 must be numerically identical (frozen by mask)
+        # Hidden layer 0 must be numerically identical (frozen by mask+freeze)
         post_w0 = jnp.array(solver.models[lid].hidden_layers[0].weight)
         post_b0 = jnp.array(solver.models[lid].hidden_layers[0].bias)
         assert jnp.allclose(pre_w0, post_w0), "Masked weight changed after solve"
@@ -560,15 +601,15 @@ def test_mask_initialize_freeze_lora_combined():
     # Create "pretrained" weights from a different seed
     pretrained = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(99))
 
-    # Mask: only output layer is trainable
+    # Mask marks parameters to freeze via mask(...).freeze().
     all_false_u = jax.tree_util.tree_map(lambda _: False, u_net.module)
     mask_u = eqx.tree_at(
-        lambda m: (m.output_layer.weight, m.output_layer.bias),
+        lambda m: (m.hidden_layers[0].weight, m.hidden_layers[0].bias),
         all_false_u,
         (True, True),
     )
 
-    (u_net.mask(mask_u).initialize(pretrained.module).optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5)))  # load pretrained weights from pytree
+    (u_net.mask(mask_u).initialize(pretrained.module).freeze().optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5)))  # load pretrained weights and partially freeze via mask+freeze
 
     u = u_net(x) * x * (1 - x)
     pde_u = jnn.laplacian(u, [x])
@@ -742,20 +783,20 @@ def test_nnx_mask():
 
     net = jnn.nn.wrap(Net(nnx.Rngs(0)))
 
-    # Build a mask: train only l2 kernel and bias, freeze l1.
+    # Build a mask that marks l1 for freezing via mask(...).freeze().
     # Navigate the NNX State pytree with subscript access; use
     # tree_leaves(param)[0] to reach the raw array leaf (avoids
     # the deprecated .value attribute).
     all_false = jax.tree_util.tree_map(lambda _: False, net.module)
     mask = eqx.tree_at(
         lambda w: (
-            jax.tree_util.tree_leaves(w.state["l2"]["kernel"])[0],
-            jax.tree_util.tree_leaves(w.state["l2"]["bias"])[0],
+            jax.tree_util.tree_leaves(w.state["l1"]["kernel"])[0],
+            jax.tree_util.tree_leaves(w.state["l1"]["bias"])[0],
         ),
         all_false,
         (True, True),
     )
-    net.mask(mask).optimizer(optax.adam, lr=lrs(1e-3))
+    net.mask(mask).freeze().optimizer(optax.adam, lr=lrs(1e-3))
 
     u = net(x) * x * (1 - x)
     pde = jnn.laplacian(u, [x]) + 1.0

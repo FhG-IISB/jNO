@@ -1,2059 +1,22 @@
-import numpy as np
+from __future__ import annotations
+
 from typing import Dict, List, Tuple, Optional, Callable, Any, Union
-from scipy.spatial import KDTree
-import jax.numpy as jnp
-import jax
-from dataclasses import dataclass
-import meshio
+
 import cloudpickle
-
-from .trace import Variable, TensorTag, Literal, BinaryOp, FunctionCall, Jacobian, TestFunction, TrialFunction, Constant, FemLinearSystem, Assembly
-from .utils.logger import get_logger, Logger, PrintFallback
-
-
-@dataclass
-class DomainData:
-    """Pre-processed domain data for training."""
-
-    context: Dict[str, jax.Array]
-    dimension: int
-
-
-class Geometries:
-
-    @staticmethod
-    def line(x_range=(0, 1), mesh_size=0.1):
-        """Create a 1D line domain."""
-
-        def constructor(geo):
-            x0, x1 = x_range
-            p0 = geo.add_point([x0, 0], mesh_size=mesh_size)
-            p1 = geo.add_point([x1, 0], mesh_size=mesh_size)
-            line = geo.add_line(p0, p1)
-
-            geo.add_physical(line, "interior")
-            geo.add_physical([p0], "left")
-            geo.add_physical([p1], "right")
-            geo.add_physical([p0, p1], "boundary")
-
-            return geo, 1, mesh_size
-
-        return constructor
-
-    @staticmethod
-    def rect(x_range=(0, 1), y_range=(0, 1), mesh_size=0.1):
-        """Create a rectangular domain for pygmsh."""
-
-        def construct(geo):
-            x0, x1 = x_range
-            y0, y1 = y_range
-
-            points = [
-                geo.add_point([x0, y0], mesh_size=mesh_size),
-                geo.add_point([x1, y0], mesh_size=mesh_size),
-                geo.add_point([x1, y1], mesh_size=mesh_size),
-                geo.add_point([x0, y1], mesh_size=mesh_size),
-            ]
-
-            lines = [
-                geo.add_line(points[0], points[1]),
-                geo.add_line(points[1], points[2]),
-                geo.add_line(points[2], points[3]),
-                geo.add_line(points[3], points[0]),
-            ]
-
-            curve_loop = geo.add_curve_loop(lines)
-            surface = geo.add_plane_surface(curve_loop)
-
-            geo.add_physical(surface, "interior")
-            geo.add_physical(lines, "boundary")
-            geo.add_physical([lines[0]], "bottom")
-            geo.add_physical([lines[1]], "right")
-            geo.add_physical([lines[2]], "top")
-            geo.add_physical([lines[3]], "left")
-
-            return geo, 2, mesh_size
-
-        return construct
-
-    @staticmethod
-    def equi_distant_rect(x_range=(0, 1), y_range=(0, 1), nx=10, ny=10):
-        """
-        Create a structured triangular mesh with proper cell_sets for boundary extraction.
-
-        Returns:
-            meshio.Mesh with cell_sets for boundaries and domain
-        """
-
-        def constructor(geo):
-            x0 = x_range[0]
-            x1 = x_range[1]
-
-            y0 = y_range[0]
-            y1 = y_range[1]
-
-            # Create structured grid points
-            x = np.linspace(x0, x1, nx + 1)
-            y = np.linspace(y0, y1, ny + 1)
-            xx, yy = np.meshgrid(x, y, indexing="ij")
-
-            # Flatten to create points array
-            points = np.column_stack([xx.ravel(), yy.ravel(), np.zeros((nx + 1) * (ny + 1))])
-
-            # Helper function to get point index
-            def idx(i, j):
-                return i * (ny + 1) + j
-
-            # =========================================================================
-            # Create triangles (2D cells)
-            # =========================================================================
-            triangles = []
-            for i in range(nx):
-                for j in range(ny):
-                    p0 = idx(i, j)
-                    p1 = idx(i + 1, j)
-                    p2 = idx(i + 1, j + 1)
-                    p3 = idx(i, j + 1)
-
-                    triangles.append([p0, p1, p2])
-                    triangles.append([p0, p2, p3])
-
-            triangles = np.array(triangles)
-
-            # =========================================================================
-            # Create boundary edges (1D cells)
-            # =========================================================================
-            bottom_edges = []
-            top_edges = []
-            left_edges = []
-            right_edges = []
-
-            # Bottom boundary (j = 0)
-            for i in range(nx):
-                bottom_edges.append([idx(i, 0), idx(i + 1, 0)])
-
-            # Top boundary (j = ny)
-            for i in range(nx):
-                top_edges.append([idx(i, ny), idx(i + 1, ny)])
-
-            # Left boundary (i = 0)
-            for j in range(ny):
-                left_edges.append([idx(0, j), idx(0, j + 1)])
-
-            # Right boundary (i = nx)
-            for j in range(ny):
-                right_edges.append([idx(nx, j), idx(nx, j + 1)])
-
-            bottom_edges = np.array(bottom_edges)
-            top_edges = np.array(top_edges)
-            left_edges = np.array(left_edges)
-            right_edges = np.array(right_edges)
-
-            # Combine all edges into one array
-            all_edges = np.vstack([bottom_edges, top_edges, left_edges, right_edges])
-
-            # Track indices within the combined edge array
-            n_bottom = len(bottom_edges)
-            n_top = len(top_edges)
-            n_left = len(left_edges)
-            n_right = len(right_edges)
-
-            bottom_indices = np.arange(0, n_bottom)
-            top_indices = np.arange(n_bottom, n_bottom + n_top)
-            left_indices = np.arange(n_bottom + n_top, n_bottom + n_top + n_left)
-            right_indices = np.arange(n_bottom + n_top + n_left, n_bottom + n_top + n_left + n_right)
-            all_boundary_indices = np.arange(len(all_edges))
-
-            # =========================================================================
-            # Create cells list
-            # =========================================================================
-            cells = [
-                ("triangle", triangles),  # Block 0: triangles
-                ("line", all_edges),  # Block 1: all boundary edges
-            ]
-
-            # =========================================================================
-            # Create cell_sets
-            # cell_sets format: {name: [array_for_block_0, array_for_block_1, ...]}
-            # Each array contains indices of cells within that block
-            # =========================================================================
-            cell_sets = {
-                # domain (all triangles)
-                "interior": [
-                    np.arange(len(triangles)),  # Block 0: all triangle indices
-                    np.array([], dtype=np.int64),  # Block 1: no edges
-                ],
-                # Boundary edges
-                "bottom": [
-                    np.array([], dtype=np.int64),  # Block 0: no triangles
-                    bottom_indices,  # Block 1: bottom edge indices
-                ],
-                "top": [
-                    np.array([], dtype=np.int64),
-                    top_indices,
-                ],
-                "left": [
-                    np.array([], dtype=np.int64),
-                    left_indices,
-                ],
-                "right": [
-                    np.array([], dtype=np.int64),
-                    right_indices,
-                ],
-                "boundary": [
-                    np.array([], dtype=np.int64),
-                    all_boundary_indices,
-                ],
-            }
-
-            # =========================================================================
-            # Create mesh
-            # =========================================================================
-            mesh = meshio.Mesh(
-                points=points,
-                cells=cells,
-                cell_sets=cell_sets,
-            )
-
-            return mesh, 2, min((x_range[1] - x_range[0]) / nx, (y_range[1] - y_range[0]) / ny)
-
-        return constructor
-
-    @staticmethod
-    def poseidon(nx: int = 128, ny: int = 128):
-        """
-        Create a structured 2-D grid for foundation models (Poseidon, Walrus, …).
-
-        The grid has exactly ``nx × ny`` vertices on [0, 1]×[0, 1], matching
-        the pixel resolution that these models expect.  Triangulation and
-        boundary edge connectivity are built so that ``scheme='finite_difference'``
-        works out of the box with ``jnn.laplacian`` / ``jnn.grad``.
-
-        Args:
-            nx: Number of grid points along x.  Default 128.
-            ny: Number of grid points along y.  Default 128.
-        """
-        x_range = (0, 1)
-        y_range = (0, 1)
-
-        def constructor(geo):
-            x0 = x_range[0]
-            x1 = x_range[1]
-
-            y0 = y_range[0]
-            y1 = y_range[1]
-
-            # Create structured grid points — exactly nx × ny vertices
-            x = np.linspace(x0, x1, nx)
-            y = np.linspace(y0, y1, ny)
-            xx, yy = np.meshgrid(x, y, indexing="ij")
-
-            # Flatten to create points array (N = nx*ny, 3)
-            points = np.column_stack([xx.ravel(), yy.ravel(), np.zeros(nx * ny)])
-
-            # Helper function to get point index
-            def idx(i, j):
-                return i * ny + j
-
-            # =========================================================================
-            # Create triangles (2D cells) — (nx-1)*(ny-1)*2 triangles
-            # =========================================================================
-            triangles = []
-            for i in range(nx - 1):
-                for j in range(ny - 1):
-                    p0 = idx(i, j)
-                    p1 = idx(i + 1, j)
-                    p2 = idx(i + 1, j + 1)
-                    p3 = idx(i, j + 1)
-
-                    triangles.append([p0, p1, p2])
-                    triangles.append([p0, p2, p3])
-
-            triangles = np.array(triangles)
-
-            # =========================================================================
-            # Create boundary edges (1D cells)
-            # =========================================================================
-            bottom_edges = []
-            top_edges = []
-            left_edges = []
-            right_edges = []
-
-            # Bottom boundary (j = 0)
-            for i in range(nx - 1):
-                bottom_edges.append([idx(i, 0), idx(i + 1, 0)])
-
-            # Top boundary (j = ny - 1)
-            for i in range(nx - 1):
-                top_edges.append([idx(i, ny - 1), idx(i + 1, ny - 1)])
-
-            # Left boundary (i = 0)
-            for j in range(ny - 1):
-                left_edges.append([idx(0, j), idx(0, j + 1)])
-
-            # Right boundary (i = nx - 1)
-            for j in range(ny - 1):
-                right_edges.append([idx(nx - 1, j), idx(nx - 1, j + 1)])
-
-            bottom_edges = np.array(bottom_edges)
-            top_edges = np.array(top_edges)
-            left_edges = np.array(left_edges)
-            right_edges = np.array(right_edges)
-
-            # Combine all edges into one array
-            all_edges = np.vstack([bottom_edges, top_edges, left_edges, right_edges])
-
-            # Track indices within the combined edge array
-            n_bottom = len(bottom_edges)
-            n_top = len(top_edges)
-            n_left = len(left_edges)
-            n_right = len(right_edges)
-
-            bottom_indices = np.arange(0, n_bottom)
-            top_indices = np.arange(n_bottom, n_bottom + n_top)
-            left_indices = np.arange(n_bottom + n_top, n_bottom + n_top + n_left)
-            right_indices = np.arange(n_bottom + n_top + n_left, n_bottom + n_top + n_left + n_right)
-            all_boundary_indices = np.arange(len(all_edges))
-
-            # =========================================================================
-            # Create cells list
-            # =========================================================================
-            cells = [
-                ("triangle", triangles),  # Block 0: triangles
-                ("line", all_edges),  # Block 1: all boundary edges
-            ]
-
-            # =========================================================================
-            # Create cell_sets
-            # cell_sets format: {name: [array_for_block_0, array_for_block_1, ...]}
-            # Each array contains indices of cells within that block
-            # =========================================================================
-            cell_sets = {
-                # domain (all triangles)
-                "interior": [
-                    np.arange(len(triangles)),  # Block 0: all triangle indices
-                    np.array([], dtype=np.int64),  # Block 1: no edges
-                ],
-                # Boundary edges
-                "bottom": [
-                    np.array([], dtype=np.int64),  # Block 0: no triangles
-                    bottom_indices,  # Block 1: bottom edge indices
-                ],
-                "top": [
-                    np.array([], dtype=np.int64),
-                    top_indices,
-                ],
-                "left": [
-                    np.array([], dtype=np.int64),
-                    left_indices,
-                ],
-                "right": [
-                    np.array([], dtype=np.int64),
-                    right_indices,
-                ],
-                "boundary": [
-                    np.array([], dtype=np.int64),
-                    all_boundary_indices,
-                ],
-            }
-
-            # =========================================================================
-            # Create mesh
-            # =========================================================================
-            mesh = meshio.Mesh(
-                points=points,
-                cells=cells,
-                cell_sets=cell_sets,
-            )
-
-            return mesh, 2, 0.1
-
-        return constructor
-
-    @staticmethod
-    def cube(x_range=(0, 1), y_range=(0, 1), z_range=(0, 1), mesh_size=0.1):
-        """Create a cubic domain for pygmsh."""
-
-        def construct(geo):
-            x0, x1 = x_range
-            y0, y1 = y_range
-            z0, z1 = z_range
-
-            # Create 8 corner points
-            points = [
-                geo.add_point([x0, y0, z0], mesh_size=mesh_size),  # 0: bottom-left-front
-                geo.add_point([x1, y0, z0], mesh_size=mesh_size),  # 1: bottom-right-front
-                geo.add_point([x1, y1, z0], mesh_size=mesh_size),  # 2: bottom-right-back
-                geo.add_point([x0, y1, z0], mesh_size=mesh_size),  # 3: bottom-left-back
-                geo.add_point([x0, y0, z1], mesh_size=mesh_size),  # 4: top-left-front
-                geo.add_point([x1, y0, z1], mesh_size=mesh_size),  # 5: top-right-front
-                geo.add_point([x1, y1, z1], mesh_size=mesh_size),  # 6: top-right-back
-                geo.add_point([x0, y1, z1], mesh_size=mesh_size),  # 7: top-left-back
-            ]
-
-            # Create lines for each edge of the cube (12 edges)
-            # Bottom face (z=z0)
-            lines_bottom = [
-                geo.add_line(points[0], points[1]),  # front
-                geo.add_line(points[1], points[2]),  # right
-                geo.add_line(points[2], points[3]),  # back
-                geo.add_line(points[3], points[0]),  # left
-            ]
-
-            # Top face (z=z1)
-            lines_top = [
-                geo.add_line(points[4], points[5]),  # front
-                geo.add_line(points[5], points[6]),  # right
-                geo.add_line(points[6], points[7]),  # back
-                geo.add_line(points[7], points[4]),  # left
-            ]
-
-            # Vertical edges
-            lines_vertical = [
-                geo.add_line(points[0], points[4]),  # front-left
-                geo.add_line(points[1], points[5]),  # front-right
-                geo.add_line(points[2], points[6]),  # back-right
-                geo.add_line(points[3], points[7]),  # back-left
-            ]
-
-            # Create curve loops for each face
-            loop_bottom = geo.add_curve_loop(lines_bottom)
-            loop_top = geo.add_curve_loop(lines_top)
-            loop_front = geo.add_curve_loop([lines_bottom[0], lines_vertical[1], -lines_top[0], -lines_vertical[0]])
-            loop_right = geo.add_curve_loop([lines_bottom[1], lines_vertical[2], -lines_top[1], -lines_vertical[1]])
-            loop_back = geo.add_curve_loop([lines_bottom[2], lines_vertical[3], -lines_top[2], -lines_vertical[2]])
-            loop_left = geo.add_curve_loop([lines_bottom[3], lines_vertical[0], -lines_top[3], -lines_vertical[3]])
-
-            # Create surfaces for each face
-            surface_bottom = geo.add_plane_surface(loop_bottom)
-            surface_top = geo.add_plane_surface(loop_top)
-            surface_front = geo.add_plane_surface(loop_front)
-            surface_right = geo.add_plane_surface(loop_right)
-            surface_back = geo.add_plane_surface(loop_back)
-            surface_left = geo.add_plane_surface(loop_left)
-
-            # Create surface loop and volume
-            surface_loop = geo.add_surface_loop([surface_bottom, surface_top, surface_front, surface_right, surface_back, surface_left])
-            volume = geo.add_volume(surface_loop)
-
-            # Add physical groups
-            geo.add_physical(volume, "interior")
-            geo.add_physical([surface_bottom, surface_top, surface_front, surface_right, surface_back, surface_left], "boundary")
-            geo.add_physical([surface_bottom], "bottom")
-            geo.add_physical([surface_top], "top")
-            geo.add_physical([surface_front], "front")
-            geo.add_physical([surface_back], "back")
-            geo.add_physical([surface_left], "left")
-            geo.add_physical([surface_right], "right")
-
-            return geo, 3, mesh_size
-
-        return construct
-
-    @staticmethod
-    def disk(center=(0, 0), radius=1.0, mesh_size=0.1, num_points=32):
-        """Create a circular domain using polygon approximation."""
-
-        def constructor(geo):
-            angles = np.linspace(0, 2 * np.pi, num_points, endpoint=False)
-            cx, cy = center
-            points = [geo.add_point([cx + radius * np.cos(a), cy + radius * np.sin(a)], mesh_size=mesh_size) for a in angles]
-
-            lines = []
-            for i in range(num_points):
-                lines.append(geo.add_line(points[i], points[(i + 1) % num_points]))
-
-            loop = geo.add_curve_loop(lines)
-            surface = geo.add_plane_surface(loop)
-
-            geo.add_physical(surface, "interior")
-            geo.add_physical(lines, "boundary")
-
-            return geo, 2, mesh_size
-
-        return constructor
-
-    @staticmethod
-    def l_shape(size=1.0, mesh_size=0.1, separate_boundary=False):
-        """Create an L-shaped domain."""
-
-        def constructor(geo):
-            points = [
-                geo.add_point([0, 0], mesh_size=mesh_size),
-                geo.add_point([size, 0], mesh_size=mesh_size),
-                geo.add_point([size, size / 2], mesh_size=mesh_size),
-                geo.add_point([size / 2, size / 2], mesh_size=mesh_size),
-                geo.add_point([size / 2, size], mesh_size=mesh_size),
-                geo.add_point([0, size], mesh_size=mesh_size),
-            ]
-
-            lines = [
-                geo.add_line(points[0], points[1]),
-                geo.add_line(points[1], points[2]),
-                geo.add_line(points[2], points[3]),
-                geo.add_line(points[3], points[4]),
-                geo.add_line(points[4], points[5]),
-                geo.add_line(points[5], points[0]),
-            ]
-
-            curve_loop = geo.add_curve_loop(lines)
-            surface = geo.add_plane_surface(curve_loop)
-
-            geo.add_physical(surface, "interior")
-            geo.add_physical(lines, "boundary")
-
-            if separate_boundary:
-                geo.add_physical([lines[0]], "bottom")
-                geo.add_physical([lines[1]], "right_lower")
-                geo.add_physical([lines[2]], "inner_horizontal")
-                geo.add_physical([lines[3]], "inner_vertical")
-                geo.add_physical([lines[4]], "top")
-                geo.add_physical([lines[5]], "left")
-
-            return geo, 2, mesh_size
-
-        return constructor
-
-    @staticmethod
-    def rectangle_with_hole(outer_size=1.0, hole_size=0.4, mesh_size=0.1, separate_boundary=False):
-        """Create a rectangular domain with a rectangular hole in the middle.
-
-        Parameters
-        ----------
-        outer_size : float
-            Size of the outer rectangle (width and height).
-        hole_size : float
-            Size of the inner rectangular hole (width and height).
-        mesh_size : float
-            Mesh element size.
-        separate_boundary : bool
-            If True, assign separate physical groups to each boundary segment.
-        """
-
-        def constructor(geo):
-            # Outer rectangle points (counter-clockwise)
-            outer_points = [
-                geo.add_point([0, 0], mesh_size=mesh_size),
-                geo.add_point([outer_size, 0], mesh_size=mesh_size),
-                geo.add_point([outer_size, outer_size], mesh_size=mesh_size),
-                geo.add_point([0, outer_size], mesh_size=mesh_size),
-            ]
-
-            # Inner rectangle (hole) points (clockwise for hole)
-            # Centered in the middle
-            hole_offset = (outer_size - hole_size) / 2
-            inner_points = [
-                geo.add_point([hole_offset, hole_offset], mesh_size=mesh_size),
-                geo.add_point([hole_offset + hole_size, hole_offset], mesh_size=mesh_size),
-                geo.add_point([hole_offset + hole_size, hole_offset + hole_size], mesh_size=mesh_size),
-                geo.add_point([hole_offset, hole_offset + hole_size], mesh_size=mesh_size),
-            ]
-
-            # Outer boundary lines (counter-clockwise)
-            outer_lines = [
-                geo.add_line(outer_points[0], outer_points[1]),  # bottom
-                geo.add_line(outer_points[1], outer_points[2]),  # right
-                geo.add_line(outer_points[2], outer_points[3]),  # top
-                geo.add_line(outer_points[3], outer_points[0]),  # left
-            ]
-
-            # Inner boundary lines (clockwise for hole)
-            inner_lines = [
-                geo.add_line(inner_points[0], inner_points[1]),  # hole_bottom
-                geo.add_line(inner_points[1], inner_points[2]),  # hole_right
-                geo.add_line(inner_points[2], inner_points[3]),  # hole_top
-                geo.add_line(inner_points[3], inner_points[0]),  # hole_left
-            ]
-
-            # Create curve loops
-            outer_loop = geo.add_curve_loop(outer_lines)
-            inner_loop = geo.add_curve_loop(inner_lines)
-
-            # Create surface with hole (outer loop first, then hole loop)
-            surface = geo.add_plane_surface(outer_loop, holes=[inner_loop])
-
-            # Physical groups
-            geo.add_physical(surface, "interior")
-            geo.add_physical(outer_lines + inner_lines, "boundary")
-
-            if separate_boundary:
-                # Outer boundary
-                geo.add_physical([outer_lines[0]], "bottom")
-                geo.add_physical([outer_lines[1]], "right")
-                geo.add_physical([outer_lines[2]], "top")
-                geo.add_physical([outer_lines[3]], "left")
-                # Inner boundary (hole)
-                geo.add_physical([inner_lines[0]], "_bottom")
-                geo.add_physical([inner_lines[1]], "_right")
-                geo.add_physical([inner_lines[2]], "_top")
-                geo.add_physical([inner_lines[3]], "_left")
-                # Group all hole boundaries together as well
-                geo.add_physical(inner_lines, "_boundary")
-
-            return geo, 2, mesh_size
-
-        return constructor
-
-    @staticmethod
-    def rect_pml(
-        x_range=(0, 1),
-        y_range=(0, 1),
-        mesh_size=0.1,
-        pml_thickness_top=0.2,
-        pml_thickness_bottom=0.2,
-    ):
-        """Rectangle with top and bottom PMLs (pygmsh-compatible)."""
-
-        def construct(geo):
-            x0, x1 = x_range
-            y0, y1 = y_range
-
-            yb = y0 - pml_thickness_bottom
-            yt = y1 + pml_thickness_top
-
-            # ------------------------------------------------------------
-            # Points
-            # ------------------------------------------------------------
-            p00 = geo.add_point([x0, y0], mesh_size)
-            p10 = geo.add_point([x1, y0], mesh_size)
-            p11 = geo.add_point([x1, y1], mesh_size)
-            p01 = geo.add_point([x0, y1], mesh_size)
-
-            pb0 = geo.add_point([x0, yb], mesh_size)
-            pb1 = geo.add_point([x1, yb], mesh_size)
-
-            pt1 = geo.add_point([x1, yt], mesh_size)
-            pt0 = geo.add_point([x0, yt], mesh_size)
-
-            # ------------------------------------------------------------
-            # Interior rectangle
-            # ------------------------------------------------------------
-            l0 = geo.add_line(p00, p10)  # bottom
-            l1 = geo.add_line(p10, p11)  # right
-            l2 = geo.add_line(p11, p01)  # top
-            l3 = geo.add_line(p01, p00)  # left
-
-            s_int = geo.add_plane_surface(geo.add_curve_loop([l0, l1, l2, l3]))
-
-            # ------------------------------------------------------------
-            # Bottom PML (CCW)
-            # ------------------------------------------------------------
-            lb0 = geo.add_line(pb0, pb1)
-            lb1 = geo.add_line(pb1, p10)
-            lb2 = geo.add_line(p00, pb0)
-
-            s_pb = geo.add_plane_surface(
-                geo.add_curve_loop(
-                    [
-                        lb0,  # pb0 -> pb1
-                        lb1,  # pb1 -> p10
-                        -l0,  # p10 -> p00  (reverse interior bottom)
-                        lb2,  # p00 -> pb0
-                    ]
-                )
-            )
-
-            # ------------------------------------------------------------
-
-            # Top PML (CCW)
-
-            # ------------------------------------------------------------
-
-            lt0 = geo.add_line(p11, pt1)  # p11 → pt1
-            lt1 = geo.add_line(pt1, pt0)  # pt1 → pt0
-            lt2 = geo.add_line(pt0, p01)  # pt0 → p01
-
-            s_pt = geo.add_plane_surface(
-                geo.add_curve_loop(
-                    [
-                        -l2,  # p01 → p11  (reversed: l2 was p11 → p01)
-                        lt0,  # p11 → pt1
-                        lt1,  # pt1 → pt0
-                        lt2,  # pt0 → p01
-                    ]
-                )
-            )
-
-            # ------------------------------------------------------------
-            # Physical groups
-            # ------------------------------------------------------------
-            geo.add_physical(s_int, "interior")
-            geo.add_physical(s_pb, "pml_bottom")
-            geo.add_physical(s_pt, "pml_top")
-
-            geo.add_physical([l0, l1, l2, l3], "boundary")
-            geo.add_physical([l0], "bottom")
-            geo.add_physical([l2], "top")
-            geo.add_physical([l1], "right")
-            geo.add_physical([l3], "left")
-
-            return geo, 2, mesh_size
-
-        return construct
-
-    @staticmethod
-    def rectangle_with_holes(outer_size=(2.0, 1.0), holes=None, mesh_size=0.1, separate_boundary=True):
-        """Create a rectangular domain with multiple rectangular holes.
-
-        Parameters
-        ----------
-        outer_size : tuple
-            (width, height) of the outer rectangle.
-        holes : list of dict
-            List of hole specifications. Each dict should contain:
-            - 'origin': (x, y) bottom-left corner of the hole
-            - 'size': (width, height) of the hole
-            - 'type': str, name for this hole's boundary (e.g., 'hole1', 'heater')
-
-        mesh_size : float
-            Mesh element size.
-        separate_boundary : bool
-            If True, assign separate physical groups to each boundary segment.
-
-        Example
-        -------
-        >>> holes = [
-        ...     {'origin': (0.3, 0.3), 'size': (0.2, 0.2), 'type': 'obstacle'},
-        ...     {'origin': (0.7, 0.3), 'size': (0.15, 0.3), 'type': 'heater'},
-        ... ]
-        >>> geom = Geometries.rectangle_with_holes(
-        ...     outer_size=(1.5, 1.0),
-        ...     holes=holes,
-        ...     mesh_size=0.05
-        ... )
-        """
-
-        if holes is None:
-            holes = []
-
-        def constructor(geo):
-            outer_w, outer_h = outer_size
-
-            # =================================================================
-            # Outer rectangle points (counter-clockwise)
-            # =================================================================
-            outer_points = [
-                geo.add_point([0, 0], mesh_size=mesh_size),
-                geo.add_point([outer_w, 0], mesh_size=mesh_size),
-                geo.add_point([outer_w, outer_h], mesh_size=mesh_size),
-                geo.add_point([0, outer_h], mesh_size=mesh_size),
-            ]
-
-            # Outer boundary lines (counter-clockwise)
-            outer_lines = [
-                geo.add_line(outer_points[0], outer_points[1]),  # bottom
-                geo.add_line(outer_points[1], outer_points[2]),  # right
-                geo.add_line(outer_points[2], outer_points[3]),  # top
-                geo.add_line(outer_points[3], outer_points[0]),  # left
-            ]
-
-            # Create outer loop
-            outer_loop = geo.add_curve_loop(outer_lines)
-
-            # =================================================================
-            # Create holes
-            # =================================================================
-            hole_loops = []
-            hole_data = []  # Store (lines, type) for each hole
-
-            for hole_spec in holes:
-                origin = hole_spec["origin"]
-                size = hole_spec["size"]
-                hole_type = hole_spec.get("type", "hole")
-
-                x0, y0 = origin
-                w, h = size
-
-                # Hole corner points (counter-clockwise)
-                hole_points = [
-                    geo.add_point([x0, y0], mesh_size=mesh_size),  # bottom-left
-                    geo.add_point([x0 + w, y0], mesh_size=mesh_size),  # bottom-right
-                    geo.add_point([x0 + w, y0 + h], mesh_size=mesh_size),  # top-right
-                    geo.add_point([x0, y0 + h], mesh_size=mesh_size),  # top-left
-                ]
-
-                # Hole boundary lines (counter-clockwise)
-                hole_lines = [
-                    geo.add_line(hole_points[0], hole_points[1]),  # bottom
-                    geo.add_line(hole_points[1], hole_points[2]),  # right
-                    geo.add_line(hole_points[2], hole_points[3]),  # top
-                    geo.add_line(hole_points[3], hole_points[0]),  # left
-                ]
-
-                # Create hole loop
-                hole_loop = geo.add_curve_loop(hole_lines)
-                hole_loops.append(hole_loop)
-                hole_data.append((hole_lines, hole_type))
-
-            # =================================================================
-            # Create surface with all holes
-            # =================================================================
-            surface = geo.add_plane_surface(outer_loop, holes=hole_loops)
-
-            # =================================================================
-            # Physical groups
-            # =================================================================
-
-            # Interior surface
-            geo.add_physical(surface, "interior")
-
-            # Outer boundary (all outer lines)
-            geo.add_physical(outer_lines, "boundary")
-
-            # Collect all hole lines for a combined hole boundary
-            all_hole_lines = []
-            for hole_lines, _ in hole_data:
-                all_hole_lines.extend(hole_lines)
-
-            if all_hole_lines:
-                geo.add_physical(all_hole_lines, "hole_boundary")
-
-            if separate_boundary:
-                # Outer boundary segments
-                geo.add_physical([outer_lines[0]], "bottom")
-                geo.add_physical([outer_lines[1]], "right")
-                geo.add_physical([outer_lines[2]], "top")
-                geo.add_physical([outer_lines[3]], "left")
-
-                # Each hole gets its own boundary groups
-                for hole_lines, hole_type in hole_data:
-                    # Combined boundary for this hole
-                    geo.add_physical(hole_lines, f"{hole_type}_boundary")
-
-                    # Individual sides
-                    geo.add_physical([hole_lines[0]], f"{hole_type}_bottom")
-                    geo.add_physical([hole_lines[1]], f"{hole_type}_right")
-                    geo.add_physical([hole_lines[2]], f"{hole_type}_top")
-                    geo.add_physical([hole_lines[3]], f"{hole_type}_left")
-
-            return geo, 2, mesh_size
-
-        return constructor
-
-
-class MeshUtils:
-
-    @staticmethod
-    def _preprocess_mesh_connectivity(mesh, dimension, boundary_indices):
-        """Preprocess mesh to build FEM connectivity matrices for finite differences."""
-        if mesh is None:
-            return
-
-        points = mesh.points[:, :dimension]
-        n_points = len(points)
-
-        if dimension == 1:
-            # Check for line elements in the mesh
-            if "line" not in mesh.cells_dict:
-                raise ValueError("1D finite difference support requires line meshes")
-
-            elements = mesh.cells_dict["line"]
-            element_type = "lines"
-            n_vertices_per_element = 2
-
-            # Precompute 1D element lengths and shape function gradients
-            length, grad_phi = MeshUtils.precompute_p1_line_geometry(points, elements)
-
-            # Create all directed edges from line elements
-            # Each line element [a, b] creates edges a->b and b->a
-            edges = np.concatenate([elements[:, [0, 1]], elements[:, [1, 0]]], axis=0)
-
-        elif dimension == 2:
-            if "triangle" not in mesh.cells_dict:
-                raise ValueError("2D finite difference support requires triangular meshes")
-
-            elements = mesh.cells_dict["triangle"]
-            element_type = "triangles"
-            n_vertices_per_element = 3
-
-            area, grad_phi = MeshUtils.precompute_p1_triangle_geometry(points, elements)
-
-            # Create all directed edges from triangles
-            edges = np.concatenate(
-                [
-                    elements[:, [0, 1]],  # a -> b
-                    elements[:, [0, 2]],  # a -> c
-                    elements[:, [1, 0]],  # b -> a
-                    elements[:, [1, 2]],  # b -> c
-                    elements[:, [2, 0]],  # c -> a
-                    elements[:, [2, 1]],  # c -> b
-                ],
-                axis=0,
-            )
-
-        elif dimension == 3:
-            if "tetra" not in mesh.cells_dict:
-                raise ValueError("3D finite difference support requires tetrahedral meshes")
-
-            elements = mesh.cells_dict["tetra"]
-            element_type = "tetrahedra"
-            n_vertices_per_element = 4
-
-            # Create all directed edges from tetrahedra (6 edges per tetrahedron)
-            edges = np.concatenate(
-                [
-                    elements[:, [0, 1]],  # a -> b
-                    elements[:, [0, 2]],  # a -> c
-                    elements[:, [0, 3]],  # a -> d
-                    elements[:, [1, 2]],  # b -> c
-                    elements[:, [1, 3]],  # b -> d
-                    elements[:, [2, 3]],  # c -> d
-                    # Reverse directions
-                    elements[:, [1, 0]],
-                    elements[:, [2, 0]],
-                    elements[:, [3, 0]],
-                    elements[:, [2, 1]],
-                    elements[:, [3, 1]],
-                    elements[:, [3, 2]],
-                ],
-                axis=0,
-            )
-
-        else:
-            raise ValueError(f"Finite difference not supported for dimension {dimension}")
-
-        # Build neighbor lists efficiently
-        neighbors = {}
-        for i in range(n_points):
-            # Find all edges starting from vertex i
-            mask = edges[:, 0] == i
-            neighbor_ids = np.unique(edges[mask, 1]).tolist()
-            neighbors[i] = neighbor_ids
-
-        # Store connectivity info
-        mesh_connectivity = {"points": points, element_type: elements, "neighbors": neighbors, "n_points": n_points, "dimension": dimension}
-
-        if dimension == 2:
-            mesh_connectivity["p1_area"] = np.array(area)
-            mesh_connectivity["p1_grad_phi"] = np.array(grad_phi)
-
-        msg = f"Preprocessed mesh connectivity: {n_points} points, {len(elements)} {element_type}"
-
-        mesh_connectivity["nodal_ds"] = MeshUtils.compute_nodal_ds(mesh_connectivity)
-        mesh_connectivity["boundary_indices"] = boundary_indices
-
-        bp = points[boundary_indices]
-        all_indices = np.arange(len(points))
-        non_boundary_indices = np.setdiff1d(all_indices, boundary_indices)
-        _bp = points[non_boundary_indices]
-
-        mesh_connectivity["boundary_points"] = bp
-        # Use raytrace-based visibility for multi-connected domains (holes),
-        # fall back to ordered method for simple single-loop boundaries.
-        if dimension == 2 and "triangle" in mesh.cells_dict:
-            bpe_global = MeshUtils.extract_boundary_edges(mesh.cells_dict["triangle"], len(bp))
-            bpe_global = np.asarray(bpe_global)
-
-            # Re-map edge indices from full-mesh space to boundary-only space
-            global_to_local = {int(gi): li for li, gi in enumerate(boundary_indices)}
-            bpe_local = np.array([[global_to_local[int(e[0])], global_to_local[int(e[1])]] for e in bpe_global if int(e[0]) in global_to_local and int(e[1]) in global_to_local])
-
-            mesh_connectivity["boundary_edges"] = bpe_local
-            mesh_connectivity["VM"] = MeshUtils.get_visibility_matrix_raytrace(bp, bpe_local, _bp[0], n_ray_samples=20)
-        elif dimension <= 2:
-            # 1-D domains: boundary is just 2 points; ordered visibility still works.
-            mesh_connectivity["VM"] = MeshUtils.get_visibility_matrix_ordered(bp, _bp[0])
-        else:
-            # 3-D (and higher): the 2-D ordered visibility algorithm does not
-            # generalise to higher-dimensional boundaries.  Store a trivial
-            # all-visible placeholder so the rest of the pipeline keeps working.
-            n_bp = len(bp)
-            mesh_connectivity["VM"] = np.ones((n_bp, n_bp), dtype=np.float32) - np.eye(n_bp, dtype=np.float32)
-
-        msg = f"Preprocessed mesh connectivity: {n_points} points, {len(elements)} {element_type}"
-
-        return mesh_connectivity, msg
-
-    @staticmethod
-    def compute_nodal_ds(mesh_connectivity, boundary_indices=None):
-        """
-        Compute element measure (length/area/volume) attributed to each node.
-
-        For boundary view factors:
-        - 1D domain: ds = length of adjacent line segments (÷2 per node)
-        - 2D domain: ds = length of adjacent boundary edges (÷2 per node)
-        - 3D domain: ds = area of adjacent boundary faces (÷3 per node)
-
-        Parameters
-        ----------
-        mesh_connectivity : dict
-            Preprocessed mesh connectivity from _preprocess_mesh_connectivity
-        boundary_indices : array, optional
-            Indices of boundary nodes. If None, returns ds for all nodes.
-
-        Returns
-        -------
-        ds : ndarray of shape (n_boundary_points,)
-        """
-        from collections import Counter
-
-        dimension = mesh_connectivity["dimension"]
-        points = mesh_connectivity["points"]
-        n_points = mesh_connectivity["n_points"]
-
-        ds = np.zeros(n_points)
-
-        if dimension == 1:
-            # Boundary = endpoints, ds = half of adjacent line element
-            elements = mesh_connectivity["lines"]
-            for elem in elements:
-                p0, p1 = points[elem[0]], points[elem[1]]
-                length = np.linalg.norm(p1 - p0)
-                ds[elem[0]] += 0.5 * length
-                ds[elem[1]] += 0.5 * length
-
-        elif dimension == 2:
-            # Boundary = edges that appear once in the triangulation
-            triangles = mesh_connectivity["triangles"]
-
-            edge_count = Counter()
-            edge_lengths = {}
-
-            for tri in triangles:
-                for i in range(3):
-                    n0, n1 = int(tri[i]), int(tri[(i + 1) % 3])
-                    edge = (min(n0, n1), max(n0, n1))
-                    edge_count[edge] += 1
-                    if edge not in edge_lengths:
-                        edge_lengths[edge] = np.linalg.norm(points[n1] - points[n0])
-
-            # Boundary edges appear exactly once
-            for edge, count in edge_count.items():
-                if count == 1:
-                    length = edge_lengths[edge]
-                    ds[edge[0]] += 0.5 * length
-                    ds[edge[1]] += 0.5 * length
-
-        elif dimension == 3:
-            # Boundary = faces that appear once in the tetrahedralization
-            tetra = mesh_connectivity["tetrahedra"]
-
-            face_count = Counter()
-            face_areas = {}
-
-            # 4 faces per tetrahedron
-            face_local = [[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]]
-
-            for tet in tetra:
-                for fl in face_local:
-                    nodes = tuple(sorted([int(tet[fl[0]]), int(tet[fl[1]]), int(tet[fl[2]])]))
-                    face_count[nodes] += 1
-                    if nodes not in face_areas:
-                        p0, p1, p2 = points[nodes[0]], points[nodes[1]], points[nodes[2]]
-                        area = 0.5 * np.linalg.norm(np.cross(p1 - p0, p2 - p0))
-                        face_areas[nodes] = area
-
-            # Boundary faces appear exactly once
-            for face, count in face_count.items():
-                if count == 1:
-                    area = face_areas[face]
-                    for node in face:
-                        ds[node] += area / 3.0  # Divide among 3 vertices
-
-        else:
-            raise ValueError(f"Unsupported dimension: {dimension}")
-
-        if boundary_indices is not None:
-            return ds[boundary_indices]
-
-        return ds
-
-    @staticmethod
-    def get_boundary_normals(mesh, k=8):
-        points = mesh.points
-        if "tetra" in mesh.cells_dict:
-            boundary_elements = MeshUtils._get_boundary_elements(mesh.cells_dict["tetra"], "tetra")
-            actual_dim = 3
-        elif "triangle" in mesh.cells_dict:
-            boundary_elements = MeshUtils._get_boundary_elements(mesh.cells_dict["triangle"], "triangle")
-            actual_dim = 2
-        else:
-            raise ValueError("Unsupported mesh type.")
-
-        boundary_indices = np.unique(boundary_elements)
-        return MeshUtils._compute_normals_pca(points, boundary_indices, actual_dim, k, mesh=mesh)
-
-    @staticmethod
-    def _get_boundary_elements(cells, cell_type):
-        """Finds elements (lines/triangles) that appear only once."""
-        if cell_type == "tetra":
-            faces = np.sort(np.vstack([cells[:, [0, 1, 2]], cells[:, [0, 1, 3]], cells[:, [0, 2, 3]], cells[:, [1, 2, 3]]]), axis=1)
-        else:  # triangle
-            faces = np.sort(np.vstack([cells[:, [0, 1]], cells[:, [1, 2]], cells[:, [2, 0]]]), axis=1)
-
-        unique_elements, counts = np.unique(faces, axis=0, return_counts=True)
-        return unique_elements[counts == 1]
-
-    @staticmethod
-    def _compute_normals_pca(points, boundary_indices, dim, k=8, mesh=None):
-        """
-        Compute outward-pointing normals for boundary points using PCA.
-
-        Handles both outer boundaries and inner boundaries (holes) correctly.
-        Normals always point OUT of the domain material.
-        """
-        coords = points[boundary_indices, :dim]
-
-        tree = KDTree(coords)
-        _, neighbors = tree.query(coords, k=min(k, len(coords)))
-
-        v_normals = np.zeros((len(boundary_indices), dim))
-        mesh_centroid = np.mean(points[:, :dim], axis=0)
-
-        # Get boundary edges for point-in-polygon test
-        boundary_edges = None
-        if dim == 2 and mesh is not None and "triangle" in mesh.cells_dict:
-            from collections import Counter
-
-            triangles = mesh.cells_dict["triangle"]
-            edge_count = Counter()
-            for tri in triangles:
-                for j in range(3):
-                    n0, n1 = int(tri[j]), int(tri[(j + 1) % 3])
-                    edge = (min(n0, n1), max(n0, n1))
-                    edge_count[edge] += 1
-            boundary_edges = [edge for edge, count in edge_count.items() if count == 1]
-
-        def point_in_domain_2d(pt, edges, all_points):
-            """Ray casting point-in-polygon for 2D."""
-            if edges is None:
-                return True  # Fallback
-
-            x, y = pt[0], pt[1]
-            crossings = 0
-
-            for e0, e1 in edges:
-                x0, y0 = all_points[e0, 0], all_points[e0, 1]
-                x1, y1 = all_points[e1, 0], all_points[e1, 1]
-
-                if ((y0 > y) != (y1 > y)) and (y1 != y0):
-                    x_int = x0 + (x1 - x0) * (y - y0) / (y1 - y0)
-                    if x < x_int:
-                        crossings += 1
-
-            return crossings % 2 == 1
-
-        for i in range(len(boundary_indices)):
-            patch = coords[neighbors[i]]
-            centered_patch = patch - np.mean(patch, axis=0)
-
-            # SVD finds directions of variance
-            _, _, vh = np.linalg.svd(centered_patch)
-
-            # The last row of vh is the direction of LEAST variance (the normal)
-            normal = vh[-1, :]
-            normal = normal / (np.linalg.norm(normal) + 1e-12)
-
-            # Test which direction is "inside" the domain
-            step_size = 1e-4 * np.max(np.abs(coords.max(axis=0) - coords.min(axis=0)))
-
-            test_point_positive = coords[i] + step_size * normal
-            test_point_negative = coords[i] - step_size * normal
-
-            if dim == 2:
-                inside_positive = point_in_domain_2d(test_point_positive, boundary_edges, points[:, :dim])
-                inside_negative = point_in_domain_2d(test_point_negative, boundary_edges, points[:, :dim])
-
-                # Normal should point OUT of domain (toward the side that is NOT inside)
-                if inside_positive and not inside_negative:
-                    # Positive direction is inside, so normal should point negative
-                    normal = -normal
-                elif inside_negative and not inside_positive:
-                    # Negative direction is inside, normal already points out
-                    pass
-                else:
-                    # Fallback to centroid-based heuristic
-                    point_vec = coords[i] - mesh_centroid
-                    if np.dot(normal, point_vec) < 0:
-                        normal = -normal
-            else:
-                # 3D or fallback: use centroid heuristic
-                point_vec = coords[i] - mesh_centroid
-                if np.dot(normal, point_vec) < 0:
-                    normal = -normal
-
-            v_normals[i] = normal
-
-        return v_normals, boundary_indices
-
-    @staticmethod
-    @jax.jit
-    def get_visibility_matrix_ordered(P_bnd: jnp.ndarray, P_int: jnp.ndarray) -> jnp.ndarray:
-        """
-        Compute visibility matrix for boundary points considering interior points.
-
-        Parameters
-        ----------
-        P_bnd : jnp.ndarray
-            (n_bnd, 2) boundary points of the mesh (simple polygon).
-        P_int : jnp.ndarray
-            (n_int, 2) interior points of the mesh.
-
-        Returns
-        -------
-        jnp.ndarray
-            (n_bnd, n_bnd) boolean visibility matrix.
-            VM[i,j] = 1 if boundary point i can "see" boundary point j.
-
-        Two boundary points are visible if:
-        1. The line segment between them does not intersect any boundary edge
-
-        (except at the endpoints themselves).
-        2. The ray passes through the interior (midpoint inside polygon).
-        3. No other boundary point lies on the segment between them.
-
-        """
-
-        def order_boundary_points(P):
-            """Order boundary points counter-clockwise by angle from centroid."""
-            center = jnp.mean(P, axis=0)
-            angles = jnp.arctan2(P[:, 1] - center[1], P[:, 0] - center[0])
-            return jnp.argsort(angles)
-
-        # Order boundary points
-        order = order_boundary_points(P_bnd)
-        P = P_bnd[order]
-
-        @jax.jit
-        def _compute(P, P_interior):
-            n_bnd = P.shape[0]
-            n_int = P_interior.shape[0]
-            ks = jnp.arange(n_bnd)
-
-            # Polygon edges: edge k connects point k to point (k+1) mod n
-            C = P  # Start points of edges (n_bnd, 2)
-            D = jnp.roll(P, -1, axis=0)  # End points of edges (n_bnd, 2)
-
-            def orient(p, q, r):
-                """
-                Compute orientation of triplet (p, q, r).
-                Returns positive if counter-clockwise, negative if clockwise, 0 if collinear.
-                """
-                return (q[..., 0] - p[..., 0]) * (r[..., 1] - p[..., 1]) - (q[..., 1] - p[..., 1]) * (r[..., 0] - p[..., 0])
-
-            def point_in_polygon(pt):
-                """
-                Ray-casting point-in-polygon test for a single point pt (2,).
-                Returns True if pt is inside (or on) the polygon defined by C-D.
-                """
-                x = pt[0]
-                y = pt[1]
-
-                x0 = C[:, 0]
-                y0 = C[:, 1]
-                x1 = D[:, 0]
-                y1 = D[:, 1]
-
-                # Edges that straddle the horizontal ray at y
-                cond = ((y0 > y) != (y1 > y)) & (y1 != y0)
-
-                # x-coordinate where the ray at height y intersects the edge
-                x_int = x0 + (x1 - x0) * (y - y0) / (y1 - y0 + 1e-12)
-
-                crossings = cond & (x < x_int)
-
-                # Inside if number of crossings is odd
-                inside = jnp.mod(jnp.sum(crossings.astype(jnp.int32)), 2) == 1
-                return inside
-
-            def segments_intersect_strict(A, B, C_pt, D_pt):
-                """
-                Check if segment AB strictly intersects segment CD.
-                Returns True only if they cross each other (not just touch at endpoints).
-                """
-                o1 = orient(A, B, C_pt)
-                o2 = orient(A, B, D_pt)
-                o3 = orient(C_pt, D_pt, A)
-                o4 = orient(C_pt, D_pt, B)
-
-                # Strict intersection: both segments must straddle each other
-                return (o1 * o2 < 0.0) & (o3 * o4 < 0.0)
-
-            def point_on_segment(A, B, P_test, tol=1e-8):
-                """
-                Check if point P_test lies on segment AB (excluding endpoints).
-
-                Parameters
-                ----------
-                A, B : points defining the segment
-                P_test : point to test
-                tol : tolerance for collinearity and bounds checking
-
-                Returns
-                -------
-                bool : True if P_test is strictly on segment AB (not at endpoints)
-                """
-                # Vector from A to B
-                AB = B - A
-                # Vector from A to P
-                AP = P_test - A
-
-                # Length squared of AB
-                AB_len_sq = jnp.dot(AB, AB)
-
-                # Parameter t where P = A + t * AB
-                # t = dot(AP, AB) / dot(AB, AB)
-                t = jnp.dot(AP, AB) / (AB_len_sq + 1e-12)
-
-                # Point on line closest to P_test
-                closest = A + t * AB
-
-                # Distance from P_test to the line
-                dist_sq = jnp.sum((P_test - closest) ** 2)
-
-                # Check if:
-                # 1. Point is close to the line (collinear)
-                # 2. t is strictly between 0 and 1 (not at endpoints)
-                is_collinear = dist_sq < tol**2
-                is_between = (t > tol) & (t < 1.0 - tol)
-
-                return is_collinear & is_between
-
-            def boundary_point_blocks_segment(A, B, i, j):
-                """
-                Check if any OTHER boundary point (not i or j) lies on segment AB.
-
-                This ensures the ray terminates at the first boundary point it hits.
-                """
-
-                def check_single_point(k):
-                    # Skip the endpoints themselves
-                    is_endpoint = (k == i) | (k == j)
-                    P_k = P[k]
-                    on_segment = point_on_segment(A, B, P_k)
-                    return (~is_endpoint) & on_segment
-
-                # Check all boundary points
-                blocked_by = jax.vmap(check_single_point)(ks)
-                return jnp.any(blocked_by)
-
-            def seg_visible(i, j):
-                """
-                Check if the segment from boundary point i to boundary point j is visible.
-
-                Visible means:
-                1. The segment does not intersect any polygon edge (except adjacent ones)
-                2. The midpoint lies inside the polygon
-                3. No other boundary point lies on the segment
-
-                """
-                A = P[i]
-                B = P[j]
-
-                # === Check 1: No intersection with polygon edges ===
-                k2 = (ks + 1) % n_bnd
-
-                # Skip edges that share an endpoint with the query segment
-                is_adjacent = (ks == i) | (ks == j) | (k2 == i) | (k2 == j)
-
-                # Broadcast A and B for vectorized computation
-                A_b = jnp.broadcast_to(A, (n_bnd, 2))
-                B_b = jnp.broadcast_to(B, (n_bnd, 2))
-
-                # Check intersection with each edge
-                intersects = segments_intersect_strict(A_b, B_b, C, D)
-
-                # Mask out adjacent edges
-                intersects = intersects & (~is_adjacent)
-
-                # No edge intersection
-                no_edge_intersection = ~jnp.any(intersects)
-
-                # === Check 2: Midpoint inside polygon ===
-                mid = 0.5 * (A + B)
-                midpoint_inside = point_in_polygon(mid)
-
-                # === Check 3: No other boundary point on the segment ===
-                no_blocking_point = ~boundary_point_blocks_segment(A, B, i, j)
-
-                # All conditions must be satisfied
-                return no_edge_intersection & midpoint_inside & no_blocking_point
-
-            def outer_body(i, VM):
-                def inner_body(j, row):
-                    is_same = i == j
-
-                    # Adjacent boundary points are always visible (they share an edge)
-                    is_adjacent_point = (j == (i + 1) % n_bnd) | (j == (i - 1 + n_bnd) % n_bnd)
-
-                    visible_ij = jax.lax.cond(is_same, lambda: False, lambda: jax.lax.cond(is_adjacent_point, lambda: True, lambda: seg_visible(i, j)))  # Diagonal is always 0 (can't see itself)  # Adjacent boundary points are always visible
-                    row = row.at[j].set(visible_ij)
-                    return row
-
-                row = VM[i]
-                row = jax.lax.fori_loop(0, n_bnd, inner_body, row)
-                VM = VM.at[i].set(row)
-                return VM
-
-            VM0 = jnp.zeros((n_bnd, n_bnd), dtype=jnp.float32)
-            VM = jax.lax.fori_loop(0, n_bnd, outer_body, VM0)
-
-            return VM
-
-        # Compute visibility in ordered space
-        visible_ord = _compute(P, P_int)
-
-        # Reorder back to original point ordering
-        inv_order = jnp.argsort(order)
-        visible = visible_ord[jnp.ix_(inv_order, inv_order)]
-
-        # Ensure diagonal is zero (point can't see itself)
-        n = visible.shape[0]
-        VM_jax = visible.at[jnp.diag_indices(n)].set(0.0)
-
-        return VM_jax
-
-    @staticmethod
-    def get_visibility_matrix_raytrace(boundary_points, boundary_edges, interior_point=None, n_ray_samples: int = 3) -> jnp.ndarray:
-        """
-        Compute visibility matrix via segment–edge intersection tests.
-
-        Two boundary points see each other if and only if the straight line
-        between them does **not** cross any boundary edge (excluding the
-        edges adjacent to the two endpoints).  This is exact for any closed
-        2-D enclosure and avoids the fragile point-in-polygon sampling that
-        the previous implementation relied on.
-
-        The computation is fully vectorized over target points for each
-        source point, giving O(N · E) work per source row.
-
-        Parameters
-        ----------
-        boundary_points : array-like, shape (N, 2)
-            Coordinates of the boundary discretisation points.
-        boundary_edges : array-like, shape (E, 2)
-            Index pairs into *boundary_points* defining the boundary segments.
-        interior_point : ignored (kept for API compatibility)
-        n_ray_samples : ignored (kept for API compatibility)
-
-        Returns
-        -------
-        jnp.ndarray, shape (N, N)
-            Binary visibility matrix (float32).  ``VM[i, j] = 1`` means
-            point *i* can see point *j*.
-        """
-        import numpy as np
-        import time
-
-        P = np.asarray(boundary_points, dtype=np.float64)
-        edges = np.asarray(boundary_edges, dtype=np.int32)
-        n_bnd = P.shape[0]
-        n_edges = edges.shape[0]
-
-        E0 = P[edges[:, 0]]  # (n_edges, 2)
-        E1 = P[edges[:, 1]]  # (n_edges, 2)
-
-        t0 = time.time()
-
-        # ==================================================================
-        # Build adjacency: adj_mask[j, k] = True if edge k touches point j
-        # ==================================================================
-        adj_mask = np.zeros((n_bnd, n_edges), dtype=bool)
-        for k in range(n_edges):
-            adj_mask[edges[k, 0], k] = True
-            adj_mask[edges[k, 1], k] = True
-
-        # ==================================================================
-        # Precompute edge directions and 2-D cross-product helper
-        # ==================================================================
-        edge_dir = E1 - E0  # (n_edges, 2)
-
-        def cross2d(a, b):
-            return a[..., 0] * b[..., 1] - a[..., 1] * b[..., 0]
-
-        # ==================================================================
-        # For each source point, test all target segments against all edges
-        # ==================================================================
-        VM = np.zeros((n_bnd, n_bnd), dtype=np.float32)
-
-        for i in range(n_bnd):
-            A = P[i]  # (2,)
-
-            AB = P - A  # (n_bnd, 2)  — direction vectors to every target
-            AB_exp = AB[:, None, :]  # (n_bnd, 1, 2)
-            edge_exp = edge_dir[None, :, :]  # (1, n_edges, 2)
-            diff_row = (E0 - A)[None, :, :]  # (1, n_edges, 2)
-
-            denom = cross2d(AB_exp, edge_exp)  # (n_bnd, n_edges)
-            parallel = np.abs(denom) < 1e-12
-            denom_safe = np.where(parallel, 1.0, denom)
-
-            t_seg = cross2d(diff_row, edge_exp) / denom_safe  # param on A→B
-            t_edge = cross2d(diff_row, AB_exp) / denom_safe  # param on edge
-
-            eps = 1e-10
-            crossings = (~parallel) & (t_seg > eps) & (t_seg < 1 - eps) & (t_edge > eps) & (t_edge < 1 - eps)
-
-            # Ignore edges that share an endpoint with source or target
-            crossings[:, adj_mask[i]] = False  # edges touching source i
-            crossings &= ~adj_mask  # edges touching each target j
-
-            any_crossing = np.any(crossings, axis=1)  # (n_bnd,)
-
-            visible = ~any_crossing
-            visible[i] = False  # no self-visibility
-
-            VM[i, :] = visible.astype(np.float32)
-
-        elapsed = time.time() - t0
-
-        return jnp.array(VM)
-
-    @staticmethod
-    def extract_boundary_edges(triangles: jnp.ndarray, n_points: int) -> jnp.ndarray:
-        """
-        Extract boundary edges from triangle connectivity.
-        Boundary edges appear in exactly one triangle.
-
-        Parameters
-        ----------
-        triangles : jnp.ndarray
-            (n_tri, 3) triangle connectivity.
-        n_points : int
-            Total number of points.
-
-        Returns
-        -------
-        jnp.ndarray
-            (n_boundary_edges, 2) boundary edge indices.
-        """
-        import numpy as np
-
-        triangles_np = np.asarray(triangles)
-
-        # Collect all edges (sorted to make undirected)
-        edges = []
-        for tri in triangles_np:
-            for k in range(3):
-                e = tuple(sorted([tri[k], tri[(k + 1) % 3]]))
-                edges.append(e)
-
-        # Count occurrences
-        from collections import Counter
-
-        edge_count = Counter(edges)
-
-        # Boundary edges appear exactly once
-        boundary_edges = [list(e) for e, c in edge_count.items() if c == 1]  # type: ignore[misc]
-
-        return jnp.array(boundary_edges)  # type: ignore[return-value]
-
-    @staticmethod
-    @jax.jit
-    def get_view_factor_3d(P, VM, Nrm, ds):
-
-        n_pts = P.shape[0]
-
-        v = P[None, :, :] - P[:, None, :]  # (N,N,3), x_j - x_i
-        r = jnp.linalg.norm(v, axis=-1)  # (N,N)
-
-        # avoid divide by zero only on diagonal
-        r_safe = r + jnp.eye(n_pts)
-        r_hat = v / r_safe[..., None]  # (N,N,3)
-
-        # cosines
-        cos_i = jnp.sum(Nrm[:, None, :] * r_hat, axis=-1)  # (N,N)
-        cos_j = -jnp.sum(Nrm[None, :, :] * r_hat, axis=-1)  # (N,N)
-
-        # physical clipping
-        cos_i = jnp.maximum(0.0, cos_i)
-        cos_j = jnp.maximum(0.0, cos_j)
-
-        # kernel
-        F_ij = (cos_i * cos_j) / (jnp.pi * r_safe**2)  # 3D Formula
-
-        # apply visibility
-        F_ij = F_ij * VM
-
-        # total view factor from i
-        F = jnp.sum(F_ij * ds[None, :], axis=1)
-
-        return F
-
-    @staticmethod
-    @jax.jit
-    def get_view_factor_2d(P, VM, Nrm, ds):
-
-        n_pts = P.shape[0]
-
-        v = P[None, :, :] - P[:, None, :]
-        r = jnp.linalg.norm(v, axis=-1)
-
-        r_safe = r + jnp.eye(n_pts)
-        r_hat = v / r_safe[..., None]
-
-        cos_i = jnp.sum(Nrm[:, None, :] * r_hat, axis=-1)
-        cos_j = -jnp.sum(Nrm[None, :, :] * r_hat, axis=-1)
-
-        cos_i = jnp.maximum(0.0, cos_i)
-        cos_j = jnp.maximum(0.0, cos_j)
-
-        F_ij = (cos_i * cos_j) / (2.0 * r_safe)
-        F_ij = F_ij * VM
-        F_ij = F_ij * (1 - jnp.eye(n_pts))
-
-        # include quadrature weights
-        F_op = F_ij * ds[None, :]
-
-        # enforce row sum = 1
-        # row_sum = jnp.sum(F_op, axis=1, keepdims=True)
-        F_op = F_op  # / row_sum
-
-        return F_op
-
-    @staticmethod
-    def get_view_factor_1d(P, VM, Nrm, ds):
-        n_pts = P.shape[0]
-        return jnp.ones(n_pts)
-
-    @staticmethod
-    def precompute_p1_line_geometry(points, elements):
-        """
-        Precompute P1 line element geometry (lengths and shape function gradients).
-
-        Parameters
-        ----------
-        points : ndarray of shape (n_points, 1)
-            Node coordinates
-        elements : ndarray of shape (n_elements, 2)
-            Line element connectivity (node indices)
-
-        Returns
-        -------
-        length : ndarray of shape (n_elements,)
-            Length of each line element
-        grad_phi : ndarray of shape (n_elements, 2)
-            Gradient of each shape function on each element
-            grad_phi[e, i] = d(phi_i)/dx on element e
-        """
-        n_elements = elements.shape[0]
-
-        # Get coordinates of element vertices
-        x0 = points[elements[:, 0], 0]  # First node x-coordinate
-        x1 = points[elements[:, 1], 0]  # Second node x-coordinate
-
-        # Compute element lengths
-        length = np.abs(x1 - x0)
-
-        # For P1 elements in 1D:
-        # phi_0(x) = (x1 - x) / L  =>  d(phi_0)/dx = -1/L
-        # phi_1(x) = (x - x0) / L  =>  d(phi_1)/dx = +1/L
-        # Note: Sign depends on orientation (x1 > x0 or x1 < x0)
-
-        grad_phi = np.zeros((n_elements, 2))
-
-        # Handle orientation: gradient sign depends on element direction
-        dx = x1 - x0
-        grad_phi[:, 0] = -1.0 / dx  # d(phi_0)/dx
-        grad_phi[:, 1] = 1.0 / dx  # d(phi_1)/dx
-
-        return length, grad_phi
-
-    @staticmethod
-    @jax.jit
-    def precompute_p1_triangle_geometry(points: jnp.ndarray, triangles: jnp.ndarray):
-        """
-        points: (N,2)
-        triangles: (T,3) int
-        Returns:
-        area: (T,)
-        grad_phi: (T,3,2) where grad_phi[t,a,:] = ∇φ_a on triangle t
-        """
-        tri = triangles.astype(jnp.int32)
-        p0 = points[tri[:, 0], :]  # (T,2)
-        p1 = points[tri[:, 1], :]
-        p2 = points[tri[:, 2], :]
-
-        x0, y0 = p0[:, 0], p0[:, 1]
-        x1, y1 = p1[:, 0], p1[:, 1]
-        x2, y2 = p2[:, 0], p2[:, 1]
-
-        # Twice signed area (Jacobian determinant)
-        det = (x1 - x0) * (y2 - y0) - (x2 - x0) * (y1 - y0)  # (T,)
-        area = 0.5 * jnp.abs(det)  # (T,)
-        det_safe = jnp.where(jnp.abs(det) < 1e-12, 1e-12, det)
-
-        # Gradients of barycentric basis functions on a triangle:
-        # ∇φ0 = [ (y1 - y2), (x2 - x1) ] / det
-        # ∇φ1 = [ (y2 - y0), (x0 - x2) ] / det
-        # ∇φ2 = [ (y0 - y1), (x1 - x0) ] / det
-        g0 = jnp.stack([(y1 - y2) / det_safe, (x2 - x1) / det_safe], axis=-1)  # (T,2)
-        g1 = jnp.stack([(y2 - y0) / det_safe, (x0 - x2) / det_safe], axis=-1)
-        g2 = jnp.stack([(y0 - y1) / det_safe, (x1 - x0) / det_safe], axis=-1)
-
-        grad_phi = jnp.stack([g0, g1, g2], axis=1)  # (T,3,2)
-        return area, grad_phi
-
-
-@dataclass
-class BoundaryRegion:
-    tag: str
-    dim: int
-    points: np.ndarray
-    edges: Optional[np.ndarray] = None
-    triangles: Optional[np.ndarray] = None
-    tol: float = 1e-8
-
-    def contains(self, p):
-        import jax.numpy as jnp
-
-        p = jnp.asarray(p)[: self.dim]
-
-        # 2D: segment membership
-        if self.dim == 2 and self.edges is not None and len(self.edges) > 0:
-            a = jnp.asarray(self.edges[:, 0, :])  # (E,2)
-            b = jnp.asarray(self.edges[:, 1, :])  # (E,2)
-
-            ab = b - a
-            ap = p[None, :] - a
-
-            ab_len2 = jnp.sum(ab * ab, axis=1)
-            ab_len2 = jnp.maximum(ab_len2, 1e-30)
-
-            t = jnp.sum(ap * ab, axis=1) / ab_len2
-            t = jnp.clip(t, 0.0, 1.0)
-
-            proj = a + t[:, None] * ab
-            dist2 = jnp.sum((proj - p[None, :]) ** 2, axis=1)
-            return jnp.any(dist2 <= self.tol * self.tol)
-
-        # 3D: triangle membership
-        if self.dim == 3 and self.triangles is not None and len(self.triangles) > 0:
-            a = jnp.asarray(self.triangles[:, 0, :])  # (T,3)
-            b = jnp.asarray(self.triangles[:, 1, :])
-            c = jnp.asarray(self.triangles[:, 2, :])
-
-            ab = b - a
-            ac = c - a
-            ap = p[None, :] - a
-
-            n = jnp.cross(ab, ac)
-            n_norm = jnp.linalg.norm(n, axis=1)
-            n_norm = jnp.maximum(n_norm, 1e-30)
-
-            plane_dist = jnp.abs(jnp.sum(ap * n, axis=1)) / n_norm
-
-            d00 = jnp.sum(ab * ab, axis=1)
-            d01 = jnp.sum(ab * ac, axis=1)
-            d11 = jnp.sum(ac * ac, axis=1)
-            d20 = jnp.sum(ap * ab, axis=1)
-            d21 = jnp.sum(ap * ac, axis=1)
-
-            denom = d00 * d11 - d01 * d01
-            denom = jnp.maximum(denom, 1e-30)
-
-            v = (d11 * d20 - d01 * d21) / denom
-            w = (d00 * d21 - d01 * d20) / denom
-            u = 1.0 - v - w
-
-            inside = (u >= -1e-8) & (v >= -1e-8) & (w >= -1e-8)
-            return jnp.any((plane_dist <= self.tol) & inside)
-
-        # fallback only if no explicit entities are available
-        pts = jnp.asarray(self.points[:, : self.dim])
-        d = jnp.linalg.norm(pts - p[None, :], axis=1)
-        return jnp.any(d <= self.tol)
-
-
-class MeshIOMixin(MeshUtils):
-    """Mesh loading and export helpers shared by domain-like classes."""
-
-    log: Logger | PrintFallback
-    context: Dict[str, Any]
-    _param_tags: set[str]
-    spatial: List[str]
-    mesh: meshio.Mesh | None
-    dimension: int
-
-    def _load_mesh(self, mesh_file: str):
-        """Load mesh from file using Meshio."""
-        import meshio
-
-        from pathlib import Path
-
-        if not Path(mesh_file).exists():
-            raise FileNotFoundError(f"Mesh file not found: {mesh_file}")
-
-        self.mesh = meshio.read(mesh_file)
-
-        points = self.mesh.points  # type: ignore[attr-defined]
-        if points.shape[1] == 3 and np.allclose(points[:, 2], 0):
-            self.dimension = 2
-        else:
-            self.dimension = points.shape[1]
-
-    def _write_meshio_safely(self, save_path: str, file_format: Optional[str] = None):
-        """Write mesh with meshio, falling back to a cell_set-free copy if needed."""
-        import os
-
-        if self.mesh is None:
-            raise ValueError("No mesh available to export")
-
-        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-        try:
-            meshio.write(save_path, self.mesh, file_format=file_format)
-        except IndexError as e:
-            # Some meshio VTK writers can fail when converting cell_sets to
-            # cell_data if set indices are malformed or global-indexed.
-            # Fallback: export geometry/cells without cell_sets.
-            msg = str(e)
-            if "cell_sets" not in msg and "out of bounds" not in msg:
-                raise
-
-            sanitized_mesh = meshio.Mesh(
-                points=self.mesh.points,
-                cells=self.mesh.cells,
-                point_data=getattr(self.mesh, "point_data", None),
-                cell_data=getattr(self.mesh, "cell_data", None),
-                field_data=getattr(self.mesh, "field_data", None),
-            )
-            meshio.write(save_path, sanitized_mesh, file_format=file_format)
-            self.log.warning("Mesh export dropped cell_sets due to meshio conversion issue")
-
-    def export_vtk(self, save_path: str = "./runs/domain.vtk", file_format: Optional[str] = None):
-        """Export the current mesh to a VTK file for external viewers.
-
-        The output can be opened in ParaView, PyVista, or many browser-based
-        viewers that support VTK-compatible formats.
-        """
-        self._write_meshio_safely(save_path, file_format=file_format)
-        self.log.info(f"Saved mesh to {save_path}")
-
-    def export_msh(self, save_path: str = "./runs/domain.msh", file_format: str = "gmsh22"):
-        """Export the current mesh to Gmsh .msh format."""
-        self._write_meshio_safely(save_path, file_format=file_format)
-        self.log.info(f"Saved mesh to {save_path}")
-
-    def export(self, save_path: str, fmt: Optional[str] = None, show_sampled: bool = True, figsize: Tuple[int, int] = (10, 8)):
-        """Unified export helper.
-
-        Supported formats:
-        - png/jpg/jpeg/svg/pdf: static mesh image via ``plot_mesh``
-        - vtk/vtu: VTK mesh export
-        - msh: Gmsh mesh export
-        - html/htm: interactive browser view via Plotly
-        """
-        import os
-
-        _fmt = (fmt or os.path.splitext(save_path)[1].lower().lstrip(".")).lower()
-        if _fmt in {"png", "jpg", "jpeg", "svg", "pdf"}:
-            self.plot_mesh(save_path=save_path, figsize=figsize, show_sampled=show_sampled)
-        elif _fmt in {"vtk", "vtu"}:
-            self.export_vtk(save_path=save_path, file_format=_fmt)
-        elif _fmt in {"msh", "gmsh"}:
-            self.export_msh(save_path=save_path, file_format="gmsh22")
-        elif _fmt in {"html", "htm"}:
-            self.export_interactive_html(save_path=save_path, show_sampled=show_sampled)
-        else:
-            raise ValueError(f"Unsupported export format '{_fmt}'. Supported: png, jpg, svg, pdf, vtk, vtu, msh, html")
-
-    @staticmethod
-    def _set_3d_equal_axes(ax, points: np.ndarray):
-        """Set equal scaling on all 3D axes for better shape perception."""
-        mins = points.min(axis=0)
-        maxs = points.max(axis=0)
-        center = 0.5 * (mins + maxs)
-        radius = 0.5 * np.max(maxs - mins)
-        ax.set_xlim(center[0] - radius, center[0] + radius)
-        ax.set_ylim(center[1] - radius, center[1] + radius)
-        ax.set_zlim(center[2] - radius, center[2] + radius)
-
-    def plot_mesh(self, save_path: str = "./runs/domain_mesh.png", figsize: Tuple[int, int] = (10, 8), show_sampled: bool = True):
-        """Plot the actual mesh (elements), optionally overlaying sampled points."""
-        import os
-        import matplotlib.pyplot as plt
-
-        if self.mesh is None:
-            raise ValueError("No mesh available to plot")
-
-        points = np.asarray(self.mesh.points[:, : self.dimension])
-        spatial_dim = self.dimension
-
-        if spatial_dim == 3:
-            from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-
-            fig = plt.figure(figsize=figsize)
-            ax = fig.add_subplot(111, projection="3d")
-
-            if "tetra" in self.mesh.cells_dict:
-                boundary_faces = self._get_boundary_elements(self.mesh.cells_dict["tetra"], "tetra")
-                face_xyz = points[boundary_faces]
-                poly = Poly3DCollection(face_xyz, facecolor=(0.2, 0.55, 0.9, 0.12), edgecolor=(0.15, 0.15, 0.2, 0.35), linewidth=0.25)
-                ax.add_collection3d(poly)
-            elif "triangle" in self.mesh.cells_dict:
-                tri = self.mesh.cells_dict["triangle"]
-                face_xyz = points[tri]
-                poly = Poly3DCollection(face_xyz, facecolor=(0.2, 0.55, 0.9, 0.12), edgecolor=(0.15, 0.15, 0.2, 0.35), linewidth=0.25)
-                ax.add_collection3d(poly)
-
-            if show_sampled and self.context:
-                for tag, data in self.context.items():
-                    if tag.startswith("n_") or tag in self._param_tags or tag == "__time__":
-                        continue
-                    arr = np.asarray(data)
-                    if arr.ndim >= 4:
-                        pts = arr[0, 0]
-                        if pts.shape[-1] >= 3:
-                            ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], s=4, alpha=0.5)
-
-            self._set_3d_equal_axes(ax, points)
-            ax.set_xlabel(self.spatial[0])
-            ax.set_ylabel(self.spatial[1])
-            ax.set_zlabel(self.spatial[2])
-            ax.set_title("Mesh")
-        else:
-            fig, ax = plt.subplots(figsize=figsize)
-            if "triangle" in self.mesh.cells_dict and points.shape[1] >= 2:
-                import matplotlib.tri as mtri
-
-                tri = np.asarray(self.mesh.cells_dict["triangle"])
-                triang = mtri.Triangulation(points[:, 0], points[:, 1], tri)
-                ax.triplot(triang, color="0.3", linewidth=0.45, alpha=0.8)
-            elif "line" in self.mesh.cells_dict and points.shape[1] >= 1:
-                for e in np.asarray(self.mesh.cells_dict["line"]):
-                    p0, p1 = points[e[0]], points[e[1]]
-                    x0, x1 = p0[0], p1[0]
-                    y0 = p0[1] if points.shape[1] > 1 else 0.0
-                    y1 = p1[1] if points.shape[1] > 1 else 0.0
-                    ax.plot([x0, x1], [y0, y1], color="0.3", linewidth=0.8)
-
-            if show_sampled and self.context:
-                for tag, data in self.context.items():
-                    if tag.startswith("n_") or tag in self._param_tags or tag == "__time__":
-                        continue
-                    arr = np.asarray(data)
-                    if arr.ndim >= 4:
-                        pts = arr[0, 0]
-                    elif arr.ndim >= 2:
-                        pts = arr[0]
-                    else:
-                        continue
-                    if pts.shape[-1] >= 2:
-                        ax.scatter(pts[:, 0], pts[:, 1], s=8, alpha=0.5, label=tag)
-
-            if spatial_dim >= 2:
-                ax.set_aspect("equal")
-                ax.set_xlabel(self.spatial[0])
-                ax.set_ylabel(self.spatial[1])
-            else:
-                ax.set_xlabel(self.spatial[0])
-                ax.set_yticks([])
-            ax.set_title("Mesh")
-            if show_sampled and self.context:
-                ax.legend(loc="best", fontsize=8)
-
-        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=180, bbox_inches="tight")
-        plt.close()
-        self.log.info(f"Saved mesh plot to {save_path}")
-
-    def export_interactive_html(self, save_path: str = "./runs/domain_mesh.html", show_sampled: bool = True):
-        """Export an interactive mesh visualization as HTML (Plotly).
-
-        Open the generated HTML in any browser to rotate/pan/zoom.
-        """
-        import os
-
-        if self.mesh is None:
-            raise ValueError("No mesh available to export")
-
-        try:
-            import plotly.graph_objects as go
-        except Exception as e:
-            raise ImportError("plotly is required for interactive HTML export") from e
-
-        points = np.asarray(self.mesh.points[:, : self.dimension])
-        traces = []
-
-        if self.dimension == 3:
-            if "tetra" in self.mesh.cells_dict:
-                faces = self._get_boundary_elements(self.mesh.cells_dict["tetra"], "tetra")
-            elif "triangle" in self.mesh.cells_dict:
-                faces = np.asarray(self.mesh.cells_dict["triangle"])
-            else:
-                faces = None
-
-            if faces is not None and len(faces) > 0:
-                traces.append(
-                    go.Mesh3d(
-                        x=points[:, 0],
-                        y=points[:, 1],
-                        z=points[:, 2],
-                        i=faces[:, 0],
-                        j=faces[:, 1],
-                        k=faces[:, 2],
-                        opacity=0.25,
-                        color="royalblue",
-                        name="mesh",
-                    )
-                )
-
-            if show_sampled and self.context:
-                for tag, data in self.context.items():
-                    if tag.startswith("n_") or tag in self._param_tags or tag == "__time__":
-                        continue
-                    arr = np.asarray(data)
-                    if arr.ndim >= 4:
-                        pts = arr[0, 0]
-                        if pts.shape[-1] >= 3:
-                            traces.append(
-                                go.Scatter3d(
-                                    x=pts[:, 0],
-                                    y=pts[:, 1],
-                                    z=pts[:, 2],
-                                    mode="markers",
-                                    marker=dict(size=2),
-                                    name=tag,
-                                )
-                            )
-        else:
-            if "triangle" in self.mesh.cells_dict and points.shape[1] >= 2:
-                tri = np.asarray(self.mesh.cells_dict["triangle"])
-                edge_segments = []
-                for a, b, c in tri:
-                    edge_segments.extend(
-                        [
-                            (points[a, 0], points[a, 1]),
-                            (points[b, 0], points[b, 1]),
-                            (None, None),
-                            (points[b, 0], points[b, 1]),
-                            (points[c, 0], points[c, 1]),
-                            (None, None),
-                            (points[c, 0], points[c, 1]),
-                            (points[a, 0], points[a, 1]),
-                            (None, None),
-                        ]
-                    )
-                xe = [p[0] for p in edge_segments]
-                ye = [p[1] for p in edge_segments]
-                traces.append(go.Scatter(x=xe, y=ye, mode="lines", line=dict(width=1, color="rgba(70,70,70,0.5)"), name="mesh"))
-
-            if show_sampled and self.context:
-                for tag, data in self.context.items():
-                    if tag.startswith("n_") or tag in self._param_tags or tag == "__time__":
-                        continue
-                    arr = np.asarray(data)
-                    if arr.ndim >= 4:
-                        pts = arr[0, 0]
-                    elif arr.ndim >= 2:
-                        pts = arr[0]
-                    else:
-                        continue
-                    if pts.shape[-1] >= 2:
-                        traces.append(go.Scatter(x=pts[:, 0], y=pts[:, 1], mode="markers", marker=dict(size=4), name=tag))
-
-        fig = go.Figure(data=traces)
-        fig.update_layout(title="Interactive Mesh", template="plotly_white")
-        if self.dimension == 2:
-            fig.update_yaxes(scaleanchor="x", scaleratio=1)
-
-        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
-        fig.write_html(save_path, include_plotlyjs="cdn")
-        self.log.info(f"Saved interactive mesh HTML to {save_path}")
-
-
-class domain(MeshIOMixin, Geometries):
+import jax
+import jax.numpy as jnp
+import meshio
+import numpy as np
+
+from ..trace import Variable, TensorTag, Literal, BinaryOp, FunctionCall, Jacobian, TestFunction, TrialFunction, Constant, FemLinearSystem, Assembly
+from ..utils.logger import get_logger
+from .boundary_region import BoundaryRegion
+from .domain_data import DomainData
+from .geometries import Geometries
+from .meshio_mixin import MeshIOMixin
+
+
+class domain(MeshIOMixin):
     """
     Mesh-based domain class for defining computational domains and sampling collocation points.
 
@@ -2068,18 +31,278 @@ class domain(MeshIOMixin, Geometries):
         context: Unified dict of spatial (B,N,D) and parametric (B,F) arrays for training
     """
 
-    def __init__(self, constructor: Union[Callable, str] = None, algorithm: int = 6, time: Optional[Tuple[float, float, int]] = None, compute_mesh_connectivity: bool = True):
+    @classmethod
+    def _from_geometry(
+        cls,
+        geometry_constructor: Callable,
+        *,
+        algorithm: int = 6,
+        time: Optional[Tuple[float, float, int]] = None,
+        compute_mesh_connectivity: bool = True,
+    ) -> "domain":
+        return cls(
+            constructor=geometry_constructor,
+            algorithm=algorithm,
+            time=time,
+            compute_mesh_connectivity=compute_mesh_connectivity,
+        )
+
+    @classmethod
+    def line(
+        cls,
+        x_range=(0, 1),
+        mesh_size=0.1,
+        *,
+        algorithm: int = 6,
+        time: Optional[Tuple[float, float, int]] = None,
+        compute_mesh_connectivity: bool = True,
+    ) -> "domain":
+        """Instantiate a 1D line domain."""
+        return cls._from_geometry(
+            Geometries.line(x_range=x_range, mesh_size=mesh_size),
+            algorithm=algorithm,
+            time=time,
+            compute_mesh_connectivity=compute_mesh_connectivity,
+        )
+
+    @classmethod
+    def rect(
+        cls,
+        x_range=(0, 1),
+        y_range=(0, 1),
+        mesh_size=0.1,
+        *,
+        algorithm: int = 6,
+        time: Optional[Tuple[float, float, int]] = None,
+        compute_mesh_connectivity: bool = True,
+    ) -> "domain":
+        """Instantiate a rectangular domain.
+
+        Args:
+            x_range: Inclusive spatial extent along x.
+            y_range: Inclusive spatial extent along y.
+            mesh_size: Target mesh size passed to pygmsh.
+            algorithm: Gmsh meshing algorithm.
+            time: Optional tuple of ``(start, end, n_steps)`` for time-dependent problems.
+            compute_mesh_connectivity: Whether to precompute mesh connectivity metadata.
+        """
+        return cls._from_geometry(
+            Geometries.rect(x_range=x_range, y_range=y_range, mesh_size=mesh_size),
+            algorithm=algorithm,
+            time=time,
+            compute_mesh_connectivity=compute_mesh_connectivity,
+        )
+
+    @classmethod
+    def equi_distant_rect(
+        cls,
+        x_range=(0, 1),
+        y_range=(0, 1),
+        nx=10,
+        ny=10,
+        *,
+        algorithm: int = 6,
+        time: Optional[Tuple[float, float, int]] = None,
+        compute_mesh_connectivity: bool = True,
+    ) -> "domain":
+        """Instantiate a structured rectangular triangulation."""
+        return cls._from_geometry(
+            Geometries.equi_distant_rect(x_range=x_range, y_range=y_range, nx=nx, ny=ny),
+            algorithm=algorithm,
+            time=time,
+            compute_mesh_connectivity=compute_mesh_connectivity,
+        )
+
+    @classmethod
+    def poseidon(
+        cls,
+        nx: int = 128,
+        ny: int = 128,
+        *,
+        algorithm: int = 6,
+        time: Optional[Tuple[float, float, int]] = None,
+        compute_mesh_connectivity: bool = True,
+    ) -> "domain":
+        """Instantiate the structured Poseidon-style 2D grid."""
+        return cls._from_geometry(
+            Geometries.poseidon(nx=nx, ny=ny),
+            algorithm=algorithm,
+            time=time,
+            compute_mesh_connectivity=compute_mesh_connectivity,
+        )
+
+    @classmethod
+    def cube(
+        cls,
+        x_range=(0, 1),
+        y_range=(0, 1),
+        z_range=(0, 1),
+        mesh_size=0.1,
+        *,
+        algorithm: int = 6,
+        time: Optional[Tuple[float, float, int]] = None,
+        compute_mesh_connectivity: bool = True,
+    ) -> "domain":
+        """Instantiate a cubic 3D domain."""
+        return cls._from_geometry(
+            Geometries.cube(x_range=x_range, y_range=y_range, z_range=z_range, mesh_size=mesh_size),
+            algorithm=algorithm,
+            time=time,
+            compute_mesh_connectivity=compute_mesh_connectivity,
+        )
+
+    @classmethod
+    def disk(
+        cls,
+        center=(0, 0),
+        radius=1.0,
+        mesh_size=0.1,
+        num_points=32,
+        *,
+        algorithm: int = 6,
+        time: Optional[Tuple[float, float, int]] = None,
+        compute_mesh_connectivity: bool = True,
+    ) -> "domain":
+        """Instantiate a polygonal disk domain."""
+        return cls._from_geometry(
+            Geometries.disk(center=center, radius=radius, mesh_size=mesh_size, num_points=num_points),
+            algorithm=algorithm,
+            time=time,
+            compute_mesh_connectivity=compute_mesh_connectivity,
+        )
+
+    @classmethod
+    def l_shape(
+        cls,
+        size=1.0,
+        mesh_size=0.1,
+        separate_boundary=False,
+        *,
+        algorithm: int = 6,
+        time: Optional[Tuple[float, float, int]] = None,
+        compute_mesh_connectivity: bool = True,
+    ) -> "domain":
+        """Instantiate an L-shaped domain."""
+        return cls._from_geometry(
+            Geometries.l_shape(size=size, mesh_size=mesh_size, separate_boundary=separate_boundary),
+            algorithm=algorithm,
+            time=time,
+            compute_mesh_connectivity=compute_mesh_connectivity,
+        )
+
+    @classmethod
+    def rectangle_with_hole(
+        cls,
+        outer_size=1.0,
+        hole_size=0.4,
+        mesh_size=0.1,
+        separate_boundary=False,
+        *,
+        algorithm: int = 6,
+        time: Optional[Tuple[float, float, int]] = None,
+        compute_mesh_connectivity: bool = True,
+    ) -> "domain":
+        """Instantiate a rectangle with a single rectangular hole."""
+        return cls._from_geometry(
+            Geometries.rectangle_with_hole(
+                outer_size=outer_size,
+                hole_size=hole_size,
+                mesh_size=mesh_size,
+                separate_boundary=separate_boundary,
+            ),
+            algorithm=algorithm,
+            time=time,
+            compute_mesh_connectivity=compute_mesh_connectivity,
+        )
+
+    @classmethod
+    def rect_pml(
+        cls,
+        x_range=(0, 1),
+        y_range=(0, 1),
+        mesh_size=0.1,
+        pml_thickness_top=0.2,
+        pml_thickness_bottom=0.2,
+        *,
+        algorithm: int = 6,
+        time: Optional[Tuple[float, float, int]] = None,
+        compute_mesh_connectivity: bool = True,
+    ) -> "domain":
+        """Instantiate a rectangle with top and bottom PML regions."""
+        return cls._from_geometry(
+            Geometries.rect_pml(
+                x_range=x_range,
+                y_range=y_range,
+                mesh_size=mesh_size,
+                pml_thickness_top=pml_thickness_top,
+                pml_thickness_bottom=pml_thickness_bottom,
+            ),
+            algorithm=algorithm,
+            time=time,
+            compute_mesh_connectivity=compute_mesh_connectivity,
+        )
+
+    @classmethod
+    def rectangle_with_holes(
+        cls,
+        outer_size=(2.0, 1.0),
+        holes=None,
+        mesh_size=0.1,
+        separate_boundary=True,
+        *,
+        algorithm: int = 6,
+        time: Optional[Tuple[float, float, int]] = None,
+        compute_mesh_connectivity: bool = True,
+    ) -> "domain":
+        """Instantiate a rectangle with multiple rectangular holes."""
+        return cls._from_geometry(
+            Geometries.rectangle_with_holes(
+                outer_size=outer_size,
+                holes=holes,
+                mesh_size=mesh_size,
+                separate_boundary=separate_boundary,
+            ),
+            algorithm=algorithm,
+            time=time,
+            compute_mesh_connectivity=compute_mesh_connectivity,
+        )
+
+    def __init__(
+        self,
+        constructor: Union[Callable, str, "domain", None] = None,
+        algorithm: Optional[int] = None,
+        time: Optional[Tuple[float, float, int]] = None,
+        compute_mesh_connectivity: Optional[bool] = None,
+    ):
         """
         Initialize the domain.
 
         Args:
-            constructor: Function accepting a pygmsh.geo.Geometry object or a path to a meshfile
+            constructor: Function accepting a pygmsh.geo.Geometry object, an existing domain,
+                or a path to a meshfile
             algorithm: Gmsh meshing algorithm
             time: Tuple of (start, end) for time-dependent problems
             mesh_connectivity: Wether or not to compute the some hyperparameters about the mesh (needed for finite_difference methods)
         """
+        if isinstance(constructor, domain):
+            existing_domain = constructor
+            if algorithm is None:
+                algorithm = getattr(existing_domain, "_algorithm", 6)
+            if time is None:
+                time = existing_domain.time
+            if compute_mesh_connectivity is None:
+                compute_mesh_connectivity = existing_domain.compute_mesh_connectivity
+            constructor = getattr(existing_domain, "_constructor_source", None)
+
+        if algorithm is None:
+            algorithm = 6
+        if compute_mesh_connectivity is None:
+            compute_mesh_connectivity = True
+
         super().__init__()
         self.log = get_logger()
+        self._algorithm = algorithm
+        self._constructor_source = constructor
 
         # Storage
         self.compute_mesh_connectivity = compute_mesh_connectivity
@@ -2319,7 +542,7 @@ class domain(MeshIOMixin, Geometries):
             Boundary-condition descriptor for use with ``init_fem(..., bcs=...)``.
         """
         try:
-            from .utils.fem_route import dirichlet as _dirichlet_bc
+            from ..utils.fem_route import dirichlet as _dirichlet_bc
         except ImportError as e:
             raise ImportError("FEM support is not available. Install the FEM/dev extras to use " "domain.dirichlet(...) and init_fem(...).") from e
         return _dirichlet_bc(tags, values)
@@ -2339,7 +562,7 @@ class domain(MeshIOMixin, Geometries):
             Boundary-condition descriptor for use with ``init_fem(..., bcs=...)``.
         """
         try:
-            from .utils.fem_route import neumann as _neumann_bc
+            from ..utils.fem_route import neumann as _neumann_bc
         except ImportError as e:
             raise ImportError("FEM support is not available. Install the FEM/dev extras to use " "domain.neumann(...) and init_fem(...).") from e
         return _neumann_bc(tags)
@@ -2558,11 +781,11 @@ class domain(MeshIOMixin, Geometries):
         from jax_fem.problem import Problem
         from jax_fem.generate_mesh import Mesh
         from scipy.spatial import KDTree  # Ensuring this is available locally
-        from .utils.fem_route import expand_bcs
+        from ..utils.fem_route import expand_bcs
 
         if bcs is not None:
             try:
-                from .utils.fem_route import expand_bcs
+                from ..utils.fem_route import expand_bcs
             except ImportError as e:
                 raise ImportError("FEM support is not available. Install the FEM/dev extras to use init_fem(...).") from e
 
@@ -2786,7 +1009,7 @@ class domain(MeshIOMixin, Geometries):
         object
             Assembled backend-specific representation of the weak form.
         """
-        from .utils.weak_form import assemble_weak_form
+        from ..utils.weak_form import assemble_weak_form
 
         return assemble_weak_form(self, expr, target=target, **kwargs)
 
