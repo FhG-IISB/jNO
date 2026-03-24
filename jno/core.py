@@ -727,28 +727,6 @@ class core:
             if needs_optimizer and fm._opt_fn is None:
                 raise ValueError(f"Model '{fm.name or type(fm.module).__name__}' (layer {lid}) " f"has no optimizer. Call  model.optimizer(optax.adam, lr=...)  " f"before solve(), or freeze it with  model.freeze().")
 
-        # ── 1b. Mask diagnostics (always logged; warns on empty matches) ──
-        for lid, fm in flax_mods.items():
-            meta = getattr(fm, "_mask_meta", None)
-            if meta is None:
-                continue
-            target = meta.get("target")
-            matched = int(meta.get("matched", 0))
-            total_arrays = int(meta.get("total_arrays", 0))
-            sample_paths = meta.get("sample_paths", [])
-
-            self.log.info(f"Model {lid}: mask(target={target!r}) matched {matched}/{total_arrays} array leaves")
-            self.log.quiet(f"Mask Diagnostic Report for model {lid}")
-            self.log.quiet(f"target={target!r}")
-            self.log.quiet(f"matched={matched} / total_arrays={total_arrays}")
-            if sample_paths:
-                self.log.quiet("sample matched paths:")
-                for p in sample_paths:
-                    self.log.quiet(f"  {p}")
-
-            if matched == 0:
-                self.log.warning(f"Model {lid}: mask(target={target!r}) matched 0 parameters. " "No parameters will be selected by this target.")
-
         # ── 2. Apply LoRA transforms ──
         models = dict(self.models)
         lora_param_counts: Dict[int, Any] = {}  # Track LoRA params per model for logging
@@ -816,15 +794,15 @@ class core:
             if fm is not None and fm._lora_config is not None:
                 # LoRA modes:
                 # 1) fm._frozen=True  -> freeze all base params, train LoRA only
-                # 2) fm._param_mask   -> freeze only masked target params in base,
+                # 2) fm._trainable_param_mask -> custom base trainability mask,
                 #                        train non-target base + LoRA params
                 # 3) otherwise        -> default LoRA behaviour (freeze all base)
                 if fm._frozen:
                     filter_spec[lid] = _lora_trainable_filter(model)
-                elif fm._param_mask is not None:
+                elif fm._trainable_param_mask is not None:
                     filter_spec[lid] = _lora_trainable_filter(
                         model,
-                        base_param_mask=fm._param_mask,
+                        base_param_mask=fm._trainable_param_mask,
                         freeze_base=False,
                     )
                 else:
@@ -832,7 +810,7 @@ class core:
             elif fm is not None and fm._frozen:
                 # Whole model frozen – no arrays trainable
                 filter_spec[lid] = jax.tree_util.tree_map(lambda l: False, model)
-            elif fm is not None and fm._param_mask is not None:
+            elif fm is not None and fm._trainable_param_mask is not None:
                 # Partial mask — only leaves marked True in the mask are trained.
                 # Non-array leaves (e.g. activation functions kept as module
                 # attributes) are always False so equinox does not misinterpret
@@ -842,7 +820,7 @@ class core:
                     # (e.g. RNG/state tensors in wrapped modules) must stay frozen.
                     lambda arr, m: bool(m) if eqx.is_inexact_array(arr) else False,
                     model,
-                    fm._param_mask,
+                    fm._trainable_param_mask,
                 )
             else:
                 # Normal – every array trainable, non-arrays (e.g. activation
@@ -927,9 +905,21 @@ class core:
                 masked_transforms = []
                 group_scheds = []
 
+                # Align each user-supplied group mask to the *trainable* tree,
+                # where frozen/static leaves are represented as None.
+                group_masks_norm = []
+                for g in fm._param_groups:
+                    gmask_norm = jax.tree_util.tree_map(
+                        lambda p, m: (bool(m) if p is not None else False),
+                        trainable[lid],
+                        g["mask"],
+                        is_leaf=lambda x: x is None,
+                    )
+                    group_masks_norm.append(gmask_norm)
+
                 # Diagnostics over group masks: per-group coverage + overlap + uncovered
-                array_flags = [eqx.is_array(x) for x in jax.tree_util.tree_leaves(models[lid])]
-                group_leaf_masks = [[bool(x) if isinstance(x, bool) else False for x in jax.tree_util.tree_leaves(g["mask"])] for g in fm._param_groups]
+                array_flags = [x is not None for x in jax.tree_util.tree_leaves(trainable[lid])]
+                group_leaf_masks = [[bool(x) if isinstance(x, bool) else False for x in jax.tree_util.tree_leaves(gm)] for gm in group_masks_norm]
 
                 group_counts = []
                 for g, gmask in zip(fm._param_groups, group_leaf_masks):
@@ -958,24 +948,25 @@ class core:
                 for tgt, cnt in group_counts:
                     self.log.quiet(f"  target={tgt!r}: matched_arrays={cnt}")
 
-                for g in fm._param_groups:
+                for g, gmask_norm in zip(fm._param_groups, group_masks_norm):
                     g_opt = g["opt_fn"] or global_opt_fn
                     g_lr = g["lr"] if g["lr"] is not None else global_lr
                     chain = _build_opt_chain(g_opt, g_lr)
-                    masked_transforms.append(optax.masked(chain, g["mask"]))
+                    masked_transforms.append(optax.masked(chain, gmask_norm))
                     group_scheds.append(g_lr)
 
                 # "default" group: negate all group masks to cover remaining params
-                def _default_mask(params, _groups=fm._param_groups):
+                def _default_mask(params, _group_masks=group_masks_norm):
                     """True for leaves in no explicit group."""
                     combined = jax.tree_util.tree_map(lambda _: False, params)
-                    for g in _groups:
+                    for gmask in _group_masks:
                         combined = jax.tree_util.tree_map(
                             lambda c, m: c or (m if isinstance(m, bool) else False),
                             combined,
-                            g["mask"],
+                            gmask,
+                            is_leaf=lambda x: x is None,
                         )
-                    return jax.tree_util.tree_map(lambda c: not c, combined)
+                    return jax.tree_util.tree_map(lambda c: (not c), combined, is_leaf=lambda x: x is None)
 
                 default_chain = _build_opt_chain(global_opt_fn, global_lr)
                 masked_transforms.append(optax.masked(default_chain, _default_mask(trainable[lid])))

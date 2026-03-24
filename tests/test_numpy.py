@@ -2,6 +2,7 @@
 
 import pytest
 import jax.numpy as jnp
+import jno
 
 from jno.trace import Placeholder, FunctionCall, Literal, BinaryOp
 from tests.conftest import make_var
@@ -12,6 +13,12 @@ import jno.numpy as np
 # Constants
 # ======================================================================
 class TestConstants:
+    def test_top_level_np_alias_matches_submodule(self):
+        assert jno.np is np
+
+    def test_top_level_numpy_module_export(self):
+        assert jno.numpy is np
+
     def test_pi(self):
         assert float(np.pi) == pytest.approx(3.141592653589793)
 

@@ -360,14 +360,15 @@ class TestModelMask:
         assert u_net._opt_fn is optax.adam
 
     def test_mask_then_freeze_chains(self):
-        """mask().freeze() sets both _param_mask and _frozen."""
+        """mask().freeze() stores partial-freeze state on _trainable_param_mask."""
         import jax
 
         u_net = self._make_eqx_model()
         all_false = jax.tree_util.tree_map(lambda _: False, u_net.module)
         u_net.mask(all_false).freeze()
-        assert u_net._param_mask is all_false
-        assert u_net._frozen is True
+        assert u_net._frozen is False
+        leaves = jax.tree_util.tree_leaves(u_net._trainable_param_mask)
+        assert all(v is True for v in leaves if isinstance(v, bool))
 
     def test_mask_then_lora_chains(self):
         """mask().lora() sets both _param_mask and _lora_config."""
@@ -379,118 +380,115 @@ class TestModelMask:
         assert u_net._param_mask is all_true
         assert u_net._lora_config == (4, 1.0, None)
 
-    def test_mask_target_then_lora_consumes_target(self):
-        """mask(target=...).lora(...) stores target in _lora_config and clears _mask_target."""
-        u_net = self._make_eqx_model()
-
-        u_net.mask(target="output_layer").lora(rank=4, alpha=1.0)
-
-        assert u_net._lora_config == (4, 1.0, "output_layer")
-        assert u_net._mask_target is None
-
-    def test_mask_target_matches_maskx_selection(self):
-        """mask(target=...) uses maskx selection and only marks array leaves."""
-        import maskx
-        import equinox as eqx
+    def test_manual_mask_optimizer_creates_group_and_keeps_global_fallback(self):
+        """mask(param_mask).optimizer(...) should create a masked group without replacing global fallback."""
         import jax
-
-        u_net = self._make_eqx_model()
-        expected = maskx.select(u_net.module, target="output_layer", leaf_type=eqx.is_array)
-
-        u_net.mask(target="output_layer")
-
-        assert jax.tree_util.tree_leaves(u_net._param_mask) == jax.tree_util.tree_leaves(expected.tree)
-        assert u_net._mask_meta["matched"] == expected.count()
-        assert all(path.startswith("output_layer/") for path in u_net._mask_meta["sample_paths"])
-
-    def test_mask_path_prefix_matches_maskx_selection(self):
-        """mask(path_prefix=...) materializes the same tree as maskx.select."""
-        import maskx
-        import equinox as eqx
-        import jax
-
-        u_net = self._make_eqx_model()
-        expected = maskx.select(u_net.module, path_prefix="output_layer", leaf_type=eqx.is_array)
-
-        u_net.mask(path_prefix="output_layer")
-
-        assert jax.tree_util.tree_leaves(u_net._param_mask) == jax.tree_util.tree_leaves(expected.tree)
-        assert u_net._mask_target is None
-        assert u_net._mask_meta is None
-
-    def test_mask_accepts_maskx_mask_object(self):
-        """mask() accepts a direct maskx.Mask object as param_mask input."""
-        import maskx
-        import equinox as eqx
-        import jax
-
-        u_net = self._make_eqx_model()
-        expected = maskx.select(u_net.module, path_prefix="output_layer", leaf_type=eqx.is_array)
-
-        u_net.mask(expected)
-
-        assert jax.tree_util.tree_leaves(u_net._param_mask) == jax.tree_util.tree_leaves(expected.tree)
-
-    def test_mask_selector_kwargs_reject_manual_mask(self):
-        """mask() should reject mixing a manual mask with selector kwargs."""
-        import jax
+        import optax
 
         u_net = self._make_eqx_model()
         all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
 
-        with pytest.raises(ValueError, match="either a manual param_mask"):
-            u_net.mask(all_true, path_prefix="output_layer")
+        u_net.optimizer(optax.sgd, lr=1e-2)
+        u_net.mask(all_true).optimizer(optax.adam, lr=1e-3)
 
-    def test_mask_target_then_initialize_consumes_target(self):
-        """mask(target=...).initialize(...) stores _initialize_mask and clears transient target state."""
-        u_net = self._make_eqx_model()
-
-        # Any non-string object takes the pytree initialize path.
-        weights = u_net.module
-        u_net.mask(target="output_layer").initialize(weights)
-
-        assert u_net._initialize_mask is not None
-        assert u_net._mask_target is None
-        assert u_net._param_mask is None
-
-    def test_mask_target_then_freeze_is_partial(self):
-        """mask(target=...).freeze() should freeze target only (not set global _frozen)."""
-        import jax
-
-        u_net = self._make_eqx_model()
-        u_net.mask(target="output_layer").freeze()
-
-        assert u_net._frozen is False
-        assert u_net._mask_target is None
-        leaves = jax.tree_util.tree_leaves(u_net._param_mask)
-        assert any(v is True for v in leaves)
-        assert any(v is False for v in leaves)
-
-    def test_mask_target_optimizer_and_lr_use_same_group(self):
-        """mask(target).optimizer(...).lr(...) should write one parameter group."""
-        import optax
-
-        u_net = self._make_eqx_model()
-        u_net.mask(target="output_layer").optimizer(optax.adam).lr(1e-3)
-
+        assert u_net._opt_fn is optax.sgd
         assert len(u_net._param_groups) == 1
         group = u_net._param_groups[0]
-        assert group["target"] == "output_layer"
         assert group["opt_fn"] is optax.adam
         assert group["lr"] == 1e-3
 
-    def test_mask_target_optimizer_lr_shorthand_sets_group_lr(self):
-        """mask(target).optimizer(opt, lr=...) should set group LR directly."""
+    def test_manual_mask_optimizer_without_global_sets_global_fallback(self):
+        """When no global optimizer exists, masked optimizer call should seed it as fallback."""
+        import jax
         import optax
 
         u_net = self._make_eqx_model()
-        u_net.mask(target="output_layer").optimizer(optax.adam, lr=5e-4)
+        all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
+
+        u_net.mask(all_true).optimizer(optax.adam, lr=5e-4)
+
+        assert u_net._opt_fn is optax.adam
+        assert len(u_net._param_groups) == 1
+        group = u_net._param_groups[0]
+        assert group["opt_fn"] is optax.adam
+        assert group["lr"] == 5e-4
+
+    def test_global_optimizer_call_clears_existing_param_groups(self):
+        """A bare optimizer(...) call should replace prior group configuration."""
+        import jax
+        import optax
+
+        u_net = self._make_eqx_model()
+        all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
+
+        u_net.optimizer(optax.sgd, lr=1e-2)
+        u_net.mask(all_true).optimizer(optax.adam, lr=1e-3)
+        assert len(u_net._param_groups) == 1
+
+        u_net.optimizer(optax.lbfgs)
+
+        assert u_net._opt_fn is optax.lbfgs
+        assert len(u_net._param_groups) == 0
+
+    def test_mask_scope_is_one_shot_for_optimizer_then_lr(self):
+        """mask() should be consumed by optimizer; later lr() without remask is global."""
+        import jax
+        import optax
+
+        u_net = self._make_eqx_model()
+        all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
+
+        u_net.optimizer(optax.sgd, lr=1e-2)
+        u_net.mask(all_true).optimizer(optax.adam)
+        u_net.lr(1e-6)
 
         assert len(u_net._param_groups) == 1
         group = u_net._param_groups[0]
-        assert group["target"] == "output_layer"
         assert group["opt_fn"] is optax.adam
-        assert group["lr"] == 5e-4
+        assert group["lr"] is None
+        assert u_net._lr == 1e-6
+
+    def test_mask_scope_is_one_shot_for_freeze(self):
+        """After mask().freeze(), a subsequent freeze() without remask is global."""
+        import jax
+
+        u_net = self._make_eqx_model()
+        all_false = jax.tree_util.tree_map(lambda _: False, u_net.module)
+
+        u_net.mask(all_false).freeze()
+        assert u_net._frozen is False
+
+        u_net.freeze()
+        assert u_net._frozen is True
+
+    def test_mask_scope_is_one_shot_for_lora(self):
+        """mask().lora() consumes mask scope and stores base trainability mask."""
+        import jax
+
+        u_net = self._make_eqx_model()
+        all_false = jax.tree_util.tree_map(lambda _: False, u_net.module)
+
+        u_net.mask(all_false).lora(rank=2, alpha=1.0)
+
+        assert u_net._lora_config == (2, 1.0, None)
+        assert u_net._mask_scope_pending is False
+        leaves = jax.tree_util.tree_leaves(u_net._trainable_param_mask)
+        assert all(v is True for v in leaves if isinstance(v, bool))
+
+    def test_plain_lora_clears_stale_trainable_mask(self):
+        """A plain lora() call should reset stale base trainability overrides."""
+        import jax
+
+        u_net = self._make_eqx_model()
+        all_false = jax.tree_util.tree_map(lambda _: False, u_net.module)
+
+        # First set a custom base trainability mask via masked LoRA.
+        u_net.mask(all_false).lora(rank=2, alpha=1.0)
+        assert u_net._trainable_param_mask is not None
+
+        # A later plain lora() should restore default LoRA semantics.
+        u_net.lora(rank=4, alpha=1.0)
+        assert u_net._trainable_param_mask is None
 
     def test_mask_reset_clears_param_mask(self):
         """reset() clears _param_mask back to None."""

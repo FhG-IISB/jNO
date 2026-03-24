@@ -6,6 +6,8 @@ jNO: Physics-Informed Neural Operators.
     to continuous change without notice.
 """
 
+import sys
+
 from .core import core
 from .domain import domain
 from .utils.fem_route import dirichlet, neumann
@@ -27,7 +29,16 @@ from .trace_evaluator import TraceEvaluator
 from .trace_compiler import TraceCompiler
 from .differential_operators import DifferentialOperators
 from . import resampling
+from . import jnp_ops as np
 from .utils.load_save import save, load
+from .architectures.models import nn, parameter
+
+# Mirror the submodule on the package namespace and add a short alias.
+numpy = np
+# Backward compatibility: allow `import jno.numpy` after renaming internals.
+sys.modules[__name__ + ".numpy"] = np
+do = domain
+
 
 __version__ = "0.1.0"
 
@@ -46,6 +57,7 @@ __all__ = [
     "core",
     "sampler",
     "domain",
+    "do",
     "Model",
     "Variable",
     "Placeholder",
@@ -77,4 +89,7 @@ __all__ = [
     "FemResidualOperator",
     "dirichlet",
     "neumann",
+    "numpy",
+    "nn",
+    "np",
 ]

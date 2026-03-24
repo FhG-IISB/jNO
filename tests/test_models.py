@@ -53,6 +53,23 @@ class TestNNWrap:
         wrapped = nn.wrap(module, name="my_dense")
         assert wrapped.name == "my_dense"
 
+    def test_call_alias_wrap_module_instance(self):
+        key = jax.random.PRNGKey(0)
+        module = eqx.nn.Linear(4, 2, key=key)
+        wrapped = nn(module)
+
+        assert isinstance(wrapped, Model)
+        y = wrapped.module(jnp.ones((4,)))
+        assert y.shape == (2,)
+
+    def test_call_alias_wrap_with_name(self):
+        key = jax.random.PRNGKey(0)
+        module = eqx.nn.Linear(4, 2, key=key)
+        wrapped = nn(module, name="my_dense")
+
+        assert isinstance(wrapped, Model)
+        assert wrapped.name == "my_dense"
+
 
 # ======================================================================
 # nn.mlp

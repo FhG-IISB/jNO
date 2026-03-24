@@ -16,14 +16,6 @@ import equinox as eqx
 from .utils.adaptive import LearningRateSchedule
 from .utils.logger import get_logger
 
-try:
-    import maskx
-except ImportError:
-    maskx = None
-
-
-_DEFAULT_MASKX_LEAF_TYPE = object()
-
 __all__ = [
     "Placeholder",
     "FunctionCall",
@@ -883,12 +875,12 @@ class Model(Placeholder):
         self._opt_fn = None  # optax optimizer factory / instance
         self._lr = LearningRateSchedule(1.0)
         self._dtype = None  # target dtype (e.g. jnp.bfloat16) or None
-        self._param_mask = None  # pytree of bool with same structure as model; None = all trainable
-        self._mask_target: str | None = None  # last regex string passed to mask(), consumed by initialize()/lora()/freeze()
+        self._param_mask = None  # current mask scope for grouped optimizer/lr calls
+        self._trainable_param_mask = None  # persistent trainability mask used by mask(...).freeze()
+        self._mask_scope_pending: bool = False  # transient flag for mask(...).optimizer()/lr() group scoping
         self._param_groups: list = []  # [{target, mask, opt_fn, lr}] for per-group optimizer config
         self._weight_tree = None  # pretrained weights as a pytree (alternative to weight_path file)
         self._initialize_mask = None  # optional bool pytree consumed by initialize() for partial preload
-        self._mask_meta: dict[str, object] | None = None  # diagnostics for last mask(target=...): {target, matched, total_arrays, sample_paths}
         self._tunable_opts: Dict[str, list] = {}  # per-model tunable options for sweeps
 
     # ── public API ───────────────────────────────────────────
@@ -932,7 +924,7 @@ class Model(Placeholder):
             f"optimizer:            {getattr(self._opt_fn, '__name__', str(self._opt_fn))}",
             f"lr_schedule:          {self._lr}",
             f"lora_config:          {self._lora_config}",
-            f"mask_target_pending:  {self._mask_target}",
+            f"mask_scope_pending:   {self._mask_scope_pending}",
             "",
             "Initialization",
             "-" * 60,
@@ -942,7 +934,8 @@ class Model(Placeholder):
             "",
             "Mask Diagnostics",
             "-" * 60,
-            f"mask_meta:            {self._mask_meta}",
+            f"mask_active:          {self._param_mask is not None}",
+            f"trainable_mask_set:   {self._trainable_param_mask is not None}",
             "",
             "Parameter Groups",
             "-" * 60,
@@ -1016,77 +1009,47 @@ class Model(Placeholder):
     def freeze(self):
         """Mark this model as frozen (not trained).
 
-        When preceded by ``mask(target=...)``, only the targeted parameters
-        are frozen and everything else remains trainable::
+        When preceded by ``mask(...)``, only the currently selected
+        parameters are frozen and everything else remains trainable::
 
-            NN.mask(target="encoder").freeze()  # encoder frozen, rest trainable
+            NN.mask(param_mask).freeze()         # True leaves frozen, False leaves trainable
             NN.freeze()                          # whole model frozen
 
         Order matters: ``mask()`` must be called before ``freeze()``.
         """
-        if self._mask_target is not None:
-            # mask(target).freeze(): invert _param_mask so target=False (frozen),
-            # non-target=True (trainable). _frozen stays False — partial freeze
-            # is expressed entirely through _param_mask.
-            self._param_mask = jax.tree_util.tree_map(
+        if self._mask_scope_pending and self._param_mask is not None:
+            # mask(...).freeze(): invert the current scope mask so
+            # selected=True leaves become frozen (False), and non-selected
+            # leaves remain trainable (True).
+            self._trainable_param_mask = jax.tree_util.tree_map(
                 lambda x: (not x) if isinstance(x, bool) else False,
                 self._param_mask,
             )
-            self._mask_target = None  # consumed
+            self._mask_scope_pending = False
+            self._frozen = False
         else:
+            self._trainable_param_mask = None
             self._frozen = True
+            self._mask_scope_pending = False
         return self
 
     def unfreeze(self):
         """Unfreeze this model so it is trained normally."""
         self._frozen = False
+        self._trainable_param_mask = None
         return self
 
-    def mask(
-        self,
-        param_mask=None,
-        *,
-        target: str | None = None,
-        where: Callable[[str, Any], bool] | None = None,
-        leaf_type: Any = _DEFAULT_MASKX_LEAF_TYPE,
-        shape: tuple[int, ...] | None = None,
-        dtype: Any | None = None,
-        ndim: int | None = None,
-        path_prefix: str | tuple[str, ...] | list[str] | None = None,
-        path_in: list[str] | tuple[str, ...] | None = None,
-    ):
-        """Restrict which parameters are trainable via a boolean pytree mask
-        or by delegating selectors to ``maskx.select``.
+    def mask(self, param_mask=None):
+        """Set the current mask scope using an explicit boolean pytree mask.
 
-        **String / regex usage** (recommended)::
+        ``param_mask`` must mirror the parameter tree structure and contain
+        boolean leaves where ``True`` selects leaves in the masked scope.
 
-            # Train only attention query/key/value kernels
-            NN.mask(target="query|key|value")
+        This scope is consumed by grouped optimizer/lr calls and by
+        ``mask(...).freeze()``. It does not by itself freeze or unfreeze
+        parameters.
 
-            # Train only decoder kernels
-            NN.mask(target="decoder.*kernel")
-
-            # Positional shorthand — string as first argument
-            NN.mask("decoder.*kernel")
-
-        **Additional maskx selectors**::
-
-            # Train only leaves under a prefix
-            NN.mask(path_prefix="encoder")
-
-            # Train only 2D array leaves
-            NN.mask(ndim=2)
-
-            # Select an exact set of paths
-            NN.mask(path_in=["output_layer/weight", "output_layer/bias"])
-
-        The ``target`` pattern is matched with ``re.search`` against each
-        parameter's full path, formed by joining its pytree key segments
-        with ``/``.  For a Flax params dict the path looks like::
-
-            encoder/layers_0/SelfAttention_0/query/kernel
-
-        **Manual pytree usage** (advanced)::
+        Example::
 
             import equinox as eqx, jax
 
@@ -1096,77 +1059,9 @@ class Model(Placeholder):
                 all_false, (True, True),
             )
             model.mask(param_mask).optimizer(optax.adam, lr=1e-3)
-
-        Args:
-            param_mask: A pytree of ``bool`` matching the module structure,
-                a ``maskx.Mask`` object, **or** a regex string (shorthand
-                for ``target=``).
-            target: Regex matched against each parameter's path string.
-                Matched leaves are trainable; everything else is frozen.
-                This is the only selector that keeps the existing transient
-                chaining behaviour for ``freeze()``, ``initialize()``,
-                per-group ``optimizer()``, and targeted Flax ``lora()``.
-            where: Optional ``maskx`` predicate receiving ``(path, leaf)``.
-            leaf_type: Optional ``maskx`` leaf type filter. When any selector
-                kwargs are used and ``leaf_type`` is left unspecified,
-                selection defaults to array leaves only via ``eqx.is_array``.
-                Pass ``leaf_type=None`` to disable that default.
-            shape: Optional exact shape filter.
-            dtype: Optional exact dtype filter.
-            ndim: Optional exact ndim filter.
-            path_prefix: Optional prefix string or sequence of prefixes.
-            path_in: Optional exact leaf paths to include.
-
-        Returns:
-            self (for chaining).
         """
-        # Allow string as positional arg: NN.mask("query|key")
-        if isinstance(param_mask, str):
-            target = param_mask
-            param_mask = None
-
-        if maskx is not None and isinstance(param_mask, maskx.Mask):
-            param_mask = param_mask.tree
-
-        selector_requested = any(value is not None for value in (target, where, shape, dtype, ndim, path_prefix, path_in)) or leaf_type is not _DEFAULT_MASKX_LEAF_TYPE
-
-        if selector_requested:
-            if maskx is None:
-                raise ImportError("maskx is required for selector-based mask(...). Install the 'maskx' package to use parameter selection helpers.")
-
-            if param_mask is not None:
-                raise ValueError("mask() accepts either a manual param_mask/maskx.Mask or selector kwargs, not both.")
-
-            selected = maskx.select(
-                self.module,
-                target=target,
-                where=where,
-                leaf_type=(eqx.is_array if leaf_type is _DEFAULT_MASKX_LEAF_TYPE else leaf_type),
-                shape=shape,
-                dtype=dtype,
-                ndim=ndim,
-                path_prefix=path_prefix,
-                path_in=path_in,
-            )
-            matched_paths = selected.paths()
-
-            self._param_mask = selected.tree
-            if target is not None:
-                total_arrays = sum(1 for _, leaf in maskx.leaf_paths(self.module) if eqx.is_array(leaf))
-                self._mask_target = target  # capture for lora() to consume
-                self._mask_meta = {
-                    "target": target,
-                    "matched": int(len(matched_paths)),
-                    "total_arrays": int(total_arrays),
-                    "sample_paths": matched_paths[:8],
-                }
-            else:
-                self._mask_target = None
-                self._mask_meta = None
-        else:
-            self._param_mask = param_mask
-            self._mask_target = None
-            self._mask_meta = None
+        self._param_mask = param_mask
+        self._mask_scope_pending = self._param_mask is not None
         return self
 
     def lora(self, rank: int = 4, alpha: float = 1.0):
@@ -1175,41 +1070,63 @@ class Model(Placeholder):
         By default only the low-rank adapters are trained; base weights are
         frozen.
 
-        If ``mask(target=...)`` was called immediately before this method,
-        LoRA adapters are created only for matching kernels and those
-        matching base parameters are frozen, while non-target base
-        parameters remain trainable.
-
         Call ``freeze()`` before ``lora()`` to freeze all base parameters::
 
-            NN.freeze().mask("decoder").lora(rank=8, alpha=16)
+            NN.freeze().mask(param_mask).lora(rank=8, alpha=16)
+
+        ``mask(...)`` is one-shot and consumed by the next mutator call.
+        To keep masked scoping across multiple mutators, chain them::
+
+            NN.optimizer(optax.adam(...))
+            NN.mask(param_mask).lora(rank=4).optimizer(optax.adamw(...))
+
+        Splitting into separate statements changes semantics because the
+        mask scope is already consumed by ``lora(...)``::
+
+            NN.mask(param_mask).lora(rank=4)
+            NN.optimizer(optax.adamw(...))  # global overwrite
 
         Args:
             rank:  LoRA rank.
             alpha: LoRA scaling factor.
         """
-        lora_target = self._mask_target  # may be None
-        self._mask_target = None  # consumed
-        self._lora_config = (rank, alpha, lora_target)
+        if self._mask_scope_pending and self._param_mask is not None:
+            # mask(...).lora(): freeze selected base params while keeping
+            # non-selected base params trainable in addition to LoRA params.
+            self._trainable_param_mask = jax.tree_util.tree_map(
+                lambda x: (not x) if isinstance(x, bool) else False,
+                self._param_mask,
+            )
+        else:
+            # Plain lora(): clear any stale partial-trainability mask so
+            # base parameters are frozen by default and only LoRA adapters train.
+            self._trainable_param_mask = None
+        self._mask_scope_pending = False
+        self._lora_config = (rank, alpha, None)
         return self
 
     def optimizer(self, opt_fn, *, lr=None):
         """Attach an optimizer to this model.
 
-        When preceded by ``mask(target=...)``, the optimizer applies only
+        When preceded by ``mask(param_mask)``, the optimizer applies only
         to matching parameters; everything else uses the global optimizer
         (set via a bare ``optimizer()`` call)::
 
-            NN.mask("decoder").optimizer(optax.adam)   # decoder group
-            NN.mask("encoder").optimizer(optax.sgd)    # encoder group
+            NN.mask(mask_decoder).optimizer(optax.adam)  # decoder group
+            NN.mask(mask_encoder).optimizer(optax.sgd)   # encoder group
             NN.optimizer(optax.adam)                   # global fallback
 
-        Chaining with ``.lr()`` works because ``mask()`` target is kept
-        alive until the next ``mask()`` / ``freeze()`` / ``lora()`` call::
+        ``mask(...)`` is one-shot: it applies only to the immediate next
+        mutator call. If you want a masked LR as well, call ``mask(...)``
+        again before ``lr(...)``::
 
-            NN.mask("decoder").optimizer(optax.adam).lr(my_schedule)
+            NN.mask(mask_decoder).optimizer(optax.adam)
+            NN.mask(mask_decoder).lr(my_schedule)
 
         The ``lr`` keyword is a convenience shorthand for ``.lr(lr)``.
+
+        A bare/global call (not preceded by ``mask(...)``) replaces any
+        previously configured parameter groups.
 
         Args:
             opt_fn: An optax optimizer factory, e.g. ``optax.adam``,
@@ -1217,42 +1134,62 @@ class Model(Placeholder):
             lr: Optional LR schedule/value shorthand (equivalent to chaining
                 ``.lr(lr)``).
         """
-        if self._mask_target is not None:
-            self._get_or_create_group()["opt_fn"] = opt_fn
+        if self._mask_scope_pending and self._param_mask is not None:
+            # One-shot masked scope: consume mask on this call.
+            group = self._get_or_create_group()
+            if self._opt_fn is None:
+                self._opt_fn = opt_fn
+            group["opt_fn"] = opt_fn
+            if lr is not None:
+                if self._lr is None:
+                    self._lr = lr
+                group["lr"] = lr
+            self._mask_scope_pending = False
         else:
             self._opt_fn = opt_fn
+            # Global optimizer replacement should discard stale group overrides.
+            self._param_groups = []
+            self._mask_scope_pending = False
+            if lr is not None:
+                self._lr = lr
 
-        # Convenience shorthand: optimizer(opt_fn, lr=...) == optimizer(opt_fn).lr(...)
-        if lr is not None:
-            self.lr(lr)
         return self
 
     def lr(self, lr):
         """Attach an LR schedule to this model.
 
-        When preceded by ``mask(target=...)``, the schedule applies only to
-        that parameter group::
+        When preceded by ``mask(param_mask)``, the schedule applies only to
+        that parameter group. ``mask(...)`` is one-shot, so call it
+        immediately before ``lr(...)``::
 
-            NN.mask("decoder").optimizer(optax.adam).lr(my_schedule)
+            NN.mask(mask_decoder).lr(my_schedule)
 
         Args:
             lr:     A ``LearningRateSchedule`` (or float) for this model.
                     If *None*, a constant schedule of 1e-3 is used.
         """
-        if self._mask_target is not None:
+        if self._mask_scope_pending and self._param_mask is not None:
+            # Ensure a global fallback exists for uncovered leaves.
+            if self._lr is None:
+                self._lr = lr
             self._get_or_create_group()["lr"] = lr
-            # Keep _mask_target alive
+            self._mask_scope_pending = False
         else:
             self._lr = lr
         return self
 
+    def _current_group_key(self) -> str:
+        """Stable key for the currently active mask scope."""
+        return f"<mask:{id(self._param_mask)}>"
+
     def _get_or_create_group(self):
-        """Return the param group dict for the current _mask_target, creating it if needed."""
+        """Return the param group dict for the current mask scope, creating it if needed."""
+        key = self._current_group_key()
         for g in self._param_groups:
-            if g["target"] == self._mask_target:
+            if g["target"] == key:
                 g["mask"] = self._param_mask  # refresh in case mask() was called again
                 return g
-        g = {"target": self._mask_target, "mask": self._param_mask, "opt_fn": None, "lr": None}
+        g = {"target": key, "mask": self._param_mask, "opt_fn": None, "lr": None}
         self._param_groups.append(g)
         return g
 
@@ -1279,10 +1216,6 @@ class Model(Placeholder):
               new_model = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key2)
               new_model.initialize(pretrained.module)   # use pytree directly
 
-        If ``mask(target=...)`` was called immediately before this method,
-        only matching parameters are loaded from pretrained weights; all
-        non-matching parameters keep their fresh initialisation.
-
         Args:
             weights: A file path (``str``) *or* a pytree whose leaves are
                      the pretrained arrays.
@@ -1290,13 +1223,7 @@ class Model(Placeholder):
         Returns:
             self (for chaining).
         """
-        # mask(target=...).initialize(...): consume target for partial load.
-        if self._mask_target is not None:
-            self._initialize_mask = self._param_mask
-            self._mask_target = None
-            self._param_mask = None
-        else:
-            self._initialize_mask = None
+        self._initialize_mask = None
 
         if isinstance(weights, (str, Path)):
             self.weight_path = str(weights)
@@ -1387,9 +1314,10 @@ class Model(Placeholder):
         self._lr = None
         self._dtype = None
         self._param_mask = None
+        self._trainable_param_mask = None
+        self._mask_scope_pending = False
         self._weight_tree = None
         self._initialize_mask = None
-        self._mask_meta = None
         self._merge_lora_flag = False
         return self
 
@@ -1432,31 +1360,9 @@ class ModelCall(Placeholder):
         self.model.unfreeze()
         return self
 
-    def mask(
-        self,
-        param_mask=None,
-        *,
-        target: str | None = None,
-        where: Callable[[str, Any], bool] | None = None,
-        leaf_type: Any = _DEFAULT_MASKX_LEAF_TYPE,
-        shape: tuple[int, ...] | None = None,
-        dtype: Any | None = None,
-        ndim: int | None = None,
-        path_prefix: str | tuple[str, ...] | list[str] | None = None,
-        path_in: list[str] | tuple[str, ...] | None = None,
-    ):
+    def mask(self, param_mask=None):
         """Proxy for :meth:`Model.mask`."""
-        self.model.mask(
-            param_mask,
-            target=target,
-            where=where,
-            leaf_type=leaf_type,
-            shape=shape,
-            dtype=dtype,
-            ndim=ndim,
-            path_prefix=path_prefix,
-            path_in=path_in,
-        )
+        self.model.mask(param_mask)
         return self
 
     def lora(self, rank: int = 4, alpha: float = 1.0):

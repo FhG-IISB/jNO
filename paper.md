@@ -60,7 +60,7 @@ The repository uses `pytest` with custom markers to separate slow, integration, 
 
 # Availability and reuse
 
-jNO is implemented in Python and currently targets Python versions `>=3.11,<3.14`. Core dependencies include JAX, Equinox, maskx, Optax, PyGmsh, cloudpickle, and einops [@bradbury2018jax; @kidger2021equinox; @maskx2026maskx; @deepmind2020optax; @schlomer2018pygmsh; @cloudpipe2024cloudpickle; @arogozhnikov2022einops]. Optional extras provide CUDA-enabled JAX, development and testing tools, IREE integration, and foundation-model adapters.
+jNO is implemented in Python and currently targets Python versions `>=3.11,<3.14`. Core dependencies include JAX, Equinox, Optax, PyGmsh, cloudpickle, and einops [@bradbury2018jax; @kidger2021equinox; @deepmind2020optax; @schlomer2018pygmsh; @cloudpipe2024cloudpickle; @arogozhnikov2022einops]. Optional extras provide CUDA-enabled JAX, development and testing tools, IREE integration, and foundation-model adapters.
 
 The source repository is available at <https://github.com/FhG-IISB/jNO> under the MIT License. Related translated foundation-model repositories include Poseidon, Walrus, PDEformer2, MPP, and Morph. The package is also published on PyPI at <https://pypi.org/project/jNO/>.
 
