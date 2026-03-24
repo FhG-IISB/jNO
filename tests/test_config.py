@@ -2,8 +2,10 @@
 
 import pytest
 
+import os
+
 import jno.utils.config as cfg_module
-from jno.utils.config import get_seed, load_config
+from jno.utils.config import get_seed, load_config, get_runs_base_dir, get_rsa_public_key, get_rsa_private_key
 
 
 # ======================================================================
@@ -39,6 +41,47 @@ class TestGetSeed:
         for seed in (0, 1, 100, 99999):
             monkeypatch.setattr(cfg_module, "_CONFIG", {"jno": {"seed": seed}})
             assert get_seed() == seed
+
+    def test_env_seed_overrides_config(self, monkeypatch):
+        monkeypatch.setenv("JNO_SEED", "123")
+        monkeypatch.setattr(cfg_module, "_CONFIG", {"jno": {"seed": 42}})
+        assert get_seed() == 123
+
+    def test_env_seed_invalid_raises(self, monkeypatch):
+        monkeypatch.setenv("JNO_SEED", "abc")
+        monkeypatch.setattr(cfg_module, "_CONFIG", {"jno": {"seed": 42}})
+        with pytest.raises(ValueError, match="Invalid JNO_SEED"):
+            get_seed()
+
+
+class TestEnvOverrides:
+    def test_log_dir_env_overrides_config(self, monkeypatch):
+        monkeypatch.setenv("JNO_LOG_DIR", "~/my_jno_logs")
+        monkeypatch.setattr(cfg_module, "_CONFIG", {"runs": {"base_dir": "./runs_from_config"}})
+        assert get_runs_base_dir() == os.path.expanduser("~/my_jno_logs")
+
+    def test_rsa_path_env_sets_both_key_paths(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("JNO_RSA_PATH", str(tmp_path))
+        monkeypatch.setattr(
+            cfg_module,
+            "_CONFIG",
+            {
+                "rsa": {
+                    "public_key": "~/config_public.pem",
+                    "private_key": "~/config_private.pem",
+                }
+            },
+        )
+        assert get_rsa_public_key() == str((tmp_path / "public.pem").resolve())
+        assert get_rsa_private_key() == str((tmp_path / "private.pem").resolve())
+
+    def test_explicit_rsa_key_env_overrides_rsa_path(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("JNO_RSA_PATH", str(tmp_path))
+        monkeypatch.setenv("JNO_RSA_PUBLIC_KEY", "~/pub_env.pem")
+        monkeypatch.setenv("JNO_RSA_PRIVATE_KEY", "~/priv_env.pem")
+        monkeypatch.setattr(cfg_module, "_CONFIG", {})
+        assert get_rsa_public_key() == os.path.expanduser("~/pub_env.pem")
+        assert get_rsa_private_key() == os.path.expanduser("~/priv_env.pem")
 
 
 # ======================================================================

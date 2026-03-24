@@ -53,6 +53,7 @@ class Logger:
     def _setup_logger(self, name: str):
         """Helper to set up logger and handlers (used by __init__ and __setstate__)."""
         log_level = logging.INFO
+        log_file: Path | None = None
 
         self.logger = logging.getLogger(name)
         self.logger.setLevel(log_level)
@@ -82,6 +83,9 @@ class Logger:
             formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
             self.console_handler.setFormatter(formatter)
             self.logger.addHandler(self.console_handler)
+
+        if log_file is not None:
+            self.logger.info(f"Log file: {log_file.resolve()}")
 
     def _output(self, message: str, level: int = logging.INFO) -> None:
         """Internal method to handle both logging and printing."""

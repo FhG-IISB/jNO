@@ -2032,15 +2032,19 @@ class domain(MeshIOMixin):
         else:
             return self.context[tag], None, tag
 
-    def plot(self, save_path: str = "./runs/domain.png", figsize: Tuple[int, int] = (10, 8), show_normals: bool = True, arrow_scale: float = 0.05):
+    def plot(self, save_path: str = "./runs/domain.png", figsize: Tuple[int, int] = (10, 8), show_normals: bool = True, arrow_scale: float = 0.05, interactive: bool = False):
         """Plot the sampled points and normals.
 
         Args:
-            name: Base name for saved figure
+            save_path: Output path. For 3D, ``.html`` enables interactive view.
             figsize: Figure size (width, height)
             show_normals: Whether to display normal vectors as arrows
-            arrow_scale: Scale factor for normal vector arrows
+            arrow_scale: Scale factor for normal vector arrows. In 3D this is
+                interpreted relative to the tag bounding-box diagonal.
+            interactive: If True and in 3D, export interactive Plotly HTML
+                (zoom/rotate/pan) with sampled points and normal vectors.
         """
+        import os
         import matplotlib.pyplot as plt
         from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
@@ -2050,6 +2054,140 @@ class domain(MeshIOMixin):
 
         # Get spatial dimension (exclude time)
         spatial_dim = len(self.spatial)
+
+        def _extract_points(arr):
+            """Normalize sampled point arrays to shape (N, D)."""
+            a = np.asarray(arr)
+            # Typical shapes: (B,T,N,D), (B,N,D), (N,D)
+            if a.ndim == 4:
+                return a[0, 0]
+            if a.ndim == 3:
+                return a[0]
+            if a.ndim == 2:
+                return a
+            return None
+
+        def _extract_normals(arr):
+            """Normalize sampled normal arrays to shape (N, D)."""
+            a = np.asarray(arr)
+            # Typical shapes: (B,T,N,D), (B,N,D), (N,D)
+            if a.ndim == 4:
+                return a[0, 0]
+            if a.ndim == 3:
+                return a[0]
+            if a.ndim == 2:
+                return a
+            return None
+
+        # Interactive 3D path for easier exploration (zoom/rotate/pan).
+        if spatial_dim == 3 and (interactive or save_path.lower().endswith(".html")):
+            try:
+                import plotly.graph_objects as go
+            except Exception as e:
+                raise ImportError("plotly is required for interactive 3D plotting") from e
+
+            traces = []
+            colors = [
+                "#1f77b4",
+                "#ff7f0e",
+                "#2ca02c",
+                "#d62728",
+                "#9467bd",
+                "#8c564b",
+                "#e377c2",
+                "#7f7f7f",
+                "#bcbd22",
+                "#17becf",
+            ]
+
+            for i, (tag, points) in enumerate(self.context.items()):
+                if tag.startswith("n_") or tag in self._param_tags or tag == "__time__":
+                    continue
+
+                pts = _extract_points(points)
+                if pts is None or pts.ndim != 2 or pts.shape[-1] < 3:
+                    continue
+
+                color = colors[i % len(colors)]
+                n_points = pts.shape[0]
+
+                traces.append(
+                    go.Scatter3d(
+                        x=pts[:, 0],
+                        y=pts[:, 1],
+                        z=pts[:, 2],
+                        mode="markers",
+                        marker=dict(size=2.5, color=color, opacity=0.75),
+                        name=f"{tag} ({n_points})",
+                    )
+                )
+
+                if show_normals and f"n_{tag}" in self.context:
+                    normals = _extract_normals(self.context[f"n_{tag}"])
+                    if normals is None or normals.ndim != 2 or normals.shape[-1] < 3:
+                        continue
+
+                    m = min(len(pts), len(normals))
+                    if m == 0:
+                        continue
+
+                    pts_m = pts[:m]
+                    nrm_m = normals[:m]
+
+                    # Downsample only for very dense clouds to keep HTML responsive.
+                    max_arrows = 8000
+                    step = max(1, m // max_arrows)
+                    pts_s = pts_m[::step]
+                    nrm_s = nrm_m[::step]
+
+                    diag = float(np.linalg.norm(np.ptp(pts_m, axis=0)))
+                    scale3d = (arrow_scale * diag) if diag > 0 else arrow_scale
+
+                    x0, y0, z0 = pts_s[:, 0], pts_s[:, 1], pts_s[:, 2]
+                    x1 = x0 + scale3d * nrm_s[:, 0]
+                    y1 = y0 + scale3d * nrm_s[:, 1]
+                    z1 = z0 + scale3d * nrm_s[:, 2]
+
+                    # Draw normals as lightweight line segments.
+                    xs = np.empty(3 * len(x0))
+                    ys = np.empty(3 * len(y0))
+                    zs = np.empty(3 * len(z0))
+                    xs[0::3], xs[1::3], xs[2::3] = x0, x1, np.nan
+                    ys[0::3], ys[1::3], ys[2::3] = y0, y1, np.nan
+                    zs[0::3], zs[1::3], zs[2::3] = z0, z1, np.nan
+
+                    traces.append(
+                        go.Scatter3d(
+                            x=xs,
+                            y=ys,
+                            z=zs,
+                            mode="lines",
+                            line=dict(color=color, width=2),
+                            opacity=0.7,
+                            name=f"{tag} normals",
+                        )
+                    )
+
+            fig = go.Figure(data=traces)
+            fig.update_layout(
+                title="Sampled Points (Interactive 3D)",
+                template="plotly_white",
+                scene=dict(
+                    xaxis_title=self.spatial[0],
+                    yaxis_title=self.spatial[1],
+                    zaxis_title=self.spatial[2],
+                    aspectmode="data",
+                ),
+                legend=dict(itemsizing="constant"),
+            )
+
+            if not save_path.lower().endswith(".html"):
+                root, _ = os.path.splitext(save_path)
+                save_path = f"{root}.html"
+            os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+            fig.write_html(save_path, include_plotlyjs="cdn")
+            self.log.info(f"Saved interactive domain plot to {save_path}")
+            return
 
         # Create figure
         if spatial_dim == 3:
@@ -2068,14 +2206,8 @@ class domain(MeshIOMixin):
 
             color = colors[i % len(colors)]
 
-            # Extract spatial points at batch=0, time=0 for plotting
-            # Arrays are always (B, T, N, D) — T=1 for steady-state
-            if points.ndim == 4:
-                pts = points[0, 0]  # (N, D_spatial)
-            elif points.ndim >= 2:
-                # Parametric / other 2D arrays
-                pts = points[0]  # (N, D)
-            else:
+            pts = _extract_points(points)
+            if pts is None or pts.ndim != 2:
                 continue
             n_points = pts.shape[0]
 
@@ -2085,7 +2217,9 @@ class domain(MeshIOMixin):
 
                 # Plot normals if available
                 if show_normals and f"n_{tag}" in self.context:
-                    normals = self.context[f"n_{tag}"][0]  # (N, 1)
+                    normals = _extract_normals(self.context[f"n_{tag}"])
+                    if normals is None or normals.ndim != 2 or normals.shape[-1] < 1:
+                        continue
                     for j in range(n_points):
                         ax.arrow(
                             pts[j, 0],
@@ -2106,7 +2240,9 @@ class domain(MeshIOMixin):
 
                 # Plot normals if available
                 if show_normals and f"n_{tag}" in self.context:
-                    normals = self.context[f"n_{tag}"][0, 0]  # (N, 2)
+                    normals = _extract_normals(self.context[f"n_{tag}"])
+                    if normals is None or normals.ndim != 2 or normals.shape[-1] < 2:
+                        continue
                     ax.quiver(
                         pts[:, 0],
                         pts[:, 1],
@@ -2133,17 +2269,22 @@ class domain(MeshIOMixin):
 
                 # Plot normals if available
                 if show_normals and f"n_{tag}" in self.context:
-                    normals = self.context[f"n_{tag}"][0]  # (N, 3)
+                    normals = _extract_normals(self.context[f"n_{tag}"])
+                    if normals is None or normals.ndim != 2 or normals.shape[-1] < 3:
+                        continue
+                    m = min(len(pts), len(normals))
+                    diag = float(np.linalg.norm(np.ptp(pts[:m], axis=0)))
+                    scale3d = (arrow_scale * diag) if diag > 0 else arrow_scale
                     ax.quiver(
-                        pts[:, 0],
-                        pts[:, 1],
-                        pts[:, 2],
-                        normals[:, 0],
-                        normals[:, 1],
-                        normals[:, 2],
+                        pts[:m, 0],
+                        pts[:m, 1],
+                        pts[:m, 2],
+                        normals[:m, 0],
+                        normals[:m, 1],
+                        normals[:m, 2],
                         color=color,
                         alpha=0.6,
-                        length=arrow_scale,
+                        length=scale3d,
                         normalize=True,
                         label=f"{tag} normals",
                     )

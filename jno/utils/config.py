@@ -86,27 +86,80 @@ def get_config_path() -> Path | None:
 
 
 def get_runs_base_dir() -> str:
-    """Return ``runs.base_dir`` from config, defaulting to ``"./runs"``."""
+    """Return run base dir with env override support.
+
+    Precedence:
+    1) ``JNO_LOG_DIR`` (environment)
+    2) ``runs.base_dir`` (config)
+    3) ``"./runs"`` (default)
+    """
+    env = os.getenv("JNO_LOG_DIR")
+    if env:
+        return os.path.expanduser(env)
+
     cfg = get_config()
     return cfg.get("runs", {}).get("base_dir", "./runs")
 
 
 def get_rsa_public_key() -> str | None:
-    """Return the RSA public key path from config, or ``None``."""
+    """Return RSA public key path with env override support.
+
+    Precedence:
+    1) ``JNO_RSA_PUBLIC_KEY`` (environment)
+    2) ``JNO_RSA_PATH`` + ``/public.pem`` (environment)
+    3) ``rsa.public_key`` (config)
+    4) ``None``
+    """
+    env_pub = os.getenv("JNO_RSA_PUBLIC_KEY")
+    if env_pub:
+        return os.path.expanduser(env_pub)
+
+    env_rsa_path = os.getenv("JNO_RSA_PATH")
+    if env_rsa_path:
+        return str((Path(os.path.expanduser(env_rsa_path)) / "public.pem").resolve())
+
     cfg = get_config()
     raw = cfg.get("rsa", {}).get("public_key")
     return os.path.expanduser(raw) if raw else None
 
 
 def get_rsa_private_key() -> str | None:
-    """Return the RSA private key path from config, or ``None``."""
+    """Return RSA private key path with env override support.
+
+    Precedence:
+    1) ``JNO_RSA_PRIVATE_KEY`` (environment)
+    2) ``JNO_RSA_PATH`` + ``/private.pem`` (environment)
+    3) ``rsa.private_key`` (config)
+    4) ``None``
+    """
+    env_priv = os.getenv("JNO_RSA_PRIVATE_KEY")
+    if env_priv:
+        return os.path.expanduser(env_priv)
+
+    env_rsa_path = os.getenv("JNO_RSA_PATH")
+    if env_rsa_path:
+        return str((Path(os.path.expanduser(env_rsa_path)) / "private.pem").resolve())
+
     cfg = get_config()
     raw = cfg.get("rsa", {}).get("private_key")
     return os.path.expanduser(raw) if raw else None
 
 
 def get_seed() -> int | None:
-    """Return ``jno.seed`` from config, or ``None`` if not set."""
+    """Return seed with env override support.
+
+    Precedence:
+    1) ``JNO_SEED`` (environment)
+    2) ``jno.seed`` (config)
+    3) ``None``
+    """
+    env_seed = os.getenv("JNO_SEED")
+    if env_seed is not None:
+        try:
+            return int(env_seed)
+        except ValueError as e:
+            raise ValueError(f"Invalid JNO_SEED={env_seed!r}; expected integer.") from e
+
     cfg = get_config()
     return cfg.get("jno", {}).get("seed", None)
 
@@ -170,5 +223,15 @@ def setup(script_file: str, name: str | None = None) -> str:
         pass
 
     _logger_mod._default_logger = _logger_mod.Logger(path=dire, log_print=(True, True), name="DefaultLogger")
+
+    # Seed jno.nn default PRNG stream from config so model factories can
+    # omit explicit key=... after setup().
+    try:
+        from ..architectures.models import set_default_rng_seed
+
+        set_default_rng_seed(get_seed())
+    except Exception:
+        # Keep setup robust even if architecture modules are unavailable.
+        pass
 
     return str(dire)

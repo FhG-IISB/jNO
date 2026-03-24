@@ -9,7 +9,7 @@ import jno
 import jno.numpy as jnn
 
 from jno.trace import Model, TunableModule
-from jno.architectures.models import nn, parameter
+from jno.architectures.models import nn, parameter, set_default_rng_seed
 
 
 # ======================================================================
@@ -32,6 +32,15 @@ class TestParameter:
         p = parameter((3, 2), key=key)
         result = p.module()
         assert result.shape == (3, 2)
+
+    def test_parameter_uses_default_seed_when_key_omitted(self):
+        set_default_rng_seed(123)
+        try:
+            p = parameter((2, 1))
+            result = p.module()
+            assert result.shape == (2, 1)
+        finally:
+            set_default_rng_seed(None)
 
 
 # ======================================================================
@@ -96,6 +105,16 @@ class TestNNMLP:
         x = jnp.ones((5, 3))
         y = m.module(x)
         assert y.shape == (5, 4)
+
+    def test_default_seed_allows_mlp_without_key(self):
+        set_default_rng_seed(123)
+        try:
+            m = nn.mlp(3, output_dim=1, hidden_dims=8, num_layers=2)
+            assert isinstance(m, Model)
+            y = m.module(jnp.ones((2, 3)))
+            assert y.shape == (2, 1)
+        finally:
+            set_default_rng_seed(None)
 
 
 # ======================================================================

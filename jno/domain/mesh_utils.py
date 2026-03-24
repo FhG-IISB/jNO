@@ -241,7 +241,7 @@ class MeshUtils:
         points = mesh.points
         if "tetra" in mesh.cells_dict:
             boundary_elements = MeshUtils._get_boundary_elements(mesh.cells_dict["tetra"], "tetra")
-            actual_dim = 3
+            return MeshUtils._compute_normals_from_boundary_faces(points, boundary_elements)
         elif "triangle" in mesh.cells_dict:
             boundary_elements = MeshUtils._get_boundary_elements(mesh.cells_dict["triangle"], "triangle")
             actual_dim = 2
@@ -250,6 +250,56 @@ class MeshUtils:
 
         boundary_indices = np.unique(boundary_elements)
         return MeshUtils._compute_normals_pca(points, boundary_indices, actual_dim, k, mesh=mesh)
+
+    @staticmethod
+    def _compute_normals_from_boundary_faces(points, boundary_faces):
+        """Compute robust 3D boundary vertex normals from boundary triangle faces.
+
+        Face normals are oriented outward using the global mesh centroid and then
+        accumulated per vertex (area-weighted via unnormalized face normals).
+        """
+        pts = np.asarray(points[:, :3], dtype=np.float64)
+        faces = np.asarray(boundary_faces, dtype=np.int64)
+        if faces.size == 0:
+            return np.zeros((0, 3), dtype=np.float64), np.array([], dtype=np.int64)
+
+        centroid = np.mean(pts, axis=0)
+        vnorm = np.zeros_like(pts)
+        eps = 1e-20
+
+        for f in faces:
+            i0, i1, i2 = int(f[0]), int(f[1]), int(f[2])
+            p0, p1, p2 = pts[i0], pts[i1], pts[i2]
+
+            # Unnormalized normal magnitude is 2*face_area.
+            n = np.cross(p1 - p0, p2 - p0)
+            nlen = np.linalg.norm(n)
+            if nlen < eps:
+                continue
+
+            fc = (p0 + p1 + p2) / 3.0
+            if np.dot(n, fc - centroid) < 0.0:
+                n = -n
+
+            vnorm[i0] += n
+            vnorm[i1] += n
+            vnorm[i2] += n
+
+        boundary_indices = np.unique(faces.ravel())
+        out = vnorm[boundary_indices]
+        lens = np.linalg.norm(out, axis=1, keepdims=True)
+
+        # Fallback for numerically degenerate vertices.
+        bad = lens[:, 0] < eps
+        if np.any(bad):
+            radial = pts[boundary_indices[bad]] - centroid
+            radial_len = np.linalg.norm(radial, axis=1, keepdims=True)
+            radial_len[radial_len < eps] = 1.0
+            out[bad] = radial / radial_len
+            lens[bad] = 1.0
+
+        out = out / lens
+        return out, boundary_indices
 
     @staticmethod
     def _get_boundary_elements(cells, cell_type):
