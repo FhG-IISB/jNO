@@ -105,9 +105,43 @@ from .lora_linear import LoRALinear
 
 from ..tuner import ArchSpace
 from ..trace import Model, TunableModule
+from ..utils.config import get_seed
 
 
-def parameter(shape: tuple, *, key: jax.Array, init: Callable = jax.nn.initializers.zeros, name: str = "value") -> Model:
+_DEFAULT_NN_KEY: jax.Array | None = None
+
+
+def set_default_rng_seed(seed: int | None) -> None:
+    """Set (or clear) the default PRNG seed used by jno.nn factories."""
+    global _DEFAULT_NN_KEY
+    if seed is None:
+        _DEFAULT_NN_KEY = None
+    else:
+        _DEFAULT_NN_KEY = jax.random.PRNGKey(int(seed))
+
+
+def _resolve_key(key: jax.Array | None):
+    """Resolve optional key; fall back to seeded global default if available."""
+    global _DEFAULT_NN_KEY
+    if key is not None:
+        return key
+
+    if _DEFAULT_NN_KEY is None:
+        seed = get_seed()
+        if seed is not None:
+            _DEFAULT_NN_KEY = jax.random.PRNGKey(int(seed))
+
+    if _DEFAULT_NN_KEY is None:
+        raise ValueError(
+            "No PRNG key provided. Pass key=... explicitly, or set [jno].seed "
+            "and call jno.setup(...) before creating models."
+        )
+
+    _DEFAULT_NN_KEY, key_out = jax.random.split(_DEFAULT_NN_KEY)
+    return key_out
+
+
+def parameter(shape: tuple, *, key: jax.Array | None = None, init: Callable = jax.nn.initializers.zeros, name: str = "value") -> Model:
     """
     Create a trainable parameter tensor.
 
@@ -138,6 +172,7 @@ def parameter(shape: tuple, *, key: jax.Array, init: Callable = jax.nn.initializ
         def __call__(self):
             return self.value
 
+    key = _resolve_key(key)
     return nn.wrap(_Parameter(value=init(key, shape)))
 
 
@@ -184,8 +219,12 @@ class nn:
         return cls.wrap(module, *args, **kwargs)
 
     @staticmethod
-    def linear(in_features: int, out_features: int, use_bias: bool = True, *, key: Any):
-        return Linear(in_features, out_features, use_bias, key=key)
+    def linear(in_features: int, out_features: int, use_bias: bool = True, *, key: Any = None):
+        return Linear(in_features, out_features, use_bias, key=_resolve_key(key))
+
+    @staticmethod
+    def _resolve_key(key):
+        return _resolve_key(key)
 
     # =========================================================================
     # Core Wrapping Methods
@@ -251,7 +290,8 @@ class nn:
             return Model(module, name, weight_path)
 
     @classmethod
-    def flaxwrap(cls, module, input, key) -> Model:
+    def flaxwrap(cls, module, input, key=None) -> Model:
+        key = cls._resolve_key(key)
         params = module.init({"params": key}, *input)
         wrapped = FlaxModelWrapper(module.apply, params)
         return cls.wrap(wrapped)
@@ -275,7 +315,7 @@ class nn:
         layer_norm: bool = False,
         final_layer_bias: bool = True,
         *,
-        key: jax.Array,
+        key: jax.Array | None = None,
     ) -> Model:
         """
         Create a Multi-Layer Perceptron (MLP).
@@ -365,7 +405,7 @@ class nn:
             batch_norm,
             layer_norm,
             final_layer_bias,
-            key=key,
+            key=cls._resolve_key(key),
         )
 
         return cls.wrap(inst)
@@ -386,7 +426,7 @@ class nn:
         channel_multiplier: int = 16,
         use_bn: bool = True,
         *,
-        key: jax.Array,
+        key: jax.Array | None = None,
     ) -> Model:
         """
         Create a 2D Continuous Neural Operator (CNO).
@@ -476,7 +516,7 @@ class nn:
             N_res_neck=N_res_neck,
             channel_multiplier=channel_multiplier,
             use_bn=use_bn,
-            key=key,
+            key=cls._resolve_key(key),
         )
 
         return cls.wrap(model)
@@ -500,7 +540,7 @@ class nn:
         training: bool = True,
         dropout_rate: float = 0.0,
         *,
-        key: jax.Array,
+        key: jax.Array | None = None,
     ) -> Model:
         """
         Create a 1D Fourier Neural Operator.
@@ -569,7 +609,7 @@ class nn:
             norm=norm_type,
             training=training,
             dropout_rate=dropout_rate,
-            key=key,
+            key=cls._resolve_key(key),
         )
 
         return cls.wrap(model_instance)
@@ -590,7 +630,7 @@ class nn:
         use_positions: bool = False,
         linear_conv: bool = True,
         *,
-        key: jax.Array,
+        key: jax.Array | None = None,
     ) -> Model:
         """
         Create a 2D Fourier Neural Operator.
@@ -658,7 +698,7 @@ class nn:
             training=training,
             use_positions=use_positions,
             linear_conv=linear_conv,
-            key=key,
+            key=cls._resolve_key(key),
         )
 
         return cls.wrap(fno)
@@ -680,7 +720,7 @@ class nn:
         linear_conv: bool = True,
         dropout_rate: float = 0.0,
         *,
-        key: jax.Array,
+        key: jax.Array | None = None,
     ) -> Model:
         """
         Create a 3D Fourier Neural Operator.
@@ -731,7 +771,7 @@ class nn:
             use_positions=use_positions,
             linear_conv=linear_conv,
             dropout_rate=dropout_rate,
-            key=key,
+            key=cls._resolve_key(key),
         )
 
         return cls.wrap(fno)
@@ -752,7 +792,7 @@ class nn:
         out_dim: int = 1,
         act: str = "gelu",
         *,
-        key: jax.Array,
+        key: jax.Array | None = None,
     ) -> Model:
         """
         Create a Geometry-aware Fourier Neural Operator.
@@ -817,7 +857,7 @@ class nn:
             in_dim=in_dim,
             out_dim=out_dim,
             act=act,
-            key=key,
+            key=cls._resolve_key(key),
         )
 
         return cls.wrap(model)
@@ -833,7 +873,7 @@ class nn:
         out_dim: int = 1,
         act: str = "gelu",
         *,
-        key: jax.Array,
+        key: jax.Array | None = None,
     ) -> Model:
         """
         Create a 1D Geometry-aware FNO.
@@ -861,7 +901,7 @@ class nn:
             in_dim=in_dim,
             out_dim=out_dim,
             act=act,
-            key=key,
+            key=cls._resolve_key(key),
         )
 
     @classmethod
@@ -875,7 +915,7 @@ class nn:
         out_dim: int = 1,
         act: str = "gelu",
         *,
-        key: jax.Array,
+        key: jax.Array | None = None,
     ) -> Model:
         """
         Create a 2D Geometry-aware FNO.
@@ -912,7 +952,7 @@ class nn:
             in_dim=in_dim,
             out_dim=out_dim,
             act=act,
-            key=key,
+            key=cls._resolve_key(key),
         )
 
     @classmethod
@@ -926,7 +966,7 @@ class nn:
         out_dim: int = 1,
         act: str = "gelu",
         *,
-        key: jax.Array,
+        key: jax.Array | None = None,
     ) -> Model:
         """
         Create a 3D Geometry-aware FNO.
@@ -954,7 +994,7 @@ class nn:
             in_dim=in_dim,
             out_dim=out_dim,
             act=act,
-            key=key,
+            key=cls._resolve_key(key),
         )
 
     @classmethod
@@ -972,7 +1012,7 @@ class nn:
         train_inv_L_scale: bool = True,
         act: str = "gelu",
         *,
-        key: jax.Array,
+        key: jax.Array | None = None,
     ) -> Model:
         """
         Create a Point Cloud Neural Operator.
@@ -1043,7 +1083,7 @@ class nn:
             inv_L_scale_max=inv_L_scale_max,
             train_inv_L_scale=train_inv_L_scale,
             act=act,
-            key=key,
+            key=cls._resolve_key(key),
         )
 
         return cls.wrap(model)
@@ -1069,7 +1109,7 @@ class nn:
         attn_dropout: float = 0.0,
         horiz_fourier_dim: int = 0,
         *,
-        key: jax.Array,
+        key: jax.Array | None = None,
     ) -> "Model":
         """
         Create a Cross-attention GPT Neural Operator (CGPTNO).
@@ -1153,7 +1193,7 @@ class nn:
             ffn_dropout=ffn_dropout,
             attn_dropout=attn_dropout,
             horiz_fourier_dim=horiz_fourier_dim,
-            key=key,
+            key=cls._resolve_key(key),
         )
         return cls.wrap(model)
 
@@ -1176,7 +1216,7 @@ class nn:
         attn_dropout: float = 0.0,
         horiz_fourier_dim: int = 0,
         *,
-        key: jax.Array,
+        key: jax.Array | None = None,
     ) -> "Model":
         """
         Create a General Neural Operator Transformer (GNOT).
@@ -1263,7 +1303,7 @@ class nn:
             ffn_dropout=ffn_dropout,
             attn_dropout=attn_dropout,
             horiz_fourier_dim=horiz_fourier_dim,
-            key=key,
+            key=cls._resolve_key(key),
         )
         return cls.wrap(model)
 
@@ -1285,7 +1325,7 @@ class nn:
         attn_dropout: float = 0.0,
         horiz_fourier_dim: int = 0,
         *,
-        key: jax.Array,
+        key: jax.Array | None = None,
     ) -> "Model":
         """
         Create a single-input MoE GPT Neural Operator.
@@ -1336,7 +1376,7 @@ class nn:
             ffn_dropout=ffn_dropout,
             attn_dropout=attn_dropout,
             horiz_fourier_dim=horiz_fourier_dim,
-            key=key,
+            key=cls._resolve_key(key),
         )
         return cls.wrap(model)
 
@@ -1357,7 +1397,7 @@ class nn:
         activation: Callable = jax.nn.celu,
         padding_mode: str = "circular",
         *,
-        key: jax.Array,
+        key: jax.Array | None = None,
     ) -> Model:
         """
         Create a 1D U-Net.
@@ -1425,7 +1465,7 @@ class nn:
             groups=groups,
             activation=activation,
             padding_mode=padding_mode,
-            key=key,
+            key=cls._resolve_key(key),
         )
 
         return cls.wrap(unet)
@@ -1442,7 +1482,7 @@ class nn:
         activation: Callable = jax.nn.gelu,
         padding_mode: str = "circular",
         *,
-        key: jax.Array,
+        key: jax.Array | None = None,
     ) -> Model:
         """
         Create a 2D U-Net.
@@ -1496,7 +1536,7 @@ class nn:
             groups=1,
             activation=activation,
             padding_mode=padding_mode,
-            key=key,
+            key=cls._resolve_key(key),
         )
 
         return cls.wrap(model)
@@ -1513,7 +1553,7 @@ class nn:
         activation: str = "celu",
         padding_mode: str = "circular",
         *,
-        key: jax.Array,
+        key: jax.Array | None = None,
     ) -> Model:
         """
         Create a 3D U-Net.
@@ -1548,7 +1588,7 @@ class nn:
             groups=1,
             activation=activation,
             padding_mode=padding_mode,
-            key=key,
+            key=cls._resolve_key(key),
         )
 
         return cls.wrap(model)
@@ -1569,7 +1609,7 @@ class nn:
         activation: str = "gelu",
         padding_mode: str = "CIRCULAR",
         *,
-        key: jax.Array,
+        key: jax.Array | None = None,
     ) -> Model:
         """
         Create a 1D Multigrid Neural Operator.
@@ -1625,7 +1665,7 @@ class nn:
             output_dim=output_dim,
             activation=activation,
             padding_mode=padding_mode,
-            key=key,
+            key=cls._resolve_key(key),
         )
 
         return cls.wrap(model)
@@ -1642,7 +1682,7 @@ class nn:
         activation: str = "gelu",
         padding_mode: str = "CIRCULAR",
         *,
-        key: jax.Array,
+        key: jax.Array | None = None,
     ) -> Model:
         """
         Create a 2D Multigrid Neural Operator.
@@ -1702,7 +1742,7 @@ class nn:
             output_dim=output_dim,
             activation=activation,
             padding_mode=padding_mode,
-            key=key,
+            key=cls._resolve_key(key),
         )
 
         return cls.wrap(model)
@@ -1724,7 +1764,7 @@ class nn:
         output_res: Optional[Tuple[int, int]] = (64, 64),
         m_dists: Optional[Sequence[jnp.ndarray]] = None,
         *,
-        key: jax.Array,
+        key: jax.Array | None = None,
     ) -> Model:
         """
         Create a Position-induced Transformer (PiT).
@@ -1810,7 +1850,7 @@ class nn:
                 n_head=n_head,
                 localities=list(localities),
                 m_dists=m_dists,
-                key=key,
+                key=cls._resolve_key(key),
             )
         else:
             model = PiTWithCoords(  # type: ignore[assignment]
@@ -1822,7 +1862,7 @@ class nn:
                 input_res=input_res,
                 latent_res=latent_res,
                 output_res=output_res,
-                key=key,
+                key=cls._resolve_key(key),
             )
 
         return cls.wrap(model)
@@ -1838,7 +1878,7 @@ class nn:
         vocab_size: int = 10000,
         max_len: int = 128,
         *,
-        key: jax.Array,
+        key: jax.Array | None = None,
     ) -> Model:
         """
         Create a standard Transformer.
@@ -1874,7 +1914,7 @@ class nn:
             vocab_size=vocab_size,
             dropout_rate=dropout_rate,
             max_len=max_len,
-            key=key,
+            key=cls._resolve_key(key),
         )
 
         return cls.wrap(model_inst)
@@ -1904,7 +1944,7 @@ class nn:
         norm: Optional[str] = None,
         dropout_rate: float = 0.0,
         *,
-        key: jax.Array,
+        key: jax.Array | None = None,
     ) -> Model:
         """
         Create a Deep Operator Network (DeepONet).
@@ -2001,7 +2041,7 @@ class nn:
             activation=activation,
             norm=norm,
             dropout_rate=dropout_rate,
-            key=key,
+            key=cls._resolve_key(key),
         )
 
         return cls.wrap(model)
@@ -2021,7 +2061,7 @@ class nn:
         activation_function: Callable = jnp.tanh,
         use_bias: bool = True,
         *,
-        key: jax.Array,
+        key: jax.Array | None = None,
     ) -> Model:
         """
         Create a PointNet-style network.
@@ -2067,7 +2107,7 @@ class nn:
             feature_transform=feature_transform,
             act=activation_function,
             use_bias=use_bias,
-            key=key,
+            key=cls._resolve_key(key),
         )
 
         return cls.wrap(model)

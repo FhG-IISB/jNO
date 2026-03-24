@@ -1795,21 +1795,30 @@ class core:
 
         return choices
 
-    def eval(self, operation: BinaryOp, domain: Optional[domain] = None, min_consecutive: int = 1, key=None):
+    def eval(self, operation: Union[List[BinaryOp], BinaryOp], domain: Optional[domain] = None, min_consecutive: int = 1, key=None):
         """
-        Evaluates an operation.
+        Evaluates an operation or a list of operations on the current models and domain context.
         """
+
+        if isinstance(operation, BinaryOp):
+            operation = [operation]
+
         domain_data = self.domain_data if domain is None else self.prepare_domain_data(domain)
 
-        fn = TraceCompiler.compile_traced_expression(operation, self.all_ops)
-        result = fn(
-            self.models,
-            domain_data.context,
-            batchsize=None,
-            key=key,
-            min_consecutive=min_consecutive,
-        )
-        return result
+        results = []
+        for op in operation:
+            fn = TraceCompiler.compile_traced_expression(op, self.all_ops)
+            results.append(
+                fn(
+                    self.models,
+                    domain_data.context,
+                    batchsize=None,
+                    key=key,
+                    min_consecutive=min_consecutive,
+                )
+            )
+
+        return results[0] if len(results) == 1 else results
 
     def __getstate__(self):
         """Prepare state for pickling - remove unpicklable objects."""

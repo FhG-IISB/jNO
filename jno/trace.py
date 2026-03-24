@@ -330,6 +330,20 @@ class Placeholder:
         """Alias for :meth:`d`."""
         return Jacobian(self, [variable], scheme)
 
+    def d2(self, variable: "Variable", scheme: str = "automatic_differentiation") -> "Hessian":
+        """Return ∂²self/∂variable² — shorthand for ``jnn.hessian(self, [variable])``.
+
+        Args:
+            variable: The Variable to differentiate with respect to.
+            scheme: ``'automatic_differentiation'`` (default) or
+                ``'finite_difference'``.
+        """
+        return Hessian(self, [variable], scheme, trace=True)
+
+    def dd(self, variable: "Variable", scheme: str = "automatic_differentiation") -> "Hessian":
+        """Alias for :meth:`d2`."""
+        return Hessian(self, [variable], scheme, trace=True)
+
     def laplacian(
         self,
         *variables: "Variable",
@@ -374,6 +388,10 @@ class Placeholder:
             scheme: ``'automatic_differentiation'`` (default) or
                 ``'finite_difference'``.
         """
+        return Hessian(self, [variable], scheme, trace=True)
+
+    def dd(self, variable: "Variable", scheme: str = "automatic_differentiation") -> "Hessian":
+        """Alias for :meth:`d2`."""
         return Hessian(self, [variable], scheme, trace=True)
 
 
