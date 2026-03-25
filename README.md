@@ -39,6 +39,30 @@ micromamba install -n jno -c conda-forge gmsh python-gmsh -y
 pip install -e .
 ```
 
+
+
+# Minimal Examples
+
+```python
+import jno
+import optax
+
+jno.setup("./runs/test")
+
+dom = jno.domain.rect(mesh_size=0.025)
+x, y, _ = dom.variable("interior")
+
+net = jno.nn.mlp(in_features=2).optimizer(optax.adam(1e-3))
+u = net(x, y) * (1 - x) * (1 - y)
+
+pde = (u.dd(x) + u.dd(y)) - 10.0
+
+crux = jno.core(constraints=[pde.mse], domain=dom)
+crux.solve(epochs=5_000)
+
+pred = crux.eval(u)
+```
+
 ### Foundation Models
 
 These models are maintained as separate repositories so they can also be used independently.
