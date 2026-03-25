@@ -46,13 +46,7 @@ COPY jno/ ./jno/
 # ---- Step 1: install all CPU packages from the lockfile ----
 # We skip the cuda extra here because uv.lock is generated on a CPU machine
 # and will not have CUDA-platform wheels resolved.
-RUN uv sync --extra iree --extra dev --no-extra cuda
-
-# ---- Step 2: overlay CUDA-enabled JAX on top ----
-# jax[cuda12] pulls in jaxlib-cuda12, cublas, cusparse, etc. via PyPI binary
-# wheels compiled against CUDA 12.x.  This bypasses the lockfile so it
-# always fetches the matching CUDA build for the installed JAX version.
-RUN uv pip install --reinstall "jax[cuda12]"
+RUN uv sync --all-extras
 
 # ---- put the uv-managed venv on PATH ----
 ENV PATH="/app/.venv/bin:$PATH"

@@ -24,8 +24,19 @@
 
 # Install
 
+Quick install from PyPI:
+
 ```bash
 pip install jax-neural-operators
+```
+
+For local development (recommended on Linux `aarch64` when `gmsh` wheels are unavailable on PyPI), use `micromamba`:
+
+```bash
+micromamba create -n jno python=3.12 pip -y
+micromamba activate jno
+micromamba install -n jno -c conda-forge gmsh python-gmsh -y
+pip install -e .
 ```
 
 ### Foundation Models
