@@ -328,6 +328,10 @@ class core:
         if domain is None:
             raise ValueError("domain required")
 
+        if self.domain is not None:
+            for sample in self.domain.sample_dict:
+                domain.sample({sample[0]: sample[1]}, sample[3], sample[4])
+
         context = {}
         if hasattr(domain, "context"):
             for tag, arr in domain.context.items():

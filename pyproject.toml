@@ -8,15 +8,10 @@ version = "0.1.0"
 description = "Jax Neural Operators"
 readme = "README.md"
 requires-python = ">=3.11, <3.14"
-authors = [{ name = "Leon Armbruster", email = "leonarmbruster@iisb.fraunhofer.de" }]
+authors = [{ name = "Leon Armbruster", email = "leon.armbruster@iisb.fraunhofer.de" }]
 license = "MIT"
 classifiers = [
-    "Development Status :: 3 - Alpha",
     "Intended Audience :: Science/Research",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
     "Topic :: Scientific/Engineering :: Mathematics",
 ]
 
@@ -41,29 +36,22 @@ cuda = [
     "jax[cuda12]"
 ]
 dev = ["pytest>=7.0", 
-"black>=22.0", 
-"flake8>=4.0", 
-"mypy>=0.950", 
-"matplotlib", 
-"paramax", 
-"flax", 
-"xprof", 
-"pylotte", 
-"nevergrad", 
-"lineax", "jax-fem @git+https://github.com/FhG-IISB/jax-fem", "pyfiglet", "fenics-basix",]
+        "black>=22.0", 
+        "flake8>=4.0", 
+        "mypy>=0.950", 
+        "matplotlib", 
+        "paramax", 
+        "flax", 
+        "xprof", 
+        "pylotte", 
+        "nevergrad", 
+        "lineax", 
+        "pyfiglet", 
+        "fenics-basix",
+]
 iree = [
     "iree-base-compiler",
     "iree-base-runtime"
-]
-foundation = [
-    "jax_morph @git+https://github.com/armbrusl/jax_morph",
-    "jax_mpp @git+https://github.com/armbrusl/jax_mpp",
-]
-fem = [
-    "lineax",
-    "jax-fem @git+https://github.com/FhG-IISB/jax-fem",
-     "pyfiglet", 
-     "fenics-basix"
 ]
 
 
@@ -89,8 +77,27 @@ exclude = '^(build/|jNO\.egg-info/|runs/)'
 
 [tool.uv.sources]
 jno = { workspace = true}
+jax_morph = { git = "https://github.com/armbrusl/jax_morph" }
+jax_mpp = { git = "https://github.com/armbrusl/jax_mpp" }
+jax_poseidon = { git = "https://github.com/FhG-IISB/jax_poseidon" }
+jax_pdeformer2 = { git = "https://github.com/FhG-IISB/jax_pdeformer2" }
+jax_walrus = { git = "https://github.com/FhG-IISB/jax_walrus" }
+"jax-fem" = { git = "https://github.com/FhG-IISB/jax-fem" }
 
 [dependency-groups]
 dev = [
-    "jno",
+    "jno[dev]",
+]
+foundation = [
+    "jax_morph",
+    "jax_mpp",
+    "jax_poseidon",
+    "jax_pdeformer2",
+    "jax_walrus",
+]
+fem = [
+    "lineax",
+    "jax-fem",
+    "pyfiglet",
+    "fenics-basix",
 ]

@@ -1161,6 +1161,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "jax-pdeformer2"
+version = "0.1.0"
+source = { git = "https://github.com/FhG-IISB/jax_pdeformer2#f6187591ef4ecdbcbbaafd9a09ed662cec290b97" }
+dependencies = [
+    { name = "flax" },
+    { name = "jax" },
+    { name = "jaxlib" },
+    { name = "networkx" },
+    { name = "numpy" },
+]
+
+[[package]]
+name = "jax-poseidon"
+version = "0.1.0"
+source = { git = "https://github.com/FhG-IISB/jax_poseidon#a0e921beeaff81eaf05ef4b1b6ea3f372d99bdf1" }
+dependencies = [
+    { name = "flax" },
+    { name = "jax" },
+    { name = "jaxlib" },
+    { name = "numpy" },
+]
+
+[[package]]
+name = "jax-walrus"
+version = "0.1.0"
+source = { git = "https://github.com/FhG-IISB/jax_walrus#617232fd4209c73b3779e6e0d727235711e68c94" }
+dependencies = [
+    { name = "einops" },
+    { name = "flax" },
+    { name = "jax" },
+    { name = "jaxlib" },
+    { name = "numpy" },
+]
+
+[[package]]
 name = "jaxlib"
 version = "0.8.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1221,7 +1256,6 @@ dev = [
     { name = "fenics-basix" },
     { name = "flake8" },
     { name = "flax" },
-    { name = "jax-fem" },
     { name = "lineax" },
     { name = "matplotlib" },
     { name = "mypy" },
@@ -1232,6 +1266,15 @@ dev = [
     { name = "pytest" },
     { name = "xprof" },
 ]
+iree = [
+    { name = "iree-base-compiler" },
+    { name = "iree-base-runtime" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "jno", extra = ["dev"] },
+]
 fem = [
     { name = "fenics-basix" },
     { name = "jax-fem" },
@@ -1241,15 +1284,9 @@ fem = [
 foundation = [
     { name = "jax-morph" },
     { name = "jax-mpp" },
-]
-iree = [
-    { name = "iree-base-compiler" },
-    { name = "iree-base-runtime" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "jno" },
+    { name = "jax-pdeformer2" },
+    { name = "jax-poseidon" },
+    { name = "jax-walrus" },
 ]
 
 [package.metadata]
@@ -1259,35 +1296,41 @@ requires-dist = [
     { name = "einops" },
     { name = "equinox" },
     { name = "fenics-basix", marker = "extra == 'dev'" },
-    { name = "fenics-basix", marker = "extra == 'fem'" },
     { name = "flake8", marker = "extra == 'dev'", specifier = ">=4.0" },
     { name = "flax", marker = "extra == 'dev'" },
     { name = "iree-base-compiler", marker = "extra == 'iree'" },
     { name = "iree-base-runtime", marker = "extra == 'iree'" },
     { name = "jax" },
     { name = "jax", extras = ["cuda12"], marker = "extra == 'cuda'" },
-    { name = "jax-fem", marker = "extra == 'dev'", git = "https://github.com/FhG-IISB/jax-fem" },
-    { name = "jax-fem", marker = "extra == 'fem'", git = "https://github.com/FhG-IISB/jax-fem" },
-    { name = "jax-morph", marker = "extra == 'foundation'", git = "https://github.com/armbrusl/jax_morph" },
-    { name = "jax-mpp", marker = "extra == 'foundation'", git = "https://github.com/armbrusl/jax_mpp" },
     { name = "lineax", marker = "extra == 'dev'" },
-    { name = "lineax", marker = "extra == 'fem'" },
     { name = "matplotlib", marker = "extra == 'dev'" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=0.950" },
     { name = "nevergrad", marker = "extra == 'dev'" },
     { name = "optax" },
     { name = "paramax", marker = "extra == 'dev'" },
     { name = "pyfiglet", marker = "extra == 'dev'" },
-    { name = "pyfiglet", marker = "extra == 'fem'" },
     { name = "pygmsh" },
     { name = "pylotte", marker = "extra == 'dev'" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "xprof", marker = "extra == 'dev'" },
 ]
-provides-extras = ["cuda", "dev", "iree", "foundation", "fem"]
+provides-extras = ["cuda", "dev", "iree"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "jno", editable = "." }]
+dev = [{ name = "jno", extras = ["dev"], editable = "." }]
+fem = [
+    { name = "fenics-basix" },
+    { name = "jax-fem", git = "https://github.com/FhG-IISB/jax-fem" },
+    { name = "lineax" },
+    { name = "pyfiglet" },
+]
+foundation = [
+    { name = "jax-morph", git = "https://github.com/armbrusl/jax_morph" },
+    { name = "jax-mpp", git = "https://github.com/armbrusl/jax_mpp" },
+    { name = "jax-pdeformer2", git = "https://github.com/FhG-IISB/jax_pdeformer2" },
+    { name = "jax-poseidon", git = "https://github.com/FhG-IISB/jax_poseidon" },
+    { name = "jax-walrus", git = "https://github.com/FhG-IISB/jax_walrus" },
+]
 
 [[package]]
 name = "joblib"
@@ -1777,6 +1820,15 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/83/f8/51569ac65d696c8ecbee95938f89d4abf00f47d58d48f6fbabfe8f0baefe/nest_asyncio-1.6.0.tar.gz", hash = "sha256:6f172d5449aca15afd6c646851f4e31e02c598d553a667e38cafa997cfec55fe", size = 7418, upload-time = "2024-01-21T14:25:19.227Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a0/c4/c2971a3ba4c6103a3d10c4b0f24f461ddc027f0f09763220cf35ca1401b3/nest_asyncio-1.6.0-py3-none-any.whl", hash = "sha256:87af6efd6b5e897c81050477ef65c62e2b2f35d51703cae01aff2905b1852e1c", size = 5195, upload-time = "2024-01-21T14:25:17.223Z" },
+]
+
+[[package]]
+name = "networkx"
+version = "3.6.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6a/51/63fe664f3908c97be9d2e4f1158eb633317598cfa6e1fc14af5383f17512/networkx-3.6.1.tar.gz", hash = "sha256:26b7c357accc0c8cde558ad486283728b65b6a95d85ee1cd66bafab4c8168509", size = 2517025, upload-time = "2025-12-08T17:02:39.908Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9e/c9/b2622292ea83fbb4ec318f5b9ab867d0a28ab43c5717bb85b0a5f6b3b0a4/networkx-3.6.1-py3-none-any.whl", hash = "sha256:d47fbf302e7d9cbbb9e2555a0d267983d2aa476bac30e90dfbe5669bd57f3762", size = 2068504, upload-time = "2025-12-08T17:02:38.159Z" },
 ]
 
 [[package]]
