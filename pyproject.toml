@@ -76,7 +76,6 @@ line-length = 250
 exclude = '^(build/|jNO\.egg-info/|runs/)'
 
 [tool.uv.sources]
-jno = { workspace = true}
 jax_morph = { git = "https://github.com/armbrusl/jax_morph" }
 jax_mpp = { git = "https://github.com/armbrusl/jax_mpp" }
 jax_poseidon = { git = "https://github.com/FhG-IISB/jax_poseidon" }
@@ -85,9 +84,6 @@ jax_walrus = { git = "https://github.com/FhG-IISB/jax_walrus" }
 "jax-fem" = { git = "https://github.com/FhG-IISB/jax-fem" }
 
 [dependency-groups]
-dev = [
-    "jno[dev]",
-]
 foundation = [
     "jax_morph",
     "jax_mpp",
