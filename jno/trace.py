@@ -1388,6 +1388,7 @@ class Model(Placeholder):
             optimization_level=optimization_level,
         )
 
+
 class ModelCall(Placeholder):
     """Represents a call to a Model with specific arguments.
 

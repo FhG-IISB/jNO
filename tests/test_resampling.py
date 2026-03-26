@@ -10,7 +10,7 @@ import optax
 import pytest
 
 import jno
-import jno.numpy as jnn
+import jno.jnp_ops as jnn
 from jno import LearningRateSchedule as lrs
 from jno import sampler
 from jno.resampling import CR3, HA, PINNFluence, R3, RAD, RARD, RandomResampling, ResamplingStrategy

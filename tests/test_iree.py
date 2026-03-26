@@ -15,7 +15,7 @@ if shutil.which("iree-compile") is None:
 
 
 import jno  # noqa: E402
-import jno.numpy as jnn  # noqa: E402
+import jno.jnp_ops as jnn  # noqa: E402
 from jno.utils.iree import IREEModel  # noqa: E402
 
 

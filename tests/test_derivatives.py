@@ -24,7 +24,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-import jno.numpy as jnn
+import jno.jnp_ops as jnn
 from jno.differential_operators import DifferentialOperators
 from jno.trace import (
     Jacobian,

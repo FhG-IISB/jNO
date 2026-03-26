@@ -22,7 +22,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 import jno
-import jno.numpy as jnn
+import jno.jnp_ops as jnn
 
 # ---------------------------------------------------------------------------
 # GPU skip marker — all TestGPUPlacement tests are guarded by this

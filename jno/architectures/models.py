@@ -132,10 +132,7 @@ def _resolve_key(key: jax.Array | None):
             _DEFAULT_NN_KEY = jax.random.PRNGKey(int(seed))
 
     if _DEFAULT_NN_KEY is None:
-        raise ValueError(
-            "No PRNG key provided. Pass key=... explicitly, or set [jno].seed "
-            "and call jno.setup(...) before creating models."
-        )
+        raise ValueError("No PRNG key provided. Pass key=... explicitly, or set [jno].seed " "and call jno.setup(...) before creating models.")
 
     _DEFAULT_NN_KEY, key_out = jax.random.split(_DEFAULT_NN_KEY)
     return key_out
