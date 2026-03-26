@@ -21,6 +21,7 @@
     <img src="https://img.shields.io/badge/docker-image%20available-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker image available"/>
 </p>
 
+Warning: This is a research-level repository. It may contain bugs and is subject to continuous change without notice.
 
 # Install
 
