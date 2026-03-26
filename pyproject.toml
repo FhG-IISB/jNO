@@ -3,7 +3,7 @@ requires = ["setuptools>=68", "wheel", "build"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "jNO"
+name = "jax-neural-operators"
 version = "0.1.0"
 description = "Jax Neural Operators"
 readme = "README.md"
