@@ -85,10 +85,10 @@ to use a foundation model.
     <a href="https://github.com/FhG-IISB/jax_pdeformer2">
         <img src="https://img.shields.io/badge/jax_pdeformer2-1f6feb?style=for-the-badge" alt="jax_pdeformer2"/>
     </a>
-    <a href="https://github.com/armbrusl/jax_morph">
+    <a href="https://github.com/FhG-IISB/jax_morph">
         <img src="https://img.shields.io/badge/jax_morph-1f6feb?style=for-the-badge" alt="jax_morph"/>
     </a>
-    <a href="https://github.com/armbrusl/jax_mpp">
+    <a href="https://github.com/FhG-IISB/jax_mpp">
         <img src="https://img.shields.io/badge/jax_mpp-1f6feb?style=for-the-badge" alt="jax_mpp"/>
     </a>
 </p>
