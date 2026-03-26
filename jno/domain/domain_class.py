@@ -1321,9 +1321,19 @@ class domain(MeshIOMixin):
 
         if tag in self._mesh_pool.keys() and isinstance(sample, tuple) and len(sample) > 0 and isinstance(sample[0], (int, type(None))):
             # Sample points for this tag on demand
-            # Save sample dict for inference
-            self.sample_dict.append([tag, (None, None), resampling_strategy, normals, view_factor])
+            source_tag = tag
             points, idx, tag = self.sample({tag: sample}, normals, return_indices)
+            self.sample_dict.append(
+                {
+                    "source_tag": source_tag,
+                    "resolved_tag": tag,
+                    "sample": sample,
+                    "resampling_strategy": resampling_strategy,
+                    "normals": normals,
+                    "reverse_normals": reverse_normals,
+                    "view_factor": view_factor,
+                }
+            )
 
         # Store resampling strategy if provided
         if resampling_strategy is not None:

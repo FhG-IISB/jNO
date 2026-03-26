@@ -56,7 +56,7 @@ def _make_solver():
     """Build and briefly train a minimal 1-D Laplace solver."""
     import optax
     import jno
-    import jno.numpy as jnn
+    import jno.jnp_ops as jnn
     from jno import LearningRateSchedule as lrs
 
     domain = jno.domain(constructor=jno.domain.line(mesh_size=0.05))

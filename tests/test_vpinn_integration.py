@@ -4,7 +4,7 @@ import pytest
 import jax
 import jax.numpy as jnp
 import jno
-import jno.numpy as jnn
+import jno.jnp_ops as jnn
 from jno.trace import dump_tree
 
 

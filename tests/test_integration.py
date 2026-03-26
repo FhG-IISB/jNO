@@ -171,7 +171,7 @@ class TestRegressions:
     def test_choice_is_sweepable(self):
         """A jnn.choice(...) branch index is exposed to core.sweep()."""
         import jno
-        import jno.numpy as jnn
+        import jno.jnp_ops as jnn
         import optax
         from jno.tuner import ArchSpace
 
@@ -203,9 +203,9 @@ class TestRegressions:
 def _make_solver():
     """Build a minimal core solver for memory-management tests."""
     import jno
-    import jno.numpy as jnn
+    import jno.jnp_ops as jnn
 
-    domain = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.01))
+    domain = 1 * jno.domain.line(mesh_size=0.01)
     x, t = domain.variable("interior")
 
     key = jax.random.PRNGKey(0)
@@ -417,7 +417,7 @@ class TestParamMask:
         """
         import jax
         import jno
-        import jno.numpy as jnn
+        import jno.jnp_ops as jnn
         import equinox as eqx
 
         domain = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.05))
@@ -495,7 +495,7 @@ class TestParamMask:
         import equinox as eqx
         from jno import LearningRateSchedule as lrs
         import jno
-        import jno.numpy as jnn
+        import jno.jnp_ops as jnn
 
         def make_masked(seed):
             domain = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.05))
@@ -529,7 +529,7 @@ class TestParamMask:
         import equinox as eqx
         from jno import LearningRateSchedule as lrs
         import jno
-        import jno.numpy as jnn
+        import jno.jnp_ops as jnn
 
         domain = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.05))
         x, *_ = domain.variable("interior")
@@ -587,7 +587,7 @@ def test_mask_initialize_freeze_lora_combined():
     import optax
     import equinox as eqx
     import jno
-    import jno.numpy as jnn
+    import jno.jnp_ops as jnn
     from jno import LearningRateSchedule as lrs
 
     # ── Domain ───────────────────────────────────────────────
@@ -685,7 +685,7 @@ def test_nnx_auto_wrap_and_train():
     from flax import nnx
     import optax
     import jno
-    import jno.numpy as jnn
+    import jno.jnp_ops as jnn
     from jno import LearningRateSchedule as lrs
     from jno.architectures.common import FlaxNNXWrapper
 
@@ -724,7 +724,7 @@ def test_nnx_freeze():
     from flax import nnx
     import optax
     import jno
-    import jno.numpy as jnn
+    import jno.jnp_ops as jnn
     from jno import LearningRateSchedule as lrs
 
     class Net(nnx.Module):
@@ -767,7 +767,7 @@ def test_nnx_mask():
     import optax
     import equinox as eqx
     import jno
-    import jno.numpy as jnn
+    import jno.jnp_ops as jnn
     from jno import LearningRateSchedule as lrs
 
     class Net(nnx.Module):
@@ -822,7 +822,7 @@ def test_nnx_initialize_from_pytree():
     from flax import nnx
     import optax
     import jno
-    import jno.numpy as jnn
+    import jno.jnp_ops as jnn
     from jno import LearningRateSchedule as lrs
 
     class Net(nnx.Module):

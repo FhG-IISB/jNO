@@ -323,14 +323,77 @@ class core:
                 tensor_dims[name] = tensor.shape[1:]
         return tensor_dims
 
+    def _populate_missing_context_tags(self, domain) -> None:
+        """Populate missing tags on a new eval domain.
+
+        For tags originally created via ``domain.variable(..., sample=...)``,
+        prefer re-sampling from the provided domain so the points reflect that
+        domain's geometry. If a tag cannot be re-sampled there, fall back to
+        copying the already-materialized context from ``self.domain``. Existing
+        tags on the provided domain are never overwritten.
+        """
+        if self.domain is None or domain is self.domain:
+            return
+
+        source_context = getattr(self.domain, "context", None)
+        target_context = getattr(domain, "context", None)
+        if not source_context or target_context is None:
+            return
+
+        sample_records = getattr(self.domain, "sample_dict", None) or []
+        for record in sample_records:
+            if isinstance(record, dict):
+                source_tag = record.get("source_tag")
+                resolved_tag = record.get("resolved_tag", source_tag)
+                sample = record.get("sample")
+                resampling_strategy = record.get("resampling_strategy")
+                normals = bool(record.get("normals", False))
+                reverse_normals = bool(record.get("reverse_normals", False))
+                view_factor = bool(record.get("view_factor", False))
+            else:
+                source_tag = record[0] if len(record) > 0 else None
+                resolved_tag = source_tag
+                sample = record[1] if len(record) > 1 else None
+                resampling_strategy = record[2] if len(record) > 2 else None
+                normals = bool(record[3]) if len(record) > 3 else False
+                reverse_normals = False
+                view_factor = bool(record[4]) if len(record) > 4 else False
+
+            if source_tag is None or resolved_tag in target_context:
+                continue
+
+            if source_tag in getattr(domain, "_mesh_pool", {}) and isinstance(sample, tuple):
+                try:
+                    domain.variable(
+                        source_tag,
+                        sample=sample,
+                        resampling_strategy=resampling_strategy,
+                        normals=normals,
+                        reverse_normals=reverse_normals,
+                        view_factor=view_factor,
+                    )
+                    continue
+                except Exception as exc:
+                    self.log.warning(f"Falling back to copied context for '{resolved_tag}': could not sample on provided domain ({exc})")
+
+        for tag, value in source_context.items():
+            if tag in target_context:
+                continue
+
+            if isinstance(value, dict):
+                target_context[tag] = jax.tree_util.tree_map(lambda x: np.asarray(x).copy(), value)
+            else:
+                target_context[tag] = np.asarray(value).copy()
+
+        if hasattr(self.domain, "_param_tags") and hasattr(domain, "_param_tags"):
+            domain._param_tags.update(tag for tag in self.domain._param_tags if tag in domain.context)
+
     def prepare_domain_data(self, domain) -> DomainData:
         """Convert domain data to JAX arrays for training."""
         if domain is None:
             raise ValueError("domain required")
 
-        if self.domain is not None:
-            for sample in self.domain.sample_dict:
-                domain.sample({sample[0]: sample[1]}, sample[3], sample[4])
+        self._populate_missing_context_tags(domain)
 
         context = {}
         if hasattr(domain, "context"):
