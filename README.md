@@ -42,7 +42,7 @@ pip install -e .
 
 
 
-# Minimal Examples
+# Minimal Example
 
 ```python
 import jno
