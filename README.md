@@ -72,7 +72,7 @@ net = jno.nn.deeponet(n_sensors=1, coord_dim=2, basis_functions=32, hidden_dim=1
 net.optimizer(optax.adam(learning_rate=optax.schedules.cosine_decay_schedule(init_value=1e-3, decay_steps=20_000, alpha=1e-5)))
 
 # Forward pass and hard enforcement of BCs via output transformation
-u = net(k, jno.np.concat([x, y], axis=-1)) * x * (1 - x) * y * (1 - y)
+u = net(k, jno.np.concat([x, y], axis=-1)) * x * (2 - x) * y * (1 - y)
 pde = k * (u.dd(x) + u.dd(y)) + 1.0  # PDE Loss
 
 # Create -> Train -> Save
