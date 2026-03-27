@@ -48,7 +48,7 @@ pip install -e .
 
 
 
-# Minimal DeepONet Neural Operator Example
+# Minimal DeepONet Example
 
 Create the following file
 
