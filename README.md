@@ -76,7 +76,7 @@ u = net(k, jno.np.concat([x, y], axis=-1)) * x * (2 - x) * y * (1 - y)
 pde = k * (u.dd(x) + u.dd(y)) + 1.0  # PDE Loss
 
 # Create -> Train -> Save
-crux = jno.core(constraints=[pde.mse], domain=dom, mesh=(2, 1)).print_shapes()
+crux = jno.core(constraints=[pde.mse], domain=dom).print_shapes()
 crux.solve(epochs=20_000, batchsize=32).plot(f"{dir}/training.png")
 jno.save(crux, f"{dir}/model.pkl")
 
