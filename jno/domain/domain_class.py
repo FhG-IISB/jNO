@@ -2326,7 +2326,11 @@ class domain(MeshIOMixin):
                 time_info = f" (t ∈ [{t_vals.min():.3f}, {t_vals.max():.3f}])"
 
         ax.set_title(f"Sampled Points: {time_info}")
-        ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+        handles, labels = ax.get_legend_handles_labels()
+        if not handles:
+            self.log.warning("No legend entries found. This usually means no variable of the domain has been set or sampled. Be sure to call e.g. domain.variable('interior') before plotting.")
+        else:
+            ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
 
         import matplotlib.pyplot as plt  # already imported above, but safe
 

@@ -1867,7 +1867,7 @@ class core:
         Evaluates an operation or a list of operations on the current models and domain context.
         """
 
-        if isinstance(operation, BinaryOp):
+        if isinstance(operation, Placeholder):
             operation = [operation]
 
         domain_data = self.domain_data if domain is None else self.prepare_domain_data(domain)
