@@ -741,7 +741,7 @@ class domain(MeshIOMixin):
         bcs=None,
     ) -> "domain":
         """
-        Initialize the JAX-FEM data associated with this domain.
+        Initialize the FEM data associated with this domain using FEAX.
 
         This sets up the FEM mesh, boundary-condition data, quadrature data,
         and cached tensors needed for weak-form assembly and FEM solves.
@@ -749,7 +749,7 @@ class domain(MeshIOMixin):
         Parameters
         ----------
         element_type : str, default="TRI3"
-            Finite-element type used by JAX-FEM.
+            Finite-element type used by FEAX.
         quad_degree : int, default=2
             Quadrature degree for volume and boundary integration.
         neumann_tags : list[str], optional
@@ -776,8 +776,7 @@ class domain(MeshIOMixin):
         self._variational_sampling_registry = {}
         import jax.numpy as jnp
         import numpy as onp
-        from jax_fem.problem import Problem
-        from jax_fem.generate_mesh import Mesh
+        import feax as fe
         from scipy.spatial import KDTree  # Ensuring this is available locally
         from ..utils.fem_route import expand_bcs
 
@@ -797,7 +796,14 @@ class domain(MeshIOMixin):
             "TET4": "tetra",
         }
         meshio_type = meshio_type_map.get(element_type)
-        jax_mesh = Mesh(self.mesh.points[:, : self.dimension], self.mesh.cells_dict[meshio_type])
+        if meshio_type is None:
+            raise ValueError(f"Unsupported FEM element_type '{element_type}'.")
+
+        feax_mesh = fe.Mesh(
+            self.mesh.points[:, :self.dimension],
+            self.mesh.cells_dict[meshio_type],
+            ele_type=element_type,
+        )
 
         # --- Location functions for Neumann ---
         location_fns = []
@@ -817,7 +823,7 @@ class domain(MeshIOMixin):
             vec=vec,
         )
 
-        class DummyProblem(Problem):
+        class DummyProblem(fe.Problem):
             def get_tensor_map(self):
                 return lambda x: x
 
@@ -828,7 +834,7 @@ class domain(MeshIOMixin):
                 return [lambda u, x: jnp.zeros((1,))] * len(location_fns)
 
         prob = DummyProblem(
-            jax_mesh,
+            feax_mesh,
             vec=vec,
             dim=self.dimension,
             ele_type=element_type,
@@ -837,15 +843,20 @@ class domain(MeshIOMixin):
             location_fns=location_fns,
         )
         self._fem_solver_enabled = bool(fem_solver)
-        self._jaxfem_solver_context = {
-            "mesh": jax_mesh,
-            "element_type": element_type,
-            "quad_degree": quad_degree,
+
+        # Neutral FEM backend metadata used by the FEAX-backed fem_route.py
+        self._fem_backend = "feax"
+        self._fem_element_type = element_type
+        self._fem_quad_degree = quad_degree
+        self._fem_default_vec = vec
+
+        self._feax_context = {
+            "mesh": feax_mesh,
+            "problem": prob,
             "location_fns": location_fns,
             "valid_neumann_tags": list(valid_tags),
             "dirichlet_tags": list(dirichlet_tags),
             "dirichlet_bc_info": dirichlet_bc_info,
-            "dummy_problem": prob,
             "dim": self.dimension,
             "default_vec": vec,
         }
@@ -947,7 +958,7 @@ class domain(MeshIOMixin):
                     region_id=tag,
                     context_tag=f"gauss_{tag}",
                 )
-                self.log.info(f"jax-fem Nanson extraction: Matched {len(inds)} faces for '{tag}'")
+                self.log.info(f"FEAX surface extraction: matched {len(inds)} faces for '{tag}'")
         # ====================================================================
         # THE FIX: Pad FEM arrays with Batch (B=1) and Time (T=1) dimensions
         # This prevents trace_compiler from mistaking the spatial/node
