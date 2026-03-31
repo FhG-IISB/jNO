@@ -343,7 +343,7 @@ class core:
                 arr = jnp.asarray(arr)
 
                 # List of tags that are MESH METADATA and should never be batched
-                metadata_tags = ["JxW", "flat_cells", "global_areas", "N_flat", "dN_dx_flat", "dirichlet_nodes", "__time__"]
+                metadata_tags = ["JxW", "flat_cells", "global_areas", "N_flat", "dN_dx_flat", "dirichlet_nodes","cells", "quad_points","boundary_nodes","v_grads_JxW_flat","__time__"]
 
                 if tag in metadata_tags:
                     context[tag] = arr

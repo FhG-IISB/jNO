@@ -1555,9 +1555,11 @@ class OperationDef(Placeholder):
                 for arg in node.args:
                     visit(arg)
             elif isinstance(node, GroupedAssembly):
-                if node.volume_expr is not None:
-                    visit(node.volume_expr)
-                for bnd_expr in node.boundary_exprs.values():
+                if node.volume_value_expr is not None:
+                    visit(node.volume_value_expr)
+                if node.volume_grad_expr is not None:
+                    visit(node.volume_grad_expr)
+                for bnd_expr in node.boundary_value_exprs.values():
                     visit(bnd_expr)
             elif isinstance(node, Assembly):
                 visit(node.expr)
@@ -1582,9 +1584,10 @@ class OperationDef(Placeholder):
             elif isinstance(node, Assembly):
                 return visit(node.expr)
             elif isinstance(node, GroupedAssembly):
-                vol_has = visit(node.volume_expr) if node.volume_expr is not None else False
-                bnd_has = any(visit(expr) for expr in node.boundary_exprs.values())
-                return vol_has or bnd_has
+                val_has = visit(node.volume_value_expr) if node.volume_value_expr is not None else False
+                grad_has = visit(node.volume_grad_expr) if node.volume_grad_expr is not None else False
+                bnd_has = any(visit(expr) for expr in node.boundary_value_exprs.values())
+                return val_has or grad_has or bnd_has
             return False
 
         return visit(expr)
@@ -1837,15 +1840,18 @@ class Assembly(Placeholder):
 
 class GroupedAssembly(Placeholder):
     """
-    Internal node for a grouped variational assembly:
-      - optional volume expression
-      - optional boundary expressions by region
-    Evaluated in one pass by the trace evaluator.
+    Internal node for grouped FEAX-style variational assembly.
+
+    Separate channels:
+      - volume_value_expr   : terms multiplied by TestFunction(phi)
+      - volume_grad_expr    : terms multiplied by grad(TestFunction(phi))
+      - boundary_value_exprs: boundary terms multiplied by TestFunction(phi)
     """
 
-    def __init__(self, volume_expr, boundary_exprs, domain_or_nodes):
-        self.volume_expr = volume_expr  # Placeholder | None
-        self.boundary_exprs = boundary_exprs or {}  # dict[str, Placeholder]
+    def __init__(self, volume_value_expr, volume_grad_expr, boundary_value_exprs, domain_or_nodes):
+        self.volume_value_expr = volume_value_expr          # Placeholder | None
+        self.volume_grad_expr = volume_grad_expr            # Placeholder | None
+        self.boundary_value_exprs = boundary_value_exprs or {}  # dict[str, Placeholder]
         if hasattr(domain_or_nodes, "context"):
             self.num_total_nodes = int(domain_or_nodes.context["num_total_nodes"])
         else:
@@ -1853,8 +1859,12 @@ class GroupedAssembly(Placeholder):
         self.op_id = _next_op_id()
 
     def __repr__(self):
-        bkeys = list(self.boundary_exprs.keys())
-        return f"GroupedAssembly(volume={'yes' if self.volume_expr is not None else 'no'}, " f"boundaries={bkeys}, nodes={self.num_total_nodes})"
+        bkeys = list(self.boundary_value_exprs.keys())
+        return (
+            f"GroupedAssembly(value={'yes' if self.volume_value_expr is not None else 'no'}, "
+            f"grad={'yes' if self.volume_grad_expr is not None else 'no'}, "
+            f"boundaries={bkeys}, nodes={self.num_total_nodes})"
+        )
 
 
 # =============================================================================
@@ -1935,8 +1945,9 @@ def cse(expr: Placeholder) -> Placeholder:
         if isinstance(node, GroupedAssembly):
             return (
                 "GroupedAssembly",
-                id(node.volume_expr) if node.volume_expr is not None else None,
-                tuple((k, id(v)) for k, v in sorted(node.boundary_exprs.items())),
+                id(node.volume_value_expr) if node.volume_value_expr is not None else None,
+                id(node.volume_grad_expr) if node.volume_grad_expr is not None else None,
+                tuple((k, id(v)) for k, v in sorted(node.boundary_value_exprs.items())),
                 node.num_total_nodes,
             )
 
@@ -2005,11 +2016,15 @@ def cse(expr: Placeholder) -> Placeholder:
                     region_id=node.region_id,
                 )
         elif isinstance(node, GroupedAssembly):
-            new_volume = _visit(node.volume_expr) if node.volume_expr is not None else None
+            new_volume_value = _visit(node.volume_value_expr) if node.volume_value_expr is not None else None
+            new_volume_grad = _visit(node.volume_grad_expr) if node.volume_grad_expr is not None else None
             new_boundary = {}
-            changed = new_volume is not node.volume_expr
+            changed = (
+                new_volume_value is not node.volume_value_expr
+                or new_volume_grad is not node.volume_grad_expr
+            )
 
-            for region_id, bnd_expr in node.boundary_exprs.items():
+            for region_id, bnd_expr in node.boundary_value_exprs.items():
                 new_expr = _visit(bnd_expr)
                 new_boundary[region_id] = new_expr
                 if new_expr is not bnd_expr:
@@ -2017,7 +2032,8 @@ def cse(expr: Placeholder) -> Placeholder:
 
             if changed:
                 node = GroupedAssembly(
-                    new_volume,
+                    new_volume_value,
+                    new_volume_grad,
                     new_boundary,
                     node.num_total_nodes,
                 )
@@ -2082,9 +2098,11 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
         elif isinstance(node, Assembly):
             visit(node.expr)
         elif isinstance(node, GroupedAssembly):
-            if node.volume_expr is not None:
-                visit(node.volume_expr)
-            for bnd_expr in node.boundary_exprs.values():
+            if node.volume_value_expr is not None:
+                visit(node.volume_value_expr)
+            if node.volume_grad_expr is not None:
+                visit(node.volume_grad_expr)
+            for bnd_expr in node.boundary_value_exprs.values():
                 visit(bnd_expr)
 
     visit(expr)
@@ -2137,9 +2155,11 @@ def collect_tags(expr: Placeholder) -> set:
         elif isinstance(node, Assembly):
             visit(node.expr)
         elif isinstance(node, GroupedAssembly):
-            if node.volume_expr is not None:
-                visit(node.volume_expr)
-            for bnd_expr in node.boundary_exprs.values():
+            if node.volume_value_expr is not None:
+                visit(node.volume_value_expr)
+            if node.volume_grad_expr is not None:
+                visit(node.volume_grad_expr)
+            for bnd_expr in node.boundary_value_exprs.values():
                 visit(bnd_expr)
 
     visit(expr)
@@ -2269,11 +2289,14 @@ def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
             _visit(node.expr, depth + 1)
         elif isinstance(node, GroupedAssembly):
             lines.append(f"{p}GroupedAssembly(nodes={node.num_total_nodes})")
-            if node.volume_expr is not None:
-                lines.append(f"{p}  volume:")
-                _visit(node.volume_expr, depth + 2)
-            for region_id, bnd_expr in node.boundary_exprs.items():
-                lines.append(f"{p}  boundary[{region_id}]:")
+            if node.volume_value_expr is not None:
+                lines.append(f"{p}  volume_value:")
+                _visit(node.volume_value_expr, depth + 2)
+            if node.volume_grad_expr is not None:
+                lines.append(f"{p}  volume_grad:")
+                _visit(node.volume_grad_expr, depth + 2)
+            for region_id, bnd_expr in node.boundary_value_exprs.items():
+                lines.append(f"{p}  boundary_value[{region_id}]:")
                 _visit(bnd_expr, depth + 2)
         elif isinstance(node, ConstantNamespace):
             lines.append(f"{p}ConstantNamespace({node._full_tag})")

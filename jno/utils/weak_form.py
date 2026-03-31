@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
-
+import jax.numpy as jnp
 from ..trace import (
     Placeholder,
     Literal,
@@ -63,6 +63,106 @@ class LoweredWeakForm:
     def boundary_exprs(self) -> Dict[str, Placeholder]:
         return {k: _sum_terms(self.domain, v) for k, v in self.boundary_terms.items()}
 
+    @property
+    def volume_value_terms(self) -> List[Placeholder]:
+        out: List[Placeholder] = []
+        for t in self.terms:
+            if t.support != "volume":
+                continue
+            kind, coeff = _strip_single_test_basis_factor(self.domain, t.expr)
+            if kind == "value":
+                out.append(coeff)
+        return out
+
+
+    @property
+    def boundary_value_terms(self) -> Dict[str, List[Placeholder]]:
+        out: Dict[str, List[Placeholder]] = {}
+        for t in self.terms:
+            if t.support != "boundary":
+                continue
+            kind, coeff = _strip_single_test_basis_factor(self.domain, t.expr)
+            if kind == "grad":
+                raise NotImplementedError(
+                    f"Boundary grad(test) terms are not supported yet for VPINN on region '{t.region_id}'."
+                )
+            out.setdefault(t.region_id, []).append(coeff)
+        return out
+
+    @property
+    def volume_value_expr(self):
+        return _sum_terms(self.domain, self.volume_value_terms)
+
+    @property
+    def volume_grad_terms(self) -> Dict[int, List[Placeholder]]:
+        """
+        Return grad(test) coefficients bucketed by derivative direction.
+
+        Example for 2D scalar Poisson:
+            {
+                0: [u_x term coeffs...],
+                1: [u_y term coeffs...],
+            }
+        """
+        out: Dict[int, List[Placeholder]] = {}
+        for t in self.terms:
+            if t.support != "volume":
+                continue
+
+            if not _contains_testfunction_gradient(self.domain, t.expr):
+                continue
+
+            if not (isinstance(t.expr, BinaryOp) and t.expr.op == "*"):
+                raise ValueError(
+                    f"Expected grad(test) weak-form term to be a product, got {t.expr}"
+                )
+
+            left = t.expr.left
+            right = t.expr.right
+
+            if _is_testfunction_grad(left):
+                dim = _get_testfunction_grad_dim(left)
+                coeff = right
+            elif _is_testfunction_grad(right):
+                dim = _get_testfunction_grad_dim(right)
+                coeff = left
+            else:
+                raise ValueError(
+                    f"Expected one grad(TestFunction) factor in term, got {t.expr}"
+                )
+
+            out.setdefault(dim, []).append(coeff)
+
+        return out
+
+
+    @property
+    def volume_grad_expr(self):
+        """
+        Build a vector coefficient field for grad(test) assembly.
+
+        Returns shape-like traced object corresponding to:
+            stack([sum(coeffs_dim0), sum(coeffs_dim1), ...], axis=-1)
+        """
+        by_dim = self.volume_grad_terms
+        if len(by_dim) == 0:
+            return None
+
+        max_dim = max(by_dim.keys())
+        comps = []
+
+        for d in range(max_dim + 1):
+            comp = _sum_terms(self.domain, by_dim.get(d, []))
+            if comp is None:
+                comp = Literal(0.0)
+            comps.append(comp)
+
+        return FunctionCall(lambda *xs: jnp.stack(xs, axis=-1), comps, name="stack_grad_coeff")
+
+    @property
+    def boundary_value_exprs(self) -> Dict[str, Placeholder]:
+        return {k: _sum_terms(self.domain, v) for k, v in self.boundary_value_terms.items()}
+
 
 # --------------------------------
 # additive-term helpers
@@ -110,6 +210,113 @@ def _contains_node_type(domain, expr, node_type):
 
     return False
 
+def _contains_testfunction_gradient(domain, expr):
+    if isinstance(expr, Jacobian) and isinstance(expr.target, TestFunction):
+        return True
+
+    for attr in ("left", "right", "operand", "args", "expr", "integrand", "target", "variables"):
+        if hasattr(expr, attr):
+            child = getattr(expr, attr)
+            if isinstance(child, (list, tuple)):
+                for c in child:
+                    if _contains_testfunction_gradient(domain, c):
+                        return True
+            elif child is not None:
+                if _contains_testfunction_gradient(domain, child):
+                    return True
+
+    return False
+
+def _is_testfunction_value(node):
+    return isinstance(node, TestFunction)
+
+
+def _is_testfunction_grad(node):
+    return isinstance(node, Jacobian) and isinstance(node.target, TestFunction)
+
+
+def _strip_single_test_basis_factor(domain, expr):
+    """
+    For scalar weak forms, strip exactly one test-function factor from a term.
+
+    Supported recursively through nested multiplications:
+      coeff * phi
+      phi * coeff
+      coeff * grad(phi)
+      grad(phi) * coeff
+      a * (b * phi)
+      a * (b * grad(phi))
+      etc.
+
+    Returns
+    -------
+    kind, coeff_expr
+        kind = "value" or "grad"
+        coeff_expr = expr with exactly one test basis factor removed
+    """
+    if _is_testfunction_value(expr):
+        return "value", Literal(1.0)
+
+    if _is_testfunction_grad(expr):
+        return "grad", Literal(1.0)
+
+    if isinstance(expr, BinaryOp) and expr.op == "*":
+        left = expr.left
+        right = expr.right
+
+        # direct patterns
+        if _is_testfunction_value(left):
+            return "value", right
+        if _is_testfunction_value(right):
+            return "value", left
+
+        if _is_testfunction_grad(left):
+            return "grad", right
+        if _is_testfunction_grad(right):
+            return "grad", left
+
+        # recursive patterns: try stripping from left subtree
+        try:
+            kind, coeff_left = _strip_single_test_basis_factor(domain, left)
+            return kind, coeff_left * right
+        except ValueError:
+            pass
+
+        # recursive patterns: try stripping from right subtree
+        try:
+            kind, coeff_right = _strip_single_test_basis_factor(domain, right)
+            return kind, left * coeff_right
+        except ValueError:
+            pass
+
+    raise ValueError(
+        "Could not strip a single TestFunction basis factor from weak-form term. "
+        f"Unsupported term structure: {expr}"
+    )
+
+def _get_testfunction_grad_dim(expr):
+    """
+    Return the physical derivative direction index for a grad(TestFunction) term.
+
+    Expected form:
+        Jacobian(TestFunction(...), [Variable(...)])
+
+    Returns
+    -------
+    int
+        derivative direction, e.g. 0 for x, 1 for y
+    """
+    if not (isinstance(expr, Jacobian) and isinstance(expr.target, TestFunction)):
+        raise ValueError(f"Expected Jacobian(TestFunction(...)), got {expr}")
+
+    if len(expr.variables) != 1:
+        raise ValueError(f"Expected one differentiation variable in {expr}")
+
+    var = expr.variables[0]
+    if not hasattr(var, "dim") or not isinstance(var.dim, (list, tuple)):
+        raise ValueError(f"Could not infer grad direction from variable {var}")
+
+    return int(var.dim[0])
 
 def _collect_variational_metas(domain, node, out):
     if node is None:
@@ -265,10 +472,15 @@ def _rebind_variational_variables(domain, node, target_support: str, target_regi
         return node
 
     if isinstance(node, GroupedAssembly):
-        vol_expr = _rebind_variational_variables(domain, node.volume_expr, target_support, target_region_id) if node.volume_expr is not None else None
-        bnd_exprs = {k: _rebind_variational_variables(domain, v, target_support, target_region_id) for k, v in node.boundary_exprs.items()}
-        if vol_expr is not node.volume_expr or any(bnd_exprs[k] is not node.boundary_exprs[k] for k in bnd_exprs):
-            rebuilt = GroupedAssembly(vol_expr, bnd_exprs, node.num_total_nodes)
+        vol_val = _rebind_variational_variables(domain, node.volume_value_expr, target_support, target_region_id) if node.volume_value_expr is not None else None
+        vol_grad = _rebind_variational_variables(domain, node.volume_grad_expr, target_support, target_region_id) if node.volume_grad_expr is not None else None
+        bnd_exprs = {k: _rebind_variational_variables(domain, v, target_support, target_region_id) for k, v in node.boundary_value_exprs.items()}
+        if (
+            vol_val is not node.volume_value_expr
+            or vol_grad is not node.volume_grad_expr
+            or any(bnd_exprs[k] is not node.boundary_value_exprs[k] for k in bnd_exprs)
+        ):
+            rebuilt = GroupedAssembly(vol_val, vol_grad, bnd_exprs, node.num_total_nodes)
             rebuilt.op_id = node.op_id
             return rebuilt
         return node
@@ -360,10 +572,15 @@ def _substitute_trial_for_vpinn(domain, node, trial_value, target_support: Optio
         return node
 
     if isinstance(node, GroupedAssembly):
-        vol_expr = _substitute_trial_for_vpinn(domain, node.volume_expr, trial_value, target_support, target_region_id) if node.volume_expr is not None else None
-        bnd_exprs = {k: _substitute_trial_for_vpinn(domain, v, trial_value, target_support, target_region_id) for k, v in node.boundary_exprs.items()}
-        if vol_expr is not node.volume_expr or any(bnd_exprs[k] is not node.boundary_exprs[k] for k in bnd_exprs):
-            rebuilt = GroupedAssembly(vol_expr, bnd_exprs, node.num_total_nodes)
+        vol_val = _substitute_trial_for_vpinn(domain, node.volume_value_expr, trial_value, target_support, target_region_id) if node.volume_value_expr is not None else None
+        vol_grad = _substitute_trial_for_vpinn(domain, node.volume_grad_expr, trial_value, target_support, target_region_id) if node.volume_grad_expr is not None else None
+        bnd_exprs = {k: _substitute_trial_for_vpinn(domain, v, trial_value, target_support, target_region_id) for k, v in node.boundary_value_exprs.items()}
+        if (
+            vol_val is not node.volume_value_expr
+            or vol_grad is not node.volume_grad_expr
+            or any(bnd_exprs[k] is not node.boundary_value_exprs[k] for k in bnd_exprs)
+        ):
+            rebuilt = GroupedAssembly(vol_val, vol_grad, bnd_exprs, node.num_total_nodes)
             rebuilt.op_id = node.op_id
             return rebuilt
         return node
@@ -391,6 +608,10 @@ def lower_weak_form(domain, expr, *, trial_value=None, for_target: str = "fem") 
                 target_support=support,
                 target_region_id=region_id,
             )
+            if for_target == "vpinn" and _contains_node_type(domain, term_for_target, TrialFunction):
+                raise RuntimeError(
+                    "VPINN lowering failed: a TrialFunction is still present after substitution."
+                )
 
         lowered_terms.append(
             LoweredWeakTerm(
@@ -407,7 +628,22 @@ def lower_weak_form(domain, expr, *, trial_value=None, for_target: str = "fem") 
 
 def assemble_weak_form(domain, expr, target="vpinn", **kwargs):
     if target == "vpinn":
-        ir = lower_weak_form(domain, expr, trial_value=kwargs.get("u_net", None), for_target="vpinn")
+        u_net = kwargs.get("u_net", None)
+
+        # Only require u_net when the weak form actually contains a TrialFunction.
+        has_trial = _contains_node_type(domain, expr, TrialFunction)
+
+        if has_trial and u_net is None:
+            raise ValueError(
+                "For target='vpinn', you must pass u_net=... when the weak form contains a TrialFunction."
+            )
+
+        ir = lower_weak_form(
+            domain,
+            expr,
+            trial_value=u_net,
+            for_target="vpinn",
+        )
         return _assemble_vpinn_from_ir(ir, **kwargs)
 
     if target in {"fem_system", "fem_residual"}:
@@ -415,14 +651,30 @@ def assemble_weak_form(domain, expr, target="vpinn", **kwargs):
         if target == "fem_system":
             from .fem_route import _assemble_fem_system_from_ir
             return _assemble_fem_system_from_ir(domain, ir, **kwargs)
+
         from .fem_route import _assemble_fem_residual_from_ir
         return _assemble_fem_residual_from_ir(domain, ir, **kwargs)
 
-    raise ValueError(f"Unknown assembly target '{target}'. Supported: 'vpinn', 'fem_system', 'fem_residual'")
+    raise ValueError(
+        f"Unknown assembly target '{target}'. "
+        "Supported: 'vpinn', 'fem_system', 'fem_residual'"
+    )
 
 
 def _assemble_vpinn_from_ir(ir: LoweredWeakForm, **kwargs):
-    if ir.volume_expr is None and len(ir.boundary_exprs) == 0:
+    if (
+        ir.volume_value_expr is None
+        and ir.volume_grad_expr is None
+        and len(ir.boundary_value_exprs) == 0
+    ):
         raise ValueError("No terms found for VPINN assembly.")
-    return GroupedAssembly(ir.volume_expr, ir.boundary_exprs, ir.domain)
+
+    num_total_nodes = int(ir.domain.fem_context["num_total_nodes"])
+
+    return GroupedAssembly(
+        ir.volume_value_expr,
+        ir.volume_grad_expr,
+        ir.boundary_value_exprs,
+        num_total_nodes,
+    )
 

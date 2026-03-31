@@ -745,51 +745,29 @@ class domain(MeshIOMixin):
 
         This sets up the FEM mesh, boundary-condition data, quadrature data,
         and cached tensors needed for weak-form assembly and FEM solves.
-
-        Parameters
-        ----------
-        element_type : str, default="TRI3"
-            Finite-element type used by FEAX.
-        quad_degree : int, default=2
-            Quadrature degree for volume and boundary integration.
-        neumann_tags : list[str], optional
-            Boundary tags used for Neumann or surface terms.
-        dirichlet_tags : list[str], optional
-            Boundary tags with Dirichlet constraints.
-        dirichlet_value_fns : dict | None, optional
-            Prescribed Dirichlet value functions by boundary tag.
-        fem_solver : bool, default=False
-            Whether to enable FEM-solver mode.
-        vec : int, default=1
-            Number of field components.
-        bcs : list | None, optional
-            New-style boundary-condition descriptors.
-
-        Returns
-        -------
-        domain
-            The current domain with FEM context initialized.
         """
         if self.mesh is None:
             raise ValueError("Mesh must be loaded before initializing FEM context.")
+
         self._variational_initialized = True
         self._variational_sampling_registry = {}
+
+        import jax
         import jax.numpy as jnp
         import numpy as onp
         import feax as fe
-        from scipy.spatial import KDTree  # Ensuring this is available locally
+        from feax.DCboundary import DirichletBCConfig, DirichletBCSpec
+        from scipy.spatial import KDTree
         from ..utils.fem_route import expand_bcs
 
         if bcs is not None:
-            try:
-                from ..utils.fem_route import expand_bcs
-            except ImportError as e:
-                raise ImportError("FEM support is not available. Install the FEM/dev extras to use init_fem(...).") from e
-
             if dirichlet_tags or neumann_tags or dirichlet_value_fns is not None:
-                raise ValueError("Use either 'bcs=[...]' or the legacy " "'dirichlet_tags/neumann_tags/dirichlet_value_fns' arguments, not both.")
-
+                raise ValueError(
+                    "Use either 'bcs=[...]' or the legacy "
+                    "'dirichlet_tags/neumann_tags/dirichlet_value_fns' arguments, not both."
+                )
             dirichlet_tags, dirichlet_value_fns, neumann_tags = expand_bcs(bcs, vec=vec)
+
         meshio_type_map = {
             "TRI3": "triangle",
             "QUAD4": "quad",
@@ -805,7 +783,9 @@ class domain(MeshIOMixin):
             ele_type=element_type,
         )
 
-        # --- Location functions for Neumann ---
+        # ---------------------------------------------------------
+        # Boundary tags -> FEAX location functions
+        # ---------------------------------------------------------
         location_fns = []
         valid_tags = []
 
@@ -814,9 +794,9 @@ class domain(MeshIOMixin):
             if loc_fn is None:
                 self.log.warning(f"Neumann tag '{tag}' not found in mesh tags. Skipping.")
                 continue
-
             valid_tags.append(tag)
             location_fns.append(loc_fn)
+
         dirichlet_bc_info = self._build_dirichlet_bc_info(
             dirichlet_tags,
             dirichlet_value_fns,
@@ -834,14 +814,17 @@ class domain(MeshIOMixin):
                 return [lambda u, x: jnp.zeros((1,))] * len(location_fns)
 
         prob = DummyProblem(
-            feax_mesh,
-            vec=vec,
-            dim=self.dimension,
-            ele_type=element_type,
-            gauss_order=quad_degree,
-            dirichlet_bc_info=dirichlet_bc_info,
-            location_fns=location_fns,
-        )
+                feax_mesh,
+                vec=vec,
+                dim=self.dimension,
+                ele_type=element_type,
+                gauss_order=quad_degree,
+                location_fns=location_fns,
+            )
+        print("len(prob.boundary_inds_list) =", len(prob.boundary_inds_list))
+        print("len(prob.selected_face_shape_grads) =", len(prob.selected_face_shape_grads))
+        print("len(prob.nanson_scale) =", len(prob.nanson_scale))
+        print("len(prob.selected_face_shape_vals) =", len(prob.selected_face_shape_vals))
         self._fem_solver_enabled = bool(fem_solver)
 
         # Neutral FEM backend metadata used by the FEAX-backed fem_route.py
@@ -863,121 +846,255 @@ class domain(MeshIOMixin):
 
         fe = prob.fes[0]
 
-        # --- Identify Dirichlet node indices ---
+        # ---------------------------------------------------------
+        # Dirichlet node ids
+        # ---------------------------------------------------------
         dirichlet_node_ids: List[int] = []
-        for node_inds in getattr(fe, "node_inds_list", []):
-            dirichlet_node_ids.extend(np.asarray(node_inds).reshape(-1).tolist())
 
-        dirichlet_nodes = jnp.array(sorted(set(dirichlet_node_ids)), dtype=jnp.int32) if dirichlet_node_ids else jnp.array([], dtype=jnp.int32)
-        # --- Precompute Constants for Fast Assembly ---
-        shape_vals_jax = jnp.asarray(fe.shape_vals)
-        shape_grads_jax = jnp.asarray(fe.shape_grads)
-        JxW_jax = jnp.asarray(fe.JxW)
+        if len(dirichlet_tags) > 0:
+            try:
+                bc_config = DirichletBCConfig()
+
+                for tag in dirichlet_tags:
+                    loc_fn = self._make_tag_location_fn(tag)
+                    if loc_fn is None:
+                        self.log.warning(f"Dirichlet tag '{tag}' not found in mesh tags. Skipping.")
+                        continue
+
+                    value_obj = 0.0
+                    if dirichlet_value_fns is not None and tag in dirichlet_value_fns:
+                        value_obj = dirichlet_value_fns[tag]
+
+                    bc_config.add(loc_fn, "all", value_obj)
+
+                if len(bc_config.specs) > 0:
+                    bc = bc_config.create_bc(prob)
+                    bc_rows = onp.asarray(bc.bc_rows).reshape(-1)
+                    dirichlet_node_ids = (bc_rows // int(vec)).astype(int).tolist()
+
+            except Exception as e:
+                self.log.warning(f"FEAX-native DirichletBC extraction failed, falling back to geometric extraction: {e}")
+
+        if len(dirichlet_node_ids) == 0 and len(dirichlet_tags) > 0:
+            pts = onp.asarray(fe.points)
+            for tag in dirichlet_tags:
+                loc_fn = self._make_tag_location_fn(tag)
+                if loc_fn is None:
+                    continue
+
+                for i, p in enumerate(pts):
+                    try:
+                        inside = bool(loc_fn(p))
+                    except Exception:
+                        inside = False
+                    if inside:
+                        dirichlet_node_ids.append(i)
+
+        dirichlet_nodes = (
+            jnp.array(sorted(set(dirichlet_node_ids)), dtype=jnp.int32)
+            if len(dirichlet_node_ids) > 0
+            else jnp.array([], dtype=jnp.int32)
+        )
+
+        print("num extracted dirichlet nodes =", len(dirichlet_nodes))
+        # ---------------------------------------------------------
+        # Volume FEM context for VPINN / grouped weak-form assembly
+        # Use FEAX Problem tensors directly so VPINN sees the same
+        # physical gradients / weights that FEAX assembly uses.
+        # ---------------------------------------------------------
         cells_jax = jnp.asarray(fe.cells, dtype=jnp.int32)
-        flat_cells = cells_jax.flatten()
+        num_cells = cells_jax.shape[0]
+        num_local_nodes = cells_jax.shape[1]
 
-        # Precompute Volume Normalization Areas (runs ONLY ONCE!)
+        # FEAX shape values are reference-shape values, shared across cells
+        shape_vals_jax = jnp.asarray(fe.shape_vals)   # (n_q, n_loc)
+
+        # FEAX Problem already stores PHYSICAL gradients and weighted test gradients
+        # for all variables. Since this is the single-variable scalar case, take var 0.
+        shape_grads_phys_jax = jnp.asarray(prob.shape_grads[:, :, :num_local_nodes, :])      # (n_cells, n_q, n_loc, dim)
+        v_grads_JxW_jax = jnp.asarray(prob.v_grads_JxW[:, :, :num_local_nodes, 0, :])        # (n_cells, n_q, n_loc, dim)
+        JxW_jax = jnp.asarray(prob.JxW[:, 0, :])                                              # (n_cells, n_q)
+        quad_points = jnp.asarray(prob.physical_quad_points).reshape(-1, self.dimension)      # (n_cells*n_q, dim)
+
+        num_quads = JxW_jax.shape[1]
+        dim = shape_grads_phys_jax.shape[-1]
+
+        # IMPORTANT:
+        # flat_cells must stay as (n_cells, n_loc); grouped assembly later flattens it
+        flat_cells = cells_jax
+
+        # Flatten for jNO TraceEvaluator consumption
+        N_flat = jnp.tile(shape_vals_jax[None, :, :], (num_cells, 1, 1)).reshape(-1, num_local_nodes)
+        dN_dx_flat = shape_grads_phys_jax.reshape(-1, num_local_nodes, dim)
+        v_grads_JxW_flat = v_grads_JxW_jax.reshape(-1, num_local_nodes, dim)
+
+        # Lumped nodal normalization areas
         local_areas = jnp.einsum("cq,qa->ca", JxW_jax, shape_vals_jax)
-        global_areas = jax.ops.segment_sum(local_areas.flatten(), flat_cells, num_segments=fe.num_total_nodes)
-        num_cells, num_quads, num_local_nodes, dim = shape_grads_jax.shape
-        N_flat = jnp.tile(shape_vals_jax[None, ...], (num_cells, 1, 1)).reshape(-1, num_local_nodes)
-        dN_dx_flat = shape_grads_jax.reshape(-1, num_local_nodes, dim)
+        global_areas = jax.ops.segment_sum(
+            local_areas.reshape(-1),
+            flat_cells.reshape(-1),
+            num_segments=fe.num_total_nodes,
+        )
 
-        # Extract standard Volume Context
         self.fem_context = {
             "cells": cells_jax,
             "flat_cells": flat_cells,
             "global_areas": global_areas,
             "N_flat": N_flat,
             "dN_dx_flat": dN_dx_flat,
+            "v_grads_JxW_flat": v_grads_JxW_flat,
             "JxW": JxW_jax,
-            "num_total_nodes": fe.num_total_nodes,
+            "quad_points": quad_points,
+            "num_total_nodes": int(fe.num_total_nodes),
             "boundary_nodes": jnp.asarray(self._extract_points_from_mesh(self.mesh), dtype=jnp.int32),
             "dirichlet_nodes": dirichlet_nodes,
             "surface_data": {},
         }
-        self._mesh_pool["fem_gauss"] = jnp.asarray(fe.get_physical_quad_points()).reshape(-1, self.dimension)
+
+        self._mesh_pool["fem_gauss"] = quad_points
         self._register_variational_sample(
             sample_tag="fem_gauss",
             support="volume",
             region_id="volume",
             context_tag="fem_gauss",
         )
+
         self._fem_dirichlet_tags = list(dirichlet_tags)
         self._fem_neumann_tags = list(neumann_tags)
         self._fem_dirichlet_value_fns = dirichlet_value_fns if dirichlet_value_fns is not None else {}
-        # --- Extract Native jax-fem Nanson Scales for Neumann ---
-        for i, tag in enumerate(valid_tags):
-            inds = prob.boundary_inds_list[i]
-            if len(inds) > 0:
-                _, nanson_scale = fe.get_face_shape_grads(inds)
 
-                parent_cells = fe.cells[inds[:, 0]]
-                face_ids = inds[:, 1]
-                face_shape_vals = fe.face_shape_vals[face_ids]
+        # Debug prints
+        print("has prob.boundary_inds_list =", hasattr(prob, "boundary_inds_list"))
+        print("has fe.boundary_inds_list   =", hasattr(fe, "boundary_inds_list"))
+        print("prob boundary attrs =", [a for a in dir(prob) if "boundary" in a.lower()])
+        print("fe boundary attrs   =", [a for a in dir(fe) if "boundary" in a.lower()])
 
-                physical_coos = onp.take(fe.points, fe.cells, axis=0)
-                selected_coos = physical_coos[inds[:, 0]]
-                physical_face_quads = onp.einsum("fqn,fnd->fqd", face_shape_vals, selected_coos)
+        print("N_flat shape       =", self.fem_context["N_flat"].shape)
+        print("dN_dx_flat shape   =", self.fem_context["dN_dx_flat"].shape)
+        print("JxW shape          =", self.fem_context["JxW"].shape)
+        print("flat_cells shape   =", self.fem_context["flat_cells"].shape)
+        print("quad_points shape  =", self.fem_context["quad_points"].shape)
+        print("global_areas shape =", self.fem_context["global_areas"].shape)
+        print(
+            "global_areas min/max =",
+            float(jnp.min(self.fem_context["global_areas"])),
+            float(jnp.max(self.fem_context["global_areas"])),
+        )
 
-                # Precompute boundary normalization areas for this Neumann tag
-                local_boundary_areas = jnp.einsum("fq,fqn->fn", jnp.asarray(nanson_scale), jnp.asarray(face_shape_vals))
-                global_boundary_areas = jax.ops.segment_sum(local_boundary_areas.flatten(), jnp.asarray(parent_cells, dtype=jnp.int32).flatten(), num_segments=fe.num_total_nodes)
+        # ---------------------------------------------------------
+        # Boundary extraction for Neumann / surface weak forms
+        # ---------------------------------------------------------
+        boundary_inds_list = getattr(prob, "boundary_inds_list", None)
 
-                quad_pts_flat_np = onp.asarray(physical_face_quads).reshape(-1, self.dimension)
-                quad_pts_flat = jnp.asarray(quad_pts_flat_np)
+        if boundary_inds_list is None or len(boundary_inds_list) == 0:
+            if hasattr(fe, "get_boundary_conditions_inds"):
+                boundary_inds_list = fe.get_boundary_conditions_inds(location_fns)
+            else:
+                boundary_inds_list = getattr(fe, "boundary_inds_list", None)
 
-                # Map quadrature points to boundary normals using nearest tagged boundary point.
-                quad_normals = None
-                if tag in self.normals_by_tag and tag in self._mesh_pool:
-                    tag_pts_np = onp.asarray(self._mesh_pool[tag])[:, : self.dimension]
-                    tag_nrm_np = onp.asarray(self.normals_by_tag[tag])[:, : self.dimension]
+        if boundary_inds_list is None:
+            raise RuntimeError(
+                "Could not find or build boundary_inds_list from the FEM problem or FE space."
+            )
 
-                    if len(tag_pts_np) == len(tag_nrm_np) and len(tag_pts_np) > 0:
-                        tree = KDTree(tag_pts_np)
-                        _, nn_idx = tree.query(quad_pts_flat_np)
-                        quad_normals_np = tag_nrm_np[onp.asarray(nn_idx, dtype=int)]
-                        quad_normals = jnp.asarray(quad_normals_np)
+        if len(boundary_inds_list) < len(valid_tags):
+            self.log.warning(
+                f"Only {len(boundary_inds_list)} boundary index sets found for "
+                f"{len(valid_tags)} requested Neumann tags."
+            )
 
-                        # expose normals on the quadrature tag so domain.variable("gauss_tag", normals=True) works
-                        self.normals_by_tag[f"gauss_{tag}"] = quad_normals_np
+        for tag, inds in zip(valid_tags, boundary_inds_list):
+            if len(inds) == 0:
+                self.log.info(f"FEAX surface extraction: matched 0 faces for '{tag}'")
+                continue
 
-                self.fem_context["surface_data"][tag] = {
-                    "flat_parent_nodes": jnp.asarray(parent_cells, dtype=jnp.int32).flatten(),
-                    "face_shape_vals": jnp.asarray(face_shape_vals),
-                    "nanson_scale": jnp.asarray(nanson_scale),
-                    "global_boundary_areas": global_boundary_areas,
-                    "quad_points": quad_pts_flat,
-                    "quad_normals": quad_normals,
-                }
+            # Find matching FEAX boundary slot
+            bidx = valid_tags.index(tag)
 
-                self._mesh_pool[f"gauss_{tag}"] = quad_pts_flat
-                self._register_variational_sample(
-                    sample_tag=f"gauss_{tag}",
-                    support="boundary",
-                    region_id=tag,
-                    context_tag=f"gauss_{tag}",
-                )
-                self.log.info(f"FEAX surface extraction: matched {len(inds)} faces for '{tag}'")
-        # ====================================================================
-        # THE FIX: Pad FEM arrays with Batch (B=1) and Time (T=1) dimensions
-        # This prevents trace_compiler from mistaking the spatial/node
-        # dimensions for the Batch dimension during vmap.
-        # ====================================================================
+            inds = onp.asarray(inds)
 
-        keys_to_pad = ["cells", "flat_cells", "global_areas", "N_flat", "dN_dx_flat", "JxW", "boundary_nodes", "dirichlet_nodes"]
-        for key in keys_to_pad:
-            if key in self.fem_context and hasattr(self.fem_context[key], "ndim"):
-                self.fem_context[key] = jnp.expand_dims(self.fem_context[key], axis=(0, 1))
+            # Pull boundary tensors directly from FEAX Problem
+            face_shape_grads = jnp.asarray(prob.selected_face_shape_grads[bidx][:, :, :num_local_nodes, :])   # (n_faces, n_fq, n_loc, dim)
+            nanson_scale = jnp.asarray(prob.nanson_scale[bidx][:, 0, :])                                       # (n_faces, n_fq)
+            face_shape_vals = jnp.asarray(prob.selected_face_shape_vals[bidx][:, :, :num_local_nodes])         # (n_faces, n_fq, n_loc)
+            physical_face_quads = jnp.asarray(prob.physical_surface_quad_points[bidx])                          # (n_faces, n_fq, dim)
 
-        # Also pad the nested jax-fem surface/neumann arrays if they exist
-        for tag_name, s_data in self.fem_context.get("surface_data", {}).items():
-            for skey, s_arr in s_data.items():
-                if hasattr(s_arr, "ndim"):
-                    s_data[skey] = jnp.expand_dims(s_arr, axis=(0, 1))
-                # Expose the integration arrays to jNO's trace evaluator
+            parent_cells = fe.cells[inds[:, 0]]
+
+            # Precompute boundary normalization areas for this Neumann tag
+            local_boundary_areas = jnp.einsum(
+                "fq,fqn->fn",
+                nanson_scale,
+                face_shape_vals,
+            )
+            global_boundary_areas = jax.ops.segment_sum(
+                local_boundary_areas.reshape(-1),
+                jnp.asarray(parent_cells, dtype=jnp.int32).reshape(-1),
+                num_segments=fe.num_total_nodes,
+            )
+
+            quad_pts_flat_np = onp.asarray(physical_face_quads).reshape(-1, self.dimension)
+            quad_pts_flat = jnp.asarray(quad_pts_flat_np)
+
+            quad_normals = None
+            if tag in self.normals_by_tag and tag in self._mesh_pool:
+                tag_pts_np = onp.asarray(self._mesh_pool[tag])[:, : self.dimension]
+                tag_nrm_np = onp.asarray(self.normals_by_tag[tag])[:, : self.dimension]
+
+                if len(tag_pts_np) == len(tag_nrm_np) and len(tag_pts_np) > 0:
+                    tree = KDTree(tag_pts_np)
+                    _, nn_idx = tree.query(quad_pts_flat_np)
+                    quad_normals_np = tag_nrm_np[onp.asarray(nn_idx, dtype=int)]
+                    quad_normals = jnp.asarray(quad_normals_np)
+
+                    # expose normals on the quadrature tag so domain.variable("gauss_tag", normals=True) works
+                    self.normals_by_tag[f"gauss_{tag}"] = quad_normals_np
+
+            self.fem_context["surface_data"][tag] = {
+                "flat_parent_nodes": jnp.asarray(parent_cells, dtype=jnp.int32).reshape(-1),
+                "face_shape_vals": face_shape_vals,
+                "face_shape_grads": face_shape_grads,
+                "nanson_scale": nanson_scale,
+                "global_boundary_areas": global_boundary_areas,
+                "quad_points": quad_pts_flat,
+                "quad_normals": quad_normals,
+            }
+            print(f"surface_data[{tag}]['face_shape_vals'].shape =", self.fem_context["surface_data"][tag]["face_shape_vals"].shape)
+            print(f"surface_data[{tag}]['face_shape_grads'].shape =", self.fem_context["surface_data"][tag]["face_shape_grads"].shape)
+            print(f"surface_data[{tag}]['nanson_scale'].shape =", self.fem_context["surface_data"][tag]["nanson_scale"].shape)
+            self._mesh_pool[f"gauss_{tag}"] = quad_pts_flat
+            self._register_variational_sample(
+                sample_tag=f"gauss_{tag}",
+                support="boundary",
+                region_id=tag,
+                context_tag=f"gauss_{tag}",
+            )
+            self.log.info(f"FEAX surface extraction: matched {len(inds)} faces for '{tag}'")
+
+        # ---------------------------------------------------------
+        # Pad FEM arrays with Batch (B=1) and Time (T=1) dimensions
+        # ---------------------------------------------------------
+        # keys_to_pad = [
+        #     "cells",
+        #     "flat_cells",
+        #     "global_areas",
+        #     "N_flat",
+        #     "dN_dx_flat",
+        #     "JxW",
+        #     "quad_points",
+        #     "boundary_nodes",
+        #     "dirichlet_nodes",
+        # ]
+        # for key in keys_to_pad:
+        #     if key in self.fem_context and hasattr(self.fem_context[key], "ndim"):
+        #         self.fem_context[key] = jnp.expand_dims(self.fem_context[key], axis=(0, 1))
+
+        # for tag_name, s_data in self.fem_context.get("surface_data", {}).items():
+        #     for skey, s_arr in s_data.items():
+        #         if hasattr(s_arr, "ndim"):
+        #             s_data[skey] = jnp.expand_dims(s_arr, axis=(0, 1))
+
         self.context.update(self.fem_context)
-
         return self
 
     def _make_tag_location_fn(self, tag):

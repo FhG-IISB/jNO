@@ -154,9 +154,11 @@ class TraceCompiler:
             elif isinstance(node, Assembly):
                 visit(node.expr)
             elif isinstance(node, GroupedAssembly):
-                if node.volume_expr is not None:
-                    visit(node.volume_expr)
-                for bnd_expr in node.boundary_exprs.values():
+                if node.volume_value_expr is not None:
+                    visit(node.volume_value_expr)
+                if node.volume_grad_expr is not None:
+                    visit(node.volume_grad_expr)
+                for bnd_expr in node.boundary_value_exprs.values():
                     visit(bnd_expr)
 
         visit(expr)
@@ -523,6 +525,19 @@ class TraceCompiler:
         """
         TraceEvaluator = _get_evaluator_class()
         TIME_TAG = "__time__"
+        METADATA_TAGS = {
+        "JxW",
+        "flat_cells",
+        "global_areas",
+        "N_flat",
+        "dN_dx_flat",
+        "dirichlet_nodes",
+        "cells",
+        "quad_points",
+        "boundary_nodes",
+        "surface_data",
+        "v_grads_JxW_flat"
+    }
 
         def evaluate_single_point_set(params, context_single, key):
             """Evaluate for a single (N, D) context — no batch or time."""
@@ -569,7 +584,7 @@ class TraceCompiler:
             # __time__ is (T, 1) — skip it when finding B.
             batched_sizes = []
             for tag, arr in zip(tag_order, ctx_tuple):
-                if tag == TIME_TAG:
+                if tag == TIME_TAG or tag in METADATA_TAGS:
                     continue
                 if hasattr(arr, "ndim") and arr.ndim >= 1:
                     batched_sizes.append(arr.shape[0])
@@ -593,8 +608,8 @@ class TraceCompiler:
                     indices = jnp.arange(0, B, 1)
 
                 def subset_entry(tag_name, arr):
-                    if tag_name == TIME_TAG:
-                        return arr  # not batched
+                    if tag_name == TIME_TAG or tag_name in METADATA_TAGS:
+                        return arr
                     if hasattr(arr, "ndim") and arr.ndim >= 1 and arr.shape[0] == B:
                         return arr[indices]
                     return arr
@@ -606,15 +621,16 @@ class TraceCompiler:
             # After vmap peels B, spatial arrays become (T, N, D).
             # __time__ is (T, 1) and must NOT be vmapped — pass via
             # closure instead.
-            time_arr = None  # will be set if __time__ is present
-            time_idx_in_order = None
-
+            time_arr = None
             spatial_tag_order = []
             spatial_ctx = []
-            for i, (tag, arr) in enumerate(zip(tag_order, ctx_tuple)):
+            metadata_ctx = {}
+
+            for tag, arr in zip(tag_order, ctx_tuple):
                 if tag == TIME_TAG:
-                    time_arr = jnp.asarray(arr)  # (T, 1)
-                    time_idx_in_order = i
+                    time_arr = jnp.asarray(arr)
+                elif tag in METADATA_TAGS:
+                    metadata_ctx[tag] = arr
                 else:
                     spatial_tag_order.append(tag)
                     spatial_ctx.append(arr)
@@ -676,12 +692,14 @@ class TraceCompiler:
                     windowed_ctx: tuple of (W, N, D) or non-spatial arrays.
                     t_wind: (W, 1) time slice, or dummy scalar when time_arr is None.
                     """
-                    ctx_dict = {}
+                    ctx_dict = dict(metadata_ctx)
+
                     for tag, arr in zip(spatial_tag_order, windowed_ctx):
                         if W == 1 and hasattr(arr, "ndim") and arr.ndim >= 2:
-                            ctx_dict[tag] = arr[0]  # (1, N, D) → (N, D) — scalar-step compat
+                            ctx_dict[tag] = arr[0]
                         else:
-                            ctx_dict[tag] = arr  # (W, N, D)
+                            ctx_dict[tag] = arr
+
                     if time_arr is not None:
                         ctx_dict[TIME_TAG] = t_wind[0] if W == 1 else t_wind
                     return evaluate_single_point_set(params, ctx_dict, key=rng_key)
@@ -742,6 +760,19 @@ class TraceCompiler:
         """
         TraceEvaluator = _get_evaluator_class()
         TIME_TAG = "__time__"
+        METADATA_TAGS = {
+            "JxW",
+            "flat_cells",
+            "global_areas",
+            "N_flat",
+            "dN_dx_flat",
+            "dirichlet_nodes",
+            "cells",
+            "quad_points",
+            "boundary_nodes",
+            "surface_data",
+            "v_grads_JxW_flat"
+        }
 
         def evaluate_single_point_set(params, context_single, key):
             """Evaluate ALL expressions on one (N, D) context — shared evaluator."""
@@ -764,7 +795,7 @@ class TraceCompiler:
 
             batched_sizes = []
             for tag, arr in zip(tag_order, ctx_tuple):
-                if tag == TIME_TAG:
+                if tag == TIME_TAG or tag in METADATA_TAGS:
                     continue
                 if hasattr(arr, "ndim") and arr.ndim >= 1:
                     batched_sizes.append(arr.shape[0])
@@ -787,7 +818,7 @@ class TraceCompiler:
                     indices = jnp.arange(0, B, 1)
 
                 def subset_entry(tag_name, arr):
-                    if tag_name == TIME_TAG:
+                    if tag_name == TIME_TAG or tag_name in METADATA_TAGS:
                         return arr
                     if hasattr(arr, "ndim") and arr.ndim >= 1 and arr.shape[0] == B:
                         return arr[indices]
@@ -799,9 +830,13 @@ class TraceCompiler:
             time_arr = None
             spatial_tag_order = []
             spatial_ctx = []
+            metadata_ctx = {}
+
             for tag, arr in zip(tag_order, ctx_tuple):
                 if tag == TIME_TAG:
                     time_arr = jnp.asarray(arr)
+                elif tag in METADATA_TAGS:
+                    metadata_ctx[tag] = arr
                 else:
                     spatial_tag_order.append(tag)
                     spatial_ctx.append(arr)
@@ -848,12 +883,14 @@ class TraceCompiler:
                     start = zero_idx
 
                 def eval_window(windowed_ctx, t_wind):
-                    ctx_dict = {}
+                    ctx_dict = dict(metadata_ctx)
+
                     for tag, arr in zip(spatial_tag_order, windowed_ctx):
                         if W == 1 and hasattr(arr, "ndim") and arr.ndim >= 2:
                             ctx_dict[tag] = arr[0]
                         else:
                             ctx_dict[tag] = arr
+
                     if time_arr is not None:
                         ctx_dict[TIME_TAG] = t_wind[0] if W == 1 else t_wind
                     return evaluate_single_point_set(params, ctx_dict, key=rng_key)

@@ -4,6 +4,7 @@ from typing import Dict, List, Callable, Tuple
 import jax
 import jax.numpy as jnp
 import inspect
+import numpy as np
 
 from .trace import (
     Placeholder,
@@ -683,6 +684,8 @@ class TraceEvaluator:
         # ── Spatial derivative ──
         tag = bound_var.tag
         points = ctx.context[bound_var.tag]
+        while hasattr(points, "ndim") and points.ndim > 2 and points.shape[0] == 1:
+            points = jnp.squeeze(points, axis=0)
         n_vars = len(variables)
         var_dims = [(i, vi.dim[0]) for i, vi in enumerate(variables)]
 
@@ -957,62 +960,193 @@ class TraceEvaluator:
         eye = jnp.eye(n_comp, dtype=shape_vals.dtype)
         return shape_vals[:, :, None, None] * eye[None, None, :, :]
 
-    @staticmethod
-    def _assemble_basis_integrand(integrand, weights, flat_cells, num_total_nodes):
+    def _assemble_value_basis_integrand(self, coeff, shape_vals_flat, weights, flat_entity_nodes, num_total_nodes):
         """
-        Assemble a grouped VPINN integrand into nodal residuals while preserving any
-        trailing component axes.
+        Assemble coeff * phi-type terms.
 
-        Supported shapes
-        ----------------
-        scalar:
-            integrand = (Nq_total, nloc)
+        coeff            : (Nq_total,) or (Nq_total, 1)
+        shape_vals_flat  : (Nq_total, n_loc)
+        weights          : (n_cells, n_q) or with leading singleton axes
+        flat_entity_nodes: (n_cells*n_loc,)
+        returns          : (num_total_nodes, 1)
+        """
+        coeff = jnp.asarray(coeff)
+        shape_vals_flat = jnp.asarray(shape_vals_flat)
+        weights = jnp.asarray(weights)
+        flat_entity_nodes = jnp.asarray(flat_entity_nodes, dtype=jnp.int32).reshape(-1)
 
-        vector:
-            integrand = (Nq_total, nloc, ncomp)
+        # Strip leading singleton axes introduced by compiled/runtime path
+        while weights.ndim > 2 and weights.shape[0] == 1:
+            weights = jnp.squeeze(weights, axis=0)
 
-        more generally:
-            integrand = (Nq_total, nloc, ...)
+        while shape_vals_flat.ndim > 2 and shape_vals_flat.shape[0] == 1:
+            shape_vals_flat = jnp.squeeze(shape_vals_flat, axis=0)
+
+        while coeff.ndim > 1 and coeff.shape[0] == 1:
+            coeff = jnp.squeeze(coeff, axis=0)
+
+        if coeff.ndim > 1 and coeff.shape[-1] == 1:
+            coeff = coeff.reshape(-1)
+
+        if weights.ndim != 2:
+            raise ValueError(f"_assemble_value_basis_integrand expected weights.ndim == 2, got {weights.shape}")
+
+        num_entities, num_quads = weights.shape
+        n_loc = shape_vals_flat.shape[1]
+
+        if coeff.shape[0] != num_entities * num_quads:
+            raise ValueError(
+                f"value coeff shape {coeff.shape} incompatible with weights {weights.shape}"
+            )
+
+        local = (coeff[:, None] * shape_vals_flat).reshape(num_entities, num_quads, n_loc)
+        weighted = local * weights[:, :, None]
+        local_residual = jnp.sum(weighted, axis=1)  # (n_entities, n_loc)
+
+        global_residual = jax.ops.segment_sum(
+            local_residual.reshape(-1),
+            flat_entity_nodes,
+            num_segments=num_total_nodes,
+        )
+        return global_residual[:, None]
+
+    def _assemble_grad_basis_integrand(self, coeff_vec, v_grads_JxW_flat, flat_entity_nodes, num_total_nodes):
+        """
+        Assemble coeff · grad(phi)-type terms.
+
+        coeff_vec         : (Nq_total, dim)
+        v_grads_JxW_flat  : (Nq_total, n_loc, dim)
+        flat_entity_nodes : (n_cells*n_loc,)
+        returns           : (num_total_nodes, 1)
+        """
+        coeff_vec = jnp.asarray(coeff_vec)
+        v_grads_JxW_flat = jnp.asarray(v_grads_JxW_flat)
+        flat_entity_nodes = jnp.asarray(flat_entity_nodes, dtype=jnp.int32).reshape(-1)
+
+        # Strip leading singleton batch/time axes if present
+        while coeff_vec.ndim > 2 and coeff_vec.shape[0] == 1:
+            coeff_vec = jnp.squeeze(coeff_vec, axis=0)
+
+        # If shape came in as (Nq_total, 1, dim), collapse middle singleton
+        if coeff_vec.ndim == 3 and coeff_vec.shape[1] == 1:
+            coeff_vec = coeff_vec[:, 0, :]
+
+        if coeff_vec.ndim == 1:
+            coeff_vec = coeff_vec[:, None]
+
+        if coeff_vec.shape[0] != v_grads_JxW_flat.shape[0]:
+            raise ValueError(
+                f"grad coeff shape {coeff_vec.shape} incompatible with "
+                f"v_grads_JxW_flat {v_grads_JxW_flat.shape}"
+            )
+
+        n_q_total, n_loc, dim = v_grads_JxW_flat.shape
+        n_cell_times_nloc = flat_entity_nodes.shape[0]
+
+        if n_cell_times_nloc % n_loc != 0:
+            raise ValueError(
+                f"flat_entity_nodes size {n_cell_times_nloc} is not divisible by n_loc={n_loc}"
+            )
+
+        num_cells = n_cell_times_nloc // n_loc
+
+        if n_q_total % num_cells != 0:
+            raise ValueError(
+                f"Number of quad rows {n_q_total} is not divisible by num_cells={num_cells}"
+            )
+
+        num_quads = n_q_total // num_cells
+
+        # (Nq_total, n_loc)
+        local_q = jnp.sum(coeff_vec[:, None, :] * v_grads_JxW_flat, axis=-1)
+
+        # reshape to (n_cells, n_q, n_loc), then sum over quadrature
+        local_cell = local_q.reshape(num_cells, num_quads, n_loc).sum(axis=1)
+
+        global_residual = jax.ops.segment_sum(
+            local_cell.reshape(-1),
+            flat_entity_nodes,
+            num_segments=num_total_nodes,
+        )
+        return global_residual[:, None]
+
+    def _assemble_basis_integrand(self, integrand, weights, flat_entity_nodes, num_total_nodes):
+        """
+        Assemble a basis-weighted integral into nodal residuals.
+
+        Expected scalar-field shapes:
+        integrand         : (Nq_total, n_loc)        or (n_cells, n_q, n_loc)
+        weights           : (n_cells, n_q)
+        flat_entity_nodes : (n_cells * n_loc,)
+        Returns:
+        global_residual   : (num_total_nodes, 1)
         """
         integrand = jnp.asarray(integrand)
         weights = jnp.asarray(weights)
-        flat_cells = jnp.asarray(flat_cells).flatten().astype(jnp.int32)
+        flat_entity_nodes = jnp.asarray(flat_entity_nodes, dtype=jnp.int32).reshape(-1)
+        while integrand.ndim > 2 and integrand.shape[0] == 1:
+            integrand = jnp.squeeze(integrand, axis=0)
 
-        num_entities, num_quads = weights.shape[-2], weights.shape[-1]
-        n_local_nodes = integrand.shape[1]
-        trailing_shape = integrand.shape[2:]
+        print("DEBUG integrand shape after squeeze =", integrand.shape)
+        print("DEBUG weights shape =", weights.shape)
+        if weights.ndim != 2:
+            raise ValueError(f"_assemble_basis_integrand expected weights.ndim == 2, got {weights.shape}")
 
-        # broadcast weights over all trailing axes
-        wshape = (weights.size,) + (1,) * (integrand.ndim - 1)
-        local_residuals = integrand * weights.reshape(wshape)
+        num_entities, num_quads = weights.shape
 
-        # restore entity/quad structure
-        local_residuals = local_residuals.reshape((num_entities, num_quads, n_local_nodes) + trailing_shape)
+        if integrand.ndim == 2:
+            if integrand.shape[0] != num_entities * num_quads:
+                raise ValueError(
+                    f"Integrand first dim {integrand.shape[0]} does not match "
+                    f"num_entities*num_quads = {num_entities * num_quads}"
+                )
+            n_loc = integrand.shape[1]
+            integrand = integrand.reshape(num_entities, num_quads, n_loc)
 
-        # integrate over quadrature
-        cell_residuals = jnp.sum(local_residuals, axis=1)  # (entities, nloc, ...)
+        elif integrand.ndim >= 3:
+            if integrand.shape[0] != num_entities or integrand.shape[1] != num_quads:
+                raise ValueError(
+                    f"Structured integrand shape {integrand.shape} is incompatible with "
+                    f"weights shape {weights.shape}"
+                )
+            n_loc = integrand.shape[2]
 
-        if len(trailing_shape) == 0:
-            data = cell_residuals.reshape(-1)
+        else:
+            raise ValueError(f"Unsupported integrand shape: {integrand.shape}")
+
+        weighted = integrand * weights[..., None]
+        local_residual = jnp.sum(weighted, axis=1)
+
+        if local_residual.ndim == 2:
+            if flat_entity_nodes.size != local_residual.size:
+                raise ValueError(
+                    f"flat_entity_nodes size {flat_entity_nodes.size} does not match "
+                    f"local_residual size {local_residual.size}"
+                )
+
             global_residual = jax.ops.segment_sum(
-                data,
-                flat_cells,
+                local_residual.reshape(-1),
+                flat_entity_nodes,
                 num_segments=num_total_nodes,
             )
-            return global_residual[:, jnp.newaxis]
+            return global_residual[:, None]
 
-        flat_comp = 1
-        for s in trailing_shape:
-            flat_comp *= int(s)
+        trailing_shape = local_residual.shape[2:]
+        n_comp = int(np.prod(trailing_shape))
+        local_flat = local_residual.reshape(num_entities, n_loc, n_comp)
 
-        data = cell_residuals.reshape(-1, flat_comp)
-        global_residual = jax.ops.segment_sum(
-            data,
-            flat_cells,
-            num_segments=num_total_nodes,
-        )
+        outs = []
+        for c in range(n_comp):
+            outs.append(
+                jax.ops.segment_sum(
+                    local_flat[:, :, c].reshape(-1),
+                    flat_entity_nodes,
+                    num_segments=num_total_nodes,
+                )
+            )
 
-        return global_residual.reshape((num_total_nodes,) + trailing_shape)
+        global_residual = jnp.stack(outs, axis=-1)
+        return global_residual.reshape(num_total_nodes, *trailing_shape)
 
     def _eval_test_function(self, expr, ctx):
         """
@@ -1082,9 +1216,9 @@ class TraceEvaluator:
         total = None
 
         # -------------------------
-        # Volume contribution
+        # Volume value contribution
         # -------------------------
-        if expr.volume_expr is not None:
+        if expr.volume_value_expr is not None:
             vol_ctx = self._EvalCtx(
                 ctx.context,
                 ctx.var_bindings,
@@ -1092,21 +1226,46 @@ class TraceEvaluator:
                 active_region={"support": "volume", "region_id": "volume"},
             )
 
-            integrand = self._dispatch(expr.volume_expr, vol_ctx)
+            coeff_val = self._dispatch(expr.volume_value_expr, vol_ctx)
 
-            vol_res = self._assemble_basis_integrand(
-                integrand,
+            vol_val_res = self._assemble_value_basis_integrand(
+                coeff_val,
+                ctx.context["N_flat"],
                 ctx.context["JxW"],
-                ctx.context["flat_cells"].flatten(),
+                ctx.context["flat_cells"].reshape(-1),
                 expr.num_total_nodes,
             )
 
-            total = vol_res if total is None else (total + vol_res)
+            # Value terms act like RHS/load contributions in the residual,
+            # so they enter with a minus sign.
+            total = vol_val_res if total is None else (total - vol_val_res)
 
         # -------------------------
-        # Boundary contributions
+        # Volume grad contribution
         # -------------------------
-        for region_id, bnd_expr in expr.boundary_exprs.items():
+        if expr.volume_grad_expr is not None:
+            vol_ctx = self._EvalCtx(
+                ctx.context,
+                ctx.var_bindings,
+                ctx.key,
+                active_region={"support": "volume", "region_id": "volume"},
+            )
+
+            coeff_grad = self._dispatch(expr.volume_grad_expr, vol_ctx)
+
+            vol_grad_res = self._assemble_grad_basis_integrand(
+                coeff_grad,
+                ctx.context["v_grads_JxW_flat"],
+                ctx.context["flat_cells"].reshape(-1),
+                expr.num_total_nodes,
+            )
+
+            total = vol_grad_res if total is None else (total + vol_grad_res)
+
+        # -------------------------
+        # Boundary value contributions
+        # -------------------------
+        for region_id, bnd_expr in expr.boundary_value_exprs.items():
             bnd_ctx = self._EvalCtx(
                 ctx.context,
                 ctx.var_bindings,
@@ -1114,20 +1273,32 @@ class TraceEvaluator:
                 active_region={"support": "boundary", "region_id": region_id},
             )
 
-            integrand = self._dispatch(bnd_expr, bnd_ctx)
+            coeff_val = self._dispatch(bnd_expr, bnd_ctx)
 
             surf_data = ctx.context["surface_data"][region_id]
-            bnd_res = self._assemble_basis_integrand(
-                integrand,
+
+            face_shape_vals = jnp.asarray(surf_data["face_shape_vals"])
+            while face_shape_vals.ndim > 3 and face_shape_vals.shape[0] == 1:
+                face_shape_vals = jnp.squeeze(face_shape_vals, axis=0)
+
+            bnd_res = self._assemble_value_basis_integrand(
+                coeff_val,
+                face_shape_vals.reshape(-1, face_shape_vals.shape[-1]),
                 surf_data["nanson_scale"],
-                surf_data["flat_parent_nodes"].flatten(),
+                surf_data["flat_parent_nodes"].reshape(-1),
                 expr.num_total_nodes,
             )
 
-            total = bnd_res if total is None else (total + bnd_res)
+            if "global_boundary_areas" in surf_data and "global_areas" in ctx.context:
+                gb = jnp.asarray(surf_data["global_boundary_areas"]).reshape(-1, 1)
+                gv = jnp.asarray(ctx.context["global_areas"]).reshape(-1, 1)
+                bnd_res = bnd_res * (gv / (gb + 1e-12))
+
+            # Boundary value terms (e.g. Neumann loads) also act like RHS/load contributions
+            total = bnd_res if total is None else (total - bnd_res)
 
         if total is None:
-            raise ValueError("GroupedAssembly has neither volume nor boundary expressions.")
+            raise ValueError("GroupedAssembly has neither value nor grad nor boundary terms.")
 
         if "global_areas" in ctx.context:
             areas = jnp.asarray(ctx.context["global_areas"]).reshape(-1, 1)
