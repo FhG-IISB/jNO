@@ -1238,7 +1238,7 @@ class TraceEvaluator:
 
             # Value terms act like RHS/load contributions in the residual,
             # so they enter with a minus sign.
-            total = vol_val_res if total is None else (total - vol_val_res)
+            total = vol_val_res if total is None else (total + vol_val_res)
 
         # -------------------------
         # Volume grad contribution
@@ -1289,13 +1289,14 @@ class TraceEvaluator:
                 expr.num_total_nodes,
             )
 
-            if "global_boundary_areas" in surf_data and "global_areas" in ctx.context:
-                gb = jnp.asarray(surf_data["global_boundary_areas"]).reshape(-1, 1)
-                gv = jnp.asarray(ctx.context["global_areas"]).reshape(-1, 1)
-                bnd_res = bnd_res * (gv / (gb + 1e-12))
+            # if "global_boundary_areas" in surf_data and "global_areas" in ctx.context:
+            #     gb = jnp.asarray(surf_data["global_boundary_areas"]).reshape(-1, 1)
+            #     gv = jnp.asarray(ctx.context["global_areas"]).reshape(-1, 1)
+            #     bnd_res = bnd_res * (gv / (gb + 1e-12))
 
             # Boundary value terms (e.g. Neumann loads) also act like RHS/load contributions
-            total = bnd_res if total is None else (total - bnd_res)
+            #print(f"DEBUG boundary tag={region_id}, ||bnd_res|| =", jnp.linalg.norm(bnd_res))
+            total = bnd_res if total is None else (total + bnd_res)
 
         if total is None:
             raise ValueError("GroupedAssembly has neither value nor grad nor boundary terms.")
