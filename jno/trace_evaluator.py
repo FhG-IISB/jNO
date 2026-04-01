@@ -961,63 +961,105 @@ class TraceEvaluator:
         return shape_vals[:, :, None, None] * eye[None, None, :, :]
 
     def _assemble_value_basis_integrand(self, coeff, shape_vals_flat, weights, flat_entity_nodes, num_total_nodes):
-        """
-        Assemble coeff * phi-type terms.
-
-        coeff            : (Nq_total,) or (Nq_total, 1)
-        shape_vals_flat  : (Nq_total, n_loc)
-        weights          : (n_cells, n_q) or with leading singleton axes
-        flat_entity_nodes: (n_cells*n_loc,)
-        returns          : (num_total_nodes, 1)
-        """
         coeff = jnp.asarray(coeff)
         shape_vals_flat = jnp.asarray(shape_vals_flat)
-        weights = jnp.asarray(weights)
         flat_entity_nodes = jnp.asarray(flat_entity_nodes, dtype=jnp.int32).reshape(-1)
+        weights = jnp.asarray(weights)
 
-        # Strip leading singleton axes introduced by compiled/runtime path
-        while weights.ndim > 2 and weights.shape[0] == 1:
-            weights = jnp.squeeze(weights, axis=0)
-
-        while shape_vals_flat.ndim > 2 and shape_vals_flat.shape[0] == 1:
-            shape_vals_flat = jnp.squeeze(shape_vals_flat, axis=0)
-
-        while coeff.ndim > 1 and coeff.shape[0] == 1:
+        while coeff.ndim > 2 and coeff.shape[0] == 1:
             coeff = jnp.squeeze(coeff, axis=0)
 
-        if coeff.ndim > 1 and coeff.shape[-1] == 1:
-            coeff = coeff.reshape(-1)
+        if coeff.ndim == 0:
+            coeff = coeff[None]
+        elif coeff.ndim == 2 and coeff.shape[1] == 1:
+            coeff = coeff[:, 0]
+        elif coeff.ndim > 2:
+            raise ValueError(f"Unsupported coeff rank {coeff.ndim} for value assembly; got shape {coeff.shape}")
 
-        if weights.ndim != 2:
-            raise ValueError(f"_assemble_value_basis_integrand expected weights.ndim == 2, got {weights.shape}")
+        if shape_vals_flat.ndim != 2:
+            raise ValueError(f"Expected shape_vals_flat.ndim == 2, got shape {shape_vals_flat.shape}")
 
-        num_entities, num_quads = weights.shape
-        n_loc = shape_vals_flat.shape[1]
+        n_q_total, n_loc = shape_vals_flat.shape
+        n_cell_times_nloc = flat_entity_nodes.shape[0]
 
-        if coeff.shape[0] != num_entities * num_quads:
-            raise ValueError(
-                f"value coeff shape {coeff.shape} incompatible with weights {weights.shape}"
+        if n_cell_times_nloc % n_loc != 0:
+            raise ValueError(f"flat_entity_nodes size {n_cell_times_nloc} is not divisible by n_loc={n_loc}")
+
+        num_entities = n_cell_times_nloc // n_loc
+
+        if n_q_total % num_entities != 0:
+            raise ValueError(f"Number of quad rows {n_q_total} is not divisible by num_entities={num_entities}")
+
+        num_quads = n_q_total // num_entities
+
+        if weights.ndim == 2:
+            weights_flat = weights.reshape(-1)
+        elif weights.ndim == 1:
+            weights_flat = weights
+        else:
+            raise ValueError(f"Unsupported weights rank {weights.ndim}; got shape {weights.shape}")
+
+        # scalar case -> (Nq_total, n_loc)
+        if coeff.ndim == 1:
+            if coeff.shape[0] != n_q_total:
+                raise ValueError(f"coeff shape {coeff.shape} incompatible with shape_vals_flat {shape_vals_flat.shape}")
+
+            local_q = coeff[:, None] * shape_vals_flat * weights_flat[:, None]
+            local_entity = local_q.reshape(num_entities, num_quads, n_loc).sum(axis=1)
+
+            global_residual = jax.ops.segment_sum(
+                local_entity.reshape(-1),
+                flat_entity_nodes,
+                num_segments=num_total_nodes,
             )
+            return global_residual[:, None]
 
-        local = (coeff[:, None] * shape_vals_flat).reshape(num_entities, num_quads, n_loc)
-        weighted = local * weights[:, :, None]
-        local_residual = jnp.sum(weighted, axis=1)  # (n_entities, n_loc)
+        # vector case -> (Nq_total, vec)
+        elif coeff.ndim == 2:
+            if coeff.shape[0] != n_q_total:
+                raise ValueError(f"coeff shape {coeff.shape} incompatible with shape_vals_flat {shape_vals_flat.shape}")
 
-        global_residual = jax.ops.segment_sum(
-            local_residual.reshape(-1),
-            flat_entity_nodes,
-            num_segments=num_total_nodes,
-        )
-        return global_residual[:, None]
+            vec = coeff.shape[1]
+
+            # (Nq_total, n_loc, vec)
+            local_q = coeff[:, None, :] * shape_vals_flat[:, :, None] * weights_flat[:, None, None]
+
+            # (num_entities, num_quads, n_loc, vec) -> sum quads -> (num_entities, n_loc, vec)
+            local_entity = local_q.reshape(num_entities, num_quads, n_loc, vec).sum(axis=1)
+
+            # assemble each component separately
+            comps = []
+            for c in range(vec):
+                gc = jax.ops.segment_sum(
+                    local_entity[:, :, c].reshape(-1),
+                    flat_entity_nodes,
+                    num_segments=num_total_nodes,
+                )
+                comps.append(gc)
+
+            return jnp.stack(comps, axis=-1)
+
+        else:
+            raise ValueError(f"Unsupported normalized coeff shape {coeff.shape}")
 
     def _assemble_grad_basis_integrand(self, coeff_vec, v_grads_JxW_flat, flat_entity_nodes, num_total_nodes):
         """
-        Assemble coeff · grad(phi)-type terms.
+        Assemble coeff : grad(phi)-type terms.
 
-        coeff_vec         : (Nq_total, dim)
-        v_grads_JxW_flat  : (Nq_total, n_loc, dim)
-        flat_entity_nodes : (n_cells*n_loc,)
-        returns           : (num_total_nodes, 1)
+        Supported canonical cases
+        -------------------------
+        Scalar:
+            coeff_vec         : (Nq_total, dim)
+            v_grads_JxW_flat  : (Nq_total, n_loc, dim)
+
+        Vector / multi-component:
+            coeff_vec         : (Nq_total, vec, dim)
+            v_grads_JxW_flat  : (Nq_total, n_loc, test_vec, dim)
+
+        Notes
+        -----
+        FEAX may provide test_vec = 1 even for vector-valued problems. In that case
+        the test gradient weights are broadcast over the coefficient component axis.
         """
         coeff_vec = jnp.asarray(coeff_vec)
         v_grads_JxW_flat = jnp.asarray(v_grads_JxW_flat)
@@ -1027,20 +1069,94 @@ class TraceEvaluator:
         while coeff_vec.ndim > 2 and coeff_vec.shape[0] == 1:
             coeff_vec = jnp.squeeze(coeff_vec, axis=0)
 
-        # If shape came in as (Nq_total, 1, dim), collapse middle singleton
-        if coeff_vec.ndim == 3 and coeff_vec.shape[1] == 1:
-            coeff_vec = coeff_vec[:, 0, :]
+        # --------------------------------------------------
+        # Scalar grad-channel case
+        # --------------------------------------------------
+        if v_grads_JxW_flat.ndim == 3:
+            # coeff: (Nq_total, dim)
+            if coeff_vec.ndim == 3 and coeff_vec.shape[1] == 1:
+                coeff_vec = coeff_vec[:, 0, :]
 
-        if coeff_vec.ndim == 1:
-            coeff_vec = coeff_vec[:, None]
+            if coeff_vec.ndim == 1:
+                coeff_vec = coeff_vec[:, None]
 
-        if coeff_vec.shape[0] != v_grads_JxW_flat.shape[0]:
+            if coeff_vec.ndim != 2:
+                raise ValueError(
+                    f"Scalar grad assembly expects coeff_vec.ndim == 2 after normalization, "
+                    f"got shape {coeff_vec.shape} with v_grads_JxW_flat {v_grads_JxW_flat.shape}"
+                )
+
+            if coeff_vec.shape[0] != v_grads_JxW_flat.shape[0]:
+                raise ValueError(
+                    f"grad coeff shape {coeff_vec.shape} incompatible with "
+                    f"v_grads_JxW_flat {v_grads_JxW_flat.shape}"
+                )
+
+            n_q_total, n_loc, dim = v_grads_JxW_flat.shape
+            if coeff_vec.shape[1] != dim:
+                raise ValueError(
+                    f"Scalar grad coeff last dimension {coeff_vec.shape[1]} does not match dim={dim}"
+                )
+
+            # (Nq_total, n_loc)
+            local_q = jnp.sum(coeff_vec[:, None, :] * v_grads_JxW_flat, axis=-1)
+
+        # --------------------------------------------------
+        # Vector / multi-component grad-channel case
+        # --------------------------------------------------
+        elif v_grads_JxW_flat.ndim == 4:
+            # coeff should be (Nq_total, vec, dim)
+            if coeff_vec.ndim == 2:
+                coeff_vec = coeff_vec[:, None, :]
+
+            if coeff_vec.ndim != 3:
+                raise ValueError(
+                    f"Vector grad assembly expects coeff_vec.ndim == 3 after normalization, "
+                    f"got shape {coeff_vec.shape} with v_grads_JxW_flat {v_grads_JxW_flat.shape}"
+                )
+
+            if coeff_vec.shape[0] != v_grads_JxW_flat.shape[0]:
+                raise ValueError(
+                    f"grad coeff shape {coeff_vec.shape} incompatible with "
+                    f"v_grads_JxW_flat {v_grads_JxW_flat.shape}"
+                )
+
+            n_q_total, n_loc, test_vec, dim = v_grads_JxW_flat.shape
+            coeff_nq, coeff_vec_dim, coeff_dim = coeff_vec.shape
+
+            if coeff_dim != dim:
+                raise ValueError(
+                    f"Vector grad coeff last dimension {coeff_dim} does not match dim={dim}"
+                )
+
+            # FEAX may provide singleton component axis in v_grads_JxW_flat.
+            # Broadcast it to the coefficient component count if needed.
+            if test_vec != coeff_vec_dim:
+                if test_vec == 1:
+                    v_grads_JxW_flat = jnp.broadcast_to(
+                        v_grads_JxW_flat,
+                        (n_q_total, n_loc, coeff_vec_dim, dim),
+                    )
+                    test_vec = coeff_vec_dim
+                else:
+                    raise ValueError(
+                        f"grad coeff shape {coeff_vec.shape} incompatible with "
+                        f"v_grads_JxW_flat {v_grads_JxW_flat.shape}"
+                    )
+
+            # FEAX-style double contraction over component and spatial direction
+            # -> local_q shape (Nq_total, n_loc)
+            local_q = jnp.sum(coeff_vec[:, None, :, :] * v_grads_JxW_flat, axis=-1,)
+
+        else:
             raise ValueError(
-                f"grad coeff shape {coeff_vec.shape} incompatible with "
-                f"v_grads_JxW_flat {v_grads_JxW_flat.shape}"
+                f"Unsupported v_grads_JxW_flat rank {v_grads_JxW_flat.ndim}; "
+                f"expected 3 (scalar) or 4 (vector/multi-component)."
             )
 
-        n_q_total, n_loc, dim = v_grads_JxW_flat.shape
+        # --------------------------------------------------
+        # Reconstruct cell structure and sum quadrature
+        # --------------------------------------------------
         n_cell_times_nloc = flat_entity_nodes.shape[0]
 
         if n_cell_times_nloc % n_loc != 0:
@@ -1057,18 +1173,35 @@ class TraceEvaluator:
 
         num_quads = n_q_total // num_cells
 
-        # (Nq_total, n_loc)
-        local_q = jnp.sum(coeff_vec[:, None, :] * v_grads_JxW_flat, axis=-1)
+        # Scalar case: local_q shape (Nq_total, n_loc)
+        if local_q.ndim == 2:
+            local_cell = local_q.reshape(num_cells, num_quads, n_loc).sum(axis=1)
 
-        # reshape to (n_cells, n_q, n_loc), then sum over quadrature
-        local_cell = local_q.reshape(num_cells, num_quads, n_loc).sum(axis=1)
+            global_residual = jax.ops.segment_sum(
+                local_cell.reshape(-1),
+                flat_entity_nodes,
+                num_segments=num_total_nodes,
+            )
+            return global_residual[:, None]
 
-        global_residual = jax.ops.segment_sum(
-            local_cell.reshape(-1),
-            flat_entity_nodes,
-            num_segments=num_total_nodes,
-        )
-        return global_residual[:, None]
+        # Vector case: local_q shape (Nq_total, n_loc, vec)
+        elif local_q.ndim == 3:
+            vec = local_q.shape[-1]
+            local_cell = local_q.reshape(num_cells, num_quads, n_loc, vec).sum(axis=1)
+
+            comps = []
+            for c in range(vec):
+                gc = jax.ops.segment_sum(
+                    local_cell[:, :, c].reshape(-1),
+                    flat_entity_nodes,
+                    num_segments=num_total_nodes,
+                )
+                comps.append(gc)
+
+            return jnp.stack(comps, axis=-1)
+
+        else:
+            raise ValueError(f"Unsupported local_q shape {local_q.shape}")
 
     def _assemble_basis_integrand(self, integrand, weights, flat_entity_nodes, num_total_nodes):
         """
@@ -1308,7 +1441,10 @@ class TraceEvaluator:
         if "dirichlet_nodes" in ctx.context:
             d_nodes = jnp.asarray(ctx.context["dirichlet_nodes"]).flatten().astype(jnp.int32)
             if d_nodes.size > 0:
-                total = total.at[d_nodes].set(0.0)
+                if total.ndim == 1:
+                    total = total.at[d_nodes].set(0.0)
+                else:
+                    total = total.at[d_nodes, :].set(0.0)
 
         return total
 

@@ -716,7 +716,6 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
 
 def _assemble_fem_system_from_ir(domain, ir, **kwargs):
     import feax as fe
-    import jax.numpy as jnp
 
     problem, bc = _build_feax_problem(domain, ir)
     internal_vars = fe.InternalVars()
@@ -731,10 +730,9 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
     res_bc = fe.create_res_bc_function(problem, bc)
     jac_bc = fe.create_J_bc_function(problem, bc, symmetric=kwargs.get("symmetric_bc", True))
 
-    # FEAX returns the correction system:
+    # FEAX gives the correction system:
     #     A du = -r(u0)
-    # but jNO examples solve A u = b as a full-state system.
-    # Convert correction form to full-state form:
+    # Convert to the full-state system expected by jNO examples:
     #     A u = A u0 - r(u0)
     A = jac_bc(u0, internal_vars)
     r0 = jnp.asarray(res_bc(u0, internal_vars), dtype=_default_float_dtype())
@@ -742,7 +740,6 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
     if hasattr(A, "__matmul__"):
         b = A @ u0 - r0
     else:
-        # fallback for sparse types without direct matmul overload
         A_dense = jnp.asarray(A.todense() if hasattr(A, "todense") else A.toarray())
         b = A_dense @ u0 - r0
         A = A_dense

@@ -1,8 +1,8 @@
 from __future__ import annotations
-
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any, Tuple
 import jax.numpy as jnp
+from ..jnp_ops import stack
 from ..trace import (
     Placeholder,
     Literal,
@@ -29,141 +29,87 @@ from ..trace import (
 # -----------------------------------------------------------------------------
 
 
+
 @dataclass(frozen=True)
-class LoweredWeakTerm:
+class LoweredChannelTerm:
     sign: float
-    expr: Placeholder
-    support: str  # "volume" | "boundary"
+    support: str          # "volume" | "boundary"
     region_id: str
-    original_expr: Placeholder
+    channel: str          # "test_value" | "test_grad" | "boundary_test_value" | "raw"
+    coeff: Placeholder
+    variable_id: int = 0
+    value_shape: tuple = ()
+    original_expr: Placeholder = None
 
 
 @dataclass
 class LoweredWeakForm:
     domain: object
-    terms: List[LoweredWeakTerm] = field(default_factory=list)
+    terms: List[LoweredChannelTerm] = field(default_factory=list)
 
-    @property
-    def volume_terms(self) -> List[Placeholder]:
-        return [t.expr for t in self.terms if t.support == "volume"]
-
-    @property
-    def boundary_terms(self) -> Dict[str, List[Placeholder]]:
-        out: Dict[str, List[Placeholder]] = {}
-        for term in self.terms:
-            if term.support == "boundary":
-                out.setdefault(term.region_id, []).append(term.expr)
+    def select(self, *, support=None, region_id=None, channel=None, variable_id=None):
+        out = []
+        for t in self.terms:
+            if support is not None and t.support != support:
+                continue
+            if region_id is not None and t.region_id != region_id:
+                continue
+            if channel is not None and t.channel != channel:
+                continue
+            if variable_id is not None and t.variable_id != variable_id:
+                continue
+            out.append(t)
         return out
 
+    def sum_coeffs(self, *, support=None, region_id=None, channel=None, variable_id=None):
+        coeffs = [
+            t.coeff
+            for t in self.select(
+                support=support,
+                region_id=region_id,
+                channel=channel,
+                variable_id=variable_id,
+            )
+        ]
+        return _sum_terms(self.domain, coeffs)
+
+    # FEM-facing raw expressions
     @property
     def volume_expr(self):
-        return _sum_terms(self.domain, self.volume_terms)
+        exprs = [t.coeff for t in self.terms if t.support == "volume" and t.channel == "raw"]
+        return _sum_terms(self.domain, exprs)
 
     @property
     def boundary_exprs(self) -> Dict[str, Placeholder]:
-        return {k: _sum_terms(self.domain, v) for k, v in self.boundary_terms.items()}
-
-    @property
-    def volume_value_terms(self) -> List[Placeholder]:
-        out: List[Placeholder] = []
-        for t in self.terms:
-            if t.support != "volume":
-                continue
-            kind, coeff = _strip_single_test_basis_factor(self.domain, t.expr)
-            if kind == "value":
-                out.append(coeff)
-        return out
-
-
-    @property
-    def boundary_value_terms(self) -> Dict[str, List[Placeholder]]:
         out: Dict[str, List[Placeholder]] = {}
         for t in self.terms:
-            if t.support != "boundary":
-                continue
-            kind, coeff = _strip_single_test_basis_factor(self.domain, t.expr)
-            if kind == "grad":
-                raise NotImplementedError(
-                    f"Boundary grad(test) terms are not supported yet for VPINN on region '{t.region_id}'."
-                )
-            out.setdefault(t.region_id, []).append(coeff)
-        return out
+            if t.support == "boundary" and t.channel == "raw":
+                out.setdefault(t.region_id, []).append(t.coeff)
+        return {k: _sum_terms(self.domain, v) for k, v in out.items()}
 
+    # VPINN-facing canonical channels
     @property
     def volume_value_expr(self):
-        return _sum_terms(self.domain, self.volume_value_terms)
-
-    @property
-    def volume_grad_terms(self) -> Dict[int, List[Placeholder]]:
-        """
-        Return grad(test) coefficients bucketed by derivative direction.
-
-        Example for 2D scalar Poisson:
-            {
-                0: [u_x term coeffs...],
-                1: [u_y term coeffs...],
-            }
-        """
-        out: Dict[int, List[Placeholder]] = {}
-        for t in self.terms:
-            if t.support != "volume":
-                continue
-
-            if not _contains_testfunction_gradient(self.domain, t.expr):
-                continue
-
-            if not (isinstance(t.expr, BinaryOp) and t.expr.op == "*"):
-                raise ValueError(
-                    f"Expected grad(test) weak-form term to be a product, got {t.expr}"
-                )
-
-            left = t.expr.left
-            right = t.expr.right
-
-            if _is_testfunction_grad(left):
-                dim = _get_testfunction_grad_dim(left)
-                coeff = right
-            elif _is_testfunction_grad(right):
-                dim = _get_testfunction_grad_dim(right)
-                coeff = left
-            else:
-                raise ValueError(
-                    f"Expected one grad(TestFunction) factor in term, got {t.expr}"
-                )
-
-            out.setdefault(dim, []).append(coeff)
-
-        return out
-
+        return self.sum_coeffs(support="volume", channel="test_value", variable_id=0)
 
     @property
     def volume_grad_expr(self):
-        """
-        Build a vector coefficient field for grad(test) assembly.
-
-        Returns shape-like traced object corresponding to:
-            stack([sum(coeffs_dim0), sum(coeffs_dim1), ...], axis=-1)
-        """
-        by_dim = self.volume_grad_terms
-        if len(by_dim) == 0:
-            return None
-
-        max_dim = max(by_dim.keys())
-        comps = []
-
-        for d in range(max_dim + 1):
-            comp = _sum_terms(self.domain, by_dim.get(d, []))
-            if comp is None:
-                comp = Literal(0.0)
-            comps.append(comp)
-
-        return FunctionCall(lambda *xs: jnp.stack(xs, axis=-1), comps, name="stack_grad_coeff")
+        return self.sum_coeffs(support="volume", channel="test_grad", variable_id=0)
 
     @property
     def boundary_value_exprs(self) -> Dict[str, Placeholder]:
-        return {k: _sum_terms(self.domain, v) for k, v in self.boundary_value_terms.items()}
-
-
+        out = {}
+        region_ids = sorted({t.region_id for t in self.terms if t.support == "boundary"})
+        for rid in region_ids:
+            coeff = self.sum_coeffs(
+                support="boundary",
+                region_id=rid,
+                channel="boundary_test_value",
+                variable_id=0,
+            )
+            if coeff is not None:
+                out[rid] = coeff
+        return out
 # --------------------------------
 # additive-term helpers
 # --------------------------------
@@ -189,6 +135,268 @@ def _sum_terms(domain, terms):
         out = out + t
     return out
 
+def _contains_testfunction(node) -> bool:
+    return _contains_node_type(None, node, TestFunction)
+
+def _contains_trialfunction(node) -> bool:
+    return _contains_node_type(None, node, TrialFunction)
+
+def _function_name(node) -> Optional[str]:
+    if isinstance(node, FunctionCall):
+        if getattr(node, "_name", None) is not None:
+            return str(node._name)
+        if hasattr(node.fn, "__name__"):
+            return str(node.fn.__name__)
+    return None
+
+def _get_grad_axis_from_test_grad(node) -> int:
+    """
+    Return the spatial derivative axis for Jacobian(TestFunction, [var]).
+    For fem_gauss variables in 2D:
+      x -> 0
+      y -> 1
+    """
+    if not (isinstance(node, Jacobian) and isinstance(node.target, TestFunction)):
+        raise TypeError(f"Expected Jacobian(TestFunction), got {type(node).__name__}")
+
+    if len(node.variables) != 1:
+        raise ValueError(
+            "Canonical FEAX-style test_grad lowering currently expects exactly one "
+            f"spatial variable in Jacobian(TestFunction,...), got {len(node.variables)}"
+        )
+
+    var = node.variables[0]
+    if not isinstance(var, Variable):
+        raise TypeError(f"Expected Variable inside Jacobian(TestFunction), got {type(var).__name__}")
+
+    # For split=True variables:
+    # xg has dim like [0,1], yg has dim like [1,2]
+    if not hasattr(var, "dim") or len(var.dim) < 1:
+        raise ValueError(f"Cannot infer gradient axis from variable {var}")
+
+    axis = int(var.dim[0])
+    return axis
+
+def _canonicalize_grad_coeff(domain, coeff_expr, axis: int, value_shape: tuple):
+    """
+    Convert a directional grad(test) coefficient into canonical FEAX-style grad coeff.
+
+    Scalar test:
+        directional coeff shape ~ (...)        -> canonical (..., dim)
+
+    Vector test with value_shape=(vec,):
+        directional coeff shape ~ (..., vec)   -> canonical (..., vec, dim)
+    """
+    dim = int(domain.dimension)
+
+    # scalar-valued test
+    if value_shape is None or len(value_shape) == 0:
+        comps = []
+        for j in range(dim):
+            scale = Literal(1.0 if j == axis else 0.0)
+            comps.append(coeff_expr * scale)
+        return stack(comps, axis=-1)
+
+    # vector-valued test (current common case)
+    if len(value_shape) == 1:
+        comps = []
+        for j in range(dim):
+            scale = Literal(1.0 if j == axis else 0.0)
+            comps.append(coeff_expr * scale)   # each has shape (..., vec)
+        return stack(comps, axis=-1)           # -> (..., vec, dim)
+
+    raise NotImplementedError(
+        f"Canonical grad coeff inflation not implemented yet for value_shape={value_shape}"
+    )
+def _value_shape_num_components(value_shape) -> int:
+    if value_shape is None or len(value_shape) == 0:
+        return 1
+    n = 1
+    for s in value_shape:
+        n *= int(s)
+    return n
+
+def _is_test_value(node):
+    return isinstance(node, TestFunction)
+
+def _is_test_grad(node):
+    return isinstance(node, Jacobian) and isinstance(node.target, TestFunction)
+
+def _is_symgrad_test(node) -> bool:
+    if not isinstance(node, FunctionCall):
+        return False
+    name = _function_name(node)
+    if name != "symgrad":
+        return False
+    if len(node.args) < 1:
+        return False
+    arg0 = node.args[0]
+    return isinstance(arg0, TestFunction) or (
+        isinstance(arg0, Jacobian) and isinstance(arg0.target, TestFunction)
+    )
+
+def _get_test_value_shape(node) -> tuple:
+    if isinstance(node, TestFunction):
+        return getattr(node, "value_shape", ())
+    if isinstance(node, Jacobian) and isinstance(node.target, TestFunction):
+        return getattr(node.target, "value_shape", ())
+    if _is_symgrad_test(node):
+        arg0 = node.args[0]
+        if isinstance(arg0, TestFunction):
+            return getattr(arg0, "value_shape", ())
+        if isinstance(arg0, Jacobian) and isinstance(arg0.target, TestFunction):
+            return getattr(arg0.target, "value_shape", ())
+    return ()
+
+def _extract_test_channel(domain, expr) -> Tuple[str, Placeholder, Dict[str, Any]]:
+    """
+    Canonicalize one weak-form term into FEAX-style channels:
+      - volume/test_value
+      - volume/test_grad
+      - boundary_test_value (assigned later from support)
+    """
+
+    # pure test value
+    if isinstance(expr, TestFunction):
+        return "test_value", Literal(1.0), {
+            "value_shape": getattr(expr, "value_shape", ()),
+            "variable_id": 0,
+        }
+
+    # pure grad(test)
+    if isinstance(expr, Jacobian) and isinstance(expr.target, TestFunction):
+        value_shape = getattr(expr.target, "value_shape", ())
+        axis = _get_grad_axis_from_test_grad(expr)
+        coeff = _canonicalize_grad_coeff(domain, Literal(1.0), axis, value_shape)
+        return "test_grad", coeff, {
+            "value_shape": value_shape,
+            "variable_id": 0,
+        }
+    # additive combination of same-channel terms
+    if isinstance(expr, BinaryOp) and expr.op in {"+", "-"}:
+        ch_left, coeff_left, meta_left = _extract_test_channel(domain, expr.left)
+        ch_right, coeff_right, meta_right = _extract_test_channel(domain, expr.right)
+
+        if ch_left != ch_right:
+            raise ValueError(
+                "Could not extract a single canonical test channel from additive term: "
+                f"left channel={ch_left}, right channel={ch_right}, expr={expr}"
+            )
+
+        if meta_left.get("variable_id", 0) != meta_right.get("variable_id", 0):
+            raise ValueError(
+                "Additive weak-form term mixes different variable ids: "
+                f"{meta_left.get('variable_id', 0)} vs {meta_right.get('variable_id', 0)}"
+            )
+
+        if tuple(meta_left.get("value_shape", ())) != tuple(meta_right.get("value_shape", ())):
+            raise ValueError(
+                "Additive weak-form term mixes different test value shapes: "
+                f"{meta_left.get('value_shape', ())} vs {meta_right.get('value_shape', ())}"
+            )
+
+        if expr.op == "+":
+            coeff = coeff_left + coeff_right
+        else:
+            coeff = coeff_left - coeff_right
+
+        return ch_left, coeff, meta_left
+    # direct product tree
+    if isinstance(expr, BinaryOp) and expr.op == "*":
+        left = expr.left
+        right = expr.right
+
+        if _is_test_value(left):
+            return "test_value", right, {
+                "value_shape": getattr(left, "value_shape", ()),
+                "variable_id": 0,
+            }
+        if _is_test_value(right):
+            return "test_value", left, {
+                "value_shape": getattr(right, "value_shape", ()),
+                "variable_id": 0,
+            }
+
+        if _is_test_grad(left):
+            value_shape = getattr(left.target, "value_shape", ())
+            axis = _get_grad_axis_from_test_grad(left)
+            coeff = _canonicalize_grad_coeff(domain, right, axis, value_shape)
+            return "test_grad", coeff, {
+                "value_shape": value_shape,
+                "variable_id": 0,
+            }
+
+        if _is_test_grad(right):
+            value_shape = getattr(right.target, "value_shape", ())
+            axis = _get_grad_axis_from_test_grad(right)
+            coeff = _canonicalize_grad_coeff(domain, left, axis, value_shape)
+            return "test_grad", coeff, {
+                "value_shape": value_shape,
+                "variable_id": 0,
+            }
+
+        # recurse left
+        try:
+            channel, coeff_left, meta = _extract_test_channel(domain, left)
+            return channel, coeff_left * right, meta
+        except ValueError:
+            pass
+
+        # recurse right
+        try:
+            channel, coeff_right, meta = _extract_test_channel(domain, right)
+            return channel, left * coeff_right, meta
+        except ValueError:
+            pass
+
+    # contractions
+    if isinstance(expr, FunctionCall):
+        name = _function_name(expr)
+
+        if name == "inner" and len(expr.args) >= 2:
+            a0, a1 = expr.args[0], expr.args[1]
+
+            # inner(a, phi) or inner(phi, a)
+            if _is_test_value(a0):
+                return "test_value", a1, {
+                    "value_shape": getattr(a0, "value_shape", ()),
+                    "variable_id": 0,
+                }
+            if _is_test_value(a1):
+                return "test_value", a0, {
+                    "value_shape": getattr(a1, "value_shape", ()),
+                    "variable_id": 0,
+                }
+
+            # inner(A, grad(phi)) or inner(grad(phi), A)
+            if _is_test_grad(a0):
+                return "test_grad", a1, {
+                    "value_shape": getattr(a0.target, "value_shape", ()),
+                    "variable_id": 0,
+                }
+            if _is_test_grad(a1):
+                return "test_grad", a0, {
+                    "value_shape": getattr(a1.target, "value_shape", ()),
+                    "variable_id": 0,
+                }
+
+            # elasticity-like inner(sigma, symgrad(phi), n_contract=2)
+            # canonical FEAX grad channel uses sigma itself
+            if _is_symgrad_test(a0):
+                return "test_grad", a1, {
+                    "value_shape": _get_test_value_shape(a0),
+                    "variable_id": 0,
+                }
+            if _is_symgrad_test(a1):
+                return "test_grad", a0, {
+                    "value_shape": _get_test_value_shape(a1),
+                    "variable_id": 0,
+                }
+
+    raise ValueError(
+        "Could not extract a canonical FEAX-style test channel from weak-form term. "
+        f"Unsupported term structure: {expr}"
+    )
 
 # --------------------------------
 # variational region helpers
@@ -209,114 +417,6 @@ def _contains_node_type(domain, expr, node_type):
                     return True
 
     return False
-
-def _contains_testfunction_gradient(domain, expr):
-    if isinstance(expr, Jacobian) and isinstance(expr.target, TestFunction):
-        return True
-
-    for attr in ("left", "right", "operand", "args", "expr", "integrand", "target", "variables"):
-        if hasattr(expr, attr):
-            child = getattr(expr, attr)
-            if isinstance(child, (list, tuple)):
-                for c in child:
-                    if _contains_testfunction_gradient(domain, c):
-                        return True
-            elif child is not None:
-                if _contains_testfunction_gradient(domain, child):
-                    return True
-
-    return False
-
-def _is_testfunction_value(node):
-    return isinstance(node, TestFunction)
-
-
-def _is_testfunction_grad(node):
-    return isinstance(node, Jacobian) and isinstance(node.target, TestFunction)
-
-
-def _strip_single_test_basis_factor(domain, expr):
-    """
-    For scalar weak forms, strip exactly one test-function factor from a term.
-
-    Supported recursively through nested multiplications:
-      coeff * phi
-      phi * coeff
-      coeff * grad(phi)
-      grad(phi) * coeff
-      a * (b * phi)
-      a * (b * grad(phi))
-      etc.
-
-    Returns
-    -------
-    kind, coeff_expr
-        kind = "value" or "grad"
-        coeff_expr = expr with exactly one test basis factor removed
-    """
-    if _is_testfunction_value(expr):
-        return "value", Literal(1.0)
-
-    if _is_testfunction_grad(expr):
-        return "grad", Literal(1.0)
-
-    if isinstance(expr, BinaryOp) and expr.op == "*":
-        left = expr.left
-        right = expr.right
-
-        # direct patterns
-        if _is_testfunction_value(left):
-            return "value", right
-        if _is_testfunction_value(right):
-            return "value", left
-
-        if _is_testfunction_grad(left):
-            return "grad", right
-        if _is_testfunction_grad(right):
-            return "grad", left
-
-        # recursive patterns: try stripping from left subtree
-        try:
-            kind, coeff_left = _strip_single_test_basis_factor(domain, left)
-            return kind, coeff_left * right
-        except ValueError:
-            pass
-
-        # recursive patterns: try stripping from right subtree
-        try:
-            kind, coeff_right = _strip_single_test_basis_factor(domain, right)
-            return kind, left * coeff_right
-        except ValueError:
-            pass
-
-    raise ValueError(
-        "Could not strip a single TestFunction basis factor from weak-form term. "
-        f"Unsupported term structure: {expr}"
-    )
-
-def _get_testfunction_grad_dim(expr):
-    """
-    Return the physical derivative direction index for a grad(TestFunction) term.
-
-    Expected form:
-        Jacobian(TestFunction(...), [Variable(...)])
-
-    Returns
-    -------
-    int
-        derivative direction, e.g. 0 for x, 1 for y
-    """
-    if not (isinstance(expr, Jacobian) and isinstance(expr.target, TestFunction)):
-        raise ValueError(f"Expected Jacobian(TestFunction(...)), got {expr}")
-
-    if len(expr.variables) != 1:
-        raise ValueError(f"Expected one differentiation variable in {expr}")
-
-    var = expr.variables[0]
-    if not hasattr(var, "dim") or not isinstance(var.dim, (list, tuple)):
-        raise ValueError(f"Could not infer grad direction from variable {var}")
-
-    return int(var.dim[0])
 
 def _collect_variational_metas(domain, node, out):
     if node is None:
@@ -591,10 +691,9 @@ def _substitute_trial_for_vpinn(domain, node, trial_value, target_support: Optio
 # -----------------------------------------------------------------------------
 # Lower once, dispatch many
 # -----------------------------------------------------------------------------
-
 def lower_weak_form(domain, expr, *, trial_value=None, for_target: str = "fem") -> LoweredWeakForm:
     terms = _split_additive_terms(domain, expr)
-    lowered_terms: List[LoweredWeakTerm] = []
+    lowered_terms: List[LoweredChannelTerm] = []
 
     for sign, term in terms:
         support, region_id = _infer_term_bucket(domain, term)
@@ -608,23 +707,51 @@ def lower_weak_form(domain, expr, *, trial_value=None, for_target: str = "fem") 
                 target_support=support,
                 target_region_id=region_id,
             )
-            if for_target == "vpinn" and _contains_node_type(domain, term_for_target, TrialFunction):
+            if _contains_node_type(domain, term_for_target, TrialFunction):
                 raise RuntimeError(
                     "VPINN lowering failed: a TrialFunction is still present after substitution."
                 )
 
-        lowered_terms.append(
-            LoweredWeakTerm(
-                sign=sign,
-                expr=_apply_sign(domain, sign, term_for_target),
-                support=support,
-                region_id=region_id,
-                original_expr=term,
+        signed_expr = _apply_sign(domain, sign, term_for_target)
+
+        if for_target == "vpinn":
+            channel, coeff, meta = _extract_test_channel(domain, signed_expr)
+
+            if support == "boundary":
+                if channel != "test_value":
+                    raise NotImplementedError(
+                        f"Boundary grad(test)-type terms are not supported on region '{region_id}'."
+                    )
+                channel = "boundary_test_value"
+
+            lowered_terms.append(
+                LoweredChannelTerm(
+                    sign=sign,
+                    support=support,
+                    region_id=region_id,
+                    channel=channel,
+                    coeff=coeff,
+                    variable_id=int(meta.get("variable_id", 0)),
+                    value_shape=tuple(meta.get("value_shape", ())),
+                    original_expr=term,
+                )
             )
-        )
+        else:
+            # FEM/FEAX keeps the full signed term expression
+            lowered_terms.append(
+                LoweredChannelTerm(
+                    sign=sign,
+                    support=support,
+                    region_id=region_id,
+                    channel="raw",
+                    coeff=signed_expr,
+                    variable_id=0,
+                    value_shape=(),
+                    original_expr=term,
+                )
+            )
 
     return LoweredWeakForm(domain=domain, terms=lowered_terms)
-
 
 def assemble_weak_form(domain, expr, target="vpinn", **kwargs):
     if target == "vpinn":
@@ -677,4 +804,3 @@ def _assemble_vpinn_from_ir(ir: LoweredWeakForm, **kwargs):
         ir.boundary_value_exprs,
         num_total_nodes,
     )
-

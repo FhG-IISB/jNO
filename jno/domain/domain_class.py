@@ -855,6 +855,8 @@ class domain(MeshIOMixin):
             try:
                 bc_config = DirichletBCConfig()
 
+                component_names = {0: "x", 1: "y", 2: "z"}
+
                 for tag in dirichlet_tags:
                     loc_fn = self._make_tag_location_fn(tag)
                     if loc_fn is None:
@@ -865,7 +867,32 @@ class domain(MeshIOMixin):
                     if dirichlet_value_fns is not None and tag in dirichlet_value_fns:
                         value_obj = dirichlet_value_fns[tag]
 
-                    bc_config.add(loc_fn, "all", value_obj)
+                    # Scalar case
+                    if vec == 1:
+                        fn = value_obj if callable(value_obj) else (lambda p, c=float(value_obj): c)
+                        bc_config.add(loc_fn, "all", fn)
+                        continue
+
+                    # Vector case: value_obj may already be normalized into a list/tuple
+                    # of callables/scalars, or may be a single callable/scalar for all comps.
+                    if callable(value_obj) or onp.isscalar(value_obj):
+                        vals = [value_obj for _ in range(vec)]
+                    elif isinstance(value_obj, (list, tuple)):
+                        if len(value_obj) != vec:
+                            raise ValueError( f"Dirichlet BC for tag '{tag}' has {len(value_obj)} entries, but vec={vec}.")
+                        vals = list(value_obj)
+                    else:
+                        raise TypeError( f"Unsupported Dirichlet BC value type for tag '{tag}': {type(value_obj).__name__}")
+
+                    for comp, v in enumerate(vals):
+                        if callable(v):
+                            fn = v
+                        elif onp.isscalar(v):
+                            fn = (lambda p, c=float(v): c)
+                        else:
+                            raise TypeError(f"Unsupported Dirichlet BC component type for tag '{tag}', "f"component {comp}: {type(v).__name__}")
+
+                        bc_config.add(loc_fn, component_names.get(comp, comp), fn)
 
                 if len(bc_config.specs) > 0:
                     bc = bc_config.create_bc(prob)
@@ -912,13 +939,20 @@ class domain(MeshIOMixin):
         # FEAX Problem already stores PHYSICAL gradients and weighted test gradients
         # for all variables. Since this is the single-variable scalar case, take var 0.
         shape_grads_phys_jax = jnp.asarray(prob.shape_grads[:, :, :num_local_nodes, :])      # (n_cells, n_q, n_loc, dim)
-        v_grads_JxW_jax = jnp.asarray(prob.v_grads_JxW[:, :, :num_local_nodes, 0, :])        # (n_cells, n_q, n_loc, dim)
-        JxW_jax = jnp.asarray(prob.JxW[:, 0, :])                                              # (n_cells, n_q)
+        v_grads_JxW_jax = jnp.asarray(prob.v_grads_JxW[:, :, :num_local_nodes, :, :])     # (n_cells, n_q, n_loc, test_vec, dim)
+        JxW_raw = jnp.asarray(prob.JxW)
+        if JxW_raw.ndim == 3 and JxW_raw.shape[1] == 1:
+            JxW_jax = JxW_raw[:, 0, :]                                                     # (n_cells, n_q)
+        elif JxW_raw.ndim == 2:
+            JxW_jax = JxW_raw
+        else:
+            raise ValueError(f"Unexpected prob.JxW shape: {JxW_raw.shape}")                                             # (n_cells, n_q)
         quad_points = jnp.asarray(prob.physical_quad_points).reshape(-1, self.dimension)      # (n_cells*n_q, dim)
+            # (n_cells*n_q, dim)
 
         num_quads = JxW_jax.shape[1]
         dim = shape_grads_phys_jax.shape[-1]
-
+        test_vec = v_grads_JxW_jax.shape[-2]
         # IMPORTANT:
         # flat_cells must stay as (n_cells, n_loc); grouped assembly later flattens it
         flat_cells = cells_jax
@@ -926,7 +960,7 @@ class domain(MeshIOMixin):
         # Flatten for jNO TraceEvaluator consumption
         N_flat = jnp.tile(shape_vals_jax[None, :, :], (num_cells, 1, 1)).reshape(-1, num_local_nodes)
         dN_dx_flat = shape_grads_phys_jax.reshape(-1, num_local_nodes, dim)
-        v_grads_JxW_flat = v_grads_JxW_jax.reshape(-1, num_local_nodes, dim)
+        v_grads_JxW_flat = v_grads_JxW_jax.reshape(-1, num_local_nodes, test_vec, dim)
 
         # Lumped nodal normalization areas
         local_areas = jnp.einsum("cq,qa->ca", JxW_jax, shape_vals_jax)
@@ -945,6 +979,7 @@ class domain(MeshIOMixin):
             "v_grads_JxW_flat": v_grads_JxW_flat,
             "JxW": JxW_jax,
             "quad_points": quad_points,
+            "test_vec": int(test_vec),
             "num_total_nodes": int(fe.num_total_nodes),
             "boundary_nodes": jnp.asarray(self._extract_points_from_mesh(self.mesh), dtype=jnp.int32),
             "dirichlet_nodes": dirichlet_nodes,
