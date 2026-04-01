@@ -285,14 +285,28 @@ def _eval_expr_for_feax(domain, node, local):
         return tensor
 
     if isinstance(node, Variable):
-        if isinstance(node.tag, str) and node.tag.startswith("n_"):
-            if "boundary_normals" not in local or local["boundary_normals"] is None:
-                raise ValueError(f"Normal variable '{node.tag}' requested, but no boundary_normals were provided.")
-            dim0 = node.dim[0]
-            return local["boundary_normals"][:, dim0 : dim0 + 1]
-        pts = local["physical_quad_points"]
-        dim0 = node.dim[0]
-        return pts[:, dim0 : dim0 + 1]
+        dim_start, dim_end = node.dim
+
+        # FEAX local quadrature coordinates
+        if local.get("surface", False):
+            # Any boundary quadrature variable like gauss_right, gauss_top, gauss_wall
+            # should read from the current surface quad points inside that surface kernel.
+            if isinstance(node.tag, str) and node.tag.startswith("gauss_"):
+                return local["physical_quad_points"][..., dim_start:dim_end]
+
+        else:
+            # Volume quadrature variable
+            if node.tag == "fem_gauss":
+                return local["physical_quad_points"][..., dim_start:dim_end]
+
+        # Fallback to stored tensor/point-data context
+        if node.tag in local["domain_context"]:
+            arr = jnp.asarray(local["domain_context"][node.tag])
+            if arr.ndim >= 1 and arr.shape[0] == 1:
+                arr = arr[0]
+            return arr[..., dim_start:dim_end]
+
+        raise KeyError(f"Variable tag '{node.tag}' not found in FEAX local/domain context.")
 
     if isinstance(node, TestFunction):
         n_comp = _value_shape_num_components(getattr(node, "value_shape", ()))
@@ -393,10 +407,91 @@ def _eval_volume_integrand(domain, expr, value_shape, cell_sol_flat, physical_qu
     return ravel_pytree(jnp.sum(weighted, axis=0))[0]
 
 
-def _eval_surface_integrand(domain, expr, tag, value_shape, cell_sol_flat, physical_surface_quad_points, face_shape_vals, face_shape_grads, face_nanson_scale):
-    num_nodes = face_shape_vals.shape[1]
+def _eval_surface_integrand(
+    domain,
+    expr,
+    tag,
+    value_shape,
+    cell_sol_flat,
+    physical_surface_quad_points,
+    face_shape_vals,
+    face_shape_grads,
+    face_nanson_scale,
+):
     vec = _value_shape_num_components(value_shape)
-    cell_sol = cell_sol_flat.reshape(num_nodes, vec)
+
+    cell_sol_flat = jnp.asarray(cell_sol_flat)
+    physical_surface_quad_points = jnp.asarray(physical_surface_quad_points)
+    face_shape_vals = jnp.asarray(face_shape_vals)
+    face_shape_grads = jnp.asarray(face_shape_grads)
+    face_nanson_scale = jnp.asarray(face_nanson_scale)
+
+    # FEAX surface kernels use parent-cell DOFs, so derive node count from cell_sol_flat
+    if cell_sol_flat.ndim != 1:
+        cell_sol_flat = cell_sol_flat.reshape(-1)
+
+    if cell_sol_flat.size % vec != 0:
+        raise ValueError(
+            f"Surface kernel DOF size {cell_sol_flat.size} is not divisible by vec={vec} for tag '{tag}'."
+        )
+
+    n_parent_nodes = cell_sol_flat.size // vec
+    cell_sol = cell_sol_flat.reshape(n_parent_nodes, vec)
+
+    # Normalize FEAX inputs after boundary-wise vmap:
+    # expected:
+    #   physical_surface_quad_points : (nq, dim)
+    #   face_shape_vals              : (nq, n_parent_nodes)
+    #   face_shape_grads             : (nq, n_parent_nodes, dim)
+    #   face_nanson_scale            : (num_vars, nq) or (nq,)
+    if face_shape_vals.ndim != 2:
+        raise ValueError(
+            f"Expected face_shape_vals.ndim == 2, got shape {face_shape_vals.shape} for tag '{tag}'."
+        )
+    if face_shape_grads.ndim != 3:
+        raise ValueError(
+            f"Expected face_shape_grads.ndim == 3, got shape {face_shape_grads.shape} for tag '{tag}'."
+        )
+    if physical_surface_quad_points.ndim != 2:
+        raise ValueError(
+            f"Expected physical_surface_quad_points.ndim == 2, got shape {physical_surface_quad_points.shape} for tag '{tag}'."
+        )
+
+    nq = face_shape_vals.shape[0]
+    if face_shape_vals.shape[1] != n_parent_nodes:
+        raise ValueError(
+            f"Boundary shape/node mismatch on '{tag}': "
+            f"face_shape_vals.shape={face_shape_vals.shape}, "
+            f"but cell_sol implies n_parent_nodes={n_parent_nodes}."
+        )
+    if face_shape_grads.shape[0] != nq or face_shape_grads.shape[1] != n_parent_nodes:
+        raise ValueError(
+            f"Boundary grad shape mismatch on '{tag}': "
+            f"face_shape_grads.shape={face_shape_grads.shape}, "
+            f"expected (nq={nq}, n_parent_nodes={n_parent_nodes}, dim)."
+        )
+    if physical_surface_quad_points.shape[0] != nq:
+        raise ValueError(
+            f"Boundary quadrature mismatch on '{tag}': "
+            f"physical_surface_quad_points.shape={physical_surface_quad_points.shape}, "
+            f"face_shape_vals.shape={face_shape_vals.shape}."
+        )
+
+    # FEAX: face_nanson_scale after vmap over boundary faces is typically (num_vars, nq)
+    if face_nanson_scale.ndim == 2:
+        weights = face_nanson_scale[0]
+    elif face_nanson_scale.ndim == 1:
+        weights = face_nanson_scale
+    else:
+        raise ValueError(
+            f"Unsupported face_nanson_scale shape {face_nanson_scale.shape} for tag '{tag}'."
+        )
+
+    if weights.shape[0] != nq:
+        raise ValueError(
+            f"Boundary weight/quadrature mismatch on '{tag}': "
+            f"weights.shape={weights.shape}, nq={nq}."
+        )
 
     boundary_normals = None
     if hasattr(domain, "normals_by_tag"):
@@ -422,12 +517,11 @@ def _eval_surface_integrand(domain, expr, tag, value_shape, cell_sol_flat, physi
         "trial_vec": vec,
         "boundary_normals": boundary_normals,
     }
+
     val = _eval_expr_for_feax(domain, expr, local)
-    weights = face_nanson_scale[0]
     wshape = (weights.shape[0],) + (1,) * (val.ndim - 1)
     weighted = val * weights.reshape(wshape)
     return ravel_pytree(jnp.sum(weighted, axis=0))[0]
-
 
 def _make_universal_volume_kernel(domain, expr, value_shape):
     def kernel(cell_sol_flat, physical_quad_points, cell_shape_grads, cell_JxW, cell_v_grads_JxW, *cell_internal_vars):
@@ -622,6 +716,7 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
 
 def _assemble_fem_system_from_ir(domain, ir, **kwargs):
     import feax as fe
+    import jax.numpy as jnp
 
     problem, bc = _build_feax_problem(domain, ir)
     internal_vars = fe.InternalVars()
@@ -631,9 +726,25 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
     except Exception:
         u0 = jnp.zeros((problem.num_total_dofs_all_vars,), dtype=_default_float_dtype())
 
+    u0 = jnp.asarray(u0, dtype=_default_float_dtype())
+
     res_bc = fe.create_res_bc_function(problem, bc)
     jac_bc = fe.create_J_bc_function(problem, bc, symmetric=kwargs.get("symmetric_bc", True))
 
+    # FEAX returns the correction system:
+    #     A du = -r(u0)
+    # but jNO examples solve A u = b as a full-state system.
+    # Convert correction form to full-state form:
+    #     A u = A u0 - r(u0)
     A = jac_bc(u0, internal_vars)
-    b = -jnp.asarray(res_bc(u0, internal_vars))
+    r0 = jnp.asarray(res_bc(u0, internal_vars), dtype=_default_float_dtype())
+
+    if hasattr(A, "__matmul__"):
+        b = A @ u0 - r0
+    else:
+        # fallback for sparse types without direct matmul overload
+        A_dense = jnp.asarray(A.todense() if hasattr(A, "todense") else A.toarray())
+        b = A_dense @ u0 - r0
+        A = A_dense
+
     return A, b
