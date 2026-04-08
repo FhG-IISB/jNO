@@ -145,13 +145,13 @@ def get_rsa_private_key() -> str | None:
     return os.path.expanduser(raw) if raw else None
 
 
-def get_seed() -> int | None:
+def get_seed() -> int:
     """Return seed with env override support.
 
     Precedence:
     1) ``JNO_SEED`` (environment)
     2) ``jno.seed`` (config)
-    3) ``None``
+    3) ``42`` (default)
     """
     env_seed = os.getenv("JNO_SEED")
     if env_seed is not None:
@@ -161,7 +161,7 @@ def get_seed() -> int | None:
             raise ValueError(f"Invalid JNO_SEED={env_seed!r}; expected integer.") from e
 
     cfg = get_config()
-    return cfg.get("jno", {}).get("seed", None)
+    return cfg.get("jno", {}).get("seed", 42)
 
 
 # ---------------------------------------------------------------------------
