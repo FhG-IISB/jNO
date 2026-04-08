@@ -319,11 +319,11 @@ class TestCoreInit:
     def test_devices_set_after_compile(self, solver):
         assert solver.devices is not None
 
-    def test_default_seed_is_21_without_config(self, monkeypatch):
-        """With no config seed, core uses fallback seed 21."""
+    def test_default_seed_is_42_without_config(self, monkeypatch):
+        """With no config seed, core uses default seed 42."""
         import jno.utils.config as cfg_module
 
-        # Force config to empty so get_seed() returns None
+        # Force config to empty so get_seed() returns default 42
         monkeypatch.setattr(cfg_module, "_CONFIG", {})
 
         dom = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.1))
@@ -333,7 +333,7 @@ class TestCoreInit:
         u = u_net(x)
         pde = jnn.laplacian(u, [x])
         s = jno.core([pde.mse], dom)
-        assert s.seed == 21
+        assert s.seed == 42
 
     def test_seed_read_from_config(self, monkeypatch):
         """core uses the seed value from [jno] config when present."""

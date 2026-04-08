@@ -1176,9 +1176,6 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-checkpoint = [
-    { name = "orbax-checkpoint" },
-]
 cuda = [
     { name = "jax", extra = ["cuda12"] },
 ]
@@ -1190,7 +1187,6 @@ dev = [
     { name = "lineax" },
     { name = "mypy" },
     { name = "nevergrad" },
-    { name = "orbax-checkpoint" },
     { name = "paramax" },
     { name = "pyfiglet" },
     { name = "pylotte" },
@@ -1236,8 +1232,6 @@ requires-dist = [
     { name = "nevergrad", marker = "extra == 'dev'" },
     { name = "optax" },
     { name = "orbax-checkpoint" },
-    { name = "orbax-checkpoint", marker = "extra == 'checkpoint'" },
-    { name = "orbax-checkpoint", marker = "extra == 'dev'" },
     { name = "paramax", marker = "extra == 'dev'" },
     { name = "pyfiglet", marker = "extra == 'dev'" },
     { name = "pygmsh" },
@@ -1245,7 +1239,7 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "xprof", marker = "extra == 'dev'" },
 ]
-provides-extras = ["cuda", "checkpoint", "dev", "iree"]
+provides-extras = ["cuda", "dev", "iree"]
 
 [package.metadata.requires-dev]
 fem = [

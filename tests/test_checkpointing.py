@@ -50,7 +50,7 @@ class TestCallbackHooks:
             def __init__(self):
                 self.calls = []
 
-            def on_epoch_end(self, state, **kwargs):
+            def on_epoch_end(self, **kwargs):
                 self.calls.append(kwargs.get("epoch"))
 
         rec = Recorder()
@@ -68,7 +68,7 @@ class TestCallbackHooks:
             def __init__(self):
                 self.count = 0
 
-            def on_training_end(self, state, **kwargs):
+            def on_training_end(self, **kwargs):
                 self.count += 1
 
         ctr = Counter()
@@ -81,13 +81,13 @@ class TestCallbackHooks:
         """on_epoch_end should receive the documented keyword arguments."""
         from jno.utils.callbacks import Callback
 
-        required_keys = {"epoch", "trainable", "opt_states", "rng", "total_loss", "individual_losses"}
+        required_keys = {"epoch", "trainable", "opt_states", "rng", "total_loss", "individual_losses", "log"}
 
         class KeyChecker(Callback):
             def __init__(self):
                 self.received_keys = set()
 
-            def on_epoch_end(self, state, **kwargs):
+            def on_epoch_end(self, **kwargs):
                 self.received_keys.update(kwargs.keys())
 
         kc = KeyChecker()
@@ -367,3 +367,123 @@ class TestImportGuard:
 
         with pytest.raises(ImportError, match="orbax-checkpoint"):
             CC(directory="/tmp/test")
+
+
+# ---------------------------------------------------------------------------
+# Early stopping callback
+# ---------------------------------------------------------------------------
+
+
+class TestEarlyStoppingCallback:
+    """Tests for the EarlyStoppingCallback."""
+
+    def test_stops_training(self):
+        """Training should terminate before max epochs when loss plateaus."""
+        from jno.utils.callbacks import EarlyStoppingCallback
+
+        # patience=3 so it stops quickly
+        cb = EarlyStoppingCallback(patience=3, min_delta=0.0, verbose=False)
+        solver = _make_solver(epochs=0)
+        solver.solve(200, callbacks=[cb])
+
+        assert cb.has_stopped, "Early stopping should have triggered"
+        assert cb.stopped_epoch is not None
+        assert cb.stopped_epoch < 199, "Should have stopped before final epoch"
+
+    def test_does_not_stop_when_improving(self):
+        """With high patience, training should complete normally."""
+        from jno.utils.callbacks import EarlyStoppingCallback
+
+        cb = EarlyStoppingCallback(patience=10_000, verbose=False)
+        solver = _make_solver(epochs=0)
+        solver.solve(20, callbacks=[cb])
+
+        assert not cb.has_stopped
+
+    def test_mode_min(self):
+        """mode='min' should detect when loss stops decreasing."""
+        from jno.utils.callbacks import EarlyStoppingCallback
+
+        cb = EarlyStoppingCallback(patience=5, mode="min", verbose=False)
+
+        # Simulate decreasing then flat losses
+        for i, loss_val in enumerate([1.0, 0.5, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3]):
+            stop = cb.on_epoch_end(epoch=i, total_loss=jnp.array(loss_val), individual_losses=jnp.array([loss_val]), trainable=None, opt_states=None, rng=None)
+            if stop:
+                break
+
+        assert cb.has_stopped
+        assert cb.best_metric == pytest.approx(0.3)
+
+    def test_mode_max(self):
+        """mode='max' should detect when metric stops increasing."""
+        from jno.utils.callbacks import EarlyStoppingCallback
+
+        cb = EarlyStoppingCallback(
+            patience=3,
+            mode="max",
+            metric_fn=lambda **kw: float(jax.device_get(kw["total_loss"])),
+            verbose=False,
+        )
+
+        for i, val in enumerate([0.1, 0.5, 0.9, 0.9, 0.9, 0.9]):
+            stop = cb.on_epoch_end(epoch=i, total_loss=jnp.array(val), individual_losses=jnp.array([val]), trainable=None, opt_states=None, rng=None)
+            if stop:
+                break
+
+        assert cb.has_stopped
+        assert cb.best_metric == pytest.approx(0.9)
+
+    def test_mode_rel(self):
+        """mode='rel' should use relative improvement threshold."""
+        from jno.utils.callbacks import EarlyStoppingCallback
+
+        cb = EarlyStoppingCallback(patience=2, mode="rel", min_delta=0.1, verbose=False)
+
+        # 1.0 -> 0.95 is only 5% improvement, below 10% threshold
+        losses = [1.0, 0.95, 0.94, 0.93]
+        for i, val in enumerate(losses):
+            stop = cb.on_epoch_end(epoch=i, total_loss=jnp.array(val), individual_losses=jnp.array([val]), trainable=None, opt_states=None, rng=None)
+            if stop:
+                break
+
+        assert cb.has_stopped
+
+    def test_baseline(self):
+        """With a baseline, early stopping fires if metric never beats it."""
+        from jno.utils.callbacks import EarlyStoppingCallback
+
+        cb = EarlyStoppingCallback(patience=2, baseline=0.01, verbose=False)
+
+        # Loss never goes below baseline 0.01
+        for i in range(5):
+            stop = cb.on_epoch_end(epoch=i, total_loss=jnp.array(0.5), individual_losses=jnp.array([0.5]), trainable=None, opt_states=None, rng=None)
+            if stop:
+                break
+
+        assert cb.has_stopped
+
+    def test_invalid_mode_raises(self):
+        """Invalid mode should raise ValueError."""
+        from jno.utils.callbacks import EarlyStoppingCallback
+
+        with pytest.raises(ValueError, match="mode"):
+            EarlyStoppingCallback(mode="invalid")
+
+    def test_custom_metric_fn(self):
+        """A custom metric_fn should be used to extract the metric."""
+        from jno.utils.callbacks import EarlyStoppingCallback
+
+        # Monitor the first individual loss instead of total
+        cb = EarlyStoppingCallback(
+            patience=2,
+            metric_fn=lambda **kw: float(jax.device_get(kw["individual_losses"])[0]),
+            verbose=False,
+        )
+
+        for i, val in enumerate([1.0, 1.0, 1.0]):
+            stop = cb.on_epoch_end(epoch=i, total_loss=jnp.array(0.0), individual_losses=jnp.array([val]), trainable=None, opt_states=None, rng=None)
+            if stop:
+                break
+
+        assert cb.has_stopped

@@ -4,25 +4,23 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import Any, Dict, Optional
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-if TYPE_CHECKING:
-    from ..core import core
-
 
 class Callback:
     """Base callback class.
 
-    Subclass and override the hooks you need.  Every hook receives the
-    ``core`` solver instance as its first positional argument, followed by
-    keyword arguments whose contents depend on the hook.
+    Subclass and override the hooks you need.  Every hook receives
+    keyword arguments whose contents depend on the hook and the
+    caller.  This keeps the interface decoupled from any particular
+    solver implementation.
     """
 
-    def on_epoch_end(self, state: "core", **kwargs) -> None:
+    def on_epoch_end(self, **kwargs) -> bool:
         """Called at the end of every outer training step.
 
         Keyword Args:
@@ -32,9 +30,15 @@ class Callback:
             rng: Current JAX PRNG key.
             total_loss: Scalar total loss (JAX array, still on device).
             individual_losses: Per-constraint losses (JAX array).
-        """
+            log: Logger instance (when called from ``core.solve``).
 
-    def on_training_end(self, state: "core", **kwargs) -> None:
+        Returns:
+            ``True`` to request early termination of the training loop,
+            ``False`` (default) to continue.
+        """
+        return False
+
+    def on_training_end(self, **kwargs) -> None:
         """Called once after the training loop finishes."""
 
 
@@ -132,7 +136,7 @@ class CheckpointCallback(Callback):
 
     # -- hooks ---------------------------------------------------------------
 
-    def on_epoch_end(self, state: "core", **kwargs) -> None:
+    def on_epoch_end(self, **kwargs) -> None:
         ocp = self._ocp
         epoch: int = kwargs["epoch"]
         trainable = kwargs["trainable"]
@@ -167,7 +171,7 @@ class CheckpointCallback(Callback):
             metrics=metadata if self._best_fn is not None else None,
         )
 
-    def on_training_end(self, state: "core", **kwargs) -> None:
+    def on_training_end(self, **kwargs) -> None:
         self._manager.wait_until_finished()
 
     # -- public API ----------------------------------------------------------
@@ -210,3 +214,122 @@ class CheckpointCallback(Callback):
     def close(self) -> None:
         """Close the checkpoint manager (waits for pending writes)."""
         self._manager.close()
+
+
+# ---------------------------------------------------------------------------
+# Early stopping callback
+# ---------------------------------------------------------------------------
+
+
+class EarlyStoppingCallback(Callback):
+    """Stop training when a monitored metric stops improving.
+
+    Monitors a scalar metric (by default the total loss) each epoch and
+    signals the training loop to stop once the metric has not improved
+    for *patience* consecutive checks.
+
+    Three stopping strategies are available via the *mode* parameter:
+
+    ``"min"``
+        Improvement means the metric decreased by more than *min_delta*.
+        Use for losses.
+    ``"max"``
+        Improvement means the metric increased by more than *min_delta*.
+        Use for accuracy-like metrics.
+    ``"rel"``
+        Improvement means the metric decreased by a factor of at least
+        *min_delta* relative to the best value so far
+        (i.e. ``new < best * (1 - min_delta)``).  Useful when the loss
+        spans many orders of magnitude, which is common in PINN training.
+
+    Args:
+        patience: Number of epochs with no improvement after which
+            training is stopped.  Default ``500``.
+        min_delta: Minimum change to qualify as an improvement.
+            For ``"min"``/``"max"`` this is an absolute threshold;
+            for ``"rel"`` it is a relative fraction.  Default ``0.0``.
+        mode: One of ``"min"``, ``"max"``, or ``"rel"``.
+            Default ``"min"``.
+        metric_fn: Callable that extracts the scalar metric from the
+            ``on_epoch_end`` keyword arguments.  Default extracts
+            ``total_loss`` (transferred to host).
+        baseline: An optional baseline value.  Training will stop if
+            the metric never improves beyond this value.
+        verbose: If ``True``, log a message when stopping.
+
+    Example::
+
+        cb = jno.callback.early_stopping(patience=1000, min_delta=1e-6)
+        solver.solve(epochs=100_000, callbacks=[cb])
+
+        print(cb.stopped_epoch)   # epoch at which training was halted
+        print(cb.best_metric)     # best metric value observed
+    """
+
+    def __init__(
+        self,
+        patience: int = 500,
+        min_delta: float = 0.0,
+        mode: str = "min",
+        metric_fn: Optional[Any] = None,
+        baseline: Optional[float] = None,
+        verbose: bool = True,
+    ) -> None:
+        if mode not in ("min", "max", "rel"):
+            raise ValueError(f"mode must be 'min', 'max', or 'rel', got {mode!r}")
+
+        self.patience = patience
+        self.min_delta = abs(min_delta)
+        self.mode = mode
+        self.verbose = verbose
+
+        if metric_fn is None:
+            self._metric_fn = lambda **kw: float(jax.device_get(kw["total_loss"]))
+        else:
+            self._metric_fn = metric_fn
+
+        self.best_metric: Optional[float] = baseline
+        self.stopped_epoch: Optional[int] = None
+        self._wait = 0
+        self._stopped = False
+
+    # -- comparison helpers --------------------------------------------------
+
+    def _is_improvement(self, current: float) -> bool:
+        if self.best_metric is None:
+            return True
+        if self.mode == "min":
+            return current < self.best_metric - self.min_delta
+        elif self.mode == "max":
+            return current > self.best_metric + self.min_delta
+        else:  # rel
+            return current < self.best_metric * (1.0 - self.min_delta)
+
+    # -- hooks ---------------------------------------------------------------
+
+    def on_epoch_end(self, **kwargs) -> bool:
+        current = self._metric_fn(**kwargs)
+        epoch: int = kwargs["epoch"]
+
+        if self._is_improvement(current):
+            self.best_metric = current
+            self._wait = 0
+        else:
+            self._wait += 1
+
+        if self._wait >= self.patience:
+            self._stopped = True
+            self.stopped_epoch = epoch
+            if self.verbose:
+                log = kwargs.get("log")
+                msg = f"Early stopping at epoch {epoch}: " f"no improvement for {self.patience} epochs " f"(best={self.best_metric:.6e})"
+                if log is not None:
+                    log.info(msg)
+            return True  # signal stop
+
+        return False
+
+    @property
+    def has_stopped(self) -> bool:
+        """Whether early stopping was triggered."""
+        return self._stopped
