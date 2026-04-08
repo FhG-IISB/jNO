@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple, Optional, Callable, Any, Union
+from typing import Dict, List, Tuple, Optional, Callable, Any, Union, overload
 
 import jax
 import jax.numpy as jnp
@@ -1278,10 +1278,38 @@ class domain(MeshIOMixin):
         self._param_tags.add(name)
         return self
 
+    @overload
     def variable(
         self,
         tag: str,
-        sample: Tuple[Optional[int], Optional[Callable]] = (None, None),
+        sample: Union[jnp.ndarray, np.ndarray],
+        resampling_strategy: Any = ...,
+        normals: bool = ...,
+        reverse_normals: bool = ...,
+        view_factor: bool = ...,
+        point_data: bool = ...,
+        split: bool = ...,
+        return_indices: Any = ...,
+    ) -> TensorTag: ...
+
+    @overload
+    def variable(
+        self,
+        tag: str,
+        sample: Tuple[Optional[int], Optional[Callable]] = ...,
+        resampling_strategy: Any = ...,
+        normals: bool = ...,
+        reverse_normals: bool = ...,
+        view_factor: bool = ...,
+        point_data: bool = ...,
+        split: bool = ...,
+        return_indices: Any = ...,
+    ) -> Tuple[Variable, ...]: ...
+
+    def variable(
+        self,
+        tag: str,
+        sample=(None, None),
         resampling_strategy=None,
         normals: bool = False,
         reverse_normals: bool = False,
@@ -1289,7 +1317,7 @@ class domain(MeshIOMixin):
         point_data: bool = False,
         split: bool = False,
         return_indices=False,
-    ) -> Any:
+    ):
         """Create Variable placeholders for a tagged point set or tensor.
 
         Args:
