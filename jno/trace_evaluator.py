@@ -325,30 +325,33 @@ class TraceEvaluator:
     # Helpers shared by differential-operator handlers
     # ------------------------------------------------------------------
     def _build_local_context(self, idx, tag, points, context):
-        """Build dynamically-sliced local context for a single point ``idx``.
+        """Build dynamically-sliced local context for a single point ``idx``."""
+        local = {
+                "__active_spatial_n__": 1,
+            }
 
-        Used by AD-based Jacobian and Hessian handlers
-        to construct per-point evaluation contexts.
-        """
-        local = {}
         for k, v in context.items():
-            # ---Safely pass through FEM dictionaries and scalars ---
+            # keep helper key / scalars / dicts
+            if k == "__active_spatial_n__":
+                continue
             if isinstance(v, dict) or not hasattr(v, "ndim"):
                 local[k] = v
                 continue
+
             if v.ndim < 1:
                 local[k] = v
+
             elif v.ndim == 1:
                 if k == tag or v.shape[0] == points.shape[0]:
                     local[k] = jax.lax.dynamic_slice(v, (idx,), (1,))
                 else:
                     local[k] = v
+
             else:
                 # v.ndim >= 2
                 if k == tag or v.shape[0] == points.shape[0]:
-                    # Handle N-dimensional arrays by padding start_indices and slice_sizes
                     start_indices = (idx,) + (0,) * (v.ndim - 1)
-                    slice_sizes = (1,) + v.shape[1:]
+                    slice_sizes = (1,) + tuple(v.shape[1:])
                     local[k] = jax.lax.dynamic_slice(v, start_indices, slice_sizes)
                 else:
                     local[k] = v
@@ -404,20 +407,58 @@ class TraceEvaluator:
         tag = bound_var.tag
         axis = getattr(bound_var, "axis", "spatial")
 
+        def _broadcast_temporal(result):
+            result = jnp.asarray(result)
+
+            # Prefer explicitly supplied active local point count
+            N = ctx.context.get("__active_spatial_n__", None)
+
+            if N is None:
+                # Fallback: infer from current context
+                for k, v in ctx.context.items():
+                    if k == "__active_spatial_n__":
+                        continue
+                    if str(k).startswith("__time"):
+                        continue
+                    if hasattr(v, "ndim") and v.ndim >= 2:
+                        N = int(v.shape[0])
+                        break
+
+            if N is None:
+                return result
+
+            # scalar -> (N,1)
+            if result.ndim == 0:
+                return jnp.full((N, 1), result)
+
+            # (1,) or (N,) -> (N,1)
+            if result.ndim == 1:
+                if result.shape[0] == 1:
+                    return jnp.broadcast_to(result.reshape(1, 1), (N, 1))
+                if result.shape[0] == N:
+                    return result[:, None]
+                return result
+
+            # (1,1) -> (N,1)
+            if result.ndim == 2 and result.shape[0] == 1:
+                return jnp.broadcast_to(result, (N, result.shape[1]))
+
+            return result
+
         if tag in ctx.context:
             tag_data = ctx.context[tag]
             dim_start, dim_end = bound_var.dim
             result = tag_data[..., dim_start:dim_end]
-            if dim_end is None:
-                pass  # keep full shape
+            if axis == "temporal":
+                return _broadcast_temporal(result)
             return result
+
         elif axis == "temporal" and "__time__" in ctx.context:
-            # Temporal variable reads from the shared time context.
-            # After T-scan peels the T axis this is a scalar (1,).
             tag_data = ctx.context["__time__"]
             dim_start, dim_end = bound_var.dim
             result = tag_data[..., dim_start:dim_end]
-            return result
+            return _broadcast_temporal(result)
+
         else:
             self.log.error(f"Variable tag '{tag}' not found. context: {list(ctx.context.keys())}")
             raise KeyError(f"Variable tag '{tag}' not found in context")
@@ -650,34 +691,53 @@ class TraceEvaluator:
 
             # ── Temporal derivative via AD (default) ──
             # Find any spatial tag to determine N
+            domain = getattr(bound_var, "_domain", None)
+            param_tags = set(getattr(domain, "_param_tags", set())) if domain is not None else set()
+
+            def is_spatial_pointset(tag_name, value):
+                if tag_name == time_key or str(tag_name).startswith("__time"):
+                    return False
+                if tag_name in param_tags:
+                    return False
+                if not hasattr(value, "ndim"):
+                    return False
+                # active sampled coordinates are typically (N, D)
+                return value.ndim >= 2
+
+            # Determine N only from spatial point-set arrays, not parametric tags like GRF
             N = 1
             for k, v in ctx.context.items():
-                if k != time_key and hasattr(v, "ndim") and v.ndim >= 1:
-                    N = max(N, v.shape[0])
+                if is_spatial_pointset(k, v):
+                    N = max(N, int(v.shape[0]))
 
             def grad_time_single(idx):
-                """Grad w.r.t. time for spatial point idx."""
-                # Build local context with point idx sliced out of spatial arrays
-                local_ctx = {}
+                """Grad w.r.t. time for one spatial point idx."""
+                local_ctx = {"__active_spatial_n__": 1}
                 for k, v in ctx.context.items():
                     if k == time_key:
-                        continue  # will be replaced by differentiable t
-                    if hasattr(v, "ndim") and v.ndim >= 2 and v.shape[0] == N:
-                        local_ctx[k] = jax.lax.dynamic_slice(v, (idx, 0), (1, v.shape[1]))
-                    elif hasattr(v, "ndim") and v.ndim == 1 and v.shape[0] == N:
-                        local_ctx[k] = jax.lax.dynamic_slice(v, (idx,), (1,))
+                        continue  # replaced by differentiable t below
+
+                    if is_spatial_pointset(k, v) and int(v.shape[0]) == N:
+                        start_indices = (idx,) + (0,) * (v.ndim - 1)
+                        slice_sizes = (1,) + tuple(v.shape[1:])
+                        local_ctx[k] = jax.lax.dynamic_slice(v, start_indices, slice_sizes)
                     else:
+                        # keep parametric tags like GRF untouched
                         local_ctx[k] = v
 
                 def u_of_t(t_arr):
                     new_ctx_dict = {**local_ctx, time_key: t_arr}
-                    new_ctx = evaluator_self._EvalCtx(new_ctx_dict, ctx.var_bindings, ctx.key, active_region=ctx.active_region)
+                    new_ctx = evaluator_self._EvalCtx(
+                        new_ctx_dict,
+                        ctx.var_bindings,
+                        ctx.key,
+                        active_region=ctx.active_region,
+                    )
                     return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
 
                 return jax.grad(u_of_t)(time_val)[0]
 
             result = jax.vmap(grad_time_single)(jnp.arange(N))
-            # Ensure (N,) → (N, 1) to match variable / model-output shapes
             return result[:, jnp.newaxis]
 
         # ── Spatial derivative ──

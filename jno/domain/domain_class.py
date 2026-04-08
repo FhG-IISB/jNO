@@ -1317,7 +1317,8 @@ class domain(MeshIOMixin):
         point_data: bool = False,
         split: bool = False,
         return_indices=False,
-    ):
+        time_value: float | None = None,
+    ) -> Any:
         """Create Variable placeholders for a tagged point set or tensor.
 
         Args:
@@ -1346,6 +1347,9 @@ class domain(MeshIOMixin):
                     self.context[tag] = sample
                 else:
                     self.add_tensor_tag(tag, sample)
+        # auto-default for the initial slice in time-dependent problems
+        if time_value is None and tag == "initial" and self._is_time_dependent and self.time is not None:
+            time_value = self.time[0]
 
         if tag in self._mesh_pool.keys() and isinstance(sample, tuple) and len(sample) > 0 and isinstance(sample[0], (int, type(None))):
             # Sample points for this tag on demand
@@ -1391,16 +1395,48 @@ class domain(MeshIOMixin):
         # Create Variable placeholder for each spatial dimension
         coord_vars: List[Any] = [Variable(tag=tag, dim=[i, i + 1], domain=self, axis="spatial", fem_meta=fem_meta) for i in range(self.dimension)]
 
-        # Always add temporal variable (constant 1 for stationary problems)
-        coord_vars.append(
-            Variable(
-                tag="__time__",
-                dim=[0, 1],
-                domain=self,
-                axis="temporal",
-                fem_meta=None,
+        # Time variable
+        if self._is_time_dependent:
+            if time_value is None:
+                # default behavior: shared global time variable
+                coord_vars.append(
+                    Variable(
+                        tag="__time__",
+                        dim=[0, 1],
+                        domain=self,
+                        axis="temporal",
+                        fem_meta=None,
+                    )
+                )
+            else:
+                # local fixed-time variable with the same shape as this sampled tag
+                local_time_tag = f"__time_{tag}__"
+
+                if local_time_tag not in self.context:
+                    pts = np.asarray(self.context[tag])
+                    time_dtype = np.asarray(self.context["__time__"]).dtype if "__time__" in self.context else pts.dtype
+                    self.context[local_time_tag] = np.full(pts[..., :1].shape, time_value, dtype=time_dtype)
+
+                coord_vars.append(
+                    Variable(
+                        tag=local_time_tag,
+                        dim=[0, 1],
+                        domain=self,
+                        axis="temporal",
+                        fem_meta=None,
+                    )
+                )
+        else:
+            # stationary problems still expose a time-like variable via __time__
+            coord_vars.append(
+                Variable(
+                    tag="__time__",
+                    dim=[0, 1],
+                    domain=self,
+                    axis="temporal",
+                    fem_meta=None,
+                )
             )
-        )
 
         if normals:
             if reverse_normals:
