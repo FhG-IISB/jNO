@@ -57,6 +57,7 @@ class _CallbackNamespace:
 
     from .utils.callbacks import Callback as base  # noqa: F401
     from .utils.callbacks import CheckpointCallback as checkpoint  # noqa: F401
+    from .utils.callbacks import EarlyStoppingCallback as early_stopping  # noqa: F401
 
 
 callback = _CallbackNamespace()

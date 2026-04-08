@@ -34,7 +34,6 @@ from .trace import (
     cse,
 )
 from .utils import LearningRateSchedule, WeightSchedule, statistics, get_logger, get_seed
-from .utils.monitor import HardwareMonitor
 from .domain import domain, DomainData
 from .trace_evaluator import TraceEvaluator
 from .trace_compiler import TraceCompiler
@@ -1329,8 +1328,6 @@ class core:
             del _tw, _ow, _rw, _ew, _pl
 
             # ── 8. Training loop ──
-            # hw_monitor = HardwareMonitor(logger=self.log, interval=0.5)
-            # hw_monitor.start()
 
             print_rate = max(1, epochs // 10 if epochs < 100_000 else epochs // 1000)
             prev_losses = jax.device_put(jnp.zeros(self.n_constraints), replicated)
@@ -1528,15 +1525,19 @@ class core:
                         "rng": self.rng,
                         "total_loss": total_loss,
                         "individual_losses": individual_losses,
+                        "log": self.log,
                     }
+                    _stop_requested = False
                     for cb in callbacks:
-                        cb.on_epoch_end(self, **cb_info)
+                        if cb.on_epoch_end(**cb_info):
+                            _stop_requested = True
+                    if _stop_requested:
+                        break
 
             if _profile_active:
                 _profile_ctx.__exit__(None, None, None)
 
             et = time.time()
-            # hw_monitor.stop(logger=self.log)
 
             gc.enable()  # restore GC after training loop
 
@@ -1583,7 +1584,7 @@ class core:
         # --- callbacks: on_training_end ---
         if callbacks:
             for cb in callbacks:
-                cb.on_training_end(self)
+                cb.on_training_end()
 
         return statistics(self.training_logs)
 
