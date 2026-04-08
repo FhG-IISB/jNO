@@ -386,8 +386,7 @@ class EarlyStoppingCallback(Callback):
                     log.info(msg)
             wandb_alert(
                 "Early stopping",
-                f"Stopped at epoch {epoch} — no improvement for "
-                f"{self.patience} epochs (best={self.best_metric:.6e})",
+                f"Stopped at epoch {epoch} — no improvement for " f"{self.patience} epochs (best={self.best_metric:.6e})",
                 level="WARN",
             )
             return True  # signal stop

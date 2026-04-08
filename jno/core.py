@@ -1374,16 +1374,19 @@ class core:
                     _k = str(_lid)
                     _wandb_model_names[_k] = _fm.name or type(_fm.module).__name__
                 # Log config to wandb
-                _wandb_run.config.update({
-                    "epochs": epochs,
-                    "inner_steps": inner_steps,
-                    "n_constraints": self.n_constraints,
-                    "n_trackers": len(self.compiled_trackers),
-                    "trainable_params": n_trainable_params,
-                    "frozen_params": n_frozen_params,
-                    "total_params": n_total_params,
-                    "seed": self.seed,
-                }, allow_val_change=True)
+                _wandb_run.config.update(
+                    {
+                        "epochs": epochs,
+                        "inner_steps": inner_steps,
+                        "n_constraints": self.n_constraints,
+                        "n_trackers": len(self.compiled_trackers),
+                        "trainable_params": n_trainable_params,
+                        "frozen_params": n_frozen_params,
+                        "total_params": n_total_params,
+                        "seed": self.seed,
+                    },
+                    allow_val_change=True,
+                )
 
             _wandb_nan_alerted = False
 
@@ -1642,10 +1645,12 @@ class core:
 
             # --- wandb: log training summary ---
             if _wandb_run is not None:
-                _wandb_run.summary.update({
-                    "training_time": logs["training_time"],
-                    "final_total_loss": float(log_total_loss[-1]) if log_total_loss else None,
-                })
+                _wandb_run.summary.update(
+                    {
+                        "training_time": logs["training_time"],
+                        "final_total_loss": float(log_total_loss[-1]) if log_total_loss else None,
+                    }
+                )
                 wandb_log_model(self)
 
         self._total_epochs += epochs

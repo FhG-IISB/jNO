@@ -270,8 +270,7 @@ def _init_wandb(wandb_arg: bool | dict, project: str, run_dir: str) -> None:
         import warnings
 
         warnings.warn(
-            "wandb=True was passed to jno.setup() but the 'wandb' package "
-            "is not installed.  Install it with:  pip install wandb",
+            "wandb=True was passed to jno.setup() but the 'wandb' package " "is not installed.  Install it with:  pip install wandb",
             stacklevel=3,
         )
         _WANDB_RUN = None
@@ -311,6 +310,7 @@ def wandb_alert(title: str, text: str, level: str = "WARN") -> None:
         return
     try:
         import wandb  # type: ignore[import-untyped]
+
         alert_level = getattr(wandb.AlertLevel, level, wandb.AlertLevel.WARN)
         _WANDB_RUN.alert(title=title, text=text, level=alert_level)
     except Exception:

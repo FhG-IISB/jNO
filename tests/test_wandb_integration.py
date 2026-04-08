@@ -33,9 +33,7 @@ class TestInitWandb:
         with patch.dict("sys.modules", {"wandb": mock_wandb}):
             cfg_module._init_wandb(True, "heat_eq", "/tmp/runs/heat_eq")
 
-        mock_wandb.init.assert_called_once_with(
-            project="heat_eq", dir="/tmp/runs/heat_eq"
-        )
+        mock_wandb.init.assert_called_once_with(project="heat_eq", dir="/tmp/runs/heat_eq")
         assert cfg_module.get_wandb_run() is mock_run
 
     def test_dict_passes_kwargs(self):
