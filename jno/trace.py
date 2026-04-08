@@ -381,20 +381,6 @@ class Placeholder:
         """
         return Hessian(self, list(variables), scheme, trace=False)
 
-    def d2(self, variable: "Variable", scheme: str = "automatic_differentiation") -> "Hessian":
-        """Return ∂²self/∂variable² — shorthand for ``jnn.hessian(self, [variable])``.
-
-        Args:
-            variable: The Variable to differentiate with respect to.
-            scheme: ``'automatic_differentiation'`` (default) or
-                ``'finite_difference'``.
-        """
-        return Hessian(self, [variable], scheme, trace=True)
-
-    def dd(self, variable: "Variable", scheme: str = "automatic_differentiation") -> "Hessian":
-        """Alias for :meth:`d2`."""
-        return Hessian(self, [variable], scheme, trace=True)
-
 
 class Literal(Placeholder):
     """Concrete scalar/array embedded in the trace (no trainable params)."""
@@ -904,8 +890,8 @@ class Model(Placeholder):
 
     # ── public API ───────────────────────────────────────────
 
-    def __call__(self, *args):
-        """Call this module with variables - creates a ModelCall."""
+    def __call__(self, *args) -> "ModelCall":
+        """Call this module with variables and return a traced ``ModelCall``."""
         return ModelCall(self, list(args))
 
     def __repr__(self):
