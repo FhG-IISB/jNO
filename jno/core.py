@@ -60,6 +60,7 @@ class core:
         constraints: List[Placeholder],
         domain: domain,
         mesh: Optional[Tuple[int, ...]] = (1, 1),
+        resume_from: Optional[str] = None,
     ):
         """
         Initialize core solver.
@@ -112,17 +113,24 @@ class core:
 
                 Default: (1, 1), automatically expanded to (n_devices, 1) for pure
                 data parallelism when multiple devices are available.
+
+            resume_from: Path to a checkpoint directory written by
+                :class:`~jno.utils.callbacks.CheckpointCallback`.  When
+                provided, model parameters, optimizer states, and the RNG
+                key are restored from the latest checkpoint at the start
+                of the next ``solve()`` call.  Requires the optional
+                ``orbax-checkpoint`` package.
         """
         self.log = get_logger()
         self.constraints: List[Placeholder] = constraints
 
         self.domain = domain
-        self.models: Dict[int, Any] = {}  # full equinox models (pytrees with arrays + static)
+        self.models: Dict[int, Any] = {}
         self._trained_ops: Dict[int, Any] = {}
         self.training_logs: List[Dict[str, jnp.ndarray]] = []
         self.dots: List = []
-        self.checkpoints: List[Dict] = []
         self.all_ops: List[OperationDef] = []
+        self._resume_from: Optional[str] = resume_from
 
         super().__init__()
 
@@ -670,6 +678,7 @@ class core:
         inner_steps: int = 1,
         min_consecutive: int = 1,
         profile: bool = False,
+        callbacks: Optional[List] = None,
     ):
         """Train using per-model optimizers attached via ``model.optimizer()``.
 
@@ -690,6 +699,19 @@ class core:
                 host (CPU) memory and stream only the current mini-batch
                 to the device each step.  Requires ``batchsize`` to be
                 set.  Default ``False``.
+            inner_steps: Number of gradient steps to fuse into a single
+                ``jax.lax.fori_loop`` call, amortising Python dispatch
+                overhead.  Must evenly divide *epochs*.  Default ``1``.
+            min_consecutive: Minimum number of consecutive time steps
+                fed to each constraint evaluation.  Default ``1``.
+            profile: If ``True``, capture a JAX profiler trace for a
+                short window of steady-state training steps.  The trace
+                is written to ``<logger.path>/traces``.  Default
+                ``False``.
+            callbacks: Optional list of :class:`~jno.utils.callbacks.Callback`
+                instances.  ``on_epoch_end`` is called after every outer
+                step; ``on_training_end`` is called once after the loop
+                finishes.
 
         Returns:
             statistics: Training history with ``.plot()`` convenience.
@@ -904,6 +926,10 @@ class core:
         trainable, rest = eqx.partition(models, filter_spec)
         frozen_arrays, static = eqx.partition(rest, eqx.is_array)
 
+        # Stash for restore_checkpoint()
+        self._last_frozen_arrays = frozen_arrays
+        self._last_static = static
+
         # ── 4b. Log parameter counts ──
         def _count_params(pytree):
             """Count total parameters in a pytree."""
@@ -1083,6 +1109,46 @@ class core:
             )
 
         self._log_constraint_shapes(batchsize, min_consecutive=min_consecutive)
+
+        # ── 5b. Resume from checkpoint (optional) ──
+        if self._resume_from is not None:
+            try:
+                import orbax.checkpoint as _ocp
+            except ImportError as exc:
+                raise ImportError("orbax-checkpoint is required for resume_from=. " "Install it with:  pip install orbax-checkpoint") from exc
+
+            _ckpt_mgr = _ocp.CheckpointManager(
+                os.path.abspath(self._resume_from),
+                options=_ocp.CheckpointManagerOptions(read_only=True),
+            )
+            _ckpt_step = getattr(self, "_resume_step", None) or _ckpt_mgr.latest_step()
+            if _ckpt_step is None:
+                raise FileNotFoundError(f"No checkpoints found in {self._resume_from}")
+
+            # Build the target tree matching the live partition/opt structure
+            # so Orbax restores arrays into the correct Equinox pytree shape.
+            _target_state = {
+                "trainable": trainable,
+                "opt_states": opt_states,
+                "rng": self.rng,
+            }
+            _restored = _ckpt_mgr.restore(
+                _ckpt_step,
+                args=_ocp.args.Composite(
+                    state=_ocp.args.StandardRestore(_target_state),
+                    metadata=_ocp.args.JsonRestore(),
+                ),
+            )
+            trainable = _restored.state["trainable"]
+            opt_states = _restored.state["opt_states"]
+            self.rng = _restored.state["rng"]
+
+            _ckpt_meta = _restored.metadata
+            if _ckpt_meta is not None and "epoch" in _ckpt_meta:
+                self._total_epochs = int(_ckpt_meta["epoch"])
+            self.log.info(f"Resumed from checkpoint {self._resume_from} at step {_ckpt_step}")
+            _ckpt_mgr.close()
+            self._resume_from = None  # only resume once
 
         # ── 6. Prepare data ──
         n_devices = len(self.devices)
@@ -1453,6 +1519,19 @@ class core:
                     else:
                         self.log.info(f"Epoch {displayed_epoch:>6}/{epochs}| " f"L:{total_np:>10.4e} | {loss_strs}")
 
+                # --- callbacks ---
+                if callbacks:
+                    cb_info = {
+                        "epoch": epoch + inner_steps - 1,
+                        "trainable": trainable,
+                        "opt_states": opt_states,
+                        "rng": self.rng,
+                        "total_loss": total_loss,
+                        "individual_losses": individual_losses,
+                    }
+                    for cb in callbacks:
+                        cb.on_epoch_end(self, **cb_info)
+
             if _profile_active:
                 _profile_ctx.__exit__(None, None, None)
 
@@ -1501,31 +1580,66 @@ class core:
 
         self._total_epochs += epochs
 
-        # Checkpoint
-        self.checkpoints.append(
-            self.checkpoint(
-                models=self.models,
-                opt_state=opt_states,
-                rng=self.rng,
-            )
-        )
+        # --- callbacks: on_training_end ---
+        if callbacks:
+            for cb in callbacks:
+                cb.on_training_end(self)
 
         return statistics(self.training_logs)
 
-    def checkpoint(self, models, opt_state, rng, lora_params=None):
-        """Snapshot current model weights and optimiser state."""
-        import copy
+    def restore_checkpoint(self, directory: str, step: Optional[int] = None):
+        """Restore model parameters and optimizer state from an Orbax checkpoint.
 
-        payload = {
-            "step": int(self._total_epochs),
-            "time": time.time(),
-            "models": copy.deepcopy(models),
-            "opt_state": copy.deepcopy(opt_state),
-            "rng": copy.deepcopy(rng),
-        }
-        if lora_params is not None:
-            payload["lora_params"] = copy.deepcopy(lora_params)
-        return payload
+        Reads checkpoint metadata (epoch counter) immediately and schedules
+        a full weight restore for the next :meth:`solve` call.  The actual
+        array restore is deferred because Orbax needs the live Equinox /
+        Optax tree structures as a target, and those are only available
+        inside ``solve()`` after the three-way partition and optimizer
+        initialisation.
+
+        Args:
+            directory: Path to the checkpoint directory written by
+                :class:`~jno.utils.callbacks.CheckpointCallback`.
+            step: Checkpoint step to restore.  ``None`` (default)
+                restores the latest available checkpoint.
+
+        Returns:
+            self, for chaining.
+        """
+        try:
+            import orbax.checkpoint as ocp
+        except ImportError as exc:
+            raise ImportError("orbax-checkpoint is required for restore_checkpoint(). " "Install it with:  pip install orbax-checkpoint") from exc
+
+        manager = ocp.CheckpointManager(
+            os.path.abspath(directory),
+            options=ocp.CheckpointManagerOptions(read_only=True),
+        )
+        if step is None:
+            step = manager.latest_step()
+        if step is None:
+            raise FileNotFoundError(f"No checkpoints found in {directory}")
+
+        # Read only metadata so we can set the epoch counter now.
+        restored = manager.restore(
+            step,
+            args=ocp.args.Composite(
+                metadata=ocp.args.JsonRestore(),
+            ),
+        )
+        metadata = restored.metadata
+
+        if metadata is not None and "epoch" in metadata:
+            self._total_epochs = int(metadata["epoch"])
+
+        self.log.info(f"Restored checkpoint from {directory} at step {step}")
+        manager.close()
+
+        # Defer actual weight / opt-state restore to solve(), where the
+        # correct Equinox and Optax tree structures are available.
+        self._resume_from = os.path.abspath(directory)
+        self._resume_step = step
+        return self
 
     def _log_constraint_shapes(self, batchsize, min_consecutive: int = 1):
         """Log the output shape of each constraint by doing a test evaluation.
