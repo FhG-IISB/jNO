@@ -34,7 +34,7 @@ from .trace import (
     cse,
 )
 from .utils import LearningRateSchedule, WeightSchedule, statistics, get_logger, get_seed
-from .utils.monitor import HardwareMonitor
+from .utils.config import get_wandb_run, wandb_log, wandb_log_model, wandb_alert
 from .domain import domain, DomainData
 from .trace_evaluator import TraceEvaluator
 from .trace_compiler import TraceCompiler
@@ -60,6 +60,7 @@ class core:
         constraints: List[Placeholder],
         domain: domain,
         mesh: Optional[Tuple[int, ...]] = (1, 1),
+        resume_from: Optional[str] = None,
     ):
         """
         Initialize core solver.
@@ -112,17 +113,24 @@ class core:
 
                 Default: (1, 1), automatically expanded to (n_devices, 1) for pure
                 data parallelism when multiple devices are available.
+
+            resume_from: Path to a checkpoint directory written by
+                :class:`~jno.utils.callbacks.CheckpointCallback`.  When
+                provided, model parameters, optimizer states, and the RNG
+                key are restored from the latest checkpoint at the start
+                of the next ``solve()`` call.  Requires the optional
+                ``orbax-checkpoint`` package.
         """
         self.log = get_logger()
         self.constraints: List[Placeholder] = constraints
 
         self.domain = domain
-        self.models: Dict[int, Any] = {}  # full equinox models (pytrees with arrays + static)
+        self.models: Dict[int, Any] = {}
         self._trained_ops: Dict[int, Any] = {}
         self.training_logs: List[Dict[str, jnp.ndarray]] = []
         self.dots: List = []
-        self.checkpoints: List[Dict] = []
         self.all_ops: List[OperationDef] = []
+        self._resume_from: Optional[str] = resume_from
 
         super().__init__()
 
@@ -556,6 +564,98 @@ class core:
 
         return step
 
+    def make_grad_fn(
+        self,
+        batchsize,
+        frozen,
+        static,
+        checkpoint_gradients=False,
+        min_consecutive=1,
+    ):
+        """Build a function that computes gradients without an optimizer update.
+
+        Returns a function with signature::
+
+            grad_fn(trainable, rng, context)
+                -> (grads, total_loss, individual_losses)
+
+        Used by gradient accumulation to compute gradients on multiple
+        micro-batches before averaging and applying a single update.
+        """
+        loss_fn = self._make_loss_fn(
+            self.compiled_constraints_fn,
+            self.n_constraints,
+            batchsize,
+            frozen,
+            static,
+            checkpoint_gradients=checkpoint_gradients,
+            min_consecutive=min_consecutive,
+        )
+
+        def grad_fn(trainable, rng, context):
+            rng, step_rng = jax.random.split(rng)
+
+            def loss_wrapper(p):
+                return loss_fn(p, context, step_rng)
+
+            (total_loss, individual_losses), grads = jax.value_and_grad(loss_wrapper, has_aux=True)(trainable)
+            return grads, rng, total_loss, individual_losses
+
+        return grad_fn
+
+    def make_apply_fn(
+        self,
+        per_model_opts,
+        lr_schedules,
+        group_lr_schedules=None,
+    ):
+        """Build a function that applies pre-computed gradients via the optimizer.
+
+        Returns a function with signature::
+
+            apply_fn(trainable, opt_states, grads, epoch, prev_losses)
+                -> (trainable, opt_states)
+
+        Used together with :meth:`make_grad_fn` for gradient accumulation.
+        """
+        lid_keys = sorted(per_model_opts.keys())
+        base_epoch = self._total_epochs
+        _group_lr = group_lr_schedules or {}
+
+        def apply_fn(trainable, opt_states, grads, epoch, prev_losses):
+            for k in lid_keys:
+                lid = int(k)
+                model_grads = grads[lid]
+                model_params = trainable[lid]
+
+                updates, new_state = per_model_opts[k].update(
+                    model_grads,
+                    opt_states[k],
+                    model_params,
+                )
+
+                # Update LR — either per-group or single global
+                if k in _group_lr:
+                    for i, sched in enumerate(_group_lr[k]):
+                        lr_val = sched(base_epoch + epoch, prev_losses)
+                        new_state[i].inner_state[-1].hyperparams["step_size"] = jnp.asarray(
+                            lr_val,
+                            dtype=new_state[i].inner_state[-1].hyperparams["step_size"].dtype,
+                        )
+                else:
+                    lr_val = lr_schedules[k](base_epoch + epoch, prev_losses)
+                    new_state[-1].hyperparams["step_size"] = jnp.asarray(
+                        lr_val,
+                        dtype=opt_states[k][-1].hyperparams["step_size"].dtype,
+                    )
+
+                trainable = {**trainable, lid: optax.apply_updates(model_params, updates)}
+                opt_states = {**opt_states, k: new_state}
+
+            return trainable, opt_states
+
+        return apply_fn
+
     def print_tree(self, file: Optional[str] = None):
         """Print the computation tree for every constraint and tracker.
 
@@ -668,8 +768,10 @@ class core:
         checkpoint_gradients: bool = False,
         offload_data: bool = False,
         inner_steps: int = 1,
+        accumulation_steps: int = 1,
         min_consecutive: int = 1,
         profile: bool = False,
+        callbacks: Optional[List] = None,
     ):
         """Train using per-model optimizers attached via ``model.optimizer()``.
 
@@ -690,6 +792,25 @@ class core:
                 host (CPU) memory and stream only the current mini-batch
                 to the device each step.  Requires ``batchsize`` to be
                 set.  Default ``False``.
+            inner_steps: Number of gradient steps to fuse into a single
+                ``jax.lax.fori_loop`` call, amortising Python dispatch
+                overhead.  Must evenly divide *epochs*.  Default ``1``.
+            accumulation_steps: Number of micro-batches whose gradients
+                are averaged before a single optimizer update.  The
+                effective batch size becomes
+                ``batchsize * accumulation_steps`` while peak activation
+                memory stays proportional to *batchsize*.  Requires
+                ``batchsize`` to be set.  Default ``1``.
+            min_consecutive: Minimum number of consecutive time steps
+                fed to each constraint evaluation.  Default ``1``.
+            profile: If ``True``, capture a JAX profiler trace for a
+                short window of steady-state training steps.  The trace
+                is written to ``<logger.path>/traces``.  Default
+                ``False``.
+            callbacks: Optional list of :class:`~jno.utils.callbacks.Callback`
+                instances.  ``on_epoch_end`` is called after every outer
+                step; ``on_training_end`` is called once after the loop
+                finishes.
 
         Returns:
             statistics: Training history with ``.plot()`` convenience.
@@ -701,6 +822,13 @@ class core:
         _trace = jax.profiler.TraceAnnotation if _profiling else lambda name, **_: nullcontext()
 
         batchsize = batchsize if batchsize is not None else self.domain.total_samples
+
+        # Validate accumulation_steps
+        if accumulation_steps < 1:
+            raise ValueError(f"accumulation_steps must be >= 1, got {accumulation_steps}")
+        if accumulation_steps > 1 and batchsize >= self.domain.total_samples:
+            self.log.warning("accumulation_steps > 1 has no effect with full-batch training; " "falling back to accumulation_steps=1")
+            accumulation_steps = 1
 
         # Adaptive resampling metadata
         strategies = getattr(self.domain, "_resampling_strategies", {})
@@ -829,31 +957,6 @@ class core:
                     if n_lora_layers == 0:
                         self.log.warning(f"LoRA: No layers were adapted for model {lid}! " f"LoRA has NO EFFECT on this model.")
 
-                # Write detailed LoRA diagnostics to log file (file-only, no console noise)
-                # self.log.quiet(f"LoRA Diagnostic Report for model {lid}")
-                # self.log.quiet(f"{'='*60}")
-                # self.log.quiet(f"Requested: rank={rank}, alpha={alpha}")
-                # self.log.quiet(f"Model type: {type(model_before).__name__}")
-                # self.log.quiet(f"Wrapper type: {type(model_after).__name__}")
-                # self.log.quiet(f"LoRA layers adapted:        {n_lora_layers}")
-                # self.log.quiet(f"Total arrays before LoRA:   {n_arrays_before}")
-                # self.log.quiet(f"Total arrays after LoRA:    {n_arrays_after}")
-                # self.log.quiet(f"Total params before LoRA:   {n_params_before:,}")
-                # self.log.quiet(f"Total params after LoRA:    {n_params_after:,}")
-                # self.log.quiet(f"New LoRA params:            {n_lora_params:,}")
-                # if isinstance(model_after, FlaxLoRAWrapper):
-                #    self.log.quiet("Adapted kernels (lora_a / lora_b shapes):")
-                #    flat, _ = jax.tree_util.tree_flatten_with_path(model_after.lora_params)
-                #    for path, leaf in flat:
-                #        if eqx.is_array(leaf):
-                #            self.log.quiet(f"  {'/'.join(str(k) for k in path)}: {leaf.shape} {leaf.dtype}")
-                # else:
-                #    self.log.quiet("Full pytree paths (after LoRA):")
-                #    flat, _ = jax.tree_util.tree_flatten_with_path(model_after)
-                #    for path, leaf in flat:
-                #        if eqx.is_array(leaf):
-                #            self.log.quiet(f"  {'/'.join(str(k) for k in path)}: {leaf.shape} {leaf.dtype}")
-
         # ── 3. Build trainable filter ──
         filter_spec = {}
         for lid, model in models.items():
@@ -903,6 +1006,10 @@ class core:
         # ── 4. Three-way partition ──
         trainable, rest = eqx.partition(models, filter_spec)
         frozen_arrays, static = eqx.partition(rest, eqx.is_array)
+
+        # Stash for restore_checkpoint()
+        self._last_frozen_arrays = frozen_arrays
+        self._last_static = static
 
         # ── 4b. Log parameter counts ──
         def _count_params(pytree):
@@ -1084,6 +1191,46 @@ class core:
 
         self._log_constraint_shapes(batchsize, min_consecutive=min_consecutive)
 
+        # ── 5b. Resume from checkpoint (optional) ──
+        if self._resume_from is not None:
+            try:
+                import orbax.checkpoint as _ocp
+            except ImportError as exc:
+                raise ImportError("orbax-checkpoint is required for resume_from=. " "Install it with:  pip install orbax-checkpoint") from exc
+
+            _ckpt_mgr = _ocp.CheckpointManager(
+                os.path.abspath(self._resume_from),
+                options=_ocp.CheckpointManagerOptions(read_only=True),
+            )
+            _ckpt_step = getattr(self, "_resume_step", None) or _ckpt_mgr.latest_step()
+            if _ckpt_step is None:
+                raise FileNotFoundError(f"No checkpoints found in {self._resume_from}")
+
+            # Build the target tree matching the live partition/opt structure
+            # so Orbax restores arrays into the correct Equinox pytree shape.
+            _target_state = {
+                "trainable": trainable,
+                "opt_states": opt_states,
+                "rng": self.rng,
+            }
+            _restored = _ckpt_mgr.restore(
+                _ckpt_step,
+                args=_ocp.args.Composite(
+                    state=_ocp.args.StandardRestore(_target_state),
+                    metadata=_ocp.args.JsonRestore(),
+                ),
+            )
+            trainable = _restored.state["trainable"]
+            opt_states = _restored.state["opt_states"]
+            self.rng = _restored.state["rng"]
+
+            _ckpt_meta = _restored.metadata
+            if _ckpt_meta is not None and "epoch" in _ckpt_meta:
+                self._total_epochs = int(_ckpt_meta["epoch"])
+            self.log.info(f"Resumed from checkpoint {self._resume_from} at step {_ckpt_step}")
+            _ckpt_mgr.close()
+            self._resume_from = None  # only resume once
+
         # ── 6. Prepare data ──
         n_devices = len(self.devices)
         full_context = self.domain_data.context
@@ -1140,6 +1287,23 @@ class core:
 
                     init = (trainable, opt_states, rng, start_epoch, jnp.zeros(()), prev_losses)
                     return jax.lax.fori_loop(0, _K, body, init)
+
+        # ── 7b. Build gradient accumulation functions (if needed) ──
+        _use_accumulation = accumulation_steps > 1
+        if _use_accumulation:
+            _grad_fn = self.make_grad_fn(
+                batchsize=effective_batchsize,
+                frozen=frozen_arrays,
+                static=static,
+                checkpoint_gradients=checkpoint_gradients,
+                min_consecutive=min_consecutive,
+            )
+            _apply_fn = self.make_apply_fn(
+                per_model_opts=per_model_opts,
+                lr_schedules=lr_schedules,
+                group_lr_schedules=group_lr_schedules,
+            )
+            self.log.info(f"Gradient accumulation enabled: {accumulation_steps} micro-batches " f"per update (effective batch = {batchsize} × {accumulation_steps} " f"= {batchsize * accumulation_steps})")
 
         # Optional: build JIT-compiled tracker function
         has_trackers = len(self.compiled_trackers) > 0
@@ -1211,6 +1375,43 @@ class core:
                 donate_argnums=(0, 1, 2),
             )
 
+            # JIT-compile gradient accumulation functions when enabled.
+            if _use_accumulation:
+                _trainable_sharding = jax.tree_util.tree_map(_leaf_sharding, trainable)
+                _ctx_sharding = jax.tree_util.tree_map(_leaf_sharding, trace_context)
+
+                jit_grad = jax.jit(
+                    _grad_fn,
+                    in_shardings=(
+                        _trainable_sharding,  # trainable (read-only)
+                        replicated,  # rng
+                        _ctx_sharding,  # context
+                    ),
+                    out_shardings=(
+                        _trainable_sharding,  # grads (same tree as trainable)
+                        replicated,  # rng
+                        replicated,  # total_loss
+                        replicated,  # individual_losses
+                    ),
+                )
+
+                _opt_sharding = jax.tree_util.tree_map(_leaf_sharding, opt_states)
+                jit_apply = jax.jit(
+                    _apply_fn,
+                    in_shardings=(
+                        _trainable_sharding,  # trainable
+                        _opt_sharding,  # opt_states
+                        _trainable_sharding,  # grads
+                        replicated,  # epoch
+                        replicated,  # prev_losses
+                    ),
+                    out_shardings=(
+                        _trainable_sharding,  # trainable
+                        _opt_sharding,  # opt_states
+                    ),
+                    donate_argnums=(2,),  # donate grads (freshly accumulated)
+                )
+
             if has_trackers:
                 jit_track = jax.jit(track_fn)
 
@@ -1229,14 +1430,27 @@ class core:
 
             # Trigger AOT compilation so the first real step is fast.
 
-            _ = jit_step.lower(
-                trainable,
-                opt_states,
-                self.rng,
-                trace_context,
-                jax.device_put(jnp.int32(0), replicated),
-                prev_losses,
-            ).compile()
+            if _use_accumulation:
+                # AOT compile grad and apply separately
+                _ = jit_grad.lower(trainable, self.rng, trace_context).compile()
+                _zero_grads = jax.tree_util.tree_map(jnp.zeros_like, trainable)
+                _ = jit_apply.lower(
+                    trainable,
+                    opt_states,
+                    _zero_grads,
+                    jax.device_put(jnp.int32(0), replicated),
+                    prev_losses,
+                ).compile()
+                del _zero_grads
+            else:
+                _ = jit_step.lower(
+                    trainable,
+                    opt_states,
+                    self.rng,
+                    trace_context,
+                    jax.device_put(jnp.int32(0), replicated),
+                    prev_losses,
+                ).compile()
 
             # Pre-compile tracker JIT as well so profile windows focus on
             # steady-state train-step behavior instead of one-time compile work.
@@ -1253,8 +1467,14 @@ class core:
             _rw = jnp.copy(self.rng)
             _ew = jax.device_put(jnp.int32(0), replicated)
             _pl = jax.device_put(jnp.zeros(self.n_constraints), replicated)
-            for _ in range(3):
-                _tw, _ow, _rw, _ew, _, _pl = jit_step(_tw, _ow, _rw, trace_context, _ew, _pl)
+            if _use_accumulation:
+                for _ in range(3):
+                    _gw, _rw, _, _ = jit_grad(_tw, _rw, trace_context)
+                    _tw, _ow = jit_apply(_tw, _ow, _gw, _ew, _pl)
+                del _gw
+            else:
+                for _ in range(3):
+                    _tw, _ow, _rw, _ew, _, _pl = jit_step(_tw, _ow, _rw, trace_context, _ew, _pl)
 
             if has_trackers:
                 _ = jit_track(_tw, trace_context, _rw)
@@ -1263,8 +1483,6 @@ class core:
             del _tw, _ow, _rw, _ew, _pl
 
             # ── 8. Training loop ──
-            # hw_monitor = HardwareMonitor(logger=self.log, interval=0.5)
-            # hw_monitor.start()
 
             print_rate = max(1, epochs // 10 if epochs < 100_000 else epochs // 1000)
             prev_losses = jax.device_put(jnp.zeros(self.n_constraints), replicated)
@@ -1302,9 +1520,33 @@ class core:
             _profile_active = False
             _profile_ctx: Any = nullcontext()
 
+            # --- wandb: cache run reference and build model name map ---
+            _wandb_run = get_wandb_run()
+            _wandb_model_names: dict = {}
+            if _wandb_run is not None:
+                for _lid, _fm in flax_mods.items():
+                    _k = str(_lid)
+                    _wandb_model_names[_k] = _fm.name or type(_fm.module).__name__
+                # Log config to wandb
+                _wandb_run.config.update(
+                    {
+                        "epochs": epochs,
+                        "inner_steps": inner_steps,
+                        "n_constraints": self.n_constraints,
+                        "n_trackers": len(self.compiled_trackers),
+                        "trainable_params": n_trainable_params,
+                        "frozen_params": n_frozen_params,
+                        "total_params": n_total_params,
+                        "seed": self.seed,
+                    },
+                    allow_val_change=True,
+                )
+
+            _wandb_nan_alerted = False
+
             for outer_epoch in range(n_outer):
                 if (not _profile_active) and _profile_steps > 0 and outer_epoch == _profile_start:
-                    _profile_ctx = jax.profiler.trace(f"{self.log.path}/traces")
+                    _profile_ctx = jax.profiler.trace(f"{self.log.path}/traces", create_perfetto_trace=True)
                     _profile_ctx.__enter__()
                     _profile_active = True
 
@@ -1397,25 +1639,70 @@ class core:
                             else:
                                 on_device_context = on_device_context_new
 
-                # --- prepare context for this step ---
-                if offload_data:
-                    if host_context is None:
-                        raise RuntimeError("offload_data=True but host_context is not available")
-                    indices = rng_np.choice(total_samples, batchsize, replace=False)
-                    batch_np = {k: (v if k == "__time__" else (np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices])) for k, v in host_context.items()}
-                    context = self._shard_data(jax.device_put(batch_np))
-                else:
-                    context = on_device_context
+                # --- prepare context and step ---
+                if _use_accumulation:
+                    # Gradient accumulation: N micro-batch forward/backward
+                    # passes, then one averaged optimizer update.
+                    _acc_grads = None
+                    _acc_total = 0.0
+                    _acc_losses = jax.device_put(jnp.zeros(self.n_constraints), replicated)
+                    _inv_accum = 1.0 / accumulation_steps
 
-                # --- step ---
-                (trainable, opt_states, self.rng, epoch_jnp, total_loss, individual_losses) = jit_step(
-                    trainable,
-                    opt_states,
-                    self.rng,
-                    context,
-                    epoch_jnp,
-                    prev_losses,
-                )
+                    for _ai in range(accumulation_steps):
+                        # Each micro-batch gets a fresh random sample
+                        if offload_data:
+                            if host_context is None:
+                                raise RuntimeError("offload_data=True but host_context is not available")
+                            indices = rng_np.choice(total_samples, batchsize, replace=False)
+                            batch_np = {k: (v if k == "__time__" else (np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices])) for k, v in host_context.items()}
+                            micro_ctx = self._shard_data(jax.device_put(batch_np))
+                        else:
+                            micro_ctx = on_device_context
+
+                        _micro_grads, self.rng, _micro_loss, _micro_indiv = jit_grad(
+                            trainable,
+                            self.rng,
+                            micro_ctx,
+                        )
+
+                        if _acc_grads is None:
+                            _acc_grads = jax.tree_util.tree_map(lambda g: g * _inv_accum, _micro_grads)
+                        else:
+                            _acc_grads = jax.tree_util.tree_map(lambda a, g: a + g * _inv_accum, _acc_grads, _micro_grads)
+                        _acc_total = _acc_total + float(jax.device_get(_micro_loss)) * _inv_accum
+                        _acc_losses = _acc_losses + _micro_indiv * _inv_accum
+
+                    # Single optimizer update with averaged gradients
+                    trainable, opt_states = jit_apply(
+                        trainable,
+                        opt_states,
+                        _acc_grads,
+                        epoch_jnp,
+                        prev_losses,
+                    )
+                    total_loss = jax.device_put(jnp.float32(_acc_total), replicated)
+                    individual_losses = _acc_losses
+                    epoch_jnp = epoch_jnp + jnp.asarray(1, dtype=epoch_jnp.dtype)
+                    context = micro_ctx  # keep last micro-batch for tracker evaluation
+                else:
+                    if offload_data:
+                        if host_context is None:
+                            raise RuntimeError("offload_data=True but host_context is not available")
+                        indices = rng_np.choice(total_samples, batchsize, replace=False)
+                        batch_np = {k: (v if k == "__time__" else (np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices])) for k, v in host_context.items()}
+                        context = self._shard_data(jax.device_put(batch_np))
+                    else:
+                        context = on_device_context
+
+                    # --- step ---
+                    (trainable, opt_states, self.rng, epoch_jnp, total_loss, individual_losses) = jit_step(
+                        trainable,
+                        opt_states,
+                        self.rng,
+                        context,
+                        epoch_jnp,
+                        prev_losses,
+                    )
 
                 prev_losses = individual_losses
 
@@ -1425,6 +1712,40 @@ class core:
                     _profile_active = False
                     _profile_ctx = nullcontext()
 
+                # --- wandb: log every epoch ---
+                displayed_epoch = epoch + inner_steps - 1
+                if _wandb_run is not None:
+                    _wb_losses, _wb_total = jax.device_get((individual_losses, total_loss))
+                    _wb_metrics: dict = {
+                        "total_loss": float(_wb_total),
+                        "epoch": displayed_epoch,
+                    }
+                    for _ci, _cl in enumerate(np.asarray(_wb_losses)):
+                        _wb_metrics[f"constraint_{_ci}"] = float(_cl)
+                    # Learning rates (one per model)
+                    for _wk in sorted(opt_states.keys()):
+                        _wst = opt_states[_wk]
+                        try:
+                            _lr = float(jax.device_get(_wst[-1].hyperparams["step_size"]))
+                        except (IndexError, KeyError, AttributeError):
+                            try:
+                                _lr = float(jax.device_get(_wst[0].inner_state[-1].hyperparams["step_size"]))
+                            except Exception:
+                                _lr = None
+                        if _lr is not None:
+                            _model_name = _wandb_model_names.get(_wk, _wk)
+                            _wb_metrics[f"lr/{_model_name}"] = _lr
+                    wandb_log(_wb_metrics, step=displayed_epoch)
+
+                    # NaN / Inf alert (only fire once)
+                    if not _wandb_nan_alerted and not np.isfinite(_wb_total):
+                        wandb_alert(
+                            "NaN/Inf loss detected",
+                            f"total_loss became {_wb_total} at epoch {displayed_epoch}",
+                            level="ERROR",
+                        )
+                        _wandb_nan_alerted = True
+
                 # --- logging: sync only at print interval ---
                 should_print = (outer_epoch % print_rate == 0) or (outer_epoch == n_outer - 1)
                 if should_print:
@@ -1432,7 +1753,6 @@ class core:
                     losses_np = np.asarray(losses_np)
                     total_np = float(total_np_arr)
 
-                    displayed_epoch = epoch + inner_steps - 1  # last epoch completed in this outer step
                     log_epochs.append(displayed_epoch)
                     log_losses.append(losses_np)
                     log_total_loss.append(total_np)
@@ -1444,6 +1764,12 @@ class core:
                         track_vals = jit_track(trainable, context, self.rng)
                         track_stats_np = [float(v) for v in jax.device_get(track_vals)]
                         log_track_stats.append(track_stats_np)
+                        # Log trackers to wandb
+                        if _wandb_run is not None:
+                            _wb_track = {}
+                            for _ti, _tv in enumerate(track_stats_np):
+                                _wb_track[f"tracker_{_ti}"] = _tv
+                            wandb_log(_wb_track, step=displayed_epoch)
 
                     # Progress line
                     loss_strs = " | ".join(f"C{i}: {l:>10.4e}" for i, l in enumerate(losses_np))
@@ -1453,11 +1779,28 @@ class core:
                     else:
                         self.log.info(f"Epoch {displayed_epoch:>6}/{epochs}| " f"L:{total_np:>10.4e} | {loss_strs}")
 
+                # --- callbacks ---
+                if callbacks:
+                    cb_info = {
+                        "epoch": epoch + inner_steps - 1,
+                        "trainable": trainable,
+                        "opt_states": opt_states,
+                        "rng": self.rng,
+                        "total_loss": total_loss,
+                        "individual_losses": individual_losses,
+                        "log": self.log,
+                    }
+                    _stop_requested = False
+                    for cb in callbacks:
+                        if cb.on_epoch_end(**cb_info):
+                            _stop_requested = True
+                    if _stop_requested:
+                        break
+
             if _profile_active:
                 _profile_ctx.__exit__(None, None, None)
 
             et = time.time()
-            # hw_monitor.stop(logger=self.log)
 
             gc.enable()  # restore GC after training loop
 
@@ -1499,33 +1842,78 @@ class core:
             _t = int(logs["training_time"])
             self.log.info(f"Training took {_t // 3600}h {(_t % 3600) // 60}m {_t % 60}s")
 
+            # --- wandb: log training summary ---
+            if _wandb_run is not None:
+                _wandb_run.summary.update(
+                    {
+                        "training_time": logs["training_time"],
+                        "final_total_loss": float(log_total_loss[-1]) if log_total_loss else None,
+                    }
+                )
+                wandb_log_model(self)
+
         self._total_epochs += epochs
 
-        # Checkpoint
-        self.checkpoints.append(
-            self.checkpoint(
-                models=self.models,
-                opt_state=opt_states,
-                rng=self.rng,
-            )
-        )
+        # --- callbacks: on_training_end ---
+        if callbacks:
+            for cb in callbacks:
+                cb.on_training_end()
 
         return statistics(self.training_logs)
 
-    def checkpoint(self, models, opt_state, rng, lora_params=None):
-        """Snapshot current model weights and optimiser state."""
-        import copy
+    def restore_checkpoint(self, directory: str, step: Optional[int] = None):
+        """Restore model parameters and optimizer state from an Orbax checkpoint.
 
-        payload = {
-            "step": int(self._total_epochs),
-            "time": time.time(),
-            "models": copy.deepcopy(models),
-            "opt_state": copy.deepcopy(opt_state),
-            "rng": copy.deepcopy(rng),
-        }
-        if lora_params is not None:
-            payload["lora_params"] = copy.deepcopy(lora_params)
-        return payload
+        Reads checkpoint metadata (epoch counter) immediately and schedules
+        a full weight restore for the next :meth:`solve` call.  The actual
+        array restore is deferred because Orbax needs the live Equinox /
+        Optax tree structures as a target, and those are only available
+        inside ``solve()`` after the three-way partition and optimizer
+        initialisation.
+
+        Args:
+            directory: Path to the checkpoint directory written by
+                :class:`~jno.utils.callbacks.CheckpointCallback`.
+            step: Checkpoint step to restore.  ``None`` (default)
+                restores the latest available checkpoint.
+
+        Returns:
+            self, for chaining.
+        """
+        try:
+            import orbax.checkpoint as ocp
+        except ImportError as exc:
+            raise ImportError("orbax-checkpoint is required for restore_checkpoint(). " "Install it with:  pip install orbax-checkpoint") from exc
+
+        manager = ocp.CheckpointManager(
+            os.path.abspath(directory),
+            options=ocp.CheckpointManagerOptions(read_only=True),
+        )
+        if step is None:
+            step = manager.latest_step()
+        if step is None:
+            raise FileNotFoundError(f"No checkpoints found in {directory}")
+
+        # Read only metadata so we can set the epoch counter now.
+        restored = manager.restore(
+            step,
+            args=ocp.args.Composite(
+                metadata=ocp.args.JsonRestore(),
+            ),
+        )
+        metadata = restored.metadata
+
+        if metadata is not None and "epoch" in metadata:
+            self._total_epochs = int(metadata["epoch"])
+
+        self.log.info(f"Restored checkpoint from {directory} at step {step}")
+        manager.close()
+
+        # Defer actual weight / opt-state restore to solve(), where the
+        # correct Equinox and Optax tree structures are available.
+        self._resume_from = os.path.abspath(directory)
+        self._resume_step = step
+        return self
 
     def _log_constraint_shapes(self, batchsize, min_consecutive: int = 1):
         """Log the output shape of each constraint by doing a test evaluation.

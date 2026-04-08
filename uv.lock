@@ -1161,6 +1161,102 @@ dependencies = [
 ]
 
 [[package]]
+name = "jax-neural-operators"
+version = "0.1.0"
+source = { editable = "." }
+dependencies = [
+    { name = "cloudpickle" },
+    { name = "einops" },
+    { name = "equinox" },
+    { name = "jax" },
+    { name = "matplotlib" },
+    { name = "optax" },
+    { name = "orbax-checkpoint" },
+    { name = "pygmsh" },
+]
+
+[package.optional-dependencies]
+cuda = [
+    { name = "jax", extra = ["cuda12"] },
+]
+dev = [
+    { name = "black" },
+    { name = "fenics-basix" },
+    { name = "flake8" },
+    { name = "flax" },
+    { name = "lineax" },
+    { name = "mypy" },
+    { name = "nevergrad" },
+    { name = "paramax" },
+    { name = "pyfiglet" },
+    { name = "pylotte" },
+    { name = "pytest" },
+    { name = "xprof" },
+]
+iree = [
+    { name = "iree-base-compiler" },
+    { name = "iree-base-runtime" },
+]
+
+[package.dev-dependencies]
+fem = [
+    { name = "fenics-basix" },
+    { name = "jax-fem" },
+    { name = "lineax" },
+    { name = "pyfiglet" },
+]
+foundation = [
+    { name = "jax-morph" },
+    { name = "jax-mpp" },
+    { name = "jax-pdeformer2" },
+    { name = "jax-poseidon" },
+    { name = "jax-walrus" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "black", marker = "extra == 'dev'", specifier = ">=22.0" },
+    { name = "cloudpickle" },
+    { name = "einops" },
+    { name = "equinox" },
+    { name = "fenics-basix", marker = "extra == 'dev'" },
+    { name = "flake8", marker = "extra == 'dev'", specifier = ">=4.0" },
+    { name = "flax", marker = "extra == 'dev'" },
+    { name = "iree-base-compiler", marker = "extra == 'iree'" },
+    { name = "iree-base-runtime", marker = "extra == 'iree'" },
+    { name = "jax" },
+    { name = "jax", extras = ["cuda12"], marker = "extra == 'cuda'" },
+    { name = "lineax", marker = "extra == 'dev'" },
+    { name = "matplotlib" },
+    { name = "mypy", marker = "extra == 'dev'", specifier = ">=0.950" },
+    { name = "nevergrad", marker = "extra == 'dev'" },
+    { name = "optax" },
+    { name = "orbax-checkpoint" },
+    { name = "paramax", marker = "extra == 'dev'" },
+    { name = "pyfiglet", marker = "extra == 'dev'" },
+    { name = "pygmsh" },
+    { name = "pylotte", marker = "extra == 'dev'" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
+    { name = "xprof", marker = "extra == 'dev'" },
+]
+provides-extras = ["cuda", "dev", "iree"]
+
+[package.metadata.requires-dev]
+fem = [
+    { name = "fenics-basix" },
+    { name = "jax-fem", git = "https://github.com/FhG-IISB/jax-fem" },
+    { name = "lineax" },
+    { name = "pyfiglet" },
+]
+foundation = [
+    { name = "jax-morph", git = "https://github.com/armbrusl/jax_morph" },
+    { name = "jax-mpp", git = "https://github.com/armbrusl/jax_mpp" },
+    { name = "jax-pdeformer2", git = "https://github.com/FhG-IISB/jax_pdeformer2" },
+    { name = "jax-poseidon", git = "https://github.com/FhG-IISB/jax_poseidon" },
+    { name = "jax-walrus", git = "https://github.com/FhG-IISB/jax_walrus" },
+]
+
+[[package]]
 name = "jax-pdeformer2"
 version = "0.1.0"
 source = { git = "https://github.com/FhG-IISB/jax_pdeformer2#f6187591ef4ecdbcbbaafd9a09ed662cec290b97" }
@@ -1232,104 +1328,6 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/43/30/0e29eab664d33127a7a30aebd7a845a95fbfa1887ede692676769820acea/jaxtyping-0.3.5.tar.gz", hash = "sha256:8150ad5b72b62fa63f573d492a79e9e455f070abe3b260f7dc15270b3eb9bba6", size = 45482, upload-time = "2026-01-05T10:51:34.486Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/73/19/a29de61c7ada0edf4eacfc19355ab8560091b65ea5d2450bcb984e203259/jaxtyping-0.3.5-py3-none-any.whl", hash = "sha256:862c39fa2e526274e82dc96ee8dbe9369dadb651ab1e05d95bd685acb4e2ef02", size = 55824, upload-time = "2026-01-05T10:51:33.523Z" },
-]
-
-[[package]]
-name = "jno"
-version = "0.1.0"
-source = { editable = "." }
-dependencies = [
-    { name = "cloudpickle" },
-    { name = "einops" },
-    { name = "equinox" },
-    { name = "jax" },
-    { name = "optax" },
-    { name = "pygmsh" },
-]
-
-[package.optional-dependencies]
-cuda = [
-    { name = "jax", extra = ["cuda12"] },
-]
-dev = [
-    { name = "black" },
-    { name = "fenics-basix" },
-    { name = "flake8" },
-    { name = "flax" },
-    { name = "lineax" },
-    { name = "matplotlib" },
-    { name = "mypy" },
-    { name = "nevergrad" },
-    { name = "paramax" },
-    { name = "pyfiglet" },
-    { name = "pylotte" },
-    { name = "pytest" },
-    { name = "xprof" },
-]
-iree = [
-    { name = "iree-base-compiler" },
-    { name = "iree-base-runtime" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "jno", extra = ["dev"] },
-]
-fem = [
-    { name = "fenics-basix" },
-    { name = "jax-fem" },
-    { name = "lineax" },
-    { name = "pyfiglet" },
-]
-foundation = [
-    { name = "jax-morph" },
-    { name = "jax-mpp" },
-    { name = "jax-pdeformer2" },
-    { name = "jax-poseidon" },
-    { name = "jax-walrus" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "black", marker = "extra == 'dev'", specifier = ">=22.0" },
-    { name = "cloudpickle" },
-    { name = "einops" },
-    { name = "equinox" },
-    { name = "fenics-basix", marker = "extra == 'dev'" },
-    { name = "flake8", marker = "extra == 'dev'", specifier = ">=4.0" },
-    { name = "flax", marker = "extra == 'dev'" },
-    { name = "iree-base-compiler", marker = "extra == 'iree'" },
-    { name = "iree-base-runtime", marker = "extra == 'iree'" },
-    { name = "jax" },
-    { name = "jax", extras = ["cuda12"], marker = "extra == 'cuda'" },
-    { name = "lineax", marker = "extra == 'dev'" },
-    { name = "matplotlib", marker = "extra == 'dev'" },
-    { name = "mypy", marker = "extra == 'dev'", specifier = ">=0.950" },
-    { name = "nevergrad", marker = "extra == 'dev'" },
-    { name = "optax" },
-    { name = "paramax", marker = "extra == 'dev'" },
-    { name = "pyfiglet", marker = "extra == 'dev'" },
-    { name = "pygmsh" },
-    { name = "pylotte", marker = "extra == 'dev'" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=7.0" },
-    { name = "xprof", marker = "extra == 'dev'" },
-]
-provides-extras = ["cuda", "dev", "iree"]
-
-[package.metadata.requires-dev]
-dev = [{ name = "jno", extras = ["dev"], editable = "." }]
-fem = [
-    { name = "fenics-basix" },
-    { name = "jax-fem", git = "https://github.com/FhG-IISB/jax-fem" },
-    { name = "lineax" },
-    { name = "pyfiglet" },
-]
-foundation = [
-    { name = "jax-morph", git = "https://github.com/armbrusl/jax_morph" },
-    { name = "jax-mpp", git = "https://github.com/armbrusl/jax_mpp" },
-    { name = "jax-pdeformer2", git = "https://github.com/FhG-IISB/jax_pdeformer2" },
-    { name = "jax-poseidon", git = "https://github.com/FhG-IISB/jax_poseidon" },
-    { name = "jax-walrus", git = "https://github.com/FhG-IISB/jax_walrus" },
 ]
 
 [[package]]

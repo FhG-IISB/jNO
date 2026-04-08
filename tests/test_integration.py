@@ -856,3 +856,81 @@ def test_nnx_initialize_from_pytree():
 
     assert jnp.allclose(loaded_l1_k, pretrained_l1_k), "initialize() did not load pretrained NNX weights"
     assert not jnp.allclose(loaded_l1_k, random_l1_k), "weights still match random init — initialize() had no effect"
+
+
+# ======================================================================
+# Gradient accumulation
+# ======================================================================
+@pytest.mark.integration
+class TestGradientAccumulation:
+    """Tests for accumulation_steps parameter in core.solve()."""
+
+    def test_accumulation_runs_end_to_end(self):
+        """accumulation_steps=2 with batchsize completes without error."""
+        import optax
+        from jno import LearningRateSchedule as lrs
+
+        solver, u_net = _make_solver()
+        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        stats = solver.solve(10, batchsize=16, accumulation_steps=2)
+
+        logs = stats.training_logs[-1]
+        assert logs["losses"].ndim == 2
+        assert jnp.isfinite(logs["total_loss"][-1])
+
+    def test_accumulation_with_offload_data(self):
+        """accumulation_steps works together with offload_data=True."""
+        import optax
+        from jno import LearningRateSchedule as lrs
+
+        solver, u_net = _make_solver()
+        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        stats = solver.solve(
+            10,
+            batchsize=16,
+            offload_data=True,
+            accumulation_steps=3,
+        )
+
+        logs = stats.training_logs[-1]
+        assert jnp.isfinite(logs["total_loss"][-1])
+
+    def test_accumulation_fallback_fullbatch(self):
+        """accumulation_steps > 1 with full-batch falls back to 1 (no error)."""
+        import optax
+        from jno import LearningRateSchedule as lrs
+
+        solver, u_net = _make_solver()
+        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        # batchsize=None → full-batch → accumulation should be silently disabled
+        stats = solver.solve(10, accumulation_steps=4)
+
+        logs = stats.training_logs[-1]
+        assert jnp.isfinite(logs["total_loss"][-1])
+
+    def test_accumulation_invalid_value_raises(self):
+        """accumulation_steps=0 raises ValueError."""
+        import optax
+        from jno import LearningRateSchedule as lrs
+
+        solver, u_net = _make_solver()
+        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        with pytest.raises(ValueError, match="accumulation_steps"):
+            solver.solve(10, accumulation_steps=0)
+
+    def test_accumulation_with_checkpoint_gradients(self):
+        """accumulation_steps combined with checkpoint_gradients works."""
+        import optax
+        from jno import LearningRateSchedule as lrs
+
+        solver, u_net = _make_solver()
+        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        stats = solver.solve(
+            10,
+            batchsize=16,
+            accumulation_steps=2,
+            checkpoint_gradients=True,
+        )
+
+        logs = stats.training_logs[-1]
+        assert jnp.isfinite(logs["total_loss"][-1])

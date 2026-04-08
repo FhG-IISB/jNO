@@ -19,6 +19,7 @@ dependencies = [
     "jax",
     "equinox",
     "optax",
+    "orbax-checkpoint",
 
     "pygmsh",
     "cloudpickle",
@@ -47,7 +48,7 @@ dev = ["pytest>=7.0",
         "nevergrad", 
         "lineax", 
         "pyfiglet", 
-        "fenics-basix",
+        "fenics-basix"
 ]
 iree = [
     "iree-base-compiler",

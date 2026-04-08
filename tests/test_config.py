@@ -14,20 +14,20 @@ from jno.utils.config import get_seed, load_config, get_runs_base_dir, get_rsa_p
 
 
 class TestGetSeed:
-    def test_returns_none_when_config_empty(self, monkeypatch):
-        """get_seed() returns None when no [jno] section is present."""
+    def test_returns_default_when_config_empty(self, monkeypatch):
+        """get_seed() returns 42 when no [jno] section is present."""
         monkeypatch.setattr(cfg_module, "_CONFIG", {})
-        assert get_seed() is None
+        assert get_seed() == 42
 
     def test_returns_seed_value(self, monkeypatch):
         """get_seed() returns the integer seed from [jno] section."""
         monkeypatch.setattr(cfg_module, "_CONFIG", {"jno": {"seed": 42}})
         assert get_seed() == 42
 
-    def test_returns_none_when_seed_key_absent(self, monkeypatch):
-        """get_seed() returns None when [jno] exists but has no 'seed' key."""
+    def test_returns_default_when_seed_key_absent(self, monkeypatch):
+        """get_seed() returns 42 when [jno] exists but has no 'seed' key."""
         monkeypatch.setattr(cfg_module, "_CONFIG", {"jno": {"other_key": "x"}})
-        assert get_seed() is None
+        assert get_seed() == 42
 
     def test_seed_is_int(self, monkeypatch):
         """get_seed() returns the value as-is from TOML (integer)."""
@@ -143,9 +143,9 @@ class TestEndToEnd:
         load_config(force=True)
         assert get_seed() == 55
 
-    def test_get_seed_returns_none_after_empty_load(self, tmp_path, monkeypatch):
-        """get_seed() returns None when the loaded config has no seed."""
+    def test_get_seed_returns_default_after_empty_load(self, tmp_path, monkeypatch):
+        """get_seed() returns 42 when the loaded config has no seed."""
         (tmp_path / ".jno.toml").write_bytes(b"[runs]\nbase_dir = './r'\n")
         monkeypatch.chdir(tmp_path)
         load_config(force=True)
-        assert get_seed() is None
+        assert get_seed() == 42
