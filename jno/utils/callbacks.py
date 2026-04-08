@@ -10,6 +10,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from .config import wandb_alert
+
 
 class Callback:
     """Base callback class.
@@ -74,6 +76,10 @@ class CheckpointCallback(Callback):
             checkpoint with the lowest total loss.
         async_checkpointing: If *True* (default), writes happen in a
             background thread so training is not blocked.
+
+    When a W&B run is active (see :func:`jno.setup(wandb=True) <jno.utils.config.setup>`),
+    each checkpoint is automatically uploaded as a versioned ``checkpoint``
+    artifact.
 
     Example::
 
@@ -162,7 +168,7 @@ class CheckpointCallback(Callback):
         # CheckpointManager.save internally checks should_save(step)
         # based on save_interval_steps, so we call it every epoch and
         # let the manager decide.
-        self._manager.save(
+        saved = self._manager.save(
             epoch,
             args=ocp.args.Composite(
                 state=ocp.args.StandardSave(pytree),
@@ -171,8 +177,61 @@ class CheckpointCallback(Callback):
             metrics=metadata if self._best_fn is not None else None,
         )
 
+        # Upload checkpoint as a W&B artifact when a save happened.
+        if saved:
+            self._upload_wandb_artifact(epoch)
+            self._log_wandb_histograms(trainable, epoch)
+
     def on_training_end(self, **kwargs) -> None:
         self._manager.wait_until_finished()
+
+    # -- wandb ---------------------------------------------------------------
+
+    def _upload_wandb_artifact(self, epoch: int) -> None:
+        """Upload the latest checkpoint directory as a W&B artifact."""
+        from .config import get_wandb_run
+
+        run = get_wandb_run()
+        if run is None:
+            return
+
+        try:
+            import wandb  # type: ignore[import-untyped]
+        except ImportError:
+            return
+
+        ckpt_path = os.path.join(self._directory, str(epoch))
+        artifact = wandb.Artifact(
+            f"checkpoint-{epoch}",
+            type="checkpoint",
+            metadata={"epoch": epoch},
+        )
+        artifact.add_dir(ckpt_path)
+        run.log_artifact(artifact)
+
+    def _log_wandb_histograms(self, trainable: Any, epoch: int) -> None:
+        """Log per-layer weight histograms to W&B."""
+        from .config import get_wandb_run
+
+        run = get_wandb_run()
+        if run is None:
+            return
+
+        try:
+            import wandb  # type: ignore[import-untyped]
+        except ImportError:
+            return
+
+        histograms: dict = {}
+        for model_key, model_params in trainable.items():
+            leaves = jax.tree_util.tree_leaves_with_path(model_params)
+            for path, leaf in leaves:
+                name = "/".join(str(k) for k in path)
+                arr = np.asarray(jax.device_get(leaf)).ravel()
+                if arr.size > 0:
+                    histograms[f"weights/{model_key}/{name}"] = wandb.Histogram(arr)
+        if histograms:
+            run.log(histograms, step=epoch)
 
     # -- public API ----------------------------------------------------------
 
@@ -325,6 +384,11 @@ class EarlyStoppingCallback(Callback):
                 msg = f"Early stopping at epoch {epoch}: " f"no improvement for {self.patience} epochs " f"(best={self.best_metric:.6e})"
                 if log is not None:
                     log.info(msg)
+            wandb_alert(
+                "Early stopping",
+                f"Stopped at epoch {epoch} — no improvement for " f"{self.patience} epochs (best={self.best_metric:.6e})",
+                level="WARN",
+            )
             return True  # signal stop
 
         return False
