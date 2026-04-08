@@ -34,6 +34,7 @@ from .trace import (
     cse,
 )
 from .utils import LearningRateSchedule, WeightSchedule, statistics, get_logger, get_seed
+from .utils.config import get_wandb_run, wandb_log, wandb_log_model, wandb_alert
 from .domain import domain, DomainData
 from .trace_evaluator import TraceEvaluator
 from .trace_compiler import TraceCompiler
@@ -1519,6 +1520,30 @@ class core:
             _profile_active = False
             _profile_ctx: Any = nullcontext()
 
+            # --- wandb: cache run reference and build model name map ---
+            _wandb_run = get_wandb_run()
+            _wandb_model_names: dict = {}
+            if _wandb_run is not None:
+                for _lid, _fm in flax_mods.items():
+                    _k = str(_lid)
+                    _wandb_model_names[_k] = _fm.name or type(_fm.module).__name__
+                # Log config to wandb
+                _wandb_run.config.update(
+                    {
+                        "epochs": epochs,
+                        "inner_steps": inner_steps,
+                        "n_constraints": self.n_constraints,
+                        "n_trackers": len(self.compiled_trackers),
+                        "trainable_params": n_trainable_params,
+                        "frozen_params": n_frozen_params,
+                        "total_params": n_total_params,
+                        "seed": self.seed,
+                    },
+                    allow_val_change=True,
+                )
+
+            _wandb_nan_alerted = False
+
             for outer_epoch in range(n_outer):
                 if (not _profile_active) and _profile_steps > 0 and outer_epoch == _profile_start:
                     _profile_ctx = jax.profiler.trace(f"{self.log.path}/traces", create_perfetto_trace=True)
@@ -1687,6 +1712,40 @@ class core:
                     _profile_active = False
                     _profile_ctx = nullcontext()
 
+                # --- wandb: log every epoch ---
+                displayed_epoch = epoch + inner_steps - 1
+                if _wandb_run is not None:
+                    _wb_losses, _wb_total = jax.device_get((individual_losses, total_loss))
+                    _wb_metrics: dict = {
+                        "total_loss": float(_wb_total),
+                        "epoch": displayed_epoch,
+                    }
+                    for _ci, _cl in enumerate(np.asarray(_wb_losses)):
+                        _wb_metrics[f"constraint_{_ci}"] = float(_cl)
+                    # Learning rates (one per model)
+                    for _wk in sorted(opt_states.keys()):
+                        _wst = opt_states[_wk]
+                        try:
+                            _lr = float(jax.device_get(_wst[-1].hyperparams["step_size"]))
+                        except (IndexError, KeyError, AttributeError):
+                            try:
+                                _lr = float(jax.device_get(_wst[0].inner_state[-1].hyperparams["step_size"]))
+                            except Exception:
+                                _lr = None
+                        if _lr is not None:
+                            _model_name = _wandb_model_names.get(_wk, _wk)
+                            _wb_metrics[f"lr/{_model_name}"] = _lr
+                    wandb_log(_wb_metrics, step=displayed_epoch)
+
+                    # NaN / Inf alert (only fire once)
+                    if not _wandb_nan_alerted and not np.isfinite(_wb_total):
+                        wandb_alert(
+                            "NaN/Inf loss detected",
+                            f"total_loss became {_wb_total} at epoch {displayed_epoch}",
+                            level="ERROR",
+                        )
+                        _wandb_nan_alerted = True
+
                 # --- logging: sync only at print interval ---
                 should_print = (outer_epoch % print_rate == 0) or (outer_epoch == n_outer - 1)
                 if should_print:
@@ -1694,7 +1753,6 @@ class core:
                     losses_np = np.asarray(losses_np)
                     total_np = float(total_np_arr)
 
-                    displayed_epoch = epoch + inner_steps - 1  # last epoch completed in this outer step
                     log_epochs.append(displayed_epoch)
                     log_losses.append(losses_np)
                     log_total_loss.append(total_np)
@@ -1706,6 +1764,12 @@ class core:
                         track_vals = jit_track(trainable, context, self.rng)
                         track_stats_np = [float(v) for v in jax.device_get(track_vals)]
                         log_track_stats.append(track_stats_np)
+                        # Log trackers to wandb
+                        if _wandb_run is not None:
+                            _wb_track = {}
+                            for _ti, _tv in enumerate(track_stats_np):
+                                _wb_track[f"tracker_{_ti}"] = _tv
+                            wandb_log(_wb_track, step=displayed_epoch)
 
                     # Progress line
                     loss_strs = " | ".join(f"C{i}: {l:>10.4e}" for i, l in enumerate(losses_np))
@@ -1777,6 +1841,16 @@ class core:
             self.training_logs.append(logs)
             _t = int(logs["training_time"])
             self.log.info(f"Training took {_t // 3600}h {(_t % 3600) // 60}m {_t % 60}s")
+
+            # --- wandb: log training summary ---
+            if _wandb_run is not None:
+                _wandb_run.summary.update(
+                    {
+                        "training_time": logs["training_time"],
+                        "final_total_loss": float(log_total_loss[-1]) if log_total_loss else None,
+                    }
+                )
+                wandb_log_model(self)
 
         self._total_epochs += epochs
 
