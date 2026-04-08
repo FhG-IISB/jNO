@@ -564,6 +564,98 @@ class core:
 
         return step
 
+    def make_grad_fn(
+        self,
+        batchsize,
+        frozen,
+        static,
+        checkpoint_gradients=False,
+        min_consecutive=1,
+    ):
+        """Build a function that computes gradients without an optimizer update.
+
+        Returns a function with signature::
+
+            grad_fn(trainable, rng, context)
+                -> (grads, total_loss, individual_losses)
+
+        Used by gradient accumulation to compute gradients on multiple
+        micro-batches before averaging and applying a single update.
+        """
+        loss_fn = self._make_loss_fn(
+            self.compiled_constraints_fn,
+            self.n_constraints,
+            batchsize,
+            frozen,
+            static,
+            checkpoint_gradients=checkpoint_gradients,
+            min_consecutive=min_consecutive,
+        )
+
+        def grad_fn(trainable, rng, context):
+            rng, step_rng = jax.random.split(rng)
+
+            def loss_wrapper(p):
+                return loss_fn(p, context, step_rng)
+
+            (total_loss, individual_losses), grads = jax.value_and_grad(loss_wrapper, has_aux=True)(trainable)
+            return grads, rng, total_loss, individual_losses
+
+        return grad_fn
+
+    def make_apply_fn(
+        self,
+        per_model_opts,
+        lr_schedules,
+        group_lr_schedules=None,
+    ):
+        """Build a function that applies pre-computed gradients via the optimizer.
+
+        Returns a function with signature::
+
+            apply_fn(trainable, opt_states, grads, epoch, prev_losses)
+                -> (trainable, opt_states)
+
+        Used together with :meth:`make_grad_fn` for gradient accumulation.
+        """
+        lid_keys = sorted(per_model_opts.keys())
+        base_epoch = self._total_epochs
+        _group_lr = group_lr_schedules or {}
+
+        def apply_fn(trainable, opt_states, grads, epoch, prev_losses):
+            for k in lid_keys:
+                lid = int(k)
+                model_grads = grads[lid]
+                model_params = trainable[lid]
+
+                updates, new_state = per_model_opts[k].update(
+                    model_grads,
+                    opt_states[k],
+                    model_params,
+                )
+
+                # Update LR — either per-group or single global
+                if k in _group_lr:
+                    for i, sched in enumerate(_group_lr[k]):
+                        lr_val = sched(base_epoch + epoch, prev_losses)
+                        new_state[i].inner_state[-1].hyperparams["step_size"] = jnp.asarray(
+                            lr_val,
+                            dtype=new_state[i].inner_state[-1].hyperparams["step_size"].dtype,
+                        )
+                else:
+                    lr_val = lr_schedules[k](base_epoch + epoch, prev_losses)
+                    new_state[-1].hyperparams["step_size"] = jnp.asarray(
+                        lr_val,
+                        dtype=opt_states[k][-1].hyperparams["step_size"].dtype,
+                    )
+
+                trainable = {**trainable, lid: optax.apply_updates(model_params, updates)}
+                opt_states = {**opt_states, k: new_state}
+
+            return trainable, opt_states
+
+        return apply_fn
+
     def print_tree(self, file: Optional[str] = None):
         """Print the computation tree for every constraint and tracker.
 
@@ -676,6 +768,7 @@ class core:
         checkpoint_gradients: bool = False,
         offload_data: bool = False,
         inner_steps: int = 1,
+        accumulation_steps: int = 1,
         min_consecutive: int = 1,
         profile: bool = False,
         callbacks: Optional[List] = None,
@@ -702,6 +795,12 @@ class core:
             inner_steps: Number of gradient steps to fuse into a single
                 ``jax.lax.fori_loop`` call, amortising Python dispatch
                 overhead.  Must evenly divide *epochs*.  Default ``1``.
+            accumulation_steps: Number of micro-batches whose gradients
+                are averaged before a single optimizer update.  The
+                effective batch size becomes
+                ``batchsize * accumulation_steps`` while peak activation
+                memory stays proportional to *batchsize*.  Requires
+                ``batchsize`` to be set.  Default ``1``.
             min_consecutive: Minimum number of consecutive time steps
                 fed to each constraint evaluation.  Default ``1``.
             profile: If ``True``, capture a JAX profiler trace for a
@@ -723,6 +822,13 @@ class core:
         _trace = jax.profiler.TraceAnnotation if _profiling else lambda name, **_: nullcontext()
 
         batchsize = batchsize if batchsize is not None else self.domain.total_samples
+
+        # Validate accumulation_steps
+        if accumulation_steps < 1:
+            raise ValueError(f"accumulation_steps must be >= 1, got {accumulation_steps}")
+        if accumulation_steps > 1 and batchsize >= self.domain.total_samples:
+            self.log.warning("accumulation_steps > 1 has no effect with full-batch training; " "falling back to accumulation_steps=1")
+            accumulation_steps = 1
 
         # Adaptive resampling metadata
         strategies = getattr(self.domain, "_resampling_strategies", {})
@@ -850,31 +956,6 @@ class core:
                     self.log.info(f"LoRA applied to model {lid} (rank={rank}, alpha={alpha}): " f"{n_lora_layers} LoRALinear layers, " f"Params: {n_params_before:,}→{n_params_after:,}")
                     if n_lora_layers == 0:
                         self.log.warning(f"LoRA: No layers were adapted for model {lid}! " f"LoRA has NO EFFECT on this model.")
-
-                # Write detailed LoRA diagnostics to log file (file-only, no console noise)
-                # self.log.quiet(f"LoRA Diagnostic Report for model {lid}")
-                # self.log.quiet(f"{'='*60}")
-                # self.log.quiet(f"Requested: rank={rank}, alpha={alpha}")
-                # self.log.quiet(f"Model type: {type(model_before).__name__}")
-                # self.log.quiet(f"Wrapper type: {type(model_after).__name__}")
-                # self.log.quiet(f"LoRA layers adapted:        {n_lora_layers}")
-                # self.log.quiet(f"Total arrays before LoRA:   {n_arrays_before}")
-                # self.log.quiet(f"Total arrays after LoRA:    {n_arrays_after}")
-                # self.log.quiet(f"Total params before LoRA:   {n_params_before:,}")
-                # self.log.quiet(f"Total params after LoRA:    {n_params_after:,}")
-                # self.log.quiet(f"New LoRA params:            {n_lora_params:,}")
-                # if isinstance(model_after, FlaxLoRAWrapper):
-                #    self.log.quiet("Adapted kernels (lora_a / lora_b shapes):")
-                #    flat, _ = jax.tree_util.tree_flatten_with_path(model_after.lora_params)
-                #    for path, leaf in flat:
-                #        if eqx.is_array(leaf):
-                #            self.log.quiet(f"  {'/'.join(str(k) for k in path)}: {leaf.shape} {leaf.dtype}")
-                # else:
-                #    self.log.quiet("Full pytree paths (after LoRA):")
-                #    flat, _ = jax.tree_util.tree_flatten_with_path(model_after)
-                #    for path, leaf in flat:
-                #        if eqx.is_array(leaf):
-                #            self.log.quiet(f"  {'/'.join(str(k) for k in path)}: {leaf.shape} {leaf.dtype}")
 
         # ── 3. Build trainable filter ──
         filter_spec = {}
@@ -1207,6 +1288,23 @@ class core:
                     init = (trainable, opt_states, rng, start_epoch, jnp.zeros(()), prev_losses)
                     return jax.lax.fori_loop(0, _K, body, init)
 
+        # ── 7b. Build gradient accumulation functions (if needed) ──
+        _use_accumulation = accumulation_steps > 1
+        if _use_accumulation:
+            _grad_fn = self.make_grad_fn(
+                batchsize=effective_batchsize,
+                frozen=frozen_arrays,
+                static=static,
+                checkpoint_gradients=checkpoint_gradients,
+                min_consecutive=min_consecutive,
+            )
+            _apply_fn = self.make_apply_fn(
+                per_model_opts=per_model_opts,
+                lr_schedules=lr_schedules,
+                group_lr_schedules=group_lr_schedules,
+            )
+            self.log.info(f"Gradient accumulation enabled: {accumulation_steps} micro-batches " f"per update (effective batch = {batchsize} × {accumulation_steps} " f"= {batchsize * accumulation_steps})")
+
         # Optional: build JIT-compiled tracker function
         has_trackers = len(self.compiled_trackers) > 0
         if has_trackers:
@@ -1277,6 +1375,43 @@ class core:
                 donate_argnums=(0, 1, 2),
             )
 
+            # JIT-compile gradient accumulation functions when enabled.
+            if _use_accumulation:
+                _trainable_sharding = jax.tree_util.tree_map(_leaf_sharding, trainable)
+                _ctx_sharding = jax.tree_util.tree_map(_leaf_sharding, trace_context)
+
+                jit_grad = jax.jit(
+                    _grad_fn,
+                    in_shardings=(
+                        _trainable_sharding,  # trainable (read-only)
+                        replicated,  # rng
+                        _ctx_sharding,  # context
+                    ),
+                    out_shardings=(
+                        _trainable_sharding,  # grads (same tree as trainable)
+                        replicated,  # rng
+                        replicated,  # total_loss
+                        replicated,  # individual_losses
+                    ),
+                )
+
+                _opt_sharding = jax.tree_util.tree_map(_leaf_sharding, opt_states)
+                jit_apply = jax.jit(
+                    _apply_fn,
+                    in_shardings=(
+                        _trainable_sharding,  # trainable
+                        _opt_sharding,  # opt_states
+                        _trainable_sharding,  # grads
+                        replicated,  # epoch
+                        replicated,  # prev_losses
+                    ),
+                    out_shardings=(
+                        _trainable_sharding,  # trainable
+                        _opt_sharding,  # opt_states
+                    ),
+                    donate_argnums=(2,),  # donate grads (freshly accumulated)
+                )
+
             if has_trackers:
                 jit_track = jax.jit(track_fn)
 
@@ -1295,14 +1430,27 @@ class core:
 
             # Trigger AOT compilation so the first real step is fast.
 
-            _ = jit_step.lower(
-                trainable,
-                opt_states,
-                self.rng,
-                trace_context,
-                jax.device_put(jnp.int32(0), replicated),
-                prev_losses,
-            ).compile()
+            if _use_accumulation:
+                # AOT compile grad and apply separately
+                _ = jit_grad.lower(trainable, self.rng, trace_context).compile()
+                _zero_grads = jax.tree_util.tree_map(jnp.zeros_like, trainable)
+                _ = jit_apply.lower(
+                    trainable,
+                    opt_states,
+                    _zero_grads,
+                    jax.device_put(jnp.int32(0), replicated),
+                    prev_losses,
+                ).compile()
+                del _zero_grads
+            else:
+                _ = jit_step.lower(
+                    trainable,
+                    opt_states,
+                    self.rng,
+                    trace_context,
+                    jax.device_put(jnp.int32(0), replicated),
+                    prev_losses,
+                ).compile()
 
             # Pre-compile tracker JIT as well so profile windows focus on
             # steady-state train-step behavior instead of one-time compile work.
@@ -1319,8 +1467,14 @@ class core:
             _rw = jnp.copy(self.rng)
             _ew = jax.device_put(jnp.int32(0), replicated)
             _pl = jax.device_put(jnp.zeros(self.n_constraints), replicated)
-            for _ in range(3):
-                _tw, _ow, _rw, _ew, _, _pl = jit_step(_tw, _ow, _rw, trace_context, _ew, _pl)
+            if _use_accumulation:
+                for _ in range(3):
+                    _gw, _rw, _, _ = jit_grad(_tw, _rw, trace_context)
+                    _tw, _ow = jit_apply(_tw, _ow, _gw, _ew, _pl)
+                del _gw
+            else:
+                for _ in range(3):
+                    _tw, _ow, _rw, _ew, _, _pl = jit_step(_tw, _ow, _rw, trace_context, _ew, _pl)
 
             if has_trackers:
                 _ = jit_track(_tw, trace_context, _rw)
@@ -1392,7 +1546,7 @@ class core:
 
             for outer_epoch in range(n_outer):
                 if (not _profile_active) and _profile_steps > 0 and outer_epoch == _profile_start:
-                    _profile_ctx = jax.profiler.trace(f"{self.log.path}/traces")
+                    _profile_ctx = jax.profiler.trace(f"{self.log.path}/traces", create_perfetto_trace=True)
                     _profile_ctx.__enter__()
                     _profile_active = True
 
@@ -1485,25 +1639,70 @@ class core:
                             else:
                                 on_device_context = on_device_context_new
 
-                # --- prepare context for this step ---
-                if offload_data:
-                    if host_context is None:
-                        raise RuntimeError("offload_data=True but host_context is not available")
-                    indices = rng_np.choice(total_samples, batchsize, replace=False)
-                    batch_np = {k: (v if k == "__time__" else (np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices])) for k, v in host_context.items()}
-                    context = self._shard_data(jax.device_put(batch_np))
-                else:
-                    context = on_device_context
+                # --- prepare context and step ---
+                if _use_accumulation:
+                    # Gradient accumulation: N micro-batch forward/backward
+                    # passes, then one averaged optimizer update.
+                    _acc_grads = None
+                    _acc_total = 0.0
+                    _acc_losses = jax.device_put(jnp.zeros(self.n_constraints), replicated)
+                    _inv_accum = 1.0 / accumulation_steps
 
-                # --- step ---
-                (trainable, opt_states, self.rng, epoch_jnp, total_loss, individual_losses) = jit_step(
-                    trainable,
-                    opt_states,
-                    self.rng,
-                    context,
-                    epoch_jnp,
-                    prev_losses,
-                )
+                    for _ai in range(accumulation_steps):
+                        # Each micro-batch gets a fresh random sample
+                        if offload_data:
+                            if host_context is None:
+                                raise RuntimeError("offload_data=True but host_context is not available")
+                            indices = rng_np.choice(total_samples, batchsize, replace=False)
+                            batch_np = {k: (v if k == "__time__" else (np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices])) for k, v in host_context.items()}
+                            micro_ctx = self._shard_data(jax.device_put(batch_np))
+                        else:
+                            micro_ctx = on_device_context
+
+                        _micro_grads, self.rng, _micro_loss, _micro_indiv = jit_grad(
+                            trainable,
+                            self.rng,
+                            micro_ctx,
+                        )
+
+                        if _acc_grads is None:
+                            _acc_grads = jax.tree_util.tree_map(lambda g: g * _inv_accum, _micro_grads)
+                        else:
+                            _acc_grads = jax.tree_util.tree_map(lambda a, g: a + g * _inv_accum, _acc_grads, _micro_grads)
+                        _acc_total = _acc_total + float(jax.device_get(_micro_loss)) * _inv_accum
+                        _acc_losses = _acc_losses + _micro_indiv * _inv_accum
+
+                    # Single optimizer update with averaged gradients
+                    trainable, opt_states = jit_apply(
+                        trainable,
+                        opt_states,
+                        _acc_grads,
+                        epoch_jnp,
+                        prev_losses,
+                    )
+                    total_loss = jax.device_put(jnp.float32(_acc_total), replicated)
+                    individual_losses = _acc_losses
+                    epoch_jnp = epoch_jnp + jnp.asarray(1, dtype=epoch_jnp.dtype)
+                    context = micro_ctx  # keep last micro-batch for tracker evaluation
+                else:
+                    if offload_data:
+                        if host_context is None:
+                            raise RuntimeError("offload_data=True but host_context is not available")
+                        indices = rng_np.choice(total_samples, batchsize, replace=False)
+                        batch_np = {k: (v if k == "__time__" else (np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices])) for k, v in host_context.items()}
+                        context = self._shard_data(jax.device_put(batch_np))
+                    else:
+                        context = on_device_context
+
+                    # --- step ---
+                    (trainable, opt_states, self.rng, epoch_jnp, total_loss, individual_losses) = jit_step(
+                        trainable,
+                        opt_states,
+                        self.rng,
+                        context,
+                        epoch_jnp,
+                        prev_losses,
+                    )
 
                 prev_losses = individual_losses
 

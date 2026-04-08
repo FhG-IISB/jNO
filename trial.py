@@ -2,7 +2,7 @@ import jno
 import jax
 import optax
 
-dir = jno.setup("./runs/test", wandb=True)
+dir = jno.setup("./runs/test")
 
 # Domain
 dom = 500 * jno.domain.rect(mesh_size=0.05, x_range=(0, 2), y_range=(0, 1))
@@ -25,7 +25,7 @@ cb = jno.callback.checkpoint(save_interval_epochs=5000, best_fn=lambda m: m["tot
 
 # Create -> Train -> Save
 crux = jno.core(constraints=[pde.mse], domain=dom).print_shapes()
-crux.solve(epochs=20_000, batchsize=32, callbacks=[cb]).plot(f"{dir}/training.png")
+crux.solve(epochs=20_000, batchsize=32, callbacks=[cb], accumulation_steps=3, profile=True).plot(f"{dir}/training.png")
 jno.save(crux, f"{dir}/model.pkl")
 
 # Inference via test domain on a finer mesh
