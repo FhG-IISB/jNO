@@ -52,6 +52,17 @@ class ScheduleWrapper:
 schedule = ScheduleWrapper()
 
 
+class _CallbackNamespace:
+    """Namespace for callback constructors: ``jno.callback.checkpoint(...)``."""
+
+    from .utils.callbacks import Callback as base  # noqa: F401
+    from .utils.callbacks import CheckpointCallback as checkpoint  # noqa: F401
+    from .utils.callbacks import EarlyStoppingCallback as early_stopping  # noqa: F401
+
+
+callback = _CallbackNamespace()
+
+
 __all__ = [
     "schedule",
     "core",
@@ -92,4 +103,5 @@ __all__ = [
     "numpy",
     "nn",
     "np",
+    "callback",
 ]

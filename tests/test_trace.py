@@ -179,7 +179,7 @@ class TestReshape:
 # ======================================================================
 class TestConcat:
     def test_concat(self):
-        import jno.numpy as pnp
+        import jno.jnp_ops as pnp
 
         a = make_var("x")
         b = make_var("y")
@@ -193,7 +193,7 @@ class TestConcat:
 # ======================================================================
 class TestChoice:
     def test_choice_constructs(self):
-        import jno.numpy as jnn
+        import jno.jnp_ops as jnn
 
         a = make_var("x")
         b = make_var("y")
@@ -203,7 +203,7 @@ class TestChoice:
         assert ch.selected == 1
 
     def test_choice_select_updates_index(self):
-        import jno.numpy as jnn
+        import jno.jnp_ops as jnn
 
         a = make_var("x")
         b = make_var("y")
@@ -326,7 +326,7 @@ class TestModelMask:
 
     def _make_eqx_model(self):
         import jax
-        import jno.numpy as jnn
+        import jno.jnp_ops as jnn
 
         key = jax.random.PRNGKey(0)
         return jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key)

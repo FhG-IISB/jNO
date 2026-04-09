@@ -28,7 +28,7 @@ def save(instance, filepath: str, public_key_path: str | None = None, private_ke
         try:
             from pylotte.signed_pickle import SignedPickle
         except ImportError as e:
-            raise ImportError("pylotte is required for signed save/load functionality. " "Install with `pip install pylotte` or `pip install jno[dev]`") from e
+            raise ImportError("pylotte is required for signed save/load functionality. " "Install with `pip install pylotte` or `pip install jax-neural-operators[dev]`") from e
         signer = SignedPickle(
             public_key_path=public_key_path,
             private_key_path=private_key_path,
@@ -87,7 +87,7 @@ def load(
         try:
             from pylotte.signed_pickle import SignedPickle
         except ImportError as e:
-            raise ImportError("pylotte is required for signed save/load functionality. " "Install with `pip install pylotte` or `pip install jno[dev]`") from e
+            raise ImportError("pylotte is required for signed save/load functionality. " "Install with `pip install pylotte` or `pip install jax-neural-operators[dev]`") from e
         loader = SignedPickle(public_key_path=public_key_path, serializer=cloudpickle)
         instance = loader.safe_load(filepath, signature_path)
     else:

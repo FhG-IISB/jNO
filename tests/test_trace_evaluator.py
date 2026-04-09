@@ -203,11 +203,11 @@ class TestEvalFunctionCall:
 
 # ======================================================================
 # Concat evaluation
-# (now via jno.numpy.concat which returns a FunctionCall)
+# (now via jno.jnp_ops.concat which returns a FunctionCall)
 # ======================================================================
 class TestEvalConcat:
     def test_concat_literals(self):
-        import jno.numpy as pnp
+        import jno.jnp_ops as pnp
 
         ev = make_evaluator()
         a = Literal(jnp.array([[1.0], [2.0]]))

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple, Optional, Callable, Any, Union
+from typing import Dict, List, Tuple, Optional, Callable, Any, Union, overload
 
 import jax
 import jax.numpy as jnp
@@ -1441,10 +1441,38 @@ class domain(MeshIOMixin):
         self._param_tags.add(name)
         return self
 
+    @overload
     def variable(
         self,
         tag: str,
-        sample: Tuple[Optional[int], Optional[Callable]] = (None, None),
+        sample: Union[jnp.ndarray, np.ndarray],
+        resampling_strategy: Any = ...,
+        normals: bool = ...,
+        reverse_normals: bool = ...,
+        view_factor: bool = ...,
+        point_data: bool = ...,
+        split: bool = ...,
+        return_indices: Any = ...,
+    ) -> TensorTag: ...
+
+    @overload
+    def variable(
+        self,
+        tag: str,
+        sample: Tuple[Optional[int], Optional[Callable]] = ...,
+        resampling_strategy: Any = ...,
+        normals: bool = ...,
+        reverse_normals: bool = ...,
+        view_factor: bool = ...,
+        point_data: bool = ...,
+        split: bool = ...,
+        return_indices: Any = ...,
+    ) -> Tuple[Variable, ...]: ...
+
+    def variable(
+        self,
+        tag: str,
+        sample=(None, None),
         resampling_strategy=None,
         normals: bool = False,
         reverse_normals: bool = False,
@@ -1452,6 +1480,7 @@ class domain(MeshIOMixin):
         point_data: bool = False,
         split: bool = False,
         return_indices=False,
+        time_value: float | None = None,
     ) -> Any:
         """Create Variable placeholders for a tagged point set or tensor.
 
@@ -1481,12 +1510,25 @@ class domain(MeshIOMixin):
                     self.context[tag] = sample
                 else:
                     self.add_tensor_tag(tag, sample)
+        # auto-default for the initial slice in time-dependent problems
+        if time_value is None and tag == "initial" and self._is_time_dependent and self.time is not None:
+            time_value = self.time[0]
 
         if tag in self._mesh_pool.keys() and isinstance(sample, tuple) and len(sample) > 0 and isinstance(sample[0], (int, type(None))):
             # Sample points for this tag on demand
-            # Save sample dict for inference
-            self.sample_dict.append([tag, (None, None), resampling_strategy, normals, view_factor])
+            source_tag = tag
             points, idx, tag = self.sample({tag: sample}, normals, return_indices)
+            self.sample_dict.append(
+                {
+                    "source_tag": source_tag,
+                    "resolved_tag": tag,
+                    "sample": sample,
+                    "resampling_strategy": resampling_strategy,
+                    "normals": normals,
+                    "reverse_normals": reverse_normals,
+                    "view_factor": view_factor,
+                }
+            )
 
         # Store resampling strategy if provided
         if resampling_strategy is not None:
@@ -1516,16 +1558,48 @@ class domain(MeshIOMixin):
         # Create Variable placeholder for each spatial dimension
         coord_vars: List[Any] = [Variable(tag=tag, dim=[i, i + 1], domain=self, axis="spatial", fem_meta=fem_meta) for i in range(self.dimension)]
 
-        # Always add temporal variable (constant 1 for stationary problems)
-        coord_vars.append(
-            Variable(
-                tag="__time__",
-                dim=[0, 1],
-                domain=self,
-                axis="temporal",
-                fem_meta=None,
+        # Time variable
+        if self._is_time_dependent:
+            if time_value is None:
+                # default behavior: shared global time variable
+                coord_vars.append(
+                    Variable(
+                        tag="__time__",
+                        dim=[0, 1],
+                        domain=self,
+                        axis="temporal",
+                        fem_meta=None,
+                    )
+                )
+            else:
+                # local fixed-time variable with the same shape as this sampled tag
+                local_time_tag = f"__time_{tag}__"
+
+                if local_time_tag not in self.context:
+                    pts = np.asarray(self.context[tag])
+                    time_dtype = np.asarray(self.context["__time__"]).dtype if "__time__" in self.context else pts.dtype
+                    self.context[local_time_tag] = np.full(pts[..., :1].shape, time_value, dtype=time_dtype)
+
+                coord_vars.append(
+                    Variable(
+                        tag=local_time_tag,
+                        dim=[0, 1],
+                        domain=self,
+                        axis="temporal",
+                        fem_meta=None,
+                    )
+                )
+        else:
+            # stationary problems still expose a time-like variable via __time__
+            coord_vars.append(
+                Variable(
+                    tag="__time__",
+                    dim=[0, 1],
+                    domain=self,
+                    axis="temporal",
+                    fem_meta=None,
+                )
             )
-        )
 
         if normals:
             if reverse_normals:
@@ -2479,7 +2553,11 @@ class domain(MeshIOMixin):
                 time_info = f" (t ∈ [{t_vals.min():.3f}, {t_vals.max():.3f}])"
 
         ax.set_title(f"Sampled Points: {time_info}")
-        ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+        handles, labels = ax.get_legend_handles_labels()
+        if not handles:
+            self.log.warning("No legend entries found. This usually means no variable of the domain has been set or sampled. Be sure to call e.g. domain.variable('interior') before plotting.")
+        else:
+            ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
 
         import matplotlib.pyplot as plt  # already imported above, but safe
 

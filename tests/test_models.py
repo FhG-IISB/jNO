@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import equinox as eqx
 import optax
 import jno
-import jno.numpy as jnn
+import jno.jnp_ops as jnn
 
 from jno.trace import Model, TunableModule
 from jno.architectures.models import nn, parameter, set_default_rng_seed

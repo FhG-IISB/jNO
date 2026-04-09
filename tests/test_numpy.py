@@ -1,4 +1,4 @@
-"""Unit tests for jno.numpy — JAX NumPy wrappers for the tracing DSL."""
+"""Unit tests for jno.jnp_ops — JAX NumPy wrappers for the tracing DSL."""
 
 import pytest
 import jax.numpy as jnp
@@ -6,7 +6,7 @@ import jno
 
 from jno.trace import Placeholder, FunctionCall, Literal, BinaryOp
 from tests.conftest import make_var
-import jno.numpy as np
+import jno.jnp_ops as np
 
 
 # ======================================================================
@@ -17,7 +17,7 @@ class TestConstants:
         assert jno.np is np
 
     def test_top_level_numpy_module_export(self):
-        assert jno.numpy is np
+        assert jno.jnp_ops is np
 
     def test_pi(self):
         assert float(np.pi) == pytest.approx(3.141592653589793)

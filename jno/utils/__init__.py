@@ -13,6 +13,10 @@ from .config import (
     get_rsa_public_key,
     get_rsa_private_key,
     get_seed,
+    get_wandb_run,
+    wandb_log,
+    wandb_log_model,
+    wandb_alert,
     setup,
 )
 
@@ -32,5 +36,9 @@ __all__ = [
     "get_rsa_public_key",
     "get_rsa_private_key",
     "get_seed",
+    "get_wandb_run",
+    "wandb_log",
+    "wandb_log_model",
+    "wandb_alert",
     "setup",
 ]
