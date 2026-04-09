@@ -1,6 +1,6 @@
-
 import jax
-#jax.config.update("jax_enable_x64", False)
+
+# jax.config.update("jax_enable_x64", False)
 
 import jax.numpy as jnp
 import lineax as lx
@@ -12,6 +12,7 @@ import jno
 
 import numpy as np
 from jno import LearningRateSchedule as lrs
+
 """04 - 3-D Helmholtz equation on an F-shaped domain with FEM and variational PINNs
 
 Problem
@@ -33,6 +34,8 @@ Analytical solution
 """
 alpha = 0.2
 k_val = 4.0
+
+
 # -----------------------------------------------------------------------------
 # Geometry helper
 # -----------------------------------------------------------------------------
@@ -87,30 +90,51 @@ def letter_F_3d(depth=1.0, mesh_size=0.18):
         return geo, 3, mesh_size
 
     return construct
+
+
 # -----------------------------------------------------------------------------
 # Manufactured solution
 # -----------------------------------------------------------------------------
-def exact_u(x, y, z):  return z + alpha * jno.np.sin(jno.np.pi * z)
-def exact_u_num(x, y, z): return z + alpha * jnp.sin(jnp.pi * z)
-def source_f(x, y, z): return alpha * (jno.np.pi**2) * jno.np.sin(jno.np.pi * z) - (k_val**2) * (z + alpha * jno.np.sin(jno.np.pi * z))
-def flux_top(x, y, z):  return 0.0 * x + (1.0 - alpha * jno.np.pi)
-def flux_wall(x, y, z): return 0.0 * x
+def exact_u(x, y, z):
+    return z + alpha * jno.np.sin(jno.np.pi * z)
+
+
+def exact_u_num(x, y, z):
+    return z + alpha * jnp.sin(jnp.pi * z)
+
+
+def source_f(x, y, z):
+    return alpha * (jno.np.pi**2) * jno.np.sin(jno.np.pi * z) - (k_val**2) * (z + alpha * jno.np.sin(jno.np.pi * z))
+
+
+def flux_top(x, y, z):
+    return 0.0 * x + (1.0 - alpha * jno.np.pi)
+
+
+def flux_wall(x, y, z):
+    return 0.0 * x
+
+
 # -----------------------------------------------------------------------------
 # Plotting helpers
 # -----------------------------------------------------------------------------
 def extract_boundary_faces_from_tetra(mesh):
     pts = np.asarray(mesh.points)
     tet = np.asarray(mesh.cells_dict["tetra"], dtype=int)
-    faces = np.vstack([
-        tet[:, [0, 1, 2]],
-        tet[:, [0, 1, 3]],
-        tet[:, [0, 2, 3]],
-        tet[:, [1, 2, 3]],
-    ])
+    faces = np.vstack(
+        [
+            tet[:, [0, 1, 2]],
+            tet[:, [0, 1, 3]],
+            tet[:, [0, 2, 3]],
+            tet[:, [1, 2, 3]],
+        ]
+    )
     faces_sorted = np.sort(faces, axis=1)
     unique_faces, counts = np.unique(faces_sorted, axis=0, return_counts=True)
     boundary_faces = unique_faces[counts == 1]
     return pts[:, :3], boundary_faces
+
+
 def plot_boundary_scalar(ax, pts, faces, nodal_values, title, cmap="viridis"):
     nodal_values = np.asarray(nodal_values).reshape(-1)
     verts = pts[faces]
@@ -133,6 +157,7 @@ def plot_boundary_scalar(ax, pts, faces, nodal_values, title, cmap="viridis"):
     ax.view_init(elev=25, azim=35)
     return poly
 
+
 # -----------------------------------------------------------------------------
 # Coarse training domain
 # -----------------------------------------------------------------------------
@@ -153,8 +178,19 @@ xt, yt, zt, _ = train_domain.variable("gauss_top", split=True)
 xw, yw, zw, _ = train_domain.variable("gauss_wall", split=True)
 x_int, y_int, z_int, _ = train_domain.variable("interior", split=True)
 
-net = jno.np.nn.mlp( 3, hidden_dims=32, num_layers=4, activation=jax.nn.tanh, key=jax.random.PRNGKey(0),)
-def apply_hard_bc(u_pred, x, y, z): return z * u_pred
+net = jno.np.nn.mlp(
+    3,
+    hidden_dims=32,
+    num_layers=4,
+    activation=jax.nn.tanh,
+    key=jax.random.PRNGKey(0),
+)
+
+
+def apply_hard_bc(u_pred, x, y, z):
+    return z * u_pred
+
+
 u_gauss = apply_hard_bc(net(xg, yg, zg), xg, yg, zg)
 u_int = apply_hard_bc(net(x_int, y_int, z_int), x_int, y_int, z_int)
 
@@ -180,4 +216,3 @@ crux.solve(epochs=3)
 u_pred, u_true = crux.eval([u_int, exact_u(x_int, y_int, z_int)])
 rel_l2 = float(jnp.linalg.norm(u_pred - u_true) / (jnp.linalg.norm(u_true) + 1e-8))
 assert rel_l2 < 1.1, f"relative L2 error too large: {rel_l2:.3e}"
-

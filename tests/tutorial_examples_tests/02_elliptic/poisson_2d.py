@@ -16,6 +16,7 @@ import jax
 import jno
 
 import optax
+
 π = jno.np.pi
 # ── Domain ────────────────────────────────────────────────────────────────────
 domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.2))
@@ -27,6 +28,8 @@ u_exact = jno.np.sin(π * x) * jno.np.sin(π * y)
 forcing = 2 * π**2 * jno.np.sin(π * x) * jno.np.sin(π * y)
 layer_dims = [2, 10, 10, 1]
 req_params = {"D": 5, "flavor": "exact"}
+
+
 def make_solver(scheme: str, label: str, epochs: int = 5):
     net = jno.np.nn.mlp(in_features=2, hidden_dims=64, num_layers=4, key=jax.random.PRNGKey(0))
     net.optimizer(optax.adam(1))
@@ -52,4 +55,3 @@ rel_l2_fd = make_solver("finite_difference", "fd")
 
 assert rel_l2_ad < 1.1, f"AD relative L2 error too large: {rel_l2_ad:.3e}"
 assert rel_l2_fd < 1.1, f"FD relative L2 error too large: {rel_l2_fd:.3e}"
-
