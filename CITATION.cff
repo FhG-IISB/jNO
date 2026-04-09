@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it."
+title: "jNO: A JAX Library for Neural Operator and Foundation Model Training"
+version: 0.1.0
+date-released: 2026-01-01
+authors:
+  - family-names: Armbruster
+    given-names: Leon
+    affiliation: Fraunhofer IISB, Germany
+url: "https://github.com/FhG-IISB/jno"

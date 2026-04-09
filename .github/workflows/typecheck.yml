@@ -1,0 +1,29 @@
+name: Lint
+
+on:
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v4
+      with:
+        python-version: "3.12"
+
+    - name: Install dependencies
+      run: uv sync --all-extras --no-extra cuda
+
+    - name: Format with Black
+      run: uv run black --line-length 250 jno/ tests/
+
+    - name: Check formatting with black
+      run: uv run black --check --line-length 250 jno/ tests/
+
+    - name: Run mypy
+      run: uv run mypy jno/ --ignore-missing-imports --no-strict-optional

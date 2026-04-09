@@ -1,0 +1,100 @@
+[build-system]
+requires = ["setuptools>=68", "wheel", "build"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jax-neural-operators"
+version = "0.1.0"
+description = "Jax Neural Operators"
+readme = "README.md"
+requires-python = ">=3.11, <3.14"
+authors = [{ name = "Leon Armbruster", email = "leon.armbruster@iisb.fraunhofer.de" }]
+license = "MIT"
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Mathematics",
+]
+
+dependencies = [
+    "jax",
+    "equinox",
+    "optax",
+    "orbax-checkpoint",
+
+    "pygmsh",
+    "cloudpickle",
+    "einops",
+    "matplotlib",
+]
+
+[project.urls]
+Homepage = "https://github.com/FhG-IISB/jno"
+Documentation = "https://fhg-iisb.github.io/jNO_docs/"
+Source = "https://github.com/FhG-IISB/jno"
+Issues = "https://github.com/FhG-IISB/jno/issues"
+
+[project.optional-dependencies]
+cuda = [
+    "jax[cuda12]"
+]
+dev = ["pytest>=7.0", 
+        "black>=22.0", 
+        "flake8>=4.0", 
+        "mypy>=0.950", 
+        "paramax", 
+        "flax", 
+        "xprof", 
+        "pylotte", 
+        "nevergrad", 
+        "lineax", 
+        "pyfiglet", 
+        "fenics-basix"
+]
+iree = [
+    "iree-base-compiler",
+    "iree-base-runtime"
+]
+
+
+[tool.setuptools]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["jno*"]
+
+[tool.setuptools.package-data]
+jno = ["py.typed"]
+
+[tool.uv.workspace]
+members = [
+    ".",
+]
+
+[tool.black]
+line-length = 250
+
+[tool.mypy]
+exclude = '^(build/|jNO\.egg-info/|runs/)'
+
+[tool.uv.sources]
+jax_morph = { git = "https://github.com/armbrusl/jax_morph" }
+jax_mpp = { git = "https://github.com/armbrusl/jax_mpp" }
+jax_poseidon = { git = "https://github.com/FhG-IISB/jax_poseidon" }
+jax_pdeformer2 = { git = "https://github.com/FhG-IISB/jax_pdeformer2" }
+jax_walrus = { git = "https://github.com/FhG-IISB/jax_walrus" }
+"jax-fem" = { git = "https://github.com/FhG-IISB/jax-fem" }
+
+[dependency-groups]
+foundation = [
+    "jax_morph",
+    "jax_mpp",
+    "jax_poseidon",
+    "jax_pdeformer2",
+    "jax_walrus",
+]
+fem = [
+    "lineax",
+    "jax-fem",
+    "pyfiglet",
+    "fenics-basix",
+]
