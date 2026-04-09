@@ -1,0 +1,35 @@
+Model Summary (layer 1)
+============================================================
+name:                 MLP
+module_type:          MLP
+show_architecture:    True
+
+Training Controls
+------------------------------------------------------------
+frozen:               False
+dtype:                None
+optimizer:            GradientTransformationExtraArgs(init=<function chain.<locals>.init_fn at 0x14d6bc166fc0>, update=<function chain.<locals>.update_fn at 0x14d6bc167060>)
+lr_schedule:          <jno.utils.adaptive.lrscheduler.LearningRateSchedule object at 0x14d6bc15bc50>
+lora_config:          None
+mask_scope_pending:   False
+
+Initialization
+------------------------------------------------------------
+weight_path:          None
+weight_tree_set:      False
+initialize_mask_set:  False
+
+Mask Diagnostics
+------------------------------------------------------------
+mask_active:          False
+trainable_mask_set:   False
+
+Parameter Groups
+------------------------------------------------------------
+num_groups:           0
+
+Parameters
+------------------------------------------------------------
+array_leaves:         8
+total_parameters:     3481
+

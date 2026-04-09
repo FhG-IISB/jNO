@@ -37,6 +37,8 @@ def test_geometry_shortcut_routes_domain_kwargs():
         ("poseidon", {"nx", "ny", "algorithm", "time", "compute_mesh_connectivity"}),
         ("cube", {"x_range", "y_range", "z_range", "mesh_size", "algorithm", "time", "compute_mesh_connectivity"}),
         ("disk", {"center", "radius", "mesh_size", "num_points", "algorithm", "time", "compute_mesh_connectivity"}),
+        ("triangle", {"vertices", "mesh_size", "algorithm", "time", "compute_mesh_connectivity"}),
+        ("polygon", {"vertices", "mesh_size", "algorithm", "time", "compute_mesh_connectivity"}),
         ("l_shape", {"size", "mesh_size", "separate_boundary", "algorithm", "time", "compute_mesh_connectivity"}),
         ("rectangle_with_hole", {"outer_size", "hole_size", "mesh_size", "separate_boundary", "algorithm", "time", "compute_mesh_connectivity"}),
         ("rect_pml", {"x_range", "y_range", "mesh_size", "pml_thickness_top", "pml_thickness_bottom", "algorithm", "time", "compute_mesh_connectivity"}),
@@ -167,7 +169,7 @@ class TestRect2DStationary:
         assert pts.shape[1] == 2
 
     def test_side_tags_present(self, dom):
-        for tag in ("bottom", "top", "left", "right"):
+        for tag in ("one", "two", "three", "four", "top", "right", "bottom", "left"):
             assert tag in dom.avaiable_mesh_tags, f"Expected tag '{tag}' in avaiable_mesh_tags"
 
     def test_stationary_time_in_context(self, dom):
@@ -313,3 +315,110 @@ class TestCube3DTimeDep:
     def test_interior_pool_has_3_cols(self, dom):
         # _mesh_pool is (T, N, D) for time-dep domains; check last axis is D=3
         assert dom._mesh_pool["interior"].shape[-1] == 3
+
+
+# ---------------------------------------------------------------------------
+# Triangle geometry
+# ---------------------------------------------------------------------------
+
+
+class TestTriangle:
+    """Basic triangle domain from custom vertices."""
+
+    @pytest.fixture(scope="class")
+    def dom(self):
+        return jno.domain.triangle(
+            vertices=((0, 0), (2, 0), (1, 1)),
+            mesh_size=0.3,
+            compute_mesh_connectivity=True,
+        )
+
+    def test_dimension_is_2(self, dom):
+        assert dom.dimension == 2
+
+    def test_interior_tag_present(self, dom):
+        assert "interior" in dom._mesh_pool
+
+    def test_boundary_tag_present(self, dom):
+        assert "boundary" in dom._mesh_pool
+
+    def test_interior_has_2_cols(self, dom):
+        assert dom._mesh_pool["interior"].shape[-1] == 2
+
+
+# ---------------------------------------------------------------------------
+# Polygon geometry
+# ---------------------------------------------------------------------------
+
+
+class TestPolygon:
+    """Generic polygon domain with auto-orientation and boundary labels."""
+
+    @pytest.fixture(scope="class")
+    def dom(self):
+        # Pentagon (given in CW order to test auto-reorientation)
+        verts = [(0, 0), (0, 2), (1, 3), (2, 2), (2, 0)]
+        return jno.domain.polygon(vertices=verts, mesh_size=0.5, compute_mesh_connectivity=True)
+
+    def test_dimension_is_2(self, dom):
+        assert dom.dimension == 2
+
+    def test_interior_and_boundary_present(self, dom):
+        assert "interior" in dom._mesh_pool
+        assert "boundary" in dom._mesh_pool
+
+    def test_five_boundary_labels(self, dom):
+        tags = set(dom._mesh_pool.keys())
+        for name in ("one", "two", "three", "four", "five"):
+            assert name in tags, f"Missing boundary label '{name}'"
+
+    def test_rect_has_four_boundary_labels(self):
+        dom = jno.domain.rect(mesh_size=0.4)
+        tags = set(dom._mesh_pool.keys())
+        for name in ("one", "two", "three", "four"):
+            assert name in tags
+
+    def test_triangle_has_three_boundary_labels(self):
+        dom = jno.domain.triangle(mesh_size=0.4)
+        tags = set(dom._mesh_pool.keys())
+        for name in ("one", "two", "three"):
+            assert name in tags
+
+
+# ---------------------------------------------------------------------------
+# Multi-geometry domain stacking via + operator
+# ---------------------------------------------------------------------------
+
+
+class TestDomainStacking:
+    """Verify that combining domains via ``+`` correctly stacks batches."""
+
+    def test_two_geometries_batch_shape(self):
+        dom = 3 * jno.domain.rect(mesh_size=0.3)
+        dom += 2 * jno.domain.disk(mesh_size=0.3)
+        x, y, _ = dom.variable("interior", (10, None))
+        ctx = dom.context["interior"]
+        assert ctx.shape[0] == 5  # 3 rect + 2 disk
+        assert ctx.shape[2] == 10
+        assert ctx.shape[3] == 2
+
+    def test_three_geometries_batch_shape(self):
+        dom = 4 * jno.domain.rect(mesh_size=0.3)
+        dom += 3 * jno.domain.disk(mesh_size=0.3)
+        dom += 2 * jno.domain.l_shape(mesh_size=0.3)
+        x, y, _ = dom.variable("interior", (8, None))
+        ctx = dom.context["interior"]
+        assert ctx.shape[0] == 9  # 4 + 3 + 2
+        assert ctx.shape[2] == 8
+
+    def test_boundary_also_stacks(self):
+        dom = 2 * jno.domain.rect(mesh_size=0.3)
+        dom += 3 * jno.domain.triangle(mesh_size=0.3)
+        x, y, _ = dom.variable("boundary")
+        ctx = dom.context["boundary"]
+        assert ctx.shape[0] == 5  # 2 + 3
+
+    def test_total_samples_updated(self):
+        dom = 5 * jno.domain.rect(mesh_size=0.3)
+        dom += 3 * jno.domain.disk(mesh_size=0.3)
+        assert dom.total_samples == 8

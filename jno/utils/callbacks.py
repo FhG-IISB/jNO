@@ -126,7 +126,7 @@ class CheckpointCallback(Callback):
         self._save_interval = save_interval_epochs
         self._best_fn = best_fn
 
-        opts_kwargs = dict(
+        opts_kwargs: Dict[str, Any] = dict(
             max_to_keep=max_to_keep,
             save_interval_steps=save_interval_epochs,
             enable_async_checkpointing=async_checkpointing,
@@ -229,7 +229,7 @@ class CheckpointCallback(Callback):
                 name = "/".join(str(k) for k in path)
                 arr = np.asarray(jax.device_get(leaf)).ravel()
                 if arr.size > 0:
-                    histograms[f"weights/{model_key}/{name}"] = wandb.Histogram(arr)
+                    histograms[f"weights/{model_key}/{name}"] = wandb.Histogram(arr.tolist())
         if histograms:
             run.log(histograms, step=epoch)
 

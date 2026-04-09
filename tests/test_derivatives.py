@@ -869,3 +869,110 @@ class TestFDSubSchemesOnLShape:
         lap = _eval(u.laplacian(self.x, self.y, scheme="finite_difference:lsq"), self._ctx())
         err = float(jnp.mean(jnp.abs(lap - 4.0)[self.interior_mask]))
         assert err < 1.0, f"lsq laplacian mean error = {err:.4f}"
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 13. FD on stacked (multi-geometry) domains
+# ───────────────────────────────────────────────────────────────────────────────
+
+
+class TestFDOnStackedDomains:
+    """Verify FD derivatives use the correct mesh when domains are stacked via +."""
+
+    @pytest.fixture(autouse=True, scope="class")
+    def _setup(self, request):
+        import jno
+        from jno.trace_compiler import TraceCompiler
+
+        # Two different geometries
+        dom = 3 * jno.domain.rect(mesh_size=0.1)
+        dom += 2 * jno.domain.polygon(
+            [(0, 0), (1, 0), (0.5, 1)], mesh_size=0.1,
+        )
+        x, y, t = dom.variable("interior")
+        request.cls.dom = dom
+        request.cls.x = x
+        request.cls.y = y
+
+    def _compile_and_eval(self, expr):
+        """Compile expression through the full pipeline and evaluate."""
+        from jno.trace_compiler import TraceCompiler
+        from jno.trace import OperationDef
+
+        fn = TraceCompiler.compile_traced_expression(expr, [])
+        ctx = dict(self.dom.context)
+        return fn({}, context=ctx, key=jax.random.PRNGKey(0))
+
+    def test_batch_domain_map_exists(self):
+        """After sampling, _batch_domain_map should exist and have correct length."""
+        bdm = getattr(self.dom, "_batch_domain_map", None)
+        assert bdm is not None
+        assert len(bdm) == 5  # 3 rect + 2 triangle
+        # First 3 should be domain 0 (rect), last 2 domain 1 (triangle)
+        np.testing.assert_array_equal(bdm[:3], 0)
+        np.testing.assert_array_equal(bdm[3:], 1)
+
+    def test_mesh_connectivity_stored_in_sub_domains(self):
+        """Each sub-domain should have its own mesh_connectivity."""
+        assert self.dom.mesh_connectivity is not None
+        assert len(self.dom._sub_domains) == 1
+        sd_mc = self.dom._sub_domains[0].get("mesh_connectivity")
+        assert sd_mc is not None
+        assert "triangles" in sd_mc
+        # Primary and sub-domain meshes should be different
+        assert sd_mc["n_points"] != self.dom.mesh_connectivity["n_points"]
+
+    def test_domain_mesh_connectivities_property(self):
+        """_domain_mesh_connectivities should return [primary, sd0, ...]."""
+        mcs = self.dom._domain_mesh_connectivities
+        assert len(mcs) == 2
+        assert mcs[0] is self.dom.mesh_connectivity
+        assert mcs[1] is self.dom._sub_domains[0]["mesh_connectivity"]
+
+    def test_fd_gradient_stacked(self):
+        """FD gradient of x² + y² should be correct across both geometries.
+
+        ∂(x² + y²)/∂x = 2x for every batch, regardless of which mesh
+        generated the points. The grouped-vmap should route each batch
+        to its correct mesh_connectivity.
+        """
+        u = self.x * self.x + self.y * self.y
+        du_dx = self._compile_and_eval(u.d(self.x, scheme="finite_difference"))
+        # du_dx shape: (B, 1, N, 1) — B=5, T=1
+        assert du_dx.shape[0] == 5
+
+        # Extract x-coordinates from context (B, 1, N, 2) → compare
+        pts = jnp.array(self.dom.context["interior"])  # (5, 1, N, 2)
+        expected = 2.0 * pts[:, :, :, 0:1]  # (5, 1, N, 1)
+
+        # Check each batch: mean absolute error should be < 0.1
+        for b in range(5):
+            err = float(jnp.mean(jnp.abs(du_dx[b] - expected[b])))
+            assert err < 0.1, f"Batch {b}: FD gradient error = {err:.4f}"
+
+    def test_fd_laplacian_stacked(self):
+        """FD Laplacian of x² + y² should be ≈ 4 for all batches."""
+        u = self.x * self.x + self.y * self.y
+        lap = self._compile_and_eval(
+            u.laplacian(self.x, self.y, scheme="finite_difference")
+        )
+        assert lap.shape[0] == 5
+
+        for b in range(5):
+            mean_lap = float(jnp.mean(lap[b]))
+            # FD Laplacian is approximate, especially near boundaries
+            assert abs(mean_lap - 4.0) < 2.0, (
+                f"Batch {b}: mean Laplacian = {mean_lap:.2f}, expected ≈ 4.0"
+            )
+
+
+class TestFEMGuardOnStackedDomains:
+    """Verify that init_fem() raises on stacked domains."""
+
+    def test_init_fem_raises_on_stacked_domain(self):
+        import jno
+
+        dom = 2 * jno.domain.rect(mesh_size=0.3)
+        dom += 1 * jno.domain.disk(mesh_size=0.3)
+        with pytest.raises(ValueError, match="not supported on stacked domains"):
+            dom.init_fem()

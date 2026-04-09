@@ -311,7 +311,8 @@ def wandb_alert(title: str, text: str, level: str = "WARN") -> None:
     try:
         import wandb  # type: ignore[import-untyped]
 
-        alert_level = getattr(wandb.AlertLevel, level, wandb.AlertLevel.WARN)
+        alert_level_enum = getattr(wandb, "AlertLevel", None)
+        alert_level = getattr(alert_level_enum, level, getattr(alert_level_enum, "WARN", level))
         _WANDB_RUN.alert(title=title, text=text, level=alert_level)
     except Exception:
         pass
