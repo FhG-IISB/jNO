@@ -31,7 +31,7 @@ Quick install from PyPI:
 pip install jax-neural-operators
 ```
 
-If a Nvidia GPU is avaiable install
+If a Nvidia GPU is available install
 
 ```bash
 pip instal jax[cuda]
