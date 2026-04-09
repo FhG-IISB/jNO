@@ -1,5 +1,5 @@
-
 import jax
+
 jax.config.update("jax_enable_x64", False)
 
 import jax.numpy as jnp
@@ -10,6 +10,7 @@ import jno
 
 import numpy as np
 from jno import LearningRateSchedule as lrs
+
 """02 - 2-D Helmholtz equation with FEM and variational PINNs
 
 Problem
@@ -30,14 +31,30 @@ pi = jno.np.pi
 sin = jno.np.sin
 cos = jno.np.cos
 k_val = 4.0
+
+
 # -----------------------------------------------------------------------------
 # Manufactured solution
 # -----------------------------------------------------------------------------
-def exact_u(x, y): return sin(pi * x) * (cos(pi * y) + y)
-def exact_u_num(x, y): return jnp.sin(jnp.pi * x) * (jnp.cos(jnp.pi * y) + y)
-def source_f(x, y): return pi**2 * sin(pi * x) * (2.0 * cos(pi * y) + y) - (k_val**2) * sin(pi * x) * (cos(pi * y) + y)
-def exact_flux_right(x, y): return -pi * (cos(pi * y) + y)
-def exact_flux_top(x, y): return sin(pi * x)
+def exact_u(x, y):
+    return sin(pi * x) * (cos(pi * y) + y)
+
+
+def exact_u_num(x, y):
+    return jnp.sin(jnp.pi * x) * (jnp.cos(jnp.pi * y) + y)
+
+
+def source_f(x, y):
+    return pi**2 * sin(pi * x) * (2.0 * cos(pi * y) + y) - (k_val**2) * sin(pi * x) * (cos(pi * y) + y)
+
+
+def exact_flux_right(x, y):
+    return -pi * (cos(pi * y) + y)
+
+
+def exact_flux_top(x, y):
+    return sin(pi * x)
+
 
 # -----------------------------------------------------------------------------
 # Training domain (coarse)
@@ -63,9 +80,18 @@ x_int, y_int, _ = train_domain.variable("interior", split=True)
 # -----------------------------------------------------------------------------
 # Neural network with hard Dirichlet BCs
 # -----------------------------------------------------------------------------
-net = jno.np.nn.mlp( 2, hidden_dims=32, num_layers=4,  activation=jax.nn.tanh,  key=jax.random.PRNGKey(0),)
+net = jno.np.nn.mlp(
+    2,
+    hidden_dims=32,
+    num_layers=4,
+    activation=jax.nn.tanh,
+    key=jax.random.PRNGKey(0),
+)
 
-def apply_hard_bc(u_pred, x, y): return sin(pi * x) + x * y * u_pred
+
+def apply_hard_bc(u_pred, x, y):
+    return sin(pi * x) + x * y * u_pred
+
 
 u_gauss = apply_hard_bc(net(xg, yg), xg, yg)
 u_int = apply_hard_bc(net(x_int, y_int), x_int, y_int)
@@ -158,4 +184,3 @@ print(f"Fine FEM Relative L2 Error: {rel_l2_fem:.6e}")
 print(f"Fine FEM Max Abs Error:     {max_abs_fem:.6e}")
 assert float(rel_l2_vpinn) < 1.1, f"VPINN relative L2 error too large: {float(rel_l2_vpinn):.3e}"
 assert float(rel_l2_fem) < 0.5, f"FEM relative L2 error too large: {float(rel_l2_fem):.3e}"
-

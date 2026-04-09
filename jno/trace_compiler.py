@@ -185,8 +185,10 @@ def _grouped_vmap(
             vmapped = jax.vmap(scan_fn, in_axes=(grp_in_axes, 0))
             grp_result = vmapped(grp_ctx, grp_keys)
         else:
+
             def _scan_no_key(sv):
                 return scan_fn(sv, rng_key=None)
+
             vmapped = jax.vmap(_scan_no_key, in_axes=(grp_in_axes,))
             grp_result = vmapped(grp_ctx)
 
@@ -889,16 +891,17 @@ class TraceCompiler:
 
             if batch_domain_map is not None:
                 if len(batch_domain_map) != B:
-                    raise ValueError(
-                        "Mini-batching (batchsize) is not supported with "
-                        "finite-difference derivatives on stacked domains. "
-                        "Use batchsize=None (full-batch) or switch to "
-                        "scheme='automatic_differentiation'."
-                    )
+                    raise ValueError("Mini-batching (batchsize) is not supported with " "finite-difference derivatives on stacked domains. " "Use batchsize=None (full-batch) or switch to " "scheme='automatic_differentiation'.")
                 return _grouped_vmap(
-                    scan_over_time, spatial_ctx, ctx_in_axes,
-                    spatial_tag_order, fd_domain, batch_domain_map,
-                    B, key, is_multi=False,
+                    scan_over_time,
+                    spatial_ctx,
+                    ctx_in_axes,
+                    spatial_tag_order,
+                    fd_domain,
+                    batch_domain_map,
+                    B,
+                    key,
+                    is_multi=False,
                 )
 
             if key is not None:
@@ -1074,16 +1077,17 @@ class TraceCompiler:
 
             if batch_domain_map is not None:
                 if len(batch_domain_map) != B:
-                    raise ValueError(
-                        "Mini-batching (batchsize) is not supported with "
-                        "finite-difference derivatives on stacked domains. "
-                        "Use batchsize=None (full-batch) or switch to "
-                        "scheme='automatic_differentiation'."
-                    )
+                    raise ValueError("Mini-batching (batchsize) is not supported with " "finite-difference derivatives on stacked domains. " "Use batchsize=None (full-batch) or switch to " "scheme='automatic_differentiation'.")
                 return _grouped_vmap(
-                    scan_over_time, spatial_ctx, ctx_in_axes,
-                    spatial_tag_order, fd_domain, batch_domain_map,
-                    B, key, is_multi=True,
+                    scan_over_time,
+                    spatial_ctx,
+                    ctx_in_axes,
+                    spatial_tag_order,
+                    fd_domain,
+                    batch_domain_map,
+                    B,
+                    key,
+                    is_multi=True,
                 )
 
             if key is not None:

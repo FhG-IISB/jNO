@@ -1,5 +1,5 @@
-
 import jax
+
 jax.config.update("jax_enable_x64", False)
 
 import jax.numpy as jnp
@@ -10,6 +10,7 @@ import jno
 
 import numpy as np
 from jno import LearningRateSchedule as lrs
+
 """
 2-D diffusion-reaction equation with mixed Dirichlet + Robin BCs
 (FEM + VPINN comparison)
@@ -59,18 +60,31 @@ k_val = 4.0
 alpha_right = 2.0
 alpha_top = 3.0
 
+
 # ============================================================
 # Exact solution and forcing:  u(x,y) = x sin(pi y) + y
 # ============================================================
-def exact_u(x, y): return x * sin(pi * y) + y
-def exact_u_num(x, y): return x * jnp.sin(jnp.pi * y) + y
-def source_f(x, y): return x * (pi**2) * sin(pi * y) - (k_val**2) * (x * sin(pi * y) + y)
-def robin_rhs_right(x, y): # du/dn + alpha u on x=1
+def exact_u(x, y):
+    return x * sin(pi * y) + y
+
+
+def exact_u_num(x, y):
+    return x * jnp.sin(jnp.pi * y) + y
+
+
+def source_f(x, y):
+    return x * (pi**2) * sin(pi * y) - (k_val**2) * (x * sin(pi * y) + y)
+
+
+def robin_rhs_right(x, y):  # du/dn + alpha u on x=1
     return sin(pi * y) + alpha_right * (sin(pi * y) + y)
+
+
 def robin_rhs_top(x, y):
     # du/dn + alpha u on y=1
     # u_y(x,1)=1-pi x, u(x,1)=1
     return 1.0 - pi * x + alpha_top
+
 
 # ============================================================
 # Training domain
@@ -107,9 +121,18 @@ x_int, y_int, _ = train_domain.variable("interior", split=True)
 # ============================================================
 key = jax.random.PRNGKey(0)
 
-net = jno.np.nn.mlp( 2, hidden_dims=32, num_layers=2, activation=jax.nn.tanh,  key=key,)
+net = jno.np.nn.mlp(
+    2,
+    hidden_dims=32,
+    num_layers=2,
+    activation=jax.nn.tanh,
+    key=key,
+)
 
-def apply_hard_bc(raw, x, y):  return y + x * y * raw
+
+def apply_hard_bc(raw, x, y):
+    return y + x * y * raw
+
 
 # network evaluated on all supports
 u_gauss = apply_hard_bc(net(xg, yg), xg, yg)
@@ -135,14 +158,19 @@ robin_right_fem = alpha_r * u * phi - robin_rhs_right(xr, yr) * phi
 robin_top_fem = alpha_t * u * phi - robin_rhs_top(xt, yt) * phi
 
 weak_form = vol_integrand_fem + robin_right_fem + robin_top_fem
-pde = weak_form.assemble(train_domain,u_net= u_gauss, target="vpinn")
+pde = weak_form.assemble(train_domain, u_net=u_gauss, target="vpinn")
 
 # ============================================================
 # Train VPINN
 # ============================================================
 crux = jno.core(constraints=[pde.mse], domain=train_domain)
 
-learning_rate = lrs.warmup_cosine(5, 1, 1e-3, 1e-5,)
+learning_rate = lrs.warmup_cosine(
+    5,
+    1,
+    1e-3,
+    1e-5,
+)
 
 net.optimizer(optax.adam, lr=learning_rate)
 crux.solve(epochs=5)
@@ -193,14 +221,17 @@ op_fine = lx.MatrixLinearOperator(A_fine_dense)
 sol_fine = lx.linear_solve(op_fine, b_fine_dense, solver=lx.AutoLinearSolver(well_posed=True))
 u_fem_fine = sol_fine.value.reshape(-1)
 
-lin_res_fine = jnp.linalg.norm(A_fine_dense @ u_fem_fine - b_fine_dense) / ( jnp.linalg.norm(b_fine_dense) + 1e-14)
+lin_res_fine = jnp.linalg.norm(A_fine_dense @ u_fem_fine - b_fine_dense) / (jnp.linalg.norm(b_fine_dense) + 1e-14)
 print(f"Fine FEM linear solve residual: {lin_res_fine:.6e}")
 # ============================================================
 # Evaluate VPINN on fine domain
 # ============================================================
 x_eval, y_eval, _ = fem_domain.variable("interior", split=True)
 
-u_vpinn_eval = crux.eval(apply_hard_bc(net(x_eval, y_eval), x_eval, y_eval), domain=fem_domain,)
+u_vpinn_eval = crux.eval(
+    apply_hard_bc(net(x_eval, y_eval), x_eval, y_eval),
+    domain=fem_domain,
+)
 u_true_eval = crux.eval(exact_u(x_eval, y_eval), domain=fem_domain)
 
 rel_l2_vpinn = jnp.linalg.norm(u_true_eval - u_vpinn_eval) / (jnp.linalg.norm(u_true_eval) + 1e-14)
@@ -228,4 +259,3 @@ assert float(rel_l2_fem) < 0.5, f"FEM relative L2 error too large: {float(rel_l2
 # ============================================================
 # Plot / smoke test
 # ============================================================
-

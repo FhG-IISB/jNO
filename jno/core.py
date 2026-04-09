@@ -1,4 +1,4 @@
-from typing import List, Callable, Dict, Optional, Tuple, Union, Any
+from typing import List, Callable, Dict, Optional, Tuple, Union, Any, cast
 import os
 import gc
 import jax
@@ -325,7 +325,10 @@ class core:
         """
         # Unwrap OperationDef envelope if present.
         wrapped_in_opdef = isinstance(expr, OperationDef)
-        node = expr.expr if wrapped_in_opdef else expr
+        if wrapped_in_opdef:
+            node = cast(Placeholder, getattr(expr, "expr"))
+        else:
+            node = expr
 
         # Walk through BinaryOp wrappers (e.g. w0 * pde.mse) to find the
         # operand that carries the pointwise reduction.

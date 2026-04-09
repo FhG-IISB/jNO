@@ -9,11 +9,13 @@ Analytical solution
 -------------------
     u(x, y, t) = exp(-t) sin(pi x) sin(pi y)
 """
+
 import jax
 import jno
 
 import optax
 from jno import LearningRateSchedule as lrs
+
 pi = jno.np.pi
 bx = 1.0
 by = -0.5
@@ -48,4 +50,3 @@ history = crux.solve(10)
 _u, _u_exact = crux.eval([u, u_exact])
 rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_exact) + 1e-8))
 assert rel_l2 < 1.1, f"relative L2 error too large: {rel_l2:.3e}"
-
