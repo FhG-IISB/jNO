@@ -484,6 +484,21 @@ class domain(MeshIOMixin):
         """Batch the domain n times: domain * 2 samples 2x independently."""
         return self.__rmul__(n)
 
+    def _effective_batch_count(self) -> int:
+        """Infer the current batch size from metadata and existing batched context."""
+        declared = int(getattr(self, "_batch_count", getattr(self, "total_samples", 1)))
+        inferred = 1
+
+        # Infer from already-batched context entries (skip shared time axis).
+        for tag, data in self.context.items():
+            if tag == "__time__" or not hasattr(data, "shape"):
+                continue
+            shape = data.shape
+            if len(shape) >= 1:
+                inferred = max(inferred, int(shape[0]))
+
+        return max(1, declared, inferred)
+
     def __add__(self, other: "domain") -> "domain":
         """Merge another domain into this one (stacks along batch dimension).
 
@@ -517,6 +532,13 @@ class domain(MeshIOMixin):
 
         for name, values in self._parameter_list.items():
             self.parameters[name] = np.array(values, dtype=np.float32)
+
+        # Keep batch metadata consistent after domain stacking.
+        self_batch = int(getattr(self, "_batch_count", getattr(self, "total_samples", 1)))
+        other_batch = int(getattr(other, "_batch_count", getattr(other, "total_samples", 1)))
+        self._batch_count = max(1, self_batch) + max(1, other_batch)
+        self.total_samples = self._batch_count
+        self.same_domain = False
 
         return self
 
@@ -1289,10 +1311,10 @@ class domain(MeshIOMixin):
             tensor = tensor.reshape(1, 1)
 
         # Validate batch dimension - must match exactly
-        batch_count = getattr(self, "_batch_count", 1)
+        batch_count = self._effective_batch_count()
         tensor_batch = tensor.shape[0]
         if tensor_batch != batch_count:
-            self.log.warning(f"Tensor '{name}' has batch dimension {tensor_batch}, but domain has " f"batch count {batch_count}. Was this intended?")
+            self.log.warning(f"Tensor '{name}' has batch dimension {tensor_batch}, but domain has " f"effective batch count {batch_count}. Was this intended?")
 
         self.context[name] = tensor
         self._param_tags.add(name)
@@ -1929,7 +1951,7 @@ class domain(MeshIOMixin):
           (shared across batches).
         """
 
-        batch_count = getattr(self, "_batch_count", 1)
+        batch_count = self._effective_batch_count()
         is_time_dep = self._is_time_dependent
 
         for tag, (n_samples, sampler) in sample_spec.items():
