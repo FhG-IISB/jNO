@@ -2,7 +2,6 @@ __pycache__/
 *.py[cod]
 *.egg-info
 *.dot
-*.pkl
 *.lock
 *.png
 *.npz

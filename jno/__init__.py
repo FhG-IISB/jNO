@@ -30,6 +30,7 @@ from .trace_compiler import TraceCompiler
 from .differential_operators import DifferentialOperators
 from . import resampling
 from . import jnp_ops as np
+from . import fn
 from .utils.load_save import save, load
 from .architectures.models import nn, parameter
 
@@ -61,6 +62,7 @@ class _CallbackNamespace:
 
 
 callback = _CallbackNamespace()
+cb = _CallbackNamespace()
 
 
 __all__ = [
@@ -103,5 +105,6 @@ __all__ = [
     "numpy",
     "nn",
     "np",
+    "fn",
     "callback",
 ]

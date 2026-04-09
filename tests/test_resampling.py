@@ -292,3 +292,37 @@ def test_time_dependent_2d_domain_training_path_remains_stable():
     assert strategy.call_count == 0
     assert strategy._last_resample_epoch == -1
     assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
+
+
+def test_solve_resampling_works_with_adaptive_weight_wrapped_losses():
+    """Resampling should work when constraints are ``w * loss.mse``.
+
+    Adaptive weight balancers wrap the raw loss in a ``BinaryOp(*)`` which
+    previously prevented ``_strip_reduction_for_resampling`` from reaching
+    the inner ``.mse`` reduction to recover pointwise residuals.
+    """
+    strategy = CountingStrategy(resample_every=1, resample_fraction=0.3, start_epoch=0)
+
+    domain = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.05))
+    x, *_ = domain.variable(
+        "interior",
+        sample=(64, None),
+        resampling_strategy=strategy,
+    )
+
+    key = jax.random.PRNGKey(0)
+    u_net = jnn.nn.mlp(1, hidden_dims=16, num_layers=2, key=key)
+    u = u_net(x) * x * (1.0 - x)
+
+    pde = (jnn.laplacian(u, [x]) - jnn.sin(jnn.pi * x)).mse
+    bcs = (u - 0).mse
+
+    w0, w1 = jno.fn.adaptive.relobralo([pde, bcs])
+
+    solver = jno.core([w0 * pde, w1 * bcs, w0.tracker(), w1.tracker()], domain)
+    u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+
+    stats = solver.solve(epochs=3)
+
+    assert strategy.call_count > 0
+    assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])

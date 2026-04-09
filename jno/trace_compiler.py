@@ -57,6 +57,182 @@ def _default_float_dtype():
     return jnp.asarray(0.0).dtype
 
 
+def _find_fd_domain(expr):
+    """Walk expression tree to find a domain that uses FD + sub-domains.
+
+    Returns the domain if FD derivatives are present and the domain has
+    sub-domains with ``_batch_domain_map``, otherwise ``None``.
+    """
+    visited = set()
+    domain = None
+
+    def _walk(node):
+        nonlocal domain
+        if domain is not None:
+            return
+        nid = id(node)
+        if nid in visited:
+            return
+        visited.add(nid)
+
+        if isinstance(node, (Jacobian, Hessian)):
+            if getattr(node, "scheme", "").startswith("finite_difference"):
+                # Find domain from variable nodes
+                for v in getattr(node, "variables", []):
+                    d = getattr(v, "_domain", None)
+                    if d is not None and getattr(d, "_sub_domains", []):
+                        domain = d
+                        return
+
+        # Recurse into children
+        for attr in ("target", "left", "right", "expr", "volume_expr"):
+            child = getattr(node, attr, None)
+            if child is not None:
+                _walk(child)
+        for attr in ("variables", "args", "boundary_exprs"):
+            children = getattr(node, attr, None)
+            if isinstance(children, (list, tuple)):
+                for c in children:
+                    if c is not None:
+                        _walk(c)
+
+    if isinstance(expr, (list, tuple)):
+        for e in expr:
+            _walk(e)
+    else:
+        _walk(expr)
+    return domain
+
+
+import numpy as _np  # used only for _grouped_vmap index manipulation
+
+
+def _grouped_vmap(
+    scan_fn,
+    spatial_ctx,
+    ctx_in_axes,
+    spatial_tag_order,
+    fd_domain,
+    batch_domain_map,
+    B,
+    key,
+    is_multi,
+):
+    """Run vmap in per-domain groups so each group uses correct mesh_connectivity.
+
+    For each unique domain index in *batch_domain_map*, the function:
+    1. Subsets the context arrays to only that group's batch indices.
+    2. Temporarily swaps ``fd_domain.mesh_connectivity`` to the group's mesh.
+    3. Runs ``jax.vmap(scan_fn)`` on the subset.
+    4. Restores the original ``mesh_connectivity``.
+    5. Concatenates all group outputs in the original batch order.
+
+    Parameters
+    ----------
+    scan_fn : callable
+        The per-sample evaluation function ``(spatial_vals, rng_key) -> result``.
+    spatial_ctx : tuple of arrays
+        Context arrays (potentially batched along axis 0).
+    ctx_in_axes : tuple
+        Per-array vmap in_axes (0 or None).
+    spatial_tag_order : tuple of str
+        Tag names corresponding to ``spatial_ctx``.
+    fd_domain : domain
+        The domain with ``_sub_domains`` and ``_domain_mesh_connectivities``.
+    batch_domain_map : ndarray of int, shape (B,)
+        Maps each batch index to its source domain index.
+    B : int
+        Total batch size.
+    key : jax random key or None
+    is_multi : bool
+        If True, scan_fn returns a list of arrays (multi-expression).
+    """
+    connectivities = fd_domain._domain_mesh_connectivities
+    original_mc = fd_domain.mesh_connectivity
+    unique_domains = sorted(set(int(d) for d in batch_domain_map))
+
+    # Pre-split keys if needed
+    all_keys = jax.random.split(key, B) if key is not None else None
+
+    group_results = {}  # domain_idx -> result (array or list of arrays)
+    group_indices = {}  # domain_idx -> numpy array of original batch indices
+
+    for d_idx in unique_domains:
+        mask = _np.array(batch_domain_map) == d_idx
+        indices = _np.where(mask)[0]
+        group_indices[d_idx] = indices
+        Bg = len(indices)
+
+        # Subset context arrays for this group
+        grp_ctx = []
+        grp_in_axes = []
+        for arr, ax in zip(spatial_ctx, ctx_in_axes):
+            if ax == 0:
+                grp_ctx.append(arr[indices])
+                grp_in_axes.append(0)
+            else:
+                grp_ctx.append(arr)
+                grp_in_axes.append(ax)
+        grp_ctx = tuple(grp_ctx)
+        grp_in_axes = tuple(grp_in_axes)
+
+        # Swap mesh_connectivity
+        mc = connectivities[d_idx]
+        fd_domain.mesh_connectivity = mc
+
+        if key is not None:
+            grp_keys = all_keys[indices]
+            vmapped = jax.vmap(scan_fn, in_axes=(grp_in_axes, 0))
+            grp_result = vmapped(grp_ctx, grp_keys)
+        else:
+            def _scan_no_key(sv):
+                return scan_fn(sv, rng_key=None)
+            vmapped = jax.vmap(_scan_no_key, in_axes=(grp_in_axes,))
+            grp_result = vmapped(grp_ctx)
+
+        group_results[d_idx] = grp_result
+
+    # Restore original mesh_connectivity
+    fd_domain.mesh_connectivity = original_mc
+
+    # Recombine in original batch order
+    # Build a permutation: for each original batch index, find which
+    # group it's in and what position within that group.
+    order = _np.empty(B, dtype=_np.int64)
+    group_offsets = {}
+    offset = 0
+    for d_idx in unique_domains:
+        group_offsets[d_idx] = offset
+        offset += len(group_indices[d_idx])
+
+    # Build concatenation order: groups are concatenated in domain order,
+    # then we permute to restore original batch order.
+    concat_to_original = _np.empty(B, dtype=_np.int64)
+    pos = 0
+    for d_idx in unique_domains:
+        for local_i, orig_i in enumerate(group_indices[d_idx]):
+            concat_to_original[pos] = orig_i
+            pos += 1
+
+    # The inverse permutation: original_order[concat_to_original[i]] = i
+    inv_perm = _np.argsort(concat_to_original)
+
+    if is_multi:
+        # grp_result is a list of arrays, one per expression
+        # Concatenate along batch axis for each expression, then reorder
+        n_exprs = len(group_results[unique_domains[0]])
+        combined = []
+        for expr_idx in range(n_exprs):
+            parts = [group_results[d_idx][expr_idx] for d_idx in unique_domains]
+            cat = jnp.concatenate(parts, axis=0)
+            combined.append(cat[inv_perm])
+        return combined
+    else:
+        parts = [group_results[d_idx] for d_idx in unique_domains]
+        cat = jnp.concatenate(parts, axis=0)
+        return cat[inv_perm]
+
+
 class TraceCompiler:
     """One-time graph-compilation and parameter-initialisation utilities.
 
@@ -708,6 +884,23 @@ class TraceCompiler:
                 return eval_window(tuple(windowed_list), t_windowed)
 
             # ----- outer: vmap over B ---------------------------------
+            fd_domain = _find_fd_domain(expr)
+            batch_domain_map = getattr(fd_domain, "_batch_domain_map", None) if fd_domain is not None else None
+
+            if batch_domain_map is not None:
+                if len(batch_domain_map) != B:
+                    raise ValueError(
+                        "Mini-batching (batchsize) is not supported with "
+                        "finite-difference derivatives on stacked domains. "
+                        "Use batchsize=None (full-batch) or switch to "
+                        "scheme='automatic_differentiation'."
+                    )
+                return _grouped_vmap(
+                    scan_over_time, spatial_ctx, ctx_in_axes,
+                    spatial_tag_order, fd_domain, batch_domain_map,
+                    B, key, is_multi=False,
+                )
+
             if key is not None:
                 keys = jax.random.split(key, B)
                 vmapped_fn = jax.vmap(
@@ -875,6 +1068,23 @@ class TraceCompiler:
                     t_windowed = jnp.zeros((W, 1))
 
                 return eval_window(tuple(windowed_list), t_windowed)
+
+            fd_domain = _find_fd_domain(exprs)
+            batch_domain_map = getattr(fd_domain, "_batch_domain_map", None) if fd_domain is not None else None
+
+            if batch_domain_map is not None:
+                if len(batch_domain_map) != B:
+                    raise ValueError(
+                        "Mini-batching (batchsize) is not supported with "
+                        "finite-difference derivatives on stacked domains. "
+                        "Use batchsize=None (full-batch) or switch to "
+                        "scheme='automatic_differentiation'."
+                    )
+                return _grouped_vmap(
+                    scan_over_time, spatial_ctx, ctx_in_axes,
+                    spatial_tag_order, fd_domain, batch_domain_map,
+                    B, key, is_multi=True,
+                )
 
             if key is not None:
                 keys = jax.random.split(key, B)

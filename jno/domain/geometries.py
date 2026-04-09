@@ -3,6 +3,60 @@ from __future__ import annotations
 import numpy as np
 import meshio
 
+# Ordinal labels used for boundary segment naming.
+_ORDINALS = [
+    "one",
+    "two",
+    "three",
+    "four",
+    "five",
+    "six",
+    "seven",
+    "eight",
+    "nine",
+    "ten",
+    "eleven",
+    "twelve",
+    "thirteen",
+    "fourteen",
+    "fifteen",
+    "sixteen",
+    "seventeen",
+    "eighteen",
+    "nineteen",
+    "twenty",
+]
+
+
+def _ensure_ccw(vertices):
+    """Return *vertices* in counter-clockwise order (positive signed area)."""
+    v = np.asarray(vertices, dtype=np.float64)
+    # Shoelace signed area
+    xs, ys = v[:, 0], v[:, 1]
+    area2 = np.sum(xs * np.roll(ys, -1) - np.roll(xs, -1) * ys)
+    if area2 < 0:
+        v = v[::-1]
+    return v
+
+
+def _order_from_top_right(vertices):
+    """Return an index permutation that starts at the topmost vertex and
+    proceeds clockwise (i.e. the next vertex is to the right).
+
+    The caller already guarantees counter-clockwise winding, so "starting from
+    the top going right" means we find the top-most vertex (highest y, break
+    ties with rightmost x) and then *reverse* the vertex order so the
+    traversal goes clockwise.
+    """
+    v = np.asarray(vertices, dtype=np.float64)
+    # Pick top-most vertex; break ties by rightmost x.
+    start = int(np.lexsort((v[:, 0] * -1, v[:, 1] * -1))[0])
+    n = len(v)
+    # CCW order starting from *start*, then reversed → clockwise from top.
+    ccw_order = [(start + i) % n for i in range(n)]
+    cw_order = [ccw_order[0]] + ccw_order[1:][::-1]
+    return cw_order
+
 
 class Geometries:
 
@@ -26,40 +80,81 @@ class Geometries:
         return constructor
 
     @staticmethod
-    def rect(x_range=(0, 1), y_range=(0, 1), mesh_size=0.1):
-        """Create a rectangular domain for pygmsh."""
+    def polygon(vertices, mesh_size=0.1, _aliases=None):
+        """Create a 2D polygon domain from an arbitrary list of vertices.
 
-        def construct(geo):
-            x0, x1 = x_range
-            y0, y1 = y_range
+        Vertices are automatically oriented to counter-clockwise winding.
+        Boundary segments are labeled ``"one"``, ``"two"``, … starting from
+        the topmost vertex and proceeding clockwise (to the right).
 
-            points = [
-                geo.add_point([x0, y0], mesh_size=mesh_size),
-                geo.add_point([x1, y0], mesh_size=mesh_size),
-                geo.add_point([x1, y1], mesh_size=mesh_size),
-                geo.add_point([x0, y1], mesh_size=mesh_size),
-            ]
+        Parameters
+        ----------
+        vertices : sequence of (x, y) pairs
+            At least 3 corner points defining the polygon.
+        mesh_size : float
+            Target mesh element size.
+        """
 
-            lines = [
-                geo.add_line(points[0], points[1]),
-                geo.add_line(points[1], points[2]),
-                geo.add_line(points[2], points[3]),
-                geo.add_line(points[3], points[0]),
-            ]
+        def constructor(geo):
+            verts = np.asarray(vertices, dtype=np.float64)
+            if verts.ndim != 2 or verts.shape[0] < 3 or verts.shape[1] != 2:
+                raise ValueError(f"Expected >= 3 vertices of shape (N, 2), got {verts.shape}")
+
+            verts = _ensure_ccw(verts)
+            label_order = _order_from_top_right(verts)
+            n = len(verts)
+
+            points = [geo.add_point([verts[i, 0], verts[i, 1]], mesh_size=mesh_size) for i in range(n)]
+            lines = [geo.add_line(points[i], points[(i + 1) % n]) for i in range(n)]
 
             curve_loop = geo.add_curve_loop(lines)
             surface = geo.add_plane_surface(curve_loop)
 
             geo.add_physical(surface, "interior")
             geo.add_physical(lines, "boundary")
-            geo.add_physical([lines[0]], "bottom")
-            geo.add_physical([lines[1]], "right")
-            geo.add_physical([lines[2]], "top")
-            geo.add_physical([lines[3]], "left")
+
+            # Label each segment starting from the top-right vertex, going clockwise.
+            for label_idx, vi in enumerate(label_order):
+                name = _ORDINALS[label_idx] if label_idx < len(_ORDINALS) else str(label_idx + 1)
+                geo.add_physical([lines[vi]], name)
+                # Add backward-compatible aliases (e.g. "top", "right", …)
+                if _aliases and label_idx in _aliases:
+                    geo.add_physical([lines[vi]], _aliases[label_idx])
 
             return geo, 2, mesh_size
 
-        return construct
+        return constructor
+
+    @staticmethod
+    def rect(x_range=(0, 1), y_range=(0, 1), mesh_size=0.1):
+        """Create a rectangular domain as a polygon.
+
+        Boundary labels: ``"one"`` / ``"top"``, ``"two"`` / ``"right"``,
+        ``"three"`` / ``"bottom"``, ``"four"`` / ``"left"``.
+        """
+        x0, x1 = x_range
+        y0, y1 = y_range
+        return Geometries.polygon(
+            vertices=[(x0, y0), (x1, y0), (x1, y1), (x0, y1)],
+            mesh_size=mesh_size,
+            _aliases={0: "top", 1: "right", 2: "bottom", 3: "left"},
+        )
+
+    @staticmethod
+    def triangle(vertices=((0, 0), (1, 0), (0, 1)), mesh_size=0.1):
+        """Create a triangular domain as a polygon.
+
+        Parameters
+        ----------
+        vertices : sequence of 3 (x, y) pairs
+            The three corner points.
+        mesh_size : float
+            Mesh element size.
+        """
+        v = list(vertices)
+        if len(v) != 3:
+            raise ValueError(f"Triangle requires exactly 3 vertices, got {len(v)}")
+        return Geometries.polygon(vertices=v, mesh_size=mesh_size)
 
     @staticmethod
     def equi_distant_rect(x_range=(0, 1), y_range=(0, 1), nx=10, ny=10):

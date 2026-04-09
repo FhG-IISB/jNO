@@ -315,8 +315,43 @@ class core:
 
         If the constraint is ``residual.mse`` (or similar reduction),
         resampling needs the unreduced ``residual`` field to score points.
+
+        Also handles ``weight * residual.mse`` patterns produced by adaptive
+        loss balancers: walks through ``BinaryOp`` multiplication nodes and
+        strips the reduction from the operand that contains it.
+
+        Transparently unwraps ``OperationDef`` envelopes that
+        ``wrap_constraints`` adds around every constraint expression.
         """
-        node = expr
+        # Unwrap OperationDef envelope if present.
+        wrapped_in_opdef = isinstance(expr, OperationDef)
+        node = expr.expr if wrapped_in_opdef else expr
+
+        # Walk through BinaryOp wrappers (e.g. w0 * pde.mse) to find the
+        # operand that carries the pointwise reduction.
+        if isinstance(node, BinaryOp) and node.op == "*":
+            left_stripped = core._strip_reduction_inner(node.left)
+            right_stripped = core._strip_reduction_inner(node.right)
+            # Prefer the operand whose strip actually changed something
+            # (i.e. it had a reduction to unwrap).
+            if left_stripped is not node.left:
+                result = left_stripped
+            elif right_stripped is not node.right:
+                result = right_stripped
+            else:
+                # Neither side had a reduction — nothing to strip
+                result = node
+        else:
+            result = core._strip_reduction_inner(node)
+
+        # Re-wrap so the compiled expression list stays consistent.
+        if wrapped_in_opdef and result is not node:
+            return OperationDef(result)
+        return expr if result is node else result
+
+    @staticmethod
+    def _strip_reduction_inner(node: Placeholder) -> Placeholder:
+        """Peel off terminal FunctionCall nodes that reduce an axis."""
         while isinstance(node, FunctionCall) and getattr(node, "reduces_axis", False) and len(node.args) == 1:
             node = node.args[0]
         return node
@@ -754,8 +789,10 @@ class core:
         # Keep tag metadata and a pointwise residual function for adaptive
         # resampling. The normal training loss still uses reduced constraints
         # in ``self.compiled_constraints_fn``.
-        self._constraint_tags = self.get_constraint_tags(self._constraint_exprs)
         self._resample_exprs = [self._strip_reduction_for_resampling(expr) for expr in self._constraint_exprs]
+        # Derive tags from the *stripped* expressions so that adaptive-weight
+        # wrappers (which reference all losses) don't contaminate the tag set.
+        self._constraint_tags = self.get_constraint_tags(self._resample_exprs)
         self.compiled_resample_constraints_fn = TraceCompiler.compile_multi_expression(self._resample_exprs, self.all_ops)
 
         # self.log.info(f"There are a total of {self.count(self.models)} trainable parameters in the network/s.")
@@ -838,8 +875,13 @@ class core:
 
         constraint_tags = getattr(self, "_constraint_tags", self.get_constraint_tags(getattr(self, "_constraint_exprs", [])))
         tag_to_constraint_indices: Dict[str, List[int]] = {}
-        for i, tag in enumerate(constraint_tags):
-            tag_to_constraint_indices.setdefault(tag, []).append(i)
+        # Map each constraint to *every* tag it touches so that resampling
+        # strategies always find matching constraints, even when adaptive
+        # weights or multi-variable expressions make get_primary_tag fragile.
+        resample_exprs = getattr(self, "_resample_exprs", getattr(self, "_constraint_exprs", []))
+        for i, expr in enumerate(resample_exprs):
+            for tag in collect_tags(expr):
+                tag_to_constraint_indices.setdefault(tag, []).append(i)
 
         def _infer_total_samples(ctx: Dict[str, np.ndarray]) -> int:
             candidates = [v.shape[0] for k, v in ctx.items() if k != "__time__" and hasattr(v, "shape") and len(v.shape) >= 1]
