@@ -1,6 +1,6 @@
-
 import jax
-#jax.config.update("jax_enable_x64", False)
+
+# jax.config.update("jax_enable_x64", False)
 
 import jax.numpy as jnp
 import scipy.optimize as spo
@@ -8,6 +8,7 @@ import scipy.optimize as spo
 import jno
 
 import numpy as np
+
 """03 - Stationary Allen–Cahn equation (nonlinear FEM only)
 
 Problem
@@ -26,11 +27,19 @@ Analytical solution
 sqrt = jno.np.sqrt
 tanh = jno.np.tanh
 eps = 0.05
+
+
 # -----------------------------------------------------------------------------
 # Exact interface profile
 # -----------------------------------------------------------------------------
-def u_exact(x, y):  return tanh((x - 0.5) / (sqrt(2.0) * eps))
-def u_exact_num(x, y):  return jnp.tanh((x - 0.5) / (jnp.sqrt(2.0) * eps))
+def u_exact(x, y):
+    return tanh((x - 0.5) / (sqrt(2.0) * eps))
+
+
+def u_exact_num(x, y):
+    return jnp.tanh((x - 0.5) / (jnp.sqrt(2.0) * eps))
+
+
 u_left = float(u_exact_num(jnp.array([[0.0]]), jnp.array([[0.0]])).reshape(()))
 u_right = float(u_exact_num(jnp.array([[1.0]]), jnp.array([[0.0]])).reshape(()))
 
@@ -66,12 +75,17 @@ u0 = u_exact_num(x_nodes, y_nodes).reshape(-1)
 
 R0 = op.residual(u0)
 print("Initial FEM residual norm:", float(jnp.linalg.norm(R0)))
+
+
 def residual_np(u_np):
     return np.asarray(op.residual(jnp.asarray(u_np)))
+
+
 def jacobian_np(u_np):
     J = op.jacobian(jnp.asarray(u_np))
     return np.asarray(J.todense())
-  
+
+
 sol_root = spo.root(
     residual_np,
     np.asarray(u0),
@@ -93,4 +107,3 @@ max_abs = jnp.max(jnp.abs(u_exact_nodes - u_fem))
 print(f"FEM Relative L2 Error: {rel_l2:.6e}")
 print(f"FEM Max Abs Error:     {max_abs:.6e}")
 assert float(rel_l2) < 0.5, f"FEM relative L2 error too large: {float(rel_l2):.3e}"
-

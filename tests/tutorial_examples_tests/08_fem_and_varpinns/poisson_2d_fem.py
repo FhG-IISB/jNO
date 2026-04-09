@@ -1,5 +1,6 @@
 import jax
-#jax.config.update("jax_enable_x64", False)
+
+# jax.config.update("jax_enable_x64", False)
 
 import jax.numpy as jnp
 import lineax as lx
@@ -30,12 +31,22 @@ Why this example?
 - smooth non-oscillatory exact solution
 - homogeneous Dirichlet BCs on all boundaries
 """
+
+
 # -----------------------------------------------------------------------------
 # Manufactured solution
 # -----------------------------------------------------------------------------
-def exact_u(x, y): return x * (1.0 - x) * y * (1.0 - y)
-def exact_u_num(x, y): return x * (1.0 - x) * y * (1.0 - y)
-def source_f(x, y): return 2.0 * (x * (1.0 - x) + y * (1.0 - y))
+def exact_u(x, y):
+    return x * (1.0 - x) * y * (1.0 - y)
+
+
+def exact_u_num(x, y):
+    return x * (1.0 - x) * y * (1.0 - y)
+
+
+def source_f(x, y):
+    return 2.0 * (x * (1.0 - x) + y * (1.0 - y))
+
 
 # -----------------------------------------------------------------------------
 # FEM domain and weak form
@@ -91,4 +102,3 @@ print(f"FEM Relative L2 Error: {rel_l2:.6e}")
 print(f"FEM Mean Abs Error:    {mean_abs:.6e}")
 print(f"FEM Max Abs Error:     {max_abs:.6e}")
 assert float(rel_l2) < 0.5, f"FEM relative L2 error too large: {float(rel_l2):.3e}"
-

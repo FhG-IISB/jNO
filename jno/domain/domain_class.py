@@ -815,11 +815,7 @@ class domain(MeshIOMixin):
             raise ValueError("Mesh must be loaded before initializing FEM context.")
 
         if getattr(self, "_sub_domains", []):
-            raise ValueError(
-                "init_fem() is not supported on stacked domains (combined "
-                "via +). Call init_fem() on individual domains before "
-                "combining, or use a single domain for FEM/weak-form problems."
-            )
+            raise ValueError("init_fem() is not supported on stacked domains (combined " "via +). Call init_fem() on individual domains before " "combining, or use a single domain for FEM/weak-form problems.")
         self._variational_initialized = True
         self._variational_sampling_registry = {}
 
@@ -2403,9 +2399,7 @@ class domain(MeshIOMixin):
 
             # Build batch→domain map when sub-domains exist
             if sub_domains and domain_map_segments:
-                self._batch_domain_map = np.concatenate(
-                    [np.full(cnt, dom_idx, dtype=np.int32) for dom_idx, cnt in domain_map_segments]
-                )
+                self._batch_domain_map = np.concatenate([np.full(cnt, dom_idx, dtype=np.int32) for dom_idx, cnt in domain_map_segments])
 
             total = self.context[tag].shape[0]
             effective_n = self.context[tag].shape[2]

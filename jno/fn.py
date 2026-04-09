@@ -1083,7 +1083,7 @@ def continuity(
     if len(velocity_field) != len(variables):
         raise ValueError("velocity_field and variables must have the same length")
 
-    div_u = velocity_field[0].d(variables[0], scheme=scheme)
+    div_u: Placeholder = velocity_field[0].d(variables[0], scheme=scheme)
     for i in range(1, len(variables)):
         div_u = div_u + velocity_field[i].d(variables[i], scheme=scheme)
     return div_u - source

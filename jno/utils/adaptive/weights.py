@@ -24,7 +24,7 @@ Factories:
   rlw(...)                    ->  RLW instance
 """
 
-from typing import Callable, List, Union, Sequence
+from typing import Callable, List, Optional, Union, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -327,9 +327,9 @@ class LbPINNsLossBalancing:
         self.loss_floor = float(loss_floor)
 
         # Host-side mutable state
-        self.s = None
-        self.m = None  # Adam 1st moment
-        self.v = None  # Adam 2nd moment
+        self.s: Optional[np.ndarray] = None
+        self.m: Optional[np.ndarray] = None  # Adam 1st moment
+        self.v: Optional[np.ndarray] = None  # Adam 2nd moment
         self.t_adam = 0
         self.initialized = False
 
@@ -356,6 +356,8 @@ class LbPINNsLossBalancing:
 
         if not self.initialized:
             self._init_params(L)
+
+        assert self.s is not None and self.m is not None and self.v is not None
 
         # Gradient wrt s_j:
         #   d/ds_j [0.5 * exp(-s_j) * L_j + s_j]

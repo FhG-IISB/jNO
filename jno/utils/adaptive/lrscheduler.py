@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-LRFunction = Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]
+LRFunction = Callable[[Union[int, jnp.ndarray], jnp.ndarray], jnp.ndarray]
 
 
 # =============================================================================
@@ -61,7 +61,7 @@ class LearningRateSchedule:
         self.min_lr = float(min_lr)
         self.max_lr = float(max_lr)
 
-    def __call__(self, t: int, losses: jnp.ndarray) -> jnp.ndarray:
+    def __call__(self, t: Union[int, jnp.ndarray], losses: jnp.ndarray) -> jnp.ndarray:
         lr = self.fn(t, losses)
         lr = jnp.asarray(lr)
         lr = jnp.clip(lr, self.min_lr, self.max_lr)
@@ -149,12 +149,12 @@ class LearningRateSchedule:
         """
         lr0 = float(lr0)
         decay_rate = float(decay_rate)
-        decay_steps = float(decay_steps)
+        decay_steps_f = float(decay_steps)
         lr_end = float(lr_end)
 
         def fn(t, losses):
             t = jnp.asarray(t, dtype=jnp.float32)
-            p = t / decay_steps
+            p = t / decay_steps_f
             if staircase:
                 p = jnp.floor(p)
             lr = lr0 * (decay_rate**p)
@@ -249,7 +249,7 @@ class DLRS:
 
         # Host-side mutable state
         self.lr = np.float32(self.lr0)
-        self.loss_hist = []
+        self.loss_hist: list[float] = []
         self.initialized = False
 
     def _update_state_host(self, total_loss_np):

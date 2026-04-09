@@ -61,7 +61,6 @@ u.optimizer(
 
 crux.solve(
     epochs=EPOCHS,
-    constraint_weights=jno.schedule.constraint([1]),
     batchsize=BATCH,
     checkpoint_gradients=False,
     offload_data=False,

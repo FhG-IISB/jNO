@@ -73,4 +73,3 @@ rel_l2_u = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_
 rel_l2_v = float(jax.numpy.linalg.norm(_v - _v_exact) / (jax.numpy.linalg.norm(_v_exact) + 1e-8))
 assert rel_l2_u < 1.1, f"u relative L2 error too large: {rel_l2_u:.3e}"
 assert rel_l2_v < 1.1, f"v relative L2 error too large: {rel_l2_v:.3e}"
-

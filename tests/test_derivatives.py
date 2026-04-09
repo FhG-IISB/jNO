@@ -887,7 +887,8 @@ class TestFDOnStackedDomains:
         # Two different geometries
         dom = 3 * jno.domain.rect(mesh_size=0.1)
         dom += 2 * jno.domain.polygon(
-            [(0, 0), (1, 0), (0.5, 1)], mesh_size=0.1,
+            [(0, 0), (1, 0), (0.5, 1)],
+            mesh_size=0.1,
         )
         x, y, t = dom.variable("interior")
         request.cls.dom = dom
@@ -953,17 +954,13 @@ class TestFDOnStackedDomains:
     def test_fd_laplacian_stacked(self):
         """FD Laplacian of x² + y² should be ≈ 4 for all batches."""
         u = self.x * self.x + self.y * self.y
-        lap = self._compile_and_eval(
-            u.laplacian(self.x, self.y, scheme="finite_difference")
-        )
+        lap = self._compile_and_eval(u.laplacian(self.x, self.y, scheme="finite_difference"))
         assert lap.shape[0] == 5
 
         for b in range(5):
             mean_lap = float(jnp.mean(lap[b]))
             # FD Laplacian is approximate, especially near boundaries
-            assert abs(mean_lap - 4.0) < 2.0, (
-                f"Batch {b}: mean Laplacian = {mean_lap:.2f}, expected ≈ 4.0"
-            )
+            assert abs(mean_lap - 4.0) < 2.0, f"Batch {b}: mean Laplacian = {mean_lap:.2f}, expected ≈ 4.0"
 
 
 class TestFEMGuardOnStackedDomains:

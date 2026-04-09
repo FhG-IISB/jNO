@@ -41,7 +41,7 @@ def test_tutorial_script_smoke(script_path: Path):
     try:
         result = subprocess.run(
             cmd,
-            cwd=REPO_ROOT,
+            cwd=script_path.parent,
             env=env,
             capture_output=True,
             text=True,
