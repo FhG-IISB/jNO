@@ -892,10 +892,10 @@ class domain(MeshIOMixin):
                 gauss_order=quad_degree,
                 location_fns=location_fns,
             )
-        print("len(prob.boundary_inds_list) =", len(prob.boundary_inds_list))
-        print("len(prob.selected_face_shape_grads) =", len(prob.selected_face_shape_grads))
-        print("len(prob.nanson_scale) =", len(prob.nanson_scale))
-        print("len(prob.selected_face_shape_vals) =", len(prob.selected_face_shape_vals))
+        # print("len(prob.boundary_inds_list) =", len(prob.boundary_inds_list))
+        # print("len(prob.selected_face_shape_grads) =", len(prob.selected_face_shape_grads))
+        # print("len(prob.nanson_scale) =", len(prob.nanson_scale))
+        # print("len(prob.selected_face_shape_vals) =", len(prob.selected_face_shape_vals))
         self._fem_solver_enabled = bool(fem_solver)
 
         # Neutral FEM backend metadata used by the FEAX-backed fem_route.py
@@ -994,7 +994,7 @@ class domain(MeshIOMixin):
             else jnp.array([], dtype=jnp.int32)
         )
 
-        print("num extracted dirichlet nodes =", len(dirichlet_nodes))
+        #print("num extracted dirichlet nodes =", len(dirichlet_nodes))
         # ---------------------------------------------------------
         # Volume FEM context for VPINN / grouped weak-form assembly
         # Use FEAX Problem tensors directly so VPINN sees the same
@@ -1070,22 +1070,22 @@ class domain(MeshIOMixin):
         self._fem_dirichlet_value_fns = dirichlet_value_fns if dirichlet_value_fns is not None else {}
 
         # Debug prints
-        print("has prob.boundary_inds_list =", hasattr(prob, "boundary_inds_list"))
-        print("has fe.boundary_inds_list   =", hasattr(fe, "boundary_inds_list"))
-        print("prob boundary attrs =", [a for a in dir(prob) if "boundary" in a.lower()])
-        print("fe boundary attrs   =", [a for a in dir(fe) if "boundary" in a.lower()])
+        # print("has prob.boundary_inds_list =", hasattr(prob, "boundary_inds_list"))
+        # print("has fe.boundary_inds_list   =", hasattr(fe, "boundary_inds_list"))
+        # print("prob boundary attrs =", [a for a in dir(prob) if "boundary" in a.lower()])
+        # print("fe boundary attrs   =", [a for a in dir(fe) if "boundary" in a.lower()])
 
-        print("N_flat shape       =", self.fem_context["N_flat"].shape)
-        print("dN_dx_flat shape   =", self.fem_context["dN_dx_flat"].shape)
-        print("JxW shape          =", self.fem_context["JxW"].shape)
-        print("flat_cells shape   =", self.fem_context["flat_cells"].shape)
-        print("quad_points shape  =", self.fem_context["quad_points"].shape)
-        print("global_areas shape =", self.fem_context["global_areas"].shape)
-        print(
-            "global_areas min/max =",
-            float(jnp.min(self.fem_context["global_areas"])),
-            float(jnp.max(self.fem_context["global_areas"])),
-        )
+        # print("N_flat shape       =", self.fem_context["N_flat"].shape)
+        # print("dN_dx_flat shape   =", self.fem_context["dN_dx_flat"].shape)
+        # print("JxW shape          =", self.fem_context["JxW"].shape)
+        # print("flat_cells shape   =", self.fem_context["flat_cells"].shape)
+        # print("quad_points shape  =", self.fem_context["quad_points"].shape)
+        # print("global_areas shape =", self.fem_context["global_areas"].shape)
+        # print(
+        #     "global_areas min/max =",
+        #     float(jnp.min(self.fem_context["global_areas"])),
+        #     float(jnp.max(self.fem_context["global_areas"])),
+        # )
 
         # ---------------------------------------------------------
         # Boundary extraction for Neumann / surface weak forms
@@ -1165,9 +1165,9 @@ class domain(MeshIOMixin):
                 "quad_points": quad_pts_flat,
                 "quad_normals": quad_normals,
             }
-            print(f"surface_data[{tag}]['face_shape_vals'].shape =", self.fem_context["surface_data"][tag]["face_shape_vals"].shape)
-            print(f"surface_data[{tag}]['face_shape_grads'].shape =", self.fem_context["surface_data"][tag]["face_shape_grads"].shape)
-            print(f"surface_data[{tag}]['nanson_scale'].shape =", self.fem_context["surface_data"][tag]["nanson_scale"].shape)
+            # print(f"surface_data[{tag}]['face_shape_vals'].shape =", self.fem_context["surface_data"][tag]["face_shape_vals"].shape)
+            # print(f"surface_data[{tag}]['face_shape_grads'].shape =", self.fem_context["surface_data"][tag]["face_shape_grads"].shape)
+            # print(f"surface_data[{tag}]['nanson_scale'].shape =", self.fem_context["surface_data"][tag]["nanson_scale"].shape)
             self._mesh_pool[f"gauss_{tag}"] = quad_pts_flat
             self._register_variational_sample(
                 sample_tag=f"gauss_{tag}",

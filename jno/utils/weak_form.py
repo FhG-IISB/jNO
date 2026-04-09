@@ -208,6 +208,7 @@ def _canonicalize_grad_coeff(domain, coeff_expr, axis: int, value_shape: tuple):
     raise NotImplementedError(
         f"Canonical grad coeff inflation not implemented yet for value_shape={value_shape}"
     )
+
 def _value_shape_num_components(value_shape) -> int:
     if value_shape is None or len(value_shape) == 0:
         return 1
