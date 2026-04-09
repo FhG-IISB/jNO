@@ -27,6 +27,7 @@ LRFunction = Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]
 # LearningRateSchedule
 # =============================================================================
 
+
 class LearningRateSchedule:
     """
     Stateless learning rate schedule.
@@ -193,6 +194,7 @@ class LearningRateSchedule:
 # DLRS: Dynamic Learning Rate Scheduler
 # =============================================================================
 
+
 class DLRS:
     """
     Loss-based Dynamic Learning Rate Scheduler (DLRS).
@@ -263,7 +265,7 @@ class DLRS:
         # Update rolling window
         self.loss_hist.append(total_loss)
         if len(self.loss_hist) > self.window:
-            self.loss_hist = self.loss_hist[-self.window:]
+            self.loss_hist = self.loss_hist[-self.window :]
 
         # Compute normalized slope
         if len(self.loss_hist) >= 2:
@@ -275,9 +277,9 @@ class DLRS:
 
         lr_safe = float(np.clip(self.lr, self.min_lr, self.max_lr))
         k = float(np.floor(np.log10(max(lr_safe, self.min_lr))))
-        base = 10.0 ** k
+        base = 10.0**k
 
-        # Case selection 
+        # Case selection
         if slope > 1.0:
             case = +self.decremental_factor
         elif slope > 0.0:
@@ -301,7 +303,8 @@ class DLRS:
         lr = jax.pure_callback(
             self._update_state_host,
             result_shape,
-            total_loss
+            total_loss,
+            vmap_method="sequential",
         )
         # Safety clamp also on device
         lr = jnp.clip(lr, self.min_lr, self.max_lr)
@@ -317,6 +320,7 @@ class DLRS:
 # =============================================================================
 # Factory
 # =============================================================================
+
 
 def dlrs(
     lr0: float = 1e-3,
@@ -348,5 +352,3 @@ __all__ = [
     "DLRS",
     "dlrs",
 ]
-
-
