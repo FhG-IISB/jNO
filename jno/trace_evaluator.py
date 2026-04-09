@@ -1025,7 +1025,8 @@ class TraceEvaluator:
         shape_vals_flat = jnp.asarray(shape_vals_flat)
         flat_entity_nodes = jnp.asarray(flat_entity_nodes, dtype=jnp.int32).reshape(-1)
         weights = jnp.asarray(weights)
-
+        while weights.ndim > 2 and weights.shape[0] == 1:
+            weights = jnp.squeeze(weights, axis=0)
         while coeff.ndim > 2 and coeff.shape[0] == 1:
             coeff = jnp.squeeze(coeff, axis=0)
 
@@ -1474,11 +1475,19 @@ class TraceEvaluator:
             while face_shape_vals.ndim > 3 and face_shape_vals.shape[0] == 1:
                 face_shape_vals = jnp.squeeze(face_shape_vals, axis=0)
 
+            nanson_scale = jnp.asarray(surf_data["nanson_scale"])
+            while nanson_scale.ndim > 2 and nanson_scale.shape[0] == 1:
+                nanson_scale = jnp.squeeze(nanson_scale, axis=0)
+
+            flat_parent_nodes = jnp.asarray(surf_data["flat_parent_nodes"], dtype=jnp.int32)
+            while flat_parent_nodes.ndim > 1 and flat_parent_nodes.shape[0] == 1:
+                flat_parent_nodes = jnp.squeeze(flat_parent_nodes, axis=0)
+
             bnd_res = self._assemble_value_basis_integrand(
                 coeff_val,
                 face_shape_vals.reshape(-1, face_shape_vals.shape[-1]),
-                surf_data["nanson_scale"],
-                surf_data["flat_parent_nodes"].reshape(-1),
+                nanson_scale,
+                flat_parent_nodes.reshape(-1),
                 expr.num_total_nodes,
             )
 

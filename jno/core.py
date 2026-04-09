@@ -404,21 +404,23 @@ class core:
         self._populate_missing_context_tags(domain)
 
         context = {}
+        # List of tags that are MESH METADATA and should never be batched
+        metadata_tags = ["JxW", "flat_cells", "global_areas", "N_flat", "dN_dx_flat", "dirichlet_nodes","cells", "quad_points","boundary_nodes","surface_data","v_grads_JxW_flat","__time__"]
         if hasattr(domain, "context"):
             for tag, arr in domain.context.items():
                 # If it's a nested dictionary (like our VPINN surface_data), map safely
                 if isinstance(arr, dict):
                     # 1. Convert leaves to arrays
                     arr = jax.tree_util.tree_map(jnp.asarray, arr)
-                    # 2. Add the batch dimension [None, ...] to every array in the dict
-                    context[tag] = jax.tree_util.tree_map(lambda x: x[None, ...], arr)
+                    # 2. Add the batch dimension [None, ...] to every array in the dict, FEM/static metadata dicts must stay unbatched
+                    if tag in metadata_tags:
+                        context[tag] = arr
+                    else:
+                        context[tag] = jax.tree_util.tree_map(lambda x: x[None, ...], arr)
                     # 3. Skip the rest of the loop for dictionaries!
                     continue
                     # Standard behavior for everything else (preserves backward compatibility)
                 arr = jnp.asarray(arr)
-
-                # List of tags that are MESH METADATA and should never be batched
-                metadata_tags = ["JxW", "flat_cells", "global_areas", "N_flat", "dN_dx_flat", "dirichlet_nodes","cells", "quad_points","boundary_nodes","v_grads_JxW_flat","__time__"]
 
                 if tag in metadata_tags:
                     context[tag] = arr
@@ -427,10 +429,7 @@ class core:
                 else:
                     context[tag] = arr[None, ...]
 
-        return DomainData(
-            context=context,
-            dimension=domain.dimension,
-        )
+        return DomainData(context=context, dimension=domain.dimension,)
 
     # Training
     def _make_loss_fn(self, compiled_constraints_fn, n_constraints, batchsize, frozen, static, checkpoint_gradients=False, min_consecutive=1):
