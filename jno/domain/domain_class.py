@@ -112,6 +112,24 @@ class domain(MeshIOMixin):
         )
 
     @classmethod
+    def triangle(
+        cls,
+        vertices=((0, 0), (1, 0), (0, 1)),
+        mesh_size=0.1,
+        *,
+        algorithm: int = 6,
+        time: Optional[Tuple[float, float, int]] = None,
+        compute_mesh_connectivity: bool = True,
+    ) -> "domain":
+        """Instantiate a triangular domain from 3 vertices."""
+        return cls._from_geometry(
+            Geometries.triangle(vertices=vertices, mesh_size=mesh_size),
+            algorithm=algorithm,
+            time=time,
+            compute_mesh_connectivity=compute_mesh_connectivity,
+        )
+
+    @classmethod
     def equi_distant_rect(
         cls,
         x_range=(0, 1),
@@ -346,6 +364,8 @@ class domain(MeshIOMixin):
         self._mesh_pool_groups: Dict[str, List[Tuple[int, Any]]] = {}  # Per-tag sampling groups as (batch_count, points)
         self._normal_pool_groups: Dict[str, List[Tuple[int, np.ndarray]]] = {}  # Per-tag normal groups as (batch_count, normals)
         self._resampling_strategies: Dict[str, Any] = {}  # Tag -> ResamplingStrategy
+        self._sub_domains: List[Dict[str, Any]] = []  # metadata from merged sub-domains
+        self._batch_domain_map: Optional[np.ndarray] = None  # maps batch index → sub-domain index
 
         # Configuration
         self.dimension: int = 2
@@ -594,9 +614,30 @@ class domain(MeshIOMixin):
         self.total_samples = self._batch_count
         self.same_domain = False
 
+        # Track sub-domain metadata for FD / mesh-connectivity routing.
+        self._sub_domains.append({
+            "mesh_connectivity": other.mesh_connectivity,
+            "batch_count": max(1, other_batch),
+        })
+
+        # Build batch → domain index map: 0 = primary, 1 = first sub, …
+        primary_count = max(1, self_batch)
+        parts = [np.full(primary_count, 0, dtype=int)]
+        for i, sd in enumerate(self._sub_domains):
+            parts.append(np.full(sd["batch_count"], i + 1, dtype=int))
+        self._batch_domain_map = np.concatenate(parts)
+
         return self
 
     # FEM/ variational interface
+
+    @property
+    def _domain_mesh_connectivities(self) -> List:
+        """Return mesh connectivities for the primary and all sub-domains."""
+        mcs = [self.mesh_connectivity]
+        for sd in self._sub_domains:
+            mcs.append(sd["mesh_connectivity"])
+        return mcs
 
     def _estimate_boundary_tol(self, pts: np.ndarray) -> float:
         pts = np.asarray(pts)
@@ -868,6 +909,8 @@ class domain(MeshIOMixin):
         """
         if self.mesh is None:
             raise ValueError("Mesh must be loaded before initializing FEM context.")
+        if self._sub_domains:
+            raise ValueError("init_fem() is not supported on stacked domains (created via +).")
         self._variational_initialized = True
         self._variational_sampling_registry = {}
         import jax.numpy as jnp
