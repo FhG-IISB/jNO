@@ -19,8 +19,8 @@ dom += 100 * jno.domain.disk(mesh_size=0.025, center=(1, 0.5), radius=0.5)
 
 
 # Variables
-x, y, _ = dom.variable("interior", (100, None), resampling_strategy=jno.sampler.cr3())
-xb, yb, _ = dom.variable("boundary", (10, None))
+x, y, _ = dom.variable("interior")
+xb, yb, _ = dom.variable("boundary")
 k, a = dom.variable("k", train_k), dom.variable("a", train_a)
 
 xy = jno.np.concat([x, y], axis=-1)

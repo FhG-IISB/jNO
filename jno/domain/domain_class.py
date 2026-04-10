@@ -343,6 +343,8 @@ class domain(MeshIOMixin):
         self.mesh_connectivity: Optional[Dict[str, Any]] = None  # precomputed mesh connectivity data
         # Resampling support
         self._mesh_points: Dict[str, np.ndarray] = {}  # Full mesh points for resampling
+        self._mesh_pool_groups: Dict[str, List[Tuple[int, Any]]] = {}  # Per-tag sampling groups as (batch_count, points)
+        self._normal_pool_groups: Dict[str, List[Tuple[int, np.ndarray]]] = {}  # Per-tag normal groups as (batch_count, normals)
         self._resampling_strategies: Dict[str, Any] = {}  # Tag -> ResamplingStrategy
 
         # Configuration
@@ -475,9 +477,15 @@ class domain(MeshIOMixin):
         """
         if not isinstance(n, int) or n < 1:
             raise ValueError(f"Batch count must be positive integer, got {n}")
-        self._batch_count = n
-        self.total_samples = n
-        self.same_domain = True
+        current_batch = int(getattr(self, "_batch_count", getattr(self, "total_samples", 1)))
+        if self._mesh_pool_groups:
+            for tag, groups in self._mesh_pool_groups.items():
+                self._mesh_pool_groups[tag] = [(count * n, points) for count, points in groups]
+            for tag, groups in self._normal_pool_groups.items():
+                self._normal_pool_groups[tag] = [(count * n, normals) for count, normals in groups]
+        self._batch_count = max(1, current_batch) * n
+        self.total_samples = self._batch_count
+        self.same_domain = not any(len(groups) > 1 for groups in self._mesh_pool_groups.values())
         return self
 
     def __mul__(self, n: int) -> "domain":
@@ -499,6 +507,25 @@ class domain(MeshIOMixin):
 
         return max(1, declared, inferred)
 
+    def _sampling_groups_for_tag(self, tag: str) -> List[Tuple[int, Any, Optional[np.ndarray]]]:
+        """Return per-batch sampling sources for a tag as ``(count, points, normals)``."""
+        point_groups = self._mesh_pool_groups.get(tag)
+        normal_groups = self._normal_pool_groups.get(tag)
+
+        if point_groups:
+            groups: List[Tuple[int, Any, Optional[np.ndarray]]] = []
+            for idx, (count, points) in enumerate(point_groups):
+                normals = None
+                if normal_groups and idx < len(normal_groups):
+                    normals = normal_groups[idx][1]
+                groups.append((count, points, normals))
+            return groups
+
+        points = self._mesh_pool[tag]
+        normals = self.normals_by_tag.get(tag)
+        count = int(getattr(self, "_batch_count", getattr(self, "total_samples", 1))) if self.same_domain else 1
+        return [(max(1, count), points, normals)]
+
     def __add__(self, other: "domain") -> "domain":
         """Merge another domain into this one (stacks along batch dimension).
 
@@ -507,10 +534,37 @@ class domain(MeshIOMixin):
         same spatial mesh).  ``context`` entries are concatenated along the
         batch axis (axis 0).  ``"__time__"`` is shared and not stacked.
         """
+        self_groups = {
+            tag: [(count, points) for count, points, _ in self._sampling_groups_for_tag(tag)]
+            for tag in self._mesh_pool.keys()
+        }
+        other_groups = {
+            tag: [(count, points) for count, points, _ in other._sampling_groups_for_tag(tag)]
+            for tag in other._mesh_pool.keys()
+        }
+        self_normal_groups = {
+            tag: [(count, normals) for count, _, normals in self._sampling_groups_for_tag(tag) if normals is not None]
+            for tag in self._mesh_pool.keys()
+        }
+        other_normal_groups = {
+            tag: [(count, normals) for count, _, normals in other._sampling_groups_for_tag(tag) if normals is not None]
+            for tag in other._mesh_pool.keys()
+        }
+
         for tag, points in other._mesh_pool.items():
             if tag not in self._mesh_pool:
                 self._mesh_pool[tag] = points
             # else: keep self's mesh pool (same mesh)
+
+        for tag in set(self_groups) | set(other_groups):
+            merged_groups = list(self_groups.get(tag, [])) + list(other_groups.get(tag, []))
+            if merged_groups:
+                self._mesh_pool_groups[tag] = merged_groups
+
+        for tag in set(self_normal_groups) | set(other_normal_groups):
+            merged_groups = list(self_normal_groups.get(tag, [])) + list(other_normal_groups.get(tag, []))
+            if merged_groups:
+                self._normal_pool_groups[tag] = merged_groups
 
         for tag, data in other.context.items():
             if tag == "__time__":
@@ -1960,19 +2014,17 @@ class domain(MeshIOMixin):
                 available = list(self._mesh_pool.keys())
                 self.log.error(f"Tag '{tag}' not found. Available: {available}")
 
-            normals_avaiable = tag in self.normals_by_tag
+            sampling_groups = self._sampling_groups_for_tag(tag)
+            normals_avaiable = normals and any(group_normals is not None for _, _, group_normals in sampling_groups)
 
-            available_points = self._mesh_pool[tag]
-            if normals_avaiable and normals:
-                available_normals = self.normals_by_tag[tag]  # Pull the normals for this tag
-
-            # n_available is the number of *spatial* points
-            if is_time_dep:
-                # _mesh_pool[tag] has shape (T, N, D_spatial)
-                n_available = available_points.shape[1]
-            else:
-                # _mesh_pool[tag] has shape (N, D_spatial)
-                n_available = available_points.shape[0]
+            available_points = sampling_groups[0][1]
+            n_available_by_group = []
+            for _, group_points, _ in sampling_groups:
+                if is_time_dep:
+                    n_available_by_group.append(group_points.shape[1])
+                else:
+                    n_available_by_group.append(group_points.shape[0])
+            n_available = min(n_available_by_group)
 
             ii = 0
             og_tag = tag
@@ -1988,34 +2040,37 @@ class domain(MeshIOMixin):
                 n_samples = n_available
 
             if n_samples > n_available:
-                self.log.warning(f"Requested {n_samples} samples for '{tag}' but only {n_available} available. Using all points.")
+                self.log.warning(f"Requested {n_samples} samples for '{tag}' but only {n_available} available across all batches. Using all shared points.")
                 n_samples = n_available
 
             all_samples = []
             all_normals = []
 
             if not self.same_domain:
-                for _ in range(batch_count):
-                    if sampler is not None:
-                        if callable(sampler):
-                            idx = sampler(available_points, n_samples)
-                        elif isinstance(sampler, np.ndarray):
-                            idx = sampler
-                    else:
-                        if n_available != n_samples:
-                            idx = np.random.choice(n_available, size=n_samples, replace=False)
+                for group_count, group_points, group_normals in sampling_groups:
+                    group_n_available = group_points.shape[1] if is_time_dep else group_points.shape[0]
+                    group_n_samples = min(n_samples, group_n_available)
+                    for _ in range(group_count):
+                        if sampler is not None:
+                            if callable(sampler):
+                                idx = sampler(group_points, group_n_samples)
+                            elif isinstance(sampler, np.ndarray):
+                                idx = sampler
                         else:
-                            idx = np.arange(n_available)
+                            if group_n_available != group_n_samples:
+                                idx = np.random.choice(group_n_available, size=group_n_samples, replace=False)
+                            else:
+                                idx = np.arange(group_n_available)
 
-                    if is_time_dep:
-                        # Index spatial axis: (T, N, D) → (T, n_samples, D)
-                        all_samples.append(available_points[:, idx, :])
-                    else:
-                        # (N, D) → (n_samples, D)
-                        all_samples.append(available_points[idx])
+                        if is_time_dep:
+                            # Index spatial axis: (T, N, D) → (T, n_samples, D)
+                            all_samples.append(group_points[:, idx, :])
+                        else:
+                            # (N, D) → (n_samples, D)
+                            all_samples.append(group_points[idx])
 
-                    if normals_avaiable and normals:
-                        all_normals.append(available_normals[idx])
+                        if normals_avaiable and group_normals is not None:
+                            all_normals.append(group_normals[idx])
 
                 # Stack → (B, T, N, D) for time-dep, (B, N, D) for steady
                 stacked = np.stack(all_samples, axis=0)
@@ -2024,7 +2079,7 @@ class domain(MeshIOMixin):
                     stacked = stacked[:, np.newaxis, :, :]
                 self.context[tag] = stacked
 
-                if normals_avaiable and normals:
+                if normals_avaiable and all_normals:
                     nrm_stacked = np.stack(all_normals, axis=0)
                     if not is_time_dep:
                         nrm_stacked = nrm_stacked[:, np.newaxis, :, :]
@@ -2032,6 +2087,7 @@ class domain(MeshIOMixin):
 
             else:
                 # Sample once -> broadcast to all batches
+                _, available_points, available_normals = sampling_groups[0]
                 if sampler is not None:
                     idx = sampler(available_points, n_samples)
                 else:
@@ -2052,7 +2108,7 @@ class domain(MeshIOMixin):
                     (batch_count, *sampled_pts.shape),
                 )
 
-                if normals_avaiable and normals:
+                if normals_avaiable and available_normals is not None:
                     sampled_nrm = available_normals[idx]
                     if not is_time_dep:
                         sampled_nrm = sampled_nrm[np.newaxis, :, :]
