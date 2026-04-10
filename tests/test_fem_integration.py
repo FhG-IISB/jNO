@@ -1,6 +1,9 @@
 """Minimal tests for the JAX-FEM / weak-form integration."""
 
 import pytest
+
+pytest.importorskip("petsc4py", reason="petsc4py required for FEM solver tests")
+
 import jax
 import jax.numpy as jnp
 import numpy as np

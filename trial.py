@@ -19,8 +19,8 @@ dom += 100 * jno.domain.disk(mesh_size=0.025, center=(1, 0.5), radius=0.5)
 
 
 # Variables
-x, y, _ = dom.variable("interior", (100, None), resampling_strategy=jno.sampler.cr3())
-xb, yb, _ = dom.variable("boundary", (10, None))
+x, y, _ = dom.variable("interior")
+xb, yb, _ = dom.variable("boundary")
 k, a = dom.variable("k", train_k), dom.variable("a", train_a)
 
 xy = jno.np.concat([x, y], axis=-1)
@@ -29,7 +29,7 @@ ka = jno.np.concat([k, a], axis=-1)
 
 
 # Neural Network
-net = jno.nn.deeponet(n_sensors=2, coord_dim=2, basis_functions=32, hidden_dim=128, activation=jax.numpy.tanh)
+net = jno.nn.deeponet(n_sensors=2, coord_dim=2, basis_functions=8, hidden_dim=16, activation=jax.numpy.tanh)
 net.optimizer(optax.adam(learning_rate=optax.schedules.cosine_decay_schedule(init_value=1e-3, decay_steps=20_000, alpha=1e-5)))
 
 

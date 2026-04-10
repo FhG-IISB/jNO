@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple, Optional, Callable, Any, Union, overload, cast
+from typing import Dict, List, Tuple, Optional, Callable, Any, Union
 
+import cloudpickle
 import jax
 import jax.numpy as jnp
 import meshio
@@ -10,6 +11,7 @@ import numpy as np
 from ..trace import Variable, TensorTag, Literal, BinaryOp, FunctionCall, Jacobian, TestFunction, TrialFunction, Constant, FemLinearSystem, Assembly
 from ..utils.logger import get_logger
 from .boundary_region import BoundaryRegion
+from .domain_data import DomainData
 from .geometries import Geometries
 from .meshio_mixin import MeshIOMixin
 
@@ -92,6 +94,42 @@ class domain(MeshIOMixin):
         )
 
     @classmethod
+    def polygon(
+        cls,
+        vertices,
+        mesh_size=0.1,
+        *,
+        algorithm: int = 6,
+        time: Optional[Tuple[float, float, int]] = None,
+        compute_mesh_connectivity: bool = True,
+    ) -> "domain":
+        """Instantiate a 2D polygon domain from an arbitrary list of vertices."""
+        return cls._from_geometry(
+            Geometries.polygon(vertices=vertices, mesh_size=mesh_size),
+            algorithm=algorithm,
+            time=time,
+            compute_mesh_connectivity=compute_mesh_connectivity,
+        )
+
+    @classmethod
+    def triangle(
+        cls,
+        vertices=((0, 0), (1, 0), (0, 1)),
+        mesh_size=0.1,
+        *,
+        algorithm: int = 6,
+        time: Optional[Tuple[float, float, int]] = None,
+        compute_mesh_connectivity: bool = True,
+    ) -> "domain":
+        """Instantiate a triangular domain from 3 vertices."""
+        return cls._from_geometry(
+            Geometries.triangle(vertices=vertices, mesh_size=mesh_size),
+            algorithm=algorithm,
+            time=time,
+            compute_mesh_connectivity=compute_mesh_connectivity,
+        )
+
+    @classmethod
     def equi_distant_rect(
         cls,
         x_range=(0, 1),
@@ -164,47 +202,6 @@ class domain(MeshIOMixin):
         """Instantiate a polygonal disk domain."""
         return cls._from_geometry(
             Geometries.disk(center=center, radius=radius, mesh_size=mesh_size, num_points=num_points),
-            algorithm=algorithm,
-            time=time,
-            compute_mesh_connectivity=compute_mesh_connectivity,
-        )
-
-    @classmethod
-    def triangle(
-        cls,
-        vertices=((0, 0), (1, 0), (0, 1)),
-        mesh_size=0.1,
-        *,
-        algorithm: int = 6,
-        time: Optional[Tuple[float, float, int]] = None,
-        compute_mesh_connectivity: bool = True,
-    ) -> "domain":
-        """Instantiate a triangular domain from three vertices."""
-        return cls._from_geometry(
-            Geometries.triangle(vertices=vertices, mesh_size=mesh_size),
-            algorithm=algorithm,
-            time=time,
-            compute_mesh_connectivity=compute_mesh_connectivity,
-        )
-
-    @classmethod
-    def polygon(
-        cls,
-        vertices,
-        mesh_size=0.1,
-        *,
-        algorithm: int = 6,
-        time: Optional[Tuple[float, float, int]] = None,
-        compute_mesh_connectivity: bool = True,
-    ) -> "domain":
-        """Instantiate a 2D polygon domain from a list of vertices.
-
-        Vertices are auto-oriented to CCW.  Boundary segments are labeled
-        ``"one"``, ``"two"``, … starting from the topmost vertex going
-        clockwise.
-        """
-        return cls._from_geometry(
-            Geometries.polygon(vertices=vertices, mesh_size=mesh_size),
             algorithm=algorithm,
             time=time,
             compute_mesh_connectivity=compute_mesh_connectivity,
@@ -328,9 +325,9 @@ class domain(MeshIOMixin):
             if algorithm is None:
                 algorithm = getattr(existing_domain, "_algorithm", 6)
             if time is None:
-                time = cast(Optional[Tuple[float, float, int]], getattr(existing_domain, "time", None))
+                time = existing_domain.time
             if compute_mesh_connectivity is None:
-                compute_mesh_connectivity = cast(bool, getattr(existing_domain, "compute_mesh_connectivity", True))
+                compute_mesh_connectivity = existing_domain.compute_mesh_connectivity
             constructor = getattr(existing_domain, "_constructor_source", None)
 
         if algorithm is None:
@@ -364,7 +361,11 @@ class domain(MeshIOMixin):
         self.mesh_connectivity: Optional[Dict[str, Any]] = None  # precomputed mesh connectivity data
         # Resampling support
         self._mesh_points: Dict[str, np.ndarray] = {}  # Full mesh points for resampling
+        self._mesh_pool_groups: Dict[str, List[Tuple[int, Any]]] = {}  # Per-tag sampling groups as (batch_count, points)
+        self._normal_pool_groups: Dict[str, List[Tuple[int, np.ndarray]]] = {}  # Per-tag normal groups as (batch_count, normals)
         self._resampling_strategies: Dict[str, Any] = {}  # Tag -> ResamplingStrategy
+        self._sub_domains: List[Dict[str, Any]] = []  # metadata from merged sub-domains
+        self._batch_domain_map: Optional[np.ndarray] = None  # maps batch index → sub-domain index
 
         # Configuration
         self.dimension: int = 2
@@ -379,7 +380,6 @@ class domain(MeshIOMixin):
         self.normal_tags: List[str] = []
         self.reference_solutions: List[Callable] = []
         self.sample_dict: List = []
-        self._sub_domains: List[Dict[str, Any]] = []  # for multi-geometry addition
 
         # Meshio mesh
         self.mesh = None
@@ -497,46 +497,98 @@ class domain(MeshIOMixin):
         """
         if not isinstance(n, int) or n < 1:
             raise ValueError(f"Batch count must be positive integer, got {n}")
-        self._batch_count = n
-        self.total_samples = n
-        self.same_domain = True
+        current_batch = int(getattr(self, "_batch_count", getattr(self, "total_samples", 1)))
+        if self._mesh_pool_groups:
+            for tag, groups in self._mesh_pool_groups.items():
+                self._mesh_pool_groups[tag] = [(count * n, points) for count, points in groups]
+            for tag, groups in self._normal_pool_groups.items():
+                self._normal_pool_groups[tag] = [(count * n, normals) for count, normals in groups]
+        self._batch_count = max(1, current_batch) * n
+        self.total_samples = self._batch_count
+        self.same_domain = not any(len(groups) > 1 for groups in self._mesh_pool_groups.values())
         return self
 
     def __mul__(self, n: int) -> "domain":
         """Batch the domain n times: domain * 2 samples 2x independently."""
         return self.__rmul__(n)
 
+    def _effective_batch_count(self) -> int:
+        """Infer the current batch size from metadata and existing batched context."""
+        declared = int(getattr(self, "_batch_count", getattr(self, "total_samples", 1)))
+        inferred = 1
+
+        # Infer from already-batched context entries (skip shared time axis).
+        for tag, data in self.context.items():
+            if tag == "__time__" or not hasattr(data, "shape"):
+                continue
+            shape = data.shape
+            if len(shape) >= 1:
+                inferred = max(inferred, int(shape[0]))
+
+        return max(1, declared, inferred)
+
+    def _sampling_groups_for_tag(self, tag: str) -> List[Tuple[int, Any, Optional[np.ndarray]]]:
+        """Return per-batch sampling sources for a tag as ``(count, points, normals)``."""
+        point_groups = self._mesh_pool_groups.get(tag)
+        normal_groups = self._normal_pool_groups.get(tag)
+
+        if point_groups:
+            groups: List[Tuple[int, Any, Optional[np.ndarray]]] = []
+            for idx, (count, points) in enumerate(point_groups):
+                normals = None
+                if normal_groups and idx < len(normal_groups):
+                    normals = normal_groups[idx][1]
+                groups.append((count, points, normals))
+            return groups
+
+        points = self._mesh_pool[tag]
+        normals = self.normals_by_tag.get(tag)
+        count = int(getattr(self, "_batch_count", getattr(self, "total_samples", 1))) if self.same_domain else 1
+        return [(max(1, count), points, normals)]
+
     def __add__(self, other: "domain") -> "domain":
         """Merge another domain into this one (stacks along batch dimension).
-
-        Each added domain is stored as a sub-domain so that ``sample()`` can
-        draw from the correct mesh pool for each geometry's batch count.
 
         For time-dependent problems, ``_mesh_pool`` entries have shape
         ``(T, N, D_spatial)`` and do **not** get stacked (they represent the
         same spatial mesh).  ``context`` entries are concatenated along the
         batch axis (axis 0).  ``"__time__"`` is shared and not stacked.
         """
-        # Store the other domain's mesh and batch info for deferred sampling
-        self._sub_domains.append(
-            {
-                "mesh_pool": dict(other._mesh_pool),
-                "batch_count": getattr(other, "_batch_count", 1),
-                "same_domain": getattr(other, "same_domain", False),
-                "normals_by_tag": dict(other.normals_by_tag),
-                "mesh_connectivity": other.mesh_connectivity,
-            }
-        )
-        self.total_samples = getattr(self, "_batch_count", 1) + sum(sd["batch_count"] for sd in self._sub_domains)
+        self_groups = {
+            tag: [(count, points) for count, points, _ in self._sampling_groups_for_tag(tag)]
+            for tag in self._mesh_pool.keys()
+        }
+        other_groups = {
+            tag: [(count, points) for count, points, _ in other._sampling_groups_for_tag(tag)]
+            for tag in other._mesh_pool.keys()
+        }
+        self_normal_groups = {
+            tag: [(count, normals) for count, _, normals in self._sampling_groups_for_tag(tag) if normals is not None]
+            for tag in self._mesh_pool.keys()
+        }
+        other_normal_groups = {
+            tag: [(count, normals) for count, _, normals in other._sampling_groups_for_tag(tag) if normals is not None]
+            for tag in other._mesh_pool.keys()
+        }
 
-        # Merge any new mesh tags that don't exist in self (for tag discovery)
         for tag, points in other._mesh_pool.items():
             if tag not in self._mesh_pool:
                 self._mesh_pool[tag] = points
+            # else: keep self's mesh pool (same mesh)
 
-        # Concatenate any already-sampled context data (parameters, etc.)
+        for tag in set(self_groups) | set(other_groups):
+            merged_groups = list(self_groups.get(tag, [])) + list(other_groups.get(tag, []))
+            if merged_groups:
+                self._mesh_pool_groups[tag] = merged_groups
+
+        for tag in set(self_normal_groups) | set(other_normal_groups):
+            merged_groups = list(self_normal_groups.get(tag, [])) + list(other_normal_groups.get(tag, []))
+            if merged_groups:
+                self._normal_pool_groups[tag] = merged_groups
+
         for tag, data in other.context.items():
             if tag == "__time__":
+                # Time array is shared, not batched
                 self.context[tag] = data
                 continue
             if tag in self.context:
@@ -555,17 +607,37 @@ class domain(MeshIOMixin):
         for name, values in self._parameter_list.items():
             self.parameters[name] = np.array(values, dtype=np.float32)
 
+        # Keep batch metadata consistent after domain stacking.
+        self_batch = int(getattr(self, "_batch_count", getattr(self, "total_samples", 1)))
+        other_batch = int(getattr(other, "_batch_count", getattr(other, "total_samples", 1)))
+        self._batch_count = max(1, self_batch) + max(1, other_batch)
+        self.total_samples = self._batch_count
+        self.same_domain = False
+
+        # Track sub-domain metadata for FD / mesh-connectivity routing.
+        self._sub_domains.append({
+            "mesh_connectivity": other.mesh_connectivity,
+            "batch_count": max(1, other_batch),
+        })
+
+        # Build batch → domain index map: 0 = primary, 1 = first sub, …
+        primary_count = max(1, self_batch)
+        parts = [np.full(primary_count, 0, dtype=int)]
+        for i, sd in enumerate(self._sub_domains):
+            parts.append(np.full(sd["batch_count"], i + 1, dtype=int))
+        self._batch_domain_map = np.concatenate(parts)
+
         return self
 
-    @property
-    def _domain_mesh_connectivities(self) -> list:
-        """Return mesh connectivity for primary + each sub-domain."""
-        result = [self.mesh_connectivity]
-        for sd in getattr(self, "_sub_domains", []):
-            result.append(sd.get("mesh_connectivity"))
-        return result
-
     # FEM/ variational interface
+
+    @property
+    def _domain_mesh_connectivities(self) -> List:
+        """Return mesh connectivities for the primary and all sub-domains."""
+        mcs = [self.mesh_connectivity]
+        for sd in self._sub_domains:
+            mcs.append(sd["mesh_connectivity"])
+        return mcs
 
     def _estimate_boundary_tol(self, pts: np.ndarray) -> float:
         pts = np.asarray(pts)
@@ -837,8 +909,8 @@ class domain(MeshIOMixin):
         """
         if self.mesh is None:
             raise ValueError("Mesh must be loaded before initializing FEM context.")
-        if getattr(self, "_sub_domains", []):
-            raise ValueError("init_fem() is not supported on stacked domains (combined " "via +). Call init_fem() on individual domains before " "combining, or use a single domain for FEM/weak-form problems.")
+        if self._sub_domains:
+            raise ValueError("init_fem() is not supported on stacked domains (created via +).")
         self._variational_initialized = True
         self._variational_sampling_registry = {}
         import jax.numpy as jnp
@@ -1336,47 +1408,19 @@ class domain(MeshIOMixin):
             tensor = tensor.reshape(1, 1)
 
         # Validate batch dimension - must match exactly
-        batch_count = getattr(self, "total_samples", getattr(self, "_batch_count", 1))
+        batch_count = self._effective_batch_count()
         tensor_batch = tensor.shape[0]
         if tensor_batch != batch_count:
-            self.log.warning(f"Tensor '{name}' has batch dimension {tensor_batch}, but domain has " f"batch count {batch_count}. Was this intended?")
+            self.log.warning(f"Tensor '{name}' has batch dimension {tensor_batch}, but domain has " f"effective batch count {batch_count}. Was this intended?")
 
         self.context[name] = tensor
         self._param_tags.add(name)
         return self
 
-    @overload
     def variable(
         self,
         tag: str,
-        sample: Union[jnp.ndarray, np.ndarray],
-        resampling_strategy: Any = ...,
-        normals: bool = ...,
-        reverse_normals: bool = ...,
-        view_factor: bool = ...,
-        point_data: bool = ...,
-        split: bool = ...,
-        return_indices: Any = ...,
-    ) -> TensorTag: ...
-
-    @overload
-    def variable(
-        self,
-        tag: str,
-        sample: Tuple[Optional[int], Optional[Callable]] = ...,
-        resampling_strategy: Any = ...,
-        normals: bool = ...,
-        reverse_normals: bool = ...,
-        view_factor: bool = ...,
-        point_data: bool = ...,
-        split: bool = ...,
-        return_indices: Any = ...,
-    ) -> Tuple[Variable, ...]: ...
-
-    def variable(
-        self,
-        tag: str,
-        sample=(None, None),
+        sample: Tuple[Optional[int], Optional[Callable]] = (None, None),
         resampling_strategy=None,
         normals: bool = False,
         reverse_normals: bool = False,
@@ -1384,7 +1428,6 @@ class domain(MeshIOMixin):
         point_data: bool = False,
         split: bool = False,
         return_indices=False,
-        time_value: float | None = None,
     ) -> Any:
         """Create Variable placeholders for a tagged point set or tensor.
 
@@ -1414,25 +1457,12 @@ class domain(MeshIOMixin):
                     self.context[tag] = sample
                 else:
                     self.add_tensor_tag(tag, sample)
-        # auto-default for the initial slice in time-dependent problems
-        if time_value is None and tag == "initial" and self._is_time_dependent and self.time is not None:
-            time_value = self.time[0]
 
         if tag in self._mesh_pool.keys() and isinstance(sample, tuple) and len(sample) > 0 and isinstance(sample[0], (int, type(None))):
             # Sample points for this tag on demand
-            source_tag = tag
+            # Save sample dict for inference
+            self.sample_dict.append([tag, (None, None), resampling_strategy, normals, view_factor])
             points, idx, tag = self.sample({tag: sample}, normals, return_indices)
-            self.sample_dict.append(
-                {
-                    "source_tag": source_tag,
-                    "resolved_tag": tag,
-                    "sample": sample,
-                    "resampling_strategy": resampling_strategy,
-                    "normals": normals,
-                    "reverse_normals": reverse_normals,
-                    "view_factor": view_factor,
-                }
-            )
 
         # Store resampling strategy if provided
         if resampling_strategy is not None:
@@ -1462,48 +1492,16 @@ class domain(MeshIOMixin):
         # Create Variable placeholder for each spatial dimension
         coord_vars: List[Any] = [Variable(tag=tag, dim=[i, i + 1], domain=self, axis="spatial", fem_meta=fem_meta) for i in range(self.dimension)]
 
-        # Time variable
-        if self._is_time_dependent:
-            if time_value is None:
-                # default behavior: shared global time variable
-                coord_vars.append(
-                    Variable(
-                        tag="__time__",
-                        dim=[0, 1],
-                        domain=self,
-                        axis="temporal",
-                        fem_meta=None,
-                    )
-                )
-            else:
-                # local fixed-time variable with the same shape as this sampled tag
-                local_time_tag = f"__time_{tag}__"
-
-                if local_time_tag not in self.context:
-                    pts = np.asarray(self.context[tag])
-                    time_dtype = np.asarray(self.context["__time__"]).dtype if "__time__" in self.context else pts.dtype
-                    self.context[local_time_tag] = np.full(pts[..., :1].shape, time_value, dtype=time_dtype)
-
-                coord_vars.append(
-                    Variable(
-                        tag=local_time_tag,
-                        dim=[0, 1],
-                        domain=self,
-                        axis="temporal",
-                        fem_meta=None,
-                    )
-                )
-        else:
-            # stationary problems still expose a time-like variable via __time__
-            coord_vars.append(
-                Variable(
-                    tag="__time__",
-                    dim=[0, 1],
-                    domain=self,
-                    axis="temporal",
-                    fem_meta=None,
-                )
+        # Always add temporal variable (constant 1 for stationary problems)
+        coord_vars.append(
+            Variable(
+                tag="__time__",
+                dim=[0, 1],
+                domain=self,
+                axis="temporal",
+                fem_meta=None,
             )
+        )
 
         if normals:
             if reverse_normals:
@@ -2028,105 +2026,6 @@ class domain(MeshIOMixin):
 
         return tuple(result)
 
-    def _sample_one_source(
-        self,
-        tag: str,
-        n_samples: int,
-        sampler,
-        batch_count: int,
-        same_domain: bool,
-        mesh_pool: Dict[str, Any],
-        normals_by_tag: Dict[str, np.ndarray],
-        normals: bool,
-    ):
-        """Sample *n_samples* points from a single mesh source.
-
-        Returns ``(samples, normals_or_None)`` where shapes are
-        ``(batch_count, 1, n_samples, D)`` for steady-state.
-        """
-        is_time_dep = self._is_time_dependent
-
-        if tag not in mesh_pool:
-            return None, None
-
-        available_points = mesh_pool[tag]
-        normals_available = tag in normals_by_tag
-        if normals_available and normals:
-            available_normals = normals_by_tag[tag]
-
-        n_available = available_points.shape[1] if is_time_dep else available_points.shape[0]
-
-        effective_n = n_samples
-        if effective_n is None:
-            effective_n = n_available
-        if effective_n > n_available:
-            self.log.warning(f"Requested {effective_n} samples for '{tag}' but only " f"{n_available} available in sub-domain. Using all points.")
-            effective_n = n_available
-
-        all_samples = []
-        all_normals = []
-
-        if not same_domain:
-            for _ in range(batch_count):
-                if sampler is not None:
-                    if callable(sampler):
-                        idx = sampler(available_points, effective_n)
-                    elif isinstance(sampler, np.ndarray):
-                        idx = sampler
-                else:
-                    if n_available != effective_n:
-                        idx = np.random.choice(n_available, size=effective_n, replace=False)
-                    else:
-                        idx = np.arange(n_available)
-
-                if is_time_dep:
-                    all_samples.append(available_points[:, idx, :])
-                else:
-                    all_samples.append(available_points[idx])
-
-                if normals_available and normals:
-                    all_normals.append(available_normals[idx])
-
-            stacked = np.stack(all_samples, axis=0)
-            if not is_time_dep:
-                stacked = stacked[:, np.newaxis, :, :]
-            nrm_stacked = None
-            if normals_available and normals:
-                nrm_stacked = np.stack(all_normals, axis=0)
-                if not is_time_dep:
-                    nrm_stacked = nrm_stacked[:, np.newaxis, :, :]
-            return stacked, nrm_stacked
-        else:
-            if sampler is not None:
-                idx = sampler(available_points, effective_n)
-            else:
-                if n_available != effective_n:
-                    idx = np.random.choice(n_available, size=effective_n, replace=False)
-                else:
-                    idx = np.arange(n_available)
-
-            if is_time_dep:
-                sampled_pts = available_points[:, idx, :]
-            else:
-                sampled_pts = available_points[idx][np.newaxis, :, :]
-
-            result = np.broadcast_to(
-                sampled_pts[np.newaxis, ...],
-                (batch_count, *sampled_pts.shape),
-            ).copy()
-
-            nrm_result = None
-            if normals_available and normals:
-                sampled_nrm = available_normals[idx]
-                if not is_time_dep:
-                    sampled_nrm = sampled_nrm[np.newaxis, :, :]
-                nrm_result = np.broadcast_to(
-                    sampled_nrm[np.newaxis, ...],
-                    (batch_count, *sampled_nrm.shape),
-                ).copy()
-
-            return result, nrm_result
-
     def sample(self, sample_spec: Dict[str, Tuple[int, Optional[Callable]]], normals: bool = False, return_indices: bool = False):
         """
         Sample points from the domain.
@@ -2141,10 +2040,6 @@ class domain(MeshIOMixin):
         If domain was batched (e.g., 10 * domain), samples n_samples for each
         batch independently and concatenates results.
 
-        When multiple domains have been combined via ``+``, each sub-domain is
-        sampled from its own mesh pool for its own batch count, and the results
-        are concatenated along the batch axis.
-
         Shapes stored in ``self.context``:
 
         * **Always**: ``(B, T, N, D_spatial)`` for spatial tags.
@@ -2153,13 +2048,26 @@ class domain(MeshIOMixin):
           (shared across batches).
         """
 
-        batch_count = getattr(self, "_batch_count", 1)
-        sub_domains = getattr(self, "_sub_domains", [])
+        batch_count = self._effective_batch_count()
+        is_time_dep = self._is_time_dependent
 
         for tag, (n_samples, sampler) in sample_spec.items():
+            # Handle special "initial" tag for time-dependent problems
             if tag not in self._mesh_pool:
                 available = list(self._mesh_pool.keys())
                 self.log.error(f"Tag '{tag}' not found. Available: {available}")
+
+            sampling_groups = self._sampling_groups_for_tag(tag)
+            normals_avaiable = normals and any(group_normals is not None for _, _, group_normals in sampling_groups)
+
+            available_points = sampling_groups[0][1]
+            n_available_by_group = []
+            for _, group_points, _ in sampling_groups:
+                if is_time_dep:
+                    n_available_by_group.append(group_points.shape[1])
+                else:
+                    n_available_by_group.append(group_points.shape[0])
+            n_available = min(n_available_by_group)
 
             ii = 0
             og_tag = tag
@@ -2169,85 +2077,97 @@ class domain(MeshIOMixin):
 
             # Store full mesh points for resampling
             if tag not in self._mesh_points:
-                self._mesh_points[tag] = self._mesh_pool.get(og_tag, self._mesh_pool.get(tag, np.array([]))).copy()
+                self._mesh_points[tag] = available_points.copy()
 
-            # When n_samples is None and sub-domains exist, resolve to the
-            # minimum available point count across all sources so that the
-            # spatial dimension N is consistent for concatenation.
-            if n_samples is None and sub_domains:
-                is_time_dep = self._is_time_dependent
-                counts = []
-                if og_tag in self._mesh_pool:
-                    pts = self._mesh_pool[og_tag]
-                    counts.append(pts.shape[1] if is_time_dep else pts.shape[0])
-                for sd in sub_domains:
-                    if og_tag in sd["mesh_pool"]:
-                        pts = sd["mesh_pool"][og_tag]
-                        counts.append(pts.shape[1] if is_time_dep else pts.shape[0])
-                if counts:
-                    n_samples = int(min(counts))
+            if n_samples is None:
+                n_samples = n_available
 
-            # -- Collect samples from self (primary domain) --
-            chunks = []
-            nrm_chunks = []
-            domain_map_segments = []  # (domain_index, batch_count) per chunk
+            if n_samples > n_available:
+                self.log.warning(f"Requested {n_samples} samples for '{tag}' but only {n_available} available across all batches. Using all shared points.")
+                n_samples = n_available
 
-            primary_pts, primary_nrm = self._sample_one_source(
-                og_tag,
-                n_samples,
-                sampler,
-                batch_count,
-                self.same_domain,
-                self._mesh_pool,
-                self.normals_by_tag,
-                normals,
-            )
-            if primary_pts is not None:
-                chunks.append(primary_pts)
-                domain_map_segments.append((0, primary_pts.shape[0]))
-                if primary_nrm is not None:
-                    nrm_chunks.append(primary_nrm)
+            all_samples = []
+            all_normals = []
 
-            # -- Collect samples from each sub-domain --
-            for sd_idx, sd in enumerate(sub_domains):
-                sd_pts, sd_nrm = self._sample_one_source(
-                    og_tag,
-                    n_samples,
-                    sampler,
-                    sd["batch_count"],
-                    sd["same_domain"],
-                    sd["mesh_pool"],
-                    sd["normals_by_tag"],
-                    normals,
-                )
-                if sd_pts is not None:
-                    chunks.append(sd_pts)
-                    domain_map_segments.append((sd_idx + 1, sd_pts.shape[0]))
-                    if sd_nrm is not None:
-                        nrm_chunks.append(sd_nrm)
+            if not self.same_domain:
+                for group_count, group_points, group_normals in sampling_groups:
+                    group_n_available = group_points.shape[1] if is_time_dep else group_points.shape[0]
+                    group_n_samples = min(n_samples, group_n_available)
+                    for _ in range(group_count):
+                        if sampler is not None:
+                            if callable(sampler):
+                                idx = sampler(group_points, group_n_samples)
+                            elif isinstance(sampler, np.ndarray):
+                                idx = sampler
+                        else:
+                            if group_n_available != group_n_samples:
+                                idx = np.random.choice(group_n_available, size=group_n_samples, replace=False)
+                            else:
+                                idx = np.arange(group_n_available)
 
-            if not chunks:
-                self.log.error(f"No mesh points found for tag '{og_tag}' in any domain.")
-                continue
+                        if is_time_dep:
+                            # Index spatial axis: (T, N, D) → (T, n_samples, D)
+                            all_samples.append(group_points[:, idx, :])
+                        else:
+                            # (N, D) → (n_samples, D)
+                            all_samples.append(group_points[idx])
 
-            self.context[tag] = np.concatenate(chunks, axis=0)
-            if nrm_chunks:
-                self.context[f"n_{tag}"] = np.concatenate(nrm_chunks, axis=0)
+                        if normals_avaiable and group_normals is not None:
+                            all_normals.append(group_normals[idx])
 
-            # Build batch→domain map when sub-domains exist
-            if sub_domains and domain_map_segments:
-                self._batch_domain_map = np.concatenate([np.full(cnt, dom_idx, dtype=np.int32) for dom_idx, cnt in domain_map_segments])
+                # Stack → (B, T, N, D) for time-dep, (B, N, D) for steady
+                stacked = np.stack(all_samples, axis=0)
+                if not is_time_dep:
+                    # (B, N, D) → (B, 1, N, D)  — T=1 for steady-state
+                    stacked = stacked[:, np.newaxis, :, :]
+                self.context[tag] = stacked
 
-            total = self.context[tag].shape[0]
-            effective_n = self.context[tag].shape[2]
-            if self._verbose:
-                if total > 1:
-                    self.log.info(f"Sampled {effective_n} x {total} = {total * effective_n} points for '{tag}' with shape {self.context[tag].shape}")
+                if normals_avaiable and all_normals:
+                    nrm_stacked = np.stack(all_normals, axis=0)
+                    if not is_time_dep:
+                        nrm_stacked = nrm_stacked[:, np.newaxis, :, :]
+                    self.context[f"n_{tag}"] = nrm_stacked
+
+            else:
+                # Sample once -> broadcast to all batches
+                _, available_points, available_normals = sampling_groups[0]
+                if sampler is not None:
+                    idx = sampler(available_points, n_samples)
                 else:
-                    self.log.info(f"Sampled {effective_n} points for '{tag}'")
+                    if n_available != n_samples:
+                        idx = np.random.choice(n_available, size=n_samples, replace=False)
+                    else:
+                        idx = np.arange(n_available)
+
+                if is_time_dep:
+                    # (T, N, D) → (T, n_samples, D) → broadcast to (B, T, n_samples, D)
+                    sampled_pts = available_points[:, idx, :]
+                else:
+                    # (N, D) → (1, n_samples, D)  — T=1 for steady-state
+                    sampled_pts = available_points[idx][np.newaxis, :, :]
+
+                self.context[tag] = np.broadcast_to(
+                    sampled_pts[np.newaxis, ...],
+                    (batch_count, *sampled_pts.shape),
+                )
+
+                if normals_avaiable and available_normals is not None:
+                    sampled_nrm = available_normals[idx]
+                    if not is_time_dep:
+                        sampled_nrm = sampled_nrm[np.newaxis, :, :]
+                    self.context[f"n_{tag}"] = np.broadcast_to(
+                        sampled_nrm[np.newaxis, ...],
+                        (batch_count, *sampled_nrm.shape),
+                    )
+
+            if self._verbose:
+                if batch_count > 1:
+                    self.log.info(f"Sampled {n_samples} x {batch_count} = {batch_count * n_samples} points for '{tag}' with shape {self.context[tag].shape}")
+                else:
+                    self.log.info(f"Sampled {n_samples} points for '{tag}'")
 
         if return_indices:
-            return self.context[tag], None, tag
+            return self.context[tag], idx, tag
         else:
             return self.context[tag], None, tag
 
@@ -2537,11 +2457,7 @@ class domain(MeshIOMixin):
                 time_info = f" (t ∈ [{t_vals.min():.3f}, {t_vals.max():.3f}])"
 
         ax.set_title(f"Sampled Points: {time_info}")
-        handles, labels = ax.get_legend_handles_labels()
-        if not handles:
-            self.log.warning("No legend entries found. This usually means no variable of the domain has been set or sampled. Be sure to call e.g. domain.variable('interior') before plotting.")
-        else:
-            ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
+        ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=8)
 
         import matplotlib.pyplot as plt  # already imported above, but safe
 
