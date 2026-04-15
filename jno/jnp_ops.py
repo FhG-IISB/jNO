@@ -230,7 +230,20 @@ def concat(items, axis: int = -1) -> FunctionCall:
     """Concatenate placeholders along an axis (always axis=-1 at eval time)."""
 
     def _fn(*args):
-        expanded = [a[..., jnp.newaxis] if a.ndim == 1 else a for a in args]
+        expanded = []
+        for a in args:
+            a = jnp.asarray(a)
+
+            # scalar -> make it length-1 on the concat axis
+            if a.ndim == 0:
+                a = a[jnp.newaxis]
+
+            # vector -> make final axis explicit
+            elif a.ndim == 1:
+                a = a[..., jnp.newaxis]
+
+            expanded.append(a)
+
         return jnp.concatenate(expanded, axis=-1)
 
     return FunctionCall(_fn, list(items), name="concat")

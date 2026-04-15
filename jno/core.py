@@ -471,7 +471,7 @@ class core:
 
         return DomainData(context=context, dimension=domain.dimension,)
     #Vpinn helpers
-
+    
     def _materialize_weak_reduction(self, node):
         from .utils.weak_form import assemble_weak_form
 

@@ -115,11 +115,41 @@ class LoweredWeakForm:
 # --------------------------------
 # additive-term helpers
 # --------------------------------
+def _can_bucket_as_single_term(domain, node):
+    try:
+        return _infer_term_bucket(domain, node)
+    except Exception:
+        return None
+
+
 def _split_additive_terms(domain, node, sign=1.0):
-    if isinstance(node, BinaryOp) and node.op == "+":
-        return _split_additive_terms(domain, node.left, sign) + _split_additive_terms(domain, node.right, sign)
-    if isinstance(node, BinaryOp) and node.op == "-":
-        return _split_additive_terms(domain, node.left, sign) + _split_additive_terms(domain, node.right, -sign)
+    if isinstance(node, BinaryOp) and node.op in {"+", "-"}:
+        bucket = _can_bucket_as_single_term(domain, node)
+
+        # Keep additive subtree intact ONLY for boundary buckets.
+        # This is crucial for Robin terms:
+        #   alpha*u*phi - g*phi
+        # which should remain one boundary contribution.
+        #
+        # For volume terms, we still need additive splitting so VPINN can
+        # separate test_grad and test_value channels correctly.
+        if bucket is not None:
+            support, region_id = bucket
+            if support == "boundary":
+                return [(sign, node)]
+
+        if node.op == "+":
+            return (
+                _split_additive_terms(domain, node.left, sign)
+                + _split_additive_terms(domain, node.right, sign)
+            )
+
+        if node.op == "-":
+            return (
+                _split_additive_terms(domain, node.left, sign)
+                + _split_additive_terms(domain, node.right, -sign)
+            )
+
     return [(sign, node)]
 
 
@@ -404,6 +434,22 @@ def _extract_test_channel(domain, expr) -> Tuple[str, Placeholder, Dict[str, Any
 # --------------------------------
 # domain infer helpers
 # --------------------------------
+def is_variational_expr(domain, expr) -> bool:
+    """Return True if expr still looks like an unassembled weak-form expression."""
+    if expr is None:
+        return False
+
+    # Already assembled weak object -> not raw anymore
+    if isinstance(expr, (Assembly, GroupedAssembly, WeakReduction)):
+        return False
+
+    return (
+        _contains_node_type(domain, expr, TestFunction)
+        or _contains_node_type(domain, expr, TrialFunction)
+        or _contains_node_type(domain, expr, StateField)
+        or _contains_testfunction_gradient(domain, expr)
+    )
+
 def _infer_domain_from_expr(expr):
     domains = []
 
@@ -495,17 +541,51 @@ def _depends_on_domain_variables(node) -> bool:
                     return True
     return False
 
+def _infer_state_value_shape(domain, expr) -> tuple:
+    shapes = set()
 
-def _wrap_primary_state(node, target):
+    def walk(node):
+        if node is None:
+            return
+
+        if isinstance(node, TestFunction):
+            shapes.add(tuple(getattr(node, "value_shape", ())))
+            return
+
+        if isinstance(node, Jacobian) and isinstance(node.target, TestFunction):
+            shapes.add(tuple(getattr(node.target, "value_shape", ())))
+            return
+
+        if _is_symgrad_test(node):
+            shapes.add(tuple(_get_test_value_shape(node)))
+            return
+
+        for child in _iter_placeholder_children(node):
+            walk(child)
+
+    walk(expr)
+
+    if len(shapes) == 0:
+        return ()
+
+    if len(shapes) == 1:
+        return next(iter(shapes))
+
+    raise NotImplementedError(
+        "Could not infer a unique state value_shape from the weak form. "
+        f"Found multiple test value shapes: {sorted(shapes)}"
+    )
+
+def _wrap_primary_state(node, target, *, state_name="u", value_shape=()):
     if node is target:
-        return StateField(node, state_id=0, name="u", value_shape=())
+        return StateField(node, state_id=0, name=state_name, value_shape=value_shape)
 
     if node is None:
         return None
 
     if isinstance(node, BinaryOp):
-        left = _wrap_primary_state(node.left, target)
-        right = _wrap_primary_state(node.right, target)
+        left = _wrap_primary_state(node.left, target, state_name=state_name, value_shape=value_shape)
+        right = _wrap_primary_state(node.right, target, state_name=state_name, value_shape=value_shape)
         if left is not node.left or right is not node.right:
             return BinaryOp(node.op, left, right)
         return node
@@ -515,7 +595,7 @@ def _wrap_primary_state(node, target):
         changed = False
         for a in node.args:
             if isinstance(a, Placeholder):
-                na = _wrap_primary_state(a, target)
+                na = _wrap_primary_state(a, target, state_name=state_name, value_shape=value_shape)
                 changed = changed or (na is not a)
                 new_args.append(na)
             else:
@@ -529,7 +609,7 @@ def _wrap_primary_state(node, target):
         changed = False
         for a in node.args:
             if isinstance(a, Placeholder):
-                na = _wrap_primary_state(a, target)
+                na = _wrap_primary_state(a, target, state_name=state_name, value_shape=value_shape)
                 changed = changed or (na is not a)
                 new_args.append(na)
             else:
@@ -541,12 +621,12 @@ def _wrap_primary_state(node, target):
         return node
 
     if isinstance(node, Jacobian):
-        new_target = _wrap_primary_state(node.target, target)
+        new_target = _wrap_primary_state(node.target, target, state_name=state_name, value_shape=value_shape)
         new_vars = []
         changed = new_target is not node.target
         for v in node.variables:
             if isinstance(v, Placeholder):
-                nv = _wrap_primary_state(v, target)
+                nv = _wrap_primary_state(v, target, state_name=state_name, value_shape=value_shape)
             else:
                 nv = v
             changed = changed or (nv is not v)
@@ -556,12 +636,12 @@ def _wrap_primary_state(node, target):
         return node
 
     if isinstance(node, Hessian):
-        new_target = _wrap_primary_state(node.target, target)
+        new_target = _wrap_primary_state(node.target, target, state_name=state_name, value_shape=value_shape)
         new_vars = []
         changed = new_target is not node.target
         for v in node.variables:
             if isinstance(v, Placeholder):
-                nv = _wrap_primary_state(v, target)
+                nv = _wrap_primary_state(v, target, state_name=state_name, value_shape=value_shape)
             else:
                 nv = v
             changed = changed or (nv is not v)
@@ -571,7 +651,7 @@ def _wrap_primary_state(node, target):
         return node
 
     if isinstance(node, OperationDef):
-        new_expr = _wrap_primary_state(node.expr, target)
+        new_expr = _wrap_primary_state(node.expr, target, state_name=state_name, value_shape=value_shape)
         if new_expr is not node.expr:
             rebuilt = OperationDef.__new__(OperationDef)
             rebuilt.expr = new_expr
@@ -586,7 +666,7 @@ def _wrap_primary_state(node, target):
         changed = False
         for a in node.args:
             if isinstance(a, Placeholder):
-                na = _wrap_primary_state(a, target)
+                na = _wrap_primary_state(a, target, state_name=state_name, value_shape=value_shape)
                 changed = changed or (na is not a)
                 new_args.append(na)
             else:
@@ -598,7 +678,7 @@ def _wrap_primary_state(node, target):
         return node
 
     if isinstance(node, Tracker):
-        new_expr = _wrap_primary_state(node.expr, target)
+        new_expr = _wrap_primary_state(node.expr, target, state_name=state_name, value_shape=value_shape)
         if new_expr is not node.expr:
             rebuilt = Tracker(new_expr, interval=node.interval)
             rebuilt.op_id = node.op_id
@@ -610,11 +690,13 @@ def _wrap_primary_state(node, target):
 def _ensure_statefield_wrapped(domain, expr):
     if _contains_node_type(domain, expr, StateField) or _contains_node_type(domain, expr, TrialFunction):
         return expr
+
     candidate = _detect_primary_state_field(domain, expr)
-    #print("DEBUG primary state candidate:", candidate)
     if candidate is None:
         return expr
-    return _wrap_primary_state(expr, candidate)
+
+    value_shape = _infer_state_value_shape(domain, expr)
+    return _wrap_primary_state(expr, candidate, state_name="u", value_shape=value_shape)
 
 def _iter_placeholder_children(node):
     for attr in ("left", "right", "target", "expr"):
@@ -849,6 +931,13 @@ def _contains_node_type(domain, expr, node_type):
 
 def _collect_variational_metas(domain, node, out):
     if node is None:
+        return
+
+    # IMPORTANT:
+    # StateField is a symbolic unknown placeholder.
+    # Do not inspect node.expr here, otherwise Robin terms that contain
+    # a volume-built state leak volume tags into boundary bucket inference.
+    if isinstance(node, StateField):
         return
 
     if isinstance(node, Variable) and getattr(node, "fem_meta", None) is not None:
@@ -1271,6 +1360,9 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
             "getitem",
             "concat",
             "stack",
+            "symgrad",
+            "trace",
+            "einsum",
         }
 
         # Jacobian/Hessian are handled through their own nodes
@@ -1304,7 +1396,7 @@ def _infer_solver_target(domain, expr):
 def lower_weak_form(domain, expr, trial_value=None, for_target="vpinn"):
     print("DEBUG lower_weak_form has StateField before wrap:",
       _contains_node_type(domain, expr, StateField))
-    expr = _ensure_statefield_wrapped(domain, expr)
+    #expr = _ensure_statefield_wrapped(domain, expr)
     print("DEBUG lower_weak_form has StateField after wrap:",
       _contains_node_type(domain, expr, StateField))
     shared_trial_symbol = None
