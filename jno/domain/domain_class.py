@@ -763,6 +763,21 @@ class domain(MeshIOMixin):
         """
         return self.variational_symbols(value_shape=value_shape, names=names)
 
+    def test_function(self, value_shape=(), name="phi"):
+        """Return only the weak-form test function.
+
+        Intended for NN-first weak VPINN authoring:
+            phi = domain.test_function()
+            u   = net(...)
+            weak = ...
+        """
+        return TestFunction(name=name, value_shape=value_shape)
+
+
+    def trial_function(self, value_shape=(), name="u"):
+        """Advanced helper for explicit FEM-only authoring."""
+        return TrialFunction(name=name, value_shape=value_shape)
+
     def _register_variational_sample(
         self,
         sample_tag: str,

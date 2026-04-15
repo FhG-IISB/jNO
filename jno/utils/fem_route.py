@@ -9,17 +9,29 @@ import jax.numpy as jnp
 from jax.flatten_util import ravel_pytree
 
 from ..trace import (
+    Placeholder,
     Literal,
-    Constant,
-    TensorTag,
-    Variable,
-    TestFunction,
-    TrialFunction,
-    Jacobian,
     BinaryOp,
     FunctionCall,
+    Variable,
+    ModelCall,
+    OperationDef,
+    OperationCall,
+    Jacobian,
+    Hessian,
+    Tracker,
+    TrialFunction,
+    TestFunction,
+    TensorTag,
+    Constant,
+    Assembly,
+    GroupedAssembly,
+    StateField,
+    WeakReduction,
     FemResidualOperator,
+    FemLinearSystem,
 )
+
 
 from .weak_form import _sum_terms
 
@@ -42,6 +54,130 @@ class DirichletBC:
 class NeumannBC:
     tags: tuple[str, ...]
 
+
+
+def _lower_statefield_to_trial(expr, trial_cache=None):
+    """Final safety pass: replace any remaining StateField with one shared TrialFunction.
+
+    This is backend-side insurance for the Phase-1 NN-first weak route.
+    """
+    if trial_cache is None:
+        trial_cache = {}
+
+    if expr is None:
+        return None
+
+    if isinstance(expr, StateField):
+        key = (int(expr.state_id), str(expr.name), tuple(expr.value_shape))
+        if key not in trial_cache:
+            trial_cache[key] = TrialFunction(name=expr.name, value_shape=expr.value_shape)
+        return trial_cache[key]
+
+    if isinstance(expr, BinaryOp):
+        left = _lower_statefield_to_trial(expr.left, trial_cache)
+        right = _lower_statefield_to_trial(expr.right, trial_cache)
+        if left is not expr.left or right is not expr.right:
+            return BinaryOp(expr.op, left, right)
+        return expr
+
+    if isinstance(expr, FunctionCall):
+        new_args = []
+        changed = False
+        for a in expr.args:
+            if isinstance(a, (Literal, Constant, TensorTag, Variable, TestFunction, TrialFunction,
+                              Jacobian, Hessian, BinaryOp, FunctionCall, ModelCall,
+                              OperationDef, OperationCall, Tracker, StateField)):
+                na = _lower_statefield_to_trial(a, trial_cache)
+                changed = changed or (na is not a)
+                new_args.append(na)
+            else:
+                new_args.append(a)
+        if changed:
+            return expr.copy_with_args(new_args)
+        return expr
+
+    if isinstance(expr, ModelCall):
+        new_args = []
+        changed = False
+        for a in expr.args:
+            if isinstance(a, (Literal, Constant, TensorTag, Variable, TestFunction, TrialFunction,
+                              Jacobian, Hessian, BinaryOp, FunctionCall, ModelCall,
+                              OperationDef, OperationCall, Tracker, StateField)):
+                na = _lower_statefield_to_trial(a, trial_cache)
+                changed = changed or (na is not a)
+                new_args.append(na)
+            else:
+                new_args.append(a)
+        if changed:
+            rebuilt = ModelCall(expr.model, new_args)
+            rebuilt.op_id = expr.op_id
+            return rebuilt
+        return expr
+
+    if isinstance(expr, OperationDef):
+        new_expr = _lower_statefield_to_trial(expr.expr, trial_cache)
+        if new_expr is not expr.expr:
+            rebuilt = OperationDef.__new__(OperationDef)
+            rebuilt.expr = new_expr
+            rebuilt.input_vars = expr.input_vars
+            rebuilt.name = getattr(expr, "name", None)
+            rebuilt.op_id = expr.op_id
+            return rebuilt
+        return expr
+
+    if isinstance(expr, OperationCall):
+        new_args = []
+        changed = False
+        for a in expr.args:
+            if isinstance(a, (Literal, Constant, TensorTag, Variable, TestFunction, TrialFunction,
+                              Jacobian, Hessian, BinaryOp, FunctionCall, ModelCall,
+                              OperationDef, OperationCall, Tracker, StateField)):
+                na = _lower_statefield_to_trial(a, trial_cache)
+                changed = changed or (na is not a)
+                new_args.append(na)
+            else:
+                new_args.append(a)
+        if changed:
+            rebuilt = OperationCall(expr.operation, tuple(new_args))
+            rebuilt.op_id = expr.op_id
+            return rebuilt
+        return expr
+
+    if isinstance(expr, Jacobian):
+        new_target = _lower_statefield_to_trial(expr.target, trial_cache)
+        new_vars = []
+        changed = new_target is not expr.target
+        for v in expr.variables:
+            if isinstance(v, (Literal, Constant, TensorTag, Variable, TestFunction, TrialFunction,
+                              Jacobian, Hessian, BinaryOp, FunctionCall, ModelCall,
+                              OperationDef, OperationCall, Tracker, StateField)):
+                nv = _lower_statefield_to_trial(v, trial_cache)
+            else:
+                nv = v
+            changed = changed or (nv is not v)
+            new_vars.append(nv)
+        if changed:
+            return Jacobian(new_target, new_vars, expr.scheme)
+        return expr
+
+    if isinstance(expr, Hessian):
+        new_target = _lower_statefield_to_trial(expr.target, trial_cache)
+        new_vars = []
+        changed = new_target is not expr.target
+        for v in expr.variables:
+            if isinstance(v, (Literal, Constant, TensorTag, Variable, TestFunction, TrialFunction,
+                              Jacobian, Hessian, BinaryOp, FunctionCall, ModelCall,
+                              OperationDef, OperationCall, Tracker, StateField)):
+                nv = _lower_statefield_to_trial(v, trial_cache)
+            else:
+                nv = v
+            changed = changed or (nv is not v)
+            new_vars.append(nv)
+        if changed:
+            return Hessian(new_target, new_vars, expr.scheme, trace=expr.trace)
+        return expr
+
+    return expr
 
 def _as_tags(tags) -> tuple[str, ...]:
     if isinstance(tags, str):
@@ -621,14 +757,20 @@ def _make_feax_dirichlet_specs(domain, vec: int):
 
 def _build_feax_problem(domain, ir):
     import feax as fe
+    trial_cache = {}
 
-    volume_expr = ir.volume_expr
-    boundary_exprs = ir.boundary_exprs
-
+    volume_expr = _lower_statefield_to_trial(ir.volume_expr, trial_cache)
+    boundary_exprs = {
+        k: _lower_statefield_to_trial(v, trial_cache)
+        for k, v in ir.boundary_exprs.items()
+    }
+    print("DEBUG FEAX volume_expr after StateField->Trial lowering:", volume_expr)
     if volume_expr is None and len(boundary_exprs) == 0:
         raise ValueError("No terms found for FEM assembly.")
 
-    metadata = _infer_trial_metadata(volume_expr if volume_expr is not None else next(iter(boundary_exprs.values())))
+    metadata = _infer_trial_metadata(
+        volume_expr if volume_expr is not None else next(iter(boundary_exprs.values()))
+    )
     vec = int(metadata["vec"])
     value_shape = metadata["value_shape"]
 

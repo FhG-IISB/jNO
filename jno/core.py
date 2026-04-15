@@ -27,6 +27,8 @@ from .trace import (
     Constant,
     ConstantNamespace,
     Tracker,
+    StateField,
+    WeakReduction,
     collect_operations,
     collect_tags,
     get_primary_tag,
@@ -468,7 +470,53 @@ class core:
                     context[tag] = arr[None, ...]
 
         return DomainData(context=context, dimension=domain.dimension,)
+    #Vpinn helpers
 
+    def _materialize_weak_reduction(self, node):
+        from .utils.weak_form import assemble_weak_form
+
+        if isinstance(node, WeakReduction):
+            #print(f"DEBUG WeakReduction materialized: reduction={node.reduction}")
+            assembled = assemble_weak_form(self.domain, node.expr, target="vpinn")
+            if node.reduction == "mse":
+                return assembled.mse
+            if node.reduction == "mae":
+                return assembled.mae
+            raise ValueError(f"Unsupported weak reduction '{node.reduction}'.")
+
+        if isinstance(node, BinaryOp):
+            left = self._materialize_weak_reduction(node.left)
+            right = self._materialize_weak_reduction(node.right)
+            if left is not node.left or right is not node.right:
+                return BinaryOp(node.op, left, right)
+            return node
+
+        if isinstance(node, FunctionCall):
+            new_args = []
+            changed = False
+            for a in node.args:
+                if isinstance(a, Placeholder):
+                    na = self._materialize_weak_reduction(a)
+                    changed = changed or (na is not a)
+                    new_args.append(na)
+                else:
+                    new_args.append(a)
+            if changed:
+                return node.copy_with_args(new_args)
+            return node
+
+        if isinstance(node, OperationDef):
+            new_expr = self._materialize_weak_reduction(node.expr)
+            if new_expr is not node.expr:
+                return OperationDef(new_expr)
+            return node
+
+        return node
+
+    def _materialize_all_weak_reductions(self, constraints):
+        #print("DEBUG entering _materialize_all_weak_reductions")
+        return [self._materialize_weak_reduction(c) for c in constraints]
+    
     # Training
     def _make_loss_fn(self, compiled_constraints_fn, n_constraints, batchsize, frozen, static, checkpoint_gradients=False, min_consecutive=1):
         """Create loss function — evaluates ALL constraints in one combined call."""
@@ -740,7 +788,9 @@ class core:
         self._setup_parallelism(mesh)
 
         # === Preprocessing ===
-        constraints = self.wrap_constraints(self.constraints)
+        # Check if its Vpinn and routes accordingly
+        constraints_in = self._materialize_all_weak_reductions(self.constraints)
+        constraints = self.wrap_constraints(constraints_in)
 
         # === Collect operations and tags ===
         self.all_ops = self.collect_unique_operations(constraints)

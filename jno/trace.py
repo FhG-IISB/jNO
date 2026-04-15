@@ -47,6 +47,8 @@ __all__ = [
     "TrialFunction",
     "FemLinearSystem",
     "FemResidualOperator",
+    "StateField",
+    "WeakReduction",
 ]
 
 # Global counter for unique operation IDs
@@ -58,6 +60,36 @@ def _next_op_id() -> int:
     _operation_counter += 1
     return _operation_counter
 
+def _contains_node_type_local(node, cls) -> bool:
+    if isinstance(node, cls):
+        return True
+
+    for attr in ("left", "right", "target", "expr", "operation", "model"):
+        child = getattr(node, attr, None)
+        if child is not None and _contains_node_type_local(child, cls):
+            return True
+
+    for attr in ("args", "variables", "options"):
+        vals = getattr(node, attr, None)
+        if vals is None:
+            continue
+        for v in vals:
+            if isinstance(v, (list, tuple)):
+                for vv in v:
+                    if _contains_node_type_local(vv, cls):
+                        return True
+            else:
+                if _contains_node_type_local(v, cls):
+                    return True
+    return False
+
+
+def _looks_like_weak_expression(node) -> bool:
+    return (
+        _contains_node_type_local(node, TestFunction)
+        or _contains_node_type_local(node, TrialFunction)
+        or _contains_node_type_local(node, StateField)
+    )
 
 class Placeholder:
     """Base node for the traced DSL graph.
@@ -182,16 +214,14 @@ class Placeholder:
             shape = tuple(shape[0])
         return FunctionCall(lambda x, s=shape: x.reshape(s), [self], name="reshape")
 
-    def assemble(self, domain, target="vpinn", **kwargs):
-        """
-        Unified variational assembly entry point.
+    def assemble(self, domain=None, target=None, **kwargs):
+        """Unified assembly entry point.
 
-        target="vpinn"      -> assemble weak residual / VPINN quantity
-        target="fem_system" -> assemble FEM matrices (A, b)
-
-        Additional kwargs can carry backend-specific options, e.g. model=u_net.
+        If domain is omitted, try to infer it from Variables/TestFunction/etc.
+        target=None lets weak_form.py infer the steady solver route in Phase 1.
         """
-        return domain.assemble_weak_form(self, target=target, **kwargs)
+        from .utils.weak_form import assemble_weak_form
+        return assemble_weak_form(domain, self, target=target, **kwargs)
 
     def print(self, what: Union[str, Callable[[jnp.ndarray], Any]] = "shape", label: Optional[str] = None):
         """Emit runtime debug info for this placeholder and pass it through.
@@ -295,6 +325,8 @@ class Placeholder:
 
     @property
     def mse(self) -> FunctionCall:
+        if _looks_like_weak_expression(self):
+            return WeakReduction(self, reduction="mse")
         def fn(x):
             return jnp.squeeze(jnp.mean(jnp.square(x)))
 
@@ -302,6 +334,8 @@ class Placeholder:
 
     @property
     def mae(self) -> FunctionCall:
+        if _looks_like_weak_expression(self):
+            return WeakReduction(self, reduction="mae")
         return FunctionCall(lambda x: jnp.squeeze(jnp.mean(jnp.abs(x))), [self], "mae", True)
 
     @property
@@ -1699,7 +1733,6 @@ class FemLinearSystem:
         shape = getattr(self.A, "shape", None)
         return f"FemLinearSystem(shape={shape}, b_shape={getattr(self.b, 'shape', None)})"
 
-
 class FemResidualOperator:
     """Container for a nonlinear FEM residual operator R(u)=0.
 
@@ -1729,6 +1762,37 @@ class FemResidualOperator:
     def __repr__(self):
         return f"FemResidualOperator(size={self.size}, has_jacobian={self.jacobian is not None})"
 
+class StateField(Placeholder):
+    """Internal marker for the primary weak-form unknown.
+
+    This wraps the original NN-valued expression so the same weak graph can be
+    lowered either to VPINN (bind back to expr) or FEM (replace by TrialFunction).
+    """
+
+    def __init__(self, expr: Placeholder, *, state_id: int = 0, name: str = "u", value_shape: tuple = ()):
+        self.expr = expr
+        self.state_id = int(state_id)
+        self.name = name
+        self.value_shape = tuple(value_shape)
+
+    def __repr__(self):
+        return f"StateField(name={self.name!r}, id={self.state_id}, shape={self.value_shape})"
+
+class WeakReduction(Placeholder):
+    """Deferred VPINN reduction for weak-form expressions.
+
+    Example internal flow:
+        weak.mse  -> WeakReduction(weak, "mse")
+        core.compile() materializes it to:
+            assemble_weak_form(..., target='vpinn').mse
+    """
+
+    def __init__(self, expr: Placeholder, reduction: str = "mse"):
+        self.expr = expr
+        self.reduction = str(reduction)
+
+    def __repr__(self):
+        return f"WeakReduction({self.reduction}, expr={self.expr})"
 
 class TrialFunction(Placeholder):
     """

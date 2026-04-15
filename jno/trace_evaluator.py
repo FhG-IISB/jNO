@@ -27,6 +27,7 @@ from .trace import (
     TestFunction,
     Assembly,
     GroupedAssembly,
+    StateField,
 )
 
 
@@ -298,6 +299,7 @@ class TraceEvaluator:
         (OperationDef, "_eval_operation_def"),
         (TestFunction, "_eval_test_function"),
         (Assembly, "_eval_assembly"),
+        (StateField, "_eval_state_field"),
         (GroupedAssembly, "_eval_grouped_assembly"),
     ]
 
@@ -573,6 +575,9 @@ class TraceEvaluator:
         if expr._current_instance is None:
             raise ValueError(f"TunableModule {expr} has no current instance.  " "This should be set by core.solve() before evaluation.")
         return self._dispatch(expr._current_instance, ctx)
+
+    def _eval_state_field(self, expr, ctx):
+        return self._dispatch(expr.expr, ctx)
 
     def _eval_tunable_module_call(self, expr, ctx):
         tunable = expr.model
