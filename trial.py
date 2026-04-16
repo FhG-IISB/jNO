@@ -1,6 +1,7 @@
 import jno
 import jax
 import optax
+import foundax
 
 dir = jno.setup("./runs/test")
 
@@ -13,7 +14,8 @@ random_k = jax.random.uniform(jax.random.PRNGKey(0), shape=(500, 1, 1), minval=0
 k = dom.variable("k", random_k)
 
 # Neural Network
-net = jno.nn.deeponet(n_sensors=1, coord_dim=2, basis_functions=32, hidden_dim=128, activation=jax.numpy.tanh)
+fx = foundax.deeponet(n_sensors=1, coord_dim=2, basis_functions=32, hidden_dim=128, activation=jax.numpy.tanh)
+net = jno.nn.wrap(fx)
 net.optimizer(optax.adam(learning_rate=optax.schedules.cosine_decay_schedule(init_value=1e-3, decay_steps=20_000, alpha=1e-5)))
 
 # Forward pass and hard enforcement of BCs via output transformation

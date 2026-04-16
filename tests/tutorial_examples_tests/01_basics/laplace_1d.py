@@ -19,6 +19,7 @@ Techniques shown
 import jax
 import jno
 
+import foundax
 import optax
 from jno import LearningRateSchedule as lrs
 
@@ -31,12 +32,12 @@ x, _ = domain.variable("interior")
 u_exact = jno.np.sin(π * x) / π**2
 
 # ── Network with hard-enforced BCs ────────────────────────────────────────────
-u_net = jno.nn.mlp(
+u_net = jno.nn.wrap(foundax.mlp(
     in_features=1,
     hidden_dims=32,
     num_layers=3,
     key=jax.random.PRNGKey(0),
-).optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 10, 1e-5))
+)).optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 10, 1e-5))
 
 u = u_net(x) * x * (1 - x)  # hard BC: u(0) = u(1) = 0
 

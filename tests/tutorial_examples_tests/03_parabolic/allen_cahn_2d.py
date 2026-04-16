@@ -21,6 +21,7 @@ Parameters: ε = 0.1  (interface width)
 import jax
 import jno
 
+import foundax
 import optax
 from jno import LearningRateSchedule as lrs
 
@@ -45,7 +46,7 @@ coeff = 2 * eps**2 * π**2 - 2
 source = exp(-t) * S * coeff + exp(-3 * t) * S**3
 
 # ── Network ───────────────────────────────────────────────────────────────────
-net = jno.nn.deeponet(
+net = jno.nn.wrap(foundax.deeponet(
     n_sensors=1,
     coord_dim=2,
     n_outputs=1,
@@ -53,7 +54,7 @@ net = jno.nn.deeponet(
     basis_functions=64,
     hidden_dim=40,
     key=jax.random.PRNGKey(42),
-)
+))
 net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(10, 1, 1e-3, 1e-5))
 
 xy = jno.np.concat([x, y])

@@ -8,6 +8,7 @@ import optax
 
 import jno
 
+import foundax
 import numpy as np
 from jno import LearningRateSchedule as lrs
 
@@ -121,13 +122,13 @@ x_int, y_int, _ = train_domain.variable("interior", split=True)
 # ============================================================
 key = jax.random.PRNGKey(0)
 
-net = jno.nn.mlp(
+net = jno.nn.wrap(foundax.mlp(
     2,
     hidden_dims=32,
     num_layers=2,
     activation=jax.nn.tanh,
     key=key,
-)
+))
 
 
 def apply_hard_bc(raw, x, y):

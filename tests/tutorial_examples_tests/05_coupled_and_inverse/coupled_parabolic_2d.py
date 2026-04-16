@@ -16,6 +16,7 @@ Analytical solution
 import jax
 import jno
 
+import foundax
 import optax
 from jno import LearningRateSchedule as lrs
 
@@ -34,7 +35,7 @@ v_exact = jno.np.exp(-t) * jno.np.sin(2 * pi * x) * jno.np.sin(pi * y)
 f = (2 * pi**2 - 1) * u_exact + v_exact
 g = (5 * pi**2 - 1) * v_exact + u_exact
 
-u_net = jno.nn.deeponet(
+u_net = jno.nn.wrap(foundax.deeponet(
     n_sensors=1,
     coord_dim=2,
     n_outputs=1,
@@ -42,8 +43,8 @@ u_net = jno.nn.deeponet(
     basis_functions=64,
     hidden_dim=48,
     key=jax.random.PRNGKey(24),
-)
-v_net = jno.nn.deeponet(
+))
+v_net = jno.nn.wrap(foundax.deeponet(
     n_sensors=1,
     coord_dim=2,
     n_outputs=1,
@@ -51,7 +52,7 @@ v_net = jno.nn.deeponet(
     basis_functions=64,
     hidden_dim=48,
     key=jax.random.PRNGKey(25),
-)
+))
 for net in [u_net, v_net]:
     net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(10, 1, 1e-3, 1e-5))
 

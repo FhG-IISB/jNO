@@ -21,6 +21,7 @@ The convection term introduces an apparent leftward shift in the forcing.
 import jax
 import jno
 
+import foundax
 import optax
 from jno import LearningRateSchedule as lrs
 
@@ -42,7 +43,7 @@ u_exact = jno.np.exp(-t) * jno.np.sin(π * x)
 source = jno.np.exp(-t) * ((ν * π**2 - 1) * jno.np.sin(π * x) + c * π * jno.np.cos(π * x))
 
 # ── Network  (hard Dirichlet BCs) ────────────────────────────────────────────
-net = jno.nn.deeponet(
+net = jno.nn.wrap(foundax.deeponet(
     n_sensors=1,
     coord_dim=1,
     n_outputs=1,
@@ -50,7 +51,7 @@ net = jno.nn.deeponet(
     basis_functions=64,
     hidden_dim=32,
     key=jax.random.PRNGKey(1),
-)
+))
 net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.6, 10, 1e-5))
 
 u = net(t, x) * x * (1 - x)

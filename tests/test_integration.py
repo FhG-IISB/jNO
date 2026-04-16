@@ -4,6 +4,7 @@ import pytest
 import jax
 import jax.numpy as jnp
 import equinox as eqx
+import foundax
 
 from jno.trace import (
     Literal,
@@ -178,7 +179,7 @@ class TestRegressions:
         dom = jno.domain(constructor=jno.domain.rect(mesh_size=0.5))
         x, y, _ = dom.variable("interior")
 
-        net = jnn.nn.mlp(in_features=2, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(0))
+        net = jnn.nn.wrap(foundax.mlp(in_features=2, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(0)))
         net.optimizer(optax.adam(1e-3))
 
         raw = net(jnn.concat([x, y], axis=-1))
@@ -209,7 +210,7 @@ def _make_solver():
     x, t = domain.variable("interior")
 
     key = jax.random.PRNGKey(0)
-    u_net = jnn.nn.mlp(1, hidden_dims=32, num_layers=2, key=key)
+    u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=32, num_layers=2, key=key))
     u = u_net(x) * x * (1 - x)
     pde = jnn.laplacian(u, [x]) - jnn.sin(jnn.pi * x)
 
@@ -425,7 +426,7 @@ class TestParamMask:
         domain = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.05))
         x, *_ = domain.variable("interior")
         key = jax.random.PRNGKey(0)
-        u_net = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key)
+        u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key))
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x])
         param_mask = mask_fn(u_net.module)
@@ -503,7 +504,7 @@ class TestParamMask:
             domain = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.05))
             x, *_ = domain.variable("interior")
             key = jax.random.PRNGKey(seed)
-            u_net = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key)
+            u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key))
             return u_net, domain, jno.core([jnn.laplacian(u_net(x) * x * (1 - x), [x]).mse], domain)
 
         u_masked, dom_m, solver_m = make_masked(7)
@@ -536,7 +537,7 @@ class TestParamMask:
         domain = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.05))
         x, *_ = domain.variable("interior")
         key = jax.random.PRNGKey(0)
-        u_net = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key)
+        u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key))
 
         all_false = jax.tree_util.tree_map(lambda _: False, u_net.module)
         partial_mask = eqx.tree_at(
@@ -598,10 +599,10 @@ def test_mask_initialize_freeze_lora_combined():
 
     # ── u_net: mask (output layer only) + initialize from pytree ─────
     key_u = jax.random.PRNGKey(0)
-    u_net = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key_u)
+    u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key_u))
 
     # Create "pretrained" weights from a different seed
-    pretrained = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(99))
+    pretrained = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(99)))
 
     # Mask marks parameters to freeze via mask(...).freeze().
     all_false_u = jax.tree_util.tree_map(lambda _: False, u_net.module)
@@ -618,7 +619,7 @@ def test_mask_initialize_freeze_lora_combined():
 
     # ── v_net: mask + freeze + lora  (LoRA takes priority over freeze) ──
     key_v = jax.random.PRNGKey(1)
-    v_net = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key_v)
+    v_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key_v))
 
     all_false_v = jax.tree_util.tree_map(lambda _: False, v_net.module)
     mask_v = eqx.tree_at(
@@ -744,7 +745,7 @@ def test_nnx_freeze():
     frozen_net.freeze()
 
     # need at least one trainable model → add a small equinox MLP
-    train_net = jnn.nn.mlp(1, output_dim=1, hidden_dims=4, num_layers=1, key=jax.random.PRNGKey(99))
+    train_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=4, num_layers=1, key=jax.random.PRNGKey(99)))
     train_net.optimizer(optax.adam, lr=lrs(1e-3))
 
     u_frozen = frozen_net(x) * x * (1 - x)

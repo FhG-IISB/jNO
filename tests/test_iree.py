@@ -3,6 +3,7 @@
 import pickle
 import shutil
 
+import foundax
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -159,11 +160,13 @@ def laplace1d_solver():
     domain = jno.domain(constructor=jno.domain.line(mesh_size=0.05))
     x, *_ = domain.variable("interior")
 
-    u_net = jnn.nn.mlp(
-        in_features=1,
-        hidden_dims=16,
-        num_layers=2,
-        key=jax.random.PRNGKey(0),
+    u_net = jnn.nn.wrap(
+        foundax.mlp(
+            in_features=1,
+            hidden_dims=16,
+            num_layers=2,
+            key=jax.random.PRNGKey(0),
+        )
     ).optimizer(optax.adam(1e-3))
 
     u = u_net(x) * x * (1 - x)

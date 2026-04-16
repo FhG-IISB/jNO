@@ -21,6 +21,7 @@ Architecture: (B, H, W, C) → Encoder (skip connections) → Decoder → (B, H,
 import jax
 import jno
 
+import foundax
 import optax
 
 KEY = jax.random.PRNGKey(0)
@@ -37,7 +38,7 @@ _u = domain.variable("_u")  # (S, 1, 1, H, W, 1)
 # ── Model ─────────────────────────────────────────────────────────────────────
 # UNet2D: index with [0, ...] to drop the outer sample wrapper dimension;
 # the model receives (1, 1, H, W, 1) which it normalizes internally.
-u = jno.nn.unet2d(
+u = jno.nn.wrap(foundax.unet2d(
     in_channels=1,
     out_channels=1,
     depth=4,
@@ -46,7 +47,7 @@ u = jno.nn.unet2d(
     up_mode="upconv",
     padding_mode="reflect",  # non-periodic BCs
     key=KEY,
-)
+))
 
 # ── Constraint & solver ───────────────────────────────────────────────────────
 crux = jno.core([(_u - u(_f[0, ...])).mse], domain)

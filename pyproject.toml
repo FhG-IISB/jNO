@@ -20,6 +20,7 @@ dependencies = [
     "equinox",
     "optax",
     "orbax-checkpoint",
+    "foundax",
 
     "pygmsh",
     "cloudpickle",

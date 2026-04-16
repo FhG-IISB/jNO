@@ -14,6 +14,7 @@ Analytical solution
 import jax
 import jno
 
+import foundax
 import optax
 from jno import LearningRateSchedule as lrs
 
@@ -25,7 +26,7 @@ kappa = 1 + x + y
 u_exact = jno.np.sin(pi * x) * jno.np.sin(pi * y)
 forcing = 2 * pi**2 * kappa * u_exact - pi * jno.np.cos(pi * x) * jno.np.sin(pi * y) - pi * jno.np.sin(pi * x) * jno.np.cos(pi * y)
 
-net = jno.nn.mlp(in_features=2, hidden_dims=48, num_layers=4, key=jax.random.PRNGKey(13))
+net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=48, num_layers=4, key=jax.random.PRNGKey(13)))
 net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 10, 1e-5))
 
 u = net(x, y) * x * (1 - x) * y * (1 - y)

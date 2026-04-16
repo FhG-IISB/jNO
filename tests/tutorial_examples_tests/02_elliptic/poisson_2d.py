@@ -15,6 +15,7 @@ used for the same network architecture so the results can be compared directly.
 import jax
 import jno
 
+import foundax
 import optax
 
 π = jno.np.pi
@@ -31,7 +32,7 @@ req_params = {"D": 5, "flavor": "exact"}
 
 
 def make_solver(scheme: str, label: str, epochs: int = 5000) -> float:
-    net = jno.nn.mlp(in_features=2, hidden_dims=64, num_layers=4, key=jax.random.PRNGKey(0))
+    net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=64, num_layers=4, key=jax.random.PRNGKey(0)))
     net.optimizer(optax.adam(1))
     net.lr(jno.schedule.learning_rate.exponential(1e-3, 0.5, epochs, 1e-5))
 

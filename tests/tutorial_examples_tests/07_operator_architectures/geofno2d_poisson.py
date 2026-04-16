@@ -25,6 +25,7 @@ import jax
 import jax.numpy as jnp
 import jno
 
+import foundax
 import numpy as np
 import optax
 
@@ -60,7 +61,7 @@ _u_flat = _u.reshape((1, N, 1))  # (1, N, 1) target
 # ── Model ─────────────────────────────────────────────────────────────────────
 # nks: Fourier modes per spatial dimension
 # in_dim=3: input = (f, x, y) at each node
-u = jno.nn.geofno2d(
+u = jno.nn.wrap(foundax.geofno(ndims=2, 
     nks=(8, 8),
     Ls=(1.0, 1.0),
     layers=(64, 64, 64, 64),
@@ -68,7 +69,7 @@ u = jno.nn.geofno2d(
     in_dim=3,
     out_dim=1,
     key=KEY,
-)
+))
 
 # ── Constraint & solver ───────────────────────────────────────────────────────
 # u(x, node_mask, nodes, node_weights) → (N, 1)

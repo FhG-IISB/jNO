@@ -12,6 +12,7 @@ from __future__ import annotations
 import jax
 import jno
 
+import foundax
 import numpy as np
 import optax
 
@@ -114,7 +115,7 @@ def main():
     f_vals = _f[:, 0]  # (B, N, 1)
     u_vals = _u[:, 0]  # (B, N, 1)
 
-    model = jno.nn.deeponet(
+    model = jno.nn.wrap(foundax.deeponet(
         branch_type="mlp",
         trunk_type="mlp",
         combination_type="dot",
@@ -126,7 +127,7 @@ def main():
         hidden_dim=128,
         n_layers=4,
         key=KEY,
-    )
+    ))
 
     # Evaluate DeepONet per-sample because coordinates differ per geometry
     u_pred = jax.vmap(lambda f_i, y_i: model(f_i, y_i), in_axes=(0, 0))(f_vals, coords)

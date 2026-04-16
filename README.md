@@ -56,6 +56,7 @@ Create the following file
 import jno
 import jax
 import optax
+import foundax
 
 dir = jno.setup("./runs/test")
 
@@ -68,7 +69,8 @@ random_k = jax.random.uniform(jax.random.PRNGKey(0), shape=(500, 1, 1), minval=0
 k = dom.variable("k", random_k)
 
 # Neural Network
-net = jno.nn.deeponet(n_sensors=1, coord_dim=2, basis_functions=32, hidden_dim=128, activation=jax.numpy.tanh)
+fx = foundax.deeponet(n_sensors=1, coord_dim=2, basis_functions=32, hidden_dim=128, activation=jax.numpy.tanh)
+net = jno.nn.wrap(fx)
 net.optimizer(optax.adam(learning_rate=optax.schedules.cosine_decay_schedule(init_value=1e-3, decay_steps=20_000, alpha=1e-5)))
 
 # Forward pass and hard enforcement of BCs via output transformation
@@ -97,41 +99,13 @@ and then run with
 CUDA_VISIBLE_DEVICES=<gpu_id> JNO_SEED=<seed> python <filename>.py
 ```
 
-### Foundation Models
+### Foundation Models and other neural networks
 
-These models are maintained as separate repositories so they can also be used independently.
-If installed via
+These models are maintained in a seperate repository ([foundax](https://github.com/FhG-IISB/foundax)) so they can also be used independently.
 
+```bash
+pip install foundax
 ```
-pip install https://github.com/FhG-IISB/jax_<model_name>.git
-```
-
-you can access them via:
-
-```python
-jno.nn.<model_name>
-```
-
-to use a foundation model install one or more of the following repositories (they can also be used as standalone repos without jNO).
-
-<p>
-    <a href="https://github.com/FhG-IISB/jax_poseidon">
-        <img src="https://img.shields.io/badge/jax_poseidon-1f6feb?style=for-the-badge" alt="jax_poseidon"/>
-    </a>
-    <a href="https://github.com/FhG-IISB/jax_walrus">
-        <img src="https://img.shields.io/badge/jax_walrus-1f6feb?style=for-the-badge" alt="jax_walrus"/>
-    </a>
-    <a href="https://github.com/FhG-IISB/jax_pdeformer2">
-        <img src="https://img.shields.io/badge/jax_pdeformer2-1f6feb?style=for-the-badge" alt="jax_pdeformer2"/>
-    </a>
-    <a href="https://github.com/FhG-IISB/jax_morph">
-        <img src="https://img.shields.io/badge/jax_morph-1f6feb?style=for-the-badge" alt="jax_morph"/>
-    </a>
-    <a href="https://github.com/FhG-IISB/jax_mpp">
-        <img src="https://img.shields.io/badge/jax_mpp-1f6feb?style=for-the-badge" alt="jax_mpp"/>
-    </a>
-</p>
-
 
 
 ## Citation

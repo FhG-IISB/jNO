@@ -2,6 +2,7 @@
 
 import pytest
 import jax.numpy as jnp
+import foundax
 
 from jno.trace import (
     Placeholder,
@@ -329,7 +330,7 @@ class TestModelMask:
         import jno.jnp_ops as jnn
 
         key = jax.random.PRNGKey(0)
-        return jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key)
+        return jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key))
 
     def test_mask_stores_param_mask(self):
         """mask() stores the pytree on _param_mask."""

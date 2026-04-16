@@ -16,6 +16,7 @@ which gives
 
 import jax
 import jno
+import foundax
 import optax
 
 pi = jno.np.pi
@@ -28,7 +29,7 @@ x, y, _ = domain.variable("interior")
 u_exact = jno.np.sin(pi * x) * jno.np.sin(pi * y)
 forcing = (a + b) * pi**2 * u_exact
 
-net = jno.nn.mlp(in_features=2, hidden_dims=32, num_layers=4, key=jax.random.PRNGKey(12))
+net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=32, num_layers=4, key=jax.random.PRNGKey(12)))
 net.optimizer(optax.adam(1), lr=jno.schedule.learning_rate.exponential(1e-3, 0.5, 10, 1e-5))
 
 u = net(x, y) * x * (1 - x) * y * (1 - y)

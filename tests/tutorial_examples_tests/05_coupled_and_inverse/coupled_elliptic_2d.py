@@ -24,6 +24,7 @@ same hard-constraint ansatz.
 import jax
 import jno
 
+import foundax
 import optax
 from jno import LearningRateSchedule as lrs
 
@@ -44,8 +45,8 @@ g = 5 * π**2 * sin(2 * π * x) * sin(π * y) + sin(π * x) * sin(π * y)
 key = jax.random.PRNGKey(0)
 k1, k2 = jax.random.split(key)
 
-u_net = jno.nn.mlp(in_features=2, hidden_dims=64, num_layers=4, key=k1)
-v_net = jno.nn.mlp(in_features=2, hidden_dims=64, num_layers=4, key=k2)
+u_net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=64, num_layers=4, key=k1))
+v_net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=64, num_layers=4, key=k2))
 
 for net in [u_net, v_net]:
     net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(10, 1, 1e-3, 1e-5))

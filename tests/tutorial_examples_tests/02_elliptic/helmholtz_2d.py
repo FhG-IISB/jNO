@@ -18,6 +18,7 @@ Try different values of k (e.g. 1, 2, 4) to see the effect on convergence.
 import jax
 import jno
 
+import foundax
 import optax
 from jno import LearningRateSchedule as lrs
 
@@ -34,12 +35,12 @@ u_exact = jno.np.sin(π * x) * jno.np.sin(π * y)
 forcing = (2 * π**2 - k**2) * jno.np.sin(π * x) * jno.np.sin(π * y)
 
 # ── Network ───────────────────────────────────────────────────────────────────
-u_net = jno.nn.mlp(
+u_net = jno.nn.wrap(foundax.mlp(
     in_features=2,
     hidden_dims=64,
     num_layers=5,  # slightly deeper for the oscillatory problem
     key=jax.random.PRNGKey(0),
-).optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 10, 1e-5))
+)).optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 10, 1e-5))
 
 u = u_net(x, y) * x * (1 - x) * y * (1 - y)
 

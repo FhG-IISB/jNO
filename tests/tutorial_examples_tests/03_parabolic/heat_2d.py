@@ -18,6 +18,7 @@ evaluated on the "initial" domain tag.
 import jax
 import jno
 
+import foundax
 import optax
 from jno import LearningRateSchedule as lrs
 
@@ -39,7 +40,7 @@ domain.summary()
 u_exact = jno.np.exp(-2 * α * π**2 * t) * jno.np.sin(π * x) * jno.np.sin(π * y)
 
 # ── Network ───────────────────────────────────────────────────────────────────
-net = jno.nn.deeponet(
+net = jno.nn.wrap(foundax.deeponet(
     n_sensors=1,
     coord_dim=2,
     n_outputs=1,
@@ -47,7 +48,7 @@ net = jno.nn.deeponet(
     basis_functions=64,
     hidden_dim=40,
     key=jax.random.PRNGKey(0),
-)
+))
 net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(10, 1, 1e-3, 1e-5))
 net.summary()
 xy = jno.np.concat([x, y])

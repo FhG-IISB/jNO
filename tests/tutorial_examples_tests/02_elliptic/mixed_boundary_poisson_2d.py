@@ -19,6 +19,7 @@ which gives
 import jax
 import jno
 
+import foundax
 import optax
 from jno import LearningRateSchedule as lrs
 
@@ -31,7 +32,7 @@ xb, yb, _ = domain.variable("bottom")
 u_exact = jno.np.sin(pi * x) * jno.np.cos(pi * y)
 forcing = 2 * pi**2 * u_exact
 
-net = jno.nn.mlp(in_features=2, hidden_dims=48, num_layers=4, key=jax.random.PRNGKey(14))
+net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=48, num_layers=4, key=jax.random.PRNGKey(14)))
 net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 10, 1e-5))
 
 u = net(x, y) * x * (1 - x)
