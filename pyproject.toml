@@ -78,24 +78,7 @@ line-length = 250
 [tool.mypy]
 exclude = '^(build/|jNO\.egg-info/|runs/)'
 
-[tool.uv.sources]
-jax_bcat = { git = "https://github.com/armbrusl/jax_bcat" }
-jax_morph = { git = "https://github.com/armbrusl/jax_morph" }
-jax_mpp = { git = "https://github.com/armbrusl/jax_mpp" }
-jax_poseidon = { git = "https://github.com/FhG-IISB/jax_poseidon" }
-jax_pdeformer2 = { git = "https://github.com/FhG-IISB/jax_pdeformer2" }
-jax_walrus = { git = "https://github.com/FhG-IISB/jax_walrus" }
-"jax-fem" = { git = "https://github.com/FhG-IISB/jax-fem" }
-
 [dependency-groups]
-foundation = [
-    "jax_bcat",
-    "jax_morph",
-    "jax_mpp",
-    "jax_poseidon",
-    "jax_pdeformer2",
-    "jax_walrus",
-]
 fem = [
     "lineax",
     "jax-fem",
