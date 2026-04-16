@@ -77,7 +77,18 @@ class MLP(eqx.Module):
         if len(inputs) == 1:
             h = inputs[0]
         else:
-            h = jnp.concatenate(inputs, axis=-1)
+            arrays = [jnp.asarray(a) for a in inputs]
+
+            # Determine common broadcast shape for all axes except the final feature axis.
+            prefix_shapes = [a.shape[:-1] for a in arrays]
+            target_prefix = jnp.broadcast_shapes(*prefix_shapes)
+
+            broadcasted = []
+            for a in arrays:
+                target_shape = target_prefix + (a.shape[-1],)
+                broadcasted.append(jnp.broadcast_to(a, target_shape))
+
+            h = jnp.concatenate(broadcasted, axis=-1)
 
         # Hidden layers
         for i, layer in enumerate(self.hidden_layers):

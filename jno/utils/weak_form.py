@@ -22,7 +22,6 @@ from ..trace import (
     Assembly,
     GroupedAssembly,
     StateField,
-    WeakReduction,
 )
 
 
@@ -1382,10 +1381,21 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
 
 def _infer_solver_target(domain, expr):
     if _contains_temporal_derivative(expr):
-        raise NotImplementedError(
-            "Automatic time-target inference belongs to Phase 2. "
-            "For now, pass target='diffrax' or target='feax_time' after Phase 2 is added."
-        )
+        from .time_route import _contains_node_type
+        if (
+            _contains_node_type(expr, TestFunction)
+            or _contains_node_type(expr, TrialFunction)
+            or _contains_node_type(expr, StateField)
+        ):
+            if getattr(domain, "_feax_context", None) is not None:
+                return "feax_time"
+            raise ValueError(
+                "A time-dependent weak form was detected, but domain.init_fem(...) "
+                "has not been called. For transient weak forms, initialize FEM first "
+                "and use target='feax_time' (or let auto-inference choose it)."
+            )
+
+        return "diffrax"
 
     if _is_obviously_nonlinear_in_unknown(domain, expr):
         return "fem_residual"
@@ -1479,27 +1489,21 @@ def assemble_weak_form(domain, expr, target=None, **kwargs):
     if domain is None:
         domain = _infer_domain_from_expr(expr)
 
-    expr = _ensure_statefield_wrapped(domain, expr)
-
+    # IMPORTANT:
+    # Infer target first from the raw user expression.
     if target is None:
         target = _infer_solver_target(domain, expr)
 
+    # Strong-form Diffrax lowering should not go through weak/state wrapping.
+    if target == "diffrax":
+        from .time_route import _assemble_diffrax_from_strong_form
+        return _assemble_diffrax_from_strong_form(domain, expr, **kwargs)
+
+    # All weak/FEM/VPINN routes still use the wrapped weak expression path.
+    expr = _ensure_statefield_wrapped(domain, expr)
+
     if target == "vpinn":
-        u_net = kwargs.get("u_net", None)
-
-        has_trial = _contains_node_type(domain, expr, TrialFunction)
-
-        if has_trial and u_net is None:
-            raise ValueError(
-                "For target='vpinn', you must pass u_net=... when the weak form contains a TrialFunction."
-            )
-
-        ir = lower_weak_form(
-            domain,
-            expr,
-            trial_value=u_net,
-            for_target="vpinn",
-        )
+        ir = lower_weak_form(domain, expr, for_target="vpinn")
         return _assemble_vpinn_from_ir(ir, **kwargs)
 
     if target in {"fem_system", "fem_residual"}:
@@ -1511,11 +1515,15 @@ def assemble_weak_form(domain, expr, target=None, **kwargs):
         from .fem_route import _assemble_fem_residual_from_ir
         return _assemble_fem_residual_from_ir(domain, ir, **kwargs)
 
+    if target == "feax_time":
+        ir = lower_weak_form(domain, expr, for_target="fem")
+        from .time_route import _assemble_feax_time_from_ir
+        return _assemble_feax_time_from_ir(domain, ir, **kwargs)
+
     raise ValueError(
         f"Unknown assembly target '{target}'. "
-        "Supported in Phase 1: 'vpinn', 'fem_system', 'fem_residual'"
+        "Supported: 'vpinn', 'fem_system', 'fem_residual', 'feax_time', 'diffrax'"
     )
-
 
 def _assemble_vpinn_from_ir(ir: LoweredWeakForm, **kwargs):
     if (

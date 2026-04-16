@@ -709,11 +709,16 @@ class TraceEvaluator:
                     return False
                 # active sampled coordinates are typically (N, D)
                 return value.ndim >= 2
+            def point_axis(value):
+                # For sampled coordinates / fields the point axis is the
+                # second-last axis, not necessarily axis 0.
+                return value.ndim - 2
 
             # Determine N only from spatial point-set arrays, not parametric tags like GRF
             N = 1
             for k, v in ctx.context.items():
                 if is_spatial_pointset(k, v):
+                    ax = point_axis(v)
                     N = max(N, int(v.shape[0]))
 
             def grad_time_single(idx):
@@ -723,10 +728,18 @@ class TraceEvaluator:
                     if k == time_key:
                         continue  # replaced by differentiable t below
 
-                    if is_spatial_pointset(k, v) and int(v.shape[0]) == N:
-                        start_indices = (idx,) + (0,) * (v.ndim - 1)
-                        slice_sizes = (1,) + tuple(v.shape[1:])
-                        local_ctx[k] = jax.lax.dynamic_slice(v, start_indices, slice_sizes)
+                    if is_spatial_pointset(k, v):
+                        ax = point_axis(v)
+
+                        # Slice only true sampled point sets along their point axis.
+                        if int(v.shape[ax]) == N:
+                            start_indices = [0] * v.ndim
+                            slice_sizes = list(v.shape)
+                            start_indices[ax] = idx
+                            slice_sizes[ax] = 1
+                            local_ctx[k] = jax.lax.dynamic_slice(v, tuple(start_indices), tuple(slice_sizes),)
+                        else:
+                            local_ctx[k] = v
                     else:
                         # keep parametric tags like GRF untouched
                         local_ctx[k] = v
@@ -739,7 +752,10 @@ class TraceEvaluator:
                         ctx.key,
                         active_region=ctx.active_region,
                     )
-                    return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
+                    out = jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
+                    if out.ndim != 0:
+                        raise ValueError(f"Temporal derivative expected scalar output per point, got shape {out.shape}")
+                    return out
 
                 return jax.grad(u_of_t)(time_val)[0]
 

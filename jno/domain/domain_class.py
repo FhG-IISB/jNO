@@ -1593,8 +1593,25 @@ class domain(MeshIOMixin):
                 else:
                     self.add_tensor_tag(tag, sample)
         # auto-default for the initial slice in time-dependent problems
-        if time_value is None and tag == "initial" and self._is_time_dependent and self.time is not None:
-            time_value = self.time[0]
+        # Public API expectation:
+        #   x0, y0, t0 = domain.variable("initial")
+        #
+        # In many time-dependent examples there is no separately sampled spatial
+        # tag called "initial"; users usually mean:
+        #   - use the same spatial support as "interior"
+        #   - but pin time to t = t0
+        #
+        # So if "initial" is requested and not already materialized as its own
+        # spatial tag, transparently fall back to "interior".
+        source_tag = tag
+        if tag == "initial" and self._is_time_dependent and self.time is not None:
+            if time_value is None:
+                time_value = self.time[0]
+
+            # If there is no explicit spatial tag called "initial", reuse the
+            # interior spatial coordinates and only specialize the time slice.
+            if tag not in self.context and "interior" in self.context:
+                tag = "interior"
 
         if tag in self._mesh_pool.keys() and isinstance(sample, tuple) and len(sample) > 0 and isinstance(sample[0], (int, type(None))):
             # Sample points for this tag on demand
@@ -2257,7 +2274,9 @@ class domain(MeshIOMixin):
                     else:
                         idx = np.arange(n_available)
 
-                if is_time_dep:
+                is_time_expanded = (getattr(available_points, "ndim", 0) == 3)
+
+                if is_time_expanded:
                     all_samples.append(available_points[:, idx, :])
                 else:
                     all_samples.append(available_points[idx])
@@ -2266,12 +2285,12 @@ class domain(MeshIOMixin):
                     all_normals.append(available_normals[idx])
 
             stacked = np.stack(all_samples, axis=0)
-            if not is_time_dep:
+            if not is_time_expanded:
                 stacked = stacked[:, np.newaxis, :, :]
             nrm_stacked = None
             if normals_available and normals:
                 nrm_stacked = np.stack(all_normals, axis=0)
-                if not is_time_dep:
+                if not is_time_expanded:
                     nrm_stacked = nrm_stacked[:, np.newaxis, :, :]
             return stacked, nrm_stacked
         else:
@@ -2283,7 +2302,9 @@ class domain(MeshIOMixin):
                 else:
                     idx = np.arange(n_available)
 
-            if is_time_dep:
+            is_time_expanded = (getattr(available_points, "ndim", 0) == 3)
+
+            if is_time_expanded:
                 sampled_pts = available_points[:, idx, :]
             else:
                 sampled_pts = available_points[idx][np.newaxis, :, :]
@@ -2296,7 +2317,7 @@ class domain(MeshIOMixin):
             nrm_result = None
             if normals_available and normals:
                 sampled_nrm = available_normals[idx]
-                if not is_time_dep:
+                if not is_time_expanded:
                     sampled_nrm = sampled_nrm[np.newaxis, :, :]
                 nrm_result = np.broadcast_to(
                     sampled_nrm[np.newaxis, ...],

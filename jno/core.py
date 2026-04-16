@@ -28,7 +28,8 @@ from .trace import (
     ConstantNamespace,
     Tracker,
     StateField,
-    WeakReduction,
+    Assembly,
+    GroupedAssembly,
     collect_operations,
     collect_tags,
     get_primary_tag,
@@ -471,52 +472,70 @@ class core:
 
         return DomainData(context=context, dimension=domain.dimension,)
     #Vpinn helpers
-    
-    def _materialize_weak_reduction(self, node):
+    def _is_marked_weak(self, node) -> bool:
+        return isinstance(node, Placeholder) and bool(getattr(node, "_is_weak_expr", False))
+
+    def _materialize_marked_weak(self, node, parent_is_weak: bool = False):
         from .utils.weak_form import assemble_weak_form
 
-        if isinstance(node, WeakReduction):
-            #print(f"DEBUG WeakReduction materialized: reduction={node.reduction}")
-            assembled = assemble_weak_form(self.domain, node.expr, target="vpinn")
-            if node.reduction == "mse":
-                return assembled.mse
-            if node.reduction == "mae":
-                return assembled.mae
-            raise ValueError(f"Unsupported weak reduction '{node.reduction}'.")
+        if node is None:
+            return None
 
+        is_weak = self._is_marked_weak(node)
+
+        # Recurse through ordinary wrappers first.
         if isinstance(node, BinaryOp):
-            left = self._materialize_weak_reduction(node.left)
-            right = self._materialize_weak_reduction(node.right)
+            left = self._materialize_marked_weak(node.left, parent_is_weak=is_weak)
+            right = self._materialize_marked_weak(node.right, parent_is_weak=is_weak)
             if left is not node.left or right is not node.right:
-                return BinaryOp(node.op, left, right)
-            return node
+                rebuilt = BinaryOp(node.op, left, right)
+                if is_weak:
+                    setattr(rebuilt, "_is_weak_expr", True)
+                    setattr(rebuilt, "_weak_root_id", getattr(node, "_weak_root_id", None))
+                node = rebuilt
 
-        if isinstance(node, FunctionCall):
+        elif isinstance(node, FunctionCall):
             new_args = []
             changed = False
             for a in node.args:
                 if isinstance(a, Placeholder):
-                    na = self._materialize_weak_reduction(a)
+                    na = self._materialize_marked_weak(a, parent_is_weak=is_weak)
                     changed = changed or (na is not a)
                     new_args.append(na)
                 else:
                     new_args.append(a)
             if changed:
-                return node.copy_with_args(new_args)
-            return node
+                rebuilt = FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
+                if is_weak:
+                    setattr(rebuilt, "_is_weak_expr", True)
+                    setattr(rebuilt, "_weak_root_id", getattr(node, "_weak_root_id", None))
+                node = rebuilt
 
-        if isinstance(node, OperationDef):
-            new_expr = self._materialize_weak_reduction(node.expr)
+        elif isinstance(node, OperationDef):
+            new_expr = self._materialize_marked_weak(node.expr, parent_is_weak=is_weak)
             if new_expr is not node.expr:
-                return OperationDef(new_expr)
-            return node
+                rebuilt = OperationDef(new_expr)
+                rebuilt.name = getattr(node, "name", None)
+                if is_weak:
+                    setattr(rebuilt, "_is_weak_expr", True)
+                    setattr(rebuilt, "_weak_root_id", getattr(node, "_weak_root_id", None))
+                node = rebuilt
+
+        elif isinstance(node, Tracker):
+            new_expr = self._materialize_marked_weak(node.expr, parent_is_weak=is_weak)
+            if new_expr is not node.expr:
+                rebuilt = Tracker(new_expr, interval=node.interval)
+                if is_weak:
+                    setattr(rebuilt, "_is_weak_expr", True)
+                    setattr(rebuilt, "_weak_root_id", getattr(node, "_weak_root_id", None))
+                node = rebuilt
+
+        # Replace only the OUTERMOST marked weak subtree, after wrapper recursion.
+        if self._is_marked_weak(node) and not parent_is_weak:
+            return assemble_weak_form(self.domain, node, target="vpinn")
 
         return node
 
-    def _materialize_all_weak_reductions(self, constraints):
-        #print("DEBUG entering _materialize_all_weak_reductions")
-        return [self._materialize_weak_reduction(c) for c in constraints]
-    
     # Training
     def _make_loss_fn(self, compiled_constraints_fn, n_constraints, batchsize, frozen, static, checkpoint_gradients=False, min_consecutive=1):
         """Create loss function — evaluates ALL constraints in one combined call."""
@@ -789,7 +808,7 @@ class core:
 
         # === Preprocessing ===
         # Check if its Vpinn and routes accordingly
-        constraints_in = self._materialize_all_weak_reductions(self.constraints)
+        constraints_in = [self._materialize_marked_weak(c) for c in self.constraints]
         constraints = self.wrap_constraints(constraints_in)
 
         # === Collect operations and tags ===

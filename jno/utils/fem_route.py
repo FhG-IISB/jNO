@@ -27,7 +27,6 @@ from ..trace import (
     Assembly,
     GroupedAssembly,
     StateField,
-    WeakReduction,
     FemResidualOperator,
     FemLinearSystem,
 )

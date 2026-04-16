@@ -48,7 +48,6 @@ __all__ = [
     "FemLinearSystem",
     "FemResidualOperator",
     "StateField",
-    "WeakReduction",
 ]
 
 # Global counter for unique operation IDs
@@ -83,6 +82,27 @@ def _contains_node_type_local(node, cls) -> bool:
                     return True
     return False
 
+def _mark_weak(node, root_id=None):
+    if root_id is None:
+        root_id = getattr(node, "op_id", id(node))
+    setattr(node, "_is_weak_expr", True)
+    setattr(node, "_weak_root_id", root_id)
+    return node
+
+
+def _propagate_weak(node, *children):
+    # 1) If any child is already marked weak, propagate the same weak root id.
+    weak_children = [c for c in children if getattr(c, "_is_weak_expr", False)]
+    if weak_children:
+        root_id = getattr(weak_children[0], "_weak_root_id", None)
+        return _mark_weak(node, root_id=root_id)
+
+    # 2) Otherwise seed the weak marker if this newly built node now contains
+    #    TestFunction / TrialFunction / StateField anywhere underneath.
+    if _looks_like_weak_expression(node):
+        return _mark_weak(node)
+
+    return node
 
 def _looks_like_weak_expression(node) -> bool:
     return (
@@ -325,8 +345,6 @@ class Placeholder:
 
     @property
     def mse(self) -> FunctionCall:
-        if _looks_like_weak_expression(self):
-            return WeakReduction(self, reduction="mse")
         def fn(x):
             return jnp.squeeze(jnp.mean(jnp.square(x)))
 
@@ -334,8 +352,6 @@ class Placeholder:
 
     @property
     def mae(self) -> FunctionCall:
-        if _looks_like_weak_expression(self):
-            return WeakReduction(self, reduction="mae")
         return FunctionCall(lambda x: jnp.squeeze(jnp.mean(jnp.abs(x))), [self], "mae", True)
 
     @property
@@ -442,6 +458,9 @@ class FunctionCall(Placeholder):
         self._name = name
         self.reduces_axis = reduces_axis
         self.kwargs = kwargs
+        weak_children = [a for a in self.args if isinstance(a, Placeholder)]
+        if not self.reduces_axis:
+            _propagate_weak(self, *weak_children)
 
     def __repr__(self):
         name = self._name or getattr(self.fn, "__name__", str(self.fn))
@@ -859,6 +878,7 @@ class BinaryOp(Placeholder):
         self.op = op
         self.left = left
         self.right = right
+        _propagate_weak(self, left, right)
 
     def __repr__(self):
         return f"({self.left} {self.op} {self.right})"
@@ -1670,6 +1690,8 @@ class Hessian(Placeholder):
         self.variables = variables if isinstance(variables, list) else [variables]
         self.scheme = scheme
         self.trace = trace  # True → Laplacian (sum of diagonal)
+        weak_vars = [v for v in self.variables if isinstance(v, Placeholder)]
+        _propagate_weak(self, target, *weak_vars)
 
     def __repr__(self):
         var_names = ", ".join(str(v) for v in self.variables)
@@ -1694,7 +1716,9 @@ class Jacobian(Placeholder):
         self.target = target
         self.variables = variables if isinstance(variables, list) else [variables]
         self.scheme = scheme
-
+        weak_vars = [v for v in self.variables if isinstance(v, Placeholder)]
+        _propagate_weak(self, target, *weak_vars)
+    
     def __repr__(self):
         var_names = ", ".join(str(v) for v in self.variables)
         return f"Jacobian({self.target}, [{var_names}])"
@@ -1777,22 +1801,6 @@ class StateField(Placeholder):
 
     def __repr__(self):
         return f"StateField(name={self.name!r}, id={self.state_id}, shape={self.value_shape})"
-
-class WeakReduction(Placeholder):
-    """Deferred VPINN reduction for weak-form expressions.
-
-    Example internal flow:
-        weak.mse  -> WeakReduction(weak, "mse")
-        core.compile() materializes it to:
-            assemble_weak_form(..., target='vpinn').mse
-    """
-
-    def __init__(self, expr: Placeholder, reduction: str = "mse"):
-        self.expr = expr
-        self.reduction = str(reduction)
-
-    def __repr__(self):
-        return f"WeakReduction({self.reduction}, expr={self.expr})"
 
 class TrialFunction(Placeholder):
     """
