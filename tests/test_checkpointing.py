@@ -2,6 +2,7 @@
 
 import os
 import pytest
+import foundax
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -23,7 +24,7 @@ def _make_solver(epochs=10):
     x, _ = domain.variable("interior")
 
     key = jax.random.PRNGKey(0)
-    u_net = jnn.nn.mlp(1, hidden_dims=8, num_layers=2, key=key)
+    u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=8, num_layers=2, key=key))
     u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 100, 1e-5))
     u = u_net(x) * x * (1 - x)
     pde = jnn.laplacian(u, [x]) - jnn.sin(jnn.pi * x)
@@ -381,8 +382,8 @@ class TestEarlyStoppingCallback:
         """Training should terminate before max epochs when loss plateaus."""
         from jno.utils.callbacks import EarlyStoppingCallback
 
-        # patience=3 so it stops quickly
-        cb = EarlyStoppingCallback(patience=3, min_delta=0.0, verbose=False)
+        # patience=3 so it stops quickly; min_delta large enough to detect plateau
+        cb = EarlyStoppingCallback(patience=3, min_delta=1e-3, verbose=False)
         solver = _make_solver(epochs=0)
         solver.solve(200, callbacks=[cb])
 

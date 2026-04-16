@@ -21,6 +21,7 @@ Parameters: ε = 0.1  (interface width)
 import jax
 import jno
 
+import foundax
 import optax
 from jno import LearningRateSchedule as lrs
 
@@ -45,30 +46,33 @@ coeff = 2 * eps**2 * π**2 - 2
 source = exp(-t) * S * coeff + exp(-3 * t) * S**3
 
 # ── Network ───────────────────────────────────────────────────────────────────
-net = jno.np.nn.mlp(
-    in_features=3,
-    hidden_dims=40,
-    num_layers=3,
+net = jno.nn.wrap(foundax.deeponet(
+    n_sensors=1,
+    coord_dim=2,
+    n_outputs=1,
+    n_layers=3,
+    basis_functions=64,
+    hidden_dim=40,
     key=jax.random.PRNGKey(42),
-)
+))
 net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(10, 1, 1e-3, 1e-5))
 
-txy = jno.np.concat([t, x, y])
-u = net(txy) * x * (1 - x) * y * (1 - y)
+xy = jno.np.concat([x, y])
+u = net(t, xy) * x * (1 - x) * y * (1 - y)
 
 # ── PDE residual ──────────────────────────────────────────────────────────────
 pde = jno.np.grad(u, t) - eps**2 * jno.np.laplacian(u, [x, y]) - u + u**3 - source
 
 # ── Initial condition  (t=0 via 0*t trick) ──────────────────────────────────
-u_at_0 = net(jno.np.concat([0 * t, x, y])) * x * (1 - x) * y * (1 - y)
+u_at_0 = net(0 * t, xy) * x * (1 - x) * y * (1 - y)
 ini = u_at_0 - sin(π * x) * sin(π * y)
 
 # ── Solve ─────────────────────────────────────────────────────────────────────
 crux = jno.core([pde.mse, ini.mse], domain)
 
 print(f"Allen–Cahn 2-D  (ε={eps})")
-history = crux.solve(10)
+history = crux.solve(5000)
 
 _u, _u_exact = crux.eval([u, u_exact])
 rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_exact) + 1e-8))
-assert rel_l2 < 1.1, f"relative L2 error too large: {rel_l2:.3e}"
+assert rel_l2 < 1e-1, f"relative L2 error too large: {rel_l2:.3e}"

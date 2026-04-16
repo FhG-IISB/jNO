@@ -21,6 +21,7 @@ Architecture: Input → [MgConv V-cycle + skip]×num_layer → 1×1-Conv → Out
 import jax
 import jno
 
+import foundax
 import optax
 
 KEY = jax.random.PRNGKey(0)
@@ -37,7 +38,7 @@ _u = domain.variable("_u")  # (S, 1, 1, H, W, 1)
 # ── Model ─────────────────────────────────────────────────────────────────────
 # input_shape spatial dims must be divisible by 2^(num_levels-1)
 # with num_iteration=[[1,1]]*5, num_levels=5, requires GRID divisible by 16
-u = jno.np.nn.mgno2d(
+u = jno.nn.wrap(foundax.mgno2d(
     input_shape=(GRID, GRID),
     num_layer=5,
     num_channel_u=24,
@@ -47,7 +48,7 @@ u = jno.np.nn.mgno2d(
     activation="gelu",
     padding_mode="SAME",  # SAME padding for Dirichlet BC (non-periodic)
     key=KEY,
-)
+))
 
 # ── Constraint & solver ───────────────────────────────────────────────────────
 crux = jno.core([(_u - u(_f)).mse], domain)

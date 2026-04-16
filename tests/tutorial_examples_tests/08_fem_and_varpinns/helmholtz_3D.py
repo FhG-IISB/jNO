@@ -10,6 +10,7 @@ from scipy.spatial import cKDTree
 
 import jno
 
+import foundax
 import numpy as np
 from jno import LearningRateSchedule as lrs
 
@@ -178,13 +179,13 @@ xt, yt, zt, _ = train_domain.variable("gauss_top", split=True)
 xw, yw, zw, _ = train_domain.variable("gauss_wall", split=True)
 x_int, y_int, z_int, _ = train_domain.variable("interior", split=True)
 
-net = jno.np.nn.mlp(
+net = jno.nn.wrap(foundax.mlp(
     3,
     hidden_dims=32,
     num_layers=4,
     activation=jax.nn.tanh,
     key=jax.random.PRNGKey(0),
-)
+))
 
 
 def apply_hard_bc(u_pred, x, y, z):

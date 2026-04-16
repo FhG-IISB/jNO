@@ -1,4 +1,5 @@
 import numpy as np
+
 """
 FNO2D Poisson Operator Learning With Reference Comparison
 =========================================================
@@ -28,6 +29,7 @@ through the operator architectures one at a time.
 import jax
 import jax.numpy as jnp
 import jno
+import foundax
 import numpy as np
 import optax
 
@@ -131,13 +133,12 @@ def relative_l2(prediction: np.ndarray, target: np.ndarray) -> float:
     return float(np.linalg.norm((prediction - target).ravel()) / target_norm)
 
 
-
 def main():
     domain = build_training_domain(SAMPLES, GRID)
     forcing_train = domain.variable("_f")
     solution_train = domain.variable("_u")
 
-    model = jno.np.nn.fno2d(
+    model = jno.nn.wrap(foundax.fno2d(
         in_features=1,
         hidden_channels=48,
         n_modes=24,
@@ -148,7 +149,7 @@ def main():
         norm="layer",
         activation=jnp.tanh,
         key=KEY,
-    )
+    ))
     model.optimizer(optax.chain(optax.clip_by_global_norm(1e-3), optax.adamw(1.0, weight_decay=1e-6)))
     model.lr(jno.schedule.learning_rate.cosine(EPOCHS, 5e-4, 1e-7))
 

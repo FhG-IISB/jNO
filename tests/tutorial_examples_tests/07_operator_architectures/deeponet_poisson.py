@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 import jno
 
+import foundax
 import numpy as np
 import optax
 
@@ -51,7 +52,7 @@ _u_flat = _u.reshape((1, N, 1))  # (1, N, 1) target per sample
 # ── Model ─────────────────────────────────────────────────────────────────────
 # branch: encodes f sampled at N sensor points (N, 1)
 # trunk:  encodes 2D query coordinates (N, 2)
-u = jno.np.nn.deeponet(
+u = jno.nn.wrap(foundax.deeponet(
     branch_type="mlp",
     trunk_type="mlp",
     combination_type="dot",
@@ -63,7 +64,7 @@ u = jno.np.nn.deeponet(
     hidden_dim=128,
     n_layers=4,
     key=KEY,
-)
+))
 
 # ── Constraint & solver ───────────────────────────────────────────────────────
 # u(branch_input, trunk_input) → (N, 1) predictions at query points

@@ -9,7 +9,7 @@ description = "Jax Neural Operators"
 readme = "README.md"
 requires-python = ">=3.11, <3.14"
 authors = [{ name = "Leon Armbruster", email = "leon.armbruster@iisb.fraunhofer.de" }]
-license = "MIT"
+license = "EPL-2.0"
 classifiers = [
     "Intended Audience :: Science/Research",
     "Topic :: Scientific/Engineering :: Mathematics",
@@ -20,6 +20,7 @@ dependencies = [
     "equinox",
     "optax",
     "orbax-checkpoint",
+    "foundax",
 
     "pygmsh",
     "cloudpickle",
@@ -77,22 +78,7 @@ line-length = 250
 [tool.mypy]
 exclude = '^(build/|jNO\.egg-info/|runs/)'
 
-[tool.uv.sources]
-jax_morph = { git = "https://github.com/armbrusl/jax_morph" }
-jax_mpp = { git = "https://github.com/armbrusl/jax_mpp" }
-jax_poseidon = { git = "https://github.com/FhG-IISB/jax_poseidon" }
-jax_pdeformer2 = { git = "https://github.com/FhG-IISB/jax_pdeformer2" }
-jax_walrus = { git = "https://github.com/FhG-IISB/jax_walrus" }
-"jax-fem" = { git = "https://github.com/FhG-IISB/jax-fem" }
-
 [dependency-groups]
-foundation = [
-    "jax_morph",
-    "jax_mpp",
-    "jax_poseidon",
-    "jax_pdeformer2",
-    "jax_walrus",
-]
 fem = [
     "lineax",
     "jax-fem",

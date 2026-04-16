@@ -4,6 +4,7 @@ import pytest
 import jax
 import jax.numpy as jnp
 import equinox as eqx
+import foundax
 
 from jno.trace import (
     Literal,
@@ -178,7 +179,7 @@ class TestRegressions:
         dom = jno.domain(constructor=jno.domain.rect(mesh_size=0.5))
         x, y, _ = dom.variable("interior")
 
-        net = jnn.nn.mlp(in_features=2, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(0))
+        net = jnn.nn.wrap(foundax.mlp(in_features=2, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(0)))
         net.optimizer(optax.adam(1e-3))
 
         raw = net(jnn.concat([x, y], axis=-1))
@@ -209,7 +210,7 @@ def _make_solver():
     x, t = domain.variable("interior")
 
     key = jax.random.PRNGKey(0)
-    u_net = jnn.nn.mlp(1, hidden_dims=32, num_layers=2, key=key)
+    u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=32, num_layers=2, key=key))
     u = u_net(x) * x * (1 - x)
     pde = jnn.laplacian(u, [x]) - jnn.sin(jnn.pi * x)
 
@@ -313,6 +314,7 @@ class TestMemoryStrategies:
         assert 1 <= logs["losses"].shape[0] <= 20
         assert jnp.isfinite(logs["total_loss"][-1])
 
+    @pytest.mark.serial
     def test_offload_data_with_batchsize(self):
         """Host-resident data: stream mini-batches each step."""
         import optax
@@ -341,6 +343,7 @@ class TestMemoryStrategies:
         logs = stats.training_logs[-1]
         assert jnp.isfinite(logs["total_loss"][-1])
 
+    @pytest.mark.serial
     def test_checkpoint_and_offload_combined(self):
         """Both checkpoint_gradients and offload_data active together."""
         import optax
@@ -423,7 +426,7 @@ class TestParamMask:
         domain = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.05))
         x, *_ = domain.variable("interior")
         key = jax.random.PRNGKey(0)
-        u_net = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key)
+        u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key))
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x])
         param_mask = mask_fn(u_net.module)
@@ -501,7 +504,7 @@ class TestParamMask:
             domain = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.05))
             x, *_ = domain.variable("interior")
             key = jax.random.PRNGKey(seed)
-            u_net = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key)
+            u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key))
             return u_net, domain, jno.core([jnn.laplacian(u_net(x) * x * (1 - x), [x]).mse], domain)
 
         u_masked, dom_m, solver_m = make_masked(7)
@@ -534,7 +537,7 @@ class TestParamMask:
         domain = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.05))
         x, *_ = domain.variable("interior")
         key = jax.random.PRNGKey(0)
-        u_net = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key)
+        u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key))
 
         all_false = jax.tree_util.tree_map(lambda _: False, u_net.module)
         partial_mask = eqx.tree_at(
@@ -596,10 +599,10 @@ def test_mask_initialize_freeze_lora_combined():
 
     # ── u_net: mask (output layer only) + initialize from pytree ─────
     key_u = jax.random.PRNGKey(0)
-    u_net = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key_u)
+    u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key_u))
 
     # Create "pretrained" weights from a different seed
-    pretrained = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(99))
+    pretrained = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(99)))
 
     # Mask marks parameters to freeze via mask(...).freeze().
     all_false_u = jax.tree_util.tree_map(lambda _: False, u_net.module)
@@ -616,7 +619,7 @@ def test_mask_initialize_freeze_lora_combined():
 
     # ── v_net: mask + freeze + lora  (LoRA takes priority over freeze) ──
     key_v = jax.random.PRNGKey(1)
-    v_net = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key_v)
+    v_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key_v))
 
     all_false_v = jax.tree_util.tree_map(lambda _: False, v_net.module)
     mask_v = eqx.tree_at(
@@ -742,7 +745,7 @@ def test_nnx_freeze():
     frozen_net.freeze()
 
     # need at least one trainable model → add a small equinox MLP
-    train_net = jnn.nn.mlp(1, output_dim=1, hidden_dims=4, num_layers=1, key=jax.random.PRNGKey(99))
+    train_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=4, num_layers=1, key=jax.random.PRNGKey(99)))
     train_net.optimizer(optax.adam, lr=lrs(1e-3))
 
     u_frozen = frozen_net(x) * x * (1 - x)
@@ -865,6 +868,7 @@ def test_nnx_initialize_from_pytree():
 class TestGradientAccumulation:
     """Tests for accumulation_steps parameter in core.solve()."""
 
+    @pytest.mark.serial
     def test_accumulation_runs_end_to_end(self):
         """accumulation_steps=2 with batchsize completes without error."""
         import optax
@@ -878,6 +882,7 @@ class TestGradientAccumulation:
         assert logs["losses"].ndim == 2
         assert jnp.isfinite(logs["total_loss"][-1])
 
+    @pytest.mark.serial
     def test_accumulation_with_offload_data(self):
         """accumulation_steps works together with offload_data=True."""
         import optax

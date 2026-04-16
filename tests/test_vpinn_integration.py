@@ -3,6 +3,7 @@
 import pytest
 import jax
 import jax.numpy as jnp
+import foundax
 import jno
 import jno.jnp_ops as jnn
 from jno.trace import dump_tree
@@ -41,24 +42,28 @@ def init_vpinn_fem(dom, with_neumann_tags=True):
 
 def make_scalar_net():
     key = jax.random.PRNGKey(0)
-    return jnn.nn.mlp(
-        2,
-        hidden_dims=32,
-        num_layers=2,
-        activation=jax.nn.tanh,
-        key=key,
+    return jnn.nn.wrap(
+        foundax.mlp(
+            2,
+            hidden_dims=32,
+            num_layers=2,
+            activation=jax.nn.tanh,
+            key=key,
+        )
     )
 
 
 def make_vector_net():
     key = jax.random.PRNGKey(0)
-    return jnn.nn.mlp(
-        2,
-        hidden_dims=32,
-        num_layers=2,
-        activation=jax.nn.tanh,
-        key=key,
-        output_dim=2,
+    return jnn.nn.wrap(
+        foundax.mlp(
+            2,
+            hidden_dims=32,
+            num_layers=2,
+            activation=jax.nn.tanh,
+            key=key,
+            output_dim=2,
+        )
     )
 
 

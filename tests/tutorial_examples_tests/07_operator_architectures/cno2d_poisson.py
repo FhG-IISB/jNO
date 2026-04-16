@@ -24,6 +24,7 @@ Reference: Raonić et al. "Convolutional Neural Operators" (2023)
 import jax
 import jno
 
+import foundax
 import optax
 
 KEY = jax.random.PRNGKey(0)
@@ -39,7 +40,7 @@ _u = domain.variable("_u")  # (S, 1, 1, H, W, 1)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 # size must match the spatial resolution (GRID)
-u = jno.np.nn.cno2d(
+u = jno.nn.wrap(foundax.cno2d(
     in_dim=1,
     out_dim=1,
     size=GRID,
@@ -49,7 +50,7 @@ u = jno.np.nn.cno2d(
     channel_multiplier=16,
     use_bn=True,
     key=KEY,
-)
+))
 
 # ── Constraint & solver ───────────────────────────────────────────────────────
 crux = jno.core([(_u - u(_f)).mse], domain)

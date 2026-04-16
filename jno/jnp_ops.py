@@ -231,7 +231,41 @@ def concat(items, axis: int = -1) -> FunctionCall:
 
     def _fn(*args):
         expanded = [a[..., jnp.newaxis] if a.ndim == 1 else a for a in args]
-        return jnp.concatenate(expanded, axis=-1)
+
+        # Fast path when shapes already match on non-concatenation dims.
+        if len(expanded) > 1:
+            ref = expanded[0].shape[:-1]
+            if all(a.shape[:-1] == ref for a in expanded[1:]):
+                return jnp.concatenate(expanded, axis=-1)
+
+        # Fallback: align ranks and only broadcast singleton dimensions.
+        # This supports temporal/scalar-like inputs while avoiding expensive
+        # symbolic shape broadcasting during tracing.
+        max_ndim = max(a.ndim for a in expanded)
+        aligned = []
+        for a in expanded:
+            if a.ndim < max_ndim:
+                a = a.reshape((1,) * (max_ndim - a.ndim) + a.shape)
+            aligned.append(a)
+
+        target_prefix = list(aligned[0].shape[:-1])
+        for a in aligned[1:]:
+            shp = a.shape[:-1]
+            if len(shp) != len(target_prefix):
+                raise ValueError(f"concat rank mismatch: {len(shp)} vs {len(target_prefix)}")
+            for i, (t, s) in enumerate(zip(target_prefix, shp)):
+                if t == s:
+                    continue
+                if t == 1:
+                    target_prefix[i] = s
+                elif s == 1:
+                    continue
+                else:
+                    raise ValueError(f"concat cannot broadcast dim {i}: {t} vs {s}")
+
+        target_prefix = tuple(target_prefix)
+        broadcasted = [jnp.broadcast_to(a, target_prefix + (a.shape[-1],)) for a in aligned]
+        return jnp.concatenate(broadcasted, axis=-1)
 
     return FunctionCall(_fn, list(items), name="concat")
 

@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import optax
 import pytest
 
+import foundax
 import jno
 import jno.jnp_ops as jnn
 from jno import LearningRateSchedule as lrs
@@ -60,7 +61,7 @@ def _build_solver(strategy: ResamplingStrategy, *, time: tuple[float, float, int
     )
 
     key = jax.random.PRNGKey(0)
-    u_net = jnn.nn.mlp(1, hidden_dims=16, num_layers=2, key=key)
+    u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=16, num_layers=2, key=key))
     u = u_net(x) * x * (1.0 - x)
     pde = jnn.laplacian(u, [x]) - jnn.sin(jnn.pi * x)
 
@@ -97,7 +98,7 @@ def _build_solver_nd(
     coords = vars_all[:spatial_dim]
 
     key = jax.random.PRNGKey(7)
-    u_net = jnn.nn.mlp(spatial_dim, hidden_dims=16, num_layers=2, key=key)
+    u_net = jnn.nn.wrap(foundax.mlp(spatial_dim, hidden_dims=16, num_layers=2, key=key))
     u = u_net(*coords)
     for c in coords:
         u = u * c * (1.0 - c)
@@ -311,7 +312,7 @@ def test_solve_resampling_works_with_adaptive_weight_wrapped_losses():
     )
 
     key = jax.random.PRNGKey(0)
-    u_net = jnn.nn.mlp(1, hidden_dims=16, num_layers=2, key=key)
+    u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=16, num_layers=2, key=key))
     u = u_net(x) * x * (1.0 - x)
 
     pde = (jnn.laplacian(u, [x]) - jnn.sin(jnn.pi * x)).mse

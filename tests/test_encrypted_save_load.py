@@ -54,6 +54,7 @@ def _sig_path(filepath: str) -> str:
 
 def _make_solver():
     """Build and briefly train a minimal 1-D Laplace solver."""
+    import foundax
     import optax
     import jno
     import jno.jnp_ops as jnn
@@ -63,7 +64,7 @@ def _make_solver():
     x, _ = domain.variable("interior")
 
     key = jax.random.PRNGKey(42)
-    u_net = jnn.nn.mlp(1, hidden_dims=16, num_layers=2, key=key)
+    u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=16, num_layers=2, key=key))
     u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 100, 1e-5))
     u = u_net(x) * x * (1 - x)
     pde = jnn.laplacian(u, [x]) - jnn.sin(jnn.pi * x)

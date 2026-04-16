@@ -4,16 +4,16 @@
 
 <p align="center">
     <a href="https://fhg-iisb.github.io/jNO_docs/">
-        <img src="https://img.shields.io/badge/docs-GitHub%20Pages-0aa?style=for-the-badge" alt="Docs"/>
+        <img src="https://img.shields.io/badge/docs-GitHub%20Pages-0aa?style=for-the-badge" alt="Dev Docs"/>
     </a>
     <a href="https://fhg-iisb.github.io/jNO_docs/Tutorials/">
-        <img src="https://img.shields.io/badge/tutorials-step_by_step-0b8f7a?style=for-the-badge" alt="Tutorials"/>
+        <img src="https://img.shields.io/badge/tutorials-step_by_step-0b8f7a?style=for-the-badge" alt="Dev Tutorials"/>
     </a>
     <a href="https://github.com/FhG-IISB/jno/actions/workflows/python-package.yml">
         <img src="https://img.shields.io/github/actions/workflow/status/FhG-IISB/jno/python-package.yml?branch=main&style=for-the-badge&label=tests" alt="Tests"/>
     </a>
     <a href="LICENSE">
-        <img src="https://img.shields.io/badge/license-MIT-2ea44f?style=for-the-badge" alt="License"/>
+        <img src="https://img.shields.io/badge/license-EPL--2.0-2ea44f?style=for-the-badge" alt="License"/>
     </a>
     <a href="CITATION.cff">
         <img src="https://img.shields.io/badge/cite-CITATION.cff-6b5b95?style=for-the-badge" alt="Citation"/>
@@ -23,7 +23,6 @@
 
 Warning: This is a research-level repository. It may contain bugs and is subject to continuous change without notice.
 
-jNO (jax Neural Operators) is a JAX-native library for neural operators and foundation models with unified support for both data-driven and physics-informed training. Its core design is a tracing system in which domains, model calls, residuals, supervised losses, and diagnostics are written in one symbolic language and compiled into one optimization pipeline. This allows users to move between operator regression, mesh-aware residual evaluation, and PDE-constrained training without restructuring the surrounding code. jNO also supports multi-model compositions, fine-grained control at parameter level (model, optimizer, and learning rate), hyperparameter tuning, and JAX-native workflows for translated PDE foundation-model families.
 
 # Install
 
@@ -58,6 +57,7 @@ Create the following file
 import jno
 import jax
 import optax
+import foundax
 
 dir = jno.setup("./runs/test")
 
@@ -70,7 +70,8 @@ random_k = jax.random.uniform(jax.random.PRNGKey(0), shape=(500, 1, 1), minval=0
 k = dom.variable("k", random_k)
 
 # Neural Network
-net = jno.nn.deeponet(n_sensors=1, coord_dim=2, basis_functions=32, hidden_dim=128, activation=jax.numpy.tanh)
+fx = foundax.deeponet(n_sensors=1, coord_dim=2, basis_functions=32, hidden_dim=128, activation=jax.numpy.tanh)
+net = jno.nn.wrap(fx)
 net.optimizer(optax.adam(learning_rate=optax.schedules.cosine_decay_schedule(init_value=1e-3, decay_steps=20_000, alpha=1e-5)))
 
 # Forward pass and hard enforcement of BCs via output transformation
@@ -99,35 +100,13 @@ and then run with
 CUDA_VISIBLE_DEVICES=<gpu_id> JNO_SEED=<seed> python <filename>.py
 ```
 
-### Foundation Models
+### Foundation Models and other neural networks
 
-These models are maintained as separate repositories so they can also be used independently.
-If installed, you can access them via:
+These models are maintained in a seperate repository ([foundax](https://github.com/FhG-IISB/foundax)) so they can also be used independently.
 
-```python
-jno.nn.<model_name>
+```bash
+pip install foundax
 ```
-
-to use a foundation model install one or more of the following repositories (they can also be used as standalone repos without jNO).
-
-<p>
-    <a href="https://github.com/FhG-IISB/jax_poseidon">
-        <img src="https://img.shields.io/badge/jax_poseidon-1f6feb?style=for-the-badge" alt="jax_poseidon"/>
-    </a>
-    <a href="https://github.com/FhG-IISB/jax_walrus">
-        <img src="https://img.shields.io/badge/jax_walrus-1f6feb?style=for-the-badge" alt="jax_walrus"/>
-    </a>
-    <a href="https://github.com/FhG-IISB/jax_pdeformer2">
-        <img src="https://img.shields.io/badge/jax_pdeformer2-1f6feb?style=for-the-badge" alt="jax_pdeformer2"/>
-    </a>
-    <a href="https://github.com/FhG-IISB/jax_morph">
-        <img src="https://img.shields.io/badge/jax_morph-1f6feb?style=for-the-badge" alt="jax_morph"/>
-    </a>
-    <a href="https://github.com/FhG-IISB/jax_mpp">
-        <img src="https://img.shields.io/badge/jax_mpp-1f6feb?style=for-the-badge" alt="jax_mpp"/>
-    </a>
-</p>
-
 
 
 ## Citation

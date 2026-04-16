@@ -26,6 +26,7 @@ import equinox as eqx
 
 from .trace import (
     BinaryOp,
+    collect_tags,
     FunctionCall,
     Hessian,
     Jacobian,
@@ -701,6 +702,7 @@ class TraceCompiler:
         """
         TraceEvaluator = _get_evaluator_class()
         TIME_TAG = "__time__"
+        expr_tags = collect_tags(expr)
 
         def evaluate_single_point_set(params, context_single, key):
             """Evaluate for a single (N, D) context — no batch or time."""
@@ -720,7 +722,8 @@ class TraceCompiler:
                     from the batch dimension.
                 key: JAX random key for mini-batch and stochastic ops.
                 min_consecutive: Minimum number of consecutive time steps
-                    passed to the evaluator in one call.  Setting this >= T
+                    passed to the evaluator in one call.  ``None`` means use
+                    all available steps (``W=T``). Setting this >= T
                     passes all time steps at once (no loop, 2 AD passes).
                     Values > 1 require the model to accept a leading time
                     dimension (shape ``(W, N, D)`` instead of ``(N, D)``).
@@ -728,7 +731,7 @@ class TraceCompiler:
             context = context or {}
 
             # ----- tag ordering (stable across calls) -----------------
-            all_tags = set()
+            all_tags = set(expr_tags)
             for op in all_ops:
                 if hasattr(op, "_collected_vars"):
                     for var in op._collected_vars:
@@ -747,7 +750,7 @@ class TraceCompiler:
             # __time__ is (T, 1) — skip it when finding B.
             batched_sizes = []
             for tag, arr in zip(tag_order, ctx_tuple):
-                if tag == TIME_TAG:
+                if tag == TIME_TAG or tag not in expr_tags:
                     continue
                 if hasattr(arr, "ndim") and arr.ndim >= 1:
                     batched_sizes.append(arr.shape[0])
@@ -787,15 +790,22 @@ class TraceCompiler:
             time_arr = None  # will be set if __time__ is present
             time_idx_in_order = None
 
+            passive_ctx = {}
             spatial_tag_order = []
             spatial_ctx = []
             for i, (tag, arr) in enumerate(zip(tag_order, ctx_tuple)):
                 if tag == TIME_TAG:
                     time_arr = jnp.asarray(arr)  # (T, 1)
                     time_idx_in_order = i
-                else:
+                elif hasattr(arr, "ndim") and arr.ndim >= 1 and arr.shape[0] in (B, 1):
+                    # Include all arrays carrying a per-sample batch axis (size B or
+                    # broadcastable 1), regardless of whether they appear in expr_tags.
+                    # This covers FEM tensors (JxW, N_flat, …) that are accessed by the
+                    # evaluator via ctx.context directly and are not Variable-tagged.
                     spatial_tag_order.append(tag)
                     spatial_ctx.append(arr)
+                else:
+                    passive_ctx[tag] = arr
 
             spatial_tag_order = tuple(spatial_tag_order)
             spatial_ctx = tuple(spatial_ctx)
@@ -836,7 +846,7 @@ class TraceCompiler:
                     if hasattr(v, "ndim") and v.ndim >= 3:
                         T = max(T, v.shape[0])
 
-                W = max(1, min(min_consecutive, T))  # window size
+                W = T if min_consecutive is None else max(1, min(min_consecutive, T))  # window size
                 idx_dtype = jnp.int64 if jax.config.jax_enable_x64 else jnp.int32
                 zero_idx = jnp.asarray(0, dtype=idx_dtype)
 
@@ -854,15 +864,54 @@ class TraceCompiler:
                     windowed_ctx: tuple of (W, N, D) or non-spatial arrays.
                     t_wind: (W, 1) time slice, or dummy scalar when time_arr is None.
                     """
-                    ctx_dict = {}
-                    for tag, arr in zip(spatial_tag_order, windowed_ctx):
-                        if W == 1 and hasattr(arr, "ndim") and arr.ndim >= 2:
-                            ctx_dict[tag] = arr[0]  # (1, N, D) → (N, D) — scalar-step compat
-                        else:
-                            ctx_dict[tag] = arr  # (W, N, D)
-                    if time_arr is not None:
-                        ctx_dict[TIME_TAG] = t_wind[0] if W == 1 else t_wind
-                    return evaluate_single_point_set(params, ctx_dict, key=rng_key)
+                    if W > 1:
+                        # Vmap over the time-window dimension so each step
+                        # sees (N, D) spatial + (1,) time — identical to W=1.
+                        in_axes_list = []
+                        for arr in windowed_ctx:
+                            if hasattr(arr, "ndim") and arr.ndim >= 3:
+                                in_axes_list.append(0)
+                            else:
+                                in_axes_list.append(None)
+                        in_axes_list.append(0)  # for t_wind
+
+                        def _eval_single_step(*step_spatial_and_t):
+                            step_t = step_spatial_and_t[-1]
+                            step_spatial = step_spatial_and_t[:-1]
+                            ctx_dict = dict(passive_ctx)
+                            active_spatial_n = None
+                            for tag, step_arr in zip(spatial_tag_order, step_spatial):
+                                ctx_dict[tag] = step_arr
+                                if active_spatial_n is None and hasattr(step_arr, "ndim") and step_arr.ndim >= 1:
+                                    active_spatial_n = int(step_arr.shape[0])
+                            if active_spatial_n is not None:
+                                ctx_dict["__active_spatial_n__"] = active_spatial_n
+                            if time_arr is not None:
+                                ctx_dict[TIME_TAG] = step_t
+                            return evaluate_single_point_set(params, ctx_dict, key=rng_key)
+
+                        return jax.vmap(
+                            _eval_single_step,
+                            in_axes=tuple(in_axes_list),
+                        )(*windowed_ctx, t_wind)
+                    else:
+                        ctx_dict = dict(passive_ctx)
+                        active_spatial_n = None
+                        for tag, arr in zip(spatial_tag_order, windowed_ctx):
+                            if hasattr(arr, "ndim") and arr.ndim >= 2:
+                                ctx_dict[tag] = arr[0]
+                                if active_spatial_n is None and arr[0].ndim >= 1:
+                                    active_spatial_n = int(arr[0].shape[0])
+                            else:
+                                ctx_dict[tag] = arr
+                                if active_spatial_n is None and hasattr(arr, "ndim"):
+                                    if arr.ndim >= 2:
+                                        active_spatial_n = int(arr.shape[0])
+                        if active_spatial_n is not None:
+                            ctx_dict["__active_spatial_n__"] = active_spatial_n
+                        if time_arr is not None:
+                            ctx_dict[TIME_TAG] = t_wind[0]
+                        return evaluate_single_point_set(params, ctx_dict, key=rng_key)
 
                 # Slice one temporal window: (T, ...) → (W, ...)
                 windowed_list = []
@@ -945,11 +994,16 @@ class TraceCompiler:
             # One evaluator → one JAX trace → XLA sees all constraints together
             return [evaluator.evaluate(expr, context_single, {}, key) for expr in exprs]
 
-        # Everything below is identical to compile_traced_expression.
-        def compiled_fn(params, context=None, batchsize=None, key=None, min_consecutive=1):
+        # Collect tags from ALL expressions so batch inference is scoped.
+        expr_tags = set()
+        for _expr in exprs:
+            expr_tags |= collect_tags(_expr)
+
+        # Everything below mirrors compile_traced_expression.
+        def compiled_fn(params, context=None, batchsize=None, key=None, min_consecutive=None):
             context = context or {}
 
-            all_tags = set()
+            all_tags = set(expr_tags)
             for op in all_ops:
                 if hasattr(op, "_collected_vars"):
                     for var in op._collected_vars:
@@ -960,7 +1014,7 @@ class TraceCompiler:
 
             batched_sizes = []
             for tag, arr in zip(tag_order, ctx_tuple):
-                if tag == TIME_TAG:
+                if tag == TIME_TAG or tag not in expr_tags:
                     continue
                 if hasattr(arr, "ndim") and arr.ndim >= 1:
                     batched_sizes.append(arr.shape[0])
@@ -993,14 +1047,21 @@ class TraceCompiler:
                 B = batchsize
 
             time_arr = None
+            passive_ctx = {}
             spatial_tag_order = []
             spatial_ctx = []
             for tag, arr in zip(tag_order, ctx_tuple):
                 if tag == TIME_TAG:
                     time_arr = jnp.asarray(arr)
-                else:
+                elif hasattr(arr, "ndim") and arr.ndim >= 1 and arr.shape[0] in (B, 1):
+                    # Include both expression-tag arrays and any auxiliary arrays
+                    # (e.g. FEM tensors not in expr_tags) that carry a matching batch
+                    # axis — they must be vmapped over rather than passed as static
+                    # passive context so per-sample evaluation sees the right slice.
                     spatial_tag_order.append(tag)
                     spatial_ctx.append(arr)
+                else:
+                    passive_ctx[tag] = arr
 
             spatial_tag_order = tuple(spatial_tag_order)
             spatial_ctx = tuple(spatial_ctx)
@@ -1030,7 +1091,7 @@ class TraceCompiler:
                     if hasattr(v, "ndim") and v.ndim >= 3:
                         T = max(T, v.shape[0])
 
-                W = max(1, min(min_consecutive, T))
+                W = T if min_consecutive is None else max(1, min(min_consecutive, T))
                 idx_dtype = jnp.int64 if jax.config.jax_enable_x64 else jnp.int32
                 zero_idx = jnp.asarray(0, dtype=idx_dtype)
 
@@ -1044,15 +1105,58 @@ class TraceCompiler:
                     start = zero_idx
 
                 def eval_window(windowed_ctx, t_wind):
-                    ctx_dict = {}
-                    for tag, arr in zip(spatial_tag_order, windowed_ctx):
-                        if W == 1 and hasattr(arr, "ndim") and arr.ndim >= 2:
-                            ctx_dict[tag] = arr[0]
-                        else:
-                            ctx_dict[tag] = arr
-                    if time_arr is not None:
-                        ctx_dict[TIME_TAG] = t_wind[0] if W == 1 else t_wind
-                    return evaluate_single_point_set(params, ctx_dict, key=rng_key)
+                    if W > 1:
+                        # Vmap over the W (time-window) dimension so each
+                        # step sees (N, D) spatial + (1,) time — identical
+                        # to the W=1 case.  This ensures FD operators and
+                        # model branch networks that flatten their input
+                        # (e.g. DeepONet) work correctly.
+                        in_axes_list = []
+                        for arr in windowed_ctx:
+                            if hasattr(arr, "ndim") and arr.ndim >= 3:
+                                in_axes_list.append(0)
+                            else:
+                                in_axes_list.append(None)
+                        in_axes_list.append(0)  # for t_wind
+
+                        def _eval_single_step(*step_spatial_and_t):
+                            step_t = step_spatial_and_t[-1]
+                            step_spatial = step_spatial_and_t[:-1]
+                            ctx_dict = dict(passive_ctx)
+                            active_spatial_n = None
+                            for tag, step_arr in zip(spatial_tag_order, step_spatial):
+                                ctx_dict[tag] = step_arr
+                                if active_spatial_n is None and hasattr(step_arr, "ndim") and step_arr.ndim >= 1:
+                                    active_spatial_n = int(step_arr.shape[0])
+                            if active_spatial_n is not None:
+                                ctx_dict["__active_spatial_n__"] = active_spatial_n
+                            if time_arr is not None:
+                                ctx_dict[TIME_TAG] = step_t  # (1,) per step
+                            return evaluate_single_point_set(params, ctx_dict, key=rng_key)
+
+                        return jax.vmap(
+                            _eval_single_step,
+                            in_axes=tuple(in_axes_list),
+                        )(*windowed_ctx, t_wind)
+                    else:
+                        # W == 1: squeeze the window dimension
+                        ctx_dict = dict(passive_ctx)
+                        active_spatial_n = None
+                        for tag, arr in zip(spatial_tag_order, windowed_ctx):
+                            if hasattr(arr, "ndim") and arr.ndim >= 2:
+                                ctx_dict[tag] = arr[0]
+                                if active_spatial_n is None and arr[0].ndim >= 1:
+                                    active_spatial_n = int(arr[0].shape[0])
+                            else:
+                                ctx_dict[tag] = arr
+                                if active_spatial_n is None and hasattr(arr, "ndim"):
+                                    if arr.ndim >= 2:
+                                        active_spatial_n = int(arr.shape[0])
+                        if active_spatial_n is not None:
+                            ctx_dict["__active_spatial_n__"] = active_spatial_n
+                        if time_arr is not None:
+                            ctx_dict[TIME_TAG] = t_wind[0]
+                        return evaluate_single_point_set(params, ctx_dict, key=rng_key)
 
                 windowed_list = []
                 for arr in spatial_vals:

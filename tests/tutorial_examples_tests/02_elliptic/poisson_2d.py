@@ -15,6 +15,7 @@ used for the same network architecture so the results can be compared directly.
 import jax
 import jno
 
+import foundax
 import optax
 
 π = jno.np.pi
@@ -30,8 +31,8 @@ layer_dims = [2, 10, 10, 1]
 req_params = {"D": 5, "flavor": "exact"}
 
 
-def make_solver(scheme: str, label: str, epochs: int = 5):
-    net = jno.np.nn.mlp(in_features=2, hidden_dims=64, num_layers=4, key=jax.random.PRNGKey(0))
+def make_solver(scheme: str, label: str, epochs: int = 5000) -> float:
+    net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=64, num_layers=4, key=jax.random.PRNGKey(0)))
     net.optimizer(optax.adam(1))
     net.lr(jno.schedule.learning_rate.exponential(1e-3, 0.5, epochs, 1e-5))
 
@@ -53,5 +54,5 @@ def make_solver(scheme: str, label: str, epochs: int = 5):
 rel_l2_ad = make_solver("automatic_differentiation", "ad")
 rel_l2_fd = make_solver("finite_difference", "fd")
 
-assert rel_l2_ad < 1.1, f"AD relative L2 error too large: {rel_l2_ad:.3e}"
-assert rel_l2_fd < 1.1, f"FD relative L2 error too large: {rel_l2_fd:.3e}"
+assert rel_l2_ad < 1e-1, f"AD relative L2 error too large: {rel_l2_ad:.3e}"
+assert rel_l2_fd < 1e-1, f"FD relative L2 error too large: {rel_l2_fd:.3e}"

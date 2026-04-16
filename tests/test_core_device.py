@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
+import foundax
 import jno
 import jno.jnp_ops as jnn
 
@@ -43,7 +44,7 @@ def solver():
     dom = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.05))
     x, *_ = dom.variable("interior")
     key = jax.random.PRNGKey(0)
-    u_net = jnn.nn.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=key)
+    u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=key))
     u = u_net(x) * x * (1 - x)
     pde = jnn.laplacian(u, [x])
     return jno.core([pde.mse], dom)
@@ -94,7 +95,7 @@ class TestSetupParallelism:
         dom = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.1))
         x, *_ = dom.variable("interior")
         key = jax.random.PRNGKey(1)
-        u_net = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=1, key=key)
+        u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=1, key=key))
         u = u_net(x)
         pde = jnn.laplacian(u, [x])
         # (2, 3) = 6 devices but we almost certainly don't have 6 → fallback
@@ -329,7 +330,7 @@ class TestCoreInit:
         dom = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.1))
         x, *_ = dom.variable("interior")
         key = jax.random.PRNGKey(0)
-        u_net = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=1, key=key)
+        u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=1, key=key))
         u = u_net(x)
         pde = jnn.laplacian(u, [x])
         s = jno.core([pde.mse], dom)
@@ -344,7 +345,7 @@ class TestCoreInit:
         dom = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.1))
         x, *_ = dom.variable("interior")
         key = jax.random.PRNGKey(0)
-        u_net = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=1, key=key)
+        u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=1, key=key))
         u = u_net(x)
         pde = jnn.laplacian(u, [x])
         s = jno.core([pde.mse], dom)
@@ -382,7 +383,7 @@ class TestGPUPlacement:
         dom = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.1))
         x, *_ = dom.variable("interior")
         key = jax.random.PRNGKey(0)
-        u_net = jnn.nn.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=key)
+        u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=key))
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x])
         s = jno.core([pde.mse], dom)
@@ -409,7 +410,7 @@ class TestGPUPlacement:
         dom = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.1))
         x, *_ = dom.variable("interior")
         key = jax.random.PRNGKey(1)
-        u_net = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=1, key=key)
+        u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=1, key=key))
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x])
         s = jno.core([pde.mse], dom)
@@ -456,7 +457,7 @@ class TestGPUPlacement:
         dom = 20 * jno.domain(constructor=jno.domain.line(mesh_size=0.1))
         x, *_ = dom.variable("interior")
         key = jax.random.PRNGKey(2)
-        u_net = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=1, key=key)
+        u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=1, key=key))
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x])
         s = jno.core([pde.mse], dom)
@@ -501,7 +502,7 @@ class TestGPUPlacement:
         dom = 20 * jno.domain(constructor=jno.domain.line(mesh_size=0.1))
         x, *_ = dom.variable("interior")
         key = jax.random.PRNGKey(3)
-        u_net = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=1, key=key)
+        u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=1, key=key))
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x])
         s = jno.core([pde.mse], dom)
@@ -535,7 +536,7 @@ class TestGPUPlacement:
         dom = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.1))
         x, *_ = dom.variable("interior")
         key = jax.random.PRNGKey(42)
-        u_net = jnn.nn.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=key)
+        u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=key))
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x])
         s = jno.core([pde.mse], dom)

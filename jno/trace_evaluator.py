@@ -327,8 +327,8 @@ class TraceEvaluator:
     def _build_local_context(self, idx, tag, points, context):
         """Build dynamically-sliced local context for a single point ``idx``."""
         local = {
-                "__active_spatial_n__": 1,
-            }
+            "__active_spatial_n__": 1,
+        }
 
         for k, v in context.items():
             # keep helper key / scalars / dicts
@@ -410,38 +410,25 @@ class TraceEvaluator:
         def _broadcast_temporal(result):
             result = jnp.asarray(result)
 
-            # Prefer explicitly supplied active local point count
-            N = ctx.context.get("__active_spatial_n__", None)
+            # Find target ndim from spatial arrays in context
+            target_ndim = None
+            for k, v in ctx.context.items():
+                if str(k).startswith("__"):
+                    continue
+                if hasattr(v, "ndim") and v.ndim >= 2:
+                    target_ndim = v.ndim
+                    break
 
-            if N is None:
-                # Fallback: infer from current context
-                for k, v in ctx.context.items():
-                    if k == "__active_spatial_n__":
-                        continue
-                    if str(k).startswith("__time"):
-                        continue
-                    if hasattr(v, "ndim") and v.ndim >= 2:
-                        N = int(v.shape[0])
-                        break
+            if target_ndim is None:
+                target_ndim = 2  # default: (N, D)
 
-            if N is None:
-                return result
-
-            # scalar -> (N,1)
-            if result.ndim == 0:
-                return jnp.full((N, 1), result)
-
-            # (1,) or (N,) -> (N,1)
-            if result.ndim == 1:
-                if result.shape[0] == 1:
-                    return jnp.broadcast_to(result.reshape(1, 1), (N, 1))
-                if result.shape[0] == N:
-                    return result[:, None]
-                return result
-
-            # (1,1) -> (N,1)
-            if result.ndim == 2 and result.shape[0] == 1:
-                return jnp.broadcast_to(result, (N, result.shape[1]))
+            # Pad trailing 1s so temporal matches spatial ndim.
+            # E.g. spatial (N, D) → temporal (1,) becomes (1, 1);
+            #      spatial (W, N, D) → temporal (W,) becomes (W, 1, 1).
+            # JAX broadcasting then handles (1, 1) * (N, 1) → (N, 1)
+            # in arithmetic, while models receive compact temporal input.
+            while result.ndim < target_ndim:
+                result = jnp.expand_dims(result, axis=-1)
 
             return result
 
@@ -512,13 +499,14 @@ class TraceEvaluator:
                 arg_values.append(val)
 
                 is_spatial = False
+                if isinstance(arg, TensorTag):
+                    is_spatial = getattr(val, "ndim", 0) >= 3
                 if isinstance(arg, Variable):
                     bound_arg = ctx.var_bindings.get(id(arg), arg)
                     axis = getattr(bound_arg, "axis", "spatial")
                     if axis == "spatial" and bound_arg.tag in ctx.context:
                         is_spatial = True
                     elif axis == "temporal":
-                        # Temporal variable — will be broadcast to (N, 1)
                         is_spatial = False
 
                 arg_sources.append(is_spatial)
@@ -543,6 +531,8 @@ class TraceEvaluator:
                     return val.reshape(1, 1)
                 elif val.ndim == 1:
                     return val[:, jnp.newaxis]  # (N,) → (N, 1)
+                while val.ndim > 4 and val.shape[0] == 1:
+                    val = val[0]
                 return val
             else:
                 if val.ndim == 0:
@@ -690,55 +680,31 @@ class TraceEvaluator:
                 return result
 
             # ── Temporal derivative via AD (default) ──
-            # Find any spatial tag to determine N
-            domain = getattr(bound_var, "_domain", None)
-            param_tags = set(getattr(domain, "_param_tags", set())) if domain is not None else set()
+            def u_of_t_full(t_arr):
+                new_ctx_dict = {**ctx.context, time_key: t_arr}
+                new_ctx = evaluator_self._EvalCtx(
+                    new_ctx_dict,
+                    ctx.var_bindings,
+                    ctx.key,
+                    active_region=ctx.active_region,
+                )
+                return evaluator_self._dispatch(target, new_ctx)
 
-            def is_spatial_pointset(tag_name, value):
-                if tag_name == time_key or str(tag_name).startswith("__time"):
-                    return False
-                if tag_name in param_tags:
-                    return False
-                if not hasattr(value, "ndim"):
-                    return False
-                # active sampled coordinates are typically (N, D)
-                return value.ndim >= 2
+            jac = jax.jacrev(u_of_t_full)(time_val)
+            # jac shape = output_shape + time_shape.
+            # For windowed time input (W, 1), extract the derivative of each
+            # output time slice with respect to its aligned input time slice.
+            if getattr(time_val, "ndim", 0) == 2 and time_val.shape[1] == 1:
+                jac_scalar = jac[..., 0]
+                result = jnp.moveaxis(jnp.diagonal(jac_scalar, axis1=0, axis2=-1), -1, 0)
+            elif getattr(time_val, "ndim", 0) == 1 and time_val.shape[0] == 1:
+                result = jac[..., 0]
+            else:
+                result = jac
 
-            # Determine N only from spatial point-set arrays, not parametric tags like GRF
-            N = 1
-            for k, v in ctx.context.items():
-                if is_spatial_pointset(k, v):
-                    N = max(N, int(v.shape[0]))
-
-            def grad_time_single(idx):
-                """Grad w.r.t. time for one spatial point idx."""
-                local_ctx = {"__active_spatial_n__": 1}
-                for k, v in ctx.context.items():
-                    if k == time_key:
-                        continue  # replaced by differentiable t below
-
-                    if is_spatial_pointset(k, v) and int(v.shape[0]) == N:
-                        start_indices = (idx,) + (0,) * (v.ndim - 1)
-                        slice_sizes = (1,) + tuple(v.shape[1:])
-                        local_ctx[k] = jax.lax.dynamic_slice(v, start_indices, slice_sizes)
-                    else:
-                        # keep parametric tags like GRF untouched
-                        local_ctx[k] = v
-
-                def u_of_t(t_arr):
-                    new_ctx_dict = {**local_ctx, time_key: t_arr}
-                    new_ctx = evaluator_self._EvalCtx(
-                        new_ctx_dict,
-                        ctx.var_bindings,
-                        ctx.key,
-                        active_region=ctx.active_region,
-                    )
-                    return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
-
-                return jax.grad(u_of_t)(time_val)[0]
-
-            result = jax.vmap(grad_time_single)(jnp.arange(N))
-            return result[:, jnp.newaxis]
+            if result.ndim == 1:
+                result = result[:, jnp.newaxis]
+            return result
 
         # ── Spatial derivative ──
         tag = bound_var.tag
@@ -951,6 +917,40 @@ class TraceEvaluator:
         elif scheme == "automatic_differentiation":
             evaluator_self = self
 
+            if points is not None and points.ndim == 3:
+                n_time, n_points, _ = points.shape
+
+                def _windowed_scalar(t_idx, p_idx, p):
+                    updated_points = points.at[t_idx, p_idx, :].set(p)
+                    new_ctx = evaluator_self._EvalCtx(
+                        {**ctx.context, tag: updated_points},
+                        ctx.var_bindings,
+                        ctx.key,
+                        active_region=ctx.active_region,
+                    )
+                    value = evaluator_self._dispatch(target, new_ctx)
+                    return jnp.squeeze(value[t_idx, p_idx])
+
+                if compute_trace:
+
+                    def lap_time_point(t_idx, p_idx):
+                        pt = points[t_idx, p_idx]
+                        hess = jax.hessian(lambda p: _windowed_scalar(t_idx, p_idx, p))(pt)
+                        return sum(hess[d, d] for d in dims)
+
+                    result = jax.vmap(lambda t_idx: jax.vmap(lambda p_idx: lap_time_point(t_idx, p_idx))(jnp.arange(n_points)))(jnp.arange(n_time))
+                    return result[..., jnp.newaxis]
+
+                def hess_time_point(t_idx, p_idx):
+                    pt = points[t_idx, p_idx]
+                    hess = jax.hessian(lambda p: _windowed_scalar(t_idx, p_idx, p))(pt)
+                    result = jnp.zeros((n, n))
+                    for i, vi_dim, j, vj_dim in var_dims:
+                        result = result.at[i, j].set(hess[vi_dim, vj_dim])
+                    return result
+
+                return jax.vmap(lambda t_idx: jax.vmap(lambda p_idx: hess_time_point(t_idx, p_idx))(jnp.arange(n_points)))(jnp.arange(n_time))
+
             if compute_trace:
                 # Laplacian via AD
                 def lap_single(idx):
@@ -1039,6 +1039,26 @@ class TraceEvaluator:
         flat_cells = jnp.asarray(flat_cells).flatten().astype(jnp.int32)
 
         num_entities, num_quads = weights.shape[-2], weights.shape[-1]
+        # Expected local-node count comes from connectivity, not integrand shape.
+        # This guards grouped FEM paths where integrand is emitted with a flattened
+        # (nloc * feature) axis instead of an explicit nloc axis.
+        if flat_cells.size % num_entities != 0:
+            raise ValueError("Inconsistent FEM connectivity: flat_cells.size is not divisible " f"by num_entities ({flat_cells.size} vs {num_entities}).")
+        expected_n_local_nodes = int(flat_cells.size // num_entities)
+
+        if integrand.ndim < 2:
+            raise ValueError(f"Assembly integrand must have at least 2 dims, got shape {integrand.shape}.")
+
+        if integrand.shape[0] != weights.size:
+            raise ValueError("Assembly integrand leading axis must match total quadrature points " f"({integrand.shape[0]} vs {weights.size}).")
+
+        if integrand.shape[1] != expected_n_local_nodes:
+            if integrand.shape[1] % expected_n_local_nodes != 0:
+                raise ValueError("Assembly integrand local-node axis is incompatible with connectivity: " f"shape={integrand.shape}, expected nloc={expected_n_local_nodes}.")
+            # Recover explicit local-node axis from flattened representation.
+            split = integrand.shape[1] // expected_n_local_nodes
+            integrand = integrand.reshape((integrand.shape[0], expected_n_local_nodes, split) + tuple(integrand.shape[2:]))
+
         n_local_nodes = integrand.shape[1]
         trailing_shape = integrand.shape[2:]
 
