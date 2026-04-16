@@ -45,7 +45,7 @@ _u_flat = _u.reshape((1, N, 1))  # (1, N, 1) — full batch column
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 # latent_res is the resolution of the internal coarsened representation.
-u = jno.np.nn.pit(
+u = jno.nn.pit(
     in_channels=1,
     out_channels=1,
     hid_channels=128,

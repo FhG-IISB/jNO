@@ -37,7 +37,7 @@ _f = domain.variable("_f")  # (S, 1, 1, H, W, 1)
 _u = domain.variable("_u")  # (S, 1, 1, H, W, 1)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-u = jno.np.nn.fno2d(
+u = jno.nn.fno2d(
     in_features=1,
     hidden_channels=48,
     n_modes=24,

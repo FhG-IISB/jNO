@@ -28,7 +28,7 @@ x, y, _ = domain.variable("interior")
 u_exact = jno.np.sin(pi * x) * jno.np.sin(pi * y)
 forcing = (a + b) * pi**2 * u_exact
 
-net = jno.np.nn.mlp(in_features=2, hidden_dims=32, num_layers=4, key=jax.random.PRNGKey(12))
+net = jno.nn.mlp(in_features=2, hidden_dims=32, num_layers=4, key=jax.random.PRNGKey(12))
 net.optimizer(optax.adam(1), lr=jno.schedule.learning_rate.exponential(1e-3, 0.5, 10, 1e-5))
 
 u = net(x, y) * x * (1 - x) * y * (1 - y)
@@ -40,4 +40,4 @@ history = crux.solve(10_000)
 _u, _u_exact = crux.eval([u, u_exact])
 
 rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_exact) + 1e-8))
-assert rel_l2 < 1.1, f"relative L2 error too large: {rel_l2:.3e}"
+assert rel_l2 < 1e-1, f"relative L2 error too large: {rel_l2:.3e}"

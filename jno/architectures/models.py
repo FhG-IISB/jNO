@@ -129,7 +129,7 @@ def _resolve_key(key: jax.Array | None):
     if _DEFAULT_NN_KEY is None:
         seed = get_seed()
         if seed is None:
-            seed = 21   # make this consistent with jno.core
+            seed = 21  # make this consistent with jno.core
         _DEFAULT_NN_KEY = jax.random.PRNGKey(int(seed))
 
     if _DEFAULT_NN_KEY is None:
@@ -2419,6 +2419,7 @@ class nn:
         input_shape: Tuple[int, ...],
         num_out_channels: int = 1,
         state_labels: Optional[jnp.ndarray] = None,
+        field_indices: Optional[jnp.ndarray] = None,
         bcs: Optional[List] = None,
         dim_key: int = 2,
         remat: bool = True,
@@ -2446,6 +2447,14 @@ class nn:
                 given explicitly.
             state_labels: Explicit output-channel indices for the decoder.
                 Overrides ``num_out_channels`` when provided.
+            field_indices: SpaceBag channel indices for encoder input
+                selection.  When the number of input channels differs
+                from ``num_out_channels`` (e.g. because boundary-condition
+                fields are concatenated onto the input), this **must** be
+                supplied explicitly.  Length must equal ``C_in + 3``
+                (input channels plus 3 internal BC-flag channels).  If
+                ``None``, the model auto-builds it from ``state_labels``
+                (only valid when ``C_in == C_out``).
             bcs: Boundary conditions per spatial dim, each
                 ``[bc_left, bc_right]``.  ``2`` = periodic, ``0`` = open.
                 Default: periodic in H & W, singleton in D
@@ -2481,6 +2490,7 @@ class nn:
         # without the "JAX array set as static" warning.  The Flax model
         # converts it back to an array at the top of __call__.
         state_labels_tup = tuple(int(s) for s in state_labels)
+        field_indices_tup = tuple(int(f) for f in field_indices) if field_indices is not None else None
 
         # ── Build model with pretrained hyperparameters ──
         flax_model = WalrusModel(
@@ -2508,6 +2518,7 @@ class nn:
             x=dummy_x,
             state_labels=state_labels,
             bcs=bcs,
+            field_indices=field_indices,
             dim_key=dim_key,
             deterministic=True,
         )
@@ -2517,6 +2528,7 @@ class nn:
             params,
             state_labels=state_labels_tup,
             bcs=bcs,
+            field_indices=field_indices_tup,
             dim_key=dim_key,
             deterministic=True,
         )
@@ -2937,6 +2949,144 @@ class nn:
         return cls._mpp("mpp_L", "L", spatial_size, num_channels)
 
     # =========================================================================
+    # BCAT Foundation Models
+    # =========================================================================
+
+    @classmethod
+    def _bcat(
+        cls,
+        name: str,
+        spatial_size: int = 128,
+        num_channels: int = 4,
+        input_len: int = 1,
+        max_data_len: int = 20,
+    ) -> Model:
+        """Internal helper that builds a fresh BCAT model.
+
+        jNO's vmap+scan pipeline delivers one sample at a time to the model.
+        Each sample arrives as ``(1, H, W, C)`` (channels-last, with a
+        leading singleton time axis).  BCAT expects
+        ``(bs, T, H, W, data_dim)`` data + ``(bs, T, 1)`` times +
+        ``input_len``.
+
+        For single-step evaluation (the common jNO use-case), we
+        construct a two-timestep input (duplicating the frame so that
+        the autoregressive ``data[:, :-1]`` logic keeps one input
+        frame) and extract the single predicted output frame.
+
+        Args:
+            name: Display name (e.g. ``"bcat"``).
+            spatial_size: Spatial resolution H=W. Default: 128.
+            num_channels: Number of active state-variable channels.
+                Default: 4.
+            input_len: Number of input time-steps for the autoregressive
+                window. Default: 1.
+            max_data_len: Maximum sequence length the position / time
+                embeddings support. Default: 20.
+        """
+
+        from jax_bcat import BCAT as BCATModel, bcat_default
+
+        flax_model = bcat_default()
+
+        # Override dimensions that depend on the dataset.
+        flax_model = BCATModel(
+            n_layer=flax_model.n_layer,
+            dim_emb=flax_model.dim_emb,
+            dim_ffn=flax_model.dim_ffn,
+            n_head=flax_model.n_head,
+            norm_first=flax_model.norm_first,
+            norm_type=flax_model.norm_type,
+            activation=flax_model.activation,
+            qk_norm=flax_model.qk_norm,
+            x_num=spatial_size,
+            max_output_dim=num_channels,
+            patch_num=flax_model.patch_num,
+            patch_num_output=flax_model.patch_num_output,
+            conv_dim=flax_model.conv_dim,
+            time_embed=flax_model.time_embed,
+            max_time_len=max_data_len,
+            max_data_len=max_data_len,
+            deep=flax_model.deep,
+        )
+
+        # Init params with a dummy forward pass.
+        S = spatial_size
+        C = num_channels
+        T = input_len + 1  # model drops last timestep internally
+        rng = jax.random.PRNGKey(0)
+        dummy_data = jnp.ones((1, T, S, S, C))
+        dummy_times = jnp.arange(T, dtype=jnp.float32).reshape(1, T, 1)
+        params = flax_model.init(rng, dummy_data, dummy_times, input_len=input_len)
+
+        _base_apply = flax_model.apply
+        _input_len = input_len
+
+        def bcat_apply(params, x, **kwargs):
+            # x: (1, H, W, C)  — jNO per-sample input (channels-last 2-D)
+            H, W = x.shape[-3], x.shape[-2]
+            C = x.shape[-1]
+            # Build a two-timestep window so the model's ``data[:, :-1]``
+            # keeps one input frame and produces one output frame.
+            frame = x.reshape(1, 1, H, W, C)
+            data = jnp.broadcast_to(frame, (1, _input_len + 1, H, W, C))
+            times = jnp.arange(_input_len + 1, dtype=jnp.float32).reshape(1, _input_len + 1, 1)
+            out = _base_apply(params, data, times, input_len=_input_len)
+            # out: (1, 1, H, W, C) → (1, H, W, C)
+            return out[:, -1:]  # keep the last predicted frame
+            # result shape: (1, H, W, C)
+
+        wrapped = FlaxModelWrapper(
+            bcat_apply,
+            params,
+        )
+        return cls.wrap(wrapped, name=name)
+
+    @classmethod
+    def bcat(
+        cls,
+        spatial_size: int = 128,
+        num_channels: int = 4,
+        input_len: int = 1,
+        max_data_len: int = 20,
+    ) -> Model:
+        """
+        BCAT foundation model (~185 M parameters).
+
+        Block Causal Autoregressive Transformer for fluid dynamics PDE
+        prediction.  Creates a fresh model with random parameters.  To
+        load pretrained weights call ``model.initialize(weight_path)``
+        afterwards.
+
+        Args:
+            spatial_size: Spatial resolution H=W. Default: 128.
+            num_channels: Number of active state channels. Default: 4.
+            input_len: Number of input time-steps for the autoregressive
+                window. Default: 1.
+            max_data_len: Maximum sequence length the position / time
+                embeddings support. Default: 20.
+
+        Returns:
+            Model wrapping the BCAT model.
+
+        Example::
+
+            u = nn.bcat(num_channels=1)
+            u.initialize("bcat.msgpack")
+
+        Reference:
+            Wang et al., "BCAT: Block Causal Transformer for PDE Foundation
+            Models for Fluid Dynamics" (2025), arXiv:2501.18972
+        """
+        return cls._bcat(
+            "bcat",
+            spatial_size=spatial_size,
+            num_channels=num_channels,
+            input_len=input_len,
+            max_data_len=max_data_len,
+        )
+
+    # =========================================================================
     # PDEformer-2 Foundation Models
     # =========================================================================
 
@@ -3149,4 +3299,668 @@ class nn:
             PDEFORMER_FAST_CONFIG,
             dag_inputs,
             num_points,
+        )
+
+    # =========================================================================
+    # DPOT Foundation Models (2D)
+    # =========================================================================
+
+    @classmethod
+    def _dpot(
+        cls,
+        name: str,
+        variant: str,
+        spatial_size: int = 128,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        in_timesteps: int = 1,
+        out_timesteps: int = 1,
+    ) -> Model:
+        """Internal helper that builds a fresh DPOTNet (2D) model.
+
+        jNO's vmap+scan pipeline delivers one sample at a time to the model.
+        Each sample arrives as ``(1, H, W, C)`` (channels-last, with a
+        leading singleton time axis).  DPOTNet expects
+        ``(B, H, W, T, C)`` (spatial + temporal + channel).
+
+        The adapter reshapes the jNO input to DPOT format and extracts
+        only the predicted field ``y`` from the ``(y, cls_pred)`` tuple.
+
+        Args:
+            name: Display name (e.g. ``"dpot_Ti"``).
+            variant: One of ``'Ti'``, ``'S'``, ``'M'``, ``'L'``, ``'H'``.
+            spatial_size: Spatial resolution H=W. Default: 128.
+            in_channels: Number of input channels. Default: 1.
+            out_channels: Number of output channels. Default: 1.
+            in_timesteps: Number of input timesteps. Default: 1.
+            out_timesteps: Number of output timesteps. Default: 1.
+        """
+
+        from jax_dpot import DPOTNet, DPOT_CONFIGS
+
+        cfg = DPOT_CONFIGS[variant]
+        flax_model = DPOTNet(
+            img_size=spatial_size,
+            patch_size=cfg.patch_size,
+            mixing_type=cfg.mixing_type,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            in_timesteps=in_timesteps,
+            out_timesteps=out_timesteps,
+            n_blocks=cfg.n_blocks,
+            embed_dim=cfg.embed_dim,
+            out_layer_dim=cfg.out_layer_dim,
+            depth=cfg.depth,
+            modes=cfg.modes,
+            mlp_ratio=cfg.mlp_ratio,
+            n_cls=cfg.n_cls,
+            normalize=cfg.normalize,
+            act=cfg.act,
+            time_agg=cfg.time_agg,
+        )
+
+        S = spatial_size
+        rng = jax.random.PRNGKey(0)
+        dummy = jnp.ones((1, S, S, in_timesteps, in_channels))
+        params = flax_model.init(rng, dummy)
+
+        _base_apply = flax_model.apply
+        _out_t = out_timesteps
+        _out_c = out_channels
+
+        def dpot_apply(params, x, **kwargs):
+            # x: (1, H, W, C) — jNO per-sample input (channels-last 2-D)
+            H, W = x.shape[-3], x.shape[-2]
+            C = x.shape[-1]
+            # → (1, H, W, 1, C) add singleton time axis
+            vol = x.reshape(1, H, W, 1, C)
+            y, _cls = _base_apply(params, vol)
+            # y: (1, H, W, out_timesteps, out_channels)
+            # → (1, H, W, out_channels * out_timesteps)
+            return y.reshape(1, H, W, _out_c * _out_t)
+
+        wrapped = FlaxModelWrapper(
+            dpot_apply,
+            params,
+        )
+        return cls.wrap(wrapped, name=name)
+
+    @classmethod
+    def dpotTi(
+        cls,
+        spatial_size: int = 128,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        in_timesteps: int = 1,
+        out_timesteps: int = 1,
+    ) -> Model:
+        """
+        DPOT-Ti (Tiny) foundation model (~7 M parameters).
+
+        Creates a fresh model. To load pretrained weights call
+        ``model.initialize(weight_path)`` afterwards.
+
+        Args:
+            spatial_size: Spatial resolution H=W. Default: 128.
+            in_channels: Number of input channels. Default: 1.
+            out_channels: Number of output channels. Default: 1.
+            in_timesteps: Number of input timesteps. Default: 1.
+            out_timesteps: Number of output timesteps. Default: 1.
+
+        Returns:
+            Model wrapping the DPOT-Ti model.
+
+        Example::
+
+            u = nn.dpotTi()
+            u.initialize("dpot-Ti.msgpack")
+
+        Reference:
+            Hao et al., "DPOT: Auto-Regressive Denoising Operator Transformer
+            for Large-Scale PDE Pre-Training" (ICML 2024)
+        """
+        return cls._dpot(
+            "dpot_Ti",
+            "Ti",
+            spatial_size,
+            in_channels,
+            out_channels,
+            in_timesteps,
+            out_timesteps,
+        )
+
+    @classmethod
+    def dpotS(
+        cls,
+        spatial_size: int = 128,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        in_timesteps: int = 1,
+        out_timesteps: int = 1,
+    ) -> Model:
+        """
+        DPOT-S (Small) foundation model (~30 M parameters).
+
+        See :meth:`dpotTi` for full documentation.
+        """
+        return cls._dpot(
+            "dpot_S",
+            "S",
+            spatial_size,
+            in_channels,
+            out_channels,
+            in_timesteps,
+            out_timesteps,
+        )
+
+    @classmethod
+    def dpotM(
+        cls,
+        spatial_size: int = 128,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        in_timesteps: int = 1,
+        out_timesteps: int = 1,
+    ) -> Model:
+        """
+        DPOT-M (Medium) foundation model (~122 M parameters).
+
+        See :meth:`dpotTi` for full documentation.
+        """
+        return cls._dpot(
+            "dpot_M",
+            "M",
+            spatial_size,
+            in_channels,
+            out_channels,
+            in_timesteps,
+            out_timesteps,
+        )
+
+    @classmethod
+    def dpotL(
+        cls,
+        spatial_size: int = 128,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        in_timesteps: int = 1,
+        out_timesteps: int = 1,
+    ) -> Model:
+        """
+        DPOT-L (Large) foundation model (~509 M parameters).
+
+        See :meth:`dpotTi` for full documentation.
+        """
+        return cls._dpot(
+            "dpot_L",
+            "L",
+            spatial_size,
+            in_channels,
+            out_channels,
+            in_timesteps,
+            out_timesteps,
+        )
+
+    @classmethod
+    def dpotH(
+        cls,
+        spatial_size: int = 128,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        in_timesteps: int = 1,
+        out_timesteps: int = 1,
+    ) -> Model:
+        """
+        DPOT-H (Huge) foundation model (~1.03 B parameters).
+
+        See :meth:`dpotTi` for full documentation.
+        """
+        return cls._dpot(
+            "dpot_H",
+            "H",
+            spatial_size,
+            in_channels,
+            out_channels,
+            in_timesteps,
+            out_timesteps,
+        )
+
+    # =========================================================================
+    # CDPOT Foundation Models (2D, CNO-based output head)
+    # =========================================================================
+
+    @classmethod
+    def _cdpot(
+        cls,
+        name: str,
+        variant: str,
+        spatial_size: int = 128,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        in_timesteps: int = 1,
+        out_timesteps: int = 1,
+    ) -> Model:
+        """Internal helper that builds a fresh CDPOTNet model.
+
+        CDPOTNet is a DPOT variant that replaces the transposed-convolution
+        output head with a CNOBlock (continuous neural operator upsampling).
+        The jNO adapter follows the same pattern as :meth:`_dpot`.
+
+        Args:
+            name: Display name (e.g. ``"cdpot_Ti"``).
+            variant: One of ``'Ti'``, ``'S'``, ``'M'``, ``'L'``, ``'H'``.
+            spatial_size: Spatial resolution H=W. Default: 128.
+            in_channels: Number of input channels. Default: 1.
+            out_channels: Number of output channels. Default: 1.
+            in_timesteps: Number of input timesteps. Default: 1.
+            out_timesteps: Number of output timesteps. Default: 1.
+        """
+
+        from jax_dpot import CDPOTNet, DPOT_CONFIGS
+
+        cfg = DPOT_CONFIGS[variant]
+        flax_model = CDPOTNet(
+            img_size=spatial_size,
+            patch_size=cfg.patch_size,
+            mixing_type=cfg.mixing_type,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            in_timesteps=in_timesteps,
+            out_timesteps=out_timesteps,
+            n_blocks=cfg.n_blocks,
+            embed_dim=cfg.embed_dim,
+            out_layer_dim=cfg.out_layer_dim,
+            depth=cfg.depth,
+            modes=cfg.modes,
+            mlp_ratio=cfg.mlp_ratio,
+            n_cls=cfg.n_cls,
+            normalize=cfg.normalize,
+            act=cfg.act,
+            time_agg=cfg.time_agg,
+        )
+
+        S = spatial_size
+        rng = jax.random.PRNGKey(0)
+        dummy = jnp.ones((1, S, S, in_timesteps, in_channels))
+        params = flax_model.init(rng, dummy)
+
+        _base_apply = flax_model.apply
+        _out_t = out_timesteps
+        _out_c = out_channels
+
+        def cdpot_apply(params, x, **kwargs):
+            H, W = x.shape[-3], x.shape[-2]
+            C = x.shape[-1]
+            vol = x.reshape(1, H, W, 1, C)
+            y, _cls = _base_apply(params, vol)
+            return y.reshape(1, H, W, _out_c * _out_t)
+
+        wrapped = FlaxModelWrapper(
+            cdpot_apply,
+            params,
+        )
+        return cls.wrap(wrapped, name=name)
+
+    @classmethod
+    def cdpotTi(
+        cls,
+        spatial_size: int = 128,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        in_timesteps: int = 1,
+        out_timesteps: int = 1,
+    ) -> Model:
+        """
+        CDPOT-Ti (Tiny) foundation model with CNO output head.
+
+        Creates a fresh model. To load pretrained weights call
+        ``model.initialize(weight_path)`` afterwards.
+
+        Args:
+            spatial_size: Spatial resolution H=W. Default: 128.
+            in_channels: Number of input channels. Default: 1.
+            out_channels: Number of output channels. Default: 1.
+            in_timesteps: Number of input timesteps. Default: 1.
+            out_timesteps: Number of output timesteps. Default: 1.
+
+        Returns:
+            Model wrapping the CDPOT-Ti model.
+
+        Example::
+
+            u = nn.cdpotTi()
+            u.initialize("cdpot-Ti.msgpack")
+
+        Reference:
+            Hao et al., "DPOT: Auto-Regressive Denoising Operator Transformer
+            for Large-Scale PDE Pre-Training" (ICML 2024)
+        """
+        return cls._cdpot(
+            "cdpot_Ti",
+            "Ti",
+            spatial_size,
+            in_channels,
+            out_channels,
+            in_timesteps,
+            out_timesteps,
+        )
+
+    @classmethod
+    def cdpotS(
+        cls,
+        spatial_size: int = 128,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        in_timesteps: int = 1,
+        out_timesteps: int = 1,
+    ) -> Model:
+        """
+        CDPOT-S (Small) foundation model with CNO output head.
+
+        See :meth:`cdpotTi` for full documentation.
+        """
+        return cls._cdpot(
+            "cdpot_S",
+            "S",
+            spatial_size,
+            in_channels,
+            out_channels,
+            in_timesteps,
+            out_timesteps,
+        )
+
+    @classmethod
+    def cdpotM(
+        cls,
+        spatial_size: int = 128,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        in_timesteps: int = 1,
+        out_timesteps: int = 1,
+    ) -> Model:
+        """
+        CDPOT-M (Medium) foundation model with CNO output head.
+
+        See :meth:`cdpotTi` for full documentation.
+        """
+        return cls._cdpot(
+            "cdpot_M",
+            "M",
+            spatial_size,
+            in_channels,
+            out_channels,
+            in_timesteps,
+            out_timesteps,
+        )
+
+    @classmethod
+    def cdpotL(
+        cls,
+        spatial_size: int = 128,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        in_timesteps: int = 1,
+        out_timesteps: int = 1,
+    ) -> Model:
+        """
+        CDPOT-L (Large) foundation model with CNO output head.
+
+        See :meth:`cdpotTi` for full documentation.
+        """
+        return cls._cdpot(
+            "cdpot_L",
+            "L",
+            spatial_size,
+            in_channels,
+            out_channels,
+            in_timesteps,
+            out_timesteps,
+        )
+
+    @classmethod
+    def cdpotH(
+        cls,
+        spatial_size: int = 128,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        in_timesteps: int = 1,
+        out_timesteps: int = 1,
+    ) -> Model:
+        """
+        CDPOT-H (Huge) foundation model with CNO output head.
+
+        See :meth:`cdpotTi` for full documentation.
+        """
+        return cls._cdpot(
+            "cdpot_H",
+            "H",
+            spatial_size,
+            in_channels,
+            out_channels,
+            in_timesteps,
+            out_timesteps,
+        )
+
+    # =========================================================================
+    # DPOT 3D Foundation Models
+    # =========================================================================
+
+    @classmethod
+    def _dpot3d(
+        cls,
+        name: str,
+        variant: str,
+        spatial_size: int = 64,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        in_timesteps: int = 1,
+        out_timesteps: int = 1,
+    ) -> Model:
+        """Internal helper that builds a fresh DPOTNet3D model.
+
+        DPOTNet3D operates on volumetric (3-D spatial) data.  jNO delivers
+        each sample as ``(1, X, Y, Z, C)`` (channels-last with a leading
+        singleton time axis).  DPOTNet3D expects
+        ``(B, X, Y, Z, T, C)`` (spatial + temporal + channel).
+
+        Unlike the 2-D variant, DPOTNet3D returns only the predicted
+        field ``y`` (no ``cls_pred``).
+
+        Args:
+            name: Display name (e.g. ``"dpot3d_Ti"``).
+            variant: One of ``'Ti'``, ``'S'``, ``'M'``, ``'L'``, ``'H'``.
+            spatial_size: Spatial resolution X=Y=Z. Default: 64.
+            in_channels: Number of input channels. Default: 1.
+            out_channels: Number of output channels. Default: 1.
+            in_timesteps: Number of input timesteps. Default: 1.
+            out_timesteps: Number of output timesteps. Default: 1.
+        """
+
+        from jax_dpot import DPOTNet3D, DPOT_CONFIGS
+
+        cfg = DPOT_CONFIGS[variant]
+        flax_model = DPOTNet3D(
+            img_size=spatial_size,
+            patch_size=cfg.patch_size,
+            mixing_type=cfg.mixing_type,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            in_timesteps=in_timesteps,
+            out_timesteps=out_timesteps,
+            n_blocks=cfg.n_blocks,
+            embed_dim=cfg.embed_dim,
+            out_layer_dim=cfg.out_layer_dim,
+            depth=cfg.depth,
+            modes=cfg.modes,
+            mlp_ratio=cfg.mlp_ratio,
+            n_cls=cfg.n_cls,
+            normalize=cfg.normalize,
+            act=cfg.act,
+            time_agg=cfg.time_agg,
+        )
+
+        S = spatial_size
+        rng = jax.random.PRNGKey(0)
+        dummy = jnp.ones((1, S, S, S, in_timesteps, in_channels))
+        params = flax_model.init(rng, dummy)
+
+        _base_apply = flax_model.apply
+        _out_t = out_timesteps
+        _out_c = out_channels
+
+        def dpot3d_apply(params, x, **kwargs):
+            # x: (1, X, Y, Z, C) — jNO per-sample input (channels-last 3-D)
+            X, Y, Z = x.shape[-4], x.shape[-3], x.shape[-2]
+            C = x.shape[-1]
+            # → (1, X, Y, Z, 1, C) add singleton time axis
+            vol = x.reshape(1, X, Y, Z, 1, C)
+            y = _base_apply(params, vol)
+            # y: (1, X, Y, Z, out_timesteps, out_channels)
+            # → (1, X, Y, Z, out_channels * out_timesteps)
+            return y.reshape(1, X, Y, Z, _out_c * _out_t)
+
+        wrapped = FlaxModelWrapper(
+            dpot3d_apply,
+            params,
+        )
+        return cls.wrap(wrapped, name=name)
+
+    @classmethod
+    def dpot3dTi(
+        cls,
+        spatial_size: int = 64,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        in_timesteps: int = 1,
+        out_timesteps: int = 1,
+    ) -> Model:
+        """
+        DPOT3D-Ti (Tiny) foundation model for volumetric data.
+
+        Creates a fresh model. To load pretrained weights call
+        ``model.initialize(weight_path)`` afterwards.
+
+        Args:
+            spatial_size: Spatial resolution X=Y=Z. Default: 64.
+            in_channels: Number of input channels. Default: 1.
+            out_channels: Number of output channels. Default: 1.
+            in_timesteps: Number of input timesteps. Default: 1.
+            out_timesteps: Number of output timesteps. Default: 1.
+
+        Returns:
+            Model wrapping the DPOT3D-Ti model.
+
+        Example::
+
+            u = nn.dpot3dTi()
+            u.initialize("dpot3d-Ti.msgpack")
+
+        Reference:
+            Hao et al., "DPOT: Auto-Regressive Denoising Operator Transformer
+            for Large-Scale PDE Pre-Training" (ICML 2024)
+        """
+        return cls._dpot3d(
+            "dpot3d_Ti",
+            "Ti",
+            spatial_size,
+            in_channels,
+            out_channels,
+            in_timesteps,
+            out_timesteps,
+        )
+
+    @classmethod
+    def dpot3dS(
+        cls,
+        spatial_size: int = 64,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        in_timesteps: int = 1,
+        out_timesteps: int = 1,
+    ) -> Model:
+        """
+        DPOT3D-S (Small) foundation model for volumetric data.
+
+        See :meth:`dpot3dTi` for full documentation.
+        """
+        return cls._dpot3d(
+            "dpot3d_S",
+            "S",
+            spatial_size,
+            in_channels,
+            out_channels,
+            in_timesteps,
+            out_timesteps,
+        )
+
+    @classmethod
+    def dpot3dM(
+        cls,
+        spatial_size: int = 64,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        in_timesteps: int = 1,
+        out_timesteps: int = 1,
+    ) -> Model:
+        """
+        DPOT3D-M (Medium) foundation model for volumetric data.
+
+        See :meth:`dpot3dTi` for full documentation.
+        """
+        return cls._dpot3d(
+            "dpot3d_M",
+            "M",
+            spatial_size,
+            in_channels,
+            out_channels,
+            in_timesteps,
+            out_timesteps,
+        )
+
+    @classmethod
+    def dpot3dL(
+        cls,
+        spatial_size: int = 64,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        in_timesteps: int = 1,
+        out_timesteps: int = 1,
+    ) -> Model:
+        """
+        DPOT3D-L (Large) foundation model for volumetric data.
+
+        See :meth:`dpot3dTi` for full documentation.
+        """
+        return cls._dpot3d(
+            "dpot3d_L",
+            "L",
+            spatial_size,
+            in_channels,
+            out_channels,
+            in_timesteps,
+            out_timesteps,
+        )
+
+    @classmethod
+    def dpot3dH(
+        cls,
+        spatial_size: int = 64,
+        in_channels: int = 1,
+        out_channels: int = 1,
+        in_timesteps: int = 1,
+        out_timesteps: int = 1,
+    ) -> Model:
+        """
+        DPOT3D-H (Huge) foundation model for volumetric data.
+
+        See :meth:`dpot3dTi` for full documentation.
+        """
+        return cls._dpot3d(
+            "dpot3d_H",
+            "H",
+            spatial_size,
+            in_channels,
+            out_channels,
+            in_timesteps,
+            out_timesteps,
         )

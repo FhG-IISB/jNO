@@ -39,7 +39,7 @@ _u = domain.variable("_u")  # (S, 1, 1, H, W, 1)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 # size must match the spatial resolution (GRID)
-u = jno.np.nn.cno2d(
+u = jno.nn.cno2d(
     in_dim=1,
     out_dim=1,
     size=GRID,

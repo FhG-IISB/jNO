@@ -313,6 +313,7 @@ class TestMemoryStrategies:
         assert 1 <= logs["losses"].shape[0] <= 20
         assert jnp.isfinite(logs["total_loss"][-1])
 
+    @pytest.mark.serial
     def test_offload_data_with_batchsize(self):
         """Host-resident data: stream mini-batches each step."""
         import optax
@@ -341,6 +342,7 @@ class TestMemoryStrategies:
         logs = stats.training_logs[-1]
         assert jnp.isfinite(logs["total_loss"][-1])
 
+    @pytest.mark.serial
     def test_checkpoint_and_offload_combined(self):
         """Both checkpoint_gradients and offload_data active together."""
         import optax
@@ -865,6 +867,7 @@ def test_nnx_initialize_from_pytree():
 class TestGradientAccumulation:
     """Tests for accumulation_steps parameter in core.solve()."""
 
+    @pytest.mark.serial
     def test_accumulation_runs_end_to_end(self):
         """accumulation_steps=2 with batchsize completes without error."""
         import optax
@@ -878,6 +881,7 @@ class TestGradientAccumulation:
         assert logs["losses"].ndim == 2
         assert jnp.isfinite(logs["total_loss"][-1])
 
+    @pytest.mark.serial
     def test_accumulation_with_offload_data(self):
         """accumulation_steps works together with offload_data=True."""
         import optax

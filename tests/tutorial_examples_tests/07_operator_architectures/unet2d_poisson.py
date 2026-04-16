@@ -37,7 +37,7 @@ _u = domain.variable("_u")  # (S, 1, 1, H, W, 1)
 # ── Model ─────────────────────────────────────────────────────────────────────
 # UNet2D: index with [0, ...] to drop the outer sample wrapper dimension;
 # the model receives (1, 1, H, W, 1) which it normalizes internally.
-u = jno.np.nn.unet2d(
+u = jno.nn.unet2d(
     in_channels=1,
     out_channels=1,
     depth=4,

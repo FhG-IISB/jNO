@@ -809,7 +809,7 @@ class core:
         offload_data: bool = False,
         inner_steps: int = 1,
         accumulation_steps: int = 1,
-        min_consecutive: int = 1,
+        min_consecutive: Optional[int] = 1,
         profile: bool = False,
         callbacks: Optional[List] = None,
     ):
@@ -842,7 +842,8 @@ class core:
                 memory stays proportional to *batchsize*.  Requires
                 ``batchsize`` to be set.  Default ``1``.
             min_consecutive: Minimum number of consecutive time steps
-                fed to each constraint evaluation.  Default ``1``.
+                fed to each constraint evaluation. ``None`` means use all
+                available time steps. Default ``1``.
             profile: If ``True``, capture a JAX profiler trace for a
                 short window of steady-state training steps.  The trace
                 is written to ``<logger.path>/traces``.  Default
@@ -1960,7 +1961,7 @@ class core:
         self._resume_step = step
         return self
 
-    def _log_constraint_shapes(self, batchsize, min_consecutive: int = 1):
+    def _log_constraint_shapes(self, batchsize, min_consecutive: Optional[int] = 1):
         """Log the output shape of each constraint by doing a test evaluation.
 
         When the log level is DEBUG, prints a full shape-annotated tree
@@ -2067,12 +2068,13 @@ class core:
 
         return None
 
-    def _build_shape_context(self, min_consecutive: int = 1) -> dict:
+    def _build_shape_context(self, min_consecutive: Optional[int] = 1) -> dict:
         """Build a single-sample runtime context for shape tracing.
 
         The compiled expression uses ``vmap(B) → scan(T) → eval(...)``.
         This method strips B and keeps a temporal window of size
-        ``min_consecutive`` (clamped to available T) so shape tracing mirrors
+        ``min_consecutive`` (clamped to available T), or full T when
+        ``min_consecutive`` is ``None``, so shape tracing mirrors
         what the evaluator receives at runtime.
 
         Returns a plain dict mapping tag → array.
@@ -2082,7 +2084,10 @@ class core:
             _t_arr = jnp.asarray(self.domain_data.context["__time__"])
             if _t_arr.ndim >= 1:
                 t_total = int(_t_arr.shape[0])
-        w_global = max(1, min(int(min_consecutive), t_total))
+        if min_consecutive is None:
+            w_global = t_total
+        else:
+            w_global = max(1, min(int(min_consecutive), t_total))
 
         ctx_single = {}
         for tag, arr in self.domain_data.context.items():
@@ -2109,7 +2114,7 @@ class core:
                 ctx_single[tag] = arr
         return ctx_single
 
-    def _log_shape_traces(self, min_consecutive: int = 1):
+    def _log_shape_traces(self, min_consecutive: Optional[int] = 1):
         """Emit per-node shape trees for constraints and trackers.
 
         Called automatically when log level is DEBUG, or on demand via
@@ -2135,7 +2140,7 @@ class core:
             except Exception as exc:
                 self.log.debug(f"Tracker {i} shape trace failed: {exc}")
 
-    def print_shapes(self, min_consecutive: int = 1):
+    def print_shapes(self, min_consecutive: Optional[int] = 1):
         """Print shape-annotated expression trees to stdout.
 
         Can be called any time after ``compile()`` or ``solve()`` has
@@ -2295,7 +2300,7 @@ class core:
 
         return choices
 
-    def eval(self, operation: Union[List[BinaryOp], BinaryOp], domain: Optional[domain] = None, min_consecutive: int = 1, key=None):
+    def eval(self, operation: Union[List[BinaryOp], BinaryOp], domain: Optional[domain] = None, min_consecutive: Optional[int] = 1, key=None):
         """
         Evaluates an operation or a list of operations on the current models and domain context.
         """

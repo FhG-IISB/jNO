@@ -60,7 +60,7 @@ _u_flat = _u.reshape((1, N, 1))  # (1, N, 1) target
 # ── Model ─────────────────────────────────────────────────────────────────────
 # nks: Fourier modes per spatial dimension
 # in_dim=3: input = (f, x, y) at each node
-u = jno.np.nn.geofno2d(
+u = jno.nn.geofno2d(
     nks=(8, 8),
     Ls=(1.0, 1.0),
     layers=(64, 64, 64, 64),

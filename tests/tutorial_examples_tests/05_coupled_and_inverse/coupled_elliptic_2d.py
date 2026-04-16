@@ -44,8 +44,8 @@ g = 5 * π**2 * sin(2 * π * x) * sin(π * y) + sin(π * x) * sin(π * y)
 key = jax.random.PRNGKey(0)
 k1, k2 = jax.random.split(key)
 
-u_net = jno.np.nn.mlp(in_features=2, hidden_dims=64, num_layers=4, key=k1)
-v_net = jno.np.nn.mlp(in_features=2, hidden_dims=64, num_layers=4, key=k2)
+u_net = jno.nn.mlp(in_features=2, hidden_dims=64, num_layers=4, key=k1)
+v_net = jno.nn.mlp(in_features=2, hidden_dims=64, num_layers=4, key=k2)
 
 for net in [u_net, v_net]:
     net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(10, 1, 1e-3, 1e-5))
@@ -66,10 +66,10 @@ pde2 = -Δv + u - g
 
 # ── Solve ─────────────────────────────────────────────────────────────────────
 crux = jno.core([pde1.mse, pde2.mse], domain)
-history = crux.solve(10)
+history = crux.solve(10000)
 
 _u, _u_exact, _v, _v_exact = crux.eval([u, u_exact, v, v_exact])
 rel_l2_u = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_exact) + 1e-8))
 rel_l2_v = float(jax.numpy.linalg.norm(_v - _v_exact) / (jax.numpy.linalg.norm(_v_exact) + 1e-8))
-assert rel_l2_u < 1.1, f"u relative L2 error too large: {rel_l2_u:.3e}"
-assert rel_l2_v < 1.1, f"v relative L2 error too large: {rel_l2_v:.3e}"
+assert rel_l2_u < 1e-1, f"u relative L2 error too large: {rel_l2_u:.3e}"
+assert rel_l2_v < 1e-1, f"v relative L2 error too large: {rel_l2_v:.3e}"

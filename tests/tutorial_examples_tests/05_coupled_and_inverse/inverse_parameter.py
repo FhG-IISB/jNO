@@ -58,5 +58,12 @@ for net in [a_net, b_net, c_net]:
 
 # ── Solve ─────────────────────────────────────────────────────────────────────
 crux = jno.core([residual.mse], domain)
-history = crux.solve(25)
+history = crux.solve(10000)
 
+_a, _b, _c = crux.eval([a, b, c])
+rel_l2_a = float(jax.numpy.linalg.norm(_a - A_true) / (jax.numpy.linalg.norm(A_true) + 1e-8))
+rel_l2_b = float(jax.numpy.linalg.norm(_b - B_true) / (jax.numpy.linalg.norm(B_true) + 1e-8))
+rel_l2_c = float(jax.numpy.linalg.norm(_c - C_true) / (jax.numpy.linalg.norm(C_true) + 1e-8))
+assert rel_l2_a < 1e-1, f"a relative L2 error too large: {rel_l2_a:.3e}"
+assert rel_l2_b < 1e-1, f"b relative L2 error too large: {rel_l2_b:.3e}"
+assert rel_l2_c < 1e-1, f"c relative L2 error too large: {rel_l2_c:.3e}"

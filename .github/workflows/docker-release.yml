@@ -30,7 +30,7 @@ jobs:
         run: uv sync --extra dev --extra iree
 
       - name: Run tests
-        run: uv run pytest
+        run: uv run pytest -m "not slow"
 
   # ------------------------------------------------------------------
   # CPU image  (linux/amd64)

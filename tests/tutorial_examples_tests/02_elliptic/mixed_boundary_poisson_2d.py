@@ -31,7 +31,7 @@ xb, yb, _ = domain.variable("bottom")
 u_exact = jno.np.sin(pi * x) * jno.np.cos(pi * y)
 forcing = 2 * pi**2 * u_exact
 
-net = jno.np.nn.mlp(in_features=2, hidden_dims=48, num_layers=4, key=jax.random.PRNGKey(14))
+net = jno.nn.mlp(in_features=2, hidden_dims=48, num_layers=4, key=jax.random.PRNGKey(14))
 net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 10, 1e-5))
 
 u = net(x, y) * x * (1 - x)
@@ -43,8 +43,8 @@ neumann_top = jno.np.grad(u_top, yt)
 neumann_bottom = jno.np.grad(u_bottom, yb)
 
 crux = jno.core([pde.mse, neumann_top.mse, neumann_bottom.mse], domain)
-history = crux.solve(10)
+history = crux.solve(5000)
 
 _u, _u_exact = crux.eval([u, u_exact])
 rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_exact) + 1e-8))
-assert rel_l2 < 1.1, f"relative L2 error too large: {rel_l2:.3e}"
+assert rel_l2 < 1e-1, f"relative L2 error too large: {rel_l2:.3e}"

@@ -178,7 +178,7 @@ xt, yt, zt, _ = train_domain.variable("gauss_top", split=True)
 xw, yw, zw, _ = train_domain.variable("gauss_wall", split=True)
 x_int, y_int, z_int, _ = train_domain.variable("interior", split=True)
 
-net = jno.np.nn.mlp(
+net = jno.nn.mlp(
     3,
     hidden_dims=32,
     num_layers=4,

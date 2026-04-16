@@ -51,7 +51,7 @@ _u_flat = _u.reshape((1, N, 1))  # (1, N, 1) target per sample
 # ── Model ─────────────────────────────────────────────────────────────────────
 # branch: encodes f sampled at N sensor points (N, 1)
 # trunk:  encodes 2D query coordinates (N, 2)
-u = jno.np.nn.deeponet(
+u = jno.nn.deeponet(
     branch_type="mlp",
     trunk_type="mlp",
     combination_type="dot",

@@ -1,4 +1,5 @@
 import numpy as np
+
 """
 FNO2D Poisson Operator Learning With Reference Comparison
 =========================================================
@@ -131,13 +132,12 @@ def relative_l2(prediction: np.ndarray, target: np.ndarray) -> float:
     return float(np.linalg.norm((prediction - target).ravel()) / target_norm)
 
 
-
 def main():
     domain = build_training_domain(SAMPLES, GRID)
     forcing_train = domain.variable("_f")
     solution_train = domain.variable("_u")
 
-    model = jno.np.nn.fno2d(
+    model = jno.nn.fno2d(
         in_features=1,
         hidden_channels=48,
         n_modes=24,

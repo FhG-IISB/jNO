@@ -121,7 +121,7 @@ x_int, y_int, _ = train_domain.variable("interior", split=True)
 # ============================================================
 key = jax.random.PRNGKey(0)
 
-net = jno.np.nn.mlp(
+net = jno.nn.mlp(
     2,
     hidden_dims=32,
     num_layers=2,

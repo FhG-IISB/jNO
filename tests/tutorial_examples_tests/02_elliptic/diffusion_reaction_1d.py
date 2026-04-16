@@ -33,7 +33,7 @@ u_exact = jno.np.sin(π * x)
 forcing = (π**2 + σ) * jno.np.sin(π * x)  # f = −u'exact'' + σ u_exact
 
 # ── Network (hard BCs via x(1−x) factor) ─────────────────────────────────────
-u_net = jno.np.nn.mlp(
+u_net = jno.nn.mlp(
     in_features=1,
     hidden_dims=64,
     num_layers=4,
@@ -48,8 +48,8 @@ pde = -u_xx + σ * u - forcing
 
 # ── Solve ─────────────────────────────────────────────────────────────────────
 crux = jno.core([pde.mse], domain)
-history = crux.solve(10)
+history = crux.solve(5000)
 
 _u, _u_exact = crux.eval([u, u_exact])
 rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_exact) + 1e-8))
-assert rel_l2 < 1.1, f"relative L2 error too large: {rel_l2:.3e}"
+assert rel_l2 < 1e-1, f"relative L2 error too large: {rel_l2:.3e}"

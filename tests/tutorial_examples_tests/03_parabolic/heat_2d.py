@@ -39,19 +39,22 @@ domain.summary()
 u_exact = jno.np.exp(-2 * α * π**2 * t) * jno.np.sin(π * x) * jno.np.sin(π * y)
 
 # ── Network ───────────────────────────────────────────────────────────────────
-net = jno.np.nn.mlp(
-    in_features=3,
-    hidden_dims=40,
-    num_layers=3,
+net = jno.nn.deeponet(
+    n_sensors=1,
+    coord_dim=2,
+    n_outputs=1,
+    n_layers=3,
+    basis_functions=64,
+    hidden_dim=40,
     key=jax.random.PRNGKey(0),
 )
 net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(10, 1, 1e-3, 1e-5))
 net.summary()
-txy = jno.np.concat([t, x, y])
-txy0 = jno.np.concat([t0, x0, y0])
+xy = jno.np.concat([x, y])
+xy0 = jno.np.concat([x0, y0])
 
-u = net(txy) * x * (1 - x) * y * (1 - y)
-u0 = net(txy0) * x0 * (1 - x0) * y0 * (1 - y0)
+u = net(t, xy) * x * (1 - x) * y * (1 - y)
+u0 = net(t0, xy0) * x0 * (1 - x0) * y0 * (1 - y0)
 
 # ── Constraints ───────────────────────────────────────────────────────────────
 pde = jno.np.grad(u, t) - α * jno.np.laplacian(u, [x, y])
@@ -59,8 +62,8 @@ ini = u0 - jno.np.sin(π * x0) * jno.np.sin(π * y0)
 
 # ── Solve ─────────────────────────────────────────────────────────────────────
 crux = jno.core([pde.mse, ini.mse], domain).print_shapes()
-history = crux.solve(10)
+history = crux.solve(5000)
 
 _u, _u_exact = crux.eval([u, u_exact])
 rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_exact) + 1e-8))
-assert rel_l2 < 1.1, f"relative L2 error too large: {rel_l2:.3e}"
+assert rel_l2 < 1e-1, f"relative L2 error too large: {rel_l2:.3e}"

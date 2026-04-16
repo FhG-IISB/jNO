@@ -23,6 +23,8 @@ N_MODES = 3
 EPOCHS = 300
 BATCH = 30
 MESH_SIZE = 0.05
+
+
 def triangle_geometry(vertices, mesh_size=MESH_SIZE):
     """Return a pygmsh constructor for a triangle."""
 
@@ -42,10 +44,14 @@ def triangle_geometry(vertices, mesh_size=MESH_SIZE):
         return geo, 2, mesh_size
 
     return constructor
+
+
 def available_points(constructor) -> int:
     temp = jno.domain(constructor=constructor, compute_mesh_connectivity=False)
     pts = temp._mesh_pool["interior"]
     return int(pts.shape[0]) if pts.ndim == 2 else int(pts.shape[1])
+
+
 def random_fourier_field(points: np.ndarray, rng: np.random.Generator, n_modes: int) -> np.ndarray:
     """Generate a smooth random field on points (B, N, 2)."""
     batch, n_pts, _ = points.shape
@@ -59,6 +65,8 @@ def random_fourier_field(points: np.ndarray, rng: np.random.Generator, n_modes: 
             basis = np.sin((i + 1) * np.pi * x) * np.sin((j + 1) * np.pi * y)
             field += coeffs[:, i, j][:, None] * basis[..., 0]
     return field
+
+
 def build_domain(constructor, geom_id: int, rng: np.random.Generator, n_points: int) -> jno.domain:
     base = jno.domain(constructor=constructor, compute_mesh_connectivity=False)
     dom = SAMPLES_PER_GEOM * base
@@ -75,6 +83,8 @@ def build_domain(constructor, geom_id: int, rng: np.random.Generator, n_points: 
     dom.add_tensor_tag("geom_id", np.full((SAMPLES_PER_GEOM, 1), geom_id, dtype=np.float32))
 
     return dom
+
+
 def main():
     rng = np.random.default_rng(SEED)
 
@@ -104,7 +114,7 @@ def main():
     f_vals = _f[:, 0]  # (B, N, 1)
     u_vals = _u[:, 0]  # (B, N, 1)
 
-    model = jno.np.nn.deeponet(
+    model = jno.nn.deeponet(
         branch_type="mlp",
         trunk_type="mlp",
         combination_type="dot",
@@ -134,4 +144,4 @@ def main():
         batchsize=BATCH,
         checkpoint_gradients=False,
         offload_data=False,
-)
+    )

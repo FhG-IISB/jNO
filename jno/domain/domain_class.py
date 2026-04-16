@@ -328,7 +328,38 @@ class domain(MeshIOMixin):
                 time = existing_domain.time
             if compute_mesh_connectivity is None:
                 compute_mesh_connectivity = existing_domain.compute_mesh_connectivity
-            constructor = getattr(existing_domain, "_constructor_source", None)
+
+            cloned = cloudpickle.loads(cloudpickle.dumps(existing_domain))
+            self.__dict__.update(cloned.__dict__)
+            self.log = get_logger()
+            self._algorithm = algorithm
+            self.compute_mesh_connectivity = compute_mesh_connectivity
+            self._constructor_source = getattr(existing_domain, "_constructor_source", None)
+            self.time = time
+            self._is_time_dependent = time is not None
+
+            if getattr(existing_domain, "_is_time_dependent", False):
+                base_mesh_pool = {}
+                for tag, points in self._mesh_pool.items():
+                    if tag == "initial":
+                        continue
+                    if hasattr(points, "ndim") and points.ndim >= 3:
+                        base_mesh_pool[tag] = np.asarray(points[0]).copy()
+                    else:
+                        base_mesh_pool[tag] = np.asarray(points).copy()
+                self._mesh_pool = base_mesh_pool
+
+            self.context = {k: v for k, v in self.context.items() if k != "__time__"}
+            if self._is_time_dependent:
+                self._add_time_dimension(time[0], time[1], time[2])
+            else:
+                self.context["__time__"] = np.ones((1, 1))
+
+            spatial_dims = self.dimension
+            default_spatial = ["x", "y", "z"][:spatial_dims]
+            self.indep = default_spatial + ["t"]
+            self.spatial = [i for i in self.indep if i != "t"]
+            return
 
         if algorithm is None:
             algorithm = 6
@@ -387,10 +418,10 @@ class domain(MeshIOMixin):
         # Generate or load mesh
         if isinstance(constructor, str):
             self._load_mesh(constructor)
-            self.log.info(f"Loaded mesh from the constructor function: {len(self.mesh.points)} points")  # type: ignore[attr-defined]
+            self.log.info(f"Loaded mesh from the constructor function")  # type: ignore[attr-defined]
         elif callable(constructor):
             self._generate_mesh(constructor, algorithm)
-            self.log.info(f"Loaded mesh from {constructor}: {len(self.mesh.points)} points")  # type: ignore[attr-defined]
+            self.log.info(f"Loaded mesh from {constructor}")  # type: ignore[attr-defined]
         else:
             raise ValueError("Must provide either geometry_func or mesh_file")
 
@@ -554,22 +585,10 @@ class domain(MeshIOMixin):
         same spatial mesh).  ``context`` entries are concatenated along the
         batch axis (axis 0).  ``"__time__"`` is shared and not stacked.
         """
-        self_groups = {
-            tag: [(count, points) for count, points, _ in self._sampling_groups_for_tag(tag)]
-            for tag in self._mesh_pool.keys()
-        }
-        other_groups = {
-            tag: [(count, points) for count, points, _ in other._sampling_groups_for_tag(tag)]
-            for tag in other._mesh_pool.keys()
-        }
-        self_normal_groups = {
-            tag: [(count, normals) for count, _, normals in self._sampling_groups_for_tag(tag) if normals is not None]
-            for tag in self._mesh_pool.keys()
-        }
-        other_normal_groups = {
-            tag: [(count, normals) for count, _, normals in other._sampling_groups_for_tag(tag) if normals is not None]
-            for tag in other._mesh_pool.keys()
-        }
+        self_groups = {tag: [(count, points) for count, points, _ in self._sampling_groups_for_tag(tag)] for tag in self._mesh_pool.keys()}
+        other_groups = {tag: [(count, points) for count, points, _ in other._sampling_groups_for_tag(tag)] for tag in other._mesh_pool.keys()}
+        self_normal_groups = {tag: [(count, normals) for count, _, normals in self._sampling_groups_for_tag(tag) if normals is not None] for tag in self._mesh_pool.keys()}
+        other_normal_groups = {tag: [(count, normals) for count, _, normals in other._sampling_groups_for_tag(tag) if normals is not None] for tag in other._mesh_pool.keys()}
 
         for tag, points in other._mesh_pool.items():
             if tag not in self._mesh_pool:
@@ -615,10 +634,12 @@ class domain(MeshIOMixin):
         self.same_domain = False
 
         # Track sub-domain metadata for FD / mesh-connectivity routing.
-        self._sub_domains.append({
-            "mesh_connectivity": other.mesh_connectivity,
-            "batch_count": max(1, other_batch),
-        })
+        self._sub_domains.append(
+            {
+                "mesh_connectivity": other.mesh_connectivity,
+                "batch_count": max(1, other_batch),
+            }
+        )
 
         # Build batch → domain index map: 0 = primary, 1 = first sub, …
         primary_count = max(1, self_batch)
@@ -2161,6 +2182,18 @@ class domain(MeshIOMixin):
                     )
 
             if self._verbose:
+                if is_time_dep:
+                    tag_arr = np.asarray(self.context[tag])
+                    # Time-dependent tag arrays are typically (B, T_tag, N, D).
+                    # Use tag-specific T so regions like 'initial' (T=1) log correctly.
+                    n_time = int(tag_arr.shape[1]) if tag_arr.ndim >= 3 else 1
+                    per_batch_total = n_samples * n_time
+                    if batch_count > 1:
+                        grand_total = per_batch_total * batch_count
+                        self.log.info(f"Sampled {n_samples} spatial points x {n_time} timesteps x {batch_count} batches " f"= {grand_total} spatiotemporal points for '{tag}' with shape {self.context[tag].shape}")
+                    else:
+                        self.log.info(f"Sampled {n_samples} spatial points x {n_time} timesteps " f"= {per_batch_total} spatiotemporal points for '{tag}'")
+                    continue
                 if batch_count > 1:
                     self.log.info(f"Sampled {n_samples} x {batch_count} = {batch_count * n_samples} points for '{tag}' with shape {self.context[tag].shape}")
                 else:

@@ -4,16 +4,16 @@
 
 <p align="center">
     <a href="https://fhg-iisb.github.io/jNO_docs/">
-        <img src="https://img.shields.io/badge/docs-GitHub%20Pages-0aa?style=for-the-badge" alt="Docs"/>
+        <img src="https://img.shields.io/badge/docs-GitHub%20Pages-0aa?style=for-the-badge" alt="Dev Docs"/>
     </a>
     <a href="https://fhg-iisb.github.io/jNO_docs/Tutorials/">
-        <img src="https://img.shields.io/badge/tutorials-step_by_step-0b8f7a?style=for-the-badge" alt="Tutorials"/>
+        <img src="https://img.shields.io/badge/tutorials-step_by_step-0b8f7a?style=for-the-badge" alt="Dev Tutorials"/>
     </a>
     <a href="https://github.com/FhG-IISB/jno/actions/workflows/python-package.yml">
         <img src="https://img.shields.io/github/actions/workflow/status/FhG-IISB/jno/python-package.yml?branch=main&style=for-the-badge&label=tests" alt="Tests"/>
     </a>
     <a href="LICENSE">
-        <img src="https://img.shields.io/badge/license-MIT-2ea44f?style=for-the-badge" alt="License"/>
+        <img src="https://img.shields.io/badge/license-EPL--2.0-2ea44f?style=for-the-badge" alt="License"/>
     </a>
     <a href="CITATION.cff">
         <img src="https://img.shields.io/badge/cite-CITATION.cff-6b5b95?style=for-the-badge" alt="Citation"/>
@@ -100,7 +100,13 @@ CUDA_VISIBLE_DEVICES=<gpu_id> JNO_SEED=<seed> python <filename>.py
 ### Foundation Models
 
 These models are maintained as separate repositories so they can also be used independently.
-If installed, you can access them via:
+If installed via
+
+```
+pip install https://github.com/FhG-IISB/jax_<model_name>.git
+```
+
+you can access them via:
 
 ```python
 jno.nn.<model_name>
