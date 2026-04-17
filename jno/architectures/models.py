@@ -15,7 +15,6 @@ import jax
 import jax.numpy as jnp
 from typing import Callable, Union, Any, overload
 
-from .common import FlaxModelWrapper, FlaxNNXWrapper
 from .linear import Linear
 
 from ..tuner import ArchSpace
@@ -167,20 +166,6 @@ class nn:
             else:
                 raise ValueError("When space= is provided, module must be a CLASS (not instance). " "Use: pnp.nn.wrap(MLP, space=space) not pnp.nn.wrap(MLP(), space=space)")
         else:
-            # Auto-detect flax.nnx modules and wrap in FlaxNNXWrapper so the
-            # equinox partition / optimizer / LoRA / mask machinery works.
-            try:
-                from flax import nnx as _nnx
-
-                if isinstance(module, _nnx.Module):
-                    module = FlaxNNXWrapper(module)
-            except ImportError:
-                pass
+            if not isinstance(module, eqx.Module):
+                raise TypeError(f"nn.wrap() expects an eqx.Module instance, got {type(module).__name__}. " f"Flax modules are no longer supported at runtime. " f"Use the Equinox version of your model (e.g. foundax provides *_eqx variants).")
             return Model(module, name, weight_path)
-
-    @classmethod
-    def flaxwrap(cls, module, input, key=None) -> Model:
-        key = cls._resolve_key(key)
-        params = module.init({"params": key}, *input)
-        wrapped = FlaxModelWrapper(module.apply, params)
-        return cls.wrap(wrapped)
