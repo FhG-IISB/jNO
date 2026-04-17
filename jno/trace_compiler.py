@@ -342,17 +342,12 @@ class TraceCompiler:
         return layers
 
     # ------------------------------------------------------------------
-    # Shape inference (for legacy Flax modules only)
+    # Shape inference (legacy — kept for offline tools)
     # ------------------------------------------------------------------
 
     @staticmethod
     def _infer_arg_shapes(call_args: List, tensor_dims: Dict[str, tuple], existing_params: Dict) -> List[tuple]:
-        """Infer the *normalised* argument shapes for a ModelCall.
-
-        Only needed for legacy Flax modules that require dummy inputs
-        for ``module.init()``.  Equinox modules are constructed eagerly
-        and never reach this code path.
-        """
+        """Infer the *normalised* argument shapes for a ModelCall."""
         TraceEvaluator = _get_evaluator_class()
         abstract_ctx = {tag: jax.ShapeDtypeStruct(tuple(shape), _default_float_dtype()) for tag, shape in tensor_dims.items()}
 
@@ -403,8 +398,7 @@ class TraceCompiler:
     def _cast_model_dtype(model, dtype, logger):
         """Cast all floating-point arrays in *model* to *dtype*.
 
-        Works for both Equinox modules and ``FlaxModelWrapper`` (which
-        wraps a Flax param dict).  Integer arrays are left unchanged.
+        Integer arrays are left unchanged.
         """
 
         def cast_leaf(x):
@@ -500,6 +494,52 @@ class TraceCompiler:
         return merged
 
     @staticmethod
+    def _load_eqx_weights_partial(weight_path: str, model, logger):
+        """Load an Equinox checkpoint, skipping leaves with incompatible shapes.
+
+        Only compatible leaves are loaded; mismatched leaves keep their
+        fresh initialisation.
+        """
+
+        stats = {"matched": 0, "skipped": 0, "matched_leaves": 0, "skipped_leaves": 0}
+
+        def _count_params(arr):
+            return int(arr.size) if hasattr(arr, "size") else 0
+
+        def _filter_spec(f, x):
+            loaded = eqx.default_deserialise_filter_spec(f, x)
+
+            # For non-array leaves default_deserialise_filter_spec returns x
+            # unchanged and does not read from the file.
+            if not eqx.is_array(x) and not isinstance(x, jax.ShapeDtypeStruct):
+                return loaded
+
+            src_shape = tuple(loaded.shape) if hasattr(loaded, "shape") else None
+            dst_shape = tuple(x.shape) if hasattr(x, "shape") else None
+            src_dtype = getattr(loaded, "dtype", None)
+            dst_dtype = getattr(x, "dtype", None)
+
+            shape_ok = src_shape is not None and dst_shape is not None and src_shape == dst_shape
+            dtype_ok = (src_dtype is None) or (dst_dtype is None) or (src_dtype == dst_dtype)
+
+            if shape_ok and dtype_ok:
+                stats["matched"] += _count_params(loaded)
+                stats["matched_leaves"] += 1
+                return loaded
+
+            # Keep fresh init for incompatible leaves.
+            stats["skipped"] += _count_params(x)
+            stats["skipped_leaves"] += 1
+            return x
+
+        loaded_model = eqx.tree_deserialise_leaves(weight_path, model, filter_spec=_filter_spec)
+
+        total = stats["matched"] + stats["skipped"]
+        pct = 100 * stats["matched"] / total if total else 0.0
+        logger.info(f"Equinox checkpoint: {stats['matched']:,}/{total:,} params matched " f"({pct:.4f}%), {stats['skipped']:,} kept fresh init " f"({stats['skipped_leaves']} mismatched leaves)")
+        return loaded_model
+
+    @staticmethod
     def build_single_layer_params(layer, arg_shapes, rng, logger):
         """Retrieve or construct the model for a single layer.
 
@@ -512,129 +552,44 @@ class TraceCompiler:
         module = layer.module
         init_mask = getattr(layer, "_initialize_mask", None)
 
-        # ---- Flax NNX wrapper path ----------------------------------
-        from .architectures.common import FlaxModelWrapper, FlaxNNXWrapper
+        # ---- Equinox path (all models) ------------------------------
+        if not isinstance(module, eqx.Module):
+            raise TypeError(f"Expected an eqx.Module, got {type(module).__name__}. " f"Flax modules are no longer supported at runtime. " f"Use the Equinox version of your model.")
 
-        if isinstance(module, FlaxNNXWrapper) and getattr(layer, "_weight_tree", None) is not None:
-            pretrained = layer._weight_tree
-            try:
-                from flax import nnx as _nnx
+        model = module
 
-                if isinstance(pretrained, _nnx.Module):
-                    # Extract state from the live NNX module
-                    _, pretrained_state = _nnx.split(pretrained)
-                else:
-                    # Assume it already is an nnx.State (or compatible pytree)
-                    pretrained_state = pretrained
-            except ImportError:
-                pretrained_state = pretrained
-            logger.info("Loading pretrained NNX weights from pytree")
-            module = FlaxNNXWrapper.__new__(FlaxNNXWrapper)
-            object.__setattr__(module, "graphdef", layer.module.graphdef)
-            if init_mask is not None:
-                state_mask = init_mask.state if hasattr(init_mask, "state") else init_mask
-                state = jax.tree_util.tree_map(
-                    lambda src, dst, m: src if bool(m) else dst,
-                    pretrained_state,
-                    layer.module.state,
-                    state_mask,
-                )
-            else:
-                state = jax.tree_util.tree_map(lambda src, _: src, pretrained_state, layer.module.state)
-            object.__setattr__(module, "state", state)
-            object.__setattr__(module, "post_fn", layer.module.post_fn)
-            object.__setattr__(module, "default_kwargs", layer.module.default_kwargs)
-            if layer.show:
-                logger.info(f"  FlaxNNXWrapper: {module._param_count():,} parameters")
-            return module
-
-        # ---- Flax Linen wrapper path (msgpack weights) ---------------
-
-        if isinstance(module, FlaxModelWrapper) and (layer.weight_path is not None or getattr(layer, "_weight_tree", None) is not None):
-            if layer.weight_path is not None:
-                logger.info(f"Loading pretrained Flax weights from {layer.weight_path}")
-                from flax.serialization import from_bytes
-
-                with open(layer.weight_path, "rb") as f:
-                    pretrained_params = from_bytes(module.params, f.read())
-            else:
-                # Pytree supplied directly — must be a dict of Flax params
-                pretrained_params = layer._weight_tree
-                logger.info("Loading pretrained Flax weights from pytree")
-
-            # Merge pretrained weights with fresh params
-            merged = TraceCompiler.merge_pretrained_params(
-                pretrained_params,
-                module.params,
-                logger,
-            )
-            # Optional masked initialise: copy only selected leaves from
-            # pretrained params; keep fresh init elsewhere.
-            if init_mask is not None:
-                params_mask = init_mask.params if hasattr(init_mask, "params") else init_mask
-                merged = jax.tree_util.tree_map(
-                    lambda pre, fresh, m: pre if bool(m) else fresh,
-                    merged,
-                    module.params,
-                    params_mask,
-                )
-                logger.info("Applied masked initialise (Flax): loaded target subset only")
-
-            # Return a new FlaxModelWrapper with merged params
-            model = FlaxModelWrapper(
-                module.apply_fn,
-                merged,
-                post_fn=module.post_fn,
-                **module.default_kwargs,
+        if layer.weight_path is not None:
+            logger.info(f"Loading pretrained weights from {layer.weight_path}")
+            model = TraceCompiler._load_eqx_weights_partial(layer.weight_path, model, logger)
+        elif getattr(layer, "_weight_tree", None) is not None:
+            # Pytree supplied directly — copy array leaves from the tree
+            # onto the freshly-initialised model.
+            logger.info("Loading pretrained weights from pytree")
+            model = jax.tree_util.tree_map(
+                lambda src, _: src,
+                layer._weight_tree,
+                model,
             )
 
-            # ---- optional dtype cast --------------------------------
-            if getattr(layer, "_dtype", None) is not None:
-                model = TraceCompiler._cast_model_dtype(model, layer._dtype, logger)
+        if init_mask is not None:
+            model = jax.tree_util.tree_map(
+                lambda pre, fresh, m: pre if bool(m) else fresh,
+                model,
+                module,
+                init_mask,
+            )
+            logger.info("Applied masked initialise: loaded target subset only")
 
-            if layer.show:
-                leaves = jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))
-                total = sum(l.size for l in leaves)
-                logger.info(f"  {type(model).__name__}: {total:,} parameters")
+        # ---- optional dtype cast --------------------------------
+        if getattr(layer, "_dtype", None) is not None:
+            model = TraceCompiler._cast_model_dtype(model, layer._dtype, logger)
 
-            return model
+        if layer.show:
+            leaves = jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))
+            total = sum(l.size for l in leaves)
+            logger.info(f"  {type(model).__name__}: {total:,} parameters")
 
-        # ---- Equinox path (normal) ----------------------------------
-        if isinstance(module, eqx.Module):
-            model = module
-
-            if layer.weight_path is not None:
-                logger.info(f"Loading pretrained weights from {layer.weight_path}")
-                model = eqx.tree_deserialise_leaves(layer.weight_path, model)
-            elif getattr(layer, "_weight_tree", None) is not None:
-                # Pytree supplied directly — copy array leaves from the tree
-                # onto the freshly-initialised model.
-                logger.info("Loading pretrained weights from pytree")
-                model = jax.tree_util.tree_map(
-                    lambda src, _: src,
-                    layer._weight_tree,
-                    model,
-                )
-
-            if init_mask is not None:
-                model = jax.tree_util.tree_map(
-                    lambda pre, fresh, m: pre if bool(m) else fresh,
-                    model,
-                    module,
-                    init_mask,
-                )
-                logger.info("Applied masked initialise: loaded target subset only")
-
-            # ---- optional dtype cast --------------------------------
-            if getattr(layer, "_dtype", None) is not None:
-                model = TraceCompiler._cast_model_dtype(model, layer._dtype, logger)
-
-            if layer.show:
-                leaves = jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))
-                total = sum(l.size for l in leaves)
-                logger.info(f"  {type(model).__name__}: {total:,} parameters")
-
-            return model
+        return model
 
     # ------------------------------------------------------------------
     # Parameter initialisation for all layers
@@ -644,12 +599,9 @@ class TraceCompiler:
     def init_layer_params(all_ops: List, domain_dim: int, tensor_dims: Dict[str, Tuple], rng: jax.Array, logger) -> Tuple[Dict, jax.Array]:
         """Collect / initialise models for all layers.
 
-        For equinox modules (the normal path), the model was already
-        constructed eagerly at factory time — we just store it directly
-        (with optional pretrained weight loading).
-
-        For legacy Flax modules (ScOT / Poseidon), we fall back to
-        shape inference via ``jax.eval_shape`` and ``module.init``.
+        For equinox modules (the only supported path), the model was
+        already constructed eagerly at factory time — we just store it
+        directly (with optional pretrained weight loading).
 
         Returns:
             all_models: Dict mapping layer_id -> callable model
@@ -666,18 +618,7 @@ class TraceCompiler:
                 seen.add(layer.layer_id)
 
                 rng, init_rng = jax.random.split(rng)
-
-                # Fast path: equinox modules are already fully constructed
-                if isinstance(layer.module, eqx.Module):
-                    model = TraceCompiler.build_single_layer_params(layer, None, init_rng, logger)
-                else:
-                    # Legacy Flax: need shape inference first
-                    if call_args is not None:
-                        arg_shapes = TraceCompiler._infer_arg_shapes(call_args, tensor_dims, all_models)
-                    else:
-                        arg_shapes = None
-                    model = TraceCompiler.build_single_layer_params(layer, arg_shapes, init_rng, logger)
-
+                model = TraceCompiler.build_single_layer_params(layer, None, init_rng, logger)
                 all_models[layer.layer_id] = model
 
         return all_models, rng

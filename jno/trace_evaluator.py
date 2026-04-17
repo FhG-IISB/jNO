@@ -550,9 +550,11 @@ class TraceEvaluator:
         else:
             result = model(*shaped_args)
 
-        # Ensure result is (N, 1) when model flattens to (N,).
-        # Networks like DeepONet squeeze n_outputs=1 → (N,), but the
-        # expression tree expects (N, 1) to match variable shapes.
+        # Some foundation models return structured outputs (e.g. ScOTOutput,
+        # tuples) instead of a raw array. Normalize to an array-like payload.
+        if hasattr(result, "output"):
+            result = result.output
+
         if result.ndim == 1 and result.shape[0] > 1:
             result = result[:, jnp.newaxis]
 

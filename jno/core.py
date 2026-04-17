@@ -366,7 +366,7 @@ class core:
             for name, tensor in domain.context.items():
                 if isinstance(tensor, dict) or not hasattr(tensor, "shape"):
                     continue
-                tensor_dims[name] = tensor.shape[1:]
+                tensor_dims[name] = tensor.shape[2:]  # was 1 but I think 2 is right for the (B, T, ...) shape of context tensors
         return tensor_dims
 
     def _populate_missing_context_tags(self, domain) -> None:
@@ -973,35 +973,43 @@ class core:
         lora_param_counts: Dict[int, Any] = {}  # Track LoRA params per model for logging
         for lid, fm in flax_mods.items():
             if fm._lora_config is not None:
-                rank, alpha, lora_target = fm._lora_config
                 self.rng, key = jax.random.split(self.rng)
-                model_before = models[lid]
-                models[lid] = _apply_lora(models[lid], rank, alpha, key=key, target=(lora_target if lora_target is not None else ""))
+                n_params_before = sum(l.size for l in jax.tree_util.tree_leaves(models[lid]) if eqx.is_array(l))
+
+                if isinstance(fm._lora_config, list):
+                    # Per-target LoRA specs
+                    models[lid] = _apply_lora(models[lid], key=key, specs=fm._lora_config)
+                else:
+                    # Uniform LoRA (backward-compatible tuple)
+                    rank, alpha, lora_target = fm._lora_config
+                    models[lid] = _apply_lora(models[lid], rank, alpha, key=key, target=(lora_target if lora_target is not None else ""))
+
                 model_after = models[lid]
-
-                # ── LoRA diagnostic logging ──
-                from .architectures.lora_linear import LoRALinear, FlaxLoRAWrapper
-
-                n_arrays_before = sum(1 for l in jax.tree_util.tree_leaves(model_before) if eqx.is_array(l))
-                n_arrays_after = sum(1 for l in jax.tree_util.tree_leaves(model_after) if eqx.is_array(l))
-                n_params_before = sum(l.size for l in jax.tree_util.tree_leaves(model_before) if eqx.is_array(l))
                 n_params_after = sum(l.size for l in jax.tree_util.tree_leaves(model_after) if eqx.is_array(l))
                 n_lora_params = n_params_after - n_params_before
                 lora_param_counts[lid] = n_lora_params
 
-                if isinstance(model_after, FlaxLoRAWrapper):
-                    # Count LoRA layers from the Flax lora_params dict
-                    n_lora_layers = sum(1 for l in jax.tree_util.tree_leaves(model_after.lora_params) if eqx.is_array(l)) // 2  # each layer has lora_a + lora_b
-                    self.log.info(f"LoRA (Flax) applied to model {lid} (rank={rank}, alpha={alpha}): " f"{n_lora_layers} kernel layers adapted, " f"{n_lora_params:,} new LoRA params")
-                else:
-                    from .architectures.linear import Linear as JNOLinear
+                from .architectures.lora_linear import LoRALinear
 
-                    is_lora = lambda x: isinstance(x, LoRALinear)
-                    lora_leaves_after = [l for l in jax.tree_util.tree_leaves(model_after, is_leaf=is_lora) if isinstance(l, LoRALinear)]
-                    n_lora_layers = len(lora_leaves_after)
-                    self.log.info(f"LoRA applied to model {lid} (rank={rank}, alpha={alpha}): " f"{n_lora_layers} LoRALinear layers, " f"Params: {n_params_before:,}→{n_params_after:,}")
-                    if n_lora_layers == 0:
-                        self.log.warning(f"LoRA: No layers were adapted for model {lid}! " f"LoRA has NO EFFECT on this model.")
+                is_lora = lambda x: isinstance(x, LoRALinear)
+                lora_leaves = [l for l in jax.tree_util.tree_leaves(model_after, is_leaf=is_lora) if isinstance(l, LoRALinear)]
+                n_lora_layers = len(lora_leaves)
+
+                # Group by (rank, alpha) for reporting
+                rank_groups: Dict[tuple, int] = {}
+                for ll in lora_leaves:
+                    rk = (ll.rank, ll.alpha)
+                    rank_groups[rk] = rank_groups.get(rk, 0) + 1
+
+                if len(rank_groups) == 1:
+                    (r, a), cnt = next(iter(rank_groups.items()))
+                    self.log.info(f"LoRA applied to model {lid} (rank={r}, alpha={a}): " f"{cnt} LoRALinear layers, " f"Params: {n_params_before:,}→{n_params_after:,}")
+                else:
+                    parts = [f"r={r}/a={a}×{cnt}" for (r, a), cnt in sorted(rank_groups.items())]
+                    self.log.info(f"LoRA applied to model {lid}: {n_lora_layers} layers " f"[{', '.join(parts)}], " f"Params: {n_params_before:,}→{n_params_after:,}")
+
+                if n_lora_layers == 0:
+                    self.log.warning(f"LoRA: No layers were adapted for model {lid}! " f"LoRA has NO EFFECT on this model.")
 
         # ── 3. Build trainable filter ──
         filter_spec = {}
@@ -1074,6 +1082,32 @@ class core:
         if n_lora_params_total > 0:
             self.log.info(f"    LoRA parameters:       {n_lora_params_total:>12,} (included in trainable)")
             self.log.info(f"    LoRA % of total:       {100.0 * n_lora_params_total / n_total_params:>11.2f}%")
+
+        # ── Per-model policy report ──
+        for lid, model in models.items():
+            fm = flax_mods.get(lid)
+            if fm is None:
+                continue
+            mname = fm.name or type(fm.module).__name__
+            m_total = sum(l.size for l in jax.tree_util.tree_leaves(model) if eqx.is_array(l))
+            fspec = filter_spec.get(lid)
+            if fspec is not None:
+                m_train = sum(
+                    l.size
+                    for l, f in zip(
+                        jax.tree_util.tree_leaves(model),
+                        jax.tree_util.tree_leaves(fspec),
+                    )
+                    if eqx.is_array(l) and f is True
+                )
+            else:
+                m_train = m_total
+            m_frozen = m_total - m_train
+            m_lora = lora_param_counts.get(lid, 0)
+            policy = "LoRA" if fm._lora_config else ("frozen" if fm._frozen else "full fine-tune")
+            if fm._trainable_param_mask is not None and fm._lora_config:
+                policy = "LoRA + partial base"
+            self.log.info(f"    [{mname}] policy={policy}  train={m_train:,}  frozen={m_frozen:,}  lora={m_lora:,}")
 
         # Shard trainable params
         trainable = self._shard_params(trainable)

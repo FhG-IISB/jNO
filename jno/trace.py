@@ -876,7 +876,7 @@ class Model(Placeholder):
 
         # ── training config (plain Python, not JAX arrays) ──
         self._frozen: bool = False
-        self._lora_config: tuple[int, float, str | None] | None = None  # (rank, alpha, target_str | None) or None
+        self._lora_config: tuple[int, float, str | None] | list[dict] | None = None  # (rank, alpha, target) | [{"target":..,"rank":..,"alpha":..}] | None
         self._opt_fn = None  # optax optimizer factory / instance
         self._lr = LearningRateSchedule(1.0)
         self._dtype = None  # target dtype (e.g. jnp.bfloat16) or None
@@ -1069,8 +1069,24 @@ class Model(Placeholder):
         self._mask_scope_pending = self._param_mask is not None
         return self
 
-    def lora(self, rank: int = 4, alpha: float = 1.0):
+    def lora(self, rank: int = 4, alpha: float = 1.0, *, specs: list[dict] | None = None):
         """Enable LoRA fine-tuning for this model.
+
+        Two calling conventions:
+
+        1. **Uniform** (backward-compatible)::
+
+               NN.lora(rank=8, alpha=16)
+
+        2. **Per-target** — different rank/alpha per layer group::
+
+               NN.lora(specs=[
+                   {"target": "encoder", "rank": 4,  "alpha": 1.0},
+                   {"target": "decoder", "rank": 16, "alpha": 4.0},
+               ])
+
+           Each ``target`` is a regex matched against the pytree path of
+           ``Linear`` leaves.  The first matching spec wins.
 
         By default only the low-rank adapters are trained; base weights are
         frozen.
@@ -1079,35 +1095,25 @@ class Model(Placeholder):
 
             NN.freeze().mask(param_mask).lora(rank=8, alpha=16)
 
-        ``mask(...)`` is one-shot and consumed by the next mutator call.
-        To keep masked scoping across multiple mutators, chain them::
-
-            NN.optimizer(optax.adam(...))
-            NN.mask(param_mask).lora(rank=4).optimizer(optax.adamw(...))
-
-        Splitting into separate statements changes semantics because the
-        mask scope is already consumed by ``lora(...)``::
-
-            NN.mask(param_mask).lora(rank=4)
-            NN.optimizer(optax.adamw(...))  # global overwrite
-
         Args:
-            rank:  LoRA rank.
-            alpha: LoRA scaling factor.
+            rank:  LoRA rank (uniform mode).
+            alpha: LoRA scaling factor (uniform mode).
+            specs: List of per-target LoRA specs (per-target mode).
+                   Each dict has keys ``target`` (str regex), ``rank`` (int),
+                   ``alpha`` (float).
         """
         if self._mask_scope_pending and self._param_mask is not None:
-            # mask(...).lora(): freeze selected base params while keeping
-            # non-selected base params trainable in addition to LoRA params.
             self._trainable_param_mask = jax.tree_util.tree_map(
                 lambda x: (not x) if isinstance(x, bool) else False,
                 self._param_mask,
             )
         else:
-            # Plain lora(): clear any stale partial-trainability mask so
-            # base parameters are frozen by default and only LoRA adapters train.
             self._trainable_param_mask = None
         self._mask_scope_pending = False
-        self._lora_config = (rank, alpha, None)
+        if specs is not None:
+            self._lora_config = list(specs)
+        else:
+            self._lora_config = (rank, alpha, None)
         return self
 
     def optimizer(self, opt_fn, *, lr=None):
@@ -1207,8 +1213,7 @@ class Model(Placeholder):
 
           - *Equinox* modules: path written by
             ``eqx.tree_serialise_leaves``.
-          - *Flax* ``FlaxModelWrapper``: path to a ``.msgpack`` weights
-            file.  Shape-mismatched arrays are re-initialised automatically.
+            Shape-mismatched arrays are re-initialised automatically.
 
         * **Pytree** (any non-string value, e.g. an ``eqx.Module`` instance
           or a plain dict of arrays) — the tree is stored directly and
@@ -1418,8 +1423,8 @@ class ModelCall(Placeholder):
         self.model.mask(param_mask)
         return self
 
-    def lora(self, rank: int = 4, alpha: float = 1.0):
-        self.model.lora(rank, alpha)
+    def lora(self, rank: int = 4, alpha: float = 1.0, *, specs: list[dict] | None = None):
+        self.model.lora(rank, alpha, specs=specs)
         return self
 
     def optimizer(self, opt_fn, *, lr=None):
