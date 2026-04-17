@@ -1404,11 +1404,11 @@ def _infer_solver_target(domain, expr):
 # Lower once, dispatch many
 # -----------------------------------------------------------------------------
 def lower_weak_form(domain, expr, trial_value=None, for_target="vpinn"):
-    print("DEBUG lower_weak_form has StateField before wrap:",
-      _contains_node_type(domain, expr, StateField))
+    #print("DEBUG lower_weak_form has StateField before wrap:",
+      #_contains_node_type(domain, expr, StateField))
     #expr = _ensure_statefield_wrapped(domain, expr)
-    print("DEBUG lower_weak_form has StateField after wrap:",
-      _contains_node_type(domain, expr, StateField))
+    #print("DEBUG lower_weak_form has StateField after wrap:",
+      #_contains_node_type(domain, expr, StateField))
     shared_trial_symbol = None
     if for_target == "fem":
         sf = _find_first_statefield(expr)

@@ -424,15 +424,27 @@ def _eval_expr_for_feax(domain, node, local):
 
         # FEAX local quadrature coordinates
         if local.get("surface", False):
-            # Any boundary quadrature variable like gauss_right, gauss_top, gauss_wall
-            # should read from the current surface quad points inside that surface kernel.
             if isinstance(node.tag, str) and node.tag.startswith("gauss_"):
                 return local["physical_quad_points"][..., dim_start:dim_end]
-
         else:
-            # Volume quadrature variable
             if node.tag == "fem_gauss":
                 return local["physical_quad_points"][..., dim_start:dim_end]
+
+        # Temporal variable in FEAX assembly:
+        # treat time as a scalar/shared value for the current assembly call,
+        # not as the full stored __time__ trajectory.
+        if getattr(node, "axis", None) == "temporal":
+            if node.tag not in local["domain_context"]:
+                raise KeyError(f"Temporal Variable tag '{node.tag}' not found in FEAX domain context.")
+            arr = jnp.asarray(local["domain_context"][node.tag])
+
+            # Accept shapes like (), (1,), (1,1), (T,1), ...
+            # During FEAX assembly we want ONE time value only.
+            t_scalar = jnp.reshape(arr, (-1,))[0]
+
+            # Return shape (1,) so it broadcasts cleanly against local FE
+            # quadrature arrays like (nq,1) or component arrays.
+            return jnp.asarray([t_scalar])
 
         # Fallback to stored tensor/point-data context
         if node.tag in local["domain_context"]:
@@ -754,7 +766,7 @@ def _make_feax_dirichlet_specs(domain, vec: int):
     return specs
 
 
-def _build_feax_problem(domain, ir):
+def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_domain: bool = True):
     import feax as fe
     trial_cache = {}
 
@@ -763,7 +775,7 @@ def _build_feax_problem(domain, ir):
         k: _lower_statefield_to_trial(v, trial_cache)
         for k, v in ir.boundary_exprs.items()
     }
-    print("DEBUG FEAX volume_expr after StateField->Trial lowering:", volume_expr)
+    #print("DEBUG FEAX volume_expr after StateField->Trial lowering:", volume_expr)
     if volume_expr is None and len(boundary_exprs) == 0:
         raise ValueError("No terms found for FEM assembly.")
 
@@ -817,11 +829,12 @@ def _build_feax_problem(domain, ir):
         location_fns=location_fns,
     )
 
-    bc_specs = _make_feax_dirichlet_specs(domain, vec)
-    bc = fe.DirichletBCConfig(bc_specs).create_bc(problem) if len(bc_specs) > 0 else fe.DirichletBCConfig([]).create_bc(problem)
+    bc_specs = _make_feax_dirichlet_specs(domain, vec) if apply_dirichlet else []
+    bc = fe.DirichletBCConfig(bc_specs).create_bc(problem)
 
-    domain._feax_problem = problem
-    domain._feax_bc = bc
+    if store_on_domain:
+        domain._feax_problem = problem
+        domain._feax_bc = bc
 
     return problem, bc
 

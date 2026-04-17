@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, Tuple
 from contextlib import contextmanager
 import numpy as np
+import jax
 import jax.numpy as jnp
 from ..trace import BinaryOp, FunctionCall, Hessian, Jacobian, Literal, Placeholder, StateField, TestFunction, TrialFunction, Variable
 from .backend_blocks import DiffraxBlock, FeaxTimeBlock
@@ -325,11 +326,13 @@ def _temporary_time_value(domain, t_value: float):
     try:
         if had_main:
             arr = np.asarray(domain.context["__time__"])
-            domain.context["__time__"] = np.full(arr.shape, t_value, dtype=arr.dtype)
+            dtype = arr.dtype if arr.size > 0 else np.float32
+            domain.context["__time__"] = np.asarray([[t_value]], dtype=dtype)
 
         for k in local_keys:
             arr = np.asarray(domain.context[k])
-            domain.context[k] = np.full(arr.shape, t_value, dtype=arr.dtype)
+            dtype = arr.dtype if arr.size > 0 else np.float32
+            domain.context[k] = np.asarray([[t_value]], dtype=dtype)
 
         yield
     finally:
@@ -337,7 +340,6 @@ def _temporary_time_value(domain, t_value: float):
             domain.context["__time__"] = old_main
         for k, v in old_local.items():
             domain.context[k] = v
-
 
 def _build_first_order_semidiscrete_operators(domain, ir, mass_expr, residual_expr, boundary_exprs):
     """
@@ -616,6 +618,129 @@ def _dense_array(A):
     return jnp.asarray(A)
 
 
+def _is_linear_first_order_ir(ir) -> bool:
+    """
+    Narrow structural check for the current JAX-native semidiscrete path.
+
+    Conditions:
+    - first-order in time
+    - raw weak-form terms
+    - no obvious nonlinear function of TrialFunction
+    """
+    from .weak_form import _is_obviously_nonlinear_in_unknown
+
+    for term in ir.terms:
+        if term.channel != "raw":
+            return False
+        if _is_obviously_nonlinear_in_unknown(ir.domain, term.coeff):
+            return False
+    return True
+
+
+def _should_use_linear_semidiscrete_path(ir, kwargs) -> bool:
+    if "linear" in kwargs:
+        return bool(kwargs["linear"])
+    return _is_linear_first_order_ir(ir)
+
+
+def _to_numpy_dense(A):
+    if hasattr(A, "todense"):
+        return np.asarray(A.todense())
+    if hasattr(A, "toarray"):
+        return np.asarray(A.toarray())
+    return np.asarray(A)
+
+
+def _ir_temporal_tags(ir) -> list[str]:
+    tags = set()
+    for term in ir.terms:
+        tags.update(_collect_temporal_tags(term.coeff))
+    return sorted(tags)
+
+
+def _prepare_src_runtime(domain, src_ir):
+    """
+    Build a pure source/load runtime ONCE.
+
+    Important:
+    - no Dirichlet elimination
+    - do not overwrite domain._feax_problem / _feax_bc
+    - src_ir is expected to contain only non-trial terms
+    """
+    import feax as fe
+    from .fem_route import _build_feax_problem, _default_float_dtype
+
+    problem, bc = _build_feax_problem(
+        domain,
+        src_ir,
+        apply_dirichlet=False,
+        store_on_domain=False,
+    )
+
+    internal_vars = fe.InternalVars()
+    res_bc = fe.create_res_bc_function(problem, bc)
+    size = int(problem.num_total_dofs_all_vars)
+
+    u_zero = jnp.zeros((size,), dtype=_default_float_dtype())
+
+    return {
+        "size": size,
+        "u_zero": u_zero,
+        "res_bc": res_bc,
+        "internal_vars": internal_vars,
+    }
+
+
+def _eval_src_vector_host(domain, runtime, t_value, dtype):
+    """
+    Evaluate the pure source/load vector at one time value.
+
+    Since src_ir contains no TrialFunction terms, the source vector is
+
+        b(t) = -r_src(0, t)
+
+    for the FEAX residual assembled from the source-only weak form.
+    """
+    with _temporary_time_value(domain, float(t_value)):
+        r_t = runtime["res_bc"](runtime["u_zero"], runtime["internal_vars"])
+
+    return np.asarray(-np.asarray(r_t), dtype=np.dtype(dtype)).reshape(-1)
+
+
+def _build_auto_forcing_vector_fn(domain, src_ir, *, size, dtype):
+    if src_ir is None or len(src_ir.terms) == 0:
+        return None
+
+    runtime = _prepare_src_runtime(domain, src_ir)
+    if int(runtime["size"]) != int(size):
+        raise ValueError(
+            f"Auto forcing runtime size mismatch: runtime size={runtime['size']}, expected {size}."
+        )
+
+    temporal_tags = _ir_temporal_tags(src_ir)
+
+    # time-independent forcing -> assemble once
+    if len(temporal_tags) == 0:
+        const_vec = _eval_src_vector_host(domain, runtime, t_value=0.0, dtype=dtype)
+        const_vec = jnp.asarray(const_vec, dtype=dtype)
+
+        def forcing_vector_fn(t, args=None):
+            return const_vec
+
+        return forcing_vector_fn
+
+    # time-dependent forcing -> callback over current time
+    out_spec = jax.ShapeDtypeStruct((int(size),), jnp.dtype(dtype))
+
+    def _host_eval(t_host):
+        t_scalar = np.asarray(t_host).reshape(()).item()
+        return _eval_src_vector_host(domain, runtime, t_value=t_scalar, dtype=dtype)
+
+    def forcing_vector_fn(t, args=None):
+        return jax.pure_callback(_host_eval, out_spec, t)
+
+    return forcing_vector_fn
+
 def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
     if not hasattr(domain, "_feax_context"):
         raise ValueError(
@@ -663,8 +788,10 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
     # ------------------------------------------------------------------
     # New narrow linear JAX-native path
     # ------------------------------------------------------------------
-    if kwargs.get("linear", False):
-        from .fem_route import _assemble_fem_system_from_ir
+    use_linear_path = _should_use_linear_semidiscrete_path(ir, kwargs)
+
+    if use_linear_path:
+        from .fem_route import _assemble_fem_system_from_ir, _build_feax_mesh
 
         mass_ir, op_ir, src_ir = _split_first_order_linear_terms(ir)
 
@@ -674,16 +801,6 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
                 "Expected something like u_t * phi."
             )
 
-        # We intentionally require the user to provide a JAX forcing vector callback
-        # for any nonzero source/load contribution, rather than doing Python-side
-        # FEAX reassembly inside the RHS.
-        if len(src_ir.terms) > 0 and kwargs.get("forcing_vector_fn", None) is None:
-            raise ValueError(
-                "Linear semidiscrete FEAX-time path detected source/load terms. "
-                "Please pass forcing_vector_fn(t, args) as a pure JAX callback, "
-                "or assemble an operator-only weak form and provide the load externally."
-            )
-
         M_sys, bM = _assemble_fem_system_from_ir(domain, mass_ir)
         A_sys, bA = _assemble_fem_system_from_ir(domain, op_ir)
 
@@ -691,13 +808,55 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         A = _dense_array(A_sys)
         affine_bias = jnp.asarray(bA).reshape(-1)
 
+        feax_problem = getattr(domain, "_feax_problem", None)
+        feax_mesh = getattr(feax_problem, "mesh", None)
+
+        if feax_mesh is None:
+            element_type = getattr(domain, "_fem_element_type", "TRI3")
+            feax_mesh = _build_feax_mesh(domain, element_type)
+
+        forcing_vector_fn = kwargs.get("forcing_vector_fn", None)
+        auto_forcing = False
+        forcing_mode = "none"
+
+        if forcing_vector_fn is not None:
+            forcing_mode = "user_callback"
+        elif len(src_ir.terms) > 0:
+            forcing_vector_fn = _build_auto_forcing_vector_fn(
+                domain,
+                src_ir,
+                size=M.shape[0],
+                dtype=M.dtype,
+            )
+            auto_forcing = True
+            forcing_mode = "weak_auto"
+
         metadata["phase"] = "phase_2_linear_jax"
         metadata["lowering_complete"] = True
-        metadata["notes"] = (
-            "Linear semidiscrete JAX FEAX block assembled. "
-            "Runtime data are pure JAX arrays/callables. "
-            "Use block.as_diffrax(...) to obtain a Diffrax ODETerm."
-        )
+        metadata["forcing_terms"] = int(len(src_ir.terms))
+        metadata["forcing_temporal_tags"] = _ir_temporal_tags(src_ir)
+        metadata["auto_forcing"] = bool(auto_forcing)
+        metadata["forcing_mode"] = forcing_mode
+        metadata["linear_inferred"] = "linear" not in kwargs
+        metadata["linear_path_selected"] = bool(use_linear_path)
+
+        if forcing_mode == "weak_auto":
+            metadata["notes"] = (
+                "Linear semidiscrete JAX FEAX block assembled. "
+                "M, A, affine_bias, and forcing_vector_fn are populated for external solvers. "
+                "Forcing was auto-lowered from non-trial weak-form terms."
+            )
+        elif forcing_mode == "user_callback":
+            metadata["notes"] = (
+                "Linear semidiscrete JAX FEAX block assembled. "
+                "M, A, affine_bias, and forcing_vector_fn are populated for external solvers. "
+                "Forcing uses the user-supplied callback."
+            )
+        else:
+            metadata["notes"] = (
+                "Linear semidiscrete JAX FEAX block assembled. "
+                "M, A, affine_bias, and forcing_vector_fn are populated for external solvers."
+            )
 
         return FeaxTimeBlock(
             backend="feax_time",
@@ -722,7 +881,9 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             M=M,
             A=A,
             affine_bias=affine_bias,
-            forcing_vector_fn=kwargs.get("forcing_vector_fn", None),
+            forcing_vector_fn=forcing_vector_fn,
+            feax_mesh=feax_mesh,
+            forcing_mode=forcing_mode,
         )
 
     # ------------------------------------------------------------------
