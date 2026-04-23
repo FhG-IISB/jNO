@@ -222,71 +222,6 @@ def _split_mass_and_residual_from_ir(ir) -> Tuple[Any, Any, Dict[str, Any]]:
     return mass_expr, residual_expr, boundary_exprs
 
 
-def _is_temporal_jacobian_of_trial(node: Any) -> bool:
-    return (
-        isinstance(node, Jacobian)
-        and isinstance(node.target, TrialFunction)
-        and any(_is_temporal_var(v) for v in node.variables)
-    )
-
-
-def _strip_temporal_trial_derivative(node: Any) -> Any:
-    """
-    Convert Jacobian(TrialFunction, [t]) -> TrialFunction.
-
-    This is the key step for building the FE mass matrix from a weak term like
-        ∫ u_t * phi
-    by turning it into
-        ∫ u * phi
-    during spatial semidiscretization.
-
-    Phase 1:
-    - first-order in time only
-    - only strips temporal derivatives directly on TrialFunction
-    """
-    if _is_temporal_jacobian_of_trial(node):
-        return node.target
-
-    if isinstance(node, BinaryOp):
-        return BinaryOp(
-            node.op,
-            _strip_temporal_trial_derivative(node.left),
-            _strip_temporal_trial_derivative(node.right),
-        )
-
-    if isinstance(node, FunctionCall):
-        new_args = [
-            _strip_temporal_trial_derivative(a) if isinstance(a, Placeholder) else a
-            for a in node.args
-        ]
-        if hasattr(node, "copy_with_args"):
-            return node.copy_with_args(new_args)
-        return FunctionCall(
-            node.fn,
-            new_args,
-            name=getattr(node, "_name", None),
-            reduces_axis=getattr(node, "reduces_axis", None),
-            kwargs=getattr(node, "kwargs", None),
-        )
-
-    if isinstance(node, Jacobian):
-        new_target = _strip_temporal_trial_derivative(node.target)
-        new_vars = [
-            _strip_temporal_trial_derivative(v) if isinstance(v, Placeholder) else v
-            for v in node.variables
-        ]
-        return Jacobian(new_target, new_vars, node.scheme)
-
-    if isinstance(node, Hessian):
-        new_target = _strip_temporal_trial_derivative(node.target)
-        new_vars = [
-            _strip_temporal_trial_derivative(v) if isinstance(v, Placeholder) else v
-            for v in node.variables
-        ]
-        return Hessian(new_target, new_vars, node.scheme, trace=node.trace)
-
-    return node
-
 
 def _filter_ir_terms(ir, predicate):
     from .weak_form import LoweredWeakForm
@@ -341,19 +276,104 @@ def _temporary_time_value(domain, t_value: float):
         for k, v in old_local.items():
             domain.context[k] = v
 
+def _make_internal_vars(fe_module, temporal_tags, t, *, n_cells: int, dtype=None, extra_volume_vars=()):
+    """
+    Build FEAX InternalVars in a batched shape FEAX can slice.
+
+    Each temporal variable is broadcast to shape (n_cells, 1).
+    """
+    vol = []
+
+    if temporal_tags:
+        t0 = jnp.asarray(t, dtype=dtype)
+        t_batched = jnp.full((int(n_cells), 1), t0, dtype=t0.dtype)
+        vol.extend([t_batched for _ in temporal_tags])
+
+    for v in extra_volume_vars:
+        arr = jnp.asarray(v, dtype=dtype)
+        if arr.ndim == 0:
+            arr = jnp.full((int(n_cells), 1), arr, dtype=arr.dtype)
+        vol.append(arr)
+
+    return fe_module.InternalVars(volume_vars=tuple(vol))
+
+def _prepare_feax_runtime(
+    domain,
+    ir,
+    *,
+    apply_dirichlet=True,
+    need_jacobian=True,
+    symmetric_bc=True,
+):
+    import feax as fe
+    from .fem_route import _build_feax_problem, _default_float_dtype, _meshio_type_for_element
+
+    problem, bc = _build_feax_problem(
+        domain,
+        ir,
+        apply_dirichlet=apply_dirichlet,
+        store_on_domain=False,
+    )
+
+    res_bc = fe.create_res_bc_function(problem, bc)
+    jac_bc = (
+        fe.create_J_bc_function(problem, bc, symmetric=symmetric_bc)
+        if need_jacobian
+        else None
+    )
+
+    size = int(problem.num_total_dofs_all_vars)
+    dtype = _default_float_dtype()
+
+    try:
+        u_ref = fe.zero_like_initial_guess(problem, bc)
+    except Exception:
+        u_ref = jnp.zeros((size,), dtype=dtype)
+
+    u_ref = jnp.asarray(u_ref, dtype=dtype)
+    temporal_tags = tuple(_ir_temporal_tags(ir))
+
+    # robust cell count lookup
+    # Robust cell count lookup: use the domain mesh directly.
+    # This is the same source used by _build_feax_mesh(...) in fem_route.py.
+    element_type = getattr(domain, "_fem_element_type", None)
+    if element_type is None:
+        element_type = "TRI3"
+
+    meshio_type = _meshio_type_for_element(element_type)
+
+    if meshio_type not in domain.mesh.cells_dict:
+        raise KeyError(
+            f"Mesh cell type '{meshio_type}' for element_type='{element_type}' "
+            f"not found in domain.mesh.cells_dict. "
+            f"Available: {list(domain.mesh.cells_dict.keys())}"
+        )
+
+    n_cells = int(np.asarray(domain.mesh.cells_dict[meshio_type]).shape[0])
+
+    return {
+        "problem": problem,
+        "bc": bc,
+        "res_bc": res_bc,
+        "jac_bc": jac_bc,
+        "size": size,
+        "dtype": dtype,
+        "u_ref": u_ref,
+        "temporal_tags": temporal_tags,
+        "n_cells": n_cells,
+    }
+
 def _build_first_order_semidiscrete_operators(domain, ir, mass_expr, residual_expr, boundary_exprs):
     """
-    Build callables for the semidiscrete problem
+    Build pure-JAX callable operators for the semidiscrete problem
 
         M(t) u_dot + R(u,t) = 0
 
-    Phase 1 assumptions:
-    - first-order only
-    - one unknown
-    - FEAX weak route
+    This version caches FEAX problem/operator construction ONCE and
+    reuses the resulting res_bc/jac_bc callables many times.
     """
+    import feax as fe
     from .weak_form import LoweredWeakForm, LoweredChannelTerm
-    from .fem_route import _assemble_fem_system_from_ir, _assemble_fem_residual_from_ir
 
     # -------------------------
     # Build mass IR
@@ -379,7 +399,6 @@ def _build_first_order_semidiscrete_operators(domain, ir, mass_expr, residual_ex
 
     # -------------------------
     # Build residual IR
-    # volume residual + boundary residual
     # -------------------------
     residual_terms = []
     for term in ir.terms:
@@ -390,25 +409,93 @@ def _build_first_order_semidiscrete_operators(domain, ir, mass_expr, residual_ex
 
     residual_ir = LoweredWeakForm(domain=domain, terms=residual_terms)
 
-    def mass_fn(t, args=None):
-        with _temporary_time_value(domain, float(t)):
-            A, _ = _assemble_fem_system_from_ir(domain, mass_ir)
-            return A
+    if len(mass_ir.terms) == 0:
+        raise ValueError(
+            "Nonlinear semidiscrete path could not extract a mass term. "
+            "Expected something like u_t * phi."
+        )
 
-    def residual_fn(u_flat, t, args=None):
-        with _temporary_time_value(domain, float(t)):
-            op = _assemble_fem_residual_from_ir(domain, residual_ir)
-            return op.residual(u_flat)
+    mass_rt = _prepare_feax_runtime(
+        domain,
+        mass_ir,
+        apply_dirichlet=True,
+        need_jacobian=True,
+        symmetric_bc=True,
+    )
+    residual_rt = _prepare_feax_runtime(
+        domain,
+        residual_ir,
+        apply_dirichlet=True,
+        need_jacobian=True,
+        symmetric_bc=True,
+    )
 
-    def jacobian_fn(u_flat, t, args=None):
-        with _temporary_time_value(domain, float(t)):
-            op = _assemble_fem_residual_from_ir(domain, residual_ir)
-            if op.jacobian is None:
-                raise ValueError("No jacobian available for semidiscrete residual.")
-            return op.jacobian(u_flat)
+    # -------------------------
+    # Mass operator
+    # -------------------------
+    if mass_rt["jac_bc"] is None:
+        raise ValueError("Mass runtime did not produce a Jacobian operator.")
+
+    if len(mass_rt["temporal_tags"]) == 0:
+        M_const = _dense_array(mass_rt["jac_bc"](mass_rt["u_ref"], fe.InternalVars()))
+        M_const = jnp.asarray(M_const, dtype=mass_rt["dtype"])
+
+        def mass_fn(t, args=None):
+            return M_const
+    else:
+        def mass_fn(t, args=None):
+            iv = _make_internal_vars(
+                    fe,
+                    mass_rt["temporal_tags"],
+                    t,
+                    n_cells=mass_rt["n_cells"],
+                    dtype=mass_rt["dtype"],
+                )
+            M_t = _dense_array(mass_rt["jac_bc"](mass_rt["u_ref"], iv))
+            return jnp.asarray(M_t, dtype=mass_rt["dtype"])
+
+    # -------------------------
+    # Residual / Jacobian operators
+    # -------------------------
+    if residual_rt["jac_bc"] is None:
+        raise ValueError("Residual runtime did not produce a Jacobian operator.")
+
+    if len(residual_rt["temporal_tags"]) == 0:
+        iv_res0 = fe.InternalVars()
+
+        def residual_fn(u_flat, t, args=None):
+            u_flat = jnp.asarray(u_flat, dtype=residual_rt["dtype"]).reshape(-1)
+            return jnp.asarray(residual_rt["res_bc"](u_flat, iv_res0), dtype=residual_rt["dtype"]).reshape(-1)
+
+        def jacobian_fn(u_flat, t, args=None):
+            u_flat = jnp.asarray(u_flat, dtype=residual_rt["dtype"]).reshape(-1)
+            J = _dense_array(residual_rt["jac_bc"](u_flat, iv_res0))
+            return jnp.asarray(J, dtype=residual_rt["dtype"])
+    else:
+        def residual_fn(u_flat, t, args=None):
+            u_flat = jnp.asarray(u_flat, dtype=residual_rt["dtype"]).reshape(-1)
+            iv = _make_internal_vars(
+                    fe,
+                    residual_rt["temporal_tags"],
+                    t,
+                    n_cells=residual_rt["n_cells"],
+                    dtype=residual_rt["dtype"],
+                )
+            return jnp.asarray(residual_rt["res_bc"](u_flat, iv), dtype=residual_rt["dtype"]).reshape(-1)
+
+        def jacobian_fn(u_flat, t, args=None):
+            u_flat = jnp.asarray(u_flat, dtype=residual_rt["dtype"]).reshape(-1)
+            iv = _make_internal_vars(
+                    fe,
+                    residual_rt["temporal_tags"],
+                    t,
+                    n_cells=residual_rt["n_cells"],
+                    dtype=residual_rt["dtype"],
+                )
+            J = _dense_array(residual_rt["jac_bc"](u_flat, iv))
+            return jnp.asarray(J, dtype=residual_rt["dtype"])
 
     return mass_fn, residual_fn, jacobian_fn
-
 
 # -----------------------------------------------------------------------------
 # Public backend lowerers
@@ -491,37 +578,26 @@ def _contains_trial(node: Any) -> bool:
     return _contains_node_type(node, TrialFunction)
 
 
+def _is_temporal_jacobian_of_trial(node: Any) -> bool:
+    return (
+        isinstance(node, Jacobian)
+        and isinstance(node.target, TrialFunction)
+        and any(_is_temporal_var(v) for v in node.variables)
+    )
+
+
 def _strip_temporal_trial_derivative(node: Any) -> Any:
     """
-    Replace d/dt(TrialFunction) -> TrialFunction.
+    Replace d/dt(TrialFunction) with TrialFunction.
 
-    This is used to turn a weak mass term like
-        ∫ u_t phi
-    into the spatial mass operator
-        ∫ u phi
+    Used when converting first-order weak transient terms like
+        ∫ u_t * phi
+    into a spatial mass operator
+        ∫ u * phi
+    during semidiscrete assembly.
     """
-    if isinstance(node, Jacobian):
-        if isinstance(node.target, TrialFunction) and any(_is_temporal_var(v) for v in node.variables):
-            return node.target
-        return Jacobian(
-            _strip_temporal_trial_derivative(node.target),
-            [
-                _strip_temporal_trial_derivative(v) if isinstance(v, Placeholder) else v
-                for v in node.variables
-            ],
-            node.scheme,
-        )
-
-    if isinstance(node, Hessian):
-        return Hessian(
-            _strip_temporal_trial_derivative(node.target),
-            [
-                _strip_temporal_trial_derivative(v) if isinstance(v, Placeholder) else v
-                for v in node.variables
-            ],
-            node.scheme,
-            trace=node.trace,
-        )
+    if _is_temporal_jacobian_of_trial(node):
+        return node.target
 
     if isinstance(node, BinaryOp):
         return BinaryOp(
@@ -545,8 +621,28 @@ def _strip_temporal_trial_derivative(node: Any) -> Any:
             kwargs=getattr(node, "kwargs", None),
         )
 
-    return node
+    if isinstance(node, Jacobian):
+        return Jacobian(
+            _strip_temporal_trial_derivative(node.target),
+            [
+                _strip_temporal_trial_derivative(v) if isinstance(v, Placeholder) else v
+                for v in node.variables
+            ],
+            node.scheme,
+        )
 
+    if isinstance(node, Hessian):
+        return Hessian(
+            _strip_temporal_trial_derivative(node.target),
+            [
+                _strip_temporal_trial_derivative(v) if isinstance(v, Placeholder) else v
+                for v in node.variables
+            ],
+            node.scheme,
+            trace=node.trace,
+        )
+
+    return node
 
 def _clone_term_with_coeff(term, new_coeff):
     from .weak_form import LoweredChannelTerm
@@ -615,7 +711,10 @@ def _dense_array(A):
         return jnp.asarray(A.todense())
     if hasattr(A, "toarray"):
         return jnp.asarray(A.toarray())
-    return jnp.asarray(A)
+    try:
+        return jnp.asarray(A)
+    except Exception:
+        return jnp.asarray(np.asarray(A))
 
 
 def _is_linear_first_order_ir(ir) -> bool:
@@ -660,36 +759,23 @@ def _ir_temporal_tags(ir) -> list[str]:
 
 def _prepare_src_runtime(domain, src_ir):
     """
-    Build a pure source/load runtime ONCE.
+    Build FEAX source-only runtime ONCE.
 
-    Important:
-    - no Dirichlet elimination
-    - do not overwrite domain._feax_problem / _feax_bc
-    - src_ir is expected to contain only non-trial terms
+    Source/load vector is evaluated as:
+        b(t) = -r_src(0, t)
+    with no Dirichlet elimination.
     """
-    import feax as fe
-    from .fem_route import _build_feax_problem, _default_float_dtype
-
-    problem, bc = _build_feax_problem(
+    rt = _prepare_feax_runtime(
         domain,
         src_ir,
         apply_dirichlet=False,
-        store_on_domain=False,
+        need_jacobian=False,
+        symmetric_bc=True,
     )
 
-    internal_vars = fe.InternalVars()
-    res_bc = fe.create_res_bc_function(problem, bc)
-    size = int(problem.num_total_dofs_all_vars)
-
-    u_zero = jnp.zeros((size,), dtype=_default_float_dtype())
-
-    return {
-        "size": size,
-        "u_zero": u_zero,
-        "res_bc": res_bc,
-        "internal_vars": internal_vars,
-    }
-
+    u_zero = jnp.zeros((rt["size"],), dtype=rt["dtype"])
+    rt["u_zero"] = u_zero
+    return rt
 
 def _eval_src_vector_host(domain, runtime, t_value, dtype):
     """
@@ -708,36 +794,29 @@ def _eval_src_vector_host(domain, runtime, t_value, dtype):
 
 
 def _build_auto_forcing_vector_fn(domain, src_ir, *, size, dtype):
+    import feax as fe
+
     if src_ir is None or len(src_ir.terms) == 0:
         return None
 
-    runtime = _prepare_src_runtime(domain, src_ir)
-    if int(runtime["size"]) != int(size):
+    rt = _prepare_src_runtime(domain, src_ir)
+    if int(rt["size"]) != int(size):
         raise ValueError(
-            f"Auto forcing runtime size mismatch: runtime size={runtime['size']}, expected {size}."
+            f"Auto forcing runtime size mismatch: runtime size={rt['size']}, expected {size}."
         )
 
-    temporal_tags = _ir_temporal_tags(src_ir)
-
-    # time-independent forcing -> assemble once
-    if len(temporal_tags) == 0:
-        const_vec = _eval_src_vector_host(domain, runtime, t_value=0.0, dtype=dtype)
-        const_vec = jnp.asarray(const_vec, dtype=dtype)
+    if len(rt["temporal_tags"]) == 0:
+        iv0 = fe.InternalVars()
+        const_vec = -jnp.asarray(rt["res_bc"](rt["u_zero"], iv0), dtype=dtype).reshape(-1)
 
         def forcing_vector_fn(t, args=None):
             return const_vec
 
         return forcing_vector_fn
 
-    # time-dependent forcing -> callback over current time
-    out_spec = jax.ShapeDtypeStruct((int(size),), jnp.dtype(dtype))
-
-    def _host_eval(t_host):
-        t_scalar = np.asarray(t_host).reshape(()).item()
-        return _eval_src_vector_host(domain, runtime, t_value=t_scalar, dtype=dtype)
-
     def forcing_vector_fn(t, args=None):
-        return jax.pure_callback(_host_eval, out_spec, t)
+        iv = _make_internal_vars(fe, rt["temporal_tags"], t, n_cells=rt["n_cells"], dtype=rt["dtype"], )
+        return -jnp.asarray(rt["res_bc"](rt["u_zero"], iv), dtype=dtype).reshape(-1)
 
     return forcing_vector_fn
 
@@ -836,17 +915,17 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         metadata["forcing_terms"] = int(len(src_ir.terms))
         metadata["forcing_temporal_tags"] = _ir_temporal_tags(src_ir)
         metadata["auto_forcing"] = bool(auto_forcing)
-        metadata["forcing_mode"] = forcing_mode
+        metadata["forcing_mode"] = "weak_auto" if auto_forcing else ("user_callback" if forcing_vector_fn is not None else "none")
         metadata["linear_inferred"] = "linear" not in kwargs
         metadata["linear_path_selected"] = bool(use_linear_path)
 
-        if forcing_mode == "weak_auto":
+        if auto_forcing:
             metadata["notes"] = (
                 "Linear semidiscrete JAX FEAX block assembled. "
                 "M, A, affine_bias, and forcing_vector_fn are populated for external solvers. "
                 "Forcing was auto-lowered from non-trial weak-form terms."
             )
-        elif forcing_mode == "user_callback":
+        elif forcing_vector_fn is not None:
             metadata["notes"] = (
                 "Linear semidiscrete JAX FEAX block assembled. "
                 "M, A, affine_bias, and forcing_vector_fn are populated for external solvers. "
@@ -887,14 +966,30 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         )
 
     # ------------------------------------------------------------------
-    # Fallback: old contract-only path
+    # Nonlinear first-order semidiscrete path
     # ------------------------------------------------------------------
-    metadata.setdefault("phase", "phase_2_contract")
-    metadata.setdefault("lowering_complete", False)
-    metadata.setdefault(
-        "notes",
-        "Contract-only FEAX-time block. Pass linear=True for the current JAX-native "
-        "linear first-order semidiscrete path.",
+    mass_fn, residual_fn, jacobian_fn = _build_first_order_semidiscrete_operators(
+        domain,
+        ir,
+        mass_expr,
+        residual_expr,
+        boundary_exprs,
+    )
+
+    feax_mesh = None
+    if getattr(domain, "_feax_context", None) is not None:
+        feax_mesh = domain._feax_context.get("mesh", None)
+
+    metadata["phase"] = "phase_2_nonlinear_jax"
+    metadata["lowering_complete"] = True
+    metadata["auto_forcing"] = False
+    metadata["forcing_mode"] = "embedded_residual"
+    metadata["linear_inferred"] = "linear" not in kwargs
+    metadata["linear_path_selected"] = bool(use_linear_path)
+    metadata["notes"] = (
+        "Nonlinear first-order semidiscrete FEAX-time block assembled. "
+        "mass(t), residual(u,t), and jacobian(u,t) are populated for external solvers. "
+        "Source and boundary forcing are embedded inside residual(u,t)."
     )
 
     return FeaxTimeBlock(
@@ -906,10 +1001,10 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         mass_expr=mass_expr,
         residual_expr=residual_expr,
         boundary_exprs=boundary_exprs,
-        rhs=kwargs.get("rhs", None),
-        jacobian=kwargs.get("jacobian", None),
-        mass=kwargs.get("mass", None),
-        residual=kwargs.get("residual", None),
+        rhs=None,
+        jacobian=jacobian_fn,
+        mass=mass_fn,
+        residual=residual_fn,
         state0=state0,
         initial_conditions=initial_conditions,
         t0=t0,
@@ -917,4 +1012,11 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         dt=dt,
         feax_context=getattr(domain, "_feax_context", {}),
         metadata=metadata,
+        M=None,
+        A=None,
+        affine_bias=None,
+        forcing_vector_fn=None,
+        feax_mesh=feax_mesh,
+        forcing_mode="embedded_residual",
     )
+    

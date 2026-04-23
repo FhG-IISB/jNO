@@ -386,7 +386,67 @@ def _infer_trial_metadata(expr) -> Dict[str, Any]:
     vec = _value_shape_num_components(value_shape)
     return {"trial": trial, "value_shape": value_shape, "vec": vec, "has_trial": trial is not None}
 
+def _collect_temporal_tags_for_feax(node, out=None):
+    if out is None:
+        out = set()
 
+    if isinstance(node, Variable) and getattr(node, "axis", None) == "temporal":
+        out.add(str(node.tag))
+        return out
+
+    if isinstance(node, BinaryOp):
+        _collect_temporal_tags_for_feax(node.left, out)
+        _collect_temporal_tags_for_feax(node.right, out)
+        return out
+
+    if isinstance(node, FunctionCall):
+        for a in node.args:
+            if isinstance(a, (Literal, Constant, TensorTag, Variable, TestFunction, TrialFunction,
+                              Jacobian, Hessian, BinaryOp, FunctionCall, ModelCall,
+                              OperationDef, OperationCall, Tracker, StateField)):
+                _collect_temporal_tags_for_feax(a, out)
+        return out
+
+    if isinstance(node, Jacobian):
+        _collect_temporal_tags_for_feax(node.target, out)
+        for v in node.variables:
+            if isinstance(v, (Literal, Constant, TensorTag, Variable, TestFunction, TrialFunction,
+                              Jacobian, Hessian, BinaryOp, FunctionCall, ModelCall,
+                              OperationDef, OperationCall, Tracker, StateField)):
+                _collect_temporal_tags_for_feax(v, out)
+        return out
+
+    if isinstance(node, Hessian):
+        _collect_temporal_tags_for_feax(node.target, out)
+        for v in node.variables:
+            if isinstance(v, (Literal, Constant, TensorTag, Variable, TestFunction, TrialFunction,
+                              Jacobian, Hessian, BinaryOp, FunctionCall, ModelCall,
+                              OperationDef, OperationCall, Tracker, StateField)):
+                _collect_temporal_tags_for_feax(v, out)
+        return out
+
+    return out
+
+
+def _temporal_value_from_internal_vars(local, tag, dim_start=0, dim_end=1):
+    temporal_tags = local.get("temporal_tags", ())
+    volume_vars = local.get("volume_vars", ())
+
+    if tag not in temporal_tags:
+        return None
+
+    idx = temporal_tags.index(tag)
+    if idx >= len(volume_vars):
+        raise IndexError(
+            f"Temporal FEAX variable tag '{tag}' mapped to slot {idx}, "
+            f"but only {len(volume_vars)} volume_vars were provided."
+        )
+
+    arr = jnp.asarray(volume_vars[idx])
+    # scalar / (1,) / (1,1) -> one scalar time for this assembly call
+    t_scalar = jnp.reshape(arr, (-1,))[0]
+    out = jnp.asarray([t_scalar])
+    return out[dim_start:dim_end]
 # --------------------------------
 # FEAX expression evaluation helpers
 # --------------------------------
@@ -431,20 +491,24 @@ def _eval_expr_for_feax(domain, node, local):
                 return local["physical_quad_points"][..., dim_start:dim_end]
 
         # Temporal variable in FEAX assembly:
-        # treat time as a scalar/shared value for the current assembly call,
-        # not as the full stored __time__ trajectory.
+        # prefer FEAX InternalVars volume_vars (pure JAX / no domain mutation),
+        # then fall back to domain.context for older steady / legacy paths.
         if getattr(node, "axis", None) == "temporal":
+            from_iv = _temporal_value_from_internal_vars(
+                local,
+                str(node.tag),
+                dim_start=dim_start,
+                dim_end=dim_end,
+            )
+            if from_iv is not None:
+                return from_iv
+
             if node.tag not in local["domain_context"]:
-                raise KeyError(f"Temporal Variable tag '{node.tag}' not found in FEAX domain context.")
+                raise KeyError(f"Temporal Variable tag '{node.tag}' not found in FEAX local/domain context.")
             arr = jnp.asarray(local["domain_context"][node.tag])
-
-            # Accept shapes like (), (1,), (1,1), (T,1), ...
-            # During FEAX assembly we want ONE time value only.
             t_scalar = jnp.reshape(arr, (-1,))[0]
-
-            # Return shape (1,) so it broadcasts cleanly against local FE
-            # quadrature arrays like (nq,1) or component arrays.
-            return jnp.asarray([t_scalar])
+            out = jnp.asarray([t_scalar])
+            return out[dim_start:dim_end]
 
         # Fallback to stored tensor/point-data context
         if node.tag in local["domain_context"]:
@@ -529,13 +593,16 @@ def _eval_expr_for_feax(domain, node, local):
 # FEAX kernel builders
 # --------------------------------
 
-def _eval_volume_integrand(domain, expr, value_shape, cell_sol_flat, physical_quad_points, cell_shape_grads, cell_JxW, cell_v_grads_JxW):
+def _eval_volume_integrand(domain, expr,value_shape, cell_sol_flat, physical_quad_points, cell_shape_grads,cell_JxW, cell_v_grads_JxW,temporal_tags, problem_ref,*cell_internal_vars,):
     num_nodes = cell_shape_grads.shape[1]
     vec = _value_shape_num_components(value_shape)
     cell_sol = cell_sol_flat.reshape(num_nodes, vec)
 
-    # FEAX/JAX-FEM compatible local context
-    shape_vals = domain._feax_problem.fes[0].shape_vals
+    problem = problem_ref["problem"]
+    if problem is None:
+        raise RuntimeError("FEAX problem_ref['problem'] was not initialized before kernel evaluation.")
+
+    shape_vals = problem.fes[0].shape_vals
     local = {
         "physical_quad_points": physical_quad_points,
         "shape_vals": shape_vals,
@@ -546,7 +613,10 @@ def _eval_volume_integrand(domain, expr, value_shape, cell_sol_flat, physical_qu
         "domain_context": domain.context,
         "trial_value_shape": value_shape,
         "trial_vec": vec,
+        "temporal_tags": tuple(temporal_tags),
+        "volume_vars": tuple(cell_internal_vars),
     }
+
     val = _eval_expr_for_feax(domain, expr, local)
     weights = cell_JxW[0]
     wshape = (weights.shape[0],) + (1,) * (val.ndim - 1)
@@ -564,6 +634,8 @@ def _eval_surface_integrand(
     face_shape_vals,
     face_shape_grads,
     face_nanson_scale,
+    temporal_tags,
+    *cell_internal_vars_surface,
 ):
     vec = _value_shape_num_components(value_shape)
 
@@ -573,7 +645,6 @@ def _eval_surface_integrand(
     face_shape_grads = jnp.asarray(face_shape_grads)
     face_nanson_scale = jnp.asarray(face_nanson_scale)
 
-    # FEAX surface kernels use parent-cell DOFs, so derive node count from cell_sol_flat
     if cell_sol_flat.ndim != 1:
         cell_sol_flat = cell_sol_flat.reshape(-1)
 
@@ -585,12 +656,6 @@ def _eval_surface_integrand(
     n_parent_nodes = cell_sol_flat.size // vec
     cell_sol = cell_sol_flat.reshape(n_parent_nodes, vec)
 
-    # Normalize FEAX inputs after boundary-wise vmap:
-    # expected:
-    #   physical_surface_quad_points : (nq, dim)
-    #   face_shape_vals              : (nq, n_parent_nodes)
-    #   face_shape_grads             : (nq, n_parent_nodes, dim)
-    #   face_nanson_scale            : (num_vars, nq) or (nq,)
     if face_shape_vals.ndim != 2:
         raise ValueError(
             f"Expected face_shape_vals.ndim == 2, got shape {face_shape_vals.shape} for tag '{tag}'."
@@ -624,7 +689,6 @@ def _eval_surface_integrand(
             f"face_shape_vals.shape={face_shape_vals.shape}."
         )
 
-    # FEAX: face_nanson_scale after vmap over boundary faces is typically (num_vars, nq)
     if face_nanson_scale.ndim == 2:
         weights = face_nanson_scale[0]
     elif face_nanson_scale.ndim == 1:
@@ -663,6 +727,8 @@ def _eval_surface_integrand(
         "trial_value_shape": value_shape,
         "trial_vec": vec,
         "boundary_normals": boundary_normals,
+        "temporal_tags": tuple(temporal_tags),
+        "volume_vars": tuple(cell_internal_vars_surface),
     }
 
     val = _eval_expr_for_feax(domain, expr, local)
@@ -670,7 +736,7 @@ def _eval_surface_integrand(
     weighted = val * weights.reshape(wshape)
     return ravel_pytree(jnp.sum(weighted, axis=0))[0]
 
-def _make_universal_volume_kernel(domain, expr, value_shape):
+def _make_universal_volume_kernel(domain, expr, value_shape, temporal_tags, problem_ref):
     def kernel(cell_sol_flat, physical_quad_points, cell_shape_grads, cell_JxW, cell_v_grads_JxW, *cell_internal_vars):
         return _eval_volume_integrand(
             domain,
@@ -681,11 +747,14 @@ def _make_universal_volume_kernel(domain, expr, value_shape):
             cell_shape_grads,
             cell_JxW,
             cell_v_grads_JxW,
+            temporal_tags,
+            problem_ref,
+            *cell_internal_vars,
         )
     return kernel
 
 
-def _make_universal_surface_kernel(domain, expr, tag, value_shape):
+def _make_universal_surface_kernel(domain, expr, tag, value_shape, temporal_tags):
     def kernel(cell_sol_flat, physical_surface_quad_points, face_shape_vals, face_shape_grads, face_nanson_scale, *cell_internal_vars_surface):
         return _eval_surface_integrand(
             domain,
@@ -697,10 +766,10 @@ def _make_universal_surface_kernel(domain, expr, tag, value_shape):
             face_shape_vals,
             face_shape_grads,
             face_nanson_scale,
+            temporal_tags,
+            *cell_internal_vars_surface,
         )
     return kernel
-
-
 # --------------------------------
 # FEAX problem assembly
 # --------------------------------
@@ -775,7 +844,7 @@ def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_do
         k: _lower_statefield_to_trial(v, trial_cache)
         for k, v in ir.boundary_exprs.items()
     }
-    #print("DEBUG FEAX volume_expr after StateField->Trial lowering:", volume_expr)
+
     if volume_expr is None and len(boundary_exprs) == 0:
         raise ValueError("No terms found for FEM assembly.")
 
@@ -787,17 +856,22 @@ def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_do
 
     element_type = getattr(domain, "_fem_element_type", None)
     quad_degree = getattr(domain, "_fem_quad_degree", None)
-    if element_type is None or quad_degree is None:
-        solver_ctx = getattr(domain, "_jaxfem_solver_context", None)
-        if solver_ctx is not None:
-            element_type = solver_ctx.get("element_type", element_type)
-            quad_degree = solver_ctx.get("quad_degree", quad_degree)
+
     if element_type is None:
         element_type = "TRI3"
     if quad_degree is None:
         quad_degree = 2
 
     mesh = _build_feax_mesh(domain, element_type)
+
+    temporal_tags_set = set()
+    if volume_expr is not None:
+        temporal_tags_set.update(_collect_temporal_tags_for_feax(volume_expr))
+    for expr in boundary_exprs.values():
+        temporal_tags_set.update(_collect_temporal_tags_for_feax(expr))
+    temporal_tags = tuple(sorted(temporal_tags_set))
+
+    problem_ref = {"problem": None}
 
     active_boundary_tags: List[str] = []
     location_fns = []
@@ -809,9 +883,11 @@ def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_do
             continue
         active_boundary_tags.append(tag)
         location_fns.append(loc_fn)
-        surface_kernels.append(_make_universal_surface_kernel(domain, expr, tag, value_shape))
+        surface_kernels.append(_make_universal_surface_kernel(domain, expr, tag, value_shape, temporal_tags))
 
-    volume_kernel = None if volume_expr is None else _make_universal_volume_kernel(domain, volume_expr, value_shape)
+    volume_kernel = None
+    if volume_expr is not None:
+        volume_kernel = _make_universal_volume_kernel(domain, volume_expr, value_shape, temporal_tags, problem_ref)
 
     class GeneratedProblem(fe.Problem):
         def get_universal_kernel(self_inner):
@@ -828,6 +904,7 @@ def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_do
         gauss_order=quad_degree,
         location_fns=location_fns,
     )
+    problem_ref["problem"] = problem
 
     bc_specs = _make_feax_dirichlet_specs(domain, vec) if apply_dirichlet else []
     bc = fe.DirichletBCConfig(bc_specs).create_bc(problem)

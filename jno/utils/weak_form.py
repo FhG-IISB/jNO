@@ -439,7 +439,7 @@ def is_variational_expr(domain, expr) -> bool:
         return False
 
     # Already assembled weak object -> not raw anymore
-    if isinstance(expr, (Assembly, GroupedAssembly, WeakReduction)):
+    if isinstance(expr, (Assembly, GroupedAssembly)):
         return False
 
     return (
