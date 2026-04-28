@@ -1400,14 +1400,16 @@ class TraceEvaluator:
         while integrand.ndim > 2 and integrand.shape[0] == 1:
             integrand = jnp.squeeze(integrand, axis=0)
 
-<<<<<<< HEAD
         num_entities, num_quads = weights.shape[-2], weights.shape[-1]
         # Expected local-node count comes from connectivity, not integrand shape.
         # This guards grouped FEM paths where integrand is emitted with a flattened
         # (nloc * feature) axis instead of an explicit nloc axis.
-        if flat_cells.size % num_entities != 0:
-            raise ValueError("Inconsistent FEM connectivity: flat_cells.size is not divisible " f"by num_entities ({flat_cells.size} vs {num_entities}).")
-        expected_n_local_nodes = int(flat_cells.size // num_entities)
+        if flat_entity_nodes.size % num_entities != 0:
+            raise ValueError(
+                "Inconsistent FEM connectivity: flat_entity_nodes.size is not divisible "
+                f"by num_entities ({flat_entity_nodes.size} vs {num_entities})."
+            )
+        expected_n_local_nodes = int(flat_entity_nodes.size // num_entities)
 
         if integrand.ndim < 2:
             raise ValueError(f"Assembly integrand must have at least 2 dims, got shape {integrand.shape}.")
@@ -1424,12 +1426,6 @@ class TraceEvaluator:
 
         n_local_nodes = integrand.shape[1]
         trailing_shape = integrand.shape[2:]
-=======
-        print("DEBUG integrand shape after squeeze =", integrand.shape)
-        print("DEBUG weights shape =", weights.shape)
-        if weights.ndim != 2:
-            raise ValueError(f"_assemble_basis_integrand expected weights.ndim == 2, got {weights.shape}")
->>>>>>> feax
 
         num_entities, num_quads = weights.shape
 
