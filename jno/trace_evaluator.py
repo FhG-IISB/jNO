@@ -672,92 +672,164 @@ class TraceEvaluator:
         # ── Temporal derivative ──
         if first_axis == "temporal":
             evaluator_self = self
-            time_key = "__time__"
-            time_val = ctx.context.get(time_key)  # (1,)
+
+            def is_time_tag(tag_name):
+                s = str(tag_name)
+                return s == "__time__" or s.startswith("__time")
+
+            def spatial_tag_for_time_key(tkey):
+                s = str(tkey)
+                if s == "__time__":
+                    return None
+                if s.startswith("__time_") and s.endswith("__"):
+                    return s[len("__time_"):-2]
+                return None
+
+            # Use the actual temporal tag of the differentiated variable if present
+            active_time_key = getattr(bound_var, "tag", "__time__")
+            if active_time_key not in ctx.context:
+                active_time_key = "__time__"
+
+            active_spatial_tag = spatial_tag_for_time_key(active_time_key)
+
+            time_arr = jnp.asarray(ctx.context[active_time_key])
+            time_dtype = time_arr.dtype
+            time_scalar0 = jnp.reshape(time_arr, (-1,))[0]
 
             if scheme == "finite_difference":
-                # Central difference: (u(t+eps) - u(t-eps)) / (2*eps)
-                # Two forward passes through the network — much cheaper
-                # than N jax.grad calls for AD.
                 eps = jnp.asarray(1e-3, dtype=_default_float_dtype())
-                t_fwd = time_val + eps
-                t_bwd = time_val - eps
 
-                ctx_fwd = {**ctx.context, time_key: t_fwd}
-                ctx_bwd = {**ctx.context, time_key: t_bwd}
+                def _set_active_time_tags(base_ctx, t_scalar):
+                    t_box = jnp.asarray([[t_scalar]], dtype=time_dtype)
+                    out = dict(base_ctx)
 
-                u_fwd = self._dispatch(target, self._EvalCtx(ctx_fwd, ctx.var_bindings, ctx.key, active_region=ctx.active_region))
-                u_bwd = self._dispatch(target, self._EvalCtx(ctx_bwd, ctx.var_bindings, ctx.key, active_region=ctx.active_region))
+                    # keep the global time consistent
+                    out["__time__"] = t_box
+                    # and also the specific active time tag
+                    out[active_time_key] = t_box
+                    return out
+
+                ctx_fwd = _set_active_time_tags(ctx.context, time_scalar0 + eps)
+                ctx_bwd = _set_active_time_tags(ctx.context, time_scalar0 - eps)
+
+                u_fwd = self._dispatch(
+                    target,
+                    self._EvalCtx(ctx_fwd, ctx.var_bindings, ctx.key, active_region=ctx.active_region),
+                )
+                u_bwd = self._dispatch(
+                    target,
+                    self._EvalCtx(ctx_bwd, ctx.var_bindings, ctx.key, active_region=ctx.active_region),
+                )
 
                 result = (u_fwd - u_bwd) / (2.0 * eps)
-                # Ensure (N, 1) shape
                 if result.ndim == 1:
                     result = result[:, jnp.newaxis]
                 return result
 
             # ── Temporal derivative via AD (default) ──
-            # Find any spatial tag to determine N
             domain = getattr(bound_var, "_domain", None)
             param_tags = set(getattr(domain, "_param_tags", set())) if domain is not None else set()
 
             def is_spatial_pointset(tag_name, value):
-                if tag_name == time_key or str(tag_name).startswith("__time"):
+                if is_time_tag(tag_name):
                     return False
                 if tag_name in param_tags:
                     return False
                 if not hasattr(value, "ndim"):
                     return False
-                # active sampled coordinates are typically (N, D)
                 return value.ndim >= 2
+
             def point_axis(value):
-                # For sampled coordinates / fields the point axis is the
-                # second-last axis, not necessarily axis 0.
                 return value.ndim - 2
 
-            # Determine N only from spatial point-set arrays, not parametric tags like GRF
-            N = 1
-            for k, v in ctx.context.items():
-                if is_spatial_pointset(k, v):
-                    ax = point_axis(v)
-                    N = max(N, int(v.shape[0]))
+            # Determine active N from the matching spatial tag FIRST.
+            N = int(ctx.context.get("__active_spatial_n__", 1))
+            if (
+                active_spatial_tag is not None
+                and active_spatial_tag in ctx.context
+                and is_spatial_pointset(active_spatial_tag, ctx.context[active_spatial_tag])
+            ):
+                v = ctx.context[active_spatial_tag]
+                N = int(v.shape[point_axis(v)])
+            else:
+                # fallback only if there is no matching spatial tag
+                for k, v in ctx.context.items():
+                    if is_spatial_pointset(k, v):
+                        ax = point_axis(v)
+                        N = max(N, int(v.shape[ax]))
 
             def grad_time_single(idx):
-                """Grad w.r.t. time for one spatial point idx."""
                 local_ctx = {"__active_spatial_n__": 1}
+
                 for k, v in ctx.context.items():
-                    if k == time_key:
-                        continue  # replaced by differentiable t below
+                    # skip all time tags; they will be rebuilt below
+                    if is_time_tag(k):
+                        continue
 
                     if is_spatial_pointset(k, v):
                         ax = point_axis(v)
 
-                        # Slice only true sampled point sets along their point axis.
-                        if int(v.shape[ax]) == N:
+                        # Slice the matching spatial tag unconditionally
+                        if active_spatial_tag is not None and k == active_spatial_tag:
                             start_indices = [0] * v.ndim
                             slice_sizes = list(v.shape)
                             start_indices[ax] = idx
                             slice_sizes[ax] = 1
-                            local_ctx[k] = jax.lax.dynamic_slice(v, tuple(start_indices), tuple(slice_sizes),)
+                            local_ctx[k] = jax.lax.dynamic_slice(
+                                v,
+                                tuple(start_indices),
+                                tuple(slice_sizes),
+                            )
+                        # Fallback behavior only when no matching spatial tag exists
+                        elif active_spatial_tag is None and int(v.shape[ax]) == N:
+                            start_indices = [0] * v.ndim
+                            slice_sizes = list(v.shape)
+                            start_indices[ax] = idx
+                            slice_sizes[ax] = 1
+                            local_ctx[k] = jax.lax.dynamic_slice(
+                                v,
+                                tuple(start_indices),
+                                tuple(slice_sizes),
+                            )
                         else:
                             local_ctx[k] = v
                     else:
-                        # keep parametric tags like GRF untouched
                         local_ctx[k] = v
 
-                def u_of_t(t_arr):
-                    new_ctx_dict = {**local_ctx, time_key: t_arr}
+                def _set_active_time_tags(base_ctx, t_scalar):
+                    t_box = jnp.asarray([[t_scalar]], dtype=time_dtype)
+                    out = dict(base_ctx)
+
+                    # always keep the global time coherent
+                    out["__time__"] = t_box
+                    # and also the specific active time tag
+                    out[active_time_key] = t_box
+                    return out
+
+                def u_of_t_scalar(t_scalar):
+                    new_ctx_dict = _set_active_time_tags(local_ctx, t_scalar)
                     new_ctx = evaluator_self._EvalCtx(
                         new_ctx_dict,
                         ctx.var_bindings,
                         ctx.key,
                         active_region=ctx.active_region,
                     )
-                    out = jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
-                    if out.ndim != 0:
-                        raise ValueError(f"Temporal derivative expected scalar output per point, got shape {out.shape}")
-                    return out
 
-                return jax.grad(u_of_t)(time_val)[0]
+                    out = jnp.asarray(evaluator_self._dispatch(target, new_ctx))
+                    out = jnp.squeeze(out)
+
+                    if out.ndim == 0:
+                        return out
+                    if out.ndim == 1 and out.shape[0] == 1:
+                        return out[0]
+                    if out.ndim == 2 and out.shape == (1, 1):
+                        return out[0, 0]
+
+                    raise ValueError(
+                        f"Temporal derivative expected scalar output per point, got shape {out.shape}"
+                    )
+
+                return jax.grad(u_of_t_scalar)(time_scalar0)
 
             result = jax.vmap(grad_time_single)(jnp.arange(N))
             return result[:, jnp.newaxis]

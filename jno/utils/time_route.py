@@ -5,10 +5,9 @@ from contextlib import contextmanager
 import numpy as np
 import jax
 import jax.numpy as jnp
-from ..trace import BinaryOp, FunctionCall, Hessian, Jacobian, Literal, Placeholder, StateField, TestFunction, TrialFunction, Variable,TensorTag
+from ..trace import BinaryOp, FunctionCall, Hessian, Jacobian, Literal, Placeholder, StateField, TestFunction, TrialFunction, Variable,TensorTag,ModelCall
 from .backend_blocks import DiffraxBlock, FeaxTimeBlock
 from ..trace_evaluator import TraceEvaluator
-from .backend_blocks import DiffraxBlock, FeaxTimeBlock
 
 # -----------------------------------------------------------------------------
 # Small graph-inspection helpers
@@ -153,6 +152,151 @@ def _extract_initial_conditions(kwargs: Dict[str, Any]) -> Tuple[Any, Any]:
 # -----------------------------------------------------------------------------
 # Strong-form Diffrax helpers
 # -----------------------------------------------------------------------------
+# def _replace_exact_subtree(node: Any, target: Any, replacement: Any) -> Any:
+#     if node is target:
+#         return replacement
+
+#     if isinstance(node, BinaryOp):
+#         left = _replace_exact_subtree(node.left, target, replacement)
+#         right = _replace_exact_subtree(node.right, target, replacement)
+#         if left is not node.left or right is not node.right:
+#             return BinaryOp(node.op, left, right)
+#         return node
+
+#     if isinstance(node, FunctionCall):
+#         new_args = [
+#             _replace_exact_subtree(a, target, replacement) if isinstance(a, Placeholder) else a
+#             for a in node.args
+#         ]
+#         if any(a is not b for a, b in zip(new_args, node.args)):
+#             if hasattr(node, "copy_with_args"):
+#                 return node.copy_with_args(new_args)
+#             return FunctionCall(
+#                 node.fn,
+#                 new_args,
+#                 name=getattr(node, "_name", None),
+#                 reduces_axis=getattr(node, "reduces_axis", None),
+#                 kwargs=getattr(node, "kwargs", None),
+#             )
+#         return node
+
+#     if isinstance(node, Jacobian):
+#         new_target = _replace_exact_subtree(node.target, target, replacement)
+#         new_vars = [
+#             _replace_exact_subtree(v, target, replacement) if isinstance(v, Placeholder) else v
+#             for v in node.variables
+#         ]
+#         if new_target is not node.target or any(a is not b for a, b in zip(new_vars, node.variables)):
+#             return Jacobian(new_target, new_vars, node.scheme)
+#         return node
+
+#     if isinstance(node, Hessian):
+#         new_target = _replace_exact_subtree(node.target, target, replacement)
+#         new_vars = [
+#             _replace_exact_subtree(v, target, replacement) if isinstance(v, Placeholder) else v
+#             for v in node.variables
+#         ]
+#         if new_target is not node.target or any(a is not b for a, b in zip(new_vars, node.variables)):
+#             return Hessian(new_target, new_vars, node.scheme, trace=node.trace)
+#         return node
+
+#     return node
+
+def _contains_model_call(node: Any) -> bool:
+    if isinstance(node, ModelCall):
+        return True
+    if isinstance(node, BinaryOp):
+        return _contains_model_call(node.left) or _contains_model_call(node.right)
+    if isinstance(node, FunctionCall):
+        return any(_contains_model_call(a) for a in node.args if isinstance(a, Placeholder))
+    if isinstance(node, Jacobian):
+        return _contains_model_call(node.target) or any(
+            _contains_model_call(v) for v in node.variables if isinstance(v, Placeholder)
+        )
+    if isinstance(node, Hessian):
+        return _contains_model_call(node.target) or any(
+            _contains_model_call(v) for v in node.variables if isinstance(v, Placeholder)
+        )
+    return False
+
+
+def _append_identity_unique(out, node):
+    if not any(node is x for x in out):
+        out.append(node)
+
+
+def _collect_temporal_state_candidates(node: Any, out=None):
+    if out is None:
+        out = []
+
+    if isinstance(node, Jacobian):
+        if any(_is_temporal_var(v) for v in node.variables):
+            _append_identity_unique(out, node.target)
+        _collect_temporal_state_candidates(node.target, out)
+        for v in node.variables:
+            if isinstance(v, Placeholder):
+                _collect_temporal_state_candidates(v, out)
+        return out
+
+    if isinstance(node, Hessian):
+        if any(_is_temporal_var(v) for v in node.variables):
+            _append_identity_unique(out, node.target)
+        _collect_temporal_state_candidates(node.target, out)
+        for v in node.variables:
+            if isinstance(v, Placeholder):
+                _collect_temporal_state_candidates(v, out)
+        return out
+
+    if isinstance(node, BinaryOp):
+        _collect_temporal_state_candidates(node.left, out)
+        _collect_temporal_state_candidates(node.right, out)
+        return out
+
+    if isinstance(node, FunctionCall):
+        for a in node.args:
+            if isinstance(a, Placeholder):
+                _collect_temporal_state_candidates(a, out)
+        return out
+
+    return out
+
+
+def _infer_single_state_expr(expr: Any):
+    candidates = _collect_temporal_state_candidates(expr, out=[])
+
+    # Prefer candidates that actually contain a model call
+    model_candidates = [c for c in candidates if _contains_model_call(c)]
+    if len(model_candidates) == 1:
+        return model_candidates[0]
+
+    if len(candidates) == 1:
+        return candidates[0]
+
+    if len(model_candidates) > 1:
+        raise ValueError(
+            "Could not infer state_expr automatically: multiple model-based temporal candidates found. "
+            "Pass state_expr=... explicitly."
+        )
+
+    if len(candidates) > 1:
+        raise ValueError(
+            "Could not infer state_expr automatically: multiple temporal candidates found. "
+            "Pass state_expr=... explicitly."
+        )
+
+    raise ValueError(
+        "Could not infer state_expr automatically. Pass state_expr=... explicitly."
+    )
+
+def _resolve_strong_state_expr(expr: Any, **kwargs):
+    state_expr = kwargs.get("state_expr", None)
+    if state_expr is not None:
+        return state_expr
+
+    if bool(kwargs.get("infer_state_expr", False)):
+        return _infer_single_state_expr(expr)
+
+    return None
 
 
 def _rewrite_second_order_to_first_order(expr: Any, **kwargs) -> Dict[str, Any]:
@@ -591,19 +735,20 @@ def _assemble_diffrax_from_strong_form(domain, expr, **kwargs) -> DiffraxBlock:
     # Priority 2: real first-order symbolic lowering
     # --------------------------------------------------
     if time_order == 1:
-        state_expr = kwargs.get("state_expr", None)
+        state_expr = _resolve_strong_state_expr(expr, **kwargs)
         time_var = kwargs.get("time_var", None)
         params = kwargs.get("params", None)
 
         if state_expr is not None:
             if time_var is None or not isinstance(time_var, Variable) or getattr(time_var, "axis", None) != "temporal":
                 raise ValueError(
-                    "First-order strong-form Diffrax lowering requires time_var=<temporal Variable>."
+                     "Strong-form Diffrax lowering with state_expr=... requires "
+                    "time_var=<temporal Variable>."
                 )
 
             if state0 is None:
                 raise ValueError(
-                    "First-order strong-form Diffrax lowering requires state0=..."
+                    "Strong-form Diffrax lowering with state_expr=... requires state0=..."
                 )
 
             mass_expr, residual_expr = _split_first_order_strong_form(expr, state_expr, time_var)
@@ -621,9 +766,10 @@ def _assemble_diffrax_from_strong_form(domain, expr, **kwargs) -> DiffraxBlock:
 
             metadata["phase"] = "phase_2_first_order_lowered"
             metadata["lowering_complete"] = True
+            metadata["state_expr_mode"] = "explicit" if kwargs.get("state_expr", None) is not None else "inferred"
             metadata["notes"] = (
                 "First-order strong-form Diffrax lowering completed. "
-                "Symbolic temporal term was isolated and converted into rhs(t,y)."
+                "The provided state_expr subtree was replaced internally by a runtime solver state."
             )
 
             return DiffraxBlock(
@@ -687,34 +833,91 @@ def _assemble_diffrax_from_strong_form(domain, expr, **kwargs) -> DiffraxBlock:
         )
 
     # --------------------------------------------------
-    # Priority 3: manual second-order reduction
+    # Second-order manual reduction
     # --------------------------------------------------
-    reduction = _build_manual_second_order_reduction(expr, **kwargs)
+    if time_order == 2:
+        state_expr = _resolve_strong_state_expr(expr, **kwargs)
+        reduction = _build_manual_second_order_reduction(expr, **kwargs)
 
-    rhs = kwargs.get("rhs", None)
-    mass = kwargs.get("mass", None)
-    term = kwargs.get("term", None)
+        rhs = kwargs.get("rhs", None)
+        mass = kwargs.get("mass", None)
+        term = kwargs.get("term", None)
 
-    if reduction.get("implemented", False):
-        if term is None:
-            try:
-                import diffrax as _diffrax  # type: ignore
+        if kwargs.get("second_order", None) == "manual":
+            if rhs is None:
+                raise ValueError(
+                    "second_order='manual' requires rhs=... for the reduced first-order system."
+                )
+
+            if state0 is None:
+                raise ValueError(
+                    "second_order='manual' requires state0=..., typically [u0, v0]."
+                )
+
+            state_names = tuple(kwargs.get("state_names", ("u", "v")))
+            rewritten_system = {
+                "implemented": True,
+                "strategy": "manual_first_order",
+                "original_expr": expr,
+                "state_names": state_names,
+                "state_expr_mode": (
+                    "explicit" if kwargs.get("state_expr", None) is not None
+                    else ("inferred" if state_expr is not None else "none")
+                ),
+            }
+
+            if term is None:
+                import diffrax as _diffrax
                 term = _diffrax.ODETerm(rhs)
-            except Exception:
-                term = None
 
-        metadata["phase"] = "phase_3_second_order_manual_reduction"
-        metadata["lowering_complete"] = True
+            metadata["phase"] = "phase_3_second_order_manual_reduction"
+            metadata["lowering_complete"] = True
+            metadata["reduction_mode"] = "manual"
+            metadata["notes"] = (
+                "Second-order strong-form problem accepted through manual first-order reduction. "
+                "state_expr is used only as the training-expression anchor; the actual solver route uses the reduced rhs."
+            )
+
+            return DiffraxBlock(
+                backend="diffrax",
+                form="manual_second_order_reduced",
+                time_order=2,
+                original_expr=expr,
+                lowered_rhs=None,
+                rewritten_system=rewritten_system,
+                state0=state0,
+                initial_conditions=initial_conditions,
+                t0=t0,
+                t1=t1,
+                dt0=dt0,
+                rhs=rhs,
+                term=term,
+                args=kwargs.get("args", None),
+                mass=mass,
+                state_meta={
+                    **dict(kwargs.get("state_meta", {})),
+                    "original_order": 2,
+                    "reduction_state_names": state_names,
+                },
+                metadata=metadata,
+            )
+
+    # --------------------------------------------------
+    # Fallback: keep old contract-only placeholder
+    # --------------------------------------------------
+
+        metadata["phase"] = "phase_3_contract"
+        metadata["lowering_complete"] = False
         metadata["rewrite_required"] = True
-        metadata["reduction_mode"] = "manual"
         metadata["notes"] = (
-            "Second-order strong-form problem accepted through manual first-order reduction. "
-            "User supplied rhs(t,y,args) for the reduced [u, v] system."
+            "Second-order strong-form problem was classified, but no manual reduction "
+            "was provided. Pass second_order='manual', rhs=..., state0=[u0, v0] to "
+            "build a usable Diffrax block."
         )
 
         return DiffraxBlock(
             backend="diffrax",
-            form="manual_second_order_reduced",
+            form="rewritten_second_order",
             time_order=2,
             original_expr=expr,
             lowered_rhs=None,
@@ -728,45 +931,10 @@ def _assemble_diffrax_from_strong_form(domain, expr, **kwargs) -> DiffraxBlock:
             term=term,
             args=kwargs.get("args", None),
             mass=mass,
-            state_meta={
-                **dict(kwargs.get("state_meta", {})),
-                "original_order": 2,
-                "reduction_state_names": reduction["state_names"],
-            },
+            state_meta=dict(kwargs.get("state_meta", {})),
             metadata=metadata,
         )
 
-    # --------------------------------------------------
-    # Fallback: keep old contract-only placeholder
-    # --------------------------------------------------
-    metadata["phase"] = "phase_3_contract"
-    metadata["lowering_complete"] = False
-    metadata["rewrite_required"] = True
-    metadata["notes"] = (
-        "Second-order strong-form problem was classified, but no manual reduction "
-        "was provided. Pass second_order='manual', rhs=..., state0=[u0, v0] to "
-        "build a usable Diffrax block."
-    )
-
-    return DiffraxBlock(
-        backend="diffrax",
-        form="rewritten_second_order",
-        time_order=2,
-        original_expr=expr,
-        lowered_rhs=None,
-        rewritten_system=reduction,
-        state0=state0,
-        initial_conditions=initial_conditions,
-        t0=t0,
-        t1=t1,
-        dt0=dt0,
-        rhs=rhs,
-        term=term,
-        args=kwargs.get("args", None),
-        mass=mass,
-        state_meta=dict(kwargs.get("state_meta", {})),
-        metadata=metadata,
-    )
 
 def _split_additive_terms_strong(node):
     if isinstance(node, BinaryOp):
