@@ -2365,7 +2365,7 @@ class domain(MeshIOMixin):
             return result, nrm_result
 
 
-    def sample(self, sample_spec: Dict[str, Tuple[int, Optional[Callable]]], normals: bool = False, return_indices: bool = False):
+    def sample(self, sample_spec: Dict[str, Tuple[int, Optional[Callable]]], normals: bool = False, return_indices: bool = False,time_value: float | None = None,):
         """
         Sample points from the domain.
 
