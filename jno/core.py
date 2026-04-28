@@ -27,6 +27,9 @@ from .trace import (
     Constant,
     ConstantNamespace,
     Tracker,
+    StateField,
+    Assembly,
+    GroupedAssembly,
     collect_operations,
     collect_tags,
     get_primary_tag,
@@ -442,21 +445,23 @@ class core:
         self._populate_missing_context_tags(domain)
 
         context = {}
+        # List of tags that are MESH METADATA and should never be batched
+        metadata_tags = ["JxW", "flat_cells", "global_areas", "N_flat", "dN_dx_flat", "dirichlet_nodes","cells", "quad_points","boundary_nodes","surface_data","v_grads_JxW_flat","__time__"]
         if hasattr(domain, "context"):
             for tag, arr in domain.context.items():
                 # If it's a nested dictionary (like our VPINN surface_data), map safely
                 if isinstance(arr, dict):
                     # 1. Convert leaves to arrays
                     arr = jax.tree_util.tree_map(jnp.asarray, arr)
-                    # 2. Add the batch dimension [None, ...] to every array in the dict
-                    context[tag] = jax.tree_util.tree_map(lambda x: x[None, ...], arr)
+                    # 2. Add the batch dimension [None, ...] to every array in the dict, FEM/static metadata dicts must stay unbatched
+                    if tag in metadata_tags:
+                        context[tag] = arr
+                    else:
+                        context[tag] = jax.tree_util.tree_map(lambda x: x[None, ...], arr)
                     # 3. Skip the rest of the loop for dictionaries!
                     continue
                     # Standard behavior for everything else (preserves backward compatibility)
                 arr = jnp.asarray(arr)
-
-                # List of tags that are MESH METADATA and should never be batched
-                metadata_tags = ["JxW", "flat_cells", "global_areas", "N_flat", "dN_dx_flat", "dirichlet_nodes", "__time__"]
 
                 if tag in metadata_tags:
                     context[tag] = arr
@@ -465,10 +470,71 @@ class core:
                 else:
                     context[tag] = arr[None, ...]
 
-        return DomainData(
-            context=context,
-            dimension=domain.dimension,
-        )
+        return DomainData(context=context, dimension=domain.dimension,)
+    #Vpinn helpers
+    def _is_marked_weak(self, node) -> bool:
+        return isinstance(node, Placeholder) and bool(getattr(node, "_is_weak_expr", False))
+
+    def _materialize_marked_weak(self, node, parent_is_weak: bool = False):
+        from .utils.weak_form import assemble_weak_form
+
+        if node is None:
+            return None
+
+        is_weak = self._is_marked_weak(node)
+
+        # Recurse through ordinary wrappers first.
+        if isinstance(node, BinaryOp):
+            left = self._materialize_marked_weak(node.left, parent_is_weak=is_weak)
+            right = self._materialize_marked_weak(node.right, parent_is_weak=is_weak)
+            if left is not node.left or right is not node.right:
+                rebuilt = BinaryOp(node.op, left, right)
+                if is_weak:
+                    setattr(rebuilt, "_is_weak_expr", True)
+                    setattr(rebuilt, "_weak_root_id", getattr(node, "_weak_root_id", None))
+                node = rebuilt
+
+        elif isinstance(node, FunctionCall):
+            new_args = []
+            changed = False
+            for a in node.args:
+                if isinstance(a, Placeholder):
+                    na = self._materialize_marked_weak(a, parent_is_weak=is_weak)
+                    changed = changed or (na is not a)
+                    new_args.append(na)
+                else:
+                    new_args.append(a)
+            if changed:
+                rebuilt = FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
+                if is_weak:
+                    setattr(rebuilt, "_is_weak_expr", True)
+                    setattr(rebuilt, "_weak_root_id", getattr(node, "_weak_root_id", None))
+                node = rebuilt
+
+        elif isinstance(node, OperationDef):
+            new_expr = self._materialize_marked_weak(node.expr, parent_is_weak=is_weak)
+            if new_expr is not node.expr:
+                rebuilt = OperationDef(new_expr)
+                rebuilt.name = getattr(node, "name", None)
+                if is_weak:
+                    setattr(rebuilt, "_is_weak_expr", True)
+                    setattr(rebuilt, "_weak_root_id", getattr(node, "_weak_root_id", None))
+                node = rebuilt
+
+        elif isinstance(node, Tracker):
+            new_expr = self._materialize_marked_weak(node.expr, parent_is_weak=is_weak)
+            if new_expr is not node.expr:
+                rebuilt = Tracker(new_expr, interval=node.interval)
+                if is_weak:
+                    setattr(rebuilt, "_is_weak_expr", True)
+                    setattr(rebuilt, "_weak_root_id", getattr(node, "_weak_root_id", None))
+                node = rebuilt
+
+        # Replace only the OUTERMOST marked weak subtree, after wrapper recursion.
+        if self._is_marked_weak(node) and not parent_is_weak:
+            return assemble_weak_form(self.domain, node, target="vpinn")
+
+        return node
 
     # Training
     def _make_loss_fn(self, compiled_constraints_fn, n_constraints, batchsize, frozen, static, checkpoint_gradients=False, min_consecutive=1):
@@ -741,7 +807,9 @@ class core:
         self._setup_parallelism(mesh)
 
         # === Preprocessing ===
-        constraints = self.wrap_constraints(self.constraints)
+        # Check if its Vpinn and routes accordingly
+        constraints_in = [self._materialize_marked_weak(c) for c in self.constraints]
+        constraints = self.wrap_constraints(constraints_in)
 
         # === Collect operations and tags ===
         self.all_ops = self.collect_unique_operations(constraints)
