@@ -28,14 +28,14 @@ pi = jno.np.pi
 a = 1.0
 b = 3.0
 
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=pick(0.2, 0.3)))
+domain = jno.domain(constructor=jno.domain.rect(mesh_size=pick(0.05, 0.3)))
 x, y, _ = domain.variable("interior")
 
 u_exact = jno.np.sin(pi * x) * jno.np.sin(pi * y)
 forcing = (a + b) * pi**2 * u_exact
 
 net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=pick(32, 16), num_layers=pick(4, 2), key=jax.random.PRNGKey(12)))
-net.optimizer(optax.adam(1), lr=jno.schedule.learning_rate.exponential(1e-3, 0.5, 10, 1e-5))
+net.optimizer(optax.adam(1), lr=jno.schedule.learning_rate.exponential(1e-3, 0.5, 1000, 1e-5))
 
 u = net(x, y) * x * (1 - x) * y * (1 - y)
 pde = -(a * u.d2(x) + b * u.d2(y)) - forcing

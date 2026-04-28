@@ -45,7 +45,7 @@ u_net = jno.nn.wrap(foundax.mlp(
     hidden_dims=pick(64, 24),
     num_layers=pick(5, 3),  # slightly deeper for the oscillatory problem
     key=jax.random.PRNGKey(0),
-)).optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 10, 1e-5))
+)).optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 1000, 1e-5))
 
 u = u_net(x, y) * x * (1 - x) * y * (1 - y)
 
