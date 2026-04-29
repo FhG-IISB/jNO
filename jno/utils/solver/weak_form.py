@@ -26,9 +26,15 @@ from ...trace import (
 from .solver_helper import (
     sum_terms as _sum_terms,
     apply_sign as _apply_sign,
-    contains_node_type as _contains_node_type_base,
-    contains_testfunction as _contains_testfunction_base,
-    contains_trialfunction as _contains_trialfunction_base,
+    contains_node_type as _contains_node_type,
+    contains_testfunction as _contains_testfunction,
+    contains_trialfunction as _contains_trialfunction,
+    iter_placeholder_children as _iter_placeholder_children,
+    contains_subexpr as _contains_subexpr,
+    contains_model_call as _contains_model_eval,
+    depends_on_domain_variables as _depends_on_domain_variables,
+    unique_by_id as _unique_by_id,
+    contains_temporal_derivative as _contains_temporal_derivative,
 )
 
 from .weak_form_helpers import (
@@ -41,40 +47,32 @@ from .weak_form_helpers import (
     is_test_grad as _is_test_grad,
     is_symgrad_test as _is_symgrad_test,
     get_test_value_shape as _get_test_value_shape,
-)
+    contains_testfunction_gradient as _contains_testfunction_gradient,
+    has_weak_basis_symbols as _has_weak_basis_symbols,
+    collect_region_keys as _collect_region_keys,
+    collect_variational_metas as _collect_variational_metas,
+    infer_term_bucket as _infer_term_bucket,
+    get_variational_region_meta as _get_variational_region_meta,
+    find_first_statefield as _find_first_statefield,
+    infer_state_value_shape as _infer_state_value_shape,
 
+    # state-field / trial rewriters
+    wrap_primary_state as _wrap_primary_state,
+    ensure_statefield_wrapped as _ensure_statefield_wrapped,
+    is_statefield_candidate as _is_statefield_candidate,
+    collect_state_field_candidates as _collect_state_field_candidates,
+    collect_derivative_based_state_targets as _collect_derivative_based_state_targets,
+    detect_primary_state_field as _detect_primary_state_field,
+    rebind_variational_variables as _rebind_variational_variables,
+    bind_statefield_for_vpinn as _bind_statefield_for_vpinn,
+    bind_statefield_for_fem as _bind_statefield_for_fem,
+    substitute_trial_for_vpinn as _substitute_trial_for_vpinn,
+
+)
 # -----------------------------------------------------------------------------
 # Backend-neutral weak-form IR
 # -----------------------------------------------------------------------------
 
-def _contains_node_type(domain_or_node, node_or_cls, cls=None) -> bool:
-    """
-    Compatibility wrapper.
-
-    Supports both:
-        _contains_node_type(node, cls)
-    and old weak_form style:
-        _contains_node_type(domain, node, cls)
-    """
-    if cls is None:
-        node = domain_or_node
-        cls = node_or_cls
-    else:
-        node = node_or_cls
-
-    return _contains_node_type_base(node, cls)
-
-
-def _contains_testfunction(domain_or_node, node=None) -> bool:
-    if node is None:
-        node = domain_or_node
-    return _contains_testfunction_base(node)
-
-
-def _contains_trialfunction(domain_or_node, node=None) -> bool:
-    if node is None:
-        node = domain_or_node
-    return _contains_trialfunction_base(node)
 
 @dataclass(frozen=True)
 class LoweredChannelTerm:
@@ -338,9 +336,9 @@ def is_variational_expr(domain, expr) -> bool:
         return False
 
     return (
-        _contains_node_type(domain, expr, TestFunction)
-        or _contains_node_type(domain, expr, TrialFunction)
-        or _contains_node_type(domain, expr, StateField)
+        _contains_node_type( expr, TestFunction)
+        or _contains_node_type( expr, TrialFunction)
+        or _contains_node_type( expr, StateField)
         or _contains_testfunction_gradient(domain, expr)
     )
 
@@ -392,788 +390,18 @@ def _infer_domain_from_expr(expr):
 
 
 
-def _contains_model_eval(node) -> bool:
-    if isinstance(node, ModelCall):
-        return True
-    for attr in ("left", "right", "target", "expr"):
-        child = getattr(node, attr, None)
-        if child is not None and _contains_model_eval(child):
-            return True
-    for attr in ("args", "variables"):
-        vals = getattr(node, attr, None)
-        if vals is None:
-            continue
-        for v in vals:
-            if isinstance(v, (list, tuple)):
-                for vv in v:
-                    if _contains_model_eval(vv):
-                        return True
-            else:
-                if _contains_model_eval(v):
-                    return True
-    return False
 
-
-def _depends_on_domain_variables(node) -> bool:
-    if isinstance(node, Variable):
-        return True
-    for attr in ("left", "right", "target", "expr"):
-        child = getattr(node, attr, None)
-        if child is not None and _depends_on_domain_variables(child):
-            return True
-    for attr in ("args", "variables"):
-        vals = getattr(node, attr, None)
-        if vals is None:
-            continue
-        for v in vals:
-            if isinstance(v, (list, tuple)):
-                for vv in v:
-                    if _depends_on_domain_variables(vv):
-                        return True
-            else:
-                if _depends_on_domain_variables(v):
-                    return True
-    return False
-
-def _infer_state_value_shape(domain, expr) -> tuple:
-    shapes = set()
-
-    def walk(node):
-        if node is None:
-            return
-
-        if isinstance(node, TestFunction):
-            shapes.add(tuple(getattr(node, "value_shape", ())))
-            return
-
-        if isinstance(node, Jacobian) and isinstance(node.target, TestFunction):
-            shapes.add(tuple(getattr(node.target, "value_shape", ())))
-            return
-
-        if _is_symgrad_test(node):
-            shapes.add(tuple(_get_test_value_shape(node)))
-            return
-
-        for child in _iter_placeholder_children(node):
-            walk(child)
-
-    walk(expr)
-
-    if len(shapes) == 0:
-        return ()
-
-    if len(shapes) == 1:
-        return next(iter(shapes))
-
-    raise NotImplementedError(
-        "Could not infer a unique state value_shape from the weak form. "
-        f"Found multiple test value shapes: {sorted(shapes)}"
-    )
-
-def _wrap_primary_state(node, target, *, state_name="u", value_shape=()):
-    if node is target:
-        return StateField(node, state_id=0, name=state_name, value_shape=value_shape)
-
-    if node is None:
-        return None
-
-    if isinstance(node, BinaryOp):
-        left = _wrap_primary_state(node.left, target, state_name=state_name, value_shape=value_shape)
-        right = _wrap_primary_state(node.right, target, state_name=state_name, value_shape=value_shape)
-        if left is not node.left or right is not node.right:
-            return BinaryOp(node.op, left, right)
-        return node
-
-    if isinstance(node, FunctionCall):
-        new_args = []
-        changed = False
-        for a in node.args:
-            if isinstance(a, Placeholder):
-                na = _wrap_primary_state(a, target, state_name=state_name, value_shape=value_shape)
-                changed = changed or (na is not a)
-                new_args.append(na)
-            else:
-                new_args.append(a)
-        if changed:
-            return node.copy_with_args(new_args)
-        return node
-
-    if isinstance(node, ModelCall):
-        new_args = []
-        changed = False
-        for a in node.args:
-            if isinstance(a, Placeholder):
-                na = _wrap_primary_state(a, target, state_name=state_name, value_shape=value_shape)
-                changed = changed or (na is not a)
-                new_args.append(na)
-            else:
-                new_args.append(a)
-        if changed:
-            rebuilt = ModelCall(node.model, new_args)
-            rebuilt.op_id = node.op_id
-            return rebuilt
-        return node
-
-    if isinstance(node, Jacobian):
-        new_target = _wrap_primary_state(node.target, target, state_name=state_name, value_shape=value_shape)
-        new_vars = []
-        changed = new_target is not node.target
-        for v in node.variables:
-            if isinstance(v, Placeholder):
-                nv = _wrap_primary_state(v, target, state_name=state_name, value_shape=value_shape)
-            else:
-                nv = v
-            changed = changed or (nv is not v)
-            new_vars.append(nv)
-        if changed:
-            return Jacobian(new_target, new_vars, node.scheme)
-        return node
-
-    if isinstance(node, Hessian):
-        new_target = _wrap_primary_state(node.target, target, state_name=state_name, value_shape=value_shape)
-        new_vars = []
-        changed = new_target is not node.target
-        for v in node.variables:
-            if isinstance(v, Placeholder):
-                nv = _wrap_primary_state(v, target, state_name=state_name, value_shape=value_shape)
-            else:
-                nv = v
-            changed = changed or (nv is not v)
-            new_vars.append(nv)
-        if changed:
-            return Hessian(new_target, new_vars, node.scheme, trace=node.trace)
-        return node
-
-    if isinstance(node, OperationDef):
-        new_expr = _wrap_primary_state(node.expr, target, state_name=state_name, value_shape=value_shape)
-        if new_expr is not node.expr:
-            rebuilt = OperationDef.__new__(OperationDef)
-            rebuilt.expr = new_expr
-            rebuilt.input_vars = node.input_vars
-            rebuilt.name = getattr(node, "name", None)
-            rebuilt.op_id = node.op_id
-            return rebuilt
-        return node
-
-    if isinstance(node, OperationCall):
-        new_args = []
-        changed = False
-        for a in node.args:
-            if isinstance(a, Placeholder):
-                na = _wrap_primary_state(a, target, state_name=state_name, value_shape=value_shape)
-                changed = changed or (na is not a)
-                new_args.append(na)
-            else:
-                new_args.append(a)
-        if changed:
-            rebuilt = OperationCall(node.operation, tuple(new_args))
-            rebuilt.op_id = node.op_id
-            return rebuilt
-        return node
-
-    if isinstance(node, Tracker):
-        new_expr = _wrap_primary_state(node.expr, target, state_name=state_name, value_shape=value_shape)
-        if new_expr is not node.expr:
-            rebuilt = Tracker(new_expr, interval=node.interval)
-            rebuilt.op_id = node.op_id
-            return rebuilt
-        return node
-
-    return node
-
-def _ensure_statefield_wrapped(domain, expr):
-    if _contains_node_type(domain, expr, StateField) or _contains_node_type(domain, expr, TrialFunction):
-        return expr
-
-    candidate = _detect_primary_state_field(domain, expr)
-    if candidate is None:
-        return expr
-
-    value_shape = _infer_state_value_shape(domain, expr)
-    return _wrap_primary_state(expr, candidate, state_name="u", value_shape=value_shape)
-
-def _iter_placeholder_children(node):
-    for attr in ("left", "right", "target", "expr"):
-        child = getattr(node, attr, None)
-        if child is not None and isinstance(child, Placeholder):
-            yield child
-
-    for attr in ("args", "variables"):
-        vals = getattr(node, attr, None)
-        if vals is None:
-            continue
-        for v in vals:
-            if isinstance(v, (list, tuple)):
-                for vv in v:
-                    if isinstance(vv, Placeholder):
-                        yield vv
-            else:
-                if isinstance(v, Placeholder):
-                    yield v
-
-
-def _contains_subexpr(root, target):
-    if root is target:
-        return True
-    for child in _iter_placeholder_children(root):
-        if _contains_subexpr(child, target):
-            return True
-    return False
-
-def _contains_testfunction_gradient(domain, expr):
-    if expr is None:
-        return False
-
-    if isinstance(expr, Jacobian) and isinstance(expr.target, TestFunction):
-        return True
-
-    for attr in ("left", "right", "operand", "expr", "integrand", "target"):
-        child = getattr(expr, attr, None)
-        if child is not None and _contains_testfunction_gradient(domain, child):
-            return True
-
-    for attr in ("args", "variables"):
-        vals = getattr(expr, attr, None)
-        if vals is None:
-            continue
-        for v in vals:
-            if isinstance(v, (list, tuple)):
-                for vv in v:
-                    if _contains_testfunction_gradient(domain, vv):
-                        return True
-            else:
-                if _contains_testfunction_gradient(domain, v):
-                    return True
-
-    return False
-
-def _has_weak_basis_symbols(domain, node):
-    return (
-        _contains_node_type(domain, node, TestFunction)
-        or _contains_node_type(domain, node, TrialFunction)
-        or _contains_testfunction_gradient(domain, node)
-    )
-
-
-def _collect_region_keys(domain, node):
-    metas = []
-    _collect_variational_metas(domain, node, metas)
-    return {(m["support"], m["region_id"]) for m in metas}
-
-
-def _is_statefield_candidate(domain, node):
-    if node is None:
-        return False
-
-    # Never wrap existing weak symbols or already-wrapped state fields.
-    if isinstance(node, (StateField, TestFunction, TrialFunction)):
-        return False
-
-    # NEW: derivatives are not the state field itself
-    if isinstance(node, (Jacobian, Hessian)):
-        return False
-
-    # The unknown field itself must not already include weak basis functions.
-    if _has_weak_basis_symbols(domain, node):
-        return False
-
-    # Reject additive composites like (u**3 - u) or whole weak expressions.
-    if isinstance(node, BinaryOp) and node.op in {"+", "-"}:
-        return False
-
-    # Must actually come from a model / NN evaluation somewhere.
-    if not _contains_model_eval(node):
-        return False
-
-    # Must depend on domain variables.
-    if not _depends_on_domain_variables(node):
-        return False
-
-    # If sampled FEM regions appear, they must all belong to one bucket only.
-    keys = _collect_region_keys(domain, node)
-    if len(keys) > 1:
-        return False
-
-    return True
-
-
-def _collect_state_field_candidates(domain, node, out):
-    if node is None:
-        return
-
-    if _is_statefield_candidate(domain, node):
-        out.append(node)
-        return   # IMPORTANT: do not descend further
-
-    for child in _iter_placeholder_children(node):
-        _collect_state_field_candidates(domain, child, out)
-
-
-# def _prune_to_minimal_candidates(candidates):
-#     """Keep only the smallest candidates, e.g. keep u, discard u**3."""
-#     uniq = []
-#     seen = set()
-#     for c in candidates:
-#         if id(c) not in seen:
-#             seen.add(id(c))
-#             uniq.append(c)
-
-#     minimal = []
-#     for c in uniq:
-#         contains_other = any(
-#             (other is not c) and _contains_subexpr(c, other)
-#             for other in uniq
-#         )
-#         if not contains_other:
-#             minimal.append(c)
-
-#     return minimal
-def _unique_by_id(nodes):
-    out = []
-    seen = set()
-    for n in nodes:
-        if id(n) not in seen:
-            seen.add(id(n))
-            out.append(n)
-    return out
-
-
-def _collect_derivative_based_state_targets(domain, node, out):
-    if node is None:
-        return
-
-    if isinstance(node, (Jacobian, Hessian)):
-        tgt = node.target
-
-        if not isinstance(tgt, (TrialFunction, TestFunction, StateField)):
-            if (
-                _contains_model_eval(tgt)
-                and _depends_on_domain_variables(tgt)
-                and not _has_weak_basis_symbols(domain, tgt)
-            ):
-                keys = _collect_region_keys(domain, tgt)
-                if len(keys) <= 1:
-                    out.append(tgt)
-
-    for child in _iter_placeholder_children(node):
-        _collect_derivative_based_state_targets(domain, child, out)
-
-def _detect_primary_state_field(domain, expr):
-    # Phase 1 robust path:
-    # if the unknown already appears as target of grad/hessian, use that first.
-    deriv_targets = []
-    _collect_derivative_based_state_targets(domain, expr, deriv_targets)
-    deriv_targets = _unique_by_id(deriv_targets)
-
-    if len(deriv_targets) == 1:
-        return deriv_targets[0]
-
-    if len(deriv_targets) > 1:
-        raise NotImplementedError(
-            "Multiple derivative-based state targets detected in weak form. "
-            "Phase 1 supports exactly one unknown. "
-            "Phase 3 will support multi-unknown systems."
-        )
-
-    # Fallback for weak forms without grad(u), e.g. pure reaction-like forms
-    candidates = []
-    _collect_state_field_candidates(domain, expr, candidates)
-    candidates = _unique_by_id(candidates)
-
-    if len(candidates) == 0:
-        return None
-
-    if len(candidates) > 1:
-        raise NotImplementedError(
-            "Multiple state-field candidates detected in weak form. "
-            "Phase 1 supports exactly one unknown. "
-            "Phase 3 will support multi-unknown systems."
-        )
-
-    return candidates[0]
-# --------------------------------
-# variational region helpers
-# --------------------------------
-
-
-
-def _collect_variational_metas(domain, node, out):
-    if node is None:
-        return
-
-    # IMPORTANT:
-    # StateField is a symbolic unknown placeholder.
-    # Do not inspect node.expr here, otherwise Robin terms that contain
-    # a volume-built state leak volume tags into boundary bucket inference.
-    if isinstance(node, StateField):
-        return
-
-    if isinstance(node, Variable) and getattr(node, "fem_meta", None) is not None:
-        out.append(node.fem_meta)
-        return
-
-    for attr in ("left", "right", "target", "expr"):
-        child = getattr(node, attr, None)
-        if child is not None:
-            _collect_variational_metas(domain, child, out)
-
-    for attr in ("args", "variables"):
-        vals = getattr(node, attr, None)
-        if vals is None:
-            continue
-        for v in vals:
-            if isinstance(v, (list, tuple)):
-                for vv in v:
-                    _collect_variational_metas(domain, vv, out)
-            else:
-                _collect_variational_metas(domain, v, out)
-
-
-def _infer_term_bucket(domain, term):
-    metas = []
-    _collect_variational_metas(domain, term, metas)
-
-    if len(metas) > 0:
-        support = metas[0]["support"]
-        region_id = metas[0]["region_id"]
-        for m in metas[1:]:
-            if m["support"] != support or m["region_id"] != region_id:
-                raise ValueError(
-                    "Weak-form term mixes variational regions. "
-                    f"Found both ({support}, {region_id}) and ({m['support']}, {m['region_id']})."
-                )
-        return support, region_id
-
-    if _contains_node_type(domain, term, TrialFunction) or _contains_node_type(domain, term, TestFunction):
-        return "volume", "volume"
-
-    raise ValueError(
-        "Could not infer weak-form support for term. "
-        "Use variables sampled on fem_gauss / gauss_<tag> inside the term or include TrialFunction/TestFunction."
-    )
-
-
-def _get_variational_region_meta(domain, support: str, region_id: str):
-    registry = getattr(domain, "_variational_sampling_registry", {})
-    for sample_tag, meta in registry.items():
-        if meta.get("support") == support and meta.get("region_id") == region_id:
-            return meta
-    raise KeyError(
-        f"No variational sampling meta found for support={support!r}, region_id={region_id!r}. Available: {registry}"
-    )
-
-def _find_first_statefield(node):
-    if node is None:
-        return None
-
-    if isinstance(node, StateField):
-        return node
-
-    for child in _iter_placeholder_children(node):
-        found = _find_first_statefield(child)
-        if found is not None:
-            return found
-
-    return None
-
-# --------------------------------
-# trial substitution / rebind
-# --------------------------------
-def _rebind_variational_variables(domain, node, target_support: str, target_region_id: str):
-    if node is None:
-        return None
-
-    target_meta = _get_variational_region_meta(domain, target_support, target_region_id)
-    target_tag = target_meta["context_tag"]
-
-    if isinstance(node, Variable) and getattr(node, "fem_meta", None) is not None:
-        if node.axis == "temporal":
-            return node
-        return Variable(
-            tag=target_tag,
-            dim=list(node.dim),
-            domain=domain,
-            axis=node.axis,
-            fem_meta=target_meta,
-        )
-
-    if isinstance(node, (TensorTag, Constant, Literal, TrialFunction, TestFunction)):
-        return node
-
-    if isinstance(node, BinaryOp):
-        left = _rebind_variational_variables(domain, node.left, target_support, target_region_id)
-        right = _rebind_variational_variables(domain, node.right, target_support, target_region_id)
-        if left is not node.left or right is not node.right:
-            return BinaryOp(node.op, left, right)
-        return node
-
-    if isinstance(node, FunctionCall):
-        new_args = [_rebind_variational_variables(domain, a, target_support, target_region_id) if isinstance(a, Placeholder) else a for a in node.args]
-        if any(n is not o for n, o in zip(new_args, node.args)):
-            return FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
-        return node
-
-    if isinstance(node, ModelCall):
-        new_args = [_rebind_variational_variables(domain, a, target_support, target_region_id) if isinstance(a, Placeholder) else a for a in node.args]
-        if any(n is not o for n, o in zip(new_args, node.args)):
-            rebuilt = ModelCall(node.model, new_args)
-            rebuilt.op_id = node.op_id
-            return rebuilt
-        return node
-
-    if isinstance(node, OperationDef):
-        new_expr = _rebind_variational_variables(domain, node.expr, target_support, target_region_id)
-        if new_expr is not node.expr:
-            rebuilt = OperationDef.__new__(OperationDef)
-            rebuilt.expr = new_expr
-            rebuilt.input_vars = node.input_vars
-            rebuilt.name = getattr(node, "name", None)
-            rebuilt.op_id = node.op_id
-            return rebuilt
-        return node
-
-    if isinstance(node, OperationCall):
-        new_args = [_rebind_variational_variables(domain, a, target_support, target_region_id) if isinstance(a, Placeholder) else a for a in node.args]
-        if any(n is not o for n, o in zip(new_args, node.args)):
-            rebuilt = OperationCall(node.operation, tuple(new_args))
-            rebuilt.op_id = node.op_id
-            return rebuilt
-        return node
-
-    if isinstance(node, Jacobian):
-        new_target = _rebind_variational_variables(domain, node.target, target_support, target_region_id)
-        new_vars = [_rebind_variational_variables(domain, v, target_support, target_region_id) if isinstance(v, Placeholder) else v for v in node.variables]
-        if new_target is not node.target or any(n is not o for n, o in zip(new_vars, node.variables)):
-            return Jacobian(new_target, new_vars, node.scheme)
-        return node
-
-    if isinstance(node, Hessian):
-        new_target = _rebind_variational_variables(domain, node.target, target_support, target_region_id)
-        new_vars = [_rebind_variational_variables(domain, v, target_support, target_region_id) if isinstance(v, Placeholder) else v for v in node.variables]
-        if new_target is not node.target or any(n is not o for n, o in zip(new_vars, node.variables)):
-            return Hessian(new_target, new_vars, node.scheme)
-        return node
-
-    if isinstance(node, Tracker):
-        new_expr = _rebind_variational_variables(domain, node.expr, target_support, target_region_id)
-        if new_expr is not node.expr:
-            rebuilt = Tracker(new_expr, interval=node.interval)
-            rebuilt.op_id = node.op_id
-            return rebuilt
-        return node
-
-    if isinstance(node, Assembly):
-        new_expr = _rebind_variational_variables(domain, node.expr, target_support, target_region_id)
-        if new_expr is not node.expr:
-            rebuilt = Assembly(new_expr, node.num_total_nodes, node.support, node.region_id)
-            rebuilt.op_id = node.op_id
-            return rebuilt
-        return node
-
-    if isinstance(node, GroupedAssembly):
-        vol_val = _rebind_variational_variables(domain, node.volume_value_expr, target_support, target_region_id) if node.volume_value_expr is not None else None
-        vol_grad = _rebind_variational_variables(domain, node.volume_grad_expr, target_support, target_region_id) if node.volume_grad_expr is not None else None
-        bnd_exprs = {k: _rebind_variational_variables(domain, v, target_support, target_region_id) for k, v in node.boundary_value_exprs.items()}
-        if (
-            vol_val is not node.volume_value_expr
-            or vol_grad is not node.volume_grad_expr
-            or any(bnd_exprs[k] is not node.boundary_value_exprs[k] for k in bnd_exprs)
-        ):
-            rebuilt = GroupedAssembly(vol_val, vol_grad, bnd_exprs, node.num_total_nodes)
-            rebuilt.op_id = node.op_id
-            return rebuilt
-        return node
-
-    return node
-
-def _bind_statefield_for_vpinn(domain, node, target_support: str, target_region_id: str):
-    if node is None:
-        return None
-
-    if isinstance(node, StateField):
-        rebound = _rebind_variational_variables(domain, node.expr, target_support, target_region_id)
-        return rebound
-
-    if isinstance(node, BinaryOp):
-        left = _bind_statefield_for_vpinn(domain, node.left, target_support, target_region_id)
-        right = _bind_statefield_for_vpinn(domain, node.right, target_support, target_region_id)
-        if left is not node.left or right is not node.right:
-            return BinaryOp(node.op, left, right)
-        return node
-
-    if isinstance(node, FunctionCall):
-        new_args = []
-        changed = False
-        for a in node.args:
-            if isinstance(a, Placeholder):
-                na = _bind_statefield_for_vpinn(domain, a, target_support, target_region_id)
-                changed = changed or (na is not a)
-                new_args.append(na)
-            else:
-                new_args.append(a)
-        if changed:
-            return node.copy_with_args(new_args)
-        return node
-
-    if isinstance(node, (Jacobian, Hessian)):
-        new_target = _bind_statefield_for_vpinn(domain, node.target, target_support, target_region_id)
-        if isinstance(node, Jacobian):
-            return Jacobian(new_target, node.variables, node.scheme)
-        return Hessian(new_target, node.variables, node.scheme, trace=node.trace)
-
-    return node
-
-
-def _bind_statefield_for_fem(node, trial_symbol=None):
-    if node is None:
-        return None
-
-    if isinstance(node, StateField):
-        if trial_symbol is None:
-            trial_symbol = TrialFunction(name=node.name, value_shape=node.value_shape)
-        return trial_symbol
-
-    if isinstance(node, BinaryOp):
-        left = _bind_statefield_for_fem(node.left, trial_symbol)
-        right = _bind_statefield_for_fem(node.right, trial_symbol)
-        if left is not node.left or right is not node.right:
-            return BinaryOp(node.op, left, right)
-        return node
-
-    if isinstance(node, FunctionCall):
-        new_args = []
-        changed = False
-        for a in node.args:
-            if isinstance(a, Placeholder):
-                na = _bind_statefield_for_fem(a, trial_symbol)
-                changed = changed or (na is not a)
-                new_args.append(na)
-            else:
-                new_args.append(a)
-        if changed:
-            return node.copy_with_args(new_args)
-        return node
-
-    if isinstance(node, (Jacobian, Hessian)):
-        new_target = _bind_statefield_for_fem(node.target, trial_symbol)
-        if isinstance(node, Jacobian):
-            return Jacobian(new_target, node.variables, node.scheme)
-        return Hessian(new_target, node.variables, node.scheme, trace=node.trace)
-
-    return node
-
-def _substitute_trial_for_vpinn(domain, node, trial_value, target_support: Optional[str] = None, target_region_id: Optional[str] = None):
-    if node is None:
-        return None
-
-    if isinstance(node, (Variable, TestFunction, TensorTag, Constant, Literal)):
-        return node
-
-    if isinstance(node, TrialFunction):
-        out = trial_value
-        if target_support is not None and target_region_id is not None:
-            out = _rebind_variational_variables(domain, out, target_support, target_region_id)
-        return out
-
-    if isinstance(node, BinaryOp):
-        left = _substitute_trial_for_vpinn(domain, node.left, trial_value, target_support, target_region_id)
-        right = _substitute_trial_for_vpinn(domain, node.right, trial_value, target_support, target_region_id)
-        if left is not node.left or right is not node.right:
-            return BinaryOp(node.op, left, right)
-        return node
-
-    if isinstance(node, FunctionCall):
-        new_args = [_substitute_trial_for_vpinn(domain, a, trial_value, target_support, target_region_id) if isinstance(a, Placeholder) else a for a in node.args]
-        if any(n is not o for n, o in zip(new_args, node.args)):
-            return FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
-        return node
-
-    if isinstance(node, ModelCall):
-        new_args = [_substitute_trial_for_vpinn(domain, a, trial_value, target_support, target_region_id) if isinstance(a, Placeholder) else a for a in node.args]
-        if any(n is not o for n, o in zip(new_args, node.args)):
-            rebuilt = ModelCall(node.model, new_args)
-            rebuilt.op_id = node.op_id
-            return rebuilt
-        return node
-
-    if isinstance(node, OperationDef):
-        new_expr = _substitute_trial_for_vpinn(domain, node.expr, trial_value, target_support, target_region_id)
-        if new_expr is not node.expr:
-            rebuilt = OperationDef.__new__(OperationDef)
-            rebuilt.expr = new_expr
-            rebuilt.input_vars = node.input_vars
-            rebuilt.name = getattr(node, "name", None)
-            rebuilt.op_id = node.op_id
-            return rebuilt
-        return node
-
-    if isinstance(node, OperationCall):
-        new_args = [_substitute_trial_for_vpinn(domain, a, trial_value, target_support, target_region_id) if isinstance(a, Placeholder) else a for a in node.args]
-        if any(n is not o for n, o in zip(new_args, node.args)):
-            rebuilt = OperationCall(node.operation, tuple(new_args))
-            rebuilt.op_id = node.op_id
-            return rebuilt
-        return node
-
-    if isinstance(node, Jacobian):
-        new_target = _substitute_trial_for_vpinn(domain, node.target, trial_value, target_support, target_region_id)
-        new_vars = [_substitute_trial_for_vpinn(domain, v, trial_value, target_support, target_region_id) if isinstance(v, Placeholder) else v for v in node.variables]
-        if new_target is not node.target or any(n is not o for n, o in zip(new_vars, node.variables)):
-            return Jacobian(new_target, new_vars, node.scheme)
-        return node
-
-    if isinstance(node, Hessian):
-        new_target = _substitute_trial_for_vpinn(domain, node.target, trial_value, target_support, target_region_id)
-        new_vars = [_substitute_trial_for_vpinn(domain, v, trial_value, target_support, target_region_id) if isinstance(v, Placeholder) else v for v in node.variables]
-        if new_target is not node.target or any(n is not o for n, o in zip(new_vars, node.variables)):
-            return Hessian(new_target, new_vars, node.scheme)
-        return node
-
-    if isinstance(node, Tracker):
-        new_expr = _substitute_trial_for_vpinn(domain, node.expr, trial_value, target_support, target_region_id)
-        if new_expr is not node.expr:
-            rebuilt = Tracker(new_expr, interval=node.interval)
-            rebuilt.op_id = node.op_id
-            return rebuilt
-        return node
-
-    if isinstance(node, Assembly):
-        new_expr = _substitute_trial_for_vpinn(domain, node.expr, trial_value, target_support, target_region_id)
-        if new_expr is not node.expr:
-            rebuilt = Assembly(new_expr, node.num_total_nodes, node.support, node.region_id)
-            rebuilt.op_id = node.op_id
-            return rebuilt
-        return node
-
-    if isinstance(node, GroupedAssembly):
-        vol_val = _substitute_trial_for_vpinn(domain, node.volume_value_expr, trial_value, target_support, target_region_id) if node.volume_value_expr is not None else None
-        vol_grad = _substitute_trial_for_vpinn(domain, node.volume_grad_expr, trial_value, target_support, target_region_id) if node.volume_grad_expr is not None else None
-        bnd_exprs = {k: _substitute_trial_for_vpinn(domain, v, trial_value, target_support, target_region_id) for k, v in node.boundary_value_exprs.items()}
-        if (
-            vol_val is not node.volume_value_expr
-            or vol_grad is not node.volume_grad_expr
-            or any(bnd_exprs[k] is not node.boundary_value_exprs[k] for k in bnd_exprs)
-        ):
-            rebuilt = GroupedAssembly(vol_val, vol_grad, bnd_exprs, node.num_total_nodes)
-            rebuilt.op_id = node.op_id
-            return rebuilt
-        return node
-
-    return node
 
 
 # --------------------------------
 # auto solver helpers
 # --------------------------------
-def _contains_temporal_derivative(expr) -> bool:
-    from ..time_route import _max_temporal_derivative_order
-    return _max_temporal_derivative_order(expr) > 0
 
 
 def _contains_unknown_symbol(domain, expr) -> bool:
     return (
-        _contains_node_type(domain, expr, StateField)
-        or _contains_node_type(domain, expr, TrialFunction)
+        _contains_node_type( expr, StateField)
+        or _contains_node_type( expr, TrialFunction)
     )
 
 
@@ -1250,7 +478,6 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
 
 def _infer_solver_target(domain, expr):
     if _contains_temporal_derivative(expr):
-        from ..time_route import _contains_node_type
         if (
             _contains_node_type(expr, TestFunction)
             or _contains_node_type(expr, TrialFunction)
@@ -1365,7 +592,7 @@ def assemble_weak_form(domain, expr, target=None, **kwargs):
 
     # Strong-form Diffrax lowering should not go through weak/state wrapping.
     if target == "diffrax":
-        from ..time_route import _assemble_diffrax_from_strong_form
+        from .time_route import _assemble_diffrax_from_strong_form
         return _assemble_diffrax_from_strong_form(domain, expr, **kwargs)
 
     # All weak/FEM/VPINN routes still use the wrapped weak expression path.
@@ -1378,15 +605,15 @@ def assemble_weak_form(domain, expr, target=None, **kwargs):
     if target in {"fem_system", "fem_residual"}:
         ir = lower_weak_form(domain, expr, for_target="fem")
         if target == "fem_system":
-            from ..fem_route import _assemble_fem_system_from_ir
+            from .fem_route import _assemble_fem_system_from_ir
             return _assemble_fem_system_from_ir(domain, ir, **kwargs)
 
-        from ..fem_route import _assemble_fem_residual_from_ir
+        from .fem_route import _assemble_fem_residual_from_ir
         return _assemble_fem_residual_from_ir(domain, ir, **kwargs)
 
     if target == "feax_time":
         ir = lower_weak_form(domain, expr, for_target="fem")
-        from ..time_route import _assemble_feax_time_from_ir
+        from .time_route import _assemble_feax_time_from_ir
         return _assemble_feax_time_from_ir(domain, ir, **kwargs)
 
     raise ValueError(
