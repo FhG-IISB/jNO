@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 """
 Internal weak-form helper utilities.
 
@@ -49,6 +50,7 @@ from .solver_helper import (
 # Additive splitting
 # ---------------------------------------------------------------------------
 
+
 def split_weak_additive_terms(domain, node, sign=1.0, infer_term_bucket=None):
     """
     Split weak-form additive expressions into signed terms.
@@ -70,16 +72,10 @@ def split_weak_additive_terms(domain, node, sign=1.0, infer_term_bucket=None):
                 return [(sign, node)]
 
         if node.op == "+":
-            return (
-                split_weak_additive_terms(domain, node.left, sign, infer_term_bucket)
-                + split_weak_additive_terms(domain, node.right, sign, infer_term_bucket)
-            )
+            return split_weak_additive_terms(domain, node.left, sign, infer_term_bucket) + split_weak_additive_terms(domain, node.right, sign, infer_term_bucket)
 
         if node.op == "-":
-            return (
-                split_weak_additive_terms(domain, node.left, sign, infer_term_bucket)
-                + split_weak_additive_terms(domain, node.right, -sign, infer_term_bucket)
-            )
+            return split_weak_additive_terms(domain, node.left, sign, infer_term_bucket) + split_weak_additive_terms(domain, node.right, -sign, infer_term_bucket)
 
     return [(sign, node)]
 
@@ -87,6 +83,7 @@ def split_weak_additive_terms(domain, node, sign=1.0, infer_term_bucket=None):
 # ---------------------------------------------------------------------------
 # Function/test-symbol helpers
 # ---------------------------------------------------------------------------
+
 
 def function_name(node) -> Optional[str]:
     if isinstance(node, FunctionCall):
@@ -107,16 +104,11 @@ def get_grad_axis_from_test_grad(node) -> int:
         raise TypeError(f"Expected Jacobian(TestFunction), got {type(node).__name__}")
 
     if len(node.variables) != 1:
-        raise ValueError(
-            "Canonical FEAX-style test_grad lowering currently expects exactly one "
-            f"spatial variable in Jacobian(TestFunction,...), got {len(node.variables)}"
-        )
+        raise ValueError("Canonical FEAX-style test_grad lowering currently expects exactly one " f"spatial variable in Jacobian(TestFunction,...), got {len(node.variables)}")
 
     var = node.variables[0]
     if not isinstance(var, Variable):
-        raise TypeError(
-            f"Expected Variable inside Jacobian(TestFunction), got {type(var).__name__}"
-        )
+        raise TypeError(f"Expected Variable inside Jacobian(TestFunction), got {type(var).__name__}")
 
     if not hasattr(var, "dim") or len(var.dim) < 1:
         raise ValueError(f"Cannot infer gradient axis from variable {var}")
@@ -143,9 +135,7 @@ def canonicalize_grad_coeff(domain, coeff_expr, axis: int, value_shape: tuple):
             axis=-1,
         )
 
-    raise NotImplementedError(
-        f"Canonical grad coeff inflation not implemented yet for value_shape={value_shape}"
-    )
+    raise NotImplementedError(f"Canonical grad coeff inflation not implemented yet for value_shape={value_shape}")
 
 
 def value_shape_num_components(value_shape) -> int:
@@ -178,9 +168,7 @@ def is_symgrad_test(node) -> bool:
         return False
 
     arg0 = node.args[0]
-    return isinstance(arg0, TestFunction) or (
-        isinstance(arg0, Jacobian) and isinstance(arg0.target, TestFunction)
-    )
+    return isinstance(arg0, TestFunction) or (isinstance(arg0, Jacobian) and isinstance(arg0.target, TestFunction))
 
 
 def get_test_value_shape(node) -> tuple:
@@ -215,16 +203,13 @@ def contains_testfunction_gradient(domain, expr):
 
 
 def has_weak_basis_symbols(domain, node):
-    return (
-        contains_node_type(node, TestFunction)
-        or contains_node_type(node, TrialFunction)
-        or contains_testfunction_gradient(domain, node)
-    )
+    return contains_node_type(node, TestFunction) or contains_node_type(node, TrialFunction) or contains_testfunction_gradient(domain, node)
 
 
 # ---------------------------------------------------------------------------
 # Variational region helpers
 # ---------------------------------------------------------------------------
+
 
 def collect_region_keys(domain, node):
     metas = []
@@ -276,22 +261,14 @@ def infer_term_bucket(domain, term):
 
         for m in metas[1:]:
             if m["support"] != support or m["region_id"] != region_id:
-                raise ValueError(
-                    "Weak-form term mixes variational regions. "
-                    f"Found both ({support}, {region_id}) and "
-                    f"({m['support']}, {m['region_id']})."
-                )
+                raise ValueError("Weak-form term mixes variational regions. " f"Found both ({support}, {region_id}) and " f"({m['support']}, {m['region_id']}).")
 
         return support, region_id
 
     if contains_node_type(term, TrialFunction) or contains_node_type(term, TestFunction):
         return "volume", "volume"
 
-    raise ValueError(
-        "Could not infer weak-form support for term. "
-        "Use variables sampled on fem_gauss / gauss_<tag> inside the term "
-        "or include TrialFunction/TestFunction."
-    )
+    raise ValueError("Could not infer weak-form support for term. " "Use variables sampled on fem_gauss / gauss_<tag> inside the term " "or include TrialFunction/TestFunction.")
 
 
 def get_variational_region_meta(domain, support: str, region_id: str):
@@ -307,15 +284,13 @@ def get_variational_region_meta(domain, support: str, region_id: str):
         if meta.get("support") == support and meta.get("region_id") == region_id:
             return meta
 
-    raise KeyError(
-        f"No variational sampling meta found for support={support!r}, "
-        f"region_id={region_id!r}. Available: {registry}"
-    )
+    raise KeyError(f"No variational sampling meta found for support={support!r}, " f"region_id={region_id!r}. Available: {registry}")
 
 
 # ---------------------------------------------------------------------------
 # State-field detection
 # ---------------------------------------------------------------------------
+
 
 def find_first_statefield(node):
     if node is None:
@@ -362,10 +337,7 @@ def infer_state_value_shape(domain, expr) -> tuple:
     if len(shapes) == 1:
         return next(iter(shapes))
 
-    raise NotImplementedError(
-        "Could not infer a unique state value_shape from the weak form. "
-        f"Found multiple test value shapes: {sorted(shapes)}"
-    )
+    raise NotImplementedError("Could not infer a unique state value_shape from the weak form. " f"Found multiple test value shapes: {sorted(shapes)}")
 
 
 def wrap_primary_state(node, target, *, state_name="u", value_shape=()):
@@ -438,9 +410,9 @@ def wrap_primary_state(node, target, *, state_name="u", value_shape=()):
                 new_args.append(a)
 
         if changed:
-            rebuilt = ModelCall(node.model, new_args)
-            rebuilt.op_id = node.op_id
-            return rebuilt
+            rebuilt_model = ModelCall(node.model, new_args)
+            rebuilt_model.op_id = node.op_id
+            return rebuilt_model
 
         return node
 
@@ -511,12 +483,12 @@ def wrap_primary_state(node, target, *, state_name="u", value_shape=()):
         )
 
         if new_expr is not node.expr:
-            rebuilt = OperationDef.__new__(OperationDef)
-            rebuilt.expr = new_expr
-            rebuilt.input_vars = node.input_vars
-            rebuilt.name = getattr(node, "name", None)
-            rebuilt.op_id = node.op_id
-            return rebuilt
+            rebuilt_opdef = OperationDef.__new__(OperationDef)
+            rebuilt_opdef.expr = new_expr
+            rebuilt_opdef.input_vars = node.input_vars
+            rebuilt_opdef.name = getattr(node, "name", None)
+            rebuilt_opdef.op_id = node.op_id
+            return rebuilt_opdef
 
         return node
 
@@ -538,9 +510,9 @@ def wrap_primary_state(node, target, *, state_name="u", value_shape=()):
                 new_args.append(a)
 
         if changed:
-            rebuilt = OperationCall(node.operation, tuple(new_args))
-            rebuilt.op_id = node.op_id
-            return rebuilt
+            rebuilt_opcall = OperationCall(node.operation, tuple(new_args))
+            rebuilt_opcall.op_id = node.op_id
+            return rebuilt_opcall
 
         return node
 
@@ -553,9 +525,9 @@ def wrap_primary_state(node, target, *, state_name="u", value_shape=()):
         )
 
         if new_expr is not node.expr:
-            rebuilt = Tracker(new_expr, interval=node.interval)
-            rebuilt.op_id = node.op_id
-            return rebuilt
+            rebuilt_tracker = Tracker(new_expr, interval=node.interval)
+            rebuilt_tracker.op_id = node.op_id
+            return rebuilt_tracker
 
         return node
 
@@ -648,11 +620,7 @@ def collect_derivative_based_state_targets(domain, node, out):
         tgt = node.target
 
         if not isinstance(tgt, (TrialFunction, TestFunction, StateField)):
-            if (
-                contains_model_eval(tgt)
-                and depends_on_domain_variables(tgt)
-                and not has_weak_basis_symbols(domain, tgt)
-            ):
+            if contains_model_eval(tgt) and depends_on_domain_variables(tgt) and not has_weak_basis_symbols(domain, tgt):
                 keys = collect_region_keys(domain, tgt)
                 if len(keys) <= 1:
                     out.append(tgt)
@@ -678,11 +646,7 @@ def detect_primary_state_field(domain, expr):
         return deriv_targets[0]
 
     if len(deriv_targets) > 1:
-        raise NotImplementedError(
-            "Multiple derivative-based state targets detected in weak form. "
-            "Phase 1 supports exactly one unknown. "
-            "Phase 3 will support multi-unknown systems."
-        )
+        raise NotImplementedError("Multiple derivative-based state targets detected in weak form. " "Phase 1 supports exactly one unknown. " "Phase 3 will support multi-unknown systems.")
 
     # Fallback for weak forms without grad(u), e.g. pure reaction-like forms.
     candidates = []
@@ -693,11 +657,7 @@ def detect_primary_state_field(domain, expr):
         return None
 
     if len(candidates) > 1:
-        raise NotImplementedError(
-            "Multiple state-field candidates detected in weak form. "
-            "Phase 1 supports exactly one unknown. "
-            "Phase 3 will support multi-unknown systems."
-        )
+        raise NotImplementedError("Multiple state-field candidates detected in weak form. " "Phase 1 supports exactly one unknown. " "Phase 3 will support multi-unknown systems.")
 
     return candidates[0]
 
@@ -705,6 +665,7 @@ def detect_primary_state_field(domain, expr):
 # ---------------------------------------------------------------------------
 # Trial substitution / variational rebinding
 # ---------------------------------------------------------------------------
+
 
 def rebind_variational_variables(domain, node, target_support: str, target_region_id: str):
     """
@@ -755,12 +716,7 @@ def rebind_variational_variables(domain, node, target_support: str, target_regio
         return node
 
     if isinstance(node, FunctionCall):
-        new_args = [
-            rebind_variational_variables(domain, a, target_support, target_region_id)
-            if isinstance(a, Placeholder)
-            else a
-            for a in node.args
-        ]
+        new_args = [rebind_variational_variables(domain, a, target_support, target_region_id) if isinstance(a, Placeholder) else a for a in node.args]
 
         if any(n is not o for n, o in zip(new_args, node.args)):
             return FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
@@ -768,17 +724,12 @@ def rebind_variational_variables(domain, node, target_support: str, target_regio
         return node
 
     if isinstance(node, ModelCall):
-        new_args = [
-            rebind_variational_variables(domain, a, target_support, target_region_id)
-            if isinstance(a, Placeholder)
-            else a
-            for a in node.args
-        ]
+        new_args = [rebind_variational_variables(domain, a, target_support, target_region_id) if isinstance(a, Placeholder) else a for a in node.args]
 
         if any(n is not o for n, o in zip(new_args, node.args)):
-            rebuilt = ModelCall(node.model, new_args)
-            rebuilt.op_id = node.op_id
-            return rebuilt
+            rebuilt_model = ModelCall(node.model, new_args)
+            rebuilt_model.op_id = node.op_id
+            return rebuilt_model
 
         return node
 
@@ -791,27 +742,22 @@ def rebind_variational_variables(domain, node, target_support: str, target_regio
         )
 
         if new_expr is not node.expr:
-            rebuilt = OperationDef.__new__(OperationDef)
-            rebuilt.expr = new_expr
-            rebuilt.input_vars = node.input_vars
-            rebuilt.name = getattr(node, "name", None)
-            rebuilt.op_id = node.op_id
-            return rebuilt
+            rebuilt_opdef = OperationDef.__new__(OperationDef)
+            rebuilt_opdef.expr = new_expr
+            rebuilt_opdef.input_vars = node.input_vars
+            rebuilt_opdef.name = getattr(node, "name", None)
+            rebuilt_opdef.op_id = node.op_id
+            return rebuilt_opdef
 
         return node
 
     if isinstance(node, OperationCall):
-        new_args = [
-            rebind_variational_variables(domain, a, target_support, target_region_id)
-            if isinstance(a, Placeholder)
-            else a
-            for a in node.args
-        ]
+        new_args = [rebind_variational_variables(domain, a, target_support, target_region_id) if isinstance(a, Placeholder) else a for a in node.args]
 
         if any(n is not o for n, o in zip(new_args, node.args)):
-            rebuilt = OperationCall(node.operation, tuple(new_args))
-            rebuilt.op_id = node.op_id
-            return rebuilt
+            rebuilt_opcall = OperationCall(node.operation, tuple(new_args))
+            rebuilt_opcall.op_id = node.op_id
+            return rebuilt_opcall
 
         return node
 
@@ -822,16 +768,9 @@ def rebind_variational_variables(domain, node, target_support: str, target_regio
             target_support,
             target_region_id,
         )
-        new_vars = [
-            rebind_variational_variables(domain, v, target_support, target_region_id)
-            if isinstance(v, Placeholder)
-            else v
-            for v in node.variables
-        ]
+        new_vars = [rebind_variational_variables(domain, v, target_support, target_region_id) if isinstance(v, Placeholder) else v for v in node.variables]
 
-        if new_target is not node.target or any(
-            n is not o for n, o in zip(new_vars, node.variables)
-        ):
+        if new_target is not node.target or any(n is not o for n, o in zip(new_vars, node.variables)):
             return Jacobian(new_target, new_vars, node.scheme)
 
         return node
@@ -843,16 +782,9 @@ def rebind_variational_variables(domain, node, target_support: str, target_regio
             target_support,
             target_region_id,
         )
-        new_vars = [
-            rebind_variational_variables(domain, v, target_support, target_region_id)
-            if isinstance(v, Placeholder)
-            else v
-            for v in node.variables
-        ]
+        new_vars = [rebind_variational_variables(domain, v, target_support, target_region_id) if isinstance(v, Placeholder) else v for v in node.variables]
 
-        if new_target is not node.target or any(
-            n is not o for n, o in zip(new_vars, node.variables)
-        ):
+        if new_target is not node.target or any(n is not o for n, o in zip(new_vars, node.variables)):
             return Hessian(new_target, new_vars, node.scheme, trace=node.trace)
 
         return node
@@ -866,9 +798,9 @@ def rebind_variational_variables(domain, node, target_support: str, target_regio
         )
 
         if new_expr is not node.expr:
-            rebuilt = Tracker(new_expr, interval=node.interval)
-            rebuilt.op_id = node.op_id
-            return rebuilt
+            rebuilt_tracker = Tracker(new_expr, interval=node.interval)
+            rebuilt_tracker.op_id = node.op_id
+            return rebuilt_tracker
 
         return node
 
@@ -881,10 +813,9 @@ def rebind_variational_variables(domain, node, target_support: str, target_regio
         )
 
         if new_expr is not node.expr:
-            rebuilt = Assembly(new_expr, node.num_total_nodes, node.support, node.region_id)
-            rebuilt.op_id = node.op_id
-            return rebuilt
-
+            rebuilt_assembly = Assembly(new_expr, node.num_total_nodes, node.support, node.region_id)
+            rebuilt_assembly.op_id = node.op_id
+            return rebuilt_assembly
         return node
 
     if isinstance(node, GroupedAssembly):
@@ -908,16 +839,9 @@ def rebind_variational_variables(domain, node, target_support: str, target_regio
             if node.volume_grad_expr is not None
             else None
         )
-        bnd_exprs = {
-            k: rebind_variational_variables(domain, v, target_support, target_region_id)
-            for k, v in node.boundary_value_exprs.items()
-        }
+        bnd_exprs = {k: rebind_variational_variables(domain, v, target_support, target_region_id) for k, v in node.boundary_value_exprs.items()}
 
-        if (
-            vol_val is not node.volume_value_expr
-            or vol_grad is not node.volume_grad_expr
-            or any(bnd_exprs[k] is not node.boundary_value_exprs[k] for k in bnd_exprs)
-        ):
+        if vol_val is not node.volume_value_expr or vol_grad is not node.volume_grad_expr or any(bnd_exprs[k] is not node.boundary_value_exprs[k] for k in bnd_exprs):
             rebuilt = GroupedAssembly(vol_val, vol_grad, bnd_exprs, node.num_total_nodes)
             rebuilt.op_id = node.op_id
             return rebuilt
@@ -1146,41 +1070,51 @@ def substitute_trial_for_vpinn(
 
     if isinstance(node, FunctionCall):
         new_args = [
-            substitute_trial_for_vpinn(
-                domain,
-                a,
-                trial_value,
-                target_support,
-                target_region_id,
+            (
+                substitute_trial_for_vpinn(
+                    domain,
+                    a,
+                    trial_value,
+                    target_support,
+                    target_region_id,
+                )
+                if isinstance(a, Placeholder)
+                else a
             )
-            if isinstance(a, Placeholder)
-            else a
             for a in node.args
         ]
 
         if any(n is not o for n, o in zip(new_args, node.args)):
-            return FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
+            return FunctionCall(
+                node.fn,
+                new_args,
+                node._name,
+                node.reduces_axis,
+                node.kwargs,
+            )
 
         return node
 
     if isinstance(node, ModelCall):
         new_args = [
-            substitute_trial_for_vpinn(
-                domain,
-                a,
-                trial_value,
-                target_support,
-                target_region_id,
+            (
+                substitute_trial_for_vpinn(
+                    domain,
+                    a,
+                    trial_value,
+                    target_support,
+                    target_region_id,
+                )
+                if isinstance(a, Placeholder)
+                else a
             )
-            if isinstance(a, Placeholder)
-            else a
             for a in node.args
         ]
 
         if any(n is not o for n, o in zip(new_args, node.args)):
-            rebuilt = ModelCall(node.model, new_args)
-            rebuilt.op_id = node.op_id
-            return rebuilt
+            rebuilt_model = ModelCall(node.model, new_args)
+            rebuilt_model.op_id = node.op_id
+            return rebuilt_model
 
         return node
 
@@ -1194,33 +1128,35 @@ def substitute_trial_for_vpinn(
         )
 
         if new_expr is not node.expr:
-            rebuilt = OperationDef.__new__(OperationDef)
-            rebuilt.expr = new_expr
-            rebuilt.input_vars = node.input_vars
-            rebuilt.name = getattr(node, "name", None)
-            rebuilt.op_id = node.op_id
-            return rebuilt
+            rebuilt_opdef = OperationDef.__new__(OperationDef)
+            rebuilt_opdef.expr = new_expr
+            rebuilt_opdef.input_vars = node.input_vars
+            rebuilt_opdef.name = getattr(node, "name", None)
+            rebuilt_opdef.op_id = node.op_id
+            return rebuilt_opdef
 
         return node
 
     if isinstance(node, OperationCall):
         new_args = [
-            substitute_trial_for_vpinn(
-                domain,
-                a,
-                trial_value,
-                target_support,
-                target_region_id,
+            (
+                substitute_trial_for_vpinn(
+                    domain,
+                    a,
+                    trial_value,
+                    target_support,
+                    target_region_id,
+                )
+                if isinstance(a, Placeholder)
+                else a
             )
-            if isinstance(a, Placeholder)
-            else a
             for a in node.args
         ]
 
         if any(n is not o for n, o in zip(new_args, node.args)):
-            rebuilt = OperationCall(node.operation, tuple(new_args))
-            rebuilt.op_id = node.op_id
-            return rebuilt
+            rebuilt_opcall = OperationCall(node.operation, tuple(new_args))
+            rebuilt_opcall.op_id = node.op_id
+            return rebuilt_opcall
 
         return node
 
@@ -1233,21 +1169,21 @@ def substitute_trial_for_vpinn(
             target_region_id,
         )
         new_vars = [
-            substitute_trial_for_vpinn(
-                domain,
-                v,
-                trial_value,
-                target_support,
-                target_region_id,
+            (
+                substitute_trial_for_vpinn(
+                    domain,
+                    v,
+                    trial_value,
+                    target_support,
+                    target_region_id,
+                )
+                if isinstance(v, Placeholder)
+                else v
             )
-            if isinstance(v, Placeholder)
-            else v
             for v in node.variables
         ]
 
-        if new_target is not node.target or any(
-            n is not o for n, o in zip(new_vars, node.variables)
-        ):
+        if new_target is not node.target or any(n is not o for n, o in zip(new_vars, node.variables)):
             return Jacobian(new_target, new_vars, node.scheme)
 
         return node
@@ -1261,21 +1197,21 @@ def substitute_trial_for_vpinn(
             target_region_id,
         )
         new_vars = [
-            substitute_trial_for_vpinn(
-                domain,
-                v,
-                trial_value,
-                target_support,
-                target_region_id,
+            (
+                substitute_trial_for_vpinn(
+                    domain,
+                    v,
+                    trial_value,
+                    target_support,
+                    target_region_id,
+                )
+                if isinstance(v, Placeholder)
+                else v
             )
-            if isinstance(v, Placeholder)
-            else v
             for v in node.variables
         ]
 
-        if new_target is not node.target or any(
-            n is not o for n, o in zip(new_vars, node.variables)
-        ):
+        if new_target is not node.target or any(n is not o for n, o in zip(new_vars, node.variables)):
             return Hessian(new_target, new_vars, node.scheme, trace=node.trace)
 
         return node
@@ -1290,9 +1226,9 @@ def substitute_trial_for_vpinn(
         )
 
         if new_expr is not node.expr:
-            rebuilt = Tracker(new_expr, interval=node.interval)
-            rebuilt.op_id = node.op_id
-            return rebuilt
+            rebuilt_tracker = Tracker(new_expr, interval=node.interval)
+            rebuilt_tracker.op_id = node.op_id
+            return rebuilt_tracker
 
         return node
 
@@ -1306,9 +1242,14 @@ def substitute_trial_for_vpinn(
         )
 
         if new_expr is not node.expr:
-            rebuilt = Assembly(new_expr, node.num_total_nodes, node.support, node.region_id)
-            rebuilt.op_id = node.op_id
-            return rebuilt
+            rebuilt_assembly = Assembly(
+                new_expr,
+                node.num_total_nodes,
+                node.support,
+                node.region_id,
+            )
+            rebuilt_assembly.op_id = node.op_id
+            return rebuilt_assembly
 
         return node
 
@@ -1346,14 +1287,15 @@ def substitute_trial_for_vpinn(
             for k, v in node.boundary_value_exprs.items()
         }
 
-        if (
-            vol_val is not node.volume_value_expr
-            or vol_grad is not node.volume_grad_expr
-            or any(bnd_exprs[k] is not node.boundary_value_exprs[k] for k in bnd_exprs)
-        ):
-            rebuilt = GroupedAssembly(vol_val, vol_grad, bnd_exprs, node.num_total_nodes)
-            rebuilt.op_id = node.op_id
-            return rebuilt
+        if vol_val is not node.volume_value_expr or vol_grad is not node.volume_grad_expr or any(bnd_exprs[k] is not node.boundary_value_exprs[k] for k in bnd_exprs):
+            rebuilt_grouped = GroupedAssembly(
+                vol_val,
+                vol_grad,
+                bnd_exprs,
+                node.num_total_nodes,
+            )
+            rebuilt_grouped.op_id = node.op_id
+            return rebuilt_grouped
 
         return node
 

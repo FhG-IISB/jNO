@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 """
 Weak-form lowering and assembly dispatcher.
 
@@ -26,7 +27,7 @@ Supported assemble targets:
     "diffrax"      -> DiffraxBlock
 """
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Tuple
+from typing import Dict, List, Optional, Any, Tuple, cast
 import jax.numpy as jnp
 from ...jnp_ops import stack
 from ...trace import (
@@ -81,7 +82,6 @@ from .weak_form_helpers import (
     get_variational_region_meta as _get_variational_region_meta,
     find_first_statefield as _find_first_statefield,
     infer_state_value_shape as _infer_state_value_shape,
-
     # state-field / trial rewriters
     wrap_primary_state as _wrap_primary_state,
     ensure_statefield_wrapped as _ensure_statefield_wrapped,
@@ -93,8 +93,8 @@ from .weak_form_helpers import (
     bind_statefield_for_vpinn as _bind_statefield_for_vpinn,
     bind_statefield_for_fem as _bind_statefield_for_fem,
     substitute_trial_for_vpinn as _substitute_trial_for_vpinn,
-
 )
+
 # -----------------------------------------------------------------------------
 # Backend-neutral weak-form IR
 # -----------------------------------------------------------------------------
@@ -141,10 +141,11 @@ class LoweredChannelTerm:
     original_expr:
         Original symbolic term before channel extraction.
     """
+
     sign: float
-    support: str          # "volume" | "boundary"
+    support: str  # "volume" | "boundary"
     region_id: str
-    channel: str          # "test_value" | "test_grad" | "boundary_test_value" | "raw"
+    channel: str  # "test_value" | "test_grad" | "boundary_test_value" | "raw"
     coeff: Placeholder
     variable_id: int = 0
     value_shape: tuple = ()
@@ -152,7 +153,6 @@ class LoweredChannelTerm:
 
 
 @dataclass
-
 class LoweredWeakForm:
     """
     Backend-neutral lowered representation of a weak form.
@@ -183,7 +183,8 @@ class LoweredWeakForm:
     terms:
         Lowered weak-form terms.
     """
-    domain: object
+
+    domain: Any
     terms: List[LoweredChannelTerm] = field(default_factory=list)
 
     def select(self, *, support=None, region_id=None, channel=None, variable_id=None):
@@ -266,6 +267,8 @@ class LoweredWeakForm:
             if coeff is not None:
                 out[rid] = coeff
         return out
+
+
 # --------------------------------
 # additive-term helpers
 # --------------------------------
@@ -307,42 +310,41 @@ def _extract_test_channel(domain, expr) -> Tuple[str, Placeholder, Dict[str, Any
 
     # pure test value
     if isinstance(expr, TestFunction):
-        return "test_value", Literal(1.0), {
-            "value_shape": getattr(expr, "value_shape", ()),
-            "variable_id": 0,
-        }
+        return (
+            "test_value",
+            Literal(1.0),
+            {
+                "value_shape": getattr(expr, "value_shape", ()),
+                "variable_id": 0,
+            },
+        )
 
     # pure grad(test)
     if isinstance(expr, Jacobian) and isinstance(expr.target, TestFunction):
         value_shape = getattr(expr.target, "value_shape", ())
         axis = _get_grad_axis_from_test_grad(expr)
         coeff = _canonicalize_grad_coeff(domain, Literal(1.0), axis, value_shape)
-        return "test_grad", coeff, {
-            "value_shape": value_shape,
-            "variable_id": 0,
-        }
+        return (
+            "test_grad",
+            coeff,
+            {
+                "value_shape": value_shape,
+                "variable_id": 0,
+            },
+        )
     # additive combination of same-channel terms
     if isinstance(expr, BinaryOp) and expr.op in {"+", "-"}:
         ch_left, coeff_left, meta_left = _extract_test_channel(domain, expr.left)
         ch_right, coeff_right, meta_right = _extract_test_channel(domain, expr.right)
 
         if ch_left != ch_right:
-            raise ValueError(
-                "Could not extract a single canonical test channel from additive term: "
-                f"left channel={ch_left}, right channel={ch_right}, expr={expr}"
-            )
+            raise ValueError("Could not extract a single canonical test channel from additive term: " f"left channel={ch_left}, right channel={ch_right}, expr={expr}")
 
         if meta_left.get("variable_id", 0) != meta_right.get("variable_id", 0):
-            raise ValueError(
-                "Additive weak-form term mixes different variable ids: "
-                f"{meta_left.get('variable_id', 0)} vs {meta_right.get('variable_id', 0)}"
-            )
+            raise ValueError("Additive weak-form term mixes different variable ids: " f"{meta_left.get('variable_id', 0)} vs {meta_right.get('variable_id', 0)}")
 
         if tuple(meta_left.get("value_shape", ())) != tuple(meta_right.get("value_shape", ())):
-            raise ValueError(
-                "Additive weak-form term mixes different test value shapes: "
-                f"{meta_left.get('value_shape', ())} vs {meta_right.get('value_shape', ())}"
-            )
+            raise ValueError("Additive weak-form term mixes different test value shapes: " f"{meta_left.get('value_shape', ())} vs {meta_right.get('value_shape', ())}")
 
         if expr.op == "+":
             coeff = coeff_left + coeff_right
@@ -356,34 +358,51 @@ def _extract_test_channel(domain, expr) -> Tuple[str, Placeholder, Dict[str, Any
         right = expr.right
 
         if _is_test_value(left):
-            return "test_value", right, {
-                "value_shape": getattr(left, "value_shape", ()),
-                "variable_id": 0,
-            }
+            return (
+                "test_value",
+                right,
+                {
+                    "value_shape": getattr(left, "value_shape", ()),
+                    "variable_id": 0,
+                },
+            )
         if _is_test_value(right):
-            return "test_value", left, {
-                "value_shape": getattr(right, "value_shape", ()),
-                "variable_id": 0,
-            }
+            return (
+                "test_value",
+                left,
+                {
+                    "value_shape": getattr(right, "value_shape", ()),
+                    "variable_id": 0,
+                },
+            )
 
         if _is_test_grad(left):
-            value_shape = getattr(left.target, "value_shape", ())
-            axis = _get_grad_axis_from_test_grad(left)
+            left_grad = cast(Jacobian, left)
+            value_shape = getattr(left_grad.target, "value_shape", ())
+            axis = _get_grad_axis_from_test_grad(left_grad)
             coeff = _canonicalize_grad_coeff(domain, right, axis, value_shape)
-            return "test_grad", coeff, {
-                "value_shape": value_shape,
-                "variable_id": 0,
-            }
+            return (
+                "test_grad",
+                coeff,
+                {
+                    "value_shape": value_shape,
+                    "variable_id": 0,
+                },
+            )
 
         if _is_test_grad(right):
-            value_shape = getattr(right.target, "value_shape", ())
-            axis = _get_grad_axis_from_test_grad(right)
+            right_grad = cast(Jacobian, right)
+            value_shape = getattr(right_grad.target, "value_shape", ())
+            axis = _get_grad_axis_from_test_grad(right_grad)
             coeff = _canonicalize_grad_coeff(domain, left, axis, value_shape)
-            return "test_grad", coeff, {
-                "value_shape": value_shape,
-                "variable_id": 0,
-            }
-
+            return (
+                "test_grad",
+                coeff,
+                {
+                    "value_shape": value_shape,
+                    "variable_id": 0,
+                },
+            )
         # recurse left
         try:
             channel, coeff_left, meta = _extract_test_channel(domain, left)
@@ -407,45 +426,67 @@ def _extract_test_channel(domain, expr) -> Tuple[str, Placeholder, Dict[str, Any
 
             # inner(a, phi) or inner(phi, a)
             if _is_test_value(a0):
-                return "test_value", a1, {
-                    "value_shape": getattr(a0, "value_shape", ()),
-                    "variable_id": 0,
-                }
+                return (
+                    "test_value",
+                    a1,
+                    {
+                        "value_shape": getattr(a0, "value_shape", ()),
+                        "variable_id": 0,
+                    },
+                )
             if _is_test_value(a1):
-                return "test_value", a0, {
-                    "value_shape": getattr(a1, "value_shape", ()),
-                    "variable_id": 0,
-                }
+                return (
+                    "test_value",
+                    a0,
+                    {
+                        "value_shape": getattr(a1, "value_shape", ()),
+                        "variable_id": 0,
+                    },
+                )
 
             # inner(A, grad(phi)) or inner(grad(phi), A)
             if _is_test_grad(a0):
-                return "test_grad", a1, {
-                    "value_shape": getattr(a0.target, "value_shape", ()),
-                    "variable_id": 0,
-                }
+                return (
+                    "test_grad",
+                    a1,
+                    {
+                        "value_shape": getattr(a0.target, "value_shape", ()),
+                        "variable_id": 0,
+                    },
+                )
             if _is_test_grad(a1):
-                return "test_grad", a0, {
-                    "value_shape": getattr(a1.target, "value_shape", ()),
-                    "variable_id": 0,
-                }
+                return (
+                    "test_grad",
+                    a0,
+                    {
+                        "value_shape": getattr(a1.target, "value_shape", ()),
+                        "variable_id": 0,
+                    },
+                )
 
             # elasticity-like inner(sigma, symgrad(phi), n_contract=2)
             # canonical FEAX grad channel uses sigma itself
             if _is_symgrad_test(a0):
-                return "test_grad", a1, {
-                    "value_shape": _get_test_value_shape(a0),
-                    "variable_id": 0,
-                }
+                return (
+                    "test_grad",
+                    a1,
+                    {
+                        "value_shape": _get_test_value_shape(a0),
+                        "variable_id": 0,
+                    },
+                )
             if _is_symgrad_test(a1):
-                return "test_grad", a0, {
-                    "value_shape": _get_test_value_shape(a1),
-                    "variable_id": 0,
-                }
+                return (
+                    "test_grad",
+                    a0,
+                    {
+                        "value_shape": _get_test_value_shape(a1),
+                        "variable_id": 0,
+                    },
+                )
 
-    raise ValueError(
-        "Could not extract a canonical FEAX-style test channel from weak-form term. "
-        f"Unsupported term structure: {expr}"
-    )
+    raise ValueError("Could not extract a canonical FEAX-style test channel from weak-form term. " f"Unsupported term structure: {expr}")
+
 
 # --------------------------------
 # domain infer helpers
@@ -459,12 +500,8 @@ def is_variational_expr(domain, expr) -> bool:
     if isinstance(expr, (Assembly, GroupedAssembly)):
         return False
 
-    return (
-        _contains_node_type( expr, TestFunction)
-        or _contains_node_type( expr, TrialFunction)
-        or _contains_node_type( expr, StateField)
-        or _contains_testfunction_gradient(domain, expr)
-    )
+    return _contains_node_type(expr, TestFunction) or _contains_node_type(expr, TrialFunction) or _contains_node_type(expr, StateField) or _contains_testfunction_gradient(domain, expr)
+
 
 def _infer_domain_from_expr(expr):
     """
@@ -522,20 +559,13 @@ def _infer_domain_from_expr(expr):
     raise ValueError("Weak expression references multiple domains. Pass the intended domain explicitly.")
 
 
-
-
-
-
 # --------------------------------
 # auto solver helpers
 # --------------------------------
 
 
 def _contains_unknown_symbol(domain, expr) -> bool:
-    return (
-        _contains_node_type( expr, StateField)
-        or _contains_node_type( expr, TrialFunction)
-    )
+    return _contains_node_type(expr, StateField) or _contains_node_type(expr, TrialFunction)
 
 
 def _is_obviously_nonlinear_in_unknown(domain, expr):
@@ -575,16 +605,10 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
             if right_has:
                 return True
 
-        return (
-            _is_obviously_nonlinear_in_unknown(domain, expr.left)
-            or _is_obviously_nonlinear_in_unknown(domain, expr.right)
-        )
+        return _is_obviously_nonlinear_in_unknown(domain, expr.left) or _is_obviously_nonlinear_in_unknown(domain, expr.right)
 
     if isinstance(expr, FunctionCall):
-        unknown_args = [
-            a for a in expr.args
-            if isinstance(a, Placeholder) and _contains_unknown_symbol(domain, a)
-        ]
+        unknown_args = [a for a in expr.args if isinstance(a, Placeholder) and _contains_unknown_symbol(domain, a)]
 
         name = _function_name(expr)
 
@@ -605,16 +629,13 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
         if len(unknown_args) > 0 and name not in linearish:
             return True
 
-        return any(
-            _is_obviously_nonlinear_in_unknown(domain, a)
-            for a in expr.args
-            if isinstance(a, Placeholder)
-        )
+        return any(_is_obviously_nonlinear_in_unknown(domain, a) for a in expr.args if isinstance(a, Placeholder))
 
     if isinstance(expr, (Jacobian, Hessian)):
         return _is_obviously_nonlinear_in_unknown(domain, expr.target)
 
     return False
+
 
 def _infer_solver_target(domain, expr):
     """
@@ -629,24 +650,18 @@ def _infer_solver_target(domain, expr):
     The inference is only used when `target=None`.
     """
     if _contains_temporal_derivative(expr):
-        if (
-            _contains_node_type(expr, TestFunction)
-            or _contains_node_type(expr, TrialFunction)
-            or _contains_node_type(expr, StateField)
-        ):
+        if _contains_node_type(expr, TestFunction) or _contains_node_type(expr, TrialFunction) or _contains_node_type(expr, StateField):
             if getattr(domain, "_feax_context", None) is not None:
                 return "feax_time"
-            raise ValueError(
-                "A time-dependent weak form was detected, but domain.init_fem(...) "
-                "has not been called. For transient weak forms, initialize FEM first "
-                "and use target='feax_time' (or let auto-inference choose it)."
-            )
+            raise ValueError("A time-dependent weak form was detected, but domain.init_fem(...) " "has not been called. For transient weak forms, initialize FEM first " "and use target='feax_time' (or let auto-inference choose it).")
 
         return "diffrax"
 
     if _is_obviously_nonlinear_in_unknown(domain, expr):
         return "fem_residual"
     return "fem_system"
+
+
 # -----------------------------------------------------------------------------
 # Lower once, dispatch many
 # -----------------------------------------------------------------------------
@@ -691,11 +706,11 @@ def lower_weak_form(domain, expr, trial_value=None, for_target="vpinn"):
         StateField is replaced by a shared TrialFunction so FEAX can assemble
         matrix/residual operators.
     """
-    #print("DEBUG lower_weak_form has StateField before wrap:",
-      #_contains_node_type(domain, expr, StateField))
-    #expr = _ensure_statefield_wrapped(domain, expr)
-    #print("DEBUG lower_weak_form has StateField after wrap:",
-      #_contains_node_type(domain, expr, StateField))
+    # print("DEBUG lower_weak_form has StateField before wrap:",
+    # _contains_node_type(domain, expr, StateField))
+    # expr = _ensure_statefield_wrapped(domain, expr)
+    # print("DEBUG lower_weak_form has StateField after wrap:",
+    # _contains_node_type(domain, expr, StateField))
     shared_trial_symbol = None
     if for_target == "fem":
         sf = _find_first_statefield(expr)
@@ -739,9 +754,7 @@ def lower_weak_form(domain, expr, trial_value=None, for_target="vpinn"):
 
             if support == "boundary":
                 if channel != "test_value":
-                    raise NotImplementedError(
-                        f"Boundary grad(test)-type terms are not supported on region '{region_id}'."
-                    )
+                    raise NotImplementedError(f"Boundary grad(test)-type terms are not supported on region '{region_id}'.")
                 channel = "boundary_test_value"
 
             lowered_terms.append(
@@ -771,6 +784,7 @@ def lower_weak_form(domain, expr, trial_value=None, for_target="vpinn"):
             )
 
     return LoweredWeakForm(domain=domain, terms=lowered_terms)
+
 
 def assemble_weak_form(domain, expr, target=None, **kwargs):
     """
@@ -840,6 +854,7 @@ def assemble_weak_form(domain, expr, target=None, **kwargs):
     # Strong-form Diffrax lowering should not go through weak/state wrapping.
     if target == "diffrax":
         from .time_route import _assemble_diffrax_from_strong_form
+
         return _assemble_diffrax_from_strong_form(domain, expr, **kwargs)
 
     # All weak/FEM/VPINN routes still use the wrapped weak expression path.
@@ -853,27 +868,33 @@ def assemble_weak_form(domain, expr, target=None, **kwargs):
         if trial_value is None:
             trial_value = kwargs.pop("u_net", None)
 
-        ir = lower_weak_form(domain,expr, trial_value=trial_value, for_target="vpinn",)
+        ir = lower_weak_form(
+            domain,
+            expr,
+            trial_value=trial_value,
+            for_target="vpinn",
+        )
         return _assemble_vpinn_from_ir(ir, **kwargs)
 
     if target in {"fem_system", "fem_residual"}:
         ir = lower_weak_form(domain, expr, for_target="fem")
         if target == "fem_system":
             from .fem_route import _assemble_fem_system_from_ir
+
             return _assemble_fem_system_from_ir(domain, ir, **kwargs)
 
         from .fem_route import _assemble_fem_residual_from_ir
+
         return _assemble_fem_residual_from_ir(domain, ir, **kwargs)
 
     if target == "feax_time":
         ir = lower_weak_form(domain, expr, for_target="fem")
         from .time_route import _assemble_feax_time_from_ir
+
         return _assemble_feax_time_from_ir(domain, ir, **kwargs)
 
-    raise ValueError(
-        f"Unknown assembly target '{target}'. "
-        "Supported: 'vpinn', 'fem_system', 'fem_residual', 'feax_time', 'diffrax'"
-    )
+    raise ValueError(f"Unknown assembly target '{target}'. " "Supported: 'vpinn', 'fem_system', 'fem_residual', 'feax_time', 'diffrax'")
+
 
 def _assemble_vpinn_from_ir(ir: LoweredWeakForm, **kwargs):
     """
@@ -896,11 +917,7 @@ def _assemble_vpinn_from_ir(ir: LoweredWeakForm, **kwargs):
     This route does not solve a FEM system. It creates a differentiable weak
     residual object evaluated during neural training.
     """
-    if (
-        ir.volume_value_expr is None
-        and ir.volume_grad_expr is None
-        and len(ir.boundary_value_exprs) == 0
-    ):
+    if ir.volume_value_expr is None and ir.volume_grad_expr is None and len(ir.boundary_value_exprs) == 0:
         raise ValueError("No terms found for VPINN assembly.")
 
     num_total_nodes = int(ir.domain.fem_context["num_total_nodes"])

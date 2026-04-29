@@ -59,6 +59,7 @@ def _next_op_id() -> int:
     _operation_counter += 1
     return _operation_counter
 
+
 def _contains_node_type_local(node, cls) -> bool:
     if isinstance(node, cls):
         return True
@@ -82,6 +83,7 @@ def _contains_node_type_local(node, cls) -> bool:
                     return True
     return False
 
+
 def _mark_weak(node, root_id=None):
     if root_id is None:
         root_id = getattr(node, "op_id", id(node))
@@ -104,12 +106,10 @@ def _propagate_weak(node, *children):
 
     return node
 
+
 def _looks_like_weak_expression(node) -> bool:
-    return (
-        _contains_node_type_local(node, TestFunction)
-        or _contains_node_type_local(node, TrialFunction)
-        or _contains_node_type_local(node, StateField)
-    )
+    return _contains_node_type_local(node, TestFunction) or _contains_node_type_local(node, TrialFunction) or _contains_node_type_local(node, StateField)
+
 
 class Placeholder:
     """Base node for the traced DSL graph.
@@ -241,6 +241,7 @@ class Placeholder:
         target=None lets weak_form.py infer the steady solver route in Phase 1.
         """
         from .utils.solver.weak_form import assemble_weak_form
+
         return assemble_weak_form(domain, self, target=target, **kwargs)
 
     def print(self, what: Union[str, Callable[[jnp.ndarray], Any]] = "shape", label: Optional[str] = None):
@@ -1723,7 +1724,7 @@ class Jacobian(Placeholder):
         self.scheme = scheme
         weak_vars = [v for v in self.variables if isinstance(v, Placeholder)]
         _propagate_weak(self, target, *weak_vars)
-    
+
     def __repr__(self):
         var_names = ", ".join(str(v) for v in self.variables)
         return f"Jacobian({self.target}, [{var_names}])"
@@ -1762,6 +1763,7 @@ class FemLinearSystem:
         shape = getattr(self.A, "shape", None)
         return f"FemLinearSystem(shape={shape}, b_shape={getattr(self.b, 'shape', None)})"
 
+
 class FemResidualOperator:
     """Container for a nonlinear FEM residual operator R(u)=0.
 
@@ -1791,6 +1793,7 @@ class FemResidualOperator:
     def __repr__(self):
         return f"FemResidualOperator(size={self.size}, has_jacobian={self.jacobian is not None})"
 
+
 class StateField(Placeholder):
     """Internal marker for the primary weak-form unknown.
 
@@ -1806,6 +1809,7 @@ class StateField(Placeholder):
 
     def __repr__(self):
         return f"StateField(name={self.name!r}, id={self.state_id}, shape={self.value_shape})"
+
 
 class TrialFunction(Placeholder):
     """
@@ -1913,8 +1917,8 @@ class GroupedAssembly(Placeholder):
     """
 
     def __init__(self, volume_value_expr, volume_grad_expr, boundary_value_exprs, domain_or_nodes):
-        self.volume_value_expr = volume_value_expr          # Placeholder | None
-        self.volume_grad_expr = volume_grad_expr            # Placeholder | None
+        self.volume_value_expr = volume_value_expr  # Placeholder | None
+        self.volume_grad_expr = volume_grad_expr  # Placeholder | None
         self.boundary_value_exprs = boundary_value_exprs or {}  # dict[str, Placeholder]
         if hasattr(domain_or_nodes, "context"):
             self.num_total_nodes = int(domain_or_nodes.context["num_total_nodes"])
@@ -1924,11 +1928,7 @@ class GroupedAssembly(Placeholder):
 
     def __repr__(self):
         bkeys = list(self.boundary_value_exprs.keys())
-        return (
-            f"GroupedAssembly(value={'yes' if self.volume_value_expr is not None else 'no'}, "
-            f"grad={'yes' if self.volume_grad_expr is not None else 'no'}, "
-            f"boundaries={bkeys}, nodes={self.num_total_nodes})"
-        )
+        return f"GroupedAssembly(value={'yes' if self.volume_value_expr is not None else 'no'}, " f"grad={'yes' if self.volume_grad_expr is not None else 'no'}, " f"boundaries={bkeys}, nodes={self.num_total_nodes})"
 
 
 # =============================================================================
@@ -2083,10 +2083,7 @@ def cse(expr: Placeholder) -> Placeholder:
             new_volume_value = _visit(node.volume_value_expr) if node.volume_value_expr is not None else None
             new_volume_grad = _visit(node.volume_grad_expr) if node.volume_grad_expr is not None else None
             new_boundary = {}
-            changed = (
-                new_volume_value is not node.volume_value_expr
-                or new_volume_grad is not node.volume_grad_expr
-            )
+            changed = new_volume_value is not node.volume_value_expr or new_volume_grad is not node.volume_grad_expr
 
             for region_id, bnd_expr in node.boundary_value_exprs.items():
                 new_expr = _visit(bnd_expr)

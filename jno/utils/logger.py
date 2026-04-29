@@ -168,7 +168,7 @@ _default_logger: Optional[Logger] = None
 class PrintFallback:
     """Fallback logger that uses print when real logger isn't needed."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.path: Path = Path("")
 
     def __call__(self, message: str = "", level: int = logging.INFO) -> None:

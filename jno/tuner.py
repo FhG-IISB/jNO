@@ -101,7 +101,7 @@ class ArchSpace:
     # Reserved names for training hyperparameters
     TRAINING_PARAMS = {"epochs", "optimizer", "learning_rate", "constraint_weights", "weight_schedule"}
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._groups: List[Union[UniqueGroup, FloatGroup, IntGroup]] = []
         self._name_to_group: Dict[str, Union[UniqueGroup, FloatGroup, IntGroup]] = {}
 

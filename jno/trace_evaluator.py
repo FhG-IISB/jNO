@@ -587,7 +587,7 @@ class TraceEvaluator:
 
         if _is_foundax_pointwise_mlp(model):
             shaped_args = _broadcast_pointwise_args(shaped_args)
-        
+
         # Call equinox model directly (it IS the pytree, no init/apply split)
         import inspect
 
@@ -718,7 +718,7 @@ class TraceEvaluator:
                 if s == "__time__":
                     return None
                 if s.startswith("__time_") and s.endswith("__"):
-                    return s[len("__time_"):-2]
+                    return s[len("__time_") : -2]
                 return None
 
             # Use the actual temporal tag of the differentiated variable if present
@@ -811,11 +811,7 @@ class TraceEvaluator:
 
             # Determine active N from the matching spatial tag first.
             N = int(ctx.context.get("__active_spatial_n__", 1))
-            if (
-                active_spatial_tag is not None
-                and active_spatial_tag in ctx.context
-                and is_spatial_pointset(active_spatial_tag, ctx.context[active_spatial_tag])
-            ):
+            if active_spatial_tag is not None and active_spatial_tag in ctx.context and is_spatial_pointset(active_spatial_tag, ctx.context[active_spatial_tag]):
                 v = ctx.context[active_spatial_tag]
                 N = int(v.shape[point_axis(v)])
             else:
@@ -847,9 +843,7 @@ class TraceEvaluator:
                 if out.size == 1:
                     return jnp.reshape(out, (-1,))[0]
 
-                raise ValueError(
-                    f"Temporal derivative expected scalar output per point, got shape {out.shape}"
-                )
+                raise ValueError(f"Temporal derivative expected scalar output per point, got shape {out.shape}")
 
             def _local_context_for_point(idx):
                 local_ctx = {"__active_spatial_n__": 1}
@@ -913,12 +907,10 @@ class TraceEvaluator:
                 if temporal_derivative_order == 2:
                     return jax.grad(jax.grad(u_of_t_scalar))(time_scalar0)
 
-                raise NotImplementedError(
-                    f"Temporal AD derivative order {temporal_derivative_order} is not supported."
-                )
+                raise NotImplementedError(f"Temporal AD derivative order {temporal_derivative_order} is not supported.")
 
             result = jax.vmap(temporal_derivative_single_point)(jnp.arange(N))
-            return result[:, jnp.newaxis] 
+            return result[:, jnp.newaxis]
 
         # ── Spatial derivative ──
         tag = bound_var.tag
@@ -1355,22 +1347,14 @@ class TraceEvaluator:
                 coeff_vec = coeff_vec[:, None]
 
             if coeff_vec.ndim != 2:
-                raise ValueError(
-                    f"Scalar grad assembly expects coeff_vec.ndim == 2 after normalization, "
-                    f"got shape {coeff_vec.shape} with v_grads_JxW_flat {v_grads_JxW_flat.shape}"
-                )
+                raise ValueError(f"Scalar grad assembly expects coeff_vec.ndim == 2 after normalization, " f"got shape {coeff_vec.shape} with v_grads_JxW_flat {v_grads_JxW_flat.shape}")
 
             if coeff_vec.shape[0] != v_grads_JxW_flat.shape[0]:
-                raise ValueError(
-                    f"grad coeff shape {coeff_vec.shape} incompatible with "
-                    f"v_grads_JxW_flat {v_grads_JxW_flat.shape}"
-                )
+                raise ValueError(f"grad coeff shape {coeff_vec.shape} incompatible with " f"v_grads_JxW_flat {v_grads_JxW_flat.shape}")
 
             n_q_total, n_loc, dim = v_grads_JxW_flat.shape
             if coeff_vec.shape[1] != dim:
-                raise ValueError(
-                    f"Scalar grad coeff last dimension {coeff_vec.shape[1]} does not match dim={dim}"
-                )
+                raise ValueError(f"Scalar grad coeff last dimension {coeff_vec.shape[1]} does not match dim={dim}")
 
             # (Nq_total, n_loc)
             local_q = jnp.sum(coeff_vec[:, None, :] * v_grads_JxW_flat, axis=-1)
@@ -1384,24 +1368,16 @@ class TraceEvaluator:
                 coeff_vec = coeff_vec[:, None, :]
 
             if coeff_vec.ndim != 3:
-                raise ValueError(
-                    f"Vector grad assembly expects coeff_vec.ndim == 3 after normalization, "
-                    f"got shape {coeff_vec.shape} with v_grads_JxW_flat {v_grads_JxW_flat.shape}"
-                )
+                raise ValueError(f"Vector grad assembly expects coeff_vec.ndim == 3 after normalization, " f"got shape {coeff_vec.shape} with v_grads_JxW_flat {v_grads_JxW_flat.shape}")
 
             if coeff_vec.shape[0] != v_grads_JxW_flat.shape[0]:
-                raise ValueError(
-                    f"grad coeff shape {coeff_vec.shape} incompatible with "
-                    f"v_grads_JxW_flat {v_grads_JxW_flat.shape}"
-                )
+                raise ValueError(f"grad coeff shape {coeff_vec.shape} incompatible with " f"v_grads_JxW_flat {v_grads_JxW_flat.shape}")
 
             n_q_total, n_loc, test_vec, dim = v_grads_JxW_flat.shape
             coeff_nq, coeff_vec_dim, coeff_dim = coeff_vec.shape
 
             if coeff_dim != dim:
-                raise ValueError(
-                    f"Vector grad coeff last dimension {coeff_dim} does not match dim={dim}"
-                )
+                raise ValueError(f"Vector grad coeff last dimension {coeff_dim} does not match dim={dim}")
 
             # FEAX may provide singleton component axis in v_grads_JxW_flat.
             # Broadcast it to the coefficient component count if needed.
@@ -1413,20 +1389,17 @@ class TraceEvaluator:
                     )
                     test_vec = coeff_vec_dim
                 else:
-                    raise ValueError(
-                        f"grad coeff shape {coeff_vec.shape} incompatible with "
-                        f"v_grads_JxW_flat {v_grads_JxW_flat.shape}"
-                    )
+                    raise ValueError(f"grad coeff shape {coeff_vec.shape} incompatible with " f"v_grads_JxW_flat {v_grads_JxW_flat.shape}")
 
             # FEAX-style double contraction over component and spatial direction
             # -> local_q shape (Nq_total, n_loc)
-            local_q = jnp.sum(coeff_vec[:, None, :, :] * v_grads_JxW_flat, axis=-1,)
+            local_q = jnp.sum(
+                coeff_vec[:, None, :, :] * v_grads_JxW_flat,
+                axis=-1,
+            )
 
         else:
-            raise ValueError(
-                f"Unsupported v_grads_JxW_flat rank {v_grads_JxW_flat.ndim}; "
-                f"expected 3 (scalar) or 4 (vector/multi-component)."
-            )
+            raise ValueError(f"Unsupported v_grads_JxW_flat rank {v_grads_JxW_flat.ndim}; " f"expected 3 (scalar) or 4 (vector/multi-component).")
 
         # --------------------------------------------------
         # Reconstruct cell structure and sum quadrature
@@ -1434,16 +1407,12 @@ class TraceEvaluator:
         n_cell_times_nloc = flat_entity_nodes.shape[0]
 
         if n_cell_times_nloc % n_loc != 0:
-            raise ValueError(
-                f"flat_entity_nodes size {n_cell_times_nloc} is not divisible by n_loc={n_loc}"
-            )
+            raise ValueError(f"flat_entity_nodes size {n_cell_times_nloc} is not divisible by n_loc={n_loc}")
 
         num_cells = n_cell_times_nloc // n_loc
 
         if n_q_total % num_cells != 0:
-            raise ValueError(
-                f"Number of quad rows {n_q_total} is not divisible by num_cells={num_cells}"
-            )
+            raise ValueError(f"Number of quad rows {n_q_total} is not divisible by num_cells={num_cells}")
 
         num_quads = n_q_total // num_cells
 
@@ -1499,10 +1468,7 @@ class TraceEvaluator:
         # This guards grouped FEM paths where integrand is emitted with a flattened
         # (nloc * feature) axis instead of an explicit nloc axis.
         if flat_entity_nodes.size % num_entities != 0:
-            raise ValueError(
-                "Inconsistent FEM connectivity: flat_entity_nodes.size is not divisible "
-                f"by num_entities ({flat_entity_nodes.size} vs {num_entities})."
-            )
+            raise ValueError("Inconsistent FEM connectivity: flat_entity_nodes.size is not divisible " f"by num_entities ({flat_entity_nodes.size} vs {num_entities}).")
         expected_n_local_nodes = int(flat_entity_nodes.size // num_entities)
 
         if integrand.ndim < 2:
@@ -1525,19 +1491,13 @@ class TraceEvaluator:
 
         if integrand.ndim == 2:
             if integrand.shape[0] != num_entities * num_quads:
-                raise ValueError(
-                    f"Integrand first dim {integrand.shape[0]} does not match "
-                    f"num_entities*num_quads = {num_entities * num_quads}"
-                )
+                raise ValueError(f"Integrand first dim {integrand.shape[0]} does not match " f"num_entities*num_quads = {num_entities * num_quads}")
             n_loc = integrand.shape[1]
             integrand = integrand.reshape(num_entities, num_quads, n_loc)
 
         elif integrand.ndim >= 3:
             if integrand.shape[0] != num_entities or integrand.shape[1] != num_quads:
-                raise ValueError(
-                    f"Structured integrand shape {integrand.shape} is incompatible with "
-                    f"weights shape {weights.shape}"
-                )
+                raise ValueError(f"Structured integrand shape {integrand.shape} is incompatible with " f"weights shape {weights.shape}")
             n_loc = integrand.shape[2]
 
         else:
@@ -1548,10 +1508,7 @@ class TraceEvaluator:
 
         if local_residual.ndim == 2:
             if flat_entity_nodes.size != local_residual.size:
-                raise ValueError(
-                    f"flat_entity_nodes size {flat_entity_nodes.size} does not match "
-                    f"local_residual size {local_residual.size}"
-                )
+                raise ValueError(f"flat_entity_nodes size {flat_entity_nodes.size} does not match " f"local_residual size {local_residual.size}")
 
             global_residual = jax.ops.segment_sum(
                 local_residual.reshape(-1),
@@ -1732,7 +1689,7 @@ class TraceEvaluator:
             #     bnd_res = bnd_res * (gv / (gb + 1e-12))
 
             # Boundary value terms (e.g. Neumann loads) also act like RHS/load contributions
-            #print(f"DEBUG boundary tag={region_id}, ||bnd_res|| =", jnp.linalg.norm(bnd_res))
+            # print(f"DEBUG boundary tag={region_id}, ||bnd_res|| =", jnp.linalg.norm(bnd_res))
             total = bnd_res if total is None else (total + bnd_res)
 
         if total is None:

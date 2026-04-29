@@ -193,9 +193,7 @@ class FeaxPipelineBlock:
 
         dt_use = self.dt if dt is None else float(dt)
         if dt_use is None:
-            raise ValueError(
-                "No dt available on FeaxPipelineBlock. Pass dt=... explicitly."
-            )
+            raise ValueError("No dt available on FeaxPipelineBlock. Pass dt=... explicitly.")
 
         return TimeConfig(
             dt=dt_use,

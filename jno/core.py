@@ -446,7 +446,7 @@ class core:
 
         context = {}
         # List of tags that are MESH METADATA and should never be batched
-        metadata_tags = ["JxW", "flat_cells", "global_areas", "N_flat", "dN_dx_flat", "dirichlet_nodes","cells", "quad_points","boundary_nodes","surface_data","v_grads_JxW_flat","__time__"]
+        metadata_tags = ["JxW", "flat_cells", "global_areas", "N_flat", "dN_dx_flat", "dirichlet_nodes", "cells", "quad_points", "boundary_nodes", "surface_data", "v_grads_JxW_flat", "__time__"]
         if hasattr(domain, "context"):
             for tag, arr in domain.context.items():
                 # If it's a nested dictionary (like our VPINN surface_data), map safely
@@ -470,8 +470,12 @@ class core:
                 else:
                     context[tag] = arr[None, ...]
 
-        return DomainData(context=context, dimension=domain.dimension,)
-    #Vpinn helpers
+        return DomainData(
+            context=context,
+            dimension=domain.dimension,
+        )
+
+    # Vpinn helpers
     def _is_marked_weak(self, node) -> bool:
         return isinstance(node, Placeholder) and bool(getattr(node, "_is_weak_expr", False))
 
@@ -488,14 +492,14 @@ class core:
             left = self._materialize_marked_weak(node.left, parent_is_weak=is_weak)
             right = self._materialize_marked_weak(node.right, parent_is_weak=is_weak)
             if left is not node.left or right is not node.right:
-                rebuilt = BinaryOp(node.op, left, right)
+                rebuilt_binary = BinaryOp(node.op, left, right)
                 if is_weak:
-                    setattr(rebuilt, "_is_weak_expr", True)
-                    setattr(rebuilt, "_weak_root_id", getattr(node, "_weak_root_id", None))
-                node = rebuilt
+                    setattr(rebuilt_binary, "_is_weak_expr", True)
+                    setattr(rebuilt_binary, "_weak_root_id", getattr(node, "_weak_root_id", None))
+                node = rebuilt_binary
 
         elif isinstance(node, FunctionCall):
-            new_args = []
+            new_args: List[Any] = []
             changed = False
             for a in node.args:
                 if isinstance(a, Placeholder):
@@ -505,30 +509,30 @@ class core:
                 else:
                     new_args.append(a)
             if changed:
-                rebuilt = FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
+                rebuilt_function = FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
                 if is_weak:
-                    setattr(rebuilt, "_is_weak_expr", True)
-                    setattr(rebuilt, "_weak_root_id", getattr(node, "_weak_root_id", None))
-                node = rebuilt
+                    setattr(rebuilt_function, "_is_weak_expr", True)
+                    setattr(rebuilt_function, "_weak_root_id", getattr(node, "_weak_root_id", None))
+                node = rebuilt_function
 
         elif isinstance(node, OperationDef):
             new_expr = self._materialize_marked_weak(node.expr, parent_is_weak=is_weak)
             if new_expr is not node.expr:
-                rebuilt = OperationDef(new_expr)
-                rebuilt.name = getattr(node, "name", None)
+                rebuilt_opdef = OperationDef(new_expr)
+                rebuilt_opdef.name = getattr(node, "name", None)
                 if is_weak:
-                    setattr(rebuilt, "_is_weak_expr", True)
-                    setattr(rebuilt, "_weak_root_id", getattr(node, "_weak_root_id", None))
-                node = rebuilt
+                    setattr(rebuilt_opdef, "_is_weak_expr", True)
+                    setattr(rebuilt_opdef, "_weak_root_id", getattr(node, "_weak_root_id", None))
+                node = rebuilt_opdef
 
         elif isinstance(node, Tracker):
             new_expr = self._materialize_marked_weak(node.expr, parent_is_weak=is_weak)
             if new_expr is not node.expr:
-                rebuilt = Tracker(new_expr, interval=node.interval)
+                rebuilt_tracker = Tracker(new_expr, interval=node.interval)
                 if is_weak:
-                    setattr(rebuilt, "_is_weak_expr", True)
-                    setattr(rebuilt, "_weak_root_id", getattr(node, "_weak_root_id", None))
-                node = rebuilt
+                    setattr(rebuilt_tracker, "_is_weak_expr", True)
+                    setattr(rebuilt_tracker, "_weak_root_id", getattr(node, "_weak_root_id", None))
+                node = rebuilt_tracker
 
         # Replace only the OUTERMOST marked weak subtree, after wrapper recursion.
         if self._is_marked_weak(node) and not parent_is_weak:
@@ -1629,7 +1633,7 @@ class core:
 
             jax.effects_barrier()
             del _tw, _ow, _rw, _ew, _pl
-            #self.log.info("Skipping AOT compile/warmup; first training step will JIT normally.")
+            # self.log.info("Skipping AOT compile/warmup; first training step will JIT normally.")
 
             # ── 8. Training loop ──
 

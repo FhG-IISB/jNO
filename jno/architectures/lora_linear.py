@@ -147,7 +147,7 @@ def apply_lora(
     is_linear = lambda x: isinstance(x, Linear)
     flat_with_path, treedef = jax.tree_util.tree_flatten_with_path(model, is_leaf=is_linear)
 
-    new_leaves = []
+    new_leaves: list[Any] = []
     for path_keys, leaf in flat_with_path:
         if isinstance(leaf, Linear):
             pstr = _path_str(path_keys)

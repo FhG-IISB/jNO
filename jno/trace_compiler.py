@@ -653,19 +653,7 @@ class TraceCompiler:
         TraceEvaluator = _get_evaluator_class()
         TIME_TAG = "__time__"
         expr_tags = collect_tags(expr)
-        METADATA_TAGS = {
-        "JxW",
-        "flat_cells",
-        "global_areas",
-        "N_flat",
-        "dN_dx_flat",
-        "dirichlet_nodes",
-        "cells",
-        "quad_points",
-        "boundary_nodes",
-        "surface_data",
-        "v_grads_JxW_flat"
-    }
+        METADATA_TAGS = {"JxW", "flat_cells", "global_areas", "N_flat", "dN_dx_flat", "dirichlet_nodes", "cells", "quad_points", "boundary_nodes", "surface_data", "v_grads_JxW_flat"}
 
         def evaluate_single_point_set(params, context_single, key):
             """Evaluate for a single (N, D) context — no batch or time."""
@@ -871,7 +859,7 @@ class TraceCompiler:
                             else:
                                 ctx_dict[tag] = arr
                                 if active_spatial_n is None and hasattr(arr, "ndim") and arr.ndim >= 2:
-                                        active_spatial_n = int(arr.shape[0])
+                                    active_spatial_n = int(arr.shape[0])
                         if active_spatial_n is not None:
                             ctx_dict["__active_spatial_n__"] = active_spatial_n
                         if time_arr is not None:
@@ -952,19 +940,7 @@ class TraceCompiler:
         """
         TraceEvaluator = _get_evaluator_class()
         TIME_TAG = "__time__"
-        METADATA_TAGS = {
-            "JxW",
-            "flat_cells",
-            "global_areas",
-            "N_flat",
-            "dN_dx_flat",
-            "dirichlet_nodes",
-            "cells",
-            "quad_points",
-            "boundary_nodes",
-            "surface_data",
-            "v_grads_JxW_flat"
-        }
+        METADATA_TAGS = {"JxW", "flat_cells", "global_areas", "N_flat", "dN_dx_flat", "dirichlet_nodes", "cells", "quad_points", "boundary_nodes", "surface_data", "v_grads_JxW_flat"}
 
         def evaluate_single_point_set(params, context_single, key):
             """Evaluate ALL expressions on one (N, D) context — shared evaluator."""
@@ -1134,7 +1110,7 @@ class TraceCompiler:
                             else:
                                 ctx_dict[tag] = arr
                                 if active_spatial_n is None and hasattr(arr, "ndim") and arr.ndim >= 2:
-                                        active_spatial_n = int(arr.shape[0])
+                                    active_spatial_n = int(arr.shape[0])
                         if active_spatial_n is not None:
                             ctx_dict["__active_spatial_n__"] = active_spatial_n
                         if time_arr is not None:

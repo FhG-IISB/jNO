@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple, Optional, Callable, Any, Union
+from typing import Dict, List, Tuple, Optional, Callable, Any, Union, cast
 
 import cloudpickle
 import jax
@@ -14,6 +14,14 @@ from .boundary_region import BoundaryRegion
 from .domain_data import DomainData
 from .geometries import Geometries
 from .meshio_mixin import MeshIOMixin
+
+
+def _scalar_float(value: Any) -> float:
+    """Convert a scalar-like Python/NumPy/JAX value to float for BC callbacks."""
+    arr = np.asarray(value)
+    if arr.shape != ():
+        raise TypeError(f"Expected scalar value, got shape {arr.shape}.")
+    return float(arr.item())
 
 
 class domain(MeshIOMixin):
@@ -30,6 +38,12 @@ class domain(MeshIOMixin):
         _mesh_pool: Full mesh vertices per tag (private, used for sampling)
         context: Unified dict of spatial (B,N,D) and parametric (B,F) arrays for training
     """
+
+    time: Optional[Tuple[float, float, int]]
+    compute_mesh_connectivity: bool
+    _mesh_pool: Dict[str, Any]
+    context: Dict[str, Any]
+    fem_context: Dict[str, Any]
 
     @classmethod
     def _from_geometry(
@@ -322,35 +336,48 @@ class domain(MeshIOMixin):
         """
         if isinstance(constructor, domain):
             existing_domain = constructor
+
             if algorithm is None:
-                algorithm = getattr(existing_domain, "_algorithm", 6)
+                algorithm = int(getattr(existing_domain, "_algorithm", 6))
+
             if time is None:
-                time = existing_domain.time
+                time = cast(
+                    Optional[Tuple[float, float, int]],
+                    getattr(existing_domain, "time", None),
+                )
+
             if compute_mesh_connectivity is None:
-                compute_mesh_connectivity = existing_domain.compute_mesh_connectivity
+                compute_mesh_connectivity = bool(getattr(existing_domain, "compute_mesh_connectivity", True))
 
             cloned = cloudpickle.loads(cloudpickle.dumps(existing_domain))
             self.__dict__.update(cloned.__dict__)
+
             self.log = get_logger()
             self._algorithm = algorithm
-            self.compute_mesh_connectivity = compute_mesh_connectivity
+            self.compute_mesh_connectivity = bool(compute_mesh_connectivity)
             self._constructor_source = getattr(existing_domain, "_constructor_source", None)
             self.time = time
             self._is_time_dependent = time is not None
 
             if getattr(existing_domain, "_is_time_dependent", False):
-                base_mesh_pool = {}
-                for tag, points in self._mesh_pool.items():
+                base_mesh_pool: Dict[str, Any] = {}
+                mesh_pool = cast(Dict[str, Any], getattr(self, "_mesh_pool", {}))
+
+                for tag, points in mesh_pool.items():
                     if tag == "initial":
                         continue
                     if hasattr(points, "ndim") and points.ndim >= 3:
                         base_mesh_pool[tag] = np.asarray(points[0]).copy()
                     else:
                         base_mesh_pool[tag] = np.asarray(points).copy()
+
                 self._mesh_pool = base_mesh_pool
 
             self.context = {k: v for k, v in self.context.items() if k != "__time__"}
+
             if self._is_time_dependent:
+                if time is None:
+                    raise RuntimeError("Internal error: time-dependent cloned domain has time=None.")
                 self._add_time_dimension(time[0], time[1], time[2])
             else:
                 self.context["__time__"] = np.ones((1, 1))
@@ -373,7 +400,7 @@ class domain(MeshIOMixin):
 
         # Storage
         self.compute_mesh_connectivity = compute_mesh_connectivity
-        self._mesh_pool: Dict[str, Any] = {}  # full mesh vertices per tag (M, D)
+        self._mesh_pool = {}  # full mesh vertices per tag (M, D)
         self.context: Dict[str, Any] = {}  # unified: spatial (B,N,D) + params (B,F)
         self._param_tags: set = set()  # tags that are parametric (TensorTag)
         self.normals_by_tag: Dict[str, np.ndarray] = {}
@@ -866,7 +893,6 @@ class domain(MeshIOMixin):
         """
         return TestFunction(name=name, value_shape=value_shape)
 
-
     def trial_function(self, value_shape=(), name="u"):
         """Advanced helper for explicit FEM-only authoring."""
         return TrialFunction(name=name, value_shape=value_shape)
@@ -937,10 +963,7 @@ class domain(MeshIOMixin):
 
         if bcs is not None:
             if dirichlet_tags or neumann_tags or dirichlet_value_fns is not None:
-                raise ValueError(
-                    "Use either 'bcs=[...]' or the legacy "
-                    "'dirichlet_tags/neumann_tags/dirichlet_value_fns' arguments, not both."
-                )
+                raise ValueError("Use either 'bcs=[...]' or the legacy " "'dirichlet_tags/neumann_tags/dirichlet_value_fns' arguments, not both.")
             dirichlet_tags, dirichlet_value_fns, neumann_tags = expand_bcs(bcs, vec=vec)
 
         meshio_type_map = {
@@ -953,7 +976,7 @@ class domain(MeshIOMixin):
             raise ValueError(f"Unsupported FEM element_type '{element_type}'.")
 
         feax_mesh = fe.Mesh(
-            self.mesh.points[:, :self.dimension],
+            self.mesh.points[:, : self.dimension],
             self.mesh.cells_dict[meshio_type],
             ele_type=element_type,
         )
@@ -989,13 +1012,13 @@ class domain(MeshIOMixin):
                 return [lambda u, x: jnp.zeros((1,))] * len(location_fns)
 
         prob = DummyProblem(
-                feax_mesh,
-                vec=vec,
-                dim=self.dimension,
-                ele_type=element_type,
-                gauss_order=quad_degree,
-                location_fns=location_fns,
-            )
+            feax_mesh,
+            vec=vec,
+            dim=self.dimension,
+            ele_type=element_type,
+            gauss_order=quad_degree,
+            location_fns=location_fns,
+        )
         # print("len(prob.boundary_inds_list) =", len(prob.boundary_inds_list))
         # print("len(prob.selected_face_shape_grads) =", len(prob.selected_face_shape_grads))
         # print("len(prob.nanson_scale) =", len(prob.nanson_scale))
@@ -1044,7 +1067,7 @@ class domain(MeshIOMixin):
 
                     # Scalar case
                     if vec == 1:
-                        fn = value_obj if callable(value_obj) else (lambda p, c=float(value_obj): c)
+                        fn = value_obj if callable(value_obj) else (lambda p, c=_scalar_float(value_obj): c)
                         bc_config.add(loc_fn, "all", fn)
                         continue
 
@@ -1054,18 +1077,18 @@ class domain(MeshIOMixin):
                         vals = [value_obj for _ in range(vec)]
                     elif isinstance(value_obj, (list, tuple)):
                         if len(value_obj) != vec:
-                            raise ValueError( f"Dirichlet BC for tag '{tag}' has {len(value_obj)} entries, but vec={vec}.")
+                            raise ValueError(f"Dirichlet BC for tag '{tag}' has {len(value_obj)} entries, but vec={vec}.")
                         vals = list(value_obj)
                     else:
-                        raise TypeError( f"Unsupported Dirichlet BC value type for tag '{tag}': {type(value_obj).__name__}")
+                        raise TypeError(f"Unsupported Dirichlet BC value type for tag '{tag}': {type(value_obj).__name__}")
 
                     for comp, v in enumerate(vals):
                         if callable(v):
                             fn = v
                         elif onp.isscalar(v):
-                            fn = (lambda p, c=float(v): c)
+                            fn = lambda p, c=_scalar_float(v): c
                         else:
-                            raise TypeError(f"Unsupported Dirichlet BC component type for tag '{tag}', "f"component {comp}: {type(v).__name__}")
+                            raise TypeError(f"Unsupported Dirichlet BC component type for tag '{tag}', " f"component {comp}: {type(v).__name__}")
 
                         bc_config.add(loc_fn, component_names.get(comp, comp), fn)
 
@@ -1092,13 +1115,9 @@ class domain(MeshIOMixin):
                     if inside:
                         dirichlet_node_ids.append(i)
 
-        dirichlet_nodes = (
-            jnp.array(sorted(set(dirichlet_node_ids)), dtype=jnp.int32)
-            if len(dirichlet_node_ids) > 0
-            else jnp.array([], dtype=jnp.int32)
-        )
+        dirichlet_nodes = jnp.array(sorted(set(dirichlet_node_ids)), dtype=jnp.int32) if len(dirichlet_node_ids) > 0 else jnp.array([], dtype=jnp.int32)
 
-        #print("num extracted dirichlet nodes =", len(dirichlet_nodes))
+        # print("num extracted dirichlet nodes =", len(dirichlet_nodes))
         # ---------------------------------------------------------
         # Volume FEM context for VPINN / grouped weak-form assembly
         # Use FEAX Problem tensors directly so VPINN sees the same
@@ -1109,21 +1128,21 @@ class domain(MeshIOMixin):
         num_local_nodes = cells_jax.shape[1]
 
         # FEAX shape values are reference-shape values, shared across cells
-        shape_vals_jax = jnp.asarray(fe.shape_vals)   # (n_q, n_loc)
+        shape_vals_jax = jnp.asarray(fe.shape_vals)  # (n_q, n_loc)
 
         # FEAX Problem already stores PHYSICAL gradients and weighted test gradients
         # for all variables. Since this is the single-variable scalar case, take var 0.
-        shape_grads_phys_jax = jnp.asarray(prob.shape_grads[:, :, :num_local_nodes, :])      # (n_cells, n_q, n_loc, dim)
-        v_grads_JxW_jax = jnp.asarray(prob.v_grads_JxW[:, :, :num_local_nodes, :, :])     # (n_cells, n_q, n_loc, test_vec, dim)
+        shape_grads_phys_jax = jnp.asarray(prob.shape_grads[:, :, :num_local_nodes, :])  # (n_cells, n_q, n_loc, dim)
+        v_grads_JxW_jax = jnp.asarray(prob.v_grads_JxW[:, :, :num_local_nodes, :, :])  # (n_cells, n_q, n_loc, test_vec, dim)
         JxW_raw = jnp.asarray(prob.JxW)
         if JxW_raw.ndim == 3 and JxW_raw.shape[1] == 1:
-            JxW_jax = JxW_raw[:, 0, :]                                                     # (n_cells, n_q)
+            JxW_jax = JxW_raw[:, 0, :]  # (n_cells, n_q)
         elif JxW_raw.ndim == 2:
             JxW_jax = JxW_raw
         else:
-            raise ValueError(f"Unexpected prob.JxW shape: {JxW_raw.shape}")                                             # (n_cells, n_q)
-        quad_points = jnp.asarray(prob.physical_quad_points).reshape(-1, self.dimension)      # (n_cells*n_q, dim)
-            # (n_cells*n_q, dim)
+            raise ValueError(f"Unexpected prob.JxW shape: {JxW_raw.shape}")  # (n_cells, n_q)
+        quad_points = jnp.asarray(prob.physical_quad_points).reshape(-1, self.dimension)  # (n_cells*n_q, dim)
+        # (n_cells*n_q, dim)
 
         num_quads = JxW_jax.shape[1]
         dim = shape_grads_phys_jax.shape[-1]
@@ -1212,15 +1231,10 @@ class domain(MeshIOMixin):
                 boundary_inds_list = getattr(fe, "boundary_inds_list", None)
 
         if boundary_inds_list is None:
-            raise RuntimeError(
-                "Could not find or build boundary_inds_list from the FEM problem or FE space."
-            )
+            raise RuntimeError("Could not find or build boundary_inds_list from the FEM problem or FE space.")
 
         if len(boundary_inds_list) < len(valid_tags):
-            self.log.warning(
-                f"Only {len(boundary_inds_list)} boundary index sets found for "
-                f"{len(valid_tags)} requested Neumann tags."
-            )
+            self.log.warning(f"Only {len(boundary_inds_list)} boundary index sets found for " f"{len(valid_tags)} requested Neumann tags.")
 
         for tag, inds in zip(valid_tags, boundary_inds_list):
             if len(inds) == 0:
@@ -1233,10 +1247,10 @@ class domain(MeshIOMixin):
             inds = onp.asarray(inds)
 
             # Pull boundary tensors directly from FEAX Problem
-            face_shape_grads = jnp.asarray(prob.selected_face_shape_grads[bidx][:, :, :num_local_nodes, :])   # (n_faces, n_fq, n_loc, dim)
-            nanson_scale = jnp.asarray(prob.nanson_scale[bidx][:, 0, :])                                       # (n_faces, n_fq)
-            face_shape_vals = jnp.asarray(prob.selected_face_shape_vals[bidx][:, :, :num_local_nodes])         # (n_faces, n_fq, n_loc)
-            physical_face_quads = jnp.asarray(prob.physical_surface_quad_points[bidx])                          # (n_faces, n_fq, dim)
+            face_shape_grads = jnp.asarray(prob.selected_face_shape_grads[bidx][:, :, :num_local_nodes, :])  # (n_faces, n_fq, n_loc, dim)
+            nanson_scale = jnp.asarray(prob.nanson_scale[bidx][:, 0, :])  # (n_faces, n_fq)
+            face_shape_vals = jnp.asarray(prob.selected_face_shape_vals[bidx][:, :, :num_local_nodes])  # (n_faces, n_fq, n_loc)
+            physical_face_quads = jnp.asarray(prob.physical_surface_quad_points[bidx])  # (n_faces, n_fq, dim)
 
             parent_cells = fe.cells[inds[:, 0]]
 
@@ -1255,7 +1269,7 @@ class domain(MeshIOMixin):
             quad_pts_flat_np = onp.asarray(physical_face_quads).reshape(-1, self.dimension)
             quad_pts_flat = jnp.asarray(quad_pts_flat_np)
 
-            quad_normals = None
+            quad_normals: Any = None
             if tag in self.normals_by_tag and tag in self._mesh_pool:
                 tag_pts_np = onp.asarray(self._mesh_pool[tag])[:, : self.dimension]
                 tag_nrm_np = onp.asarray(self.normals_by_tag[tag])[:, : self.dimension]
@@ -1269,7 +1283,9 @@ class domain(MeshIOMixin):
                     # expose normals on the quadrature tag so domain.variable("gauss_tag", normals=True) works
                     self.normals_by_tag[f"gauss_{tag}"] = quad_normals_np
 
-            self.fem_context["surface_data"][tag] = {
+            surface_data = cast(Dict[str, Any], self.fem_context["surface_data"])
+
+            surface_data[tag] = {
                 "flat_parent_nodes": jnp.asarray(parent_cells, dtype=jnp.int32).reshape(-1),
                 "face_shape_vals": face_shape_vals,
                 "face_shape_grads": face_shape_grads,
@@ -1691,12 +1707,7 @@ class domain(MeshIOMixin):
 
         sample_tag = source_tag
 
-        if (
-            sample_tag in self._mesh_pool.keys()
-            and isinstance(sample, tuple)
-            and len(sample) > 0
-            and isinstance(sample[0], (int, type(None)))
-        ):
+        if sample_tag in self._mesh_pool.keys() and isinstance(sample, tuple) and len(sample) > 0 and isinstance(sample[0], (int, type(None))):
             # Sample points for this tag on demand.
             self.sample_dict.append([sample_tag, (None, None), resampling_strategy, normals, view_factor])
 
@@ -2357,7 +2368,7 @@ class domain(MeshIOMixin):
                     else:
                         idx = np.arange(n_available)
 
-                is_time_expanded = (getattr(available_points, "ndim", 0) == 3)
+                is_time_expanded = getattr(available_points, "ndim", 0) == 3
 
                 if is_time_expanded:
                     all_samples.append(available_points[:, idx, :])
@@ -2385,7 +2396,7 @@ class domain(MeshIOMixin):
                 else:
                     idx = np.arange(n_available)
 
-            is_time_expanded = (getattr(available_points, "ndim", 0) == 3)
+            is_time_expanded = getattr(available_points, "ndim", 0) == 3
 
             if is_time_expanded:
                 sampled_pts = available_points[:, idx, :]
@@ -2409,8 +2420,13 @@ class domain(MeshIOMixin):
 
             return result, nrm_result
 
-
-    def sample(self, sample_spec: Dict[str, Tuple[int, Optional[Callable]]], normals: bool = False, return_indices: bool = False,time_value: float | None = None,):
+    def sample(
+        self,
+        sample_spec: Dict[str, Tuple[int, Optional[Callable]]],
+        normals: bool = False,
+        return_indices: bool = False,
+        time_value: float | None = None,
+    ):
         """
         Sample points from the domain.
 
@@ -2434,6 +2450,7 @@ class domain(MeshIOMixin):
 
         batch_count = self._effective_batch_count()
         is_time_dep = self._is_time_dependent
+
         def _apply_time_value_to_sampled(tag_out, arr):
             """If time_value is given, reduce (B,T,N,D) to (B,1,N,D)."""
             if time_value is None or not is_time_dep:
@@ -2452,6 +2469,7 @@ class domain(MeshIOMixin):
             )
 
             return arr
+
         for tag, (n_samples, sampler) in sample_spec.items():
             # Handle special "initial" tag for time-dependent problems
             source_tag = tag

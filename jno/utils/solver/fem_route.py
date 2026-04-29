@@ -15,11 +15,10 @@ from .feax_utils import (
     _normalize_dirichlet_value,
     _build_feax_problem,
 )
+
 # --------------------------------
 # FEM boundary-condition helpers
 # --------------------------------
-
-
 
 
 @dataclass(frozen=True)
@@ -39,6 +38,7 @@ class DirichletBC:
         `_normalize_dirichlet_value(...)` and include `None`, scalars,
         callables, component lists/tuples, and component dictionaries.
     """
+
     tags: tuple[str, ...]
     values: object = None
 
@@ -57,6 +57,7 @@ class NeumannBC:
     tags:
         Boundary tag names treated as natural/surface regions.
     """
+
     tags: tuple[str, ...]
 
 
@@ -82,6 +83,7 @@ def _as_tags(tags) -> tuple[str, ...]:
             raise ValueError("Boundary tag list cannot be empty.")
         return out
     raise TypeError(f"Boundary tags must be a string or a sequence of strings, got {type(tags).__name__}.")
+
 
 def dirichlet(tags, values=None):
     """
@@ -131,6 +133,7 @@ def neumann(tags):
         Boundary-condition descriptor consumed by `expand_bcs(...)`.
     """
     return NeumannBC(tags=_as_tags(tags))
+
 
 def expand_bcs(bcs, vec: int):
     """
@@ -182,6 +185,7 @@ def expand_bcs(bcs, vec: int):
 # --------------------------------
 # public FEAX-backed entry points
 # --------------------------------
+
 
 def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
     """

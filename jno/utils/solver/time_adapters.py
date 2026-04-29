@@ -1,4 +1,5 @@
 from __future__ import annotations
+
 """
 Adapters from semidiscrete FEAX-time blocks to executable solver blocks.
 
@@ -26,6 +27,8 @@ import jax
 import jax.numpy as jnp
 
 from .backend_blocks import DiffraxBlock, FeaxTimeBlock, FeaxPipelineBlock
+
+
 # ---------------------------------------------------------------------
 # Adapter helpers
 # ---------------------------------------------------------------------
@@ -37,9 +40,7 @@ def _require_first_order(block: FeaxTimeBlock):
     semidiscrete systems only.
     """
     if block.time_order != 1:
-        raise NotImplementedError(
-            "Only first-order-in-time semidiscrete blocks are currently supported."
-        )
+        raise NotImplementedError("Only first-order-in-time semidiscrete blocks are currently supported.")
 
 
 def _select_scheme(block: FeaxTimeBlock, scheme: Optional[str]) -> str:
@@ -55,10 +56,7 @@ def _select_scheme(block: FeaxTimeBlock, scheme: Optional[str]) -> str:
 
     scheme = str(scheme).lower()
     if scheme not in {"backward_euler", "forward_euler"}:
-        raise ValueError(
-            f"Unsupported FEAX adapter scheme '{scheme}'. "
-            "Supported: 'backward_euler', 'forward_euler'."
-        )
+        raise ValueError(f"Unsupported FEAX adapter scheme '{scheme}'. " "Supported: 'backward_euler', 'forward_euler'.")
     return scheme
 
 
@@ -173,9 +171,7 @@ def make_diffrax_block(
 
         def rhs(t, y, solver_args):
             M_t = jnp.asarray(mass_fn(t, args if solver_args is None else solver_args))
-            R_t = jnp.asarray(
-                residual_fn(y, t, args if solver_args is None else solver_args)
-            ).reshape(-1)
+            R_t = jnp.asarray(residual_fn(y, t, args if solver_args is None else solver_args)).reshape(-1)
             return jnp.linalg.solve(M_t, -R_t)
 
         return DiffraxBlock(
@@ -203,10 +199,7 @@ def make_diffrax_block(
             },
         )
 
-    raise ValueError(
-        "make_diffrax_block(...) requires either a linear payload (M,A,...) "
-        "or a nonlinear payload (mass,residual,...)."
-    )
+    raise ValueError("make_diffrax_block(...) requires either a linear payload (M,A,...) " "or a nonlinear payload (mass,residual,...).")
 
 
 # ---------------------------------------------------------------------
@@ -299,9 +292,7 @@ def make_feax_pipeline(
     _require_first_order(block)
 
     if block.feax_mesh is None:
-        raise ValueError(
-            "make_feax_pipeline(...) requires feax_mesh on the semidiscrete block."
-        )
+        raise ValueError("make_feax_pipeline(...) requires feax_mesh on the semidiscrete block.")
 
     from feax.solvers.time_solver import TimePipeline
 
@@ -332,21 +323,13 @@ def make_feax_pipeline(
                 def _step_impl(state, t, dt):
                     if scheme_use == "backward_euler":
                         t_eval = t + dt
-                        ff = (
-                            jnp.zeros_like(c)
-                            if f_fn is None
-                            else jnp.asarray(f_fn(t_eval, args), dtype=M.dtype).reshape(-1)
-                        )
+                        ff = jnp.zeros_like(c) if f_fn is None else jnp.asarray(f_fn(t_eval, args), dtype=M.dtype).reshape(-1)
                         lhs = M + dt * A
                         rhs_vec = M @ state + dt * (c + ff)
                         return jnp.linalg.solve(lhs, rhs_vec)
 
                     t_eval = t
-                    ff = (
-                        jnp.zeros_like(c)
-                        if f_fn is None
-                        else jnp.asarray(f_fn(t_eval, args), dtype=M.dtype).reshape(-1)
-                    )
+                    ff = jnp.zeros_like(c) if f_fn is None else jnp.asarray(f_fn(t_eval, args), dtype=M.dtype).reshape(-1)
                     return state + dt * jnp.linalg.solve(M, c + ff - A @ state)
 
                 self._step_impl = jax.jit(_step_impl) if compile_step else _step_impl
@@ -405,6 +388,7 @@ def make_feax_pipeline(
         mass_is_constant = bool(runtime_info.get("mass_is_constant", False))
 
         if scheme_use == "forward_euler":
+
             class _NonlinearForwardEulerPipeline(TimePipeline):
                 def build(self, mesh):
                     self.mesh = mesh
@@ -466,10 +450,7 @@ def make_feax_pipeline(
             )
 
         if jacobian_fn is None:
-            raise ValueError(
-                "Nonlinear backward Euler requires jacobian(u,t). "
-                "Re-assemble with a residual+jacobian-capable nonlinear route."
-            )
+            raise ValueError("Nonlinear backward Euler requires jacobian(u,t). " "Re-assemble with a residual+jacobian-capable nonlinear route.")
 
         class _NonlinearBackwardEulerPipeline(TimePipeline):
             def build(self, mesh):
@@ -573,7 +554,4 @@ def make_feax_pipeline(
             },
         )
 
-    raise ValueError(
-        "make_feax_pipeline(...) requires either a linear payload (M,A,...) "
-        "or a nonlinear payload (mass,residual,...)."
-    )
+    raise ValueError("make_feax_pipeline(...) requires either a linear payload (M,A,...) " "or a nonlinear payload (mass,residual,...).")
