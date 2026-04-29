@@ -115,7 +115,7 @@ class FeaxPipelineBlock:
     Important fields
     ----------------
     backend:
-        Backend identifier. Usually `"feax_time"`.
+        Backend identifier. Usually `"fem_time"`.
     scheme:
         Time-integration scheme used by the generated pipeline, for example
         `"backward_euler"` or `"forward_euler"`.
@@ -217,7 +217,7 @@ class FeaxTimeBlock:
 
     A `FeaxTimeBlock` is returned by:
 
-        weak_expr.assemble(target="feax_time")
+        weak_expr.assemble(target="fem_time")
 
     It represents the spatially discretized transient weak-form problem, but it
     does not perform time integration by itself. It can be converted either to
@@ -250,12 +250,12 @@ class FeaxTimeBlock:
     Important fields
     ----------------
     backend:
-        Backend identifier. Usually `"feax_time"`.
+        Backend identifier. Usually `"fem_time"`.
     mode:
         Time-integration mode hint, usually `"implicit"` or `"explicit"`.
     time_order:
         Temporal order of the semidiscrete problem. Currently first-order
-        FEAX-time blocks are supported by the adapters.
+        FEM-time blocks are supported by the adapters.
     spatial_kind:
         Spatial discretization origin, usually `"weak_form"`.
     ir:

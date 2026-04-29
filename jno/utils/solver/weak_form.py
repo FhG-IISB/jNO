@@ -23,7 +23,7 @@ Supported assemble targets:
     "vpinn"        -> GroupedAssembly
     "fem_system"   -> (A, b)
     "fem_residual" -> FemResidualOperator
-    "feax_time"    -> FeaxTimeBlock
+    "fem_time"    -> FemTimeBlock
     "diffrax"      -> DiffraxBlock
 """
 from dataclasses import dataclass, field
@@ -643,7 +643,7 @@ def _infer_solver_target(domain, expr):
 
     Rules:
     - strong time-dependent expressions without weak symbols -> `"diffrax"`
-    - weak time-dependent expressions -> `"feax_time"`
+    - weak time-dependent expressions -> `"fem_time"`
     - steady weak forms that are linear in the unknown -> `"fem_system"`
     - steady weak forms that are nonlinear in the unknown -> `"fem_residual"`
 
@@ -651,9 +651,9 @@ def _infer_solver_target(domain, expr):
     """
     if _contains_temporal_derivative(expr):
         if _contains_node_type(expr, TestFunction) or _contains_node_type(expr, TrialFunction) or _contains_node_type(expr, StateField):
-            if getattr(domain, "_feax_context", None) is not None:
-                return "feax_time"
-            raise ValueError("A time-dependent weak form was detected, but domain.init_fem(...) " "has not been called. For transient weak forms, initialize FEM first " "and use target='feax_time' (or let auto-inference choose it).")
+            if getattr(domain, "_fem_context", None) is not None:
+                return "fem_time"
+            raise ValueError("A time-dependent weak form was detected, but domain.init_fem(...) " "has not been called. For transient weak forms, initialize FEM first " "and use target='fem_time' (or let auto-inference choose it).")
 
         return "diffrax"
 
@@ -816,8 +816,8 @@ def assemble_weak_form(domain, expr, target=None, **kwargs):
         `"fem_residual"`:
             Return a `FemResidualOperator` with residual and Jacobian callables.
 
-        `"feax_time"`:
-            Return a `FeaxTimeBlock` representing a transient semidiscrete
+        `"fem_time"`:
+            Return a `FemTimeBlock` representing a transient semidiscrete
             weak-form FEM problem.
 
         `"diffrax"`:
@@ -834,7 +834,7 @@ def assemble_weak_form(domain, expr, target=None, **kwargs):
         - `"vpinn"`        -> GroupedAssembly
         - `"fem_system"`   -> tuple(A, b)
         - `"fem_residual"` -> FemResidualOperator
-        - `"feax_time"`    -> FeaxTimeBlock
+        - `"fem_time"`    -> FemTimeBlock
         - `"diffrax"`      -> DiffraxBlock
 
     Notes
@@ -887,13 +887,13 @@ def assemble_weak_form(domain, expr, target=None, **kwargs):
 
         return _assemble_fem_residual_from_ir(domain, ir, **kwargs)
 
-    if target == "feax_time":
+    if target == "fem_time":
         ir = lower_weak_form(domain, expr, for_target="fem")
         from .time_route import _assemble_feax_time_from_ir
 
         return _assemble_feax_time_from_ir(domain, ir, **kwargs)
 
-    raise ValueError(f"Unknown assembly target '{target}'. " "Supported: 'vpinn', 'fem_system', 'fem_residual', 'feax_time', 'diffrax'")
+    raise ValueError(f"Unknown assembly target '{target}'. " "Supported: 'vpinn', 'fem_system', 'fem_residual', 'fem_time', 'diffrax'")
 
 
 def _assemble_vpinn_from_ir(ir: LoweredWeakForm, **kwargs):

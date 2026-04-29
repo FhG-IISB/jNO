@@ -15,7 +15,7 @@ Main responsibilities:
 This module is internal. User-facing code should normally call:
 
     expr.assemble(target="diffrax")
-    weak_expr.assemble(target="feax_time")
+    weak_expr.assemble(target="fem_time")
 """
 from typing import Any, Dict, Tuple
 from contextlib import contextmanager
@@ -561,10 +561,10 @@ def _assemble_diffrax_from_strong_form(domain, expr, **kwargs) -> DiffraxBlock:
 
     Raises:
         ValueError if the expression contains TestFunction/TrialFunction symbols,
-        because transient weak forms must use `target="feax_time"`.
+        because transient weak forms must use `target="fem_time"`.
     """
     if _contains_node_type(expr, TrialFunction) or _contains_node_type(expr, TestFunction):
-        raise ValueError("target='diffrax' expects a strong-form expression without " "TrialFunction/TestFunction symbols. For transient weak forms, " "use target='feax_time'.")
+        raise ValueError("target='diffrax' expects a strong-form expression without " "TrialFunction/TestFunction symbols. For transient weak forms, " "use target='fem_time'.")
 
     time_order = _detect_time_order(expr)
     if time_order <= 0:
@@ -1191,7 +1191,7 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
 
     This route is used by:
 
-        weak_expr.assemble(target="feax_time")
+        weak_expr.assemble(target="fem_time")
 
     It supports first-order-in-time weak forms and produces a solver-agnostic
     semidiscrete block.
@@ -1208,7 +1208,7 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             M(t) u_dot + R(u, t) = 0
 
     Returns:
-        FeaxTimeBlock with either linear payload `(M, A, affine_bias,
+        FemTimeBlock with either linear payload `(M, A, affine_bias,
         forcing_vector_fn)` or nonlinear payload `(mass, residual, jacobian)`.
 
     Raises:
@@ -1216,8 +1216,10 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         derivative is found.
         NotImplementedError for weak forms that are not first-order in time.
     """
-    if not hasattr(domain, "_feax_context"):
-        raise ValueError("target='feax_time' requires domain.init_fem(...) to be called before " "assembly so the FEAX mesh and quadrature context are available.")
+    has_fem_context = getattr(domain, "_variational_initialized", False) and getattr(domain, "fem_context", None) is not None and getattr(domain, "_feax_context", None) is not None
+
+    if not has_fem_context:
+        raise ValueError("target='fem_time' requires domain.init_fem(...) to be called before " "assembly so the FEM mesh and quadrature context are available.")
 
     expr_candidates = []
     if getattr(ir, "volume_expr", None) is not None:
@@ -1226,7 +1228,7 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
 
     time_order = max((_detect_time_order(e) for e in expr_candidates), default=0)
     if time_order <= 0:
-        raise ValueError("target='feax_time' could not find a temporal derivative in the weak-form " "expression. Use target='fem_system' or 'fem_residual' for steady weak forms.")
+        raise ValueError("target='fem_time' could not find a temporal derivative in the weak-form " "expression. Use target='fem_system' or 'fem_residual' for steady weak forms.")
 
     if time_order != 1:
         raise NotImplementedError("The JAX-native semidiscrete FEAX-time path currently supports only " "first-order-in-time weak forms.")
@@ -1239,12 +1241,12 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         mode = "implicit"
     mode = str(mode).lower()
     if mode not in {"implicit", "explicit"}:
-        raise ValueError(f"Unsupported target='feax_time' mode '{mode}'. Supported: 'implicit', 'explicit'.")
+        raise ValueError(f"Unsupported target='fem_time' mode '{mode}'. Supported: 'implicit', 'explicit'.")
 
     mass_expr, residual_expr, boundary_exprs = _split_mass_and_residual_from_ir(ir)
 
     metadata = dict(kwargs.get("metadata", {}))
-    metadata.setdefault("classification", _classify_time_problem(ir.volume_expr, domain, target="feax_time"))
+    metadata.setdefault("classification", _classify_time_problem(ir.volume_expr, domain, target="fem_time"))
     metadata.setdefault("temporal_tags", sorted(set().union(*(_collect_temporal_tags(e) for e in expr_candidates))))
     metadata.setdefault("domain_time", getattr(domain, "time", None))
 

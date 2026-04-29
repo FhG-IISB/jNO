@@ -219,7 +219,7 @@ def run_case(mesh_size=0.12, diffrax_dt0=2e-3, feax_dt=1e-2):
     t0_asm = time.perf_counter()
 
     block = weak.assemble(
-        target="feax_time",
+        target="fem_time",
         state0=u0_nodes,
         initial_conditions={"u(x,y,0)": "moving tanh front"},
         mode="implicit",

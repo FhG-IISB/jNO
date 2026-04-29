@@ -103,7 +103,7 @@ class TestLinearFeaxTimeRoute:
 
         block = weak.assemble(
             dom,
-            target="feax_time",
+            target="fem_time",
             linear=True,
             state0=state0,
             mode="implicit",
@@ -137,7 +137,7 @@ class TestLinearFeaxTimeRoute:
 
         block = weak.assemble(
             dom,
-            target="feax_time",
+            target="fem_time",
             linear=True,
             state0=state0,
             mode="explicit",
@@ -165,7 +165,7 @@ class TestLinearFeaxTimeRoute:
 
         block = weak.assemble(
             dom,
-            target="feax_time",
+            target="fem_time",
             linear=True,
             state0=state0,
             mode="implicit",
@@ -200,7 +200,7 @@ class TestNonlinearFeaxTimeRoute:
 
         block = weak.assemble(
             dom,
-            target="feax_time",
+            target="fem_time",
             state0=state0,
             mode="implicit",
         )
@@ -237,7 +237,7 @@ class TestNonlinearFeaxTimeRoute:
 
         block = weak.assemble(
             dom,
-            target="feax_time",
+            target="fem_time",
             state0=state0,
             mode="implicit",
         )
@@ -262,7 +262,7 @@ class TestNonlinearFeaxTimeRoute:
 
         block = weak.assemble(
             dom,
-            target="feax_time",
+            target="fem_time",
             state0=state0,
             mode="implicit",
         )
@@ -300,6 +300,6 @@ class TestTimeRouteValidation:
         with pytest.raises(ValueError):
             weak.assemble(
                 dom,
-                target="feax_time",
+                target="fem_time",
                 state0=zero_state_from_mesh(dom),
             )
