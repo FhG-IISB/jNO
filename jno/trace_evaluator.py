@@ -763,6 +763,19 @@ class TraceEvaluator:
                 return result
 
             # ── Temporal derivative via AD (default) ──
+            #
+            # Supports both:
+            #   grad(u, t)                  -> first temporal derivative
+            #   grad(grad(u, t), t)         -> second temporal derivative
+            #
+            # Important:
+            # For the nested case, do NOT evaluate the inner Jacobian as the
+            # target of an outer jax.grad. That can return a vector over all
+            # spatial points and causes:
+            #   "Temporal derivative expected scalar output per point"
+            #
+            # Instead, collapse the nested temporal Jacobian into one scalar
+            # function u_i(t) per spatial point and apply grad(grad(...)).
             domain = getattr(bound_var, "_domain", None)
             param_tags = set(getattr(domain, "_param_tags", set())) if domain is not None else set()
 
@@ -776,9 +789,27 @@ class TraceEvaluator:
                 return value.ndim >= 2
 
             def point_axis(value):
+                # During TraceCompiler time-window evaluation, spatial arrays
+                # are typically (W, N, D). For steady/single-time local contexts,
+                # they are often (N, D). In both cases the point axis is ndim - 2.
                 return value.ndim - 2
 
-            # Determine active N from the matching spatial tag FIRST.
+            def _is_temporal_variable(v):
+                bv = ctx.var_bindings.get(id(v), v)
+                return isinstance(bv, Variable) and getattr(bv, "axis", None) == "temporal"
+
+            # Detect nested temporal derivative:
+            #   Jacobian(Jacobian(u, [t]), [t])
+            temporal_derivative_order = 1
+            base_target = target
+
+            if isinstance(target, Jacobian) and len(getattr(target, "variables", [])) == 1:
+                inner_var = target.variables[0]
+                if _is_temporal_variable(inner_var):
+                    temporal_derivative_order = 2
+                    base_target = target.target
+
+            # Determine active N from the matching spatial tag first.
             N = int(ctx.context.get("__active_spatial_n__", 1))
             if (
                 active_spatial_tag is not None
@@ -788,40 +819,67 @@ class TraceEvaluator:
                 v = ctx.context[active_spatial_tag]
                 N = int(v.shape[point_axis(v)])
             else:
-                # fallback only if there is no matching spatial tag
+                # Fallback only if there is no matching spatial tag.
                 for k, v in ctx.context.items():
                     if is_spatial_pointset(k, v):
                         ax = point_axis(v)
                         N = max(N, int(v.shape[ax]))
 
-            def grad_time_single(idx):
+            def _set_active_time_tags(base_ctx, t_scalar):
+                t_box = jnp.asarray([[t_scalar]], dtype=time_dtype)
+                out = dict(base_ctx)
+
+                # Always keep the global time coherent.
+                out["__time__"] = t_box
+
+                # Also keep the specific active time tag coherent.
+                out[active_time_key] = t_box
+                return out
+
+            def _scalar_from_point_output(out):
+                out = jnp.asarray(out)
+                out = jnp.squeeze(out)
+
+                if out.ndim == 0:
+                    return out
+
+                # Accept any single-entry shape, e.g. (1,), (1,1), (1,1,1).
+                if out.size == 1:
+                    return jnp.reshape(out, (-1,))[0]
+
+                raise ValueError(
+                    f"Temporal derivative expected scalar output per point, got shape {out.shape}"
+                )
+
+            def _local_context_for_point(idx):
                 local_ctx = {"__active_spatial_n__": 1}
 
                 for k, v in ctx.context.items():
-                    # skip all time tags; they will be rebuilt below
+                    # Skip time tags; they are rebuilt for each t_scalar.
                     if is_time_tag(k):
                         continue
 
                     if is_spatial_pointset(k, v):
                         ax = point_axis(v)
 
-                        # Slice the matching spatial tag unconditionally
+                        should_slice = False
+
+                        # If the temporal tag is tied to a specific spatial tag,
+                        # slice that tag.
                         if active_spatial_tag is not None and k == active_spatial_tag:
-                            start_indices = [0] * v.ndim
-                            slice_sizes = list(v.shape)
-                            start_indices[ax] = idx
-                            slice_sizes[ax] = 1
-                            local_ctx[k] = jax.lax.dynamic_slice(
-                                v,
-                                tuple(start_indices),
-                                tuple(slice_sizes),
-                            )
-                        # Fallback behavior only when no matching spatial tag exists
+                            should_slice = True
+
+                        # If the temporal tag is the global "__time__", slice all
+                        # spatial point sets whose point axis matches N.
                         elif active_spatial_tag is None and int(v.shape[ax]) == N:
+                            should_slice = True
+
+                        if should_slice:
                             start_indices = [0] * v.ndim
                             slice_sizes = list(v.shape)
                             start_indices[ax] = idx
                             slice_sizes[ax] = 1
+
                             local_ctx[k] = jax.lax.dynamic_slice(
                                 v,
                                 tuple(start_indices),
@@ -832,15 +890,10 @@ class TraceEvaluator:
                     else:
                         local_ctx[k] = v
 
-                def _set_active_time_tags(base_ctx, t_scalar):
-                    t_box = jnp.asarray([[t_scalar]], dtype=time_dtype)
-                    out = dict(base_ctx)
+                return local_ctx
 
-                    # always keep the global time coherent
-                    out["__time__"] = t_box
-                    # and also the specific active time tag
-                    out[active_time_key] = t_box
-                    return out
+            def temporal_derivative_single_point(idx):
+                local_ctx = _local_context_for_point(idx)
 
                 def u_of_t_scalar(t_scalar):
                     new_ctx_dict = _set_active_time_tags(local_ctx, t_scalar)
@@ -851,24 +904,21 @@ class TraceEvaluator:
                         active_region=ctx.active_region,
                     )
 
-                    out = jnp.asarray(evaluator_self._dispatch(target, new_ctx))
-                    out = jnp.squeeze(out)
+                    out = evaluator_self._dispatch(base_target, new_ctx)
+                    return _scalar_from_point_output(out)
 
-                    if out.ndim == 0:
-                        return out
-                    if out.ndim == 1 and out.shape[0] == 1:
-                        return out[0]
-                    if out.ndim == 2 and out.shape == (1, 1):
-                        return out[0, 0]
+                if temporal_derivative_order == 1:
+                    return jax.grad(u_of_t_scalar)(time_scalar0)
 
-                    raise ValueError(
-                        f"Temporal derivative expected scalar output per point, got shape {out.shape}"
-                    )
+                if temporal_derivative_order == 2:
+                    return jax.grad(jax.grad(u_of_t_scalar))(time_scalar0)
 
-                return jax.grad(u_of_t_scalar)(time_scalar0)
+                raise NotImplementedError(
+                    f"Temporal AD derivative order {temporal_derivative_order} is not supported."
+                )
 
-            result = jax.vmap(grad_time_single)(jnp.arange(N))
-            return result[:, jnp.newaxis]
+            result = jax.vmap(temporal_derivative_single_point)(jnp.arange(N))
+            return result[:, jnp.newaxis] 
 
         # ── Spatial derivative ──
         tag = bound_var.tag
