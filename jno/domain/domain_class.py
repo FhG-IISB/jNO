@@ -1161,7 +1161,16 @@ class domain(MeshIOMixin):
             "surface_data": {},
         }
 
-        self._mesh_pool["fem_gauss"] = quad_points
+        quad_points_np = np.asarray(quad_points)
+
+        if getattr(self, "_is_time_dependent", False):
+            n_time = int(getattr(self, "_n_time", len(getattr(self, "_time_points", [0.0]))))
+            self._mesh_pool["fem_gauss"] = np.broadcast_to(
+                quad_points_np[np.newaxis, :, :],
+                (n_time, *quad_points_np.shape),
+            ).copy()
+        else:
+            self._mesh_pool["fem_gauss"] = quad_points_np
         self._register_variational_sample(
             sample_tag="fem_gauss",
             support="volume",
@@ -1658,42 +1667,78 @@ class domain(MeshIOMixin):
                 else:
                     self.add_tensor_tag(tag, sample)
 
-        # auto-default for the initial slice in time-dependent problems
-        # Public API expectation:
-        #   x0, y0, t0 = domain.variable("initial")
+        # ------------------------------------------------------------------
+        # Clean API for initial condition:
+        #   x0, y0, t0 = domain.variable("initial", split=True)
         #
-        # In many time-dependent examples there is no separately sampled spatial
-        # tag called "initial"; users usually mean:
-        #   - use the same spatial support as "interior"
-        #   - but pin time to t = t0
+        # requested_tag = public tag returned to the user.
+        # source_tag    = internal mesh/context tag used for sampling.
         #
-        # So if "initial" is requested and not already materialized as its own
-        # spatial tag, transparently fall back to "interior".
-        source_tag = tag
-        if tag == "initial" and self._is_time_dependent and self.time is not None:
+        # For time-dependent domains, "initial" means t = self.time[0].
+        # If an explicit "initial" mesh pool exists, sample from it.
+        # Otherwise fall back to "interior" but materialize the result
+        # under the public tag "initial".
+        # ------------------------------------------------------------------
+        requested_tag = tag
+        source_tag = requested_tag
+
+        if requested_tag == "initial" and self._is_time_dependent and self.time is not None:
             if time_value is None:
-                time_value = self.time[0]
+                time_value = float(self.time[0])
 
-            #If "initial" is not explicitly present as a spatial tag, fall
-            # back to the interior support for sampling/materialization.
-            if (
-                tag not in self.context
-                and tag not in self._mesh_pool
-                and "interior" in self._mesh_pool
-            ):
-                source_tag = "interior"
-            elif tag not in self.context and "interior" in self.context:
+            if requested_tag not in self._mesh_pool and "interior" in self._mesh_pool:
                 source_tag = "interior"
 
-        sample_tag = source_tag if 'source_tag' in locals() else tag
+        sample_tag = source_tag
 
-        if sample_tag in self._mesh_pool.keys() and isinstance(sample, tuple) and len(sample) > 0 and isinstance(sample[0], (int, type(None))):
-            # Sample points for this tag on demand
-            # Save sample dict for inference
+        if (
+            sample_tag in self._mesh_pool.keys()
+            and isinstance(sample, tuple)
+            and len(sample) > 0
+            and isinstance(sample[0], (int, type(None)))
+        ):
+            # Sample points for this tag on demand.
             self.sample_dict.append([sample_tag, (None, None), resampling_strategy, normals, view_factor])
 
-            # Pass time_value through so "initial" / t=t0 slices can be materialized
-            points, idx, tag = self.sample({sample_tag: sample}, normals, return_indices, time_value=time_value)
+            # Pass time_value through so "initial" / fixed-time slices can be materialized.
+            points, idx, sampled_tag = self.sample(
+                {sample_tag: sample},
+                normals,
+                return_indices,
+                time_value=time_value,
+            )
+
+            # If user asked for "initial" but we sampled from "interior",
+            # expose the sampled/sliced data under "initial".
+            if requested_tag != sampled_tag:
+                if sampled_tag in self.context:
+                    self.context[requested_tag] = self.context[sampled_tag]
+
+                sampled_time_tag = f"__time_{sampled_tag}__"
+                requested_time_tag = f"__time_{requested_tag}__"
+
+                if sampled_time_tag in self.context:
+                    self.context[requested_time_tag] = self.context[sampled_time_tag]
+                elif time_value is not None:
+                    base_time = self.context.get("__time__", np.asarray([[time_value]], dtype=np.float32))
+                    dtype = np.asarray(base_time).dtype
+                    self.context[requested_time_tag] = np.asarray([[time_value]], dtype=dtype)
+
+                if normals and f"n_{sampled_tag}" in self.context:
+                    self.context[f"n_{requested_tag}"] = self.context[f"n_{sampled_tag}"]
+
+                tag = requested_tag
+            else:
+                tag = sampled_tag
+
+            # Safety: if a fixed time was requested, ensure the tag-specific
+            # temporal context exists even when sample(...) did not create it.
+            if time_value is not None:
+                requested_time_tag = f"__time_{tag}__"
+                if requested_time_tag not in self.context:
+                    base_time = self.context.get("__time__", np.asarray([[time_value]], dtype=np.float32))
+                    dtype = np.asarray(base_time).dtype
+                    self.context[requested_time_tag] = np.asarray([[time_value]], dtype=dtype)
 
         # Store resampling strategy if provided
         if resampling_strategy is not None:
@@ -2389,7 +2434,24 @@ class domain(MeshIOMixin):
 
         batch_count = self._effective_batch_count()
         is_time_dep = self._is_time_dependent
+        def _apply_time_value_to_sampled(tag_out, arr):
+            """If time_value is given, reduce (B,T,N,D) to (B,1,N,D)."""
+            if time_value is None or not is_time_dep:
+                return arr
 
+            t_points = np.asarray(getattr(self, "_time_points", [self.time[0]]), dtype=float)
+            tidx = int(np.argmin(np.abs(t_points - float(time_value))))
+
+            arr = np.asarray(arr)
+            arr = arr[:, tidx : tidx + 1, :, :]
+
+            # Create a tag-specific time context, e.g. "__time_initial__".
+            self.context[f"__time_{tag_out}__"] = np.asarray(
+                [[t_points[tidx]]],
+                dtype=np.asarray(self.context.get("__time__", np.asarray([[time_value]]))).dtype,
+            )
+
+            return arr
         for tag, (n_samples, sampler) in sample_spec.items():
             # Handle special "initial" tag for time-dependent problems
             source_tag = tag
@@ -2464,7 +2526,7 @@ class domain(MeshIOMixin):
                 if not is_time_dep:
                     # (B, N, D) → (B, 1, N, D)  — T=1 for steady-state
                     stacked = stacked[:, np.newaxis, :, :]
-                self.context[tag] = stacked
+                self.context[tag] = _apply_time_value_to_sampled(tag, stacked)
 
                 if normals_avaiable and all_normals:
                     nrm_stacked = np.stack(all_normals, axis=0)
@@ -2494,6 +2556,7 @@ class domain(MeshIOMixin):
                     sampled_pts[np.newaxis, ...],
                     (batch_count, *sampled_pts.shape),
                 )
+                self.context[tag] = _apply_time_value_to_sampled(tag, self.context[tag])
 
                 if normals_avaiable and available_normals is not None:
                     sampled_nrm = available_normals[idx]

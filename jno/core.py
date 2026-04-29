@@ -1629,6 +1629,7 @@ class core:
 
             jax.effects_barrier()
             del _tw, _ow, _rw, _ew, _pl
+            #self.log.info("Skipping AOT compile/warmup; first training step will JIT normally.")
 
             # ── 8. Training loop ──
 

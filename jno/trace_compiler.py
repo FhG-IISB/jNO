@@ -387,7 +387,14 @@ class TraceCompiler:
                     else:
                         return val
 
-            return tuple(normalize_arg(v, s) for v, s in zip(arg_values, arg_sources))
+            normalized = tuple(normalize_arg(v, s) for v, s in zip(arg_values, arg_sources))
+
+            # Keep shape inference consistent with TraceEvaluator._eval_flax_module_call.
+            model = None
+            # In this function you only have call_args, not the model object.
+            # So either pass model into _infer_arg_shapes later, or leave this alone
+            # if this function is no longer used for Equinox-foundax initialization.
+            return normalized
 
         abstract_results = jax.eval_shape(eval_and_normalize, abstract_ctx)
         return [r.shape for r in abstract_results]

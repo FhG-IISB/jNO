@@ -542,8 +542,52 @@ class TraceEvaluator:
                     return val.reshape(1)  # scalar → (1,)
                 return val
 
+        def _is_foundax_pointwise_mlp(model):
+            mod_name = type(model).__module__.lower()
+            cls_name = type(model).__name__.lower()
+
+            # Do not touch operator architectures such as DeepONet.
+            if "deeponet" in mod_name or "deeponet" in cls_name:
+                return False
+
+            # Foundax MLP concatenates coordinate arguments internally.
+            return "mlp" in mod_name or "mlp" in cls_name
+
+        def _broadcast_pointwise_args(args):
+            arrs = [jnp.asarray(a) for a in args]
+
+            if len(arrs) <= 1:
+                return arrs
+
+            # Use all args with a feature axis. For coordinate inputs this is
+            # usually (..., 1). We broadcast only the leading axes.
+            leading_shapes = []
+            for a in arrs:
+                if a.ndim >= 2:
+                    leading_shapes.append(a.shape[:-1])
+
+            if not leading_shapes:
+                return arrs
+
+            target_leading = jnp.broadcast_shapes(*leading_shapes)
+
+            out = []
+            for a in arrs:
+                if a.ndim == 0:
+                    a = a.reshape((1,) * len(target_leading) + (1,))
+                elif a.ndim == 1:
+                    a = a.reshape((1,) * len(target_leading) + (a.shape[0],))
+
+                target_shape = target_leading + (a.shape[-1],)
+                out.append(jnp.broadcast_to(a, target_shape))
+
+            return out
+
         shaped_args = [normalize_arg(v, s) for v, s in zip(arg_values, arg_sources)]
 
+        if _is_foundax_pointwise_mlp(model):
+            shaped_args = _broadcast_pointwise_args(shaped_args)
+        
         # Call equinox model directly (it IS the pytree, no init/apply split)
         import inspect
 
