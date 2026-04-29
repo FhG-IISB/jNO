@@ -61,9 +61,8 @@ from .feax_utils import (
 
 
 def _infer_time_window(domain, **kwargs) -> Tuple[float, float, float | None]:
-   """
+    """
     Infer the time interval and default time-step from the domain or kwargs.
-
     Priority:
     - `kwargs["t0"]`, `kwargs["t1"]`, `kwargs["dt"]` / `kwargs["dt0"]`
     - `domain.time = (t0, t1, n_steps)`

@@ -640,7 +640,7 @@ def collect_derivative_based_state_targets(domain, node, out):
 
     This path is preferred because terms like grad(u) identify the unknown more
     reliably than searching arbitrary model-call expressions.
-    """s
+    """
     if node is None:
         return
 
@@ -1026,7 +1026,7 @@ def bind_statefield_for_fem(node, trial_symbol=None):
     Replace StateField nodes by their neural expression for VPINN evaluation.
 
     The wrapped expression is rebound to the requested volume/boundary region.
-    """s
+    """
     if node is None:
         return None
 

@@ -26,7 +26,7 @@ T_end = 1.0
 N_t = 4
 
 domain = jno.domain(
-    constructor=jno.domain.rect(mesh_size=0.2),
+    constructor=jno.domain.rect(mesh_size=0.06),
     time=(0, T_end, N_t),
     compute_mesh_connectivity=False,
 )
@@ -56,7 +56,7 @@ pde = jno.np.grad(u, t) + bx * jno.np.grad(u, x) + by * jno.np.grad(u, y) - nu *
 ini = u0 - jno.np.sin(pi * x0) * jno.np.sin(pi * y0)
 
 crux = jno.core([pde.mse, ini.mse], domain)
-history = crux.solve(5000)
+history = crux.solve(8000)
 
 _u, _u_exact = crux.eval([u, u_exact])
 rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_exact) + 1e-8))

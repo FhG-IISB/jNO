@@ -102,7 +102,7 @@ from .weak_form_helpers import (
 
 @dataclass(frozen=True)
 class LoweredChannelTerm:
-   """
+    """
     One lowered weak-form term in backend-neutral IR.
 
     A symbolic weak-form expression is first split into additive terms. Each
@@ -846,7 +846,14 @@ def assemble_weak_form(domain, expr, target=None, **kwargs):
     expr = _ensure_statefield_wrapped(domain, expr)
 
     if target == "vpinn":
-        ir = lower_weak_form(domain, expr, for_target="vpinn")
+        trial_value = kwargs.pop("trial_value", None)
+
+        # Backward-compatible alias used in examples:
+        #     weak.assemble(domain, u_net=u_gauss, target="vpinn")
+        if trial_value is None:
+            trial_value = kwargs.pop("u_net", None)
+
+        ir = lower_weak_form(domain,expr, trial_value=trial_value, for_target="vpinn",)
         return _assemble_vpinn_from_ir(ir, **kwargs)
 
     if target in {"fem_system", "fem_residual"}:

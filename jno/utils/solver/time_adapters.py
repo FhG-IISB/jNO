@@ -35,7 +35,7 @@ def _require_first_order(block: FeaxTimeBlock):
 
     The current Diffrax and FEAX pipeline adapters operate on first-order
     semidiscrete systems only.
-    """s
+    """
     if block.time_order != 1:
         raise NotImplementedError(
             "Only first-order-in-time semidiscrete blocks are currently supported."
