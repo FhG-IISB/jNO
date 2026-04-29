@@ -476,7 +476,7 @@ class core:
         return isinstance(node, Placeholder) and bool(getattr(node, "_is_weak_expr", False))
 
     def _materialize_marked_weak(self, node, parent_is_weak: bool = False):
-        from .utils.weak_form import assemble_weak_form
+        from .utils.solver.weak_form import assemble_weak_form
 
         if node is None:
             return None

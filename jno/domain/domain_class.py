@@ -698,7 +698,7 @@ class domain(MeshIOMixin):
             Boundary-condition descriptor for use with ``init_fem(..., bcs=...)``.
         """
         try:
-            from ..utils.fem_route import dirichlet as _dirichlet_bc
+            from ..utils.solver.fem_route import dirichlet as _dirichlet_bc
         except ImportError as e:
             raise ImportError("FEM support is not available. Install the FEM/dev extras to use " "domain.dirichlet(...) and init_fem(...).") from e
         return _dirichlet_bc(tags, values)
@@ -718,7 +718,7 @@ class domain(MeshIOMixin):
             Boundary-condition descriptor for use with ``init_fem(..., bcs=...)``.
         """
         try:
-            from ..utils.fem_route import neumann as _neumann_bc
+            from ..utils.solver.fem_route import neumann as _neumann_bc
         except ImportError as e:
             raise ImportError("FEM support is not available. Install the FEM/dev extras to use " "domain.neumann(...) and init_fem(...).") from e
         return _neumann_bc(tags)
@@ -933,7 +933,7 @@ class domain(MeshIOMixin):
         import feax as fe
         from feax.DCboundary import DirichletBCConfig, DirichletBCSpec
         from scipy.spatial import KDTree
-        from ..utils.fem_route import expand_bcs
+        from ..utils.solver.fem_route import expand_bcs
 
         if bcs is not None:
             if dirichlet_tags or neumann_tags or dirichlet_value_fns is not None:
@@ -1354,7 +1354,7 @@ class domain(MeshIOMixin):
         object
             Assembled backend-specific representation of the weak form.
         """
-        from ..utils.weak_form import assemble_weak_form
+        from ..utils.solver.weak_form import assemble_weak_form
 
         return assemble_weak_form(self, expr, target=target, **kwargs)
 

@@ -1,5 +1,21 @@
 from __future__ import annotations
+"""
+Internal time-dependent solver routing.
 
+This module lowers time-dependent jNO expressions into solver-facing blocks.
+
+Main responsibilities:
+- classify temporal order and time metadata,
+- lower strong-form time-dependent expressions to DiffraxBlock,
+- lower transient weak forms to FeaxTimeBlock,
+- split weak-form IR into mass, operator, residual, and source parts,
+- build JAX/FEAX semidiscrete runtime callables for transient FEM problems.
+
+This module is internal. User-facing code should normally call:
+
+    expr.assemble(target="diffrax")
+    weak_expr.assemble(target="feax_time")
+"""
 from typing import Any, Dict, Tuple
 from contextlib import contextmanager
 import numpy as np
@@ -45,6 +61,17 @@ from .feax_utils import (
 
 
 def _infer_time_window(domain, **kwargs) -> Tuple[float, float, float | None]:
+   """
+    Infer the time interval and default time-step from the domain or kwargs.
+
+    Priority:
+    - `kwargs["t0"]`, `kwargs["t1"]`, `kwargs["dt"]` / `kwargs["dt0"]`
+    - `domain.time = (t0, t1, n_steps)`
+    - fallback `(0.0, 1.0, None)`
+
+    Returns:
+        `(t0, t1, dt_default)`.
+    """
     if getattr(domain, "time", None) is not None:
         t0, t1, n_steps = domain.time
         if n_steps is None or int(n_steps) <= 1:
@@ -64,6 +91,13 @@ def _infer_time_window(domain, **kwargs) -> Tuple[float, float, float | None]:
 
 
 def _resolve_initial_data(kwargs: Dict[str, Any]) -> Tuple[Any, Any]:
+    """
+    Extract initial-condition metadata and solver initial state from kwargs.
+
+    Recognized aliases:
+    - initial conditions: `initial_conditions`, `ics`
+    - state: `state0`, `y0`, `initial_state`
+    """
     initial_conditions = kwargs.get("initial_conditions", kwargs.get("ics", None))
     state0 = kwargs.get("state0", kwargs.get("y0", kwargs.get("initial_state", None)))
     return initial_conditions, state0
@@ -74,6 +108,12 @@ def _detect_time_order(expr: Any) -> int:
 
 
 def _classify_time_problem(expr: Any, domain, target: str) -> Dict[str, Any]:
+    """
+    Build lightweight metadata describing a time-dependent expression.
+
+    The result records temporal order, temporal tags, weak-form symbols, and
+    domain time information. It is stored in backend block metadata.
+    """
     return {
         "target": target,
         "time_order": _detect_time_order(expr),
@@ -92,55 +132,6 @@ def _extract_initial_conditions(kwargs: Dict[str, Any]) -> Tuple[Any, Any]:
 # -----------------------------------------------------------------------------
 # Strong-form Diffrax helpers
 # -----------------------------------------------------------------------------
-# def _replace_exact_subtree(node: Any, target: Any, replacement: Any) -> Any:
-#     if node is target:
-#         return replacement
-
-#     if isinstance(node, BinaryOp):
-#         left = _replace_exact_subtree(node.left, target, replacement)
-#         right = _replace_exact_subtree(node.right, target, replacement)
-#         if left is not node.left or right is not node.right:
-#             return BinaryOp(node.op, left, right)
-#         return node
-
-#     if isinstance(node, FunctionCall):
-#         new_args = [
-#             _replace_exact_subtree(a, target, replacement) if isinstance(a, Placeholder) else a
-#             for a in node.args
-#         ]
-#         if any(a is not b for a, b in zip(new_args, node.args)):
-#             if hasattr(node, "copy_with_args"):
-#                 return node.copy_with_args(new_args)
-#             return FunctionCall(
-#                 node.fn,
-#                 new_args,
-#                 name=getattr(node, "_name", None),
-#                 reduces_axis=getattr(node, "reduces_axis", None),
-#                 kwargs=getattr(node, "kwargs", None),
-#             )
-#         return node
-
-#     if isinstance(node, Jacobian):
-#         new_target = _replace_exact_subtree(node.target, target, replacement)
-#         new_vars = [
-#             _replace_exact_subtree(v, target, replacement) if isinstance(v, Placeholder) else v
-#             for v in node.variables
-#         ]
-#         if new_target is not node.target or any(a is not b for a, b in zip(new_vars, node.variables)):
-#             return Jacobian(new_target, new_vars, node.scheme)
-#         return node
-
-#     if isinstance(node, Hessian):
-#         new_target = _replace_exact_subtree(node.target, target, replacement)
-#         new_vars = [
-#             _replace_exact_subtree(v, target, replacement) if isinstance(v, Placeholder) else v
-#             for v in node.variables
-#         ]
-#         if new_target is not node.target or any(a is not b for a, b in zip(new_vars, node.variables)):
-#             return Hessian(new_target, new_vars, node.scheme, trace=node.trace)
-#         return node
-
-#     return node
 
 
 
@@ -150,6 +141,11 @@ def _append_identity_unique(out, node):
 
 
 def _collect_temporal_state_candidates(node: Any, out=None):
+    """
+    Collect expression subtrees that appear as targets of temporal derivatives.
+
+    Used to infer the primary state expression for strong-form Diffrax lowering.
+    """
     if out is None:
         out = []
 
@@ -186,6 +182,12 @@ def _collect_temporal_state_candidates(node: Any, out=None):
 
 
 def _infer_single_state_expr(expr: Any):
+    """
+    Infer a unique state expression from temporal derivative targets.
+
+    Model-call candidates are preferred. Raises if multiple possible state
+    expressions are found and the user must pass `state_expr=...` explicitly.
+    """
     candidates = _collect_temporal_state_candidates(expr, out=[])
 
     # Prefer candidates that actually contain a model call
@@ -213,6 +215,12 @@ def _infer_single_state_expr(expr: Any):
     )
 
 def _resolve_strong_state_expr(expr: Any, **kwargs):
+    """
+    Resolve the state expression for strong-form lowering.
+
+    Uses explicit `state_expr=...` when provided. If `infer_state_expr=True`,
+    attempts automatic inference from temporal derivative targets.
+    """
     state_expr = kwargs.get("state_expr", None)
     if state_expr is not None:
         return state_expr
@@ -238,6 +246,16 @@ def _rewrite_second_order_to_first_order(expr: Any, **kwargs) -> Dict[str, Any]:
     }
 
 def _build_manual_second_order_reduction(expr: Any, **kwargs) -> Dict[str, Any]:
+    """
+    Validate and describe a user-provided manual second-order reduction.
+
+    Requires:
+        second_order="manual"
+        rhs=...
+        state0=[u0, v0]
+
+    Returns metadata for a reduced first-order system.
+    """
     rhs = kwargs.get("rhs", None)
     state0 = kwargs.get("state0", kwargs.get("y0", kwargs.get("initial_state", None)))
     state_names = tuple(kwargs.get("state_names", ("u", "v")))
@@ -290,6 +308,11 @@ def _build_manual_second_order_reduction(expr: Any, **kwargs) -> Dict[str, Any]:
 # -----------------------------------------------------------------------------
 
 def _split_additive_terms(node):
+    """
+    Split an expression into additive terms while preserving signs.
+
+    Subtractions are rewritten by multiplying the right-hand terms by `-1`.
+    """
     if isinstance(node, BinaryOp):
         if node.op == "+":
             return _split_additive_terms(node.left) + _split_additive_terms(node.right)
@@ -299,6 +322,11 @@ def _split_additive_terms(node):
 
 
 def _sum_terms(terms):
+    """
+    Recombine a list of symbolic terms using BinaryOp("+", ...).
+
+    Returns None for an empty list.
+    """
     if not terms:
         return None
     out = terms[0]
@@ -375,12 +403,20 @@ def _temporary_time_value(domain, t_value: float):
 
 def _build_first_order_semidiscrete_operators(domain, ir, mass_expr, residual_expr, boundary_exprs):
     """
-    Build pure-JAX callable operators for the semidiscrete problem
+    Build JAX-callable operators for a nonlinear first-order semidiscrete system.
 
-        M(t) u_dot + R(u,t) = 0
+    The generated callables represent:
 
-    This version caches FEAX problem/operator construction ONCE and
-    reuses the resulting res_bc/jac_bc callables many times.
+        M(t) u_dot + R(u, t) = 0
+
+    Returns:
+        mass_fn(t, args)
+        residual_fn(u, t, args)
+        jacobian_fn(u, t, args)
+        runtime_info
+
+    The FEAX residual/Jacobian runtimes are built once and reused by the
+    returned callables.
     """
     import feax as fe
     from .weak_form import LoweredWeakForm, LoweredChannelTerm
@@ -521,6 +557,26 @@ def _build_first_order_semidiscrete_operators(domain, ir, mass_expr, residual_ex
 # -----------------------------------------------------------------------------
 
 def _assemble_diffrax_from_strong_form(domain, expr, **kwargs) -> DiffraxBlock:
+    """
+    Lower a strong-form time-dependent expression into a DiffraxBlock.
+
+    This route is used by:
+
+        expr.assemble(target="diffrax")
+
+    Supported cases:
+    - first-order strong forms with explicit `state_expr`, `time_var`, and `state0`
+    - first-order contract mode when no symbolic lowering inputs are provided
+    - second-order problems through manual first-order reduction
+
+    Returns:
+        DiffraxBlock containing RHS, Diffrax term, initial state, time interval,
+        optional mass function, and lowering metadata.
+
+    Raises:
+        ValueError if the expression contains TestFunction/TrialFunction symbols,
+        because transient weak forms must use `target="feax_time"`.
+    """
     if _contains_node_type(expr, TrialFunction) or _contains_node_type(expr, TestFunction):
         raise ValueError(
             "target='diffrax' expects a strong-form expression without "
@@ -766,6 +822,12 @@ def _split_additive_terms_strong(node):
     return [node]
 
 def _replace_exact_subtree(node: Any, target: Any, replacement: Any) -> Any:
+    """
+    Replace a specific expression subtree by object identity.
+
+    Used when replacing the symbolic state expression with a runtime state tag
+    during strong-form Diffrax lowering.
+    """
     if node is target:
         return replacement
 
@@ -836,6 +898,15 @@ def _is_state_time_derivative(node: Any, state_expr: Any, time_var: Variable) ->
 
 
 def _extract_temporal_coeff(term: Any, state_expr: Any, time_var: Variable):
+    """
+    Extract the coefficient multiplying the first-order state time derivative.
+
+    Supports forms such as:
+        u_t
+        a * u_t
+        u_t * a
+        u_t / a
+    """
     # u_t
     if _is_state_time_derivative(term, state_expr, time_var):
         return Literal(1.0)
@@ -855,6 +926,17 @@ def _extract_temporal_coeff(term: Any, state_expr: Any, time_var: Variable):
     return None
 
 def _split_first_order_strong_form(expr: Any, state_expr: Any, time_var: Variable):
+    """
+    Split a first-order strong form into mass coefficient and residual parts.
+
+    For an expression like:
+
+        a(x,t,u) * u_t + F(u,t) = 0
+
+    returns:
+        mass_expr = a(x,t,u)
+        residual_expr = F(u,t)
+    """
     terms = _split_additive_terms_strong(expr)
 
     mass_terms = []
@@ -896,6 +978,17 @@ def _build_first_order_strong_diffrax_runtime(
     state0,
     params=None,
 ):
+    """
+    Build the runtime RHS for first-order strong-form Diffrax lowering.
+
+    Replaces the symbolic state expression by a TensorTag holding the solver
+    state, evaluates mass and residual expressions through TraceEvaluator, and
+    returns:
+
+        rhs(t, y, args)
+        mass_fn(t, args)
+        lowered_rhs_expression
+    """
     params = {} if params is None else params
     evaluator = TraceEvaluator(params)
 
@@ -1171,6 +1264,36 @@ def _build_auto_forcing_vector_fn(domain, src_ir, *, size, dtype):
     return forcing_vector_fn
 
 def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
+    """
+    Lower a transient weak-form IR into a FeaxTimeBlock.
+
+    This route is used by:
+
+        weak_expr.assemble(target="feax_time")
+
+    It supports first-order-in-time weak forms and produces a solver-agnostic
+    semidiscrete block.
+
+    Linear path:
+        Splits the IR into mass, operator, and source parts and returns a block
+        representing:
+
+            M u_dot + A u = affine_bias + forcing_vector_fn(t)
+
+    Nonlinear path:
+        Builds FEAX/JAX runtime callables and returns a block representing:
+
+            M(t) u_dot + R(u, t) = 0
+
+    Returns:
+        FeaxTimeBlock with either linear payload `(M, A, affine_bias,
+        forcing_vector_fn)` or nonlinear payload `(mass, residual, jacobian)`.
+
+    Raises:
+        ValueError if `domain.init_fem(...)` was not called or if no temporal
+        derivative is found.
+        NotImplementedError for weak forms that are not first-order in time.
+    """
     if not hasattr(domain, "_feax_context"):
         raise ValueError(
             "target='feax_time' requires domain.init_fem(...) to be called before "

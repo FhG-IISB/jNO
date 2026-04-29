@@ -1,5 +1,16 @@
 from __future__ import annotations
+"""
+Internal FEAX backend utilities.
 
+This module contains low-level helpers shared by the steady FEM route and the
+transient FEAX-time route. It is intentionally not a public API.
+
+Responsibilities:
+- convert jNO weak-form symbols into FEAX-compatible kernels,
+- build FEAX meshes/problems/Dirichlet BC configs,
+- evaluate symbolic expressions inside FEAX volume/surface kernels,
+- prepare residual/Jacobian runtime objects for time-dependent assembly.
+"""
 from typing import Any, Dict, List
 
 import numpy as np
@@ -160,6 +171,12 @@ def _const_bc_fn(value):
 
 
 def _normalize_dirichlet_value(value, vec: int):
+    """
+    Normalize user Dirichlet data into FEAX-compatible value functions.
+
+    Accepts None, scalar, callable, component list/tuple, or component dict.
+    Returns one callable for scalar fields or a list of callables for vector fields.
+    """
     if value is None:
         value = 0.0
 
@@ -274,6 +291,12 @@ def _expand_test_shape_vals(shape_vals, n_comp):
     return shape_vals[:, :, None, None] * eye[None, None, :, :]
 
 def _infer_trial_metadata(expr) -> Dict[str, Any]:
+    """
+    Infer the FEM unknown metadata from TrialFunction nodes.
+
+    Returns the unique trial symbol, its value shape, vector size, and whether
+    the expression contains a TrialFunction.
+    """
     trial_nodes = {}
 
     def walk(node):
@@ -309,6 +332,12 @@ def _infer_trial_metadata(expr) -> Dict[str, Any]:
     }
 
 def _collect_temporal_tags_for_feax(node, out=None):
+    """
+    Collect temporal Variable tags used inside FEAX kernels.
+
+    These tags determine which time values must be passed through FEAX
+    InternalVars during transient assembly.
+    """
     if out is None:
         out = set()
 
@@ -351,6 +380,12 @@ def _collect_temporal_tags_for_feax(node, out=None):
 
 
 def _temporal_value_from_internal_vars(local, tag, dim_start=0, dim_end=1):
+    """
+    Read a temporal variable value from FEAX InternalVars.
+
+    Returns None when the requested temporal tag is not part of the current
+    FEAX kernel call.
+    """
     temporal_tags = local.get("temporal_tags", ())
     volume_vars = local.get("volume_vars", ())
 
@@ -374,6 +409,15 @@ def _temporal_value_from_internal_vars(local, tag, dim_start=0, dim_end=1):
 # --------------------------------
 
 def _eval_expr_for_feax(domain, node, local):
+    """
+    Evaluate a jNO symbolic expression inside a FEAX local kernel.
+
+    The `local` dictionary contains quadrature coordinates, shape values,
+    shape gradients, local cell DOFs, domain context, and optional temporal
+    InternalVars. This evaluator supports literals, constants, variables,
+    tensor tags, TrialFunction/TestFunction values, their Jacobians, binary
+    operations, and FunctionCall nodes.
+    """
     if not isinstance(node, (Literal, Constant, TensorTag, Variable, TestFunction, TrialFunction, Jacobian, BinaryOp, FunctionCall)):
         try:
             return jnp.asarray(node)
@@ -516,6 +560,11 @@ def _eval_expr_for_feax(domain, node, local):
 # --------------------------------
 
 def _eval_volume_integrand(domain, expr,value_shape, cell_sol_flat, physical_quad_points, cell_shape_grads,cell_JxW, cell_v_grads_JxW,temporal_tags, problem_ref,*cell_internal_vars,):
+    """
+    Evaluate and integrate one volume weak-form expression on one FEAX cell.
+
+    Returns the flattened cell residual contribution expected by FEAX.
+    """
     num_nodes = cell_shape_grads.shape[1]
     vec = _value_shape_num_components(value_shape)
     cell_sol = cell_sol_flat.reshape(num_nodes, vec)
@@ -559,6 +608,11 @@ def _eval_surface_integrand(
     temporal_tags,
     *cell_internal_vars_surface,
 ):
+    """
+    Evaluate and integrate one boundary weak-form expression on one FEAX face.
+
+    Returns the flattened surface residual contribution expected by FEAX.
+    """
     vec = _value_shape_num_components(value_shape)
 
     cell_sol_flat = jnp.asarray(cell_sol_flat)
@@ -659,6 +713,9 @@ def _eval_surface_integrand(
     return ravel_pytree(jnp.sum(weighted, axis=0))[0]
 
 def _make_universal_volume_kernel(domain, expr, value_shape, temporal_tags, problem_ref):
+    """
+    Create the FEAX universal volume kernel for a lowered weak-form expression.
+    """
     def kernel(cell_sol_flat, physical_quad_points, cell_shape_grads, cell_JxW, cell_v_grads_JxW, *cell_internal_vars):
         return _eval_volume_integrand(
             domain,
@@ -758,6 +815,13 @@ def _make_feax_dirichlet_specs(domain, vec: int):
 
 
 def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_domain: bool = True):
+    """
+    Build a FEAX Problem and Dirichlet BC object from lowered weak-form IR.
+
+    The returned FEAX problem owns the generated volume and surface kernels.
+    When `store_on_domain=True`, the FEAX problem and BC are cached on the
+    domain for later reuse.
+    """
     import feax as fe
     trial_cache = {}
 
@@ -878,6 +942,13 @@ def _prepare_feax_runtime(
     need_jacobian=True,
     symmetric_bc=True,
 ):
+    """
+    Prepare reusable FEAX residual/Jacobian runtime objects for an IR.
+
+    Returns a dictionary containing the FEAX problem, BC, residual callable,
+    optional Jacobian callable, reference state, dtype, temporal tags, and
+    number of mesh cells.
+    """
     import feax as fe
 
     problem, bc = _build_feax_problem(

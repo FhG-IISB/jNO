@@ -1,5 +1,18 @@
 from __future__ import annotations
+"""
+Internal weak-form helper utilities.
 
+This module contains symbolic transformation helpers used by
+`solver.weak_form`. It is not a public API.
+
+Responsibilities:
+- split weak-form expressions into additive signed terms,
+- detect TestFunction / TrialFunction / test-gradient channels,
+- infer volume/boundary variational regions,
+- detect and wrap neural unknowns as StateField nodes,
+- rebind FEM/VPINN variables between volume and boundary quadrature regions,
+- substitute TrialFunction symbols with neural trial expressions for VPINN.
+"""
 from typing import Optional
 
 from ...jnp_ops import stack
@@ -85,6 +98,11 @@ def function_name(node) -> Optional[str]:
 
 
 def get_grad_axis_from_test_grad(node) -> int:
+    """
+    Infer the spatial derivative axis from Jacobian(TestFunction, variable).
+
+    Used when lowering test-gradient terms into canonical VPINN/FEAX channels.
+    """
     if not (isinstance(node, Jacobian) and isinstance(node.target, TestFunction)):
         raise TypeError(f"Expected Jacobian(TestFunction), got {type(node).__name__}")
 
@@ -215,6 +233,12 @@ def collect_region_keys(domain, node):
 
 
 def collect_variational_metas(domain, node, out):
+    """
+    Collect FEM/variational metadata from Variable nodes inside an expression.
+
+    StateField nodes are intentionally not expanded, because their wrapped
+    expression may have been created on a different quadrature region.
+    """
     if node is None:
         return
 
@@ -234,6 +258,15 @@ def collect_variational_metas(domain, node, out):
 
 
 def infer_term_bucket(domain, term):
+    """
+    Infer whether a weak-form term belongs to the volume or a boundary region.
+
+    Returns:
+        `(support, region_id)`
+
+    Raises:
+        ValueError if one term mixes incompatible variational regions.
+    """
     metas = []
     collect_variational_metas(domain, term, metas)
 
@@ -262,6 +295,12 @@ def infer_term_bucket(domain, term):
 
 
 def get_variational_region_meta(domain, support: str, region_id: str):
+    """
+    Return stored variational sampling metadata for a support/region pair.
+
+    Used when rebinding expressions between volume and boundary quadrature
+    contexts.
+    """
     registry = getattr(domain, "_variational_sampling_registry", {})
 
     for _sample_tag, meta in registry.items():
@@ -330,6 +369,12 @@ def infer_state_value_shape(domain, expr) -> tuple:
 
 
 def wrap_primary_state(node, target, *, state_name="u", value_shape=()):
+    """
+    Replace the selected symbolic unknown subtree by a StateField wrapper.
+
+    The wrapper marks the primary unknown for FEM/FEAX lowering while preserving
+    the original neural expression inside the StateField.
+    """
     if node is target:
         return StateField(node, state_id=0, name=state_name, value_shape=value_shape)
 
@@ -518,6 +563,12 @@ def wrap_primary_state(node, target, *, state_name="u", value_shape=()):
 
 
 def ensure_statefield_wrapped(domain, expr):
+    """
+    Ensure that a weak form has an explicit StateField or TrialFunction.
+
+    If the expression contains a neural unknown but no StateField/TrialFunction,
+    this function detects the primary unknown and wraps it as StateField.
+    """
     if contains_node_type(expr, StateField) or contains_node_type(expr, TrialFunction):
         return expr
 
@@ -530,6 +581,12 @@ def ensure_statefield_wrapped(domain, expr):
 
 
 def is_statefield_candidate(domain, node):
+    """
+    Return True if a node is a valid candidate for automatic StateField wrapping.
+
+    Candidates must be neural/model-based expressions that depend on domain
+    variables and must not already contain weak basis symbols.
+    """
     if node is None:
         return False
 
@@ -578,6 +635,12 @@ def collect_state_field_candidates(domain, node, out):
 
 
 def collect_derivative_based_state_targets(domain, node, out):
+    """
+    Collect unknown candidates that appear as targets of derivatives.
+
+    This path is preferred because terms like grad(u) identify the unknown more
+    reliably than searching arbitrary model-call expressions.
+    """s
     if node is None:
         return
 
@@ -599,6 +662,12 @@ def collect_derivative_based_state_targets(domain, node, out):
 
 
 def detect_primary_state_field(domain, expr):
+    """
+    Detect the unique primary unknown expression in a weak form.
+
+    First searches derivative targets such as grad(u), then falls back to
+    model-call candidates. Raises if multiple unknowns are detected.
+    """
     # Robust path:
     # If the unknown already appears as target of grad/hessian, use that first.
     deriv_targets = []
@@ -638,6 +707,13 @@ def detect_primary_state_field(domain, expr):
 # ---------------------------------------------------------------------------
 
 def rebind_variational_variables(domain, node, target_support: str, target_region_id: str):
+    """
+    Rebind FEM quadrature Variables to a target variational region.
+
+    Used when an expression created on one quadrature region must be evaluated
+    on another region, for example rebinding a neural trial expression from
+    volume quadrature to boundary quadrature.
+    """
     if node is None:
         return None
 
@@ -946,6 +1022,11 @@ def bind_statefield_for_vpinn(domain, node, target_support: str, target_region_i
 
 
 def bind_statefield_for_fem(node, trial_symbol=None):
+    """
+    Replace StateField nodes by their neural expression for VPINN evaluation.
+
+    The wrapped expression is rebound to the requested volume/boundary region.
+    """s
     if node is None:
         return None
 
@@ -1017,6 +1098,12 @@ def substitute_trial_for_vpinn(
     target_support: Optional[str] = None,
     target_region_id: Optional[str] = None,
 ):
+    """
+    Substitute TrialFunction symbols with a neural trial expression for VPINN.
+
+    If a target support/region is provided, the trial expression is rebound to
+    that quadrature region before substitution.
+    """
     if node is None:
         return None
 

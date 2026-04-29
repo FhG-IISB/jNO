@@ -24,16 +24,56 @@ from .feax_utils import (
 
 @dataclass(frozen=True)
 class DirichletBC:
+    """
+    Essential boundary-condition descriptor for FEM/FEAX assembly.
+
+    Instances are created through `dirichlet(...)` and later normalized by
+    `expand_bcs(...)` during `domain.init_fem(...)`.
+
+    Parameters
+    ----------
+    tags:
+        Boundary tag names on which the Dirichlet condition is applied.
+    values:
+        Boundary value specification. Supported forms are handled by
+        `_normalize_dirichlet_value(...)` and include `None`, scalars,
+        callables, component lists/tuples, and component dictionaries.
+    """
     tags: tuple[str, ...]
     values: object = None
 
 
 @dataclass(frozen=True)
 class NeumannBC:
+    """
+    Natural boundary-condition descriptor for FEM/FEAX assembly.
+
+    Instances are created through `neumann(...)`. The tags mark boundary
+    regions whose weak-form boundary terms should be included in FEAX surface
+    assembly.
+
+    Parameters
+    ----------
+    tags:
+        Boundary tag names treated as natural/surface regions.
+    """
     tags: tuple[str, ...]
 
 
 def _as_tags(tags) -> tuple[str, ...]:
+    """
+    Normalize one boundary tag or a sequence of tags into a non-empty tuple.
+
+    Parameters
+    ----------
+    tags:
+        Either a string tag or a sequence of tag-like objects.
+
+    Returns
+    -------
+    tuple[str, ...]
+        Normalized tuple of boundary tag strings.
+    """
     if isinstance(tags, str):
         return (tags,)
     if isinstance(tags, Sequence):
@@ -43,17 +83,82 @@ def _as_tags(tags) -> tuple[str, ...]:
         return out
     raise TypeError(f"Boundary tags must be a string or a sequence of strings, got {type(tags).__name__}.")
 
-
 def dirichlet(tags, values=None):
+    """
+    Create a Dirichlet boundary-condition descriptor.
+
+    This is the public helper used in FEM setup, for example:
+
+        domain.init_fem(
+            bcs=[
+                domain.dirichlet("left", 0.0),
+                domain.dirichlet(["bottom", "top"], {"x": 0.0, "y": 1.0}),
+            ]
+        )
+
+    Parameters
+    ----------
+    tags:
+        Boundary tag or list of boundary tags.
+    values:
+        Boundary value specification. For scalar unknowns, this can be a scalar
+        or callable. For vector unknowns, this can also be a component list,
+        tuple, or dictionary.
+
+    Returns
+    -------
+    DirichletBC
+        Boundary-condition descriptor consumed by `expand_bcs(...)`.
+    """
     return DirichletBC(tags=_as_tags(tags), values=values)
 
 
 def neumann(tags):
+    """
+    Create a Neumann/natural boundary-condition descriptor.
+
+    This marks boundary regions whose weak-form boundary terms should be
+    assembled through FEAX surface kernels.
+
+    Parameters
+    ----------
+    tags:
+        Boundary tag or list of boundary tags.
+
+    Returns
+    -------
+    NeumannBC
+        Boundary-condition descriptor consumed by `expand_bcs(...)`.
+    """
     return NeumannBC(tags=_as_tags(tags))
 
-
-
 def expand_bcs(bcs, vec: int):
+    """
+    Normalize user boundary-condition descriptors for FEM initialization.
+
+    Parameters
+    ----------
+    bcs:
+        Iterable containing `DirichletBC` and `NeumannBC` descriptors.
+    vec:
+        Number of scalar components of the FEM unknown. For scalar problems this
+        is `1`; for vector-valued problems this is the flattened component count.
+
+    Returns
+    -------
+    tuple
+        `(dirichlet_tags, dirichlet_value_fns, neumann_tags)`, where:
+
+        - `dirichlet_tags` is an ordered list of essential-BC boundary tags.
+        - `dirichlet_value_fns` maps each Dirichlet tag to FEAX-compatible value
+          callable(s).
+        - `neumann_tags` is an ordered list of natural/surface boundary tags.
+
+    Raises
+    ------
+    TypeError
+        If an unsupported BC descriptor is provided.
+    """
     dirichlet_tags = []
     dirichlet_value_fns = {}
     neumann_tags = []
@@ -79,6 +184,40 @@ def expand_bcs(bcs, vec: int):
 # --------------------------------
 
 def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
+    """
+    Assemble a steady nonlinear FEM residual operator from lowered weak-form IR.
+
+    This target is used by:
+
+        weak_expr.assemble(target="fem_residual")
+
+    It builds a FEAX problem from the lowered weak-form IR and returns callable
+    residual and Jacobian functions for external Newton-like solvers.
+
+    Parameters
+    ----------
+    domain:
+        jNO domain with initialized FEM/FEAX context.
+    ir:
+        Lowered weak-form IR produced by `lower_weak_form(..., for_target="fem")`.
+    **kwargs:
+        Optional backend settings. Currently supports `symmetric_bc`.
+
+    Returns
+    -------
+    FemResidualOperator
+        Object containing:
+
+        - `residual_fn(u_flat)`: evaluates the FEAX residual vector `r(u)`.
+        - `jacobian_fn(u_flat)`: evaluates the FEAX Jacobian matrix `J(u)`.
+        - `size`: total number of scalar FEM degrees of freedom.
+
+    Notes
+    -----
+    This route is intended for nonlinear steady weak forms. Linear steady weak
+    forms should usually use `_assemble_fem_system_from_ir(...)`, which returns
+    the direct system `(A, b)`.
+    """
     import feax as fe
 
     problem, bc = _build_feax_problem(domain, ir)
@@ -104,6 +243,42 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
 
 
 def _assemble_fem_system_from_ir(domain, ir, **kwargs):
+    """
+    Assemble a steady linear FEM system from lowered weak-form IR.
+
+    This target is used by:
+
+        weak_expr.assemble(target="fem_system")
+
+    and is also the default auto-selected target for linear steady weak forms.
+
+    Parameters
+    ----------
+    domain:
+        jNO domain with initialized FEM/FEAX context.
+    ir:
+        Lowered weak-form IR produced by `lower_weak_form(..., for_target="fem")`.
+    **kwargs:
+        Optional backend settings. Currently supports `symmetric_bc`.
+
+    Returns
+    -------
+    tuple
+        `(A, b)` such that the physical FEM unknown satisfies:
+
+            A @ u = b
+
+    Notes
+    -----
+    FEAX naturally assembles a Newton/correction system:
+
+        A @ du = -r(u0)
+
+    This route converts that correction system into the full-state linear
+    system expected by jNO examples and external linear solvers:
+
+        A @ u = A @ u0 - r(u0)
+    """
     import feax as fe
 
     problem, bc = _build_feax_problem(domain, ir)

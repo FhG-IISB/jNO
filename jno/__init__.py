@@ -10,7 +10,7 @@ import sys
 
 from .core import core
 from .domain import domain
-from .utils.fem_route import dirichlet, neumann
+from .utils.solver.fem_route import dirichlet, neumann
 from .resampling import sampler
 from .trace import Variable, Placeholder, OperationDef, OperationCall, Model, Hessian, Jacobian, TestFunction, TrialFunction, Assembly, FemLinearSystem, GroupedAssembly, FemResidualOperator, StateField
 from .utils.adaptive import LearningRateSchedule, WeightSchedule

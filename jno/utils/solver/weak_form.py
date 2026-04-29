@@ -1,4 +1,30 @@
 from __future__ import annotations
+"""
+Weak-form lowering and assembly dispatcher.
+
+This module is the central routing layer behind:
+
+    expr.assemble(target=...)
+
+It converts symbolic jNO weak forms into backend-neutral IR and dispatches that
+IR to VPINN, steady FEM, transient FEAX-time, or strong-form Diffrax routes.
+
+Main responsibilities:
+- represent lowered weak-form terms through LoweredChannelTerm / LoweredWeakForm,
+- infer the solver target when target=None,
+- lower weak expressions into VPINN or FEM-compatible IR,
+- assemble VPINN GroupedAssembly objects for training,
+- dispatch linear/nonlinear steady FEM assembly,
+- dispatch transient weak-form FEAX-time assembly,
+- dispatch strong-form time-dependent expressions to Diffrax.
+
+Supported assemble targets:
+    "vpinn"        -> GroupedAssembly
+    "fem_system"   -> (A, b)
+    "fem_residual" -> FemResidualOperator
+    "feax_time"    -> FeaxTimeBlock
+    "diffrax"      -> DiffraxBlock
+"""
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Tuple
 import jax.numpy as jnp
@@ -76,6 +102,45 @@ from .weak_form_helpers import (
 
 @dataclass(frozen=True)
 class LoweredChannelTerm:
+   """
+    One lowered weak-form term in backend-neutral IR.
+
+    A symbolic weak-form expression is first split into additive terms. Each
+    additive term is then classified by support, region, and channel.
+
+    Fields
+    ------
+    sign:
+        Original additive sign of the term, usually +1.0 or -1.0.
+    support:
+        Geometric support of the term. Usually `"volume"` or `"boundary"`.
+    region_id:
+        Region identifier. For volume terms this is usually `"volume"`.
+        For boundary terms this is the boundary tag, for example `"left"`,
+        `"right"`, or `"top"`.
+    channel:
+        Lowered channel name.
+
+        For VPINN lowering:
+            `"test_value"`:
+                volume term multiplying the test function value.
+            `"test_grad"`:
+                volume term multiplying the test function gradient.
+            `"boundary_test_value"`:
+                boundary term multiplying the test function value.
+
+        For FEM/FEAX lowering:
+            `"raw"`:
+                original weak-form term kept in raw symbolic form.
+    coeff:
+        Symbolic coefficient expression after channel extraction.
+    variable_id:
+        Reserved id for multi-field systems. Currently usually 0.
+    value_shape:
+        Value shape of the weak unknown/test function.
+    original_expr:
+        Original symbolic term before channel extraction.
+    """
     sign: float
     support: str          # "volume" | "boundary"
     region_id: str
@@ -87,11 +152,44 @@ class LoweredChannelTerm:
 
 
 @dataclass
+
 class LoweredWeakForm:
+    """
+    Backend-neutral lowered representation of a weak form.
+
+    `LoweredWeakForm` stores a list of `LoweredChannelTerm` objects and exposes
+    convenience properties for the different backend routes.
+
+    FEM/FEAX routes use:
+        volume_expr:
+            Sum of raw volume weak-form expressions.
+        boundary_exprs:
+            Dictionary mapping boundary region id to summed raw boundary
+            expression.
+
+    VPINN routes use:
+        volume_value_expr:
+            Sum of coefficients multiplying the test-function value.
+        volume_grad_expr:
+            Sum of coefficients multiplying the test-function gradient.
+        boundary_value_exprs:
+            Dictionary mapping boundary region id to coefficients multiplying
+            boundary test-function values.
+
+    Parameters
+    ----------
+    domain:
+        Domain that owns the quadrature/FEM context.
+    terms:
+        Lowered weak-form terms.
+    """
     domain: object
     terms: List[LoweredChannelTerm] = field(default_factory=list)
 
     def select(self, *, support=None, region_id=None, channel=None, variable_id=None):
+        """
+        Select lowered terms matching optional support, region, channel, and variable id.
+        """
         out = []
         for t in self.terms:
             if support is not None and t.support != support:
@@ -106,6 +204,11 @@ class LoweredWeakForm:
         return out
 
     def sum_coeffs(self, *, support=None, region_id=None, channel=None, variable_id=None):
+        """
+        Sum coefficients of all lowered terms matching the given filters.
+
+        Returns None if no matching terms exist.
+        """
         coeffs = [
             t.coeff
             for t in self.select(
@@ -120,11 +223,20 @@ class LoweredWeakForm:
     # FEM-facing raw expressions
     @property
     def volume_expr(self):
+        """
+        Raw summed volume expression used by FEM/FEAX assembly routes.
+        """
         exprs = [t.coeff for t in self.terms if t.support == "volume" and t.channel == "raw"]
         return _sum_terms(self.domain, exprs)
 
     @property
     def boundary_exprs(self) -> Dict[str, Placeholder]:
+        """
+        Raw summed boundary expressions grouped by boundary region id.
+
+        Returns:
+            dict mapping region_id -> symbolic boundary expression.
+        """
         out: Dict[str, List[Placeholder]] = {}
         for t in self.terms:
             if t.support == "boundary" and t.channel == "raw":
@@ -175,10 +287,22 @@ def _split_additive_terms(domain, node, sign=1.0):
 
 def _extract_test_channel(domain, expr) -> Tuple[str, Placeholder, Dict[str, Any]]:
     """
-    Canonicalize one weak-form term into FEAX-style channels:
-      - volume/test_value
-      - volume/test_grad
-      - boundary_test_value (assigned later from support)
+    Extract the VPINN test-function channel from a signed weak-form term.
+
+    Returns:
+        channel:
+            `"test_value"` or `"test_grad"`.
+        coeff:
+            Symbolic coefficient multiplying the test channel.
+        meta:
+            Metadata such as `variable_id` and `value_shape`.
+
+    Supported patterns include terms multiplying `TestFunction`, spatial
+    `Jacobian(TestFunction)`, and selected symmetric-gradient test expressions.
+
+    Raises:
+        NotImplementedError if the term cannot be reduced to a supported VPINN
+        test-function channel.
     """
 
     # pure test value
@@ -343,6 +467,15 @@ def is_variational_expr(domain, expr) -> bool:
     )
 
 def _infer_domain_from_expr(expr):
+    """
+    Infer the owning domain from variables or weak symbols inside an expression.
+
+    This is used when `expr.assemble(domain=None, ...)` is called. The function
+    walks the symbolic expression and returns the first attached domain it finds.
+
+    Raises:
+        ValueError if no domain can be inferred.
+    """
     domains = []
 
     def walk(node):
@@ -406,6 +539,13 @@ def _contains_unknown_symbol(domain, expr) -> bool:
 
 
 def _is_obviously_nonlinear_in_unknown(domain, expr):
+    """
+    Heuristically detect nonlinear dependence on the unknown.
+
+    This is used for steady FEM auto-routing. Linear-looking weak forms are sent
+    to `target="fem_system"`, while nonlinear forms are sent to
+    `target="fem_residual"`.
+    """
     if expr is None:
         return False
 
@@ -477,6 +617,17 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
     return False
 
 def _infer_solver_target(domain, expr):
+    """
+    Infer the default assembly target for a symbolic expression.
+
+    Rules:
+    - strong time-dependent expressions without weak symbols -> `"diffrax"`
+    - weak time-dependent expressions -> `"feax_time"`
+    - steady weak forms that are linear in the unknown -> `"fem_system"`
+    - steady weak forms that are nonlinear in the unknown -> `"fem_residual"`
+
+    The inference is only used when `target=None`.
+    """
     if _contains_temporal_derivative(expr):
         if (
             _contains_node_type(expr, TestFunction)
@@ -500,6 +651,46 @@ def _infer_solver_target(domain, expr):
 # Lower once, dispatch many
 # -----------------------------------------------------------------------------
 def lower_weak_form(domain, expr, trial_value=None, for_target="vpinn"):
+    """
+    Lower a symbolic weak-form expression into backend-neutral weak-form IR.
+
+    Parameters
+    ----------
+    domain:
+        Domain that owns the sampled quadrature/FEM context.
+    expr:
+        Symbolic weak-form expression.
+    trial_value:
+        Optional neural trial expression used when substituting TrialFunction
+        symbols for VPINN training.
+    for_target:
+        Lowering mode.
+
+        `"vpinn"`:
+            Converts each term into canonical VPINN channels:
+            test-value, test-gradient, and boundary-test-value.
+
+        `"fem"`:
+            Keeps each weak-form term in raw symbolic form so FEAX can evaluate
+            TrialFunction/TestFunction values and gradients directly.
+
+    Returns
+    -------
+    LoweredWeakForm
+        Backend-neutral IR containing lowered weak-form terms.
+
+    Notes
+    -----
+    StateField nodes are rebound differently depending on the target:
+
+    - VPINN:
+        StateField is replaced by the wrapped neural expression and rebound to
+        the active quadrature region.
+
+    - FEM/FEAX:
+        StateField is replaced by a shared TrialFunction so FEAX can assemble
+        matrix/residual operators.
+    """
     #print("DEBUG lower_weak_form has StateField before wrap:",
       #_contains_node_type(domain, expr, StateField))
     #expr = _ensure_statefield_wrapped(domain, expr)
@@ -582,6 +773,62 @@ def lower_weak_form(domain, expr, trial_value=None, for_target="vpinn"):
     return LoweredWeakForm(domain=domain, terms=lowered_terms)
 
 def assemble_weak_form(domain, expr, target=None, **kwargs):
+    """
+    Assemble or lower a jNO expression into the requested solver backend.
+
+    This is the central implementation behind:
+
+        expr.assemble(target=...)
+
+    Parameters
+    ----------
+    domain:
+        Domain owning the expression and FEM/VPINN context. If None, the domain
+        is inferred from symbolic variables inside `expr`.
+    expr:
+        Symbolic expression to assemble or lower.
+    target:
+        Backend target. Supported values:
+
+        None:
+            Infer the target automatically.
+
+        `"vpinn"`:
+            Return a differentiable `GroupedAssembly` object for VPINN training.
+
+        `"fem_system"`:
+            Return a steady linear FEM system `(A, b)` such that `A @ u = b`.
+
+        `"fem_residual"`:
+            Return a `FemResidualOperator` with residual and Jacobian callables.
+
+        `"feax_time"`:
+            Return a `FeaxTimeBlock` representing a transient semidiscrete
+            weak-form FEM problem.
+
+        `"diffrax"`:
+            Return a `DiffraxBlock` for strong-form time-dependent problems.
+
+    **kwargs:
+        Backend-specific options forwarded to the selected route.
+
+    Returns
+    -------
+    object
+        Depending on target:
+
+        - `"vpinn"`        -> GroupedAssembly
+        - `"fem_system"`   -> tuple(A, b)
+        - `"fem_residual"` -> FemResidualOperator
+        - `"feax_time"`    -> FeaxTimeBlock
+        - `"diffrax"`      -> DiffraxBlock
+
+    Notes
+    -----
+    Strong-form Diffrax lowering is dispatched before weak-form StateField
+    wrapping. All weak/FEM/VPINN/FEAX-time routes go through the weak-form
+    lowering path.
+    """
     if domain is None:
         domain = _infer_domain_from_expr(expr)
 
@@ -622,6 +869,26 @@ def assemble_weak_form(domain, expr, target=None, **kwargs):
     )
 
 def _assemble_vpinn_from_ir(ir: LoweredWeakForm, **kwargs):
+    """
+    Convert lowered VPINN weak-form IR into a differentiable GroupedAssembly.
+
+    Returns:
+        GroupedAssembly containing:
+
+        - volume_value_expr:
+            coefficient of volume test-function value terms.
+        - volume_grad_expr:
+            coefficient of volume test-function gradient terms.
+        - boundary_value_exprs:
+            boundary value terms grouped by boundary region id.
+        - num_total_nodes:
+            number of global FEM/test nodes.
+
+    Notes
+    -----
+    This route does not solve a FEM system. It creates a differentiable weak
+    residual object evaluated during neural training.
+    """
     if (
         ir.volume_value_expr is None
         and ir.volume_grad_expr is None

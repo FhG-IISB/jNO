@@ -1,5 +1,24 @@
 from __future__ import annotations
+"""
+Adapters from semidiscrete FEAX-time blocks to executable solver blocks.
 
+This module converts `FeaxTimeBlock` objects into:
+
+- `DiffraxBlock`, for Diffrax-based ODE integration.
+- `FeaxPipelineBlock`, for FEAX-native time stepping.
+
+The adapters support two semidiscrete payloads:
+
+Linear:
+    M u_dot + A u = c + f(t)
+
+Nonlinear:
+    M(t) u_dot + R(u, t) = 0
+
+This module is internal solver plumbing. User-facing code should normally call
+`block.as_diffrax(...)` or `block.as_feax_pipeline(...)` instead of importing
+these functions directly.
+"""
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -11,6 +30,12 @@ from .backend_blocks import DiffraxBlock, FeaxTimeBlock, FeaxPipelineBlock
 # Adapter helpers
 # ---------------------------------------------------------------------
 def _require_first_order(block: FeaxTimeBlock):
+    """
+    Validate that a FEAX-time block is first order in time.
+
+    The current Diffrax and FEAX pipeline adapters operate on first-order
+    semidiscrete systems only.
+    """s
     if block.time_order != 1:
         raise NotImplementedError(
             "Only first-order-in-time semidiscrete blocks are currently supported."
@@ -18,6 +43,13 @@ def _require_first_order(block: FeaxTimeBlock):
 
 
 def _select_scheme(block: FeaxTimeBlock, scheme: Optional[str]) -> str:
+    """
+    Select and validate the time-integration scheme.
+
+    If `scheme` is None, the scheme is inferred from `block.mode`:
+    implicit blocks use `"backward_euler"` and explicit blocks use
+    `"forward_euler"`.
+    """
     if scheme is None:
         scheme = "backward_euler" if str(block.mode).lower() == "implicit" else "forward_euler"
 
@@ -39,6 +71,45 @@ def make_diffrax_block(
     forcing_vector_fn: Optional[Callable] = None,
     args: Any = None,
 ) -> DiffraxBlock:
+    """
+    Convert a first-order `FeaxTimeBlock` into a `DiffraxBlock`.
+
+    Linear conversion
+    -----------------
+    For a linear semidiscrete block,
+
+        M u_dot + A u = c + f(t)
+
+    the generated Diffrax RHS is:
+
+        u_dot = solve(M, c + f(t) - A u)
+
+    Nonlinear conversion
+    --------------------
+    For a nonlinear semidiscrete block,
+
+        M(t) u_dot + R(u, t) = 0
+
+    the generated Diffrax RHS is:
+
+        u_dot = solve(M(t), -R(u, t))
+
+    Parameters
+    ----------
+    block:
+        First-order FEAX-time semidiscrete block.
+    forcing_vector_fn:
+        Optional override for the linear forcing callback. If omitted,
+        `block.forcing_vector_fn` is used.
+    args:
+        Optional runtime arguments passed to the generated RHS.
+
+    Returns
+    -------
+    DiffraxBlock
+        Diffrax-compatible block containing `rhs`, `term`, initial state,
+        time interval, and conversion metadata.
+    """
     _require_first_order(block)
 
     import diffrax
@@ -154,6 +225,77 @@ def make_feax_pipeline(
     newton_damping: float = 1.0,
     compile_step: bool = True,
 ) -> FeaxPipelineBlock:
+    """
+    Convert a first-order `FeaxTimeBlock` into a FEAX `TimePipeline`.
+
+    Supported schemes
+    -----------------
+    - `"backward_euler"`
+    - `"forward_euler"`
+
+    Linear backward Euler
+    ---------------------
+    For
+
+        M u_dot + A u = c + f(t)
+
+    the generated step solves:
+
+        (M + dt A) u_next = M u + dt(c + f(t_next))
+
+    Linear forward Euler
+    --------------------
+    The generated step evaluates:
+
+        u_next = u + dt solve(M, c + f(t) - A u)
+
+    Nonlinear backward Euler
+    ------------------------
+    For
+
+        M(t) u_dot + R(u, t) = 0
+
+    the generated step solves Newton iterations for:
+
+        M(t_next) (u_next - u) / dt + R(u_next, t_next) = 0
+
+    Nonlinear forward Euler
+    -----------------------
+    The generated step evaluates:
+
+        u_next = u - dt solve(M(t), R(u, t))
+
+    Parameters
+    ----------
+    block:
+        First-order FEAX-time semidiscrete block.
+    scheme:
+        Optional scheme override. If omitted, the scheme is inferred from
+        `block.mode`.
+    forcing_vector_fn:
+        Optional override for the linear forcing callback.
+    args:
+        Optional runtime arguments passed to generated step functions.
+    monitor_index:
+        Optional state index reported as `u_monitor`.
+    newton_tol:
+        Newton convergence tolerance for nonlinear backward Euler.
+    newton_maxiter:
+        Maximum Newton iterations for nonlinear backward Euler.
+    snapshot_times:
+        Optional list of times at which the generated pipeline stores state
+        snapshots.
+    newton_damping:
+        Damping factor applied to Newton updates.
+    compile_step:
+        If True, JIT-compile the generated step implementation.
+
+    Returns
+    -------
+    FeaxPipelineBlock
+        Block containing the FEAX `TimePipeline`, mesh, initial state, time
+        settings, and conversion metadata.
+    """
     _require_first_order(block)
 
     if block.feax_mesh is None:

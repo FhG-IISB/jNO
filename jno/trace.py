@@ -240,7 +240,7 @@ class Placeholder:
         If domain is omitted, try to infer it from Variables/TestFunction/etc.
         target=None lets weak_form.py infer the steady solver route in Phase 1.
         """
-        from .utils.weak_form import assemble_weak_form
+        from .utils.solver.weak_form import assemble_weak_form
         return assemble_weak_form(domain, self, target=target, **kwargs)
 
     def print(self, what: Union[str, Callable[[jnp.ndarray], Any]] = "shape", label: Optional[str] = None):
