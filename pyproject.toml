@@ -38,11 +38,22 @@ Issues = "https://github.com/FhG-IISB/jno/issues"
 cuda = [
     "jax[cuda12]"
 ]
+fem = [
+    "feax",
+    "diffrax",
+    "optimistix",
+    "lineax",
+    "pyfiglet",
+    "fenics-basix",
+]
 dev = ["pytest>=7.0", 
         "black>=22.0", 
         "flake8>=4.0", 
         "mypy>=0.950", 
-        "jax-fem",
+        "feax",
+        "diffrax",
+        "optimistix",
+        "lineax",
         "paramax", 
         "flax", 
         "xprof", 
@@ -80,8 +91,10 @@ exclude = '^(build/|jNO\.egg-info/|runs/)'
 
 [dependency-groups]
 fem = [
+    "feax",
+    "diffrax",
+    "optimistix",
     "lineax",
-    "jax-fem",
     "pyfiglet",
     "fenics-basix",
 ]

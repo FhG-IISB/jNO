@@ -24,8 +24,8 @@ pi = jno.np.pi
 T_end = 1.0
 
 domain = jno.domain(
-    constructor=jno.domain.rect(mesh_size=0.2),
-    time=(0, T_end, 4),
+    constructor=jno.domain.rect(mesh_size=0.05),
+    time=(0, T_end, 10),
 )
 x, y, t = domain.variable("interior")
 x0, y0, t0 = domain.variable("initial")
@@ -39,18 +39,18 @@ u_net = jno.nn.wrap(foundax.deeponet(
     n_sensors=1,
     coord_dim=2,
     n_outputs=1,
-    n_layers=4,
+    n_layers=6,
     basis_functions=64,
-    hidden_dim=48,
+    hidden_dim=64,
     key=jax.random.PRNGKey(24),
 ))
 v_net = jno.nn.wrap(foundax.deeponet(
     n_sensors=1,
     coord_dim=2,
     n_outputs=1,
-    n_layers=4,
+    n_layers=6,
     basis_functions=64,
-    hidden_dim=48,
+    hidden_dim=64,
     key=jax.random.PRNGKey(25),
 ))
 for net in [u_net, v_net]:
@@ -69,7 +69,7 @@ ini_u = u0 - jno.np.sin(pi * x0) * jno.np.sin(pi * y0)
 ini_v = v0 - jno.np.sin(2 * pi * x0) * jno.np.sin(pi * y0)
 
 crux = jno.core([pde_u.mse, pde_v.mse, ini_u.mse, ini_v.mse], domain)
-history = crux.solve(10_000)
+history = crux.solve(12_000)
 
 _u, _u_exact, _v, _v_exact = crux.eval([u, u_exact, v, v_exact])
 rel_l2_u = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_exact) + 1e-8))

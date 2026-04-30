@@ -24,7 +24,7 @@ import optax
 from jno import LearningRateSchedule as lrs
 
 pi = jno.np.pi
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.2))
+domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05))
 x, y, _ = domain.variable("interior")
 xt, yt, _ = domain.variable("top")
 xb, yb, _ = domain.variable("bottom")
@@ -33,7 +33,7 @@ u_exact = jno.np.sin(pi * x) * jno.np.cos(pi * y)
 forcing = 2 * pi**2 * u_exact
 
 net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=48, num_layers=4, key=jax.random.PRNGKey(14)))
-net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 10, 1e-5))
+net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 1000, 1e-5))
 
 u = net(x, y) * x * (1 - x)
 u_top = net(xt, yt) * xt * (1 - xt)

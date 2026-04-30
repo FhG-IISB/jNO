@@ -230,7 +230,14 @@ def concat(items, axis: int = -1) -> FunctionCall:
     """Concatenate placeholders along an axis (always axis=-1 at eval time)."""
 
     def _fn(*args):
-        expanded = [a[..., jnp.newaxis] if a.ndim == 1 else a for a in args]
+        expanded = []
+        for a in args:
+            a = jnp.asarray(a)
+            if a.ndim == 0:
+                a = a[jnp.newaxis]
+            elif a.ndim == 1:
+                a = a[..., jnp.newaxis]
+            expanded.append(a)
 
         # Fast path when shapes already match on non-concatenation dims.
         if len(expanded) > 1:
@@ -239,8 +246,6 @@ def concat(items, axis: int = -1) -> FunctionCall:
                 return jnp.concatenate(expanded, axis=-1)
 
         # Fallback: align ranks and only broadcast singleton dimensions.
-        # This supports temporal/scalar-like inputs while avoiding expensive
-        # symbolic shape broadcasting during tracing.
         max_ndim = max(a.ndim for a in expanded)
         aligned = []
         for a in expanded:

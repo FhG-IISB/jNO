@@ -443,7 +443,7 @@ class TestGPUPlacement:
         arrays (the domain context lives on GPU) and converts them to
         host-resident numpy arrays.
 
-        ``20 * domain`` sets ``total_samples=20``; ``batchsize=5`` is less than
+        ``20 * domain`` sets ``total_samples=20``; ``batchsize=int(jax.device_count())`` is less than
         20, so the guard in solve() does not suppress the offload path.
         """
         import sys
@@ -476,7 +476,7 @@ class TestGPUPlacement:
             return result
 
         monkeypatch.setattr(core_mod.np, "asarray", spy_asarray)
-        s.solve(3, offload_data=True, batchsize=5)
+        s.solve(3, offload_data=True, batchsize=int(jax.device_count()))
 
         assert len(converted_types) > 0, "np.asarray was never called with a jax.Array during offload_data solve; " "the host-offload path may not have been reached"
         for arr_id, info in converted_types.items():
@@ -493,7 +493,7 @@ class TestGPUPlacement:
         and verify that by the time the batch reaches _shard_data it is a
         JAX GPU array (result of jax.device_put(batch_np) inside solve()).
 
-        ``20 * domain`` sets ``total_samples=20``; ``batchsize=5`` is less
+        ``20 * domain`` sets ``total_samples=20``; ``batchsize=int(jax.device_count())`` is less
         than 20, so the offload path is actually entered.
         """
         import optax
@@ -516,7 +516,7 @@ class TestGPUPlacement:
             return original_shard_data(data)
 
         monkeypatch.setattr(s, "_shard_data", spy_shard_data)
-        s.solve(3, offload_data=True, batchsize=5)
+        s.solve(3, offload_data=True, batchsize=int(jax.device_count()))
 
         # The first shard_data call during the offload loop receives the
         # device_put'd batch — it should be a JAX array on the GPU.

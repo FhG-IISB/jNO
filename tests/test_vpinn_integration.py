@@ -1,9 +1,13 @@
-"""Minimal tests for the VPINN / weak-form integration."""
+"""Lightweight tests for VPINN / weak-form integration."""
 
 import pytest
+
+pytest.importorskip("foundax", reason="foundax required for neural VPINN tests")
+
 import jax
 import jax.numpy as jnp
 import foundax
+
 import jno
 import jno.jnp_ops as jnn
 from jno.trace import dump_tree
@@ -14,7 +18,7 @@ from jno.trace import dump_tree
 # ============================================================
 
 
-def make_domain(mesh_size=0.25):
+def make_domain(mesh_size=0.35):
     """Create a small rectangular domain for fast VPINN tests."""
     return jno.domain(constructor=jno.domain.rect(mesh_size=mesh_size))
 
@@ -23,9 +27,9 @@ def init_vpinn_fem(dom, with_neumann_tags=True):
     """
     Initialize FEM quadrature tags used by the VPINN route.
 
-    VPINN uses the same sampled tags as the FEM route:
-      - fem_gauss      : volume quadrature
-      - gauss_<tag>    : boundary quadrature
+    VPINN uses the same sampled tags as the FEAX/FEM route:
+    - fem_gauss
+    - gauss_<boundary_tag>
     """
     bcs = [dom.dirichlet("left")]
     if with_neumann_tags:
@@ -45,7 +49,7 @@ def make_scalar_net():
     return jnn.nn.wrap(
         foundax.mlp(
             2,
-            hidden_dims=32,
+            hidden_dims=16,
             num_layers=2,
             activation=jax.nn.tanh,
             key=key,
@@ -58,7 +62,7 @@ def make_vector_net():
     return jnn.nn.wrap(
         foundax.mlp(
             2,
-            hidden_dims=32,
+            hidden_dims=16,
             num_layers=2,
             activation=jax.nn.tanh,
             key=key,
@@ -128,6 +132,7 @@ class TestVpinnScalarAssembly:
 
         assert pde is not None
         assert hasattr(pde, "mse")
+        assert hasattr(pde, "volume_grad_expr")
 
     def test_scalar_nonlinear_volume_weak_form_assembles(self):
         dom = make_domain()
@@ -173,7 +178,7 @@ class TestVpinnBoundaryAssembly:
         phiy = jnn.grad(phi, y)
 
         vol = ux * phix + uy * phiy
-        surf = (1.0 + 0.0 * xr) * phi
+        surf = (1.0 + 0.0 * xr + 0.0 * yr) * phi
         weak = vol - surf
 
         net = make_scalar_net()
@@ -183,6 +188,7 @@ class TestVpinnBoundaryAssembly:
 
         assert pde is not None
         assert hasattr(pde, "mse")
+        assert "right" in pde.boundary_value_exprs
 
 
 # ============================================================
@@ -213,7 +219,7 @@ class TestVpinnVectorAssembly:
 
 
 # ============================================================
-# Validation / error behavior
+# Validation / display
 # ============================================================
 
 
@@ -223,11 +229,6 @@ class TestVpinnValidation:
 
         with pytest.raises(Exception):
             dom.variable("does_not_exist", split=True)
-
-
-# ============================================================
-# Symbolic weak-form display
-# ============================================================
 
 
 def test_dump_tree_on_vpinn_weak_form():

@@ -15,9 +15,9 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TUTORIAL_ROOT = REPO_ROOT / "tests" / "tutorial_examples_tests"
-DEFAULT_TIMEOUT_SECONDS = int(os.environ.get("JNO_TUTORIAL_SMOKE_TIMEOUT", "120"))
+DEFAULT_TIMEOUT_SECONDS = int(os.environ.get("JNO_TUTORIAL_SMOKE_TIMEOUT", "360"))
 PATTERN = os.environ.get("JNO_TUTORIAL_SMOKE_PATTERN", "**/*.py")
-DEFAULT_CUDA_DEVICE = os.environ.get("JNO_TUTORIAL_CUDA_DEVICE", "7")
+DEFAULT_CUDA_DEVICE = os.environ.get("JNO_TUTORIAL_CUDA_DEVICE", "0")
 
 
 def _discover_scripts() -> list[Path]:

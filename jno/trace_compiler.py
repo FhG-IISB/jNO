@@ -333,9 +333,11 @@ class TraceCompiler:
             elif isinstance(node, Assembly):
                 visit(node.expr)
             elif isinstance(node, GroupedAssembly):
-                if node.volume_expr is not None:
-                    visit(node.volume_expr)
-                for bnd_expr in node.boundary_exprs.values():
+                if node.volume_value_expr is not None:
+                    visit(node.volume_value_expr)
+                if node.volume_grad_expr is not None:
+                    visit(node.volume_grad_expr)
+                for bnd_expr in node.boundary_value_exprs.values():
                     visit(bnd_expr)
 
         visit(expr)
@@ -385,7 +387,14 @@ class TraceCompiler:
                     else:
                         return val
 
-            return tuple(normalize_arg(v, s) for v, s in zip(arg_values, arg_sources))
+            normalized = tuple(normalize_arg(v, s) for v, s in zip(arg_values, arg_sources))
+
+            # Keep shape inference consistent with TraceEvaluator._eval_flax_module_call.
+            model = None
+            # In this function you only have call_args, not the model object.
+            # So either pass model into _infer_arg_shapes later, or leave this alone
+            # if this function is no longer used for Equinox-foundax initialization.
+            return normalized
 
         abstract_results = jax.eval_shape(eval_and_normalize, abstract_ctx)
         return [r.shape for r in abstract_results]
@@ -644,6 +653,7 @@ class TraceCompiler:
         TraceEvaluator = _get_evaluator_class()
         TIME_TAG = "__time__"
         expr_tags = collect_tags(expr)
+        METADATA_TAGS = {"JxW", "flat_cells", "global_areas", "N_flat", "dN_dx_flat", "dirichlet_nodes", "cells", "quad_points", "boundary_nodes", "surface_data", "v_grads_JxW_flat"}
 
         def evaluate_single_point_set(params, context_single, key):
             """Evaluate for a single (N, D) context — no batch or time."""
@@ -691,7 +701,7 @@ class TraceCompiler:
             # __time__ is (T, 1) — skip it when finding B.
             batched_sizes = []
             for tag, arr in zip(tag_order, ctx_tuple):
-                if tag == TIME_TAG or tag not in expr_tags:
+                if tag == TIME_TAG or tag in METADATA_TAGS or tag not in expr_tags:
                     continue
                 if hasattr(arr, "ndim") and arr.ndim >= 1:
                     batched_sizes.append(arr.shape[0])
@@ -715,8 +725,8 @@ class TraceCompiler:
                     indices = jnp.arange(0, B, 1)
 
                 def subset_entry(tag_name, arr):
-                    if tag_name == TIME_TAG:
-                        return arr  # not batched
+                    if tag_name == TIME_TAG or tag_name in METADATA_TAGS:
+                        return arr
                     if hasattr(arr, "ndim") and arr.ndim >= 1 and arr.shape[0] == B:
                         return arr[indices]
                     return arr
@@ -730,14 +740,14 @@ class TraceCompiler:
             # closure instead.
             time_arr = None  # will be set if __time__ is present
             time_idx_in_order = None
-
             passive_ctx = {}
             spatial_tag_order = []
             spatial_ctx = []
-            for i, (tag, arr) in enumerate(zip(tag_order, ctx_tuple)):
+            metadata_ctx = {}
+
+            for tag, arr in zip(tag_order, ctx_tuple):
                 if tag == TIME_TAG:
                     time_arr = jnp.asarray(arr)  # (T, 1)
-                    time_idx_in_order = i
                 elif hasattr(arr, "ndim") and arr.ndim >= 1 and arr.shape[0] in (B, 1):
                     # Include all arrays carrying a per-sample batch axis (size B or
                     # broadcastable 1), regardless of whether they appear in expr_tags.
@@ -745,6 +755,8 @@ class TraceCompiler:
                     # evaluator via ctx.context directly and are not Variable-tagged.
                     spatial_tag_order.append(tag)
                     spatial_ctx.append(arr)
+                elif tag in METADATA_TAGS:
+                    metadata_ctx[tag] = arr
                 else:
                     passive_ctx[tag] = arr
 
@@ -795,8 +807,7 @@ class TraceCompiler:
                     if rng_key is None:
                         start = zero_idx
                     else:
-                        start = jax.random.randint(rng_key, shape=(), minval=0, maxval=T - W + 1)
-                        start = start.astype(idx_dtype)
+                        start = jax.random.randint(rng_key, shape=(), minval=0, maxval=T - W + 1).astype(idx_dtype)
                 else:
                     start = zero_idx
 
@@ -819,7 +830,8 @@ class TraceCompiler:
                         def _eval_single_step(*step_spatial_and_t):
                             step_t = step_spatial_and_t[-1]
                             step_spatial = step_spatial_and_t[:-1]
-                            ctx_dict = dict(passive_ctx)
+                            ctx_dict = dict(metadata_ctx)
+                            ctx_dict.update(passive_ctx)
                             active_spatial_n = None
                             for tag, step_arr in zip(spatial_tag_order, step_spatial):
                                 ctx_dict[tag] = step_arr
@@ -836,7 +848,8 @@ class TraceCompiler:
                             in_axes=tuple(in_axes_list),
                         )(*windowed_ctx, t_wind)
                     else:
-                        ctx_dict = dict(passive_ctx)
+                        ctx_dict = dict(metadata_ctx)
+                        ctx_dict.update(passive_ctx)
                         active_spatial_n = None
                         for tag, arr in zip(spatial_tag_order, windowed_ctx):
                             if hasattr(arr, "ndim") and arr.ndim >= 2:
@@ -845,9 +858,8 @@ class TraceCompiler:
                                     active_spatial_n = int(arr[0].shape[0])
                             else:
                                 ctx_dict[tag] = arr
-                                if active_spatial_n is None and hasattr(arr, "ndim"):
-                                    if arr.ndim >= 2:
-                                        active_spatial_n = int(arr.shape[0])
+                                if active_spatial_n is None and hasattr(arr, "ndim") and arr.ndim >= 2:
+                                    active_spatial_n = int(arr.shape[0])
                         if active_spatial_n is not None:
                             ctx_dict["__active_spatial_n__"] = active_spatial_n
                         if time_arr is not None:
@@ -928,6 +940,7 @@ class TraceCompiler:
         """
         TraceEvaluator = _get_evaluator_class()
         TIME_TAG = "__time__"
+        METADATA_TAGS = {"JxW", "flat_cells", "global_areas", "N_flat", "dN_dx_flat", "dirichlet_nodes", "cells", "quad_points", "boundary_nodes", "surface_data", "v_grads_JxW_flat"}
 
         def evaluate_single_point_set(params, context_single, key):
             """Evaluate ALL expressions on one (N, D) context — shared evaluator."""
@@ -955,7 +968,7 @@ class TraceCompiler:
 
             batched_sizes = []
             for tag, arr in zip(tag_order, ctx_tuple):
-                if tag == TIME_TAG or tag not in expr_tags:
+                if tag == TIME_TAG or tag in METADATA_TAGS or tag not in expr_tags:
                     continue
                 if hasattr(arr, "ndim") and arr.ndim >= 1:
                     batched_sizes.append(arr.shape[0])
@@ -978,7 +991,7 @@ class TraceCompiler:
                     indices = jnp.arange(0, B, 1)
 
                 def subset_entry(tag_name, arr):
-                    if tag_name == TIME_TAG:
+                    if tag_name == TIME_TAG or tag_name in METADATA_TAGS or tag_name not in expr_tags:
                         return arr
                     if hasattr(arr, "ndim") and arr.ndim >= 1 and arr.shape[0] == B:
                         return arr[indices]
@@ -991,6 +1004,8 @@ class TraceCompiler:
             passive_ctx = {}
             spatial_tag_order = []
             spatial_ctx = []
+            metadata_ctx = {}
+
             for tag, arr in zip(tag_order, ctx_tuple):
                 if tag == TIME_TAG:
                     time_arr = jnp.asarray(arr)
@@ -1001,6 +1016,8 @@ class TraceCompiler:
                     # passive context so per-sample evaluation sees the right slice.
                     spatial_tag_order.append(tag)
                     spatial_ctx.append(arr)
+                elif tag in METADATA_TAGS:
+                    metadata_ctx[tag] = arr
                 else:
                     passive_ctx[tag] = arr
 
@@ -1063,7 +1080,8 @@ class TraceCompiler:
                         def _eval_single_step(*step_spatial_and_t):
                             step_t = step_spatial_and_t[-1]
                             step_spatial = step_spatial_and_t[:-1]
-                            ctx_dict = dict(passive_ctx)
+                            ctx_dict = dict(metadata_ctx)
+                            ctx_dict.update(passive_ctx)
                             active_spatial_n = None
                             for tag, step_arr in zip(spatial_tag_order, step_spatial):
                                 ctx_dict[tag] = step_arr
@@ -1081,7 +1099,8 @@ class TraceCompiler:
                         )(*windowed_ctx, t_wind)
                     else:
                         # W == 1: squeeze the window dimension
-                        ctx_dict = dict(passive_ctx)
+                        ctx_dict = dict(metadata_ctx)
+                        ctx_dict.update(passive_ctx)
                         active_spatial_n = None
                         for tag, arr in zip(spatial_tag_order, windowed_ctx):
                             if hasattr(arr, "ndim") and arr.ndim >= 2:
@@ -1090,9 +1109,8 @@ class TraceCompiler:
                                     active_spatial_n = int(arr[0].shape[0])
                             else:
                                 ctx_dict[tag] = arr
-                                if active_spatial_n is None and hasattr(arr, "ndim"):
-                                    if arr.ndim >= 2:
-                                        active_spatial_n = int(arr.shape[0])
+                                if active_spatial_n is None and hasattr(arr, "ndim") and arr.ndim >= 2:
+                                    active_spatial_n = int(arr.shape[0])
                         if active_spatial_n is not None:
                             ctx_dict["__active_spatial_n__"] = active_spatial_n
                         if time_arr is not None:

@@ -33,7 +33,7 @@ T_end = 1.0
 
 # ── Domain ────────────────────────────────────────────────────────────────────
 domain = jno.domain(
-    constructor=jno.domain.rect(mesh_size=0.2),
+    constructor=jno.domain.rect(mesh_size=0.05),
     time=(0, T_end, 4),
 )
 x, y, t = domain.variable("interior")
@@ -55,7 +55,7 @@ net = jno.nn.wrap(foundax.deeponet(
     hidden_dim=40,
     key=jax.random.PRNGKey(42),
 ))
-net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(10, 1, 1e-3, 1e-5))
+net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(500, 1, 1e-3, 1e-5))
 
 xy = jno.np.concat([x, y])
 u = net(t, xy) * x * (1 - x) * y * (1 - y)

@@ -47,7 +47,7 @@ net = jno.nn.wrap(foundax.deeponet(
     hidden_dim=48,
     key=jax.random.PRNGKey(7),
 ))
-net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(10, 1, 1e-3, 1e-5))
+net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(5000, 1000, 1e-3, 1e-5))
 
 boundary_envelope = 4.0 * x * (1 - x)
 u = net(t, x) * boundary_envelope

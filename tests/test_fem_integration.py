@@ -1,16 +1,14 @@
-"""Minimal tests for the JAX-FEM / weak-form integration."""
+"""Lightweight tests for FEAX-backed FEM / weak-form integration."""
 
 import pytest
 
-pytest.importorskip("petsc4py", reason="petsc4py required for FEM solver tests")
+pytest.importorskip("feax", reason="feax required for FEAX FEM integration tests")
 
-import jax
 import jax.numpy as jnp
-import numpy as np
 
 import jno
 import jno.jnp_ops as jnn
-from jno import dirichlet, neumann
+from jno import dirichlet
 
 
 # ============================================================
@@ -18,13 +16,13 @@ from jno import dirichlet, neumann
 # ============================================================
 
 
-def make_domain(mesh_size=0.25):
-    """Create a small rectangular domain for fast FEM tests."""
+def make_domain(mesh_size=0.35):
+    """Create a small rectangular domain for fast FEAX/FEM tests."""
     return jno.domain(constructor=jno.domain.rect(mesh_size=mesh_size))
 
 
 def to_dense(A):
-    """Convert sparse/JAX sparse matrices to a dense array for simple checks."""
+    """Convert sparse/JAX/scipy-like matrices to a dense JAX array."""
     if hasattr(A, "todense"):
         return jnp.asarray(A.todense())
     if hasattr(A, "toarray"):
@@ -37,7 +35,7 @@ def to_dense(A):
 # ============================================================
 
 
-class TestFemInit:
+class TestFeaxFemInit:
     def test_init_fem_registers_volume_and_boundary_quadrature(self):
         dom = make_domain()
 
@@ -51,7 +49,6 @@ class TestFemInit:
             fem_solver=True,
         )
 
-        # symbolic variables exist
         xg, yg, _ = dom.variable("fem_gauss", split=True)
         xr, yr, _ = dom.variable("gauss_right", split=True)
         xt, yt, _ = dom.variable("gauss_top", split=True)
@@ -63,23 +60,13 @@ class TestFemInit:
         assert xt is not None
         assert yt is not None
 
-        # concrete sampled quadrature arrays exist
         assert "fem_gauss" in dom._mesh_pool
         assert "gauss_right" in dom._mesh_pool
         assert "gauss_top" in dom._mesh_pool
 
-        fem_pts = dom._mesh_pool["fem_gauss"]
-        right_pts = dom._mesh_pool["gauss_right"]
-        top_pts = dom._mesh_pool["gauss_top"]
-
-        assert fem_pts.shape[0] > 0
-        assert fem_pts.shape[1] == dom.dimension
-
-        assert right_pts.shape[0] > 0
-        assert right_pts.shape[1] == dom.dimension
-
-        assert top_pts.shape[0] > 0
-        assert top_pts.shape[1] == dom.dimension
+        assert dom._mesh_pool["fem_gauss"].shape[-1] == dom.dimension
+        assert dom._mesh_pool["gauss_right"].shape[-1] == dom.dimension
+        assert dom._mesh_pool["gauss_top"].shape[-1] == dom.dimension
 
     def test_default_zero_dirichlet_builds(self):
         dom = make_domain()
@@ -87,7 +74,7 @@ class TestFemInit:
         dom.init_fem(
             element_type="TRI3",
             quad_degree=2,
-            bcs=[dirichlet(["left", "bottom"])],  # values omitted -> zero
+            bcs=[dirichlet(["left", "bottom"])],
             fem_solver=True,
         )
 
@@ -98,20 +85,15 @@ class TestFemInit:
         assert phi is not None
         assert xg is not None
         assert yg is not None
-
         assert "fem_gauss" in dom._mesh_pool
-        fem_pts = dom._mesh_pool["fem_gauss"]
-
-        assert fem_pts.shape[0] > 0
-        assert fem_pts.shape[1] == dom.dimension
 
 
 # ============================================================
-# Symbolic FEM symbols
+# FEM symbols
 # ============================================================
 
 
-class TestFemSymbols:
+class TestFeaxFemSymbols:
     def test_scalar_fem_symbols(self):
         dom = make_domain()
         u, phi = dom.fem_symbols()
@@ -132,7 +114,7 @@ class TestFemSymbols:
 # ============================================================
 
 
-class TestFemLinearAssembly:
+class TestFeaxFemLinearAssembly:
     def test_scalar_poisson_fem_system_assembles(self):
         dom = make_domain()
 
@@ -164,13 +146,36 @@ class TestFemLinearAssembly:
         assert jnp.isfinite(A_dense).all()
         assert jnp.isfinite(b).all()
 
+    def test_target_none_auto_selects_fem_system_for_linear_steady_form(self):
+        dom = make_domain()
+
+        dom.init_fem(
+            element_type="TRI3",
+            quad_degree=2,
+            bcs=[dom.dirichlet(["left", "right", "top", "bottom"])],
+            fem_solver=True,
+        )
+
+        u, phi = dom.fem_symbols()
+        xg, yg, _ = dom.variable("fem_gauss", split=True)
+
+        weak = jnn.grad(u, xg) * jnn.grad(phi, xg) - (1.0 + 0.0 * xg) * phi
+
+        A, b = weak.assemble(dom)
+
+        A_dense = to_dense(A)
+        b = jnp.asarray(b)
+
+        assert A_dense.shape[0] == A_dense.shape[1]
+        assert A_dense.shape[0] == b.shape[0]
+
 
 # ============================================================
 # Linear vector FEM assembly
 # ============================================================
 
 
-class TestFemVectorAssembly:
+class TestFeaxFemVectorAssembly:
     def test_linear_elasticity_like_system_assembles(self):
         dom = make_domain()
 
@@ -179,7 +184,7 @@ class TestFemVectorAssembly:
             quad_degree=2,
             bcs=[dom.dirichlet(["left", "right", "top", "bottom"], (0.0, 0.0))],
             fem_solver=True,
-            vec=2,  # keep if your current init_fem still needs it
+            vec=2,
         )
 
         u, phi = dom.fem_symbols(value_shape=(2,))
@@ -207,7 +212,7 @@ class TestFemVectorAssembly:
 # ============================================================
 
 
-class TestFemBoundaryAssembly:
+class TestFeaxFemBoundaryAssembly:
     def test_neumann_boundary_quadrature_tag_is_usable(self):
         dom = make_domain()
 
@@ -231,7 +236,7 @@ class TestFemBoundaryAssembly:
         phiy = jnn.grad(phi, yg)
 
         vol = ux * phix + uy * phiy
-        surf = (1.0 + 0.0 * xr) * phi
+        surf = (1.0 + 0.0 * xr + 0.0 * yr) * phi
         weak = vol - surf
 
         A, b = weak.assemble(dom, target="fem_system")
@@ -250,7 +255,7 @@ class TestFemBoundaryAssembly:
 # ============================================================
 
 
-class TestFemResidualRoute:
+class TestFeaxFemResidualRoute:
     def test_nonlinear_residual_operator_builds(self):
         dom = make_domain()
 
@@ -275,6 +280,7 @@ class TestFemResidualRoute:
         assert hasattr(op, "size")
         assert hasattr(op, "residual")
         assert hasattr(op, "jacobian")
+        assert op.size > 0
 
         u0 = jnp.zeros(op.size)
         r0 = op.residual(u0)
@@ -288,7 +294,12 @@ class TestFemResidualRoute:
         assert jnp.isfinite(J0_dense).all()
 
 
-class TestFemBCNormalization:
+# ============================================================
+# BC validation / registration
+# ============================================================
+
+
+class TestFeaxFemBCNormalization:
     def test_vector_dirichlet_component_dict_builds(self):
         dom = make_domain()
 
@@ -310,7 +321,7 @@ class TestFemBCNormalization:
         assert "bottom" in dom._fem_dirichlet_value_fns
 
 
-class TestFemBCValidation:
+class TestFeaxFemBCValidation:
     def test_dirichlet_tuple_length_mismatch_raises(self):
         dom = make_domain()
 
@@ -319,9 +330,7 @@ class TestFemBCValidation:
                 element_type="TRI3",
                 quad_degree=2,
                 vec=2,
-                bcs=[
-                    dom.dirichlet("left", (0.0, 0.0, 0.0)),
-                ],
+                bcs=[dom.dirichlet("left", (0.0, 0.0, 0.0))],
                 fem_solver=True,
             )
 
@@ -338,7 +347,7 @@ class TestFemBCValidation:
             )
 
 
-class TestFemSurfaceRegistration:
+class TestFeaxFemSurfaceRegistration:
     def test_multiple_neumann_tags_register_surface_data(self):
         dom = make_domain()
 

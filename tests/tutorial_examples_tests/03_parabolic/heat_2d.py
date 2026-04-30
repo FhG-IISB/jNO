@@ -29,7 +29,7 @@ N_t = 4  # number of time slices
 
 # ── Domain ────────────────────────────────────────────────────────────────────
 domain = jno.domain(
-    constructor=jno.domain.rect(mesh_size=0.2),
+    constructor=jno.domain.rect(mesh_size=0.05),
     time=(0, T_end, N_t),
     compute_mesh_connectivity=False,
 )
@@ -44,9 +44,9 @@ net = jno.nn.wrap(foundax.deeponet(
     n_sensors=1,
     coord_dim=2,
     n_outputs=1,
-    n_layers=3,
+    n_layers=6,
     basis_functions=64,
-    hidden_dim=40,
+    hidden_dim=64,
     key=jax.random.PRNGKey(0),
 ))
 net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(10, 1, 1e-3, 1e-5))

@@ -22,7 +22,7 @@ import foundax
 import optax
 from jno import LearningRateSchedule as lrs
 
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+domain = jno.domain(constructor=jno.domain.line(mesh_size=0.05))
 x, _ = domain.variable("interior")
 
 u_exact = x**2 * (1 - x) ** 2

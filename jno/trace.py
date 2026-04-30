@@ -47,6 +47,7 @@ __all__ = [
     "TrialFunction",
     "FemLinearSystem",
     "FemResidualOperator",
+    "StateField",
 ]
 
 # Global counter for unique operation IDs
@@ -57,6 +58,57 @@ def _next_op_id() -> int:
     global _operation_counter
     _operation_counter += 1
     return _operation_counter
+
+
+def _contains_node_type_local(node, cls) -> bool:
+    if isinstance(node, cls):
+        return True
+
+    for attr in ("left", "right", "target", "expr", "operation", "model"):
+        child = getattr(node, attr, None)
+        if child is not None and _contains_node_type_local(child, cls):
+            return True
+
+    for attr in ("args", "variables", "options"):
+        vals = getattr(node, attr, None)
+        if vals is None:
+            continue
+        for v in vals:
+            if isinstance(v, (list, tuple)):
+                for vv in v:
+                    if _contains_node_type_local(vv, cls):
+                        return True
+            else:
+                if _contains_node_type_local(v, cls):
+                    return True
+    return False
+
+
+def _mark_weak(node, root_id=None):
+    if root_id is None:
+        root_id = getattr(node, "op_id", id(node))
+    setattr(node, "_is_weak_expr", True)
+    setattr(node, "_weak_root_id", root_id)
+    return node
+
+
+def _propagate_weak(node, *children):
+    # 1) If any child is already marked weak, propagate the same weak root id.
+    weak_children = [c for c in children if getattr(c, "_is_weak_expr", False)]
+    if weak_children:
+        root_id = getattr(weak_children[0], "_weak_root_id", None)
+        return _mark_weak(node, root_id=root_id)
+
+    # 2) Otherwise seed the weak marker if this newly built node now contains
+    #    TestFunction / TrialFunction / StateField anywhere underneath.
+    if _looks_like_weak_expression(node):
+        return _mark_weak(node)
+
+    return node
+
+
+def _looks_like_weak_expression(node) -> bool:
+    return _contains_node_type_local(node, TestFunction) or _contains_node_type_local(node, TrialFunction) or _contains_node_type_local(node, StateField)
 
 
 class Placeholder:
@@ -182,16 +234,15 @@ class Placeholder:
             shape = tuple(shape[0])
         return FunctionCall(lambda x, s=shape: x.reshape(s), [self], name="reshape")
 
-    def assemble(self, domain, target="vpinn", **kwargs):
-        """
-        Unified variational assembly entry point.
+    def assemble(self, domain=None, target=None, **kwargs):
+        """Unified assembly entry point.
 
-        target="vpinn"      -> assemble weak residual / VPINN quantity
-        target="fem_system" -> assemble FEM matrices (A, b)
-
-        Additional kwargs can carry backend-specific options, e.g. model=u_net.
+        If domain is omitted, try to infer it from Variables/TestFunction/etc.
+        target=None lets weak_form.py infer the steady solver route in Phase 1.
         """
-        return domain.assemble_weak_form(self, target=target, **kwargs)
+        from .utils.solver.weak_form import assemble_weak_form
+
+        return assemble_weak_form(domain, self, target=target, **kwargs)
 
     def print(self, what: Union[str, Callable[[jnp.ndarray], Any]] = "shape", label: Optional[str] = None):
         """Emit runtime debug info for this placeholder and pass it through.
@@ -408,6 +459,9 @@ class FunctionCall(Placeholder):
         self._name = name
         self.reduces_axis = reduces_axis
         self.kwargs = kwargs
+        weak_children = [a for a in self.args if isinstance(a, Placeholder)]
+        if not self.reduces_axis:
+            _propagate_weak(self, *weak_children)
 
     def __repr__(self):
         name = self._name or getattr(self.fn, "__name__", str(self.fn))
@@ -825,6 +879,7 @@ class BinaryOp(Placeholder):
         self.op = op
         self.left = left
         self.right = right
+        _propagate_weak(self, left, right)
 
     def __repr__(self):
         return f"({self.left} {self.op} {self.right})"
@@ -1547,9 +1602,11 @@ class OperationDef(Placeholder):
                 for arg in node.args:
                     visit(arg)
             elif isinstance(node, GroupedAssembly):
-                if node.volume_expr is not None:
-                    visit(node.volume_expr)
-                for bnd_expr in node.boundary_exprs.values():
+                if node.volume_value_expr is not None:
+                    visit(node.volume_value_expr)
+                if node.volume_grad_expr is not None:
+                    visit(node.volume_grad_expr)
+                for bnd_expr in node.boundary_value_exprs.values():
                     visit(bnd_expr)
             elif isinstance(node, Assembly):
                 visit(node.expr)
@@ -1574,9 +1631,10 @@ class OperationDef(Placeholder):
             elif isinstance(node, Assembly):
                 return visit(node.expr)
             elif isinstance(node, GroupedAssembly):
-                vol_has = visit(node.volume_expr) if node.volume_expr is not None else False
-                bnd_has = any(visit(expr) for expr in node.boundary_exprs.values())
-                return vol_has or bnd_has
+                val_has = visit(node.volume_value_expr) if node.volume_value_expr is not None else False
+                grad_has = visit(node.volume_grad_expr) if node.volume_grad_expr is not None else False
+                bnd_has = any(visit(expr) for expr in node.boundary_value_exprs.values())
+                return val_has or grad_has or bnd_has
             return False
 
         return visit(expr)
@@ -1638,6 +1696,8 @@ class Hessian(Placeholder):
         self.variables = variables if isinstance(variables, list) else [variables]
         self.scheme = scheme
         self.trace = trace  # True → Laplacian (sum of diagonal)
+        weak_vars = [v for v in self.variables if isinstance(v, Placeholder)]
+        _propagate_weak(self, target, *weak_vars)
 
     def __repr__(self):
         var_names = ", ".join(str(v) for v in self.variables)
@@ -1662,6 +1722,8 @@ class Jacobian(Placeholder):
         self.target = target
         self.variables = variables if isinstance(variables, list) else [variables]
         self.scheme = scheme
+        weak_vars = [v for v in self.variables if isinstance(v, Placeholder)]
+        _propagate_weak(self, target, *weak_vars)
 
     def __repr__(self):
         var_names = ", ".join(str(v) for v in self.variables)
@@ -1730,6 +1792,23 @@ class FemResidualOperator:
 
     def __repr__(self):
         return f"FemResidualOperator(size={self.size}, has_jacobian={self.jacobian is not None})"
+
+
+class StateField(Placeholder):
+    """Internal marker for the primary weak-form unknown.
+
+    This wraps the original NN-valued expression so the same weak graph can be
+    lowered either to VPINN (bind back to expr) or FEM (replace by TrialFunction).
+    """
+
+    def __init__(self, expr: Placeholder, *, state_id: int = 0, name: str = "u", value_shape: tuple = ()):
+        self.expr = expr
+        self.state_id = int(state_id)
+        self.name = name
+        self.value_shape = tuple(value_shape)
+
+    def __repr__(self):
+        return f"StateField(name={self.name!r}, id={self.state_id}, shape={self.value_shape})"
 
 
 class TrialFunction(Placeholder):
@@ -1829,15 +1908,18 @@ class Assembly(Placeholder):
 
 class GroupedAssembly(Placeholder):
     """
-    Internal node for a grouped variational assembly:
-      - optional volume expression
-      - optional boundary expressions by region
-    Evaluated in one pass by the trace evaluator.
+    Internal node for grouped FEAX-style variational assembly.
+
+    Separate channels:
+      - volume_value_expr   : terms multiplied by TestFunction(phi)
+      - volume_grad_expr    : terms multiplied by grad(TestFunction(phi))
+      - boundary_value_exprs: boundary terms multiplied by TestFunction(phi)
     """
 
-    def __init__(self, volume_expr, boundary_exprs, domain_or_nodes):
-        self.volume_expr = volume_expr  # Placeholder | None
-        self.boundary_exprs = boundary_exprs or {}  # dict[str, Placeholder]
+    def __init__(self, volume_value_expr, volume_grad_expr, boundary_value_exprs, domain_or_nodes):
+        self.volume_value_expr = volume_value_expr  # Placeholder | None
+        self.volume_grad_expr = volume_grad_expr  # Placeholder | None
+        self.boundary_value_exprs = boundary_value_exprs or {}  # dict[str, Placeholder]
         if hasattr(domain_or_nodes, "context"):
             self.num_total_nodes = int(domain_or_nodes.context["num_total_nodes"])
         else:
@@ -1845,8 +1927,8 @@ class GroupedAssembly(Placeholder):
         self.op_id = _next_op_id()
 
     def __repr__(self):
-        bkeys = list(self.boundary_exprs.keys())
-        return f"GroupedAssembly(volume={'yes' if self.volume_expr is not None else 'no'}, " f"boundaries={bkeys}, nodes={self.num_total_nodes})"
+        bkeys = list(self.boundary_value_exprs.keys())
+        return f"GroupedAssembly(value={'yes' if self.volume_value_expr is not None else 'no'}, " f"grad={'yes' if self.volume_grad_expr is not None else 'no'}, " f"boundaries={bkeys}, nodes={self.num_total_nodes})"
 
 
 # =============================================================================
@@ -1927,8 +2009,9 @@ def cse(expr: Placeholder) -> Placeholder:
         if isinstance(node, GroupedAssembly):
             return (
                 "GroupedAssembly",
-                id(node.volume_expr) if node.volume_expr is not None else None,
-                tuple((k, id(v)) for k, v in sorted(node.boundary_exprs.items())),
+                id(node.volume_value_expr) if node.volume_value_expr is not None else None,
+                id(node.volume_grad_expr) if node.volume_grad_expr is not None else None,
+                tuple((k, id(v)) for k, v in sorted(node.boundary_value_exprs.items())),
                 node.num_total_nodes,
             )
 
@@ -1997,11 +2080,12 @@ def cse(expr: Placeholder) -> Placeholder:
                     region_id=node.region_id,
                 )
         elif isinstance(node, GroupedAssembly):
-            new_volume = _visit(node.volume_expr) if node.volume_expr is not None else None
+            new_volume_value = _visit(node.volume_value_expr) if node.volume_value_expr is not None else None
+            new_volume_grad = _visit(node.volume_grad_expr) if node.volume_grad_expr is not None else None
             new_boundary = {}
-            changed = new_volume is not node.volume_expr
+            changed = new_volume_value is not node.volume_value_expr or new_volume_grad is not node.volume_grad_expr
 
-            for region_id, bnd_expr in node.boundary_exprs.items():
+            for region_id, bnd_expr in node.boundary_value_exprs.items():
                 new_expr = _visit(bnd_expr)
                 new_boundary[region_id] = new_expr
                 if new_expr is not bnd_expr:
@@ -2009,7 +2093,8 @@ def cse(expr: Placeholder) -> Placeholder:
 
             if changed:
                 node = GroupedAssembly(
-                    new_volume,
+                    new_volume_value,
+                    new_volume_grad,
                     new_boundary,
                     node.num_total_nodes,
                 )
@@ -2074,9 +2159,11 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
         elif isinstance(node, Assembly):
             visit(node.expr)
         elif isinstance(node, GroupedAssembly):
-            if node.volume_expr is not None:
-                visit(node.volume_expr)
-            for bnd_expr in node.boundary_exprs.values():
+            if node.volume_value_expr is not None:
+                visit(node.volume_value_expr)
+            if node.volume_grad_expr is not None:
+                visit(node.volume_grad_expr)
+            for bnd_expr in node.boundary_value_exprs.values():
                 visit(bnd_expr)
 
     visit(expr)
@@ -2129,9 +2216,11 @@ def collect_tags(expr: Placeholder) -> set:
         elif isinstance(node, Assembly):
             visit(node.expr)
         elif isinstance(node, GroupedAssembly):
-            if node.volume_expr is not None:
-                visit(node.volume_expr)
-            for bnd_expr in node.boundary_exprs.values():
+            if node.volume_value_expr is not None:
+                visit(node.volume_value_expr)
+            if node.volume_grad_expr is not None:
+                visit(node.volume_grad_expr)
+            for bnd_expr in node.boundary_value_exprs.values():
                 visit(bnd_expr)
 
     visit(expr)
@@ -2261,11 +2350,14 @@ def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
             _visit(node.expr, depth + 1)
         elif isinstance(node, GroupedAssembly):
             lines.append(f"{p}GroupedAssembly(nodes={node.num_total_nodes})")
-            if node.volume_expr is not None:
-                lines.append(f"{p}  volume:")
-                _visit(node.volume_expr, depth + 2)
-            for region_id, bnd_expr in node.boundary_exprs.items():
-                lines.append(f"{p}  boundary[{region_id}]:")
+            if node.volume_value_expr is not None:
+                lines.append(f"{p}  volume_value:")
+                _visit(node.volume_value_expr, depth + 2)
+            if node.volume_grad_expr is not None:
+                lines.append(f"{p}  volume_grad:")
+                _visit(node.volume_grad_expr, depth + 2)
+            for region_id, bnd_expr in node.boundary_value_exprs.items():
+                lines.append(f"{p}  boundary_value[{region_id}]:")
                 _visit(bnd_expr, depth + 2)
         elif isinstance(node, ConstantNamespace):
             lines.append(f"{p}ConstantNamespace({node._full_tag})")

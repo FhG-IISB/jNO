@@ -25,7 +25,7 @@ T_end = 1.0
 N_t = 4
 
 domain = jno.domain(
-    constructor=jno.domain.rect(mesh_size=0.2),
+    constructor=jno.domain.rect(mesh_size=0.05),
     time=(0, T_end, N_t),
     compute_mesh_connectivity=False,
 )
@@ -39,12 +39,12 @@ net = jno.nn.wrap(foundax.deeponet(
     n_sensors=1,
     coord_dim=2,
     n_outputs=1,
-    n_layers=4,
+    n_layers=6,
     basis_functions=64,
-    hidden_dim=48,
+    hidden_dim=64,
     key=jax.random.PRNGKey(21),
 ))
-net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(10, 1, 1e-3, 1e-5))
+net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(20, 1, 1e-3, 1e-5))
 
 xy = jno.np.concat([x, y])
 xy0 = jno.np.concat([x0, y0])
@@ -55,7 +55,7 @@ pde = jno.np.grad(u, t) - nu * jno.np.laplacian(u, [x, y]) + lam * u - source
 ini = u0 - jno.np.sin(pi * x0) * jno.np.sin(pi * y0)
 
 crux = jno.core([pde.mse, ini.mse], domain)
-history = crux.solve(5000)
+history = crux.solve(8000)
 
 _u, _u_exact = crux.eval([u, u_exact])
 rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_exact) + 1e-8))
