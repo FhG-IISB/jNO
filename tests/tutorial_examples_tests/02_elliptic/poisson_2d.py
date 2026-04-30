@@ -17,10 +17,11 @@ import jno
 
 import foundax
 import optax
+from pathlib import Path
 
 π = jno.np.pi
 # ── Domain ────────────────────────────────────────────────────────────────────
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05))
+domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.1))
 x, y, _ = domain.variable("interior")
 
 domain.summary()
@@ -31,10 +32,9 @@ layer_dims = [2, 10, 10, 1]
 req_params = {"D": 5, "flavor": "exact"}
 
 
-def make_solver(scheme: str, label: str, epochs: int = 5000) -> float:
-    net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=64, num_layers=4, key=jax.random.PRNGKey(0)))
-    net.optimizer(optax.adam(1))
-    net.lr(jno.schedule.learning_rate.exponential(1e-3, 0.5, epochs, 1e-5))
+def make_solver(scheme: str, label: str, epochs: int = 40000) -> float:
+    net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=96, num_layers=5, activation=jax.nn.tanh, key=jax.random.PRNGKey(0)))
+    net.optimizer(optax.adam(optax.exponential_decay(init_value=1e-3, transition_steps=epochs // 10, decay_rate=0.5, end_value=1e-5)))
 
     u = net(jno.np.concat([x, y], axis=-1)) * x * (1 - x) * y * (1 - y)
     pde = -u.laplacian(x, y, scheme=scheme) - forcing
@@ -53,6 +53,11 @@ def make_solver(scheme: str, label: str, epochs: int = 5000) -> float:
 
 rel_l2_ad = make_solver("automatic_differentiation", "ad")
 rel_l2_fd = make_solver("finite_difference", "fd")
+
+# Write result to tracking file
+results_file = Path(__file__).parent.parent.parent / "tutorial_results.txt"
+with open(results_file, "a") as f:
+    f.write(f"02_elliptic/poisson_2d.py | epochs=40000 | AD_rel_L2={rel_l2_ad:.6e} | FD_rel_L2={rel_l2_fd:.6e}\n")
 
 assert rel_l2_ad < 1e-1, f"AD relative L2 error too large: {rel_l2_ad:.3e}"
 assert rel_l2_fd < 1e-1, f"FD relative L2 error too large: {rel_l2_fd:.3e}"

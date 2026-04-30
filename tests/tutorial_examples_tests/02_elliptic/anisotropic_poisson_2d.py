@@ -13,40 +13,39 @@ which gives
 
     f(x, y) = (a + b) pi^2 sin(pi x) sin(pi y)
 """
-import os
+
 import jax
 import jno
 import foundax
 import optax
-
-TEST_MODE = os.getenv("JNO_TUTORIAL_TEST_MODE", "").lower() in {"1", "true", "yes"}
-
-def pick(full, test):
-    return test if TEST_MODE else full
+from pathlib import Path
 
 pi = jno.np.pi
 a = 1.0
 b = 3.0
 
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=pick(0.05, 0.3)))
+domain = jno.domain.rect(mesh_size=0.1)
 x, y, _ = domain.variable("interior")
 
 u_exact = jno.np.sin(pi * x) * jno.np.sin(pi * y)
 forcing = (a + b) * pi**2 * u_exact
 
-net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=pick(32, 16), num_layers=pick(4, 2), key=jax.random.PRNGKey(12)))
-net.optimizer(optax.adam(1), lr=jno.schedule.learning_rate.exponential(1e-3, 0.5, 1000, 1e-5))
+net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=64, num_layers=5, activation=jax.nn.tanh, key=jax.random.PRNGKey(12)))
+net.optimizer(optax.adam(optax.exponential_decay(init_value=1e-3, transition_steps=80, decay_rate=0.5, end_value=1e-5)))
 
 u = net(x, y) * x * (1 - x) * y * (1 - y)
 pde = -(a * u.d2(x) + b * u.d2(y)) - forcing
 
 crux = jno.core([pde.mse], domain)
-history = crux.solve(pick(10_000, 1000))
+history = crux.solve(40_000)
 
 _u, _u_exact = crux.eval([u, u_exact])
 
 rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_exact) + 1e-8))
-if TEST_MODE:
-    assert jax.numpy.isfinite(rel_l2), f"non-finite relative L2 error: {rel_l2}"
-else:
-    assert rel_l2 < 1e-1, f"relative L2 error too large: {rel_l2:.3e}"
+
+# Write result to tracking file
+results_file = Path(__file__).parent.parent.parent / "tutorial_results.txt"
+with open(results_file, "a") as f:
+    f.write(f"02_elliptic/anisotropic_poisson_2d.py | epochs=40000 | rel_L2={rel_l2:.6e}\n")
+
+assert rel_l2 < 1e-1, f"relative L2 error too large: {rel_l2:.3e}"

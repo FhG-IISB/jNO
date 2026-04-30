@@ -29,6 +29,15 @@ SCRIPTS = _discover_scripts()
 SCRIPT_IDS = [str(p.relative_to(REPO_ROOT)) for p in SCRIPTS]
 
 
+@pytest.fixture(scope="session", autouse=True)
+def clear_tutorial_results():
+    """Clear the tutorial results file before running tests."""
+    results_file = REPO_ROOT / "tests" / "tutorial_results.txt"
+    if results_file.exists():
+        results_file.unlink()
+    yield
+
+
 @pytest.mark.slow
 @pytest.mark.integration
 @pytest.mark.parametrize("script_path", SCRIPTS, ids=SCRIPT_IDS)

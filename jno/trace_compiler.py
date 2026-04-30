@@ -503,6 +503,32 @@ class TraceCompiler:
         return merged
 
     @staticmethod
+    def _count_checkpoint_arrays(weight_path: str):
+        """Count arrays and total params in an .eqx file by scanning npy headers."""
+        import numpy as np
+
+        path = Path(weight_path)
+        if path.suffix == "":
+            path = path.with_suffix(".eqx")
+        if not path.exists():
+            return None, None
+        n_arrays = 0
+        total_params = 0
+        with open(path, "rb") as f:
+            while True:
+                try:
+                    major, minor = np.lib.format.read_magic(f)
+                    reader = np.lib.format.read_array_header_1_0 if major == 1 else np.lib.format.read_array_header_2_0
+                    shape, _fortran, dtype = reader(f)
+                    n_elems = int(np.prod(shape)) if len(shape) > 0 else 1
+                    f.seek(n_elems * dtype.itemsize, 1)
+                    n_arrays += 1
+                    total_params += n_elems
+                except Exception:
+                    break
+        return n_arrays, total_params
+
+    @staticmethod
     def _load_eqx_weights_partial(weight_path: str, model, logger):
         """Load an Equinox checkpoint, skipping leaves with incompatible shapes.
 
@@ -546,6 +572,18 @@ class TraceCompiler:
         total = stats["matched"] + stats["skipped"]
         pct = 100 * stats["matched"] / total if total else 0.0
         logger.info(f"Equinox checkpoint: {stats['matched']:,}/{total:,} params matched " f"({pct:.4f}%), {stats['skipped']:,} kept fresh init " f"({stats['skipped_leaves']} mismatched leaves)")
+
+        # Report unused arrays in the checkpoint file.
+        file_arrays, file_params = TraceCompiler._count_checkpoint_arrays(weight_path)
+        if file_arrays is not None:
+            used_leaves = stats["matched_leaves"] + stats["skipped_leaves"]
+            unused_arrays = file_arrays - used_leaves
+            unused_params = file_params - total
+            if unused_arrays > 0:
+                logger.warning(f"Checkpoint file contains {file_arrays} arrays " f"({file_params:,} params) but model only consumed " f"{used_leaves} arrays — {unused_arrays} arrays " f"({unused_params:,} params) unused")
+            else:
+                logger.info(f"Checkpoint file: {file_arrays} arrays " f"({file_params:,} params total), all consumed by model")
+
         return loaded_model
 
     @staticmethod

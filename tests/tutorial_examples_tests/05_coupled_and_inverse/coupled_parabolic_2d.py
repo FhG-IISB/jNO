@@ -18,7 +18,7 @@ import jno
 
 import foundax
 import optax
-from jno import LearningRateSchedule as lrs
+from pathlib import Path
 
 pi = jno.np.pi
 T_end = 1.0
@@ -35,26 +35,30 @@ v_exact = jno.np.exp(-t) * jno.np.sin(2 * pi * x) * jno.np.sin(pi * y)
 f = (2 * pi**2 - 1) * u_exact + v_exact
 g = (5 * pi**2 - 1) * v_exact + u_exact
 
-u_net = jno.nn.wrap(foundax.deeponet(
-    n_sensors=1,
-    coord_dim=2,
-    n_outputs=1,
-    n_layers=6,
-    basis_functions=64,
-    hidden_dim=64,
-    key=jax.random.PRNGKey(24),
-))
-v_net = jno.nn.wrap(foundax.deeponet(
-    n_sensors=1,
-    coord_dim=2,
-    n_outputs=1,
-    n_layers=6,
-    basis_functions=64,
-    hidden_dim=64,
-    key=jax.random.PRNGKey(25),
-))
+u_net = jno.nn.wrap(
+    foundax.deeponet(
+        n_sensors=1,
+        coord_dim=2,
+        n_outputs=1,
+        n_layers=5,
+        basis_functions=96,
+        hidden_dim=64,
+        key=jax.random.PRNGKey(24),
+    )
+)
+v_net = jno.nn.wrap(
+    foundax.deeponet(
+        n_sensors=1,
+        coord_dim=2,
+        n_outputs=1,
+        n_layers=5,
+        basis_functions=96,
+        hidden_dim=64,
+        key=jax.random.PRNGKey(25),
+    )
+)
 for net in [u_net, v_net]:
-    net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(10, 1, 1e-3, 1e-5))
+    net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(init_value=0, peak_value=1e-3, warmup_steps=40, decay_steps=40000 - 40, end_value=1e-5)))
 
 xy = jno.np.concat([x, y])
 xy0 = jno.np.concat([x0, y0])
@@ -69,10 +73,16 @@ ini_u = u0 - jno.np.sin(pi * x0) * jno.np.sin(pi * y0)
 ini_v = v0 - jno.np.sin(2 * pi * x0) * jno.np.sin(pi * y0)
 
 crux = jno.core([pde_u.mse, pde_v.mse, ini_u.mse, ini_v.mse], domain)
-history = crux.solve(12_000)
+history = crux.solve(40_000)
 
 _u, _u_exact, _v, _v_exact = crux.eval([u, u_exact, v, v_exact])
 rel_l2_u = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_exact) + 1e-8))
 rel_l2_v = float(jax.numpy.linalg.norm(_v - _v_exact) / (jax.numpy.linalg.norm(_v_exact) + 1e-8))
+
+# Write result to tracking file
+results_file = Path(__file__).parent.parent.parent / "tutorial_results.txt"
+with open(results_file, "a") as f:
+    f.write(f"05_coupled_and_inverse/coupled_parabolic_2d.py | epochs=40000 | rel_L2_u={rel_l2_u:.6e} | rel_L2_v={rel_l2_v:.6e}\n")
+
 assert rel_l2_u < 1e-1, f"u relative L2 error too large: {rel_l2_u:.3e}"
 assert rel_l2_v < 1e-1, f"v relative L2 error too large: {rel_l2_v:.3e}"

@@ -24,7 +24,7 @@ import jax
 import jno
 
 import optax
-from jno import LearningRateSchedule as lrs
+from pathlib import Path
 
 π = jno.np.pi
 # ── Ground-truth and "measured" data ─────────────────────────────────────────
@@ -54,16 +54,22 @@ residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) + c * x * (1 - x) - t
 
 # ── Optimizers ────────────────────────────────────────────────────────────────
 for net in [a_net, b_net, c_net]:
-    net.optimizer(optax.adam, lr=lrs.exponential(1e-2, 0.9, 25, 1e-5))
+    net.optimizer(optax.adam(optax.exponential_decay(init_value=1e-2, transition_steps=100, decay_rate=0.9, end_value=1e-5)))
 
 # ── Solve ─────────────────────────────────────────────────────────────────────
 crux = jno.core([residual.mse], domain)
-history = crux.solve(10000)
+history = crux.solve(40000)
 
 _a, _b, _c = crux.eval([a, b, c])
 rel_l2_a = float(jax.numpy.linalg.norm(_a - A_true) / (jax.numpy.linalg.norm(A_true) + 1e-8))
 rel_l2_b = float(jax.numpy.linalg.norm(_b - B_true) / (jax.numpy.linalg.norm(B_true) + 1e-8))
 rel_l2_c = float(jax.numpy.linalg.norm(_c - C_true) / (jax.numpy.linalg.norm(C_true) + 1e-8))
-assert rel_l2_a < 5e-1, f"a relative L2 error too large: {rel_l2_a:.3e}"
-assert rel_l2_b < 5e-1, f"b relative L2 error too large: {rel_l2_b:.3e}"
-assert rel_l2_c < 5e-1, f"c relative L2 error too large: {rel_l2_c:.3e}"
+
+# Write result to tracking file
+results_file = Path(__file__).parent.parent.parent / "tutorial_results.txt"
+with open(results_file, "a") as f:
+    f.write(f"05_coupled_and_inverse/inverse_parameter.py | epochs=40000 | rel_L2_a={rel_l2_a:.6e} | rel_L2_b={rel_l2_b:.6e} | rel_L2_c={rel_l2_c:.6e}\n")
+
+assert rel_l2_a < 1e-1, f"a relative L2 error too large: {rel_l2_a:.3e}"
+assert rel_l2_b < 1e-1, f"b relative L2 error too large: {rel_l2_b:.3e}"
+assert rel_l2_c < 1e-1, f"c relative L2 error too large: {rel_l2_c:.3e}"

@@ -16,16 +16,16 @@ classifiers = [
 ]
 
 dependencies = [
-    "jax",
-    "equinox",
-    "optax",
-    "orbax-checkpoint",
-    "foundax>=0.1.4",
+    "jax>=0.4.30",
+    "equinox>=0.11.0",
+    "optax>=0.2.0",
+    "orbax-checkpoint>=0.6.0",
+    "foundax>=0.1.5",
 
-    "pygmsh",
-    "cloudpickle",
-    "einops",
-    "matplotlib",
+    "pygmsh>=7.0.0",
+    "cloudpickle>=3.0.0",
+    "einops>=0.7.0",
+    "matplotlib>=3.8.0",
 ]
 
 [project.urls]

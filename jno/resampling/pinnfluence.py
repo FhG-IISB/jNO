@@ -81,21 +81,6 @@ class PINNFluence(ResamplingStrategy):
         # as a proxy for influence (points in high-error, high-variance regions
         # are more influential)
 
-        # Compute local variance estimate using nearest neighbor distances
-        def compute_local_variance(pts, res):
-            # For each point, estimate local variance from nearby residuals
-            # Using a simple distance-weighted scheme
-            n = len(pts)
-            local_var = jnp.zeros(n)
-
-            for i in range(min(n, 100)):  # Sample subset for efficiency
-                dists = jnp.sum((pts - pts[i : i + 1]) ** 2, axis=1)
-                weights = jnp.exp(-dists / jnp.mean(dists + 1e-8))
-                weighted_res = res * weights
-                local_var = local_var.at[i].set(jnp.std(weighted_res))
-
-            return local_var
-
         # Simplified scoring: residual magnitude + small penalty for uniformity
         scores = residuals + 0.1 * jnp.std(residuals)
 
@@ -122,38 +107,26 @@ class PINNFluence(ResamplingStrategy):
             else:
                 eval_candidates = candidates
 
-            # Score candidates based on distance to high-residual current points
-            high_res_points = points[jnp.argsort(residuals)[-min(50, n_points) :]]
+            # Score candidates based on distance to high-residual current points (vectorized).
+            n_top = min(50, n_points)
+            high_res_points = points[jnp.argsort(residuals)[-n_top:]]  # (n_top, D)
 
-            # Compute minimum distance to high-residual region
-            candidate_scores = jnp.zeros(len(eval_candidates))
-            for i in range(len(eval_candidates)):
-                dists = jnp.sum((high_res_points - eval_candidates[i : i + 1]) ** 2, axis=1)
-                # Higher score for points near high-residual regions
-                candidate_scores = candidate_scores.at[i].set(1.0 / (jnp.min(dists) + 1e-4))
+            # Pairwise squared distances (n_eval, n_top); take min over anchors -> (n_eval,).
+            diffs = eval_candidates[:, None, :] - high_res_points[None, :, :]
+            sq_dists = jnp.sum(diffs * diffs, axis=-1)
+            candidate_scores = 1.0 / (jnp.min(sq_dists, axis=-1) + 1e-4)
 
             # Compute sampling weights
             weights = jnp.power(candidate_scores + 1e-12, self.alpha) + self.c
             weights = jnp.clip(weights, 0, None)
             total = jnp.sum(weights)
 
-            if total > 0:
-                probs = weights / total
-                probs = jnp.clip(probs, 0, None)
-                probs = probs / jnp.sum(probs)  # Re-normalize
+            # Numerically safe normalization; fall back to uniform when weights collapse.
+            safe_probs = jnp.where(total > 0, weights / jnp.maximum(total, 1e-20), jnp.ones_like(weights) / weights.shape[0])
+            safe_probs = safe_probs / jnp.sum(safe_probs)
 
-                try:
-                    # Sample with probabilities
-                    new_indices = jax.random.choice(key2, len(eval_candidates), shape=(n_new,), replace=True, p=probs)
-                    new_points = eval_candidates[new_indices]
-                except:
-                    # Fallback to uniform
-                    new_indices = jax.random.choice(key2, len(eval_candidates), shape=(n_new,), replace=True)
-                    new_points = eval_candidates[new_indices]
-            else:
-                # Fallback to uniform
-                new_indices = jax.random.choice(key2, len(eval_candidates), shape=(n_new,), replace=True)
-                new_points = eval_candidates[new_indices]
+            new_indices = jax.random.choice(key2, eval_candidates.shape[0], shape=(n_new,), replace=True, p=safe_probs)
+            new_points = eval_candidates[new_indices]
 
             result = jnp.concatenate([kept_points, new_points], axis=0)
         else:
