@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Callable, Any, Union, cast
 
 import cloudpickle
@@ -442,17 +443,25 @@ class domain(MeshIOMixin):
         # Meshio mesh
         self.mesh = None
 
-        # Generate or load mesh
+        # Generate or load mesh / npz point cloud tags
         if isinstance(constructor, str):
-            self._load_mesh(constructor)
-            self.log.info(f"Loaded mesh from the constructor function")  # type: ignore[attr-defined]
+            suffix = Path(constructor).suffix.lower()
+            if suffix == ".npz":
+                self._load_npz_tags(constructor)
+                self.log.info(f"Loaded NPZ coordinate tags from {constructor}")
+            else:
+                self._load_mesh(constructor)
+                self.log.info(f"Loaded mesh from {constructor}")  # type: ignore[attr-defined]
         elif callable(constructor):
             self._generate_mesh(constructor, algorithm)
             self.log.info(f"Loaded mesh from {constructor}")  # type: ignore[attr-defined]
         else:
-            raise ValueError("Must provide either geometry_func or mesh_file")
+            raise ValueError("Must provide either geometry_func, mesh file, or NPZ tag file")
 
-        boundary_indices = self._extract_points_from_mesh(self.mesh)
+        if self.mesh is not None:
+            boundary_indices = self._extract_points_from_mesh(self.mesh)
+        else:
+            boundary_indices = np.asarray([], dtype=np.int64)
 
         # Preprocess mesh for finite differences
         if self.mesh is not None and self.compute_mesh_connectivity:
@@ -482,6 +491,51 @@ class domain(MeshIOMixin):
             for tag, pts in self._mesh_pool.items():
                 if pts.shape[-1] > self.dimension:
                     self._mesh_pool[tag] = pts[..., : self.dimension]
+
+    def _load_npz_tags(self, npz_file: str):
+        """Load per-tag coordinate arrays from a .npz file.
+
+        Expected NPZ structure:
+        - Each key is a tag name (e.g. "Air", "WallS", ...)
+        - Each value is a numeric array of shape (N, D), with D >= 1
+        """
+        npz_path = Path(npz_file)
+        if not npz_path.exists():
+            raise FileNotFoundError(f"NPZ file not found: {npz_file}")
+
+        loaded = np.load(npz_path, allow_pickle=False)
+        tags = list(loaded.files)
+        if not tags:
+            raise ValueError(f"No arrays found in NPZ file: {npz_file}")
+
+        self.mesh = None
+        self._mesh_pool = {}
+        self.avaiable_mesh_tags = []
+
+        inferred_dim: Optional[int] = None
+        for tag in tags:
+            arr = np.asarray(loaded[tag], dtype=np.float64)
+
+            if arr.ndim != 2:
+                raise ValueError(f"NPZ tag '{tag}' must have shape (N, D), got {arr.shape}")
+            if arr.shape[0] == 0:
+                # Keep empty tags to preserve user intent.
+                if inferred_dim is None:
+                    inferred_dim = 2
+                arr = np.zeros((0, inferred_dim), dtype=np.float64)
+            elif arr.shape[1] < 1:
+                raise ValueError(f"NPZ tag '{tag}' must have at least one coordinate column, got {arr.shape}")
+
+            if inferred_dim is None and arr.shape[0] > 0:
+                inferred_dim = int(arr.shape[1])
+
+            self._mesh_pool[tag] = arr
+            self.context[tag] = arr[None, None, ...]
+            self.avaiable_mesh_tags.append(tag)
+
+        if inferred_dim is None:
+            inferred_dim = 2
+        self.dimension = inferred_dim
 
     def summary(self) -> "domain":
         """Log a human-readable summary of the domain configuration.

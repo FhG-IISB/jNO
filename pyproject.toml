@@ -20,12 +20,13 @@ dependencies = [
     "equinox>=0.11.0",
     "optax>=0.2.0",
     "orbax-checkpoint>=0.6.0",
-    "foundax>=0.1.5",
+    "foundax>=0.1.6",
 
     "pygmsh>=7.0.0",
     "cloudpickle>=3.0.0",
     "einops>=0.7.0",
     "matplotlib>=3.8.0",
+    "pylotte>=0.3"
 ]
 
 [project.urls]
@@ -35,22 +36,19 @@ Source = "https://github.com/FhG-IISB/jno"
 Issues = "https://github.com/FhG-IISB/jno/issues"
 
 [project.optional-dependencies]
-cuda = [
-    "jax[cuda12]"
-]
+cuda = ["jax[cuda]>=0.4.30"]
+
 fem = [
-    "feax",
+    "feax>=0.5.1",
     "diffrax",
     "optimistix",
     "lineax",
-    "pyfiglet",
-    "fenics-basix",
 ]
 dev = ["pytest>=7.0", 
         "black>=22.0", 
         "flake8>=4.0", 
         "mypy>=0.950", 
-        "feax",
+        "feax>=0.5.1",
         "diffrax",
         "optimistix",
         "lineax",

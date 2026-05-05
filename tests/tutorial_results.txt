@@ -1,10 +1,10 @@
-02_elliptic/anisotropic_poisson_2d.py | epochs=40000 | rel_L2=7.177307e-05
-02_elliptic/helmholtz_2d.py | epochs=40000 | rel_L2=1.350705e-03
-02_elliptic/mixed_boundary_poisson_2d.py | epochs=40000 | rel_L2=6.197488e-02
-02_elliptic/poisson_2d.py | epochs=40000 | AD_rel_L2=7.488774e-05 | FD_rel_L2=6.610945e-02
-02_elliptic/variable_coefficient_poisson_2d.py | epochs=40000 | rel_L2=7.915157e-04
-03_parabolic/heat_2d.py | epochs=40000 | rel_L2=5.093196e-03
-03_parabolic/reaction_diffusion_2d.py | epochs=40000 | rel_L2=9.834344e-05
-04_hyperbolic/convection_reaction_diffusion_2d.py | epochs=40000 | rel_L2=1.989165e-02
-05_coupled_and_inverse/coupled_parabolic_2d.py | epochs=40000 | rel_L2_u=4.893322e-02 | rel_L2_v=2.103142e-02
-05_coupled_and_inverse/inverse_parameter.py | epochs=40000 | rel_L2_a=1.623039e+00 | rel_L2_b=3.662954e-02 | rel_L2_c=8.038729e-01
+02_elliptic/anisotropic_poisson_2d.py | epochs=40000 | rel_L2=7.217289e-05
+02_elliptic/helmholtz_2d.py | epochs=40000 | rel_L2=7.449157e-05
+02_elliptic/mixed_boundary_poisson_2d.py | epochs=40000 | rel_L2=4.228351e-04
+02_elliptic/poisson_2d.py | epochs=40000 | AD_rel_L2=9.699490e-05 | FD_rel_L2=6.626529e-02
+02_elliptic/variable_coefficient_poisson_2d.py | epochs=40000 | rel_L2=5.349821e-05
+03_parabolic/heat_2d.py | epochs=40000 | rel_L2=6.470307e-05
+03_parabolic/reaction_diffusion_2d.py | epochs=40000 | rel_L2=3.014904e-04
+04_hyperbolic/convection_reaction_diffusion_2d.py | epochs=40000 | rel_L2=1.649477e-04
+05_coupled_and_inverse/coupled_parabolic_2d.py | epochs=40000 | rel_L2_u=5.032822e-03 | rel_L2_v=1.377824e-03
+05_coupled_and_inverse/inverse_parameter.py | epochs=30000 | rel_L2_a=4.555769e-07 | rel_L2_b=1.231683e-06 | rel_L2_c=1.816523e-07

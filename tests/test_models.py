@@ -9,39 +9,52 @@ import foundax
 import jno
 import jno.jnp_ops as jnn
 
-from jno.trace import Model, TunableModule
+from jno.trace import Model, TunableModule, ModelCall
 from jno.architectures.models import nn, parameter, set_default_rng_seed
+from jno.trace_compiler import TraceCompiler
 
 
 # ======================================================================
 # parameter() helper
 # ======================================================================
 class TestParameter:
-    def test_creates_flax_module(self):
+    def test_creates_model_call(self):
         key = jax.random.PRNGKey(0)
         p = parameter((3, 2), key=key)
-        assert isinstance(p, Model)
+        assert isinstance(p, ModelCall)
 
     def test_unique_ids(self):
         k1, k2 = jax.random.split(jax.random.PRNGKey(0))
         p1 = parameter((1,), key=k1)
         p2 = parameter((1,), key=k2)
-        assert p1.layer_id != p2.layer_id
+        assert p1.model.layer_id != p2.model.layer_id
 
     def test_parameter_shape(self):
         key = jax.random.PRNGKey(0)
         p = parameter((3, 2), key=key)
-        result = p.module()
+        result = p.model.module()
         assert result.shape == (3, 2)
 
     def test_parameter_uses_default_seed_when_key_omitted(self):
         set_default_rng_seed(123)
         try:
             p = parameter((2, 1))
-            result = p.module()
+            result = p.model.module()
             assert result.shape == (2, 1)
         finally:
             set_default_rng_seed(None)
+
+    def test_parameter_initialize_accepts_jax_initializer(self):
+        class _NoopLogger:
+            def info(self, *_args, **_kwargs):
+                return None
+
+            def warning(self, *_args, **_kwargs):
+                return None
+
+        p = parameter((2, 1), key=jax.random.PRNGKey(0)).initialize(jax.nn.initializers.ones)
+        initialized = TraceCompiler.build_single_layer_params(p.model, None, jax.random.PRNGKey(1), _NoopLogger())
+        assert jnp.allclose(initialized(), jnp.ones((2, 1), dtype=initialized().dtype))
 
 
 # ======================================================================

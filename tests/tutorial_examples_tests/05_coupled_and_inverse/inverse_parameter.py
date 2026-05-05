@@ -41,26 +41,27 @@ target = A_true * jno.np.sin(π * x) + B_true * jno.np.cos(π * x) + C_true * x 
 key = jax.random.PRNGKey(0)
 k1, k2, k3 = jax.random.split(key, 3)
 
-a_net = jno.np.parameter((1,), key=k1, name="a")
-b_net = jno.np.parameter((1,), key=k2, name="b")
-c_net = jno.np.parameter((1,), key=k3, name="c")
-
-a = a_net()
-b = b_net()
-c = c_net()
+a = jno.np.parameter((1,), key=k1, name="a")
+b = jno.np.parameter((1,), key=k2, name="b")
+c = jno.np.parameter((1,), key=k3, name="c")
 
 # ── Residual: parametric model − observations ─────────────────────────────────
-residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) + c * x * (1 - x) - target
+residual = (a * jno.np.sin(π * x) + b * jno.np.cos(π * x) + c * x * (1 - x)) - target
 
 # ── Optimizers ────────────────────────────────────────────────────────────────
-for net in [a_net, b_net, c_net]:
-    net.optimizer(optax.adam(optax.exponential_decay(init_value=1e-2, transition_steps=100, decay_rate=0.9, end_value=1e-5)))
+for net in [a, b, c]:
+    # Constant LR converges more reliably here: sin(pi*x) and x(1-x)
+    # are highly correlated on [0, 1], so aggressive early decay stalls.
+    net.optimizer(optax.adam(1e-2))
 
 # ── Solve ─────────────────────────────────────────────────────────────────────
 crux = jno.core([residual.mse], domain)
-history = crux.solve(40000)
+history = crux.solve(30000)
 
 _a, _b, _c = crux.eval([a, b, c])
+
+print(f"Recovered parameters: a={_a[0]:.3f}, b={_b[0]:.3f}, c={_c[0]:.3f}")
+
 rel_l2_a = float(jax.numpy.linalg.norm(_a - A_true) / (jax.numpy.linalg.norm(A_true) + 1e-8))
 rel_l2_b = float(jax.numpy.linalg.norm(_b - B_true) / (jax.numpy.linalg.norm(B_true) + 1e-8))
 rel_l2_c = float(jax.numpy.linalg.norm(_c - C_true) / (jax.numpy.linalg.norm(C_true) + 1e-8))
@@ -68,7 +69,7 @@ rel_l2_c = float(jax.numpy.linalg.norm(_c - C_true) / (jax.numpy.linalg.norm(C_t
 # Write result to tracking file
 results_file = Path(__file__).parent.parent.parent / "tutorial_results.txt"
 with open(results_file, "a") as f:
-    f.write(f"05_coupled_and_inverse/inverse_parameter.py | epochs=40000 | rel_L2_a={rel_l2_a:.6e} | rel_L2_b={rel_l2_b:.6e} | rel_L2_c={rel_l2_c:.6e}\n")
+    f.write(f"05_coupled_and_inverse/inverse_parameter.py | epochs=30000 | rel_L2_a={rel_l2_a:.6e} | rel_L2_b={rel_l2_b:.6e} | rel_L2_c={rel_l2_c:.6e}\n")
 
 assert rel_l2_a < 1e-1, f"a relative L2 error too large: {rel_l2_a:.3e}"
 assert rel_l2_b < 1e-1, f"b relative L2 error too large: {rel_l2_b:.3e}"

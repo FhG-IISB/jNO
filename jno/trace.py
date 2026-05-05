@@ -941,6 +941,8 @@ class Model(Placeholder):
         self._param_groups: list = []  # [{target, mask, opt_fn, lr}] for per-group optimizer config
         self._weight_tree = None  # pretrained weights as a pytree (alternative to weight_path file)
         self._initialize_mask = None  # optional bool pytree consumed by initialize() for partial preload
+        self._initializer_fn = None  # callable initializer used at compile time
+        self._initializer_key = None  # optional PRNG key for callable initializer
         self._tunable_opts: Dict[str, list] = {}  # per-model tunable options for sweeps
 
     # ── public API ───────────────────────────────────────────
@@ -991,6 +993,8 @@ class Model(Placeholder):
             f"weight_path:          {self.weight_path}",
             f"weight_tree_set:      {self._weight_tree is not None}",
             f"initialize_mask_set:  {self._initialize_mask is not None}",
+            f"initializer_fn_set:   {self._initializer_fn is not None}",
+            f"initializer_key_set:  {self._initializer_key is not None}",
             "",
             "Mask Diagnostics",
             "-" * 60,
@@ -1259,40 +1263,52 @@ class Model(Placeholder):
         self._param_groups.append(g)
         return g
 
-    def initialize(self, weights):
+    def initialize(self, weights, *, key=None):
         """Load pretrained weights into this model at init time.
 
-        Accepts either a **file path** or a **pytree of arrays** directly.
+                Accepted ``weights`` inputs:
 
-        * **File path** (``str`` / ``Path``) — existing behaviour:
+                - ``str`` / ``Path``: load from checkpoint path.
+                    Supports Equinox ``.eqx`` files and Orbax checkpoint directories
+                    (optionally ``"<path>::<model_key>"``).
+                - Pytree object: copy array leaves directly from the provided tree.
+                - Callable initializer: apply a JAX initializer function to every
+                    floating-point array leaf at compile time.
 
-          - *Equinox* modules: path written by
-            ``eqx.tree_serialise_leaves``.
-            Shape-mismatched arrays are re-initialised automatically.
+                Examples:
 
-        * **Pytree** (any non-string value, e.g. an ``eqx.Module`` instance
-          or a plain dict of arrays) — the tree is stored directly and
-          its array leaves replace those of the freshly-initialised model:
+                .. code-block:: python
 
-          .. code-block:: python
+                        net.initialize("./weights.eqx")
+                        net.initialize("./runs/ckpts/2000::1")
+                        net.initialize(other_model.module)
 
-              # Save a model's current params into another model
-              pretrained = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key)
-              new_model = jnn.nn.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key2)
-              new_model.initialize(pretrained.module)   # use pytree directly
+                        p = jno.np.parameter((1,), key=jax.random.PRNGKey(0))
+                        p.initialize(jax.nn.initializers.ones)
 
         Args:
-            weights: A file path (``str``) *or* a pytree whose leaves are
-                     the pretrained arrays.
+            weights: File path / pytree / callable initializer.
+            key: Optional PRNG key used when ``weights`` is callable.
 
         Returns:
             self (for chaining).
         """
         self._initialize_mask = None
+        self._initializer_fn = None
+        self._initializer_key = None
 
         if isinstance(weights, (str, Path)):
             self.weight_path = str(weights)
             self._weight_tree = None
+        elif isinstance(weights, eqx.Module):
+            self._weight_tree = weights
+            self.weight_path = None
+        elif callable(weights):
+            self._initializer_fn = weights
+            self.weight_path = None
+            self._weight_tree = None
+            if key is not None:
+                self._initializer_key = key
         else:
             self._weight_tree = weights
             self.weight_path = None
@@ -1383,6 +1399,7 @@ class Model(Placeholder):
         self._mask_scope_pending = False
         self._weight_tree = None
         self._initialize_mask = None
+        self._initializer_fn = None
         self._merge_lora_flag = False
         return self
 
@@ -1486,8 +1503,8 @@ class ModelCall(Placeholder):
         self.model.optimizer(opt_fn, lr=lr)
         return self
 
-    def initialize(self, weight_path: str):
-        self.model.initialize(weight_path)
+    def initialize(self, weights, *, key=None):
+        self.model.initialize(weights, key=key)
         return self
 
     def dtype(self, dtype):

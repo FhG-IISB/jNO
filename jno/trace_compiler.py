@@ -17,6 +17,9 @@ The hot-path **evaluation** code lives in :mod:`jno.trace_evaluator`
 
 from __future__ import annotations
 
+import math
+import os
+import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
 
@@ -420,6 +423,29 @@ class TraceCompiler:
         return model
 
     @staticmethod
+    def _apply_callable_initializer(model, initializer: Callable, *, key: jax.Array, logger):
+        """Apply a JAX initializer to every floating-point array leaf in *model*."""
+        leaves, treedef = jax.tree_util.tree_flatten(model)
+        out_leaves = []
+        local_key = key
+        n_init = 0
+
+        for leaf in leaves:
+            if eqx.is_inexact_array(leaf):
+                local_key, subkey = jax.random.split(local_key)
+                try:
+                    init_leaf = initializer(subkey, leaf.shape, leaf.dtype)
+                except TypeError:
+                    init_leaf = initializer(subkey, leaf.shape)
+                out_leaves.append(jnp.asarray(init_leaf, dtype=leaf.dtype))
+                n_init += 1
+            else:
+                out_leaves.append(leaf)
+
+        logger.info(f"Applied callable initializer to {n_init} floating-point parameter leaves")
+        return jax.tree_util.tree_unflatten(treedef, out_leaves)
+
+    @staticmethod
     def merge_pretrained_params(pretrained_params: dict, new_params: dict, logger) -> dict:
         """
         Merge pretrained weights with new params, replacing embedding/recovery layers
@@ -587,6 +613,205 @@ class TraceCompiler:
         return loaded_model
 
     @staticmethod
+    def _resolve_orbax_step_dir(weight_path: str) -> tuple[Path, str | None]:
+        """Resolve an Orbax checkpoint root or step dir, with optional model-key selector.
+
+        Supports paths of the form ``/path/to/checkpoints`` (latest step),
+        ``/path/to/checkpoints/1234`` (specific step), and
+        ``/path/to/checkpoints/1234::1`` (specific saved trainable model key).
+        """
+        raw_path = str(weight_path)
+        selected_key = None
+        if "::" in raw_path:
+            raw_path, selected_key = raw_path.rsplit("::", 1)
+            selected_key = selected_key.strip() or None
+
+        path = Path(raw_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Checkpoint path not found: {path}")
+
+        if path.is_dir() and (path / "_CHECKPOINT_METADATA").exists() and (path / "state").exists():
+            return path, selected_key
+
+        if not path.is_dir():
+            raise FileNotFoundError(f"Orbax checkpoint path must be a directory, got: {path}")
+
+        try:
+            import orbax.checkpoint as ocp
+        except ImportError as exc:
+            raise ImportError("orbax-checkpoint is required to load Orbax checkpoints. Install it with: pip install orbax-checkpoint") from exc
+
+        manager = ocp.CheckpointManager(
+            os.path.abspath(path),
+            options=ocp.CheckpointManagerOptions(read_only=True),
+        )
+        try:
+            step = manager.latest_step()
+        finally:
+            manager.close()
+
+        if step is None:
+            raise FileNotFoundError(f"No Orbax checkpoints found in {path}")
+
+        return path / str(step), selected_key
+
+    @staticmethod
+    def _discover_orbax_trainable_keys(step_dir: Path) -> list[str]:
+        metadata_path = step_dir / "state" / "_METADATA"
+        if not metadata_path.exists():
+            raise FileNotFoundError(f"Orbax state metadata not found: {metadata_path}")
+
+        metadata_text = metadata_path.read_text()
+        keys = sorted(set(re.findall(r"\('trainable', '([^']+)'", metadata_text)))
+        if not keys:
+            raise ValueError(f"No trainable model entries found in Orbax checkpoint: {step_dir}")
+        return keys
+
+    @staticmethod
+    def _normalize_keypath(keypath: tuple[Any, ...]) -> tuple[Any, ...]:
+        normalized: list[Any] = []
+        for key in keypath:
+            if hasattr(key, "idx"):
+                normalized.append(key.idx)
+            elif hasattr(key, "key"):
+                normalized.append(key.key)
+            elif hasattr(key, "name"):
+                normalized.append(key.name)
+            else:
+                normalized.append(str(key))
+        return tuple(normalized)
+
+    @staticmethod
+    def _count_shape_params(shape: tuple[int, ...]) -> int:
+        return int(math.prod(shape)) if len(shape) > 0 else 1
+
+    @staticmethod
+    def _build_orbax_restore_plan(checkpoint_tree, model):
+        checkpoint_by_path = {}
+        checkpoint_arrays = 0
+        checkpoint_params = 0
+        for keypath, meta in jax.tree_util.tree_leaves_with_path(checkpoint_tree):
+            normalized = TraceCompiler._normalize_keypath(keypath)
+            checkpoint_by_path[normalized] = meta
+            checkpoint_arrays += 1
+            checkpoint_params += TraceCompiler._count_shape_params(tuple(meta.shape))
+
+        stats = {
+            "matched": 0,
+            "skipped": 0,
+            "matched_leaves": 0,
+            "skipped_leaves": 0,
+            "checkpoint_arrays": checkpoint_arrays,
+            "checkpoint_params": checkpoint_params,
+            "considered_checkpoint_arrays": 0,
+            "considered_checkpoint_params": 0,
+        }
+        matching_paths: set[tuple[Any, ...]] = set()
+
+        filtered_model = eqx.filter(model, eqx.is_array)
+        for keypath, leaf in jax.tree_util.tree_leaves_with_path(filtered_model):
+            normalized = TraceCompiler._normalize_keypath(keypath)
+            meta = checkpoint_by_path.get(normalized)
+            if meta is None:
+                stats["skipped"] += int(leaf.size)
+                stats["skipped_leaves"] += 1
+                continue
+
+            stats["considered_checkpoint_arrays"] += 1
+            stats["considered_checkpoint_params"] += TraceCompiler._count_shape_params(tuple(meta.shape))
+
+            shape_ok = tuple(meta.shape) == tuple(leaf.shape)
+            dtype_ok = getattr(meta, "dtype", None) is None or meta.dtype == leaf.dtype
+            if shape_ok and dtype_ok:
+                stats["matched"] += int(leaf.size)
+                stats["matched_leaves"] += 1
+                matching_paths.add(normalized)
+            else:
+                stats["skipped"] += int(leaf.size)
+                stats["skipped_leaves"] += 1
+
+        stats["unused_arrays"] = stats["checkpoint_arrays"] - stats["considered_checkpoint_arrays"]
+        stats["unused_params"] = stats["checkpoint_params"] - stats["considered_checkpoint_params"]
+        return matching_paths, stats
+
+    @staticmethod
+    def _load_orbax_weights_partial(weight_path: str, model, logger):
+        """Load a model subtree from an Orbax training checkpoint.
+
+        Orbax checkpoints written by jNO store a full training state under the
+        ``state`` item. This loader restores only the ``trainable`` subtree for
+        the selected model key so that ``nn.initialize(...)`` can reuse those
+        weights without restoring optimizer state.
+        """
+        try:
+            import orbax.checkpoint as ocp
+        except ImportError as exc:
+            raise ImportError("orbax-checkpoint is required to load Orbax checkpoints. Install it with: pip install orbax-checkpoint") from exc
+
+        step_dir, selected_key = TraceCompiler._resolve_orbax_step_dir(weight_path)
+        available_keys = TraceCompiler._discover_orbax_trainable_keys(step_dir)
+
+        if selected_key is None:
+            if len(available_keys) != 1:
+                available_str = ", ".join(available_keys)
+                raise ValueError("Orbax checkpoint contains multiple trainable models " f"({available_str}). Pass '<checkpoint_path>::<model_key>' to select one.")
+            selected_key = available_keys[0]
+        elif selected_key not in available_keys:
+            available_str = ", ".join(available_keys)
+            raise ValueError(f"Orbax checkpoint model key '{selected_key}' not found. " f"Available keys: {available_str}")
+
+        metadata_tree = ocp.PyTreeCheckpointHandler().metadata(step_dir / "state").tree["trainable"][selected_key]
+        matching_paths, stats = TraceCompiler._build_orbax_restore_plan(metadata_tree, model)
+
+        restore_template = jax.tree_util.tree_map_with_path(
+            lambda keypath, leaf: leaf if eqx.is_array(leaf) and TraceCompiler._normalize_keypath(keypath) in matching_paths else ocp.PLACEHOLDER,
+            model,
+            is_leaf=lambda leaf: leaf is None,
+        )
+
+        checkpointer = ocp.Checkpointer(ocp.PyTreeCheckpointHandler())
+        try:
+            restored = checkpointer.restore(
+                step_dir / "state",
+                args=ocp.args.PyTreeRestore(
+                    item={"trainable": {selected_key: restore_template}},
+                    partial_restore=True,
+                ),
+            )
+        finally:
+            close = getattr(checkpointer, "close", None)
+            if callable(close):
+                close()
+
+        logger.info(f"Orbax checkpoint: restored trainable model key {selected_key} from {step_dir}")
+        total = stats["matched"] + stats["skipped"]
+        pct = 100 * stats["matched"] / total if total else 0.0
+        skipped_leaf_label = "leaf" if stats["skipped_leaves"] == 1 else "leaves"
+        logger.info(f"Orbax checkpoint: {stats['matched']:,}/{total:,} params matched " f"({pct:.4f}%), {stats['skipped']:,} kept fresh init " f"({stats['skipped_leaves']} model {skipped_leaf_label})")
+        if stats["unused_arrays"] > 0:
+            logger.warning(
+                f"Checkpoint file contains {stats['checkpoint_arrays']} arrays "
+                f"({stats['checkpoint_params']:,} params) but model only consumed "
+                f"{stats['considered_checkpoint_arrays']} arrays — {stats['unused_arrays']} arrays "
+                f"({stats['unused_params']:,} params) unused"
+            )
+        elif stats["skipped_leaves"] > 0:
+            logger.info(
+                f"Checkpoint file: {stats['checkpoint_arrays']} arrays "
+                f"({stats['checkpoint_params']:,} params total), all checkpoint arrays consumed; "
+                f"model kept fresh init for {stats['skipped_leaves']} additional "
+                f"{skipped_leaf_label} ({stats['skipped']:,} params)"
+            )
+        else:
+            logger.info(f"Checkpoint file: {stats['checkpoint_arrays']} arrays " f"({stats['checkpoint_params']:,} params total), all consumed by model")
+        return jax.tree_util.tree_map(
+            lambda restored_leaf, fresh_leaf: fresh_leaf if restored_leaf is ocp.PLACEHOLDER or restored_leaf is None else restored_leaf,
+            restored["trainable"][selected_key],
+            model,
+            is_leaf=lambda leaf: leaf is ocp.PLACEHOLDER or leaf is None,
+        )
+
+    @staticmethod
     def build_single_layer_params(layer, arg_shapes, rng, logger):
         """Retrieve or construct the model for a single layer.
 
@@ -607,7 +832,10 @@ class TraceCompiler:
 
         if layer.weight_path is not None:
             logger.info(f"Loading pretrained weights from {layer.weight_path}")
-            model = TraceCompiler._load_eqx_weights_partial(layer.weight_path, model, logger)
+            if Path(str(layer.weight_path).rsplit("::", 1)[0]).is_dir():
+                model = TraceCompiler._load_orbax_weights_partial(layer.weight_path, model, logger)
+            else:
+                model = TraceCompiler._load_eqx_weights_partial(layer.weight_path, model, logger)
         elif getattr(layer, "_weight_tree", None) is not None:
             # Pytree supplied directly — copy array leaves from the tree
             # onto the freshly-initialised model.
@@ -617,6 +845,12 @@ class TraceCompiler:
                 layer._weight_tree,
                 model,
             )
+        elif getattr(layer, "_initializer_fn", None) is not None:
+            init_key = getattr(layer, "_initializer_key", None)
+            if init_key is None:
+                init_key = rng
+            logger.info("Initializing model parameters from callable initializer")
+            model = TraceCompiler._apply_callable_initializer(model, layer._initializer_fn, key=init_key, logger=logger)
 
         if init_mask is not None:
             model = jax.tree_util.tree_map(

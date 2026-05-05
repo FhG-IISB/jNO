@@ -24,7 +24,9 @@ jobs:
 
     - name: Install system dependencies
 
-      run: sudo apt-get update && sudo apt-get install -y libglu1-mesa
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libglu1-mesa libsuitesparse-dev build-essential
 
     - name: Install dependencies
 
