@@ -1848,7 +1848,7 @@ class core:
                         context = on_device_context
 
                     # --- step ---
-                    (trainable, opt_states, self.rng, epoch_jnp, total_loss, individual_losses) = jit_step(
+                    trainable, opt_states, self.rng, epoch_jnp, total_loss, individual_losses = jit_step(
                         trainable,
                         opt_states,
                         self.rng,

@@ -13,14 +13,13 @@ Architecture factories (``mlp``, ``fno2d``, ``deeponet``, …) have moved to the
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from typing import Callable, Union, Any, overload
+from typing import Union, Any, overload
 
 from .linear import Linear
 
 from ..tuner import ArchSpace
-from ..trace import Model, TunableModule
+from ..trace import Model, TunableModule, ModelCall
 from ..utils.config import get_seed
-
 
 _DEFAULT_NN_KEY: jax.Array | None = None
 
@@ -53,7 +52,7 @@ def _resolve_key(key: jax.Array | None):
     return key_out
 
 
-def parameter(shape: tuple, *, key: jax.Array | None = None, init: Callable = jax.nn.initializers.zeros, name: str = "value") -> Model:
+def parameter(shape: tuple, *, key: jax.Array | None = None, name: str = "value") -> ModelCall:
     """
     Create a trainable parameter tensor.
 
@@ -62,18 +61,18 @@ def parameter(shape: tuple, *, key: jax.Array | None = None, init: Callable = ja
 
     Args:
         shape: Shape of the parameter tensor.
-        key: JAX PRNG key for initialization.
-        init: Initializer function ``(key, shape) -> array``. Default: zeros.
-        name: Name of the parameter (used for display). Default: "value".
+        key: Optional JAX PRNG key used as default when calling
+            ``.initialize(<jax initializer>)`` later.
+        name: Name of the parameter model.
 
     Returns:
-        Model: A wrapped module that returns the parameter when called.
+        ModelCall: A scalar/tensor parameter expression that can be optimized by jno.
 
     Example:
         >>> key = jax.random.PRNGKey(0)
         >>> # Learnable diffusion coefficient
-        >>> D = parameter((1,), key=key, init=jax.nn.initializers.ones)
-        >>>
+        >>> D = parameter((1,), key=key).initialize(jax.nn.initializers.ones)
+
         >>> # Learnable 2D tensor
         >>> K = parameter((3, 3), key=key)
     """
@@ -84,8 +83,9 @@ def parameter(shape: tuple, *, key: jax.Array | None = None, init: Callable = ja
         def __call__(self):
             return self.value
 
-    key = _resolve_key(key)
-    return nn.wrap(_Parameter(value=init(key, shape)))
+    model = nn.wrap(_Parameter(value=jnp.zeros(shape, dtype=jnp.float32)), name=name)
+    model._initializer_key = _resolve_key(key)
+    return model()
 
 
 class nn:

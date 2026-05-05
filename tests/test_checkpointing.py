@@ -1,6 +1,10 @@
 """Tests for the Orbax checkpoint callback and resume-from-checkpoint."""
 
+import logging
 import os
+from pathlib import Path
+
+import equinox as eqx
 import pytest
 import foundax
 import jax
@@ -33,6 +37,78 @@ def _make_solver(epochs=10):
     if epochs > 0:
         solver.solve(epochs)
     return solver
+
+
+def _restore_trainable_model_from_orbax_step(step_dir: Path, model_key: str, model):
+    """Restore one trainable model subtree directly from an Orbax step dir."""
+    restore_template = jax.tree_util.tree_map(
+        lambda leaf: leaf if eqx.is_array(leaf) else orbax.PLACEHOLDER,
+        model,
+        is_leaf=lambda leaf: leaf is None,
+    )
+    checkpointer = orbax.Checkpointer(orbax.PyTreeCheckpointHandler())
+    try:
+        restored = checkpointer.restore(
+            step_dir / "state",
+            args=orbax.args.PyTreeRestore(
+                item={"trainable": {model_key: restore_template}},
+                partial_restore=True,
+            ),
+        )
+    finally:
+        close = getattr(checkpointer, "close", None)
+        if callable(close):
+            close()
+
+    return jax.tree_util.tree_map(
+        lambda restored_leaf, fresh_leaf: fresh_leaf if restored_leaf is orbax.PLACEHOLDER or restored_leaf is None else restored_leaf,
+        restored["trainable"][model_key],
+        model,
+        is_leaf=lambda leaf: leaf is orbax.PLACEHOLDER or leaf is None,
+    )
+
+
+def _save_orbax_step(step_dir: Path, trainable, *, epoch: int = 0):
+    """Write a minimal jNO-compatible Orbax checkpoint step."""
+    checkpointer = orbax.Checkpointer(orbax.CompositeCheckpointHandler())
+    try:
+        checkpointer.save(
+            step_dir,
+            args=orbax.args.Composite(
+                state=orbax.args.StandardSave(
+                    {
+                        "trainable": {"1": trainable},
+                        "opt_states": {},
+                        "rng": jax.random.PRNGKey(0),
+                    }
+                ),
+                metadata=orbax.args.JsonSave(
+                    {
+                        "epoch": epoch,
+                        "total_loss": 0.0,
+                        "individual_losses": [],
+                        "timestamp": 0.0,
+                    }
+                ),
+            ),
+            force=True,
+        )
+        wait_until_finished = getattr(checkpointer, "wait_until_finished", None)
+        if callable(wait_until_finished):
+            wait_until_finished()
+    finally:
+        close = getattr(checkpointer, "close", None)
+        if callable(close):
+            close()
+
+
+class _ToyOrbaxModel(eqx.Module):
+    weight: jax.Array
+    relative_position_index: jax.Array
+
+    def __init__(self, *, weight_scale: float, index_offset: int):
+        self.weight = (weight_scale * jnp.arange(6, dtype=jnp.float32)).reshape(2, 3)
+        self.relative_position_index = (jnp.arange(4, dtype=jnp.int32) + index_offset).reshape(2, 2)
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +327,141 @@ class TestCheckpointCallback:
         latest = cb.latest_step
         assert latest is not None
         assert latest == max(cb.all_steps)
+
+    def test_initialize_from_orbax_step_dir(self, tmp_path):
+        """nn.initialize should accept a numbered Orbax checkpoint directory."""
+        import jno
+        from jno.trace_compiler import TraceCompiler
+        from jno.utils.callbacks import CheckpointCallback
+
+        ckpt_dir = Path(tmp_path / "ckpts")
+        cb = CheckpointCallback(
+            directory=str(ckpt_dir),
+            save_interval_epochs=1,
+            max_to_keep=3,
+            async_checkpointing=False,
+        )
+
+        solver = _make_solver(epochs=0)
+        solver.solve(3, callbacks=[cb])
+        cb.close()
+
+        latest_step = cb.latest_step
+        restored = cb.restore(step=latest_step)
+        saved_key = next(iter(restored["trainable"]))
+
+        key = jax.random.PRNGKey(0)
+        reference_model = _restore_trainable_model_from_orbax_step(
+            ckpt_dir / str(latest_step),
+            saved_key,
+            foundax.mlp(1, hidden_dims=8, num_layers=2, key=key),
+        )
+        net = jno.nn.wrap(foundax.mlp(1, hidden_dims=8, num_layers=2, key=key))
+        net.initialize(str(ckpt_dir / str(latest_step)))
+
+        loaded_model = TraceCompiler.build_single_layer_params(net, None, key, logging.getLogger(__name__))
+
+        expected_leaves = jax.tree_util.tree_leaves(eqx.filter(reference_model, eqx.is_array))
+        loaded_leaves = jax.tree_util.tree_leaves(eqx.filter(loaded_model, eqx.is_array))
+        assert len(loaded_leaves) == len(expected_leaves)
+        for loaded, expected in zip(loaded_leaves, expected_leaves, strict=True):
+            np.testing.assert_allclose(np.asarray(loaded), np.asarray(expected))
+
+    def test_initialize_from_orbax_root_dir_uses_latest_step(self, tmp_path):
+        """nn.initialize should accept an Orbax checkpoint root directory."""
+        import jno
+        from jno.trace_compiler import TraceCompiler
+        from jno.utils.callbacks import CheckpointCallback
+
+        ckpt_dir = Path(tmp_path / "ckpts")
+        cb = CheckpointCallback(
+            directory=str(ckpt_dir),
+            save_interval_epochs=1,
+            max_to_keep=3,
+            async_checkpointing=False,
+        )
+
+        solver = _make_solver(epochs=0)
+        solver.solve(3, callbacks=[cb])
+        cb.close()
+
+        latest_step = cb.latest_step
+        restored = cb.restore(step=latest_step)
+        saved_key = next(iter(restored["trainable"]))
+
+        key = jax.random.PRNGKey(0)
+        reference_model = _restore_trainable_model_from_orbax_step(
+            ckpt_dir / str(latest_step),
+            saved_key,
+            foundax.mlp(1, hidden_dims=8, num_layers=2, key=key),
+        )
+        net = jno.nn.wrap(foundax.mlp(1, hidden_dims=8, num_layers=2, key=key))
+        net.initialize(str(ckpt_dir))
+
+        loaded_model = TraceCompiler.build_single_layer_params(net, None, key, logging.getLogger(__name__))
+
+        expected_leaves = jax.tree_util.tree_leaves(eqx.filter(reference_model, eqx.is_array))
+        loaded_leaves = jax.tree_util.tree_leaves(eqx.filter(loaded_model, eqx.is_array))
+        assert len(loaded_leaves) == len(expected_leaves)
+        for loaded, expected in zip(loaded_leaves, expected_leaves, strict=True):
+            np.testing.assert_allclose(np.asarray(loaded), np.asarray(expected))
+
+    def test_initialize_from_orbax_logs_match_summary(self, tmp_path, caplog):
+        """Orbax restore should log matched/skipped parameter statistics."""
+        import jno
+        from jno.trace_compiler import TraceCompiler
+        from jno.utils.callbacks import CheckpointCallback
+
+        ckpt_dir = Path(tmp_path / "ckpts")
+        cb = CheckpointCallback(
+            directory=str(ckpt_dir),
+            save_interval_epochs=1,
+            max_to_keep=3,
+            async_checkpointing=False,
+        )
+
+        solver = _make_solver(epochs=0)
+        solver.solve(3, callbacks=[cb])
+        cb.close()
+
+        latest_step = cb.latest_step
+        key = jax.random.PRNGKey(0)
+        net = jno.nn.wrap(foundax.mlp(1, hidden_dims=8, num_layers=2, key=key))
+        net.initialize(str(ckpt_dir / str(latest_step)))
+
+        logger = logging.getLogger(__name__)
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=logger.name):
+            TraceCompiler.build_single_layer_params(net, None, key, logger)
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(msg.startswith("Orbax checkpoint:") and "params matched" in msg for msg in messages)
+        assert any(msg.startswith("Checkpoint file:") or "model only consumed" in msg for msg in messages)
+
+    def test_initialize_from_orbax_keeps_unmatched_array_leaves_fresh(self, tmp_path, caplog):
+        """Orbax restore should keep unmatched array leaves from the fresh model."""
+        from jno.trace_compiler import TraceCompiler
+
+        step_dir = Path(tmp_path / "toy_step")
+        reference_model = _ToyOrbaxModel(weight_scale=2.0, index_offset=100)
+        fresh_model = _ToyOrbaxModel(weight_scale=1.0, index_offset=0)
+
+        _save_orbax_step(step_dir, eqx.filter(reference_model, eqx.is_inexact_array))
+
+        logger = logging.getLogger(__name__)
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=logger.name):
+            loaded_model = TraceCompiler._load_orbax_weights_partial(str(step_dir), fresh_model, logger)
+
+        np.testing.assert_allclose(np.asarray(loaded_model.weight), np.asarray(reference_model.weight))
+        np.testing.assert_array_equal(
+            np.asarray(loaded_model.relative_position_index),
+            np.asarray(fresh_model.relative_position_index),
+        )
+        assert loaded_model.relative_position_index is not None
+
+        messages = [record.getMessage() for record in caplog.records]
+        assert any(msg.startswith("Checkpoint file:") and "all checkpoint arrays consumed; model kept fresh init" in msg for msg in messages)
 
 
 # ---------------------------------------------------------------------------

@@ -73,13 +73,26 @@ class RARD(ResamplingStrategy):
         keep_indices = sorted_indices[n_resample:]
         points_kept = points[keep_indices]
 
-        # Sample new points from candidates
+        # Sample new points from candidates, weighted by residual^power at the
+        # nearest current point (importance sampling over the mesh pool).
         if hasattr(domain, "_mesh_points") and tag in domain._mesh_points:
             candidates = jnp.array(domain._mesh_points[tag])
 
-            # Randomly sample from candidates
-            key1, key2 = jax.random.split(rng_key)
-            new_indices = jax.random.choice(key1, candidates.shape[0], shape=(n_resample,), replace=True)
+            # For each candidate, find nearest current point and inherit its residual-power weight.
+            # Pairwise squared distances (|C|, N) — O(|C|*N*D); acceptable at resample cadence.
+            diffs = candidates[:, None, :] - points[None, :, :]
+            sq_dists = jnp.sum(diffs * diffs, axis=-1)
+            nearest = jnp.argmin(sq_dists, axis=-1)  # (|C|,)
+            cand_weights = jnp.power(residuals[nearest] + 1e-10, self.power)
+            cand_weights = cand_weights / jnp.sum(cand_weights)
+
+            new_indices = jax.random.choice(
+                rng_key,
+                candidates.shape[0],
+                shape=(n_resample,),
+                replace=True,
+                p=cand_weights,
+            )
             new_points = candidates[new_indices]
         else:
             # Fallback: sample from current high-residual regions

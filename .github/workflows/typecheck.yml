@@ -16,6 +16,11 @@ jobs:
       with:
         python-version: "3.12"
 
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libsuitesparse-dev build-essential
+
     - name: Install dependencies
       run: uv sync --all-extras --no-extra cuda
 

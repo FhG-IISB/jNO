@@ -109,7 +109,8 @@ class HA(ResamplingStrategy):
             # Fill remainder with random
             if n_new > 0 and hasattr(domain, "_mesh_points") and tag in domain._mesh_points:
                 candidates = jnp.array(domain._mesh_points[tag])
-                new_indices = jax.random.choice(rng_key, candidates.shape[0], shape=(n_new,), replace=True)
+                fill_key, _ = jax.random.split(rng_key)
+                new_indices = jax.random.choice(fill_key, candidates.shape[0], shape=(n_new,), replace=True)
                 new_points = candidates[new_indices]
                 result = jnp.concatenate([retained_points, new_points], axis=0)
                 assert result.shape[0] == n_points, f"Expected {n_points}, got {result.shape[0]}"
@@ -118,6 +119,7 @@ class HA(ResamplingStrategy):
                 return retained_points
             else:
                 # Fallback: pad with retained points if no candidates
-                pad_indices = jax.random.choice(rng_key, n_retain, shape=(n_new,), replace=True)
+                pad_key, _ = jax.random.split(rng_key)
+                pad_indices = jax.random.choice(pad_key, n_retain, shape=(n_new,), replace=True)
                 result = jnp.concatenate([retained_points, retained_points[pad_indices]], axis=0)
                 return result

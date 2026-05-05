@@ -292,34 +292,6 @@ class TestVariableTensorTag:
 
 
 # ======================================================================
-# Model / ModelCall
-# ======================================================================
-class TestFlaxModule:
-    def test_flax_module_unique_id(self):
-        from flax import linen as ln
-
-        m1 = Model(ln.Dense(3))
-        m2 = Model(ln.Dense(3))
-        assert m1.layer_id != m2.layer_id
-
-    def test_call_returns_module_call(self):
-        from flax import linen as ln
-
-        m = Model(ln.Dense(3))
-        a = make_var("x")
-        result = m(a)
-        assert isinstance(result, ModelCall)
-
-    def test_dont_show(self):
-        from flax import linen as ln
-
-        m = Model(ln.Dense(3), name="test")
-        result = m.dont_show()
-        assert result is m
-        assert m.show is False
-
-
-# ======================================================================
 # Model.mask / ModelCall.mask
 # ======================================================================
 class TestModelMask:

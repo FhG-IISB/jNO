@@ -25,14 +25,12 @@ The problem is intentionally reaction-only, not reaction-diffusion.
 import os
 import time
 import numpy as np
-import matplotlib.pyplot as plt
 
 import jax
 import jax.numpy as jnp
 import diffrax
 
 import jno
-import jno.numpy as jnn
 
 jax.config.update("jax_enable_x64", True)
 
@@ -59,7 +57,7 @@ DT0 = 1.0e-3
 
 def forcing_sym(t):
     """Symbolic forcing used in the jNO traced residual."""
-    return 0.50 * jnn.sin(2.0 * jnn.pi * t)
+    return 0.50 * jno.np.sin(2.0 * jno.np.pi * t)
 
 
 def forcing_num(t):
@@ -71,7 +69,11 @@ def forcing_num(t):
 # Domain
 # ============================================================
 
-domain = jno.domain( constructor=jno.domain.line(x_range=(0.0, 1.0), mesh_size=0.25),time=(0.0, T_END, 21), compute_mesh_connectivity=False,)
+domain = jno.domain(
+    constructor=jno.domain.line(x_range=(0.0, 1.0), mesh_size=0.25),
+    time=(0.0, T_END, 21),
+    compute_mesh_connectivity=False,
+)
 
 # For a 1D space-time domain this returns (x, t).
 x, t = domain.variable("interior", split=True)
@@ -128,9 +130,7 @@ print("t0, t1, dt0     :", block.t0, block.t1, block.dt0)
 print("metadata        :", block.metadata)
 
 if block.term is None or block.rhs is None:
-    raise RuntimeError(
-        "Strong-form Diffrax lowering did not produce a usable Diffrax term."
-    )
+    raise RuntimeError("Strong-form Diffrax lowering did not produce a usable Diffrax term.")
 
 if block.backend != "diffrax":
     raise RuntimeError(f"Expected backend='diffrax', got {block.backend!r}.")
@@ -153,12 +153,8 @@ def rhs_ref(t, y, args):
 probe_ts = jnp.asarray([0.0, 0.3, 1.0, 2.5], dtype=jnp.float64)
 probe_us = jnp.asarray([0.25, 0.5, -0.2, 0.9], dtype=jnp.float64)
 
-rhs_jno_vals = jnp.asarray(
-    [block.rhs(tt, uu, None) for tt, uu in zip(probe_ts, probe_us)]
-)
-rhs_ref_vals = jnp.asarray(
-    [rhs_ref(tt, uu, None) for tt, uu in zip(probe_ts, probe_us)]
-)
+rhs_jno_vals = jnp.asarray([block.rhs(tt, uu, None) for tt, uu in zip(probe_ts, probe_us)])
+rhs_ref_vals = jnp.asarray([rhs_ref(tt, uu, None) for tt, uu in zip(probe_ts, probe_us)])
 
 rhs_max_abs_err = float(jnp.max(jnp.abs(rhs_jno_vals - rhs_ref_vals)))
 
@@ -223,10 +219,7 @@ u_ref = jnp.asarray(sol_ref.ys).reshape(-1)
 abs_err = jnp.abs(u_jno - u_ref)
 
 max_abs_err = float(jnp.max(abs_err))
-rel_l2 = float(
-    jnp.linalg.norm(u_jno - u_ref)
-    / (jnp.linalg.norm(u_ref) + 1.0e-14)
-)
+rel_l2 = float(jnp.linalg.norm(u_jno - u_ref) / (jnp.linalg.norm(u_ref) + 1.0e-14))
 
 final_abs_err = float(jnp.abs(u_jno[-1] - u_ref[-1]))
 
@@ -246,50 +239,6 @@ print(f"final value (ref)    : {float(u_ref[-1]):.10f}")
 
 
 # ============================================================
-# Plot
-# ============================================================
-
-fig, axes = plt.subplots(2, 1, figsize=(9, 8), sharex=True)
-
-axes[0].plot(
-    np.asarray(t_hist),
-    np.asarray(u_ref),
-    label="Reference hand-written RHS",
-    linewidth=2,
-)
-axes[0].plot(
-    np.asarray(t_hist),
-    np.asarray(u_jno),
-    "--",
-    label="jNO strong form -> Diffrax",
-    linewidth=2,
-)
-axes[0].set_ylabel("u(t)")
-axes[0].set_title("Reaction-only Allen-Cahn ODE")
-axes[0].grid(True, alpha=0.3)
-axes[0].legend()
-
-axes[1].semilogy(
-    np.asarray(t_hist),
-    np.asarray(abs_err) + 1.0e-18,
-    label="|u_jno - u_ref|",
-    linewidth=2,
-)
-axes[1].set_xlabel("t")
-axes[1].set_ylabel("absolute error")
-axes[1].grid(True, alpha=0.3)
-axes[1].legend()
-
-plt.tight_layout()
-
-plot_path = os.path.join(OUT_DIR, "reaction_only_ac_ode_compare.png")
-plt.savefig(plot_path, dpi=180)
-plt.close(fig)
-
-print(f"\nSaved comparison plot to: {plot_path}")
-
-
-# ============================================================
 # Pass/fail guard
 # ============================================================
 
@@ -300,15 +249,9 @@ if not np.isfinite(rhs_max_abs_err):
     raise RuntimeError("Non-finite RHS error encountered.")
 
 if rhs_max_abs_err > 1.0e-10:
-    raise RuntimeError(
-        f"RHS mismatch too large: {rhs_max_abs_err:.3e}. "
-        "Check strong-form lowering/sign convention."
-    )
+    raise RuntimeError(f"RHS mismatch too large: {rhs_max_abs_err:.3e}. " "Check strong-form lowering/sign convention.")
 
 if max_abs_err > 1.0e-8:
-    raise RuntimeError(
-        f"Solution mismatch too large: {max_abs_err:.3e}. "
-        "Check strong-form lowering or Diffrax solve settings."
-    )
+    raise RuntimeError(f"Solution mismatch too large: {max_abs_err:.3e}. " "Check strong-form lowering or Diffrax solve settings.")
 
 print("\nPASS: strong-form Diffrax lowering matches the hand-written reference.")

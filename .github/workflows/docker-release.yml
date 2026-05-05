@@ -21,7 +21,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libglu1-mesa
+          sudo apt-get install -y --no-install-recommends libglu1-mesa libsuitesparse-dev build-essential
 
       - name: Install uv
         uses: astral-sh/setup-uv@v4

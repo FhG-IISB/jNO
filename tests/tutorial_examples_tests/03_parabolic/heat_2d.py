@@ -20,7 +20,7 @@ import jno
 
 import foundax
 import optax
-from jno import LearningRateSchedule as lrs
+from pathlib import Path
 
 π = jno.np.pi
 α = 0.1  # thermal diffusivity
@@ -40,16 +40,18 @@ domain.summary()
 u_exact = jno.np.exp(-2 * α * π**2 * t) * jno.np.sin(π * x) * jno.np.sin(π * y)
 
 # ── Network ───────────────────────────────────────────────────────────────────
-net = jno.nn.wrap(foundax.deeponet(
-    n_sensors=1,
-    coord_dim=2,
-    n_outputs=1,
-    n_layers=6,
-    basis_functions=64,
-    hidden_dim=64,
-    key=jax.random.PRNGKey(0),
-))
-net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(10, 1, 1e-3, 1e-5))
+net = jno.nn.wrap(
+    foundax.deeponet(
+        n_sensors=1,
+        coord_dim=2,
+        n_outputs=1,
+        n_layers=4,
+        basis_functions=96,
+        hidden_dim=64,
+        key=jax.random.PRNGKey(0),
+    )
+)
+net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(init_value=0, peak_value=1e-3, warmup_steps=40, decay_steps=40000 - 40, end_value=1e-5)))
 net.summary()
 xy = jno.np.concat([x, y])
 xy0 = jno.np.concat([x0, y0])
@@ -63,8 +65,14 @@ ini = u0 - jno.np.sin(π * x0) * jno.np.sin(π * y0)
 
 # ── Solve ─────────────────────────────────────────────────────────────────────
 crux = jno.core([pde.mse, ini.mse], domain).print_shapes()
-history = crux.solve(5000)
+history = crux.solve(40000)
 
 _u, _u_exact = crux.eval([u, u_exact])
 rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_exact) + 1e-8))
+
+# Write result to tracking file
+results_file = Path(__file__).parent.parent.parent / "tutorial_results.txt"
+with open(results_file, "a") as f:
+    f.write(f"03_parabolic/heat_2d.py | epochs=40000 | rel_L2={rel_l2:.6e}\n")
+
 assert rel_l2 < 1e-1, f"relative L2 error too large: {rel_l2:.3e}"

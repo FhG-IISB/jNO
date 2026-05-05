@@ -41,7 +41,7 @@ sys.modules[__name__ + ".numpy"] = np
 do = domain
 
 
-__version__ = "0.1.0"
+__version__ = "0.2.1"
 
 
 class ScheduleWrapper:

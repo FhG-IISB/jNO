@@ -89,12 +89,21 @@ class RAD(ResamplingStrategy):
             new_points = new_points + noise
             return jnp.concatenate([points_kept, new_points], axis=0)
 
-        # Sample k candidates per new point, pick the one nearest to high-residual region
-        key1, key2 = jax.random.split(rng_key)
+        # Sample k candidates per new slot, pick the one nearest to a high-residual anchor.
+        key1, _ = jax.random.split(rng_key)
         candidate_indices = jax.random.choice(key1, candidates.shape[0], shape=(n_resample * self.k,), replace=True)
-        candidate_points = candidates[candidate_indices].reshape(n_resample, self.k, -1)
+        candidate_points = candidates[candidate_indices].reshape(n_resample, self.k, -1)  # (n_resample, k, D)
 
-        # For each candidate set, pick one (here: first, could weight by distance to high-res points)
-        new_points = candidate_points[:, 0, :]
+        # High-residual anchors: the n_resample current points with largest residuals.
+        anchor_points = points[sorted_indices[-n_resample:]]  # (n_resample, D)
+
+        # For each of the n_resample groups, pick the candidate closest to ANY anchor.
+        # Pairwise squared distances of shape (n_resample, k, n_resample), min over anchors -> (n_resample, k).
+        diffs = candidate_points[:, :, None, :] - anchor_points[None, None, :, :]
+        sq_dists = jnp.sum(diffs * diffs, axis=-1)  # (n_resample, k, n_resample)
+        min_dist_to_anchor = jnp.min(sq_dists, axis=-1)  # (n_resample, k)
+        best_in_group = jnp.argmin(min_dist_to_anchor, axis=-1)  # (n_resample,)
+
+        new_points = jnp.take_along_axis(candidate_points, best_in_group[:, None, None], axis=1)[:, 0, :]
 
         return jnp.concatenate([points_kept, new_points], axis=0)
