@@ -6,7 +6,6 @@ from ..domain import domain
 from .iree import IREEModel
 from typing import Union, TypeVar, Type, overload, Any
 
-
 TLoaded = TypeVar("TLoaded", core, domain, IREEModel)
 
 

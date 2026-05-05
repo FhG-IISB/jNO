@@ -160,23 +160,24 @@ class TestFNO1D:
 class TestDeepONet:
     def test_returns_flax_module(self):
         key = jax.random.PRNGKey(0)
-        m = nn.wrap(foundax.deeponet(
-            n_sensors=16,
-            sensor_channels=1,
-            coord_dim=1,
-            n_outputs=1,
-            basis_functions=8,
-            hidden_dim=16,
-            n_layers=2,
-            key=key,
-        ))
+        m = nn.wrap(
+            foundax.deeponet(
+                n_sensors=16,
+                sensor_channels=1,
+                coord_dim=1,
+                n_outputs=1,
+                basis_functions=8,
+                hidden_dim=16,
+                n_layers=2,
+                key=key,
+            )
+        )
         assert isinstance(m, Model)
         u = jnp.ones((16, 1))
         y_query = jnp.ones((7, 1))
         out = m.module(u, y_query, key=key)
         assert out.shape == (7,)
         assert jnp.all(jnp.isfinite(out))
-
 
 
 # ======================================================================

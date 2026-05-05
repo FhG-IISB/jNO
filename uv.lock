@@ -711,16 +711,16 @@ wheels = [
 
 [[package]]
 name = "foundax"
-version = "0.1.5"
+version = "0.1.6"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "einops" },
     { name = "equinox" },
     { name = "jax" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/76/f4/e885f0165a1aa6eae31627509764be0f23e66578aa024341d93a3a6cfd53/foundax-0.1.5.tar.gz", hash = "sha256:36abb9fe36a7aea7459f4fc81d796586c933f33a303f97a09e00cb32ca8bbc35", size = 128699, upload-time = "2026-04-18T18:24:28.666Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c5/b5/c3ad728f0ca1d5202bb0c1f84aaf0f38682806a75146bf7195d4a0b38809/foundax-0.1.6.tar.gz", hash = "sha256:28fbb1b2e506c4f047c47be83f21ad7be51651c2ea2e61bc4acf7b24914c5fca", size = 139048, upload-time = "2026-05-05T12:51:05.471Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/97/ba/15c4264625412a19a812898c71e54baf1051df0c00c8b85988e336eabf9d/foundax-0.1.5-py3-none-any.whl", hash = "sha256:21275f54f6cd65f7a65fc393179d11ca365cbddf4075c7f71865c256ae6efbde", size = 140395, upload-time = "2026-04-18T18:24:27.669Z" },
+    { url = "https://files.pythonhosted.org/packages/ee/2a/ee291de42bc42ec533a500bec63d8c3d51bee193cc47e06b651996cc9047/foundax-0.1.6-py3-none-any.whl", hash = "sha256:8bdf6be8a1cb1b2fccfc4299fb81530b9d13bf59e34f4b5d4fb59967cbbbde97", size = 152167, upload-time = "2026-05-05T12:51:04.222Z" },
 ]
 
 [[package]]
@@ -1244,7 +1244,7 @@ with-cuda = [
 
 [[package]]
 name = "jax-neural-operators"
-version = "0.2.0"
+version = "0.2.1"
 source = { editable = "." }
 dependencies = [
     { name = "cloudpickle" },
@@ -1312,12 +1312,12 @@ requires-dist = [
     { name = "diffrax", marker = "extra == 'fem'" },
     { name = "einops", specifier = ">=0.7.0" },
     { name = "equinox", specifier = ">=0.11.0" },
-    { name = "feax", marker = "extra == 'dev'" },
+    { name = "feax", marker = "extra == 'dev'", specifier = ">=0.5.1" },
     { name = "feax", marker = "extra == 'fem'", specifier = ">=0.5.1" },
     { name = "fenics-basix", marker = "extra == 'dev'" },
     { name = "flake8", marker = "extra == 'dev'", specifier = ">=4.0" },
     { name = "flax", marker = "extra == 'dev'" },
-    { name = "foundax", specifier = ">=0.1.5" },
+    { name = "foundax", specifier = ">=0.1.6" },
     { name = "iree-base-compiler", marker = "extra == 'iree'" },
     { name = "iree-base-runtime", marker = "extra == 'iree'" },
     { name = "jax", specifier = ">=0.4.30" },

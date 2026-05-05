@@ -21,7 +21,6 @@ from ..tuner import ArchSpace
 from ..trace import Model, TunableModule, ModelCall
 from ..utils.config import get_seed
 
-
 _DEFAULT_NN_KEY: jax.Array | None = None
 
 

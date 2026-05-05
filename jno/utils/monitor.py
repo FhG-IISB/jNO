@@ -21,7 +21,6 @@ import time
 import threading
 from typing import Optional
 
-
 # ── nvidia-smi helpers ──────────────────────────────────────────────
 
 _GPU_QUERY = "index,name,utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw"

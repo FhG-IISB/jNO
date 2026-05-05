@@ -32,7 +32,6 @@ import equinox as eqx
 
 from .linear import Linear
 
-
 # =====================================================================
 # Equinox LoRA (for jNO Linear layers)
 # =====================================================================
