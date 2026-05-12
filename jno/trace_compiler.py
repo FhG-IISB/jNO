@@ -768,13 +768,18 @@ class TraceCompiler:
             model,
             is_leaf=lambda leaf: leaf is None,
         )
+        restore_item = {"trainable": {selected_key: restore_template}}
+
+        construct_restore_args = getattr(getattr(ocp, "checkpoint_utils", None), "construct_restore_args", None)
+        restore_args = construct_restore_args(restore_item) if callable(construct_restore_args) else None
 
         checkpointer = ocp.Checkpointer(ocp.PyTreeCheckpointHandler())
         try:
             restored = checkpointer.restore(
                 step_dir / "state",
                 args=ocp.args.PyTreeRestore(
-                    item={"trainable": {selected_key: restore_template}},
+                    item=restore_item,
+                    restore_args=restore_args,
                     partial_restore=True,
                 ),
             )

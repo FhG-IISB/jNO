@@ -9,12 +9,11 @@ jNO: Physics-Informed Neural Operators.
 import sys
 
 from .core import core
-from .domain import domain
+from .domain import PolygonDomain, domain
 from .utils.solver.fem_route import dirichlet, neumann
-from .resampling import sampler
 from .trace import Variable, Placeholder, OperationDef, OperationCall, Model, Hessian, Jacobian, TestFunction, TrialFunction, Assembly, FemLinearSystem, GroupedAssembly, FemResidualOperator, StateField
-from .utils.adaptive import LearningRateSchedule, WeightSchedule
-from .utils import callbacks, Logger, init_default_logger as logger, IREEModel as iree
+from .utils.adaptive import LearningRateSchedule, WeightSchedule, sampler, callbacks
+from .utils import Logger, init_default_logger as logger, IREEModel as iree
 from .utils.config import (
     load_config,
     get_config,
@@ -28,7 +27,6 @@ from .utils.config import (
 from .trace_evaluator import TraceEvaluator
 from .trace_compiler import TraceCompiler
 from .differential_operators import DifferentialOperators
-from . import resampling
 from . import jnp_ops as np
 from . import fn
 from .utils.load_save import save, load
@@ -52,25 +50,13 @@ class ScheduleWrapper:
 
 schedule = ScheduleWrapper()
 
-
-class _CallbackNamespace:
-    """Namespace for callback constructors: ``jno.callback.checkpoint(...)``."""
-
-    from .utils.callbacks import Callback as base  # noqa: F401
-    from .utils.callbacks import CheckpointCallback as checkpoint  # noqa: F401
-    from .utils.callbacks import EarlyStoppingCallback as early_stopping  # noqa: F401
-
-
-callback = _CallbackNamespace()
-cb = _CallbackNamespace()
-
-
 __all__ = [
     "schedule",
     "core",
     "sampler",
     "domain",
     "do",
+    "PolygonDomain",
     "Model",
     "Variable",
     "Placeholder",

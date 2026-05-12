@@ -1,0 +1,78 @@
+"""03 — 2-D heat equation  (parabolic, time-dependent)
+
+Problem
+-------
+    ∂u/∂t = α ∇²u,   (x,y) ∈ [0,1]²,  t ∈ [0, 0.5]
+    u = 0 on ∂Ω  (homogeneous Dirichlet BCs)
+    u(x,y,0) = sin(πx) sin(πy)
+
+Analytical solution
+-------------------
+    u(x,y,t) = exp(−2απ²t) sin(πx) sin(πy)
+
+The x(1−x)y(1−y) factor in the ansatz hard-enforces the Dirichlet BCs on the
+unit-square boundary for all times.  The initial condition is a soft constraint
+evaluated on the "initial" domain tag.
+"""
+
+import jax
+import jno
+
+import foundax
+import optax
+from pathlib import Path
+
+π = jno.np.pi
+α = 0.1  # thermal diffusivity
+T_end = 0.5  # final time
+N_t = 4  # number of time slices
+
+# ── Domain ────────────────────────────────────────────────────────────────────
+domain = jno.domain(
+    constructor=jno.domain.rect(mesh_size=0.05),
+    time=(0, T_end, N_t),
+    compute_mesh_connectivity=False,
+)
+x, y, t = domain.variable("interior")
+x0, y0, t0 = domain.variable("initial")
+domain.summary()
+# ── Analytical solution ───────────────────────────────────────────────────────
+u_exact = jno.np.exp(-2 * α * π**2 * t) * jno.np.sin(π * x) * jno.np.sin(π * y)
+
+# ── Network ───────────────────────────────────────────────────────────────────
+net = jno.nn.wrap(
+    foundax.deeponet(
+        n_sensors=1,
+        coord_dim=2,
+        n_outputs=1,
+        n_layers=4,
+        basis_functions=96,
+        hidden_dim=64,
+        key=jax.random.PRNGKey(0),
+    )
+)
+net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(init_value=0, peak_value=1e-3, warmup_steps=40, decay_steps=40000 - 40, end_value=1e-5)))
+net.summary()
+xy = jno.np.concat([x, y])
+xy0 = jno.np.concat([x0, y0])
+
+u = net(t, xy) * x * (1 - x) * y * (1 - y)
+u0 = net(t0, xy0) * x0 * (1 - x0) * y0 * (1 - y0)
+
+# ── Constraints ───────────────────────────────────────────────────────────────
+pde = jno.np.grad(u, t) - α * jno.np.laplacian(u, [x, y])
+ini = u0 - jno.np.sin(π * x0) * jno.np.sin(π * y0)
+
+# ── Solve ─────────────────────────────────────────────────────────────────────
+crux = jno.core([pde.mse, ini.mse], domain).print_shapes()
+history = crux.solve(40000)
+
+_u, _u_exact = crux.eval([u, u_exact])
+rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_exact) + 1e-8))
+
+# Write result to tracking file
+results_file = Path(__file__).parent.parent.parent / "tutorial_results.txt"
+with open(results_file, "a") as f:
+    f.write(f"03_parabolic/heat_2d.py | epochs=40000 | rel_L2={rel_l2:.6e}\n")
+
+assert rel_l2 < 1e-1, f"relative L2 error too large: {rel_l2:.3e}"

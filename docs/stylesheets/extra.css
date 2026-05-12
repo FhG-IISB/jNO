@@ -1,0 +1,82 @@
+:root {
+  --jno-brand-1: #006d77;
+  --jno-brand-2: #83c5be;
+  --jno-brand-3: #ffddd2;
+  --jno-accent: #ee9b00;
+  --jno-text-soft: #365a64;
+}
+
+.md-typeset h1 {
+  font-weight: 800;
+  letter-spacing: 0.01em;
+  margin-bottom: 0.3rem;
+}
+
+.md-typeset h2 {
+  border-bottom: 2px solid color-mix(in srgb, var(--jno-brand-2) 45%, transparent);
+  padding-bottom: 0.2rem;
+}
+
+.hero-actions {
+  margin: 1rem 0 1.25rem;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.6rem;
+}
+
+.hero-actions .md-button {
+  border-radius: 999px;
+}
+
+.hero-actions .md-button--primary {
+  background: linear-gradient(135deg, var(--jno-brand-1), #0b8793);
+  border: 0;
+}
+
+.md-typeset table:not([class]) th {
+  background: color-mix(in srgb, var(--jno-brand-2) 22%, white);
+}
+
+.md-typeset table:not([class]) tr:hover {
+  background: color-mix(in srgb, var(--jno-brand-3) 55%, white);
+}
+
+.md-header {
+  background: linear-gradient(90deg, #02434a, #006d77);
+}
+
+.md-main__inner {
+  margin-top: 0.8rem;
+}
+
+/* Keep the content focused while preserving an always-present left navigation on desktop. */
+@media screen and (min-width: 76.25em) {
+  .md-grid {
+    max-width: 1680px;
+  }
+
+  .md-sidebar--primary {
+    display: block;
+    width: 19rem;
+  }
+
+  .md-content {
+    margin: 0 auto;
+    max-width: 900px;
+  }
+}
+
+.md-typeset .admonition.warning {
+  border-left: 4px solid var(--jno-accent);
+}
+
+@media (max-width: 700px) {
+  .hero-actions {
+    flex-direction: column;
+  }
+
+  .hero-actions .md-button {
+    width: 100%;
+    text-align: center;
+  }
+}

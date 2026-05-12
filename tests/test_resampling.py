@@ -14,7 +14,7 @@ import jno
 import jno.jnp_ops as jnn
 from jno import LearningRateSchedule as lrs
 from jno import sampler
-from jno.resampling import CR3, HA, PINNFluence, R3, RAD, RARD, RandomResampling, ResamplingStrategy
+from jno.utils.adaptive.resampling import CR3, HA, PINNFluence, R3, RAD, RARD, RandomResampling, ResamplingStrategy
 
 
 def _points_1d(n: int = 24) -> jnp.ndarray:

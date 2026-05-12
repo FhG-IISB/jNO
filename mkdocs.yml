@@ -1,0 +1,78 @@
+site_name: jNO Documentation
+docs_dir: docs
+use_directory_urls: true
+
+theme:
+  name: material
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - md_in_html
+  - tables
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.inlinehilite
+  - pymdownx.snippets:
+      base_path: docs
+  - pymdownx.tabbed:
+      alternate_style: true
+
+extra_css:
+  - stylesheets/extra.css
+
+not_in_nav: |
+  /index.md
+  /Docker.md
+
+nav:
+  - Home: Getting-Started.md
+  - Installation: Installation.md
+  - Domain and Geometry: Domain-and-Geometry.md
+  - Differential Operators: Differential-Operators.md
+  - Training: Training.md
+  - Model Controls: Model-Controls.md
+  - Adaptive Resampling: Adaptive-Resampling.md
+  - Hyperparameter Tuning: Hyperparameter-Tuning.md
+  - Save, Load and Configuration: Save-Load-and-Configuration.md
+  - Foundation Models:
+    - Core Architectures: foundation_models/Core-Architectures.md
+    - Foundation Models: foundation_models/Foundation-Models.md
+  - Tutorials:
+    - 01 Basics:
+      - Laplace 1D: tutorials/01-basics/laplace-1d.md
+      - Poisson 1D: tutorials/01-basics/poisson-1d.md
+      - Biharmonic 1D: tutorials/01-basics/biharmonic-1d.md
+    - 02 Elliptic:
+      - Anisotropic Poisson 2D: tutorials/02-elliptic/anisotropic-poisson-2d.md
+      - Diffusion-Reaction 1D: tutorials/02-elliptic/diffusion-reaction-1d.md
+      - Helmholtz 2D: tutorials/02-elliptic/helmholtz-2d.md
+      - Mixed-Boundary Poisson 2D: tutorials/02-elliptic/mixed-boundary-poisson-2d.md
+      - Variable-Coefficient Poisson 2D: tutorials/02-elliptic/variable-coefficient-poisson-2d.md
+    - 03 Parabolic:
+      - Heat 1D: tutorials/03-parabolic/heat-1d.md
+      - Heat 2D: tutorials/03-parabolic/heat-2d.md
+      - Reaction-Diffusion 2D: tutorials/03-parabolic/reaction-diffusion-2d.md
+      - Allen-Cahn 2D: tutorials/03-parabolic/allen-cahn-2d.md
+    - 04 Hyperbolic:
+      - Advection-Diffusion 1D: tutorials/04-hyperbolic/advection-diffusion-1d.md
+      - Burgers Viscous 1D: tutorials/04-hyperbolic/burgers-viscous-1d.md
+      - Convection-Reaction-Diffusion 2D: tutorials/04-hyperbolic/convection-reaction-diffusion-2d.md
+      - Telegraph 1D: tutorials/04-hyperbolic/telegraph-1d.md
+      - Wave 1D: tutorials/04-hyperbolic/wave-1d.md
+    - 05 Coupled and Inverse:
+      - Coupled Elliptic 2D: tutorials/05-coupled-and-inverse/coupled-elliptic-2d.md
+      - Coupled Parabolic 2D: tutorials/05-coupled-and-inverse/coupled-parabolic-2d.md
+      - Inverse Parameter: tutorials/05-coupled-and-inverse/inverse-parameter.md
+    - 08 FEM and Variational PINNs:
+      - Poisson 2D FEM: tutorials/08-fem-and-varpinns/poisson-2d-fem.md
+      - Stationary Allen-Cahn FEM: tutorials/08-fem-and-varpinns/stationary-allen-cahn-fem.md
+      - Diffusion-Reaction Robin BC: tutorials/08-fem-and-varpinns/diffusion-reaction-robin-bc.md
+      - Helmholtz Mixed BC FEM VarPINN: tutorials/08-fem-and-varpinns/helmholtz-mixed-bc-fem-varpinn.md
+      - Helmholtz 3D: tutorials/08-fem-and-varpinns/helmholtz-3d.md

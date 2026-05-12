@@ -4,6 +4,7 @@ from .domain_data import DomainData
 from .geometries import Geometries
 from .mesh_utils import MeshUtils
 from .meshio_mixin import MeshIOMixin
+from .polygon_domain import PolygonDomain
 
 # Preserve historical import path for pickling/repr compatibility.
 _domain.__module__ = __name__
@@ -15,5 +16,6 @@ __all__ = [
     "MeshUtils",
     "BoundaryRegion",
     "MeshIOMixin",
+    "PolygonDomain",
     "domain",
 ]

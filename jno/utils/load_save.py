@@ -1,12 +1,96 @@
 from __future__ import annotations
+import io
+import pathlib
 import struct
+import sys
 import cloudpickle
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from ..core import core
 from ..domain import domain
 from .iree import IREEModel
 from typing import Union, TypeVar, Type, overload, Any
 
 TLoaded = TypeVar("TLoaded", core, domain, IREEModel)
+
+
+def _rebuild_local_path(path_text: str):
+    return Path(path_text)
+
+
+def _rebuild_pure_path(path_text: str):
+    return PurePath(path_text)
+
+
+def _rebuild_pure_posix_path(path_text: str):
+    return PurePosixPath(path_text)
+
+
+def _rebuild_pure_windows_path(path_text: str):
+    return PureWindowsPath(path_text)
+
+
+def _reduce_path_for_pickle(path_obj: PurePath):
+    class_name = type(path_obj).__name__
+    if class_name == "PureWindowsPath":
+        return _rebuild_pure_windows_path, (str(path_obj),)
+    if class_name == "PurePosixPath":
+        return _rebuild_pure_posix_path, (str(path_obj),)
+    if class_name == "PurePath":
+        return _rebuild_pure_path, (str(path_obj),)
+    return _rebuild_local_path, (str(path_obj),)
+
+
+class _CompatCloudPickler(cloudpickle.CloudPickler):
+    dispatch_table = dict(cloudpickle.CloudPickler.dispatch_table)
+
+
+for _path_type in {
+    Path(".").__class__,
+    PurePath(".").__class__,
+    PurePosixPath,
+    PureWindowsPath,
+}:
+    _CompatCloudPickler.dispatch_table[_path_type] = _reduce_path_for_pickle
+
+
+def _compat_cloudpickle_dump(obj: Any, file_obj) -> None:
+    _CompatCloudPickler(file_obj).dump(obj)
+
+
+def _compat_cloudpickle_dumps(obj: Any) -> bytes:
+    buffer = io.BytesIO()
+    _compat_cloudpickle_dump(obj, buffer)
+    return buffer.getvalue()
+
+
+def _compat_cloudpickle_load_from_bytes(payload: bytes) -> Any:
+    try:
+        return cloudpickle.load(io.BytesIO(payload))
+    except ModuleNotFoundError as exc:
+        if exc.name != "pathlib._local":
+            raise
+        sys.modules.setdefault("pathlib._local", pathlib)
+        return cloudpickle.load(io.BytesIO(payload))
+
+
+class _CompatCloudpickleSerializer:
+    CloudPickler = _CompatCloudPickler
+
+    @staticmethod
+    def dump(obj: Any, file_obj) -> None:
+        _compat_cloudpickle_dump(obj, file_obj)
+
+    @staticmethod
+    def dumps(obj: Any) -> bytes:
+        return _compat_cloudpickle_dumps(obj)
+
+    @staticmethod
+    def load(file_obj) -> Any:
+        return _compat_cloudpickle_load_from_bytes(file_obj.read())
+
+    @staticmethod
+    def loads(payload: bytes) -> Any:
+        return _compat_cloudpickle_load_from_bytes(payload)
 
 
 def save(instance, filepath: str, public_key_path: str | None = None, private_key_path: str | None = None):
@@ -31,7 +115,7 @@ def save(instance, filepath: str, public_key_path: str | None = None, private_ke
         signer = SignedPickle(
             public_key_path=public_key_path,
             private_key_path=private_key_path,
-            serializer=cloudpickle,
+            serializer=_CompatCloudpickleSerializer,
         )
         sig_path = f"{filepath.rsplit('.', 1)[0]}.sig"
         signer.dump_and_sign(instance, filepath, sig_path)
@@ -39,7 +123,7 @@ def save(instance, filepath: str, public_key_path: str | None = None, private_ke
     else:
 
         with open(filepath, "wb") as f:
-            cloudpickle.dump(instance, f)
+            _compat_cloudpickle_dump(instance, f)
 
     instance.log.info(f"Model/Domain saved to: {filepath}")
     return None
@@ -87,7 +171,7 @@ def load(
             from pylotte.signed_pickle import SignedPickle
         except ImportError as e:
             raise ImportError("pylotte is required for signed save/load functionality. " "Install with `pip install pylotte` or `pip install jax-neural-operators[dev]`") from e
-        loader = SignedPickle(public_key_path=public_key_path, serializer=cloudpickle)
+        loader = SignedPickle(public_key_path=public_key_path, serializer=_CompatCloudpickleSerializer)
         instance = loader.safe_load(filepath, signature_path)
     else:
         _MAGIC = b"PYLOTTE-SP\x01"
@@ -100,7 +184,7 @@ def load(
                 f.read(length)
             else:
                 f.seek(0)
-            instance = cloudpickle.load(f)
+            instance = _compat_cloudpickle_load_from_bytes(f.read())
 
     if not isinstance(instance, (core, domain, IREEModel)):
         raise TypeError(f"Loaded object has unsupported type: {type(instance).__name__}")
