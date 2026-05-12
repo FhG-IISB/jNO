@@ -46,12 +46,16 @@ def _restore_trainable_model_from_orbax_step(step_dir: Path, model_key: str, mod
         model,
         is_leaf=lambda leaf: leaf is None,
     )
+    restore_item = {"trainable": {model_key: restore_template}}
+    restore_args = orbax.checkpoint_utils.construct_restore_args(restore_item)
+
     checkpointer = orbax.Checkpointer(orbax.PyTreeCheckpointHandler())
     try:
         restored = checkpointer.restore(
             step_dir / "state",
             args=orbax.args.PyTreeRestore(
-                item={"trainable": {model_key: restore_template}},
+                item=restore_item,
+                restore_args=restore_args,
                 partial_restore=True,
             ),
         )
@@ -121,7 +125,7 @@ class TestCallbackHooks:
 
     def test_on_epoch_end_called(self):
         """on_epoch_end should be invoked at least once during solve()."""
-        from jno.utils.callbacks import Callback
+        from jno.utils.adaptive.callbacks import Callback
 
         class Recorder(Callback):
             def __init__(self):
@@ -139,7 +143,7 @@ class TestCallbackHooks:
 
     def test_on_training_end_called(self):
         """on_training_end should be called exactly once."""
-        from jno.utils.callbacks import Callback
+        from jno.utils.adaptive.callbacks import Callback
 
         class Counter(Callback):
             def __init__(self):
@@ -156,7 +160,7 @@ class TestCallbackHooks:
 
     def test_epoch_end_kwargs(self):
         """on_epoch_end should receive the documented keyword arguments."""
-        from jno.utils.callbacks import Callback
+        from jno.utils.adaptive.callbacks import Callback
 
         required_keys = {"epoch", "trainable", "opt_states", "rng", "total_loss", "individual_losses", "log"}
 
@@ -188,7 +192,7 @@ class TestCheckpointCallback:
 
     def test_checkpoint_creates_files(self, tmp_path):
         """Checkpoints should be written to disk."""
-        from jno.utils.callbacks import CheckpointCallback
+        from jno.utils.adaptive.callbacks import CheckpointCallback
 
         ckpt_dir = str(tmp_path / "ckpts")
         cb = CheckpointCallback(
@@ -208,7 +212,7 @@ class TestCheckpointCallback:
 
     def test_max_to_keep(self, tmp_path):
         """Only max_to_keep checkpoints should be retained."""
-        from jno.utils.callbacks import CheckpointCallback
+        from jno.utils.adaptive.callbacks import CheckpointCallback
 
         ckpt_dir = str(tmp_path / "ckpts")
         cb = CheckpointCallback(
@@ -227,7 +231,7 @@ class TestCheckpointCallback:
 
     def test_restore_latest(self, tmp_path):
         """restore() should return a dict with the expected keys."""
-        from jno.utils.callbacks import CheckpointCallback
+        from jno.utils.adaptive.callbacks import CheckpointCallback
 
         ckpt_dir = str(tmp_path / "ckpts")
         cb = CheckpointCallback(
@@ -251,7 +255,7 @@ class TestCheckpointCallback:
 
     def test_restore_specific_step(self, tmp_path):
         """restore(step=...) should return the checkpoint at that step."""
-        from jno.utils.callbacks import CheckpointCallback
+        from jno.utils.adaptive.callbacks import CheckpointCallback
 
         ckpt_dir = str(tmp_path / "ckpts")
         cb = CheckpointCallback(
@@ -273,7 +277,7 @@ class TestCheckpointCallback:
 
     def test_restore_empty_dir_raises(self, tmp_path):
         """restore() on an empty directory should raise FileNotFoundError."""
-        from jno.utils.callbacks import CheckpointCallback
+        from jno.utils.adaptive.callbacks import CheckpointCallback
 
         ckpt_dir = str(tmp_path / "empty_ckpts")
         os.makedirs(ckpt_dir, exist_ok=True)
@@ -289,7 +293,7 @@ class TestCheckpointCallback:
 
     def test_best_fn(self, tmp_path):
         """When best_fn is set, the best checkpoint should be retained."""
-        from jno.utils.callbacks import CheckpointCallback
+        from jno.utils.adaptive.callbacks import CheckpointCallback
 
         ckpt_dir = str(tmp_path / "ckpts")
         cb = CheckpointCallback(
@@ -310,7 +314,7 @@ class TestCheckpointCallback:
 
     def test_latest_step_property(self, tmp_path):
         """latest_step should return the most recent step number."""
-        from jno.utils.callbacks import CheckpointCallback
+        from jno.utils.adaptive.callbacks import CheckpointCallback
 
         ckpt_dir = str(tmp_path / "ckpts")
         cb = CheckpointCallback(
@@ -332,7 +336,7 @@ class TestCheckpointCallback:
         """nn.initialize should accept a numbered Orbax checkpoint directory."""
         import jno
         from jno.trace_compiler import TraceCompiler
-        from jno.utils.callbacks import CheckpointCallback
+        from jno.utils.adaptive.callbacks import CheckpointCallback
 
         ckpt_dir = Path(tmp_path / "ckpts")
         cb = CheckpointCallback(
@@ -371,7 +375,7 @@ class TestCheckpointCallback:
         """nn.initialize should accept an Orbax checkpoint root directory."""
         import jno
         from jno.trace_compiler import TraceCompiler
-        from jno.utils.callbacks import CheckpointCallback
+        from jno.utils.adaptive.callbacks import CheckpointCallback
 
         ckpt_dir = Path(tmp_path / "ckpts")
         cb = CheckpointCallback(
@@ -410,7 +414,7 @@ class TestCheckpointCallback:
         """Orbax restore should log matched/skipped parameter statistics."""
         import jno
         from jno.trace_compiler import TraceCompiler
-        from jno.utils.callbacks import CheckpointCallback
+        from jno.utils.adaptive.callbacks import CheckpointCallback
 
         ckpt_dir = Path(tmp_path / "ckpts")
         cb = CheckpointCallback(
@@ -475,7 +479,7 @@ class TestResumeFrom:
 
     def test_resume_restores_epoch(self, tmp_path):
         """After resuming, _total_epochs should reflect the checkpoint."""
-        from jno.utils.callbacks import CheckpointCallback
+        from jno.utils.adaptive.callbacks import CheckpointCallback
 
         ckpt_dir = str(tmp_path / "ckpts")
         cb = CheckpointCallback(
@@ -522,7 +526,7 @@ class TestRestoreCheckpointMethod:
 
     def test_restore_checkpoint_updates_state(self, tmp_path):
         """restore_checkpoint should update the solver's epoch counter."""
-        from jno.utils.callbacks import CheckpointCallback
+        from jno.utils.adaptive.callbacks import CheckpointCallback
 
         ckpt_dir = str(tmp_path / "ckpts")
         cb = CheckpointCallback(
@@ -575,7 +579,7 @@ class TestImportGuard:
         monkeypatch.setattr(builtins, "__import__", fake_import)
 
         # Need to reload to pick up the monkeypatch
-        from jno.utils.callbacks import CheckpointCallback as CC
+        from jno.utils.adaptive.callbacks import CheckpointCallback as CC
 
         with pytest.raises(ImportError, match="orbax-checkpoint"):
             CC(directory="/tmp/test")
@@ -591,7 +595,7 @@ class TestEarlyStoppingCallback:
 
     def test_stops_training(self):
         """Training should terminate before max epochs when loss plateaus."""
-        from jno.utils.callbacks import EarlyStoppingCallback
+        from jno.utils.adaptive.callbacks import EarlyStoppingCallback
 
         # patience=3 so it stops quickly; min_delta large enough to detect plateau
         cb = EarlyStoppingCallback(patience=3, min_delta=1e-3, verbose=False)
@@ -604,7 +608,7 @@ class TestEarlyStoppingCallback:
 
     def test_does_not_stop_when_improving(self):
         """With high patience, training should complete normally."""
-        from jno.utils.callbacks import EarlyStoppingCallback
+        from jno.utils.adaptive.callbacks import EarlyStoppingCallback
 
         cb = EarlyStoppingCallback(patience=10_000, verbose=False)
         solver = _make_solver(epochs=0)
@@ -614,7 +618,7 @@ class TestEarlyStoppingCallback:
 
     def test_mode_min(self):
         """mode='min' should detect when loss stops decreasing."""
-        from jno.utils.callbacks import EarlyStoppingCallback
+        from jno.utils.adaptive.callbacks import EarlyStoppingCallback
 
         cb = EarlyStoppingCallback(patience=5, mode="min", verbose=False)
 
@@ -629,7 +633,7 @@ class TestEarlyStoppingCallback:
 
     def test_mode_max(self):
         """mode='max' should detect when metric stops increasing."""
-        from jno.utils.callbacks import EarlyStoppingCallback
+        from jno.utils.adaptive.callbacks import EarlyStoppingCallback
 
         cb = EarlyStoppingCallback(
             patience=3,
@@ -648,7 +652,7 @@ class TestEarlyStoppingCallback:
 
     def test_mode_rel(self):
         """mode='rel' should use relative improvement threshold."""
-        from jno.utils.callbacks import EarlyStoppingCallback
+        from jno.utils.adaptive.callbacks import EarlyStoppingCallback
 
         cb = EarlyStoppingCallback(patience=2, mode="rel", min_delta=0.1, verbose=False)
 
@@ -663,7 +667,7 @@ class TestEarlyStoppingCallback:
 
     def test_baseline(self):
         """With a baseline, early stopping fires if metric never beats it."""
-        from jno.utils.callbacks import EarlyStoppingCallback
+        from jno.utils.adaptive.callbacks import EarlyStoppingCallback
 
         cb = EarlyStoppingCallback(patience=2, baseline=0.01, verbose=False)
 
@@ -677,14 +681,14 @@ class TestEarlyStoppingCallback:
 
     def test_invalid_mode_raises(self):
         """Invalid mode should raise ValueError."""
-        from jno.utils.callbacks import EarlyStoppingCallback
+        from jno.utils.adaptive.callbacks import EarlyStoppingCallback
 
         with pytest.raises(ValueError, match="mode"):
             EarlyStoppingCallback(mode="invalid")
 
     def test_custom_metric_fn(self):
         """A custom metric_fn should be used to extract the metric."""
-        from jno.utils.callbacks import EarlyStoppingCallback
+        from jno.utils.adaptive.callbacks import EarlyStoppingCallback
 
         # Monitor the first individual loss instead of total
         cb = EarlyStoppingCallback(

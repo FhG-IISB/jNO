@@ -1,22 +1,19 @@
 """
 jno.utils.adaptive
 ==================
-Adaptive scheduling package for PINNs.
-
-Use new-style imports only:
-
-    from jno.utils.adaptive.lrscheduler import LearningRateSchedule, DLRS, dlrs
-    from jno.utils.adaptive.weights import (
-        WeightSchedule,
-        ReLoBRaLo, relobralo,
-        LbPINNsLossBalancing, lbpinns_loss_balancing,
-    )
+Adaptive scheduling and resampling utilities for PINNs.
 """
+
+from importlib import import_module
 
 from .lrscheduler import LearningRateSchedule
 from .weights import WeightSchedule
+from .resampling import sampler
+from .callbacks import callbacks
 
 __all__ = [
     "LearningRateSchedule",
     "WeightSchedule",
+    "sampler",
+    "callbacks",
 ]

@@ -26,7 +26,8 @@ dependencies = [
     "cloudpickle>=3.0.0",
     "einops>=0.7.0",
     "matplotlib>=3.8.0",
-    "pylotte>=0.3"
+    "pylotte>=0.3",
+    "shapely>=2.0"
 ]
 
 [project.urls]

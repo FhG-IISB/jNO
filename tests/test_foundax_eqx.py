@@ -226,7 +226,8 @@ class TestForwardAndGrad:
 
     def test_morph_forward_grad(self):
         model = _make_morph()
-        x = jnp.zeros((1, 1, 1, 1, 8, 8, 8))
+        # foundax.morph expects (B, T, D, H, W, C) for 3D inputs.
+        x = jnp.zeros((1, 1, 8, 8, 8, 1))
 
         @eqx.filter_value_and_grad
         def loss_fn(m):
@@ -239,8 +240,8 @@ class TestForwardAndGrad:
 
     def test_mpp_forward_grad(self):
         model = _make_mpp()
-        # (T=1, B=1, C=n_states=3, H=32, W=32); H,W must be divisible by 16
-        x = jax.random.normal(jax.random.PRNGKey(0), (1, 1, 3, 32, 32))
+        # foundax.mpp expects (B, T, H, W, C); H,W must be divisible by 16.
+        x = jax.random.normal(jax.random.PRNGKey(0), (1, 1, 32, 32, 3))
         labels = jnp.array([0, 1, 2], dtype=jnp.int32)
         bcs = jnp.zeros((1, 2), dtype=jnp.int32)
 
@@ -254,8 +255,8 @@ class TestForwardAndGrad:
 
     def test_dpot_forward_grad(self):
         model = _make_dpot()
-        # (B, Sx, Sy, T=in_timesteps, C=in_channels)
-        x = jnp.zeros((1, 32, 32, 1, 1))
+        # foundax.dpot expects (B, T=in_timesteps, H, W, C=in_channels).
+        x = jnp.zeros((1, 1, 32, 32, 1))
 
         @eqx.filter_value_and_grad
         def loss_fn(m):

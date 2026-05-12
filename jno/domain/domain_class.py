@@ -45,6 +45,7 @@ class domain(MeshIOMixin):
     _mesh_pool: Dict[str, Any]
     context: Dict[str, Any]
     fem_context: Dict[str, Any]
+    mesh_connectivity: Optional[Dict[str, Any]]
 
     @classmethod
     def _from_geometry(
@@ -318,6 +319,30 @@ class domain(MeshIOMixin):
             compute_mesh_connectivity=compute_mesh_connectivity,
         )
 
+    @classmethod
+    def poly(
+        cls,
+        vertices,
+        *,
+        name: str = "polygon",
+        time: Optional[Tuple[float, float, int]] = None,
+        compute_mesh_connectivity: bool = False,
+    ) -> "domain":
+        """Instantiate a Shapely-backed polygon CSG domain.
+
+        This factory intentionally leaves :meth:`polygon` unchanged: the
+        historical ``domain.polygon(...)`` constructor remains mesh-backed,
+        while ``domain.poly(...)`` returns the separate lazy CSG domain class.
+        """
+        from .polygon_domain import PolygonDomain
+
+        return PolygonDomain(
+            vertices,
+            name=name,
+            time=time,
+            compute_mesh_connectivity=compute_mesh_connectivity,
+        )
+
     def __init__(
         self,
         constructor: Union[Callable, str, "domain", None] = None,
@@ -394,54 +419,12 @@ class domain(MeshIOMixin):
         if compute_mesh_connectivity is None:
             compute_mesh_connectivity = True
 
-        super().__init__()
-        self.log = get_logger()
-        self._algorithm = algorithm
-        self._constructor_source = constructor
-
-        # Storage
-        self.compute_mesh_connectivity = compute_mesh_connectivity
-        self._mesh_pool = {}  # full mesh vertices per tag (M, D)
-        self.context: Dict[str, Any] = {}  # unified: spatial (B,N,D) + params (B,F)
-        self._param_tags: set = set()  # tags that are parametric (TensorTag)
-        self.normals_by_tag: Dict[str, np.ndarray] = {}
-        self._boundary_registry: Dict[str, Dict[str, Any]] = {}
-        self._tag_edges: Dict[str, np.ndarray] = {}
-        self._tag_triangles: Dict[str, np.ndarray] = {}
-        self._boundary_regions: Dict[str, BoundaryRegion] = {}
-        # self._boundary_predicates: Dict[str, Callable] = {}
-
-        # Neural operator storage
-        self.parameters: Dict[str, Any] = {}
-        self.arrays: Dict[str, np.ndarray] = {}
-        self.tag_indices: Dict[str, np.ndarray] = {}
-        self.avaiable_mesh_tags: List[str] = []  # names of the tags from the mesh generator
-        self._boundary_loop_tags: set = set()  # tags extracted from line cells (boundary loops)
-        self.mesh_connectivity: Optional[Dict[str, Any]] = None  # precomputed mesh connectivity data
-        # Resampling support
-        self._mesh_points: Dict[str, np.ndarray] = {}  # Full mesh points for resampling
-        self._mesh_pool_groups: Dict[str, List[Tuple[int, Any]]] = {}  # Per-tag sampling groups as (batch_count, points)
-        self._normal_pool_groups: Dict[str, List[Tuple[int, np.ndarray]]] = {}  # Per-tag normal groups as (batch_count, normals)
-        self._resampling_strategies: Dict[str, Any] = {}  # Tag -> ResamplingStrategy
-        self._sub_domains: List[Dict[str, Any]] = []  # metadata from merged sub-domains
-        self._batch_domain_map: Optional[np.ndarray] = None  # maps batch index → sub-domain index
-
-        # Configuration
-        self.dimension: int = 2
-        self.total_samples: int = 1
-        self.time = time
-        self._is_time_dependent = time is not None
-        self._verbose = True
-        self.same_domain = False
-
-        # Tracking
-        self.index_tags: List[str] = []
-        self.normal_tags: List[str] = []
-        self.reference_solutions: List[Callable] = []
-        self.sample_dict: List = []
-
-        # Meshio mesh
-        self.mesh = None
+        self._init_empty_state(
+            constructor_source=constructor,
+            algorithm=algorithm,
+            time=time,
+            compute_mesh_connectivity=compute_mesh_connectivity,
+        )
 
         # Generate or load mesh / npz point cloud tags
         if isinstance(constructor, str):
@@ -491,6 +474,69 @@ class domain(MeshIOMixin):
             for tag, pts in self._mesh_pool.items():
                 if pts.shape[-1] > self.dimension:
                     self._mesh_pool[tag] = pts[..., : self.dimension]
+
+    def _init_empty_state(
+        self,
+        *,
+        constructor_source: Any = None,
+        algorithm: int = 6,
+        time: Optional[Tuple[float, float, int]] = None,
+        compute_mesh_connectivity: bool = True,
+    ) -> None:
+        """Initialize common domain bookkeeping without loading a mesh.
+
+        Subclasses that provide their own geometry/sampling backend can call
+        this to get the same context, tag, batching, and logging attributes as
+        regular mesh-backed domains.
+        """
+        super().__init__()
+        self.log = get_logger()
+        self._algorithm = algorithm
+        self._constructor_source = constructor_source
+
+        # Storage
+        self.compute_mesh_connectivity = compute_mesh_connectivity
+        self._mesh_pool = {}  # full mesh vertices per tag (M, D)
+        self.context: Dict[str, Any] = {}  # unified: spatial (B,N,D) + params (B,F)
+        self._param_tags: set = set()  # tags that are parametric (TensorTag)
+        self.normals_by_tag: Dict[str, np.ndarray] = {}
+        self._boundary_registry: Dict[str, Dict[str, Any]] = {}
+        self._tag_edges: Dict[str, np.ndarray] = {}
+        self._tag_triangles: Dict[str, np.ndarray] = {}
+        self._boundary_regions: Dict[str, BoundaryRegion] = {}
+        # self._boundary_predicates: Dict[str, Callable] = {}
+
+        # Neural operator storage
+        self.parameters: Dict[str, Any] = {}
+        self.arrays: Dict[str, np.ndarray] = {}
+        self.tag_indices: Dict[str, np.ndarray] = {}
+        self.avaiable_mesh_tags: List[str] = []  # names of the tags from the mesh generator
+        self._boundary_loop_tags: set = set()  # tags extracted from line cells (boundary loops)
+        self.mesh_connectivity = None  # precomputed mesh connectivity data
+        # Resampling support
+        self._mesh_points: Dict[str, np.ndarray] = {}  # Full mesh points for resampling
+        self._mesh_pool_groups: Dict[str, List[Tuple[int, Any]]] = {}  # Per-tag sampling groups as (batch_count, points)
+        self._normal_pool_groups: Dict[str, List[Tuple[int, np.ndarray]]] = {}  # Per-tag normal groups as (batch_count, normals)
+        self._resampling_strategies: Dict[str, Any] = {}  # Tag -> ResamplingStrategy
+        self._sub_domains: List[Dict[str, Any]] = []  # metadata from merged sub-domains
+        self._batch_domain_map: Optional[np.ndarray] = None  # maps batch index → sub-domain index
+
+        # Configuration
+        self.dimension: int = 2
+        self.total_samples: int = 1
+        self.time = time
+        self._is_time_dependent = time is not None
+        self._verbose = True
+        self.same_domain = False
+
+        # Tracking
+        self.index_tags: List[str] = []
+        self.normal_tags: List[str] = []
+        self.reference_solutions: List[Callable] = []
+        self.sample_dict: List = []
+
+        # Meshio mesh
+        self.mesh = None
 
     def _load_npz_tags(self, npz_file: str):
         """Load per-tag coordinate arrays from a .npz file.
