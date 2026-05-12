@@ -11,7 +11,6 @@ from .weights import WeightSchedule
 from .resampling import sampler
 from .callbacks import callbacks
 
-
 __all__ = [
     "LearningRateSchedule",
     "WeightSchedule",

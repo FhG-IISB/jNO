@@ -45,6 +45,7 @@ class domain(MeshIOMixin):
     _mesh_pool: Dict[str, Any]
     context: Dict[str, Any]
     fem_context: Dict[str, Any]
+    mesh_connectivity: Optional[Dict[str, Any]]
 
     @classmethod
     def _from_geometry(
@@ -511,7 +512,7 @@ class domain(MeshIOMixin):
         self.tag_indices: Dict[str, np.ndarray] = {}
         self.avaiable_mesh_tags: List[str] = []  # names of the tags from the mesh generator
         self._boundary_loop_tags: set = set()  # tags extracted from line cells (boundary loops)
-        self.mesh_connectivity: Optional[Dict[str, Any]] = None  # precomputed mesh connectivity data
+        self.mesh_connectivity = None  # precomputed mesh connectivity data
         # Resampling support
         self._mesh_points: Dict[str, np.ndarray] = {}  # Full mesh points for resampling
         self._mesh_pool_groups: Dict[str, List[Tuple[int, Any]]] = {}  # Per-tag sampling groups as (batch_count, points)
