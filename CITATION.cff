@@ -40,7 +40,7 @@ preferred-citation:
     - family-names: Straub
       given-names: Christopher
   title: "jNO: A JAX Library for Neural Operator and Foundation Model Training"
-  year: 2025
+  year: 2026
   doi: "10.48550/arXiv.2605.10159"
   url: "https://arxiv.org/abs/2605.10159"
   note: "Preprint on arXiv (arXiv:2605.10159)"
