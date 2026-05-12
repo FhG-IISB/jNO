@@ -3,11 +3,8 @@
 </p>
 
 <p align="center">
-    <a href="https://fhg-iisb.github.io/jNO_docs/">
+    <a href="https://fhg-iisb.github.io/jNO/">
         <img src="https://img.shields.io/badge/docs-GitHub%20Pages-0aa?style=for-the-badge" alt="Dev Docs"/>
-    </a>
-    <a href="https://fhg-iisb.github.io/jNO_docs/Tutorials/">
-        <img src="https://img.shields.io/badge/tutorials-step_by_step-0b8f7a?style=for-the-badge" alt="Dev Tutorials"/>
     </a>
     <a href="https://github.com/FhG-IISB/jno/actions/workflows/python-package.yml">
         <img src="https://img.shields.io/github/actions/workflow/status/FhG-IISB/jno/python-package.yml?branch=main&style=for-the-badge&label=tests" alt="Tests"/>
