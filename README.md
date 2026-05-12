@@ -30,13 +30,7 @@ pip install jax-neural-operators
 ```
 
 
-### Foundation Models and other neural networks
-
-These models are maintained in a seperate repository ([foundax](https://github.com/FhG-IISB/foundax)) so they can also be used independently.
-
-```bash
-pip install foundax
-```
+Foundation models and other neural operators  are maintained in a seperate repository ([foundax](https://github.com/FhG-IISB/foundax)) so they can also be used independently (foundax is installed automatically with this repository).
 
 # Minimal DeepONet Example
 
