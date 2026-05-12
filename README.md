@@ -108,17 +108,3 @@ These models are maintained in a seperate repository ([foundax](https://github.c
 pip install foundax
 ```
 
-
-## Citation
-
-If jNO is used we would appreciate to cite the following paper:
-
-```text
-@article{armbruster2026jNO,
-  author  = {Armbruster, Leon, ....},
-  title   = {{jNO}: A JAX Library for Neural Operator and PDE Foundation Model Training},
-  journal = {},
-  year    = {},
-}
-```
-
