@@ -1,10 +1,46 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it."
 title: "jNO: A JAX Library for Neural Operator and Foundation Model Training"
-version: 0.1.0
-date-released: 2026-01-01
+version: "0.2.1"
+date-released: 2026-03-26
+license: EPL-2.0
+repository-code: "https://github.com/FhG-IISB/jno"
+url: "https://github.com/FhG-IISB/jno"
+
+abstract: >
+  jNO (jax Neural Operators) is a JAX-native library for neural operators and foundation models with unified support for both data-driven and physics-informed training.
+  Its core design is a tracing system in which domains, model calls, residuals, supervised losses, and diagnostics are written in one symbolic language and compiled into one optimization pipeline.
+  This allows users to move between operator regression, mesh-aware residual evaluation, and PDE-constrained training without restructuring the surrounding code.
+  jNO also supports multi-model compositions, fine-grained control at parameter level (model, optimizer, and learning rate), hyperparameter tuning, and JAX-native workflows for translated PDE foundation-model families.
+
+keywords:
+  - JAX
+  - neural operators
+  - physics-informed machine learning
+  - PINNs
+  - PDEs
+  - foundation models
+  - scientific machine learning
+
 authors:
   - family-names: Armbruster
     given-names: Leon
-    affiliation: Fraunhofer IISB, Germany
-url: "https://github.com/FhG-IISB/jno"
+    affiliation: "Fraunhofer IISB, Germany"
+    orcid: "https://orcid.org/0009-0007-7602-362X"
+
+preferred-citation:
+  type: article
+  authors:
+    - family-names: Armbruster
+      given-names: Leon
+    - family-names: Ramesh
+      given-names: Rathan
+    - family-names: Kruse
+      given-names: Georg
+    - family-names: Straub
+      given-names: Christopher
+  title: "jNO: A JAX Library for Neural Operator and Foundation Model Training"
+  year: 2025
+  doi: "10.48550/arXiv.2605.10159"
+  url: "https://arxiv.org/abs/2605.10159"
+  note: "Preprint on arXiv (arXiv:2605.10159)"
