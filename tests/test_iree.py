@@ -193,7 +193,9 @@ def laplace1d_iree(laplace1d_solver):
     def infer(x_pts):  # x_pts: (1, 1, N, 1)
         return fn(models, {"interior": x_pts}, batchsize=None, key=rng)
 
-    x_sample = context["interior"]  # shape (1, 1, N, 1)
+    # Cast to float32: JAX traces the model in float32 (network params are f32),
+    # so IREE compiles an f32 kernel — runtime inputs must match.
+    x_sample = jnp.asarray(context["interior"], dtype=jnp.float32)
     iree_model = IREEModel.compile(infer, (x_sample,))
     return iree_model, solver, u, x_sample
 

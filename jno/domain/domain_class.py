@@ -1080,7 +1080,6 @@ class domain(MeshIOMixin):
         self._variational_sampling_registry = {}
 
         import feax as fe
-        import jax
         import jax.numpy as jnp
         import numpy as onp
         from feax.DCboundary import DirichletBCConfig
@@ -1791,7 +1790,7 @@ class domain(MeshIOMixin):
     def variable(
         self,
         tag: str,
-        sample: Union[Tuple[Optional[int], Optional[Callable]], jax.numpy.array, np.array] = (None, None),
+        sample: Union[Tuple[Optional[int], Optional[Callable]], np.ndarray, jnp.ndarray] = (None, None),
         resampling_strategy=None,
         normals: bool = False,
         reverse_normals: bool = False,
@@ -1910,13 +1909,13 @@ class domain(MeshIOMixin):
         # Check if it's a parametric (TensorTag) entry
         if tag in self._param_tags:
             if split:
-                return tuple(TensorTag(tag=tag, dim_index=i, domain=self) for i in range(sample.shape[-1]))  # type: ignore[attr-defined]
+                return tuple(TensorTag(tag=tag, dim_index=i, domain=self) for i in range(sample.shape[-1]))  # type: ignore[attr-defined,union-attr]
             else:
                 return TensorTag(tag=tag, domain=self)
 
         if point_data:
             if split:
-                return tuple(Variable(tag=tag, dim=[i, i + 1], domain=self) for i in range(sample.shape[-1]))  # type: ignore[attr-defined]
+                return tuple(Variable(tag=tag, dim=[i, i + 1], domain=self) for i in range(sample.shape[-1]))  # type: ignore[attr-defined,union-attr]
             else:
                 return Variable(tag=tag, dim=[0, None], domain=self)
 
