@@ -19,6 +19,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 
 # System libs required by gmsh (via pygmsh) at import time
 RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
         curl \
         libglu1-mesa \
         libgl1 \
@@ -28,9 +29,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libxinerama1 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install pixi
-RUN curl -fsSL https://pixi.sh/install.sh | bash
-ENV PATH="/root/.pixi/bin:$PATH"
+# Install pixi as a static binary directly on PATH
+RUN curl -fsSL https://github.com/prefix-dev/pixi/releases/latest/download/pixi-x86_64-unknown-linux-musl.tar.gz \
+    | tar -xz -C /usr/local/bin
 
 WORKDIR /app
 
@@ -41,8 +42,7 @@ COPY jno/ ./jno/
 # Install exact versions from the lock file — no network resolution at build time
 RUN pixi install --frozen
 
-# Prefer GPU; falls back to CPU if no GPU is present at runtime
-ENV JAX_PLATFORM_NAME=gpu
-
+# JAX auto-detects GPU when run with --gpus all (NVIDIA Container Toolkit).
+# Override at runtime with: docker run -e JAX_PLATFORM_NAME=gpu ...
 CMD ["pixi", "run", "python", "-c", \
      "import jax; import jno; print('jNO ready — devices:', jax.devices())"]
