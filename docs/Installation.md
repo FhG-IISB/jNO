@@ -169,67 +169,61 @@ Choose support profile, then Python version, then installer.
 ## Docker
 
 Use Docker when you want a reproducible runtime without managing local Python dependencies.
+The image targets `linux/amd64` and includes JAX's bundled CUDA runtime — no NVIDIA base
+image needed. You only need NVIDIA drivers and the
+[NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
+on the host.
 
-### Pre-built images
+### Pre-built image
 
-Images are published to GitHub Container Registry on release and on default-branch edge builds.
+Images are published to GitHub Container Registry on each release.
 
 | Tag | Description |
 |-----|-------------|
-| `ghcr.io/<owner>/jno:latest` | CPU image (linux/amd64) |
-| `ghcr.io/<owner>/jno:latest-cuda` | CUDA image (linux/amd64) |
-| `ghcr.io/<owner>/jno:edge` | Default-branch edge image (CPU) |
+| `ghcr.io/<owner>/jno:latest` | linux/amd64, GPU-capable (falls back to CPU) |
+| `ghcr.io/<owner>/jno:<version>` | pinned release, e.g. `0.2.1` |
 
-### Run pre-built images
+### Run
 
-CPU:
+CPU only:
 
 ```bash
-docker pull ghcr.io/<owner>/jno:latest
 docker run --rm ghcr.io/<owner>/jno:latest
 ```
 
-CUDA (pin to GPU 0):
+With GPU:
 
 ```bash
-docker pull ghcr.io/<owner>/jno:latest-cuda
-docker run --rm --gpus '"device=0"' ghcr.io/<owner>/jno:latest-cuda
+docker run --rm --gpus all ghcr.io/<owner>/jno:latest
+```
+
+### HPC / Apptainer
+
+Most HPC clusters use [Apptainer](https://apptainer.org) (formerly Singularity).
+Convert the Docker image once and run it with GPU passthrough:
+
+```bash
+apptainer pull jno.sif docker://ghcr.io/<owner>/jno:latest
+apptainer run --nv jno.sif
 ```
 
 ### Build locally
 
-CPU amd64:
-
 ```bash
-docker build -f Dockerfile.amd64 -t jno:cpu-amd64 .
-docker run --rm jno:cpu-amd64
-```
-
-CPU arm64:
-
-```bash
-docker build -f Dockerfile.arm64 -t jno:cpu-arm64 .
-docker run --rm jno:cpu-arm64
-```
-
-CUDA:
-
-```bash
-docker build -f Dockerfile.cuda -t jno:cuda .
-docker run --rm --gpus '"device=0"' jno:cuda
+docker build -t jno:latest .
+docker run --rm --gpus all jno:latest
 ```
 
 ### Environment variables
 
-| Variable | Image | Value | Description |
-|----------|-------|-------|-------------|
-| `DEBIAN_FRONTEND` | both | `noninteractive` | Suppress apt prompts during image build |
-| `PATH` | both | `/app/.venv/bin:...` | Prioritize uv-managed environment in container |
-| `JAX_PLATFORM_NAME` | CUDA | `gpu` | Prefer GPU backend in JAX |
+| Variable | Value | Description |
+|----------|-------|-------------|
+| `DEBIAN_FRONTEND` | `noninteractive` | Suppress apt prompts during image build |
+| `JAX_PLATFORM_NAME` | `gpu` | Prefer GPU backend; falls back to CPU if no GPU present |
 
 ### CI note
 
-Docker images are built by `.github/workflows/docker-release.yml` and pushed to GHCR.
+Images are built and pushed by `.github/workflows/docker-release.yml` on each GitHub release.
 
 ## Development Setup
 
