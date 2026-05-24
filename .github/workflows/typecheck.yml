@@ -16,19 +16,11 @@ jobs:
       with:
         python-version: "3.12"
 
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y libsuitesparse-dev build-essential
-
     - name: Install dependencies
       run: uv sync --all-extras --no-extra cuda
 
-    - name: Format with Black
-      run: uv run black --line-length 250 jno/ tests/
+    - name: Check formatting with ruff
+      run: uv run ruff format --check jno/ tests/
 
-    - name: Check formatting with black
-      run: uv run black --check --line-length 250 jno/ tests/
-
-    - name: Run mypy
-      run: uv run mypy jno/ --ignore-missing-imports --no-strict-optional
+    - name: Lint with ruff
+      run: uv run ruff check jno/ tests/
