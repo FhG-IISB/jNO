@@ -21,13 +21,11 @@ Showcases
 - external nonlinear solve using scipy.optimize.root
 """
 
+import jax.numpy as jnp
 import numpy as np
 import scipy.optimize as spo
 
-import jax.numpy as jnp
-
 import jno
-
 
 eps = 0.05
 

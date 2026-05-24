@@ -20,11 +20,11 @@ Architecture: (B, H, W, C) → Lift → [SpectralConv2D + Conv2D → LayerNorm �
 Reference: Li et al. "Fourier Neural Operator for Parametric PDEs" (2020)
 """
 
-import jax
-import jno
-
 import foundax
+import jax
 import optax
+
+import jno
 
 KEY = jax.random.PRNGKey(0)
 SAMPLES = 200
@@ -38,18 +38,20 @@ _f = domain.variable("_f")  # (S, 1, 1, H, W, 1)
 _u = domain.variable("_u")  # (S, 1, 1, H, W, 1)
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-u = jno.nn.wrap(foundax.fno2d(
-    in_features=1,
-    hidden_channels=48,
-    n_modes=24,
-    d_vars=1,
-    n_layers=4,
-    n_steps=1,
-    d_model=(GRID, GRID),
-    norm="layer",
-    linear_conv=True,  # non-periodic → suitable for Dirichlet BC
-    key=KEY,
-))
+u = jno.nn.wrap(
+    foundax.fno2d(
+        in_features=1,
+        hidden_channels=48,
+        n_modes=24,
+        d_vars=1,
+        n_layers=4,
+        n_steps=1,
+        d_model=(GRID, GRID),
+        norm="layer",
+        linear_conv=True,  # non-periodic → suitable for Dirichlet BC
+        key=KEY,
+    )
+)
 
 # ── Constraint & solver ───────────────────────────────────────────────────────
 crux = jno.core([(_u - u(_f)).mse], domain)

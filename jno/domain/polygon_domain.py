@@ -23,12 +23,31 @@ def _refresh_shapely_imports() -> None:
     global contains_xy, GeometryCollection, LineString, Point, Polygon
     global triangulate, unary_union, explain_validity, _SHAPELY_IMPORT_ERROR
 
-    if Point is not None and GeometryCollection is not None and LineString is not None and Polygon is not None and triangulate is not None and unary_union is not None:
+    if (
+        Point is not None
+        and GeometryCollection is not None
+        and LineString is not None
+        and Polygon is not None
+        and triangulate is not None
+        and unary_union is not None
+    ):
         return
 
     try:  # pragma: no cover - exercised only when the optional import is missing
-        from shapely.geometry import GeometryCollection as _GeometryCollection, LineString as _LineString, Point as _Point, Polygon as _Polygon
-        from shapely.ops import triangulate as _triangulate, unary_union as _unary_union
+        from shapely.geometry import (
+            GeometryCollection as _GeometryCollection,
+        )
+        from shapely.geometry import (
+            LineString as _LineString,
+        )
+        from shapely.geometry import (
+            Point as _Point,
+        )
+        from shapely.geometry import (
+            Polygon as _Polygon,
+        )
+        from shapely.ops import triangulate as _triangulate
+        from shapely.ops import unary_union as _unary_union
         from shapely.validation import explain_validity as _explain_validity
 
         try:
@@ -59,7 +78,9 @@ _GEOM_TOL = 1e-14
 def _require_shapely() -> None:
     _refresh_shapely_imports()
     if _SHAPELY_IMPORT_ERROR is not None:  # pragma: no cover
-        raise ImportError("PolygonDomain requires shapely. Install jno with shapely support or add `shapely>=2.0`.") from _SHAPELY_IMPORT_ERROR
+        raise ImportError(
+            "PolygonDomain requires shapely. Install jno with shapely support or add `shapely>=2.0`."
+        ) from _SHAPELY_IMPORT_ERROR
 
 
 def _as_xy_vertices(vertices: Sequence[Sequence[float]]) -> np.ndarray:
@@ -86,7 +107,9 @@ def _as_xy_vertices(vertices: Sequence[Sequence[float]]) -> np.ndarray:
     return arr
 
 
-def _polygon_from_vertices(vertices: Sequence[Sequence[float]]) -> Tuple[BaseGeometry, List[BaseGeometry]]:
+def _polygon_from_vertices(
+    vertices: Sequence[Sequence[float]],
+) -> Tuple[BaseGeometry, List[BaseGeometry]]:
     _require_shapely()
     arr = _as_xy_vertices(vertices)
     poly = Polygon(arr)  # type: ignore[operator]
@@ -230,8 +253,12 @@ class PolygonDomain(domain):
             geometry = _as_polygonal_geometry(geometry)
 
         self._active_geometry = geometry
-        self._source_regions: Dict[str, BaseGeometry] = {str(k): _as_polygonal_geometry(v) for k, v in (regions or {}).items()}
-        self._source_edges: Dict[str, List[BaseGeometry]] = {str(k): [_as_line_geometry(edge) for edge in edges] for k, edges in (source_edges or {}).items()}
+        self._source_regions: Dict[str, BaseGeometry] = {
+            str(k): _as_polygonal_geometry(v) for k, v in (regions or {}).items()
+        }
+        self._source_edges: Dict[str, List[BaseGeometry]] = {
+            str(k): [_as_line_geometry(edge) for edge in edges] for k, edges in (source_edges or {}).items()
+        }
         self._normal_eps = self._estimate_polygon_tol(self._active_geometry)
 
         if self._is_time_dependent:
@@ -347,7 +374,11 @@ class PolygonDomain(domain):
                 self._register_boundary_tag(tag, edge, normal_geometry=normal_geometry)
                 source_edge_geoms.append(edge)
             if source_edge_geoms:
-                self._register_boundary_tag(f"boundary_{name}", unary_union(source_edge_geoms), normal_geometry=region if region_is_active else self._active_geometry)  # type: ignore[misc]
+                self._register_boundary_tag(
+                    f"boundary_{name}",
+                    unary_union(source_edge_geoms),
+                    normal_geometry=region if region_is_active else self._active_geometry,
+                )  # type: ignore[misc]
 
     def _register_interior_tag(self, tag: str, geom: BaseGeometry) -> None:
         geom = _as_polygonal_geometry(geom)
@@ -356,7 +387,13 @@ class PolygonDomain(domain):
         self._polygon_tags[tag] = ("interior", geom)
         self.avaiable_mesh_tags.append(tag)
 
-    def _register_boundary_tag(self, tag: str, geom: BaseGeometry, *, normal_geometry: Optional[BaseGeometry] = None) -> None:
+    def _register_boundary_tag(
+        self,
+        tag: str,
+        geom: BaseGeometry,
+        *,
+        normal_geometry: Optional[BaseGeometry] = None,
+    ) -> None:
         geom = _as_line_geometry(geom)
         if geom.is_empty or geom.length <= _GEOM_TOL:
             return
@@ -366,7 +403,9 @@ class PolygonDomain(domain):
         points = _unique_segment_points(segments)
         self._polygon_tags[tag] = ("boundary", geom)
         self._polygon_boundary_segments[tag] = segments
-        self._polygon_boundary_normal_geometries[tag] = normal_geometry if normal_geometry is not None else self._active_geometry
+        self._polygon_boundary_normal_geometries[tag] = (
+            normal_geometry if normal_geometry is not None else self._active_geometry
+        )
         self.avaiable_mesh_tags.append(tag)
         self._boundary_regions[tag] = BoundaryRegion(
             tag=tag,
@@ -382,7 +421,13 @@ class PolygonDomain(domain):
             "points": points,
         }
 
-    def add_boundary_segments(self, tag: str, segments: Sequence[Sequence[Sequence[float]]], *, normal_geometry: Optional[Any] = None) -> "PolygonDomain":
+    def add_boundary_segments(
+        self,
+        tag: str,
+        segments: Sequence[Sequence[Sequence[float]]],
+        *,
+        normal_geometry: Optional[Any] = None,
+    ) -> "PolygonDomain":
         """Register an additional boundary tag from explicit line segments.
 
         This is intended for imported boundary-condition/radiation surfaces
@@ -406,7 +451,11 @@ class PolygonDomain(domain):
         if isinstance(normal_geometry, str):
             normal_geometry = self._source_regions.get(normal_geometry)
         elif isinstance(normal_geometry, Sequence) and not isinstance(normal_geometry, (bytes, bytearray)):
-            normal_parts = [self._source_regions[name] for name in normal_geometry if isinstance(name, str) and name in self._source_regions]
+            normal_parts = [
+                self._source_regions[name]
+                for name in normal_geometry
+                if isinstance(name, str) and name in self._source_regions
+            ]
             if normal_parts:
                 normal_geometry = _as_polygonal_geometry(unary_union(normal_parts))  # type: ignore[misc]
 
@@ -462,7 +511,10 @@ class PolygonDomain(domain):
             if contains_xy is not None:
                 mask = np.asarray(contains_xy(geom, xs, ys), dtype=bool)
             else:  # pragma: no cover
-                mask = np.asarray([geom.contains(Point(float(x), float(y))) for x, y in zip(xs, ys)], dtype=bool)
+                mask = np.asarray(
+                    [geom.contains(Point(float(x), float(y))) for x, y in zip(xs, ys)],
+                    dtype=bool,
+                )
             pts = np.column_stack([xs[mask], ys[mask]])
             if len(pts) == 0:
                 continue
@@ -510,10 +562,22 @@ class PolygonDomain(domain):
         normals = None
         if with_normals:
             normal_geometry = self._polygon_boundary_normal_geometries.get(tag, self._active_geometry)
-            normals = np.stack([self._outward_normal(p0_i, p0_i + vec_i, pt_i, normal_geometry) for p0_i, vec_i, pt_i in zip(p0, vec, points)], axis=0)
+            normals = np.stack(
+                [
+                    self._outward_normal(p0_i, p0_i + vec_i, pt_i, normal_geometry)
+                    for p0_i, vec_i, pt_i in zip(p0, vec, points)
+                ],
+                axis=0,
+            )
         return points, normals
 
-    def _outward_normal(self, p0: np.ndarray, p1: np.ndarray, point: np.ndarray, normal_geometry: BaseGeometry) -> np.ndarray:
+    def _outward_normal(
+        self,
+        p0: np.ndarray,
+        p1: np.ndarray,
+        point: np.ndarray,
+        normal_geometry: BaseGeometry,
+    ) -> np.ndarray:
         tangent = p1 - p0
         length = float(np.linalg.norm(tangent))
         if length <= _GEOM_TOL:
@@ -534,7 +598,9 @@ class PolygonDomain(domain):
         return left
 
     @staticmethod
-    def _segment_key(segment: np.ndarray) -> Tuple[Tuple[float, float], Tuple[float, float]]:
+    def _segment_key(
+        segment: np.ndarray,
+    ) -> Tuple[Tuple[float, float], Tuple[float, float]]:
         start = tuple(np.round(segment[0], decimals=14))
         end = tuple(np.round(segment[1], decimals=14))
         return tuple(sorted((start, end)))  # type: ignore[return-value]
@@ -668,7 +734,12 @@ class PolygonDomain(domain):
             medium = _as_polygonal_geometry(medium.difference(unary_union(solid_parts)))  # type: ignore[misc]
         return medium
 
-    def _orient_normals_to_medium(self, points: np.ndarray, normals: np.ndarray, medium_geom: Optional[BaseGeometry]) -> np.ndarray:
+    def _orient_normals_to_medium(
+        self,
+        points: np.ndarray,
+        normals: np.ndarray,
+        medium_geom: Optional[BaseGeometry],
+    ) -> np.ndarray:
         if medium_geom is None or medium_geom.is_empty:
             return normals
 
@@ -685,7 +756,12 @@ class PolygonDomain(domain):
                 oriented[idx] = -normal
         return oriented
 
-    def _filter_visibility_to_medium(self, points: np.ndarray, visibility: np.ndarray, medium_geom: Optional[BaseGeometry]) -> np.ndarray:
+    def _filter_visibility_to_medium(
+        self,
+        points: np.ndarray,
+        visibility: np.ndarray,
+        medium_geom: Optional[BaseGeometry],
+    ) -> np.ndarray:
         """Keep only visible rays whose interiors travel through the radiation medium.
 
         Segment-intersection ray tracing correctly blocks rays crossing opaque
@@ -713,9 +789,15 @@ class PolygonDomain(domain):
             samples = source[None, None, :] + fractions[None, :, None] * (targets[:, None, :] - source[None, None, :])
             flat_samples = samples.reshape(-1, 2)
             if contains_xy is not None:
-                inside = np.asarray(contains_xy(medium_buffer, flat_samples[:, 0], flat_samples[:, 1]), dtype=bool)
+                inside = np.asarray(
+                    contains_xy(medium_buffer, flat_samples[:, 0], flat_samples[:, 1]),
+                    dtype=bool,
+                )
             else:  # pragma: no cover
-                inside = np.asarray([medium_buffer.contains(Point(float(x), float(y))) for x, y in flat_samples], dtype=bool)
+                inside = np.asarray(
+                    [medium_buffer.contains(Point(float(x), float(y))) for x, y in flat_samples],
+                    dtype=bool,
+                )
             valid = inside.reshape(len(candidate_idx), len(fractions)).all(axis=1)
             if np.any(~valid):
                 blocked_count += int(np.sum(~valid))
@@ -725,7 +807,13 @@ class PolygonDomain(domain):
             self.log.info(f"Blocked {blocked_count} polygon visibility rays outside the radiation medium")
         return filtered
 
-    def _filter_visibility_by_normals(self, points: np.ndarray, normals: np.ndarray, visibility: np.ndarray, tol: float = 1e-12) -> np.ndarray:
+    def _filter_visibility_by_normals(
+        self,
+        points: np.ndarray,
+        normals: np.ndarray,
+        visibility: np.ndarray,
+        tol: float = 1e-12,
+    ) -> np.ndarray:
         """Keep only rays for which both boundary normals face the segment.
 
         For radiative exchange, point ``j`` is only visible from point ``i`` if
@@ -755,9 +843,13 @@ class PolygonDomain(domain):
 
     def _sampled_boundary_arrays(self, tag: str) -> Tuple[np.ndarray, np.ndarray]:
         if tag not in self.context:
-            raise ValueError(f"Boundary tag '{tag}' not yet sampled. Call domain.variable('{tag}', sample=(n, None), normals=True) first.")
+            raise ValueError(
+                f"Boundary tag '{tag}' not yet sampled. Call domain.variable('{tag}', sample=(n, None), normals=True) first."
+            )
         if f"n_{tag}" not in self.context:
-            raise ValueError(f"Boundary tag '{tag}' needs normals. Call domain.variable('{tag}', sample=(n, None), normals=True) first.")
+            raise ValueError(
+                f"Boundary tag '{tag}' needs normals. Call domain.variable('{tag}', sample=(n, None), normals=True) first."
+            )
         points = np.asarray(self.context[tag], dtype=np.float64)
         normals = np.asarray(self.context[f"n_{tag}"], dtype=np.float64)
         while points.ndim > 2:
@@ -907,7 +999,9 @@ class PolygonDomain(domain):
 
         medium_info = f", medium=[{', '.join(medium_names)}]" if medium_names else ""
         opaque_info = f", opaque=[{', '.join(map(str, opaque_tags))}]" if opaque_tags else ""
-        self.log.info(f"Computed polygon enclosure view factors for [{', '.join(tags)}]{medium_info}{opaque_info} ({all_points.shape[0]} total boundary pts)")
+        self.log.info(
+            f"Computed polygon enclosure view factors for [{', '.join(tags)}]{medium_info}{opaque_info} ({all_points.shape[0]} total boundary pts)"
+        )
         return tuple(result)
 
     def sample(
@@ -926,9 +1020,13 @@ class PolygonDomain(domain):
                 available = sorted(self._polygon_tags)
                 raise ValueError(f"Tag '{requested_tag}' not found on PolygonDomain. Available polygon tags: {available}")
             if sampler is not None:
-                raise ValueError("PolygonDomain currently uses its built-in geometric samplers; custom samplers are not supported")
+                raise ValueError(
+                    "PolygonDomain currently uses its built-in geometric samplers; custom samplers are not supported"
+                )
             if n_samples is None:
-                raise ValueError("PolygonDomain tags are lazy and require an explicit sample count, e.g. sample=(500, None)")
+                raise ValueError(
+                    "PolygonDomain tags are lazy and require an explicit sample count, e.g. sample=(500, None)"
+                )
             if n_samples < 0:
                 raise ValueError(f"n_samples must be non-negative, got {n_samples}")
 
@@ -951,11 +1049,17 @@ class PolygonDomain(domain):
 
             spatial = np.stack(all_points, axis=0)
             if self._is_time_dependent:
-                t_points = np.asarray(getattr(self, "_time_points", [self.time[0] if self.time else 0.0]), dtype=float)
+                t_points = np.asarray(
+                    getattr(self, "_time_points", [self.time[0] if self.time else 0.0]),
+                    dtype=float,
+                )
                 if time_value is not None:
                     tidx = int(np.argmin(np.abs(t_points - float(time_value))))
                     n_time = 1
-                    self.context[f"__time_{tag}__"] = np.asarray([[t_points[tidx]]], dtype=np.asarray(self.context["__time__"]).dtype)
+                    self.context[f"__time_{tag}__"] = np.asarray(
+                        [[t_points[tidx]]],
+                        dtype=np.asarray(self.context["__time__"]).dtype,
+                    )
                 else:
                     n_time = len(t_points)
                 arr = np.broadcast_to(spatial[:, np.newaxis, :, :], (batch_count, n_time, n_samples, 2)).copy()
@@ -966,14 +1070,18 @@ class PolygonDomain(domain):
             if normals and all_normals:
                 normal_arr = np.stack(all_normals, axis=0)
                 n_time = arr.shape[1]
-                self.context[f"n_{tag}"] = np.broadcast_to(normal_arr[:, np.newaxis, :, :], (batch_count, n_time, n_samples, 2)).copy()
+                self.context[f"n_{tag}"] = np.broadcast_to(
+                    normal_arr[:, np.newaxis, :, :], (batch_count, n_time, n_samples, 2)
+                ).copy()
 
             self._mesh_points[tag] = arr[0, 0].copy() if arr.size else np.zeros((0, 2), dtype=np.float64)
             last_tag = tag
             last_idx = np.arange(n_samples, dtype=int) if return_indices else None
             if self._verbose:
                 if batch_count > 1:
-                    self.log.info(f"Sampled {n_samples} x {batch_count} = {batch_count * n_samples} polygon points for '{tag}' with shape {arr.shape}")
+                    self.log.info(
+                        f"Sampled {n_samples} x {batch_count} = {batch_count * n_samples} polygon points for '{tag}' with shape {arr.shape}"
+                    )
                 else:
                     self.log.info(f"Sampled {n_samples} polygon points for '{tag}'")
 
@@ -1015,7 +1123,9 @@ class PolygonDomain(domain):
                 tag = sampled_tag
                 sample = None  # type: ignore[assignment]
             elif tag not in self.context:
-                raise ValueError(f"PolygonDomain tag '{tag}' is lazy. Use variable('{tag}', sample=(n, None)) to materialize points.")
+                raise ValueError(
+                    f"PolygonDomain tag '{tag}' is lazy. Use variable('{tag}', sample=(n, None)) to materialize points."
+                )
 
         result = super().variable(
             tag,
@@ -1095,19 +1205,35 @@ class PolygonDomain(domain):
 
     def union(self, other: Any) -> "PolygonDomain":
         other_poly = self._coerce_other(other)
-        return self._new_from_csg(other_poly, self._active_geometry.union(other_poly._active_geometry), "union")
+        return self._new_from_csg(
+            other_poly,
+            self._active_geometry.union(other_poly._active_geometry),
+            "union",
+        )
 
     def intersection(self, other: Any) -> "PolygonDomain":
         other_poly = self._coerce_other(other)
-        return self._new_from_csg(other_poly, self._active_geometry.intersection(other_poly._active_geometry), "intersection")
+        return self._new_from_csg(
+            other_poly,
+            self._active_geometry.intersection(other_poly._active_geometry),
+            "intersection",
+        )
 
     def difference(self, other: Any) -> "PolygonDomain":
         other_poly = self._coerce_other(other)
-        return self._new_from_csg(other_poly, self._active_geometry.difference(other_poly._active_geometry), "difference")
+        return self._new_from_csg(
+            other_poly,
+            self._active_geometry.difference(other_poly._active_geometry),
+            "difference",
+        )
 
     def symmetric_difference(self, other: Any) -> "PolygonDomain":
         other_poly = self._coerce_other(other)
-        return self._new_from_csg(other_poly, self._active_geometry.symmetric_difference(other_poly._active_geometry), "symmetric_difference")
+        return self._new_from_csg(
+            other_poly,
+            self._active_geometry.symmetric_difference(other_poly._active_geometry),
+            "symmetric_difference",
+        )
 
     def __add__(self, other: Any) -> "PolygonDomain":
         return self.union(other)

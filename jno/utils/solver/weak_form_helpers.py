@@ -18,30 +18,30 @@ from typing import Optional
 
 from ...jnp_ops import stack
 from ...trace import (
-    Placeholder,
-    Literal,
+    Assembly,
     BinaryOp,
+    Constant,
     FunctionCall,
-    Variable,
-    ModelCall,
-    OperationDef,
-    OperationCall,
-    Jacobian,
+    GroupedAssembly,
     Hessian,
+    Jacobian,
+    Literal,
+    ModelCall,
+    OperationCall,
+    OperationDef,
+    Placeholder,
+    StateField,
+    TensorTag,
+    TestFunction,
     Tracker,
     TrialFunction,
-    TestFunction,
-    TensorTag,
-    Constant,
-    Assembly,
-    GroupedAssembly,
-    StateField,
+    Variable,
 )
 from .solver_helper import (
-    contains_node_type,
-    iter_placeholder_children,
     contains_model_eval,
+    contains_node_type,
     depends_on_domain_variables,
+    iter_placeholder_children,
     unique_by_id,
 )
 
@@ -71,10 +71,14 @@ def split_weak_additive_terms(domain, node, sign=1.0, infer_term_bucket=None):
                 return [(sign, node)]
 
         if node.op == "+":
-            return split_weak_additive_terms(domain, node.left, sign, infer_term_bucket) + split_weak_additive_terms(domain, node.right, sign, infer_term_bucket)
+            return split_weak_additive_terms(domain, node.left, sign, infer_term_bucket) + split_weak_additive_terms(
+                domain, node.right, sign, infer_term_bucket
+            )
 
         if node.op == "-":
-            return split_weak_additive_terms(domain, node.left, sign, infer_term_bucket) + split_weak_additive_terms(domain, node.right, -sign, infer_term_bucket)
+            return split_weak_additive_terms(domain, node.left, sign, infer_term_bucket) + split_weak_additive_terms(
+                domain, node.right, -sign, infer_term_bucket
+            )
 
     return [(sign, node)]
 
@@ -103,7 +107,10 @@ def get_grad_axis_from_test_grad(node) -> int:
         raise TypeError(f"Expected Jacobian(TestFunction), got {type(node).__name__}")
 
     if len(node.variables) != 1:
-        raise ValueError("Canonical FEAX-style test_grad lowering currently expects exactly one " f"spatial variable in Jacobian(TestFunction,...), got {len(node.variables)}")
+        raise ValueError(
+            "Canonical FEAX-style test_grad lowering currently expects exactly one "
+            f"spatial variable in Jacobian(TestFunction,...), got {len(node.variables)}"
+        )
 
     var = node.variables[0]
     if not isinstance(var, Variable):
@@ -202,7 +209,11 @@ def contains_testfunction_gradient(domain, expr):
 
 
 def has_weak_basis_symbols(domain, node):
-    return contains_node_type(node, TestFunction) or contains_node_type(node, TrialFunction) or contains_testfunction_gradient(domain, node)
+    return (
+        contains_node_type(node, TestFunction)
+        or contains_node_type(node, TrialFunction)
+        or contains_testfunction_gradient(domain, node)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -260,14 +271,22 @@ def infer_term_bucket(domain, term):
 
         for m in metas[1:]:
             if m["support"] != support or m["region_id"] != region_id:
-                raise ValueError("Weak-form term mixes variational regions. " f"Found both ({support}, {region_id}) and " f"({m['support']}, {m['region_id']}).")
+                raise ValueError(
+                    "Weak-form term mixes variational regions. "
+                    f"Found both ({support}, {region_id}) and "
+                    f"({m['support']}, {m['region_id']})."
+                )
 
         return support, region_id
 
     if contains_node_type(term, TrialFunction) or contains_node_type(term, TestFunction):
         return "volume", "volume"
 
-    raise ValueError("Could not infer weak-form support for term. " "Use variables sampled on fem_gauss / gauss_<tag> inside the term " "or include TrialFunction/TestFunction.")
+    raise ValueError(
+        "Could not infer weak-form support for term. "
+        "Use variables sampled on fem_gauss / gauss_<tag> inside the term "
+        "or include TrialFunction/TestFunction."
+    )
 
 
 def get_variational_region_meta(domain, support: str, region_id: str):
@@ -283,7 +302,9 @@ def get_variational_region_meta(domain, support: str, region_id: str):
         if meta.get("support") == support and meta.get("region_id") == region_id:
             return meta
 
-    raise KeyError(f"No variational sampling meta found for support={support!r}, " f"region_id={region_id!r}. Available: {registry}")
+    raise KeyError(
+        f"No variational sampling meta found for support={support!r}, region_id={region_id!r}. Available: {registry}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +357,9 @@ def infer_state_value_shape(domain, expr) -> tuple:
     if len(shapes) == 1:
         return next(iter(shapes))
 
-    raise NotImplementedError("Could not infer a unique state value_shape from the weak form. " f"Found multiple test value shapes: {sorted(shapes)}")
+    raise NotImplementedError(
+        f"Could not infer a unique state value_shape from the weak form. Found multiple test value shapes: {sorted(shapes)}"
+    )
 
 
 def wrap_primary_state(node, target, *, state_name="u", value_shape=()):
@@ -645,7 +668,11 @@ def detect_primary_state_field(domain, expr):
         return deriv_targets[0]
 
     if len(deriv_targets) > 1:
-        raise NotImplementedError("Multiple derivative-based state targets detected in weak form. " "Phase 1 supports exactly one unknown. " "Phase 3 will support multi-unknown systems.")
+        raise NotImplementedError(
+            "Multiple derivative-based state targets detected in weak form. "
+            "Phase 1 supports exactly one unknown. "
+            "Phase 3 will support multi-unknown systems."
+        )
 
     # Fallback for weak forms without grad(u), e.g. pure reaction-like forms.
     candidates = []
@@ -656,7 +683,11 @@ def detect_primary_state_field(domain, expr):
         return None
 
     if len(candidates) > 1:
-        raise NotImplementedError("Multiple state-field candidates detected in weak form. " "Phase 1 supports exactly one unknown. " "Phase 3 will support multi-unknown systems.")
+        raise NotImplementedError(
+            "Multiple state-field candidates detected in weak form. "
+            "Phase 1 supports exactly one unknown. "
+            "Phase 3 will support multi-unknown systems."
+        )
 
     return candidates[0]
 
@@ -715,7 +746,10 @@ def rebind_variational_variables(domain, node, target_support: str, target_regio
         return node
 
     if isinstance(node, FunctionCall):
-        new_args = [rebind_variational_variables(domain, a, target_support, target_region_id) if isinstance(a, Placeholder) else a for a in node.args]
+        new_args = [
+            rebind_variational_variables(domain, a, target_support, target_region_id) if isinstance(a, Placeholder) else a
+            for a in node.args
+        ]
 
         if any(n is not o for n, o in zip(new_args, node.args)):
             return FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
@@ -723,7 +757,10 @@ def rebind_variational_variables(domain, node, target_support: str, target_regio
         return node
 
     if isinstance(node, ModelCall):
-        new_args = [rebind_variational_variables(domain, a, target_support, target_region_id) if isinstance(a, Placeholder) else a for a in node.args]
+        new_args = [
+            rebind_variational_variables(domain, a, target_support, target_region_id) if isinstance(a, Placeholder) else a
+            for a in node.args
+        ]
 
         if any(n is not o for n, o in zip(new_args, node.args)):
             rebuilt_model = ModelCall(node.model, new_args)
@@ -751,7 +788,10 @@ def rebind_variational_variables(domain, node, target_support: str, target_regio
         return node
 
     if isinstance(node, OperationCall):
-        new_args = [rebind_variational_variables(domain, a, target_support, target_region_id) if isinstance(a, Placeholder) else a for a in node.args]
+        new_args = [
+            rebind_variational_variables(domain, a, target_support, target_region_id) if isinstance(a, Placeholder) else a
+            for a in node.args
+        ]
 
         if any(n is not o for n, o in zip(new_args, node.args)):
             rebuilt_opcall = OperationCall(node.operation, tuple(new_args))
@@ -767,7 +807,10 @@ def rebind_variational_variables(domain, node, target_support: str, target_regio
             target_support,
             target_region_id,
         )
-        new_vars = [rebind_variational_variables(domain, v, target_support, target_region_id) if isinstance(v, Placeholder) else v for v in node.variables]
+        new_vars = [
+            rebind_variational_variables(domain, v, target_support, target_region_id) if isinstance(v, Placeholder) else v
+            for v in node.variables
+        ]
 
         if new_target is not node.target or any(n is not o for n, o in zip(new_vars, node.variables)):
             return Jacobian(new_target, new_vars, node.scheme)
@@ -781,7 +824,10 @@ def rebind_variational_variables(domain, node, target_support: str, target_regio
             target_support,
             target_region_id,
         )
-        new_vars = [rebind_variational_variables(domain, v, target_support, target_region_id) if isinstance(v, Placeholder) else v for v in node.variables]
+        new_vars = [
+            rebind_variational_variables(domain, v, target_support, target_region_id) if isinstance(v, Placeholder) else v
+            for v in node.variables
+        ]
 
         if new_target is not node.target or any(n is not o for n, o in zip(new_vars, node.variables)):
             return Hessian(new_target, new_vars, node.scheme, trace=node.trace)
@@ -838,9 +884,16 @@ def rebind_variational_variables(domain, node, target_support: str, target_regio
             if node.volume_grad_expr is not None
             else None
         )
-        bnd_exprs = {k: rebind_variational_variables(domain, v, target_support, target_region_id) for k, v in node.boundary_value_exprs.items()}
+        bnd_exprs = {
+            k: rebind_variational_variables(domain, v, target_support, target_region_id)
+            for k, v in node.boundary_value_exprs.items()
+        }
 
-        if vol_val is not node.volume_value_expr or vol_grad is not node.volume_grad_expr or any(bnd_exprs[k] is not node.boundary_value_exprs[k] for k in bnd_exprs):
+        if (
+            vol_val is not node.volume_value_expr
+            or vol_grad is not node.volume_grad_expr
+            or any(bnd_exprs[k] is not node.boundary_value_exprs[k] for k in bnd_exprs)
+        ):
             rebuilt = GroupedAssembly(vol_val, vol_grad, bnd_exprs, node.num_total_nodes)
             rebuilt.op_id = node.op_id
             return rebuilt
@@ -1286,7 +1339,11 @@ def substitute_trial_for_vpinn(
             for k, v in node.boundary_value_exprs.items()
         }
 
-        if vol_val is not node.volume_value_expr or vol_grad is not node.volume_grad_expr or any(bnd_exprs[k] is not node.boundary_value_exprs[k] for k in bnd_exprs):
+        if (
+            vol_val is not node.volume_value_expr
+            or vol_grad is not node.volume_grad_expr
+            or any(bnd_exprs[k] is not node.boundary_value_exprs[k] for k in bnd_exprs)
+        ):
             rebuilt_grouped = GroupedAssembly(
                 vol_val,
                 vol_grad,

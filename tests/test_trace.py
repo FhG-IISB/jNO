@@ -1,25 +1,22 @@
 """Unit tests for jno.trace — the symbolic tracing DSL."""
 
-import pytest
-import jax.numpy as jnp
 import foundax
+import jax.numpy as jnp
+import pytest
 
 from jno.trace import (
-    Placeholder,
-    FunctionCall,
-    Choice,
-    Literal,
-    ConstantNamespace,
-    Constant,
-    Variable,
-    TensorTag,
     BinaryOp,
-    Model,
-    ModelCall,
-    OperationDef,
-    OperationCall,
+    Choice,
+    Constant,
+    ConstantNamespace,
+    FunctionCall,
     Hessian,
     Jacobian,
+    Literal,
+    ModelCall,
+    OperationCall,
+    OperationDef,
+    TensorTag,
     collect_operations,
 )
 from tests.conftest import make_var
@@ -299,6 +296,7 @@ class TestModelMask:
 
     def _make_eqx_model(self):
         import jax
+
         import jno.jnp_ops as jnn
 
         key = jax.random.PRNGKey(0)
@@ -307,11 +305,10 @@ class TestModelMask:
     def test_mask_stores_param_mask(self):
         """mask() stores the pytree on _param_mask."""
         import jax
-        import equinox as eqx
 
         u_net = self._make_eqx_model()
         all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
-        result = u_net.mask(all_true)
+        _result = u_net.mask(all_true)
         assert u_net._param_mask is all_true
 
     def test_mask_returns_self(self):
@@ -324,7 +321,8 @@ class TestModelMask:
 
     def test_mask_then_optimizer_chains(self):
         """mask().optimizer() sets both _param_mask and _opt_fn."""
-        import jax, optax
+        import jax
+        import optax
 
         u_net = self._make_eqx_model()
         all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
@@ -491,7 +489,8 @@ class TestModelMask:
 
     def test_model_call_mask_chains_with_optimizer(self):
         """ModelCall.mask().optimizer() sets mask and optimizer on the model."""
-        import jax, optax
+        import jax
+        import optax
 
         u_net = self._make_eqx_model()
         x = make_var("x")
@@ -507,8 +506,8 @@ class TestModelMask:
 
     def test_partial_mask_structure(self):
         """A partial mask (some True, some False) is stored as-is."""
-        import jax
         import equinox as eqx
+        import jax
 
         u_net = self._make_eqx_model()
         # Build a mask: only first hidden layer trainable

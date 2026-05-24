@@ -4,7 +4,7 @@ import pytest
 
 from jno import fn
 from jno.trace_evaluator import TraceEvaluator
-from tests.conftest import make_var, MockDomain
+from tests.conftest import MockDomain, make_var
 
 
 def _eval(expr, context):

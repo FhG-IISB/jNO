@@ -1,24 +1,19 @@
 """Integration tests — end-to-end traces through compile + evaluate."""
 
-import pytest
-import jax
-import jax.numpy as jnp
 import equinox as eqx
 import foundax
+import jax
+import jax.numpy as jnp
+import pytest
 
 from jno.trace import (
+    ConstantNamespace,
+    Jacobian,
     Literal,
     Model,
     OperationDef,
-    Jacobian,
-    Hessian,
-    Constant,
-    ConstantNamespace,
-    BinaryOp,
-    FunctionCall,
     collect_operations,
 )
-from jno.trace_evaluator import TraceEvaluator
 from jno.trace_compiler import TraceCompiler
 from tests.conftest import make_var
 
@@ -171,9 +166,10 @@ class TestRegressions:
 
     def test_choice_is_sweepable(self):
         """A jnn.choice(...) branch index is exposed to core.sweep()."""
+        import optax
+
         import jno
         import jno.jnp_ops as jnn
-        import optax
         from jno.tuner import ArchSpace
 
         dom = jno.domain(constructor=jno.domain.rect(mesh_size=0.5))
@@ -225,6 +221,7 @@ class TestMemoryStrategies:
     def test_default_solve(self):
         """Baseline: default solve (no new flags) still works."""
         import optax
+
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
@@ -302,6 +299,7 @@ class TestMemoryStrategies:
     def test_checkpoint_gradients(self):
         """Gradient checkpointing (activation rematerialisation) runs end-to-end."""
         import optax
+
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
@@ -318,6 +316,7 @@ class TestMemoryStrategies:
     def test_offload_data_with_batchsize(self):
         """Host-resident data: stream mini-batches each step."""
         import optax
+
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
@@ -333,6 +332,7 @@ class TestMemoryStrategies:
     def test_offload_data_without_batchsize_is_ignored(self):
         """offload_data=True without batchsize falls back to on-device."""
         import optax
+
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
@@ -347,6 +347,7 @@ class TestMemoryStrategies:
     def test_checkpoint_and_offload_combined(self):
         """Both checkpoint_gradients and offload_data active together."""
         import optax
+
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
@@ -367,6 +368,7 @@ class TestMemoryStrategies:
     def test_loss_decreases(self):
         """Sanity: loss should decrease over enough epochs."""
         import optax
+
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
@@ -379,6 +381,7 @@ class TestMemoryStrategies:
     def test_multiple_solve_calls(self):
         """Calling solve() twice accumulates training logs."""
         import optax
+
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
@@ -392,6 +395,7 @@ class TestMemoryStrategies:
     def test_log_keys_complete(self):
         """Log dict contains all expected keys."""
         import optax
+
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
@@ -419,9 +423,9 @@ class TestParamMask:
         of bools with the same structure.
         """
         import jax
+
         import jno
         import jno.jnp_ops as jnn
-        import equinox as eqx
 
         domain = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.05))
         x, *_ = domain.variable("interior")
@@ -436,9 +440,10 @@ class TestParamMask:
     def test_partial_mask_solve_produces_finite_loss(self):
         """Solve with a partial mask (first hidden layer only) runs without
         errors and produces a finite loss."""
+        import equinox as eqx
         import jax
         import optax
-        import equinox as eqx
+
         from jno import LearningRateSchedule as lrs
 
         def make_mask(module):
@@ -457,9 +462,10 @@ class TestParamMask:
 
     def test_masked_out_params_do_not_change(self):
         """Weights masked to False must not be modified by the optimizer."""
+        import equinox as eqx
         import jax
         import optax
-        import equinox as eqx
+
         from jno import LearningRateSchedule as lrs
 
         def make_mask(module):
@@ -495,17 +501,21 @@ class TestParamMask:
         import jax
         import jax.numpy as jnp
         import optax
-        import equinox as eqx
-        from jno import LearningRateSchedule as lrs
+
         import jno
         import jno.jnp_ops as jnn
+        from jno import LearningRateSchedule as lrs
 
         def make_masked(seed):
             domain = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.05))
             x, *_ = domain.variable("interior")
             key = jax.random.PRNGKey(seed)
             u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key))
-            return u_net, domain, jno.core([jnn.laplacian(u_net(x) * x * (1 - x), [x]).mse], domain)
+            return (
+                u_net,
+                domain,
+                jno.core([jnn.laplacian(u_net(x) * x * (1 - x), [x]).mse], domain),
+            )
 
         u_masked, dom_m, solver_m = make_masked(7)
         u_nomask, dom_n, solver_n = make_masked(7)
@@ -527,12 +537,13 @@ class TestParamMask:
 
     def test_mask_via_model_call_syntax(self):
         """The fluent call syntax model(x).mask(...).optimizer(...) works end-to-end."""
+        import equinox as eqx
         import jax
         import optax
-        import equinox as eqx
-        from jno import LearningRateSchedule as lrs
+
         import jno
         import jno.jnp_ops as jnn
+        from jno import LearningRateSchedule as lrs
 
         domain = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.05))
         x, *_ = domain.variable("interior")
@@ -585,10 +596,11 @@ def test_mask_initialize_freeze_lora_combined():
       (initialize overwrote the random init).
     * v_net has LoRA structure (base weights frozen, adapters trained).
     """
+    import equinox as eqx
     import jax
     import jax.numpy as jnp
     import optax
-    import equinox as eqx
+
     import jno
     import jno.jnp_ops as jnn
     from jno import LearningRateSchedule as lrs
@@ -612,7 +624,12 @@ def test_mask_initialize_freeze_lora_combined():
         (True, True),
     )
 
-    (u_net.mask(mask_u).initialize(pretrained.module).freeze().optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5)))  # load pretrained weights and partially freeze via mask+freeze
+    (
+        u_net.mask(mask_u)
+        .initialize(pretrained.module)
+        .freeze()
+        .optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+    )  # load pretrained weights and partially freeze via mask+freeze
 
     u = u_net(x) * x * (1 - x)
     pde_u = jnn.laplacian(u, [x])
@@ -628,7 +645,9 @@ def test_mask_initialize_freeze_lora_combined():
         (True, True),
     )
 
-    (v_net.mask(mask_v).freeze().lora(rank=2, alpha=1.0).optimizer(optax.sgd, lr=lrs.exponential(5e-4, 0.9, 1000, 1e-6)))  # would freeze whole model, but ...  # ... LoRA takes priority: adapters trainable
+    (
+        v_net.mask(mask_v).freeze().lora(rank=2, alpha=1.0).optimizer(optax.sgd, lr=lrs.exponential(5e-4, 0.9, 1000, 1e-6))
+    )  # would freeze whole model, but ...  # ... LoRA takes priority: adapters trainable
 
     v = v_net(x) * x * (1 - x)
     pde_v = jnn.laplacian(v, [x]) - jnn.sin(jnn.pi * x)
@@ -674,7 +693,9 @@ def test_mask_initialize_freeze_lora_combined():
     # The merged weights must differ from the original random init, proving the
     # LoRA adapters were actually trained (freeze flag was correctly overridden).
     post_v_hidden0_w = jnp.array(solver.models[lid_v].hidden_layers[0].weight)
-    assert not jnp.allclose(pre_v_hidden0_w, post_v_hidden0_w), "v_net base weights did not change — LoRA adapters were not trained/merged"
+    assert not jnp.allclose(pre_v_hidden0_w, post_v_hidden0_w), (
+        "v_net base weights did not change — LoRA adapters were not trained/merged"
+    )
 
 
 # ======================================================================
@@ -688,6 +709,7 @@ class TestGradientAccumulation:
     def test_accumulation_runs_end_to_end(self):
         """accumulation_steps=2 with batchsize completes without error."""
         import optax
+
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
@@ -702,6 +724,7 @@ class TestGradientAccumulation:
     def test_accumulation_with_offload_data(self):
         """accumulation_steps works together with offload_data=True."""
         import optax
+
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
@@ -719,6 +742,7 @@ class TestGradientAccumulation:
     def test_accumulation_fallback_fullbatch(self):
         """accumulation_steps > 1 with full-batch falls back to 1 (no error)."""
         import optax
+
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
@@ -732,6 +756,7 @@ class TestGradientAccumulation:
     def test_accumulation_invalid_value_raises(self):
         """accumulation_steps=0 raises ValueError."""
         import optax
+
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
@@ -742,6 +767,7 @@ class TestGradientAccumulation:
     def test_accumulation_with_checkpoint_gradients(self):
         """accumulation_steps combined with checkpoint_gradients works."""
         import optax
+
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()

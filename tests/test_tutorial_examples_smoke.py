@@ -63,9 +63,19 @@ def test_tutorial_script_smoke(script_path: Path):
     except subprocess.TimeoutExpired as exc:
         stdout_tail = (exc.stdout or "")[-3000:]
         stderr_tail = (exc.stderr or "")[-3000:]
-        pytest.fail(f"Timeout after {DEFAULT_TIMEOUT_SECONDS}s for {script_path.relative_to(REPO_ROOT)}\n" f"--- stdout (tail) ---\n{stdout_tail}\n" f"--- stderr (tail) ---\n{stderr_tail}")
+        pytest.fail(
+            f"Timeout after {DEFAULT_TIMEOUT_SECONDS}s for {script_path.relative_to(REPO_ROOT)}\n"
+            f"--- stdout (tail) ---\n{stdout_tail}\n"
+            f"--- stderr (tail) ---\n{stderr_tail}"
+        )
 
     if result.returncode != 0:
         stdout_tail = (result.stdout or "")[-4000:]
         stderr_tail = (result.stderr or "")[-4000:]
-        pytest.fail(f"Script failed: {script_path.relative_to(REPO_ROOT)}\n" f"Command: {' '.join(cmd)}\n" f"Exit code: {result.returncode}\n" f"--- stdout (tail) ---\n{stdout_tail}\n" f"--- stderr (tail) ---\n{stderr_tail}")
+        pytest.fail(
+            f"Script failed: {script_path.relative_to(REPO_ROOT)}\n"
+            f"Command: {' '.join(cmd)}\n"
+            f"Exit code: {result.returncode}\n"
+            f"--- stdout (tail) ---\n{stdout_tail}\n"
+            f"--- stderr (tail) ---\n{stderr_tail}"
+        )

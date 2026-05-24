@@ -1,16 +1,16 @@
 """Tests for jno.architectures.models — the neural network factory."""
 
-import pytest
+import equinox as eqx
+import foundax
 import jax
 import jax.numpy as jnp
-import equinox as eqx
 import optax
-import foundax
+import pytest
+
 import jno
 import jno.jnp_ops as jnn
-
-from jno.trace import Model, TunableModule, ModelCall
 from jno.architectures.models import nn, parameter, set_default_rng_seed
+from jno.trace import Model, ModelCall
 from jno.trace_compiler import TraceCompiler
 
 

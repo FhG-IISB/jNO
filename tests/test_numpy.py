@@ -1,12 +1,12 @@
 """Unit tests for jno.jnp_ops — JAX NumPy wrappers for the tracing DSL."""
 
-import pytest
 import jax.numpy as jnp
-import jno
+import pytest
 
-from jno.trace import Placeholder, FunctionCall, Literal, BinaryOp
-from tests.conftest import make_var
+import jno
 import jno.jnp_ops as np
+from jno.trace import FunctionCall, Placeholder
+from tests.conftest import make_var
 
 
 # ======================================================================
