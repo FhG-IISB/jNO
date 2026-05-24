@@ -14,11 +14,11 @@ Compared to laplace_1d.py this example uses:
 * A final relative-L² check against the exact solution
 """
 
-import jax
-import jno
-
 import foundax
+import jax
 import optax
+
+import jno
 from jno import LearningRateSchedule as lrs
 
 π = jno.np.pi
@@ -31,12 +31,14 @@ xb, _ = domain.variable("boundary")
 u_exact = jno.np.sin(π * x) / π**2
 
 # ── Network ───────────────────────────────────────────────────────────────────
-u_net = jno.nn.wrap(foundax.mlp(
-    in_features=1,
-    hidden_dims=64,
-    num_layers=4,
-    key=jax.random.PRNGKey(0),
-)).optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 1000, 1e-5))
+u_net = jno.nn.wrap(
+    foundax.mlp(
+        in_features=1,
+        hidden_dims=64,
+        num_layers=4,
+        key=jax.random.PRNGKey(0),
+    )
+).optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 1000, 1e-5))
 
 u = u_net(x)
 

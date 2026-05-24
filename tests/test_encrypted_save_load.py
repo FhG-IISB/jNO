@@ -4,11 +4,9 @@ import os
 
 import jax
 import pytest
-
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -56,6 +54,7 @@ def _make_solver():
     """Build and briefly train a minimal 1-D Laplace solver."""
     import foundax
     import optax
+
     import jno
     import jno.jnp_ops as jnn
     from jno import LearningRateSchedule as lrs
@@ -81,7 +80,6 @@ def _make_solver():
 
 @pytest.mark.integration
 class TestEncryptedSaveLoad:
-
     def test_plain_save_and_load(self, tmp_path):
         """Save without keys and reload — plain cloudpickle round-trip."""
         import jno

@@ -1,6 +1,6 @@
 import logging
 from pathlib import Path
-from typing import Optional, Union, Tuple
+from typing import Optional, Tuple, Union
 
 
 class Logger:
@@ -9,7 +9,12 @@ class Logger:
     Now supports multiple independent instances instead of singleton.
     """
 
-    def __init__(self, path: Union[str, Path] = Path("./"), log_print: Tuple[bool, bool] = (True, True), name: str = "log.txt"):
+    def __init__(
+        self,
+        path: Union[str, Path] = Path("./"),
+        log_print: Tuple[bool, bool] = (True, True),
+        name: str = "log.txt",
+    ):
         path = Path(path) if isinstance(path, str) else path
         self.path: Path = path
         self.log_print: Tuple[bool, bool] = log_print
@@ -199,7 +204,11 @@ class PrintFallback:
         pass
 
 
-def get_logger(path: Optional[Path] = None, log_print: Tuple[bool, bool] = (True, True), use_default: bool = True) -> Union[Logger, PrintFallback]:
+def get_logger(
+    path: Optional[Path] = None,
+    log_print: Tuple[bool, bool] = (True, True),
+    use_default: bool = True,
+) -> Union[Logger, PrintFallback]:
     """
     Get a Logger instance.
 

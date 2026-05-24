@@ -3,22 +3,22 @@ from __future__ import annotations
 from typing import Any
 
 from ...trace import (
-    Placeholder,
-    Literal,
+    Assembly,
     BinaryOp,
     FunctionCall,
-    Variable,
-    Jacobian,
-    Hessian,
-    ModelCall,
-    OperationDef,
-    OperationCall,
-    Tracker,
-    Assembly,
     GroupedAssembly,
+    Hessian,
+    Jacobian,
+    Literal,
+    ModelCall,
+    OperationCall,
+    OperationDef,
+    Placeholder,
     StateField,
     TestFunction,
+    Tracker,
     TrialFunction,
+    Variable,
 )
 
 

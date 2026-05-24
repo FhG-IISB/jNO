@@ -26,13 +26,12 @@ The file name is left unchanged so it can serve as a scratchpad while we work
 through the operator architectures one at a time.
 """
 
+import foundax
 import jax
 import jax.numpy as jnp
-import jno
-import foundax
-import numpy as np
 import optax
 
+import jno
 
 KEY = jax.random.PRNGKey(0)
 GRID = 64
@@ -92,7 +91,9 @@ def build_training_domain(samples: int, grid_size: int) -> jno.domain:
 
 def apply_dirichlet_poisson(u: np.ndarray, h: float) -> np.ndarray:
     padded = np.pad(u, 1, mode="constant")
-    return (4.0 * padded[1:-1, 1:-1] - padded[:-2, 1:-1] - padded[2:, 1:-1] - padded[1:-1, :-2] - padded[1:-1, 2:]) / (h * h)
+    return (4.0 * padded[1:-1, 1:-1] - padded[:-2, 1:-1] - padded[2:, 1:-1] - padded[1:-1, :-2] - padded[1:-1, 2:]) / (
+        h * h
+    )
 
 
 def solve_poisson_reference(forcing: np.ndarray, tol: float = CG_TOL, maxiter: int = CG_MAXITER):
@@ -138,18 +139,20 @@ def main():
     forcing_train = domain.variable("_f")
     solution_train = domain.variable("_u")
 
-    model = jno.nn.wrap(foundax.fno2d(
-        in_features=1,
-        hidden_channels=48,
-        n_modes=24,
-        d_vars=1,
-        n_layers=2,
-        n_steps=1,
-        d_model=(GRID, GRID),
-        norm="layer",
-        activation=jnp.tanh,
-        key=KEY,
-    ))
+    model = jno.nn.wrap(
+        foundax.fno2d(
+            in_features=1,
+            hidden_channels=48,
+            n_modes=24,
+            d_vars=1,
+            n_layers=2,
+            n_steps=1,
+            d_model=(GRID, GRID),
+            norm="layer",
+            activation=jnp.tanh,
+            key=KEY,
+        )
+    )
     model.optimizer(optax.chain(optax.clip_by_global_norm(1e-3), optax.adamw(1.0, weight_decay=1e-6)))
     model.lr(jno.schedule.learning_rate.cosine(EPOCHS, 5e-4, 1e-7))
 

@@ -8,29 +8,46 @@ jNO: Physics-Informed Neural Operators.
 
 import sys
 
+from . import fn
+from . import jnp_ops as np
+from .architectures.models import nn, parameter
 from .core import core
+from .differential_operators import DifferentialOperators
 from .domain import PolygonDomain, domain
-from .utils.solver.fem_route import dirichlet, neumann
-from .trace import Variable, Placeholder, OperationDef, OperationCall, Model, Hessian, Jacobian, TestFunction, TrialFunction, Assembly, FemLinearSystem, GroupedAssembly, FemResidualOperator, StateField
-from .utils.adaptive import LearningRateSchedule, WeightSchedule, sampler, callbacks
-from .utils import Logger, init_default_logger as logger, IREEModel as iree
+from .trace import (
+    Assembly,
+    FemLinearSystem,
+    FemResidualOperator,
+    GroupedAssembly,
+    Hessian,
+    Jacobian,
+    Model,
+    OperationCall,
+    OperationDef,
+    Placeholder,
+    StateField,
+    TestFunction,
+    TrialFunction,
+    Variable,
+)
+from .trace_compiler import TraceCompiler
+from .trace_evaluator import TraceEvaluator
+from .utils import IREEModel as iree
+from .utils import Logger
+from .utils import init_default_logger as logger
+from .utils.adaptive import LearningRateSchedule, WeightSchedule, callbacks, sampler
 from .utils.config import (
-    load_config,
     get_config,
     get_config_path,
-    get_runs_base_dir,
-    get_rsa_public_key,
     get_rsa_private_key,
+    get_rsa_public_key,
+    get_runs_base_dir,
     get_seed,
+    load_config,
     setup,
 )
-from .trace_evaluator import TraceEvaluator
-from .trace_compiler import TraceCompiler
-from .differential_operators import DifferentialOperators
-from . import jnp_ops as np
-from . import fn
-from .utils.load_save import save, load
-from .architectures.models import nn, parameter
+from .utils.load_save import load, save
+from .utils.solver.fem_route import dirichlet, neumann
 
 # Mirror the submodule on the package namespace and add a short alias.
 numpy = np
@@ -43,7 +60,6 @@ __version__ = "0.2.1"
 
 
 class ScheduleWrapper:
-
     constraint = WeightSchedule
     learning_rate = LearningRateSchedule
 

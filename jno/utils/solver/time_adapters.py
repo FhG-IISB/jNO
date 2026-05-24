@@ -22,11 +22,11 @@ these functions directly.
 """
 from typing import Any, Callable, Optional
 
-import numpy as np
 import jax
 import jax.numpy as jnp
+import numpy as np
 
-from .backend_blocks import DiffraxBlock, FeaxTimeBlock, FeaxPipelineBlock
+from .backend_blocks import DiffraxBlock, FeaxPipelineBlock, FeaxTimeBlock
 
 
 # ---------------------------------------------------------------------
@@ -56,7 +56,7 @@ def _select_scheme(block: FeaxTimeBlock, scheme: Optional[str]) -> str:
 
     scheme = str(scheme).lower()
     if scheme not in {"backward_euler", "forward_euler"}:
-        raise ValueError(f"Unsupported FEAX adapter scheme '{scheme}'. " "Supported: 'backward_euler', 'forward_euler'.")
+        raise ValueError(f"Unsupported FEAX adapter scheme '{scheme}'. Supported: 'backward_euler', 'forward_euler'.")
     return scheme
 
 
@@ -199,7 +199,9 @@ def make_diffrax_block(
             },
         )
 
-    raise ValueError("make_diffrax_block(...) requires either a linear payload (M,A,...) " "or a nonlinear payload (mass,residual,...).")
+    raise ValueError(
+        "make_diffrax_block(...) requires either a linear payload (M,A,...) or a nonlinear payload (mass,residual,...)."
+    )
 
 
 # ---------------------------------------------------------------------
@@ -323,7 +325,11 @@ def make_feax_pipeline(
                 def _step_impl(state, t, dt):
                     if scheme_use == "backward_euler":
                         t_eval = t + dt
-                        ff = jnp.zeros_like(c) if f_fn is None else jnp.asarray(f_fn(t_eval, args), dtype=M.dtype).reshape(-1)
+                        ff = (
+                            jnp.zeros_like(c)
+                            if f_fn is None
+                            else jnp.asarray(f_fn(t_eval, args), dtype=M.dtype).reshape(-1)
+                        )
                         lhs = M + dt * A
                         rhs_vec = M @ state + dt * (c + ff)
                         return jnp.linalg.solve(lhs, rhs_vec)
@@ -450,7 +456,10 @@ def make_feax_pipeline(
             )
 
         if jacobian_fn is None:
-            raise ValueError("Nonlinear backward Euler requires jacobian(u,t). " "Re-assemble with a residual+jacobian-capable nonlinear route.")
+            raise ValueError(
+                "Nonlinear backward Euler requires jacobian(u,t). "
+                "Re-assemble with a residual+jacobian-capable nonlinear route."
+            )
 
         class _NonlinearBackwardEulerPipeline(TimePipeline):
             def build(self, mesh):
@@ -554,4 +563,6 @@ def make_feax_pipeline(
             },
         )
 
-    raise ValueError("make_feax_pipeline(...) requires either a linear payload (M,A,...) " "or a nonlinear payload (mass,residual,...).")
+    raise ValueError(
+        "make_feax_pipeline(...) requires either a linear payload (M,A,...) or a nonlinear payload (mass,residual,...)."
+    )

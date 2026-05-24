@@ -19,7 +19,6 @@ import jno  # noqa: E402
 import jno.jnp_ops as jnn  # noqa: E402
 from jno.utils.iree import IREEModel  # noqa: E402
 
-
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -155,7 +154,6 @@ class TestJnoSaveLoad:
 def laplace1d_solver():
     """Build and briefly train a 1-D Laplace PINN — compiled once per module."""
     import optax
-    from jno import LearningRateSchedule as lrs
 
     domain = jno.domain(constructor=jno.domain.line(mesh_size=0.05))
     x, *_ = domain.variable("interior")

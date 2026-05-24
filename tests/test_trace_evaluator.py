@@ -1,23 +1,20 @@
 """Unit tests for jno.trace_evaluator — the dispatch-table evaluator."""
 
-import pytest
 import jax
 import jax.numpy as jnp
+import pytest
 
 from jno.trace import (
-    Literal,
     Constant,
-    TensorTag,
-    BinaryOp,
     FunctionCall,
-    OperationDef,
-    OperationCall,
-    Model,
     Jacobian,
-    Hessian,
+    Literal,
+    Model,
+    OperationDef,
+    TensorTag,
 )
-from jno.trace_evaluator import TraceEvaluator
 from jno.trace_compiler import TraceCompiler
+from jno.trace_evaluator import TraceEvaluator
 from tests.conftest import make_var
 
 
@@ -291,8 +288,9 @@ class TestEvalOperations:
 class TestEvalFlaxModule:
     def test_dense_layer(self):
         """Evaluate a simple Dense layer (batched Linear) through the trace evaluator."""
-        from jno.architectures.linear import Linear
         import jax
+
+        from jno.architectures.linear import Linear
 
         module = Linear(1, 2, key=jax.random.PRNGKey(0))
         fm = Model(module, name="dense")

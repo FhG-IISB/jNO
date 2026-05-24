@@ -269,7 +269,8 @@ def _init_wandb(wandb_arg: bool | dict, project: str, run_dir: str) -> None:
         import warnings
 
         warnings.warn(
-            "wandb=True was passed to jno.setup() but the 'wandb' package " "is not installed.  Install it with:  pip install wandb",
+            "wandb=True was passed to jno.setup() but the 'wandb' package "
+            "is not installed.  Install it with:  pip install wandb",
             stacklevel=3,
         )
         _WANDB_RUN = None
@@ -331,6 +332,7 @@ def wandb_log_model(solver: Any, name: str = "model") -> None:
         return
 
     import tempfile
+
     import cloudpickle
 
     try:

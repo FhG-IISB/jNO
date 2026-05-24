@@ -17,11 +17,12 @@ This module is internal. User-facing code should normally call:
     expr.assemble(target="diffrax")
     weak_expr.assemble(target="fem_time")
 """
-from typing import Any, Dict, Tuple
 from contextlib import contextmanager
-import numpy as np
-import jax
+from typing import Any, Dict, Tuple
+
 import jax.numpy as jnp
+import numpy as np
+
 from ...trace import (
     BinaryOp,
     FunctionCall,
@@ -30,28 +31,36 @@ from ...trace import (
     Literal,
     Placeholder,
     StateField,
+    TensorTag,
     TestFunction,
     TrialFunction,
     Variable,
-    TensorTag,
 )
-
-from .backend_blocks import DiffraxBlock, FeaxTimeBlock
 from ...trace_evaluator import TraceEvaluator
-from .solver_helper import (
-    contains_node_type as _contains_node_type,
-    contains_model_call as _contains_model_call,
-    unique_by_id as _unique_by_id,
-    is_temporal_var as _is_temporal_var,
-    max_temporal_derivative_order as _max_temporal_derivative_order,
-    collect_temporal_tags as _collect_temporal_tags,
-    contains_temporal_derivative as _contains_temporal_derivative,
-)
+from .backend_blocks import DiffraxBlock, FeaxTimeBlock
 from .feax_utils import (
+    _build_feax_mesh,
     _dense_array,
     _make_internal_vars,
     _prepare_feax_runtime,
-    _build_feax_mesh,
+)
+from .solver_helper import (
+    collect_temporal_tags as _collect_temporal_tags,
+)
+from .solver_helper import (
+    contains_model_call as _contains_model_call,
+)
+from .solver_helper import (
+    contains_node_type as _contains_node_type,
+)
+from .solver_helper import (
+    contains_temporal_derivative as _contains_temporal_derivative,
+)
+from .solver_helper import (
+    is_temporal_var as _is_temporal_var,
+)
+from .solver_helper import (
+    max_temporal_derivative_order as _max_temporal_derivative_order,
 )
 
 # -----------------------------------------------------------------------------
@@ -196,10 +205,15 @@ def _infer_single_state_expr(expr: Any):
         return candidates[0]
 
     if len(model_candidates) > 1:
-        raise ValueError("Could not infer state_expr automatically: multiple model-based temporal candidates found. " "Pass state_expr=... explicitly.")
+        raise ValueError(
+            "Could not infer state_expr automatically: multiple model-based temporal candidates found. "
+            "Pass state_expr=... explicitly."
+        )
 
     if len(candidates) > 1:
-        raise ValueError("Could not infer state_expr automatically: multiple temporal candidates found. " "Pass state_expr=... explicitly.")
+        raise ValueError(
+            "Could not infer state_expr automatically: multiple temporal candidates found. Pass state_expr=... explicitly."
+        )
 
     raise ValueError("Could not infer state_expr automatically. Pass state_expr=... explicitly.")
 
@@ -260,7 +274,9 @@ def _build_manual_second_order_reduction(expr: Any, **kwargs) -> Dict[str, Any]:
         }
 
     if rhs is None:
-        raise ValueError("second_order='manual' requires rhs=..., where rhs(t, y, args) returns " "the reduced first-order system.")
+        raise ValueError(
+            "second_order='manual' requires rhs=..., where rhs(t, y, args) returns the reduced first-order system."
+        )
 
     if state0 is None:
         raise ValueError("second_order='manual' requires state0=..., typically [u0, v0].")
@@ -273,7 +289,7 @@ def _build_manual_second_order_reduction(expr: Any, **kwargs) -> Dict[str, Any]:
         raise ValueError(f"state_names must contain exactly two names, got {state_names}.")
 
     if state0_arr.shape[0] != 2:
-        raise ValueError("Priority-3 manual second-order support currently expects exactly " "two reduced states: [u, v].")
+        raise ValueError("Priority-3 manual second-order support currently expects exactly two reduced states: [u, v].")
 
     return {
         "implemented": True,
@@ -299,7 +315,9 @@ def _split_additive_terms(node):
         if node.op == "+":
             return _split_additive_terms(node.left) + _split_additive_terms(node.right)
         if node.op == "-":
-            return _split_additive_terms(node.left) + [BinaryOp("*", Literal(-1.0), t) for t in _split_additive_terms(node.right)]
+            return _split_additive_terms(node.left) + [
+                BinaryOp("*", Literal(-1.0), t) for t in _split_additive_terms(node.right)
+            ]
     return [node]
 
 
@@ -401,7 +419,8 @@ def _build_first_order_semidiscrete_operators(domain, ir, mass_expr, residual_ex
     returned callables.
     """
     import feax as fe
-    from .weak_form import LoweredWeakForm, LoweredChannelTerm
+
+    from .weak_form import LoweredChannelTerm, LoweredWeakForm
 
     # -------------------------
     # Build mass IR
@@ -438,7 +457,7 @@ def _build_first_order_semidiscrete_operators(domain, ir, mass_expr, residual_ex
     residual_ir = LoweredWeakForm(domain=domain, terms=residual_terms)
 
     if len(mass_ir.terms) == 0:
-        raise ValueError("Nonlinear semidiscrete path could not extract a mass term. " "Expected something like u_t * phi.")
+        raise ValueError("Nonlinear semidiscrete path could not extract a mass term. Expected something like u_t * phi.")
 
     mass_rt = _prepare_feax_runtime(
         domain,
@@ -563,13 +582,22 @@ def _assemble_diffrax_from_strong_form(domain, expr, **kwargs) -> DiffraxBlock:
         because transient weak forms must use `target="fem_time"`.
     """
     if _contains_node_type(expr, TrialFunction) or _contains_node_type(expr, TestFunction):
-        raise ValueError("target='diffrax' expects a strong-form expression without " "TrialFunction/TestFunction symbols. For transient weak forms, " "use target='fem_time'.")
+        raise ValueError(
+            "target='diffrax' expects a strong-form expression without "
+            "TrialFunction/TestFunction symbols. For transient weak forms, "
+            "use target='fem_time'."
+        )
 
     time_order = _detect_time_order(expr)
     if time_order <= 0:
-        raise ValueError("target='diffrax' could not find a temporal derivative in the provided " "strong-form expression. Expected a first- or second-order-in-time problem.")
+        raise ValueError(
+            "target='diffrax' could not find a temporal derivative in the provided "
+            "strong-form expression. Expected a first- or second-order-in-time problem."
+        )
     if time_order > 2:
-        raise NotImplementedError("target='diffrax' currently supports only first- or second-order-in-time " "strong-form problems.")
+        raise NotImplementedError(
+            "target='diffrax' currently supports only first- or second-order-in-time strong-form problems."
+        )
 
     t0, t1, dt0 = _infer_time_window(domain, **kwargs)
     initial_conditions, state0 = _extract_initial_conditions(kwargs)
@@ -590,7 +618,7 @@ def _assemble_diffrax_from_strong_form(domain, expr, **kwargs) -> DiffraxBlock:
 
         if state_expr is not None:
             if time_var is None or not isinstance(time_var, Variable) or getattr(time_var, "axis", None) != "temporal":
-                raise ValueError("Strong-form Diffrax lowering with state_expr=... requires " "time_var=<temporal Variable>.")
+                raise ValueError("Strong-form Diffrax lowering with state_expr=... requires time_var=<temporal Variable>.")
 
             if state0 is None:
                 raise ValueError("Strong-form Diffrax lowering with state_expr=... requires state0=...")
@@ -611,7 +639,10 @@ def _assemble_diffrax_from_strong_form(domain, expr, **kwargs) -> DiffraxBlock:
             metadata["phase"] = "phase_2_first_order_lowered"
             metadata["lowering_complete"] = True
             metadata["state_expr_mode"] = "explicit" if kwargs.get("state_expr", None) is not None else "inferred"
-            metadata["notes"] = "First-order strong-form Diffrax lowering completed. " "The provided state_expr subtree was replaced internally by a runtime solver state."
+            metadata["notes"] = (
+                "First-order strong-form Diffrax lowering completed. "
+                "The provided state_expr subtree was replaced internally by a runtime solver state."
+            )
 
             return DiffraxBlock(
                 backend="diffrax",
@@ -638,7 +669,8 @@ def _assemble_diffrax_from_strong_form(domain, expr, **kwargs) -> DiffraxBlock:
         metadata.setdefault("lowering_complete", False)
         metadata.setdefault(
             "notes",
-            "First-order strong-form problem classified, but no symbolic lowering was performed. " "Pass state_expr=..., time_var=..., state0=... to enable real Diffrax lowering.",
+            "First-order strong-form problem classified, but no symbolic lowering was performed. "
+            "Pass state_expr=..., time_var=..., state0=... to enable real Diffrax lowering.",
         )
 
         rhs = kwargs.get("rhs", None)
@@ -697,7 +729,11 @@ def _assemble_diffrax_from_strong_form(domain, expr, **kwargs) -> DiffraxBlock:
                 "strategy": "manual_first_order",
                 "original_expr": expr,
                 "state_names": state_names,
-                "state_expr_mode": ("explicit" if kwargs.get("state_expr", None) is not None else ("inferred" if state_expr is not None else "none")),
+                "state_expr_mode": (
+                    "explicit"
+                    if kwargs.get("state_expr", None) is not None
+                    else ("inferred" if state_expr is not None else "none")
+                ),
             }
 
             if term is None:
@@ -708,7 +744,10 @@ def _assemble_diffrax_from_strong_form(domain, expr, **kwargs) -> DiffraxBlock:
             metadata["phase"] = "phase_3_second_order_manual_reduction"
             metadata["lowering_complete"] = True
             metadata["reduction_mode"] = "manual"
-            metadata["notes"] = "Second-order strong-form problem accepted through manual first-order reduction. " "state_expr is used only as the training-expression anchor; the actual solver route uses the reduced rhs."
+            metadata["notes"] = (
+                "Second-order strong-form problem accepted through manual first-order reduction. "
+                "state_expr is used only as the training-expression anchor; the actual solver route uses the reduced rhs."
+            )
 
             return DiffraxBlock(
                 backend="diffrax",
@@ -741,7 +780,11 @@ def _assemble_diffrax_from_strong_form(domain, expr, **kwargs) -> DiffraxBlock:
         metadata["phase"] = "phase_3_contract"
         metadata["lowering_complete"] = False
         metadata["rewrite_required"] = True
-        metadata["notes"] = "Second-order strong-form problem was classified, but no manual reduction " "was provided. Pass second_order='manual', rhs=..., state0=[u0, v0] to " "build a usable Diffrax block."
+        metadata["notes"] = (
+            "Second-order strong-form problem was classified, but no manual reduction "
+            "was provided. Pass second_order='manual', rhs=..., state0=[u0, v0] to "
+            "build a usable Diffrax block."
+        )
 
         return DiffraxBlock(
             backend="diffrax",
@@ -762,7 +805,7 @@ def _assemble_diffrax_from_strong_form(domain, expr, **kwargs) -> DiffraxBlock:
             state_meta=dict(kwargs.get("state_meta", {})),
             metadata=metadata,
         )
-    raise RuntimeError("Internal error: strong-form Diffrax lowering reached an unsupported " f"time_order={time_order}.")
+    raise RuntimeError(f"Internal error: strong-form Diffrax lowering reached an unsupported time_order={time_order}.")
 
 
 def _split_additive_terms_strong(node):
@@ -770,7 +813,9 @@ def _split_additive_terms_strong(node):
         if node.op == "+":
             return _split_additive_terms_strong(node.left) + _split_additive_terms_strong(node.right)
         if node.op == "-":
-            return _split_additive_terms_strong(node.left) + [BinaryOp("*", Literal(-1.0), t) for t in _split_additive_terms_strong(node.right)]
+            return _split_additive_terms_strong(node.left) + [
+                BinaryOp("*", Literal(-1.0), t) for t in _split_additive_terms_strong(node.right)
+            ]
     return [node]
 
 
@@ -807,14 +852,18 @@ def _replace_exact_subtree(node: Any, target: Any, replacement: Any) -> Any:
 
     if isinstance(node, Jacobian):
         new_target = _replace_exact_subtree(node.target, target, replacement)
-        new_vars = [_replace_exact_subtree(v, target, replacement) if isinstance(v, Placeholder) else v for v in node.variables]
+        new_vars = [
+            _replace_exact_subtree(v, target, replacement) if isinstance(v, Placeholder) else v for v in node.variables
+        ]
         if new_target is not node.target or any(a is not b for a, b in zip(new_vars, node.variables)):
             return Jacobian(new_target, new_vars, node.scheme)
         return node
 
     if isinstance(node, Hessian):
         new_target = _replace_exact_subtree(node.target, target, replacement)
-        new_vars = [_replace_exact_subtree(v, target, replacement) if isinstance(v, Placeholder) else v for v in node.variables]
+        new_vars = [
+            _replace_exact_subtree(v, target, replacement) if isinstance(v, Placeholder) else v for v in node.variables
+        ]
         if new_target is not node.target or any(a is not b for a, b in zip(new_vars, node.variables)):
             return Hessian(new_target, new_vars, node.scheme, trace=node.trace)
         return node
@@ -823,11 +872,22 @@ def _replace_exact_subtree(node: Any, target: Any, replacement: Any) -> Any:
 
 
 def _same_temporal_var(a: Any, b: Any) -> bool:
-    return isinstance(a, Variable) and isinstance(b, Variable) and getattr(a, "axis", None) == "temporal" and getattr(b, "axis", None) == "temporal" and str(a.tag) == str(b.tag)
+    return (
+        isinstance(a, Variable)
+        and isinstance(b, Variable)
+        and getattr(a, "axis", None) == "temporal"
+        and getattr(b, "axis", None) == "temporal"
+        and str(a.tag) == str(b.tag)
+    )
 
 
 def _is_state_time_derivative(node: Any, state_expr: Any, time_var: Variable) -> bool:
-    return isinstance(node, Jacobian) and node.target is state_expr and len(node.variables) == 1 and _same_temporal_var(node.variables[0], time_var)
+    return (
+        isinstance(node, Jacobian)
+        and node.target is state_expr
+        and len(node.variables) == 1
+        and _same_temporal_var(node.variables[0], time_var)
+    )
 
 
 def _extract_temporal_coeff(term: Any, state_expr: Any, time_var: Variable):
@@ -880,13 +940,19 @@ def _split_first_order_strong_form(expr: Any, state_expr: Any, time_var: Variabl
         coeff = _extract_temporal_coeff(term, state_expr, time_var)
         if coeff is not None:
             if _contains_temporal_derivative(coeff):
-                raise NotImplementedError("Strong-form Diffrax lowering does not support temporal derivatives " "inside the coefficient of the state time-derivative term yet.")
+                raise NotImplementedError(
+                    "Strong-form Diffrax lowering does not support temporal derivatives "
+                    "inside the coefficient of the state time-derivative term yet."
+                )
             mass_terms.append(coeff)
         else:
             residual_terms.append(term)
 
     if len(mass_terms) == 0:
-        raise ValueError("Could not isolate a first-order temporal state term. " "Expected something like u_t + F(u,t)=0 or a(x,t,u)*u_t + F(u,t)=0.")
+        raise ValueError(
+            "Could not isolate a first-order temporal state term. "
+            "Expected something like u_t + F(u,t)=0 or a(x,t,u)*u_t + F(u,t)=0."
+        )
 
     mass_expr = _sum_terms(mass_terms)
     residual_expr = _sum_terms(residual_terms)
@@ -985,7 +1051,11 @@ def _contains_trial(node: Any) -> bool:
 
 
 def _is_temporal_jacobian_of_trial(node: Any) -> bool:
-    return isinstance(node, Jacobian) and isinstance(node.target, TrialFunction) and any(_is_temporal_var(v) for v in node.variables)
+    return (
+        isinstance(node, Jacobian)
+        and isinstance(node.target, TrialFunction)
+        and any(_is_temporal_var(v) for v in node.variables)
+    )
 
 
 def _strip_temporal_trial_derivative(node: Any) -> Any:
@@ -1080,7 +1150,9 @@ def _split_first_order_linear_terms(ir):
         coeff = term.coeff
 
         if term.channel != "raw":
-            raise NotImplementedError("Linear semidiscrete FEAX-time path currently expects raw FEM weak-form IR terms only.")
+            raise NotImplementedError(
+                "Linear semidiscrete FEAX-time path currently expects raw FEM weak-form IR terms only."
+            )
 
         if term.support == "volume" and _contains_temporal_derivative(coeff):
             stripped = _strip_temporal_trial_derivative(coeff)
@@ -1215,10 +1287,17 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         derivative is found.
         NotImplementedError for weak forms that are not first-order in time.
     """
-    has_fem_context = getattr(domain, "_variational_initialized", False) and getattr(domain, "fem_context", None) is not None and getattr(domain, "_feax_context", None) is not None
+    has_fem_context = (
+        getattr(domain, "_variational_initialized", False)
+        and getattr(domain, "fem_context", None) is not None
+        and getattr(domain, "_feax_context", None) is not None
+    )
 
     if not has_fem_context:
-        raise ValueError("target='fem_time' requires domain.init_fem(...) to be called before " "assembly so the FEM mesh and quadrature context are available.")
+        raise ValueError(
+            "target='fem_time' requires domain.init_fem(...) to be called before "
+            "assembly so the FEM mesh and quadrature context are available."
+        )
 
     expr_candidates = []
     if getattr(ir, "volume_expr", None) is not None:
@@ -1227,10 +1306,15 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
 
     time_order = max((_detect_time_order(e) for e in expr_candidates), default=0)
     if time_order <= 0:
-        raise ValueError("target='fem_time' could not find a temporal derivative in the weak-form " "expression. Use target='fem_system' or 'fem_residual' for steady weak forms.")
+        raise ValueError(
+            "target='fem_time' could not find a temporal derivative in the weak-form "
+            "expression. Use target='fem_system' or 'fem_residual' for steady weak forms."
+        )
 
     if time_order != 1:
-        raise NotImplementedError("The JAX-native semidiscrete FEAX-time path currently supports only " "first-order-in-time weak forms.")
+        raise NotImplementedError(
+            "The JAX-native semidiscrete FEAX-time path currently supports only first-order-in-time weak forms."
+        )
 
     t0, t1, dt = _infer_time_window(domain, **kwargs)
     initial_conditions, state0 = _extract_initial_conditions(kwargs)
@@ -1245,8 +1329,14 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
     mass_expr, residual_expr, boundary_exprs = _split_mass_and_residual_from_ir(ir)
 
     metadata = dict(kwargs.get("metadata", {}))
-    metadata.setdefault("classification", _classify_time_problem(ir.volume_expr, domain, target="fem_time"))
-    metadata.setdefault("temporal_tags", sorted(set().union(*(_collect_temporal_tags(e) for e in expr_candidates))))
+    metadata.setdefault(
+        "classification",
+        _classify_time_problem(ir.volume_expr, domain, target="fem_time"),
+    )
+    metadata.setdefault(
+        "temporal_tags",
+        sorted(set().union(*(_collect_temporal_tags(e) for e in expr_candidates))),
+    )
     metadata.setdefault("domain_time", getattr(domain, "time", None))
 
     # ------------------------------------------------------------------
@@ -1260,7 +1350,7 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         mass_ir, op_ir, src_ir = _split_first_order_linear_terms(ir)
 
         if len(mass_ir.terms) == 0:
-            raise ValueError("Linear semidiscrete path could not extract a mass term. " "Expected something like u_t * phi.")
+            raise ValueError("Linear semidiscrete path could not extract a mass term. Expected something like u_t * phi.")
 
         M_sys, bM = _assemble_fem_system_from_ir(domain, mass_ir)
         A_sys, bA = _assemble_fem_system_from_ir(domain, op_ir)
@@ -1297,16 +1387,29 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         metadata["forcing_terms"] = int(len(src_ir.terms))
         metadata["forcing_temporal_tags"] = _ir_temporal_tags(src_ir)
         metadata["auto_forcing"] = bool(auto_forcing)
-        metadata["forcing_mode"] = "weak_auto" if auto_forcing else ("user_callback" if forcing_vector_fn is not None else "none")
+        metadata["forcing_mode"] = (
+            "weak_auto" if auto_forcing else ("user_callback" if forcing_vector_fn is not None else "none")
+        )
         metadata["linear_inferred"] = "linear" not in kwargs
         metadata["linear_path_selected"] = bool(use_linear_path)
 
         if auto_forcing:
-            metadata["notes"] = "Linear semidiscrete JAX FEAX block assembled. " "M, A, affine_bias, and forcing_vector_fn are populated for external solvers. " "Forcing was auto-lowered from non-trial weak-form terms."
+            metadata["notes"] = (
+                "Linear semidiscrete JAX FEAX block assembled. "
+                "M, A, affine_bias, and forcing_vector_fn are populated for external solvers. "
+                "Forcing was auto-lowered from non-trial weak-form terms."
+            )
         elif forcing_vector_fn is not None:
-            metadata["notes"] = "Linear semidiscrete JAX FEAX block assembled. " "M, A, affine_bias, and forcing_vector_fn are populated for external solvers. " "Forcing uses the user-supplied callback."
+            metadata["notes"] = (
+                "Linear semidiscrete JAX FEAX block assembled. "
+                "M, A, affine_bias, and forcing_vector_fn are populated for external solvers. "
+                "Forcing uses the user-supplied callback."
+            )
         else:
-            metadata["notes"] = "Linear semidiscrete JAX FEAX block assembled. " "M, A, affine_bias, and forcing_vector_fn are populated for external solvers."
+            metadata["notes"] = (
+                "Linear semidiscrete JAX FEAX block assembled. "
+                "M, A, affine_bias, and forcing_vector_fn are populated for external solvers."
+            )
 
         return FeaxTimeBlock(
             backend="feax_time",
@@ -1361,7 +1464,11 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
     metadata["mass_is_constant"] = bool(nonlinear_runtime["mass_is_constant"])
     metadata["residual_has_time"] = bool(nonlinear_runtime["residual_has_time"])
     metadata["state_size"] = int(nonlinear_runtime["state_size"])
-    metadata["notes"] = "Nonlinear first-order semidiscrete FEAX-time block assembled. " "mass(t), residual(u,t), and jacobian(u,t) are populated for external solvers. " "Source and boundary forcing are embedded inside residual(u,t)."
+    metadata["notes"] = (
+        "Nonlinear first-order semidiscrete FEAX-time block assembled. "
+        "mass(t), residual(u,t), and jacobian(u,t) are populated for external solvers. "
+        "Source and boundary forcing are embedded inside residual(u,t)."
+    )
 
     return FeaxTimeBlock(
         backend="feax_time",

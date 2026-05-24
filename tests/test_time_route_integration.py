@@ -5,13 +5,16 @@ import pytest
 pytest.importorskip("feax", reason="feax required for FEAX-time route tests")
 pytest.importorskip("diffrax", reason="diffrax required for Diffrax adapter tests")
 
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 
 import jno
 import jno.jnp_ops as jnn
-from jno.utils.solver.backend_blocks import DiffraxBlock, FeaxPipelineBlock, FeaxTimeBlock
-
+from jno.utils.solver.backend_blocks import (
+    DiffraxBlock,
+    FeaxPipelineBlock,
+    FeaxTimeBlock,
+)
 
 # ============================================================
 # Helpers
@@ -82,11 +85,7 @@ def make_nonlinear_reaction_weak_form(dom):
     phix = jnn.grad(phi, xg)
     phiy = jnn.grad(phi, yg)
 
-    weak = (
-        u_t * phi
-        + (ux * phix + uy * phiy)
-        + (u * u * u - u) * phi
-    )
+    weak = u_t * phi + (ux * phix + uy * phiy) + (u * u * u - u) * phi
     return weak
 
 

@@ -15,12 +15,13 @@ unit-square boundary for all times.  The initial condition is a soft constraint
 evaluated on the "initial" domain tag.
 """
 
-import jax
-import jno
+from pathlib import Path
 
 import foundax
+import jax
 import optax
-from pathlib import Path
+
+import jno
 
 π = jno.np.pi
 α = 0.1  # thermal diffusivity
@@ -51,7 +52,17 @@ net = jno.nn.wrap(
         key=jax.random.PRNGKey(0),
     )
 )
-net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(init_value=0, peak_value=1e-3, warmup_steps=40, decay_steps=40000 - 40, end_value=1e-5)))
+net.optimizer(
+    optax.adam(
+        optax.warmup_cosine_decay_schedule(
+            init_value=0,
+            peak_value=1e-3,
+            warmup_steps=40,
+            decay_steps=40000 - 40,
+            end_value=1e-5,
+        )
+    )
+)
 net.summary()
 xy = jno.np.concat([x, y])
 xy0 = jno.np.concat([x0, y0])

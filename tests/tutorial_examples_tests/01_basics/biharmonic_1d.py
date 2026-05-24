@@ -15,11 +15,11 @@ The x^2 (1-x)^2 ansatz hard-enforces the clamped boundary conditions, making
 this a compact fourth-order derivative example.
 """
 
-import jax
-import jno
-
 import foundax
+import jax
 import optax
+
+import jno
 from jno import LearningRateSchedule as lrs
 
 domain = jno.domain(constructor=jno.domain.line(mesh_size=0.05))
@@ -27,12 +27,14 @@ x, _ = domain.variable("interior")
 
 u_exact = x**2 * (1 - x) ** 2
 
-net = jno.nn.wrap(foundax.mlp(
-    in_features=1,
-    hidden_dims=32,
-    num_layers=3,
-    key=jax.random.PRNGKey(11),
-))
+net = jno.nn.wrap(
+    foundax.mlp(
+        in_features=1,
+        hidden_dims=32,
+        num_layers=3,
+        key=jax.random.PRNGKey(11),
+    )
+)
 net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.6, 10, 1e-5))
 
 u = net(x) * x**2 * (1 - x) ** 2

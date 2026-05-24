@@ -16,7 +16,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "jax>=0.4.30",
+    "jax[cuda]>=0.10.1,<0.11",
     "equinox>=0.11.0",
     "optax>=0.2.0",
     "orbax-checkpoint>=0.6.0",
@@ -82,8 +82,19 @@ members = [
     ".",
 ]
 
-[tool.black]
-line-length = 250
+[tool.ruff]
+line-length = 124
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I"]
+ignore = [
+    "E501",   # line too long (handled by formatter)
+    "E402",   # module import not at top (common in JAX config-before-import patterns)
+    "E731",   # lambda assignment (style preference)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # re-exports are intentional in public API files
 
 [tool.mypy]
 exclude = '^(build/|jNO\.egg-info/|runs/)'
@@ -100,3 +111,27 @@ fem = [
 dev = [
     "pytest-xdist>=3.8.0",
 ]
+
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tool.pixi.pypi-dependencies]
+jax-neural-operators = { path = ".", editable = true }
+jax-cuda12-plugin = { version = ">=0.10.1,<0.11", extras = ["with-cuda"] }
+
+[tool.pixi.environments]
+default = { solve-group = "default" }
+cuda = { features = ["cuda"], solve-group = "default" }
+dev = { features = ["dev"], solve-group = "default" }
+fem = { features = ["fem"], solve-group = "default" }
+iree = { features = ["iree"], solve-group = "default" }
+
+[tool.pixi.tasks]
+fmt = "ruff format ."
+lint = "ruff check . --fix"
+test = "pytest -x --tb=short"
+
+[tool.pixi.dependencies]
+pytest = ">=9.0.3,<10"
+ruff = ">=0.9.0"
