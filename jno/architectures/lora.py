@@ -243,7 +243,11 @@ def apply_lora(
                 pat=_re.compile(s["target"]) if s.get("target") else None,
                 rank=int(s["rank"]),
                 alpha=float(s["alpha"]),
-                wrappers=s["wrappers"] if "wrappers" in s else _normalize_wrappers(s.get("wrapper")) if "wrapper" in s else default_wrappers,
+                wrappers=s["wrappers"]
+                if "wrappers" in s
+                else _normalize_wrappers(s.get("wrapper"))
+                if "wrapper" in s
+                else default_wrappers,
             )
             for s in specs
         ]
@@ -536,12 +540,12 @@ class VeRALinear(LoRAWrapper):
     adapter_fields = ("b", "d")
 
     base: LinearLike
-    b: jax.Array                      # (out_features,) trainable — scales B rows
-    d: jax.Array                      # (rank,)         trainable — scales A rows
-    rank: int         = eqx.field(static=True)
-    alpha: float      = eqx.field(static=True)
-    seed: int         = eqx.field(static=True)
-    in_features: int  = eqx.field(static=True)
+    b: jax.Array  # (out_features,) trainable — scales B rows
+    d: jax.Array  # (rank,)         trainable — scales A rows
+    rank: int = eqx.field(static=True)
+    alpha: float = eqx.field(static=True)
+    seed: int = eqx.field(static=True)
+    in_features: int = eqx.field(static=True)
     out_features: int = eqx.field(static=True)
 
     @classmethod
@@ -561,12 +565,8 @@ class VeRALinear(LoRAWrapper):
         self.d = jnp.ones(rank)
 
     def _frozen_AB(self) -> tuple[jax.Array, jax.Array]:
-        A = jax.random.normal(
-            jax.random.PRNGKey(self.seed), (self.rank, self.in_features)
-        ) / jnp.sqrt(self.in_features)
-        B = jax.random.normal(
-            jax.random.PRNGKey(self.seed + 1), (self.out_features, self.rank)
-        )
+        A = jax.random.normal(jax.random.PRNGKey(self.seed), (self.rank, self.in_features)) / jnp.sqrt(self.in_features)
+        B = jax.random.normal(jax.random.PRNGKey(self.seed + 1), (self.out_features, self.rank))
         return A, B
 
     def __call__(self, x: jax.Array) -> jax.Array:

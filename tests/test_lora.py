@@ -47,13 +47,13 @@ _MLP_KW = dict(in_features=4, output_dim=2, hidden_dims=8, num_layers=2)
 
 # Expected adapter leaf count for the 3-layer MLP with rank=2
 _ADAPTER_LEAVES: dict[type[LoRAWrapper], int] = {
-    LoRALinear:   6,   # 3 × (lora_A, lora_B)
+    LoRALinear: 6,  # 3 × (lora_A, lora_B)
     rsLoRALinear: 6,
-    LoRAFALinear: 3,   # 3 × (lora_B,)
-    DoRALinear:   9,   # 3 × (magnitude, lora_A, lora_B)
-    PiSSALinear:  6,
-    LoRAXSLinear: 3,   # 3 × (R,)
-    VeRALinear:   6,   # 3 × (b, d)
+    LoRAFALinear: 3,  # 3 × (lora_B,)
+    DoRALinear: 9,  # 3 × (magnitude, lora_A, lora_B)
+    PiSSALinear: 6,
+    LoRAXSLinear: 3,  # 3 × (R,)
+    VeRALinear: 6,  # 3 × (b, d)
 }
 
 ZOO = list(_ADAPTER_LEAVES.keys())
@@ -133,8 +133,7 @@ class TestApplyLora:
         """target= regex wraps only matching layers; fewer than the default."""
         mlp = _mlp()
         n_all = _count_wrappers(apply_lora(mlp, rank=2, alpha=1.0, key=KEY))
-        adapted = apply_lora(mlp, rank=2, alpha=1.0, key=KEY,
-                             specs=[{"target": "0", "rank": 2, "alpha": 1.0}])
+        adapted = apply_lora(mlp, rank=2, alpha=1.0, key=KEY, specs=[{"target": "0", "rank": 2, "alpha": 1.0}])
         n_filtered = _count_wrappers(adapted)
         assert 0 < n_filtered < n_all
 
@@ -146,10 +145,14 @@ class TestApplyLora:
 
     def test_per_spec_different_wrappers(self):
         """Layers with different paths can receive different adapter classes."""
-        adapted = apply_lora(_mlp(), key=KEY, specs=[
-            {"target": "0", "rank": 2, "alpha": 1.0, "wrapper": rsLoRALinear},
-            {"target": ".*", "rank": 2, "alpha": 1.0, "wrapper": LoRALinear},
-        ])
+        adapted = apply_lora(
+            _mlp(),
+            key=KEY,
+            specs=[
+                {"target": "0", "rank": 2, "alpha": 1.0, "wrapper": rsLoRALinear},
+                {"target": ".*", "rank": 2, "alpha": 1.0, "wrapper": LoRALinear},
+            ],
+        )
         wrapper_types = {
             type(leaf)
             for leaf in jax.tree_util.tree_leaves(adapted, is_leaf=lambda x: isinstance(x, LoRAWrapper))
@@ -160,8 +163,7 @@ class TestApplyLora:
 
     def test_list_of_wrappers_first_match_wins(self):
         """When a list is passed, the first class whose applies_to() returns True wins."""
-        adapted = apply_lora(_mlp(), rank=2, alpha=1.0, key=KEY,
-                             wrappers=(rsLoRALinear, LoRALinear))
+        adapted = apply_lora(_mlp(), rank=2, alpha=1.0, key=KEY, wrappers=(rsLoRALinear, LoRALinear))
         leaves = jax.tree_util.tree_leaves(adapted, is_leaf=lambda x: isinstance(x, LoRAWrapper))
         assert all(isinstance(leaf, rsLoRALinear) for leaf in leaves if isinstance(leaf, LoRAWrapper))
 
@@ -208,9 +210,7 @@ def test_output_equals_base_at_init(cls):
     mlp = _mlp()
     adapted = apply_lora(mlp, rank=2, alpha=1.0, key=KEY, wrappers=(cls,))
     x = jnp.ones((4,))
-    assert jnp.allclose(mlp(x), adapted(x), atol=1e-5), (
-        f"{cls.__name__}: output differs from base at init"
-    )
+    assert jnp.allclose(mlp(x), adapted(x), atol=1e-5), f"{cls.__name__}: output differs from base at init"
 
 
 # ---------------------------------------------------------------------------
@@ -240,9 +240,7 @@ class TestMergeLora:
         """merge_lora must remove every LoRAWrapper node from the tree."""
         adapted = apply_lora(_mlp(), rank=2, alpha=1.0, key=KEY, wrappers=(cls,))
         merged = merge_lora(adapted)
-        assert _count_wrappers(merged) == 0, (
-            f"{cls.__name__}: LoRAWrapper nodes remain after merge_lora"
-        )
+        assert _count_wrappers(merged) == 0, f"{cls.__name__}: LoRAWrapper nodes remain after merge_lora"
 
     def test_restores_original_linear_class(self, cls):
         """merge_lora must restore the original layer class (foundax.Linear), not jno.Linear."""
@@ -361,7 +359,7 @@ class TestLoRAFAInvariants:
             return sum(a.size for a, f in zip(flat_arrays, flat_filt) if f)
 
         n_std = _adapter_param_size(apply_lora(mlp, rank=2, alpha=1.0, key=KEY, wrappers=(LoRALinear,)))
-        n_fa  = _adapter_param_size(apply_lora(mlp, rank=2, alpha=1.0, key=KEY, wrappers=(LoRAFALinear,)))
+        n_fa = _adapter_param_size(apply_lora(mlp, rank=2, alpha=1.0, key=KEY, wrappers=(LoRAFALinear,)))
         assert n_fa < n_std
 
 
@@ -442,9 +440,7 @@ class TestModelLoraAPI:
     def test_default_config(self):
         net = self._net()
         net.lora(rank=4, alpha=1.0)
-        assert net._lora_config == [
-            {"target": None, "rank": 4, "alpha": 1.0, "wrappers": (LoRALinear,)}
-        ]
+        assert net._lora_config == [{"target": None, "rank": 4, "alpha": 1.0, "wrappers": (LoRALinear,)}]
 
     def test_wrapper_param_single(self):
         net = self._net()
@@ -458,10 +454,12 @@ class TestModelLoraAPI:
 
     def test_specs_stores_multiple_groups(self):
         net = self._net()
-        net.lora(specs=[
-            {"target": "encoder", "rank": 4,  "alpha": 1.0},
-            {"target": "decoder", "rank": 16, "alpha": 4.0},
-        ])
+        net.lora(
+            specs=[
+                {"target": "encoder", "rank": 4, "alpha": 1.0},
+                {"target": "decoder", "rank": 16, "alpha": 4.0},
+            ]
+        )
         assert len(net._lora_config) == 2
         assert net._lora_config[0]["rank"] == 4
         assert net._lora_config[1]["rank"] == 16
@@ -514,9 +512,7 @@ class TestRegressionWrappersKey:
             for leaf in jax.tree_util.tree_leaves(adapted, is_leaf=lambda x: isinstance(x, LoRAWrapper))
             if isinstance(leaf, LoRAWrapper)
         }
-        assert rsLoRALinear in wrapper_types, (
-            "apply_lora ignored the 'wrappers' key and fell back to LoRALinear"
-        )
+        assert rsLoRALinear in wrapper_types, "apply_lora ignored the 'wrappers' key and fell back to LoRALinear"
         assert LoRALinear not in wrapper_types
 
     def test_pissa_output_equals_base_with_nonunity_alpha_rank(self):
@@ -530,9 +526,7 @@ class TestRegressionWrappersKey:
 
         for alpha in [0.5, 2.0, 8.0]:  # all != rank
             adapted = PiSSALinear(lin, rank=2, alpha=alpha, key=KEY)
-            assert jnp.allclose(lin(x), adapted(x), atol=1e-5), (
-                f"PiSSA (alpha={alpha}): output differs from base at init"
-            )
+            assert jnp.allclose(lin(x), adapted(x), atol=1e-5), f"PiSSA (alpha={alpha}): output differs from base at init"
 
 
 # ---------------------------------------------------------------------------
@@ -587,9 +581,7 @@ class TestLoraIntegration:
                 return self.base
 
         net = nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=KEY))
-        net.freeze().lora(rank=4, alpha=1.0, wrapper=LearnableBias).optimizer(
-            optax.adam, lr=lrs(1e-3)
-        )
+        net.freeze().lora(rank=4, alpha=1.0, wrapper=LearnableBias).optimizer(optax.adam, lr=lrs(1e-3))
         assert jnp.isfinite(self._solve(net))
 
 
@@ -644,9 +636,9 @@ class TestModelControlStateCombinations:
     def test_mask_freeze_then_lora_mask_already_consumed(self):
         """mask(m).freeze() followed by .lora() — mask scope consumed by freeze."""
         net = self._net()
-        net.mask(self._all_true_mask()).freeze()   # mask scope consumed here
-        net.lora(rank=4, alpha=1.0)               # no pending mask
-        assert net._frozen is False               # mask.freeze(), not global
+        net.mask(self._all_true_mask()).freeze()  # mask scope consumed here
+        net.lora(rank=4, alpha=1.0)  # no pending mask
+        assert net._frozen is False  # mask.freeze(), not global
         assert net._lora_config is not None
         assert net._trainable_param_mask is None  # lora() cleared it (no pending mask)
 
@@ -774,13 +766,9 @@ class TestIntegrationCombinations:
     def test_two_lora_models_different_wrappers(self):
         k1, k2 = jax.random.split(KEY)
         net1 = self._net(key=k1)
-        net1.freeze().lora(rank=4, alpha=1.0, wrapper=rsLoRALinear).optimizer(
-            optax.adam, lr=lrs(1e-3)
-        )
+        net1.freeze().lora(rank=4, alpha=1.0, wrapper=rsLoRALinear).optimizer(optax.adam, lr=lrs(1e-3))
         net2 = self._net(key=k2)
-        net2.freeze().lora(rank=4, alpha=1.0, wrapper=LoRAFALinear).optimizer(
-            optax.adam, lr=lrs(1e-3)
-        )
+        net2.freeze().lora(rank=4, alpha=1.0, wrapper=LoRAFALinear).optimizer(optax.adam, lr=lrs(1e-3))
         domain, x = self._domain_and_x()
         loss = (net1(x) + net2(x) - jnn.sin(jnn.pi * x)).mse
         stats = jno.core([loss], domain).solve(3)
@@ -795,9 +783,7 @@ class TestIntegrationCombinations:
         leaves, treedef = jax.tree_util.tree_flatten(eqx.filter(m, eqx.is_array))
         # Freeze the first half, leave the second half trainable.
         half = len(leaves) // 2
-        partial_mask = jax.tree_util.tree_unflatten(
-            treedef, [i < half for i in range(len(leaves))]
-        )
+        partial_mask = jax.tree_util.tree_unflatten(treedef, [i < half for i in range(len(leaves))])
         net.mask(partial_mask).freeze()
         net.optimizer(optax.adam, lr=lrs(1e-3))
         assert jnp.isfinite(self._solve_single(net))
@@ -814,20 +800,24 @@ class TestIntegrationCombinations:
 
     def test_lora_multi_spec_different_ranks(self):
         net = self._net()
-        net.freeze().lora(specs=[
-            {"target": "0",  "rank": 2, "alpha": 1.0},
-            {"target": ".*", "rank": 8, "alpha": 2.0},
-        ]).optimizer(optax.adam, lr=lrs(1e-3))
+        net.freeze().lora(
+            specs=[
+                {"target": "0", "rank": 2, "alpha": 1.0},
+                {"target": ".*", "rank": 8, "alpha": 2.0},
+            ]
+        ).optimizer(optax.adam, lr=lrs(1e-3))
         assert jnp.isfinite(self._solve_single(net))
 
     # ── multi-spec: different wrappers per layer group ────────────────────────
 
     def test_lora_multi_spec_different_wrappers(self):
         net = self._net()
-        net.freeze().lora(specs=[
-            {"target": "0",  "rank": 4, "alpha": 1.0, "wrapper": rsLoRALinear},
-            {"target": ".*", "rank": 4, "alpha": 1.0, "wrapper": DoRALinear},
-        ]).optimizer(optax.adam, lr=lrs(1e-3))
+        net.freeze().lora(
+            specs=[
+                {"target": "0", "rank": 4, "alpha": 1.0, "wrapper": rsLoRALinear},
+                {"target": ".*", "rank": 4, "alpha": 1.0, "wrapper": DoRALinear},
+            ]
+        ).optimizer(optax.adam, lr=lrs(1e-3))
         assert jnp.isfinite(self._solve_single(net))
 
     # ── mask(m).lora(): adapters train, no crash ──────────────────────────────
@@ -838,9 +828,7 @@ class TestIntegrationCombinations:
         m = foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=KEY)
         net = nn.wrap(m)
         leaves, treedef = jax.tree_util.tree_flatten(eqx.filter(m, eqx.is_array))
-        half_mask = jax.tree_util.tree_unflatten(
-            treedef, [i < len(leaves) // 2 for i in range(len(leaves))]
-        )
+        half_mask = jax.tree_util.tree_unflatten(treedef, [i < len(leaves) // 2 for i in range(len(leaves))])
         net.mask(half_mask).lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
         assert jnp.isfinite(self._solve_single(net))
 
@@ -848,9 +836,7 @@ class TestIntegrationCombinations:
 
     def test_dtype_bfloat16_with_freeze_and_lora(self):
         net = self._net()
-        net.dtype(jnp.bfloat16).freeze().lora(rank=4, alpha=1.0).optimizer(
-            optax.adam, lr=lrs(1e-3)
-        )
+        net.dtype(jnp.bfloat16).freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
         assert jnp.isfinite(self._solve_single(net))
 
     # ── initialize from file + freeze + lora (transfer learning) ─────────────
@@ -862,9 +848,7 @@ class TestIntegrationCombinations:
         eqx.tree_serialise_leaves(path, m)
 
         net = nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=KEY))
-        net.initialize(path).freeze().lora(rank=4, alpha=1.0).optimizer(
-            optax.adam, lr=lrs(1e-3)
-        )
+        net.initialize(path).freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
         assert jnp.isfinite(self._solve_single(net))
 
     # ── two models with separate LoRA wrappers + separate losses ─────────────
@@ -873,13 +857,9 @@ class TestIntegrationCombinations:
         """Two independent LoRA models with different wrappers trained jointly."""
         k1, k2 = jax.random.split(KEY)
         net1 = self._net(key=k1)
-        net1.freeze().lora(rank=4, alpha=1.0, wrapper=LoRALinear).optimizer(
-            optax.adam, lr=lrs(1e-3)
-        )
+        net1.freeze().lora(rank=4, alpha=1.0, wrapper=LoRALinear).optimizer(optax.adam, lr=lrs(1e-3))
         net2 = self._net(key=k2)
-        net2.freeze().lora(rank=4, alpha=1.0, wrapper=VeRALinear).optimizer(
-            optax.adamw, lr=lrs(5e-4)
-        )
+        net2.freeze().lora(rank=4, alpha=1.0, wrapper=VeRALinear).optimizer(optax.adamw, lr=lrs(5e-4))
         domain, x = self._domain_and_x()
         loss1 = (net1(x) - jnn.sin(jnn.pi * x)).mse
         loss2 = (net2(x) - jnn.cos(jnn.pi * x)).mse
@@ -894,9 +874,7 @@ class TestIntegrationCombinations:
         net.freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
         net.reset()
         # Re-configure with a different wrapper
-        net.freeze().lora(rank=8, alpha=2.0, wrapper=rsLoRALinear).optimizer(
-            optax.adamw, lr=lrs(5e-4)
-        )
+        net.freeze().lora(rank=8, alpha=2.0, wrapper=rsLoRALinear).optimizer(optax.adamw, lr=lrs(5e-4))
         assert jnp.isfinite(self._solve_single(net))
 
     # ── three models: frozen backbone, LoRA adapter, trainable head ───────────

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import inspect
 import types
-from typing import TYPE_CHECKING, Sequence, Optional
+from typing import TYPE_CHECKING, Optional, Sequence
 
 import jax.numpy as jnp
 
