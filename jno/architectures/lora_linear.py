@@ -29,8 +29,6 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 
-from .linear import Linear
-
 # =====================================================================
 # Equinox LoRA (for jNO Linear layers)
 # =====================================================================
@@ -40,20 +38,22 @@ class LoRALinear(eqx.Module):
     """Linear layer with frozen base weights and trainable LoRA adapters.
 
     Attributes:
-        base:   Original ``Linear`` module (frozen during training).
+        base:   Original linear module (frozen during training). Accepts any
+                linear-like ``eqx.Module`` with ``weight``, ``in_features``,
+                and ``out_features`` attributes (e.g. jNO or foundax Linear).
         lora_A: Down-projection, shape ``(rank, in_features)``.
         lora_B: Up-projection,   shape ``(out_features, rank)``.
         rank:   LoRA rank (static).
         alpha:  Scaling factor (static).
     """
 
-    base: Linear
+    base: eqx.Module
     lora_A: jax.Array
     lora_B: jax.Array
     rank: int = eqx.field(static=True)
     alpha: float = eqx.field(static=True)
 
-    def __init__(self, base: Linear, rank: int, alpha: float, *, key: jax.Array):
+    def __init__(self, base: eqx.Module, rank: int, alpha: float, *, key: jax.Array):
         self.base = base
         self.rank = min(rank, min(base.in_features, base.out_features))
         self.alpha = alpha
@@ -104,6 +104,21 @@ def _path_str(path_keys) -> str:
 # =====================================================================
 
 
+def _is_linear_like(x: Any) -> bool:
+    """Return True for any linear-like eqx.Module that LoRA can wrap.
+
+    Matches both jNO's and foundax's ``Linear`` classes (and any other
+    module with the same interface) without requiring a shared base class.
+    """
+    return (
+        isinstance(x, eqx.Module)
+        and not isinstance(x, LoRALinear)
+        and hasattr(x, "weight")
+        and hasattr(x, "in_features")
+        and hasattr(x, "out_features")
+    )
+
+
 def apply_lora(
     model: eqx.Module,
     rank: int = 0,
@@ -113,18 +128,22 @@ def apply_lora(
     target: str = None,
     specs: Sequence[LoRASpec] | None = None,
 ) -> eqx.Module:
-    """Apply LoRA to every ``Linear`` layer in *model*.
+    """Apply LoRA to every linear-like layer in *model*.
 
     Two calling conventions:
 
     1. **Uniform** (backward-compatible): ``apply_lora(model, rank, alpha, key=key)``
-       Applies the same rank/alpha to all ``Linear`` layers (optionally
+       Applies the same rank/alpha to all linear layers (optionally
        filtered by ``target`` regex).
 
     2. **Per-target**: ``apply_lora(model, key=key, specs=[...])``
        Each spec ``{"target": regex, "rank": int, "alpha": float}``
        is matched against the pytree path. A layer matched by multiple
        specs uses the **first** matching spec.
+
+    Recognises any ``eqx.Module`` with ``weight``, ``in_features``, and
+    ``out_features`` attributes, including both jNO's and foundax's
+    ``Linear`` implementations.
 
     Returns:
         A new model with ``LoRALinear`` replacements.
@@ -142,12 +161,11 @@ def apply_lora(
         pat = _re.compile(target) if target else None
         spec_list = [(pat, int(rank), float(alpha))]
 
-    is_linear = lambda x: isinstance(x, Linear)
-    flat_with_path, treedef = jax.tree_util.tree_flatten_with_path(model, is_leaf=is_linear)
+    flat_with_path, treedef = jax.tree_util.tree_flatten_with_path(model, is_leaf=_is_linear_like)
 
     new_leaves: list[Any] = []
     for path_keys, leaf in flat_with_path:
-        if isinstance(leaf, Linear):
+        if _is_linear_like(leaf):
             pstr = _path_str(path_keys)
             matched_spec = None
             for pat, r, a in spec_list:
@@ -167,19 +185,14 @@ def apply_lora(
 
 
 def merge_lora(model: eqx.Module) -> eqx.Module:
-    """Collapse LoRA adapters back into base weights (``LoRALinear`` → ``Linear``)."""
+    """Collapse LoRA adapters back into base weights (``LoRALinear`` → original linear type)."""
 
     def _merge(leaf):
         if not isinstance(leaf, LoRALinear):
             return leaf
         s = leaf.alpha / leaf.rank
         w = leaf.base.weight + s * (leaf.lora_B @ leaf.lora_A)
-        new = Linear.__new__(Linear)
-        object.__setattr__(new, "weight", w)
-        object.__setattr__(new, "bias", leaf.base.bias)
-        object.__setattr__(new, "in_features", leaf.base.in_features)
-        object.__setattr__(new, "out_features", leaf.base.out_features)
-        return new
+        return eqx.tree_at(lambda m: m.weight, leaf.base, w)
 
     is_lora = lambda x: isinstance(x, LoRALinear)
     leaves, treedef = jax.tree_util.tree_flatten(model, is_leaf=is_lora)
