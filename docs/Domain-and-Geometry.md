@@ -195,7 +195,7 @@ theta = ...  # shape (B, 4)
 
 ## Mesh Connectivity (for Finite Differences and Finite Elements)
 
-Some schemes (e.g., `scheme="finite_difference"` in `jnn.grad` / `jnn.laplacian`) require the mesh topology to be pre-processed:
+Some schemes (e.g., `scheme="finite_difference"` in `jnn.grad` etc..) require the mesh topology to be pre-processed:
 
 ```python
 domain = jno.domain(
