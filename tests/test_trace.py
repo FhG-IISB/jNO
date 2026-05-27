@@ -342,14 +342,18 @@ class TestModelMask:
         assert all(v is True for v in leaves if isinstance(v, bool))
 
     def test_mask_then_lora_chains(self):
-        """mask().lora() sets both _param_mask and _lora_config."""
+        """mask().lora() sets _lora_config as a list of dicts and consumes the mask scope."""
         import jax
+
+        from jno.lora import LoRALinear
 
         u_net = self._make_eqx_model()
         all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
         u_net.mask(all_true).lora(rank=4, alpha=1.0)
-        assert u_net._param_mask is all_true
-        assert u_net._lora_config == (4, 1.0, None)
+        assert u_net._lora_config == [
+            {"target": None, "rank": 4, "alpha": 1.0, "wrappers": (LoRALinear,)}
+        ]
+        assert u_net._mask_scope_pending is False
 
     def test_manual_mask_optimizer_creates_group_and_keeps_global_fallback(self):
         """mask(param_mask).optimizer(...) should create a masked group without replacing global fallback."""
