@@ -30,11 +30,18 @@ class IREEModel:
     and are reconstructed transparently on unpickle via ``__setstate__``.
     """
 
-    def __init__(self, vmfb_bytes: bytes, module_name: str, device: str = "local-sync"):
+    def __init__(
+        self,
+        vmfb_bytes: bytes,
+        module_name: str,
+        device: str = "local-sync",
+        input_dtypes: tuple[str, ...] | None = None,
+    ):
 
         self.vmfb_bytes = vmfb_bytes
         self.module_name = module_name
         self.device = device
+        self.input_dtypes = input_dtypes
         # Runtime state — rebuilt in _load_model and after unpickling
         self._tmpfile_path: str | None = None
         self._ctx = None
@@ -78,12 +85,14 @@ class IREEModel:
             "vmfb_bytes": self.vmfb_bytes,
             "module_name": self.module_name,
             "device": self.device,
+            "input_dtypes": self.input_dtypes,
         }
 
     def __setstate__(self, state):
         self.vmfb_bytes = state["vmfb_bytes"]
         self.module_name = state["module_name"]
         self.device = state["device"]
+        self.input_dtypes = state.get("input_dtypes")
         self._tmpfile_path = None
         self._ctx = None
         self._module = None
@@ -92,13 +101,33 @@ class IREEModel:
 
     # ── Inference ─────────────────────────────────────────────────────────────
 
+    def _prepare_args(self, args: tuple) -> tuple:
+        """Cast numpy-convertible args to the model's compile-time input dtypes."""
+        if self.input_dtypes is None or len(args) != len(self.input_dtypes):
+            return args
+
+        prepared = []
+        for arg, dtype_str in zip(args, self.input_dtypes):
+            target_dtype = np.dtype(dtype_str)
+            try:
+                arr = np.asarray(arg)
+            except Exception:
+                prepared.append(arg)
+                continue
+            if arr.dtype != target_dtype:
+                arr = arr.astype(target_dtype, copy=False)
+            prepared.append(arr)
+        return tuple(prepared)
+
     def __call__(self, *args) -> np.ndarray:
         """Run inference and return a numpy array."""
-        return np.asarray(self._module.main(*args))  # type: ignore[attr-defined]
+        prepared_args = self._prepare_args(args)
+        return np.asarray(self._module.main(*prepared_args))  # type: ignore[attr-defined]
 
     def infer_raw(self, *args):
         """Run inference and return an IREE DeviceArray (no host copy)."""
-        return self._module.main(*args)  # type: ignore[attr-defined]
+        prepared_args = self._prepare_args(args)
+        return self._module.main(*prepared_args)  # type: ignore[attr-defined]
 
     # ── Compile ───────────────────────────────────────────────────────────────
 
@@ -180,9 +209,22 @@ class IREEModel:
                     os.unlink(p)
 
         module_name = f"jit_{func.__name__}"
+        in_avals = tuple(exported.in_avals)
+        input_dtypes = []
+        for idx, sample in enumerate(sample_inputs):
+            dtype = np.asarray(sample).dtype
+            if idx < len(in_avals):
+                aval_dtype = getattr(in_avals[idx], "dtype", None)
+                if aval_dtype is not None:
+                    dtype = np.dtype(aval_dtype)
+            input_dtypes.append(str(dtype))
         log.info(
             "Compiled IREE model  (module: %s, %d KB)",
             module_name,
             len(vmfb_bytes) // 1024,
         )
-        return cls(vmfb_bytes, module_name=module_name)
+        return cls(
+            vmfb_bytes,
+            module_name=module_name,
+            input_dtypes=tuple(input_dtypes),
+        )

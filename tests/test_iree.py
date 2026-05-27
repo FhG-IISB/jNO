@@ -73,6 +73,22 @@ class TestCompile:
         expected = np.array(x * y)
         np.testing.assert_allclose(np.asarray(model(x, y)), expected, rtol=1e-5)
 
+    def test_input_dtypes_recorded_from_compile_sample(self, linear_model):
+        assert linear_model.input_dtypes == ("float32",)
+
+    def test_float64_inputs_are_coerced_to_compiled_dtype(self, linear_model):
+        x64 = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float64)
+        expected = np.array(_linear(jnp.asarray(x64, dtype=jnp.float32)))
+        result = np.asarray(linear_model(x64))
+        np.testing.assert_allclose(result, expected, rtol=1e-5)
+
+    def test_input_dtype_tracks_compiled_abi_dtype(self):
+        sample = np.ones((4,), dtype=np.float64)
+        model = IREEModel.compile(_linear, (sample,))
+        # JAX may canonicalize float64 sample inputs to float32 depending on x64 config.
+        expected = str(jnp.asarray(sample).dtype)
+        assert model.input_dtypes == (expected,)
+
 
 # ---------------------------------------------------------------------------
 # Pickle round-trip
@@ -100,6 +116,10 @@ class TestPickleRoundTrip:
     def test_device_preserved(self, linear_model):
         restored = pickle.loads(pickle.dumps(linear_model))
         assert restored.device == linear_model.device
+
+    def test_input_dtypes_preserved(self, linear_model):
+        restored = pickle.loads(pickle.dumps(linear_model))
+        assert restored.input_dtypes == linear_model.input_dtypes
 
     def test_runtime_is_rebuilt(self, linear_model):
         """Unpickled model must have live IREE runtime handles."""
