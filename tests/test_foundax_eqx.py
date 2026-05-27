@@ -393,7 +393,9 @@ class TestLoRA:
     def test_lora_sets_config(self, factory):
         net = nn.wrap(factory())
         net.lora(rank=4, alpha=1.0)
-        assert net._lora_config == (4, 1.0, None)
+        from jno.architectures.lora_linear import LoRALinear
+
+        assert net._lora_config == [{"target": None, "rank": 4, "alpha": 1.0, "wrappers": (LoRALinear,)}]
 
     @pytest.mark.parametrize("factory", ALL_FACTORIES)
     def test_lora_with_freeze(self, factory):

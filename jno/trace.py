@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Type, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Type, Union
 
 import equinox as eqx
 import jax
 import jax.numpy as jnp
 
+from .architectures.lora_linear import LoRAWrapper, _normalize_wrappers
 from .tuner import Arch, ArchSpace
 from .utils.adaptive import LearningRateSchedule
 from .utils.iree import IREEModel
@@ -462,8 +463,8 @@ class FunctionCall(Placeholder):
         fn: Callable,
         args: Union[list, tuple],
         name: str | None = None,
-        reduces_axis: int = None,
-        kwargs: Dict = None,
+        reduces_axis: Optional[int] = None,
+        kwargs: Optional[Dict] = None,
     ):
         self.fn = fn
         self.args = args if isinstance(args, (list, tuple)) else [args]
@@ -970,9 +971,7 @@ class Model(Placeholder):
 
         # ── training config (plain Python, not JAX arrays) ──
         self._frozen: bool = False
-        self._lora_config: tuple[int, float, str | None] | list[dict] | None = (
-            None  # (rank, alpha, target) | [{"target":..,"rank":..,"alpha":..}] | None
-        )
+        self._lora_config: list[dict] | None = None  # [{"target", "rank", "alpha", "wrappers"}, ...]
         self._opt_fn = None  # optax optimizer factory / instance
         self._lr = LearningRateSchedule(1.0)
         self._dtype = None  # target dtype (e.g. jnp.bfloat16) or None
@@ -1172,38 +1171,52 @@ class Model(Placeholder):
         self._mask_scope_pending = self._param_mask is not None
         return self
 
-    def lora(self, rank: int = 4, alpha: float = 1.0, *, specs: list[dict] | None = None):
+    def lora(
+        self,
+        rank: int = 4,
+        alpha: float = 1.0,
+        *,
+        target: str | None = None,
+        wrapper: type[LoRAWrapper] | Sequence[type[LoRAWrapper]] | None = None,
+        specs: list[dict] | None = None,
+    ):
         """Enable LoRA fine-tuning for this model.
 
         Two calling conventions:
 
-        1. **Uniform** (backward-compatible)::
+        1. **Uniform**::
 
                NN.lora(rank=8, alpha=16)
+               NN.lora(rank=4, wrapper=MyConvAdapter)          # custom adapter
+               NN.lora(rank=4, wrapper=[LoRALinear, MyConv])   # tried in order
 
-        2. **Per-target** — different rank/alpha per layer group::
+        2. **Per-target** — different rank/alpha/adapter per layer group::
 
                NN.lora(specs=[
                    {"target": "encoder", "rank": 4,  "alpha": 1.0},
-                   {"target": "decoder", "rank": 16, "alpha": 4.0},
+                   {"target": "conv",    "rank": 8,  "alpha": 2.0, "wrapper": MyConvAdapter},
                ])
 
-           Each ``target`` is a regex matched against the pytree path of
-           ``Linear`` leaves.  The first matching spec wins.
+           Each ``target`` is a regex matched against the pytree path.
+           The first matching spec wins.
 
         By default only the low-rank adapters are trained; base weights are
-        frozen.
+        frozen.  Call ``freeze()`` before ``lora()`` to also freeze any
+        base parameters that are outside LoRA-wrapped layers::
 
-        Call ``freeze()`` before ``lora()`` to freeze all base parameters::
-
-            NN.freeze().mask(param_mask).lora(rank=8, alpha=16)
+            NN.freeze().lora(rank=8, alpha=16)
 
         Args:
-            rank:  LoRA rank (uniform mode).
-            alpha: LoRA scaling factor (uniform mode).
-            specs: List of per-target LoRA specs (per-target mode).
-                   Each dict has keys ``target`` (str regex), ``rank`` (int),
-                   ``alpha`` (float).
+            rank:    LoRA rank (uniform mode).
+            alpha:   LoRA scaling factor (uniform mode).
+            target:  Regex to restrict which layers are wrapped (uniform mode).
+            wrapper: Adapter class or list of classes to try in order.
+                     Defaults to ``LoRALinear`` (wraps ``LinearLike`` layers).
+                     Pass a custom ``LoRAWrapper`` subclass to support other
+                     layer types (e.g. convolutions).
+            specs:   Per-target specs (per-target mode).  Each dict has keys
+                     ``target`` (str regex), ``rank`` (int), ``alpha`` (float),
+                     and optionally ``wrapper``.
         """
         if self._mask_scope_pending and self._param_mask is not None:
             self._trainable_param_mask = jax.tree_util.tree_map(
@@ -1213,10 +1226,22 @@ class Model(Placeholder):
         else:
             self._trainable_param_mask = None
         self._mask_scope_pending = False
+
+        default_wrappers = _normalize_wrappers(wrapper)
+
         if specs is not None:
-            self._lora_config = list(specs)
+            self._lora_config = [
+                {
+                    "target": s.get("target"),
+                    "rank": s["rank"],
+                    "alpha": s["alpha"],
+                    "wrappers": _normalize_wrappers(s["wrapper"]) if "wrapper" in s else default_wrappers,
+                }
+                for s in specs
+            ]
         else:
-            self._lora_config = (rank, alpha, None)
+            self._lora_config = [{"target": target, "rank": rank, "alpha": alpha, "wrappers": default_wrappers}]
+
         return self
 
     def optimizer(self, opt_fn, *, lr=None):
@@ -1539,8 +1564,8 @@ class ModelCall(Placeholder):
         self.model.mask(param_mask)
         return self
 
-    def lora(self, rank: int = 4, alpha: float = 1.0, *, specs: list[dict] | None = None):
-        self.model.lora(rank, alpha, specs=specs)
+    def lora(self, rank: int = 4, alpha: float = 1.0, *, target=None, wrapper=None, specs=None):
+        self.model.lora(rank, alpha, target=target, wrapper=wrapper, specs=specs)
         return self
 
     def optimizer(self, opt_fn, *, lr=None):
@@ -1752,7 +1777,7 @@ class Hessian(Placeholder):
     def __init__(
         self,
         target: "Placeholder",
-        variables: List[Union[Variable, None]],
+        variables: Optional[List[Variable]] = None,
         scheme: str = "automatic_differentiation",
         trace: bool = False,
     ):
