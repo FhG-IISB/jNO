@@ -115,6 +115,8 @@ class LoRALinear(LoRAWrapper):
         self.rank = min(rank, min(base.in_features, base.out_features))
         self.alpha = alpha
 
+        # A ~ N(0, 1/in_features), B = 0 — output is zero at init, A variance matches
+        # the pre-existing weight scale. Justified in https://proceedings.neurips.cc/paper_files/paper/2024/file/d4387c37b3b06e55f86eccdb8cd1f829-Paper-Conference.pdf
         k1, _ = jax.random.split(key)
         std = 1.0 / jnp.sqrt(base.in_features)
         self.lora_A = jax.random.normal(k1, (self.rank, base.in_features)) * std

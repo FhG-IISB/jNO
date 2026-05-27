@@ -40,7 +40,7 @@ Legacy shorthand constructors like `jno.numpy.nn.mlp(...)` are no longer the pri
 - `summary()`
 - `freeze()` / `unfreeze()`
 - `mask(param_mask=None)`
-- `lora(rank=4, alpha=1.0, *, specs=None)`
+- `lora(rank=4, alpha=1.0, *, target=None, wrapper=None, specs=None)`
 - `optimizer(opt_fn, *, lr=None)`
 - `lr(schedule_or_scalar)`
 - `initialize(weights_or_path_or_initializer, *, key=None)`
@@ -123,10 +123,20 @@ With `mask(...).freeze()`, selected leaves are frozen and non-selected leaves re
 
 ## 3. LoRA
 
+LoRA inserts trainable low-rank adapter matrices into matching layers while keeping base weights
+frozen. By default `LoRALinear` is used, which targets any layer with `weight`, `in_features`, and
+`out_features` attributes (jNO Linear, foundax Linear, `eqx.nn.Linear`).
+
 ### Uniform LoRA
 
 ```python
 net.lora(rank=8, alpha=16)
+```
+
+Restrict to a subset of layers with a path-regex:
+
+```python
+net.lora(rank=8, alpha=16, target="encoder")
 ```
 
 ### Per-target LoRA specs
@@ -134,13 +144,65 @@ net.lora(rank=8, alpha=16)
 ```python
 net.lora(
 	specs=[
-		{"target": "encoder", "rank": 4, "alpha": 1.0},
+		{"target": "encoder", "rank": 4,  "alpha": 1.0},
 		{"target": "decoder", "rank": 16, "alpha": 4.0},
 	]
 )
 ```
 
-`target` in LoRA `specs` is regex-matched against pytree paths of supported linear leaves.
+`target` is regex-matched against the slash-joined pytree path of each candidate leaf. The first
+matching spec wins.
+
+### Custom adapter classes
+
+Pass any `LoRAWrapper` subclass via `wrapper` to support layer types beyond linear:
+
+```python
+from jno.architectures.lora_linear import LoRAWrapper
+import equinox as eqx
+
+class LoRAConv(LoRAWrapper):
+	adapter_fields = ("delta_w",)            # names of trainable adapter attributes
+	base: eqx.Module
+	delta_w: jax.Array
+	rank: int = eqx.field(static=True)
+	alpha: float = eqx.field(static=True)
+
+	@classmethod
+	def applies_to(cls, leaf):
+		return isinstance(leaf, eqx.nn.Conv2d) and not isinstance(leaf, LoRAWrapper)
+
+	def __init__(self, base, rank, alpha, *, key):
+		self.base, self.rank, self.alpha = base, rank, alpha
+		self.delta_w = jnp.zeros_like(base.weight)
+
+	def __call__(self, x):
+		w = self.base.weight + self.delta_w * (self.alpha / self.rank)
+		return self.base(x)   # simplified — use eqx.tree_at to swap weight
+
+	def merge(self):
+		w = self.base.weight + self.delta_w * (self.alpha / self.rank)
+		return eqx.tree_at(lambda m: m.weight, self.base, w)
+
+# Apply to all matching layers
+net.lora(rank=4, wrapper=LoRAConv)
+
+# Pass a list — tried in order, first applies_to() match wins per leaf
+net.lora(rank=4, wrapper=[LoRALinear, LoRAConv])
+```
+
+Per-target specs may carry their own `"wrapper"` key, which overrides the global default for that
+group:
+
+```python
+net.lora(
+	wrapper=LoRALinear,          # global default
+	specs=[
+		{"target": "linear", "rank": 4,  "alpha": 1.0},
+		{"target": "conv",   "rank": 8,  "alpha": 2.0, "wrapper": LoRAConv},
+	]
+)
+```
 
 ### Combine mask + LoRA for base-trainability control
 
