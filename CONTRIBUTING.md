@@ -2,54 +2,77 @@
 
 Thank you for your interest in contributing to jNO! This document outlines the development workflow and quality standards.
 
+## Environment Setup
+
+jNO uses [pixi](https://pixi.sh) to manage the development environment. Install it once:
+
+```bash
+curl -fsSL https://pixi.sh/install.sh | bash
+```
+
+Then clone the repo and install all dependencies from the lock file:
+
+```bash
+git clone https://github.com/FhG-IISB/jNO.git
+cd jNO
+pixi install
+```
+
+That's it — no manual conda/pip steps needed.
+
 ## Pre-Commit Checklist
 
-Before submitting code or pushing changes, please run the following checks locally:
+Before submitting code or pushing changes, run the following checks locally using the pixi tasks defined in `pyproject.toml`.
 
 ### 1. Code Formatting
 
-Format all Python code with [Black](https://github.com/psf/black):
-
 ```bash
-black jno/
+pixi run fmt
 ```
 
-### 2. Type Checking
+Auto-formats all Python files with [ruff](https://docs.astral.sh/ruff/). Re-run until no files are reformatted.
 
-Run mypy to ensure type safety:
+### 2. Linting
 
 ```bash
-uv run mypy jno/ --ignore-missing-imports --no-strict-optional
+pixi run lint
 ```
 
-All errors must be resolved before committing. Notes and warnings are acceptable.
+Runs `ruff check --fix` over the codebase. Fix any remaining errors that cannot be auto-fixed before committing.
 
 ### 3. Unit Tests
 
-Run the full test suite to ensure no regressions:
-
 ```bash
-uv run pytest
+pixi run test
 ```
 
-All tests must pass before submitting a pull request.
+Runs the fast test suite (`pytest -x --tb=short`). All tests must pass before submitting a pull request.
 
 ## Development Workflow
 
-1. **Create feature branch**: Start from `main` and create a descriptive branch.
-2. **Implement changes**: Write code following project conventions.
-3. **Run checks locally**: Execute the three commands above in order.
-4. **Commit and push**: Once all checks pass, commit with a clear message.
-5. **Submit PR**: Request review and address any feedback.
+1. **Create a feature branch**: start from `main` and use a descriptive name.
+2. **Implement changes**: follow the project conventions in the existing code.
+3. **Run checks locally**: execute `fmt`, `lint`, and `test` in order.
+4. **Commit and push**: once all checks pass, commit with a clear message.
+5. **Submit PR**: request review and address any feedback.
 
-## Quick Check Command
-
-To run all three checks in sequence:
+## Quick Check — All Three in Sequence
 
 ```bash
-black jno/ && uv run pytest && uv run mypy jno/ --ignore-missing-imports --no-strict-optional
+pixi run fmt && pixi run lint && pixi run test
 ```
+
+## Available Pixi Tasks
+
+| Task | Command | Purpose |
+|------|---------|---------|
+| `pixi run fmt` | `ruff format .` | Auto-format code |
+| `pixi run lint` | `ruff check . --fix` | Lint and auto-fix |
+| `pixi run test` | `pytest -x --tb=short` | Run fast test suite |
+| `pixi run ci-fmt` | `ruff format --check .` | Format check (read-only, used by CI) |
+| `pixi run ci-lint` | `ruff check .` | Lint check (no auto-fix, used by CI) |
+| `pixi run ci-test` | `pytest -x --tb=short -m 'not slow'` | Test suite without slow tests (used by CI) |
 
 ## CI/CD
 
-These checks are also enforced via continuous integration. All commits must pass automated checks before merging.
+Pull requests are checked by `.github/workflows/ci.yml`, which runs `ci-fmt`, `ci-lint`, and `ci-test` via pixi. The CI environment is identical to local — same lock file, same tool versions, no surprises.

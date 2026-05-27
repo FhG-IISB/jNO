@@ -1,53 +1,56 @@
-from typing import List, Callable, Dict, Optional, Tuple, Union, Any, cast
-import os
 import gc
+import os
+import time
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
+
+import equinox as eqx
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
-from jax.experimental import mesh_utils
-import optax
 import numpy as np
-import time
-from .trace import (
-    Placeholder,
-    Variable,
-    TensorTag,
-    BinaryOp,
-    Model,
-    TunableModule,
-    TunableModuleCall,
-    Choice,
-    ModelCall,
-    OperationDef,
-    OperationCall,
-    Hessian,
-    Jacobian,
-    FunctionCall,
-    Literal,
-    Constant,
-    ConstantNamespace,
-    Tracker,
-    StateField,
-    Assembly,
-    GroupedAssembly,
-    collect_operations,
-    collect_tags,
-    get_primary_tag,
-    dump_tree,
-    cse,
-)
-from .utils import LearningRateSchedule, WeightSchedule, statistics, get_logger, get_seed
-from .utils.config import get_wandb_run, wandb_log, wandb_log_model, wandb_alert
-from .domain import domain, DomainData
-from .trace_evaluator import TraceEvaluator
-from .trace_compiler import TraceCompiler
-from .tuner import ArchSpace, DeviceConfig, Tuner
+import optax
+from jax.experimental import mesh_utils
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
+
 from .architectures.lora_linear import (
     apply_lora as _apply_lora,
-    merge_lora as _merge_lora,
+)
+from .architectures.lora_linear import (
     lora_trainable_filter as _lora_trainable_filter,
 )
-import equinox as eqx
+from .architectures.lora_linear import (
+    merge_lora as _merge_lora,
+)
+from .domain import DomainData, domain
+from .trace import (
+    BinaryOp,
+    Choice,
+    FunctionCall,
+    Hessian,
+    Jacobian,
+    Model,
+    OperationCall,
+    OperationDef,
+    Placeholder,
+    Tracker,
+    TunableModule,
+    TunableModuleCall,
+    collect_operations,
+    collect_tags,
+    cse,
+    dump_tree,
+    get_primary_tag,
+)
+from .trace_compiler import TraceCompiler
+from .trace_evaluator import TraceEvaluator
+from .tuner import ArchSpace, DeviceConfig, Tuner
+from .utils import (
+    LearningRateSchedule,
+    get_logger,
+    get_seed,
+    statistics,
+)
+from .utils.config import get_wandb_run, wandb_alert, wandb_log, wandb_log_model
 
 try:
     import paramax as _paramax
@@ -144,7 +147,7 @@ class core:
         self.rng = jax.random.PRNGKey(seed)
         self.log.info(f"RNG seed: {seed}")
 
-        self.log.info(f"Initializing Model/s and compiling constraints")
+        self.log.info("Initializing Model/s and compiling constraints")
 
         self.compile(mesh)
 
@@ -369,7 +372,9 @@ class core:
             for name, tensor in domain.context.items():
                 if isinstance(tensor, dict) or not hasattr(tensor, "shape"):
                     continue
-                tensor_dims[name] = tensor.shape[2:]  # was 1 but I think 2 is right for the (B, T, ...) shape of context tensors
+                tensor_dims[name] = tensor.shape[
+                    2:
+                ]  # was 1 but I think 2 is right for the (B, T, ...) shape of context tensors
         return tensor_dims
 
     def _populate_missing_context_tags(self, domain) -> None:
@@ -423,7 +428,9 @@ class core:
                     )
                     continue
                 except Exception as exc:
-                    self.log.warning(f"Falling back to copied context for '{resolved_tag}': could not sample on provided domain ({exc})")
+                    self.log.warning(
+                        f"Falling back to copied context for '{resolved_tag}': could not sample on provided domain ({exc})"
+                    )
 
         for tag, value in source_context.items():
             if tag in target_context:
@@ -446,7 +453,20 @@ class core:
 
         context = {}
         # List of tags that are MESH METADATA and should never be batched
-        metadata_tags = ["JxW", "flat_cells", "global_areas", "N_flat", "dN_dx_flat", "dirichlet_nodes", "cells", "quad_points", "boundary_nodes", "surface_data", "v_grads_JxW_flat", "__time__"]
+        metadata_tags = [
+            "JxW",
+            "flat_cells",
+            "global_areas",
+            "N_flat",
+            "dN_dx_flat",
+            "dirichlet_nodes",
+            "cells",
+            "quad_points",
+            "boundary_nodes",
+            "surface_data",
+            "v_grads_JxW_flat",
+            "__time__",
+        ]
         if hasattr(domain, "context"):
             for tag, arr in domain.context.items():
                 # If it's a nested dictionary (like our VPINN surface_data), map safely
@@ -495,7 +515,11 @@ class core:
                 rebuilt_binary = BinaryOp(node.op, left, right)
                 if is_weak:
                     setattr(rebuilt_binary, "_is_weak_expr", True)
-                    setattr(rebuilt_binary, "_weak_root_id", getattr(node, "_weak_root_id", None))
+                    setattr(
+                        rebuilt_binary,
+                        "_weak_root_id",
+                        getattr(node, "_weak_root_id", None),
+                    )
                 node = rebuilt_binary
 
         elif isinstance(node, FunctionCall):
@@ -512,7 +536,11 @@ class core:
                 rebuilt_function = FunctionCall(node.fn, new_args, node._name, node.reduces_axis, node.kwargs)
                 if is_weak:
                     setattr(rebuilt_function, "_is_weak_expr", True)
-                    setattr(rebuilt_function, "_weak_root_id", getattr(node, "_weak_root_id", None))
+                    setattr(
+                        rebuilt_function,
+                        "_weak_root_id",
+                        getattr(node, "_weak_root_id", None),
+                    )
                 node = rebuilt_function
 
         elif isinstance(node, OperationDef):
@@ -522,7 +550,11 @@ class core:
                 rebuilt_opdef.name = getattr(node, "name", None)
                 if is_weak:
                     setattr(rebuilt_opdef, "_is_weak_expr", True)
-                    setattr(rebuilt_opdef, "_weak_root_id", getattr(node, "_weak_root_id", None))
+                    setattr(
+                        rebuilt_opdef,
+                        "_weak_root_id",
+                        getattr(node, "_weak_root_id", None),
+                    )
                 node = rebuilt_opdef
 
         elif isinstance(node, Tracker):
@@ -531,7 +563,11 @@ class core:
                 rebuilt_tracker = Tracker(new_expr, interval=node.interval)
                 if is_weak:
                     setattr(rebuilt_tracker, "_is_weak_expr", True)
-                    setattr(rebuilt_tracker, "_weak_root_id", getattr(node, "_weak_root_id", None))
+                    setattr(
+                        rebuilt_tracker,
+                        "_weak_root_id",
+                        getattr(node, "_weak_root_id", None),
+                    )
                 node = rebuilt_tracker
 
         # Replace only the OUTERMOST marked weak subtree, after wrapper recursion.
@@ -541,7 +577,16 @@ class core:
         return node
 
     # Training
-    def _make_loss_fn(self, compiled_constraints_fn, n_constraints, batchsize, frozen, static, checkpoint_gradients=False, min_consecutive=1):
+    def _make_loss_fn(
+        self,
+        compiled_constraints_fn,
+        n_constraints,
+        batchsize,
+        frozen,
+        static,
+        checkpoint_gradients=False,
+        min_consecutive=1,
+    ):
         """Create loss function — evaluates ALL constraints in one combined call."""
 
         def loss_fn(trainable, context, rng):
@@ -556,12 +601,24 @@ class core:
                 # Equinox wrapper avoids JAX export false-positives in type stubs.
                 @eqx.filter_checkpoint
                 def _remat_eval(models, ctx, key):
-                    return _fn(models, ctx, batchsize=_bs, key=key, min_consecutive=min_consecutive)
+                    return _fn(
+                        models,
+                        ctx,
+                        batchsize=_bs,
+                        key=key,
+                        min_consecutive=min_consecutive,
+                    )
 
                 all_residuals = _remat_eval(full_models, context, rng)
             else:
                 # One call → one JAX function → XLA applies CSE across constraints
-                all_residuals = compiled_constraints_fn(full_models, context, batchsize=batchsize, key=rng, min_consecutive=min_consecutive)
+                all_residuals = compiled_constraints_fn(
+                    full_models,
+                    context,
+                    batchsize=batchsize,
+                    key=rng,
+                    min_consecutive=min_consecutive,
+                )
 
             # all_residuals is a list of (B, T, ...) arrays — one per constraint
             losses = jnp.stack([jnp.mean(r) for r in all_residuals])
@@ -659,12 +716,20 @@ class core:
                     # Each MaskedState has .inner_state = (base_opt_state, inject_scale_state)
                     for i, sched in enumerate(_group_lr[k]):
                         lr_val = sched(base_epoch + start_epoch, individual_losses)
-                        new_state[i].inner_state[-1].hyperparams["step_size"] = jnp.asarray(lr_val, dtype=new_state[i].inner_state[-1].hyperparams["step_size"].dtype)
+                        new_state[i].inner_state[-1].hyperparams["step_size"] = jnp.asarray(
+                            lr_val,
+                            dtype=new_state[i].inner_state[-1].hyperparams["step_size"].dtype,
+                        )
                 else:
                     lr_val = lr_schedules[k](base_epoch + start_epoch, individual_losses)
-                    new_state[-1].hyperparams["step_size"] = jnp.asarray(lr_val, dtype=opt_states[k][-1].hyperparams["step_size"].dtype)
+                    new_state[-1].hyperparams["step_size"] = jnp.asarray(
+                        lr_val, dtype=opt_states[k][-1].hyperparams["step_size"].dtype
+                    )
 
-                trainable = {**trainable, lid: optax.apply_updates(model_params, updates)}
+                trainable = {
+                    **trainable,
+                    lid: optax.apply_updates(model_params, updates),
+                }
                 opt_states = {**opt_states, k: new_state}
 
             next_epoch = start_epoch + jnp.asarray(1, dtype=start_epoch.dtype)
@@ -757,7 +822,10 @@ class core:
                         dtype=opt_states[k][-1].hyperparams["step_size"].dtype,
                     )
 
-                trainable = {**trainable, lid: optax.apply_updates(model_params, updates)}
+                trainable = {
+                    **trainable,
+                    lid: optax.apply_updates(model_params, updates),
+                }
                 opt_states = {**opt_states, k: new_state}
 
             return trainable, opt_states
@@ -827,7 +895,9 @@ class core:
         tensor_dims = self.compute_tensor_dims(self.domain)
 
         # === Initialize models ===
-        self.models, self.rng = TraceCompiler.init_layer_params(self.all_ops, self.domain_data.dimension, tensor_dims, self.rng, self.log)
+        self.models, self.rng = TraceCompiler.init_layer_params(
+            self.all_ops, self.domain_data.dimension, tensor_dims, self.rng, self.log
+        )
 
         # === Apply sharding to model arrays ===
         self.models = self._shard_params(self.models)
@@ -929,6 +999,7 @@ class core:
             statistics: Training history with ``.plot()`` convenience.
         """
         from contextlib import nullcontext
+
         from jax._src import profiler as _jax_profiler
 
         _profiling = _jax_profiler._profile_state.profile_session is not None
@@ -940,7 +1011,9 @@ class core:
         if accumulation_steps < 1:
             raise ValueError(f"accumulation_steps must be >= 1, got {accumulation_steps}")
         if accumulation_steps > 1 and batchsize >= self.domain.total_samples:
-            self.log.warning("accumulation_steps > 1 has no effect with full-batch training; " "falling back to accumulation_steps=1")
+            self.log.warning(
+                "accumulation_steps > 1 has no effect with full-batch training; falling back to accumulation_steps=1"
+            )
             accumulation_steps = 1
 
         # Adaptive resampling metadata
@@ -949,7 +1022,6 @@ class core:
         if has_resampling and inner_steps > 1:
             self.log.warning("Adaptive resampling with inner_steps > 1 is applied at outer-step boundaries only.")
 
-        constraint_tags = getattr(self, "_constraint_tags", self.get_constraint_tags(getattr(self, "_constraint_exprs", [])))
         tag_to_constraint_indices: Dict[str, List[int]] = {}
         # Map each constraint to *every* tag it touches so that resampling
         # strategies always find matching constraints, even when adaptive
@@ -960,7 +1032,9 @@ class core:
                 tag_to_constraint_indices.setdefault(tag, []).append(i)
 
         def _infer_total_samples(ctx: Dict[str, np.ndarray]) -> int:
-            candidates = [v.shape[0] for k, v in ctx.items() if k != "__time__" and hasattr(v, "shape") and len(v.shape) >= 1]
+            candidates = [
+                v.shape[0] for k, v in ctx.items() if k != "__time__" and hasattr(v, "shape") and len(v.shape) >= 1
+            ]
             if candidates:
                 return int(max(candidates))
             fallback = [v.shape[0] for v in ctx.values() if hasattr(v, "shape") and len(v.shape) >= 1]
@@ -1023,7 +1097,7 @@ class core:
 
         # ── 0. Validate offload_data ──
         if offload_data and (batchsize is None or batchsize >= self.domain.total_samples):
-            self.log.warning("offload_data requires batchsize < total_samples; " "ignoring offload_data for this run.")
+            self.log.warning("offload_data requires batchsize < total_samples; ignoring offload_data for this run.")
             offload_data = False
 
         if _paramax is not None:
@@ -1038,7 +1112,11 @@ class core:
         for lid, fm in flax_mods.items():
             needs_optimizer = (not fm._frozen) or (fm._lora_config is not None)
             if needs_optimizer and fm._opt_fn is None:
-                raise ValueError(f"Model '{fm.name or type(fm.module).__name__}' (layer {lid}) " f"has no optimizer. Call  model.optimizer(optax.adam, lr=...)  " f"before solve(), or freeze it with  model.freeze().")
+                raise ValueError(
+                    f"Model '{fm.name or type(fm.module).__name__}' (layer {lid}) "
+                    f"has no optimizer. Call  model.optimizer(optax.adam, lr=...)  "
+                    f"before solve(), or freeze it with  model.freeze()."
+                )
 
         # ── 2. Apply LoRA transforms ──
         models = dict(self.models)
@@ -1046,7 +1124,7 @@ class core:
         for lid, fm in flax_mods.items():
             if fm._lora_config is not None:
                 self.rng, key = jax.random.split(self.rng)
-                n_params_before = sum(l.size for l in jax.tree_util.tree_leaves(models[lid]) if eqx.is_array(l))
+                n_params_before = sum(param.size for param in jax.tree_util.tree_leaves(models[lid]) if eqx.is_array(param))
 
                 if isinstance(fm._lora_config, list):
                     # Per-target LoRA specs
@@ -1054,17 +1132,25 @@ class core:
                 else:
                     # Uniform LoRA (backward-compatible tuple)
                     rank, alpha, lora_target = fm._lora_config
-                    models[lid] = _apply_lora(models[lid], rank, alpha, key=key, target=(lora_target if lora_target is not None else ""))
+                    models[lid] = _apply_lora(
+                        models[lid],
+                        rank,
+                        alpha,
+                        key=key,
+                        target=(lora_target if lora_target is not None else ""),
+                    )
 
                 model_after = models[lid]
-                n_params_after = sum(l.size for l in jax.tree_util.tree_leaves(model_after) if eqx.is_array(l))
+                n_params_after = sum(param.size for param in jax.tree_util.tree_leaves(model_after) if eqx.is_array(param))
                 n_lora_params = n_params_after - n_params_before
                 lora_param_counts[lid] = n_lora_params
 
                 from .architectures.lora_linear import LoRALinear
 
                 is_lora = lambda x: isinstance(x, LoRALinear)
-                lora_leaves = [l for l in jax.tree_util.tree_leaves(model_after, is_leaf=is_lora) if isinstance(l, LoRALinear)]
+                lora_leaves = [
+                    leaf for leaf in jax.tree_util.tree_leaves(model_after, is_leaf=is_lora) if isinstance(leaf, LoRALinear)
+                ]
                 n_lora_layers = len(lora_leaves)
 
                 # Group by (rank, alpha) for reporting
@@ -1075,13 +1161,21 @@ class core:
 
                 if len(rank_groups) == 1:
                     (r, a), cnt = next(iter(rank_groups.items()))
-                    self.log.info(f"LoRA applied to model {lid} (rank={r}, alpha={a}): " f"{cnt} LoRALinear layers, " f"Params: {n_params_before:,}→{n_params_after:,}")
+                    self.log.info(
+                        f"LoRA applied to model {lid} (rank={r}, alpha={a}): "
+                        f"{cnt} LoRALinear layers, "
+                        f"Params: {n_params_before:,}→{n_params_after:,}"
+                    )
                 else:
                     parts = [f"r={r}/a={a}×{cnt}" for (r, a), cnt in sorted(rank_groups.items())]
-                    self.log.info(f"LoRA applied to model {lid}: {n_lora_layers} layers " f"[{', '.join(parts)}], " f"Params: {n_params_before:,}→{n_params_after:,}")
+                    self.log.info(
+                        f"LoRA applied to model {lid}: {n_lora_layers} layers "
+                        f"[{', '.join(parts)}], "
+                        f"Params: {n_params_before:,}→{n_params_after:,}"
+                    )
 
                 if n_lora_layers == 0:
-                    self.log.warning(f"LoRA: No layers were adapted for model {lid}! " f"LoRA has NO EFFECT on this model.")
+                    self.log.warning(f"LoRA: No layers were adapted for model {lid}! LoRA has NO EFFECT on this model.")
 
         # ── 3. Build trainable filter ──
         filter_spec = {}
@@ -1105,7 +1199,7 @@ class core:
                     filter_spec[lid] = _lora_trainable_filter(model)
             elif fm is not None and fm._frozen:
                 # Whole model frozen – no arrays trainable
-                filter_spec[lid] = jax.tree_util.tree_map(lambda l: False, model)
+                filter_spec[lid] = jax.tree_util.tree_map(lambda leaf: False, model)
             elif fm is not None and fm._trainable_param_mask is not None:
                 # Partial mask — only leaves marked True in the mask are trained.
                 # Non-array leaves (e.g. activation functions kept as module
@@ -1125,7 +1219,7 @@ class core:
                 # filter spec as sub-filters.
                 filter_spec[lid] = jax.tree_util.tree_map(
                     # Gradients are defined only for inexact dtypes.
-                    lambda l: True if eqx.is_inexact_array(l) else False,
+                    lambda leaf: True if eqx.is_inexact_array(leaf) else False,
                     model,
                 )
 
@@ -1140,14 +1234,14 @@ class core:
         # ── 4b. Log parameter counts ──
         def _count_params(pytree):
             """Count total parameters in a pytree."""
-            return sum(l.size for l in jax.tree_util.tree_leaves(pytree) if eqx.is_array(l))
+            return sum(param.size for param in jax.tree_util.tree_leaves(pytree) if eqx.is_array(param))
 
         n_trainable_params = _count_params(trainable)
         n_frozen_params = _count_params(frozen_arrays)
         n_total_params = n_trainable_params + n_frozen_params
         n_lora_params_total = sum(lora_param_counts.values())
 
-        self.log.info(f"Parameter summary:")
+        self.log.info("Parameter summary:")
         self.log.info(f"    Trainable parameters:  {n_trainable_params:>12,}")
         self.log.info(f"    Frozen parameters:     {n_frozen_params:>12,}")
         self.log.info(f"    Total parameters:      {n_total_params:>12,}")
@@ -1161,16 +1255,16 @@ class core:
             if fm is None:
                 continue
             mname = fm.name or type(fm.module).__name__
-            m_total = sum(l.size for l in jax.tree_util.tree_leaves(model) if eqx.is_array(l))
+            m_total = sum(param.size for param in jax.tree_util.tree_leaves(model) if eqx.is_array(param))
             fspec = filter_spec.get(lid)
             if fspec is not None:
                 m_train = sum(
-                    l.size
-                    for l, f in zip(
+                    param.size
+                    for param, f in zip(
                         jax.tree_util.tree_leaves(model),
                         jax.tree_util.tree_leaves(fspec),
                     )
-                    if eqx.is_array(l) and f is True
+                    if eqx.is_array(param) and f is True
                 )
             else:
                 m_train = m_total
@@ -1226,7 +1320,10 @@ class core:
                 global_lr = fm._lr if fm._lr is not None else LearningRateSchedule(1e-3)
 
                 if global_opt_fn is None:
-                    raise ValueError(f"Model (layer {lid}) has parameter groups but no global optimizer. " f"Call  model.optimizer(optax.adam)  as a fallback for ungrouped params.")
+                    raise ValueError(
+                        f"Model (layer {lid}) has parameter groups but no global optimizer. "
+                        f"Call  model.optimizer(optax.adam)  as a fallback for ungrouped params."
+                    )
 
                 masked_transforms = []
                 group_scheds = []
@@ -1236,7 +1333,7 @@ class core:
                 group_masks_norm = []
                 for g in fm._param_groups:
                     gmask_norm = jax.tree_util.tree_map(
-                        lambda p, m: (bool(m) if p is not None else False),
+                        lambda p, m: bool(m) if p is not None else False,
                         trainable[lid],
                         g["mask"],
                         is_leaf=lambda x: x is None,
@@ -1245,7 +1342,10 @@ class core:
 
                 # Diagnostics over group masks: per-group coverage + overlap + uncovered
                 array_flags = [x is not None for x in jax.tree_util.tree_leaves(trainable[lid])]
-                group_leaf_masks = [[bool(x) if isinstance(x, bool) else False for x in jax.tree_util.tree_leaves(gm)] for gm in group_masks_norm]
+                group_leaf_masks = [
+                    [bool(x) if isinstance(x, bool) else False for x in jax.tree_util.tree_leaves(gm)]
+                    for gm in group_masks_norm
+                ]
 
                 group_counts = []
                 for g, gmask in zip(fm._param_groups, group_leaf_masks):
@@ -1266,9 +1366,15 @@ class core:
                         uncovered_count += 1
 
                 if overlap_count > 0:
-                    self.log.warning(f"Model {lid}: parameter groups overlap on {overlap_count} array leaves. " "Update order will follow optax.chain mask order.")
+                    self.log.warning(
+                        f"Model {lid}: parameter groups overlap on {overlap_count} array leaves. "
+                        "Update order will follow optax.chain mask order."
+                    )
 
-                self.log.info(f"Model {lid}: parameter groups summary — groups={len(fm._param_groups)}, " f"overlap={overlap_count}, uncovered_by_groups={uncovered_count}")
+                self.log.info(
+                    f"Model {lid}: parameter groups summary — groups={len(fm._param_groups)}, "
+                    f"overlap={overlap_count}, uncovered_by_groups={uncovered_count}"
+                )
                 self.log.quiet(f"Parameter Group Diagnostic Report for model {lid}")
                 self.log.quiet(f"groups={len(fm._param_groups)}, overlap={overlap_count}, uncovered={uncovered_count}")
                 for tgt, cnt in group_counts:
@@ -1292,7 +1398,7 @@ class core:
                             gmask,
                             is_leaf=lambda x: x is None,
                         )
-                    return jax.tree_util.tree_map(lambda c: (not c), combined, is_leaf=lambda x: x is None)
+                    return jax.tree_util.tree_map(lambda c: not c, combined, is_leaf=lambda x: x is None)
 
                 default_chain = _build_opt_chain(global_opt_fn, global_lr)
                 masked_transforms.append(optax.masked(default_chain, _default_mask(trainable[lid])))
@@ -1300,7 +1406,9 @@ class core:
 
                 per_model_opts[k] = optax.chain(*masked_transforms)
                 group_lr_schedules[k] = group_scheds
-                self.log.info(f"Model {lid}: {len(fm._param_groups)} parameter group(s) + default — " f"using per-group optimizers")
+                self.log.info(
+                    f"Model {lid}: {len(fm._param_groups)} parameter group(s) + default — using per-group optimizers"
+                )
             else:
                 # ── Single global optimizer (original behaviour) ──
                 opt_fn = fm._opt_fn
@@ -1337,7 +1445,11 @@ class core:
             # Then place on the mesh with P() so shardings are canonical
             # and match what the step function will produce.
             opt_states[k] = jax.tree_util.tree_map(
-                lambda x: jax.device_put(jnp.copy(x), NamedSharding(self.mesh, P())) if isinstance(x, (jnp.ndarray, jax.Array)) else x,
+                lambda x: (
+                    jax.device_put(jnp.copy(x), NamedSharding(self.mesh, P()))
+                    if isinstance(x, (jnp.ndarray, jax.Array))
+                    else x
+                ),
                 state,
             )
 
@@ -1348,7 +1460,9 @@ class core:
             try:
                 import orbax.checkpoint as _ocp
             except ImportError as exc:
-                raise ImportError("orbax-checkpoint is required for resume_from=. " "Install it with:  pip install orbax-checkpoint") from exc
+                raise ImportError(
+                    "orbax-checkpoint is required for resume_from=. Install it with:  pip install orbax-checkpoint"
+                ) from exc
 
             _ckpt_mgr = _ocp.CheckpointManager(
                 os.path.abspath(self._resume_from),
@@ -1393,7 +1507,9 @@ class core:
             host_context = {k: np.asarray(v) for k, v in full_context.items()}
             total_samples = _infer_total_samples(host_context)
             effective_batchsize = None  # data is already pre-sliced
-            self.log.info(f"Data offloading enabled: {total_samples} total samples, " f"streaming batches of {batchsize} from host")
+            self.log.info(
+                f"Data offloading enabled: {total_samples} total samples, streaming batches of {batchsize} from host"
+            )
         else:
             # Replicate / shard full dataset on device (original behaviour)
             domain_data = DomainData(context=full_context, dimension=self.domain_data.dimension)
@@ -1425,7 +1541,7 @@ class core:
         # Only valid when context is fixed on-device (offload_data=False).
         if inner_steps > 1:
             if offload_data:
-                self.log.warning("inner_steps > 1 is not compatible with offload_data=True; " "falling back to inner_steps=1")
+                self.log.warning("inner_steps > 1 is not compatible with offload_data=True; falling back to inner_steps=1")
                 inner_steps = 1
             else:
                 _K = inner_steps
@@ -1437,7 +1553,14 @@ class core:
                         tr, opt, rn, ep_next, total, indv = _single(tr, opt, rn, context, ep, _indv)
                         return tr, opt, rn, ep_next, total, indv
 
-                    init = (trainable, opt_states, rng, start_epoch, jnp.zeros(()), prev_losses)
+                    init = (
+                        trainable,
+                        opt_states,
+                        rng,
+                        start_epoch,
+                        jnp.zeros(()),
+                        prev_losses,
+                    )
                     return jax.lax.fori_loop(0, _K, body, init)
 
         # ── 7b. Build gradient accumulation functions (if needed) ──
@@ -1455,7 +1578,11 @@ class core:
                 lr_schedules=lr_schedules,
                 group_lr_schedules=group_lr_schedules,
             )
-            self.log.info(f"Gradient accumulation enabled: {accumulation_steps} micro-batches " f"per update (effective batch = {batchsize} × {accumulation_steps} " f"= {batchsize * accumulation_steps})")
+            self.log.info(
+                f"Gradient accumulation enabled: {accumulation_steps} micro-batches "
+                f"per update (effective batch = {batchsize} × {accumulation_steps} "
+                f"= {batchsize * accumulation_steps})"
+            )
 
         # Optional: build JIT-compiled tracker function
         has_trackers = len(self.compiled_trackers) > 0
@@ -1567,7 +1694,7 @@ class core:
             if has_trackers:
                 jit_track = jax.jit(track_fn)
 
-            self.log.info("JIT compiling step function with mesh sharding — " "this might take a while")
+            self.log.info("JIT compiling step function with mesh sharding — this might take a while")
 
             # ── Enable persistent XLA compilation cache ──
             # On the first run XLA compiles and writes artifacts to disk.
@@ -1653,7 +1780,10 @@ class core:
 
             n_outer = epochs // inner_steps
             if epochs % inner_steps != 0:
-                self.log.warning(f"epochs={epochs} is not divisible by inner_steps={inner_steps}; " f"running {n_outer * inner_steps} epochs instead.")
+                self.log.warning(
+                    f"epochs={epochs} is not divisible by inner_steps={inner_steps}; "
+                    f"running {n_outer * inner_steps} epochs instead."
+                )
             print_rate = max(10, n_outer // 10 if n_outer < 100_000 else n_outer // 1000)
 
             # Freeze all surviving Python objects (model params, opt states, etc.)
@@ -1731,7 +1861,10 @@ class core:
                             # Current strategies are designed for steady-state point
                             # sets represented as (B, 1, N, D). Keep T fixed at 1.
                             if not hasattr(tag_points, "ndim") or tag_points.ndim != 4 or tag_points.shape[1] != 1:
-                                self.log.warning(f"Resampling skipped for tag '{tag}': expected point shape (B, 1, N, D), " f"got {tuple(tag_points.shape)}")
+                                self.log.warning(
+                                    f"Resampling skipped for tag '{tag}': expected point shape (B, 1, N, D), "
+                                    f"got {tuple(tag_points.shape)}"
+                                )
                                 continue
 
                             points_bn = jnp.asarray(tag_points[:, 0, :, :])
@@ -1739,7 +1872,9 @@ class core:
 
                             idxs = tag_to_constraint_indices.get(tag, [])
                             if not idxs:
-                                self.log.warning(f"Resampling skipped for tag '{tag}': no constraints associated with this tag")
+                                self.log.warning(
+                                    f"Resampling skipped for tag '{tag}': no constraints associated with this tag"
+                                )
                                 continue
 
                             scored = []
@@ -1807,7 +1942,14 @@ class core:
                             if host_context is None:
                                 raise RuntimeError("offload_data=True but host_context is not available")
                             indices = rng_np.choice(total_samples, batchsize, replace=False)
-                            batch_np = {k: (v if k == "__time__" else (np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices])) for k, v in host_context.items()}
+                            batch_np = {
+                                k: (
+                                    v
+                                    if k == "__time__"
+                                    else (np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices])
+                                )
+                                for k, v in host_context.items()
+                            }
                             micro_ctx = self._shard_data(jax.device_put(batch_np))
                         else:
                             micro_ctx = on_device_context
@@ -1821,7 +1963,11 @@ class core:
                         if _acc_grads is None:
                             _acc_grads = jax.tree_util.tree_map(lambda g: g * _inv_accum, _micro_grads)
                         else:
-                            _acc_grads = jax.tree_util.tree_map(lambda a, g: a + g * _inv_accum, _acc_grads, _micro_grads)
+                            _acc_grads = jax.tree_util.tree_map(
+                                lambda a, g: a + g * _inv_accum,
+                                _acc_grads,
+                                _micro_grads,
+                            )
                         _acc_total = _acc_total + float(jax.device_get(_micro_loss)) * _inv_accum
                         _acc_losses = _acc_losses + _micro_indiv * _inv_accum
 
@@ -1842,13 +1988,27 @@ class core:
                         if host_context is None:
                             raise RuntimeError("offload_data=True but host_context is not available")
                         indices = rng_np.choice(total_samples, batchsize, replace=False)
-                        batch_np = {k: (v if k == "__time__" else (np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices])) for k, v in host_context.items()}
+                        batch_np = {
+                            k: (
+                                v
+                                if k == "__time__"
+                                else (np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices])
+                            )
+                            for k, v in host_context.items()
+                        }
                         context = self._shard_data(jax.device_put(batch_np))
                     else:
                         context = on_device_context
 
                     # --- step ---
-                    trainable, opt_states, self.rng, epoch_jnp, total_loss, individual_losses = jit_step(
+                    (
+                        trainable,
+                        opt_states,
+                        self.rng,
+                        epoch_jnp,
+                        total_loss,
+                        individual_losses,
+                    ) = jit_step(
                         trainable,
                         opt_states,
                         self.rng,
@@ -1925,12 +2085,14 @@ class core:
                             wandb_log(_wb_track, step=displayed_epoch)
 
                     # Progress line
-                    loss_strs = " | ".join(f"C{i}: {l:>10.4e}" for i, l in enumerate(losses_np))
+                    loss_strs = " | ".join(f"C{i}: {v:>10.4e}" for i, v in enumerate(losses_np))
                     if track_stats_np is not None:
                         track_strs = " | ".join(f"T{i}: {v:>10.4e}" for i, v in enumerate(track_stats_np))
-                        self.log.info(f"Epoch {displayed_epoch:>6}/{epochs}| " f"L:{total_np:>10.4e} | {loss_strs} | {track_strs}")
+                        self.log.info(
+                            f"Epoch {displayed_epoch:>6}/{epochs}| L:{total_np:>10.4e} | {loss_strs} | {track_strs}"
+                        )
                     else:
-                        self.log.info(f"Epoch {displayed_epoch:>6}/{epochs}| " f"L:{total_np:>10.4e} | {loss_strs}")
+                        self.log.info(f"Epoch {displayed_epoch:>6}/{epochs}| L:{total_np:>10.4e} | {loss_strs}")
 
                 # --- callbacks ---
                 if callbacks:
@@ -2036,7 +2198,9 @@ class core:
         try:
             import orbax.checkpoint as ocp
         except ImportError as exc:
-            raise ImportError("orbax-checkpoint is required for restore_checkpoint(). " "Install it with:  pip install orbax-checkpoint") from exc
+            raise ImportError(
+                "orbax-checkpoint is required for restore_checkpoint(). Install it with:  pip install orbax-checkpoint"
+            ) from exc
 
         manager = ocp.CheckpointManager(
             os.path.abspath(directory),
@@ -2121,7 +2285,7 @@ class core:
         for i, (const, (_, op_name)) in enumerate(zip(out_shape, parent_exprs)):
             p_shape = parent_shape[i]
             if op_name is not None and p_shape is not None:
-                self.log.info(f"Constraint {i}: Shape = {p_shape.shape}" f" → .{op_name}() → {const.shape}")
+                self.log.info(f"Constraint {i}: Shape = {p_shape.shape} → .{op_name}() → {const.shape}")
             else:
                 self.log.info(f"Constraint {i}: Shape = {const.shape}")
 
@@ -2162,7 +2326,7 @@ class core:
 
             if not isinstance(out_shape, tuple):
                 if t_shape is not None:
-                    self.log.info(f"Tracker {i}: Shape = {t_shape.shape}" f" → .{op_name}() → {out_shape.shape}")
+                    self.log.info(f"Tracker {i}: Shape = {t_shape.shape} → .{op_name}() → {out_shape.shape}")
                 else:
                     self.log.info(f"Tracker {i}: Shape = {out_shape.shape}")
             else:
@@ -2407,7 +2571,13 @@ class core:
 
         return choices
 
-    def eval(self, operation: Union[List[BinaryOp], BinaryOp], domain: Optional[domain] = None, min_consecutive: Optional[int] = 1, key=None):
+    def eval(
+        self,
+        operation: Union[List[BinaryOp], BinaryOp],
+        domain: Optional[domain] = None,
+        min_consecutive: Optional[int] = 1,
+        key=None,
+    ):
         """
         Evaluates an operation or a list of operations on the current models and domain context.
         """

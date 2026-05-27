@@ -2,14 +2,13 @@ import jax
 
 jax.config.update("jax_enable_x64", False)
 
-import jax.numpy as jnp
-import optax
 import foundax
+import jax.numpy as jnp
 import numpy as np
+import optax
 
 import jno
 from jno import LearningRateSchedule as lrs
-
 
 """02 - 2-D Helmholtz equation with FEAX-FEM and variational PINNs
 
@@ -57,10 +56,7 @@ def exact_u_num(x, y):
 
 
 def source_f(x, y):
-    return (
-        pi**2 * sin(pi * x) * (2.0 * cos(pi * y) + y)
-        - (k_val**2) * sin(pi * x) * (cos(pi * y) + y)
-    )
+    return pi**2 * sin(pi * x) * (2.0 * cos(pi * y) + y) - (k_val**2) * sin(pi * x) * (cos(pi * y) + y)
 
 
 def exact_flux_right(x, y):
@@ -122,12 +118,7 @@ def build_helmholtz_weak_form(domain):
 
     k_sq = 0.0 * xg + k_val**2
 
-    vol_integrand = (
-        du_dx * phi_x
-        + du_dy * phi_y
-        - k_sq * u * phi
-        - source_f(xg, yg) * phi
-    )
+    vol_integrand = du_dx * phi_x + du_dy * phi_y - k_sq * u * phi - source_f(xg, yg) * phi
 
     neumann_right = exact_flux_right(xr, yr) * phi
     neumann_top = exact_flux_top(xt, yt) * phi
@@ -211,9 +202,7 @@ b_fem_dense = jnp.asarray(b_fem)
 
 u_fem = jnp.linalg.solve(A_fem_dense, b_fem_dense).reshape(-1)
 
-lin_res_fem = jnp.linalg.norm(A_fem_dense @ u_fem - b_fem_dense) / (
-    jnp.linalg.norm(b_fem_dense) + 1e-14
-)
+lin_res_fem = jnp.linalg.norm(A_fem_dense @ u_fem - b_fem_dense) / (jnp.linalg.norm(b_fem_dense) + 1e-14)
 
 print("\n" + "=" * 70)
 print("2D Helmholtz mixed BC: FEAX-FEM + VPINN")
@@ -236,9 +225,7 @@ u_true_eval = crux.eval(exact_u(x_eval, y_eval), domain=fem_domain)
 u_vpinn_eval = jnp.asarray(u_vpinn_eval).reshape(-1)
 u_true_eval = jnp.asarray(u_true_eval).reshape(-1)
 
-rel_l2_vpinn = jnp.linalg.norm(u_true_eval - u_vpinn_eval) / (
-    jnp.linalg.norm(u_true_eval) + 1e-14
-)
+rel_l2_vpinn = jnp.linalg.norm(u_true_eval - u_vpinn_eval) / (jnp.linalg.norm(u_true_eval) + 1e-14)
 max_abs_vpinn = jnp.max(jnp.abs(u_true_eval - u_vpinn_eval))
 
 coords_fem = np.asarray(fem_domain.mesh.points)[:, :2]
@@ -248,9 +235,7 @@ y_f = jnp.asarray(coords_fem[:, 1:2])
 u_exact_fem = exact_u_num(x_f, y_f).reshape(-1)
 u_fem_vec = jnp.asarray(u_fem).reshape(-1)
 
-rel_l2_fem = jnp.linalg.norm(u_exact_fem - u_fem_vec) / (
-    jnp.linalg.norm(u_exact_fem) + 1e-14
-)
+rel_l2_fem = jnp.linalg.norm(u_exact_fem - u_fem_vec) / (jnp.linalg.norm(u_exact_fem) + 1e-14)
 max_abs_fem = jnp.max(jnp.abs(u_exact_fem - u_fem_vec))
 
 print("\nVPINN")
@@ -263,9 +248,5 @@ print("-" * 70)
 print(f"Relative L2 Error             : {float(rel_l2_fem):.6e}")
 print(f"Max Abs Error                 : {float(max_abs_fem):.6e}")
 
-assert float(rel_l2_vpinn) < 1.1, (
-    f"VPINN relative L2 error too large: {float(rel_l2_vpinn):.3e}"
-)
-assert float(rel_l2_fem) < 0.5, (
-    f"FEM relative L2 error too large: {float(rel_l2_fem):.3e}"
-)
+assert float(rel_l2_vpinn) < 1.1, f"VPINN relative L2 error too large: {float(rel_l2_vpinn):.3e}"
+assert float(rel_l2_fem) < 0.5, f"FEM relative L2 error too large: {float(rel_l2_fem):.3e}"

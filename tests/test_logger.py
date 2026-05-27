@@ -4,7 +4,11 @@ from jno.utils.logger import Logger
 
 
 def test_logger_reports_log_file_path_once(tmp_path: Path):
-    logger = Logger(path=tmp_path, log_print=(True, False), name="test_logger_reports_log_file_path_once")
+    logger = Logger(
+        path=tmp_path,
+        log_print=(True, False),
+        name="test_logger_reports_log_file_path_once",
+    )
     logger.close()
 
     log_file = tmp_path / "log.txt"

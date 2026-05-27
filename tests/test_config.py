@@ -1,12 +1,17 @@
 """Tests for jno.utils.config — get_seed() and load_config()."""
 
-import pytest
-
 import os
 
-import jno.utils.config as cfg_module
-from jno.utils.config import get_seed, load_config, get_runs_base_dir, get_rsa_public_key, get_rsa_private_key
+import pytest
 
+import jno.utils.config as cfg_module
+from jno.utils.config import (
+    get_rsa_private_key,
+    get_rsa_public_key,
+    get_runs_base_dir,
+    get_seed,
+    load_config,
+)
 
 # ======================================================================
 # get_seed() — reads from the cached _CONFIG dict

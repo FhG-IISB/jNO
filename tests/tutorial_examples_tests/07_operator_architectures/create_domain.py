@@ -1,22 +1,30 @@
 """Shared Poisson data generation for the operator-learning architecture zoo."""
 
-import jno
 import numpy as np
+
+import jno
+
 GRID = 128
 N_MODES = 5
 ALPHA = 1.5
 SAMPLES = 3000
 SEED = 42
 FORCING_SCALE = 4.0
+
+
 def cell_centered_grid(grid_size: int):
     """Return 1D and 2D cell-centered coordinates on [0, 1]."""
     x1d = (np.arange(grid_size, dtype=np.float32) + 0.5) / grid_size
     xg, yg = np.meshgrid(x1d, x1d, indexing="ij")
     return x1d, xg, yg
+
+
 def grid_coordinates(grid_size: int) -> np.ndarray:
     """Return flattened coordinate pairs with shape (grid_size^2, 2)."""
     _, xg, yg = cell_centered_grid(grid_size)
     return np.stack([xg.ravel(), yg.ravel()], axis=-1).astype(np.float32)
+
+
 def generate_poisson_data(
     n_samples: int,
     grid_size: int,
@@ -48,6 +56,8 @@ def generate_poisson_data(
                 u_arr[sample_idx] += coeffs[k, m] / denom[k, m] * mode
 
     return f_arr[..., None], u_arr[..., None]
+
+
 def build_domain_from_arrays(forcing: np.ndarray, solution: np.ndarray, grid_size: int):
     """Build a batched jNO domain with stored `_f` and `_u` tensors."""
     if forcing.shape != solution.shape:
@@ -63,6 +73,8 @@ def build_domain_from_arrays(forcing: np.ndarray, solution: np.ndarray, grid_siz
     domain.variable("_f", forcing[:, np.newaxis, np.newaxis, :, :, :])
     domain.variable("_u", solution[:, np.newaxis, np.newaxis, :, :, :])
     return domain
+
+
 def build_training_domain(
     samples: int = SAMPLES,
     grid_size: int = GRID,
@@ -74,6 +86,8 @@ def build_training_domain(
     forcing, solution = generate_poisson_data(samples, grid_size, n_modes, alpha, seed, forcing_scale=forcing_scale)
     domain = build_domain_from_arrays(forcing, solution, grid_size)
     return domain, forcing, solution
+
+
 def save_domain(
     out_path: str | None = None,
     samples: int = SAMPLES,
@@ -88,10 +102,11 @@ def save_domain(
     output_path = out_path or f"domain_{samples}_{grid_size}.pkl"
     jno.save(domain, output_path)
     return output_path, domain, forcing, solution
+
+
 def main():
     print(f"Generating {SAMPLES} samples on {GRID}x{GRID} grid ...")
     out_path, domain, forcing, solution = save_domain()
     print(f"  forcing scale: {FORCING_SCALE:.2f}")
     print(f"  f: {forcing.shape}, u: {solution.shape}")
     print(f"  f range [{forcing.min():.3f}, {forcing.max():.3f}]  u range [{solution.min():.3f}, {solution.max():.3f}]")
-

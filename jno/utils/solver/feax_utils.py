@@ -14,29 +14,26 @@ Responsibilities:
 """
 from typing import Any, Dict, List
 
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 from jax.flatten_util import ravel_pytree
 
 from ...trace import (
-    Placeholder,
-    Literal,
     BinaryOp,
+    Constant,
     FunctionCall,
-    Variable,
-    ModelCall,
-    OperationDef,
-    OperationCall,
-    Jacobian,
     Hessian,
+    Jacobian,
+    Literal,
+    ModelCall,
+    OperationCall,
+    OperationDef,
+    StateField,
+    TensorTag,
+    TestFunction,
     Tracker,
     TrialFunction,
-    TestFunction,
-    TensorTag,
-    Constant,
-    Assembly,
-    GroupedAssembly,
-    StateField,
+    Variable,
 )
 from .solver_helper import contains_node_type, iter_children
 
@@ -73,7 +70,26 @@ def _lower_statefield_to_trial(expr, trial_cache=None):
         new_args = []
         changed = False
         for a in expr.args:
-            if isinstance(a, (Literal, Constant, TensorTag, Variable, TestFunction, TrialFunction, Jacobian, Hessian, BinaryOp, FunctionCall, ModelCall, OperationDef, OperationCall, Tracker, StateField)):
+            if isinstance(
+                a,
+                (
+                    Literal,
+                    Constant,
+                    TensorTag,
+                    Variable,
+                    TestFunction,
+                    TrialFunction,
+                    Jacobian,
+                    Hessian,
+                    BinaryOp,
+                    FunctionCall,
+                    ModelCall,
+                    OperationDef,
+                    OperationCall,
+                    Tracker,
+                    StateField,
+                ),
+            ):
                 na = _lower_statefield_to_trial(a, trial_cache)
                 changed = changed or (na is not a)
                 new_args.append(na)
@@ -87,7 +103,26 @@ def _lower_statefield_to_trial(expr, trial_cache=None):
         new_args = []
         changed = False
         for a in expr.args:
-            if isinstance(a, (Literal, Constant, TensorTag, Variable, TestFunction, TrialFunction, Jacobian, Hessian, BinaryOp, FunctionCall, ModelCall, OperationDef, OperationCall, Tracker, StateField)):
+            if isinstance(
+                a,
+                (
+                    Literal,
+                    Constant,
+                    TensorTag,
+                    Variable,
+                    TestFunction,
+                    TrialFunction,
+                    Jacobian,
+                    Hessian,
+                    BinaryOp,
+                    FunctionCall,
+                    ModelCall,
+                    OperationDef,
+                    OperationCall,
+                    Tracker,
+                    StateField,
+                ),
+            ):
                 na = _lower_statefield_to_trial(a, trial_cache)
                 changed = changed or (na is not a)
                 new_args.append(na)
@@ -114,7 +149,26 @@ def _lower_statefield_to_trial(expr, trial_cache=None):
         new_args = []
         changed = False
         for a in expr.args:
-            if isinstance(a, (Literal, Constant, TensorTag, Variable, TestFunction, TrialFunction, Jacobian, Hessian, BinaryOp, FunctionCall, ModelCall, OperationDef, OperationCall, Tracker, StateField)):
+            if isinstance(
+                a,
+                (
+                    Literal,
+                    Constant,
+                    TensorTag,
+                    Variable,
+                    TestFunction,
+                    TrialFunction,
+                    Jacobian,
+                    Hessian,
+                    BinaryOp,
+                    FunctionCall,
+                    ModelCall,
+                    OperationDef,
+                    OperationCall,
+                    Tracker,
+                    StateField,
+                ),
+            ):
                 na = _lower_statefield_to_trial(a, trial_cache)
                 changed = changed or (na is not a)
                 new_args.append(na)
@@ -131,7 +185,26 @@ def _lower_statefield_to_trial(expr, trial_cache=None):
         new_vars = []
         changed = new_target is not expr.target
         for v in expr.variables:
-            if isinstance(v, (Literal, Constant, TensorTag, Variable, TestFunction, TrialFunction, Jacobian, Hessian, BinaryOp, FunctionCall, ModelCall, OperationDef, OperationCall, Tracker, StateField)):
+            if isinstance(
+                v,
+                (
+                    Literal,
+                    Constant,
+                    TensorTag,
+                    Variable,
+                    TestFunction,
+                    TrialFunction,
+                    Jacobian,
+                    Hessian,
+                    BinaryOp,
+                    FunctionCall,
+                    ModelCall,
+                    OperationDef,
+                    OperationCall,
+                    Tracker,
+                    StateField,
+                ),
+            ):
                 nv = _lower_statefield_to_trial(v, trial_cache)
             else:
                 nv = v
@@ -146,7 +219,26 @@ def _lower_statefield_to_trial(expr, trial_cache=None):
         new_vars = []
         changed = new_target is not expr.target
         for v in expr.variables:
-            if isinstance(v, (Literal, Constant, TensorTag, Variable, TestFunction, TrialFunction, Jacobian, Hessian, BinaryOp, FunctionCall, ModelCall, OperationDef, OperationCall, Tracker, StateField)):
+            if isinstance(
+                v,
+                (
+                    Literal,
+                    Constant,
+                    TensorTag,
+                    Variable,
+                    TestFunction,
+                    TrialFunction,
+                    Jacobian,
+                    Hessian,
+                    BinaryOp,
+                    FunctionCall,
+                    ModelCall,
+                    OperationDef,
+                    OperationCall,
+                    Tracker,
+                    StateField,
+                ),
+            ):
                 nv = _lower_statefield_to_trial(v, trial_cache)
             else:
                 nv = v
@@ -310,7 +402,11 @@ def _infer_trial_metadata(expr) -> Dict[str, Any]:
 
     unique_trials = list(trial_nodes.values())
     if len(unique_trials) > 1:
-        raise NotImplementedError("FEAX backend currently supports exactly one TrialFunction " "(scalar or vector valued). Multiple coupled FEM unknowns will " "come in the next refactor step.")
+        raise NotImplementedError(
+            "FEAX backend currently supports exactly one TrialFunction "
+            "(scalar or vector valued). Multiple coupled FEM unknowns will "
+            "come in the next refactor step."
+        )
 
     trial = unique_trials[0] if unique_trials else None
     value_shape = getattr(trial, "value_shape", ()) if trial is not None else ()
@@ -345,21 +441,78 @@ def _collect_temporal_tags_for_feax(node, out=None):
 
     if isinstance(node, FunctionCall):
         for a in node.args:
-            if isinstance(a, (Literal, Constant, TensorTag, Variable, TestFunction, TrialFunction, Jacobian, Hessian, BinaryOp, FunctionCall, ModelCall, OperationDef, OperationCall, Tracker, StateField)):
+            if isinstance(
+                a,
+                (
+                    Literal,
+                    Constant,
+                    TensorTag,
+                    Variable,
+                    TestFunction,
+                    TrialFunction,
+                    Jacobian,
+                    Hessian,
+                    BinaryOp,
+                    FunctionCall,
+                    ModelCall,
+                    OperationDef,
+                    OperationCall,
+                    Tracker,
+                    StateField,
+                ),
+            ):
                 _collect_temporal_tags_for_feax(a, out)
         return out
 
     if isinstance(node, Jacobian):
         _collect_temporal_tags_for_feax(node.target, out)
         for v in node.variables:
-            if isinstance(v, (Literal, Constant, TensorTag, Variable, TestFunction, TrialFunction, Jacobian, Hessian, BinaryOp, FunctionCall, ModelCall, OperationDef, OperationCall, Tracker, StateField)):
+            if isinstance(
+                v,
+                (
+                    Literal,
+                    Constant,
+                    TensorTag,
+                    Variable,
+                    TestFunction,
+                    TrialFunction,
+                    Jacobian,
+                    Hessian,
+                    BinaryOp,
+                    FunctionCall,
+                    ModelCall,
+                    OperationDef,
+                    OperationCall,
+                    Tracker,
+                    StateField,
+                ),
+            ):
                 _collect_temporal_tags_for_feax(v, out)
         return out
 
     if isinstance(node, Hessian):
         _collect_temporal_tags_for_feax(node.target, out)
         for v in node.variables:
-            if isinstance(v, (Literal, Constant, TensorTag, Variable, TestFunction, TrialFunction, Jacobian, Hessian, BinaryOp, FunctionCall, ModelCall, OperationDef, OperationCall, Tracker, StateField)):
+            if isinstance(
+                v,
+                (
+                    Literal,
+                    Constant,
+                    TensorTag,
+                    Variable,
+                    TestFunction,
+                    TrialFunction,
+                    Jacobian,
+                    Hessian,
+                    BinaryOp,
+                    FunctionCall,
+                    ModelCall,
+                    OperationDef,
+                    OperationCall,
+                    Tracker,
+                    StateField,
+                ),
+            ):
                 _collect_temporal_tags_for_feax(v, out)
         return out
 
@@ -381,7 +534,10 @@ def _temporal_value_from_internal_vars(local, tag, dim_start=0, dim_end=1):
 
     idx = temporal_tags.index(tag)
     if idx >= len(volume_vars):
-        raise IndexError(f"Temporal FEAX variable tag '{tag}' mapped to slot {idx}, " f"but only {len(volume_vars)} volume_vars were provided.")
+        raise IndexError(
+            f"Temporal FEAX variable tag '{tag}' mapped to slot {idx}, "
+            f"but only {len(volume_vars)} volume_vars were provided."
+        )
 
     arr = jnp.asarray(volume_vars[idx])
     # scalar / (1,) / (1,1) -> one scalar time for this assembly call
@@ -405,7 +561,20 @@ def _eval_expr_for_feax(domain, node, local):
     tensor tags, TrialFunction/TestFunction values, their Jacobians, binary
     operations, and FunctionCall nodes.
     """
-    if not isinstance(node, (Literal, Constant, TensorTag, Variable, TestFunction, TrialFunction, Jacobian, BinaryOp, FunctionCall)):
+    if not isinstance(
+        node,
+        (
+            Literal,
+            Constant,
+            TensorTag,
+            Variable,
+            TestFunction,
+            TrialFunction,
+            Jacobian,
+            BinaryOp,
+            FunctionCall,
+        ),
+    ):
         try:
             return jnp.asarray(node)
         except Exception:
@@ -424,7 +593,10 @@ def _eval_expr_for_feax(domain, node, local):
         if tensor.ndim >= 1 and tensor.shape[0] == 1:
             tensor = tensor[0]
         elif tensor.ndim >= 1 and tensor.shape[0] > 1:
-            raise NotImplementedError("FEAX backend currently supports singleton-batch TensorTag coefficients only. " f"Got shape {tensor.shape} for tag '{node.tag}'.")
+            raise NotImplementedError(
+                "FEAX backend currently supports singleton-batch TensorTag coefficients only. "
+                f"Got shape {tensor.shape} for tag '{node.tag}'."
+            )
         if node.dim_index is not None and tensor.ndim >= 1:
             tensor = tensor[..., node.dim_index]
         return tensor
@@ -485,7 +657,9 @@ def _eval_expr_for_feax(domain, node, local):
         dims = []
         for var in node.variables:
             if not isinstance(var, Variable):
-                raise NotImplementedError("FEAX backend expects Jacobian variables to be domain.variable(...) placeholders.")
+                raise NotImplementedError(
+                    "FEAX backend expects Jacobian variables to be domain.variable(...) placeholders."
+                )
             dims.append(var.dim[0])
         if len(dims) == 0:
             raise ValueError("Jacobian node has no differentiation variables")
@@ -632,15 +806,29 @@ def _eval_surface_integrand(
     if face_shape_grads.ndim != 3:
         raise ValueError(f"Expected face_shape_grads.ndim == 3, got shape {face_shape_grads.shape} for tag '{tag}'.")
     if physical_surface_quad_points.ndim != 2:
-        raise ValueError(f"Expected physical_surface_quad_points.ndim == 2, got shape {physical_surface_quad_points.shape} for tag '{tag}'.")
+        raise ValueError(
+            f"Expected physical_surface_quad_points.ndim == 2, got shape {physical_surface_quad_points.shape} for tag '{tag}'."
+        )
 
     nq = face_shape_vals.shape[0]
     if face_shape_vals.shape[1] != n_parent_nodes:
-        raise ValueError(f"Boundary shape/node mismatch on '{tag}': " f"face_shape_vals.shape={face_shape_vals.shape}, " f"but cell_sol implies n_parent_nodes={n_parent_nodes}.")
+        raise ValueError(
+            f"Boundary shape/node mismatch on '{tag}': "
+            f"face_shape_vals.shape={face_shape_vals.shape}, "
+            f"but cell_sol implies n_parent_nodes={n_parent_nodes}."
+        )
     if face_shape_grads.shape[0] != nq or face_shape_grads.shape[1] != n_parent_nodes:
-        raise ValueError(f"Boundary grad shape mismatch on '{tag}': " f"face_shape_grads.shape={face_shape_grads.shape}, " f"expected (nq={nq}, n_parent_nodes={n_parent_nodes}, dim).")
+        raise ValueError(
+            f"Boundary grad shape mismatch on '{tag}': "
+            f"face_shape_grads.shape={face_shape_grads.shape}, "
+            f"expected (nq={nq}, n_parent_nodes={n_parent_nodes}, dim)."
+        )
     if physical_surface_quad_points.shape[0] != nq:
-        raise ValueError(f"Boundary quadrature mismatch on '{tag}': " f"physical_surface_quad_points.shape={physical_surface_quad_points.shape}, " f"face_shape_vals.shape={face_shape_vals.shape}.")
+        raise ValueError(
+            f"Boundary quadrature mismatch on '{tag}': "
+            f"physical_surface_quad_points.shape={physical_surface_quad_points.shape}, "
+            f"face_shape_vals.shape={face_shape_vals.shape}."
+        )
 
     if face_nanson_scale.ndim == 2:
         weights = face_nanson_scale[0]
@@ -650,7 +838,7 @@ def _eval_surface_integrand(
         raise ValueError(f"Unsupported face_nanson_scale shape {face_nanson_scale.shape} for tag '{tag}'.")
 
     if weights.shape[0] != nq:
-        raise ValueError(f"Boundary weight/quadrature mismatch on '{tag}': " f"weights.shape={weights.shape}, nq={nq}.")
+        raise ValueError(f"Boundary weight/quadrature mismatch on '{tag}': weights.shape={weights.shape}, nq={nq}.")
 
     boundary_normals = None
     if hasattr(domain, "normals_by_tag"):
@@ -690,7 +878,14 @@ def _make_universal_volume_kernel(domain, expr, value_shape, temporal_tags, prob
     Create the FEAX universal volume kernel for a lowered weak-form expression.
     """
 
-    def kernel(cell_sol_flat, physical_quad_points, cell_shape_grads, cell_JxW, cell_v_grads_JxW, *cell_internal_vars):
+    def kernel(
+        cell_sol_flat,
+        physical_quad_points,
+        cell_shape_grads,
+        cell_JxW,
+        cell_v_grads_JxW,
+        *cell_internal_vars,
+    ):
         return _eval_volume_integrand(
             domain,
             expr,
@@ -709,7 +904,14 @@ def _make_universal_volume_kernel(domain, expr, value_shape, temporal_tags, prob
 
 
 def _make_universal_surface_kernel(domain, expr, tag, value_shape, temporal_tags):
-    def kernel(cell_sol_flat, physical_surface_quad_points, face_shape_vals, face_shape_grads, face_nanson_scale, *cell_internal_vars_surface):
+    def kernel(
+        cell_sol_flat,
+        physical_surface_quad_points,
+        face_shape_vals,
+        face_shape_grads,
+        face_nanson_scale,
+        *cell_internal_vars_surface,
+    ):
         return _eval_surface_integrand(
             domain,
             expr,
@@ -785,7 +987,13 @@ def _make_feax_dirichlet_specs(domain, vec: int):
 
         if isinstance(normalized, (list, tuple)):
             for comp, fn in enumerate(normalized):
-                specs.append(fe.DirichletBCSpec(location=loc_fn, component=component_names.get(comp, comp), value=fn))
+                specs.append(
+                    fe.DirichletBCSpec(
+                        location=loc_fn,
+                        component=component_names.get(comp, comp),
+                        value=fn,
+                    )
+                )
             continue
 
         raise TypeError(f"Unsupported normalized Dirichlet value type for tag '{tag}': {type(normalized).__name__}")
@@ -959,7 +1167,11 @@ def _prepare_feax_runtime(
     meshio_type = _meshio_type_for_element(element_type)
 
     if meshio_type not in domain.mesh.cells_dict:
-        raise KeyError(f"Mesh cell type '{meshio_type}' for element_type='{element_type}' " f"not found in domain.mesh.cells_dict. " f"Available: {list(domain.mesh.cells_dict.keys())}")
+        raise KeyError(
+            f"Mesh cell type '{meshio_type}' for element_type='{element_type}' "
+            f"not found in domain.mesh.cells_dict. "
+            f"Available: {list(domain.mesh.cells_dict.keys())}"
+        )
 
     n_cells = int(np.asarray(domain.mesh.cells_dict[meshio_type]).shape[0])
 

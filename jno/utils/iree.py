@@ -5,8 +5,8 @@ import tempfile
 from pathlib import Path
 from typing import Callable
 
-import numpy as np
 import jax
+import numpy as np
 from jax import export
 
 log = logging.getLogger(__name__)
@@ -180,5 +180,9 @@ class IREEModel:
                     os.unlink(p)
 
         module_name = f"jit_{func.__name__}"
-        log.info("Compiled IREE model  (module: %s, %d KB)", module_name, len(vmfb_bytes) // 1024)
+        log.info(
+            "Compiled IREE model  (module: %s, %d KB)",
+            module_name,
+            len(vmfb_bytes) // 1024,
+        )
         return cls(vmfb_bytes, module_name=module_name)

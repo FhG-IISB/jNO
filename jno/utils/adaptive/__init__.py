@@ -6,10 +6,10 @@ Adaptive scheduling and resampling utilities for PINNs.
 
 from importlib import import_module
 
-from .lrscheduler import LearningRateSchedule
-from .weights import WeightSchedule
-from .resampling import sampler
 from .callbacks import callbacks
+from .lrscheduler import LearningRateSchedule
+from .resampling import sampler
+from .weights import WeightSchedule
 
 __all__ = [
     "LearningRateSchedule",

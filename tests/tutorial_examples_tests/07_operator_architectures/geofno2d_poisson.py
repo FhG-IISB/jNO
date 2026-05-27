@@ -21,13 +21,13 @@ Architecture: (N, in_dim) + geometry → Lift → [SpectralConvGeo + skip]×L
 Reference: Li et al. "Geometry-Informed Neural Operator" (2023)
 """
 
+import foundax
 import jax
 import jax.numpy as jnp
-import jno
-
-import foundax
 import numpy as np
 import optax
+
+import jno
 
 KEY = jax.random.PRNGKey(0)
 SAMPLES = 200
@@ -61,15 +61,18 @@ _u_flat = _u.reshape((1, N, 1))  # (1, N, 1) target
 # ── Model ─────────────────────────────────────────────────────────────────────
 # nks: Fourier modes per spatial dimension
 # in_dim=3: input = (f, x, y) at each node
-u = jno.nn.wrap(foundax.geofno(ndims=2, 
-    nks=(8, 8),
-    Ls=(1.0, 1.0),
-    layers=(64, 64, 64, 64),
-    fc_dim=128,
-    in_dim=3,
-    out_dim=1,
-    key=KEY,
-))
+u = jno.nn.wrap(
+    foundax.geofno(
+        ndims=2,
+        nks=(8, 8),
+        Ls=(1.0, 1.0),
+        layers=(64, 64, 64, 64),
+        fc_dim=128,
+        in_dim=3,
+        out_dim=1,
+        key=KEY,
+    )
+)
 
 # ── Constraint & solver ───────────────────────────────────────────────────────
 # u(x, node_mask, nodes, node_weights) → (N, 1)

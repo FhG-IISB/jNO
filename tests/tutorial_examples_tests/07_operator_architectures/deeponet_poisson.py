@@ -19,13 +19,13 @@ Then:
 Reference: Lu et al. "Learning nonlinear operators via DeepONet" (2021)
 """
 
+import foundax
 import jax
 import jax.numpy as jnp
-import jno
-
-import foundax
 import numpy as np
 import optax
+
+import jno
 
 KEY = jax.random.PRNGKey(0)
 SAMPLES = 200
@@ -52,19 +52,21 @@ _u_flat = _u.reshape((1, N, 1))  # (1, N, 1) target per sample
 # ── Model ─────────────────────────────────────────────────────────────────────
 # branch: encodes f sampled at N sensor points (N, 1)
 # trunk:  encodes 2D query coordinates (N, 2)
-u = jno.nn.wrap(foundax.deeponet(
-    branch_type="mlp",
-    trunk_type="mlp",
-    combination_type="dot",
-    n_sensors=N,
-    sensor_channels=1,
-    coord_dim=2,
-    n_outputs=1,
-    basis_functions=64,
-    hidden_dim=128,
-    n_layers=4,
-    key=KEY,
-))
+u = jno.nn.wrap(
+    foundax.deeponet(
+        branch_type="mlp",
+        trunk_type="mlp",
+        combination_type="dot",
+        n_sensors=N,
+        sensor_channels=1,
+        coord_dim=2,
+        n_outputs=1,
+        basis_functions=64,
+        hidden_dim=128,
+        n_layers=4,
+        key=KEY,
+    )
+)
 
 # ── Constraint & solver ───────────────────────────────────────────────────────
 # u(branch_input, trunk_input) → (N, 1) predictions at query points

@@ -7,9 +7,11 @@ preprocessing pipeline (connectivity, normals, etc.) is exercised.
 Mesh sizes are kept deliberately coarse to keep the suite fast.
 """
 
-import pytest
-import jno
 import inspect
+
+import pytest
+
+import jno
 
 
 def test_geometry_shortcut_returns_domain_instance():
@@ -31,18 +33,114 @@ def test_geometry_shortcut_routes_domain_kwargs():
 @pytest.mark.parametrize(
     ("shape_name", "expected_parameters"),
     [
-        ("line", {"x_range", "mesh_size", "algorithm", "time", "compute_mesh_connectivity"}),
-        ("rect", {"x_range", "y_range", "mesh_size", "algorithm", "time", "compute_mesh_connectivity"}),
-        ("equi_distant_rect", {"x_range", "y_range", "nx", "ny", "algorithm", "time", "compute_mesh_connectivity"}),
+        (
+            "line",
+            {"x_range", "mesh_size", "algorithm", "time", "compute_mesh_connectivity"},
+        ),
+        (
+            "rect",
+            {
+                "x_range",
+                "y_range",
+                "mesh_size",
+                "algorithm",
+                "time",
+                "compute_mesh_connectivity",
+            },
+        ),
+        (
+            "equi_distant_rect",
+            {
+                "x_range",
+                "y_range",
+                "nx",
+                "ny",
+                "algorithm",
+                "time",
+                "compute_mesh_connectivity",
+            },
+        ),
         ("poseidon", {"nx", "ny", "algorithm", "time", "compute_mesh_connectivity"}),
-        ("cube", {"x_range", "y_range", "z_range", "mesh_size", "algorithm", "time", "compute_mesh_connectivity"}),
-        ("disk", {"center", "radius", "mesh_size", "num_points", "algorithm", "time", "compute_mesh_connectivity"}),
-        ("triangle", {"vertices", "mesh_size", "algorithm", "time", "compute_mesh_connectivity"}),
-        ("polygon", {"vertices", "mesh_size", "algorithm", "time", "compute_mesh_connectivity"}),
-        ("l_shape", {"size", "mesh_size", "separate_boundary", "algorithm", "time", "compute_mesh_connectivity"}),
-        ("rectangle_with_hole", {"outer_size", "hole_size", "mesh_size", "separate_boundary", "algorithm", "time", "compute_mesh_connectivity"}),
-        ("rect_pml", {"x_range", "y_range", "mesh_size", "pml_thickness_top", "pml_thickness_bottom", "algorithm", "time", "compute_mesh_connectivity"}),
-        ("rectangle_with_holes", {"outer_size", "holes", "mesh_size", "separate_boundary", "algorithm", "time", "compute_mesh_connectivity"}),
+        (
+            "cube",
+            {
+                "x_range",
+                "y_range",
+                "z_range",
+                "mesh_size",
+                "algorithm",
+                "time",
+                "compute_mesh_connectivity",
+            },
+        ),
+        (
+            "disk",
+            {
+                "center",
+                "radius",
+                "mesh_size",
+                "num_points",
+                "algorithm",
+                "time",
+                "compute_mesh_connectivity",
+            },
+        ),
+        (
+            "triangle",
+            {"vertices", "mesh_size", "algorithm", "time", "compute_mesh_connectivity"},
+        ),
+        (
+            "polygon",
+            {"vertices", "mesh_size", "algorithm", "time", "compute_mesh_connectivity"},
+        ),
+        (
+            "l_shape",
+            {
+                "size",
+                "mesh_size",
+                "separate_boundary",
+                "algorithm",
+                "time",
+                "compute_mesh_connectivity",
+            },
+        ),
+        (
+            "rectangle_with_hole",
+            {
+                "outer_size",
+                "hole_size",
+                "mesh_size",
+                "separate_boundary",
+                "algorithm",
+                "time",
+                "compute_mesh_connectivity",
+            },
+        ),
+        (
+            "rect_pml",
+            {
+                "x_range",
+                "y_range",
+                "mesh_size",
+                "pml_thickness_top",
+                "pml_thickness_bottom",
+                "algorithm",
+                "time",
+                "compute_mesh_connectivity",
+            },
+        ),
+        (
+            "rectangle_with_holes",
+            {
+                "outer_size",
+                "holes",
+                "mesh_size",
+                "separate_boundary",
+                "algorithm",
+                "time",
+                "compute_mesh_connectivity",
+            },
+        ),
     ],
 )
 def test_geometry_shortcuts_expose_explicit_signatures(shape_name, expected_parameters):

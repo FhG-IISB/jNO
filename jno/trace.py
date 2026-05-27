@@ -6,16 +6,19 @@ Operations trace computations and return callable placeholders.
 """
 
 from __future__ import annotations
-from typing import List, Callable, Any, Union, Dict, Optional, Type
-from .tuner import Arch, ArchSpace
-import jax.numpy as jnp
-from pathlib import Path
+
 import json
-import jax
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Type, Union
+
 import equinox as eqx
+import jax
+import jax.numpy as jnp
+
+from .tuner import Arch, ArchSpace
 from .utils.adaptive import LearningRateSchedule
-from .utils.logger import get_logger
 from .utils.iree import IREEModel
+from .utils.logger import get_logger
 
 __all__ = [
     "Placeholder",
@@ -108,7 +111,11 @@ def _propagate_weak(node, *children):
 
 
 def _looks_like_weak_expression(node) -> bool:
-    return _contains_node_type_local(node, TestFunction) or _contains_node_type_local(node, TrialFunction) or _contains_node_type_local(node, StateField)
+    return (
+        _contains_node_type_local(node, TestFunction)
+        or _contains_node_type_local(node, TrialFunction)
+        or _contains_node_type_local(node, StateField)
+    )
 
 
 class Placeholder:
@@ -244,7 +251,11 @@ class Placeholder:
 
         return assemble_weak_form(domain, self, target=target, **kwargs)
 
-    def print(self, what: Union[str, Callable[[jnp.ndarray], Any]] = "shape", label: Optional[str] = None):
+    def print(
+        self,
+        what: Union[str, Callable[[jnp.ndarray], Any]] = "shape",
+        label: Optional[str] = None,
+    ):
         """Emit runtime debug info for this placeholder and pass it through.
 
         Args:
@@ -470,7 +481,13 @@ class FunctionCall(Placeholder):
 
     def copy_with_args(self, new_args):
         """Create a new instance with different args."""
-        return FunctionCall(fn=self.fn, args=new_args, name=self._name, reduces_axis=self.reduces_axis, kwargs=self.kwargs)
+        return FunctionCall(
+            fn=self.fn,
+            args=new_args,
+            name=self._name,
+            reduces_axis=self.reduces_axis,
+            kwargs=self.kwargs,
+        )
 
     def __call__(self, args):
         """Return a new FunctionCall with the given args."""
@@ -514,7 +531,12 @@ class ConstantNamespace:
     Nested dictionaries become nested ConstantNamespace objects.
     """
 
-    def __init__(self, tag: str | None, data: Union[dict, str, Path], _parent_tag: str | None = None):
+    def __init__(
+        self,
+        tag: str | None,
+        data: Union[dict, str, Path],
+        _parent_tag: str | None = None,
+    ):
         self._tag = tag
         self._full_tag = f"{_parent_tag}.{tag}" if _parent_tag else tag
         self._data = self._load_and_convert(data)
@@ -562,7 +584,14 @@ class ConstantNamespace:
             # Check if it contains dicts (don't convert to array)
             if any(isinstance(item, dict) for item in value):
                 # Convert each dict to ConstantNamespace, keep others as-is
-                return [(ConstantNamespace(f"{key}[{i}]", item, _parent_tag=parent_tag) if isinstance(item, dict) else ConstantNamespace._convert_value(item, f"{key}[{i}]", parent_tag)) for i, item in enumerate(value)]
+                return [
+                    (
+                        ConstantNamespace(f"{key}[{i}]", item, _parent_tag=parent_tag)
+                        if isinstance(item, dict)
+                        else ConstantNamespace._convert_value(item, f"{key}[{i}]", parent_tag)
+                    )
+                    for i, item in enumerate(value)
+                ]
             # Check if it's numeric (could be nested arrays)
             if ConstantNamespace._is_numeric_sequence(value):
                 return jnp.asarray(value)
@@ -640,7 +669,10 @@ class ConstantNamespace:
             return self._load_npy(path)
 
         else:
-            raise ValueError(f"Unsupported file format: '{suffix}'. " f"Supported formats: .json, .yaml, .yml, .toml, .pkl, .pickle, .npz, .npy")
+            raise ValueError(
+                f"Unsupported file format: '{suffix}'. "
+                f"Supported formats: .json, .yaml, .yml, .toml, .pkl, .pickle, .npz, .npy"
+            )
 
     @staticmethod
     def _load_json(path: Path) -> dict:
@@ -654,7 +686,7 @@ class ConstantNamespace:
         try:
             import yaml  # type: ignore[import-untyped]
         except ImportError:
-            raise ImportError("PyYAML is required to load .yaml/.yml files. " "Install with: pip install pyyaml")
+            raise ImportError("PyYAML is required to load .yaml/.yml files. Install with: pip install pyyaml")
 
         with open(path, "r") as f:
             return yaml.safe_load(f)
@@ -675,7 +707,7 @@ class ConstantNamespace:
                 with open(path, "r") as f:
                     return toml.load(f)
             except ImportError:
-                raise ImportError("toml package is required to load .toml files. " "Install with: pip install toml")
+                raise ImportError("toml package is required to load .toml files. Install with: pip install toml")
 
     @staticmethod
     def _load_pickle(path: Path) -> dict:
@@ -718,7 +750,7 @@ class ConstantNamespace:
 
         if key not in self._data:
             available = list(self._data.keys())
-            raise AttributeError(f"Constant '{self._full_tag}' has no key '{key}'. " f"Available keys: {available}")
+            raise AttributeError(f"Constant '{self._full_tag}' has no key '{key}'. Available keys: {available}")
 
         value = self._data[key]
 
@@ -829,7 +861,14 @@ class Variable(Placeholder):
     ``context["__time__"]`` entry that is a scalar (after the T vmap).
     """
 
-    def __init__(self, tag: str, dim: list, domain: Any, axis: str = "spatial", fem_meta: dict | None = None):
+    def __init__(
+        self,
+        tag: str,
+        dim: list,
+        domain: Any,
+        axis: str = "spatial",
+        fem_meta: dict | None = None,
+    ):
         self.tag = tag
         self.dim = dim
         self.axis = axis  # 'spatial' or 'temporal'
@@ -842,7 +881,7 @@ class Variable(Placeholder):
 
     def __repr__(self):
         if self.axis == "temporal":
-            return f"Var(t)"
+            return "Var(t)"
         if self.fem_meta is not None:
             support = self.fem_meta.get("support")
             region = self.fem_meta.get("region_id")
@@ -931,7 +970,9 @@ class Model(Placeholder):
 
         # ── training config (plain Python, not JAX arrays) ──
         self._frozen: bool = False
-        self._lora_config: tuple[int, float, str | None] | list[dict] | None = None  # (rank, alpha, target) | [{"target":..,"rank":..,"alpha":..}] | None
+        self._lora_config: tuple[int, float, str | None] | list[dict] | None = (
+            None  # (rank, alpha, target) | [{"target":..,"rank":..,"alpha":..}] | None
+        )
         self._opt_fn = None  # optax optimizer factory / instance
         self._lr = LearningRateSchedule(1.0)
         self._dtype = None  # target dtype (e.g. jnp.bfloat16) or None
@@ -1017,13 +1058,16 @@ class Model(Placeholder):
                 n_true = sum(1 for x in leaves if isinstance(x, bool) and x)
             except Exception:
                 n_true = None
-            lines.append(f"  [{i}] target={target!r}, opt={getattr(opt_fn, '__name__', str(opt_fn))}, " f"lr={lr}, matched_leaves={n_true}")
+            lines.append(
+                f"  [{i}] target={target!r}, opt={getattr(opt_fn, '__name__', str(opt_fn))}, "
+                f"lr={lr}, matched_leaves={n_true}"
+            )
 
         # Param summary
         try:
             leaves = jax.tree_util.tree_leaves(self.module)
-            arr_leaves = [l for l in leaves if eqx.is_array(l)]
-            n_params = int(sum(int(l.size) for l in arr_leaves))
+            arr_leaves = [leaf for leaf in leaves if eqx.is_array(leaf)]
+            n_params = int(sum(int(leaf.size) for leaf in arr_leaves))
             lines.extend(
                 [
                     "",
@@ -1666,7 +1710,10 @@ class OperationDef(Placeholder):
         n_vars = len(self._collected_vars)
         if len(args) > n_vars:
             var_names = [str(v) for v in self._collected_vars]
-            raise ValueError(f"Op[{self.op_id}] has {n_vars} variable(s) {var_names}, " f"but {len(args)} argument(s) were passed: {[str(a) for a in args]}")
+            raise ValueError(
+                f"Op[{self.op_id}] has {n_vars} variable(s) {var_names}, "
+                f"but {len(args)} argument(s) were passed: {[str(a) for a in args]}"
+            )
         # Fill in missing args from original variables
         if len(args) < n_vars:
             args = args + tuple(self._collected_vars[len(args) :])
@@ -1818,7 +1865,14 @@ class StateField(Placeholder):
     lowered either to VPINN (bind back to expr) or FEM (replace by TrialFunction).
     """
 
-    def __init__(self, expr: Placeholder, *, state_id: int = 0, name: str = "u", value_shape: tuple = ()):
+    def __init__(
+        self,
+        expr: Placeholder,
+        *,
+        state_id: int = 0,
+        name: str = "u",
+        value_shape: tuple = (),
+    ):
         self.expr = expr
         self.state_id = int(state_id)
         self.name = name
@@ -1920,7 +1974,7 @@ class Assembly(Placeholder):
         self.op_id = _next_op_id()
 
     def __repr__(self):
-        return f"Assemble({self.expr}, support={self.support}, " f"region={self.region_id}, nodes={self.num_total_nodes})"
+        return f"Assemble({self.expr}, support={self.support}, region={self.region_id}, nodes={self.num_total_nodes})"
 
 
 class GroupedAssembly(Placeholder):
@@ -1945,7 +1999,11 @@ class GroupedAssembly(Placeholder):
 
     def __repr__(self):
         bkeys = list(self.boundary_value_exprs.keys())
-        return f"GroupedAssembly(value={'yes' if self.volume_value_expr is not None else 'no'}, " f"grad={'yes' if self.volume_grad_expr is not None else 'no'}, " f"boundaries={bkeys}, nodes={self.num_total_nodes})"
+        return (
+            f"GroupedAssembly(value={'yes' if self.volume_value_expr is not None else 'no'}, "
+            f"grad={'yes' if self.volume_grad_expr is not None else 'no'}, "
+            f"boundaries={bkeys}, nodes={self.num_total_nodes})"
+        )
 
 
 # =============================================================================
@@ -2040,10 +2098,10 @@ def cse(expr: Placeholder) -> Placeholder:
 
         # ── recurse into children and rebuild if anything changed ──
         if isinstance(node, BinaryOp):
-            l = _visit(node.left)
+            left_node = _visit(node.left)
             r = _visit(node.right)
-            if l is not node.left or r is not node.right:
-                node = BinaryOp(node.op, l, r)
+            if left_node is not node.left or r is not node.right:
+                node = BinaryOp(node.op, left_node, r)
         elif isinstance(node, FunctionCall):
             new_args = [_visit(a) if isinstance(a, Placeholder) else a for a in node.args]
             if any(n is not o for n, o in zip(new_args, node.args)):
@@ -2272,7 +2330,6 @@ def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
     """
     if seen is None:
         seen = set()
-    pad = "  " * indent
     lines: list[str] = []
 
     def _node_label(node) -> str:

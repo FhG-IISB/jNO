@@ -7,7 +7,13 @@ import jax.numpy as jnp
 
 import jno.utils.adaptive as adaptive_pkg
 from jno.utils.adaptive.lrscheduler import DLRS
-from jno.utils.adaptive.weights import LbPINNsLossBalancing, ReLoBRaLo, SoftAdapt, DWA, RLW
+from jno.utils.adaptive.weights import (
+    DWA,
+    RLW,
+    LbPINNsLossBalancing,
+    ReLoBRaLo,
+    SoftAdapt,
+)
 
 
 def test_adaptive_import_resolves_to_package_directory():

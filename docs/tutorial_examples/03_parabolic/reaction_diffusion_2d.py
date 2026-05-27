@@ -11,12 +11,13 @@ Analytical solution
     u(x, y, t) = exp(-t) sin(pi x) sin(pi y)
 """
 
-import jax
-import jno
+from pathlib import Path
 
 import foundax
+import jax
 import optax
-from pathlib import Path
+
+import jno
 
 pi = jno.np.pi
 nu = 0.1
@@ -46,7 +47,17 @@ net = jno.nn.wrap(
         key=jax.random.PRNGKey(21),
     )
 )
-net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(init_value=0, peak_value=1e-3, warmup_steps=40, decay_steps=40000 - 40, end_value=1e-5)))
+net.optimizer(
+    optax.adam(
+        optax.warmup_cosine_decay_schedule(
+            init_value=0,
+            peak_value=1e-3,
+            warmup_steps=40,
+            decay_steps=40000 - 40,
+            end_value=1e-5,
+        )
+    )
+)
 
 xy = jno.np.concat([x, y])
 xy0 = jno.np.concat([x0, y0])

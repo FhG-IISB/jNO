@@ -15,19 +15,19 @@ Run with a single GPU::
 """
 
 import tempfile
-import pytest
+
+import equinox as eqx
+import foundax
 import jax
 import jax.numpy as jnp
-import equinox as eqx
 import optax
-import foundax
+import pytest
 
 import jno
 import jno.jnp_ops as jnn
+from jno import LearningRateSchedule as lrs
 from jno.architectures.models import nn
 from jno.trace import Model
-from jno import LearningRateSchedule as lrs
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -36,7 +36,7 @@ from jno import LearningRateSchedule as lrs
 
 def _param_count(model):
     leaves = jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))
-    return sum(l.size for l in leaves)
+    return sum(leaf.size for leaf in leaves)
 
 
 def _assert_finite_grads(grads):
@@ -169,7 +169,6 @@ FORWARD_FACTORIES = [
 
 @pytest.mark.integration
 class TestFoundaxModelsAreEquinox:
-
     @pytest.mark.parametrize("factory", ALL_FACTORIES)
     def test_is_eqx_module(self, factory):
         m = factory()
@@ -183,7 +182,6 @@ class TestFoundaxModelsAreEquinox:
 
 @pytest.mark.integration
 class TestNNWrapEquinox:
-
     @pytest.mark.parametrize("factory", ALL_FACTORIES)
     def test_wrap_produces_model_not_flax(self, factory):
         m = factory()
@@ -210,7 +208,6 @@ class TestNNWrapEquinox:
 @pytest.mark.integration
 @pytest.mark.gpu
 class TestForwardAndGrad:
-
     def test_bcat_forward_grad(self):
         model = _make_bcat()
         data = jnp.zeros((1, 5, 16, 16, 2))
@@ -290,7 +287,6 @@ class TestForwardAndGrad:
 
 @pytest.mark.integration
 class TestModelControls:
-
     # -- optimizer -------------------------------------------------------
 
     @pytest.mark.parametrize("factory", ALL_FACTORIES)
@@ -393,7 +389,6 @@ class TestModelControls:
 
 @pytest.mark.integration
 class TestLoRA:
-
     @pytest.mark.parametrize("factory", ALL_FACTORIES)
     def test_lora_sets_config(self, factory):
         net = nn.wrap(factory())
@@ -416,7 +411,6 @@ class TestLoRA:
 
 @pytest.mark.integration
 class TestSerialisation:
-
     @pytest.mark.parametrize("factory", ALL_FACTORIES)
     def test_eqx_serialise_roundtrip(self, factory, tmp_path):
         m = factory()
@@ -438,7 +432,6 @@ class TestSerialisation:
 @pytest.mark.integration
 @pytest.mark.gpu
 class TestJNOPipeline:
-
     def test_mlp_head_solves(self):
         """An MLP (foundax.mlp) trains for a few epochs through jno.core."""
         domain = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.1))

@@ -21,10 +21,11 @@ from __future__ import annotations
 
 import inspect
 import types
-from typing import Sequence, TYPE_CHECKING
+from typing import TYPE_CHECKING, Sequence
+
 import jax.numpy as jnp
 
-from .trace import Placeholder, FunctionCall, Variable
+from .trace import FunctionCall, Placeholder, Variable
 from .utils.adaptive import lrscheduler as _adaptive_lrscheduler
 from .utils.adaptive import weights as _adaptive_weights
 
@@ -443,7 +444,10 @@ else:
             self._registry = {}
             self._source_kind = {}
 
-            for mod, kind in ((_adaptive_weights, "weights"), (_adaptive_lrscheduler, "lrscheduler")):
+            for mod, kind in (
+                (_adaptive_weights, "weights"),
+                (_adaptive_lrscheduler, "lrscheduler"),
+            ):
                 for name in getattr(mod, "__all__", []):
                     if hasattr(mod, name):
                         self._registry[name] = getattr(mod, name)
@@ -473,7 +477,14 @@ else:
             def bridge(*args, **kwargs):
                 # Weight balancer: single call with losses list as first arg
                 losses = args[0] if args else kwargs.get("losses")
-                if source_kind == "weights" and name not in self._TRACE_WEIGHT_BUILDERS_EXCLUDE and losses is not None and isinstance(losses, (list, tuple)) and len(losses) > 0 and all(isinstance(x, Placeholder) for x in losses):
+                if (
+                    source_kind == "weights"
+                    and name not in self._TRACE_WEIGHT_BUILDERS_EXCLUDE
+                    and losses is not None
+                    and isinstance(losses, (list, tuple))
+                    and len(losses) > 0
+                    and all(isinstance(x, Placeholder) for x in losses)
+                ):
                     context_terms = args[1:]
                     mode = kwargs.pop("mode", "raw")
                     eps = float(kwargs.pop("eps", 1e-12))
@@ -795,7 +806,12 @@ def smooth_l1(pred: Placeholder, target: Placeholder, beta: float = 1.0) -> Func
 # ============================================================================
 
 
-def _advection(u: Placeholder, velocity: Sequence[Placeholder | float], variables: Sequence[Variable], scheme: str) -> Placeholder:
+def _advection(
+    u: Placeholder,
+    velocity: Sequence[Placeholder | float],
+    variables: Sequence[Variable],
+    scheme: str,
+) -> Placeholder:
     if len(velocity) != len(variables):
         raise ValueError("velocity and variables must have the same length")
     adv = velocity[0] * u.d(variables[0], scheme=scheme)
@@ -893,7 +909,9 @@ def burgers_1d(
     scheme: str = "automatic_differentiation",
 ) -> Placeholder:
     """1D viscous Burgers residual: ``u_t + u u_x - viscosity * u_xx - forcing``."""
-    return u.d(t, scheme=scheme) + u * u.d(x, scheme=scheme) - viscosity * u.d(x, scheme=scheme).d(x, scheme=scheme) - forcing
+    return (
+        u.d(t, scheme=scheme) + u * u.d(x, scheme=scheme) - viscosity * u.d(x, scheme=scheme).d(x, scheme=scheme) - forcing
+    )
 
 
 def burgers_inviscid_1d(
@@ -1031,7 +1049,16 @@ def maxwell_3d(
     permittivity: float = 1.0,
     permeability: float = 1.0,
     scheme: str = "automatic_differentiation",
-) -> tuple[Placeholder, Placeholder, Placeholder, Placeholder, Placeholder, Placeholder, Placeholder, Placeholder]:
+) -> tuple[
+    Placeholder,
+    Placeholder,
+    Placeholder,
+    Placeholder,
+    Placeholder,
+    Placeholder,
+    Placeholder,
+    Placeholder,
+]:
     """3D Maxwell residuals: Faraday, Ampere-Maxwell, Gauss(E), Gauss(B).
 
     Returns:

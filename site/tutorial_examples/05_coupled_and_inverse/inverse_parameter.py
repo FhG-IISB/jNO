@@ -20,11 +20,12 @@ A small MLP evaluates sin/cos/x(1-x) at interior points, and the residual
 between the parametric expression and the "measured" data is minimised.
 """
 
-import jax
-import jno
-
-import optax
 from pathlib import Path
+
+import jax
+import optax
+
+import jno
 
 π = jno.np.pi
 # ── Ground-truth and "measured" data ─────────────────────────────────────────
@@ -69,7 +70,9 @@ rel_l2_c = float(jax.numpy.linalg.norm(_c - C_true) / (jax.numpy.linalg.norm(C_t
 # Write result to tracking file
 results_file = Path(__file__).parent.parent.parent / "tutorial_results.txt"
 with open(results_file, "a") as f:
-    f.write(f"05_coupled_and_inverse/inverse_parameter.py | epochs=30000 | rel_L2_a={rel_l2_a:.6e} | rel_L2_b={rel_l2_b:.6e} | rel_L2_c={rel_l2_c:.6e}\n")
+    f.write(
+        f"05_coupled_and_inverse/inverse_parameter.py | epochs=30000 | rel_L2_a={rel_l2_a:.6e} | rel_L2_b={rel_l2_b:.6e} | rel_L2_c={rel_l2_c:.6e}\n"
+    )
 
 assert rel_l2_a < 1e-1, f"a relative L2 error too large: {rel_l2_a:.3e}"
 assert rel_l2_b < 1e-1, f"b relative L2 error too large: {rel_l2_b:.3e}"

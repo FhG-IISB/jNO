@@ -22,13 +22,12 @@ pytree path::
 
 from __future__ import annotations
 
+import re as _re
 from typing import Any, Optional, Sequence
 
-import re as _re
-
+import equinox as eqx
 import jax
 import jax.numpy as jnp
-import equinox as eqx
 
 from .linear import Linear
 
@@ -184,7 +183,7 @@ def merge_lora(model: eqx.Module) -> eqx.Module:
 
     is_lora = lambda x: isinstance(x, LoRALinear)
     leaves, treedef = jax.tree_util.tree_flatten(model, is_leaf=is_lora)
-    return jax.tree_util.tree_unflatten(treedef, [_merge(l) for l in leaves])
+    return jax.tree_util.tree_unflatten(treedef, [_merge(leaf) for leaf in leaves])
 
 
 def lora_trainable_filter(

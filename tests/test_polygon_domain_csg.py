@@ -6,7 +6,6 @@ from shapely.geometry import Point
 
 import jno
 
-
 SQUARE_A = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
 SQUARE_B = [(0.5, 0.0), (1.5, 0.0), (1.5, 1.0), (0.5, 1.0)]
 

@@ -5,12 +5,11 @@ import os
 from pathlib import Path
 
 import equinox as eqx
-import pytest
 import foundax
 import jax
 import jax.numpy as jnp
 import numpy as np
-
+import pytest
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -20,6 +19,7 @@ import numpy as np
 def _make_solver(epochs=10):
     """Build and briefly train a minimal 1-D solver, return the core instance."""
     import optax
+
     import jno
     import jno.jnp_ops as jnn
     from jno import LearningRateSchedule as lrs
@@ -65,7 +65,9 @@ def _restore_trainable_model_from_orbax_step(step_dir: Path, model_key: str, mod
             close()
 
     return jax.tree_util.tree_map(
-        lambda restored_leaf, fresh_leaf: fresh_leaf if restored_leaf is orbax.PLACEHOLDER or restored_leaf is None else restored_leaf,
+        lambda restored_leaf, fresh_leaf: (
+            fresh_leaf if restored_leaf is orbax.PLACEHOLDER or restored_leaf is None else restored_leaf
+        ),
         restored["trainable"][model_key],
         model,
         is_leaf=lambda leaf: leaf is orbax.PLACEHOLDER or leaf is None,
@@ -162,7 +164,15 @@ class TestCallbackHooks:
         """on_epoch_end should receive the documented keyword arguments."""
         from jno.utils.adaptive.callbacks import Callback
 
-        required_keys = {"epoch", "trainable", "opt_states", "rng", "total_loss", "individual_losses", "log"}
+        required_keys = {
+            "epoch",
+            "trainable",
+            "opt_states",
+            "rng",
+            "total_loss",
+            "individual_losses",
+            "log",
+        }
 
         class KeyChecker(Callback):
             def __init__(self):
@@ -465,7 +475,10 @@ class TestCheckpointCallback:
         assert loaded_model.relative_position_index is not None
 
         messages = [record.getMessage() for record in caplog.records]
-        assert any(msg.startswith("Checkpoint file:") and "all checkpoint arrays consumed; model kept fresh init" in msg for msg in messages)
+        assert any(
+            msg.startswith("Checkpoint file:") and "all checkpoint arrays consumed; model kept fresh init" in msg
+            for msg in messages
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -505,7 +518,6 @@ class TestResumeFrom:
 
     def test_resume_from_sets_and_clears(self, tmp_path):
         """resume_from should be stored and cleared after first solve()."""
-        import jno
 
         # Just verify the attribute lifecycle — no actual checkpoint needed
         # for this: passing a non-existent dir is fine, it'll error, but
@@ -624,7 +636,14 @@ class TestEarlyStoppingCallback:
 
         # Simulate decreasing then flat losses
         for i, loss_val in enumerate([1.0, 0.5, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3]):
-            stop = cb.on_epoch_end(epoch=i, total_loss=jnp.array(loss_val), individual_losses=jnp.array([loss_val]), trainable=None, opt_states=None, rng=None)
+            stop = cb.on_epoch_end(
+                epoch=i,
+                total_loss=jnp.array(loss_val),
+                individual_losses=jnp.array([loss_val]),
+                trainable=None,
+                opt_states=None,
+                rng=None,
+            )
             if stop:
                 break
 
@@ -643,7 +662,14 @@ class TestEarlyStoppingCallback:
         )
 
         for i, val in enumerate([0.1, 0.5, 0.9, 0.9, 0.9, 0.9]):
-            stop = cb.on_epoch_end(epoch=i, total_loss=jnp.array(val), individual_losses=jnp.array([val]), trainable=None, opt_states=None, rng=None)
+            stop = cb.on_epoch_end(
+                epoch=i,
+                total_loss=jnp.array(val),
+                individual_losses=jnp.array([val]),
+                trainable=None,
+                opt_states=None,
+                rng=None,
+            )
             if stop:
                 break
 
@@ -659,7 +685,14 @@ class TestEarlyStoppingCallback:
         # 1.0 -> 0.95 is only 5% improvement, below 10% threshold
         losses = [1.0, 0.95, 0.94, 0.93]
         for i, val in enumerate(losses):
-            stop = cb.on_epoch_end(epoch=i, total_loss=jnp.array(val), individual_losses=jnp.array([val]), trainable=None, opt_states=None, rng=None)
+            stop = cb.on_epoch_end(
+                epoch=i,
+                total_loss=jnp.array(val),
+                individual_losses=jnp.array([val]),
+                trainable=None,
+                opt_states=None,
+                rng=None,
+            )
             if stop:
                 break
 
@@ -673,7 +706,14 @@ class TestEarlyStoppingCallback:
 
         # Loss never goes below baseline 0.01
         for i in range(5):
-            stop = cb.on_epoch_end(epoch=i, total_loss=jnp.array(0.5), individual_losses=jnp.array([0.5]), trainable=None, opt_states=None, rng=None)
+            stop = cb.on_epoch_end(
+                epoch=i,
+                total_loss=jnp.array(0.5),
+                individual_losses=jnp.array([0.5]),
+                trainable=None,
+                opt_states=None,
+                rng=None,
+            )
             if stop:
                 break
 
@@ -698,7 +738,14 @@ class TestEarlyStoppingCallback:
         )
 
         for i, val in enumerate([1.0, 1.0, 1.0]):
-            stop = cb.on_epoch_end(epoch=i, total_loss=jnp.array(0.0), individual_losses=jnp.array([val]), trainable=None, opt_states=None, rng=None)
+            stop = cb.on_epoch_end(
+                epoch=i,
+                total_loss=jnp.array(0.0),
+                individual_losses=jnp.array([val]),
+                trainable=None,
+                opt_states=None,
+                rng=None,
+            )
             if stop:
                 break
 
