@@ -35,3 +35,40 @@ Parameters
 array_leaves:         21
 total_parameters:     37761
 
+Model Summary (layer 1)
+============================================================
+name:                 DeepONet
+module_type:          DeepONet
+show_architecture:    True
+
+Training Controls
+------------------------------------------------------------
+frozen:               False
+dtype:                None
+optimizer:            GradientTransformationExtraArgs(init=<function chain.<locals>.init_fn at 0x14e24dbc1760>, update=<function chain.<locals>.update_fn at 0x14e24dbc1b20>)
+lr_schedule:          <jno.utils.adaptive.lrscheduler.LearningRateSchedule object at 0x14e24db046e0>
+lora_config:          None
+mask_scope_pending:   False
+
+Initialization
+------------------------------------------------------------
+weight_path:          None
+weight_tree_set:      False
+initialize_mask_set:  False
+initializer_fn_set:   False
+initializer_key_set:  False
+
+Mask Diagnostics
+------------------------------------------------------------
+mask_active:          False
+trainable_mask_set:   False
+
+Parameter Groups
+------------------------------------------------------------
+num_groups:           0
+
+Parameters
+------------------------------------------------------------
+array_leaves:         21
+total_parameters:     37761
+

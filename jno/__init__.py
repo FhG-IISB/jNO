@@ -8,7 +8,7 @@ jNO: Physics-Informed Neural Operators.
 
 import sys
 
-from . import fn
+from . import fn, lora
 from . import jnp_ops as np
 from .architectures.models import nn, parameter
 from .core import core
@@ -108,6 +108,7 @@ __all__ = [
     "nn",
     "np",
     "fn",
+    "lora",
     "callback",
     "StateField",
 ]
