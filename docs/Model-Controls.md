@@ -224,10 +224,11 @@ the same layer types as `LoRALinear` (`weight`, `in_features`, `out_features`) a
 from jno.lora import (
     LoRALinear,    # standard LoRA (default)
     rsLoRALinear,  # rank-stabilized
-    LoRAFALinear,  # frozen A — fewest trainable params
+    LoRAFALinear,  # frozen A — fewer trainable params
     DoRALinear,    # weight-decomposed
     PiSSALinear,   # SVD init — fastest convergence on pretrained models
     LoRAXSLinear,  # extra-small r×r core
+    VeRALinear,    # frozen random A,B; only b,d vectors trained
 )
 
 net.lora(rank=4, wrapper=rsLoRALinear)
@@ -241,6 +242,7 @@ net.lora(rank=4, wrapper=rsLoRALinear)
 | `DoRALinear` | `r·(in + out) + out` | Decomposes weight into magnitude + direction; trains both ([DoRA](https://arxiv.org/abs/2402.09353)) |
 | `PiSSALinear` | `r·(in + out)` | A, B initialised from top-r SVD components; base holds residual ([PiSSA](https://arxiv.org/abs/2404.02948)) |
 | `LoRAXSLinear` | `r²` | A, B from SVD and frozen; only an r×r core R is trained ([LoRA-XS](https://arxiv.org/abs/2405.17604)) |
+| `VeRALinear` | `out + r` | A, B are frozen random matrices generated from a seed (never stored as arrays); only `b`, `d` scaling vectors are trained ([VeRA](https://arxiv.org/abs/2310.11454)) |
 
 **When to use which:**
 
@@ -249,6 +251,7 @@ net.lora(rank=4, wrapper=rsLoRALinear)
 - **DoRALinear** — fine-tuning pretrained models where preserving weight norms matters.
 - **PiSSALinear** — fine-tuning pretrained models; adapters start at the most informative weight directions.
 - **LoRAXSLinear** — extreme parameter efficiency; useful when `r` is large relative to `in/out`.
+- **VeRALinear** — fewest trainable params of any zoo class (`out + r`); A, B consume no Python/JAX memory and are not saved in checkpoints.
 
 Mix classes per layer group via per-target specs:
 

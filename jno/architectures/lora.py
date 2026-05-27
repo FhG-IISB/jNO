@@ -16,6 +16,7 @@ Several ``LoRAWrapper`` subclasses are provided out of the box:
 - ``DoRALinear``   — weight-decomposed: trains magnitude and direction separately
 - ``PiSSALinear``  — SVD-initialised: adapters start from principal weight components
 - ``LoRAXSLinear`` — extra-small: A and B fixed from SVD, only a tiny R matrix is trained
+- ``VeRALinear``   — frozen random A,B from a seed (XLA constants); only b,d vectors trained
 
 Custom adapters
 ~~~~~~~~~~~~~~~
@@ -510,3 +511,72 @@ class LoRAXSLinear(LoRAWrapper):
     def merge(self) -> eqx.Module:
         W = self.base.weight + (self.alpha / self.rank) * (self.lora_B @ self.R @ self.lora_A)
         return eqx.tree_at(lambda m: m.weight, self.base, W)
+
+
+class VeRALinear(LoRAWrapper):
+    """Vector-based Random Matrix Adaptation (VeRA).
+
+    Replaces trainable A and B matrices with frozen random matrices that are
+    generated on-the-fly from a stored integer seed and never materialised as
+    Python/JAX arrays — JAX/XLA constant-folds their generation into the compiled
+    kernel.  Only two small per-layer scaling vectors are trained:
+
+    - ``b`` (out_features,) — scales each output row of B
+    - ``d`` (rank,)         — scales each row of A
+
+    Trainable params per layer: ``out + rank``  (vs ``r·(in + out)`` for LoRALinear).
+    Checkpoints store only the seed and scaling vectors, not A or B.
+
+    Layers with the same ``seed`` and the same shape share A, B at the XLA level
+    via constant-expression deduplication (CSE), achieving true device-level sharing.
+
+    Reference: https://arxiv.org/abs/2310.11454
+    """
+
+    adapter_fields = ("b", "d")
+
+    base: LinearLike
+    b: jax.Array                      # (out_features,) trainable — scales B rows
+    d: jax.Array                      # (rank,)         trainable — scales A rows
+    rank: int         = eqx.field(static=True)
+    alpha: float      = eqx.field(static=True)
+    seed: int         = eqx.field(static=True)
+    in_features: int  = eqx.field(static=True)
+    out_features: int = eqx.field(static=True)
+
+    @classmethod
+    def applies_to(cls, leaf: Any) -> bool:
+        return _linear_applies_to(leaf)
+
+    def __init__(self, base: LinearLike, rank: int, alpha: float, *, key: jax.Array):
+        self.base = base
+        self.rank = rank
+        self.alpha = alpha
+        self.in_features = base.in_features
+        self.out_features = base.out_features
+        # Derive a reproducible int seed; A,B are regenerated from it on every
+        # forward pass so they are never stored as Python/JAX arrays.
+        self.seed = int(jax.random.randint(key, shape=(), minval=0, maxval=2**30))
+        self.b = jnp.zeros(base.out_features)
+        self.d = jnp.ones(rank)
+
+    def _frozen_AB(self) -> tuple[jax.Array, jax.Array]:
+        A = jax.random.normal(
+            jax.random.PRNGKey(self.seed), (self.rank, self.in_features)
+        ) / jnp.sqrt(self.in_features)
+        B = jax.random.normal(
+            jax.random.PRNGKey(self.seed + 1), (self.out_features, self.rank)
+        )
+        return A, B
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        A, B = self._frozen_AB()
+        # x @ A.T supports both 1-D (in,) and batched (batch, in) inputs.
+        delta = (x @ A.T * self.d) @ B.T * self.b * (self.alpha / self.rank)
+        return self.base(x) + delta
+
+    def merge(self) -> eqx.Module:
+        A, B = self._frozen_AB()
+        # delta_W = diag(b) @ B @ diag(d) @ A * (alpha / rank)
+        delta_W = (self.b[:, None] * B) @ (self.d[:, None] * A) * (self.alpha / self.rank)
+        return eqx.tree_at(lambda m: m.weight, self.base, self.base.weight + delta_W)
