@@ -158,7 +158,7 @@ matching spec wins.
 Pass any `LoRAWrapper` subclass via `wrapper` to support layer types beyond linear:
 
 ```python
-from jno.architectures.lora_linear import LoRAWrapper
+from jno.lora import LoRAWrapper
 import equinox as eqx
 
 class LoRAConv(LoRAWrapper):
@@ -212,6 +212,53 @@ net.mask(decoder_mask).lora(rank=8, alpha=16)
 
 # Freeze all base params; train LoRA adapters only.
 net.freeze().lora(rank=8, alpha=16)
+```
+
+### LoRA Zoo
+
+jNO ships several drop-in `LoRAWrapper` variants in `jno.lora`.  All target
+the same layer types as `LoRALinear` (`weight`, `in_features`, `out_features`) and accept the same
+`rank` and `alpha` arguments.
+
+```python
+from jno.lora import (
+    LoRALinear,    # standard LoRA (default)
+    rsLoRALinear,  # rank-stabilized
+    LoRAFALinear,  # frozen A — fewest trainable params
+    DoRALinear,    # weight-decomposed
+    PiSSALinear,   # SVD init — fastest convergence on pretrained models
+    LoRAXSLinear,  # extra-small r×r core
+)
+
+net.lora(rank=4, wrapper=rsLoRALinear)
+```
+
+| Class | Trainable params | Key idea |
+|-------|-----------------|----------|
+| `LoRALinear` | `r·(in + out)` | Standard LoRA; scale = `α/r` |
+| `rsLoRALinear` | `r·(in + out)` | Scale = `α/√r` — gradient magnitude stable across ranks ([rsLoRA](https://arxiv.org/abs/2312.03732)) |
+| `LoRAFALinear` | `r·out` | A is frozen after random init; halves adapter params ([LoRAFA](https://arxiv.org/abs/2308.03303)) |
+| `DoRALinear` | `r·(in + out) + out` | Decomposes weight into magnitude + direction; trains both ([DoRA](https://arxiv.org/abs/2402.09353)) |
+| `PiSSALinear` | `r·(in + out)` | A, B initialised from top-r SVD components; base holds residual ([PiSSA](https://arxiv.org/abs/2404.02948)) |
+| `LoRAXSLinear` | `r²` | A, B from SVD and frozen; only an r×r core R is trained ([LoRA-XS](https://arxiv.org/abs/2405.17604)) |
+
+**When to use which:**
+
+- **rsLoRALinear** — default upgrade over `LoRALinear`; use higher ranks without numerical issues.
+- **LoRAFALinear** — memory-constrained training; halves adapter parameter count.
+- **DoRALinear** — fine-tuning pretrained models where preserving weight norms matters.
+- **PiSSALinear** — fine-tuning pretrained models; adapters start at the most informative weight directions.
+- **LoRAXSLinear** — extreme parameter efficiency; useful when `r` is large relative to `in/out`.
+
+Mix classes per layer group via per-target specs:
+
+```python
+net.lora(
+    specs=[
+        {"target": "encoder", "rank": 8,  "alpha": 16, "wrapper": PiSSALinear},
+        {"target": "decoder", "rank": 4,  "alpha": 1.0, "wrapper": rsLoRALinear},
+    ]
+)
 ```
 
 ---
