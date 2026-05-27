@@ -17,6 +17,10 @@ Several ``LoRAWrapper`` subclasses are provided out of the box:
 - ``PiSSALinear``  — SVD-initialised: adapters start from principal weight components
 - ``LoRAXSLinear`` — extra-small: A and B fixed from SVD, only a tiny R matrix is trained
 - ``VeRALinear``   — frozen random A,B from a seed (XLA constants); only b,d vectors trained
+- ``MiLoRALinear`` — like PiSSA but adapts the minor (noise-subspace) singular components
+- ``IA3Linear``    — scales output activations via a learned vector; no low-rank matrices
+- ``LoKrLinear``   — Kronecker product adapter: delta_W = kron(kron_A, kron_B)
+- ``OFTLinear``    — block-diagonal orthogonal fine-tuning via Cayley map
 
 Custom adapters
 ~~~~~~~~~~~~~~~
@@ -42,6 +46,7 @@ Subclass ``LoRAWrapper`` to support any layer type::
 
 from __future__ import annotations
 
+import math as _math
 import re as _re
 from typing import Any, ClassVar, Optional, Protocol, Sequence, runtime_checkable
 
@@ -580,3 +585,215 @@ class VeRALinear(LoRAWrapper):
         # delta_W = diag(b) @ B @ diag(d) @ A * (alpha / rank)
         delta_W = (self.b[:, None] * B) @ (self.d[:, None] * A) * (self.alpha / self.rank)
         return eqx.tree_at(lambda m: m.weight, self.base, self.base.weight + delta_W)
+
+
+class MiLoRALinear(LoRAWrapper):
+    """Minor Singular Values and Singular Vectors Adaptation (MiLoRA).
+
+    Like ``PiSSALinear`` but initialises the adapters from the *least* significant
+    singular components of the pretrained weight (the "noise" subspace).  The frozen
+    base retains the principal (high-energy) components, so fine-tuning only updates
+    directions the base model treats as noise — preserving pretrained knowledge.
+
+    Reference: https://arxiv.org/abs/2405.09913
+    """
+
+    adapter_fields = ("lora_A", "lora_B")
+
+    base: LinearLike
+    lora_A: jax.Array  # (rank, in_features) — minor right singular vectors
+    lora_B: jax.Array  # (out_features, rank) — minor left singular vectors
+    rank: int = eqx.field(static=True)
+    alpha: float = eqx.field(static=True)
+
+    @classmethod
+    def applies_to(cls, leaf: Any) -> bool:
+        return _linear_applies_to(leaf)
+
+    def __init__(self, base: LinearLike, rank: int, alpha: float, *, key: jax.Array):
+        r = min(rank, min(base.in_features, base.out_features))
+        self.rank = r
+        self.alpha = alpha
+
+        U, S, Vt = jnp.linalg.svd(base.weight, full_matrices=False)
+        # Take the MINOR (last r) singular components — the noise subspace.
+        U_r, S_r, Vt_r = U[:, -r:], S[-r:], Vt[-r:, :]
+
+        scale = jnp.sqrt(S_r * r / alpha)
+        self.lora_B = U_r * scale[None, :]
+        self.lora_A = Vt_r * scale[:, None]
+
+        # Residual keeps principal components; adapter restores minor ones at init.
+        W_residual = base.weight - (alpha / r) * (self.lora_B @ self.lora_A)
+        self.base = eqx.tree_at(lambda m: m.weight, base, W_residual)
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        y = self.base(x)
+        delta = (x @ self.lora_A.T) @ self.lora_B.T * (self.alpha / self.rank)
+        return y + delta
+
+    def merge(self) -> eqx.Module:
+        w = self.base.weight + (self.alpha / self.rank) * (self.lora_B @ self.lora_A)
+        return eqx.tree_at(lambda m: m.weight, self.base, w)
+
+
+class IA3Linear(LoRAWrapper):
+    """Infused Adapter by Inhibiting and Amplifying Inner Activations (IA³).
+
+    Applies a single per-output learned scale vector to the linear output
+    (before adding bias).  No low-rank matrices — trainable params per layer
+    is exactly ``out_features``.
+
+    At initialisation ``scale = ones(out_features)`` so the output is
+    unchanged.  ``rank`` is stored for API compatibility but unused.
+
+        y = (x @ weight.T) * scale + bias
+
+    Reference: https://arxiv.org/abs/2205.05638
+    """
+
+    adapter_fields = ("scale",)
+
+    base: LinearLike
+    scale: jax.Array  # (out_features,) — learned per-output multiplier
+    rank: int = eqx.field(static=True)
+    alpha: float = eqx.field(static=True)
+
+    @classmethod
+    def applies_to(cls, leaf: Any) -> bool:
+        return _linear_applies_to(leaf)
+
+    def __init__(self, base: LinearLike, rank: int, alpha: float, *, key: jax.Array):
+        self.base = base
+        self.rank = rank
+        self.alpha = alpha
+        self.scale = jnp.ones(base.out_features)
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        y = x @ self.base.weight.T
+        y = y * self.scale
+        bias = getattr(self.base, "bias", None)
+        return y + bias if bias is not None else y
+
+    def merge(self) -> eqx.Module:
+        w = self.base.weight * self.scale[:, None]
+        return eqx.tree_at(lambda m: m.weight, self.base, w)
+
+
+class LoKrLinear(LoRAWrapper):
+    """Kronecker-product Adapter (LoKr).
+
+    Parameterises the weight delta as a Kronecker product of two small matrices::
+
+        delta_W = kron(kron_A, kron_B)[:out_features, :in_features] * (alpha / rank)
+
+    ``kron_A`` has shape ``(rank, rank)``; ``kron_B`` has shape
+    ``(⌈out/rank⌉, ⌈in/rank⌉)``.  The Kronecker product always covers the
+    target weight shape and is cropped.  ``kron_B`` is initialised to zero so
+    the output is unchanged at init.
+
+    Reference: https://arxiv.org/abs/2212.10650
+    """
+
+    adapter_fields = ("kron_A", "kron_B")
+
+    base: LinearLike
+    kron_A: jax.Array  # (rank, rank)
+    kron_B: jax.Array  # (ceil(out/rank), ceil(in/rank))
+    rank: int = eqx.field(static=True)
+    alpha: float = eqx.field(static=True)
+    in_features: int = eqx.field(static=True)
+    out_features: int = eqx.field(static=True)
+
+    @classmethod
+    def applies_to(cls, leaf: Any) -> bool:
+        return _linear_applies_to(leaf)
+
+    def __init__(self, base: LinearLike, rank: int, alpha: float, *, key: jax.Array):
+        r = min(rank, min(base.in_features, base.out_features))
+        self.rank = r
+        self.alpha = alpha
+        self.in_features = base.in_features
+        self.out_features = base.out_features
+        self.base = base
+
+        m2 = _math.ceil(base.out_features / r)
+        n2 = _math.ceil(base.in_features / r)
+        self.kron_A = jax.random.normal(key, (r, r)) / jnp.sqrt(r)
+        self.kron_B = jnp.zeros((m2, n2))
+
+    def _delta_W(self) -> jax.Array:
+        return jnp.kron(self.kron_A, self.kron_B)[: self.out_features, : self.in_features]
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        y = self.base(x)
+        delta = x @ self._delta_W().T * (self.alpha / self.rank)
+        return y + delta
+
+    def merge(self) -> eqx.Module:
+        W = self.base.weight + (self.alpha / self.rank) * self._delta_W()
+        return eqx.tree_at(lambda m: m.weight, self.base, W)
+
+
+class OFTLinear(LoRAWrapper):
+    """Orthogonal Fine-Tuning (OFT).
+
+    Fine-tunes the weight by multiplying with a block-diagonal orthogonal matrix
+    ``R``.  Each (rank × rank) block is parameterised via the Cayley map of a
+    learnable skew-symmetric matrix ``Q_i``::
+
+        R_i = (I - Q_i)(I + Q_i)^{-1}   (orthogonal for any skew-symmetric Q_i)
+
+    The full ``R`` is block-diagonal, assembled from ``n_blocks = ⌈out/rank⌉``
+    blocks and cropped to ``(out_features, out_features)``.  At init ``Q = 0``
+    so ``R = I`` and the model output is unchanged.
+
+    ``alpha`` is stored for API compatibility; orthogonality is its own
+    regularisation and no explicit scaling is applied.
+
+    Reference: https://arxiv.org/abs/2306.07280
+    """
+
+    adapter_fields = ("Q_blocks",)
+
+    base: LinearLike
+    Q_blocks: jax.Array  # (n_blocks, rank, rank)
+    rank: int = eqx.field(static=True)
+    alpha: float = eqx.field(static=True)
+    n_blocks: int = eqx.field(static=True)
+    out_features: int = eqx.field(static=True)
+
+    @classmethod
+    def applies_to(cls, leaf: Any) -> bool:
+        return _linear_applies_to(leaf)
+
+    def __init__(self, base: LinearLike, rank: int, alpha: float, *, key: jax.Array):
+        r = min(rank, base.out_features)
+        self.rank = r
+        self.alpha = alpha
+        self.out_features = base.out_features
+        self.n_blocks = _math.ceil(base.out_features / r)
+        self.base = base
+        self.Q_blocks = jnp.zeros((self.n_blocks, r, r))
+
+    def _R(self) -> jax.Array:
+        eye = jnp.eye(self.rank)
+
+        def cayley(Q: jax.Array) -> jax.Array:
+            Qs = (Q - Q.T) / 2  # enforce skew-symmetry
+            return (eye - Qs) @ jnp.linalg.inv(eye + Qs)
+
+        blocks = jax.vmap(cayley)(self.Q_blocks)  # (n_blocks, rank, rank)
+        # n_blocks is static so the list comprehension unrolls at trace time.
+        R_padded = jax.scipy.linalg.block_diag(*[blocks[i] for i in range(self.n_blocks)])
+        return R_padded[: self.out_features, : self.out_features]
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        W_new = self._R() @ self.base.weight
+        y = x @ W_new.T
+        bias = getattr(self.base, "bias", None)
+        return y + bias if bias is not None else y
+
+    def merge(self) -> eqx.Module:
+        W_new = self._R() @ self.base.weight
+        return eqx.tree_at(lambda m: m.weight, self.base, W_new)
