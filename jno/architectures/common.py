@@ -4,12 +4,12 @@ Centralises BatchNorm, activation lookup, Fourier-mode computation, and
 NHWC convolution helpers so they aren't duplicated across architecture files.
 """
 
-from typing import Any, Callable, Optional, Sequence, Tuple
+from typing import Callable, Optional, Sequence, Tuple
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
-import equinox as eqx
 
 
 def _default_float_dtype():

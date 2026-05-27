@@ -21,7 +21,6 @@ import numpy as np
 
 import jno
 
-
 INTERIOR_SAMPLES = 256
 BOUNDARY_SAMPLES = 96
 EDGE_SAMPLES = 64

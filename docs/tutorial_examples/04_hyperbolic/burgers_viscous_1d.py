@@ -20,11 +20,11 @@ creates a higher-frequency component in the forcing that the network must
 reproduce, making this a good stress-test of the capacity.
 """
 
-import jax
-import jno
-
 import foundax
+import jax
 import optax
+
+import jno
 from jno import LearningRateSchedule as lrs
 
 π = jno.np.pi
@@ -46,15 +46,17 @@ u_exact = jno.np.exp(-t) * jno.np.sin(π * x)
 source = jno.np.exp(-t) * (ν * π**2 - 1) * jno.np.sin(π * x) + (π / 2) * jno.np.exp(-2 * t) * jno.np.sin(2 * π * x)
 
 # ── Network  (hard Dirichlet BCs) ────────────────────────────────────────────
-net = jno.nn.wrap(foundax.deeponet(
-    n_sensors=1,
-    coord_dim=1,
-    n_outputs=1,
-    n_layers=4,
-    basis_functions=64,
-    hidden_dim=48,
-    key=jax.random.PRNGKey(3),
-))
+net = jno.nn.wrap(
+    foundax.deeponet(
+        n_sensors=1,
+        coord_dim=1,
+        n_outputs=1,
+        n_layers=4,
+        basis_functions=64,
+        hidden_dim=48,
+        key=jax.random.PRNGKey(3),
+    )
+)
 net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(10, 1, 1e-3, 1e-5))
 
 u = net(t, x) * x * (1 - x)

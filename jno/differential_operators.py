@@ -56,8 +56,8 @@ The default ``"finite_difference"`` (no suffix) keeps the existing
 
 from __future__ import annotations
 
-import numpy as np
 import jax.numpy as jnp
+import numpy as np
 
 
 class DifferentialOperators:
@@ -230,13 +230,19 @@ class DifferentialOperators:
         elif method == "inverse_distance":
             cx = (p0[:, 0] + p1[:, 0] + p2[:, 0]) / 3.0
             cy = (p0[:, 1] + p1[:, 1] + p2[:, 1]) / 3.0
-            avg_dist = (jnp.sqrt((p0[:, 0] - cx) ** 2 + (p0[:, 1] - cy) ** 2) + jnp.sqrt((p1[:, 0] - cx) ** 2 + (p1[:, 1] - cy) ** 2) + jnp.sqrt((p2[:, 0] - cx) ** 2 + (p2[:, 1] - cy) ** 2)) / 3.0
+            avg_dist = (
+                jnp.sqrt((p0[:, 0] - cx) ** 2 + (p0[:, 1] - cy) ** 2)
+                + jnp.sqrt((p1[:, 0] - cx) ** 2 + (p1[:, 1] - cy) ** 2)
+                + jnp.sqrt((p2[:, 0] - cx) ** 2 + (p2[:, 1] - cy) ** 2)
+            ) / 3.0
             w_elem = jnp.where(areas > 1e-12, 1.0 / (avg_dist + 1e-12), 0.0)
         else:  # area_weighted
             w_elem = jnp.where(areas > 1e-12, areas, 0.0)
 
         contributions = grads * w_elem
-        gradients = jnp.zeros(n_points).at[i_idx].add(contributions).at[j_idx].add(contributions).at[k_idx].add(contributions)
+        gradients = (
+            jnp.zeros(n_points).at[i_idx].add(contributions).at[j_idx].add(contributions).at[k_idx].add(contributions)
+        )
         weights = jnp.zeros(n_points).at[i_idx].add(w_elem).at[j_idx].add(w_elem).at[k_idx].add(w_elem)
         return jnp.where(weights > 1e-12, gradients / weights, 0.0)
 
@@ -407,7 +413,21 @@ class DifferentialOperators:
         cot2 = jnp.clip(cot2, -10.0, 10.0)
 
         # Accumulate: edge (i,j) opposite k → weight cot2, etc.
-        lap = jnp.zeros(N).at[i_idx].add(cot2 * (u1 - u0)).at[j_idx].add(cot2 * (u0 - u1)).at[j_idx].add(cot0 * (u2 - u1)).at[k_idx].add(cot0 * (u1 - u2)).at[i_idx].add(cot1 * (u2 - u0)).at[k_idx].add(cot1 * (u0 - u2))
+        lap = (
+            jnp.zeros(N)
+            .at[i_idx]
+            .add(cot2 * (u1 - u0))
+            .at[j_idx]
+            .add(cot2 * (u0 - u1))
+            .at[j_idx]
+            .add(cot0 * (u2 - u1))
+            .at[k_idx]
+            .add(cot0 * (u1 - u2))
+            .at[i_idx]
+            .add(cot1 * (u2 - u0))
+            .at[k_idx]
+            .add(cot1 * (u0 - u2))
+        )
 
         # A_i = 2 * (barycentric dual area) because the standard cotangent
         # Laplacian formula is  (Δu)_i = (1/(2*A_i)) * Σ_j (cot α + cot β)(u_j-u_i)
@@ -440,7 +460,17 @@ class DifferentialOperators:
         d2u_dxdy = DifferentialOperators.compute_fd_gradient_2d_simple(grad_x, points, triangles, 1)
         d2u_dy2 = DifferentialOperators.compute_fd_gradient_2d_simple(grad_y, points, triangles, 1)
 
-        hess_full = jnp.zeros((N, 2, 2)).at[:, 0, 0].set(d2u_dx2).at[:, 0, 1].set(d2u_dxdy).at[:, 1, 0].set(d2u_dxdy).at[:, 1, 1].set(d2u_dy2)
+        hess_full = (
+            jnp.zeros((N, 2, 2))
+            .at[:, 0, 0]
+            .set(d2u_dx2)
+            .at[:, 0, 1]
+            .set(d2u_dxdy)
+            .at[:, 1, 0]
+            .set(d2u_dxdy)
+            .at[:, 1, 1]
+            .set(d2u_dy2)
+        )
         result = jnp.zeros((N, n_vars, n_vars))
         for i, vi_dim, j, vj_dim in var_dims:
             result = result.at[:, i, j].set(hess_full[:, vi_dim, vj_dim])
@@ -490,14 +520,33 @@ class DifferentialOperators:
             u_values[l_idx],
         )
         v1, v2, v3 = p1 - p0, p2 - p0, p3 - p0
-        volumes = jnp.abs(v1[:, 0] * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1]) - v1[:, 1] * (v2[:, 0] * v3[:, 2] - v2[:, 2] * v3[:, 0]) + v1[:, 2] * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0])) / 6.0
+        volumes = (
+            jnp.abs(
+                v1[:, 0] * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1])
+                - v1[:, 1] * (v2[:, 0] * v3[:, 2] - v2[:, 2] * v3[:, 0])
+                + v1[:, 2] * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0])
+            )
+            / 6.0
+        )
 
         if dim == 0:
-            grads = ((u1 - u0) * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1]) + (u2 - u0) * (v3[:, 1] * v1[:, 2] - v3[:, 2] * v1[:, 1]) + (u3 - u0) * (v1[:, 1] * v2[:, 2] - v1[:, 2] * v2[:, 1])) / (6 * volumes + 1e-12)
+            grads = (
+                (u1 - u0) * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1])
+                + (u2 - u0) * (v3[:, 1] * v1[:, 2] - v3[:, 2] * v1[:, 1])
+                + (u3 - u0) * (v1[:, 1] * v2[:, 2] - v1[:, 2] * v2[:, 1])
+            ) / (6 * volumes + 1e-12)
         elif dim == 1:
-            grads = ((u1 - u0) * (v2[:, 2] * v3[:, 0] - v2[:, 0] * v3[:, 2]) + (u2 - u0) * (v3[:, 2] * v1[:, 0] - v3[:, 0] * v1[:, 2]) + (u3 - u0) * (v1[:, 2] * v2[:, 0] - v1[:, 0] * v2[:, 2])) / (6 * volumes + 1e-12)
+            grads = (
+                (u1 - u0) * (v2[:, 2] * v3[:, 0] - v2[:, 0] * v3[:, 2])
+                + (u2 - u0) * (v3[:, 2] * v1[:, 0] - v3[:, 0] * v1[:, 2])
+                + (u3 - u0) * (v1[:, 2] * v2[:, 0] - v1[:, 0] * v2[:, 2])
+            ) / (6 * volumes + 1e-12)
         else:
-            grads = ((u1 - u0) * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0]) + (u2 - u0) * (v3[:, 0] * v1[:, 1] - v3[:, 1] * v1[:, 0]) + (u3 - u0) * (v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0])) / (6 * volumes + 1e-12)
+            grads = (
+                (u1 - u0) * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0])
+                + (u2 - u0) * (v3[:, 0] * v1[:, 1] - v3[:, 1] * v1[:, 0])
+                + (u3 - u0) * (v1[:, 0] * v2[:, 1] - v1[:, 1] * v2[:, 0])
+            ) / (6 * volumes + 1e-12)
 
         grads = jnp.where(volumes > 1e-12, grads, 0.0)
 
@@ -518,8 +567,20 @@ class DifferentialOperators:
             w_elem = jnp.where(volumes > 1e-12, volumes, 0.0)
 
         contributions = grads * w_elem
-        gradients = jnp.zeros(n_points).at[i_idx].add(contributions).at[j_idx].add(contributions).at[k_idx].add(contributions).at[l_idx].add(contributions)
-        weights = jnp.zeros(n_points).at[i_idx].add(w_elem).at[j_idx].add(w_elem).at[k_idx].add(w_elem).at[l_idx].add(w_elem)
+        gradients = (
+            jnp.zeros(n_points)
+            .at[i_idx]
+            .add(contributions)
+            .at[j_idx]
+            .add(contributions)
+            .at[k_idx]
+            .add(contributions)
+            .at[l_idx]
+            .add(contributions)
+        )
+        weights = (
+            jnp.zeros(n_points).at[i_idx].add(w_elem).at[j_idx].add(w_elem).at[k_idx].add(w_elem).at[l_idx].add(w_elem)
+        )
         return jnp.where(weights > 1e-12, gradients / weights, 0.0)
 
     @staticmethod
@@ -552,7 +613,12 @@ class DifferentialOperators:
             tetrahedra[:, 3],
         )
         p0, p1, p2, p3 = points[i_idx], points[j_idx], points[k_idx], points[l_idx]
-        u0, u1, u2, u3 = u_values[i_idx], u_values[j_idx], u_values[k_idx], u_values[l_idx]
+        u0, u1, u2, u3 = (
+            u_values[i_idx],
+            u_values[j_idx],
+            u_values[k_idx],
+            u_values[l_idx],
+        )
 
         cx = (p0[:, 0] + p1[:, 0] + p2[:, 0] + p3[:, 0]) / 4.0
         cy = (p0[:, 1] + p1[:, 1] + p2[:, 1] + p3[:, 1]) / 4.0
@@ -562,7 +628,14 @@ class DifferentialOperators:
         v1 = p1 - p0
         v2 = p2 - p0
         v3 = p3 - p0
-        vol = jnp.abs(v1[:, 0] * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1]) - v1[:, 1] * (v2[:, 0] * v3[:, 2] - v2[:, 2] * v3[:, 0]) + v1[:, 2] * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0])) / 6.0
+        vol = (
+            jnp.abs(
+                v1[:, 0] * (v2[:, 1] * v3[:, 2] - v2[:, 2] * v3[:, 1])
+                - v1[:, 1] * (v2[:, 0] * v3[:, 2] - v2[:, 2] * v3[:, 0])
+                + v1[:, 2] * (v2[:, 0] * v3[:, 1] - v2[:, 1] * v3[:, 0])
+            )
+            / 6.0
+        )
         w = jnp.where(vol > 1e-12, vol, 0.0)
 
         def _a(rx, ry, rz, du, vid):

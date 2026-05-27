@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple, Optional, Any
-
-import numpy as np
-from scipy.spatial import KDTree
 import jax
 import jax.numpy as jnp
-import meshio
+import numpy as np
+from scipy.spatial import KDTree
 
 
 class MeshUtils:
-
     @staticmethod
     def _preprocess_mesh_connectivity(mesh, dimension, boundary_indices):
         """Preprocess mesh to build FEM connectivity matrices for finite differences."""
@@ -27,7 +23,6 @@ class MeshUtils:
 
             elements = mesh.cells_dict["line"]
             element_type = "lines"
-            n_vertices_per_element = 2
 
             # Precompute 1D element lengths and shape function gradients
             length, grad_phi = MeshUtils.precompute_p1_line_geometry(points, elements)
@@ -42,7 +37,6 @@ class MeshUtils:
 
             elements = mesh.cells_dict["triangle"]
             element_type = "triangles"
-            n_vertices_per_element = 3
 
             area, grad_phi = MeshUtils.precompute_p1_triangle_geometry(points, elements)
 
@@ -65,8 +59,6 @@ class MeshUtils:
 
             elements = mesh.cells_dict["tetra"]
             element_type = "tetrahedra"
-            n_vertices_per_element = 4
-
             # Create all directed edges from tetrahedra (6 edges per tetrahedron)
             edges = np.concatenate(
                 [
@@ -99,7 +91,13 @@ class MeshUtils:
             neighbors[i] = neighbor_ids
 
         # Store connectivity info
-        mesh_connectivity = {"points": points, element_type: elements, "neighbors": neighbors, "n_points": n_points, "dimension": dimension}
+        mesh_connectivity = {
+            "points": points,
+            element_type: elements,
+            "neighbors": neighbors,
+            "n_points": n_points,
+            "dimension": dimension,
+        }
 
         if dimension == 2:
             mesh_connectivity["p1_area"] = np.array(area)
@@ -124,7 +122,13 @@ class MeshUtils:
 
             # Re-map edge indices from full-mesh space to boundary-only space
             global_to_local = {int(gi): li for li, gi in enumerate(boundary_indices)}
-            bpe_local = np.array([[global_to_local[int(e[0])], global_to_local[int(e[1])]] for e in bpe_global if int(e[0]) in global_to_local and int(e[1]) in global_to_local])
+            bpe_local = np.array(
+                [
+                    [global_to_local[int(e[0])], global_to_local[int(e[1])]]
+                    for e in bpe_global
+                    if int(e[0]) in global_to_local and int(e[1]) in global_to_local
+                ]
+            )
 
             mesh_connectivity["boundary_edges"] = bpe_local
             mesh_connectivity["VM"] = MeshUtils.get_visibility_matrix_raytrace(bp, bpe_local, _bp[0], n_ray_samples=20)
@@ -217,7 +221,11 @@ class MeshUtils:
                     nodes = tuple(sorted([int(tet[fl[0]]), int(tet[fl[1]]), int(tet[fl[2]])]))
                     face_count[nodes] += 1
                     if nodes not in face_areas:
-                        p0, p1, p2 = points[nodes[0]], points[nodes[1]], points[nodes[2]]
+                        p0, p1, p2 = (
+                            points[nodes[0]],
+                            points[nodes[1]],
+                            points[nodes[2]],
+                        )
                         area = 0.5 * np.linalg.norm(np.cross(p1 - p0, p2 - p0))
                         face_areas[nodes] = area
 
@@ -305,9 +313,22 @@ class MeshUtils:
     def _get_boundary_elements(cells, cell_type):
         """Finds elements (lines/triangles) that appear only once."""
         if cell_type == "tetra":
-            faces = np.sort(np.vstack([cells[:, [0, 1, 2]], cells[:, [0, 1, 3]], cells[:, [0, 2, 3]], cells[:, [1, 2, 3]]]), axis=1)
+            faces = np.sort(
+                np.vstack(
+                    [
+                        cells[:, [0, 1, 2]],
+                        cells[:, [0, 1, 3]],
+                        cells[:, [0, 2, 3]],
+                        cells[:, [1, 2, 3]],
+                    ]
+                ),
+                axis=1,
+            )
         else:  # triangle
-            faces = np.sort(np.vstack([cells[:, [0, 1]], cells[:, [1, 2]], cells[:, [2, 0]]]), axis=1)
+            faces = np.sort(
+                np.vstack([cells[:, [0, 1]], cells[:, [1, 2]], cells[:, [2, 0]]]),
+                axis=1,
+            )
 
         unique_elements, counts = np.unique(faces, axis=0, return_counts=True)
         return unique_elements[counts == 1]
@@ -445,7 +466,6 @@ class MeshUtils:
         @jax.jit
         def _compute(P, P_interior):
             n_bnd = P.shape[0]
-            n_int = P_interior.shape[0]
             ks = jnp.arange(n_bnd)
 
             # Polygon edges: edge k connects point k to point (k+1) mod n
@@ -604,7 +624,11 @@ class MeshUtils:
                     # Adjacent boundary points are always visible (they share an edge)
                     is_adjacent_point = (j == (i + 1) % n_bnd) | (j == (i - 1 + n_bnd) % n_bnd)
 
-                    visible_ij = jax.lax.cond(is_same, lambda: False, lambda: jax.lax.cond(is_adjacent_point, lambda: True, lambda: seg_visible(i, j)))  # Diagonal is always 0 (can't see itself)  # Adjacent boundary points are always visible
+                    visible_ij = jax.lax.cond(
+                        is_same,
+                        lambda: False,
+                        lambda: jax.lax.cond(is_adjacent_point, lambda: True, lambda: seg_visible(i, j)),
+                    )  # Diagonal is always 0 (can't see itself)  # Adjacent boundary points are always visible
                     row = row.at[j].set(visible_ij)
                     return row
 
@@ -632,7 +656,9 @@ class MeshUtils:
         return VM_jax
 
     @staticmethod
-    def get_visibility_matrix_raytrace(boundary_points, boundary_edges, interior_point=None, n_ray_samples: int = 3) -> jnp.ndarray:
+    def get_visibility_matrix_raytrace(
+        boundary_points, boundary_edges, interior_point=None, n_ray_samples: int = 3
+    ) -> jnp.ndarray:
         """
         Compute visibility matrix via segment–edge intersection tests.
 
@@ -660,8 +686,8 @@ class MeshUtils:
             Binary visibility matrix (float32).  ``VM[i, j] = 1`` means
             point *i* can see point *j*.
         """
+
         import numpy as np
-        import time
 
         P = np.asarray(boundary_points, dtype=np.float64)
         edges = np.asarray(boundary_edges, dtype=np.int32)
@@ -670,8 +696,6 @@ class MeshUtils:
 
         E0 = P[edges[:, 0]]  # (n_edges, 2)
         E1 = P[edges[:, 1]]  # (n_edges, 2)
-
-        t0 = time.time()
 
         # ==================================================================
         # Build adjacency: adj_mask[j, k] = True if edge k touches point j
@@ -722,8 +746,6 @@ class MeshUtils:
             visible[i] = False  # no self-visibility
 
             VM[i, :] = visible.astype(np.float32)
-
-        elapsed = time.time() - t0
 
         return jnp.array(VM)
 

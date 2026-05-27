@@ -20,17 +20,17 @@ Showcases
 
 import os
 import time
-import numpy as np
 
-import jax
-import jax.numpy as jnp
-import optax
 import diffrax
 import foundax
+import jax
+import jax.numpy as jnp
+import jno.numpy as jnn
+import numpy as np
+import optax
 from feax.solvers.time_solver import run as feax_run
 
 import jno
-import jno.numpy as jnn
 from jno import LearningRateSchedule as lrs
 
 jax.config.update("jax_enable_x64", False)
@@ -123,6 +123,7 @@ def source_term_sym(x, y, t):
 # Strong PINN
 # ---------------------------------------------------------------------
 
+
 def train_pinn_reference():
     domain = jno.domain(
         constructor=jno.domain.rect(mesh_size=pick(0.18, 0.25)),
@@ -176,6 +177,7 @@ def train_pinn_reference():
 # Weak FEAX-time nonlinear solve
 # ---------------------------------------------------------------------
 
+
 def run_case(mesh_size=0.12, diffrax_dt0=2e-3, feax_dt=1e-2):
     crux, net = train_pinn_reference()
 
@@ -205,10 +207,7 @@ def run_case(mesh_size=0.12, diffrax_dt0=2e-3, feax_dt=1e-2):
     phi_y = jno.np.grad(phi, yg)
 
     weak = (
-        u_t * phi
-        + kappa * (u_x * phi_x + u_y * phi_y)
-        + alpha * (u * u * u - u) * phi
-        - source_term_sym(xg, yg, tg) * phi
+        u_t * phi + kappa * (u_x * phi_x + u_y * phi_y) + alpha * (u * u * u - u) * phi - source_term_sym(xg, yg, tg) * phi
     )
 
     coords = np.asarray(domain.mesh.points)[:, :2]
@@ -286,12 +285,7 @@ def run_case(mesh_size=0.12, diffrax_dt0=2e-3, feax_dt=1e-2):
     u_exact = exact_u_jax(x_nodes, y_nodes, t_nodes).reshape(-1)
 
     u_pinn = crux.eval(
-        net(x_nodes, y_nodes, t_nodes)
-        * 16.0
-        * x_nodes
-        * (1.0 - x_nodes)
-        * y_nodes
-        * (1.0 - y_nodes),
+        net(x_nodes, y_nodes, t_nodes) * 16.0 * x_nodes * (1.0 - x_nodes) * y_nodes * (1.0 - y_nodes),
         domain=None,
     )
     u_pinn = jnp.asarray(u_pinn).reshape(-1)

@@ -1,9 +1,9 @@
 import numpy as np
+
 from .logger import get_logger
 
 
 class statistics:
-
     def __init__(self, logs):
         self.training_logs = logs
         self.log = get_logger()
@@ -77,7 +77,14 @@ class statistics:
             for i in range(n_constraints):
                 a.semilogy(epochs, losses[:, i], linewidth=1.8, label=f"C{i}")
             if has_multi:
-                a.semilogy(epochs, total_loss, linewidth=2, linestyle="--", color="black", label="total")
+                a.semilogy(
+                    epochs,
+                    total_loss,
+                    linewidth=2,
+                    linestyle="--",
+                    color="black",
+                    label="total",
+                )
             a.legend(fontsize=8)
         else:
             a.semilogy(epochs, total_loss, linewidth=2)
@@ -117,7 +124,13 @@ class statistics:
             step_ms = np.diff(timestamps) * 1e3  # seconds → ms
             step_epochs = epochs[1:]  # one fewer point
             a.plot(step_epochs, step_ms, linewidth=1.2, color="steelblue")
-            a.axhline(np.median(step_ms), color="tomato", linestyle="--", linewidth=1.2, label=f"median {np.median(step_ms):.1f} ms")
+            a.axhline(
+                np.median(step_ms),
+                color="tomato",
+                linestyle="--",
+                linewidth=1.2,
+                label=f"median {np.median(step_ms):.1f} ms",
+            )
             a.set_xlabel("Epoch")
             a.set_ylabel("Step time (ms)")
             a.set_title("Per-step Wall Time")
@@ -128,7 +141,14 @@ class statistics:
         total_time = sum(d.get("training_time", 0) for d in self.training_logs)
         n_trainable = self.training_logs[-1].get("trainable_params", 0)
         _t = int(total_time)
-        fig.text(0.5, -0.01, f"Trainable params: {n_trainable:,}   |   " f"Total training time: {_t // 3600}h {(_t % 3600) // 60}m {_t % 60}s", ha="center", fontsize=9, color="gray")
+        fig.text(
+            0.5,
+            -0.01,
+            f"Trainable params: {n_trainable:,}   |   Total training time: {_t // 3600}h {(_t % 3600) // 60}m {_t % 60}s",
+            ha="center",
+            fontsize=9,
+            color="gray",
+        )
 
         plt.tight_layout()
         if path is not None:

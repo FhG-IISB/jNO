@@ -5,8 +5,6 @@ from __future__ import annotations
 import warnings
 from unittest.mock import MagicMock, patch
 
-import pytest
-
 import jno.utils.config as cfg_module
 
 

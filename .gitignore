@@ -3,6 +3,7 @@ __pycache__/
 *.egg-info
 *.dot
 *.lock
+!pixi.lock
 *.png
 *.npz
 *.msgpack
@@ -25,3 +26,6 @@ traces/
 !*.ini
 !*.yaml
 !*.yml
+# pixi environments
+.pixi/*
+!.pixi/config.toml

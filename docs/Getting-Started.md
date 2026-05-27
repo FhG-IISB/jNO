@@ -16,7 +16,7 @@ Before you begin, complete setup in [Installation](Installation.md).
 
 ```bash
 cd examples
-uv run python laplace1D.py
+pixi run python laplace1D.py
 ```
 
 This solves a 1D Laplace problem with a Physics-Informed Neural Network (PINN) and writes outputs to `./runs/laplace1D/`.

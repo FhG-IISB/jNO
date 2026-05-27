@@ -11,12 +11,13 @@ Analytical solution
     kappa(x, y) = 1 + x + y
 """
 
-import jax
-import jno
+from pathlib import Path
 
 import foundax
+import jax
 import optax
-from pathlib import Path
+
+import jno
 
 pi = jno.np.pi
 domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05))
@@ -24,7 +25,11 @@ x, y, _ = domain.variable("interior")
 
 kappa = 1 + x + y
 u_exact = jno.np.sin(pi * x) * jno.np.sin(pi * y)
-forcing = 2 * pi**2 * kappa * u_exact - pi * jno.np.cos(pi * x) * jno.np.sin(pi * y) - pi * jno.np.sin(pi * x) * jno.np.cos(pi * y)
+forcing = (
+    2 * pi**2 * kappa * u_exact
+    - pi * jno.np.cos(pi * x) * jno.np.sin(pi * y)
+    - pi * jno.np.sin(pi * x) * jno.np.cos(pi * y)
+)
 
 net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=80, num_layers=5, key=jax.random.PRNGKey(13)))
 net.optimizer(optax.adam(optax.exponential_decay(init_value=1e-3, transition_steps=80, decay_rate=0.5, end_value=1e-5)))

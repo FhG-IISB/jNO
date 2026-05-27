@@ -27,71 +27,77 @@ Supported assemble targets:
     "diffrax"      -> DiffraxBlock
 """
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Tuple, cast
-import jax.numpy as jnp
-from ...jnp_ops import stack
+from typing import Any, Dict, List, Tuple, cast
+
 from ...trace import (
-    Placeholder,
-    Literal,
+    Assembly,
     BinaryOp,
     FunctionCall,
-    Variable,
-    ModelCall,
-    OperationDef,
-    OperationCall,
-    Jacobian,
-    Hessian,
-    Tracker,
-    TrialFunction,
-    TestFunction,
-    TensorTag,
-    Constant,
-    Assembly,
     GroupedAssembly,
+    Hessian,
+    Jacobian,
+    Literal,
+    Placeholder,
     StateField,
+    TestFunction,
+    TrialFunction,
+    Variable,
+)
+from .solver_helper import (
+    apply_sign as _apply_sign,
+)
+from .solver_helper import (
+    contains_node_type as _contains_node_type,
+)
+from .solver_helper import (
+    contains_temporal_derivative as _contains_temporal_derivative,
 )
 from .solver_helper import (
     sum_terms as _sum_terms,
-    apply_sign as _apply_sign,
-    contains_node_type as _contains_node_type,
-    contains_testfunction as _contains_testfunction,
-    contains_trialfunction as _contains_trialfunction,
-    iter_placeholder_children as _iter_placeholder_children,
-    contains_subexpr as _contains_subexpr,
-    contains_model_call as _contains_model_eval,
-    depends_on_domain_variables as _depends_on_domain_variables,
-    unique_by_id as _unique_by_id,
-    contains_temporal_derivative as _contains_temporal_derivative,
 )
-
+from .weak_form_helpers import (
+    bind_statefield_for_fem as _bind_statefield_for_fem,
+)
+from .weak_form_helpers import (
+    bind_statefield_for_vpinn as _bind_statefield_for_vpinn,
+)
+from .weak_form_helpers import (
+    canonicalize_grad_coeff as _canonicalize_grad_coeff,
+)
+from .weak_form_helpers import (
+    contains_testfunction_gradient as _contains_testfunction_gradient,
+)
+from .weak_form_helpers import (
+    ensure_statefield_wrapped as _ensure_statefield_wrapped,
+)
+from .weak_form_helpers import (
+    find_first_statefield as _find_first_statefield,
+)
+from .weak_form_helpers import (
+    function_name as _function_name,
+)
+from .weak_form_helpers import (
+    get_grad_axis_from_test_grad as _get_grad_axis_from_test_grad,
+)
+from .weak_form_helpers import (
+    get_test_value_shape as _get_test_value_shape,
+)
+from .weak_form_helpers import (
+    infer_term_bucket as _infer_term_bucket,
+)
+from .weak_form_helpers import (
+    is_symgrad_test as _is_symgrad_test,
+)
+from .weak_form_helpers import (
+    is_test_grad as _is_test_grad,
+)
+from .weak_form_helpers import (
+    is_test_value as _is_test_value,
+)
 from .weak_form_helpers import (
     split_weak_additive_terms,
-    function_name as _function_name,
-    get_grad_axis_from_test_grad as _get_grad_axis_from_test_grad,
-    canonicalize_grad_coeff as _canonicalize_grad_coeff,
-    value_shape_num_components as _value_shape_num_components,
-    is_test_value as _is_test_value,
-    is_test_grad as _is_test_grad,
-    is_symgrad_test as _is_symgrad_test,
-    get_test_value_shape as _get_test_value_shape,
-    contains_testfunction_gradient as _contains_testfunction_gradient,
-    has_weak_basis_symbols as _has_weak_basis_symbols,
-    collect_region_keys as _collect_region_keys,
-    collect_variational_metas as _collect_variational_metas,
-    infer_term_bucket as _infer_term_bucket,
-    get_variational_region_meta as _get_variational_region_meta,
-    find_first_statefield as _find_first_statefield,
-    infer_state_value_shape as _infer_state_value_shape,
-    # state-field / trial rewriters
-    wrap_primary_state as _wrap_primary_state,
-    ensure_statefield_wrapped as _ensure_statefield_wrapped,
-    is_statefield_candidate as _is_statefield_candidate,
-    collect_state_field_candidates as _collect_state_field_candidates,
-    collect_derivative_based_state_targets as _collect_derivative_based_state_targets,
-    detect_primary_state_field as _detect_primary_state_field,
-    rebind_variational_variables as _rebind_variational_variables,
-    bind_statefield_for_vpinn as _bind_statefield_for_vpinn,
-    bind_statefield_for_fem as _bind_statefield_for_fem,
+)
+from .weak_form_helpers import (
     substitute_trial_for_vpinn as _substitute_trial_for_vpinn,
 )
 
@@ -338,13 +344,22 @@ def _extract_test_channel(domain, expr) -> Tuple[str, Placeholder, Dict[str, Any
         ch_right, coeff_right, meta_right = _extract_test_channel(domain, expr.right)
 
         if ch_left != ch_right:
-            raise ValueError("Could not extract a single canonical test channel from additive term: " f"left channel={ch_left}, right channel={ch_right}, expr={expr}")
+            raise ValueError(
+                "Could not extract a single canonical test channel from additive term: "
+                f"left channel={ch_left}, right channel={ch_right}, expr={expr}"
+            )
 
         if meta_left.get("variable_id", 0) != meta_right.get("variable_id", 0):
-            raise ValueError("Additive weak-form term mixes different variable ids: " f"{meta_left.get('variable_id', 0)} vs {meta_right.get('variable_id', 0)}")
+            raise ValueError(
+                "Additive weak-form term mixes different variable ids: "
+                f"{meta_left.get('variable_id', 0)} vs {meta_right.get('variable_id', 0)}"
+            )
 
         if tuple(meta_left.get("value_shape", ())) != tuple(meta_right.get("value_shape", ())):
-            raise ValueError("Additive weak-form term mixes different test value shapes: " f"{meta_left.get('value_shape', ())} vs {meta_right.get('value_shape', ())}")
+            raise ValueError(
+                "Additive weak-form term mixes different test value shapes: "
+                f"{meta_left.get('value_shape', ())} vs {meta_right.get('value_shape', ())}"
+            )
 
         if expr.op == "+":
             coeff = coeff_left + coeff_right
@@ -485,7 +500,9 @@ def _extract_test_channel(domain, expr) -> Tuple[str, Placeholder, Dict[str, Any
                     },
                 )
 
-    raise ValueError("Could not extract a canonical FEAX-style test channel from weak-form term. " f"Unsupported term structure: {expr}")
+    raise ValueError(
+        f"Could not extract a canonical FEAX-style test channel from weak-form term. Unsupported term structure: {expr}"
+    )
 
 
 # --------------------------------
@@ -500,7 +517,12 @@ def is_variational_expr(domain, expr) -> bool:
     if isinstance(expr, (Assembly, GroupedAssembly)):
         return False
 
-    return _contains_node_type(expr, TestFunction) or _contains_node_type(expr, TrialFunction) or _contains_node_type(expr, StateField) or _contains_testfunction_gradient(domain, expr)
+    return (
+        _contains_node_type(expr, TestFunction)
+        or _contains_node_type(expr, TrialFunction)
+        or _contains_node_type(expr, StateField)
+        or _contains_testfunction_gradient(domain, expr)
+    )
 
 
 def _infer_domain_from_expr(expr):
@@ -605,7 +627,9 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
             if right_has:
                 return True
 
-        return _is_obviously_nonlinear_in_unknown(domain, expr.left) or _is_obviously_nonlinear_in_unknown(domain, expr.right)
+        return _is_obviously_nonlinear_in_unknown(domain, expr.left) or _is_obviously_nonlinear_in_unknown(
+            domain, expr.right
+        )
 
     if isinstance(expr, FunctionCall):
         unknown_args = [a for a in expr.args if isinstance(a, Placeholder) and _contains_unknown_symbol(domain, a)]
@@ -650,10 +674,18 @@ def _infer_solver_target(domain, expr):
     The inference is only used when `target=None`.
     """
     if _contains_temporal_derivative(expr):
-        if _contains_node_type(expr, TestFunction) or _contains_node_type(expr, TrialFunction) or _contains_node_type(expr, StateField):
+        if (
+            _contains_node_type(expr, TestFunction)
+            or _contains_node_type(expr, TrialFunction)
+            or _contains_node_type(expr, StateField)
+        ):
             if getattr(domain, "_fem_context", None) is not None:
                 return "fem_time"
-            raise ValueError("A time-dependent weak form was detected, but domain.init_fem(...) " "has not been called. For transient weak forms, initialize FEM first " "and use target='fem_time' (or let auto-inference choose it).")
+            raise ValueError(
+                "A time-dependent weak form was detected, but domain.init_fem(...) "
+                "has not been called. For transient weak forms, initialize FEM first "
+                "and use target='fem_time' (or let auto-inference choose it)."
+            )
 
         return "diffrax"
 
@@ -893,7 +925,9 @@ def assemble_weak_form(domain, expr, target=None, **kwargs):
 
         return _assemble_feax_time_from_ir(domain, ir, **kwargs)
 
-    raise ValueError(f"Unknown assembly target '{target}'. " "Supported: 'vpinn', 'fem_system', 'fem_residual', 'fem_time', 'diffrax'")
+    raise ValueError(
+        f"Unknown assembly target '{target}'. Supported: 'vpinn', 'fem_system', 'fem_residual', 'fem_time', 'diffrax'"
+    )
 
 
 def _assemble_vpinn_from_ir(ir: LoweredWeakForm, **kwargs):

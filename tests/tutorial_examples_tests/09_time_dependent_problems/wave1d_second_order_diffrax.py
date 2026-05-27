@@ -21,14 +21,12 @@ Showcases
 - DiffraxBlock with time_order=2
 """
 
-import numpy as np
-
+import diffrax
 import jax
 import jax.numpy as jnp
-import diffrax
+import numpy as np
 
 import jno
-import jno.numpy as jnn
 
 jax.config.update("jax_enable_x64", True)
 
@@ -71,6 +69,7 @@ pde = q_tt + (omega**2) * q
 # ---------------------------------------------------------------------
 # Manual first-order reduced system
 # ---------------------------------------------------------------------
+
 
 def rhs_manual(t, y, args):
     q_val, v_val = y[0], y[1]

@@ -1,9 +1,10 @@
 """Base class for resampling strategies."""
 
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Callable, List, Tuple
-import jax.numpy as jnp
+from typing import Callable, Dict, List, Tuple
+
 import jax
+import jax.numpy as jnp
 
 from ...utils.logger import Logger, PrintFallback, get_logger
 
@@ -16,7 +17,12 @@ class ResamplingStrategy(ABC):
     interesting dynamics.
     """
 
-    def __init__(self, resample_every: int = 100, resample_fraction: float = 1.0, start_epoch: int = 0):
+    def __init__(
+        self,
+        resample_every: int = 100,
+        resample_fraction: float = 1.0,
+        start_epoch: int = 0,
+    ):
         """Initialize resampling strategy.
 
         Args:
@@ -46,7 +52,15 @@ class ResamplingStrategy(ABC):
         return False
 
     @abstractmethod
-    def resample(self, points: jnp.ndarray, residuals: jnp.ndarray, domain, tag: str, epoch: int, rng_key: jnp.ndarray) -> jnp.ndarray:
+    def resample(
+        self,
+        points: jnp.ndarray,
+        residuals: jnp.ndarray,
+        domain,
+        tag: str,
+        epoch: int,
+        rng_key: jnp.ndarray,
+    ) -> jnp.ndarray:
         """Compute new sample points.
 
         Args:
@@ -66,7 +80,18 @@ class ResamplingStrategy(ABC):
         """Update internal epoch tracking."""
         self._last_resample_epoch = epoch
 
-    def apply_resampling(self, domain, constraints: List, tags: List[str], compiled: List[Callable], params: Dict, layer_info: Dict, context: Dict[str, jax.Array], epoch: int, rng: jax.Array) -> Tuple[Dict[str, jax.Array], jax.Array]:
+    def apply_resampling(
+        self,
+        domain,
+        constraints: List,
+        tags: List[str],
+        compiled: List[Callable],
+        params: Dict,
+        layer_info: Dict,
+        context: Dict[str, jax.Array],
+        epoch: int,
+        rng: jax.Array,
+    ) -> Tuple[Dict[str, jax.Array], jax.Array]:
         """Apply resampling strategies if configured."""
         import numpy as np
 
@@ -88,18 +113,34 @@ class ResamplingStrategy(ABC):
             current_points = context[tag]
 
             rng, resample_key = jax.random.split(rng)
-            new_points = self.resample_all_batches(strategy, current_points, combined_residuals, domain, tag, epoch, resample_key)
+            new_points = self.resample_all_batches(
+                strategy,
+                current_points,
+                combined_residuals,
+                domain,
+                tag,
+                epoch,
+                resample_key,
+            )
 
             # Update domain
             domain.context[tag] = np.array(new_points)
             context[tag] = new_points
 
             strategy.update_epoch(epoch)
-            self.log.info(f"Resampled {tag} points (epoch {epoch+1})")
+            self.log.info(f"Resampled {tag} points (epoch {epoch + 1})")
 
         return context, rng
 
-    def compute_tag_residuals(self, tag: str, constraints: List, tags: List[str], compiled: List[Callable], params: Dict, context: Dict[str, jax.Array]) -> List[jax.Array]:
+    def compute_tag_residuals(
+        self,
+        tag: str,
+        constraints: List,
+        tags: List[str],
+        compiled: List[Callable],
+        params: Dict,
+        context: Dict[str, jax.Array],
+    ) -> List[jax.Array]:
         """Compute residuals for constraints evaluated on a specific tag."""
         tag_residuals = []
         expected_n_points = context[tag].shape[1]
@@ -117,7 +158,16 @@ class ResamplingStrategy(ABC):
 
         return tag_residuals
 
-    def resample_all_batches(self, strategy, current_points: jax.Array, residuals: jax.Array, domain, tag: str, epoch: int, rng: jax.Array) -> jax.Array:
+    def resample_all_batches(
+        self,
+        strategy,
+        current_points: jax.Array,
+        residuals: jax.Array,
+        domain,
+        tag: str,
+        epoch: int,
+        rng: jax.Array,
+    ) -> jax.Array:
         """Resample points for all batches."""
         new_batches = []
 
@@ -562,10 +612,20 @@ class PINNFluence(ResamplingStrategy):
             total = jnp.sum(weights)
 
             # Numerically safe normalization; fall back to uniform when weights collapse.
-            safe_probs = jnp.where(total > 0, weights / jnp.maximum(total, 1e-20), jnp.ones_like(weights) / weights.shape[0])
+            safe_probs = jnp.where(
+                total > 0,
+                weights / jnp.maximum(total, 1e-20),
+                jnp.ones_like(weights) / weights.shape[0],
+            )
             safe_probs = safe_probs / jnp.sum(safe_probs)
 
-            new_indices = jax.random.choice(key2, eval_candidates.shape[0], shape=(n_new,), replace=True, p=safe_probs)
+            new_indices = jax.random.choice(
+                key2,
+                eval_candidates.shape[0],
+                shape=(n_new,),
+                replace=True,
+                p=safe_probs,
+            )
             new_points = eval_candidates[new_indices]
 
             result = jnp.concatenate([kept_points, new_points], axis=0)
@@ -979,7 +1039,11 @@ class sampler:
     """Factory class for creating resampling strategies."""
 
     @staticmethod
-    def random(resample_every: int = 100, resample_fraction: float = 0.1, start_epoch: int = 1000):
+    def random(
+        resample_every: int = 100,
+        resample_fraction: float = 0.1,
+        start_epoch: int = 1000,
+    ):
         """Random resampling - simple baseline to prevent overfitting.
 
         Args:
@@ -990,7 +1054,12 @@ class sampler:
         return RandomResampling(resample_every, resample_fraction, start_epoch)
 
     @staticmethod
-    def rad(resample_every: int = 100, resample_fraction: float = 0.1, start_epoch: int = 1000, k: int = 10):
+    def rad(
+        resample_every: int = 100,
+        resample_fraction: float = 0.1,
+        start_epoch: int = 1000,
+        k: int = 10,
+    ):
         """Residual-based Adaptive Distribution (RAD) resampling.
 
         Focuses on regions with high PDE residuals (high errors).
@@ -1004,7 +1073,12 @@ class sampler:
         return RAD(resample_every, resample_fraction, start_epoch, k)
 
     @staticmethod
-    def rard(resample_every: int = 100, resample_fraction: float = 0.1, start_epoch: int = 1000, power: float = 2.0):
+    def rard(
+        resample_every: int = 100,
+        resample_fraction: float = 0.1,
+        start_epoch: int = 1000,
+        power: float = 2.0,
+    ):
         """Residual-based Adaptive Refinement with Distribution (RARD).
 
         Uses importance sampling based on residual^power distribution.
@@ -1018,7 +1092,13 @@ class sampler:
         return RARD(resample_every, resample_fraction, start_epoch, power)
 
     @staticmethod
-    def ha(resample_every: int = 100, resample_fraction: float = 0.5, start_epoch: int = 1000, alternate: bool = True, random_first: bool = True):
+    def ha(
+        resample_every: int = 100,
+        resample_fraction: float = 0.5,
+        start_epoch: int = 1000,
+        alternate: bool = True,
+        random_first: bool = True,
+    ):
         """Hybrid Adaptive (HA) resampling strategy.
 
         Alternates between random and adaptive phases for regularization
@@ -1065,10 +1145,29 @@ class sampler:
             min_keep_frac: Minimum fraction to keep (default 0.1)
             max_keep_frac: Maximum fraction to keep (default 0.9)
         """
-        return CR3(resample_every, resample_fraction, start_epoch, t_index, alpha, gamma0, eta_g, epsilon, delta_max, min_keep_frac, max_keep_frac)
+        return CR3(
+            resample_every,
+            resample_fraction,
+            start_epoch,
+            t_index,
+            alpha,
+            gamma0,
+            eta_g,
+            epsilon,
+            delta_max,
+            min_keep_frac,
+            max_keep_frac,
+        )
 
     @staticmethod
-    def pinnfluence(resample_every: int = 500, resample_fraction: float = 0.2, start_epoch: int = 2000, alpha: float = 1.0, c: float = 1.0, candidate_factor: float = 3.0):
+    def pinnfluence(
+        resample_every: int = 500,
+        resample_fraction: float = 0.2,
+        start_epoch: int = 2000,
+        alpha: float = 1.0,
+        c: float = 1.0,
+        candidate_factor: float = 3.0,
+    ):
         """PINNFluence: Influence function-based adaptive sampling (simplified).
 
         Uses gradient-based scoring to identify points with high potential impact

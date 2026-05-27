@@ -19,24 +19,22 @@ AD mode summary (from trace_evaluator._eval_jacobian / _eval_hessian):
   scheme='finite_difference' -- central-difference stencils, no AD at all
 """
 
-import pytest
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 import jno.jnp_ops as jnn
 from jno.differential_operators import DifferentialOperators
 from jno.trace import (
-    Jacobian,
-    Hessian,
-    Literal,
-    OperationDef,
-    Variable,
     FunctionCall,
+    Hessian,
+    Jacobian,
+    Literal,
+    Variable,
 )
 from jno.trace_evaluator import TraceEvaluator
 from tests.conftest import make_var
-
 
 # ───────────────────────────────────────────────────────────────────────────────
 # Helpers
@@ -335,7 +333,9 @@ class TestHessianAD:
         pts = _pts_2d(n=4)
         H = _eval(u.hessian(x, y), {"xy": pts})  # shape (N, 2, 2)
         # Symmetry: H[i, 0, 1] == H[i, 1, 0]
-        assert jnp.allclose(H[:, 0, 1], H[:, 1, 0], atol=1e-4), f"Hessian not symmetric: max off-diag diff = {jnp.max(jnp.abs(H[:,0,1] - H[:,1,0]))}"
+        assert jnp.allclose(H[:, 0, 1], H[:, 1, 0], atol=1e-4), (
+            f"Hessian not symmetric: max off-diag diff = {jnp.max(jnp.abs(H[:, 0, 1] - H[:, 1, 0]))}"
+        )
 
     def test_hessian_2d_known_values(self):
         """u = x² + y²  →  H = [[2, 0], [0, 2]] everywhere."""
@@ -519,7 +519,7 @@ class TestTemporalDerivative:
 
         d = MockDomain(tags=["x"], dim=1)
         d.context["__time__"] = jnp.zeros((1, 1))
-        x = Variable("x", [0, 1], domain=d, axis="spatial")
+        _x = Variable("x", [0, 1], domain=d, axis="spatial")
         t = Variable("__time__", [0, 1], domain=d, axis="temporal")
 
         u = t * t  # t²
@@ -842,14 +842,20 @@ class TestFDSubSchemesOnLShape:
     def test_cotangent_laplacian_accuracy(self):
         """∇²(x²+y²) = 4: cotangent scheme interior mean error < 0.5."""
         u = self.x * self.x + self.y * self.y
-        lap = _eval(u.laplacian(self.x, self.y, scheme="finite_difference:cotangent"), self._ctx())
+        lap = _eval(
+            u.laplacian(self.x, self.y, scheme="finite_difference:cotangent"),
+            self._ctx(),
+        )
         err = float(jnp.mean(jnp.abs(lap - 4.0)[self.interior_mask]))
         assert err < 0.5, f"cotangent laplacian mean error = {err:.4f}"
 
     def test_cotangent_laplacian_shape(self):
         """Cotangent Laplacian must return (N, 1)."""
         u = self.x * self.x + self.y * self.y
-        result = _eval(u.laplacian(self.x, self.y, scheme="finite_difference:cotangent"), self._ctx())
+        result = _eval(
+            u.laplacian(self.x, self.y, scheme="finite_difference:cotangent"),
+            self._ctx(),
+        )
         assert result.shape == (self.pts.shape[0], 1)
 
     def test_cotangent_vs_gradient_of_gradient_laplacian(self):
@@ -882,7 +888,6 @@ class TestFDOnStackedDomains:
     @pytest.fixture(autouse=True, scope="class")
     def _setup(self, request):
         import jno
-        from jno.trace_compiler import TraceCompiler
 
         # Two different geometries
         dom = 3 * jno.domain.rect(mesh_size=0.1)
@@ -898,7 +903,6 @@ class TestFDOnStackedDomains:
     def _compile_and_eval(self, expr):
         """Compile expression through the full pipeline and evaluate."""
         from jno.trace_compiler import TraceCompiler
-        from jno.trace import OperationDef
 
         fn = TraceCompiler.compile_traced_expression(expr, [])
         ctx = dict(self.dom.context)

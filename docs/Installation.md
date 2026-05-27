@@ -231,6 +231,27 @@ docker run --rm --gpus '"device=0"' jno:cuda
 
 Docker images are built by `.github/workflows/docker-release.yml` and pushed to GHCR.
 
+## Development Setup
+
+If you are contributing to jNO, use [pixi](https://pixi.sh) to get a fully reproducible environment from the lock file:
+
+```bash
+curl -fsSL https://pixi.sh/install.sh | bash   # install pixi once
+git clone https://github.com/FhG-IISB/jNO.git
+cd jNO
+pixi install                                     # installs exact locked deps
+```
+
+Then use the built-in tasks for everyday work:
+
+```bash
+pixi run fmt     # auto-format with ruff
+pixi run lint    # lint and auto-fix with ruff
+pixi run test    # run the fast test suite
+```
+
+See [CONTRIBUTING.md](../CONTRIBUTING.md) for the full workflow.
+
 ## Next Step
 
 Continue with [Getting Started](Getting-Started.md) to run your first example.
