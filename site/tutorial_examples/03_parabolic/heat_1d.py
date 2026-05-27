@@ -18,11 +18,11 @@ The initial condition is implemented as a soft constraint evaluated on a
 separate "initial" tag.
 """
 
-import jax
-import jno
-
 import foundax
+import jax
 import optax
+
+import jno
 from jno import LearningRateSchedule as lrs
 
 π = jno.np.pi
@@ -39,15 +39,17 @@ x0, t0 = domain.variable("initial")
 u_exact = jno.np.exp(-α * π**2 * t) * jno.np.sin(π * x)
 
 # ── Network ───────────────────────────────────────────────────────────────────
-net = jno.nn.wrap(foundax.deeponet(
-    n_sensors=1,
-    coord_dim=1,
-    n_outputs=1,
-    n_layers=3,
-    basis_functions=64,
-    hidden_dim=32,
-    key=jax.random.PRNGKey(0),
-))
+net = jno.nn.wrap(
+    foundax.deeponet(
+        n_sensors=1,
+        coord_dim=1,
+        n_outputs=1,
+        n_layers=3,
+        basis_functions=64,
+        hidden_dim=32,
+        key=jax.random.PRNGKey(0),
+    )
+)
 net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.9, 10000, 1e-5))
 
 # Hard-enforce both BC and IC:

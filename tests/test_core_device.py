@@ -15,13 +15,14 @@ GPU-specific placement tests live in ``TestGPUPlacement`` and are
 automatically skipped when no CUDA device is available.
 """
 
-import pytest
+import foundax
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+import pytest
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
-import foundax
 import jno
 import jno.jnp_ops as jnn
 
@@ -378,6 +379,7 @@ class TestGPUPlacement:
         core reconstructs self.models from those updated leaves.
         """
         import optax
+
         from jno import LearningRateSchedule as lrs
 
         dom = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.1))
@@ -405,6 +407,7 @@ class TestGPUPlacement:
         outputs must also be on the GPU.
         """
         import optax
+
         from jno import LearningRateSchedule as lrs
 
         dom = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.1))
@@ -431,7 +434,9 @@ class TestGPUPlacement:
         first_output = shard_data_outputs[0]
         for key_name, v in first_output.items():
             if isinstance(v, jax.Array) and v.ndim > 0:
-                assert all(d.platform == "gpu" for d in v.devices()), f"Data '{key_name}' not on GPU after _shard_data: {v.devices()}"
+                assert all(d.platform == "gpu" for d in v.devices()), (
+                    f"Data '{key_name}' not on GPU after _shard_data: {v.devices()}"
+                )
 
     @requires_gpu
     def test_offload_data_full_dataset_stays_on_host(self, monkeypatch):
@@ -447,7 +452,9 @@ class TestGPUPlacement:
         20, so the guard in solve() does not suppress the offload path.
         """
         import sys
+
         import optax
+
         from jno import LearningRateSchedule as lrs
 
         # jno/__init__.py re-exports the class as jno.core, so grab the
@@ -478,9 +485,14 @@ class TestGPUPlacement:
         monkeypatch.setattr(core_mod.np, "asarray", spy_asarray)
         s.solve(3, offload_data=True, batchsize=int(jax.device_count()))
 
-        assert len(converted_types) > 0, "np.asarray was never called with a jax.Array during offload_data solve; " "the host-offload path may not have been reached"
+        assert len(converted_types) > 0, (
+            "np.asarray was never called with a jax.Array during offload_data solve; "
+            "the host-offload path may not have been reached"
+        )
         for arr_id, info in converted_types.items():
-            assert "gpu" in info["input_platform"], f"Expected input to np.asarray to be a GPU array, got {info['input_platform']}"
+            assert "gpu" in info["input_platform"], (
+                f"Expected input to np.asarray to be a GPU array, got {info['input_platform']}"
+            )
             assert info["output_type"] == "ndarray", f"Expected np.asarray to return ndarray, got {info['output_type']}"
 
     @requires_gpu
@@ -497,6 +509,7 @@ class TestGPUPlacement:
         than 20, so the offload path is actually entered.
         """
         import optax
+
         from jno import LearningRateSchedule as lrs
 
         dom = 20 * jno.domain(constructor=jno.domain.line(mesh_size=0.1))
@@ -525,12 +538,15 @@ class TestGPUPlacement:
         for call_data in offload_calls[:3]:  # check first 3 loop iterations
             for key_name, v in call_data.items():
                 if isinstance(v, jax.Array) and v.ndim > 0:
-                    assert all(d.platform == "gpu" for d in v.devices()), f"Batch '{key_name}' not on GPU when entering _shard_data: {v.devices()}"
+                    assert all(d.platform == "gpu" for d in v.devices()), (
+                        f"Batch '{key_name}' not on GPU when entering _shard_data: {v.devices()}"
+                    )
 
     @requires_gpu
     def test_solve_one_step_runs_on_gpu(self):
         """A single training step executes on the GPU and produces a finite loss."""
         import optax
+
         from jno import LearningRateSchedule as lrs
 
         dom = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.1))

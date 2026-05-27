@@ -1,14 +1,25 @@
+from pathlib import Path
+from typing import List, Union
+
 import jax
 import jax.numpy as jnp
 
-from typing import List, Union, Sequence
-from .trace import Placeholder, Variable, FunctionCall, Hessian, Jacobian, Constant, ConstantNamespace, TestFunction, TrialFunction, Choice
+from .architectures.models import nn, parameter  # noqa: F401
 
 # Keep import so people can use jno.numpy as jno -> jno.model, jno.tune
-from .tuner import Arch, ArchSpace, tune
-from .architectures.models import nn, parameter
-from .trace import Tracker
-from pathlib import Path
+from .trace import (
+    Choice,
+    ConstantNamespace,
+    FunctionCall,
+    Hessian,
+    Jacobian,
+    Placeholder,
+    TestFunction,
+    Tracker,
+    TrialFunction,
+    Variable,
+)
+from .tuner import Arch, ArchSpace, tune  # noqa: F401
 
 # ============================================================================
 # Constants
@@ -205,8 +216,8 @@ class ViewFactorOp:
     # -----------------------
     def solve(self, rhs, alpha):
         def solve_fn(A, b, a):
-            I = jnp.eye(A.shape[0])
-            return jnp.linalg.solve(I - a * A, b)
+            eye_mat = jnp.eye(A.shape[0])
+            return jnp.linalg.solve(eye_mat - a * A, b)
 
         return FunctionCall(solve_fn, [self.F, rhs, alpha])
 
@@ -368,7 +379,11 @@ def identity(n: int) -> FunctionCall:
     )
 
 
-def symgrad(target: Placeholder, variables: List[Variable], scheme: str = "automatic_differentiation") -> FunctionCall:
+def symgrad(
+    target: Placeholder,
+    variables: List[Variable],
+    scheme: str = "automatic_differentiation",
+) -> FunctionCall:
     """
     Symmetric gradient of a vector/tensor-valued field.
 
@@ -559,7 +574,11 @@ def grad(target: Placeholder, variable: Variable, scheme: str = "automatic_diffe
     return Jacobian(target, [variable], scheme)
 
 
-def laplacian(target: Placeholder, variables: List[Variable] = None, scheme: str = "automatic_differentiation") -> Hessian:
+def laplacian(
+    target: Placeholder,
+    variables: List[Variable] = None,
+    scheme: str = "automatic_differentiation",
+) -> Hessian:
     """
     Compute the Laplacian of target with respect to variables.
 
@@ -582,17 +601,27 @@ def laplacian(target: Placeholder, variables: List[Variable] = None, scheme: str
         lap_u = pnp.laplacian(u(x, y), [x, y])  # ∂²u/∂x² + ∂²u/∂y²
     """
     if scheme == "finite_difference" and variables is not None:
-        print("Variables were selected for the finite difference laplacian which are not used. The finite difference derivatives are computed on the entire spatial grid.")
+        print(
+            "Variables were selected for the finite difference laplacian which are not used. The finite difference derivatives are computed on the entire spatial grid."
+        )
 
     return Hessian(target, variables, scheme, trace=True)
 
 
-def laplace(target: Placeholder, variables: List[Variable], scheme: str = "automatic_differentiation") -> Hessian:
+def laplace(
+    target: Placeholder,
+    variables: List[Variable],
+    scheme: str = "automatic_differentiation",
+) -> Hessian:
     """Alias for laplacian."""
     return Hessian(target, variables, scheme, trace=True)
 
 
-def hessian(target: Placeholder, variables: List[Variable], scheme: str = "automatic_differentiation") -> Hessian:
+def hessian(
+    target: Placeholder,
+    variables: List[Variable],
+    scheme: str = "automatic_differentiation",
+) -> Hessian:
     """
     Compute the Hessian matrix of target with respect to variables.
 
@@ -612,7 +641,11 @@ def hessian(target: Placeholder, variables: List[Variable], scheme: str = "autom
     return Hessian(target, variables, scheme)
 
 
-def jacobian(target: Placeholder, variables: List[Variable], scheme: str = "automatic_differentiation") -> Jacobian:
+def jacobian(
+    target: Placeholder,
+    variables: List[Variable],
+    scheme: str = "automatic_differentiation",
+) -> Jacobian:
     """
     Compute the Jacobian matrix of target with respect to variables.
 
@@ -673,7 +706,14 @@ def curl_2d(Fx: Placeholder, Fy: Placeholder, x: Variable, y: Variable) -> Place
     return Jacobian(Fy, [x]) - Jacobian(Fx, [y])
 
 
-def curl_3d(Fx: Placeholder, Fy: Placeholder, Fz: Placeholder, x: Variable, y: Variable, z: Variable) -> Placeholder:
+def curl_3d(
+    Fx: Placeholder,
+    Fy: Placeholder,
+    Fz: Placeholder,
+    x: Variable,
+    y: Variable,
+    z: Variable,
+) -> Placeholder:
     """
     Compute the 3D curl (vector).
 
@@ -707,23 +747,23 @@ def trial(name: str = "u") -> TrialFunction:
 # ============================================================================
 # Array creation and dtypes — plain re-exports from jax.numpy
 # ============================================================================
-from jax.numpy import (
-    zeros,
-    ones,
-    full,
-    eye,
+from jax.numpy import (  # noqa: F401, E402
     arange,
-    linspace,
-    meshgrid,
     array,
     asarray,
-    float32,
-    float64,
-    int32,
-    int64,
     bool_,
     complex64,
     complex128,
+    eye,
+    float32,
+    float64,
+    full,
+    int32,
+    int64,
+    linspace,
+    meshgrid,
+    ones,
+    zeros,
 )
 
 

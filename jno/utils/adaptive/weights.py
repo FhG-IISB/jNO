@@ -24,7 +24,7 @@ Factories:
   rlw(...)                    ->  RLW instance
 """
 
-from typing import Callable, List, Optional, Union, Sequence
+from typing import Callable, List, Optional, Sequence, Union
 
 import jax
 import jax.numpy as jnp

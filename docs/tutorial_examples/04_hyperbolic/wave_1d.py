@@ -15,11 +15,11 @@ Standing wave: the spatial shape sin(πx) oscillates in amplitude with
 period T = 2/(cπ).  With c=1 and T_end=1 we see half a full oscillation.
 """
 
-import jax
-import jno
-
 import foundax
+import jax
 import optax
+
+import jno
 
 π = jno.np.pi
 c = 1.0  # wave speed
@@ -48,7 +48,17 @@ net = jno.nn.wrap(
         key=jax.random.PRNGKey(7),
     )
 )
-net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(init_value=1e-6, peak_value=1e-3, warmup_steps=200, decay_steps=49800, end_value=1e-7)))
+net.optimizer(
+    optax.adam(
+        optax.warmup_cosine_decay_schedule(
+            init_value=1e-6,
+            peak_value=1e-3,
+            warmup_steps=200,
+            decay_steps=49800,
+            end_value=1e-7,
+        )
+    )
+)
 
 # Hard-enforce BC *and* both ICs in the ansatz:
 #   u(x,0)  = sin(πx)          [because t²=0]

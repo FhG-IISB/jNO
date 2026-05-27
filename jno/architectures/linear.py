@@ -6,9 +6,10 @@ leading dimensions: ``(D,)``, ``(N, D)``, ``(M, N, D)``, etc.
 """
 
 from typing import Optional
+
+import equinox as eqx
 import jax
 import jax.numpy as jnp
-import equinox as eqx
 
 
 class Linear(eqx.Module):
@@ -24,7 +25,14 @@ class Linear(eqx.Module):
     in_features: int = eqx.field(static=True)
     out_features: int = eqx.field(static=True)
 
-    def __init__(self, in_features: int, out_features: int, use_bias: bool = True, *, key: jax.Array):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        use_bias: bool = True,
+        *,
+        key: jax.Array,
+    ):
         wkey, bkey = jax.random.split(key)
         lim = 1 / jnp.sqrt(in_features)
         self.weight = jax.random.uniform(wkey, (out_features, in_features), minval=-lim, maxval=lim)

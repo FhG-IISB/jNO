@@ -37,7 +37,10 @@ def test_export_png_vtk_msh(constructor, tmp_path):
 
 
 def test_export_dispatch_with_explicit_format(tmp_path):
-    dom = jno.domain(constructor=jno.domain.equi_distant_rect(nx=4, ny=4), compute_mesh_connectivity=True)
+    dom = jno.domain(
+        constructor=jno.domain.equi_distant_rect(nx=4, ny=4),
+        compute_mesh_connectivity=True,
+    )
 
     out = tmp_path / "mesh_any.ext"
     dom.export(str(out), fmt="vtk")

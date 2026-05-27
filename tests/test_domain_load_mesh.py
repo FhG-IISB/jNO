@@ -18,12 +18,11 @@ correctly:
 * correctly sub-samples on request
 """
 
+import meshio
 import numpy as np
 import pytest
-import meshio
 
 import jno
-
 
 # ---------------------------------------------------------------------------
 # Shared mesh factory (pure numpy, no pygmsh/gmsh required)
@@ -71,7 +70,10 @@ def _make_2d_mesh(nx: int = 4, ny: int = 4, x_range=(0.0, 1.0), y_range=(0.0, 1.
         "bottom": [np.array([], dtype=np.int64), np.arange(0, nb)],
         "top": [np.array([], dtype=np.int64), np.arange(nb, nb + nt)],
         "left": [np.array([], dtype=np.int64), np.arange(nb + nt, nb + nt + nl)],
-        "right": [np.array([], dtype=np.int64), np.arange(nb + nt + nl, nb + nt + nl + nr)],
+        "right": [
+            np.array([], dtype=np.int64),
+            np.arange(nb + nt + nl, nb + nt + nl + nr),
+        ],
     }
     return meshio.Mesh(
         points=pts,
@@ -198,7 +200,12 @@ class TestMeshPoolShapes:
     def test_boundary_pool_points_on_perimeter(self, inp_2d_domain):
         """Every point in the 'boundary' pool must lie on the unit-square perimeter."""
         pts = inp_2d_domain._mesh_pool["boundary"]
-        on_edge = np.isclose(pts[:, 0], 0.0, atol=1e-10) | np.isclose(pts[:, 0], 1.0, atol=1e-10) | np.isclose(pts[:, 1], 0.0, atol=1e-10) | np.isclose(pts[:, 1], 1.0, atol=1e-10)
+        on_edge = (
+            np.isclose(pts[:, 0], 0.0, atol=1e-10)
+            | np.isclose(pts[:, 0], 1.0, atol=1e-10)
+            | np.isclose(pts[:, 1], 0.0, atol=1e-10)
+            | np.isclose(pts[:, 1], 1.0, atol=1e-10)
+        )
         assert np.all(on_edge), f"{np.sum(~on_edge)} / {len(on_edge)} boundary points are NOT on the perimeter"
 
     def test_left_pool_x_equals_zero(self, inp_2d_domain):
@@ -292,7 +299,12 @@ class TestVariable:
         dom = jno.domain(constructor=path, compute_mesh_connectivity=False)
         dom.variable("boundary")
         pts = np.asarray(dom.context["boundary"][0, 0, :, :])
-        on_edge = np.isclose(pts[:, 0], 0.0, atol=1e-10) | np.isclose(pts[:, 0], 1.0, atol=1e-10) | np.isclose(pts[:, 1], 0.0, atol=1e-10) | np.isclose(pts[:, 1], 1.0, atol=1e-10)
+        on_edge = (
+            np.isclose(pts[:, 0], 0.0, atol=1e-10)
+            | np.isclose(pts[:, 0], 1.0, atol=1e-10)
+            | np.isclose(pts[:, 1], 0.0, atol=1e-10)
+            | np.isclose(pts[:, 1], 1.0, atol=1e-10)
+        )
         assert np.all(on_edge)
 
     def test_subsampling_respects_requested_count(self, tmp_path):
@@ -333,7 +345,12 @@ class TestCustomCoordinateRange:
         meshio.write(path, _make_2d_mesh(nx=3, ny=3, x_range=(x0, x1), y_range=(y0, y1)))
         dom = jno.domain(constructor=path, compute_mesh_connectivity=False)
         pts = dom._mesh_pool["boundary"]
-        on_edge = np.isclose(pts[:, 0], x0, atol=1e-10) | np.isclose(pts[:, 0], x1, atol=1e-10) | np.isclose(pts[:, 1], y0, atol=1e-10) | np.isclose(pts[:, 1], y1, atol=1e-10)
+        on_edge = (
+            np.isclose(pts[:, 0], x0, atol=1e-10)
+            | np.isclose(pts[:, 0], x1, atol=1e-10)
+            | np.isclose(pts[:, 1], y0, atol=1e-10)
+            | np.isclose(pts[:, 1], y1, atol=1e-10)
+        )
         assert np.all(on_edge)
 
 

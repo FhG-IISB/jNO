@@ -10,16 +10,16 @@ Architecture factories (``mlp``, ``fno2d``, ``deeponet``, …) have moved to the
 ``jno.nn.mlp(...)`` shorthand.
 """
 
+from typing import Any, Union, overload
+
 import equinox as eqx
 import jax
 import jax.numpy as jnp
-from typing import Union, Any, overload
 
-from .linear import Linear
-
+from ..trace import Model, ModelCall, TunableModule
 from ..tuner import ArchSpace
-from ..trace import Model, TunableModule, ModelCall
 from ..utils.config import get_seed
+from .linear import Linear
 
 _DEFAULT_NN_KEY: jax.Array | None = None
 
@@ -46,7 +46,10 @@ def _resolve_key(key: jax.Array | None):
         _DEFAULT_NN_KEY = jax.random.PRNGKey(int(seed))
 
     if _DEFAULT_NN_KEY is None:
-        raise ValueError("No PRNG key provided. Pass key=... explicitly, or set [jno].seed " "and call jno.setup(...) before creating models.")
+        raise ValueError(
+            "No PRNG key provided. Pass key=... explicitly, or set [jno].seed "
+            "and call jno.setup(...) before creating models."
+        )
 
     _DEFAULT_NN_KEY, key_out = jax.random.split(_DEFAULT_NN_KEY)
     return key_out
@@ -132,7 +135,9 @@ class nn:
     def wrap(cls, module, space: "ArchSpace", name: str = ..., weight_path: str = ...) -> "TunableModule": ...
 
     @classmethod
-    def wrap(cls, module, space: "ArchSpace" = None, name: str = "", weight_path: str = None) -> Union["Model", "TunableModule"]:
+    def wrap(
+        cls, module, space: "ArchSpace" = None, name: str = "", weight_path: str = None
+    ) -> Union["Model", "TunableModule"]:
         """
         Wrap a module for use in the jno pipeline.
 
@@ -164,8 +169,15 @@ class nn:
             if isinstance(module, type):
                 return TunableModule(module_cls=module, space=space)
             else:
-                raise ValueError("When space= is provided, module must be a CLASS (not instance). " "Use: pnp.nn.wrap(MLP, space=space) not pnp.nn.wrap(MLP(), space=space)")
+                raise ValueError(
+                    "When space= is provided, module must be a CLASS (not instance). "
+                    "Use: pnp.nn.wrap(MLP, space=space) not pnp.nn.wrap(MLP(), space=space)"
+                )
         else:
             if not isinstance(module, eqx.Module):
-                raise TypeError(f"nn.wrap() expects an eqx.Module instance, got {type(module).__name__}. " f"Flax modules are no longer supported at runtime. " f"Use the Equinox version of your model (e.g. foundax provides *_eqx variants).")
+                raise TypeError(
+                    f"nn.wrap() expects an eqx.Module instance, got {type(module).__name__}. "
+                    f"Flax modules are no longer supported at runtime. "
+                    f"Use the Equinox version of your model (e.g. foundax provides *_eqx variants)."
+                )
             return Model(module, name, weight_path)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Dict, List, Tuple, Optional, Any
+from typing import Any, Dict, List, Optional, Tuple
 
 import meshio
 import numpy as np
@@ -21,9 +21,9 @@ class MeshIOMixin(MeshUtils):
 
     def _load_mesh(self, mesh_file: str):
         """Load mesh from file using Meshio."""
-        import meshio
-
         from pathlib import Path
+
+        import meshio
 
         if not Path(mesh_file).exists():
             raise FileNotFoundError(f"Mesh file not found: {mesh_file}")
@@ -78,7 +78,13 @@ class MeshIOMixin(MeshUtils):
         self._write_meshio_safely(save_path, file_format=file_format)
         self.log.info(f"Saved mesh to {save_path}")
 
-    def export(self, save_path: str, fmt: Optional[str] = None, show_sampled: bool = True, figsize: Tuple[int, int] = (10, 8)):
+    def export(
+        self,
+        save_path: str,
+        fmt: Optional[str] = None,
+        show_sampled: bool = True,
+        figsize: Tuple[int, int] = (10, 8),
+    ):
         """Unified export helper.
 
         Supported formats:
@@ -112,9 +118,15 @@ class MeshIOMixin(MeshUtils):
         ax.set_ylim(center[1] - radius, center[1] + radius)
         ax.set_zlim(center[2] - radius, center[2] + radius)
 
-    def plot_mesh(self, save_path: str = "./runs/domain_mesh.png", figsize: Tuple[int, int] = (10, 8), show_sampled: bool = True):
+    def plot_mesh(
+        self,
+        save_path: str = "./runs/domain_mesh.png",
+        figsize: Tuple[int, int] = (10, 8),
+        show_sampled: bool = True,
+    ):
         """Plot the actual mesh (elements), optionally overlaying sampled points."""
         import os
+
         import matplotlib.pyplot as plt
 
         if self.mesh is None:
@@ -132,12 +144,22 @@ class MeshIOMixin(MeshUtils):
             if "tetra" in self.mesh.cells_dict:
                 boundary_faces = self._get_boundary_elements(self.mesh.cells_dict["tetra"], "tetra")
                 face_xyz = points[boundary_faces]
-                poly = Poly3DCollection(face_xyz, facecolor=(0.2, 0.55, 0.9, 0.12), edgecolor=(0.15, 0.15, 0.2, 0.35), linewidth=0.25)
+                poly = Poly3DCollection(
+                    face_xyz,
+                    facecolor=(0.2, 0.55, 0.9, 0.12),
+                    edgecolor=(0.15, 0.15, 0.2, 0.35),
+                    linewidth=0.25,
+                )
                 ax.add_collection3d(poly)
             elif "triangle" in self.mesh.cells_dict:
                 tri = self.mesh.cells_dict["triangle"]
                 face_xyz = points[tri]
-                poly = Poly3DCollection(face_xyz, facecolor=(0.2, 0.55, 0.9, 0.12), edgecolor=(0.15, 0.15, 0.2, 0.35), linewidth=0.25)
+                poly = Poly3DCollection(
+                    face_xyz,
+                    facecolor=(0.2, 0.55, 0.9, 0.12),
+                    edgecolor=(0.15, 0.15, 0.2, 0.35),
+                    linewidth=0.25,
+                )
                 ax.add_collection3d(poly)
 
             if show_sampled and self.context:
@@ -281,7 +303,15 @@ class MeshIOMixin(MeshUtils):
                     )
                 xe = [p[0] for p in edge_segments]
                 ye = [p[1] for p in edge_segments]
-                traces.append(go.Scatter(x=xe, y=ye, mode="lines", line=dict(width=1, color="rgba(70,70,70,0.5)"), name="mesh"))
+                traces.append(
+                    go.Scatter(
+                        x=xe,
+                        y=ye,
+                        mode="lines",
+                        line=dict(width=1, color="rgba(70,70,70,0.5)"),
+                        name="mesh",
+                    )
+                )
 
             if show_sampled and self.context:
                 for tag, data in self.context.items():
@@ -295,7 +325,15 @@ class MeshIOMixin(MeshUtils):
                     else:
                         continue
                     if pts.shape[-1] >= 2:
-                        traces.append(go.Scatter(x=pts[:, 0], y=pts[:, 1], mode="markers", marker=dict(size=4), name=tag))
+                        traces.append(
+                            go.Scatter(
+                                x=pts[:, 0],
+                                y=pts[:, 1],
+                                mode="markers",
+                                marker=dict(size=4),
+                                name=tag,
+                            )
+                        )
 
         fig = go.Figure(data=traces)
         fig.update_layout(title="Interactive Mesh", template="plotly_white")

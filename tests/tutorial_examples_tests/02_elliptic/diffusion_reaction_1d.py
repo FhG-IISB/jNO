@@ -13,11 +13,11 @@ This tests whether the network can balance diffusion (−u'') and reaction (σu)
 Large σ makes the reaction term dominant; try σ ∈ {1, 10, 100}.
 """
 
-import jax
-import jno
-
 import foundax
+import jax
 import optax
+
+import jno
 from jno import LearningRateSchedule as lrs
 
 π = jno.np.pi
@@ -34,12 +34,14 @@ u_exact = jno.np.sin(π * x)
 forcing = (π**2 + σ) * jno.np.sin(π * x)  # f = −u'exact'' + σ u_exact
 
 # ── Network (hard BCs via x(1−x) factor) ─────────────────────────────────────
-u_net = jno.nn.wrap(foundax.mlp(
-    in_features=1,
-    hidden_dims=64,
-    num_layers=4,
-    key=jax.random.PRNGKey(0),
-)).optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 10, 1e-5))
+u_net = jno.nn.wrap(
+    foundax.mlp(
+        in_features=1,
+        hidden_dims=64,
+        num_layers=4,
+        key=jax.random.PRNGKey(0),
+    )
+).optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 10, 1e-5))
 
 u = u_net(x) * x * (1 - x)
 

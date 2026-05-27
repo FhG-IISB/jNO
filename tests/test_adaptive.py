@@ -1,7 +1,7 @@
 """Unit tests for jno.utils.adaptive — LR and weight schedules."""
 
-import pytest
 import jax.numpy as jnp
+import pytest
 
 from jno.utils.adaptive import LearningRateSchedule, WeightSchedule
 

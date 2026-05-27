@@ -1,14 +1,17 @@
 from __future__ import annotations
+
 import io
 import pathlib
 import struct
 import sys
-import cloudpickle
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
+from typing import Any, Type, TypeVar, Union, overload
+
+import cloudpickle
+
 from ..core import core
 from ..domain import domain
 from .iree import IREEModel
-from typing import Union, TypeVar, Type, overload, Any
 
 TLoaded = TypeVar("TLoaded", core, domain, IREEModel)
 
@@ -93,14 +96,19 @@ class _CompatCloudpickleSerializer:
         return _compat_cloudpickle_load_from_bytes(payload)
 
 
-def save(instance, filepath: str, public_key_path: str | None = None, private_key_path: str | None = None):
+def save(
+    instance,
+    filepath: str,
+    public_key_path: str | None = None,
+    private_key_path: str | None = None,
+):
     """Save an object to a pickle file.
 
     If *public_key_path* / *private_key_path* are not provided, jNO checks
     whether RSA keys are configured in ``.jno.toml`` (or ``~/.jno/config.toml``)
     and uses them automatically.
     """
-    from .config import get_rsa_public_key, get_rsa_private_key
+    from .config import get_rsa_private_key, get_rsa_public_key
 
     if public_key_path is None:
         public_key_path = get_rsa_public_key()
@@ -111,7 +119,10 @@ def save(instance, filepath: str, public_key_path: str | None = None, private_ke
         try:
             from pylotte.signed_pickle import SignedPickle
         except ImportError as e:
-            raise ImportError("pylotte is required for signed save/load functionality. " "Install with `pip install pylotte` or `pip install jax-neural-operators[dev]`") from e
+            raise ImportError(
+                "pylotte is required for signed save/load functionality. "
+                "Install with `pip install pylotte` or `pip install jax-neural-operators[dev]`"
+            ) from e
         signer = SignedPickle(
             public_key_path=public_key_path,
             private_key_path=private_key_path,
@@ -121,7 +132,6 @@ def save(instance, filepath: str, public_key_path: str | None = None, private_ke
         signer.dump_and_sign(instance, filepath, sig_path)
         instance.log.info(f"Signature saved to: {sig_path}")
     else:
-
         with open(filepath, "wb") as f:
             _compat_cloudpickle_dump(instance, f)
 
@@ -170,7 +180,10 @@ def load(
         try:
             from pylotte.signed_pickle import SignedPickle
         except ImportError as e:
-            raise ImportError("pylotte is required for signed save/load functionality. " "Install with `pip install pylotte` or `pip install jax-neural-operators[dev]`") from e
+            raise ImportError(
+                "pylotte is required for signed save/load functionality. "
+                "Install with `pip install pylotte` or `pip install jax-neural-operators[dev]`"
+            ) from e
         loader = SignedPickle(public_key_path=public_key_path, serializer=_CompatCloudpickleSerializer)
         instance = loader.safe_load(filepath, signature_path)
     else:

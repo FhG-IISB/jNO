@@ -1,33 +1,32 @@
 """CORE solver using new tracing system - NO INNER VMAPS version."""
 
-from typing import Dict, List, Callable, Tuple
+import inspect
+from typing import Dict, List, Tuple
+
 import jax
 import jax.numpy as jnp
-import inspect
 import numpy as np
 
 from .trace import (
-    Placeholder,
-    FunctionCall,
-    Literal,
-    ConstantNamespace,
-    Constant,
-    Variable,
-    TensorTag,
+    Assembly,
     BinaryOp,
-    Model,
-    TunableModule,
-    TunableModuleCall,
     Choice,
-    ModelCall,
-    OperationDef,
-    OperationCall,
+    Constant,
+    FunctionCall,
+    GroupedAssembly,
     Hessian,
     Jacobian,
-    TestFunction,
-    Assembly,
-    GroupedAssembly,
+    Literal,
+    ModelCall,
+    OperationCall,
+    OperationDef,
+    Placeholder,
     StateField,
+    TensorTag,
+    TestFunction,
+    TunableModule,
+    TunableModuleCall,
+    Variable,
 )
 
 
@@ -36,11 +35,8 @@ def _default_float_dtype():
     return jnp.asarray(0.0).dtype
 
 
-from .utils import get_logger
-import equinox as eqx
-
-
 from .differential_operators import DifferentialOperators
+from .utils import get_logger
 
 
 class TraceEvaluator:
@@ -609,7 +605,9 @@ class TraceEvaluator:
 
     def _eval_tunable_module(self, expr, ctx):
         if expr._current_instance is None:
-            raise ValueError(f"TunableModule {expr} has no current instance.  " "This should be set by core.solve() before evaluation.")
+            raise ValueError(
+                f"TunableModule {expr} has no current instance.  This should be set by core.solve() before evaluation."
+            )
         return self._dispatch(expr._current_instance, ctx)
 
     def _eval_state_field(self, expr, ctx):
@@ -618,7 +616,7 @@ class TraceEvaluator:
     def _eval_tunable_module_call(self, expr, ctx):
         tunable = expr.model
         if tunable._current_instance is None:
-            raise ValueError("TunableModule has no current instance. " "This should be set by core.solve() before evaluation.")
+            raise ValueError("TunableModule has no current instance. This should be set by core.solve() before evaluation.")
         concrete_call = ModelCall(tunable._current_instance, expr.args)
         concrete_call.op_id = expr.op_id
         return self._dispatch(concrete_call, ctx)
@@ -646,7 +644,9 @@ class TraceEvaluator:
         scheme = expr.scheme
         if isinstance(target, TestFunction):
             if ctx.active_region is None:
-                raise ValueError("Jacobian of TestFunction requires an active_region. " "Use grad(phi, x) only inside Assembly(...).")
+                raise ValueError(
+                    "Jacobian of TestFunction requires an active_region. Use grad(phi, x) only inside Assembly(...)."
+                )
 
             requested_dims = []
             for var in variables:
@@ -685,7 +685,11 @@ class TraceEvaluator:
                 surf_data = ctx.context["surface_data"][region_id]
 
                 if "face_shape_grads" not in surf_data:
-                    raise NotImplementedError(f"Boundary TestFunction gradients requested on region '{region_id}', " "but 'face_shape_grads' is not stored in fem_context['surface_data']'. " "Add boundary shape gradients in domain.init_fem() first.")
+                    raise NotImplementedError(
+                        f"Boundary TestFunction gradients requested on region '{region_id}', "
+                        "but 'face_shape_grads' is not stored in fem_context['surface_data']'. "
+                        "Add boundary shape gradients in domain.init_fem() first."
+                    )
 
                 dN_face = surf_data["face_shape_grads"]
                 # flatten to (Nq_total, nloc, dim)
@@ -750,11 +754,21 @@ class TraceEvaluator:
 
                 u_fwd = self._dispatch(
                     target,
-                    self._EvalCtx(ctx_fwd, ctx.var_bindings, ctx.key, active_region=ctx.active_region),
+                    self._EvalCtx(
+                        ctx_fwd,
+                        ctx.var_bindings,
+                        ctx.key,
+                        active_region=ctx.active_region,
+                    ),
                 )
                 u_bwd = self._dispatch(
                     target,
-                    self._EvalCtx(ctx_bwd, ctx.var_bindings, ctx.key, active_region=ctx.active_region),
+                    self._EvalCtx(
+                        ctx_bwd,
+                        ctx.var_bindings,
+                        ctx.key,
+                        active_region=ctx.active_region,
+                    ),
                 )
 
                 result = (u_fwd - u_bwd) / (2.0 * eps)
@@ -811,7 +825,11 @@ class TraceEvaluator:
 
             # Determine active N from the matching spatial tag first.
             N = int(ctx.context.get("__active_spatial_n__", 1))
-            if active_spatial_tag is not None and active_spatial_tag in ctx.context and is_spatial_pointset(active_spatial_tag, ctx.context[active_spatial_tag]):
+            if (
+                active_spatial_tag is not None
+                and active_spatial_tag in ctx.context
+                and is_spatial_pointset(active_spatial_tag, ctx.context[active_spatial_tag])
+            ):
                 v = ctx.context[active_spatial_tag]
                 N = int(v.shape[point_axis(v)])
             else:
@@ -955,11 +973,28 @@ class TraceEvaluator:
             jac_components = []
             for _i, vi_dim in var_dims:
                 if mesh_dim == 1:
-                    grad_full = DifferentialOperators.compute_fd_gradient_1d_simple(u_full_1d, mesh_points, domain.mesh_connectivity["lines"], method=grad_method)
+                    grad_full = DifferentialOperators.compute_fd_gradient_1d_simple(
+                        u_full_1d,
+                        mesh_points,
+                        domain.mesh_connectivity["lines"],
+                        method=grad_method,
+                    )
                 elif mesh_dim == 2:
-                    grad_full = DifferentialOperators.compute_fd_gradient_2d_simple(u_full_1d, mesh_points, domain.mesh_connectivity["triangles"], vi_dim, method=grad_method)
+                    grad_full = DifferentialOperators.compute_fd_gradient_2d_simple(
+                        u_full_1d,
+                        mesh_points,
+                        domain.mesh_connectivity["triangles"],
+                        vi_dim,
+                        method=grad_method,
+                    )
                 elif mesh_dim == 3:
-                    grad_full = DifferentialOperators.compute_fd_gradient_3d_simple(u_full_1d, mesh_points, domain.mesh_connectivity["tetrahedra"], vi_dim, method=grad_method)
+                    grad_full = DifferentialOperators.compute_fd_gradient_3d_simple(
+                        u_full_1d,
+                        mesh_points,
+                        domain.mesh_connectivity["tetrahedra"],
+                        vi_dim,
+                        method=grad_method,
+                    )
                 jac_components.append(grad_full)
 
             if image_shape is not None:
@@ -1096,11 +1131,28 @@ class TraceEvaluator:
             if compute_trace:
                 # Laplacian: sum of second derivatives on diagonal
                 if mesh_dim == 1:
-                    lap_full = DifferentialOperators.compute_fd_laplacian_1d_simple(u_full_1d, mesh_points, domain.mesh_connectivity["lines"], method=lap_method)
+                    lap_full = DifferentialOperators.compute_fd_laplacian_1d_simple(
+                        u_full_1d,
+                        mesh_points,
+                        domain.mesh_connectivity["lines"],
+                        method=lap_method,
+                    )
                 elif mesh_dim == 2:
-                    lap_full = DifferentialOperators.compute_fd_laplacian_2d_simple(u_full_1d, mesh_points, domain.mesh_connectivity["triangles"], dims, method=lap_method)
+                    lap_full = DifferentialOperators.compute_fd_laplacian_2d_simple(
+                        u_full_1d,
+                        mesh_points,
+                        domain.mesh_connectivity["triangles"],
+                        dims,
+                        method=lap_method,
+                    )
                 elif mesh_dim == 3:
-                    lap_full = DifferentialOperators.compute_fd_laplacian_3d_simple(u_full_1d, mesh_points, domain.mesh_connectivity["tetrahedra"], dims, method=lap_method)
+                    lap_full = DifferentialOperators.compute_fd_laplacian_3d_simple(
+                        u_full_1d,
+                        mesh_points,
+                        domain.mesh_connectivity["tetrahedra"],
+                        dims,
+                        method=lap_method,
+                    )
 
                 if image_shape is not None:
                     # Return in the same image shape as the model output
@@ -1113,11 +1165,23 @@ class TraceEvaluator:
             else:
                 # Full Hessian matrix
                 if mesh_dim == 1:
-                    hess_full = DifferentialOperators.compute_fd_hessian_1d_simple(u_full_1d, mesh_points, domain.mesh_connectivity["lines"])
+                    hess_full = DifferentialOperators.compute_fd_hessian_1d_simple(
+                        u_full_1d, mesh_points, domain.mesh_connectivity["lines"]
+                    )
                 elif mesh_dim == 2:
-                    hess_full = DifferentialOperators.compute_fd_hessian_2d_simple(u_full_1d, mesh_points, domain.mesh_connectivity["triangles"], var_dims)
+                    hess_full = DifferentialOperators.compute_fd_hessian_2d_simple(
+                        u_full_1d,
+                        mesh_points,
+                        domain.mesh_connectivity["triangles"],
+                        var_dims,
+                    )
                 elif mesh_dim == 3:
-                    hess_full = DifferentialOperators.compute_fd_hessian_3d_simple(u_full_1d, mesh_points, domain.mesh_connectivity["tetrahedra"], var_dims)
+                    hess_full = DifferentialOperators.compute_fd_hessian_3d_simple(
+                        u_full_1d,
+                        mesh_points,
+                        domain.mesh_connectivity["tetrahedra"],
+                        var_dims,
+                    )
                 if image_shape is not None:
                     return hess_full.reshape(*image_shape[:-1], n, n)
                 return self._map_mesh_to_sampled(mesh_points, points, hess_full)
@@ -1146,7 +1210,9 @@ class TraceEvaluator:
                         hess = jax.hessian(lambda p: _windowed_scalar(t_idx, p_idx, p))(pt)
                         return sum(hess[d, d] for d in dims)
 
-                    result = jax.vmap(lambda t_idx: jax.vmap(lambda p_idx: lap_time_point(t_idx, p_idx))(jnp.arange(n_points)))(jnp.arange(n_time))
+                    result = jax.vmap(
+                        lambda t_idx: jax.vmap(lambda p_idx: lap_time_point(t_idx, p_idx))(jnp.arange(n_points))
+                    )(jnp.arange(n_time))
                     return result[..., jnp.newaxis]
 
                 def hess_time_point(t_idx, p_idx):
@@ -1157,7 +1223,9 @@ class TraceEvaluator:
                         result = result.at[i, j].set(hess[vi_dim, vj_dim])
                     return result
 
-                return jax.vmap(lambda t_idx: jax.vmap(lambda p_idx: hess_time_point(t_idx, p_idx))(jnp.arange(n_points)))(jnp.arange(n_time))
+                return jax.vmap(lambda t_idx: jax.vmap(lambda p_idx: hess_time_point(t_idx, p_idx))(jnp.arange(n_points)))(
+                    jnp.arange(n_time)
+                )
 
             if compute_trace:
                 # Laplacian via AD
@@ -1167,7 +1235,12 @@ class TraceEvaluator:
 
                     def u_scalar(p):
                         ctx_dict = {**local_ctx, tag: p[jnp.newaxis, :]}
-                        new_ctx = evaluator_self._EvalCtx(ctx_dict, ctx.var_bindings, ctx.key, active_region=ctx.active_region)
+                        new_ctx = evaluator_self._EvalCtx(
+                            ctx_dict,
+                            ctx.var_bindings,
+                            ctx.key,
+                            active_region=ctx.active_region,
+                        )
                         return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
 
                     hess = jax.hessian(u_scalar)(pt)
@@ -1178,7 +1251,12 @@ class TraceEvaluator:
                 # Full Hessian via AD
                 def hess_single(pt):
                     def u_scalar(p):
-                        new_ctx = evaluator_self._EvalCtx({**ctx.context, tag: p[jnp.newaxis, :]}, ctx.var_bindings, ctx.key, active_region=ctx.active_region)
+                        new_ctx = evaluator_self._EvalCtx(
+                            {**ctx.context, tag: p[jnp.newaxis, :]},
+                            ctx.var_bindings,
+                            ctx.key,
+                            active_region=ctx.active_region,
+                        )
                         return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
 
                     hess = jax.hessian(u_scalar)(pt)
@@ -1347,10 +1425,15 @@ class TraceEvaluator:
                 coeff_vec = coeff_vec[:, None]
 
             if coeff_vec.ndim != 2:
-                raise ValueError(f"Scalar grad assembly expects coeff_vec.ndim == 2 after normalization, " f"got shape {coeff_vec.shape} with v_grads_JxW_flat {v_grads_JxW_flat.shape}")
+                raise ValueError(
+                    f"Scalar grad assembly expects coeff_vec.ndim == 2 after normalization, "
+                    f"got shape {coeff_vec.shape} with v_grads_JxW_flat {v_grads_JxW_flat.shape}"
+                )
 
             if coeff_vec.shape[0] != v_grads_JxW_flat.shape[0]:
-                raise ValueError(f"grad coeff shape {coeff_vec.shape} incompatible with " f"v_grads_JxW_flat {v_grads_JxW_flat.shape}")
+                raise ValueError(
+                    f"grad coeff shape {coeff_vec.shape} incompatible with v_grads_JxW_flat {v_grads_JxW_flat.shape}"
+                )
 
             n_q_total, n_loc, dim = v_grads_JxW_flat.shape
             if coeff_vec.shape[1] != dim:
@@ -1368,10 +1451,15 @@ class TraceEvaluator:
                 coeff_vec = coeff_vec[:, None, :]
 
             if coeff_vec.ndim != 3:
-                raise ValueError(f"Vector grad assembly expects coeff_vec.ndim == 3 after normalization, " f"got shape {coeff_vec.shape} with v_grads_JxW_flat {v_grads_JxW_flat.shape}")
+                raise ValueError(
+                    f"Vector grad assembly expects coeff_vec.ndim == 3 after normalization, "
+                    f"got shape {coeff_vec.shape} with v_grads_JxW_flat {v_grads_JxW_flat.shape}"
+                )
 
             if coeff_vec.shape[0] != v_grads_JxW_flat.shape[0]:
-                raise ValueError(f"grad coeff shape {coeff_vec.shape} incompatible with " f"v_grads_JxW_flat {v_grads_JxW_flat.shape}")
+                raise ValueError(
+                    f"grad coeff shape {coeff_vec.shape} incompatible with v_grads_JxW_flat {v_grads_JxW_flat.shape}"
+                )
 
             n_q_total, n_loc, test_vec, dim = v_grads_JxW_flat.shape
             coeff_nq, coeff_vec_dim, coeff_dim = coeff_vec.shape
@@ -1389,7 +1477,9 @@ class TraceEvaluator:
                     )
                     test_vec = coeff_vec_dim
                 else:
-                    raise ValueError(f"grad coeff shape {coeff_vec.shape} incompatible with " f"v_grads_JxW_flat {v_grads_JxW_flat.shape}")
+                    raise ValueError(
+                        f"grad coeff shape {coeff_vec.shape} incompatible with v_grads_JxW_flat {v_grads_JxW_flat.shape}"
+                    )
 
             # FEAX-style double contraction over component and spatial direction
             # -> local_q shape (Nq_total, n_loc)
@@ -1399,7 +1489,10 @@ class TraceEvaluator:
             )
 
         else:
-            raise ValueError(f"Unsupported v_grads_JxW_flat rank {v_grads_JxW_flat.ndim}; " f"expected 3 (scalar) or 4 (vector/multi-component).")
+            raise ValueError(
+                f"Unsupported v_grads_JxW_flat rank {v_grads_JxW_flat.ndim}; "
+                f"expected 3 (scalar) or 4 (vector/multi-component)."
+            )
 
         # --------------------------------------------------
         # Reconstruct cell structure and sum quadrature
@@ -1468,36 +1561,49 @@ class TraceEvaluator:
         # This guards grouped FEM paths where integrand is emitted with a flattened
         # (nloc * feature) axis instead of an explicit nloc axis.
         if flat_entity_nodes.size % num_entities != 0:
-            raise ValueError("Inconsistent FEM connectivity: flat_entity_nodes.size is not divisible " f"by num_entities ({flat_entity_nodes.size} vs {num_entities}).")
+            raise ValueError(
+                "Inconsistent FEM connectivity: flat_entity_nodes.size is not divisible "
+                f"by num_entities ({flat_entity_nodes.size} vs {num_entities})."
+            )
         expected_n_local_nodes = int(flat_entity_nodes.size // num_entities)
 
         if integrand.ndim < 2:
             raise ValueError(f"Assembly integrand must have at least 2 dims, got shape {integrand.shape}.")
 
         if integrand.shape[0] != weights.size:
-            raise ValueError("Assembly integrand leading axis must match total quadrature points " f"({integrand.shape[0]} vs {weights.size}).")
+            raise ValueError(
+                "Assembly integrand leading axis must match total quadrature points "
+                f"({integrand.shape[0]} vs {weights.size})."
+            )
 
         if integrand.shape[1] != expected_n_local_nodes:
             if integrand.shape[1] % expected_n_local_nodes != 0:
-                raise ValueError("Assembly integrand local-node axis is incompatible with connectivity: " f"shape={integrand.shape}, expected nloc={expected_n_local_nodes}.")
+                raise ValueError(
+                    "Assembly integrand local-node axis is incompatible with connectivity: "
+                    f"shape={integrand.shape}, expected nloc={expected_n_local_nodes}."
+                )
             # Recover explicit local-node axis from flattened representation.
             split = integrand.shape[1] // expected_n_local_nodes
             integrand = integrand.reshape((integrand.shape[0], expected_n_local_nodes, split) + tuple(integrand.shape[2:]))
 
-        n_local_nodes = integrand.shape[1]
         trailing_shape = integrand.shape[2:]
 
         num_entities, num_quads = weights.shape
 
         if integrand.ndim == 2:
             if integrand.shape[0] != num_entities * num_quads:
-                raise ValueError(f"Integrand first dim {integrand.shape[0]} does not match " f"num_entities*num_quads = {num_entities * num_quads}")
+                raise ValueError(
+                    f"Integrand first dim {integrand.shape[0]} does not match "
+                    f"num_entities*num_quads = {num_entities * num_quads}"
+                )
             n_loc = integrand.shape[1]
             integrand = integrand.reshape(num_entities, num_quads, n_loc)
 
         elif integrand.ndim >= 3:
             if integrand.shape[0] != num_entities or integrand.shape[1] != num_quads:
-                raise ValueError(f"Structured integrand shape {integrand.shape} is incompatible with " f"weights shape {weights.shape}")
+                raise ValueError(
+                    f"Structured integrand shape {integrand.shape} is incompatible with weights shape {weights.shape}"
+                )
             n_loc = integrand.shape[2]
 
         else:
@@ -1508,7 +1614,10 @@ class TraceEvaluator:
 
         if local_residual.ndim == 2:
             if flat_entity_nodes.size != local_residual.size:
-                raise ValueError(f"flat_entity_nodes size {flat_entity_nodes.size} does not match " f"local_residual size {local_residual.size}")
+                raise ValueError(
+                    f"flat_entity_nodes size {flat_entity_nodes.size} does not match "
+                    f"local_residual size {local_residual.size}"
+                )
 
             global_residual = jax.ops.segment_sum(
                 local_residual.reshape(-1),
@@ -1547,7 +1656,7 @@ class TraceEvaluator:
             boundary -> (Nq_total, nloc, ncomp, ncomp)
         """
         if ctx.active_region is None:
-            raise ValueError("TestFunction evaluation requires an active_region. " "Use it inside Assembly(...).")
+            raise ValueError("TestFunction evaluation requires an active_region. Use it inside Assembly(...).")
 
         support = ctx.active_region["support"]
         region_id = ctx.active_region["region_id"]

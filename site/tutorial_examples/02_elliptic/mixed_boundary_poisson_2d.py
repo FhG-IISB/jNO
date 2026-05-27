@@ -16,12 +16,13 @@ which gives
     f(x, y) = 2 pi^2 sin(pi x) cos(pi y)
 """
 
-import jax
-import jno
+from pathlib import Path
 
 import foundax
+import jax
 import optax
-from pathlib import Path
+
+import jno
 
 pi = jno.np.pi
 domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05))

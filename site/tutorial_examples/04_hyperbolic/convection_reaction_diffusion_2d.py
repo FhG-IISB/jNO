@@ -10,12 +10,13 @@ Analytical solution
     u(x, y, t) = exp(-t) sin(pi x) sin(pi y)
 """
 
-import jax
-import jno
+from pathlib import Path
 
 import foundax
+import jax
 import optax
-from pathlib import Path
+
+import jno
 
 pi = jno.np.pi
 bx = 1.0
@@ -34,7 +35,11 @@ x, y, t = domain.variable("interior")
 x0, y0, t0 = domain.variable("initial")
 
 u_exact = jno.np.exp(-t) * jno.np.sin(pi * x) * jno.np.sin(pi * y)
-source = (-1 + 2 * nu * pi**2 + lam) * u_exact + bx * pi * jno.np.exp(-t) * jno.np.cos(pi * x) * jno.np.sin(pi * y) + by * pi * jno.np.exp(-t) * jno.np.sin(pi * x) * jno.np.cos(pi * y)
+source = (
+    (-1 + 2 * nu * pi**2 + lam) * u_exact
+    + bx * pi * jno.np.exp(-t) * jno.np.cos(pi * x) * jno.np.sin(pi * y)
+    + by * pi * jno.np.exp(-t) * jno.np.sin(pi * x) * jno.np.cos(pi * y)
+)
 
 net = jno.nn.wrap(
     foundax.deeponet(
@@ -47,14 +52,31 @@ net = jno.nn.wrap(
         key=jax.random.PRNGKey(23),
     )
 )
-net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(init_value=0, peak_value=1e-3, warmup_steps=40, decay_steps=40000 - 40, end_value=1e-5)))
+net.optimizer(
+    optax.adam(
+        optax.warmup_cosine_decay_schedule(
+            init_value=0,
+            peak_value=1e-3,
+            warmup_steps=40,
+            decay_steps=40000 - 40,
+            end_value=1e-5,
+        )
+    )
+)
 
 xy = jno.np.concat([x, y])
 xy0 = jno.np.concat([x0, y0])
 u = net(t, xy) * x * (1 - x) * y * (1 - y)
 u0 = net(t0, xy0) * x0 * (1 - x0) * y0 * (1 - y0)
 
-pde = jno.np.grad(u, t) + bx * jno.np.grad(u, x) + by * jno.np.grad(u, y) - nu * jno.np.laplacian(u, [x, y]) + lam * u - source
+pde = (
+    jno.np.grad(u, t)
+    + bx * jno.np.grad(u, x)
+    + by * jno.np.grad(u, y)
+    - nu * jno.np.laplacian(u, [x, y])
+    + lam * u
+    - source
+)
 ini = u0 - jno.np.sin(pi * x0) * jno.np.sin(pi * y0)
 
 crux = jno.core([pde.mse, ini.mse], domain)

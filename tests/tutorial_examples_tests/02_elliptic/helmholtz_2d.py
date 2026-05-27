@@ -15,12 +15,13 @@ Note: the problem becomes resonant when k = π√2 ≈ 4.44.
 Try different values of k (e.g. 1, 2, 4) to see the effect on convergence.
 """
 
-import jax
-import jno
+from pathlib import Path
 
 import foundax
+import jax
 import optax
-from pathlib import Path
+
+import jno
 
 π = jno.np.pi
 # ── Parameter ─────────────────────────────────────────────────────────────────

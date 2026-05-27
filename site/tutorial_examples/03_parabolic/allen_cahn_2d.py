@@ -18,11 +18,11 @@ The source term is computed by substitution:
 Parameters: ε = 0.1  (interface width)
 """
 
-import jax
-import jno
-
 import foundax
+import jax
 import optax
+
+import jno
 from jno import LearningRateSchedule as lrs
 
 π = jno.np.pi
@@ -46,15 +46,17 @@ coeff = 2 * eps**2 * π**2 - 2
 source = exp(-t) * S * coeff + exp(-3 * t) * S**3
 
 # ── Network ───────────────────────────────────────────────────────────────────
-net = jno.nn.wrap(foundax.deeponet(
-    n_sensors=1,
-    coord_dim=2,
-    n_outputs=1,
-    n_layers=3,
-    basis_functions=64,
-    hidden_dim=40,
-    key=jax.random.PRNGKey(42),
-))
+net = jno.nn.wrap(
+    foundax.deeponet(
+        n_sensors=1,
+        coord_dim=2,
+        n_outputs=1,
+        n_layers=3,
+        basis_functions=64,
+        hidden_dim=40,
+        key=jax.random.PRNGKey(42),
+    )
+)
 net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(500, 1, 1e-3, 1e-5))
 
 xy = jno.np.concat([x, y])

@@ -14,11 +14,13 @@ which gives
     f(x, y) = (a + b) pi^2 sin(pi x) sin(pi y)
 """
 
-import jax
-import jno
-import foundax
-import optax
 from pathlib import Path
+
+import foundax
+import jax
+import optax
+
+import jno
 
 pi = jno.np.pi
 a = 1.0
@@ -30,7 +32,15 @@ x, y, _ = domain.variable("interior")
 u_exact = jno.np.sin(pi * x) * jno.np.sin(pi * y)
 forcing = (a + b) * pi**2 * u_exact
 
-net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=64, num_layers=5, activation=jax.nn.tanh, key=jax.random.PRNGKey(12)))
+net = jno.nn.wrap(
+    foundax.mlp(
+        in_features=2,
+        hidden_dims=64,
+        num_layers=5,
+        activation=jax.nn.tanh,
+        key=jax.random.PRNGKey(12),
+    )
+)
 net.optimizer(optax.adam(optax.exponential_decay(init_value=1e-3, transition_steps=80, decay_rate=0.5, end_value=1e-5)))
 
 u = net(x, y) * x * (1 - x) * y * (1 - y)
