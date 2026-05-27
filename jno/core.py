@@ -12,16 +12,16 @@ from jax.experimental import mesh_utils
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from .architectures.lora_linear import (
+from .architectures.lora import (
     LoRAWrapper as _LoRAWrapper,
 )
-from .architectures.lora_linear import (
+from .architectures.lora import (
     apply_lora as _apply_lora,
 )
-from .architectures.lora_linear import (
+from .architectures.lora import (
     lora_trainable_filter as _lora_trainable_filter,
 )
-from .architectures.lora_linear import (
+from .architectures.lora import (
     merge_lora as _merge_lora,
 )
 from .domain import DomainData, domain

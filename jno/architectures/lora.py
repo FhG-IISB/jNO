@@ -6,6 +6,17 @@ weights are frozen and only the adapter arrays are trained.
 During forward (LoRALinear):  ``y = base(x) + (x @ A.T) @ B.T * (alpha / rank)``
 After merging               :  ``y = merged_linear(x)``  (no runtime overhead)
 
+LoRA Zoo
+~~~~~~~~
+Several ``LoRAWrapper`` subclasses are provided out of the box:
+
+- ``LoRALinear``   — vanilla LoRA (trainable A and B)
+- ``rsLoRALinear`` — rank-stabilized: scales by ``alpha/sqrt(rank)``
+- ``LoRAFALinear`` — frozen-A: only B is trained (half the adapter parameters)
+- ``DoRALinear``   — weight-decomposed: trains magnitude and direction separately
+- ``PiSSALinear``  — SVD-initialised: adapters start from principal weight components
+- ``LoRAXSLinear`` — extra-small: A and B fixed from SVD, only a tiny R matrix is trained
+
 Custom adapters
 ~~~~~~~~~~~~~~~
 Subclass ``LoRAWrapper`` to support any layer type::
@@ -231,7 +242,7 @@ def apply_lora(
                 pat=_re.compile(s["target"]) if s.get("target") else None,
                 rank=int(s["rank"]),
                 alpha=float(s["alpha"]),
-                wrappers=_normalize_wrappers(s.get("wrapper")) if "wrapper" in s else default_wrappers,
+                wrappers=s["wrappers"] if "wrappers" in s else _normalize_wrappers(s.get("wrapper")) if "wrapper" in s else default_wrappers,
             )
             for s in specs
         ]
@@ -299,3 +310,203 @@ def lora_trainable_filter(model: eqx.Module) -> object:
     flat, treedef = jax.tree_util.tree_flatten(model)
     specs = [eqx.is_array(leaf) and id(leaf) in adapter_ids for leaf in flat]
     return jax.tree_util.tree_unflatten(treedef, specs)
+
+
+# =====================================================================
+# LoRA Zoo — drop-in variants, all compatible with apply_lora / .lora()
+# =====================================================================
+
+
+def _linear_applies_to(leaf: Any) -> bool:
+    """Shared predicate: any unwrapped LinearLike eqx.Module."""
+    return isinstance(leaf, eqx.Module) and not isinstance(leaf, LoRAWrapper) and isinstance(leaf, LinearLike)
+
+
+class rsLoRALinear(LoRALinear):
+    """Rank-Stabilized LoRA (rsLoRA).
+
+    Replaces the ``alpha/rank`` scalar with ``alpha/sqrt(rank)``.  This keeps
+    the effective gradient scale constant as rank grows, so larger ranks are
+    actually useful rather than numerically unstable.
+
+    Drop-in replacement for ``LoRALinear`` — identical API and parameter count.
+
+    Reference: https://arxiv.org/abs/2312.03732
+    """
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        y = self.base(x)
+        delta = (x @ self.lora_A.T) @ self.lora_B.T * (self.alpha / jnp.sqrt(self.rank))
+        return y + delta
+
+    def merge(self) -> eqx.Module:
+        w = self.base.weight + (self.alpha / jnp.sqrt(self.rank)) * (self.lora_B @ self.lora_A)
+        return eqx.tree_at(lambda m: m.weight, self.base, w)
+
+
+class LoRAFALinear(LoRALinear):
+    """Frozen-A LoRA (LoRAFA).
+
+    Identical to ``LoRALinear`` but only ``lora_B`` is trained; ``lora_A``
+    is frozen after random initialisation.  Halves the number of trainable
+    adapter parameters at a small accuracy cost.
+
+    Reference: https://arxiv.org/abs/2308.03303
+    """
+
+    adapter_fields = ("lora_B",)  # lora_A stays in pytree but is frozen
+
+
+class DoRALinear(LoRAWrapper):
+    """Weight-Decomposed Low-Rank Adaptation (DoRA).
+
+    Decomposes the base weight into a magnitude vector and a unit-norm
+    direction matrix.  Low-rank matrices update the direction; the per-output
+    magnitude is a small additional trainable vector.
+
+        W' = m * (W_0 + B @ A) / ||W_0 + B @ A||_row
+
+    Assumes the base layer computes ``x @ weight.T (+ bias)``.
+
+    Reference: https://arxiv.org/abs/2402.09353
+    """
+
+    adapter_fields = ("magnitude", "lora_A", "lora_B")
+
+    base: LinearLike
+    magnitude: jax.Array  # (out_features,) — learned per-output scale
+    lora_A: jax.Array  # (rank, in_features)
+    lora_B: jax.Array  # (out_features, rank)
+    rank: int = eqx.field(static=True)
+    alpha: float = eqx.field(static=True)
+
+    @classmethod
+    def applies_to(cls, leaf: Any) -> bool:
+        return _linear_applies_to(leaf)
+
+    def __init__(self, base: LinearLike, rank: int, alpha: float, *, key: jax.Array):
+        self.base = base
+        self.rank = min(rank, min(base.in_features, base.out_features))
+        self.alpha = alpha
+        # magnitude initialised to the row norms of the pretrained weight
+        self.magnitude = jnp.linalg.norm(base.weight, axis=1)
+        k1, _ = jax.random.split(key)
+        std = 1.0 / jnp.sqrt(base.in_features)
+        self.lora_A = jax.random.normal(k1, (self.rank, base.in_features)) * std
+        self.lora_B = jnp.zeros((base.out_features, self.rank))
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        W = self.base.weight + (self.alpha / self.rank) * (self.lora_B @ self.lora_A)
+        row_norms = jnp.linalg.norm(W, axis=1, keepdims=True)
+        out = x @ (self.magnitude[:, None] * W / row_norms).T
+        bias = getattr(self.base, "bias", None)
+        return out + bias if bias is not None else out
+
+    def merge(self) -> eqx.Module:
+        W = self.base.weight + (self.alpha / self.rank) * (self.lora_B @ self.lora_A)
+        row_norms = jnp.linalg.norm(W, axis=1, keepdims=True)
+        W_dora = self.magnitude[:, None] * W / row_norms
+        return eqx.tree_at(lambda m: m.weight, self.base, W_dora)
+
+
+class PiSSALinear(LoRAWrapper):
+    """Principal Singular Values and Singular Vectors Adaptation (PiSSA).
+
+    Initialises the adapter from the top-r singular components of the
+    pretrained weight.  The frozen base stores only the *residual*
+    (the remaining singular components), so the model output is identical
+    to the original at initialisation.  Adapters therefore start from the
+    most important weight directions rather than random noise, leading to
+    faster convergence when fine-tuning pretrained models.
+
+    Reference: https://arxiv.org/abs/2404.02948
+    """
+
+    adapter_fields = ("lora_A", "lora_B")
+
+    base: LinearLike  # holds the residual weight W - B@A at init
+    lora_A: jax.Array  # (rank, in_features) — initialised from right singular vectors
+    lora_B: jax.Array  # (out_features, rank) — initialised from left singular vectors
+    rank: int = eqx.field(static=True)
+    alpha: float = eqx.field(static=True)
+
+    @classmethod
+    def applies_to(cls, leaf: Any) -> bool:
+        return _linear_applies_to(leaf)
+
+    def __init__(self, base: LinearLike, rank: int, alpha: float, *, key: jax.Array):
+        r = min(rank, min(base.in_features, base.out_features))
+        self.rank = r
+        self.alpha = alpha
+
+        U, S, Vt = jnp.linalg.svd(base.weight, full_matrices=False)
+        U_r, S_r, Vt_r = U[:, :r], S[:r], Vt[:r, :]
+
+        # Scale so that (alpha/rank) * lora_B @ lora_A == U_r diag(S_r) Vt_r at init,
+        # keeping model output identical to the original base.
+        scale = jnp.sqrt(S_r * r / alpha)
+        self.lora_B = U_r * scale[None, :]
+        self.lora_A = Vt_r * scale[:, None]
+
+        # Residual = W - (alpha/r)*B@A so that base + adapter == W at init.
+        W_residual = base.weight - (alpha / r) * (self.lora_B @ self.lora_A)
+        self.base = eqx.tree_at(lambda m: m.weight, base, W_residual)
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        y = self.base(x)
+        delta = (x @ self.lora_A.T) @ self.lora_B.T * (self.alpha / self.rank)
+        return y + delta
+
+    def merge(self) -> eqx.Module:
+        w = self.base.weight + (self.alpha / self.rank) * (self.lora_B @ self.lora_A)
+        return eqx.tree_at(lambda m: m.weight, self.base, w)
+
+
+class LoRAXSLinear(LoRAWrapper):
+    """LoRA-XS: extra-small LoRA with a trainable r×r core matrix.
+
+    ``lora_A`` (r × in) and ``lora_B`` (out × r) are initialised from the
+    top singular vectors of the pretrained weight and then **frozen**.  Only
+    the small ``R`` matrix (r × r, initialised to zero) is trained:
+
+        delta_W = B @ R @ A * (alpha / rank)
+
+    This can give better parameter efficiency than vanilla LoRA for the same
+    rank because ``R`` has r² parameters instead of r*(in+out).
+
+    Reference: https://arxiv.org/abs/2405.17604
+    """
+
+    adapter_fields = ("R",)
+
+    base: LinearLike
+    lora_A: jax.Array  # (rank, in_features) — frozen, from SVD
+    lora_B: jax.Array  # (out_features, rank) — frozen, from SVD
+    R: jax.Array  # (rank, rank) — the only trainable parameter
+    rank: int = eqx.field(static=True)
+    alpha: float = eqx.field(static=True)
+
+    @classmethod
+    def applies_to(cls, leaf: Any) -> bool:
+        return _linear_applies_to(leaf)
+
+    def __init__(self, base: LinearLike, rank: int, alpha: float, *, key: jax.Array):
+        r = min(rank, min(base.in_features, base.out_features))
+        self.rank = r
+        self.alpha = alpha
+        self.base = base
+
+        U, S, Vt = jnp.linalg.svd(base.weight, full_matrices=False)
+        # A and B span the principal directions; R=0 ensures zero delta at init.
+        self.lora_A = Vt[:r, :]
+        self.lora_B = U[:, :r]
+        self.R = jnp.zeros((r, r))
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        y = self.base(x)
+        delta = (x @ self.lora_A.T @ self.R.T) @ self.lora_B.T * (self.alpha / self.rank)
+        return y + delta
+
+    def merge(self) -> eqx.Module:
+        W = self.base.weight + (self.alpha / self.rank) * (self.lora_B @ self.R @ self.lora_A)
+        return eqx.tree_at(lambda m: m.weight, self.base, W)

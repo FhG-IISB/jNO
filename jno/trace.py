@@ -15,7 +15,7 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 
-from .architectures.lora_linear import LoRAWrapper, _normalize_wrappers
+from .architectures.lora import LoRAWrapper, _normalize_wrappers
 from .tuner import Arch, ArchSpace
 from .utils.adaptive import LearningRateSchedule
 from .utils.iree import IREEModel
