@@ -469,7 +469,10 @@ class TestLoRA:
 
         merged_leaves = [
             leaf
-            for leaf in jax.tree_util.tree_leaves(mlp_merged, is_leaf=lambda x: isinstance(x, eqx.Module) and hasattr(x, "weight") and hasattr(x, "in_features"))
+            for leaf in jax.tree_util.tree_leaves(
+                mlp_merged,
+                is_leaf=lambda x: isinstance(x, eqx.Module) and hasattr(x, "weight") and hasattr(x, "in_features"),
+            )
             if hasattr(leaf, "in_features") and isinstance(leaf, eqx.Module)
         ]
         assert all(isinstance(leaf, FoundaxLinear) for leaf in merged_leaves), (
