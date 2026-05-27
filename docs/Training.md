@@ -207,11 +207,26 @@ v_net.mask(mask_v).optimizer(optax.adam, lr=lrs(5e-4))
 
 ### LoRA (Low-Rank Adaptation)
 
-LoRA inserts trainable low-rank adapter matrices into each linear layer while keeping the base weights frozen. After `solve()`, adapters are merged back into the base weights.
+LoRA inserts trainable low-rank adapter matrices into matching layers while keeping base weights
+frozen. After `solve()`, adapters are merged back into the base weights.
 
 ```python
 v_net.freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-4))
 ```
+
+Pass a `target` regex to restrict which layers are wrapped, or `specs` for per-group rank/alpha:
+
+```python
+v_net.lora(rank=8, alpha=16, target="encoder")
+
+v_net.lora(specs=[
+    {"target": "encoder", "rank": 4,  "alpha": 1.0},
+    {"target": "decoder", "rank": 16, "alpha": 4.0},
+])
+```
+
+To wrap non-linear layer types (e.g. convolutions), pass a custom `LoRAWrapper` subclass via
+`wrapper`. See [Model Controls](Model-Controls.md#3-lora) for the full API and an example.
 
 > `.lora()` takes priority over `.freeze()` — the base weights are frozen by LoRA itself.
 
