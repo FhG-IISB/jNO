@@ -110,13 +110,7 @@ def _is_linear_like(x: Any) -> bool:
     Matches both jNO's and foundax's ``Linear`` classes (and any other
     module with the same interface) without requiring a shared base class.
     """
-    return (
-        isinstance(x, eqx.Module)
-        and not isinstance(x, LoRALinear)
-        and hasattr(x, "weight")
-        and hasattr(x, "in_features")
-        and hasattr(x, "out_features")
-    )
+    return isinstance(x, eqx.Module) and not isinstance(x, LoRALinear) and hasattr(x, "weight") and hasattr(x, "in_features") and hasattr(x, "out_features")
 
 
 def apply_lora(
@@ -219,7 +213,7 @@ def lora_trainable_filter(
     specs = []
     for path, leaf in flat:
         if not eqx.is_array(leaf):
-            specs.append(leaf)
+            specs.append(False)  # non-array leaves are always frozen (e.g. LoRALinear.base modules)
             continue
 
         # LoRALinear: base.* is frozen, lora_A / lora_B are trainable.
@@ -229,9 +223,9 @@ def lora_trainable_filter(
         if is_adapter:
             specs.append(True)
         elif in_base:
-            specs.append(not freeze_base)
+            specs.append(False)
         else:
             # Non-LoRA arrays in the model — follow freeze_base policy.
-            specs.append(True if not freeze_base else eqx.is_inexact_array(leaf))
+            specs.append(False)  # if not freeze_base else eqx.is_inexact_array(leaf))
 
     return jax.tree_util.tree_unflatten(treedef, specs)

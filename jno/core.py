@@ -372,9 +372,7 @@ class core:
             for name, tensor in domain.context.items():
                 if isinstance(tensor, dict) or not hasattr(tensor, "shape"):
                     continue
-                tensor_dims[name] = tensor.shape[
-                    2:
-                ]  # was 1 but I think 2 is right for the (B, T, ...) shape of context tensors
+                tensor_dims[name] = tensor.shape[2:]  # was 1 but I think 2 is right for the (B, T, ...) shape of context tensors
         return tensor_dims
 
     def _populate_missing_context_tags(self, domain) -> None:
@@ -428,9 +426,7 @@ class core:
                     )
                     continue
                 except Exception as exc:
-                    self.log.warning(
-                        f"Falling back to copied context for '{resolved_tag}': could not sample on provided domain ({exc})"
-                    )
+                    self.log.warning(f"Falling back to copied context for '{resolved_tag}': could not sample on provided domain ({exc})")
 
         for tag, value in source_context.items():
             if tag in target_context:
@@ -722,9 +718,7 @@ class core:
                         )
                 else:
                     lr_val = lr_schedules[k](base_epoch + start_epoch, individual_losses)
-                    new_state[-1].hyperparams["step_size"] = jnp.asarray(
-                        lr_val, dtype=opt_states[k][-1].hyperparams["step_size"].dtype
-                    )
+                    new_state[-1].hyperparams["step_size"] = jnp.asarray(lr_val, dtype=opt_states[k][-1].hyperparams["step_size"].dtype)
 
                 trainable = {
                     **trainable,
@@ -895,9 +889,7 @@ class core:
         tensor_dims = self.compute_tensor_dims(self.domain)
 
         # === Initialize models ===
-        self.models, self.rng = TraceCompiler.init_layer_params(
-            self.all_ops, self.domain_data.dimension, tensor_dims, self.rng, self.log
-        )
+        self.models, self.rng = TraceCompiler.init_layer_params(self.all_ops, self.domain_data.dimension, tensor_dims, self.rng, self.log)
 
         # === Apply sharding to model arrays ===
         self.models = self._shard_params(self.models)
@@ -1011,9 +1003,7 @@ class core:
         if accumulation_steps < 1:
             raise ValueError(f"accumulation_steps must be >= 1, got {accumulation_steps}")
         if accumulation_steps > 1 and batchsize >= self.domain.total_samples:
-            self.log.warning(
-                "accumulation_steps > 1 has no effect with full-batch training; falling back to accumulation_steps=1"
-            )
+            self.log.warning("accumulation_steps > 1 has no effect with full-batch training; falling back to accumulation_steps=1")
             accumulation_steps = 1
 
         # Adaptive resampling metadata
@@ -1032,9 +1022,7 @@ class core:
                 tag_to_constraint_indices.setdefault(tag, []).append(i)
 
         def _infer_total_samples(ctx: Dict[str, np.ndarray]) -> int:
-            candidates = [
-                v.shape[0] for k, v in ctx.items() if k != "__time__" and hasattr(v, "shape") and len(v.shape) >= 1
-            ]
+            candidates = [v.shape[0] for k, v in ctx.items() if k != "__time__" and hasattr(v, "shape") and len(v.shape) >= 1]
             if candidates:
                 return int(max(candidates))
             fallback = [v.shape[0] for v in ctx.values() if hasattr(v, "shape") and len(v.shape) >= 1]
@@ -1112,11 +1100,7 @@ class core:
         for lid, fm in flax_mods.items():
             needs_optimizer = (not fm._frozen) or (fm._lora_config is not None)
             if needs_optimizer and fm._opt_fn is None:
-                raise ValueError(
-                    f"Model '{fm.name or type(fm.module).__name__}' (layer {lid}) "
-                    f"has no optimizer. Call  model.optimizer(optax.adam, lr=...)  "
-                    f"before solve(), or freeze it with  model.freeze()."
-                )
+                raise ValueError(f"Model '{fm.name or type(fm.module).__name__}' (layer {lid}) " f"has no optimizer. Call  model.optimizer(optax.adam, lr=...)  " f"before solve(), or freeze it with  model.freeze().")
 
         # ── 2. Apply LoRA transforms ──
         models = dict(self.models)
@@ -1148,9 +1132,7 @@ class core:
                 from .architectures.lora_linear import LoRALinear
 
                 is_lora = lambda x: isinstance(x, LoRALinear)
-                lora_leaves = [
-                    leaf for leaf in jax.tree_util.tree_leaves(model_after, is_leaf=is_lora) if isinstance(leaf, LoRALinear)
-                ]
+                lora_leaves = [leaf for leaf in jax.tree_util.tree_leaves(model_after, is_leaf=is_lora) if isinstance(leaf, LoRALinear)]
                 n_lora_layers = len(lora_leaves)
 
                 # Group by (rank, alpha) for reporting
@@ -1161,18 +1143,10 @@ class core:
 
                 if len(rank_groups) == 1:
                     (r, a), cnt = next(iter(rank_groups.items()))
-                    self.log.info(
-                        f"LoRA applied to model {lid} (rank={r}, alpha={a}): "
-                        f"{cnt} LoRALinear layers, "
-                        f"Params: {n_params_before:,}→{n_params_after:,}"
-                    )
+                    self.log.info(f"LoRA applied to model {lid} (rank={r}, alpha={a}): " f"{cnt} LoRALinear layers, " f"Params: {n_params_before:,}→{n_params_after:,}")
                 else:
                     parts = [f"r={r}/a={a}×{cnt}" for (r, a), cnt in sorted(rank_groups.items())]
-                    self.log.info(
-                        f"LoRA applied to model {lid}: {n_lora_layers} layers "
-                        f"[{', '.join(parts)}], "
-                        f"Params: {n_params_before:,}→{n_params_after:,}"
-                    )
+                    self.log.info(f"LoRA applied to model {lid}: {n_lora_layers} layers " f"[{', '.join(parts)}], " f"Params: {n_params_before:,}→{n_params_after:,}")
 
                 if n_lora_layers == 0:
                     self.log.warning(f"LoRA: No layers were adapted for model {lid}! LoRA has NO EFFECT on this model.")
@@ -1320,10 +1294,7 @@ class core:
                 global_lr = fm._lr if fm._lr is not None else LearningRateSchedule(1e-3)
 
                 if global_opt_fn is None:
-                    raise ValueError(
-                        f"Model (layer {lid}) has parameter groups but no global optimizer. "
-                        f"Call  model.optimizer(optax.adam)  as a fallback for ungrouped params."
-                    )
+                    raise ValueError(f"Model (layer {lid}) has parameter groups but no global optimizer. " f"Call  model.optimizer(optax.adam)  as a fallback for ungrouped params.")
 
                 masked_transforms = []
                 group_scheds = []
@@ -1342,10 +1313,7 @@ class core:
 
                 # Diagnostics over group masks: per-group coverage + overlap + uncovered
                 array_flags = [x is not None for x in jax.tree_util.tree_leaves(trainable[lid])]
-                group_leaf_masks = [
-                    [bool(x) if isinstance(x, bool) else False for x in jax.tree_util.tree_leaves(gm)]
-                    for gm in group_masks_norm
-                ]
+                group_leaf_masks = [[bool(x) if isinstance(x, bool) else False for x in jax.tree_util.tree_leaves(gm)] for gm in group_masks_norm]
 
                 group_counts = []
                 for g, gmask in zip(fm._param_groups, group_leaf_masks):
@@ -1366,15 +1334,9 @@ class core:
                         uncovered_count += 1
 
                 if overlap_count > 0:
-                    self.log.warning(
-                        f"Model {lid}: parameter groups overlap on {overlap_count} array leaves. "
-                        "Update order will follow optax.chain mask order."
-                    )
+                    self.log.warning(f"Model {lid}: parameter groups overlap on {overlap_count} array leaves. " "Update order will follow optax.chain mask order.")
 
-                self.log.info(
-                    f"Model {lid}: parameter groups summary — groups={len(fm._param_groups)}, "
-                    f"overlap={overlap_count}, uncovered_by_groups={uncovered_count}"
-                )
+                self.log.info(f"Model {lid}: parameter groups summary — groups={len(fm._param_groups)}, " f"overlap={overlap_count}, uncovered_by_groups={uncovered_count}")
                 self.log.quiet(f"Parameter Group Diagnostic Report for model {lid}")
                 self.log.quiet(f"groups={len(fm._param_groups)}, overlap={overlap_count}, uncovered={uncovered_count}")
                 for tgt, cnt in group_counts:
@@ -1406,9 +1368,7 @@ class core:
 
                 per_model_opts[k] = optax.chain(*masked_transforms)
                 group_lr_schedules[k] = group_scheds
-                self.log.info(
-                    f"Model {lid}: {len(fm._param_groups)} parameter group(s) + default — using per-group optimizers"
-                )
+                self.log.info(f"Model {lid}: {len(fm._param_groups)} parameter group(s) + default — using per-group optimizers")
             else:
                 # ── Single global optimizer (original behaviour) ──
                 opt_fn = fm._opt_fn
@@ -1445,11 +1405,7 @@ class core:
             # Then place on the mesh with P() so shardings are canonical
             # and match what the step function will produce.
             opt_states[k] = jax.tree_util.tree_map(
-                lambda x: (
-                    jax.device_put(jnp.copy(x), NamedSharding(self.mesh, P()))
-                    if isinstance(x, (jnp.ndarray, jax.Array))
-                    else x
-                ),
+                lambda x: (jax.device_put(jnp.copy(x), NamedSharding(self.mesh, P())) if isinstance(x, (jnp.ndarray, jax.Array)) else x),
                 state,
             )
 
@@ -1460,9 +1416,7 @@ class core:
             try:
                 import orbax.checkpoint as _ocp
             except ImportError as exc:
-                raise ImportError(
-                    "orbax-checkpoint is required for resume_from=. Install it with:  pip install orbax-checkpoint"
-                ) from exc
+                raise ImportError("orbax-checkpoint is required for resume_from=. Install it with:  pip install orbax-checkpoint") from exc
 
             _ckpt_mgr = _ocp.CheckpointManager(
                 os.path.abspath(self._resume_from),
@@ -1507,9 +1461,7 @@ class core:
             host_context = {k: np.asarray(v) for k, v in full_context.items()}
             total_samples = _infer_total_samples(host_context)
             effective_batchsize = None  # data is already pre-sliced
-            self.log.info(
-                f"Data offloading enabled: {total_samples} total samples, streaming batches of {batchsize} from host"
-            )
+            self.log.info(f"Data offloading enabled: {total_samples} total samples, streaming batches of {batchsize} from host")
         else:
             # Replicate / shard full dataset on device (original behaviour)
             domain_data = DomainData(context=full_context, dimension=self.domain_data.dimension)
@@ -1578,11 +1530,7 @@ class core:
                 lr_schedules=lr_schedules,
                 group_lr_schedules=group_lr_schedules,
             )
-            self.log.info(
-                f"Gradient accumulation enabled: {accumulation_steps} micro-batches "
-                f"per update (effective batch = {batchsize} × {accumulation_steps} "
-                f"= {batchsize * accumulation_steps})"
-            )
+            self.log.info(f"Gradient accumulation enabled: {accumulation_steps} micro-batches " f"per update (effective batch = {batchsize} × {accumulation_steps} " f"= {batchsize * accumulation_steps})")
 
         # Optional: build JIT-compiled tracker function
         has_trackers = len(self.compiled_trackers) > 0
@@ -1780,10 +1728,7 @@ class core:
 
             n_outer = epochs // inner_steps
             if epochs % inner_steps != 0:
-                self.log.warning(
-                    f"epochs={epochs} is not divisible by inner_steps={inner_steps}; "
-                    f"running {n_outer * inner_steps} epochs instead."
-                )
+                self.log.warning(f"epochs={epochs} is not divisible by inner_steps={inner_steps}; " f"running {n_outer * inner_steps} epochs instead.")
             print_rate = max(10, n_outer // 10 if n_outer < 100_000 else n_outer // 1000)
 
             # Freeze all surviving Python objects (model params, opt states, etc.)
@@ -1861,10 +1806,7 @@ class core:
                             # Current strategies are designed for steady-state point
                             # sets represented as (B, 1, N, D). Keep T fixed at 1.
                             if not hasattr(tag_points, "ndim") or tag_points.ndim != 4 or tag_points.shape[1] != 1:
-                                self.log.warning(
-                                    f"Resampling skipped for tag '{tag}': expected point shape (B, 1, N, D), "
-                                    f"got {tuple(tag_points.shape)}"
-                                )
+                                self.log.warning(f"Resampling skipped for tag '{tag}': expected point shape (B, 1, N, D), " f"got {tuple(tag_points.shape)}")
                                 continue
 
                             points_bn = jnp.asarray(tag_points[:, 0, :, :])
@@ -1872,9 +1814,7 @@ class core:
 
                             idxs = tag_to_constraint_indices.get(tag, [])
                             if not idxs:
-                                self.log.warning(
-                                    f"Resampling skipped for tag '{tag}': no constraints associated with this tag"
-                                )
+                                self.log.warning(f"Resampling skipped for tag '{tag}': no constraints associated with this tag")
                                 continue
 
                             scored = []
@@ -1942,14 +1882,7 @@ class core:
                             if host_context is None:
                                 raise RuntimeError("offload_data=True but host_context is not available")
                             indices = rng_np.choice(total_samples, batchsize, replace=False)
-                            batch_np = {
-                                k: (
-                                    v
-                                    if k == "__time__"
-                                    else (np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices])
-                                )
-                                for k, v in host_context.items()
-                            }
+                            batch_np = {k: (v if k == "__time__" else (np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices])) for k, v in host_context.items()}
                             micro_ctx = self._shard_data(jax.device_put(batch_np))
                         else:
                             micro_ctx = on_device_context
@@ -1988,14 +1921,7 @@ class core:
                         if host_context is None:
                             raise RuntimeError("offload_data=True but host_context is not available")
                         indices = rng_np.choice(total_samples, batchsize, replace=False)
-                        batch_np = {
-                            k: (
-                                v
-                                if k == "__time__"
-                                else (np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices])
-                            )
-                            for k, v in host_context.items()
-                        }
+                        batch_np = {k: (v if k == "__time__" else (np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices])) for k, v in host_context.items()}
                         context = self._shard_data(jax.device_put(batch_np))
                     else:
                         context = on_device_context
@@ -2088,9 +2014,7 @@ class core:
                     loss_strs = " | ".join(f"C{i}: {v:>10.4e}" for i, v in enumerate(losses_np))
                     if track_stats_np is not None:
                         track_strs = " | ".join(f"T{i}: {v:>10.4e}" for i, v in enumerate(track_stats_np))
-                        self.log.info(
-                            f"Epoch {displayed_epoch:>6}/{epochs}| L:{total_np:>10.4e} | {loss_strs} | {track_strs}"
-                        )
+                        self.log.info(f"Epoch {displayed_epoch:>6}/{epochs}| L:{total_np:>10.4e} | {loss_strs} | {track_strs}")
                     else:
                         self.log.info(f"Epoch {displayed_epoch:>6}/{epochs}| L:{total_np:>10.4e} | {loss_strs}")
 
@@ -2198,9 +2122,7 @@ class core:
         try:
             import orbax.checkpoint as ocp
         except ImportError as exc:
-            raise ImportError(
-                "orbax-checkpoint is required for restore_checkpoint(). Install it with:  pip install orbax-checkpoint"
-            ) from exc
+            raise ImportError("orbax-checkpoint is required for restore_checkpoint(). Install it with:  pip install orbax-checkpoint") from exc
 
         manager = ocp.CheckpointManager(
             os.path.abspath(directory),
