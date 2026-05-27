@@ -6,8 +6,8 @@
     <a href="https://fhg-iisb.github.io/jNO/">
         <img src="https://img.shields.io/badge/docs-GitHub%20Pages-0aa?style=for-the-badge" alt="Dev Docs"/>
     </a>
-    <a href="https://github.com/FhG-IISB/jno/actions/workflows/python-package.yml">
-        <img src="https://img.shields.io/github/actions/workflow/status/FhG-IISB/jno/python-package.yml?branch=main&style=for-the-badge&label=tests" alt="Tests"/>
+    <a href="https://github.com/FhG-IISB/jno/actions/workflows/cli.yml">
+        <img src="https://img.shields.io/github/actions/workflow/status/FhG-IISB/jno/cli.yml?branch=main&style=for-the-badge&label=tests" alt="Tests"/>
     </a>
     <a href="LICENSE">
         <img src="https://img.shields.io/badge/license-EPL--2.0-2ea44f?style=for-the-badge" alt="License"/>
@@ -30,7 +30,7 @@ pip install jax-neural-operators
 ```
 
 
-Foundation models and other neural operators  are maintained in a seperate repository ([foundax](https://github.com/FhG-IISB/foundax)) so they can also be used independently (foundax is installed automatically with this repository).
+Foundation models and other neural operators  are maintained in a separate repository ([foundax](https://github.com/FhG-IISB/foundax)) so they can also be used independently (foundax is installed automatically with this repository).
 
 # Minimal DeepONet Example
 
@@ -62,7 +62,7 @@ u = net(k, jno.np.concat([x, y], axis=-1)) * x * (2 - x) * y * (1 - y)
 pde = k * (u.dd(x) + u.dd(y)) + 1.0  # PDE Loss
 
 # Checkpointing (saves every 5000 epochs, keeps best 3)
-cb = jno.callback.checkpoint(save_interval_epochs=5000, best_fn=lambda m: m["total_loss"])
+cb = jno.callbacks.checkpoint(save_interval_epochs=5000, best_fn=lambda m: m["total_loss"])
 
 # Create -> Train -> Save
 crux = jno.core(constraints=[pde.mse], domain=dom).print_shapes()
