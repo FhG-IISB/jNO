@@ -29,22 +29,8 @@ Quick install from PyPI:
 pip install jax-neural-operators
 ```
 
-If a Nvidia GPU is available install
 
-```bash
-pip instal jax[cuda]
-```
-
-For local development (recommended on Linux `aarch64` when `gmsh` wheels are unavailable on PyPI), use `micromamba`:
-
-```bash
-micromamba create -n jno python=3.12 pip -y
-micromamba activate jno
-micromamba install -n jno -c conda-forge gmsh python-gmsh -y
-pip install -e .
-```
-
-
+Foundation models and other neural operators  are maintained in a seperate repository ([foundax](https://github.com/FhG-IISB/foundax)) so they can also be used independently (foundax is installed automatically with this repository).
 
 # Minimal DeepONet Example
 
@@ -89,19 +75,5 @@ tst_dom.variable("k", jax.random.uniform(jax.random.PRNGKey(0), shape=(16, 1, 1)
 
 pred, x, y, k = crux.eval([u, x, y, k], domain=tst_dom)
 print(pred.shape, x.shape, y.shape, k.shape)
-```
-
-and then run with
-
-```bash
-CUDA_VISIBLE_DEVICES=<gpu_id> JNO_SEED=<seed> python <filename>.py
-```
-
-### Foundation Models and other neural networks
-
-These models are maintained in a seperate repository ([foundax](https://github.com/FhG-IISB/foundax)) so they can also be used independently.
-
-```bash
-pip install foundax
 ```
 
