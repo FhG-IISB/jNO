@@ -9,6 +9,7 @@ __pycache__/
 *.msgpack
 *.npy
 *.pyc
+*.txt
 
 .jax_cache/
 dist/

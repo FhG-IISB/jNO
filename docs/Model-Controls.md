@@ -40,7 +40,7 @@ Legacy shorthand constructors like `jno.numpy.nn.mlp(...)` are no longer the pri
 - `summary()`
 - `freeze()` / `unfreeze()`
 - `mask(param_mask=None)`
-- `lora(rank=4, alpha=1.0, *, specs=None)`
+- `lora(rank=4, alpha=1.0, *, target=None, wrapper=None, specs=None)`
 - `optimizer(opt_fn, *, lr=None)`
 - `lr(schedule_or_scalar)`
 - `initialize(weights_or_path_or_initializer, *, key=None)`
@@ -123,10 +123,20 @@ With `mask(...).freeze()`, selected leaves are frozen and non-selected leaves re
 
 ## 3. LoRA
 
+LoRA inserts trainable low-rank adapter matrices into matching layers while keeping base weights
+frozen. By default `LoRALinear` is used, which targets any layer with `weight`, `in_features`, and
+`out_features` attributes (jNO Linear, foundax Linear, `eqx.nn.Linear`).
+
 ### Uniform LoRA
 
 ```python
 net.lora(rank=8, alpha=16)
+```
+
+Restrict to a subset of layers with a path-regex:
+
+```python
+net.lora(rank=8, alpha=16, target="encoder")
 ```
 
 ### Per-target LoRA specs
@@ -134,13 +144,65 @@ net.lora(rank=8, alpha=16)
 ```python
 net.lora(
 	specs=[
-		{"target": "encoder", "rank": 4, "alpha": 1.0},
+		{"target": "encoder", "rank": 4,  "alpha": 1.0},
 		{"target": "decoder", "rank": 16, "alpha": 4.0},
 	]
 )
 ```
 
-`target` in LoRA `specs` is regex-matched against pytree paths of supported linear leaves.
+`target` is regex-matched against the slash-joined pytree path of each candidate leaf. The first
+matching spec wins.
+
+### Custom adapter classes
+
+Pass any `LoRAWrapper` subclass via `wrapper` to support layer types beyond linear:
+
+```python
+from jno.lora import LoRAWrapper
+import equinox as eqx
+
+class LoRAConv(LoRAWrapper):
+	adapter_fields = ("delta_w",)            # names of trainable adapter attributes
+	base: eqx.Module
+	delta_w: jax.Array
+	rank: int = eqx.field(static=True)
+	alpha: float = eqx.field(static=True)
+
+	@classmethod
+	def applies_to(cls, leaf):
+		return isinstance(leaf, eqx.nn.Conv2d) and not isinstance(leaf, LoRAWrapper)
+
+	def __init__(self, base, rank, alpha, *, key):
+		self.base, self.rank, self.alpha = base, rank, alpha
+		self.delta_w = jnp.zeros_like(base.weight)
+
+	def __call__(self, x):
+		w = self.base.weight + self.delta_w * (self.alpha / self.rank)
+		return self.base(x)   # simplified — use eqx.tree_at to swap weight
+
+	def merge(self):
+		w = self.base.weight + self.delta_w * (self.alpha / self.rank)
+		return eqx.tree_at(lambda m: m.weight, self.base, w)
+
+# Apply to all matching layers
+net.lora(rank=4, wrapper=LoRAConv)
+
+# Pass a list — tried in order, first applies_to() match wins per leaf
+net.lora(rank=4, wrapper=[LoRALinear, LoRAConv])
+```
+
+Per-target specs may carry their own `"wrapper"` key, which overrides the global default for that
+group:
+
+```python
+net.lora(
+	wrapper=LoRALinear,          # global default
+	specs=[
+		{"target": "linear", "rank": 4,  "alpha": 1.0},
+		{"target": "conv",   "rank": 8,  "alpha": 2.0, "wrapper": LoRAConv},
+	]
+)
+```
 
 ### Combine mask + LoRA for base-trainability control
 
@@ -150,6 +212,68 @@ net.mask(decoder_mask).lora(rank=8, alpha=16)
 
 # Freeze all base params; train LoRA adapters only.
 net.freeze().lora(rank=8, alpha=16)
+```
+
+### LoRA Zoo
+
+jNO ships several drop-in `LoRAWrapper` variants in `jno.lora`.  All target
+the same layer types as `LoRALinear` (`weight`, `in_features`, `out_features`) and accept the same
+`rank` and `alpha` arguments.
+
+```python
+from jno.lora import (
+    LoRALinear,    # standard LoRA (default)
+    rsLoRALinear,  # rank-stabilized
+    LoRAFALinear,  # frozen A — fewer trainable params
+    DoRALinear,    # weight-decomposed
+    PiSSALinear,   # SVD init — fastest convergence on pretrained models
+    LoRAXSLinear,  # extra-small r×r core
+    VeRALinear,    # frozen random A,B; only b,d vectors trained
+    MiLoRALinear,  # minor SVD components — preserves pretrained knowledge
+    IA3Linear,     # output scaling vector — no low-rank matrices
+    LoKrLinear,    # Kronecker product adapter
+    OFTLinear,     # block-diagonal orthogonal fine-tuning
+)
+
+net.lora(rank=4, wrapper=rsLoRALinear)
+```
+
+| Class | Trainable params | Key idea |
+|-------|-----------------|----------|
+| `LoRALinear` | `r·(in + out)` | Standard LoRA; scale = `α/r` |
+| `rsLoRALinear` | `r·(in + out)` | Scale = `α/√r` — gradient magnitude stable across ranks ([rsLoRA](https://arxiv.org/abs/2312.03732)) |
+| `LoRAFALinear` | `r·out` | A is frozen after random init; halves adapter params ([LoRAFA](https://arxiv.org/abs/2308.03303)) |
+| `DoRALinear` | `r·(in + out) + out` | Decomposes weight into magnitude + direction; trains both ([DoRA](https://arxiv.org/abs/2402.09353)) |
+| `PiSSALinear` | `r·(in + out)` | A, B initialised from top-r SVD components; base holds residual ([PiSSA](https://arxiv.org/abs/2404.02948)) |
+| `LoRAXSLinear` | `r²` | A, B from SVD and frozen; only an r×r core R is trained ([LoRA-XS](https://arxiv.org/abs/2405.17604)) |
+| `VeRALinear` | `out + r` | A, B are frozen random matrices generated from a seed (never stored as arrays); only `b`, `d` scaling vectors are trained ([VeRA](https://arxiv.org/abs/2310.11454)) |
+| `MiLoRALinear` | `r·(in + out)` | Like PiSSA but adapts minor SVD components; base retains principal directions ([MiLoRA](https://arxiv.org/abs/2405.09913)) |
+| `IA3Linear` | `out` | Learned per-output scale vector; no low-rank matrices ([IA³](https://arxiv.org/abs/2205.05638)) |
+| `LoKrLinear` | `r² + ⌈out/r⌉·⌈in/r⌉` | Kronecker product adapter; efficient when `r` ~ √(out·in) ([LoKr](https://arxiv.org/abs/2212.10650)) |
+| `OFTLinear` | `n_blocks·r²` | Block-diagonal orthogonal matrix via Cayley map; preserves hyperspherical energy ([OFT](https://arxiv.org/abs/2306.07280)) |
+
+**When to use which:**
+
+- **rsLoRALinear** — default upgrade over `LoRALinear`; use higher ranks without numerical issues.
+- **LoRAFALinear** — memory-constrained training; halves adapter parameter count.
+- **DoRALinear** — fine-tuning pretrained models where preserving weight norms matters.
+- **PiSSALinear** — fine-tuning pretrained models; adapters start at the most informative weight directions.
+- **LoRAXSLinear** — extreme parameter efficiency; useful when `r` is large relative to `in/out`.
+- **VeRALinear** — fewest trainable params of any zoo class (`out + r`); A, B consume no Python/JAX memory and are not saved in checkpoints.
+- **MiLoRALinear** — fine-tuning pretrained models where you want to preserve the principal weight directions; adapts the noise subspace instead.
+- **IA3Linear** — minimum trainable params with no rank hyperparameter; ideal for fast probing or very small memory budgets.
+- **LoKrLinear** — large layers where a Kronecker factorisation covers the weight space more efficiently than a low-rank product.
+- **OFTLinear** — when you need orthogonal weight updates to preserve geometry (e.g., text-to-image fine-tuning, ControlNet).
+
+Mix classes per layer group via per-target specs:
+
+```python
+net.lora(
+    specs=[
+        {"target": "encoder", "rank": 8,  "alpha": 16, "wrapper": PiSSALinear},
+        {"target": "decoder", "rank": 4,  "alpha": 1.0, "wrapper": rsLoRALinear},
+    ]
+)
 ```
 
 ---
