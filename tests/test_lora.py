@@ -11,7 +11,8 @@ Covers:
   - Per-class invariants: DoRA magnitude, PiSSA residual, LoRAXS R=0, rsLoRA scaling
   - Regression: "wrappers" key from Model.lora() config is honoured by apply_lora
   - Model.lora() API: config structure, wrapper=, specs=
-  - Integration: end-to-end training through jno.core
+  - Model control state combinations: mask/freeze/lora/reset chaining
+  - Integration: end-to-end training through jno.core, including complex combinations
 """
 
 import equinox as eqx
@@ -32,6 +33,7 @@ from jno.lora import (
     LoRAWrapper,
     LoRAXSLinear,
     PiSSALinear,
+    VeRALinear,
     apply_lora,
     lora_trainable_filter,
     merge_lora,
@@ -51,6 +53,7 @@ _ADAPTER_LEAVES: dict[type[LoRAWrapper], int] = {
     DoRALinear:   9,   # 3 × (magnitude, lora_A, lora_B)
     PiSSALinear:  6,
     LoRAXSLinear: 3,   # 3 × (R,)
+    VeRALinear:   6,   # 3 × (b, d)
 }
 
 ZOO = list(_ADAPTER_LEAVES.keys())
@@ -362,6 +365,63 @@ class TestLoRAFAInvariants:
         assert n_fa < n_std
 
 
+class TestVeRAInvariants:
+    def test_b_initialized_to_zero(self):
+        lin = eqx.nn.Linear(4, 8, key=KEY)
+        adapted = VeRALinear(lin, rank=2, alpha=1.0, key=KEY)
+        assert jnp.all(adapted.b == 0)
+
+    def test_d_initialized_to_ones(self):
+        lin = eqx.nn.Linear(4, 8, key=KEY)
+        adapted = VeRALinear(lin, rank=2, alpha=1.0, key=KEY)
+        assert jnp.all(adapted.d == 1)
+
+    def test_adapter_fields(self):
+        assert VeRALinear.adapter_fields == ("b", "d")
+
+    def test_no_AB_arrays_in_pytree(self):
+        """A and B must not appear as JAX arrays in the pytree."""
+        lin = eqx.nn.Linear(4, 8, key=KEY)
+        adapted = VeRALinear(lin, rank=2, alpha=1.0, key=KEY)
+        shapes = {leaf.shape for leaf in jax.tree_util.tree_leaves(eqx.filter(adapted, eqx.is_array))}
+        # A would be (rank, in_features) = (2, 4); B would be (out_features, rank) = (8, 2)
+        assert (2, 4) not in shapes, "lora_A-shaped array found in pytree — A should be XLA-only"
+        assert (8, 2) not in shapes, "lora_B-shaped array found in pytree — B should be XLA-only"
+
+    def test_fewer_trainable_params_than_lora(self):
+        """b+d total size must be less than lora_A+lora_B total size for same rank."""
+        mlp = _mlp()
+
+        def _adapter_param_size(model):
+            filt = lora_trainable_filter(model)
+            flat_arrays = jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))
+            flat_filt = jax.tree_util.tree_leaves(filt)
+            return sum(a.size for a, f in zip(flat_arrays, flat_filt) if f)
+
+        n_lora = _adapter_param_size(apply_lora(mlp, rank=4, alpha=1.0, key=KEY, wrappers=(LoRALinear,)))
+        n_vera = _adapter_param_size(apply_lora(mlp, rank=4, alpha=1.0, key=KEY, wrappers=(VeRALinear,)))
+        assert n_vera < n_lora, f"VeRA ({n_vera}) should have fewer params than LoRA ({n_lora})"
+
+    def test_same_seed_same_output(self):
+        """Two VeRALinear instances with the same seed must produce identical output."""
+        lin = eqx.nn.Linear(4, 8, key=KEY)
+        x = jax.random.normal(KEY, (4,))
+
+        v1 = VeRALinear(lin, rank=2, alpha=1.0, key=KEY)
+        v2 = VeRALinear(lin, rank=2, alpha=1.0, key=KEY)
+        # Same key → same seed → same A, B → same output given same b, d, base
+        assert v1.seed == v2.seed
+        assert jnp.allclose(v1(x), v2(x))
+
+    def test_different_keys_different_seeds(self):
+        """Different keys should (with overwhelming probability) produce different seeds."""
+        lin = eqx.nn.Linear(4, 8, key=KEY)
+        k1, k2 = jax.random.split(KEY)
+        v1 = VeRALinear(lin, rank=2, alpha=1.0, key=k1)
+        v2 = VeRALinear(lin, rank=2, alpha=1.0, key=k2)
+        assert v1.seed != v2.seed
+
+
 class TestRankClamping:
     @pytest.mark.parametrize("cls", [PiSSALinear, DoRALinear, LoRAXSLinear])
     def test_rank_clamped_to_min_dim(self, cls):
@@ -495,7 +555,7 @@ class TestLoraIntegration:
         net.freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
         assert jnp.isfinite(self._solve(net))
 
-    @pytest.mark.parametrize("cls", [rsLoRALinear, LoRAFALinear, DoRALinear, PiSSALinear, LoRAXSLinear])
+    @pytest.mark.parametrize("cls", [rsLoRALinear, LoRAFALinear, DoRALinear, PiSSALinear, LoRAXSLinear, VeRALinear])
     def test_zoo_class_trains(self, cls):
         net = nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=KEY))
         net.freeze().lora(rank=4, alpha=1.0, wrapper=cls).optimizer(optax.adam, lr=lrs(1e-3))
@@ -531,3 +591,330 @@ class TestLoraIntegration:
             optax.adam, lr=lrs(1e-3)
         )
         assert jnp.isfinite(self._solve(net))
+
+
+# ---------------------------------------------------------------------------
+# 10. Model control state combinations (structural — no jno.core required)
+# ---------------------------------------------------------------------------
+
+
+class TestModelControlStateCombinations:
+    """Verify Model._* state fields after chaining model-control methods."""
+
+    def _net(self):
+        return nn.wrap(foundax.mlp(**_MLP_KW, key=KEY))
+
+    def _all_true_mask(self):
+        m = foundax.mlp(**_MLP_KW, key=KEY)
+        return jax.tree_util.tree_map(lambda _: True, eqx.filter(m, eqx.is_array))
+
+    def test_mask_freeze_sets_trainable_mask_not_frozen_flag(self):
+        """mask(m).freeze() sets _trainable_param_mask and leaves _frozen=False."""
+        net = self._net()
+        net.mask(self._all_true_mask()).freeze()
+        assert net._frozen is False
+        assert net._trainable_param_mask is not None
+
+    def test_global_freeze_sets_frozen_flag_clears_mask(self):
+        """freeze() with no preceding mask sets _frozen=True, _trainable_param_mask=None."""
+        net = self._net()
+        net.freeze()
+        assert net._frozen is True
+        assert net._trainable_param_mask is None
+
+    def test_mask_lora_sets_both_trainable_mask_and_config(self):
+        """mask(m).lora() stores _trainable_param_mask and _lora_config simultaneously."""
+        net = self._net()
+        net.mask(self._all_true_mask()).lora(rank=4, alpha=1.0)
+        assert net._trainable_param_mask is not None
+        assert net._lora_config is not None
+
+    def test_freeze_then_lora_leaves_no_trainable_mask(self):
+        """freeze().lora() produces _frozen=True, _lora_config set, _trainable_param_mask=None.
+
+        freeze() consumes the (absent) mask scope and leaves _mask_scope_pending=False,
+        so the subsequent lora() call sees no pending mask.
+        """
+        net = self._net()
+        net.freeze().lora(rank=4, alpha=1.0)
+        assert net._frozen is True
+        assert net._lora_config is not None
+        assert net._trainable_param_mask is None
+
+    def test_mask_freeze_then_lora_mask_already_consumed(self):
+        """mask(m).freeze() followed by .lora() — mask scope consumed by freeze."""
+        net = self._net()
+        net.mask(self._all_true_mask()).freeze()   # mask scope consumed here
+        net.lora(rank=4, alpha=1.0)               # no pending mask
+        assert net._frozen is False               # mask.freeze(), not global
+        assert net._lora_config is not None
+        assert net._trainable_param_mask is None  # lora() cleared it (no pending mask)
+
+    def test_mask_scope_consumed_after_freeze(self):
+        """_mask_scope_pending is False after freeze() regardless of preceding mask()."""
+        net = self._net()
+        net.mask(self._all_true_mask())
+        assert net._mask_scope_pending is True
+        net.freeze()
+        assert net._mask_scope_pending is False
+
+    def test_reset_clears_all_controls(self):
+        """reset() zeroes every training-time control field."""
+        net = self._net()
+        net.mask(self._all_true_mask()).freeze()
+        net.lora(rank=4, alpha=1.0)
+        net.optimizer(optax.adam, lr=lrs(1e-3))
+        net.dtype(jnp.bfloat16)
+        net.reset()
+        assert net._frozen is False
+        assert net._lora_config is None
+        assert net._trainable_param_mask is None
+        assert net._opt_fn is None
+        assert net._lr is None
+        assert net._dtype is None
+
+    def test_second_lora_overrides_first(self):
+        """Calling .lora() twice replaces the earlier config."""
+        net = self._net()
+        net.lora(rank=4, alpha=1.0)
+        net.lora(rank=8, alpha=2.0)
+        assert net._lora_config[0]["rank"] == 8
+        assert net._lora_config[0]["alpha"] == 2.0
+
+    def test_unfreeze_clears_frozen_and_trainable_mask(self):
+        """unfreeze() clears both _frozen and _trainable_param_mask."""
+        net = self._net()
+        net.mask(self._all_true_mask()).freeze()
+        assert net._trainable_param_mask is not None
+        net.unfreeze()
+        assert net._frozen is False
+        assert net._trainable_param_mask is None
+
+    def test_masked_optimizer_adds_param_group(self):
+        """mask(m).optimizer(...) registers a parameter group."""
+        net = self._net()
+        net.mask(self._all_true_mask()).optimizer(optax.adam, lr=lrs(1e-3))
+        assert len(net._param_groups) >= 1
+
+    def test_global_optimizer_clears_param_groups(self):
+        """A bare (non-masked) optimizer() call discards existing param groups."""
+        net = self._net()
+        net.mask(self._all_true_mask()).optimizer(optax.adam, lr=lrs(1e-3))
+        assert len(net._param_groups) >= 1
+        net.optimizer(optax.adamw, lr=lrs(5e-4))
+        assert len(net._param_groups) == 0
+
+    def test_freeze_lora_chainable_returns_self(self):
+        """All model-control methods return self to support chaining."""
+        net = self._net()
+        result = net.freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
+        assert result is net
+
+    def test_freeze_and_lora_and_dtype_all_set(self):
+        """dtype, freeze, and lora config can coexist on the same model."""
+        net = self._net()
+        net.dtype(jnp.bfloat16).freeze().lora(rank=4, alpha=1.0)
+        assert net._dtype == jnp.bfloat16
+        assert net._frozen is True
+        assert net._lora_config is not None
+
+
+# ---------------------------------------------------------------------------
+# 11. Integration: complex model-control combinations through jno.core
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestIntegrationCombinations:
+    """End-to-end solve() calls exercising complex combinations of model controls."""
+
+    def _domain_and_x(self):
+        domain = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+        x, *_ = domain.variable("interior")
+        return domain, x
+
+    def _net(self, key=KEY):
+        return nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=key))
+
+    def _all_true_mask(self, m):
+        return jax.tree_util.tree_map(lambda _: True, eqx.filter(m, eqx.is_array))
+
+    def _solve_single(self, net):
+        domain, x = self._domain_and_x()
+        loss = (net(x) - jnn.sin(jnn.pi * x)).mse
+        stats = jno.core([loss], domain).solve(3)
+        return stats.training_logs[-1]["total_loss"][-1]
+
+    # ── lora without freeze: base + adapters both update ─────────────────────
+
+    def test_lora_without_freeze_trains(self):
+        """lora() alone keeps base params trainable; adapters and base both update."""
+        net = self._net()
+        net.lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
+        assert jnp.isfinite(self._solve_single(net))
+
+    # ── two models: frozen feature extractor + LoRA adapter ──────────────────
+
+    def test_frozen_feature_plus_lora_model(self):
+        """Frozen model contributes to the forward pass; only LoRA adapter trains."""
+        k1, k2 = jax.random.split(KEY)
+        feat = self._net(key=k1)
+        feat.freeze()
+
+        adapter = self._net(key=k2)
+        adapter.freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
+
+        domain, x = self._domain_and_x()
+        loss = (feat(x) + adapter(x) - jnn.sin(jnn.pi * x)).mse
+        stats = jno.core([loss], domain).solve(3)
+        assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
+
+    # ── two LoRA models with different wrappers in one solve ─────────────────
+
+    def test_two_lora_models_different_wrappers(self):
+        k1, k2 = jax.random.split(KEY)
+        net1 = self._net(key=k1)
+        net1.freeze().lora(rank=4, alpha=1.0, wrapper=rsLoRALinear).optimizer(
+            optax.adam, lr=lrs(1e-3)
+        )
+        net2 = self._net(key=k2)
+        net2.freeze().lora(rank=4, alpha=1.0, wrapper=LoRAFALinear).optimizer(
+            optax.adam, lr=lrs(1e-3)
+        )
+        domain, x = self._domain_and_x()
+        loss = (net1(x) + net2(x) - jnn.sin(jnn.pi * x)).mse
+        stats = jno.core([loss], domain).solve(3)
+        assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
+
+    # ── partial freeze via mask (no LoRA) ─────────────────────────────────────
+
+    def test_partial_freeze_no_lora(self):
+        """mask(m).freeze() freezes selected leaves; the remaining leaves train."""
+        m = foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=KEY)
+        net = nn.wrap(m)
+        leaves, treedef = jax.tree_util.tree_flatten(eqx.filter(m, eqx.is_array))
+        # Freeze the first half, leave the second half trainable.
+        half = len(leaves) // 2
+        partial_mask = jax.tree_util.tree_unflatten(
+            treedef, [i < half for i in range(len(leaves))]
+        )
+        net.mask(partial_mask).freeze()
+        net.optimizer(optax.adam, lr=lrs(1e-3))
+        assert jnp.isfinite(self._solve_single(net))
+
+    # ── lora(target=...) partial coverage ────────────────────────────────────
+
+    def test_lora_target_regex_partial_coverage(self):
+        """lora(target='0') adapts only the first layer; model still converges."""
+        net = self._net()
+        net.freeze().lora(rank=4, alpha=1.0, target="0").optimizer(optax.adam, lr=lrs(1e-3))
+        assert jnp.isfinite(self._solve_single(net))
+
+    # ── multi-spec: different ranks per layer group ───────────────────────────
+
+    def test_lora_multi_spec_different_ranks(self):
+        net = self._net()
+        net.freeze().lora(specs=[
+            {"target": "0",  "rank": 2, "alpha": 1.0},
+            {"target": ".*", "rank": 8, "alpha": 2.0},
+        ]).optimizer(optax.adam, lr=lrs(1e-3))
+        assert jnp.isfinite(self._solve_single(net))
+
+    # ── multi-spec: different wrappers per layer group ────────────────────────
+
+    def test_lora_multi_spec_different_wrappers(self):
+        net = self._net()
+        net.freeze().lora(specs=[
+            {"target": "0",  "rank": 4, "alpha": 1.0, "wrapper": rsLoRALinear},
+            {"target": ".*", "rank": 4, "alpha": 1.0, "wrapper": DoRALinear},
+        ]).optimizer(optax.adam, lr=lrs(1e-3))
+        assert jnp.isfinite(self._solve_single(net))
+
+    # ── mask(m).lora(): adapters train, no crash ──────────────────────────────
+
+    def test_mask_lora_no_crash_adapters_train(self):
+        """mask(m).lora() stores _trainable_param_mask but core uses lora_trainable_filter;
+        only adapter arrays train regardless of the mask — must not crash."""
+        m = foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=KEY)
+        net = nn.wrap(m)
+        leaves, treedef = jax.tree_util.tree_flatten(eqx.filter(m, eqx.is_array))
+        half_mask = jax.tree_util.tree_unflatten(
+            treedef, [i < len(leaves) // 2 for i in range(len(leaves))]
+        )
+        net.mask(half_mask).lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
+        assert jnp.isfinite(self._solve_single(net))
+
+    # ── dtype(bfloat16) + freeze + lora ─────────────────────────────────────
+
+    def test_dtype_bfloat16_with_freeze_and_lora(self):
+        net = self._net()
+        net.dtype(jnp.bfloat16).freeze().lora(rank=4, alpha=1.0).optimizer(
+            optax.adam, lr=lrs(1e-3)
+        )
+        assert jnp.isfinite(self._solve_single(net))
+
+    # ── initialize from file + freeze + lora (transfer learning) ─────────────
+
+    def test_initialize_then_freeze_lora(self, tmp_path):
+        """Canonical transfer-learning recipe: load pretrained weights, then LoRA-finetune."""
+        m = foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=KEY)
+        path = str(tmp_path / "weights.eqx")
+        eqx.tree_serialise_leaves(path, m)
+
+        net = nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=KEY))
+        net.initialize(path).freeze().lora(rank=4, alpha=1.0).optimizer(
+            optax.adam, lr=lrs(1e-3)
+        )
+        assert jnp.isfinite(self._solve_single(net))
+
+    # ── two models with separate LoRA wrappers + separate losses ─────────────
+
+    def test_two_lora_models_separate_losses(self):
+        """Two independent LoRA models with different wrappers trained jointly."""
+        k1, k2 = jax.random.split(KEY)
+        net1 = self._net(key=k1)
+        net1.freeze().lora(rank=4, alpha=1.0, wrapper=LoRALinear).optimizer(
+            optax.adam, lr=lrs(1e-3)
+        )
+        net2 = self._net(key=k2)
+        net2.freeze().lora(rank=4, alpha=1.0, wrapper=VeRALinear).optimizer(
+            optax.adamw, lr=lrs(5e-4)
+        )
+        domain, x = self._domain_and_x()
+        loss1 = (net1(x) - jnn.sin(jnn.pi * x)).mse
+        loss2 = (net2(x) - jnn.cos(jnn.pi * x)).mse
+        stats = jno.core([loss1, loss2], domain).solve(3)
+        assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
+
+    # ── reset then re-configure ───────────────────────────────────────────────
+
+    def test_reset_and_reconfigure(self):
+        """Calling reset() and then re-applying controls produces valid training."""
+        net = self._net()
+        net.freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
+        net.reset()
+        # Re-configure with a different wrapper
+        net.freeze().lora(rank=8, alpha=2.0, wrapper=rsLoRALinear).optimizer(
+            optax.adamw, lr=lrs(5e-4)
+        )
+        assert jnp.isfinite(self._solve_single(net))
+
+    # ── three models: frozen backbone, LoRA adapter, trainable head ───────────
+
+    def test_three_model_pipeline(self):
+        """Frozen backbone → LoRA adapter → trainable head: a realistic fine-tune setup."""
+        k1, k2, k3 = jax.random.split(KEY, 3)
+        backbone = self._net(key=k1)
+        backbone.freeze()
+
+        adapter = self._net(key=k2)
+        adapter.freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
+
+        head = self._net(key=k3)
+        head.optimizer(optax.adam, lr=lrs(5e-3))
+
+        domain, x = self._domain_and_x()
+        u = backbone(x) + adapter(x) + head(x)
+        loss = (u - jnn.sin(jnn.pi * x)).mse
+        stats = jno.core([loss], domain).solve(3)
+        assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
