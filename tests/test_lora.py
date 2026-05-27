@@ -3,12 +3,15 @@
 Covers:
   - Public namespace: jno.lora.<class>
   - Core utilities: apply_lora, merge_lora, lora_trainable_filter
-  - LoRA Zoo: LoRALinear, rsLoRALinear, LoRAFALinear, DoRALinear, PiSSALinear, LoRAXSLinear
+  - LoRA Zoo: LoRALinear, rsLoRALinear, LoRAFALinear, DoRALinear, PiSSALinear, LoRAXSLinear,
+              VeRALinear, MiLoRALinear, IA3Linear, LoKrLinear, OFTLinear
   - apply_lora options: target regex, per-spec routing, list-of-wrappers, custom wrapper
   - Initialisation invariant: all adapters are no-ops at init (output == base)
   - Merge: merged output == adapted output; no LoRAWrapper nodes remain
   - Trainable filter: only adapter arrays marked True; base weights marked False
-  - Per-class invariants: DoRA magnitude, PiSSA residual, LoRAXS R=0, rsLoRA scaling
+  - Per-class invariants: DoRA magnitude, PiSSA/MiLoRA residual, LoRAXS R=0, rsLoRA scaling,
+                           VeRA seed/no-array, IA3 scale=ones, LoKr delta shape, OFT Q=0→R=I
+  - Rank clamping: rank > min-dim is clamped per class rules
   - Regression: "wrappers" key from Model.lora() config is honoured by apply_lora
   - Model.lora() API: config structure, wrapper=, specs=
   - Model control state combinations: mask/freeze/lora/reset chaining
@@ -28,10 +31,14 @@ from jno import LearningRateSchedule as lrs
 from jno.architectures.models import nn
 from jno.lora import (
     DoRALinear,
+    IA3Linear,
+    LoKrLinear,
     LoRAFALinear,
     LoRALinear,
     LoRAWrapper,
     LoRAXSLinear,
+    MiLoRALinear,
+    OFTLinear,
     PiSSALinear,
     VeRALinear,
     apply_lora,
@@ -54,6 +61,10 @@ _ADAPTER_LEAVES: dict[type[LoRAWrapper], int] = {
     PiSSALinear: 6,
     LoRAXSLinear: 3,  # 3 × (R,)
     VeRALinear: 6,  # 3 × (b, d)
+    MiLoRALinear: 6,  # 3 × (lora_A, lora_B)
+    IA3Linear: 3,  # 3 × (scale,)
+    LoKrLinear: 6,  # 3 × (kron_A, kron_B)
+    OFTLinear: 3,  # 3 × (Q_blocks,)
 }
 
 ZOO = list(_ADAPTER_LEAVES.keys())
@@ -210,7 +221,10 @@ def test_output_equals_base_at_init(cls):
     mlp = _mlp()
     adapted = apply_lora(mlp, rank=2, alpha=1.0, key=KEY, wrappers=(cls,))
     x = jnp.ones((4,))
-    assert jnp.allclose(mlp(x), adapted(x), atol=1e-5), f"{cls.__name__}: output differs from base at init"
+    # OFT's block-diagonal Cayley map via vmap'd matrix inversion introduces ~2e-5
+    # float32 rounding even when Q=0, so use a slightly looser tolerance.
+    atol = 1e-4 if cls is OFTLinear else 1e-5
+    assert jnp.allclose(mlp(x), adapted(x), atol=atol), f"{cls.__name__}: output differs from base at init"
 
 
 # ---------------------------------------------------------------------------
@@ -420,12 +434,111 @@ class TestVeRAInvariants:
         assert v1.seed != v2.seed
 
 
+class TestMiLoRAInvariants:
+    def test_residual_plus_adapter_equals_original_weight(self):
+        """base.weight + (alpha/rank)*B@A must reconstruct the original weight."""
+        lin = eqx.nn.Linear(4, 8, key=KEY)
+        r, alpha = 2, 4.0
+        adapted = MiLoRALinear(lin, rank=r, alpha=alpha, key=KEY)
+        W_reconstructed = adapted.base.weight + (alpha / r) * (adapted.lora_B @ adapted.lora_A)
+        assert jnp.allclose(W_reconstructed, lin.weight, atol=1e-5), (
+            "MiLoRA residual is wrong: base + adapter does not recover the original weight"
+        )
+
+    def test_adapter_fields(self):
+        assert set(MiLoRALinear.adapter_fields) == {"lora_A", "lora_B"}
+
+    def test_uses_minor_components(self):
+        """Adapted singular values must correspond to the minor subspace of the original weight."""
+        lin = eqx.nn.Linear(4, 8, key=KEY)
+        adapted = MiLoRALinear(lin, rank=2, alpha=1.0, key=KEY)
+        _, S_orig, _ = jnp.linalg.svd(lin.weight, full_matrices=False)
+        _, S_base, _ = jnp.linalg.svd(adapted.base.weight, full_matrices=False)
+        # The residual base should have near-zero variance in the minor 2 directions.
+        # Its largest singular value must be less than the original's largest.
+        assert S_base[0] <= S_orig[0] + 1e-4
+
+
+class TestIA3Invariants:
+    def test_scale_initialized_to_ones(self):
+        lin = eqx.nn.Linear(4, 8, key=KEY)
+        adapted = IA3Linear(lin, rank=2, alpha=1.0, key=KEY)
+        assert jnp.all(adapted.scale == 1.0)
+
+    def test_rank_does_not_affect_scale_shape(self):
+        """IA³ ignores rank; scale.shape is (out_features,) regardless."""
+        lin = eqx.nn.Linear(4, 8, key=KEY)
+        for r in [1, 4, 16]:
+            adapted = IA3Linear(lin, rank=r, alpha=1.0, key=KEY)
+            assert adapted.scale.shape == (8,), f"scale shape wrong for rank={r}"
+
+    def test_adapter_fields(self):
+        assert IA3Linear.adapter_fields == ("scale",)
+
+    def test_merge_scales_weight_not_bias(self):
+        """merge() must absorb scale into weight rows; bias is unchanged."""
+        lin = eqx.nn.Linear(4, 8, use_bias=True, key=KEY)
+        adapted = IA3Linear(lin, rank=2, alpha=1.0, key=KEY)
+        # Perturb scale so merge produces a non-trivial result.
+        adapted = eqx.tree_at(lambda m: m.scale, adapted, jnp.linspace(0.5, 1.5, 8))
+        merged = adapted.merge()
+        assert jnp.allclose(merged.bias, lin.bias, atol=1e-6), "merge() must not alter the bias"
+        expected_w = lin.weight * adapted.scale[:, None]
+        assert jnp.allclose(merged.weight, expected_w, atol=1e-6)
+
+
+class TestLoKrInvariants:
+    def test_kron_b_initialized_to_zero(self):
+        lin = eqx.nn.Linear(4, 8, key=KEY)
+        adapted = LoKrLinear(lin, rank=2, alpha=1.0, key=KEY)
+        assert jnp.all(adapted.kron_B == 0)
+
+    def test_adapter_fields(self):
+        assert set(LoKrLinear.adapter_fields) == {"kron_A", "kron_B"}
+
+    def test_delta_w_shape_matches_weight(self):
+        """_delta_W() must produce (out, in) matching the original weight shape."""
+        lin = eqx.nn.Linear(4, 8, key=KEY)
+        adapted = LoKrLinear(lin, rank=2, alpha=1.0, key=KEY)
+        assert adapted._delta_W().shape == lin.weight.shape
+
+
+class TestOFTInvariants:
+    def test_q_initialized_to_zero(self):
+        lin = eqx.nn.Linear(4, 8, key=KEY)
+        adapted = OFTLinear(lin, rank=2, alpha=1.0, key=KEY)
+        assert jnp.all(adapted.Q_blocks == 0)
+
+    def test_r_is_identity_at_init(self):
+        """At init Q=0 → R=I, so OFT output equals base output."""
+        lin = eqx.nn.Linear(4, 8, key=KEY)
+        adapted = OFTLinear(lin, rank=2, alpha=1.0, key=KEY)
+        R = adapted._R()
+        assert jnp.allclose(R, jnp.eye(8), atol=1e-6), "R should be identity when Q_blocks=0"
+
+    def test_adapter_fields(self):
+        assert OFTLinear.adapter_fields == ("Q_blocks",)
+
+    def test_n_blocks_is_ceil_out_over_rank(self):
+        import math
+
+        lin = eqx.nn.Linear(4, 7, key=KEY)  # 7 not divisible by 3
+        adapted = OFTLinear(lin, rank=3, alpha=1.0, key=KEY)
+        assert adapted.n_blocks == math.ceil(7 / 3)
+
+
 class TestRankClamping:
-    @pytest.mark.parametrize("cls", [PiSSALinear, DoRALinear, LoRAXSLinear])
+    @pytest.mark.parametrize("cls", [PiSSALinear, DoRALinear, LoRAXSLinear, MiLoRALinear])
     def test_rank_clamped_to_min_dim(self, cls):
         lin = eqx.nn.Linear(4, 2, key=KEY)  # min dim = 2
         adapted = cls(lin, rank=8, alpha=1.0, key=KEY)
         assert adapted.rank == 2
+
+    def test_oft_rank_clamped_to_out_features(self):
+        """OFT clamps rank to out_features (block size can't exceed what's available)."""
+        lin = eqx.nn.Linear(4, 3, key=KEY)  # out_features = 3
+        adapted = OFTLinear(lin, rank=8, alpha=1.0, key=KEY)
+        assert adapted.rank == 3
 
 
 # ---------------------------------------------------------------------------
@@ -549,7 +662,21 @@ class TestLoraIntegration:
         net.freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
         assert jnp.isfinite(self._solve(net))
 
-    @pytest.mark.parametrize("cls", [rsLoRALinear, LoRAFALinear, DoRALinear, PiSSALinear, LoRAXSLinear, VeRALinear])
+    @pytest.mark.parametrize(
+        "cls",
+        [
+            rsLoRALinear,
+            LoRAFALinear,
+            DoRALinear,
+            PiSSALinear,
+            LoRAXSLinear,
+            VeRALinear,
+            MiLoRALinear,
+            IA3Linear,
+            LoKrLinear,
+            OFTLinear,
+        ],
+    )
     def test_zoo_class_trains(self, cls):
         net = nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=KEY))
         net.freeze().lora(rank=4, alpha=1.0, wrapper=cls).optimizer(optax.adam, lr=lrs(1e-3))

@@ -229,6 +229,10 @@ from jno.lora import (
     PiSSALinear,   # SVD init — fastest convergence on pretrained models
     LoRAXSLinear,  # extra-small r×r core
     VeRALinear,    # frozen random A,B; only b,d vectors trained
+    MiLoRALinear,  # minor SVD components — preserves pretrained knowledge
+    IA3Linear,     # output scaling vector — no low-rank matrices
+    LoKrLinear,    # Kronecker product adapter
+    OFTLinear,     # block-diagonal orthogonal fine-tuning
 )
 
 net.lora(rank=4, wrapper=rsLoRALinear)
@@ -243,6 +247,10 @@ net.lora(rank=4, wrapper=rsLoRALinear)
 | `PiSSALinear` | `r·(in + out)` | A, B initialised from top-r SVD components; base holds residual ([PiSSA](https://arxiv.org/abs/2404.02948)) |
 | `LoRAXSLinear` | `r²` | A, B from SVD and frozen; only an r×r core R is trained ([LoRA-XS](https://arxiv.org/abs/2405.17604)) |
 | `VeRALinear` | `out + r` | A, B are frozen random matrices generated from a seed (never stored as arrays); only `b`, `d` scaling vectors are trained ([VeRA](https://arxiv.org/abs/2310.11454)) |
+| `MiLoRALinear` | `r·(in + out)` | Like PiSSA but adapts minor SVD components; base retains principal directions ([MiLoRA](https://arxiv.org/abs/2405.09913)) |
+| `IA3Linear` | `out` | Learned per-output scale vector; no low-rank matrices ([IA³](https://arxiv.org/abs/2205.05638)) |
+| `LoKrLinear` | `r² + ⌈out/r⌉·⌈in/r⌉` | Kronecker product adapter; efficient when `r` ~ √(out·in) ([LoKr](https://arxiv.org/abs/2212.10650)) |
+| `OFTLinear` | `n_blocks·r²` | Block-diagonal orthogonal matrix via Cayley map; preserves hyperspherical energy ([OFT](https://arxiv.org/abs/2306.07280)) |
 
 **When to use which:**
 
@@ -252,6 +260,10 @@ net.lora(rank=4, wrapper=rsLoRALinear)
 - **PiSSALinear** — fine-tuning pretrained models; adapters start at the most informative weight directions.
 - **LoRAXSLinear** — extreme parameter efficiency; useful when `r` is large relative to `in/out`.
 - **VeRALinear** — fewest trainable params of any zoo class (`out + r`); A, B consume no Python/JAX memory and are not saved in checkpoints.
+- **MiLoRALinear** — fine-tuning pretrained models where you want to preserve the principal weight directions; adapts the noise subspace instead.
+- **IA3Linear** — minimum trainable params with no rank hyperparameter; ideal for fast probing or very small memory budgets.
+- **LoKrLinear** — large layers where a Kronecker factorisation covers the weight space more efficiently than a low-rank product.
+- **OFTLinear** — when you need orthogonal weight updates to preserve geometry (e.g., text-to-image fine-tuning, ControlNet).
 
 Mix classes per layer group via per-target specs:
 
