@@ -403,6 +403,79 @@ class TestLoRA:
         assert net._frozen is True
         assert net._lora_config is not None
 
+    def test_apply_lora_foundax_mlp_creates_adapters(self):
+        """apply_lora must replace foundax.Linear layers — not silently no-op.
+
+        Regression: apply_lora used isinstance(x, jno.Linear) so foundax models
+        (which use foundax.architectures.linear.Linear) got zero adapters.
+        """
+        from jno.architectures.lora_linear import LoRALinear, apply_lora
+
+        key = jax.random.PRNGKey(0)
+        mlp = foundax.mlp(in_features=4, output_dim=1, hidden_dims=32, num_layers=3, key=key)
+        mlp_lora = apply_lora(mlp, rank=4, alpha=1.0, key=key)
+
+        lora_leaves = [
+            leaf
+            for leaf in jax.tree_util.tree_leaves(mlp_lora, is_leaf=lambda x: isinstance(x, LoRALinear))
+            if isinstance(leaf, LoRALinear)
+        ]
+        assert len(lora_leaves) > 0, "apply_lora produced zero LoRALinear layers for foundax.mlp"
+
+    def test_apply_lora_eqx_linear_creates_adapters(self):
+        """apply_lora must recognise eqx.nn.Linear (used by poseidon/ScOT).
+
+        Regression: eqx.nn.Linear is a different class from jno.Linear so the
+        old isinstance check missed it entirely.
+        """
+        from jno.architectures.lora_linear import LoRALinear, apply_lora
+
+        key = jax.random.PRNGKey(0)
+        poseidon = _make_poseidon()
+        poseidon_lora = apply_lora(poseidon, rank=4, alpha=1.0, key=key)
+
+        lora_leaves = [
+            leaf
+            for leaf in jax.tree_util.tree_leaves(poseidon_lora, is_leaf=lambda x: isinstance(x, LoRALinear))
+            if isinstance(leaf, LoRALinear)
+        ]
+        assert len(lora_leaves) > 0, "apply_lora produced zero LoRALinear layers for poseidon/eqx.nn.Linear"
+
+    def test_lora_output_equals_base_at_init(self):
+        """LoRA-wrapped model is identical to base at init (lora_B is zeros)."""
+        from jno.architectures.lora_linear import apply_lora
+
+        key = jax.random.PRNGKey(0)
+        mlp = foundax.mlp(in_features=4, output_dim=1, hidden_dims=32, num_layers=2, key=key)
+        mlp_lora = apply_lora(mlp, rank=4, alpha=1.0, key=key)
+
+        x = jnp.ones((4,))
+        assert jnp.allclose(mlp(x), mlp_lora(x)), "LoRA output at init must match base (lora_B=0)"
+
+    def test_merge_lora_preserves_original_class(self):
+        """merge_lora must return the original linear class, not always jno.Linear.
+
+        Regression: merge_lora used Linear.__new__(Linear) hardcoded to jno.Linear,
+        which would break for foundax.Linear or eqx.nn.Linear bases.
+        """
+        from foundax.architectures.linear import Linear as FoundaxLinear
+
+        from jno.architectures.lora_linear import apply_lora, merge_lora
+
+        key = jax.random.PRNGKey(0)
+        mlp = foundax.mlp(in_features=4, output_dim=1, hidden_dims=16, num_layers=2, key=key)
+        mlp_lora = apply_lora(mlp, rank=4, alpha=1.0, key=key)
+        mlp_merged = merge_lora(mlp_lora)
+
+        merged_leaves = [
+            leaf
+            for leaf in jax.tree_util.tree_leaves(mlp_merged, is_leaf=lambda x: isinstance(x, eqx.Module) and hasattr(x, "weight") and hasattr(x, "in_features"))
+            if hasattr(leaf, "in_features") and isinstance(leaf, eqx.Module)
+        ]
+        assert all(isinstance(leaf, FoundaxLinear) for leaf in merged_leaves), (
+            "merge_lora must reconstruct the original foundax.Linear, not jno.Linear"
+        )
+
 
 # =====================================================================
 # 6. Serialisation round-trip
@@ -482,7 +555,7 @@ class TestJNOPipeline:
         assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
 
     def test_mlp_lora_solves(self):
-        """MLP with LoRA enabled trains (foundax.mlp uses jno Linear)."""
+        """MLP with LoRA enabled trains end-to-end through jno.core."""
         domain = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.1))
         x, *_ = domain.variable("interior")
 
