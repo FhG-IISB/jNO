@@ -23,14 +23,16 @@ import re
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Tuple
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
-import equinox as eqx
 
 from .trace import (
+    Assembly,
     BinaryOp,
-    collect_tags,
+    Choice,
     FunctionCall,
+    GroupedAssembly,
     Hessian,
     Jacobian,
     Model,
@@ -40,10 +42,8 @@ from .trace import (
     Placeholder,
     TunableModule,
     TunableModuleCall,
-    Choice,
     Variable,
-    Assembly,
-    GroupedAssembly,
+    collect_tags,
 )
 
 
@@ -165,7 +165,6 @@ def _grouped_vmap(
         mask = _np.array(batch_domain_map) == d_idx
         indices = _np.where(mask)[0]
         group_indices[d_idx] = indices
-        Bg = len(indices)
 
         # Subset context arrays for this group
         grp_ctx = []
@@ -204,7 +203,6 @@ def _grouped_vmap(
     # Recombine in original batch order
     # Build a permutation: for each original batch index, find which
     # group it's in and what position within that group.
-    order = _np.empty(B, dtype=_np.int64)
     group_offsets = {}
     offset = 0
     for d_idx in unique_domains:
@@ -354,7 +352,9 @@ class TraceCompiler:
     def _infer_arg_shapes(call_args: List, tensor_dims: Dict[str, tuple], existing_params: Dict) -> List[tuple]:
         """Infer the *normalised* argument shapes for a ModelCall."""
         TraceEvaluator = _get_evaluator_class()
-        abstract_ctx = {tag: jax.ShapeDtypeStruct(tuple(shape), _default_float_dtype()) for tag, shape in tensor_dims.items()}
+        abstract_ctx = {
+            tag: jax.ShapeDtypeStruct(tuple(shape), _default_float_dtype()) for tag, shape in tensor_dims.items()
+        }
 
         def eval_and_normalize(context):
             evaluator = TraceEvaluator(existing_params)
@@ -393,7 +393,7 @@ class TraceCompiler:
             normalized = tuple(normalize_arg(v, s) for v, s in zip(arg_values, arg_sources))
 
             # Keep shape inference consistent with TraceEvaluator._eval_flax_module_call.
-            model = None
+            _model = None
             # In this function you only have call_args, not the model object.
             # So either pass model into _infer_arg_shapes later, or leave this alone
             # if this function is no longer used for Equinox-foundax initialization.
@@ -476,24 +476,34 @@ class TraceCompiler:
                             if pretrained[key].shape == new[key].shape:
                                 result[key] = pretrained[key]
                                 stats["matched"] += count_params(pretrained[key])
-                                details.append(f"  MATCHED  {current_path}  " f"shape={pretrained[key].shape}  " f"params={count_params(pretrained[key]):,}")
+                                details.append(
+                                    f"  MATCHED  {current_path}  "
+                                    f"shape={pretrained[key].shape}  "
+                                    f"params={count_params(pretrained[key]):,}"
+                                )
                             else:
                                 result[key] = new[key]
                                 n = count_params(new[key])
                                 stats["replaced"] += n
-                                details.append(f"  MISMATCH {current_path}  " f"{pretrained[key].shape} -> {new[key].shape}  " f"params={n:,}  (reinitialized)")
+                                details.append(
+                                    f"  MISMATCH {current_path}  "
+                                    f"{pretrained[key].shape} -> {new[key].shape}  "
+                                    f"params={n:,}  (reinitialized)"
+                                )
                     elif key in pretrained:
                         result[key] = pretrained[key]
                         if not isinstance(pretrained[key], dict):
                             n = count_params(pretrained[key])
                             stats["matched"] += n
-                            details.append(f"  MATCHED  {current_path}  " f"shape={pretrained[key].shape}  " f"params={n:,}  (pretrained only)")
+                            details.append(
+                                f"  MATCHED  {current_path}  shape={pretrained[key].shape}  params={n:,}  (pretrained only)"
+                            )
                     else:
                         result[key] = new[key]
                         if not isinstance(new[key], dict):
                             n = count_params(new[key])
                             stats["replaced"] += n
-                            details.append(f"  NEW      {current_path}  " f"shape={new[key].shape}  " f"params={n:,}  (new only)")
+                            details.append(f"  NEW      {current_path}  shape={new[key].shape}  params={n:,}  (new only)")
 
                 return result
             else:
@@ -513,7 +523,11 @@ class TraceCompiler:
         n_mismatch = sum(1 for d in details if "MISMATCH" in d)
         n_new = sum(1 for d in details if "NEW" in d)
 
-        summary = f"Pretrained weights: {stats['matched']:,}/{total:,} params matched " f"({pct:.4f}%), {stats['replaced']:,} reinitialized " f"({n_mismatch} shape mismatches, {n_new} new)"
+        summary = (
+            f"Pretrained weights: {stats['matched']:,}/{total:,} params matched "
+            f"({pct:.4f}%), {stats['replaced']:,} reinitialized "
+            f"({n_mismatch} shape mismatches, {n_new} new)"
+        )
         logger.info(summary)
 
         # Write detailed per-parameter report to a text file next to log.txt
@@ -597,7 +611,11 @@ class TraceCompiler:
 
         total = stats["matched"] + stats["skipped"]
         pct = 100 * stats["matched"] / total if total else 0.0
-        logger.info(f"Equinox checkpoint: {stats['matched']:,}/{total:,} params matched " f"({pct:.4f}%), {stats['skipped']:,} kept fresh init " f"({stats['skipped_leaves']} mismatched leaves)")
+        logger.info(
+            f"Equinox checkpoint: {stats['matched']:,}/{total:,} params matched "
+            f"({pct:.4f}%), {stats['skipped']:,} kept fresh init "
+            f"({stats['skipped_leaves']} mismatched leaves)"
+        )
 
         # Report unused arrays in the checkpoint file.
         file_arrays, file_params = TraceCompiler._count_checkpoint_arrays(weight_path)
@@ -606,9 +624,14 @@ class TraceCompiler:
             unused_arrays = file_arrays - used_leaves
             unused_params = file_params - total
             if unused_arrays > 0:
-                logger.warning(f"Checkpoint file contains {file_arrays} arrays " f"({file_params:,} params) but model only consumed " f"{used_leaves} arrays — {unused_arrays} arrays " f"({unused_params:,} params) unused")
+                logger.warning(
+                    f"Checkpoint file contains {file_arrays} arrays "
+                    f"({file_params:,} params) but model only consumed "
+                    f"{used_leaves} arrays — {unused_arrays} arrays "
+                    f"({unused_params:,} params) unused"
+                )
             else:
-                logger.info(f"Checkpoint file: {file_arrays} arrays " f"({file_params:,} params total), all consumed by model")
+                logger.info(f"Checkpoint file: {file_arrays} arrays ({file_params:,} params total), all consumed by model")
 
         return loaded_model
 
@@ -639,7 +662,9 @@ class TraceCompiler:
         try:
             import orbax.checkpoint as ocp
         except ImportError as exc:
-            raise ImportError("orbax-checkpoint is required to load Orbax checkpoints. Install it with: pip install orbax-checkpoint") from exc
+            raise ImportError(
+                "orbax-checkpoint is required to load Orbax checkpoints. Install it with: pip install orbax-checkpoint"
+            ) from exc
 
         manager = ocp.CheckpointManager(
             os.path.abspath(path),
@@ -746,7 +771,9 @@ class TraceCompiler:
         try:
             import orbax.checkpoint as ocp
         except ImportError as exc:
-            raise ImportError("orbax-checkpoint is required to load Orbax checkpoints. Install it with: pip install orbax-checkpoint") from exc
+            raise ImportError(
+                "orbax-checkpoint is required to load Orbax checkpoints. Install it with: pip install orbax-checkpoint"
+            ) from exc
 
         step_dir, selected_key = TraceCompiler._resolve_orbax_step_dir(weight_path)
         available_keys = TraceCompiler._discover_orbax_trainable_keys(step_dir)
@@ -754,17 +781,24 @@ class TraceCompiler:
         if selected_key is None:
             if len(available_keys) != 1:
                 available_str = ", ".join(available_keys)
-                raise ValueError("Orbax checkpoint contains multiple trainable models " f"({available_str}). Pass '<checkpoint_path>::<model_key>' to select one.")
+                raise ValueError(
+                    "Orbax checkpoint contains multiple trainable models "
+                    f"({available_str}). Pass '<checkpoint_path>::<model_key>' to select one."
+                )
             selected_key = available_keys[0]
         elif selected_key not in available_keys:
             available_str = ", ".join(available_keys)
-            raise ValueError(f"Orbax checkpoint model key '{selected_key}' not found. " f"Available keys: {available_str}")
+            raise ValueError(f"Orbax checkpoint model key '{selected_key}' not found. Available keys: {available_str}")
 
         metadata_tree = ocp.PyTreeCheckpointHandler().metadata(step_dir / "state").tree["trainable"][selected_key]
         matching_paths, stats = TraceCompiler._build_orbax_restore_plan(metadata_tree, model)
 
         restore_template = jax.tree_util.tree_map_with_path(
-            lambda keypath, leaf: leaf if eqx.is_array(leaf) and TraceCompiler._normalize_keypath(keypath) in matching_paths else ocp.PLACEHOLDER,
+            lambda keypath, leaf: (
+                leaf
+                if eqx.is_array(leaf) and TraceCompiler._normalize_keypath(keypath) in matching_paths
+                else ocp.PLACEHOLDER
+            ),
             model,
             is_leaf=lambda leaf: leaf is None,
         )
@@ -792,7 +826,11 @@ class TraceCompiler:
         total = stats["matched"] + stats["skipped"]
         pct = 100 * stats["matched"] / total if total else 0.0
         skipped_leaf_label = "leaf" if stats["skipped_leaves"] == 1 else "leaves"
-        logger.info(f"Orbax checkpoint: {stats['matched']:,}/{total:,} params matched " f"({pct:.4f}%), {stats['skipped']:,} kept fresh init " f"({stats['skipped_leaves']} model {skipped_leaf_label})")
+        logger.info(
+            f"Orbax checkpoint: {stats['matched']:,}/{total:,} params matched "
+            f"({pct:.4f}%), {stats['skipped']:,} kept fresh init "
+            f"({stats['skipped_leaves']} model {skipped_leaf_label})"
+        )
         if stats["unused_arrays"] > 0:
             logger.warning(
                 f"Checkpoint file contains {stats['checkpoint_arrays']} arrays "
@@ -808,9 +846,14 @@ class TraceCompiler:
                 f"{skipped_leaf_label} ({stats['skipped']:,} params)"
             )
         else:
-            logger.info(f"Checkpoint file: {stats['checkpoint_arrays']} arrays " f"({stats['checkpoint_params']:,} params total), all consumed by model")
+            logger.info(
+                f"Checkpoint file: {stats['checkpoint_arrays']} arrays "
+                f"({stats['checkpoint_params']:,} params total), all consumed by model"
+            )
         return jax.tree_util.tree_map(
-            lambda restored_leaf, fresh_leaf: fresh_leaf if restored_leaf is ocp.PLACEHOLDER or restored_leaf is None else restored_leaf,
+            lambda restored_leaf, fresh_leaf: (
+                fresh_leaf if restored_leaf is ocp.PLACEHOLDER or restored_leaf is None else restored_leaf
+            ),
             restored["trainable"][selected_key],
             model,
             is_leaf=lambda leaf: leaf is ocp.PLACEHOLDER or leaf is None,
@@ -831,7 +874,11 @@ class TraceCompiler:
 
         # ---- Equinox path (all models) ------------------------------
         if not isinstance(module, eqx.Module):
-            raise TypeError(f"Expected an eqx.Module, got {type(module).__name__}. " f"Flax modules are no longer supported at runtime. " f"Use the Equinox version of your model.")
+            raise TypeError(
+                f"Expected an eqx.Module, got {type(module).__name__}. "
+                f"Flax modules are no longer supported at runtime. "
+                f"Use the Equinox version of your model."
+            )
 
         model = module
 
@@ -872,7 +919,7 @@ class TraceCompiler:
 
         if layer.show:
             leaves = jax.tree_util.tree_leaves(eqx.filter(model, eqx.is_array))
-            total = sum(l.size for l in leaves)
+            total = sum(leaf.size for leaf in leaves)
             logger.info(f"  {type(model).__name__}: {total:,} parameters")
 
         return model
@@ -882,7 +929,13 @@ class TraceCompiler:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def init_layer_params(all_ops: List, domain_dim: int, tensor_dims: Dict[str, Tuple], rng: jax.Array, logger) -> Tuple[Dict, jax.Array]:
+    def init_layer_params(
+        all_ops: List,
+        domain_dim: int,
+        tensor_dims: Dict[str, Tuple],
+        rng: jax.Array,
+        logger,
+    ) -> Tuple[Dict, jax.Array]:
         """Collect / initialise models for all layers.
 
         For equinox modules (the only supported path), the model was
@@ -930,7 +983,19 @@ class TraceCompiler:
         TraceEvaluator = _get_evaluator_class()
         TIME_TAG = "__time__"
         expr_tags = collect_tags(expr)
-        METADATA_TAGS = {"JxW", "flat_cells", "global_areas", "N_flat", "dN_dx_flat", "dirichlet_nodes", "cells", "quad_points", "boundary_nodes", "surface_data", "v_grads_JxW_flat"}
+        METADATA_TAGS = {
+            "JxW",
+            "flat_cells",
+            "global_areas",
+            "N_flat",
+            "dN_dx_flat",
+            "dirichlet_nodes",
+            "cells",
+            "quad_points",
+            "boundary_nodes",
+            "surface_data",
+            "v_grads_JxW_flat",
+        }
 
         def evaluate_single_point_set(params, context_single, key):
             """Evaluate for a single (N, D) context — no batch or time."""
@@ -991,7 +1056,7 @@ class TraceCompiler:
             # ----- mini-batch subset selection ------------------------
             if batchsize is not None:
                 if key is None:
-                    raise ValueError("A JAX random key must be provided when " "batchsize is specified.")
+                    raise ValueError("A JAX random key must be provided when batchsize is specified.")
                 if batchsize > B:
                     indices = jax.random.choice(key, B, shape=(batchsize,), replace=True)
                     indices = jnp.sort(indices)
@@ -1016,7 +1081,6 @@ class TraceCompiler:
             # __time__ is (T, 1) and must NOT be vmapped — pass via
             # closure instead.
             time_arr = None  # will be set if __time__ is present
-            time_idx_in_order = None
             passive_ctx = {}
             spatial_tag_order = []
             spatial_ctx = []
@@ -1170,7 +1234,12 @@ class TraceCompiler:
 
             if batch_domain_map is not None:
                 if len(batch_domain_map) != B:
-                    raise ValueError("Mini-batching (batchsize) is not supported with " "finite-difference derivatives on stacked domains. " "Use batchsize=None (full-batch) or switch to " "scheme='automatic_differentiation'.")
+                    raise ValueError(
+                        "Mini-batching (batchsize) is not supported with "
+                        "finite-difference derivatives on stacked domains. "
+                        "Use batchsize=None (full-batch) or switch to "
+                        "scheme='automatic_differentiation'."
+                    )
                 return _grouped_vmap(
                     scan_over_time,
                     spatial_ctx,
@@ -1217,7 +1286,19 @@ class TraceCompiler:
         """
         TraceEvaluator = _get_evaluator_class()
         TIME_TAG = "__time__"
-        METADATA_TAGS = {"JxW", "flat_cells", "global_areas", "N_flat", "dN_dx_flat", "dirichlet_nodes", "cells", "quad_points", "boundary_nodes", "surface_data", "v_grads_JxW_flat"}
+        METADATA_TAGS = {
+            "JxW",
+            "flat_cells",
+            "global_areas",
+            "N_flat",
+            "dN_dx_flat",
+            "dirichlet_nodes",
+            "cells",
+            "quad_points",
+            "boundary_nodes",
+            "surface_data",
+            "v_grads_JxW_flat",
+        }
 
         def evaluate_single_point_set(params, context_single, key):
             """Evaluate ALL expressions on one (N, D) context — shared evaluator."""
@@ -1417,7 +1498,12 @@ class TraceCompiler:
 
             if batch_domain_map is not None:
                 if len(batch_domain_map) != B:
-                    raise ValueError("Mini-batching (batchsize) is not supported with " "finite-difference derivatives on stacked domains. " "Use batchsize=None (full-batch) or switch to " "scheme='automatic_differentiation'.")
+                    raise ValueError(
+                        "Mini-batching (batchsize) is not supported with "
+                        "finite-difference derivatives on stacked domains. "
+                        "Use batchsize=None (full-batch) or switch to "
+                        "scheme='automatic_differentiation'."
+                    )
                 return _grouped_vmap(
                     scan_over_time,
                     spatial_ctx,

@@ -25,12 +25,11 @@ Showcases
 - VPINN on 3D geometry
 """
 
-import numpy as np
-
+import foundax
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
-import foundax
 
 import jno
 from jno import LearningRateSchedule as lrs
@@ -48,6 +47,7 @@ QUAD_DEGREE = 2
 # ---------------------------------------------------------------------
 # Complex 3D F-shaped geometry
 # ---------------------------------------------------------------------
+
 
 def letter_F_3d(depth=1.0, mesh_size=0.55):
     """
@@ -75,15 +75,9 @@ def letter_F_3d(depth=1.0, mesh_size=0.55):
             (0.0, 2.00),
         ]
 
-        pts = [
-            geo.add_point([x, y, 0.0], mesh_size=mesh_size)
-            for (x, y) in outline_xy
-        ]
+        pts = [geo.add_point([x, y, 0.0], mesh_size=mesh_size) for (x, y) in outline_xy]
 
-        lines = [
-            geo.add_line(pts[i], pts[(i + 1) % len(pts)])
-            for i in range(len(pts))
-        ]
+        lines = [geo.add_line(pts[i], pts[(i + 1) % len(pts)]) for i in range(len(pts))]
 
         loop = geo.add_curve_loop(lines)
         bottom_surface = geo.add_plane_surface(loop)
@@ -122,6 +116,8 @@ def letter_F_3d(depth=1.0, mesh_size=0.55):
         return geo, 3, mesh_size
 
     return construct
+
+
 # ---------------------------------------------------------------------
 # Manufactured solution
 # ---------------------------------------------------------------------
@@ -134,6 +130,7 @@ def exact_u_jax(x, y, z):
     del x, y
     return z + alpha * jnp.sin(jnp.pi * z)
 
+
 def source_f(x, y, z):
     """
     Source for:
@@ -145,10 +142,8 @@ def source_f(x, y, z):
         u = z + alpha sin(pi z)
     """
     del x, y
-    return (
-        alpha * (jno.np.pi**2) * jno.np.sin(jno.np.pi * z)
-        + sigma * (z + alpha * jno.np.sin(jno.np.pi * z))
-    )
+    return alpha * (jno.np.pi**2) * jno.np.sin(jno.np.pi * z) + sigma * (z + alpha * jno.np.sin(jno.np.pi * z))
+
 
 def flux_top(x, y, z):
     """
@@ -161,12 +156,14 @@ def flux_top(x, y, z):
     del y, z
     return 0.0 * x + (1.0 - alpha * jno.np.pi)
 
+
 def flux_wall(x, y, z):
     """
     Wall flux is zero because exact solution depends only on z.
     """
     del y, z
     return 0.0 * x
+
 
 def to_dense(A):
     if hasattr(A, "todense"):
@@ -180,8 +177,12 @@ def to_dense(A):
 # Domain and weak form
 # ---------------------------------------------------------------------
 
+
 def make_domain(mesh_size=MESH_SIZE):
-    domain = jno.domain( constructor=letter_F_3d(depth=1.0, mesh_size=mesh_size), compute_mesh_connectivity=True,  )
+    domain = jno.domain(
+        constructor=letter_F_3d(depth=1.0, mesh_size=mesh_size),
+        compute_mesh_connectivity=True,
+    )
 
     domain.init_fem(
         element_type="TET4",
@@ -190,9 +191,11 @@ def make_domain(mesh_size=MESH_SIZE):
             domain.dirichlet("bottom", 0.0),
             domain.neumann(["top", "wall"]),
         ],
-        fem_solver=True,)
+        fem_solver=True,
+    )
 
     return domain
+
 
 def build_weak_form(domain):
     """
@@ -288,12 +291,15 @@ weak_vpinn, xg, yg, zg = build_weak_form(vpinn_domain)
 
 x_int, y_int, z_int, _ = vpinn_domain.variable("interior", split=True)
 
-net = jno.nn.wrap(foundax.mlp(
+net = jno.nn.wrap(
+    foundax.mlp(
         3,
         hidden_dims=32,
         num_layers=4,
         activation=jax.nn.tanh,
-        key=jax.random.PRNGKey(0),))
+        key=jax.random.PRNGKey(0),
+    )
+)
 
 
 def apply_hard_bottom_bc(raw, x, y, z):
@@ -313,7 +319,14 @@ pde = weak_vpinn.assemble(vpinn_domain, u_net=u_gauss, target="vpinn")
 
 crux = jno.core(constraints=[pde.mse], domain=vpinn_domain)
 
-net.optimizer(optax.adam,lr=lrs.warmup_cosine(500,5,1e-3,1e-5,  ),
+net.optimizer(
+    optax.adam,
+    lr=lrs.warmup_cosine(
+        500,
+        5,
+        1e-3,
+        1e-5,
+    ),
 )
 
 crux.solve(epochs=200)

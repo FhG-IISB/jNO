@@ -1,10 +1,12 @@
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Sequence, Tuple, Union, Callable, Literal, Optional
+
 import copy
 import inspect
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
+
 import jax
 import optax
 
@@ -99,7 +101,13 @@ class ArchSpace:
     """
 
     # Reserved names for training hyperparameters
-    TRAINING_PARAMS = {"epochs", "optimizer", "learning_rate", "constraint_weights", "weight_schedule"}
+    TRAINING_PARAMS = {
+        "epochs",
+        "optimizer",
+        "learning_rate",
+        "constraint_weights",
+        "weight_schedule",
+    }
 
     def __init__(self) -> None:
         self._groups: List[Union[UniqueGroup, FloatGroup, IntGroup]] = []
@@ -151,7 +159,6 @@ class ArchSpace:
 
     def grid_size(self) -> int:
         """Calculate the total number of grid combinations."""
-        import math
 
         total = 1
         for g in self._groups:
@@ -179,7 +186,14 @@ class ArchSpace:
         self._name_to_group[name] = group
         return self
 
-    def float_range(self, name: str, low: float, high: float, log_scale: bool = False, category: str = "training") -> "ArchSpace":
+    def float_range(
+        self,
+        name: str,
+        low: float,
+        high: float,
+        log_scale: bool = False,
+        category: str = "training",
+    ) -> "ArchSpace":
         """Add a continuous float parameter.
 
         Args:
@@ -257,7 +271,11 @@ class ArchSpace:
 
         return ng.p.Instrumentation(**params)
 
-    def decode(self, candidate_value: Tuple[Tuple[Any, ...], Dict[str, Any]], categories: List[str] = None) -> Arch:
+    def decode(
+        self,
+        candidate_value: Tuple[Tuple[Any, ...], Dict[str, Any]],
+        categories: List[str] = None,
+    ) -> Arch:
         """Decode a Nevergrad candidate into a frozen Arch.
 
         Args:
@@ -332,7 +350,11 @@ class DeviceConfig:
     num_workers: int
 
     @classmethod
-    def auto_detect(cls, device_type: Optional[Literal["gpu", "cpu", "tpu"]] = None, max_workers: Optional[int] = None) -> "DeviceConfig":
+    def auto_detect(
+        cls,
+        device_type: Optional[Literal["gpu", "cpu", "tpu"]] = None,
+        max_workers: Optional[int] = None,
+    ) -> "DeviceConfig":
         """Auto-detect available devices.
 
         Args:
@@ -487,18 +509,34 @@ class Tuner:
 
         # Run the sweep
         if num_workers == 1:
-            tuning_history, best_loss, best_config = self._sweep_sequential(ng_optim, space, budget, tunable, choice_nodes, has_arch_tuning, device_config.devices[0])
+            tuning_history, best_loss, best_config = self._sweep_sequential(
+                ng_optim,
+                space,
+                budget,
+                tunable,
+                choice_nodes,
+                has_arch_tuning,
+                device_config.devices[0],
+            )
         else:
-            tuning_history, best_loss, best_config = self._sweep_parallel(ng_optim, space, budget, tunable, choice_nodes, has_arch_tuning, device_config)
+            tuning_history, best_loss, best_config = self._sweep_parallel(
+                ng_optim,
+                space,
+                budget,
+                tunable,
+                choice_nodes,
+                has_arch_tuning,
+                device_config,
+            )
 
         # Get final recommendation
         rec = ng_optim.provide_recommendation()
         final_config = space.decode(rec.value)
 
-        self.core.log.info(f"\n=== Tuning complete ===")
+        self.core.log.info("\n=== Tuning complete ===")
         self.core.log.info(f"Best configuration: {final_config}")
         self.core.log.info(f"Best tuning loss: {best_loss:.6e}")
-        self.core.log.info(f"Running final training...")
+        self.core.log.info("Running final training...")
 
         # Run final training with best config
         stats = self._run_final_training(final_config, space, tunable, choice_nodes, has_arch_tuning, tuning_history)
@@ -516,7 +554,6 @@ class Tuner:
         num_workers: int,
     ):
         """Exhaustive grid search over all parameter combinations."""
-        import itertools
 
         # Generate all combinations from the space
         grid = space.grid()
@@ -533,7 +570,7 @@ class Tuner:
         if num_workers == 1:
             # Sequential grid search
             for i, config in enumerate(grid):
-                self.core.log.info(f"[{i+1}/{total_configs}] {config}")
+                self.core.log.info(f"[{i + 1}/{total_configs}] {config}")
 
                 try:
                     loss = self._evaluate_config(None, config, space, tunable, choices, has_arch_tuning)
@@ -548,16 +585,25 @@ class Tuner:
 
                 except Exception as e:
                     self.core.log.warning(f"  -> Failed: {e}")
-                    tuning_history.append({"iteration": i + 1, "config": config, "loss": float("inf"), "error": str(e)})
+                    tuning_history.append(
+                        {
+                            "iteration": i + 1,
+                            "config": config,
+                            "loss": float("inf"),
+                            "error": str(e),
+                        }
+                    )
         else:
             # Parallel grid search
-            tuning_history, best_loss, best_config = self._sweep_grid_parallel(grid, space, tunable, choices, has_arch_tuning, device_config)
+            tuning_history, best_loss, best_config = self._sweep_grid_parallel(
+                grid, space, tunable, choices, has_arch_tuning, device_config
+            )
 
-        self.core.log.info(f"\n=== Grid search complete ===")
+        self.core.log.info("\n=== Grid search complete ===")
         self.core.log.info(f"Evaluated: {total_configs} configurations")
         self.core.log.info(f"Best configuration: {best_config}")
         self.core.log.info(f"Best loss: {best_loss:.6e}")
-        self.core.log.info(f"Running final training...")
+        self.core.log.info("Running final training...")
 
         # Run final training with best config
         stats = self._run_final_training(best_config, space, tunable, choices, has_arch_tuning, tuning_history)
@@ -592,8 +638,6 @@ class Tuner:
                     loss = self._evaluate_config(solver_copy, config, space, tunable, choices, has_arch_tuning)
                 return config, iteration, loss, None
             except Exception as e:
-                import traceback
-
                 return config, iteration, float("inf"), str(e)
 
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
@@ -609,7 +653,7 @@ class Tuner:
                     device = devices[device_idx]
 
                     with log_lock:
-                        self.core.log.info(f"[{i+1}/{total_configs}] Starting: {config}")
+                        self.core.log.info(f"[{i + 1}/{total_configs}] Starting: {config}")
 
                     future = executor.submit(evaluate_on_device, config, i + 1, device)
                     pending_futures[future] = device_idx
@@ -625,7 +669,14 @@ class Tuner:
                     config, iter_num, loss, error = future.result()
 
                     with results_lock:
-                        tuning_history.append({"iteration": iter_num, "config": config, "loss": loss, **({"error": error} if error else {})})
+                        tuning_history.append(
+                            {
+                                "iteration": iter_num,
+                                "config": config,
+                                "loss": loss,
+                                **({"error": error} if error else {}),
+                            }
+                        )
 
                         if loss < best_loss:
                             best_loss = loss
@@ -646,7 +697,7 @@ class Tuner:
                         device = devices[device_idx]
 
                         with log_lock:
-                            self.core.log.info(f"[{i+1}/{total_configs}] Starting: {config}")
+                            self.core.log.info(f"[{i + 1}/{total_configs}] Starting: {config}")
 
                         future = executor.submit(evaluate_on_device, config, i + 1, device)
                         pending_futures[future] = device_idx
@@ -668,7 +719,7 @@ class Tuner:
             candidate = ng_optim.ask()
             config = space.decode(candidate.value)
 
-            self.core.log.info(f"[{i+1}/{budget}] Trying: {config}")
+            self.core.log.info(f"[{i + 1}/{budget}] Trying: {config}")
 
             with jax.default_device(device):
                 final_loss = self._evaluate_config(None, config, space, tunable, choices, has_arch_tuning)
@@ -719,7 +770,6 @@ class Tuner:
             # Track pending futures and their device assignments
             pending_futures = {}
             available_devices = list(range(num_workers))
-            device_assignments = {}  # future -> device_index
 
             iteration = 0
 
@@ -731,7 +781,7 @@ class Tuner:
                 device = devices[device_idx]
 
                 with log_lock:
-                    self.core.log.info(f"[{iteration+1}/{budget}] Starting on {device}: {config}")
+                    self.core.log.info(f"[{iteration + 1}/{budget}] Starting on {device}: {config}")
 
                 future = executor.submit(evaluate_on_device, candidate, config, iteration + 1, device)
                 pending_futures[future] = device_idx
@@ -769,7 +819,7 @@ class Tuner:
                         completed_count[0] += 1
 
                     with log_lock:
-                        self.core.log.info(f"[{iter_num}/{budget}] Completed: Loss={loss:.6e} " f"(best: {best_loss:.6e})")
+                        self.core.log.info(f"[{iter_num}/{budget}] Completed: Loss={loss:.6e} (best: {best_loss:.6e})")
 
                     # Submit new trial if budget remains
                     if iteration < budget and available_devices:
@@ -779,7 +829,7 @@ class Tuner:
                         device = devices[device_idx]
 
                         with log_lock:
-                            self.core.log.info(f"[{iteration+1}/{budget}] Starting on {device}: {config}")
+                            self.core.log.info(f"[{iteration + 1}/{budget}] Starting on {device}: {config}")
 
                         future = executor.submit(evaluate_on_device, candidate, config, iteration + 1, device)
                         pending_futures[future] = device_idx
@@ -818,14 +868,24 @@ class Tuner:
         trial_epochs = config.get("epochs", 2000)
         trial_optimizer = config.get("optimizer", optax.adam)
         trial_lr = config.get("learning_rate", LearningRateSchedule(1e-3))
-        trial_weights = config.get("constraint_weights", config.get("weight_schedule", WeightSchedule([1.0 for _ in range(len(self.core.constraints))])))
+        trial_weights = config.get(
+            "constraint_weights",
+            config.get(
+                "weight_schedule",
+                WeightSchedule([1.0 for _ in range(len(self.core.constraints))]),
+            ),
+        )
         trial_batchsize = config.get("batchsize", None)
 
         # Set architecture if tunable module exists
         if tunable is not None and has_arch_tuning:
             from .trace import Model
 
-            arch_config = Arch(choices=tuple((name, config(name)) for name in [g.name for g in space.get_architecture_groups()] if config.has(name)))
+            arch_config = Arch(
+                choices=tuple(
+                    (name, config(name)) for name in [g.name for g in space.get_architecture_groups()] if config.has(name)
+                )
+            )
             module_instance = tunable.instantiate(arch_config, key=jax.random.PRNGKey(0))
             tunable._current_instance = Model(module_instance)
             tunable._current_instance.layer_id = tunable.layer_id
@@ -909,7 +969,9 @@ class Tuner:
             for opt_name, candidates in opts.items():
                 param_name = f"{model_key}__{opt_name}"
                 combined_space.unique(param_name, candidates, category="training")
-            self.core.log.info(f"Per-model tuning for '{model_key}': " f"{', '.join(f'{k}({len(v)} options)' for k, v in opts.items())}")
+            self.core.log.info(
+                f"Per-model tuning for '{model_key}': {', '.join(f'{k}({len(v)} options)' for k, v in opts.items())}"
+            )
 
         return combined_space
 
@@ -978,7 +1040,13 @@ class Tuner:
         if tunable is not None and has_arch_tuning:
             from .trace import Model
 
-            arch_config = Arch(choices=tuple((name, final_config(name)) for name in [g.name for g in space.get_architecture_groups()] if final_config.has(name)))
+            arch_config = Arch(
+                choices=tuple(
+                    (name, final_config(name))
+                    for name in [g.name for g in space.get_architecture_groups()]
+                    if final_config.has(name)
+                )
+            )
             final_module = tunable.instantiate(arch_config, key=jax.random.PRNGKey(0))
             tunable._current_instance = Model(final_module)
             tunable._current_instance.layer_id = tunable.layer_id

@@ -21,11 +21,11 @@ Both fields enforce the homogeneous Dirichlet boundary conditions through the
 same hard-constraint ansatz.
 """
 
-import jax
-import jno
-
 import foundax
+import jax
 import optax
+
+import jno
 from jno import LearningRateSchedule as lrs
 
 π = jno.np.pi

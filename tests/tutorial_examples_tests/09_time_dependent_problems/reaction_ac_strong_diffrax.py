@@ -24,11 +24,11 @@ The problem is intentionally reaction-only, not reaction-diffusion.
 
 import os
 import time
-import numpy as np
 
+import diffrax
 import jax
 import jax.numpy as jnp
-import diffrax
+import numpy as np
 
 import jno
 
@@ -249,9 +249,11 @@ if not np.isfinite(rhs_max_abs_err):
     raise RuntimeError("Non-finite RHS error encountered.")
 
 if rhs_max_abs_err > 1.0e-10:
-    raise RuntimeError(f"RHS mismatch too large: {rhs_max_abs_err:.3e}. " "Check strong-form lowering/sign convention.")
+    raise RuntimeError(f"RHS mismatch too large: {rhs_max_abs_err:.3e}. Check strong-form lowering/sign convention.")
 
 if max_abs_err > 1.0e-8:
-    raise RuntimeError(f"Solution mismatch too large: {max_abs_err:.3e}. " "Check strong-form lowering or Diffrax solve settings.")
+    raise RuntimeError(
+        f"Solution mismatch too large: {max_abs_err:.3e}. Check strong-form lowering or Diffrax solve settings."
+    )
 
 print("\nPASS: strong-form Diffrax lowering matches the hand-written reference.")

@@ -21,12 +21,10 @@ Showcases
 - FEAX-backed linear FEM system A u = b
 """
 
+import jax.numpy as jnp
 import numpy as np
 
-import jax.numpy as jnp
-
 import jno
-
 
 # ---------------------------------------------------------------------
 # Manufactured solution
@@ -87,9 +85,7 @@ u_fem = jnp.linalg.solve(A_dense, b_dense).reshape(-1)
 # Diagnostics
 # ---------------------------------------------------------------------
 
-lin_res = jnp.linalg.norm(A_dense @ u_fem - b_dense) / (
-    jnp.linalg.norm(b_dense) + 1e-14
-)
+lin_res = jnp.linalg.norm(A_dense @ u_fem - b_dense) / (jnp.linalg.norm(b_dense) + 1e-14)
 
 coords = np.asarray(domain.mesh.points)[:, :2]
 x = jnp.asarray(coords[:, 0:1])

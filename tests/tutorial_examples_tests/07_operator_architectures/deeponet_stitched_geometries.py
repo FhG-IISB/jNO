@@ -9,12 +9,12 @@ with u = f + bias(x,y).
 
 from __future__ import annotations
 
-import jax
-import jno
-
 import foundax
+import jax
 import numpy as np
 import optax
+
+import jno
 
 KEY = jax.random.PRNGKey(0)
 SEED = 0
@@ -115,19 +115,21 @@ def main():
     f_vals = _f[:, 0]  # (B, N, 1)
     u_vals = _u[:, 0]  # (B, N, 1)
 
-    model = jno.nn.wrap(foundax.deeponet(
-        branch_type="mlp",
-        trunk_type="mlp",
-        combination_type="dot",
-        n_sensors=n_points,
-        sensor_channels=1,
-        coord_dim=2,
-        n_outputs=1,
-        basis_functions=64,
-        hidden_dim=128,
-        n_layers=4,
-        key=KEY,
-    ))
+    model = jno.nn.wrap(
+        foundax.deeponet(
+            branch_type="mlp",
+            trunk_type="mlp",
+            combination_type="dot",
+            n_sensors=n_points,
+            sensor_channels=1,
+            coord_dim=2,
+            n_outputs=1,
+            basis_functions=64,
+            hidden_dim=128,
+            n_layers=4,
+            key=KEY,
+        )
+    )
 
     # Evaluate DeepONet per-sample because coordinates differ per geometry
     u_pred = jax.vmap(lambda f_i, y_i: model(f_i, y_i), in_axes=(0, 0))(f_vals, coords)

@@ -3,17 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 
-import numpy as np
 import jax.numpy as jnp
 
 from ...trace import (
     FemResidualOperator,
 )
-
 from .feax_utils import (
+    _build_feax_problem,
     _default_float_dtype,
     _normalize_dirichlet_value,
-    _build_feax_problem,
 )
 
 # --------------------------------

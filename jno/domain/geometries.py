@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import numpy as np
 import meshio
+import numpy as np
 
 # Ordinal labels used for boundary segment naming.
 _ORDINALS = [
@@ -59,7 +59,6 @@ def _order_from_top_right(vertices):
 
 
 class Geometries:
-
     @staticmethod
     def line(x_range=(0, 1), mesh_size=0.1):
         """Create a 1D line domain."""
@@ -295,7 +294,11 @@ class Geometries:
                 cell_sets=cell_sets,
             )
 
-            return mesh, 2, min((x_range[1] - x_range[0]) / nx, (y_range[1] - y_range[0]) / ny)
+            return (
+                mesh,
+                2,
+                min((x_range[1] - x_range[0]) / nx, (y_range[1] - y_range[0]) / ny),
+            )
 
         return constructor
 
@@ -513,12 +516,31 @@ class Geometries:
             surface_left = geo.add_plane_surface(loop_left)
 
             # Create surface loop and volume
-            surface_loop = geo.add_surface_loop([surface_bottom, surface_top, surface_front, surface_right, surface_back, surface_left])
+            surface_loop = geo.add_surface_loop(
+                [
+                    surface_bottom,
+                    surface_top,
+                    surface_front,
+                    surface_right,
+                    surface_back,
+                    surface_left,
+                ]
+            )
             volume = geo.add_volume(surface_loop)
 
             # Add physical groups
             geo.add_physical(volume, "interior")
-            geo.add_physical([surface_bottom, surface_top, surface_front, surface_right, surface_back, surface_left], "boundary")
+            geo.add_physical(
+                [
+                    surface_bottom,
+                    surface_top,
+                    surface_front,
+                    surface_right,
+                    surface_back,
+                    surface_left,
+                ],
+                "boundary",
+            )
             geo.add_physical([surface_bottom], "bottom")
             geo.add_physical([surface_top], "top")
             geo.add_physical([surface_front], "front")
@@ -537,7 +559,13 @@ class Geometries:
         def constructor(geo):
             angles = np.linspace(0, 2 * np.pi, num_points, endpoint=False)
             cx, cy = center
-            points = [geo.add_point([cx + radius * np.cos(a), cy + radius * np.sin(a)], mesh_size=mesh_size) for a in angles]
+            points = [
+                geo.add_point(
+                    [cx + radius * np.cos(a), cy + radius * np.sin(a)],
+                    mesh_size=mesh_size,
+                )
+                for a in angles
+            ]
 
             lines = []
             for i in range(num_points):
@@ -625,7 +653,10 @@ class Geometries:
             inner_points = [
                 geo.add_point([hole_offset, hole_offset], mesh_size=mesh_size),
                 geo.add_point([hole_offset + hole_size, hole_offset], mesh_size=mesh_size),
-                geo.add_point([hole_offset + hole_size, hole_offset + hole_size], mesh_size=mesh_size),
+                geo.add_point(
+                    [hole_offset + hole_size, hole_offset + hole_size],
+                    mesh_size=mesh_size,
+                ),
                 geo.add_point([hole_offset, hole_offset + hole_size], mesh_size=mesh_size),
             ]
 

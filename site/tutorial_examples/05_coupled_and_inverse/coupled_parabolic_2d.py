@@ -13,12 +13,13 @@ Analytical solution
     v(x, y, t) = exp(-t) sin(2 pi x) sin(pi y)
 """
 
-import jax
-import jno
+from pathlib import Path
 
 import foundax
+import jax
 import optax
-from pathlib import Path
+
+import jno
 
 pi = jno.np.pi
 T_end = 1.0
@@ -58,7 +59,17 @@ v_net = jno.nn.wrap(
     )
 )
 for net in [u_net, v_net]:
-    net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(init_value=0, peak_value=1e-3, warmup_steps=40, decay_steps=40000 - 40, end_value=1e-5)))
+    net.optimizer(
+        optax.adam(
+            optax.warmup_cosine_decay_schedule(
+                init_value=0,
+                peak_value=1e-3,
+                warmup_steps=40,
+                decay_steps=40000 - 40,
+                end_value=1e-5,
+            )
+        )
+    )
 
 xy = jno.np.concat([x, y])
 xy0 = jno.np.concat([x0, y0])
@@ -82,7 +93,9 @@ rel_l2_v = float(jax.numpy.linalg.norm(_v - _v_exact) / (jax.numpy.linalg.norm(_
 # Write result to tracking file
 results_file = Path(__file__).parent.parent.parent / "tutorial_results.txt"
 with open(results_file, "a") as f:
-    f.write(f"05_coupled_and_inverse/coupled_parabolic_2d.py | epochs=40000 | rel_L2_u={rel_l2_u:.6e} | rel_L2_v={rel_l2_v:.6e}\n")
+    f.write(
+        f"05_coupled_and_inverse/coupled_parabolic_2d.py | epochs=40000 | rel_L2_u={rel_l2_u:.6e} | rel_L2_v={rel_l2_v:.6e}\n"
+    )
 
 assert rel_l2_u < 1e-1, f"u relative L2 error too large: {rel_l2_u:.3e}"
 assert rel_l2_v < 1e-1, f"v relative L2 error too large: {rel_l2_v:.3e}"

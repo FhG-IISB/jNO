@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Callable, Any, Union, cast
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
 
 import cloudpickle
 import jax
@@ -9,10 +9,14 @@ import jax.numpy as jnp
 import meshio
 import numpy as np
 
-from ..trace import Variable, TensorTag, Literal, BinaryOp, FunctionCall, Jacobian, TestFunction, TrialFunction, Constant, FemLinearSystem, Assembly
+from ..trace import (
+    TensorTag,
+    TestFunction,
+    TrialFunction,
+    Variable,
+)
 from ..utils.logger import get_logger
 from .boundary_region import BoundaryRegion
-from .domain_data import DomainData
 from .geometries import Geometries
 from .meshio_mixin import MeshIOMixin
 
@@ -516,7 +520,9 @@ class domain(MeshIOMixin):
         # Resampling support
         self._mesh_points: Dict[str, np.ndarray] = {}  # Full mesh points for resampling
         self._mesh_pool_groups: Dict[str, List[Tuple[int, Any]]] = {}  # Per-tag sampling groups as (batch_count, points)
-        self._normal_pool_groups: Dict[str, List[Tuple[int, np.ndarray]]] = {}  # Per-tag normal groups as (batch_count, normals)
+        self._normal_pool_groups: Dict[
+            str, List[Tuple[int, np.ndarray]]
+        ] = {}  # Per-tag normal groups as (batch_count, normals)
         self._resampling_strategies: Dict[str, Any] = {}  # Tag -> ResamplingStrategy
         self._sub_domains: List[Dict[str, Any]] = []  # metadata from merged sub-domains
         self._batch_domain_map: Optional[np.ndarray] = None  # maps batch index → sub-domain index
@@ -712,10 +718,22 @@ class domain(MeshIOMixin):
         same spatial mesh).  ``context`` entries are concatenated along the
         batch axis (axis 0).  ``"__time__"`` is shared and not stacked.
         """
-        self_groups = {tag: [(count, points) for count, points, _ in self._sampling_groups_for_tag(tag)] for tag in self._mesh_pool.keys()}
-        other_groups = {tag: [(count, points) for count, points, _ in other._sampling_groups_for_tag(tag)] for tag in other._mesh_pool.keys()}
-        self_normal_groups = {tag: [(count, normals) for count, _, normals in self._sampling_groups_for_tag(tag) if normals is not None] for tag in self._mesh_pool.keys()}
-        other_normal_groups = {tag: [(count, normals) for count, _, normals in other._sampling_groups_for_tag(tag) if normals is not None] for tag in other._mesh_pool.keys()}
+        self_groups = {
+            tag: [(count, points) for count, points, _ in self._sampling_groups_for_tag(tag)]
+            for tag in self._mesh_pool.keys()
+        }
+        other_groups = {
+            tag: [(count, points) for count, points, _ in other._sampling_groups_for_tag(tag)]
+            for tag in other._mesh_pool.keys()
+        }
+        self_normal_groups = {
+            tag: [(count, normals) for count, _, normals in self._sampling_groups_for_tag(tag) if normals is not None]
+            for tag in self._mesh_pool.keys()
+        }
+        other_normal_groups = {
+            tag: [(count, normals) for count, _, normals in other._sampling_groups_for_tag(tag) if normals is not None]
+            for tag in other._mesh_pool.keys()
+        }
 
         for tag, points in other._mesh_pool.items():
             if tag not in self._mesh_pool:
@@ -827,7 +845,9 @@ class domain(MeshIOMixin):
         try:
             from ..utils.solver.fem_route import dirichlet as _dirichlet_bc
         except ImportError as e:
-            raise ImportError("FEM support is not available. Install the FEM/dev extras to use " "domain.dirichlet(...) and init_fem(...).") from e
+            raise ImportError(
+                "FEM support is not available. Install the FEM/dev extras to use domain.dirichlet(...) and init_fem(...)."
+            ) from e
         return _dirichlet_bc(tags, values)
 
     def neumann(self, tags):
@@ -847,7 +867,9 @@ class domain(MeshIOMixin):
         try:
             from ..utils.solver.fem_route import neumann as _neumann_bc
         except ImportError as e:
-            raise ImportError("FEM support is not available. Install the FEM/dev extras to use " "domain.neumann(...) and init_fem(...).") from e
+            raise ImportError(
+                "FEM support is not available. Install the FEM/dev extras to use domain.neumann(...) and init_fem(...)."
+            ) from e
         return _neumann_bc(tags)
 
     def _build_dirichlet_bc_info(self, dirichlet_tags, dirichlet_value_fns=None, vec: int = 1):
@@ -906,7 +928,7 @@ class domain(MeshIOMixin):
             # Case 3: list/tuple of callables, one per component
             if isinstance(spec, (list, tuple)):
                 if len(spec) != vec:
-                    raise ValueError(f"Dirichlet BC for tag '{tag}' has {len(spec)} component functions, " f"but vec={vec}.")
+                    raise ValueError(f"Dirichlet BC for tag '{tag}' has {len(spec)} component functions, but vec={vec}.")
                 for c, fn in enumerate(spec):
                     if not callable(fn):
                         raise TypeError(f"Dirichlet BC entry for tag '{tag}', component {c} is not callable.")
@@ -1049,21 +1071,28 @@ class domain(MeshIOMixin):
             raise ValueError("Mesh must be loaded before initializing FEM context.")
 
         if getattr(self, "_sub_domains", []):
-            raise ValueError("init_fem() is not supported on stacked domains (combined " "via +). Call init_fem() on individual domains before " "combining, or use a single domain for FEM/weak-form problems.")
+            raise ValueError(
+                "init_fem() is not supported on stacked domains (combined "
+                "via +). Call init_fem() on individual domains before "
+                "combining, or use a single domain for FEM/weak-form problems."
+            )
         self._variational_initialized = True
         self._variational_sampling_registry = {}
 
-        import jax
+        import feax as fe
         import jax.numpy as jnp
         import numpy as onp
-        import feax as fe
-        from feax.DCboundary import DirichletBCConfig, DirichletBCSpec
+        from feax.DCboundary import DirichletBCConfig
         from scipy.spatial import KDTree
+
         from ..utils.solver.fem_route import expand_bcs
 
         if bcs is not None:
             if dirichlet_tags or neumann_tags or dirichlet_value_fns is not None:
-                raise ValueError("Use either 'bcs=[...]' or the legacy " "'dirichlet_tags/neumann_tags/dirichlet_value_fns' arguments, not both.")
+                raise ValueError(
+                    "Use either 'bcs=[...]' or the legacy "
+                    "'dirichlet_tags/neumann_tags/dirichlet_value_fns' arguments, not both."
+                )
             dirichlet_tags, dirichlet_value_fns, neumann_tags = expand_bcs(bcs, vec=vec)
 
         meshio_type_map = {
@@ -1188,7 +1217,10 @@ class domain(MeshIOMixin):
                         elif onp.isscalar(v):
                             fn = lambda p, c=_scalar_float(v): c
                         else:
-                            raise TypeError(f"Unsupported Dirichlet BC component type for tag '{tag}', " f"component {comp}: {type(v).__name__}")
+                            raise TypeError(
+                                f"Unsupported Dirichlet BC component type for tag '{tag}', "
+                                f"component {comp}: {type(v).__name__}"
+                            )
 
                         bc_config.add(loc_fn, component_names.get(comp, comp), fn)
 
@@ -1215,7 +1247,11 @@ class domain(MeshIOMixin):
                     if inside:
                         dirichlet_node_ids.append(i)
 
-        dirichlet_nodes = jnp.array(sorted(set(dirichlet_node_ids)), dtype=jnp.int32) if len(dirichlet_node_ids) > 0 else jnp.array([], dtype=jnp.int32)
+        dirichlet_nodes = (
+            jnp.array(sorted(set(dirichlet_node_ids)), dtype=jnp.int32)
+            if len(dirichlet_node_ids) > 0
+            else jnp.array([], dtype=jnp.int32)
+        )
 
         # print("num extracted dirichlet nodes =", len(dirichlet_nodes))
         # ---------------------------------------------------------
@@ -1233,7 +1269,9 @@ class domain(MeshIOMixin):
         # FEAX Problem already stores PHYSICAL gradients and weighted test gradients
         # for all variables. Since this is the single-variable scalar case, take var 0.
         shape_grads_phys_jax = jnp.asarray(prob.shape_grads[:, :, :num_local_nodes, :])  # (n_cells, n_q, n_loc, dim)
-        v_grads_JxW_jax = jnp.asarray(prob.v_grads_JxW[:, :, :num_local_nodes, :, :])  # (n_cells, n_q, n_loc, test_vec, dim)
+        v_grads_JxW_jax = jnp.asarray(
+            prob.v_grads_JxW[:, :, :num_local_nodes, :, :]
+        )  # (n_cells, n_q, n_loc, test_vec, dim)
         JxW_raw = jnp.asarray(prob.JxW)
         if JxW_raw.ndim == 3 and JxW_raw.shape[1] == 1:
             JxW_jax = JxW_raw[:, 0, :]  # (n_cells, n_q)
@@ -1244,7 +1282,6 @@ class domain(MeshIOMixin):
         quad_points = jnp.asarray(prob.physical_quad_points).reshape(-1, self.dimension)  # (n_cells*n_q, dim)
         # (n_cells*n_q, dim)
 
-        num_quads = JxW_jax.shape[1]
         dim = shape_grads_phys_jax.shape[-1]
         test_vec = v_grads_JxW_jax.shape[-2]
         # IMPORTANT:
@@ -1334,7 +1371,9 @@ class domain(MeshIOMixin):
             raise RuntimeError("Could not find or build boundary_inds_list from the FEM problem or FE space.")
 
         if len(boundary_inds_list) < len(valid_tags):
-            self.log.warning(f"Only {len(boundary_inds_list)} boundary index sets found for " f"{len(valid_tags)} requested Neumann tags.")
+            self.log.warning(
+                f"Only {len(boundary_inds_list)} boundary index sets found for {len(valid_tags)} requested Neumann tags."
+            )
 
         for tag, inds in zip(valid_tags, boundary_inds_list):
             if len(inds) == 0:
@@ -1347,9 +1386,13 @@ class domain(MeshIOMixin):
             inds = onp.asarray(inds)
 
             # Pull boundary tensors directly from FEAX Problem
-            face_shape_grads = jnp.asarray(prob.selected_face_shape_grads[bidx][:, :, :num_local_nodes, :])  # (n_faces, n_fq, n_loc, dim)
+            face_shape_grads = jnp.asarray(
+                prob.selected_face_shape_grads[bidx][:, :, :num_local_nodes, :]
+            )  # (n_faces, n_fq, n_loc, dim)
             nanson_scale = jnp.asarray(prob.nanson_scale[bidx][:, 0, :])  # (n_faces, n_fq)
-            face_shape_vals = jnp.asarray(prob.selected_face_shape_vals[bidx][:, :, :num_local_nodes])  # (n_faces, n_fq, n_loc)
+            face_shape_vals = jnp.asarray(
+                prob.selected_face_shape_vals[bidx][:, :, :num_local_nodes]
+            )  # (n_faces, n_fq, n_loc)
             physical_face_quads = jnp.asarray(prob.physical_surface_quad_points[bidx])  # (n_faces, n_fq, dim)
 
             parent_cells = fe.cells[inds[:, 0]]
@@ -1735,7 +1778,10 @@ class domain(MeshIOMixin):
         batch_count = self._effective_batch_count()
         tensor_batch = tensor.shape[0]
         if tensor_batch != batch_count:
-            self.log.warning(f"Tensor '{name}' has batch dimension {tensor_batch}, but domain has " f"effective batch count {batch_count}. Was this intended?")
+            self.log.warning(
+                f"Tensor '{name}' has batch dimension {tensor_batch}, but domain has "
+                f"effective batch count {batch_count}. Was this intended?"
+            )
 
         self.context[name] = tensor
         self._param_tags.add(name)
@@ -1744,7 +1790,7 @@ class domain(MeshIOMixin):
     def variable(
         self,
         tag: str,
-        sample: Tuple[Optional[int], Optional[Callable]] = (None, None),
+        sample: Union[Tuple[Optional[int], Optional[Callable]], np.ndarray, jnp.ndarray] = (None, None),
         resampling_strategy=None,
         normals: bool = False,
         reverse_normals: bool = False,
@@ -1807,7 +1853,12 @@ class domain(MeshIOMixin):
 
         sample_tag = source_tag
 
-        if sample_tag in self._mesh_pool.keys() and isinstance(sample, tuple) and len(sample) > 0 and isinstance(sample[0], (int, type(None))):
+        if (
+            sample_tag in self._mesh_pool.keys()
+            and isinstance(sample, tuple)
+            and len(sample) > 0
+            and isinstance(sample[0], (int, type(None)))
+        ):
             # Sample points for this tag on demand.
             self.sample_dict.append([sample_tag, (None, None), resampling_strategy, normals, view_factor])
 
@@ -1858,13 +1909,13 @@ class domain(MeshIOMixin):
         # Check if it's a parametric (TensorTag) entry
         if tag in self._param_tags:
             if split:
-                return tuple(TensorTag(tag=tag, dim_index=i, domain=self) for i in range(sample.shape[-1]))  # type: ignore[attr-defined]
+                return tuple(TensorTag(tag=tag, dim_index=i, domain=self) for i in range(sample.shape[-1]))  # type: ignore[attr-defined,union-attr]
             else:
                 return TensorTag(tag=tag, domain=self)
 
         if point_data:
             if split:
-                return tuple(Variable(tag=tag, dim=[i, i + 1], domain=self) for i in range(sample.shape[-1]))  # type: ignore[attr-defined]
+                return tuple(Variable(tag=tag, dim=[i, i + 1], domain=self) for i in range(sample.shape[-1]))  # type: ignore[attr-defined,union-attr]
             else:
                 return Variable(tag=tag, dim=[0, None], domain=self)
 
@@ -1877,7 +1928,9 @@ class domain(MeshIOMixin):
             fem_meta = getattr(self, "_variational_sampling_registry", {}).get(tag, None)
 
         # Create Variable placeholder for each spatial dimension
-        coord_vars: List[Any] = [Variable(tag=tag, dim=[i, i + 1], domain=self, axis="spatial", fem_meta=fem_meta) for i in range(self.dimension)]
+        coord_vars: List[Any] = [
+            Variable(tag=tag, dim=[i, i + 1], domain=self, axis="spatial", fem_meta=fem_meta) for i in range(self.dimension)
+        ]
 
         # Always add temporal variable.
         # If a time-specialized tag exists for this sampled point set
@@ -1900,7 +1953,6 @@ class domain(MeshIOMixin):
             coord_vars += [Variable(tag=f"n_{tag}", dim=[i, i + 1], domain=self) for i in range(len(self.spatial))]
 
         if view_factor and hasattr(self, "mesh_connectivity"):
-
             # Only take the first batch index
             Nrm = -self.context[f"n_{tag}"][0, ...]  # Reverse the normals
             P = points[0, ...]
@@ -1929,7 +1981,10 @@ class domain(MeshIOMixin):
                 # Order points into a proper closed polygon first
                 order = self._order_boundary_loop(subset_bp)
                 ordered_bp = subset_bp[order]
-                edges = np.array([[i, (i + 1) % len(ordered_bp)] for i in range(len(ordered_bp))], dtype=np.int32)
+                edges = np.array(
+                    [[i, (i + 1) % len(ordered_bp)] for i in range(len(ordered_bp))],
+                    dtype=np.int32,
+                )
                 ordered_VM = self.get_visibility_matrix_raytrace(ordered_bp, edges, n_ray_samples=3)
                 # Map VM back to original point order
                 inv_order = np.argsort(order)
@@ -2186,7 +2241,11 @@ class domain(MeshIOMixin):
                 for loop_indices in loops:
                     opaque_loop_pts.append(pts[loop_indices])
             else:
-                self.log.warning(f"Opaque tag '{otag}' has no line or triangle cells. " f"Available boundary loops: {sorted(self._boundary_loop_tags)}, " f"volume tags: {sorted(self._tag_triangles.keys())}. Skipping.")
+                self.log.warning(
+                    f"Opaque tag '{otag}' has no line or triangle cells. "
+                    f"Available boundary loops: {sorted(self._boundary_loop_tags)}, "
+                    f"volume tags: {sorted(self._tag_triangles.keys())}. Skipping."
+                )
                 continue
 
         # Append opaque points and their closed-loop edges.
@@ -2246,7 +2305,7 @@ class domain(MeshIOMixin):
                 raytrace_pts = all_pts
 
             if skipped_loops:
-                self.log.info(f"Opaque: kept {kept_loops} loop(s), " f"skipped {skipped_loops} coincident loop(s)")
+                self.log.info(f"Opaque: kept {kept_loops} loop(s), skipped {skipped_loops} coincident loop(s)")
         else:
             raytrace_pts = all_pts
 
@@ -2370,7 +2429,9 @@ class domain(MeshIOMixin):
             n_blocked = int((inside & (blk > 0)).sum())
             blk[inside] = 0
             if n_blocked:
-                self.log.info(f"Blocked {n_blocked} self-visible pairs through solid " f"interior for loop {loop_idx} ({tags[loop_idx]})")
+                self.log.info(
+                    f"Blocked {n_blocked} self-visible pairs through solid interior for loop {loop_idx} ({tags[loop_idx]})"
+                )
             offset += n
 
         # ----- 6. Element sizes (constant ds assumed for internal boundaries) -
@@ -2403,7 +2464,10 @@ class domain(MeshIOMixin):
             row = []
             col_offset = 0
             for j, tag_j in enumerate(tags):
-                block = VF[row_offset : row_offset + tag_sizes[i], col_offset : col_offset + tag_sizes[j]]
+                block = VF[
+                    row_offset : row_offset + tag_sizes[i],
+                    col_offset : col_offset + tag_sizes[j],
+                ]
                 key = f"f_{tag_i}__{tag_j}"
                 self.context[key] = block[None, None, ...]
                 self._param_tags.add(key)
@@ -2413,7 +2477,7 @@ class domain(MeshIOMixin):
             row_offset += tag_sizes[i]
 
         opaque_info = f", opaque=[{', '.join(opaque_tags)}]" if opaque_tags else ""
-        self.log.info(f"Computed enclosure view factor for [{', '.join(tags)}]{opaque_info} " f"({N_total} total boundary pts)")
+        self.log.info(f"Computed enclosure view factor for [{', '.join(tags)}]{opaque_info} ({N_total} total boundary pts)")
 
         return tuple(result)
 
@@ -2449,7 +2513,10 @@ class domain(MeshIOMixin):
         if effective_n is None:
             effective_n = n_available
         if effective_n > n_available:
-            self.log.warning(f"Requested {effective_n} samples for '{tag}' but only " f"{n_available} available in sub-domain. Using all points.")
+            self.log.warning(
+                f"Requested {effective_n} samples for '{tag}' but only "
+                f"{n_available} available in sub-domain. Using all points."
+            )
             effective_n = n_available
 
         all_samples = []
@@ -2607,7 +2674,9 @@ class domain(MeshIOMixin):
                 n_samples = n_available
 
             if n_samples > n_available:
-                self.log.warning(f"Requested {n_samples} samples for '{tag}' but only {n_available} available across all batches. Using all shared points.")
+                self.log.warning(
+                    f"Requested {n_samples} samples for '{tag}' but only {n_available} available across all batches. Using all shared points."
+                )
                 n_samples = n_available
 
             all_samples = []
@@ -2625,7 +2694,11 @@ class domain(MeshIOMixin):
                                 idx = sampler
                         else:
                             if group_n_available != group_n_samples:
-                                idx = np.random.choice(group_n_available, size=group_n_samples, replace=False)
+                                idx = np.random.choice(
+                                    group_n_available,
+                                    size=group_n_samples,
+                                    replace=False,
+                                )
                             else:
                                 idx = np.arange(group_n_available)
 
@@ -2694,12 +2767,20 @@ class domain(MeshIOMixin):
                     per_batch_total = n_samples * n_time
                     if batch_count > 1:
                         grand_total = per_batch_total * batch_count
-                        self.log.info(f"Sampled {n_samples} spatial points x {n_time} timesteps x {batch_count} batches " f"= {grand_total} spatiotemporal points for '{tag}' with shape {self.context[tag].shape}")
+                        self.log.info(
+                            f"Sampled {n_samples} spatial points x {n_time} timesteps x {batch_count} batches "
+                            f"= {grand_total} spatiotemporal points for '{tag}' with shape {self.context[tag].shape}"
+                        )
                     else:
-                        self.log.info(f"Sampled {n_samples} spatial points x {n_time} timesteps " f"= {per_batch_total} spatiotemporal points for '{tag}'")
+                        self.log.info(
+                            f"Sampled {n_samples} spatial points x {n_time} timesteps "
+                            f"= {per_batch_total} spatiotemporal points for '{tag}'"
+                        )
                     continue
                 if batch_count > 1:
-                    self.log.info(f"Sampled {n_samples} x {batch_count} = {batch_count * n_samples} points for '{tag}' with shape {self.context[tag].shape}")
+                    self.log.info(
+                        f"Sampled {n_samples} x {batch_count} = {batch_count * n_samples} points for '{tag}' with shape {self.context[tag].shape}"
+                    )
                 else:
                     self.log.info(f"Sampled {n_samples} points for '{tag}'")
 
@@ -2708,7 +2789,14 @@ class domain(MeshIOMixin):
         else:
             return self.context[tag], None, tag
 
-    def plot(self, save_path: str = "./runs/domain.png", figsize: Tuple[int, int] = (10, 8), show_normals: bool = True, arrow_scale: float = 0.05, interactive: bool = False):
+    def plot(
+        self,
+        save_path: str = "./runs/domain.png",
+        figsize: Tuple[int, int] = (10, 8),
+        show_normals: bool = True,
+        arrow_scale: float = 0.05,
+        interactive: bool = False,
+    ):
         """Plot the sampled points and normals.
 
         Args:
@@ -2721,6 +2809,7 @@ class domain(MeshIOMixin):
                 (zoom/rotate/pan) with sampled points and normal vectors.
         """
         import os
+
         import matplotlib.pyplot as plt
         from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
@@ -2889,7 +2978,14 @@ class domain(MeshIOMixin):
 
             if spatial_dim == 1:
                 # 1D: plot as points on a line
-                ax.scatter(pts[:, 0], np.zeros(n_points), c=[color], s=10, alpha=0.7, label=f"{tag} ({n_points})")
+                ax.scatter(
+                    pts[:, 0],
+                    np.zeros(n_points),
+                    c=[color],
+                    s=10,
+                    alpha=0.7,
+                    label=f"{tag} ({n_points})",
+                )
 
                 # Plot normals if available
                 if show_normals and f"n_{tag}" in self.context:
@@ -2912,7 +3008,14 @@ class domain(MeshIOMixin):
 
             elif spatial_dim == 2:
                 # 2D: scatter plot
-                ax.scatter(pts[:, 0], pts[:, 1], c=[color], s=10, alpha=0.7, label=f"{tag} ({n_points})")
+                ax.scatter(
+                    pts[:, 0],
+                    pts[:, 1],
+                    c=[color],
+                    s=10,
+                    alpha=0.7,
+                    label=f"{tag} ({n_points})",
+                )
 
                 # Plot normals if available
                 if show_normals and f"n_{tag}" in self.context:
@@ -3021,8 +3124,9 @@ class domain(MeshIOMixin):
             figsize: Ignored (fixed 5x5 layout)
             n_show: Total number of source points across all tags (default 25)
         """
-        import matplotlib.pyplot as plt
         import os
+
+        import matplotlib.pyplot as plt
 
         # Collect all boundary data across tags
         tag_data = []  # list of (tag_label, pts, VM)
@@ -3090,9 +3194,11 @@ class domain(MeshIOMixin):
         fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 5 * nrows))
 
         tag_names = ", ".join(t for t, _, _ in tag_data)
-        fig.suptitle(f"Visibility Fans — {tag_names}  ({total_bnd} boundary pts)", fontsize=14, y=1.01)
-
-        colors = plt.cm.tab10.colors  # type: ignore[attr-defined]
+        fig.suptitle(
+            f"Visibility Fans — {tag_names}  ({total_bnd} boundary pts)",
+            fontsize=14,
+            y=1.01,
+        )
 
         for i, ax in enumerate(axes.flat):
             if i >= n_total:
@@ -3103,11 +3209,17 @@ class domain(MeshIOMixin):
             n_bnd = pts.shape[0]
 
             visible = np.where(VM[idx] == 1)[0]
-            not_visible = np.where(VM[idx] == 0)[0]
             visible = visible[visible != idx]
 
             # Draw all boundary points from all tags as light background
-            ax.scatter(all_pts[:, 0], all_pts[:, 1], c="lightgrey", s=6, zorder=1, edgecolors="none")
+            ax.scatter(
+                all_pts[:, 0],
+                all_pts[:, 1],
+                c="lightgrey",
+                s=6,
+                zorder=1,
+                edgecolors="none",
+            )
 
             # Lines to visible points
             for j in visible:
@@ -3121,9 +3233,25 @@ class domain(MeshIOMixin):
                 )
 
             # Visible points
-            ax.scatter(pts[visible, 0], pts[visible, 1], c="green", s=12, zorder=3, edgecolors="none")
+            ax.scatter(
+                pts[visible, 0],
+                pts[visible, 1],
+                c="green",
+                s=12,
+                zorder=3,
+                edgecolors="none",
+            )
             # Source point
-            ax.scatter(pts[idx, 0], pts[idx, 1], c="red", marker="*", s=150, zorder=5, edgecolors="k", linewidths=0.5)
+            ax.scatter(
+                pts[idx, 0],
+                pts[idx, 1],
+                c="red",
+                marker="*",
+                s=150,
+                zorder=5,
+                edgecolors="k",
+                linewidths=0.5,
+            )
 
             n_vis = len(visible)
             ax.set_title(f"{tag} i={idx}, sees {n_vis}/{n_bnd - 1}", fontsize=9)

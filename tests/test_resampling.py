@@ -4,17 +4,26 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import foundax
 import jax
 import jax.numpy as jnp
 import optax
 import pytest
 
-import foundax
 import jno
 import jno.jnp_ops as jnn
 from jno import LearningRateSchedule as lrs
 from jno import sampler
-from jno.utils.adaptive.resampling import CR3, HA, PINNFluence, R3, RAD, RARD, RandomResampling, ResamplingStrategy
+from jno.utils.adaptive.resampling import (
+    CR3,
+    HA,
+    R3,
+    RAD,
+    RARD,
+    PINNFluence,
+    RandomResampling,
+    ResamplingStrategy,
+)
 
 
 def _points_1d(n: int = 24) -> jnp.ndarray:
@@ -138,13 +147,30 @@ def test_base_should_resample_cadence_and_start_epoch():
 @pytest.mark.parametrize(
     "strategy, points",
     [
-        (RandomResampling(resample_every=1, resample_fraction=0.25, start_epoch=0), _points_1d()),
-        (RAD(resample_every=1, resample_fraction=0.25, start_epoch=0, k=3), _points_1d()),
-        (RARD(resample_every=1, resample_fraction=0.25, start_epoch=0, power=2.0), _points_1d()),
+        (
+            RandomResampling(resample_every=1, resample_fraction=0.25, start_epoch=0),
+            _points_1d(),
+        ),
+        (
+            RAD(resample_every=1, resample_fraction=0.25, start_epoch=0, k=3),
+            _points_1d(),
+        ),
+        (
+            RARD(resample_every=1, resample_fraction=0.25, start_epoch=0, power=2.0),
+            _points_1d(),
+        ),
         (HA(resample_every=1, resample_fraction=0.5, start_epoch=0), _points_1d()),
         (R3(resample_every=1, resample_fraction=0.5, start_epoch=0), _points_1d()),
         (CR3(resample_every=1, resample_fraction=0.5, start_epoch=0), _points_xt()),
-        (PINNFluence(resample_every=1, resample_fraction=0.25, start_epoch=0, candidate_factor=2.0), _points_1d()),
+        (
+            PINNFluence(
+                resample_every=1,
+                resample_fraction=0.25,
+                start_epoch=0,
+                candidate_factor=2.0,
+            ),
+            _points_1d(),
+        ),
     ],
 )
 def test_strategy_resample_preserves_shape_and_finite_values(strategy, points):
@@ -164,7 +190,14 @@ def test_strategy_residual_shape_mismatch_returns_input():
     domain = _domain_stub(points)
 
     for strategy in [RAD(), RARD(), R3(), CR3(), PINNFluence()]:
-        out = strategy.resample(points, wrong_residuals, domain, "interior", epoch=0, rng_key=jax.random.PRNGKey(0))
+        out = strategy.resample(
+            points,
+            wrong_residuals,
+            domain,
+            "interior",
+            epoch=0,
+            rng_key=jax.random.PRNGKey(0),
+        )
         assert jnp.array_equal(out, points)
 
 
@@ -196,7 +229,13 @@ def test_ha_alternating_phase_counter_advances():
     residuals = _residuals(20)
     domain = _domain_stub(points)
 
-    s = HA(resample_every=1, resample_fraction=0.5, start_epoch=0, alternate=True, random_first=True)
+    s = HA(
+        resample_every=1,
+        resample_fraction=0.5,
+        start_epoch=0,
+        alternate=True,
+        random_first=True,
+    )
     _ = s.resample(points, residuals, domain, "interior", epoch=0, rng_key=jax.random.PRNGKey(0))
     _ = s.resample(points, residuals, domain, "interior", epoch=1, rng_key=jax.random.PRNGKey(1))
 

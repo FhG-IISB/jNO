@@ -7,10 +7,9 @@ import time
 from typing import Any, Dict, Optional
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 
-from ..config import wandb_alert, get_wandb_run
+from ..config import get_wandb_run, wandb_alert
 
 
 class Callback:
@@ -109,17 +108,22 @@ class CheckpointCallback(Callback):
         try:
             import orbax.checkpoint as ocp
         except ImportError as exc:
-            raise ImportError("orbax-checkpoint is required for CheckpointCallback. " "Install it with:  pip install orbax-checkpoint") from exc
+            raise ImportError(
+                "orbax-checkpoint is required for CheckpointCallback. Install it with:  pip install orbax-checkpoint"
+            ) from exc
 
         if directory is None:
-            from .logger import get_logger
+            from ..logger import get_logger
 
             log = get_logger()
             log_path = getattr(log, "path", None)
             if log_path and str(log_path):
                 directory = os.path.join(str(log_path), "checkpoints")
             else:
-                raise ValueError("No directory given and no jno.setup() run directory found. " "Either pass directory= or call jno.setup(__file__) first.")
+                raise ValueError(
+                    "No directory given and no jno.setup() run directory found. "
+                    "Either pass directory= or call jno.setup(__file__) first."
+                )
 
         self._ocp = ocp
         self._directory = os.path.abspath(directory)
@@ -244,7 +248,6 @@ class CheckpointCallback(Callback):
             Dictionary with keys ``trainable``, ``opt_states``, ``rng``,
             and ``metadata``.
         """
-        ocp = self._ocp
         if step is None:
             step = self._manager.latest_step()
         if step is None:
@@ -379,12 +382,16 @@ class EarlyStoppingCallback(Callback):
             self.stopped_epoch = epoch
             if self.verbose:
                 log = kwargs.get("log")
-                msg = f"Early stopping at epoch {epoch}: " f"no improvement for {self.patience} epochs " f"(best={self.best_metric:.6e})"
+                msg = (
+                    f"Early stopping at epoch {epoch}: "
+                    f"no improvement for {self.patience} epochs "
+                    f"(best={self.best_metric:.6e})"
+                )
                 if log is not None:
                     log.info(msg)
             wandb_alert(
                 "Early stopping",
-                f"Stopped at epoch {epoch} — no improvement for " f"{self.patience} epochs (best={self.best_metric:.6e})",
+                f"Stopped at epoch {epoch} — no improvement for {self.patience} epochs (best={self.best_metric:.6e})",
                 level="WARN",
             )
             return True  # signal stop

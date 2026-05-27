@@ -21,11 +21,11 @@ Architecture: (N, C) sequence → Encoder → Latent → Processor blocks → De
 Reference: Zhao et al. "Position-induced Transformer" (2023)
 """
 
-import jax
-import jno
-
 import foundax
+import jax
 import optax
+
+import jno
 
 KEY = jax.random.PRNGKey(0)
 SAMPLES = 200
@@ -46,17 +46,19 @@ _u_flat = _u.reshape((1, N, 1))  # (1, N, 1) — full batch column
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 # latent_res is the resolution of the internal coarsened representation.
-u = jno.nn.wrap(foundax.pit(
-    in_channels=1,
-    out_channels=1,
-    hid_channels=128,
-    n_head=2,
-    localities=[100, 50, 50, 50, 100],  # global encoder/decoder, local processor
-    input_res=(GRID, GRID),
-    latent_res=(GRID // 4, GRID // 4),  # 16 × 16 latent grid
-    output_res=(GRID, GRID),
-    key=KEY,
-))
+u = jno.nn.wrap(
+    foundax.pit(
+        in_channels=1,
+        out_channels=1,
+        hid_channels=128,
+        n_head=2,
+        localities=[100, 50, 50, 50, 100],  # global encoder/decoder, local processor
+        input_res=(GRID, GRID),
+        latent_res=(GRID // 4, GRID // 4),  # 16 × 16 latent grid
+        output_res=(GRID, GRID),
+        key=KEY,
+    )
+)
 
 # ── Constraint & solver ───────────────────────────────────────────────────────
 crux = jno.core([(_u_flat - u(_f_flat)).mse], domain)

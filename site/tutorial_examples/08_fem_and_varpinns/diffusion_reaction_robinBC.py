@@ -25,16 +25,14 @@ Showcases
 - hard Dirichlet ansatz for VPINN
 """
 
-import numpy as np
-
+import foundax
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
-import foundax
 
 import jno
 from jno import LearningRateSchedule as lrs
-
 
 pi = jno.np.pi
 sin = jno.np.sin
@@ -101,22 +99,11 @@ def build_robin_weak_form(domain):
     phi_x = jno.np.grad(phi, xg)
     phi_y = jno.np.grad(phi, yg)
 
-    vol = (
-        du_dx * phi_x
-        + du_dy * phi_y
-        + sigma * u * phi
-        - source_f(xg, yg) * phi
-    )
+    vol = du_dx * phi_x + du_dy * phi_y + sigma * u * phi - source_f(xg, yg) * phi
 
-    robin_right = (
-        alpha_right * u * phi
-        - robin_rhs_right(xr, yr) * phi
-    )
+    robin_right = alpha_right * u * phi - robin_rhs_right(xr, yr) * phi
 
-    robin_top = (
-        alpha_top * u * phi
-        - robin_rhs_top(xt, yt) * phi
-    )
+    robin_top = alpha_top * u * phi - robin_rhs_top(xt, yt) * phi
 
     weak = vol + robin_right + robin_top
 
@@ -154,9 +141,7 @@ b_dense = jnp.asarray(b)
 
 u_fem = jnp.linalg.solve(A_dense, b_dense).reshape(-1)
 
-lin_res = jnp.linalg.norm(A_dense @ u_fem - b_dense) / (
-    jnp.linalg.norm(b_dense) + 1e-14
-)
+lin_res = jnp.linalg.norm(A_dense @ u_fem - b_dense) / (jnp.linalg.norm(b_dense) + 1e-14)
 
 coords = np.asarray(fem_domain.mesh.points)[:, :2]
 x_nodes = jnp.asarray(coords[:, 0:1])
@@ -164,9 +149,7 @@ y_nodes = jnp.asarray(coords[:, 1:2])
 
 u_exact_nodes = exact_u_num(x_nodes, y_nodes).reshape(-1)
 
-rel_l2_fem = jnp.linalg.norm(u_exact_nodes - u_fem) / (
-    jnp.linalg.norm(u_exact_nodes) + 1e-14
-)
+rel_l2_fem = jnp.linalg.norm(u_exact_nodes - u_fem) / (jnp.linalg.norm(u_exact_nodes) + 1e-14)
 max_abs_fem = jnp.max(jnp.abs(u_exact_nodes - u_fem))
 
 print("\n" + "=" * 70)
@@ -232,9 +215,7 @@ u_true_eval = crux.eval(exact_u(x_int, y_int), domain=train_domain)
 u_vpinn_eval = jnp.asarray(u_vpinn_eval).reshape(-1)
 u_true_eval = jnp.asarray(u_true_eval).reshape(-1)
 
-rel_l2_vpinn = jnp.linalg.norm(u_true_eval - u_vpinn_eval) / (
-    jnp.linalg.norm(u_true_eval) + 1e-14
-)
+rel_l2_vpinn = jnp.linalg.norm(u_true_eval - u_vpinn_eval) / (jnp.linalg.norm(u_true_eval) + 1e-14)
 max_abs_vpinn = jnp.max(jnp.abs(u_true_eval - u_vpinn_eval))
 
 print("\nVPINN")

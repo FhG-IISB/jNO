@@ -1,8 +1,8 @@
 """Shared fixtures and helpers for jNO tests."""
 
-import pytest
 import jax
 import jax.numpy as jnp
+import pytest
 
 
 class MockDomain:

@@ -20,17 +20,17 @@ Showcases
 
 import os
 import time
-import numpy as np
 
-import jax
-import jax.numpy as jnp
-import optax
 import diffrax
 import foundax
+import jax
+import jax.numpy as jnp
+import jno.numpy as jnn
+import numpy as np
+import optax
 from feax.solvers.time_solver import run as feax_run
 
 import jno
-import jno.numpy as jnn
 from jno import LearningRateSchedule as lrs
 
 jax.config.update("jax_enable_x64", False)
@@ -49,39 +49,42 @@ def pick(default, test):
 
 
 def exact_u_sym(x, y, t):
-    return (
-        jnn.exp(-2.0 * jnn.pi**2 * nu * t)
-        * jnn.sin(jnn.pi * x)
-        * jnn.sin(jnn.pi * y)
-    )
+    return jnn.exp(-2.0 * jnn.pi**2 * nu * t) * jnn.sin(jnn.pi * x) * jnn.sin(jnn.pi * y)
 
 
 def exact_u_jax(x, y, t):
-    return (
-        jnp.exp(-2.0 * PI**2 * nu * t)
-        * jnp.sin(PI * x)
-        * jnp.sin(PI * y)
-    )
+    return jnp.exp(-2.0 * PI**2 * nu * t) * jnp.sin(PI * x) * jnp.sin(PI * y)
 
 
 # ---------------------------------------------------------------------
 # Strong-form PINN
 # ---------------------------------------------------------------------
 
+
 def train_pinn_reference():
-    domain = jno.domain(constructor=jno.domain.rect(mesh_size=pick(0.20, 0.30)), time=(0.0, T_END, pick(N_T, 5)), compute_mesh_connectivity=False,)
+    domain = jno.domain(
+        constructor=jno.domain.rect(mesh_size=pick(0.20, 0.30)),
+        time=(0.0, T_END, pick(N_T, 5)),
+        compute_mesh_connectivity=False,
+    )
 
     x, y, t = domain.variable("interior", split=True)
     x0, y0, t0 = domain.variable("initial", split=True)
 
-    net = jno.nn.wrap(foundax.mlp(
+    net = jno.nn.wrap(
+        foundax.mlp(
             3,
             hidden_dims=pick(48, 16),
             num_layers=pick(4, 2),
             activation=jax.nn.tanh,
-            key=jax.random.PRNGKey(0),))
+            key=jax.random.PRNGKey(0),
+        )
+    )
 
-    net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(pick(1000, 10), 1, 1e-3, 1e-5),)
+    net.optimizer(
+        optax.adam(1),
+        lr=lrs.warmup_cosine(pick(1000, 10), 1, 1e-3, 1e-5),
+    )
 
     u_pinn = net(x, y, t) * x * (1.0 - x) * y * (1.0 - y)
     u0_pinn = net(x0, y0, t0) * x0 * (1.0 - x0) * y0 * (1.0 - y0)
@@ -107,10 +110,12 @@ def train_pinn_reference():
 # Weak FEAX-time solve
 # ---------------------------------------------------------------------
 
+
 def run_case(mesh_size=0.12, diffrax_dt0=1e-4, feax_dt=1e-3):
     crux, net = train_pinn_reference()
 
-    fem_domain = jno.domain(constructor=jno.domain.rect(mesh_size=pick(mesh_size, 0.25)),
+    fem_domain = jno.domain(
+        constructor=jno.domain.rect(mesh_size=pick(mesh_size, 0.25)),
         time=(0.0, T_END, pick(N_T, 7)),
         compute_mesh_connectivity=False,
     )
@@ -183,11 +188,23 @@ def run_case(mesh_size=0.12, diffrax_dt0=1e-4, feax_dt=1e-3):
     center_xy = np.array([0.5, 0.5], dtype=np.float32)
     center_idx = int(np.argmin(np.sum((coords - center_xy[None, :]) ** 2, axis=1)))
 
-    pblock = block.as_feax_pipeline(scheme="backward_euler", monitor_index=center_idx,  compile_step=True,)
+    pblock = block.as_feax_pipeline(
+        scheme="backward_euler",
+        monitor_index=center_idx,
+        compile_step=True,
+    )
 
-    time_cfg = pblock.make_time_config( dt=feax_dt, print_every=pick(20, 1), save_every=10**9, )
+    time_cfg = pblock.make_time_config(
+        dt=feax_dt,
+        print_every=pick(20, 1),
+        save_every=10**9,
+    )
 
-    feax_result = feax_run(pblock.pipeline, pblock.mesh,time_cfg, )
+    feax_result = feax_run(
+        pblock.pipeline,
+        pblock.mesh,
+        time_cfg,
+    )
 
     u_feax_final = jnp.asarray(feax_result.final_state).reshape(-1)
 
@@ -195,7 +212,10 @@ def run_case(mesh_size=0.12, diffrax_dt0=1e-4, feax_dt=1e-3):
     t_nodes = jnp.full_like(x_nodes, T_END)
     u_exact = exact_u_jax(x_nodes, y_nodes, t_nodes).reshape(-1)
 
-    u_pinn = crux.eval( net(x_nodes, y_nodes, t_nodes) * x_nodes * (1.0 - x_nodes) * y_nodes * (1.0 - y_nodes), domain=None, )
+    u_pinn = crux.eval(
+        net(x_nodes, y_nodes, t_nodes) * x_nodes * (1.0 - x_nodes) * y_nodes * (1.0 - y_nodes),
+        domain=None,
+    )
     u_pinn = jnp.asarray(u_pinn).reshape(-1)
 
     rel_pinn = float(jnp.linalg.norm(u_pinn - u_exact) / (jnp.linalg.norm(u_exact) + 1e-8))
