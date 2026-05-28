@@ -26,7 +26,7 @@ from jno import LearningRateSchedule as lrs
 domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05))
 x, y, _ = domain.variable("interior")
 
-f       = 2 * π**2 * jno.np.sin(π * x) * jno.np.sin(π * y)
+f = 2 * π**2 * jno.np.sin(π * x) * jno.np.sin(π * y)
 u_exact = jno.np.sin(π * x) * jno.np.sin(π * y)
 
 # ── Network ────────────────────────────────────────────────────────────────────
@@ -49,8 +49,8 @@ u = net(x, y) * x * (1 - x) * y * (1 - y)
 pde = -jno.np.laplacian(u, [x, y]) - f - jno.noise.gaussian(std=σ)
 
 # ── Solve ──────────────────────────────────────────────────────────────────────
-crux    = jno.core([pde.mse], domain)
-history = crux.solve(5_000)
+crux = jno.core([pde.mse], domain)
+history = crux.solve(50_000)
 
 # ── Evaluate ───────────────────────────────────────────────────────────────────
 _u, _u_exact = crux.eval([u, u_exact])
