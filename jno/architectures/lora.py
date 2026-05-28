@@ -263,6 +263,7 @@ def apply_lora(
     target: Optional[str] = None,
     specs: Sequence[LoRASpec] | None = None,
     wrappers: type[LoRAWrapper] | Sequence[type[LoRAWrapper]] | None = None,
+    param_mask=None,
 ) -> eqx.Module:
     """Apply LoRA adapters to matching layers in *model*.
 
@@ -277,6 +278,13 @@ def apply_lora(
        Each spec ``{"target": regex, "rank": int, "alpha": float}`` may
        also carry an optional ``"wrapper"`` key to use a different adapter
        class for that group.  The first matching spec wins.
+
+    Args:
+        param_mask: Optional boolean pytree mirroring the model structure.
+            When provided, only modules whose corresponding sub-tree contains
+            at least one ``True`` leaf are wrapped with LoRA adapters.
+            Produced by ``mask(M).lora()``; pass ``None`` to wrap all
+            matching layers (default behaviour).
 
     Returns:
         A new model with ``LoRAWrapper`` replacements at the matched leaves.
@@ -314,6 +322,16 @@ def apply_lora(
     all_wrappers: set[type[LoRAWrapper]] = {w for s in spec_list for w in s.wrappers}
     is_leaf = lambda x: any(w.applies_to(x) for w in all_wrappers)
 
+    # Build set of path strings with a True mask leaf — used to restrict wrapping
+    # to user-selected modules when mask(M).lora() is called.
+    if param_mask is not None:
+        flat_mask_with_path = jax.tree_util.tree_flatten_with_path(param_mask)[0]
+        mask_true_paths: set[str] | None = {
+            _path_str(mp) for mp, val in flat_mask_with_path if val is True or (isinstance(val, bool) and val)
+        }
+    else:
+        mask_true_paths = None
+
     flat_with_path, treedef = jax.tree_util.tree_flatten_with_path(model, is_leaf=is_leaf)
 
     new_leaves: list[Any] = []
@@ -323,6 +341,15 @@ def apply_lora(
             continue
 
         pstr = _path_str(path_keys)
+
+        # Honour param_mask: skip modules not covered by any True leaf.
+        # Use `pstr + "/"` prefix to avoid "layer1" matching "layer10/weight".
+        if mask_true_paths is not None:
+            module_selected = any(tp == pstr or tp.startswith(pstr + "/") for tp in mask_true_paths)
+            if not module_selected:
+                new_leaves.append(leaf)
+                continue
+
         new_leaf = leaf
         for spec in spec_list:
             if spec.pat is None or spec.pat.search(pstr):
@@ -361,6 +388,45 @@ def lora_trainable_filter(model: eqx.Module) -> object:
 
     flat, treedef = jax.tree_util.tree_flatten(model)
     specs = [eqx.is_array(leaf) and id(leaf) in adapter_ids for leaf in flat]
+    return jax.tree_util.tree_unflatten(treedef, specs)
+
+
+def partial_lora_trainable_filter(model: eqx.Module) -> object:
+    """Return a filter-spec for partial LoRA (mask(M).lora() without freeze()).
+
+    Three-bucket logic:
+    - LoRA adapter arrays (b, d, lora_A, lora_B, …)  → ``True``  (trained)
+    - Base arrays inside LoRA wrappers                 → ``False`` (frozen)
+    - Arrays outside any LoRA wrapper                  → ``True``  (trained)
+
+    Use this when the user says ``mask(M).lora()`` without a prior ``freeze()``:
+    selected layers get LoRA with frozen bases; everything else stays trainable.
+    """
+    adapter_ids: set[int] = set()
+    wrapped_base_ids: set[int] = set()
+
+    is_lora = lambda x: isinstance(x, LoRAWrapper)
+    for node in jax.tree_util.tree_leaves(model, is_leaf=is_lora):
+        if isinstance(node, LoRAWrapper):
+            for fname in node.adapter_fields:
+                arr = getattr(node, fname, None)
+                if eqx.is_array(arr):
+                    adapter_ids.add(id(arr))
+            for base_arr in jax.tree_util.tree_leaves(node.base):
+                if eqx.is_array(base_arr):
+                    wrapped_base_ids.add(id(base_arr))
+
+    flat, treedef = jax.tree_util.tree_flatten(model)
+    specs = []
+    for leaf in flat:
+        if not eqx.is_inexact_array(leaf):
+            specs.append(False)
+        elif id(leaf) in adapter_ids:
+            specs.append(True)
+        elif id(leaf) in wrapped_base_ids:
+            specs.append(False)
+        else:
+            specs.append(True)  # unwrapped param — stays trainable
     return jax.tree_util.tree_unflatten(treedef, specs)
 
 

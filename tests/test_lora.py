@@ -57,6 +57,7 @@ from jno.lora import (
     apply_lora,
     lora_trainable_filter,
     merge_lora,
+    partial_lora_trainable_filter,
     rsLoRAConv,
     rsLoRALinear,
 )
@@ -228,6 +229,58 @@ class TestApplyLora:
         leaves = jax.tree_util.tree_leaves(adapted, is_leaf=lambda x: isinstance(x, LoRAWrapper))
         assert all(isinstance(leaf, rsLoRALinear) for leaf in leaves if isinstance(leaf, LoRAWrapper))
 
+    def test_param_mask_restricts_wrapping(self):
+        """param_mask restricts apply_lora to only mask-selected modules."""
+        mlp = _mlp()
+        n_all = _count_wrappers(apply_lora(mlp, rank=2, alpha=1.0, key=KEY))
+        assert n_all > 1, "need more than one layer for this test to be meaningful"
+
+        # Build a mask selecting only the first hidden layer's weight and bias.
+        all_false = jax.tree_util.tree_map(lambda _: False, mlp)
+        first_layer_mask = eqx.tree_at(
+            lambda m: (m.hidden_layers[0].weight, m.hidden_layers[0].bias),
+            all_false,
+            (True, True),
+        )
+        adapted = apply_lora(mlp, rank=2, alpha=1.0, key=KEY, param_mask=first_layer_mask)
+        n_masked = _count_wrappers(adapted)
+        assert n_masked == 1, f"expected 1 wrapped layer, got {n_masked}"
+
+    def test_param_mask_all_false_wraps_nothing(self):
+        """param_mask with all False → no layers are wrapped."""
+        mlp = _mlp()
+        all_false = jax.tree_util.tree_map(lambda _: False, mlp)
+        adapted = apply_lora(mlp, rank=2, alpha=1.0, key=KEY, param_mask=all_false)
+        assert _count_wrappers(adapted) == 0
+
+    def test_param_mask_prefix_safety(self):
+        """Mask on 'layer1' must not accidentally wrap 'layer10' (prefix-overlap safety)."""
+
+        class TwinNet(eqx.Module):
+            layer1: eqx.nn.Linear
+            layer10: eqx.nn.Linear
+
+            def __call__(self, x):
+                return self.layer10(jax.nn.relu(self.layer1(x)))
+
+        net = TwinNet(
+            layer1=eqx.nn.Linear(4, 4, key=KEY),
+            layer10=eqx.nn.Linear(4, 2, key=KEY),
+        )
+        all_false = jax.tree_util.tree_map(lambda _: False, net)
+        # Select only layer1.weight
+        mask = eqx.tree_at(lambda m: m.layer1.weight, all_false, True)
+        adapted = apply_lora(net, rank=2, alpha=1.0, key=KEY, param_mask=mask)
+        lora_leaves = [
+            leaf
+            for leaf in jax.tree_util.tree_leaves(adapted, is_leaf=lambda x: isinstance(x, LoRAWrapper))
+            if isinstance(leaf, LoRAWrapper)
+        ]
+        assert len(lora_leaves) == 1
+        assert isinstance(lora_leaves[0].base, eqx.nn.Linear)
+        # Verify it's layer1, not layer10 — layer1 has out_features=4, layer10=2
+        assert lora_leaves[0].base.out_features == 4
+
     def test_custom_wrapper(self):
         """A user-defined LoRAWrapper subclass plugs in and its adapter fields are counted."""
         from jno.architectures.lora import LinearLike
@@ -353,6 +406,89 @@ class TestTrainableFilter:
         adapted = apply_lora(_mlp(), rank=2, alpha=1.0, key=KEY, wrappers=(cls,))
         n_true = _count_adapter_leaves(adapted)
         assert n_true == _ADAPTER_LEAVES[cls]
+
+
+# ---------------------------------------------------------------------------
+# 5b. partial_lora_trainable_filter
+# ---------------------------------------------------------------------------
+
+
+class TestPartialLoraTrainableFilter:
+    """Tests for partial_lora_trainable_filter (used by mask(M).lora() without freeze())."""
+
+    def _adapted_first_only(self):
+        """MLP with only the first hidden layer LoRA-wrapped."""
+        mlp = _mlp()
+        all_false = jax.tree_util.tree_map(lambda _: False, mlp)
+        mask = eqx.tree_at(
+            lambda m: (m.hidden_layers[0].weight, m.hidden_layers[0].bias),
+            all_false,
+            (True, True),
+        )
+        return apply_lora(mlp, rank=2, alpha=1.0, key=KEY, param_mask=mask)
+
+    def test_adapter_arrays_are_trainable(self):
+        """Adapter arrays inside LoRA wrappers must be True in the filter."""
+        adapted = self._adapted_first_only()
+        filt = partial_lora_trainable_filter(adapted)
+        flat_arrays = jax.tree_util.tree_leaves(eqx.filter(adapted, eqx.is_inexact_array))
+        flat_filt = jax.tree_util.tree_leaves(filt)
+        # collect (trainable, array) pairs for just adapter arrays
+        from jno.lora import LoRAWrapper
+
+        adapter_ids = set()
+        for node in jax.tree_util.tree_leaves(adapted, is_leaf=lambda x: isinstance(x, LoRAWrapper)):
+            if isinstance(node, LoRAWrapper):
+                for fname in node.adapter_fields:
+                    arr = getattr(node, fname, None)
+                    if eqx.is_array(arr):
+                        adapter_ids.add(id(arr))
+        for arr, f in zip(flat_arrays, flat_filt):
+            if id(arr) in adapter_ids:
+                assert f is True, "adapter array must be trainable"
+
+    def test_wrapped_base_frozen(self):
+        """Base arrays inside LoRA wrappers must be False."""
+        adapted = self._adapted_first_only()
+        filt = partial_lora_trainable_filter(adapted)
+        from jno.lora import LoRAWrapper
+
+        wrapped_base_ids = set()
+        for node in jax.tree_util.tree_leaves(adapted, is_leaf=lambda x: isinstance(x, LoRAWrapper)):
+            if isinstance(node, LoRAWrapper):
+                for arr in jax.tree_util.tree_leaves(node.base):
+                    if eqx.is_array(arr):
+                        wrapped_base_ids.add(id(arr))
+        flat_arrays = jax.tree_util.tree_leaves(eqx.filter(adapted, eqx.is_array))
+        flat_filt = jax.tree_util.tree_leaves(filt)
+        for arr, f in zip(flat_arrays, flat_filt):
+            if id(arr) in wrapped_base_ids:
+                assert f is False, "base array inside wrapper must be frozen"
+
+    def test_unwrapped_params_trainable(self):
+        """Arrays outside any LoRA wrapper must be True (they stay trainable)."""
+        adapted = self._adapted_first_only()
+        filt = partial_lora_trainable_filter(adapted)
+        from jno.lora import LoRAWrapper
+
+        all_lora_ids = set()
+        for node in jax.tree_util.tree_leaves(adapted, is_leaf=lambda x: isinstance(x, LoRAWrapper)):
+            if isinstance(node, LoRAWrapper):
+                for arr in jax.tree_util.tree_leaves(node):
+                    if eqx.is_array(arr):
+                        all_lora_ids.add(id(arr))
+        flat_arrays = jax.tree_util.tree_leaves(eqx.filter(adapted, eqx.is_inexact_array))
+        flat_filt = jax.tree_util.tree_leaves(filt)
+        for arr, f in zip(flat_arrays, flat_filt):
+            if id(arr) not in all_lora_ids:
+                assert f is True, "unwrapped param must remain trainable"
+
+    def test_more_trainable_than_lora_filter(self):
+        """partial filter marks more params True than lora_trainable_filter (unwrapped layers)."""
+        adapted = self._adapted_first_only()
+        n_partial = sum(1 for v in jax.tree_util.tree_leaves(partial_lora_trainable_filter(adapted)) if v)
+        n_lora = sum(1 for v in jax.tree_util.tree_leaves(lora_trainable_filter(adapted)) if v)
+        assert n_partial > n_lora, "partial filter should train more params than lora-only filter"
 
 
 # ---------------------------------------------------------------------------
@@ -801,33 +937,33 @@ class TestModelControlStateCombinations:
         assert net._frozen is True
         assert net._trainable_param_mask is None
 
-    def test_mask_lora_sets_both_trainable_mask_and_config(self):
-        """mask(m).lora() stores _trainable_param_mask and _lora_config simultaneously."""
+    def test_mask_lora_sets_lora_param_mask_and_config(self):
+        """mask(m).lora() stores _lora_param_mask (as-is) and _lora_config; clears trainable mask."""
         net = self._net()
-        net.mask(self._all_true_mask()).lora(rank=4, alpha=1.0)
-        assert net._trainable_param_mask is not None
+        mask = self._all_true_mask()
+        net.mask(mask).lora(rank=4, alpha=1.0)
+        assert net._lora_param_mask is mask
         assert net._lora_config is not None
+        assert net._trainable_param_mask is None
 
     def test_freeze_then_lora_leaves_no_trainable_mask(self):
-        """freeze().lora() produces _frozen=True, _lora_config set, _trainable_param_mask=None.
-
-        freeze() consumes the (absent) mask scope and leaves _mask_scope_pending=False,
-        so the subsequent lora() call sees no pending mask.
-        """
+        """freeze().lora() produces _frozen=True, _lora_config set, no masks."""
         net = self._net()
         net.freeze().lora(rank=4, alpha=1.0)
         assert net._frozen is True
         assert net._lora_config is not None
         assert net._trainable_param_mask is None
+        assert net._lora_param_mask is None
 
     def test_mask_freeze_then_lora_mask_already_consumed(self):
-        """mask(m).freeze() followed by .lora() — mask scope consumed by freeze."""
+        """mask(m).freeze() followed by .lora() — mask scope consumed by freeze, lora clears lora_mask."""
         net = self._net()
         net.mask(self._all_true_mask()).freeze()  # mask scope consumed here
         net.lora(rank=4, alpha=1.0)  # no pending mask
         assert net._frozen is False  # mask.freeze(), not global
         assert net._lora_config is not None
-        assert net._trainable_param_mask is None  # lora() cleared it (no pending mask)
+        assert net._trainable_param_mask is None  # not set by lora()
+        assert net._lora_param_mask is None  # no pending mask → cleared
 
     def test_mask_scope_consumed_after_freeze(self):
         """_mask_scope_pending is False after freeze() regardless of preceding mask()."""
@@ -841,13 +977,14 @@ class TestModelControlStateCombinations:
         """reset() zeroes every training-time control field."""
         net = self._net()
         net.mask(self._all_true_mask()).freeze()
-        net.lora(rank=4, alpha=1.0)
+        net.mask(self._all_true_mask()).lora(rank=4, alpha=1.0)
         net.optimizer(optax.adam, lr=lrs(1e-3))
         net.dtype(jnp.bfloat16)
         net.reset()
         assert net._frozen is False
         assert net._lora_config is None
         assert net._trainable_param_mask is None
+        assert net._lora_param_mask is None
         assert net._opt_fn is None
         assert net._lr is None
         assert net._dtype is None
@@ -1009,14 +1146,31 @@ class TestIntegrationCombinations:
 
     # ── mask(m).lora(): adapters train, no crash ──────────────────────────────
 
-    def test_mask_lora_no_crash_adapters_train(self):
-        """mask(m).lora() stores _trainable_param_mask but core uses lora_trainable_filter;
-        only adapter arrays train regardless of the mask — must not crash."""
+    def test_mask_lora_restricts_wrapped_layers(self):
+        """mask(M).lora() wraps only M-selected modules; unwrapped params stay trainable."""
+        import equinox as eqx
+
         m = foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=KEY)
         net = nn.wrap(m)
-        leaves, treedef = jax.tree_util.tree_flatten(eqx.filter(m, eqx.is_array))
-        half_mask = jax.tree_util.tree_unflatten(treedef, [i < len(leaves) // 2 for i in range(len(leaves))])
-        net.mask(half_mask).lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
+
+        # Build a mask that selects ONLY the first layer's weight.
+        all_false = jax.tree_util.tree_map(lambda _: False, m)
+        first_layer_mask = eqx.tree_at(lambda mod: mod.hidden_layers[0].weight, all_false, True)
+
+        net.mask(first_layer_mask).lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
+        assert jnp.isfinite(self._solve_single(net))
+
+    def test_mask_all_false_lora_wraps_nothing(self):
+        """mask(all_false).lora() wraps no layers — model trains all params normally."""
+
+        m = foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=KEY)
+        net = nn.wrap(m)
+        all_false = jax.tree_util.tree_map(lambda _: False, m)
+        net.mask(all_false).lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
+
+        # _lora_param_mask is all-False so no modules should be wrapped after solve
+        # We verify via the state check (lora_config set, but mask was all-False)
+        assert net._lora_param_mask is all_false
         assert jnp.isfinite(self._solve_single(net))
 
     # ── dtype(bfloat16) + freeze + lora ─────────────────────────────────────
