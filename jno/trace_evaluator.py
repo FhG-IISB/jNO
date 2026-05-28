@@ -15,6 +15,7 @@ from .trace import (
     FunctionCall,
     GroupedAssembly,
     Hessian,
+    Integral,
     Jacobian,
     Literal,
     ModelCall,
@@ -36,6 +37,7 @@ def _default_float_dtype():
 
 
 from .differential_operators import DifferentialOperators
+from .integration_operators import IntegrationOperators
 from .utils import get_logger
 
 
@@ -292,6 +294,7 @@ class TraceEvaluator:
         (Choice, "_eval_choice"),
         (Jacobian, "_eval_jacobian"),
         (Hessian, "_eval_hessian"),
+        (Integral, "_eval_integral"),
         (OperationDef, "_eval_operation_def"),
         (TestFunction, "_eval_test_function"),
         (Assembly, "_eval_assembly"),
@@ -1266,6 +1269,158 @@ class TraceEvaluator:
                     return result
 
                 return jax.vmap(hess_single)(points)
+
+    def _eval_integral(self, expr: "Integral", ctx):
+        """Evaluate a mesh-based integral reduction to a scalar.
+
+        Walks the expression tree to find the first spatial Variable, looks up
+        its domain and tag, then evaluates the inner expression at **all** mesh
+        nodes of that region (boundary or volume) and returns a weighted sum.
+        """
+        # 1. Find first spatial Variable in the expression tree.
+        first_spatial_var = None
+
+        def _find_spatial(node):
+            nonlocal first_spatial_var
+            if first_spatial_var is not None:
+                return
+            if isinstance(node, Variable) and getattr(node, "axis", "spatial") == "spatial":
+                bound = ctx.var_bindings.get(id(node), node)
+                b_tag = getattr(bound, "tag", "")
+                # Skip derived normal variables (tag = "n_{spatial_tag}").
+                if getattr(bound, "_domain", None) is not None and not b_tag.startswith("n_"):
+                    first_spatial_var = bound
+                    return
+            for attr in ("target", "left", "right"):
+                child = getattr(node, attr, None)
+                if isinstance(child, Placeholder):
+                    _find_spatial(child)
+            for attr in ("args", "variables"):
+                for child in getattr(node, attr, []):
+                    if isinstance(child, Placeholder):
+                        _find_spatial(child)
+
+        _find_spatial(expr.target)
+
+        if first_spatial_var is None:
+            # Fall back: try any spatial var, including normal vars (e.g. nx.integrate()).
+            # Strip the "n_" prefix to recover the spatial tag.
+            def _find_any_spatial(node):
+                nonlocal first_spatial_var
+                if first_spatial_var is not None:
+                    return
+                if isinstance(node, Variable) and getattr(node, "axis", "spatial") == "spatial":
+                    bound = ctx.var_bindings.get(id(node), node)
+                    if getattr(bound, "_domain", None) is not None:
+                        first_spatial_var = bound
+                        return
+                for attr in ("target", "left", "right"):
+                    child = getattr(node, attr, None)
+                    if isinstance(child, Placeholder):
+                        _find_any_spatial(child)
+                for attr in ("args", "variables"):
+                    for child in getattr(node, attr, []):
+                        if isinstance(child, Placeholder):
+                            _find_any_spatial(child)
+
+            _find_any_spatial(expr.target)
+
+        if first_spatial_var is None:
+            raise ValueError(
+                "Integral: no spatial Variable with a domain found in expression. "
+                "Make sure to call .integrate() on an expression containing spatial variables."
+            )
+
+        raw_tag = first_spatial_var.tag
+        # If we landed on a normal variable (tag = "n_{spatial}"), strip the prefix
+        # to get the actual spatial region tag.
+        tag = raw_tag[2:] if raw_tag.startswith("n_") else raw_tag
+        domain = first_spatial_var._domain
+        mc = domain.mesh_connectivity
+
+        if mc is None:
+            raise ValueError(
+                f"Integral: domain for tag '{tag}' has no mesh_connectivity. "
+                "Mesh-based integration requires an unstructured mesh domain."
+            )
+
+        # 2. Lazy per-tag cache on the domain object.
+        #    Populated on first call (first JIT trace); only fast dict lookups
+        #    + jnp.array() conversions happen on subsequent traces.
+        if not hasattr(domain, "_integral_region_cache"):
+            domain._integral_region_cache = {}
+
+        if tag not in domain._integral_region_cache:
+            # Boundary detection: a tag is a true boundary if it lives in
+            # _boundary_registry AND >50 % of its points are on the global
+            # mesh boundary (guards against interior gmsh physical groups).
+            global_bi = np.asarray(mc["boundary_indices"])
+            is_boundary = False
+            if tag in domain._boundary_registry:
+                reg_pts_idx = np.asarray(domain._boundary_registry[tag]["point_indices"])
+                if len(reg_pts_idx) > 0:
+                    n_on_bnd = int(np.sum(np.isin(reg_pts_idx, global_bi)))
+                    is_boundary = n_on_bnd / len(reg_pts_idx) > 0.5
+
+            if is_boundary:
+                reg_indices = np.asarray(domain._boundary_registry[tag]["point_indices"])
+                region_pts_np = np.asarray(mc["points"])[reg_indices]
+                weights_np = np.asarray(mc["nodal_ds"])[reg_indices]
+                normals_np = None
+                stored = getattr(domain, "normals_by_tag", {}).get(tag)
+                if stored is not None:
+                    normals_np = np.asarray(stored)
+            else:
+                region_pts_np = np.asarray(mc["points"])
+                weights_np = IntegrationOperators.nodal_volumes(mc)
+                normals_np = None
+
+            domain._integral_region_cache[tag] = {
+                "is_boundary": is_boundary,
+                "region_pts": region_pts_np,
+                "weights": weights_np,
+                "normals": normals_np,
+            }
+
+        cached = domain._integral_region_cache[tag]
+        is_boundary = cached["is_boundary"]
+        all_region_pts = jnp.array(cached["region_pts"])
+        weights = jnp.array(cached["weights"])
+
+        # 3. Build updated context: feed all region coordinates under this tag.
+        #    Also update the corresponding normal tag if present (e.g. 'n_wall').
+        normal_tag = f"n_{tag}"
+        coord_tag = tag
+        new_ctx_dict = dict(ctx.context)
+        new_ctx_dict[coord_tag] = all_region_pts
+        if raw_tag != coord_tag:
+            # Expression used the normal tag directly; keep that context key too
+            new_ctx_dict[raw_tag] = new_ctx_dict.get(raw_tag, all_region_pts)
+        if normal_tag in ctx.context and is_boundary and cached["normals"] is not None:
+            new_ctx_dict[normal_tag] = jnp.array(cached["normals"])
+
+        new_ctx = self._EvalCtx(
+            new_ctx_dict,
+            ctx.var_bindings,
+            ctx.key,
+            active_region=ctx.active_region,
+        )
+
+        # 4. Evaluate the inner expression at all region points.
+        u_full = self._dispatch(expr.target, new_ctx)
+
+        # Squeeze trailing size-1 dim that some models add.
+        if u_full.ndim > 1 and u_full.shape[-1] == 1:
+            u_full = u_full.squeeze(-1)
+
+        if u_full.ndim != 1:
+            raise ValueError(
+                f"Integral: inner expression must be scalar-valued (shape (N,)) after squeezing, "
+                f"got shape {u_full.shape}. Compute F·n explicitly before calling .integrate()."
+            )
+
+        # 5. Weighted sum → scalar.
+        return jnp.sum(u_full * weights)
 
     def _eval_operation_def(self, expr, ctx):
         return self._dispatch(expr.expr, ctx)
