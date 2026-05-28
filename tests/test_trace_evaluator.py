@@ -1,5 +1,7 @@
 """Unit tests for jno.trace_evaluator — the dispatch-table evaluator."""
 
+import equinox as eqx
+import foundax
 import jax
 import jax.numpy as jnp
 import pytest
@@ -10,6 +12,7 @@ from jno.trace import (
     Jacobian,
     Literal,
     Model,
+    NetworkGradient,
     OperationDef,
     TensorTag,
 )
@@ -50,7 +53,7 @@ class TestEvalCtx:
 # ======================================================================
 class TestDispatchTable:
     def test_handlers_count(self):
-        assert len(TraceEvaluator._HANDLERS) == 19  # Update this if we add more node types
+        assert len(TraceEvaluator._HANDLERS) == 20  # Update this if we add more node types
 
     def test_handlers_are_strings(self):
         for node_type, method_name in TraceEvaluator._HANDLERS:
@@ -352,3 +355,98 @@ class TestEvalGradient:
         points = {"x": jnp.array([[3.0]])}
         result = compiled({}, points)
         assert jnp.allclose(result, 6.0, atol=0.1)
+
+
+# ======================================================================
+# NetworkGradient evaluation and stop_gradient
+# ======================================================================
+def _make_tiny_net():
+    """Return a small MLP (foundax) and its layer_id, for evaluator tests."""
+    import jno.jnp_ops as jnn
+
+    key = jax.random.PRNGKey(0)
+    net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key))
+    return net
+
+
+class TestNetworkGradientEval:
+    """Evaluate NetworkGradient through TraceEvaluator directly (no crux.core)."""
+
+    def _ctx(self, net, N=5):
+        """Build evaluator + context for N spatial points."""
+        context = {"interior": jnp.linspace(0.1, 0.9, N).reshape(N, 1)}
+        params = {net.layer_id: net.module}
+        ev = TraceEvaluator(params)
+        ctx = ev._EvalCtx(context, {}, None)
+        return ev, ctx
+
+    def test_shape_is_N_x_P(self):
+        """J = u.grad(net) must have shape (N, P) after direct evaluation."""
+        net = _make_tiny_net()
+        x = make_var("interior")
+        u = net(x)
+        J = u.grad(net)
+
+        N = 5
+        ev, ctx = self._ctx(net, N=N)
+        result = ev._dispatch(J, ctx)
+
+        trainable, _ = eqx.partition(net.module, eqx.is_array)
+        P = sum(leaf.size for leaf in jax.tree_util.tree_leaves(trainable))
+        assert result.shape == (N, P)
+
+    def test_stop_gradient_values_unchanged(self):
+        """J and J.stop_gradient() must produce identical numerical values."""
+        net = _make_tiny_net()
+        x = make_var("interior")
+        u = net(x)
+        J = u.grad(net)
+        J_sg = J.stop_gradient()
+
+        ev, ctx = self._ctx(net, N=4)
+        j_val = ev._dispatch(J, ctx)
+        j_sg_val = ev._dispatch(J_sg, ctx)
+        assert jnp.allclose(j_val, j_sg_val)
+
+    def test_stop_gradient_blocks_second_order_grad(self):
+        """jax.grad through J.stop_gradient() must return all-zero leaves."""
+        net = _make_tiny_net()
+        x = make_var("interior")
+        u = net(x)
+        J = u.grad(net)
+        J_sg = J.stop_gradient()
+
+        N = 3
+        context = {"interior": jnp.linspace(0.1, 0.9, N).reshape(N, 1)}
+        trainable, static = eqx.partition(net.module, eqx.is_array)
+
+        def loss_sg(tp):
+            full = eqx.combine(tp, static)
+            ev = TraceEvaluator({net.layer_id: full})
+            ctx = ev._EvalCtx(context, {}, None)
+            return jnp.sum(ev._dispatch(J_sg, ctx))
+
+        grad_sg = jax.grad(loss_sg)(trainable)
+        leaves = jax.tree_util.tree_leaves(grad_sg)
+        assert all(jnp.allclose(leaf, jnp.zeros_like(leaf)) for leaf in leaves)
+
+    def test_without_stop_gradient_has_nonzero_second_order_grad(self):
+        """jax.grad through J (no stop_gradient) must be non-zero for a nonlinear net."""
+        net = _make_tiny_net()
+        x = make_var("interior")
+        u = net(x)
+        J = u.grad(net)
+
+        N = 3
+        context = {"interior": jnp.linspace(0.1, 0.9, N).reshape(N, 1)}
+        trainable, static = eqx.partition(net.module, eqx.is_array)
+
+        def loss(tp):
+            full = eqx.combine(tp, static)
+            ev = TraceEvaluator({net.layer_id: full})
+            ctx = ev._EvalCtx(context, {}, None)
+            return jnp.sum(ev._dispatch(J, ctx))
+
+        grad_full = jax.grad(loss)(trainable)
+        leaves = jax.tree_util.tree_leaves(grad_full)
+        assert any(jnp.any(leaf != 0) for leaf in leaves)

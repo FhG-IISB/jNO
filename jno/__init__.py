@@ -24,6 +24,7 @@ from .trace import (
     Integral,
     Jacobian,
     Model,
+    NetworkGradient,
     OperationCall,
     OperationDef,
     Placeholder,

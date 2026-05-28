@@ -40,6 +40,7 @@ __all__ = [
     "OperationCall",
     "Hessian",
     "Jacobian",
+    "NetworkGradient",
     "collect_operations",
     "collect_tags",
     "get_primary_tag",
@@ -470,6 +471,56 @@ class Placeholder:
             integral = (K(x, t) * net(t)).integrate(var=x)
         """
         return Integral(self, integration_var=var)
+
+    def grad(self, model: "Model") -> "NetworkGradient":
+        """Parameter Jacobian ∂self/∂θ where θ are the trainable weights of *model*.
+
+        Returns an ``(N, P)`` array — N spatial points × P total trainable
+        parameters (all array leaves, flattened).  For multi-dimensional
+        output ``(N, D)`` the result is ``(N, D, P)``.
+
+        **This is a post-training analysis tool**, not a training constraint.
+        Use it via ``crux.eval([u.grad(net)])``.  Placing it inside a training
+        loss would compute second-order derivatives through ``jax.jacrev`` and
+        is prohibitively expensive.
+
+        Cost: O(min(N, P)) AD passes — one backward pass per output point
+        (``jax.jacrev``) or one forward pass per parameter (``jax.jacfwd``).
+        ``jacrev`` is used here, which is efficient when N < P.
+
+        Example::
+
+            u = net(x, y) * x * (1 - x) * y * (1 - y)
+            J  = crux.eval([u.grad(net)])[0]   # (N, P)
+            # Neural Tangent Kernel:
+            K  = J @ J.T                        # (N, N)
+        """
+        if not isinstance(model, Model):
+            raise TypeError(
+                f"grad() expects a Model placeholder, got {type(model).__name__!r}. "
+                "For spatial derivatives use .d(variable) or jno.np.grad(expr, var)."
+            )
+        return NetworkGradient(self, model)
+
+    def stop_gradient(self) -> "FunctionCall":
+        """Treat this expression as a constant during backpropagation.
+
+        Wraps the expression in ``jax.lax.stop_gradient`` so no gradient
+        flows through it.  Useful for penalising a quantity (e.g. the
+        parameter Jacobian) without differentiating through its computation::
+
+            # Cheap Jacobian regularisation — first-order, J treated as constant
+            loss = (u.grad(net).stop_gradient() ** 2).mean()
+
+            # Full second-order version (expensive — differentiates through jacrev)
+            loss = (u.grad(net) ** 2).mean()
+
+        Returns a :class:`FunctionCall` node, so further symbolic operations
+        can be chained normally.
+        """
+        import jax
+
+        return FunctionCall(jax.lax.stop_gradient, [self], name="stop_gradient")
 
 
 class Literal(Placeholder):
@@ -1877,6 +1928,37 @@ class Integral(Placeholder):
         return f"Integral({self.target})"
 
 
+class NetworkGradient(Placeholder):
+    """Per-point Jacobian of an expression w.r.t. a model's trainable parameters.
+
+    Created by ``expr.grad(model)``.  Evaluated by :class:`TraceEvaluator`
+    using ``jax.jacrev`` over ``eqx.partition``-ed parameters.
+
+    **Post-training analysis** (via ``crux.eval``)::
+
+        J = crux.eval([u.grad(net)])   # (B, N, P) — access J[0] for (N, P)
+
+    **Training loss** (second-order AD, expensive)::
+
+        loss = (u.grad(net) ** 2).mean()   # differentiates through jacrev
+
+    **Training loss, stop-gradient variant** (first-order, cheaper)::
+
+        loss = (jax.lax.stop_gradient(u.grad(net)) ** 2).mean()
+
+    Output shape inside ``crux.eval``: ``(B, N, P)`` for scalar-output expressions;
+    ``(B, N, D, P)`` for D-dimensional output.
+    N = spatial points, P = total trainable params of the target model.
+    """
+
+    def __init__(self, target: Placeholder, model_node: "Model"):
+        self.target = target
+        self.model_node = model_node
+
+    def __repr__(self):
+        return f"NetworkGradient({self.target!r}, model={self.model_node!r})"
+
+
 class FemLinearSystem:
     """Container for a linear FEM contribution A x = b.
 
@@ -2312,6 +2394,8 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
             visit(node.target)
             for v in node.variables:
                 visit(v)
+        elif isinstance(node, NetworkGradient):
+            visit(node.target)
         elif isinstance(node, Tracker):
             visit(node.expr)
         elif isinstance(node, Assembly):
@@ -2367,6 +2451,8 @@ def collect_tags(expr: Placeholder) -> set:
             visit(node.target)
             for v in node.variables:
                 visit(v)
+        elif isinstance(node, NetworkGradient):
+            visit(node.target)
         elif isinstance(node, Tracker):
             visit(node.expr)
         elif isinstance(node, (TrialFunction, TestFunction)):
