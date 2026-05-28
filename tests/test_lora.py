@@ -3,8 +3,10 @@
 Covers:
   - Public namespace: jno.lora.<class>
   - Core utilities: apply_lora, merge_lora, lora_trainable_filter
-  - LoRA Zoo: LoRALinear, rsLoRALinear, LoRAFALinear, DoRALinear, PiSSALinear, LoRAXSLinear,
-              VeRALinear, MiLoRALinear, IA3Linear, LoKrLinear, OFTLinear
+  - LoRA Zoo (linear): LoRALinear, rsLoRALinear, LoRAFALinear, DoRALinear, PiSSALinear,
+                        LoRAXSLinear, VeRALinear, MiLoRALinear, IA3Linear, LoKrLinear, OFTLinear
+  - LoRA Zoo (conv):   LoRAConv, rsLoRAConv, LoRAFAConv, DoRAConv, PiSSAConv, LoRAXSConv,
+                        VeRAConv, MiLoRAConv, IA3Conv, LoKrConv, OFTConv
   - apply_lora options: target regex, per-spec routing, list-of-wrappers, custom wrapper
   - Initialisation invariant: all adapters are no-ops at init (output == base)
   - Merge: merged output == adapted output; no LoRAWrapper nodes remain
@@ -16,6 +18,7 @@ Covers:
   - Model.lora() API: config structure, wrapper=, specs=
   - Model control state combinations: mask/freeze/lora/reset chaining
   - Integration: end-to-end training through jno.core, including complex combinations
+  - Conv zoo: apply, init invariant, merge, trainable filter for all 11 conv adapters
 """
 
 import equinox as eqx
@@ -30,20 +33,31 @@ import jno.jnp_ops as jnn
 from jno import LearningRateSchedule as lrs
 from jno.architectures.models import nn
 from jno.lora import (
+    DoRAConv,
     DoRALinear,
+    IA3Conv,
     IA3Linear,
+    LoKrConv,
     LoKrLinear,
+    LoRAConv,
+    LoRAFAConv,
     LoRAFALinear,
     LoRALinear,
     LoRAWrapper,
+    LoRAXSConv,
     LoRAXSLinear,
+    MiLoRAConv,
     MiLoRALinear,
+    OFTConv,
     OFTLinear,
+    PiSSAConv,
     PiSSALinear,
+    VeRAConv,
     VeRALinear,
     apply_lora,
     lora_trainable_filter,
     merge_lora,
+    rsLoRAConv,
     rsLoRALinear,
 )
 
@@ -69,6 +83,23 @@ _ADAPTER_LEAVES: dict[type[LoRAWrapper], int] = {
 
 ZOO = list(_ADAPTER_LEAVES.keys())
 
+# Expected adapter leaf count for the 2-layer conv net with rank=2
+_CONV_ADAPTER_LEAVES: dict[type[LoRAWrapper], int] = {
+    LoRAConv: 4,  # 2 × (lora_A, lora_B)
+    rsLoRAConv: 4,
+    LoRAFAConv: 2,  # 2 × (lora_B,)
+    DoRAConv: 6,  # 2 × (magnitude, lora_A, lora_B)
+    PiSSAConv: 4,
+    LoRAXSConv: 2,  # 2 × (R,)
+    VeRAConv: 4,  # 2 × (b, d)
+    MiLoRAConv: 4,
+    IA3Conv: 2,  # 2 × (scale,)
+    LoKrConv: 4,  # 2 × (kron_A, kron_B)
+    OFTConv: 2,  # 2 × (Q_blocks,)
+}
+
+CONV_ZOO = list(_CONV_ADAPTER_LEAVES.keys())
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -77,6 +108,25 @@ ZOO = list(_ADAPTER_LEAVES.keys())
 
 def _mlp(key=KEY):
     return foundax.mlp(**_MLP_KW, key=key)
+
+
+class _TinyConvNet(eqx.Module):
+    """Two-layer Conv1d net for conv LoRA tests."""
+
+    conv1: eqx.nn.Conv1d
+    conv2: eqx.nn.Conv1d
+
+    def __call__(self, x):
+        return self.conv2(jax.nn.relu(self.conv1(x)))
+
+
+def _conv_net(key=KEY) -> _TinyConvNet:
+    """Conv1d(2→4, k=3) → relu → Conv1d(4→2, k=3); input shape (2, 8)."""
+    k1, k2 = jax.random.split(key)
+    return _TinyConvNet(
+        conv1=eqx.nn.Conv1d(2, 4, kernel_size=3, key=k1, padding=1),
+        conv2=eqx.nn.Conv1d(4, 2, kernel_size=3, key=k2, padding=1),
+    )
 
 
 def _count_wrappers(model) -> int:
@@ -225,6 +275,16 @@ def test_output_equals_base_at_init(cls):
     # float32 rounding even when Q=0, so use a slightly looser tolerance.
     atol = 1e-4 if cls is OFTLinear else 1e-5
     assert jnp.allclose(mlp(x), adapted(x), atol=atol), f"{cls.__name__}: output differs from base at init"
+
+
+@pytest.mark.parametrize("cls", CONV_ZOO)
+def test_conv_output_equals_base_at_init(cls):
+    """Adapted conv model output must equal base at initialisation."""
+    net = _conv_net()
+    adapted = apply_lora(net, rank=2, alpha=1.0, key=KEY, wrappers=(cls,))
+    x = jnp.ones((2, 8))
+    atol = 1e-4 if cls is OFTConv else 1e-5
+    assert jnp.allclose(net(x), adapted(x), atol=atol), f"{cls.__name__}: conv output differs from base at init"
 
 
 # ---------------------------------------------------------------------------
@@ -553,7 +613,7 @@ class TestModelLoraAPI:
     def test_default_config(self):
         net = self._net()
         net.lora(rank=4, alpha=1.0)
-        assert net._lora_config == [{"target": None, "rank": 4, "alpha": 1.0, "wrappers": (LoRALinear,)}]
+        assert net._lora_config == [{"target": None, "rank": 4, "alpha": 1.0, "wrappers": (LoRALinear, LoRAConv)}]
 
     def test_wrapper_param_single(self):
         net = self._net()
@@ -577,10 +637,10 @@ class TestModelLoraAPI:
         assert net._lora_config[0]["rank"] == 4
         assert net._lora_config[1]["rank"] == 16
 
-    def test_specs_default_wrapper_is_lora_linear(self):
+    def test_specs_default_wrapper_is_lora_linear_and_conv(self):
         net = self._net()
         net.lora(specs=[{"target": ".*", "rank": 4, "alpha": 1.0}])
-        assert net._lora_config[0]["wrappers"] == (LoRALinear,)
+        assert net._lora_config[0]["wrappers"] == (LoRALinear, LoRAConv)
 
     def test_specs_per_spec_wrapper(self):
         net = self._net()
@@ -1023,3 +1083,183 @@ class TestIntegrationCombinations:
         loss = (u - jnn.sin(jnn.pi * x)).mse
         stats = jno.core([loss], domain).solve(3)
         assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
+
+
+# ---------------------------------------------------------------------------
+# 12. Conv zoo tests
+# ---------------------------------------------------------------------------
+
+
+class TestConvApplyLora:
+    def test_wraps_conv1d(self):
+        """apply_lora must wrap eqx.nn.Conv1d layers by default."""
+        net = _conv_net()
+        adapted = apply_lora(net, rank=2, alpha=1.0, key=KEY)
+        assert _count_wrappers(adapted) == 2, "Conv1d layers were not wrapped"
+
+    def test_does_not_wrap_linear_with_conv_wrapper(self):
+        """LoRAConv must not wrap LinearLike layers."""
+        mlp = _mlp()
+        adapted = apply_lora(mlp, rank=2, alpha=1.0, key=KEY, wrappers=(LoRAConv,))
+        assert _count_wrappers(adapted) == 0, "LoRAConv incorrectly wrapped a linear layer"
+
+    @pytest.mark.parametrize("cls", CONV_ZOO)
+    def test_conv_adapter_leaf_count(self, cls):
+        net = _conv_net()
+        adapted = apply_lora(net, rank=2, alpha=1.0, key=KEY, wrappers=(cls,))
+        assert _count_adapter_leaves(adapted) == _CONV_ADAPTER_LEAVES[cls]
+
+    def test_no_double_wrap_conv(self):
+        net = _conv_net()
+        adapted = apply_lora(net, rank=2, alpha=1.0, key=KEY, wrappers=(LoRAConv,))
+        adapted2 = apply_lora(adapted, rank=2, alpha=1.0, key=KEY, wrappers=(LoRAConv,))
+        assert _count_wrappers(adapted) == _count_wrappers(adapted2)
+
+
+@pytest.mark.parametrize("cls", CONV_ZOO)
+class TestConvMergeLora:
+    @staticmethod
+    def _perturb(model):
+        leaves, treedef = jax.tree_util.tree_flatten(model)
+        leaves = [v + 0.01 * jnp.ones_like(v) if eqx.is_array(v) else v for v in leaves]
+        return jax.tree_util.tree_unflatten(treedef, leaves)
+
+    def test_merged_output_equals_adapted(self, cls):
+        net = _conv_net()
+        adapted = self._perturb(apply_lora(net, rank=2, alpha=1.0, key=KEY, wrappers=(cls,)))
+        merged = merge_lora(adapted)
+        x = jax.random.normal(KEY, (2, 8))
+        assert jnp.allclose(adapted(x), merged(x), atol=1e-5), f"{cls.__name__}: merge_lora output differs from adapted"
+
+    def test_no_wrapper_nodes_after_merge(self, cls):
+        net = _conv_net()
+        adapted = apply_lora(net, rank=2, alpha=1.0, key=KEY, wrappers=(cls,))
+        merged = merge_lora(adapted)
+        assert _count_wrappers(merged) == 0, f"{cls.__name__}: wrapper nodes remain after merge"
+
+
+@pytest.mark.parametrize("cls", CONV_ZOO)
+class TestConvTrainableFilter:
+    def test_correct_adapter_count(self, cls):
+        net = _conv_net()
+        adapted = apply_lora(net, rank=2, alpha=1.0, key=KEY, wrappers=(cls,))
+        n_true = _count_adapter_leaves(adapted)
+        assert n_true == _CONV_ADAPTER_LEAVES[cls], (
+            f"{cls.__name__}: expected {_CONV_ADAPTER_LEAVES[cls]} adapter leaves, got {n_true}"
+        )
+
+    def test_base_arrays_not_marked(self, cls):
+        net = _conv_net()
+        adapted = apply_lora(net, rank=2, alpha=1.0, key=KEY, wrappers=(cls,))
+        n_true = _count_adapter_leaves(adapted)
+        assert n_true == _CONV_ADAPTER_LEAVES[cls]
+
+
+class TestConvRankClamping:
+    @pytest.mark.parametrize("cls", [PiSSAConv, DoRAConv, LoRAXSConv, MiLoRAConv])
+    def test_conv_rank_clamped_to_min_dim(self, cls):
+        # Conv1d(2, 4, kernel_size=3): out_ch=4, flat_in=2*3=6; min is 4
+        conv = eqx.nn.Conv1d(2, 4, kernel_size=3, key=KEY)
+        adapted = cls(conv, rank=32, alpha=1.0, key=KEY)
+        assert adapted.rank <= min(4, 6)
+
+    def test_oft_conv_rank_clamped_to_out_ch(self):
+        conv = eqx.nn.Conv1d(2, 3, kernel_size=3, key=KEY)
+        adapted = OFTConv(conv, rank=8, alpha=1.0, key=KEY)
+        assert adapted.rank == 3
+
+
+class TestConvPerClassInvariants:
+    def test_lora_conv_lora_b_zero_at_init(self):
+        conv = eqx.nn.Conv1d(2, 4, kernel_size=3, key=KEY)
+        adapted = LoRAConv(conv, rank=2, alpha=1.0, key=KEY)
+        assert jnp.all(adapted.lora_B == 0)
+
+    def test_rs_lora_conv_scaling(self):
+        """rsLoRAConv uses alpha/sqrt(rank); output must differ from LoRAConv for same non-zero B."""
+        conv = eqx.nn.Conv1d(2, 4, kernel_size=3, key=KEY)
+        x = jax.random.normal(KEY, (2, 8))
+        a = LoRAConv(conv, rank=4, alpha=1.0, key=KEY)
+        r = rsLoRAConv(conv, rank=4, alpha=1.0, key=KEY)
+        delta_B = jax.random.normal(KEY, a.lora_B.shape)
+        a = eqx.tree_at(lambda m: m.lora_B, a, delta_B)
+        r = eqx.tree_at(lambda m: m.lora_B, r, delta_B)
+        assert not jnp.allclose(a(x), r(x), atol=1e-6)
+
+    def test_lora_fa_conv_only_b_trainable(self):
+        assert LoRAFAConv.adapter_fields == ("lora_B",)
+
+    def test_dora_conv_magnitude_init(self):
+        conv = eqx.nn.Conv1d(2, 4, kernel_size=3, key=KEY)
+        adapted = DoRAConv(conv, rank=2, alpha=1.0, key=KEY)
+        W_flat = conv.weight.reshape(4, -1)
+        expected = jnp.linalg.norm(W_flat, axis=1)
+        assert jnp.allclose(adapted.magnitude, expected, atol=1e-6)
+
+    def test_pissa_conv_residual(self):
+        conv = eqx.nn.Conv1d(2, 4, kernel_size=3, key=KEY)
+        r, alpha = 2, 4.0
+        adapted = PiSSAConv(conv, rank=r, alpha=alpha, key=KEY)
+        out_ch, flat_in = conv.weight.shape[0], conv.weight.reshape(4, -1).shape[1]
+        W_reconstructed = adapted.base.weight.reshape(out_ch, flat_in) + (alpha / r) * (adapted.lora_B @ adapted.lora_A)
+        assert jnp.allclose(W_reconstructed, conv.weight.reshape(out_ch, flat_in), atol=1e-5)
+
+    def test_lora_xs_conv_r_zero(self):
+        conv = eqx.nn.Conv1d(2, 4, kernel_size=3, key=KEY)
+        adapted = LoRAXSConv(conv, rank=2, alpha=1.0, key=KEY)
+        assert jnp.all(adapted.R == 0)
+
+    def test_vera_conv_b_zero_d_ones(self):
+        conv = eqx.nn.Conv1d(2, 4, kernel_size=3, key=KEY)
+        adapted = VeRAConv(conv, rank=2, alpha=1.0, key=KEY)
+        assert jnp.all(adapted.b == 0)
+        assert jnp.all(adapted.d == 1)
+
+    def test_vera_conv_no_AB_in_pytree(self):
+        conv = eqx.nn.Conv1d(2, 4, kernel_size=3, key=KEY)
+        adapted = VeRAConv(conv, rank=2, alpha=1.0, key=KEY)
+        shapes = {leaf.shape for leaf in jax.tree_util.tree_leaves(eqx.filter(adapted, eqx.is_array))}
+        flat_in = conv.weight.reshape(4, -1).shape[1]
+        assert (2, flat_in) not in shapes, "A-shaped array found in pytree"
+        assert (4, 2) not in shapes, "B-shaped array found in pytree"
+
+    def test_milora_conv_residual(self):
+        conv = eqx.nn.Conv1d(2, 4, kernel_size=3, key=KEY)
+        r, alpha = 2, 4.0
+        adapted = MiLoRAConv(conv, rank=r, alpha=alpha, key=KEY)
+        out_ch, flat_in = conv.weight.shape[0], conv.weight.reshape(4, -1).shape[1]
+        W_reconstructed = adapted.base.weight.reshape(out_ch, flat_in) + (alpha / r) * (adapted.lora_B @ adapted.lora_A)
+        assert jnp.allclose(W_reconstructed, conv.weight.reshape(out_ch, flat_in), atol=1e-5)
+
+    def test_ia3_conv_scale_ones(self):
+        conv = eqx.nn.Conv1d(2, 4, kernel_size=3, key=KEY)
+        adapted = IA3Conv(conv, rank=2, alpha=1.0, key=KEY)
+        assert jnp.all(adapted.scale == 1.0)
+        assert adapted.scale.shape == (4,)
+
+    def test_lokr_conv_kron_b_zero(self):
+        conv = eqx.nn.Conv1d(2, 4, kernel_size=3, key=KEY)
+        adapted = LoKrConv(conv, rank=2, alpha=1.0, key=KEY)
+        assert jnp.all(adapted.kron_B == 0)
+
+    def test_oft_conv_q_zero_r_identity(self):
+        conv = eqx.nn.Conv1d(2, 4, kernel_size=3, key=KEY)
+        adapted = OFTConv(conv, rank=2, alpha=1.0, key=KEY)
+        assert jnp.all(adapted.Q_blocks == 0)
+        R = adapted._R()
+        assert jnp.allclose(R, jnp.eye(4), atol=1e-6)
+
+    def test_default_apply_lora_wraps_both_linear_and_conv(self):
+        """Default _normalize_wrappers wraps both Linear and Conv layers."""
+
+        class MixedNet(eqx.Module):
+            linear: eqx.nn.Linear
+            conv: eqx.nn.Conv1d
+
+            def __call__(self, x_lin, x_conv):
+                return self.linear(x_lin) + self.conv(x_conv).sum()
+
+        k1, k2 = jax.random.split(KEY)
+        net = MixedNet(linear=eqx.nn.Linear(4, 8, key=k1), conv=eqx.nn.Conv1d(2, 4, kernel_size=3, key=k2))
+        adapted = apply_lora(net, rank=2, alpha=1.0, key=KEY)
+        assert _count_wrappers(adapted) == 2, "Expected both linear and conv layers to be wrapped by default"

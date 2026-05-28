@@ -6,9 +6,9 @@ weights are frozen and only the adapter arrays are trained.
 During forward (LoRALinear):  ``y = base(x) + (x @ A.T) @ B.T * (alpha / rank)``
 After merging               :  ``y = merged_linear(x)``  (no runtime overhead)
 
-LoRA Zoo
-~~~~~~~~
-Several ``LoRAWrapper`` subclasses are provided out of the box:
+LoRA Zoo — Linear
+~~~~~~~~~~~~~~~~~
+Several ``LoRAWrapper`` subclasses are provided out of the box for linear layers:
 
 - ``LoRALinear``   — vanilla LoRA (trainable A and B)
 - ``rsLoRALinear`` — rank-stabilized: scales by ``alpha/sqrt(rank)``
@@ -22,11 +22,27 @@ Several ``LoRAWrapper`` subclasses are provided out of the box:
 - ``LoKrLinear``   — Kronecker product adapter: delta_W = kron(kron_A, kron_B)
 - ``OFTLinear``    — block-diagonal orthogonal fine-tuning via Cayley map
 
+LoRA Zoo — Conv
+~~~~~~~~~~~~~~~
+Matching conv variants for ``eqx.nn.Conv1d/2d/3d`` (ConvTranspose excluded):
+
+- ``LoRAConv``   — vanilla LoRA on flattened conv weight
+- ``rsLoRAConv`` — rank-stabilized conv LoRA
+- ``LoRAFAConv`` — frozen-A conv LoRA
+- ``DoRAConv``   — weight-decomposed conv LoRA
+- ``PiSSAConv``  — SVD-initialised conv LoRA (principal components)
+- ``LoRAXSConv`` — extra-small conv LoRA with trainable r×r core
+- ``VeRAConv``   — seed-based frozen A,B; only b,d vectors trained
+- ``MiLoRAConv`` — SVD minor-component conv LoRA
+- ``IA3Conv``    — per-output-channel scale vector
+- ``LoKrConv``   — Kronecker product conv adapter
+- ``OFTConv``    — block-diagonal orthogonal fine-tuning for conv
+
 Custom adapters
 ~~~~~~~~~~~~~~~
 Subclass ``LoRAWrapper`` to support any layer type::
 
-    class LoRAConv(LoRAWrapper):
+    class MyConvAdapter(LoRAWrapper):
         adapter_fields = ("delta_w",)
 
         @classmethod
@@ -37,10 +53,10 @@ Subclass ``LoRAWrapper`` to support any layer type::
         def __call__(self, x): ...
         def merge(self): ...
 
-    net.lora(rank=4, wrapper=LoRAConv)
+    net.lora(rank=4, wrapper=MyConvAdapter)
     net.lora(specs=[
         {"target": "linear", "rank": 4, "alpha": 1.0},
-        {"target": "conv",   "rank": 8, "alpha": 2.0, "wrapper": LoRAConv},
+        {"target": "conv",   "rank": 8, "alpha": 2.0, "wrapper": MyConvAdapter},
     ])
 """
 
@@ -68,6 +84,27 @@ class LinearLike(Protocol):
     out_features: int
 
     def __call__(self, x: jax.Array) -> jax.Array: ...
+
+
+@runtime_checkable
+class ConvLike(Protocol):
+    """Structural type for any conv module LoRA can wrap (excludes ConvTranspose)."""
+
+    weight: jax.Array
+    in_channels: int
+    out_channels: int
+
+    def __call__(self, x: jax.Array) -> jax.Array: ...
+
+
+try:
+    _CONV_TRANSPOSE_TYPES: tuple[type, ...] = (
+        eqx.nn.ConvTranspose1d,
+        eqx.nn.ConvTranspose2d,
+        eqx.nn.ConvTranspose3d,
+    )
+except AttributeError:
+    _CONV_TRANSPOSE_TYPES = ()
 
 
 # =====================================================================
@@ -184,9 +221,14 @@ class _Spec:
 def _normalize_wrappers(
     wrapper: type[LoRAWrapper] | Sequence[type[LoRAWrapper]] | None,
 ) -> tuple[type[LoRAWrapper], ...]:
-    """Coerce the user-facing ``wrapper`` argument to a tuple of wrapper classes."""
+    """Coerce the user-facing ``wrapper`` argument to a tuple of wrapper classes.
+
+    When ``wrapper`` is ``None``, returns ``(LoRALinear, LoRAConv)`` — both linear
+    and conv layers are wrapped by default.  ``LoRAConv`` is resolved at call time
+    (Python late binding), so the forward reference is safe.
+    """
     if wrapper is None:
-        return (LoRALinear,)
+        return (LoRALinear, LoRAConv)  # LoRAConv defined later in this module
     if isinstance(wrapper, type):
         return (wrapper,)
     return tuple(wrapper)
@@ -330,6 +372,16 @@ def lora_trainable_filter(model: eqx.Module) -> object:
 def _linear_applies_to(leaf: Any) -> bool:
     """Shared predicate: any unwrapped LinearLike eqx.Module."""
     return isinstance(leaf, eqx.Module) and not isinstance(leaf, LoRAWrapper) and isinstance(leaf, LinearLike)
+
+
+def _conv_applies_to(leaf: Any) -> bool:
+    """Shared predicate: any unwrapped ConvLike eqx.Module (ConvTranspose excluded)."""
+    return (
+        isinstance(leaf, eqx.Module)
+        and not isinstance(leaf, LoRAWrapper)
+        and isinstance(leaf, ConvLike)
+        and not isinstance(leaf, _CONV_TRANSPOSE_TYPES)
+    )
 
 
 class rsLoRALinear(LoRALinear):
@@ -796,4 +848,541 @@ class OFTLinear(LoRAWrapper):
 
     def merge(self) -> eqx.Module:
         W_new = self._R() @ self.base.weight
+        return eqx.tree_at(lambda m: m.weight, self.base, W_new)
+
+
+# =====================================================================
+# LoRA Zoo — Conv variants (LoRAConv through OFTConv)
+#
+# All conv adapters:
+#   - target ``eqx.nn.Conv1d/2d/3d`` (ConvTranspose excluded)
+#   - flatten weight to (out_channels, flat_in) for linear-algebra ops
+#   - reconstruct via ``eqx.tree_at(lambda m: m.weight, base, W_new)(x)``
+#     so XLA fuses the weight substitution into a single conv kernel call
+#   - store ``weight_shape`` as a static field for shape-safe reshaping
+# =====================================================================
+
+
+class LoRAConv(LoRAWrapper):
+    """Standard LoRA for convolutional layers.
+
+    Flattens the weight tensor to ``(out_channels, flat_in)`` and applies
+    a low-rank update identical to ``LoRALinear``:
+
+        W' = W + (alpha/rank) * lora_B @ lora_A    (in flattened space)
+
+    The updated weight is reshaped back and passed to the base conv via
+    ``eqx.tree_at``, which XLA fuses into a single conv kernel call.
+
+    ``flat_in = in_channels // groups * prod(kernel_size)``
+    """
+
+    adapter_fields = ("lora_A", "lora_B")
+
+    base: ConvLike
+    lora_A: jax.Array  # (rank, flat_in)
+    lora_B: jax.Array  # (out_channels, rank)
+    rank: int = eqx.field(static=True)
+    alpha: float = eqx.field(static=True)
+    weight_shape: tuple = eqx.field(static=True)
+
+    @classmethod
+    def applies_to(cls, leaf: Any) -> bool:
+        return _conv_applies_to(leaf)
+
+    def __init__(self, base: ConvLike, rank: int, alpha: float, *, key: jax.Array):
+        self.base = base
+        self.weight_shape = tuple(base.weight.shape)
+        out_ch = base.weight.shape[0]
+        flat_in = _math.prod(base.weight.shape[1:])
+        self.rank = min(rank, min(out_ch, flat_in))
+        self.alpha = alpha
+        k1, _ = jax.random.split(key)
+        std = 1.0 / jnp.sqrt(flat_in)
+        self.lora_A = jax.random.normal(k1, (self.rank, flat_in)) * std
+        self.lora_B = jnp.zeros((out_ch, self.rank))
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        out_ch = self.weight_shape[0]
+        flat_in = _math.prod(self.weight_shape[1:])
+        W_flat = self.base.weight.reshape(out_ch, flat_in)
+        delta = self.lora_B @ self.lora_A * (self.alpha / self.rank)
+        W_new = (W_flat + delta).reshape(self.weight_shape)
+        return eqx.tree_at(lambda m: m.weight, self.base, W_new)(x)
+
+    def merge(self) -> eqx.Module:
+        out_ch = self.weight_shape[0]
+        flat_in = _math.prod(self.weight_shape[1:])
+        W_flat = self.base.weight.reshape(out_ch, flat_in)
+        delta = self.lora_B @ self.lora_A * (self.alpha / self.rank)
+        W_new = (W_flat + delta).reshape(self.weight_shape)
+        return eqx.tree_at(lambda m: m.weight, self.base, W_new)
+
+
+class rsLoRAConv(LoRAConv):
+    """Rank-Stabilized LoRA for conv layers.  Scales by ``alpha/sqrt(rank)``.
+
+    Reference: https://arxiv.org/abs/2312.03732
+    """
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        out_ch = self.weight_shape[0]
+        flat_in = _math.prod(self.weight_shape[1:])
+        W_flat = self.base.weight.reshape(out_ch, flat_in)
+        delta = self.lora_B @ self.lora_A * (self.alpha / jnp.sqrt(self.rank))
+        W_new = (W_flat + delta).reshape(self.weight_shape)
+        return eqx.tree_at(lambda m: m.weight, self.base, W_new)(x)
+
+    def merge(self) -> eqx.Module:
+        out_ch = self.weight_shape[0]
+        flat_in = _math.prod(self.weight_shape[1:])
+        W_flat = self.base.weight.reshape(out_ch, flat_in)
+        delta = self.lora_B @ self.lora_A * (self.alpha / jnp.sqrt(self.rank))
+        W_new = (W_flat + delta).reshape(self.weight_shape)
+        return eqx.tree_at(lambda m: m.weight, self.base, W_new)
+
+
+class LoRAFAConv(LoRAConv):
+    """Frozen-A LoRA for conv layers.  Only ``lora_B`` is trained.
+
+    Reference: https://arxiv.org/abs/2308.03303
+    """
+
+    adapter_fields = ("lora_B",)  # lora_A stays in pytree but is frozen
+
+
+class DoRAConv(LoRAWrapper):
+    """Weight-Decomposed Low-Rank Adaptation for conv layers.
+
+    Operates on the flattened weight ``(out_channels, flat_in)`` exactly
+    as ``DoRALinear`` does on a 2-D linear weight.
+
+    Reference: https://arxiv.org/abs/2402.09353
+    """
+
+    adapter_fields = ("magnitude", "lora_A", "lora_B")
+
+    base: ConvLike
+    magnitude: jax.Array  # (out_channels,) — learned per-output-channel scale
+    lora_A: jax.Array  # (rank, flat_in)
+    lora_B: jax.Array  # (out_channels, rank)
+    rank: int = eqx.field(static=True)
+    alpha: float = eqx.field(static=True)
+    weight_shape: tuple = eqx.field(static=True)
+
+    @classmethod
+    def applies_to(cls, leaf: Any) -> bool:
+        return _conv_applies_to(leaf)
+
+    def __init__(self, base: ConvLike, rank: int, alpha: float, *, key: jax.Array):
+        self.weight_shape = tuple(base.weight.shape)
+        out_ch = base.weight.shape[0]
+        flat_in = _math.prod(base.weight.shape[1:])
+        self.rank = min(rank, min(out_ch, flat_in))
+        self.alpha = alpha
+        self.base = base
+        W_flat = base.weight.reshape(out_ch, flat_in)
+        self.magnitude = jnp.linalg.norm(W_flat, axis=1)
+        k1, _ = jax.random.split(key)
+        std = 1.0 / jnp.sqrt(flat_in)
+        self.lora_A = jax.random.normal(k1, (self.rank, flat_in)) * std
+        self.lora_B = jnp.zeros((out_ch, self.rank))
+
+    def _dora_weight_flat(self) -> jax.Array:
+        out_ch = self.weight_shape[0]
+        flat_in = _math.prod(self.weight_shape[1:])
+        W_flat = self.base.weight.reshape(out_ch, flat_in)
+        W_flat = W_flat + (self.alpha / self.rank) * (self.lora_B @ self.lora_A)
+        row_norms = jnp.linalg.norm(W_flat, axis=1, keepdims=True)
+        return self.magnitude[:, None] * W_flat / row_norms
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        W_new = self._dora_weight_flat().reshape(self.weight_shape)
+        return eqx.tree_at(lambda m: m.weight, self.base, W_new)(x)
+
+    def merge(self) -> eqx.Module:
+        W_new = self._dora_weight_flat().reshape(self.weight_shape)
+        return eqx.tree_at(lambda m: m.weight, self.base, W_new)
+
+
+class PiSSAConv(LoRAWrapper):
+    """Principal Singular Values and Singular Vectors Adaptation for conv layers.
+
+    SVD is computed on the flattened weight ``(out_channels, flat_in)``.
+    Adapters start from the top-r singular components; base holds the residual.
+
+    Reference: https://arxiv.org/abs/2404.02948
+    """
+
+    adapter_fields = ("lora_A", "lora_B")
+
+    base: ConvLike
+    lora_A: jax.Array  # (rank, flat_in)
+    lora_B: jax.Array  # (out_channels, rank)
+    rank: int = eqx.field(static=True)
+    alpha: float = eqx.field(static=True)
+    weight_shape: tuple = eqx.field(static=True)
+
+    @classmethod
+    def applies_to(cls, leaf: Any) -> bool:
+        return _conv_applies_to(leaf)
+
+    def __init__(self, base: ConvLike, rank: int, alpha: float, *, key: jax.Array):
+        self.weight_shape = tuple(base.weight.shape)
+        out_ch = base.weight.shape[0]
+        flat_in = _math.prod(base.weight.shape[1:])
+        r = min(rank, min(out_ch, flat_in))
+        self.rank = r
+        self.alpha = alpha
+
+        W_flat = base.weight.reshape(out_ch, flat_in)
+        U, S, Vt = jnp.linalg.svd(W_flat, full_matrices=False)
+        U_r, S_r, Vt_r = U[:, :r], S[:r], Vt[:r, :]
+
+        scale = jnp.sqrt(S_r * r / alpha)
+        self.lora_B = U_r * scale[None, :]
+        self.lora_A = Vt_r * scale[:, None]
+
+        W_residual = (W_flat - (alpha / r) * (self.lora_B @ self.lora_A)).reshape(self.weight_shape)
+        self.base = eqx.tree_at(lambda m: m.weight, base, W_residual)
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        out_ch = self.weight_shape[0]
+        flat_in = _math.prod(self.weight_shape[1:])
+        W_flat = self.base.weight.reshape(out_ch, flat_in)
+        W_new = (W_flat + self.lora_B @ self.lora_A * (self.alpha / self.rank)).reshape(self.weight_shape)
+        return eqx.tree_at(lambda m: m.weight, self.base, W_new)(x)
+
+    def merge(self) -> eqx.Module:
+        out_ch = self.weight_shape[0]
+        flat_in = _math.prod(self.weight_shape[1:])
+        W_flat = self.base.weight.reshape(out_ch, flat_in)
+        W_new = (W_flat + self.lora_B @ self.lora_A * (self.alpha / self.rank)).reshape(self.weight_shape)
+        return eqx.tree_at(lambda m: m.weight, self.base, W_new)
+
+
+class LoRAXSConv(LoRAWrapper):
+    """LoRA-XS extra-small adapter for conv layers.
+
+    ``lora_A`` and ``lora_B`` are frozen (from SVD of flattened weight).
+    Only the small ``R`` (rank × rank) matrix is trained.
+
+    Reference: https://arxiv.org/abs/2405.17604
+    """
+
+    adapter_fields = ("R",)
+
+    base: ConvLike
+    lora_A: jax.Array  # (rank, flat_in) — frozen, from SVD
+    lora_B: jax.Array  # (out_channels, rank) — frozen, from SVD
+    R: jax.Array  # (rank, rank) — the only trainable parameter
+    rank: int = eqx.field(static=True)
+    alpha: float = eqx.field(static=True)
+    weight_shape: tuple = eqx.field(static=True)
+
+    @classmethod
+    def applies_to(cls, leaf: Any) -> bool:
+        return _conv_applies_to(leaf)
+
+    def __init__(self, base: ConvLike, rank: int, alpha: float, *, key: jax.Array):
+        self.weight_shape = tuple(base.weight.shape)
+        out_ch = base.weight.shape[0]
+        flat_in = _math.prod(base.weight.shape[1:])
+        r = min(rank, min(out_ch, flat_in))
+        self.rank = r
+        self.alpha = alpha
+        self.base = base
+
+        W_flat = base.weight.reshape(out_ch, flat_in)
+        U, _, Vt = jnp.linalg.svd(W_flat, full_matrices=False)
+        self.lora_A = Vt[:r, :]
+        self.lora_B = U[:, :r]
+        self.R = jnp.zeros((r, r))
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        out_ch = self.weight_shape[0]
+        flat_in = _math.prod(self.weight_shape[1:])
+        W_flat = self.base.weight.reshape(out_ch, flat_in)
+        delta = self.lora_B @ self.R @ self.lora_A * (self.alpha / self.rank)
+        W_new = (W_flat + delta).reshape(self.weight_shape)
+        return eqx.tree_at(lambda m: m.weight, self.base, W_new)(x)
+
+    def merge(self) -> eqx.Module:
+        out_ch = self.weight_shape[0]
+        flat_in = _math.prod(self.weight_shape[1:])
+        W_flat = self.base.weight.reshape(out_ch, flat_in)
+        delta = self.lora_B @ self.R @ self.lora_A * (self.alpha / self.rank)
+        W_new = (W_flat + delta).reshape(self.weight_shape)
+        return eqx.tree_at(lambda m: m.weight, self.base, W_new)
+
+
+class VeRAConv(LoRAWrapper):
+    """Vector-based Random Matrix Adaptation for conv layers.
+
+    A and B are generated on-the-fly from a stored seed (XLA constants).
+    Only per-channel ``b`` (out_channels,) and ``d`` (rank,) are trained.
+
+    Reference: https://arxiv.org/abs/2310.11454
+    """
+
+    adapter_fields = ("b", "d")
+
+    base: ConvLike
+    b: jax.Array  # (out_channels,) — trainable output-channel scale
+    d: jax.Array  # (rank,)         — trainable row scale for A
+    rank: int = eqx.field(static=True)
+    alpha: float = eqx.field(static=True)
+    seed: int = eqx.field(static=True)
+    weight_shape: tuple = eqx.field(static=True)
+
+    @classmethod
+    def applies_to(cls, leaf: Any) -> bool:
+        return _conv_applies_to(leaf)
+
+    def __init__(self, base: ConvLike, rank: int, alpha: float, *, key: jax.Array):
+        self.base = base
+        self.weight_shape = tuple(base.weight.shape)
+        out_ch = base.weight.shape[0]
+        self.rank = rank
+        self.alpha = alpha
+        self.seed = int(jax.random.randint(key, shape=(), minval=0, maxval=2**30))
+        self.b = jnp.zeros(out_ch)
+        self.d = jnp.ones(rank)
+
+    def _frozen_AB(self) -> tuple[jax.Array, jax.Array]:
+        out_ch = self.weight_shape[0]
+        flat_in = _math.prod(self.weight_shape[1:])
+        A = jax.random.normal(jax.random.PRNGKey(self.seed), (self.rank, flat_in)) / jnp.sqrt(flat_in)
+        B = jax.random.normal(jax.random.PRNGKey(self.seed + 1), (out_ch, self.rank))
+        return A, B
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        out_ch = self.weight_shape[0]
+        flat_in = _math.prod(self.weight_shape[1:])
+        A, B = self._frozen_AB()
+        W_flat = self.base.weight.reshape(out_ch, flat_in)
+        delta = (self.b[:, None] * B) @ (self.d[:, None] * A) * (self.alpha / self.rank)
+        W_new = (W_flat + delta).reshape(self.weight_shape)
+        return eqx.tree_at(lambda m: m.weight, self.base, W_new)(x)
+
+    def merge(self) -> eqx.Module:
+        out_ch = self.weight_shape[0]
+        flat_in = _math.prod(self.weight_shape[1:])
+        A, B = self._frozen_AB()
+        W_flat = self.base.weight.reshape(out_ch, flat_in)
+        delta = (self.b[:, None] * B) @ (self.d[:, None] * A) * (self.alpha / self.rank)
+        W_new = (W_flat + delta).reshape(self.weight_shape)
+        return eqx.tree_at(lambda m: m.weight, self.base, W_new)
+
+
+class MiLoRAConv(LoRAWrapper):
+    """Minor Singular Values and Singular Vectors Adaptation for conv layers.
+
+    Like ``PiSSAConv`` but adapts the minor (least-significant) singular
+    components; base retains the principal directions.
+
+    Reference: https://arxiv.org/abs/2405.09913
+    """
+
+    adapter_fields = ("lora_A", "lora_B")
+
+    base: ConvLike
+    lora_A: jax.Array  # (rank, flat_in) — minor right singular vectors
+    lora_B: jax.Array  # (out_channels, rank) — minor left singular vectors
+    rank: int = eqx.field(static=True)
+    alpha: float = eqx.field(static=True)
+    weight_shape: tuple = eqx.field(static=True)
+
+    @classmethod
+    def applies_to(cls, leaf: Any) -> bool:
+        return _conv_applies_to(leaf)
+
+    def __init__(self, base: ConvLike, rank: int, alpha: float, *, key: jax.Array):
+        self.weight_shape = tuple(base.weight.shape)
+        out_ch = base.weight.shape[0]
+        flat_in = _math.prod(base.weight.shape[1:])
+        r = min(rank, min(out_ch, flat_in))
+        self.rank = r
+        self.alpha = alpha
+
+        W_flat = base.weight.reshape(out_ch, flat_in)
+        U, S, Vt = jnp.linalg.svd(W_flat, full_matrices=False)
+        U_r, S_r, Vt_r = U[:, -r:], S[-r:], Vt[-r:, :]
+
+        scale = jnp.sqrt(S_r * r / alpha)
+        self.lora_B = U_r * scale[None, :]
+        self.lora_A = Vt_r * scale[:, None]
+
+        W_residual = (W_flat - (alpha / r) * (self.lora_B @ self.lora_A)).reshape(self.weight_shape)
+        self.base = eqx.tree_at(lambda m: m.weight, base, W_residual)
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        out_ch = self.weight_shape[0]
+        flat_in = _math.prod(self.weight_shape[1:])
+        W_flat = self.base.weight.reshape(out_ch, flat_in)
+        W_new = (W_flat + self.lora_B @ self.lora_A * (self.alpha / self.rank)).reshape(self.weight_shape)
+        return eqx.tree_at(lambda m: m.weight, self.base, W_new)(x)
+
+    def merge(self) -> eqx.Module:
+        out_ch = self.weight_shape[0]
+        flat_in = _math.prod(self.weight_shape[1:])
+        W_flat = self.base.weight.reshape(out_ch, flat_in)
+        W_new = (W_flat + self.lora_B @ self.lora_A * (self.alpha / self.rank)).reshape(self.weight_shape)
+        return eqx.tree_at(lambda m: m.weight, self.base, W_new)
+
+
+class IA3Conv(LoRAWrapper):
+    """IA³ output-scaling adapter for conv layers.
+
+    Applies a learned per-output-channel scale to the conv weight before
+    the convolution.  No low-rank matrices — trainable params = ``out_channels``.
+
+    Reference: https://arxiv.org/abs/2205.05638
+    """
+
+    adapter_fields = ("scale",)
+
+    base: ConvLike
+    scale: jax.Array  # (out_channels,) — learned per-channel multiplier
+    rank: int = eqx.field(static=True)
+    alpha: float = eqx.field(static=True)
+    weight_shape: tuple = eqx.field(static=True)
+
+    @classmethod
+    def applies_to(cls, leaf: Any) -> bool:
+        return _conv_applies_to(leaf)
+
+    def __init__(self, base: ConvLike, rank: int, alpha: float, *, key: jax.Array):
+        self.base = base
+        self.weight_shape = tuple(base.weight.shape)
+        out_ch = base.weight.shape[0]
+        self.rank = rank
+        self.alpha = alpha
+        self.scale = jnp.ones(out_ch)
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        # Broadcast scale over all non-output axes: (out_ch, 1, 1, ...)
+        scale_shape = (self.weight_shape[0],) + (1,) * (len(self.weight_shape) - 1)
+        W_new = self.base.weight * self.scale.reshape(scale_shape)
+        return eqx.tree_at(lambda m: m.weight, self.base, W_new)(x)
+
+    def merge(self) -> eqx.Module:
+        scale_shape = (self.weight_shape[0],) + (1,) * (len(self.weight_shape) - 1)
+        W_new = self.base.weight * self.scale.reshape(scale_shape)
+        return eqx.tree_at(lambda m: m.weight, self.base, W_new)
+
+
+class LoKrConv(LoRAWrapper):
+    """Kronecker-product adapter for conv layers.
+
+    The weight delta is a Kronecker product of two small matrices, cropped to
+    ``(out_channels, flat_in)`` and reshaped to the original weight shape.
+
+    Reference: https://arxiv.org/abs/2212.10650
+    """
+
+    adapter_fields = ("kron_A", "kron_B")
+
+    base: ConvLike
+    kron_A: jax.Array  # (rank, rank)
+    kron_B: jax.Array  # (ceil(out_ch/rank), ceil(flat_in/rank))
+    rank: int = eqx.field(static=True)
+    alpha: float = eqx.field(static=True)
+    weight_shape: tuple = eqx.field(static=True)
+
+    @classmethod
+    def applies_to(cls, leaf: Any) -> bool:
+        return _conv_applies_to(leaf)
+
+    def __init__(self, base: ConvLike, rank: int, alpha: float, *, key: jax.Array):
+        self.weight_shape = tuple(base.weight.shape)
+        out_ch = base.weight.shape[0]
+        flat_in = _math.prod(base.weight.shape[1:])
+        r = min(rank, min(out_ch, flat_in))
+        self.rank = r
+        self.alpha = alpha
+        self.base = base
+
+        m2 = _math.ceil(out_ch / r)
+        n2 = _math.ceil(flat_in / r)
+        self.kron_A = jax.random.normal(key, (r, r)) / jnp.sqrt(r)
+        self.kron_B = jnp.zeros((m2, n2))
+
+    def _delta_W_flat(self) -> jax.Array:
+        out_ch = self.weight_shape[0]
+        flat_in = _math.prod(self.weight_shape[1:])
+        return jnp.kron(self.kron_A, self.kron_B)[:out_ch, :flat_in]
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        out_ch = self.weight_shape[0]
+        flat_in = _math.prod(self.weight_shape[1:])
+        W_flat = self.base.weight.reshape(out_ch, flat_in)
+        W_new = (W_flat + self._delta_W_flat() * (self.alpha / self.rank)).reshape(self.weight_shape)
+        return eqx.tree_at(lambda m: m.weight, self.base, W_new)(x)
+
+    def merge(self) -> eqx.Module:
+        out_ch = self.weight_shape[0]
+        flat_in = _math.prod(self.weight_shape[1:])
+        W_flat = self.base.weight.reshape(out_ch, flat_in)
+        W_new = (W_flat + self._delta_W_flat() * (self.alpha / self.rank)).reshape(self.weight_shape)
+        return eqx.tree_at(lambda m: m.weight, self.base, W_new)
+
+
+class OFTConv(LoRAWrapper):
+    """Orthogonal Fine-Tuning for conv layers.
+
+    The block-diagonal Cayley map is applied to the output-channel axis of
+    the flattened weight ``(out_channels, flat_in)``, identical to
+    ``OFTLinear`` on a 2-D weight.
+
+    Reference: https://arxiv.org/abs/2306.07280
+    """
+
+    adapter_fields = ("Q_blocks",)
+
+    base: ConvLike
+    Q_blocks: jax.Array  # (n_blocks, rank, rank)
+    rank: int = eqx.field(static=True)
+    alpha: float = eqx.field(static=True)
+    n_blocks: int = eqx.field(static=True)
+    weight_shape: tuple = eqx.field(static=True)
+
+    @classmethod
+    def applies_to(cls, leaf: Any) -> bool:
+        return _conv_applies_to(leaf)
+
+    def __init__(self, base: ConvLike, rank: int, alpha: float, *, key: jax.Array):
+        self.weight_shape = tuple(base.weight.shape)
+        out_ch = base.weight.shape[0]
+        r = min(rank, out_ch)
+        self.rank = r
+        self.alpha = alpha
+        self.n_blocks = _math.ceil(out_ch / r)
+        self.base = base
+        self.Q_blocks = jnp.zeros((self.n_blocks, r, r))
+
+    def _R(self) -> jax.Array:
+        out_ch = self.weight_shape[0]
+        eye = jnp.eye(self.rank)
+
+        def cayley(Q: jax.Array) -> jax.Array:
+            Qs = (Q - Q.T) / 2
+            return (eye - Qs) @ jnp.linalg.inv(eye + Qs)
+
+        blocks = jax.vmap(cayley)(self.Q_blocks)
+        R_padded = jax.scipy.linalg.block_diag(*[blocks[i] for i in range(self.n_blocks)])
+        return R_padded[:out_ch, :out_ch]
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        out_ch = self.weight_shape[0]
+        flat_in = _math.prod(self.weight_shape[1:])
+        W_flat = self.base.weight.reshape(out_ch, flat_in)
+        W_new = (self._R() @ W_flat).reshape(self.weight_shape)
+        return eqx.tree_at(lambda m: m.weight, self.base, W_new)(x)
+
+    def merge(self) -> eqx.Module:
+        out_ch = self.weight_shape[0]
+        flat_in = _math.prod(self.weight_shape[1:])
+        W_flat = self.base.weight.reshape(out_ch, flat_in)
+        W_new = (self._R() @ W_flat).reshape(self.weight_shape)
         return eqx.tree_at(lambda m: m.weight, self.base, W_new)
