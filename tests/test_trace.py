@@ -345,12 +345,12 @@ class TestModelMask:
         """mask().lora() sets _lora_config as a list of dicts and consumes the mask scope."""
         import jax
 
-        from jno.lora import LoRALinear
+        from jno.lora import LoRAConv, LoRALinear
 
         u_net = self._make_eqx_model()
         all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
         u_net.mask(all_true).lora(rank=4, alpha=1.0)
-        assert u_net._lora_config == [{"target": None, "rank": 4, "alpha": 1.0, "wrappers": (LoRALinear,)}]
+        assert u_net._lora_config == [{"target": None, "rank": 4, "alpha": 1.0, "wrappers": (LoRALinear, LoRAConv)}]
         assert u_net._mask_scope_pending is False
 
     def test_manual_mask_optimizer_creates_group_and_keeps_global_fallback(self):
@@ -435,7 +435,7 @@ class TestModelMask:
         assert u_net._frozen is True
 
     def test_mask_scope_is_one_shot_for_lora(self):
-        """mask().lora() consumes mask scope and stores base trainability mask."""
+        """mask().lora() consumes mask scope and stores mask in _lora_param_mask (not inverted)."""
         import jax
 
         u_net = self._make_eqx_model()
@@ -443,27 +443,29 @@ class TestModelMask:
 
         u_net.mask(all_false).lora(rank=2, alpha=1.0)
 
-        from jno.lora import LoRALinear
+        from jno.lora import LoRAConv, LoRALinear
 
-        assert u_net._lora_config == [{"target": None, "rank": 2, "alpha": 1.0, "wrappers": (LoRALinear,)}]
+        assert u_net._lora_config == [{"target": None, "rank": 2, "alpha": 1.0, "wrappers": (LoRALinear, LoRAConv)}]
         assert u_net._mask_scope_pending is False
-        leaves = jax.tree_util.tree_leaves(u_net._trainable_param_mask)
-        assert all(v is True for v in leaves if isinstance(v, bool))
+        # Mask stored as-is (not inverted) — all_false means no module is selected for LoRA
+        assert u_net._lora_param_mask is all_false
+        # _trainable_param_mask is no longer used by mask().lora()
+        assert u_net._trainable_param_mask is None
 
-    def test_plain_lora_clears_stale_trainable_mask(self):
-        """A plain lora() call should reset stale base trainability overrides."""
+    def test_plain_lora_clears_stale_lora_mask(self):
+        """A plain lora() call should clear any previously set _lora_param_mask."""
         import jax
 
         u_net = self._make_eqx_model()
         all_false = jax.tree_util.tree_map(lambda _: False, u_net.module)
 
-        # First set a custom base trainability mask via masked LoRA.
+        # First set a lora param mask via masked LoRA.
         u_net.mask(all_false).lora(rank=2, alpha=1.0)
-        assert u_net._trainable_param_mask is not None
+        assert u_net._lora_param_mask is not None
 
-        # A later plain lora() should restore default LoRA semantics.
+        # A later plain lora() should restore default LoRA semantics (no mask restriction).
         u_net.lora(rank=4, alpha=1.0)
-        assert u_net._trainable_param_mask is None
+        assert u_net._lora_param_mask is None
 
     def test_mask_reset_clears_param_mask(self):
         """reset() clears _param_mask back to None."""
@@ -475,6 +477,17 @@ class TestModelMask:
         assert u_net._param_mask is not None
         u_net.reset()
         assert u_net._param_mask is None
+
+    def test_mask_reset_clears_lora_param_mask(self):
+        """reset() clears _lora_param_mask back to None."""
+        import jax
+
+        u_net = self._make_eqx_model()
+        all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
+        u_net.mask(all_true).lora(rank=2, alpha=1.0)
+        assert u_net._lora_param_mask is not None
+        u_net.reset()
+        assert u_net._lora_param_mask is None
 
     def test_mask_via_model_call_proxies_to_model(self):
         """ModelCall.mask() delegates to the underlying Model."""
