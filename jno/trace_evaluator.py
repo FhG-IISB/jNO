@@ -19,6 +19,7 @@ from .trace import (
     Jacobian,
     Literal,
     ModelCall,
+    Noise,
     OperationCall,
     OperationDef,
     Placeholder,
@@ -300,6 +301,7 @@ class TraceEvaluator:
         (Assembly, "_eval_assembly"),
         (StateField, "_eval_state_field"),
         (GroupedAssembly, "_eval_grouped_assembly"),
+        (Noise, "_eval_noise"),
     ]
 
     def _dispatch(self, expr, ctx):
@@ -615,6 +617,47 @@ class TraceEvaluator:
 
     def _eval_state_field(self, expr, ctx):
         return self._dispatch(expr.expr, ctx)
+
+    def _eval_noise(self, expr, ctx):
+        # Infer the number of active spatial points from context
+        n = ctx.context.get("__active_spatial_n__", None)
+        if n is None:
+            for k, v in ctx.context.items():
+                if not k.startswith("__") and hasattr(v, "shape") and len(v.shape) >= 1:
+                    n = v.shape[0]
+                    break
+            if n is None:
+                n = 1
+
+        ndim = int(expr.params.get("ndim", 1))
+        shape = (n, ndim)
+
+        if ctx.key is None:
+            return jnp.zeros(shape)
+
+        # fold_in gives each Noise node a unique, deterministic subkey derived
+        # from the step key — reproducible when the solver seed is fixed.
+        subkey = jax.random.fold_in(ctx.key, expr._noise_id)
+
+        dist = expr.distribution
+        if dist == "gaussian":
+            return jax.random.normal(subkey, shape) * expr.params.get("std", 1.0)
+        elif dist == "uniform":
+            return jax.random.uniform(
+                subkey, shape,
+                minval=expr.params.get("low", -1.0),
+                maxval=expr.params.get("high", 1.0),
+            )
+        elif dist == "laplace":
+            std = expr.params.get("std", 1.0)
+            # Inverse-CDF of Laplace via Uniform(-0.5, 0.5)
+            u = jax.random.uniform(subkey, shape, minval=1e-6, maxval=1.0 - 1e-6) - 0.5
+            return -jnp.sign(u) * jnp.log(1.0 - 2.0 * jnp.abs(u)) * std / jnp.sqrt(2.0)
+        else:
+            raise ValueError(
+                f"Unknown noise distribution {expr.distribution!r}. "
+                "Choose from: 'gaussian', 'uniform', 'laplace'."
+            )
 
     def _eval_tunable_module_call(self, expr, ctx):
         tunable = expr.model
@@ -2113,4 +2156,7 @@ class TraceEvaluator:
             vars_str = ", ".join(str(v) for v in node.variables)
             scheme_str = f", {node.scheme[:2]}" if node.scheme else ""
             return uid, f"{kind}([{vars_str}]{scheme_str})"
+        if isinstance(node, Noise):
+            params_str = ", ".join(f"{k}={v}" for k, v in node.params.items())
+            return uid, f"Noise({node.distribution}, {params_str})"
         return uid, type(node).__name__

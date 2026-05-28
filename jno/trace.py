@@ -40,6 +40,7 @@ __all__ = [
     "OperationCall",
     "Hessian",
     "Jacobian",
+    "Noise",
     "collect_operations",
     "collect_tags",
     "get_primary_tag",
@@ -1875,6 +1876,35 @@ class Integral(Placeholder):
         if self.integration_var is not None:
             return f"Integral({self.target}, outer={self.integration_var})"
         return f"Integral({self.target})"
+
+
+class Noise(Placeholder):
+    """Stochastic noise term regenerated every training step.
+
+    Created by :mod:`jno.noise`.  Produces an array of shape ``(N, ndim)``
+    where ``N`` is inferred at evaluation time from the number of active
+    spatial points and ``ndim`` (default 1) controls the trailing dimension.
+
+    The realisation is derived from the solver's step PRNG key via
+    ``jax.random.fold_in``, so it is fully reproducible when the global seed
+    is fixed (via :func:`jno.setup` or ``.jno.toml``).
+
+    Parameters
+    ----------
+    distribution : str
+        ``'gaussian'``, ``'uniform'``, or ``'laplace'``.
+    **params
+        Distribution-specific kwargs: ``std``, ``low``, ``high``, ``ndim``.
+    """
+
+    def __init__(self, distribution: str, **params):
+        self.distribution = distribution
+        self.params = params
+        self._noise_id = _next_op_id()
+
+    def __repr__(self):
+        params_str = ", ".join(f"{k}={v}" for k, v in self.params.items())
+        return f"Noise({self.distribution}, {params_str})"
 
 
 class FemLinearSystem:
