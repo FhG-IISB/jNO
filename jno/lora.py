@@ -37,6 +37,7 @@ from .architectures.lora import (
     apply_lora,
     lora_trainable_filter,
     merge_lora,
+    partial_lora_trainable_filter,
     rsLoRAConv,
     rsLoRALinear,
 )
@@ -74,4 +75,5 @@ __all__ = [
     "apply_lora",
     "merge_lora",
     "lora_trainable_filter",
+    "partial_lora_trainable_filter",
 ]

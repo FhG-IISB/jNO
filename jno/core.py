@@ -24,6 +24,9 @@ from .architectures.lora import (
 from .architectures.lora import (
     merge_lora as _merge_lora,
 )
+from .architectures.lora import (
+    partial_lora_trainable_filter as _partial_lora_trainable_filter,
+)
 from .domain import DomainData, domain
 from .trace import (
     BinaryOp,
@@ -1126,7 +1129,12 @@ class core:
                 self.rng, key = jax.random.split(self.rng)
                 n_params_before = sum(param.size for param in jax.tree_util.tree_leaves(models[lid]) if eqx.is_array(param))
 
-                models[lid] = _apply_lora(models[lid], key=key, specs=fm._lora_config)
+                models[lid] = _apply_lora(
+                    models[lid],
+                    key=key,
+                    specs=fm._lora_config,
+                    param_mask=getattr(fm, "_lora_param_mask", None),
+                )
 
                 model_after = models[lid]
                 n_params_after = sum(param.size for param in jax.tree_util.tree_leaves(model_after) if eqx.is_array(param))
@@ -1171,16 +1179,15 @@ class core:
             fm = flax_mods.get(lid)
             if fm is not None and fm._lora_config is not None:
                 # LoRA modes:
-                # 1) fm._frozen=True  -> freeze all base params, train LoRA only
-                # 2) fm._trainable_param_mask -> custom base trainability mask,
-                #                        train non-target base + LoRA params
-                # 3) otherwise        -> default LoRA behaviour (freeze all base)
+                # 1) fm._frozen=True  -> freeze everything; only LoRA adapters trainable.
+                #    (freeze().lora() or freeze().mask(M).lora() both land here — base
+                #    params outside LoRA-wrapped layers are frozen too.)
+                # 2) otherwise        -> partial LoRA: adapters trainable, wrapped bases
+                #    frozen, every other param stays trainable (mask(M).lora() case).
                 if fm._frozen:
                     filter_spec[lid] = _lora_trainable_filter(model)
-                elif fm._trainable_param_mask is not None:
-                    filter_spec[lid] = _lora_trainable_filter(model)
                 else:
-                    filter_spec[lid] = _lora_trainable_filter(model)
+                    filter_spec[lid] = _partial_lora_trainable_filter(model)
             elif fm is not None and fm._frozen:
                 # Whole model frozen – no arrays trainable
                 filter_spec[lid] = jax.tree_util.tree_map(lambda leaf: False, model)

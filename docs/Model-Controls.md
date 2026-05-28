@@ -124,8 +124,31 @@ With `mask(...).freeze()`, selected leaves are frozen and non-selected leaves re
 ## 3. LoRA
 
 LoRA inserts trainable low-rank adapter matrices into matching layers while keeping base weights
-frozen. By default `LoRALinear` is used, which targets any layer with `weight`, `in_features`, and
-`out_features` attributes (jNO Linear, foundax Linear, `eqx.nn.Linear`).
+frozen. By default both linear layers (`weight`, `in_features`, `out_features`) and conv layers
+(`weight`, `in_channels`, `out_channels`) are wrapped automatically.
+
+### `target=` vs `mask()` — two ways to restrict which layers get LoRA
+
+Both restrict which layers receive LoRA adapters, but they select differently:
+
+| | `target=` / `specs=` | `mask(M).lora()` |
+|---|---|---|
+| **Selects layers by** | regex on pytree path string | boolean pytree (data-driven) |
+| **Layers not selected** | left completely untouched | left completely untouched |
+| **Use when** | you know the layer names up front | you have a precomputed boolean mask (e.g. from `eqx.tree_at`) |
+
+```python
+# Path-regex: only "encoder.*" layers get LoRA
+net.lora(rank=8, target="encoder")
+
+# Data-driven: only layers whose params are True in encoder_mask get LoRA
+net.mask(encoder_mask).lora(rank=8)
+```
+
+They can be combined — only layers that pass **both** the mask AND the regex are wrapped:
+```python
+net.mask(encoder_mask).lora(rank=8, target="encoder")
+```
 
 ### Uniform LoRA
 
@@ -133,7 +156,7 @@ frozen. By default `LoRALinear` is used, which targets any layer with `weight`, 
 net.lora(rank=8, alpha=16)
 ```
 
-Restrict to a subset of layers with a path-regex:
+Restrict *which layers get adapters* with a path-regex (layers not matching are left untouched):
 
 ```python
 net.lora(rank=8, alpha=16, target="encoder")
@@ -155,40 +178,40 @@ matching spec wins.
 
 ### Custom adapter classes
 
-Pass any `LoRAWrapper` subclass via `wrapper` to support layer types beyond linear:
+Conv and linear adapters are already in the zoo — see the tables above.  To support a layer type
+not covered (e.g. an embedding or a custom module), subclass `LoRAWrapper`:
 
 ```python
 from jno.lora import LoRAWrapper
 import equinox as eqx
+import jax.numpy as jnp
 
-class LoRAConv(LoRAWrapper):
-	adapter_fields = ("delta_w",)            # names of trainable adapter attributes
+class MyEmbeddingAdapter(LoRAWrapper):
+	adapter_fields = ("delta",)
 	base: eqx.Module
-	delta_w: jax.Array
+	delta: jax.Array
 	rank: int = eqx.field(static=True)
 	alpha: float = eqx.field(static=True)
 
 	@classmethod
 	def applies_to(cls, leaf):
-		return isinstance(leaf, eqx.nn.Conv2d) and not isinstance(leaf, LoRAWrapper)
+		return isinstance(leaf, eqx.nn.Embedding) and not isinstance(leaf, LoRAWrapper)
 
 	def __init__(self, base, rank, alpha, *, key):
 		self.base, self.rank, self.alpha = base, rank, alpha
-		self.delta_w = jnp.zeros_like(base.weight)
+		self.delta = jnp.zeros_like(base.weight)
 
 	def __call__(self, x):
-		w = self.base.weight + self.delta_w * (self.alpha / self.rank)
-		return self.base(x)   # simplified — use eqx.tree_at to swap weight
+		return self.base(x) + self.delta[x] * (self.alpha / self.rank)
 
 	def merge(self):
-		w = self.base.weight + self.delta_w * (self.alpha / self.rank)
+		w = self.base.weight + self.delta * (self.alpha / self.rank)
 		return eqx.tree_at(lambda m: m.weight, self.base, w)
 
-# Apply to all matching layers
-net.lora(rank=4, wrapper=LoRAConv)
+net.lora(rank=4, wrapper=MyEmbeddingAdapter)
 
-# Pass a list — tried in order, first applies_to() match wins per leaf
-net.lora(rank=4, wrapper=[LoRALinear, LoRAConv])
+# Mix with built-in zoo classes — first applies_to() match wins per leaf
+net.lora(rank=4, wrapper=[LoRALinear, LoRAConv, MyEmbeddingAdapter])
 ```
 
 Per-target specs may carry their own `"wrapper"` key, which overrides the global default for that
@@ -196,22 +219,31 @@ group:
 
 ```python
 net.lora(
-	wrapper=LoRALinear,          # global default
 	specs=[
 		{"target": "linear", "rank": 4,  "alpha": 1.0},
-		{"target": "conv",   "rank": 8,  "alpha": 2.0, "wrapper": LoRAConv},
+		{"target": "embed",  "rank": 8,  "alpha": 2.0, "wrapper": MyEmbeddingAdapter},
 	]
 )
 ```
 
-### Combine mask + LoRA for base-trainability control
+### Combine mask + LoRA to target specific layers
+
+`mask(M)` sets the selection scope; the next command determines what happens to M-selected elements:
 
 ```python
-# Selected base leaves are frozen; non-selected base leaves stay trainable.
-net.mask(decoder_mask).lora(rank=8, alpha=16)
+# Only layers selected by encoder_mask get LoRA adapters.
+# Layers not in the mask remain fully trainable (not wrapped).
+net.mask(encoder_mask).lora(rank=8, alpha=16)
 
-# Freeze all base params; train LoRA adapters only.
+# mask().freeze(): freeze the selected params (no LoRA).
+net.mask(encoder_mask).freeze()
+
+# freeze().lora(): freeze all base params; only LoRA adapters train.
+# (freeze first, then apply LoRA everywhere)
 net.freeze().lora(rank=8, alpha=16)
+
+# freeze().mask(M).lora(): wrap only M-selected layers; freeze everything else.
+net.freeze().mask(encoder_mask).lora(rank=8, alpha=16)
 ```
 
 ### Default behaviour: linear and conv
