@@ -444,6 +444,29 @@ class Placeholder:
         """
         return Hessian(self, list(variables), scheme, trace=False)
 
+    # ------------------------------------------------------------------
+    # Integration — method-style API
+    # ------------------------------------------------------------------
+
+    def integrate(self) -> "Integral":
+        """Integrate this expression over its mesh domain region.
+
+        The region (boundary vs volume) is auto-detected from the Variable
+        tags inside the expression: if the tag is registered in
+        ``domain._boundary_registry`` it is treated as a boundary integral
+        (∫_∂Ω f ds), otherwise as a volume integral (∫_Ω f dV).
+
+        The expression is evaluated at **all** mesh nodes of the region,
+        weighted by the nodal measures from ``mesh_connectivity``, and
+        reduced to a scalar.  The user is responsible for computing any
+        desired F·n dot-product before calling ``.integrate()``::
+
+            (Fx(x_b, y_b) * nx + Fy(x_b, y_b) * ny).integrate()  # flux
+            (u(x_b, y_b) - ref).square().integrate()               # boundary loss
+            u(x, y).integrate()                                    # volume integral
+        """
+        return Integral(self)
+
 
 class Literal(Placeholder):
     """Concrete scalar/array embedded in the trace (no trainable params)."""
@@ -1825,6 +1848,22 @@ class Jacobian(Placeholder):
     def __repr__(self):
         var_names = ", ".join(str(v) for v in self.variables)
         return f"Jacobian({self.target}, [{var_names}])"
+
+
+class Integral(Placeholder):
+    """Mesh-based integral reduction of an expression over its domain region.
+
+    Created by :meth:`Placeholder.integrate`.  The region (boundary vs volume)
+    is auto-detected at evaluation time from the Variable tags inside
+    ``target`` via ``domain._boundary_registry``.  Reduces to a scalar.
+    """
+
+    def __init__(self, target: "Placeholder"):
+        self.target = target
+        _propagate_weak(self, target)
+
+    def __repr__(self):
+        return f"Integral({self.target})"
 
 
 class FemLinearSystem:
