@@ -50,14 +50,14 @@ import jno
 from jno import LearningRateSchedule as lrs
 
 π = jno.np.pi
-σ = 0.5   # noise amplitude on the forcing
+σ = 0.5  # noise amplitude on the forcing
 
 # ── Domain ─────────────────────────────────────────────────────────────────────
 domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05))
 x, y, _ = domain.variable("interior")
 
 # ── Deterministic forcing and exact solution ───────────────────────────────────
-f       = 2 * π**2 * jno.np.sin(π * x) * jno.np.sin(π * y)
+f = 2 * π**2 * jno.np.sin(π * x) * jno.np.sin(π * y)
 u_exact = jno.np.sin(π * x) * jno.np.sin(π * y)
 
 # ── Network (hard BCs via ansatz) ──────────────────────────────────────────────
@@ -72,16 +72,16 @@ net = jno.nn.wrap(
 )
 net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 10, 1e-5))
 
-u = net(x, y) * x * (1 - x) * y * (1 - y)   # u = 0 on ∂Ω by construction
+u = net(x, y) * x * (1 - x) * y * (1 - y)  # u = 0 on ∂Ω by construction
 
 # ── Stochastic PDE residual ────────────────────────────────────────────────────
 # The noise term is resampled every training step.  Its expectation is zero,
 # so E[loss] is minimised by the deterministic solution u*(x,y) = sin(πx)sin(πy).
-noise   = jno.noise.gaussian(std=σ)
-pde     = -jno.np.laplacian(u, [x, y]) - f - noise
+noise = jno.noise.gaussian(std=σ)
+pde = -jno.np.laplacian(u, [x, y]) - f - noise
 
 # ── Solve ──────────────────────────────────────────────────────────────────────
-crux    = jno.core([pde.mse], domain)
+crux = jno.core([pde.mse], domain)
 history = crux.solve(40_000)
 
 # ── Evaluate ───────────────────────────────────────────────────────────────────
@@ -94,8 +94,6 @@ print(f"Relative L2 error: {rel_l2:.4e}")
 # ── Record ─────────────────────────────────────────────────────────────────────
 results_file = Path(__file__).parent.parent.parent / "tutorial_results.txt"
 with open(results_file, "a") as f_out:
-    f_out.write(
-        f"07_stochastic/stochastic_forcing_2d.py | epochs=40000 | sigma={σ} | rel_L2={rel_l2:.6e}\n"
-    )
+    f_out.write(f"07_stochastic/stochastic_forcing_2d.py | epochs=40000 | sigma={σ} | rel_L2={rel_l2:.6e}\n")
 
 assert rel_l2 < 1e-1, f"relative L2 error too large: {rel_l2:.3e}"

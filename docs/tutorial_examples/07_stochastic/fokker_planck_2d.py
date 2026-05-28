@@ -42,15 +42,13 @@ from jno import LearningRateSchedule as lrs
 π = jno.np.pi
 
 # ── Domain (centred at origin so the stationary Gaussian is symmetric) ────────
-domain = jno.domain(
-    constructor=jno.domain.rect(x_range=(-3.0, 3.0), y_range=(-3.0, 3.0), mesh_size=0.15)
-)
-x,  y,  _ = domain.variable("interior")
+domain = jno.domain(constructor=jno.domain.rect(x_range=(-3.0, 3.0), y_range=(-3.0, 3.0), mesh_size=0.15))
+x, y, _ = domain.variable("interior")
 xb, yb, _ = domain.variable("boundary")
 
 # ── Analytical steady-state distribution ─────────────────────────────────────
-p_exact    = jno.np.exp(-(x**2  + y**2))  / π
-p_exact_bc = jno.np.exp(-(xb**2 + yb**2)) / π   # ≈ 4e-5 at the corners
+p_exact = jno.np.exp(-(x**2 + y**2)) / π
+p_exact_bc = jno.np.exp(-(xb**2 + yb**2)) / π  # ≈ 4e-5 at the corners
 
 # ── Network ───────────────────────────────────────────────────────────────────
 net = jno.nn.wrap(
@@ -64,14 +62,14 @@ net = jno.nn.wrap(
 )
 net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 10, 1e-5))
 
-p = net(x, y)   # probability density field
+p = net(x, y)  # probability density field
 
 # ── Fokker-Planck residual ─────────────────────────────────────────────────────
 # drift term:  ∂(xp)/∂x + ∂(yp)/∂y
 drift = jno.np.grad(x * p, x) + jno.np.grad(y * p, y)
 # diffusion term:  ½ ∆p
-diff  = 0.5 * jno.np.laplacian(p, [x, y])
-fp    = drift + diff                               # residual = 0
+diff = 0.5 * jno.np.laplacian(p, [x, y])
+fp = drift + diff  # residual = 0
 
 # ── Normalization constraint:  ∫∫_Ω p dx dy = 1 ──────────────────────────────
 norm = p.integrate() - 1.0
