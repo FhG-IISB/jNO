@@ -124,8 +124,31 @@ With `mask(...).freeze()`, selected leaves are frozen and non-selected leaves re
 ## 3. LoRA
 
 LoRA inserts trainable low-rank adapter matrices into matching layers while keeping base weights
-frozen. By default `LoRALinear` is used, which targets any layer with `weight`, `in_features`, and
-`out_features` attributes (jNO Linear, foundax Linear, `eqx.nn.Linear`).
+frozen. By default both linear layers (`weight`, `in_features`, `out_features`) and conv layers
+(`weight`, `in_channels`, `out_channels`) are wrapped automatically.
+
+### `target=` vs `mask()` — two ways to restrict which layers get LoRA
+
+Both restrict which layers receive LoRA adapters, but they select differently:
+
+| | `target=` / `specs=` | `mask(M).lora()` |
+|---|---|---|
+| **Selects layers by** | regex on pytree path string | boolean pytree (data-driven) |
+| **Layers not selected** | left completely untouched | left completely untouched |
+| **Use when** | you know the layer names up front | you have a precomputed boolean mask (e.g. from `eqx.tree_at`) |
+
+```python
+# Path-regex: only "encoder.*" layers get LoRA
+net.lora(rank=8, target="encoder")
+
+# Data-driven: only layers whose params are True in encoder_mask get LoRA
+net.mask(encoder_mask).lora(rank=8)
+```
+
+They can be combined — only layers that pass **both** the mask AND the regex are wrapped:
+```python
+net.mask(encoder_mask).lora(rank=8, target="encoder")
+```
 
 ### Uniform LoRA
 
@@ -133,7 +156,7 @@ frozen. By default `LoRALinear` is used, which targets any layer with `weight`, 
 net.lora(rank=8, alpha=16)
 ```
 
-Restrict to a subset of layers with a path-regex:
+Restrict *which layers get adapters* with a path-regex (layers not matching are left untouched):
 
 ```python
 net.lora(rank=8, alpha=16, target="encoder")
@@ -155,40 +178,40 @@ matching spec wins.
 
 ### Custom adapter classes
 
-Pass any `LoRAWrapper` subclass via `wrapper` to support layer types beyond linear:
+Conv and linear adapters are already in the zoo — see the tables above.  To support a layer type
+not covered (e.g. an embedding or a custom module), subclass `LoRAWrapper`:
 
 ```python
 from jno.lora import LoRAWrapper
 import equinox as eqx
+import jax.numpy as jnp
 
-class LoRAConv(LoRAWrapper):
-	adapter_fields = ("delta_w",)            # names of trainable adapter attributes
+class MyEmbeddingAdapter(LoRAWrapper):
+	adapter_fields = ("delta",)
 	base: eqx.Module
-	delta_w: jax.Array
+	delta: jax.Array
 	rank: int = eqx.field(static=True)
 	alpha: float = eqx.field(static=True)
 
 	@classmethod
 	def applies_to(cls, leaf):
-		return isinstance(leaf, eqx.nn.Conv2d) and not isinstance(leaf, LoRAWrapper)
+		return isinstance(leaf, eqx.nn.Embedding) and not isinstance(leaf, LoRAWrapper)
 
 	def __init__(self, base, rank, alpha, *, key):
 		self.base, self.rank, self.alpha = base, rank, alpha
-		self.delta_w = jnp.zeros_like(base.weight)
+		self.delta = jnp.zeros_like(base.weight)
 
 	def __call__(self, x):
-		w = self.base.weight + self.delta_w * (self.alpha / self.rank)
-		return self.base(x)   # simplified — use eqx.tree_at to swap weight
+		return self.base(x) + self.delta[x] * (self.alpha / self.rank)
 
 	def merge(self):
-		w = self.base.weight + self.delta_w * (self.alpha / self.rank)
+		w = self.base.weight + self.delta * (self.alpha / self.rank)
 		return eqx.tree_at(lambda m: m.weight, self.base, w)
 
-# Apply to all matching layers
-net.lora(rank=4, wrapper=LoRAConv)
+net.lora(rank=4, wrapper=MyEmbeddingAdapter)
 
-# Pass a list — tried in order, first applies_to() match wins per leaf
-net.lora(rank=4, wrapper=[LoRALinear, LoRAConv])
+# Mix with built-in zoo classes — first applies_to() match wins per leaf
+net.lora(rank=4, wrapper=[LoRALinear, LoRAConv, MyEmbeddingAdapter])
 ```
 
 Per-target specs may carry their own `"wrapper"` key, which overrides the global default for that
@@ -196,29 +219,52 @@ group:
 
 ```python
 net.lora(
-	wrapper=LoRALinear,          # global default
 	specs=[
 		{"target": "linear", "rank": 4,  "alpha": 1.0},
-		{"target": "conv",   "rank": 8,  "alpha": 2.0, "wrapper": LoRAConv},
+		{"target": "embed",  "rank": 8,  "alpha": 2.0, "wrapper": MyEmbeddingAdapter},
 	]
 )
 ```
 
-### Combine mask + LoRA for base-trainability control
+### Combine mask + LoRA to target specific layers
+
+`mask(M)` sets the selection scope; the next command determines what happens to M-selected elements:
 
 ```python
-# Selected base leaves are frozen; non-selected base leaves stay trainable.
-net.mask(decoder_mask).lora(rank=8, alpha=16)
+# Only layers selected by encoder_mask get LoRA adapters.
+# Layers not in the mask remain fully trainable (not wrapped).
+net.mask(encoder_mask).lora(rank=8, alpha=16)
 
-# Freeze all base params; train LoRA adapters only.
+# mask().freeze(): freeze the selected params (no LoRA).
+net.mask(encoder_mask).freeze()
+
+# freeze().lora(): freeze all base params; only LoRA adapters train.
+# (freeze first, then apply LoRA everywhere)
 net.freeze().lora(rank=8, alpha=16)
+
+# freeze().mask(M).lora(): wrap only M-selected layers; freeze everything else.
+net.freeze().mask(encoder_mask).lora(rank=8, alpha=16)
 ```
 
-### LoRA Zoo
+### Default behaviour: linear and conv
 
-jNO ships several drop-in `LoRAWrapper` variants in `jno.lora`.  All target
-the same layer types as `LoRALinear` (`weight`, `in_features`, `out_features`) and accept the same
-`rank` and `alpha` arguments.
+When you call `.lora()` without a `wrapper=` argument, jNO wraps **both** linear layers
+(`weight`, `in_features`, `out_features`) **and** conv layers (`weight`, `in_channels`,
+`out_channels`) automatically.  ConvTranspose layers are excluded.
+
+```python
+net.lora(rank=4, alpha=1.0)  # wraps Linear + Conv1d/2d/3d in one call
+```
+
+To restrict to one kind:
+
+```python
+net.lora(rank=4, wrapper=LoRALinear)   # linear only
+net.lora(rank=4, wrapper=LoRAConv)     # conv only
+net.lora(rank=4, wrapper=[LoRALinear, LoRAConv])  # explicit default
+```
+
+### LoRA Zoo — Linear
 
 ```python
 from jno.lora import (
@@ -252,7 +298,7 @@ net.lora(rank=4, wrapper=rsLoRALinear)
 | `LoKrLinear` | `r² + ⌈out/r⌉·⌈in/r⌉` | Kronecker product adapter; efficient when `r` ~ √(out·in) ([LoKr](https://arxiv.org/abs/2212.10650)) |
 | `OFTLinear` | `n_blocks·r²` | Block-diagonal orthogonal matrix via Cayley map; preserves hyperspherical energy ([OFT](https://arxiv.org/abs/2306.07280)) |
 
-**When to use which:**
+**When to use which (linear):**
 
 - **rsLoRALinear** — default upgrade over `LoRALinear`; use higher ranks without numerical issues.
 - **LoRAFALinear** — memory-constrained training; halves adapter parameter count.
@@ -265,13 +311,62 @@ net.lora(rank=4, wrapper=rsLoRALinear)
 - **LoKrLinear** — large layers where a Kronecker factorisation covers the weight space more efficiently than a low-rank product.
 - **OFTLinear** — when you need orthogonal weight updates to preserve geometry (e.g., text-to-image fine-tuning, ControlNet).
 
-Mix classes per layer group via per-target specs:
+### LoRA Zoo — Conv
+
+Matching conv variants for `eqx.nn.Conv1d`, `Conv2d`, `Conv3d`.  All operate by
+flattening the weight to `(out_channels, flat_in)` where `flat_in = in_channels // groups * prod(kernel_size)`,
+applying the same adapter logic as the linear counterpart, and reshaping back.  The
+modified weight is substituted via `eqx.tree_at` so XLA fuses it into a single conv call.
+
+```python
+from jno.lora import (
+    LoRAConv,    # standard conv LoRA (default alongside LoRALinear)
+    rsLoRAConv,  # rank-stabilized
+    LoRAFAConv,  # frozen A
+    DoRAConv,    # weight-decomposed
+    PiSSAConv,   # SVD principal components
+    LoRAXSConv,  # extra-small r×r core
+    VeRAConv,    # seed-based frozen A,B; only b,d vectors trained
+    MiLoRAConv,  # SVD minor components
+    IA3Conv,     # per-output-channel scale
+    LoKrConv,    # Kronecker product adapter
+    OFTConv,     # block-diagonal orthogonal fine-tuning
+)
+
+net.lora(rank=4, wrapper=rsLoRAConv)
+```
+
+| Class | Trainable params | Key idea |
+|-------|-----------------|----------|
+| `LoRAConv` | `r·(flat_in + out_ch)` | Standard LoRA on flattened conv weight |
+| `rsLoRAConv` | `r·(flat_in + out_ch)` | Rank-stabilized scaling `α/√r` |
+| `LoRAFAConv` | `r·out_ch` | Frozen A; only B trained |
+| `DoRAConv` | `r·(flat_in + out_ch) + out_ch` | Magnitude + direction decomposition |
+| `PiSSAConv` | `r·(flat_in + out_ch)` | SVD principal components init |
+| `LoRAXSConv` | `r²` | Frozen A,B from SVD; trainable r×r core |
+| `VeRAConv` | `out_ch + r` | Seed-based frozen A,B; only b,d vectors trained |
+| `MiLoRAConv` | `r·(flat_in + out_ch)` | SVD minor components; preserves principal directions |
+| `IA3Conv` | `out_ch` | Per-output-channel scale vector |
+| `LoKrConv` | `r² + ⌈out_ch/r⌉·⌈flat_in/r⌉` | Kronecker product adapter |
+| `OFTConv` | `n_blocks·r²` | Block-diagonal Cayley map on output channels |
+
+**When to use which (conv):**
+
+- **rsLoRAConv** — general-purpose conv adapter; mirrors rsLoRALinear.
+- **LoRAFAConv** — memory-constrained conv fine-tuning.
+- **PiSSAConv / MiLoRAConv** — pretrained conv backbones (e.g., FNO, U-Net encoders).
+- **VeRAConv** — many conv layers and tight checkpoint budgets.
+- **IA3Conv** — fastest conv adaptation; no rank hyperparameter.
+- **OFTConv** — geometry-preserving conv updates (e.g., image models).
+
+Mix linear and conv adapters per layer group via per-target specs:
 
 ```python
 net.lora(
     specs=[
         {"target": "encoder", "rank": 8,  "alpha": 16, "wrapper": PiSSALinear},
         {"target": "decoder", "rank": 4,  "alpha": 1.0, "wrapper": rsLoRALinear},
+        {"target": "conv",    "rank": 4,  "alpha": 1.0, "wrapper": rsLoRAConv},
     ]
 )
 ```

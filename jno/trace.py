@@ -977,6 +977,7 @@ class Model(Placeholder):
         self._dtype = None  # target dtype (e.g. jnp.bfloat16) or None
         self._param_mask = None  # current mask scope for grouped optimizer/lr calls
         self._trainable_param_mask = None  # persistent trainability mask used by mask(...).freeze()
+        self._lora_param_mask = None  # param mask passed to mask().lora() → restricts which modules get LoRA
         self._mask_scope_pending: bool = False  # transient flag for mask(...).optimizer()/lr() group scoping
         self._param_groups: list = []  # [{target, mask, opt_fn, lr}] for per-group optimizer config
         self._weight_tree = None  # pretrained weights as a pytree (alternative to weight_path file)
@@ -1040,6 +1041,7 @@ class Model(Placeholder):
             "-" * 60,
             f"mask_active:          {self._param_mask is not None}",
             f"trainable_mask_set:   {self._trainable_param_mask is not None}",
+            f"lora_mask_set:        {self._lora_param_mask is not None}",
             "",
             "Parameter Groups",
             "-" * 60,
@@ -1201,30 +1203,35 @@ class Model(Placeholder):
            The first matching spec wins.
 
         By default only the low-rank adapters are trained; base weights are
-        frozen.  Call ``freeze()`` before ``lora()`` to also freeze any
-        base parameters that are outside LoRA-wrapped layers::
+        frozen.  Layers that are NOT wrapped by LoRA remain fully trainable.
+        Call ``freeze()`` before ``lora()`` to also freeze any parameters
+        outside LoRA-wrapped layers::
 
             NN.freeze().lora(rank=8, alpha=16)
+
+        Use ``mask(M)`` to restrict which layers receive LoRA adapters::
+
+            NN.mask(M).lora(rank=8, alpha=16)  # only M-selected layers are wrapped
 
         Args:
             rank:    LoRA rank (uniform mode).
             alpha:   LoRA scaling factor (uniform mode).
-            target:  Regex to restrict which layers are wrapped (uniform mode).
+            target:  Regex to restrict *which layers get LoRA adapters* (uniform
+                     mode only).  Layers whose pytree path does not match are left
+                     completely untouched.  Use ``specs=`` for per-group targeting.
             wrapper: Adapter class or list of classes to try in order.
-                     Defaults to ``LoRALinear`` (wraps ``LinearLike`` layers).
-                     Pass a custom ``LoRAWrapper`` subclass to support other
-                     layer types (e.g. convolutions).
+                     Defaults to ``(LoRALinear, LoRAConv)`` — wraps both linear
+                     and conv layers.  Pass a single class or list to override.
             specs:   Per-target specs (per-target mode).  Each dict has keys
                      ``target`` (str regex), ``rank`` (int), ``alpha`` (float),
                      and optionally ``wrapper``.
         """
         if self._mask_scope_pending and self._param_mask is not None:
-            self._trainable_param_mask = jax.tree_util.tree_map(
-                lambda x: (not x) if isinstance(x, bool) else False,
-                self._param_mask,
-            )
+            self._lora_param_mask = self._param_mask
         else:
-            self._trainable_param_mask = None
+            self._lora_param_mask = None
+        # lora() always clears any stale freeze mask — it overrides mask().freeze() semantics.
+        self._trainable_param_mask = None
         self._mask_scope_pending = False
 
         default_wrappers = _normalize_wrappers(wrapper)
@@ -1465,6 +1472,7 @@ class Model(Placeholder):
         self._dtype = None
         self._param_mask = None
         self._trainable_param_mask = None
+        self._lora_param_mask = None
         self._mask_scope_pending = False
         self._weight_tree = None
         self._initialize_mask = None
