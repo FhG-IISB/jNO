@@ -37,6 +37,7 @@ from .trace import (
     Jacobian,
     Model,
     ModelCall,
+    NetworkGradient,
     OperationCall,
     OperationDef,
     Placeholder,
@@ -331,6 +332,8 @@ class TraceCompiler:
                         visit(arg)
             elif isinstance(node, (Hessian, Jacobian)):
                 visit(node.target)
+            elif isinstance(node, NetworkGradient):
+                visit(node.target)  # registers the Model inside target
             elif isinstance(node, Assembly):
                 visit(node.expr)
             elif isinstance(node, GroupedAssembly):

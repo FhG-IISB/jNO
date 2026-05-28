@@ -18,6 +18,13 @@ Showcases
 - strong PINN comparison
 """
 
+import sys
+
+try:
+    import diffrax  # noqa: F401
+except ImportError:
+    sys.exit(0)
+
 import os
 import time
 

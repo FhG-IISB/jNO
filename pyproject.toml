@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jax-neural-operators"
-version = "0.2.1"
+version = "0.2.2"
 description = "Jax Neural Operators"
 readme = "README.md"
 requires-python = ">=3.11, <3.14"
@@ -131,6 +131,8 @@ iree = { features = ["iree"], solve-group = "default" }
 fmt = "ruff format ."
 lint = "ruff check . --fix"
 test = "pytest -x --tb=short"
+all = "ruff format . && ruff check . --fix && pytest"
+
 # CI tasks: read-only (no auto-fix) and skip slow tests
 ci-fmt = "ruff format --check ."
 ci-lint = "ruff check ."

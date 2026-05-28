@@ -19,6 +19,8 @@ from .trace import (
     Jacobian,
     Literal,
     ModelCall,
+    NetworkGradient,
+    Noise,
     OperationCall,
     OperationDef,
     Placeholder,
@@ -300,6 +302,8 @@ class TraceEvaluator:
         (Assembly, "_eval_assembly"),
         (StateField, "_eval_state_field"),
         (GroupedAssembly, "_eval_grouped_assembly"),
+        (NetworkGradient, "_eval_network_gradient"),
+        (Noise, "_eval_noise"),
     ]
 
     def _dispatch(self, expr, ctx):
@@ -615,6 +619,116 @@ class TraceEvaluator:
 
     def _eval_state_field(self, expr, ctx):
         return self._dispatch(expr.expr, ctx)
+
+    def _eval_network_gradient(self, expr, ctx):
+        """Compute ∂target/∂params using jax.jacrev over eqx.partition'd weights.
+
+        Can be used both for post-training analysis via crux.eval() AND as part
+        of a training loss.  When used in training the optimizer must differentiate
+        through jax.jacrev, which is second-order AD — correct but expensive
+        (cost scales as O(P × N × forward_cost)).  To avoid the second-order cost
+        while still penalising the Jacobian, wrap the call in jax.lax.stop_gradient:
+
+            loss = (jax.lax.stop_gradient(u.grad(net)) ** 2).mean()
+
+        Returns (B, N, P) for scalar output, (B, N, D, P) for D-dimensional output,
+        consistent with other crux.eval() results.  Access J[0] for (N, P).
+        """
+        import equinox as eqx
+
+        layer_id = expr.model_node.layer_id
+        current_model = self.params.get(layer_id)
+        if current_model is None:
+            raise ValueError(
+                f"NetworkGradient: no model registered for layer_id={layer_id!r}. "
+                "Make sure to call crux.eval() after crux.solve()."
+            )
+
+        # Split into differentiable leaves vs static structure.
+        # selector is either None (all params) or a boolean pytree built by the
+        # caller via eqx.tree_at and stored on the model with net.mask(mask).
+        if expr.selector is not None:
+            trainable, static = eqx.partition(current_model, expr.selector)
+        else:
+            trainable, static = eqx.partition(current_model, eqx.is_array)
+
+        def forward_fn(trainable_params):
+            # Rebuild model from trainable leaves + static structure
+            full_model = eqx.combine(trainable_params, static)
+            # Swap in the rebuilt model and re-evaluate the full target expression
+            new_params = {**self.params, layer_id: full_model}
+            return TraceEvaluator(new_params)._dispatch(expr.target, ctx)
+
+        # Infer output shape cheaply (no actual computation).
+        # The compiled evaluator may wrap outputs in extra leading singleton
+        # dims from the device mesh vmap: (1, N, D) instead of (N, D).
+        # Strip them to recover the logical spatial shape.
+        raw_out_shape = jax.eval_shape(forward_fn, trainable).shape
+        logical_shape = raw_out_shape
+        while len(logical_shape) > 1 and logical_shape[0] == 1:
+            logical_shape = logical_shape[1:]
+
+        # ── Scalar target (e.g. loss.mse) → gradient vector (P,) ───────────
+        if len(logical_shape) == 0:
+            grad_pytree = jax.jacrev(forward_fn)(trainable)
+            leaves = jax.tree_util.tree_leaves(grad_pytree)
+            cols = [leaf.reshape(-1) for leaf in leaves]
+            return jnp.concatenate(cols, axis=-1)  # (P,)
+
+        N = logical_shape[0]
+        D = logical_shape[1] if len(logical_shape) > 1 else 1
+
+        # Jacobian: pytree matching trainable, each leaf L of shape S
+        # becomes shape (*out_shape, *S)  →  (N, D, *S)
+        jac_pytree = jax.jacrev(forward_fn)(trainable)
+
+        # Flatten all param leaves into a single (N, D, P) array, then squeeze D=1
+        leaves = jax.tree_util.tree_leaves(jac_pytree)
+        cols = [leaf.reshape(N, D, -1) for leaf in leaves]
+        J = jnp.concatenate(cols, axis=-1)  # (N, D, P)
+
+        return J[:, 0, :] if D == 1 else J  # (N, P) or (N, D, P)
+
+    def _eval_noise(self, expr, ctx):
+        # Infer the number of active spatial points from context
+        n = ctx.context.get("__active_spatial_n__", None)
+        if n is None:
+            for k, v in ctx.context.items():
+                if not k.startswith("__") and hasattr(v, "shape") and len(v.shape) >= 1:
+                    n = v.shape[0]
+                    break
+            if n is None:
+                n = 1
+
+        ndim = int(expr.params.get("ndim", 1))
+        shape = (n, ndim)
+
+        if ctx.key is None:
+            return jnp.zeros(shape)
+
+        # fold_in gives each Noise node a unique, deterministic subkey derived
+        # from the step key — reproducible when the solver seed is fixed.
+        subkey = jax.random.fold_in(ctx.key, expr._noise_id)
+
+        dist = expr.distribution
+        if dist == "gaussian":
+            return jax.random.normal(subkey, shape) * expr.params.get("std", 1.0)
+        elif dist == "uniform":
+            return jax.random.uniform(
+                subkey, shape,
+                minval=expr.params.get("low", -1.0),
+                maxval=expr.params.get("high", 1.0),
+            )
+        elif dist == "laplace":
+            std = expr.params.get("std", 1.0)
+            # Inverse-CDF of Laplace via Uniform(-0.5, 0.5)
+            u = jax.random.uniform(subkey, shape, minval=1e-6, maxval=1.0 - 1e-6) - 0.5
+            return -jnp.sign(u) * jnp.log(1.0 - 2.0 * jnp.abs(u)) * std / jnp.sqrt(2.0)
+        else:
+            raise ValueError(
+                f"Unknown noise distribution {expr.distribution!r}. "
+                "Choose from: 'gaussian', 'uniform', 'laplace'."
+            )
 
     def _eval_tunable_module_call(self, expr, ctx):
         tunable = expr.model
@@ -2113,4 +2227,9 @@ class TraceEvaluator:
             vars_str = ", ".join(str(v) for v in node.variables)
             scheme_str = f", {node.scheme[:2]}" if node.scheme else ""
             return uid, f"{kind}([{vars_str}]{scheme_str})"
+        if isinstance(node, NetworkGradient):
+            return uid, f"NetworkGradient(model={node.model_node!r})"
+        if isinstance(node, Noise):
+            params_str = ", ".join(f"{k}={v}" for k, v in node.params.items())
+            return uid, f"Noise({node.distribution}, {params_str})"
         return uid, type(node).__name__

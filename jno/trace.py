@@ -40,6 +40,8 @@ __all__ = [
     "OperationCall",
     "Hessian",
     "Jacobian",
+    "NetworkGradient",
+    "Noise",
     "collect_operations",
     "collect_tags",
     "get_primary_tag",
@@ -470,6 +472,57 @@ class Placeholder:
             integral = (K(x, t) * net(t)).integrate(var=x)
         """
         return Integral(self, integration_var=var)
+
+    def grad(self, model: "Model") -> "NetworkGradient":
+        """Parameter Jacobian ∂self/∂θ where θ are the trainable weights of *model*.
+
+        Returns an ``(N, P)`` array — N spatial points × P selected trainable
+        parameters (flattened).  For multi-dimensional output ``(N, D)`` the
+        result is ``(N, D, P)``.
+
+        To restrict to a subset of parameters, call ``model.mask(bool_pytree)``
+        first using a boolean pytree built with :func:`equinox.tree_at`.  Since
+        ``mask()`` returns the model itself, you can write the selection inline::
+
+            import equinox as eqx, jax
+
+            # All parameters — Neural Tangent Kernel
+            J = crux.eval([u.grad(net)])[0]             # (N, P_total)
+            K = J @ J.T                                  # (N, N)
+
+            # Subset — only the output-layer weight matrix
+            all_false = jax.tree_util.tree_map(lambda _: False, net.module)
+            mask = eqx.tree_at(lambda m: m.output_layer.weight, all_false, True)
+            J_w = crux.eval([u.grad(net.mask(mask))])[0]  # (N, P_weight)
+        """
+        if not isinstance(model, Model):
+            raise TypeError(
+                f"grad() expects a Model placeholder, got {type(model).__name__!r}. "
+                "For spatial derivatives use .d(variable) or jno.np.grad(expr, var)."
+            )
+        # Capture any mask set via net.mask(bool_pytree) at call time.
+        selector = getattr(model, "_param_mask", None)
+        return NetworkGradient(self, model, selector=selector)
+
+    def stop_gradient(self) -> "FunctionCall":
+        """Treat this expression as a constant during backpropagation.
+
+        Wraps the expression in ``jax.lax.stop_gradient`` so no gradient
+        flows through it.  Useful for penalising a quantity (e.g. the
+        parameter Jacobian) without differentiating through its computation::
+
+            # Cheap Jacobian regularisation — first-order, J treated as constant
+            loss = (u.grad(net).stop_gradient() ** 2).mean()
+
+            # Full second-order version (expensive — differentiates through jacrev)
+            loss = (u.grad(net) ** 2).mean()
+
+        Returns a :class:`FunctionCall` node, so further symbolic operations
+        can be chained normally.
+        """
+        import jax
+
+        return FunctionCall(jax.lax.stop_gradient, [self], name="stop_gradient")
 
 
 class Literal(Placeholder):
@@ -994,7 +1047,7 @@ class Model(Placeholder):
         self.input_dim = None
         self.weight_path = weight_path
         self.layer_id = _next_op_id()
-        self.show = True  # Wether or not to print the model
+        self.show = True  # Whether or not to print the model
 
         # ── training config (plain Python, not JAX arrays) ──
         self._frozen: bool = False
@@ -1014,6 +1067,11 @@ class Model(Placeholder):
         self._tunable_opts: Dict[str, list] = {}  # per-model tunable options for sweeps
 
     # ── public API ───────────────────────────────────────────
+
+    @property
+    def params(self):
+        """Alias for :attr:`module` — always reflects the current (post-training) weights."""
+        return self.module
 
     def __call__(self, *args) -> "ModelCall":
         """Call this module with variables and return a traced ``ModelCall``."""
@@ -1182,8 +1240,8 @@ class Model(Placeholder):
         boolean leaves where ``True`` selects leaves in the masked scope.
 
         This scope is consumed by grouped optimizer/lr calls and by
-        ``mask(...).freeze()``. It does not by itself freeze or unfreeze
-        parameters.
+        ``mask(...).freeze()``.  It is also read by ``u.grad(net.mask(...))``
+        to restrict the Jacobian to only the selected parameters.
 
         Example::
 
@@ -1195,6 +1253,7 @@ class Model(Placeholder):
                 all_false, (True, True),
             )
             model.mask(param_mask).optimizer(optax.adam, lr=1e-3)
+            J = crux.eval([u.grad(model.mask(param_mask))])[0]  # (N, P_selected)
         """
         self._param_mask = param_mask
         self._mask_scope_pending = self._param_mask is not None
@@ -1877,6 +1936,69 @@ class Integral(Placeholder):
         return f"Integral({self.target})"
 
 
+class NetworkGradient(Placeholder):
+    """Per-point Jacobian of an expression w.r.t. a model's trainable parameters.
+
+    Created by ``expr.grad(model)``.  Evaluated by :class:`TraceEvaluator`
+    using ``jax.jacrev`` over ``eqx.partition``-ed parameters.
+
+    **Post-training analysis** (via ``crux.eval``)::
+
+        J = crux.eval([u.grad(net)])   # (B, N, P) — access J[0] for (N, P)
+
+    **Training loss** (second-order AD, expensive)::
+
+        loss = (u.grad(net) ** 2).mean()   # differentiates through jacrev
+
+    **Training loss, stop-gradient variant** (first-order, cheaper)::
+
+        loss = (jax.lax.stop_gradient(u.grad(net)) ** 2).mean()
+
+    Output shape inside ``crux.eval``: ``(B, N, P)`` for scalar-output expressions;
+    ``(B, N, D, P)`` for D-dimensional output.
+    N = spatial points, P = number of selected trainable parameters.
+    When *selector* is ``None``, P = all trainable array leaves flattened.
+    """
+
+    def __init__(self, target: Placeholder, model_node: "Model", selector=None):
+        self.target = target
+        self.model_node = model_node
+        self.selector = selector  # None → all params; callable → eqx.tree_at selector
+
+    def __repr__(self):
+        sel = f", selector={self.selector!r}" if self.selector is not None else ""
+        return f"NetworkGradient({self.target!r}, model={self.model_node!r}{sel})"
+
+
+class Noise(Placeholder):
+    """Stochastic noise term regenerated every training step.
+
+    Created by :mod:`jno.noise`.  Produces an array of shape ``(N, ndim)``
+    where ``N`` is inferred at evaluation time from the number of active
+    spatial points and ``ndim`` (default 1) controls the trailing dimension.
+
+    The realisation is derived from the solver's step PRNG key via
+    ``jax.random.fold_in``, so it is fully reproducible when the global seed
+    is fixed (via :func:`jno.setup` or ``.jno.toml``).
+
+    Parameters
+    ----------
+    distribution : str
+        ``'gaussian'``, ``'uniform'``, or ``'laplace'``.
+    **params
+        Distribution-specific kwargs: ``std``, ``low``, ``high``, ``ndim``.
+    """
+
+    def __init__(self, distribution: str, **params):
+        self.distribution = distribution
+        self.params = params
+        self._noise_id = _next_op_id()
+
+    def __repr__(self):
+        params_str = ", ".join(f"{k}={v}" for k, v in self.params.items())
+        return f"Noise({self.distribution}, {params_str})"
+
+
 class FemLinearSystem:
     """Container for a linear FEM contribution A x = b.
 
@@ -2312,6 +2434,8 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
             visit(node.target)
             for v in node.variables:
                 visit(v)
+        elif isinstance(node, NetworkGradient):
+            visit(node.target)
         elif isinstance(node, Tracker):
             visit(node.expr)
         elif isinstance(node, Assembly):
@@ -2367,6 +2491,8 @@ def collect_tags(expr: Placeholder) -> set:
             visit(node.target)
             for v in node.variables:
                 visit(v)
+        elif isinstance(node, NetworkGradient):
+            visit(node.target)
         elif isinstance(node, Tracker):
             visit(node.expr)
         elif isinstance(node, (TrialFunction, TestFunction)):
