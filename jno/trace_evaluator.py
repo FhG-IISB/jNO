@@ -19,6 +19,7 @@ from .trace import (
     Jacobian,
     Literal,
     ModelCall,
+    NetworkGradient,
     OperationCall,
     OperationDef,
     Placeholder,
@@ -300,6 +301,7 @@ class TraceEvaluator:
         (Assembly, "_eval_assembly"),
         (StateField, "_eval_state_field"),
         (GroupedAssembly, "_eval_grouped_assembly"),
+        (NetworkGradient, "_eval_network_gradient"),
     ]
 
     def _dispatch(self, expr, ctx):
@@ -615,6 +617,62 @@ class TraceEvaluator:
 
     def _eval_state_field(self, expr, ctx):
         return self._dispatch(expr.expr, ctx)
+
+    def _eval_network_gradient(self, expr, ctx):
+        """Compute ∂target/∂params using jax.jacrev over eqx.partition'd weights.
+
+        Can be used both for post-training analysis via crux.eval() AND as part
+        of a training loss.  When used in training the optimizer must differentiate
+        through jax.jacrev, which is second-order AD — correct but expensive
+        (cost scales as O(P × N × forward_cost)).  To avoid the second-order cost
+        while still penalising the Jacobian, wrap the call in jax.lax.stop_gradient:
+
+            loss = (jax.lax.stop_gradient(u.grad(net)) ** 2).mean()
+
+        Returns (B, N, P) for scalar output, (B, N, D, P) for D-dimensional output,
+        consistent with other crux.eval() results.  Access J[0] for (N, P).
+        """
+        import equinox as eqx
+
+        layer_id = expr.model_node.layer_id
+        current_model = self.params.get(layer_id)
+        if current_model is None:
+            raise ValueError(
+                f"NetworkGradient: no model registered for layer_id={layer_id!r}. "
+                "Make sure to call crux.eval() after crux.solve()."
+            )
+
+        # Split into differentiable leaves (arrays) vs static Python structure
+        trainable, static = eqx.partition(current_model, eqx.is_array)
+
+        def forward_fn(trainable_params):
+            # Rebuild model from trainable leaves + static structure
+            full_model = eqx.combine(trainable_params, static)
+            # Swap in the rebuilt model and re-evaluate the full target expression
+            new_params = {**self.params, layer_id: full_model}
+            return TraceEvaluator(new_params)._dispatch(expr.target, ctx)
+
+        # Infer output shape cheaply (no actual computation).
+        # The compiled evaluator may wrap outputs in extra leading singleton
+        # dims from the device mesh vmap: (1, N, D) instead of (N, D).
+        # Strip them to recover the logical spatial shape.
+        raw_out_shape = jax.eval_shape(forward_fn, trainable).shape
+        logical_shape = raw_out_shape
+        while len(logical_shape) > 1 and logical_shape[0] == 1:
+            logical_shape = logical_shape[1:]
+        N = logical_shape[0]
+        D = logical_shape[1] if len(logical_shape) > 1 else 1
+
+        # Jacobian: pytree matching trainable, each leaf L of shape S
+        # becomes shape (*out_shape, *S)  →  (N, D, *S)
+        jac_pytree = jax.jacrev(forward_fn)(trainable)
+
+        # Flatten all param leaves into a single (N, D, P) array, then squeeze D=1
+        leaves = jax.tree_util.tree_leaves(jac_pytree)
+        cols = [leaf.reshape(N, D, -1) for leaf in leaves]
+        J = jnp.concatenate(cols, axis=-1)  # (N, D, P)
+
+        return J[:, 0, :] if D == 1 else J  # (N, P) or (N, D, P)
 
     def _eval_tunable_module_call(self, expr, ctx):
         tunable = expr.model
@@ -2113,4 +2171,6 @@ class TraceEvaluator:
             vars_str = ", ".join(str(v) for v in node.variables)
             scheme_str = f", {node.scheme[:2]}" if node.scheme else ""
             return uid, f"{kind}([{vars_str}]{scheme_str})"
+        if isinstance(node, NetworkGradient):
+            return uid, f"NetworkGradient(model={node.model_node!r})"
         return uid, type(node).__name__
