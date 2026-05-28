@@ -734,6 +734,33 @@ class TestNetworkGradient:
         assert J_sg._name == "stop_gradient"
         assert J_sg.args[0] is J
 
+    def test_grad_without_mask_has_none_selector(self):
+        net, x = _make_net_and_var()
+        J = net(x).grad(net)
+        assert J.selector is None
+
+    def test_grad_with_bool_pytree_mask(self):
+        """net.mask(bool_pytree) captures _param_mask; grad() reads it."""
+        import equinox as eqx
+
+        net, x = _make_net_and_var()
+        all_false = jax.tree_util.tree_map(lambda _: False, net.module)
+        mask = eqx.tree_at(lambda m: m.output_layer.weight, all_false, True)
+        J = net(x).grad(net.mask(mask))
+        assert isinstance(J, NetworkGradient)
+        assert J.selector is mask
+
+    def test_collect_tags_with_mask(self):
+        """collect_tags still traverses the target even with a mask selector."""
+        import equinox as eqx
+
+        net, x = _make_net_and_var()
+        all_false = jax.tree_util.tree_map(lambda _: False, net.module)
+        mask = eqx.tree_at(lambda m: m.output_layer.weight, all_false, True)
+        J = net(x).grad(net.mask(mask))
+        tags = collect_tags(J)
+        assert "interior" in tags
+
 
 # ======================================================================
 # stop_gradient

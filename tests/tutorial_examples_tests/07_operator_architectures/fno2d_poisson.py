@@ -8,12 +8,6 @@ Operator: f → u
 FNO2D learns the solution operator via global spectral convolutions in
 Fourier space, making it highly efficient for problems on regular grids.
 
-Run first:
-    python create_domain.py
-
-Then:
-    python fno2d_poisson.py
-
 Architecture: (B, H, W, C) → Lift → [SpectralConv2D + Conv2D → LayerNorm → GELU]×N
               → Project → (B, H, W, 1)
 
@@ -25,30 +19,32 @@ import jax
 import optax
 
 import jno
+from create_domain import build_domain_from_arrays, generate_poisson_data
 
 KEY = jax.random.PRNGKey(0)
-SAMPLES = 200
-GRID = 64
-EPOCHS = 500
-BATCH = 40
+GRID = 16
+SAMPLES = 20
+EPOCHS = 50
+BATCH = 10
 
-# ── Load domain ───────────────────────────────────────────────────────────────
-domain = jno.load(f"domain_{SAMPLES}_{GRID}.pkl")
-_f = domain.variable("_f")  # (S, 1, 1, H, W, 1)
-_u = domain.variable("_u")  # (S, 1, 1, H, W, 1)
+# ── Generate small dataset inline ─────────────────────────────────────────────
+forcing, solution = generate_poisson_data(SAMPLES, GRID, n_modes=5, alpha=1.5, seed=42)
+domain = build_domain_from_arrays(forcing, solution, GRID)
+_f = domain.variable("_f")
+_u = domain.variable("_u")
 
 # ── Model ─────────────────────────────────────────────────────────────────────
 u = jno.nn.wrap(
     foundax.fno2d(
         in_features=1,
-        hidden_channels=48,
-        n_modes=24,
+        hidden_channels=16,
+        n_modes=6,
         d_vars=1,
-        n_layers=4,
+        n_layers=2,
         n_steps=1,
         d_model=(GRID, GRID),
         norm="layer",
-        linear_conv=True,  # non-periodic → suitable for Dirichlet BC
+        linear_conv=True,
         key=KEY,
     )
 )

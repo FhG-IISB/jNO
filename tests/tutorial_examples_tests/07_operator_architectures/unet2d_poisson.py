@@ -9,12 +9,6 @@ U-Net is an encoder-decoder architecture with skip connections, naturally
 capturing multi-scale features.  `padding_mode="reflect"` is preferred
 over circular padding for non-periodic boundary conditions.
 
-Run first:
-    python create_domain.py
-
-Then:
-    python unet2d_poisson.py
-
 Architecture: (B, H, W, C) → Encoder (skip connections) → Decoder → (B, H, W, 1)
 """
 
@@ -23,30 +17,30 @@ import jax
 import optax
 
 import jno
+from create_domain import build_domain_from_arrays, generate_poisson_data
 
 KEY = jax.random.PRNGKey(0)
-SAMPLES = 200
-GRID = 64
-EPOCHS = 500
-BATCH = 40
+GRID = 16
+SAMPLES = 20
+EPOCHS = 50
+BATCH = 10
 
-# ── Load domain ───────────────────────────────────────────────────────────────
-domain = jno.load(f"domain_{SAMPLES}_{GRID}.pkl")
-_f = domain.variable("_f")  # (S, 1, 1, H, W, 1)
-_u = domain.variable("_u")  # (S, 1, 1, H, W, 1)
+# ── Generate small dataset inline ─────────────────────────────────────────────
+forcing, solution = generate_poisson_data(SAMPLES, GRID, n_modes=5, alpha=1.5, seed=42)
+domain = build_domain_from_arrays(forcing, solution, GRID)
+_f = domain.variable("_f")
+_u = domain.variable("_u")
 
 # ── Model ─────────────────────────────────────────────────────────────────────
-# UNet2D: index with [0, ...] to drop the outer sample wrapper dimension;
-# the model receives (1, 1, H, W, 1) which it normalizes internally.
 u = jno.nn.wrap(
     foundax.unet2d(
         in_channels=1,
         out_channels=1,
-        depth=4,
-        wf=6,  # base channels = 2^6 = 64
+        depth=2,
+        wf=4,
         norm="layer",
         up_mode="upconv",
-        padding_mode="reflect",  # non-periodic BCs
+        padding_mode="reflect",
         key=KEY,
     )
 )

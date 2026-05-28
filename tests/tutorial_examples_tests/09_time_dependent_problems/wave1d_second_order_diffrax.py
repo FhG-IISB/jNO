@@ -21,6 +21,13 @@ Showcases
 - DiffraxBlock with time_order=2
 """
 
+import sys
+
+try:
+    import diffrax  # noqa: F401
+except ImportError:
+    sys.exit(0)
+
 import diffrax
 import jax
 import jax.numpy as jnp

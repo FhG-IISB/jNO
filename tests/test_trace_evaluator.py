@@ -12,7 +12,6 @@ from jno.trace import (
     Jacobian,
     Literal,
     Model,
-    NetworkGradient,
     OperationDef,
     TensorTag,
 )
@@ -450,3 +449,177 @@ class TestNetworkGradientEval:
         grad_full = jax.grad(loss)(trainable)
         leaves = jax.tree_util.tree_leaves(grad_full)
         assert any(jnp.any(leaf != 0) for leaf in leaves)
+
+    # ------------------------------------------------------------------
+    # Selector tests
+    # ------------------------------------------------------------------
+
+    def test_mask_reduces_P(self):
+        """net.mask(bool_pytree) limits the Jacobian to selected parameters."""
+        net = _make_tiny_net()
+        x = make_var("interior")
+        u = net(x)
+
+        all_false = jax.tree_util.tree_map(lambda _: False, net.module)
+        mask = eqx.tree_at(lambda m: m.output_layer.weight, all_false, True)
+
+        J_all = u.grad(net)
+        J_sel = u.grad(net.mask(mask))
+
+        N = 5
+        context = {"interior": jnp.linspace(0.1, 0.9, N).reshape(N, 1)}
+        params = {net.layer_id: net.module}
+        ev = TraceEvaluator(params)
+        ctx = ev._EvalCtx(context, {}, None)
+
+        j_all = ev._dispatch(J_all, ctx)
+        j_sel = ev._dispatch(J_sel, ctx)
+
+        P_sel_expected = net.module.output_layer.weight.size
+        assert j_all.shape[0] == N
+        assert j_sel.shape == (N, P_sel_expected)
+        assert j_sel.shape[1] < j_all.shape[1]
+
+    def test_mask_two_tensors(self):
+        """Mask selecting weight + bias gives P = weight.size + bias.size."""
+        net = _make_tiny_net()
+        x = make_var("interior")
+        u = net(x)
+
+        all_false = jax.tree_util.tree_map(lambda _: False, net.module)
+        mask = eqx.tree_at(
+            lambda m: (m.output_layer.weight, m.output_layer.bias),
+            all_false,
+            (True, True),
+        )
+        J = u.grad(net.mask(mask))
+
+        N = 4
+        context = {"interior": jnp.linspace(0.1, 0.9, N).reshape(N, 1)}
+        ev = TraceEvaluator({net.layer_id: net.module})
+        ctx = ev._EvalCtx(context, {}, None)
+        result = ev._dispatch(J, ctx)
+
+        w = net.module.output_layer.weight
+        b = net.module.output_layer.bias
+        P_expected = w.size + b.size
+        assert result.shape == (N, P_expected)
+
+    def test_mask_stop_gradient_blocks_grad(self):
+        """stop_gradient on a masked Jacobian blocks all gradient flow."""
+        net = _make_tiny_net()
+        x = make_var("interior")
+        u = net(x)
+
+        all_false = jax.tree_util.tree_map(lambda _: False, net.module)
+        mask = eqx.tree_at(lambda m: m.output_layer.weight, all_false, True)
+        J_sg = u.grad(net.mask(mask)).stop_gradient()
+
+        N = 3
+        context = {"interior": jnp.linspace(0.1, 0.9, N).reshape(N, 1)}
+        trainable, static = eqx.partition(net.module, eqx.is_array)
+
+        def loss(tp):
+            full = eqx.combine(tp, static)
+            ev = TraceEvaluator({net.layer_id: full})
+            ctx = ev._EvalCtx(context, {}, None)
+            return jnp.sum(ev._dispatch(J_sg, ctx))
+
+        grad_sg = jax.grad(loss)(trainable)
+        leaves = jax.tree_util.tree_leaves(grad_sg)
+        assert all(jnp.allclose(leaf, jnp.zeros_like(leaf)) for leaf in leaves)
+
+
+# ======================================================================
+# Gradient cosine similarity via NetworkGradient
+#
+# The Jacobian J = u.grad(net) with shape (N, P) lets you compute
+# "virtual gradients" for any loss term without running an actual
+# backward pass:
+#
+#   g = J.T @ residual        # (P,) — gradient direction for that term
+#
+# Cosine similarity between two loss gradients reveals whether the
+# losses are aligned (≈1), orthogonal (≈0), or conflicting (≈-1).
+# Use net.mask(sparse_mask) to restrict to a fast sparse subset of
+# parameters while preserving the qualitative direction information.
+#
+# Example (post-training analysis):
+#
+#   J = crux.eval([u.grad(net.mask(sparse_mask))])[0]  # (N, P_sparse)
+#   g_pde = J.T @ pde_residual[:, 0]
+#   g_bc  = J.T @ bc_residual[:, 0]
+#   cos_sim = jnp.dot(g_pde, g_bc) / (
+#       jnp.linalg.norm(g_pde) * jnp.linalg.norm(g_bc)
+#   )
+# ======================================================================
+def _grad_direction(J, residual):
+    """Virtual gradient: J^T @ residual → (P,) gradient direction."""
+    return J.T @ residual  # (P,)
+
+
+def _cosine_similarity(g1, g2):
+    """Cosine similarity between two gradient vectors."""
+    return jnp.dot(g1, g2) / (jnp.linalg.norm(g1) * jnp.linalg.norm(g2))
+
+
+class TestGradientCosineSimilarity:
+    """Use NetworkGradient to compare loss-gradient directions."""
+
+    def _setup(self, N=8):
+        """Build a tiny net, its Jacobian, and a context."""
+        net = _make_tiny_net()
+        x = make_var("interior")
+        u = net(x)
+        J_expr = u.grad(net)
+
+        context = {"interior": jnp.linspace(0.1, 0.9, N).reshape(N, 1)}
+        ev = TraceEvaluator({net.layer_id: net.module})
+        ctx = ev._EvalCtx(context, {}, None)
+        J = ev._dispatch(J_expr, ctx)  # (N, P)
+        return J, N
+
+    def test_same_loss_twice_has_cosine_similarity_one(self):
+        """Writing the same residual twice must give cos_sim = 1."""
+        J, N = self._setup()
+        residual = jnp.ones(N)
+
+        g1 = _grad_direction(J, residual)
+        g2 = _grad_direction(J, residual)  # identical expression
+
+        cos_sim = _cosine_similarity(g1, g2)
+        assert jnp.isclose(cos_sim, 1.0)
+
+    def test_opposite_residuals_have_cosine_similarity_minus_one(self):
+        """Flipping the sign of a residual gives cos_sim = -1."""
+        J, N = self._setup()
+        residual = jnp.ones(N)
+
+        g_pos = _grad_direction(J, residual)
+        g_neg = _grad_direction(J, -residual)
+
+        cos_sim = _cosine_similarity(g_pos, g_neg)
+        assert jnp.isclose(cos_sim, -1.0)
+
+    def test_sparse_mask_same_loss_twice(self):
+        """Same result holds when using a sparse parameter mask."""
+        net = _make_tiny_net()
+        x = make_var("interior")
+        u = net(x)
+
+        all_false = jax.tree_util.tree_map(lambda _: False, net.module)
+        mask = eqx.tree_at(lambda m: m.output_layer.weight, all_false, True)
+        J_expr = u.grad(net.mask(mask))
+
+        N = 8
+        context = {"interior": jnp.linspace(0.1, 0.9, N).reshape(N, 1)}
+        ev = TraceEvaluator({net.layer_id: net.module})
+        ctx = ev._EvalCtx(context, {}, None)
+        J = ev._dispatch(J_expr, ctx)  # (N, P_sparse)
+
+        residual = jnp.linspace(-1.0, 1.0, N)
+        g1 = _grad_direction(J, residual)
+        g2 = _grad_direction(J, residual)
+
+        assert jnp.isclose(_cosine_similarity(g1, g2), 1.0)
+        assert J.shape[1] == net.module.output_layer.weight.size
