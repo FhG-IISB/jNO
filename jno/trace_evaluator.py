@@ -620,6 +620,40 @@ class TraceEvaluator:
     def _eval_state_field(self, expr, ctx):
         return self._dispatch(expr.expr, ctx)
 
+    @staticmethod
+    def _partition_by_path_match(model, selector):
+        """Partition model using path-matching when LoRA changed the tree structure.
+
+        Falls back to this when eqx.partition(model, selector) fails due to a
+        structural mismatch between the selector (built on the pre-LoRA model) and
+        the current model (with LoRALinear layers).  Selects model leaves whose
+        pytree path exactly matches a True-valued path in the selector.
+        """
+
+        def _path_str(path):
+            parts = []
+            for k in path:
+                if hasattr(k, "key"):
+                    parts.append(str(k.key))
+                elif hasattr(k, "idx"):
+                    parts.append(str(k.idx))
+                elif hasattr(k, "name"):
+                    parts.append(k.name)
+                else:
+                    parts.append(str(k))
+            return "/".join(parts)
+
+        sel_flat, _ = jax.tree_util.tree_flatten_with_path(selector)
+        true_paths = {_path_str(path) for path, val in sel_flat if val is True or (isinstance(val, bool) and val)}
+
+        bool_tree = jax.tree_util.tree_map_with_path(
+            lambda path, leaf: _path_str(path) in true_paths and isinstance(leaf, jax.Array),
+            model,
+        )
+        import equinox as eqx
+
+        return eqx.partition(model, bool_tree)
+
     def _eval_network_gradient(self, expr, ctx):
         """Compute ∂target/∂params using jax.jacrev over eqx.partition'd weights.
 
@@ -648,7 +682,13 @@ class TraceEvaluator:
         # selector is either None (all params) or a boolean pytree built by the
         # caller via eqx.tree_at and stored on the model with net.mask(mask).
         if expr.selector is not None:
-            trainable, static = eqx.partition(current_model, expr.selector)
+            try:
+                trainable, static = eqx.partition(current_model, expr.selector)
+            except ValueError:
+                # Structural mismatch — model was transformed (e.g. LoRA applied to
+                # hidden layers) after the selector was built on the original model.
+                # Fall back to selecting leaves by pytree path.
+                trainable, static = self._partition_by_path_match(current_model, expr.selector)
         else:
             trainable, static = eqx.partition(current_model, eqx.is_array)
 

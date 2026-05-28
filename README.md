@@ -51,17 +51,13 @@ dom        = jno.domain(constructor=jno.domain.rect(mesh_size=0.05, x_range=(0, 
 x,  y,  _  = dom.variable("interior")
 xl, yl, _  = dom.variable("left")    # x = 0  →  soft Dirichlet
 
-# ── Network — LoRA adapters on hidden layers, 10× LR on output layer ───────────
+# ── Network — LoRA adapters on hidden layers ────────────────────────────────────
 net = jno.nn.wrap(
     foundax.mlp(in_features=2, hidden_dims=64, num_layers=4,
                 activation=jnp.tanh, key=jax.random.PRNGKey(0))
 )
-net.lora(rank=4, alpha=1.0)                                            # parameter-efficient training
+net.lora(rank=4, alpha=1.0, target="hidden_layers")  # parameter-efficient training
 net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 5_000, 1e-5))
-
-all_false = jax.tree_util.tree_map(lambda _: False, net.module)
-out_mask  = eqx.tree_at(lambda m: m.output_layer.weight, all_false, True)
-net.mask(out_mask).lr(lrs.exponential(1e-2, 0.5, 5_000, 1e-4))       # output layer at 10× LR
 
 # ── Forward pass — hard BCs on right (x=1), bottom (y=0), top (y=1) ───────────
 π  = jno.np.pi
@@ -76,6 +72,8 @@ bc_left = ul                                          # soft: u(0, y) = 0
 vol_tracker = tracker(u.integrate(), interval=500)
 
 # ── Gradient alignment — PDE vs. left-BC loss, output-layer params only ───────
+all_false  = jax.tree_util.tree_map(lambda _: False, net.module)
+out_mask   = eqx.tree_at(lambda m: m.output_layer.weight, all_false, True)
 J_pde      = pde.mse.grad(net.mask(out_mask))         # ∂L_pde / ∂θ_out
 J_bc       = bc_left.mse.grad(net.mask(out_mask))     # ∂L_bc  / ∂θ_out
 grad_align = tracker(jno.np.dot(J_pde, J_bc), interval=500)
