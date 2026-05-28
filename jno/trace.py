@@ -448,24 +448,28 @@ class Placeholder:
     # Integration — method-style API
     # ------------------------------------------------------------------
 
-    def integrate(self) -> "Integral":
+    def integrate(self, var: "Variable | None" = None) -> "Integral":
         """Integrate this expression over its mesh domain region.
 
+        **Scalar integral** (``var=None``, default):
         The region (boundary vs volume) is auto-detected from the Variable
-        tags inside the expression: if the tag is registered in
-        ``domain._boundary_registry`` it is treated as a boundary integral
-        (∫_∂Ω f ds), otherwise as a volume integral (∫_Ω f dV).
+        tags inside the expression.  The expression is evaluated at all mesh
+        nodes and reduced to a scalar via a weighted sum.
 
-        The expression is evaluated at **all** mesh nodes of the region,
-        weighted by the nodal measures from ``mesh_connectivity``, and
-        reduced to a scalar.  The user is responsible for computing any
-        desired F·n dot-product before calling ``.integrate()``::
+        **Vectorized integral** (``var=x`` — the outer/collocation variable):
+        When the expression contains two distinct Variable objects from the
+        same mesh (e.g. an outer collocation variable ``x`` and an inner
+        dummy ``t``), pass the outer one as ``var``.  The integral is then
+        evaluated for every collocation point via ``jax.vmap``, returning an
+        ``(N, 1)`` array — a function of the outer variable.  This enables
+        non-separable Fredholm-type kernels without any special flag on
+        ``domain.variable()``::
 
-            (Fx(x_b, y_b) * nx + Fy(x_b, y_b) * ny).integrate()  # flux
-            (u(x_b, y_b) - ref).square().integrate()               # boundary loss
-            u(x, y).integrate()                                    # volume integral
+            x, _ = domain.variable("interior")   # outer (collocation)
+            t, _ = domain.variable("interior")   # inner (dummy) — no flag needed
+            integral = (K(x, t) * net(t)).integrate(var=x)
         """
-        return Integral(self)
+        return Integral(self, integration_var=var)
 
 
 class Literal(Placeholder):
@@ -1855,14 +1859,21 @@ class Integral(Placeholder):
 
     Created by :meth:`Placeholder.integrate`.  The region (boundary vs volume)
     is auto-detected at evaluation time from the Variable tags inside
-    ``target`` via ``domain._boundary_registry``.  Reduces to a scalar.
+    ``target`` via ``domain._boundary_registry``.
+
+    When ``integration_var`` is set (the outer/collocation Variable), the
+    evaluator uses ``jax.vmap`` to return an ``(N, 1)`` array instead of a
+    scalar, enabling non-separable Fredholm kernels.
     """
 
-    def __init__(self, target: "Placeholder"):
+    def __init__(self, target: "Placeholder", integration_var: "Variable | None" = None):
         self.target = target
+        self.integration_var = integration_var
         _propagate_weak(self, target)
 
     def __repr__(self):
+        if self.integration_var is not None:
+            return f"Integral({self.target}, outer={self.integration_var})"
         return f"Integral({self.target})"
 
 

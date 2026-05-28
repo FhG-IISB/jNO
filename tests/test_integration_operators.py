@@ -20,9 +20,8 @@ import numpy as np
 import pytest
 
 import jno
-from jno.trace import Model, Integral, Placeholder
-from jno.trace_evaluator import TraceEvaluator, IntegrationOperators
-
+from jno.trace import Integral, Model, Placeholder
+from jno.trace_evaluator import IntegrationOperators, TraceEvaluator
 
 # ---------------------------------------------------------------------------
 # Shared helpers
@@ -495,3 +494,207 @@ class TestFluxIntegral:
         expr = (x_b * nx + y_b * ny).integrate()
         result = float(_eval_integral_expr(expr, dom))
         assert abs(result - 2.0) < 0.15
+
+
+# ---------------------------------------------------------------------------
+# Vectorized integral via integration_variable=True
+#
+# Analytic reference (1-D domain [0, 1], kernel K(x,t) = x + t):
+#
+#   ∫₀¹ (x + t) · t dt = x · ∫₀¹ t dt + ∫₀¹ t² dt = 0.5x + 1/3
+#
+# Result is an (N_outer, 1) array — a function of the outer variable x.
+# ---------------------------------------------------------------------------
+
+
+class TestVectorizedIntegral:
+    """Non-separable Fredholm kernel via ``.integrate(var=x)``.
+
+    Uses kernel K(x,t) = x + t and integrand u(t) = t so that the analytic
+    result is 0.5·x + 1/3, verifiable pointwise.
+
+    API: call ``domain.variable(tag)`` twice — no special flag needed.
+    Pass the outer (collocation) variable to ``.integrate(var=x)``; the
+    evaluator aliases everything else to the integration mesh automatically.
+    """
+
+    @pytest.fixture(scope="class")
+    def dom(self):
+        return jno.domain(constructor=jno.domain.line(mesh_size=0.02))
+
+    def test_two_calls_produce_distinct_objects(self, dom):
+        """Two domain.variable() calls return distinct Python objects (different id)."""
+        x, _ = dom.variable("interior")
+        t, _ = dom.variable("interior")
+        assert x is not t
+        assert id(x) != id(t)
+
+    def test_vectorized_integral_shape(self, dom):
+        """(x + t)·t integrated with var=x gives (N_outer, 1), not a scalar."""
+        x, _ = dom.variable("interior")
+        t, _ = dom.variable("interior")
+        expr = ((x + t) * t).integrate(var=x)
+        result = _eval_integral_expr(expr, dom)
+        ctx = _build_context(dom)
+        N_outer = ctx["interior"].shape[0]
+        assert result.shape == (N_outer, 1), f"Expected ({N_outer}, 1), got {result.shape}"
+
+    def test_vectorized_integral_values(self, dom):
+        """Pointwise values match 0.5·x + 1/3 within mesh discretisation error."""
+        x, _ = dom.variable("interior")
+        t, _ = dom.variable("interior")
+        expr = ((x + t) * t).integrate(var=x)
+        result = _eval_integral_expr(expr, dom)  # (N, 1)
+
+        ctx = _build_context(dom)
+        x_vals = np.asarray(ctx["interior"])[:, 0]  # (N,)
+        analytic = 0.5 * x_vals + 1.0 / 3.0
+
+        max_err = float(np.max(np.abs(np.asarray(result[:, 0]) - analytic)))
+        assert max_err < 0.01, f"Max pointwise error {max_err:.4f} exceeds tolerance"
+
+    def test_vectorized_integral_is_jit_compatible(self, dom):
+        """jax.jit over the vectorized integral compiles and two calls agree."""
+        x, _ = dom.variable("interior")
+        t, _ = dom.variable("interior")
+        expr = ((x + t) * t).integrate(var=x)
+        ctx = _build_context(dom)
+
+        ev = TraceEvaluator(params={})
+
+        @jax.jit
+        def run():
+            return ev.evaluate(expr, context=ctx, var_bindings={})
+
+        r1 = run()
+        r2 = run()
+        assert jnp.allclose(r1, r2)
+
+    def test_no_inner_var_raises(self, dom):
+        """integrate(var=x) with no second variable raises a clear error."""
+        x, _ = dom.variable("interior")
+        expr = (x * x).integrate(var=x)
+        with pytest.raises(ValueError, match="no inner variable"):
+            _eval_integral_expr(expr, dom)
+
+    def test_nonseparable_kernel_analytic_values(self, dom):
+        """∫₀¹ (x+t)·sin(πt) dt = 2x/π + 1/π at every collocation point.
+
+        This is the integral term in the non-separable Fredholm tutorial.
+        """
+        x, _ = dom.variable("interior")
+        t, _ = dom.variable("interior")
+        π = jno.np.pi
+        expr = ((x + t) * jno.np.sin(π * t)).integrate(var=x)
+        result = _eval_integral_expr(expr, dom)  # (N, 1)
+
+        ctx = _build_context(dom)
+        x_vals = np.asarray(ctx["interior"])[:, 0]
+        analytic = 2.0 * x_vals / float(jnp.pi) + 1.0 / float(jnp.pi)
+
+        max_err = float(np.max(np.abs(np.asarray(result[:, 0]) - analytic)))
+        assert max_err < 0.01, f"Max pointwise error {max_err:.4f}"
+
+    def test_chained_double_integral(self, dom):
+        """∫₀¹ ∫₀¹ (x+t) dt dx = 1.0  via chained .integrate() calls."""
+        x, _ = dom.variable("interior")
+        t, _ = dom.variable("interior")
+        inner = (x + t).integrate(var=x)  # (N,1): g(x) = x + 0.5
+        result = float(_eval_integral_expr(inner.integrate(), dom))  # scalar
+        assert abs(result - 1.0) < 0.01, f"∫∫(x+t)dt dx = {result:.6f}, expected 1.0"
+
+    def test_chained_double_integral_separable(self, dom):
+        """∫₀¹ ∫₀¹ x·t dt dx = 0.25  (separable kernel, chained)."""
+        x, _ = dom.variable("interior")
+        t, _ = dom.variable("interior")
+        inner = (x * t).integrate(var=x)  # (N,1): g(x) = 0.5·x
+        result = float(_eval_integral_expr(inner.integrate(), dom))  # scalar
+        assert abs(result - 0.25) < 0.01, f"∫∫ x·t dt dx = {result:.6f}, expected 0.25"
+
+
+# ---------------------------------------------------------------------------
+# Integro-differential equation: .d(x) and .integrate() in the same residual
+#
+# IDE:  u'(x) + u(x) = g(x) + ∫₀¹ u(t) dt,   u(0) = 0
+# Exact: u*(x) = sin(πx)
+#
+# Two pure-operator checks (no training):
+#
+# 1. u = x²:
+#       u'(x) = 2x
+#       ∫₀¹ x² dt = 1/3
+#       u'(x) + ∫₀¹ u(t) dt = 2x + 1/3
+#
+# 2. IDE residual at exact solution sin(πx) should be near zero (within
+#    discretisation error).  g(x) = π cos(πx) + sin(πx) − 2/π.
+# ---------------------------------------------------------------------------
+
+
+class TestIntegroDifferential:
+    """Composition of .d(x) and .integrate() in an IDE residual.
+
+    No training — uses the identity model u=x² (via multiplication) and the
+    exact solution sin(πx) to verify operator composition analytically.
+    """
+
+    @pytest.fixture
+    def dom(self):
+        return jno.domain(constructor=jno.domain.line(mesh_size=0.05))
+
+    def test_derivative_plus_integral_composition(self, dom):
+        """u=x²: u'(x) + ∫₀¹ u(t) dt = 2x + 1/3 at every collocation point."""
+        x, _ = dom.variable("interior")
+
+        # u = x²  via placeholder arithmetic (no network)
+        u = x * x
+
+        du = u.d(x)  # (N, 1): 2x
+        C = u.integrate()  # scalar: ∫₀¹ t² dt = 1/3
+
+        combined = du + C  # (N, 1): 2x + 1/3
+
+        ctx = _build_context(dom)
+        ev = TraceEvaluator(params={})
+        result = np.asarray(ev.evaluate(combined, context=ctx, var_bindings={}))  # (N, 1)
+
+        x_vals = np.asarray(ctx["interior"])[:, 0]  # (N,)
+        analytic = 2.0 * x_vals + 1.0 / 3.0
+
+        max_err = float(np.max(np.abs(result[:, 0] - analytic)))
+        assert max_err < 0.01, f"Max pointwise error {max_err:.2e}, expected < 0.01"
+
+    def test_ide_residual_at_exact_solution_is_near_zero(self, dom):
+        """IDE residual vanishes at u*(x) = sin(πx) (within discretisation error)."""
+        x, _ = dom.variable("interior")
+        π = jno.np.pi
+
+        u = jno.np.sin(π * x)
+
+        pi_val = float(jnp.pi)
+        g = π * jno.np.cos(π * x) + jno.np.sin(π * x) - 2.0 / pi_val
+
+        C = u.integrate()  # should evaluate to ≈ 2/π
+        du = u.d(x)  # π cos(πx)
+
+        residual = du + u - g - C  # should be ≈ 0
+
+        ctx = _build_context(dom)
+        ev = TraceEvaluator(params={})
+        res = np.asarray(ev.evaluate(residual, context=ctx, var_bindings={}))
+
+        max_abs = float(np.max(np.abs(res)))
+        assert max_abs < 5e-3, f"IDE residual at exact solution: max|R| = {max_abs:.2e}"
+
+    def test_scalar_integral_has_no_outer_dimension(self, dom):
+        """C = u.integrate() (no var=) returns a true scalar, not (N, 1)."""
+        x, _ = dom.variable("interior")
+        u = jno.np.sin(jno.np.pi * x)
+        C = u.integrate()
+
+        ctx = _build_context(dom)
+        ev = TraceEvaluator(params={})
+        result = ev.evaluate(C, context=ctx, var_bindings={})
+
+        assert result.ndim == 0 or result.size == 1, f"Expected scalar, got shape {result.shape}"
+        val = float(jnp.squeeze(result))
+        assert abs(val - 2.0 / float(jnp.pi)) < 0.01, f"∫₀¹ sin(πt) dt = {val:.4f}, expected ≈ {2.0 / float(jnp.pi):.4f}"
