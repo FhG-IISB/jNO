@@ -345,12 +345,12 @@ class TestModelMask:
         """mask().lora() sets _lora_config as a list of dicts and consumes the mask scope."""
         import jax
 
-        from jno.lora import LoRALinear
+        from jno.lora import LoRAConv, LoRALinear
 
         u_net = self._make_eqx_model()
         all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
         u_net.mask(all_true).lora(rank=4, alpha=1.0)
-        assert u_net._lora_config == [{"target": None, "rank": 4, "alpha": 1.0, "wrappers": (LoRALinear,)}]
+        assert u_net._lora_config == [{"target": None, "rank": 4, "alpha": 1.0, "wrappers": (LoRALinear, LoRAConv)}]
         assert u_net._mask_scope_pending is False
 
     def test_manual_mask_optimizer_creates_group_and_keeps_global_fallback(self):
@@ -443,9 +443,9 @@ class TestModelMask:
 
         u_net.mask(all_false).lora(rank=2, alpha=1.0)
 
-        from jno.lora import LoRALinear
+        from jno.lora import LoRAConv, LoRALinear
 
-        assert u_net._lora_config == [{"target": None, "rank": 2, "alpha": 1.0, "wrappers": (LoRALinear,)}]
+        assert u_net._lora_config == [{"target": None, "rank": 2, "alpha": 1.0, "wrappers": (LoRALinear, LoRAConv)}]
         assert u_net._mask_scope_pending is False
         leaves = jax.tree_util.tree_leaves(u_net._trainable_param_mask)
         assert all(v is True for v in leaves if isinstance(v, bool))
