@@ -755,7 +755,8 @@ class TraceEvaluator:
             return jax.random.normal(subkey, shape) * expr.params.get("std", 1.0)
         elif dist == "uniform":
             return jax.random.uniform(
-                subkey, shape,
+                subkey,
+                shape,
                 minval=expr.params.get("low", -1.0),
                 maxval=expr.params.get("high", 1.0),
             )
@@ -766,8 +767,7 @@ class TraceEvaluator:
             return -jnp.sign(u) * jnp.log(1.0 - 2.0 * jnp.abs(u)) * std / jnp.sqrt(2.0)
         else:
             raise ValueError(
-                f"Unknown noise distribution {expr.distribution!r}. "
-                "Choose from: 'gaussian', 'uniform', 'laplace'."
+                f"Unknown noise distribution {expr.distribution!r}. Choose from: 'gaussian', 'uniform', 'laplace'."
             )
 
     def _eval_tunable_module_call(self, expr, ctx):
