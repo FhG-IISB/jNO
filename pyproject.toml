@@ -131,6 +131,8 @@ iree = { features = ["iree"], solve-group = "default" }
 fmt = "ruff format ."
 lint = "ruff check . --fix"
 test = "pytest -x --tb=short"
+all = "ruff format . && ruff check . --fix && pytest"
+
 # CI tasks: read-only (no auto-fix) and skip slow tests
 ci-fmt = "ruff format --check ."
 ci-lint = "ruff check ."

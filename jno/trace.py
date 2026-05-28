@@ -475,32 +475,33 @@ class Placeholder:
     def grad(self, model: "Model") -> "NetworkGradient":
         """Parameter Jacobian ∂self/∂θ where θ are the trainable weights of *model*.
 
-        Returns an ``(N, P)`` array — N spatial points × P total trainable
-        parameters (all array leaves, flattened).  For multi-dimensional
-        output ``(N, D)`` the result is ``(N, D, P)``.
+        Returns an ``(N, P)`` array — N spatial points × P selected trainable
+        parameters (flattened).  For multi-dimensional output ``(N, D)`` the
+        result is ``(N, D, P)``.
 
-        **This is a post-training analysis tool**, not a training constraint.
-        Use it via ``crux.eval([u.grad(net)])``.  Placing it inside a training
-        loss would compute second-order derivatives through ``jax.jacrev`` and
-        is prohibitively expensive.
+        To restrict to a subset of parameters, call ``model.mask(bool_pytree)``
+        first using a boolean pytree built with :func:`equinox.tree_at`.  Since
+        ``mask()`` returns the model itself, you can write the selection inline::
 
-        Cost: O(min(N, P)) AD passes — one backward pass per output point
-        (``jax.jacrev``) or one forward pass per parameter (``jax.jacfwd``).
-        ``jacrev`` is used here, which is efficient when N < P.
+            import equinox as eqx, jax
 
-        Example::
+            # All parameters — Neural Tangent Kernel
+            J = crux.eval([u.grad(net)])[0]             # (N, P_total)
+            K = J @ J.T                                  # (N, N)
 
-            u = net(x, y) * x * (1 - x) * y * (1 - y)
-            J  = crux.eval([u.grad(net)])[0]   # (N, P)
-            # Neural Tangent Kernel:
-            K  = J @ J.T                        # (N, N)
+            # Subset — only the output-layer weight matrix
+            all_false = jax.tree_util.tree_map(lambda _: False, net.module)
+            mask = eqx.tree_at(lambda m: m.output_layer.weight, all_false, True)
+            J_w = crux.eval([u.grad(net.mask(mask))])[0]  # (N, P_weight)
         """
         if not isinstance(model, Model):
             raise TypeError(
                 f"grad() expects a Model placeholder, got {type(model).__name__!r}. "
                 "For spatial derivatives use .d(variable) or jno.np.grad(expr, var)."
             )
-        return NetworkGradient(self, model)
+        # Capture any mask set via net.mask(bool_pytree) at call time.
+        selector = getattr(model, "_param_mask", None)
+        return NetworkGradient(self, model, selector=selector)
 
     def stop_gradient(self) -> "FunctionCall":
         """Treat this expression as a constant during backpropagation.
@@ -1045,7 +1046,7 @@ class Model(Placeholder):
         self.input_dim = None
         self.weight_path = weight_path
         self.layer_id = _next_op_id()
-        self.show = True  # Wether or not to print the model
+        self.show = True  # Whether or not to print the model
 
         # ── training config (plain Python, not JAX arrays) ──
         self._frozen: bool = False
@@ -1065,6 +1066,11 @@ class Model(Placeholder):
         self._tunable_opts: Dict[str, list] = {}  # per-model tunable options for sweeps
 
     # ── public API ───────────────────────────────────────────
+
+    @property
+    def params(self):
+        """Alias for :attr:`module` — always reflects the current (post-training) weights."""
+        return self.module
 
     def __call__(self, *args) -> "ModelCall":
         """Call this module with variables and return a traced ``ModelCall``."""
@@ -1233,8 +1239,8 @@ class Model(Placeholder):
         boolean leaves where ``True`` selects leaves in the masked scope.
 
         This scope is consumed by grouped optimizer/lr calls and by
-        ``mask(...).freeze()``. It does not by itself freeze or unfreeze
-        parameters.
+        ``mask(...).freeze()``.  It is also read by ``u.grad(net.mask(...))``
+        to restrict the Jacobian to only the selected parameters.
 
         Example::
 
@@ -1246,6 +1252,7 @@ class Model(Placeholder):
                 all_false, (True, True),
             )
             model.mask(param_mask).optimizer(optax.adam, lr=1e-3)
+            J = crux.eval([u.grad(model.mask(param_mask))])[0]  # (N, P_selected)
         """
         self._param_mask = param_mask
         self._mask_scope_pending = self._param_mask is not None
@@ -1948,15 +1955,18 @@ class NetworkGradient(Placeholder):
 
     Output shape inside ``crux.eval``: ``(B, N, P)`` for scalar-output expressions;
     ``(B, N, D, P)`` for D-dimensional output.
-    N = spatial points, P = total trainable params of the target model.
+    N = spatial points, P = number of selected trainable parameters.
+    When *selector* is ``None``, P = all trainable array leaves flattened.
     """
 
-    def __init__(self, target: Placeholder, model_node: "Model"):
+    def __init__(self, target: Placeholder, model_node: "Model", selector=None):
         self.target = target
         self.model_node = model_node
+        self.selector = selector  # None → all params; callable → eqx.tree_at selector
 
     def __repr__(self):
-        return f"NetworkGradient({self.target!r}, model={self.model_node!r})"
+        sel = f", selector={self.selector!r}" if self.selector is not None else ""
+        return f"NetworkGradient({self.target!r}, model={self.model_node!r}{sel})"
 
 
 class FemLinearSystem:

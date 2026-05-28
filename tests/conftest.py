@@ -1,5 +1,11 @@
 """Shared fixtures and helpers for jNO tests."""
 
+import os
+
+# Prevent JAX from pre-allocating GPU memory in the pytest process so that
+# subprocess-based smoke tests can still initialize their own CUDA contexts.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
+
 import jax
 import jax.numpy as jnp
 import pytest

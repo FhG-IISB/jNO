@@ -21,6 +21,13 @@ Showcases
 - FEAX-backed linear FEM system A u = b
 """
 
+import sys
+
+try:
+    import feax  # noqa: F401
+except ImportError:
+    sys.exit(0)
+
 import jax.numpy as jnp
 import numpy as np
 

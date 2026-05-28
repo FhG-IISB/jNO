@@ -22,6 +22,13 @@ The assembled jNO DiffraxBlock is compared against a hand-written Diffrax RHS.
 The problem is intentionally reaction-only, not reaction-diffusion.
 """
 
+import sys
+
+try:
+    import diffrax  # noqa: F401
+except ImportError:
+    sys.exit(0)
+
 import os
 import time
 

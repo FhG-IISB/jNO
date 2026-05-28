@@ -642,8 +642,13 @@ class TraceEvaluator:
                 "Make sure to call crux.eval() after crux.solve()."
             )
 
-        # Split into differentiable leaves (arrays) vs static Python structure
-        trainable, static = eqx.partition(current_model, eqx.is_array)
+        # Split into differentiable leaves vs static structure.
+        # selector is either None (all params) or a boolean pytree built by the
+        # caller via eqx.tree_at and stored on the model with net.mask(mask).
+        if expr.selector is not None:
+            trainable, static = eqx.partition(current_model, expr.selector)
+        else:
+            trainable, static = eqx.partition(current_model, eqx.is_array)
 
         def forward_fn(trainable_params):
             # Rebuild model from trainable leaves + static structure
@@ -660,6 +665,14 @@ class TraceEvaluator:
         logical_shape = raw_out_shape
         while len(logical_shape) > 1 and logical_shape[0] == 1:
             logical_shape = logical_shape[1:]
+
+        # ── Scalar target (e.g. loss.mse) → gradient vector (P,) ───────────
+        if len(logical_shape) == 0:
+            grad_pytree = jax.jacrev(forward_fn)(trainable)
+            leaves = jax.tree_util.tree_leaves(grad_pytree)
+            cols = [leaf.reshape(-1) for leaf in leaves]
+            return jnp.concatenate(cols, axis=-1)  # (P,)
+
         N = logical_shape[0]
         D = logical_shape[1] if len(logical_shape) > 1 else 1
 

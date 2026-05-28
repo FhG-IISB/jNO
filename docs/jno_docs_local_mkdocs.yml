@@ -77,6 +77,8 @@ nav:
       - Fredholm Non-Separable Kernel: tutorials/06-integration/fredholm-nonseparable.md
       - Flux Conservation 2D: tutorials/06-integration/flux-conservation-2d.md
       - Integro-Differential Equation: tutorials/06-integration/integro-differential.md
+    - 07 Analysis:
+      - Gradient Conflict Analysis: tutorials/07-analysis/gradient-conflict.md
     - 08 FEM and Variational PINNs:
       - Poisson 2D FEM: tutorials/08-fem-and-varpinns/poisson-2d-fem.md
       - Stationary Allen-Cahn FEM: tutorials/08-fem-and-varpinns/stationary-allen-cahn-fem.md

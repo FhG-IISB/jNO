@@ -18,6 +18,13 @@ Showcases
 - block.as_feax_pipeline()
 """
 
+import sys
+
+try:
+    import diffrax  # noqa: F401
+except ImportError:
+    sys.exit(0)
+
 import os
 import time
 

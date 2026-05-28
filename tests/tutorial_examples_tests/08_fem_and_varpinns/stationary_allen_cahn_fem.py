@@ -21,6 +21,13 @@ Showcases
 - external nonlinear solve using scipy.optimize.root
 """
 
+import sys
+
+try:
+    import feax  # noqa: F401
+except ImportError:
+    sys.exit(0)
+
 import jax.numpy as jnp
 import numpy as np
 import scipy.optimize as spo

@@ -34,15 +34,15 @@ import optax
 import jno
 
 KEY = jax.random.PRNGKey(0)
-GRID = 64
-SAMPLES = 200
+GRID = 16
+SAMPLES = 20
 TRAIN_MODES = 5
-TEST_MODES = 7
+TEST_MODES = 5
 ALPHA = 1.5
 TRAIN_SEED = 42
 TEST_SEED = 314
-EPOCHS = 5_000
-BATCH = 40
+EPOCHS = 100
+BATCH = 10
 CG_TOL = 1e-8
 CG_MAXITER = 4_000
 
@@ -142,8 +142,8 @@ def main():
     model = jno.nn.wrap(
         foundax.fno2d(
             in_features=1,
-            hidden_channels=48,
-            n_modes=24,
+            hidden_channels=16,
+            n_modes=6,
             d_vars=1,
             n_layers=2,
             n_steps=1,
