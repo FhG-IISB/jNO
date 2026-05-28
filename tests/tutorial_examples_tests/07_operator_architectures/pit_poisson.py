@@ -18,9 +18,9 @@ Reference: Zhao et al. "Position-induced Transformer" (2023)
 import foundax
 import jax
 import optax
+from create_domain import build_domain_from_arrays, generate_poisson_data
 
 import jno
-from create_domain import build_domain_from_arrays, generate_poisson_data
 
 KEY = jax.random.PRNGKey(0)
 GRID = 16

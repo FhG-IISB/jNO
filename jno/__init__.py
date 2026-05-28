@@ -10,12 +10,12 @@ import sys
 
 from . import fn, lora
 from . import jnp_ops as np
-from .noise import noise
 from .architectures.models import nn, parameter
 from .core import core
 from .differential_operators import DifferentialOperators
 from .domain import PolygonDomain, domain
 from .integration_operators import IntegrationOperators
+from .noise import noise
 from .trace import (
     Assembly,
     FemLinearSystem,
