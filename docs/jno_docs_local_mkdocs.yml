@@ -37,6 +37,7 @@ nav:
   - Installation: Installation.md
   - Domain and Geometry: Domain-and-Geometry.md
   - Differential Operators: Differential-Operators.md
+  - Integration Operators: Integration-Operators.md
   - Training: Training.md
   - Model Controls: Model-Controls.md
   - Adaptive Resampling: Adaptive-Resampling.md
@@ -71,6 +72,11 @@ nav:
       - Coupled Elliptic 2D: tutorials/05-coupled-and-inverse/coupled-elliptic-2d.md
       - Coupled Parabolic 2D: tutorials/05-coupled-and-inverse/coupled-parabolic-2d.md
       - Inverse Parameter: tutorials/05-coupled-and-inverse/inverse-parameter.md
+    - 06 Integration:
+      - Fredholm Integral Equation: tutorials/06-integration/fredholm-integral-equation.md
+      - Fredholm Non-Separable Kernel: tutorials/06-integration/fredholm-nonseparable.md
+      - Flux Conservation 2D: tutorials/06-integration/flux-conservation-2d.md
+      - Integro-Differential Equation: tutorials/06-integration/integro-differential.md
     - 08 FEM and Variational PINNs:
       - Poisson 2D FEM: tutorials/08-fem-and-varpinns/poisson-2d-fem.md
       - Stationary Allen-Cahn FEM: tutorials/08-fem-and-varpinns/stationary-allen-cahn-fem.md

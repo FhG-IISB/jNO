@@ -106,6 +106,7 @@ class MeshUtils:
         msg = f"Preprocessed mesh connectivity: {n_points} points, {len(elements)} {element_type}"
 
         mesh_connectivity["nodal_ds"] = MeshUtils.compute_nodal_ds(mesh_connectivity)
+        mesh_connectivity["nodal_volumes"] = MeshUtils.compute_nodal_volumes(mesh_connectivity)
         mesh_connectivity["boundary_indices"] = boundary_indices
 
         bp = points[boundary_indices]
@@ -243,6 +244,50 @@ class MeshUtils:
             return ds[boundary_indices]
 
         return ds
+
+    @staticmethod
+    def compute_nodal_volumes(mesh_connectivity: dict) -> np.ndarray:
+        """Per-node volume weights for interior integration.
+
+        Mirrors ``compute_nodal_ds`` for boundary, but distributes element
+        volume/area/length to all interior nodes:
+
+        - 1D: ½ of adjacent segment lengths (trapezoidal rule)
+        - 2D: ⅓ of incident triangle areas
+        - 3D: ¼ of incident tetrahedron volumes
+
+        Called once during mesh preprocessing and stored as
+        ``mesh_connectivity["nodal_volumes"]``.
+        """
+        dimension = mesh_connectivity["dimension"]
+        points = mesh_connectivity["points"]
+        n_points = mesh_connectivity["n_points"]
+        vols = np.zeros(n_points)
+
+        if dimension == 1:
+            for seg in mesh_connectivity["lines"]:
+                L = np.linalg.norm(points[seg[1]] - points[seg[0]])
+                vols[seg[0]] += 0.5 * L
+                vols[seg[1]] += 0.5 * L
+
+        elif dimension == 2:
+            for tri in mesh_connectivity["triangles"]:
+                a, b, c = points[tri[0]], points[tri[1]], points[tri[2]]
+                area = 0.5 * abs(float(np.cross(b - a, c - a)))
+                for n in tri:
+                    vols[n] += area / 3.0
+
+        elif dimension == 3:
+            for tet in mesh_connectivity["tetrahedra"]:
+                a, b, c, d = (points[tet[i]] for i in range(4))
+                vol = abs(float(np.dot(b - a, np.cross(c - a, d - a)))) / 6.0
+                for n in tet:
+                    vols[n] += vol / 4.0
+
+        else:
+            raise ValueError(f"Unsupported dimension: {dimension}")
+
+        return vols
 
     @staticmethod
     def get_boundary_normals(mesh, k=8):

@@ -7,11 +7,13 @@ import jax.numpy as jnp
 from .architectures.models import nn, parameter  # noqa: F401
 
 # Keep import so people can use jno.numpy as jno -> jno.model, jno.tune
+from .integration_operators import IntegrationOperators  # noqa: F401
 from .trace import (
     Choice,
     ConstantNamespace,
     FunctionCall,
     Hessian,
+    Integral,
     Jacobian,
     Placeholder,
     TestFunction,
@@ -732,6 +734,29 @@ def curl_3d(
     curl_y = Jacobian(Fx, [z]) - Jacobian(Fz, [x])
     curl_z = Jacobian(Fy, [x]) - Jacobian(Fx, [y])
     return stack([curl_x, curl_y, curl_z], axis=-1)
+
+
+def integrate(expr: Placeholder) -> "Integral":
+    """Integrate a scalar expression over its mesh domain region.
+
+    Shorthand for ``expr.integrate()``.  The region (boundary vs volume) is
+    auto-detected from the Variable tags inside ``expr`` via
+    ``domain._boundary_registry``.
+
+    The expression is evaluated at **all** mesh nodes of that region and
+    reduced to a scalar via a weighted sum using nodal measures.
+    For flux integrals, compute F·n explicitly first::
+
+        (Fx(x_b, y_b) * nx + Fy(x_b, y_b) * ny).integrate()
+        integrate(Fx(x_b, y_b) * nx + Fy(x_b, y_b) * ny)  # equivalent
+
+    Args:
+        expr: Scalar-valued Placeholder expression.
+
+    Returns:
+        Integral node that evaluates to a scalar.
+    """
+    return Integral(expr)
 
 
 def test(name: str = "phi") -> TestFunction:

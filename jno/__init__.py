@@ -14,12 +14,14 @@ from .architectures.models import nn, parameter
 from .core import core
 from .differential_operators import DifferentialOperators
 from .domain import PolygonDomain, domain
+from .integration_operators import IntegrationOperators
 from .trace import (
     Assembly,
     FemLinearSystem,
     FemResidualOperator,
     GroupedAssembly,
     Hessian,
+    Integral,
     Jacobian,
     Model,
     OperationCall,
@@ -86,6 +88,8 @@ __all__ = [
     "TraceEvaluator",
     "TraceCompiler",
     "DifferentialOperators",
+    "IntegrationOperators",
+    "Integral",
     "iree",
     "save",
     "load",
