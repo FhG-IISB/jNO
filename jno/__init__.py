@@ -10,6 +10,7 @@ import sys
 
 from . import fn, lora
 from . import jnp_ops as np
+from .noise import noise
 from .architectures.models import nn, parameter
 from .core import core
 from .differential_operators import DifferentialOperators
@@ -24,6 +25,7 @@ from .trace import (
     Integral,
     Jacobian,
     Model,
+    NetworkGradient,
     OperationCall,
     OperationDef,
     Placeholder,
@@ -113,6 +115,7 @@ __all__ = [
     "np",
     "fn",
     "lora",
+    "noise",
     "callback",
     "StateField",
 ]

@@ -1,6 +1,7 @@
 """Unit tests for jno.trace — the symbolic tracing DSL."""
 
 import foundax
+import jax
 import jax.numpy as jnp
 import pytest
 
@@ -14,10 +15,12 @@ from jno.trace import (
     Jacobian,
     Literal,
     ModelCall,
+    NetworkGradient,
     OperationCall,
     OperationDef,
     TensorTag,
     collect_operations,
+    collect_tags,
 )
 from tests.conftest import make_var
 
@@ -662,3 +665,130 @@ class TestPlaceholderProperties:
         x = make_var("x")
         result = x.T
         assert isinstance(result, FunctionCall)
+
+
+# ======================================================================
+# NetworkGradient
+# ======================================================================
+def _make_net_and_var():
+    """Return a small wrapped MLP and a Variable pointing at 'interior'."""
+    import jno.jnp_ops as jnn
+
+    key = jax.random.PRNGKey(0)
+    net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=key))
+    x = make_var("interior")
+    return net, x
+
+
+class TestNetworkGradient:
+    def test_grad_returns_network_gradient(self):
+        net, x = _make_net_and_var()
+        J = net(x).grad(net)
+        assert isinstance(J, NetworkGradient)
+
+    def test_grad_stores_target_and_model(self):
+        net, x = _make_net_and_var()
+        u = net(x)
+        J = u.grad(net)
+        assert J.target is u
+        assert J.model_node is net
+
+    def test_grad_type_error_for_variable(self):
+        net, x = _make_net_and_var()
+        u = net(x)
+        with pytest.raises(TypeError, match="grad\\(\\) expects a Model"):
+            u.grad(x)
+
+    def test_repr_contains_class_name(self):
+        net, x = _make_net_and_var()
+        assert "NetworkGradient" in repr(net(x).grad(net))
+
+    def test_collect_tags_traverses_into_target(self):
+        """collect_tags must descend into NetworkGradient.target."""
+        net, x = _make_net_and_var()
+        J = net(x).grad(net)
+        tags = collect_tags(J)
+        assert "interior" in tags
+
+    def test_collect_operations_traverses_into_target(self):
+        """collect_operations must not crash on a NetworkGradient node."""
+        net, x = _make_net_and_var()
+        J = net(x).grad(net)
+        ops = collect_operations(J)
+        assert isinstance(ops, list)
+
+    def test_binary_ops_on_network_gradient(self):
+        """NetworkGradient is a Placeholder so arithmetic should work."""
+        net, x = _make_net_and_var()
+        J = net(x).grad(net)
+        expr = J * 2.0
+        assert isinstance(expr, BinaryOp)
+        assert expr.op == "*"
+
+    def test_stop_gradient_on_network_gradient(self):
+        """u.grad(net).stop_gradient() should wrap in a FunctionCall."""
+        net, x = _make_net_and_var()
+        J = net(x).grad(net)
+        J_sg = J.stop_gradient()
+        assert isinstance(J_sg, FunctionCall)
+        assert J_sg._name == "stop_gradient"
+        assert J_sg.args[0] is J
+
+    def test_grad_without_mask_has_none_selector(self):
+        net, x = _make_net_and_var()
+        J = net(x).grad(net)
+        assert J.selector is None
+
+    def test_grad_with_bool_pytree_mask(self):
+        """net.mask(bool_pytree) captures _param_mask; grad() reads it."""
+        import equinox as eqx
+
+        net, x = _make_net_and_var()
+        all_false = jax.tree_util.tree_map(lambda _: False, net.module)
+        mask = eqx.tree_at(lambda m: m.output_layer.weight, all_false, True)
+        J = net(x).grad(net.mask(mask))
+        assert isinstance(J, NetworkGradient)
+        assert J.selector is mask
+
+    def test_collect_tags_with_mask(self):
+        """collect_tags still traverses the target even with a mask selector."""
+        import equinox as eqx
+
+        net, x = _make_net_and_var()
+        all_false = jax.tree_util.tree_map(lambda _: False, net.module)
+        mask = eqx.tree_at(lambda m: m.output_layer.weight, all_false, True)
+        J = net(x).grad(net.mask(mask))
+        tags = collect_tags(J)
+        assert "interior" in tags
+
+
+# ======================================================================
+# stop_gradient
+# ======================================================================
+class TestStopGradient:
+    def test_returns_function_call(self):
+        x = make_var("x")
+        result = x.stop_gradient()
+        assert isinstance(result, FunctionCall)
+
+    def test_name_is_stop_gradient(self):
+        x = make_var("x")
+        assert x.stop_gradient()._name == "stop_gradient"
+
+    def test_wraps_self(self):
+        x = make_var("x")
+        result = x.stop_gradient()
+        assert result.args[0] is x
+
+    def test_chainable_with_arithmetic(self):
+        """Result is a Placeholder so further symbolic ops work."""
+        x = make_var("x")
+        expr = x.stop_gradient() * 2.0
+        assert isinstance(expr, BinaryOp)
+
+    def test_double_stop_gradient(self):
+        """Stacking stop_gradient() twice is valid."""
+        x = make_var("x")
+        result = x.stop_gradient().stop_gradient()
+        assert isinstance(result, FunctionCall)
+        assert result._name == "stop_gradient"

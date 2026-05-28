@@ -48,6 +48,9 @@ def test_tutorial_script_smoke(script_path: Path):
     env.setdefault("PYTHONDONTWRITEBYTECODE", "1")
     # Use one explicit GPU by default for reproducible smoke behavior.
     env.setdefault("CUDA_VISIBLE_DEVICES", DEFAULT_CUDA_DEVICE)
+    # Disable JAX GPU pre-allocation so subprocesses can share the GPU with
+    # the parent pytest process (which imports JAX via conftest.py).
+    env.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
     cmd = [sys.executable, str(script_path)]
     try:

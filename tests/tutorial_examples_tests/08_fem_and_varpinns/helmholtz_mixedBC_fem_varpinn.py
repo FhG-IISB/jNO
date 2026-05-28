@@ -1,3 +1,10 @@
+import sys
+
+try:
+    import feax  # noqa: F401
+except ImportError:
+    sys.exit(0)
+
 import jax
 
 jax.config.update("jax_enable_x64", False)

@@ -25,6 +25,13 @@ Showcases
 - VPINN on 3D geometry
 """
 
+import sys
+
+try:
+    import feax  # noqa: F401
+except ImportError:
+    sys.exit(0)
+
 import foundax
 import jax
 import jax.numpy as jnp
