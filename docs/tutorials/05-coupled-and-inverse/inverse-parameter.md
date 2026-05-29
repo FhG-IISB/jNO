@@ -15,13 +15,42 @@ The script introduces trainable scalar parameters and fits them so synthetic con
 
 Instead of only training a neural field, the script creates scalar parameter models that participate in optimization.
 
+```python
+A_true, B_true, C_true = 3.14, -2.71, 42.0
+
+domain = jno.domain(constructor=jno.domain.line(mesh_size=0.01))
+x, _ = domain.variable("interior")
+
+target = A_true * jno.np.sin(π * x) + B_true * jno.np.cos(π * x) + C_true * x * (1 - x)
+
+k1, k2, k3 = jax.random.split(jax.random.PRNGKey(0), 3)
+a = jno.np.parameter((1,), key=k1, name="a")
+b = jno.np.parameter((1,), key=k2, name="b")
+c = jno.np.parameter((1,), key=k3, name="c")
+```
+
 ## Step 2: Build Residuals From Data Relationships
 
 The optimization target is a set of algebraic or residual constraints rather than a spatial PDE field.
 
+```python
+residual = (a * jno.np.sin(π * x) + b * jno.np.cos(π * x) + c * x * (1 - x)) - target
+
+for net in [a, b, c]:
+    net.optimizer(optax.adam(1e-2))
+```
+
 ## Step 3: Solve and Inspect Learned Coefficients
 
 After optimization, the identified parameters are printed from the trained model set.
+
+```python
+crux    = jno.core([residual.mse], domain)
+history = crux.solve(30000)
+
+_a, _b, _c = crux.eval([a, b, c])
+print(f"Recovered parameters: a={_a[0]:.3f}, b={_b[0]:.3f}, c={_c[0]:.3f}")
+```
 
 ## What To Notice
 
