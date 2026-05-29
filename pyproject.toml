@@ -27,7 +27,8 @@ dependencies = [
     "einops>=0.7.0",
     "matplotlib>=3.8.0",
     "pylotte>=0.3",
-    "shapely>=2.0"
+    "shapely>=2.0",
+    "paramax>=0.0.5"
 ]
 
 [project.urls]
@@ -119,6 +120,7 @@ platforms = ["linux-64"]
 [tool.pixi.pypi-dependencies]
 jax-neural-operators = { path = ".", editable = true }
 jax-cuda12-plugin = { version = ">=0.10.1,<0.11", extras = ["with-cuda"] }
+paramax = ">=0.0.5"
 
 [tool.pixi.environments]
 default = { solve-group = "default" }

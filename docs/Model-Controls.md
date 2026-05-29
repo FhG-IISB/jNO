@@ -40,6 +40,7 @@ Legacy shorthand constructors like `jno.numpy.nn.mlp(...)` are no longer the pri
 - `summary()`
 - `freeze()` / `unfreeze()`
 - `mask(param_mask=None)`
+- `constrain(transform)`
 - `lora(rank=4, alpha=1.0, *, target=None, wrapper=None, specs=None)`
 - `optimizer(opt_fn, *, lr=None)`
 - `lr(schedule_or_scalar)`
@@ -342,17 +343,44 @@ net.reset()
 
 ---
 
+## Constrain
+
+`constrain(transform)` applies a [paramax](https://github.com/danielward27/paramax) reparameterization to trainable parameter leaves. The raw parameter is stored unconstrained; `transform` is applied automatically before every forward pass via `paramax.unwrap()`.
+
+```python
+import jax
+
+k_net.constrain(jax.nn.softplus)   # all weights pass through softplus
+k_net.constrain(jax.nn.sigmoid)    # all weights projected to (0, 1)
+```
+
+When preceded by `mask(...)`, only the selected leaves are wrapped:
+
+```python
+output_mask = eqx.tree_at(lambda m: m.output_layer.weight, all_false, True)
+k_net.mask(output_mask).constrain(jax.nn.softplus)  # output layer only
+```
+
+This is a **hard parameter constraint** — the constraint holds at every step without adding a penalty term to the loss. Use `jno.fn.regularize.nonneg` / `.bounded` for **soft constraints** on the field *output* instead.
+
+---
+
 ## Paramax Integration
 
-jNO automatically unwraps Paramax wrappers before each forward evaluation (when `paramax` is installed):
+jNO automatically unwraps paramax wrappers before each forward evaluation. Any `paramax.Parameterize` wrapper inserted directly into the model pytree is also handled:
 
 ```python
 import paramax
 import jax.numpy as jnp
+import equinox as eqx
 
+# Direct usage
 scale = paramax.Parameterize(jnp.exp, jnp.log(jnp.ones(3)))
 print(paramax.unwrap(("abc", 1, scale)))
 # ('abc', 1, Array([1., 1., 1.], dtype=float32))
+
+# Via constrain() — preferred
+k_net.constrain(jax.nn.softplus)
 ```
 
 ---

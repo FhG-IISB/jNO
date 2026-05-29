@@ -22,6 +22,31 @@ domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05))
 domain = jno.domain('./mesh.msh')
 ```
 
+### From In-Memory Arrays
+
+`jno.domain.from_array` creates a point-cloud domain directly from numpy arrays — no file I/O required. This is the recommended way to add sparse sensor observations to an inverse problem.
+
+```python
+import numpy as np
+
+# 20 sensor locations in 2-D
+sensor_coords = np.array([[0.1, 0.2], [0.5, 0.5], ...])  # shape (N, 2)
+
+sensor_dom = jno.domain.from_array({"obs": sensor_coords})
+x_s, y_s, _ = sensor_dom.variable("obs")
+```
+
+Multiple tags can be packed into the same domain:
+
+```python
+dom = jno.domain.from_array({
+    "interior_sensors": interior_coords,
+    "boundary_sensors": boundary_coords,
+})
+x_i, y_i, _ = dom.variable("interior_sensors")
+x_b, y_b, _ = dom.variable("boundary_sensors")
+```
+
 ---
 
 ## Built-in Geometry Constructors

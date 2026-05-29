@@ -78,6 +78,7 @@ nav:
       - Initialize, Dtype & Tune: model-controls/initialize-dtype-tune.md
       - Diagnostics: model-controls/diagnostics.md
       - IREE Deployment: model-controls/iree.md
+  - Inverse Problems: inverse-problems.md
   - Save, Load and Configuration: Save-Load-and-Configuration.md
   - FEM & Variational PINNs: fem.md
   - Foundation Models: foundation_models/index.md

@@ -58,10 +58,7 @@ from .utils import (
 )
 from .utils.config import get_wandb_run, wandb_alert, wandb_log, wandb_log_model
 
-try:
-    import paramax as _paramax
-except Exception:  # pragma: no cover - optional dependency
-    _paramax = None
+import paramax as _paramax
 
 
 class core:
@@ -596,9 +593,7 @@ class core:
 
         def loss_fn(trainable, context, rng):
             full_models = eqx.combine(trainable, frozen, static)
-            if _paramax is not None:
-                # Always unwrap Paramax wrappers before model evaluation.
-                full_models = _paramax.unwrap(full_models)
+            full_models = _paramax.unwrap(full_models)
 
             if checkpoint_gradients:
                 _fn, _bs = compiled_constraints_fn, batchsize
@@ -640,9 +635,7 @@ class core:
 
         def track_fn(trainable, context, rng):
             full_models = eqx.combine(trainable, frozen, static)
-            if _paramax is not None:
-                # Keep tracker evaluation consistent with training forward path.
-                full_models = _paramax.unwrap(full_models)
+            full_models = _paramax.unwrap(full_models)
             results = []
             for _, fn in compiled_trackers:
                 results.append(jnp.mean(fn(full_models, context, batchsize=batchsize, key=rng)))
@@ -1103,8 +1096,7 @@ class core:
             self.log.warning("offload_data requires batchsize < total_samples; ignoring offload_data for this run.")
             offload_data = False
 
-        if _paramax is not None:
-            self.log.info("Paramax auto-unwrap enabled: wrappers are unwrapped before each forward evaluation")
+        self.log.info("Paramax auto-unwrap enabled: wrappers are unwrapped before each forward evaluation")
 
         # ── 1. Collect Model metadata ──
         flax_mods = self._collect_flax_modules()  # {layer_id: Model}
@@ -1847,8 +1839,7 @@ class core:
                     due = [(tag, strat) for tag, strat in strategies.items() if strat.should_resample(epoch)]
                     if due:
                         full_models = eqx.combine(trainable, frozen_arrays, static)
-                        if _paramax is not None:
-                            full_models = _paramax.unwrap(full_models)
+                        full_models = _paramax.unwrap(full_models)
 
                         residuals_all = self.compiled_resample_constraints_fn(
                             full_models,
@@ -2240,6 +2231,11 @@ class core:
         self._resume_step = step
         return self
 
+    @property
+    def _unwrapped_models(self):
+        """Models with all paramax wrappers resolved — safe for inference / shape queries."""
+        return _paramax.unwrap(self.models)
+
     def _log_constraint_shapes(self, batchsize, min_consecutive: Optional[int] = 1):
         """Log the output shape of each constraint by doing a test evaluation.
 
@@ -2252,9 +2248,10 @@ class core:
         test_rng = jax.random.PRNGKey(0)
 
         # Use jax.eval_shape to get output shape without computation
+        _models = self._unwrapped_models
         out_shape = jax.eval_shape(
             lambda: self.compiled_constraints_fn(
-                self.models,
+                _models,
                 self.domain_data.context,
                 batchsize=batchsize,
                 key=test_rng,
@@ -2280,7 +2277,7 @@ class core:
             parent_fn = TraceCompiler.compile_multi_expression([e for e, _ in parent_exprs], self.all_ops)
             parent_shape = jax.eval_shape(
                 lambda: parent_fn(
-                    self.models,
+                    _models,
                     self.domain_data.context,
                     batchsize=batchsize,
                     key=test_rng,
@@ -2301,7 +2298,7 @@ class core:
             # Use jax.eval_shape to get output shape without computation
             out_shape = jax.eval_shape(
                 lambda: fn(
-                    self.models,
+                    _models,
                     self.domain_data.context,
                     batchsize=batchsize,
                     key=test_rng,
@@ -2319,7 +2316,7 @@ class core:
                 t_parent_fn = TraceCompiler.compile_multi_expression([tracker_expr.args[0]], self.all_ops)
                 t_parent_shape = jax.eval_shape(
                     lambda: t_parent_fn(
-                        self.models,
+                        _models,
                         self.domain_data.context,
                         batchsize=batchsize,
                         key=test_rng,
@@ -2400,7 +2397,7 @@ class core:
         ``core.print_shapes()``.
         """
         ctx_single = self._build_shape_context(min_consecutive=min_consecutive)
-        evaluator = TraceEvaluator(self.models)
+        evaluator = TraceEvaluator(self._unwrapped_models)
 
         all_exprs = getattr(self, "_constraint_exprs", [])
         all_tracker_exprs = getattr(self, "_tracker_exprs", [])
@@ -2429,7 +2426,7 @@ class core:
             crux.print_shapes()
         """
         ctx_single = self._build_shape_context(min_consecutive=min_consecutive)
-        evaluator = TraceEvaluator(self.models)
+        evaluator = TraceEvaluator(self._unwrapped_models)
 
         all_exprs = getattr(self, "_constraint_exprs", [])
         all_tracker_exprs = getattr(self, "_tracker_exprs", [])
@@ -2595,12 +2592,13 @@ class core:
 
         domain_data = self.domain_data if domain is None else self.prepare_domain_data(domain)
 
+        _models = self._unwrapped_models
         results = []
         for op in operation:
             fn = TraceCompiler.compile_traced_expression(op, self.all_ops)
             results.append(
                 fn(
-                    self.models,
+                    _models,
                     domain_data.context,
                     batchsize=None,
                     key=key,

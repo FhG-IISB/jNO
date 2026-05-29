@@ -1233,6 +1233,43 @@ class Model(Placeholder):
         self._trainable_param_mask = None
         return self
 
+    def constrain(self, transform) -> "Model":
+        """Apply a paramax reparameterization to trainable parameter leaves.
+
+        Parameters are stored in their unconstrained form and transformed by
+        ``transform`` before every forward pass via ``paramax.unwrap()``,
+        which jno's training loop calls automatically.
+
+        When preceded by ``mask(...)``, only leaves where the mask is ``True``
+        are wrapped — all other leaves remain unconstrained::
+
+            k_net.mask(output_mask).constrain(jax.nn.softplus)  # output layer only
+            k_net.constrain(jax.nn.softplus)                    # all parameters
+
+        Args:
+            transform: A jit-compatible callable (e.g. ``jax.nn.softplus``,
+                       ``jax.nn.sigmoid``).
+
+        Returns:
+            self  (for chaining)
+        """
+        import paramax as _pm
+
+        use_mask = self._mask_scope_pending and self._param_mask is not None
+        mask = self._param_mask if use_mask else None
+        self._mask_scope_pending = False
+
+        def _wrap(leaf, selected=True):
+            if eqx.is_inexact_array(leaf) and selected:
+                return _pm.Parameterize(transform, leaf)
+            return leaf
+
+        if mask is not None:
+            self.module = jax.tree_util.tree_map(_wrap, self.module, mask)
+        else:
+            self.module = jax.tree_util.tree_map(lambda leaf: _wrap(leaf), self.module)
+        return self
+
     def mask(self, param_mask=None):
         """Set the current mask scope using an explicit boolean pytree mask.
 
