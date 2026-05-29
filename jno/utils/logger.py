@@ -21,14 +21,6 @@ class Logger:
         self.do_log, self.do_print = log_print
 
         # Generate logger name
-        if name is None:
-            if path:
-                name = f"CustomLogger_{str(path).replace('/', '_')}"
-            else:
-                import time
-
-                name = f"CustomLogger_{id(self)}_{int(time.time() * 1000000)}"
-
         self._logger_name = name  # Store for potential re-creation
         self._setup_logger(name)
 
