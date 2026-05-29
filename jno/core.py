@@ -1753,6 +1753,22 @@ class core:
             del _tw, _ow, _rw, _ew, _pl
             # self.log.info("Skipping AOT compile/warmup; first training step will JIT normally.")
 
+            # Notify callbacks that setup is complete so they can build and
+            # pre-compile their own JIT functions (e.g. explainability callbacks).
+            if callbacks:
+                for _cb in callbacks:
+                    _cb.on_solve_begin(
+                        compiled_constraints_fn=self.compiled_constraints_fn,
+                        n_constraints=self.n_constraints,
+                        batchsize=batchsize,
+                        frozen=frozen_arrays,
+                        static=static,
+                        trainable=trainable,
+                        context=trace_context,
+                        rng=self.rng,
+                        min_consecutive=min_consecutive,
+                    )
+
             # ── 8. Training loop ──
 
             print_rate = max(1, epochs // 10 if epochs < 100_000 else epochs // 1000)
@@ -2095,6 +2111,7 @@ class core:
                         "total_loss": total_loss,
                         "individual_losses": individual_losses,
                         "log": self.log,
+                        "context": context,
                     }
                     _stop_requested = False
                     for cb in callbacks:

@@ -5,6 +5,8 @@ from __future__ import annotations
 import warnings
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 import jno.utils.config as cfg_module
 
 
@@ -33,6 +35,17 @@ class TestInitWandb:
 
         mock_wandb.init.assert_called_once_with(project="heat_eq", dir="/tmp/runs/heat_eq")
         assert cfg_module.get_wandb_run() is mock_run
+
+    def test_weave_init_called(self):
+        """When W&B is initialised, weave.init('armbrul/jNO') is called."""
+        mock_wandb = MagicMock()
+        mock_wandb.init.return_value = MagicMock()
+        mock_weave = MagicMock()
+
+        with patch.dict("sys.modules", {"wandb": mock_wandb, "weave": mock_weave}):
+            cfg_module._init_wandb(True, "jNO", "/tmp/runs/jno")
+
+        mock_weave.init.assert_called_once_with("armbrul/jNO")
 
     def test_dict_passes_kwargs(self):
         """wandb=dict forwards kwargs and fills defaults."""
@@ -186,3 +199,114 @@ class TestWandbAlert:
             text="Really bad",
             level="ERROR_SENTINEL",
         )
+
+
+# ---------------------------------------------------------------------------
+# Full explainability + checkpoint W&B integration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestExplainabilityCallbacksWandBLogging:
+    """Full W&B integration: all four explainability callbacks + checkpoint callback.
+
+    Runs a real two-constraint 1-D Poisson solver (3 epochs) against mocked W&B
+    and verifies that every expected metric key is emitted and that the Orbax
+    checkpoint artifact metadata carries ``checkpoint_dir`` + loss fields.
+    """
+
+    def setup_method(self):
+        cfg_module._WANDB_RUN = None
+
+    def teardown_method(self):
+        cfg_module._WANDB_RUN = None
+
+    def test_all_metrics_logged_to_wandb(self, tmp_path):
+        """Smoke-test: all explainability keys + checkpoint metadata reach W&B."""
+        import foundax
+        import jax
+        import optax
+
+        import jno
+        import jno.jnp_ops as jnn
+        from jno import LearningRateSchedule as lrs
+        from jno.utils.adaptive.callbacks import (
+            CheckpointCallback,
+            CosSimilarityCallback,
+            GradientAlignmentCallback,
+            GradientNormsCallback,
+            LossLandscapeCallback,
+        )
+
+        # ── two-constraint 1-D Poisson ──────────────────────────────────────
+        domain = jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+        x, _ = domain.variable("interior")
+        key = jax.random.PRNGKey(42)
+        u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=8, num_layers=2, key=key))
+        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 100, 1e-5))
+        u = u_net(x) * x * (1 - x)
+        pde = jnn.laplacian(u, [x]) - jnn.sin(jnn.pi * x)
+        # Two identical constraints exercise the N=2 code paths in all callbacks.
+        solver = jno.core([pde.mse, pde.mse], domain)
+
+        # ── callbacks (tiny grid / interval so the test stays fast) ─────────
+        cb_norms = GradientNormsCallback(interval=1)
+        cb_cos = CosSimilarityCallback(interval=1)
+        cb_align = GradientAlignmentCallback(interval=1)
+        cb_land = LossLandscapeCallback(interval=1, n_grid=3)
+        cb_ckpt = CheckpointCallback(
+            directory=str(tmp_path / "ckpts"),
+            save_interval_epochs=1,
+            max_to_keep=2,
+            async_checkpointing=False,
+        )
+
+        mock_wandb = MagicMock()
+        mock_run = MagicMock()
+        cfg_module._WANDB_RUN = mock_run
+
+        with patch.dict("sys.modules", {"wandb": mock_wandb}):
+            solver.solve(
+                3,
+                callbacks=[cb_norms, cb_cos, cb_align, cb_land, cb_ckpt],
+            )
+        cb_ckpt.close()
+
+        # ── collect every key passed to run.log() ───────────────────────────
+        logged_keys = set()
+        for call_args in mock_run.log.call_args_list:
+            d = call_args[0][0] if call_args[0] else {}
+            logged_keys.update(d.keys())
+
+        # gradient norms — one key per constraint (N=2)
+        assert "explainability/gradient_norm/constraint_0" in logged_keys
+        assert "explainability/gradient_norm/constraint_1" in logged_keys
+
+        # pairwise cosine similarity — upper-tri entry (0, 1) for N=2
+        assert "explainability/cos_sim/0_1" in logged_keys
+
+        # total gradient alignment scalar
+        assert "explainability/gradient_alignment" in logged_keys
+
+        # loss landscape — image key or scalar fallback (matplotlib may be absent)
+        assert "explainability/loss_landscape" in logged_keys or "explainability/landscape_min" in logged_keys, (
+            "Expected loss landscape to be logged (image or scalar fallback)"
+        )
+
+        # ── checkpoint artifact carries checkpoint_dir + loss fields ─────────
+        assert mock_run.log_artifact.called, "Expected at least one checkpoint artifact upload"
+        ckpt_artifact_calls = [c for c in mock_wandb.Artifact.call_args_list if c.kwargs.get("type") == "checkpoint"]
+        assert ckpt_artifact_calls, "Expected wandb.Artifact(type='checkpoint') to be called"
+        meta = ckpt_artifact_calls[-1].kwargs["metadata"]
+        assert "checkpoint_dir" in meta, "checkpoint_dir missing from artifact metadata"
+        assert "total_loss" in meta, "total_loss missing from artifact metadata"
+        assert "individual_losses" in meta, "individual_losses missing from artifact metadata"
+        assert "epoch" in meta
+
+        # ── result shape sanity ──────────────────────────────────────────────
+        assert cb_norms.result["norms"].ndim == 2
+        assert cb_norms.result["norms"].shape[1] == 2  # N=2 constraints
+        assert cb_cos.result["cos_sim_matrix"].shape[1:] == (2, 2)
+        assert cb_align.result["alignment"].ndim == 1
+        assert len(cb_align.result["alignment"]) > 0
+        assert cb_land.result["landscapes"].shape[1:] == (3, 3)
