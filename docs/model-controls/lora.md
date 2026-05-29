@@ -1,130 +1,24 @@
-# Model Controls
-
-This page documents the model-control API in jNO 0.2.1.
-
-Important update: architecture factories moved to Foundax. The recommended style is:
-
-- build a model with `foundax` (`fx.mlp`, `fx.fno2d`, `fx.poseidon.T`, ...)
-- wrap it with `jno.nn.wrap(...)`
-- apply model controls on the wrapped `Model`
-
----
-
-## Quick Start
-
-```python
-import optax
-import foundax as fx
-import jno
-from jno import LearningRateSchedule as lrs
-
-net = jno.nn.wrap(
-    fx.mlp(in_features=2, output_dim=1, hidden_dims=64, num_layers=3),
-    name="u_net",
-)
-
-net.dont_show()
-net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 5000, 1e-5))
-net.lora(rank=8, alpha=16)
-```
-
-Legacy shorthand constructors like `jno.numpy.nn.mlp(...)` are no longer the primary API.
-
----
-
-## Available Methods
-
-`Model` (returned by `jno.nn.wrap(...)`) supports:
-
-- `dont_show()`
-- `summary()`
-- `freeze()` / `unfreeze()`
-- `mask(param_mask=None)`
-- `lora(rank=4, alpha=1.0, *, target=None, wrapper=None, specs=None)`
-- `optimizer(opt_fn, *, lr=None)`
-- `lr(schedule_or_scalar)`
-- `initialize(weights_or_path_or_initializer, *, key=None)`
-- `dtype(dtype)`
-- `tune(...)`
-- `reset()`
-
-All methods return `self` and are chainable.
-
----
-
-## Mask
-
-`mask(...)` takes a boolean pytree mask only.
-
-```python
-import equinox as eqx
-import jax
-
-all_true = jax.tree_util.tree_map(lambda _: True, eqx.filter(net.module, eqx.is_array))
-net.mask(all_true).optimizer(optax.adam, lr=lrs(1e-4))
-```
-
-There is no `target="..."` argument on `mask(...)`.
-
-### Regex-style targeting
-
-If you want to target layers by name, build a boolean mask from a regex:
-
-```python
-import re
-import equinox as eqx
-import jax
-
-def regex_mask(module, pattern: str):
-    arrays = eqx.filter(module, eqx.is_array)
-    flat, treedef = jax.tree_util.tree_flatten_with_path(arrays)
-
-    def part(k):
-        if hasattr(k, "name"): return str(k.name)
-        if hasattr(k, "idx"):  return str(k.idx)
-        if hasattr(k, "key"):  return str(k.key)
-        return str(k)
-
-    leaves = []
-    for path, _ in flat:
-        path_str = "/".join(part(p) for p in path)
-        leaves.append(bool(re.search(pattern, path_str)))
-
-    return jax.tree_util.tree_unflatten(treedef, leaves)
-
-decoder_mask = regex_mask(net.module, r"decoder")
-net.mask(decoder_mask).optimizer(optax.adam, lr=lrs(3e-4))
-```
-
----
-
-## Freeze / Unfreeze
-
-```python
-net.freeze()                      # freeze entire model
-net.mask(decoder_mask).freeze()   # freeze only selected leaves
-```
-
-With `mask(...).freeze()`, non-selected leaves remain trainable.
-
----
-
-## LoRA
+# LoRA
 
 LoRA inserts trainable low-rank adapter matrices into matching layers while keeping base weights frozen. By default both linear and conv layers are wrapped automatically.
 
-### Selecting layers
+## Selecting Layers
 
 ```python
-net.lora(rank=8, target="encoder")          # path-regex: only encoder layers
-net.mask(encoder_mask).lora(rank=8)         # boolean mask: data-driven selection
-net.mask(encoder_mask).lora(rank=8, target="encoder")  # both combined
+net.lora(rank=8, target="encoder")                         # path-regex
+net.mask(encoder_mask).lora(rank=8)                        # boolean mask
+net.mask(encoder_mask).lora(rank=8, target="encoder")      # both combined
 ```
 
-### Uniform and per-target specs
+| | `target=` / `specs=` | `mask(M).lora()` |
+|---|---|---|
+| **Selects by** | regex on pytree path string | boolean pytree |
+| **Use when** | you know the layer names up front | you have a precomputed mask |
+
+## Uniform and Per-Target Specs
 
 ```python
-net.lora(rank=8, alpha=16)                  # all layers
+net.lora(rank=8, alpha=16)                    # all layers
 net.lora(rank=8, alpha=16, target="encoder")  # restricted to a subset
 
 net.lora(
@@ -137,17 +31,17 @@ net.lora(
 
 `target` is regex-matched against the slash-joined pytree path. The first matching spec wins.
 
-### Combining mask and freeze with LoRA
+## Combining with Mask and Freeze
 
 ```python
-net.mask(encoder_mask).lora(rank=8, alpha=16)          # only mask-selected layers get LoRA
-net.freeze().lora(rank=8, alpha=16)                    # freeze all; only adapters train
-net.freeze().mask(encoder_mask).lora(rank=8, alpha=16) # wrap M-selected only, freeze rest
+net.mask(encoder_mask).lora(rank=8, alpha=16)           # only mask-selected layers
+net.freeze().lora(rank=8, alpha=16)                     # freeze all; only adapters train
+net.freeze().mask(encoder_mask).lora(rank=8, alpha=16)  # wrap M-selected, freeze rest
 ```
 
-### Default layer types
+## Default Layer Types
 
-Without a `wrapper=` argument, jNO wraps Linear and Conv layers (ConvTranspose excluded):
+Without `wrapper=`, jNO wraps Linear and Conv layers (ConvTranspose excluded):
 
 ```python
 net.lora(rank=4, alpha=1.0)           # Linear + Conv1d/2d/3d
@@ -155,7 +49,7 @@ net.lora(rank=4, wrapper=LoRALinear)  # linear only
 net.lora(rank=4, wrapper=LoRAConv)    # conv only
 ```
 
-### Custom adapters
+## Custom Adapters
 
 Subclass `LoRAWrapper` to support layer types not in the zoo:
 
@@ -201,7 +95,7 @@ net.lora(
 )
 ```
 
-### LoRA Zoo — Linear
+## LoRA Zoo — Linear
 
 ```python
 from jno.lora import (
@@ -233,7 +127,20 @@ from jno.lora import (
 | `LoKrLinear` | `r² + ⌈out/r⌉·⌈in/r⌉` | Kronecker product adapter ([LoKr](https://arxiv.org/abs/2212.10650)) |
 | `OFTLinear` | `n_blocks·r²` | Orthogonal fine-tuning via Cayley map ([OFT](https://arxiv.org/abs/2306.07280)) |
 
-### LoRA Zoo — Conv
+**When to use which:**
+
+- **rsLoRALinear** — default upgrade; use higher ranks without numerical issues.
+- **LoRAFALinear** — memory-constrained; halves adapter parameter count.
+- **DoRALinear** — pretrained models where preserving weight norms matters.
+- **PiSSALinear** — pretrained models; adapters start at the most informative directions.
+- **LoRAXSLinear** — extreme parameter efficiency.
+- **VeRALinear** — fewest trainable params; A, B not stored in checkpoints.
+- **MiLoRALinear** — preserves principal directions; adapts the noise subspace.
+- **IA3Linear** — no rank hyperparameter; ideal for fast probing.
+- **LoKrLinear** — large layers where Kronecker factorisation is more efficient.
+- **OFTLinear** — orthogonal weight updates to preserve geometry.
+
+## LoRA Zoo — Conv
 
 Matching conv variants for `eqx.nn.Conv1d/2d/3d`. All flatten the weight to `(out_ch, flat_in)`, apply the same adapter logic, and reshape back.
 
@@ -269,99 +176,3 @@ net.lora(
     ]
 )
 ```
-
----
-
-## Optimizer and LR
-
-### Global
-
-```python
-net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.9, 2000, 1e-5))
-```
-
-### Parameter groups
-
-```python
-net.optimizer(optax.adamw, lr=lrs(1e-3))               # global fallback
-net.mask(decoder_mask).optimizer(optax.adam, lr=lrs(5e-4))
-net.mask(encoder_mask).optimizer(optax.sgd,  lr=lrs(1e-4))
-```
-
-`mask(...)` is consumed by the next mutator call. A bare global `optimizer(...)` clears all previously configured groups.
-
-```python
-net.mask(decoder_mask).lr(lrs(1e-5))   # group-specific LR only
-net.lr(lrs(1e-5))                      # global LR update
-```
-
----
-
-## Initialize
-
-`initialize(...)` supports checkpoint paths, pytrees, and callable initializers:
-
-```python
-import jax
-
-net.initialize("./weights.eqx")
-net.initialize("./runs/checkpoints/2000::1")
-net.initialize(other_model.module)
-net.initialize(jax.nn.initializers.xavier_uniform(), key=jax.random.PRNGKey(0))
-```
-
----
-
-## Dtype
-
-```python
-import jax.numpy as jnp
-
-net.dtype(jnp.bfloat16)
-```
-
-Casts floating-point parameters before training.
-
----
-
-## Tune and Reset
-
-```python
-net.tune(
-    freeze=[True, False],
-    lora=[(4, 1.0), None],
-    optimizer=[optax.adam],
-    lr=[lrs(1e-3), lrs(1e-4)],
-    dtype=[jnp.float32],
-)
-
-net.reset()
-```
-
-`reset()` clears all training-time controls (`freeze`, `lora`, `optimizer`, `lr`, `dtype`, `mask`, init state).
-
----
-
-## Paramax Integration
-
-jNO automatically unwraps Paramax wrappers before each forward evaluation (when `paramax` is installed):
-
-```python
-import paramax
-import jax.numpy as jnp
-
-scale = paramax.Parameterize(jnp.exp, jnp.log(jnp.ones(3)))
-print(paramax.unwrap(("abc", 1, scale)))
-# ('abc', 1, Array([1., 1., 1.], dtype=float32))
-```
-
----
-
-## Logging and Diagnostics
-
-At `solve()` time jNO logs:
-
-- parameter-group summary
-- overlap/uncovered diagnostics for groups
-- zero-match warnings for empty masks/groups
-- detailed path samples in log file (`quiet` logs)
