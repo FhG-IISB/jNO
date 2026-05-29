@@ -347,6 +347,47 @@ class domain(MeshIOMixin):
             compute_mesh_connectivity=compute_mesh_connectivity,
         )
 
+    @classmethod
+    def from_array(
+        cls,
+        tags: dict,
+        compute_mesh_connectivity: bool = False,
+    ) -> "domain":
+        """Create a point-cloud domain from in-memory coordinate arrays.
+
+        Avoids writing a ``.npz`` file by hand — useful for sparse sensor
+        observations or any custom set of collocation points.
+
+        Args:
+            tags: Mapping of tag name to ``(N, D)`` numpy array of coordinates.
+            compute_mesh_connectivity: Whether to build mesh connectivity data.
+
+        Returns:
+            Domain whose variable sets correspond to the keys of ``tags``.
+
+        Example::
+
+            import numpy as np
+            sensors = np.random.rand(20, 2)          # 20 points in 2-D
+            dom = jno.domain.from_array({"obs": sensors})
+            x, y, _ = dom.variable("obs")
+        """
+        import os
+        import tempfile
+
+        import numpy as np
+
+        tmp = tempfile.NamedTemporaryFile(suffix=".npz", delete=False)
+        tmp.close()
+        np.savez(tmp.name, **tags)
+        try:
+            return cls(
+                constructor=tmp.name,
+                compute_mesh_connectivity=compute_mesh_connectivity,
+            )
+        finally:
+            os.unlink(tmp.name)
+
     def __init__(
         self,
         constructor: Union[Callable, str, "domain", None] = None,
