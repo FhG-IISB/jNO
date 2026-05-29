@@ -625,14 +625,13 @@ class _Regularize:
             field: Traced field expression.
             strength: Penalty coefficient.
         """
+
         def _nonneg(f, _s=strength):
             return _s * jnp.maximum(0.0, -f)
 
         return FunctionCall(_nonneg, [field], name="nonneg")
 
-    def bounded(
-        self, field: "Placeholder", lo: float, hi: float
-    ) -> "Placeholder":
+    def bounded(self, field: "Placeholder", lo: float, hi: float) -> "Placeholder":
         """Two-sided barrier: penalises values outside ``[lo, hi]``.
 
         Args:
@@ -640,6 +639,7 @@ class _Regularize:
             lo: Lower bound.
             hi: Upper bound.
         """
+
         def _bounded(f, _lo=lo, _hi=hi):
             return jnp.maximum(0.0, f - _hi) + jnp.maximum(0.0, _lo - f)
 
