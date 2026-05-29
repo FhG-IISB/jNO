@@ -18,4 +18,7 @@ __all__ = [
     "MeshIOMixin",
     "PolygonDomain",
     "domain",
+    "from_array",
 ]
+
+from_array = _domain.from_array
