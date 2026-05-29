@@ -24,27 +24,59 @@ markdown_extensions:
       base_path: docs
   - pymdownx.tabbed:
       alternate_style: true
+  - pymdownx.arithmatex:
+      generic: true
 
 extra_css:
   - stylesheets/extra.css
 
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
+
 not_in_nav: |
   /index.md
   /Docker.md
+  /Model-Controls.md
+  /Training.md
+  /Differential-Operators.md
+  /Integration-Operators.md
+  /Adaptive-Resampling.md
+  /training/schedules.md
+  /foundation_models/Core-Architectures.md
+  /foundation_models/Foundation-Models.md
 
 nav:
   - Home: Getting-Started.md
   - Installation: Installation.md
-  - Domain and Geometry: Domain-and-Geometry.md
-  - Differential Operators: Differential-Operators.md
-  - Training: Training.md
-  - Model Controls: Model-Controls.md
-  - Adaptive Resampling: Adaptive-Resampling.md
-  - Hyperparameter Tuning: Hyperparameter-Tuning.md
+  - Getting to Know jNO:
+    - Domain and Geometry: Domain-and-Geometry.md
+    - Operators:
+      - Differential Operators: operators/differential.md
+      - Integral Operators: operators/integral.md
+      - jno.numpy Reference: operators/numpy-reference.md
+    - Hyperparameter Tuning: Hyperparameter-Tuning.md
+    - Miscellaneous: misc.md
+  - Training:
+    - Overview: training/index.md
+    - Schedules, Resampling & Callbacks:
+      - Schedules: adaptive/schedules.md
+      - Adaptive Resampling: adaptive/resampling.md
+      - Callbacks: adaptive/callbacks.md
+    - Running Training: training/running.md
+    - Parallelism: training/parallelism.md
+    - Evaluation & Debugging: training/evaluation.md
+    - Model Controls:
+      - Overview: model-controls/index.md
+      - Mask & Freeze: model-controls/mask-freeze.md
+      - LoRA: model-controls/lora.md
+      - Optimizer & LR: model-controls/optimizer-lr.md
+      - Initialize, Dtype & Tune: model-controls/initialize-dtype-tune.md
+      - Diagnostics: model-controls/diagnostics.md
+      - IREE Deployment: model-controls/iree.md
   - Save, Load and Configuration: Save-Load-and-Configuration.md
-  - Foundation Models:
-    - Core Architectures: foundation_models/Core-Architectures.md
-    - Foundation Models: foundation_models/Foundation-Models.md
+  - FEM & Variational PINNs: fem.md
+  - Foundation Models: foundation_models/index.md
   - Tutorials:
     - 01 Basics:
       - Laplace 1D: tutorials/01-basics/laplace-1d.md

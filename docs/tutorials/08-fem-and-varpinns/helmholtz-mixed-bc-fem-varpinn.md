@@ -15,13 +15,70 @@ The PDE has the Helmholtz form with mixed Dirichlet and Neumann data and a manuf
 
 The residual is assembled in variational form rather than as a pointwise strong-form loss.
 
+```python
+domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.22))
+domain.init_fem(
+    element_type="TRI3",
+    quad_degree=3,
+    bcs=[
+        domain.dirichlet("left",   0.0),
+        domain.dirichlet("bottom", lambda p: jnp.sin(jnp.pi * p[0])),
+        domain.neumann(["right", "top"]),
+    ],
+    fem_solver=True,
+)
+
+u, phi = domain.fem_symbols()
+xg, yg, _ = domain.variable("fem_gauss",  split=True)
+xr, yr, _ = domain.variable("gauss_right", split=True)
+xt, yt, _ = domain.variable("gauss_top",   split=True)
+
+k_sq = 0.0 * xg + k_val**2
+vol  = (jno.np.grad(u, xg) * jno.np.grad(phi, xg)
+      + jno.np.grad(u, yg) * jno.np.grad(phi, yg)
+      - k_sq * u * phi
+      - source_f(xg, yg) * phi)
+
+weak = vol - exact_flux_right(xr, yr)*phi - exact_flux_top(xt, yt)*phi
+```
+
 ## Step 2: Combine Hard Boundary Handling With VPINN Training
 
 The neural ansatz handles some constraints structurally while the weak form captures the PDE and remaining conditions.
 
+```python
+net = jno.nn.wrap(
+    foundax.mlp(2, hidden_dims=32, num_layers=4,
+                activation=jax.nn.tanh, key=jax.random.PRNGKey(0))
+)
+
+def apply_hard_bc(u_pred, x, y):
+    # u(0,y)=0  and  u(x,0)=sin(pi*x)
+    return sin(pi * x) + x * y * u_pred
+
+xg2, yg2, _ = train_domain.variable("fem_gauss", split=True)
+u_gauss = apply_hard_bc(net(xg2, yg2), xg2, yg2)
+
+pde  = weak.assemble(train_domain, u_net=u_gauss, target="vpinn")
+crux = jno.core(constraints=[pde.mse], domain=train_domain)
+net.optimizer(optax.adam, lr=lrs.warmup_cosine(10, 1, 1e-3, 1e-5))
+crux.solve(epochs=10)
+```
+
 ## Step 3: Compare Against FEM
 
 The script solves a classical FEM reference problem on a finer mesh and visualizes the difference.
+
+```python
+A_fem, b_fem = weak.assemble(fem_domain, target="fem_system")
+u_fem = jnp.linalg.solve(to_dense(A_fem), jnp.asarray(b_fem)).reshape(-1)
+
+u_exact = exact_u_num(x_f, y_f).reshape(-1)
+rel_l2_fem  = jnp.linalg.norm(u_exact - u_fem) / (jnp.linalg.norm(u_exact) + 1e-14)
+rel_l2_vpinn = jnp.linalg.norm(u_true - u_vpinn) / (jnp.linalg.norm(u_true) + 1e-14)
+print(f"VPINN relative L2: {float(rel_l2_vpinn):.6e}")
+print(f"FEM   relative L2: {float(rel_l2_fem):.6e}")
+```
 
 ## What To Notice
 
