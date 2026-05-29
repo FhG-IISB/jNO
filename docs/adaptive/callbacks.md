@@ -115,6 +115,12 @@ cb = jno.callbacks.checkpoint(async_checkpointing=False)
 
 ---
 
+## Explainability callbacks
+
+jNO also provides callbacks for analysing gradient conflict, cosine similarity, and the loss landscape during training. See [Explainability](../training/explainability.md).
+
+---
+
 ## Combining callbacks
 
 ```python
@@ -126,3 +132,4 @@ crux.solve(
     ],
 )
 ```
+

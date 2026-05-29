@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from typing import Optional
-
 import equinox as eqx
 import jax
 import jax.numpy as jnp
@@ -57,7 +55,7 @@ def make_per_loss_grad_fn(
         return jnp.stack([jnp.mean(r) for r in residuals])  # (N,)
 
     def grad_alignment(trainable, context, rng):
-        rng, step_rng = jax.random.split(rng)
+        _, step_rng = jax.random.split(rng)
 
         if param_mask is not None:
             selected, held_fixed = eqx.partition(trainable, param_mask)
@@ -67,9 +65,7 @@ def make_per_loss_grad_fn(
         # jacrev → pytree matching `selected`; array leaves gain shape (N, *leaf_shape).
         # Equinox sentinels at frozen/non-selected positions are empty pytrees,
         # so jax.tree_util.tree_leaves skips them — only gradient arrays appear.
-        per_grads = jax.jacrev(
-            lambda s: _eval_losses(s, held_fixed, context, step_rng)
-        )(selected)
+        per_grads = jax.jacrev(lambda s: _eval_losses(s, held_fixed, context, step_rng))(selected)
 
         leaves = jax.tree_util.tree_leaves(per_grads)  # list of (N, *leaf_shape) arrays
 
