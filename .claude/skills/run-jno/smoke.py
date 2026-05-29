@@ -7,12 +7,16 @@ Usage:
 Exit 0 = all checks passed.  Non-zero = something is broken.
 """
 import os
+
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
-import tempfile, pathlib
+import pathlib
+import tempfile
+
+import foundax
 import jax
 import optax
-import foundax
+
 import jno
 
 print(f"[1/6] imports OK — jno {jno.__version__}")
