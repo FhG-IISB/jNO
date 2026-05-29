@@ -16,6 +16,7 @@ dist/
 build/
 scripts/
 misc/
+!docs/misc/
 runs/
 traces/
 
