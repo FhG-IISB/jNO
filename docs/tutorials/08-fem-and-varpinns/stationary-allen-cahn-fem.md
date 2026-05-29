@@ -15,13 +15,60 @@ The weak form corresponds to a stationary Allen-Cahn equation with a nonlinear c
 
 The script expresses the nonlinear form directly in terms of FEM operators rather than pointwise PINN losses.
 
+```python
+eps = 0.05
+domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.12))
+domain.init_fem(
+    element_type="TRI3",
+    quad_degree=3,
+    bcs=[
+        domain.dirichlet("left", u_left),
+        domain.dirichlet("right", u_right),
+    ],
+    fem_solver=True,
+)
+
+u, phi = domain.fem_symbols()
+xg, yg, _ = domain.variable("fem_gauss", split=True)
+
+ux   = jno.np.grad(u, xg)
+uy   = jno.np.grad(u, yg)
+phix = jno.np.grad(phi, xg)
+phiy = jno.np.grad(phi, yg)
+
+# Weak form: ∫ eps^2 grad(u)·grad(phi) + (u^3 - u) phi dΩ = 0
+weak = eps**2 * (ux * phix + uy * phiy) + (u**3 - u) * phi
+```
+
 ## Step 2: Build the Jacobian and Nonlinear Solve Loop
 
 Because the problem is nonlinear, a residual alone is not enough; the script also uses Jacobian information for iterative solution.
 
+```python
+op = weak.assemble(domain, target="fem_residual")
+
+def residual_np(u_np):
+    return np.asarray(op.residual(jnp.asarray(u_np)))
+
+def jacobian_np(u_np):
+    J = op.jacobian(jnp.asarray(u_np))
+    return np.asarray(to_dense(J))
+```
+
 ## Step 3: Solve With a Classical Nonlinear Method
 
 A SciPy-style root or nonlinear solve routine is used to converge the weak-form system.
+
+```python
+u0  = exact_u_num(x_nodes, y_nodes).reshape(-1)
+sol = spo.root(
+    residual_np,
+    np.asarray(u0),
+    jac=jacobian_np,
+    method="hybr",
+)
+u_fem = jnp.asarray(sol.x).reshape(-1)
+```
 
 ## What To Notice
 

@@ -15,17 +15,63 @@ The PDE is `u_t = alpha Delta u` on the unit square with homogeneous Dirichlet b
 
 The script samples interior space-time points on a rectangular domain and uses a separate initial-time slice for the starting condition.
 
+```python
+α = 0.1
+T_end = 0.5
+N_t = 4
+
+domain = jno.domain(
+    constructor=jno.domain.rect(mesh_size=0.05),
+    time=(0, T_end, N_t),
+    compute_mesh_connectivity=False,
+)
+x, y, t   = domain.variable("interior")
+x0, y0, t0 = domain.variable("initial")
+
+u_exact = jno.np.exp(-2 * α * π**2 * t) * jno.np.sin(π * x) * jno.np.sin(π * y)
+```
+
 ## Step 2: Use a DeepONet With a Hard Spatial Envelope
 
 The model output is multiplied by `x(1-x)y(1-y)` so the boundary is satisfied on all four edges.
+
+```python
+net = jno.nn.wrap(
+    foundax.deeponet(
+        n_sensors=1, coord_dim=2, n_outputs=1,
+        n_layers=4, basis_functions=96, hidden_dim=64,
+        key=jax.random.PRNGKey(0),
+    )
+)
+net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(...)))
+
+xy = jno.np.concat([x, y])
+xy0 = jno.np.concat([x0, y0])
+
+u  = net(t,  xy)  * x  * (1 - x)  * y  * (1 - y)
+u0 = net(t0, xy0) * x0 * (1 - x0) * y0 * (1 - y0)
+```
 
 ## Step 3: Combine PDE and Initial Losses
 
 The transient residual enforces the heat equation, while a dedicated initial-condition residual anchors the solution at `t = 0`.
 
+```python
+pde = jno.np.grad(u, t) - α * jno.np.laplacian(u, [x, y])
+ini = u0 - jno.np.sin(π * x0) * jno.np.sin(π * y0)
+
+crux    = jno.core([pde.mse, ini.mse], domain)
+history = crux.solve(40000)
+```
+
 ## Step 4: Plot Time Snapshots
 
 One of the nice features of this script is explicit evaluation on selected time slices so you can inspect how the field evolves.
+
+```python
+_u, _u_exact = crux.eval([u, u_exact])
+rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_exact) + 1e-8))
+```
 
 ## What To Notice
 
