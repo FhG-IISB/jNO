@@ -58,6 +58,14 @@ print(f"Recovered parameters: a={_a[0]:.3f}, b={_b[0]:.3f}, c={_c[0]:.3f}")
 - Inverse problems often reuse the same core workflow with different residual definitions.
 - This example is a good template for coefficient discovery and calibration.
 
+## Going Further
+
+For field identification (recovering a spatially-varying `k(x,y)` rather than a scalar), see the **[Inverse Problems](../../inverse-problems.md)** guide, which covers:
+
+- `jno.fn.regularize` — smooth, TV, positivity and bounded penalties on identified fields
+- `Model.constrain(transform)` — hard parameter constraints via paramax reparameterization
+- `jno.domain.from_array` — attaching sparse sensor observations without file I/O
+
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/05_coupled_and_inverse/inverse_parameter.py" download>Download full script</a>
 <a class="md-button" href="/jNO_docs/tutorials/05-coupled-and-inverse/">Back to 05 Coupled and Inverse</a>

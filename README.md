@@ -16,6 +16,9 @@
         <img src="https://img.shields.io/badge/cite-CITATION.cff-6b5b95?style=for-the-badge" alt="Citation"/>
     </a>
     <img src="https://img.shields.io/badge/docker-image%20available-2496ED?style=for-the-badge&logo=docker&logoColor=white" alt="Docker image available"/>
+    <a href="https://arxiv.org/abs/2605.10159">
+        <img src="https://img.shields.io/badge/arXiv-2605.10159-b31b1b?style=for-the-badge" alt="arXiv Paper"/>
+    </a>
 </p>
 
 Warning: This is a research-level repository. It may contain bugs and is subject to continuous change without notice.
