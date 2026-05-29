@@ -1,9 +1,0 @@
-jNO Explainability: Track during training the following:
-
--   Pairwise Cos-Similarity between loss terms -> upper triangular matrix
--   Total Cos-Similarity of loss terms, based on the metric defined in Eq. (3.1) in [2502.00604] Gradient Alignment in Physics-informed Neural Networks: A Second-Order Optimization Pe…
--   Sizes/lengths of different loss terms
--   Loss Landscape: Based on this https://arxiv.org/abs/2501.16371(for an example applied to PINNs, see this https://arxiv.org/abs/1712.09913). One could also choose a visualization similar to ESPINN: Show the loss landscape in 2D and illustrate the loss evolution, see image below
-
-
-
