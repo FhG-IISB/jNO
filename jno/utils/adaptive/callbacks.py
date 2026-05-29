@@ -9,7 +9,7 @@ from typing import Any, Dict, Optional
 import jax
 import numpy as np
 
-from ..config import get_wandb_run, wandb_alert
+from ..config import get_wandb_run, wandb_alert, wandb_log
 
 
 class Callback:
@@ -182,6 +182,7 @@ class CheckpointCallback(Callback):
             "total_loss": float(jax.device_get(total_loss)),
             "individual_losses": [float(v) for v in jax.device_get(individual_losses)],
             "timestamp": time.time(),
+            "checkpoint_dir": os.path.join(self._directory, str(epoch)),
         }
 
         # CheckpointManager.save internally checks should_save(step)
@@ -198,7 +199,7 @@ class CheckpointCallback(Callback):
 
         # Upload checkpoint as a W&B artifact when a save happened.
         if saved:
-            self._upload_wandb_artifact(epoch)
+            self._upload_wandb_artifact(epoch, metadata=metadata)
             self._log_wandb_histograms(trainable, epoch)
 
     def on_training_end(self, **kwargs) -> None:
@@ -206,7 +207,7 @@ class CheckpointCallback(Callback):
 
     # -- wandb ---------------------------------------------------------------
 
-    def _upload_wandb_artifact(self, epoch: int) -> None:
+    def _upload_wandb_artifact(self, epoch: int, metadata: Optional[Dict] = None) -> None:
         """Upload the latest checkpoint directory as a W&B artifact."""
 
         run = get_wandb_run()
@@ -222,7 +223,7 @@ class CheckpointCallback(Callback):
         artifact = wandb.Artifact(
             f"checkpoint-{epoch}",
             type="checkpoint",
-            metadata={"epoch": epoch},
+            metadata=metadata if metadata is not None else {"epoch": epoch},
         )
         artifact.add_dir(ckpt_path)
         run.log_artifact(artifact)
@@ -490,13 +491,17 @@ class GradientNormsCallback(_PerLossGradCallback):
         self._norms: list = []
 
     def on_epoch_end(self, **kwargs) -> bool:
-        out = self._compute(
-            kwargs["epoch"], kwargs["trainable"], kwargs["context"], kwargs["rng"]
-        )
+        out = self._compute(kwargs["epoch"], kwargs["trainable"], kwargs["context"], kwargs["rng"])
         if out is not None:
             norms, _, _ = out
-            self._epochs.append(kwargs["epoch"])
+            epoch = kwargs["epoch"]
+            self._epochs.append(epoch)
             self._norms.append(np.asarray(norms))
+            if get_wandb_run() is not None:
+                wandb_log(
+                    {f"explainability/gradient_norm/constraint_{i}": float(v) for i, v in enumerate(norms)},
+                    step=epoch,
+                )
         return False
 
     @property
@@ -540,13 +545,31 @@ class CosSimilarityCallback(_PerLossGradCallback):
         self._cos: list = []
 
     def on_epoch_end(self, **kwargs) -> bool:
-        out = self._compute(
-            kwargs["epoch"], kwargs["trainable"], kwargs["context"], kwargs["rng"]
-        )
+        out = self._compute(kwargs["epoch"], kwargs["trainable"], kwargs["context"], kwargs["rng"])
         if out is not None:
             _, cos_matrix, _ = out
-            self._epochs.append(kwargs["epoch"])
-            self._cos.append(np.asarray(cos_matrix))
+            epoch = kwargs["epoch"]
+            self._epochs.append(epoch)
+            cos_np = np.asarray(cos_matrix)
+            self._cos.append(cos_np)
+            if get_wandb_run() is not None:
+                N = cos_np.shape[0]
+                wb: dict = {
+                    f"explainability/cos_sim/{i}_{j}": float(cos_np[i, j]) for i in range(N) for j in range(i + 1, N)
+                }
+                try:
+                    import matplotlib.pyplot as plt
+                    import wandb as _wandb
+
+                    fig, ax = plt.subplots(figsize=(max(3, N), max(3, N)))
+                    im = ax.imshow(cos_np, vmin=-1, vmax=1, cmap="RdBu_r")
+                    fig.colorbar(im, ax=ax)
+                    ax.set_title(f"Gradient cosine similarity (epoch {epoch})")
+                    wb["explainability/cos_sim_matrix"] = _wandb.Image(fig)
+                    plt.close(fig)
+                except ImportError:
+                    pass
+                wandb_log(wb, step=epoch)
         return False
 
     @property
@@ -592,13 +615,14 @@ class GradientAlignmentCallback(_PerLossGradCallback):
         self._align: list = []
 
     def on_epoch_end(self, **kwargs) -> bool:
-        out = self._compute(
-            kwargs["epoch"], kwargs["trainable"], kwargs["context"], kwargs["rng"]
-        )
+        out = self._compute(kwargs["epoch"], kwargs["trainable"], kwargs["context"], kwargs["rng"])
         if out is not None:
             _, _, alignment = out
-            self._epochs.append(kwargs["epoch"])
+            epoch = kwargs["epoch"]
+            self._epochs.append(epoch)
             self._align.append(float(alignment))
+            if get_wandb_run() is not None:
+                wandb_log({"explainability/gradient_alignment": float(alignment)}, step=epoch)
         return False
 
     @property
@@ -677,9 +701,7 @@ class LossLandscapeCallback(Callback):
                 min_consecutive=kwargs.get("min_consecutive", 1),
             )
         )
-        self._landscape_fn.lower(
-            kwargs["trainable"], kwargs["context"], kwargs["rng"]
-        ).compile()
+        self._landscape_fn.lower(kwargs["trainable"], kwargs["context"], kwargs["rng"]).compile()
 
     def on_epoch_end(self, **kwargs) -> bool:
         if self._landscape_fn is None:
@@ -687,11 +709,27 @@ class LossLandscapeCallback(Callback):
         epoch = kwargs["epoch"]
         if epoch % self._interval != 0:
             return False
-        ls = jax.device_get(
-            self._landscape_fn(kwargs["trainable"], kwargs["context"], kwargs["rng"])
-        )
+        ls = jax.device_get(self._landscape_fn(kwargs["trainable"], kwargs["context"], kwargs["rng"]))
         self._epochs.append(epoch)
-        self._landscapes.append(np.asarray(ls))
+        ls_np = np.asarray(ls)
+        self._landscapes.append(ls_np)
+        if get_wandb_run() is not None:
+            wb: dict = {}
+            try:
+                import matplotlib.pyplot as plt
+                import wandb as _wandb
+
+                fig, ax = plt.subplots()
+                im = ax.imshow(ls_np, origin="lower", aspect="auto")
+                fig.colorbar(im, ax=ax)
+                ax.set_title(f"Loss landscape (epoch {epoch})")
+                wb["explainability/loss_landscape"] = _wandb.Image(fig)
+                plt.close(fig)
+            except ImportError:
+                wb["explainability/landscape_min"] = float(ls_np.min())
+                wb["explainability/landscape_max"] = float(ls_np.max())
+                wb["explainability/landscape_mean"] = float(ls_np.mean())
+            wandb_log(wb, step=epoch)
         return False
 
     @property
@@ -836,6 +874,4 @@ class callbacks:
             n_grid: Grid points per axis.  Total evaluations = ``n_grid²``.
             alpha_range: Perturbation range in units of ``‖θ_selected‖``.
         """
-        return LossLandscapeCallback(
-            interval=interval, mask=mask, n_grid=n_grid, alpha_range=alpha_range
-        )
+        return LossLandscapeCallback(interval=interval, mask=mask, n_grid=n_grid, alpha_range=alpha_range)

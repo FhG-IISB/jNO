@@ -56,7 +56,9 @@ nav:
       - Integral Operators: operators/integral.md
       - jno.numpy Reference: operators/numpy-reference.md
     - Hyperparameter Tuning: Hyperparameter-Tuning.md
-    - Miscellaneous: misc.md
+    - Miscellaneous:
+      - Overview: misc.md
+      - Weights & Biases: misc/wandb.md
   - Training:
     - Overview: training/index.md
     - Schedules, Resampling & Callbacks:
@@ -65,7 +67,9 @@ nav:
       - Callbacks: adaptive/callbacks.md
     - Running Training: training/running.md
     - Parallelism: training/parallelism.md
-    - Evaluation & Debugging: training/evaluation.md
+    - Evaluation & Debugging:
+      - Evaluation: training/evaluation.md
+      - Explainability: training/explainability.md
     - Model Controls:
       - Overview: model-controls/index.md
       - Mask & Freeze: model-controls/mask-freeze.md

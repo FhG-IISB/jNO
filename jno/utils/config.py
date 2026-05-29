@@ -286,6 +286,13 @@ def _init_wandb(wandb_arg: bool | dict, project: str, run_dir: str) -> None:
     _WANDB_RUN = wandb.init(**kwargs)
     _WANDB_RUN.log_code()
 
+    try:
+        import weave  # type: ignore[import-untyped]
+
+        weave.init("armbrul/jNO")
+    except ImportError:
+        pass
+
 
 def get_wandb_run() -> Any:
     """Return the active W&B run, or ``None`` if W&B is not enabled."""
