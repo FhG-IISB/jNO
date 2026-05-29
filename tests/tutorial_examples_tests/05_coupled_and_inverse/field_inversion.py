@@ -47,8 +47,8 @@ domain = jno.domain(constructor=jno.domain.line(mesh_size=0.01))
 x, _ = domain.variable("interior")
 
 # ── Manufactured source term and observations ─────────────────────────────────
-f_pde = -(π**2) * jno.np.sin(π * x)    # k_true · u_true'' = 1 · (−π² sin(πx))
-u_obs = jno.np.sin(π * x)              # noiseless observations
+f_pde = -(π**2) * jno.np.sin(π * x)  # k_true · u_true'' = 1 · (−π² sin(πx))
+u_obs = jno.np.sin(π * x)  # noiseless observations
 
 # ── Networks ──────────────────────────────────────────────────────────────────
 key = jax.random.PRNGKey(0)
@@ -61,13 +61,13 @@ u_net = jno.nn.wrap(foundax.mlp(in_features=1, output_dim=1, hidden_dims=32, num
 u_net.optimizer(optax.adam(1e-3))
 
 # ── Fields ────────────────────────────────────────────────────────────────────
-k = jno.fn.exp(k_raw(x))          # exp output transform: k > 0 by construction
-u = u_net(x) * x * (1 - x)        # hard zero Dirichlet BCs at x=0 and x=1
+k = jno.fn.exp(k_raw(x))  # exp output transform: k > 0 by construction
+u = u_net(x) * x * (1 - x)  # hard zero Dirichlet BCs at x=0 and x=1
 
 # ── Losses ────────────────────────────────────────────────────────────────────
-pde  = k * u.dd(x) - f_pde        # PDE residual
-data = u - u_obs                   # data misfit
-reg  = jno.fn.regularize.smooth(k, x)  # H1 smoothness on k
+pde = k * u.dd(x) - f_pde  # PDE residual
+data = u - u_obs  # data misfit
+reg = jno.fn.regularize.smooth(k, x)  # H1 smoothness on k
 
 # ── Solve ─────────────────────────────────────────────────────────────────────
 crux = jno.core([pde.mse, data.mse, reg.mean], domain=domain)
@@ -77,15 +77,15 @@ crux.solve(5_000)
 _u, _k, _u_obs = crux.eval([u, k, u_obs])
 
 rel_l2_u = float(jnp.linalg.norm(_u - _u_obs) / (jnp.linalg.norm(_u_obs) + 1e-8))
-k_min    = float(_k.min())
-k_mean   = float(_k.mean())
+k_min = float(_k.min())
+k_mean = float(_k.mean())
 
 print(f"u  rel-L2 error : {rel_l2_u:.3e}")
 print(f"k  min / mean   : {k_min:.3f} / {k_mean:.3f}  (true: >0 / 1.0)")
 
 # ── Assertions ────────────────────────────────────────────────────────────────
 assert rel_l2_u < 1e-1, f"u relative L2 error too large: {rel_l2_u:.3e}"
-assert k_min > 0,        f"k must be positive everywhere (got min={k_min:.4f})"
+assert k_min > 0, f"k must be positive everywhere (got min={k_min:.4f})"
 assert abs(k_mean - 1.0) < 0.5, f"k mean should be near 1.0 (got {k_mean:.3f})"
 
 # ── Result tracking ───────────────────────────────────────────────────────────

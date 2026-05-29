@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import paramax as _paramax
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -57,8 +58,6 @@ from .utils import (
     statistics,
 )
 from .utils.config import get_wandb_run, wandb_alert, wandb_log, wandb_log_model
-
-import paramax as _paramax
 
 
 class core:
