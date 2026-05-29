@@ -136,10 +136,11 @@ class TestEarlyStoppingCallback:
         """With patience=5 and a converged loss, training stops well before 500."""
         solver, u_net = _make_simple_solver()
         u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
-        # Pre-train so the loss is already low → plateau triggers early stop fast
         solver.solve(50)
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-7))  # tiny LR → plateau
-        cb = EarlyStoppingCallback(patience=5, min_delta=0.0, mode="min")
+        # min_delta=1e-5 means per-epoch improvements below ~1e-5 don't count.
+        # With lr=1e-7 Adam steps are O(1e-7), well below that threshold.
+        u_net.optimizer(optax.adam, lr=lrs.constant(1e-7))
+        cb = EarlyStoppingCallback(patience=5, min_delta=1e-5, mode="min")
         solver.solve(epochs=500, callbacks=[cb])
         assert cb.has_stopped, "EarlyStoppingCallback never triggered"
         assert cb.stopped_epoch is not None
@@ -150,8 +151,8 @@ class TestEarlyStoppingCallback:
         solver, u_net = _make_simple_solver()
         u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
         solver.solve(30)
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-8))  # force plateau
-        cb = EarlyStoppingCallback(patience=3, min_delta=0.0, mode="min")
+        u_net.optimizer(optax.adam, lr=lrs.constant(1e-7))
+        cb = EarlyStoppingCallback(patience=3, min_delta=1e-5, mode="min")
         stats = solver.solve(epochs=500, callbacks=[cb])
         n_logged = len(stats.training_logs[-1]["epoch"])
         assert cb.stopped_epoch is not None
@@ -165,8 +166,8 @@ class TestEarlyStoppingCallback:
         stats = solver.solve(10)
         initial_loss = float(stats.training_logs[-1]["total_loss"][0])
 
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-8))
-        cb = EarlyStoppingCallback(patience=3, mode="min")
+        u_net.optimizer(optax.adam, lr=lrs.constant(1e-7))
+        cb = EarlyStoppingCallback(patience=3, min_delta=1e-5, mode="min")
         solver.solve(50, callbacks=[cb])
         assert cb.best_metric is not None
         assert cb.best_metric <= initial_loss
