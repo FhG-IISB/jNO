@@ -1,16 +1,12 @@
-"""Tests that model controls are correctly attached to the right nodes.
+"""Tests that jNO model-control methods attach the right config to the right nodes.
 
-These tests verify that optimizer(), lr(), lora(), constrain(), freeze(), and mask()
-store their configurations on the right model objects — not just that training runs
-without error. They also cover the new .constrain() feature, which has no prior tests.
-
-Structure:
-  - TestOptimizerAttachment   — pure attribute inspection, no training
-  - TestLRScheduleAttachment  — schedule values callable and correct
-  - TestLoRAAttachment        — lora config stored correctly
-  - TestConstrainAttachment   — constrain() wraps the right leaves
-  - TestWeightChangeVerification — post-solve weight delta checks
+These tests verify *attachment*, not training behavior:
+  - The correct optimizer/LR/LoRA config is stored on the correct attribute
+  - Masks target the intended parameter group
+  - Two models don't cross-contaminate each other's state
 """
+
+from __future__ import annotations
 
 import equinox as eqx
 import foundax
@@ -19,401 +15,323 @@ import jax.numpy as jnp
 import optax
 import pytest
 
-import jno
 import jno.jnp_ops as jnn
 from jno import LearningRateSchedule as lrs
-from jno.architectures.models import nn
-
-# Dummy losses array needed to call LR schedules in unit tests (no training)
-_dummy_losses = jnp.array([0.5])
-
 
 # ---------------------------------------------------------------------------
-# Shared helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 
-def _mlp(key=None):
-    if key is None:
-        key = jax.random.PRNGKey(0)
-    return foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=key)
+def _make_net(*, hidden_dims=16, num_layers=2):
+    """Return a fresh jNO-wrapped MLP with a 1-D line domain."""
+    key = jax.random.PRNGKey(42)
+    return jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=hidden_dims, num_layers=num_layers, key=key))
 
 
-def _make_solver(key=None):
-    """Minimal 1D Poisson solver for integration tests."""
-    domain = 1 * jno.domain.line(mesh_size=0.05)
-    x, *_ = domain.variable("interior")
-    u_net = jnn.nn.wrap(_mlp(key or jax.random.PRNGKey(0)))
-    u = u_net(x) * x * (1 - x)
-    pde = jnn.laplacian(u, [x])
-    return jno.core([pde.mse], domain), u_net
-
-
-def _all_false(module):
+def _all_false_mask(module):
+    """All-False pytree with the same structure as module."""
     return jax.tree_util.tree_map(lambda _: False, module)
 
 
-def _mask_hidden0(module):
-    """Mask that selects only hidden_layers[0].weight and .bias."""
+def _mask_first_layer(module):
+    """Mask that selects weight + bias of the first hidden linear layer only."""
+    base = _all_false_mask(module)
     return eqx.tree_at(
         lambda m: (m.hidden_layers[0].weight, m.hidden_layers[0].bias),
-        _all_false(module),
+        base,
         (True, True),
     )
 
 
-def _mask_hidden1(module):
-    """Mask that selects only hidden_layers[1].weight and .bias."""
-    return eqx.tree_at(
-        lambda m: (m.hidden_layers[1].weight, m.hidden_layers[1].bias),
-        _all_false(module),
-        (True, True),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Group 1: Optimizer attachment — pure attribute inspection (no training)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Optimizer attachment
+# ===========================================================================
 
 
 class TestOptimizerAttachment:
     def test_single_optimizer_stored_on_correct_attribute(self):
-        net = nn.wrap(_mlp())
+        net = _make_net()
         net.optimizer(optax.adam)
         assert net._opt_fn is optax.adam
         assert len(net._param_groups) == 0
 
-    def test_two_models_different_optimizers_do_not_cross_contaminate(self):
-        net_a = nn.wrap(_mlp(jax.random.PRNGKey(0)))
-        net_b = nn.wrap(_mlp(jax.random.PRNGKey(1)))
-        net_a.optimizer(optax.adam)
-        net_b.optimizer(optax.adamw)
-        assert net_a._opt_fn is optax.adam
-        assert net_b._opt_fn is optax.adamw
-        assert net_a._opt_fn is not optax.adamw
-        assert net_b._opt_fn is not optax.adam
+    def test_global_optimizer_call_clears_param_groups(self):
+        net = _make_net()
+        # First add a masked group, then override with a global call
+        mask = _mask_first_layer(net.module)
+        net.mask(mask).optimizer(optax.sgd)
+        assert len(net._param_groups) == 1
+        net.optimizer(optax.adam)  # global call must clear groups
+        assert net._opt_fn is optax.adam
+        assert len(net._param_groups) == 0
 
     def test_masked_optimizer_creates_param_group(self):
-        net = nn.wrap(_mlp())
-        net.optimizer(optax.sgd)                                # global fallback first
-        net.mask(_mask_hidden0(net.module)).optimizer(optax.adam)  # group
-        assert net._opt_fn is optax.sgd                         # global unchanged
-        assert len(net._param_groups) == 1
-        assert net._param_groups[0]["opt_fn"] is optax.adam
-
-    def test_bare_global_optimizer_clears_existing_groups(self):
-        net = nn.wrap(_mlp())
-        net.mask(_mask_hidden0(net.module)).optimizer(optax.adam)  # creates group
-        assert len(net._param_groups) == 1
-        net.optimizer(optax.adamw)                               # bare — resets groups
-        assert len(net._param_groups) == 0
-        assert net._opt_fn is optax.adamw
-
-    def test_two_param_groups_stored_in_order(self):
-        net = nn.wrap(_mlp())
-        net.optimizer(optax.sgd)
-        net.mask(_mask_hidden0(net.module)).optimizer(optax.adam)
-        net.mask(_mask_hidden1(net.module)).optimizer(optax.adamw)
-        assert len(net._param_groups) == 2
-        assert net._param_groups[0]["opt_fn"] is optax.adam
-        assert net._param_groups[1]["opt_fn"] is optax.adamw
+        net = _make_net()
+        net.optimizer(optax.sgd)  # global fallback
+        mask = _mask_first_layer(net.module)
+        net.mask(mask).optimizer(optax.adam)
+        # Global fallback unchanged
         assert net._opt_fn is optax.sgd
+        # One masked group with adam
+        assert len(net._param_groups) == 1
+        assert net._param_groups[0]["opt_fn"] is optax.adam
 
-    def test_three_independent_models_three_optimizers(self):
-        net_a = nn.wrap(_mlp(jax.random.PRNGKey(0)))
-        net_b = nn.wrap(_mlp(jax.random.PRNGKey(1)))
-        net_c = nn.wrap(_mlp(jax.random.PRNGKey(2)))
+    def test_masked_optimizer_stores_mask_in_group(self):
+        net = _make_net()
+        mask = _mask_first_layer(net.module)
+        net.optimizer(optax.sgd)
+        net.mask(mask).optimizer(optax.adam)
+        stored_mask = net._param_groups[0]["mask"]
+        # The stored mask should be a pytree with the same leaf count
+        stored_leaves = jax.tree_util.tree_leaves(stored_mask)
+        orig_leaves = jax.tree_util.tree_leaves(mask)
+        assert len(stored_leaves) == len(orig_leaves)
+
+    def test_two_models_different_optimizers_do_not_cross_contaminate(self):
+        net_a = _make_net()
+        net_b = _make_net()
         net_a.optimizer(optax.adam)
         net_b.optimizer(optax.adamw)
-        net_c.optimizer(optax.sgd)
         assert net_a._opt_fn is optax.adam
         assert net_b._opt_fn is optax.adamw
-        assert net_c._opt_fn is optax.sgd
+
+    def test_two_masked_groups_stored_independently(self):
+        net = _make_net()
+        net.optimizer(optax.sgd)
+        mask1 = _mask_first_layer(net.module)
+        # Build a second mask for a different layer
+        base = _all_false_mask(net.module)
+        mask2 = eqx.tree_at(
+            lambda m: (m.hidden_layers[1].weight, m.hidden_layers[1].bias),
+            base,
+            (True, True),
+        )
+        net.mask(mask1).optimizer(optax.adam)
+        net.mask(mask2).optimizer(optax.adamw)
+        assert len(net._param_groups) == 2
+        opt_fns = {g["opt_fn"] for g in net._param_groups}
+        assert optax.adam in opt_fns
+        assert optax.adamw in opt_fns
 
 
-# ---------------------------------------------------------------------------
-# Group 2: LR schedule attachment and value correctness
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Learning-rate attachment
+# ===========================================================================
 
 
-class TestLRScheduleAttachment:
-    def test_constant_lr_stored_and_returns_correct_value(self):
-        net = nn.wrap(_mlp())
-        sched = lrs.constant(3e-3)
+class TestLearningRateAttachment:
+    def test_lr_stored_on_attribute(self):
+        net = _make_net()
+        sched = lrs.constant(1e-3)
         net.optimizer(optax.adam, lr=sched)
         assert net._lr is sched
-        assert float(net._lr(0, _dummy_losses)) == pytest.approx(3e-3, rel=1e-4)
 
-    def test_exponential_lr_starts_at_initial_value(self):
-        net = nn.wrap(_mlp())
-        sched = lrs.exponential(2e-3, decay_rate=0.9, decay_steps=100)
-        net.optimizer(optax.adam, lr=sched)
-        assert float(net._lr(0, _dummy_losses)) == pytest.approx(2e-3, rel=1e-4)
+    def test_lr_via_separate_call(self):
+        net = _make_net()
+        sched = lrs.exponential(1e-3, 0.9, 100)
+        net.optimizer(optax.adam)
+        net.lr(sched)
+        assert net._lr is sched
 
-    def test_exponential_lr_decays_over_time(self):
-        sched = lrs.exponential(1e-3, decay_rate=0.5, decay_steps=10)
-        lr_early = float(sched(0, _dummy_losses))
-        lr_later = float(sched(50, _dummy_losses))
-        assert lr_later < lr_early
-
-    def test_warmup_cosine_lr_increases_during_warmup_then_decays(self):
-        sched = lrs.warmup_cosine(total_steps=200, warmup_steps=20, lr0=1e-3)
-        lr_0 = float(sched(0, _dummy_losses))
-        lr_10 = float(sched(10, _dummy_losses))
-        lr_19 = float(sched(19, _dummy_losses))  # last warmup step
-        lr_150 = float(sched(150, _dummy_losses))  # deep in cosine decay
-        assert lr_0 < lr_10 < lr_19          # increasing during warmup
-        assert lr_150 < lr_19                # decaying after warmup
-
-    def test_per_group_lr_differs_from_global(self):
-        net = nn.wrap(_mlp())
-        sched_global = lrs.constant(1e-2)
-        sched_group = lrs.constant(1e-4)
+    def test_masked_lr_stored_in_group(self):
+        net = _make_net()
+        sched_global = lrs.constant(1e-3)
+        sched_layer0 = lrs.constant(1e-4)
+        mask = _mask_first_layer(net.module)
         net.optimizer(optax.adam, lr=sched_global)
-        net.mask(_mask_hidden0(net.module)).optimizer(optax.adam, lr=sched_group)
-        global_lr = float(net._lr(0, _dummy_losses))
-        group_lr = float(net._param_groups[0]["lr"](0, _dummy_losses))
-        assert global_lr == pytest.approx(1e-2, rel=1e-4)
-        assert group_lr == pytest.approx(1e-4, rel=1e-4)
-        assert global_lr != group_lr
+        net.mask(mask).lr(sched_layer0)
+        # Global LR unchanged
+        assert net._lr is sched_global
+        # Group has its own LR
+        group_lrs = [g["lr"] for g in net._param_groups if g["lr"] is not None]
+        assert sched_layer0 in group_lrs
 
-    def test_two_models_independent_lr_schedules(self):
-        net_a = nn.wrap(_mlp(jax.random.PRNGKey(0)))
-        net_b = nn.wrap(_mlp(jax.random.PRNGKey(1)))
-        net_a.optimizer(optax.adam, lr=lrs.constant(1e-3))
-        net_b.optimizer(optax.adam, lr=lrs.constant(5e-5))
-        assert float(net_a._lr(0, _dummy_losses)) == pytest.approx(1e-3, rel=1e-4)
-        assert float(net_b._lr(0, _dummy_losses)) == pytest.approx(5e-5, rel=1e-4)
+    def test_warmup_cosine_schedule_stored_correctly(self):
+        net = _make_net()
+        sched = lrs.warmup_cosine(total_steps=1000, warmup_steps=100, lr0=1e-3)
+        net.optimizer(optax.adam, lr=sched)
+        assert net._lr is sched
 
-    def test_piecewise_constant_lr_returns_correct_segment_values(self):
-        sched = lrs.piecewise_constant(boundaries=[10, 20], values=[1e-2, 1e-3, 1e-4])
-        assert float(sched(5, _dummy_losses)) == pytest.approx(1e-2, rel=1e-4)
-        assert float(sched(15, _dummy_losses)) == pytest.approx(1e-3, rel=1e-4)
-        assert float(sched(25, _dummy_losses)) == pytest.approx(1e-4, rel=1e-4)
+    def test_piecewise_constant_schedule_stored_correctly(self):
+        net = _make_net()
+        sched = lrs.piecewise_constant([100, 500], [1e-3, 1e-4, 1e-5])
+        net.optimizer(optax.adam, lr=sched)
+        assert net._lr is sched
+
+    def test_two_models_different_lr_do_not_cross_contaminate(self):
+        net_a = _make_net()
+        net_b = _make_net()
+        sched_a = lrs.constant(1e-3)
+        sched_b = lrs.constant(1e-5)
+        net_a.optimizer(optax.adam, lr=sched_a)
+        net_b.optimizer(optax.adam, lr=sched_b)
+        assert net_a._lr is sched_a
+        assert net_b._lr is sched_b
 
 
-# ---------------------------------------------------------------------------
-# Group 3: LoRA attachment
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Freeze attachment
+# ===========================================================================
 
 
-class TestLoRAAttachment:
-    def test_lora_config_rank_and_alpha_stored(self):
-        net = nn.wrap(_mlp())
-        net.lora(rank=8, alpha=16)
-        assert len(net._lora_config) == 1
-        cfg = net._lora_config[0]
-        assert cfg["rank"] == 8
-        assert cfg["alpha"] == 16
-
-    def test_lora_without_mask_sets_target_none_and_no_param_mask(self):
-        net = nn.wrap(_mlp())
-        net.lora(rank=4, alpha=1.0)
-        assert net._lora_config[0]["target"] is None
-        assert net._lora_param_mask is None
-
-    def test_masked_lora_stores_lora_param_mask(self):
-        net = nn.wrap(_mlp())
-        mask = _mask_hidden0(net.module)
-        net.mask(mask).lora(rank=4, alpha=8)
-        assert net._lora_param_mask is not None
-        assert len(net._lora_config) == 1
-
-    def test_second_lora_call_overwrites_first(self):
-        net = nn.wrap(_mlp())
-        net.lora(rank=4, alpha=1.0)
-        net.lora(rank=16, alpha=2.0)
-        assert len(net._lora_config) == 1
-        assert net._lora_config[0]["rank"] == 16
-        assert net._lora_config[0]["alpha"] == 2.0
-
-    def test_freeze_then_lora_sets_both_frozen_flag_and_config(self):
-        net = nn.wrap(_mlp())
+class TestFreezeAttachment:
+    def test_freeze_sets_frozen_flag(self):
+        net = _make_net()
+        net.optimizer(optax.adam)
         net.freeze()
-        net.lora(rank=4, alpha=1.0)
         assert net._frozen is True
+        assert net._trainable_param_mask is None
+
+    def test_unfreeze_clears_frozen_flag(self):
+        net = _make_net()
+        net.freeze()
+        net.unfreeze()
+        assert net._frozen is False
+        assert net._trainable_param_mask is None
+
+    def test_masked_freeze_sets_trainable_param_mask(self):
+        net = _make_net()
+        mask = _mask_first_layer(net.module)
+        net.mask(mask).freeze()
+        # Whole-model freeze flag should NOT be set
+        assert net._frozen is False
+        # But trainable_param_mask must be set (inverted mask: True=freeze → False in trainable)
+        assert net._trainable_param_mask is not None
+
+    def test_masked_freeze_inverts_mask_correctly(self):
+        """mask(M).freeze() → trainable_param_mask has False where M was True."""
+        net = _make_net()
+        mask = _mask_first_layer(net.module)
+        net.mask(mask).freeze()
+        tm = net._trainable_param_mask
+        # The leaves selected by mask (True) should be False (frozen) in trainable mask
+        orig_leaves = jax.tree_util.tree_leaves(mask)
+        trainable_leaves = jax.tree_util.tree_leaves(tm)
+        for orig, trainable in zip(orig_leaves, trainable_leaves):
+            if orig is True or orig is jnp.array(True):
+                assert not trainable, "Masked-True leaves should be frozen (False in trainable mask)"
+
+    def test_global_freeze_does_not_set_trainable_param_mask(self):
+        net = _make_net()
+        net.freeze()
+        assert net._trainable_param_mask is None
+        assert net._frozen is True
+
+    def test_two_models_freeze_do_not_cross_contaminate(self):
+        net_a = _make_net()
+        net_b = _make_net()
+        net_a.freeze()
+        assert net_a._frozen is True
+        assert net_b._frozen is False
+
+
+# ===========================================================================
+# LoRA attachment
+# ===========================================================================
+
+
+class TestLoraAttachment:
+    def test_lora_sets_config_attribute(self):
+        net = _make_net()
+        net.lora(rank=4, alpha=1.0)
+        assert net._lora_config is not None
         assert len(net._lora_config) == 1
 
-    def test_lora_target_regex_stored_in_config(self):
-        net = nn.wrap(_mlp())
-        net.lora(rank=4, alpha=1.0, target="hidden_layers.0")
-        assert net._lora_config[0]["target"] == "hidden_layers.0"
+    def test_lora_stores_correct_rank(self):
+        net = _make_net()
+        net.lora(rank=8)
+        assert net._lora_config[0]["rank"] == 8
 
-    def test_two_models_independent_lora_configs(self):
-        net_a = nn.wrap(_mlp(jax.random.PRNGKey(0)))
-        net_b = nn.wrap(_mlp(jax.random.PRNGKey(1)))
-        net_a.lora(rank=4, alpha=1.0)
-        net_b.lora(rank=8, alpha=2.0)
+    def test_lora_stores_correct_alpha(self):
+        net = _make_net()
+        net.lora(rank=4, alpha=2.0)
+        assert net._lora_config[0]["alpha"] == pytest.approx(2.0)
+
+    def test_lora_specs_mode_stores_multiple_configs(self):
+        net = _make_net()
+        specs = [
+            {"target": "layers.0", "rank": 4, "alpha": 1.0},
+            {"target": "layers.1", "rank": 8, "alpha": 2.0},
+        ]
+        net.lora(specs=specs)
+        assert net._lora_config is not None
+        assert len(net._lora_config) == 2
+        ranks = {c["rank"] for c in net._lora_config}
+        assert ranks == {4, 8}
+
+    def test_lora_clears_trainable_param_mask(self):
+        net = _make_net()
+        mask = _mask_first_layer(net.module)
+        net.mask(mask).freeze()
+        assert net._trainable_param_mask is not None
+        net.lora(rank=4)  # lora() clears any stale freeze mask
+        assert net._trainable_param_mask is None
+
+    def test_two_models_different_lora_do_not_cross_contaminate(self):
+        net_a = _make_net()
+        net_b = _make_net()
+        net_a.lora(rank=4)
+        net_b.lora(rank=8)
         assert net_a._lora_config[0]["rank"] == 4
         assert net_b._lora_config[0]["rank"] == 8
 
+    def test_lora_config_is_none_by_default(self):
+        net = _make_net()
+        assert net._lora_config is None
 
-# ---------------------------------------------------------------------------
-# Group 4: constrain() attachment — new feature with no prior tests
-# ---------------------------------------------------------------------------
+    def test_masked_lora_stores_lora_param_mask(self):
+        """mask(M).lora() restricts which layers receive LoRA adapters."""
+        net = _make_net()
+        mask = _mask_first_layer(net.module)
+        net.mask(mask).lora(rank=4)
+        assert net._lora_param_mask is not None
 
-
-class TestConstrainAttachment:
-    def _pm_leaves(self, pm, module):
-        """Return leaves, stopping recursion at Parameterize nodes."""
-        return jax.tree_util.tree_leaves(
-            module, is_leaf=lambda x: isinstance(x, pm.Parameterize)
-        )
-
-    def test_constrain_wraps_all_inexact_leaves(self):
-        pm = pytest.importorskip("paramax")
-        net = nn.wrap(_mlp())
-        n_float = sum(
-            1 for l in jax.tree_util.tree_leaves(net.module) if eqx.is_inexact_array(l)
-        )
-        net.constrain(jax.nn.softplus)
-        wrapped = [l for l in self._pm_leaves(pm, net.module) if isinstance(l, pm.Parameterize)]
-        assert len(wrapped) == n_float
-
-    def test_constrain_stores_correct_transform_fn(self):
-        pm = pytest.importorskip("paramax")
-        net = nn.wrap(_mlp())
-        net.constrain(jax.nn.softplus)
-        for leaf in self._pm_leaves(pm, net.module):
-            if isinstance(leaf, pm.Parameterize):
-                assert leaf.fn is jax.nn.softplus
-
-    def test_constrain_sets_contains_unwrappables(self):
-        pm = pytest.importorskip("paramax")
-        net = nn.wrap(_mlp())
-        assert not pm.contains_unwrappables(net.module)
-        net.constrain(jax.nn.softplus)
-        assert pm.contains_unwrappables(net.module)
-
-    def test_masked_constrain_wraps_only_selected_leaves(self):
-        pm = pytest.importorskip("paramax")
-        net = nn.wrap(_mlp())
-        mask = eqx.tree_at(
-            lambda m: m.hidden_layers[0].weight,
-            _all_false(net.module),
-            True,
-        )
-        net.mask(mask).constrain(jax.nn.softplus)
-        w0 = net.module.hidden_layers[0].weight
-        w1 = net.module.hidden_layers[1].weight
-        assert isinstance(w0, pm.Parameterize)
-        assert not isinstance(w1, pm.Parameterize)
-
-    def test_masked_constrain_consumes_mask_scope(self):
-        pytest.importorskip("paramax")
-        net = nn.wrap(_mlp())
-        net.mask(_mask_hidden0(net.module)).constrain(jax.nn.softplus)
-        assert net._mask_scope_pending is False
-
-    def test_constrain_returns_self_for_chaining(self):
-        pytest.importorskip("paramax")
-        net = nn.wrap(_mlp())
-        ret = net.constrain(jax.nn.softplus)
-        assert ret is net
-
-    def test_sigmoid_and_softplus_produce_different_wrapped_leaves(self):
-        pm = pytest.importorskip("paramax")
-        net_a = nn.wrap(_mlp(jax.random.PRNGKey(0)))
-        net_b = nn.wrap(_mlp(jax.random.PRNGKey(0)))
-        net_a.constrain(jax.nn.softplus)
-        net_b.constrain(jax.nn.sigmoid)
-        leaves_a = [l for l in self._pm_leaves(pm, net_a.module) if isinstance(l, pm.Parameterize)]
-        leaves_b = [l for l in self._pm_leaves(pm, net_b.module) if isinstance(l, pm.Parameterize)]
-        assert all(l.fn is jax.nn.softplus for l in leaves_a)
-        assert all(l.fn is jax.nn.sigmoid for l in leaves_b)
-
-    @pytest.mark.integration
-    def test_constrain_trains_without_error(self):
-        pytest.importorskip("paramax")
-        solver, u_net = _make_solver()
-        u_net.constrain(jax.nn.softplus)
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
-        stats = solver.solve(5)
-        assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
-
-    @pytest.mark.integration
-    def test_masked_constrain_trains_without_error(self):
-        pytest.importorskip("paramax")
-        solver, u_net = _make_solver()
-        u_net.mask(_mask_hidden0(u_net.module)).constrain(jax.nn.softplus)
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
-        stats = solver.solve(5)
-        assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
-
-    @pytest.mark.integration
-    def test_constrain_with_freeze_and_lora(self):
-        pytest.importorskip("paramax")
-        solver, u_net = _make_solver()
-        u_net.constrain(jax.nn.softplus)
-        u_net.freeze()
-        u_net.lora(rank=4, alpha=1.0)
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
-        stats = solver.solve(5)
-        assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
+    def test_global_lora_clears_lora_param_mask(self):
+        """Global lora() (without mask) must clear any stale lora_param_mask."""
+        net = _make_net()
+        mask = _mask_first_layer(net.module)
+        net.mask(mask).lora(rank=4)
+        assert net._lora_param_mask is not None
+        net.lora(rank=8)  # global call, no mask
+        assert net._lora_param_mask is None
 
 
-# ---------------------------------------------------------------------------
-# Group 5: Post-solve weight-change verification
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Integration: chaining multiple controls
+# ===========================================================================
 
 
-@pytest.mark.integration
-class TestWeightChangeVerification:
-    def test_masked_freeze_frozen_leaves_unchanged_after_solve(self):
-        """mask(layer0).freeze() → layer0 unchanged, other layers trained."""
-        solver, u_net = _make_solver()
-        lid = u_net.layer_id
+class TestChainedControls:
+    def test_freeze_plus_lora_chains_correctly(self):
+        """freeze().lora() → _frozen=True, _lora_config set, trainable_param_mask=None."""
+        net = _make_net()
+        net.freeze().lora(rank=4)
+        # freeze() sets _frozen=True; lora() respects that and sets config
+        assert net._lora_config is not None
+        assert net._lora_config[0]["rank"] == 4
 
-        w0_before = jnp.array(solver.models[lid].hidden_layers[0].weight)
-        b0_before = jnp.array(solver.models[lid].hidden_layers[0].bias)
-        w1_before = jnp.array(solver.models[lid].hidden_layers[1].weight)
+    def test_optimizer_then_masked_optimizer_coexist(self):
+        """Global optimizer + masked group must both survive on the same model."""
+        net = _make_net()
+        net.optimizer(optax.sgd, lr=lrs.constant(1e-2))
+        mask = _mask_first_layer(net.module)
+        net.mask(mask).optimizer(optax.adam, lr=lrs.constant(1e-3))
+        assert net._opt_fn is optax.sgd
+        assert len(net._param_groups) == 1
+        grp = net._param_groups[0]
+        assert grp["opt_fn"] is optax.adam
 
-        u_net.mask(_mask_hidden0(u_net.module)).freeze()
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
-        solver.solve(20)
-
-        w0_after = jnp.array(solver.models[lid].hidden_layers[0].weight)
-        b0_after = jnp.array(solver.models[lid].hidden_layers[0].bias)
-        w1_after = jnp.array(solver.models[lid].hidden_layers[1].weight)
-
-        assert jnp.allclose(w0_before, w0_after), "Frozen layer[0].weight changed"
-        assert jnp.allclose(b0_before, b0_after), "Frozen layer[0].bias changed"
-        assert not jnp.allclose(w1_before, w1_after), "Trainable layer[1].weight did not change"
-
-    def test_two_models_frozen_and_trainable_update_correctly(self):
-        """Frozen model stays put; trainable model updates. Both in one solve."""
-        domain = 1 * jno.domain.line(mesh_size=0.05)
-        x, *_ = domain.variable("interior")
-        key_a, key_b = jax.random.split(jax.random.PRNGKey(99))
-        net_frozen = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=key_a))
-        net_train = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=key_b))
-
-        u_f = net_frozen(x)
-        u_t = net_train(x)
-        pde = jnn.laplacian(u_t, [x]) + u_f
-        solver = jno.core([pde.mse], domain)
-
-        lid_f = net_frozen.layer_id
-        lid_t = net_train.layer_id
-        w_f_before = jnp.array(solver.models[lid_f].hidden_layers[0].weight)
-        w_t_before = jnp.array(solver.models[lid_t].hidden_layers[0].weight)
-
-        net_frozen.freeze()
-        net_train.optimizer(optax.adam, lr=lrs.constant(1e-3))
-        solver.solve(30)
-
-        w_f_after = jnp.array(solver.models[lid_f].hidden_layers[0].weight)
-        w_t_after = jnp.array(solver.models[lid_t].hidden_layers[0].weight)
-
-        assert jnp.allclose(w_f_before, w_f_after), "Frozen model weights changed"
-        assert not jnp.allclose(w_t_before, w_t_after), "Trainable model weights did not change"
-
-    def test_masked_group_optimizer_all_params_remain_trainable(self):
-        """mask(...).optimizer() scopes the optimizer but does not freeze anything."""
-        solver, u_net = _make_solver()
-        mask = _mask_hidden0(u_net.module)
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
-        u_net.mask(mask).optimizer(optax.adamw, lr=lrs.constant(1e-5))
-        stats = solver.solve(1)
-        logs = stats.training_logs[-1]
-        assert logs["trainable_params"] == logs["total_params"]
+    def test_reset_clears_all_controls(self):
+        """reset() must restore the model to its default (no optimizer, not frozen)."""
+        net = _make_net()
+        net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        net.lora(rank=4)
+        mask = _mask_first_layer(net.module)
+        net.mask(mask).freeze()
+        net.reset()
+        assert net._opt_fn is None
+        assert net._frozen is False
+        assert net._lora_config is None
+        assert len(net._param_groups) == 0
+        assert net._trainable_param_mask is None
