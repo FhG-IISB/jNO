@@ -12,16 +12,11 @@ from pathlib import Path
 
 
 def test_hyco_poisson_1d():
-    script = (
-        Path(__file__).parent.parent.parent.parent
-        / "docs/tutorial_examples/05_coupled_and_inverse/hyco_poisson_1d.py"
-    )
+    script = Path(__file__).parent.parent.parent.parent / "docs/tutorial_examples/05_coupled_and_inverse/hyco_poisson_1d.py"
     result = subprocess.run(
         [sys.executable, str(script)],
         capture_output=True,
         text=True,
         timeout=300,
     )
-    assert result.returncode == 0, (
-        f"hyco_poisson_1d.py failed:\n{result.stdout}\n{result.stderr}"
-    )
+    assert result.returncode == 0, f"hyco_poisson_1d.py failed:\n{result.stdout}\n{result.stderr}"

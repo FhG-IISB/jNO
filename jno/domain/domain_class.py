@@ -1828,6 +1828,34 @@ class domain(MeshIOMixin):
         self._param_tags.add(name)
         return self
 
+    def add_points(self, tag: str, coords: Union[np.ndarray, jnp.ndarray]) -> "domain":
+        """Inject a set of spatial coordinates into this domain as a named point set.
+
+        After calling this, ``domain.variable(tag)`` returns Variable placeholders
+        for those coordinates — identical to how ``"interior"`` or ``"boundary"``
+        variables work, but for an arbitrary in-memory array.
+
+        Args:
+            tag: Name for the new point set (e.g. ``"sensors"``).
+            coords: Coordinate array of shape ``(N, D)`` where ``D`` must match
+                    the domain's spatial dimension.
+
+        Returns:
+            Self, for method chaining::
+
+                dom = jno.domain(constructor=jno.domain.line(mesh_size=0.01))
+                x, _ = dom.variable("interior")
+
+                x_sensors = np.array([[0.1], [0.5], [0.9]])
+                dom.add_points("sensors", x_sensors)
+                x_s, _ = dom.variable("sensors")
+        """
+        coords = np.asarray(coords)
+        if coords.ndim == 1:
+            coords = coords[:, np.newaxis]
+        self.context[tag] = coords.reshape(1, 1, *coords.shape)
+        return self
+
     def variable(
         self,
         tag: str,

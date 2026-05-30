@@ -23,12 +23,12 @@ reproduces the observed output.
 
 from pathlib import Path
 
+import foundax
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 
-import foundax
 import jno
 
 π = jno.np.pi
@@ -47,8 +47,8 @@ x, _ = domain.variable("interior")
 u_net = jno.nn.wrap(foundax.mlp(in_features=1, output_dim=1, hidden_dims=32, num_layers=3, key=k1))
 u_net.optimizer(optax.adam(1e-3))
 
-u = u_net(x) * x * (1 - x)                     # hard zero Dirichlet BCs
-pde = u.dd(x) + π**2 * jno.np.sin(π * x)       # residual: u'' + π²sin(πx) = 0
+u = u_net(x) * x * (1 - x)  # hard zero Dirichlet BCs
+pde = u.dd(x) + π**2 * jno.np.sin(π * x)  # residual: u'' + π²sin(πx) = 0
 
 crux_fwd = jno.core([pde.mse], domain)
 crux_fwd.solve(3_000)
@@ -66,12 +66,12 @@ print(f"[forward] rel-L2 error: {fwd_err:.3e}")
 u_net.freeze()
 
 x_true = 0.3
-u_obs = float(jnp.sin(jnp.pi * x_true))        # "measured" value ≈ 0.809
+u_obs = float(jnp.sin(jnp.pi * x_true))  # "measured" value ≈ 0.809
 print(f"[inverse] target u_obs = {u_obs:.4f}  (x_true = {x_true})")
 
 # x_query is the variable we optimise — it starts as an unknown scalar in [0, 1]
 x_query = jno.np.parameter((1,), name="x_query")
-x_query.initialize(jax.nn.initializers.constant(0.1))   # initial guess: 0.1
+x_query.initialize(jax.nn.initializers.constant(0.1))  # initial guess: 0.1
 x_query.optimizer(optax.adam(5e-3))
 
 # Evaluate the frozen surrogate at the query point (same BC factor as training)
