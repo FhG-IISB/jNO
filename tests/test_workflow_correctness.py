@@ -518,3 +518,83 @@ class TestStatisticsCorrectness:
         u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
         stats = solver.solve(1)
         assert stats.training_logs[-1]["frozen_params"] == 0, "Expected 0 frozen params for a fully trainable model"
+
+
+# ===========================================================================
+# Group 7: jno.fn.stop_gradient — gradient isolation
+# ===========================================================================
+
+
+import paramax as _paramax
+
+
+def _model_leaves(crux, layer_id):
+    """Return model weights as a list of numpy arrays (safe to compare after solve)."""
+    inner = _paramax.unwrap(crux.models[layer_id])
+    return [np.array(leaf) for leaf in jax.tree_util.tree_leaves(inner)]
+
+
+def _weights_changed(before, after):
+    return any(not np.allclose(a, b) for a, b in zip(before, after))
+
+
+@pytest.mark.integration
+class TestStopGradient:
+    """Verify that jno.fn.stop_gradient blocks gradient flow between cooperating models."""
+
+    def _setup(self):
+        domain = jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+        x, _ = domain.variable("interior")
+        k1, k2 = jax.random.split(jax.random.PRNGKey(7))
+        phy = jno.nn.wrap(foundax.mlp(in_features=1, output_dim=1, hidden_dims=8, num_layers=2, key=k1))
+        syn = jno.nn.wrap(foundax.mlp(in_features=1, output_dim=1, hidden_dims=8, num_layers=2, key=k2))
+        phy.optimizer(optax.adam(1e-3))
+        syn.optimizer(optax.adam(1e-3))
+        u_phy = phy(x) * x * (1 - x)
+        u_syn = syn(x) * x * (1 - x)
+        return domain, x, phy, syn, u_phy, u_syn
+
+    def test_int_phy_does_not_update_syn(self):
+        """L_int_phy = (u_phy - stop_gradient(u_syn)).mse must not change syn weights."""
+        domain, x, phy, syn, u_phy, u_syn = self._setup()
+        L = (u_phy - jno.fn.stop_gradient(u_syn)).mse
+        crux = jno.core([L], domain)
+
+        before_phy = _model_leaves(crux, phy.layer_id)
+        before_syn = _model_leaves(crux, syn.layer_id)
+        crux.solve(20)
+        after_phy = _model_leaves(crux, phy.layer_id)
+        after_syn = _model_leaves(crux, syn.layer_id)
+
+        assert _weights_changed(before_phy, after_phy), "phy weights should have changed"
+        assert not _weights_changed(before_syn, after_syn), "syn weights must not change (stop_gradient)"
+
+    def test_int_syn_does_not_update_phy(self):
+        """L_int_syn = (u_syn - stop_gradient(u_phy)).mse must not change phy weights."""
+        domain, x, phy, syn, u_phy, u_syn = self._setup()
+        L = (u_syn - jno.fn.stop_gradient(u_phy)).mse
+        crux = jno.core([L], domain)
+
+        before_phy = _model_leaves(crux, phy.layer_id)
+        before_syn = _model_leaves(crux, syn.layer_id)
+        crux.solve(20)
+        after_phy = _model_leaves(crux, phy.layer_id)
+        after_syn = _model_leaves(crux, syn.layer_id)
+
+        assert _weights_changed(before_syn, after_syn), "syn weights should have changed"
+        assert not _weights_changed(before_phy, after_phy), "phy weights must not change (stop_gradient)"
+
+    def test_without_stop_gradient_both_models_update(self):
+        """Negative control: without stop_gradient, the interaction loss updates both models."""
+        domain, x, phy, syn, u_phy, u_syn = self._setup()
+        L = (u_phy - u_syn).mse  # no stop_gradient
+        crux = jno.core([L], domain)
+
+        before_phy = _model_leaves(crux, phy.layer_id)
+        before_syn = _model_leaves(crux, syn.layer_id)
+        crux.solve(20)
+        after_phy = _model_leaves(crux, phy.layer_id)
+        after_syn = _model_leaves(crux, syn.layer_id)
+
+        assert _weights_changed(before_phy, after_phy), "phy weights should change without stop_gradient"
+        assert _weights_changed(before_syn, after_syn), "syn weights should change without stop_gradient"
