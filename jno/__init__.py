@@ -60,7 +60,17 @@ sys.modules[__name__ + ".numpy"] = np
 do = domain
 
 
-__version__ = "0.2.1"
+# Single source of truth: pyproject.toml. importlib.metadata reads the
+# installed-package metadata so __version__ stays aligned with the wheel
+# without manual edits. The fallback covers running from a source checkout
+# without `pip install -e .`.
+try:
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _version
+
+    __version__ = _version("jax-neural-operators")
+except (ImportError, PackageNotFoundError):
+    __version__ = "unknown"
 
 
 class ScheduleWrapper:

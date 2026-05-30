@@ -24,5 +24,18 @@ jobs:
       - name: Lint
         run: pixi run ci-lint
 
-      - name: Test
-        run: pixi run ci-test
+      - name: Test (with coverage)
+        run: pixi run ci-test-cov
+
+      # Public-repo upload works without a token (codecov-action uses OIDC).
+      # For private repos, set the CODECOV_TOKEN secret and uncomment the
+      # `token:` line. Codecov must be enabled for the repo on codecov.io
+      # before the first upload will be visible.
+      - name: Upload coverage to Codecov
+        if: always()
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.xml
+          flags: unittests
+          fail_ci_if_error: false
+          # token: ${{ secrets.CODECOV_TOKEN }}

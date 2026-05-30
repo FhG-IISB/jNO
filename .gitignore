@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 *.egg-info
+*.egg-info/
 *.dot
 *.lock
 !pixi.lock
@@ -14,6 +15,7 @@ __pycache__/
 .jax_cache/
 dist/
 build/
+site/
 scripts/
 misc/
 !docs/misc/
@@ -28,6 +30,16 @@ traces/
 !*.ini
 !*.yaml
 !*.yml
+
+# Auto-memory / agent scratch and other untracked outputs that the
+# `!*.txt` re-include above would otherwise allow back in. Keep these
+# AFTER the re-includes so they win.
+-home-*/
+mode_summary.txt
+**/mode_summary.txt
+tests/tutorial_results.txt
+docs/tutorial_results.txt
+
 # pixi environments
 .pixi/*
 !.pixi/config.toml
