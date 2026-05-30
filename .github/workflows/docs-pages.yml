@@ -38,9 +38,19 @@ jobs:
       - name: Install docs dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install "mkdocs>=1.6,<2.0" "mkdocs-material>=9,<10" "pymdown-extensions>=10,<11"
+          pip install \
+            "mkdocs>=1.6,<2.0" \
+            "mkdocs-material>=9,<10" \
+            "pymdown-extensions>=10,<11" \
+            "mkdocstrings[python]>=0.25"
+          # The mkdocstrings handler imports jno to introspect docstrings,
+          # so install the package itself (no GPU wheel needed for docs).
+          pip install -e .
 
       - name: Build docs site
+        # `--strict` would be ideal but is blocked by a pre-existing broken
+        # cross-link in training/index.md. Drop the comment + add strict
+        # after that link is fixed.
         run: mkdocs build
 
       - name: Upload Pages artifact
