@@ -21,21 +21,72 @@
     </a>
 </p>
 
-Warning: This is a research-level repository. It may contain bugs and is subject to continuous change without notice.
+**jNO** (jax Neural Operators) is a JAX-native library for training neural
+operators and physics-informed networks. It unifies data-driven operator
+regression, residual-based PINN training, mesh-aware FEM/variational
+PINNs, and foundation-model fine-tuning under one symbolic tracing
+language — write the PDE once, compile once, train, evaluate, and
+checkpoint without rewriting the surrounding code.
 
+> Status: research-level repository under active development. Public API
+> is stabilising but may change between minor versions.
 
-# Install
+## Why jNO?
 
-Quick install from PyPI:
+If you've used another PDE-learning framework, here's the honest
+positioning:
+
+- **vs DeepXDE** — DeepXDE is PyTorch-first with optional JAX/TensorFlow
+  backends; jNO is JAX-native end-to-end, so multi-device sharding,
+  `jit`/`vmap`/`scan`, and gradient checkpointing compose without
+  glue code.
+- **vs NVIDIA Modulus** — Modulus ships a turnkey training harness
+  optimised for industrial workflows; jNO is a programming-style
+  library: you build the problem as a Python expression and stay close
+  to the math.
+- **vs NeuralPDE.jl** — NeuralPDE is Julia-only. Pick jNO when your
+  research stack is already Python/JAX.
+
+What's specific to jNO: a tracing layer that lets the same expression
+serve as PDE residual, supervised loss, FEM weak form, or sensitivity
+diagnostic; built-in adaptive resampling (RAD/RARD/CR3); explainability
+callbacks (gradient-conflict, loss landscape) usable from a one-line
+hook.
+
+## Install
 
 ```bash
-pip install jax-neural-operators
+pip install "jax-neural-operators[fem]"
 ```
 
+GPU support is included by default (jNO depends on `jax[cuda]`). See
+[`docs/Installation.md`](docs/Installation.md) for Pixi, Docker, and
+specific-CUDA-version setups.
 
-Foundation models and other neural operators  are maintained in a separate repository ([foundax](https://github.com/FhG-IISB/foundax)) so they can also be used independently (foundax is installed automatically with this repository).
+Foundation models and other neural operator architectures live in a
+separate repository ([foundax](https://github.com/FhG-IISB/foundax)),
+installed automatically as a dependency so they can also be used on
+their own.
 
-# Example
+## Citation
+
+If you use jNO in academic work, please cite the
+[arXiv preprint](https://arxiv.org/abs/2605.10159) (and the specific
+version via the `Cite this repository` button on GitHub, which reads
+[`CITATION.cff`](CITATION.cff)):
+
+```bibtex
+@article{armbruster2026jno,
+  title   = {jNO: A JAX Library for Neural Operator and Foundation Model Training},
+  author  = {Armbruster, Leon and Ramesh, Rathan and Kruse, Georg and Straub, Christopher},
+  journal = {arXiv preprint arXiv:2605.10159},
+  year    = {2026},
+  doi     = {10.48550/arXiv.2605.10159},
+  url     = {https://arxiv.org/abs/2605.10159}
+}
+```
+
+## Example
 
 ```python
 import jno
