@@ -35,7 +35,6 @@ extra_javascript:
   - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
 
 not_in_nav: |
-  /index.md
   /Docker.md
   /Model-Controls.md
   /Training.md
@@ -47,8 +46,10 @@ not_in_nav: |
   /foundation_models/Foundation-Models.md
 
 nav:
-  - Home: Getting-Started.md
+  - Home: index.md
   - Installation: Installation.md
+  - Getting Started: Getting-Started.md
+  - Glossary: Glossary.md
   - Getting to Know jNO:
     - Domain and Geometry: Domain-and-Geometry.md
     - Operators:
