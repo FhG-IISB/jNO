@@ -2053,6 +2053,49 @@ class domain(MeshIOMixin):
 
         return tuple(coord_vars)
 
+    def normal(self, tag: str) -> tuple:
+        """Return per-component outward-normal Variables for a boundary tag.
+
+        Each Variable resolves to the outward unit normal component at the
+        boundary mesh nodes and is valid inside ``.integrate()`` expressions.
+
+        Returns a tuple of D Variables (one per spatial dimension):
+          - 1-D domain: ``(n,)``   — unpack as ``(n,) = domain.normal("right")``
+          - 2-D domain: ``(nx, ny)``
+          - 3-D domain: ``(nx, ny, nz)``
+
+        Example::
+
+            # 1-D flux integral
+            x_r, _ = domain.variable("right")
+            (n,) = domain.normal("right")
+            flux = (k * u.d(x_r) * n).integrate()
+
+            # 2-D divergence-theorem check
+            x_b, y_b, _ = domain.variable("boundary")
+            nx, ny = domain.normal("boundary")
+            flux = (u.d(x_b) * nx + u.d(y_b) * ny).integrate()
+        """
+        normals = getattr(self, "normals_by_tag", {}).get(tag)
+        if normals is None:
+            available = list(getattr(self, "normals_by_tag", {}).keys())
+            raise ValueError(
+                f"No outward normals available for tag '{tag}'. "
+                f"Available tags with normals: {available}. "
+                f"Make sure the domain uses an unstructured mesh "
+                f"(compute_mesh_connectivity=True)."
+            )
+        normals_np = np.asarray(normals)
+        D = normals_np.shape[-1]
+        normal_ctx_key = f"n_{tag}"
+        if normal_ctx_key not in self.context:
+            # Store with shape (1, 1, M, D) to match the (B, T, N, D) convention
+            # of other spatial context arrays.  The compiler will vmap over B=1
+            # correctly, and the evaluator's _eval_integral replaces this with
+            # the raw (M, D) array in the inner integral context.
+            self.context[normal_ctx_key] = normals_np[np.newaxis, np.newaxis, :, :]  # (1, 1, M, D)
+        return tuple(Variable(tag=normal_ctx_key, dim=[i, i + 1], domain=self) for i in range(D))
+
     def __getitem__(self, tag: str) -> Tuple[Variable, ...]:
         """Shorthand for domain.variable(tag).
 
