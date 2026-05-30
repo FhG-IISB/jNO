@@ -65,7 +65,8 @@ do = domain
 # without manual edits. The fallback covers running from a source checkout
 # without `pip install -e .`.
 try:
-    from importlib.metadata import PackageNotFoundError, version as _version
+    from importlib.metadata import PackageNotFoundError
+    from importlib.metadata import version as _version
 
     __version__ = _version("jax-neural-operators")
 except (ImportError, PackageNotFoundError):

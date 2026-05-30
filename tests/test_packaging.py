@@ -18,7 +18,6 @@ from pathlib import Path
 
 import pytest
 
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 CITATION = REPO_ROOT / "CITATION.cff"
@@ -57,8 +56,7 @@ def test_jno_version_matches_pyproject():
 def test_citation_version_matches_pyproject():
     """CITATION.cff version is kept in sync with the release number."""
     assert _citation_version() == _pyproject_version(), (
-        f"CITATION.cff version ({_citation_version()!r}) does not match "
-        f"pyproject.toml version ({_pyproject_version()!r})."
+        f"CITATION.cff version ({_citation_version()!r}) does not match pyproject.toml version ({_pyproject_version()!r})."
     )
 
 
@@ -74,17 +72,16 @@ def test_project_urls_are_sensible():
     assert "github.com/FhG-IISB" in source, source
     # Docs are deployed to https://fhg-iisb.github.io/jNO/ by docs-pages.yml.
     assert "fhg-iisb.github.io" in docs, docs
-    assert "jNO_docs" not in docs, (
-        f"Documentation URL still points at the legacy `jNO_docs` site: {docs}"
-    )
+    assert "jNO_docs" not in docs, f"Documentation URL still points at the legacy `jNO_docs` site: {docs}"
 
 
-@pytest.mark.parametrize("classifier", [
-    "Development Status :: 4 - Beta",
-    "Intended Audience :: Science/Research",
-])
+@pytest.mark.parametrize(
+    "classifier",
+    [
+        "Development Status :: 4 - Beta",
+        "Intended Audience :: Science/Research",
+    ],
+)
 def test_pypi_classifiers_present(classifier):
     classifiers = _read_pyproject()["project"]["classifiers"]
-    assert classifier in classifiers, (
-        f"Expected PyPI classifier {classifier!r} not found in pyproject.toml"
-    )
+    assert classifier in classifiers, f"Expected PyPI classifier {classifier!r} not found in pyproject.toml"
