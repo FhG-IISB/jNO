@@ -455,8 +455,14 @@ class TraceEvaluator:
             return _broadcast_temporal(result)
 
         else:
+            available = sorted(k for k in ctx.context.keys() if not k.startswith("__"))
             self.log.error(f"Variable tag '{tag}' not found. context: {list(ctx.context.keys())}")
-            raise KeyError(f"Variable tag '{tag}' not found in context")
+            raise KeyError(
+                f"Variable tag '{tag}' not found in evaluation context. "
+                f"Available tags: {available}. "
+                f"If this tag should exist, ensure you called domain.variable('{tag}') "
+                f"before constructing the expression (variable() triggers sampling)."
+            )
 
     def _eval_function_call(self, expr, ctx):
         args = [(self._dispatch(arg, ctx) if isinstance(arg, Placeholder) else arg) for arg in expr.args]

@@ -1968,8 +1968,20 @@ class domain(MeshIOMixin):
                 return Variable(tag=tag, dim=[0, None], domain=self)
 
         if tag not in self.context:
-            available = list(self.context.keys())
-            raise ValueError(f"Tag '{tag}' not found. Did you call sample() first? Available: {available}")
+            available = sorted(k for k in self.context.keys() if not k.startswith("__"))
+            mesh_keys = sorted(getattr(self, "_mesh_pool", {}).keys())
+            if tag in mesh_keys:
+                hint = (
+                    f"Tag '{tag}' exists in the mesh pool but has not been sampled yet. "
+                    f"Call domain.variable('{tag}', sample=(n, sampler)) to materialize it."
+                )
+            else:
+                hint = (
+                    f"Tag '{tag}' is not in the mesh pool or context. "
+                    f"Available context tags: {available}. "
+                    f"Available mesh-pool tags: {mesh_keys}."
+                )
+            raise ValueError(hint)
 
         fem_meta = None
         if getattr(self, "_variational_initialized", False):

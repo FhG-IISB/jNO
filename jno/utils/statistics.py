@@ -4,9 +4,50 @@ from .logger import get_logger
 
 
 class statistics:
+    """Training history returned by ``core.solve()``.
+
+    Access patterns::
+
+        history = crux.solve(...)
+        history.total_loss            # final scalar total loss
+        history.total_loss_history    # 1-D array of total loss per epoch
+        history.training_logs         # list of per-solve()-call dicts
+        history.training_logs[-1]["total_loss"]   # full array from last call
+        history.plot("./runs/loss.png")           # quick visualization
+        history.summary()                          # printed run summary
+    """
+
     def __init__(self, logs):
         self.training_logs = logs
         self.log = get_logger()
+
+    @property
+    def total_loss(self):
+        """Final scalar total loss (last value across all solve() calls).
+
+        Returns ``None`` when no training has been recorded.
+        """
+        for log_dict in reversed(self.training_logs or []):
+            arr = log_dict.get("total_loss")
+            if arr is None:
+                continue
+            arr = np.asarray(arr)
+            if arr.size > 0:
+                return float(arr.flatten()[-1])
+        return None
+
+    @property
+    def total_loss_history(self) -> np.ndarray:
+        """1-D array of total loss concatenated across all solve() calls."""
+        chunks = []
+        for log_dict in self.training_logs or []:
+            arr = log_dict.get("total_loss")
+            if arr is None:
+                continue
+            arr = np.asarray(arr).flatten()
+            if arr.size > 0:
+                chunks.append(arr)
+        return np.concatenate(chunks) if chunks else np.array([])
 
     def plot(self, path: str = None):
         """Plot training statistics from all solve() calls.
