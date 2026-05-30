@@ -1061,3 +1061,9 @@ class TestBoundaryNormal:
             f"Divergence theorem 2-D: ∫Δu={float(vol_s):.4f}, ∫∇u·n={float(flux_s):.4f}"
         )
 
+    def test_normals_true_on_interior_raises(self):
+        """normals=True on a non-boundary tag should raise ValueError, not IndexError."""
+        dom = self._make_2d_domain()
+        with pytest.raises(ValueError, match="no outward normals found for tag 'interior'"):
+            dom.variable("interior", normals=True)
+
