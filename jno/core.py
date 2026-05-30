@@ -34,6 +34,8 @@ from .trace import (
     Choice,
     FunctionCall,
     Hessian,
+    Integral,
+    IntegralTime,
     Jacobian,
     Model,
     OperationCall,
@@ -1010,6 +1012,31 @@ class core:
                 "accumulation_steps > 1 has no effect with full-batch training; falling back to accumulation_steps=1"
             )
             accumulation_steps = 1
+
+        # Guard: IntegralTime requires min_consecutive >= 2
+        def _has_integral_time(node):
+            if isinstance(node, IntegralTime):
+                return True
+            for attr in ("target", "left", "right", "expr"):
+                child = getattr(node, attr, None)
+                if isinstance(child, Placeholder) and _has_integral_time(child):
+                    return True
+            for attr in ("args", "variables"):
+                for child in getattr(node, attr, []):
+                    if isinstance(child, Placeholder) and _has_integral_time(child):
+                        return True
+            return False
+
+        if min_consecutive is not None and min_consecutive < 2:
+            for expr in getattr(self, "_constraint_exprs", []):
+                if _has_integral_time(expr):
+                    raise ValueError(
+                        f"IntegralTime (.integrate(t)) requires min_consecutive >= 2 "
+                        f"(trapezoidal integration over a single time step is identically zero). "
+                        f"Got min_consecutive={min_consecutive} (the default is 1). "
+                        f"Pass min_consecutive=None to use all T time steps, "
+                        f"or min_consecutive=2 for the minimum valid windowed integration."
+                    )
 
         # Adaptive resampling metadata
         strategies = getattr(self.domain, "_resampling_strategies", {})
