@@ -10,11 +10,23 @@ Requires Python 3.11–3.13.
 pip install "jax-neural-operators[fem]"
 ```
 
-Add `cuda` for GPU support:
+GPU support is included by default — `jax-neural-operators` depends on
+`jax[cuda]>=0.10.1,<0.11`, so a standard `pip install` already pulls a
+CUDA-capable JAX wheel. The pin is tight on purpose: jNO tracks a single
+JAX minor version per release to avoid silently breaking on JAX API
+changes.
+
+If you need a specific CUDA toolkit version, install JAX from its own
+package index *before* installing jNO:
 
 ```bash
-pip install "jax-neural-operators[fem,cuda]"
+# CUDA 12 example
+pip install --upgrade "jax[cuda12]>=0.10.1,<0.11"
+pip install "jax-neural-operators[fem]"
 ```
+
+To pin a different JAX version locally for an experiment, see the
+[JAX install matrix](https://jax.readthedocs.io/en/latest/installation.html).
 
 ---
 

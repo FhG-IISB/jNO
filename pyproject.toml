@@ -11,9 +11,20 @@ requires-python = ">=3.11, <3.14"
 authors = [{ name = "Leon Armbruster", email = "leon.armbruster@iisb.fraunhofer.de" }]
 license = "EPL-2.0"
 classifiers = [
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Scientific/Engineering :: Mathematics",
+    "Topic :: Scientific/Engineering :: Physics",
 ]
+# License is expressed via the SPDX `license` field above (PEP 639);
+# do not duplicate it as a classifier — modern setuptools rejects that.
 
 dependencies = [
     "jax[cuda]>=0.10.1,<0.11",
@@ -33,12 +44,15 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/FhG-IISB/jno"
-Documentation = "https://fhg-iisb.github.io/jNO_docs/"
+Documentation = "https://fhg-iisb.github.io/jNO/"
 Source = "https://github.com/FhG-IISB/jno"
 Issues = "https://github.com/FhG-IISB/jno/issues"
 
 [project.optional-dependencies]
-cuda = ["jax[cuda]>=0.4.30"]
+# `cuda` is intentionally *not* a separate extra: the core `jax[cuda]`
+# constraint above already covers GPU installs. If you need to override
+# the JAX wheel for a specific CUDA version, install JAX from its own
+# index (see docs/Installation.md).
 
 fem = [
     "feax>=0.5.1",
@@ -123,8 +137,10 @@ jax-cuda12-plugin = { version = ">=0.10.1,<0.11", extras = ["with-cuda"] }
 paramax = ">=0.0.5"
 
 [tool.pixi.environments]
+# The default environment already includes a CUDA-capable JAX wheel via
+# the core `jax[cuda]` dependency and the `jax-cuda12-plugin` pypi entry
+# below — no separate `cuda` environment is needed.
 default = { solve-group = "default" }
-cuda = { features = ["cuda"], solve-group = "default" }
 dev = { features = ["dev"], solve-group = "default" }
 fem = { features = ["fem"], solve-group = "default" }
 iree = { features = ["iree"], solve-group = "default" }
