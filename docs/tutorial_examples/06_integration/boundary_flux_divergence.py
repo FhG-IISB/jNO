@@ -1,4 +1,4 @@
-"""06 — Boundary flux integrals via domain.normal() (divergence theorem)
+"""06 — Boundary flux integrals and the divergence theorem
 
 Problem
 -------
@@ -13,20 +13,21 @@ Divergence theorem check
 ------------------------
     ∫_∂Ω ∇u · n dS  =  ∫_Ω Δu dΩ  =  −2π² · 4/π²  =  −8
 
-Boundary normals are accessed via ``domain.normal(tag)``, which returns one
-Variable per spatial dimension.  Each Variable resolves to the outward unit
-normal component at boundary mesh nodes and is valid inside ``.integrate()``:
+Outward normal Variables are obtained by passing ``normals=True`` to
+``domain.variable()``.  The extra returned Variables are one per spatial
+dimension and resolve to the outward unit normal components at the boundary
+mesh nodes.  They are valid inside any ``.integrate()`` expression:
 
-    nx, ny = domain.normal("boundary")
+    x_b, y_b, _, nx, ny = domain.variable("boundary", normals=True)
     flux = (u.d(x_b) * nx + u.d(y_b) * ny).integrate()   # ∫_∂Ω ∇u · n dS
 
 This is the 2-D analogue of the 1-D endpoint formula u'(1) − u'(0).
 
 API demonstrated
 ----------------
-    domain.normal(tag)   — returns D outward-normal Variables for boundary
-                           ``tag``.  Works for any tag with precomputed normals
-                           (requires ``compute_mesh_connectivity=True``).
+    domain.variable(tag, normals=True)   — returns coordinate Variables followed
+                                           by D outward-normal Variables.  Requires
+                                           ``compute_mesh_connectivity=True``.
 """
 
 from pathlib import Path
@@ -45,13 +46,9 @@ from jno import LearningRateSchedule as lrs
 domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05), compute_mesh_connectivity=True)
 
 x, y, _ = domain.variable("interior")
-x_b, y_b, _ = domain.variable("boundary")
+# normals=True appends per-component outward-normal Variables after the spatial ones.
+x_b, y_b, _, nx, ny = domain.variable("boundary", normals=True)
 domain.summary()
-
-# ── Outward normals on the full boundary ──────────────────────────────────────
-# Returns (nx, ny): one Variable per spatial dimension.  Each Variable
-# evaluates to the outward unit normal component at boundary mesh nodes.
-nx, ny = domain.normal("boundary")
 
 # ── Analytical values ─────────────────────────────────────────────────────────
 forcing = 2 * π**2 * jno.np.sin(π * x) * jno.np.sin(π * y)

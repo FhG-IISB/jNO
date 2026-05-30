@@ -978,10 +978,10 @@ class TestIntegralTimeIntegration:
 
 
 # ======================================================================
-# domain.normal(tag) — boundary normal Variables for flux integrals
+# normals=True — boundary normal Variables for flux integrals
 # ======================================================================
 class TestBoundaryNormal:
-    """Tests for domain.normal(tag) and boundary flux integrals."""
+    """Tests for domain.variable(normals=True) and boundary flux integrals."""
 
     def _make_2d_domain(self):
         import jno
@@ -993,34 +993,24 @@ class TestBoundaryNormal:
 
         return jno.domain.line(mesh_size=0.01)
 
-    def test_normal_returns_tuple_length_matches_dimension(self):
-        """2-D mesh: domain.normal() returns exactly 2 Variables."""
+    def test_normals_true_2d_returns_extra_vars(self):
+        """2-D mesh: variable(normals=True) returns 5 Variables (x, y, t, nx, ny)."""
         dom = self._make_2d_domain()
-        result = dom.normal("boundary")
-        assert isinstance(result, tuple)
-        assert len(result) == 2
+        result = dom.variable("boundary", normals=True)
+        assert len(result) == 5  # x, y, t, nx, ny
 
-    def test_normal_1d_returns_length_one_tuple(self):
-        """1-D mesh: domain.normal() returns a 1-tuple."""
+    def test_normals_true_1d_returns_extra_var(self):
+        """1-D mesh: variable(normals=True) returns 3 Variables (x, t, n)."""
         dom = self._make_1d_domain()
-        result = dom.normal("right")
-        assert isinstance(result, tuple)
-        assert len(result) == 1
-
-    def test_normal_unknown_tag_raises(self):
-        """domain.normal() for a tag without normals raises ValueError."""
-        dom = self._make_2d_domain()
-        with pytest.raises(ValueError, match="No outward normals"):
-            dom.normal("nonexistent_tag")
+        result = dom.variable("right", normals=True)
+        assert len(result) == 3  # x, t, n
 
     def test_normal_sign_right_is_positive(self):
         """The outward normal at the right boundary (x=1) is +1."""
         import jno
 
         dom = self._make_1d_domain()
-        x, _ = dom.variable("right")
-        (n,) = dom.normal("right")
-        # n itself integrated gives the sum of outward normals × weights; sign must be +
+        x, _, n = dom.variable("right", normals=True)
         flux = n.integrate()
         (val,) = jno.core([], dom).eval([flux], domain=dom)
         assert float(val) > 0, f"Right normal should be positive, got {float(val):.4f}"
@@ -1030,8 +1020,7 @@ class TestBoundaryNormal:
         import jno
 
         dom = self._make_1d_domain()
-        x, _ = dom.variable("left")
-        (n,) = dom.normal("left")
+        x, _, n = dom.variable("left", normals=True)
         flux = n.integrate()
         (val,) = jno.core([], dom).eval([flux], domain=dom)
         assert float(val) < 0, f"Left normal should be negative, got {float(val):.4f}"
@@ -1041,10 +1030,8 @@ class TestBoundaryNormal:
         import jno
 
         dom = self._make_1d_domain()
-        x_r, _ = dom.variable("right")
-        x_l, _ = dom.variable("left")
-        (nr,) = dom.normal("right")
-        (nl,) = dom.normal("left")
+        _, _, nr = dom.variable("right", normals=True)
+        _, _, nl = dom.variable("left", normals=True)
         (vr,) = jno.core([], dom).eval([nr.integrate()], domain=dom)
         (vl,) = jno.core([], dom).eval([nl.integrate()], domain=dom)
         assert float(vr) > 0 and float(vl) < 0
@@ -1058,8 +1045,7 @@ class TestBoundaryNormal:
 
         dom = self._make_2d_domain()
         x, y, _ = dom.variable("interior")
-        x_b, y_b, _ = dom.variable("boundary")
-        nx, ny = dom.normal("boundary")
+        x_b, y_b, _, nx, ny = dom.variable("boundary", normals=True)
 
         u_int = jno.np.sin(jno.np.pi * x) * jno.np.sin(jno.np.pi * y)
         u_bnd = jno.np.sin(jno.np.pi * x_b) * jno.np.sin(jno.np.pi * y_b)
@@ -1069,7 +1055,6 @@ class TestBoundaryNormal:
 
         crux = jno.core([], dom)
         vol_val, flux_val = crux.eval([vol, flux], domain=dom)
-        # Results have a leading batch dimension (1,); squeeze to scalar for comparison.
         vol_s = jnp.squeeze(vol_val)
         flux_s = jnp.squeeze(flux_val)
         assert jnp.allclose(vol_s, flux_s, rtol=0.05), (
