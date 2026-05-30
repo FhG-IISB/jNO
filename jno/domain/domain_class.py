@@ -1692,10 +1692,17 @@ class domain(MeshIOMixin):
                     self.tag_indices[name] = indices_list
                     self._mesh_pool[name] = points[indices_list]
 
-                    normal_positions = np.array([index_to_normal_pos[i] for i in indices_list if i in index_to_normal_pos])
-                    if len(normal_positions) > 0:
+                    # Only attach per-point normals when every point in this tag
+                    # has one — otherwise the tag mixes boundary and interior
+                    # points (e.g. the gmsh "interior" surface tag includes the
+                    # boundary nodes too), and storing a partial normal array
+                    # creates a shape mismatch against _mesh_pool[name].
+                    normal_positions = np.array(
+                        [index_to_normal_pos[i] for i in indices_list if i in index_to_normal_pos]
+                    )
+                    if len(normal_positions) == len(indices_list) and len(indices_list) > 0:
                         self.normals_by_tag[name] = boundary_normals[normal_positions]
-                    else:
+                    elif len(normal_positions) == 0:
                         tag_pt_coords = points[indices_list, : self.dimension]
                         if len(tag_pt_coords) > 1:
                             tag_normals, _ = self._compute_normals_pca(
@@ -2002,7 +2009,7 @@ class domain(MeshIOMixin):
         if view_factor and hasattr(self, "mesh_connectivity"):
             # Only take the first batch index
             Nrm = -self.context[f"n_{tag}"][0, ...]  # Reverse the normals
-            P = points[0, ...]
+            P = self.context[tag][0, ...]
 
             ds = self.mesh_connectivity["nodal_ds"][self.mesh_connectivity["boundary_indices"]]
 
@@ -2039,10 +2046,15 @@ class domain(MeshIOMixin):
 
             if self.dimension == 1:
                 VF = self.get_view_factor_1d(P[0], subset_VM, Nrm[0], ds)
-            if self.dimension == 2:
+            elif self.dimension == 2:
                 VF = self.get_view_factor_2d(P[0], subset_VM, Nrm[0], ds)
             elif self.dimension == 3:
                 VF = self.get_view_factor_3d(P[0], subset_VM, Nrm[0], ds)
+            else:
+                raise ValueError(
+                    f"view_factor=True is only supported for spatial dimension 1, 2, or 3 "
+                    f"(got dimension={self.dimension})."
+                )
 
             # TODO: Fix if used for multiple domains !
             self.context[f"v_{tag}"] = subset_VM[None, None, ...]
