@@ -43,8 +43,8 @@ from jno import LearningRateSchedule as lrs
 π = jno.np.pi
 
 # ── Physical parameters ───────────────────────────────────────────────────────
-α = 0.1   # thermal diffusivity
-T = 0.5   # final time
+α = 0.1  # thermal diffusivity
+T = 0.5  # final time
 N_t = 10  # number of time steps (must be ≥ 2 when using .integrate(t))
 
 # ── Domain ────────────────────────────────────────────────────────────────────
@@ -100,20 +100,14 @@ print(f"Pointwise rel. L2 error: {rel_l2:.4e}   (exact: u = e^(-αλt) sin(πx))
 # Evaluate the time-mean field explicitly via .integrate(t).
 # Pass min_consecutive=None so the full time window is used.
 u_mean_pred, u_mean_ref = crux.eval([u_mean, u_mean_exact], min_consecutive=None)
-rel_l2_mean = float(
-    jnp.linalg.norm(u_mean_pred - u_mean_ref) / (jnp.linalg.norm(u_mean_ref) + 1e-8)
-)
-print(
-    f"Heat-dose    rel. L2 error: {rel_l2_mean:.4e}"
-    f"   (exact: ū = sin(πx) · {heat_dose_coeff:.4f})"
-)
+rel_l2_mean = float(jnp.linalg.norm(u_mean_pred - u_mean_ref) / (jnp.linalg.norm(u_mean_ref) + 1e-8))
+print(f"Heat-dose    rel. L2 error: {rel_l2_mean:.4e}   (exact: ū = sin(πx) · {heat_dose_coeff:.4f})")
 
 # ── Record result ─────────────────────────────────────────────────────────────
 results_file = Path(__file__).parent.parent.parent / "tutorial_results.txt"
 with open(results_file, "a") as f_out:
     f_out.write(
-        f"06_integration/heat_time_mean.py | epochs={EPOCHS}"
-        f" | rel_L2_u={rel_l2:.6e} | rel_L2_mean={rel_l2_mean:.6e}\n"
+        f"06_integration/heat_time_mean.py | epochs={EPOCHS} | rel_L2_u={rel_l2:.6e} | rel_L2_mean={rel_l2_mean:.6e}\n"
     )
 
 assert rel_l2 < 0.1, f"Pointwise rel. L2 error too large: {rel_l2:.3e}"

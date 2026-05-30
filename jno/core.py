@@ -34,7 +34,6 @@ from .trace import (
     Choice,
     FunctionCall,
     Hessian,
-    Integral,
     IntegralTime,
     Jacobian,
     Model,
@@ -1049,6 +1048,13 @@ class core:
         from contextlib import nullcontext
 
         from jax._src import profiler as _jax_profiler
+
+        if not self.constraints:
+            raise ValueError(
+                "solve() requires at least one constraint. "
+                "Pass a non-empty list to jno.core([...], domain) — typically a "
+                "PDE residual .mse, a boundary-condition loss, or a data-fitting term."
+            )
 
         _profiling = _jax_profiler._profile_state.profile_session is not None
         _trace = jax.profiler.TraceAnnotation if _profiling else lambda name, **_: nullcontext()
@@ -2138,7 +2144,7 @@ class core:
                         except (IndexError, KeyError, AttributeError):
                             try:
                                 _lr = float(jax.device_get(_wst[0].inner_state[-1].hyperparams["step_size"]))
-                            except Exception:
+                            except (IndexError, KeyError, AttributeError, TypeError):
                                 _lr = None
                         if _lr is not None:
                             _model_name = _wandb_model_names.get(_wk, _wk)

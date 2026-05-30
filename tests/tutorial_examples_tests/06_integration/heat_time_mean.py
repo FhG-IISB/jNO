@@ -69,7 +69,5 @@ assert rel_l2 < 0.05, f"Pointwise rel. L2 error too large: {rel_l2:.3e}"
 
 # ── Evaluate time-mean field against analytic formula ─────────────────────────
 u_mean_pred, u_mean_ref = crux.eval([u_mean, u_mean_exact], min_consecutive=None)
-rel_l2_mean = float(
-    jnp.linalg.norm(u_mean_pred - u_mean_ref) / (jnp.linalg.norm(u_mean_ref) + 1e-8)
-)
+rel_l2_mean = float(jnp.linalg.norm(u_mean_pred - u_mean_ref) / (jnp.linalg.norm(u_mean_ref) + 1e-8))
 assert rel_l2_mean < 0.05, f"Time-mean rel. L2 error too large: {rel_l2_mean:.3e}"
