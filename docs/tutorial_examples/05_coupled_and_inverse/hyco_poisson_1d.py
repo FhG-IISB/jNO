@@ -62,9 +62,8 @@ x, _ = domain.variable("interior")
 x_sen = np.linspace(0.1, 0.9, 7).reshape(-1, 1)
 u_sen = np.sin(np.pi * x_sen) + rng.normal(0, 0.05, x_sen.shape)
 
-# Attach sensor coordinates to the same domain as a named point set
-domain.add_points("sensors", x_sen)
-x_s, _ = domain.variable("sensors")
+# Register sensor coordinates on the same domain as a named point set
+(x_s,) = domain.variable("sensors", sample=x_sen, split=True, point_data=True)
 
 # ── Networks ──────────────────────────────────────────────────────────────────
 key = jax.random.PRNGKey(0)
