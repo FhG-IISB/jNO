@@ -37,10 +37,6 @@ Please include:
    and any relevant JAX / hardware details.
 4. Whether you would like to be credited and how.
 
-We aim to acknowledge reports within 5 business days, share a
-remediation plan within 14 days, and ship a fix in the next minor
-release. For severe issues we may publish a patch release sooner.
-
 ## Scope
 
 The most security-relevant surface in jNO is:
