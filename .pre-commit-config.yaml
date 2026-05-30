@@ -1,0 +1,33 @@
+# Pre-commit hooks for jNO.
+#
+# Install once per checkout:
+#   pixi run pre-commit install
+#
+# Hooks run automatically on `git commit`. To run them on every file
+# in the repo (e.g. after upgrading the config), use:
+#   pixi run pre-commit run --all-files
+#
+# Ruff version is pinned to the same minor as the pixi `ruff>=0.9.0`
+# constraint to avoid local-vs-CI formatting drift.
+
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.6
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: \.md$         # let markdown linters handle MD-specific rules
+      - id: end-of-file-fixer
+        exclude: \.svg$|^assets/|pixi\.lock$
+      - id: check-yaml
+        args: [--allow-multiple-documents]
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: [--maxkb=512]
