@@ -9,6 +9,9 @@
     <a href="https://github.com/FhG-IISB/jno/actions/workflows/ci.yml">
         <img src="https://img.shields.io/github/actions/workflow/status/FhG-IISB/jno/ci.yml?branch=main&style=for-the-badge&label=tests" alt="Tests"/>
     </a>
+    <a href="https://codecov.io/gh/FhG-IISB/jno">
+        <img src="https://img.shields.io/codecov/c/github/FhG-IISB/jno/main?style=for-the-badge&label=coverage" alt="Coverage"/>
+    </a>
     <a href="LICENSE">
         <img src="https://img.shields.io/badge/license-EPL--2.0-2ea44f?style=for-the-badge" alt="License"/>
     </a>
@@ -21,21 +24,50 @@
     </a>
 </p>
 
-Warning: This is a research-level repository. It may contain bugs and is subject to continuous change without notice.
+**jNO** (jax Neural Operators) is a JAX-native library for training neural
+operators and physics-informed networks. It unifies data-driven operator
+regression, residual-based PINN training, mesh-aware FEM/variational
+PINNs, and foundation-model fine-tuning under one symbolic tracing
+language — write the PDE once, compile once, train, evaluate, and
+checkpoint without rewriting the surrounding code.
 
+> Status: research-level repository under active development. Public API
+> is stabilising but may change between minor versions.
 
-# Install
-
-Quick install from PyPI:
+## Install
 
 ```bash
-pip install jax-neural-operators
+pip install "jax-neural-operators[fem]"
 ```
 
+GPU support is included by default (jNO depends on `jax[cuda]`). See
+[`docs/Installation.md`](docs/Installation.md) for Pixi, Docker, and
+specific-CUDA-version setups.
 
-Foundation models and other neural operators  are maintained in a separate repository ([foundax](https://github.com/FhG-IISB/foundax)) so they can also be used independently (foundax is installed automatically with this repository).
+Foundation models and other neural operator architectures live in a
+separate repository ([foundax](https://github.com/FhG-IISB/foundax)),
+installed automatically as a dependency so they can also be used on
+their own.
 
-# Example
+## Citation
+
+If you use jNO in academic work, please cite the
+[arXiv preprint](https://arxiv.org/abs/2605.10159) (and the specific
+version via the `Cite this repository` button on GitHub, which reads
+[`CITATION.cff`](CITATION.cff)):
+
+```bibtex
+@article{armbruster2026jno,
+  title   = {jNO: A JAX Library for Neural Operator and Foundation Model Training},
+  author  = {Armbruster, Leon and Ramesh, Rathan and Kruse, Georg and Straub, Christopher},
+  journal = {arXiv preprint arXiv:2605.10159},
+  year    = {2026},
+  doi     = {10.48550/arXiv.2605.10159},
+  url     = {https://arxiv.org/abs/2605.10159}
+}
+```
+
+## Example
 
 ```python
 import jno

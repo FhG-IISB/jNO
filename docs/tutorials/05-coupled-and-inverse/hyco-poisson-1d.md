@@ -62,19 +62,18 @@ $$u'' + \pi^2 \sin(\pi x) = 0, \qquad u(0) = u(1) = 0, \qquad u(x) = \sin(\pi x)
 
 ### Domains
 
-A single combined domain carries both point sets as named tags:
+A standard line domain provides the collocation points. Sensor coordinates are registered on the same domain object by passing the array directly to `variable`:
 
 ```python
-# Dense collocation points — PDE residual + interaction
-x_col = np.linspace(0, 1, 51)[1:-1].reshape(-1, 1)
+# Dense collocation grid — PDE residual + interaction
+domain = jno.domain(constructor=jno.domain.line(mesh_size=0.02))
+x, _ = domain.variable("interior")
 
-# Sparse noisy sensors
+# Sparse noisy sensors — registered on the same domain
 x_sen = np.linspace(0.1, 0.9, 7).reshape(-1, 1)
 u_sen = np.sin(np.pi * x_sen) + rng.normal(0, 0.05, x_sen.shape)
 
-domain = jno.domain.from_array({"interior": x_col, "obs": x_sen})
-x,   _ = domain.variable("interior")
-x_s, _ = domain.variable("obs")
+(x_s,) = domain.variable("sensors", sample=x_sen, split=True, point_data=True)
 ```
 
 ### Networks
