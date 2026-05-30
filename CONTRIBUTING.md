@@ -20,7 +20,30 @@ pixi install
 
 That's it — no manual conda/pip steps needed.
 
-## Pre-Commit Checklist
+## Pre-commit hooks (recommended)
+
+Install the git pre-commit hooks once per checkout. They run `ruff
+format`, `ruff check --fix`, and a handful of housekeeping checks
+(trailing whitespace, large files, YAML/TOML validity) on every commit:
+
+```bash
+pixi run pre-commit install
+```
+
+After installation, every `git commit` will auto-format and lint the
+files you're about to commit. If a hook modifies a file, the commit is
+aborted — re-stage and commit again.
+
+You can run all hooks against the entire repo manually:
+
+```bash
+pixi run pre-commit run --all-files
+```
+
+The hooks pin the same ruff version as the CI pixi environment, so
+local and CI behaviour stay aligned.
+
+## Pre-PR Checklist
 
 Before submitting code or pushing changes, run the following checks locally using the pixi tasks defined in `pyproject.toml`.
 
