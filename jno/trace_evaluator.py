@@ -16,6 +16,7 @@ from .trace import (
     GroupedAssembly,
     Hessian,
     Integral,
+    IntegralTime,
     Jacobian,
     Literal,
     ModelCall,
@@ -297,6 +298,7 @@ class TraceEvaluator:
         (Jacobian, "_eval_jacobian"),
         (Hessian, "_eval_hessian"),
         (Integral, "_eval_integral"),
+        (IntegralTime, "_eval_integral_time"),
         (OperationDef, "_eval_operation_def"),
         (TestFunction, "_eval_test_function"),
         (Assembly, "_eval_assembly"),
@@ -1540,6 +1542,47 @@ class TraceEvaluator:
             )
 
         return jnp.sum(u_full * weights)
+
+    def _eval_integral_time(self, expr: "IntegralTime", ctx):
+        """Trapezoidal time integral over the current window.
+
+        Reads ``context["__time_window__"]`` (shape ``(W, 1)``) injected by the
+        compiler's ``eval_window`` into ``passive_ctx`` before the per-step vmap.
+        Evaluates ``expr.target`` at each of the W time values with the current
+        spatial context, applies trapezoidal weights, and reduces over the time
+        axis.
+
+        Requires ``W >= 2`` — the solve()-level guard ensures this when
+        ``min_consecutive < 2`` is passed with an ``IntegralTime`` constraint.
+        """
+        time_window_key = "__time_window__"
+        if time_window_key not in ctx.context:
+            raise RuntimeError(
+                "IntegralTime: '__time_window__' not found in context. "
+                "This key should be injected by the compiler before the per-step vmap. "
+                "Ensure you are using a time-dependent domain and solve() with min_consecutive >= 2."
+            )
+
+        time_window = jnp.asarray(ctx.context[time_window_key])  # (W, 1)
+        t_vals = time_window[:, 0]  # (W,)
+
+        # Trapezoidal weights: w[0] = dt0/2, w[i] = (dt_{i-1} + dt_i)/2, w[-1] = dt_{W-2}/2
+        dt = jnp.diff(t_vals)  # (W-1,)
+        w = jnp.zeros_like(t_vals)
+        w = w.at[:-1].add(dt / 2)
+        w = w.at[1:].add(dt / 2)
+
+        def eval_at_t(t_i):
+            new_ctx_dict = dict(ctx.context)
+            new_ctx_dict["__time__"] = t_i[jnp.newaxis]  # (1,) to match single-step context
+            new_ctx = self._EvalCtx(new_ctx_dict, ctx.var_bindings, ctx.key, ctx.active_region)
+            return self._dispatch(expr.target, new_ctx)
+
+        results = jax.vmap(eval_at_t)(t_vals)  # (W, *inner_shape)
+
+        # Broadcast w to match results shape and sum over time axis
+        w_idx = (slice(None),) + (None,) * (results.ndim - 1)
+        return jnp.sum(results * w[w_idx], axis=0)
 
     @staticmethod
     def _get_integral_cache(domain, tag: str, mc: dict) -> dict:

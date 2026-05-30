@@ -39,6 +39,8 @@ __all__ = [
     "OperationDef",
     "OperationCall",
     "Hessian",
+    "Integral",
+    "IntegralTime",
     "Jacobian",
     "NetworkGradient",
     "Noise",
@@ -450,15 +452,15 @@ class Placeholder:
     # Integration — method-style API
     # ------------------------------------------------------------------
 
-    def integrate(self, var: "Variable | None" = None) -> "Integral":
-        """Integrate this expression over its mesh domain region.
+    def integrate(self, var: "Variable | None" = None) -> "Integral | IntegralTime":
+        """Integrate this expression over its mesh domain region or over time.
 
-        **Scalar integral** (``var=None``, default):
+        **Spatial scalar integral** (``var=None``, default):
         The region (boundary vs volume) is auto-detected from the Variable
         tags inside the expression.  The expression is evaluated at all mesh
         nodes and reduced to a scalar via a weighted sum.
 
-        **Vectorized integral** (``var=x`` — the outer/collocation variable):
+        **Vectorized spatial integral** (``var=x`` — the outer/collocation variable):
         When the expression contains two distinct Variable objects from the
         same mesh (e.g. an outer collocation variable ``x`` and an inner
         dummy ``t``), pass the outer one as ``var``.  The integral is then
@@ -470,7 +472,23 @@ class Placeholder:
             x, _ = domain.variable("interior")   # outer (collocation)
             t, _ = domain.variable("interior")   # inner (dummy) — no flag needed
             integral = (K(x, t) * net(t)).integrate(var=x)
+
+        **Temporal integral** (``var=t`` — the temporal Variable):
+        When a temporal Variable (``axis='temporal'``) is passed, the integral
+        is computed over the time window visible in the current forward pass
+        using the trapezoidal rule::
+
+            x, t = domain.variable("interior")
+            loss = (u_net(x, t).integrate(t) - target).mse
+
+        Requires ``min_consecutive >= 2`` in ``solve()`` (trapezoidal integration
+        over a single point is identically zero — a silent wrong answer).
+        Chain with spatial integration for space-time integrals::
+
+            space_time_integral = u_net(x, t).integrate().integrate(t)
         """
+        if var is not None and getattr(var, "axis", None) == "temporal":
+            return IntegralTime(self, time_var=var)
         return Integral(self, integration_var=var)
 
     def grad(self, model: "Model") -> "NetworkGradient":
@@ -1973,6 +1991,29 @@ class Integral(Placeholder):
         return f"Integral({self.target})"
 
 
+class IntegralTime(Placeholder):
+    """Trapezoidal time integral of an expression over the current time window.
+
+    Created by :meth:`Placeholder.integrate` when passed a temporal Variable.
+    At evaluation time the handler reads ``context["__time_window__"]`` (shape
+    ``(W, 1)``) injected by the compiler before the per-step vmap, evaluates
+    ``target`` at each of the W time values with the current spatial context,
+    applies trapezoidal weights, and sums to return the integral.
+
+    Chain with a spatial :class:`Integral` for space-time integrals::
+
+        u.integrate().integrate(t)   # ∫∫ u dΩ dt
+    """
+
+    def __init__(self, target: "Placeholder", time_var: "Variable"):
+        self.target = target
+        self.time_var = time_var
+        _propagate_weak(self, target)
+
+    def __repr__(self):
+        return f"IntegralTime({self.target})"
+
+
 class NetworkGradient(Placeholder):
     """Per-point Jacobian of an expression w.r.t. a model's trainable parameters.
 
@@ -2473,6 +2514,8 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
                 visit(v)
         elif isinstance(node, NetworkGradient):
             visit(node.target)
+        elif isinstance(node, (Integral, IntegralTime)):
+            visit(node.target)
         elif isinstance(node, Tracker):
             visit(node.expr)
         elif isinstance(node, Assembly):
@@ -2529,6 +2572,8 @@ def collect_tags(expr: Placeholder) -> set:
             for v in node.variables:
                 visit(v)
         elif isinstance(node, NetworkGradient):
+            visit(node.target)
+        elif isinstance(node, (Integral, IntegralTime)):
             visit(node.target)
         elif isinstance(node, Tracker):
             visit(node.expr)
