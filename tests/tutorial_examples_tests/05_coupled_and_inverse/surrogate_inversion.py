@@ -13,8 +13,7 @@ from pathlib import Path
 
 def test_surrogate_inversion():
     script = (
-        Path(__file__).parent.parent.parent.parent
-        / "docs/tutorial_examples/05_coupled_and_inverse/surrogate_inversion.py"
+        Path(__file__).parent.parent.parent.parent / "docs/tutorial_examples/05_coupled_and_inverse/surrogate_inversion.py"
     )
     result = subprocess.run(
         [sys.executable, str(script)],
@@ -22,6 +21,4 @@ def test_surrogate_inversion():
         text=True,
         timeout=300,
     )
-    assert result.returncode == 0, (
-        f"surrogate_inversion.py failed:\n{result.stdout}\n{result.stderr}"
-    )
+    assert result.returncode == 0, f"surrogate_inversion.py failed:\n{result.stdout}\n{result.stderr}"
