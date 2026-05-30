@@ -1520,7 +1520,7 @@ class TraceEvaluator:
         new_ctx_dict[tag] = all_region_pts
         if raw_tag != tag:
             new_ctx_dict[raw_tag] = new_ctx_dict.get(raw_tag, all_region_pts)
-        if normal_tag in ctx.context and is_boundary and cached["normals"] is not None:
+        if is_boundary and cached["normals"] is not None:
             new_ctx_dict[normal_tag] = jnp.array(cached["normals"])
 
         new_ctx = self._EvalCtx(

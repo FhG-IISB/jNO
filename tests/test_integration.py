@@ -975,3 +975,103 @@ class TestIntegralTimeIntegration:
         u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
         stats = solver.solve(epochs=5, min_consecutive=2)
         assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
+
+
+# ======================================================================
+# domain.normal(tag) — boundary normal Variables for flux integrals
+# ======================================================================
+class TestBoundaryNormal:
+    """Tests for domain.normal(tag) and boundary flux integrals."""
+
+    def _make_2d_domain(self):
+        import jno
+
+        return jno.domain(constructor=jno.domain.rect(mesh_size=0.1), compute_mesh_connectivity=True)
+
+    def _make_1d_domain(self):
+        import jno
+
+        return jno.domain.line(mesh_size=0.01)
+
+    def test_normal_returns_tuple_length_matches_dimension(self):
+        """2-D mesh: domain.normal() returns exactly 2 Variables."""
+        dom = self._make_2d_domain()
+        result = dom.normal("boundary")
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+
+    def test_normal_1d_returns_length_one_tuple(self):
+        """1-D mesh: domain.normal() returns a 1-tuple."""
+        dom = self._make_1d_domain()
+        result = dom.normal("right")
+        assert isinstance(result, tuple)
+        assert len(result) == 1
+
+    def test_normal_unknown_tag_raises(self):
+        """domain.normal() for a tag without normals raises ValueError."""
+        dom = self._make_2d_domain()
+        with pytest.raises(ValueError, match="No outward normals"):
+            dom.normal("nonexistent_tag")
+
+    def test_normal_sign_right_is_positive(self):
+        """The outward normal at the right boundary (x=1) is +1."""
+        import jno
+
+        dom = self._make_1d_domain()
+        x, _ = dom.variable("right")
+        (n,) = dom.normal("right")
+        # n itself integrated gives the sum of outward normals × weights; sign must be +
+        flux = n.integrate()
+        (val,) = jno.core([], dom).eval([flux], domain=dom)
+        assert float(val) > 0, f"Right normal should be positive, got {float(val):.4f}"
+
+    def test_normal_sign_left_is_negative(self):
+        """The outward normal at the left boundary (x=0) is -1."""
+        import jno
+
+        dom = self._make_1d_domain()
+        x, _ = dom.variable("left")
+        (n,) = dom.normal("left")
+        flux = n.integrate()
+        (val,) = jno.core([], dom).eval([flux], domain=dom)
+        assert float(val) < 0, f"Left normal should be negative, got {float(val):.4f}"
+
+    def test_normal_right_plus_left_opposite_signs(self):
+        """Right and left outward normals have opposite integrated sign (Gauss in 1-D)."""
+        import jno
+
+        dom = self._make_1d_domain()
+        x_r, _ = dom.variable("right")
+        x_l, _ = dom.variable("left")
+        (nr,) = dom.normal("right")
+        (nl,) = dom.normal("left")
+        (vr,) = jno.core([], dom).eval([nr.integrate()], domain=dom)
+        (vl,) = jno.core([], dom).eval([nl.integrate()], domain=dom)
+        assert float(vr) > 0 and float(vl) < 0
+        assert jnp.allclose(vr, -vl, atol=1e-5), (
+            f"right flux={float(vr):.6f}, left flux={float(vl):.6f} should be equal and opposite"
+        )
+
+    def test_divergence_theorem_2d(self):
+        """Gauss 2-D: ∫_∂Ω ∇u · n dS = ∫_Ω Δu dΩ for u = sin(πx)sin(πy)."""
+        import jno
+
+        dom = self._make_2d_domain()
+        x, y, _ = dom.variable("interior")
+        x_b, y_b, _ = dom.variable("boundary")
+        nx, ny = dom.normal("boundary")
+
+        u_int = jno.np.sin(jno.np.pi * x) * jno.np.sin(jno.np.pi * y)
+        u_bnd = jno.np.sin(jno.np.pi * x_b) * jno.np.sin(jno.np.pi * y_b)
+
+        vol = u_int.laplacian(x, y).integrate()
+        flux = (u_bnd.d(x_b) * nx + u_bnd.d(y_b) * ny).integrate()
+
+        crux = jno.core([], dom)
+        vol_val, flux_val = crux.eval([vol, flux], domain=dom)
+        # Results have a leading batch dimension (1,); squeeze to scalar for comparison.
+        vol_s = jnp.squeeze(vol_val)
+        flux_s = jnp.squeeze(flux_val)
+        assert jnp.allclose(vol_s, flux_s, rtol=0.05), (
+            f"Divergence theorem 2-D: ∫Δu={float(vol_s):.4f}, ∫∇u·n={float(flux_s):.4f}"
+        )
