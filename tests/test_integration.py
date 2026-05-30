@@ -1060,3 +1060,4 @@ class TestBoundaryNormal:
         assert jnp.allclose(vol_s, flux_s, rtol=0.05), (
             f"Divergence theorem 2-D: ∫Δu={float(vol_s):.4f}, ∫∇u·n={float(flux_s):.4f}"
         )
+

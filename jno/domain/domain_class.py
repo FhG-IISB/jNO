@@ -1989,6 +1989,12 @@ class domain(MeshIOMixin):
         )
 
         if normals:
+            if f"n_{tag}" not in self.context:
+                raise ValueError(
+                    f"domain.variable('{tag}', normals=True): no outward normals found for "
+                    f"tag '{tag}'. Normals are only available for boundary tags on mesh-based "
+                    "domains. Check that the tag refers to a boundary region."
+                )
             if reverse_normals:
                 self.context[f"n_{tag}"] = -self.context[f"n_{tag}"]
             coord_vars += [Variable(tag=f"n_{tag}", dim=[i, i + 1], domain=self) for i in range(len(self.spatial))]
