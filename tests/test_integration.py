@@ -791,12 +791,14 @@ class TestGradientAccumulation:
 def _make_1d_time_domain(*, n_time: int = 20, n_spatial: int = 16):
     """1-D line domain on [0,1] × t∈[0,1] with n_time time steps."""
     import jno
+
     return jno.domain(constructor=jno.domain.line(mesh_size=1.0 / (n_spatial + 1)), time=(0.0, 1.0, n_time))
 
 
 def _eval_time_integral(expr, domain, *, min_consecutive=None):
     """Compile and evaluate a single expression directly (no training)."""
     import jno
+
     (val,) = jno.core([], domain).eval([expr], domain=domain, min_consecutive=min_consecutive)
     return val
 
@@ -806,7 +808,6 @@ class TestIntegralTime:
 
     def test_integral_t_constant_is_one(self):
         """∫₀¹ 1 dt = 1.0 (trapezoidal, uniform 50-step grid)."""
-        import jno
 
         dom = _make_1d_time_domain(n_time=50)
         x, t = dom.variable("interior")
@@ -818,7 +819,6 @@ class TestIntegralTime:
 
     def test_integral_t_linear_is_half(self):
         """∫₀¹ t dt = 0.5 (trapezoidal, uniform 100-step grid)."""
-        import jno
 
         dom = _make_1d_time_domain(n_time=100)
         x, t = dom.variable("interior")
@@ -828,7 +828,6 @@ class TestIntegralTime:
 
     def test_integral_t_sine_matches_analytical(self):
         """∫₀¹ sin(π t) dt = 2/π ≈ 0.6366 (trapezoidal, 200-step grid)."""
-        import jno
         import jno.jnp_ops as jnn
 
         dom = _make_1d_time_domain(n_time=200)
@@ -836,9 +835,7 @@ class TestIntegralTime:
         result = jnn.sin(jnn.pi * t).integrate(t)
         val = _eval_time_integral(result, dom)
         expected = 2.0 / float(jnp.pi)
-        assert jnp.allclose(val, expected, atol=1e-3), (
-            f"∫sin(πt) dt expected {expected:.4f}, got {float(val):.6f}"
-        )
+        assert jnp.allclose(val, expected, atol=1e-3), f"∫sin(πt) dt expected {expected:.4f}, got {float(val):.6f}"
 
     def test_integrate_t_returns_integral_time_node(self):
         """Passing a temporal Variable to .integrate() returns IntegralTime, not Integral."""
@@ -871,7 +868,6 @@ class TestIntegralTime:
 
     def test_chained_spacetime_integral_unit_const(self):
         """∫₀¹ ∫₀¹ 1 dx dt ≈ 1.0 via .integrate().integrate(t)."""
-        import jno
 
         dom = _make_1d_time_domain(n_time=50, n_spatial=32)
         x, t = dom.variable("interior")
@@ -1066,4 +1062,3 @@ class TestBoundaryNormal:
         dom = self._make_2d_domain()
         with pytest.raises(ValueError, match="no outward normals found for tag 'interior'"):
             dom.variable("interior", normals=True)
-

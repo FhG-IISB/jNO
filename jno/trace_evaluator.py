@@ -154,7 +154,11 @@ class TraceEvaluator:
         try:
             abstract = jax.eval_shape(lambda: self._dispatch(node, ctx))
             shape_str = str(abstract.shape) if hasattr(abstract, "shape") else "scalar"
-        except Exception:
+        except Exception as exc:
+            # eval_shape can fail for any number of reasons (unbound vars,
+            # non-jit-traceable ops, etc.); fall back to structural inference
+            # rather than aborting constraint-shape logging.
+            self.log.debug(f"eval_shape fallback for {label}: {type(exc).__name__}: {exc}")
             shape_str = self._infer_shape_from_children(node, ctx)
 
         # Layout:

@@ -109,6 +109,5 @@ with open(results_file, "a") as f_out:
 
 assert rel_l2 < 0.15, f"Relative L2 error too large: {rel_l2:.3e}"
 assert abs(vol_s - flux_s) / abs(vol_s) < 0.05, (
-    f"Divergence theorem: ∫Δu={vol_s:.4f}, ∫∇u·n={flux_s:.4f}, "
-    f"discrepancy={abs(vol_s - flux_s) / abs(vol_s):.4f}"
+    f"Divergence theorem: ∫Δu={vol_s:.4f}, ∫∇u·n={flux_s:.4f}, discrepancy={abs(vol_s - flux_s) / abs(vol_s):.4f}"
 )

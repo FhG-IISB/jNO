@@ -70,6 +70,5 @@ flux_s = float(jnp.squeeze(flux_val))
 
 rel_disc = abs(vol_s - flux_s) / (abs(vol_s) + 1e-8)
 assert rel_disc < 0.05, (
-    f"Divergence theorem violated: ∫Δu={vol_s:.4f}, ∫∇u·n={flux_s:.4f}, "
-    f"relative discrepancy={rel_disc:.4f}"
+    f"Divergence theorem violated: ∫Δu={vol_s:.4f}, ∫∇u·n={flux_s:.4f}, relative discrepancy={rel_disc:.4f}"
 )
