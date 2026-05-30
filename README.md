@@ -34,28 +34,6 @@ checkpoint without rewriting the surrounding code.
 > Status: research-level repository under active development. Public API
 > is stabilising but may change between minor versions.
 
-## Why jNO?
-
-If you've used another PDE-learning framework, here's the honest
-positioning:
-
-- **vs DeepXDE** — DeepXDE is PyTorch-first with optional JAX/TensorFlow
-  backends; jNO is JAX-native end-to-end, so multi-device sharding,
-  `jit`/`vmap`/`scan`, and gradient checkpointing compose without
-  glue code.
-- **vs NVIDIA Modulus** — Modulus ships a turnkey training harness
-  optimised for industrial workflows; jNO is a programming-style
-  library: you build the problem as a Python expression and stay close
-  to the math.
-- **vs NeuralPDE.jl** — NeuralPDE is Julia-only. Pick jNO when your
-  research stack is already Python/JAX.
-
-What's specific to jNO: a tracing layer that lets the same expression
-serve as PDE residual, supervised loss, FEM weak form, or sensitivity
-diagnostic; built-in adaptive resampling (RAD/RARD/CR3); explainability
-callbacks (gradient-conflict, loss landscape) usable from a one-line
-hook.
-
 ## Install
 
 ```bash
