@@ -23,6 +23,7 @@ import inspect
 import types
 from typing import TYPE_CHECKING, Optional, Sequence
 
+import jax
 import jax.numpy as jnp
 
 from .trace import FunctionCall, Placeholder, Variable
@@ -723,6 +724,29 @@ sign = _unary(jnp.sign)
 # ============================================================================
 maximum = _binary(jnp.maximum)
 minimum = _binary(jnp.minimum)
+
+
+# ============================================================================
+# Gradient control
+# ============================================================================
+
+
+def stop_gradient(field: "Placeholder") -> "FunctionCall":
+    """Block gradient flow through ``field``.
+
+    Returns a node identical to ``field`` in the forward pass but with zero
+    gradient in the backward pass.  Use this to decouple cooperating models
+    so that each model's interaction term only updates *its own* parameters::
+
+        # u_phy aligns with u_syn, but syn's weights are not updated here
+        L_int_phy = (u_phy - jno.fn.stop_gradient(u_syn)).mse
+
+        # u_syn aligns with u_phy, but phy's weights are not updated here
+        L_int_syn = (u_syn - jno.fn.stop_gradient(u_phy)).mse
+
+    Equivalent to ``jax.lax.stop_gradient`` applied inside the trace graph.
+    """
+    return FunctionCall(jax.lax.stop_gradient, [field], name="stop_gradient")
 
 
 # ============================================================================

@@ -109,6 +109,7 @@ nav:
       - Coupled Parabolic 2D: tutorials/05-coupled-and-inverse/coupled-parabolic-2d.md
       - Inverse Parameter: tutorials/05-coupled-and-inverse/inverse-parameter.md
       - Surrogate Inversion: tutorials/05-coupled-and-inverse/surrogate-inversion.md
+      - HyCo Poisson 1D: tutorials/05-coupled-and-inverse/hyco-poisson-1d.md
     - 07 Stochastic:
       - Fokker-Planck 2D: tutorials/07-stochastic/fokker-planck-2d.md
       - Stochastic Forcing 2D: tutorials/07-stochastic/stochastic-forcing-2d.md
