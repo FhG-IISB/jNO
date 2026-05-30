@@ -525,14 +525,14 @@ def _pure_eval(expr, var_values: dict, model_to_skip: Model) -> jnp.ndarray:
         return jnp.asarray(expr.value, dtype=jnp.float32)
 
     if isinstance(expr, BinaryOp):
-        l = _pure_eval(expr.left, var_values, model_to_skip)
-        r = _pure_eval(expr.right, var_values, model_to_skip)
+        lhs = _pure_eval(expr.left, var_values, model_to_skip)
+        rhs = _pure_eval(expr.right, var_values, model_to_skip)
         return {
-            "+": l + r,
-            "-": l - r,
-            "*": l * r,
-            "/": l / r,
-            "**": l**r,
+            "+": lhs + rhs,
+            "-": lhs - rhs,
+            "*": lhs * rhs,
+            "/": lhs / rhs,
+            "**": lhs**rhs,
         }[expr.op]
 
     if isinstance(expr, FunctionCall):
