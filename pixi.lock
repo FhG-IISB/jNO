@@ -54,6 +54,9 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/ghp-import-2.1.0-pyhd8ed1ab_2.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/gitdb-4.0.12-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/gitpython-3.1.50-pyhd8ed1ab_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/griffe-2.0.2-pyhcf101f3_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/griffecli-2.0.2-pyhcf101f3_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/griffelib-2.0.2-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/h2-4.3.0-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/hpack-4.1.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/hyperframe-6.1.0-pyhd8ed1ab_0.conda
@@ -64,9 +67,12 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/markdown-3.10.2-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/mergedeep-1.3.4-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocs-1.6.1-pyhd8ed1ab_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocs-autorefs-1.4.4-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocs-get-deps-0.2.2-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocs-material-9.7.6-pyhcf101f3_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocs-material-extensions-1.3.1-pyhd8ed1ab_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocstrings-1.0.3-pyhd8ed1ab_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocstrings-python-2.0.2-pyh332efcf_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/packaging-26.2-pyhc364b38_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/paginate-0.5.7-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pathspec-1.1.1-pyhd8ed1ab_0.conda
@@ -204,6 +210,9 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/ghp-import-2.1.0-pyhd8ed1ab_2.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/gitdb-4.0.12-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/gitpython-3.1.50-pyhd8ed1ab_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/griffe-2.0.2-pyhcf101f3_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/griffecli-2.0.2-pyhcf101f3_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/griffelib-2.0.2-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/h2-4.3.0-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/hpack-4.1.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/hyperframe-6.1.0-pyhd8ed1ab_0.conda
@@ -214,9 +223,12 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/markdown-3.10.2-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/mergedeep-1.3.4-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocs-1.6.1-pyhd8ed1ab_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocs-autorefs-1.4.4-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocs-get-deps-0.2.2-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocs-material-9.7.6-pyhcf101f3_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocs-material-extensions-1.3.1-pyhd8ed1ab_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocstrings-1.0.3-pyhd8ed1ab_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocstrings-python-2.0.2-pyh332efcf_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/packaging-26.2-pyhc364b38_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/paginate-0.5.7-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pathspec-1.1.1-pyhd8ed1ab_0.conda
@@ -356,6 +368,9 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/ghp-import-2.1.0-pyhd8ed1ab_2.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/gitdb-4.0.12-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/gitpython-3.1.50-pyhd8ed1ab_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/griffe-2.0.2-pyhcf101f3_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/griffecli-2.0.2-pyhcf101f3_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/griffelib-2.0.2-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/h2-4.3.0-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/hpack-4.1.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/hyperframe-6.1.0-pyhd8ed1ab_0.conda
@@ -366,9 +381,12 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/markdown-3.10.2-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/mergedeep-1.3.4-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocs-1.6.1-pyhd8ed1ab_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocs-autorefs-1.4.4-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocs-get-deps-0.2.2-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocs-material-9.7.6-pyhcf101f3_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocs-material-extensions-1.3.1-pyhd8ed1ab_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocstrings-1.0.3-pyhd8ed1ab_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocstrings-python-2.0.2-pyh332efcf_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/packaging-26.2-pyhc364b38_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/paginate-0.5.7-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pathspec-1.1.1-pyhd8ed1ab_0.conda
@@ -527,6 +545,9 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/ghp-import-2.1.0-pyhd8ed1ab_2.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/gitdb-4.0.12-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/gitpython-3.1.50-pyhd8ed1ab_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/griffe-2.0.2-pyhcf101f3_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/griffecli-2.0.2-pyhcf101f3_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/griffelib-2.0.2-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/h2-4.3.0-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/hpack-4.1.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/hyperframe-6.1.0-pyhd8ed1ab_0.conda
@@ -537,9 +558,12 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/markdown-3.10.2-pyhcf101f3_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/mergedeep-1.3.4-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocs-1.6.1-pyhd8ed1ab_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocs-autorefs-1.4.4-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocs-get-deps-0.2.2-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocs-material-9.7.6-pyhcf101f3_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocs-material-extensions-1.3.1-pyhd8ed1ab_1.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocstrings-1.0.3-pyhd8ed1ab_0.conda
+      - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocstrings-python-2.0.2-pyh332efcf_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/packaging-26.2-pyhc364b38_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/paginate-0.5.7-pyhd8ed1ab_1.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/pathspec-1.1.1-pyhd8ed1ab_0.conda
@@ -1224,6 +1248,43 @@ packages:
   - pkg:pypi/gitpython?source=hash-mapping
   size: 162193
   timestamp: 1778065820061
+- conda: https://conda.anaconda.org/conda-forge/noarch/griffe-2.0.2-pyhcf101f3_0.conda
+  sha256: 14cc12f55b19ddf164fb5df96dd156eaa6a8ab60b8ded337deda43fdcf70c369
+  md5: 48dc0933013b4d09bd14373bbca33a44
+  depends:
+  - python >=3.10
+  - griffelib >=2.0.2,<2.0.3.0a0
+  - griffecli >=2.0.2,<2.0.3.0a0
+  - python
+  license: ISC
+  purls:
+  - pkg:pypi/griffe?source=hash-mapping
+  size: 17094
+  timestamp: 1774621473366
+- conda: https://conda.anaconda.org/conda-forge/noarch/griffecli-2.0.2-pyhcf101f3_0.conda
+  sha256: 4d54de99b3cf5589bf12e761e704aa00c54e5d567e934871a2d794e0772ab0b3
+  md5: df88cbe27def353593a53b8b47adf780
+  depends:
+  - python >=3.10
+  - colorama >=0.4
+  - griffelib >=2.0.2,<2.0.3.0a0
+  - python
+  license: ISC
+  purls:
+  - pkg:pypi/griffecli?source=hash-mapping
+  size: 19703
+  timestamp: 1774621473366
+- conda: https://conda.anaconda.org/conda-forge/noarch/griffelib-2.0.2-pyhcf101f3_0.conda
+  sha256: f4d0fe5835a6d1e3e828320a1df2117c96a769c788429d78a75ddcafda3cec67
+  md5: f7b9e67b788f78c6facf79b3e12b1e13
+  depends:
+  - python >=3.10
+  - python
+  license: ISC
+  purls:
+  - pkg:pypi/griffelib?source=hash-mapping
+  size: 117111
+  timestamp: 1774621473366
 - conda: https://conda.anaconda.org/conda-forge/noarch/h2-4.3.0-pyhcf101f3_0.conda
   sha256: 84c64443368f84b600bfecc529a1194a3b14c3656ee2e832d15a20e0329b6da3
   md5: 164fc43f0b53b6e3a7bc7dce5e4f1dc9
@@ -1359,6 +1420,20 @@ packages:
   - pkg:pypi/mkdocs?source=hash-mapping
   size: 3524754
   timestamp: 1734344673481
+- conda: https://conda.anaconda.org/conda-forge/noarch/mkdocs-autorefs-1.4.4-pyhd8ed1ab_0.conda
+  sha256: 2badce31930bc16c54e95c0f1bb03009b67b4525df005ac11365dcd8cfdf7604
+  md5: 3ccacc29f132fcc46a544b9b8fcbc293
+  depends:
+  - markdown >=3.3
+  - markupsafe >=2.0.1
+  - mkdocs >=1.1
+  - pymdown-extensions
+  - python >=3.10
+  license: ISC
+  purls:
+  - pkg:pypi/mkdocs-autorefs?source=hash-mapping
+  size: 35803
+  timestamp: 1770749168710
 - conda: https://conda.anaconda.org/conda-forge/noarch/mkdocs-get-deps-0.2.2-pyhd8ed1ab_0.conda
   sha256: fad4463b52def6214f64dfb918ad77ec4feb4c5d1072838dcf693dab860fde52
   md5: 4e396e96b60a1f616da1f0e5fceae543
@@ -1410,6 +1485,39 @@ packages:
   - pkg:pypi/mkdocs-material-extensions?source=hash-mapping
   size: 16122
   timestamp: 1734641109286
+- conda: https://conda.anaconda.org/conda-forge/noarch/mkdocstrings-1.0.3-pyhd8ed1ab_0.conda
+  sha256: 01aa08456b569680394caa883b5a02f54e247142b6897e537abee2998ba1de1e
+  md5: 97f68128ed142b9d918d44c785674932
+  depends:
+  - click >=7.0
+  - importlib-metadata >=4.6
+  - jinja2 >=3.1
+  - markdown >=3.6
+  - markupsafe >=1.1
+  - mkdocs >=1.6
+  - mkdocs-autorefs >=1.4
+  - pymdown-extensions >=6.3
+  - python >=3.10,<4.0
+  - typing-extensions >=4.1
+  license: ISC
+  purls:
+  - pkg:pypi/mkdocstrings?source=hash-mapping
+  size: 36266
+  timestamp: 1770555720575
+- conda: https://conda.anaconda.org/conda-forge/noarch/mkdocstrings-python-2.0.2-pyh332efcf_0.conda
+  sha256: 40202810555ccdd350d37c13d9eeb48642c7d8b08575666d822e7af9516a870c
+  md5: e9549209e83a29bb7bcf6bbc5c6396f9
+  depends:
+  - griffe >=1.13
+  - mkdocs-autorefs >=1.4
+  - mkdocstrings >=0.30
+  - python >=3.10
+  - typing_extensions >=4.0
+  license: ISC
+  purls:
+  - pkg:pypi/mkdocstrings-python?source=hash-mapping
+  size: 57013
+  timestamp: 1770730332317
 - conda: https://conda.anaconda.org/conda-forge/noarch/packaging-26.2-pyhc364b38_0.conda
   sha256: 3906abfb6511a3bb309e39b9b1b7bc38f50a723971de2395489fd1f379255890
   md5: 4c06a92e74452cfa53623a81592e8934

@@ -8,6 +8,26 @@ theme:
 
 plugins:
   - search
+  - mkdocstrings:
+      default_handler: python
+      handlers:
+        python:
+          options:
+            show_root_heading: true
+            show_source: false
+            show_signature_annotations: true
+            separate_signature: true
+            docstring_style: google
+            docstring_section_style: spacy
+            merge_init_into_class: true
+            members_order: source
+            filters:
+              - "!^_"  # skip private members
+              - "!^log$"
+              - "!^logger$"
+            heading_level: 2
+            inherited_members: false
+            show_bases: false
 
 markdown_extensions:
   - admonition
@@ -49,6 +69,7 @@ nav:
   - Home: index.md
   - Installation: Installation.md
   - Getting Started: Getting-Started.md
+  - API Reference: API.md
   - Glossary: Glossary.md
   - Getting to Know jNO:
     - Domain and Geometry: Domain-and-Geometry.md
