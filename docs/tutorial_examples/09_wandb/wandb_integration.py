@@ -17,6 +17,7 @@ Techniques shown
 * GradientAlignmentCallback    — total alignment scalar ‖Σgᵢ‖ / Σ‖gᵢ‖
 * LossLandscapeCallback        — 2-D loss landscape around current params
 * ResidualStatsCallback        — per-constraint residual mean/std/max/p99 + histogram
+* InputSensitivityCallback     — |∂u/∂x| at collocation points (saliency)
 * CheckpointCallback           — periodic Orbax save + W&B artifact upload
 
 Run this script directly to see all metrics appear in your W&B dashboard
@@ -92,6 +93,13 @@ cb_residual = jno.callbacks.residual_stats(
     interval=50,
 )
 
+# Input saliency: |∂u/∂x| at the interior collocation points.
+# Any jno placeholder expression compiles — try Jacobian(u, [x, y]) for 2-D problems.
+cb_saliency = jno.callbacks.input_sensitivity(
+    u.d(x),
+    interval=50,
+)
+
 # ── Checkpoint callback ────────────────────────────────────────────────────────
 # Saves to disk every 500 epochs; uploads a versioned artifact to W&B.
 # Artifact metadata includes epoch, total_loss, individual_losses, checkpoint_dir.
@@ -106,7 +114,7 @@ cb_ckpt = jno.callbacks.checkpoint(
 crux = jno.core([pde.mse, bc.mse], domain)
 crux.solve(
     2_000,
-    callbacks=[cb_norms, cb_cos, cb_align, cb_landscape, cb_residual, cb_ckpt],
+    callbacks=[cb_norms, cb_cos, cb_align, cb_landscape, cb_residual, cb_saliency, cb_ckpt],
 )
 cb_ckpt.close()
 
@@ -138,6 +146,13 @@ print(f"  means shape : {residual_result['means'].shape}   (samples × constrain
 print(f"  final mean  : {residual_result['means'][-1]}")
 print(f"  final max   : {residual_result['maxes'][-1]}")
 print(f"  final p99   : {residual_result['p99'][-1]}")
+
+saliency_result = cb_saliency.result
+print("\n── Input sensitivity ─────────────────────────────────────────────────")
+print(f"  values shape : {saliency_result['values'].shape}")
+final_abs = jnp.abs(saliency_result["values"][-1])
+print(f"  final mean|∂u/∂x| : {float(final_abs.mean()):.4e}")
+print(f"  final max |∂u/∂x| : {float(final_abs.max()):.4e}")
 
 # ── Validate solution ──────────────────────────────────────────────────────────
 _u, _u_exact = crux.eval([u, u_exact])

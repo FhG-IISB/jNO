@@ -235,6 +235,7 @@ class TestExplainabilityCallbacksWandBLogging:
             CosSimilarityCallback,
             GradientAlignmentCallback,
             GradientNormsCallback,
+            InputSensitivityCallback,
             LossLandscapeCallback,
             ResidualStatsCallback,
         )
@@ -256,6 +257,8 @@ class TestExplainabilityCallbacksWandBLogging:
         cb_align = GradientAlignmentCallback(interval=1)
         cb_land = LossLandscapeCallback(interval=1, n_grid=3)
         cb_residual = ResidualStatsCallback(interval=1)
+        # Input saliency: ∂u/∂x evaluated at the interior collocation points.
+        cb_saliency = InputSensitivityCallback(u.d(x), interval=1)
         cb_ckpt = CheckpointCallback(
             directory=str(tmp_path / "ckpts"),
             save_interval_epochs=1,
@@ -270,7 +273,7 @@ class TestExplainabilityCallbacksWandBLogging:
         with patch.dict("sys.modules", {"wandb": mock_wandb}):
             solver.solve(
                 3,
-                callbacks=[cb_norms, cb_cos, cb_align, cb_land, cb_residual, cb_ckpt],
+                callbacks=[cb_norms, cb_cos, cb_align, cb_land, cb_residual, cb_saliency, cb_ckpt],
             )
         cb_ckpt.close()
 
@@ -302,6 +305,11 @@ class TestExplainabilityCallbacksWandBLogging:
                     f"missing explainability/residual/constraint_{i}/{stat}"
                 )
 
+        # input sensitivity / saliency — three scalar stats per call
+        assert "explainability/saliency/mean_abs" in logged_keys
+        assert "explainability/saliency/max_abs" in logged_keys
+        assert "explainability/saliency/std_abs" in logged_keys
+
         # ── checkpoint artifact carries checkpoint_dir + loss fields ─────────
         assert mock_run.log_artifact.called, "Expected at least one checkpoint artifact upload"
         ckpt_artifact_calls = [c for c in mock_wandb.Artifact.call_args_list if c.kwargs.get("type") == "checkpoint"]
@@ -323,3 +331,6 @@ class TestExplainabilityCallbacksWandBLogging:
         assert cb_residual.result["means"].shape[1] == 2  # N=2 constraints
         assert cb_residual.result["maxes"].shape == cb_residual.result["means"].shape
         assert cb_residual.result["p99"].shape == cb_residual.result["means"].shape
+        # saliency: result["values"] holds the raw expression evaluations
+        assert cb_saliency.result["values"].ndim >= 2
+        assert len(cb_saliency.result["epochs"]) > 0

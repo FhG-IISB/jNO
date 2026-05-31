@@ -112,6 +112,33 @@ Reference: per-point residual magnitudes as a sampling / diagnostic signal — S
 
 ---
 
+## Input sensitivity / saliency
+
+```python
+cb = jno.callbacks.input_sensitivity(u.d(x), interval=100)
+crux.solve(5000, callbacks=[cb])
+
+values = cb.result["values"]    # (n_samples, *expr_shape)
+```
+
+Evaluates an arbitrary jno placeholder expression at the training collocation points and records its value every `interval` outer steps. The intended use is *input-gradient saliency* — for a scalar network output $u$ and a coordinate variable $x$, $\partial u/\partial x$ measures how strongly the network response at a given point depends on that input dimension. High-magnitude regions are where small input perturbations produce large output changes (the PINN analogue of the class-saliency map of [Simonyan, Vedaldi & Zisserman, 2014](https://arxiv.org/abs/1312.6034), Sec. 3).
+
+Common expressions to pass:
+
+| Expression                       | Meaning                                              |
+|----------------------------------|------------------------------------------------------|
+| `u.d(x)`                         | $\partial u/\partial x$ — scalar per point           |
+| `jno.Jacobian(u, [x, y])`        | full input Jacobian — shape `(N, 2)` for 2-D inputs  |
+| `u.d(x)**2 + u.d(y)**2`          | squared $\lvert\nabla u\rvert^2$ as a scalar field   |
+
+Any composite expression compiles, because the callback uses the same `TraceCompiler.compile_multi_expression` pathway that the solver uses for constraints and trackers.
+
+W&B keys: `explainability/saliency/{mean_abs,max_abs,std_abs}`, `.../histogram` (image)
+
+Reference: input-gradient saliency — Sec. 3 of [[1312.6034](https://arxiv.org/abs/1312.6034)] (Simonyan et al., 2014).
+
+---
+
 ## Loss landscape
 
 ```python
