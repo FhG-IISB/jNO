@@ -139,6 +139,80 @@ Reference: input-gradient saliency — Sec. 3 of [[1312.6034](https://arxiv.org/
 
 ---
 
+## Empirical NTK spectrum
+
+```python
+cb = jno.callbacks.ntk_spectrum(
+    u.grad(u_net),
+    n_points=256,
+    top_k=10,
+    interval=500,
+)
+crux.solve(10_000, callbacks=[cb])
+
+eigvals = cb.result["eigvals_topk"]        # (n_samples, top_k)
+cond    = cb.result["condition_number"]    # (n_samples,)
+```
+
+Compiles a `NetworkGradient` placeholder to obtain the per-point parameter Jacobian $J \in \mathbb{R}^{N \times P}$, subsamples ``n_points`` rows (with a fixed seed so the same points are used at every call), and reports the eigenvalue spectrum of the empirical NTK $K = J J^\top$. A wide spread between the largest and smallest eigenvalues is the canonical diagnostic for PINN spectral bias.
+
+$$K_{ij} = \langle \nabla_\theta u(x_i), \, \nabla_\theta u(x_j) \rangle$$
+
+Restrict to a parameter subset via `net.mask(...)` chained into the placeholder:
+
+```python
+cb = jno.callbacks.ntk_spectrum(u.grad(u_net.mask(out_mask)), n_points=128, top_k=10)
+```
+
+!!! warning "Cost"
+    Cost is $O(n\_\text{points}^2 \times P)$.  Use both subsampling (`n_points`) **and** placeholder masking on large networks.  Scalar output only — for vector-valued $u$, project first (e.g. `u[..., 0].grad(net)`).
+
+W&B keys: `explainability/ntk/eigval_{0..k-1}`, `.../lambda_max`, `.../lambda_min`, `.../condition_number`, `.../spectrum_hist`
+
+Reference: NTK spectrum for PINN spectral-bias diagnosis — Sec. 3-4 of [[2007.14527](https://arxiv.org/abs/2007.14527)] (Wang, Wang & Perdikaris, 2022).
+
+---
+
+## Hessian eigenspectrum (sharpness)
+
+```python
+cb = jno.callbacks.hessian_spectrum(
+    k=10,
+    n_iter=30,
+    interval=500,
+    # mask=output_mask  # strongly recommended for large models
+)
+crux.solve(10_000, callbacks=[cb])
+
+eigvals   = cb.result["eigvals"]      # (n_samples, k)  — descending
+sharpness = cb.result["sharpness"]    # (n_samples,)    — largest eigenvalue
+```
+
+Computes the top-$k$ eigenvalues of the total training loss Hessian $\nabla^2_\theta L$ via Lanczos with Hessian-vector products. The largest eigenvalue is the **sharpness** of the loss surface at the current iterate (Sec. 2.2 of [[1609.04836](https://arxiv.org/abs/1609.04836)] — Keskar et al., 2017).
+
+### Per-constraint Hessian (`constraints=`)
+
+The total-loss Hessian conflates conditioning across all constraints. Pass `constraints=[...]` to scope the Hessian to a subset of the constraint losses — the spectrum then reflects the Hessian of `mean(L_i for i in constraints)`:
+
+```python
+pde_loss = pde.mse
+bc_loss  = bc.mse
+solver = jno.core([pde_loss, bc_loss], domain)
+
+cb_pde = jno.callbacks.hessian_spectrum(k=5, n_iter=20, interval=500, constraints=[pde_loss])
+cb_bc  = jno.callbacks.hessian_spectrum(k=5, n_iter=20, interval=500, constraints=[bc_loss])
+crux.solve(5000, callbacks=[cb_pde, cb_bc])
+```
+
+!!! warning "Cost"
+    Each call performs ``n_iter`` HVPs, each roughly the cost of one full forward+backward pass.  Keep ``interval`` large (500–1000) for real runs and use ``mask`` to restrict to a parameter subset.
+
+W&B keys: `explainability/hessian/eigval_{0..k-1}`, `.../sharpness`, `.../n_iter`
+
+Reference: HVP-based Lanczos for neural-network Hessian spectra — Sec. 3.1-3.2 of [[1912.07145](https://arxiv.org/abs/1912.07145)] (Yao et al., 2020).  Sharpness concept — Sec. 2.2 of [[1609.04836](https://arxiv.org/abs/1609.04836)] (Keskar et al., 2017).
+
+---
+
 ## Loss landscape
 
 ```python

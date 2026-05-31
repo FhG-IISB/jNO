@@ -18,6 +18,8 @@ Techniques shown
 * LossLandscapeCallback        — 2-D loss landscape around current params
 * ResidualStatsCallback        — per-constraint residual mean/std/max/p99 + histogram
 * InputSensitivityCallback     — |∂u/∂x| at collocation points (saliency)
+* NTKSpectrumCallback          — empirical NTK eigenvalue spectrum
+* HessianSpectrumCallback      — top-k Hessian eigenvalues + sharpness
 * CheckpointCallback           — periodic Orbax save + W&B artifact upload
 
 Run this script directly to see all metrics appear in your W&B dashboard
@@ -100,6 +102,21 @@ cb_saliency = jno.callbacks.input_sensitivity(
     interval=50,
 )
 
+# Empirical NTK spectrum: diagnoses spectral bias.
+cb_ntk = jno.callbacks.ntk_spectrum(
+    u.grad(u_net),
+    n_points=32,
+    top_k=5,
+    interval=200,
+)
+
+# Hessian eigenspectrum: top-k eigenvalues + sharpness via Lanczos w/ HVPs.
+cb_hess = jno.callbacks.hessian_spectrum(
+    k=5,
+    n_iter=15,
+    interval=400,
+)
+
 # ── Checkpoint callback ────────────────────────────────────────────────────────
 # Saves to disk every 500 epochs; uploads a versioned artifact to W&B.
 # Artifact metadata includes epoch, total_loss, individual_losses, checkpoint_dir.
@@ -114,7 +131,7 @@ cb_ckpt = jno.callbacks.checkpoint(
 crux = jno.core([pde.mse, bc.mse], domain)
 crux.solve(
     2_000,
-    callbacks=[cb_norms, cb_cos, cb_align, cb_landscape, cb_residual, cb_saliency, cb_ckpt],
+    callbacks=[cb_norms, cb_cos, cb_align, cb_landscape, cb_residual, cb_saliency, cb_ntk, cb_hess, cb_ckpt],
 )
 cb_ckpt.close()
 
@@ -153,6 +170,17 @@ print(f"  values shape : {saliency_result['values'].shape}")
 final_abs = jnp.abs(saliency_result["values"][-1])
 print(f"  final mean|∂u/∂x| : {float(final_abs.mean()):.4e}")
 print(f"  final max |∂u/∂x| : {float(final_abs.max()):.4e}")
+
+ntk_result = cb_ntk.result
+print("\n── NTK spectrum ──────────────────────────────────────────────────────")
+print(f"  top-{ntk_result['eigvals_topk'].shape[1]} eigvals (final): {ntk_result['eigvals_topk'][-1]}")
+print(f"  λ_max (final)        : {ntk_result['lambda_max'][-1]:.4e}")
+print(f"  condition (final)    : {ntk_result['condition_number'][-1]:.4e}")
+
+hess_result = cb_hess.result
+print("\n── Hessian eigenspectrum ─────────────────────────────────────────────")
+print(f"  top-{hess_result['eigvals'].shape[1]} eigvals (final): {hess_result['eigvals'][-1]}")
+print(f"  sharpness (final)    : {hess_result['sharpness'][-1]:.4e}")
 
 # ── Validate solution ──────────────────────────────────────────────────────────
 _u, _u_exact = crux.eval([u, u_exact])
