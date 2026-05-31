@@ -34,6 +34,10 @@ class Callback:
             context: Domain context (use for pre-compilation only).
             rng: PRNG key.
             min_consecutive (int): Minimum consecutive time steps per constraint call.
+            constraint_exprs: List of the solver's raw constraint placeholders
+                (the exact Python objects passed to ``jno.core([...])``).
+                Callbacks that take a ``constraints=`` arg validate user input
+                against this list by Python identity.
         """
 
     def on_epoch_end(self, **kwargs) -> bool:
@@ -56,6 +60,47 @@ class Callback:
 
     def on_training_end(self, **kwargs) -> None:
         """Called once after the training loop finishes."""
+
+
+def _resolve_constraint_indices(user_constraints, solver_constraints, callback_name: str) -> list[int]:
+    """Map user-supplied constraint placeholders to their solver-side indices.
+
+    Matches by Python identity — i.e. the user must pass the *same* Python
+    object that was given to ``jno.core([...])`` (assign the constraint to a
+    variable rather than re-accessing ``.mse``, which returns a fresh
+    placeholder every time).  Raises ``ValueError`` with a clear hint on
+    mismatch.
+
+    Args:
+        user_constraints: List of placeholder expressions, or ``None`` for "all".
+        solver_constraints: ``solver._constraint_exprs`` (the solver's stored
+            constraint list).
+        callback_name: Used in the error message so users know which callback
+            raised.
+
+    Returns:
+        List of integer indices into ``solver_constraints``.  When
+        ``user_constraints is None`` the full range ``[0, len(solver_constraints))``.
+    """
+    if user_constraints is None:
+        return list(range(len(solver_constraints)))
+    indices: list[int] = []
+    for c in user_constraints:
+        found = -1
+        for i, ce in enumerate(solver_constraints):
+            if c is ce:
+                found = i
+                break
+        if found == -1:
+            raise ValueError(
+                f"{callback_name}: constraint {c!r} not found among the "
+                f"solver's compiled constraints.  Pass the same Python "
+                f"object that was given to jno.core([...]) — assign your "
+                f"constraint to a variable rather than re-accessing .mse "
+                f"(which returns a fresh placeholder each access)."
+            )
+        indices.append(found)
+    return indices
 
 
 # ---------------------------------------------------------------------------
@@ -766,16 +811,27 @@ class ResidualStatsCallback(Callback):
 
     Args:
         interval: Compute every *n* outer training steps. Default ``100``.
+        constraints: Optional list of constraint placeholders to scope the
+            callback to a subset of the solver's constraints.  Pass the
+            *same* Python objects that were given to ``jno.core([...])`` —
+            assign your constraints to variables rather than re-accessing
+            ``.mse`` (which returns a fresh placeholder each access).
+            When ``None`` (default) all constraints are tracked.
 
     Example::
 
-        cb = jno.callbacks.residual_stats(interval=100)
+        pde_loss = pde.mse                       # assign once
+        bc_loss  = bc.mse
+        solver = jno.core([pde_loss, bc_loss], domain)
+        cb = jno.callbacks.residual_stats(interval=100, constraints=[pde_loss])
         crux.solve(5000, callbacks=[cb])
-        print(cb.result["maxes"])   # (n_samples, n_constraints)
+        print(cb.result["maxes"])   # (n_samples, 1)  — just pde_loss
     """
 
-    def __init__(self, interval: int = 100) -> None:
+    def __init__(self, interval: int = 100, constraints=None) -> None:
         self._interval = interval
+        self._user_constraints = constraints  # resolved in on_solve_begin
+        self._indices: list[int] = []  # populated in on_solve_begin
         self._fn = None
         self._n_constraints = 0
         self._epochs: list = []
@@ -788,6 +844,14 @@ class ResidualStatsCallback(Callback):
         from jno.utils.explainability import make_residual_stats_fn
 
         self._n_constraints = kwargs["n_constraints"]
+        # Resolve the optional constraint subset to solver-side indices.
+        # `constraint_exprs` is added by the solver hook; defensively fall back
+        # to the full range if absent (older solvers without the hook).
+        solver_constraints = kwargs.get("constraint_exprs")
+        if solver_constraints is None:
+            solver_constraints = [None] * self._n_constraints
+        self._indices = _resolve_constraint_indices(self._user_constraints, solver_constraints, "residual_stats")
+
         self._fn = jax.jit(
             make_residual_stats_fn(
                 kwargs["compiled_constraints_fn"],
@@ -813,24 +877,36 @@ class ResidualStatsCallback(Callback):
         p99_np = np.asarray(jax.device_get(p99))
         raw_np = [np.asarray(jax.device_get(r)) for r in raw]
 
+        # Slice each scalar array to the requested constraint subset.  Raw
+        # residuals are a list of variable-length arrays, so they're
+        # picked-by-index rather than fancy-indexed.
+        idx = self._indices
+        means_sel = means_np[idx]
+        stds_sel = stds_np[idx]
+        maxes_sel = maxes_np[idx]
+        p99_sel = p99_np[idx]
+        raw_sel = [raw_np[i] for i in idx]
+
         self._epochs.append(epoch)
-        self._means.append(means_np)
-        self._stds.append(stds_np)
-        self._maxes.append(maxes_np)
-        self._p99.append(p99_np)
+        self._means.append(means_sel)
+        self._stds.append(stds_sel)
+        self._maxes.append(maxes_sel)
+        self._p99.append(p99_sel)
 
         if get_wandb_run() is not None:
             wb: dict = {}
-            for i in range(self._n_constraints):
-                wb[f"explainability/residual/constraint_{i}/mean"] = float(means_np[i])
-                wb[f"explainability/residual/constraint_{i}/std"] = float(stds_np[i])
-                wb[f"explainability/residual/constraint_{i}/max"] = float(maxes_np[i])
-                wb[f"explainability/residual/constraint_{i}/p99"] = float(p99_np[i])
+            # Use the *solver-side* index for the W&B key so the dashboard
+            # remains stable when users add/remove unrelated constraints.
+            for slot, i in enumerate(idx):
+                wb[f"explainability/residual/constraint_{i}/mean"] = float(means_sel[slot])
+                wb[f"explainability/residual/constraint_{i}/std"] = float(stds_sel[slot])
+                wb[f"explainability/residual/constraint_{i}/max"] = float(maxes_sel[slot])
+                wb[f"explainability/residual/constraint_{i}/p99"] = float(p99_sel[slot])
             try:
                 import wandb as _wandb
 
-                for i, r in enumerate(raw_np):
-                    wb[f"explainability/residual/constraint_{i}/histogram"] = _wandb.Histogram(r)
+                for slot, i in enumerate(idx):
+                    wb[f"explainability/residual/constraint_{i}/histogram"] = _wandb.Histogram(raw_sel[slot])
             except ImportError:
                 pass
             wandb_log(wb, step=epoch)
@@ -842,10 +918,14 @@ class ResidualStatsCallback(Callback):
 
         Keys:
             ``epochs`` — ``(S,)`` int array of sampled outer steps.
-            ``means``  — ``(S, N)`` float32 per-constraint residual mean.
-            ``stds``   — ``(S, N)`` float32 per-constraint residual std.
-            ``maxes``  — ``(S, N)`` float32 per-constraint residual max.
-            ``p99``    — ``(S, N)`` float32 per-constraint 99th-percentile.
+            ``means``  — ``(S, K)`` float32 per-constraint residual mean,
+                where ``K = len(constraints)`` when a subset was selected,
+                else ``N_constraints``.
+            ``stds``   — ``(S, K)`` float32 per-constraint residual std.
+            ``maxes``  — ``(S, K)`` float32 per-constraint residual max.
+            ``p99``    — ``(S, K)`` float32 per-constraint 99th-percentile.
+            ``indices`` — ``(K,)`` int array of solver-side constraint indices
+                in the same order as the columns of ``means``/``stds``/etc.
         """
         empty = np.zeros((0,))
         return {
@@ -854,6 +934,7 @@ class ResidualStatsCallback(Callback):
             "stds": np.stack(self._stds) if self._stds else empty,
             "maxes": np.stack(self._maxes) if self._maxes else empty,
             "p99": np.stack(self._p99) if self._p99 else empty,
+            "indices": np.array(self._indices, dtype=int),
         }
 
 
@@ -988,7 +1069,7 @@ class callbacks:
         return LossLandscapeCallback(interval=interval, mask=mask, n_grid=n_grid, alpha_range=alpha_range)
 
     @staticmethod
-    def residual_stats(interval: int = 100) -> ResidualStatsCallback:
+    def residual_stats(interval: int = 100, constraints=None) -> ResidualStatsCallback:
         """Create a :class:`ResidualStatsCallback`.
 
         Tracks per-constraint residual mean, std, max, and 99th-percentile —
@@ -997,5 +1078,9 @@ class callbacks:
 
         Args:
             interval: Compute every *n* outer training steps.
+            constraints: Optional list of constraint placeholders to scope to a
+                subset of the solver's constraints.  Pass the same Python
+                objects given to ``jno.core([...])`` (assign your constraints
+                to variables first).  Default ``None`` — all constraints.
         """
-        return ResidualStatsCallback(interval=interval)
+        return ResidualStatsCallback(interval=interval, constraints=constraints)
