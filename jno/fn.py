@@ -529,10 +529,13 @@ else:
             # Factory function → call it, returns an instance
             instance = symbol(**ctor_kwargs)
 
+            # These attributes may be read-only properties on user-defined
+            # weighting classes; only swallow the narrow AttributeError that
+            # the assignment can legitimately raise.
             if hasattr(instance, "num_losses") and getattr(instance, "num_losses", None) is None:
                 try:
                     instance.num_losses = n_losses
-                except Exception:
+                except AttributeError:
                     pass
 
             if hasattr(instance, "lambdas") and getattr(instance, "lambdas", None) is None:
@@ -540,7 +543,7 @@ else:
                     import numpy as _np
 
                     instance.lambdas = _np.ones((n_losses,), dtype=_np.float32)
-                except Exception:
+                except AttributeError:
                     pass
             return instance
 

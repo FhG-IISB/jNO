@@ -1,1 +1,2 @@
 06_integration/fredholm_integral_equation.py | epochs=50000 | rel_L2=1.974346e-04
+06_integration/heat_time_mean.py | epochs=10000 | rel_L2_u=0.000000e+00 | rel_L2_mean=2.629577e-04

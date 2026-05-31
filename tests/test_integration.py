@@ -781,3 +781,284 @@ class TestGradientAccumulation:
 
         logs = stats.training_logs[-1]
         assert jnp.isfinite(logs["total_loss"][-1])
+
+
+# ======================================================================
+# Temporal integration — .integrate(t)
+# ======================================================================
+
+
+def _make_1d_time_domain(*, n_time: int = 20, n_spatial: int = 16):
+    """1-D line domain on [0,1] × t∈[0,1] with n_time time steps."""
+    import jno
+
+    return jno.domain(constructor=jno.domain.line(mesh_size=1.0 / (n_spatial + 1)), time=(0.0, 1.0, n_time))
+
+
+def _eval_time_integral(expr, domain, *, min_consecutive=None):
+    """Compile and evaluate a single expression directly (no training)."""
+    import jno
+
+    (val,) = jno.core([], domain).eval([expr], domain=domain, min_consecutive=min_consecutive)
+    return val
+
+
+class TestIntegralTime:
+    """Unit tests for temporal integration correctness and error conditions."""
+
+    def test_integral_t_constant_is_one(self):
+        """∫₀¹ 1 dt = 1.0 (trapezoidal, uniform 50-step grid)."""
+
+        dom = _make_1d_time_domain(n_time=50)
+        x, t = dom.variable("interior")
+        # t * 0 + 1 evaluates to the constant 1 with the same shape as t
+        expr = t * 0 + 1
+        result = expr.integrate(t)
+        val = _eval_time_integral(result, dom)
+        assert jnp.allclose(val, 1.0, atol=1e-3), f"∫1 dt expected 1.0, got {float(val):.6f}"
+
+    def test_integral_t_linear_is_half(self):
+        """∫₀¹ t dt = 0.5 (trapezoidal, uniform 100-step grid)."""
+
+        dom = _make_1d_time_domain(n_time=100)
+        x, t = dom.variable("interior")
+        result = t.integrate(t)
+        val = _eval_time_integral(result, dom)
+        assert jnp.allclose(val, 0.5, atol=1e-3), f"∫t dt expected 0.5, got {float(val):.6f}"
+
+    def test_integral_t_sine_matches_analytical(self):
+        """∫₀¹ sin(π t) dt = 2/π ≈ 0.6366 (trapezoidal, 200-step grid)."""
+        import jno.jnp_ops as jnn
+
+        dom = _make_1d_time_domain(n_time=200)
+        x, t = dom.variable("interior")
+        result = jnn.sin(jnn.pi * t).integrate(t)
+        val = _eval_time_integral(result, dom)
+        expected = 2.0 / float(jnp.pi)
+        assert jnp.allclose(val, expected, atol=1e-3), f"∫sin(πt) dt expected {expected:.4f}, got {float(val):.6f}"
+
+    def test_integrate_t_returns_integral_time_node(self):
+        """Passing a temporal Variable to .integrate() returns IntegralTime, not Integral."""
+        from jno.trace import IntegralTime
+
+        dom = _make_1d_time_domain()
+        x, t = dom.variable("interior")
+        result = t.integrate(t)
+        assert isinstance(result, IntegralTime), f"Expected IntegralTime, got {type(result)}"
+
+    def test_integrate_spatial_var_still_returns_integral(self):
+        """Passing a spatial Variable to .integrate() still returns Integral (no regression)."""
+        from jno.trace import Integral, IntegralTime
+
+        dom = _make_1d_time_domain()
+        x, t = dom.variable("interior")
+        result = x.integrate(x)
+        assert isinstance(result, Integral), f"Expected Integral, got {type(result)}"
+        assert not isinstance(result, IntegralTime)
+
+    def test_integrate_no_var_still_returns_integral(self):
+        """Calling .integrate() without argument still returns Integral (no regression)."""
+        from jno.trace import Integral, IntegralTime
+
+        dom = _make_1d_time_domain()
+        x, t = dom.variable("interior")
+        result = x.integrate()
+        assert isinstance(result, Integral)
+        assert not isinstance(result, IntegralTime)
+
+    def test_chained_spacetime_integral_unit_const(self):
+        """∫₀¹ ∫₀¹ 1 dx dt ≈ 1.0 via .integrate().integrate(t)."""
+
+        dom = _make_1d_time_domain(n_time=50, n_spatial=32)
+        x, t = dom.variable("interior")
+        # x * 0 + t * 0 + 1 = constant 1 (depends on both x and t for shape)
+        expr = x * 0 + t * 0 + 1
+        result = expr.integrate().integrate(t)
+        val = _eval_time_integral(result, dom)
+        # Spatial integral of 1 over [0,1] ≈ 1.0; time integral of 1 over [0,1] = 1.0
+        assert jnp.allclose(val, 1.0, atol=5e-2), f"∫∫ 1 dx dt expected ≈1.0, got {float(val):.6f}"
+
+
+class TestIntegralTimeGuard:
+    """Guard: min_consecutive < 2 with IntegralTime in graph raises ValueError."""
+
+    def _build_minimal_solver(self):
+        import foundax
+        import jax
+        import optax
+
+        import jno
+        import jno.jnp_ops as jnn
+        from jno import LearningRateSchedule as lrs
+
+        dom = _make_1d_time_domain(n_time=5)
+        x, t = dom.variable("interior")
+        key = jax.random.PRNGKey(0)
+        u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=8, num_layers=2, key=key))
+        loss = (u_net(x) * (t * 0 + 1)).integrate(t)
+        solver = jno.core([loss], dom)
+        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        return solver
+
+    def test_min_consecutive_1_raises(self):
+        """solve(min_consecutive=1) raises ValueError when IntegralTime is in graph."""
+        solver = self._build_minimal_solver()
+        with pytest.raises(ValueError, match="min_consecutive"):
+            solver.solve(epochs=1, min_consecutive=1)
+
+    def test_min_consecutive_default_raises(self):
+        """solve() with default min_consecutive=1 raises ValueError for IntegralTime."""
+        solver = self._build_minimal_solver()
+        with pytest.raises(ValueError, match="min_consecutive"):
+            solver.solve(epochs=1)
+
+    def test_min_consecutive_none_ok(self):
+        """solve(min_consecutive=None) does NOT raise for IntegralTime."""
+        solver = self._build_minimal_solver()
+        stats = solver.solve(epochs=1, min_consecutive=None)
+        assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
+
+    def test_min_consecutive_2_ok(self):
+        """solve(min_consecutive=2) is the minimum valid value — no error."""
+        solver = self._build_minimal_solver()
+        stats = solver.solve(epochs=1, min_consecutive=2)
+        assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
+
+
+@pytest.mark.integration
+class TestIntegralTimeIntegration:
+    """Integration tests: training with IntegralTime constraints."""
+
+    def test_time_integral_loss_decreases(self):
+        """Network trained to match ∫₀¹ u dt = 0.5 should see loss decrease."""
+        import foundax
+        import jax
+        import optax
+
+        import jno
+        import jno.jnp_ops as jnn
+        from jno import LearningRateSchedule as lrs
+
+        dom = _make_1d_time_domain(n_time=10, n_spatial=32)
+        x, t = dom.variable("interior")
+        key = jax.random.PRNGKey(42)
+        u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=32, num_layers=3, key=key))
+        TARGET = 0.5
+        loss = ((u_net(x) * (t * 0 + 1)).integrate(t) - TARGET) ** 2
+        solver = jno.core([loss], dom)
+        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        stats = solver.solve(epochs=200, min_consecutive=None)
+        logs = stats.training_logs[-1]["total_loss"]
+        assert logs[-1] < logs[0], "Loss should decrease over 200 epochs"
+        assert jnp.isfinite(logs[-1])
+
+    def test_time_integral_windowed_does_not_crash(self):
+        """Training with min_consecutive=2 (windowed) completes without error."""
+        import foundax
+        import jax
+        import optax
+
+        import jno
+        import jno.jnp_ops as jnn
+        from jno import LearningRateSchedule as lrs
+
+        dom = _make_1d_time_domain(n_time=8, n_spatial=16)
+        x, t = dom.variable("interior")
+        key = jax.random.PRNGKey(7)
+        u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=16, num_layers=2, key=key))
+        loss = ((u_net(x) * (t * 0 + 1)).integrate(t) - 0.5) ** 2
+        solver = jno.core([loss], dom)
+        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        stats = solver.solve(epochs=5, min_consecutive=2)
+        assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
+
+
+# ======================================================================
+# normals=True — boundary normal Variables for flux integrals
+# ======================================================================
+class TestBoundaryNormal:
+    """Tests for domain.variable(normals=True) and boundary flux integrals."""
+
+    def _make_2d_domain(self):
+        import jno
+
+        return jno.domain(constructor=jno.domain.rect(mesh_size=0.1), compute_mesh_connectivity=True)
+
+    def _make_1d_domain(self):
+        import jno
+
+        return jno.domain.line(mesh_size=0.01)
+
+    def test_normals_true_2d_returns_extra_vars(self):
+        """2-D mesh: variable(normals=True) returns 5 Variables (x, y, t, nx, ny)."""
+        dom = self._make_2d_domain()
+        result = dom.variable("boundary", normals=True)
+        assert len(result) == 5  # x, y, t, nx, ny
+
+    def test_normals_true_1d_returns_extra_var(self):
+        """1-D mesh: variable(normals=True) returns 3 Variables (x, t, n)."""
+        dom = self._make_1d_domain()
+        result = dom.variable("right", normals=True)
+        assert len(result) == 3  # x, t, n
+
+    def test_normal_sign_right_is_positive(self):
+        """The outward normal at the right boundary (x=1) is +1."""
+        import jno
+
+        dom = self._make_1d_domain()
+        x, _, n = dom.variable("right", normals=True)
+        flux = n.integrate()
+        (val,) = jno.core([], dom).eval([flux], domain=dom)
+        assert float(val) > 0, f"Right normal should be positive, got {float(val):.4f}"
+
+    def test_normal_sign_left_is_negative(self):
+        """The outward normal at the left boundary (x=0) is -1."""
+        import jno
+
+        dom = self._make_1d_domain()
+        x, _, n = dom.variable("left", normals=True)
+        flux = n.integrate()
+        (val,) = jno.core([], dom).eval([flux], domain=dom)
+        assert float(val) < 0, f"Left normal should be negative, got {float(val):.4f}"
+
+    def test_normal_right_plus_left_opposite_signs(self):
+        """Right and left outward normals have opposite integrated sign (Gauss in 1-D)."""
+        import jno
+
+        dom = self._make_1d_domain()
+        _, _, nr = dom.variable("right", normals=True)
+        _, _, nl = dom.variable("left", normals=True)
+        (vr,) = jno.core([], dom).eval([nr.integrate()], domain=dom)
+        (vl,) = jno.core([], dom).eval([nl.integrate()], domain=dom)
+        assert float(vr) > 0 and float(vl) < 0
+        assert jnp.allclose(vr, -vl, atol=1e-5), (
+            f"right flux={float(vr):.6f}, left flux={float(vl):.6f} should be equal and opposite"
+        )
+
+    def test_divergence_theorem_2d(self):
+        """Gauss 2-D: ∫_∂Ω ∇u · n dS = ∫_Ω Δu dΩ for u = sin(πx)sin(πy)."""
+        import jno
+
+        dom = self._make_2d_domain()
+        x, y, _ = dom.variable("interior")
+        x_b, y_b, _, nx, ny = dom.variable("boundary", normals=True)
+
+        u_int = jno.np.sin(jno.np.pi * x) * jno.np.sin(jno.np.pi * y)
+        u_bnd = jno.np.sin(jno.np.pi * x_b) * jno.np.sin(jno.np.pi * y_b)
+
+        vol = u_int.laplacian(x, y).integrate()
+        flux = (u_bnd.d(x_b) * nx + u_bnd.d(y_b) * ny).integrate()
+
+        crux = jno.core([], dom)
+        vol_val, flux_val = crux.eval([vol, flux], domain=dom)
+        vol_s = jnp.squeeze(vol_val)
+        flux_s = jnp.squeeze(flux_val)
+        assert jnp.allclose(vol_s, flux_s, rtol=0.05), (
+            f"Divergence theorem 2-D: ∫Δu={float(vol_s):.4f}, ∫∇u·n={float(flux_s):.4f}"
+        )
+
+    def test_normals_true_on_interior_raises(self):
+        """normals=True on a non-boundary tag should raise ValueError, not IndexError."""
+        dom = self._make_2d_domain()
+        with pytest.raises(ValueError, match="no outward normals found for tag 'interior'"):
+            dom.variable("interior", normals=True)

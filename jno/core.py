@@ -34,6 +34,7 @@ from .trace import (
     Choice,
     FunctionCall,
     Hessian,
+    IntegralTime,
     Jacobian,
     Model,
     OperationCall,
@@ -58,6 +59,35 @@ from .utils import (
     statistics,
 )
 from .utils.config import get_wandb_run, wandb_alert, wandb_log, wandb_log_model
+
+
+def _find_temporal_variable(expr: Placeholder):
+    """Walk an expression tree and return the first temporal Variable, or None."""
+    from .trace import Variable as _Variable
+
+    seen: set = set()
+
+    def visit(node):
+        if node is None or id(node) in seen:
+            return None
+        seen.add(id(node))
+        if isinstance(node, _Variable) and getattr(node, "axis", "spatial") == "temporal":
+            return node
+        for attr in ("target", "left", "right", "expr", "operation"):
+            child = getattr(node, attr, None)
+            if isinstance(child, Placeholder):
+                hit = visit(child)
+                if hit is not None:
+                    return hit
+        for attr in ("args", "variables", "options"):
+            for child in getattr(node, attr, []):
+                if isinstance(child, Placeholder):
+                    hit = visit(child)
+                    if hit is not None:
+                        return hit
+        return None
+
+    return visit(expr)
 
 
 class core:
@@ -150,6 +180,28 @@ class core:
         self.log.info(f"RNG seed: {seed}")
 
         self.log.info("Initializing Model/s and compiling constraints")
+
+        # If any constraint references a PDEformer-2 backbone, build its PDE
+        # graph automatically from the symbolic expressions before compile().
+        try:
+            from .architectures.pdeformer2_bridge import maybe_attach_pdeformer2_graphs
+
+            maybe_attach_pdeformer2_graphs(self.constraints, self.domain)
+        except ImportError:
+            pass  # jax_pdeformer2 / networkx not installed → silently skip
+
+        # Early validation: temporal Variables require a time-dependent domain.
+        # Without this, compilation succeeds and the failure surfaces later as
+        # a cryptic KeyError on '__time__' deep in trace_evaluator.
+        if not getattr(self.domain, "_is_time_dependent", False):
+            for expr in self.constraints:
+                tvar = _find_temporal_variable(expr)
+                if tvar is not None:
+                    raise ValueError(
+                        f"Constraint uses a temporal Variable (tag='{tvar.tag}', axis='temporal') "
+                        f"but the domain is not time-dependent. Pass time=(t0, t1, n_t) when "
+                        f"constructing the domain, e.g. jno.domain.line(time=(0.0, 1.0, 50))."
+                    )
 
         self.compile(mesh)
 
@@ -997,6 +1049,13 @@ class core:
 
         from jax._src import profiler as _jax_profiler
 
+        if not self.constraints:
+            raise ValueError(
+                "solve() requires at least one constraint. "
+                "Pass a non-empty list to jno.core([...], domain) — typically a "
+                "PDE residual .mse, a boundary-condition loss, or a data-fitting term."
+            )
+
         _profiling = _jax_profiler._profile_state.profile_session is not None
         _trace = jax.profiler.TraceAnnotation if _profiling else lambda name, **_: nullcontext()
 
@@ -1010,6 +1069,43 @@ class core:
                 "accumulation_steps > 1 has no effect with full-batch training; falling back to accumulation_steps=1"
             )
             accumulation_steps = 1
+
+        # Guard: IntegralTime requires min_consecutive >= 2
+        def _has_integral_time(node):
+            if isinstance(node, IntegralTime):
+                return True
+            for attr in ("target", "left", "right", "expr"):
+                child = getattr(node, attr, None)
+                if isinstance(child, Placeholder) and _has_integral_time(child):
+                    return True
+            for attr in ("args", "variables"):
+                for child in getattr(node, attr, []):
+                    if isinstance(child, Placeholder) and _has_integral_time(child):
+                        return True
+            return False
+
+        if min_consecutive is not None and min_consecutive < 2:
+            for expr in getattr(self, "_constraint_exprs", []):
+                if _has_integral_time(expr):
+                    raise ValueError(
+                        f"IntegralTime (.integrate(t)) requires min_consecutive >= 2 "
+                        f"(trapezoidal integration over a single time step is identically zero). "
+                        f"Got min_consecutive={min_consecutive} (the default is 1). "
+                        f"Pass min_consecutive=None to use all T time steps, "
+                        f"or min_consecutive=2 for the minimum valid windowed integration."
+                    )
+
+        if (
+            min_consecutive == 1
+            and getattr(self.domain, "_is_time_dependent", False)
+            and not getattr(self, "_min_consec_nudged", False)
+        ):
+            self.log.info(
+                "Time-dependent domain with min_consecutive=1: each step sees a single "
+                "time slice. Pass min_consecutive=None (all T) or >=2 for true "
+                "spatiotemporal training."
+            )
+            self._min_consec_nudged = True
 
         # Adaptive resampling metadata
         strategies = getattr(self.domain, "_resampling_strategies", {})
@@ -1108,8 +1204,12 @@ class core:
             if needs_optimizer and fm._opt_fn is None:
                 raise ValueError(
                     f"Model '{fm.name or type(fm.module).__name__}' (layer {lid}) "
-                    f"has no optimizer. Call  model.optimizer(optax.adam, lr=...)  "
-                    f"before solve(), or freeze it with  model.freeze()."
+                    f"has no optimizer. Either attach one before solve(), or freeze "
+                    f"the model with model.freeze().\n"
+                    f"Example setup:\n"
+                    f"    import jno, optax\n"
+                    f"    model = jno.nn.wrap(my_eqx_module)\n"
+                    f"    model.optimizer(optax.adam, lr=1e-3)"
                 )
 
         # ── 2. Apply LoRA transforms ──
@@ -1397,7 +1497,11 @@ class core:
                 lr_sched = fm._lr if fm._lr is not None else LearningRateSchedule(1e-3)
 
                 if opt_fn is None:
-                    raise ValueError(f"Model (layer {lid}) has no optimizer.")
+                    raise ValueError(
+                        f"Model (layer {lid}) has no optimizer. "
+                        f"Call model.optimizer(optax.adam, lr=...) before solve(), "
+                        f"or freeze the model with model.freeze()."
+                    )
 
                 if callable(opt_fn) and not isinstance(opt_fn, optax.GradientTransformation):
                     try:
@@ -2040,7 +2144,7 @@ class core:
                         except (IndexError, KeyError, AttributeError):
                             try:
                                 _lr = float(jax.device_get(_wst[0].inner_state[-1].hyperparams["step_size"]))
-                            except Exception:
+                            except (IndexError, KeyError, AttributeError, TypeError):
                                 _lr = None
                         if _lr is not None:
                             _model_name = _wandb_model_names.get(_wk, _wk)

@@ -1692,10 +1692,15 @@ class domain(MeshIOMixin):
                     self.tag_indices[name] = indices_list
                     self._mesh_pool[name] = points[indices_list]
 
+                    # Only attach per-point normals when every point in this tag
+                    # has one — otherwise the tag mixes boundary and interior
+                    # points (e.g. the gmsh "interior" surface tag includes the
+                    # boundary nodes too), and storing a partial normal array
+                    # creates a shape mismatch against _mesh_pool[name].
                     normal_positions = np.array([index_to_normal_pos[i] for i in indices_list if i in index_to_normal_pos])
-                    if len(normal_positions) > 0:
+                    if len(normal_positions) == len(indices_list) and len(indices_list) > 0:
                         self.normals_by_tag[name] = boundary_normals[normal_positions]
-                    else:
+                    elif len(normal_positions) == 0:
                         tag_pt_coords = points[indices_list, : self.dimension]
                         if len(tag_pt_coords) > 1:
                             tag_normals, _ = self._compute_normals_pca(
@@ -1961,8 +1966,20 @@ class domain(MeshIOMixin):
                 return Variable(tag=tag, dim=[0, None], domain=self)
 
         if tag not in self.context:
-            available = list(self.context.keys())
-            raise ValueError(f"Tag '{tag}' not found. Did you call sample() first? Available: {available}")
+            available = sorted(k for k in self.context.keys() if not k.startswith("__"))
+            mesh_keys = sorted(getattr(self, "_mesh_pool", {}).keys())
+            if tag in mesh_keys:
+                hint = (
+                    f"Tag '{tag}' exists in the mesh pool but has not been sampled yet. "
+                    f"Call domain.variable('{tag}', sample=(n, sampler)) to materialize it."
+                )
+            else:
+                hint = (
+                    f"Tag '{tag}' is not in the mesh pool or context. "
+                    f"Available context tags: {available}. "
+                    f"Available mesh-pool tags: {mesh_keys}."
+                )
+            raise ValueError(hint)
 
         fem_meta = None
         if getattr(self, "_variational_initialized", False):
@@ -1989,6 +2006,12 @@ class domain(MeshIOMixin):
         )
 
         if normals:
+            if f"n_{tag}" not in self.context:
+                raise ValueError(
+                    f"domain.variable('{tag}', normals=True): no outward normals found for "
+                    f"tag '{tag}'. Normals are only available for boundary tags on mesh-based "
+                    "domains. Check that the tag refers to a boundary region."
+                )
             if reverse_normals:
                 self.context[f"n_{tag}"] = -self.context[f"n_{tag}"]
             coord_vars += [Variable(tag=f"n_{tag}", dim=[i, i + 1], domain=self) for i in range(len(self.spatial))]
@@ -1996,7 +2019,7 @@ class domain(MeshIOMixin):
         if view_factor and hasattr(self, "mesh_connectivity"):
             # Only take the first batch index
             Nrm = -self.context[f"n_{tag}"][0, ...]  # Reverse the normals
-            P = points[0, ...]
+            P = self.context[tag][0, ...]
 
             ds = self.mesh_connectivity["nodal_ds"][self.mesh_connectivity["boundary_indices"]]
 
@@ -2033,12 +2056,25 @@ class domain(MeshIOMixin):
 
             if self.dimension == 1:
                 VF = self.get_view_factor_1d(P[0], subset_VM, Nrm[0], ds)
-            if self.dimension == 2:
+            elif self.dimension == 2:
                 VF = self.get_view_factor_2d(P[0], subset_VM, Nrm[0], ds)
             elif self.dimension == 3:
                 VF = self.get_view_factor_3d(P[0], subset_VM, Nrm[0], ds)
+            else:
+                raise ValueError(
+                    f"view_factor=True is only supported for spatial dimension 1, 2, or 3 (got dimension={self.dimension})."
+                )
 
-            # TODO: Fix if used for multiple domains !
+            # view_factor stores tensors with a hard-coded batch size of 1.
+            # Reject the batched-domain case explicitly instead of silently
+            # producing wrong results when the domain has been merged via `+`.
+            batch_count = getattr(self, "_batch_count", 1) or 1
+            if batch_count > 1:
+                raise NotImplementedError(
+                    f"view_factor=True is not supported on batched domains "
+                    f"(_batch_count={batch_count}). Compute view factors on a "
+                    "single-batch domain or open an issue if you need this."
+                )
             self.context[f"v_{tag}"] = subset_VM[None, None, ...]
             self._param_tags.add(f"v_{tag}")
             self.context[f"f_{tag}"] = VF[None, ...]
@@ -2690,7 +2726,7 @@ class domain(MeshIOMixin):
                 self.log.error(f"Tag '{tag}' not found. Available: {available}")
 
             sampling_groups = self._sampling_groups_for_tag(source_tag)
-            normals_avaiable = normals and any(group_normals is not None for _, _, group_normals in sampling_groups)
+            normals_available = normals and any(group_normals is not None for _, _, group_normals in sampling_groups)
 
             available_points = sampling_groups[0][1]
             n_available_by_group = []
@@ -2750,7 +2786,7 @@ class domain(MeshIOMixin):
                             # (N, D) → (n_samples, D)
                             all_samples.append(group_points[idx])
 
-                        if normals_avaiable and group_normals is not None:
+                        if normals_available and group_normals is not None:
                             all_normals.append(group_normals[idx])
 
                 # Stack → (B, T, N, D) for time-dep, (B, N, D) for steady
@@ -2760,7 +2796,7 @@ class domain(MeshIOMixin):
                     stacked = stacked[:, np.newaxis, :, :]
                 self.context[tag] = _apply_time_value_to_sampled(tag, stacked)
 
-                if normals_avaiable and all_normals:
+                if normals_available and all_normals:
                     nrm_stacked = np.stack(all_normals, axis=0)
                     if not is_time_dep:
                         nrm_stacked = nrm_stacked[:, np.newaxis, :, :]
@@ -2790,7 +2826,7 @@ class domain(MeshIOMixin):
                 )
                 self.context[tag] = _apply_time_value_to_sampled(tag, self.context[tag])
 
-                if normals_avaiable and available_normals is not None:
+                if normals_available and available_normals is not None:
                     sampled_nrm = available_normals[idx]
                     if not is_time_dep:
                         sampled_nrm = sampled_nrm[np.newaxis, :, :]

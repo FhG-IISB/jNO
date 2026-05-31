@@ -34,6 +34,8 @@ from .trace import (
     FunctionCall,
     GroupedAssembly,
     Hessian,
+    Integral,
+    IntegralTime,
     Jacobian,
     Model,
     ModelCall,
@@ -334,6 +336,8 @@ class TraceCompiler:
                 visit(node.target)
             elif isinstance(node, NetworkGradient):
                 visit(node.target)  # registers the Model inside target
+            elif isinstance(node, (Integral, IntegralTime)):
+                visit(node.target)
             elif isinstance(node, Assembly):
                 visit(node.expr)
             elif isinstance(node, GroupedAssembly):
@@ -1052,6 +1056,12 @@ class TraceCompiler:
                     batched_sizes.append(arr.shape[0])
 
             if not batched_sizes:
+                # Inject __time_window__ for IntegralTime nodes that live in
+                # time-only expressions (no spatial variables in expr_tags).
+                if TIME_TAG in context:
+                    context_with_window = dict(context)
+                    context_with_window["__time_window__"] = jnp.asarray(context[TIME_TAG])
+                    return evaluate_single_point_set(params, context_with_window, key=key)
                 return evaluate_single_point_set(params, context, key=key)
 
             B = max(batched_sizes)
@@ -1160,6 +1170,11 @@ class TraceCompiler:
                     windowed_ctx: tuple of (W, N, D) or non-spatial arrays.
                     t_wind: (W, 1) time slice, or dummy scalar when time_arr is None.
                     """
+                    # Augment passive_ctx with the full time window so IntegralTime
+                    # handlers can access all W time values even inside the per-step vmap.
+                    augmented_passive_ctx = dict(passive_ctx)
+                    augmented_passive_ctx["__time_window__"] = t_wind  # (W, 1)
+
                     if W > 1:
                         # Vmap over the time-window dimension so each step
                         # sees (N, D) spatial + (1,) time — identical to W=1.
@@ -1175,7 +1190,7 @@ class TraceCompiler:
                             step_t = step_spatial_and_t[-1]
                             step_spatial = step_spatial_and_t[:-1]
                             ctx_dict = dict(metadata_ctx)
-                            ctx_dict.update(passive_ctx)
+                            ctx_dict.update(augmented_passive_ctx)
                             active_spatial_n = None
                             for tag, step_arr in zip(spatial_tag_order, step_spatial):
                                 ctx_dict[tag] = step_arr
@@ -1193,7 +1208,7 @@ class TraceCompiler:
                         )(*windowed_ctx, t_wind)
                     else:
                         ctx_dict = dict(metadata_ctx)
-                        ctx_dict.update(passive_ctx)
+                        ctx_dict.update(augmented_passive_ctx)
                         active_spatial_n = None
                         for tag, arr in zip(spatial_tag_order, windowed_ctx):
                             if hasattr(arr, "ndim") and arr.ndim >= 2:
@@ -1335,6 +1350,12 @@ class TraceCompiler:
                     batched_sizes.append(arr.shape[0])
 
             if not batched_sizes:
+                # Inject __time_window__ for IntegralTime nodes that live in
+                # time-only expressions (no spatial variables in expr_tags).
+                if TIME_TAG in context:
+                    context_with_window = dict(context)
+                    context_with_window["__time_window__"] = jnp.asarray(context[TIME_TAG])
+                    return evaluate_single_point_set(params, context_with_window, key=key)
                 return evaluate_single_point_set(params, context, key=key)
 
             B = max(batched_sizes)
@@ -1424,6 +1445,11 @@ class TraceCompiler:
                     start = zero_idx
 
                 def eval_window(windowed_ctx, t_wind):
+                    # Augment passive_ctx with the full time window so IntegralTime
+                    # handlers can access all W time values even inside the per-step vmap.
+                    augmented_passive_ctx = dict(passive_ctx)
+                    augmented_passive_ctx["__time_window__"] = t_wind  # (W, 1)
+
                     if W > 1:
                         # Vmap over the W (time-window) dimension so each
                         # step sees (N, D) spatial + (1,) time — identical
@@ -1442,7 +1468,7 @@ class TraceCompiler:
                             step_t = step_spatial_and_t[-1]
                             step_spatial = step_spatial_and_t[:-1]
                             ctx_dict = dict(metadata_ctx)
-                            ctx_dict.update(passive_ctx)
+                            ctx_dict.update(augmented_passive_ctx)
                             active_spatial_n = None
                             for tag, step_arr in zip(spatial_tag_order, step_spatial):
                                 ctx_dict[tag] = step_arr
@@ -1461,7 +1487,7 @@ class TraceCompiler:
                     else:
                         # W == 1: squeeze the window dimension
                         ctx_dict = dict(metadata_ctx)
-                        ctx_dict.update(passive_ctx)
+                        ctx_dict.update(augmented_passive_ctx)
                         active_spatial_n = None
                         for tag, arr in zip(spatial_tag_order, windowed_ctx):
                             if hasattr(arr, "ndim") and arr.ndim >= 2:
