@@ -65,6 +65,57 @@ def make_residual_stats_fn(
     return stats
 
 
+def make_expression_eval_fn(
+    expr,
+    all_ops,
+    batchsize,
+    frozen,
+    static,
+    min_consecutive: int = 1,
+):
+    """Build a function that evaluates any placeholder expression during training.
+
+    Compiles a user-supplied jno placeholder expression — for example
+    ``u.d(x)`` for an input gradient (saliency), ``Jacobian(u, [x, y])``
+    for a multi-variable spatial Jacobian, or any composite expression —
+    using the same :class:`~jno.trace_compiler.TraceCompiler` pathway that
+    the solver uses for constraints and trackers (Sec. 3, [1312.6034]).
+
+    Returns a JIT-friendly callable::
+
+        f(trainable, context, rng) -> values
+
+    where ``values`` is the array (or pytree) returned by evaluating
+    ``expr`` against the current parameters and the collocation points
+    bound to ``expr``'s :class:`~jno.trace.Variable` references.
+
+    Args:
+        expr: Any :class:`~jno.trace.Placeholder` expression.
+        all_ops: List of :class:`~jno.trace.OperationDef` (the solver's
+            ``self.all_ops``).  Forwarded to ``compile_multi_expression``.
+        batchsize: Mini-batch size (``None`` for full-batch).
+        frozen: Frozen parameter pytree (from ``eqx.partition``).
+        static: Static (non-array) pytree.
+        min_consecutive: Forwarded to the compiled expression.
+    """
+    from jno.trace_compiler import TraceCompiler
+
+    compiled_fn = TraceCompiler.compile_multi_expression([expr], all_ops)
+
+    def eval_expr(trainable, context, rng):
+        full_models = eqx.combine(trainable, frozen, static)
+        results = compiled_fn(
+            full_models,
+            context,
+            batchsize=batchsize,
+            key=rng,
+            min_consecutive=min_consecutive,
+        )
+        return results[0]
+
+    return eval_expr
+
+
 def make_per_loss_grad_fn(
     compiled_constraints_fn,
     n_constraints: int,
