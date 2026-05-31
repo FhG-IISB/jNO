@@ -61,3 +61,56 @@ def test_residual_stats_matches_handcomputed():
     assert len(raw) == 2
     assert raw[0].shape == (11,)
     assert raw[1].shape == (4,)
+
+
+def test_residual_stats_subset_selects_one_constraint():
+    """End-to-end: passing a subset of constraints scopes stats and W&B keys
+    to those constraints only.
+    """
+    import foundax
+    import optax
+    import pytest
+
+    import jno
+    import jno.jnp_ops as jnn
+    from jno import LearningRateSchedule as lrs
+    from jno.utils.adaptive.callbacks import ResidualStatsCallback
+
+    domain = jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+    x, _ = domain.variable("interior")
+    key = jax.random.PRNGKey(0)
+
+    u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=4, num_layers=2, key=key))
+    u_net.optimizer(optax.sgd, lr=lrs.exponential(0.0, 1.0, 1, 0.0))  # frozen
+    u = u_net(x)
+    c0 = (u * u).mse  # arbitrary residual
+    c1 = u.mse  # second constraint, different residual
+
+    solver = jno.core([c0, c1], domain)
+
+    # Subset: only c0 → result should have 1 column, and only the
+    # solver-side index 0 should appear in W&B keys (we can't inspect those
+    # without mocking, but we can verify the .result["indices"] is [0]).
+    cb_subset = ResidualStatsCallback(interval=1, constraints=[c0])
+    # Full: both constraints
+    cb_full = ResidualStatsCallback(interval=1)
+
+    solver.solve(2, callbacks=[cb_subset, cb_full])
+
+    # Subset result has K=1 column with index 0.
+    assert cb_subset.result["means"].shape == (2, 1)
+    np.testing.assert_array_equal(cb_subset.result["indices"], np.array([0]))
+
+    # Full has K=2 columns.
+    assert cb_full.result["means"].shape == (2, 2)
+    np.testing.assert_array_equal(cb_full.result["indices"], np.array([0, 1]))
+
+    # Subset's c0 column must equal full's c0 column (same compute, just sliced).
+    np.testing.assert_allclose(cb_subset.result["means"][:, 0], cb_full.result["means"][:, 0], atol=1e-6)
+
+    # Re-accessing .mse returns a fresh placeholder → identity match fails.
+    cb_bad = ResidualStatsCallback(interval=1, constraints=[(u * u).mse])
+    with pytest.raises(ValueError, match="constraint .* not found"):
+        # Re-using the same already-built solver; on_solve_begin fires when
+        # solve() is called again.
+        solver.solve(1, callbacks=[cb_bad])

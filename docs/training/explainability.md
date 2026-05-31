@@ -90,6 +90,24 @@ For each constraint $i$, evaluates the un-reduced residual array $r_i$ produced 
 
 W&B keys: `explainability/residual/constraint_{i}/{mean,std,max,p99}`, `.../histogram` (image)
 
+### Scoping to a subset of constraints
+
+Pass the constraint expressions you care about via `constraints=`. The callback validates them by Python identity against what was given to `jno.core(...)`, so you must assign your constraints to variables — `.mse` is a property that returns a fresh placeholder every access:
+
+```python
+pde_loss = pde.mse                       # assign once
+bc_loss  = bc.mse
+solver = jno.core([pde_loss, bc_loss], domain)
+
+cb = jno.callbacks.residual_stats(interval=100, constraints=[pde_loss])
+crux.solve(5000, callbacks=[cb])
+
+print(cb.result["means"].shape)   # (n_samples, 1)  — just pde_loss
+print(cb.result["indices"])       # [0]  — solver-side index
+```
+
+W&B keys use the **solver-side index** so the dashboard remains stable when you add or remove unrelated constraints later. `cb.result["indices"]` records that mapping.
+
 Reference: per-point residual magnitudes as a sampling / diagnostic signal — Sec. 3 of [[2207.10289](https://arxiv.org/abs/2207.10289)] (Wu et al., 2023).
 
 ---
