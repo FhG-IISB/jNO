@@ -106,3 +106,7 @@ If you use jNO in academic work, please cite:
   url     = {https://arxiv.org/abs/2605.10159}
 }
 ```
+
+## AI Disclosure
+
+Parts of this codebase — including model ports, tests, and documentation — were developed with the assistance of AI coding tools. All contributions are reviewed and tested to the best of our ability, but mistakes may remain; please open an issue if you spot one.
