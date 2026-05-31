@@ -49,24 +49,6 @@ separate repository ([foundax](https://github.com/FhG-IISB/foundax)),
 installed automatically as a dependency so they can also be used on
 their own.
 
-## Citation
-
-If you use jNO in academic work, please cite the
-[arXiv preprint](https://arxiv.org/abs/2605.10159) (and the specific
-version via the `Cite this repository` button on GitHub, which reads
-[`CITATION.cff`](CITATION.cff)):
-
-```bibtex
-@article{armbruster2026jno,
-  title   = {jNO: A JAX Library for Neural Operator and Foundation Model Training},
-  author  = {Armbruster, Leon and Ramesh, Rathan and Kruse, Georg and Straub, Christopher},
-  journal = {arXiv preprint arXiv:2605.10159},
-  year    = {2026},
-  doi     = {10.48550/arXiv.2605.10159},
-  url     = {https://arxiv.org/abs/2605.10159}
-}
-```
-
 ## Example
 
 ```python
@@ -110,3 +92,17 @@ pred, x, y, k = crux.eval([u, x, y, k], domain=tst_dom)
 print(pred.shape, x.shape, y.shape, k.shape)
 ```
 
+## Citation
+
+If you use jNO in academic work, please cite:
+
+```bibtex
+@article{armbruster2026jno,
+  title   = {jNO: A JAX Library for Neural Operator and Foundation Model Training},
+  author  = {Armbruster, Leon and Ramesh, Rathan and Kruse, Georg and Straub, Christopher},
+  journal = {arXiv preprint arXiv:2605.10159},
+  year    = {2026},
+  doi     = {10.48550/arXiv.2605.10159},
+  url     = {https://arxiv.org/abs/2605.10159}
+}
+```
