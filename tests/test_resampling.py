@@ -423,6 +423,129 @@ def test_domain_draw_candidates_returns_spatial_slice_for_time_dep():
         assert nrm.shape == pts.shape
 
 
+def test_merged_domain_resampling_draws_from_union():
+    """Resampling on a merged domain can select points from either sub-domain.
+
+    Two line domains cover non-overlapping x intervals ([0, 0.4] and [0.6, 1.0]).
+    After merging, draw_candidates returns a pool that spans both intervals.
+    Replacing all working-set points via RandomResampling must yield points from
+    the second interval — proving the full merged pool is used, not just the first
+    sub-domain's nodes.
+    """
+    d1 = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.05, x_range=(0.0, 0.4)))
+    d2 = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.05, x_range=(0.6, 1.0)))
+    d1.variable("interior", sample=(20, None))
+    d2.variable("interior", sample=(20, None))
+    merged = d1 + d2
+
+    pool, _ = merged.draw_candidates("interior")
+    assert pool is not None
+    assert np.any(pool[:, 0] <= 0.45), "pool should cover left interval"
+    assert np.any(pool[:, 0] >= 0.55), "pool should cover right interval"
+
+    # Batch 0 starts entirely in [0.1, 0.35] — the left sub-domain.
+    batch0_pts = jnp.array(merged.context["interior"][0, 0])
+    assert float(batch0_pts[:, 0].max()) < 0.45, "batch 0 should start in left interval"
+
+    strategy = RandomResampling(resample_every=1, resample_fraction=1.0, start_epoch=0)
+    new_pts = strategy.resample(
+        batch0_pts,
+        jnp.ones(batch0_pts.shape[0]),
+        merged,
+        "interior",
+        epoch=0,
+        rng_key=jax.random.PRNGKey(42),
+        candidates=pool,
+    )
+    # With full replacement from a balanced pool covering both halves, at least one
+    # point from [0.6, 1.0] must appear; P(failure) < 0.1% per seed.
+    assert np.any(np.asarray(new_pts[:, 0]) >= 0.55), (
+        "After full-fraction resampling from merged pool, points from the right "
+        f"sub-domain must appear; got max x = {float(new_pts[:, 0].max()):.3f}"
+    )
+
+
+def test_polygon_draw_candidates_exceeds_sample_size():
+    """PolygonDomain.draw_candidates returns more candidates than the working sample.
+
+    For a unit-square domain with 50 interior points, draw_candidates should
+    generate max(10*50, 1000) = 1000 candidates so resampling strategies have
+    genuine exploration room.
+    """
+    pytest.importorskip("shapely")
+    SQUARE = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+    dom = jno.PolygonDomain(SQUARE, name="sq")
+    dom.variable("interior", sample=(50, None))
+
+    pts, nrm = dom.draw_candidates("interior")
+
+    assert pts is not None, "draw_candidates must return a point array"
+    assert len(pts) > 50, f"candidate pool ({len(pts)}) must exceed sample size (50)"
+    assert nrm is None, "interior tags carry no normals"
+
+
+def test_polygon_draw_candidates_returns_fresh_points():
+    """Consecutive calls to PolygonDomain.draw_candidates produce different samples.
+
+    Each call samples the geometry afresh (not from a fixed cached set), so two
+    independent calls are extremely unlikely to be identical.
+    """
+    pytest.importorskip("shapely")
+    SQUARE = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+    dom = jno.PolygonDomain(SQUARE, name="sq")
+    dom.variable("interior", sample=(50, None))
+
+    pts1, _ = dom.draw_candidates("interior")
+    pts2, _ = dom.draw_candidates("interior")
+
+    assert not np.allclose(pts1, pts2), (
+        "Two consecutive draw_candidates calls returned identical arrays; "
+        "the implementation should sample fresh points on each call."
+    )
+
+
+@pytest.mark.integration
+def test_boundary_normals_updated_after_resample():
+    """After resampling a boundary tag, n_{tag} normals stay consistent with new points.
+
+    Samples the boundary with normals and attaches an RAD strategy to it.
+    After solve(), the stored normals must:
+      1. Have the same shape as the boundary-point array.
+      2. All be unit vectors (‖n‖ ≈ 1.0), since they are recovered from the
+         candidate pool where all normals are already normalised.
+    """
+    strategy = RAD(resample_every=1, resample_fraction=0.5, start_epoch=0, k=3)
+
+    # mesh_size=0.1 → ~40 boundary nodes in pool, working set = 20 → 2× ratio.
+    domain = 1 * jno.domain(constructor=jno.domain.rect(mesh_size=0.1))
+    b_vars = domain.variable("boundary", sample=(20, None), normals=True, resampling_strategy=strategy)
+    xb, yb = b_vars[0], b_vars[1]
+
+    xi, yi = domain.variable("interior", sample=(40, None))[:2]
+
+    key = jax.random.PRNGKey(0)
+    u_net = jnn.nn.wrap(foundax.mlp(2, hidden_dims=8, num_layers=2, key=key))
+
+    pde = jnn.laplacian(u_net(xi, yi), [xi, yi])
+    bc = (u_net(xb, yb) - 0.0).mse
+
+    solver = jno.core([pde, bc], domain)
+    u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+    solver.solve(epochs=3)
+
+    pts = np.asarray(domain.context["boundary"])   # (B, T, N, 2)
+    nrm = np.asarray(domain.context["n_boundary"]) # (B, T, N, 2)
+
+    assert nrm.shape == pts.shape, (
+        f"Normal shape {nrm.shape} must match point shape {pts.shape}"
+    )
+    magnitudes = np.linalg.norm(nrm.reshape(-1, 2), axis=-1)
+    assert np.allclose(magnitudes, 1.0, atol=1e-4), (
+        f"Normals must be unit vectors after resampling; "
+        f"magnitudes range {magnitudes.min():.6f} – {magnitudes.max():.6f}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Physics-motivated resampling tests
 # ---------------------------------------------------------------------------
