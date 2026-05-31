@@ -1050,6 +1050,249 @@ class InputSensitivityCallback(Callback):
         }
 
 
+# ---------------------------------------------------------------------------
+# Empirical NTK spectrum
+# ---------------------------------------------------------------------------
+
+
+class NTKSpectrumCallback(Callback):
+    """Track the empirical Neural Tangent Kernel eigenvalue spectrum.
+
+    For a :class:`~jno.trace.NetworkGradient` placeholder ``u.grad(net)``
+    (per-point parameter Jacobian :math:`J \\in \\mathbb{R}^{N \\times P}`)
+    constructs the empirical NTK :math:`K = J J^\\top` at every
+    ``interval`` outer steps, subsampled to ``n_points`` collocation
+    points, and reports the top-k eigenvalues, condition number, and full
+    spectrum.
+
+    The eigenvalue spread is the canonical diagnostic for PINN spectral
+    bias (Sec. 3-4, [2007.14527]): widely separated eigenvalues mean some
+    directions in parameter space train orders of magnitude faster than
+    others, producing the characteristic PINN failure mode where
+    high-frequency features lag low-frequency ones.
+
+    Args:
+        grad_expr: A :class:`~jno.trace.NetworkGradient` placeholder
+            (the result of ``expr.grad(model)``).  Use ``model.mask(...)``
+            to restrict to a parameter subset, e.g.
+            ``u.grad(net.mask(output_only_mask))`` — masking lives in the
+            placeholder rather than as a separate argument.
+        n_points: Number of collocation points to subsample for the
+            kernel.  Cost is ``O(n_points² × P)``; default ``256``.
+        top_k: Number of largest eigenvalues to report.  Default ``10``.
+        interval: Compute every *n* outer training steps.  Default ``500``
+            (expensive — keep large for real runs).
+
+    Example::
+
+        cb = jno.callbacks.ntk_spectrum(u.grad(u_net), n_points=128, top_k=10)
+        crux.solve(10_000, callbacks=[cb])
+        print(cb.result["lambda_max"])         # (n_samples,)
+        print(cb.result["condition_number"])   # (n_samples,)
+    """
+
+    def __init__(
+        self,
+        grad_expr,
+        n_points: int = 256,
+        top_k: int = 10,
+        interval: int = 500,
+    ) -> None:
+        from jno.trace import NetworkGradient
+
+        if not isinstance(grad_expr, NetworkGradient):
+            raise TypeError(
+                f"ntk_spectrum expects a NetworkGradient placeholder "
+                f"(e.g. u.grad(net)), got {type(grad_expr).__name__!r}. "
+                "Build one via ``expr.grad(model)``."
+            )
+        self._grad_expr = grad_expr
+        self._n_points = n_points
+        self._top_k = top_k
+        self._interval = interval
+        self._fn = None
+        self._epochs: list = []
+        self._top: list = []
+        self._lam_min: list = []
+        self._lam_max: list = []
+        self._cond: list = []
+        self._all: list = []
+
+    def on_solve_begin(self, **kwargs) -> None:
+        from jno.utils.explainability import make_ntk_spectrum_fn
+
+        if "all_ops" not in kwargs:
+            raise RuntimeError(
+                "NTKSpectrumCallback requires the solver to pass `all_ops` "
+                "via on_solve_begin (added by jno >= explainability v2)."
+            )
+        self._fn = jax.jit(
+            make_ntk_spectrum_fn(
+                self._grad_expr,
+                kwargs["all_ops"],
+                kwargs["batchsize"],
+                kwargs["frozen"],
+                kwargs["static"],
+                n_points=self._n_points,
+                top_k=self._top_k,
+                min_consecutive=kwargs.get("min_consecutive", 1),
+            )
+        )
+        self._fn.lower(kwargs["trainable"], kwargs["context"], kwargs["rng"]).compile()
+
+    def on_epoch_end(self, **kwargs) -> bool:
+        if self._fn is None:
+            return False
+        epoch = kwargs["epoch"]
+        if epoch % self._interval != 0:
+            return False
+        top, lam_min, lam_max, cond, all_eigs = self._fn(kwargs["trainable"], kwargs["context"], kwargs["rng"])
+        top_np = np.asarray(jax.device_get(top))
+        lam_min_v = float(jax.device_get(lam_min))
+        lam_max_v = float(jax.device_get(lam_max))
+        cond_v = float(jax.device_get(cond))
+        all_np = np.asarray(jax.device_get(all_eigs))
+
+        self._epochs.append(epoch)
+        self._top.append(top_np)
+        self._lam_min.append(lam_min_v)
+        self._lam_max.append(lam_max_v)
+        self._cond.append(cond_v)
+        self._all.append(all_np)
+
+        if get_wandb_run() is not None:
+            wb: dict = {f"explainability/ntk/eigval_{i}": float(v) for i, v in enumerate(top_np)}
+            wb["explainability/ntk/lambda_max"] = lam_max_v
+            wb["explainability/ntk/lambda_min"] = lam_min_v
+            wb["explainability/ntk/condition_number"] = cond_v
+            try:
+                import wandb as _wandb
+
+                wb["explainability/ntk/spectrum_hist"] = _wandb.Histogram(all_np)
+            except ImportError:
+                pass
+            wandb_log(wb, step=epoch)
+        return False
+
+    @property
+    def result(self) -> dict:
+        """Collected data as numpy arrays."""
+        empty = np.zeros((0,))
+        return {
+            "epochs": np.array(self._epochs),
+            "eigvals_topk": np.stack(self._top) if self._top else empty,
+            "lambda_min": np.array(self._lam_min),
+            "lambda_max": np.array(self._lam_max),
+            "condition_number": np.array(self._cond),
+            "all_eigvals": np.stack(self._all) if self._all else empty,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Hessian eigenspectrum / sharpness
+# ---------------------------------------------------------------------------
+
+
+class HessianSpectrumCallback(Callback):
+    """Track the top-k Hessian eigenvalues of the total training loss.
+
+    Constructs :math:`\\nabla^2_\\theta L` implicitly via Hessian-vector
+    products (``jvp(grad(L), …, …)``) and runs ``n_iter`` Lanczos
+    iterations with full reorthogonalisation.  The resulting tridiagonal
+    is eigendecomposed host-side via ``scipy.linalg.eigh_tridiagonal``
+    (Sec. 3.1-3.2, [1912.07145]) to obtain the top-k eigenvalues.
+
+    The largest eigenvalue is the *sharpness* of the loss surface at the
+    current iterate (Sec. 2.2, [1609.04836]); high values predict a sharp
+    minimum, typically associated with worse generalisation.
+
+    Args:
+        k: Number of largest eigenvalues to report.  Default ``10``.
+        n_iter: Number of Lanczos iterations.  Default ``30``.
+        interval: Compute every *n* outer training steps.  Default ``500``.
+        mask: Optional pytree of booleans matching the *trainable*
+            structure.  Essential for large models.
+        constraints: Optional list of constraint placeholders to scope the
+            Hessian to the mean of those constraints' losses (instead of
+            the total training loss).  Pass the same Python objects given
+            to ``jno.core([...])`` — assign your constraints to variables
+            rather than re-accessing ``.mse``.
+    """
+
+    def __init__(
+        self,
+        k: int = 10,
+        n_iter: int = 30,
+        interval: int = 500,
+        mask=None,
+        constraints=None,
+    ) -> None:
+        self._k = k
+        self._n_iter = n_iter
+        self._interval = interval
+        self._mask = mask
+        self._user_constraints = constraints
+        self._indices: list[int] = []
+        self._fn = None
+        self._epochs: list = []
+        self._eigvals: list = []
+        self._sharpness: list = []
+
+    def on_solve_begin(self, **kwargs) -> None:
+        from jno.utils.explainability import make_hessian_spectrum_fn
+
+        solver_constraints = kwargs.get("constraint_exprs")
+        if solver_constraints is None:
+            solver_constraints = [None] * kwargs["n_constraints"]
+        self._indices = _resolve_constraint_indices(self._user_constraints, solver_constraints, "hessian_spectrum")
+
+        constraint_indices = tuple(self._indices) if self._user_constraints is not None else None
+
+        self._fn = make_hessian_spectrum_fn(
+            kwargs["compiled_constraints_fn"],
+            kwargs["batchsize"],
+            kwargs["frozen"],
+            kwargs["static"],
+            param_mask=self._mask,
+            min_consecutive=kwargs.get("min_consecutive", 1),
+            k=self._k,
+            n_iter=self._n_iter,
+            constraint_indices=constraint_indices,
+        )
+        # Pre-warm — Lanczos is a Python driver, so it JIT-compiles the inner
+        # HVP lazily on first call.
+        self._fn(kwargs["trainable"], kwargs["context"], kwargs["rng"])
+
+    def on_epoch_end(self, **kwargs) -> bool:
+        if self._fn is None:
+            return False
+        epoch = kwargs["epoch"]
+        if epoch % self._interval != 0:
+            return False
+        top, lambda_max, _all = self._fn(kwargs["trainable"], kwargs["context"], kwargs["rng"])
+        top_np = np.asarray(top)
+        self._epochs.append(epoch)
+        self._eigvals.append(top_np)
+        self._sharpness.append(float(lambda_max))
+
+        if get_wandb_run() is not None:
+            wb: dict = {f"explainability/hessian/eigval_{i}": float(v) for i, v in enumerate(top_np)}
+            wb["explainability/hessian/sharpness"] = float(lambda_max)
+            wb["explainability/hessian/n_iter"] = int(self._n_iter)
+            wandb_log(wb, step=epoch)
+        return False
+
+    @property
+    def result(self) -> dict:
+        """Collected data as numpy arrays."""
+        empty = np.zeros((0,))
+        return {
+            "epochs": np.array(self._epochs),
+            "eigvals": np.stack(self._eigvals) if self._eigvals else empty,
+            "sharpness": np.array(self._sharpness),
+        }
+
+
 class callbacks:
     """Factory helpers for built-in adaptive training callbacks.
 
@@ -1179,6 +1422,68 @@ class callbacks:
             alpha_range: Perturbation range in units of ``‖θ_selected‖``.
         """
         return LossLandscapeCallback(interval=interval, mask=mask, n_grid=n_grid, alpha_range=alpha_range)
+
+    @staticmethod
+    def hessian_spectrum(
+        k: int = 10,
+        n_iter: int = 30,
+        interval: int = 500,
+        mask=None,
+        constraints=None,
+    ) -> HessianSpectrumCallback:
+        """Create a :class:`HessianSpectrumCallback`.
+
+        Tracks the top-k eigenvalues of the total training loss Hessian
+        via Lanczos with HVPs (Sec. 3.1-3.2, [1912.07145]); the largest
+        eigenvalue is the sharpness of [Keskar et al., Sec. 2.2,
+        1609.04836].
+
+        Args:
+            k: Number of largest eigenvalues to report.
+            n_iter: Number of Lanczos iterations.
+            interval: Compute every *n* outer training steps.
+            mask: Optional pytree of booleans matching ``crux.models``
+                structure — essential for large models.
+            constraints: Optional list of constraint placeholders to scope
+                the Hessian to the mean of those constraints' losses
+                instead of the full training loss.
+        """
+        return HessianSpectrumCallback(
+            k=k,
+            n_iter=n_iter,
+            interval=interval,
+            mask=mask,
+            constraints=constraints,
+        )
+
+    @staticmethod
+    def ntk_spectrum(
+        grad_expr,
+        n_points: int = 256,
+        top_k: int = 10,
+        interval: int = 500,
+    ) -> NTKSpectrumCallback:
+        """Create an :class:`NTKSpectrumCallback`.
+
+        Tracks the empirical NTK eigenvalue spectrum (Sec. 3-4, [2007.14527])
+        for a user-supplied :class:`~jno.trace.NetworkGradient` placeholder,
+        e.g. ``u.grad(net)``.  Restrict to a parameter subset by chaining
+        ``net.mask(mask)`` into the placeholder.
+
+        Args:
+            grad_expr: ``NetworkGradient`` placeholder (typically
+                ``u.grad(net)`` or ``u.grad(net.mask(mask))``).
+            n_points: Subsample cap for kernel rows.  Cost is
+                ``O(n_points² × P)``.
+            top_k: Number of largest eigenvalues to report.
+            interval: Compute every *n* outer training steps.
+        """
+        return NTKSpectrumCallback(
+            grad_expr=grad_expr,
+            n_points=n_points,
+            top_k=top_k,
+            interval=interval,
+        )
 
     @staticmethod
     def input_sensitivity(expr, interval: int = 100) -> InputSensitivityCallback:
