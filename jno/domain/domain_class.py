@@ -751,6 +751,41 @@ class domain(MeshIOMixin):
         count = int(getattr(self, "_batch_count", getattr(self, "total_samples", 1))) if self.same_domain else 1
         return [(max(1, count), points, normals)]
 
+    def draw_candidates(self, tag: str):
+        """Return (points, normals_or_None) candidate pool for resampling.
+
+        Collects all sampling groups so merged domains expose the full union
+        of their node sets.  Time-dependent pools (T, N, D) are reduced to
+        their spatial slice (N, D) since spatial coordinates are shared across
+        timesteps.
+        """
+        import numpy as _np
+
+        if tag not in self._mesh_pool:
+            return None, None
+        groups = self._sampling_groups_for_tag(tag)
+        all_pts, all_nrm = [], []
+        has_normals = False
+        for _, grp_pts, grp_nrm in groups:
+            p = _np.asarray(grp_pts)
+            if p.ndim == 3:  # (T, N, D) — time-dep: extract spatial slice
+                p = p[0]
+            all_pts.append(p)
+            if grp_nrm is not None:
+                n = _np.asarray(grp_nrm)
+                if n.ndim == 3:
+                    n = n[0]
+                all_nrm.append(n)
+                has_normals = True
+            else:
+                all_nrm.append(None)
+        pts = _np.concatenate(all_pts, axis=0) if len(all_pts) > 1 else all_pts[0].copy()
+        if has_normals and all(n is not None for n in all_nrm):
+            nrm = _np.concatenate(all_nrm, axis=0)
+        else:
+            nrm = None
+        return pts, nrm
+
     def __add__(self, other: "domain") -> "domain":
         """Merge another domain into this one (stacks along batch dimension).
 
@@ -2742,10 +2777,6 @@ class domain(MeshIOMixin):
             while tag in self.context and tag not in self._param_tags:
                 tag = og_tag + f"_{ii}"
                 ii += 1
-
-            # Store full mesh points for resampling
-            if tag not in self._mesh_points:
-                self._mesh_points[tag] = available_points.copy()
 
             if n_samples is None:
                 n_samples = n_available

@@ -1,12 +1,28 @@
 """Base class for resampling strategies."""
 
 from abc import ABC, abstractmethod
-from typing import Callable, Dict, List, Tuple
+from typing import Optional
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from ...utils.logger import Logger, PrintFallback, get_logger
+
+
+def _get_candidate_pool(
+    candidates: Optional[np.ndarray],
+    domain,
+    tag: str,
+) -> Optional[jnp.ndarray]:
+    """Return candidate points for resampling as a JAX array, or None."""
+    if candidates is not None:
+        return jnp.array(candidates)
+    if hasattr(domain, "draw_candidates"):
+        pool, _ = domain.draw_candidates(tag)
+        if pool is not None and len(pool) > 0:
+            return jnp.array(pool)
+    return None
 
 
 class ResamplingStrategy(ABC):
@@ -60,6 +76,7 @@ class ResamplingStrategy(ABC):
         tag: str,
         epoch: int,
         rng_key: jnp.ndarray,
+        candidates: Optional[np.ndarray] = None,
     ) -> jnp.ndarray:
         """Compute new sample points.
 
@@ -70,6 +87,10 @@ class ResamplingStrategy(ABC):
             tag: domain tag being resampled
             epoch: Current training epoch
             rng_key: JAX random key
+            candidates: Pre-drawn candidate points (N_pool, D) from
+                ``domain.draw_candidates(tag)``.  When provided, strategies
+                draw new points from this array; when None the strategy calls
+                ``domain.draw_candidates`` itself.
 
         Returns:
             New points (N, D)
@@ -79,107 +100,6 @@ class ResamplingStrategy(ABC):
     def update_epoch(self, epoch: int):
         """Update internal epoch tracking."""
         self._last_resample_epoch = epoch
-
-    def apply_resampling(
-        self,
-        domain,
-        constraints: List,
-        tags: List[str],
-        compiled: List[Callable],
-        params: Dict,
-        layer_info: Dict,
-        context: Dict[str, jax.Array],
-        epoch: int,
-        rng: jax.Array,
-    ) -> Tuple[Dict[str, jax.Array], jax.Array]:
-        """Apply resampling strategies if configured."""
-        import numpy as np
-
-        if not hasattr(domain, "_resampling_strategies"):
-            return context, rng
-
-        for tag, strategy in domain._resampling_strategies.items():
-            if not strategy.should_resample(epoch):
-                continue
-
-            # Compute residuals for constraints on this tag
-            tag_residuals = self.compute_tag_residuals(tag, constraints, tags, compiled, params, context)
-
-            if not tag_residuals:
-                continue
-
-            # Combine and resample
-            combined_residuals = jnp.mean(jnp.stack(tag_residuals, axis=0), axis=0)
-            current_points = context[tag]
-
-            rng, resample_key = jax.random.split(rng)
-            new_points = self.resample_all_batches(
-                strategy,
-                current_points,
-                combined_residuals,
-                domain,
-                tag,
-                epoch,
-                resample_key,
-            )
-
-            # Update domain
-            domain.context[tag] = np.array(new_points)
-            context[tag] = new_points
-
-            strategy.update_epoch(epoch)
-            self.log.info(f"Resampled {tag} points (epoch {epoch + 1})")
-
-        return context, rng
-
-    def compute_tag_residuals(
-        self,
-        tag: str,
-        constraints: List,
-        tags: List[str],
-        compiled: List[Callable],
-        params: Dict,
-        context: Dict[str, jax.Array],
-    ) -> List[jax.Array]:
-        """Compute residuals for constraints evaluated on a specific tag."""
-        tag_residuals = []
-        expected_n_points = context[tag].shape[1]
-        from ...trace import get_primary_tag
-
-        for i, expr in enumerate(constraints):
-            expr_tag = get_primary_tag(expr)
-            if expr_tag != tag:
-                continue
-
-            residual = compiled[i](params, context)
-
-            if residual.shape[-1] == expected_n_points:
-                tag_residuals.append(residual)
-
-        return tag_residuals
-
-    def resample_all_batches(
-        self,
-        strategy,
-        current_points: jax.Array,
-        residuals: jax.Array,
-        domain,
-        tag: str,
-        epoch: int,
-        rng: jax.Array,
-    ) -> jax.Array:
-        """Resample points for all batches."""
-        new_batches = []
-
-        for b in range(current_points.shape[0]):
-            batch_key = jax.random.fold_in(rng, b)
-            batch_points = current_points[b]
-            batch_residuals = residuals[b] if residuals.ndim > 1 else residuals
-
-            new_batch = strategy.resample(batch_points, batch_residuals, domain, tag, epoch, batch_key)
-            new_batches.append(new_batch)
-
-        return jnp.stack(new_batches, axis=0)
 
 
 """CR3: Causal Retain-Resample with time gating for time-dependent problems."""
@@ -286,6 +206,7 @@ class CR3(ResamplingStrategy):
         tag: str,
         epoch: int,
         rng_key: jnp.ndarray,
+        candidates: Optional[np.ndarray] = None,
     ) -> jnp.ndarray:
         """Resample using causal time gating.
 
@@ -296,6 +217,7 @@ class CR3(ResamplingStrategy):
             tag: domain tag
             epoch: Current epoch
             rng_key: JAX random key
+            candidates: Pre-drawn candidate points from draw_candidates()
 
         Returns:
             New points (N, D)
@@ -350,10 +272,10 @@ class CR3(ResamplingStrategy):
         n_new = n_points - len(retained_points)
 
         # Fill with random samples
-        if n_new > 0 and hasattr(domain, "_mesh_points") and tag in domain._mesh_points:
-            candidates = jnp.array(domain._mesh_points[tag])
-            new_indices = jax.random.choice(rng_key, candidates.shape[0], shape=(n_new,), replace=True)
-            new_points = candidates[new_indices]
+        pool = _get_candidate_pool(candidates, domain, tag)
+        if n_new > 0 and pool is not None:
+            new_indices = jax.random.choice(rng_key, pool.shape[0], shape=(n_new,), replace=True)
+            new_points = pool[new_indices]
             result = jnp.concatenate([retained_points, new_points], axis=0)
         else:
             result = retained_points
@@ -430,6 +352,7 @@ class HA(ResamplingStrategy):
         tag: str,
         epoch: int,
         rng_key: jnp.ndarray,
+        candidates: Optional[np.ndarray] = None,
     ) -> jnp.ndarray:
         """Hybrid adaptive resampling.
 
@@ -440,6 +363,7 @@ class HA(ResamplingStrategy):
             tag: domain tag
             epoch: Current epoch
             rng_key: JAX random key
+            candidates: Pre-drawn candidate points from draw_candidates()
 
         Returns:
             New points (N, D)
@@ -448,13 +372,13 @@ class HA(ResamplingStrategy):
         self._apply_count += 1
 
         n_points = points.shape[0]
+        pool = _get_candidate_pool(candidates, domain, tag)
 
         if phase == "random":
             # Fully random refresh
-            if hasattr(domain, "_mesh_points") and tag in domain._mesh_points:
-                candidates = jnp.array(domain._mesh_points[tag])
-                indices = jax.random.choice(rng_key, candidates.shape[0], shape=(n_points,), replace=True)
-                return candidates[indices]
+            if pool is not None:
+                indices = jax.random.choice(rng_key, pool.shape[0], shape=(n_points,), replace=True)
+                return pool[indices]
             return points
         else:
             # Adaptive phase: retain high-residual, fill with random
@@ -475,11 +399,10 @@ class HA(ResamplingStrategy):
             retained_points = points[retain_indices]
 
             # Fill remainder with random
-            if n_new > 0 and hasattr(domain, "_mesh_points") and tag in domain._mesh_points:
-                candidates = jnp.array(domain._mesh_points[tag])
+            if n_new > 0 and pool is not None:
                 fill_key, _ = jax.random.split(rng_key)
-                new_indices = jax.random.choice(fill_key, candidates.shape[0], shape=(n_new,), replace=True)
-                new_points = candidates[new_indices]
+                new_indices = jax.random.choice(fill_key, pool.shape[0], shape=(n_new,), replace=True)
+                new_points = pool[new_indices]
                 result = jnp.concatenate([retained_points, new_points], axis=0)
                 assert result.shape[0] == n_points, f"Expected {n_points}, got {result.shape[0]}"
                 return result
@@ -542,6 +465,7 @@ class PINNFluence(ResamplingStrategy):
         tag: str,
         epoch: int,
         rng_key: jnp.ndarray,
+        candidates: Optional[np.ndarray] = None,
     ) -> jnp.ndarray:
         """Resample using simplified influence-based scoring.
 
@@ -552,6 +476,7 @@ class PINNFluence(ResamplingStrategy):
             tag: domain tag
             epoch: Current epoch
             rng_key: JAX random key
+            candidates: Pre-drawn candidate points from draw_candidates()
 
         Returns:
             New points (N, D)
@@ -567,10 +492,6 @@ class PINNFluence(ResamplingStrategy):
         if residuals.shape[0] != n_points:
             return points
 
-        # Simplified influence scoring: use residual magnitude + local variance
-        # as a proxy for influence (points in high-error, high-variance regions
-        # are more influential)
-
         # Simplified scoring: residual magnitude + small penalty for uniformity
         scores = residuals + 0.1 * jnp.std(residuals)
 
@@ -582,9 +503,9 @@ class PINNFluence(ResamplingStrategy):
         # Sample new points from candidates using influence-based weights
         n_new = n_points - len(kept_points)
 
-        if n_new > 0 and hasattr(domain, "_mesh_points") and tag in domain._mesh_points:
-            candidates = jnp.array(domain._mesh_points[tag])
-            n_candidates = len(candidates)
+        pool = _get_candidate_pool(candidates, domain, tag)
+        if n_new > 0 and pool is not None:
+            n_candidates = len(pool)
 
             # Evaluate a subset of candidates
             n_eval = min(n_candidates, int(n_points * self.candidate_factor))
@@ -593,9 +514,9 @@ class PINNFluence(ResamplingStrategy):
 
             if n_eval < n_candidates:
                 eval_indices = jax.random.choice(key1, n_candidates, shape=(n_eval,), replace=False)
-                eval_candidates = candidates[eval_indices]
+                eval_candidates = pool[eval_indices]
             else:
-                eval_candidates = candidates
+                eval_candidates = pool
 
             # Score candidates based on distance to high-residual current points (vectorized).
             n_top = min(50, n_points)
@@ -681,6 +602,7 @@ class R3(ResamplingStrategy):
         tag: str,
         epoch: int,
         rng_key: jnp.ndarray,
+        candidates: Optional[np.ndarray] = None,
     ) -> jnp.ndarray:
         """Keep high-residual points, resample low-residual points.
 
@@ -691,6 +613,7 @@ class R3(ResamplingStrategy):
             tag: domain tag
             epoch: Current epoch
             rng_key: JAX random key
+            candidates: Pre-drawn candidate points from draw_candidates()
 
         Returns:
             New points (N, D)
@@ -741,10 +664,10 @@ class R3(ResamplingStrategy):
         n_new = n_points - len(kept_points)
 
         # Sample new points from candidates
-        if n_new > 0 and hasattr(domain, "_mesh_points") and tag in domain._mesh_points:
-            candidates = jnp.array(domain._mesh_points[tag])
-            new_indices = jax.random.choice(rng_key, candidates.shape[0], shape=(n_new,), replace=True)
-            new_points = candidates[new_indices]
+        pool = _get_candidate_pool(candidates, domain, tag)
+        if n_new > 0 and pool is not None:
+            new_indices = jax.random.choice(rng_key, pool.shape[0], shape=(n_new,), replace=True)
+            new_points = pool[new_indices]
             result = jnp.concatenate([kept_points, new_points], axis=0)
         else:
             result = kept_points
@@ -799,6 +722,7 @@ class RAD(ResamplingStrategy):
         tag: str,
         epoch: int,
         rng_key: jnp.ndarray,
+        candidates: Optional[np.ndarray] = None,
     ) -> jnp.ndarray:
         """Resample based on residual magnitude.
 
@@ -812,6 +736,7 @@ class RAD(ResamplingStrategy):
             tag: domain tag
             epoch: Current epoch
             rng_key: JAX random key
+            candidates: Pre-drawn candidate points from draw_candidates()
 
         Returns:
             New points (N, D)
@@ -836,21 +761,20 @@ class RAD(ResamplingStrategy):
         points_kept = points[keep_indices]
 
         # Sample new points from candidate pool
-        if hasattr(domain, "_mesh_points") and tag in domain._mesh_points:
-            candidates = jnp.array(domain._mesh_points[tag])
-        else:
+        pool = _get_candidate_pool(candidates, domain, tag)
+        if pool is None:
             # Fallback: random perturbation of high-residual points
             high_res_indices = sorted_indices[-n_resample:]
             new_points = points[high_res_indices]
-            key1, key2 = jax.random.split(rng_key)
+            key1, _ = jax.random.split(rng_key)
             noise = jax.random.normal(key1, new_points.shape) * 0.01
             new_points = new_points + noise
             return jnp.concatenate([points_kept, new_points], axis=0)
 
         # Sample k candidates per new slot, pick the one nearest to a high-residual anchor.
         key1, _ = jax.random.split(rng_key)
-        candidate_indices = jax.random.choice(key1, candidates.shape[0], shape=(n_resample * self.k,), replace=True)
-        candidate_points = candidates[candidate_indices].reshape(n_resample, self.k, -1)  # (n_resample, k, D)
+        candidate_indices = jax.random.choice(key1, pool.shape[0], shape=(n_resample * self.k,), replace=True)
+        candidate_points = pool[candidate_indices].reshape(n_resample, self.k, -1)  # (n_resample, k, D)
 
         # High-residual anchors: the n_resample current points with largest residuals.
         anchor_points = points[sorted_indices[-n_resample:]]  # (n_resample, D)
@@ -884,6 +808,7 @@ class RandomResampling(ResamplingStrategy):
         tag: str,
         epoch: int,
         rng_key: jnp.ndarray,
+        candidates: Optional[np.ndarray] = None,
     ) -> jnp.ndarray:
         """Randomly replace a fraction of points with new samples from domain.
 
@@ -894,6 +819,7 @@ class RandomResampling(ResamplingStrategy):
             tag: domain tag
             epoch: Current epoch
             rng_key: JAX random key
+            candidates: Pre-drawn candidate points from draw_candidates()
 
         Returns:
             New points with some randomly replaced
@@ -905,10 +831,8 @@ class RandomResampling(ResamplingStrategy):
             return points
 
         # Get all available candidate points from domain
-        if hasattr(domain, "_mesh_points") and tag in domain._mesh_points:
-            candidates = jnp.array(domain._mesh_points[tag])
-        else:
-            # Fallback: use current points
+        pool = _get_candidate_pool(candidates, domain, tag)
+        if pool is None:
             return points
 
         # Randomly select which points to replace
@@ -916,8 +840,8 @@ class RandomResampling(ResamplingStrategy):
         replace_indices = jax.random.choice(key1, n_points, shape=(n_resample,), replace=False)
 
         # Randomly sample new points from candidates
-        new_points_indices = jax.random.choice(key2, candidates.shape[0], shape=(n_resample,), replace=True)
-        new_points = candidates[new_points_indices]
+        new_points_indices = jax.random.choice(key2, pool.shape[0], shape=(n_resample,), replace=True)
+        new_points = pool[new_points_indices]
 
         # Replace selected points
         points = points.at[replace_indices].set(new_points)
@@ -961,6 +885,7 @@ class RARD(ResamplingStrategy):
         tag: str,
         epoch: int,
         rng_key: jnp.ndarray,
+        candidates: Optional[np.ndarray] = None,
     ) -> jnp.ndarray:
         """Resample using residual-weighted importance sampling.
 
@@ -971,6 +896,7 @@ class RARD(ResamplingStrategy):
             tag: domain tag
             epoch: Current epoch
             rng_key: JAX random key
+            candidates: Pre-drawn candidate points from draw_candidates()
 
         Returns:
             New points (N, D)
@@ -998,12 +924,11 @@ class RARD(ResamplingStrategy):
 
         # Sample new points from candidates, weighted by residual^power at the
         # nearest current point (importance sampling over the mesh pool).
-        if hasattr(domain, "_mesh_points") and tag in domain._mesh_points:
-            candidates = jnp.array(domain._mesh_points[tag])
-
+        pool = _get_candidate_pool(candidates, domain, tag)
+        if pool is not None:
             # For each candidate, find nearest current point and inherit its residual-power weight.
             # Pairwise squared distances (|C|, N) — O(|C|*N*D); acceptable at resample cadence.
-            diffs = candidates[:, None, :] - points[None, :, :]
+            diffs = pool[:, None, :] - points[None, :, :]
             sq_dists = jnp.sum(diffs * diffs, axis=-1)
             nearest = jnp.argmin(sq_dists, axis=-1)  # (|C|,)
             cand_weights = jnp.power(residuals[nearest] + 1e-10, self.power)
@@ -1011,12 +936,12 @@ class RARD(ResamplingStrategy):
 
             new_indices = jax.random.choice(
                 rng_key,
-                candidates.shape[0],
+                pool.shape[0],
                 shape=(n_resample,),
                 replace=True,
                 p=cand_weights,
             )
-            new_points = candidates[new_indices]
+            new_points = pool[new_indices]
         else:
             # Fallback: sample from current high-residual regions
             keep_residuals = residuals[keep_indices]
@@ -1112,6 +1037,30 @@ class sampler:
             random_first: Start with random phase if True
         """
         return HA(resample_every, resample_fraction, start_epoch, alternate, random_first)
+
+    @staticmethod
+    def r3(
+        resample_every: int = 100,
+        resample_fraction: float = 0.7,
+        start_epoch: int = 1000,
+        threshold_mode: str = "mean",
+        min_keep_frac: float = 0.3,
+        max_keep_frac: float = 0.9,
+    ):
+        """Residual-based Refinement and Resampling (R3).
+
+        Keeps points with high residuals and replaces low-residual points
+        with new samples from the candidate pool.
+
+        Args:
+            resample_every: Resample every N epochs
+            resample_fraction: Not used for R3 (uses threshold instead)
+            start_epoch: Start resampling after this many epochs
+            threshold_mode: Threshold for keeping points ("mean", "median", or float)
+            min_keep_frac: Minimum fraction of points to keep
+            max_keep_frac: Maximum fraction of points to keep
+        """
+        return R3(resample_every, resample_fraction, start_epoch, threshold_mode, min_keep_frac, max_keep_frac)
 
     @staticmethod
     def cr3(
