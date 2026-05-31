@@ -1869,6 +1869,8 @@ class core:
                         rng=self.rng,
                         min_consecutive=min_consecutive,
                         constraint_exprs=self._user_constraint_exprs,
+                        all_ops=self.all_ops,
+                        domain=self.domain,
                     )
 
             # ── 8. Training loop ──

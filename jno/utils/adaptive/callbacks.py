@@ -38,6 +38,11 @@ class Callback:
                 (the exact Python objects passed to ``jno.core([...])``).
                 Callbacks that take a ``constraints=`` arg validate user input
                 against this list by Python identity.
+            all_ops: List of OperationDef instances (the solver's compiled op set);
+                callbacks may pass this to ``TraceCompiler.compile_multi_expression``
+                to evaluate user-supplied placeholder expressions during training.
+            domain: The solver's :class:`~jno.domain.domain` instance (read-only;
+                use only for shape / metadata inspection during pre-compilation).
         """
 
     def on_epoch_end(self, **kwargs) -> bool:
@@ -938,6 +943,113 @@ class ResidualStatsCallback(Callback):
         }
 
 
+# ---------------------------------------------------------------------------
+# Input sensitivity / saliency
+# ---------------------------------------------------------------------------
+
+
+class InputSensitivityCallback(Callback):
+    """Evaluate any placeholder expression at training collocation points.
+
+    Most useful for input-saliency: pass ``u.d(x)`` (single coordinate) or
+    ``jno.Jacobian(u, [x, y])`` (multi-coordinate) and the callback will
+    record the per-point sensitivity of the network output to its inputs
+    every ``interval`` outer steps.  Conceptually equivalent to the
+    class-saliency map of Sec. 3 of [1312.6034] — high magnitude points
+    correspond to spatial regions where the network response is most
+    responsive to a perturbation of the input coordinate.
+
+    The expression is compiled via
+    :meth:`~jno.trace_compiler.TraceCompiler.compile_multi_expression`
+    (the same machinery used by the solver's constraints and trackers),
+    so any composite placeholder expression works — not just first
+    derivatives.
+
+    Args:
+        expr: A :class:`~jno.trace.Placeholder` expression to evaluate.
+            Common choices: ``u.d(x)``, ``jno.Jacobian(u, [x, y])``,
+            ``jno.np.linalg.norm(u.d(x))``.
+        interval: Compute every *n* outer training steps. Default ``100``.
+
+    Example::
+
+        cb = jno.callbacks.input_sensitivity(u.d(x), interval=100)
+        crux.solve(5000, callbacks=[cb])
+        print(cb.result["values"].shape)   # (n_samples, *expr_shape)
+    """
+
+    def __init__(self, expr, interval: int = 100) -> None:
+        from jno.trace import Placeholder
+
+        if not isinstance(expr, Placeholder):
+            raise TypeError(
+                f"input_sensitivity expects a jno Placeholder expression (e.g. u.d(x)), got {type(expr).__name__!r}."
+            )
+        self._expr = expr
+        self._interval = interval
+        self._fn = None
+        self._epochs: list = []
+        self._values: list = []
+
+    def on_solve_begin(self, **kwargs) -> None:
+        from jno.utils.explainability import make_expression_eval_fn
+
+        if "all_ops" not in kwargs:
+            raise RuntimeError(
+                "InputSensitivityCallback requires the solver to pass `all_ops` "
+                "via on_solve_begin (added by jno >= explainability v2)."
+            )
+        self._fn = jax.jit(
+            make_expression_eval_fn(
+                self._expr,
+                kwargs["all_ops"],
+                kwargs["batchsize"],
+                kwargs["frozen"],
+                kwargs["static"],
+                min_consecutive=kwargs.get("min_consecutive", 1),
+            )
+        )
+        self._fn.lower(kwargs["trainable"], kwargs["context"], kwargs["rng"]).compile()
+
+    def on_epoch_end(self, **kwargs) -> bool:
+        if self._fn is None:
+            return False
+        epoch = kwargs["epoch"]
+        if epoch % self._interval != 0:
+            return False
+        values = np.asarray(jax.device_get(self._fn(kwargs["trainable"], kwargs["context"], kwargs["rng"])))
+        self._epochs.append(epoch)
+        self._values.append(values)
+        if get_wandb_run() is not None:
+            abs_v = np.abs(values)
+            wb: dict = {
+                "explainability/saliency/mean_abs": float(abs_v.mean()),
+                "explainability/saliency/max_abs": float(abs_v.max()),
+                "explainability/saliency/std_abs": float(abs_v.std()),
+            }
+            try:
+                import wandb as _wandb
+
+                wb["explainability/saliency/histogram"] = _wandb.Histogram(abs_v.ravel())
+            except ImportError:
+                pass
+            wandb_log(wb, step=epoch)
+        return False
+
+    @property
+    def result(self) -> dict:
+        """Collected data as numpy arrays.
+
+        Keys:
+            ``epochs`` — ``(S,)`` int array of sampled outer steps.
+            ``values`` — ``(S, *expr_shape)`` array of expression evaluations.
+        """
+        return {
+            "epochs": np.array(self._epochs),
+            "values": np.stack(self._values) if self._values else np.zeros((0,)),
+        }
+
+
 class callbacks:
     """Factory helpers for built-in adaptive training callbacks.
 
@@ -1067,6 +1179,21 @@ class callbacks:
             alpha_range: Perturbation range in units of ``‖θ_selected‖``.
         """
         return LossLandscapeCallback(interval=interval, mask=mask, n_grid=n_grid, alpha_range=alpha_range)
+
+    @staticmethod
+    def input_sensitivity(expr, interval: int = 100) -> InputSensitivityCallback:
+        """Create an :class:`InputSensitivityCallback`.
+
+        Evaluates a user-supplied placeholder expression at training
+        collocation points every *interval* outer steps (Sec. 3, [1312.6034]).
+
+        Args:
+            expr: A :class:`~jno.trace.Placeholder` expression — commonly
+                ``u.d(x)`` for input-gradient saliency, or
+                ``jno.Jacobian(u, [x, y])`` for a multi-variable Jacobian.
+            interval: Compute every *n* outer training steps.
+        """
+        return InputSensitivityCallback(expr=expr, interval=interval)
 
     @staticmethod
     def residual_stats(interval: int = 100, constraints=None) -> ResidualStatsCallback:
