@@ -1,6 +1,6 @@
 # Explainability
 
-Four callbacks give insight into what is happening inside the training loop. They work by differentiating through the constraint functions after each outer step, independently of the gradient updates that drive training. Results are stored as numpy arrays and, when a W&B run is active, pushed automatically to your dashboard.
+Several callbacks give insight into what is happening inside the training loop. They work by differentiating through the constraint functions after each outer step, or by directly inspecting the residuals, independently of the gradient updates that drive training. Results are stored as numpy arrays and, when a W&B run is active, pushed automatically to your dashboard.
 
 ---
 
@@ -120,7 +120,7 @@ W&B key: `explainability/loss_landscape` (heatmap image)
 
 ## Restricting to a parameter subset
 
-All four callbacks accept an optional `mask` — a pytree of booleans matching the `trainable` structure. Only the selected parameters are differentiated or perturbed. This is essential for large networks and strongly recommended even for medium-sized ones.
+The gradient-analysis callbacks (gradient norms, cosine similarity, gradient alignment, loss landscape) accept an optional `mask` — a pytree of booleans matching the `trainable` structure. Only the selected parameters are differentiated or perturbed. This is essential for large networks and strongly recommended even for medium-sized ones. (`residual_stats` does not need a mask — it inspects pre-existing constraint residuals rather than computing parameter gradients.)
 
 ```python
 import equinox as eqx, jax
@@ -140,7 +140,7 @@ The output-layer weight matrix typically gives the dominant gradient directions 
 
 ## W&B logging
 
-All four callbacks push their results to W&B automatically when a run is active (see [Weights & Biases](../misc/wandb.md)). No extra code is needed — enabling `jno.setup(..., wandb=True)` is sufficient.
+All callbacks push their results to W&B automatically when a run is active (see [Weights & Biases](../misc/wandb.md)). No extra code is needed — enabling `jno.setup(..., wandb=True)` is sufficient.
 
 ---
 
