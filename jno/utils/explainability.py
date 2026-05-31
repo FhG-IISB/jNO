@@ -7,6 +7,64 @@ import jax
 import jax.numpy as jnp
 
 
+def make_residual_stats_fn(
+    compiled_constraints_fn,
+    n_constraints: int,
+    batchsize,
+    frozen,
+    static,
+    min_consecutive: int = 1,
+):
+    """Build a function that summarises per-constraint residual distributions.
+
+    The compiled constraints function returns one ``(B, T, ...)`` residual
+    array per constraint *before* the training loss applies ``jnp.mean``.
+    This builder wraps that call and reduces each array to four scalar
+    statistics — exposing *where* in the domain the PDE is poorly satisfied
+    (Sec. 3, [2207.10289]).
+
+    Returns a JIT-friendly callable::
+
+        f(trainable, context, rng) -> (means, stds, maxes, p99, raw)
+
+    where
+      means  : float32 (n_constraints,)  — per-constraint residual mean
+      stds   : float32 (n_constraints,)  — per-constraint residual std
+      maxes  : float32 (n_constraints,)  — per-constraint residual max
+      p99    : float32 (n_constraints,)  — 99th-percentile residual
+      raw    : tuple of 1-D arrays, one per constraint, flattened — for
+               host-side histogram logging
+
+    Args:
+        compiled_constraints_fn: Combined compiled JAX function for all constraints.
+        n_constraints: Number of constraint terms (kept for symmetry with the
+            other builders; not used directly here but documents expected output).
+        batchsize: Mini-batch size (``None`` for full-batch).
+        frozen: Frozen parameter pytree (from ``eqx.partition``).
+        static: Static (non-array) pytree.
+        min_consecutive: Forwarded to ``compiled_constraints_fn``.
+    """
+    del n_constraints  # documented for symmetry only; output length matches the call
+
+    def stats(trainable, context, rng):
+        full_models = eqx.combine(trainable, frozen, static)
+        residuals = compiled_constraints_fn(
+            full_models,
+            context,
+            batchsize=batchsize,
+            key=rng,
+            min_consecutive=min_consecutive,
+        )
+        means = jnp.stack([jnp.mean(r) for r in residuals])
+        stds = jnp.stack([jnp.std(r) for r in residuals])
+        maxes = jnp.stack([jnp.max(r) for r in residuals])
+        p99 = jnp.stack([jnp.percentile(r, 99.0) for r in residuals])
+        raw = tuple(r.ravel() for r in residuals)
+        return means, stds, maxes, p99, raw
+
+    return stats
+
+
 def make_per_loss_grad_fn(
     compiled_constraints_fn,
     n_constraints: int,

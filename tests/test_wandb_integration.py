@@ -236,6 +236,7 @@ class TestExplainabilityCallbacksWandBLogging:
             GradientAlignmentCallback,
             GradientNormsCallback,
             LossLandscapeCallback,
+            ResidualStatsCallback,
         )
 
         # ── two-constraint 1-D Poisson ──────────────────────────────────────
@@ -254,6 +255,7 @@ class TestExplainabilityCallbacksWandBLogging:
         cb_cos = CosSimilarityCallback(interval=1)
         cb_align = GradientAlignmentCallback(interval=1)
         cb_land = LossLandscapeCallback(interval=1, n_grid=3)
+        cb_residual = ResidualStatsCallback(interval=1)
         cb_ckpt = CheckpointCallback(
             directory=str(tmp_path / "ckpts"),
             save_interval_epochs=1,
@@ -268,7 +270,7 @@ class TestExplainabilityCallbacksWandBLogging:
         with patch.dict("sys.modules", {"wandb": mock_wandb}):
             solver.solve(
                 3,
-                callbacks=[cb_norms, cb_cos, cb_align, cb_land, cb_ckpt],
+                callbacks=[cb_norms, cb_cos, cb_align, cb_land, cb_residual, cb_ckpt],
             )
         cb_ckpt.close()
 
@@ -293,6 +295,13 @@ class TestExplainabilityCallbacksWandBLogging:
             "Expected loss landscape to be logged (image or scalar fallback)"
         )
 
+        # residual stats — one key per stat per constraint (N=2)
+        for i in (0, 1):
+            for stat in ("mean", "std", "max", "p99"):
+                assert f"explainability/residual/constraint_{i}/{stat}" in logged_keys, (
+                    f"missing explainability/residual/constraint_{i}/{stat}"
+                )
+
         # ── checkpoint artifact carries checkpoint_dir + loss fields ─────────
         assert mock_run.log_artifact.called, "Expected at least one checkpoint artifact upload"
         ckpt_artifact_calls = [c for c in mock_wandb.Artifact.call_args_list if c.kwargs.get("type") == "checkpoint"]
@@ -310,3 +319,7 @@ class TestExplainabilityCallbacksWandBLogging:
         assert cb_align.result["alignment"].ndim == 1
         assert len(cb_align.result["alignment"]) > 0
         assert cb_land.result["landscapes"].shape[1:] == (3, 3)
+        assert cb_residual.result["means"].ndim == 2
+        assert cb_residual.result["means"].shape[1] == 2  # N=2 constraints
+        assert cb_residual.result["maxes"].shape == cb_residual.result["means"].shape
+        assert cb_residual.result["p99"].shape == cb_residual.result["means"].shape

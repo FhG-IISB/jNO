@@ -75,6 +75,25 @@ W&B key: `explainability/gradient_alignment`
 
 ---
 
+## Residual statistics
+
+```python
+cb = jno.callbacks.residual_stats(interval=100)
+crux.solve(5000, callbacks=[cb])
+
+means = cb.result["means"]    # (n_samples, n_constraints)
+maxes = cb.result["maxes"]    # (n_samples, n_constraints)
+p99   = cb.result["p99"]      # (n_samples, n_constraints)
+```
+
+For each constraint $i$, evaluates the un-reduced residual array $r_i$ produced by the compiled constraint function (i.e. the values *before* the training loss applies its mean) and records four scalar statistics — mean, std, max, and 99th percentile — plus a histogram of the raw residuals when W&B is active. A constraint whose ``max`` or ``p99`` stays orders of magnitude above the others points to a region of the domain where the PDE is poorly satisfied, complementing [gradient norms](#gradient-norms) which only reflect each constraint's *aggregated* contribution to the parameter update.
+
+W&B keys: `explainability/residual/constraint_{i}/{mean,std,max,p99}`, `.../histogram` (image)
+
+Reference: per-point residual magnitudes as a sampling / diagnostic signal — Sec. 3 of [[2207.10289](https://arxiv.org/abs/2207.10289)] (Wu et al., 2023).
+
+---
+
 ## Loss landscape
 
 ```python

@@ -746,6 +746,117 @@ class LossLandscapeCallback(Callback):
         }
 
 
+# ---------------------------------------------------------------------------
+# Callback 5 — Per-constraint residual statistics
+# ---------------------------------------------------------------------------
+
+
+class ResidualStatsCallback(Callback):
+    """Track per-constraint residual distributions during training.
+
+    At every ``interval`` outer steps, evaluates each constraint's
+    *un-reduced* residual array (shape ``(B, T, ...)``) and records four
+    summary statistics per constraint — mean, std, max, and 99th percentile
+    — plus a histogram of the raw residual magnitudes (Sec. 3, [2207.10289]).
+
+    A constraint whose ``max`` or ``p99`` stays orders of magnitude above
+    the others indicates a region of the domain where the PDE is poorly
+    satisfied; this complements :class:`GradientNormsCallback` which only
+    reflects a constraint's *aggregated* contribution to the gradient.
+
+    Args:
+        interval: Compute every *n* outer training steps. Default ``100``.
+
+    Example::
+
+        cb = jno.callbacks.residual_stats(interval=100)
+        crux.solve(5000, callbacks=[cb])
+        print(cb.result["maxes"])   # (n_samples, n_constraints)
+    """
+
+    def __init__(self, interval: int = 100) -> None:
+        self._interval = interval
+        self._fn = None
+        self._n_constraints = 0
+        self._epochs: list = []
+        self._means: list = []
+        self._stds: list = []
+        self._maxes: list = []
+        self._p99: list = []
+
+    def on_solve_begin(self, **kwargs) -> None:
+        from jno.utils.explainability import make_residual_stats_fn
+
+        self._n_constraints = kwargs["n_constraints"]
+        self._fn = jax.jit(
+            make_residual_stats_fn(
+                kwargs["compiled_constraints_fn"],
+                kwargs["n_constraints"],
+                kwargs["batchsize"],
+                kwargs["frozen"],
+                kwargs["static"],
+                min_consecutive=kwargs.get("min_consecutive", 1),
+            )
+        )
+        self._fn.lower(kwargs["trainable"], kwargs["context"], kwargs["rng"]).compile()
+
+    def on_epoch_end(self, **kwargs) -> bool:
+        if self._fn is None:
+            return False
+        epoch = kwargs["epoch"]
+        if epoch % self._interval != 0:
+            return False
+        means, stds, maxes, p99, raw = self._fn(kwargs["trainable"], kwargs["context"], kwargs["rng"])
+        means_np = np.asarray(jax.device_get(means))
+        stds_np = np.asarray(jax.device_get(stds))
+        maxes_np = np.asarray(jax.device_get(maxes))
+        p99_np = np.asarray(jax.device_get(p99))
+        raw_np = [np.asarray(jax.device_get(r)) for r in raw]
+
+        self._epochs.append(epoch)
+        self._means.append(means_np)
+        self._stds.append(stds_np)
+        self._maxes.append(maxes_np)
+        self._p99.append(p99_np)
+
+        if get_wandb_run() is not None:
+            wb: dict = {}
+            for i in range(self._n_constraints):
+                wb[f"explainability/residual/constraint_{i}/mean"] = float(means_np[i])
+                wb[f"explainability/residual/constraint_{i}/std"] = float(stds_np[i])
+                wb[f"explainability/residual/constraint_{i}/max"] = float(maxes_np[i])
+                wb[f"explainability/residual/constraint_{i}/p99"] = float(p99_np[i])
+            try:
+                import wandb as _wandb
+
+                for i, r in enumerate(raw_np):
+                    wb[f"explainability/residual/constraint_{i}/histogram"] = _wandb.Histogram(r)
+            except ImportError:
+                pass
+            wandb_log(wb, step=epoch)
+        return False
+
+    @property
+    def result(self) -> dict:
+        """Collected data as numpy arrays.
+
+        Keys:
+            ``epochs`` — ``(S,)`` int array of sampled outer steps.
+            ``means``  — ``(S, N)`` float32 per-constraint residual mean.
+            ``stds``   — ``(S, N)`` float32 per-constraint residual std.
+            ``maxes``  — ``(S, N)`` float32 per-constraint residual max.
+            ``p99``    — ``(S, N)`` float32 per-constraint 99th-percentile.
+        """
+        empty = np.zeros((0,))
+        return {
+            "epochs": np.array(self._epochs),
+            "means": np.stack(self._means) if self._means else empty,
+            "stds": np.stack(self._stds) if self._stds else empty,
+            "maxes": np.stack(self._maxes) if self._maxes else empty,
+            "p99": np.stack(self._p99) if self._p99 else empty,
+        }
+
+
 class callbacks:
     """Factory helpers for built-in adaptive training callbacks.
 
@@ -875,3 +986,16 @@ class callbacks:
             alpha_range: Perturbation range in units of ``‖θ_selected‖``.
         """
         return LossLandscapeCallback(interval=interval, mask=mask, n_grid=n_grid, alpha_range=alpha_range)
+
+    @staticmethod
+    def residual_stats(interval: int = 100) -> ResidualStatsCallback:
+        """Create a :class:`ResidualStatsCallback`.
+
+        Tracks per-constraint residual mean, std, max, and 99th-percentile —
+        plus a histogram when W&B is active — every *interval* outer steps
+        (Sec. 3, [2207.10289]).
+
+        Args:
+            interval: Compute every *n* outer training steps.
+        """
+        return ResidualStatsCallback(interval=interval)

@@ -16,6 +16,7 @@ Techniques shown
 * CosSimilarityCallback        — pairwise cosine similarity matrix (heatmap)
 * GradientAlignmentCallback    — total alignment scalar ‖Σgᵢ‖ / Σ‖gᵢ‖
 * LossLandscapeCallback        — 2-D loss landscape around current params
+* ResidualStatsCallback        — per-constraint residual mean/std/max/p99 + histogram
 * CheckpointCallback           — periodic Orbax save + W&B artifact upload
 
 Run this script directly to see all metrics appear in your W&B dashboard
@@ -87,6 +88,10 @@ cb_landscape = jno.callbacks.loss_landscape(
     alpha_range=0.5,
 )
 
+cb_residual = jno.callbacks.residual_stats(
+    interval=50,
+)
+
 # ── Checkpoint callback ────────────────────────────────────────────────────────
 # Saves to disk every 500 epochs; uploads a versioned artifact to W&B.
 # Artifact metadata includes epoch, total_loss, individual_losses, checkpoint_dir.
@@ -101,7 +106,7 @@ cb_ckpt = jno.callbacks.checkpoint(
 crux = jno.core([pde.mse, bc.mse], domain)
 crux.solve(
     2_000,
-    callbacks=[cb_norms, cb_cos, cb_align, cb_landscape, cb_ckpt],
+    callbacks=[cb_norms, cb_cos, cb_align, cb_landscape, cb_residual, cb_ckpt],
 )
 cb_ckpt.close()
 
@@ -126,6 +131,13 @@ print("\n── Loss landscape ────────────────�
 print(f"  grid shape : {land_result['landscapes'].shape}")
 print(f"  final min  : {land_result['landscapes'][-1].min():.4e}")
 print(f"  final max  : {land_result['landscapes'][-1].max():.4e}")
+
+residual_result = cb_residual.result
+print("\n── Residual statistics ───────────────────────────────────────────────")
+print(f"  means shape : {residual_result['means'].shape}   (samples × constraints)")
+print(f"  final mean  : {residual_result['means'][-1]}")
+print(f"  final max   : {residual_result['maxes'][-1]}")
+print(f"  final p99   : {residual_result['p99'][-1]}")
 
 # ── Validate solution ──────────────────────────────────────────────────────────
 _u, _u_exact = crux.eval([u, u_exact])
