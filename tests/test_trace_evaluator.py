@@ -52,7 +52,7 @@ class TestEvalCtx:
 # ======================================================================
 class TestDispatchTable:
     def test_handlers_count(self):
-        assert len(TraceEvaluator._HANDLERS) == 21  # Update this if we add more node types
+        assert len(TraceEvaluator._HANDLERS) == 22  # Update this if we add more node types
 
     def test_handlers_are_strings(self):
         for node_type, method_name in TraceEvaluator._HANDLERS:
