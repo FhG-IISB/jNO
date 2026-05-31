@@ -747,7 +747,7 @@ class LossLandscapeCallback(Callback):
 
 
 # ---------------------------------------------------------------------------
-# Callback 5 — Per-constraint residual statistics
+# Per-constraint residual statistics
 # ---------------------------------------------------------------------------
 
 
