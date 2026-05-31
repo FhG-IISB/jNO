@@ -1004,6 +1004,32 @@ class PolygonDomain(domain):
         )
         return tuple(result)
 
+    def draw_candidates(self, tag: str):
+        """Return (points, normals_or_None) candidate pool for resampling.
+
+        Generates fresh candidate points from the polygon geometry on each
+        call (10× the currently-sampled count, min 1000) so that resampling
+        strategies can explore the full domain rather than being confined to
+        the initial sample.
+        """
+        import re
+
+        base = tag if tag in self._polygon_tags else re.sub(r"_\d+$", "", tag)
+        if base not in self._polygon_tags:
+            return None, None
+
+        kind, geom = self._polygon_tags[base]
+        n_ctx = self.context.get(tag)
+        n_base = int(n_ctx.shape[2]) if n_ctx is not None else 100
+        n_candidates = max(10 * n_base, 1000)
+
+        if kind == "interior":
+            pts = self._sample_interior(base, geom, n_candidates)
+            return pts, None
+        else:
+            pts, nrm = self._sample_boundary(base, n_candidates, with_normals=True)
+            return pts, nrm
+
     def sample(
         self,
         sample_spec: Dict[str, Tuple[int, Optional[Any]]],
@@ -1074,7 +1100,6 @@ class PolygonDomain(domain):
                     normal_arr[:, np.newaxis, :, :], (batch_count, n_time, n_samples, 2)
                 ).copy()
 
-            self._mesh_points[tag] = arr[0, 0].copy() if arr.size else np.zeros((0, 2), dtype=np.float64)
             last_tag = tag
             last_idx = np.arange(n_samples, dtype=int) if return_indices else None
             if self._verbose:

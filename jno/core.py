@@ -1959,15 +1959,15 @@ class core:
                                 self.log.warning(f"Resampling skipped for tag '{tag}': tag not found in context")
                                 continue
 
-                            # Current strategies are designed for steady-state point
-                            # sets represented as (B, 1, N, D). Keep T fixed at 1.
-                            if not hasattr(tag_points, "ndim") or tag_points.ndim != 4 or tag_points.shape[1] != 1:
+                            if not hasattr(tag_points, "ndim") or tag_points.ndim != 4:
                                 self.log.warning(
-                                    f"Resampling skipped for tag '{tag}': expected point shape (B, 1, N, D), "
-                                    f"got {tuple(tag_points.shape)}"
+                                    f"Resampling skipped for tag '{tag}': expected 4-D point array (B, T, N, D), "
+                                    f"got shape {tuple(getattr(tag_points, 'shape', '?'))}"
                                 )
                                 continue
 
+                            # Spatial slice: coordinates are identical across timesteps.
+                            T = tag_points.shape[1]
                             points_bn = jnp.asarray(tag_points[:, 0, :, :])
                             n_batch, n_points = points_bn.shape[0], points_bn.shape[1]
 
@@ -1988,7 +1988,14 @@ class core:
                                 self.log.warning(f"Resampling skipped for tag '{tag}': no compatible pointwise residuals")
                                 continue
 
-                            combined = jnp.mean(jnp.stack(scored, axis=0), axis=0)  # (B, N)
+                            # Normalize each constraint to [0, 1] then take per-point max.
+                            stacked = jnp.stack(scored, axis=0)  # (C, B, N)
+                            per_max = jnp.max(stacked, axis=-1, keepdims=True)  # (C, B, 1)
+                            normalized = stacked / (per_max + 1e-12)
+                            combined = jnp.max(normalized, axis=0)  # (B, N)
+
+                            # Draw candidates once — reused by every batch and for normals.
+                            candidates_pts, candidates_nrms = self.domain.draw_candidates(tag)
 
                             new_batches = []
                             for b in range(n_batch):
@@ -2002,12 +2009,32 @@ class core:
                                         tag,
                                         epoch,
                                         b_key,
+                                        candidates=candidates_pts,
                                     )
                                 )
 
                             new_points_bn = jnp.stack(new_batches, axis=0)
-                            full_context[tag] = new_points_bn[:, None, :, :]
+                            full_context[tag] = jnp.tile(new_points_bn[:, None, :, :], (1, T, 1, 1))
                             self.domain.context[tag] = np.asarray(full_context[tag])
+
+                            # Update normals atomically when the candidate pool provides them.
+                            normal_tag = f"n_{tag}"
+                            if (
+                                normal_tag in full_context
+                                and candidates_pts is not None
+                                and candidates_nrms is not None
+                            ):
+                                cand_pts_j = jnp.array(candidates_pts)   # (N_pool, D)
+                                cand_nrm_j = jnp.array(candidates_nrms)  # (N_pool, D)
+                                new_nrm_batches = []
+                                for b in range(n_batch):
+                                    # Each new point is an exact row from the pool → argmin recovers its index.
+                                    diffs = new_points_bn[b, :, None, :] - cand_pts_j[None, :, :]
+                                    nearest = jnp.argmin(jnp.sum(diffs**2, axis=-1), axis=-1)
+                                    new_nrm_batches.append(cand_nrm_j[nearest])
+                                new_nrms_bn = jnp.stack(new_nrm_batches, axis=0)  # (B, N, D)
+                                full_context[normal_tag] = jnp.tile(new_nrms_bn[:, None, :, :], (1, T, 1, 1))
+                                self.domain.context[normal_tag] = np.asarray(full_context[normal_tag])
                             strategy.update_epoch(epoch)
                             self.log.info(f"Resampled {tag} points (epoch {epoch + 1})")
                             updated = True

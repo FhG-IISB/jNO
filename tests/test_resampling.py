@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import foundax
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import pytest
 
@@ -41,8 +42,13 @@ def _residuals(n: int = 24) -> jnp.ndarray:
 
 
 def _domain_stub(points: jnp.ndarray, tag: str = "interior"):
-    # Strategies look for `domain._mesh_points[tag]`.
-    return SimpleNamespace(_mesh_points={tag: points})
+    """Minimal domain stub exposing the draw_candidates() interface."""
+
+    class _Stub:
+        def draw_candidates(self, t):
+            return (np.asarray(points), None) if t == tag else (None, None)
+
+    return _Stub()
 
 
 class CountingStrategy(ResamplingStrategy):
@@ -52,7 +58,7 @@ class CountingStrategy(ResamplingStrategy):
         super().__init__(**kwargs)
         self.call_count = 0
 
-    def resample(self, points, residuals, domain, tag, epoch, rng_key):
+    def resample(self, points, residuals, domain, tag, epoch, rng_key, candidates=None):
         self.call_count += 1
         return points
 
@@ -125,6 +131,10 @@ def test_sampler_factory_types():
     assert isinstance(sampler.ha(), HA)
     assert isinstance(sampler.cr3(), CR3)
     assert isinstance(sampler.pinnfluence(), PINNFluence)
+
+
+def test_sampler_factory_has_r3():
+    assert isinstance(sampler.r3(), R3)
 
 
 def test_base_should_resample_cadence_and_start_epoch():
@@ -204,7 +214,7 @@ def test_strategy_residual_shape_mismatch_returns_input():
 def test_random_resampling_without_candidates_returns_input():
     points = _points_1d(16)
     residuals = _residuals(16)
-    domain = SimpleNamespace()  # no _mesh_points
+    domain = SimpleNamespace()  # no draw_candidates
 
     s = RandomResampling(resample_every=1, resample_fraction=0.5, start_epoch=0)
     out = s.resample(points, residuals, domain, "interior", epoch=0, rng_key=jax.random.PRNGKey(0))
@@ -267,17 +277,22 @@ def test_solve_resampling_with_offload_data():
 
 
 @pytest.mark.integration
-def test_time_dependent_tag_is_skipped_by_current_resampling_path():
+def test_time_dependent_resampling_fires_for_1d_domain():
     strategy = CountingStrategy(resample_every=1, resample_fraction=0.5, start_epoch=0)
-    solver, _ = _build_solver(strategy, time=(0.0, 1.0, 3))
+    solver, domain = _build_solver(strategy, time=(0.0, 1.0, 3))
 
     stats = solver.solve(epochs=2)
 
-    # Current solve() path only applies resampling to steady-state (B,1,N,D)
-    # tags; time-dependent tags are skipped with a warning.
-    assert strategy.call_count == 0
-    assert strategy._last_resample_epoch == -1
+    assert strategy.call_count > 0
+    assert strategy._last_resample_epoch == 1
     assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
+
+    # Spatial coordinates must be identical across all T timesteps after resampling.
+    ctx = domain.context.get("interior")
+    if ctx is not None and ctx.ndim == 4:
+        T = ctx.shape[1]
+        for t in range(1, T):
+            assert np.allclose(ctx[:, 0, :, :], ctx[:, t, :, :], atol=1e-6)
 
 
 @pytest.mark.integration
@@ -321,17 +336,22 @@ def test_solve_resampling_works_for_3d_steady_domain():
 
 
 @pytest.mark.integration
-def test_time_dependent_2d_domain_training_path_remains_stable():
+def test_time_dependent_2d_domain_resampling_fires():
     strategy = CountingStrategy(resample_every=1, resample_fraction=0.3, start_epoch=0)
-    solver, _ = _build_solver_nd(strategy, spatial_dim=2, time=(0.0, 1.0, 3))
+    solver, domain = _build_solver_nd(strategy, spatial_dim=2, time=(0.0, 1.0, 3))
 
     stats = solver.solve(epochs=2)
 
-    # Current solve() resampling path focuses on steady-state point layouts;
-    # time-dependent tags are skipped gracefully.
-    assert strategy.call_count == 0
-    assert strategy._last_resample_epoch == -1
+    assert strategy.call_count > 0
+    assert strategy._last_resample_epoch == 1
     assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
+
+    # Spatial coordinates identical across T.
+    ctx = domain.context.get("interior")
+    if ctx is not None and ctx.ndim == 4:
+        T = ctx.shape[1]
+        for t in range(1, T):
+            assert np.allclose(ctx[:, 0, :, :], ctx[:, t, :, :], atol=1e-6)
 
 
 def test_solve_resampling_works_with_adaptive_weight_wrapped_losses():
@@ -366,3 +386,38 @@ def test_solve_resampling_works_with_adaptive_weight_wrapped_losses():
 
     assert strategy.call_count > 0
     assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
+
+
+def test_merged_domain_draw_candidates_covers_both_subdomains():
+    """draw_candidates on a merged domain should return points from both sub-domains."""
+    d1 = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.05, x_range=(0.0, 0.5)))
+    d2 = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.05, x_range=(0.5, 1.0)))
+
+    # Sample interior from each so _mesh_pool is populated.
+    d1.variable("interior", sample=(40, None))
+    d2.variable("interior", sample=(40, None))
+
+    # Measure individual pool sizes BEFORE merge (__add__ mutates d1 in-place).
+    pool1_pre, _ = d1.draw_candidates("interior")
+    pool2_pre, _ = d2.draw_candidates("interior")
+    n1, n2 = len(pool1_pre), len(pool2_pre)
+
+    merged = d1 + d2  # d1 is now the merged domain
+
+    pts, _ = merged.draw_candidates("interior")
+    assert pts is not None
+    assert len(pts) >= n1 + n2
+
+
+def test_domain_draw_candidates_returns_spatial_slice_for_time_dep():
+    """For a time-dependent domain the candidate pool should be (N, D_spatial)."""
+    domain = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.05), time=(0.0, 1.0, 4))
+    domain.variable("interior", sample=(50, None))
+
+    pts, nrm = domain.draw_candidates("interior")
+    assert pts is not None
+    # Spatial coordinates only — should be (N, D_spatial), not (T, N, D_spatial).
+    assert pts.ndim == 2, f"Expected 2-D spatial slice, got shape {pts.shape}"
+    # normals may or may not be present depending on domain type; shape must match pts.
+    if nrm is not None:
+        assert nrm.shape == pts.shape
