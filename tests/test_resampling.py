@@ -689,3 +689,37 @@ def test_burgers_rad_resampling_concentrates_near_steep_gradient():
         f"(initial {initial_mean_abs_x:.3f} → final {final_mean_abs_x:.3f})"
     )
     assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
+
+
+@pytest.mark.integration
+def test_temporal_derivative_with_mixed_spatial_tag_counts():
+    """Temporal derivative must not crash when interior and initial have different N.
+
+    Regression test for a bug where the fallback N-determination in the temporal
+    derivative evaluator took max(N_interior, N_initial) and then sliced only the
+    larger tag, leaving the smaller tag unsliced — so the network saw all points at
+    once instead of one point at a time, producing a shape mismatch ValueError.
+
+    Fix: scope N to the expression's own spatial tags via collect_tags(), not max
+    over all context tags (jno/trace_evaluator.py, issue #48).
+    """
+    domain = jno.domain(constructor=jno.domain.line(mesh_size=0.1), time=(0.0, 1.0, 4))
+
+    # Deliberately different sample sizes: the mismatch is what triggered the bug.
+    x, t = domain.variable("interior", sample=(6, None))
+    x0, t0 = domain.variable("initial", sample=(8, None))
+
+    key = jax.random.PRNGKey(0)
+    net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=8, num_layers=2, key=key))
+    u = net(x) * x * (1.0 - x)
+
+    u_t = jnn.grad(u, t)
+    u_xx = jnn.laplacian(u, [x])
+    pde = u_t - 0.05 * u_xx
+    ini = net(x0) * x0 * (1.0 - x0) - jnn.sin(jnn.pi * x0)
+
+    solver = jno.core([pde.mse, ini.mse], domain)
+    net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+
+    stats = solver.solve(epochs=2)
+    assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
