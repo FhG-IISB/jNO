@@ -114,3 +114,46 @@ def test_residual_stats_subset_selects_one_constraint():
         # Re-using the same already-built solver; on_solve_begin fires when
         # solve() is called again.
         solver.solve(1, callbacks=[cb_bad])
+
+
+def test_input_saliency_records_finite_values_with_consistent_shape():
+    """InputSensitivityCallback compiles ``u.d(x)`` and records finite
+    per-point sensitivities of consistent shape across sampled epochs.
+    Params are frozen via lr=0, so values should not change between epochs.
+    """
+    import foundax
+    import optax
+
+    import jno
+    import jno.jnp_ops as jnn
+    from jno import LearningRateSchedule as lrs
+    from jno.utils.adaptive.callbacks import InputSensitivityCallback
+
+    domain = jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+    x, _ = domain.variable("interior")
+    key = jax.random.PRNGKey(0)
+
+    u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=4, num_layers=2, key=key))
+    u_net.optimizer(optax.sgd, lr=lrs.exponential(0.0, 1.0, 1, 0.0))  # lr=0
+    u = u_net(x)
+    pde = u
+
+    solver = jno.core([pde.mse], domain)
+    cb = InputSensitivityCallback(u.d(x), interval=1)
+    solver.solve(2, callbacks=[cb])
+
+    values = cb.result["values"]
+    assert cb.result["epochs"].shape == (2,)
+    assert values.shape[0] == 2
+    assert np.all(np.isfinite(values))
+    np.testing.assert_allclose(values[0], values[1], atol=1e-5)
+
+
+def test_input_sensitivity_rejects_non_placeholder():
+    """InputSensitivityCallback rejects non-Placeholder arguments."""
+    import pytest
+
+    from jno.utils.adaptive.callbacks import InputSensitivityCallback
+
+    with pytest.raises(TypeError, match="Placeholder"):
+        InputSensitivityCallback(expr=jnp.zeros(3), interval=1)
