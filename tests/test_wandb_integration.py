@@ -225,6 +225,7 @@ class TestExplainabilityCallbacksWandBLogging:
         """Smoke-test: all explainability keys + checkpoint metadata reach W&B."""
         import foundax
         import jax
+        import numpy as np
         import optax
 
         import jno
@@ -235,8 +236,10 @@ class TestExplainabilityCallbacksWandBLogging:
             CosSimilarityCallback,
             GradientAlignmentCallback,
             GradientNormsCallback,
+            HessianSpectrumCallback,
             InputSensitivityCallback,
             LossLandscapeCallback,
+            NTKSpectrumCallback,
             ResidualStatsCallback,
         )
 
@@ -259,6 +262,10 @@ class TestExplainabilityCallbacksWandBLogging:
         cb_residual = ResidualStatsCallback(interval=1)
         # Input saliency: ∂u/∂x evaluated at the interior collocation points.
         cb_saliency = InputSensitivityCallback(u.d(x), interval=1)
+        # NTK spectrum on u.grad(net) — subsample to all 8 interior points, top_k=3.
+        cb_ntk = NTKSpectrumCallback(u.grad(u_net), n_points=8, top_k=3, interval=1)
+        # Hessian spectrum
+        cb_hess = HessianSpectrumCallback(k=3, n_iter=5, interval=1)
         cb_ckpt = CheckpointCallback(
             directory=str(tmp_path / "ckpts"),
             save_interval_epochs=1,
@@ -273,7 +280,7 @@ class TestExplainabilityCallbacksWandBLogging:
         with patch.dict("sys.modules", {"wandb": mock_wandb}):
             solver.solve(
                 3,
-                callbacks=[cb_norms, cb_cos, cb_align, cb_land, cb_residual, cb_saliency, cb_ckpt],
+                callbacks=[cb_norms, cb_cos, cb_align, cb_land, cb_residual, cb_saliency, cb_ntk, cb_hess, cb_ckpt],
             )
         cb_ckpt.close()
 
@@ -310,6 +317,17 @@ class TestExplainabilityCallbacksWandBLogging:
         assert "explainability/saliency/max_abs" in logged_keys
         assert "explainability/saliency/std_abs" in logged_keys
 
+        # NTK spectrum — top-k + scalars
+        assert "explainability/ntk/lambda_max" in logged_keys
+        assert "explainability/ntk/lambda_min" in logged_keys
+        assert "explainability/ntk/condition_number" in logged_keys
+        assert "explainability/ntk/eigval_0" in logged_keys
+
+        # Hessian eigenspectrum — top-k + sharpness
+        assert "explainability/hessian/sharpness" in logged_keys
+        assert "explainability/hessian/eigval_0" in logged_keys
+        assert "explainability/hessian/n_iter" in logged_keys
+
         # ── checkpoint artifact carries checkpoint_dir + loss fields ─────────
         assert mock_run.log_artifact.called, "Expected at least one checkpoint artifact upload"
         ckpt_artifact_calls = [c for c in mock_wandb.Artifact.call_args_list if c.kwargs.get("type") == "checkpoint"]
@@ -334,3 +352,10 @@ class TestExplainabilityCallbacksWandBLogging:
         # saliency: result["values"] holds the raw expression evaluations
         assert cb_saliency.result["values"].ndim >= 2
         assert len(cb_saliency.result["epochs"]) > 0
+        # NTK: top-k=3 eigvals, n_points=8 → all_eigvals shape (S, 8)
+        assert cb_ntk.result["eigvals_topk"].shape[1] == 3
+        assert cb_ntk.result["all_eigvals"].shape[1] == 8
+        assert np.all(np.isfinite(cb_ntk.result["lambda_max"]))
+        # Hessian: top-k=3 eigvals, sharpness scalar
+        assert cb_hess.result["eigvals"].shape[1] == 3
+        assert cb_hess.result["sharpness"].ndim == 1
