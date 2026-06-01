@@ -533,16 +533,13 @@ def test_boundary_normals_updated_after_resample():
     u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
     solver.solve(epochs=3)
 
-    pts = np.asarray(domain.context["boundary"])   # (B, T, N, 2)
-    nrm = np.asarray(domain.context["n_boundary"]) # (B, T, N, 2)
+    pts = np.asarray(domain.context["boundary"])  # (B, T, N, 2)
+    nrm = np.asarray(domain.context["n_boundary"])  # (B, T, N, 2)
 
-    assert nrm.shape == pts.shape, (
-        f"Normal shape {nrm.shape} must match point shape {pts.shape}"
-    )
+    assert nrm.shape == pts.shape, f"Normal shape {nrm.shape} must match point shape {pts.shape}"
     magnitudes = np.linalg.norm(nrm.reshape(-1, 2), axis=-1)
     assert np.allclose(magnitudes, 1.0, atol=1e-4), (
-        f"Normals must be unit vectors after resampling; "
-        f"magnitudes range {magnitudes.min():.6f} – {magnitudes.max():.6f}"
+        f"Normals must be unit vectors after resampling; magnitudes range {magnitudes.min():.6f} – {magnitudes.max():.6f}"
     )
 
 

@@ -1010,12 +1010,13 @@ class TraceEvaluator:
                 # compiler sets that from the first alphabetical spatial tag,
                 # which may differ from this expression's actual tag.
                 expr_spatial_tags = [
-                    t for t in collect_tags(base_target)
-                    if t in ctx.context and is_spatial_pointset(t, ctx.context[t])
+                    t for t in collect_tags(base_target) if t in ctx.context and is_spatial_pointset(t, ctx.context[t])
                 ]
-                source_tags = expr_spatial_tags if expr_spatial_tags else [
-                    k for k, v in ctx.context.items() if is_spatial_pointset(k, v)
-                ]
+                source_tags = (
+                    expr_spatial_tags
+                    if expr_spatial_tags
+                    else [k for k, v in ctx.context.items() if is_spatial_pointset(k, v)]
+                )
                 N = 1
                 for t in source_tags:
                     v = ctx.context[t]
