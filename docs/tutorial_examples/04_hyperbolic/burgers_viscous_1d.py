@@ -52,7 +52,7 @@ from jno import LearningRateSchedule as lrs
 from jno import sampler
 
 π = jno.np.pi
-ν = 0.05   # viscosity — decrease for sharper gradients
+ν = 0.05  # viscosity — decrease for sharper gradients
 T_end = 1.0
 
 # ── Adaptive resampling strategy ──────────────────────────────────────────────
@@ -88,10 +88,7 @@ x0, t0 = vars_bot[0], vars_bot[1]
 u_exact = jno.np.exp(-t) * jno.np.sin(π * x)
 
 # f = e^{-t}(νπ² − 1) sin(πx)  +  (π/2) e^{-2t} sin(2πx)
-source = (
-    jno.np.exp(-t) * (ν * π**2 - 1) * jno.np.sin(π * x)
-    + (π / 2) * jno.np.exp(-2 * t) * jno.np.sin(2 * π * x)
-)
+source = jno.np.exp(-t) * (ν * π**2 - 1) * jno.np.sin(π * x) + (π / 2) * jno.np.exp(-2 * t) * jno.np.sin(2 * π * x)
 
 # ── Network  (hard Dirichlet BCs) ────────────────────────────────────────────
 # MLP with 2 inputs (x, t); the x*(1-x) factor enforces u(0,t)=u(1,t)=0.
