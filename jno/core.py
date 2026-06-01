@@ -952,10 +952,15 @@ class core:
         # === Compile constraints and trackers ===
         self.compiled_trackers = []
         self._constraint_exprs = []  # raw expressions for shape tracing
+        # Original (pre-wrap, pre-CSE) constraint expressions in the same order
+        # as ``_constraint_exprs`` — used by callbacks like residual_stats /
+        # hessian_spectrum that accept a ``constraints=`` subset and need to
+        # identity-match the user's original Python objects.
+        self._user_constraint_exprs = []
         self._tracker_exprs = []
         constraint_exprs = []
 
-        for expr in constraints:
+        for orig_expr, expr in zip(self.constraints, constraints):
             inner = expr
             tracker_interval = None
             if isinstance(expr, OperationDef) and isinstance(expr.expr, Tracker):
@@ -972,6 +977,7 @@ class core:
             else:
                 constraint_exprs.append(inner)
                 self._constraint_exprs.append(inner)
+                self._user_constraint_exprs.append(orig_expr)
 
         # Compile all normal constraints in ONE combined function so XLA
         # can apply CSE across shared sub-expressions.
@@ -1862,6 +1868,9 @@ class core:
                         context=trace_context,
                         rng=self.rng,
                         min_consecutive=min_consecutive,
+                        constraint_exprs=self._user_constraint_exprs,
+                        all_ops=self.all_ops,
+                        domain=self.domain,
                     )
 
             # ── 8. Training loop ──

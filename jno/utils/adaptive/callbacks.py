@@ -34,6 +34,15 @@ class Callback:
             context: Domain context (use for pre-compilation only).
             rng: PRNG key.
             min_consecutive (int): Minimum consecutive time steps per constraint call.
+            constraint_exprs: List of the solver's raw constraint placeholders
+                (the exact Python objects passed to ``jno.core([...])``).
+                Callbacks that take a ``constraints=`` arg validate user input
+                against this list by Python identity.
+            all_ops: List of OperationDef instances (the solver's compiled op set);
+                callbacks may pass this to ``TraceCompiler.compile_multi_expression``
+                to evaluate user-supplied placeholder expressions during training.
+            domain: The solver's :class:`~jno.domain.domain` instance (read-only;
+                use only for shape / metadata inspection during pre-compilation).
         """
 
     def on_epoch_end(self, **kwargs) -> bool:
@@ -56,6 +65,47 @@ class Callback:
 
     def on_training_end(self, **kwargs) -> None:
         """Called once after the training loop finishes."""
+
+
+def _resolve_constraint_indices(user_constraints, solver_constraints, callback_name: str) -> list[int]:
+    """Map user-supplied constraint placeholders to their solver-side indices.
+
+    Matches by Python identity — i.e. the user must pass the *same* Python
+    object that was given to ``jno.core([...])`` (assign the constraint to a
+    variable rather than re-accessing ``.mse``, which returns a fresh
+    placeholder every time).  Raises ``ValueError`` with a clear hint on
+    mismatch.
+
+    Args:
+        user_constraints: List of placeholder expressions, or ``None`` for "all".
+        solver_constraints: ``solver._constraint_exprs`` (the solver's stored
+            constraint list).
+        callback_name: Used in the error message so users know which callback
+            raised.
+
+    Returns:
+        List of integer indices into ``solver_constraints``.  When
+        ``user_constraints is None`` the full range ``[0, len(solver_constraints))``.
+    """
+    if user_constraints is None:
+        return list(range(len(solver_constraints)))
+    indices: list[int] = []
+    for c in user_constraints:
+        found = -1
+        for i, ce in enumerate(solver_constraints):
+            if c is ce:
+                found = i
+                break
+        if found == -1:
+            raise ValueError(
+                f"{callback_name}: constraint {c!r} not found among the "
+                f"solver's compiled constraints.  Pass the same Python "
+                f"object that was given to jno.core([...]) — assign your "
+                f"constraint to a variable rather than re-accessing .mse "
+                f"(which returns a fresh placeholder each access)."
+            )
+        indices.append(found)
+    return indices
 
 
 # ---------------------------------------------------------------------------
@@ -746,6 +796,503 @@ class LossLandscapeCallback(Callback):
         }
 
 
+# ---------------------------------------------------------------------------
+# Per-constraint residual statistics
+# ---------------------------------------------------------------------------
+
+
+class ResidualStatsCallback(Callback):
+    """Track per-constraint residual distributions during training.
+
+    At every ``interval`` outer steps, evaluates each constraint's
+    *un-reduced* residual array (shape ``(B, T, ...)``) and records four
+    summary statistics per constraint — mean, std, max, and 99th percentile
+    — plus a histogram of the raw residual magnitudes (Sec. 3, [2207.10289]).
+
+    A constraint whose ``max`` or ``p99`` stays orders of magnitude above
+    the others indicates a region of the domain where the PDE is poorly
+    satisfied; this complements :class:`GradientNormsCallback` which only
+    reflects a constraint's *aggregated* contribution to the gradient.
+
+    Args:
+        interval: Compute every *n* outer training steps. Default ``100``.
+        constraints: Optional list of constraint placeholders to scope the
+            callback to a subset of the solver's constraints.  Pass the
+            *same* Python objects that were given to ``jno.core([...])`` —
+            assign your constraints to variables rather than re-accessing
+            ``.mse`` (which returns a fresh placeholder each access).
+            When ``None`` (default) all constraints are tracked.
+
+    Example::
+
+        pde_loss = pde.mse                       # assign once
+        bc_loss  = bc.mse
+        solver = jno.core([pde_loss, bc_loss], domain)
+        cb = jno.callbacks.residual_stats(interval=100, constraints=[pde_loss])
+        crux.solve(5000, callbacks=[cb])
+        print(cb.result["maxes"])   # (n_samples, 1)  — just pde_loss
+    """
+
+    def __init__(self, interval: int = 100, constraints=None) -> None:
+        self._interval = interval
+        self._user_constraints = constraints  # resolved in on_solve_begin
+        self._indices: list[int] = []  # populated in on_solve_begin
+        self._fn = None
+        self._n_constraints = 0
+        self._epochs: list = []
+        self._means: list = []
+        self._stds: list = []
+        self._maxes: list = []
+        self._p99: list = []
+
+    def on_solve_begin(self, **kwargs) -> None:
+        from jno.utils.explainability import make_residual_stats_fn
+
+        self._n_constraints = kwargs["n_constraints"]
+        # Resolve the optional constraint subset to solver-side indices.
+        # `constraint_exprs` is added by the solver hook; defensively fall back
+        # to the full range if absent (older solvers without the hook).
+        solver_constraints = kwargs.get("constraint_exprs")
+        if solver_constraints is None:
+            solver_constraints = [None] * self._n_constraints
+        self._indices = _resolve_constraint_indices(self._user_constraints, solver_constraints, "residual_stats")
+
+        self._fn = jax.jit(
+            make_residual_stats_fn(
+                kwargs["compiled_constraints_fn"],
+                kwargs["n_constraints"],
+                kwargs["batchsize"],
+                kwargs["frozen"],
+                kwargs["static"],
+                min_consecutive=kwargs.get("min_consecutive", 1),
+            )
+        )
+        self._fn.lower(kwargs["trainable"], kwargs["context"], kwargs["rng"]).compile()
+
+    def on_epoch_end(self, **kwargs) -> bool:
+        if self._fn is None:
+            return False
+        epoch = kwargs["epoch"]
+        if epoch % self._interval != 0:
+            return False
+        means, stds, maxes, p99, raw = self._fn(kwargs["trainable"], kwargs["context"], kwargs["rng"])
+        means_np = np.asarray(jax.device_get(means))
+        stds_np = np.asarray(jax.device_get(stds))
+        maxes_np = np.asarray(jax.device_get(maxes))
+        p99_np = np.asarray(jax.device_get(p99))
+        raw_np = [np.asarray(jax.device_get(r)) for r in raw]
+
+        # Slice each scalar array to the requested constraint subset.  Raw
+        # residuals are a list of variable-length arrays, so they're
+        # picked-by-index rather than fancy-indexed.
+        idx = self._indices
+        means_sel = means_np[idx]
+        stds_sel = stds_np[idx]
+        maxes_sel = maxes_np[idx]
+        p99_sel = p99_np[idx]
+        raw_sel = [raw_np[i] for i in idx]
+
+        self._epochs.append(epoch)
+        self._means.append(means_sel)
+        self._stds.append(stds_sel)
+        self._maxes.append(maxes_sel)
+        self._p99.append(p99_sel)
+
+        if get_wandb_run() is not None:
+            wb: dict = {}
+            # Use the *solver-side* index for the W&B key so the dashboard
+            # remains stable when users add/remove unrelated constraints.
+            for slot, i in enumerate(idx):
+                wb[f"explainability/residual/constraint_{i}/mean"] = float(means_sel[slot])
+                wb[f"explainability/residual/constraint_{i}/std"] = float(stds_sel[slot])
+                wb[f"explainability/residual/constraint_{i}/max"] = float(maxes_sel[slot])
+                wb[f"explainability/residual/constraint_{i}/p99"] = float(p99_sel[slot])
+            try:
+                import wandb as _wandb
+
+                for slot, i in enumerate(idx):
+                    wb[f"explainability/residual/constraint_{i}/histogram"] = _wandb.Histogram(raw_sel[slot])
+            except ImportError:
+                pass
+            wandb_log(wb, step=epoch)
+        return False
+
+    @property
+    def result(self) -> dict:
+        """Collected data as numpy arrays.
+
+        Keys:
+            ``epochs`` — ``(S,)`` int array of sampled outer steps.
+            ``means``  — ``(S, K)`` float32 per-constraint residual mean,
+                where ``K = len(constraints)`` when a subset was selected,
+                else ``N_constraints``.
+            ``stds``   — ``(S, K)`` float32 per-constraint residual std.
+            ``maxes``  — ``(S, K)`` float32 per-constraint residual max.
+            ``p99``    — ``(S, K)`` float32 per-constraint 99th-percentile.
+            ``indices`` — ``(K,)`` int array of solver-side constraint indices
+                in the same order as the columns of ``means``/``stds``/etc.
+        """
+        empty = np.zeros((0,))
+        return {
+            "epochs": np.array(self._epochs),
+            "means": np.stack(self._means) if self._means else empty,
+            "stds": np.stack(self._stds) if self._stds else empty,
+            "maxes": np.stack(self._maxes) if self._maxes else empty,
+            "p99": np.stack(self._p99) if self._p99 else empty,
+            "indices": np.array(self._indices, dtype=int),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Input sensitivity / saliency
+# ---------------------------------------------------------------------------
+
+
+class InputSensitivityCallback(Callback):
+    """Evaluate any placeholder expression at training collocation points.
+
+    Most useful for input-saliency: pass ``u.d(x)`` (single coordinate) or
+    ``jno.Jacobian(u, [x, y])`` (multi-coordinate) and the callback will
+    record the per-point sensitivity of the network output to its inputs
+    every ``interval`` outer steps.  Conceptually equivalent to the
+    class-saliency map of Sec. 3 of [1312.6034] — high magnitude points
+    correspond to spatial regions where the network response is most
+    responsive to a perturbation of the input coordinate.
+
+    The expression is compiled via
+    :meth:`~jno.trace_compiler.TraceCompiler.compile_multi_expression`
+    (the same machinery used by the solver's constraints and trackers),
+    so any composite placeholder expression works — not just first
+    derivatives.
+
+    Args:
+        expr: A :class:`~jno.trace.Placeholder` expression to evaluate.
+            Common choices: ``u.d(x)``, ``jno.Jacobian(u, [x, y])``,
+            ``jno.np.linalg.norm(u.d(x))``.
+        interval: Compute every *n* outer training steps. Default ``100``.
+
+    Example::
+
+        cb = jno.callbacks.input_sensitivity(u.d(x), interval=100)
+        crux.solve(5000, callbacks=[cb])
+        print(cb.result["values"].shape)   # (n_samples, *expr_shape)
+    """
+
+    def __init__(self, expr, interval: int = 100) -> None:
+        from jno.trace import Placeholder
+
+        if not isinstance(expr, Placeholder):
+            raise TypeError(
+                f"input_sensitivity expects a jno Placeholder expression (e.g. u.d(x)), got {type(expr).__name__!r}."
+            )
+        self._expr = expr
+        self._interval = interval
+        self._fn = None
+        self._epochs: list = []
+        self._values: list = []
+
+    def on_solve_begin(self, **kwargs) -> None:
+        from jno.utils.explainability import make_expression_eval_fn
+
+        if "all_ops" not in kwargs:
+            raise RuntimeError(
+                "InputSensitivityCallback requires the solver to pass `all_ops` "
+                "via on_solve_begin (added by jno >= explainability v2)."
+            )
+        self._fn = jax.jit(
+            make_expression_eval_fn(
+                self._expr,
+                kwargs["all_ops"],
+                kwargs["batchsize"],
+                kwargs["frozen"],
+                kwargs["static"],
+                min_consecutive=kwargs.get("min_consecutive", 1),
+            )
+        )
+        self._fn.lower(kwargs["trainable"], kwargs["context"], kwargs["rng"]).compile()
+
+    def on_epoch_end(self, **kwargs) -> bool:
+        if self._fn is None:
+            return False
+        epoch = kwargs["epoch"]
+        if epoch % self._interval != 0:
+            return False
+        values = np.asarray(jax.device_get(self._fn(kwargs["trainable"], kwargs["context"], kwargs["rng"])))
+        self._epochs.append(epoch)
+        self._values.append(values)
+        if get_wandb_run() is not None:
+            abs_v = np.abs(values)
+            wb: dict = {
+                "explainability/saliency/mean_abs": float(abs_v.mean()),
+                "explainability/saliency/max_abs": float(abs_v.max()),
+                "explainability/saliency/std_abs": float(abs_v.std()),
+            }
+            try:
+                import wandb as _wandb
+
+                wb["explainability/saliency/histogram"] = _wandb.Histogram(abs_v.ravel())
+            except ImportError:
+                pass
+            wandb_log(wb, step=epoch)
+        return False
+
+    @property
+    def result(self) -> dict:
+        """Collected data as numpy arrays.
+
+        Keys:
+            ``epochs`` — ``(S,)`` int array of sampled outer steps.
+            ``values`` — ``(S, *expr_shape)`` array of expression evaluations.
+        """
+        return {
+            "epochs": np.array(self._epochs),
+            "values": np.stack(self._values) if self._values else np.zeros((0,)),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Empirical NTK spectrum
+# ---------------------------------------------------------------------------
+
+
+class NTKSpectrumCallback(Callback):
+    """Track the empirical Neural Tangent Kernel eigenvalue spectrum.
+
+    For a :class:`~jno.trace.NetworkGradient` placeholder ``u.grad(net)``
+    (per-point parameter Jacobian :math:`J \\in \\mathbb{R}^{N \\times P}`)
+    constructs the empirical NTK :math:`K = J J^\\top` at every
+    ``interval`` outer steps, subsampled to ``n_points`` collocation
+    points, and reports the top-k eigenvalues, condition number, and full
+    spectrum.
+
+    The eigenvalue spread is the canonical diagnostic for PINN spectral
+    bias (Sec. 3-4, [2007.14527]): widely separated eigenvalues mean some
+    directions in parameter space train orders of magnitude faster than
+    others, producing the characteristic PINN failure mode where
+    high-frequency features lag low-frequency ones.
+
+    Args:
+        grad_expr: A :class:`~jno.trace.NetworkGradient` placeholder
+            (the result of ``expr.grad(model)``).  Use ``model.mask(...)``
+            to restrict to a parameter subset, e.g.
+            ``u.grad(net.mask(output_only_mask))`` — masking lives in the
+            placeholder rather than as a separate argument.
+        n_points: Number of collocation points to subsample for the
+            kernel.  Cost is ``O(n_points² × P)``; default ``256``.
+        top_k: Number of largest eigenvalues to report.  Default ``10``.
+        interval: Compute every *n* outer training steps.  Default ``500``
+            (expensive — keep large for real runs).
+
+    Example::
+
+        cb = jno.callbacks.ntk_spectrum(u.grad(u_net), n_points=128, top_k=10)
+        crux.solve(10_000, callbacks=[cb])
+        print(cb.result["lambda_max"])         # (n_samples,)
+        print(cb.result["condition_number"])   # (n_samples,)
+    """
+
+    def __init__(
+        self,
+        grad_expr,
+        n_points: int = 256,
+        top_k: int = 10,
+        interval: int = 500,
+    ) -> None:
+        from jno.trace import NetworkGradient
+
+        if not isinstance(grad_expr, NetworkGradient):
+            raise TypeError(
+                f"ntk_spectrum expects a NetworkGradient placeholder "
+                f"(e.g. u.grad(net)), got {type(grad_expr).__name__!r}. "
+                "Build one via ``expr.grad(model)``."
+            )
+        self._grad_expr = grad_expr
+        self._n_points = n_points
+        self._top_k = top_k
+        self._interval = interval
+        self._fn = None
+        self._epochs: list = []
+        self._top: list = []
+        self._lam_min: list = []
+        self._lam_max: list = []
+        self._cond: list = []
+        self._all: list = []
+
+    def on_solve_begin(self, **kwargs) -> None:
+        from jno.utils.explainability import make_ntk_spectrum_fn
+
+        if "all_ops" not in kwargs:
+            raise RuntimeError(
+                "NTKSpectrumCallback requires the solver to pass `all_ops` "
+                "via on_solve_begin (added by jno >= explainability v2)."
+            )
+        self._fn = jax.jit(
+            make_ntk_spectrum_fn(
+                self._grad_expr,
+                kwargs["all_ops"],
+                kwargs["batchsize"],
+                kwargs["frozen"],
+                kwargs["static"],
+                n_points=self._n_points,
+                top_k=self._top_k,
+                min_consecutive=kwargs.get("min_consecutive", 1),
+            )
+        )
+        self._fn.lower(kwargs["trainable"], kwargs["context"], kwargs["rng"]).compile()
+
+    def on_epoch_end(self, **kwargs) -> bool:
+        if self._fn is None:
+            return False
+        epoch = kwargs["epoch"]
+        if epoch % self._interval != 0:
+            return False
+        top, lam_min, lam_max, cond, all_eigs = self._fn(kwargs["trainable"], kwargs["context"], kwargs["rng"])
+        top_np = np.asarray(jax.device_get(top))
+        lam_min_v = float(jax.device_get(lam_min))
+        lam_max_v = float(jax.device_get(lam_max))
+        cond_v = float(jax.device_get(cond))
+        all_np = np.asarray(jax.device_get(all_eigs))
+
+        self._epochs.append(epoch)
+        self._top.append(top_np)
+        self._lam_min.append(lam_min_v)
+        self._lam_max.append(lam_max_v)
+        self._cond.append(cond_v)
+        self._all.append(all_np)
+
+        if get_wandb_run() is not None:
+            wb: dict = {f"explainability/ntk/eigval_{i}": float(v) for i, v in enumerate(top_np)}
+            wb["explainability/ntk/lambda_max"] = lam_max_v
+            wb["explainability/ntk/lambda_min"] = lam_min_v
+            wb["explainability/ntk/condition_number"] = cond_v
+            try:
+                import wandb as _wandb
+
+                wb["explainability/ntk/spectrum_hist"] = _wandb.Histogram(all_np)
+            except ImportError:
+                pass
+            wandb_log(wb, step=epoch)
+        return False
+
+    @property
+    def result(self) -> dict:
+        """Collected data as numpy arrays."""
+        empty = np.zeros((0,))
+        return {
+            "epochs": np.array(self._epochs),
+            "eigvals_topk": np.stack(self._top) if self._top else empty,
+            "lambda_min": np.array(self._lam_min),
+            "lambda_max": np.array(self._lam_max),
+            "condition_number": np.array(self._cond),
+            "all_eigvals": np.stack(self._all) if self._all else empty,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Hessian eigenspectrum / sharpness
+# ---------------------------------------------------------------------------
+
+
+class HessianSpectrumCallback(Callback):
+    """Track the top-k Hessian eigenvalues of the total training loss.
+
+    Constructs :math:`\\nabla^2_\\theta L` implicitly via Hessian-vector
+    products (``jvp(grad(L), …, …)``) and runs ``n_iter`` Lanczos
+    iterations with full reorthogonalisation.  The resulting tridiagonal
+    is eigendecomposed host-side via ``scipy.linalg.eigh_tridiagonal``
+    (Sec. 3.1-3.2, [1912.07145]) to obtain the top-k eigenvalues.
+
+    The largest eigenvalue is the *sharpness* of the loss surface at the
+    current iterate (Sec. 2.2, [1609.04836]); high values predict a sharp
+    minimum, typically associated with worse generalisation.
+
+    Args:
+        k: Number of largest eigenvalues to report.  Default ``10``.
+        n_iter: Number of Lanczos iterations.  Default ``30``.
+        interval: Compute every *n* outer training steps.  Default ``500``.
+        mask: Optional pytree of booleans matching the *trainable*
+            structure.  Essential for large models.
+        constraints: Optional list of constraint placeholders to scope the
+            Hessian to the mean of those constraints' losses (instead of
+            the total training loss).  Pass the same Python objects given
+            to ``jno.core([...])`` — assign your constraints to variables
+            rather than re-accessing ``.mse``.
+    """
+
+    def __init__(
+        self,
+        k: int = 10,
+        n_iter: int = 30,
+        interval: int = 500,
+        mask=None,
+        constraints=None,
+    ) -> None:
+        self._k = k
+        self._n_iter = n_iter
+        self._interval = interval
+        self._mask = mask
+        self._user_constraints = constraints
+        self._indices: list[int] = []
+        self._fn = None
+        self._epochs: list = []
+        self._eigvals: list = []
+        self._sharpness: list = []
+
+    def on_solve_begin(self, **kwargs) -> None:
+        from jno.utils.explainability import make_hessian_spectrum_fn
+
+        solver_constraints = kwargs.get("constraint_exprs")
+        if solver_constraints is None:
+            solver_constraints = [None] * kwargs["n_constraints"]
+        self._indices = _resolve_constraint_indices(self._user_constraints, solver_constraints, "hessian_spectrum")
+
+        constraint_indices = tuple(self._indices) if self._user_constraints is not None else None
+
+        self._fn = make_hessian_spectrum_fn(
+            kwargs["compiled_constraints_fn"],
+            kwargs["batchsize"],
+            kwargs["frozen"],
+            kwargs["static"],
+            param_mask=self._mask,
+            min_consecutive=kwargs.get("min_consecutive", 1),
+            k=self._k,
+            n_iter=self._n_iter,
+            constraint_indices=constraint_indices,
+        )
+        # Pre-warm — Lanczos is a Python driver, so it JIT-compiles the inner
+        # HVP lazily on first call.
+        self._fn(kwargs["trainable"], kwargs["context"], kwargs["rng"])
+
+    def on_epoch_end(self, **kwargs) -> bool:
+        if self._fn is None:
+            return False
+        epoch = kwargs["epoch"]
+        if epoch % self._interval != 0:
+            return False
+        top, lambda_max, _all = self._fn(kwargs["trainable"], kwargs["context"], kwargs["rng"])
+        top_np = np.asarray(top)
+        self._epochs.append(epoch)
+        self._eigvals.append(top_np)
+        self._sharpness.append(float(lambda_max))
+
+        if get_wandb_run() is not None:
+            wb: dict = {f"explainability/hessian/eigval_{i}": float(v) for i, v in enumerate(top_np)}
+            wb["explainability/hessian/sharpness"] = float(lambda_max)
+            wb["explainability/hessian/n_iter"] = int(self._n_iter)
+            wandb_log(wb, step=epoch)
+        return False
+
+    @property
+    def result(self) -> dict:
+        """Collected data as numpy arrays."""
+        empty = np.zeros((0,))
+        return {
+            "epochs": np.array(self._epochs),
+            "eigvals": np.stack(self._eigvals) if self._eigvals else empty,
+            "sharpness": np.array(self._sharpness),
+        }
+
+
 class callbacks:
     """Factory helpers for built-in adaptive training callbacks.
 
@@ -875,3 +1422,97 @@ class callbacks:
             alpha_range: Perturbation range in units of ``‖θ_selected‖``.
         """
         return LossLandscapeCallback(interval=interval, mask=mask, n_grid=n_grid, alpha_range=alpha_range)
+
+    @staticmethod
+    def hessian_spectrum(
+        k: int = 10,
+        n_iter: int = 30,
+        interval: int = 500,
+        mask=None,
+        constraints=None,
+    ) -> HessianSpectrumCallback:
+        """Create a :class:`HessianSpectrumCallback`.
+
+        Tracks the top-k eigenvalues of the total training loss Hessian
+        via Lanczos with HVPs (Sec. 3.1-3.2, [1912.07145]); the largest
+        eigenvalue is the sharpness of [Keskar et al., Sec. 2.2,
+        1609.04836].
+
+        Args:
+            k: Number of largest eigenvalues to report.
+            n_iter: Number of Lanczos iterations.
+            interval: Compute every *n* outer training steps.
+            mask: Optional pytree of booleans matching ``crux.models``
+                structure — essential for large models.
+            constraints: Optional list of constraint placeholders to scope
+                the Hessian to the mean of those constraints' losses
+                instead of the full training loss.
+        """
+        return HessianSpectrumCallback(
+            k=k,
+            n_iter=n_iter,
+            interval=interval,
+            mask=mask,
+            constraints=constraints,
+        )
+
+    @staticmethod
+    def ntk_spectrum(
+        grad_expr,
+        n_points: int = 256,
+        top_k: int = 10,
+        interval: int = 500,
+    ) -> NTKSpectrumCallback:
+        """Create an :class:`NTKSpectrumCallback`.
+
+        Tracks the empirical NTK eigenvalue spectrum (Sec. 3-4, [2007.14527])
+        for a user-supplied :class:`~jno.trace.NetworkGradient` placeholder,
+        e.g. ``u.grad(net)``.  Restrict to a parameter subset by chaining
+        ``net.mask(mask)`` into the placeholder.
+
+        Args:
+            grad_expr: ``NetworkGradient`` placeholder (typically
+                ``u.grad(net)`` or ``u.grad(net.mask(mask))``).
+            n_points: Subsample cap for kernel rows.  Cost is
+                ``O(n_points² × P)``.
+            top_k: Number of largest eigenvalues to report.
+            interval: Compute every *n* outer training steps.
+        """
+        return NTKSpectrumCallback(
+            grad_expr=grad_expr,
+            n_points=n_points,
+            top_k=top_k,
+            interval=interval,
+        )
+
+    @staticmethod
+    def input_sensitivity(expr, interval: int = 100) -> InputSensitivityCallback:
+        """Create an :class:`InputSensitivityCallback`.
+
+        Evaluates a user-supplied placeholder expression at training
+        collocation points every *interval* outer steps (Sec. 3, [1312.6034]).
+
+        Args:
+            expr: A :class:`~jno.trace.Placeholder` expression — commonly
+                ``u.d(x)`` for input-gradient saliency, or
+                ``jno.Jacobian(u, [x, y])`` for a multi-variable Jacobian.
+            interval: Compute every *n* outer training steps.
+        """
+        return InputSensitivityCallback(expr=expr, interval=interval)
+
+    @staticmethod
+    def residual_stats(interval: int = 100, constraints=None) -> ResidualStatsCallback:
+        """Create a :class:`ResidualStatsCallback`.
+
+        Tracks per-constraint residual mean, std, max, and 99th-percentile —
+        plus a histogram when W&B is active — every *interval* outer steps
+        (Sec. 3, [2207.10289]).
+
+        Args:
+            interval: Compute every *n* outer training steps.
+            constraints: Optional list of constraint placeholders to scope to a
+                subset of the solver's constraints.  Pass the same Python
+                objects given to ``jno.core([...])`` (assign your constraints
+                to variables first).  Default ``None`` — all constraints.
+        """
+        return ResidualStatsCallback(interval=interval, constraints=constraints)
