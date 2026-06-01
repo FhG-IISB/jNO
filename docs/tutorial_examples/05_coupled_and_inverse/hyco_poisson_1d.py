@@ -24,11 +24,18 @@ Loss decomposition
   L_int_phy  = MSE(u_phy, stop_gradient(u_syn))  at interior  (u_phy only)
   L_int_syn  = MSE(u_syn, stop_gradient(u_phy))  at interior  (u_syn only)
 
-Because jno.core sums all four terms, gradients flow as:
-  L_pde      → u_phy params          (u_syn not in expression)
-  L_int_phy  → u_phy params only     (u_syn path blocked by stop_gradient)
-  L_data     → u_syn params          (u_phy not in expression)
-  L_int_syn  → u_syn params only     (u_phy path blocked by stop_gradient)
+Alternating updates via ``substeps``
+------------------------------------
+The HyCo procedure prescribes *alternating* updates: first update u_phy,
+then update u_syn using the freshly updated u_phy.  We use the ``substeps``
+argument to ``solve()`` to express this:
+
+  substeps=[[0, 1], [2, 3]]
+
+means each outer epoch runs two gradient steps in sequence — first on
+constraints [0, 1] (the u_phy losses), then on constraints [2, 3] (the u_syn
+losses).  Each substep keeps its own optimizer state, so Adam momentum for
+u_phy only accumulates from u_phy gradients (and likewise for u_syn).
 
 Problem
 -------
@@ -94,14 +101,15 @@ L_data = (u_syn_s - u_obs).mse
 L_int_phy = (u_phy - jno.fn.stop_gradient(u_syn)).mse  # u_phy learns from u_syn
 L_int_syn = (u_syn - jno.fn.stop_gradient(u_phy)).mse  # u_syn learns from u_phy
 
-# ── Solve — both models update simultaneously in each step ────────────────────
+# ── Solve — alternating updates: u_phy first, then u_syn ──────────────────────
 α, β = 1.0, 1.0  # weighting: interaction vs. primary objectives
 
 crux = jno.core(
     [L_pde, β * L_int_phy, α * L_data, β * L_int_syn],
     domain,
 )
-crux.solve(3_000)
+# Each outer epoch: 1 u_phy step (constraints 0, 1) → 1 u_syn step (constraints 2, 3)
+crux.solve(3_000, substeps=[[0, 1], [2, 3]])
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
 u_exact_expr = jno.np.sin(π * x)
