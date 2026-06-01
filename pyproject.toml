@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "jax-neural-operators"
-version = "0.2.2"
+version = "0.2.3"
 description = "Jax Neural Operators"
 readme = "README.md"
 requires-python = ">=3.11, <3.14"
@@ -31,7 +31,7 @@ dependencies = [
     "equinox>=0.11.0",
     "optax>=0.2.0",
     "orbax-checkpoint>=0.6.0",
-    "foundax>=0.1.6",
+    "foundax>=0.2.0",
 
     "pygmsh>=7.0.0",
     "cloudpickle>=3.0.0",
