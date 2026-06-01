@@ -2019,12 +2019,8 @@ class core:
 
                             # Update normals atomically when the candidate pool provides them.
                             normal_tag = f"n_{tag}"
-                            if (
-                                normal_tag in full_context
-                                and candidates_pts is not None
-                                and candidates_nrms is not None
-                            ):
-                                cand_pts_j = jnp.array(candidates_pts)   # (N_pool, D)
+                            if normal_tag in full_context and candidates_pts is not None and candidates_nrms is not None:
+                                cand_pts_j = jnp.array(candidates_pts)  # (N_pool, D)
                                 cand_nrm_j = jnp.array(candidates_nrms)  # (N_pool, D)
                                 new_nrm_batches = []
                                 for b in range(n_batch):
