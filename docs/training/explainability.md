@@ -1,6 +1,6 @@
 # Explainability
 
-Four callbacks give insight into what is happening inside the training loop. They work by differentiating through the constraint functions after each outer step, independently of the gradient updates that drive training. Results are stored as numpy arrays and, when a W&B run is active, pushed automatically to your dashboard.
+Several callbacks give insight into what is happening inside the training loop. They work by differentiating through the constraint functions after each outer step, or by directly inspecting the residuals, independently of the gradient updates that drive training. Results are stored as numpy arrays and, when a W&B run is active, pushed automatically to your dashboard.
 
 ---
 
@@ -75,6 +75,144 @@ W&B key: `explainability/gradient_alignment`
 
 ---
 
+## Residual statistics
+
+```python
+cb = jno.callbacks.residual_stats(interval=100)
+crux.solve(5000, callbacks=[cb])
+
+means = cb.result["means"]    # (n_samples, n_constraints)
+maxes = cb.result["maxes"]    # (n_samples, n_constraints)
+p99   = cb.result["p99"]      # (n_samples, n_constraints)
+```
+
+For each constraint $i$, evaluates the un-reduced residual array $r_i$ produced by the compiled constraint function (i.e. the values *before* the training loss applies its mean) and records four scalar statistics — mean, std, max, and 99th percentile — plus a histogram of the raw residuals when W&B is active. A constraint whose ``max`` or ``p99`` stays orders of magnitude above the others points to a region of the domain where the PDE is poorly satisfied, complementing [gradient norms](#gradient-norms) which only reflect each constraint's *aggregated* contribution to the parameter update.
+
+W&B keys: `explainability/residual/constraint_{i}/{mean,std,max,p99}`, `.../histogram` (image)
+
+### Scoping to a subset of constraints
+
+Pass the constraint expressions you care about via `constraints=`. The callback validates them by Python identity against what was given to `jno.core(...)`, so you must assign your constraints to variables — `.mse` is a property that returns a fresh placeholder every access:
+
+```python
+pde_loss = pde.mse                       # assign once
+bc_loss  = bc.mse
+solver = jno.core([pde_loss, bc_loss], domain)
+
+cb = jno.callbacks.residual_stats(interval=100, constraints=[pde_loss])
+crux.solve(5000, callbacks=[cb])
+
+print(cb.result["means"].shape)   # (n_samples, 1)  — just pde_loss
+print(cb.result["indices"])       # [0]  — solver-side index
+```
+
+W&B keys use the **solver-side index** so the dashboard remains stable when you add or remove unrelated constraints later. `cb.result["indices"]` records that mapping.
+
+Reference: per-point residual magnitudes as a sampling / diagnostic signal — Sec. 3 of [[2207.10289](https://arxiv.org/abs/2207.10289)] (Wu et al., 2023).
+
+---
+
+## Input sensitivity / saliency
+
+```python
+cb = jno.callbacks.input_sensitivity(u.d(x), interval=100)
+crux.solve(5000, callbacks=[cb])
+
+values = cb.result["values"]    # (n_samples, *expr_shape)
+```
+
+Evaluates an arbitrary jno placeholder expression at the training collocation points and records its value every `interval` outer steps. The intended use is *input-gradient saliency* — for a scalar network output $u$ and a coordinate variable $x$, $\partial u/\partial x$ measures how strongly the network response at a given point depends on that input dimension. High-magnitude regions are where small input perturbations produce large output changes (the PINN analogue of the class-saliency map of [Simonyan, Vedaldi & Zisserman, 2014](https://arxiv.org/abs/1312.6034), Sec. 3).
+
+Common expressions to pass:
+
+| Expression                       | Meaning                                              |
+|----------------------------------|------------------------------------------------------|
+| `u.d(x)`                         | $\partial u/\partial x$ — scalar per point           |
+| `jno.Jacobian(u, [x, y])`        | full input Jacobian — shape `(N, 2)` for 2-D inputs  |
+| `u.d(x)**2 + u.d(y)**2`          | squared $\lvert\nabla u\rvert^2$ as a scalar field   |
+
+Any composite expression compiles, because the callback uses the same `TraceCompiler.compile_multi_expression` pathway that the solver uses for constraints and trackers.
+
+W&B keys: `explainability/saliency/{mean_abs,max_abs,std_abs}`, `.../histogram` (image)
+
+Reference: input-gradient saliency — Sec. 3 of [[1312.6034](https://arxiv.org/abs/1312.6034)] (Simonyan et al., 2014).
+
+---
+
+## Empirical NTK spectrum
+
+```python
+cb = jno.callbacks.ntk_spectrum(
+    u.grad(u_net),
+    n_points=256,
+    top_k=10,
+    interval=500,
+)
+crux.solve(10_000, callbacks=[cb])
+
+eigvals = cb.result["eigvals_topk"]        # (n_samples, top_k)
+cond    = cb.result["condition_number"]    # (n_samples,)
+```
+
+Compiles a `NetworkGradient` placeholder to obtain the per-point parameter Jacobian $J \in \mathbb{R}^{N \times P}$, subsamples ``n_points`` rows (with a fixed seed so the same points are used at every call), and reports the eigenvalue spectrum of the empirical NTK $K = J J^\top$. A wide spread between the largest and smallest eigenvalues is the canonical diagnostic for PINN spectral bias.
+
+$$K_{ij} = \langle \nabla_\theta u(x_i), \, \nabla_\theta u(x_j) \rangle$$
+
+Restrict to a parameter subset via `net.mask(...)` chained into the placeholder:
+
+```python
+cb = jno.callbacks.ntk_spectrum(u.grad(u_net.mask(out_mask)), n_points=128, top_k=10)
+```
+
+!!! warning "Cost"
+    Cost is $O(n\_\text{points}^2 \times P)$.  Use both subsampling (`n_points`) **and** placeholder masking on large networks.  Scalar output only — for vector-valued $u$, project first (e.g. `u[..., 0].grad(net)`).
+
+W&B keys: `explainability/ntk/eigval_{0..k-1}`, `.../lambda_max`, `.../lambda_min`, `.../condition_number`, `.../spectrum_hist`
+
+Reference: NTK spectrum for PINN spectral-bias diagnosis — Sec. 3-4 of [[2007.14527](https://arxiv.org/abs/2007.14527)] (Wang, Wang & Perdikaris, 2022).
+
+---
+
+## Hessian eigenspectrum (sharpness)
+
+```python
+cb = jno.callbacks.hessian_spectrum(
+    k=10,
+    n_iter=30,
+    interval=500,
+    # mask=output_mask  # strongly recommended for large models
+)
+crux.solve(10_000, callbacks=[cb])
+
+eigvals   = cb.result["eigvals"]      # (n_samples, k)  — descending
+sharpness = cb.result["sharpness"]    # (n_samples,)    — largest eigenvalue
+```
+
+Computes the top-$k$ eigenvalues of the total training loss Hessian $\nabla^2_\theta L$ via Lanczos with Hessian-vector products. The largest eigenvalue is the **sharpness** of the loss surface at the current iterate (Sec. 2.2 of [[1609.04836](https://arxiv.org/abs/1609.04836)] — Keskar et al., 2017).
+
+### Per-constraint Hessian (`constraints=`)
+
+The total-loss Hessian conflates conditioning across all constraints. Pass `constraints=[...]` to scope the Hessian to a subset of the constraint losses — the spectrum then reflects the Hessian of `mean(L_i for i in constraints)`:
+
+```python
+pde_loss = pde.mse
+bc_loss  = bc.mse
+solver = jno.core([pde_loss, bc_loss], domain)
+
+cb_pde = jno.callbacks.hessian_spectrum(k=5, n_iter=20, interval=500, constraints=[pde_loss])
+cb_bc  = jno.callbacks.hessian_spectrum(k=5, n_iter=20, interval=500, constraints=[bc_loss])
+crux.solve(5000, callbacks=[cb_pde, cb_bc])
+```
+
+!!! warning "Cost"
+    Each call performs ``n_iter`` HVPs, each roughly the cost of one full forward+backward pass.  Keep ``interval`` large (500–1000) for real runs and use ``mask`` to restrict to a parameter subset.
+
+W&B keys: `explainability/hessian/eigval_{0..k-1}`, `.../sharpness`, `.../n_iter`
+
+Reference: HVP-based Lanczos for neural-network Hessian spectra — Sec. 3.1-3.2 of [[1912.07145](https://arxiv.org/abs/1912.07145)] (Yao et al., 2020).  Sharpness concept — Sec. 2.2 of [[1609.04836](https://arxiv.org/abs/1609.04836)] (Keskar et al., 2017).
+
+---
+
 ## Loss landscape
 
 ```python
@@ -101,7 +239,7 @@ W&B key: `explainability/loss_landscape` (heatmap image)
 
 ## Restricting to a parameter subset
 
-All four callbacks accept an optional `mask` — a pytree of booleans matching the `trainable` structure. Only the selected parameters are differentiated or perturbed. This is essential for large networks and strongly recommended even for medium-sized ones.
+The gradient-analysis callbacks (gradient norms, cosine similarity, gradient alignment, loss landscape) accept an optional `mask` — a pytree of booleans matching the `trainable` structure. Only the selected parameters are differentiated or perturbed. This is essential for large networks and strongly recommended even for medium-sized ones. (`residual_stats` does not need a mask — it inspects pre-existing constraint residuals rather than computing parameter gradients.)
 
 ```python
 import equinox as eqx, jax
@@ -121,7 +259,7 @@ The output-layer weight matrix typically gives the dominant gradient directions 
 
 ## W&B logging
 
-All four callbacks push their results to W&B automatically when a run is active (see [Weights & Biases](../misc/wandb.md)). No extra code is needed — enabling `jno.setup(..., wandb=True)` is sufficient.
+All callbacks push their results to W&B automatically when a run is active (see [Weights & Biases](../misc/wandb.md)). No extra code is needed — enabling `jno.setup(..., wandb=True)` is sufficient.
 
 ---
 
