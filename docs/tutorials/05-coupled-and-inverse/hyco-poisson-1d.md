@@ -112,11 +112,14 @@ Without it, `L_int_phy` would backpropagate through *both* `u_phy` **and** `u_sy
 
 - Gradients of `L_int_phy` reach only `u_phy_net` — it is nudged toward `u_syn`'s predictions.
 - Gradients of `L_int_syn` reach only `u_syn_net` — it is nudged toward `u_phy`'s predictions.
-- Both models improve simultaneously in a single optimizer step.
 
 ---
 
-## Solve
+## Alternating updates via `substeps`
+
+HyCo prescribes **alternating** updates — `u_phy` is updated first, then `u_syn` is updated using the *freshly updated* `u_phy`. Updating both simultaneously in a single optimizer step lets each model only see a stale snapshot of the other, which slows convergence and contaminates Adam momentum.
+
+The `substeps` argument to `solve()` expresses the alternating schedule:
 
 ```python
 α, β = 1.0, 1.0
@@ -125,16 +128,30 @@ crux = jno.core(
     [L_pde, β * L_int_phy, α * L_data, β * L_int_syn],
     domain,
 )
-crux.solve(3_000)
+# Each outer epoch runs two gradient steps in sequence:
+#   substep 0: constraints [0, 1] → only u_phy_net updates
+#   substep 1: constraints [2, 3] → only u_syn_net updates (sees fresh u_phy)
+crux.solve(3_000, substeps=[[0, 1], [2, 3]])
 ```
+
+Each substep keeps its **own** optimizer state, so Adam momentum for `u_phy` accumulates only from substep 0's gradients and never decays from being held inactive during substep 1. The shared `trainable` dict carries parameter updates between substeps, so substep 1 sees the freshly written `u_phy` weights.
+
+You can also run multiple gradient steps per substep before alternating:
+
+```python
+crux.solve(1_500, substeps=[([0, 1], 2), ([2, 3], 2)])
+# 1500 outer epochs × (2 phy + 2 syn) = 6000 effective gradient steps
+```
+
+The shorthand `[0, 1]` is equivalent to `([0, 1], 1)`. Within a single substep the `n` repeated steps share the same optimizer state so Adam momentum builds up continuously before the switch.
 
 ---
 
 ## Results
 
 ```
-u_phy rel-L2 error : 5.1e-05  (physics model)
-u_syn rel-L2 error : 2.0e-02  (synthetic model)
+u_phy rel-L2 error : 3.7e-04  (physics model)
+u_syn rel-L2 error : 5.4e-02  (synthetic model)
 ```
 
 The physics model, guided by both the PDE and alignment with the data-fitted synthetic model, reaches near-exact accuracy.  The synthetic model, guided by 7 noisy observations and alignment with the physics model, settles on a smooth physically consistent solution — far better than overfitting to the raw data alone.
@@ -144,7 +161,7 @@ The physics model, guided by both the PDE and alignment with the data-fitted syn
 ## What To Notice
 
 - `jno.fn.stop_gradient` is the single syntactic addition that turns a standard two-model PINN into a cooperative system.
-- Four loss terms in one `jno.core` call — no alternating optimisation loops needed.
+- `substeps=[[0, 1], [2, 3]]` expresses the alternating schedule HyCo requires — no manual outer loop needed.
 - `jno.domain.from_array` with multiple tags keeps collocation and sensor points in the same domain object.
 - Tune `α` and `β` to control how strongly each model is pulled toward the other.
 
