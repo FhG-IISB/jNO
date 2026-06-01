@@ -31,6 +31,7 @@ from .trace import (
     TunableModule,
     TunableModuleCall,
     Variable,
+    collect_tags,
 )
 
 
@@ -1002,11 +1003,24 @@ class TraceEvaluator:
                 v = ctx.context[active_spatial_tag]
                 N = int(v.shape[point_axis(v)])
             else:
-                # Fallback only if there is no matching spatial tag.
-                for k, v in ctx.context.items():
-                    if is_spatial_pointset(k, v):
-                        ax = point_axis(v)
-                        N = max(N, int(v.shape[ax]))
+                # Scope N to the expression's own spatial tags so that tags
+                # with different point counts (e.g. "initial" vs "interior")
+                # don't bleed into each other's temporal-derivative vmaps.
+                # Reset to 1 rather than using __active_spatial_n__: the
+                # compiler sets that from the first alphabetical spatial tag,
+                # which may differ from this expression's actual tag.
+                expr_spatial_tags = [
+                    t for t in collect_tags(base_target) if t in ctx.context and is_spatial_pointset(t, ctx.context[t])
+                ]
+                source_tags = (
+                    expr_spatial_tags
+                    if expr_spatial_tags
+                    else [k for k, v in ctx.context.items() if is_spatial_pointset(k, v)]
+                )
+                N = 1
+                for t in source_tags:
+                    v = ctx.context[t]
+                    N = max(N, int(v.shape[point_axis(v)]))
 
             def _set_active_time_tags(base_ctx, t_scalar):
                 t_box = jnp.asarray([[t_scalar]], dtype=time_dtype)
