@@ -87,6 +87,11 @@ def parameter(shape: tuple, *, key: jax.Array | None = None, name: str = "value"
             return self.value
 
     model = nn.wrap(_Parameter(value=jnp.zeros(shape, dtype=jnp.float32)), name=name)
+    # Metadata used by the FEM-time lowering route to distinguish trainable
+    # physical coefficients from ordinary neural-network ModelCall nodes.
+    model._is_parameter = True
+    model._parameter_name = str(name)
+
     model._initializer_key = _resolve_key(key)
     return model()
 
