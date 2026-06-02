@@ -2601,6 +2601,33 @@ class core:
                         if _lr is not None:
                             _model_name = _wandb_model_names.get(_wk, _wk)
                             _wb_metrics[f"lr/{_model_name}"] = _lr
+                    # Per-Bayesian-model chain stats: last value (scalar
+                    # parameters only) + running posterior mean of the chain
+                    # collected so far.  Acceptance probability would need
+                    # plumbing the kernel info from the step; deferred.
+                    for _bk, _handle in bayesian_handles.items():
+                        _lid_int = int(_bk)
+                        _fm = flax_mods.get(_lid_int)
+                        if _fm is None:
+                            continue
+                        _name = _fm.name or f"model{_lid_int}"
+                        _buf = _bayesian_buffers.get(_bk, [])
+                        if not _buf:
+                            continue
+                        # Stack the buffer once for the running mean — cheap
+                        # because the buffer holds device arrays and we only
+                        # hit this at print_rate cadence.
+                        _stacked = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *_buf)
+                        if getattr(_fm, "_is_jno_scalar_parameter", False):
+                            _stacked = _stacked.value  # (N, *param_shape)
+                            _running_mean = float(jnp.mean(_stacked))
+                            _wb_metrics[f"posterior/{_name}/mean"] = _running_mean
+                            _wb_metrics[f"posterior/{_name}/last"] = float(_stacked[-1].reshape(-1)[0])
+                            _wb_metrics[f"posterior/{_name}/n_samples"] = len(_buf)
+                        else:
+                            # Multi-leaf modules: only log the chain length.
+                            _wb_metrics[f"posterior/{_name}/n_samples"] = len(_buf)
+
                     wandb_log(_wb_metrics, step=displayed_epoch)
 
                     # NaN / Inf alert (only fire once)
