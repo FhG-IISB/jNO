@@ -227,14 +227,19 @@ class FeaxTimeBlock:
     ------------------
     Linear semidiscrete payload:
 
-        M u_dot + A u = c + f(t)
+        M u_dot + A(t, args) u = c + f(t, args)
 
     stored as:
 
         M
-        A
+        A                       # optional constant operator matrix
+        operator_fn             # optional runtime operator callback
         affine_bias
         forcing_vector_fn
+
+    At least one of ``A`` or ``operator_fn`` must be populated.  The runtime
+    callback has signature ``operator_fn(t, args) -> matrix`` and takes
+    precedence over the constant matrix when both are present.
 
     Nonlinear semidiscrete payload:
 
@@ -288,7 +293,12 @@ class FeaxTimeBlock:
     metadata:
         Classification, lowering, and diagnostic metadata.
     M, A:
-        Linear semidiscrete mass and operator matrices.
+        Linear semidiscrete mass and optional constant operator matrices.
+    operator_fn:
+        Optional runtime linear-operator callback ``operator_fn(t, args)``.
+        When populated, adapters evaluate it at runtime instead of using the
+        constant ``A`` matrix. This keeps inverse parameters differentiably
+        connected to the physical solve.
     affine_bias:
         Constant affine vector `c` in `M u_dot + A u = c + f(t)`.
     forcing_vector_fn:
@@ -331,6 +341,7 @@ class FeaxTimeBlock:
     # linear semidiscrete payload
     M: Any = None
     A: Any = None
+    operator_fn: Optional[Callable] = None
     affine_bias: Any = None
     forcing_vector_fn: Optional[Callable] = None
 
@@ -342,12 +353,12 @@ class FeaxTimeBlock:
         """
         Return True if this block contains a linear semidiscrete payload.
 
-        A block is considered linear when both `M` and `A` are populated.
-        The represented system is:
+        A block is considered linear when ``M`` and either ``A`` or
+        ``operator_fn`` are populated. The represented system is:
 
-            M u_dot + A u = affine_bias + forcing_vector_fn(t)
+            M u_dot + A(t, args) u = affine_bias + forcing_vector_fn(t, args)
         """
-        return self.M is not None and self.A is not None
+        return self.M is not None and (self.A is not None or self.operator_fn is not None)
 
     def is_nonlinear(self) -> bool:
         """
@@ -360,7 +371,7 @@ class FeaxTimeBlock:
         """
         return self.mass is not None and self.residual is not None
 
-    def as_diffrax(self, *, forcing_vector_fn=None, args=None):
+    def as_diffrax(self, *, forcing_vector_fn=None, operator_fn=None, args=None):
         """
         Convert this semidiscrete FEAX-time block into a `DiffraxBlock`.
 
@@ -369,6 +380,10 @@ class FeaxTimeBlock:
         forcing_vector_fn:
             Optional override for the forcing callback in the linear case.
             If omitted, `self.forcing_vector_fn` is used.
+        operator_fn:
+            Optional override for the runtime linear operator callback. The
+            callback signature is ``operator_fn(t, args) -> matrix``. If
+            omitted, ``self.operator_fn`` is used, falling back to ``self.A``.
         args:
             Optional runtime arguments passed to the generated Diffrax RHS.
 
@@ -382,7 +397,7 @@ class FeaxTimeBlock:
         -----
         Linear conversion uses:
 
-            u_dot = solve(M, affine_bias + f(t) - A u)
+            u_dot = solve(M, affine_bias + f(t, args) - A(t, args) u)
 
         Nonlinear conversion uses:
 
@@ -393,6 +408,7 @@ class FeaxTimeBlock:
         return make_diffrax_block(
             self,
             forcing_vector_fn=forcing_vector_fn,
+            operator_fn=operator_fn,
             args=args,
         )
 
@@ -401,6 +417,7 @@ class FeaxTimeBlock:
         *,
         scheme=None,
         forcing_vector_fn=None,
+        operator_fn=None,
         args=None,
         monitor_index=None,
         newton_tol=1e-8,
@@ -420,6 +437,9 @@ class FeaxTimeBlock:
             selected from `self.mode`.
         forcing_vector_fn:
             Optional override for the forcing callback in the linear case.
+        operator_fn:
+            Optional override for the runtime linear operator callback. The
+            callback signature is ``operator_fn(t, args) -> matrix``.
         args:
             Optional runtime arguments passed to generated step functions.
         monitor_index:
@@ -446,7 +466,7 @@ class FeaxTimeBlock:
         -----
         Linear backward Euler solves:
 
-            (M + dt A) u_next = M u + dt(c + f(t_next))
+            (M + dt A(t_next, args)) u_next = M u + dt(c + f(t_next, args))
 
         Nonlinear backward Euler solves Newton iterations for:
 
@@ -458,6 +478,7 @@ class FeaxTimeBlock:
             self,
             scheme=scheme,
             forcing_vector_fn=forcing_vector_fn,
+            operator_fn=operator_fn,
             args=args,
             monitor_index=monitor_index,
             newton_tol=newton_tol,
