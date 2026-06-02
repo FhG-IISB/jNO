@@ -1,24 +1,29 @@
-"""05 — Bayesian inverse parameter identification with credible intervals
+"""02 — Bayesian PINN inverse problem: multi-coefficient regression
 
 Problem
 -------
-Same setup as ``inverse_parameter.py`` (low-dim coefficient recovery), but
-each scalar parameter is sampled with NUTS rather than point-optimised, so
-we get both a posterior mean *and* a credible interval.
+Recover two coefficients (A, B) of a parametric model
 
-    d(x) = A·sin(πx) + B·cos(πx)        ground truth  A = 3.14,  B = -2.71
+    d(x) = A · sin(πx) + B · cos(πx),     truth: A = 3.14, B = -2.71
 
-Technique
----------
-Two scalar parameters (a, b) are declared as trainable jno parameters.
-Each is configured with ``.bayesian(blackjax.nuts, ...)``.  ``solve()``
-runs warmup + sampling outer epochs; the post-warmup chains are stacked
-into ``a.posterior_samples`` / ``b.posterior_samples``.
+from observations of ``d``.  Each scalar parameter is *sampled* with NUTS
+rather than point-optimised, so we get a posterior mean *and* a credible
+interval.
+
+This is the purest demonstration of jno's per-parameter ``.bayesian()``
+configurator: every scalar carries its own kernel, no PDE residual is
+involved, and ``solve()`` dispatches per-parameter automatically.  Once
+this works, swapping the parametric model for a PDE residual (see the
+later tutorials in this section) follows the same recipe.
 
 References
 ----------
 Hoffman, M. D., & Gelman, A. (2014).  *The No-U-Turn Sampler: Adaptively
 Setting Path Lengths in Hamiltonian Monte Carlo.*  JMLR 15(1), 1593-1623.
+
+Yang, L., Meng, X., & Karniadakis, G. E. (2021).  *B-PINNs: Bayesian
+physics-informed neural networks for forward and inverse PDE problems
+with noisy data.*  Journal of Computational Physics, 425, 109913.
 """
 
 from pathlib import Path
@@ -75,7 +80,7 @@ rel_B = abs(B_mean - B_true) / abs(B_true)
 
 results_file = Path(__file__).parent.parent.parent / "tutorial_results.txt"
 with open(results_file, "a") as f:
-    f.write(f"05_coupled_and_inverse/bayesian_inverse_parameter.py | epochs=800 | rel_A={rel_A:.4f} | rel_B={rel_B:.4f}\n")
+    f.write(f"10_bayesian_pinns/02_inverse_multi_coefficient.py | epochs=800 | rel_A={rel_A:.4f} | rel_B={rel_B:.4f}\n")
 
 assert rel_A < 0.3, f"A posterior mean off by {rel_A:.2%}"
 assert rel_B < 0.3, f"B posterior mean off by {rel_B:.2%}"

@@ -1,4 +1,4 @@
-"""02 — Bayesian source recovery for an elliptic PDE  (steady-state heat / Poisson)
+"""03 — Bayesian PINN inverse: mixed-mode source recovery (elliptic PDE)
 
 Problem
 -------
@@ -121,6 +121,9 @@ rel_A = abs(A_mean - A_true) / abs(A_true)
 
 results_file = Path(__file__).parent.parent.parent / "tutorial_results.txt"
 with open(results_file, "a") as f:
-    f.write(f"02_elliptic/bayesian_source_recovery_1d.py | epochs=230 | rel_A={rel_A:.4f} | CI_width={A_hi - A_lo:.4f}\n")
+    f.write(
+        f"10_bayesian_pinns/03_inverse_source_steady_state.py | epochs=230 | "
+        f"rel_A={rel_A:.4f} | CI_width={A_hi - A_lo:.4f}\n"
+    )
 
 assert rel_A < 0.5, f"posterior-mean A off by {rel_A:.2%}"
