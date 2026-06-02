@@ -99,7 +99,7 @@ L_data = (u_syn_s - u_obs).mse
 #    stop_gradient blocks gradient flow into the "reference" model so that
 #    each interaction term only updates the "student" model's parameters.
 L_int_phy = (u_phy - jno.fn.stop_gradient(u_syn)).mse  # u_phy learns from u_syn
-L_int_syn = (u_syn - jno.fn.stop_gradient(u_phy.grad(u_phy_net))).mse  # u_syn learns from u_phy
+L_int_syn = (u_syn - jno.fn.stop_gradient(u_phy)).mse  # u_syn learns from u_phy
 
 # ── Solve — alternating updates: u_phy first, then u_syn ──────────────────────
 α, β = 1.0, 1.0  # weighting: interaction vs. primary objectives
