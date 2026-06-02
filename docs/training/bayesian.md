@@ -183,12 +183,30 @@ a.bayesian(blackjax.nuts, step_size=1e-2,
 The default prior is a wide isotropic Gaussian with σ=10 over every
 inexact-array leaf — effectively flat at typical parameter scales.
 
-!!! warning "Step-size tuning"
-    jno does **not** run automatic step-size adaptation inside `solve()`.
-    The `warmup=` argument only controls how many initial outer epochs are
-    discarded before sample collection — it does not tune the kernel.  If
-    you want adapted hyperparameters, run `blackjax.window_adaptation`
-    yourself and pass the result through `**kernel_kwargs`.
+## Adaptation (NUTS / HMC)
+
+For HMC-family kernels, `adapt=True` (default) runs
+`blackjax.window_adaptation` for the first `warmup` steps **before** the
+main solve loop.  Step size and inverse mass matrix are tuned
+automatically; the loop then collects `keep` samples from epoch 0.
+
+```python
+a.bayesian(blackjax.nuts, step_size=1.0, warmup=500, keep=1000)   # adapt=True default
+# → window adaptation tunes step_size + inverse_mass_matrix in 500 steps,
+#   loop collects 1000 samples from the adapted state.
+```
+
+For non-adaptive kernels (`mala`, `sgld`, `sghmc`) `adapt=` is silently
+ignored and `warmup=N` retains the classic "discard the first N samples"
+meaning.
+
+!!! warning "Mixed mode (Bayesian + optax)"
+    Window adaptation runs once at the start, with all non-Bayesian models
+    at their **initial** weights.  In mixed setups (e.g. a Bayesian
+    coefficient + an optax-trained surrogate) the adapted step size is
+    tuned against the *untrained* surrogate's logdensity and is typically
+    wrong for the actual joint problem.  Set `adapt=False` and pick
+    `step_size` by hand in that case.
 
 !!! warning "Memory"
     A full chain costs ~`keep × #params × 4 bytes` per Bayesian model.  For

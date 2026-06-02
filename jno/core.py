@@ -1810,6 +1810,44 @@ class core:
             on_device_context = domain_data.context
             effective_batchsize = batchsize
 
+        # ── 6b. Window adaptation for HMC-family Bayesian models ──
+        # Runs once before the main loop using the current trainable + the
+        # full domain context.  Replaces step_size + inverse_mass_matrix on
+        # the matching handles, seeds opt_states with the adapted state,
+        # and zeroes handle.warmup so the main loop collects from epoch 0.
+        _adapt_candidates = [(k, h) for k, h in bayesian_handles.items() if jno_bayesian.adapt_is_applicable(h)]
+        if _adapt_candidates:
+            _adapt_loss_fn = self._make_loss_fn(
+                self.compiled_constraints_fn,
+                effective_batchsize,
+                frozen_arrays,
+                static,
+                checkpoint_gradients=checkpoint_gradients,
+                min_consecutive=min_consecutive,
+            )
+            _adapt_ctx = on_device_context if not offload_data else self.domain_data.context
+            # A fixed PRNG key keeps the logdensity deterministic across
+            # adaptation steps — required for the HMC integrator's geometry.
+            _adapt_key_for_loss = jax.random.PRNGKey(0)
+            for _bk, _handle in _adapt_candidates:
+                _lid = int(_bk)
+
+                def _ld_fn(p, _lid=_lid, _h=_handle, _key=_adapt_key_for_loss):
+                    full = {**trainable, _lid: p}
+                    nll, _ = _adapt_loss_fn(full, _adapt_ctx, _key)
+                    return -nll + _h.prior_fn(p)
+
+                self.rng, _adapt_key = jax.random.split(self.rng)
+                _adapt_out = jno_bayesian.run_window_adaptation(_handle, trainable[_lid], _ld_fn, _adapt_key)
+                if _adapt_out is None:
+                    continue
+                _adapted_state, _adapted_kwargs = _adapt_out
+                _handle.extra_kwargs = _adapted_kwargs
+                opt_states[_bk] = _adapted_state
+                # main loop collects from epoch 0
+                _handle.warmup = 0
+                self.log.info(f"Model {_lid}: window adaptation done — step_size={_adapted_kwargs['step_size']:.4g}")
+
         # ── 7. Build JIT-compiled step function ──
         step_fn = self.make_step_fn(
             per_model_opts=per_model_opts,
