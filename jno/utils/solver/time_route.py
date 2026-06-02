@@ -46,22 +46,20 @@ from .feax_utils import (
     _prepare_feax_runtime,
 )
 from .solver_helper import (
-    collect_temporal_tags as _collect_temporal_tags, iter_children as _iter_children,
-)
-from .solver_helper import (
+    collect_temporal_tags as _collect_temporal_tags, 
+    iter_children as _iter_children, 
     contains_model_call as _contains_model_call,
-)
-from .solver_helper import (
     contains_node_type as _contains_node_type,
-)
-from .solver_helper import (
     contains_temporal_derivative as _contains_temporal_derivative,
-)
-from .solver_helper import (
     is_temporal_var as _is_temporal_var,
-)
-from .solver_helper import (
     max_temporal_derivative_order as _max_temporal_derivative_order,
+)
+
+from .parametric_helpers import (
+    _clone_term_with_coeff,
+    _contains_runtime_parameter,
+    _make_ir,
+    _split_parametric_operator_ir,
 )
 
 # -----------------------------------------------------------------------------
@@ -1108,167 +1106,6 @@ def _strip_temporal_trial_derivative(node: Any) -> Any:
 
     return node
 
-
-def _clone_term_with_coeff(term, new_coeff):
-    from .weak_form import LoweredChannelTerm
-
-    return LoweredChannelTerm(
-        sign=term.sign,
-        support=term.support,
-        region_id=term.region_id,
-        channel=term.channel,
-        coeff=new_coeff,
-        variable_id=term.variable_id,
-        value_shape=term.value_shape,
-        original_expr=term.original_expr,
-    )
-
-
-def _make_ir(domain, terms):
-    from .weak_form import LoweredWeakForm
-
-    return LoweredWeakForm(domain=domain, terms=list(terms))
-
-def _is_runtime_scalar_parameter(node) -> bool:
-    """Return True for zero-argument trainable jNO physical parameters."""
-    return (
-        isinstance(node, ModelCall)
-        and len(node.args) == 0
-        and bool(getattr(node.model, "_is_parameter", False))
-    )
-
-
-def _contains_runtime_parameter(node) -> bool:
-    """Recursively detect trainable physical parameters in one trace subtree."""
-    if _is_runtime_scalar_parameter(node):
-        return True
-
-    return any(
-        _contains_runtime_parameter(child)
-        for child in (_iter_children(node) or ())
-    )
-
-
-def _flatten_product(node):
-    """Flatten a symbolic multiplication tree into factors."""
-    if isinstance(node, BinaryOp) and node.op == "*":
-        return _flatten_product(node.left) + _flatten_product(node.right)
-
-    return [node]
-
-
-def _multiply_factors(factors):
-    """Rebuild a symbolic multiplication tree."""
-    if len(factors) == 0:
-        return Literal(1.0)
-
-    out = factors[0]
-    for factor in factors[1:]:
-        out = BinaryOp("*", out, factor)
-
-    return out
-
-
-def _parameter_name(param: ModelCall) -> str:
-    name = getattr(param.model, "_parameter_name", None)
-    if name:
-        return str(name)
-
-    if getattr(param.model, "name", None):
-        return str(param.model.name)
-
-    return f"parameter_{param.model.layer_id}"
-
-
-def _factor_runtime_parameter_from_term(coeff):
-    """
-    Extract one direct multiplicative scalar parameter from a linear FEM term.
-
-    Supported Phase-1 pattern:
-        nu * spatial_term
-
-    Unsupported for now:
-        (nu + c) * spatial_term
-        exp(raw_nu) * spatial_term
-        nu1 * nu2 * spatial_term
-        neural_field(x, y) * spatial_term
-    """
-    factors = _flatten_product(coeff)
-
-    params = [
-        factor
-        for factor in factors
-        if _is_runtime_scalar_parameter(factor)
-    ]
-
-    if len(params) == 0:
-        if _contains_runtime_parameter(coeff):
-            raise NotImplementedError(
-                "A trainable FEM-time parameter was found, but it is not a "
-                "direct multiplicative factor. Phase-1 supports terms such as "
-                "`nu * grad(u) * grad(phi)` only."
-            )
-
-        return None, coeff
-
-    if len(params) > 1:
-        raise NotImplementedError(
-            "Phase-1 FEM-time parameter lowering supports one trainable "
-            "scalar coefficient per operator term."
-        )
-
-    param = params[0]
-
-    stripped = _multiply_factors(
-        [factor for factor in factors if factor is not param]
-    )
-
-    if _contains_runtime_parameter(stripped):
-        raise NotImplementedError(
-            "Nested runtime physical parameters are not supported yet."
-        )
-
-    return param, stripped
-
-
-def _split_parametric_operator_ir(op_ir):
-    """
-    Split a linear operator IR into:
-
-        A0                      static operator terms
-        {name: K_name}          parameter basis terms
-        {name: parameter_expr}  symbolic jNO parameter expressions
-    """
-    static_terms = []
-    parameter_terms = {}
-    parameter_exprs = {}
-
-    for term in op_ir.terms:
-        param, stripped_coeff = _factor_runtime_parameter_from_term(
-            term.coeff
-        )
-
-        if param is None:
-            static_terms.append(term)
-            continue
-
-        name = _parameter_name(param)
-
-        parameter_exprs[name] = param
-        parameter_terms.setdefault(name, []).append(
-            _clone_term_with_coeff(term, stripped_coeff)
-        )
-
-    parameter_irs = {
-        name: _make_ir(op_ir.domain, terms)
-        for name, terms in parameter_terms.items()
-    }
-
-    return (
-        _make_ir(op_ir.domain, static_terms),
-        parameter_irs,
-        parameter_exprs,
-    )
 
 def _split_first_order_linear_terms(ir):
     """

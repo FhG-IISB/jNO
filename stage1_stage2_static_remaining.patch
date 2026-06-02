@@ -1,0 +1,648 @@
+--- a/jno/utils/solver/fem_route.py
++++ b/jno/utils/solver/fem_route.py
+@@ -4,15 +4,26 @@
+ from typing import Sequence
+ 
+ import jax.numpy as jnp
++import numpy as np
+ 
+ from ...trace import (
++    FemLinearSystem,
+     FemResidualOperator,
+ )
+ from .feax_utils import (
+     _build_feax_problem,
+     _default_float_dtype,
++    _dense_array,
+     _normalize_dirichlet_value,
++    _prepare_feax_runtime,
+ )
++from .parametric_helpers import (
++    _contains_runtime_parameter,
++    _make_zero_ir_like,
++    _runtime_scalar_arg,
++    _split_parametric_operator_ir,
++)
++from .solver_helper import contains_trialfunction as _contains_trialfunction
+ 
+ # --------------------------------
+ # FEM boundary-condition helpers
+@@ -189,125 +200,357 @@
+     """
+     Assemble a steady nonlinear FEM residual operator from lowered weak-form IR.
+ 
+-    This target is used by:
+-
+-        weak_expr.assemble(target="fem_residual")
+-
+-    It builds a FEAX problem from the lowered weak-form IR and returns callable
+-    residual and Jacobian functions for external Newton-like solvers.
+-
+-    Parameters
+-    ----------
+-    domain:
+-        jNO domain with initialized FEM/FEAX context.
+-    ir:
+-        Lowered weak-form IR produced by `lower_weak_form(..., for_target="fem")`.
+-    **kwargs:
+-        Optional backend settings. Currently supports `symmetric_bc`.
+-
+-    Returns
+-    -------
+-    FemResidualOperator
+-        Object containing:
+-
+-        - `residual_fn(u_flat)`: evaluates the FEAX residual vector `r(u)`.
+-        - `jacobian_fn(u_flat)`: evaluates the FEAX Jacobian matrix `J(u)`.
+-        - `size`: total number of scalar FEM degrees of freedom.
+-
+-    Notes
+-    -----
+-    This route is intended for nonlinear steady weak forms. Linear steady weak
+-    forms should usually use `_assemble_fem_system_from_ir(...)`, which returns
+-    the direct system `(A, b)`.
++    Parameter-free weak forms preserve the existing FEAX path.
++
++    Affine runtime parameters are lowered into:
++
++        R(u, args) = R0(u) + sum_i args[name_i] * R_i(u)
++        J(u, args) = J0(u) + sum_i args[name_i] * J_i(u)
++
++    Supported runtime pattern:
++        parameter * weak_term
++
++    The static contribution is assembled with Dirichlet enforcement. Parameter
++    basis contributions are assembled without reapplying Dirichlet enforcement,
++    so essential boundary rows are imposed exactly once.
+     """
+     import feax as fe
+ 
+-    problem, bc = _build_feax_problem(domain, ir)
++    symmetric_bc = kwargs.get("symmetric_bc", True)
++
++    has_runtime_parameters = any(
++        _contains_runtime_parameter(term.coeff)
++        for term in ir.terms
++    )
++
++    # ------------------------------------------------------------
++    # Original parameter-free route
++    # ------------------------------------------------------------
++    if not has_runtime_parameters:
++        problem, bc = _build_feax_problem(domain, ir)
++        internal_vars = fe.InternalVars()
++
++        res_bc = fe.create_res_bc_function(problem, bc)
++        jac_bc = fe.create_J_bc_function(
++            problem,
++            bc,
++            symmetric=symmetric_bc,
++        )
++        size = int(problem.num_total_dofs_all_vars)
++
++        def residual_fn(u_flat, args=None):
++            del args
++            u_flat = jnp.asarray(
++                u_flat,
++                dtype=_default_float_dtype(),
++            ).reshape(-1)
++            return jnp.asarray(
++                res_bc(u_flat, internal_vars),
++                dtype=_default_float_dtype(),
++            ).reshape(-1)
++
++        def jacobian_fn(u_flat, args=None):
++            del args
++            u_flat = jnp.asarray(
++                u_flat,
++                dtype=_default_float_dtype(),
++            ).reshape(-1)
++            return jac_bc(u_flat, internal_vars)
++
++        return FemResidualOperator(
++            residual_fn=residual_fn,
++            jacobian_fn=jacobian_fn,
++            size=size,
++        )
++
++    # ------------------------------------------------------------
++    # Parameter-aware affine route
++    # ------------------------------------------------------------
++    static_ir, parameter_irs, runtime_parameter_exprs = (
++        _split_parametric_operator_ir(ir)
++    )
++
++    if len(parameter_irs) == 0:
++        raise RuntimeError(
++            "Runtime parameters were detected, but no affine FEM basis terms "
++            "were generated."
++        )
++
++    # If all physical terms are parameter-dependent, create a structural zero
++    # contribution so the static runtime still imposes Dirichlet conditions.
++    if len(static_ir.terms) == 0:
++        first_basis_ir = next(iter(parameter_irs.values()))
++        static_ir = _make_zero_ir_like(first_basis_ir)
++
++    static_rt = _prepare_feax_runtime(
++        domain,
++        static_ir,
++        apply_dirichlet=True,
++        need_jacobian=True,
++        symmetric_bc=symmetric_bc,
++    )
++
++    basis_runtimes = {
++        name: _prepare_feax_runtime(
++            domain,
++            basis_ir,
++            apply_dirichlet=False,
++            need_jacobian=True,
++            symmetric_bc=symmetric_bc,
++        )
++        for name, basis_ir in parameter_irs.items()
++    }
++
++    if static_rt["jac_bc"] is None:
++        raise ValueError("Static FEM residual runtime did not produce a Jacobian.")
++
++    for name, rt in basis_runtimes.items():
++        if rt["jac_bc"] is None:
++            raise ValueError(
++                f"FEM residual basis {name!r} did not produce a Jacobian."
++            )
++        if int(rt["size"]) != int(static_rt["size"]):
++            raise ValueError(
++                f"FEM residual basis {name!r} has size {rt['size']}, "
++                f"expected {static_rt['size']}."
++            )
++
++    dtype = static_rt["dtype"]
++    size = int(static_rt["size"])
+     internal_vars = fe.InternalVars()
+ 
+-    res_bc = fe.create_res_bc_function(problem, bc)
+-    jac_bc = fe.create_J_bc_function(problem, bc, symmetric=kwargs.get("symmetric_bc", True))
+-    size = int(problem.num_total_dofs_all_vars)
+-
+-    def residual_fn(u_flat):
+-        u_flat = jnp.asarray(u_flat, dtype=_default_float_dtype())
+-        return jnp.asarray(res_bc(u_flat, internal_vars))
+-
+-    def jacobian_fn(u_flat):
+-        u_flat = jnp.asarray(u_flat, dtype=_default_float_dtype())
+-        return jac_bc(u_flat, internal_vars)
++    def residual_fn(u_flat, args=None):
++        u_flat = jnp.asarray(u_flat, dtype=dtype).reshape(-1)
++
++        out = jnp.asarray(
++            static_rt["res_bc"](u_flat, internal_vars),
++            dtype=dtype,
++        ).reshape(-1)
++
++        for name, rt in basis_runtimes.items():
++            coeff = _runtime_scalar_arg(args, name, dtype=dtype)
++            basis_res = jnp.asarray(
++                rt["res_bc"](u_flat, internal_vars),
++                dtype=dtype,
++            ).reshape(-1)
++            out = out + coeff * basis_res
++
++        return out
++
++    def jacobian_fn(u_flat, args=None):
++        u_flat = jnp.asarray(u_flat, dtype=dtype).reshape(-1)
++
++        out = jnp.asarray(
++            _dense_array(static_rt["jac_bc"](u_flat, internal_vars)),
++            dtype=dtype,
++        )
++
++        for name, rt in basis_runtimes.items():
++            coeff = _runtime_scalar_arg(args, name, dtype=dtype)
++            basis_jac = jnp.asarray(
++                _dense_array(rt["jac_bc"](u_flat, internal_vars)),
++                dtype=dtype,
++            )
++            out = out + coeff * basis_jac
++
++        return out
+ 
+     return FemResidualOperator(
+         residual_fn=residual_fn,
+         jacobian_fn=jacobian_fn,
+         size=size,
+-    )
+-
+-
+-def _assemble_fem_system_from_ir(domain, ir, **kwargs):
+-    """
+-    Assemble a steady linear FEM system from lowered weak-form IR.
+-
+-    This target is used by:
+-
+-        weak_expr.assemble(target="fem_system")
+-
+-    and is also the default auto-selected target for linear steady weak forms.
+-
+-    Parameters
+-    ----------
+-    domain:
+-        jNO domain with initialized FEM/FEAX context.
+-    ir:
+-        Lowered weak-form IR produced by `lower_weak_form(..., for_target="fem")`.
+-    **kwargs:
+-        Optional backend settings. Currently supports `symmetric_bc`.
+-
+-    Returns
+-    -------
+-    tuple
+-        `(A, b)` such that the physical FEM unknown satisfies:
+-
+-            A @ u = b
+-
+-    Notes
+-    -----
+-    FEAX naturally assembles a Newton/correction system:
+-
+-        A @ du = -r(u0)
+-
+-    This route converts that correction system into the full-state linear
+-    system expected by jNO examples and external linear solvers:
+-
+-        A @ u = A @ u0 - r(u0)
++        runtime_parameter_exprs=runtime_parameter_exprs,
++        residual_basis=basis_runtimes,
++        metadata={
++            "dynamic_residual": True,
++            "runtime_parameter_names": sorted(runtime_parameter_exprs),
++            "lowering": "R(u,args) = R0(u) + sum_i args[name_i] * R_i(u)",
++        },
++    )
++
++
++def _assemble_fem_system_concrete(
++    domain,
++    ir,
++    *,
++    apply_dirichlet=True,
++    symmetric_bc=True,
++):
++    """
++    Assemble one concrete steady linear FEAX contribution.
++
++    This helper deliberately receives an IR that no longer contains runtime
++    parameter ModelCall nodes.
+     """
+     import feax as fe
+ 
+-    problem, bc = _build_feax_problem(domain, ir)
++    problem, bc = _build_feax_problem(
++        domain,
++        ir,
++        apply_dirichlet=apply_dirichlet,
++    )
+     internal_vars = fe.InternalVars()
+ 
+     try:
+         u0 = fe.zero_like_initial_guess(problem, bc)
+     except Exception:
+-        u0 = jnp.zeros((problem.num_total_dofs_all_vars,), dtype=_default_float_dtype())
++        u0 = jnp.zeros(
++            (problem.num_total_dofs_all_vars,),
++            dtype=_default_float_dtype(),
++        )
+ 
+     u0 = jnp.asarray(u0, dtype=_default_float_dtype())
+ 
+     res_bc = fe.create_res_bc_function(problem, bc)
+-    jac_bc = fe.create_J_bc_function(problem, bc, symmetric=kwargs.get("symmetric_bc", True))
++    jac_bc = fe.create_J_bc_function(
++        problem,
++        bc,
++        symmetric=symmetric_bc,
++    )
+ 
+     # FEAX gives the correction system:
+     #     A du = -r(u0)
+-    # Convert to the full-state system expected by jNO examples:
++    # Convert to the full-state system:
+     #     A u = A u0 - r(u0)
+     A = jac_bc(u0, internal_vars)
+-    r0 = jnp.asarray(res_bc(u0, internal_vars), dtype=_default_float_dtype())
++    r0 = jnp.asarray(
++        res_bc(u0, internal_vars),
++        dtype=_default_float_dtype(),
++    )
+ 
+     if hasattr(A, "__matmul__"):
+         b = A @ u0 - r0
+     else:
+-        A_dense = jnp.asarray(A.todense() if hasattr(A, "todense") else A.toarray())
++        A_dense = jnp.asarray(
++            A.todense() if hasattr(A, "todense") else A.toarray()
++        )
+         b = A_dense @ u0 - r0
+         A = A_dense
+ 
+     return A, b
++
++
++def _assemble_fem_system_from_ir(domain, ir, **kwargs):
++    """
++    Assemble a steady linear FEM system from lowered weak-form IR.
++
++    Parameter-free route
++    --------------------
++    Returns the existing tuple:
++
++        A, b
++
++    Parameter-aware affine route
++    ----------------------------
++    Returns a ``FemLinearSystem`` block representing:
++
++        A(args) = A0 + sum_i args[name_i] * K_i
++        b(args) = b0
++
++    The external solve remains user controlled:
++
++        system = weak.assemble(target="fem_system")
++        A, b = system.evaluate(args={"k": k_value})
++        u = jnp.linalg.solve(A, b)
++
++    Supported runtime pattern:
++        parameter * operator_term
++
++    Runtime parameters in source/load terms are intentionally rejected in this
++    first static-linear stage.
++    """
++    symmetric_bc = kwargs.get("symmetric_bc", True)
++
++    has_runtime_parameters = any(
++        _contains_runtime_parameter(term.coeff)
++        for term in ir.terms
++    )
++
++    # Preserve the old API for ordinary static systems.
++    if not has_runtime_parameters:
++        return _assemble_fem_system_concrete(
++            domain,
++            ir,
++            apply_dirichlet=True,
++            symmetric_bc=symmetric_bc,
++        )
++
++    static_ir, parameter_irs, runtime_parameter_exprs = (
++        _split_parametric_operator_ir(ir)
++    )
++
++    if len(parameter_irs) == 0:
++        raise RuntimeError(
++            "Runtime parameters were detected, but no affine FEM basis terms "
++            "were generated."
++        )
++
++    operator_basis = {}
++
++    for name, basis_ir in parameter_irs.items():
++        # Stage 1 supports parameters multiplying operator terms only.
++        if any(
++            not _contains_trialfunction(term.coeff)
++            for term in basis_ir.terms
++        ):
++            raise NotImplementedError(
++                "Static parametric fem_system currently supports runtime "
++                "parameters in operator terms only. Parameter-dependent "
++                "source/load terms will be added separately."
++            )
++
++        K, bK = _assemble_fem_system_concrete(
++            domain,
++            basis_ir,
++            apply_dirichlet=False,
++            symmetric_bc=symmetric_bc,
++        )
++
++        K = _dense_array(K)
++        bK = jnp.asarray(bK).reshape(-1)
++
++        if not np.allclose(np.asarray(bK), 0.0, atol=1.0e-8):
++            raise NotImplementedError(
++                "A parameter basis produced a non-zero RHS contribution. "
++                "Stage 1 supports affine operator coefficients only."
++            )
++
++        operator_basis[name] = jnp.asarray(K)
++
++    # The static contribution applies Dirichlet enforcement exactly once.
++    if len(static_ir.terms) == 0:
++        first_basis_ir = next(iter(parameter_irs.values()))
++        static_ir = _make_zero_ir_like(first_basis_ir)
++
++    A0, b0 = _assemble_fem_system_concrete(
++        domain,
++        static_ir,
++        apply_dirichlet=True,
++        symmetric_bc=symmetric_bc,
++    )
++
++    A0 = jnp.asarray(_dense_array(A0))
++    b0 = jnp.asarray(b0, dtype=A0.dtype).reshape(-1)
++
++    def operator_fn(args=None):
++        A = A0
++
++        for name, K in operator_basis.items():
++            coeff = _runtime_scalar_arg(args, name, dtype=A0.dtype)
++            A = A + coeff * jnp.asarray(K, dtype=A0.dtype)
++
++        return A
++
++    return FemLinearSystem(
++        A=A0,
++        b=b0,
++        operator_fn=operator_fn,
++        rhs_fn=None,
++        runtime_parameter_exprs=runtime_parameter_exprs,
++        operator_basis=operator_basis,
++        metadata={
++            "dynamic_operator": True,
++            "runtime_parameter_names": sorted(runtime_parameter_exprs),
++            "lowering": "A(args) = A0 + sum_i args[name_i] * K_i",
++        },
++    )
+--- a/jno/trace.py
++++ b/jno/trace.py
+@@ -2078,67 +2078,140 @@
+ 
+ 
+ class FemLinearSystem:
+-    """Container for a linear FEM contribution A x = b.
+-
+-    Supports addition/subtraction so separate volume and boundary contributions
+-    can be combined naturally before unpacking.
+-    """
+-
+-    def __init__(self, A, b):
++    """Container for a steady linear FEM system ``A(args) x = b(args)``.
++
++    Ordinary parameter-free systems keep the existing unpacking behaviour:
++
++        A, b = system
++
++    Parameter-aware systems expose ``evaluate(args=...)`` so the user can
++    choose an external solver without losing the runtime parameter dependency.
++    """
++
++    def __init__(
++        self,
++        A,
++        b,
++        *,
++        operator_fn=None,
++        rhs_fn=None,
++        runtime_parameter_exprs=None,
++        operator_basis=None,
++        rhs_basis=None,
++        metadata=None,
++    ):
+         self.A = A
+         self.b = b
++        self.operator_fn = operator_fn
++        self.rhs_fn = rhs_fn
++        self.runtime_parameter_exprs = runtime_parameter_exprs or {}
++        self.operator_basis = operator_basis or {}
++        self.rhs_basis = rhs_basis or {}
++        self.metadata = metadata or {}
++
++    @property
++    def is_parametric(self) -> bool:
++        return self.operator_fn is not None or self.rhs_fn is not None
++
++    def evaluate(self, args=None):
++        A = self.A if self.operator_fn is None else self.operator_fn(args)
++        b = self.b if self.rhs_fn is None else self.rhs_fn(args)
++        return A, b
+ 
+     def __iter__(self):
++        if self.is_parametric:
++            raise TypeError(
++                "This FEM system depends on runtime parameters. "
++                "Call system.evaluate(args={...}) before unpacking."
++            )
++
+         yield self.A
+         yield self.b
+ 
+     def __add__(self, other):
+         if not isinstance(other, FemLinearSystem):
+             return NotImplemented
++
++        if self.is_parametric or other.is_parametric:
++            raise TypeError(
++                "Addition of parameter-aware FemLinearSystem blocks is not "
++                "implemented yet. Combine the weak forms before assembly."
++            )
++
+         return FemLinearSystem(self.A + other.A, self.b + other.b)
+ 
+-    def todense(self):
+-        A_dense = self.A.todense() if hasattr(self.A, "todense") else self.A
+-        return A_dense, self.b
++    def todense(self, args=None):
++        A, b = self.evaluate(args=args)
++        A_dense = A.todense() if hasattr(A, "todense") else A
++        return A_dense, b
+ 
+     def __sub__(self, other):
+         if not isinstance(other, FemLinearSystem):
+             return NotImplemented
++
++        if self.is_parametric or other.is_parametric:
++            raise TypeError(
++                "Subtraction of parameter-aware FemLinearSystem blocks is not "
++                "implemented yet. Combine the weak forms before assembly."
++            )
++
+         return FemLinearSystem(self.A - other.A, self.b - other.b)
+ 
+     def __repr__(self):
+         shape = getattr(self.A, "shape", None)
+-        return f"FemLinearSystem(shape={shape}, b_shape={getattr(self.b, 'shape', None)})"
++        return (
++            "FemLinearSystem("
++            f"shape={shape}, "
++            f"b_shape={getattr(self.b, 'shape', None)}, "
++            f"parametric={self.is_parametric}"
++            ")"
++        )
+ 
+ 
+ class FemResidualOperator:
+-    """Container for a nonlinear FEM residual operator R(u)=0.
+-
+-    Parameters
+-    ----------
+-    residual_fn : callable
+-        Function taking a flat DOF vector and returning the residual vector.
+-    jacobian_fn : callable | None
+-        Optional function taking a flat DOF vector and returning the tangent/Jacobian.
+-    size : int | None
+-        Number of scalar DOFs.
+-    """
+-
+-    def __init__(self, residual_fn, jacobian_fn=None, size=None):
++    """Container for a steady nonlinear FEM residual ``R(u, args) = 0``."""
++
++    def __init__(
++        self,
++        residual_fn,
++        jacobian_fn=None,
++        size=None,
++        *,
++        runtime_parameter_exprs=None,
++        residual_basis=None,
++        metadata=None,
++    ):
+         self.residual = residual_fn
+         self.jacobian = jacobian_fn
+         self.size = size
+-
+-    def __call__(self, u):
+-        return self.residual(u)
+-
+-    def linearize(self, u):
++        self.runtime_parameter_exprs = runtime_parameter_exprs or {}
++        self.residual_basis = residual_basis or {}
++        self.metadata = metadata or {}
++
++    @property
++    def is_parametric(self) -> bool:
++        return bool(self.runtime_parameter_exprs)
++
++    def __call__(self, u, args=None):
++        return self.residual(u, args)
++
++    def linearize(self, u, args=None):
+         if self.jacobian is None:
+             raise ValueError("No jacobian function available.")
+-        return self.jacobian(u), -self.residual(u)
++
++        return (
++            self.jacobian(u, args),
++            -self.residual(u, args),
++        )
+ 
+     def __repr__(self):
+-        return f"FemResidualOperator(size={self.size}, has_jacobian={self.jacobian is not None})"
++        return (
++            "FemResidualOperator("
++            f"size={self.size}, "
++            f"has_jacobian={self.jacobian is not None}, "
++            f"parametric={self.is_parametric}"
++            ")"
++        )
+ 
+ 
+ class StateField(Placeholder):
