@@ -208,6 +208,22 @@ meaning.
     wrong for the actual joint problem.  Set `adapt=False` and pick
     `step_size` by hand in that case.
 
+## Wandb integration
+
+When a wandb run is active, per-Bayesian-model statistics are logged at
+the same print-rate cadence as the rest of the training metrics:
+
+| Key                                 | Meaning                                        |
+|-------------------------------------|------------------------------------------------|
+| `posterior/<name>/n_samples`        | Number of samples collected in the chain so far |
+| `posterior/<name>/mean`             | Running posterior mean (scalar parameters only) |
+| `posterior/<name>/last`             | Last collected sample value (scalar parameters only) |
+
+`<name>` comes from the `name=` argument of `jno.np.parameter(...)` or
+`jno.nn.wrap(..., name=...)`.  Multi-leaf modules (MLPs) only get the
+chain length — full per-leaf statistics are out of scope for jno-side
+logging; use arviz against `model.posterior_samples` instead.
+
 !!! warning "Memory"
     A full chain costs ~`keep × #params × 4 bytes` per Bayesian model.  For
     large BNN PINNs increase `thin=` or decrease `keep=` to stay within

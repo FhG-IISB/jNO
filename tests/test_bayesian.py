@@ -689,6 +689,53 @@ class TestAutoInverseMassMatrix:
         assert p.posterior_samples.shape == (3, 3)
 
 
+class TestWandbChainStatsSmoke:
+    """Phase 4D — wandb_log gets posterior/<name>/{mean,last,n_samples}
+    entries for each Bayesian model when a wandb run is active.  Patched
+    end-to-end; no real wandb."""
+
+    def test_wandb_receives_posterior_stats(self, monkeypatch):
+        # `jno.core` is both a module and a class; bind the module explicitly.
+        import importlib
+
+        core_mod = importlib.import_module("jno.core")
+
+        # Fake a wandb run so the logging block actually runs.
+        class _FakeRun:
+            def __init__(self):
+                self.config = type("_Cfg", (), {"update": lambda *a, **kw: None})()
+                self.summary = type("_Sum", (), {"update": lambda *a, **kw: None})()
+
+        recorded: list[dict] = []
+
+        def _fake_get_run():
+            return _FakeRun()
+
+        def _fake_log(metrics, step=None):
+            recorded.append(dict(metrics))
+
+        monkeypatch.setattr(core_mod, "get_wandb_run", _fake_get_run)
+        monkeypatch.setattr(core_mod, "wandb_log", _fake_log)
+        # wandb_log_model is fine as the no-op fake — only called at end.
+        monkeypatch.setattr(core_mod, "wandb_log_model", lambda *a, **kw: None)
+
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="alpha")
+        a.bayesian(blackjax.nuts, step_size=1e-2, warmup=0, keep=3, adapt=False)
+        residual = a * jno.np.sin(π * x) - jno.np.sin(π * x)
+        jno.core([residual.mse], dom).solve(4)
+
+        # Collect all keys logged across all calls.
+        all_keys = set()
+        for metrics in recorded:
+            all_keys.update(metrics.keys())
+        assert "posterior/alpha/mean" in all_keys
+        assert "posterior/alpha/last" in all_keys
+        assert "posterior/alpha/n_samples" in all_keys
+
+
 class TestModelCallProxy:
     def test_modelcall_bayesian_proxies_to_model(self):
         # parameter() returns a ModelCall — calling .bayesian on it must
