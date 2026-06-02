@@ -37,6 +37,7 @@ from .trace import (
     IntegralTime,
     Jacobian,
     Model,
+    ModelCall,
     OperationCall,
     OperationDef,
     Placeholder,
@@ -88,6 +89,72 @@ def _find_temporal_variable(expr: Placeholder):
         return None
 
     return visit(expr)
+
+
+def _active_model_lids(exprs):
+    """Return layer_ids of Model nodes reachable without crossing stop_gradient.
+
+    Used by substep training to determine which models have non-zero gradient
+    potential for a given subset of constraints.
+    """
+    active: set = set()
+    seen: set = set()
+
+    def _walk(node):
+        if id(node) in seen:
+            return
+        seen.add(id(node))
+        # stop_gradient boundary — everything inside is frozen, skip
+        if isinstance(node, FunctionCall) and node.fn is jax.lax.stop_gradient:
+            return
+        if isinstance(node, ModelCall):
+            active.add(node.model.layer_id)
+            for arg in node.args:
+                if isinstance(arg, Placeholder):
+                    _walk(arg)
+            return
+        if isinstance(node, Model):
+            active.add(node.layer_id)
+            return
+        if isinstance(node, BinaryOp):
+            _walk(node.left)
+            _walk(node.right)
+        elif isinstance(node, FunctionCall):
+            for arg in node.args:
+                if isinstance(arg, Placeholder):
+                    _walk(arg)
+        elif isinstance(node, OperationCall):
+            _walk(node.operation.expr)
+            for arg in node.args:
+                if isinstance(arg, Placeholder):
+                    _walk(arg)
+        else:
+            for attr in ("target", "expr"):
+                child = getattr(node, attr, None)
+                if isinstance(child, Placeholder):
+                    _walk(child)
+            for seq_attr in ("args", "variables"):
+                for child in getattr(node, seq_attr, []):
+                    if isinstance(child, Placeholder):
+                        _walk(child)
+
+    for expr in exprs:
+        _walk(expr)
+    return active
+
+
+def _parse_substep_spec(spec):
+    """Normalise one substep entry → (indices: list[int], n_steps: int).
+
+    Accepts:
+      [0, 1]           → ([0, 1], 1)   plain index list, 1 step
+      ([0, 1], 2)      → ([0, 1], 2)   index list + step count
+    """
+    if isinstance(spec, (list, tuple)):
+        if len(spec) == 2 and isinstance(spec[1], int) and not isinstance(spec[0], int):
+            return list(spec[0]), int(spec[1])
+        return [int(i) for i in spec], 1
+    raise TypeError(f"substep must be a list or ([list], int) tuple, got {type(spec)}")
 
 
 class core:
@@ -704,6 +771,7 @@ class core:
         group_lr_schedules=None,
         checkpoint_gradients=False,
         min_consecutive=1,
+        compiled_constraints_fn=None,
     ):
         """Build a single JIT-compiled training step.
 
@@ -721,9 +789,12 @@ class core:
             per_model_opts: ``{layer_id_str: optax_chain}`` per-model optimizers.
             lr_schedules:   ``{layer_id_str: LearningRateSchedule}``.
             checkpoint_gradients: Wrap constraint evaluations in ``jax.checkpoint``.
+            compiled_constraints_fn: Override the default combined constraint function.
+                Used by ``substeps`` to supply per-substep compiled functions.
         """
+        _compiled_fn = compiled_constraints_fn if compiled_constraints_fn is not None else self.compiled_constraints_fn
         loss_fn = self._make_loss_fn(
-            self.compiled_constraints_fn,  # combined fn (replaces list)
+            _compiled_fn,
             batchsize,
             frozen,
             static,
@@ -1007,6 +1078,7 @@ class core:
         min_consecutive: Optional[int] = 1,
         profile: bool = False,
         callbacks: Optional[List] = None,
+        substeps=None,
     ):
         """Train using per-model optimizers attached via ``model.optimizer()``.
 
@@ -1047,6 +1119,22 @@ class core:
                 instances.  ``on_epoch_end`` is called after every outer
                 step; ``on_training_end`` is called once after the loop
                 finishes.
+            substeps: Optional list of substep specs for alternating
+                optimisation.  Each entry is either a plain list of constraint
+                indices ``[i, j, ...]`` (1 gradient step) or a tuple
+                ``([i, j, ...], n)`` (``n`` gradient steps sharing the same
+                optimizer state).  Each substep runs sequentially per outer
+                epoch and has its own independent optimizer states, so Adam
+                momentum accumulates only for actively trained models.
+
+                Example — HyCo alternating::
+
+                    crux = jno.core(
+                        [L_pde, beta * L_int_phy, alpha * L_data, beta * L_int_syn],
+                        domain,
+                    )
+                    crux.solve(1_500, substeps=[[0, 1], [2, 3]])
+                    # 1500 outer epochs × 2 substeps = 3000 effective gradient steps
 
         Returns:
             statistics: Training history with ``.plot()`` convenience.
@@ -1112,6 +1200,24 @@ class core:
                 "spatiotemporal training."
             )
             self._min_consec_nudged = True
+
+        # Validate substeps
+        _use_substeps = substeps is not None
+        if _use_substeps:
+            if accumulation_steps > 1:
+                raise ValueError("substeps is not compatible with accumulation_steps > 1.")
+            if inner_steps > 1:
+                raise ValueError(
+                    "substeps is not compatible with inner_steps > 1. Use the n_steps tuple form instead: ([i, j], n)."
+                )
+            _parsed_substeps = [_parse_substep_spec(s) for s in substeps]
+            for si, (indices, _) in enumerate(_parsed_substeps):
+                for idx in indices:
+                    if idx < 0 or idx >= self.n_constraints:
+                        raise ValueError(
+                            f"substeps[{si}] references constraint index {idx}, "
+                            f"but there are only {self.n_constraints} constraints (indices 0–{self.n_constraints - 1})."
+                        )
 
         # Adaptive resampling metadata
         strategies = getattr(self.domain, "_resampling_strategies", {})
@@ -1786,6 +1892,82 @@ class core:
             if has_trackers:
                 jit_track = jax.jit(track_fn)
 
+            # ── 7b. Build per-substep JIT step functions ──
+            if _use_substeps:
+                _substep_jit_steps = []
+                _substep_opt_states_list = []
+                _substep_n_steps_list = []
+                _substep_n_constraints_list = []
+
+                for _si, (_indices, _n_steps_i) in enumerate(_parsed_substeps):
+                    _sub_exprs = [self._constraint_exprs[i] for i in _indices]
+                    _active_lids = _active_model_lids(_sub_exprs)
+
+                    _per_model_opts_i = {k: v for k, v in per_model_opts.items() if int(k) in _active_lids}
+                    _lr_schedules_i = {k: v for k, v in lr_schedules.items() if int(k) in _active_lids}
+                    _group_lr_i = {k: v for k, v in group_lr_schedules.items() if int(k) in _active_lids}
+
+                    # Fresh optimizer states — isolated from other substeps
+                    _opt_states_i: Dict[str, Any] = {}
+                    for _k in _per_model_opts_i:
+                        _lid_i = int(_k)
+                        _state_i = _per_model_opts_i[_k].init(trainable[_lid_i])
+                        _opt_states_i[_k] = jax.tree_util.tree_map(
+                            lambda x: (
+                                jax.device_put(jnp.copy(x), NamedSharding(self.mesh, P()))
+                                if isinstance(x, (jnp.ndarray, jax.Array))
+                                else x
+                            ),
+                            _state_i,
+                        )
+
+                    _compiled_fn_i = TraceCompiler.compile_multi_expression(_sub_exprs, self.all_ops)
+                    _n_constraints_i = len(_sub_exprs)
+
+                    _step_fn_i = self.make_step_fn(
+                        per_model_opts=_per_model_opts_i,
+                        batchsize=effective_batchsize,
+                        frozen=frozen_arrays,
+                        static=static,
+                        lr_schedules=_lr_schedules_i,
+                        group_lr_schedules=_group_lr_i if _group_lr_i else None,
+                        checkpoint_gradients=checkpoint_gradients,
+                        min_consecutive=min_consecutive,
+                        compiled_constraints_fn=_compiled_fn_i,
+                    )
+
+                    _zeros_i = jax.device_put(jnp.zeros(_n_constraints_i), replicated)
+                    _in_shardings_i = (
+                        jax.tree_util.tree_map(_leaf_sharding, trainable),
+                        jax.tree_util.tree_map(_leaf_sharding, _opt_states_i),
+                        replicated,
+                        jax.tree_util.tree_map(_leaf_sharding, trace_context),
+                        replicated,
+                        replicated,
+                    )
+                    _out_shardings_i = (
+                        jax.tree_util.tree_map(_leaf_sharding, trainable),
+                        jax.tree_util.tree_map(_leaf_sharding, _opt_states_i),
+                        replicated,
+                        replicated,
+                        replicated,
+                        replicated,
+                    )
+                    _jit_step_i = jax.jit(
+                        _step_fn_i,
+                        in_shardings=_in_shardings_i,
+                        out_shardings=_out_shardings_i,
+                        donate_argnums=(0, 1, 2),
+                    )
+
+                    _substep_jit_steps.append(_jit_step_i)
+                    _substep_opt_states_list.append(_opt_states_i)
+                    _substep_n_steps_list.append(_n_steps_i)
+                    _substep_n_constraints_list.append(_n_constraints_i)
+                    self.log.info(
+                        f"Substep {_si}: constraints={_indices}, n_steps={_n_steps_i}, active_models={sorted(_active_lids)}"
+                    )
+
             self.log.info("JIT compiling step function with mesh sharding — this might take a while")
 
             # ── Enable persistent XLA compilation cache ──
@@ -1801,7 +1983,21 @@ class core:
 
             # Trigger AOT compilation so the first real step is fast.
 
-            if _use_accumulation:
+            if _use_substeps:
+                # AOT compile each substep's step function
+                for _si, (_jit_step_i, _opt_states_i, _n_constraints_i) in enumerate(
+                    zip(_substep_jit_steps, _substep_opt_states_list, _substep_n_constraints_list)
+                ):
+                    _zeros_i = jax.device_put(jnp.zeros(_n_constraints_i), replicated)
+                    _ = _jit_step_i.lower(
+                        trainable,
+                        _opt_states_i,
+                        self.rng,
+                        trace_context,
+                        jax.device_put(jnp.int32(0), replicated),
+                        _zeros_i,
+                    ).compile()
+            elif _use_accumulation:
                 # AOT compile grad and apply separately
                 _ = jit_grad.lower(trainable, self.rng, trace_context).compile()
                 _zero_grads = jax.tree_util.tree_map(jnp.zeros_like, trainable)
@@ -1834,24 +2030,37 @@ class core:
             # profiling starts. Without this the first 1-2 profiled steps
             # are anomalously slow, making the trace misleading.
             _tw = jax.tree_util.tree_map(jnp.copy, trainable)
-            _ow = jax.tree_util.tree_map(jnp.copy, opt_states)
             _rw = jnp.copy(self.rng)
             _ew = jax.device_put(jnp.int32(0), replicated)
-            _pl = jax.device_put(jnp.zeros(self.n_constraints), replicated)
-            if _use_accumulation:
+            if _use_substeps:
+                _substep_ow_list = [jax.tree_util.tree_map(jnp.copy, _os) for _os in _substep_opt_states_list]
                 for _ in range(3):
-                    _gw, _rw, _, _ = jit_grad(_tw, _rw, trace_context)
-                    _tw, _ow = jit_apply(_tw, _ow, _gw, _ew, _pl)
-                del _gw
+                    for _si, (_jit_step_i, _n_constraints_i) in enumerate(
+                        zip(_substep_jit_steps, _substep_n_constraints_list)
+                    ):
+                        _pl_i = jax.device_put(jnp.zeros(_n_constraints_i), replicated)
+                        _tw, _substep_ow_list[_si], _rw, _ew, _, _ = _jit_step_i(
+                            _tw, _substep_ow_list[_si], _rw, trace_context, _ew, _pl_i
+                        )
+                del _substep_ow_list
             else:
-                for _ in range(3):
-                    _tw, _ow, _rw, _ew, _, _pl = jit_step(_tw, _ow, _rw, trace_context, _ew, _pl)
+                _ow = jax.tree_util.tree_map(jnp.copy, opt_states)
+                _pl = jax.device_put(jnp.zeros(self.n_constraints), replicated)
+                if _use_accumulation:
+                    for _ in range(3):
+                        _gw, _rw, _, _ = jit_grad(_tw, _rw, trace_context)
+                        _tw, _ow = jit_apply(_tw, _ow, _gw, _ew, _pl)
+                    del _gw
+                else:
+                    for _ in range(3):
+                        _tw, _ow, _rw, _ew, _, _pl = jit_step(_tw, _ow, _rw, trace_context, _ew, _pl)
+                del _ow, _pl
 
             if has_trackers:
                 _ = jit_track(_tw, trace_context, _rw)
 
             jax.effects_barrier()
-            del _tw, _ow, _rw, _ew, _pl
+            del _tw, _rw, _ew
             # self.log.info("Skipping AOT compile/warmup; first training step will JIT normally.")
 
             # Notify callbacks that setup is complete so they can build and
@@ -1877,6 +2086,13 @@ class core:
 
             print_rate = max(1, epochs // 10 if epochs < 100_000 else epochs // 1000)
             prev_losses = jax.device_put(jnp.zeros(self.n_constraints), replicated)
+
+            # Substep state — one prev_losses array per substep + a global step counter
+            if _use_substeps:
+                _substep_prev_losses_list = [
+                    jax.device_put(jnp.zeros(_n), replicated) for _n in _substep_n_constraints_list
+                ]
+                _global_substep_counter = 0
 
             # Log buffers
             log_epochs = []
@@ -2061,7 +2277,54 @@ class core:
                                 on_device_context = on_device_context_new
 
                 # --- prepare context and step ---
-                if _use_accumulation:
+                if _use_substeps:
+                    # Each substep: own compiled function, own optimizer state.
+                    # `trainable` is shared and passes between substeps so a
+                    # later substep sees the freshly updated params from earlier ones.
+                    if offload_data:
+                        if host_context is None:
+                            raise RuntimeError("offload_data=True but host_context is not available")
+                        indices = rng_np.choice(total_samples, batchsize, replace=False)
+                        batch_np = {
+                            k: (
+                                v
+                                if k == "__time__"
+                                else (np.broadcast_to(v, (batchsize,) + v.shape[1:]) if v.shape[0] == 1 else v[indices])
+                            )
+                            for k, v in host_context.items()
+                        }
+                        context = self._shard_data(jax.device_put(batch_np))
+                    else:
+                        context = on_device_context
+
+                    _last_total = None
+                    _last_indiv = None
+                    for _si, _jit_step_i in enumerate(_substep_jit_steps):
+                        _n_steps_i = _substep_n_steps_list[_si]
+                        for _ in range(_n_steps_i):
+                            (
+                                trainable,
+                                _substep_opt_states_list[_si],
+                                self.rng,
+                                _,
+                                _last_total,
+                                _last_indiv,
+                            ) = _jit_step_i(
+                                trainable,
+                                _substep_opt_states_list[_si],
+                                self.rng,
+                                context,
+                                jax.device_put(jnp.int32(_global_substep_counter), replicated),
+                                _substep_prev_losses_list[_si],
+                            )
+                            _substep_prev_losses_list[_si] = _last_indiv
+                            _global_substep_counter += 1
+
+                    # Representative metrics from the final substep
+                    total_loss = _last_total
+                    individual_losses = _last_indiv
+                    epoch_jnp = epoch_jnp + jnp.asarray(1, dtype=epoch_jnp.dtype)
+                elif _use_accumulation:
                     # Gradient accumulation: N micro-batch forward/backward
                     # passes, then one averaged optimizer update.
                     _acc_grads = None
@@ -2150,7 +2413,8 @@ class core:
                         prev_losses,
                     )
 
-                prev_losses = individual_losses
+                if not _use_substeps:
+                    prev_losses = individual_losses
 
                 # Stop profiling after the requested steady-state window.
                 if _profile_active and outer_epoch + 1 >= _profile_stop:
