@@ -224,17 +224,17 @@ class TestEvalAutoChainDefault:
 
     def test_bayesian_expr_returns_chain_by_default(self):
         a, _b, _x, crux = self._setup()
-        chain = crux.eval([a])              # auto → chain
+        chain = crux.eval([a])  # auto → chain
         assert chain.shape == (10, 1)
 
     def test_non_bayesian_expr_returns_point_by_default(self):
         _a, b, _x, crux = self._setup()
-        point = crux.eval([b])              # auto → point
+        point = crux.eval([b])  # auto → point
         assert point.shape == (1,)
 
     def test_mixed_list_picks_per_expression(self):
         a, b, _x, crux = self._setup()
-        a_out, b_out = crux.eval([a, b])    # auto: a → chain, b → point
+        a_out, b_out = crux.eval([a, b])  # auto: a → chain, b → point
         assert a_out.shape == (10, 1)
         assert b_out.shape == (1,)
 
@@ -556,6 +556,87 @@ class TestLoRABayesian:
         assert len(leaves) > 0, "LoRA chain must carry adapter-array leaves"
         for leaf in leaves:
             assert leaf.shape[0] == 10
+
+
+class TestAutoInverseMassMatrix:
+    """Phase 4A — kernels that accept inverse_mass_matrix get an identity
+    default of the right shape inferred from the position pytree.  Users no
+    longer need to hand-write jnp.ones(D)."""
+
+    def _run(self, p, *, kernel=blackjax.nuts, kernel_kwargs=None, warmup=2, keep=3):
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        kernel_kwargs = dict(kernel_kwargs or {})
+        # Deliberately do NOT pass inverse_mass_matrix.
+        p.bayesian(kernel, step_size=1e-2, warmup=warmup, keep=keep, **kernel_kwargs)
+        residual = p * jno.np.sin(π * x) - jno.np.sin(π * x)
+        crux = jno.core([residual.mse], dom)
+        crux.solve(warmup + keep)
+
+    def test_nuts_scalar_param_no_imm_runs(self):
+        p = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="p")
+        self._run(p)
+        assert p.posterior_samples.shape == (3, 1)
+
+    def test_nuts_vector_param_no_imm_runs(self):
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 1.0 * jno.np.sin(π * x) + 2.0 * jno.np.cos(π * x) + 3.0 * x
+        p = jno.np.parameter((3,), key=jax.random.PRNGKey(0), name="abc")
+        p.bayesian(blackjax.nuts, step_size=5e-3, warmup=2, keep=3)
+        residual = p[0] * jno.np.sin(π * x) + p[1] * jno.np.cos(π * x) + p[2] * x - target
+        jno.core([residual.mse], dom).solve(5)
+        assert p.posterior_samples.shape == (3, 3)
+
+    def test_nuts_mlp_no_imm_runs(self):
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        net = _tiny_net(in_dim=1, out_dim=1, hidden=4)
+        net.bayesian(blackjax.nuts, step_size=1e-3, warmup=1, keep=2)
+        residual = net(x) - 0.0
+        jno.core([residual.mse], dom).solve(3)
+        leaves = jax.tree_util.tree_leaves(net.posterior_samples)
+        assert all(leaf.shape[0] == 2 for leaf in leaves)
+
+    def test_explicit_imm_is_respected(self):
+        p = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="p")
+        # Pass a deliberately non-identity diagonal.
+        custom = jnp.array([4.0])
+        p.bayesian(blackjax.nuts, step_size=1e-2, inverse_mass_matrix=custom, warmup=1, keep=2)
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        residual = p * jno.np.sin(π * x) - jno.np.sin(π * x)
+        jno.core([residual.mse], dom).solve(3)
+        assert p.model._bayesian_cfg["kernel_kwargs"]["inverse_mass_matrix"] is custom
+
+    def test_mala_does_not_get_imm_injected(self):
+        # MALA's signature has no inverse_mass_matrix; injection must skip it.
+        p = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="p")
+        p.bayesian(blackjax.mala, step_size=1e-2, warmup=1, keep=2)
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        residual = p * jno.np.sin(π * x) - jno.np.sin(π * x)
+        jno.core([residual.mse], dom).solve(3)
+        assert "inverse_mass_matrix" not in p.model._bayesian_cfg["kernel_kwargs"]
+
+    def test_scalar_imm_broadcasts_to_position_shape(self):
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 1.0 * jno.np.sin(π * x) + 2.0 * jno.np.cos(π * x) + 3.0 * x
+        p = jno.np.parameter((3,), key=jax.random.PRNGKey(0), name="abc")
+        p.bayesian(blackjax.nuts, step_size=5e-3, inverse_mass_matrix=2.0, warmup=2, keep=3)
+        residual = p[0] * jno.np.sin(π * x) + p[1] * jno.np.cos(π * x) + p[2] * x - target
+        jno.core([residual.mse], dom).solve(5)
+        # After injection, the kwarg in extra_kwargs gets broadcast to a length-3 vector.
+        # Look at the handle on the model — it was built inside solve(), so the cfg
+        # itself still holds the original scalar (we only mutate handle.extra_kwargs,
+        # not cfg).  The proof is that the run finishes without a blackjax shape error.
+        assert p.posterior_samples.shape == (3, 3)
 
 
 class TestModelCallProxy:
