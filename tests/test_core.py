@@ -168,3 +168,185 @@ class TestStatisticsTotalLoss:
         )
         assert s.total_loss == pytest.approx(1.0)
         assert s.total_loss_history.shape == (5,)
+
+
+# ---------------------------------------------------------------------------
+# Substeps — alternating optimisation
+# ---------------------------------------------------------------------------
+
+
+class TestSubsteps:
+    def _build_two_net_crux(self):
+        """Build a two-network problem with HyCo-style interaction terms."""
+        dom = _stationary_1d_domain(mesh_size=0.05)
+        x, *_ = dom.variable("interior")
+        n1 = _tiny_net(key_seed=1)
+        n2 = _tiny_net(key_seed=2)
+        for n in (n1, n2):
+            n.optimizer(optax.adam(1e-3))
+        u1 = n1(x) * x * (1 - x)
+        u2 = n2(x) * x * (1 - x)
+        L_pde = (u1.dd(x) + 1.0).mse
+        L_int1 = (u1 - jno.fn.stop_gradient(u2)).mse
+        L_data = (u2 - x).mse
+        L_int2 = (u2 - jno.fn.stop_gradient(u1)).mse
+        crux = jno.core([L_pde, L_int1, L_data, L_int2], dom)
+        return crux, n1, n2
+
+    @staticmethod
+    def _snapshot_arrays(module):
+        """Stable list of array leaves (deep-copied) for value comparison."""
+        return [jnp.asarray(leaf).copy() for leaf in jax.tree_util.tree_leaves(module) if hasattr(leaf, "shape")]
+
+    @staticmethod
+    def _any_changed(before, after, atol=1e-12):
+        return any(not jnp.allclose(b, a, atol=atol) for b, a in zip(before, after))
+
+    @staticmethod
+    def _all_unchanged(before, after, atol=1e-12):
+        return all(jnp.allclose(b, a, atol=atol) for b, a in zip(before, after))
+
+    def test_substep_phy_only_does_not_touch_syn(self):
+        """Running ONLY substep [0, 1] (the u_phy losses) must leave u_syn_net
+        bit-identical, even after many gradient steps. Proves the gradient is
+        zero for the model trapped inside stop_gradient."""
+        crux, n1, n2 = self._build_two_net_crux()
+        before_n1 = self._snapshot_arrays(n1.module)
+        before_n2 = self._snapshot_arrays(n2.module)
+
+        crux.solve(20, substeps=[[0, 1]])
+
+        after_n1 = self._snapshot_arrays(n1.module)
+        after_n2 = self._snapshot_arrays(n2.module)
+
+        assert self._any_changed(before_n1, after_n1), "u_phy_net should have updated under [L_pde, L_int_phy]"
+        assert self._all_unchanged(before_n2, after_n2), (
+            "u_syn_net must NOT change when only substep [0, 1] runs — it only appears inside stop_gradient"
+        )
+
+    def test_substep_syn_only_does_not_touch_phy(self):
+        """Mirror: running ONLY substep [2, 3] must leave u_phy_net unchanged."""
+        crux, n1, n2 = self._build_two_net_crux()
+        before_n1 = self._snapshot_arrays(n1.module)
+        before_n2 = self._snapshot_arrays(n2.module)
+
+        crux.solve(20, substeps=[[2, 3]])
+
+        after_n1 = self._snapshot_arrays(n1.module)
+        after_n2 = self._snapshot_arrays(n2.module)
+
+        assert self._all_unchanged(before_n1, after_n1), "u_phy_net must NOT change when only substep [2, 3] runs"
+        assert self._any_changed(before_n2, after_n2), "u_syn_net should have updated under [L_data, L_int_syn]"
+
+    def test_substep_gradient_is_zero_for_inactive_model(self):
+        """Direct gradient check: ∂(L_pde + L_int_phy)/∂u_syn_net == 0 everywhere
+        (because u_syn appears only inside stop_gradient). Bypasses solve() and
+        uses the compiled per-substep loss function directly."""
+        import equinox as eqx
+
+        from jno.trace_compiler import TraceCompiler
+
+        crux, n1, n2 = self._build_two_net_crux()
+
+        # Replicate the partition solve() does so we can call the loss directly.
+        models = dict(crux.models)
+        filter_spec = {
+            lid: jax.tree_util.tree_map(
+                lambda leaf: True if eqx.is_inexact_array(leaf) else False,
+                m,
+            )
+            for lid, m in models.items()
+        }
+        trainable, rest = eqx.partition(models, filter_spec)
+        frozen_arrays, static = eqx.partition(rest, eqx.is_array)
+
+        # Compile only the phy substep's constraints (indices 0, 1).
+        sub_exprs = [crux._constraint_exprs[0], crux._constraint_exprs[1]]
+        compiled_phy = TraceCompiler.compile_multi_expression(sub_exprs, crux.all_ops)
+
+        def loss_fn(params):
+            import paramax as _paramax
+
+            full = _paramax.unwrap(eqx.combine(params, frozen_arrays, static))
+            residuals = compiled_phy(full, crux.domain_data.context, batchsize=None, key=jax.random.PRNGKey(0))
+            return jnp.mean(jnp.stack([jnp.mean(r) for r in residuals]))
+
+        grads = jax.grad(loss_fn)(trainable)
+
+        # Find which layer ids correspond to n1, n2
+        phy_lid = n1.layer_id
+        syn_lid = n2.layer_id
+
+        # Every array-leaf in the syn model's gradient must be exactly zero.
+        syn_grad_leaves = [g for g in jax.tree_util.tree_leaves(grads[syn_lid]) if hasattr(g, "shape")]
+        assert syn_grad_leaves, "expected at least one array leaf in syn gradient"
+        for g in syn_grad_leaves:
+            assert jnp.all(g == 0.0), (
+                f"u_syn_net gradient under phy losses must be 0, got max |g|={float(jnp.max(jnp.abs(g))):.3e}"
+            )
+
+        # And the phy model must have at least one non-zero gradient leaf (the loss actually depends on it).
+        phy_grad_leaves = [g for g in jax.tree_util.tree_leaves(grads[phy_lid]) if hasattr(g, "shape")]
+        assert any(jnp.any(g != 0.0) for g in phy_grad_leaves), "u_phy_net should have non-zero gradient under phy losses"
+
+    def test_substeps_runs_and_updates_both_models(self):
+        """Each substep updates only its active model — but `trainable` is shared,
+        so over two substeps both networks' parameters change."""
+        crux, n1, n2 = self._build_two_net_crux()
+        before_n1 = self._snapshot_arrays(n1.module)
+        before_n2 = self._snapshot_arrays(n2.module)
+        crux.solve(10, substeps=[[0, 1], [2, 3]])
+        after_n1 = self._snapshot_arrays(n1.module)
+        after_n2 = self._snapshot_arrays(n2.module)
+        assert self._any_changed(before_n1, after_n1), "u_phy_net should have updated"
+        assert self._any_changed(before_n2, after_n2), "u_syn_net should have updated"
+
+    def test_substeps_opt_state_isolation(self):
+        """Each substep's opt_state contains only its active models."""
+        from jno.core import _active_model_lids
+
+        crux, n1, n2 = self._build_two_net_crux()
+        phy_active = _active_model_lids([crux._constraint_exprs[0], crux._constraint_exprs[1]])
+        syn_active = _active_model_lids([crux._constraint_exprs[2], crux._constraint_exprs[3]])
+
+        # Static analysis: phy substep sees only n1, syn substep sees only n2
+        assert phy_active == {n1.layer_id}
+        assert syn_active == {n2.layer_id}
+        assert phy_active.isdisjoint(syn_active)
+
+    def test_substeps_n_steps_tuple(self):
+        """Tuple form (indices, n_steps) is accepted and runs."""
+        crux, _, _ = self._build_two_net_crux()
+        # 5 outer epochs × (2 + 2) substeps = 20 effective gradient steps
+        crux.solve(5, substeps=[([0, 1], 2), ([2, 3], 2)])
+
+    def test_substeps_invalid_index_raises(self):
+        crux, _, _ = self._build_two_net_crux()
+        with pytest.raises(ValueError, match="references constraint index"):
+            crux.solve(1, substeps=[[0, 99]])
+
+    def test_substeps_inner_steps_incompatible(self):
+        crux, _, _ = self._build_two_net_crux()
+        with pytest.raises(ValueError, match="not compatible with inner_steps"):
+            crux.solve(2, substeps=[[0, 1]], inner_steps=2)
+
+    def test_substeps_bad_spec_type(self):
+        crux, _, _ = self._build_two_net_crux()
+        with pytest.raises(TypeError, match="substep must be a list"):
+            crux.solve(1, substeps=["not-a-list"])
+
+    def test_active_model_lids_skips_stop_gradient(self):
+        """Static analysis: a model only reachable through stop_gradient is inactive."""
+        from jno.core import _active_model_lids
+
+        dom = _stationary_1d_domain(mesh_size=0.1)
+        x, *_ = dom.variable("interior")
+        n1 = _tiny_net(key_seed=10)
+        n2 = _tiny_net(key_seed=11)
+        u1 = n1(x)
+        u2 = n2(x)
+        # L_int1 references both nets but n2 is inside stop_gradient
+        L_int1 = (u1 - jno.fn.stop_gradient(u2)).mse
+        active = _active_model_lids([L_int1])
+        assert n1.layer_id in active
+        assert n2.layer_id not in active
