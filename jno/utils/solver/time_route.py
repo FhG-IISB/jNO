@@ -57,8 +57,12 @@ from .solver_helper import (
 
 from .parametric_helpers import (
     _clone_term_with_coeff,
+    _collect_runtime_parameter_exprs,
     _contains_runtime_parameter,
     _make_ir,
+    _make_zero_ir_like,
+    _runtime_parameter_tag,
+    _runtime_scalar_arg,
     _split_parametric_operator_ir,
 )
 
@@ -400,34 +404,51 @@ def _temporary_time_value(domain, t_value: float):
             domain.context[k] = v
 
 
-def _build_first_order_semidiscrete_operators(domain, ir, mass_expr, residual_expr, boundary_exprs):
+def _build_first_order_semidiscrete_operators(
+    domain,
+    ir,
+    mass_expr,
+    residual_expr,
+    boundary_exprs,
+):
     """
-    Build JAX-callable operators for a nonlinear first-order semidiscrete system.
+    Build nonlinear first-order semidiscrete operators with runtime parameters.
 
     The generated callables represent:
 
-        M(t) u_dot + R(u, t) = 0
+        M(t) u_dot + R(u, t, args) = 0
 
-    Returns:
-        mass_fn(t, args)
-        residual_fn(u, t, args)
-        jacobian_fn(u, t, args)
-        runtime_info
+    Runtime parameters are supported in the residual through:
 
-    The FEAX residual/Jacobian runtimes are built once and reused by the
-    returned callables.
+        R(u,t,args) = R0(u,t) + sum_i args[name_i] * Ri(u,t)
+        J(u,t,args) = J0(u,t) + sum_i args[name_i] * Ji(u,t)
+
+    The mass term deliberately remains parameter-free in this first version.
     """
+    del mass_expr, residual_expr, boundary_exprs
+
     import feax as fe
 
-    from .weak_form import LoweredChannelTerm, LoweredWeakForm
+    from .weak_form import (
+        LoweredChannelTerm,
+        LoweredWeakForm,
+    )
 
-    # -------------------------
+    # --------------------------------------------------
     # Build mass IR
-    # -------------------------
+    # --------------------------------------------------
     mass_terms = []
+
     for term in ir.terms:
-        if term.support == "volume" and term.channel == "raw" and _contains_temporal_derivative(term.coeff):
-            stripped = _strip_temporal_trial_derivative(term.coeff)
+        if (
+            term.support == "volume"
+            and term.channel == "raw"
+            and _contains_temporal_derivative(term.coeff)
+        ):
+            stripped = _strip_temporal_trial_derivative(
+                term.coeff
+            )
+
             mass_terms.append(
                 LoweredChannelTerm(
                     sign=term.sign,
@@ -441,23 +462,56 @@ def _build_first_order_semidiscrete_operators(domain, ir, mass_expr, residual_ex
                 )
             )
 
-    mass_ir = LoweredWeakForm(domain=domain, terms=mass_terms)
+    mass_ir = LoweredWeakForm(
+        domain=domain,
+        terms=mass_terms,
+    )
 
-    # -------------------------
+    # --------------------------------------------------
     # Build residual IR
-    # -------------------------
+    # --------------------------------------------------
     residual_terms = []
+
     for term in ir.terms:
-        if term.support == "volume" and term.channel == "raw" and not _contains_temporal_derivative(term.coeff):
-            residual_terms.append(term)
-        elif term.support == "boundary" and term.channel == "raw":
+        if (
+            term.support == "volume"
+            and term.channel == "raw"
+            and not _contains_temporal_derivative(term.coeff)
+        ):
             residual_terms.append(term)
 
-    residual_ir = LoweredWeakForm(domain=domain, terms=residual_terms)
+        elif (
+            term.support == "boundary"
+            and term.channel == "raw"
+        ):
+            residual_terms.append(term)
+
+    residual_ir = LoweredWeakForm(
+        domain=domain,
+        terms=residual_terms,
+    )
 
     if len(mass_ir.terms) == 0:
-        raise ValueError("Nonlinear semidiscrete path could not extract a mass term. Expected something like u_t * phi.")
+        raise ValueError(
+            "Nonlinear semidiscrete path could not extract a mass term. "
+            "Expected something like `u_t * phi`."
+        )
 
+    # Runtime parameters in the mass matrix are intentionally rejected
+    # in this first implementation.
+    if any(
+        _contains_runtime_parameter(term.coeff)
+        for term in mass_ir.terms
+    ):
+        raise NotImplementedError(
+            "Runtime trainable parameters inside nonlinear transient mass "
+            "terms are not supported yet. Keep the mass term parameter-free "
+            "and place affine parameters inside the residual."
+        )
+
+    # --------------------------------------------------
+    # Build mass runtime
+    # --------------------------------------------------
     mass_rt = _prepare_feax_runtime(
         domain,
         mass_ir,
@@ -465,93 +519,329 @@ def _build_first_order_semidiscrete_operators(domain, ir, mass_expr, residual_ex
         need_jacobian=True,
         symmetric_bc=True,
     )
+
+    # --------------------------------------------------
+    # Split residual:
+    #
+    #     R(u,t,args)
+    #       = R0(u,t)
+    #       + sum_i args[name_i] * Ri(u,t)
+    # --------------------------------------------------
+    (
+        static_residual_ir,
+        parameter_irs,
+        runtime_parameter_exprs,
+    ) = _split_parametric_operator_ir(
+        residual_ir
+    )
+
+    # FEAX requires one structural IR even when every residual term is
+    # parameter dependent.
+    if len(static_residual_ir.terms) == 0:
+        if parameter_irs:
+            static_eval_ir = _make_zero_ir_like(
+                next(iter(parameter_irs.values()))
+            )
+        else:
+            static_eval_ir = _make_zero_ir_like(
+                mass_ir
+            )
+    else:
+        static_eval_ir = static_residual_ir
+
     residual_rt = _prepare_feax_runtime(
         domain,
-        residual_ir,
+        static_eval_ir,
         apply_dirichlet=True,
         need_jacobian=True,
         symmetric_bc=True,
     )
 
-    # -------------------------
-    # Mass operator
-    # -------------------------
+    # --------------------------------------------------
+    # Build BC-safe affine residual bases
+    #
+    #     effective_basis
+    #       = basis_with_bc - zero_basis_with_bc
+    # --------------------------------------------------
+    basis_runtimes = {}
+
+    for name, basis_ir in parameter_irs.items():
+        zero_basis_ir = _make_zero_ir_like(
+            basis_ir
+        )
+
+        basis_rt = _prepare_feax_runtime(
+            domain,
+            basis_ir,
+            apply_dirichlet=True,
+            need_jacobian=True,
+            symmetric_bc=True,
+        )
+
+        zero_rt = _prepare_feax_runtime(
+            domain,
+            zero_basis_ir,
+            apply_dirichlet=True,
+            need_jacobian=True,
+            symmetric_bc=True,
+        )
+
+        if (
+            basis_rt["jac_bc"] is None
+            or zero_rt["jac_bc"] is None
+        ):
+            raise ValueError(
+                f"Nonlinear transient residual basis {name!r} "
+                "did not produce a Jacobian."
+            )
+
+        if int(basis_rt["size"]) != int(residual_rt["size"]):
+            raise ValueError(
+                f"Nonlinear transient residual basis {name!r} has size "
+                f"{basis_rt['size']}, expected {residual_rt['size']}."
+            )
+
+        if int(zero_rt["size"]) != int(residual_rt["size"]):
+            raise ValueError(
+                f"Nonlinear transient zero basis {name!r} has size "
+                f"{zero_rt['size']}, expected {residual_rt['size']}."
+            )
+
+        basis_runtimes[name] = {
+            "basis": basis_rt,
+            "zero": zero_rt,
+        }
+
+    # --------------------------------------------------
+    # FEAX InternalVars helper
+    # --------------------------------------------------
+    def _internal_vars(rt, t):
+        if len(rt["temporal_tags"]) == 0:
+            return fe.InternalVars()
+
+        return _make_internal_vars(
+            fe,
+            rt["temporal_tags"],
+            t,
+            n_cells=rt["n_cells"],
+            dtype=rt["dtype"],
+        )
+
+    # --------------------------------------------------
+    # Mass matrix
+    # --------------------------------------------------
     if mass_rt["jac_bc"] is None:
-        raise ValueError("Mass runtime did not produce a Jacobian operator.")
+        raise ValueError(
+            "Mass runtime did not produce a Jacobian operator."
+        )
 
     if len(mass_rt["temporal_tags"]) == 0:
-        M_const = _dense_array(mass_rt["jac_bc"](mass_rt["u_ref"], fe.InternalVars()))
-        M_const = jnp.asarray(M_const, dtype=mass_rt["dtype"])
+        M_const = _dense_array(
+            mass_rt["jac_bc"](
+                mass_rt["u_ref"],
+                fe.InternalVars(),
+            )
+        )
+
+        M_const = jnp.asarray(
+            M_const,
+            dtype=mass_rt["dtype"],
+        )
 
         def mass_fn(t, args=None):
+            del t, args
             return M_const
 
     else:
 
         def mass_fn(t, args=None):
-            iv = _make_internal_vars(
-                fe,
-                mass_rt["temporal_tags"],
+            del args
+
+            iv = _internal_vars(
+                mass_rt,
                 t,
-                n_cells=mass_rt["n_cells"],
+            )
+
+            M_t = _dense_array(
+                mass_rt["jac_bc"](
+                    mass_rt["u_ref"],
+                    iv,
+                )
+            )
+
+            return jnp.asarray(
+                M_t,
                 dtype=mass_rt["dtype"],
             )
-            M_t = _dense_array(mass_rt["jac_bc"](mass_rt["u_ref"], iv))
-            return jnp.asarray(M_t, dtype=mass_rt["dtype"])
 
-    # -------------------------
-    # Residual / Jacobian operators
-    # -------------------------
+    # --------------------------------------------------
+    # Residual and Jacobian
+    # --------------------------------------------------
     if residual_rt["jac_bc"] is None:
-        raise ValueError("Residual runtime did not produce a Jacobian operator.")
+        raise ValueError(
+            "Residual runtime did not produce a Jacobian operator."
+        )
 
-    if len(residual_rt["temporal_tags"]) == 0:
-        iv_res0 = fe.InternalVars()
+    dtype = residual_rt["dtype"]
 
-        def residual_fn(u_flat, t, args=None):
-            u_flat = jnp.asarray(u_flat, dtype=residual_rt["dtype"]).reshape(-1)
-            return jnp.asarray(residual_rt["res_bc"](u_flat, iv_res0), dtype=residual_rt["dtype"]).reshape(-1)
+    def residual_fn(u_flat, t, args=None):
+        u_flat = jnp.asarray(
+            u_flat,
+            dtype=dtype,
+        ).reshape(-1)
 
-        def jacobian_fn(u_flat, t, args=None):
-            u_flat = jnp.asarray(u_flat, dtype=residual_rt["dtype"]).reshape(-1)
-            J = _dense_array(residual_rt["jac_bc"](u_flat, iv_res0))
-            return jnp.asarray(J, dtype=residual_rt["dtype"])
+        iv_static = _internal_vars(
+            residual_rt,
+            t,
+        )
 
-    else:
+        out = jnp.asarray(
+            residual_rt["res_bc"](
+                u_flat,
+                iv_static,
+            ),
+            dtype=dtype,
+        ).reshape(-1)
 
-        def residual_fn(u_flat, t, args=None):
-            u_flat = jnp.asarray(u_flat, dtype=residual_rt["dtype"]).reshape(-1)
-            iv = _make_internal_vars(
-                fe,
-                residual_rt["temporal_tags"],
-                t,
-                n_cells=residual_rt["n_cells"],
-                dtype=residual_rt["dtype"],
+        for name, pair in basis_runtimes.items():
+            coeff = _runtime_scalar_arg(
+                args,
+                name,
+                dtype=dtype,
             )
-            return jnp.asarray(residual_rt["res_bc"](u_flat, iv), dtype=residual_rt["dtype"]).reshape(-1)
 
-        def jacobian_fn(u_flat, t, args=None):
-            u_flat = jnp.asarray(u_flat, dtype=residual_rt["dtype"]).reshape(-1)
-            iv = _make_internal_vars(
-                fe,
-                residual_rt["temporal_tags"],
+            iv_basis = _internal_vars(
+                pair["basis"],
                 t,
-                n_cells=residual_rt["n_cells"],
-                dtype=residual_rt["dtype"],
             )
-            J = _dense_array(residual_rt["jac_bc"](u_flat, iv))
-            return jnp.asarray(J, dtype=residual_rt["dtype"])
+
+            iv_zero = _internal_vars(
+                pair["zero"],
+                t,
+            )
+
+            basis_res = (
+                jnp.asarray(
+                    pair["basis"]["res_bc"](
+                        u_flat,
+                        iv_basis,
+                    ),
+                    dtype=dtype,
+                ).reshape(-1)
+                - jnp.asarray(
+                    pair["zero"]["res_bc"](
+                        u_flat,
+                        iv_zero,
+                    ),
+                    dtype=dtype,
+                ).reshape(-1)
+            )
+
+            out = out + coeff * basis_res
+
+        return out
+
+    def jacobian_fn(u_flat, t, args=None):
+        u_flat = jnp.asarray(
+            u_flat,
+            dtype=dtype,
+        ).reshape(-1)
+
+        iv_static = _internal_vars(
+            residual_rt,
+            t,
+        )
+
+        out = jnp.asarray(
+            _dense_array(
+                residual_rt["jac_bc"](
+                    u_flat,
+                    iv_static,
+                )
+            ),
+            dtype=dtype,
+        )
+
+        for name, pair in basis_runtimes.items():
+            coeff = _runtime_scalar_arg(
+                args,
+                name,
+                dtype=dtype,
+            )
+
+            iv_basis = _internal_vars(
+                pair["basis"],
+                t,
+            )
+
+            iv_zero = _internal_vars(
+                pair["zero"],
+                t,
+            )
+
+            basis_jac = (
+                jnp.asarray(
+                    _dense_array(
+                        pair["basis"]["jac_bc"](
+                            u_flat,
+                            iv_basis,
+                        )
+                    ),
+                    dtype=dtype,
+                )
+                - jnp.asarray(
+                    _dense_array(
+                        pair["zero"]["jac_bc"](
+                            u_flat,
+                            iv_zero,
+                        )
+                    ),
+                    dtype=dtype,
+                )
+            )
+
+            out = out + coeff * basis_jac
+
+        return out
 
     runtime_info = {
-        "mass_is_constant": bool(len(mass_rt["temporal_tags"]) == 0),
-        "residual_has_time": bool(len(residual_rt["temporal_tags"]) > 0),
+        "mass_is_constant": bool(
+            len(mass_rt["temporal_tags"]) == 0
+        ),
+        "residual_has_time": bool(
+            len(residual_rt["temporal_tags"]) > 0
+            or any(
+                len(pair["basis"]["temporal_tags"]) > 0
+                for pair in basis_runtimes.values()
+            )
+        ),
         "dtype": mass_rt["dtype"],
-        "state_size": int(mass_rt["size"]),
-        "mass_temporal_tags": tuple(mass_rt["temporal_tags"]),
-        "residual_temporal_tags": tuple(residual_rt["temporal_tags"]),
+        "state_size": int(
+            mass_rt["size"]
+        ),
+        "mass_temporal_tags": tuple(
+            mass_rt["temporal_tags"]
+        ),
+        "residual_temporal_tags": tuple(
+            residual_rt["temporal_tags"]
+        ),
+        "runtime_parameter_names": tuple(
+            sorted(runtime_parameter_exprs.keys())
+        ),
+        "runtime_parameter_exprs": dict(
+            runtime_parameter_exprs
+        ),
+        "residual_basis_names": tuple(
+            sorted(basis_runtimes.keys())
+        ),
     }
 
-    return mass_fn, residual_fn, jacobian_fn, runtime_info
+    return (
+        mass_fn,
+        residual_fn,
+        jacobian_fn,
+        runtime_info,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -623,14 +913,28 @@ def _assemble_diffrax_from_strong_form(domain, expr, **kwargs) -> DiffraxBlock:
                 raise ValueError("Strong-form Diffrax lowering with state_expr=... requires state0=...")
 
             mass_expr, residual_expr = _split_first_order_strong_form(expr, state_expr, time_var)
-            rhs, mass_fn, lowered_rhs = _build_first_order_strong_diffrax_runtime(
-                domain,
-                mass_expr=mass_expr,
-                residual_expr=residual_expr,
-                state_expr=state_expr,
-                time_var=time_var,
-                state0=state0,
-                params=params,
+            rhs, mass_fn, lowered_rhs, strong_runtime = (
+                _build_first_order_strong_diffrax_runtime(
+                    domain,
+                    mass_expr=mass_expr,
+                    residual_expr=residual_expr,
+                    state_expr=state_expr,
+                    time_var=time_var,
+                    state0=state0,
+                    params=params,
+                )
+            )
+
+            metadata["runtime_parameter_names"] = list(
+                strong_runtime["runtime_parameter_names"]
+            )
+
+            metadata["runtime_parameter_tags"] = dict(
+                strong_runtime["runtime_parameter_tags"]
+            )
+
+            metadata["dynamic_parameters"] = bool(
+                strong_runtime["runtime_parameter_names"]
             )
 
             import diffrax as _diffrax
@@ -973,76 +1277,217 @@ def _build_first_order_strong_diffrax_runtime(
     params=None,
 ):
     """
-    Build the runtime RHS for first-order strong-form Diffrax lowering.
+    Build a strong-form Diffrax RHS with runtime ``jno.np.parameter`` values.
 
-    Replaces the symbolic state expression by a TensorTag holding the solver
-    state, evaluates mass and residual expressions through TraceEvaluator, and
-    returns:
+    Symbolic inverse parameters are replaced by private ``TensorTag`` nodes.
+    Concrete values remain external and are supplied through:
 
-        rhs(t, y, args)
-        mass_fn(t, args)
-        lowered_rhs_expression
+        diffrax.diffeqsolve(..., args={"parameter_name": value})
     """
     params = {} if params is None else params
     evaluator = TraceEvaluator(params)
 
+    # --------------------------------------------------
+    # Replace symbolic state expression by runtime state
+    # --------------------------------------------------
     state_tag = "__diffrax_state__"
-    state_runtime = TensorTag(tag=state_tag, domain=domain)
+    state_runtime = TensorTag(
+        tag=state_tag,
+        domain=domain,
+    )
 
-    mass_runtime_expr = _replace_exact_subtree(mass_expr, state_expr, state_runtime)
-    residual_runtime_expr = _replace_exact_subtree(residual_expr, state_expr, state_runtime)
+    mass_runtime_expr = _replace_exact_subtree(
+        mass_expr,
+        state_expr,
+        state_runtime,
+    )
+
+    residual_runtime_expr = _replace_exact_subtree(
+        residual_expr,
+        state_expr,
+        state_runtime,
+    )
+
+    # --------------------------------------------------
+    # Detect jno.np.parameter(...) expressions and replace
+    # them with runtime TensorTags populated from Diffrax args.
+    # --------------------------------------------------
+    runtime_parameter_exprs = {}
+
+    _collect_runtime_parameter_exprs(
+        mass_runtime_expr,
+        runtime_parameter_exprs,
+    )
+
+    _collect_runtime_parameter_exprs(
+        residual_runtime_expr,
+        runtime_parameter_exprs,
+    )
+
+    runtime_parameter_tags = {}
+
+    for name, param_expr in runtime_parameter_exprs.items():
+        tag = _runtime_parameter_tag(name)
+
+        runtime_parameter_tags[name] = tag
+
+        runtime_tag = TensorTag(
+            tag=tag,
+            domain=domain,
+        )
+
+        mass_runtime_expr = _replace_exact_subtree(
+            mass_runtime_expr,
+            param_expr,
+            runtime_tag,
+        )
+
+        residual_runtime_expr = _replace_exact_subtree(
+            residual_runtime_expr,
+            param_expr,
+            runtime_tag,
+        )
 
     state0_arr = jnp.asarray(state0)
     time_tag = str(time_var.tag)
 
     def _state_to_context(y):
         y = jnp.asarray(y)
+
         if y.ndim == 0:
             return y.reshape(1)
+
         if y.ndim == 1:
             return y[:, None]
+
         return y
 
     def _set_time_context(ctx, t):
-        t_arr = jnp.asarray([[t]], dtype=jnp.asarray(t).dtype)
+        t_arr = jnp.asarray(
+            [[t]],
+            dtype=jnp.asarray(t).dtype,
+        )
+
         ctx[time_tag] = t_arr
-        if time_tag != "__time__" and "__time__" in domain.context:
+
+        if (
+            time_tag != "__time__"
+            and "__time__" in domain.context
+        ):
             ctx["__time__"] = t_arr
+
         return ctx
 
-    def _eval_runtime(expr_rt, y, t):
+    def _inject_runtime_parameters(ctx, args):
+        for name, tag in runtime_parameter_tags.items():
+            ctx[tag] = _runtime_scalar_arg(
+                args,
+                name,
+                dtype=state0_arr.dtype,
+            )
+
+        return ctx
+
+    def _eval_runtime(expr_rt, y, t, args):
         ctx = dict(domain.context)
+
         ctx[state_tag] = _state_to_context(y)
-        ctx = _set_time_context(ctx, t)
-        out = evaluator.evaluate(expr_rt, context=ctx)
+
+        ctx = _set_time_context(
+            ctx,
+            t,
+        )
+
+        ctx = _inject_runtime_parameters(
+            ctx,
+            args,
+        )
+
+        out = evaluator.evaluate(
+            expr_rt,
+            context=ctx,
+        )
+
         return jnp.asarray(out)
 
     def mass_fn(t, args=None):
-        return _eval_runtime(mass_runtime_expr, state0_arr, t)
+        return _eval_runtime(
+            mass_runtime_expr,
+            state0_arr,
+            t,
+            args,
+        )
 
-    def residual_eval(y, t):
-        return _eval_runtime(residual_runtime_expr, y, t)
+    def residual_eval(y, t, args=None):
+        return _eval_runtime(
+            residual_runtime_expr,
+            y,
+            t,
+            args,
+        )
 
     def rhs(t, y, args=None):
         y_arr = jnp.asarray(y)
-        M_t = jnp.asarray(_eval_runtime(mass_runtime_expr, y_arr, t))
-        R_t = jnp.asarray(_eval_runtime(residual_runtime_expr, y_arr, t))
 
-        # scalar mass
+        M_t = jnp.asarray(
+            _eval_runtime(
+                mass_runtime_expr,
+                y_arr,
+                t,
+                args,
+            )
+        )
+
+        R_t = jnp.asarray(
+            _eval_runtime(
+                residual_runtime_expr,
+                y_arr,
+                t,
+                args,
+            )
+        )
+
+        # Scalar mass.
         if M_t.ndim == 0 or M_t.size == 1:
-            return (-R_t / jnp.reshape(M_t, ())).reshape(y_arr.shape)
+            return (
+                -R_t
+                / jnp.reshape(M_t, ())
+            ).reshape(y_arr.shape)
 
-        # diagonal / elementwise mass
-        if M_t.shape == y_arr.shape or M_t.shape == _state_to_context(y_arr).shape:
-            return (-R_t / M_t).reshape(y_arr.shape)
+        # Diagonal or element-wise mass.
+        if (
+            M_t.shape == y_arr.shape
+            or M_t.shape == _state_to_context(y_arr).shape
+        ):
+            return (
+                -R_t
+                / M_t
+            ).reshape(y_arr.shape)
 
-        # dense mass matrix
+        # Dense mass matrix.
         return jnp.linalg.solve(
             jnp.asarray(M_t),
             -jnp.asarray(R_t).reshape(-1),
         ).reshape(y_arr.shape)
 
-    return rhs, mass_fn, residual_runtime_expr
+    runtime_info = {
+        "runtime_parameter_names": tuple(
+            sorted(runtime_parameter_exprs.keys())
+        ),
+        "runtime_parameter_exprs": dict(
+            runtime_parameter_exprs
+        ),
+        "runtime_parameter_tags": dict(
+            runtime_parameter_tags
+        ),
+    }
+
+    return (
+        rhs,
+        mass_fn,
+        residual_runtime_expr,
+        runtime_info,
+    )
 
 
 def _contains_trial(node: Any) -> bool:
@@ -1547,6 +1992,28 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
     metadata["mass_is_constant"] = bool(nonlinear_runtime["mass_is_constant"])
     metadata["residual_has_time"] = bool(nonlinear_runtime["residual_has_time"])
     metadata["state_size"] = int(nonlinear_runtime["state_size"])
+
+    metadata["runtime_parameter_names"] = list(
+        nonlinear_runtime.get(
+            "runtime_parameter_names",
+            (),
+        )
+    )
+
+    metadata["dynamic_parameters"] = bool(
+        nonlinear_runtime.get(
+            "runtime_parameter_names",
+            (),
+        )
+    )
+
+    metadata["residual_basis_names"] = list(
+        nonlinear_runtime.get(
+            "residual_basis_names",
+            (),
+        )
+    )
+
     metadata["notes"] = (
         "Nonlinear first-order semidiscrete FEAX-time block assembled. "
         "mass(t), residual(u,t), and jacobian(u,t) are populated for external solvers. "
@@ -1575,6 +2042,12 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         metadata=metadata,
         M=None,
         A=None,
+        runtime_parameter_exprs=dict(
+            nonlinear_runtime.get(
+                "runtime_parameter_exprs",
+                {},
+            )
+        ),
         affine_bias=None,
         forcing_vector_fn=None,
         feax_mesh=feax_mesh,
