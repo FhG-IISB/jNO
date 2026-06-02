@@ -1,11 +1,15 @@
 # Bayesian PINNs
 
-Five worked examples of Bayesian Physics-Informed Neural Networks
-(B-PINNs) in jNO.  Each script wires one or more blackjax kernels into
-`solve()` via `.bayesian(...)` and returns posterior chains over either
-neural-network weights, scalar PDE coefficients, or both.
+Six worked examples of Bayesian Physics-Informed Neural Networks
+(B-PINNs) in jNO.  Every tutorial drives training through
+`crux.solve()` and uses jNO's per-parameter `.bayesian(...)`
+configurator to attach a blackjax kernel to scalar PDE coefficients,
+model weights, or inverted inputs.
 
-Background and API reference live in
+All chains are built on the [blackjax MCMC
+library](https://github.com/blackjax-devs/blackjax) — NUTS, HMC,
+MALA, SGLD, SGHMC, plus window adaptation.  Background and API
+reference for the `.bayesian()` integration live in
 [Training → Bayesian Sampling](../../training/bayesian.md).
 
 ## Examples
@@ -13,7 +17,7 @@ Background and API reference live in
 | # | File | What it shows | Reference |
 |---|---|---|---|
 | 01 | [`forward_noisy_poisson_1d`](./forward-noisy-poisson-1d.md) | Forward-UQ B-PINN: SGLD over MLP weights for the 1-D Poisson with noisy boundary data — prediction bands that widen in data-sparse regions. | Yang et al. 2021 §3.2.1 |
-| 02 | [`inverse_multi_coefficient`](./inverse-multi-coefficient.md) | Per-parameter NUTS on (A, B) of a noisy harmonic-regression target — purest demonstration of `.bayesian()` for each scalar. | Yang et al. 2021 |
+| 02 | [`inverse_multi_coefficient`](./inverse-multi-coefficient.md) | Per-parameter NUTS on (A, B) of a harmonic-regression target — purest demonstration of `.bayesian()` for each scalar. | Yang et al. 2021 |
 | 03 | [`inverse_reaction_coefficient`](./inverse-reaction-coefficient.md) | NUTS on the scalar `k` in `λ u'' + k tanh(u) = f` using the closed-form `u` — a fixed-target posterior. | Yang et al. 2021 §3.3.1 |
 | 04 | [`inverse_ode_decay`](./inverse-ode-decay.md) | First-order decay ODE `du/dt = -k u`; recovers `k` from noisy observations using the closed-form `exp(-kt)` — no surrogate, fixed-target posterior. | Linka et al. 2022 |
 | 05 | [`inverse_surrogate_uncertainty`](./inverse-surrogate-uncertainty.md) | Forward-then-freeze: train a PINN surrogate of `sin(πx)`, then NUTS samples the **inverted input** `x_query` given a noisy observation — calibrated uncertainty on the inverse output. | — |

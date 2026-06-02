@@ -9,7 +9,8 @@
 Phase 1 trains a PINN surrogate `u_net(x) ≈ sin(πx)` against the PDE
 `u'' + π² sin(πx) = 0` (point estimate, optax).  Phase 2 freezes the
 surrogate and uses NUTS to sample the posterior over an unknown input
-`x_query` given a noisy observation `u_obs ≈ u_exact(x_true)`.
+`x_query` given an observation `u_obs ≈ u_exact(x_true)` under a
+Gaussian-noise likelihood with known scale `σ`.
 
 Compared with the deterministic [`surrogate_inversion`](../05-coupled-and-inverse/surrogate-inversion.md)
 tutorial, the **input** is now Bayesian — jNO's per-parameter
@@ -24,8 +25,8 @@ The true posterior given `u_obs ≈ 0.809` is **bimodal**.  A
 single-chain NUTS started near `0.3` finds the left mode and stays
 there; the credible interval reported here characterises that mode
 only.  Multi-chain inference (with chains started from different
-initial conditions) would reveal both modes — that's the multi-chain
-follow-up tracked in the implementation plan.
+initial conditions) would reveal both modes — a natural extension on
+top of the same `.bayesian()` setup.
 
 ## Script
 

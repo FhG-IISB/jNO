@@ -18,32 +18,24 @@ FEM solver** that jNO already exposes.
 ## Architecture
 
 * jNO's `domain.init_fem` + `weak.assemble` build the JAX-traceable
-  stiffness matrix `A` and load vector `b`.  Both flow through
-  `jnp.linalg.solve` in a way that is fully differentiable in any
-  scalar parameter appearing in the weak form.
-* For pure-diffusion linear PDEs (this tutorial), `A(α) = α · A_base`,
-  so `u(α) = u_baseline / α`.  We exploit this to avoid re-assembling
-  every NUTS step.  When the PDE has α-dependent boundary terms or
-  nonlinear couplings, replace the scaling with a per-call `assemble`
-  + `linalg.solve` — the rest of the pattern is identical, just
-  slower.
-* The likelihood `logdensity(α) = -‖u(α) - u_obs‖² / (2σ²) + log_prior`
-  is a plain JAX function of `α`; we pass it to
-  `blackjax.window_adaptation` and `blackjax.nuts` directly.  jNO's
-  `.bayesian()` API is currently scoped to problems whose forward is
-  expressible as a jNO Placeholder expression, so we drop one level
-  here.
-
-This is the right pattern whenever your forward model lives outside
-jNO's tracer — FEM, finite volume, an external solver, an ODE
-integrator: use jNO for the differentiable forward, blackjax for the
-chain.
+  stiffness matrix `A` and load vector `b`.  We solve the `α = 1`
+  problem once to get `u_baseline`.
+* For pure-diffusion linear PDEs (this tutorial), `A(α) = α · A_base`
+  and therefore `u(α) = u_baseline / α`.  We express the forward as a
+  jNO expression of the trainable `α` and a per-node `u_baseline`
+  constant attached via `jno.domain.from_array`, so the **whole loss
+  flows through `crux.solve()`** with NUTS attached via `.bayesian()`
+  — same configurator pattern as every other tutorial in this section.
+* For nonlinear PDEs the scaling identity fails; you'd then wrap the
+  per-step `assemble + linalg.solve` in a jNO `FunctionCall`
+  placeholder.  Same architecture, just slower.
 
 ## Result
 
-`α = 0.99 ± 0.02`, 90 % CI `[0.96, 1.02]`, truth `α = 1.0` —
+`α = 1.07 ± 0.14`, 90 % CI `[0.88, 1.33]`, truth `α = 1.0` —
 comfortably interior, CI width set by the observation noise level
-(`σ = 0.005`) and the chain length (`keep = 1000`).
+(`σ = 0.005`), the chain length (`keep = 1000`), and the per-node
+likelihood averaging.
 
 ## Script
 

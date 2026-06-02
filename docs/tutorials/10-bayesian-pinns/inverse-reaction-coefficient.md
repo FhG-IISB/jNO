@@ -1,7 +1,7 @@
 # Inverse: nonlinear reaction coefficient (closed-form)
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/10_bayesian_pinns/04_inverse_reaction_coefficient.py" download>Download .py</a>
+<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/10_bayesian_pinns/03_inverse_reaction_coefficient.py" download>Download .py</a>
 <a class="md-button" href="/jNO_docs/tutorials/10-bayesian-pinns/">Back to chapter</a>
 </div>
 
@@ -15,10 +15,12 @@ intervals — matching Yang et al. 2021's textbook B-PINN HMC result
 (`k ≈ 0.705 ± 0.006` for the small-noise case, our short chain hits
 `k ≈ 0.703 ± 0.043`).
 
-If `u` were unknown (a real PDE solve), the surrogate approach via
-two-stage `substeps=[([0, 1], 20), ([2], 1)]` is the recommended
-pattern — see [the source-recovery
-tutorial](./inverse-source-steady-state.md) for that variant.
+If `u` were unknown (a real PDE solve), the two-stage surrogate
+pattern via `substeps=[([surrogate_constraints], n_train), ([pde], 1)]`
+with `.stop_gradient()` on the surrogate in the PDE residual is the
+recommended alternative.  Tutorial 06 ([Inverse FEM
+Diffusivity](./inverse-fem-diffusivity.md)) shows the more general
+case where the forward model is fully numerical (FEM).
 
 ## Reference
 
@@ -29,5 +31,5 @@ with noisy data.*  Journal of Computational Physics, 425, 109913.
 ## Script
 
 ```python
---8<-- "tutorial_examples/10_bayesian_pinns/04_inverse_reaction_coefficient.py"
+--8<-- "tutorial_examples/10_bayesian_pinns/03_inverse_reaction_coefficient.py"
 ```
