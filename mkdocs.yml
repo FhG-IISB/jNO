@@ -146,6 +146,5 @@ nav:
       - Overview: tutorials/10-bayesian-pinns/index.md
       - Forward Noisy Poisson 1D: tutorials/10-bayesian-pinns/forward-noisy-poisson-1d.md
       - Inverse Multi-Coefficient: tutorials/10-bayesian-pinns/inverse-multi-coefficient.md
-      - Inverse Source Steady-State: tutorials/10-bayesian-pinns/inverse-source-steady-state.md
       - Inverse Reaction Coefficient: tutorials/10-bayesian-pinns/inverse-reaction-coefficient.md
       - Inverse ODE Decay: tutorials/10-bayesian-pinns/inverse-ode-decay.md

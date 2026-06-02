@@ -1,20 +1,24 @@
-# Inverse B-PINN: nonlinear reaction coefficient
+# Inverse: nonlinear reaction coefficient (closed-form)
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/10_bayesian_pinns/04_inverse_reaction_coefficient.py" download>Download .py</a>
 <a class="md-button" href="/jNO_docs/tutorials/10-bayesian-pinns/">Back to chapter</a>
 </div>
 
-**Nonlinear reaction-coefficient inverse problem.**  Recover the scalar
-`k` in the 1-D steady PDE `λ u''(x) + k tanh(u(x)) = f(x)` from
-synthetic observations.  The nonlinear `tanh(u)` term couples the
-coefficient to the surrogate's response — exactly the regime where a
-joint Bayesian–PINN approach earns its keep.
+**Reaction-coefficient inverse problem with a fixed-target posterior.**
+Recover the scalar `k` in `λ u''(x) + k tanh(u(x)) = f(x)` from noisy
+observations of the forcing `f`.  Because the analytical solution
+`u_exact = sin(πx)/π²` is known, we plug it directly into the PDE
+residual instead of training a surrogate.  NUTS samples a fixed-target
+posterior over `k` with calibrated, hyperparameter-stable credible
+intervals — matching Yang et al. 2021's textbook B-PINN HMC result
+(`k ≈ 0.705 ± 0.006` for the small-noise case, our short chain hits
+`k ≈ 0.703 ± 0.043`).
 
-Yang et al. 2021 §3.3.1 report `k ≈ 0.705 ± 0.006` in the low-noise
-case (truth 0.7) with a 15 000-sample HMC chain.  This tutorial uses a
-short chain on CPU; recovery is approximate but tracks the truth and
-the credible interval is calibrated.
+If `u` were unknown (a real PDE solve), the surrogate approach via
+two-stage `substeps=[([0, 1], 20), ([2], 1)]` is the recommended
+pattern — see [the source-recovery
+tutorial](./inverse-source-steady-state.md) for that variant.
 
 ## Reference
 
