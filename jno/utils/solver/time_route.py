@@ -29,7 +29,6 @@ from ...trace import (
     Hessian,
     Jacobian,
     Literal,
-    ModelCall,
     Placeholder,
     StateField,
     TensorTag,
@@ -45,26 +44,34 @@ from .feax_utils import (
     _make_internal_vars,
     _prepare_feax_runtime,
 )
-from .solver_helper import (
-    collect_temporal_tags as _collect_temporal_tags, 
-    iter_children as _iter_children, 
-    contains_model_call as _contains_model_call,
-    contains_node_type as _contains_node_type,
-    contains_temporal_derivative as _contains_temporal_derivative,
-    is_temporal_var as _is_temporal_var,
-    max_temporal_derivative_order as _max_temporal_derivative_order,
-)
-
 from .parametric_helpers import (
     _clone_term_with_coeff,
     _collect_runtime_parameter_exprs,
     _contains_runtime_parameter,
     _make_ir,
     _make_zero_ir_like,
+    _merge_runtime_parameter_exprs,
     _runtime_parameter_tag,
     _runtime_scalar_arg,
     _split_parametric_operator_ir,
-    _merge_runtime_parameter_exprs,
+)
+from .solver_helper import (
+    collect_temporal_tags as _collect_temporal_tags,
+)
+from .solver_helper import (
+    contains_model_call as _contains_model_call,
+)
+from .solver_helper import (
+    contains_node_type as _contains_node_type,
+)
+from .solver_helper import (
+    contains_temporal_derivative as _contains_temporal_derivative,
+)
+from .solver_helper import (
+    is_temporal_var as _is_temporal_var,
+)
+from .solver_helper import (
+    max_temporal_derivative_order as _max_temporal_derivative_order,
 )
 
 # -----------------------------------------------------------------------------
@@ -441,14 +448,8 @@ def _build_first_order_semidiscrete_operators(
     mass_terms = []
 
     for term in ir.terms:
-        if (
-            term.support == "volume"
-            and term.channel == "raw"
-            and _contains_temporal_derivative(term.coeff)
-        ):
-            stripped = _strip_temporal_trial_derivative(
-                term.coeff
-            )
+        if term.support == "volume" and term.channel == "raw" and _contains_temporal_derivative(term.coeff):
+            stripped = _strip_temporal_trial_derivative(term.coeff)
 
             mass_terms.append(
                 LoweredChannelTerm(
@@ -474,17 +475,10 @@ def _build_first_order_semidiscrete_operators(
     residual_terms = []
 
     for term in ir.terms:
-        if (
-            term.support == "volume"
-            and term.channel == "raw"
-            and not _contains_temporal_derivative(term.coeff)
-        ):
+        if term.support == "volume" and term.channel == "raw" and not _contains_temporal_derivative(term.coeff):
             residual_terms.append(term)
 
-        elif (
-            term.support == "boundary"
-            and term.channel == "raw"
-        ):
+        elif term.support == "boundary" and term.channel == "raw":
             residual_terms.append(term)
 
     residual_ir = LoweredWeakForm(
@@ -493,17 +487,11 @@ def _build_first_order_semidiscrete_operators(
     )
 
     if len(mass_ir.terms) == 0:
-        raise ValueError(
-            "Nonlinear semidiscrete path could not extract a mass term. "
-            "Expected something like `u_t * phi`."
-        )
+        raise ValueError("Nonlinear semidiscrete path could not extract a mass term. Expected something like `u_t * phi`.")
 
     # Runtime parameters in the mass matrix are intentionally rejected
     # in this first implementation.
-    if any(
-        _contains_runtime_parameter(term.coeff)
-        for term in mass_ir.terms
-    ):
+    if any(_contains_runtime_parameter(term.coeff) for term in mass_ir.terms):
         raise NotImplementedError(
             "Runtime trainable parameters inside nonlinear transient mass "
             "terms are not supported yet. Keep the mass term parameter-free "
@@ -532,21 +520,15 @@ def _build_first_order_semidiscrete_operators(
         static_residual_ir,
         parameter_irs,
         runtime_parameter_exprs,
-    ) = _split_parametric_operator_ir(
-        residual_ir
-    )
+    ) = _split_parametric_operator_ir(residual_ir)
 
     # FEAX requires one structural IR even when every residual term is
     # parameter dependent.
     if len(static_residual_ir.terms) == 0:
         if parameter_irs:
-            static_eval_ir = _make_zero_ir_like(
-                next(iter(parameter_irs.values()))
-            )
+            static_eval_ir = _make_zero_ir_like(next(iter(parameter_irs.values())))
         else:
-            static_eval_ir = _make_zero_ir_like(
-                mass_ir
-            )
+            static_eval_ir = _make_zero_ir_like(mass_ir)
     else:
         static_eval_ir = static_residual_ir
 
@@ -567,9 +549,7 @@ def _build_first_order_semidiscrete_operators(
     basis_runtimes = {}
 
     for name, basis_ir in parameter_irs.items():
-        zero_basis_ir = _make_zero_ir_like(
-            basis_ir
-        )
+        zero_basis_ir = _make_zero_ir_like(basis_ir)
 
         basis_rt = _prepare_feax_runtime(
             domain,
@@ -587,25 +567,17 @@ def _build_first_order_semidiscrete_operators(
             symmetric_bc=True,
         )
 
-        if (
-            basis_rt["jac_bc"] is None
-            or zero_rt["jac_bc"] is None
-        ):
-            raise ValueError(
-                f"Nonlinear transient residual basis {name!r} "
-                "did not produce a Jacobian."
-            )
+        if basis_rt["jac_bc"] is None or zero_rt["jac_bc"] is None:
+            raise ValueError(f"Nonlinear transient residual basis {name!r} did not produce a Jacobian.")
 
         if int(basis_rt["size"]) != int(residual_rt["size"]):
             raise ValueError(
-                f"Nonlinear transient residual basis {name!r} has size "
-                f"{basis_rt['size']}, expected {residual_rt['size']}."
+                f"Nonlinear transient residual basis {name!r} has size {basis_rt['size']}, expected {residual_rt['size']}."
             )
 
         if int(zero_rt["size"]) != int(residual_rt["size"]):
             raise ValueError(
-                f"Nonlinear transient zero basis {name!r} has size "
-                f"{zero_rt['size']}, expected {residual_rt['size']}."
+                f"Nonlinear transient zero basis {name!r} has size {zero_rt['size']}, expected {residual_rt['size']}."
             )
 
         basis_runtimes[name] = {
@@ -632,9 +604,7 @@ def _build_first_order_semidiscrete_operators(
     # Mass matrix
     # --------------------------------------------------
     if mass_rt["jac_bc"] is None:
-        raise ValueError(
-            "Mass runtime did not produce a Jacobian operator."
-        )
+        raise ValueError("Mass runtime did not produce a Jacobian operator.")
 
     if len(mass_rt["temporal_tags"]) == 0:
         M_const = _dense_array(
@@ -679,9 +649,7 @@ def _build_first_order_semidiscrete_operators(
     # Residual and Jacobian
     # --------------------------------------------------
     if residual_rt["jac_bc"] is None:
-        raise ValueError(
-            "Residual runtime did not produce a Jacobian operator."
-        )
+        raise ValueError("Residual runtime did not produce a Jacobian operator.")
 
     dtype = residual_rt["dtype"]
 
@@ -721,22 +689,19 @@ def _build_first_order_semidiscrete_operators(
                 t,
             )
 
-            basis_res = (
-                jnp.asarray(
-                    pair["basis"]["res_bc"](
-                        u_flat,
-                        iv_basis,
-                    ),
-                    dtype=dtype,
-                ).reshape(-1)
-                - jnp.asarray(
-                    pair["zero"]["res_bc"](
-                        u_flat,
-                        iv_zero,
-                    ),
-                    dtype=dtype,
-                ).reshape(-1)
-            )
+            basis_res = jnp.asarray(
+                pair["basis"]["res_bc"](
+                    u_flat,
+                    iv_basis,
+                ),
+                dtype=dtype,
+            ).reshape(-1) - jnp.asarray(
+                pair["zero"]["res_bc"](
+                    u_flat,
+                    iv_zero,
+                ),
+                dtype=dtype,
+            ).reshape(-1)
 
             out = out + coeff * basis_res
 
@@ -780,25 +745,22 @@ def _build_first_order_semidiscrete_operators(
                 t,
             )
 
-            basis_jac = (
-                jnp.asarray(
-                    _dense_array(
-                        pair["basis"]["jac_bc"](
-                            u_flat,
-                            iv_basis,
-                        )
-                    ),
-                    dtype=dtype,
-                )
-                - jnp.asarray(
-                    _dense_array(
-                        pair["zero"]["jac_bc"](
-                            u_flat,
-                            iv_zero,
-                        )
-                    ),
-                    dtype=dtype,
-                )
+            basis_jac = jnp.asarray(
+                _dense_array(
+                    pair["basis"]["jac_bc"](
+                        u_flat,
+                        iv_basis,
+                    )
+                ),
+                dtype=dtype,
+            ) - jnp.asarray(
+                _dense_array(
+                    pair["zero"]["jac_bc"](
+                        u_flat,
+                        iv_zero,
+                    )
+                ),
+                dtype=dtype,
             )
 
             out = out + coeff * basis_jac
@@ -806,35 +768,18 @@ def _build_first_order_semidiscrete_operators(
         return out
 
     runtime_info = {
-        "mass_is_constant": bool(
-            len(mass_rt["temporal_tags"]) == 0
-        ),
+        "mass_is_constant": bool(len(mass_rt["temporal_tags"]) == 0),
         "residual_has_time": bool(
             len(residual_rt["temporal_tags"]) > 0
-            or any(
-                len(pair["basis"]["temporal_tags"]) > 0
-                for pair in basis_runtimes.values()
-            )
+            or any(len(pair["basis"]["temporal_tags"]) > 0 for pair in basis_runtimes.values())
         ),
         "dtype": mass_rt["dtype"],
-        "state_size": int(
-            mass_rt["size"]
-        ),
-        "mass_temporal_tags": tuple(
-            mass_rt["temporal_tags"]
-        ),
-        "residual_temporal_tags": tuple(
-            residual_rt["temporal_tags"]
-        ),
-        "runtime_parameter_names": tuple(
-            sorted(runtime_parameter_exprs.keys())
-        ),
-        "runtime_parameter_exprs": dict(
-            runtime_parameter_exprs
-        ),
-        "residual_basis_names": tuple(
-            sorted(basis_runtimes.keys())
-        ),
+        "state_size": int(mass_rt["size"]),
+        "mass_temporal_tags": tuple(mass_rt["temporal_tags"]),
+        "residual_temporal_tags": tuple(residual_rt["temporal_tags"]),
+        "runtime_parameter_names": tuple(sorted(runtime_parameter_exprs.keys())),
+        "runtime_parameter_exprs": dict(runtime_parameter_exprs),
+        "residual_basis_names": tuple(sorted(basis_runtimes.keys())),
     }
 
     return (
@@ -914,29 +859,21 @@ def _assemble_diffrax_from_strong_form(domain, expr, **kwargs) -> DiffraxBlock:
                 raise ValueError("Strong-form Diffrax lowering with state_expr=... requires state0=...")
 
             mass_expr, residual_expr = _split_first_order_strong_form(expr, state_expr, time_var)
-            rhs, mass_fn, lowered_rhs, strong_runtime = (
-                _build_first_order_strong_diffrax_runtime(
-                    domain,
-                    mass_expr=mass_expr,
-                    residual_expr=residual_expr,
-                    state_expr=state_expr,
-                    time_var=time_var,
-                    state0=state0,
-                    params=params,
-                )
+            rhs, mass_fn, lowered_rhs, strong_runtime = _build_first_order_strong_diffrax_runtime(
+                domain,
+                mass_expr=mass_expr,
+                residual_expr=residual_expr,
+                state_expr=state_expr,
+                time_var=time_var,
+                state0=state0,
+                params=params,
             )
 
-            metadata["runtime_parameter_names"] = list(
-                strong_runtime["runtime_parameter_names"]
-            )
+            metadata["runtime_parameter_names"] = list(strong_runtime["runtime_parameter_names"])
 
-            metadata["runtime_parameter_tags"] = dict(
-                strong_runtime["runtime_parameter_tags"]
-            )
+            metadata["runtime_parameter_tags"] = dict(strong_runtime["runtime_parameter_tags"])
 
-            metadata["dynamic_parameters"] = bool(
-                strong_runtime["runtime_parameter_names"]
-            )
+            metadata["dynamic_parameters"] = bool(strong_runtime["runtime_parameter_names"])
 
             import diffrax as _diffrax
 
@@ -1371,10 +1308,7 @@ def _build_first_order_strong_diffrax_runtime(
 
         ctx[time_tag] = t_arr
 
-        if (
-            time_tag != "__time__"
-            and "__time__" in domain.context
-        ):
+        if time_tag != "__time__" and "__time__" in domain.context:
             ctx["__time__"] = t_arr
 
         return ctx
@@ -1450,20 +1384,11 @@ def _build_first_order_strong_diffrax_runtime(
 
         # Scalar mass.
         if M_t.ndim == 0 or M_t.size == 1:
-            return (
-                -R_t
-                / jnp.reshape(M_t, ())
-            ).reshape(y_arr.shape)
+            return (-R_t / jnp.reshape(M_t, ())).reshape(y_arr.shape)
 
         # Diagonal or element-wise mass.
-        if (
-            M_t.shape == y_arr.shape
-            or M_t.shape == _state_to_context(y_arr).shape
-        ):
-            return (
-                -R_t
-                / M_t
-            ).reshape(y_arr.shape)
+        if M_t.shape == y_arr.shape or M_t.shape == _state_to_context(y_arr).shape:
+            return (-R_t / M_t).reshape(y_arr.shape)
 
         # Dense mass matrix.
         return jnp.linalg.solve(
@@ -1472,15 +1397,9 @@ def _build_first_order_strong_diffrax_runtime(
         ).reshape(y_arr.shape)
 
     runtime_info = {
-        "runtime_parameter_names": tuple(
-            sorted(runtime_parameter_exprs.keys())
-        ),
-        "runtime_parameter_exprs": dict(
-            runtime_parameter_exprs
-        ),
-        "runtime_parameter_tags": dict(
-            runtime_parameter_tags
-        ),
+        "runtime_parameter_names": tuple(sorted(runtime_parameter_exprs.keys())),
+        "runtime_parameter_exprs": dict(runtime_parameter_exprs),
+        "runtime_parameter_tags": dict(runtime_parameter_tags),
     }
 
     return (
@@ -1657,22 +1576,20 @@ def _build_source_vector_fn(domain, src_ir, *, size, dtype):
 
     rt = _prepare_src_runtime(domain, src_ir)
     if int(rt["size"]) != int(size):
-        raise ValueError(
-            f"Auto forcing runtime size mismatch: runtime size={rt['size']}, expected {size}."
-        )
+        raise ValueError(f"Auto forcing runtime size mismatch: runtime size={rt['size']}, expected {size}.")
 
     if len(rt["temporal_tags"]) == 0:
         iv0 = fe.InternalVars()
         const_vec = -jnp.asarray(rt["res_bc"](rt["u_zero"], iv0), dtype=dtype).reshape(-1)
+
         def source_vector_fn(t):
             del t
             return const_vec
+
         return source_vector_fn
 
     def source_vector_fn(t):
-        iv = _make_internal_vars(
-            fe, rt["temporal_tags"], t, n_cells=rt["n_cells"], dtype=rt["dtype"]
-        )
+        iv = _make_internal_vars(fe, rt["temporal_tags"], t, n_cells=rt["n_cells"], dtype=rt["dtype"])
         return -jnp.asarray(rt["res_bc"](rt["u_zero"], iv), dtype=dtype).reshape(-1)
 
     return source_vector_fn
@@ -1683,13 +1600,10 @@ def _build_auto_forcing_vector_fn(domain, src_ir, *, size, dtype):
     if src_ir is None or len(src_ir.terms) == 0:
         return None, {}, {}
 
-    static_src_ir, parameter_irs, runtime_parameter_exprs = (
-        _split_parametric_operator_ir(src_ir)
-    )
+    static_src_ir, parameter_irs, runtime_parameter_exprs = _split_parametric_operator_ir(src_ir)
     static_fn = _build_source_vector_fn(domain, static_src_ir, size=size, dtype=dtype)
     forcing_basis = {
-        name: _build_source_vector_fn(domain, basis_ir, size=size, dtype=dtype)
-        for name, basis_ir in parameter_irs.items()
+        name: _build_source_vector_fn(domain, basis_ir, size=size, dtype=dtype) for name, basis_ir in parameter_irs.items()
     }
     zero = jnp.zeros((int(size),), dtype=dtype)
 
@@ -1803,9 +1717,7 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         M_sys, _bM = _assemble_fem_system_from_ir(domain, mass_ir)
         M = _dense_array(M_sys)
 
-        static_op_ir, operator_parameter_irs, operator_parameter_exprs = (
-            _split_parametric_operator_ir(op_ir)
-        )
+        static_op_ir, operator_parameter_irs, operator_parameter_exprs = _split_parametric_operator_ir(op_ir)
         if len(static_op_ir.terms) > 0:
             A0_sys, bA0 = _assemble_fem_system_from_ir(domain, static_op_ir)
             A = _dense_array(A0_sys)
@@ -1827,6 +1739,7 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
 
         operator_fn = None
         if operator_basis:
+
             def operator_fn(t, args):
                 del t
                 A_t = A
@@ -1847,15 +1760,13 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         if forcing_vector_fn is not None:
             forcing_mode = "user_callback"
         elif len(src_ir.terms) > 0:
-            forcing_vector_fn, forcing_basis, forcing_parameter_exprs = (
-                _build_auto_forcing_vector_fn(domain, src_ir, size=M.shape[0], dtype=M.dtype)
+            forcing_vector_fn, forcing_basis, forcing_parameter_exprs = _build_auto_forcing_vector_fn(
+                domain, src_ir, size=M.shape[0], dtype=M.dtype
             )
             auto_forcing = True
             forcing_mode = "weak_auto"
 
-        combined_runtime_parameter_exprs = _merge_runtime_parameter_exprs(
-            operator_parameter_exprs, forcing_parameter_exprs
-        )
+        combined_runtime_parameter_exprs = _merge_runtime_parameter_exprs(operator_parameter_exprs, forcing_parameter_exprs)
 
         feax_problem = getattr(domain, "_feax_problem", None)
         feax_mesh = getattr(feax_problem, "mesh", None)
@@ -1876,17 +1787,36 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         metadata["dynamic_operator"] = bool(operator_fn is not None)
 
         return FeaxTimeBlock(
-            backend="feax_time", mode=mode, time_order=1, spatial_kind="weak_form",
-            ir=ir, mass_expr=mass_expr, residual_expr=residual_expr, boundary_exprs=boundary_exprs,
-            rhs=None, jacobian=None, mass=None, residual=None,
-            state0=state0, initial_conditions=initial_conditions,
-            t0=t0, t1=t1, dt=dt,
-            feax_context=getattr(domain, "_feax_context", {}), metadata=metadata,
-            M=M, A=A, operator_fn=operator_fn,
+            backend="feax_time",
+            mode=mode,
+            time_order=1,
+            spatial_kind="weak_form",
+            ir=ir,
+            mass_expr=mass_expr,
+            residual_expr=residual_expr,
+            boundary_exprs=boundary_exprs,
+            rhs=None,
+            jacobian=None,
+            mass=None,
+            residual=None,
+            state0=state0,
+            initial_conditions=initial_conditions,
+            t0=t0,
+            t1=t1,
+            dt=dt,
+            feax_context=getattr(domain, "_feax_context", {}),
+            metadata=metadata,
+            M=M,
+            A=A,
+            operator_fn=operator_fn,
             runtime_parameter_exprs=combined_runtime_parameter_exprs,
-            operator_basis=operator_basis, affine_bias=affine_bias,
-            forcing_vector_fn=forcing_vector_fn, forcing_basis=forcing_basis,
-            feax_mesh=feax_mesh, forcing_mode=forcing_mode, nonlinear_runtime={},
+            operator_basis=operator_basis,
+            affine_bias=affine_bias,
+            forcing_vector_fn=forcing_vector_fn,
+            forcing_basis=forcing_basis,
+            feax_mesh=feax_mesh,
+            forcing_mode=forcing_mode,
+            nonlinear_runtime={},
         )
 
     # ------------------------------------------------------------------

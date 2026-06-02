@@ -22,7 +22,6 @@ Deliberately unsupported for now
     k1 * k2 * weak_term
     neural_coefficient(x) * weak_term
 """
-from typing import Any
 
 import jax.numpy as jnp
 
@@ -32,11 +31,7 @@ from .solver_helper import iter_children as _iter_children
 
 def _is_runtime_scalar_parameter(node) -> bool:
     """Return True for zero-argument trainable jNO physical parameters."""
-    return (
-        isinstance(node, ModelCall)
-        and len(node.args) == 0
-        and bool(getattr(node.model, "_is_parameter", False))
-    )
+    return isinstance(node, ModelCall) and len(node.args) == 0 and bool(getattr(node.model, "_is_parameter", False))
 
 
 def _contains_runtime_parameter(node) -> bool:
@@ -44,10 +39,7 @@ def _contains_runtime_parameter(node) -> bool:
     if _is_runtime_scalar_parameter(node):
         return True
 
-    return any(
-        _contains_runtime_parameter(child)
-        for child in (_iter_children(node) or ())
-    )
+    return any(_contains_runtime_parameter(child) for child in (_iter_children(node) or ()))
 
 
 def _flatten_product(node):
@@ -91,11 +83,7 @@ def _factor_runtime_parameter_from_term(coeff):
     """
     factors = _flatten_product(coeff)
 
-    params = [
-        factor
-        for factor in factors
-        if _is_runtime_scalar_parameter(factor)
-    ]
+    params = [factor for factor in factors if _is_runtime_scalar_parameter(factor)]
 
     if len(params) == 0:
         if _contains_runtime_parameter(coeff):
@@ -109,20 +97,15 @@ def _factor_runtime_parameter_from_term(coeff):
 
     if len(params) > 1:
         raise NotImplementedError(
-            "Affine FEM runtime lowering supports one trainable scalar "
-            "coefficient per additive weak-form term."
+            "Affine FEM runtime lowering supports one trainable scalar coefficient per additive weak-form term."
         )
 
     param = params[0]
 
-    stripped = _multiply_factors(
-        [factor for factor in factors if factor is not param]
-    )
+    stripped = _multiply_factors([factor for factor in factors if factor is not param])
 
     if _contains_runtime_parameter(stripped):
-        raise NotImplementedError(
-            "Nested runtime physical parameters are not supported yet."
-        )
+        raise NotImplementedError("Nested runtime physical parameters are not supported yet.")
 
     return param, stripped
 
@@ -167,9 +150,7 @@ def _split_parametric_operator_ir(op_ir):
     parameter_exprs = {}
 
     for term in op_ir.terms:
-        param, stripped_coeff = _factor_runtime_parameter_from_term(
-            term.coeff
-        )
+        param, stripped_coeff = _factor_runtime_parameter_from_term(term.coeff)
 
         if param is None:
             static_terms.append(term)
@@ -178,25 +159,16 @@ def _split_parametric_operator_ir(op_ir):
         name = _parameter_name(param)
 
         previous = parameter_exprs.get(name)
-        if (
-            previous is not None
-            and getattr(previous, "model", None)
-            is not getattr(param, "model", None)
-        ):
+        if previous is not None and getattr(previous, "model", None) is not getattr(param, "model", None):
             raise ValueError(
                 f"Multiple runtime parameter models use the name {name!r}. "
                 "Parameter names must be unique inside one solver block."
             )
 
         parameter_exprs[name] = param
-        parameter_terms.setdefault(name, []).append(
-            _clone_term_with_coeff(term, stripped_coeff)
-        )
+        parameter_terms.setdefault(name, []).append(_clone_term_with_coeff(term, stripped_coeff))
 
-    parameter_irs = {
-        name: _make_ir(op_ir.domain, terms)
-        for name, terms in parameter_terms.items()
-    }
+    parameter_irs = {name: _make_ir(op_ir.domain, terms) for name, terms in parameter_terms.items()}
 
     return (
         _make_ir(op_ir.domain, static_terms),
@@ -233,12 +205,10 @@ def _runtime_scalar_arg(args, name: str, *, dtype):
         )
 
     if name not in args:
-        raise KeyError(
-            f"Missing runtime physical parameter {name!r}. "
-            f"Available args: {sorted(args.keys())}"
-        )
+        raise KeyError(f"Missing runtime physical parameter {name!r}. Available args: {sorted(args.keys())}")
 
     return jnp.asarray(args[name], dtype=dtype).reshape(())
+
 
 # -----------------------------------------------------------------------------
 # Strong-form runtime-parameter helpers
@@ -262,11 +232,7 @@ def _collect_runtime_parameter_exprs(node, out=None):
         name = _parameter_name(node)
         previous = out.get(name)
 
-        if (
-            previous is not None
-            and getattr(previous, "model", None)
-            is not getattr(node, "model", None)
-        ):
+        if previous is not None and getattr(previous, "model", None) is not getattr(node, "model", None):
             raise ValueError(
                 f"Multiple runtime parameter models use the name {name!r}. "
                 "Parameter names must be unique inside one solver block."
@@ -275,7 +241,7 @@ def _collect_runtime_parameter_exprs(node, out=None):
         out[name] = node
         return out
 
-    for child in (_iter_children(node) or ()):
+    for child in _iter_children(node) or ():
         _collect_runtime_parameter_exprs(child, out)
 
     return out
@@ -303,11 +269,7 @@ def _merge_runtime_parameter_exprs(*mappings):
         for name, expr in (mapping or {}).items():
             previous = merged.get(name)
 
-            if (
-                previous is not None
-                and getattr(previous, "model", None)
-                is not getattr(expr, "model", None)
-            ):
+            if previous is not None and getattr(previous, "model", None) is not getattr(expr, "model", None):
                 raise ValueError(
                     f"Multiple runtime parameter models use the name {name!r}. "
                     "Parameter names must be unique inside one solver block."
@@ -316,4 +278,3 @@ def _merge_runtime_parameter_exprs(*mappings):
             merged[name] = expr
 
     return merged
-

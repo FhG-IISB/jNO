@@ -26,9 +26,9 @@ import foundax
 import jax
 import jax.numpy as jnp
 import optax
-from jno.numpy import tracker
 
 import jno
+from jno.numpy import tracker
 
 π = jno.np.pi
 

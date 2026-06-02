@@ -19,10 +19,10 @@ from .feax_utils import (
 )
 from .parametric_helpers import (
     _contains_runtime_parameter,
+    _make_ir,
     _make_zero_ir_like,
     _runtime_scalar_arg,
     _split_parametric_operator_ir,
-    _make_ir,
 )
 from .solver_helper import contains_trialfunction as _contains_trialfunction
 
@@ -219,10 +219,7 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
 
     symmetric_bc = kwargs.get("symmetric_bc", True)
 
-    has_runtime_parameters = any(
-        _contains_runtime_parameter(term.coeff)
-        for term in ir.terms
-    )
+    has_runtime_parameters = any(_contains_runtime_parameter(term.coeff) for term in ir.terms)
 
     # ------------------------------------------------------------
     # Original parameter-free route
@@ -267,15 +264,10 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
     # ------------------------------------------------------------
     # Parameter-aware affine route
     # ------------------------------------------------------------
-    static_ir, parameter_irs, runtime_parameter_exprs = (
-        _split_parametric_operator_ir(ir)
-    )
+    static_ir, parameter_irs, runtime_parameter_exprs = _split_parametric_operator_ir(ir)
 
     if len(parameter_irs) == 0:
-        raise RuntimeError(
-            "Runtime parameters were detected, but no affine FEM basis terms "
-            "were generated."
-        )
+        raise RuntimeError("Runtime parameters were detected, but no affine FEM basis terms were generated.")
 
     # If all physical terms are parameter-dependent, create a structural zero
     # contribution so the static runtime still imposes Dirichlet conditions.
@@ -325,15 +317,10 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
         zero_rt = pair["zero"]
 
         if rt["jac_bc"] is None or zero_rt["jac_bc"] is None:
-            raise ValueError(
-                f"FEM residual basis {name!r} did not produce a Jacobian."
-            )
+            raise ValueError(f"FEM residual basis {name!r} did not produce a Jacobian.")
 
         if int(rt["size"]) != int(static_rt["size"]):
-            raise ValueError(
-                f"FEM residual basis {name!r} has size {rt['size']}, "
-                f"expected {static_rt['size']}."
-            )
+            raise ValueError(f"FEM residual basis {name!r} has size {rt['size']}, expected {static_rt['size']}.")
 
     dtype = static_rt["dtype"]
     size = int(static_rt["size"])
@@ -354,22 +341,19 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
                 dtype=dtype,
             )
 
-            basis_res = (
-                jnp.asarray(
-                    pair["basis"]["res_bc"](
-                        u_flat,
-                        internal_vars,
-                    ),
-                    dtype=dtype,
-                ).reshape(-1)
-                - jnp.asarray(
-                    pair["zero"]["res_bc"](
-                        u_flat,
-                        internal_vars,
-                    ),
-                    dtype=dtype,
-                ).reshape(-1)
-            )
+            basis_res = jnp.asarray(
+                pair["basis"]["res_bc"](
+                    u_flat,
+                    internal_vars,
+                ),
+                dtype=dtype,
+            ).reshape(-1) - jnp.asarray(
+                pair["zero"]["res_bc"](
+                    u_flat,
+                    internal_vars,
+                ),
+                dtype=dtype,
+            ).reshape(-1)
 
             out = out + coeff * basis_res
 
@@ -384,11 +368,29 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
         )
 
         for name, pair in basis_runtimes.items():
-            coeff = _runtime_scalar_arg(args, name, dtype=dtype, )
+            coeff = _runtime_scalar_arg(
+                args,
+                name,
+                dtype=dtype,
+            )
 
-            basis_jac = (
-                jnp.asarray(_dense_array(pair["basis"]["jac_bc"](  u_flat, internal_vars, ) ), dtype=dtype, )
-                - jnp.asarray(_dense_array(pair["zero"]["jac_bc"]( u_flat, internal_vars,  ) ),dtype=dtype, ))
+            basis_jac = jnp.asarray(
+                _dense_array(
+                    pair["basis"]["jac_bc"](
+                        u_flat,
+                        internal_vars,
+                    )
+                ),
+                dtype=dtype,
+            ) - jnp.asarray(
+                _dense_array(
+                    pair["zero"]["jac_bc"](
+                        u_flat,
+                        internal_vars,
+                    )
+                ),
+                dtype=dtype,
+            )
 
             out = out + coeff * basis_jac
 
@@ -406,8 +408,6 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
             "lowering": "R(u,args) = R0(u) + sum_i args[name_i] * R_i(u)",
         },
     )
-
-
 
 
 def _split_trial_and_load_ir(ir):
@@ -503,9 +503,7 @@ def _assemble_fem_system_concrete(
     if hasattr(A, "__matmul__"):
         b = A @ u0 - r0
     else:
-        A_dense = jnp.asarray(
-            A.todense() if hasattr(A, "todense") else A.toarray()
-        )
+        A_dense = jnp.asarray(A.todense() if hasattr(A, "todense") else A.toarray())
         b = A_dense @ u0 - r0
         A = A_dense
 
@@ -516,10 +514,7 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
     """Assemble ``A(args) u = b(args)`` for affine runtime weak-form terms."""
     symmetric_bc = kwargs.get("symmetric_bc", True)
 
-    has_runtime_parameters = any(
-        _contains_runtime_parameter(term.coeff)
-        for term in ir.terms
-    )
+    has_runtime_parameters = any(_contains_runtime_parameter(term.coeff) for term in ir.terms)
 
     if not has_runtime_parameters:
         return _assemble_fem_system_concrete(
@@ -529,9 +524,7 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
             symmetric_bc=symmetric_bc,
         )
 
-    static_ir, parameter_irs, runtime_parameter_exprs = (
-        _split_parametric_operator_ir(ir)
-    )
+    static_ir, parameter_irs, runtime_parameter_exprs = _split_parametric_operator_ir(ir)
 
     operator_basis = {}
     rhs_basis = {}
@@ -557,9 +550,7 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
             operator_basis[name] = K
 
         if len(rhs_basis_ir.terms) > 0:
-            rhs_vec = _assemble_static_source_vector_from_ir(
-                domain, rhs_basis_ir, dtype=_default_float_dtype()
-            )
+            rhs_vec = _assemble_static_source_vector_from_ir(domain, rhs_basis_ir, dtype=_default_float_dtype())
             if rhs_vec is not None:
                 rhs_basis[name] = jnp.asarray(rhs_vec)
 
@@ -572,19 +563,17 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
                 break
         if structural_op_ir is None:
             raise ValueError(
-                "A static fem_system requires at least one operator term. "
-                "Only runtime source/load terms were found."
+                "A static fem_system requires at least one operator term. Only runtime source/load terms were found."
             )
         static_ir = _make_zero_ir_like(structural_op_ir)
 
-    A0, b0 = _assemble_fem_system_concrete(
-        domain, static_ir, apply_dirichlet=True, symmetric_bc=symmetric_bc
-    )
+    A0, b0 = _assemble_fem_system_concrete(domain, static_ir, apply_dirichlet=True, symmetric_bc=symmetric_bc)
     A0 = jnp.asarray(_dense_array(A0))
     b0 = jnp.asarray(b0, dtype=A0.dtype).reshape(-1)
 
     operator_fn = None
     if operator_basis:
+
         def operator_fn(args=None):
             A = A0
             for name, K in operator_basis.items():
@@ -594,6 +583,7 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
 
     rhs_fn = None
     if rhs_basis:
+
         def rhs_fn(args=None):
             b = b0
             for name, f_vec in rhs_basis.items():
@@ -615,10 +605,6 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
             "runtime_parameter_names": sorted(runtime_parameter_exprs),
             "operator_parameter_names": sorted(operator_basis),
             "rhs_parameter_names": sorted(rhs_basis),
-            "lowering": (
-                "A(args) = A0 + sum_i args[name_i] * K_i; "
-                "b(args) = b0 + sum_j args[name_j] * f_j"
-            ),
+            "lowering": ("A(args) = A0 + sum_i args[name_i] * K_i; b(args) = b0 + sum_j args[name_j] * f_j"),
         },
     )
-
