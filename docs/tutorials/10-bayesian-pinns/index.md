@@ -1,10 +1,17 @@
 # Bayesian PINNs
 
-Six worked examples of Bayesian Physics-Informed Neural Networks
+Seven worked examples of Bayesian Physics-Informed Neural Networks
 (B-PINNs) in jNO.  Every tutorial drives training through
 `crux.solve()` and uses jNO's per-parameter `.bayesian(...)`
 configurator to attach a blackjax kernel to scalar PDE coefficients,
 model weights, or inverted inputs.
+
+Two tutorials demonstrate training an **entire MLP via Bayesian
+sampling** (no optax): [Tutorial 01](./forward-noisy-poisson-1d.md)
+treats the MLP as a *PINN* with a PDE residual constraint;
+[Tutorial 07](./bnn-regression.md) treats it as a pure *regressor*
+with only a data-fit constraint — same `.bayesian()` plumbing, no PDE
+machinery.
 
 All chains are built on the [blackjax MCMC
 library](https://github.com/blackjax-devs/blackjax) — NUTS, HMC,
@@ -22,6 +29,7 @@ reference for the `.bayesian()` integration live in
 | 04 | [`inverse_ode_decay`](./inverse-ode-decay.md) | First-order decay ODE `du/dt = -k u`; recovers `k` from noisy observations using the closed-form `exp(-kt)` — no surrogate, fixed-target posterior. | Linka et al. 2022 |
 | 05 | [`inverse_surrogate_uncertainty`](./inverse-surrogate-uncertainty.md) | Forward-then-freeze: train a PINN surrogate of `sin(πx)`, then NUTS samples the **inverted input** `x_query` given a noisy observation — calibrated uncertainty on the inverse output. | — |
 | 06 | [`inverse_fem_diffusivity`](./inverse-fem-diffusivity.md) | Bayesian inference with jNO's **FEM solver** as the differentiable forward: recover the scalar diffusivity `α` in `-α Δu = f` from noisy nodal observations.  Pattern for any numerical (non-closed-form) forward. | — |
+| 07 | [`bnn_regression`](./bnn-regression.md) | **Full BNN regression, no PDE.**  SGLD over MLP weights against a 32-point gapped training set of `sin³(6x)`; predictive band widens ~2.6× in the data gap.  Canonical "uncertainty grows where data don't constrain" demonstration. | Yang et al. 2021 §3.1 |
 
 ## When to use a neural surrogate (and when not to)
 
