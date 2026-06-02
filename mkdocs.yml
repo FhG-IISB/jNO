@@ -148,3 +148,5 @@ nav:
       - Inverse Multi-Coefficient: tutorials/10-bayesian-pinns/inverse-multi-coefficient.md
       - Inverse Reaction Coefficient: tutorials/10-bayesian-pinns/inverse-reaction-coefficient.md
       - Inverse ODE Decay: tutorials/10-bayesian-pinns/inverse-ode-decay.md
+      - Inverse Surrogate w/ Uncertainty: tutorials/10-bayesian-pinns/inverse-surrogate-uncertainty.md
+      - Inverse FEM Diffusivity: tutorials/10-bayesian-pinns/inverse-fem-diffusivity.md
