@@ -1054,9 +1054,22 @@ def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_do
         location_fns.append(loc_fn)
         surface_kernels.append(_make_universal_surface_kernel(domain, expr, tag, value_shape, temporal_tags))
 
-    volume_kernel = None
+    # FEAX always evaluates the volume kernel before adding optional surface
+    # contributions. A boundary-only source, such as a pure Neumann load,
+    # therefore still needs a valid zero-valued volume kernel.
     if volume_expr is not None:
-        volume_kernel = _make_universal_volume_kernel(domain, volume_expr, value_shape, temporal_tags, problem_ref)
+        volume_kernel = _make_universal_volume_kernel(  domain, volume_expr,  value_shape, temporal_tags, problem_ref,)
+    else:
+        def volume_kernel(
+            cell_sol_flat,  physical_quad_points,cell_shape_grads, cell_JxW,  cell_v_grads_JxW,  *cell_internal_vars,):
+            del ( physical_quad_points, cell_shape_grads, cell_JxW, cell_v_grads_JxW,  cell_internal_vars, )
+
+            # FEAX expects one local residual vector per cell. For a
+            # boundary-only weak form, the volume contribution is identically
+            # zero and the actual load is assembled by the surface kernels.
+            return jnp.zeros_like(
+                jnp.asarray(cell_sol_flat)
+            )
 
     class GeneratedProblem(fe.Problem):
         def get_universal_kernel(self_inner):

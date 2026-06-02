@@ -22,6 +22,7 @@ from .parametric_helpers import (
     _make_zero_ir_like,
     _runtime_scalar_arg,
     _split_parametric_operator_ir,
+    _make_ir,
 )
 from .solver_helper import contains_trialfunction as _contains_trialfunction
 
@@ -407,6 +408,49 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
     )
 
 
+
+
+def _split_trial_and_load_ir(ir):
+    """Split one lowered FEM IR into operator and source/load terms."""
+    operator_terms = []
+    load_terms = []
+
+    for term in ir.terms:
+        if _contains_trialfunction(term.coeff):
+            operator_terms.append(term)
+        else:
+            load_terms.append(term)
+
+    return (
+        _make_ir(ir.domain, operator_terms),
+        _make_ir(ir.domain, load_terms),
+    )
+
+
+def _assemble_static_source_vector_from_ir(domain, src_ir, *, dtype):
+    """Assemble a steady volume-source or Neumann-load vector."""
+    import feax as fe
+
+    if src_ir is None or len(src_ir.terms) == 0:
+        return None
+
+    rt = _prepare_feax_runtime(
+        domain,
+        src_ir,
+        apply_dirichlet=False,
+        need_jacobian=False,
+        symmetric_bc=True,
+    )
+
+    u_zero = jnp.zeros((rt["size"],), dtype=rt["dtype"])
+    iv = fe.InternalVars()
+
+    return -jnp.asarray(
+        rt["res_bc"](u_zero, iv),
+        dtype=dtype,
+    ).reshape(-1)
+
+
 def _assemble_fem_system_concrete(
     domain,
     ir,
@@ -469,34 +513,7 @@ def _assemble_fem_system_concrete(
 
 
 def _assemble_fem_system_from_ir(domain, ir, **kwargs):
-    """
-    Assemble a steady linear FEM system from lowered weak-form IR.
-
-    Parameter-free route
-    --------------------
-    Returns the existing tuple:
-
-        A, b
-
-    Parameter-aware affine route
-    ----------------------------
-    Returns a ``FemLinearSystem`` block representing:
-
-        A(args) = A0 + sum_i args[name_i] * K_i
-        b(args) = b0
-
-    The external solve remains user controlled:
-
-        system = weak.assemble(target="fem_system")
-        A, b = system.evaluate(args={"k": k_value})
-        u = jnp.linalg.solve(A, b)
-
-    Supported runtime pattern:
-        parameter * operator_term
-
-    Runtime parameters in source/load terms are intentionally rejected in this
-    first static-linear stage.
-    """
+    """Assemble ``A(args) u = b(args)`` for affine runtime weak-form terms."""
     symmetric_bc = kwargs.get("symmetric_bc", True)
 
     has_runtime_parameters = any(
@@ -504,7 +521,6 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
         for term in ir.terms
     )
 
-    # Preserve the old API for ordinary static systems.
     if not has_runtime_parameters:
         return _assemble_fem_system_concrete(
             domain,
@@ -517,91 +533,92 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
         _split_parametric_operator_ir(ir)
     )
 
-    if len(parameter_irs) == 0:
-        raise RuntimeError(
-            "Runtime parameters were detected, but no affine FEM basis terms "
-            "were generated."
-        )
-
     operator_basis = {}
+    rhs_basis = {}
 
     for name, basis_ir in parameter_irs.items():
-        # Stage 1 supports parameters multiplying operator terms only.
-        if any(
-            not _contains_trialfunction(term.coeff)
-            for term in basis_ir.terms
-        ):
-            raise NotImplementedError(
-                "Static parametric fem_system currently supports runtime "
-                "parameters in operator terms only. Parameter-dependent "
-                "source/load terms will be added separately."
+        op_basis_ir, rhs_basis_ir = _split_trial_and_load_ir(basis_ir)
+
+        if len(op_basis_ir.terms) > 0:
+            zero_basis_ir = _make_zero_ir_like(op_basis_ir)
+            K_bc, bK_bc = _assemble_fem_system_concrete(
+                domain, op_basis_ir, apply_dirichlet=True, symmetric_bc=symmetric_bc
             )
-        zero_basis_ir = _make_zero_ir_like(basis_ir)
-        K_bc, bK_bc = _assemble_fem_system_concrete(
-            domain,
-            basis_ir,
-            apply_dirichlet=True,
-            symmetric_bc=symmetric_bc,
-        )
-        K_zero_bc, bK_zero_bc = _assemble_fem_system_concrete(
-            domain,
-            zero_basis_ir,
-            apply_dirichlet=True,
-            symmetric_bc=symmetric_bc,
-        )
-
-        K = (
-            jnp.asarray(_dense_array(K_bc))
-            - jnp.asarray(_dense_array(K_zero_bc))
-        )
-
-        bK = (
-            jnp.asarray(bK_bc).reshape(-1)
-            - jnp.asarray(bK_zero_bc).reshape(-1)
-        )
-
-        if not np.allclose(np.asarray(bK), 0.0, atol=1.0e-8):
-            raise NotImplementedError(
-                "A parameter basis produced a non-zero RHS contribution. "
-                "Stage 1 supports affine operator coefficients only."
+            K_zero_bc, bK_zero_bc = _assemble_fem_system_concrete(
+                domain, zero_basis_ir, apply_dirichlet=True, symmetric_bc=symmetric_bc
             )
+            K = jnp.asarray(_dense_array(K_bc)) - jnp.asarray(_dense_array(K_zero_bc))
+            bK = jnp.asarray(bK_bc).reshape(-1) - jnp.asarray(bK_zero_bc).reshape(-1)
+            if not np.allclose(np.asarray(bK), 0.0, atol=1.0e-8):
+                raise NotImplementedError(
+                    "A runtime operator basis produced a non-zero RHS contribution. "
+                    "Runtime Dirichlet parameters are not supported yet."
+                )
+            operator_basis[name] = K
 
-        operator_basis[name] = jnp.asarray(K)
+        if len(rhs_basis_ir.terms) > 0:
+            rhs_vec = _assemble_static_source_vector_from_ir(
+                domain, rhs_basis_ir, dtype=_default_float_dtype()
+            )
+            if rhs_vec is not None:
+                rhs_basis[name] = jnp.asarray(rhs_vec)
 
-    # The static contribution applies Dirichlet enforcement exactly once.
     if len(static_ir.terms) == 0:
-        first_basis_ir = next(iter(parameter_irs.values()))
-        static_ir = _make_zero_ir_like(first_basis_ir)
+        structural_op_ir = None
+        for basis_ir in parameter_irs.values():
+            op_basis_ir, _ = _split_trial_and_load_ir(basis_ir)
+            if len(op_basis_ir.terms) > 0:
+                structural_op_ir = op_basis_ir
+                break
+        if structural_op_ir is None:
+            raise ValueError(
+                "A static fem_system requires at least one operator term. "
+                "Only runtime source/load terms were found."
+            )
+        static_ir = _make_zero_ir_like(structural_op_ir)
 
     A0, b0 = _assemble_fem_system_concrete(
-        domain,
-        static_ir,
-        apply_dirichlet=True,
-        symmetric_bc=symmetric_bc,
+        domain, static_ir, apply_dirichlet=True, symmetric_bc=symmetric_bc
     )
-
     A0 = jnp.asarray(_dense_array(A0))
     b0 = jnp.asarray(b0, dtype=A0.dtype).reshape(-1)
 
-    def operator_fn(args=None):
-        A = A0
+    operator_fn = None
+    if operator_basis:
+        def operator_fn(args=None):
+            A = A0
+            for name, K in operator_basis.items():
+                coeff = _runtime_scalar_arg(args, name, dtype=A0.dtype)
+                A = A + coeff * jnp.asarray(K, dtype=A0.dtype)
+            return A
 
-        for name, K in operator_basis.items():
-            coeff = _runtime_scalar_arg(args, name, dtype=A0.dtype)
-            A = A + coeff * jnp.asarray(K, dtype=A0.dtype)
-
-        return A
+    rhs_fn = None
+    if rhs_basis:
+        def rhs_fn(args=None):
+            b = b0
+            for name, f_vec in rhs_basis.items():
+                coeff = _runtime_scalar_arg(args, name, dtype=A0.dtype)
+                b = b + coeff * jnp.asarray(f_vec, dtype=A0.dtype)
+            return b
 
     return FemLinearSystem(
         A=A0,
         b=b0,
         operator_fn=operator_fn,
-        rhs_fn=None,
+        rhs_fn=rhs_fn,
         runtime_parameter_exprs=runtime_parameter_exprs,
         operator_basis=operator_basis,
+        rhs_basis=rhs_basis,
         metadata={
-            "dynamic_operator": True,
+            "dynamic_operator": bool(operator_basis),
+            "dynamic_rhs": bool(rhs_basis),
             "runtime_parameter_names": sorted(runtime_parameter_exprs),
-            "lowering": "A(args) = A0 + sum_i args[name_i] * K_i",
+            "operator_parameter_names": sorted(operator_basis),
+            "rhs_parameter_names": sorted(rhs_basis),
+            "lowering": (
+                "A(args) = A0 + sum_i args[name_i] * K_i; "
+                "b(args) = b0 + sum_j args[name_j] * f_j"
+            ),
         },
     )
+

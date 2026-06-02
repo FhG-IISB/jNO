@@ -352,6 +352,9 @@ class FeaxTimeBlock:
     operator_basis: Dict[str, Any] = field(default_factory=dict)
     affine_bias: Any = None
     forcing_vector_fn: Optional[Callable] = None
+    # Optional affine source/load basis callbacks:
+    #     forcing_basis[name](t) -> vector
+    forcing_basis: Dict[str, Callable] = field(default_factory=dict)
 
     # optional mesh / hints
     feax_mesh: Any = None
