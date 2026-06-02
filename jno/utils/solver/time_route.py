@@ -1271,7 +1271,7 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         Splits the IR into mass, operator, and source parts and returns a block
         representing:
 
-            M u_dot + A u = affine_bias + forcing_vector_fn(t)
+            M u_dot + A(t, args) u = affine_bias + forcing_vector_fn(t, args)
 
     Nonlinear path:
         Builds FEAX/JAX runtime callables and returns a block representing:
@@ -1367,6 +1367,7 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             feax_mesh = _build_feax_mesh(domain, element_type)
 
         forcing_vector_fn = kwargs.get("forcing_vector_fn", None)
+        operator_fn = kwargs.get("operator_fn", None)
         auto_forcing = False
         forcing_mode = "none"
 
@@ -1392,6 +1393,7 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         )
         metadata["linear_inferred"] = "linear" not in kwargs
         metadata["linear_path_selected"] = bool(use_linear_path)
+        metadata["dynamic_operator"] = bool(operator_fn is not None)
 
         if auto_forcing:
             metadata["notes"] = (
@@ -1433,6 +1435,7 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             metadata=metadata,
             M=M,
             A=A,
+            operator_fn=operator_fn,
             affine_bias=affine_bias,
             forcing_vector_fn=forcing_vector_fn,
             feax_mesh=feax_mesh,
