@@ -64,6 +64,7 @@ from .parametric_helpers import (
     _runtime_parameter_tag,
     _runtime_scalar_arg,
     _split_parametric_operator_ir,
+    _merge_runtime_parameter_exprs,
 )
 
 # -----------------------------------------------------------------------------
@@ -1647,7 +1648,8 @@ def _prepare_src_runtime(domain, src_ir):
     return rt
 
 
-def _build_auto_forcing_vector_fn(domain, src_ir, *, size, dtype):
+def _build_source_vector_fn(domain, src_ir, *, size, dtype):
+    """Build one transient volume-source or Neumann-load vector callback."""
     import feax as fe
 
     if src_ir is None or len(src_ir.terms) == 0:
@@ -1655,28 +1657,50 @@ def _build_auto_forcing_vector_fn(domain, src_ir, *, size, dtype):
 
     rt = _prepare_src_runtime(domain, src_ir)
     if int(rt["size"]) != int(size):
-        raise ValueError(f"Auto forcing runtime size mismatch: runtime size={rt['size']}, expected {size}.")
+        raise ValueError(
+            f"Auto forcing runtime size mismatch: runtime size={rt['size']}, expected {size}."
+        )
 
     if len(rt["temporal_tags"]) == 0:
         iv0 = fe.InternalVars()
         const_vec = -jnp.asarray(rt["res_bc"](rt["u_zero"], iv0), dtype=dtype).reshape(-1)
-
-        def forcing_vector_fn(t, args=None):
+        def source_vector_fn(t):
+            del t
             return const_vec
+        return source_vector_fn
 
-        return forcing_vector_fn
-
-    def forcing_vector_fn(t, args=None):
+    def source_vector_fn(t):
         iv = _make_internal_vars(
-            fe,
-            rt["temporal_tags"],
-            t,
-            n_cells=rt["n_cells"],
-            dtype=rt["dtype"],
+            fe, rt["temporal_tags"], t, n_cells=rt["n_cells"], dtype=rt["dtype"]
         )
         return -jnp.asarray(rt["res_bc"](rt["u_zero"], iv), dtype=dtype).reshape(-1)
 
-    return forcing_vector_fn
+    return source_vector_fn
+
+
+def _build_auto_forcing_vector_fn(domain, src_ir, *, size, dtype):
+    """Build ``f(t,args) = f0(t) + sum_i args[name_i] * f_i(t)``."""
+    if src_ir is None or len(src_ir.terms) == 0:
+        return None, {}, {}
+
+    static_src_ir, parameter_irs, runtime_parameter_exprs = (
+        _split_parametric_operator_ir(src_ir)
+    )
+    static_fn = _build_source_vector_fn(domain, static_src_ir, size=size, dtype=dtype)
+    forcing_basis = {
+        name: _build_source_vector_fn(domain, basis_ir, size=size, dtype=dtype)
+        for name, basis_ir in parameter_irs.items()
+    }
+    zero = jnp.zeros((int(size),), dtype=dtype)
+
+    def forcing_vector_fn(t, args=None):
+        out = zero if static_fn is None else static_fn(t)
+        for name, basis_fn in forcing_basis.items():
+            coeff = _runtime_scalar_arg(args, name, dtype=dtype)
+            out = out + coeff * basis_fn(t)
+        return out
+
+    return forcing_vector_fn, forcing_basis, runtime_parameter_exprs
 
 
 def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
@@ -1771,201 +1795,98 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         from .fem_route import _assemble_fem_system_from_ir
 
         mass_ir, op_ir, src_ir = _split_first_order_linear_terms(ir)
-
         if len(mass_ir.terms) == 0:
-            raise ValueError("Linear semidiscrete path could not extract a mass term. Expected something like u_t * phi.")
+            raise ValueError("Expected a mass term such as `u_t * phi`.")
+        if any(_contains_runtime_parameter(term.coeff) for term in mass_ir.terms):
+            raise NotImplementedError("Runtime parameters inside transient mass terms are not supported yet.")
 
-        # Runtime parameters in the mass or forcing term are deliberately rejected
-        # in Phase 1. The heat inverse example only needs A(nu) = nu * K.
-        for label, ir_part in (
-            ("mass", mass_ir),
-            ("source", src_ir),
-        ):
-            if any(
-                _contains_runtime_parameter(term.coeff)
-                for term in ir_part.terms
-            ):
-                raise NotImplementedError(
-                    f"Runtime trainable parameters inside the {label} terms are "
-                    "not supported yet. Phase-1 supports affine operator "
-                    "coefficients such as `nu * grad(u) * grad(phi)`."
-                )
-
-        M_sys, bM = _assemble_fem_system_from_ir(domain, mass_ir)
+        M_sys, _bM = _assemble_fem_system_from_ir(domain, mass_ir)
         M = _dense_array(M_sys)
 
-        static_op_ir, parameter_irs, runtime_parameter_exprs = (
+        static_op_ir, operator_parameter_irs, operator_parameter_exprs = (
             _split_parametric_operator_ir(op_ir)
         )
-
-        # Static operator part A0
         if len(static_op_ir.terms) > 0:
-            A0_sys, bA0 = _assemble_fem_system_from_ir(
-                domain,
-                static_op_ir,
-            )
+            A0_sys, bA0 = _assemble_fem_system_from_ir(domain, static_op_ir)
             A = _dense_array(A0_sys)
             affine_bias = jnp.asarray(bA0).reshape(-1)
         else:
             A = jnp.zeros_like(M)
-            affine_bias = jnp.zeros(
-                (M.shape[0],),
-                dtype=M.dtype,
-            )
+            affine_bias = jnp.zeros((M.shape[0],), dtype=M.dtype)
 
-        # Parameter-dependent basis matrices:
-        #     A(args) = A0 + sum_i args[name_i] * K_i
         operator_basis = {}
-
-        for name, basis_ir in parameter_irs.items():
-            K_sys, bK = _assemble_fem_system_from_ir(
-                domain,
-                basis_ir,
-            )
-
-            K = _dense_array(K_sys)
-            bK = jnp.asarray(bK).reshape(-1)
-
-            # Homogeneous Dirichlet heat example satisfies this.
-            # Non-zero parameter-dependent affine BC contributions can be added later.
-            if not np.allclose(
-                np.asarray(bK),
-                0.0,
-                atol=1.0e-8,
-            ):
-                raise NotImplementedError(
-                    "Parameter-dependent affine boundary/load contributions are "
-                    "not supported yet. Use homogeneous Dirichlet data for the "
-                    "Phase-1 heat inverse example."
-                )
-
+        for name, basis_ir in operator_parameter_irs.items():
+            zero_basis_ir = _make_zero_ir_like(basis_ir)
+            K_bc, bK_bc = _assemble_fem_system_from_ir(domain, basis_ir)
+            K_zero_bc, bK_zero_bc = _assemble_fem_system_from_ir(domain, zero_basis_ir)
+            K = jnp.asarray(_dense_array(K_bc)) - jnp.asarray(_dense_array(K_zero_bc))
+            bK = jnp.asarray(bK_bc).reshape(-1) - jnp.asarray(bK_zero_bc).reshape(-1)
+            if not np.allclose(np.asarray(bK), 0.0, atol=1.0e-8):
+                raise NotImplementedError("Runtime Dirichlet parameters are not supported yet.")
             operator_basis[name] = K
 
         operator_fn = None
-
         if operator_basis:
-
             def operator_fn(t, args):
                 del t
-
-                if args is None:
-                    raise ValueError(
-                        "This FeaxTimeBlock has trainable runtime operator "
-                        "parameters. Pass them to Diffrax through `args={...}`."
-                    )
-
                 A_t = A
-
                 for name, K in operator_basis.items():
-                    if name not in args:
-                        raise KeyError(
-                            f"Missing runtime operator parameter {name!r}. "
-                            f"Available args: {sorted(args.keys())}"
-                        )
-
-                    coeff = jnp.asarray(
-                        args[name],
-                        dtype=A.dtype,
-                    ).reshape(())
-
-                    A_t = A_t + coeff * K
-
+                    coeff = _runtime_scalar_arg(args, name, dtype=A.dtype)
+                    A_t = A_t + coeff * jnp.asarray(K, dtype=A.dtype)
                 return A_t
 
-        feax_problem = getattr(domain, "_feax_problem", None)
-        feax_mesh = getattr(feax_problem, "mesh", None)
-
-        if feax_mesh is None:
-            element_type = getattr(domain, "_fem_element_type", "TRI3")
-            feax_mesh = _build_feax_mesh(domain, element_type)
-
-        forcing_vector_fn = kwargs.get("forcing_vector_fn", None)
-        # Preserve the automatically generated operator_fn.
-        # Only replace it when the user explicitly supplies a non-None override.
         user_operator_fn = kwargs.get("operator_fn", None)
-
         if user_operator_fn is not None:
             operator_fn = user_operator_fn
 
+        forcing_vector_fn = kwargs.get("forcing_vector_fn", None)
+        forcing_basis = {}
+        forcing_parameter_exprs = {}
         auto_forcing = False
         forcing_mode = "none"
-
         if forcing_vector_fn is not None:
             forcing_mode = "user_callback"
         elif len(src_ir.terms) > 0:
-            forcing_vector_fn = _build_auto_forcing_vector_fn(
-                domain,
-                src_ir,
-                size=M.shape[0],
-                dtype=M.dtype,
+            forcing_vector_fn, forcing_basis, forcing_parameter_exprs = (
+                _build_auto_forcing_vector_fn(domain, src_ir, size=M.shape[0], dtype=M.dtype)
             )
             auto_forcing = True
             forcing_mode = "weak_auto"
+
+        combined_runtime_parameter_exprs = _merge_runtime_parameter_exprs(
+            operator_parameter_exprs, forcing_parameter_exprs
+        )
+
+        feax_problem = getattr(domain, "_feax_problem", None)
+        feax_mesh = getattr(feax_problem, "mesh", None)
+        if feax_mesh is None:
+            feax_mesh = _build_feax_mesh(domain, getattr(domain, "_fem_element_type", "TRI3"))
 
         metadata["phase"] = "phase_2_linear_jax"
         metadata["lowering_complete"] = True
         metadata["forcing_terms"] = int(len(src_ir.terms))
         metadata["forcing_temporal_tags"] = _ir_temporal_tags(src_ir)
         metadata["auto_forcing"] = bool(auto_forcing)
-        metadata["forcing_mode"] = (
-            "weak_auto" if auto_forcing else ("user_callback" if forcing_vector_fn is not None else "none")
-        )
+        metadata["forcing_mode"] = forcing_mode
         metadata["linear_inferred"] = "linear" not in kwargs
         metadata["linear_path_selected"] = bool(use_linear_path)
-        metadata["runtime_parameter_names"] = sorted(
-                runtime_parameter_exprs.keys()
-            )
-
+        metadata["runtime_parameter_names"] = sorted(combined_runtime_parameter_exprs)
+        metadata["operator_parameter_names"] = sorted(operator_parameter_exprs)
+        metadata["forcing_parameter_names"] = sorted(forcing_parameter_exprs)
         metadata["dynamic_operator"] = bool(operator_fn is not None)
 
-        if auto_forcing:
-            metadata["notes"] = (
-                "Linear semidiscrete JAX FEAX block assembled. "
-                "M, A, affine_bias, and forcing_vector_fn are populated for external solvers. "
-                "Forcing was auto-lowered from non-trial weak-form terms."
-            )
-        elif forcing_vector_fn is not None:
-            metadata["notes"] = (
-                "Linear semidiscrete JAX FEAX block assembled. "
-                "M, A, affine_bias, and forcing_vector_fn are populated for external solvers. "
-                "Forcing uses the user-supplied callback."
-            )
-        else:
-            metadata["notes"] = (
-                "Linear semidiscrete JAX FEAX block assembled. "
-                "M, A, affine_bias, and forcing_vector_fn are populated for external solvers."
-            )
-
         return FeaxTimeBlock(
-            backend="feax_time",
-            mode=mode,
-            time_order=1,
-            spatial_kind="weak_form",
-            ir=ir,
-            mass_expr=mass_expr,
-            residual_expr=residual_expr,
-            boundary_exprs=boundary_exprs,
-            rhs=None,
-            jacobian=None,
-            mass=None,
-            residual=None,
-            state0=state0,
-            initial_conditions=initial_conditions,
-            t0=t0,
-            t1=t1,
-            dt=dt,
-            feax_context=getattr(domain, "_feax_context", {}),
-            metadata=metadata,
-            M=M,
-            A=A,
-            operator_fn=operator_fn,
-            runtime_parameter_exprs=runtime_parameter_exprs,
-            operator_basis=operator_basis,
-            affine_bias=affine_bias,
-            forcing_vector_fn=forcing_vector_fn,
-            feax_mesh=feax_mesh,
-            forcing_mode=forcing_mode,
-            nonlinear_runtime={},
+            backend="feax_time", mode=mode, time_order=1, spatial_kind="weak_form",
+            ir=ir, mass_expr=mass_expr, residual_expr=residual_expr, boundary_exprs=boundary_exprs,
+            rhs=None, jacobian=None, mass=None, residual=None,
+            state0=state0, initial_conditions=initial_conditions,
+            t0=t0, t1=t1, dt=dt,
+            feax_context=getattr(domain, "_feax_context", {}), metadata=metadata,
+            M=M, A=A, operator_fn=operator_fn,
+            runtime_parameter_exprs=combined_runtime_parameter_exprs,
+            operator_basis=operator_basis, affine_bias=affine_bias,
+            forcing_vector_fn=forcing_vector_fn, forcing_basis=forcing_basis,
+            feax_mesh=feax_mesh, forcing_mode=forcing_mode, nonlinear_runtime={},
         )
 
     # ------------------------------------------------------------------

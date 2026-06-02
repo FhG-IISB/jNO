@@ -2078,15 +2078,7 @@ class Noise(Placeholder):
 
 
 class FemLinearSystem:
-    """Container for a steady linear FEM system ``A(args) x = b(args)``.
-
-    Ordinary parameter-free systems keep the existing unpacking behaviour:
-
-        A, b = system
-
-    Parameter-aware systems expose ``evaluate(args=...)`` so the user can
-    choose an external solver without losing the runtime parameter dependency.
-    """
+    """Container for a steady linear FEM system ``A(args) x = b(args)``."""
 
     def __init__(
         self,
@@ -2124,20 +2116,17 @@ class FemLinearSystem:
                 "This FEM system depends on runtime parameters. "
                 "Call system.evaluate(args={...}) before unpacking."
             )
-
         yield self.A
         yield self.b
 
     def __add__(self, other):
         if not isinstance(other, FemLinearSystem):
             return NotImplemented
-
         if self.is_parametric or other.is_parametric:
             raise TypeError(
                 "Addition of parameter-aware FemLinearSystem blocks is not "
-                "implemented yet. Combine the weak forms before assembly."
+                "implemented. Combine the weak forms before assembly."
             )
-
         return FemLinearSystem(self.A + other.A, self.b + other.b)
 
     def todense(self, args=None):
@@ -2148,13 +2137,11 @@ class FemLinearSystem:
     def __sub__(self, other):
         if not isinstance(other, FemLinearSystem):
             return NotImplemented
-
         if self.is_parametric or other.is_parametric:
             raise TypeError(
                 "Subtraction of parameter-aware FemLinearSystem blocks is not "
-                "implemented yet. Combine the weak forms before assembly."
+                "implemented. Combine the weak forms before assembly."
             )
-
         return FemLinearSystem(self.A - other.A, self.b - other.b)
 
     def __repr__(self):

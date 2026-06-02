@@ -177,6 +177,17 @@ def _split_parametric_operator_ir(op_ir):
 
         name = _parameter_name(param)
 
+        previous = parameter_exprs.get(name)
+        if (
+            previous is not None
+            and getattr(previous, "model", None)
+            is not getattr(param, "model", None)
+        ):
+            raise ValueError(
+                f"Multiple runtime parameter models use the name {name!r}. "
+                "Parameter names must be unique inside one solver block."
+            )
+
         parameter_exprs[name] = param
         parameter_terms.setdefault(name, []).append(
             _clone_term_with_coeff(term, stripped_coeff)
@@ -275,4 +286,34 @@ def _runtime_parameter_tag(name: str) -> str:
     Return the private TensorTag name used by strong-form Diffrax lowering.
     """
     return f"__runtime_parameter_{name}__"
+
+
+def _merge_runtime_parameter_exprs(*mappings):
+    """
+    Merge runtime-parameter expression maps while rejecting name collisions.
+
+    The same physical parameter may appear in multiple affine channels, for
+    example both in an operator basis and in a forcing basis. Reusing the same
+    parameter model is valid; using two different parameter models with the
+    same public name is rejected.
+    """
+    merged = {}
+
+    for mapping in mappings:
+        for name, expr in (mapping or {}).items():
+            previous = merged.get(name)
+
+            if (
+                previous is not None
+                and getattr(previous, "model", None)
+                is not getattr(expr, "model", None)
+            ):
+                raise ValueError(
+                    f"Multiple runtime parameter models use the name {name!r}. "
+                    "Parameter names must be unique inside one solver block."
+                )
+
+            merged[name] = expr
+
+    return merged
 
