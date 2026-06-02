@@ -14,9 +14,38 @@ Background and API reference live in
 |---|---|---|---|
 | 01 | [`forward_noisy_poisson_1d`](./forward-noisy-poisson-1d.md) | Forward-UQ B-PINN: SGLD over MLP weights for the 1-D Poisson with noisy boundary data — prediction bands that widen in data-sparse regions. | Yang et al. 2021 §3.2.1 |
 | 02 | [`inverse_multi_coefficient`](./inverse-multi-coefficient.md) | Per-parameter NUTS on (A, B) of a noisy harmonic-regression target — purest demonstration of `.bayesian()` for each scalar. | Yang et al. 2021 |
-| 03 | [`inverse_source_steady_state`](./inverse-source-steady-state.md) | Mixed-mode: NUTS over an unknown source amplitude in `α u'' + A sin(πx) = 0`, with an optax-trained surrogate. | Yang et al. 2021 §3.3 |
-| 04 | [`inverse_reaction_coefficient`](./inverse-reaction-coefficient.md) | Mixed-mode NUTS on the scalar `k` in the nonlinear PDE `λ u'' + k tanh(u) = f`. | Yang et al. 2021 §3.3.1 |
-| 05 | [`inverse_ode_decay`](./inverse-ode-decay.md) | First-order decay ODE `du/dt = -k u`; recovers the rate constant `k` from noisy observations — same recipe Linka et al. 2022 use for COVID-19 SIR models. | Linka et al. 2022 |
+| 03 | [`inverse_reaction_coefficient`](./inverse-reaction-coefficient.md) | NUTS on the scalar `k` in `λ u'' + k tanh(u) = f` using the closed-form `u` — a fixed-target posterior. | Yang et al. 2021 §3.3.1 |
+| 04 | [`inverse_ode_decay`](./inverse-ode-decay.md) | First-order decay ODE `du/dt = -k u`; recovers `k` from noisy observations using the closed-form `exp(-kt)` — no surrogate, fixed-target posterior. | Linka et al. 2022 |
+
+## When to use a neural surrogate (and when not to)
+
+A naïve mixed-mode B-PINN — optax on the surrogate, NUTS on the
+coefficient simultaneously — samples the coefficient against a
+**moving target** because the surrogate shifts every step.  That isn't
+proper MCMC on a fixed posterior, and the resulting credible interval
+becomes brittle to hyperparameter choices (different step sizes,
+warmup lengths, surrogate sizes can all give materially different
+posteriors).
+
+Two patterns avoid the moving-target problem:
+
+* **No surrogate at all.**  If the forward model has a closed form
+  (e.g. `exp(-kt)` for first-order decay, `sin(πx)/π²` for the
+  analytical Poisson reference), plug it directly into the likelihood
+  and let NUTS sample a **fixed-target** posterior over the coefficient.
+  Hyperparameters then affect chain efficiency only, not the target.
+  Tutorials 03 and 04 use this approach.
+* **Two-stage via `substeps=`.**  When the surrogate is genuinely
+  needed (the PDE has no tractable closed form), use jNO's
+  `substeps=[([surrogate-constraints], n_train), ([pde-constraint], 1)]`
+  with `.stop_gradient()` on the surrogate in the PDE-residual term.
+  Substep 0 trains the surrogate (`n_train` steps); substep 1 runs one
+  NUTS proposal with the surrogate frozen.  The 20:1 ratio (or higher)
+  approximates an idealised two-stage where the surrogate fully
+  converges before sampling.  None of the tutorials in this section
+  *require* this pattern (we picked problems with closed-form forward
+  models for clarity), but the substep machinery is wired and tested
+  for it.
 
 ## How to read the chain output
 
