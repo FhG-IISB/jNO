@@ -11,3 +11,6 @@
 01_basics/bayesian_poisson_1d.py | epochs=2800 | rel_L2_mean=0.7301 | max_band_width=0.2870
 05_coupled_and_inverse/bayesian_inverse_parameter.py | epochs=800 | rel_A=0.0015 | rel_B=0.0566
 02_elliptic/bayesian_source_recovery_1d.py | epochs=230 | rel_A=0.1301 | CI_width=2.7007
+05_coupled_and_inverse/bayesian_inverse_parameter.py | epochs=800 | rel_A=0.0119 | rel_B=0.0381
+02_elliptic/bayesian_source_recovery_1d.py | epochs=230 | rel_A=0.6777 | CI_width=4.3538
+02_elliptic/bayesian_source_recovery_1d.py | epochs=230 | rel_A=0.1301 | CI_width=2.7007

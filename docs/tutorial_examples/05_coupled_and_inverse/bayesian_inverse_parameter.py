@@ -43,8 +43,9 @@ a = jno.np.parameter((1,), key=k1, name="a")
 b = jno.np.parameter((1,), key=k2, name="b")
 
 for p in [a, b]:
-    # inverse_mass_matrix defaults to identity of the right shape — see
-    # docs/training/bayesian.md.
+    # adapt=True (default) runs blackjax.window_adaptation for `warmup`
+    # steps and tunes step_size + inverse_mass_matrix automatically — the
+    # `step_size` given here is just the adapter's initial guess.
     p.bayesian(
         blackjax.nuts,
         step_size=1e-2,

@@ -74,6 +74,13 @@ A.bayesian(
     warmup=80,
     keep=150,
     max_num_doublings=4,
+    # Mixed mode (A is Bayesian, net is optax) — disable window adaptation
+    # because the adapter would run once at the START against the
+    # *untrained* MLP surrogate, producing a step_size tuned for the wrong
+    # logdensity. With adapt=False, `warmup=80` reverts to the classic
+    # "discard first N samples" meaning, which is the safe choice for
+    # mixed-mode runs.
+    adapt=False,
 )
 
 # ── Surrogate u(x) — deterministic optax ─────────────────────────────────────

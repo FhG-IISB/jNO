@@ -1469,6 +1469,7 @@ class Model(Placeholder):
         warmup: int = 500,
         keep: int = 1000,
         thin: int = 1,
+        adapt: bool = True,
         **kernel_kwargs,
     ):
         """Sample this model's parameters from a posterior via blackjax.
@@ -1521,15 +1522,24 @@ class Model(Placeholder):
                 (SG-MCMC) as its first positional argument is accepted.
             prior: Optional ``pytree -> float`` log-prior.  Default: a wide
                 isotropic Gaussian with σ=10 over all inexact-array leaves.
-            warmup: Number of initial outer epochs whose samples are
-                discarded.  No automatic step-size adaptation in this
-                version — set ``step_size`` manually, or use
-                ``blackjax.window_adaptation`` externally and pass the
-                adapted hyperparameters.  Default 500.
+            warmup: For adaptive HMC-family kernels (``blackjax.nuts`` /
+                ``blackjax.hmc``) with ``adapt=True``: number of
+                ``blackjax.window_adaptation`` steps run before the main
+                loop.  Adapted ``step_size`` and ``inverse_mass_matrix``
+                replace the initial values, and the main loop collects
+                samples from epoch 0.  For non-adaptive kernels (MALA,
+                SGLD, SGHMC) and ``adapt=False``: number of initial outer
+                epochs whose samples are discarded.  Default 500.
             keep:   Number of post-warmup samples to retain (after thinning).
                 Default 1000.
             thin:   Keep one sample every ``thin`` post-warmup steps.
                 Default 1.
+            adapt:  When ``True`` (default) and the kernel is in the HMC
+                family, ``blackjax.window_adaptation`` runs for ``warmup``
+                steps before the main loop and adapts step size + inverse
+                mass matrix.  Silently no-op for non-adaptive kernels.
+                Set ``False`` to revert to the "discard first N samples"
+                semantics with the user-supplied hyperparameters.
             **kernel_kwargs: Forwarded to ``kernel_factory``.  Must include
                 ``step_size``.  May include e.g. ``inverse_mass_matrix=``
                 (NUTS/HMC), ``num_integration_steps=`` (HMC/SGHMC).
@@ -1544,6 +1554,7 @@ class Model(Placeholder):
             "warmup": int(warmup),
             "keep": int(keep),
             "thin": int(thin),
+            "adapt": bool(adapt),
         }
         # `.bayesian()` IS the update — clear any prior `.freeze()` flag so
         # solve() does not skip this model.
@@ -1830,7 +1841,7 @@ class ModelCall(Placeholder):
         self.model.optimizer(opt_fn, lr=lr)
         return self
 
-    def bayesian(self, kernel_factory, *, prior=None, warmup=500, keep=1000, thin=1, **kernel_kwargs):
+    def bayesian(self, kernel_factory, *, prior=None, warmup=500, keep=1000, thin=1, adapt=True, **kernel_kwargs):
         """Proxy for :meth:`Model.bayesian`."""
         self.model.bayesian(
             kernel_factory,
@@ -1838,6 +1849,7 @@ class ModelCall(Placeholder):
             warmup=warmup,
             keep=keep,
             thin=thin,
+            adapt=adapt,
             **kernel_kwargs,
         )
         return self

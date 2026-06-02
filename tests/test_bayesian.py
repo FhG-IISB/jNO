@@ -558,6 +558,56 @@ class TestLoRABayesian:
             assert leaf.shape[0] == 10
 
 
+class TestWindowAdaptation:
+    """Phase 4B — `adapt=True` (default for HMC-family) runs
+    blackjax.window_adaptation for `warmup` steps before the main loop and
+    replaces step_size + inverse_mass_matrix with the adapted values.  The
+    main loop then collects samples from epoch 0."""
+
+    def _run_nuts(self, *, adapt: bool, step_size: float, warmup: int, keep: int):
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 2.0 * jno.np.sin(π * x)
+        p = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="p")
+        p.bayesian(
+            blackjax.nuts,
+            step_size=step_size,
+            warmup=warmup,
+            keep=keep,
+            adapt=adapt,
+        )
+        residual = p * jno.np.sin(π * x) - target
+        jno.core([residual.mse], dom).solve(warmup + keep)
+        return p
+
+    def test_adapt_recovers_with_bad_initial_step_size(self):
+        # step_size=5.0 is too large; without adaptation NUTS diverges.
+        # With adapt=True window_adaptation tunes it down before sampling.
+        p = self._run_nuts(adapt=True, step_size=5.0, warmup=200, keep=200)
+        chain = p.posterior_samples
+        assert chain.shape == (200, 1)
+        assert abs(float(jnp.mean(chain)) - 2.0) < 0.5
+
+    def test_adapt_false_keeps_skip_n_semantics(self):
+        # adapt=False → main loop runs warmup+keep epochs and the first
+        # `warmup` are discarded.  Total stored = keep.
+        p = self._run_nuts(adapt=False, step_size=1e-2, warmup=5, keep=10)
+        assert p.posterior_samples.shape == (10, 1)
+
+    def test_mala_with_adapt_true_is_noop(self):
+        # MALA isn't in the HMC family; adapt=True must silently skip
+        # adaptation and fall back to skip-N semantics.
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        p = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="p")
+        p.bayesian(blackjax.mala, step_size=1e-2, warmup=5, keep=10, adapt=True)
+        residual = p * jno.np.sin(π * x) - jno.np.sin(π * x)
+        jno.core([residual.mse], dom).solve(15)
+        assert p.posterior_samples.shape == (10, 1)
+
+
 class TestAutoInverseMassMatrix:
     """Phase 4A — kernels that accept inverse_mass_matrix get an identity
     default of the right shape inferred from the position pytree.  Users no

@@ -102,6 +102,7 @@ class _KernelHandle:
         "warmup",
         "keep",
         "thin",
+        "adapt",
     )
 
     def __init__(
@@ -114,6 +115,7 @@ class _KernelHandle:
         warmup: int,
         keep: int,
         thin: int,
+        adapt: bool = True,
     ):
         self.factory = factory
         self.kind = kind
@@ -123,6 +125,7 @@ class _KernelHandle:
         self.warmup = warmup
         self.keep = keep
         self.thin = thin
+        self.adapt = adapt
 
 
 def build_kernel_handle(cfg: dict) -> _KernelHandle:
@@ -147,13 +150,14 @@ def build_kernel_handle(cfg: dict) -> _KernelHandle:
     warmup = int(cfg.get("warmup", 500))
     keep = int(cfg.get("keep", 1000))
     thin = int(cfg.get("thin", 1))
+    adapt = bool(cfg.get("adapt", True))
     if warmup < 0 or keep < 0 or thin < 1:
         raise ValueError("warmup>=0, keep>=0, thin>=1 are required.")
 
     if kind == "full":
         extra = {**user_kwargs, "step_size": float(step_size)}
-        return _KernelHandle(factory, kind, prior_fn, None, extra, warmup, keep, thin)
-    return _KernelHandle(factory, kind, prior_fn, float(step_size), user_kwargs, warmup, keep, thin)
+        return _KernelHandle(factory, kind, prior_fn, None, extra, warmup, keep, thin, adapt)
+    return _KernelHandle(factory, kind, prior_fn, float(step_size), user_kwargs, warmup, keep, thin, adapt)
 
 
 def _flat_inexact_size(position) -> int:
@@ -194,6 +198,69 @@ def _maybe_inject_inverse_mass_matrix(handle: _KernelHandle, position) -> None:
     arr = jnp.asarray(current)
     if arr.ndim == 0:
         handle.extra_kwargs["inverse_mass_matrix"] = jnp.full((d,), float(arr))
+
+
+def adapt_is_applicable(handle: _KernelHandle) -> bool:
+    """``True`` iff ``run_window_adaptation`` would do real work for this
+    handle (HMC-family kernel, ``adapt=True``, ``warmup>0``).  Used to gate
+    the cost of building an adapt-side ``loss_fn`` closure in
+    :mod:`jno.core` when no Bayesian model actually needs it.
+    """
+    if not handle.adapt or handle.warmup <= 0 or handle.kind != "full":
+        return False
+    target = getattr(handle.factory, "differentiable", handle.factory)
+    try:
+        sig = inspect.signature(target)
+    except (TypeError, ValueError):
+        return False
+    return "inverse_mass_matrix" in sig.parameters
+
+
+def run_window_adaptation(handle: _KernelHandle, position, logdensity_fn, rng_key):
+    """Run ``blackjax.window_adaptation`` for ``handle.warmup`` steps and
+    return the adapted ``(state, extra_kwargs)``.
+
+    Returns ``None`` when adaptation does not apply: non-HMC-family kernels
+    (whose factories don't accept ``inverse_mass_matrix``), ``handle.adapt``
+    is False, or ``handle.warmup <= 0``.
+
+    The caller is responsible for assigning the returned state into
+    ``opt_states[k]``, replacing ``handle.extra_kwargs``, and setting
+    ``handle.warmup = 0`` so the main loop does not double-skip samples.
+    """
+    if not handle.adapt or handle.warmup <= 0 or handle.kind != "full":
+        return None
+    target = getattr(handle.factory, "differentiable", handle.factory)
+    try:
+        sig = inspect.signature(target)
+    except (TypeError, ValueError):
+        return None
+    if "inverse_mass_matrix" not in sig.parameters:
+        return None  # Not HMC family — window_adaptation does not support it.
+
+    # Lazy import — blackjax is a hard dep, but keeps the module top tidy.
+    import blackjax
+
+    # Pull step_size out for window_adaptation's `initial_step_size`; drop
+    # any user-supplied `inverse_mass_matrix` since adaptation computes one.
+    kwargs = dict(handle.extra_kwargs)
+    initial_step_size = float(kwargs.pop("step_size", 1.0))
+    kwargs.pop("inverse_mass_matrix", None)
+
+    adapt = blackjax.window_adaptation(
+        handle.factory,
+        logdensity_fn,
+        initial_step_size=initial_step_size,
+        **kwargs,  # forwards e.g. max_num_doublings to the kernel algorithm
+    )
+    result, _info = adapt.run(rng_key, position, num_steps=int(handle.warmup))
+
+    adapted_kwargs = {
+        **kwargs,
+        "step_size": float(result.parameters["step_size"]),
+        "inverse_mass_matrix": result.parameters["inverse_mass_matrix"],
+    }
+    return result.state, adapted_kwargs
 
 
 def init_state(handle: _KernelHandle, position):
