@@ -88,6 +88,9 @@ def parameter(shape: tuple, *, key: jax.Array | None = None, name: str = "value"
 
     model = nn.wrap(_Parameter(value=jnp.zeros(shape, dtype=jnp.float32)), name=name)
     model._initializer_key = _resolve_key(key)
+    # Mark this Model so .posterior_samples unwraps the single-leaf wrapper
+    # into the plain array a user expects from `.parameter()` semantics.
+    model._is_jno_scalar_parameter = True
     return model()
 
 

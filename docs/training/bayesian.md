@@ -1,0 +1,201 @@
+# Bayesian sampling — `.bayesian(...)` per parameter
+
+`model.bayesian(kernel_factory, **kw)` replaces a model's per-step gradient
+update with one transition of a [blackjax](https://blackjax-devs.github.io/blackjax)
+MCMC kernel.  The configurator mirrors `.optimizer(...)` — each parameter
+in your script can independently choose to be **optimised** (point estimate
+via optax) or **sampled** (posterior chain via blackjax).  Mix freely;
+`crux.solve()` dispatches per-model.
+
+After training the chain is available on the model as
+`model.posterior_samples`, and on the `crux` itself via
+`crux.eval([...], samples="chain")` which vmaps the evaluator over the
+chain so nonlinear predictions push forward correctly.
+
+## Quick example — Bayesian inverse problem
+
+Recover `(A, B)` in `d(x) = A·sin(πx) + B·cos(πx)` from noisy
+observations, with credible intervals:
+
+```python
+import blackjax, jax, jno
+import jax.numpy as jnp
+
+π = jno.np.pi
+dom = jno.domain(constructor=jno.domain.line(mesh_size=0.01))
+x, _ = dom.variable("interior")
+
+A_true, B_true = 3.14, -2.71
+target = A_true * jno.np.sin(π * x) + B_true * jno.np.cos(π * x) \
+       + jno.noise.gaussian(std=0.1)
+
+k1, k2 = jax.random.split(jax.random.PRNGKey(0), 2)
+a = jno.np.parameter((1,), key=k1, name="a")
+b = jno.np.parameter((1,), key=k2, name="b")
+
+for p in [a, b]:
+    p.bayesian(
+        blackjax.nuts,
+        step_size=1e-2,
+        inverse_mass_matrix=jnp.ones(1),
+        warmup=500,
+        keep=1000,
+    )
+
+residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
+crux = jno.core([residual.mse], dom)
+crux.solve(1500)
+
+# Raw chains — leading axis = sample
+a_chain = a.posterior_samples           # (1000, 1)
+A_mean = jnp.mean(a_chain, axis=0)
+A_lo, A_hi = jnp.quantile(a_chain, jnp.array([0.05, 0.95]), axis=0)
+print(f"A = {A_mean[0]:.3f}  [{A_lo[0]:.3f}, {A_hi[0]:.3f}]")
+```
+
+## API
+
+```python
+Model.bayesian(
+    kernel_factory,             # e.g. blackjax.nuts, blackjax.sgld
+    *,
+    prior=None,                 # callable: pytree -> log p(θ);  default Gaussian(σ=10)
+    warmup=500,                 # outer epochs to discard before collecting
+    keep=1000,                  # number of post-warmup samples to retain
+    thin=1,                     # keep one sample every `thin` post-warmup steps
+    **kernel_kwargs,            # forwarded to kernel_factory; must include step_size=
+)
+```
+
+`kernel_factory` is duck-typed at solve time:
+
+| First parameter of factory   | Family               | Examples                          |
+|------------------------------|----------------------|-----------------------------------|
+| `logdensity_fn`              | Full-data MCMC       | `blackjax.nuts`, `blackjax.hmc`, `blackjax.mala` |
+| `grad_estimator`             | Stochastic-gradient  | `blackjax.sgld`, `blackjax.sghmc` |
+
+jno builds the appropriate closure from the live loss + context and rebuilds
+the kernel inside the JIT graph each step.
+
+## Output — chains only
+
+| Read                              | `.optimizer()` (point)   | `.bayesian()` (chain)                          |
+|-----------------------------------|--------------------------|------------------------------------------------|
+| `crux.eval([m])`                  | point value              | last sample                                    |
+| `crux.eval([expr], samples="chain")` | broadcast point value | full vmapped chain — `(n_kept, …)`             |
+| `m.posterior_samples`             | `None`                   | stacked module pytree (or array for `parameter`) |
+
+No `.mean() / .std() / .quantile()` helpers are provided — compute whatever
+summary you need from the chain with `jnp.mean`, `jnp.quantile`, arviz, or
+your favourite plotting library.
+
+### Nonlinear pushforward
+
+For predictions through a neural network, the posterior mean over outputs
+is **not** the output at the posterior mean of the weights.  Use
+`samples="chain"` so the evaluator vmaps over each sample, then summarise
+afterwards:
+
+```python
+(u_chain,) = crux.eval([u], samples="chain")    # (n_kept, n_points, 1)
+u_mean = jnp.mean(u_chain, axis=0)
+u_lo, u_hi = jnp.quantile(u_chain, jnp.array([0.05, 0.95]), axis=0)
+```
+
+## Mixed: optimised + sampled
+
+Different parameters use different update rules; they coexist in one
+`crux.solve()`:
+
+```python
+encoder = jno.nn.wrap(foundax.mlp(2, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(0)))
+head    = jno.nn.wrap(foundax.mlp(1, hidden_dims=32, num_layers=1, key=jax.random.PRNGKey(1)))
+
+encoder.optimizer(optax.adam(1e-3))                          # point estimate
+head.bayesian(blackjax.sgld, step_size=1e-5)                 # SGLD chain
+```
+
+Only `head.posterior_samples` is populated; `encoder.posterior_samples` is
+`None`.
+
+## Bayesian PINN — predictive bands
+
+```python
+import blackjax, foundax, jax, jno
+import jax.numpy as jnp
+
+π = jno.np.pi
+dom = jno.domain(constructor=jno.domain.line(mesh_size=0.01))
+x, _  = dom.variable("interior")
+xb, _ = dom.variable("boundary")
+
+net = jno.nn.wrap(foundax.mlp(1, hidden_dims=32, num_layers=3,
+                              key=jax.random.PRNGKey(0)))
+net.bayesian(blackjax.sgld, step_size=1e-5, warmup=2000, keep=1000)
+
+u    = net(x)
+u_xx = jno.diff(u, x, order=2)
+pde  = u_xx + (π ** 2) * jno.np.sin(π * x)        # u'' = -π² sin(πx)
+bc   = net(xb) - 0.0
+
+crux = jno.core([pde.mse, bc.mse], dom)
+crux.solve(3000)
+
+(u_chain,) = crux.eval([u], samples="chain")
+u_mean     = jnp.mean(u_chain, axis=0)
+u_lo, u_hi = jnp.quantile(u_chain, jnp.array([0.05, 0.95]), axis=0)
+```
+
+## Custom prior
+
+`prior=` takes any `pytree → float` returning the log-prior density.
+
+```python
+def laplace_prior(p, scale=1.0):
+    return -sum(
+        jnp.sum(jnp.abs(leaf))
+        for leaf in jax.tree_util.tree_leaves(p)
+        if hasattr(leaf, "dtype") and jnp.issubdtype(leaf.dtype, jnp.floating)
+    ) / scale
+
+a.bayesian(blackjax.nuts, step_size=1e-2,
+           inverse_mass_matrix=jnp.ones(1), prior=laplace_prior)
+```
+
+The default prior is a wide isotropic Gaussian with σ=10 over every
+inexact-array leaf — effectively flat at typical parameter scales.
+
+!!! warning "Step-size tuning"
+    jno does **not** run automatic step-size adaptation inside `solve()`.
+    The `warmup=` argument only controls how many initial outer epochs are
+    discarded before sample collection — it does not tune the kernel.  If
+    you want adapted hyperparameters, run `blackjax.window_adaptation`
+    yourself and pass the result through `**kernel_kwargs`.
+
+!!! warning "Memory"
+    A full chain costs ~`keep × #params × 4 bytes` per Bayesian model.  For
+    large BNN PINNs increase `thin=` or decrease `keep=` to stay within
+    GPU/CPU memory.
+
+## References
+
+- NUTS — Hoffman, M. D., & Gelman, A. (2014). *The No-U-Turn Sampler:
+  Adaptively Setting Path Lengths in Hamiltonian Monte Carlo.* Journal of
+  Machine Learning Research, 15(1), 1593–1623.
+- SGLD — Welling, M., & Teh, Y. W. (2011). *Bayesian Learning via
+  Stochastic Gradient Langevin Dynamics.* ICML 2011, 681–688.
+
+The kernels themselves come from [blackjax](https://blackjax-devs.github.io/blackjax) —
+jno only wires their `(state, key) → state` interface into the per-model
+step dispatch.
+
+## Limitations (this release)
+
+- **No combination with `substeps=`** — using both in one `solve()` raises
+  a clear error.
+- **No automatic adaptation** — supply `step_size` (and
+  `inverse_mass_matrix` for HMC/NUTS) yourself.
+- **VI (`blackjax.vi.*`)** has different mechanics (ELBO optimisation) and
+  is not yet routed through `.bayesian()`.
+- **Discrete posteriors** (e.g. over `Choice` selections) need SMC and are
+  out of scope.

@@ -1072,6 +1072,8 @@ class Model(Placeholder):
         self._lora_config: list[dict] | None = None  # [{"target", "rank", "alpha", "wrappers"}, ...]
         self._opt_fn = None  # optax optimizer factory / instance
         self._lr = LearningRateSchedule(1.0)
+        self._bayesian_cfg = None  # {"factory", "kernel_kwargs", "prior", "warmup", "keep", "thin"}
+        self._posterior_samples_pytree = None  # stacked module pytree, leading axis = N; populated by solve()
         self._dtype = None  # target dtype (e.g. jnp.bfloat16) or None
         self._param_mask = None  # current mask scope for grouped optimizer/lr calls
         self._trainable_param_mask = None  # persistent trainability mask used by mask(...).freeze()
@@ -1090,6 +1092,23 @@ class Model(Placeholder):
     def params(self):
         """Alias for :attr:`module` — always reflects the current (post-training) weights."""
         return self.module
+
+    @property
+    def posterior_samples(self):
+        """Post-warmup MCMC samples for this model, or ``None`` if it was not
+        configured with :meth:`bayesian`.
+
+        Returns the stacked module pytree (leading axis = number of kept
+        samples).  For :func:`jno.np.parameter` models, the single-leaf
+        ``_Parameter(value=…)`` wrapper is unwrapped to a plain array, so
+        ``a.posterior_samples`` has shape ``(N, *a_shape)`` directly.
+        """
+        pytree = getattr(self, "_posterior_samples_pytree", None)
+        if pytree is None:
+            return None
+        if getattr(self, "_is_jno_scalar_parameter", False):
+            return pytree.value
+        return pytree
 
     def __call__(self, *args) -> "ModelCall":
         """Call this module with variables and return a traced ``ModelCall``."""
@@ -1442,6 +1461,96 @@ class Model(Placeholder):
 
         return self
 
+    def bayesian(
+        self,
+        kernel_factory,
+        *,
+        prior=None,
+        warmup: int = 500,
+        keep: int = 1000,
+        thin: int = 1,
+        **kernel_kwargs,
+    ):
+        """Sample this model's parameters from a posterior via blackjax.
+
+        Mirrors :meth:`optimizer` but uses an MCMC kernel instead of an
+        optax update.  The model's parameters become the *position* of a
+        chain initialised at the current weights; each training step is
+        one transition of ``kernel_factory(logdensity_fn, **kernel_kwargs)``
+        for full-data kernels (NUTS/HMC/MALA), or
+        ``kernel_factory(grad_estimator, **kernel_kwargs)`` for SG-MCMC
+        (SGLD/SGHMC).  jno chooses the dispatch shape by inspecting the
+        factory's signature.
+
+        After :meth:`jno.core.core.solve` returns, the chain is available
+        on the model via :attr:`posterior_samples` — a pytree mirroring
+        the model parameters with a leading sample axis of length
+        ``keep // thin``.
+
+        Example — NUTS on a scalar PDE coefficient::
+
+            import blackjax, jax.numpy as jnp
+            a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+            a.bayesian(
+                blackjax.nuts,
+                step_size=1e-2,
+                inverse_mass_matrix=jnp.ones(1),
+                warmup=500,
+                keep=1000,
+            )
+            crux = jno.core([residual.mse], domain)
+            crux.solve(2000)
+            chain = a.posterior_samples            # (1000, 1)
+
+        Example — SGLD on a small MLP (BNN PINN)::
+
+            import blackjax
+            net = jno.nn.wrap(foundax.mlp(...))
+            net.bayesian(blackjax.sgld, step_size=1e-5, warmup=2000, keep=1000)
+
+        References:
+            * NUTS — Hoffman & Gelman (2014), *The No-U-Turn Sampler*, JMLR
+              15(1), 1593-1623.
+            * SGLD — Welling & Teh (2011), *Bayesian Learning via Stochastic
+              Gradient Langevin Dynamics*, ICML 2011, 681-688.
+
+        Args:
+            kernel_factory: A blackjax kernel constructor, e.g.
+                ``blackjax.nuts`` or ``blackjax.sgld``.  Any callable that
+                takes ``logdensity_fn`` (full-data) or ``grad_estimator``
+                (SG-MCMC) as its first positional argument is accepted.
+            prior: Optional ``pytree -> float`` log-prior.  Default: a wide
+                isotropic Gaussian with σ=10 over all inexact-array leaves.
+            warmup: Number of initial outer epochs whose samples are
+                discarded.  No automatic step-size adaptation in this
+                version — set ``step_size`` manually, or use
+                ``blackjax.window_adaptation`` externally and pass the
+                adapted hyperparameters.  Default 500.
+            keep:   Number of post-warmup samples to retain (after thinning).
+                Default 1000.
+            thin:   Keep one sample every ``thin`` post-warmup steps.
+                Default 1.
+            **kernel_kwargs: Forwarded to ``kernel_factory``.  Must include
+                ``step_size``.  May include e.g. ``inverse_mass_matrix=``
+                (NUTS/HMC), ``num_integration_steps=`` (HMC/SGHMC).
+
+        Returns:
+            self, for chaining.
+        """
+        self._bayesian_cfg = {
+            "factory": kernel_factory,
+            "kernel_kwargs": dict(kernel_kwargs),
+            "prior": prior,
+            "warmup": int(warmup),
+            "keep": int(keep),
+            "thin": int(thin),
+        }
+        # `.bayesian()` IS the update — clear any prior `.freeze()` flag so
+        # solve() does not skip this model.
+        self._frozen = False
+        self._trainable_param_mask = None
+        return self
+
     def lr(self, lr):
         """Attach an LR schedule to this model.
 
@@ -1720,6 +1829,23 @@ class ModelCall(Placeholder):
     def optimizer(self, opt_fn, *, lr=None):
         self.model.optimizer(opt_fn, lr=lr)
         return self
+
+    def bayesian(self, kernel_factory, *, prior=None, warmup=500, keep=1000, thin=1, **kernel_kwargs):
+        """Proxy for :meth:`Model.bayesian`."""
+        self.model.bayesian(
+            kernel_factory,
+            prior=prior,
+            warmup=warmup,
+            keep=keep,
+            thin=thin,
+            **kernel_kwargs,
+        )
+        return self
+
+    @property
+    def posterior_samples(self):
+        """Shortcut to the underlying :attr:`Model.posterior_samples`."""
+        return self.model.posterior_samples
 
     def initialize(self, weights, *, key=None):
         self.model.initialize(weights, key=key)

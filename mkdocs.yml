@@ -92,6 +92,7 @@ nav:
     - Evaluation & Debugging:
       - Evaluation: training/evaluation.md
       - Explainability: training/explainability.md
+    - Bayesian Sampling: training/bayesian.md
     - Model Controls:
       - Overview: model-controls/index.md
       - Mask & Freeze: model-controls/mask-freeze.md
