@@ -192,6 +192,65 @@ class TestEvalChainSamples:
 
 
 # ---------------------------------------------------------------------------
+# Auto-chain default + samples="point" escape hatch
+# ---------------------------------------------------------------------------
+
+
+class TestEvalAutoChainDefault:
+    """`crux.eval(...)` auto-picks chain vs point per expression based on whether
+    its dependency graph touches a Bayesian model.  The chain default avoids the
+    `f(mean(θ)) ≠ mean(f(θ))` foot-gun without forcing the user to pass
+    ``samples="chain"`` every time."""
+
+    def _setup(self):
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        b = jno.np.parameter((1,), key=jax.random.PRNGKey(1), name="b")
+        a.bayesian(
+            blackjax.nuts,
+            step_size=5e-2,
+            inverse_mass_matrix=jnp.ones(1),
+            warmup=5,
+            keep=10,
+        )
+        b.optimizer(optax.adam(1e-2))
+        target = 1.0 * jno.np.sin(π * x)
+        residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
+        crux = jno.core([residual.mse], dom)
+        crux.solve(15)
+        return a, b, x, crux
+
+    def test_bayesian_expr_returns_chain_by_default(self):
+        a, _b, _x, crux = self._setup()
+        chain = crux.eval([a])              # auto → chain
+        assert chain.shape == (10, 1)
+
+    def test_non_bayesian_expr_returns_point_by_default(self):
+        _a, b, _x, crux = self._setup()
+        point = crux.eval([b])              # auto → point
+        assert point.shape == (1,)
+
+    def test_mixed_list_picks_per_expression(self):
+        a, b, _x, crux = self._setup()
+        a_out, b_out = crux.eval([a, b])    # auto: a → chain, b → point
+        assert a_out.shape == (10, 1)
+        assert b_out.shape == (1,)
+
+    def test_samples_point_forces_point_on_bayesian_expr(self):
+        a, _b, _x, crux = self._setup()
+        point = crux.eval([a], samples="point")
+        # last sample, no leading chain axis
+        assert point.shape == (1,)
+
+    def test_unknown_samples_value_raises(self):
+        _a, _b, _x, crux = self._setup()
+        with pytest.raises(ValueError, match="samples="):
+            crux.eval([1.0], samples="bogus")  # value won't matter — raises before eval
+
+
+# ---------------------------------------------------------------------------
 # Determinism: no .bayesian anywhere → matches the optax-only baseline
 # ---------------------------------------------------------------------------
 

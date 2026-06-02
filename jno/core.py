@@ -3115,7 +3115,7 @@ class core:
         domain: Optional[domain] = None,
         min_consecutive: Optional[int] = 1,
         key=None,
-        samples: Optional[str] = None,
+        samples: str = "auto",
     ):
         """Evaluate an operation (or list of operations) on the current models.
 
@@ -3125,110 +3125,116 @@ class core:
             min_consecutive: Consecutive-time-step window for time-dependent
                 expressions.
             key: Optional PRNG key for stochastic ops.
-            samples: If ``"chain"``, ``vmap`` the evaluator over the leading
-                sample axis of every Bayesian model's ``posterior_samples``;
-                non-Bayesian models broadcast their point value.  Returns
-                pytrees with shape ``(n_samples, *original_shape)``.  Default
-                ``None`` evaluates at the current point values (last sample
-                for Bayesian models, trained value for optax models).
+            samples: How to handle Bayesian models in the dependency graph:
+
+                * ``"auto"`` (default) — per expression: if any model it
+                  depends on has ``posterior_samples`` set, ``vmap`` the
+                  evaluator over the chain (output shape
+                  ``(n_samples, *original_shape)``); otherwise evaluate at
+                  the point value.
+                * ``"chain"`` — force chain evaluation; raises if no Bayesian
+                  model appears in any expression's dependency graph.
+                * ``"point"`` — force point evaluation for every expression
+                  (last sample for Bayesian models, trained value for optax
+                  models).  Use for a quick look without paying the vmap cost.
+
+                The default flips to chain automatically because a single
+                last-sample evaluation of a nonlinear function of Bayesian
+                weights is, in general, *not* a meaningful summary of the
+                posterior (``f(mean(θ)) ≠ mean(f(θ))``).
         """
 
         if isinstance(operation, Placeholder):
             operation = [operation]
 
+        if samples not in ("auto", "chain", "point"):
+            raise ValueError(
+                f"crux.eval(samples=...) expects 'auto' | 'chain' | 'point', got {samples!r}."
+            )
+
         domain_data = self.domain_data if domain is None else self.prepare_domain_data(domain)
-
         _models = self._unwrapped_models
+        ctx = domain_data.context
 
-        if samples is None:
-            results = []
-            for op in operation:
-                fn = TraceCompiler.compile_traced_expression(op, self.all_ops)
-                results.append(
-                    fn(
-                        _models,
-                        domain_data.context,
-                        batchsize=None,
-                        key=key,
-                        min_consecutive=min_consecutive,
-                    )
-                )
+        def _point_eval(op):
+            fn = TraceCompiler.compile_traced_expression(op, self.all_ops)
+            return fn(_models, ctx, batchsize=None, key=key, min_consecutive=min_consecutive)
+
+        if samples == "point":
+            results = [_point_eval(op) for op in operation]
             return results[0] if len(results) == 1 else results
 
-        if samples != "chain":
-            raise ValueError(f"crux.eval(samples=...) supports None or 'chain', got {samples!r}.")
+        # samples == "auto" or "chain": walk each expression to discover its
+        # Bayesian dependencies, then chain-eval or point-eval per expression.
+        def _collect_posterior_lids(op) -> Dict[int, Any]:
+            posterior_by_lid: Dict[int, Any] = {}
 
-        # Collect posterior chains from any Bayesian models in the graph.
-        # We use the raw wrapped pytree (_posterior_samples_pytree) so that
-        # vmap can substitute it as drop-in for the model in the trace.
-        posterior_by_lid: Dict[int, Any] = {}
+            def _record(m):
+                raw = getattr(m, "_posterior_samples_pytree", None)
+                if raw is not None:
+                    posterior_by_lid[m.layer_id] = raw
 
-        def _record(m):
-            raw = getattr(m, "_posterior_samples_pytree", None)
-            if raw is not None:
-                posterior_by_lid[m.layer_id] = raw
+            def _walk(node, _seen):
+                if id(node) in _seen:
+                    return
+                _seen.add(id(node))
+                if isinstance(node, Model):
+                    _record(node)
+                    return
+                if isinstance(node, ModelCall):
+                    _record(node.model)
+                    for a in node.args:
+                        if isinstance(a, Placeholder):
+                            _walk(a, _seen)
+                    return
+                if isinstance(node, BinaryOp):
+                    _walk(node.left, _seen)
+                    _walk(node.right, _seen)
+                    return
+                if isinstance(node, FunctionCall):
+                    for a in node.args:
+                        if isinstance(a, Placeholder):
+                            _walk(a, _seen)
+                    return
+                if isinstance(node, OperationCall):
+                    _walk(node.operation.expr, _seen)
+                    for a in node.args:
+                        if isinstance(a, Placeholder):
+                            _walk(a, _seen)
+                    return
+                if isinstance(node, OperationDef):
+                    _walk(node.expr, _seen)
+                    return
 
-        def _walk(node, _seen=set()):
-            if id(node) in _seen:
-                return
-            _seen.add(id(node))
-            if isinstance(node, Model):
-                _record(node)
-                return
-            if isinstance(node, ModelCall):
-                _record(node.model)
-                for a in node.args:
-                    if isinstance(a, Placeholder):
-                        _walk(a, _seen)
-                return
-            if isinstance(node, BinaryOp):
-                _walk(node.left, _seen)
-                _walk(node.right, _seen)
-                return
-            if isinstance(node, FunctionCall):
-                for a in node.args:
-                    if isinstance(a, Placeholder):
-                        _walk(a, _seen)
-                return
-            if isinstance(node, OperationCall):
-                _walk(node.operation.expr, _seen)
-                for a in node.args:
-                    if isinstance(a, Placeholder):
-                        _walk(a, _seen)
-                return
-            if isinstance(node, OperationDef):
-                _walk(node.expr, _seen)
-                return
-            # Other node types (Variable, Literal, etc.) have no nested models.
+            _walk(op, set())
+            return posterior_by_lid
 
-        for op in operation:
-            _walk(op)
+        per_op_chains = [_collect_posterior_lids(op) for op in operation]
+        any_bayesian = any(per_op_chains)
 
-        if not posterior_by_lid:
+        if samples == "chain" and not any_bayesian:
             raise ValueError(
                 "samples='chain' was requested but no models in the given expression(s) "
                 "carry posterior_samples. Configure one or more parameters with "
                 ".bayesian(...) and run crux.solve() before calling eval(samples='chain')."
             )
 
-        chain_part, static_part = jno_bayesian.chain_params_for_eval(_models, posterior_by_lid)
-
-        ctx = domain_data.context
-        results = []
-        for op in operation:
+        def _chain_eval(op, posterior_by_lid):
+            chain_part, static_part = jno_bayesian.chain_params_for_eval(_models, posterior_by_lid)
             fn = TraceCompiler.compile_traced_expression(op, self.all_ops)
 
             def _one(_chain_p, _fn=fn):
                 params = {**static_part, **_chain_p}
-                return _fn(
-                    params,
-                    ctx,
-                    batchsize=None,
-                    key=key,
-                    min_consecutive=min_consecutive,
-                )
+                return _fn(params, ctx, batchsize=None, key=key, min_consecutive=min_consecutive)
 
-            results.append(jax.vmap(_one)(chain_part))
+            return jax.vmap(_one)(chain_part)
+
+        results = []
+        for op, posterior_by_lid in zip(operation, per_op_chains):
+            if posterior_by_lid or (samples == "chain"):
+                results.append(_chain_eval(op, posterior_by_lid))
+            else:
+                results.append(_point_eval(op))
 
         return results[0] if len(results) == 1 else results
 

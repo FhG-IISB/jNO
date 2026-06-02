@@ -77,30 +77,48 @@ Model.bayesian(
 jno builds the appropriate closure from the live loss + context and rebuilds
 the kernel inside the JIT graph each step.
 
-## Output — chains only
+## Output — chains by default
+
+`crux.eval(...)` is **auto-chain-aware** per expression: if an expression's
+dependency graph touches a model with ``posterior_samples`` set, the
+evaluator is `vmap`-ped over that chain.  Otherwise the expression is
+evaluated at the point value as before.  No `samples=` argument is needed
+for the common case.
 
 | Read                              | `.optimizer()` (point)   | `.bayesian()` (chain)                          |
 |-----------------------------------|--------------------------|------------------------------------------------|
-| `crux.eval([m])`                  | point value              | last sample                                    |
-| `crux.eval([expr], samples="chain")` | broadcast point value | full vmapped chain — `(n_kept, …)`             |
+| `crux.eval([m])`                  | point value              | `(n_kept, *m_shape)` chain                     |
+| `crux.eval([expr])`               | `(n_points, …)` point    | `(n_kept, n_points, …)` chain (auto)           |
 | `m.posterior_samples`             | `None`                   | stacked module pytree (or array for `parameter`) |
 
 No `.mean() / .std() / .quantile()` helpers are provided — compute whatever
 summary you need from the chain with `jnp.mean`, `jnp.quantile`, arviz, or
 your favourite plotting library.
 
-### Nonlinear pushforward
+### Nonlinear pushforward — handled automatically
 
 For predictions through a neural network, the posterior mean over outputs
-is **not** the output at the posterior mean of the weights.  Use
-`samples="chain"` so the evaluator vmaps over each sample, then summarise
-afterwards:
+is **not** the output at the posterior mean of the weights.  This used to
+require an explicit `samples="chain"`; the default now does the right
+thing:
 
 ```python
-(u_chain,) = crux.eval([u], samples="chain")    # (n_kept, n_points, 1)
+u_chain = crux.eval([u])                          # (n_kept, n_points, 1)
 u_mean = jnp.mean(u_chain, axis=0)
 u_lo, u_hi = jnp.quantile(u_chain, jnp.array([0.05, 0.95]), axis=0)
 ```
+
+### Escape hatches
+
+```python
+crux.eval([u], samples="chain")    # force chain (raises if no Bayesian deps)
+crux.eval([u], samples="point")    # force point: evaluate at last sample,
+                                   # skips the vmap. Quick debugging / sanity.
+```
+
+The `samples="point"` mode returns a single sample at the model's current
+position — useful when you just want a quick number, but **not** a
+substitute for the posterior summary on nonlinear outputs.
 
 ## Mixed: optimised + sampled
 
