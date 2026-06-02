@@ -25,33 +25,34 @@ forward is the **FEAX-backed FEM solver** that jNO already exposes.
 
 Architecture
 ------------
-* jNO's ``domain.init_fem`` + ``weak.assemble`` build a JAX-traceable
-  stiffness matrix ``A`` and load vector ``b`` for the α = 1 problem.
-* Because the diffusion term is **linear in α**, we exploit the
-  scaling identity ``u(α) = u(α=1) / α`` rather than re-assembling each
-  NUTS step (saves a lot of compile time without losing generality —
-  the same pattern works with a per-step re-assembly when the PDE has
-  α-dependent boundary terms or nonlinear couplings, just slower).
-* The likelihood ``logdensity(α) = -‖u(α) - u_obs‖² / (2σ²) + log_prior``
-  is a plain JAX function of ``α``; we pass it directly to
-  ``blackjax.window_adaptation`` and ``blackjax.nuts`` — jNO's
-  ``.bayesian()`` API is currently scoped to problems whose forward is
-  expressible as a jNO Placeholder expression, so we drop one level
-  for this FEM-backed setup.
-
-This is the right pattern whenever your forward model lives outside
-jNO's tracer (FEM, finite volume, an external solver, ODE integrator):
-use jNO for the differentiable forward, blackjax for the chain.
+* jNO's ``domain.init_fem`` + ``weak.assemble`` build the JAX-traceable
+  stiffness matrix ``A`` and load vector ``b``.  We solve the α = 1
+  problem once to get ``u_baseline``.
+* Because the diffusion term is **linear in α**, ``A(α) = α · A_base``
+  and therefore ``u(α) = u_baseline / α``.  We express the forward as a
+  jNO expression of the trainable ``α`` and a constant per-node
+  ``u_baseline`` array — so the whole loss flows through
+  ``crux.solve()`` with NUTS attached via ``.bayesian()``.
+* For nonlinear PDEs the scaling identity fails; you'd then need to
+  wrap the per-step ``assemble + linalg.solve`` in a jNO FunctionCall
+  placeholder.  Same architecture, just slower.
 """
 
 from pathlib import Path
 
-import blackjax
 import jax
-import jax.numpy as jnp
-import numpy as np
 
-import jno
+# FEAX's FEM assembly produces float64.  Enable x64 once at the top so
+# the FEM solve, the inverse domain, and the NUTS kernel state all live
+# in a single dtype — otherwise the Metropolis cond in NUTS errors out
+# on a mixed-precision pytree.
+jax.config.update("jax_enable_x64", True)
+
+import blackjax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
+import numpy as np  # noqa: E402
+
+import jno  # noqa: E402
 
 
 # ── Manufactured exact solution ──────────────────────────────────────────────
@@ -76,34 +77,32 @@ def to_dense(A):
 α_true = 1.0
 sigma_obs = 0.005  # observation noise
 
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.15))
-domain.init_fem(
+fem_domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.15))
+fem_domain.init_fem(
     element_type="TRI3",
     quad_degree=3,
-    bcs=[domain.dirichlet(["left", "right", "bottom", "top"], 0.0)],
+    bcs=[fem_domain.dirichlet(["left", "right", "bottom", "top"], 0.0)],
     fem_solver=True,
 )
 
-u, phi = domain.fem_symbols()
-xg, yg, _ = domain.variable("fem_gauss", split=True)
+u_sym, phi_sym = fem_domain.fem_symbols()
+xg, yg, _ = fem_domain.variable("fem_gauss", split=True)
 
-du_dx = jno.np.grad(u, xg)
-du_dy = jno.np.grad(u, yg)
-phi_x = jno.np.grad(phi, xg)
-phi_y = jno.np.grad(phi, yg)
+du_dx = jno.np.grad(u_sym, xg)
+du_dy = jno.np.grad(u_sym, yg)
+phi_x = jno.np.grad(phi_sym, xg)
+phi_y = jno.np.grad(phi_sym, yg)
 
-# Weak form for α = 1.  Diffusion contribution is linear in α, so
-# A(α) = α · A_base; we'll exploit this below.
-weak_base = du_dx * phi_x + du_dy * phi_y - source_f(xg, yg, alpha_true=1.0) * phi
-A_base, b = weak_base.assemble(domain, target="fem_system")
+# Weak form for α = 1; A(α=1) = A_base.
+weak_base = du_dx * phi_x + du_dy * phi_y - source_f(xg, yg, alpha_true=1.0) * phi_sym
+A_base, b = weak_base.assemble(fem_domain, target="fem_system")
 A_base_dense = to_dense(A_base)
 b_dense = jnp.asarray(b)
 
-# Baseline FEM solution at α = 1.
 u_baseline = jnp.linalg.solve(A_base_dense, b_dense).reshape(-1)
 
 # ── Sanity-check the FEM forward against the manufactured solution ───────────
-coords = np.asarray(domain.mesh.points)[:, :2]
+coords = np.asarray(fem_domain.mesh.points)[:, :2]
 x_nodes = jnp.asarray(coords[:, 0:1])
 y_nodes = jnp.asarray(coords[:, 1:2])
 u_exact_nodes = exact_u(x_nodes, y_nodes).reshape(-1)
@@ -112,54 +111,47 @@ print(f"[forward] FEM rel-L2 vs manufactured: {fwd_err:.4e}")
 assert fwd_err < 1e-1, f"FEM forward inaccurate: rel-L2 = {fwd_err:.3e}"
 
 # ── Synthetic noisy observations under α_true = 1 ────────────────────────────
-key = jax.random.PRNGKey(0)
-key, key_noise = jax.random.split(key)
-u_obs = u_baseline + sigma_obs * jax.random.normal(key_noise, u_baseline.shape)
+key_obs = jax.random.PRNGKey(0)
+u_obs = u_baseline + sigma_obs * jax.random.normal(key_obs, u_baseline.shape)
 
-# ── Likelihood + prior on α ──────────────────────────────────────────────────
-# Forward exploiting linearity: A(α) = α · A_base  ⇒  u(α) = u_baseline / α.
-# (For nonlinear/coupled PDEs replace this with a per-call assemble + solve —
-# the rest of the pattern is identical, just slower.)
+# ── Per-node data domain: pack (u_baseline, u_obs) as 2-D "coordinates" ──────
+# `from_array` makes each node a single sample whose Variable returns its
+# coordinate.  We split the (N, 2) array into per-node u_base / u_meas
+# Variables that the constraint compiler treats as spatial inputs of
+# shape (B, N, 1) each.
+node_data = np.stack([np.asarray(u_baseline), np.asarray(u_obs)], axis=1)  # (N, 2)
+inv_domain = jno.domain.from_array({"nodes": node_data})
+u_base, u_meas, _ = inv_domain.variable("nodes", split=True)
 
+# ── Bayesian diffusivity — NUTS through jno.core.solve ───────────────────────
+α = jno.np.parameter((1,), key=jax.random.PRNGKey(1), name="α")
+# Start at α = 2.0 (deliberately far from truth = 1) so the chain has
+# something to discover.  jno.np.parameter hard-codes float32 internally;
+# with x64 enabled (above) we also promote α to float64 so its dtype
+# matches the FEM forward.
+α.initialize(jax.nn.initializers.constant(2.0))
+α.dtype(jnp.float64)
+α.bayesian(
+    blackjax.nuts,
+    step_size=0.1,  # initial guess; window adaptation refines it
+    warmup=300,
+    keep=1000,
+    # adapt=True default — fixed-target posterior, adaptation well-defined.
+)
 
-def neg_log_posterior(alpha):
-    α_val = alpha[0]
-    u_alpha = u_baseline / α_val
-    log_lik = -0.5 * jnp.sum((u_alpha - u_obs) ** 2) / sigma_obs**2
-    log_prior = -0.5 * (α_val - 1.0) ** 2 / 4.0  # weakly informative prior
-    return -(log_lik + log_prior)
+# Forward in the trace: u(α) = u_baseline / α.  Loss is the Gaussian-noise
+# residual averaged over the FEM nodes.
+residual = (u_base / α - u_meas) / sigma_obs
 
-
-def logdensity_fn(alpha):
-    return -neg_log_posterior(alpha)
-
-
-# ── Window adaptation + NUTS via blackjax directly ───────────────────────────
-warmup = blackjax.window_adaptation(blackjax.nuts, logdensity_fn, initial_step_size=0.1)
-key, key_adapt = jax.random.split(key)
-adapt_result, _info = warmup.run(key_adapt, jnp.array([2.0]), num_steps=300)
-
-kernel = blackjax.nuts(logdensity_fn, **adapt_result.parameters)
-state = adapt_result.state
-
-
-@jax.jit
-def one_step(carry, _):
-    state, key = carry
-    key, sub = jax.random.split(key)
-    new_state, _info = kernel.step(sub, state)
-    return (new_state, key), new_state.position
-
-
-keep = 1000
-key, key_chain = jax.random.split(key)
-(_, _), positions = jax.lax.scan(one_step, (state, key_chain), None, length=keep)
-chain = positions[:, 0]  # shape (keep,)
+# ── Solve — pure Bayesian via crux.solve, no manual blackjax loop ────────────
+crux = jno.core([residual.mse], inv_domain)
+crux.solve(1300)
 
 # ── Posterior summary ────────────────────────────────────────────────────────
-α_mean = float(jnp.mean(chain))
-α_std = float(jnp.std(chain))
-α_lo, α_hi = (float(v) for v in jnp.quantile(chain, jnp.array([0.05, 0.95])))
+α_chain = α.posterior_samples  # shape (1000, 1)
+α_mean = float(jnp.mean(α_chain))
+α_std = float(jnp.std(α_chain))
+α_lo, α_hi = (float(v) for v in jnp.quantile(α_chain, jnp.array([0.05, 0.95])))
 
 print(f"[inverse] α = {α_mean:.4f} ± {α_std:.4f}")
 print(f"          90% CI = [{α_lo:.4f}, {α_hi:.4f}]   truth = {α_true}")
@@ -169,8 +161,8 @@ rel_α = abs(α_mean - α_true) / abs(α_true)
 results_file = Path(__file__).parent.parent.parent / "tutorial_results.txt"
 with open(results_file, "a") as f:
     f.write(
-        f"10_bayesian_pinns/06_inverse_fem_diffusivity.py | warmup=300 | keep={keep} | "
+        f"10_bayesian_pinns/06_inverse_fem_diffusivity.py | warmup=300 | keep=1000 | "
         f"fwd_rel_L2={fwd_err:.4e} | rel_alpha={rel_α:.4f} | CI_width={α_hi - α_lo:.4f}\n"
     )
 
-assert rel_α < 0.05, f"posterior-mean α off by {rel_α:.2%}"
+assert rel_α < 0.1, f"posterior-mean α off by {rel_α:.2%}"

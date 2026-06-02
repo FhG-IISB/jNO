@@ -24,8 +24,8 @@ mass at both `0.3` and `0.7`.  A single-chain NUTS started near `0.3`
 will discover the left mode and stay there; the credible interval
 reported below characterises that mode only.  This is a feature, not
 a bug — the CI is calibrated *within* the discovered mode, and the
-multi-modal structure can be revealed by running multiple chains from
-different initialisations (a follow-up; see Phase 4C in the plan).
+multi-modal structure could be revealed by running multiple chains
+from different initialisations.
 
 Technique
 ---------
@@ -88,9 +88,9 @@ assert fwd_err < 0.05, f"Forward solve inaccurate: rel-L2 = {fwd_err:.3e}"
 u_net.freeze()
 
 x_true = 0.3
-sigma_obs = 0.02
-u_obs_clean = float(jnp.sin(jnp.pi * x_true))  # ≈ 0.809
-print(f"[inverse] u_obs = {u_obs_clean:.4f}  (x_true = {x_true})")
+sigma_obs = 0.02  # likelihood scale; observation itself is noiseless here.
+u_obs = float(jnp.sin(jnp.pi * x_true))  # ≈ 0.809
+print(f"[inverse] u_obs = {u_obs:.4f}  (x_true = {x_true})")
 
 # Bayesian input parameter.  Initialise near x_true so the chain
 # discovers the left mode (see the non-identifiability caveat above).
@@ -110,7 +110,7 @@ x_query.bayesian(
 u_at_query = u_net(x_query) * x_query * (1 - x_query)
 
 # Gaussian-noise likelihood with known σ.
-residual = (u_at_query - u_obs_clean) / sigma_obs
+residual = (u_at_query - u_obs) / sigma_obs
 
 # Single-point inverse domain — loss has no spatial dependence on a mesh.
 inv_domain = jno.domain.from_array({"pt": np.zeros((1, 1))})

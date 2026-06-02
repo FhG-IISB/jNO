@@ -59,3 +59,19 @@
 10_bayesian_pinns/04_inverse_ode_decay.py | epochs=1000 | rel_k=0.0175 | CI_width=0.1826
 10_bayesian_pinns/05_inverse_surrogate_uncertainty.py | fwd_epochs=3000 | inv_epochs=800 | fwd_rel_L2=5.485865e-05 | x_mean=0.3006 | abs_err=0.0006 | CI_width=0.0253
 10_bayesian_pinns/06_inverse_fem_diffusivity.py | warmup=300 | keep=1000 | fwd_rel_L2=4.0942e-03 | rel_alpha=0.0084 | CI_width=0.0676
+10_bayesian_pinns/01_forward_noisy_poisson_1d.py | epochs=2800 | rel_L2_mean=0.7300 | max_band_width=0.2870
+10_bayesian_pinns/02_inverse_multi_coefficient.py | epochs=800 | rel_A=0.0119 | rel_B=0.0381
+10_bayesian_pinns/03_inverse_reaction_coefficient.py | epochs=600 | rel_k=0.0043 | CI_width=0.1461
+10_bayesian_pinns/04_inverse_ode_decay.py | epochs=1000 | rel_k=0.0175 | CI_width=0.1826
+10_bayesian_pinns/05_inverse_surrogate_uncertainty.py | fwd_epochs=3000 | inv_epochs=800 | fwd_rel_L2=5.485865e-05 | x_mean=0.3006 | abs_err=0.0006 | CI_width=0.0253
+10_bayesian_pinns/06_inverse_fem_diffusivity.py | warmup=300 | keep=1000 | fwd_rel_L2=4.0942e-03 | rel_alpha=0.0084 | CI_width=0.0676
+10_bayesian_pinns/01_forward_noisy_poisson_1d.py | epochs=2800 | rel_L2_mean=0.7300 | max_band_width=0.2870
+10_bayesian_pinns/05_inverse_surrogate_uncertainty.py | fwd_epochs=3000 | inv_epochs=800 | fwd_rel_L2=5.485865e-05 | x_mean=0.3006 | abs_err=0.0006 | CI_width=0.0253
+10_bayesian_pinns/06_inverse_fem_diffusivity.py | warmup=300 | keep=1000 | fwd_rel_L2=4.0942e-03 | rel_alpha=1.0000 | CI_width=0.0000
+10_bayesian_pinns/06_inverse_fem_diffusivity.py | warmup=300 | keep=1000 | fwd_rel_L2=4.0942e-03 | rel_alpha=0.0720 | CI_width=0.4484
+10_bayesian_pinns/01_forward_noisy_poisson_1d.py | epochs=2800 | rel_L2_mean=0.7300 | max_band_width=0.2870
+10_bayesian_pinns/02_inverse_multi_coefficient.py | epochs=800 | rel_A=0.0119 | rel_B=0.0381
+10_bayesian_pinns/03_inverse_reaction_coefficient.py | epochs=600 | rel_k=0.0043 | CI_width=0.1461
+10_bayesian_pinns/04_inverse_ode_decay.py | epochs=1000 | rel_k=0.0175 | CI_width=0.1826
+10_bayesian_pinns/05_inverse_surrogate_uncertainty.py | fwd_epochs=3000 | inv_epochs=800 | fwd_rel_L2=5.485865e-05 | x_mean=0.3006 | abs_err=0.0006 | CI_width=0.0253
+10_bayesian_pinns/06_inverse_fem_diffusivity.py | warmup=300 | keep=1000 | fwd_rel_L2=4.0942e-03 | rel_alpha=0.0720 | CI_width=0.4484

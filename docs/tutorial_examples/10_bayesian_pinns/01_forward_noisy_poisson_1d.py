@@ -1,21 +1,21 @@
-"""01 — Bayesian PINN forward problem: 1-D Poisson with noisy sparse data
+"""01 — Bayesian PINN forward problem: 1-D Poisson with noisy boundary data
 
 Problem
 -------
-    λ u''(x) = f(x),     x ∈ [-0.7, 0.7],     λ = 0.01,
-with u(±0.7) = u_exact(±0.7) (Dirichlet from the analytical solution),
-and the analytical solution
+    u''(x) = -sin(πx),    x ∈ [0, 1],    u(0) = u(1) = 0,
 
-    u_exact(x) = sin(πx) / π² .
+with closed-form reference ``u_exact(x) = sin(πx) / π²``.
 
-(The Yang-et-al. paper uses ``u = sin³(6x)`` and a derived ``f``; we use
-the simpler ``sin(πx)`` here so the assertion still passes with a small
-SGLD chain on CPU.  The setup is otherwise identical.)
+(Compared with the Yang-et-al. §3.2.1 setup, which uses
+``u = sin³(6x)`` on ``[-0.7, 0.7]`` with ``λ = 0.01``, we use the
+simpler unit-coefficient Poisson here so a small SGLD chain on CPU
+recovers the solution within seconds.  The Bayesian setup is otherwise
+identical.)
 
-Sparse "sensors" sample ``f`` at the interior points (exactly, since the
-forcing is analytically known) and ``u`` at the two boundary points
-**with Gaussian observation noise** σ_b = 0.01.  The B-PINN's posterior
-over the network weights then has two visible features:
+The PDE residual is enforced exactly at interior collocation points;
+the two boundary observations carry Gaussian noise of standard
+deviation ``σ_b = 0.01``.  The B-PINN's posterior over the network
+weights then has two visible features:
 
 * the predictive mean fits the analytical solution near the data,
 * the credible band widens in regions with fewer observations.

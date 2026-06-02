@@ -1,7 +1,7 @@
 # Inverse: ODE rate constant (no surrogate)
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/10_bayesian_pinns/05_inverse_ode_decay.py" download>Download .py</a>
+<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/10_bayesian_pinns/04_inverse_ode_decay.py" download>Download .py</a>
 <a class="md-button" href="/jNO_docs/tutorials/10-bayesian-pinns/">Back to chapter</a>
 </div>
 
@@ -23,9 +23,10 @@ vector and the noise model.
 mixed-mode noise that makes the posterior brittle to hyperparameters.
 A direct analytical likelihood gives a properly-defined Bayesian
 inference where hyperparameters affect *chain efficiency* only — not
-the *target*.  Compare with [the source-recovery
-tutorial](./inverse-source-steady-state.md) which uses a surrogate
-because its PDE doesn't have a tractable closed form.
+the *target*.  See [Inverse FEM
+Diffusivity](./inverse-fem-diffusivity.md) for the pattern when no
+closed form is available: jNO's FEM solver provides the differentiable
+forward and blackjax samples the posterior directly.
 
 ## References
 
@@ -40,5 +41,5 @@ Journal of Machine Learning Research, 15(1), 1593-1623.
 ## Script
 
 ```python
---8<-- "tutorial_examples/10_bayesian_pinns/05_inverse_ode_decay.py"
+--8<-- "tutorial_examples/10_bayesian_pinns/04_inverse_ode_decay.py"
 ```

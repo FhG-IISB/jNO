@@ -34,13 +34,9 @@ a = jno.np.parameter((1,), key=k1, name="a")
 b = jno.np.parameter((1,), key=k2, name="b")
 
 for p in [a, b]:
-    p.bayesian(
-        blackjax.nuts,
-        step_size=1e-2,
-        inverse_mass_matrix=jnp.ones(1),
-        warmup=500,
-        keep=1000,
-    )
+    # inverse_mass_matrix defaults to identity of the right shape;
+    # adapt=True (default) tunes step_size and IMM via blackjax.window_adaptation.
+    p.bayesian(blackjax.nuts, step_size=1e-2, warmup=500, keep=1000)
 
 residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
 crux = jno.core([residual.mse], dom)
@@ -159,7 +155,7 @@ bc   = net(xb) - 0.0
 crux = jno.core([pde.mse, bc.mse], dom)
 crux.solve(3000)
 
-(u_chain,) = crux.eval([u], samples="chain")
+u_chain = crux.eval([u], samples="chain")
 u_mean     = jnp.mean(u_chain, axis=0)
 u_lo, u_hi = jnp.quantile(u_chain, jnp.array([0.05, 0.95]), axis=0)
 ```
@@ -176,8 +172,7 @@ def laplace_prior(p, scale=1.0):
         if hasattr(leaf, "dtype") and jnp.issubdtype(leaf.dtype, jnp.floating)
     ) / scale
 
-a.bayesian(blackjax.nuts, step_size=1e-2,
-           inverse_mass_matrix=jnp.ones(1), prior=laplace_prior)
+a.bayesian(blackjax.nuts, step_size=1e-2, prior=laplace_prior)
 ```
 
 The default prior is a wide isotropic Gaussian with σ=10 over every
@@ -243,11 +238,28 @@ step dispatch.
 
 ## Limitations (this release)
 
-- **No combination with `substeps=`** — using both in one `solve()` raises
-  a clear error.
-- **No automatic adaptation** — supply `step_size` (and
-  `inverse_mass_matrix` for HMC/NUTS) yourself.
 - **VI (`blackjax.vi.*`)** has different mechanics (ELBO optimisation) and
   is not yet routed through `.bayesian()`.
+- **Multi-chain** — chains are single-chain only.  Running K chains for
+  R-hat / cross-chain diagnostics needs K separate `solve()` calls and
+  manual stacking (or a follow-up that wires `jax.vmap` over seeds).
 - **Discrete posteriors** (e.g. over `Choice` selections) need SMC and are
   out of scope.
+- **Custom forward models outside the jNO tracer** (FEM solver, ODE
+  integrator, finite volume) can't be wrapped in `.bayesian()` directly —
+  the API expects the forward to be expressible as a jNO Placeholder
+  expression.  For those cases use blackjax directly with jNO supplying
+  the differentiable forward; see [Inverse FEM
+  Diffusivity](../tutorials/10-bayesian-pinns/inverse-fem-diffusivity.md)
+  for the pattern.
+
+## Combining with `substeps=`
+
+`substeps=` is supported with `.bayesian()` to enable the *two-stage
+decoupled inference* pattern: substep 0 trains a surrogate via optax,
+substep 1 runs one NUTS proposal on a Bayesian coefficient with the
+surrogate `stop_gradient`-ed.  See the section index of the
+[Bayesian PINNs tutorial chapter](../tutorials/10-bayesian-pinns/index.md).
+When using substeps you must set `adapt=False` on the Bayesian model —
+window adaptation runs against the full loss but the kernel only sees
+the substep-local constraint set.
