@@ -1529,11 +1529,6 @@ class core:
         zeros = jnp.zeros(self.n_constraints)
 
         _has_bayesian = any(fm._bayesian_cfg is not None for fm in flax_mods.values())
-        if substeps is not None and _has_bayesian:
-            raise ValueError(
-                "Combining substeps= with .bayesian() is not supported in this release. "
-                "Run Bayesian sampling without substeps for now, or open an issue if you need both."
-            )
         if accumulation_steps > 1 and _has_bayesian:
             raise ValueError(
                 "Combining accumulation_steps>1 with .bayesian() is not supported in this release. "
@@ -1815,7 +1810,18 @@ class core:
         # full domain context.  Replaces step_size + inverse_mass_matrix on
         # the matching handles, seeds opt_states with the adapted state,
         # and zeroes handle.warmup so the main loop collects from epoch 0.
+        # Window adaptation runs against the full constraint set.  With
+        # substeps, the Bayesian kernel sees only a substep-local subset,
+        # so an adapter tuned to the full loss would mis-tune.  Force
+        # users to set adapt=False (or skip substeps) in that case.
         _adapt_candidates = [(k, h) for k, h in bayesian_handles.items() if jno_bayesian.adapt_is_applicable(h)]
+        if _use_substeps and _adapt_candidates:
+            raise ValueError(
+                "Combining substeps= with .bayesian(..., adapt=True) is not supported. "
+                "When using substeps, set adapt=False on each Bayesian model — window "
+                "adaptation would tune against the full loss, but the kernel in a "
+                "substep sees only the substep's constraints."
+            )
         if _adapt_candidates:
             _adapt_loss_fn = self._make_loss_fn(
                 self.compiled_constraints_fn,
@@ -2033,12 +2039,19 @@ class core:
                     _per_model_opts_i = {k: v for k, v in per_model_opts.items() if int(k) in _active_lids}
                     _lr_schedules_i = {k: v for k, v in lr_schedules.items() if int(k) in _active_lids}
                     _group_lr_i = {k: v for k, v in group_lr_schedules.items() if int(k) in _active_lids}
+                    # Per-substep Bayesian handles — only kernels for models
+                    # whose params receive non-zero gradient from this
+                    # substep's constraints participate in this substep.
+                    _bayesian_handles_i = {k: v for k, v in bayesian_handles.items() if int(k) in _active_lids}
 
-                    # Fresh optimizer states — isolated from other substeps
+                    # Fresh optimizer / kernel states — isolated from other substeps
                     _opt_states_i: Dict[str, Any] = {}
-                    for _k in _per_model_opts_i:
+                    for _k in sorted({*_per_model_opts_i.keys(), *_bayesian_handles_i.keys()}):
                         _lid_i = int(_k)
-                        _state_i = _per_model_opts_i[_k].init(trainable[_lid_i])
+                        if _k in _bayesian_handles_i:
+                            _state_i = jno_bayesian.init_state(_bayesian_handles_i[_k], trainable[_lid_i])
+                        else:
+                            _state_i = _per_model_opts_i[_k].init(trainable[_lid_i])
                         _opt_states_i[_k] = jax.tree_util.tree_map(
                             lambda x: (
                                 jax.device_put(jnp.copy(x), NamedSharding(self.mesh, P()))
@@ -2061,6 +2074,7 @@ class core:
                         checkpoint_gradients=checkpoint_gradients,
                         min_consecutive=min_consecutive,
                         compiled_constraints_fn=_compiled_fn_i,
+                        bayesian_handles=_bayesian_handles_i,
                     )
 
                     _zeros_i = jax.device_put(jnp.zeros(_n_constraints_i), replicated)

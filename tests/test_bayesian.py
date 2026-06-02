@@ -314,22 +314,49 @@ class TestCustomPrior:
 
 
 # ---------------------------------------------------------------------------
-# Substeps + Bayesian → explicit error
+# Substeps + Bayesian — two-stage decoupled inference
 # ---------------------------------------------------------------------------
 
 
-class TestSubstepsBayesianGuard:
-    def test_substeps_with_bayesian_raises(self):
+class TestSubstepsWithBayesian:
+    """`substeps=` is allowed with `.bayesian()`.  The classic use case is
+    two-stage decoupled inference: substep 0 trains a surrogate (optax),
+    substep 1 samples a coefficient against the trained surrogate (NUTS).
+    Each substep's active-models set is detected from gradient probing, so
+    the surrogate doesn't update in substep 1 and the coefficient isn't
+    touched in substep 0.
+
+    When ``adapt=True`` is set on a Bayesian model AND substeps= is in
+    play, we raise — the adapter would tune against the full loss but the
+    kernel only sees substep-local constraints."""
+
+    def test_substeps_with_bayesian_runs(self):
         π = jno.np.pi
         dom = _line_domain()
         x, _ = dom.variable("interior")
         target = jno.np.sin(π * x)
         a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
-        a.bayesian(blackjax.nuts, step_size=1e-2, inverse_mass_matrix=jnp.ones(1))
+        a.bayesian(blackjax.nuts, step_size=1e-2, warmup=5, keep=10, adapt=False)
         residual = a * jno.np.sin(π * x) - target
         crux = jno.core([residual.mse, residual.mse], dom)
-        with pytest.raises(ValueError, match="substeps.*not supported"):
-            crux.solve(5, substeps=[[0], [1]])
+        crux.solve(15, substeps=[[0], [1]])
+        # Bayesian model collects samples once per outer epoch from whichever
+        # substep updated its position.
+        assert a.posterior_samples is not None
+        assert a.posterior_samples.shape == (10, 1)
+
+    def test_substeps_with_adapt_true_raises(self):
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = jno.np.sin(π * x)
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        # adapt=True is the default — make it explicit for clarity.
+        a.bayesian(blackjax.nuts, step_size=1e-2, warmup=5, keep=5, adapt=True)
+        residual = a * jno.np.sin(π * x) - target
+        crux = jno.core([residual.mse, residual.mse], dom)
+        with pytest.raises(ValueError, match="substeps.*adapt=True"):
+            crux.solve(10, substeps=[[0], [1]])
 
 
 # ---------------------------------------------------------------------------
