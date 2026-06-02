@@ -125,7 +125,7 @@ def make_diffrax_block(
         solve_dtype = state0.dtype
         M = jnp.asarray(block.M, dtype=solve_dtype)
         op_fn = operator_fn if operator_fn is not None else block.operator_fn
-        A_const = ( None if op_fn is not None else jnp.asarray(block.A, dtype=solve_dtype))
+        A_const = None if op_fn is not None else jnp.asarray(block.A, dtype=solve_dtype)
 
         if block.affine_bias is None:
             c = jnp.zeros((M.shape[0],), dtype=M.dtype)

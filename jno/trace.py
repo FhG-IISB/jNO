@@ -2113,8 +2113,7 @@ class FemLinearSystem:
     def __iter__(self):
         if self.is_parametric:
             raise TypeError(
-                "This FEM system depends on runtime parameters. "
-                "Call system.evaluate(args={...}) before unpacking."
+                "This FEM system depends on runtime parameters. Call system.evaluate(args={...}) before unpacking."
             )
         yield self.A
         yield self.b
@@ -2146,13 +2145,7 @@ class FemLinearSystem:
 
     def __repr__(self):
         shape = getattr(self.A, "shape", None)
-        return (
-            "FemLinearSystem("
-            f"shape={shape}, "
-            f"b_shape={getattr(self.b, 'shape', None)}, "
-            f"parametric={self.is_parametric}"
-            ")"
-        )
+        return f"FemLinearSystem(shape={shape}, b_shape={getattr(self.b, 'shape', None)}, parametric={self.is_parametric})"
 
 
 class FemResidualOperator:
