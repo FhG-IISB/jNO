@@ -16,6 +16,8 @@ Background and API reference live in
 | 02 | [`inverse_multi_coefficient`](./inverse-multi-coefficient.md) | Per-parameter NUTS on (A, B) of a noisy harmonic-regression target — purest demonstration of `.bayesian()` for each scalar. | Yang et al. 2021 |
 | 03 | [`inverse_reaction_coefficient`](./inverse-reaction-coefficient.md) | NUTS on the scalar `k` in `λ u'' + k tanh(u) = f` using the closed-form `u` — a fixed-target posterior. | Yang et al. 2021 §3.3.1 |
 | 04 | [`inverse_ode_decay`](./inverse-ode-decay.md) | First-order decay ODE `du/dt = -k u`; recovers `k` from noisy observations using the closed-form `exp(-kt)` — no surrogate, fixed-target posterior. | Linka et al. 2022 |
+| 05 | [`inverse_surrogate_uncertainty`](./inverse-surrogate-uncertainty.md) | Forward-then-freeze: train a PINN surrogate of `sin(πx)`, then NUTS samples the **inverted input** `x_query` given a noisy observation — calibrated uncertainty on the inverse output. | — |
+| 06 | [`inverse_fem_diffusivity`](./inverse-fem-diffusivity.md) | Bayesian inference with jNO's **FEM solver** as the differentiable forward: recover the scalar diffusivity `α` in `-α Δu = f` from noisy nodal observations.  Pattern for any numerical (non-closed-form) forward. | — |
 
 ## When to use a neural surrogate (and when not to)
 
