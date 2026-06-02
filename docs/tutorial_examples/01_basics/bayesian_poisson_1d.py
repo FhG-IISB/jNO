@@ -70,8 +70,8 @@ crux = jno.core([pde.mse, bc.mse], domain)
 crux.solve(2800)
 
 # ── Posterior prediction bands ────────────────────────────────────────────────
-u_chain = crux.eval([u])                  # auto-chain: shape (n_kept, n_points, 1)
-u_exact = crux.eval([u_exact_expr])       # no Bayesian deps → point value
+u_chain = crux.eval([u])  # auto-chain: shape (n_kept, n_points, 1)
+u_exact = crux.eval([u_exact_expr])  # no Bayesian deps → point value
 u_mean = jnp.mean(u_chain, axis=0)
 u_lo, u_hi = jnp.quantile(u_chain, jnp.array([0.05, 0.95]), axis=0)
 

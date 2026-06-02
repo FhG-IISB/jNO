@@ -43,10 +43,11 @@ a = jno.np.parameter((1,), key=k1, name="a")
 b = jno.np.parameter((1,), key=k2, name="b")
 
 for p in [a, b]:
+    # inverse_mass_matrix defaults to identity of the right shape — see
+    # docs/training/bayesian.md.
     p.bayesian(
         blackjax.nuts,
         step_size=1e-2,
-        inverse_mass_matrix=jnp.ones(1),
         warmup=300,
         keep=500,
     )

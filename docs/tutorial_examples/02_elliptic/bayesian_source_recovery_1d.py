@@ -71,7 +71,6 @@ A = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="A")
 A.bayesian(
     blackjax.nuts,
     step_size=2e-2,
-    inverse_mass_matrix=jnp.ones(1),
     warmup=80,
     keep=150,
     max_num_doublings=4,

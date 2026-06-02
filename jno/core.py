@@ -3148,9 +3148,7 @@ class core:
             operation = [operation]
 
         if samples not in ("auto", "chain", "point"):
-            raise ValueError(
-                f"crux.eval(samples=...) expects 'auto' | 'chain' | 'point', got {samples!r}."
-            )
+            raise ValueError(f"crux.eval(samples=...) expects 'auto' | 'chain' | 'point', got {samples!r}.")
 
         domain_data = self.domain_data if domain is None else self.prepare_domain_data(domain)
         _models = self._unwrapped_models

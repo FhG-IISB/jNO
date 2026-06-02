@@ -156,6 +156,46 @@ def build_kernel_handle(cfg: dict) -> _KernelHandle:
     return _KernelHandle(factory, kind, prior_fn, float(step_size), user_kwargs, warmup, keep, thin)
 
 
+def _flat_inexact_size(position) -> int:
+    """Total number of inexact (floating/complex) array entries in ``position``."""
+    n = 0
+    for leaf in jax.tree_util.tree_leaves(position):
+        if hasattr(leaf, "dtype") and jnp.issubdtype(leaf.dtype, jnp.inexact):
+            n += int(leaf.size)
+    return n
+
+
+def _maybe_inject_inverse_mass_matrix(handle: _KernelHandle, position) -> None:
+    """If the kernel accepts ``inverse_mass_matrix`` and the user didn't pass
+    one, default to identity of the inferred shape ``(D,)``.  A scalar
+    ``inverse_mass_matrix=1.5`` is broadcast to the same shape.
+
+    Mutates ``handle.extra_kwargs`` in place.  Safe to call on non-full
+    kernels (MALA / SGLD / SGHMC) — they don't expose the kwarg and the
+    function exits early.
+    """
+    target = getattr(handle.factory, "differentiable", handle.factory)
+    try:
+        sig = inspect.signature(target)
+    except (TypeError, ValueError):
+        return
+    if "inverse_mass_matrix" not in sig.parameters:
+        return
+
+    d = _flat_inexact_size(position)
+    if d == 0:
+        return  # nothing trainable; let blackjax raise downstream
+
+    current = handle.extra_kwargs.get("inverse_mass_matrix", None)
+    if current is None:
+        handle.extra_kwargs["inverse_mass_matrix"] = jnp.ones(d)
+        return
+
+    arr = jnp.asarray(current)
+    if arr.ndim == 0:
+        handle.extra_kwargs["inverse_mass_matrix"] = jnp.full((d,), float(arr))
+
+
 def init_state(handle: _KernelHandle, position):
     """Initialise the kernel state for ``position``.
 
@@ -163,7 +203,12 @@ def init_state(handle: _KernelHandle, position):
     logdensity (the prior alone) just to call ``.init`` — the real
     logdensity is rebuilt per step.  For SG-MCMC, ``init`` only needs the
     position.
+
+    Before constructing the kernel we may inject a default
+    ``inverse_mass_matrix`` of identity shape inferred from ``position`` —
+    see :func:`_maybe_inject_inverse_mass_matrix`.
     """
+    _maybe_inject_inverse_mass_matrix(handle, position)
     factory = handle.factory
     if handle.kind == "full":
         kernel = factory(handle.prior_fn, **handle.extra_kwargs)
