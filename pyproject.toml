@@ -39,7 +39,8 @@ dependencies = [
     "matplotlib>=3.8.0",
     "pylotte>=0.3",
     "shapely>=2.0",
-    "paramax>=0.0.5"
+    "paramax>=0.0.5",
+    "blackjax>=1.2"
 ]
 
 [project.urls]
@@ -135,6 +136,7 @@ platforms = ["linux-64"]
 jax-neural-operators = { path = ".", editable = true }
 jax-cuda12-plugin = { version = ">=0.10.1,<0.11", extras = ["with-cuda"] }
 paramax = ">=0.0.5"
+blackjax = ">=1.2"
 
 [tool.pixi.environments]
 # The default environment already includes a CUDA-capable JAX wheel via

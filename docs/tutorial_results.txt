@@ -1,2 +1,10 @@
 06_integration/fredholm_integral_equation.py | epochs=50000 | rel_L2=1.974346e-04
 06_integration/heat_time_mean.py | epochs=10000 | rel_L2_u=0.000000e+00 | rel_L2_mean=2.629577e-04
+05_coupled_and_inverse/bayesian_inverse_parameter.py | epochs=800 | rel_A=0.0015 | rel_B=0.0566
+01_basics/bayesian_poisson_1d.py | epochs=1200 | rel_L2_mean=0.6293 | max_band_width=0.2119
+01_basics/bayesian_poisson_1d.py | epochs=1200 | rel_L2_mean=0.7301 | max_band_width=0.2870
+01_basics/bayesian_poisson_1d.py | epochs=1200 | rel_L2_mean=0.7301 | max_band_width=0.2870
+02_elliptic/bayesian_source_recovery_1d.py | epochs=230 | rel_A=0.1301 | CI_width=2.7007
+05_coupled_and_inverse/bayesian_inverse_parameter.py | epochs=800 | rel_A=0.0015 | rel_B=0.0566
+01_basics/bayesian_poisson_1d.py | epochs=2800 | rel_L2_mean=0.7301 | max_band_width=0.2870
+02_elliptic/bayesian_source_recovery_1d.py | epochs=230 | rel_A=0.1301 | CI_width=2.7007

@@ -13,6 +13,7 @@ from jax.experimental import mesh_utils
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from . import bayesian as jno_bayesian
 from .architectures.lora import (
     LoRAWrapper as _LoRAWrapper,
 )
@@ -772,6 +773,7 @@ class core:
         checkpoint_gradients=False,
         min_consecutive=1,
         compiled_constraints_fn=None,
+        bayesian_handles=None,
     ):
         """Build a single JIT-compiled training step.
 
@@ -791,6 +793,9 @@ class core:
             checkpoint_gradients: Wrap constraint evaluations in ``jax.checkpoint``.
             compiled_constraints_fn: Override the default combined constraint function.
                 Used by ``substeps`` to supply per-substep compiled functions.
+            bayesian_handles: Optional ``{layer_id_str: _KernelHandle}`` for
+                models configured with ``.bayesian()``.  Their per-step update
+                runs a blackjax MCMC kernel instead of the optax chain.
         """
         _compiled_fn = compiled_constraints_fn if compiled_constraints_fn is not None else self.compiled_constraints_fn
         loss_fn = self._make_loss_fn(
@@ -802,7 +807,11 @@ class core:
             min_consecutive=min_consecutive,
         )
 
-        lid_keys = sorted(per_model_opts.keys())  # deterministic order
+        bayesian_handles = bayesian_handles or {}
+        # per_model_opts and bayesian_handles are disjoint by construction:
+        # each model has exactly one backend (optax OR blackjax kernel).
+        opt_keys = sorted(per_model_opts.keys())
+        bay_keys = sorted(bayesian_handles.keys())
         base_epoch = self._total_epochs
         _group_lr = group_lr_schedules or {}  # {k: [(mask, sched), ..., (None, global_sched)]}
 
@@ -814,8 +823,8 @@ class core:
 
             (total_loss, individual_losses), grads = jax.value_and_grad(loss_wrapper, has_aux=True)(trainable)
 
-            # ── per-model optimizer step ──
-            for k in lid_keys:
+            # ── per-model optimizer step (optax models only) ──
+            for k in opt_keys:
                 lid = int(k)
                 model_grads = grads[lid]
                 model_params = trainable[lid]
@@ -849,6 +858,43 @@ class core:
                     **trainable,
                     lid: optax.apply_updates(model_params, updates),
                 }
+                opt_states = {**opt_states, k: new_state}
+
+            # ── per-model Bayesian step (blackjax kernels) ──
+            for k in bay_keys:
+                lid = int(k)
+                handle = bayesian_handles[k]
+                rng, kernel_key = jax.random.split(rng)
+
+                # logdensity_fn closes over the *current* trainable / context;
+                # blackjax kernels re-evaluate this closure during their step.
+                # We pass step_rng as the loss key so any minibatch slice or
+                # jno.noise term is consistent across the leapfrog/integrator
+                # evaluations within a single kernel.step call.
+                def logdensity_fn(p, _lid=lid, _h=handle):
+                    full = {**trainable, _lid: p}
+                    nll, _ = loss_fn(full, context, step_rng)
+                    return -nll + _h.prior_fn(p)
+
+                def grad_estimator(p, minibatch, _lid=lid, _h=handle):
+                    def neg_log_post(pp):
+                        full = {**trainable, _lid: pp}
+                        nll, _ = loss_fn(full, minibatch, step_rng)
+                        return -nll + _h.prior_fn(pp)
+
+                    return jax.grad(neg_log_post)(p)
+
+                new_state, new_position = jno_bayesian.step(
+                    handle,
+                    kernel_key,
+                    opt_states[k],
+                    trainable[lid],
+                    logdensity_fn,
+                    grad_estimator,
+                    context,
+                )
+
+                trainable = {**trainable, lid: new_position}
                 opt_states = {**opt_states, k: new_state}
 
             next_epoch = start_epoch + jnp.asarray(1, dtype=start_epoch.dtype)
@@ -1308,16 +1354,19 @@ class core:
         # ── 1. Collect Model metadata ──
         flax_mods = self._collect_flax_modules()  # {layer_id: Model}
 
-        # Validate: every non-frozen model must have an optimizer.
-        # A frozen model that has LoRA active is also "effectively trainable"
-        # (LoRA overrides freeze) and therefore also needs an optimizer.
+        # Validate: every non-frozen model must have either an optimizer or
+        # a Bayesian sampler attached.  A frozen model that has LoRA active
+        # is also "effectively trainable" (LoRA overrides freeze) and
+        # therefore needs one of the two.
         for lid, fm in flax_mods.items():
-            needs_optimizer = (not fm._frozen) or (fm._lora_config is not None)
-            if needs_optimizer and fm._opt_fn is None:
+            needs_update = (not fm._frozen) or (fm._lora_config is not None)
+            has_backend = fm._opt_fn is not None or fm._bayesian_cfg is not None
+            if needs_update and not has_backend:
                 raise ValueError(
                     f"Model '{fm.name or type(fm.module).__name__}' (layer {lid}) "
-                    f"has no optimizer. Either attach one before solve(), or freeze "
-                    f"the model with model.freeze().\n"
+                    f"has no optimizer. Attach one with model.optimizer(...) or "
+                    f"sample its posterior with model.bayesian(...), or freeze the "
+                    f"model with model.freeze().\n"
                     f"Example setup:\n"
                     f"    import jno, optax\n"
                     f"    model = jno.nn.wrap(my_eqx_module)\n"
@@ -1472,11 +1521,25 @@ class core:
         # Shard trainable params
         trainable = self._shard_params(trainable)
 
-        # ── 5. Build per-model optimizers ──
+        # ── 5. Build per-model optimizers and Bayesian kernels ──
         per_model_opts: Dict[str, optax.GradientTransformation] = {}  # {str(lid): optax chain}
         lr_schedules: Dict[str, Any] = {}  # {str(lid): LearningRateSchedule} — global only
         group_lr_schedules: Dict[str, Any] = {}  # {str(lid): [sched_per_masked_group]} — when groups present
+        bayesian_handles: Dict[str, Any] = {}  # {str(lid): _KernelHandle} for .bayesian() models
         zeros = jnp.zeros(self.n_constraints)
+
+        _has_bayesian = any(fm._bayesian_cfg is not None for fm in flax_mods.values())
+        if substeps is not None and _has_bayesian:
+            raise ValueError(
+                "Combining substeps= with .bayesian() is not supported in this release. "
+                "Run Bayesian sampling without substeps for now, or open an issue if you need both."
+            )
+        if accumulation_steps > 1 and _has_bayesian:
+            raise ValueError(
+                "Combining accumulation_steps>1 with .bayesian() is not supported in this release. "
+                "Bayesian models are dispatched through the blackjax kernel; the optax-style "
+                "gradient accumulation does not apply to them."
+            )
 
         def _build_opt_chain(opt_fn, lr_sched):
             """Build an optax chain with inject_hyperparams LR scaling."""
@@ -1505,6 +1568,26 @@ class core:
             if fm._frozen and fm._lora_config is None:
                 continue
             k = str(lid)
+
+            # Bayesian models: route through bayesian_handles only — they
+            # are NOT added to per_model_opts.  The step dispatcher checks
+            # both dicts; opt_states carries either an optax state (for
+            # optax models) or a kernel state (for Bayesian models).
+            if fm._bayesian_cfg is not None:
+                if fm._param_groups:
+                    raise NotImplementedError(
+                        f"Model (layer {lid}): combining .mask().bayesian() with parameter "
+                        "groups is not supported yet. Use .bayesian() on the whole model "
+                        "or .mask().optimizer() — not both on the same model."
+                    )
+                handle = jno_bayesian.build_kernel_handle(fm._bayesian_cfg)
+                bayesian_handles[k] = handle
+                self.log.info(
+                    f"Model {lid}: Bayesian sampling via "
+                    f"{getattr(handle.factory, '__name__', handle.factory)!r} "
+                    f"(kind={handle.kind}, warmup={handle.warmup}, keep={handle.keep}, thin={handle.thin})"
+                )
+                continue
 
             if fm._param_groups and fm._lora_config is None:
                 # ── Per-group optimizer via chained optax.masked transforms ──
@@ -1630,11 +1713,16 @@ class core:
                 per_model_opts[k] = optax.chain(base_opt, scale)
                 lr_schedules[k] = lr_sched
 
-        # Initialise optimizer states and place on mesh
+        # Initialise optimizer / kernel states and place on mesh.  We
+        # iterate the union of optax and Bayesian keys; each model has
+        # exactly one of the two backends.
         opt_states = {}
-        for k in per_model_opts:
+        for k in sorted({*per_model_opts.keys(), *bayesian_handles.keys()}):
             lid = int(k)
-            state = per_model_opts[k].init(trainable[lid])
+            if k in bayesian_handles:
+                state = jno_bayesian.init_state(bayesian_handles[k], trainable[lid])
+            else:
+                state = per_model_opts[k].init(trainable[lid])
             # Copy every array leaf so that aliased buffers (e.g. from
             # L-BFGS zero-initialised history arrays that share the same
             # underlying allocation) become distinct.  Without this,
@@ -1732,6 +1820,7 @@ class core:
             group_lr_schedules=group_lr_schedules,
             checkpoint_gradients=checkpoint_gradients,
             min_consecutive=min_consecutive,
+            bayesian_handles=bayesian_handles,
         )
 
         # Optionally amortise Python dispatch overhead by running multiple
@@ -2101,6 +2190,13 @@ class core:
             log_timestamps = []
             log_track_stats = []
 
+            # Bayesian sample buffers — one per Bayesian model.  We append the
+            # post-update position (a device array pytree) every `thin` outer
+            # epochs after `warmup`, capped at `keep` samples.  Storing device
+            # arrays keeps the loop async; the actual host transfer happens at
+            # the end of solve() via jnp.stack + jax.device_get.
+            _bayesian_buffers: Dict[str, list] = {k: [] for k in bayesian_handles}
+
             rng_np = np.random.default_rng(int(jax.device_get(self.rng[0])))
             st = time.time()
             epoch_jnp = jax.device_put(jnp.int32(0), replicated)
@@ -2416,6 +2512,28 @@ class core:
                 if not _use_substeps:
                     prev_losses = individual_losses
 
+                # --- collect Bayesian samples (post-warmup, thinned, capped at keep) ---
+                if bayesian_handles:
+                    for _bk, _handle in bayesian_handles.items():
+                        _idx = outer_epoch
+                        if _idx < _handle.warmup:
+                            continue
+                        _post = _idx - _handle.warmup
+                        if _post % _handle.thin != 0:
+                            continue
+                        _buf = _bayesian_buffers[_bk]
+                        if len(_buf) >= _handle.keep:
+                            continue
+                        _lid_int = int(_bk)
+                        # Detach from buffer donation: a jnp.copy of every
+                        # array leaf gives us our own buffers that survive
+                        # the next jit_step's donate_argnums.
+                        _sample = jax.tree_util.tree_map(
+                            lambda x: jnp.copy(x) if isinstance(x, (jnp.ndarray, jax.Array)) else x,
+                            trainable[_lid_int],
+                        )
+                        _buf.append(_sample)
+
                 # Stop profiling after the requested steady-state window.
                 if _profile_active and outer_epoch + 1 >= _profile_stop:
                     _profile_ctx.__exit__(None, None, None)
@@ -2536,6 +2654,22 @@ class core:
             # Update every Model to point at the trained model.
             for lid, fm in flax_mods.items():
                 fm.module = trained_models[lid]
+
+            # ── 9c. Flush Bayesian sample buffers ──
+            # Each buffer is a list of module-shaped pytrees (one per
+            # collected step).  Stack along a leading sample axis and stash on
+            # the Model in its full wrapped form; the user-facing
+            # `posterior_samples` property auto-unwraps single-leaf
+            # ``jno.np.parameter`` wrappers for convenience.
+            for _bk, _buf in _bayesian_buffers.items():
+                _lid_int = int(_bk)
+                _fm = flax_mods.get(_lid_int)
+                if _fm is None:
+                    continue
+                if len(_buf) == 0:
+                    _fm._posterior_samples_pytree = None
+                    continue
+                _fm._posterior_samples_pytree = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *_buf)
 
             # ── 10. Build log dict ──
             logs = {
@@ -2981,9 +3115,22 @@ class core:
         domain: Optional[domain] = None,
         min_consecutive: Optional[int] = 1,
         key=None,
+        samples: Optional[str] = None,
     ):
-        """
-        Evaluates an operation or a list of operations on the current models and domain context.
+        """Evaluate an operation (or list of operations) on the current models.
+
+        Args:
+            operation: Expression(s) to evaluate.
+            domain:    Override the stored domain.
+            min_consecutive: Consecutive-time-step window for time-dependent
+                expressions.
+            key: Optional PRNG key for stochastic ops.
+            samples: If ``"chain"``, ``vmap`` the evaluator over the leading
+                sample axis of every Bayesian model's ``posterior_samples``;
+                non-Bayesian models broadcast their point value.  Returns
+                pytrees with shape ``(n_samples, *original_shape)``.  Default
+                ``None`` evaluates at the current point values (last sample
+                for Bayesian models, trained value for optax models).
         """
 
         if isinstance(operation, Placeholder):
@@ -2992,18 +3139,96 @@ class core:
         domain_data = self.domain_data if domain is None else self.prepare_domain_data(domain)
 
         _models = self._unwrapped_models
+
+        if samples is None:
+            results = []
+            for op in operation:
+                fn = TraceCompiler.compile_traced_expression(op, self.all_ops)
+                results.append(
+                    fn(
+                        _models,
+                        domain_data.context,
+                        batchsize=None,
+                        key=key,
+                        min_consecutive=min_consecutive,
+                    )
+                )
+            return results[0] if len(results) == 1 else results
+
+        if samples != "chain":
+            raise ValueError(f"crux.eval(samples=...) supports None or 'chain', got {samples!r}.")
+
+        # Collect posterior chains from any Bayesian models in the graph.
+        # We use the raw wrapped pytree (_posterior_samples_pytree) so that
+        # vmap can substitute it as drop-in for the model in the trace.
+        posterior_by_lid: Dict[int, Any] = {}
+
+        def _record(m):
+            raw = getattr(m, "_posterior_samples_pytree", None)
+            if raw is not None:
+                posterior_by_lid[m.layer_id] = raw
+
+        def _walk(node, _seen=set()):
+            if id(node) in _seen:
+                return
+            _seen.add(id(node))
+            if isinstance(node, Model):
+                _record(node)
+                return
+            if isinstance(node, ModelCall):
+                _record(node.model)
+                for a in node.args:
+                    if isinstance(a, Placeholder):
+                        _walk(a, _seen)
+                return
+            if isinstance(node, BinaryOp):
+                _walk(node.left, _seen)
+                _walk(node.right, _seen)
+                return
+            if isinstance(node, FunctionCall):
+                for a in node.args:
+                    if isinstance(a, Placeholder):
+                        _walk(a, _seen)
+                return
+            if isinstance(node, OperationCall):
+                _walk(node.operation.expr, _seen)
+                for a in node.args:
+                    if isinstance(a, Placeholder):
+                        _walk(a, _seen)
+                return
+            if isinstance(node, OperationDef):
+                _walk(node.expr, _seen)
+                return
+            # Other node types (Variable, Literal, etc.) have no nested models.
+
+        for op in operation:
+            _walk(op)
+
+        if not posterior_by_lid:
+            raise ValueError(
+                "samples='chain' was requested but no models in the given expression(s) "
+                "carry posterior_samples. Configure one or more parameters with "
+                ".bayesian(...) and run crux.solve() before calling eval(samples='chain')."
+            )
+
+        chain_part, static_part = jno_bayesian.chain_params_for_eval(_models, posterior_by_lid)
+
+        ctx = domain_data.context
         results = []
         for op in operation:
             fn = TraceCompiler.compile_traced_expression(op, self.all_ops)
-            results.append(
-                fn(
-                    _models,
-                    domain_data.context,
+
+            def _one(_chain_p, _fn=fn):
+                params = {**static_part, **_chain_p}
+                return _fn(
+                    params,
+                    ctx,
                     batchsize=None,
                     key=key,
                     min_consecutive=min_consecutive,
                 )
-            )
+
+            results.append(jax.vmap(_one)(chain_part))
 
         return results[0] if len(results) == 1 else results
 
