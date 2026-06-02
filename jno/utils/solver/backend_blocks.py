@@ -341,7 +341,15 @@ class FeaxTimeBlock:
     # linear semidiscrete payload
     M: Any = None
     A: Any = None
+    # Optional runtime callback:
+    #     operator_fn(t, args) -> A(t, args)
+    #
+    # For the heat inverse example:
+    #     A(t, args) = A0 + args["nu"] * K
     operator_fn: Optional[Callable] = None
+    # Diagnostic payload generated during symbolic lowering.
+    runtime_parameter_exprs: Dict[str, Any] = field(default_factory=dict)
+    operator_basis: Dict[str, Any] = field(default_factory=dict)
     affine_bias: Any = None
     forcing_vector_fn: Optional[Callable] = None
 

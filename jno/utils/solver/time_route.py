@@ -29,6 +29,7 @@ from ...trace import (
     Hessian,
     Jacobian,
     Literal,
+    ModelCall,
     Placeholder,
     StateField,
     TensorTag,
@@ -45,7 +46,7 @@ from .feax_utils import (
     _prepare_feax_runtime,
 )
 from .solver_helper import (
-    collect_temporal_tags as _collect_temporal_tags,
+    collect_temporal_tags as _collect_temporal_tags, iter_children as _iter_children,
 )
 from .solver_helper import (
     contains_model_call as _contains_model_call,
@@ -1128,6 +1129,146 @@ def _make_ir(domain, terms):
 
     return LoweredWeakForm(domain=domain, terms=list(terms))
 
+def _is_runtime_scalar_parameter(node) -> bool:
+    """Return True for zero-argument trainable jNO physical parameters."""
+    return (
+        isinstance(node, ModelCall)
+        and len(node.args) == 0
+        and bool(getattr(node.model, "_is_parameter", False))
+    )
+
+
+def _contains_runtime_parameter(node) -> bool:
+    """Recursively detect trainable physical parameters in one trace subtree."""
+    if _is_runtime_scalar_parameter(node):
+        return True
+
+    return any(
+        _contains_runtime_parameter(child)
+        for child in (_iter_children(node) or ())
+    )
+
+
+def _flatten_product(node):
+    """Flatten a symbolic multiplication tree into factors."""
+    if isinstance(node, BinaryOp) and node.op == "*":
+        return _flatten_product(node.left) + _flatten_product(node.right)
+
+    return [node]
+
+
+def _multiply_factors(factors):
+    """Rebuild a symbolic multiplication tree."""
+    if len(factors) == 0:
+        return Literal(1.0)
+
+    out = factors[0]
+    for factor in factors[1:]:
+        out = BinaryOp("*", out, factor)
+
+    return out
+
+
+def _parameter_name(param: ModelCall) -> str:
+    name = getattr(param.model, "_parameter_name", None)
+    if name:
+        return str(name)
+
+    if getattr(param.model, "name", None):
+        return str(param.model.name)
+
+    return f"parameter_{param.model.layer_id}"
+
+
+def _factor_runtime_parameter_from_term(coeff):
+    """
+    Extract one direct multiplicative scalar parameter from a linear FEM term.
+
+    Supported Phase-1 pattern:
+        nu * spatial_term
+
+    Unsupported for now:
+        (nu + c) * spatial_term
+        exp(raw_nu) * spatial_term
+        nu1 * nu2 * spatial_term
+        neural_field(x, y) * spatial_term
+    """
+    factors = _flatten_product(coeff)
+
+    params = [
+        factor
+        for factor in factors
+        if _is_runtime_scalar_parameter(factor)
+    ]
+
+    if len(params) == 0:
+        if _contains_runtime_parameter(coeff):
+            raise NotImplementedError(
+                "A trainable FEM-time parameter was found, but it is not a "
+                "direct multiplicative factor. Phase-1 supports terms such as "
+                "`nu * grad(u) * grad(phi)` only."
+            )
+
+        return None, coeff
+
+    if len(params) > 1:
+        raise NotImplementedError(
+            "Phase-1 FEM-time parameter lowering supports one trainable "
+            "scalar coefficient per operator term."
+        )
+
+    param = params[0]
+
+    stripped = _multiply_factors(
+        [factor for factor in factors if factor is not param]
+    )
+
+    if _contains_runtime_parameter(stripped):
+        raise NotImplementedError(
+            "Nested runtime physical parameters are not supported yet."
+        )
+
+    return param, stripped
+
+
+def _split_parametric_operator_ir(op_ir):
+    """
+    Split a linear operator IR into:
+
+        A0                      static operator terms
+        {name: K_name}          parameter basis terms
+        {name: parameter_expr}  symbolic jNO parameter expressions
+    """
+    static_terms = []
+    parameter_terms = {}
+    parameter_exprs = {}
+
+    for term in op_ir.terms:
+        param, stripped_coeff = _factor_runtime_parameter_from_term(
+            term.coeff
+        )
+
+        if param is None:
+            static_terms.append(term)
+            continue
+
+        name = _parameter_name(param)
+
+        parameter_exprs[name] = param
+        parameter_terms.setdefault(name, []).append(
+            _clone_term_with_coeff(term, stripped_coeff)
+        )
+
+    parameter_irs = {
+        name: _make_ir(op_ir.domain, terms)
+        for name, terms in parameter_terms.items()
+    }
+
+    return (
+        _make_ir(op_ir.domain, static_terms),
+        parameter_irs,
+        parameter_exprs,
+    )
 
 def _split_first_order_linear_terms(ir):
     """
@@ -1352,12 +1493,102 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         if len(mass_ir.terms) == 0:
             raise ValueError("Linear semidiscrete path could not extract a mass term. Expected something like u_t * phi.")
 
-        M_sys, bM = _assemble_fem_system_from_ir(domain, mass_ir)
-        A_sys, bA = _assemble_fem_system_from_ir(domain, op_ir)
+        # Runtime parameters in the mass or forcing term are deliberately rejected
+        # in Phase 1. The heat inverse example only needs A(nu) = nu * K.
+        for label, ir_part in (
+            ("mass", mass_ir),
+            ("source", src_ir),
+        ):
+            if any(
+                _contains_runtime_parameter(term.coeff)
+                for term in ir_part.terms
+            ):
+                raise NotImplementedError(
+                    f"Runtime trainable parameters inside the {label} terms are "
+                    "not supported yet. Phase-1 supports affine operator "
+                    "coefficients such as `nu * grad(u) * grad(phi)`."
+                )
 
+        M_sys, bM = _assemble_fem_system_from_ir(domain, mass_ir)
         M = _dense_array(M_sys)
-        A = _dense_array(A_sys)
-        affine_bias = jnp.asarray(bA).reshape(-1)
+
+        static_op_ir, parameter_irs, runtime_parameter_exprs = (
+            _split_parametric_operator_ir(op_ir)
+        )
+
+        # Static operator part A0
+        if len(static_op_ir.terms) > 0:
+            A0_sys, bA0 = _assemble_fem_system_from_ir(
+                domain,
+                static_op_ir,
+            )
+            A = _dense_array(A0_sys)
+            affine_bias = jnp.asarray(bA0).reshape(-1)
+        else:
+            A = jnp.zeros_like(M)
+            affine_bias = jnp.zeros(
+                (M.shape[0],),
+                dtype=M.dtype,
+            )
+
+        # Parameter-dependent basis matrices:
+        #     A(args) = A0 + sum_i args[name_i] * K_i
+        operator_basis = {}
+
+        for name, basis_ir in parameter_irs.items():
+            K_sys, bK = _assemble_fem_system_from_ir(
+                domain,
+                basis_ir,
+            )
+
+            K = _dense_array(K_sys)
+            bK = jnp.asarray(bK).reshape(-1)
+
+            # Homogeneous Dirichlet heat example satisfies this.
+            # Non-zero parameter-dependent affine BC contributions can be added later.
+            if not np.allclose(
+                np.asarray(bK),
+                0.0,
+                atol=1.0e-8,
+            ):
+                raise NotImplementedError(
+                    "Parameter-dependent affine boundary/load contributions are "
+                    "not supported yet. Use homogeneous Dirichlet data for the "
+                    "Phase-1 heat inverse example."
+                )
+
+            operator_basis[name] = K
+
+        operator_fn = None
+
+        if operator_basis:
+
+            def operator_fn(t, args):
+                del t
+
+                if args is None:
+                    raise ValueError(
+                        "This FeaxTimeBlock has trainable runtime operator "
+                        "parameters. Pass them to Diffrax through `args={...}`."
+                    )
+
+                A_t = A
+
+                for name, K in operator_basis.items():
+                    if name not in args:
+                        raise KeyError(
+                            f"Missing runtime operator parameter {name!r}. "
+                            f"Available args: {sorted(args.keys())}"
+                        )
+
+                    coeff = jnp.asarray(
+                        args[name],
+                        dtype=A.dtype,
+                    ).reshape(())
+
+                    A_t = A_t + coeff * K
+
+                return A_t
 
         feax_problem = getattr(domain, "_feax_problem", None)
         feax_mesh = getattr(feax_problem, "mesh", None)
@@ -1367,7 +1598,13 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             feax_mesh = _build_feax_mesh(domain, element_type)
 
         forcing_vector_fn = kwargs.get("forcing_vector_fn", None)
-        operator_fn = kwargs.get("operator_fn", None)
+        # Preserve the automatically generated operator_fn.
+        # Only replace it when the user explicitly supplies a non-None override.
+        user_operator_fn = kwargs.get("operator_fn", None)
+
+        if user_operator_fn is not None:
+            operator_fn = user_operator_fn
+
         auto_forcing = False
         forcing_mode = "none"
 
@@ -1393,6 +1630,10 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         )
         metadata["linear_inferred"] = "linear" not in kwargs
         metadata["linear_path_selected"] = bool(use_linear_path)
+        metadata["runtime_parameter_names"] = sorted(
+                runtime_parameter_exprs.keys()
+            )
+
         metadata["dynamic_operator"] = bool(operator_fn is not None)
 
         if auto_forcing:
@@ -1436,6 +1677,8 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             M=M,
             A=A,
             operator_fn=operator_fn,
+            runtime_parameter_exprs=runtime_parameter_exprs,
+            operator_basis=operator_basis,
             affine_bias=affine_bias,
             forcing_vector_fn=forcing_vector_fn,
             feax_mesh=feax_mesh,
