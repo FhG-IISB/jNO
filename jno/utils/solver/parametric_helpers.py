@@ -228,3 +228,51 @@ def _runtime_scalar_arg(args, name: str, *, dtype):
         )
 
     return jnp.asarray(args[name], dtype=dtype).reshape(())
+
+# -----------------------------------------------------------------------------
+# Strong-form runtime-parameter helpers
+# -----------------------------------------------------------------------------
+
+
+def _collect_runtime_parameter_exprs(node, out=None):
+    """
+    Collect zero-argument ``jno.np.parameter(...)`` calls by public name.
+
+    Strong-form Diffrax lowering replaces these symbolic parameter ModelCalls
+    with private TensorTags. Concrete values are supplied by the external
+    solver through:
+
+        diffrax.diffeqsolve(..., args={"parameter_name": value})
+    """
+    if out is None:
+        out = {}
+
+    if _is_runtime_scalar_parameter(node):
+        name = _parameter_name(node)
+        previous = out.get(name)
+
+        if (
+            previous is not None
+            and getattr(previous, "model", None)
+            is not getattr(node, "model", None)
+        ):
+            raise ValueError(
+                f"Multiple runtime parameter models use the name {name!r}. "
+                "Parameter names must be unique inside one solver block."
+            )
+
+        out[name] = node
+        return out
+
+    for child in (_iter_children(node) or ()):
+        _collect_runtime_parameter_exprs(child, out)
+
+    return out
+
+
+def _runtime_parameter_tag(name: str) -> str:
+    """
+    Return the private TensorTag name used by strong-form Diffrax lowering.
+    """
+    return f"__runtime_parameter_{name}__"
+
