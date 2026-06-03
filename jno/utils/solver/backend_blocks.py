@@ -95,6 +95,17 @@ class DiffraxBlock:
     state_meta: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    # Periodic prolongation matrix P (n_full x n_red); None when absent.
+    prolongation: Any = None
+
+    def prolong(self, reduced):
+        """Map reduced periodic DOFs back to the full nodal layout."""
+        if self.prolongation is None:
+            return reduced
+        from .feax_utils import prolong as _prolong
+
+        return _prolong(self.prolongation, reduced)
+
 
 @dataclass
 class FeaxPipelineBlock:
@@ -355,6 +366,8 @@ class FeaxTimeBlock:
     # Optional affine source/load basis callbacks:
     #     forcing_basis[name](t) -> vector
     forcing_basis: Dict[str, Callable] = field(default_factory=dict)
+    # Periodic prolongation matrix P (n_full x n_red); None when absent.
+    prolongation: Any = None
 
     # optional mesh / hints
     feax_mesh: Any = None
@@ -370,6 +383,14 @@ class FeaxTimeBlock:
             M u_dot + A(t, args) u = affine_bias + forcing_vector_fn(t, args)
         """
         return self.M is not None and (self.A is not None or self.operator_fn is not None)
+
+    def prolong(self, reduced):
+        """Map reduced periodic DOFs back to the full nodal layout."""
+        if self.prolongation is None:
+            return reduced
+        from .feax_utils import prolong as _prolong
+
+        return _prolong(self.prolongation, reduced)
 
     def is_nonlinear(self) -> bool:
         """

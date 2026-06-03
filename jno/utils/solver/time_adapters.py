@@ -175,12 +175,14 @@ def make_diffrax_block(
             args=args,
             mass=lambda t, a=None: M,
             state_meta={},
+            prolongation=getattr(block, "prolongation", None),
             metadata={
                 **block.metadata,
                 "converted_from": "feax_time",
                 "conversion": "u_dot = solve(M, c + f(t,args) - A(t,args) u)",
                 "dynamic_operator": bool(op_fn is not None),
                 "jax_runtime": True,
+                "periodic": getattr(block, "prolongation", None) is not None,
             },
         )
 

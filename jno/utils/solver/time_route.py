@@ -1716,7 +1716,7 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
 
         M_sys, _bM = _assemble_fem_system_from_ir(domain, mass_ir)
         M = _dense_array(M_sys)
-
+        full_size = int(M.shape[0])
         static_op_ir, operator_parameter_irs, operator_parameter_exprs = _split_parametric_operator_ir(op_ir)
         if len(static_op_ir.terms) > 0:
             A0_sys, bA0 = _assemble_fem_system_from_ir(domain, static_op_ir)
@@ -1736,6 +1736,20 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             if not np.allclose(np.asarray(bK), 0.0, atol=1.0e-8):
                 raise NotImplementedError("Runtime Dirichlet parameters are not supported yet.")
             operator_basis[name] = K
+
+        # ---- Periodic reduction (if a prolongation matrix was built) ----
+        _feax_ctx = getattr(domain, "_feax_context", {}) or {}
+        P_block = _feax_ctx.get("P", None)
+        periodic_info = _feax_ctx.get("periodic", None)
+        if P_block is not None:
+            from .feax_utils import reduce_matrix, reduce_vector, restrict_state
+
+            M = reduce_matrix(P_block, M)
+            A = reduce_matrix(P_block, A)
+            affine_bias = reduce_vector(P_block, affine_bias)
+            operator_basis = {name: reduce_matrix(P_block, K) for name, K in operator_basis.items()}
+            if state0 is not None:
+                state0 = restrict_state(P_block, state0, periodic_info["kept_nodes"], vec=periodic_info["vec"])
 
         operator_fn = None
         if operator_basis:
@@ -1761,10 +1775,20 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             forcing_mode = "user_callback"
         elif len(src_ir.terms) > 0:
             forcing_vector_fn, forcing_basis, forcing_parameter_exprs = _build_auto_forcing_vector_fn(
-                domain, src_ir, size=M.shape[0], dtype=M.dtype
+                domain, src_ir, size=full_size, dtype=M.dtype
             )
             auto_forcing = True
             forcing_mode = "weak_auto"
+
+            if P_block is not None and forcing_vector_fn is not None:
+                from .feax_utils import reduce_vector as _rv
+
+                _full_forcing = forcing_vector_fn
+
+                def forcing_vector_fn(t, args=None, _f=_full_forcing):
+                    return _rv(P_block, _f(t, args))
+
+                forcing_basis = {n: (lambda t, _b=b: _rv(P_block, _b(t))) for n, b in forcing_basis.items()}
 
         combined_runtime_parameter_exprs = _merge_runtime_parameter_exprs(operator_parameter_exprs, forcing_parameter_exprs)
 
@@ -1785,6 +1809,10 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         metadata["operator_parameter_names"] = sorted(operator_parameter_exprs)
         metadata["forcing_parameter_names"] = sorted(forcing_parameter_exprs)
         metadata["dynamic_operator"] = bool(operator_fn is not None)
+        metadata["periodic"] = bool(P_block is not None)
+        if P_block is not None:
+            metadata["reduced_state_size"] = int(M.shape[0])
+            metadata["full_state_size"] = int(full_size)
 
         return FeaxTimeBlock(
             backend="feax_time",
@@ -1817,6 +1845,7 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             feax_mesh=feax_mesh,
             forcing_mode=forcing_mode,
             nonlinear_runtime={},
+            prolongation=P_block,
         )
 
     # ------------------------------------------------------------------

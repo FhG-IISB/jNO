@@ -12,7 +12,7 @@ Responsibilities:
 - evaluate symbolic expressions inside FEAX volume/surface kernels,
 - prepare residual/Jacobian runtime objects for time-dependent assembly.
 """
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence, Tuple
 
 import jax.numpy as jnp
 import numpy as np
@@ -1216,3 +1216,203 @@ def _prepare_feax_runtime(
         "temporal_tags": temporal_tags,
         "n_cells": n_cells,
     }
+
+
+"""
+Periodic boundary-condition support for the FEAX-backed time/static routes.
+
+The FEAX assembly produces *full* unconstrained Galerkin operators (mass M,
+operator A, parametric basis K_i, affine bias, forcing). Periodicity is not a
+property of those matrices: left/right (or bottom/top) boundary nodes are
+independent free DOFs that, left alone, satisfy a natural zero-flux condition
+rather than a periodic one.
+
+Periodicity is enforced algebraically through a prolongation matrix ``P`` that
+identifies slave DOFs with their master DOFs:
+
+    u_full = P @ u_red                          (n_full x n_red)
+
+The reduced semidiscrete system that the time integrator actually solves is
+
+    (P^T M P) u_red_dot + (P^T A P) u_red = P^T (c + f).
+
+This module builds ``P`` by coordinate matching on the user-declared periodic
+tag pairs and provides the small reduction/prolongation helpers used by the
+time route and the Diffrax adapter.
+
+Only node-level (scalar, vec=1) and node-major vector layouts
+(dof = node*vec + comp) are handled; the vector case is obtained from the
+node-level ``P`` via a Kronecker product with the identity.
+"""
+
+
+def build_periodic_prolongation(
+    points: np.ndarray,
+    pairs: Sequence[Tuple[str, str]],
+    tag_indices: Dict[str, np.ndarray],
+    *,
+    vec: int = 1,
+    tol: float | None = None,
+) -> Dict[str, object]:
+    """Build the node-level periodic prolongation matrix ``P``.
+
+    Parameters
+    ----------
+    points:
+        ``(n_nodes, dim)`` array of FEM node coordinates. Node ordering must
+        match the FEAX mesh (it does: the FEAX mesh is built directly from
+        ``mesh.points``).
+    pairs:
+        Ordered ``(master_tag, slave_tag)`` boundary pairings, e.g.
+        ``[("left", "right"), ("bottom", "top")]``.
+    tag_indices:
+        Mapping from boundary tag name to the global node ids on that tag.
+    vec:
+        Number of scalar components per node. ``vec > 1`` returns the
+        node-major expansion ``kron(P_node, I_vec)``.
+    tol:
+        Coordinate-matching tolerance for the transverse coordinates. When
+        ``None`` it is derived from the bounding-box diagonal.
+
+    Returns
+    -------
+    dict with keys:
+        ``P``               : ``(n_full, n_red)`` dense jnp prolongation matrix.
+        ``P_node``          : node-level prolongation (``vec == 1`` form).
+        ``kept_nodes``      : sorted global ids of the retained (master/free) nodes.
+        ``slave_to_master`` : resolved slave-node -> master-node mapping.
+        ``n_full``          : full node count.
+        ``n_red``           : reduced node count.
+        ``vec``             : component count used.
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    n_nodes = pts.shape[0]
+
+    if tol is None:
+        span = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
+        tol = max(span, 1.0) * 1.0e-6
+
+    # slave global id -> master global id (one hop per pairing).
+    slave_to_master: Dict[int, int] = {}
+
+    for master_tag, slave_tag in pairs:
+        if master_tag not in tag_indices or slave_tag not in tag_indices:
+            raise KeyError(
+                f"Periodic pair ({master_tag!r}, {slave_tag!r}) refers to a tag "
+                f"that is not present in the mesh. Known tags: {sorted(tag_indices)}."
+            )
+
+        m_ids = np.asarray(tag_indices[master_tag], dtype=int).reshape(-1)
+        s_ids = np.asarray(tag_indices[slave_tag], dtype=int).reshape(-1)
+        m_pts = pts[m_ids]
+        s_pts = pts[s_ids]
+
+        # Periodic axis = coordinate whose tag means differ the most.
+        axis = int(np.argmax(np.abs(m_pts.mean(axis=0) - s_pts.mean(axis=0))))
+        transverse = [d for d in range(pts.shape[1]) if d != axis]
+
+        m_trans = m_pts[:, transverse]
+        s_trans = s_pts[:, transverse]
+
+        # Nearest transverse master for every slave node.
+        d2 = np.sum(
+            (s_trans[:, None, :] - m_trans[None, :, :]) ** 2,
+            axis=-1,
+        )
+        nn = np.argmin(d2, axis=1)
+        worst = float(np.sqrt(d2[np.arange(len(s_ids)), nn].max())) if len(s_ids) else 0.0
+        if worst > tol:
+            raise ValueError(
+                f"Periodic matching for ({master_tag!r}, {slave_tag!r}) failed: "
+                f"largest transverse mismatch {worst:.3e} exceeds tol {tol:.3e}. "
+                "Use a periodically compatible mesh (equal node layout on opposite "
+                "faces) or relax tol."
+            )
+
+        for k, sid in enumerate(s_ids):
+            slave_to_master[int(sid)] = int(m_ids[nn[k]])
+
+    # Resolve corner chains: a corner is a slave in two directions, so its
+    # master may itself be a slave. Follow until a free node is reached.
+    def _resolve(i: int) -> int:
+        seen = set()
+        while i in slave_to_master and i not in seen:
+            seen.add(i)
+            i = slave_to_master[i]
+        return i
+
+    final_master = {sid: _resolve(sid) for sid in slave_to_master}
+    slave_set = set(slave_to_master)
+
+    kept_nodes: List[int] = [i for i in range(n_nodes) if i not in slave_set]
+    reduced_index = {node: r for r, node in enumerate(kept_nodes)}
+    n_red = len(kept_nodes)
+
+    P_node = np.zeros((n_nodes, n_red), dtype=np.float64)
+    for i in range(n_nodes):
+        master = final_master[i] if i in slave_set else i
+        P_node[i, reduced_index[master]] = 1.0
+
+    P_node_j = jnp.asarray(P_node)
+    if vec == 1:
+        P = P_node_j
+    else:
+        P = jnp.kron(P_node_j, jnp.eye(vec, dtype=P_node_j.dtype))
+
+    return {
+        "P": P,
+        "P_node": P_node_j,
+        "kept_nodes": np.asarray(kept_nodes, dtype=np.int64),
+        "slave_to_master": final_master,
+        "n_full": int(n_nodes * vec),
+        "n_red": int(n_red * vec),
+        "vec": int(vec),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Operator / state reduction and prolongation
+# ---------------------------------------------------------------------------
+
+
+def reduce_matrix(P, mat):
+    """Galerkin reduction ``P^T mat P``."""
+    P = jnp.asarray(P)
+    mat = jnp.asarray(mat, dtype=P.dtype)
+    return P.T @ mat @ P
+
+
+def reduce_vector(P, vec):
+    """Reduce a full-space load/bias vector via ``P^T vec``."""
+    P = jnp.asarray(P)
+    vec = jnp.asarray(vec, dtype=P.dtype).reshape(-1)
+    return P.T @ vec
+
+
+def restrict_state(P, state_full, kept_nodes, vec: int = 1):
+    """Restrict a full initial state to the reduced master DOFs.
+
+    For a consistent periodic initial condition (matching values on opposite
+    faces) gathering the kept-node entries is exact and avoids the doubling
+    that ``P^T`` would introduce on master nodes.
+    """
+    state_full = jnp.asarray(state_full).reshape(-1)
+    kept = np.asarray(kept_nodes, dtype=int)
+    if vec == 1:
+        return state_full[jnp.asarray(kept)]
+    dof = (kept[:, None] * vec + np.arange(vec)[None, :]).reshape(-1)
+    return state_full[jnp.asarray(dof)]
+
+
+def prolong(P, reduced):
+    """Map reduced DOFs back to the full space: ``u_full = P @ u_red``.
+
+    Accepts a single ``(n_red,)`` vector or a batched ``(..., n_red)`` array
+    (e.g. a Diffrax ``solution.ys`` trajectory of shape ``(T, n_red)``).
+    """
+    P = jnp.asarray(P)
+    reduced = jnp.asarray(reduced, dtype=P.dtype)
+    if reduced.ndim == 1:
+        return P @ reduced
+    # (..., n_red) @ (n_red, n_full) -> (..., n_full)
+    return reduced @ P.T
