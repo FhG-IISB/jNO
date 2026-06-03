@@ -1783,7 +1783,7 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             )
             na_tags = na_rt["runtime_parameter_tags"]
             na_temp = na_rt["temporal_tags"]
-            na_dt = na_rt["dtype"]
+            na_dt = M.dtype
             na_u0 = jnp.zeros((na_rt["size"],), dtype=na_dt)  # module-level jnp; do NOT import here
 
             def _na_full(t, args, _rt=na_rt, _tags=na_tags, _temp=na_temp, _u0=na_u0, _dt=na_dt):
