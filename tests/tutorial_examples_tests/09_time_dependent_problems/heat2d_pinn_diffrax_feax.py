@@ -32,12 +32,12 @@ import diffrax
 import foundax
 import jax
 import jax.numpy as jnp
+import jno.numpy as jnn
 import numpy as np
 import optax
 from feax.solvers.time_solver import run as feax_run
 
 import jno
-import jno.numpy as jnn
 from jno import LearningRateSchedule as lrs
 
 jax.config.update("jax_enable_x64", False)
