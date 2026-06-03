@@ -836,7 +836,6 @@ class MeshUtils:
     @staticmethod
     @jax.jit
     def get_view_factor_3d(P, VM, Nrm, ds):
-
         n_pts = P.shape[0]
 
         v = P[None, :, :] - P[:, None, :]  # (N,N,3), x_j - x_i
@@ -868,7 +867,6 @@ class MeshUtils:
     @staticmethod
     @jax.jit
     def get_view_factor_2d(P, VM, Nrm, ds):
-
         n_pts = P.shape[0]
 
         v = P[None, :, :] - P[:, None, :]

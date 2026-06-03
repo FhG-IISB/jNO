@@ -2078,67 +2078,120 @@ class Noise(Placeholder):
 
 
 class FemLinearSystem:
-    """Container for a linear FEM contribution A x = b.
+    """Container for a steady linear FEM system ``A(args) x = b(args)``."""
 
-    Supports addition/subtraction so separate volume and boundary contributions
-    can be combined naturally before unpacking.
-    """
-
-    def __init__(self, A, b):
+    def __init__(
+        self,
+        A,
+        b,
+        *,
+        operator_fn=None,
+        rhs_fn=None,
+        runtime_parameter_exprs=None,
+        operator_basis=None,
+        rhs_basis=None,
+        metadata=None,
+    ):
         self.A = A
         self.b = b
+        self.operator_fn = operator_fn
+        self.rhs_fn = rhs_fn
+        self.runtime_parameter_exprs = runtime_parameter_exprs or {}
+        self.operator_basis = operator_basis or {}
+        self.rhs_basis = rhs_basis or {}
+        self.metadata = metadata or {}
+
+    @property
+    def is_parametric(self) -> bool:
+        return self.operator_fn is not None or self.rhs_fn is not None
+
+    def evaluate(self, args=None):
+        A = self.A if self.operator_fn is None else self.operator_fn(args)
+        b = self.b if self.rhs_fn is None else self.rhs_fn(args)
+        return A, b
 
     def __iter__(self):
+        if self.is_parametric:
+            raise TypeError(
+                "This FEM system depends on runtime parameters. Call system.evaluate(args={...}) before unpacking."
+            )
         yield self.A
         yield self.b
 
     def __add__(self, other):
         if not isinstance(other, FemLinearSystem):
             return NotImplemented
+        if self.is_parametric or other.is_parametric:
+            raise TypeError(
+                "Addition of parameter-aware FemLinearSystem blocks is not "
+                "implemented. Combine the weak forms before assembly."
+            )
         return FemLinearSystem(self.A + other.A, self.b + other.b)
 
-    def todense(self):
-        A_dense = self.A.todense() if hasattr(self.A, "todense") else self.A
-        return A_dense, self.b
+    def todense(self, args=None):
+        A, b = self.evaluate(args=args)
+        A_dense = A.todense() if hasattr(A, "todense") else A
+        return A_dense, b
 
     def __sub__(self, other):
         if not isinstance(other, FemLinearSystem):
             return NotImplemented
+        if self.is_parametric or other.is_parametric:
+            raise TypeError(
+                "Subtraction of parameter-aware FemLinearSystem blocks is not "
+                "implemented. Combine the weak forms before assembly."
+            )
         return FemLinearSystem(self.A - other.A, self.b - other.b)
 
     def __repr__(self):
         shape = getattr(self.A, "shape", None)
-        return f"FemLinearSystem(shape={shape}, b_shape={getattr(self.b, 'shape', None)})"
+        return f"FemLinearSystem(shape={shape}, b_shape={getattr(self.b, 'shape', None)}, parametric={self.is_parametric})"
 
 
 class FemResidualOperator:
-    """Container for a nonlinear FEM residual operator R(u)=0.
+    """Container for a steady nonlinear FEM residual ``R(u, args) = 0``."""
 
-    Parameters
-    ----------
-    residual_fn : callable
-        Function taking a flat DOF vector and returning the residual vector.
-    jacobian_fn : callable | None
-        Optional function taking a flat DOF vector and returning the tangent/Jacobian.
-    size : int | None
-        Number of scalar DOFs.
-    """
-
-    def __init__(self, residual_fn, jacobian_fn=None, size=None):
+    def __init__(
+        self,
+        residual_fn,
+        jacobian_fn=None,
+        size=None,
+        *,
+        runtime_parameter_exprs=None,
+        residual_basis=None,
+        metadata=None,
+    ):
         self.residual = residual_fn
         self.jacobian = jacobian_fn
         self.size = size
+        self.runtime_parameter_exprs = runtime_parameter_exprs or {}
+        self.residual_basis = residual_basis or {}
+        self.metadata = metadata or {}
 
-    def __call__(self, u):
-        return self.residual(u)
+    @property
+    def is_parametric(self) -> bool:
+        return bool(self.runtime_parameter_exprs)
 
-    def linearize(self, u):
+    def __call__(self, u, args=None):
+        return self.residual(u, args)
+
+    def linearize(self, u, args=None):
         if self.jacobian is None:
             raise ValueError("No jacobian function available.")
-        return self.jacobian(u), -self.residual(u)
+
+        return (
+            self.jacobian(u, args),
+            -self.residual(u, args),
+        )
 
     def __repr__(self):
-        return f"FemResidualOperator(size={self.size}, has_jacobian={self.jacobian is not None})"
+        return (
+            "FemResidualOperator("
+            f"size={self.size}, "
+            f"has_jacobian={self.jacobian is not None}, "
+            f"parametric={self.is_parametric}"
+            ")"
+        )
 
 
 class StateField(Placeholder):

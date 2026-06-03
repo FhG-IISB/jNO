@@ -196,5 +196,3 @@ compiled.save("model.vmfb")
 loaded = IREEModel.load("model.vmfb")
 result = loaded(inputs)
 ```
-
-

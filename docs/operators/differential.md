@@ -81,4 +81,3 @@ curl_vec = jnn.curl_3d(Fx, Fy, Fz, x, y, z)
 |--------|------|-------|
 | Automatic Differentiation | `"automatic_differentiation"` (default) | Exact; uses JAX `jax.grad` / `jax.jacfwd`. |
 | Finite Difference (mesh-based) | `"finite_difference"` | Approximation; uses FEM stencils. Requires `compute_mesh_connectivity=True` in the domain. |
-
