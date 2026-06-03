@@ -520,6 +520,7 @@ def _build_first_order_semidiscrete_operators(
         static_residual_ir,
         parameter_irs,
         runtime_parameter_exprs,
+        _nonaffine_residual_ir,
     ) = _split_parametric_operator_ir(residual_ir)
 
     # FEAX requires one structural IR even when every residual term is
@@ -1600,7 +1601,7 @@ def _build_auto_forcing_vector_fn(domain, src_ir, *, size, dtype):
     if src_ir is None or len(src_ir.terms) == 0:
         return None, {}, {}
 
-    static_src_ir, parameter_irs, runtime_parameter_exprs = _split_parametric_operator_ir(src_ir)
+    static_src_ir, parameter_irs, runtime_parameter_exprs, _ = _split_parametric_operator_ir(src_ir)
     static_fn = _build_source_vector_fn(domain, static_src_ir, size=size, dtype=dtype)
     forcing_basis = {
         name: _build_source_vector_fn(domain, basis_ir, size=size, dtype=dtype) for name, basis_ir in parameter_irs.items()
@@ -1717,7 +1718,9 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         M_sys, _bM = _assemble_fem_system_from_ir(domain, mass_ir)
         M = _dense_array(M_sys)
         full_size = int(M.shape[0])
-        static_op_ir, operator_parameter_irs, operator_parameter_exprs = _split_parametric_operator_ir(op_ir)
+        static_op_ir, operator_parameter_irs, operator_parameter_exprs, nonaffine_op_ir = _split_parametric_operator_ir(
+            op_ir, allow_nonaffine=True
+        )
         if len(static_op_ir.terms) > 0:
             A0_sys, bA0 = _assemble_fem_system_from_ir(domain, static_op_ir)
             A = _dense_array(A0_sys)
@@ -1765,6 +1768,57 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         user_operator_fn = kwargs.get("operator_fn", None)
         if user_operator_fn is not None:
             operator_fn = user_operator_fn
+        # ---- Step I: runtime-assembled (non-affine) operator ----
+        if len(nonaffine_op_ir.terms) > 0:
+            import feax as fe
+
+            from .feax_utils import _make_internal_vars, _prepare_feax_runtime
+
+            na_rt = _prepare_feax_runtime(
+                domain,
+                nonaffine_op_ir,
+                apply_dirichlet=True,
+                need_jacobian=True,
+                symmetric_bc=True,
+            )
+            na_tags = na_rt["runtime_parameter_tags"]
+            na_temp = na_rt["temporal_tags"]
+            na_dt = na_rt["dtype"]
+            na_u0 = jnp.zeros((na_rt["size"],), dtype=na_dt)  # module-level jnp; do NOT import here
+
+            def _na_full(t, args, _rt=na_rt, _tags=na_tags, _temp=na_temp, _u0=na_u0, _dt=na_dt):
+                values = {name: _runtime_scalar_arg(args, name, dtype=_dt) for name in _tags}
+                iv = _make_internal_vars(
+                    fe,
+                    _temp,
+                    t,
+                    n_cells=_rt["n_cells"],
+                    dtype=_dt,
+                    runtime_parameter_tags=_tags,
+                    runtime_parameter_values=values,
+                )
+                return jnp.asarray(_dense_array(_rt["jac_bc"](_u0, iv)), dtype=_dt)
+
+            if P_block is not None:
+                _Pna = jnp.asarray(P_block)
+
+                def nonaffine_operator_fn(t, args, _f=_na_full, _P=_Pna):
+                    return _P.T @ _f(t, args) @ _P  # reduce: full -> reduced
+            else:
+                nonaffine_operator_fn = _na_full
+
+            _affine_op = operator_fn  # affine reduced operator (may be None)
+            _static_A = A  # reduced static operator (0 here)
+
+            def operator_fn(t, args, _aff=_affine_op, _na=nonaffine_operator_fn, _A=_static_A):
+                A_t = _na(t, args)
+                A_t = A_t + (_aff(t, args) if _aff is not None else _A)
+                return A_t
+
+            for term in nonaffine_op_ir.terms:
+                _collect_runtime_parameter_exprs(term.coeff, operator_parameter_exprs)
+
+            metadata["nonaffine_operator"] = True
 
         forcing_vector_fn = kwargs.get("forcing_vector_fn", None)
         forcing_basis = {}
@@ -1859,6 +1913,38 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         boundary_exprs,
     )
 
+    # ---- Periodic reduction of the nonlinear semidiscrete operators ----
+    _feax_ctx = getattr(domain, "_feax_context", {}) or {}
+    P_block = _feax_ctx.get("P", None)
+    periodic_info = _feax_ctx.get("periodic", None)
+    if P_block is not None:
+        from .feax_utils import restrict_state
+
+        P_mat = jnp.asarray(P_block)
+
+        _mass_full = mass_fn
+        _res_full = residual_fn
+        _jac_full = jacobian_fn
+
+        def mass_fn(t, args=None, _m=_mass_full, _P=P_mat):
+            M_full = jnp.asarray(_m(t, args), dtype=_P.dtype)
+            return _P.T @ M_full @ _P
+
+        def residual_fn(u_red, t, args=None, _r=_res_full, _P=P_mat):
+            u_full = _P @ jnp.asarray(u_red, dtype=_P.dtype).reshape(-1)
+            R_full = jnp.asarray(_r(u_full, t, args), dtype=_P.dtype).reshape(-1)
+            return _P.T @ R_full
+
+        def jacobian_fn(u_red, t, args=None, _j=_jac_full, _P=P_mat):
+            u_full = _P @ jnp.asarray(u_red, dtype=_P.dtype).reshape(-1)
+            J_full = jnp.asarray(_j(u_full, t, args), dtype=_P.dtype)
+            return _P.T @ J_full @ _P
+
+        if state0 is not None:
+            state0 = restrict_state(P_block, state0, periodic_info["kept_nodes"], vec=periodic_info["vec"])
+        nonlinear_runtime = dict(nonlinear_runtime)
+        nonlinear_runtime["state_size"] = int(P_mat.shape[1])
+
     feax_mesh = None
     if getattr(domain, "_feax_context", None) is not None:
         feax_mesh = domain._feax_context.get("mesh", None)
@@ -1872,6 +1958,10 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
     metadata["mass_is_constant"] = bool(nonlinear_runtime["mass_is_constant"])
     metadata["residual_has_time"] = bool(nonlinear_runtime["residual_has_time"])
     metadata["state_size"] = int(nonlinear_runtime["state_size"])
+    metadata["periodic"] = bool(P_block is not None)
+    if P_block is not None:
+        metadata["full_state_size"] = int(P_mat.shape[0])
+        metadata["reduced_state_size"] = int(P_mat.shape[1])
 
     metadata["runtime_parameter_names"] = list(
         nonlinear_runtime.get(
@@ -1933,4 +2023,5 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         feax_mesh=feax_mesh,
         forcing_mode="embedded_residual",
         nonlinear_runtime=nonlinear_runtime,
+        prolongation=P_block,
     )

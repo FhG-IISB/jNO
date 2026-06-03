@@ -296,7 +296,7 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
     # ------------------------------------------------------------
     # Parameter-aware affine route
     # ------------------------------------------------------------
-    static_ir, parameter_irs, runtime_parameter_exprs = _split_parametric_operator_ir(ir)
+    static_ir, parameter_irs, runtime_parameter_exprs, _ = _split_parametric_operator_ir(ir)
 
     if len(parameter_irs) == 0:
         raise RuntimeError("Runtime parameters were detected, but no affine FEM basis terms were generated.")
@@ -557,7 +557,7 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
             symmetric_bc=symmetric_bc,
         )
 
-    static_ir, parameter_irs, runtime_parameter_exprs = _split_parametric_operator_ir(ir)
+    static_ir, parameter_irs, runtime_parameter_exprs, _ = _split_parametric_operator_ir(ir)
 
     operator_basis = {}
     rhs_basis = {}

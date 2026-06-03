@@ -420,6 +420,22 @@ def _infer_trial_metadata(expr) -> Dict[str, Any]:
     }
 
 
+def _collect_runtime_parameter_tags_for_feax(node, out=None):
+    """Collect names of trainable runtime parameters (ModelCall) used in a coeff."""
+    from .parametric_helpers import _is_runtime_scalar_parameter, _parameter_name
+
+    if out is None:
+        out = []
+    if _is_runtime_scalar_parameter(node):
+        name = _parameter_name(node)
+        if name not in out:
+            out.append(name)
+        return out
+    for child in iter_children(node) or ():
+        _collect_runtime_parameter_tags_for_feax(child, out)
+    return out
+
+
 def _collect_temporal_tags_for_feax(node, out=None):
     """
     Collect temporal Variable tags used inside FEAX kernels.
@@ -519,6 +535,25 @@ def _collect_temporal_tags_for_feax(node, out=None):
     return out
 
 
+def _runtime_parameter_value_from_internal_vars(local, name):
+    """Read a runtime parameter scalar from volume_vars.
+
+    Parameter values are packed AFTER the temporal values, so the volume_vars
+    layout is:  [ temporal_tags ... , runtime_parameter_tags ... ].
+    """
+    temporal_tags = local.get("temporal_tags", ())
+    param_tags = local.get("runtime_parameter_tags", ())
+    volume_vars = local.get("volume_vars", ())
+    if name not in param_tags:
+        return None
+    idx = len(temporal_tags) + param_tags.index(name)
+    if idx >= len(volume_vars):
+        return None
+    arr = jnp.asarray(volume_vars[idx])
+    # Broadcast the per-cell scalar to the quadrature-point axis, like time.
+    return jnp.reshape(arr, (-1,))[0]
+
+
 def _temporal_value_from_internal_vars(local, tag, dim_start=0, dim_end=1):
     """
     Read a temporal variable value from FEAX InternalVars.
@@ -573,6 +608,7 @@ def _eval_expr_for_feax(domain, node, local):
             Jacobian,
             BinaryOp,
             FunctionCall,
+            ModelCall,
         ),
     ):
         try:
@@ -705,6 +741,22 @@ def _eval_expr_for_feax(domain, node, local):
             return a**b
         raise NotImplementedError(f"Unsupported binary operator: {node.op}")
 
+    if isinstance(node, ModelCall):
+        from .parametric_helpers import _is_runtime_scalar_parameter, _parameter_name
+
+        if _is_runtime_scalar_parameter(node):
+            name = _parameter_name(node)
+            val = _runtime_parameter_value_from_internal_vars(local, name)
+            if val is None:
+                raise KeyError(
+                    f"Runtime parameter '{name}' not supplied to the FEAX kernel. "
+                    "Ensure it was registered in runtime_parameter_tags and packed "
+                    "into InternalVars.volume_vars."
+                )
+            return val
+        # Non-parameter ModelCall (e.g. a neural coefficient) -> not handled here.
+        raise NotImplementedError("FEAX kernel cannot evaluate non-parameter ModelCall coefficients yet.")
+
     if isinstance(node, FunctionCall):
         args = [_eval_expr_for_feax(domain, arg, local) for arg in node.args]
         kwargs = node.kwargs if node.kwargs else {}
@@ -728,6 +780,7 @@ def _eval_volume_integrand(
     cell_JxW,
     cell_v_grads_JxW,
     temporal_tags,
+    runtime_parameter_tags,
     problem_ref,
     *cell_internal_vars,
 ):
@@ -756,6 +809,7 @@ def _eval_volume_integrand(
         "trial_value_shape": value_shape,
         "trial_vec": vec,
         "temporal_tags": tuple(temporal_tags),
+        "runtime_parameter_tags": tuple(runtime_parameter_tags),
         "volume_vars": tuple(cell_internal_vars),
     }
 
@@ -777,6 +831,7 @@ def _eval_surface_integrand(
     face_shape_grads,
     face_nanson_scale,
     temporal_tags,
+    runtime_parameter_tags,
     *cell_internal_vars_surface,
 ):
     """
@@ -865,6 +920,7 @@ def _eval_surface_integrand(
         "boundary_normals": boundary_normals,
         "temporal_tags": tuple(temporal_tags),
         "volume_vars": tuple(cell_internal_vars_surface),
+        "runtime_parameter_tags": tuple(runtime_parameter_tags),
     }
 
     val = _eval_expr_for_feax(domain, expr, local)
@@ -873,7 +929,7 @@ def _eval_surface_integrand(
     return ravel_pytree(jnp.sum(weighted, axis=0))[0]
 
 
-def _make_universal_volume_kernel(domain, expr, value_shape, temporal_tags, problem_ref):
+def _make_universal_volume_kernel(domain, expr, value_shape, temporal_tags, runtime_parameter_tags, problem_ref):
     """
     Create the FEAX universal volume kernel for a lowered weak-form expression.
     """
@@ -896,6 +952,7 @@ def _make_universal_volume_kernel(domain, expr, value_shape, temporal_tags, prob
             cell_JxW,
             cell_v_grads_JxW,
             temporal_tags,
+            runtime_parameter_tags,
             problem_ref,
             *cell_internal_vars,
         )
@@ -903,7 +960,7 @@ def _make_universal_volume_kernel(domain, expr, value_shape, temporal_tags, prob
     return kernel
 
 
-def _make_universal_surface_kernel(domain, expr, tag, value_shape, temporal_tags):
+def _make_universal_surface_kernel(domain, expr, tag, value_shape, runtime_parameter_tags, temporal_tags):
     def kernel(
         cell_sol_flat,
         physical_surface_quad_points,
@@ -923,6 +980,7 @@ def _make_universal_surface_kernel(domain, expr, tag, value_shape, temporal_tags
             face_shape_grads,
             face_nanson_scale,
             temporal_tags,
+            runtime_parameter_tags,
             *cell_internal_vars_surface,
         )
 
@@ -1040,6 +1098,13 @@ def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_do
         temporal_tags_set.update(_collect_temporal_tags_for_feax(expr))
     temporal_tags = tuple(sorted(temporal_tags_set))
 
+    runtime_parameter_tags_set = []
+    if volume_expr is not None:
+        _collect_runtime_parameter_tags_for_feax(volume_expr, runtime_parameter_tags_set)
+    for expr in boundary_exprs.values():
+        _collect_runtime_parameter_tags_for_feax(expr, runtime_parameter_tags_set)
+    runtime_parameter_tags = tuple(runtime_parameter_tags_set)
+
     problem_ref: dict[str, Any] = {"problem": None}
 
     active_boundary_tags: List[str] = []
@@ -1052,7 +1117,9 @@ def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_do
             continue
         active_boundary_tags.append(tag)
         location_fns.append(loc_fn)
-        surface_kernels.append(_make_universal_surface_kernel(domain, expr, tag, value_shape, temporal_tags))
+        surface_kernels.append(
+            _make_universal_surface_kernel(domain, expr, tag, value_shape, runtime_parameter_tags, temporal_tags)
+        )
 
     # FEAX always evaluates the volume kernel before adding optional surface
     # contributions. A boundary-only source, such as a pure Neumann load,
@@ -1063,6 +1130,7 @@ def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_do
             volume_expr,
             value_shape,
             temporal_tags,
+            runtime_parameter_tags,
             problem_ref,
         )
     else:
@@ -1126,7 +1194,17 @@ def _dense_array(A):
         return jnp.asarray(np.asarray(A))
 
 
-def _make_internal_vars(fe_module, temporal_tags, t, *, n_cells: int, dtype=None, extra_volume_vars=()):
+def _make_internal_vars(
+    fe_module,
+    temporal_tags,
+    t,
+    *,
+    n_cells: int,
+    dtype=None,
+    runtime_parameter_tags=(),
+    runtime_parameter_values=None,
+    extra_volume_vars=(),
+):
     """
     Build FEAX InternalVars in a batched shape FEAX can slice.
 
@@ -1138,7 +1216,11 @@ def _make_internal_vars(fe_module, temporal_tags, t, *, n_cells: int, dtype=None
         t0 = jnp.asarray(t, dtype=dtype)
         t_batched = jnp.full((int(n_cells), 1), t0, dtype=t0.dtype)
         vol.extend([t_batched for _ in temporal_tags])
-
+    # Parameter values, in runtime_parameter_tags order, broadcast per cell.
+    rpv = runtime_parameter_values or {}
+    for name in runtime_parameter_tags:
+        p = jnp.asarray(rpv[name], dtype=dtype).reshape(())
+        vol.append(jnp.full((int(n_cells), 1), p, dtype=p.dtype))
     for v in extra_volume_vars:
         arr = jnp.asarray(v, dtype=dtype)
         if arr.ndim == 0:
@@ -1189,6 +1271,10 @@ def _prepare_feax_runtime(
     for term in getattr(ir, "terms", []):
         temporal_tags.update(_collect_temporal_tags_for_feax(term.coeff))
     temporal_tags = tuple(sorted(temporal_tags))
+    runtime_parameter_tags = []
+    for term in getattr(ir, "terms", []):
+        _collect_runtime_parameter_tags_for_feax(term.coeff, runtime_parameter_tags)
+    runtime_parameter_tags = tuple(runtime_parameter_tags)
 
     element_type = getattr(domain, "_fem_element_type", None)
     if element_type is None:
@@ -1214,6 +1300,7 @@ def _prepare_feax_runtime(
         "dtype": dtype,
         "u_ref": u_ref,
         "temporal_tags": temporal_tags,
+        "runtime_parameter_tags": runtime_parameter_tags,
         "n_cells": n_cells,
     }
 
