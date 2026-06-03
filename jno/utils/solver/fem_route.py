@@ -71,6 +71,50 @@ class NeumannBC:
     tags: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class PeriodicBC:
+    """
+    Periodic boundary-condition descriptor.
+
+    Each pair identifies a master and slave boundary whose degrees of freedom
+    must be identified through a FEAX prolongation matrix.
+    """
+
+    pairs: tuple[tuple[str, str], ...]
+
+
+def periodic(*pairs):
+    """
+    Create periodic boundary-condition pairings.
+
+    Example
+    -------
+    periodic(
+        ("left", "right"),
+        ("bottom", "top"),
+    )
+    """
+    normalized = []
+
+    for pair in pairs:
+        if not isinstance(pair, (tuple, list)) or len(pair) != 2:
+            raise TypeError("Each periodic pair must be `(master_tag, slave_tag)`.")
+
+        normalized.append(
+            (
+                str(pair[0]),
+                str(pair[1]),
+            )
+        )
+
+    if len(normalized) == 0:
+        raise ValueError("At least one periodic boundary pair is required.")
+
+    return PeriodicBC(
+        pairs=tuple(normalized),
+    )
+
+
 def _as_tags(tags) -> tuple[str, ...]:
     """
     Normalize one boundary tag or a sequence of tags into a non-empty tuple.
@@ -149,32 +193,16 @@ def expand_bcs(bcs, vec: int):
     """
     Normalize user boundary-condition descriptors for FEM initialization.
 
-    Parameters
-    ----------
-    bcs:
-        Iterable containing `DirichletBC` and `NeumannBC` descriptors.
-    vec:
-        Number of scalar components of the FEM unknown. For scalar problems this
-        is `1`; for vector-valued problems this is the flattened component count.
-
     Returns
     -------
     tuple
-        `(dirichlet_tags, dirichlet_value_fns, neumann_tags)`, where:
-
-        - `dirichlet_tags` is an ordered list of essential-BC boundary tags.
-        - `dirichlet_value_fns` maps each Dirichlet tag to FEAX-compatible value
-          callable(s).
-        - `neumann_tags` is an ordered list of natural/surface boundary tags.
-
-    Raises
-    ------
-    TypeError
-        If an unsupported BC descriptor is provided.
+        ``(dirichlet_tags, dirichlet_value_fns, neumann_tags, periodic_pairs)``.
+        ``periodic_pairs`` is a list of ``(master_tag, slave_tag)`` tuples.
     """
     dirichlet_tags = []
     dirichlet_value_fns = {}
     neumann_tags = []
+    periodic_pairs = []
 
     for bc in bcs:
         if isinstance(bc, DirichletBC):
@@ -186,10 +214,14 @@ def expand_bcs(bcs, vec: int):
             for tag in bc.tags:
                 if tag not in neumann_tags:
                     neumann_tags.append(tag)
+        elif isinstance(bc, PeriodicBC):
+            periodic_pairs.extend(bc.pairs)
         else:
-            raise TypeError(f"Unsupported BC entry '{type(bc).__name__}'. Use dirichlet(...) or neumann(...).")
+            raise TypeError(
+                f"Unsupported BC entry '{type(bc).__name__}'. Use dirichlet(...), neumann(...) or periodic(...)."
+            )
 
-    return dirichlet_tags, dirichlet_value_fns, neumann_tags
+    return dirichlet_tags, dirichlet_value_fns, neumann_tags, periodic_pairs
 
 
 # --------------------------------
