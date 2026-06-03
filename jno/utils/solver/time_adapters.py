@@ -192,9 +192,39 @@ def make_diffrax_block(
         residual_fn = block.residual
 
         def rhs(t, y, solver_args):
-            M_t = jnp.asarray(mass_fn(t, args if solver_args is None else solver_args))
-            R_t = jnp.asarray(residual_fn(y, t, args if solver_args is None else solver_args)).reshape(-1)
-            return jnp.linalg.solve(M_t, -R_t)
+            runtime_args = args if solver_args is None else solver_args
+
+            y_arr = jnp.asarray(y)
+            dtype = y_arr.dtype
+
+            M_t = jnp.asarray(
+                mass_fn(
+                    t,
+                    runtime_args,
+                ),
+                dtype=dtype,
+            )
+
+            R_t = jnp.asarray(
+                residual_fn(
+                    y_arr,
+                    t,
+                    runtime_args,
+                ),
+                dtype=dtype,
+            ).reshape(-1)
+
+            velocity = jnp.linalg.solve(
+                M_t,
+                -R_t,
+            )
+
+            # Diffrax RK buffers are initialized using y0.dtype.
+            # Always return the same dtype from the generated RHS.
+            return jnp.asarray(
+                velocity,
+                dtype=dtype,
+            )
 
         return DiffraxBlock(
             backend="diffrax",

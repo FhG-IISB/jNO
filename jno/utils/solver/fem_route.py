@@ -382,7 +382,8 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
                     )
                 ),
                 dtype=dtype,
-            ) - jnp.asarray(
+            )
+            -jnp.asarray(
                 _dense_array(
                     pair["zero"]["jac_bc"](
                         u_flat,
