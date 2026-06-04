@@ -203,6 +203,61 @@ meaning.
     wrong for the actual joint problem.  Set `adapt=False` and pick
     `step_size` by hand in that case.
 
+## Multiple chains
+
+Pass `num_chains=K` (default `1`) to run K independent MCMC chains in
+parallel via `jax.vmap`:
+
+```python
+a.bayesian(
+    blackjax.nuts,
+    step_size=1e-2,
+    num_chains=4,
+    init_jitter=0.1,   # per-chain Gaussian perturbation of the initial position
+    warmup=300,
+    keep=400,
+)
+```
+
+After `crux.solve()`, `a.posterior_samples` has shape `(K, N, *param)`
+— the canonical arviz layout `(chain, draw, *)`.  All Bayesian models
+in a single `solve()` must share the same `num_chains`; mismatched
+values raise at solve-start.
+
+`init_jitter > 0` over-disperses the K starting positions so R-hat is
+conservative (chains forced apart at start; if they reconverge to the
+same distribution, that's strong evidence of convergence).
+
+A single window-adaptation sweep runs at start (PyMC convention) and
+its adapted step-size + inverse mass matrix are broadcast to all K
+chains; per-chain adaptation can be enabled in a follow-up if needed.
+
+## Convergence diagnostics
+
+Two pure-JAX helpers on `jno.bayesian` operate directly on the
+`(K, N, *param)` chain layout — no `arviz` dep:
+
+| Helper | What it computes | Threshold |
+|---|---|---|
+| `jno.bayesian.rhat(chain)` | Vehtari et al. 2021 split, rank-normalised, folded R-hat | < 1.01 (strict) or < 1.05 (lenient) → converged |
+| `jno.bayesian.ess(chain)` | Effective sample size via FFT-based autocorrelation + Geyer 1992 truncation | > 100 per parameter typically sufficient |
+
+Both return arrays of shape `*param`, one diagnostic per parameter
+component.  For `K=1` `rhat` falls back to a split-R-hat using the two
+halves of the chain (Gelman et al. 2014 BDA3 §11.4).
+
+Example:
+
+```python
+chain = a.posterior_samples              # (K, N, 1)
+r = jno.bayesian.rhat(chain)             # → (1,)
+e = jno.bayesian.ess(chain)              # → (1,)
+print(f"A: R-hat = {float(r[0]):.4f}, ESS = {float(e[0]):.1f}")
+```
+
+See [Tutorial 08](../tutorials/10-bayesian-pinns/multichain-nuts.md)
+for a worked end-to-end example.
+
 ## Wandb integration
 
 When a wandb run is active, per-Bayesian-model statistics are logged at
@@ -211,8 +266,8 @@ the same print-rate cadence as the rest of the training metrics:
 | Key                                 | Meaning                                        |
 |-------------------------------------|------------------------------------------------|
 | `posterior/<name>/n_samples`        | Number of samples collected in the chain so far |
-| `posterior/<name>/mean`             | Running posterior mean (scalar parameters only) |
-| `posterior/<name>/last`             | Last collected sample value (scalar parameters only) |
+| `posterior/<name>/n_chains`         | `num_chains` for this model (1 for the default) |
+| `posterior/<name>/mean`             | Running posterior mean (scalar parameters only, averaged over all draws) |
 
 `<name>` comes from the `name=` argument of `jno.np.parameter(...)` or
 `jno.nn.wrap(..., name=...)`.  Multi-leaf modules (MLPs) only get the
