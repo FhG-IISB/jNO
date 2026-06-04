@@ -1073,6 +1073,7 @@ class Model(Placeholder):
         self._opt_fn = None  # optax optimizer factory / instance
         self._lr = LearningRateSchedule(1.0)
         self._bayesian_cfg = None  # {"factory", "kernel_kwargs", "prior", "warmup", "keep", "thin"}
+        self._vi_cfg = None  # {"factory", "optimizer", "num_samples", "posterior_draws", "prior"}
         self._posterior_samples_pytree = None  # stacked module pytree, leading axis = N; populated by solve()
         self._dtype = None  # target dtype (e.g. jnp.bfloat16) or None
         self._param_mask = None  # current mask scope for grouped optimizer/lr calls
@@ -1562,6 +1563,8 @@ class Model(Placeholder):
         """
         if int(num_chains) < 1:
             raise ValueError(f"num_chains must be >= 1, got {num_chains}.")
+        if getattr(self, "_vi_cfg", None) is not None:
+            raise ValueError("Model already has .vi(...) configured; .bayesian() and .vi() are mutually exclusive.")
         self._bayesian_cfg = {
             "factory": kernel_factory,
             "kernel_kwargs": dict(kernel_kwargs),
@@ -1575,6 +1578,89 @@ class Model(Placeholder):
         }
         # `.bayesian()` IS the update — clear any prior `.freeze()` flag so
         # solve() does not skip this model.
+        self._frozen = False
+        self._trainable_param_mask = None
+        return self
+
+    def vi(
+        self,
+        factory,
+        *,
+        optimizer,
+        num_samples: int = 8,
+        posterior_draws: int = 500,
+        prior=None,
+        **factory_kwargs,
+    ):
+        """Fit a variational approximation to this model's posterior.
+
+        Mirrors :meth:`bayesian` but optimises the **evidence lower bound**
+        (ELBO) of a variational family ``q`` instead of running an MCMC
+        chain.  After :meth:`jno.core.core.solve` returns, ``posterior_draws``
+        i.i.d. samples are drawn from the fitted ``q`` and stored on the
+        model as :attr:`posterior_samples` — same ``(1, N, *param)`` layout
+        as the MCMC path, so all downstream code (:func:`crux.eval` with
+        ``samples="auto"``, :func:`jno.bayesian.rhat`, wandb stats) keeps
+        working transparently.
+
+        Example — mean-field VI on a scalar PDE coefficient::
+
+            import blackjax, optax
+            a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+            a.vi(
+                blackjax.meanfield_vi,
+                optimizer=optax.adam(1e-3),
+                num_samples=8,
+                posterior_draws=500,
+            )
+            crux = jno.core([residual.mse], domain)
+            crux.solve(2000)            # 2000 ELBO optimisation steps
+            chain = a.posterior_samples  # (1, 500, 1) — draws from fitted q
+
+        References:
+            * Kucukelbir, A., Tran, D., Ranganath, R., Gelman, A., & Blei,
+              D. M. (2017).  *Automatic Differentiation Variational
+              Inference.*  JMLR 18(1), 430–474.
+            * Hoffman, M. D., Blei, D. M., Wang, C., & Paisley, J. (2013).
+              *Stochastic Variational Inference.*  JMLR 14(1), 1303–1347.
+
+        Args:
+            factory: A blackjax VI factory, e.g. :func:`blackjax.meanfield_vi`.
+                Detected via signature (first arg ``logdensity_fn``, second
+                ``optimizer``).
+            optimizer: An optax ``GradientTransformation`` used to
+                optimise the ELBO.  Common choice: ``optax.adam(1e-3)``.
+            num_samples: Monte-Carlo sample count used to estimate the ELBO
+                at each step.  Higher = lower-variance gradient, slower
+                step.  Default 8.
+            posterior_draws: After solve(), draw this many i.i.d. samples
+                from the fitted variational distribution and store them on
+                :attr:`posterior_samples`.  Default 500.
+            prior: Optional ``pytree -> float`` log-prior.  Default: the
+                same wide isotropic Gaussian (σ=10) used by
+                :meth:`bayesian`.
+            **factory_kwargs: Forwarded to ``factory``.  E.g. an explicit
+                ``objective=blackjax.vi.meanfield_vi.RenyiAlpha(alpha=0.5)``
+                or ``stl_estimator=False``.
+
+        Returns:
+            self, for chaining.
+        """
+        if getattr(self, "_bayesian_cfg", None) is not None:
+            raise ValueError("Model already has .bayesian(...) configured; .bayesian() and .vi() are mutually exclusive.")
+        if int(num_samples) < 1:
+            raise ValueError(f"num_samples must be >= 1, got {num_samples}.")
+        if int(posterior_draws) < 1:
+            raise ValueError(f"posterior_draws must be >= 1, got {posterior_draws}.")
+        self._vi_cfg = {
+            "factory": factory,
+            "optimizer": optimizer,
+            "num_samples": int(num_samples),
+            "posterior_draws": int(posterior_draws),
+            "prior": prior,
+            "factory_kwargs": dict(factory_kwargs),
+        }
+        # .vi() IS the update — clear freeze.
         self._frozen = False
         self._trainable_param_mask = None
         return self
@@ -1868,6 +1954,18 @@ class ModelCall(Placeholder):
             thin=thin,
             adapt=adapt,
             **kernel_kwargs,
+        )
+        return self
+
+    def vi(self, factory, *, optimizer, num_samples=8, posterior_draws=500, prior=None, **factory_kwargs):
+        """Proxy for :meth:`Model.vi`."""
+        self.model.vi(
+            factory,
+            optimizer=optimizer,
+            num_samples=num_samples,
+            posterior_draws=posterior_draws,
+            prior=prior,
+            **factory_kwargs,
         )
         return self
 

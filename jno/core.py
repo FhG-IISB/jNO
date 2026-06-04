@@ -868,7 +868,11 @@ class core:
             def _pos_of(_state, _kind):
                 # K-leading current position of a kernel state.  SG-MCMC
                 # states ARE the position; HMC-family states carry it on
-                # ``.position``.
+                # ``.position``; VI states carry the variational mean on
+                # ``.mu`` (used as a per-step representative — actual VI
+                # samples are drawn post-solve from the fitted state).
+                if _kind == "vi":
+                    return _state.mu
                 return _state if _kind == "grad_estimator" else _state.position
 
             for k in bay_keys:
@@ -1017,6 +1021,8 @@ class core:
         _bay_lid_set = {int(_k) for _k in bay_keys}
 
         def _pos_of(_state, _kind):
+            if _kind == "vi":
+                return _state.mu
             return _state if _kind == "grad_estimator" else _state.position
 
         def _one_step(trainable, opt_states, rng, context):
@@ -1598,13 +1604,14 @@ class core:
         # therefore needs one of the two.
         for lid, fm in flax_mods.items():
             needs_update = (not fm._frozen) or (fm._lora_config is not None)
-            has_backend = fm._opt_fn is not None or fm._bayesian_cfg is not None
+            has_backend = fm._opt_fn is not None or fm._bayesian_cfg is not None or getattr(fm, "_vi_cfg", None) is not None
             if needs_update and not has_backend:
                 raise ValueError(
                     f"Model '{fm.name or type(fm.module).__name__}' (layer {lid}) "
-                    f"has no optimizer. Attach one with model.optimizer(...) or "
-                    f"sample its posterior with model.bayesian(...), or freeze the "
-                    f"model with model.freeze().\n"
+                    f"has no optimizer. Attach one with model.optimizer(...), "
+                    f"sample its posterior with model.bayesian(...), fit a "
+                    f"variational approximation with model.vi(...), or freeze "
+                    f"the model with model.freeze().\n"
                     f"Example setup:\n"
                     f"    import jno, optax\n"
                     f"    model = jno.nn.wrap(my_eqx_module)\n"
@@ -1819,6 +1826,27 @@ class core:
                     f"Model {lid}: Bayesian sampling via "
                     f"{getattr(handle.factory, '__name__', handle.factory)!r} "
                     f"(kind={handle.kind}, warmup={handle.warmup}, keep={handle.keep}, thin={handle.thin})"
+                )
+                continue
+
+            # VI models: route through the same ``bayesian_handles`` dict
+            # (the per-step dispatch in ``make_step_fn`` / ``make_mcmc_scan_fn``
+            # branches on ``handle.kind == 'vi'`` internally).  VI handles
+            # are excluded from the buffer-collection block and instead
+            # produce ``posterior_samples`` via a post-loop draw from the
+            # fitted variational distribution.
+            if getattr(fm, "_vi_cfg", None) is not None:
+                if fm._param_groups:
+                    raise NotImplementedError(
+                        f"Model (layer {lid}): combining .mask().vi() with parameter groups is not supported yet."
+                    )
+                handle = jno_bayesian.build_vi_handle(fm._vi_cfg)
+                bayesian_handles[k] = handle
+                self.log.info(
+                    f"Model {lid}: variational inference via "
+                    f"{getattr(handle.factory, '__name__', handle.factory)!r} "
+                    f"(kind=vi, num_samples={handle.vi_num_samples}, "
+                    f"posterior_draws={handle.vi_posterior_draws})"
                 )
                 continue
 
@@ -2592,20 +2620,32 @@ class core:
                 and not (has_resampling and strategies)
             )
             if _fastpath_enabled and bayesian_handles:
-                # All Bayesian handles must share warmup/keep/thin so a
-                # single scan length is well-defined.  num_chains is
-                # already validated upstream.
-                _shared = {(h.warmup, h.keep, h.thin) for h in bayesian_handles.values()}
-                if len(_shared) != 1:
+                # All MCMC handles must share warmup/keep/thin so a
+                # single scan length is well-defined.  VI handles are
+                # excluded from this check — they don't have a
+                # per-step "keep" concept; posterior_draws are taken
+                # from the fitted q post-solve.
+                _mcmc_handles_only = {k: h for k, h in bayesian_handles.items() if h.kind != "vi"}
+                _shared = {(h.warmup, h.keep, h.thin) for h in _mcmc_handles_only.values()}
+                if len(_shared) > 1:
                     _fastpath_enabled = False
                     self.log.info(
-                        "MCMC fastpath disabled: Bayesian models have mixed "
+                        "MCMC fastpath disabled: Bayesian (MCMC) models have mixed "
                         "warmup/keep/thin; falling back to per-epoch loop."
                     )
 
             if _fastpath_enabled:
-                _ref_h = next(iter(bayesian_handles.values()))
-                _fp_warmup, _fp_keep, _fp_thin = _ref_h.warmup, _ref_h.keep, _ref_h.thin
+                # If any MCMC handles exist, use their shared (warmup,
+                # keep, thin); otherwise (pure-VI solve) derive scan
+                # length from ``epochs`` so VI gets ``epochs`` ELBO
+                # optimisation steps without per-epoch dispatch.
+                _mcmc_for_shape = [h for h in bayesian_handles.values() if h.kind != "vi"]
+                if _mcmc_for_shape:
+                    _ref_h = _mcmc_for_shape[0]
+                    _fp_warmup, _fp_keep, _fp_thin = _ref_h.warmup, _ref_h.keep, _ref_h.thin
+                else:
+                    # Pure-VI: each outer iter = one ELBO step.
+                    _fp_warmup, _fp_keep, _fp_thin = 0, n_outer, 1
                 self.log.info(
                     f"MCMC fastpath: scan over {_fp_keep} samples × thin={_fp_thin} "
                     f"+ {_fp_warmup} warmup, chunked at print_rate={print_rate}."
@@ -3005,6 +3045,11 @@ class core:
                 # representative, so we read from opt_states here.
                 if bayesian_handles:
                     for _bk, _handle in bayesian_handles.items():
+                        # VI handles skip per-step collection — proper
+                        # posterior samples are drawn from the fitted
+                        # variational state in the post-solve block.
+                        if _handle.kind == "vi":
+                            continue
                         _idx = outer_epoch
                         if _idx < _handle.warmup:
                             continue
@@ -3211,6 +3256,28 @@ class core:
                         lambda x: jnp.swapaxes(x, 0, 1),
                         joined,
                     )
+
+            # ── 9d. Variational posterior draws ──
+            # For each VI handle, draw ``vi_posterior_draws`` i.i.d. samples
+            # from the fitted variational distribution and overwrite the
+            # per-step buffer with these proper posterior samples.  Layout
+            # ``(1, posterior_draws, *param)`` matches the MCMC posterior
+            # shape so downstream code (crux.eval, rhat, ess) is uniform.
+            for _bk, _handle in bayesian_handles.items():
+                if _handle.kind != "vi":
+                    continue
+                _lid_int = int(_bk)
+                _fm = flax_mods.get(_lid_int)
+                if _fm is None:
+                    continue
+                self.rng, _vi_draw_key = jax.random.split(self.rng)
+                _samples = jno_bayesian.vi_sample(_handle, opt_states[_bk], _vi_draw_key, _handle.vi_posterior_draws)
+                # _samples is a pytree with leading axis = posterior_draws.
+                # Add the canonical K-axis at position 0.
+                _fm._posterior_samples_pytree = jax.tree_util.tree_map(
+                    lambda x: jnp.copy(x)[None, ...] if isinstance(x, (jnp.ndarray, jax.Array)) else x,
+                    _samples,
+                )
 
             # ── 10. Build log dict ──
             logs = {
