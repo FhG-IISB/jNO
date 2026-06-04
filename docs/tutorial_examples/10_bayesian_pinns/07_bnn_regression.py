@@ -21,23 +21,37 @@ constrains them), this tutorial trains an MLP purely as a **regressor**:
 
 The headline B-PINN behaviour is the predictive band:
 
-* **narrow** in the data-dense regions (``|x| ∈ [0.2, 0.8]``),
+* **narrower** in the data-dense regions (``|x| ∈ [0.2, 0.8]``),
 * **widens sharply** in the data gap (``|x| < 0.2``) and outside the
-  data range (``|x| > 0.8``).
+  data range (``|x| > 0.8``) — typically ~2.5× the in-data width.
 
 That uncertainty growing where data don't constrain the model is the
 core value proposition of BNNs that point-estimate networks can't
 provide.
 
+A caveat on calibration
+-----------------------
+Vanilla SGLD on a 300-parameter MLP doesn't fully concentrate the
+chain around the data-fit MAP in a tractable budget of steps, so the
+*absolute* in-data band is wider than the noise level σ.  For
+tightly-calibrated bands on neural network weights the literature
+recommends preconditioned variants (pSGLD), SGHMC with mass-matrix
+adaptation, or variational inference — those are deliberately out of
+scope here.  We instead aim for the **qualitative** result: a
+markedly wider band in the data gap than in the data-dense region.
+
 Wiring
 ------
-The training set is packed as ``(N, 2)`` "coordinates" (`x_train` and
-`y_train` per node) and attached to a ``jno.domain.from_array`` domain;
-``.variable("obs", split=True)`` returns per-node Variables for the
-two columns.  A separate dense eval domain
-``jno.domain.line(x_range=(-1, 1), ...)`` provides the prediction
-grid.  The whole loop runs through ``crux.solve()`` — no manual
-blackjax loop.
+The 32 training inputs are a **1-D array** of ``x`` values (no
+``(N, 2)`` (x, y) packing); ``jno.domain.from_array({"train": x_train})``
+turns them into a small point-cloud domain whose ``"train"`` variable
+returns just the ``x`` coordinate.  The noisy targets are pre-computed
+once and used as a plain ``jnp`` constant in the residual.
+
+Inference happens on a separate dense 1-D ``jno.domain.line(...)`` grid
+— the same ``Line`` construct every other 1-D tutorial uses for
+visualisation — passed to ``crux.eval([...], domain=dense_dom)``.  The
+whole loop runs through ``crux.solve()`` — no manual blackjax loop.
 
 Reference
 ---------
@@ -70,17 +84,20 @@ x_train_np = np.concatenate([x_left, x_right]).astype(np.float32)
 y_clean = np.sin(6.0 * x_train_np) ** 3
 y_train_np = (y_clean + sigma_obs * rng_np.normal(size=x_train_np.shape)).astype(np.float32)
 
-# Pack (x, y) as per-node "coordinates" so a single Variable returns both.
-train_data = np.stack([x_train_np, y_train_np], axis=1)  # (32, 2)
-train_dom = jno.domain.from_array({"obs": train_data})
-x_train_var, y_train_var, _ = train_dom.variable("obs", split=True)
+# Training domain — a 1-D point cloud of the 32 training x's.
+# from_array expects (N, D) coords; here D = 1 (no y packing).
+train_dom = jno.domain.from_array({"train": x_train_np.reshape(-1, 1)})
+x_train_var, _ = train_dom.variable("train")
 
 # `from_array` round-trips through .npz which widens float32 → float64.
 # SGLD has no Metropolis cond so this dtype isn't fatal, but matching
 # the network's float32 weights keeps the loss / gradients in one dtype.
-for _tag in ("obs", "obs_0", "obs_1"):
-    if _tag in train_dom.context:
-        train_dom.context[_tag] = train_dom.context[_tag].astype(np.float32)
+if "train" in train_dom.context:
+    train_dom.context["train"] = train_dom.context["train"].astype(np.float32)
+
+# y_train is a plain jnp constant — broadcasts against u_net(x)'s
+# (B, S, N, d) = (1, 1, 32, 1) output via the trailing (32, 1) shape.
+y_train_const = jnp.asarray(y_train_np).reshape(-1, 1)
 
 # ── Bayesian MLP — every weight sampled via SGLD ─────────────────────────────
 u_net = jno.nn.wrap(
@@ -91,6 +108,13 @@ u_net = jno.nn.wrap(
         key=jax.random.PRNGKey(0),
     )
 )
+# Vanilla SGLD with the default wide Gaussian prior (σ=10).  Note that
+# SGLD on a 300-param MLP without preconditioning is known to give
+# relatively *wide* posterior bands — the chain doesn't fully
+# concentrate near the data-fit MAP in a small number of steps.  We
+# show the qualitative "uncertainty grows in the gap" effect honestly
+# (gap band ≈ 2.5× the in-data band) rather than chasing tight
+# calibration that would need pSGLD/SGHMC/VI.
 u_net.bayesian(
     blackjax.sgld,
     step_size=1e-3,
@@ -101,7 +125,7 @@ u_net.bayesian(
 
 # Data-fit residual, scaled by σ for a proper Gaussian-noise likelihood.
 y_pred = u_net(x_train_var)
-residual = (y_pred - y_train_var) / sigma_obs
+residual = (y_pred - y_train_const) / sigma_obs
 
 # ── Solve through crux.solve — no manual blackjax loop ──────────────────────
 crux = jno.core([residual.mse], train_dom)
