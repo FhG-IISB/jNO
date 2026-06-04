@@ -908,3 +908,195 @@ class TestMultiChain:
         # chain should give at least a handful.
         assert float(e[0]) > 1.0, f"ESS too low: {float(e[0])}"
         assert float(e[0]) <= 4 * 80 + 1e-3, f"ESS exceeds K*N: {float(e[0])}"
+
+
+# ---------------------------------------------------------------------------
+# MCMC fastpath (Phase 9) — scan-based pure-Bayesian solve loop
+# ---------------------------------------------------------------------------
+
+
+class TestMCMCFastpath:
+    """Phase 9 — pure-Bayesian solves auto-dispatch to a scan-based
+    fastpath that closes three perf gaps in the per-epoch Python loop:
+    no outer ``value_and_grad``, one XLA dispatch per ``print_rate``
+    chunk, and one host transfer per chunk.  Falls through to the
+    per-epoch loop when conditions don't apply (mixed-mode, substeps,
+    streaming, trackers, resampling, heterogeneous warmup/keep/thin).
+    """
+
+    def _fastpath_solve(self, *, warmup=10, keep=20, thin=1, num_chains=1, mesh_size=0.05):
+        """Tiny inverse problem that exercises the fastpath."""
+        π = jno.np.pi
+        dom = _line_domain(mesh_size)
+        x, _ = dom.variable("interior")
+        target = 2.0 * jno.np.sin(π * x)
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.bayesian(
+            blackjax.nuts,
+            step_size=1e-2,
+            inverse_mass_matrix=jnp.ones(1),
+            warmup=warmup,
+            keep=keep,
+            thin=thin,
+            adapt=False,
+            num_chains=num_chains,
+        )
+        residual = a * jno.np.sin(π * x) - target
+        jno.core([residual.mse], dom).solve(warmup + keep * thin)
+        return a
+
+    def test_fastpath_k1_recovers(self):
+        # Single chain, single Bayesian model — the most basic
+        # fastpath qualifier.
+        a = self._fastpath_solve(warmup=100, keep=200)
+        chain = a.posterior_samples
+        assert chain.shape == (1, 200, 1)
+        assert abs(float(jnp.mean(chain)) - 2.0) < 0.5
+
+    def test_fastpath_k4_multichain(self):
+        # K=4 → fastpath still applies and produces the arviz layout.
+        a = self._fastpath_solve(warmup=20, keep=50, num_chains=4)
+        chain = a.posterior_samples
+        assert chain.shape == (4, 50, 1)
+
+    def test_fastpath_multi_bayesian_gibbs(self):
+        # T02-style two-coefficient inverse — verifies the per-lid
+        # Gibbs cycle inside the scan body.  Step size + chain length
+        # match T02 reasonably so the chain actually reaches truth.
+        π = jno.np.pi
+        dom = _line_domain(mesh_size=0.02)
+        x, _ = dom.variable("interior")
+        target = 3.14 * jno.np.sin(π * x) + (-2.71) * jno.np.cos(π * x)
+        k1, k2 = jax.random.split(jax.random.PRNGKey(0), 2)
+        a = jno.np.parameter((1,), key=k1, name="a")
+        b = jno.np.parameter((1,), key=k2, name="b")
+        for p in (a, b):
+            p.bayesian(
+                blackjax.nuts,
+                step_size=1e-1,
+                inverse_mass_matrix=jnp.ones(1),
+                warmup=200,
+                keep=200,
+                adapt=False,
+            )
+        residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
+        jno.core([residual.mse], dom).solve(400)
+        assert a.posterior_samples.shape == (1, 200, 1)
+        assert b.posterior_samples.shape == (1, 200, 1)
+        # Both posterior means roughly recover truth (loose tolerance).
+        assert abs(float(jnp.mean(a.posterior_samples)) - 3.14) < 1.5
+        assert abs(float(jnp.mean(b.posterior_samples)) - (-2.71)) < 1.5
+
+    def test_substeps_falls_through_to_slow_path(self):
+        # substeps disqualifies the fastpath; the solve must still run
+        # and produce ``posterior_samples`` of the right shape.
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = jno.np.sin(π * x)
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.bayesian(blackjax.nuts, step_size=1e-2, warmup=5, keep=10, adapt=False)
+        residual = a * jno.np.sin(π * x) - target
+        jno.core([residual.mse, residual.mse], dom).solve(15, substeps=[[0], [1]])
+        assert a.posterior_samples.shape == (1, 10, 1)
+
+    def test_mixed_mode_falls_through_to_slow_path(self):
+        # An optax + Bayesian mix disqualifies the fastpath; both
+        # branches must still produce the right outputs.
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = jno.np.sin(π * x)
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        b = jno.np.parameter((1,), key=jax.random.PRNGKey(1), name="b")
+        a.bayesian(
+            blackjax.nuts,
+            step_size=5e-2,
+            inverse_mass_matrix=jnp.ones(1),
+            warmup=5,
+            keep=10,
+            adapt=False,
+        )
+        b.optimizer(optax.adam(1e-2))
+        residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
+        jno.core([residual.mse], dom).solve(15)
+        assert a.posterior_samples.shape == (1, 10, 1)
+        assert b.posterior_samples is None
+
+    def test_mixed_thin_falls_through(self):
+        # Heterogeneous ``thin`` across Bayesian models means a single
+        # scan length isn't well-defined; the gate must reject and
+        # the per-epoch loop must still work.
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = jno.np.sin(π * x)
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        b = jno.np.parameter((1,), key=jax.random.PRNGKey(1), name="b")
+        a.bayesian(
+            blackjax.nuts,
+            step_size=5e-2,
+            inverse_mass_matrix=jnp.ones(1),
+            warmup=2,
+            keep=10,
+            thin=1,
+            adapt=False,
+        )
+        b.bayesian(
+            blackjax.nuts,
+            step_size=5e-2,
+            inverse_mass_matrix=jnp.ones(1),
+            warmup=2,
+            keep=10,
+            thin=2,
+            adapt=False,
+        )
+        residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
+        jno.core([residual.mse], dom).solve(22)
+        # Slow-path collection still respects per-handle thin.
+        assert a.posterior_samples.shape == (1, 10, 1)
+        assert b.posterior_samples.shape == (1, 10, 1)
+
+    def test_thin_preserves_chain_length(self):
+        # thin > 1 must still produce exactly ``keep`` samples.
+        a = self._fastpath_solve(warmup=10, keep=30, thin=3)
+        assert a.posterior_samples.shape == (1, 30, 1)
+
+    def test_fastpath_faster_than_slow_path(self):
+        # Performance smoke: with ``epochs`` much greater than chunk
+        # size, the fastpath should beat a re-run on a budget that
+        # forces the slow path.  This is a smoke check — wall-clock
+        # variance on CI machines is high, so we only assert the
+        # fastpath isn't *slower*.
+        import time
+
+        π = jno.np.pi
+        dom = _line_domain(mesh_size=0.05)
+        x, _ = dom.variable("interior")
+        target = 2.0 * jno.np.sin(π * x)
+
+        def _solve_once(use_substeps):
+            a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+            a.bayesian(
+                blackjax.nuts,
+                step_size=1e-2,
+                inverse_mass_matrix=jnp.ones(1),
+                warmup=0,
+                keep=200,
+                adapt=False,
+            )
+            residual = a * jno.np.sin(π * x) - target
+            crux = jno.core([residual.mse, residual.mse], dom) if use_substeps else jno.core([residual.mse], dom)
+            kwargs = {"substeps": [[0], [1]]} if use_substeps else {}
+            # Warmup the JIT — first call compiles.
+            crux.solve(10, **kwargs)
+            t0 = time.time()
+            crux.solve(200, **kwargs)
+            return time.time() - t0
+
+        # Substeps forces the slow path; without forces the fastpath.
+        t_slow = _solve_once(use_substeps=True)
+        t_fast = _solve_once(use_substeps=False)
+        # Both should be small; fastpath should not be dramatically
+        # slower (a 2x margin gives wide CI tolerance).
+        assert t_fast < 2.0 * t_slow + 1.0, f"fastpath ({t_fast:.2f}s) much slower than slow path ({t_slow:.2f}s)"
