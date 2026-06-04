@@ -30,9 +30,9 @@ data don't constrain the model is the core BNN value proposition:
 
 | Region | Posterior band (90 %) |
 |---|---|
-| In-data (`|x| ∈ [0.2, 0.8]`) | width ≈ 1.4 |
+| In-data (`|x| ∈ [0.2, 0.8]`) | width ≈ 1.5 |
 | In-gap (`|x| < 0.2`) | width ≈ 3.7 |
-| Gap / in-data ratio | ≈ 2.6 × |
+| Gap / in-data ratio | ≈ 2.5 × |
 
 ## Reference
 
