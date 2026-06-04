@@ -153,3 +153,4 @@ nav:
       - BNN Regression: tutorials/10-bayesian-pinns/bnn-regression.md
       - Multi-chain NUTS: tutorials/10-bayesian-pinns/multichain-nuts.md
       - VI BNN Regression: tutorials/10-bayesian-pinns/vi-bnn-regression.md
+      - Masked BNN Head: tutorials/10-bayesian-pinns/masked-bnn-head.md

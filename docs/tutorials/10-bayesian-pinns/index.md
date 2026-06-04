@@ -1,6 +1,6 @@
 # Bayesian PINNs
 
-Nine worked examples of Bayesian Physics-Informed Neural Networks
+Ten worked examples of Bayesian Physics-Informed Neural Networks
 (B-PINNs) in jNO.  Every tutorial drives training through
 `crux.solve()` and uses jNO's per-parameter `.bayesian(...)` (MCMC) or
 `.vi(...)` (variational) configurator to attach a blackjax inference
@@ -9,7 +9,9 @@ inputs.  [Tutorial 08](./multichain-nuts.md) adds multi-chain sampling
 with Gelman-Rubin R-hat and effective sample size diagnostics;
 [Tutorial 09](./vi-bnn-regression.md) trains the same BNN regressor
 as T07 via mean-field variational inference for tighter, faster
-posterior bands.
+posterior bands; [Tutorial 10](./masked-bnn-head.md) demonstrates the
+`.mask(M).bayesian(...)` per-mask backend dispatch — sampling only a
+chosen subset of a model's parameter pytree.
 
 Two tutorials demonstrate training an **entire MLP via Bayesian
 sampling** (no optax): [Tutorial 01](./forward-noisy-poisson-1d.md)
@@ -37,6 +39,7 @@ reference for the `.bayesian()` integration live in
 | 07 | [`bnn_regression`](./bnn-regression.md) | **Full BNN regression, no PDE.**  SGLD over MLP weights against a 32-point gapped training set of `sin³(6x)`; predictive band widens ~2.5× in the data gap.  Canonical "uncertainty grows where data don't constrain" demonstration. | Yang et al. 2021 §3.1 |
 | 08 | [`multichain_nuts`](./multichain-nuts.md) | **Four parallel chains** per parameter with R-hat / ESS convergence diagnostics.  Same recovery problem as T02 but with `num_chains=4` + `init_jitter`; uses `jno.bayesian.{rhat, ess}` (pure-JAX, no arviz). | Gelman & Rubin 1992; Vehtari et al. 2021 |
 | 09 | [`vi_bnn_regression`](./vi-bnn-regression.md) | **Mean-field Variational Inference** on the same gapped BNN regression problem as T07.  Optimisation-based alternative to SGLD: faster convergence, tighter in-data bands, smaller gap-vs-data ratio.  Demonstrates `Model.vi(blackjax.meanfield_vi, ...)` with the residual-by-√N scaling needed for sum-likelihood VI. | Kucukelbir et al. 2017 |
+| 10 | [`masked_bnn_head`](./masked-bnn-head.md) | **`.mask(M).bayesian(...)` per-mask backend dispatch.**  2-layer MLP with the output linear layer ("head", 17 params) SGLD-sampled while the hidden body (304 params) stays at random init.  Demonstrates the v1 contract: chain-variance is non-zero on the masked head and machine-precision-small on the unmasked body.  Pattern B (head Bayesian + body Adam-trained) is the v2 plan — see [Training → Bayesian Sampling](../../training/bayesian.md#composable-per-mask-backends-v1). | — |
 
 ## When to use a neural surrogate (and when not to)
 
