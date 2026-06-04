@@ -1477,3 +1477,325 @@ class TestMaskedBackends:
         for leaf in leaves:
             var = float(jnp.mean(jnp.var(leaf, axis=1)))
             assert var > 1e-8, f"every leaf should vary under full mask; got var={var:.3e}"
+
+
+# ---------------------------------------------------------------------------
+# Under-the-hood: complex-scenario regression guards
+# ---------------------------------------------------------------------------
+#
+# The tests above cover individual features in isolation.  This class
+# targets the *combinations* and *new control flow* that compound
+# assumptions in subtle ways and would slip past the per-feature tests
+# if a regression occurred:
+#
+#   1. MCMC fastpath (Phase 9) vs slow path produce the same posterior.
+#   2. Multi-leaf eqx.tree_at masks (the T10 tutorial pattern).
+#   3. Window adaptation visibly mutates step_size / IMM.
+#   4. Buffer chunk-boundary correctness across many chunks.
+#   5. Mixed mode: the optax model's value actually moves from init.
+#   6. Multi-chain reproducibility with adapt=True (window_adaptation
+#      RNG determinism).
+
+
+class TestUnderTheHood:
+    """Combination and internal-invariant regression guards.  Each test
+    verifies behaviour that's a consequence of *several* features
+    interacting; per-feature unit tests above would not catch a bug
+    that only manifests under the combination.
+    """
+
+    def test_fastpath_matches_slow_path_posterior(self):
+        """Same problem, same seed, fastpath ON vs OFF → posterior
+        statistics agree.
+
+        Forces the slow path by passing ``offload_data=True`` (one of
+        the fastpath gates).  The two paths thread PRNG keys
+        differently across the chunk boundary, so chains aren't
+        bit-identical — but for a well-mixed 1-D inverse problem the
+        posterior mean should agree within ~1σ of either chain.
+        """
+        π = jno.np.pi
+
+        def _solve(offload):
+            dom = _line_domain()
+            x, _ = dom.variable("interior")
+            target = 2.5 * jno.np.sin(π * x)
+            a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+            a.bayesian(
+                blackjax.nuts,
+                step_size=1e-2,
+                inverse_mass_matrix=jnp.ones(1),
+                warmup=100,
+                keep=200,
+                adapt=False,
+            )
+            residual = a * jno.np.sin(π * x) - target
+            crux = jno.core([residual.mse], dom)
+            crux.solve(300, offload_data=offload)
+            return a.posterior_samples
+
+        chain_fast = _solve(offload=False)
+        chain_slow = _solve(offload=True)
+
+        # Same shape — neither path drops or duplicates samples.
+        assert chain_fast.shape == chain_slow.shape, (
+            f"fast/slow chain shapes disagree: {chain_fast.shape} vs {chain_slow.shape}"
+        )
+
+        # Posterior means agree within ~1 chain-stddev.
+        mean_fast = float(jnp.mean(chain_fast))
+        mean_slow = float(jnp.mean(chain_slow))
+        std_combined = float(jnp.std(jnp.concatenate([chain_fast.reshape(-1), chain_slow.reshape(-1)])))
+        assert abs(mean_fast - mean_slow) < std_combined, (
+            f"fast/slow means diverge: |{mean_fast:.4f} - {mean_slow:.4f}| = "
+            f"{abs(mean_fast - mean_slow):.4f} > 1σ = {std_combined:.4f}"
+        )
+        # Both should recover the truth ~2.5.
+        assert abs(mean_fast - 2.5) < 0.5
+        assert abs(mean_slow - 2.5) < 0.5
+
+    def test_multi_leaf_eqx_tree_at_mask_works(self):
+        """T10 tutorial pattern: ``eqx.tree_at(lambda m: m.output_layer,
+        all_false, replace=head_all_true)`` builds a mask covering BOTH
+        ``output_layer.weight`` and ``output_layer.bias`` in one call.
+        The single-leaf ``_build_last_leaf_mask`` helper doesn't
+        exercise this — if multi-leaf partition / reassembly via
+        ``eqx.partition`` ever breaks, T10 silently fails in docs CI but
+        the unit suite stays green without this test.
+        """
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        net = _tiny_net(in_dim=1, out_dim=1, hidden=4)
+
+        # The exact T10 mask construction — multi-leaf head mask.
+        all_false = jax.tree_util.tree_map(lambda _: False, net.module)
+        head_all_true = jax.tree_util.tree_map(lambda _: True, net.module.output_layer)
+        head_mask = eqx.tree_at(lambda m: m.output_layer, all_false, replace=head_all_true)
+
+        # Sanity: the head mask should select exactly 2 leaves (weight + bias).
+        head_leaf_count = sum(int(b) for b in jax.tree_util.tree_leaves(head_mask))
+        assert head_leaf_count == 2, f"expected 2 head leaves marked True; got {head_leaf_count}"
+
+        net.mask(head_mask).bayesian(blackjax.sgld, step_size=1e-3, warmup=10, keep=30)
+        residual = net(x) - 0.0
+        jno.core([residual.mse], dom).solve(40)
+
+        chain = net.posterior_samples
+        all_leaves = jax.tree_util.tree_leaves(chain)
+        mask_leaves = jax.tree_util.tree_leaves(head_mask)
+        head_vars = [float(jnp.mean(jnp.var(leaf, axis=1))) for leaf, m in zip(all_leaves, mask_leaves) if m]
+        body_vars = [float(jnp.mean(jnp.var(leaf, axis=1))) for leaf, m in zip(all_leaves, mask_leaves) if not m]
+
+        # Both head leaves (weight AND bias) must vary — this is what
+        # the single-leaf helper doesn't check.
+        assert len(head_vars) == 2, f"expected 2 head leaves in chain; got {len(head_vars)}"
+        for v in head_vars:
+            assert v > 1e-8, f"head leaf should vary across chain; got var={v:.3e}"
+        for v in body_vars:
+            assert v < 1e-10, f"body leaf should be frozen; got var={v:.3e}"
+
+    def test_window_adaptation_visibly_mutates_kwargs(self, monkeypatch):
+        """``adapt=True`` should actually run ``blackjax.window_adaptation``
+        and replace ``step_size`` / ``inverse_mass_matrix`` in the kernel
+        handle's ``extra_kwargs``.  Existing
+        ``test_adapt_recovers_with_bad_initial_step_size`` only verifies
+        recovery — both ``adapt=False`` with a lucky seed and ``adapt=True``
+        could pass that.  This test fishes the adapted values out via a
+        monkeypatched ``run_window_adaptation`` and asserts they differ
+        from the (catastrophic) initial.
+        """
+        import jno.bayesian as bay_mod
+
+        captured = {}
+        orig = bay_mod.run_window_adaptation
+
+        def _spy(handle, position, logdensity_fn, rng_key):
+            result = orig(handle, position, logdensity_fn, rng_key)
+            if result is not None:
+                _state, adapted_kwargs = result
+                captured["step_size"] = float(adapted_kwargs["step_size"])
+                captured["imm"] = adapted_kwargs["inverse_mass_matrix"]
+            return result
+
+        monkeypatch.setattr(bay_mod, "run_window_adaptation", _spy)
+
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 1.5 * jno.np.sin(π * x)
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+
+        # Catastrophic initial step_size — adaptation must shrink it
+        # massively or sampling diverges.
+        bad_step = 1e3
+        a.bayesian(
+            blackjax.nuts,
+            step_size=bad_step,
+            inverse_mass_matrix=jnp.ones(1),
+            warmup=200,
+            keep=100,
+            adapt=True,
+        )
+        residual = a * jno.np.sin(π * x) - target
+        jno.core([residual.mse], dom).solve(300)
+
+        # The spy fired exactly once for this single Bayesian model.
+        assert "step_size" in captured, "run_window_adaptation was never called — adapt=True did nothing"
+        # Adapted step_size must be at least 2 orders of magnitude
+        # smaller than the catastrophic initial 1e3.  The exact value
+        # depends on the posterior curvature; on this 1-D problem it
+        # typically lands near O(1) — comfortably below bad_step / 100.
+        assert captured["step_size"] < bad_step / 100.0, (
+            f"adapted step_size {captured['step_size']:.4f} not << bad initial {bad_step} — adaptation didn't move it"
+        )
+        # Adapted IMM has the right shape and is not the trivial identity.
+        # NOTE: this IMM check is the load-bearing half of this test.
+        # The step_size assertion above could plausibly pass under a
+        # "clamp absurd step_size to sane default" fallback, but the
+        # IMM moving away from the initial identity requires
+        # window_adaptation to have actually run and estimated the
+        # posterior covariance.
+        imm = captured["imm"]
+        assert imm.shape == (1,), f"adapted IMM has wrong shape {imm.shape}"
+        assert float(jnp.abs(imm[0] - 1.0)) > 0.01, (
+            f"adapted IMM {float(imm[0]):.4f} indistinguishable from initial 1.0 — adaptation didn't move it"
+        )
+
+    def test_fastpath_buffer_chunk_boundary_correctness(self):
+        """The fastpath flushes a pre-stacked ``(chunk_keep, *)`` buffer
+        per chunk and concatenates at the end.  Off-by-one or
+        double-counting at chunk boundaries would change the final
+        chain length in a non-linear way with respect to ``keep``.
+
+        Verify: chain length scales linearly with ``keep`` across
+        multiple chunk counts, samples are not NaN, and the chain
+        is not stuck (first / last samples differ).
+        """
+        π = jno.np.pi
+
+        def _solve(keep, thin, warmup):
+            dom = _line_domain()
+            x, _ = dom.variable("interior")
+            target = 1.0 * jno.np.sin(π * x)
+            a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+            a.bayesian(
+                blackjax.sgld,  # SGLD has no adaptation: warmup= is "skip-N" semantic
+                step_size=1e-3,
+                warmup=warmup,
+                keep=keep,
+                thin=thin,
+            )
+            residual = a * jno.np.sin(π * x) - target
+            jno.core([residual.mse], dom).solve(warmup + keep * thin)
+            return a.posterior_samples
+
+        # Three different configurations that produce different chunk
+        # counts (print_rate ≈ n_outer // 10, so chunk count ≈ 10 across
+        # all of these, but chunk_keep differs).
+        chain_a = _solve(keep=20, thin=1, warmup=5)
+        chain_b = _solve(keep=60, thin=1, warmup=5)
+        chain_c = _solve(keep=20, thin=3, warmup=5)
+
+        # Shape contract: leading axis (K=1, N=keep, *param).
+        assert chain_a.shape == (1, 20, 1), f"K=1 N=20 shape wrong: {chain_a.shape}"
+        assert chain_b.shape == (1, 60, 1), f"K=1 N=60 shape wrong: {chain_b.shape}"
+        assert chain_c.shape == (1, 20, 1), f"K=1 N=20 thin=3 shape wrong: {chain_c.shape}"
+
+        # No NaN samples anywhere — would indicate kernel state lost
+        # across a chunk boundary.
+        for c, name in [(chain_a, "a"), (chain_b, "b"), (chain_c, "c")]:
+            assert bool(jnp.all(jnp.isfinite(c))), f"chain {name} contains NaN / inf"
+
+        # Chain is not stuck: first vs last sample differ.  SGLD on a
+        # 1-param problem moves enough in 20 samples that the first /
+        # last differ by far more than machine precision.
+        first = float(chain_a[0, 0, 0])
+        last = float(chain_a[0, -1, 0])
+        assert abs(first - last) > 1e-5, (
+            f"chain stuck — first {first:.3e} == last {last:.3e}; chunking may be dropping kernel state updates"
+        )
+
+    def test_mixed_mode_optax_param_actually_moves(self):
+        """In a mixed solve (one model optax, one model Bayesian) the
+        existing tests verify ``b.posterior_samples is None`` on the
+        optax side.  They do NOT verify the optax param actually
+        learned.  If a plumbing bug zeroed the optax gradient in
+        mixed mode, that test would still pass.  This one catches it.
+        """
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 2.0 * jno.np.sin(π * x) + 3.0 * jno.np.cos(π * x)
+
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")  # Bayesian
+        b = jno.np.parameter((1,), key=jax.random.PRNGKey(1), name="b")  # optax
+
+        a.bayesian(blackjax.nuts, step_size=5e-2, inverse_mass_matrix=jnp.ones(1), warmup=20, keep=30, adapt=False)
+        b.optimizer(optax.adam(1e-1))
+
+        residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
+        crux = jno.core([residual.mse], dom)
+        crux.solve(50)
+
+        # Existing contract: only the Bayesian model carries a chain.
+        assert a.posterior_samples is not None
+        assert b.posterior_samples is None
+
+        # New: the optax model's point estimate must have moved from
+        # its zero init.  ``crux.eval([b])`` returns the current point
+        # value; comparing against zero (the .parameter() default init)
+        # tells us whether Adam actually fired.
+        b_final = float(crux.eval([b]).reshape(()))
+        assert abs(b_final) > 1e-2, (
+            f"optax param stayed at init zero under mixed-mode solve: b_final={b_final:.3e}; "
+            f"a plumbing bug may be zeroing the optax gradient when a Bayesian model is present"
+        )
+        # And b should have headed toward the true value of 3.0.
+        # Initial b is 0.0; final must be closer to 3.0 than 0.0 was.
+        assert abs(b_final - 3.0) < 3.0, (
+            f"optax param moved (b_final={b_final:.3e}) but away from truth 3.0 — gradient sign may be wrong"
+        )
+
+    def test_multichain_reproducible_with_adapt(self):
+        """Multi-chain solves with ``adapt=True`` go through one
+        ``blackjax.window_adaptation`` run that broadcasts to K chains.
+        If the adaptation RNG isn't threaded deterministically from
+        the seed, two solves with the same seed produce different
+        posteriors — which silently breaks reproducibility for the
+        path users actually run (multi-chain + adapt is the default
+        recommended setup).
+
+        The single-chain ``TestNUTSInverseProblem.test_reproducible_with_fixed_seed``
+        already covers K=1 + adapt=True implicitly; this test extends
+        coverage to K>1.
+        """
+        π = jno.np.pi
+
+        def _solve():
+            dom = _line_domain()
+            x, _ = dom.variable("interior")
+            target = 1.7 * jno.np.sin(π * x)
+            a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+            a.bayesian(
+                blackjax.nuts,
+                step_size=1e-2,
+                inverse_mass_matrix=jnp.ones(1),
+                warmup=40,
+                keep=20,
+                adapt=True,
+                num_chains=3,
+                init_jitter=0.0,
+            )
+            residual = a * jno.np.sin(π * x) - target
+            jno.core([residual.mse], dom).solve(60)
+            return a.posterior_samples
+
+        chain_a = _solve()
+        chain_b = _solve()
+        assert chain_a.shape == chain_b.shape == (3, 20, 1), (
+            f"unexpected multichain shape: {chain_a.shape} vs {chain_b.shape}"
+        )
+        assert jnp.allclose(chain_a, chain_b), (
+            "multi-chain solve with adapt=True is not reproducible under a fixed seed; "
+            "window_adaptation RNG is not threaded from the master seed"
+        )
