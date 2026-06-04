@@ -373,6 +373,63 @@ both.  Setting one after the other raises a clear error.  Models with
 VI and models with MCMC **can coexist** in the same solve call —
 each runs its own paradigm during the step loop.
 
+## Composable per-mask backends (v1)
+
+`.mask(M)` followed by `.bayesian(...)` (or `.vi(...)`) restricts
+the posterior to the subset of the model's parameter pytree where
+`M` is `True`.  Leaves outside the mask **stay at their initial
+value** throughout `solve()` — they are not updated.
+
+```python
+import equinox as eqx
+
+# Mark only the output layer ("head") as Bayesian; body stays at init.
+all_false     = jax.tree_util.tree_map(lambda _: False, net.module)
+head_all_true = jax.tree_util.tree_map(lambda _: True, net.module.output_layer)
+head_mask     = eqx.tree_at(lambda m: m.output_layer, all_false,
+                            replace=head_all_true)
+
+net.mask(head_mask).bayesian(blackjax.sgld, step_size=1e-3,
+                              warmup=1500, keep=400, thin=2)
+```
+
+After solve, `net.posterior_samples` stores the **full** pytree at every
+sample.  Leaves inside the mask vary across the chain; leaves outside
+the mask are constant.  `crux.eval([net(x)], samples="auto")`,
+`jno.bayesian.{rhat, ess}`, and wandb stats all work uniformly — no
+special case for masked solves.
+
+A worked example lives at
+[Tutorial 10](../tutorials/10-bayesian-pinns/masked-bnn-head.md).
+
+### What v1 ships
+
+* **Pattern A**: `.mask(M).bayesian(...)` (or `.vi(...)`) on a model
+  with **no** global `.optimizer(...)`.  Body stays at init; masked
+  subset is the posterior.
+* **`.lora()` + `.bayesian()`** (no mask) — the LoRA partition already
+  restricts trainable parameters to the LoRA adapters; `.bayesian()`
+  samples that restricted subset.  Composes without v1 changes.
+
+### What v1 blocks (clear errors at `solve()` time)
+
+| Pattern | Why blocked | Workaround in v1 |
+|---|---|---|
+| **B**: masked `.bayesian()` + global `.optimizer()` on the **same** model | `opt_states[layer_id]` currently holds **either** an optax state **or** a kernel state — not both.  Supporting it needs composite keys or a tuple-state encoding (the v2 refactor). | Drop the global optimizer (body stays at init), or remove the mask and apply `.bayesian()` to the whole model. |
+| **D**: multiple disjoint `.mask().bayesian()` groups on the same model | The per-group Metropolis-within-Gibbs cycle needs the same state-storage refactor as Pattern B. | Combine the disjoint masks into a single one and call `.bayesian()` once. |
+| **E**: mixed VI + MCMC on disjoint masks of the same model | Same state-storage constraint. | Run VI and MCMC on **separate** models (they may coexist freely in one solve). |
+| Masked + `num_chains > 1` | Per-chain partition / reassembly with a shared unmasked snapshot is wired but not validated against the multi-chain path in v1. | Use `num_chains=1` with masked solves; do parallel single-chain runs externally if you need R-hat. |
+
+### What `posterior_samples` looks like
+
+The chain stores the **full** model pytree (both masked and unmasked
+leaves) with leading axes `(K, N, *param_shape)` for K=1 single-chain
+solves.  Unmasked leaves are constant along the chain axis; masked
+leaves vary.  This full-pytree storage is a memory cost: for very
+narrow masks on wide models, sparse storage (varying leaves only +
+a frozen-leaves snapshot, reassembled lazily) is documented as a v2
+follow-up.  The user-facing API will not change.
+
 ## Wandb integration
 
 When a wandb run is active, per-Bayesian-model statistics are logged at

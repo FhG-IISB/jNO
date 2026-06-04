@@ -107,3 +107,5 @@
 10_bayesian_pinns/09_vi_bnn_regression.py | epochs=2000 | rel_L2_in_data=1.0035 | band_in_data=0.9569 | band_in_gap=0.9196 | band_ratio=0.96
 10_bayesian_pinns/09_vi_bnn_regression.py | epochs=2000 | rel_L2_in_data=1.0051 | band_in_data=0.9440 | band_in_gap=0.9109 | band_ratio=0.96
 10_bayesian_pinns/09_vi_bnn_regression.py | epochs=2000 | rel_L2_in_data=0.2442 | band_in_data=0.3169 | band_in_gap=0.4380 | band_ratio=1.38
+10_bayesian_pinns/10_masked_bnn_head.py | epochs=2300 | rel_L2=0.3936 | band_median=0.2400 | band_max=0.3193 | body_var_max=4.996e-16 | head_var_min=6.454e-02
+10_bayesian_pinns/10_masked_bnn_head.py | epochs=2300 | rel_L2=0.3936 | band_median=0.2400 | band_max=0.3193 | body_var_max=4.996e-16 | head_var_min=6.454e-02
