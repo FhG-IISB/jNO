@@ -1100,3 +1100,143 @@ class TestMCMCFastpath:
         # Both should be small; fastpath should not be dramatically
         # slower (a 2x margin gives wide CI tolerance).
         assert t_fast < 2.0 * t_slow + 1.0, f"fastpath ({t_fast:.2f}s) much slower than slow path ({t_slow:.2f}s)"
+
+
+# ---------------------------------------------------------------------------
+# Variational Inference (Phase 10) — mean-field VI via blackjax
+# ---------------------------------------------------------------------------
+
+
+class TestVIMeanField:
+    """Phase 10 — ``Model.vi(blackjax.meanfield_vi, ...)`` fits a
+    variational approximation through ``crux.solve()``.  After solve,
+    ``posterior_draws`` i.i.d. samples are drawn from the fitted
+    distribution and stored on ``posterior_samples`` in the same
+    ``(1, N, *param)`` layout as the MCMC path.
+    """
+
+    def _vi_solve_scalar(self, *, num_iters=1500, posterior_draws=200, lr=1e-2):
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 3.0 * jno.np.sin(π * x)
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.vi(
+            blackjax.meanfield_vi,
+            optimizer=optax.adam(lr),
+            num_samples=8,
+            posterior_draws=posterior_draws,
+        )
+        residual = a * jno.np.sin(π * x) - target
+        jno.core([residual.mse], dom).solve(num_iters)
+        return a
+
+    def test_scalar_recovery(self):
+        # Mean-field VI recovers the truth on a 1-parameter problem.
+        a = self._vi_solve_scalar()
+        chain = a.posterior_samples
+        assert chain.shape == (1, 200, 1)
+        assert abs(float(jnp.mean(chain)) - 3.0) < 0.5
+
+    def test_vector_recovery(self):
+        # VI on a 3-vector parameter.
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 1.0 * jno.np.sin(π * x) + 2.0 * jno.np.cos(π * x) + 3.0 * x
+        p = jno.np.parameter((3,), key=jax.random.PRNGKey(0), name="abc")
+        p.vi(
+            blackjax.meanfield_vi,
+            optimizer=optax.adam(1e-2),
+            num_samples=8,
+            posterior_draws=150,
+        )
+        residual = p[0] * jno.np.sin(π * x) + p[1] * jno.np.cos(π * x) + p[2] * x - target
+        jno.core([residual.mse], dom).solve(1500)
+        chain = p.posterior_samples
+        assert chain.shape == (1, 150, 3)
+        # Per-component means within reasonable tolerance.  Mean-field
+        # VI assumes diagonal covariance, so for correlated coefficients
+        # the marginal means can drift somewhat from a joint-MAP truth;
+        # a generous tolerance keeps the test stable across reseeds.
+        means = jnp.mean(chain, axis=(0, 1))
+        truth = jnp.array([1.0, 2.0, 3.0])
+        assert float(jnp.max(jnp.abs(means - truth))) < 1.5
+
+    def test_mlp_smoke(self):
+        # VI on a small MLP runs to completion and produces sensible
+        # posterior_samples shape across the multi-leaf pytree.
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        net = _tiny_net(in_dim=1, out_dim=1, hidden=4)
+        net.vi(
+            blackjax.meanfield_vi,
+            optimizer=optax.adam(1e-2),
+            num_samples=4,
+            posterior_draws=50,
+        )
+        residual = net(x) - 0.0
+        jno.core([residual.mse], dom).solve(200)
+        chain = net.posterior_samples
+        assert chain is not None
+        leaves = jax.tree_util.tree_leaves(chain)
+        # Every inexact-array leaf has the (K, N, *param_leaf) layout.
+        for leaf in leaves:
+            assert leaf.shape[:2] == (1, 50), f"unexpected leaf shape {leaf.shape}"
+
+    def test_posterior_samples_shape(self):
+        # posterior_draws controls the second axis exactly.
+        a = self._vi_solve_scalar(num_iters=200, posterior_draws=42)
+        assert a.posterior_samples.shape == (1, 42, 1)
+
+    def test_vi_and_bayesian_mutually_exclusive(self):
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.bayesian(blackjax.nuts, step_size=1e-2, warmup=2, keep=3, adapt=False)
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            a.vi(blackjax.meanfield_vi, optimizer=optax.adam(1e-3))
+
+    def test_bayesian_after_vi_raises(self):
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.vi(blackjax.meanfield_vi, optimizer=optax.adam(1e-3))
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            a.bayesian(blackjax.nuts, step_size=1e-2, warmup=2, keep=3, adapt=False)
+
+    def test_mixed_vi_and_mcmc_runs(self):
+        # One model uses VI, another uses MCMC in the same solve.
+        # Both paths populate posterior_samples with the same layout.
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 1.0 * jno.np.sin(π * x) + 2.0 * jno.np.cos(π * x)
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        b = jno.np.parameter((1,), key=jax.random.PRNGKey(1), name="b")
+        a.vi(blackjax.meanfield_vi, optimizer=optax.adam(1e-2), num_samples=4, posterior_draws=50)
+        b.bayesian(blackjax.nuts, step_size=1e-2, inverse_mass_matrix=jnp.ones(1), warmup=10, keep=50, adapt=False)
+        residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
+        jno.core([residual.mse], dom).solve(60)
+        assert a.posterior_samples.shape == (1, 50, 1)
+        assert b.posterior_samples.shape == (1, 50, 1)
+
+    def test_elbo_loss_decreases(self):
+        # Trivially: after enough VI steps the loss / negative log
+        # density should have decreased from the start.  Run two short
+        # solves at different lengths and check the longer one ends
+        # with a smaller loss.
+        π = jno.np.pi
+
+        def _run(num_iters):
+            dom = _line_domain()
+            x, _ = dom.variable("interior")
+            target = 2.0 * jno.np.sin(π * x)
+            a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+            a.vi(blackjax.meanfield_vi, optimizer=optax.adam(1e-2), num_samples=4, posterior_draws=10)
+            residual = a * jno.np.sin(π * x) - target
+            crux = jno.core([residual.mse], dom)
+            history = crux.solve(num_iters)
+            return float(history.total_loss)
+
+        loss_short = _run(50)
+        loss_long = _run(500)
+        # Longer run converges further — assert the long-run final loss
+        # is meaningfully lower than the short-run final loss.
+        assert loss_long < loss_short, f"VI loss didn't decrease: short={loss_short:.4f}, long={loss_long:.4f}"
