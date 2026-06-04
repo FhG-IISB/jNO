@@ -329,6 +329,12 @@ def init_state(handle: _KernelHandle, position, rng_key=None):
 
         kernel = factory(_dummy_grad, **handle.extra_kwargs)
 
+    if handle.num_chains == 1:
+        # Backward-compat: no K axis on the returned state.  The K axis
+        # is reattached at buffer-flush time so user-facing
+        # ``posterior_samples`` is always ``(K, N, *param)``.
+        return kernel.init(position)
+
     if rng_key is None:
         rng_key = jax.random.PRNGKey(0)
     position_K = _replicate_with_jitter(position, handle.num_chains, handle.init_jitter, rng_key)
@@ -365,6 +371,23 @@ def step(
     """
     factory = handle.factory
     K = handle.num_chains
+
+    if K == 1:
+        # Backward-compatible single-chain path: state has no K axis,
+        # kernel built once outside, no jax.vmap.  Bit-identical to the
+        # pre-multi-chain JIT trace / gradient / PRNG behaviour.
+        # ``core.py`` passes ``(p) -> log p`` style closures here (not
+        # factories), matching the OLD code form.
+        if handle.kind == "full":
+            kernel = factory(logdensity_factory, **handle.extra_kwargs)
+            new_state, _info = kernel.step(rng_key, state)
+            return new_state, new_state.position
+        kernel = factory(grad_estimator_factory, **handle.extra_kwargs)
+        new_state = kernel.step(rng_key, state, minibatch_ctx, handle.step_size)
+        return new_state, new_state
+
+    # Multi-chain path: per-chain PRNG keys + vmap.  ``core.py`` passes
+    # *factories* taking ``(p, k_idx)`` / ``(p, mb, k_idx)`` here.
     keys = jax.random.split(rng_key, K)
     chain_idx = jnp.arange(K)
 
