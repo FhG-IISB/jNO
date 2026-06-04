@@ -1879,7 +1879,12 @@ class core:
 
             # Masked .bayesian() / .vi() — a single group entry tagged
             # with backend in {"bayesian", "vi"} (Phase 11 v1 supports
-            # at most one non-optax group per model).
+            # at most one non-optax group per model, and **no** optax
+            # peers on the same model: the unmasked complement is
+            # frozen at its initial value).  Pattern B (masked Bayesian
+            # + global ``.optimizer()`` on the unmasked rest) needs a
+            # state-storage refactor that doesn't fit into v1 and is
+            # tracked as a follow-up.
             if _non_optax_groups:
                 if len(_non_optax_groups) > 1:
                     raise NotImplementedError(
@@ -1887,12 +1892,32 @@ class core:
                         "on the same model are not yet supported (Phase 11 v1).  "
                         "Use one masked group at a time."
                     )
+                if _optax_groups:
+                    raise NotImplementedError(
+                        f"Model (layer {lid}): combining .mask().bayesian()/.vi() with "
+                        ".mask().optimizer() groups is not yet supported (Phase 11 v1)."
+                    )
+                if fm._opt_fn is not None:
+                    raise NotImplementedError(
+                        f"Model (layer {lid}): combining masked .bayesian()/.vi() with "
+                        "a global .optimizer(...) on the same model needs a state-"
+                        "storage refactor and is not supported in Phase 11 v1.  As a "
+                        "workaround: drop the global .optimizer() (unmasked complement "
+                        "stays at init), or remove the .mask() and use a global "
+                        ".bayesian()/.vi() on the whole model."
+                    )
                 _g = _non_optax_groups[0]
                 if _g["backend"] == "bayesian":
                     handle = jno_bayesian.build_kernel_handle(_g["bayesian_cfg"])
                 else:
                     handle = jno_bayesian.build_vi_handle(_g["vi_cfg"])
                 handle.param_mask = _g["mask"]
+                if handle.num_chains != 1:
+                    raise NotImplementedError(
+                        f"Model (layer {lid}): masked .bayesian()/.vi() with "
+                        f"num_chains={handle.num_chains} > 1 is not supported in Phase 11 v1. "
+                        "Use num_chains=1 with masking, or drop the mask for multi-chain."
+                    )
                 bayesian_handles[k] = handle
                 self.log.info(
                     f"Model {lid}: masked {_g['backend']} via "

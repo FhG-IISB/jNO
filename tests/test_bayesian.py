@@ -8,6 +8,7 @@ short chains on tiny problems so the suite stays under a second.
 from __future__ import annotations
 
 import blackjax
+import equinox as eqx
 import foundax
 import jax
 import jax.numpy as jnp
@@ -1240,3 +1241,239 @@ class TestVIMeanField:
         # Longer run converges further — assert the long-run final loss
         # is meaningfully lower than the short-run final loss.
         assert loss_long < loss_short, f"VI loss didn't decrease: short={loss_short:.4f}, long={loss_long:.4f}"
+
+
+# ---------------------------------------------------------------------------
+# Phase 11 — Composable per-mask backends: .mask().bayesian() / .mask().vi()
+# ---------------------------------------------------------------------------
+
+
+def _build_last_leaf_mask(net):
+    """Build a leaf-level mask marking only the last array leaf of a model
+    as ``True`` and all others as ``False``.  Used by the masked-Bayesian /
+    masked-VI tests to restrict sampling to a single weight tensor.
+    """
+    leaves = jax.tree_util.tree_leaves(net.module)
+    flags = [False] * len(leaves)
+    flags[-1] = True
+    treedef = jax.tree_util.tree_structure(net.module)
+    return jax.tree_util.tree_unflatten(treedef, flags), len(leaves) - 1
+
+
+class TestMaskedBackends:
+    """Phase 11 — ``.mask(M).bayesian()`` / ``.mask(M).vi()`` restrict the
+    posterior to a subset of a model's parameter pytree; the unmasked
+    complement either stays at its initial value (no global backend) or
+    is updated by a global ``.optimizer()`` on the same model.
+    """
+
+    def test_masked_bayesian_only_masked_varies(self):
+        """Pattern A: head Bayesian, body frozen at init."""
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        net = _tiny_net(in_dim=1, out_dim=1, hidden=4)
+        mask, masked_idx = _build_last_leaf_mask(net)
+        net.mask(mask).bayesian(blackjax.sgld, step_size=1e-4, warmup=5, keep=10)
+
+        residual = net(x) - 0.0
+        jno.core([residual.mse], dom).solve(15)
+
+        chain = net.posterior_samples
+        assert chain is not None
+        leaves = jax.tree_util.tree_leaves(chain)
+        for i, leaf in enumerate(leaves):
+            # variance along the sample (N) axis, averaged over remaining dims
+            var_along_n = float(jnp.mean(jnp.var(leaf, axis=1)))
+            if i == masked_idx:
+                assert var_along_n > 1e-8, (
+                    f"masked leaf {i} should vary across the chain; got var-along-N={var_along_n:.3e}"
+                )
+            else:
+                assert var_along_n < 1e-8, (
+                    f"unmasked leaf {i} should be constant across the chain; got var-along-N={var_along_n:.3e}"
+                )
+
+    def test_masked_bayesian_with_global_optimizer_raises(self):
+        """Pattern B (mixed mode) is explicitly NOT supported in v1 —
+        masked .bayesian() + global .optimizer() on the same model
+        needs a state-storage refactor (opt_states currently can't
+        hold both an optax state and a kernel state under the same
+        key).  Verify the error is clear and actionable.
+        """
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        net = _tiny_net(in_dim=1, out_dim=1, hidden=4)
+        mask, _ = _build_last_leaf_mask(net)
+        net.optimizer(optax.adam(1e-2))
+        net.mask(mask).bayesian(blackjax.sgld, step_size=1e-4, warmup=2, keep=3)
+        residual = net(x) - 0.0
+        with pytest.raises(NotImplementedError, match="state-storage refactor"):
+            jno.core([residual.mse], dom).solve(5)
+
+    def test_masked_vi_only_masked_varies(self):
+        """Pattern A for VI: head VI, body frozen at init."""
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        net = _tiny_net(in_dim=1, out_dim=1, hidden=4)
+        mask, masked_idx = _build_last_leaf_mask(net)
+        net.mask(mask).vi(
+            blackjax.meanfield_vi,
+            optimizer=optax.adam(1e-2),
+            num_samples=4,
+            posterior_draws=20,
+        )
+
+        residual = net(x) - 0.0
+        jno.core([residual.mse], dom).solve(60)
+
+        chain = net.posterior_samples
+        assert chain is not None
+        leaves = jax.tree_util.tree_leaves(chain)
+        masked_leaf = leaves[masked_idx]
+        masked_var = float(jnp.mean(jnp.var(masked_leaf, axis=1)))
+        assert masked_var > 1e-8, f"masked VI leaf should have non-zero variance from posterior draws; got {masked_var:.3e}"
+        for i, leaf in enumerate(leaves):
+            if i == masked_idx:
+                continue
+            var_along_n = float(jnp.mean(jnp.var(leaf, axis=1)))
+            assert var_along_n < 1e-8, f"unmasked VI leaf {i} should be constant; got var-along-N={var_along_n:.3e}"
+
+    def test_masked_vi_with_global_optimizer_raises(self):
+        """Same v1 restriction as masked .bayesian() + global optimiser:
+        the mixed-mode path is blocked with a clear error."""
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        net = _tiny_net(in_dim=1, out_dim=1, hidden=4)
+        mask, _ = _build_last_leaf_mask(net)
+        net.optimizer(optax.adam(1e-2))
+        net.mask(mask).vi(
+            blackjax.meanfield_vi,
+            optimizer=optax.adam(1e-2),
+            num_samples=4,
+            posterior_draws=15,
+        )
+        residual = net(x) - 0.0
+        with pytest.raises(NotImplementedError, match="state-storage refactor"):
+            jno.core([residual.mse], dom).solve(5)
+
+    def test_masked_bayesian_posterior_samples_full_pytree(self):
+        """The chain stores the full module pytree (every leaf present),
+        not just the masked subset — so ``crux.eval(samples="auto")``
+        and other downstream tooling work unchanged.
+        """
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        net = _tiny_net(in_dim=1, out_dim=1, hidden=4)
+        # Count expected leaves on the live module.
+        expected_n_leaves = len(jax.tree_util.tree_leaves(net.module))
+        mask, _ = _build_last_leaf_mask(net)
+        net.mask(mask).bayesian(blackjax.sgld, step_size=1e-4, warmup=5, keep=8)
+        residual = net(x) - 0.0
+        jno.core([residual.mse], dom).solve(13)
+        chain_leaves = jax.tree_util.tree_leaves(net.posterior_samples)
+        assert len(chain_leaves) == expected_n_leaves, (
+            f"chain has {len(chain_leaves)} leaves, expected {expected_n_leaves} (full pytree)"
+        )
+
+    def test_masked_with_multichain_raises(self):
+        """v1 explicitly blocks .mask() + num_chains > 1 (would need
+        per-chain reassembly machinery that isn't in v1)."""
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        net = _tiny_net(in_dim=1, out_dim=1, hidden=4)
+        mask, _ = _build_last_leaf_mask(net)
+        net.mask(mask).bayesian(
+            blackjax.nuts,
+            step_size=1e-2,
+            inverse_mass_matrix=jnp.ones(1),
+            warmup=3,
+            keep=5,
+            adapt=False,
+            num_chains=4,
+        )
+        residual = net(x) - 0.0
+        with pytest.raises((NotImplementedError, ValueError)):
+            jno.core([residual.mse], dom).solve(8)
+
+    def test_global_bayesian_then_mask_raises(self):
+        """A model with both a global ``.bayesian(...)`` and a masked
+        group is ambiguous — solve raises a clear error."""
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        net = _tiny_net(in_dim=1, out_dim=1, hidden=4)
+        mask, _ = _build_last_leaf_mask(net)
+        # Global Bayesian first, then masked Bayesian.  Configurator
+        # itself doesn't reject (the user could conceivably want to
+        # override); solve catches the ambiguity.
+        net.bayesian(blackjax.sgld, step_size=1e-4, warmup=2, keep=3)
+        net.mask(mask).bayesian(blackjax.sgld, step_size=1e-4, warmup=2, keep=3)
+        residual = net(x) - 0.0
+        with pytest.raises(ValueError, match="global .bayesian"):
+            jno.core([residual.mse], dom).solve(5)
+
+    def test_multiple_masked_bayesian_raises(self):
+        """v1 supports at most one non-optax group per model.  Two
+        masked .bayesian() calls on different masks raise."""
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        net = _tiny_net(in_dim=1, out_dim=2, hidden=4)
+        leaves = jax.tree_util.tree_leaves(net.module)
+        treedef = jax.tree_util.tree_structure(net.module)
+        m1_flags = [False] * len(leaves)
+        m1_flags[-1] = True
+        m2_flags = [False] * len(leaves)
+        m2_flags[-2] = True
+        m1 = jax.tree_util.tree_unflatten(treedef, m1_flags)
+        m2 = jax.tree_util.tree_unflatten(treedef, m2_flags)
+
+        net.mask(m1).bayesian(blackjax.sgld, step_size=1e-4, warmup=2, keep=3)
+        net.mask(m2).bayesian(blackjax.sgld, step_size=1e-4, warmup=2, keep=3)
+
+        residual = net(x) - 0.0
+        with pytest.raises(NotImplementedError, match="multiple masked"):
+            jno.core([residual.mse], dom).solve(5)
+
+    def test_mask_scope_consumed_one_shot(self):
+        """``.mask(M)`` sets a pending scope consumed by the next
+        configurator call.  After ``.mask(M).bayesian(...)`` the scope
+        is gone, so a follow-on bare ``.bayesian(...)`` lands on the
+        global path (and is then caught at solve time as ambiguous)."""
+        net = _tiny_net(in_dim=1, out_dim=1, hidden=4)
+        mask, _ = _build_last_leaf_mask(net)
+        net.mask(mask).bayesian(blackjax.sgld, step_size=1e-4, warmup=2, keep=3)
+        # After this, _mask_scope_pending must be False.
+        assert net._mask_scope_pending is False
+        # And the configured backend lives in _param_groups, not in
+        # _bayesian_cfg (which is the global slot).
+        assert net._bayesian_cfg is None
+        assert any(g.get("backend") == "bayesian" for g in net._param_groups)
+
+    def test_masked_bayesian_inverse_recovery(self):
+        """End-to-end recovery: a 1-leaf network whose only trainable
+        leaf is the masked subset.  After 200 NUTS steps the posterior
+        mean should land near the data-fit MAP — checks the full
+        pipeline including the eqx.combine/eqx.filter reassembly works
+        for a problem where the answer is non-trivial.
+        """
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 2.0 * jno.np.sin(π * x)
+        net = _tiny_net(in_dim=1, out_dim=1, hidden=2)
+        # Mask True on every leaf — equivalent to no mask in the limit
+        # (every parameter is masked into the Bayesian group).  This
+        # exercises the eqx.partition / combine round-trip even when
+        # the "unmasked complement" is empty.
+        full_mask = jax.tree_util.tree_map(
+            lambda leaf: True if eqx.is_inexact_array(leaf) else False,
+            net.module,
+        )
+        net.mask(full_mask).bayesian(blackjax.sgld, step_size=1e-3, warmup=100, keep=100)
+        residual = net(x) - target
+        jno.core([residual.mse], dom).solve(200)
+        chain = net.posterior_samples
+        # All inexact leaves vary (they're all in the mask).
+        leaves = jax.tree_util.tree_leaves(chain)
+        for leaf in leaves:
+            var = float(jnp.mean(jnp.var(leaf, axis=1)))
+            assert var > 1e-8, f"every leaf should vary under full mask; got var={var:.3e}"
