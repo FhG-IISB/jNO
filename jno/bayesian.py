@@ -37,6 +37,7 @@ import jax.numpy as jnp
 
 _FULL_FIRST_ARG = "logdensity_fn"
 _GRAD_FIRST_ARG = "grad_estimator"
+_VI_SECOND_ARG = "optimizer"  # blackjax.meanfield_vi has (logdensity_fn, optimizer, ...)
 
 
 def default_gaussian_prior(position, *, sigma: float = 10.0):
@@ -53,11 +54,18 @@ def default_gaussian_prior(position, *, sigma: float = 10.0):
 
 
 def _detect_kind(factory) -> str:
-    """Return ``'full'`` or ``'grad_estimator'`` for a blackjax kernel factory.
+    """Return ``'full'``, ``'grad_estimator'``, or ``'vi'`` for a blackjax
+    kernel / VI factory.
 
     Inspects ``factory.differentiable`` (the wrapped callable on blackjax's
-    ``GenerateSamplingAPI``) and looks at the first parameter name.  Falls
-    back to ``factory`` itself for plain callables.
+    ``GenerateSamplingAPI``) or the factory itself, and looks at the first
+    parameter name and (for VI) the second.  The dispatch is:
+
+    * first arg ``logdensity_fn``, second arg ``optimizer`` → ``"vi"``
+      (e.g. :func:`blackjax.meanfield_vi`).
+    * first arg ``logdensity_fn``, no special second arg → ``"full"``
+      (NUTS / HMC / MALA).
+    * first arg ``grad_estimator`` → ``"grad_estimator"`` (SGLD / SGHMC).
     """
     target = getattr(factory, "differentiable", factory)
     try:
@@ -73,6 +81,9 @@ def _detect_kind(factory) -> str:
         )
 
     first = params[0]
+    second = params[1] if len(params) >= 2 else None
+    if first == _FULL_FIRST_ARG and second == _VI_SECOND_ARG:
+        return "vi"
     if first == _FULL_FIRST_ARG:
         return "full"
     if first == _GRAD_FIRST_ARG:
@@ -80,7 +91,8 @@ def _detect_kind(factory) -> str:
     raise ValueError(
         f"Unrecognised blackjax kernel factory {factory!r}: first argument "
         f"is {first!r}, expected one of "
-        f"{(_FULL_FIRST_ARG, _GRAD_FIRST_ARG)}."
+        f"{(_FULL_FIRST_ARG, _GRAD_FIRST_ARG)} (MCMC) or "
+        f"({_FULL_FIRST_ARG}, {_VI_SECOND_ARG}) (VI)."
     )
 
 
@@ -105,6 +117,10 @@ class _KernelHandle:
         "adapt",
         "num_chains",
         "init_jitter",
+        # VI-only fields (None / 0 for MCMC kinds).
+        "vi_optimizer",
+        "vi_num_samples",
+        "vi_posterior_draws",
     )
 
     def __init__(
@@ -120,6 +136,9 @@ class _KernelHandle:
         adapt: bool = True,
         num_chains: int = 1,
         init_jitter: float = 0.0,
+        vi_optimizer=None,
+        vi_num_samples: int = 8,
+        vi_posterior_draws: int = 500,
     ):
         self.factory = factory
         self.kind = kind
@@ -132,6 +151,57 @@ class _KernelHandle:
         self.adapt = adapt
         self.num_chains = int(num_chains)
         self.init_jitter = float(init_jitter)
+        self.vi_optimizer = vi_optimizer
+        self.vi_num_samples = int(vi_num_samples)
+        self.vi_posterior_draws = int(vi_posterior_draws)
+
+
+def build_vi_handle(cfg: dict) -> _KernelHandle:
+    """Construct a VI handle from a ``_vi_cfg`` dict.
+
+    ``cfg`` is the value stored on ``Model._vi_cfg`` by
+    :meth:`jno.trace.Model.vi`.  Keys: ``factory`` (e.g.
+    :func:`blackjax.meanfield_vi`), ``optimizer`` (an optax
+    ``GradientTransformation``), ``prior``, ``num_samples``,
+    ``posterior_draws``, plus user-supplied factory kwargs.
+
+    References
+    ----------
+    Hoffman, M. D., Blei, D. M., Wang, C., & Paisley, J. (2013).
+        *Stochastic Variational Inference.* JMLR 14(1), 1303-1347.
+
+    Kucukelbir, A., Tran, D., Ranganath, R., Gelman, A., & Blei, D. M.
+        (2017). *Automatic Differentiation Variational Inference.*
+        JMLR 18(1), 430-474.
+    """
+    factory = cfg["factory"]
+    kind = _detect_kind(factory)
+    if kind != "vi":
+        raise ValueError(f"build_vi_handle expects a VI factory (e.g. blackjax.meanfield_vi); got a {kind!r} factory.")
+    prior_fn = cfg.get("prior") or default_gaussian_prior
+    optimizer = cfg.get("optimizer")
+    if optimizer is None:
+        raise ValueError("jno .vi(..., optimizer=...) is required (an optax GradientTransformation).")
+    num_samples = int(cfg.get("num_samples", 8))
+    posterior_draws = int(cfg.get("posterior_draws", 500))
+    if num_samples < 1 or posterior_draws < 1:
+        raise ValueError("num_samples>=1, posterior_draws>=1 are required.")
+    return _KernelHandle(
+        factory=factory,
+        kind="vi",
+        prior_fn=prior_fn,
+        step_size=None,
+        extra_kwargs=dict(cfg.get("factory_kwargs", {})),
+        warmup=0,
+        keep=0,
+        thin=1,
+        adapt=False,
+        num_chains=1,
+        init_jitter=0.0,
+        vi_optimizer=optimizer,
+        vi_num_samples=num_samples,
+        vi_posterior_draws=posterior_draws,
+    )
 
 
 def build_kernel_handle(cfg: dict) -> _KernelHandle:
@@ -144,6 +214,11 @@ def build_kernel_handle(cfg: dict) -> _KernelHandle:
     """
     factory = cfg["factory"]
     kind = _detect_kind(factory)
+    if kind == "vi":
+        raise ValueError(
+            "build_kernel_handle: got a VI factory; use Model.vi(...) (not "
+            ".bayesian(...)) to configure variational inference."
+        )
     prior_fn = cfg.get("prior") or default_gaussian_prior
 
     user_kwargs = dict(cfg.get("kernel_kwargs", {}))
@@ -318,6 +393,21 @@ def init_state(handle: _KernelHandle, position, rng_key=None):
     ``init_jitter`` noise (no-op if ``init_jitter == 0``); pass any fixed
     key if you don't need jitter.
     """
+    # VI handles take a separate path — no K-axis, no inverse-mass-matrix
+    # injection; just the meanfield_vi-style ``MFVIState(mu, rho, opt_state)``.
+    if handle.kind == "vi":
+
+        def _dummy_logdensity(p):
+            return handle.prior_fn(p)
+
+        vi_algo = handle.factory(
+            _dummy_logdensity,
+            handle.vi_optimizer,
+            num_samples=handle.vi_num_samples,
+            **handle.extra_kwargs,
+        )
+        return vi_algo.init(position)
+
     _maybe_inject_inverse_mass_matrix(handle, position)
     factory = handle.factory
     if handle.kind == "full":
@@ -372,6 +462,24 @@ def step(
     factory = handle.factory
     K = handle.num_chains
 
+    if handle.kind == "vi":
+        # Variational inference path — no K axis, no MCMC kernel.
+        # Build the VI algorithm with the live logdensity_fn (closure
+        # over the current ``trainable`` / ``context``) and run one
+        # ELBO optimisation step.  ``core.py`` passes the K=1
+        # ``(p) -> log p`` closure here; we ignore the SG-MCMC factory
+        # since VI doesn't use minibatch gradient estimators.
+        vi_algo = factory(
+            logdensity_factory,
+            handle.vi_optimizer,
+            num_samples=handle.vi_num_samples,
+            **handle.extra_kwargs,
+        )
+        new_state, _info = vi_algo.step(rng_key, state)
+        # Return the variational *mean* as the position so the outer
+        # ``trainable[lid]`` carries a representative point estimate.
+        return new_state, new_state.mu
+
     if K == 1:
         # Backward-compatible single-chain path: state has no K axis,
         # kernel built once outside, no jax.vmap.  Bit-identical to the
@@ -410,6 +518,30 @@ def step(
         return new_s, new_s
 
     return jax.vmap(_one)(state, keys, chain_idx)
+
+
+def vi_sample(handle: _KernelHandle, state, rng_key, num_samples: int):
+    """Draw ``num_samples`` i.i.d. samples from a fitted VI distribution.
+
+    Builds the VI algorithm with a dummy logdensity (unused by
+    ``.sample``) and calls its sample method.  Returns a pytree mirroring
+    the position structure with a leading axis of length ``num_samples``.
+
+    Only valid for ``handle.kind == "vi"`` handles.
+    """
+    if handle.kind != "vi":
+        raise ValueError(f"vi_sample expects a VI handle; got kind={handle.kind!r}.")
+
+    def _dummy_logdensity(p):
+        return handle.prior_fn(p)
+
+    vi_algo = handle.factory(
+        _dummy_logdensity,
+        handle.vi_optimizer,
+        num_samples=handle.vi_num_samples,
+        **handle.extra_kwargs,
+    )
+    return vi_algo.sample(rng_key, state, num_samples)
 
 
 def chain_params_for_eval(models, posterior_samples_by_lid):
