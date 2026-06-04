@@ -258,6 +258,43 @@ print(f"A: R-hat = {float(r[0]):.4f}, ESS = {float(e[0]):.1f}")
 See [Tutorial 08](../tutorials/10-bayesian-pinns/multichain-nuts.md)
 for a worked end-to-end example.
 
+## Pure-Bayesian fastpath (automatic)
+
+When a `solve()` call qualifies as **pure-Bayesian** — every Bayesian
+model on the same `num_chains`, `warmup`, `keep`, and `thin`; no
+`.optimizer()` models in the same solve; no `substeps=`; no
+`offload_data=True`; no trackers; no adaptive resampling; and
+`inner_steps == 1` — `solve()` auto-dispatches to a scan-based
+fastpath that closes three perf gaps in the per-epoch Python loop:
+
+1. **No outer `value_and_grad`.**  The slow path runs
+   `jax.value_and_grad(loss_wrapper)(trainable)` every step and
+   discards the gradients when no optax models are present.  The
+   fastpath omits that pass entirely — the MCMC kernels still compute
+   their own gradients via the existing logdensity / grad-estimator
+   closures.
+2. **One XLA dispatch per `print_rate` steps.**  `warmup` steps run in
+   a `jax.lax.fori_loop` with no sample accumulation; the post-warmup
+   phase runs in a `jax.lax.scan` chunked at `print_rate` outer
+   iterations, with `thin` inner steps per outer iteration in a nested
+   `fori_loop`.  Typical solve with `print_rate ≈ keep / 10`: ~10
+   XLA dispatches instead of `epochs` of them.
+3. **One host transfer per chunk.**  Samples are stacked inside XLA
+   and returned as a single `(chunk_keep, K, *param)` tensor per
+   Bayesian model.
+
+The dispatch is fully automatic — there is no kwarg to set.  At
+solve-start jno logs a single line so the decision is visible::
+
+    INFO: MCMC fastpath: scan over 500 samples × thin=1 + 0 warmup, chunked at print_rate=80.
+
+If your solve doesn't qualify (mixed-mode, substeps, streaming, …)
+the per-epoch Python loop runs exactly as before with all its
+features intact.  The fastpath's output (`posterior_samples`,
+wandb metrics, `history`) matches the slow path's at the same
+`print_rate` cadence, just with fewer datapoints between print
+boundaries.
+
 ## Wandb integration
 
 When a wandb run is active, per-Bayesian-model statistics are logged at

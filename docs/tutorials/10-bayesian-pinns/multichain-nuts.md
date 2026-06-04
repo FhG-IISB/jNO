@@ -39,6 +39,15 @@ R-hat ≪ 1.01 → chains have converged to the same distribution.  ESS
 ~89 (vs 1600 raw draws) is modest — that's the cost of strong sample
 autocorrelation in NUTS on a short chain.
 
+## Speed note
+
+This tutorial qualifies for the [pure-Bayesian
+fastpath](../../training/bayesian.md#pure-bayesian-fastpath-automatic):
+all four chains × 400 post-warmup samples × 2 Bayesian models = 3200
+MCMC steps run inside a single `jax.lax.scan` per chunk of
+`print_rate` iterations.  Look for the ``MCMC fastpath: scan over ...``
+log line at solve-start.
+
 ## API used
 
 ```python
