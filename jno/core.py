@@ -1132,7 +1132,18 @@ class core:
                 else:
                     tr, os_, rg = _one_step(tr, os_, rg, context)
 
-                sample = {k: _pos_of(os_[k], bayesian_handles[k].kind) for k in bay_keys}
+                # Sample = full position per Bayesian/VI lid.  For masked
+                # handles (Phase 11) the kernel state holds only the
+                # masked subset, but ``tr[lid]`` is the post-step full
+                # reassembled position (done in ``jno_bayesian.step``),
+                # so we read directly from ``tr`` for masked handles.
+                sample = {}
+                for k in bay_keys:
+                    handle = bayesian_handles[k]
+                    if handle.param_mask is not None:
+                        sample[k] = tr[int(k)]
+                    else:
+                        sample[k] = _pos_of(os_[k], handle.kind)
                 return (tr, os_, rg), sample
 
             if keep > 0:
@@ -1604,7 +1615,16 @@ class core:
         # therefore needs one of the two.
         for lid, fm in flax_mods.items():
             needs_update = (not fm._frozen) or (fm._lora_config is not None)
-            has_backend = fm._opt_fn is not None or fm._bayesian_cfg is not None or getattr(fm, "_vi_cfg", None) is not None
+            has_global_backend = (
+                fm._opt_fn is not None or fm._bayesian_cfg is not None or getattr(fm, "_vi_cfg", None) is not None
+            )
+            # Phase 11: a masked .bayesian() / .vi() / .optimizer() call
+            # registers a group entry without setting a global backend.
+            # Treat that as a valid backend for the model.
+            has_group_backend = any(
+                g.get("opt_fn") is not None or g.get("backend") in ("bayesian", "vi") for g in fm._param_groups
+            )
+            has_backend = has_global_backend or has_group_backend
             if needs_update and not has_backend:
                 raise ValueError(
                     f"Model '{fm.name or type(fm.module).__name__}' (layer {lid}) "
@@ -1809,16 +1829,22 @@ class core:
                 continue
             k = str(lid)
 
+            # Split parameter groups by backend tag (Phase 11).  Existing
+            # `.mask().optimizer()` entries default to backend="optax" so
+            # this is backwards-compatible.
+            _non_optax_groups = [g for g in fm._param_groups if g.get("backend") in ("bayesian", "vi")]
+            _optax_groups = [g for g in fm._param_groups if g.get("backend", "optax") == "optax"]
+
             # Bayesian models: route through bayesian_handles only — they
             # are NOT added to per_model_opts.  The step dispatcher checks
             # both dicts; opt_states carries either an optax state (for
             # optax models) or a kernel state (for Bayesian models).
             if fm._bayesian_cfg is not None:
                 if fm._param_groups:
-                    raise NotImplementedError(
-                        f"Model (layer {lid}): combining .mask().bayesian() with parameter "
-                        "groups is not supported yet. Use .bayesian() on the whole model "
-                        "or .mask().optimizer() — not both on the same model."
+                    raise ValueError(
+                        f"Model (layer {lid}): cannot combine global .bayesian() with .mask() "
+                        "groups.  Either drop the global .bayesian() and use one or more "
+                        ".mask(M).bayesian() calls, or drop the masks."
                     )
                 handle = jno_bayesian.build_kernel_handle(fm._bayesian_cfg)
                 bayesian_handles[k] = handle
@@ -1837,8 +1863,9 @@ class core:
             # fitted variational distribution.
             if getattr(fm, "_vi_cfg", None) is not None:
                 if fm._param_groups:
-                    raise NotImplementedError(
-                        f"Model (layer {lid}): combining .mask().vi() with parameter groups is not supported yet."
+                    raise ValueError(
+                        f"Model (layer {lid}): cannot combine global .vi() with .mask() "
+                        "groups.  Use .mask(M).vi(...) instead."
                     )
                 handle = jno_bayesian.build_vi_handle(fm._vi_cfg)
                 bayesian_handles[k] = handle
@@ -1850,7 +1877,36 @@ class core:
                 )
                 continue
 
-            if fm._param_groups and fm._lora_config is None:
+            # Masked .bayesian() / .vi() — a single group entry tagged
+            # with backend in {"bayesian", "vi"} (Phase 11 v1 supports
+            # at most one non-optax group per model).
+            if _non_optax_groups:
+                if len(_non_optax_groups) > 1:
+                    raise NotImplementedError(
+                        f"Model (layer {lid}): multiple masked .bayesian()/.vi() groups "
+                        "on the same model are not yet supported (Phase 11 v1).  "
+                        "Use one masked group at a time."
+                    )
+                _g = _non_optax_groups[0]
+                if _g["backend"] == "bayesian":
+                    handle = jno_bayesian.build_kernel_handle(_g["bayesian_cfg"])
+                else:
+                    handle = jno_bayesian.build_vi_handle(_g["vi_cfg"])
+                handle.param_mask = _g["mask"]
+                bayesian_handles[k] = handle
+                self.log.info(
+                    f"Model {lid}: masked {_g['backend']} via "
+                    f"{getattr(handle.factory, '__name__', handle.factory)!r} "
+                    f"(restricted to .mask() scope)"
+                )
+                # If no optax-tagged groups and no global optimiser, the
+                # complement of the mask is implicitly frozen — done.
+                if not _optax_groups and fm._opt_fn is None:
+                    continue
+                # Otherwise fall through to the optax block (which uses
+                # _optax_groups + the global _opt_fn for the "rest").
+
+            if _optax_groups and fm._lora_config is None:
                 # ── Per-group optimizer via chained optax.masked transforms ──
                 # Build one masked transform per group, plus a "default" for
                 # any trainable params not covered by an explicit group.
@@ -1869,7 +1925,7 @@ class core:
                 # Align each user-supplied group mask to the *trainable* tree,
                 # where frozen/static leaves are represented as None.
                 group_masks_norm = []
-                for g in fm._param_groups:
+                for g in _optax_groups:
                     gmask_norm = jax.tree_util.tree_map(
                         lambda p, m: bool(m) if p is not None else False,
                         trainable[lid],
@@ -1886,7 +1942,7 @@ class core:
                 ]
 
                 group_counts = []
-                for g, gmask in zip(fm._param_groups, group_leaf_masks):
+                for g, gmask in zip(_optax_groups, group_leaf_masks):
                     count = sum(1 for m, is_arr in zip(gmask, array_flags) if is_arr and m)
                     group_counts.append((g["target"], count))
                     if count == 0:
@@ -1910,15 +1966,15 @@ class core:
                     )
 
                 self.log.info(
-                    f"Model {lid}: parameter groups summary — groups={len(fm._param_groups)}, "
+                    f"Model {lid}: parameter groups summary — groups={len(_optax_groups)}, "
                     f"overlap={overlap_count}, uncovered_by_groups={uncovered_count}"
                 )
                 self.log.quiet(f"Parameter Group Diagnostic Report for model {lid}")
-                self.log.quiet(f"groups={len(fm._param_groups)}, overlap={overlap_count}, uncovered={uncovered_count}")
+                self.log.quiet(f"groups={len(_optax_groups)}, overlap={overlap_count}, uncovered={uncovered_count}")
                 for tgt, cnt in group_counts:
                     self.log.quiet(f"  target={tgt!r}: matched_arrays={cnt}")
 
-                for g, gmask_norm in zip(fm._param_groups, group_masks_norm):
+                for g, gmask_norm in zip(_optax_groups, group_masks_norm):
                     g_opt = g["opt_fn"] or global_opt_fn
                     g_lr = g["lr"] if g["lr"] is not None else global_lr
                     chain = _build_opt_chain(g_opt, g_lr)
@@ -1945,7 +2001,7 @@ class core:
                 per_model_opts[k] = optax.chain(*masked_transforms)
                 group_lr_schedules[k] = group_scheds
                 self.log.info(
-                    f"Model {lid}: {len(fm._param_groups)} parameter group(s) + default — using per-group optimizers"
+                    f"Model {lid}: {len(_optax_groups)} parameter group(s) + default — using per-group optimizers"
                 )
             else:
                 # ── Single global optimizer (original behaviour) ──
@@ -3059,8 +3115,22 @@ class core:
                         _buf = _bayesian_buffers[_bk]
                         if len(_buf) >= _handle.keep:
                             continue
-                        _state_for_sample = opt_states[_bk]
-                        _pos_K = _state_for_sample if _handle.kind == "grad_estimator" else _state_for_sample.position
+                        _lid_int = int(_bk)
+                        if _handle.param_mask is not None:
+                            # Masked Bayesian (Phase 11): the kernel state
+                            # holds only the masked subset; the full
+                            # reassembled position lives in trainable[lid]
+                            # (updated post-step inside the jit by
+                            # ``jno_bayesian.step``).
+                            if _handle.num_chains != 1:
+                                raise NotImplementedError(
+                                    "Masked .bayesian()/.vi() with num_chains>1 is not "
+                                    "supported in Phase 11 v1. Use num_chains=1 with .mask()."
+                                )
+                            _pos_K = trainable[_lid_int]
+                        else:
+                            _state_for_sample = opt_states[_bk]
+                            _pos_K = _state_for_sample if _handle.kind == "grad_estimator" else _state_for_sample.position
                         # Detach from buffer donation: a jnp.copy of every
                         # array leaf gives us our own buffers that survive
                         # the next jit_step's donate_argnums.  We add a
@@ -3273,6 +3343,12 @@ class core:
                 self.rng, _vi_draw_key = jax.random.split(self.rng)
                 _samples = jno_bayesian.vi_sample(_handle, opt_states[_bk], _vi_draw_key, _handle.vi_posterior_draws)
                 # _samples is a pytree with leading axis = posterior_draws.
+                # For masked VI: ``_samples`` only covers the masked
+                # subset; reassemble each draw with the unmasked
+                # snapshot (constant across draws).
+                if _handle.param_mask is not None:
+                    _unmasked_snap = eqx.filter(trainable[_lid_int], _handle.param_mask, inverse=True)
+                    _samples = jax.vmap(lambda p: eqx.combine(p, _unmasked_snap))(_samples)
                 # Add the canonical K-axis at position 0.
                 _fm._posterior_samples_pytree = jax.tree_util.tree_map(
                     lambda x: jnp.copy(x)[None, ...] if isinstance(x, (jnp.ndarray, jax.Array)) else x,

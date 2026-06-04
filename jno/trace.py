@@ -1565,7 +1565,7 @@ class Model(Placeholder):
             raise ValueError(f"num_chains must be >= 1, got {num_chains}.")
         if getattr(self, "_vi_cfg", None) is not None:
             raise ValueError("Model already has .vi(...) configured; .bayesian() and .vi() are mutually exclusive.")
-        self._bayesian_cfg = {
+        cfg = {
             "factory": kernel_factory,
             "kernel_kwargs": dict(kernel_kwargs),
             "prior": prior,
@@ -1576,6 +1576,23 @@ class Model(Placeholder):
             "num_chains": int(num_chains),
             "init_jitter": float(init_jitter),
         }
+        if self._mask_scope_pending and self._param_mask is not None:
+            # Masked branch: register this kernel as a per-group backend
+            # on the currently pending ``.mask(M)`` scope.  The remaining
+            # leaves (not covered by any group) use the global optimizer
+            # (if set via a bare ``.optimizer(...)``), or are frozen.
+            group = self._get_or_create_group()
+            if group.get("backend") not in (None, "optax"):
+                raise ValueError(
+                    "Model: this mask scope already has a non-optax backend "
+                    f"({group['backend']!r}).  One backend per mask scope."
+                )
+            group["backend"] = "bayesian"
+            group["bayesian_cfg"] = cfg
+            self._mask_scope_pending = False
+        else:
+            # Global branch — unchanged.
+            self._bayesian_cfg = cfg
         # `.bayesian()` IS the update — clear any prior `.freeze()` flag so
         # solve() does not skip this model.
         self._frozen = False
@@ -1652,7 +1669,7 @@ class Model(Placeholder):
             raise ValueError(f"num_samples must be >= 1, got {num_samples}.")
         if int(posterior_draws) < 1:
             raise ValueError(f"posterior_draws must be >= 1, got {posterior_draws}.")
-        self._vi_cfg = {
+        cfg = {
             "factory": factory,
             "optimizer": optimizer,
             "num_samples": int(num_samples),
@@ -1660,6 +1677,22 @@ class Model(Placeholder):
             "prior": prior,
             "factory_kwargs": dict(factory_kwargs),
         }
+        if self._mask_scope_pending and self._param_mask is not None:
+            # Masked branch — register VI as a per-group backend on the
+            # currently pending ``.mask(M)`` scope.  Mirror of the
+            # masked branch in ``Model.bayesian(...)``.
+            group = self._get_or_create_group()
+            if group.get("backend") not in (None, "optax"):
+                raise ValueError(
+                    "Model: this mask scope already has a non-optax backend "
+                    f"({group['backend']!r}).  One backend per mask scope."
+                )
+            group["backend"] = "vi"
+            group["vi_cfg"] = cfg
+            self._mask_scope_pending = False
+        else:
+            # Global branch — unchanged.
+            self._vi_cfg = cfg
         # .vi() IS the update — clear freeze.
         self._frozen = False
         self._trainable_param_mask = None

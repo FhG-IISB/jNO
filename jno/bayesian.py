@@ -32,6 +32,7 @@ from __future__ import annotations
 import inspect
 from typing import Any, Callable
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 
@@ -121,6 +122,13 @@ class _KernelHandle:
         "vi_optimizer",
         "vi_num_samples",
         "vi_posterior_draws",
+        # Phase 11: ``.mask(M).bayesian()`` / ``.mask(M).vi()``.  ``None``
+        # means "operate on the full position" (the default for global
+        # configurators).  When set, the kernel sees only the masked
+        # subset of the position; the unmasked portion is held constant
+        # at the model's current ``trainable[lid]`` snapshot and
+        # reassembled inside the closure before each logdensity eval.
+        "param_mask",
     )
 
     def __init__(
@@ -139,6 +147,7 @@ class _KernelHandle:
         vi_optimizer=None,
         vi_num_samples: int = 8,
         vi_posterior_draws: int = 500,
+        param_mask=None,
     ):
         self.factory = factory
         self.kind = kind
@@ -154,6 +163,7 @@ class _KernelHandle:
         self.vi_optimizer = vi_optimizer
         self.vi_num_samples = int(vi_num_samples)
         self.vi_posterior_draws = int(vi_posterior_draws)
+        self.param_mask = param_mask
 
 
 def build_vi_handle(cfg: dict) -> _KernelHandle:
@@ -393,6 +403,16 @@ def init_state(handle: _KernelHandle, position, rng_key=None):
     ``init_jitter`` noise (no-op if ``init_jitter == 0``); pass any fixed
     key if you don't need jitter.
     """
+    # Phase 11 masked path — narrow the position to the masked subset
+    # *before* any init.  The unmasked portion is held constant at the
+    # current model snapshot (held by ``trainable[lid]`` in the
+    # caller); we don't capture it here.  ``init_position`` is the
+    # ``eqx.partition``-narrowed pytree blackjax sees from now on.
+    if handle.param_mask is not None:
+        init_position = eqx.filter(position, handle.param_mask)
+    else:
+        init_position = position
+
     # VI handles take a separate path — no K-axis, no inverse-mass-matrix
     # injection; just the meanfield_vi-style ``MFVIState(mu, rho, opt_state)``.
     if handle.kind == "vi":
@@ -406,7 +426,7 @@ def init_state(handle: _KernelHandle, position, rng_key=None):
             num_samples=handle.vi_num_samples,
             **handle.extra_kwargs,
         )
-        state = vi_algo.init(position)
+        state = vi_algo.init(init_position)
         # Two manual overrides on the blackjax-default init:
         # 1. ``state.mu`` is initialised at zeros regardless of the
         #    position argument.  For non-trivial models (e.g. an MLP
@@ -421,9 +441,9 @@ def init_state(handle: _KernelHandle, position, rng_key=None):
         #    so the initial q is tight; the optimiser then *grows* rho
         #    where the posterior is genuinely wide.
         small_rho = jax.tree_util.tree_map(lambda x: jnp.full_like(x, -3.0), state.rho)
-        return state._replace(mu=position, rho=small_rho)
+        return state._replace(mu=init_position, rho=small_rho)
 
-    _maybe_inject_inverse_mass_matrix(handle, position)
+    _maybe_inject_inverse_mass_matrix(handle, init_position)
     factory = handle.factory
     if handle.kind == "full":
         kernel = factory(handle.prior_fn, **handle.extra_kwargs)
@@ -438,11 +458,11 @@ def init_state(handle: _KernelHandle, position, rng_key=None):
         # Backward-compat: no K axis on the returned state.  The K axis
         # is reattached at buffer-flush time so user-facing
         # ``posterior_samples`` is always ``(K, N, *param)``.
-        return kernel.init(position)
+        return kernel.init(init_position)
 
     if rng_key is None:
         rng_key = jax.random.PRNGKey(0)
-    position_K = _replicate_with_jitter(position, handle.num_chains, handle.init_jitter, rng_key)
+    position_K = _replicate_with_jitter(init_position, handle.num_chains, handle.init_jitter, rng_key)
     return jax.vmap(kernel.init)(position_K)
 
 
@@ -477,6 +497,36 @@ def step(
     factory = handle.factory
     K = handle.num_chains
 
+    # ── Phase 11: ``.mask(M).bayesian()`` / ``.mask(M).vi()`` ──
+    # When the handle has a ``param_mask``, the MCMC / VI state only
+    # spans the masked subset of the position.  ``position`` (the
+    # caller-supplied full snapshot) provides the unmasked complement;
+    # we wrap the user-supplied factories so each call reassembles
+    # the full pytree before logdensity / loss evaluation.  After the
+    # kernel step, the new masked position is recombined with the
+    # unmasked snapshot and returned so the caller can store the full
+    # pytree in ``trainable[lid]`` without knowing about the mask.
+    _mask = handle.param_mask
+    if _mask is not None:
+        _unmasked = eqx.filter(position, _mask, inverse=True)
+        _orig_ld = logdensity_factory
+        _orig_ge = grad_estimator_factory
+
+        def _wrap_full(p_masked):
+            return eqx.combine(p_masked, _unmasked)
+
+        def logdensity_factory(p_masked, *args):  # noqa: F811 — rebind
+            return _orig_ld(_wrap_full(p_masked), *args)
+
+        def grad_estimator_factory(p_masked, mb, *args):  # noqa: F811
+            grad_full = _orig_ge(_wrap_full(p_masked), mb, *args)
+            return eqx.filter(grad_full, _mask)
+
+        def _reassemble_single(p_masked):
+            return _wrap_full(p_masked)
+    else:
+        _reassemble_single = None
+
     if handle.kind == "vi":
         # Variational inference path — no K axis, no MCMC kernel.
         # Build the VI algorithm with the live logdensity_fn (closure
@@ -493,7 +543,10 @@ def step(
         new_state, _info = vi_algo.step(rng_key, state)
         # Return the variational *mean* as the position so the outer
         # ``trainable[lid]`` carries a representative point estimate.
-        return new_state, new_state.mu
+        new_pos = new_state.mu
+        if _reassemble_single is not None:
+            new_pos = _reassemble_single(new_pos)
+        return new_state, new_pos
 
     if K == 1:
         # Backward-compatible single-chain path: state has no K axis,
@@ -504,10 +557,16 @@ def step(
         if handle.kind == "full":
             kernel = factory(logdensity_factory, **handle.extra_kwargs)
             new_state, _info = kernel.step(rng_key, state)
-            return new_state, new_state.position
+            new_pos = new_state.position
+            if _reassemble_single is not None:
+                new_pos = _reassemble_single(new_pos)
+            return new_state, new_pos
         kernel = factory(grad_estimator_factory, **handle.extra_kwargs)
         new_state = kernel.step(rng_key, state, minibatch_ctx, handle.step_size)
-        return new_state, new_state
+        new_pos = new_state
+        if _reassemble_single is not None:
+            new_pos = _reassemble_single(new_pos)
+        return new_state, new_pos
 
     # Multi-chain path: per-chain PRNG keys + vmap.  ``core.py`` passes
     # *factories* taking ``(p, k_idx)`` / ``(p, mb, k_idx)`` here.
@@ -520,7 +579,10 @@ def step(
             ld = lambda p, _k=k_idx: logdensity_factory(p, _k)
             kernel_k = factory(ld, **handle.extra_kwargs)
             new_s, _info = kernel_k.step(key_k, state_k)
-            return new_s, new_s.position
+            new_p = new_s.position
+            if _reassemble_single is not None:
+                new_p = _reassemble_single(new_p)
+            return new_s, new_p
 
         return jax.vmap(_one)(state, keys, chain_idx)
 
@@ -530,7 +592,10 @@ def step(
         ge = lambda p, mb, _k=k_idx: grad_estimator_factory(p, mb, _k)
         kernel_k = factory(ge, **handle.extra_kwargs)
         new_s = kernel_k.step(key_k, state_k, minibatch_ctx, step_size)
-        return new_s, new_s
+        new_p = new_s
+        if _reassemble_single is not None:
+            new_p = _reassemble_single(new_p)
+        return new_s, new_p
 
     return jax.vmap(_one)(state, keys, chain_idx)
 
