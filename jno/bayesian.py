@@ -406,7 +406,22 @@ def init_state(handle: _KernelHandle, position, rng_key=None):
             num_samples=handle.vi_num_samples,
             **handle.extra_kwargs,
         )
-        return vi_algo.init(position)
+        state = vi_algo.init(position)
+        # Two manual overrides on the blackjax-default init:
+        # 1. ``state.mu`` is initialised at zeros regardless of the
+        #    position argument.  For non-trivial models (e.g. an MLP
+        #    with Xavier init) starting at mu=zeros makes the ELBO
+        #    landscape flat and convergence painfully slow.  We set
+        #    mu to the user-supplied initial weights so VI starts
+        #    from a reasonable point — matches numpyro's autoguide.
+        # 2. ``state.rho`` defaults to large values (≈ exp(rho) ≈ 1,
+        #    meaning the variational q has unit std per weight).  For
+        #    multi-layer MLPs that gives extremely noisy MC ELBO
+        #    gradients.  We shrink rho to ``log_std = -3`` (std ≈ 0.05)
+        #    so the initial q is tight; the optimiser then *grows* rho
+        #    where the posterior is genuinely wide.
+        small_rho = jax.tree_util.tree_map(lambda x: jnp.full_like(x, -3.0), state.rho)
+        return state._replace(mu=position, rho=small_rho)
 
     _maybe_inject_inverse_mass_matrix(handle, position)
     factory = handle.factory
