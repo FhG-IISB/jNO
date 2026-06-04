@@ -151,3 +151,4 @@ nav:
       - Inverse Surrogate w/ Uncertainty: tutorials/10-bayesian-pinns/inverse-surrogate-uncertainty.md
       - Inverse FEM Diffusivity: tutorials/10-bayesian-pinns/inverse-fem-diffusivity.md
       - BNN Regression: tutorials/10-bayesian-pinns/bnn-regression.md
+      - Multi-chain NUTS: tutorials/10-bayesian-pinns/multichain-nuts.md
