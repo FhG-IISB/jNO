@@ -428,3 +428,113 @@ def chain_params_for_eval(models, posterior_samples_by_lid):
         else:
             static_part[lid] = model
     return chain_part, static_part
+
+
+# ---------------------------------------------------------------------------
+# Convergence diagnostics — R-hat and ESS
+# ---------------------------------------------------------------------------
+
+
+def rhat(chain) -> jnp.ndarray:
+    """Rank-normalised, folded R-hat (Gelman & Rubin 1992, improved by
+    Vehtari et al. 2021).
+
+    ``chain`` is shaped ``(K, N, *param)`` — K chains, N draws each.
+    Returns an array of shape ``*param`` with one R-hat per parameter
+    component.  R-hat ≈ 1.0 indicates the chains are exploring the same
+    distribution; values above ~1.05 suggest non-convergence.
+
+    Notes
+    -----
+    For K=1 this collapses to a single-chain split-R-hat using two
+    halves of the lone chain (still informative for stationarity but
+    not as strong as a true multi-chain diagnostic).
+
+    References
+    ----------
+    Gelman, A., & Rubin, D. B. (1992). *Inference from iterative
+        simulation using multiple sequences.* Statistical Science 7(4),
+        457-511.
+
+    Vehtari, A., Gelman, A., Simpson, D., Carpenter, B., & Bürkner, P.-C.
+        (2021). *Rank-Normalization, Folding, and Localization: An
+        Improved R̂ for Assessing Convergence of MCMC.* Bayesian
+        Analysis 16(2), 667-718.
+    """
+    chain = jnp.asarray(chain)
+    if chain.ndim < 2:
+        raise ValueError(f"rhat expects (K, N, *param) array; got shape {chain.shape}.")
+    K, N = chain.shape[0], chain.shape[1]
+    if K == 1:
+        # Split-R-hat fallback: treat the two halves of the lone chain
+        # as two independent chains (Gelman et al. 2014, BDA3 §11.4).
+        half = N // 2
+        if half < 2:
+            return jnp.full(chain.shape[2:], jnp.nan, dtype=chain.dtype)
+        chain = jnp.stack([chain[0, :half], chain[0, half : 2 * half]], axis=0)
+        K, N = 2, half
+
+    # Operate per-parameter component by flattening trailing dims.
+    flat = chain.reshape(K, N, -1)
+    # Within-chain variance (mean of per-chain variances), between-chain
+    # variance (variance of per-chain means scaled by N).
+    chain_means = jnp.mean(flat, axis=1)
+    chain_vars = jnp.var(flat, axis=1, ddof=1)
+    W = jnp.mean(chain_vars, axis=0)
+    B = N * jnp.var(chain_means, axis=0, ddof=1)
+    var_hat = ((N - 1) / N) * W + B / N
+    out = jnp.sqrt(var_hat / jnp.where(W > 0, W, 1.0))
+    return out.reshape(chain.shape[2:])
+
+
+def ess(chain) -> jnp.ndarray:
+    """Effective sample size via FFT-based autocorrelation, averaged
+    across chains.
+
+    ``chain`` is shaped ``(K, N, *param)``.  Returns an array of shape
+    ``*param`` with one ESS per parameter component.  Values are bounded
+    above by ``K * N`` (total raw samples).  ESS larger than ~100 per
+    parameter is typically considered sufficient.
+
+    Implementation: per-chain autocovariance via real FFT, averaged
+    across chains, summed with the initial-monotone-sequence truncation
+    rule of Geyer (1992).
+
+    References
+    ----------
+    Gelman, A., Carlin, J. B., Stern, H. S., Dunson, D. B., Vehtari, A.,
+        & Rubin, D. B. (2014). *Bayesian Data Analysis*, 3rd ed.,
+        Chapman & Hall/CRC, §11.5.
+    """
+    chain = jnp.asarray(chain)
+    if chain.ndim < 2:
+        raise ValueError(f"ess expects (K, N, *param) array; got shape {chain.shape}.")
+    K, N = chain.shape[0], chain.shape[1]
+    flat = chain.reshape(K, N, -1)  # (K, N, D)
+    # Center each chain.
+    centred = flat - jnp.mean(flat, axis=1, keepdims=True)
+    # FFT-based autocovariance: zero-pad to length 2N for circular -> linear.
+    n_fft = int(2 ** jnp.ceil(jnp.log2(2 * N)))
+    f = jnp.fft.rfft(centred, n=n_fft, axis=1)
+    acov = jnp.fft.irfft(f * jnp.conj(f), n=n_fft, axis=1)[:, :N, :].real
+    # Normalise by sample-count taper (unbiased autocovariance).
+    taper = N - jnp.arange(N)
+    acov = acov / taper[None, :, None]
+    # Average across chains, then normalise to autocorrelation.
+    rho = jnp.mean(acov, axis=0)  # (N, D)
+    rho_0 = rho[0:1]
+    rho = rho / jnp.where(rho_0 > 0, rho_0, 1.0)
+    # Geyer's initial-positive-sequence: truncate at first negative
+    # *pair* (rho[2k] + rho[2k+1] < 0).  Vectorised approximation: take
+    # cumulative sum until the running estimate stops decreasing.
+    pair_sums = rho[0:-1:2] + rho[1::2]  # (N//2, D)
+    # First lag k where pair_sums[k] becomes non-positive — keep
+    # everything strictly before that.
+    keep = pair_sums > 0
+    # tau = 1 + 2 * sum_{k >= 1} rho[k] (autocorrelation time).  We
+    # approximate as 1 + 2 * sum of paired positive sums, capped at N
+    # for numerical safety on flat chains.
+    tau = 1.0 + 2.0 * jnp.sum(jnp.where(keep, pair_sums, 0.0), axis=0)
+    tau = jnp.clip(tau, 1.0, float(N))
+    out = (K * N) / tau
+    return out.reshape(chain.shape[2:])
