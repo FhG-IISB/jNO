@@ -861,25 +861,63 @@ class core:
                 opt_states = {**opt_states, k: new_state}
 
             # ── per-model Bayesian step (blackjax kernels) ──
+            # Set of Bayesian lids — chain-indexed slicing applies to these
+            # other Bayesian models inside each chain's logdensity closure.
+            _bay_lid_set = {int(_k) for _k in bay_keys}
+
+            def _pos_of(_state, _kind):
+                # K-leading current position of a kernel state.  SG-MCMC
+                # states ARE the position; HMC-family states carry it on
+                # ``.position``.
+                return _state if _kind == "grad_estimator" else _state.position
+
             for k in bay_keys:
                 lid = int(k)
                 handle = bayesian_handles[k]
                 rng, kernel_key = jax.random.split(rng)
 
-                # logdensity_fn closes over the *current* trainable / context;
-                # blackjax kernels re-evaluate this closure during their step.
-                # We pass step_rng as the loss key so any minibatch slice or
-                # jno.noise term is consistent across the leapfrog/integrator
-                # evaluations within a single kernel.step call.
-                def logdensity_fn(p, _lid=lid, _h=handle):
-                    full = {**trainable, _lid: p}
-                    nll, _ = loss_fn(full, context, step_rng)
+                # Snapshot per-chain positions of every Bayesian model
+                # (including this one) from ``opt_states`` — these carry
+                # the K-leading axis set by :func:`bayesian.init_state`.
+                # Iterating ``bay_keys`` in sorted order gives deterministic
+                # Gibbs cycling: each lid's closure sees the most-recent
+                # post-step positions for previously-stepped lids.
+                _bay_positions_K = {int(_bk): _pos_of(opt_states[_bk], bayesian_handles[_bk].kind) for _bk in bay_keys}
+
+                # logdensity_factory(p, k_idx) closes over the *current*
+                # ``trainable`` / ``context`` and slices chain k_idx out of
+                # every OTHER Bayesian model's K-leading position so each
+                # chain sees its own joint Bayesian state
+                # (Metropolis-within-Gibbs).  Non-Bayesian models are
+                # broadcast across K (no leading axis).  We pass step_rng as
+                # the loss key so any minibatch slice or jno.noise term is
+                # consistent across the leapfrog/integrator evaluations
+                # within a single kernel.step call.
+                def logdensity_factory(p, k_idx, _lid=lid, _h=handle, _bay=_bay_lid_set, _bp=_bay_positions_K):
+                    per_chain = {}
+                    for _olid, _ov in trainable.items():
+                        if _olid == _lid:
+                            per_chain[_olid] = p
+                        elif _olid in _bay:
+                            per_chain[_olid] = jax.tree_util.tree_map(lambda x, _ki=k_idx: x[_ki], _bp[_olid])
+                        else:
+                            per_chain[_olid] = _ov
+                    nll, _ = loss_fn(per_chain, context, step_rng)
                     return -nll + _h.prior_fn(p)
 
-                def grad_estimator(p, minibatch, _lid=lid, _h=handle):
+                def grad_estimator_factory(
+                    p, minibatch, k_idx, _lid=lid, _h=handle, _bay=_bay_lid_set, _bp=_bay_positions_K
+                ):
                     def neg_log_post(pp):
-                        full = {**trainable, _lid: pp}
-                        nll, _ = loss_fn(full, minibatch, step_rng)
+                        per_chain = {}
+                        for _olid, _ov in trainable.items():
+                            if _olid == _lid:
+                                per_chain[_olid] = pp
+                            elif _olid in _bay:
+                                per_chain[_olid] = jax.tree_util.tree_map(lambda x, _ki=k_idx: x[_ki], _bp[_olid])
+                            else:
+                                per_chain[_olid] = _ov
+                        nll, _ = loss_fn(per_chain, minibatch, step_rng)
                         return -nll + _h.prior_fn(pp)
 
                     return jax.grad(neg_log_post)(p)
@@ -889,12 +927,23 @@ class core:
                     kernel_key,
                     opt_states[k],
                     trainable[lid],
-                    logdensity_fn,
-                    grad_estimator,
+                    logdensity_factory,
+                    grad_estimator_factory,
                     context,
                 )
 
-                trainable = {**trainable, lid: new_position}
+                # Trainable keeps a single-position representative (chain
+                # 0) of each Bayesian model.  This is what the outer
+                # ``value_and_grad`` and ``individual_losses`` logging see
+                # in subsequent epochs.  K-leading state lives in
+                # ``opt_states[k]`` (read by the buffer flush and by the
+                # next iteration's logdensity closure).
+                #
+                # Mixed-mode caveat for ``num_chains > 1``: optax-trained
+                # parameters compute their gradients against chain 0 of
+                # any Bayesian model in the same solve().  For pure-Bayesian
+                # solves this caveat doesn't matter.
+                trainable = {**trainable, lid: jax.tree_util.tree_map(lambda x: x[0], new_position)}
                 opt_states = {**opt_states, k: new_state}
 
             next_epoch = start_epoch + jnp.asarray(1, dtype=start_epoch.dtype)
@@ -1708,6 +1757,19 @@ class core:
                 per_model_opts[k] = optax.chain(base_opt, scale)
                 lr_schedules[k] = lr_sched
 
+        # Validate that all Bayesian models in this solve share the same
+        # num_chains — the joint K-axis is shared across chains so mixing
+        # K values would be ambiguous (Metropolis-within-Gibbs needs one K).
+        if bayesian_handles:
+            _k_set = {h.num_chains for h in bayesian_handles.values()}
+            if len(_k_set) > 1:
+                raise ValueError(
+                    f"All .bayesian() models in one solve() must share the same num_chains; got {sorted(_k_set)}."
+                )
+            _num_chains_global = next(iter(_k_set))
+        else:
+            _num_chains_global = 1
+
         # Initialise optimizer / kernel states and place on mesh.  We
         # iterate the union of optax and Bayesian keys; each model has
         # exactly one of the two backends.
@@ -1715,7 +1777,10 @@ class core:
         for k in sorted({*per_model_opts.keys(), *bayesian_handles.keys()}):
             lid = int(k)
             if k in bayesian_handles:
-                state = jno_bayesian.init_state(bayesian_handles[k], trainable[lid])
+                # Per-chain jitter is drawn from a key split off self.rng so
+                # multi-chain runs get reproducible over-dispersion.
+                self.rng, _bay_init_key = jax.random.split(self.rng)
+                state = jno_bayesian.init_state(bayesian_handles[k], trainable[lid], _bay_init_key)
             else:
                 state = per_model_opts[k].init(trainable[lid])
             # Copy every array leaf so that aliased buffers (e.g. from
@@ -1849,7 +1914,18 @@ class core:
                     continue
                 _adapted_state, _adapted_kwargs = _adapt_out
                 _handle.extra_kwargs = _adapted_kwargs
-                opt_states[_bk] = _adapted_state
+                # Broadcast the single-chain adapted state across K chains.
+                # Following PyMC convention: one adaptation sweep, then
+                # vmap K chains from the same post-adapt position.  Cheaper
+                # than per-chain adaptation; negligible robustness loss for
+                # HMC-family kernels.
+                _K_bay = _handle.num_chains
+                opt_states[_bk] = jax.tree_util.tree_map(
+                    lambda x, _K=_K_bay: (
+                        jnp.broadcast_to(x[None, ...], (_K, *x.shape)) if isinstance(x, (jnp.ndarray, jax.Array)) else x
+                    ),
+                    _adapted_state,
+                )
                 # main loop collects from epoch 0
                 _handle.warmup = 0
                 self.log.info(f"Model {_lid}: window adaptation done — step_size={_adapted_kwargs['step_size']:.4g}")
@@ -2049,7 +2125,8 @@ class core:
                     for _k in sorted({*_per_model_opts_i.keys(), *_bayesian_handles_i.keys()}):
                         _lid_i = int(_k)
                         if _k in _bayesian_handles_i:
-                            _state_i = jno_bayesian.init_state(_bayesian_handles_i[_k], trainable[_lid_i])
+                            self.rng, _bay_init_key_i = jax.random.split(self.rng)
+                            _state_i = jno_bayesian.init_state(_bayesian_handles_i[_k], trainable[_lid_i], _bay_init_key_i)
                         else:
                             _state_i = _per_model_opts_i[_k].init(trainable[_lid_i])
                         _opt_states_i[_k] = jax.tree_util.tree_map(
@@ -2565,6 +2642,10 @@ class core:
                     prev_losses = individual_losses
 
                 # --- collect Bayesian samples (post-warmup, thinned, capped at keep) ---
+                # The per-chain (K-leading) position lives on ``opt_states[_bk]``
+                # — either the state itself (SG-MCMC) or ``.position``
+                # (HMC-family). ``trainable[_lid]`` only carries a chain-0
+                # representative, so we read from opt_states here.
                 if bayesian_handles:
                     for _bk, _handle in bayesian_handles.items():
                         _idx = outer_epoch
@@ -2576,13 +2657,14 @@ class core:
                         _buf = _bayesian_buffers[_bk]
                         if len(_buf) >= _handle.keep:
                             continue
-                        _lid_int = int(_bk)
+                        _state_for_sample = opt_states[_bk]
+                        _pos_K = _state_for_sample if _handle.kind == "grad_estimator" else _state_for_sample.position
                         # Detach from buffer donation: a jnp.copy of every
                         # array leaf gives us our own buffers that survive
                         # the next jit_step's donate_argnums.
                         _sample = jax.tree_util.tree_map(
                             lambda x: jnp.copy(x) if isinstance(x, (jnp.ndarray, jax.Array)) else x,
-                            trainable[_lid_int],
+                            _pos_K,
                         )
                         _buf.append(_sample)
 
@@ -2615,10 +2697,13 @@ class core:
                         if _lr is not None:
                             _model_name = _wandb_model_names.get(_wk, _wk)
                             _wb_metrics[f"lr/{_model_name}"] = _lr
-                    # Per-Bayesian-model chain stats: last value (scalar
-                    # parameters only) + running posterior mean of the chain
-                    # collected so far.  Acceptance probability would need
-                    # plumbing the kernel info from the step; deferred.
+                    # Per-Bayesian-model chain stats: running posterior
+                    # mean over all (K, N) collected draws so far.  For
+                    # multi-chain runs the per-chain "last sample" doesn't
+                    # have a single meaning, so we drop the legacy /last
+                    # field and instead expose /n_chains so dashboards can
+                    # group panels by chain.  Acceptance probability would
+                    # need plumbing the kernel info from the step; deferred.
                     for _bk, _handle in bayesian_handles.items():
                         _lid_int = int(_bk)
                         _fm = flax_mods.get(_lid_int)
@@ -2630,17 +2715,14 @@ class core:
                             continue
                         # Stack the buffer once for the running mean — cheap
                         # because the buffer holds device arrays and we only
-                        # hit this at print_rate cadence.
+                        # hit this at print_rate cadence.  Each entry is
+                        # already (K, *param); stack gives (N, K, *param).
                         _stacked = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *_buf)
+                        _wb_metrics[f"posterior/{_name}/n_samples"] = len(_buf)
+                        _wb_metrics[f"posterior/{_name}/n_chains"] = _handle.num_chains
                         if getattr(_fm, "_is_jno_scalar_parameter", False):
-                            _stacked = _stacked.value  # (N, *param_shape)
-                            _running_mean = float(jnp.mean(_stacked))
-                            _wb_metrics[f"posterior/{_name}/mean"] = _running_mean
-                            _wb_metrics[f"posterior/{_name}/last"] = float(_stacked[-1].reshape(-1)[0])
-                            _wb_metrics[f"posterior/{_name}/n_samples"] = len(_buf)
-                        else:
-                            # Multi-leaf modules: only log the chain length.
-                            _wb_metrics[f"posterior/{_name}/n_samples"] = len(_buf)
+                            _stacked_v = _stacked.value  # (N, K, *param_shape)
+                            _wb_metrics[f"posterior/{_name}/mean"] = float(jnp.mean(_stacked_v))
 
                     wandb_log(_wb_metrics, step=displayed_epoch)
 
@@ -2735,9 +2817,11 @@ class core:
                 fm.module = trained_models[lid]
 
             # ── 9c. Flush Bayesian sample buffers ──
-            # Each buffer is a list of module-shaped pytrees (one per
-            # collected step).  Stack along a leading sample axis and stash on
-            # the Model in its full wrapped form; the user-facing
+            # Each buffer is a list of module-shaped pytrees with a leading
+            # K-axis (one per collected step).  Stack along a leading
+            # sample axis to get ``(N, K, *param)``, then swap to
+            # ``(K, N, *param)`` so the canonical arviz layout
+            # `(chain, draw, *)` falls out naturally.  The user-facing
             # `posterior_samples` property auto-unwraps single-leaf
             # ``jno.np.parameter`` wrappers for convenience.
             for _bk, _buf in _bayesian_buffers.items():
@@ -2748,7 +2832,10 @@ class core:
                 if len(_buf) == 0:
                     _fm._posterior_samples_pytree = None
                     continue
-                _fm._posterior_samples_pytree = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs, axis=0), *_buf)
+                _fm._posterior_samples_pytree = jax.tree_util.tree_map(
+                    lambda *xs: jnp.swapaxes(jnp.stack(xs, axis=0), 0, 1),
+                    *_buf,
+                )
 
             # ── 10. Build log dict ──
             logs = {
@@ -3304,7 +3391,11 @@ class core:
                 params = {**static_part, **_chain_p}
                 return _fn(params, ctx, batchsize=None, key=key, min_consecutive=min_consecutive)
 
-            return jax.vmap(_one)(chain_part)
+            # ``chain_part`` carries the arviz-shaped (K, N, *param) leading
+            # axes from solve(); nested vmap pushes the K outer axis and the
+            # N inner axis through the evaluator so the result lands as
+            # ``(K, N, *expr_shape)``.
+            return jax.vmap(jax.vmap(_one))(chain_part)
 
         results = []
         for op, posterior_by_lid in zip(operation, per_op_chains):

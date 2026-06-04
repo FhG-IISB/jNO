@@ -103,6 +103,8 @@ class _KernelHandle:
         "keep",
         "thin",
         "adapt",
+        "num_chains",
+        "init_jitter",
     )
 
     def __init__(
@@ -116,6 +118,8 @@ class _KernelHandle:
         keep: int,
         thin: int,
         adapt: bool = True,
+        num_chains: int = 1,
+        init_jitter: float = 0.0,
     ):
         self.factory = factory
         self.kind = kind
@@ -126,6 +130,8 @@ class _KernelHandle:
         self.keep = keep
         self.thin = thin
         self.adapt = adapt
+        self.num_chains = int(num_chains)
+        self.init_jitter = float(init_jitter)
 
 
 def build_kernel_handle(cfg: dict) -> _KernelHandle:
@@ -151,13 +157,19 @@ def build_kernel_handle(cfg: dict) -> _KernelHandle:
     keep = int(cfg.get("keep", 1000))
     thin = int(cfg.get("thin", 1))
     adapt = bool(cfg.get("adapt", True))
+    num_chains = int(cfg.get("num_chains", 1))
+    init_jitter = float(cfg.get("init_jitter", 0.0))
     if warmup < 0 or keep < 0 or thin < 1:
         raise ValueError("warmup>=0, keep>=0, thin>=1 are required.")
+    if num_chains < 1:
+        raise ValueError(f"num_chains must be >= 1, got {num_chains}.")
 
     if kind == "full":
         extra = {**user_kwargs, "step_size": float(step_size)}
-        return _KernelHandle(factory, kind, prior_fn, None, extra, warmup, keep, thin, adapt)
-    return _KernelHandle(factory, kind, prior_fn, float(step_size), user_kwargs, warmup, keep, thin, adapt)
+        return _KernelHandle(factory, kind, prior_fn, None, extra, warmup, keep, thin, adapt, num_chains, init_jitter)
+    return _KernelHandle(
+        factory, kind, prior_fn, float(step_size), user_kwargs, warmup, keep, thin, adapt, num_chains, init_jitter
+    )
 
 
 def _flat_inexact_size(position) -> int:
@@ -263,17 +275,48 @@ def run_window_adaptation(handle: _KernelHandle, position, logdensity_fn, rng_ke
     return result.state, adapted_kwargs
 
 
-def init_state(handle: _KernelHandle, position):
-    """Initialise the kernel state for ``position``.
+def _replicate_with_jitter(position, num_chains: int, jitter: float, rng_key):
+    """Broadcast ``position`` to a leading K-axis with optional per-chain jitter.
+
+    With ``jitter == 0``, every chain starts from the exact same position
+    (broadcast).  With ``jitter > 0``, per-chain Gaussian noise
+    ``N(0, jitter²)`` is added to each inexact-array leaf (integer
+    bookkeeping leaves are broadcast unchanged).
+    """
+    leaves, treedef = jax.tree_util.tree_flatten(position)
+    K = int(num_chains)
+    if jitter <= 0.0:
+        rep_leaves = [jnp.broadcast_to(leaf[None, ...], (K, *leaf.shape)) for leaf in leaves]
+        return jax.tree_util.tree_unflatten(treedef, rep_leaves)
+    # Per-chain noise per inexact leaf with distinct PRNG splits.
+    inexact_idxs = [
+        i for i, leaf in enumerate(leaves) if hasattr(leaf, "dtype") and jnp.issubdtype(leaf.dtype, jnp.inexact)
+    ]
+    keys = jax.random.split(rng_key, max(len(inexact_idxs), 1))
+    out = []
+    ki = 0
+    for i, leaf in enumerate(leaves):
+        base = jnp.broadcast_to(leaf[None, ...], (K, *leaf.shape))
+        if i in inexact_idxs:
+            noise = jitter * jax.random.normal(keys[ki], shape=(K, *leaf.shape), dtype=leaf.dtype)
+            base = base + noise
+            ki += 1
+        out.append(base)
+    return jax.tree_util.tree_unflatten(treedef, out)
+
+
+def init_state(handle: _KernelHandle, position, rng_key=None):
+    """Initialise the kernel state for ``position``, with a leading K-axis.
 
     For full-data kernels we build a one-off kernel with a trivial
     logdensity (the prior alone) just to call ``.init`` — the real
     logdensity is rebuilt per step.  For SG-MCMC, ``init`` only needs the
     position.
 
-    Before constructing the kernel we may inject a default
-    ``inverse_mass_matrix`` of identity shape inferred from ``position`` —
-    see :func:`_maybe_inject_inverse_mass_matrix`.
+    The returned state has a leading axis of length ``handle.num_chains``
+    (= 1 by default). ``rng_key`` is used to draw per-chain
+    ``init_jitter`` noise (no-op if ``init_jitter == 0``); pass any fixed
+    key if you don't need jitter.
     """
     _maybe_inject_inverse_mass_matrix(handle, position)
     factory = handle.factory
@@ -285,7 +328,11 @@ def init_state(handle: _KernelHandle, position):
             return jax.tree_util.tree_map(jnp.zeros_like, p)
 
         kernel = factory(_dummy_grad, **handle.extra_kwargs)
-    return kernel.init(position)
+
+    if rng_key is None:
+        rng_key = jax.random.PRNGKey(0)
+    position_K = _replicate_with_jitter(position, handle.num_chains, handle.init_jitter, rng_key)
+    return jax.vmap(kernel.init)(position_K)
 
 
 def step(
@@ -293,29 +340,53 @@ def step(
     rng_key,
     state,
     position,
-    logdensity_fn: Callable,
-    grad_estimator: Callable,
+    logdensity_factory: Callable,
+    grad_estimator_factory: Callable,
     minibatch_ctx,
 ):
-    """One kernel step.
+    """One kernel step, vmapped over ``handle.num_chains``.
 
-    Caller supplies both a ``logdensity_fn`` (used by full-data kernels)
-    and a ``grad_estimator`` (used by SG-MCMC).  We pick the right one,
-    build the blackjax kernel inside the JIT trace, and dispatch.
+    ``state`` carries a leading K-axis (set by :func:`init_state`); we
+    split ``rng_key`` into K per-chain keys and vmap the per-chain
+    transition.  Returns both ``new_state`` and ``new_position`` with
+    leading K.
 
-    Returns ``(new_state, new_position)``.  For SG-MCMC the state *is*
-    the position; for full-data it is an ``HMCState`` whose ``.position``
-    field carries the new sample.
+    The caller supplies *factories* rather than concrete callables so
+    that each chain's logdensity can see *that* chain's positions for
+    every other Bayesian model in the same solve (correct
+    Metropolis-within-Gibbs semantics when multiple models are
+    Bayesian).  The signatures are::
+
+        logdensity_factory(p, k_idx)               -> scalar log p
+        grad_estimator_factory(p, minibatch, k_idx) -> grad pytree
+
+    For ``num_chains == 1`` both reduce to a no-op slice of the lone
+    chain — no semantic change versus pre-multi-chain code.
     """
     factory = handle.factory
-    if handle.kind == "full":
-        kernel = factory(logdensity_fn, **handle.extra_kwargs)
-        new_state, _info = kernel.step(rng_key, state)
-        return new_state, new_state.position
+    K = handle.num_chains
+    keys = jax.random.split(rng_key, K)
+    chain_idx = jnp.arange(K)
 
-    kernel = factory(grad_estimator, **handle.extra_kwargs)
-    new_state = kernel.step(rng_key, state, minibatch_ctx, handle.step_size)
-    return new_state, new_state
+    if handle.kind == "full":
+
+        def _one(state_k, key_k, k_idx):
+            ld = lambda p, _k=k_idx: logdensity_factory(p, _k)
+            kernel_k = factory(ld, **handle.extra_kwargs)
+            new_s, _info = kernel_k.step(key_k, state_k)
+            return new_s, new_s.position
+
+        return jax.vmap(_one)(state, keys, chain_idx)
+
+    step_size = handle.step_size
+
+    def _one(state_k, key_k, k_idx):
+        ge = lambda p, mb, _k=k_idx: grad_estimator_factory(p, mb, _k)
+        kernel_k = factory(ge, **handle.extra_kwargs)
+        new_s = kernel_k.step(key_k, state_k, minibatch_ctx, step_size)
+        return new_s, new_s
+
+    return jax.vmap(_one)(state, keys, chain_idx)
 
 
 def chain_params_for_eval(models, posterior_samples_by_lid):

@@ -1470,6 +1470,8 @@ class Model(Placeholder):
         keep: int = 1000,
         thin: int = 1,
         adapt: bool = True,
+        num_chains: int = 1,
+        init_jitter: float = 0.0,
         **kernel_kwargs,
     ):
         """Sample this model's parameters from a posterior via blackjax.
@@ -1540,6 +1542,17 @@ class Model(Placeholder):
                 mass matrix.  Silently no-op for non-adaptive kernels.
                 Set ``False`` to revert to the "discard first N samples"
                 semantics with the user-supplied hyperparameters.
+            num_chains: Number of parallel MCMC chains run via
+                ``jax.vmap``.  Default 1.  Output
+                :attr:`posterior_samples` has leading axes ``(K, N, *)``
+                regardless of K (arviz / `az.from_dict` compatible).
+                All ``.bayesian()`` models in a single :meth:`solve` call
+                must share the same ``num_chains``.
+            init_jitter: When ``num_chains > 1``, perturb each chain's
+                initial position by ``N(0, init_jitter)`` for
+                over-dispersion (gives a more conservative R-hat).
+                Default 0.0 = all chains start from the same point with
+                different PRNG keys.
             **kernel_kwargs: Forwarded to ``kernel_factory``.  Must include
                 ``step_size``.  May include e.g. ``inverse_mass_matrix=``
                 (NUTS/HMC), ``num_integration_steps=`` (HMC/SGHMC).
@@ -1547,6 +1560,8 @@ class Model(Placeholder):
         Returns:
             self, for chaining.
         """
+        if int(num_chains) < 1:
+            raise ValueError(f"num_chains must be >= 1, got {num_chains}.")
         self._bayesian_cfg = {
             "factory": kernel_factory,
             "kernel_kwargs": dict(kernel_kwargs),
@@ -1555,6 +1570,8 @@ class Model(Placeholder):
             "keep": int(keep),
             "thin": int(thin),
             "adapt": bool(adapt),
+            "num_chains": int(num_chains),
+            "init_jitter": float(init_jitter),
         }
         # `.bayesian()` IS the update — clear any prior `.freeze()` flag so
         # solve() does not skip this model.
