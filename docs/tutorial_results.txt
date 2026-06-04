@@ -101,3 +101,9 @@
 10_bayesian_pinns/03_inverse_reaction_coefficient.py | epochs=600 | rel_k=0.0040 | CI_width=0.1637
 10_bayesian_pinns/04_inverse_ode_decay.py | epochs=1000 | rel_k=0.0405 | CI_width=0.1995
 10_bayesian_pinns/08_multichain_nuts.py | epochs=700 | K=4 | rel_A=0.0085 | rel_B=0.0078 | rhat_A=1.0026 | rhat_B=0.9994 | ess_A=96.3 | ess_B=77.5
+10_bayesian_pinns/09_vi_bnn_regression.py | epochs=2000 | rel_L2_in_data=1.0006 | band_in_data=1.3119 | band_in_gap=1.3119 | band_ratio=1.00
+10_bayesian_pinns/09_vi_bnn_regression.py | epochs=2000 | rel_L2_in_data=1.0025 | band_in_data=0.9481 | band_in_gap=0.9015 | band_ratio=0.95
+10_bayesian_pinns/09_vi_bnn_regression.py | epochs=2000 | rel_L2_in_data=1.0025 | band_in_data=0.9481 | band_in_gap=0.9015 | band_ratio=0.95
+10_bayesian_pinns/09_vi_bnn_regression.py | epochs=2000 | rel_L2_in_data=1.0035 | band_in_data=0.9569 | band_in_gap=0.9196 | band_ratio=0.96
+10_bayesian_pinns/09_vi_bnn_regression.py | epochs=2000 | rel_L2_in_data=1.0051 | band_in_data=0.9440 | band_in_gap=0.9109 | band_ratio=0.96
+10_bayesian_pinns/09_vi_bnn_regression.py | epochs=2000 | rel_L2_in_data=0.2442 | band_in_data=0.3169 | band_in_gap=0.4380 | band_ratio=1.38

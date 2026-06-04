@@ -295,6 +295,84 @@ wandb metrics, `history`) matches the slow path's at the same
 `print_rate` cadence, just with fewer datapoints between print
 boundaries.
 
+## Variational Inference (mean-field)
+
+`Model.vi(...)` fits a variational approximation to the posterior
+through the same `crux.solve()` driver as `.bayesian()` — but
+optimises the **evidence lower bound** (ELBO) of a Gaussian product
+`q(θ) = ∏_i N(μ_i, σ_i)` instead of running an MCMC chain.  After
+solve(), `posterior_draws` i.i.d. samples are drawn from the fitted
+`q` and stored on the model as `posterior_samples` in the same
+`(1, N, *param)` layout as the MCMC path:
+
+```python
+import blackjax, optax
+
+a.vi(
+    blackjax.meanfield_vi,
+    optimizer=optax.adam(1e-3),
+    num_samples=8,           # MC samples per ELBO eval
+    posterior_draws=500,     # draws from fitted q for posterior_samples
+)
+crux.solve(2000)              # 2000 ELBO optimisation steps
+chain = a.posterior_samples   # (1, 500, *param) — draws from fitted q
+```
+
+Configuration mirrors the MCMC `.bayesian()` API: same downstream
+`crux.eval(samples="auto")` plumbing, same `jno.bayesian.{rhat, ess}`
+helpers (which trivially report ≈ 1 and ≈ N respectively for VI
+draws — see caveat below).
+
+| Aspect | MCMC | Mean-field VI |
+|---|---|---|
+| Mechanism | per-step Metropolis-Hastings / Langevin / leapfrog | per-step ELBO optimisation |
+| Cost | High (many forward passes per sample) | Low (one MC ELBO eval per step) |
+| Calibration | Asymptotically exact | Diagonal-covariance lower bound |
+| Multi-modal | Multi-chain reveals modes | Captures one mode |
+| ``posterior_samples`` shape | `(K, N, *param)` from collected chain | `(1, posterior_draws, *param)` drawn from fitted q |
+
+Two manual overrides on blackjax's defaults at `init_state` time make
+VI converge usefully on non-trivial models:
+
+* ``state.mu = position`` (the model's initial weights), rather than
+  blackjax's zeros — gives VI a sensible starting point on
+  non-trivial architectures (numpyro autoguide convention).
+* ``state.rho = -3.0`` everywhere (initial std ≈ 0.05), rather than
+  blackjax's wider default — keeps the initial MC ELBO sample close
+  to the mean so the gradient estimator is low-variance from the
+  start.  The optimiser then *grows* rho where the posterior is
+  genuinely wide.
+
+!!! warning "Likelihood scaling for VI"
+    The canonical Gaussian-noise log-likelihood is a **sum** over data
+    points, but jno's ``residual.mse`` returns the **mean**.  For VI
+    to get the right magnitude of gradient signal, multiply the
+    residual by ``sqrt(N_obs)``::
+
+        residual = (y_pred - y_obs) / sigma_obs * jnp.sqrt(N_obs)
+        crux = jno.core([residual.mse], domain)
+
+    Without this rescaling the likelihood is N× too small and the
+    prior dominates, leaving VI stuck near initialisation.  See
+    [Tutorial 09](../tutorials/10-bayesian-pinns/vi-bnn-regression.md)
+    for a worked end-to-end example.  MCMC paths are less sensitive
+    to this — their gradient signal is more robust to magnitude.
+
+### Diagnostics caveat
+
+`jno.bayesian.rhat` and `jno.bayesian.ess` still run on VI
+`posterior_samples`, but they trivially report ≈ 1 and ≈ N
+respectively because the draws are i.i.d. from the fitted `q`.  For
+VI convergence monitoring, watch the ELBO trajectory in `history`
+(via `crux.solve(...).total_loss` per-chunk values) instead.
+
+### Mutual exclusion
+
+A single model has **either** `.bayesian()` **or** `.vi()` — never
+both.  Setting one after the other raises a clear error.  Models with
+VI and models with MCMC **can coexist** in the same solve call —
+each runs its own paradigm during the step loop.
+
 ## Wandb integration
 
 When a wandb run is active, per-Bayesian-model statistics are logged at
