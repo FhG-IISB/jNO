@@ -8,7 +8,7 @@ jNO: Physics-Informed Neural Operators.
 
 import sys
 
-from . import fn, lora
+from . import bayesian, fn, lora
 from . import jnp_ops as np
 from .architectures.models import nn, parameter
 from .core import core

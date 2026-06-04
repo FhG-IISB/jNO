@@ -793,3 +793,118 @@ class TestModelCallProxy:
         jno.core([residual.mse], dom).solve(5)
         assert a.posterior_samples is not None
         assert a.posterior_samples.shape == (1, 3, 1)
+
+
+# ---------------------------------------------------------------------------
+# Multi-chain (Phase 8) — num_chains > 1, init_jitter, diagnostics
+# ---------------------------------------------------------------------------
+
+
+def _multichain_solve(K: int, *, warmup=50, keep=80, init_jitter=0.0):
+    """1-parameter NUTS inverse problem with K parallel chains."""
+    π = jno.np.pi
+    dom = _line_domain()
+    x, _ = dom.variable("interior")
+    target = 2.0 * jno.np.sin(π * x)
+    a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+    a.bayesian(
+        blackjax.nuts,
+        step_size=1e-2,
+        inverse_mass_matrix=jnp.ones(1),
+        warmup=warmup,
+        keep=keep,
+        adapt=False,
+        num_chains=K,
+        init_jitter=init_jitter,
+    )
+    residual = a * jno.np.sin(π * x) - target
+    jno.core([residual.mse], dom).solve(warmup + keep)
+    return a
+
+
+class TestMultiChain:
+    """Phase 8 — ``num_chains=K`` runs K independent chains via ``vmap``
+    and stores ``posterior_samples`` with the arviz-shaped
+    ``(K, N, *param)`` layout regardless of K.  Convergence diagnostics
+    ``jno.bayesian.{rhat, ess}`` operate on this layout."""
+
+    def test_nuts_num_chains_K_shape(self):
+        a = _multichain_solve(K=4)
+        assert a.posterior_samples.shape == (4, 80, 1)
+
+    def test_chains_are_independent(self):
+        a = _multichain_solve(K=4)
+        chain = a.posterior_samples  # (4, 80, 1)
+        # Per-chain last samples should differ (independent PRNG paths).
+        lasts = jnp.asarray([chain[k, -1, 0] for k in range(4)])
+        assert float(jnp.std(lasts)) > 1e-3, "K chains produced identical last samples"
+
+    def test_num_chains_1_keeps_K_axis(self):
+        # K=1 still produces ``(1, N, *param)`` — arviz-shape uniformity.
+        a = _multichain_solve(K=1, warmup=5, keep=10)
+        assert a.posterior_samples.shape == (1, 10, 1)
+
+    def test_init_jitter_disperses_chains(self):
+        # Without jitter, K=2 chains start from identical positions and
+        # diverge only through the kernel's per-chain RNG.  With
+        # ``init_jitter > 0`` each chain starts at a different point.
+        a_jit = _multichain_solve(K=2, warmup=2, keep=5, init_jitter=0.5)
+        # First sample of each chain should already differ when jitter
+        # was applied at init.
+        c0 = a_jit.posterior_samples[0, 0, 0]
+        c1 = a_jit.posterior_samples[1, 0, 0]
+        assert float(jnp.abs(c0 - c1)) > 1e-3
+
+    def test_eval_multichain_shape(self):
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 2.0 * jno.np.sin(π * x)
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.bayesian(
+            blackjax.nuts,
+            step_size=1e-2,
+            inverse_mass_matrix=jnp.ones(1),
+            warmup=5,
+            keep=10,
+            adapt=False,
+            num_chains=3,
+        )
+        residual = a * jno.np.sin(π * x) - target
+        crux = jno.core([residual.mse], dom)
+        crux.solve(15)
+        # crux.eval with auto-chain mode vmaps over (K, N) → output has
+        # leading (K, N) axes.
+        out = crux.eval([a])
+        assert out.shape[:2] == (3, 10), f"expected (3, 10, ...) got {out.shape}"
+
+    def test_mismatched_num_chains_raises(self):
+        # Two Bayesian models with different num_chains must raise.
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        b = jno.np.parameter((1,), key=jax.random.PRNGKey(1), name="b")
+        a.bayesian(blackjax.nuts, step_size=1e-2, warmup=2, keep=3, adapt=False, num_chains=2)
+        b.bayesian(blackjax.nuts, step_size=1e-2, warmup=2, keep=3, adapt=False, num_chains=4)
+        residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - jno.np.sin(π * x)
+        crux = jno.core([residual.mse], dom)
+        with pytest.raises(ValueError, match="num_chains"):
+            crux.solve(5)
+
+    def test_rhat_helper(self):
+        # Converged 1-parameter problem → R-hat close to 1.0.
+        a = _multichain_solve(K=4, warmup=200, keep=400)
+        r = jno.bayesian.rhat(a.posterior_samples)
+        assert r.shape == (1,), f"unexpected rhat shape {r.shape}"
+        # Loose: 4 NUTS chains on a 1-param problem mix quickly.
+        assert float(r[0]) < 1.5, f"R-hat too high: {float(r[0])}"
+
+    def test_ess_helper(self):
+        a = _multichain_solve(K=4, warmup=50, keep=80)
+        e = jno.bayesian.ess(a.posterior_samples)
+        assert e.shape == (1,), f"unexpected ess shape {e.shape}"
+        # ESS is bounded above by K*N=320 and below by 0; a working
+        # chain should give at least a handful.
+        assert float(e[0]) > 1.0, f"ESS too low: {float(e[0])}"
+        assert float(e[0]) <= 4 * 80 + 1e-3, f"ESS exceeds K*N: {float(e[0])}"
