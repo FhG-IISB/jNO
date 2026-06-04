@@ -97,3 +97,7 @@
 10_bayesian_pinns/05_inverse_surrogate_uncertainty.py | fwd_epochs=3000 | inv_epochs=800 | fwd_rel_L2=6.854833e-05 | x_mean=0.3003 | abs_err=0.0003 | CI_width=0.0250
 10_bayesian_pinns/07_bnn_regression.py | epochs=4200 | rel_L2_in_data=0.2082 | band_in_data=1.4909 | band_in_gap=6.4339 | band_ratio=4.32
 10_bayesian_pinns/08_multichain_nuts.py | epochs=700 | K=4 | rel_A=0.0146 | rel_B=0.0337 | rhat_A=1.0004 | rhat_B=1.0052 | ess_A=89.4 | ess_B=88.3
+10_bayesian_pinns/02_inverse_multi_coefficient.py | epochs=800 | rel_A=0.0084 | rel_B=0.0624
+10_bayesian_pinns/03_inverse_reaction_coefficient.py | epochs=600 | rel_k=0.0040 | CI_width=0.1637
+10_bayesian_pinns/04_inverse_ode_decay.py | epochs=1000 | rel_k=0.0405 | CI_width=0.1995
+10_bayesian_pinns/08_multichain_nuts.py | epochs=700 | K=4 | rel_A=0.0085 | rel_B=0.0078 | rhat_A=1.0026 | rhat_B=0.9994 | ess_A=96.3 | ess_B=77.5

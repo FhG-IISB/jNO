@@ -967,6 +967,179 @@ class core:
 
         return step
 
+    def make_mcmc_scan_fn(
+        self,
+        bayesian_handles,
+        batchsize,
+        frozen,
+        static,
+        compiled_constraints_fn=None,
+        checkpoint_gradients=False,
+        min_consecutive=1,
+        warmup: int = 0,
+        keep: int = 0,
+        thin: int = 1,
+    ):
+        """Build a JIT-compatible scan function for the pure-Bayesian fastpath.
+
+        Closes the three performance gaps in pure-Bayesian solves:
+
+        1. No outer ``value_and_grad`` — only the Bayesian kernels compute
+           their gradients (the slow-path discards the outer ``grads`` for
+           pure-Bayesian anyway).
+        2. ``warmup`` steps run inside a ``jax.lax.fori_loop`` (no sample
+           accumulation); ``keep * thin`` post-warmup steps run inside a
+           single ``jax.lax.scan`` (one XLA program, stacked sample output).
+        3. Samples are stacked inside XLA and returned as one
+           ``(keep, *param)`` (K=1) / ``(keep, K, *param)`` (K>1) tensor
+           per Bayesian lid — one host transfer per scan-call, not one per
+           step.
+
+        Signature of the returned function::
+
+            scan_fn(trainable, opt_states, rng, context)
+                -> (trainable, opt_states, rng, samples)
+
+        where ``samples`` is a dict keyed by ``bayesian_handles`` keys, each
+        entry stacked along a leading axis of length ``keep``.
+        """
+        if compiled_constraints_fn is None:
+            compiled_constraints_fn = self.compiled_constraints_fn
+        loss_fn = self._make_loss_fn(
+            compiled_constraints_fn,
+            batchsize,
+            frozen,
+            static,
+            checkpoint_gradients=checkpoint_gradients,
+            min_consecutive=min_consecutive,
+        )
+        bay_keys = sorted(bayesian_handles.keys())
+        _bay_lid_set = {int(_k) for _k in bay_keys}
+
+        def _pos_of(_state, _kind):
+            return _state if _kind == "grad_estimator" else _state.position
+
+        def _one_step(trainable, opt_states, rng, context):
+            """Single Bayesian Gibbs cycle — no outer value_and_grad."""
+            rng, step_rng = jax.random.split(rng)
+            for k in bay_keys:
+                lid = int(k)
+                handle = bayesian_handles[k]
+                rng, kernel_key = jax.random.split(rng)
+
+                if handle.num_chains == 1:
+                    # K=1 OLD-style closures — bit-identical to slow-path.
+                    def logdensity_fn(p, _lid=lid, _h=handle):
+                        full = {**trainable, _lid: p}
+                        nll, _ = loss_fn(full, context, step_rng)
+                        return -nll + _h.prior_fn(p)
+
+                    def grad_estimator(p, minibatch, _lid=lid, _h=handle):
+                        def neg_log_post(pp):
+                            full = {**trainable, _lid: pp}
+                            nll, _ = loss_fn(full, minibatch, step_rng)
+                            return -nll + _h.prior_fn(pp)
+
+                        return jax.grad(neg_log_post)(p)
+
+                    new_state, new_position = jno_bayesian.step(
+                        handle,
+                        kernel_key,
+                        opt_states[k],
+                        trainable[lid],
+                        logdensity_fn,
+                        grad_estimator,
+                        context,
+                    )
+                    trainable = {**trainable, lid: new_position}
+                else:
+                    # K>1 chain-indexed factories — same as slow-path.
+                    _bay_positions_K = {int(_bk): _pos_of(opt_states[_bk], bayesian_handles[_bk].kind) for _bk in bay_keys}
+
+                    def logdensity_factory(p, k_idx, _lid=lid, _h=handle, _bay=_bay_lid_set, _bp=_bay_positions_K):
+                        per_chain = {}
+                        for _olid, _ov in trainable.items():
+                            if _olid == _lid:
+                                per_chain[_olid] = p
+                            elif _olid in _bay:
+                                per_chain[_olid] = jax.tree_util.tree_map(lambda x, _ki=k_idx: x[_ki], _bp[_olid])
+                            else:
+                                per_chain[_olid] = _ov
+                        nll, _ = loss_fn(per_chain, context, step_rng)
+                        return -nll + _h.prior_fn(p)
+
+                    def grad_estimator_factory(
+                        p, minibatch, k_idx, _lid=lid, _h=handle, _bay=_bay_lid_set, _bp=_bay_positions_K
+                    ):
+                        def neg_log_post(pp):
+                            per_chain = {}
+                            for _olid, _ov in trainable.items():
+                                if _olid == _lid:
+                                    per_chain[_olid] = pp
+                                elif _olid in _bay:
+                                    per_chain[_olid] = jax.tree_util.tree_map(lambda x, _ki=k_idx: x[_ki], _bp[_olid])
+                                else:
+                                    per_chain[_olid] = _ov
+                            nll, _ = loss_fn(per_chain, minibatch, step_rng)
+                            return -nll + _h.prior_fn(pp)
+
+                        return jax.grad(neg_log_post)(p)
+
+                    new_state, new_position = jno_bayesian.step(
+                        handle,
+                        kernel_key,
+                        opt_states[k],
+                        trainable[lid],
+                        logdensity_factory,
+                        grad_estimator_factory,
+                        context,
+                    )
+                    # K>1: trainable keeps chain-0 representative.
+                    trainable = {**trainable, lid: jax.tree_util.tree_map(lambda x: x[0], new_position)}
+                opt_states = {**opt_states, k: new_state}
+
+            return trainable, opt_states, rng
+
+        def scan_fn(trainable, opt_states, rng, context):
+            """Run ``warmup`` warmup steps (no collection) + ``keep`` outer
+            iterations each running ``thin`` inner steps (one sample per
+            outer iter).  Returns (trainable, opt_states, rng, samples).
+            """
+            # --- Phase A: warmup (fori_loop, no sample accumulation) ---
+            if warmup > 0:
+
+                def _warmup_body(_i, carry):
+                    tr, os_, rg = carry
+                    return _one_step(tr, os_, rg, context)
+
+                trainable, opt_states, rng = jax.lax.fori_loop(0, warmup, _warmup_body, (trainable, opt_states, rng))
+
+            # --- Phase B: scan over `keep` outer iters × `thin` inner steps ---
+            def _outer_body(carry, _):
+                tr, os_, rg = carry
+
+                def _inner_body(_j, c):
+                    return _one_step(c[0], c[1], c[2], context)
+
+                if thin > 1:
+                    tr, os_, rg = jax.lax.fori_loop(0, thin, _inner_body, (tr, os_, rg))
+                else:
+                    tr, os_, rg = _one_step(tr, os_, rg, context)
+
+                sample = {k: _pos_of(os_[k], bayesian_handles[k].kind) for k in bay_keys}
+                return (tr, os_, rg), sample
+
+            if keep > 0:
+                (trainable, opt_states, rng), samples = jax.lax.scan(
+                    _outer_body, (trainable, opt_states, rng), None, length=keep
+                )
+            else:
+                samples = {k: jnp.zeros((0,)) for k in bay_keys}
+
+            return trainable, opt_states, rng, samples
+
+        return scan_fn
+
     def make_grad_fn(
         self,
         batchsize,
@@ -2394,7 +2567,176 @@ class core:
 
             _wandb_nan_alerted = False
 
-            for outer_epoch in range(n_outer):
+            # ── MCMC fastpath gate ──
+            # Pure-Bayesian solves (no optax, no substeps, no streaming,
+            # no inner_steps amortisation, no gradient accumulation, no
+            # trackers, no resampling) take a scan-based fastpath: all
+            # ``keep * thin`` post-warmup steps run inside a single
+            # JIT-compiled XLA program per chunk of ``print_rate`` outer
+            # iterations.  Closes three Bayesian perf gaps:
+            #
+            # 1. No outer ``value_and_grad`` (kernels do their own grads).
+            # 2. ``lax.scan`` over chunked steps — one XLA dispatch per
+            #    print_rate steps instead of per epoch.
+            # 3. Samples stacked inside XLA — one host transfer per chunk.
+            #
+            # Falls through to the per-epoch Python loop otherwise.
+            _fastpath_enabled = bool(
+                bayesian_handles
+                and not per_model_opts
+                and not _use_substeps
+                and inner_steps == 1
+                and accumulation_steps == 1
+                and not offload_data
+                and not self.compiled_trackers
+                and not (has_resampling and strategies)
+            )
+            if _fastpath_enabled and bayesian_handles:
+                # All Bayesian handles must share warmup/keep/thin so a
+                # single scan length is well-defined.  num_chains is
+                # already validated upstream.
+                _shared = {(h.warmup, h.keep, h.thin) for h in bayesian_handles.values()}
+                if len(_shared) != 1:
+                    _fastpath_enabled = False
+                    self.log.info(
+                        "MCMC fastpath disabled: Bayesian models have mixed "
+                        "warmup/keep/thin; falling back to per-epoch loop."
+                    )
+
+            if _fastpath_enabled:
+                _ref_h = next(iter(bayesian_handles.values()))
+                _fp_warmup, _fp_keep, _fp_thin = _ref_h.warmup, _ref_h.keep, _ref_h.thin
+                self.log.info(
+                    f"MCMC fastpath: scan over {_fp_keep} samples × thin={_fp_thin} "
+                    f"+ {_fp_warmup} warmup, chunked at print_rate={print_rate}."
+                )
+
+                # Chunk size in *outer* iterations (each = ``thin`` MCMC
+                # steps).  print_rate gives the desired progress cadence;
+                # divide by thin to keep the chunk's collected sample
+                # count near print_rate.
+                _chunk_keep = max(1, min(_fp_keep, max(1, print_rate // max(_fp_thin, 1))))
+                _n_chunks = (_fp_keep + _chunk_keep - 1) // _chunk_keep
+                # All but possibly the last chunk are `_chunk_keep` long.
+                _last_chunk_keep = _fp_keep - (_n_chunks - 1) * _chunk_keep
+
+                # Build (and JIT) the scan function.  Two compilations
+                # at most — one for the steady chunk size, one for the
+                # last (smaller) chunk.  Warmup folds into chunk 0.
+                def _build_jit_scan(_chunk_warmup, _chunk_keep_arg):
+                    _sf = self.make_mcmc_scan_fn(
+                        bayesian_handles=bayesian_handles,
+                        batchsize=effective_batchsize,
+                        frozen=frozen_arrays,
+                        static=static,
+                        checkpoint_gradients=checkpoint_gradients,
+                        min_consecutive=min_consecutive,
+                        warmup=_chunk_warmup,
+                        keep=_chunk_keep_arg,
+                        thin=_fp_thin,
+                    )
+                    return jax.jit(_sf, donate_argnums=(0, 1, 2))
+
+                # Loss eval for per-chunk wandb / progress (one forward
+                # pass — no grad, no accumulation).
+                _loss_fn_for_log = self._make_loss_fn(
+                    self.compiled_constraints_fn,
+                    effective_batchsize,
+                    frozen_arrays,
+                    static,
+                    checkpoint_gradients=False,
+                    min_consecutive=min_consecutive,
+                )
+                _jit_loss_eval = jax.jit(_loss_fn_for_log)
+
+                # Context for the scan body — on-device tensor.
+                _fp_ctx = on_device_context if not offload_data else self.domain_data.context
+
+                # Profile the very first chunk only (fastpath chunks are
+                # large so one chunk is a representative sample).
+                if (not _profile_active) and _profile_steps > 0:
+                    _profile_ctx = jax.profiler.trace(f"{self.log.path}/traces", create_perfetto_trace=True)
+                    _profile_ctx.__enter__()
+                    _profile_active = True
+
+                _epoch_counter = 0
+                for _chunk_idx in range(_n_chunks):
+                    _this_keep = _chunk_keep if _chunk_idx < _n_chunks - 1 else _last_chunk_keep
+                    # Warmup steps fold into chunk 0; subsequent chunks
+                    # don't need to re-do warmup.
+                    _this_warmup = _fp_warmup if _chunk_idx == 0 else 0
+                    _jit_scan = _build_jit_scan(_this_warmup, _this_keep)
+
+                    trainable, opt_states, self.rng, _samples_chunk = _jit_scan(trainable, opt_states, self.rng, _fp_ctx)
+
+                    # Append the (this_keep, K, *param) chunk to each
+                    # Bayesian model's buffer.  One device→host copy
+                    # per chunk (vs one per step in slow path).
+                    for _bk in bayesian_handles:
+                        _bayesian_buffers[_bk].append(
+                            jax.tree_util.tree_map(
+                                lambda x: jnp.copy(x) if isinstance(x, (jnp.ndarray, jax.Array)) else x,
+                                _samples_chunk[_bk],
+                            )
+                        )
+
+                    # Advance epoch counter and emit a per-chunk loss /
+                    # progress snapshot.
+                    _epoch_counter += _this_warmup + _this_keep * _fp_thin
+                    self.rng, _loss_key = jax.random.split(self.rng)
+                    _total_loss_chunk, _individual_losses_chunk = _jit_loss_eval(trainable, _fp_ctx, _loss_key)
+                    _total_np = float(_total_loss_chunk)
+                    _ind_np = np.asarray(_individual_losses_chunk)
+
+                    # Append to history buffers at chunk-boundary cadence.
+                    log_epochs.append(_epoch_counter - 1)
+                    log_total_loss.append(_total_np)
+                    log_losses.append(_ind_np)
+                    log_timestamps.append(time.time())
+
+                    # Progress message.
+                    _msg = " | ".join([f"C{ci}: {float(v):.4e}" for ci, v in enumerate(_ind_np)])
+                    self.log.info(f"Epoch {_epoch_counter - 1:>6}/{epochs}| L:{_total_np:.4e} | {_msg}")
+
+                    # Wandb (per chunk) — mirror the slow-path block:
+                    # n_samples, n_chains, plus a running posterior mean
+                    # for scalar parameters.
+                    if _wandb_run is not None:
+                        _wb = {"total_loss": _total_np, "epoch": _epoch_counter - 1}
+                        for _ci, _cv in enumerate(_ind_np):
+                            _wb[f"constraint_{_ci}"] = float(_cv)
+                        for _bk_w, _h_w in bayesian_handles.items():
+                            _fm_w = flax_mods.get(int(_bk_w))
+                            if _fm_w is None:
+                                continue
+                            _name_w = _fm_w.name or f"model{_bk_w}"
+                            _bufw = _bayesian_buffers[_bk_w]
+                            # Each entry is shape ``(chunk_keep, *)`` — sum
+                            # leading axis across chunks gives total
+                            # samples collected so far.
+                            _so_far = sum(int(jax.tree_util.tree_leaves(s)[0].shape[0]) for s in _bufw)
+                            _wb[f"posterior/{_name_w}/n_samples"] = _so_far
+                            _wb[f"posterior/{_name_w}/n_chains"] = _h_w.num_chains
+                            if getattr(_fm_w, "_is_jno_scalar_parameter", False) and _bufw:
+                                _stacked = jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs, axis=0), *_bufw)
+                                _stacked_v = _stacked.value
+                                _wb[f"posterior/{_name_w}/mean"] = float(jnp.mean(_stacked_v))
+                        wandb_log(_wb, step=_epoch_counter - 1)
+                        if (not _wandb_nan_alerted) and not np.isfinite(_total_np):
+                            wandb_alert(
+                                "NaN/Inf loss detected",
+                                f"total_loss became {_total_np} at epoch {_epoch_counter - 1}",
+                                level="ERROR",
+                            )
+                            _wandb_nan_alerted = True
+
+                # Stop the profile window opened above.
+                if _profile_active:
+                    _profile_ctx.__exit__(None, None, None)
+                    _profile_active = False
+                    _profile_ctx = nullcontext()
+
+            for outer_epoch in range(0 if _fastpath_enabled else n_outer):
                 if (not _profile_active) and _profile_steps > 0 and outer_epoch == _profile_start:
                     _profile_ctx = jax.profiler.trace(f"{self.log.path}/traces", create_perfetto_trace=True)
                     _profile_ctx.__enter__()
@@ -2676,9 +3018,13 @@ class core:
                         _pos_K = _state_for_sample if _handle.kind == "grad_estimator" else _state_for_sample.position
                         # Detach from buffer donation: a jnp.copy of every
                         # array leaf gives us our own buffers that survive
-                        # the next jit_step's donate_argnums.
+                        # the next jit_step's donate_argnums.  We add a
+                        # leading length-1 chunk axis so the slow-path
+                        # ``(1, *param)`` entries concatenate uniformly
+                        # with the MCMC-fastpath ``(chunk_keep, *param)``
+                        # entries at flush time.
                         _sample = jax.tree_util.tree_map(
-                            lambda x: jnp.copy(x) if isinstance(x, (jnp.ndarray, jax.Array)) else x,
+                            lambda x: jnp.copy(x)[None, ...] if isinstance(x, (jnp.ndarray, jax.Array)) else x,
                             _pos_K,
                         )
                         _buf.append(_sample)
@@ -2832,14 +3178,14 @@ class core:
                 fm.module = trained_models[lid]
 
             # ── 9c. Flush Bayesian sample buffers ──
-            # Each buffer is a list of module-shaped pytrees, one per
-            # collected step.  For K=1 each entry has no K axis: stack →
-            # ``(N, *param)`` then ``[None]`` → ``(1, N, *param)``.  For
-            # K>1 each entry already has leading K: stack → ``(N, K, *)``
-            # then ``swapaxes(0, 1)`` → ``(K, N, *param)``.  The canonical
-            # arviz layout ``(chain, draw, *)`` falls out either way.
-            # The user-facing ``posterior_samples`` property auto-unwraps
-            # single-leaf ``jno.np.parameter`` wrappers for convenience.
+            # Each buffer entry is a module-shaped pytree with a leading
+            # *chunk* axis: ``(1, *param)`` for slow-path single-step
+            # collection, ``(chunk_keep, *param)`` (K=1) or
+            # ``(chunk_keep, K, *param)`` (K>1) for the MCMC fastpath.
+            # Concatenating along axis 0 unifies both cases into
+            # ``(N, *param)`` (K=1) or ``(N, K, *param)`` (K>1); the K
+            # axis is then either added (K=1) or swapped to front (K>1)
+            # to produce the canonical arviz ``(chain, draw, *)`` layout.
             for _bk, _buf in _bayesian_buffers.items():
                 _lid_int = int(_bk)
                 _fm = flax_mods.get(_lid_int)
@@ -2849,15 +3195,21 @@ class core:
                     _fm._posterior_samples_pytree = None
                     continue
                 _K_flush = bayesian_handles[_bk].num_chains
+                # Step 1: concatenate all chunks along axis 0.
+                joined = jax.tree_util.tree_map(
+                    lambda *xs: jnp.concatenate(xs, axis=0),
+                    *_buf,
+                )
+                # Step 2: reshape to the user-facing ``(K, N, *param)``.
                 if _K_flush == 1:
                     _fm._posterior_samples_pytree = jax.tree_util.tree_map(
-                        lambda *xs: jnp.stack(xs, axis=0)[None, ...],
-                        *_buf,
+                        lambda x: x[None, ...],
+                        joined,
                     )
                 else:
                     _fm._posterior_samples_pytree = jax.tree_util.tree_map(
-                        lambda *xs: jnp.swapaxes(jnp.stack(xs, axis=0), 0, 1),
-                        *_buf,
+                        lambda x: jnp.swapaxes(x, 0, 1),
+                        joined,
                     )
 
             # ── 10. Build log dict ──
