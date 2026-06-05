@@ -1381,7 +1381,6 @@ class core:
         return self
 
     def compile(self, mesh: Optional[Tuple[int, ...]] = (1, 1)):
-
         # === Parallelism ===
         self._setup_parallelism(mesh)
 

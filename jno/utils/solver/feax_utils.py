@@ -12,7 +12,7 @@ Responsibilities:
 - evaluate symbolic expressions inside FEAX volume/surface kernels,
 - prepare residual/Jacobian runtime objects for time-dependent assembly.
 """
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Sequence, Tuple
 
 import jax.numpy as jnp
 import numpy as np
@@ -420,6 +420,22 @@ def _infer_trial_metadata(expr) -> Dict[str, Any]:
     }
 
 
+def _collect_runtime_parameter_tags_for_feax(node, out=None):
+    """Collect names of trainable runtime parameters (ModelCall) used in a coeff."""
+    from .parametric_helpers import _is_runtime_scalar_parameter, _parameter_name
+
+    if out is None:
+        out = []
+    if _is_runtime_scalar_parameter(node):
+        name = _parameter_name(node)
+        if name not in out:
+            out.append(name)
+        return out
+    for child in iter_children(node) or ():
+        _collect_runtime_parameter_tags_for_feax(child, out)
+    return out
+
+
 def _collect_temporal_tags_for_feax(node, out=None):
     """
     Collect temporal Variable tags used inside FEAX kernels.
@@ -519,6 +535,25 @@ def _collect_temporal_tags_for_feax(node, out=None):
     return out
 
 
+def _runtime_parameter_value_from_internal_vars(local, name):
+    """Read a runtime parameter scalar from volume_vars.
+
+    Parameter values are packed AFTER the temporal values, so the volume_vars
+    layout is:  [ temporal_tags ... , runtime_parameter_tags ... ].
+    """
+    temporal_tags = local.get("temporal_tags", ())
+    param_tags = local.get("runtime_parameter_tags", ())
+    volume_vars = local.get("volume_vars", ())
+    if name not in param_tags:
+        return None
+    idx = len(temporal_tags) + param_tags.index(name)
+    if idx >= len(volume_vars):
+        return None
+    arr = jnp.asarray(volume_vars[idx])
+    # Broadcast the per-cell scalar to the quadrature-point axis, like time.
+    return jnp.reshape(arr, (-1,))[0]
+
+
 def _temporal_value_from_internal_vars(local, tag, dim_start=0, dim_end=1):
     """
     Read a temporal variable value from FEAX InternalVars.
@@ -573,6 +608,7 @@ def _eval_expr_for_feax(domain, node, local):
             Jacobian,
             BinaryOp,
             FunctionCall,
+            ModelCall,
         ),
     ):
         try:
@@ -705,6 +741,22 @@ def _eval_expr_for_feax(domain, node, local):
             return a**b
         raise NotImplementedError(f"Unsupported binary operator: {node.op}")
 
+    if isinstance(node, ModelCall):
+        from .parametric_helpers import _is_runtime_scalar_parameter, _parameter_name
+
+        if _is_runtime_scalar_parameter(node):
+            name = _parameter_name(node)
+            val = _runtime_parameter_value_from_internal_vars(local, name)
+            if val is None:
+                raise KeyError(
+                    f"Runtime parameter '{name}' not supplied to the FEAX kernel. "
+                    "Ensure it was registered in runtime_parameter_tags and packed "
+                    "into InternalVars.volume_vars."
+                )
+            return val
+        # Non-parameter ModelCall (e.g. a neural coefficient) -> not handled here.
+        raise NotImplementedError("FEAX kernel cannot evaluate non-parameter ModelCall coefficients yet.")
+
     if isinstance(node, FunctionCall):
         args = [_eval_expr_for_feax(domain, arg, local) for arg in node.args]
         kwargs = node.kwargs if node.kwargs else {}
@@ -728,6 +780,7 @@ def _eval_volume_integrand(
     cell_JxW,
     cell_v_grads_JxW,
     temporal_tags,
+    runtime_parameter_tags,
     problem_ref,
     *cell_internal_vars,
 ):
@@ -756,6 +809,7 @@ def _eval_volume_integrand(
         "trial_value_shape": value_shape,
         "trial_vec": vec,
         "temporal_tags": tuple(temporal_tags),
+        "runtime_parameter_tags": tuple(runtime_parameter_tags),
         "volume_vars": tuple(cell_internal_vars),
     }
 
@@ -777,6 +831,7 @@ def _eval_surface_integrand(
     face_shape_grads,
     face_nanson_scale,
     temporal_tags,
+    runtime_parameter_tags,
     *cell_internal_vars_surface,
 ):
     """
@@ -865,6 +920,7 @@ def _eval_surface_integrand(
         "boundary_normals": boundary_normals,
         "temporal_tags": tuple(temporal_tags),
         "volume_vars": tuple(cell_internal_vars_surface),
+        "runtime_parameter_tags": tuple(runtime_parameter_tags),
     }
 
     val = _eval_expr_for_feax(domain, expr, local)
@@ -873,7 +929,7 @@ def _eval_surface_integrand(
     return ravel_pytree(jnp.sum(weighted, axis=0))[0]
 
 
-def _make_universal_volume_kernel(domain, expr, value_shape, temporal_tags, problem_ref):
+def _make_universal_volume_kernel(domain, expr, value_shape, temporal_tags, runtime_parameter_tags, problem_ref):
     """
     Create the FEAX universal volume kernel for a lowered weak-form expression.
     """
@@ -896,6 +952,7 @@ def _make_universal_volume_kernel(domain, expr, value_shape, temporal_tags, prob
             cell_JxW,
             cell_v_grads_JxW,
             temporal_tags,
+            runtime_parameter_tags,
             problem_ref,
             *cell_internal_vars,
         )
@@ -903,7 +960,7 @@ def _make_universal_volume_kernel(domain, expr, value_shape, temporal_tags, prob
     return kernel
 
 
-def _make_universal_surface_kernel(domain, expr, tag, value_shape, temporal_tags):
+def _make_universal_surface_kernel(domain, expr, tag, value_shape, runtime_parameter_tags, temporal_tags):
     def kernel(
         cell_sol_flat,
         physical_surface_quad_points,
@@ -923,6 +980,7 @@ def _make_universal_surface_kernel(domain, expr, tag, value_shape, temporal_tags
             face_shape_grads,
             face_nanson_scale,
             temporal_tags,
+            runtime_parameter_tags,
             *cell_internal_vars_surface,
         )
 
@@ -1040,6 +1098,13 @@ def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_do
         temporal_tags_set.update(_collect_temporal_tags_for_feax(expr))
     temporal_tags = tuple(sorted(temporal_tags_set))
 
+    runtime_parameter_tags_set = []
+    if volume_expr is not None:
+        _collect_runtime_parameter_tags_for_feax(volume_expr, runtime_parameter_tags_set)
+    for expr in boundary_exprs.values():
+        _collect_runtime_parameter_tags_for_feax(expr, runtime_parameter_tags_set)
+    runtime_parameter_tags = tuple(runtime_parameter_tags_set)
+
     problem_ref: dict[str, Any] = {"problem": None}
 
     active_boundary_tags: List[str] = []
@@ -1052,11 +1117,44 @@ def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_do
             continue
         active_boundary_tags.append(tag)
         location_fns.append(loc_fn)
-        surface_kernels.append(_make_universal_surface_kernel(domain, expr, tag, value_shape, temporal_tags))
+        surface_kernels.append(
+            _make_universal_surface_kernel(domain, expr, tag, value_shape, runtime_parameter_tags, temporal_tags)
+        )
 
-    volume_kernel = None
+    # FEAX always evaluates the volume kernel before adding optional surface
+    # contributions. A boundary-only source, such as a pure Neumann load,
+    # therefore still needs a valid zero-valued volume kernel.
     if volume_expr is not None:
-        volume_kernel = _make_universal_volume_kernel(domain, volume_expr, value_shape, temporal_tags, problem_ref)
+        volume_kernel = _make_universal_volume_kernel(
+            domain,
+            volume_expr,
+            value_shape,
+            temporal_tags,
+            runtime_parameter_tags,
+            problem_ref,
+        )
+    else:
+
+        def volume_kernel(
+            cell_sol_flat,
+            physical_quad_points,
+            cell_shape_grads,
+            cell_JxW,
+            cell_v_grads_JxW,
+            *cell_internal_vars,
+        ):
+            del (
+                physical_quad_points,
+                cell_shape_grads,
+                cell_JxW,
+                cell_v_grads_JxW,
+                cell_internal_vars,
+            )
+
+            # FEAX expects one local residual vector per cell. For a
+            # boundary-only weak form, the volume contribution is identically
+            # zero and the actual load is assembled by the surface kernels.
+            return jnp.zeros_like(jnp.asarray(cell_sol_flat))
 
     class GeneratedProblem(fe.Problem):
         def get_universal_kernel(self_inner):
@@ -1096,7 +1194,17 @@ def _dense_array(A):
         return jnp.asarray(np.asarray(A))
 
 
-def _make_internal_vars(fe_module, temporal_tags, t, *, n_cells: int, dtype=None, extra_volume_vars=()):
+def _make_internal_vars(
+    fe_module,
+    temporal_tags,
+    t,
+    *,
+    n_cells: int,
+    dtype=None,
+    runtime_parameter_tags=(),
+    runtime_parameter_values=None,
+    extra_volume_vars=(),
+):
     """
     Build FEAX InternalVars in a batched shape FEAX can slice.
 
@@ -1108,7 +1216,11 @@ def _make_internal_vars(fe_module, temporal_tags, t, *, n_cells: int, dtype=None
         t0 = jnp.asarray(t, dtype=dtype)
         t_batched = jnp.full((int(n_cells), 1), t0, dtype=t0.dtype)
         vol.extend([t_batched for _ in temporal_tags])
-
+    # Parameter values, in runtime_parameter_tags order, broadcast per cell.
+    rpv = runtime_parameter_values or {}
+    for name in runtime_parameter_tags:
+        p = jnp.asarray(rpv[name], dtype=dtype).reshape(())
+        vol.append(jnp.full((int(n_cells), 1), p, dtype=p.dtype))
     for v in extra_volume_vars:
         arr = jnp.asarray(v, dtype=dtype)
         if arr.ndim == 0:
@@ -1159,6 +1271,10 @@ def _prepare_feax_runtime(
     for term in getattr(ir, "terms", []):
         temporal_tags.update(_collect_temporal_tags_for_feax(term.coeff))
     temporal_tags = tuple(sorted(temporal_tags))
+    runtime_parameter_tags = []
+    for term in getattr(ir, "terms", []):
+        _collect_runtime_parameter_tags_for_feax(term.coeff, runtime_parameter_tags)
+    runtime_parameter_tags = tuple(runtime_parameter_tags)
 
     element_type = getattr(domain, "_fem_element_type", None)
     if element_type is None:
@@ -1184,5 +1300,206 @@ def _prepare_feax_runtime(
         "dtype": dtype,
         "u_ref": u_ref,
         "temporal_tags": temporal_tags,
+        "runtime_parameter_tags": runtime_parameter_tags,
         "n_cells": n_cells,
     }
+
+
+"""
+Periodic boundary-condition support for the FEAX-backed time/static routes.
+
+The FEAX assembly produces *full* unconstrained Galerkin operators (mass M,
+operator A, parametric basis K_i, affine bias, forcing). Periodicity is not a
+property of those matrices: left/right (or bottom/top) boundary nodes are
+independent free DOFs that, left alone, satisfy a natural zero-flux condition
+rather than a periodic one.
+
+Periodicity is enforced algebraically through a prolongation matrix ``P`` that
+identifies slave DOFs with their master DOFs:
+
+    u_full = P @ u_red                          (n_full x n_red)
+
+The reduced semidiscrete system that the time integrator actually solves is
+
+    (P^T M P) u_red_dot + (P^T A P) u_red = P^T (c + f).
+
+This module builds ``P`` by coordinate matching on the user-declared periodic
+tag pairs and provides the small reduction/prolongation helpers used by the
+time route and the Diffrax adapter.
+
+Only node-level (scalar, vec=1) and node-major vector layouts
+(dof = node*vec + comp) are handled; the vector case is obtained from the
+node-level ``P`` via a Kronecker product with the identity.
+"""
+
+
+def build_periodic_prolongation(
+    points: np.ndarray,
+    pairs: Sequence[Tuple[str, str]],
+    tag_indices: Dict[str, np.ndarray],
+    *,
+    vec: int = 1,
+    tol: float | None = None,
+) -> Dict[str, object]:
+    """Build the node-level periodic prolongation matrix ``P``.
+
+    Parameters
+    ----------
+    points:
+        ``(n_nodes, dim)`` array of FEM node coordinates. Node ordering must
+        match the FEAX mesh (it does: the FEAX mesh is built directly from
+        ``mesh.points``).
+    pairs:
+        Ordered ``(master_tag, slave_tag)`` boundary pairings, e.g.
+        ``[("left", "right"), ("bottom", "top")]``.
+    tag_indices:
+        Mapping from boundary tag name to the global node ids on that tag.
+    vec:
+        Number of scalar components per node. ``vec > 1`` returns the
+        node-major expansion ``kron(P_node, I_vec)``.
+    tol:
+        Coordinate-matching tolerance for the transverse coordinates. When
+        ``None`` it is derived from the bounding-box diagonal.
+
+    Returns
+    -------
+    dict with keys:
+        ``P``               : ``(n_full, n_red)`` dense jnp prolongation matrix.
+        ``P_node``          : node-level prolongation (``vec == 1`` form).
+        ``kept_nodes``      : sorted global ids of the retained (master/free) nodes.
+        ``slave_to_master`` : resolved slave-node -> master-node mapping.
+        ``n_full``          : full node count.
+        ``n_red``           : reduced node count.
+        ``vec``             : component count used.
+    """
+    pts = np.asarray(points, dtype=np.float64)
+    n_nodes = pts.shape[0]
+
+    if tol is None:
+        span = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
+        tol = max(span, 1.0) * 1.0e-6
+
+    # slave global id -> master global id (one hop per pairing).
+    slave_to_master: Dict[int, int] = {}
+
+    for master_tag, slave_tag in pairs:
+        if master_tag not in tag_indices or slave_tag not in tag_indices:
+            raise KeyError(
+                f"Periodic pair ({master_tag!r}, {slave_tag!r}) refers to a tag "
+                f"that is not present in the mesh. Known tags: {sorted(tag_indices)}."
+            )
+
+        m_ids = np.asarray(tag_indices[master_tag], dtype=int).reshape(-1)
+        s_ids = np.asarray(tag_indices[slave_tag], dtype=int).reshape(-1)
+        m_pts = pts[m_ids]
+        s_pts = pts[s_ids]
+
+        # Periodic axis = coordinate whose tag means differ the most.
+        axis = int(np.argmax(np.abs(m_pts.mean(axis=0) - s_pts.mean(axis=0))))
+        transverse = [d for d in range(pts.shape[1]) if d != axis]
+
+        m_trans = m_pts[:, transverse]
+        s_trans = s_pts[:, transverse]
+
+        # Nearest transverse master for every slave node.
+        d2 = np.sum(
+            (s_trans[:, None, :] - m_trans[None, :, :]) ** 2,
+            axis=-1,
+        )
+        nn = np.argmin(d2, axis=1)
+        worst = float(np.sqrt(d2[np.arange(len(s_ids)), nn].max())) if len(s_ids) else 0.0
+        if worst > tol:
+            raise ValueError(
+                f"Periodic matching for ({master_tag!r}, {slave_tag!r}) failed: "
+                f"largest transverse mismatch {worst:.3e} exceeds tol {tol:.3e}. "
+                "Use a periodically compatible mesh (equal node layout on opposite "
+                "faces) or relax tol."
+            )
+
+        for k, sid in enumerate(s_ids):
+            slave_to_master[int(sid)] = int(m_ids[nn[k]])
+
+    # Resolve corner chains: a corner is a slave in two directions, so its
+    # master may itself be a slave. Follow until a free node is reached.
+    def _resolve(i: int) -> int:
+        seen = set()
+        while i in slave_to_master and i not in seen:
+            seen.add(i)
+            i = slave_to_master[i]
+        return i
+
+    final_master = {sid: _resolve(sid) for sid in slave_to_master}
+    slave_set = set(slave_to_master)
+
+    kept_nodes: List[int] = [i for i in range(n_nodes) if i not in slave_set]
+    reduced_index = {node: r for r, node in enumerate(kept_nodes)}
+    n_red = len(kept_nodes)
+
+    P_node = np.zeros((n_nodes, n_red), dtype=np.float64)
+    for i in range(n_nodes):
+        master = final_master[i] if i in slave_set else i
+        P_node[i, reduced_index[master]] = 1.0
+
+    P_node_j = jnp.asarray(P_node)
+    if vec == 1:
+        P = P_node_j
+    else:
+        P = jnp.kron(P_node_j, jnp.eye(vec, dtype=P_node_j.dtype))
+
+    return {
+        "P": P,
+        "P_node": P_node_j,
+        "kept_nodes": np.asarray(kept_nodes, dtype=np.int64),
+        "slave_to_master": final_master,
+        "n_full": int(n_nodes * vec),
+        "n_red": int(n_red * vec),
+        "vec": int(vec),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Operator / state reduction and prolongation
+# ---------------------------------------------------------------------------
+
+
+def reduce_matrix(P, mat):
+    """Galerkin reduction ``P^T mat P``."""
+    P = jnp.asarray(P)
+    mat = jnp.asarray(mat, dtype=P.dtype)
+    return P.T @ mat @ P
+
+
+def reduce_vector(P, vec):
+    """Reduce a full-space load/bias vector via ``P^T vec``."""
+    P = jnp.asarray(P)
+    vec = jnp.asarray(vec, dtype=P.dtype).reshape(-1)
+    return P.T @ vec
+
+
+def restrict_state(P, state_full, kept_nodes, vec: int = 1):
+    """Restrict a full initial state to the reduced master DOFs.
+
+    For a consistent periodic initial condition (matching values on opposite
+    faces) gathering the kept-node entries is exact and avoids the doubling
+    that ``P^T`` would introduce on master nodes.
+    """
+    state_full = jnp.asarray(state_full).reshape(-1)
+    kept = np.asarray(kept_nodes, dtype=int)
+    if vec == 1:
+        return state_full[jnp.asarray(kept)]
+    dof = (kept[:, None] * vec + np.arange(vec)[None, :]).reshape(-1)
+    return state_full[jnp.asarray(dof)]
+
+
+def prolong(P, reduced):
+    """Map reduced DOFs back to the full space: ``u_full = P @ u_red``.
+
+    Accepts a single ``(n_red,)`` vector or a batched ``(..., n_red)`` array
+    (e.g. a Diffrax ``solution.ys`` trajectory of shape ``(T, n_red)``).
+    """
+    P = jnp.asarray(P)
+    reduced = jnp.asarray(reduced, dtype=P.dtype)
+    if reduced.ndim == 1:
+        return P @ reduced
+    # (..., n_red) @ (n_red, n_full) -> (..., n_full)
+    return reduced @ P.T

@@ -948,6 +948,24 @@ class domain(MeshIOMixin):
             ) from e
         return _neumann_bc(tags)
 
+    def periodic(self, *pairs):
+        """
+        Create a periodic boundary-condition descriptor.
+
+        Example
+        -------
+            domain.init_fem(
+                bcs=[domain.periodic(("left", "right"), ("bottom", "top"))],
+            )
+        """
+        try:
+            from ..utils.solver.fem_route import periodic as _periodic_bc
+        except ImportError as e:
+            raise ImportError(
+                "FEM support is not available. Install the FEM/dev extras to use domain.periodic(...) and init_fem(...)."
+            ) from e
+        return _periodic_bc(*pairs)
+
     def _build_dirichlet_bc_info(self, dirichlet_tags, dirichlet_value_fns=None, vec: int = 1):
         """
         Build JAX-FEM Dirichlet boundary data from tagged user input.
@@ -1136,6 +1154,7 @@ class domain(MeshIOMixin):
         fem_solver: bool = False,
         vec: int = 1,
         bcs=None,
+        periodic=None,
     ) -> "domain":
         """
         Initialize the FEM data associated with this domain using FEAX.
@@ -1163,13 +1182,15 @@ class domain(MeshIOMixin):
 
         from ..utils.solver.fem_route import expand_bcs
 
+        periodic_pairs = list(periodic) if periodic else []
         if bcs is not None:
             if dirichlet_tags or neumann_tags or dirichlet_value_fns is not None:
                 raise ValueError(
                     "Use either 'bcs=[...]' or the legacy "
                     "'dirichlet_tags/neumann_tags/dirichlet_value_fns' arguments, not both."
                 )
-            dirichlet_tags, dirichlet_value_fns, neumann_tags = expand_bcs(bcs, vec=vec)
+            dirichlet_tags, dirichlet_value_fns, neumann_tags, bc_periodic_pairs = expand_bcs(bcs, vec=vec)
+            periodic_pairs = periodic_pairs + list(bc_periodic_pairs)
 
         meshio_type_map = {
             "TRI3": "triangle",
@@ -1392,7 +1413,29 @@ class domain(MeshIOMixin):
             "dirichlet_nodes": dirichlet_nodes,
             "surface_data": {},
         }
+        # ---------------------------------------------------------
+        # Periodic boundary conditions -> prolongation matrix P
+        # ---------------------------------------------------------
+        self._periodic_pairs = list(periodic_pairs)
+        self._periodic = None
+        if periodic_pairs:
+            from ..utils.solver.feax_utils import build_periodic_prolongation
 
+            self._periodic = build_periodic_prolongation(
+                onp.asarray(fe.points),
+                periodic_pairs,
+                self.tag_indices,
+                vec=vec,
+            )
+            # Consumed by the linear fem_time route and the Diffrax adapter.
+            self._feax_context["P"] = self._periodic["P"]
+            self._feax_context["periodic"] = self._periodic
+            self.fem_context["prolongation"] = self._periodic["P"]
+            self.fem_context["periodic"] = self._periodic
+            self.log.info(
+                f"Periodic BCs: reduced {self._periodic['n_full']} -> "
+                f"{self._periodic['n_red']} DOFs via {len(periodic_pairs)} pairing(s)."
+            )
         quad_points_np = np.asarray(quad_points)
 
         if getattr(self, "_is_time_dependent", False):
@@ -1548,7 +1591,13 @@ class domain(MeshIOMixin):
         #         if hasattr(s_arr, "ndim"):
         #             s_data[skey] = jnp.expand_dims(s_arr, axis=(0, 1))
 
-        self.context.update(self.fem_context)
+        self.context.update(
+            {
+                k: v
+                for k, v in self.fem_context.items()
+                if not (getattr(v, "ndim", 0) >= 1 and getattr(v, "shape", (1,))[0] == 0)
+            }
+        )
         return self
 
     def _make_tag_location_fn(self, tag):
