@@ -1085,6 +1085,11 @@ class Model(Placeholder):
         self._initialize_mask = None  # optional bool pytree consumed by initialize() for partial preload
         self._initializer_fn = None  # callable initializer used at compile time
         self._initializer_key = None  # optional PRNG key for callable initializer
+        # Phase 12 — logdensity-aware initializer (jno.bayesian.pathfinder, future Laplace, …).
+        # Detected by .initialize() via the requires_logdensity = True marker.
+        # Runs *inside* solve() after the loss is built but before the kernel state is finalised.
+        self._bayesian_initializer = None
+        self._bayesian_initializer_key = None
         self._tunable_opts: Dict[str, list] = {}  # per-model tunable options for sweeps
 
     # ── public API ───────────────────────────────────────────
@@ -1770,6 +1775,22 @@ class Model(Placeholder):
         self._initializer_fn = None
         self._initializer_key = None
 
+        # Phase 12 — logdensity-aware initializer.  Detected via the
+        # class-level ``requires_logdensity = True`` marker so the existing
+        # stateless ``(shape, dtype, key) -> array`` callable path is
+        # unaffected (those callables don't carry the attribute).
+        if getattr(weights, "requires_logdensity", False):
+            self._bayesian_initializer = weights
+            self._bayesian_initializer_key = key
+            self.weight_path = None
+            self._weight_tree = None
+            return self
+
+        # Other branches reset the logdensity-aware slot so .initialize()
+        # is last-write-wins regardless of which path was previously set.
+        self._bayesian_initializer = None
+        self._bayesian_initializer_key = None
+
         if isinstance(weights, (str, Path)):
             self.weight_path = str(weights)
             self._weight_tree = None
@@ -1874,6 +1895,8 @@ class Model(Placeholder):
         self._weight_tree = None
         self._initialize_mask = None
         self._initializer_fn = None
+        self._bayesian_initializer = None
+        self._bayesian_initializer_key = None
         self._merge_lora_flag = False
         return self
 
