@@ -2377,3 +2377,171 @@ class TestLaplaceInitializer:
         else raises a clear ValueError at run time."""
         with pytest.raises(ValueError, match="hessian_strategy"):
             self._harmonic_inverse(initializer=jno.bayesian.laplace(map_steps=5, hessian_strategy="bogus"))
+
+
+# ---------------------------------------------------------------------------
+# Phase 14 — SVGDInitializer (Stein Variational Gradient Descent)
+# ---------------------------------------------------------------------------
+
+
+class TestSVGDInitializer:
+    """``.initialize(jno.bayesian.svgd(...))`` runs Stein Variational
+    Gradient Descent (Liu & Wang 2016) — a particle-based variational
+    method — and uses the final particle cloud as the warm-start.
+    These tests cover the protocol contract, the multi-chain dispersion
+    coming directly from the particle dynamics, and the composition
+    with masks (shared dispatch helpers).
+    """
+
+    @staticmethod
+    def _harmonic_inverse(*, initializer, adapt=False, warmup=2, keep=15, seed=0, **bayes_kwargs):
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 2.5 * jno.np.sin(π * x)
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(seed), name="a")
+        if initializer is not None:
+            a.initialize(initializer)
+        a.bayesian(
+            blackjax.nuts,
+            step_size=1e-2,
+            inverse_mass_matrix=jnp.ones(1),
+            warmup=warmup,
+            keep=keep,
+            adapt=adapt,
+            **bayes_kwargs,
+        )
+        residual = a * jno.np.sin(π * x) - target
+        jno.core([residual.mse], dom).solve(warmup + keep)
+        return a
+
+    # ─── 1. spy: invoked and IMM merged ───────────────────────────────
+
+    def test_svgd_initializer_runs_and_sets_imm(self, monkeypatch):
+        """Spy on ``SVGDInitializer.__call__``; assert it ran exactly
+        once with correct shape inputs and that the returned IMM was
+        merged into ``handle.extra_kwargs``."""
+        captured = {"count": 0, "imm_shape": None}
+        orig_call = jno.bayesian.SVGDInitializer.__call__
+
+        def _spy(self, rng_key, ld, position, num_chains):
+            captured["count"] += 1
+            warm, kw = orig_call(self, rng_key, ld, position, num_chains)
+            captured["imm_shape"] = kw["inverse_mass_matrix"].shape
+            return warm, kw
+
+        monkeypatch.setattr(jno.bayesian.SVGDInitializer, "__call__", _spy)
+        _ = self._harmonic_inverse(initializer=jno.bayesian.svgd(num_iters=50, num_particles=16))
+        assert captured["count"] == 1
+        assert captured["imm_shape"] == (1,), f"IMM shape wrong: {captured['imm_shape']}"
+
+    # ─── 2. recovers truth ───────────────────────────────────────────
+
+    def test_svgd_recovers_inverse_problem(self):
+        """SVGD warm-start + NUTS chain recovers the truth on a 1-D
+        inverse problem."""
+        a = self._harmonic_inverse(
+            initializer=jno.bayesian.svgd(num_iters=200, num_particles=32, init_jitter=2.0),
+            warmup=2,
+            keep=50,
+        )
+        chain = a.posterior_samples
+        assert chain.shape == (1, 50, 1)
+        # Wide-prior posterior is broad; check the chain mean is within
+        # ~1 posterior-std of truth (see TestLaplaceInitializer note).
+        assert abs(float(jnp.mean(chain)) - 2.5) < 1.5
+
+    # ─── 3. K>1 particle dispersion ──────────────────────────────────
+
+    def test_svgd_multichain_uses_distinct_particles(self):
+        """K=4 chains start at 4 distinct particles from the final
+        cloud; particle dynamics provide natural over-dispersion."""
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 2.5 * jno.np.sin(π * x)
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.initialize(jno.bayesian.svgd(num_iters=100, num_particles=16, init_jitter=2.0))
+        a.bayesian(
+            blackjax.nuts,
+            step_size=1e-2,
+            inverse_mass_matrix=jnp.ones(1),
+            warmup=2,
+            keep=8,
+            num_chains=4,
+            adapt=False,
+        )
+        residual = a * jno.np.sin(π * x) - target
+        jno.core([residual.mse], dom).solve(10)
+        chain = a.posterior_samples
+        assert chain.shape == (4, 8, 1)
+        firsts = chain[:, 0, 0]
+        pairwise = float(jnp.max(firsts) - jnp.min(firsts))
+        assert pairwise > 1e-3, f"K=4 chains share a starting particle: {firsts}"
+
+    # ─── 4. num_particles < num_chains raises ────────────────────────
+
+    def test_svgd_num_particles_too_small_raises(self):
+        """``num_particles < num_chains`` raises a clear ValueError —
+        you can't slice K chain inits out of fewer than K particles."""
+        with pytest.raises(ValueError, match="num_particles"):
+            self._harmonic_inverse(
+                initializer=jno.bayesian.svgd(num_iters=5, num_particles=2),
+                num_chains=4,
+                warmup=1,
+                keep=2,
+            )
+
+    # ─── 5. composes with .mask().bayesian() ─────────────────────────
+
+    def test_svgd_with_mask_works(self):
+        """``.mask(M).bayesian()`` + SVGD: only the masked subset is
+        warm-started; the unmasked complement stays at init."""
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        net = _tiny_net(in_dim=1, out_dim=1, hidden=4)
+        mask, masked_idx = _build_last_leaf_mask(net)
+        net.initialize(jno.bayesian.svgd(num_iters=20, num_particles=8, init_jitter=0.5))
+        net.mask(mask).bayesian(blackjax.sgld, step_size=1e-4, warmup=5, keep=10)
+        residual = net(x) - 0.0
+        jno.core([residual.mse], dom).solve(15)
+
+        chain = net.posterior_samples
+        leaves = jax.tree_util.tree_leaves(chain)
+        for i, leaf in enumerate(leaves):
+            var = float(jnp.mean(jnp.var(leaf, axis=1)))
+            if i == masked_idx:
+                assert var > 1e-8, f"masked leaf {i} should vary; got var={var:.3e}"
+            else:
+                assert var < 1e-8, f"unmasked leaf {i} should be constant; got var={var:.3e}"
+
+    # ─── 6. reproducibility ──────────────────────────────────────────
+
+    def test_svgd_reproducible_with_fixed_seed(self):
+        """Two solves with identical master seed produce identical
+        posteriors.  Verifies the SVGD scan threads PRNG keys
+        deterministically."""
+        a1 = self._harmonic_inverse(initializer=jno.bayesian.svgd(num_iters=80, num_particles=16, init_jitter=1.0))
+        a2 = self._harmonic_inverse(initializer=jno.bayesian.svgd(num_iters=80, num_particles=16, init_jitter=1.0))
+        assert jnp.allclose(a1.posterior_samples, a2.posterior_samples)
+
+    # ─── 7. particles approximate the posterior ──────────────────────
+
+    def test_svgd_particles_approximate_posterior(self, monkeypatch):
+        """Spy on SVGD; assert the final particle cloud's mean is
+        near truth and the diagonal IMM is positive.  Sanity check on
+        the SVGD path itself, independent of the NUTS chain that
+        follows."""
+        captured = {}
+        orig_call = jno.bayesian.SVGDInitializer.__call__
+
+        def _spy(self, rng_key, ld, position, num_chains):
+            warm, kw = orig_call(self, rng_key, ld, position, num_chains)
+            captured["warm"] = float(jax.tree_util.tree_leaves(warm)[0].reshape(-1)[0])
+            captured["imm"] = float(kw["inverse_mass_matrix"][0])
+            return warm, kw
+
+        monkeypatch.setattr(jno.bayesian.SVGDInitializer, "__call__", _spy)
+        _ = self._harmonic_inverse(initializer=jno.bayesian.svgd(num_iters=300, num_particles=32, init_jitter=2.0))
+        assert abs(captured["warm"] - 2.5) < 1.5, f"SVGD ensemble mean {captured['warm']} far from truth 2.5"
+        assert captured["imm"] > 0.0, "SVGD particle variance should be positive"
