@@ -2545,3 +2545,207 @@ class TestSVGDInitializer:
         _ = self._harmonic_inverse(initializer=jno.bayesian.svgd(num_iters=300, num_particles=32, init_jitter=2.0))
         assert abs(captured["warm"] - 2.5) < 1.5, f"SVGD ensemble mean {captured['warm']} far from truth 2.5"
         assert captured["imm"] > 0.0, "SVGD particle variance should be positive"
+
+
+# ---------------------------------------------------------------------------
+# Initializer composition — multiple initializers / mixed-mode in one solve
+# ---------------------------------------------------------------------------
+
+
+class TestInitializerComposition:
+    """The dispatch in ``core.py`` block 6a iterates ``_init_candidates``
+    per Bayesian model — so multiple Bayesian models in the **same**
+    solve can each carry a *different* initializer, and Bayesian models
+    with initializers can coexist with optax-trained models in mixed
+    mode.  These tests pin those compositions.
+
+    Note: mixing **on a single pytree** (e.g. an MLP whose head is
+    Bayesian and body is optax-trained) is Phase 11's Pattern B and is
+    explicitly blocked at solve start — see
+    ``TestMaskedBackends.test_masked_bayesian_with_global_optimizer_raises``.
+    """
+
+    # ─── 1. Two Bayesian models, two different initializers ──────────
+
+    def test_different_initializers_per_model(self, monkeypatch):
+        """``a.initialize(pathfinder)`` + ``b.initialize(laplace)`` in one
+        solve: each initializer runs exactly once on its own model;
+        each model gets its own warm position and IMM.
+        """
+        pf_count = [0]
+        lap_count = [0]
+        orig_pf = jno.bayesian.PathfinderInitializer.__call__
+        orig_lap = jno.bayesian.LaplaceInitializer.__call__
+
+        def _spy_pf(self, rng_key, ld, position, num_chains):
+            pf_count[0] += 1
+            return orig_pf(self, rng_key, ld, position, num_chains)
+
+        def _spy_lap(self, rng_key, ld, position, num_chains):
+            lap_count[0] += 1
+            return orig_lap(self, rng_key, ld, position, num_chains)
+
+        monkeypatch.setattr(jno.bayesian.PathfinderInitializer, "__call__", _spy_pf)
+        monkeypatch.setattr(jno.bayesian.LaplaceInitializer, "__call__", _spy_lap)
+
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        A_true, B_true = 3.14, -2.71
+        target = A_true * jno.np.sin(π * x) + B_true * jno.np.cos(π * x)
+
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        b = jno.np.parameter((1,), key=jax.random.PRNGKey(1), name="b")
+        a.initialize(jno.bayesian.pathfinder(maxiter=20, num_samples=50))
+        b.initialize(jno.bayesian.laplace(map_steps=100, map_optimizer=optax.adam(1e-1)))
+        a.bayesian(blackjax.nuts, step_size=1e-2, inverse_mass_matrix=jnp.ones(1), warmup=2, keep=15, adapt=False)
+        b.bayesian(blackjax.nuts, step_size=1e-2, inverse_mass_matrix=jnp.ones(1), warmup=2, keep=15, adapt=False)
+
+        residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
+        jno.core([residual.mse], dom).solve(17)
+
+        # Each initializer ran exactly once — for its own model.
+        assert pf_count[0] == 1, f"pathfinder ran {pf_count[0]} times; expected 1"
+        assert lap_count[0] == 1, f"laplace ran {lap_count[0]} times; expected 1"
+        # Both chains exist and are independent.
+        assert a.posterior_samples.shape == (1, 15, 1)
+        assert b.posterior_samples.shape == (1, 15, 1)
+        # Both posteriors are in the right ballpark (wide posterior — loose
+        # tolerance, see TestLaplaceInitializer for why).
+        assert abs(float(jnp.mean(a.posterior_samples)) - A_true) < 2.0
+        assert abs(float(jnp.mean(b.posterior_samples)) - B_true) < 2.0
+
+    # ─── 2. Initializer on Bayesian + optax on another model ─────────
+
+    def test_initializer_plus_optax_mixed_mode(self, monkeypatch):
+        """One model with ``.initialize(pathfinder).bayesian(...)``, another
+        with ``.optimizer(adam)``: pathfinder runs on the Bayesian
+        model only, optax updates the other, both recover.  Combines
+        ``TestPathfinderInitializer`` with the existing
+        ``TestMixedOptimizerBayesian`` setup.
+        """
+        pf_count = [0]
+        orig_pf = jno.bayesian.PathfinderInitializer.__call__
+
+        def _spy(self, rng_key, ld, position, num_chains):
+            pf_count[0] += 1
+            return orig_pf(self, rng_key, ld, position, num_chains)
+
+        monkeypatch.setattr(jno.bayesian.PathfinderInitializer, "__call__", _spy)
+
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        A_true, B_true = 2.0, 3.0
+        target = A_true * jno.np.sin(π * x) + B_true * jno.np.cos(π * x)
+
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")  # Bayesian + pathfinder
+        b = jno.np.parameter((1,), key=jax.random.PRNGKey(1), name="b")  # optax
+
+        a.initialize(jno.bayesian.pathfinder(maxiter=20, num_samples=50))
+        a.bayesian(blackjax.nuts, step_size=5e-2, inverse_mass_matrix=jnp.ones(1), warmup=2, keep=30, adapt=False)
+        b.optimizer(optax.adam(1e-1))
+
+        residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
+        crux = jno.core([residual.mse], dom)
+        crux.solve(50)
+
+        # Pathfinder ran exactly once — on the Bayesian model only.
+        assert pf_count[0] == 1, f"pathfinder ran {pf_count[0]} times; expected 1 (only on Bayesian model)"
+        # Bayesian model has a chain; optax model does not.
+        assert a.posterior_samples is not None
+        assert b.posterior_samples is None
+        # Optax model moved from zero init toward B_true.
+        b_final = float(crux.eval([b]).reshape(()))
+        assert abs(b_final) > 1e-2, f"optax param stayed at init zero in mixed-mode with initializer; got {b_final:.3e}"
+        # Bayesian chain mean recovers A_true (loose, see LaplaceInitializer
+        # note on jno's MSE convention giving a wide posterior).
+        assert abs(float(jnp.mean(a.posterior_samples)) - A_true) < 1.5
+
+    # ─── 3. All three initializers in one solve ──────────────────────
+
+    def test_three_initializers_one_solve(self, monkeypatch):
+        """``a.initialize(pathfinder)`` + ``b.initialize(laplace)`` +
+        ``c.initialize(svgd)`` — three Bayesian models, three different
+        initializers.  Each runs exactly once on its own model; all
+        three chains are produced.  Validates that block 6a correctly
+        iterates and applies *different* initializer types per model.
+        """
+        counts = {"pf": 0, "lap": 0, "svgd": 0}
+        orig_pf = jno.bayesian.PathfinderInitializer.__call__
+        orig_lap = jno.bayesian.LaplaceInitializer.__call__
+        orig_svgd = jno.bayesian.SVGDInitializer.__call__
+
+        def _make_spy(name, orig):
+            def _wrapped(self, rng_key, ld, position, num_chains):
+                counts[name] += 1
+                return orig(self, rng_key, ld, position, num_chains)
+
+            return _wrapped
+
+        monkeypatch.setattr(jno.bayesian.PathfinderInitializer, "__call__", _make_spy("pf", orig_pf))
+        monkeypatch.setattr(jno.bayesian.LaplaceInitializer, "__call__", _make_spy("lap", orig_lap))
+        monkeypatch.setattr(jno.bayesian.SVGDInitializer, "__call__", _make_spy("svgd", orig_svgd))
+
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        A_true, B_true, C_true = 2.0, 1.5, -1.0
+        target = A_true * jno.np.sin(π * x) + B_true * jno.np.cos(π * x) + C_true * x * (1 - x)
+
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        b = jno.np.parameter((1,), key=jax.random.PRNGKey(1), name="b")
+        c = jno.np.parameter((1,), key=jax.random.PRNGKey(2), name="c")
+        a.initialize(jno.bayesian.pathfinder(maxiter=20, num_samples=50))
+        b.initialize(jno.bayesian.laplace(map_steps=100, map_optimizer=optax.adam(1e-1)))
+        c.initialize(jno.bayesian.svgd(num_iters=80, num_particles=16, init_jitter=1.0))
+        for p in (a, b, c):
+            p.bayesian(blackjax.nuts, step_size=1e-2, inverse_mass_matrix=jnp.ones(1), warmup=2, keep=15, adapt=False)
+
+        residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) + c * x * (1 - x) - target
+        jno.core([residual.mse], dom).solve(17)
+
+        # Each initializer ran on exactly its own model.
+        assert counts == {"pf": 1, "lap": 1, "svgd": 1}, f"unexpected initializer call counts: {counts}"
+        # All three chains exist with the right shape.
+        for p in (a, b, c):
+            assert p.posterior_samples.shape == (1, 15, 1)
+
+    # ─── 4. Some Bayesian models have initializers, others don't ─────
+
+    def test_initializer_on_subset_of_bayesian_models(self, monkeypatch):
+        """``a.initialize(pathfinder).bayesian(...)`` + ``b.bayesian(...)``
+        (no initializer on b): pathfinder runs only on a; b uses the
+        standard init_state path.  Verifies the per-model filter in
+        block 6a's ``_init_candidates`` builder.
+        """
+        pf_count = [0]
+        orig_pf = jno.bayesian.PathfinderInitializer.__call__
+
+        def _spy(self, rng_key, ld, position, num_chains):
+            pf_count[0] += 1
+            return orig_pf(self, rng_key, ld, position, num_chains)
+
+        monkeypatch.setattr(jno.bayesian.PathfinderInitializer, "__call__", _spy)
+
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        A_true, B_true = 2.0, -1.0
+        target = A_true * jno.np.sin(π * x) + B_true * jno.np.cos(π * x)
+
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        b = jno.np.parameter((1,), key=jax.random.PRNGKey(1), name="b")
+        a.initialize(jno.bayesian.pathfinder(maxiter=10, num_samples=40))
+        # b has NO initializer.
+        a.bayesian(blackjax.nuts, step_size=1e-2, inverse_mass_matrix=jnp.ones(1), warmup=2, keep=10, adapt=False)
+        b.bayesian(blackjax.nuts, step_size=1e-2, inverse_mass_matrix=jnp.ones(1), warmup=2, keep=10, adapt=False)
+
+        residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
+        jno.core([residual.mse], dom).solve(12)
+
+        # Pathfinder ran exactly once — for a only, not for b.
+        assert pf_count[0] == 1, f"pathfinder ran {pf_count[0]} times; expected 1 (a only, not b)"
+        # Both Bayesian models still produced chains.
+        assert a.posterior_samples is not None
+        assert b.posterior_samples is not None
