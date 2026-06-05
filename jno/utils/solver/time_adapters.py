@@ -11,7 +11,7 @@ This module converts `FeaxTimeBlock` objects into:
 The adapters support two semidiscrete payloads:
 
 Linear:
-    M u_dot + A u = c + f(t)
+    M u_dot + A(t, args) u = c + f(t, args)
 
 Nonlinear:
     M(t) u_dot + R(u, t) = 0
@@ -67,6 +67,7 @@ def make_diffrax_block(
     block: FeaxTimeBlock,
     *,
     forcing_vector_fn: Optional[Callable] = None,
+    operator_fn: Optional[Callable] = None,
     args: Any = None,
 ) -> DiffraxBlock:
     """
@@ -76,11 +77,11 @@ def make_diffrax_block(
     -----------------
     For a linear semidiscrete block,
 
-        M u_dot + A u = c + f(t)
+        M u_dot + A(t, args) u = c + f(t, args)
 
     the generated Diffrax RHS is:
 
-        u_dot = solve(M, c + f(t) - A u)
+        u_dot = solve(M, c + f(t, args) - A(t, args) u)
 
     Nonlinear conversion
     --------------------
@@ -99,6 +100,10 @@ def make_diffrax_block(
     forcing_vector_fn:
         Optional override for the linear forcing callback. If omitted,
         `block.forcing_vector_fn` is used.
+    operator_fn:
+        Optional override for the runtime linear operator callback. The
+        signature is ``operator_fn(t, args) -> matrix``. If omitted,
+        ``block.operator_fn`` is used, falling back to ``block.A``.
     args:
         Optional runtime arguments passed to the generated RHS.
 
@@ -116,8 +121,11 @@ def make_diffrax_block(
     # Linear path
     # --------------------------------------------------
     if block.is_linear():
-        M = jnp.asarray(block.M)
-        A = jnp.asarray(block.A)
+        state0 = jnp.asarray(block.state0)
+        solve_dtype = state0.dtype
+        M = jnp.asarray(block.M, dtype=solve_dtype)
+        op_fn = operator_fn if operator_fn is not None else block.operator_fn
+        A_const = None if op_fn is not None else jnp.asarray(block.A, dtype=solve_dtype)
 
         if block.affine_bias is None:
             c = jnp.zeros((M.shape[0],), dtype=M.dtype)
@@ -126,16 +134,29 @@ def make_diffrax_block(
 
         f_fn = forcing_vector_fn if forcing_vector_fn is not None else block.forcing_vector_fn
 
+        def _runtime_args(solver_args):
+            return args if solver_args is None else solver_args
+
+        def _operator(t, solver_args):
+            if op_fn is None:
+                return A_const
+            return jnp.asarray(op_fn(t, _runtime_args(solver_args)), dtype=M.dtype)
+
         def rhs(t, y, solver_args):
+            runtime_args = _runtime_args(solver_args)
             ff = (
                 jnp.zeros_like(c)
                 if f_fn is None
                 else jnp.asarray(
-                    f_fn(t, args if solver_args is None else solver_args),
+                    f_fn(t, runtime_args),
                     dtype=M.dtype,
                 ).reshape(-1)
             )
-            return jnp.linalg.solve(M, c + ff - A @ y)
+            A_t = _operator(t, solver_args)
+            out = jnp.linalg.solve(M, c + ff - A_t @ y)
+
+            # Diffrax requires the vector-field output to match the state dtype.
+            return jnp.asarray(out, dtype=y.dtype)
 
         return DiffraxBlock(
             backend="diffrax",
@@ -144,7 +165,7 @@ def make_diffrax_block(
             original_expr=block.ir,
             lowered_rhs=None,
             rewritten_system=None,
-            state0=block.state0,
+            state0=state0,
             initial_conditions=block.initial_conditions,
             t0=block.t0,
             t1=block.t1,
@@ -154,11 +175,14 @@ def make_diffrax_block(
             args=args,
             mass=lambda t, a=None: M,
             state_meta={},
+            prolongation=getattr(block, "prolongation", None),
             metadata={
                 **block.metadata,
                 "converted_from": "feax_time",
-                "conversion": "u_dot = solve(M, c + f(t) - A u)",
+                "conversion": "u_dot = solve(M, c + f(t,args) - A(t,args) u)",
+                "dynamic_operator": bool(op_fn is not None),
                 "jax_runtime": True,
+                "periodic": getattr(block, "prolongation", None) is not None,
             },
         )
 
@@ -170,9 +194,39 @@ def make_diffrax_block(
         residual_fn = block.residual
 
         def rhs(t, y, solver_args):
-            M_t = jnp.asarray(mass_fn(t, args if solver_args is None else solver_args))
-            R_t = jnp.asarray(residual_fn(y, t, args if solver_args is None else solver_args)).reshape(-1)
-            return jnp.linalg.solve(M_t, -R_t)
+            runtime_args = args if solver_args is None else solver_args
+
+            y_arr = jnp.asarray(y)
+            dtype = y_arr.dtype
+
+            M_t = jnp.asarray(
+                mass_fn(
+                    t,
+                    runtime_args,
+                ),
+                dtype=dtype,
+            )
+
+            R_t = jnp.asarray(
+                residual_fn(
+                    y_arr,
+                    t,
+                    runtime_args,
+                ),
+                dtype=dtype,
+            ).reshape(-1)
+
+            velocity = jnp.linalg.solve(
+                M_t,
+                -R_t,
+            )
+
+            # Diffrax RK buffers are initialized using y0.dtype.
+            # Always return the same dtype from the generated RHS.
+            return jnp.asarray(
+                velocity,
+                dtype=dtype,
+            )
 
         return DiffraxBlock(
             backend="diffrax",
@@ -200,7 +254,8 @@ def make_diffrax_block(
         )
 
     raise ValueError(
-        "make_diffrax_block(...) requires either a linear payload (M,A,...) or a nonlinear payload (mass,residual,...)."
+        "make_diffrax_block(...) requires either a linear payload (M and A/operator_fn) "
+        "or a nonlinear payload (mass,residual,...)."
     )
 
 
@@ -212,6 +267,7 @@ def make_feax_pipeline(
     *,
     scheme: Optional[str] = None,
     forcing_vector_fn: Optional[Callable] = None,
+    operator_fn: Optional[Callable] = None,
     args: Any = None,
     monitor_index: Optional[int] = None,
     newton_tol: float = 1e-8,
@@ -232,17 +288,17 @@ def make_feax_pipeline(
     ---------------------
     For
 
-        M u_dot + A u = c + f(t)
+        M u_dot + A(t, args) u = c + f(t, args)
 
     the generated step solves:
 
-        (M + dt A) u_next = M u + dt(c + f(t_next))
+        (M + dt A(t_next, args)) u_next = M u + dt(c + f(t_next, args))
 
     Linear forward Euler
     --------------------
     The generated step evaluates:
 
-        u_next = u + dt solve(M, c + f(t) - A u)
+        u_next = u + dt solve(M, c + f(t, args) - A(t, args) u)
 
     Nonlinear backward Euler
     ------------------------
@@ -269,6 +325,9 @@ def make_feax_pipeline(
         `block.mode`.
     forcing_vector_fn:
         Optional override for the linear forcing callback.
+    operator_fn:
+        Optional override for the runtime linear operator callback. The
+        signature is ``operator_fn(t, args) -> matrix``.
     args:
         Optional runtime arguments passed to generated step functions.
     monitor_index:
@@ -306,7 +365,8 @@ def make_feax_pipeline(
     # --------------------------------------------------
     if block.is_linear():
         M = jnp.asarray(block.M)
-        A = jnp.asarray(block.A)
+        op_fn = operator_fn if operator_fn is not None else block.operator_fn
+        A_const = None if op_fn is not None else jnp.asarray(block.A)
         y0 = jnp.asarray(block.state0).reshape(-1)
 
         if block.affine_bias is None:
@@ -315,6 +375,11 @@ def make_feax_pipeline(
             c = jnp.asarray(block.affine_bias, dtype=M.dtype).reshape(-1)
 
         f_fn = forcing_vector_fn if forcing_vector_fn is not None else block.forcing_vector_fn
+
+        def _operator(t_eval):
+            if op_fn is None:
+                return A_const
+            return jnp.asarray(op_fn(t_eval, args), dtype=M.dtype)
 
         class _LinearSemidiscretePipeline(TimePipeline):
             def build(self, mesh):
@@ -330,13 +395,15 @@ def make_feax_pipeline(
                             if f_fn is None
                             else jnp.asarray(f_fn(t_eval, args), dtype=M.dtype).reshape(-1)
                         )
-                        lhs = M + dt * A
+                        A_t = _operator(t_eval)
+                        lhs = M + dt * A_t
                         rhs_vec = M @ state + dt * (c + ff)
                         return jnp.linalg.solve(lhs, rhs_vec)
 
                     t_eval = t
                     ff = jnp.zeros_like(c) if f_fn is None else jnp.asarray(f_fn(t_eval, args), dtype=M.dtype).reshape(-1)
-                    return state + dt * jnp.linalg.solve(M, c + ff - A @ state)
+                    A_t = _operator(t_eval)
+                    return state + dt * jnp.linalg.solve(M, c + ff - A_t @ state)
 
                 self._step_impl = jax.jit(_step_impl) if compile_step else _step_impl
 
@@ -376,6 +443,7 @@ def make_feax_pipeline(
                 "converted_from": "feax_time",
                 "conversion": f"semidiscrete_{scheme_use}",
                 "forcing_mode": block.forcing_mode,
+                "dynamic_operator": bool(op_fn is not None),
                 "snapshot_support": bool(len(snapshot_times_use) > 0),
                 "compile_step": bool(compile_step),
             },

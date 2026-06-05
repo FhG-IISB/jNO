@@ -37,7 +37,6 @@ class IREEModel:
         device: str = "local-sync",
         input_dtypes: tuple[str, ...] | None = None,
     ):
-
         self.vmfb_bytes = vmfb_bytes
         self.module_name = module_name
         self.device = device
