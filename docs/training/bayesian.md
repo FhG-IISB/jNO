@@ -495,23 +495,46 @@ A worked example lives at
   subset is the posterior.
 * **Pattern B** *(Phase 15)*: `.mask(M).bayesian(...)` + global
   `.optimizer(...)` on the same model.  Body is Adam-trained; head is
-  MCMC-sampled.  `opt_states[lid]` carries both states via a
-  `_MixedState` wrapper.  **K=1 and K>1 both supported**: for K>1 the
-  body's gradient is computed at the chain-0 representative head (SAEM
+  MCMC-sampled.  **K=1 and K>1 both supported**: for K>1 the body's
+  gradient is computed at the chain-0 representative head (SAEM
   simplification).  Tutorial: [T14](../tutorials/10-bayesian-pinns/pattern-b-bnn-head.md).
-* **Masked + `num_chains > 1`** *(Phase 15)*: lifted as a side-effect
-  of Pattern B's state-storage refactor — masked Bayesian solves with
-  K parallel chains work for both Pattern A and Pattern B.
+* **Pattern D** *(Phase 16)*: multiple disjoint `.mask().bayesian()`
+  groups on the same model.  Each group's kernel state lives at its
+  own composite key (`"<lid>.<group_idx>"`) in `opt_states`; the step
+  loop iterates groups in sorted order (Metropolis-within-Gibbs cycle
+  for K=1; SAEM-style chain-0 representative for K>1).
+* **Pattern E** *(Phase 16)*: mixed VI + MCMC on disjoint masks of
+  the same model.  MCMC accumulates per-step samples; at solve end
+  the VI handle draws `posterior_draws` i.i.d. samples from its
+  fitted distribution and splices them into the MCMC chain at the
+  VI mask's leaves.  **Strict matching**: VI's `posterior_draws` must
+  equal the MCMC group's `keep` (validated at solve start).
+* **Masked + `num_chains > 1`** *(Phase 15)*: masked Bayesian solves
+  with K parallel chains work for Pattern A, B, and D.
 * **`.lora()` + `.bayesian()`** (no mask) — the LoRA partition already
   restricts trainable parameters to the LoRA adapters; `.bayesian()`
   samples that restricted subset.
 
+### State storage (composite keys)
+
+Internally, `opt_states` uses two key formats:
+
+* **Bare** `"<lid>"` — optax states (one per layer with `.optimizer(...)`).
+* **Composite** `"<lid>.<group_idx>"` — Bayesian / VI kernel states
+  (one per masked group; bare-`.bayesian()` layers use `"<lid>.0"`).
+
+A Pattern B + D layer therefore carries entries like
+`{"1": optax_state, "1.0": kernel_g0, "1.1": kernel_g1}` simultaneously.
+The helpers `jno.core._lid_of(k)`, `_group_idx_of(k)`, `_bay_key(lid, gi)`
+parse / build these keys.
+
 ### What's still blocked
 
-| Pattern | Why blocked | Workaround |
-|---|---|---|
-| **D**: multiple disjoint `.mask().bayesian()` groups on the same model | The per-group Metropolis-within-Gibbs cycle would need either composite keys per group or a list-of-groups extension of `_MixedState`.  Not yet wired. | Combine the disjoint masks into a single one and call `.bayesian()` once. |
-| **E**: mixed VI + MCMC on disjoint masks of the same model | Same group-list extension as Pattern D. | Run VI and MCMC on **separate** models (they may coexist freely in one solve). |
+The composite-key scheme generalises further (multiple VI groups
+beyond one per layer, overlapping masks, etc.) but the current
+implementation only validates the patterns above.  Patterns not in
+the supported list above fall back to clear `NotImplementedError` /
+`ValueError` at solve start.
 
 ### What `posterior_samples` looks like
 

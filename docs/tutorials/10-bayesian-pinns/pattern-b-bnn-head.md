@@ -27,8 +27,7 @@ net.mask(head_mask).bayesian(blackjax.sgld, ...)     # head sampled
 One line — `net.optimizer(...)` — added on top of the Pattern A recipe.
 The masked Bayesian configurator was previously blocked from coexisting
 with a global optimiser on the same model; Phase 15 lifts that block via
-a `_MixedState` wrapper that carries both states under the same layer
-key.
+composite keys in `opt_states` (one entry per backend per layer).
 
 ## How it works under the hood
 

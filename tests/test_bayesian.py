@@ -1451,9 +1451,11 @@ class TestMaskedBackends:
         with pytest.raises(ValueError, match="global .bayesian"):
             jno.core([residual.mse], dom).solve(5)
 
-    def test_multiple_masked_bayesian_raises(self):
-        """v1 supports at most one non-optax group per model.  Two
-        masked .bayesian() calls on different masks raise."""
+    def test_multiple_masked_bayesian_runs(self):
+        """Phase 16 lifts the block on multiple disjoint masked
+        ``.bayesian()`` groups (Pattern D).  Two SGLD groups on
+        disjoint leaves of one model produce a unified chain whose
+        full pytree captures both groups' variation."""
         dom = _line_domain()
         x, _ = dom.variable("interior")
         net = _tiny_net(in_dim=1, out_dim=2, hidden=4)
@@ -1466,12 +1468,20 @@ class TestMaskedBackends:
         m1 = jax.tree_util.tree_unflatten(treedef, m1_flags)
         m2 = jax.tree_util.tree_unflatten(treedef, m2_flags)
 
-        net.mask(m1).bayesian(blackjax.sgld, step_size=1e-4, warmup=2, keep=3)
-        net.mask(m2).bayesian(blackjax.sgld, step_size=1e-4, warmup=2, keep=3)
+        net.mask(m1).bayesian(blackjax.sgld, step_size=1e-4, warmup=2, keep=5)
+        net.mask(m2).bayesian(blackjax.sgld, step_size=1e-4, warmup=2, keep=5)
 
         residual = net(x) - 0.0
-        with pytest.raises(NotImplementedError, match="multiple masked"):
-            jno.core([residual.mse], dom).solve(5)
+        jno.core([residual.mse], dom).solve(7)
+        chain = net.posterior_samples
+        assert chain is not None
+        # Both group leaves vary across the chain (each group's kernel
+        # contributes variation to its own masked subset).
+        chain_leaves = jax.tree_util.tree_leaves(chain)
+        var_m1 = float(jnp.mean(jnp.var(chain_leaves[-1], axis=1)))
+        var_m2 = float(jnp.mean(jnp.var(chain_leaves[-2], axis=1)))
+        assert var_m1 > 1e-10, f"first masked group should vary; got var={var_m1:.3e}"
+        assert var_m2 > 1e-10, f"second masked group should vary; got var={var_m2:.3e}"
 
     def test_mask_scope_consumed_one_shot(self):
         """``.mask(M)`` sets a pending scope consumed by the next
@@ -2797,11 +2807,11 @@ class TestInitializerComposition:
 
 
 class TestPatternB:
-    """One pytree, two backends.  Phase 15 lifts the v1 block on
-    ``.mask(M).bayesian()`` + ``.optimizer(...)`` on the same model:
-    the unmasked complement is Adam-trained (body) while the masked
-    subset is MCMC-sampled (head).  ``opt_states[lid]`` is a
-    ``_MixedState`` wrapper carrying both pieces.  These tests pin
+    """One pytree, two backends.  Phase 15 lifted the v1 block on
+    ``.mask(M).bayesian()`` + ``.optimizer(...)`` on the same model;
+    Phase 16 refactored the state storage so optax lives at the bare
+    composite key (``"<lid>"``) and each Bayesian/VI group lives at
+    its own composite key (``"<lid>.<group_idx>"``).  These tests pin
     the K=1 and K>1 paths and the composition with the existing
     Bayesian features.
     """
@@ -2950,14 +2960,228 @@ class TestPatternB:
         head_var = float(jnp.mean(jnp.var(leaves[masked_idx], axis=1)))
         assert head_var > 1e-8
 
-    # ─── 6. _MixedState contract ────────────────────────────────────
+    # ─── 6. Composite-key contract (Phase 16 refactor) ──────────────
 
-    def test_pattern_b_mixed_state_class_exists(self):
-        """Ensure the ``_MixedState`` NamedTuple is importable and has
-        the right field names.  Regression guard for the state-storage
-        contract."""
-        from jno.core import _MixedState
+    def test_pattern_b_composite_keys_layout(self):
+        """Phase 16: Pattern B's two states live under distinct composite
+        keys (optax at ``"<lid>"``, kernel at ``"<lid>.<group_idx>"``).
+        Regression guard for the contract that replaced the v1 ``_MixedState``
+        wrapper."""
+        from jno.core import _bay_key, _lid_of
 
-        ms = _MixedState(optax="a", bayesian="b")
-        assert ms.optax == "a"
-        assert ms.bayesian == "b"
+        assert _lid_of("1") == 1
+        assert _lid_of("1.0") == 1
+        assert _lid_of("42.3") == 42
+        assert _bay_key(1, 0) == "1.0"
+        assert _bay_key(42, 3) == "42.3"
+
+
+# ---------------------------------------------------------------------------
+# Phase 16 — Pattern D: multiple disjoint masked Bayesian groups on one model
+# ---------------------------------------------------------------------------
+
+
+class TestPatternD:
+    """Multiple disjoint masked ``.bayesian()`` groups on the same
+    model.  Each group gets its own composite-keyed handle / kernel
+    state in ``opt_states["<lid>.<group_idx>"]``.  At step time the
+    Gibbs cycle iterates groups in sorted key order; each group's
+    kernel sees the LATEST positions of the other groups (proper
+    Metropolis-within-Gibbs for K=1).
+    """
+
+    @staticmethod
+    def _build_two_groups(*, num_chains=1, hidden=4):
+        """Two-group MLP: leaves split into two disjoint masks."""
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        net = _tiny_net(in_dim=1, out_dim=2, hidden=hidden)
+        leaves = jax.tree_util.tree_leaves(net.module)
+        treedef = jax.tree_util.tree_structure(net.module)
+        m1_flags = [False] * len(leaves)
+        m1_flags[-1] = True
+        m2_flags = [False] * len(leaves)
+        m2_flags[-2] = True
+        m1 = jax.tree_util.tree_unflatten(treedef, m1_flags)
+        m2 = jax.tree_util.tree_unflatten(treedef, m2_flags)
+        residual = net(x) - 0.0
+        return dom, net, m1, m2, residual
+
+    # ─── 1. Two SGLD groups both fire ────────────────────────────────
+
+    def test_pattern_d_two_sgld_groups_both_vary(self):
+        """Two disjoint masked SGLD groups: chain has variation in
+        both groups' masked leaves; other leaves stay constant."""
+        dom, net, m1, m2, residual = self._build_two_groups()
+        net.mask(m1).bayesian(blackjax.sgld, step_size=1e-3, warmup=3, keep=15)
+        net.mask(m2).bayesian(blackjax.sgld, step_size=1e-3, warmup=3, keep=15)
+        jno.core([residual.mse], dom).solve(18)
+
+        chain = net.posterior_samples
+        assert chain is not None
+        chain_leaves = jax.tree_util.tree_leaves(chain)
+        # Last leaf is in m1; second-to-last is in m2.
+        var_m1 = float(jnp.mean(jnp.var(chain_leaves[-1], axis=1)))
+        var_m2 = float(jnp.mean(jnp.var(chain_leaves[-2], axis=1)))
+        assert var_m1 > 1e-10, f"group m1 should vary; got var={var_m1:.3e}"
+        assert var_m2 > 1e-10, f"group m2 should vary; got var={var_m2:.3e}"
+        # First leaf is outside both masks → constant across chain.
+        var_outer = float(jnp.mean(jnp.var(chain_leaves[0], axis=1)))
+        assert var_outer < 1e-10, f"unmasked leaf should stay at init; got var={var_outer:.3e}"
+
+    # ─── 2. Pattern D + Pattern B (multi-Bayesian + global optax) ───
+
+    def test_pattern_d_with_global_optimizer(self):
+        """Two SGLD groups + global ``.optimizer()``: each group's
+        masked subset is sampled; the unmasked complement is
+        Adam-trained.  Body moves from init; both group leaves vary."""
+        dom, net, m1, m2, residual = self._build_two_groups()
+
+        # Snapshot initial weights for "moved" comparison
+        init_leaves = jax.tree_util.tree_leaves(net.module)
+        init_body_l0 = jnp.copy(init_leaves[0])
+
+        net.optimizer(optax.adam(1e-1))
+        net.mask(m1).bayesian(blackjax.sgld, step_size=1e-3, warmup=3, keep=15)
+        net.mask(m2).bayesian(blackjax.sgld, step_size=1e-3, warmup=3, keep=15)
+        jno.core([residual.mse], dom).solve(18)
+
+        chain = net.posterior_samples
+        chain_leaves = jax.tree_util.tree_leaves(chain)
+        # Both group leaves vary.
+        assert float(jnp.mean(jnp.var(chain_leaves[-1], axis=1))) > 1e-10
+        assert float(jnp.mean(jnp.var(chain_leaves[-2], axis=1))) > 1e-10
+        # Body (first leaf, outside both masks) moved under optax.
+        final_body_l0 = jax.tree_util.tree_leaves(net.module)[0]
+        assert float(jnp.linalg.norm(final_body_l0 - init_body_l0)) > 1e-4, "Pattern D + B: body did not move under optax"
+
+    # ─── 3. K>1 multichain + Pattern D ───────────────────────────────
+
+    def test_pattern_d_multichain_K4(self):
+        """Pattern D + K=4 chains: chain has (K=4, N, ...) and both
+        group leaves vary across N."""
+        dom, net, m1, m2, residual = self._build_two_groups()
+        net.mask(m1).bayesian(blackjax.sgld, step_size=1e-3, warmup=2, keep=6, num_chains=4)
+        net.mask(m2).bayesian(blackjax.sgld, step_size=1e-3, warmup=2, keep=6, num_chains=4)
+        jno.core([residual.mse], dom).solve(8)
+
+        chain = net.posterior_samples
+        chain_leaves = jax.tree_util.tree_leaves(chain)
+        for leaf in chain_leaves:
+            assert leaf.shape[:2] == (4, 6), f"unexpected (K, N) = {leaf.shape[:2]}"
+        # Both group leaves vary along N within each chain.
+        assert float(jnp.mean(jnp.var(chain_leaves[-1], axis=1))) > 1e-10
+        assert float(jnp.mean(jnp.var(chain_leaves[-2], axis=1))) > 1e-10
+
+    # ─── 4. Composite-key contract ───────────────────────────────────
+
+    def test_pattern_d_composite_keys_present(self):
+        """After solve, the *internal* opt_states dict must carry
+        composite keys per group.  We probe via opt_states exposure on
+        the solve closure isn't possible from outside — but we can
+        check via the symptom: the posterior_samples chain has two
+        groups' worth of variation, which can only happen if both
+        groups had their own state slots."""
+        # Already covered by ``test_pattern_d_two_sgld_groups_both_vary``;
+        # here we additionally verify the composite-key helpers
+        # parse the expected formats.
+        from jno.core import _bay_key, _group_idx_of, _lid_of
+
+        assert _bay_key(2, 1) == "2.1"
+        assert _lid_of("2.1") == 2
+        assert _group_idx_of("2.1") == 1
+        assert _group_idx_of("2") is None  # bare optax key
+
+
+# ---------------------------------------------------------------------------
+# Phase 16 — Pattern E: mixed VI + MCMC on disjoint masks of one model
+# ---------------------------------------------------------------------------
+
+
+class TestPatternE:
+    """One model with both an MCMC handle and a VI handle on disjoint
+    masks.  At step time the MCMC group samples; at solve end the VI
+    group draws ``posterior_draws`` from its fitted distribution and
+    its draws are spliced into the MCMC chain at the VI-masked leaves.
+    Strict matching: MCMC's ``keep`` must equal VI's ``posterior_draws``.
+    """
+
+    @staticmethod
+    def _build_two_groups(*, hidden=4):
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        net = _tiny_net(in_dim=1, out_dim=2, hidden=hidden)
+        leaves = jax.tree_util.tree_leaves(net.module)
+        treedef = jax.tree_util.tree_structure(net.module)
+        m1_flags = [False] * len(leaves)
+        m1_flags[-1] = True
+        m2_flags = [False] * len(leaves)
+        m2_flags[-2] = True
+        m1 = jax.tree_util.tree_unflatten(treedef, m1_flags)
+        m2 = jax.tree_util.tree_unflatten(treedef, m2_flags)
+        residual = net(x) - 0.0
+        return dom, net, m1, m2, residual
+
+    # ─── 1. MCMC + VI on disjoint masks: chain produced ─────────────
+
+    def test_pattern_e_mcmc_plus_vi_runs(self):
+        """One MCMC + one VI on disjoint masks of the same model:
+        chain has both groups' leaves varying."""
+        dom, net, m1, m2, residual = self._build_two_groups()
+        N = 20
+        net.mask(m1).bayesian(blackjax.sgld, step_size=1e-3, warmup=2, keep=N)
+        net.mask(m2).vi(
+            blackjax.meanfield_vi,
+            optimizer=optax.adam(1e-2),
+            num_samples=4,
+            posterior_draws=N,  # must match MCMC keep
+        )
+        jno.core([residual.mse], dom).solve(22)
+
+        chain = net.posterior_samples
+        assert chain is not None
+        leaves = jax.tree_util.tree_leaves(chain)
+        var_mcmc = float(jnp.mean(jnp.var(leaves[-1], axis=1)))
+        var_vi = float(jnp.mean(jnp.var(leaves[-2], axis=1)))
+        assert var_mcmc > 1e-10, f"MCMC leaf should vary; got var={var_mcmc:.3e}"
+        assert var_vi > 1e-10, f"VI leaf should vary across draws; got var={var_vi:.3e}"
+
+    # ─── 2. Strict matching: keep != posterior_draws raises ─────────
+
+    def test_pattern_e_mismatched_lengths_raises(self):
+        """Pattern E requires ``keep == posterior_draws`` across the
+        mixed VI / MCMC groups on one layer.  Mismatched lengths
+        raise at solve start."""
+        dom, net, m1, m2, residual = self._build_two_groups()
+        net.mask(m1).bayesian(blackjax.sgld, step_size=1e-3, warmup=2, keep=10)
+        net.mask(m2).vi(
+            blackjax.meanfield_vi,
+            optimizer=optax.adam(1e-2),
+            num_samples=4,
+            posterior_draws=20,  # mismatch on purpose
+        )
+        with pytest.raises(ValueError, match="Pattern E requires"):
+            jno.core([residual.mse], dom).solve(12)
+
+    # ─── 3. Composite-key contract — both kinds at distinct keys ────
+
+    def test_pattern_e_both_handles_registered(self):
+        """Both handles are reachable via composite keys ``"<lid>.0"``
+        and ``"<lid>.1"`` — symptom: chain has 2 groups' worth of
+        variation, which is only possible if both are registered."""
+        dom, net, m1, m2, residual = self._build_two_groups()
+        net.mask(m1).bayesian(blackjax.sgld, step_size=1e-3, warmup=2, keep=15)
+        net.mask(m2).vi(
+            blackjax.meanfield_vi,
+            optimizer=optax.adam(1e-2),
+            num_samples=4,
+            posterior_draws=15,
+        )
+        jno.core([residual.mse], dom).solve(17)
+        chain = net.posterior_samples
+        leaves = jax.tree_util.tree_leaves(chain)
+        # Both group leaves vary
+        assert float(jnp.mean(jnp.var(leaves[-1], axis=1))) > 1e-10
+        assert float(jnp.mean(jnp.var(leaves[-2], axis=1))) > 1e-10
+        # Unmasked complement (first leaf) stays at init
+        assert float(jnp.mean(jnp.var(leaves[0], axis=1))) < 1e-10
