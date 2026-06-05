@@ -1072,6 +1072,14 @@ class Model(Placeholder):
         self._lora_config: list[dict] | None = None  # [{"target", "rank", "alpha", "wrappers"}, ...]
         self._opt_fn = None  # optax optimizer factory / instance
         self._lr = LearningRateSchedule(1.0)
+        self._bayesian_cfg = None  # {"factory", "kernel_kwargs", "prior", "warmup", "keep", "thin"}
+        self._vi_cfg = None  # {"factory", "optimizer", "num_samples", "posterior_draws", "prior"}
+        self._posterior_samples_pytree = None  # stacked module pytree, leading axis = N; populated by solve()
+        # Per-step blackjax info aggregated post-solve into a
+        # ``{field_name: (K, N) array}`` dict — populated for HMC-family
+        # kernels (NUTS/HMC: is_divergent, acceptance_rate, energy; MALA:
+        # acceptance_rate).  ``None`` for SG-MCMC / VI / non-Bayesian.
+        self._posterior_diagnostics: dict | None = None
         self._dtype = None  # target dtype (e.g. jnp.bfloat16) or None
         self._param_mask = None  # current mask scope for grouped optimizer/lr calls
         self._trainable_param_mask = None  # persistent trainability mask used by mask(...).freeze()
@@ -1082,6 +1090,11 @@ class Model(Placeholder):
         self._initialize_mask = None  # optional bool pytree consumed by initialize() for partial preload
         self._initializer_fn = None  # callable initializer used at compile time
         self._initializer_key = None  # optional PRNG key for callable initializer
+        # Phase 12 — logdensity-aware initializer (jno.bayesian.pathfinder, future Laplace, …).
+        # Detected by .initialize() via the requires_logdensity = True marker.
+        # Runs *inside* solve() after the loss is built but before the kernel state is finalised.
+        self._bayesian_initializer = None
+        self._bayesian_initializer_key = None
         self._tunable_opts: Dict[str, list] = {}  # per-model tunable options for sweeps
 
     # ── public API ───────────────────────────────────────────
@@ -1090,6 +1103,44 @@ class Model(Placeholder):
     def params(self):
         """Alias for :attr:`module` — always reflects the current (post-training) weights."""
         return self.module
+
+    @property
+    def posterior_samples(self):
+        """Post-warmup MCMC samples for this model, or ``None`` if it was not
+        configured with :meth:`bayesian`.
+
+        Returns the stacked module pytree (leading axis = number of kept
+        samples).  For :func:`jno.np.parameter` models, the single-leaf
+        ``_Parameter(value=…)`` wrapper is unwrapped to a plain array, so
+        ``a.posterior_samples`` has shape ``(N, *a_shape)`` directly.
+        """
+        pytree = getattr(self, "_posterior_samples_pytree", None)
+        if pytree is None:
+            return None
+        if getattr(self, "_is_jno_scalar_parameter", False):
+            return pytree.value
+        return pytree
+
+    @property
+    def posterior_diagnostics(self):
+        """Per-step blackjax kernel info aggregated across the chain.
+
+        Returns a ``{field: (K, N) array}`` dict — one entry per field
+        the kernel surfaces:
+
+        * **NUTS / HMC** — ``is_divergent`` (bool), ``acceptance_rate``
+          (float), ``energy`` (float).
+        * **MALA** — ``acceptance_rate`` only.
+        * **SG-MCMC / VI** — ``None``: those kernels expose no
+          per-step info object.
+
+        Returns ``None`` if this model is not Bayesian, or if its
+        kernel doesn't surface per-step diagnostics.  Inspect
+        ``is_divergent`` first — non-zero counts mean the integrator
+        is repeatedly failing and the chain cannot be trusted at the
+        posted ``step_size`` / ``inverse_mass_matrix``.
+        """
+        return getattr(self, "_posterior_diagnostics", None)
 
     def __call__(self, *args) -> "ModelCall":
         """Call this module with variables and return a traced ``ModelCall``."""
@@ -1442,6 +1493,289 @@ class Model(Placeholder):
 
         return self
 
+    def bayesian(
+        self,
+        kernel_factory,
+        *,
+        prior=None,
+        warmup: int = 500,
+        keep: int = 1000,
+        thin: int = 1,
+        adapt: bool = True,
+        num_chains: int = 1,
+        init_jitter: float = 0.0,
+        likelihood_scale: float = 1.0,
+        **kernel_kwargs,
+    ):
+        """Sample this model's parameters from a posterior via blackjax.
+
+        Mirrors :meth:`optimizer` but uses an MCMC kernel instead of an
+        optax update.  The model's parameters become the *position* of a
+        chain initialised at the current weights; each training step is
+        one transition of ``kernel_factory(logdensity_fn, **kernel_kwargs)``
+        for full-data kernels (NUTS/HMC/MALA), or
+        ``kernel_factory(grad_estimator, **kernel_kwargs)`` for SG-MCMC
+        (SGLD/SGHMC).  jno chooses the dispatch shape by inspecting the
+        factory's signature.
+
+        After :meth:`jno.core.core.solve` returns, the chain is available
+        on the model via :attr:`posterior_samples` — a pytree mirroring
+        the model parameters with a leading sample axis of length
+        ``keep // thin``.
+
+        Example — NUTS on a scalar PDE coefficient::
+
+            import blackjax, jax.numpy as jnp
+            a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+            a.bayesian(
+                blackjax.nuts,
+                step_size=1e-2,
+                inverse_mass_matrix=jnp.ones(1),
+                warmup=500,
+                keep=1000,
+            )
+            crux = jno.core([residual.mse], domain)
+            crux.solve(2000)
+            chain = a.posterior_samples            # (1000, 1)
+
+        Example — SGLD on a small MLP (BNN PINN)::
+
+            import blackjax
+            net = jno.nn.wrap(foundax.mlp(...))
+            net.bayesian(blackjax.sgld, step_size=1e-5, warmup=2000, keep=1000)
+
+        References:
+            * NUTS — Hoffman & Gelman (2014), *The No-U-Turn Sampler*, JMLR
+              15(1), 1593-1623.
+            * SGLD — Welling & Teh (2011), *Bayesian Learning via Stochastic
+              Gradient Langevin Dynamics*, ICML 2011, 681-688.
+
+        Args:
+            kernel_factory: A blackjax kernel constructor, e.g.
+                ``blackjax.nuts`` or ``blackjax.sgld``.  Any callable that
+                takes ``logdensity_fn`` (full-data) or ``grad_estimator``
+                (SG-MCMC) as its first positional argument is accepted.
+            prior: Optional ``pytree -> float`` log-prior.  Default: a wide
+                isotropic Gaussian with σ=10 over all inexact-array leaves.
+            warmup: For adaptive HMC-family kernels (``blackjax.nuts`` /
+                ``blackjax.hmc``) with ``adapt=True``: number of
+                ``blackjax.window_adaptation`` steps run before the main
+                loop.  Adapted ``step_size`` and ``inverse_mass_matrix``
+                replace the initial values, and the main loop collects
+                samples from epoch 0.  For non-adaptive kernels (MALA,
+                SGLD, SGHMC) and ``adapt=False``: number of initial outer
+                epochs whose samples are discarded.  Default 500.
+            keep:   Number of post-warmup samples to retain (after thinning).
+                Default 1000.
+            thin:   Keep one sample every ``thin`` post-warmup steps.
+                Default 1.
+            adapt:  When ``True`` (default) and the kernel is in the HMC
+                family, ``blackjax.window_adaptation`` runs for ``warmup``
+                steps before the main loop and adapts step size + inverse
+                mass matrix.  Silently no-op for non-adaptive kernels.
+                Set ``False`` to revert to the "discard first N samples"
+                semantics with the user-supplied hyperparameters.
+            num_chains: Number of parallel MCMC chains run via
+                ``jax.vmap``.  Default 1.  Output
+                :attr:`posterior_samples` has leading axes ``(K, N, *)``
+                regardless of K (arviz / `az.from_dict` compatible).
+                All ``.bayesian()`` models in a single :meth:`solve` call
+                must share the same ``num_chains``.
+            init_jitter: When ``num_chains > 1``, perturb each chain's
+                initial position by ``N(0, init_jitter)`` for
+                over-dispersion (gives a more conservative R-hat).
+                Default 0.0 = all chains start from the same point with
+                different PRNG keys.
+            likelihood_scale: Multiplier on the negative log-likelihood
+                term in the per-step logdensity.  Default ``1.0``.  The
+                canonical Gaussian-noise log-likelihood is a *sum* over
+                data points; jno's ``residual.mse`` returns a *mean*.
+                Pass ``N_obs`` (the data-point count) — or
+                ``N_obs / sigma**2`` more generally — to recover the
+                correct posterior magnitude.  Without this, MCMC chains
+                on multi-thousand-point PINN losses move much more
+                slowly than they should and VI is often stuck near the
+                prior.
+            **kernel_kwargs: Forwarded to ``kernel_factory``.  ``step_size``
+                is optional for HMC-family kernels (NUTS / HMC) when
+                ``adapt=True`` and ``warmup > 0`` — window adaptation
+                picks one.  **Required** for ``adapt=False``, MALA, and
+                SG-MCMC.  May include e.g. ``inverse_mass_matrix=``
+                (NUTS/HMC), ``num_integration_steps=`` (HMC/SGHMC).
+
+        Returns:
+            self, for chaining.
+        """
+        if int(num_chains) < 1:
+            raise ValueError(f"num_chains must be >= 1, got {num_chains}.")
+        if float(likelihood_scale) <= 0.0:
+            raise ValueError(f"likelihood_scale must be positive, got {likelihood_scale!r}.")
+        if getattr(self, "_vi_cfg", None) is not None:
+            raise ValueError("Model already has .vi(...) configured; .bayesian() and .vi() are mutually exclusive.")
+        cfg = {
+            "factory": kernel_factory,
+            "kernel_kwargs": dict(kernel_kwargs),
+            "prior": prior,
+            "warmup": int(warmup),
+            "keep": int(keep),
+            "thin": int(thin),
+            "adapt": bool(adapt),
+            "num_chains": int(num_chains),
+            "init_jitter": float(init_jitter),
+            "likelihood_scale": float(likelihood_scale),
+        }
+        if self._mask_scope_pending and self._param_mask is not None:
+            # Masked branch: register this kernel as a per-group backend
+            # on the currently pending ``.mask(M)`` scope.  The remaining
+            # leaves (not covered by any group) use the global optimizer
+            # (if set via a bare ``.optimizer(...)``), or are frozen.
+            group = self._get_or_create_group()
+            if group.get("backend") not in (None, "optax"):
+                raise ValueError(
+                    "Model: this mask scope already has a non-optax backend "
+                    f"({group['backend']!r}).  One backend per mask scope."
+                )
+            group["backend"] = "bayesian"
+            group["bayesian_cfg"] = cfg
+            self._mask_scope_pending = False
+        else:
+            # Global branch — unchanged.
+            self._bayesian_cfg = cfg
+        # `.bayesian()` IS the update — clear any prior `.freeze()` flag so
+        # solve() does not skip this model.
+        self._frozen = False
+        self._trainable_param_mask = None
+        return self
+
+    def vi(
+        self,
+        factory,
+        *,
+        optimizer,
+        num_samples: int = 8,
+        posterior_draws: int = 500,
+        prior=None,
+        likelihood_scale: float = 1.0,
+        init_log_std: float = -3.0,
+        init_mu_at_position: bool = True,
+        **factory_kwargs,
+    ):
+        """Fit a variational approximation to this model's posterior.
+
+        Mirrors :meth:`bayesian` but optimises the **evidence lower bound**
+        (ELBO) of a variational family ``q`` instead of running an MCMC
+        chain.  After :meth:`jno.core.core.solve` returns, ``posterior_draws``
+        i.i.d. samples are drawn from the fitted ``q`` and stored on the
+        model as :attr:`posterior_samples` — same ``(1, N, *param)`` layout
+        as the MCMC path, so all downstream code (:func:`crux.eval` with
+        ``samples="auto"``, :func:`jno.bayesian.rhat`, wandb stats) keeps
+        working transparently.
+
+        Example — mean-field VI on a scalar PDE coefficient::
+
+            import blackjax, optax
+            a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+            a.vi(
+                blackjax.meanfield_vi,
+                optimizer=optax.adam(1e-3),
+                num_samples=8,
+                posterior_draws=500,
+            )
+            crux = jno.core([residual.mse], domain)
+            crux.solve(2000)            # 2000 ELBO optimisation steps
+            chain = a.posterior_samples  # (1, 500, 1) — draws from fitted q
+
+        References:
+            * Kucukelbir, A., Tran, D., Ranganath, R., Gelman, A., & Blei,
+              D. M. (2017).  *Automatic Differentiation Variational
+              Inference.*  JMLR 18(1), 430–474.
+            * Hoffman, M. D., Blei, D. M., Wang, C., & Paisley, J. (2013).
+              *Stochastic Variational Inference.*  JMLR 14(1), 1303–1347.
+
+        Args:
+            factory: A blackjax VI factory, e.g. :func:`blackjax.meanfield_vi`.
+                Detected via signature (first arg ``logdensity_fn``, second
+                ``optimizer``).
+            optimizer: An optax ``GradientTransformation`` used to
+                optimise the ELBO.  Common choice: ``optax.adam(1e-3)``.
+            num_samples: Monte-Carlo sample count used to estimate the ELBO
+                at each step.  Higher = lower-variance gradient, slower
+                step.  Default 8.
+            posterior_draws: After solve(), draw this many i.i.d. samples
+                from the fitted variational distribution and store them on
+                :attr:`posterior_samples`.  Default 500.
+            prior: Optional ``pytree -> float`` log-prior.  Default: the
+                same wide isotropic Gaussian (σ=10) used by
+                :meth:`bayesian`.
+            likelihood_scale: Multiplier on the negative log-likelihood
+                term in the ELBO.  Default ``1.0``.  The canonical
+                Gaussian-noise log-likelihood is a *sum* over data
+                points; jno's ``residual.mse`` returns a *mean*.  For
+                mean-field VI in particular, pass ``N_obs`` (or
+                ``N_obs / sigma**2``) so the likelihood actually pulls
+                the variational mean away from the prior.  Without
+                this, VI is often stuck near its initialisation
+                because the prior dominates by a factor of
+                ``N_obs``.
+            init_log_std: Initial value for ``state.rho`` (log-std of the
+                variational ``q``) on every weight.  Default ``-3.0``
+                (σ ≈ 0.05) — keeps the initial MC ELBO sample tight so
+                gradients are low-variance from the start; the
+                optimiser then grows rho where the posterior is wide.
+                Pass ``0.0`` (σ ≈ 1.0) to restore blackjax's default
+                broad init.
+            init_mu_at_position: When ``True`` (default), initialise
+                ``state.mu`` at the user-supplied position (matches
+                numpyro's autoguide).  ``False`` keeps blackjax's
+                zero start — only useful on toy problems where the
+                MAP is exactly zero.
+            **factory_kwargs: Forwarded to ``factory``.  E.g. an explicit
+                ``objective=blackjax.vi.meanfield_vi.RenyiAlpha(alpha=0.5)``
+                or ``stl_estimator=False``.
+
+        Returns:
+            self, for chaining.
+        """
+        if getattr(self, "_bayesian_cfg", None) is not None:
+            raise ValueError("Model already has .bayesian(...) configured; .bayesian() and .vi() are mutually exclusive.")
+        if int(num_samples) < 1:
+            raise ValueError(f"num_samples must be >= 1, got {num_samples}.")
+        if int(posterior_draws) < 1:
+            raise ValueError(f"posterior_draws must be >= 1, got {posterior_draws}.")
+        if float(likelihood_scale) <= 0.0:
+            raise ValueError(f"likelihood_scale must be positive, got {likelihood_scale!r}.")
+        cfg = {
+            "factory": factory,
+            "optimizer": optimizer,
+            "num_samples": int(num_samples),
+            "posterior_draws": int(posterior_draws),
+            "prior": prior,
+            "factory_kwargs": dict(factory_kwargs),
+            "likelihood_scale": float(likelihood_scale),
+            "init_log_std": float(init_log_std),
+            "init_mu_at_position": bool(init_mu_at_position),
+        }
+        if self._mask_scope_pending and self._param_mask is not None:
+            # Masked branch — register VI as a per-group backend on the
+            # currently pending ``.mask(M)`` scope.  Mirror of the
+            # masked branch in ``Model.bayesian(...)``.
+            group = self._get_or_create_group()
+            if group.get("backend") not in (None, "optax"):
+                raise ValueError(
+                    "Model: this mask scope already has a non-optax backend "
+                    f"({group['backend']!r}).  One backend per mask scope."
+                )
+            group["backend"] = "vi"
+            group["vi_cfg"] = cfg
+            self._mask_scope_pending = False
+        else:
+            # Global branch — unchanged.
+            self._vi_cfg = cfg
+        # .vi() IS the update — clear freeze.
+        self._frozen = False
+        self._trainable_param_mask = None
+        return self
+
     def lr(self, lr):
         """Attach an LR schedule to this model.
 
@@ -1513,6 +1847,22 @@ class Model(Placeholder):
         self._initialize_mask = None
         self._initializer_fn = None
         self._initializer_key = None
+
+        # Phase 12 — logdensity-aware initializer.  Detected via the
+        # class-level ``requires_logdensity = True`` marker so the existing
+        # stateless ``(shape, dtype, key) -> array`` callable path is
+        # unaffected (those callables don't carry the attribute).
+        if getattr(weights, "requires_logdensity", False):
+            self._bayesian_initializer = weights
+            self._bayesian_initializer_key = key
+            self.weight_path = None
+            self._weight_tree = None
+            return self
+
+        # Other branches reset the logdensity-aware slot so .initialize()
+        # is last-write-wins regardless of which path was previously set.
+        self._bayesian_initializer = None
+        self._bayesian_initializer_key = None
 
         if isinstance(weights, (str, Path)):
             self.weight_path = str(weights)
@@ -1618,7 +1968,14 @@ class Model(Placeholder):
         self._weight_tree = None
         self._initialize_mask = None
         self._initializer_fn = None
+        self._bayesian_initializer = None
+        self._bayesian_initializer_key = None
         self._merge_lora_flag = False
+        # ``_posterior_samples_pytree`` and ``_posterior_diagnostics``
+        # are populated by solve() — clearing them here ensures a stale
+        # chain from a prior run doesn't bleed into the next.
+        self._posterior_samples_pytree = None
+        self._posterior_diagnostics = None
         return self
 
     def to_iree(
@@ -1720,6 +2077,41 @@ class ModelCall(Placeholder):
     def optimizer(self, opt_fn, *, lr=None):
         self.model.optimizer(opt_fn, lr=lr)
         return self
+
+    def bayesian(self, kernel_factory, *, prior=None, warmup=500, keep=1000, thin=1, adapt=True, **kernel_kwargs):
+        """Proxy for :meth:`Model.bayesian`."""
+        self.model.bayesian(
+            kernel_factory,
+            prior=prior,
+            warmup=warmup,
+            keep=keep,
+            thin=thin,
+            adapt=adapt,
+            **kernel_kwargs,
+        )
+        return self
+
+    def vi(self, factory, *, optimizer, num_samples=8, posterior_draws=500, prior=None, **factory_kwargs):
+        """Proxy for :meth:`Model.vi`."""
+        self.model.vi(
+            factory,
+            optimizer=optimizer,
+            num_samples=num_samples,
+            posterior_draws=posterior_draws,
+            prior=prior,
+            **factory_kwargs,
+        )
+        return self
+
+    @property
+    def posterior_samples(self):
+        """Shortcut to the underlying :attr:`Model.posterior_samples`."""
+        return self.model.posterior_samples
+
+    @property
+    def posterior_diagnostics(self):
+        """Shortcut to the underlying :attr:`Model.posterior_diagnostics`."""
+        return self.model.posterior_diagnostics
 
     def initialize(self, weights, *, key=None):
         self.model.initialize(weights, key=key)

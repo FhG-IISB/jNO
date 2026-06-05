@@ -92,6 +92,7 @@ nav:
     - Evaluation & Debugging:
       - Evaluation: training/evaluation.md
       - Explainability: training/explainability.md
+    - Bayesian Sampling: training/bayesian.md
     - Model Controls:
       - Overview: model-controls/index.md
       - Mask & Freeze: model-controls/mask-freeze.md
@@ -141,3 +142,19 @@ nav:
       - Diffusion-Reaction Robin BC: tutorials/08-fem-and-varpinns/diffusion-reaction-robin-bc.md
       - Helmholtz Mixed BC FEM VarPINN: tutorials/08-fem-and-varpinns/helmholtz-mixed-bc-fem-varpinn.md
       - Helmholtz 3D: tutorials/08-fem-and-varpinns/helmholtz-3d.md
+    - 10 Bayesian PINNs:
+      - Overview: tutorials/10-bayesian-pinns/index.md
+      - Forward Noisy Poisson 1D: tutorials/10-bayesian-pinns/forward-noisy-poisson-1d.md
+      - Inverse Multi-Coefficient: tutorials/10-bayesian-pinns/inverse-multi-coefficient.md
+      - Inverse Reaction Coefficient: tutorials/10-bayesian-pinns/inverse-reaction-coefficient.md
+      - Inverse ODE Decay: tutorials/10-bayesian-pinns/inverse-ode-decay.md
+      - Inverse Surrogate w/ Uncertainty: tutorials/10-bayesian-pinns/inverse-surrogate-uncertainty.md
+      - Inverse FEM Diffusivity: tutorials/10-bayesian-pinns/inverse-fem-diffusivity.md
+      - BNN Regression: tutorials/10-bayesian-pinns/bnn-regression.md
+      - Multi-chain NUTS: tutorials/10-bayesian-pinns/multichain-nuts.md
+      - VI BNN Regression: tutorials/10-bayesian-pinns/vi-bnn-regression.md
+      - Masked BNN Head: tutorials/10-bayesian-pinns/masked-bnn-head.md
+      - Pathfinder Warm-Start: tutorials/10-bayesian-pinns/pathfinder-init.md
+      - Laplace Warm-Start: tutorials/10-bayesian-pinns/laplace-init.md
+      - SVGD Warm-Start: tutorials/10-bayesian-pinns/svgd-init.md
+      - Pattern B BNN Head: tutorials/10-bayesian-pinns/pattern-b-bnn-head.md
