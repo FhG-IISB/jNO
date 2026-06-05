@@ -283,6 +283,134 @@ class TestNoBayesianBitIdentical:
 # ---------------------------------------------------------------------------
 
 
+class TestPriorsNamespace:
+    """``jno.bayesian.priors.{gaussian, laplace, student_t,
+    layerwise_gaussian}`` — each factory returns a callable
+    ``pytree -> scalar`` that obeys the ``prior=`` contract on
+    :meth:`Model.bayesian` / :meth:`Model.vi`.  Tests cover the
+    mathematical form (compare numerical output to a hand-coded
+    reference) and the fan-in-aware scaling for weight tensors.
+    """
+
+    def test_gaussian_matches_hand_coded(self):
+        prior = jno.bayesian.priors.gaussian(sigma=2.0)
+        # A small pytree of two floating leaves.
+        p = {"w": jnp.array([1.0, -1.0, 2.0]), "b": jnp.array([0.5])}
+        # Hand: -0.5 * (1 + 1 + 4 + 0.25) / 4 = -6.25 / 8.
+        expected = -0.5 * (1.0 + 1.0 + 4.0 + 0.25) / (2.0 * 2.0)
+        assert float(prior(p)) == pytest.approx(expected, rel=1e-5)
+
+    def test_gaussian_fan_in_aware_uses_prod_of_trailing_dims(self):
+        # A (3, 4) weight tensor has fan_in=4 → σ scaled by sqrt(4)=2.
+        # Bias (4,) has ndim<2 → unscaled.
+        prior = jno.bayesian.priors.gaussian(sigma=1.0, fan_in_aware=True)
+        W = jnp.ones((3, 4))  # ‖W‖² = 12
+        b = jnp.ones((4,))  # ‖b‖² = 4
+        # log p = -0.5 * (‖W‖² * fan_in_W + ‖b‖²) / σ²
+        #       = -0.5 * (12 * 4 + 4) / 1 = -26.
+        assert float(prior({"W": W, "b": b})) == pytest.approx(-26.0, rel=1e-5)
+
+    def test_gaussian_rejects_non_positive_sigma(self):
+        with pytest.raises(ValueError, match="sigma must be > 0"):
+            jno.bayesian.priors.gaussian(sigma=0.0)
+        with pytest.raises(ValueError, match="sigma must be > 0"):
+            jno.bayesian.priors.gaussian(sigma=-1.0)
+
+    def test_laplace_matches_hand_coded(self):
+        prior = jno.bayesian.priors.laplace(scale=2.0)
+        p = {"w": jnp.array([1.0, -1.0, 3.0])}
+        # log p = -(1 + 1 + 3) / 2 = -2.5
+        assert float(prior(p)) == pytest.approx(-2.5, rel=1e-5)
+
+    def test_laplace_rejects_non_positive_scale(self):
+        with pytest.raises(ValueError, match="scale must be > 0"):
+            jno.bayesian.priors.laplace(scale=0.0)
+
+    def test_student_t_heavier_tails_than_gaussian(self):
+        # At the same scale, student-t assigns higher log-prob to a
+        # large-magnitude weight than Gaussian does.  Quick sanity check.
+        gauss = jno.bayesian.priors.gaussian(sigma=1.0)
+        st = jno.bayesian.priors.student_t(df=3.0, scale=1.0)
+        big = {"w": jnp.array([5.0])}
+        # Gaussian: -0.5 * 25 = -12.5
+        # Student-t (df=3): -2 * log(1 + 25/3) = -2 * log(28/3) ≈ -4.46
+        # student_t > gaussian at large |θ| — heavier tails.
+        assert float(st(big)) > float(gauss(big))
+
+    def test_student_t_rejects_df_below_two(self):
+        with pytest.raises(ValueError, match="df must be > 2"):
+            jno.bayesian.priors.student_t(df=2.0, scale=1.0)
+        with pytest.raises(ValueError, match="df must be > 2"):
+            jno.bayesian.priors.student_t(df=1.5, scale=1.0)
+
+    def test_layerwise_gaussian_default_is_fan_in_aware(self):
+        # Default: fan_in_aware=True, base_sigma=1, default_sigma=1.
+        # Weight (2, 3): fan_in=3 → σ = 1/sqrt(3) → log-prob includes
+        # ‖W‖² * 3.
+        # Bias (3,): σ = 1.
+        prior = jno.bayesian.priors.layerwise_gaussian()
+        W = jnp.ones((2, 3))  # ‖W‖² = 6
+        b = jnp.ones((3,))  # ‖b‖² = 3
+        # log p = -0.5 * (6 * 3 + 3) = -10.5
+        assert float(prior({"W": W, "b": b})) == pytest.approx(-10.5, rel=1e-5)
+
+    def test_layerwise_gaussian_can_disable_fan_in_awareness(self):
+        prior = jno.bayesian.priors.layerwise_gaussian(fan_in_aware=False)
+        W = jnp.ones((2, 3))
+        b = jnp.ones((3,))
+        # log p = -0.5 * (6 + 3) = -4.5
+        assert float(prior({"W": W, "b": b})) == pytest.approx(-4.5, rel=1e-5)
+
+    def test_priors_compose_with_bayesian_solve(self):
+        # End-to-end smoke: pass priors.gaussian into Model.bayesian and
+        # check the chain runs without error.
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 1.0 * jno.np.sin(π * x)
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.bayesian(
+            blackjax.nuts,
+            step_size=1e-2,
+            inverse_mass_matrix=jnp.ones(1),
+            prior=jno.bayesian.priors.gaussian(sigma=0.5),
+            warmup=5,
+            keep=10,
+            adapt=False,
+        )
+        residual = a * jno.np.sin(π * x) - target
+        jno.core([residual.mse], dom).solve(15)
+        assert a.posterior_samples is not None
+        assert a.posterior_samples.shape == (1, 10, 1)
+
+    def test_priors_compose_with_vi_solve(self):
+        # Same end-to-end smoke for VI.
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 1.0 * jno.np.sin(π * x)
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.vi(
+            blackjax.meanfield_vi,
+            optimizer=optax.adam(1e-2),
+            prior=jno.bayesian.priors.laplace(scale=1.0),
+            num_samples=4,
+            posterior_draws=20,
+        )
+        residual = a * jno.np.sin(π * x) - target
+        jno.core([residual.mse], dom).solve(20)
+        assert a.posterior_samples.shape == (1, 20, 1)
+
+    def test_priors_skip_integer_leaves(self):
+        # A pytree with an int array leaf (e.g. a mask / index) must not
+        # contribute to the log-prob.  Verifies the _floating_leaves
+        # filter inside each factory.
+        prior = jno.bayesian.priors.gaussian(sigma=1.0)
+        p = {"w": jnp.array([1.0, 2.0]), "idx": jnp.array([0, 1, 2], dtype=jnp.int32)}
+        # Only the floats contribute: -0.5 * (1 + 4) = -2.5
+        assert float(prior(p)) == pytest.approx(-2.5, rel=1e-5)
+
+
 class TestCustomPrior:
     def test_custom_prior_is_called(self):
         π = jno.np.pi
