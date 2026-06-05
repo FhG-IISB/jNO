@@ -2177,6 +2177,37 @@ class core:
                     f"{len(_non_optax_groups)} Bayesian-group(s) + default — "
                     f"per-group optimizers (Pattern B = {_pattern_b})"
                 )
+
+                # Pattern B + K>1: warn loudly that the body's optax
+                # update is computed against chain 0's head, not the
+                # full K-chain ensemble.  All K chains do explore the
+                # head's posterior — the simplification is that the
+                # body only sees one of them at a time (SAEM-style).
+                # This is correct for SAEM-style joint inference but
+                # is NOT the same as running K independent
+                # head+body solves.  Documented in
+                # docs/training/bayesian.md (Pattern B section); the
+                # warning here makes the trade-off visible at
+                # solve-start so users can decide whether it matches
+                # their inference goal.
+                if _pattern_b:
+                    _multi_chain_groups = [
+                        g
+                        for g in _non_optax_groups
+                        if g["backend"] == "bayesian" and int(g.get("bayesian_cfg", {}).get("num_chains", 1)) > 1
+                    ]
+                    if _multi_chain_groups:
+                        _Ks = ", ".join(str(int(g["bayesian_cfg"]["num_chains"])) for g in _multi_chain_groups)
+                        self.log.warning(
+                            f"Model {lid}: Pattern B + num_chains>1 detected (K={_Ks}). "
+                            f"The body's optax gradient is computed against the chain-0 "
+                            f"head representative — the other K-1 chains explore the head's "
+                            f"posterior but DO NOT influence the body update (SAEM-style "
+                            f"simplification, mirroring Pattern D). This is correct for "
+                            f"joint head+body posterior inference; it is NOT equivalent to "
+                            f"K independent head+body solves. Pass num_chains=1 if you want "
+                            f"the latter, or accept this trade-off."
+                        )
             else:
                 # ── Single global optimizer (original behaviour) ──
                 opt_fn = fm._opt_fn

@@ -3281,7 +3281,34 @@ class TestPatternB:
         head_var = float(jnp.mean(jnp.var(leaves[masked_idx], axis=1)))
         assert head_var > 1e-8
 
-    # ─── 6. Composite-key contract (Phase 16 refactor) ──────────────
+    # ─── 6. SAEM warning fires for K>1 ──────────────────────────────
+
+    def test_pattern_b_k1_no_saem_warning(self, capsys):
+        # K=1 Pattern B is not subject to the chain-0 simplification.
+        # The warning line must NOT fire.
+        dom, net, residual = self._build_problem(hidden=4)
+        mask, _ = _build_last_leaf_mask(net)
+        net.optimizer(optax.adam(1e-2))
+        net.mask(mask).bayesian(blackjax.sgld, step_size=1e-3, warmup=2, keep=3, num_chains=1)
+        jno.core([residual.mse], dom).solve(5)
+        out = capsys.readouterr().out
+        assert "Pattern B + num_chains>1" not in out
+
+    def test_pattern_b_k4_emits_saem_warning(self, capsys):
+        # K>1 Pattern B: warn that the body's optax update is computed
+        # against chain 0 only.  Loud at solve-start so users can see
+        # the trade-off without reading the docs.
+        dom, net, residual = self._build_problem(hidden=4)
+        mask, _ = _build_last_leaf_mask(net)
+        net.optimizer(optax.adam(1e-2))
+        net.mask(mask).bayesian(blackjax.sgld, step_size=1e-3, warmup=2, keep=3, num_chains=4)
+        jno.core([residual.mse], dom).solve(5)
+        out = capsys.readouterr().out
+        assert "Pattern B + num_chains>1" in out
+        assert "K=4" in out
+        assert "chain-0" in out
+
+    # ─── 7. Composite-key contract (Phase 16 refactor) ──────────────
 
     def test_pattern_b_composite_keys_layout(self):
         """Phase 16: Pattern B's two states live under distinct composite
