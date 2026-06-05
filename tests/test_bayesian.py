@@ -1486,6 +1486,108 @@ class TestVIMeanField:
         assert a.posterior_samples.shape == (1, 50, 1)
         assert b.posterior_samples.shape == (1, 50, 1)
 
+    def test_init_log_std_defaults_to_minus_three(self):
+        # Default init_log_std=-3 → state.rho starts at -3.0 everywhere.
+        # Spy on init_state to capture the post-init state.
+        import importlib
+
+        bay_mod = importlib.import_module("jno.bayesian")
+        captured = {}
+        orig_init = bay_mod.init_state
+
+        def _spy(handle, position, rng_key=None):
+            state = orig_init(handle, position, rng_key=rng_key)
+            if handle.kind == "vi":
+                captured["rho"] = state.rho
+                captured["mu"] = state.mu
+            return state
+
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.vi(blackjax.meanfield_vi, optimizer=optax.adam(1e-3), num_samples=4, posterior_draws=10)
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        residual = a * jno.np.sin(π * x) - jno.np.sin(π * x)
+        # Patch init_state on the module the solve loop imports.
+        bay_mod.init_state = _spy
+        try:
+            jno.core([residual.mse], dom).solve(2)
+        finally:
+            bay_mod.init_state = orig_init
+        assert "rho" in captured
+        # rho is a pytree of arrays, all -3.0.
+        for leaf in jax.tree_util.tree_leaves(captured["rho"]):
+            assert jnp.allclose(leaf, -3.0)
+
+    def test_init_log_std_custom_value_respected(self):
+        import importlib
+
+        bay_mod = importlib.import_module("jno.bayesian")
+        captured = {}
+        orig_init = bay_mod.init_state
+
+        def _spy(handle, position, rng_key=None):
+            state = orig_init(handle, position, rng_key=rng_key)
+            if handle.kind == "vi":
+                captured["rho"] = state.rho
+            return state
+
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.vi(
+            blackjax.meanfield_vi,
+            optimizer=optax.adam(1e-3),
+            num_samples=4,
+            posterior_draws=10,
+            init_log_std=0.0,  # σ ≈ 1.0
+        )
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        residual = a * jno.np.sin(π * x) - jno.np.sin(π * x)
+        bay_mod.init_state = _spy
+        try:
+            jno.core([residual.mse], dom).solve(2)
+        finally:
+            bay_mod.init_state = orig_init
+        for leaf in jax.tree_util.tree_leaves(captured["rho"]):
+            assert jnp.allclose(leaf, 0.0)
+
+    def test_init_mu_at_position_false_keeps_blackjax_default(self):
+        # When init_mu_at_position=False, state.mu stays at blackjax's
+        # default (zeros).  Spy and check.
+        import importlib
+
+        bay_mod = importlib.import_module("jno.bayesian")
+        captured = {}
+        orig_init = bay_mod.init_state
+
+        def _spy(handle, position, rng_key=None):
+            state = orig_init(handle, position, rng_key=rng_key)
+            if handle.kind == "vi":
+                captured["mu"] = state.mu
+            return state
+
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.vi(
+            blackjax.meanfield_vi,
+            optimizer=optax.adam(1e-3),
+            num_samples=4,
+            posterior_draws=10,
+            init_mu_at_position=False,
+        )
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        residual = a * jno.np.sin(π * x) - jno.np.sin(π * x)
+        bay_mod.init_state = _spy
+        try:
+            jno.core([residual.mse], dom).solve(2)
+        finally:
+            bay_mod.init_state = orig_init
+        # blackjax default = zeros for every mu leaf.
+        for leaf in jax.tree_util.tree_leaves(captured["mu"]):
+            assert jnp.allclose(leaf, 0.0)
+
     def test_elbo_loss_decreases(self):
         # Trivially: after enough VI steps the loss / negative log
         # density should have decreased from the start.  Run two short
