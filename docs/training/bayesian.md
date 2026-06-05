@@ -557,6 +557,16 @@ A worked example lives at
   MCMC-sampled.  **K=1 and K>1 both supported**: for K>1 the body's
   gradient is computed at the chain-0 representative head (SAEM
   simplification).  Tutorial: [T14](../tutorials/10-bayesian-pinns/pattern-b-bnn-head.md).
+
+  !!! warning "Pattern B + K>1 — SAEM chain-0 representative"
+      When ``num_chains>1`` with Pattern B, only one of the K head
+      chains influences the body's optax update each step (chain 0).
+      All K chains still explore the head's posterior, but the body
+      sees a single representative — equivalent to SAEM-style joint
+      inference, **not** K independent head+body solves.  jno emits a
+      one-line ``WARNING`` at solve-start naming the trade-off so it
+      is visible without reading the docs.  Pass ``num_chains=1`` if
+      you want independent head+body runs (one solve per chain).
 * **Pattern D** *(Phase 16)*: multiple disjoint `.mask().bayesian()`
   groups on the same model.  Each group's kernel state lives at its
   own composite key (`"<lid>.<group_idx>"`) in `opt_states`; the step
