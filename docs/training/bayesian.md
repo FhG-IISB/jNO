@@ -331,8 +331,7 @@ Two pure-JAX helpers on `jno.bayesian` operate directly on the
 | `jno.bayesian.ess(chain)` | Effective sample size via FFT-based autocorrelation + Geyer 1992 truncation | > 100 per parameter typically sufficient |
 
 Both return arrays of shape `*param`, one diagnostic per parameter
-component.  For `K=1` `rhat` falls back to a split-R-hat using the two
-halves of the chain (Gelman et al. 2014 BDA3 §11.4).
+component.
 
 Example:
 
@@ -342,6 +341,22 @@ r = jno.bayesian.rhat(chain)             # → (1,)
 e = jno.bayesian.ess(chain)              # → (1,)
 print(f"A: R-hat = {float(r[0]):.4f}, ESS = {float(e[0]):.1f}")
 ```
+
+### `rhat` strategies — when K=1 falls back silently
+
+`rhat(chain, strategy=...)` controls what happens for single-chain
+input.  Three values:
+
+| `strategy` | K==1 behaviour | K>=2 behaviour |
+|---|---|---|
+| `"auto"` (default) | Split-R-hat on the two halves (Gelman et al. 2014 BDA3 §11.4) | Multichain R-hat |
+| `"multichain"` | Raises `ValueError` — loud failure when you expected multiple chains | Multichain R-hat |
+| `"split"` | Split-R-hat on the two halves | Split every chain in half → 2K chains, then multichain R-hat (extra stationarity check) |
+
+Use `"multichain"` when you've explicitly configured `num_chains>=2`
+and want a hard failure if the chain layout doesn't carry them
+(catches bugs where you thought you had 4 chains but `posterior_samples`
+came back as `(1, N, *param)`).
 
 See [Tutorial 08](../tutorials/10-bayesian-pinns/multichain-nuts.md)
 for a worked end-to-end example.
@@ -467,17 +482,29 @@ draws — see caveat below).
 | Multi-modal | Multi-chain reveals modes | Captures one mode |
 | ``posterior_samples`` shape | `(K, N, *param)` from collected chain | `(1, posterior_draws, *param)` drawn from fitted q |
 
-Two manual overrides on blackjax's defaults at `init_state` time make
-VI converge usefully on non-trivial models:
+Two overrides on blackjax's defaults at `init_state` time make VI
+converge usefully on non-trivial models.  Both are exposed as
+kwargs on `Model.vi(...)`:
 
-* ``state.mu = position`` (the model's initial weights), rather than
-  blackjax's zeros — gives VI a sensible starting point on
-  non-trivial architectures (numpyro autoguide convention).
-* ``state.rho = -3.0`` everywhere (initial std ≈ 0.05), rather than
-  blackjax's wider default — keeps the initial MC ELBO sample close
-  to the mean so the gradient estimator is low-variance from the
-  start.  The optimiser then *grows* rho where the posterior is
-  genuinely wide.
+* `init_mu_at_position=True` (default) — `state.mu` starts at the
+  model's initial weights instead of blackjax's zeros.  Matches the
+  numpyro autoguide convention; pass `False` to restore blackjax's
+  zero start.
+* `init_log_std=-3.0` (default → σ ≈ 0.05) — `state.rho` starts
+  small everywhere instead of blackjax's broader init (σ ≈ 1).
+  Keeps the initial MC ELBO sample close to the mean so the gradient
+  estimator is low-variance from the start.  The optimiser then
+  *grows* rho where the posterior is genuinely wide.  Pass
+  `init_log_std=0.0` (σ ≈ 1) to restore blackjax's default.
+
+```python
+a.vi(
+    blackjax.meanfield_vi,
+    optimizer=optax.adam(1e-3),
+    init_log_std=-3.0,       # tight initial q
+    init_mu_at_position=True, # mu = current weights
+)
+```
 
 !!! tip "Likelihood scaling for VI — `likelihood_scale=`"
     The canonical Gaussian-noise log-likelihood is a **sum** over data
