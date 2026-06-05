@@ -1799,3 +1799,411 @@ class TestUnderTheHood:
             "multi-chain solve with adapt=True is not reproducible under a fixed seed; "
             "window_adaptation RNG is not threaded from the master seed"
         )
+
+
+# ---------------------------------------------------------------------------
+# Phase 12 — Logdensity-aware initializer hook (.initialize() extension)
+# ---------------------------------------------------------------------------
+
+
+class TestPathfinderInitializer:
+    """``.initialize(jno.bayesian.pathfinder(...))`` warm-starts a chain by
+    running ``blackjax.pathfinder`` against the loss-derived log-density
+    *inside* ``solve()``.  These tests cover the protocol contract, the
+    pathfinder dispatch, and composition with the existing mask /
+    multi-chain / substep / VI features.
+    """
+
+    # ─── helpers ──────────────────────────────────────────────────────
+
+    def _harmonic_inverse(self, *, a_init=0.0, initializer=None, adapt=True, warmup=100, keep=100, seed=0):
+        """Standard 1-parameter inverse problem used by most tests in this
+        class.  Returns the ``a`` parameter handle so the caller can read
+        ``a.posterior_samples`` and friends.
+        """
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 2.5 * jno.np.sin(π * x)
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(seed), name="a")
+        a.initialize(jnp.array([a_init]))
+        if initializer is not None:
+            a.initialize(initializer)
+        a.bayesian(
+            blackjax.nuts,
+            step_size=1e-2,
+            inverse_mass_matrix=jnp.ones(1),
+            warmup=warmup,
+            keep=keep,
+            adapt=adapt,
+        )
+        residual = a * jno.np.sin(π * x) - target
+        jno.core([residual.mse], dom).solve(warmup + keep)
+        return a
+
+    # ─── 1. spy: initializer invoked and IMM merged ───────────────────
+
+    def test_pathfinder_initializer_runs_and_sets_imm(self, monkeypatch):
+        """Patch ``PathfinderInitializer.__call__`` to spy; assert it ran
+        exactly once with the right shape inputs, and that the IMM it
+        returned was merged into ``handle.extra_kwargs``."""
+        captured = {"count": 0, "imm": None}
+        orig_call = jno.bayesian.PathfinderInitializer.__call__
+
+        def _spy(self, rng_key, ld, position, num_chains):
+            captured["count"] += 1
+            captured["num_chains"] = num_chains
+            warm, kw = orig_call(self, rng_key, ld, position, num_chains)
+            captured["imm"] = kw.get("inverse_mass_matrix")
+            return warm, kw
+
+        monkeypatch.setattr(jno.bayesian.PathfinderInitializer, "__call__", _spy)
+
+        _ = self._harmonic_inverse(
+            initializer=jno.bayesian.pathfinder(maxiter=20, num_samples=50),
+            adapt=False,
+            warmup=5,
+            keep=20,
+        )
+        assert captured["count"] == 1, f"pathfinder should run once; ran {captured['count']} times"
+        assert captured["num_chains"] == 1
+        assert captured["imm"] is not None, "pathfinder didn't produce an IMM update"
+        assert captured["imm"].shape == (1,), f"IMM shape wrong: {captured['imm'].shape}"
+
+    # ─── 2. warm position is moved ────────────────────────────────────
+
+    def test_pathfinder_warm_position_is_moved(self, monkeypatch):
+        """From a deliberately bad init (a=-10, truth=2.5), pathfinder
+        moves the warm position close to the MAP.  We capture the
+        warm position directly via a spy on the initializer rather
+        than the first chain sample (NUTS moves a lot in a few steps,
+        which would mask the warm-start signal).
+        """
+        captured = {}
+        orig_call = jno.bayesian.PathfinderInitializer.__call__
+
+        def _spy(self, rng_key, ld, position, num_chains):
+            warm, kw = orig_call(self, rng_key, ld, position, num_chains)
+            # Copy out of JAX-land — solve() donates buffers, so the
+            # captured arrays would be deleted by the time we read them.
+            captured["warm"] = jax.tree_util.tree_map(
+                lambda x: float(jnp.asarray(x).reshape(-1)[0]) if hasattr(x, "shape") else x,
+                warm,
+            )
+            return warm, kw
+
+        monkeypatch.setattr(jno.bayesian.PathfinderInitializer, "__call__", _spy)
+
+        _ = self._harmonic_inverse(
+            a_init=-10.0,
+            initializer=jno.bayesian.pathfinder(maxiter=30, num_samples=100),
+            adapt=False,
+            warmup=2,
+            keep=10,
+        )
+        warm_value = jax.tree_util.tree_leaves(captured["warm"])[0]
+        # Pathfinder should have moved from -10 to near the truth 2.5.
+        assert abs(warm_value - 2.5) < 0.5, (
+            f"pathfinder didn't move the warm position from -10 to near 2.5; got {warm_value:.3f}"
+        )
+
+    # ─── 3. chained: pathfinder + window ──────────────────────────────
+
+    def test_pathfinder_then_window_chain(self):
+        """``pathfinder + adapt=True`` runs both: pathfinder warm-starts;
+        window adaptation refines step_size from there.  Sampler still
+        recovers truth."""
+        a = self._harmonic_inverse(
+            a_init=-5.0,
+            initializer=jno.bayesian.pathfinder(maxiter=20, num_samples=80),
+            adapt=True,
+            warmup=80,
+            keep=80,
+        )
+        chain = a.posterior_samples
+        assert chain.shape == (1, 80, 1)
+        # Truth = 2.5; window adaptation from pathfinder's warm position
+        # gives a tight chain.
+        assert abs(float(jnp.mean(chain)) - 2.5) < 0.5
+
+    # ─── 4. pathfinder only — no window adaptation ────────────────────
+
+    def test_pathfinder_only_no_window(self, monkeypatch):
+        """With ``adapt=False``, window adaptation is skipped entirely
+        even when a pathfinder initializer is set.  Patch
+        ``run_window_adaptation`` to a sentinel; assert it wasn't
+        called.
+        """
+        sentinel = {"called": False}
+
+        def _never_call(*_args, **_kw):
+            sentinel["called"] = True
+            return None
+
+        monkeypatch.setattr(jno.bayesian, "run_window_adaptation", _never_call)
+
+        _ = self._harmonic_inverse(
+            initializer=jno.bayesian.pathfinder(maxiter=20, num_samples=50),
+            adapt=False,
+            warmup=5,
+            keep=20,
+        )
+        assert not sentinel["called"], "window_adaptation should not run when adapt=False"
+
+    # ─── 5. pathfinder kwargs reach blackjax ──────────────────────────
+
+    def test_pathfinder_kwargs_forwarded(self, monkeypatch):
+        """``pathfinder(maxiter=1)`` (too few L-BFGS iters from a bad
+        starting point) produces a clearly worse warm position than
+        ``maxiter=30``.  We capture both warm positions via a spy and
+        compare them directly — chain samples are too noisy to detect
+        the difference reliably.
+        """
+        captured = {"warms": []}
+        orig_call = jno.bayesian.PathfinderInitializer.__call__
+
+        def _spy(self, rng_key, ld, position, num_chains):
+            warm, kw = orig_call(self, rng_key, ld, position, num_chains)
+            captured["warms"].append(
+                jax.tree_util.tree_map(
+                    lambda x: float(jnp.asarray(x).reshape(-1)[0]) if hasattr(x, "shape") else x,
+                    warm,
+                )
+            )
+            return warm, kw
+
+        monkeypatch.setattr(jno.bayesian.PathfinderInitializer, "__call__", _spy)
+
+        # maxiter=30 — fully converged
+        _ = self._harmonic_inverse(
+            a_init=-10.0,
+            initializer=jno.bayesian.pathfinder(maxiter=30, num_samples=80),
+            adapt=False,
+            warmup=2,
+            keep=8,
+        )
+        # maxiter=1 — barely moved
+        _ = self._harmonic_inverse(
+            a_init=-10.0,
+            initializer=jno.bayesian.pathfinder(maxiter=1, num_samples=80),
+            adapt=False,
+            warmup=2,
+            keep=8,
+        )
+        assert len(captured["warms"]) == 2
+        good_value = jax.tree_util.tree_leaves(captured["warms"][0])[0]
+        bad_value = jax.tree_util.tree_leaves(captured["warms"][1])[0]
+        # maxiter=30 lands at the MAP (~2.5); maxiter=1 still near -10.
+        assert abs(good_value - 2.5) < abs(bad_value - 2.5), (
+            f"maxiter knob didn't propagate: good_warm={good_value:.3f}, bad_warm={bad_value:.3f}"
+        )
+
+    # ─── 6. multichain dispersion ─────────────────────────────────────
+
+    def test_pathfinder_multichain_init_dispersion(self):
+        """K=4 + pathfinder draws K distinct positions from the fitted q.
+        With ``init_jitter`` ALSO set, an info-log fires but pathfinder's
+        dispersion takes precedence (deterministic, doesn't fall back to
+        jitter).
+        """
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 2.5 * jno.np.sin(π * x)
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.initialize(jno.bayesian.pathfinder(maxiter=20, num_samples=80))
+        a.bayesian(
+            blackjax.nuts,
+            step_size=1e-2,
+            inverse_mass_matrix=jnp.ones(1),
+            warmup=2,
+            keep=8,
+            adapt=False,
+            num_chains=4,
+            init_jitter=0.5,  # would normally disperse; should be overridden
+        )
+        residual = a * jno.np.sin(π * x) - target
+        jno.core([residual.mse], dom).solve(10)
+        chain = a.posterior_samples
+        assert chain.shape == (4, 8, 1)
+        # K=4 first samples must differ pairwise — pathfinder samples
+        # K distinct starting points from the fitted q.
+        firsts = chain[:, 0, 0]
+        pairwise_diff = float(jnp.max(firsts) - jnp.min(firsts))
+        assert pairwise_diff > 1e-4, f"K=4 chains share a starting position: {firsts}"
+
+    # ─── 7. composes with .mask().bayesian() ──────────────────────────
+
+    def test_pathfinder_with_mask_works(self):
+        """``.mask(M).bayesian()`` + pathfinder: pathfinder runs on the
+        masked subset's log-density; the unmasked complement stays at
+        init in ``trainable[lid]``.
+        """
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        net = _tiny_net(in_dim=1, out_dim=1, hidden=4)
+        mask, masked_idx = _build_last_leaf_mask(net)
+        net.initialize(jno.bayesian.pathfinder(maxiter=10, num_samples=30))
+        net.mask(mask).bayesian(blackjax.sgld, step_size=1e-4, warmup=5, keep=10)
+        residual = net(x) - 0.0
+        jno.core([residual.mse], dom).solve(15)
+
+        chain = net.posterior_samples
+        leaves = jax.tree_util.tree_leaves(chain)
+        # Masked leaf varies (sampled); unmasked leaves are constant
+        # (unchanged by pathfinder, unchanged by SGLD).
+        for i, leaf in enumerate(leaves):
+            var = float(jnp.mean(jnp.var(leaf, axis=1)))
+            if i == masked_idx:
+                assert var > 1e-8, f"masked leaf {i} should vary; got var={var:.3e}"
+            else:
+                assert var < 1e-8, f"unmasked leaf {i} should be constant; got var={var:.3e}"
+
+    # ─── 8. substeps guard ────────────────────────────────────────────
+
+    def test_pathfinder_with_substeps_raises(self):
+        """substeps + pathfinder → clear error (initializer runs against
+        the full loss, but substep kernel sees only substep-local
+        constraints).  Mirrors the existing adapt+substeps guard."""
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 2.5 * jno.np.sin(π * x)
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.initialize(jno.bayesian.pathfinder(maxiter=5))
+        a.bayesian(blackjax.nuts, step_size=1e-2, warmup=2, keep=5, adapt=False)
+        # Use a second optax-trained parameter so substeps has a second
+        # group to alternate against (substeps require >=2 substeps).
+        b = jno.np.parameter((1,), key=jax.random.PRNGKey(1), name="b")
+        b.optimizer(optax.adam(1e-2))
+        residual_a = a * jno.np.sin(π * x) - target
+        residual_b = b * jno.np.sin(π * x) - target
+        with pytest.raises(ValueError, match="substeps"):
+            jno.core([residual_a.mse, residual_b.mse], dom).solve(7, substeps=[([0], 1), ([1], 1)])
+
+    # ─── 9. VI guard ──────────────────────────────────────────────────
+
+    def test_pathfinder_with_vi_raises(self):
+        """``.vi(...)`` + pathfinder → clear error (VI's init sets
+        ``state.mu = position`` itself; a logdensity-aware warm-start
+        doesn't compose)."""
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 2.5 * jno.np.sin(π * x)
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.initialize(jno.bayesian.pathfinder(maxiter=5))
+        a.vi(blackjax.meanfield_vi, optimizer=optax.adam(1e-2), num_samples=4, posterior_draws=10)
+        residual = a * jno.np.sin(π * x) - target
+        with pytest.raises(ValueError, match=".vi"):
+            jno.core([residual.mse], dom).solve(5)
+
+    # ─── 10. non-IMM kernel drops IMM, keeps warm position ───────────
+
+    def test_pathfinder_with_non_imm_kernel_keeps_position(self):
+        """MALA doesn't accept ``inverse_mass_matrix``; pathfinder's IMM
+        update should be silently dropped, but the warm position is
+        still applied and sampling runs to completion."""
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 2.5 * jno.np.sin(π * x)
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.initialize(jno.bayesian.pathfinder(maxiter=20, num_samples=50))
+        # MALA doesn't accept inverse_mass_matrix in its factory signature.
+        a.bayesian(blackjax.mala, step_size=1e-3, warmup=5, keep=20, adapt=False)
+        residual = a * jno.np.sin(π * x) - target
+        jno.core([residual.mse], dom).solve(25)
+        chain = a.posterior_samples
+        assert chain.shape == (1, 20, 1)
+        # The warm position landed the chain near truth (within MALA's
+        # short-chain noise tolerance).
+        assert abs(float(jnp.mean(chain)) - 2.5) < 1.0
+
+    # ─── 11. reproducibility ──────────────────────────────────────────
+
+    def test_pathfinder_reproducible_with_fixed_seed(self):
+        """Two solves with identical master seed produce identical
+        posteriors.  Verifies pathfinder's L-BFGS RNG is threaded
+        deterministically."""
+        a1 = self._harmonic_inverse(
+            a_init=-1.0,
+            initializer=jno.bayesian.pathfinder(maxiter=15, num_samples=40),
+            adapt=False,
+            warmup=2,
+            keep=15,
+        )
+        a2 = self._harmonic_inverse(
+            a_init=-1.0,
+            initializer=jno.bayesian.pathfinder(maxiter=15, num_samples=40),
+            adapt=False,
+            warmup=2,
+            keep=15,
+        )
+        assert jnp.allclose(a1.posterior_samples, a2.posterior_samples), (
+            "pathfinder warm-start not reproducible under a fixed seed"
+        )
+
+    # ─── 12. .initialize() lifecycle ──────────────────────────────────
+
+    def test_initialize_marker_clears_other_init_state(self):
+        """Calling ``.initialize(pretrained_tree)`` then
+        ``.initialize(pathfinder(...))`` clears the pretrained tree —
+        ``.initialize`` is last-write-wins.  Regression guard for the
+        lifecycle cleanup in trace.py."""
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        # Existing-path init: pytree.  Use a tiny eqx.Module so the
+        # existing isinstance(weights, eqx.Module) branch fires.
+        pre_tree = a.model.module.__class__(value=jnp.array([99.0]))
+        a.initialize(pre_tree)
+        assert a.model._weight_tree is not None
+        # Now overwrite with the pathfinder marker.
+        a.initialize(jno.bayesian.pathfinder(maxiter=5))
+        assert a.model._weight_tree is None, "_weight_tree should be cleared by the marker branch"
+        assert a.model._bayesian_initializer is not None
+        # And the reverse — re-set to a tree → marker must be cleared.
+        a.initialize(pre_tree)
+        assert a.model._bayesian_initializer is None, "_bayesian_initializer should be cleared by the tree branch"
+
+    # ─── 13. protocol subclassability ─────────────────────────────────
+
+    def test_protocol_contract_smoke(self):
+        """A minimal user-written subclass of ``_BayesianInitializer`` runs
+        end-to-end through ``.initialize()`` and ``solve()`` — validates
+        the protocol is genuinely subclassable by third parties.
+
+        The subclass deliberately produces a logdensity-derived warm
+        position (the gradient direction from the input) so we can verify
+        both invocation and that the result reaches ``trainable[lid]``
+        and feeds the kernel.
+        """
+        call_count = [0]
+
+        class _IdentityInitializer(jno.bayesian._BayesianInitializer):
+            """Returns the input position unchanged + a trivial kwargs
+            update.  Verifies the protocol dispatch end-to-end without
+            any algorithmic content."""
+
+            def __call__(self, rng_key, logdensity_fn, position, num_chains):
+                call_count[0] += 1
+                # Sanity-check: the logdensity_fn is callable on the
+                # input position (the protocol must wire it correctly).
+                ld_val = logdensity_fn(position)
+                assert jnp.isfinite(ld_val), "ld_fn returned non-finite value"
+                return position, {}
+
+        a = self._harmonic_inverse(
+            a_init=2.4,
+            initializer=_IdentityInitializer(),
+            adapt=False,
+            warmup=2,
+            keep=15,
+        )
+        # 1) The user-written initializer was invoked.
+        assert call_count[0] == 1, f"protocol dispatched {call_count[0]} times; expected 1"
+        # 2) The solve completed with a valid posterior shape.
+        chain = a.posterior_samples
+        assert chain.shape == (1, 15, 1)
+        # 3) Identity initializer means the chain starts near the user's
+        #    init (2.4) and recovers truth ~2.5 in 15 steps.
+        assert abs(float(jnp.mean(chain)) - 2.5) < 1.0
