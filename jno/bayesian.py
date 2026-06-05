@@ -337,15 +337,37 @@ def build_kernel_handle(cfg: dict) -> _KernelHandle:
 
     user_kwargs = dict(cfg.get("kernel_kwargs", {}))
     step_size = user_kwargs.pop("step_size", None)
-    if step_size is None:
-        raise ValueError(
-            f"jno .bayesian({getattr(factory, '__name__', factory)!r}, ...) requires a step_size= keyword argument."
-        )
 
     warmup = int(cfg.get("warmup", 500))
     keep = int(cfg.get("keep", 1000))
     thin = int(cfg.get("thin", 1))
     adapt = bool(cfg.get("adapt", True))
+    if step_size is None:
+        # When adapt=True on an HMC-family kernel,
+        # ``blackjax.window_adaptation`` overrides ``step_size`` anyway
+        # — make it optional in that case so the common path is just
+        # ``model.bayesian(blackjax.nuts, warmup=500, keep=1000)``.
+        # Detect HMC family by checking the factory signature for
+        # ``inverse_mass_matrix`` (same gate ``adapt_is_applicable`` uses).
+        _target = getattr(factory, "differentiable", factory)
+        try:
+            _sig = inspect.signature(_target)
+            _is_hmc_family = "inverse_mass_matrix" in _sig.parameters
+        except (TypeError, ValueError):
+            _is_hmc_family = False
+        if adapt and warmup > 0 and _is_hmc_family:
+            # Sentinel default — window adaptation's first integrator
+            # iteration uses this as its ``initial_step_size`` and
+            # then refines.  1.0 is the value blackjax uses internally
+            # when the user lets it choose; surfacing it here keeps
+            # behaviour identical.
+            step_size = 1.0
+        else:
+            raise ValueError(
+                f"jno .bayesian({getattr(factory, '__name__', factory)!r}, ...) requires a "
+                f"step_size= keyword argument when adapt=False or the kernel is not HMC-family "
+                f"(adapt={adapt}, hmc_family={_is_hmc_family}, warmup={warmup})."
+            )
     num_chains = int(cfg.get("num_chains", 1))
     init_jitter = float(cfg.get("init_jitter", 0.0))
     if warmup < 0 or keep < 0 or thin < 1:

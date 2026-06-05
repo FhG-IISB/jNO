@@ -1585,8 +1585,11 @@ class Model(Placeholder):
                 over-dispersion (gives a more conservative R-hat).
                 Default 0.0 = all chains start from the same point with
                 different PRNG keys.
-            **kernel_kwargs: Forwarded to ``kernel_factory``.  Must include
-                ``step_size``.  May include e.g. ``inverse_mass_matrix=``
+            **kernel_kwargs: Forwarded to ``kernel_factory``.  ``step_size``
+                is optional for HMC-family kernels (NUTS / HMC) when
+                ``adapt=True`` and ``warmup > 0`` — window adaptation
+                picks one.  **Required** for ``adapt=False``, MALA, and
+                SG-MCMC.  May include e.g. ``inverse_mass_matrix=``
                 (NUTS/HMC), ``num_integration_steps=`` (HMC/SGHMC).
 
         Returns:
