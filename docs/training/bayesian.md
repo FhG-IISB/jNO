@@ -488,23 +488,30 @@ special case for masked solves.
 A worked example lives at
 [Tutorial 10](../tutorials/10-bayesian-pinns/masked-bnn-head.md).
 
-### What v1 ships
+### What's supported
 
 * **Pattern A**: `.mask(M).bayesian(...)` (or `.vi(...)`) on a model
   with **no** global `.optimizer(...)`.  Body stays at init; masked
   subset is the posterior.
+* **Pattern B** *(Phase 15)*: `.mask(M).bayesian(...)` + global
+  `.optimizer(...)` on the same model.  Body is Adam-trained; head is
+  MCMC-sampled.  `opt_states[lid]` carries both states via a
+  `_MixedState` wrapper.  **K=1 and K>1 both supported**: for K>1 the
+  body's gradient is computed at the chain-0 representative head (SAEM
+  simplification).  Tutorial: [T14](../tutorials/10-bayesian-pinns/pattern-b-bnn-head.md).
+* **Masked + `num_chains > 1`** *(Phase 15)*: lifted as a side-effect
+  of Pattern B's state-storage refactor — masked Bayesian solves with
+  K parallel chains work for both Pattern A and Pattern B.
 * **`.lora()` + `.bayesian()`** (no mask) — the LoRA partition already
   restricts trainable parameters to the LoRA adapters; `.bayesian()`
-  samples that restricted subset.  Composes without v1 changes.
+  samples that restricted subset.
 
-### What v1 blocks (clear errors at `solve()` time)
+### What's still blocked
 
-| Pattern | Why blocked | Workaround in v1 |
+| Pattern | Why blocked | Workaround |
 |---|---|---|
-| **B**: masked `.bayesian()` + global `.optimizer()` on the **same** model | `opt_states[layer_id]` currently holds **either** an optax state **or** a kernel state — not both.  Supporting it needs composite keys or a tuple-state encoding (the v2 refactor). | Drop the global optimizer (body stays at init), or remove the mask and apply `.bayesian()` to the whole model. |
-| **D**: multiple disjoint `.mask().bayesian()` groups on the same model | The per-group Metropolis-within-Gibbs cycle needs the same state-storage refactor as Pattern B. | Combine the disjoint masks into a single one and call `.bayesian()` once. |
-| **E**: mixed VI + MCMC on disjoint masks of the same model | Same state-storage constraint. | Run VI and MCMC on **separate** models (they may coexist freely in one solve). |
-| Masked + `num_chains > 1` | Per-chain partition / reassembly with a shared unmasked snapshot is wired but not validated against the multi-chain path in v1. | Use `num_chains=1` with masked solves; do parallel single-chain runs externally if you need R-hat. |
+| **D**: multiple disjoint `.mask().bayesian()` groups on the same model | The per-group Metropolis-within-Gibbs cycle would need either composite keys per group or a list-of-groups extension of `_MixedState`.  Not yet wired. | Combine the disjoint masks into a single one and call `.bayesian()` once. |
+| **E**: mixed VI + MCMC on disjoint masks of the same model | Same group-list extension as Pattern D. | Run VI and MCMC on **separate** models (they may coexist freely in one solve). |
 
 ### What `posterior_samples` looks like
 

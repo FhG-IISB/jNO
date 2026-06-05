@@ -1293,22 +1293,49 @@ class TestMaskedBackends:
                     f"unmasked leaf {i} should be constant across the chain; got var-along-N={var_along_n:.3e}"
                 )
 
-    def test_masked_bayesian_with_global_optimizer_raises(self):
-        """Pattern B (mixed mode) is explicitly NOT supported in v1 —
-        masked .bayesian() + global .optimizer() on the same model
-        needs a state-storage refactor (opt_states currently can't
-        hold both an optax state and a kernel state under the same
-        key).  Verify the error is clear and actionable.
-        """
+    def test_masked_bayesian_with_global_optimizer_runs(self):
+        """Pattern B — masked .bayesian() head + global .optimizer() body
+        on the same model — is supported as of Phase 15.  Verifies that
+        the solve completes, the masked leaf varies across the chain
+        (Bayesian update fires), and the body leaves moved from their
+        initial values (optax update fires)."""
         dom = _line_domain()
         x, _ = dom.variable("interior")
         net = _tiny_net(in_dim=1, out_dim=1, hidden=4)
-        mask, _ = _build_last_leaf_mask(net)
-        net.optimizer(optax.adam(1e-2))
-        net.mask(mask).bayesian(blackjax.sgld, step_size=1e-4, warmup=2, keep=3)
+        mask, masked_idx = _build_last_leaf_mask(net)
+
+        # Snapshot initial body params (unmasked leaves).
+        init_leaves = jax.tree_util.tree_leaves(net.module)
+        init_body_leaves = [
+            jnp.copy(leaf)
+            for i, leaf in enumerate(init_leaves)
+            if i != masked_idx and hasattr(leaf, "shape") and jnp.issubdtype(leaf.dtype, jnp.inexact)
+        ]
+
+        net.optimizer(optax.adam(1e-1))
+        net.mask(mask).bayesian(blackjax.sgld, step_size=1e-3, warmup=5, keep=20)
         residual = net(x) - 0.0
-        with pytest.raises(NotImplementedError, match="state-storage refactor"):
-            jno.core([residual.mse], dom).solve(5)
+        crux = jno.core([residual.mse], dom)
+        crux.solve(30)
+
+        # Bayesian contract: masked leaf varies across the chain.
+        chain = net.posterior_samples
+        assert chain is not None
+        chain_leaves = jax.tree_util.tree_leaves(chain)
+        masked_var = float(jnp.mean(jnp.var(chain_leaves[masked_idx], axis=1)))
+        assert masked_var > 1e-8, f"masked leaf should vary across the chain; got var={masked_var:.3e}"
+
+        # Optax contract: body params (unmasked leaves) moved during solve.
+        final_leaves = jax.tree_util.tree_leaves(net.module)
+        body_moved = False
+        b_iter = iter(init_body_leaves)
+        for i, leaf in enumerate(final_leaves):
+            if i == masked_idx or not (hasattr(leaf, "shape") and jnp.issubdtype(leaf.dtype, jnp.inexact)):
+                continue
+            init_l = next(b_iter)
+            if float(jnp.linalg.norm(leaf - init_l)) > 1e-4:
+                body_moved = True
+        assert body_moved, "Pattern B: body (unmasked) leaves didn't move under optax"
 
     def test_masked_vi_only_masked_varies(self):
         """Pattern A for VI: head VI, body frozen at init."""
@@ -1338,23 +1365,28 @@ class TestMaskedBackends:
             var_along_n = float(jnp.mean(jnp.var(leaf, axis=1)))
             assert var_along_n < 1e-8, f"unmasked VI leaf {i} should be constant; got var-along-N={var_along_n:.3e}"
 
-    def test_masked_vi_with_global_optimizer_raises(self):
-        """Same v1 restriction as masked .bayesian() + global optimiser:
-        the mixed-mode path is blocked with a clear error."""
+    def test_masked_vi_with_global_optimizer_runs(self):
+        """Pattern B for VI — masked .vi() head + global .optimizer()
+        body on the same model — is supported as of Phase 15.  Verifies
+        the solve completes and posterior_samples is populated."""
         dom = _line_domain()
         x, _ = dom.variable("interior")
         net = _tiny_net(in_dim=1, out_dim=1, hidden=4)
-        mask, _ = _build_last_leaf_mask(net)
-        net.optimizer(optax.adam(1e-2))
+        mask, masked_idx = _build_last_leaf_mask(net)
+        net.optimizer(optax.adam(1e-1))
         net.mask(mask).vi(
             blackjax.meanfield_vi,
             optimizer=optax.adam(1e-2),
             num_samples=4,
-            posterior_draws=15,
+            posterior_draws=20,
         )
         residual = net(x) - 0.0
-        with pytest.raises(NotImplementedError, match="state-storage refactor"):
-            jno.core([residual.mse], dom).solve(5)
+        jno.core([residual.mse], dom).solve(60)
+        chain = net.posterior_samples
+        assert chain is not None
+        leaves = jax.tree_util.tree_leaves(chain)
+        masked_var = float(jnp.mean(jnp.var(leaves[masked_idx], axis=1)))
+        assert masked_var > 1e-8, f"masked VI leaf should vary across draws; got var={masked_var:.3e}"
 
     def test_masked_bayesian_posterior_samples_full_pytree(self):
         """The chain stores the full module pytree (every leaf present),
@@ -1375,25 +1407,33 @@ class TestMaskedBackends:
             f"chain has {len(chain_leaves)} leaves, expected {expected_n_leaves} (full pytree)"
         )
 
-    def test_masked_with_multichain_raises(self):
-        """v1 explicitly blocks .mask() + num_chains > 1 (would need
-        per-chain reassembly machinery that isn't in v1)."""
+    def test_masked_with_multichain_runs(self):
+        """Phase 15 lifts the v1 block on masked + num_chains > 1:
+        the per-chain reassembly machinery falls out of Pattern B's
+        state-storage refactor.  Verify the solve completes and the
+        chain has the expected K-leading shape."""
         dom = _line_domain()
         x, _ = dom.variable("interior")
         net = _tiny_net(in_dim=1, out_dim=1, hidden=4)
-        mask, _ = _build_last_leaf_mask(net)
+        mask, masked_idx = _build_last_leaf_mask(net)
         net.mask(mask).bayesian(
-            blackjax.nuts,
-            step_size=1e-2,
-            inverse_mass_matrix=jnp.ones(1),
+            blackjax.sgld,
+            step_size=1e-4,
             warmup=3,
             keep=5,
-            adapt=False,
             num_chains=4,
         )
         residual = net(x) - 0.0
-        with pytest.raises((NotImplementedError, ValueError)):
-            jno.core([residual.mse], dom).solve(8)
+        jno.core([residual.mse], dom).solve(8)
+        chain = net.posterior_samples
+        assert chain is not None
+        # Each leaf should now have leading (K, N) = (4, 5).
+        leaves = jax.tree_util.tree_leaves(chain)
+        for leaf in leaves:
+            assert leaf.shape[:2] == (4, 5), f"unexpected K-leading shape {leaf.shape[:2]} (expected (4, 5))"
+        # The masked leaf should vary along the sample axis.
+        masked_var = float(jnp.mean(jnp.var(leaves[masked_idx], axis=1)))
+        assert masked_var > 1e-8, f"masked leaf should vary across the chain; got var={masked_var:.3e}"
 
     def test_global_bayesian_then_mask_raises(self):
         """A model with both a global ``.bayesian(...)`` and a masked
@@ -2560,9 +2600,9 @@ class TestInitializerComposition:
     mode.  These tests pin those compositions.
 
     Note: mixing **on a single pytree** (e.g. an MLP whose head is
-    Bayesian and body is optax-trained) is Phase 11's Pattern B and is
-    explicitly blocked at solve start — see
-    ``TestMaskedBackends.test_masked_bayesian_with_global_optimizer_raises``.
+    Bayesian and body is optax-trained) is Phase 15's Pattern B and is
+    now supported — see
+    ``TestMaskedBackends.test_masked_bayesian_with_global_optimizer_runs``.
     """
 
     # ─── 1. Two Bayesian models, two different initializers ──────────
@@ -2749,3 +2789,175 @@ class TestInitializerComposition:
         # Both Bayesian models still produced chains.
         assert a.posterior_samples is not None
         assert b.posterior_samples is not None
+
+
+# ---------------------------------------------------------------------------
+# Phase 15 — Pattern B: masked Bayesian head + global optax body on one model
+# ---------------------------------------------------------------------------
+
+
+class TestPatternB:
+    """One pytree, two backends.  Phase 15 lifts the v1 block on
+    ``.mask(M).bayesian()`` + ``.optimizer(...)`` on the same model:
+    the unmasked complement is Adam-trained (body) while the masked
+    subset is MCMC-sampled (head).  ``opt_states[lid]`` is a
+    ``_MixedState`` wrapper carrying both pieces.  These tests pin
+    the K=1 and K>1 paths and the composition with the existing
+    Bayesian features.
+    """
+
+    @staticmethod
+    def _build_problem(*, num_chains=1, hidden=4):
+        """Tiny MLP regression problem used by most tests in this class.
+        Head = output_layer (last leaf via _build_last_leaf_mask); body
+        = everything else.  Returns ``(domain, net, residual)`` ready
+        for ``crux.solve``.
+        """
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        net = _tiny_net(in_dim=1, out_dim=1, hidden=hidden)
+        target = jno.np.sin(jno.np.pi * x)  # a target the net can approximate
+        residual = net(x) - target
+        return dom, net, residual
+
+    # ─── 1. K=1: body moves under optax, head moves under SGLD ──────
+
+    def test_pattern_b_k1_both_backends_fire(self):
+        """K=1 Pattern B end-to-end: chain shows the masked head varies
+        across samples (Bayesian fired) AND the body leaves moved from
+        their initial values (optax fired)."""
+        dom, net, residual = self._build_problem(hidden=4)
+        mask, masked_idx = _build_last_leaf_mask(net)
+
+        init_body = [jnp.copy(leaf) for i, leaf in enumerate(jax.tree_util.tree_leaves(net.module)) if i != masked_idx]
+
+        net.optimizer(optax.adam(1e-1))
+        net.mask(mask).bayesian(blackjax.sgld, step_size=1e-3, warmup=5, keep=30)
+
+        jno.core([residual.mse], dom).solve(40)
+        chain = net.posterior_samples
+        chain_leaves = jax.tree_util.tree_leaves(chain)
+
+        # Bayesian contract — head varies across the chain
+        masked_var = float(jnp.mean(jnp.var(chain_leaves[masked_idx], axis=1)))
+        assert masked_var > 1e-8, f"head should vary; got var={masked_var:.3e}"
+
+        # Optax contract — body moved from init
+        final_body = [leaf for i, leaf in enumerate(jax.tree_util.tree_leaves(net.module)) if i != masked_idx]
+        any_moved = any(float(jnp.linalg.norm(a - b)) > 1e-4 for a, b in zip(final_body, init_body))
+        assert any_moved, "Pattern B: body leaves did not move under optax"
+
+    # ─── 2. K>1: chain has K-leading axis ────────────────────────────
+
+    def test_pattern_b_k4_multichain_shape(self):
+        """K=4 Pattern B: chain has ``(K=4, N, *leaf)`` for every leaf,
+        head leaf varies along N, body leaves are populated."""
+        dom, net, residual = self._build_problem(hidden=4)
+        mask, masked_idx = _build_last_leaf_mask(net)
+        net.optimizer(optax.adam(1e-1))
+        net.mask(mask).bayesian(blackjax.sgld, step_size=1e-3, warmup=3, keep=8, num_chains=4)
+        jno.core([residual.mse], dom).solve(12)
+
+        chain = net.posterior_samples
+        chain_leaves = jax.tree_util.tree_leaves(chain)
+        for leaf in chain_leaves:
+            assert leaf.shape[:2] == (4, 8), f"unexpected K, N axes: {leaf.shape[:2]} (expected (4, 8))"
+        # Head varies along N within each chain
+        head_var = float(jnp.mean(jnp.var(chain_leaves[masked_idx], axis=1)))
+        assert head_var > 1e-8, f"head should vary along N; got var={head_var:.3e}"
+
+    # ─── 3. Body gradient excludes head leaves ───────────────────────
+
+    def test_pattern_b_body_gradient_excludes_head(self):
+        """Sanity-check the masking: an optax update on Pattern B
+        should NOT move the head leaves.  Compare the head leaves
+        at init vs after solve — they must be identical (modulo the
+        kernel's own Bayesian noise).
+        """
+        dom, net, residual = self._build_problem(hidden=4)
+        mask, masked_idx = _build_last_leaf_mask(net)
+
+        # Snapshot the head leaf at init
+        init_head = jnp.copy(jax.tree_util.tree_leaves(net.module)[masked_idx])
+
+        # Use a tiny step size so the body barely moves; what matters
+        # is whether optax accidentally touches the head.
+        net.optimizer(optax.adam(1e-2))
+        # Use SGLD with step_size=0 so the head doesn't move by SGLD either
+        net.mask(mask).bayesian(blackjax.sgld, step_size=0.0, warmup=2, keep=5)
+        jno.core([residual.mse], dom).solve(8)
+
+        final_head = jax.tree_util.tree_leaves(net.module)[masked_idx]
+        # With SGLD step_size=0 the head should be EXACTLY at init
+        # (no Bayesian update fires).  If the optax body update
+        # accidentally bled into the head, the head would have moved.
+        assert jnp.allclose(init_head, final_head, atol=1e-6), (
+            "Pattern B: optax body update bled into the masked head leaves"
+        )
+
+    # ─── 4. Reproducibility ─────────────────────────────────────────
+
+    def test_pattern_b_reproducible_with_fixed_seed(self):
+        """Two solves with identical master seed produce identical
+        chains AND identical final body values."""
+
+        def _solve():
+            dom, net, residual = self._build_problem(hidden=4)
+            mask, _ = _build_last_leaf_mask(net)
+            net.optimizer(optax.adam(1e-1))
+            net.mask(mask).bayesian(blackjax.sgld, step_size=1e-3, warmup=3, keep=10)
+            jno.core([residual.mse], dom).solve(13)
+            return (
+                net.posterior_samples,
+                jax.tree_util.tree_leaves(net.module),
+            )
+
+        chain_a, body_a = _solve()
+        chain_b, body_b = _solve()
+        for la, lb in zip(jax.tree_util.tree_leaves(chain_a), jax.tree_util.tree_leaves(chain_b)):
+            assert jnp.allclose(la, lb), "Pattern B chain not reproducible with fixed seed"
+        for la, lb in zip(body_a, body_b):
+            assert jnp.allclose(la, lb), "Pattern B body not reproducible with fixed seed"
+
+    # ─── 5. Pattern B + initializer composes ────────────────────────
+
+    def test_pattern_b_with_initializer_composes(self, monkeypatch):
+        """``.initialize(pathfinder).mask(M).bayesian()`` + global
+        ``.optimizer()``: pathfinder warm-starts the head, optax
+        trains the body.  Pathfinder must run exactly once on the
+        masked subset."""
+        pf_count = [0]
+        orig = jno.bayesian.PathfinderInitializer.__call__
+
+        def _spy(self, rng_key, ld, position, num_chains):
+            pf_count[0] += 1
+            return orig(self, rng_key, ld, position, num_chains)
+
+        monkeypatch.setattr(jno.bayesian.PathfinderInitializer, "__call__", _spy)
+
+        dom, net, residual = self._build_problem(hidden=4)
+        mask, masked_idx = _build_last_leaf_mask(net)
+        net.initialize(jno.bayesian.pathfinder(maxiter=10, num_samples=30))
+        net.optimizer(optax.adam(1e-1))
+        net.mask(mask).bayesian(blackjax.sgld, step_size=1e-3, warmup=2, keep=10)
+        jno.core([residual.mse], dom).solve(12)
+
+        assert pf_count[0] == 1, f"pathfinder ran {pf_count[0]} times; expected 1"
+        chain = net.posterior_samples
+        assert chain is not None
+        # Head varies along chain axis (sampling fired)
+        leaves = jax.tree_util.tree_leaves(chain)
+        head_var = float(jnp.mean(jnp.var(leaves[masked_idx], axis=1)))
+        assert head_var > 1e-8
+
+    # ─── 6. _MixedState contract ────────────────────────────────────
+
+    def test_pattern_b_mixed_state_class_exists(self):
+        """Ensure the ``_MixedState`` NamedTuple is importable and has
+        the right field names.  Regression guard for the state-storage
+        contract."""
+        from jno.core import _MixedState
+
+        ms = _MixedState(optax="a", bayesian="b")
+        assert ms.optax == "a"
+        assert ms.bayesian == "b"

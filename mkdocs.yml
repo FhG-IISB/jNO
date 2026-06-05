@@ -157,3 +157,4 @@ nav:
       - Pathfinder Warm-Start: tutorials/10-bayesian-pinns/pathfinder-init.md
       - Laplace Warm-Start: tutorials/10-bayesian-pinns/laplace-init.md
       - SVGD Warm-Start: tutorials/10-bayesian-pinns/svgd-init.md
+      - Pattern B BNN Head: tutorials/10-bayesian-pinns/pattern-b-bnn-head.md
