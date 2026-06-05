@@ -644,10 +644,12 @@ class CosSimilarityCallback(_PerLossGradCallback):
 class GradientAlignmentCallback(_PerLossGradCallback):
     """Track the total gradient alignment scalar during training.
 
-    Computes ``‖Σgᵢ‖ / Σ‖gᵢ‖`` (Eq. 3.1, [2502.00604]), a value in
-    ``[0, 1]`` that measures how well all loss gradients point in the same
-    direction.  A value near 1 means perfect alignment; near 0 means
-    destructive interference.
+    Computes ``2‖(1/N) Σ ĝᵢ‖² − 1`` with ``ĝᵢ = gᵢ / ‖gᵢ‖`` (Eq. 3.1,
+    [2502.00604]), a value in ``[-1, 1]`` that measures how well all loss
+    gradients point in the same direction.  Near ``1`` means perfect
+    alignment; ``0`` means orthogonal; near ``-1`` means anti-aligned
+    (gradients actively cancel).  For ``N = 2`` this reduces to the
+    ordinary cosine similarity (Proposition 1 of the paper).
 
     Args:
         interval: Compute every *n* outer training steps.  Default ``100``.
@@ -1391,8 +1393,9 @@ class callbacks:
     def gradient_alignment(interval: int = 100, mask=None) -> GradientAlignmentCallback:
         """Create a :class:`GradientAlignmentCallback`.
 
-        Tracks the total gradient alignment scalar ``‖Σgᵢ‖ / Σ‖gᵢ‖``
-        (Eq. 3.1, [2502.00604]) every *interval* outer steps.
+        Tracks the total gradient alignment scalar
+        ``2‖(1/N) Σ ĝᵢ‖² − 1`` (Eq. 3.1, [2502.00604]) every *interval*
+        outer steps.  Range ``[-1, 1]``.
 
         Args:
             interval: Compute every *n* outer training steps.

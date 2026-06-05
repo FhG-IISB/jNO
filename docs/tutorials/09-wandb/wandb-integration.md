@@ -91,11 +91,11 @@ $$\text{sim}_{ij} = \frac{\nabla L_i \cdot \nabla L_j}{\|\nabla L_i\| \|\nabla L
 cb_align = jno.callbacks.gradient_alignment(interval=50)
 ```
 
-A single scalar in $[0, 1]$ measuring global agreement across all gradients (Eq. 3.1, [2502.00604]):
+A single scalar in $[-1, 1]$ measuring global agreement across all gradients (Eq. 3.1, [2502.00604]):
 
-$$\text{alignment} = \frac{\|\sum_i \nabla L_i\|}{\sum_i \|\nabla L_i\|}$$
+$$\text{alignment} \;=\; 2\left\|\frac{1}{N}\sum_{i=1}^{N} \frac{\nabla L_i}{\|\nabla L_i\|}\right\|^2 - 1$$
 
-A value near 1 means all loss terms pull in the same direction. Near 0 means destructive interference.
+Near $+1$ means all loss terms pull in the same direction; $0$ means orthogonal; near $-1$ means anti-aligned (destructive interference).
 
 ### 2-D loss landscape
 
