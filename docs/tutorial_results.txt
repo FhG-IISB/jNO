@@ -109,3 +109,15 @@
 10_bayesian_pinns/09_vi_bnn_regression.py | epochs=2000 | rel_L2_in_data=0.2442 | band_in_data=0.3169 | band_in_gap=0.4380 | band_ratio=1.38
 10_bayesian_pinns/10_masked_bnn_head.py | epochs=2300 | rel_L2=0.3936 | band_median=0.2400 | band_max=0.3193 | body_var_max=4.996e-16 | head_var_min=6.454e-02
 10_bayesian_pinns/10_masked_bnn_head.py | epochs=2300 | rel_L2=0.3936 | band_median=0.2400 | band_max=0.3193 | body_var_max=4.996e-16 | head_var_min=6.454e-02
+10_bayesian_pinns/11_pathfinder_init.py | run=baseline   | rel_A=0.0093 | rel_B=0.0078 | rhat_a=1.017 | rhat_b=1.000 | wall=8.90s
+10_bayesian_pinns/11_pathfinder_init.py | run=pf-only    | rel_A=0.0078 | rel_B=0.0133 | rhat_a=1.005 | rhat_b=1.006 | wall=21.34s
+10_bayesian_pinns/11_pathfinder_init.py | run=chained    | rel_A=0.0087 | rel_B=0.0102 | rhat_a=0.998 | rhat_b=1.000 | wall=11.05s
+10_bayesian_pinns/11_pathfinder_init.py | run=baseline   | rel_A=0.0091 | rel_B=0.0078 | rhat_a=1.038 | rhat_b=0.999 | wall=6.54s
+10_bayesian_pinns/11_pathfinder_init.py | run=pf-only    | rel_A=0.0078 | rel_B=0.0133 | rhat_a=1.007 | rhat_b=1.006 | wall=12.72s
+10_bayesian_pinns/11_pathfinder_init.py | run=chained    | rel_A=0.0074 | rel_B=0.0100 | rhat_a=1.004 | rhat_b=0.998 | wall=8.34s
+10_bayesian_pinns/11_pathfinder_init.py | run=baseline   | rel_A=0.0091 | rel_B=0.0078 | rhat_a=1.038 | rhat_b=0.999 | wall=6.53s
+10_bayesian_pinns/11_pathfinder_init.py | run=pf-only    | rel_A=0.0078 | rel_B=0.0133 | rhat_a=1.007 | rhat_b=1.006 | wall=12.71s
+10_bayesian_pinns/11_pathfinder_init.py | run=chained    | rel_A=0.0074 | rel_B=0.0100 | rhat_a=1.004 | rhat_b=0.998 | wall=8.32s
+10_bayesian_pinns/11_pathfinder_init.py | run=baseline   | rel_A=0.0091 | rel_B=0.0078 | rhat_a=1.038 | rhat_b=0.999 | wall=6.53s
+10_bayesian_pinns/11_pathfinder_init.py | run=pf-only    | rel_A=0.0078 | rel_B=0.0133 | rhat_a=1.007 | rhat_b=1.006 | wall=12.72s
+10_bayesian_pinns/11_pathfinder_init.py | run=chained    | rel_A=0.0074 | rel_B=0.0100 | rhat_a=1.004 | rhat_b=0.998 | wall=8.41s
