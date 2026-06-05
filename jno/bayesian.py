@@ -829,9 +829,15 @@ class SVGDInitializer(_BayesianInitializer):
 
     1. Initialise ``num_particles`` particles by perturbing the
        user-supplied position with Gaussian noise of std
-       ``init_jitter``.  Default ``num_particles = max(num_chains, 32)``
-       so we always have at least 32 particles for the variance
-       estimate, even when the caller only asked for 1 chain.
+       ``init_jitter``.  When ``init_jitter`` is left at its default
+       (``None``), jno picks ``max(0.1 * std(position), 1e-3)`` so
+       particles start one-tenth of a parameter-scale apart — a
+       sensible "small but visible" spread that adapts to whatever
+       initialisation the model uses.  Explicit positive floats are
+       respected as absolute std values.  Default
+       ``num_particles = max(num_chains, 32)`` so we always have at
+       least 32 particles for the variance estimate, even when the
+       caller only asked for 1 chain.
     2. Run ``num_iters`` SVGD steps using :func:`blackjax.svgd` with
        the supplied optax optimiser (Adam by default) and the
        default RBF kernel (overridable via ``kernel``).  The whole
@@ -874,7 +880,12 @@ class SVGDInitializer(_BayesianInitializer):
     num_particles: int | None = None  # default: max(num_chains, 32)
     optimizer: Any = None  # optax.GradientTransformation; defaults to optax.adam(1e-1)
     kernel: Callable | None = None  # blackjax kernel; defaults to blackjax's RBF
-    init_jitter: float = 1.0  # std of Gaussian perturbation around input position
+    # Std of Gaussian perturbation around the input position.  ``None``
+    # → ``max(0.1 * std(position), 1e-3)`` — scale-aware default that
+    # avoids the historical ``1.0`` which was 100× larger than Xavier
+    # weights at scale 0.01.  Pass an explicit positive float to
+    # override (must be > 0).
+    init_jitter: float | None = None
 
     def __call__(self, rng_key, logdensity_fn, position, num_chains):
         import blackjax  # lazy
@@ -896,9 +907,21 @@ class SVGDInitializer(_BayesianInitializer):
 
         _flat_ld_grad = jax.grad(_flat_ld)
 
+        # Resolve init_jitter — ``None`` (default) picks a position-aware
+        # scale: ten percent of the parameter std, floored at 1e-3 so
+        # constant-init parameters still get a nonzero spread.  Explicit
+        # positive floats are validated up-front and respected verbatim.
+        if self.init_jitter is None:
+            jitter = jnp.maximum(0.1 * jnp.std(flat_pos), 1e-3)
+        else:
+            jitter_f = float(self.init_jitter)
+            if jitter_f <= 0.0:
+                raise ValueError(f"SVGDInitializer: init_jitter must be > 0, got {jitter_f!r}.")
+            jitter = jitter_f
+
         # Initial particles: Gaussian noise around the user's flat init.
         keys = jax.random.split(rng_key, N)
-        init_particles = jax.vmap(lambda k: flat_pos + float(self.init_jitter) * jax.random.normal(k, (D,)))(keys)
+        init_particles = jax.vmap(lambda k: flat_pos + jitter * jax.random.normal(k, (D,)))(keys)
 
         opt = self.optimizer if self.optimizer is not None else optax.adam(1e-1)
         svgd_kwargs = {}
@@ -950,9 +973,11 @@ def svgd(**kwargs) -> SVGDInitializer:
     * ``kernel`` (default blackjax's RBF) — any positive
       semi-definite kernel; signature
       ``(particles, kernel_parameters) -> (kxx, dxkxx)``.
-    * ``init_jitter`` (default ``1.0``) — std of Gaussian noise
+    * ``init_jitter`` (default ``None``) — std of Gaussian noise
       perturbing the input position to seed the initial particle
-      cloud.
+      cloud.  ``None`` picks ``max(0.1 * std(position), 1e-3)`` so
+      particles start one-tenth of a parameter-scale apart;
+      explicit positive floats are respected as absolute std.
 
     Reference
     ---------
