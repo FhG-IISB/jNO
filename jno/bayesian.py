@@ -1417,7 +1417,7 @@ def chain_params_for_eval(models, posterior_samples_by_lid):
 # ---------------------------------------------------------------------------
 
 
-def rhat(chain) -> jnp.ndarray:
+def rhat(chain, *, strategy: str = "auto") -> jnp.ndarray:
     """Rank-normalised, folded R-hat (Gelman & Rubin 1992, improved by
     Vehtari et al. 2021).
 
@@ -1426,11 +1426,28 @@ def rhat(chain) -> jnp.ndarray:
     component.  R-hat ≈ 1.0 indicates the chains are exploring the same
     distribution; values above ~1.05 suggest non-convergence.
 
+    Parameters
+    ----------
+    chain : array
+        ``(K, N, *param)`` posterior chain.
+    strategy : {"auto", "multichain", "split"}, default "auto"
+        How to estimate R-hat:
+
+        * ``"auto"`` (default): split-R-hat when K == 1, multichain
+          R-hat when K >= 2 — preserves the historical behaviour.
+        * ``"multichain"``: require K >= 2; raise ``ValueError`` if not.
+          Use when you've explicitly run multiple chains and want a
+          loud failure if the layout doesn't carry them.
+        * ``"split"``: split every chain in half and treat the halves
+          as 2K independent chains.  Useful as a stationarity check
+          on top of cross-chain mixing for K >= 2.
+
     Notes
     -----
-    For K=1 this collapses to a single-chain split-R-hat using two
-    halves of the lone chain (still informative for stationarity but
-    not as strong as a true multi-chain diagnostic).
+    For K=1 the default ``"auto"`` strategy falls back to single-chain
+    split-R-hat (still informative for stationarity but not as strong
+    as a true multi-chain diagnostic).  Pass ``strategy="multichain"``
+    to forbid this silent fallback.
 
     References
     ----------
@@ -1443,18 +1460,27 @@ def rhat(chain) -> jnp.ndarray:
         Improved R̂ for Assessing Convergence of MCMC.* Bayesian
         Analysis 16(2), 667-718.
     """
+    if strategy not in ("auto", "multichain", "split"):
+        raise ValueError(f"rhat: strategy must be one of 'auto', 'multichain', 'split'; got {strategy!r}.")
     chain = jnp.asarray(chain)
     if chain.ndim < 2:
         raise ValueError(f"rhat expects (K, N, *param) array; got shape {chain.shape}.")
     K, N = chain.shape[0], chain.shape[1]
-    if K == 1:
-        # Split-R-hat fallback: treat the two halves of the lone chain
-        # as two independent chains (Gelman et al. 2014, BDA3 §11.4).
+    if strategy == "multichain" and K < 2:
+        raise ValueError(
+            f"rhat(strategy='multichain') requires K>=2; got K={K}. "
+            f"Use the default strategy='auto' or strategy='split' for single-chain input."
+        )
+    if strategy == "split" or (strategy == "auto" and K == 1):
+        # Split: treat each chain's two halves as independent chains
+        # (Gelman et al. 2014, BDA3 §11.4).  For K=1 this is the
+        # historical fallback; for K>=2 it gives a stricter
+        # 2K-chain diagnostic.
         half = N // 2
         if half < 2:
             return jnp.full(chain.shape[2:], jnp.nan, dtype=chain.dtype)
-        chain = jnp.stack([chain[0, :half], chain[0, half : 2 * half]], axis=0)
-        K, N = 2, half
+        chain = jnp.concatenate([chain[:, :half], chain[:, half : 2 * half]], axis=0)
+        K, N = 2 * K, half
 
     # Operate per-parameter component by flattening trailing dims.
     flat = chain.reshape(K, N, -1)
@@ -1506,17 +1532,22 @@ def ess(chain) -> jnp.ndarray:
     rho = jnp.mean(acov, axis=0)  # (N, D)
     rho_0 = rho[0:1]
     rho = rho / jnp.where(rho_0 > 0, rho_0, 1.0)
-    # Geyer's initial-positive-sequence: truncate at first negative
-    # *pair* (rho[2k] + rho[2k+1] < 0).  Vectorised approximation: take
-    # cumulative sum until the running estimate stops decreasing.
+    # Geyer's initial-positive-sequence: truncate at the FIRST
+    # non-positive pair (rho[2k] + rho[2k+1] ≤ 0) and discard
+    # everything from that pair onward — including any later positive
+    # pairs that would otherwise inflate the sum.  Strict rule from
+    # Geyer (1992); the previous approximation summed every positive
+    # pair anywhere in the sequence (over-counting on noisy chains).
     pair_sums = rho[0:-1:2] + rho[1::2]  # (N//2, D)
-    # First lag k where pair_sums[k] becomes non-positive — keep
-    # everything strictly before that.
-    keep = pair_sums > 0
-    # tau = 1 + 2 * sum_{k >= 1} rho[k] (autocorrelation time).  We
-    # approximate as 1 + 2 * sum of paired positive sums, capped at N
-    # for numerical safety on flat chains.
-    tau = 1.0 + 2.0 * jnp.sum(jnp.where(keep, pair_sums, 0.0), axis=0)
+    # ``cummin`` over axis 0 gives the running minimum: as soon as one
+    # pair becomes non-positive the cummin drops there and stays
+    # ≤ 0 forever, so ``cummin > 0`` is True iff every preceding pair
+    # (and this one) was strictly positive — the strict
+    # initial-positive sequence.
+    strict_keep = jnp.minimum.accumulate(pair_sums, axis=0) > 0
+    # tau = 1 + 2 * sum_{k >= 1} rho[k] (autocorrelation time), clipped
+    # to [1, N] for numerical safety on flat chains.
+    tau = 1.0 + 2.0 * jnp.sum(jnp.where(strict_keep, pair_sums, 0.0), axis=0)
     tau = jnp.clip(tau, 1.0, float(N))
     out = (K * N) / tau
     return out.reshape(chain.shape[2:])

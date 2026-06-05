@@ -12,6 +12,7 @@ import equinox as eqx
 import foundax
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 import pytest
 
@@ -1169,6 +1170,34 @@ class TestMultiChain:
         # Loose: 4 NUTS chains on a 1-param problem mix quickly.
         assert float(r[0]) < 1.5, f"R-hat too high: {float(r[0])}"
 
+    def test_rhat_strategy_multichain_raises_on_k1(self):
+        # Single-chain input with strategy='multichain' must raise loudly
+        # rather than silently switch to split-rhat.
+        a = _multichain_solve(K=1, warmup=10, keep=40)
+        with pytest.raises(ValueError, match="requires K>=2"):
+            jno.bayesian.rhat(a.posterior_samples, strategy="multichain")
+
+    def test_rhat_strategy_auto_falls_back_to_split_on_k1(self):
+        # Default 'auto' on K=1 → split-rhat fallback (the historical
+        # behaviour).  Must run without error and return a finite value.
+        a = _multichain_solve(K=1, warmup=10, keep=40)
+        r = jno.bayesian.rhat(a.posterior_samples, strategy="auto")
+        assert r.shape == (1,)
+        assert jnp.isfinite(r[0])
+
+    def test_rhat_strategy_split_works_on_k2(self):
+        # strategy='split' on K=2 → treat as 4 independent half-chains.
+        # Just check shape + finite output.
+        a = _multichain_solve(K=2, warmup=20, keep=40)
+        r = jno.bayesian.rhat(a.posterior_samples, strategy="split")
+        assert r.shape == (1,)
+        assert jnp.isfinite(r[0])
+
+    def test_rhat_strategy_unknown_raises(self):
+        a = _multichain_solve(K=2, warmup=10, keep=40)
+        with pytest.raises(ValueError, match="strategy must be one of"):
+            jno.bayesian.rhat(a.posterior_samples, strategy="bogus")
+
     def test_ess_helper(self):
         a = _multichain_solve(K=4, warmup=50, keep=80)
         e = jno.bayesian.ess(a.posterior_samples)
@@ -1177,6 +1206,33 @@ class TestMultiChain:
         # chain should give at least a handful.
         assert float(e[0]) > 1.0, f"ESS too low: {float(e[0])}"
         assert float(e[0]) <= 4 * 80 + 1e-3, f"ESS exceeds K*N: {float(e[0])}"
+
+    def test_ess_geyer_strict_truncation(self):
+        # Strict initial-positive-sequence: discard EVERYTHING from
+        # the first non-positive pair onward.  We assert this property
+        # directly against the alternative "sum every positive pair"
+        # rule on a manually-constructed pair-sum vector.
+        # ``cummin > 0`` is True only for the prefix of strictly
+        # positive pair sums.
+        pair_sums = jnp.asarray([1.0, 0.5, -0.1, 0.3, 0.2])  # (5,)
+        strict_mask = jnp.minimum.accumulate(pair_sums) > 0
+        # Indices 0, 1 kept; 2 (-0.1) drops the cummin to -0.1 and
+        # everything from there onward is excluded — including the
+        # later spurious-positive pairs (0.3, 0.2).
+        assert bool(strict_mask[0]) is True
+        assert bool(strict_mask[1]) is True
+        assert bool(strict_mask[2]) is False
+        assert bool(strict_mask[3]) is False
+        assert bool(strict_mask[4]) is False
+        # Sanity check against IID samples — finite-N empirical ACF
+        # has spurious-negative pairs early; strict rule keeps ESS in
+        # the [0.2*N, N] band rather than collapsing to zero.
+        rng = np.random.default_rng(0)
+        N = 4096
+        chain = rng.standard_normal((1, N, 1)).astype(np.float32)
+        e = jno.bayesian.ess(jnp.asarray(chain))
+        assert float(e[0]) > 0.2 * N, f"ESS {float(e[0])} too low for iid chain of {N}"
+        assert float(e[0]) <= N + 1e-3, f"ESS {float(e[0])} exceeds N"
 
 
 # ---------------------------------------------------------------------------
