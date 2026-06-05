@@ -20,7 +20,10 @@ a.bayesian(blackjax.nuts, step_size=1e-2, warmup=100, adapt=True)
    the user-supplied position by adding Gaussian noise of std
    ``init_jitter``.  Default ``num_particles = max(num_chains, 32)``
    so we always have enough particles for stable variance estimation
-   even when the caller only asked for 1 chain.
+   even when the caller only asked for 1 chain.  ``init_jitter``
+   defaults to ``None`` → ``max(0.1 * std(position), 1e-3)`` — a
+   scale-aware spread one-tenth of the parameter scale.  Pass an
+   explicit positive float (e.g. ``init_jitter=0.5``) to override.
 2. **Run SVGD.**  Each particle is updated by a kernelised functional
    gradient (Liu & Wang 2016, eq. 8):
 
