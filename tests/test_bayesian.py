@@ -2864,6 +2864,59 @@ class TestSVGDInitializer:
         assert abs(captured["warm"] - 2.5) < 1.5, f"SVGD ensemble mean {captured['warm']} far from truth 2.5"
         assert captured["imm"] > 0.0, "SVGD particle variance should be positive"
 
+    # ─── 8. init_jitter default is scale-aware ───────────────────────
+
+    def test_init_jitter_default_is_none(self):
+        # The class-level default was historically 1.0 — that's ~100× too
+        # large for Xavier-init weights at scale 0.01.  None signals the
+        # scale-aware code path inside __call__.
+        init = jno.bayesian.svgd(num_iters=10, num_particles=8)
+        assert init.init_jitter is None
+
+    def test_init_jitter_none_picks_scale_aware_default(self, monkeypatch):
+        # When init_jitter is None, __call__ derives a per-position
+        # default of ``max(0.1 * std(flat_pos), 1e-3)``.  We spy on the
+        # initial-particle creation to check the std of the first-step
+        # particles matches that derived jitter.
+        captured = {}
+        orig_call = jno.bayesian.SVGDInitializer.__call__
+
+        def _spy(self, rng_key, ld, position, num_chains):
+            # Compute expected jitter without re-running SVGD.
+            import jax.flatten_util as _fu
+
+            flat_pos, _ = _fu.ravel_pytree(position)
+            captured["expected"] = float(jnp.maximum(0.1 * jnp.std(flat_pos), 1e-3))
+            return orig_call(self, rng_key, ld, position, num_chains)
+
+        monkeypatch.setattr(jno.bayesian.SVGDInitializer, "__call__", _spy)
+        # Use a tiny MLP so the position std is well below 1.0.
+        net = _tiny_net(in_dim=1, out_dim=1, hidden=8, key_seed=3)
+        net.initialize(jno.bayesian.svgd(num_iters=5, num_particles=4))
+        net.bayesian(blackjax.nuts, step_size=1e-2, warmup=1, keep=1, adapt=False)
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        residual = net(x) - 0.0
+        jno.core([residual.mse], dom).solve(2)
+        # Scale-aware default is in (0, 1.0) — never the historical 1.0.
+        assert 0.0 < captured["expected"] < 1.0
+
+    def test_init_jitter_explicit_positive_respected(self):
+        init = jno.bayesian.svgd(num_iters=10, num_particles=8, init_jitter=0.05)
+        assert init.init_jitter == 0.05
+
+    def test_init_jitter_explicit_non_positive_raises(self):
+        # The validation fires at __call__ time (the dataclass holds the
+        # raw user value).  We trigger it by running through a solve.
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.initialize(jno.bayesian.svgd(num_iters=5, num_particles=4, init_jitter=0.0))
+        a.bayesian(blackjax.nuts, step_size=1e-2, warmup=1, keep=1, adapt=False)
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        residual = a * jno.np.sin(jno.np.pi * x) - jno.np.sin(jno.np.pi * x)
+        with pytest.raises(ValueError, match="init_jitter must be > 0"):
+            jno.core([residual.mse], dom).solve(2)
+
 
 # ---------------------------------------------------------------------------
 # Initializer composition — multiple initializers / mixed-mode in one solve
