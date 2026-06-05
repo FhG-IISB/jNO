@@ -1075,6 +1075,11 @@ class Model(Placeholder):
         self._bayesian_cfg = None  # {"factory", "kernel_kwargs", "prior", "warmup", "keep", "thin"}
         self._vi_cfg = None  # {"factory", "optimizer", "num_samples", "posterior_draws", "prior"}
         self._posterior_samples_pytree = None  # stacked module pytree, leading axis = N; populated by solve()
+        # Per-step blackjax info aggregated post-solve into a
+        # ``{field_name: (K, N) array}`` dict — populated for HMC-family
+        # kernels (NUTS/HMC: is_divergent, acceptance_rate, energy; MALA:
+        # acceptance_rate).  ``None`` for SG-MCMC / VI / non-Bayesian.
+        self._posterior_diagnostics: dict | None = None
         self._dtype = None  # target dtype (e.g. jnp.bfloat16) or None
         self._param_mask = None  # current mask scope for grouped optimizer/lr calls
         self._trainable_param_mask = None  # persistent trainability mask used by mask(...).freeze()
@@ -1115,6 +1120,27 @@ class Model(Placeholder):
         if getattr(self, "_is_jno_scalar_parameter", False):
             return pytree.value
         return pytree
+
+    @property
+    def posterior_diagnostics(self):
+        """Per-step blackjax kernel info aggregated across the chain.
+
+        Returns a ``{field: (K, N) array}`` dict — one entry per field
+        the kernel surfaces:
+
+        * **NUTS / HMC** — ``is_divergent`` (bool), ``acceptance_rate``
+          (float), ``energy`` (float).
+        * **MALA** — ``acceptance_rate`` only.
+        * **SG-MCMC / VI** — ``None``: those kernels expose no
+          per-step info object.
+
+        Returns ``None`` if this model is not Bayesian, or if its
+        kernel doesn't surface per-step diagnostics.  Inspect
+        ``is_divergent`` first — non-zero counts mean the integrator
+        is repeatedly failing and the chain cannot be trusted at the
+        posted ``step_size`` / ``inverse_mass_matrix``.
+        """
+        return getattr(self, "_posterior_diagnostics", None)
 
     def __call__(self, *args) -> "ModelCall":
         """Call this module with variables and return a traced ``ModelCall``."""
@@ -1898,6 +1924,11 @@ class Model(Placeholder):
         self._bayesian_initializer = None
         self._bayesian_initializer_key = None
         self._merge_lora_flag = False
+        # ``_posterior_samples_pytree`` and ``_posterior_diagnostics``
+        # are populated by solve() — clearing them here ensures a stale
+        # chain from a prior run doesn't bleed into the next.
+        self._posterior_samples_pytree = None
+        self._posterior_diagnostics = None
         return self
 
     def to_iree(
@@ -2029,6 +2060,11 @@ class ModelCall(Placeholder):
     def posterior_samples(self):
         """Shortcut to the underlying :attr:`Model.posterior_samples`."""
         return self.model.posterior_samples
+
+    @property
+    def posterior_diagnostics(self):
+        """Shortcut to the underlying :attr:`Model.posterior_diagnostics`."""
+        return self.model.posterior_diagnostics
 
     def initialize(self, weights, *, key=None):
         self.model.initialize(weights, key=key)
