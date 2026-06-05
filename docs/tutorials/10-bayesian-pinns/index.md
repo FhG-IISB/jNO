@@ -1,6 +1,6 @@
 # Bayesian PINNs
 
-Twelve worked examples of Bayesian Physics-Informed Neural Networks
+Thirteen worked examples of Bayesian Physics-Informed Neural Networks
 (B-PINNs) in jNO.  Every tutorial drives training through
 `crux.solve()` and uses jNO's per-parameter `.bayesian(...)` (MCMC) or
 `.vi(...)` (variational) configurator to attach a blackjax inference
@@ -11,12 +11,13 @@ with Gelman-Rubin R-hat and effective sample size diagnostics;
 as T07 via mean-field variational inference for tighter, faster
 posterior bands; [Tutorial 10](./masked-bnn-head.md) demonstrates the
 `.mask(M).bayesian(...)` per-mask backend dispatch — sampling only a
-chosen subset of a model's parameter pytree; [Tutorials 11](./pathfinder-init.md)
-and [12](./laplace-init.md) expose the *logdensity-aware initializer*
-hook on `.initialize()`, landing **pathfinder** (Zhang et al. 2022)
-and **Laplace** (MacKay 1992; Daxberger et al. 2021) as warm-starts
-for any HMC-family chain — the same extension point future SVGD /
-MAP initializers will plug into.
+chosen subset of a model's parameter pytree; [Tutorials 11](./pathfinder-init.md),
+[12](./laplace-init.md), and [13](./svgd-init.md) expose the
+*logdensity-aware initializer* hook on `.initialize()`, landing
+**pathfinder** (Zhang et al. 2022), **Laplace** (MacKay 1992;
+Daxberger et al. 2021), and **SVGD** (Liu & Wang 2016) as warm-start
+strategies for any HMC-family chain — the same extension point user-
+written initializers plug into.
 
 Two tutorials demonstrate training an **entire MLP via Bayesian
 sampling** (no optax): [Tutorial 01](./forward-noisy-poisson-1d.md)
@@ -47,6 +48,7 @@ reference for the `.bayesian()` integration live in
 | 10 | [`masked_bnn_head`](./masked-bnn-head.md) | **`.mask(M).bayesian(...)` per-mask backend dispatch.**  2-layer MLP with the output linear layer ("head", 17 params) SGLD-sampled while the hidden body (304 params) stays at random init.  Demonstrates the v1 contract: chain-variance is non-zero on the masked head and machine-precision-small on the unmasked body.  Pattern B (head Bayesian + body Adam-trained) is the v2 plan — see [Training → Bayesian Sampling](../../training/bayesian.md#composable-per-mask-backends-v1). | — |
 | 11 | [`pathfinder_init`](./pathfinder-init.md) | **`.initialize(jno.bayesian.pathfinder(...))` warm-start.**  Logdensity-aware initializer hook on `Model.initialize` — pathfinder runs L-BFGS on the loss-derived log-density and returns a warm starting position + a diagonal `inverse_mass_matrix` estimate.  Three side-by-side runs (baseline / pathfinder-only / pathfinder + window chain) on T02's harmonic-regression problem.  Demonstrates the extensible `_BayesianInitializer` protocol that future Laplace / SVGD / MAP initializers will plug into. | Zhang et al. 2022 |
 | 12 | [`laplace_init`](./laplace-init.md) | **`.initialize(jno.bayesian.laplace(...))` warm-start.**  Second logdensity-aware initializer on the same `.initialize()` hook: finds the MAP via optax (Adam by default) and forms `N(MAP, H⁻¹)` with an exact Hessian at the MAP.  Diagonal-Hessian strategy scales to BNN-size pytrees; full-Hessian strategy gives clean correlated posterior covariance for small models.  Two side-by-side runs (baseline / laplace) on T02's problem. | MacKay 1992 §6; Daxberger et al. 2021 §2 |
+| 13 | [`svgd_init`](./svgd-init.md) | **`.initialize(jno.bayesian.svgd(...))` warm-start.**  Third logdensity-aware initializer: runs Stein Variational Gradient Descent (Liu & Wang 2016) — a particle-based method whose RBF-kernel repulsion can capture multi-modal posteriors that pathfinder / Laplace miss.  Final particle cloud becomes the warm-start: ensemble mean for K=1; K distinct particles for K>1.  Cost grows ``O(num_particles²)`` per step. | Liu & Wang 2016 §3 |
 
 ## When to use a neural surrogate (and when not to)
 

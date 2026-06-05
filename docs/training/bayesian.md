@@ -282,7 +282,7 @@ class _BayesianInitializer:
 |---|---|---|
 | `jno.bayesian.pathfinder(...)` | blackjax pathfinder | This release.  See [Tutorial 11](../tutorials/10-bayesian-pinns/pathfinder-init.md). |
 | `jno.bayesian.laplace(...)` | MAP via optax + `jax.hessian` (diagonal or full) | This release.  See [Tutorial 12](../tutorials/10-bayesian-pinns/laplace-init.md).  MacKay 1992 §6; Daxberger et al. 2021 §2. |
-| `jno.bayesian.svgd(...)` | blackjax svgd | Coming next.  K particles → K chain inits. |
+| `jno.bayesian.svgd(...)` | blackjax svgd | This release.  See [Tutorial 13](../tutorials/10-bayesian-pinns/svgd-init.md).  K particles → K chain inits.  Liu & Wang 2016 §3. |
 | `jno.bayesian.map(...)` | Fixed-step optax warm-start | Future.  No IMM output; user keeps step_size. |
 | User-written subclass | anything that fits the contract | See [Tutorial 11](../tutorials/10-bayesian-pinns/pathfinder-init.md). |
 

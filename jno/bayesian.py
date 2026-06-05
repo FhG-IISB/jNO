@@ -5,8 +5,9 @@ directly and attach them per parameter via :meth:`jno.trace.Model.bayesian`
 or :meth:`jno.trace.Model.vi`.  A small public surface lives at
 ``jno.bayesian.*``: convergence diagnostics (:func:`rhat`, :func:`ess`)
 and the *logdensity-aware initializer* protocol — currently
-:class:`PathfinderInitializer` (:func:`pathfinder`) and
-:class:`LaplaceInitializer` (:func:`laplace`).  The training loop in
+:class:`PathfinderInitializer` (:func:`pathfinder`),
+:class:`LaplaceInitializer` (:func:`laplace`), and
+:class:`SVGDInitializer` (:func:`svgd`).  The training loop in
 :mod:`jno.core` dispatches each model's per-step update either through
 :mod:`optax` or through the blackjax kernel configured here.
 
@@ -648,6 +649,156 @@ def laplace(**kwargs) -> LaplaceInitializer:
     :class:`LaplaceInitializer` for full citations.
     """
     return LaplaceInitializer(**kwargs)
+
+
+@dataclass(frozen=True)
+class SVGDInitializer(_BayesianInitializer):
+    """Stein Variational Gradient Descent warm-start.
+
+    Runs SVGD (Liu & Wang 2016) — a deterministic, particle-based
+    variational inference algorithm — and uses the final particle
+    cloud as the warm-start.  Each particle is dragged toward the
+    posterior by a kernelised functional gradient that combines a
+    repulsive RBF term (keeps particles diverse) with an attractive
+    log-density gradient term (pulls each particle toward higher
+    posterior density).  At convergence, the particles approximate
+    the posterior distribution.
+
+    Three-step algorithm:
+
+    1. Initialise ``num_particles`` particles by perturbing the
+       user-supplied position with Gaussian noise of std
+       ``init_jitter``.  Default ``num_particles = max(num_chains, 32)``
+       so we always have at least 32 particles for the variance
+       estimate, even when the caller only asked for 1 chain.
+    2. Run ``num_iters`` SVGD steps using :func:`blackjax.svgd` with
+       the supplied optax optimiser (Adam by default) and the
+       default RBF kernel (overridable via ``kernel``).  The whole
+       run is wrapped in :func:`jax.lax.scan` for fast XLA-side
+       iteration.
+    3. Return:
+
+       * For ``num_chains == 1`` — the particle-cloud **mean** as
+         the warm starting position (most stable summary).
+       * For ``num_chains > 1`` — the first ``num_chains`` particles
+         as K distinct warm starting positions.  The particle
+         dynamics already provide proper over-dispersion; no extra
+         jitter step is needed.
+
+       The per-dimension **variance of the particle cloud** is
+       returned as the diagonal ``inverse_mass_matrix`` (a cheap
+       empirical-Bayes estimate of the posterior covariance).
+
+    Trade-offs vs Pathfinder / Laplace
+    ----------------------------------
+    * **Pathfinder** approximates the posterior via L-BFGS factors —
+      cheap and unimodal.
+    * **Laplace** uses the exact Hessian at the MAP — accurate
+      locally but ignores posterior modes beyond the MAP basin.
+    * **SVGD** captures multi-modal structure when present: the
+      repulsive RBF kernel pushes particles apart so multiple modes
+      can be discovered with enough particles.  Cost grows with
+      ``num_particles²`` per step (pairwise kernel interactions).
+
+    Reference
+    ---------
+    Liu, Q., & Wang, D. (2016).  *Stein Variational Gradient Descent:
+    A General Purpose Bayesian Inference Algorithm.*  §3 (the SVGD
+    update rule).  Advances in Neural Information Processing Systems
+    (NeurIPS), 29, 2378-2386.
+    https://arxiv.org/abs/1608.04471
+    """
+
+    num_iters: int = 500
+    num_particles: int | None = None  # default: max(num_chains, 32)
+    optimizer: Any = None  # optax.GradientTransformation; defaults to optax.adam(1e-1)
+    kernel: Callable | None = None  # blackjax kernel; defaults to blackjax's RBF
+    init_jitter: float = 1.0  # std of Gaussian perturbation around input position
+
+    def __call__(self, rng_key, logdensity_fn, position, num_chains):
+        import blackjax  # lazy
+        import optax  # lazy
+
+        flat_pos, unflatten = jax.flatten_util.ravel_pytree(position)
+        D = int(flat_pos.size)
+        K = int(num_chains)
+
+        # Choose particle count: enough for stable variance + at
+        # least K for chain inits.
+        N = int(self.num_particles) if self.num_particles is not None else max(K, 32)
+        if N < K:
+            raise ValueError(f"SVGDInitializer: num_particles ({N}) must be >= num_chains ({K}).")
+
+        # Flat gradient of log p
+        def _flat_ld(v):
+            return logdensity_fn(unflatten(v))
+
+        _flat_ld_grad = jax.grad(_flat_ld)
+
+        # Initial particles: Gaussian noise around the user's flat init.
+        keys = jax.random.split(rng_key, N)
+        init_particles = jax.vmap(lambda k: flat_pos + float(self.init_jitter) * jax.random.normal(k, (D,)))(keys)
+
+        opt = self.optimizer if self.optimizer is not None else optax.adam(1e-1)
+        svgd_kwargs = {}
+        if self.kernel is not None:
+            svgd_kwargs["kernel"] = self.kernel
+        svgd = blackjax.svgd(_flat_ld_grad, opt, **svgd_kwargs)
+        state = svgd.init(init_particles)
+
+        # Run num_iters SVGD steps via lax.scan (one XLA dispatch).
+        def _step(state_in, _):
+            return svgd.step(state_in), None
+
+        state, _ = jax.lax.scan(_step, state, None, length=int(self.num_iters))
+
+        particles = state.particles  # shape (N, D)
+
+        # Diagonal IMM from particle variance (+ small ridge).
+        imm_diag = jnp.var(particles, axis=0) + 1e-6
+
+        # Warm positions.
+        if K == 1:
+            warm_flat = jnp.mean(particles, axis=0)
+            warm_pos = unflatten(warm_flat)
+        else:
+            # First K particles → K chain inits.  Particles are
+            # exchangeable so any K of them work; first K is
+            # deterministic.
+            warm_pos = jax.vmap(unflatten)(particles[:K])
+
+        return warm_pos, {"inverse_mass_matrix": imm_diag}
+
+
+def svgd(**kwargs) -> SVGDInitializer:
+    """Build an :class:`SVGDInitializer` for use with
+    :meth:`jno.trace.Model.initialize`.
+
+    Usage::
+
+        net.initialize(jno.bayesian.svgd(num_iters=500, num_particles=32))
+        net.bayesian(blackjax.nuts, step_size=1e-2, warmup=100, adapt=True)
+
+    Kwargs (see :class:`SVGDInitializer` for full descriptions):
+
+    * ``num_iters`` (default 500) — number of SVGD update steps.
+    * ``num_particles`` (default ``max(num_chains, 32)``) — particle
+      count; larger captures more modes but costs ``O(N²)`` per step.
+    * ``optimizer`` (default ``optax.adam(1e-1)``) — any optax
+      ``GradientTransformation``.
+    * ``kernel`` (default blackjax's RBF) — any positive
+      semi-definite kernel; signature
+      ``(particles, kernel_parameters) -> (kxx, dxkxx)``.
+    * ``init_jitter`` (default ``1.0``) — std of Gaussian noise
+      perturbing the input position to seed the initial particle
+      cloud.
+
+    Reference
+    ---------
+    Liu & Wang 2016 §3.  See :class:`SVGDInitializer` for full
+    citation.
+    """
+    return SVGDInitializer(**kwargs)
 
 
 def init_state_at_warm_positions(handle: _KernelHandle, warm_position_full, rng_key=None):
