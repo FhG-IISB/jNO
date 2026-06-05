@@ -1002,7 +1002,7 @@ def svgd(**kwargs) -> SVGDInitializer:
     return SVGDInitializer(**kwargs)
 
 
-def init_state_at_warm_positions(handle: _KernelHandle, warm_position_full, rng_key=None):
+def init_state_at_warm_positions(handle: _KernelHandle, warm_position_full):
     """Build the kernel state when a logdensity-aware initializer has
     already supplied warm starting position(s).
 
