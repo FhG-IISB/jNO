@@ -9,9 +9,10 @@ than a random one.
 
 Pattern B (head Bayesian + body Adam on the same model) was a
 v1 limitation when masked Bayesian inference first landed.  Phase 15
-lifts that block: ``opt_states[lid]`` carries both the kernel state
-(masked head) and the optax state (body complement) via a
-``_MixedState`` wrapper.
+lifted that block (later refactored in Phase 16): ``opt_states`` uses
+composite keys (``"<lid>"`` for the optax body and ``"<lid>.<gi>"``
+for each masked Bayesian/VI group) so each backend's state lives at
+its own slot.
 
 Bayesian Last Layer in jno
 --------------------------

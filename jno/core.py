@@ -1,7 +1,7 @@
 import gc
 import os
 import time
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union, cast
+from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import equinox as eqx
 import jax
@@ -158,23 +158,41 @@ def _parse_substep_spec(spec):
     raise TypeError(f"substep must be a list or ([list], int) tuple, got {type(spec)}")
 
 
-# Phase 15 — Pattern B: one layer carries BOTH a Bayesian kernel state and
-# an optax state (masked head sampled, body Adam-trained).  ``opt_states[lid]``
-# wraps the pair in this NamedTuple; the step function detects it in both
-# the optax and Bayesian loops and unwraps the appropriate half.  Non-Pattern-B
-# layers continue to hold a plain state directly.
-class _MixedState(NamedTuple):
-    """Carries both an optax state and a Bayesian kernel state for a single
-    layer whose pytree is split by a mask (Pattern B).
+# Phase 16 — Composite keys for Bayesian states.
+#
+# ``opt_states`` and ``bayesian_handles`` use **composite string keys** of
+# the form ``"<lid>.<group_idx>"`` for every Bayesian / VI handle, even when
+# a layer has just one group (then ``group_idx == 0``).  Optax states use
+# bare ``"<lid>"`` keys.  A single layer can therefore carry:
+#
+#   * ``opt_states["1"]``        — optax state (body of a Pattern B layer)
+#   * ``opt_states["1.0"]``      — first Bayesian/VI group on layer 1
+#   * ``opt_states["1.1"]``      — second Bayesian/VI group on layer 1 (Pattern D)
+#
+# The two helpers below parse composite keys uniformly.  Bare optax keys
+# satisfy ``_lid_of("1") == 1`` and ``_group_idx_of("1") is None``.
+#
+# Patterns this scheme unblocks:
+#   B — masked Bayesian + global optax       (Phase 15 → re-implemented here)
+#   D — multiple disjoint Bayesian groups    (Phase 16)
+#   E — mixed VI + MCMC on disjoint masks    (Phase 16, with strict matching)
+def _lid_of(k: str) -> int:
+    """Layer id from a composite ``"<lid>.<group_idx>"`` or bare ``"<lid>"`` key."""
+    return int(k.split(".")[0])
 
-    The optax state lives on the unmasked complement (body), the kernel
-    state on the masked subset (head).  Update order at step time:
-    optax-first (body), then kernel (head sees the just-updated body in
-    its logdensity closure — natural Metropolis-within-Gibbs).
-    """
 
-    optax: Any
-    bayesian: Any
+def _group_idx_of(k: str) -> Optional[int]:
+    """Group index from a composite key.  ``None`` for bare optax keys."""
+    parts = k.split(".")
+    if len(parts) < 2:
+        return None
+    return int(parts[1])
+
+
+def _bay_key(lid: int, group_idx: int = 0) -> str:
+    """Build a composite Bayesian/VI key.  Group 0 is the default for
+    single-group layers."""
+    return f"{lid}.{group_idx}"
 
 
 class core:
@@ -827,11 +845,14 @@ class core:
         )
 
         bayesian_handles = bayesian_handles or {}
-        # per_model_opts and bayesian_handles are normally disjoint (one
-        # backend per model).  Phase 15 (Pattern B): a layer can appear
-        # in *both* dicts — masked Bayesian head + optax-trained body.
-        # ``opt_states[k]`` is then a ``_MixedState(optax=..., bayesian=...)``
-        # wrapper; the two loops below unwrap the half they need.
+        # ``per_model_opts`` and ``bayesian_handles`` use disjoint key
+        # spaces under the composite-key scheme (Phase 16):
+        #   * ``per_model_opts["<lid>"]``         — optax states (bare keys)
+        #   * ``bayesian_handles["<lid>.<gi>"]``  — Bayesian/VI handles
+        # A layer can have ENTRIES IN BOTH (Pattern B / D / E); each
+        # entry's state lives at its own composite key in ``opt_states``,
+        # so no wrapper is needed and the two loops below iterate
+        # independently without unwrapping.
         opt_keys = sorted(per_model_opts.keys())
         bay_keys = sorted(bayesian_handles.keys())
         base_epoch = self._total_epochs
@@ -851,15 +872,9 @@ class core:
                 model_grads = grads[lid]
                 model_params = trainable[lid]
 
-                # Pattern B: ``opt_states[k]`` is a ``_MixedState``; the
-                # optax half lives on ``.optax``.
-                _cur_state = opt_states[k]
-                _is_mixed = isinstance(_cur_state, _MixedState)
-                _opt_state_in = _cur_state.optax if _is_mixed else _cur_state
-
                 updates, new_state = per_model_opts[k].update(
                     model_grads,
-                    _opt_state_in,
+                    opt_states[k],
                     model_params,
                     value=total_loss,
                     grad=model_grads,
@@ -879,24 +894,19 @@ class core:
                 else:
                     lr_val = lr_schedules[k](base_epoch + start_epoch, individual_losses)
                     new_state[-1].hyperparams["step_size"] = jnp.asarray(
-                        lr_val, dtype=_opt_state_in[-1].hyperparams["step_size"].dtype
+                        lr_val, dtype=opt_states[k][-1].hyperparams["step_size"].dtype
                     )
 
                 trainable = {
                     **trainable,
                     lid: optax.apply_updates(model_params, updates),
                 }
-                # Pattern B: rewrap the new optax state into the MixedState,
-                # preserving the kernel state untouched.
-                opt_states = {
-                    **opt_states,
-                    k: _MixedState(optax=new_state, bayesian=_cur_state.bayesian) if _is_mixed else new_state,
-                }
+                opt_states = {**opt_states, k: new_state}
 
             # ── per-model Bayesian step (blackjax kernels) ──
             # Set of Bayesian lids — chain-indexed slicing applies to these
             # other Bayesian models inside each chain's logdensity closure.
-            _bay_lid_set = {int(_k) for _k in bay_keys}
+            _bay_lid_set = {_lid_of(_k) for _k in bay_keys}
 
             def _pos_of(_state, _kind):
                 # K-leading current position of a kernel state.  SG-MCMC
@@ -904,22 +914,14 @@ class core:
                 # ``.position``; VI states carry the variational mean on
                 # ``.mu`` (used as a per-step representative — actual VI
                 # samples are drawn post-solve from the fitted state).
-                # Unwrap Pattern B's MixedState transparently.
-                if isinstance(_state, _MixedState):
-                    _state = _state.bayesian
                 if _kind == "vi":
                     return _state.mu
                 return _state if _kind == "grad_estimator" else _state.position
 
             for k in bay_keys:
-                lid = int(k)
+                lid = _lid_of(k)
                 handle = bayesian_handles[k]
                 rng, kernel_key = jax.random.split(rng)
-
-                # Pattern B unwrap: kernel half of the MixedState.
-                _cur_state = opt_states[k]
-                _bay_is_mixed = isinstance(_cur_state, _MixedState)
-                _kernel_state_in = _cur_state.bayesian if _bay_is_mixed else _cur_state
 
                 if handle.num_chains == 1:
                     # ── K=1 backward-compat path ──
@@ -944,17 +946,14 @@ class core:
                     new_state, new_position = jno_bayesian.step(
                         handle,
                         kernel_key,
-                        _kernel_state_in,
+                        opt_states[k],
                         trainable[lid],
                         logdensity_fn,
                         grad_estimator,
                         context,
                     )
                     trainable = {**trainable, lid: new_position}
-                    opt_states = {
-                        **opt_states,
-                        k: _MixedState(optax=_cur_state.optax, bayesian=new_state) if _bay_is_mixed else new_state,
-                    }
+                    opt_states = {**opt_states, k: new_state}
                     continue
 
                 # ── K>1 multi-chain path ──
@@ -962,15 +961,34 @@ class core:
                 # from ``opt_states`` (K-leading by construction).
                 # Iterating ``bay_keys`` in sorted order gives
                 # deterministic Gibbs cycling.
-                _bay_positions_K = {int(_bk): _pos_of(opt_states[_bk], bayesian_handles[_bk].kind) for _bk in bay_keys}
+                # K-leading masked-subset positions, keyed by composite
+                # Bayesian key.  For Pattern D + K>1 multiple groups on the
+                # same layer share trainable[lid] but have distinct kernel
+                # states under different composite keys.
+                _bay_positions_K = {_bk: _pos_of(opt_states[_bk], bayesian_handles[_bk].kind) for _bk in bay_keys}
 
                 def logdensity_factory(p, k_idx, _lid=lid, _h=handle, _bay=_bay_lid_set, _bp=_bay_positions_K):
+                    # For K>1 with multiple Bayesian groups on the same
+                    # layer (Pattern D), this group's chain-k logdensity
+                    # uses trainable[_lid] for the unmasked complement
+                    # (which includes other groups' chain-0 positions —
+                    # SAEM-style simplification, mirroring Pattern B's
+                    # treatment of the optax body).  Cross-layer Bayesian
+                    # models continue to use proper chain-aligned slicing.
                     per_chain = {}
                     for _olid, _ov in trainable.items():
                         if _olid == _lid:
                             per_chain[_olid] = p
                         elif _olid in _bay:
-                            per_chain[_olid] = jax.tree_util.tree_map(lambda x, _ki=k_idx: x[_ki], _bp[_olid])
+                            # Pick *any* Bayesian handle on _olid for its
+                            # chain-k position.  For single-group layers
+                            # (the common case) there's exactly one.
+                            _other_keys = [_bk for _bk in _bp if _lid_of(_bk) == _olid]
+                            if _other_keys:
+                                _other_pos = _bp[_other_keys[0]]
+                                per_chain[_olid] = jax.tree_util.tree_map(lambda x, _ki=k_idx: x[_ki], _other_pos)
+                            else:
+                                per_chain[_olid] = _ov
                         else:
                             per_chain[_olid] = _ov
                     nll, _ = loss_fn(per_chain, context, step_rng)
@@ -985,7 +1003,12 @@ class core:
                             if _olid == _lid:
                                 per_chain[_olid] = pp
                             elif _olid in _bay:
-                                per_chain[_olid] = jax.tree_util.tree_map(lambda x, _ki=k_idx: x[_ki], _bp[_olid])
+                                _other_keys = [_bk for _bk in _bp if _lid_of(_bk) == _olid]
+                                if _other_keys:
+                                    _other_pos = _bp[_other_keys[0]]
+                                    per_chain[_olid] = jax.tree_util.tree_map(lambda x, _ki=k_idx: x[_ki], _other_pos)
+                                else:
+                                    per_chain[_olid] = _ov
                             else:
                                 per_chain[_olid] = _ov
                         nll, _ = loss_fn(per_chain, minibatch, step_rng)
@@ -996,7 +1019,7 @@ class core:
                 new_state, new_position = jno_bayesian.step(
                     handle,
                     kernel_key,
-                    _kernel_state_in,
+                    opt_states[k],
                     trainable[lid],
                     logdensity_factory,
                     grad_estimator_factory,
@@ -1008,10 +1031,7 @@ class core:
                 # logging.  Mixed-mode caveat: optax-trained parameters
                 # compute gradients against chain 0 of Bayesian models.
                 trainable = {**trainable, lid: jax.tree_util.tree_map(lambda x: x[0], new_position)}
-                opt_states = {
-                    **opt_states,
-                    k: _MixedState(optax=_cur_state.optax, bayesian=new_state) if _bay_is_mixed else new_state,
-                }
+                opt_states = {**opt_states, k: new_state}
 
             next_epoch = start_epoch + jnp.asarray(1, dtype=start_epoch.dtype)
             return trainable, opt_states, rng, next_epoch, total_loss, individual_losses
@@ -1065,7 +1085,7 @@ class core:
             min_consecutive=min_consecutive,
         )
         bay_keys = sorted(bayesian_handles.keys())
-        _bay_lid_set = {int(_k) for _k in bay_keys}
+        _bay_lid_set = {_lid_of(_k) for _k in bay_keys}
 
         def _pos_of(_state, _kind):
             if _kind == "vi":
@@ -1076,7 +1096,7 @@ class core:
             """Single Bayesian Gibbs cycle — no outer value_and_grad."""
             rng, step_rng = jax.random.split(rng)
             for k in bay_keys:
-                lid = int(k)
+                lid = _lid_of(k)
                 handle = bayesian_handles[k]
                 rng, kernel_key = jax.random.split(rng)
 
@@ -1106,8 +1126,10 @@ class core:
                     )
                     trainable = {**trainable, lid: new_position}
                 else:
-                    # K>1 chain-indexed factories — same as slow-path.
-                    _bay_positions_K = {int(_bk): _pos_of(opt_states[_bk], bayesian_handles[_bk].kind) for _bk in bay_keys}
+                    # K>1 chain-indexed factories — keyed by composite
+                    # Bayesian key so Pattern D's multi-group-per-layer
+                    # case works (each group has its own K-leading state).
+                    _bay_positions_K = {_bk: _pos_of(opt_states[_bk], bayesian_handles[_bk].kind) for _bk in bay_keys}
 
                     def logdensity_factory(p, k_idx, _lid=lid, _h=handle, _bay=_bay_lid_set, _bp=_bay_positions_K):
                         per_chain = {}
@@ -1115,7 +1137,11 @@ class core:
                             if _olid == _lid:
                                 per_chain[_olid] = p
                             elif _olid in _bay:
-                                per_chain[_olid] = jax.tree_util.tree_map(lambda x, _ki=k_idx: x[_ki], _bp[_olid])
+                                _ok = [_bk for _bk in _bp if _lid_of(_bk) == _olid]
+                                if _ok:
+                                    per_chain[_olid] = jax.tree_util.tree_map(lambda x, _ki=k_idx: x[_ki], _bp[_ok[0]])
+                                else:
+                                    per_chain[_olid] = _ov
                             else:
                                 per_chain[_olid] = _ov
                         nll, _ = loss_fn(per_chain, context, step_rng)
@@ -1130,7 +1156,11 @@ class core:
                                 if _olid == _lid:
                                     per_chain[_olid] = pp
                                 elif _olid in _bay:
-                                    per_chain[_olid] = jax.tree_util.tree_map(lambda x, _ki=k_idx: x[_ki], _bp[_olid])
+                                    _ok = [_bk for _bk in _bp if _lid_of(_bk) == _olid]
+                                    if _ok:
+                                        per_chain[_olid] = jax.tree_util.tree_map(lambda x, _ki=k_idx: x[_ki], _bp[_ok[0]])
+                                    else:
+                                        per_chain[_olid] = _ov
                                 else:
                                     per_chain[_olid] = _ov
                             nll, _ = loss_fn(per_chain, minibatch, step_rng)
@@ -1188,14 +1218,12 @@ class core:
                 sample = {}
                 for k in bay_keys:
                     handle = bayesian_handles[k]
-                    lid_k = int(k)
+                    lid_k = _lid_of(k)
                     if handle.param_mask is not None:
                         if handle.num_chains == 1:
                             sample[k] = tr[lid_k]
                         else:
                             _state_k = os_[k]
-                            if isinstance(_state_k, _MixedState):
-                                _state_k = _state_k.bayesian
                             _masked_K = _state_k if handle.kind == "grad_estimator" else _state_k.position
                             _unmasked_full = eqx.filter(tr[lid_k], handle.param_mask, inverse=True)
                             sample[k] = jax.vmap(lambda head_k, _u=_unmasked_full: eqx.combine(head_k, _u))(_masked_K)
@@ -1277,14 +1305,9 @@ class core:
                 model_grads = grads[lid]
                 model_params = trainable[lid]
 
-                # Pattern B: optax half of a MixedState.
-                _cur_state = opt_states[k]
-                _is_mixed = isinstance(_cur_state, _MixedState)
-                _opt_state_in = _cur_state.optax if _is_mixed else _cur_state
-
                 updates, new_state = per_model_opts[k].update(
                     model_grads,
-                    _opt_state_in,
+                    opt_states[k],
                     model_params,
                 )
 
@@ -1300,7 +1323,7 @@ class core:
                     lr_val = lr_schedules[k](base_epoch + epoch, prev_losses)
                     new_state[-1].hyperparams["step_size"] = jnp.asarray(
                         lr_val,
-                        dtype=_opt_state_in[-1].hyperparams["step_size"].dtype,
+                        dtype=opt_states[k][-1].hyperparams["step_size"].dtype,
                     )
 
                 trainable = {
@@ -1309,7 +1332,7 @@ class core:
                 }
                 opt_states = {
                     **opt_states,
-                    k: _MixedState(optax=new_state, bayesian=_cur_state.bayesian) if _is_mixed else new_state,
+                    k: new_state,
                 }
 
             return trainable, opt_states
@@ -1912,7 +1935,8 @@ class core:
                         ".mask(M).bayesian() calls, or drop the masks."
                     )
                 handle = jno_bayesian.build_kernel_handle(fm._bayesian_cfg)
-                bayesian_handles[k] = handle
+                # Composite key: single group → group_idx=0.
+                bayesian_handles[_bay_key(lid, 0)] = handle
                 self.log.info(
                     f"Model {lid}: Bayesian sampling via "
                     f"{getattr(handle.factory, '__name__', handle.factory)!r} "
@@ -1933,7 +1957,7 @@ class core:
                         "groups.  Use .mask(M).vi(...) instead."
                     )
                 handle = jno_bayesian.build_vi_handle(fm._vi_cfg)
-                bayesian_handles[k] = handle
+                bayesian_handles[_bay_key(lid, 0)] = handle
                 self.log.info(
                     f"Model {lid}: variational inference via "
                     f"{getattr(handle.factory, '__name__', handle.factory)!r} "
@@ -1942,44 +1966,69 @@ class core:
                 )
                 continue
 
-            # Masked .bayesian() / .vi() — a single group entry tagged
-            # with backend in {"bayesian", "vi"}.  Phase 15 lifts the
-            # v1 Pattern B block: when ``fm._opt_fn`` is also set, the
-            # global optimiser is applied to the **complement** of the
-            # masked subset (the body), and the kernel state coexists
-            # with the optax state under one ``opt_states[k]`` via the
-            # ``_MixedState`` wrapper.
+            # Phase 16: multiple non-optax groups on the same model.  Each
+            # group becomes its own composite-keyed handle in
+            # ``bayesian_handles`` (``"<lid>.<group_idx>"``).  Pattern B
+            # (optax + Bayesian/VI on the same model) coexists via the
+            # bare optax key ``"<lid>"`` in ``per_model_opts``.  Pattern D
+            # (multiple disjoint Bayesian groups) and Pattern E (mixed
+            # VI + MCMC on disjoint masks) both fall out of this scheme.
             if _non_optax_groups:
-                if len(_non_optax_groups) > 1:
-                    raise NotImplementedError(
-                        f"Model (layer {lid}): multiple masked .bayesian()/.vi() groups "
-                        "on the same model are not yet supported (Phase 11 v1).  "
-                        "Use one masked group at a time."
-                    )
                 if _optax_groups:
                     raise NotImplementedError(
                         f"Model (layer {lid}): combining .mask().bayesian()/.vi() with "
-                        ".mask().optimizer() groups is not yet supported (Phase 11 v1)."
+                        ".mask().optimizer() groups is not yet supported."
                     )
-                _g = _non_optax_groups[0]
-                if _g["backend"] == "bayesian":
-                    handle = jno_bayesian.build_kernel_handle(_g["bayesian_cfg"])
-                else:
-                    handle = jno_bayesian.build_vi_handle(_g["vi_cfg"])
-                handle.param_mask = _g["mask"]
-                bayesian_handles[k] = handle
+
+                # Pattern E strict matching: when a layer mixes VI and
+                # MCMC handles on disjoint masks, the MCMC ``keep`` and
+                # the VI ``posterior_draws`` must match — they share the
+                # layer's per-sample chain index after combination.
+                _ng_kinds = []
+                _ng_lens = []
+                for _g_check in _non_optax_groups:
+                    if _g_check["backend"] == "vi":
+                        _vh_tmp = jno_bayesian.build_vi_handle(_g_check["vi_cfg"])
+                        _ng_kinds.append("vi")
+                        _ng_lens.append(("vi", _vh_tmp.vi_posterior_draws))
+                    else:
+                        _kh_tmp = jno_bayesian.build_kernel_handle(_g_check["bayesian_cfg"])
+                        _ng_kinds.append("bayesian")
+                        _ng_lens.append(("bayesian", _kh_tmp.keep))
+                _has_vi = "vi" in _ng_kinds
+                _has_bay = "bayesian" in _ng_kinds
+                if _has_vi and _has_bay:
+                    _unique_lens = {n for _, n in _ng_lens}
+                    if len(_unique_lens) > 1:
+                        raise ValueError(
+                            f"Model (layer {lid}): Pattern E requires every group's chain "
+                            f"length to match across the mixed VI / MCMC groups.  Got: "
+                            f"{_ng_lens}.  Set ``keep`` on the MCMC group(s) equal to "
+                            f"``posterior_draws`` on the VI group(s), or stick to one "
+                            f"backend per layer."
+                        )
+
+                # Build one handle per group; key each on (lid, group_idx).
+                for _gi, _g in enumerate(_non_optax_groups):
+                    if _g["backend"] == "bayesian":
+                        handle = jno_bayesian.build_kernel_handle(_g["bayesian_cfg"])
+                    else:
+                        handle = jno_bayesian.build_vi_handle(_g["vi_cfg"])
+                    handle.param_mask = _g["mask"]
+                    bayesian_handles[_bay_key(lid, _gi)] = handle
                 self.log.info(
-                    f"Model {lid}: masked {_g['backend']} via "
-                    f"{getattr(handle.factory, '__name__', handle.factory)!r} "
-                    f"(restricted to .mask() scope)"
+                    f"Model {lid}: {len(_non_optax_groups)} masked Bayesian/VI group(s) "
+                    f"(Pattern D enabled = {len(_non_optax_groups) > 1}; mixed VI+MCMC = "
+                    f"{_has_vi and _has_bay})"
                 )
+
                 # If no optax-tagged groups and no global optimiser, the
-                # complement of the mask is implicitly frozen — done.
+                # complement of all masks is implicitly frozen — done.
                 if not _optax_groups and fm._opt_fn is None:
                     continue
                 # Otherwise fall through to the optax block.  Pattern B:
-                # the optax chain's default mask excludes the masked
-                # subset (which is owned by the Bayesian kernel).
+                # the optax chain's default mask excludes EVERY masked
+                # subset owned by a Bayesian/VI group.
 
             # Phase 15 (Pattern B): the per-group optax chain also triggers
             # when only ``_non_optax_groups`` are present together with a
@@ -2145,26 +2194,16 @@ class core:
         else:
             _num_chains_global = 1
 
-        # Initialise optimizer / kernel states and place on mesh.  We
-        # iterate the union of optax and Bayesian keys; each model has
-        # either one backend (the historical case) or both for Pattern B
-        # (masked Bayesian head + optax-trained body on the same model)
-        # — those land in a ``_MixedState`` wrapper.
+        # Initialise optimizer / kernel states and place on mesh.  Each
+        # key in ``per_model_opts`` (bare ``"<lid>"``) initialises its
+        # own optax state; each key in ``bayesian_handles`` (composite
+        # ``"<lid>.<group_idx>"``) initialises its own kernel state.
+        # Pattern B / D / E layers therefore have multiple entries in
+        # ``opt_states`` under different keys, all sharing ``trainable[lid]``.
         opt_states = {}
         for k in sorted({*per_model_opts.keys(), *bayesian_handles.keys()}):
-            lid = int(k)
-            _has_bay = k in bayesian_handles
-            _has_opt = k in per_model_opts
-            if _has_bay and _has_opt:
-                # Pattern B: build both states and wrap.  Init the
-                # optax state on the full pytree (the masked transforms
-                # inside the chain skip the head leaves anyway) and the
-                # kernel state on the masked subset.
-                self.rng, _bay_init_key = jax.random.split(self.rng)
-                _bay_state = jno_bayesian.init_state(bayesian_handles[k], trainable[lid], _bay_init_key)
-                _opt_state = per_model_opts[k].init(trainable[lid])
-                state = _MixedState(optax=_opt_state, bayesian=_bay_state)
-            elif _has_bay:
+            lid = _lid_of(k)
+            if k in bayesian_handles:
                 # Per-chain jitter is drawn from a key split off self.rng so
                 # multi-chain runs get reproducible over-dispersion.
                 self.rng, _bay_init_key = jax.random.split(self.rng)
@@ -2269,7 +2308,7 @@ class core:
         _init_candidates = [
             (k, h)
             for k, h in bayesian_handles.items()
-            if getattr(flax_mods.get(int(k)), "_bayesian_initializer", None) is not None
+            if getattr(flax_mods.get(_lid_of(k)), "_bayesian_initializer", None) is not None
         ]
         # VI + initializer: VI configures ``state.mu = position`` itself
         # at init_state time (block 6); a logdensity-aware warm-start
@@ -2277,7 +2316,7 @@ class core:
         for _bk, _h in _init_candidates:
             if _h.kind == "vi":
                 raise ValueError(
-                    f"Model {int(_bk)}: .vi(...) is not compatible with "
+                    f"Model {_lid_of(_bk)}: .vi(...) is not compatible with "
                     f".initialize(jno.bayesian.<initializer>) — VI initialises its own "
                     f"variational distribution from the model's current position. "
                     f"Either drop the .initialize(...) call or switch to .bayesian(...)."
@@ -2319,7 +2358,7 @@ class core:
         # ── 6a body — run each logdensity-aware initializer ──
         if _init_candidates:
             for _bk, _handle in _init_candidates:
-                _lid = int(_bk)
+                _lid = _lid_of(_bk)
                 _fm = flax_mods[_lid]
                 _initializer = _fm._bayesian_initializer
                 _mask = _handle.param_mask
@@ -2411,13 +2450,11 @@ class core:
                     ),
                     _new_state,
                 )
-                # Pattern B: if this layer also has an optax state under
-                # the same key, preserve it inside the MixedState wrapper.
-                _prev_state = opt_states[_bk]
-                if isinstance(_prev_state, _MixedState):
-                    opt_states[_bk] = _MixedState(optax=_prev_state.optax, bayesian=_new_state_sharded)
-                else:
-                    opt_states[_bk] = _new_state_sharded
+                # Composite keys: optax state lives under the bare
+                # ``"<lid>"`` key, this kernel state under
+                # ``"<lid>.<group_idx>"`` — independent slots, just
+                # overwrite the Bayesian one.
+                opt_states[_bk] = _new_state_sharded
 
                 # If K>1 and init_jitter was also set, log that
                 # pathfinder's per-chain dispersion takes precedence.
@@ -2431,7 +2468,7 @@ class core:
 
         if _adapt_candidates:
             for _bk, _handle in _adapt_candidates:
-                _lid = int(_bk)
+                _lid = _lid_of(_bk)
 
                 def _ld_fn(p, _lid=_lid, _h=_handle, _key=_adapt_key_for_loss):
                     full = {**trainable, _lid: p}
@@ -2455,12 +2492,9 @@ class core:
                         lambda x, _K=_K_bay: jnp.stack([x] * _K, axis=0) if isinstance(x, (jnp.ndarray, jax.Array)) else x,
                         _adapted_state,
                     )
-                # Pattern B: preserve the optax half of any MixedState.
-                _prev_state = opt_states[_bk]
-                if isinstance(_prev_state, _MixedState):
-                    opt_states[_bk] = _MixedState(optax=_prev_state.optax, bayesian=_new_kernel)
-                else:
-                    opt_states[_bk] = _new_kernel
+                # Composite keys: kernel state at ``"<lid>.<group_idx>"``,
+                # independent from any optax state at ``"<lid>"``.
+                opt_states[_bk] = _new_kernel
                 # main loop collects from epoch 0
                 _handle.warmup = 0
                 self.log.info(f"Model {_lid}: window adaptation done — step_size={_adapted_kwargs['step_size']:.4g}")
@@ -2653,12 +2687,12 @@ class core:
                     # Per-substep Bayesian handles — only kernels for models
                     # whose params receive non-zero gradient from this
                     # substep's constraints participate in this substep.
-                    _bayesian_handles_i = {k: v for k, v in bayesian_handles.items() if int(k) in _active_lids}
+                    _bayesian_handles_i = {k: v for k, v in bayesian_handles.items() if _lid_of(k) in _active_lids}
 
                     # Fresh optimizer / kernel states — isolated from other substeps
                     _opt_states_i: Dict[str, Any] = {}
                     for _k in sorted({*_per_model_opts_i.keys(), *_bayesian_handles_i.keys()}):
-                        _lid_i = int(_k)
+                        _lid_i = _lid_of(_k)
                         if _k in _bayesian_handles_i:
                             self.rng, _bay_init_key_i = jax.random.split(self.rng)
                             _state_i = jno_bayesian.init_state(_bayesian_handles_i[_k], trainable[_lid_i], _bay_init_key_i)
@@ -3065,7 +3099,7 @@ class core:
                         for _ci, _cv in enumerate(_ind_np):
                             _wb[f"constraint_{_ci}"] = float(_cv)
                         for _bk_w, _h_w in bayesian_handles.items():
-                            _fm_w = flax_mods.get(int(_bk_w))
+                            _fm_w = flax_mods.get(_lid_of(_bk_w))
                             if _fm_w is None:
                                 continue
                             _name_w = _fm_w.name or f"model{_bk_w}"
@@ -3378,11 +3412,8 @@ class core:
                         _buf = _bayesian_buffers[_bk]
                         if len(_buf) >= _handle.keep:
                             continue
-                        _lid_int = int(_bk)
+                        _lid_int = _lid_of(_bk)
                         _state_for_sample = opt_states[_bk]
-                        # Pattern B: unwrap to the kernel half of MixedState.
-                        if isinstance(_state_for_sample, _MixedState):
-                            _state_for_sample = _state_for_sample.bayesian
                         if _handle.param_mask is not None:
                             # Masked Bayesian.  The kernel state holds the
                             # masked subset (K-leading for K>1); the unmasked
@@ -3448,7 +3479,7 @@ class core:
                     # group panels by chain.  Acceptance probability would
                     # need plumbing the kernel info from the step; deferred.
                     for _bk, _handle in bayesian_handles.items():
-                        _lid_int = int(_bk)
+                        _lid_int = _lid_of(_bk)
                         _fm = flax_mods.get(_lid_int)
                         if _fm is None:
                             continue
@@ -3559,72 +3590,91 @@ class core:
             for lid, fm in flax_mods.items():
                 fm.module = trained_models[lid]
 
-            # ── 9c. Flush Bayesian sample buffers ──
-            # Each buffer entry is a module-shaped pytree with a leading
-            # *chunk* axis: ``(1, *param)`` for slow-path single-step
-            # collection, ``(chunk_keep, *param)`` (K=1) or
-            # ``(chunk_keep, K, *param)`` (K>1) for the MCMC fastpath.
-            # Concatenating along axis 0 unifies both cases into
-            # ``(N, *param)`` (K=1) or ``(N, K, *param)`` (K>1); the K
-            # axis is then either added (K=1) or swapped to front (K>1)
-            # to produce the canonical arviz ``(chain, draw, *)`` layout.
-            for _bk, _buf in _bayesian_buffers.items():
-                _lid_int = int(_bk)
-                _fm = flax_mods.get(_lid_int)
-                if _fm is None:
-                    continue
-                if len(_buf) == 0:
-                    _fm._posterior_samples_pytree = None
-                    continue
-                _K_flush = bayesian_handles[_bk].num_chains
-                # Step 1: concatenate all chunks along axis 0.
-                joined = jax.tree_util.tree_map(
-                    lambda *xs: jnp.concatenate(xs, axis=0),
-                    *_buf,
-                )
-                # Step 2: reshape to the user-facing ``(K, N, *param)``.
-                if _K_flush == 1:
-                    _fm._posterior_samples_pytree = jax.tree_util.tree_map(
-                        lambda x: x[None, ...],
-                        joined,
-                    )
-                else:
-                    _fm._posterior_samples_pytree = jax.tree_util.tree_map(
-                        lambda x: jnp.swapaxes(x, 0, 1),
-                        joined,
-                    )
+            # ── 9c. Flush Bayesian sample buffers (Pattern D + E aware) ──
+            #
+            # Group handles by layer.  For each layer:
+            #
+            #   * **MCMC-only**, single group — chain is the buffer's
+            #     concatenation reshaped to ``(K, N, *full)``.
+            #   * **MCMC-only**, multi-group (Pattern D) — use the LAST
+            #     handle's buffer (by sort order); it captures
+            #     ``trainable[lid]`` AFTER all groups' kernels fired in
+            #     the epoch, so it has every group's updates.
+            #   * **Mixed VI + MCMC** (Pattern E) — use the LAST MCMC
+            #     handle's buffer as the base chain, then splice each
+            #     VI handle's i.i.d. draws (from its fitted q) at the
+            #     VI mask's leaves.  Strict-matching (enforced at solve
+            #     start) guarantees ``keep == posterior_draws``.
+            #   * **VI-only** — build the chain entirely from VI draws,
+            #     using the first VI handle's samples as the base and
+            #     splicing additional VI handles at their masks.
+            from collections import defaultdict as _defaultdict
 
-            # ── 9d. Variational posterior draws ──
-            # For each VI handle, draw ``vi_posterior_draws`` i.i.d. samples
-            # from the fitted variational distribution and overwrite the
-            # per-step buffer with these proper posterior samples.  Layout
-            # ``(1, posterior_draws, *param)`` matches the MCMC posterior
-            # shape so downstream code (crux.eval, rhat, ess) is uniform.
-            for _bk, _handle in bayesian_handles.items():
-                if _handle.kind != "vi":
-                    continue
-                _lid_int = int(_bk)
+            _handles_by_lid: dict = _defaultdict(list)
+            for _bk in sorted(bayesian_handles.keys()):
+                _handles_by_lid[_lid_of(_bk)].append((_bk, bayesian_handles[_bk]))
+
+            def _splice_vi_into_chain(base_chain, vi_samples, vi_mask):
+                """Replace ``vi_mask``-True leaves in ``base_chain`` (shape
+                ``(K, N, *full)``) with values from ``vi_samples`` (shape
+                ``(N, *masked)``).  ``vi_samples`` is broadcast across the
+                K axis."""
+
+                def _per_n(base_n, vi_n):
+                    return eqx.combine(vi_n, eqx.filter(base_n, vi_mask, inverse=True))
+
+                def _per_k(base_kn):
+                    return jax.vmap(_per_n)(base_kn, vi_samples)
+
+                return jax.vmap(_per_k)(base_chain)
+
+            for _lid_int, _layer_handles in _handles_by_lid.items():
                 _fm = flax_mods.get(_lid_int)
                 if _fm is None:
                     continue
-                self.rng, _vi_draw_key = jax.random.split(self.rng)
-                # Pattern B: unwrap MixedState to the VI half before sampling.
-                _vi_state = opt_states[_bk]
-                if isinstance(_vi_state, _MixedState):
-                    _vi_state = _vi_state.bayesian
-                _samples = jno_bayesian.vi_sample(_handle, _vi_state, _vi_draw_key, _handle.vi_posterior_draws)
-                # _samples is a pytree with leading axis = posterior_draws.
-                # For masked VI: ``_samples`` only covers the masked
-                # subset; reassemble each draw with the unmasked
-                # snapshot (constant across draws).
-                if _handle.param_mask is not None:
-                    _unmasked_snap = eqx.filter(trainable[_lid_int], _handle.param_mask, inverse=True)
-                    _samples = jax.vmap(lambda p: eqx.combine(p, _unmasked_snap))(_samples)
-                # Add the canonical K-axis at position 0.
-                _fm._posterior_samples_pytree = jax.tree_util.tree_map(
-                    lambda x: jnp.copy(x)[None, ...] if isinstance(x, (jnp.ndarray, jax.Array)) else x,
-                    _samples,
-                )
+
+                _mcmc_entries = [(bk, h) for bk, h in _layer_handles if h.kind != "vi"]
+                _vi_entries = [(bk, h) for bk, h in _layer_handles if h.kind == "vi"]
+
+                base_chain = None
+
+                # Step 1: build base chain from MCMC buffers (last handle wins
+                # for Pattern D — its buffer has all groups' updates).
+                if _mcmc_entries:
+                    _base_bk, _base_h = _mcmc_entries[-1]
+                    _buf = _bayesian_buffers[_base_bk]
+                    if len(_buf) == 0:
+                        _fm._posterior_samples_pytree = None
+                        continue
+                    _K_flush = _base_h.num_chains
+                    joined = jax.tree_util.tree_map(lambda *xs: jnp.concatenate(xs, axis=0), *_buf)
+                    if _K_flush == 1:
+                        base_chain = jax.tree_util.tree_map(lambda x: x[None, ...], joined)
+                    else:
+                        base_chain = jax.tree_util.tree_map(lambda x: jnp.swapaxes(x, 0, 1), joined)
+
+                # Step 2: VI splicing (Pattern E) or VI-only chain build.
+                for _vi_bk, _vi_h in _vi_entries:
+                    self.rng, _vi_draw_key = jax.random.split(self.rng)
+                    _samples = jno_bayesian.vi_sample(
+                        _vi_h, opt_states[_vi_bk], _vi_draw_key, _vi_h.vi_posterior_draws
+                    )  # (N, *masked or *full)
+                    if base_chain is None:
+                        # VI-only layer or first VI in a VI-only layer.
+                        if _vi_h.param_mask is not None:
+                            _unmasked = eqx.filter(trainable[_lid_int], _vi_h.param_mask, inverse=True)
+                            _samples = jax.vmap(lambda p: eqx.combine(p, _unmasked))(_samples)
+                        base_chain = jax.tree_util.tree_map(lambda x: x[None, ...], _samples)
+                    else:
+                        if _vi_h.param_mask is None:
+                            # Non-masked VI in a multi-group layer doesn't
+                            # really make sense (the VI's variational
+                            # parameters cover the whole pytree); skip
+                            # splicing and trust the MCMC chain.
+                            continue
+                        base_chain = _splice_vi_into_chain(base_chain, _samples, _vi_h.param_mask)
+
+                _fm._posterior_samples_pytree = base_chain
 
             # ── 10. Build log dict ──
             logs = {
