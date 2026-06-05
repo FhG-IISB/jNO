@@ -232,6 +232,14 @@ class _KernelHandle:
         # NamedTuple — populated from :func:`_detect_diagnostic_fields`
         # at handle creation.  Empty tuple for SG-MCMC / VI.
         "diagnostic_fields",
+        # Likelihood scale: multiplier on the negative-log-likelihood
+        # term in the logdensity closure.  Default 1.0; users tuning a
+        # Gaussian-noise problem typically pass ``N_obs`` (so that
+        # ``residual.mse`` — which returns a *mean* — matches the
+        # canonical *sum* over data points).  Without this VI is
+        # silently driven by the prior alone on multi-thousand-point
+        # PINN losses.
+        "likelihood_scale",
     )
 
     def __init__(
@@ -251,6 +259,7 @@ class _KernelHandle:
         vi_num_samples: int = 8,
         vi_posterior_draws: int = 500,
         param_mask=None,
+        likelihood_scale: float = 1.0,
     ):
         self.factory = factory
         self.kind = kind
@@ -268,6 +277,7 @@ class _KernelHandle:
         self.vi_posterior_draws = int(vi_posterior_draws)
         self.param_mask = param_mask
         self.diagnostic_fields = _detect_diagnostic_fields(factory, kind)
+        self.likelihood_scale = float(likelihood_scale)
 
 
 def build_vi_handle(cfg: dict) -> _KernelHandle:
@@ -300,6 +310,9 @@ def build_vi_handle(cfg: dict) -> _KernelHandle:
     posterior_draws = int(cfg.get("posterior_draws", 500))
     if num_samples < 1 or posterior_draws < 1:
         raise ValueError("num_samples>=1, posterior_draws>=1 are required.")
+    likelihood_scale = float(cfg.get("likelihood_scale", 1.0))
+    if likelihood_scale <= 0.0:
+        raise ValueError(f"likelihood_scale must be positive, got {likelihood_scale!r}.")
     return _KernelHandle(
         factory=factory,
         kind="vi",
@@ -315,6 +328,7 @@ def build_vi_handle(cfg: dict) -> _KernelHandle:
         vi_optimizer=optimizer,
         vi_num_samples=num_samples,
         vi_posterior_draws=posterior_draws,
+        likelihood_scale=likelihood_scale,
     )
 
 
@@ -370,16 +384,43 @@ def build_kernel_handle(cfg: dict) -> _KernelHandle:
             )
     num_chains = int(cfg.get("num_chains", 1))
     init_jitter = float(cfg.get("init_jitter", 0.0))
+    likelihood_scale = float(cfg.get("likelihood_scale", 1.0))
     if warmup < 0 or keep < 0 or thin < 1:
         raise ValueError("warmup>=0, keep>=0, thin>=1 are required.")
     if num_chains < 1:
         raise ValueError(f"num_chains must be >= 1, got {num_chains}.")
+    if likelihood_scale <= 0.0:
+        raise ValueError(f"likelihood_scale must be positive, got {likelihood_scale!r}.")
 
     if kind == "full":
         extra = {**user_kwargs, "step_size": float(step_size)}
-        return _KernelHandle(factory, kind, prior_fn, None, extra, warmup, keep, thin, adapt, num_chains, init_jitter)
+        return _KernelHandle(
+            factory,
+            kind,
+            prior_fn,
+            None,
+            extra,
+            warmup,
+            keep,
+            thin,
+            adapt,
+            num_chains,
+            init_jitter,
+            likelihood_scale=likelihood_scale,
+        )
     return _KernelHandle(
-        factory, kind, prior_fn, float(step_size), user_kwargs, warmup, keep, thin, adapt, num_chains, init_jitter
+        factory,
+        kind,
+        prior_fn,
+        float(step_size),
+        user_kwargs,
+        warmup,
+        keep,
+        thin,
+        adapt,
+        num_chains,
+        init_jitter,
+        likelihood_scale=likelihood_scale,
     )
 
 

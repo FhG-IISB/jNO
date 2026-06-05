@@ -938,13 +938,13 @@ class core:
                     def logdensity_fn(p, _lid=lid, _h=handle):
                         full = {**trainable, _lid: p}
                         nll, _ = loss_fn(full, context, step_rng)
-                        return -nll + _h.prior_fn(p)
+                        return -_h.likelihood_scale * nll + _h.prior_fn(p)
 
                     def grad_estimator(p, minibatch, _lid=lid, _h=handle):
                         def neg_log_post(pp):
                             full = {**trainable, _lid: pp}
                             nll, _ = loss_fn(full, minibatch, step_rng)
-                            return -nll + _h.prior_fn(pp)
+                            return -_h.likelihood_scale * nll + _h.prior_fn(pp)
 
                         return jax.grad(neg_log_post)(p)
 
@@ -998,7 +998,7 @@ class core:
                         else:
                             per_chain[_olid] = _ov
                     nll, _ = loss_fn(per_chain, context, step_rng)
-                    return -nll + _h.prior_fn(p)
+                    return -_h.likelihood_scale * nll + _h.prior_fn(p)
 
                 def grad_estimator_factory(
                     p, minibatch, k_idx, _lid=lid, _h=handle, _bay=_bay_lid_set, _bp=_bay_positions_K
@@ -1018,7 +1018,7 @@ class core:
                             else:
                                 per_chain[_olid] = _ov
                         nll, _ = loss_fn(per_chain, minibatch, step_rng)
-                        return -nll + _h.prior_fn(pp)
+                        return -_h.likelihood_scale * nll + _h.prior_fn(pp)
 
                     return jax.grad(neg_log_post)(p)
 
@@ -1113,13 +1113,13 @@ class core:
                     def logdensity_fn(p, _lid=lid, _h=handle):
                         full = {**trainable, _lid: p}
                         nll, _ = loss_fn(full, context, step_rng)
-                        return -nll + _h.prior_fn(p)
+                        return -_h.likelihood_scale * nll + _h.prior_fn(p)
 
                     def grad_estimator(p, minibatch, _lid=lid, _h=handle):
                         def neg_log_post(pp):
                             full = {**trainable, _lid: pp}
                             nll, _ = loss_fn(full, minibatch, step_rng)
-                            return -nll + _h.prior_fn(pp)
+                            return -_h.likelihood_scale * nll + _h.prior_fn(pp)
 
                         return jax.grad(neg_log_post)(p)
 
@@ -1153,7 +1153,7 @@ class core:
                             else:
                                 per_chain[_olid] = _ov
                         nll, _ = loss_fn(per_chain, context, step_rng)
-                        return -nll + _h.prior_fn(p)
+                        return -_h.likelihood_scale * nll + _h.prior_fn(p)
 
                     def grad_estimator_factory(
                         p, minibatch, k_idx, _lid=lid, _h=handle, _bay=_bay_lid_set, _bp=_bay_positions_K
@@ -1172,7 +1172,7 @@ class core:
                                 else:
                                     per_chain[_olid] = _ov
                             nll, _ = loss_fn(per_chain, minibatch, step_rng)
-                            return -nll + _h.prior_fn(pp)
+                            return -_h.likelihood_scale * nll + _h.prior_fn(pp)
 
                         return jax.grad(neg_log_post)(p)
 
@@ -2405,14 +2405,14 @@ class core:
                         full_p = eqx.combine(p_masked, _unm)
                         full = {**trainable, _lid: full_p}
                         nll, _ = _adapt_loss_fn(full, _adapt_ctx, _key)
-                        return -nll + _h.prior_fn(p_masked)
+                        return -_h.likelihood_scale * nll + _h.prior_fn(p_masked)
                 else:
                     _input_position = _full_position
 
                     def _ld_fn(p, _lid=_lid, _h=_handle, _key=_adapt_key_for_loss):
                         full = {**trainable, _lid: p}
                         nll, _ = _adapt_loss_fn(full, _adapt_ctx, _key)
-                        return -nll + _h.prior_fn(p)
+                        return -_h.likelihood_scale * nll + _h.prior_fn(p)
 
                 # Master PRNG: user-supplied key wins; else derived
                 # from self.rng so multi-init runs stay reproducible.
@@ -2496,7 +2496,7 @@ class core:
                 def _ld_fn(p, _lid=_lid, _h=_handle, _key=_adapt_key_for_loss):
                     full = {**trainable, _lid: p}
                     nll, _ = _adapt_loss_fn(full, _adapt_ctx, _key)
-                    return -nll + _h.prior_fn(p)
+                    return -_h.likelihood_scale * nll + _h.prior_fn(p)
 
                 self.rng, _adapt_key = jax.random.split(self.rng)
                 _adapt_out = jno_bayesian.run_window_adaptation(_handle, trainable[_lid], _ld_fn, _adapt_key)

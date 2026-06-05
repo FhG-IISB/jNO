@@ -1504,6 +1504,7 @@ class Model(Placeholder):
         adapt: bool = True,
         num_chains: int = 1,
         init_jitter: float = 0.0,
+        likelihood_scale: float = 1.0,
         **kernel_kwargs,
     ):
         """Sample this model's parameters from a posterior via blackjax.
@@ -1585,6 +1586,16 @@ class Model(Placeholder):
                 over-dispersion (gives a more conservative R-hat).
                 Default 0.0 = all chains start from the same point with
                 different PRNG keys.
+            likelihood_scale: Multiplier on the negative log-likelihood
+                term in the per-step logdensity.  Default ``1.0``.  The
+                canonical Gaussian-noise log-likelihood is a *sum* over
+                data points; jno's ``residual.mse`` returns a *mean*.
+                Pass ``N_obs`` (the data-point count) — or
+                ``N_obs / sigma**2`` more generally — to recover the
+                correct posterior magnitude.  Without this, MCMC chains
+                on multi-thousand-point PINN losses move much more
+                slowly than they should and VI is often stuck near the
+                prior.
             **kernel_kwargs: Forwarded to ``kernel_factory``.  ``step_size``
                 is optional for HMC-family kernels (NUTS / HMC) when
                 ``adapt=True`` and ``warmup > 0`` — window adaptation
@@ -1597,6 +1608,8 @@ class Model(Placeholder):
         """
         if int(num_chains) < 1:
             raise ValueError(f"num_chains must be >= 1, got {num_chains}.")
+        if float(likelihood_scale) <= 0.0:
+            raise ValueError(f"likelihood_scale must be positive, got {likelihood_scale!r}.")
         if getattr(self, "_vi_cfg", None) is not None:
             raise ValueError("Model already has .vi(...) configured; .bayesian() and .vi() are mutually exclusive.")
         cfg = {
@@ -1609,6 +1622,7 @@ class Model(Placeholder):
             "adapt": bool(adapt),
             "num_chains": int(num_chains),
             "init_jitter": float(init_jitter),
+            "likelihood_scale": float(likelihood_scale),
         }
         if self._mask_scope_pending and self._param_mask is not None:
             # Masked branch: register this kernel as a per-group backend
@@ -1641,6 +1655,7 @@ class Model(Placeholder):
         num_samples: int = 8,
         posterior_draws: int = 500,
         prior=None,
+        likelihood_scale: float = 1.0,
         **factory_kwargs,
     ):
         """Fit a variational approximation to this model's posterior.
@@ -1690,6 +1705,16 @@ class Model(Placeholder):
             prior: Optional ``pytree -> float`` log-prior.  Default: the
                 same wide isotropic Gaussian (σ=10) used by
                 :meth:`bayesian`.
+            likelihood_scale: Multiplier on the negative log-likelihood
+                term in the ELBO.  Default ``1.0``.  The canonical
+                Gaussian-noise log-likelihood is a *sum* over data
+                points; jno's ``residual.mse`` returns a *mean*.  For
+                mean-field VI in particular, pass ``N_obs`` (or
+                ``N_obs / sigma**2``) so the likelihood actually pulls
+                the variational mean away from the prior.  Without
+                this, VI is often stuck near its initialisation
+                because the prior dominates by a factor of
+                ``N_obs``.
             **factory_kwargs: Forwarded to ``factory``.  E.g. an explicit
                 ``objective=blackjax.vi.meanfield_vi.RenyiAlpha(alpha=0.5)``
                 or ``stl_estimator=False``.
@@ -1703,6 +1728,8 @@ class Model(Placeholder):
             raise ValueError(f"num_samples must be >= 1, got {num_samples}.")
         if int(posterior_draws) < 1:
             raise ValueError(f"posterior_draws must be >= 1, got {posterior_draws}.")
+        if float(likelihood_scale) <= 0.0:
+            raise ValueError(f"likelihood_scale must be positive, got {likelihood_scale!r}.")
         cfg = {
             "factory": factory,
             "optimizer": optimizer,
@@ -1710,6 +1737,7 @@ class Model(Placeholder):
             "posterior_draws": int(posterior_draws),
             "prior": prior,
             "factory_kwargs": dict(factory_kwargs),
+            "likelihood_scale": float(likelihood_scale),
         }
         if self._mask_scope_pending and self._param_mask is not None:
             # Masked branch — register VI as a per-group backend on the
