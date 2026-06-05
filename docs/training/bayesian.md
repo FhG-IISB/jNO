@@ -59,7 +59,9 @@ Model.bayesian(
     warmup=500,                 # outer epochs to discard before collecting
     keep=1000,                  # number of post-warmup samples to retain
     thin=1,                     # keep one sample every `thin` post-warmup steps
-    **kernel_kwargs,            # forwarded to kernel_factory; must include step_size=
+    **kernel_kwargs,            # forwarded to kernel_factory; `step_size=` is required
+                                # EXCEPT for HMC-family kernels with adapt=True + warmup>0
+                                # (window adaptation chooses one — defaults to 1.0).
 )
 ```
 

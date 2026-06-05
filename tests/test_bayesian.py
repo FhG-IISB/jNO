@@ -367,11 +367,59 @@ class TestSubstepsWithBayesian:
 
 
 class TestMissingStepSize:
-    def test_no_step_size_raises_clearly(self):
+    def test_no_step_size_with_adapt_false_raises_clearly(self):
         a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
-        # Configure without step_size — the error fires inside solve(), when
-        # build_kernel_handle runs.
-        a.bayesian(blackjax.nuts, inverse_mass_matrix=jnp.ones(1))
+        # Without window adaptation NUTS has no way to pick a step size,
+        # so the missing kwarg must still raise.
+        a.bayesian(blackjax.nuts, inverse_mass_matrix=jnp.ones(1), adapt=False)
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        residual = a * jno.np.sin(jno.np.pi * x) - jno.np.sin(jno.np.pi * x)
+        crux = jno.core([residual.mse], dom)
+        with pytest.raises(ValueError, match="requires a step_size"):
+            crux.solve(2)
+
+    def test_no_step_size_with_mala_raises_clearly(self):
+        # MALA has no inverse_mass_matrix parameter — it's not HMC-family,
+        # so the adapt-route default doesn't apply.
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.bayesian(blackjax.mala, warmup=2, keep=2)
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        residual = a * jno.np.sin(jno.np.pi * x) - jno.np.sin(jno.np.pi * x)
+        crux = jno.core([residual.mse], dom)
+        with pytest.raises(ValueError, match="requires a step_size"):
+            crux.solve(4)
+
+    def test_adapt_true_nuts_omits_step_size(self):
+        # The common case: just give NUTS warmup + keep and let
+        # blackjax.window_adaptation choose step_size.  No step_size
+        # kwarg, no raise.
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.bayesian(blackjax.nuts, warmup=20, keep=10)  # adapt=True default
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        residual = a * jno.np.sin(jno.np.pi * x) - jno.np.sin(jno.np.pi * x)
+        jno.core([residual.mse], dom).solve(30)
+        assert a.posterior_samples is not None
+        assert a.posterior_samples.shape == (1, 10, 1)
+
+    def test_adapt_true_hmc_omits_step_size(self):
+        # Same default works for blackjax.hmc.
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.bayesian(blackjax.hmc, warmup=20, keep=10, num_integration_steps=4)
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        residual = a * jno.np.sin(jno.np.pi * x) - jno.np.sin(jno.np.pi * x)
+        jno.core([residual.mse], dom).solve(30)
+        assert a.posterior_samples.shape == (1, 10, 1)
+
+    def test_adapt_true_zero_warmup_still_raises(self):
+        # adapt=True with warmup=0 is a degenerate config — adaptation
+        # has nothing to run, so the user-provided step_size is still
+        # required.  Must raise loudly, not silently default to 1.0.
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.bayesian(blackjax.nuts, warmup=0, keep=2)  # adapt=True default
         dom = _line_domain()
         x, _ = dom.variable("interior")
         residual = a * jno.np.sin(jno.np.pi * x) - jno.np.sin(jno.np.pi * x)
