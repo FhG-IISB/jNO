@@ -344,6 +344,54 @@ print(f"A: R-hat = {float(r[0]):.4f}, ESS = {float(e[0]):.1f}")
 See [Tutorial 08](../tutorials/10-bayesian-pinns/multichain-nuts.md)
 for a worked end-to-end example.
 
+## Per-step kernel diagnostics — `model.posterior_diagnostics`
+
+Every blackjax kernel call returns an `info` NamedTuple alongside the
+new state.  jno captures the fields that matter for the kernel family
+in use and aggregates them across the chain into
+`model.posterior_diagnostics`, a `{field: (K, N) array}` dict:
+
+| Kernel family             | Captured fields                                       |
+|---------------------------|-------------------------------------------------------|
+| NUTS / HMC                | `is_divergent` (bool), `acceptance_rate` (float), `energy` (float) |
+| MALA                      | `acceptance_rate` only                                 |
+| SGLD / SGHMC (SG-MCMC)    | `None` — these kernels have no `info` NamedTuple       |
+| Mean-field VI             | `None` — track ELBO via `history.total_loss` instead   |
+
+```python
+a.bayesian(blackjax.nuts, step_size=1e-2, warmup=500, keep=1000)
+crux.solve(...)
+
+diag = a.posterior_diagnostics              # {"is_divergent": (K,N), ...}
+n_divergent = int(diag["is_divergent"].sum())
+acc = float(diag["acceptance_rate"].mean())  # target: 0.6–0.8 for NUTS
+```
+
+**`is_divergent` is the single most diagnostic signal of an unhealthy
+NUTS / HMC run.**  More than ~1% divergent transitions almost always
+means the integrator's `step_size` is too large for the local
+posterior curvature — drop `step_size`, raise `inverse_mass_matrix`
+to match the geometry, or run window adaptation (`adapt=True`).
+
+The same information surfaces in three other places so problems are
+loud:
+
+1. **wandb** (per print-rate chunk) — `posterior/<name>/n_is_divergent`,
+   `posterior/<name>/mean_acceptance_rate`,
+   `posterior/<name>/mean_energy`.
+2. **Solve-end summary** — one log line per Bayesian model::
+
+       INFO: Model 'a': 12/1000 divergent (1.20%), mean_accept=0.81, mean_energy=42.3
+
+3. **Handle-creation log** — each `.bayesian()` configuration logs the
+   diagnostic schema it'll track::
+
+       INFO: Model 1: Bayesian sampling via 'nuts' (kind=full, ..., diagnostics=is_divergent, acceptance_rate, energy)
+
+Kernels that surface no info object (SG-MCMC, VI) are flagged
+explicitly at handle-creation time (`diagnostics=none (kernel API has
+no info object)`) — never silently downgraded.
+
 ## Pure-Bayesian fastpath (automatic)
 
 When a `solve()` call qualifies as **pure-Bayesian** — every Bayesian
@@ -551,11 +599,14 @@ follow-up.  The user-facing API will not change.
 When a wandb run is active, per-Bayesian-model statistics are logged at
 the same print-rate cadence as the rest of the training metrics:
 
-| Key                                 | Meaning                                        |
-|-------------------------------------|------------------------------------------------|
-| `posterior/<name>/n_samples`        | Number of samples collected in the chain so far |
-| `posterior/<name>/n_chains`         | `num_chains` for this model (1 for the default) |
-| `posterior/<name>/mean`             | Running posterior mean (scalar parameters only, averaged over all draws) |
+| Key                                          | Meaning                                                            |
+|----------------------------------------------|--------------------------------------------------------------------|
+| `posterior/<name>/n_samples`                 | Number of samples collected in the chain so far                    |
+| `posterior/<name>/n_chains`                  | `num_chains` for this model (1 for the default)                    |
+| `posterior/<name>/mean`                      | Running posterior mean (scalar parameters only)                    |
+| `posterior/<name>/n_is_divergent`            | Running divergent-transition count (NUTS / HMC only)               |
+| `posterior/<name>/mean_acceptance_rate`      | Running mean MH acceptance rate (NUTS / HMC / MALA)                |
+| `posterior/<name>/mean_energy`               | Running mean Hamiltonian energy (NUTS / HMC only)                  |
 
 `<name>` comes from the `name=` argument of `jno.np.parameter(...)` or
 `jno.nn.wrap(..., name=...)`.  Multi-leaf modules (MLPs) only get the

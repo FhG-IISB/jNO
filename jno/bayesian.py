@@ -46,6 +46,22 @@ _FULL_FIRST_ARG = "logdensity_fn"
 _GRAD_FIRST_ARG = "grad_estimator"
 _VI_SECOND_ARG = "optimizer"  # blackjax.meanfield_vi has (logdensity_fn, optimizer, ...)
 
+# Per-kernel-family diagnostic fields pulled from the blackjax info NamedTuple.
+# Detected by factory __name__ in :func:`_detect_diagnostic_fields`.  Empty
+# tuple means "no per-step info to surface" (SG-MCMC, VI — those report
+# convergence via ``total_loss`` / ELBO).  The dtype tag drives both the
+# diagnostic-buffer allocation and the post-solve aggregation in core.py.
+_INFO_SCHEMA: dict[str, tuple[tuple[str, str], ...]] = {
+    # NUTS / HMC: divergences are the primary signal that the integrator
+    # blew up; acceptance_rate < 0.6 typically means step_size is too
+    # big; energy lets users diagnose energy-conservation issues.
+    "nuts": (("is_divergent", "bool"), ("acceptance_rate", "float"), ("energy", "float")),
+    "hmc": (("is_divergent", "bool"), ("acceptance_rate", "float"), ("energy", "float")),
+    # MALA has Metropolis-Hastings acceptance but no Hamiltonian integrator
+    # (so no is_divergent / energy concept).
+    "mala": (("acceptance_rate", "float"),),
+}
+
 
 def default_gaussian_prior(position, *, sigma: float = 10.0):
     """Wide isotropic Gaussian log-prior over a pytree position.
@@ -103,6 +119,83 @@ def _detect_kind(factory) -> str:
     )
 
 
+def _detect_diagnostic_fields(factory, kind: str) -> tuple[tuple[str, str], ...]:
+    """Return the per-step diagnostic fields jno should pull off the kernel
+    info NamedTuple, as ``(name, dtype_tag)`` pairs.
+
+    Detected by ``factory.__name__`` — falls back to ``()`` for SG-MCMC
+    (``grad_estimator``) and VI (no per-step diagnostics surfaced; their
+    convergence is read off the ELBO / total_loss curve).  The empty
+    tuple is *not* a silent discard — it means "this kernel has no
+    blackjax info object to drop in the first place", and that case
+    is logged at handle creation so users know what's tracked.
+    """
+    if kind in ("grad_estimator", "vi"):
+        return ()
+    # blackjax's MCMC entry points are NamedTuples (``GenerateSamplingAPI``)
+    # without a ``__name__`` — inspect the underlying ``differentiable`` /
+    # ``build_kernel`` callable's qualified module path, which uniquely
+    # identifies the algorithm (``blackjax.mcmc.nuts`` /
+    # ``blackjax.mcmc.hmc`` / ``blackjax.mcmc.mala`` / …).  Fall back to
+    # ``__name__`` for user-supplied factories.
+    target = getattr(factory, "build_kernel", None) or getattr(factory, "differentiable", None) or factory
+    name_hint = (
+        getattr(target, "__module__", "")
+        + " "
+        + getattr(target, "__qualname__", "")
+        + " "
+        + getattr(factory, "__name__", "")
+    ).lower()
+    for key, fields in _INFO_SCHEMA.items():
+        if key in name_hint:
+            return fields
+    # Unrecognised full-data kernel.  Best-effort: capture any field the
+    # info object happens to expose by trying common names; jno logs the
+    # detected set at handle creation so users see what's tracked.
+    return (("acceptance_rate", "float"),)
+
+
+def _extract_info(info, fields: tuple[tuple[str, str], ...]) -> dict[str, jnp.ndarray]:
+    """Pull each named field off the blackjax info NamedTuple into a flat
+    dict of jnp arrays.
+
+    Missing fields fall back to NaN (float) or False (bool) sentinels —
+    flagged at post-solve aggregation so the user sees that the kernel
+    didn't supply that piece of information, not a silent zero.
+    """
+    out: dict[str, jnp.ndarray] = {}
+    for name, dtype_tag in fields:
+        v = getattr(info, name, None)
+        if v is None:
+            if dtype_tag == "bool":
+                out[name] = jnp.asarray(False, dtype=jnp.bool_)
+            else:
+                out[name] = jnp.asarray(jnp.nan, dtype=jnp.float32)
+        else:
+            if dtype_tag == "bool":
+                out[name] = jnp.asarray(v, dtype=jnp.bool_)
+            else:
+                out[name] = jnp.asarray(v, dtype=jnp.float32)
+    return out
+
+
+def _empty_info_like(fields: tuple[tuple[str, str], ...]) -> dict[str, jnp.ndarray]:
+    """Construct a (scalar) all-NaN/False info dict matching ``fields``.
+
+    Used to fill the slot for kinds without a kernel info object
+    (SG-MCMC / VI) so per-handle dict shapes stay homogeneous across
+    JIT boundaries.  In practice these handles have ``fields == ()`` so
+    the returned dict is empty and contributes nothing.
+    """
+    out: dict[str, jnp.ndarray] = {}
+    for name, dtype_tag in fields:
+        if dtype_tag == "bool":
+            out[name] = jnp.asarray(False, dtype=jnp.bool_)
+        else:
+            out[name] = jnp.asarray(jnp.nan, dtype=jnp.float32)
+    return out
+
+
 class _KernelHandle:
     """Per-model handle stashed alongside the optax chain in jno's solve loop.
 
@@ -135,6 +228,10 @@ class _KernelHandle:
         # at the model's current ``trainable[lid]`` snapshot and
         # reassembled inside the closure before each logdensity eval.
         "param_mask",
+        # Per-step diagnostic fields pulled off the blackjax info
+        # NamedTuple — populated from :func:`_detect_diagnostic_fields`
+        # at handle creation.  Empty tuple for SG-MCMC / VI.
+        "diagnostic_fields",
     )
 
     def __init__(
@@ -170,6 +267,7 @@ class _KernelHandle:
         self.vi_num_samples = int(vi_num_samples)
         self.vi_posterior_draws = int(vi_posterior_draws)
         self.param_mask = param_mask
+        self.diagnostic_fields = _detect_diagnostic_fields(factory, kind)
 
 
 def build_vi_handle(cfg: dict) -> _KernelHandle:
@@ -1034,8 +1132,11 @@ def step(
 
     ``state`` carries a leading K-axis (set by :func:`init_state`); we
     split ``rng_key`` into K per-chain keys and vmap the per-chain
-    transition.  Returns both ``new_state`` and ``new_position`` with
-    leading K.
+    transition.  Returns ``(new_state, new_position, info)`` — info is a
+    dict of per-step diagnostic arrays (one entry per
+    ``handle.diagnostic_fields`` entry, K-leading for K>1, scalar for
+    K=1).  Empty dict for SG-MCMC / VI handles that don't surface a
+    blackjax info object.
 
     The caller supplies *factories* rather than concrete callables so
     that each chain's logdensity can see *that* chain's positions for
@@ -1082,6 +1183,8 @@ def step(
     else:
         _reassemble_single = None
 
+    _fields = handle.diagnostic_fields
+
     if handle.kind == "vi":
         # Variational inference path — no K axis, no MCMC kernel.
         # Build the VI algorithm with the live logdensity_fn (closure
@@ -1101,7 +1204,8 @@ def step(
         new_pos = new_state.mu
         if _reassemble_single is not None:
             new_pos = _reassemble_single(new_pos)
-        return new_state, new_pos
+        # ``_fields`` is () for VI handles — info dict is empty.
+        return new_state, new_pos, _empty_info_like(_fields)
 
     if K == 1:
         # Backward-compatible single-chain path: state has no K axis,
@@ -1115,13 +1219,15 @@ def step(
             new_pos = new_state.position
             if _reassemble_single is not None:
                 new_pos = _reassemble_single(new_pos)
-            return new_state, new_pos
+            return new_state, new_pos, _extract_info(_info, _fields)
         kernel = factory(grad_estimator_factory, **handle.extra_kwargs)
         new_state = kernel.step(rng_key, state, minibatch_ctx, handle.step_size)
         new_pos = new_state
         if _reassemble_single is not None:
             new_pos = _reassemble_single(new_pos)
-        return new_state, new_pos
+        # SG-MCMC has no info NamedTuple — ``_fields`` is () so the dict
+        # is empty.
+        return new_state, new_pos, _empty_info_like(_fields)
 
     # Multi-chain path: per-chain PRNG keys + vmap.  ``core.py`` passes
     # *factories* taking ``(p, k_idx)`` / ``(p, mb, k_idx)`` here.
@@ -1137,7 +1243,7 @@ def step(
             new_p = new_s.position
             if _reassemble_single is not None:
                 new_p = _reassemble_single(new_p)
-            return new_s, new_p
+            return new_s, new_p, _extract_info(_info, _fields)
 
         return jax.vmap(_one)(state, keys, chain_idx)
 
@@ -1150,7 +1256,7 @@ def step(
         new_p = new_s
         if _reassemble_single is not None:
             new_p = _reassemble_single(new_p)
-        return new_s, new_p
+        return new_s, new_p, _empty_info_like(_fields)
 
     return jax.vmap(_one)(state, keys, chain_idx)
 

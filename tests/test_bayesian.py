@@ -725,6 +725,143 @@ class TestAutoInverseMassMatrix:
         assert p.posterior_samples.shape == (1, 3, 3)
 
 
+class TestPosteriorDiagnostics:
+    """Per-step blackjax info (is_divergent / acceptance_rate / energy)
+    surfaced on ``model.posterior_diagnostics``, wandb, and the
+    solve-end log line.
+
+    The kernel info is captured every step (mirroring the sample
+    buffer), aggregated to ``(K, N)`` arrays at solve-end, and
+    summarised in a single log line per Bayesian model.  Empty for
+    SG-MCMC / VI (those kernels expose no info object) — surfaced as
+    ``None``, not silently dropped.
+    """
+
+    def _line_setup(self):
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 1.0 * jno.np.sin(π * x)
+        return π, dom, x, target
+
+    def test_nuts_diagnostics_have_all_three_fields(self):
+        π, dom, x, target = self._line_setup()
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.bayesian(blackjax.nuts, step_size=1e-2, warmup=0, keep=8, adapt=False)
+        residual = a * jno.np.sin(π * x) - target
+        jno.core([residual.mse], dom).solve(8)
+        diag = a.model.posterior_diagnostics
+        assert diag is not None
+        assert set(diag.keys()) == {"is_divergent", "acceptance_rate", "energy"}
+        assert diag["is_divergent"].dtype == jnp.bool_
+        assert diag["acceptance_rate"].dtype == jnp.float32
+        assert diag["energy"].dtype == jnp.float32
+        # Shape: (K=1, N=8) — one diagnostic per kept sample.
+        assert diag["is_divergent"].shape == (1, 8)
+        assert diag["acceptance_rate"].shape == (1, 8)
+        assert diag["energy"].shape == (1, 8)
+        # Acceptance rates live in [0, 1].
+        assert bool(jnp.all((diag["acceptance_rate"] >= 0.0) & (diag["acceptance_rate"] <= 1.0)))
+
+    def test_mala_diagnostics_only_acceptance_rate(self):
+        π, dom, x, target = self._line_setup()
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.bayesian(blackjax.mala, step_size=1e-2, warmup=0, keep=5)
+        residual = a * jno.np.sin(π * x) - target
+        jno.core([residual.mse], dom).solve(5)
+        diag = a.model.posterior_diagnostics
+        assert diag is not None
+        # MALA has no Hamiltonian integrator → no divergence / energy.
+        assert set(diag.keys()) == {"acceptance_rate"}
+        assert diag["acceptance_rate"].shape == (1, 5)
+
+    def test_sgld_diagnostics_is_none(self):
+        # SG-MCMC kernels return only the new state — no info object —
+        # so posterior_diagnostics is None (not an empty dict, not zeros).
+        π, dom, x, target = self._line_setup()
+        net = _tiny_net(in_dim=1, out_dim=1, hidden=4, key_seed=1)
+        net.bayesian(blackjax.sgld, step_size=1e-5, warmup=0, keep=3)
+        residual = net(x) - target
+        jno.core([residual.mse], dom).solve(3)
+        assert net.posterior_diagnostics is None
+
+    def test_diagnostics_multi_chain_shape(self):
+        π, dom, x, target = self._line_setup()
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.bayesian(
+            blackjax.nuts,
+            step_size=1e-2,
+            inverse_mass_matrix=jnp.ones(1),
+            warmup=0,
+            keep=6,
+            adapt=False,
+            num_chains=3,
+            init_jitter=0.1,
+        )
+        residual = a * jno.np.sin(π * x) - target
+        jno.core([residual.mse], dom).solve(6)
+        diag = a.model.posterior_diagnostics
+        assert diag is not None
+        # Shape mirrors posterior_samples: (K=3, N=6).
+        assert diag["is_divergent"].shape == (3, 6)
+        assert diag["acceptance_rate"].shape == (3, 6)
+        assert diag["energy"].shape == (3, 6)
+
+    def test_modelcall_proxy(self):
+        # The ModelCall proxy mirrors posterior_diagnostics like
+        # posterior_samples does.
+        π, dom, x, target = self._line_setup()
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.bayesian(blackjax.nuts, step_size=1e-2, warmup=0, keep=3, adapt=False)
+        residual = a * jno.np.sin(π * x) - target
+        jno.core([residual.mse], dom).solve(3)
+        # ``a`` is the ModelCall; ``a.posterior_diagnostics`` must
+        # resolve to the underlying Model's dict.
+        assert a.posterior_diagnostics is a.model.posterior_diagnostics
+        assert a.posterior_diagnostics is not None
+
+    def test_diagnostics_solve_end_summary_logged(self, capsys):
+        # jno's Logger uses ``propagate=False`` so caplog (which hooks the
+        # root logger) doesn't see jno messages — but the same Logger
+        # writes to stdout via a StreamHandler, so capsys captures it.
+        π, dom, x, target = self._line_setup()
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="diag_a")
+        a.bayesian(blackjax.nuts, step_size=1e-2, warmup=0, keep=4, adapt=False)
+        residual = a * jno.np.sin(π * x) - target
+        jno.core([residual.mse], dom).solve(4)
+        captured = capsys.readouterr().out
+        assert "diag_a" in captured
+        assert "divergent" in captured
+        assert "mean_accept" in captured
+
+    def test_wandb_diagnostics_keys(self, monkeypatch):
+        import importlib
+
+        core_mod = importlib.import_module("jno.core")
+
+        class _FakeRun:
+            def __init__(self):
+                self.config = type("_Cfg", (), {"update": lambda *a, **kw: None})()
+                self.summary = type("_Sum", (), {"update": lambda *a, **kw: None})()
+
+        recorded: list[dict] = []
+        monkeypatch.setattr(core_mod, "get_wandb_run", lambda: _FakeRun())
+        monkeypatch.setattr(core_mod, "wandb_log", lambda m, step=None: recorded.append(dict(m)))
+        monkeypatch.setattr(core_mod, "wandb_log_model", lambda *a, **kw: None)
+
+        π, dom, x, target = self._line_setup()
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="wb_a")
+        a.bayesian(blackjax.nuts, step_size=1e-2, warmup=0, keep=3, adapt=False)
+        residual = a * jno.np.sin(π * x) - target
+        jno.core([residual.mse], dom).solve(4)
+        keys: set[str] = set()
+        for m in recorded:
+            keys.update(m.keys())
+        assert "posterior/wb_a/n_is_divergent" in keys
+        assert "posterior/wb_a/mean_acceptance_rate" in keys
+        assert "posterior/wb_a/mean_energy" in keys
+
+
 class TestWandbChainStatsSmoke:
     """Phase 4D — wandb_log gets posterior/<name>/{mean,last,n_samples}
     entries for each Bayesian model when a wandb run is active.  Patched
