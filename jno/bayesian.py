@@ -67,6 +67,12 @@ def default_gaussian_prior(position, *, sigma: float = 10.0):
     """Wide isotropic Gaussian log-prior over a pytree position.
 
     ``log p(θ) = -‖θ‖² / (2σ²)``, summed over every inexact-array leaf.
+
+    This is the internal fallback when ``.bayesian(prior=None)``.  Users
+    composing custom priors should prefer the named factories in
+    :data:`priors` (e.g. ``jno.bayesian.priors.gaussian(sigma=5.0)``)
+    — they share the same logdensity-over-pytree contract but document
+    their arguments and validate inputs at construction time.
     """
     leaves = jax.tree_util.tree_leaves(position)
     sq = jnp.array(0.0)
@@ -74,6 +80,251 @@ def default_gaussian_prior(position, *, sigma: float = 10.0):
         if hasattr(leaf, "dtype") and jnp.issubdtype(leaf.dtype, jnp.floating):
             sq = sq + jnp.sum(jnp.asarray(leaf) ** 2)
     return -0.5 * sq / (sigma * sigma)
+
+
+# ---------------------------------------------------------------------------
+# Prior namespace — jno.bayesian.priors.{gaussian, laplace, student_t,
+# layerwise_gaussian}.  Each factory returns a callable
+# ``pytree -> scalar log p(theta)`` matching the contract Model.bayesian /
+# Model.vi expects on ``prior=``.
+#
+# Masked-prior tree scoping note: when configured via ``.mask(M).bayesian()``
+# / ``.mask(M).vi()`` the prior factory's callable receives the *masked
+# subset* of the position (the kernel state) — not the full model pytree.
+# Custom priors written by users should be aware that ``p`` is whatever
+# subset the kernel sees: full pytree for global ``.bayesian()``, masked
+# subset for ``.mask(M).bayesian()``.  Built-in factories below operate
+# leaf-by-leaf via ``jax.tree_util.tree_leaves`` so they handle both cases
+# identically.
+# ---------------------------------------------------------------------------
+
+
+def _floating_leaves(position):
+    """Yield only the floating-point inexact-array leaves of ``position``.
+
+    Integer bookkeeping leaves (e.g. masks, indices) are skipped so they
+    don't accidentally contribute to ``‖θ‖²``.
+    """
+    for leaf in jax.tree_util.tree_leaves(position):
+        if hasattr(leaf, "dtype") and jnp.issubdtype(leaf.dtype, jnp.floating):
+            yield leaf
+
+
+def _leaf_fan_in(leaf) -> int:
+    """Fan-in of a weight tensor, following the standard ``(out, in, ...)``
+    layout used by foundax / equinox / flax / jax.nn.initializers.
+
+    For ``ndim >= 2``: ``prod(shape[1:])`` — covers Linear ``(out, in)`` →
+    ``in`` and Conv ``(out, in, kH, kW)`` → ``in * kH * kW``.  For
+    ``ndim < 2`` (biases / scalars) the concept doesn't apply; the
+    caller falls back to the default sigma.
+    """
+    if leaf.ndim < 2:
+        return 1
+    fi = 1
+    for d in leaf.shape[1:]:
+        fi *= int(d)
+    return fi
+
+
+def _gaussian_prior_fn(sigma: float, fan_in_aware: bool):
+    """Build the closure for :func:`priors.gaussian`."""
+    if sigma <= 0.0:
+        raise ValueError(f"gaussian prior: sigma must be > 0, got {sigma!r}.")
+    base_inv_s2 = 1.0 / (sigma * sigma)
+
+    def _prior(position):
+        sq = jnp.array(0.0)
+        for leaf in _floating_leaves(position):
+            arr = jnp.asarray(leaf)
+            if fan_in_aware and arr.ndim >= 2:
+                inv_s2 = float(_leaf_fan_in(arr)) * base_inv_s2
+            else:
+                inv_s2 = base_inv_s2
+            sq = sq + jnp.sum(arr * arr) * inv_s2
+        return -0.5 * sq
+
+    return _prior
+
+
+def _laplace_prior_fn(scale: float):
+    """Build the closure for :func:`priors.laplace`."""
+    if scale <= 0.0:
+        raise ValueError(f"laplace prior: scale must be > 0, got {scale!r}.")
+    inv_scale = 1.0 / scale
+
+    def _prior(position):
+        s = jnp.array(0.0)
+        for leaf in _floating_leaves(position):
+            s = s + jnp.sum(jnp.abs(jnp.asarray(leaf)))
+        return -s * inv_scale
+
+    return _prior
+
+
+def _student_t_prior_fn(df: float, scale: float):
+    """Build the closure for :func:`priors.student_t`."""
+    if df <= 2.0:
+        raise ValueError(f"student_t prior: df must be > 2 for finite variance, got {df!r}.")
+    if scale <= 0.0:
+        raise ValueError(f"student_t prior: scale must be > 0, got {scale!r}.")
+    inv_scale2_df = 1.0 / (scale * scale * df)
+    half_df_plus_one = 0.5 * (df + 1.0)
+
+    def _prior(position):
+        s = jnp.array(0.0)
+        for leaf in _floating_leaves(position):
+            arr = jnp.asarray(leaf)
+            s = s + jnp.sum(jnp.log1p(arr * arr * inv_scale2_df))
+        return -half_df_plus_one * s
+
+    return _prior
+
+
+def _layerwise_gaussian_prior_fn(base_sigma: float, default_sigma: float, fan_in_aware: bool):
+    """Build the closure for :func:`priors.layerwise_gaussian`."""
+    if base_sigma <= 0.0 or default_sigma <= 0.0:
+        raise ValueError(
+            f"layerwise_gaussian prior: base_sigma and default_sigma must be > 0, "
+            f"got base_sigma={base_sigma!r}, default_sigma={default_sigma!r}."
+        )
+    base_inv_s2 = 1.0 / (base_sigma * base_sigma)
+    default_inv_s2 = 1.0 / (default_sigma * default_sigma)
+
+    def _prior(position):
+        sq = jnp.array(0.0)
+        for leaf in _floating_leaves(position):
+            arr = jnp.asarray(leaf)
+            if arr.ndim >= 2:
+                if fan_in_aware:
+                    inv_s2 = float(_leaf_fan_in(arr)) * base_inv_s2
+                else:
+                    inv_s2 = base_inv_s2
+            else:
+                # Bias / scalar — use the looser default sigma.
+                inv_s2 = default_inv_s2
+            sq = sq + jnp.sum(arr * arr) * inv_s2
+        return -0.5 * sq
+
+    return _prior
+
+
+class _PriorsNamespace:
+    """Namespace object exposed as ``jno.bayesian.priors``.
+
+    Each factory returns a callable ``pytree -> scalar log p(theta)``
+    suitable for the ``prior=`` argument on :meth:`Model.bayesian` and
+    :meth:`Model.vi`.  All four operate leaf-by-leaf over the floating
+    inexact-array leaves of the pytree, so they compose transparently
+    with ``.mask(M).bayesian()`` (the kernel sees only the masked
+    subset; the prior closure scans whatever subset it's handed).
+
+    References
+    ----------
+    Sun, Y., Song, Z., Hewitt, A., & Kingma, D. P. (2019).
+        *Functional Variational Bayesian Neural Networks.* ICLR 2019
+        (layer-wise priors matching He / Xavier scales).
+
+    Wenzel, F., Roth, K., Veeling, B., Świątkowski, J., Tran, L.,
+        Mandt, S., … Nowozin, S. (2020).  *How Good is the Bayes
+        Posterior in Deep Neural Networks Really?*  ICML 2020.
+        (Cold-posterior effect with N(0, 1/fan_in) priors.)
+    """
+
+    @staticmethod
+    def gaussian(sigma: float = 10.0, *, fan_in_aware: bool = False):
+        """Isotropic Gaussian log-prior — ``log p = -‖θ‖² / (2σ²)``.
+
+        Parameters
+        ----------
+        sigma : float, default ``10.0``
+            Standard deviation of the prior.  ``sigma=10`` is wide
+            enough to be "effectively flat" at typical parameter
+            scales; pass smaller values (``1.0``, ``0.1``) for stronger
+            shrinkage toward zero.
+        fan_in_aware : bool, default ``False``
+            When ``True``, scale ``σ`` per-leaf by ``1/sqrt(fan_in)``
+            — matches He / Xavier initialisation conventions.  Only
+            applies to weight tensors (``ndim >= 2``); biases and
+            scalars use the base ``sigma`` unchanged.
+
+        Returns
+        -------
+        callable
+            ``pytree -> scalar log p`` for use as ``prior=`` on
+            :meth:`Model.bayesian` / :meth:`Model.vi`.
+        """
+        return _gaussian_prior_fn(float(sigma), bool(fan_in_aware))
+
+    @staticmethod
+    def laplace(scale: float = 1.0):
+        """Laplace (L1) log-prior — ``log p = -‖θ‖₁ / scale``.
+
+        Sparse-friendly: the unbounded gradient at zero encourages
+        many components to shrink to zero exactly (under MAP) or
+        cluster near zero (under MCMC).  Useful for inverse problems
+        with expected-sparse coefficients.
+        """
+        return _laplace_prior_fn(float(scale))
+
+    @staticmethod
+    def student_t(df: float = 4.0, scale: float = 1.0):
+        """Student-t log-prior — heavy-tailed alternative to Gaussian.
+
+        ``log p = -(df+1)/2 * Σ log(1 + (θ/scale)²/df)`` (additive
+        constants dropped).  Lower ``df`` → heavier tails; ``df → ∞``
+        recovers the Gaussian.
+
+        Common BNN choices: ``df=3`` or ``df=4`` — heavy enough to
+        allow large outliers, ``df > 2`` keeps the variance finite.
+        Often used as a practical substitute for the horseshoe prior
+        on individual weights when the full hierarchical horseshoe is
+        too expensive (the horseshoe needs auxiliary scale variables
+        that don't fit jno's pure ``logdensity_fn`` interface).
+
+        Parameters
+        ----------
+        df : float, default ``4.0``
+            Degrees of freedom.  Must be ``> 2`` for finite variance.
+        scale : float, default ``1.0``
+            Scale parameter (analogue of σ for the Gaussian).
+        """
+        return _student_t_prior_fn(float(df), float(scale))
+
+    @staticmethod
+    def layerwise_gaussian(
+        *,
+        base_sigma: float = 1.0,
+        default_sigma: float = 1.0,
+        fan_in_aware: bool = True,
+    ):
+        """Per-leaf Gaussian with fan-in-aware scaling — the standard
+        BNN-PINN prior.
+
+        For each inexact-array leaf:
+
+        * **ndim >= 2** (weight tensors): σ = ``base_sigma / sqrt(fan_in)``
+          when ``fan_in_aware=True``, else σ = ``base_sigma``.
+        * **ndim < 2** (biases / scalars): σ = ``default_sigma``.
+
+        Default ``base_sigma=1.0`` + ``fan_in_aware=True`` reproduces
+        the He-style ``N(0, 1/fan_in)`` prior used in Wenzel et al.
+        2020 and Sun et al. 2019.
+
+        Parameters
+        ----------
+        base_sigma : float, default ``1.0``
+            Base sigma for weight tensors; scaled per-layer when
+            ``fan_in_aware=True``.
+        default_sigma : float, default ``1.0``
+            Sigma for biases and scalars (no fan-in concept).
+        fan_in_aware : bool, default ``True``
+            Apply ``1/sqrt(fan_in)`` scaling on weight tensors.
+        """
+        return _layerwise_gaussian_prior_fn(float(base_sigma), float(default_sigma), bool(fan_in_aware))
+
+
+priors = _PriorsNamespace()
 
 
 def _detect_kind(factory) -> str:

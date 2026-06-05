@@ -162,23 +162,67 @@ u_mean     = jnp.mean(u_chain, axis=0)
 u_lo, u_hi = jnp.quantile(u_chain, jnp.array([0.05, 0.95]), axis=0)
 ```
 
-## Custom prior
+## Priors — built-in factories
 
-`prior=` takes any `pytree → float` returning the log-prior density.
+The `prior=` argument takes any `pytree → float` returning the
+log-prior density.  Four built-in factories live at
+`jno.bayesian.priors.*`; each one returns a callable that obeys the
+contract above.
+
+| Factory | Form | When to use |
+|---|---|---|
+| `priors.gaussian(sigma=10.0, fan_in_aware=False)` | $-\|\theta\|^2 / (2\sigma^2)$ | Wide default (σ=10) is "effectively flat"; pass smaller σ for shrinkage. `fan_in_aware=True` scales σ by 1/√fan_in per weight tensor. |
+| `priors.laplace(scale=1.0)` | $-\|\theta\|_1 / \text{scale}$ | Sparse-friendly: encourages many components near zero. |
+| `priors.student_t(df=4.0, scale=1.0)` | $-\frac{df+1}{2} \sum \log\big(1 + (\theta/\text{scale})^2 / df\big)$ | Heavy-tailed alternative to Gaussian; practical substitute for horseshoe on individual weights. `df` must be > 2 for finite variance. |
+| `priors.layerwise_gaussian(base_sigma=1.0, default_sigma=1.0, fan_in_aware=True)` | Per-leaf $N(0, \sigma_\text{leaf}^2)$ with $\sigma_\text{weight} = \text{base}/\sqrt{\text{fan\_in}}$, $\sigma_\text{bias} = \text{default}$ | The standard BNN-PINN prior (Sun et al. 2019, Wenzel et al. 2020). |
 
 ```python
-def laplace_prior(p, scale=1.0):
+import jno
+
+# Wide Gaussian, σ=10 — the historical default
+a.bayesian(blackjax.nuts, step_size=1e-2,
+           prior=jno.bayesian.priors.gaussian(sigma=10.0))
+
+# Sparse coefficient — Laplace
+a.bayesian(blackjax.nuts, step_size=1e-2,
+           prior=jno.bayesian.priors.laplace(scale=0.5))
+
+# BNN head with fan-in-aware layer-wise priors
+head.mask(M).bayesian(blackjax.sgld, step_size=1e-3,
+                     prior=jno.bayesian.priors.layerwise_gaussian())
+```
+
+When `prior=None` the internal default is
+`priors.gaussian(sigma=10.0)` — effectively flat at typical
+parameter scales, but for BNN weights at scale 0.01 it's overly wide
+and for outputs at scale 100 it's overly tight.  Prefer one of the
+named factories above for non-trivial problems.
+
+### Custom priors — `pytree → float` contract
+
+Any `pytree → float` callable works.  For example, an L½ prior:
+
+```python
+def l_half_prior(p, scale=1.0):
     return -sum(
-        jnp.sum(jnp.abs(leaf))
+        jnp.sum(jnp.sqrt(jnp.abs(leaf)))
         for leaf in jax.tree_util.tree_leaves(p)
         if hasattr(leaf, "dtype") and jnp.issubdtype(leaf.dtype, jnp.floating)
     ) / scale
 
-a.bayesian(blackjax.nuts, step_size=1e-2, prior=laplace_prior)
+a.bayesian(blackjax.nuts, step_size=1e-2, prior=l_half_prior)
 ```
 
-The default prior is a wide isotropic Gaussian with σ=10 over every
-inexact-array leaf — effectively flat at typical parameter scales.
+!!! note "Masked priors see only the masked subset"
+    When configured via `.mask(M).bayesian()` / `.mask(M).vi()`, the
+    prior closure receives the **masked subset** of the position
+    (whatever the kernel sees) — not the full model pytree.  The
+    built-in factories iterate over the leaves they're handed, so
+    they handle masked and unmasked solves identically.  Custom
+    priors should be aware that `p` is whatever subset the kernel
+    operates on; if you need the full pytree (e.g. for a hierarchical
+    prior coupling masked and unmasked leaves), use a global
+    `.bayesian()` rather than `.mask(M).bayesian()`.
 
 ## Adaptation (NUTS / HMC)
 
