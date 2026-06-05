@@ -2207,3 +2207,173 @@ class TestPathfinderInitializer:
         # 3) Identity initializer means the chain starts near the user's
         #    init (2.4) and recovers truth ~2.5 in 15 steps.
         assert abs(float(jnp.mean(chain)) - 2.5) < 1.0
+
+
+# ---------------------------------------------------------------------------
+# Phase 13 — LaplaceInitializer (MAP + Hessian-based Gaussian approximation)
+# ---------------------------------------------------------------------------
+
+
+class TestLaplaceInitializer:
+    """``.initialize(jno.bayesian.laplace(...))`` finds the MAP via optax
+    and forms a Gaussian approximation to the posterior using the
+    Hessian at the MAP.  These tests cover the protocol contract, the
+    diagonal/full Hessian strategies, and composition with the existing
+    mask / multi-chain features (shared with the pathfinder dispatch).
+    """
+
+    @staticmethod
+    def _harmonic_inverse(*, initializer, adapt=False, warmup=2, keep=15, seed=0, **bayes_kwargs):
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 2.5 * jno.np.sin(π * x)
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(seed), name="a")
+        if initializer is not None:
+            a.initialize(initializer)
+        a.bayesian(
+            blackjax.nuts,
+            step_size=1e-2,
+            inverse_mass_matrix=jnp.ones(1),
+            warmup=warmup,
+            keep=keep,
+            adapt=adapt,
+            **bayes_kwargs,
+        )
+        residual = a * jno.np.sin(π * x) - target
+        jno.core([residual.mse], dom).solve(warmup + keep)
+        return a
+
+    # ─── 1. spy: invoked and IMM merged ───────────────────────────────
+
+    def test_laplace_initializer_runs_and_sets_imm(self, monkeypatch):
+        """Spy on ``LaplaceInitializer.__call__``; assert it ran exactly
+        once with correct shape inputs and that the returned IMM was
+        merged into ``handle.extra_kwargs``."""
+        captured = {"count": 0, "imm_shape": None}
+        orig_call = jno.bayesian.LaplaceInitializer.__call__
+
+        def _spy(self, rng_key, ld, position, num_chains):
+            captured["count"] += 1
+            warm, kw = orig_call(self, rng_key, ld, position, num_chains)
+            captured["imm_shape"] = kw["inverse_mass_matrix"].shape
+            return warm, kw
+
+        monkeypatch.setattr(jno.bayesian.LaplaceInitializer, "__call__", _spy)
+        _ = self._harmonic_inverse(initializer=jno.bayesian.laplace(map_steps=50))
+        assert captured["count"] == 1
+        assert captured["imm_shape"] == (1,), f"IMM shape wrong: {captured['imm_shape']}"
+
+    # ─── 2. recovers truth on a 1-D inverse problem ──────────────────
+
+    def test_laplace_recovers_inverse_problem(self):
+        """Full pipeline: Laplace warm-start + NUTS chain recovers the
+        truth on a 1-D inverse problem.  Tolerance is loose because
+        jno's MSE convention treats the data noise as σ²=1, so the
+        posterior is genuinely wide (std ≈ 1.0 for this problem); we
+        check the mean lies within ~1 posterior-std of truth.
+        """
+        a = self._harmonic_inverse(
+            initializer=jno.bayesian.laplace(map_steps=300, map_optimizer=optax.adam(1e-1)),
+            warmup=2,
+            keep=50,
+        )
+        chain = a.posterior_samples
+        assert chain.shape == (1, 50, 1)
+        assert abs(float(jnp.mean(chain)) - 2.5) < 1.5
+
+    # ─── 3. diagonal vs full agree on 1-D problem ────────────────────
+
+    def test_laplace_diagonal_matches_full_on_1d(self, monkeypatch):
+        """For a 1-parameter problem, diagonal and full Hessian
+        strategies should produce identical IMMs (D=1 → trivially
+        diagonal)."""
+        captured = {"diag_imm": None, "full_imm": None}
+        orig_call = jno.bayesian.LaplaceInitializer.__call__
+
+        def _spy(self, rng_key, ld, position, num_chains):
+            warm, kw = orig_call(self, rng_key, ld, position, num_chains)
+            key = "diag_imm" if self.hessian_strategy == "diagonal" else "full_imm"
+            captured[key] = float(kw["inverse_mass_matrix"][0])
+            return warm, kw
+
+        monkeypatch.setattr(jno.bayesian.LaplaceInitializer, "__call__", _spy)
+        _ = self._harmonic_inverse(
+            initializer=jno.bayesian.laplace(map_steps=200, map_optimizer=optax.adam(1e-1), hessian_strategy="diagonal")
+        )
+        _ = self._harmonic_inverse(
+            initializer=jno.bayesian.laplace(map_steps=200, map_optimizer=optax.adam(1e-1), hessian_strategy="full")
+        )
+        assert captured["diag_imm"] is not None and captured["full_imm"] is not None
+        # Should agree to numerical precision since D=1.
+        assert jnp.isclose(captured["diag_imm"], captured["full_imm"], rtol=1e-4), (
+            f"diagonal {captured['diag_imm']} != full {captured['full_imm']}"
+        )
+
+    # ─── 4. multichain: K distinct positions ─────────────────────────
+
+    def test_laplace_multichain_dispersion(self):
+        """K=4 chains start at K distinct samples from N(MAP, H^{-1})."""
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 2.5 * jno.np.sin(π * x)
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        a.initialize(jno.bayesian.laplace(map_steps=200, map_optimizer=optax.adam(1e-1)))
+        a.bayesian(
+            blackjax.nuts,
+            step_size=1e-2,
+            inverse_mass_matrix=jnp.ones(1),
+            warmup=2,
+            keep=8,
+            num_chains=4,
+            adapt=False,
+        )
+        residual = a * jno.np.sin(π * x) - target
+        jno.core([residual.mse], dom).solve(10)
+        chain = a.posterior_samples
+        assert chain.shape == (4, 8, 1)
+        firsts = chain[:, 0, 0]
+        pairwise = float(jnp.max(firsts) - jnp.min(firsts))
+        assert pairwise > 1e-4, f"K=4 chains share a starting position: {firsts}"
+
+    # ─── 5. composes with .mask().bayesian() ─────────────────────────
+
+    def test_laplace_with_mask_works(self):
+        """``.mask(M).bayesian()`` + Laplace: only the masked subset is
+        Laplace-warm-started; the unmasked complement stays at init."""
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        net = _tiny_net(in_dim=1, out_dim=1, hidden=4)
+        mask, masked_idx = _build_last_leaf_mask(net)
+        net.initialize(jno.bayesian.laplace(map_steps=20, hessian_strategy="diagonal"))
+        net.mask(mask).bayesian(blackjax.sgld, step_size=1e-4, warmup=5, keep=10)
+        residual = net(x) - 0.0
+        jno.core([residual.mse], dom).solve(15)
+
+        chain = net.posterior_samples
+        leaves = jax.tree_util.tree_leaves(chain)
+        for i, leaf in enumerate(leaves):
+            var = float(jnp.mean(jnp.var(leaf, axis=1)))
+            if i == masked_idx:
+                assert var > 1e-8, f"masked leaf {i} should vary; got var={var:.3e}"
+            else:
+                assert var < 1e-8, f"unmasked leaf {i} should be constant; got var={var:.3e}"
+
+    # ─── 6. reproducible under a fixed seed ──────────────────────────
+
+    def test_laplace_reproducible_with_fixed_seed(self):
+        """Two solves with identical master seed produce identical
+        posteriors.  Verifies the MAP scan + Hessian Cholesky path is
+        deterministic."""
+        a1 = self._harmonic_inverse(initializer=jno.bayesian.laplace(map_steps=100, map_optimizer=optax.adam(5e-2)))
+        a2 = self._harmonic_inverse(initializer=jno.bayesian.laplace(map_steps=100, map_optimizer=optax.adam(5e-2)))
+        assert jnp.allclose(a1.posterior_samples, a2.posterior_samples)
+
+    # ─── 7. invalid hessian_strategy raises ──────────────────────────
+
+    def test_laplace_invalid_hessian_strategy_raises(self):
+        """``hessian_strategy`` must be 'diagonal' or 'full'; anything
+        else raises a clear ValueError at run time."""
+        with pytest.raises(ValueError, match="hessian_strategy"):
+            self._harmonic_inverse(initializer=jno.bayesian.laplace(map_steps=5, hessian_strategy="bogus"))

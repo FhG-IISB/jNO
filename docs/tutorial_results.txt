@@ -121,3 +121,7 @@
 10_bayesian_pinns/11_pathfinder_init.py | run=baseline   | rel_A=0.0091 | rel_B=0.0078 | rhat_a=1.038 | rhat_b=0.999 | wall=6.53s
 10_bayesian_pinns/11_pathfinder_init.py | run=pf-only    | rel_A=0.0078 | rel_B=0.0133 | rhat_a=1.007 | rhat_b=1.006 | wall=12.72s
 10_bayesian_pinns/11_pathfinder_init.py | run=chained    | rel_A=0.0074 | rel_B=0.0100 | rhat_a=1.004 | rhat_b=0.998 | wall=8.41s
+10_bayesian_pinns/12_laplace_init.py | run=baseline   | rel_A=0.0091 | rel_B=0.0078 | rhat_a=1.038 | rhat_b=0.999 | wall=6.60s
+10_bayesian_pinns/12_laplace_init.py | run=laplace    | rel_A=0.4860 | rel_B=0.2523 | rhat_a=202973.609 | rhat_b=171968.984 | wall=9.58s
+10_bayesian_pinns/12_laplace_init.py | run=baseline   | rel_A=0.0024 | rel_B=0.0136 | rhat_a=1.016 | rhat_b=0.999 | wall=6.56s
+10_bayesian_pinns/12_laplace_init.py | run=laplace    | rel_A=0.0307 | rel_B=0.0581 | rhat_a=1.013 | rhat_b=1.005 | wall=9.80s
