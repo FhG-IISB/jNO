@@ -127,3 +127,4 @@
 10_bayesian_pinns/12_laplace_init.py | run=laplace    | rel_A=0.0307 | rel_B=0.0581 | rhat_a=1.013 | rhat_b=1.005 | wall=9.80s
 10_bayesian_pinns/13_svgd_init.py | run=baseline   | rel_A=0.0024 | rel_B=0.0136 | rhat_a=1.016 | rhat_b=0.999 | wall=6.50s
 10_bayesian_pinns/13_svgd_init.py | run=svgd       | rel_A=0.0226 | rel_B=0.0757 | rhat_a=1.003 | rhat_b=1.004 | wall=9.33s
+10_bayesian_pinns/14_pattern_b_bnn_head.py | epochs=2300 | rel_L2=0.0633 | band_median=0.2694 | head_var_max=2.348e-01

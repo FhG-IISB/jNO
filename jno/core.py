@@ -1,7 +1,7 @@
 import gc
 import os
 import time
-from typing import Any, Dict, List, Optional, Tuple, Union, cast
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union, cast
 
 import equinox as eqx
 import jax
@@ -156,6 +156,25 @@ def _parse_substep_spec(spec):
             return list(spec[0]), int(spec[1])
         return [int(i) for i in spec], 1
     raise TypeError(f"substep must be a list or ([list], int) tuple, got {type(spec)}")
+
+
+# Phase 15 — Pattern B: one layer carries BOTH a Bayesian kernel state and
+# an optax state (masked head sampled, body Adam-trained).  ``opt_states[lid]``
+# wraps the pair in this NamedTuple; the step function detects it in both
+# the optax and Bayesian loops and unwraps the appropriate half.  Non-Pattern-B
+# layers continue to hold a plain state directly.
+class _MixedState(NamedTuple):
+    """Carries both an optax state and a Bayesian kernel state for a single
+    layer whose pytree is split by a mask (Pattern B).
+
+    The optax state lives on the unmasked complement (body), the kernel
+    state on the masked subset (head).  Update order at step time:
+    optax-first (body), then kernel (head sees the just-updated body in
+    its logdensity closure — natural Metropolis-within-Gibbs).
+    """
+
+    optax: Any
+    bayesian: Any
 
 
 class core:
@@ -808,8 +827,11 @@ class core:
         )
 
         bayesian_handles = bayesian_handles or {}
-        # per_model_opts and bayesian_handles are disjoint by construction:
-        # each model has exactly one backend (optax OR blackjax kernel).
+        # per_model_opts and bayesian_handles are normally disjoint (one
+        # backend per model).  Phase 15 (Pattern B): a layer can appear
+        # in *both* dicts — masked Bayesian head + optax-trained body.
+        # ``opt_states[k]`` is then a ``_MixedState(optax=..., bayesian=...)``
+        # wrapper; the two loops below unwrap the half they need.
         opt_keys = sorted(per_model_opts.keys())
         bay_keys = sorted(bayesian_handles.keys())
         base_epoch = self._total_epochs
@@ -829,9 +851,15 @@ class core:
                 model_grads = grads[lid]
                 model_params = trainable[lid]
 
+                # Pattern B: ``opt_states[k]`` is a ``_MixedState``; the
+                # optax half lives on ``.optax``.
+                _cur_state = opt_states[k]
+                _is_mixed = isinstance(_cur_state, _MixedState)
+                _opt_state_in = _cur_state.optax if _is_mixed else _cur_state
+
                 updates, new_state = per_model_opts[k].update(
                     model_grads,
-                    opt_states[k],
+                    _opt_state_in,
                     model_params,
                     value=total_loss,
                     grad=model_grads,
@@ -851,14 +879,19 @@ class core:
                 else:
                     lr_val = lr_schedules[k](base_epoch + start_epoch, individual_losses)
                     new_state[-1].hyperparams["step_size"] = jnp.asarray(
-                        lr_val, dtype=opt_states[k][-1].hyperparams["step_size"].dtype
+                        lr_val, dtype=_opt_state_in[-1].hyperparams["step_size"].dtype
                     )
 
                 trainable = {
                     **trainable,
                     lid: optax.apply_updates(model_params, updates),
                 }
-                opt_states = {**opt_states, k: new_state}
+                # Pattern B: rewrap the new optax state into the MixedState,
+                # preserving the kernel state untouched.
+                opt_states = {
+                    **opt_states,
+                    k: _MixedState(optax=new_state, bayesian=_cur_state.bayesian) if _is_mixed else new_state,
+                }
 
             # ── per-model Bayesian step (blackjax kernels) ──
             # Set of Bayesian lids — chain-indexed slicing applies to these
@@ -871,6 +904,9 @@ class core:
                 # ``.position``; VI states carry the variational mean on
                 # ``.mu`` (used as a per-step representative — actual VI
                 # samples are drawn post-solve from the fitted state).
+                # Unwrap Pattern B's MixedState transparently.
+                if isinstance(_state, _MixedState):
+                    _state = _state.bayesian
                 if _kind == "vi":
                     return _state.mu
                 return _state if _kind == "grad_estimator" else _state.position
@@ -879,6 +915,11 @@ class core:
                 lid = int(k)
                 handle = bayesian_handles[k]
                 rng, kernel_key = jax.random.split(rng)
+
+                # Pattern B unwrap: kernel half of the MixedState.
+                _cur_state = opt_states[k]
+                _bay_is_mixed = isinstance(_cur_state, _MixedState)
+                _kernel_state_in = _cur_state.bayesian if _bay_is_mixed else _cur_state
 
                 if handle.num_chains == 1:
                     # ── K=1 backward-compat path ──
@@ -903,14 +944,17 @@ class core:
                     new_state, new_position = jno_bayesian.step(
                         handle,
                         kernel_key,
-                        opt_states[k],
+                        _kernel_state_in,
                         trainable[lid],
                         logdensity_fn,
                         grad_estimator,
                         context,
                     )
                     trainable = {**trainable, lid: new_position}
-                    opt_states = {**opt_states, k: new_state}
+                    opt_states = {
+                        **opt_states,
+                        k: _MixedState(optax=_cur_state.optax, bayesian=new_state) if _bay_is_mixed else new_state,
+                    }
                     continue
 
                 # ── K>1 multi-chain path ──
@@ -952,7 +996,7 @@ class core:
                 new_state, new_position = jno_bayesian.step(
                     handle,
                     kernel_key,
-                    opt_states[k],
+                    _kernel_state_in,
                     trainable[lid],
                     logdensity_factory,
                     grad_estimator_factory,
@@ -964,7 +1008,10 @@ class core:
                 # logging.  Mixed-mode caveat: optax-trained parameters
                 # compute gradients against chain 0 of Bayesian models.
                 trainable = {**trainable, lid: jax.tree_util.tree_map(lambda x: x[0], new_position)}
-                opt_states = {**opt_states, k: new_state}
+                opt_states = {
+                    **opt_states,
+                    k: _MixedState(optax=_cur_state.optax, bayesian=new_state) if _bay_is_mixed else new_state,
+                }
 
             next_epoch = start_epoch + jnp.asarray(1, dtype=start_epoch.dtype)
             return trainable, opt_states, rng, next_epoch, total_loss, individual_losses
@@ -1133,15 +1180,25 @@ class core:
                     tr, os_, rg = _one_step(tr, os_, rg, context)
 
                 # Sample = full position per Bayesian/VI lid.  For masked
-                # handles (Phase 11) the kernel state holds only the
-                # masked subset, but ``tr[lid]`` is the post-step full
-                # reassembled position (done in ``jno_bayesian.step``),
-                # so we read directly from ``tr`` for masked handles.
+                # handles the kernel state holds only the masked subset:
+                # for K=1, ``tr[lid]`` carries the post-step full
+                # reassembled position; for K>1 (Phase 15), the kernel
+                # state's K-leading masked positions must be reassembled
+                # per chain with the unmasked complement from ``tr``.
                 sample = {}
                 for k in bay_keys:
                     handle = bayesian_handles[k]
+                    lid_k = int(k)
                     if handle.param_mask is not None:
-                        sample[k] = tr[int(k)]
+                        if handle.num_chains == 1:
+                            sample[k] = tr[lid_k]
+                        else:
+                            _state_k = os_[k]
+                            if isinstance(_state_k, _MixedState):
+                                _state_k = _state_k.bayesian
+                            _masked_K = _state_k if handle.kind == "grad_estimator" else _state_k.position
+                            _unmasked_full = eqx.filter(tr[lid_k], handle.param_mask, inverse=True)
+                            sample[k] = jax.vmap(lambda head_k, _u=_unmasked_full: eqx.combine(head_k, _u))(_masked_K)
                     else:
                         sample[k] = _pos_of(os_[k], handle.kind)
                 return (tr, os_, rg), sample
@@ -1220,9 +1277,14 @@ class core:
                 model_grads = grads[lid]
                 model_params = trainable[lid]
 
+                # Pattern B: optax half of a MixedState.
+                _cur_state = opt_states[k]
+                _is_mixed = isinstance(_cur_state, _MixedState)
+                _opt_state_in = _cur_state.optax if _is_mixed else _cur_state
+
                 updates, new_state = per_model_opts[k].update(
                     model_grads,
-                    opt_states[k],
+                    _opt_state_in,
                     model_params,
                 )
 
@@ -1238,14 +1300,17 @@ class core:
                     lr_val = lr_schedules[k](base_epoch + epoch, prev_losses)
                     new_state[-1].hyperparams["step_size"] = jnp.asarray(
                         lr_val,
-                        dtype=opt_states[k][-1].hyperparams["step_size"].dtype,
+                        dtype=_opt_state_in[-1].hyperparams["step_size"].dtype,
                     )
 
                 trainable = {
                     **trainable,
                     lid: optax.apply_updates(model_params, updates),
                 }
-                opt_states = {**opt_states, k: new_state}
+                opt_states = {
+                    **opt_states,
+                    k: _MixedState(optax=new_state, bayesian=_cur_state.bayesian) if _is_mixed else new_state,
+                }
 
             return trainable, opt_states
 
@@ -1878,13 +1943,12 @@ class core:
                 continue
 
             # Masked .bayesian() / .vi() — a single group entry tagged
-            # with backend in {"bayesian", "vi"} (Phase 11 v1 supports
-            # at most one non-optax group per model, and **no** optax
-            # peers on the same model: the unmasked complement is
-            # frozen at its initial value).  Pattern B (masked Bayesian
-            # + global ``.optimizer()`` on the unmasked rest) needs a
-            # state-storage refactor that doesn't fit into v1 and is
-            # tracked as a follow-up.
+            # with backend in {"bayesian", "vi"}.  Phase 15 lifts the
+            # v1 Pattern B block: when ``fm._opt_fn`` is also set, the
+            # global optimiser is applied to the **complement** of the
+            # masked subset (the body), and the kernel state coexists
+            # with the optax state under one ``opt_states[k]`` via the
+            # ``_MixedState`` wrapper.
             if _non_optax_groups:
                 if len(_non_optax_groups) > 1:
                     raise NotImplementedError(
@@ -1897,27 +1961,12 @@ class core:
                         f"Model (layer {lid}): combining .mask().bayesian()/.vi() with "
                         ".mask().optimizer() groups is not yet supported (Phase 11 v1)."
                     )
-                if fm._opt_fn is not None:
-                    raise NotImplementedError(
-                        f"Model (layer {lid}): combining masked .bayesian()/.vi() with "
-                        "a global .optimizer(...) on the same model needs a state-"
-                        "storage refactor and is not supported in Phase 11 v1.  As a "
-                        "workaround: drop the global .optimizer() (unmasked complement "
-                        "stays at init), or remove the .mask() and use a global "
-                        ".bayesian()/.vi() on the whole model."
-                    )
                 _g = _non_optax_groups[0]
                 if _g["backend"] == "bayesian":
                     handle = jno_bayesian.build_kernel_handle(_g["bayesian_cfg"])
                 else:
                     handle = jno_bayesian.build_vi_handle(_g["vi_cfg"])
                 handle.param_mask = _g["mask"]
-                if handle.num_chains != 1:
-                    raise NotImplementedError(
-                        f"Model (layer {lid}): masked .bayesian()/.vi() with "
-                        f"num_chains={handle.num_chains} > 1 is not supported in Phase 11 v1. "
-                        "Use num_chains=1 with masking, or drop the mask for multi-chain."
-                    )
                 bayesian_handles[k] = handle
                 self.log.info(
                     f"Model {lid}: masked {_g['backend']} via "
@@ -1928,10 +1977,16 @@ class core:
                 # complement of the mask is implicitly frozen — done.
                 if not _optax_groups and fm._opt_fn is None:
                     continue
-                # Otherwise fall through to the optax block (which uses
-                # _optax_groups + the global _opt_fn for the "rest").
+                # Otherwise fall through to the optax block.  Pattern B:
+                # the optax chain's default mask excludes the masked
+                # subset (which is owned by the Bayesian kernel).
 
-            if _optax_groups and fm._lora_config is None:
+            # Phase 15 (Pattern B): the per-group optax chain also triggers
+            # when only ``_non_optax_groups`` are present together with a
+            # global ``fm._opt_fn`` — the default optax transform covers
+            # the *unmasked complement* of the Bayesian group.
+            _pattern_b = bool(_non_optax_groups) and fm._opt_fn is not None
+            if (_optax_groups or _pattern_b) and fm._lora_config is None:
                 # ── Per-group optimizer via chained optax.masked transforms ──
                 # Build one masked transform per group, plus a "default" for
                 # any trainable params not covered by an explicit group.
@@ -2006,11 +2061,31 @@ class core:
                     masked_transforms.append(optax.masked(chain, gmask_norm))
                     group_scheds.append(g_lr)
 
-                # "default" group: negate all group masks to cover remaining params
-                def _default_mask(params, _group_masks=group_masks_norm):
-                    """True for leaves in no explicit group."""
+                # Phase 15 (Pattern B): the masked Bayesian group's mask
+                # is also "covered" — the default optax transform must
+                # skip it so the body's optax update doesn't touch the
+                # head-leaves owned by the Bayesian kernel.
+                non_optax_masks_norm = [
+                    jax.tree_util.tree_map(
+                        lambda p, m: bool(m) if p is not None else False,
+                        trainable[lid],
+                        ng["mask"],
+                        is_leaf=lambda x: x is None,
+                    )
+                    for ng in _non_optax_groups
+                ]
+
+                # "default" group: negate all group masks (optax + Bayesian)
+                # to cover remaining params.
+                def _default_mask(
+                    params,
+                    _opt_masks=group_masks_norm,
+                    _bay_masks=non_optax_masks_norm,
+                ):
+                    """True for leaves in no explicit group (covers neither
+                    an optax group nor the masked Bayesian subset)."""
                     combined = jax.tree_util.tree_map(lambda _: False, params)
-                    for gmask in _group_masks:
+                    for gmask in (*_opt_masks, *_bay_masks):
                         combined = jax.tree_util.tree_map(
                             lambda c, m: c or (m if isinstance(m, bool) else False),
                             combined,
@@ -2026,7 +2101,9 @@ class core:
                 per_model_opts[k] = optax.chain(*masked_transforms)
                 group_lr_schedules[k] = group_scheds
                 self.log.info(
-                    f"Model {lid}: {len(_optax_groups)} parameter group(s) + default — using per-group optimizers"
+                    f"Model {lid}: {len(_optax_groups)} optax-group(s) + "
+                    f"{len(_non_optax_groups)} Bayesian-group(s) + default — "
+                    f"per-group optimizers (Pattern B = {_pattern_b})"
                 )
             else:
                 # ── Single global optimizer (original behaviour) ──
@@ -2070,11 +2147,24 @@ class core:
 
         # Initialise optimizer / kernel states and place on mesh.  We
         # iterate the union of optax and Bayesian keys; each model has
-        # exactly one of the two backends.
+        # either one backend (the historical case) or both for Pattern B
+        # (masked Bayesian head + optax-trained body on the same model)
+        # — those land in a ``_MixedState`` wrapper.
         opt_states = {}
         for k in sorted({*per_model_opts.keys(), *bayesian_handles.keys()}):
             lid = int(k)
-            if k in bayesian_handles:
+            _has_bay = k in bayesian_handles
+            _has_opt = k in per_model_opts
+            if _has_bay and _has_opt:
+                # Pattern B: build both states and wrap.  Init the
+                # optax state on the full pytree (the masked transforms
+                # inside the chain skip the head leaves anyway) and the
+                # kernel state on the masked subset.
+                self.rng, _bay_init_key = jax.random.split(self.rng)
+                _bay_state = jno_bayesian.init_state(bayesian_handles[k], trainable[lid], _bay_init_key)
+                _opt_state = per_model_opts[k].init(trainable[lid])
+                state = _MixedState(optax=_opt_state, bayesian=_bay_state)
+            elif _has_bay:
                 # Per-chain jitter is drawn from a key split off self.rng so
                 # multi-chain runs get reproducible over-dispersion.
                 self.rng, _bay_init_key = jax.random.split(self.rng)
@@ -2313,7 +2403,7 @@ class core:
                 # verbatim (no jitter / replication) and respects the
                 # mask via the handle.
                 _new_state = jno_bayesian.init_state_at_warm_positions(_handle, warm_full)
-                opt_states[_bk] = jax.tree_util.tree_map(
+                _new_state_sharded = jax.tree_util.tree_map(
                     lambda x: (
                         jax.device_put(jnp.copy(x), NamedSharding(self.mesh, P()))
                         if isinstance(x, (jnp.ndarray, jax.Array))
@@ -2321,6 +2411,13 @@ class core:
                     ),
                     _new_state,
                 )
+                # Pattern B: if this layer also has an optax state under
+                # the same key, preserve it inside the MixedState wrapper.
+                _prev_state = opt_states[_bk]
+                if isinstance(_prev_state, _MixedState):
+                    opt_states[_bk] = _MixedState(optax=_prev_state.optax, bayesian=_new_state_sharded)
+                else:
+                    opt_states[_bk] = _new_state_sharded
 
                 # If K>1 and init_jitter was also set, log that
                 # pathfinder's per-chain dispersion takes precedence.
@@ -2350,14 +2447,20 @@ class core:
                 _K_bay = _handle.num_chains
                 if _K_bay == 1:
                     # K=1: keep the adapted state as-is (no K axis).
-                    opt_states[_bk] = _adapted_state
+                    _new_kernel = _adapted_state
                 else:
                     # Multi-chain: broadcast adapted state across K
                     # chains (PyMC convention).
-                    opt_states[_bk] = jax.tree_util.tree_map(
+                    _new_kernel = jax.tree_util.tree_map(
                         lambda x, _K=_K_bay: jnp.stack([x] * _K, axis=0) if isinstance(x, (jnp.ndarray, jax.Array)) else x,
                         _adapted_state,
                     )
+                # Pattern B: preserve the optax half of any MixedState.
+                _prev_state = opt_states[_bk]
+                if isinstance(_prev_state, _MixedState):
+                    opt_states[_bk] = _MixedState(optax=_prev_state.optax, bayesian=_new_kernel)
+                else:
+                    opt_states[_bk] = _new_kernel
                 # main loop collects from epoch 0
                 _handle.warmup = 0
                 self.log.info(f"Model {_lid}: window adaptation done — step_size={_adapted_kwargs['step_size']:.4g}")
@@ -3276,20 +3379,24 @@ class core:
                         if len(_buf) >= _handle.keep:
                             continue
                         _lid_int = int(_bk)
+                        _state_for_sample = opt_states[_bk]
+                        # Pattern B: unwrap to the kernel half of MixedState.
+                        if isinstance(_state_for_sample, _MixedState):
+                            _state_for_sample = _state_for_sample.bayesian
                         if _handle.param_mask is not None:
-                            # Masked Bayesian (Phase 11): the kernel state
-                            # holds only the masked subset; the full
-                            # reassembled position lives in trainable[lid]
-                            # (updated post-step inside the jit by
-                            # ``jno_bayesian.step``).
-                            if _handle.num_chains != 1:
-                                raise NotImplementedError(
-                                    "Masked .bayesian()/.vi() with num_chains>1 is not "
-                                    "supported in Phase 11 v1. Use num_chains=1 with .mask()."
-                                )
-                            _pos_K = trainable[_lid_int]
+                            # Masked Bayesian.  The kernel state holds the
+                            # masked subset (K-leading for K>1); the unmasked
+                            # complement lives in trainable[lid].  Reassemble
+                            # per chain so the buffer carries full pytrees.
+                            _masked_pos = (
+                                _state_for_sample if _handle.kind == "grad_estimator" else _state_for_sample.position
+                            )
+                            _unmasked = eqx.filter(trainable[_lid_int], _handle.param_mask, inverse=True)
+                            if _handle.num_chains == 1:
+                                _pos_K = eqx.combine(_masked_pos, _unmasked)
+                            else:
+                                _pos_K = jax.vmap(lambda head_k, _u=_unmasked: eqx.combine(head_k, _u))(_masked_pos)
                         else:
-                            _state_for_sample = opt_states[_bk]
                             _pos_K = _state_for_sample if _handle.kind == "grad_estimator" else _state_for_sample.position
                         # Detach from buffer donation: a jnp.copy of every
                         # array leaf gives us our own buffers that survive
@@ -3501,7 +3608,11 @@ class core:
                 if _fm is None:
                     continue
                 self.rng, _vi_draw_key = jax.random.split(self.rng)
-                _samples = jno_bayesian.vi_sample(_handle, opt_states[_bk], _vi_draw_key, _handle.vi_posterior_draws)
+                # Pattern B: unwrap MixedState to the VI half before sampling.
+                _vi_state = opt_states[_bk]
+                if isinstance(_vi_state, _MixedState):
+                    _vi_state = _vi_state.bayesian
+                _samples = jno_bayesian.vi_sample(_handle, _vi_state, _vi_draw_key, _handle.vi_posterior_draws)
                 # _samples is a pytree with leading axis = posterior_draws.
                 # For masked VI: ``_samples`` only covers the masked
                 # subset; reassemble each draw with the unmasked
