@@ -1656,6 +1656,8 @@ class Model(Placeholder):
         posterior_draws: int = 500,
         prior=None,
         likelihood_scale: float = 1.0,
+        init_log_std: float = -3.0,
+        init_mu_at_position: bool = True,
         **factory_kwargs,
     ):
         """Fit a variational approximation to this model's posterior.
@@ -1715,6 +1717,18 @@ class Model(Placeholder):
                 this, VI is often stuck near its initialisation
                 because the prior dominates by a factor of
                 ``N_obs``.
+            init_log_std: Initial value for ``state.rho`` (log-std of the
+                variational ``q``) on every weight.  Default ``-3.0``
+                (σ ≈ 0.05) — keeps the initial MC ELBO sample tight so
+                gradients are low-variance from the start; the
+                optimiser then grows rho where the posterior is wide.
+                Pass ``0.0`` (σ ≈ 1.0) to restore blackjax's default
+                broad init.
+            init_mu_at_position: When ``True`` (default), initialise
+                ``state.mu`` at the user-supplied position (matches
+                numpyro's autoguide).  ``False`` keeps blackjax's
+                zero start — only useful on toy problems where the
+                MAP is exactly zero.
             **factory_kwargs: Forwarded to ``factory``.  E.g. an explicit
                 ``objective=blackjax.vi.meanfield_vi.RenyiAlpha(alpha=0.5)``
                 or ``stl_estimator=False``.
@@ -1738,6 +1752,8 @@ class Model(Placeholder):
             "prior": prior,
             "factory_kwargs": dict(factory_kwargs),
             "likelihood_scale": float(likelihood_scale),
+            "init_log_std": float(init_log_std),
+            "init_mu_at_position": bool(init_mu_at_position),
         }
         if self._mask_scope_pending and self._param_mask is not None:
             # Masked branch — register VI as a per-group backend on the

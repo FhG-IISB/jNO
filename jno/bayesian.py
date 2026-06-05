@@ -221,6 +221,13 @@ class _KernelHandle:
         "vi_optimizer",
         "vi_num_samples",
         "vi_posterior_draws",
+        # VI init overrides (None for non-VI handles).  ``init_log_std``
+        # sets ``state.rho`` everywhere (-3.0 → σ ≈ 0.05).
+        # ``init_mu_at_position`` controls whether ``state.mu`` starts
+        # at the user-supplied position (True, jno default) or at
+        # zeros (False, blackjax default).
+        "vi_init_log_std",
+        "vi_init_mu_at_position",
         # Phase 11: ``.mask(M).bayesian()`` / ``.mask(M).vi()``.  ``None``
         # means "operate on the full position" (the default for global
         # configurators).  When set, the kernel sees only the masked
@@ -260,6 +267,8 @@ class _KernelHandle:
         vi_posterior_draws: int = 500,
         param_mask=None,
         likelihood_scale: float = 1.0,
+        vi_init_log_std: float = -3.0,
+        vi_init_mu_at_position: bool = True,
     ):
         self.factory = factory
         self.kind = kind
@@ -278,6 +287,8 @@ class _KernelHandle:
         self.param_mask = param_mask
         self.diagnostic_fields = _detect_diagnostic_fields(factory, kind)
         self.likelihood_scale = float(likelihood_scale)
+        self.vi_init_log_std = float(vi_init_log_std)
+        self.vi_init_mu_at_position = bool(vi_init_mu_at_position)
 
 
 def build_vi_handle(cfg: dict) -> _KernelHandle:
@@ -313,6 +324,8 @@ def build_vi_handle(cfg: dict) -> _KernelHandle:
     likelihood_scale = float(cfg.get("likelihood_scale", 1.0))
     if likelihood_scale <= 0.0:
         raise ValueError(f"likelihood_scale must be positive, got {likelihood_scale!r}.")
+    init_log_std = float(cfg.get("init_log_std", -3.0))
+    init_mu_at_position = bool(cfg.get("init_mu_at_position", True))
     return _KernelHandle(
         factory=factory,
         kind="vi",
@@ -329,6 +342,8 @@ def build_vi_handle(cfg: dict) -> _KernelHandle:
         vi_num_samples=num_samples,
         vi_posterior_draws=posterior_draws,
         likelihood_scale=likelihood_scale,
+        vi_init_log_std=init_log_std,
+        vi_init_mu_at_position=init_mu_at_position,
     )
 
 
@@ -1168,21 +1183,27 @@ def init_state(handle: _KernelHandle, position, rng_key=None):
             **handle.extra_kwargs,
         )
         state = vi_algo.init(init_position)
-        # Two manual overrides on the blackjax-default init:
-        # 1. ``state.mu`` is initialised at zeros regardless of the
-        #    position argument.  For non-trivial models (e.g. an MLP
-        #    with Xavier init) starting at mu=zeros makes the ELBO
-        #    landscape flat and convergence painfully slow.  We set
-        #    mu to the user-supplied initial weights so VI starts
-        #    from a reasonable point — matches numpyro's autoguide.
+        # Two overrides on blackjax's defaults, exposed as user kwargs:
+        # 1. ``state.mu`` defaults to zeros regardless of position.  For
+        #    non-trivial models (e.g. an MLP with Xavier init) starting
+        #    at mu=zeros makes the ELBO landscape flat and convergence
+        #    painfully slow.  ``vi_init_mu_at_position=True`` (jno
+        #    default) sets mu to the user-supplied initial weights —
+        #    matches numpyro's autoguide; pass False to keep blackjax's
+        #    zero start.
         # 2. ``state.rho`` defaults to large values (≈ exp(rho) ≈ 1,
-        #    meaning the variational q has unit std per weight).  For
-        #    multi-layer MLPs that gives extremely noisy MC ELBO
-        #    gradients.  We shrink rho to ``log_std = -3`` (std ≈ 0.05)
-        #    so the initial q is tight; the optimiser then *grows* rho
-        #    where the posterior is genuinely wide.
-        small_rho = jax.tree_util.tree_map(lambda x: jnp.full_like(x, -3.0), state.rho)
-        return state._replace(mu=init_position, rho=small_rho)
+        #    σ ≈ 1.0 per weight) — extremely noisy MC ELBO gradients
+        #    on multi-layer MLPs.  ``vi_init_log_std=-3.0`` (jno default
+        #    → σ ≈ 0.05) keeps the initial q tight; the optimiser then
+        #    *grows* rho where the posterior is genuinely wide.  Pass
+        #    e.g. ``vi_init_log_std=0.0`` (σ ≈ 1.0) to restore the
+        #    blackjax default, or any other float for a custom width.
+        if handle.vi_init_mu_at_position:
+            new_mu = init_position
+        else:
+            new_mu = state.mu
+        new_rho = jax.tree_util.tree_map(lambda x: jnp.full_like(x, handle.vi_init_log_std), state.rho)
+        return state._replace(mu=new_mu, rho=new_rho)
 
     _maybe_inject_inverse_mass_matrix(handle, init_position)
     factory = handle.factory
