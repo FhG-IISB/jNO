@@ -280,10 +280,10 @@ class _BayesianInitializer:
 
 | Slot | Algorithm | Notes |
 |---|---|---|
-| `jno.bayesian.pathfinder(...)` | blackjax pathfinder | This release. |
-| `jno.bayesian.laplace(...)` | MAP via Adam + `jax.hessian` | Coming next.  Magnani et al. 2024 *Linearization Turns Neural Operators into GPs*. |
-| `jno.bayesian.svgd(...)` | blackjax svgd | K particles → K chain inits. |
-| `jno.bayesian.map(...)` | Fixed-step optax warm-start | No IMM output; user keeps step_size. |
+| `jno.bayesian.pathfinder(...)` | blackjax pathfinder | This release.  See [Tutorial 11](../tutorials/10-bayesian-pinns/pathfinder-init.md). |
+| `jno.bayesian.laplace(...)` | MAP via optax + `jax.hessian` (diagonal or full) | This release.  See [Tutorial 12](../tutorials/10-bayesian-pinns/laplace-init.md).  MacKay 1992 §6; Daxberger et al. 2021 §2. |
+| `jno.bayesian.svgd(...)` | blackjax svgd | Coming next.  K particles → K chain inits. |
+| `jno.bayesian.map(...)` | Fixed-step optax warm-start | Future.  No IMM output; user keeps step_size. |
 | User-written subclass | anything that fits the contract | See [Tutorial 11](../tutorials/10-bayesian-pinns/pathfinder-init.md). |
 
 A worked example lives at

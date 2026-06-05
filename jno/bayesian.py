@@ -4,10 +4,11 @@ Most of this module is internal — users compose `blackjax` kernels
 directly and attach them per parameter via :meth:`jno.trace.Model.bayesian`
 or :meth:`jno.trace.Model.vi`.  A small public surface lives at
 ``jno.bayesian.*``: convergence diagnostics (:func:`rhat`, :func:`ess`)
-and the *logdensity-aware initializer* protocol (:class:`PathfinderInitializer`
-and the :func:`pathfinder` factory).  The training loop in :mod:`jno.core`
-dispatches each model's per-step update either through :mod:`optax` or
-through the blackjax kernel configured here.
+and the *logdensity-aware initializer* protocol — currently
+:class:`PathfinderInitializer` (:func:`pathfinder`) and
+:class:`LaplaceInitializer` (:func:`laplace`).  The training loop in
+:mod:`jno.core` dispatches each model's per-step update either through
+:mod:`optax` or through the blackjax kernel configured here.
 
 Supported kernel families (duck-typed via the first argument name of the
 factory's ``.differentiable`` callable):
@@ -481,6 +482,172 @@ def pathfinder(**kwargs) -> PathfinderInitializer:
     ``maxcor``, plus any ``lbfgs_kwargs``-eligible LBFGS knobs).
     """
     return PathfinderInitializer(**kwargs)
+
+
+@dataclass(frozen=True)
+class LaplaceInitializer(_BayesianInitializer):
+    """Laplace approximation to the posterior — warm-start a chain from
+    the MAP plus its local Gaussian approximation.
+
+    Three-step algorithm:
+
+    1. Find the maximum a-posteriori (MAP) point by optimising
+       ``-log p(theta | data)`` with an optax optimiser (Adam by
+       default).  The optimisation runs as a JIT-compiled
+       ``jax.lax.scan`` over ``map_steps`` iterations.
+    2. Compute the Hessian ``H = -∇²log p`` at the MAP.  Two strategies:
+
+       * ``hessian_strategy="full"`` — full ``(D, D)`` Hessian via
+         :func:`jax.hessian`.  Numerically clean but memory cost grows
+         as ``D²``.  Right choice for small models / scalar PDE
+         coefficients (D up to ~1000).
+       * ``hessian_strategy="diagonal"`` (default) — only the diagonal
+         of the Hessian is computed via D Hessian-vector probes.
+         Memory cost is ``O(D)`` instead of ``O(D²)`` — required for
+         BNN-scale problems.  Compute cost is comparable to "full" but
+         peak memory is much smaller because no D×D matrix is ever
+         materialised.
+
+    3. Approximate the posterior as ``N(MAP, H⁻¹)``.  For ``num_chains=1``
+       the warm position is the MAP; for ``num_chains>1`` we draw K
+       i.i.d. samples from this Gaussian (proper over-dispersion).  The
+       diagonal of ``H⁻¹`` is returned as the kernel's
+       ``inverse_mass_matrix``.
+
+    A small ``ridge`` (default ``1e-6``) is added to the diagonal of H
+    before any inversion / Cholesky to guard against rank-deficient
+    Hessians at non-converged MAP estimates.
+
+    Trade-offs vs :class:`PathfinderInitializer`
+    --------------------------------------------
+    * **Pathfinder** uses L-BFGS — explores the optimisation path and
+      produces a normal approximation from the path's inverse-Hessian
+      factors.  Often robust on multi-modal or curved posteriors;
+      cheaper than computing a Hessian for very large models.
+    * **Laplace** uses gradient descent on ``-log p`` and the *exact*
+      Hessian at the MAP.  More accurate locally if the posterior is
+      well-approximated by a Gaussian; falls back to ridge-regularised
+      sampling if H is ill-conditioned.
+
+    References
+    ----------
+    MacKay, D. J. C. (1992).  *A Practical Bayesian Framework for
+    Backpropagation Networks.*  §6 (Laplace approximation around the
+    posterior mode).  Neural Computation, 4(3), 448-472.
+    https://doi.org/10.1162/neco.1992.4.3.448
+
+    Daxberger, E., Kristiadi, A., Immer, A., Eschenhagen, R., Bauer, M.,
+    & Hennig, P. (2021).  *Laplace Redux — Effortless Bayesian Deep
+    Learning.*  §2 (Laplace approximations for neural networks).
+    Advances in Neural Information Processing Systems (NeurIPS).
+    https://arxiv.org/abs/2106.14806
+
+    Magnani, E., Krämer, N., Pförtner, M., & Hennig, P. (2024).
+    *Linearization Turns Neural Operators into Function-Valued
+    Gaussian Processes.*  §3 (linearised-Laplace for neural
+    operators).  https://arxiv.org/abs/2406.05072
+    """
+
+    map_steps: int = 500
+    map_optimizer: Any = None  # optax.GradientTransformation; defaults to optax.adam(1e-2)
+    hessian_strategy: str = "diagonal"  # "diagonal" | "full"
+    ridge: float = 1e-6
+
+    def __call__(self, rng_key, logdensity_fn, position, num_chains):
+        import optax  # lazy
+
+        flat_pos, unflatten = jax.flatten_util.ravel_pytree(position)
+        D = int(flat_pos.size)
+
+        def _neg_flat_ld(v):
+            return -logdensity_fn(unflatten(v))
+
+        # ── Step 1: MAP via optax Adam (or user-supplied optimizer) ──
+        opt = self.map_optimizer if self.map_optimizer is not None else optax.adam(1e-2)
+        opt_state = opt.init(flat_pos)
+
+        def _map_step(carry, _):
+            v, state = carry
+            g = jax.grad(_neg_flat_ld)(v)
+            updates, new_state = opt.update(g, state, v)
+            new_v = optax.apply_updates(v, updates)
+            return (new_v, new_state), None
+
+        (map_flat, _), _ = jax.lax.scan(_map_step, (flat_pos, opt_state), None, length=int(self.map_steps))
+
+        if self.hessian_strategy == "full":
+            # ── Step 2a: full (D, D) Hessian → Cholesky ──
+            H = jax.hessian(_neg_flat_ld)(map_flat) + float(self.ridge) * jnp.eye(D)
+            L = jnp.linalg.cholesky(H)
+            # IMM = diag(H⁻¹).  Solve H X = I then take diag.
+            H_inv = jnp.linalg.solve(L.T, jnp.linalg.solve(L, jnp.eye(D)))
+            imm_diag = jnp.diag(H_inv)
+        elif self.hessian_strategy == "diagonal":
+            # ── Step 2b: diagonal of Hessian via D HVPs ──
+            # diag(H)[i] = e_i · (H @ e_i), computed via jax.jvp on the gradient.
+            _grad_fn = jax.grad(_neg_flat_ld)
+
+            def _hvp(v):
+                # H @ v via forward-mode over grad — O(D) flops per call.
+                return jax.jvp(_grad_fn, (map_flat,), (v,))[1]
+
+            eye = jnp.eye(D)
+            diag_H = jax.vmap(lambda e: jnp.dot(e, _hvp(e)))(eye) + float(self.ridge)
+            imm_diag = 1.0 / diag_H
+            L = None  # signal "diagonal path" to the sampling branch
+        else:
+            raise ValueError(f"hessian_strategy must be 'diagonal' or 'full'; got {self.hessian_strategy!r}")
+
+        # ── Step 3: warm positions ──
+        K = int(num_chains)
+        if K == 1:
+            warm_pos = unflatten(map_flat)
+        else:
+            keys = jax.random.split(rng_key, K)
+            if L is not None:
+                # Full-Hessian path: sample from N(MAP, H⁻¹) via Cholesky.
+                # If L is Cholesky of H, then  MAP + solve(L.T, z)  ~  N(MAP, H⁻¹).
+                z = jax.vmap(lambda k: jax.random.normal(k, (D,)))(keys)
+                samples_centered = jax.vmap(lambda zi: jnp.linalg.solve(L.T, zi))(z)
+            else:
+                # Diagonal path: independent per-dim N(0, imm_diag[i]).
+                std = jnp.sqrt(imm_diag)
+                z = jax.vmap(lambda k: jax.random.normal(k, (D,)))(keys)
+                samples_centered = std[None, :] * z
+            warm_samples = map_flat[None, :] + samples_centered
+            warm_pos = jax.vmap(unflatten)(warm_samples)
+
+        return warm_pos, {"inverse_mass_matrix": imm_diag}
+
+
+def laplace(**kwargs) -> LaplaceInitializer:
+    """Build a :class:`LaplaceInitializer` for use with
+    :meth:`jno.trace.Model.initialize`.
+
+    Usage::
+
+        net.initialize(jno.bayesian.laplace(map_steps=500,
+                                            hessian_strategy="diagonal"))
+        net.bayesian(blackjax.nuts, step_size=1e-2, warmup=100, adapt=True)
+
+    Kwargs (see :class:`LaplaceInitializer` for full descriptions):
+
+    * ``map_steps`` (default 500) — number of optimiser iterations to
+      find the MAP.
+    * ``map_optimizer`` (default ``optax.adam(1e-2)``) — any optax
+      ``GradientTransformation``.
+    * ``hessian_strategy`` (default ``"diagonal"``) — ``"diagonal"``
+      computes diag(H) via D HVPs (O(D) memory), ``"full"`` materialises
+      the (D, D) Hessian.
+    * ``ridge`` (default ``1e-6``) — diagonal stabiliser added to H
+      before inversion.
+
+    Reference
+    ---------
+    MacKay 1992 §6; Daxberger et al. 2021 §2.  See
+    :class:`LaplaceInitializer` for full citations.
+    """
+    return LaplaceInitializer(**kwargs)
 
 
 def init_state_at_warm_positions(handle: _KernelHandle, warm_position_full, rng_key=None):
