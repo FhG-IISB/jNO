@@ -59,17 +59,20 @@ W&B keys: `explainability/cos_sim/0_1`, …, `explainability/cos_sim_matrix` (im
 cb = jno.callbacks.gradient_alignment(interval=100)
 crux.solve(5000, callbacks=[cb])
 
-alignment = cb.result["alignment"]   # (n_samples,)  — values in [0, 1]
+alignment = cb.result["alignment"]   # (n_samples,)  — values in [-1, 1]
 ```
 
 A single scalar measuring global agreement across all constraints (Eq. 3.1 of [[2502.00604](https://arxiv.org/abs/2502.00604)]):
 
-$$\text{alignment} = \frac{\left\|\sum_i \nabla L_i\right\|}{\sum_i \|\nabla L_i\|}$$
+$$\text{alignment} \;=\; 2\left\|\frac{1}{N}\sum_{i=1}^{N} \frac{\nabla L_i}{\|\nabla L_i\|}\right\|^2 - 1$$
 
-- **1.0** — all gradients point in exactly the same direction
-- **0.0** — gradients cancel completely (destructive interference)
+Each gradient is unit-normalized *first*, so the metric reflects pure direction agreement and is invariant to per-loss scale. For $N = 2$ it reduces to the ordinary cosine similarity.
 
-A value that drops steadily during training is a reliable early warning of constraint conflict.
+- **+1** — all gradients point in exactly the same direction
+- **0** — gradients are mutually orthogonal on average
+- **−1** — gradients perfectly cancel (anti-aligned)
+
+A value that drops steadily during training — especially one that crosses zero into negative territory — is a reliable early warning of constraint conflict.
 
 W&B key: `explainability/gradient_alignment`
 
