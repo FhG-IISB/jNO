@@ -1,10 +1,13 @@
-"""Internal adapters that wire blackjax MCMC kernels into jno's training loop.
+"""Adapters that wire blackjax MCMC / VI kernels into jno's training loop.
 
-This module is **not** part of the public API — users compose `blackjax`
-kernels directly and attach them per parameter via
-:meth:`jno.trace.Model.bayesian`.  The training loop in
-:mod:`jno.core` then dispatches each model's per-step update either through
-:mod:`optax` or through the blackjax kernel configured here.
+Most of this module is internal — users compose `blackjax` kernels
+directly and attach them per parameter via :meth:`jno.trace.Model.bayesian`
+or :meth:`jno.trace.Model.vi`.  A small public surface lives at
+``jno.bayesian.*``: convergence diagnostics (:func:`rhat`, :func:`ess`)
+and the *logdensity-aware initializer* protocol (:class:`PathfinderInitializer`
+and the :func:`pathfinder` factory).  The training loop in :mod:`jno.core`
+dispatches each model's per-step update either through :mod:`optax` or
+through the blackjax kernel configured here.
 
 Supported kernel families (duck-typed via the first argument name of the
 factory's ``.differentiable`` callable):
@@ -30,7 +33,8 @@ References:
 from __future__ import annotations
 
 import inspect
-from typing import Any, Callable
+from dataclasses import dataclass, field
+from typing import Any, Callable, ClassVar
 
 import equinox as eqx
 import jax
@@ -295,6 +299,239 @@ def _maybe_inject_inverse_mass_matrix(handle: _KernelHandle, position) -> None:
     arr = jnp.asarray(current)
     if arr.ndim == 0:
         handle.extra_kwargs["inverse_mass_matrix"] = jnp.full((d,), float(arr))
+
+
+def _kernel_accepts_kwarg(handle: _KernelHandle, kwarg_name: str) -> bool:
+    """``True`` iff the kernel factory accepts ``kwarg_name``.  Signature-based
+    gate used to decide whether a logdensity-aware initializer's returned
+    kwarg (e.g. ``inverse_mass_matrix``) can be merged into
+    ``handle.extra_kwargs``.
+    """
+    target = getattr(handle.factory, "differentiable", handle.factory)
+    try:
+        sig = inspect.signature(target)
+    except (TypeError, ValueError):
+        return False
+    return kwarg_name in sig.parameters
+
+
+def merge_initializer_kwargs(handle: _KernelHandle, kwargs_update: dict) -> tuple[dict, list[str]]:
+    """Merge an initializer-returned kwargs dict into ``handle.extra_kwargs``,
+    silently dropping any key the kernel doesn't accept (e.g. an IMM update
+    against a MALA kernel which has no ``inverse_mass_matrix`` parameter).
+
+    Returns ``(new_extra_kwargs, dropped_keys)`` so the caller can log.
+    """
+    merged = dict(handle.extra_kwargs)
+    dropped: list[str] = []
+    for key, val in kwargs_update.items():
+        if _kernel_accepts_kwarg(handle, key):
+            merged[key] = val
+        else:
+            dropped.append(key)
+    return merged, dropped
+
+
+# ---------------------------------------------------------------------------
+# Logdensity-aware initializer protocol
+# ---------------------------------------------------------------------------
+#
+# ``Model.initialize(...)`` already accepts a path, a pytree, or a stateless
+# ``(shape, dtype, key) -> array`` callable.  The protocol below is a fourth
+# shape: an object with ``requires_logdensity = True`` whose ``__call__``
+# runs *inside* solve() with access to the loss-derived log-density.
+#
+# Pathfinder is the first concrete implementation; future Laplace / SVGD /
+# MAP-via-Adam initializers slot in as additional subclasses with no
+# changes to ``Model.initialize`` or the solve()-side dispatch.
+
+
+class _BayesianInitializer:
+    """Base for ``.initialize()``-routable, log-density-aware warm-start
+    strategies.
+
+    Detected by :meth:`jno.trace.Model.initialize` via the class-level
+    ``requires_logdensity = True`` marker.  Subclasses implement
+    :meth:`__call__` with the contract below; jno handles the
+    mask-wrap, multichain dispatch, and kernel-state reinitialisation
+    once at the solve() site.
+
+    The contract — one method, one return shape:
+
+    ``__call__(rng_key, logdensity_fn, position, num_chains)
+    -> (new_position, extra_kwargs_update)``
+
+    * ``rng_key`` — master PRNG key for this initializer.
+    * ``logdensity_fn`` — closes over the loss + prior.  Already
+      mask-wrapped if the model was configured via
+      ``.mask(M).bayesian(...)`` — subclasses see only the masked
+      subset.
+    * ``position`` — current pytree of (masked) parameter values to
+      use as the optimisation start.
+    * ``num_chains`` — K.  For K=1 return a leaf-shape position; for
+      K>1 return a (K, *leaf)-leading pytree (one warm position per
+      chain).
+
+    Returns ``(new_position, extra_kwargs_update)``:
+
+    * ``new_position`` — replaces ``trainable[lid]``; mask
+      reassembly happens jno-side.
+    * ``extra_kwargs_update`` — dict merged into the kernel handle's
+      ``extra_kwargs``.  Typically
+      ``{"inverse_mass_matrix": ...}``; empty dict if the initializer
+      doesn't produce kernel-tunable output.  Keys the kernel
+      doesn't accept are silently dropped (see
+      :func:`merge_initializer_kwargs`).
+    """
+
+    requires_logdensity: ClassVar[bool] = True
+
+    def __call__(
+        self,
+        rng_key,
+        logdensity_fn: Callable,
+        position,
+        num_chains: int,
+    ) -> tuple:
+        raise NotImplementedError
+
+
+def _diagonal_variance(samples) -> jnp.ndarray:
+    """Per-dimension variance over a leading sample-axis pytree, flattened
+    to ``(D,)`` matching jno's diagonal IMM convention.
+    """
+    leaves = jax.tree_util.tree_leaves(samples)
+    flat = []
+    for leaf in leaves:
+        if hasattr(leaf, "dtype") and jnp.issubdtype(leaf.dtype, jnp.inexact):
+            flat.append(jnp.var(leaf, axis=0).reshape(-1))
+    if not flat:
+        return jnp.zeros((0,))
+    return jnp.concatenate(flat)
+
+
+@dataclass(frozen=True)
+class PathfinderInitializer(_BayesianInitializer):
+    """Warm-start a chain via :func:`blackjax.pathfinder`.
+
+    Runs L-BFGS on the log-density; the inverse-Hessian factors along
+    the optimisation path are turned into a normal approximation to the
+    posterior.  From that fitted ``q`` we draw (a) the warm starting
+    position (the MAP-ish ``state.position`` for ``K=1``; ``K`` distinct
+    samples for ``K>1`` — proper over-dispersion at zero extra cost)
+    and (b) per-dimension variance estimates that become the kernel's
+    diagonal ``inverse_mass_matrix``.
+
+    Reference
+    ---------
+    Zhang, L., Carpenter, B., Gelman, A., & Vehtari, A. (2022).
+    *Pathfinder: Parallel quasi-Newton variational inference.*
+    Journal of Machine Learning Research, 23(306), 1-49.
+    https://arxiv.org/abs/2108.03782
+    """
+
+    maxiter: int = 30
+    num_samples: int = 200  # ELBO sample budget passed to pathfinder.approximate
+    maxcor: int = 10  # L-BFGS history size
+    imm_estimator_samples: int = 500  # # draws from fitted q used to estimate diag IMM
+    lbfgs_kwargs: dict = field(default_factory=dict)  # ftol / gtol / maxls / ...
+
+    def __call__(self, rng_key, logdensity_fn, position, num_chains):
+        # Lazy import — keeps the module top tidy and avoids a JAX
+        # initialisation cost at import time on unrelated code paths.
+        import blackjax
+
+        k_fit, k_imm, k_init = jax.random.split(rng_key, 3)
+        pf_state, _info = blackjax.pathfinder.approximate(
+            rng_key=k_fit,
+            logdensity_fn=logdensity_fn,
+            initial_position=position,
+            num_samples=self.num_samples,
+            maxiter=self.maxiter,
+            maxcor=self.maxcor,
+            **self.lbfgs_kwargs,
+        )
+        # Diagonal IMM from the empirical per-dim variance of M samples
+        # drawn from the fitted Gaussian approximation to the posterior.
+        # blackjax returns (samples, log_densities) — we want just the samples.
+        imm_samples, _ = blackjax.pathfinder.sample(k_imm, pf_state, num_samples=self.imm_estimator_samples)
+        imm_diag = _diagonal_variance(imm_samples)
+        # Warm position: K=1 → MAP-ish (state.position); K>1 → K
+        # i.i.d. samples from the fitted q (proper over-dispersion,
+        # strictly better than additive jitter on a fixed init).
+        if int(num_chains) == 1:
+            warm_pos = pf_state.position
+        else:
+            warm_samples, _ = blackjax.pathfinder.sample(k_init, pf_state, num_samples=int(num_chains))
+            warm_pos = warm_samples
+        return warm_pos, {"inverse_mass_matrix": imm_diag}
+
+
+def pathfinder(**kwargs) -> PathfinderInitializer:
+    """Build a :class:`PathfinderInitializer` for use with
+    :meth:`jno.trace.Model.initialize`.
+
+    Usage::
+
+        net.initialize(jno.bayesian.pathfinder(maxiter=30, num_samples=200))
+        net.bayesian(blackjax.nuts, step_size=1e-2, warmup=100, adapt=True)
+
+    All kwargs are forwarded to the underlying
+    ``blackjax.pathfinder.approximate`` call (``maxiter``, ``num_samples``,
+    ``maxcor``, plus any ``lbfgs_kwargs``-eligible LBFGS knobs).
+    """
+    return PathfinderInitializer(**kwargs)
+
+
+def init_state_at_warm_positions(handle: _KernelHandle, warm_position_full, rng_key=None):
+    """Build the kernel state when a logdensity-aware initializer has
+    already supplied warm starting position(s).
+
+    Unlike :func:`init_state`, this does **not** replicate-with-jitter
+    for ``K>1`` — the caller has provided ``K`` distinct positions (or 1
+    for ``K=1``) and we use them verbatim.  ``warm_position_full`` is the
+    *full* pytree (with the unmasked complement already reassembled for
+    masked Bayesian groups); we narrow internally before
+    ``kernel.init``.
+
+    VI handles are not supported here — they have their own init path
+    inside :func:`init_state` keyed on ``state.mu = position``.
+    """
+    if handle.kind == "vi":
+        raise ValueError(
+            "init_state_at_warm_positions does not apply to VI handles; "
+            "use init_state directly with the warm position as input."
+        )
+
+    K = int(handle.num_chains)
+
+    # Narrow to the masked subset if applicable.  For K>1 the leading
+    # axis is the chain dim; ``eqx.filter`` is leaf-by-leaf so applies
+    # uniformly whether or not a K axis is present.
+    if handle.param_mask is not None:
+        init_position = eqx.filter(warm_position_full, handle.param_mask)
+    else:
+        init_position = warm_position_full
+
+    # Inject IMM if applicable (using a representative single-chain slice
+    # for shape inference when K>1).
+    rep = init_position if K == 1 else jax.tree_util.tree_map(lambda x: x[0], init_position)
+    _maybe_inject_inverse_mass_matrix(handle, rep)
+
+    factory = handle.factory
+    if handle.kind == "full":
+        # Placeholder logdensity — kernel.init only needs the position.
+        kernel = factory(handle.prior_fn, **handle.extra_kwargs)
+    else:
+
+        def _dummy_grad(p, _mb):
+            return jax.tree_util.tree_map(jnp.zeros_like, p)
+
+        kernel = factory(_dummy_grad, **handle.extra_kwargs)
+
+    if K == 1:
+        return kernel.init(init_position)
+    return jax.vmap(kernel.init)(init_position)
 
 
 def adapt_is_applicable(handle: _KernelHandle) -> bool:

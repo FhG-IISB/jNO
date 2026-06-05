@@ -2168,6 +2168,31 @@ class core:
             on_device_context = domain_data.context
             effective_batchsize = batchsize
 
+        # ── 6a. Logdensity-aware initializers (pathfinder, future Laplace, …) ──
+        # ``.initialize(jno.bayesian.<initializer>(...))`` stashes an
+        # initializer on the model.  Here we run each one with the
+        # loss-derived log-density, replace ``trainable[lid]`` with the
+        # warm position, merge any kernel-tunable kwargs (e.g. an IMM
+        # estimate) into ``handle.extra_kwargs``, and re-build the
+        # kernel state at the new position.  Window adaptation (block
+        # 6b below) then continues from the warm starting point.
+        _init_candidates = [
+            (k, h)
+            for k, h in bayesian_handles.items()
+            if getattr(flax_mods.get(int(k)), "_bayesian_initializer", None) is not None
+        ]
+        # VI + initializer: VI configures ``state.mu = position`` itself
+        # at init_state time (block 6); a logdensity-aware warm-start
+        # doesn't compose with that path.
+        for _bk, _h in _init_candidates:
+            if _h.kind == "vi":
+                raise ValueError(
+                    f"Model {int(_bk)}: .vi(...) is not compatible with "
+                    f".initialize(jno.bayesian.<initializer>) — VI initialises its own "
+                    f"variational distribution from the model's current position. "
+                    f"Either drop the .initialize(...) call or switch to .bayesian(...)."
+                )
+
         # ── 6b. Window adaptation for HMC-family Bayesian models ──
         # Runs once before the main loop using the current trainable + the
         # full domain context.  Replaces step_size + inverse_mass_matrix on
@@ -2178,14 +2203,16 @@ class core:
         # so an adapter tuned to the full loss would mis-tune.  Force
         # users to set adapt=False (or skip substeps) in that case.
         _adapt_candidates = [(k, h) for k, h in bayesian_handles.items() if jno_bayesian.adapt_is_applicable(h)]
-        if _use_substeps and _adapt_candidates:
+        if _use_substeps and (_adapt_candidates or _init_candidates):
             raise ValueError(
-                "Combining substeps= with .bayesian(..., adapt=True) is not supported. "
-                "When using substeps, set adapt=False on each Bayesian model — window "
-                "adaptation would tune against the full loss, but the kernel in a "
-                "substep sees only the substep's constraints."
+                "Combining substeps= with .bayesian(..., adapt=True) or with a "
+                ".initialize(jno.bayesian.<initializer>) call is not supported. "
+                "Both run against the full loss, but in substeps mode the kernel "
+                "sees only substep-local constraints.  Set adapt=False on every "
+                "Bayesian model and drop any .initialize(jno.bayesian....) call, "
+                "or remove substeps=."
             )
-        if _adapt_candidates:
+        if _init_candidates or _adapt_candidates:
             _adapt_loss_fn = self._make_loss_fn(
                 self.compiled_constraints_fn,
                 effective_batchsize,
@@ -2198,6 +2225,114 @@ class core:
             # A fixed PRNG key keeps the logdensity deterministic across
             # adaptation steps — required for the HMC integrator's geometry.
             _adapt_key_for_loss = jax.random.PRNGKey(0)
+
+        # ── 6a body — run each logdensity-aware initializer ──
+        if _init_candidates:
+            for _bk, _handle in _init_candidates:
+                _lid = int(_bk)
+                _fm = flax_mods[_lid]
+                _initializer = _fm._bayesian_initializer
+                _mask = _handle.param_mask
+                _full_position = trainable[_lid]
+
+                # Build the mask-aware logdensity closure.  For masked
+                # groups we capture the unmasked complement once and
+                # reassemble inside the closure before evaluating the
+                # full loss; the initializer only sees the masked subset.
+                if _mask is not None:
+                    _unmasked_snap = eqx.filter(_full_position, _mask, inverse=True)
+                    _input_position = eqx.filter(_full_position, _mask)
+
+                    def _ld_fn(
+                        p_masked,
+                        _lid=_lid,
+                        _h=_handle,
+                        _unm=_unmasked_snap,
+                        _key=_adapt_key_for_loss,
+                    ):
+                        full_p = eqx.combine(p_masked, _unm)
+                        full = {**trainable, _lid: full_p}
+                        nll, _ = _adapt_loss_fn(full, _adapt_ctx, _key)
+                        return -nll + _h.prior_fn(p_masked)
+                else:
+                    _input_position = _full_position
+
+                    def _ld_fn(p, _lid=_lid, _h=_handle, _key=_adapt_key_for_loss):
+                        full = {**trainable, _lid: p}
+                        nll, _ = _adapt_loss_fn(full, _adapt_ctx, _key)
+                        return -nll + _h.prior_fn(p)
+
+                # Master PRNG: user-supplied key wins; else derived
+                # from self.rng so multi-init runs stay reproducible.
+                _user_key = getattr(_fm, "_bayesian_initializer_key", None)
+                if _user_key is None:
+                    self.rng, _init_key = jax.random.split(self.rng)
+                else:
+                    _init_key = _user_key
+
+                warm_position_or_K, kw_update = _initializer(
+                    _init_key,
+                    _ld_fn,
+                    _input_position,
+                    _handle.num_chains,
+                )
+
+                # Mask reassembly: warm_position_or_K is masked-shape
+                # if the handle was masked; reassemble with the
+                # unmasked complement to get the full pytree.
+                K = int(_handle.num_chains)
+                if _mask is not None:
+                    if K == 1:
+                        warm_full = eqx.combine(warm_position_or_K, _unmasked_snap)
+                    else:
+                        warm_full = jax.vmap(lambda p, _u=_unmasked_snap: eqx.combine(p, _u))(warm_position_or_K)
+                else:
+                    warm_full = warm_position_or_K
+
+                # Update trainable[lid] — full pytree.  For K>1 we keep
+                # the chain-0 representative on trainable[lid] (matches
+                # the existing convention used by buffer collection).
+                if K == 1:
+                    trainable[_lid] = warm_full
+                else:
+                    trainable[_lid] = jax.tree_util.tree_map(lambda x: x[0], warm_full)
+
+                # Merge kernel-tunable kwargs (e.g. IMM).  Keys the
+                # kernel doesn't accept are silently dropped.
+                if kw_update:
+                    new_extra, _dropped = jno_bayesian.merge_initializer_kwargs(_handle, kw_update)
+                    _handle.extra_kwargs = new_extra
+                    if _dropped:
+                        self.log.info(
+                            f"Model {_lid}: {type(_initializer).__name__} returned "
+                            f"kwargs {_dropped} that this kernel doesn't accept — dropped."
+                        )
+
+                # Re-build the kernel state at the warm position.
+                # ``init_state_at_warm_positions`` uses the K positions
+                # verbatim (no jitter / replication) and respects the
+                # mask via the handle.
+                _new_state = jno_bayesian.init_state_at_warm_positions(_handle, warm_full)
+                opt_states[_bk] = jax.tree_util.tree_map(
+                    lambda x: (
+                        jax.device_put(jnp.copy(x), NamedSharding(self.mesh, P()))
+                        if isinstance(x, (jnp.ndarray, jax.Array))
+                        else x
+                    ),
+                    _new_state,
+                )
+
+                # If K>1 and init_jitter was also set, log that
+                # pathfinder's per-chain dispersion takes precedence.
+                if K > 1 and _handle.init_jitter > 0.0:
+                    self.log.info(
+                        f"Model {_lid}: {type(_initializer).__name__} sampled K={K} "
+                        f"warm positions; init_jitter={_handle.init_jitter} is ignored."
+                    )
+
+                self.log.info(f"Model {_lid}: {type(_initializer).__name__} warm-start done (K={K}).")
+
+        if _adapt_candidates:
             for _bk, _handle in _adapt_candidates:
                 _lid = int(_bk)
 
