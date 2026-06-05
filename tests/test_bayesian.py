@@ -315,6 +315,89 @@ class TestCustomPrior:
         assert abs(post_mean) < 1.5, f"Strong prior failed to shrink toward 0; got {post_mean}"
 
 
+class TestLikelihoodScale:
+    """``likelihood_scale=`` multiplies the negative log-likelihood term in
+    the per-step logdensity.  The canonical sum-over-data Gaussian
+    likelihood is approximated by ``residual.mse`` which returns the
+    mean; passing ``N_obs`` (or ``N_obs / sigma**2``) recovers the
+    correct posterior magnitude.
+
+    With ``likelihood_scale`` large the data overwhelms a weak prior and
+    the posterior concentrates near the MLE — that's what we check.
+    """
+
+    def test_bayesian_likelihood_scale_concentrates_posterior(self):
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 2.0 * jno.np.sin(π * x)
+
+        # Wide prior + scaled likelihood → posterior concentrates near 2.0
+        # with small variance.  Unscaled (default 1.0) the same setup
+        # leaves the chain dispersed over a much wider region.
+        def _solve(scale):
+            a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+            a.bayesian(
+                blackjax.nuts,
+                step_size=1e-2,
+                inverse_mass_matrix=jnp.ones(1),
+                warmup=50,
+                keep=200,
+                adapt=False,
+                likelihood_scale=scale,
+            )
+            residual = a * jno.np.sin(π * x) - target
+            jno.core([residual.mse], dom).solve(250)
+            return jnp.std(a.posterior_samples)
+
+        std_low = _solve(1.0)
+        std_high = _solve(100.0)
+        # Scaling the likelihood by 100 must concentrate the posterior
+        # by a noticeable margin (sqrt-of-N rule of thumb).
+        assert float(std_high) < float(std_low) * 0.5
+
+    def test_bayesian_likelihood_scale_rejects_non_positive(self):
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        with pytest.raises(ValueError, match="likelihood_scale must be positive"):
+            a.bayesian(blackjax.nuts, step_size=1e-2, warmup=2, keep=2, likelihood_scale=0.0)
+        with pytest.raises(ValueError, match="likelihood_scale must be positive"):
+            a.bayesian(blackjax.nuts, step_size=1e-2, warmup=2, keep=2, likelihood_scale=-1.0)
+
+    def test_vi_likelihood_scale_pulls_mean_off_prior(self):
+        # VI is the canonical case for likelihood_scale.  Without it,
+        # an N_obs-mean likelihood leaves VI stuck near initialisation
+        # because the wide Gaussian prior dominates.  With it, the
+        # variational mean tracks the data.
+        π = jno.np.pi
+        dom = _line_domain()
+        x, _ = dom.variable("interior")
+        target = 3.0 * jno.np.sin(π * x)
+
+        def _solve(scale):
+            a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+            a.vi(
+                blackjax.meanfield_vi,
+                optimizer=optax.adam(5e-2),
+                num_samples=8,
+                posterior_draws=100,
+                likelihood_scale=scale,
+            )
+            residual = a * jno.np.sin(π * x) - target
+            jno.core([residual.mse], dom).solve(400)
+            return float(jnp.mean(a.posterior_samples))
+
+        mean_unscaled = _solve(1.0)
+        mean_scaled = _solve(100.0)
+        # Scaled VI should land much closer to the data-fit value (3.0)
+        # than the unscaled run, which gets pulled toward the prior at 0.
+        assert abs(mean_scaled - 3.0) < abs(mean_unscaled - 3.0)
+
+    def test_vi_likelihood_scale_rejects_non_positive(self):
+        a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        with pytest.raises(ValueError, match="likelihood_scale must be positive"):
+            a.vi(blackjax.meanfield_vi, optimizer=optax.adam(1e-3), likelihood_scale=0.0)
+
+
 # ---------------------------------------------------------------------------
 # Substeps + Bayesian — two-stage decoupled inference
 # ---------------------------------------------------------------------------

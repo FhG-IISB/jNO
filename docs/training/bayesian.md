@@ -479,20 +479,29 @@ VI converge usefully on non-trivial models:
   start.  The optimiser then *grows* rho where the posterior is
   genuinely wide.
 
-!!! warning "Likelihood scaling for VI"
+!!! tip "Likelihood scaling for VI — `likelihood_scale=`"
     The canonical Gaussian-noise log-likelihood is a **sum** over data
-    points, but jno's ``residual.mse`` returns the **mean**.  For VI
-    to get the right magnitude of gradient signal, multiply the
-    residual by ``sqrt(N_obs)``::
+    points, but jno's ``residual.mse`` returns the **mean** — so by
+    default the likelihood term in the ELBO is N× too small and the
+    prior dominates, leaving VI stuck near initialisation.
 
-        residual = (y_pred - y_obs) / sigma_obs * jnp.sqrt(N_obs)
-        crux = jno.core([residual.mse], domain)
+    Pass ``likelihood_scale=N_obs`` (or ``N_obs / sigma**2`` more
+    generally) on ``.vi(...)`` so the ELBO uses the correct
+    magnitude::
 
-    Without this rescaling the likelihood is N× too small and the
-    prior dominates, leaving VI stuck near initialisation.  See
-    [Tutorial 09](../tutorials/10-bayesian-pinns/vi-bnn-regression.md)
-    for a worked end-to-end example.  MCMC paths are less sensitive
-    to this — their gradient signal is more robust to magnitude.
+        a.vi(
+            blackjax.meanfield_vi,
+            optimizer=optax.adam(1e-3),
+            likelihood_scale=N_obs,   # canonical sum-over-data weighting
+        )
+
+    The same kwarg works on ``.bayesian(...)`` for MCMC kernels —
+    less critical (HMC's geometry is more robust to magnitude) but
+    still correct.  Available on both Pattern A (global) and Pattern
+    B/D (masked) configurators.
+
+    See [Tutorial 09](../tutorials/10-bayesian-pinns/vi-bnn-regression.md)
+    for a worked end-to-end example.
 
 ### Diagnostics caveat
 
