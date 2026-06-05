@@ -203,6 +203,92 @@ meaning.
     wrong for the actual joint problem.  Set `adapt=False` and pick
     `step_size` by hand in that case.
 
+## Logdensity-aware initializers (`.initialize()` extension)
+
+`Model.initialize(...)` already takes a path, a pytree, or a stateless
+`(shape, dtype, key) -> array` callable.  A fourth shape is now
+accepted: any object with `requires_logdensity = True` whose
+`__call__` runs *inside* `solve()` with access to the loss-derived
+log-density.  **Pathfinder** (Zhang et al. 2022) is the first concrete
+implementation.
+
+```python
+import jno, blackjax
+
+a.initialize(jno.bayesian.pathfinder(maxiter=30, num_samples=200))
+a.bayesian(blackjax.nuts, step_size=1e-2, warmup=100, adapt=True)
+```
+
+Pathfinder runs L-BFGS on the log-density and turns the inverse-Hessian
+trajectory into a normal approximation to the posterior.  From the
+fitted `q` jno extracts (a) a warm starting position (the MAP for K=1
+chains; K i.i.d. samples for K>1 — proper over-dispersion) and (b) a
+diagonal `inverse_mass_matrix` from the per-dimension variance of M
+draws.  `.bayesian()`'s `warmup` and `adapt` then apply **after**
+pathfinder.
+
+### Behaviour matrix
+
+| `.initialize(pathfinder(...))` | `adapt` | What runs |
+|---|---|---|
+| not set | `True` | window adaptation from the user's init (today's default) |
+| not set | `False` | user's init, user's step_size — no warmup |
+| set | `True` | pathfinder → window: warm position + IMM, then window refines step_size |
+| set | `False` | pathfinder only: warm position + pathfinder's IMM, user's step_size kept |
+
+### The protocol — `_BayesianInitializer`
+
+Minimal, single-method contract.  Any class with
+`requires_logdensity = True` is detected by `Model.initialize` and
+dispatched the same way at solve time:
+
+```python
+class _BayesianInitializer:
+    requires_logdensity: ClassVar[bool] = True
+
+    def __call__(self, rng_key, logdensity_fn, position, num_chains):
+        # → (new_position, extra_kwargs_update)
+        ...
+```
+
+* `logdensity_fn` is already mask-wrapped for
+  `.mask(M).bayesian()` groups — subclasses see only the masked subset.
+* For `num_chains > 1`, return a `(K, *leaf)`-leading pytree (one warm
+  position per chain).
+* `extra_kwargs_update` is merged into the kernel handle's
+  `extra_kwargs`; keys the kernel doesn't accept (e.g. an IMM update
+  against a MALA kernel) are silently dropped.
+
+### Composition
+
+* **Masks** — `.mask(M).bayesian()` + pathfinder works: pathfinder
+  runs on the masked subset's log-density; the unmasked complement
+  stays at init.
+* **Multi-chain** — pathfinder samples K distinct starting positions
+  from the fitted `q`.  `init_jitter` is silently overridden when an
+  initializer is set.
+* **Non-IMM kernels** (MALA / SGLD / SGHMC) — warm position is
+  applied; the IMM update is silently dropped (signature gate).
+* **`substeps=`** + initializer → clear error (the initializer runs
+  on the full loss; substep kernels see only substep-local
+  constraints).
+* **`.vi(...)`** + initializer → clear error (VI initialises its own
+  variational distribution from the position; warm-start is
+  redundant).
+
+### Future initializers (same hook, no further core changes)
+
+| Slot | Algorithm | Notes |
+|---|---|---|
+| `jno.bayesian.pathfinder(...)` | blackjax pathfinder | This release. |
+| `jno.bayesian.laplace(...)` | MAP via Adam + `jax.hessian` | Coming next.  Magnani et al. 2024 *Linearization Turns Neural Operators into GPs*. |
+| `jno.bayesian.svgd(...)` | blackjax svgd | K particles → K chain inits. |
+| `jno.bayesian.map(...)` | Fixed-step optax warm-start | No IMM output; user keeps step_size. |
+| User-written subclass | anything that fits the contract | See [Tutorial 11](../tutorials/10-bayesian-pinns/pathfinder-init.md). |
+
+A worked example lives at
+[Tutorial 11](../tutorials/10-bayesian-pinns/pathfinder-init.md).
+
 ## Multiple chains
 
 Pass `num_chains=K` (default `1`) to run K independent MCMC chains in
