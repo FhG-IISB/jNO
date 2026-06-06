@@ -72,9 +72,8 @@ When ambiguous, the docs say *spatial mesh* vs *device mesh*.
   mesh tag (`domain.variable("interior")` → `x, y, t`). Has a `dim`
   slice into the tag's array.
 - **`TensorTag`** — a non-coordinate quantity stored on the domain
-  context (e.g., a per-sample diffusion field). Built via
-  `domain.add_tensor_tag(name, array)` and referenced as
-  `domain.variable(name)`.
+  context (e.g., a per-sample diffusion field). Attached and
+  referenced through the same call: `domain.variable(name, array)`.
 
 ### Tag (domain tag)
 
