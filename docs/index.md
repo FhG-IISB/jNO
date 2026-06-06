@@ -65,7 +65,7 @@ Each status badge links to the tutorial (or, where no dedicated tutorial exists,
 ## Common terminology
 
 A few jNO-specific terms appear throughout the docs. See the
-[Glossary](Glossary.md) for full definitions:
+[Concepts](Glossary.md) page for full definitions:
 
 - **Trace / tracing system** — the unified symbolic graph that holds
   domain points, network calls, residuals, and losses.

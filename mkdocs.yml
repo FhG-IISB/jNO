@@ -78,7 +78,7 @@ nav:
   - Installation: Installation.md
   - Getting Started: Getting-Started.md
   - API Reference: API.md
-  - Glossary: Glossary.md
+  - Concepts: Glossary.md
   - Getting to Know jNO:
     - Domain and Geometry: Domain-and-Geometry.md
     - Operators:
