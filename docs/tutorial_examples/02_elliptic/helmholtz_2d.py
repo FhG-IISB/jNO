@@ -28,7 +28,7 @@ import jno
 k = 2.0  # wave number — change to test different regimes
 
 # ── Domain ────────────────────────────────────────────────────────────────────
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05))
+domain = jno.domain.rect(mesh_size=0.05)
 x, y, _ = domain.variable("interior")
 
 # ── Manufactured solution and forcing ─────────────────────────────────────────

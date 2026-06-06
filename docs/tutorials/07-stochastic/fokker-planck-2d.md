@@ -55,9 +55,7 @@ This example solves the **stationary Fokker-Planck equation** for a 2-D Ornstein
 ### Step 1 — Domain centred at the origin
 
 ```python
-domain = jno.domain(
-    constructor=jno.domain.rect(x_range=(-3.0, 3.0), y_range=(-3.0, 3.0), mesh_size=0.15)
-)
+domain = jno.domain.rect(x_range=(-3.0, 3.0), y_range=(-3.0, 3.0), mesh_size=0.15)
 x,  y,  _ = domain.variable("interior")
 xb, yb, _ = domain.variable("boundary")
 ```
@@ -71,7 +69,7 @@ net = jno.nn.wrap(
     foundax.mlp(in_features=2, hidden_dims=64, num_layers=5,
                 activation=jax.nn.tanh, key=jax.random.PRNGKey(0))
 )
-net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 10, 1e-5))
+net.optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.5, end_value=1e-5)))
 
 p = net(x, y)
 ```
@@ -81,12 +79,12 @@ A tanh MLP is a natural fit because the target $e^{-(x^2+y^2)}$ is smooth and be
 ### Step 3 — Fokker-Planck residual
 
 ```python
-drift = jno.np.grad(x * p, x) + jno.np.grad(y * p, y)
+drift = (x * p).d(x) + (y * p).d(y)
 diff  = 0.5 * jno.np.laplacian(p, [x, y])
 fp    = drift + diff
 ```
 
-`jno.np.grad(x * p, x)` computes $\partial(x\,p)/\partial x$ via automatic differentiation.  The Laplacian $\Delta p$ is computed by `jno.np.laplacian`.
+`(x * p).d(x)` computes $\partial(x\,p)/\partial x$ via automatic differentiation.  The Laplacian $\Delta p$ is computed by `jno.np.laplacian`.
 
 ### Step 4 — Normalization constraint
 

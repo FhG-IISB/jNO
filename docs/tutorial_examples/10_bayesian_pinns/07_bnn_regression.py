@@ -132,7 +132,7 @@ crux = jno.core([residual.mse], train_dom)
 crux.solve(4200)
 
 # ── Predict on a dense eval grid ─────────────────────────────────────────────
-eval_dom = jno.domain(constructor=jno.domain.line(x_range=(-1.0, 1.0), mesh_size=0.02))
+eval_dom = jno.domain.line(x_range=(-1.0, 1.0), mesh_size=0.02)
 x_eval, _ = eval_dom.variable("interior")
 
 # auto-chain default: u_net is Bayesian, so the chain is vmapped through.

@@ -5,30 +5,27 @@
 <a class="md-button" href="/jNO_docs/tutorials/03-parabolic/">Back to chapter</a>
 </div>
 
-This example solves the transient 1D heat equation and introduces time as an explicit input to the model.
+Transient 1D heat equation — the introductory time-dependent example. Uses **soft enforcement** for both the initial condition and the spatial boundary conditions, which keeps the IC/BC roles explicit and works on any geometry (not just the unit interval).
 
 ## Problem Setup
 
-The script solves a diffusion equation of the form `u_t = alpha u_xx` on a space-time domain with zero Dirichlet boundaries and a sinusoidal initial condition.
+`u_t = α u_xx` on `(x, t) ∈ [0, 1] × [0, 0.5]`, with `u(0, t) = u(1, t) = 0` (Dirichlet) and `u(x, 0) = sin(π x)` (initial). Exact solution: `u(x, t) = e^{-α π² t} sin(π x)`.
 
 ## Step 1: Build a Space-Time Domain
 
-The domain includes both space and time, with separate sampling for interior and initial-condition points.
-
 ```python
-α = 0.1   # thermal diffusivity
+α = 0.1
 T_end = 0.5
 
 domain = jno.domain.line(mesh_size=0.01, time=(0, T_end, 10))
-x, t   = domain.variable("interior")
-x0, t0 = domain.variable("initial")
-
-u_exact = jno.np.exp(-α * π**2 * t) * jno.np.sin(π * x)
+x, t   = domain.variable("interior")   # full interior of space-time
+x0, t0 = domain.variable("initial")    # t = 0 slice
+xb, tb = domain.variable("boundary")   # x = 0 and x = 1 at all t
 ```
 
-## Step 2: Use a DeepONet-Style Model
+Three tags sampled — one for the PDE residual, one for the IC, one for the BC.
 
-The example uses a DeepONet architecture in PINN mode so the model can learn a time-dependent field over the full domain.
+## Step 2: Bare-Network Ansatz
 
 ```python
 net = jno.nn.wrap(
@@ -38,35 +35,32 @@ net = jno.nn.wrap(
         key=jax.random.PRNGKey(0),
     )
 )
-net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.9, 10000, 1e-5))
+net.optimizer(optax.adam(optax.exponential_decay(1e-3, 10000, 0.9, end_value=1e-5)))
+
+u = net(t, x)   # no multiplicative ansatz — IC + BC enforced via loss terms below
 ```
 
-## Step 3: Hard-Enforce Spatial Boundary Conditions
-
-A spatial envelope `x(1-x)` keeps the field zero at the two endpoints for every time. The initial condition `sin(πx)` is built directly into the ansatz via the additive term, so the IC is hard-enforced as well.
+## Step 3: Three Constraints — PDE + IC + BC
 
 ```python
-u = jno.np.sin(π * x) + t * net(t, x) * x * (1 - x)
-```
+# Interior PDE residual:  u_t − α u_xx = 0
+pde = u.d(t) - α * u.d2(x)
 
-## Step 4: Add the Initial Condition as a Separate Constraint
+# Initial condition:  net(0, x) = sin(πx)
+ic = net(t0, x0) - jno.np.sin(π * x0)
 
-The PDE residual governs the interior, while a second loss enforces the known initial profile at `t = 0`.
+# Spatial boundary:  net(t, 0) = net(t, 1) = 0
+bc = net(tb, xb)
 
-```python
-pde = jno.np.grad(u, t) - α * jno.np.grad(jno.np.grad(u, x), x)
-
-crux    = jno.core([pde.mse], domain)
+crux = jno.core([pde.mse, ic.mse, bc.mse], domain)
 history = crux.solve(10000)
-
-_u, _u_exact = crux.eval([u, u_exact])
 ```
 
 ## What To Notice
 
-- Time-dependent PDEs need both interior physics and initial data.
-- The jNO workflow stays similar even though the field now depends on multiple coordinates.
-- This is the cleanest parabolic starting point in the tutorial set.
+- Each physical condition is its own constraint term — the IC, the BC, and the PDE are three separate scalars that the optimiser balances. There is no ansatz hiding any of them.
+- For unit-interval Dirichlet problems a hard ansatz `u = sin(πx) + t · net(t,x) · x(1−x)` would work and remove two of the three losses (see the original `Laplace 1D` for the hard-ansatz pattern). The soft pattern shown here generalises to arbitrary geometries and to PDEs where no clean ansatz exists.
+- DeepONet is used here in PINN mode (single instance, no parameter sweep). The branch/trunk split makes it expressive enough to capture both space and time dependence with a small network.
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/03_parabolic/heat_1d.py" download>Download full script</a>

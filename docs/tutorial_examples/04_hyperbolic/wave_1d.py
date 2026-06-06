@@ -13,6 +13,13 @@ Analytical solution
 
 Standing wave: the spatial shape sin(πx) oscillates in amplitude with
 period T = 2/(cπ).  With c=1 and T_end=1 we see half a full oscillation.
+
+Pattern shown
+-------------
+Soft enforcement of all four conditions — the displacement IC, the
+velocity IC, and the two spatial BCs — as separate loss terms.  This
+generalises to any hyperbolic problem; the matching hard-ansatz pattern
+is much more constrained.
 """
 
 import foundax
@@ -23,7 +30,7 @@ import jno
 
 π = jno.np.pi
 c = 1.0  # wave speed
-T_end = 1.0  # final time (half period for c=1)
+T_end = 1.0
 
 # ── Domain ────────────────────────────────────────────────────────────────────
 domain = jno.domain(
@@ -31,6 +38,8 @@ domain = jno.domain(
     time=(0, T_end, 20),
 )
 x, t = domain.variable("interior")
+x0, t0 = domain.variable("initial")  # t = 0 slice — for displacement + velocity IC
+xb, tb = domain.variable("boundary")  # x = 0 and x = 1 at all t — for the Dirichlet BC
 
 # ── Analytical solution ───────────────────────────────────────────────────────
 u_exact = jno.np.cos(c * π * t) * jno.np.sin(π * x)
@@ -60,22 +69,23 @@ net.optimizer(
     )
 )
 
-# Hard-enforce BC *and* both ICs in the ansatz:
-#   u(x,0)  = sin(πx)          [because t²=0]
-#   u_t(x,0) = 0               [because d/dt(t²)=2t=0 at t=0]
-#   u(0,t)  = u(1,t) = 0       [because sin(0)=sin(π)=0 and x(1-x)=0]
-u = jno.np.sin(π * x) + t**2 * net(t, x) * x * (1 - x)
+u = net(t, x)
 
 # ── PDE constraint:  u_tt − c² u_xx = 0 ─────────────────────────────────────
-u_t = jno.np.grad(u, t)
-u_tt = jno.np.grad(u_t, t)
-u_xx = jno.np.grad(jno.np.grad(u, x), x)
-pde = u_tt - c**2 * u_xx
+pde = u.d2(t) - c**2 * u.d2(x)
 
-# ── Solve (single PDE constraint — ICs and BCs are hard-coded) ───────────────
-crux = jno.core([pde.mse], domain)
+# ── Initial conditions:  u(x,0) = sin(πx)  and  u_t(x,0) = 0 ────────────────
+u0 = net(t0, x0)
+ic_disp = u0 - jno.np.sin(π * x0)
+ic_vel = u0.d(t0)
+
+# ── Spatial boundary:  u(0, t) = u(1, t) = 0 ───────────────────────────────
+bc = net(tb, xb)
+
+# ── Solve ────────────────────────────────────────────────────────────────────
+crux = jno.core([pde.mse, ic_disp.mse, ic_vel.mse, bc.mse], domain)
 history = crux.solve(50000)
 
 _u, _u_exact = crux.eval([u, u_exact])
 rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_exact) + 1e-8))
-assert rel_l2 < 1e-1, f"relative L2 error too large: {rel_l2:.3e}"
+assert rel_l2 < 2e-1, f"relative L2 error too large: {rel_l2:.3e}"

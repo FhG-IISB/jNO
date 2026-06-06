@@ -57,12 +57,21 @@ u0 = net(t0, xy0) * x0 * (1 - x0) * y0 * (1 - y0)
 The transient residual enforces the heat equation, while a dedicated initial-condition residual anchors the solution at `t = 0`.
 
 ```python
-pde = jno.np.grad(u, t) - α * jno.np.laplacian(u, [x, y])
+pde = u.d(t) - α * jno.np.laplacian(u, [x, y])
 ini = u0 - jno.np.sin(π * x0) * jno.np.sin(π * y0)
 
 crux    = jno.core([pde.mse, ini.mse], domain)
 history = crux.solve(40000)
 ```
+
+!!! tip "Autodiff vs finite-difference laplacian"
+    On a 2-D mesh you can swap the autodiff Laplacian for the FD version by passing `scheme="finite_difference"` to `.laplacian(...)`:
+
+    ```python
+    pde = u.d(t) - α * jno.np.laplacian(u, [x, y], scheme="finite_difference")
+    ```
+
+    Two prerequisites: the domain must be created with `compute_mesh_connectivity=True` (so the FD stencils are precomputed at mesh build time), and the mesh must be regular enough that the stencil is well-defined. The FD path is **substantially cheaper per step** for dense interior meshes because it skips the autodiff tape, but it pays mesh-resolution error. A useful sanity check is to run the same PDE twice (once with each scheme) and confirm the two solutions agree to within `O(h²)`.
 
 ## Step 4: Plot Time Snapshots
 

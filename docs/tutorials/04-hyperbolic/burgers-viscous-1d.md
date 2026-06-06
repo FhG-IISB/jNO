@@ -33,12 +33,10 @@ strategy = sampler.rad(
 `mesh_size=0.05` on `[0,1]²` gives 513 interior nodes in the candidate pool. With `sample=(60, None)`, the network trains on a 60-point working set — an **8× pool-to-sample ratio** that gives RAD substantial room to move points into high-residual regions.
 
 ```python
-domain = 1 * jno.domain(
-    constructor=jno.domain.rect(
-        mesh_size=0.05,
-        x_range=(0.0, 1.0),
-        y_range=(0.0, 1.0),
-    )
+domain = 1 * jno.domain.rect(
+    mesh_size=0.05,
+    x_range=(0.0, 1.0),
+    y_range=(0.0, 1.0),
 )
 vars_int = domain.variable("interior", sample=(60, None), resampling_strategy=strategy)
 x, t = vars_int[0], vars_int[1]
@@ -54,13 +52,13 @@ An MLP with 2 inputs `(x, t)` takes both coordinates directly. The `x*(1-x)` fac
 
 ```python
 net = jno.nn.wrap(foundax.mlp(2, hidden_dims=64, num_layers=4, key=jax.random.PRNGKey(3)))
-net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(10, 1, 1e-3, 1e-5))
+net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=1e-3, warmup_steps=1, decay_steps=10, end_value=1e-5)))
 
 u = net(x, t) * x * (1 - x)
 
-u_t  = jno.np.grad(u, t)
-u_x  = jno.np.grad(u, x)
-u_xx = jno.np.grad(u_x, x)
+u_t  = u.d(t)
+u_x  = u.d(x)
+u_xx = u_x.d(x)
 pde  = u_t + u * u_x - ν * u_xx - source
 ```
 

@@ -66,7 +66,7 @@ A standard line domain provides the collocation points. Sensor coordinates are r
 
 ```python
 # Dense collocation grid — PDE residual + interaction
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.02))
+domain = jno.domain.line(mesh_size=0.02)
 x, _ = domain.variable("interior")
 
 # Sparse noisy sensors — registered on the same domain

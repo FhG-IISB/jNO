@@ -14,7 +14,48 @@ Adaptive strategies periodically replace a fraction of points based on some crit
 
 ---
 
-## Available Strategies
+## Build your own strategy
+
+Any subclass of `ResamplingStrategy` is a valid strategy — override one abstract method:
+
+```python
+def resample(self, points, residuals, domain, tag, epoch, rng_key, candidates=None) -> jnp.ndarray
+```
+
+The base class handles `resample_every`, `resample_fraction`, and `start_epoch` for you; your `resample` only sees calls that actually need to produce new points. `candidates` is a pre-drawn pool from `domain.draw_candidates(tag)` — use it as the source of replacement points so you stay inside the domain's physical groups.
+
+```python
+from jno.utils.adaptive.resampling import ResamplingStrategy
+import jax, jax.numpy as jnp
+
+class TopResidual(ResamplingStrategy):
+    """Replace the worst-residual points with fresh draws from the candidate pool."""
+
+    def resample(self, points, residuals, domain, tag, epoch, rng_key, candidates=None):
+        if residuals.ndim > 1:                         # collapse batch dim if present
+            residuals = jnp.mean(residuals, axis=0)
+        n_replace = int(len(points) * self.resample_fraction)
+        n_keep    = len(points) - n_replace
+        order     = jnp.argsort(residuals)             # ascending — keep lowest
+        kept      = points[order[:n_keep]]
+        idx       = jax.random.choice(rng_key, len(candidates), shape=(n_replace,))
+        return jnp.concatenate([kept, candidates[idx]], axis=0)
+
+# Wire it in exactly like the built-ins
+x, y = domain.variable(
+    "interior",
+    sample=(None, None),
+    resampling_strategy=TopResidual(resample_every=100, resample_fraction=0.2, start_epoch=1000),
+)
+```
+
+The built-in strategies below all subclass `ResamplingStrategy` themselves — they are common patterns shipped for convenience, not the only thing the system supports.
+
+---
+
+## Built-in strategies
+
+For the common cases, `jno.sampler` ships these out of the box.
 
 ### `sampler.random` — Random Resampling (Baseline)
 

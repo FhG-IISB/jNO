@@ -71,7 +71,7 @@ u = net(t, xy) * x * (1 - x) * y * (1 - y)
 u0 = net(t0, xy0) * x0 * (1 - x0) * y0 * (1 - y0)
 
 # ── Constraints ───────────────────────────────────────────────────────────────
-pde = jno.np.grad(u, t) - α * jno.np.laplacian(u, [x, y])
+pde = u.d(t) - α * jno.np.laplacian(u, [x, y])
 ini = u0 - jno.np.sin(π * x0) * jno.np.sin(π * y0)
 
 # ── Solve ─────────────────────────────────────────────────────────────────────

@@ -25,7 +25,7 @@ import optax
 import jno
 
 pi = jno.np.pi
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05))
+domain = jno.domain.rect(mesh_size=0.05)
 x, y, _ = domain.variable("interior")
 xt, yt, _ = domain.variable("top")
 xb, yb, _ = domain.variable("bottom")
@@ -41,8 +41,8 @@ u_top = net(xt, yt) * xt * (1 - xt)
 u_bottom = net(xb, yb) * xb * (1 - xb)
 
 pde = -jno.np.laplacian(u, [x, y]) - forcing
-neumann_top = jno.np.grad(u_top, yt)
-neumann_bottom = jno.np.grad(u_bottom, yb)
+neumann_top = u_top.d(yt)
+neumann_bottom = u_bottom.d(yb)
 
 crux = jno.core([pde.mse, neumann_top.mse, neumann_bottom.mse], domain)
 history = crux.solve(40000)

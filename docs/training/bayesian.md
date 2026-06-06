@@ -75,6 +75,52 @@ Model.bayesian(
 jno builds the appropriate closure from the live loss + context and rebuilds
 the kernel inside the JIT graph each step.
 
+### Custom kernel factories — `(logdensity_fn, **kw) → SamplingAlgorithm`
+
+You are **not** limited to the blackjax kernels listed above. `kernel_factory`
+is anything that returns a [`blackjax.SamplingAlgorithm`](https://blackjax-devs.github.io/blackjax/autoapi/blackjax/base/index.html)
+(a `NamedTuple(init, step)`). jno detects which family it belongs to by
+inspecting the **first parameter name**:
+
+- `logdensity_fn` → full-data MCMC; jno passes a closure
+  `θ → log p(data | θ) + log p(θ)`.
+- `grad_estimator` → stochastic-gradient MCMC; jno passes a mini-batch
+  gradient closure.
+
+A barebones random-walk Metropolis factory, for illustration:
+
+```python
+import blackjax, jax
+import jax.numpy as jnp
+
+def my_rwm(logdensity_fn, step_size):
+    def init_fn(position):
+        return {"position": position, "logdensity": logdensity_fn(position)}
+
+    def step_fn(rng_key, state):
+        k1, k2 = jax.random.split(rng_key)
+        prop = jax.tree.map(
+            lambda p: p + step_size * jax.random.normal(k1, p.shape),
+            state["position"],
+        )
+        new_logd = logdensity_fn(prop)
+        accept = jnp.log(jax.random.uniform(k2)) < new_logd - state["logdensity"]
+        new_state = {
+            "position":  jax.tree.map(lambda x, y: jnp.where(accept, y, x),
+                                      state["position"], prop),
+            "logdensity": jnp.where(accept, new_logd, state["logdensity"]),
+        }
+        return new_state, {"accepted": accept}
+
+    return blackjax.SamplingAlgorithm(init_fn, step_fn)
+
+net.bayesian(my_rwm, step_size=1e-2, warmup=500, keep=1000)
+```
+
+The built-in kernels in the table above all match this protocol — your
+factory plugs in the same way and goes through the same warmup / thin /
+keep pipeline.
+
 ## Output — chains by default
 
 `crux.eval(...)` is **auto-chain-aware** per expression: if an expression's

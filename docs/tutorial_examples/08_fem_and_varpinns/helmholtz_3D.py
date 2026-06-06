@@ -32,7 +32,6 @@ import numpy as np
 import optax
 
 import jno
-from jno import LearningRateSchedule as lrs
 
 jax.config.update("jax_enable_x64", False)
 
@@ -215,13 +214,13 @@ def build_weak_form(domain):
     xt, yt, zt, _ = domain.variable("gauss_top", split=True)
     xw, yw, zw, _ = domain.variable("gauss_wall", split=True)
 
-    ux = jno.np.grad(u, xg)
-    uy = jno.np.grad(u, yg)
-    uz = jno.np.grad(u, zg)
+    ux = u.d(xg)
+    uy = u.d(yg)
+    uz = u.d(zg)
 
-    phix = jno.np.grad(phi, xg)
-    phiy = jno.np.grad(phi, yg)
-    phiz = jno.np.grad(phi, zg)
+    phix = phi.d(xg)
+    phiy = phi.d(yg)
+    phiz = phi.d(zg)
 
     volume = ux * phix + uy * phiy + uz * phiz + sigma * u * phi - source_f(xg, yg, zg) * phi
 
@@ -320,13 +319,9 @@ pde = weak_vpinn.assemble(vpinn_domain, u_net=u_gauss, target="vpinn")
 crux = jno.core(constraints=[pde.mse], domain=vpinn_domain)
 
 net.optimizer(
-    optax.adam,
-    lr=lrs.warmup_cosine(
-        500,
-        5,
-        1e-3,
-        1e-5,
-    ),
+    optax.adam(
+        optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=1e-3, warmup_steps=5, decay_steps=500, end_value=1e-5)
+    )
 )
 
 crux.solve(epochs=200)

@@ -1,18 +1,21 @@
-"""01 — 1-D Laplace / Poisson equation  (simplest possible PINN)
+"""01 — 1-D Laplace equation  (simplest possible PINN)
 
 Problem
 -------
-    −u''(x) = sin(πx),   x ∈ [0, 1],   u(0) = u(1) = 0
+    u''(x) = 0,   x ∈ [0, 1],   u(0) = 0,  u(1) = 1
 
 Analytical solution
 -------------------
-    u(x) = sin(πx) / π²
+    u(x) = x   (the linear interpolant between the two boundary values)
 
 Techniques shown
 ----------------
-* Homogeneous Dirichlet BCs via hard constraint:  u = net(x) · x (1−x)
-* Automatic-differentiation gradient  (jno.np.grad)
-* Final relative-L² check against the exact solution
+* Non-homogeneous Dirichlet BCs via a hard-enforced ansatz:
+    u = x + x(1−x)·net(x)
+  The linear part x exactly satisfies u(0)=0 and u(1)=1; the
+  x(1−x) factor vanishes at both endpoints so the network only
+  learns the *deviation* from the linear interpolant.
+* `.d2()` shortcut for the second derivative (autodiff)
 * Single-phase Adam with exponential LR decay
 """
 
@@ -21,17 +24,15 @@ import jax
 import optax
 
 import jno
-from jno import LearningRateSchedule as lrs
 
-π = jno.np.pi
 # ── Domain ────────────────────────────────────────────────────────────────────
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+domain = jno.domain.line(mesh_size=0.1)
 x, _ = domain.variable("interior")
 
 # ── Analytical solution ───────────────────────────────────────────────────────
-u_exact = jno.np.sin(π * x) / π**2
+u_exact = x  # linear interpolant between u(0)=0 and u(1)=1
 
-# ── Network with hard-enforced BCs ────────────────────────────────────────────
+# ── Network with non-homogeneous hard-enforced BCs ────────────────────────────
 u_net = jno.nn.wrap(
     foundax.mlp(
         in_features=1,
@@ -39,12 +40,13 @@ u_net = jno.nn.wrap(
         num_layers=3,
         key=jax.random.PRNGKey(0),
     )
-).optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 10, 1e-5))
+).optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.5, end_value=1e-5)))
 
-u = u_net(x) * x * (1 - x)  # hard BC: u(0) = u(1) = 0
+# Linear interpolant + network correction that vanishes at the endpoints.
+u = x + x * (1 - x) * u_net(x)
 
 # ── Constraints ───────────────────────────────────────────────────────────────
-pde = -jno.np.grad(jno.np.grad(u, x), x) - jno.np.sin(π * x)  # should be 0
+pde = u.d2(x)  # Laplace: u'' = 0
 
 # ── Solve ─────────────────────────────────────────────────────────────────────
 crux = jno.core([pde.mse], domain)

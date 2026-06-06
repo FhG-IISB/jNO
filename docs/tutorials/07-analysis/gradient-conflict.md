@@ -58,15 +58,15 @@ $$-u''(x) = \sin(\pi x), \quad x \in [0, 1], \quad u(0) = u(1) = 0$$
 Exact solution: $u(x) = \sin(\pi x) / \pi^2$.
 
 ```python
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+domain = jno.domain.line(mesh_size=0.1)
 x, _ = domain.variable("interior")
 
 u_net = jno.nn.wrap(
     foundax.mlp(in_features=1, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(0))
-).optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 10, 1e-5))
+).optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.5, end_value=1e-5)))
 
 u    = u_net(x) * x * (1 - x)        # hard BC: u(0) = u(1) = 0
-u_xx = jno.np.grad(jno.np.grad(u, x), x)
+u_xx = u.d2(x)
 pde  = -u_xx - jno.np.sin(π * x)
 ```
 

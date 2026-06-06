@@ -19,6 +19,8 @@ site/
 scripts/
 misc/
 !docs/misc/
+!docs/assets/
+!docs/assets/*
 runs/
 traces/
 

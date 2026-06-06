@@ -21,7 +21,7 @@ with `kappa(x,y) = 1 + x + y` and exact solution `sin(pi x) sin(pi y)`.
 The script constructs `kappa` directly from the sampled coordinates, so the PDE coefficients vary pointwise across the domain.
 
 ```python
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05))
+domain = jno.domain.rect(mesh_size=0.05)
 x, y, _ = domain.variable("interior")
 
 kappa    = 1 + x + y
@@ -42,8 +42,8 @@ net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=80, num_layers=5, key=j
 net.optimizer(optax.adam(optax.exponential_decay(1e-3, 80, 0.5, end_value=1e-5)))
 
 u      = net(x, y) * x * (1 - x) * y * (1 - y)
-flux_x = kappa * jno.np.grad(u, x)
-flux_y = kappa * jno.np.grad(u, y)
+flux_x = kappa * u.d(x)
+flux_y = kappa * u.d(y)
 ```
 
 ## Step 3: Enforce Boundary Conditions Hard

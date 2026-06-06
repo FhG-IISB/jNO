@@ -13,6 +13,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Detect whether anything under jno/ (or test inputs / lockfile /
+      # this workflow itself) changed in the PR or push.  Docs-only and
+      # GitHub-template-only changes skip the test suite below — fmt +
+      # lint still run on every PR.
+      - name: Detect code changes
+        id: changes
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            code:
+              - 'jno/**'
+              - 'tests/**'
+              - 'pyproject.toml'
+              - 'pixi.lock'
+              - 'pytest.ini'
+              - '.github/workflows/ci.yml'
+
       - name: Set up pixi
         uses: prefix-dev/setup-pixi@v0.8.1
         with:
@@ -25,14 +42,18 @@ jobs:
         run: pixi run ci-lint
 
       - name: Test (with coverage)
+        if: steps.changes.outputs.code == 'true'
         run: pixi run ci-test-cov
 
       # Public-repo upload works without a token (codecov-action uses OIDC).
       # For private repos, set the CODECOV_TOKEN secret and uncomment the
       # `token:` line. Codecov must be enabled for the repo on codecov.io
       # before the first upload will be visible.
+      # Runs only when the test step ran — and even if those tests
+      # failed (so red coverage reports stay visible) — but skips when
+      # the job was cancelled or when no code paths changed.
       - name: Upload coverage to Codecov
-        if: always()
+        if: steps.changes.outputs.code == 'true' && !cancelled()
         uses: codecov/codecov-action@v4
         with:
           files: ./coverage.xml

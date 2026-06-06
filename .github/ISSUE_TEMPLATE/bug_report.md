@@ -1,27 +1,50 @@
 ---
 name: Bug report
-about: Create a report to help us improve
+about: Report unexpected behaviour in jNO
 title: ''
-labels: ''
+labels: bug
 assignees: ''
 
 ---
 
-**Describe the bug**
-A clear and concise description of what the bug is.
+## What happened
 
-**To Reproduce**
-Steps to reproduce the behavior:
-1. Go to '...'
-2. Click on '....'
-3. Scroll down to '....'
-4. See error
+<!-- A short description of the unexpected behaviour. -->
 
-**Expected behavior**
-A clear and concise description of what you expected to happen.
+## Minimal reproducer
 
-**Screenshots**
-If applicable, add screenshots to help explain your problem.
+<!--
+The shortest script that reproduces the issue. A self-contained snippet
+that someone can paste into a file and run is much more useful than
+prose. Trim unrelated setup; keep imports.
+-->
 
-**Additional context**
-Add any other context about the problem here.
+```python
+import jno
+# ...
+```
+
+## Expected vs actual
+
+<!--
+What did you expect to happen, and what did you observe instead? Paste
+the full traceback (inside a ```python or ```text fence) if one exists.
+-->
+
+## Environment
+
+- `jno.__version__`:
+- `jax.__version__`:
+- Python version (`python --version`):
+- Operating system (e.g. Ubuntu 24.04, macOS 14.5):
+- GPU / CUDA version (or "CPU only"):
+- Install method (`pip install jax-neural-operators[fem]`, `pixi install`, Docker image tag, source checkout):
+
+## Additional context
+
+<!--
+Anything else relevant — does the bug only appear on GPU? Only with
+batch size > N? Only after a particular `crux.solve(...)` configuration?
+Links to related issues, papers, or upstream blackjax/optax/equinox
+bugs.
+-->

@@ -37,7 +37,7 @@ net = jno.nn.wrap(
         key=jax.random.PRNGKey(22),
     )
 )
-net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(10, 1, 1e-3, 1e-5))
+net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=1e-3, warmup_steps=1, decay_steps=10, end_value=1e-5)))
 
 u = net(t, x) * x * (1 - x)
 ```
@@ -60,9 +60,9 @@ ini_ut = u_t0 + jno.np.sin(pi * x0)
 The `beta u_t` term changes the dynamics from undamped propagation to dissipative wave motion.
 
 ```python
-pde = (jno.np.grad(jno.np.grad(u, t), t)
-       + beta * jno.np.grad(u, t)
-       - c**2 * jno.np.grad(jno.np.grad(u, x), x)
+pde = (u.d2(t)
+       + beta * u.d(t)
+       - c**2 * u.d2(x)
        - source)
 
 crux    = jno.core([pde.mse, ini_u.mse, ini_ut.mse], domain)

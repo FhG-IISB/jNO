@@ -61,8 +61,8 @@ ini_v = v0 - jno.np.sin(2 * pi * x0) * jno.np.sin(pi * y0)
 All losses are optimized together so the two models remain consistent with each other and with the data.
 
 ```python
-pde_u = jno.np.grad(u, t) - jno.np.laplacian(u, [x, y]) + v - f
-pde_v = jno.np.grad(v, t) - jno.np.laplacian(v, [x, y]) + u - g
+pde_u = u.d(t) - jno.np.laplacian(u, [x, y]) + v - f
+pde_v = v.d(t) - jno.np.laplacian(v, [x, y]) + u - g
 
 crux    = jno.core([pde_u.mse, pde_v.mse, ini_u.mse, ini_v.mse], domain)
 history = crux.solve(40_000)

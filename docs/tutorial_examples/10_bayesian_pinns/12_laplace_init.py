@@ -87,7 +87,7 @@ A_true, B_true = 3.14, -2.71
 
 
 def _build_problem():
-    domain = jno.domain(constructor=jno.domain.line(mesh_size=0.02))
+    domain = jno.domain.line(mesh_size=0.02)
     x, _ = domain.variable("interior")
     target = A_true * jno.np.sin(π * x) + B_true * jno.np.cos(π * x)
 

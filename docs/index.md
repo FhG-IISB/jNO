@@ -1,4 +1,4 @@
-# jNO Documentation
+# Documentation
 
 **jNO** (jax Neural Operators) is a JAX-native library for training
 neural operators, physics-informed networks, and PDE foundation models.
@@ -24,8 +24,8 @@ language and compiled into one optimisation pipeline.
 
 -   :material-book-open-page-variant-outline: **[Tutorials](#tutorials)**
 
-    40 worked examples across elliptic, parabolic, hyperbolic, coupled,
-    inverse, integral, stochastic, and FEM problems.
+    ~50 worked examples across elliptic, parabolic, hyperbolic, coupled,
+    inverse, integral, stochastic, FEM, and Bayesian problems.
 
 -   :material-language-python: **[API Reference](API.md)**
 
@@ -40,27 +40,32 @@ language and compiled into one optimisation pipeline.
 
 What works today, what is experimental, what is not yet supported.
 
+Each status badge links to the tutorial (or, where no dedicated tutorial exists, the closest reference page) that demonstrates the capability.
+
 | Capability | Status | Notes |
 |------------|--------|-------|
-| Forward PINNs (residual minimisation) | ✅ stable | Hard or soft BC enforcement |
-| Operator learning (DeepONet, FNO via [foundax](https://github.com/FhG-IISB/foundax)) | ✅ stable | Combine with PDE residual or train purely data-driven |
-| Inverse problems (parameter recovery, surrogate inversion) | ✅ stable | See [Inverse Problems](inverse-problems.md) |
-| FEM / Variational PINNs | ✅ stable | TRI3/TRI6/QUAD4 elements, weak-form assembly |
-| Adaptive resampling (RAD, RARD, CR3 causal) | ✅ stable | See [Adaptive Resampling](adaptive/resampling.md) |
-| Hybrid data + model parallelism | ✅ stable | `core(mesh=(batch, model))` |
-| W&B logging, gradient-conflict explainability | ✅ stable | See [Explainability](training/explainability.md) |
-| Stochastic PDEs (Fokker–Planck, noisy forcing) | ✅ stable | See [`07_stochastic`](tutorials/07-stochastic/fokker-planck-2d.md) |
-| Hyperparameter / architecture search | 🟡 beta | Grid + Nevergrad; see [Tuning](Hyperparameter-Tuning.md) |
-| Multi-physics coupling | 🟡 beta | HyCo Poisson tutorial; broader patterns developing |
-| Pretrained operator model zoo | ⛔ planned | Tracked in roadmap |
-| Bayesian / ensemble UQ helpers | ⛔ planned | Ensemble runs already possible via multiple seeds |
+| Forward PINNs (residual minimisation) | [✅ stable](tutorials/01-basics/poisson-1d.md) | Hard or soft BC enforcement |
+| Operator learning (DeepONet, FNO, PROSE via [foundax](https://github.com/FhG-IISB/foundax)) | [✅ stable](Getting-Started.md) | Combine with PDE residual or train purely data-driven |
+| Inverse problems (parameter recovery, surrogate inversion) | [✅ stable](tutorials/05-coupled-and-inverse/inverse-parameter.md) | See [Inverse Problems](inverse-problems.md) |
+| FEM / Variational PINNs | [✅ stable](tutorials/08-fem-and-varpinns/poisson-2d-fem.md) | TRI3 / TRI6 / QUAD4 elements, weak-form assembly |
+| Adaptive resampling (RAD, RARD, CR3, R3, pinnfluence) | [✅ stable](adaptive/resampling.md) | See [Adaptive Resampling](adaptive/resampling.md) |
+| Stochastic PDEs and noise nodes (gaussian / uniform / laplace) | [✅ stable](tutorials/07-stochastic/fokker-planck-2d.md) | Fokker–Planck, stochastic forcing |
+| Bayesian PINNs (NUTS, HMC, MALA, SGLD, SGHMC, VI) | [✅ stable](tutorials/10-bayesian-pinns/index.md) | 14 worked tutorials — see [Bayesian Sampling](training/bayesian.md) |
+| Parameter-efficient fine-tuning (LoRA, DoRA, rsLoRA, PiSSA, VeRA, LoKr, OFT, IA3) | [✅ stable](model-controls/lora.md) | Chain `.lora(...)` on any wrapped model |
+| Training explainability (gradient conflict, NTK, Hessian, loss landscape, input sensitivity, residual stats) | [✅ stable](tutorials/07-analysis/gradient-conflict.md) | See [Explainability](training/explainability.md) |
+| Foundation-model integration ([foundax](https://github.com/FhG-IISB/foundax) MLPs, transformers, DeepONet, FNO, PROSE) | [✅ stable](foundation_models/index.md) | Wrap any Equinox module via `jno.nn.wrap(...)` |
+| Hybrid data + model parallelism | [✅ stable](training/parallelism.md) | `core(mesh=(batch, model))` |
+| W&B logging + Orbax checkpointing | [✅ stable](tutorials/09-wandb/wandb-integration.md) | |
+| IREE / MLIR compiled inference for deployment | [✅ stable](model-controls/iree.md) | |
+| Hyperparameter / architecture search | [🟡 beta](Hyperparameter-Tuning.md) | Grid + Nevergrad |
+| Multi-physics coupling | [🟡 beta](tutorials/05-coupled-and-inverse/hyco-poisson-1d.md) | HyCo Poisson tutorial; broader patterns developing |
 
 ---
 
 ## Common terminology
 
 A few jNO-specific terms appear throughout the docs. See the
-[Glossary](Glossary.md) for full definitions:
+[Concepts](Glossary.md) page for full definitions:
 
 - **Trace / tracing system** — the unified symbolic graph that holds
   domain points, network calls, residuals, and losses.
@@ -77,9 +82,9 @@ A few jNO-specific terms appear throughout the docs. See the
 
 ## Tutorials
 
-Forty worked examples, ordered from simplest to most involved. Start at
-01 if you are new; jump into 05 (inverse) or 08 (FEM) if you have a
-specific goal.
+Roughly fifty worked examples, ordered from simplest to most involved.
+Start at 01 if you are new; jump into 05 (inverse), 08 (FEM), or 10
+(Bayesian) if you have a specific goal.
 
 | Group | Topic |
 |-------|-------|
@@ -92,6 +97,7 @@ specific goal.
 | 07 Stochastic | Fokker–Planck, stochastic forcing |
 | 08 FEM & Variational PINNs | Poisson 2-D, Allen–Cahn, Robin BC, Helmholtz 3-D |
 | 09 W&B logging | Reproducible training runs with Weights & Biases |
+| 10 Bayesian PINNs | NUTS / HMC chains, VI, inverse problems, BNN regression, warm-start initialisations (Pathfinder, Laplace, SVGD) |
 
 The full nav is in the left sidebar; the source scripts live under
 [`docs/tutorial_examples/`](https://github.com/FhG-IISB/jno/tree/main/docs/tutorial_examples).

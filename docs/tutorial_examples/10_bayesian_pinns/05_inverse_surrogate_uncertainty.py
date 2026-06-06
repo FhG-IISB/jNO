@@ -62,7 +62,7 @@ k_fwd, k_inv = jax.random.split(key)
 # Phase 1 — Forward solve (deterministic PINN)
 # ══════════════════════════════════════════════════════════════════════════════
 
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.01))
+domain = jno.domain.line(mesh_size=0.01)
 x, _ = domain.variable("interior")
 
 u_net = jno.nn.wrap(foundax.mlp(in_features=1, output_dim=1, hidden_dims=32, num_layers=3, key=k_fwd))
