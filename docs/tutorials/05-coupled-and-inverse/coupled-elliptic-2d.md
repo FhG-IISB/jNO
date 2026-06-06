@@ -28,7 +28,7 @@ k1, k2 = jax.random.split(jax.random.PRNGKey(0))
 u_net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=64, num_layers=4, key=k1))
 v_net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=64, num_layers=4, key=k2))
 for net in [u_net, v_net]:
-    net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(10, 1, 1e-3, 1e-5))
+    net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=1e-3, warmup_steps=1, decay_steps=10, end_value=1e-5)))
 
 boundary_envelope = 16.0 * x * (1 - x) * y * (1 - y)
 u = u_net(x, y) * boundary_envelope

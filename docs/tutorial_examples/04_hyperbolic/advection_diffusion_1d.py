@@ -14,8 +14,10 @@ Substituting into the PDE gives the source term:
     f(x,t) = u_t + c u_x − ν u_xx
            = e^{−t} [ (νπ² − 1) sin(πx) + cπ cos(πx) ]
 
-This holds the spatial shape fixed while the amplitude decays exponentially.
-The convection term introduces an apparent leftward shift in the forcing.
+Pattern shown
+-------------
+Soft IC + BC pattern (no multiplicative ansatz).  Three explicit
+constraints — PDE residual, IC, BC — are passed to ``jno.core``.
 """
 
 import foundax
@@ -23,7 +25,6 @@ import jax
 import optax
 
 import jno
-from jno import LearningRateSchedule as lrs
 
 π = jno.np.pi
 c = 1.0  # advection speed
@@ -37,12 +38,13 @@ domain = jno.domain(
 )
 x, t = domain.variable("interior")
 x0, t0 = domain.variable("initial")
+xb, tb = domain.variable("boundary")
 
 # ── Manufactured solution + source ───────────────────────────────────────────
 u_exact = jno.np.exp(-t) * jno.np.sin(π * x)
 source = jno.np.exp(-t) * ((ν * π**2 - 1) * jno.np.sin(π * x) + c * π * jno.np.cos(π * x))
 
-# ── Network  (hard Dirichlet BCs) ────────────────────────────────────────────
+# ── Network ──────────────────────────────────────────────────────────────────
 net = jno.nn.wrap(
     foundax.deeponet(
         n_sensors=1,
@@ -54,24 +56,24 @@ net = jno.nn.wrap(
         key=jax.random.PRNGKey(1),
     )
 )
-net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.6, 10, 1e-5))
+net.optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.6, end_value=1e-5)))
 
-u = net(t, x) * x * (1 - x)
+u = net(t, x)
 
-# ── PDE residual:  u_t + c u_x − ν u_xx − f = 0 ─────────────────────────────
-u_t = jno.np.grad(u, t)
-u_x = jno.np.grad(u, x)
-u_xx = jno.np.grad(u_x, x)
-pde = u_t + c * u_x - ν * u_xx - source
+# ── Constraints ──────────────────────────────────────────────────────────────
+# PDE residual:  u_t + c u_x − ν u_xx − f = 0
+pde = u.d(t) + c * u.d(x) - ν * u.d2(x) - source
 
-# ── Initial condition:  u(x,0) = sin(πx) ─────────────────────────────────────
-u_0 = net(t0, x0) * x0 * (1 - x0)
-ini = u_0 - jno.np.sin(π * x0)
+# Initial condition:  u(x, 0) = sin(πx)
+ic = net(t0, x0) - jno.np.sin(π * x0)
 
-# ── Solve ─────────────────────────────────────────────────────────────────────
-crux = jno.core([pde.mse, ini.mse], domain)
+# Spatial boundary:  u(0, t) = u(1, t) = 0
+bc = net(tb, xb)
+
+# ── Solve ────────────────────────────────────────────────────────────────────
+crux = jno.core([pde.mse, ic.mse, bc.mse], domain)
 history = crux.solve(5000)
 
 _u, _u_exact = crux.eval([u, u_exact])
 rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_exact) + 1e-8))
-assert rel_l2 < 1e-1, f"relative L2 error too large: {rel_l2:.3e}"
+assert rel_l2 < 2e-1, f"relative L2 error too large: {rel_l2:.3e}"

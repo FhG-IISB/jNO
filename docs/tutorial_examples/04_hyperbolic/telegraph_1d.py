@@ -17,7 +17,6 @@ import jax
 import optax
 
 import jno
-from jno import LearningRateSchedule as lrs
 
 pi = jno.np.pi
 beta = 0.5
@@ -45,14 +44,18 @@ net = jno.nn.wrap(
         key=jax.random.PRNGKey(22),
     )
 )
-net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(10, 1, 1e-3, 1e-5))
+net.optimizer(
+    optax.adam(
+        optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=1e-3, warmup_steps=1, decay_steps=10, end_value=1e-5)
+    )
+)
 
 u = net(t, x) * x * (1 - x)
 dt_ic = 1e-2
 u0 = net(t0, x0) * x0 * (1 - x0)
 u_t0 = ((net(t0 + dt_ic, x0) - net(t0, x0)) / dt_ic) * x0 * (1 - x0)
 
-pde = jno.np.grad(jno.np.grad(u, t), t) + beta * jno.np.grad(u, t) - c**2 * jno.np.grad(jno.np.grad(u, x), x) - source
+pde = u.d2(t) + beta * u.d(t) - c**2 * u.d2(x) - source
 ini_u = u0 - jno.np.sin(pi * x0)
 ini_ut = u_t0 + jno.np.sin(pi * x0)
 

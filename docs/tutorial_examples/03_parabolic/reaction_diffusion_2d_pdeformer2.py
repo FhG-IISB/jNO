@@ -124,7 +124,7 @@ u = net(t, x, y)
 u0 = net(t0, x0, y0)
 ub = net(tb, xb, yb)
 
-pde = jno.np.grad(u, t) - α * jno.np.laplacian(u, [x, y]) + λ * u
+pde = u.d(t) - α * jno.np.laplacian(u, [x, y]) + λ * u
 ini = u0 - sin(π * x0) * sin(π * y0)
 bc = ub  # u = 0 on ∂Ω (soft)
 

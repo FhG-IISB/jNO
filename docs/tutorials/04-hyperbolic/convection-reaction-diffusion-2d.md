@@ -59,9 +59,9 @@ u   = net(t,  xy)  * x  * (1 - x)  * y  * (1 - y)
 u0  = net(t0, xy0) * x0 * (1 - x0) * y0 * (1 - y0)
 
 pde = (
-    jno.np.grad(u, t)
-    + bx * jno.np.grad(u, x)
-    + by * jno.np.grad(u, y)
+    u.d(t)
+    + bx * u.d(x)
+    + by * u.d(y)
     - nu * jno.np.laplacian(u, [x, y])
     + lam * u
     - source

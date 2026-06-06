@@ -46,12 +46,12 @@ xb, _ = domain.variable("boundary")
 
 u_net = jno.nn.wrap(
     foundax.mlp(in_features=1, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(0))
-).optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 1_000, 1e-5))
+).optimizer(optax.adam(optax.exponential_decay(1e-3, 1_000, 0.5, end_value=1e-5)))
 
 u  = u_net(x)
 ub = u_net(xb)
 
-pde = -jno.np.grad(jno.np.grad(u, x), x) - jno.np.sin(π * x)
+pde = -u.d2(x) - jno.np.sin(π * x)
 bc  = ub   # u = 0 on boundary
 ```
 

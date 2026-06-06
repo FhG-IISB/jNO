@@ -22,7 +22,6 @@ import jax.numpy as jnp
 import optax
 
 import jno
-from jno import LearningRateSchedule as lrs
 
 π = jno.np.pi
 
@@ -42,10 +41,10 @@ u_net = jno.nn.wrap(
         num_layers=3,
         key=jax.random.PRNGKey(0),
     )
-).optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 10, 1e-5))
+).optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.5, end_value=1e-5)))
 
 u = u_net(x)
-u_xx = jno.np.grad(jno.np.grad(u, x), x)
+u_xx = u.d2(x)
 pde = -u_xx - jno.np.sin(π * x)  # residual — should be 0
 
 

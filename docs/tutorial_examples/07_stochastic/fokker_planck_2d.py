@@ -37,7 +37,6 @@ import jax.numpy as jnp
 import optax
 
 import jno
-from jno import LearningRateSchedule as lrs
 
 π = jno.np.pi
 
@@ -60,13 +59,13 @@ net = jno.nn.wrap(
         key=jax.random.PRNGKey(0),
     )
 )
-net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 10, 1e-5))
+net.optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.5, end_value=1e-5)))
 
 p = net(x, y)  # probability density field
 
 # ── Fokker-Planck residual ─────────────────────────────────────────────────────
 # drift term:  ∂(xp)/∂x + ∂(yp)/∂y
-drift = jno.np.grad(x * p, x) + jno.np.grad(y * p, y)
+drift = (x * p).d(x) + (y * p).d(y)
 # diffusion term:  ½ ∆p
 diff = 0.5 * jno.np.laplacian(p, [x, y])
 fp = drift + diff  # residual = 0

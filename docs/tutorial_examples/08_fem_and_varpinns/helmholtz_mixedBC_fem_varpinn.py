@@ -8,7 +8,6 @@ import numpy as np
 import optax
 
 import jno
-from jno import LearningRateSchedule as lrs
 
 """02 - 2-D Helmholtz equation with FEAX-FEM and variational PINNs
 
@@ -111,10 +110,10 @@ def build_helmholtz_weak_form(domain):
     xr, yr, _ = domain.variable("gauss_right", split=True)
     xt, yt, _ = domain.variable("gauss_top", split=True)
 
-    du_dx = jno.np.grad(u, xg)
-    du_dy = jno.np.grad(u, yg)
-    phi_x = jno.np.grad(phi, xg)
-    phi_y = jno.np.grad(phi, yg)
+    du_dx = u.d(xg)
+    du_dy = u.d(yg)
+    phi_x = phi.d(xg)
+    phi_y = phi.d(yg)
 
     k_sq = 0.0 * xg + k_val**2
 
@@ -175,13 +174,9 @@ pde = weak_vpinn.assemble(train_domain, u_net=u_gauss, target="vpinn")
 crux = jno.core(constraints=[pde.mse], domain=train_domain)
 
 net.optimizer(
-    optax.adam,
-    lr=lrs.warmup_cosine(
-        10,
-        1,
-        1e-3,
-        1e-5,
-    ),
+    optax.adam(
+        optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=1e-3, warmup_steps=1, decay_steps=10, end_value=1e-5)
+    )
 )
 
 crux.solve(epochs=10)

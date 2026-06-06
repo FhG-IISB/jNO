@@ -119,7 +119,7 @@ u = net(t, x, y)  # interior
 u0 = net(t0, x0, y0)  # IC
 ub = net(tb, xb, yb)  # boundary
 
-pde = jno.np.grad(u, t) - α * jno.np.laplacian(u, [x, y])
+pde = u.d(t) - α * jno.np.laplacian(u, [x, y])
 ini = u0 - jno.np.sin(π * x0) * jno.np.sin(π * y0)
 bc = ub  # u = 0 on ∂Ω
 

@@ -40,23 +40,23 @@ checkpoint without rewriting the surrounding code.
 
 | Capability | Status | Notes |
 |------------|--------|-------|
-| Forward PINNs (residual minimisation) | [stable](docs/tutorials/01-basics/poisson-1d.md) | Hard or soft BC enforcement |
-| Operator learning (DeepONet, FNO, PROSE via [foundax](https://github.com/FhG-IISB/foundax)) | [stable](docs/Getting-Started.md) | Combine with PDE residual or train purely data-driven |
-| Inverse problems (parameter recovery, surrogate inversion) | [stable](docs/tutorials/05-coupled-and-inverse/inverse-parameter.md) | |
-| FEM / Variational PINNs | [stable](docs/tutorials/08-fem-and-varpinns/poisson-2d-fem.md) | TRI3 / TRI6 / QUAD4 elements, weak-form assembly |
-| Adaptive resampling (RAD, RARD, CR3, R3, pinnfluence) | [stable](docs/adaptive/resampling.md) | |
-| Stochastic PDEs and noise nodes (gaussian / uniform / laplace) | [stable](docs/tutorials/07-stochastic/fokker-planck-2d.md) | Fokker–Planck, stochastic forcing |
-| Bayesian PINNs (NUTS, HMC, MALA, SGLD, SGHMC, VI) | [stable](docs/tutorials/10-bayesian-pinns/index.md) | 14 worked tutorials |
-| Parameter-efficient fine-tuning (LoRA, DoRA, rsLoRA, PiSSA, VeRA, LoKr, OFT, IA3) | [stable](docs/model-controls/lora.md) | Chain `.lora(...)` on any wrapped model |
-| Training explainability (gradient conflict, NTK, Hessian, loss landscape, input sensitivity, residual stats) | [stable](docs/tutorials/07-analysis/gradient-conflict.md) | |
-| Foundation-model integration ([foundax](https://github.com/FhG-IISB/foundax) MLPs, transformers, DeepONet, FNO, PROSE) | [stable](docs/foundation_models/index.md) | Wrap any Equinox module via `jno.nn.wrap(...)` |
-| Hybrid data + model parallelism | [stable](docs/training/parallelism.md) | `jno.core(..., mesh=(batch, model))` |
-| W&B logging + Orbax checkpointing | [stable](docs/tutorials/09-wandb/wandb-integration.md) | |
-| IREE / MLIR compiled inference for deployment | [stable](docs/model-controls/iree.md) | |
-| Hyperparameter / architecture search | [beta](docs/Hyperparameter-Tuning.md) | Grid + Nevergrad |
-| Multi-physics coupling | [beta](docs/tutorials/05-coupled-and-inverse/hyco-poisson-1d.md) | HyCo patterns developing |
+| Forward PINNs (residual minimisation) | [stable](https://fhg-iisb.github.io/jNO/tutorials/01-basics/poisson-1d/) | Hard or soft BC enforcement |
+| Operator learning (DeepONet, FNO, U-Net, PROSE via [foundax](https://github.com/FhG-IISB/foundax)) | [stable](https://fhg-iisb.github.io/jNO/tutorials/11-operator-learning/) | PDE-residual or data-driven; three architectures showcased |
+| Inverse problems (parameter recovery, surrogate inversion) | [stable](https://fhg-iisb.github.io/jNO/tutorials/05-coupled-and-inverse/inverse-parameter/) | |
+| FEM / Variational PINNs | [stable](https://fhg-iisb.github.io/jNO/tutorials/08-fem-and-varpinns/poisson-2d-fem/) | TRI3 / TRI6 / QUAD4 elements, weak-form assembly |
+| Adaptive resampling (RAD, RARD, CR3, R3, pinnfluence) | [stable](https://fhg-iisb.github.io/jNO/adaptive/resampling/) | |
+| Stochastic PDEs and noise nodes (gaussian / uniform / laplace) | [stable](https://fhg-iisb.github.io/jNO/tutorials/07-stochastic/fokker-planck-2d/) | Fokker–Planck, stochastic forcing |
+| Bayesian PINNs (NUTS, HMC, MALA, SGLD, SGHMC, VI) | [stable](https://fhg-iisb.github.io/jNO/tutorials/10-bayesian-pinns/) | 14 worked tutorials |
+| Parameter-efficient fine-tuning (LoRA, DoRA, rsLoRA, PiSSA, VeRA, LoKr, OFT, IA3) | [stable](https://fhg-iisb.github.io/jNO/model-controls/lora/) | Chain `.lora(...)` on any wrapped model |
+| Training explainability (gradient conflict, NTK, Hessian, loss landscape, input sensitivity, residual stats) | [stable](https://fhg-iisb.github.io/jNO/tutorials/07-analysis/gradient-conflict/) | |
+| Foundation-model integration ([foundax](https://github.com/FhG-IISB/foundax) MLPs, transformers, DeepONet, FNO, PROSE) | [stable](https://fhg-iisb.github.io/jNO/foundation_models/) | Wrap any Equinox module via `jno.nn.wrap(...)` |
+| Hybrid data + model parallelism | [stable](https://fhg-iisb.github.io/jNO/training/parallelism/) | `jno.core(..., mesh=(batch, model))` |
+| W&B logging + Orbax checkpointing | [stable](https://fhg-iisb.github.io/jNO/tutorials/09-wandb/wandb-integration/) | |
+| IREE / MLIR compiled inference for deployment | [stable](https://fhg-iisb.github.io/jNO/model-controls/iree/) | |
+| Hyperparameter / architecture search | [beta](https://fhg-iisb.github.io/jNO/Hyperparameter-Tuning/) | Grid + Nevergrad |
+| Multi-physics coupling | [beta](https://fhg-iisb.github.io/jNO/tutorials/05-coupled-and-inverse/hyco-poisson-1d/) | HyCo patterns developing |
 
-~50 worked tutorials across elliptic, parabolic, hyperbolic, coupled, inverse, integral, stochastic, FEM/variational, and Bayesian groups — see [`docs/tutorials/`](docs/tutorials/).
+~50 worked tutorials across elliptic, parabolic, hyperbolic, coupled, inverse, integral, stochastic, FEM/variational, Bayesian, and operator-learning groups — browse the [tutorials index](https://fhg-iisb.github.io/jNO/#tutorials).
 
 ## Install
 
@@ -64,9 +64,7 @@ checkpoint without rewriting the surrounding code.
 pip install "jax-neural-operators[fem]"
 ```
 
-GPU support is included by default (jNO depends on `jax[cuda]`). See
-[`docs/Installation.md`](docs/Installation.md) for Pixi, Docker, and
-specific-CUDA-version setups.
+GPU support is included by default (jNO depends on `jax[cuda]`). See the [Installation guide](https://fhg-iisb.github.io/jNO/Installation/) for Pixi, Docker, and specific-CUDA-version setups.
 
 Foundation models and other neural operator architectures live in a
 separate repository ([foundax](https://github.com/FhG-IISB/foundax)),

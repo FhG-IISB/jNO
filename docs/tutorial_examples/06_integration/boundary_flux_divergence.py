@@ -38,7 +38,6 @@ import jax.numpy as jnp
 import optax
 
 import jno
-from jno import LearningRateSchedule as lrs
 
 π = jno.np.pi
 
@@ -65,7 +64,7 @@ net = jno.nn.wrap(
         key=jax.random.PRNGKey(0),
     )
 )
-net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.9, 5_000, 1e-5))
+net.optimizer(optax.adam(optax.exponential_decay(1e-3, 5_000, 0.9, end_value=1e-5)))
 
 u = net(jno.np.concat([x, y], axis=-1)) * x * (1 - x) * y * (1 - y)  # hard Dirichlet BCs
 u_bnd = net(jno.np.concat([x_b, y_b], axis=-1)) * x_b * (1 - x_b) * y_b * (1 - y_b)

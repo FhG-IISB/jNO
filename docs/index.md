@@ -1,4 +1,4 @@
-# jNO Documentation
+# Documentation
 
 **jNO** (jax Neural Operators) is a JAX-native library for training
 neural operators, physics-informed networks, and PDE foundation models.

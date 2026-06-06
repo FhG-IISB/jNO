@@ -58,7 +58,7 @@ u0  = net(t0, xy0) * x0 * (1 - x0) * y0 * (1 - y0)
 The time-dependent PDE residual and the initial-condition loss are optimized together.
 
 ```python
-pde = jno.np.grad(u, t) - nu * jno.np.laplacian(u, [x, y]) + lam * u - source
+pde = u.d(t) - nu * jno.np.laplacian(u, [x, y]) + lam * u - source
 ini = u0 - jno.np.sin(pi * x0) * jno.np.sin(pi * y0)
 
 crux = jno.core([pde.mse, ini.mse], domain)

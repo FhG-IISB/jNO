@@ -50,8 +50,8 @@ The top and bottom boundary losses are built by differentiating the boundary-eva
 
 ```python
 pde           = -jno.np.laplacian(u, [x, y]) - forcing
-neumann_top   = jno.np.grad(u_top,    yt)
-neumann_bottom = jno.np.grad(u_bottom, yb)
+neumann_top   = u_top.d(yt)
+neumann_bottom = u_bottom.d(yb)
 ```
 
 ## Step 4: Solve With Multiple Loss Terms

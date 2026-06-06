@@ -42,8 +42,8 @@ net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=80, num_layers=5, key=j
 net.optimizer(optax.adam(optax.exponential_decay(1e-3, 80, 0.5, end_value=1e-5)))
 
 u      = net(x, y) * x * (1 - x) * y * (1 - y)
-flux_x = kappa * jno.np.grad(u, x)
-flux_y = kappa * jno.np.grad(u, y)
+flux_x = kappa * u.d(x)
+flux_y = kappa * u.d(y)
 ```
 
 ## Step 3: Enforce Boundary Conditions Hard

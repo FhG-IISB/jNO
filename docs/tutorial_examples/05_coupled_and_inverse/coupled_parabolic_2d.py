@@ -78,8 +78,8 @@ v = v_net(t, xy) * x * (1 - x) * y * (1 - y)
 u0 = u_net(t0, xy0) * x0 * (1 - x0) * y0 * (1 - y0)
 v0 = v_net(t0, xy0) * x0 * (1 - x0) * y0 * (1 - y0)
 
-pde_u = jno.np.grad(u, t) - jno.np.laplacian(u, [x, y]) + v - f
-pde_v = jno.np.grad(v, t) - jno.np.laplacian(v, [x, y]) + u - g
+pde_u = u.d(t) - jno.np.laplacian(u, [x, y]) + v - f
+pde_v = v.d(t) - jno.np.laplacian(v, [x, y]) + u - g
 ini_u = u0 - jno.np.sin(pi * x0) * jno.np.sin(pi * y0)
 ini_v = v0 - jno.np.sin(2 * pi * x0) * jno.np.sin(pi * y0)
 

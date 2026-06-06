@@ -44,7 +44,7 @@ net = jno.nn.wrap(
         key=jax.random.PRNGKey(42),
     )
 )
-net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(500, 1, 1e-3, 1e-5))
+net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=1e-3, warmup_steps=1, decay_steps=500, end_value=1e-5)))
 
 xy = jno.np.concat([x, y])
 u  = net(t, xy) * x * (1 - x) * y * (1 - y)
@@ -55,7 +55,7 @@ u  = net(t, xy) * x * (1 - x) * y * (1 - y)
 The key change relative to the heat equation is the nonlinear reaction term `u - u^3`.
 
 ```python
-pde = jno.np.grad(u, t) - eps**2 * jno.np.laplacian(u, [x, y]) - u + u**3 - source
+pde = u.d(t) - eps**2 * jno.np.laplacian(u, [x, y]) - u + u**3 - source
 ```
 
 ## Step 4: Impose the Initial Condition

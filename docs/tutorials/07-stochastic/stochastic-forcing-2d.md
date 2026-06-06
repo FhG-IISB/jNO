@@ -70,7 +70,7 @@ net = jno.nn.wrap(
     foundax.mlp(in_features=2, hidden_dims=64, num_layers=5,
                 activation=jax.nn.tanh, key=jax.random.PRNGKey(0))
 )
-net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 10, 1e-5))
+net.optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.5, end_value=1e-5)))
 
 u = net(x, y) * x * (1 - x) * y * (1 - y)
 ```
