@@ -1,4 +1,7 @@
 site_name: jNO Documentation
+site_url: https://fhg-iisb.github.io/jNO/
+repo_url: https://github.com/FhG-IISB/jno
+repo_name: FhG-IISB/jno
 docs_dir: docs
 site_dir: site
 use_directory_urls: true
