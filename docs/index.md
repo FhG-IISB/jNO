@@ -59,7 +59,6 @@ Each status badge links to the tutorial (or, where no dedicated tutorial exists,
 | IREE / MLIR compiled inference for deployment | [✅ stable](model-controls/iree.md) | |
 | Hyperparameter / architecture search | [🟡 beta](Hyperparameter-Tuning.md) | Grid + Nevergrad |
 | Multi-physics coupling | [🟡 beta](tutorials/05-coupled-and-inverse/hyco-poisson-1d.md) | HyCo Poisson tutorial; broader patterns developing |
-| Pretrained operator model zoo | ⛔ planned | Tracked in roadmap |
 
 ---
 
