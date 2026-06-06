@@ -38,7 +38,6 @@ sampling, and tensor tags.
         - __init__
         - variable
         - sample
-        - add_tensor_tag
         - summary
         - line
         - rect
