@@ -33,8 +33,8 @@ xg, yg, _ = domain.variable("fem_gauss",  split=True)
 xr, yr, _ = domain.variable("gauss_right", split=True)
 xt, yt, _ = domain.variable("gauss_top",   split=True)
 
-du_dx = jno.np.grad(u, xg);  du_dy = jno.np.grad(u, yg)
-phi_x = jno.np.grad(phi, xg); phi_y = jno.np.grad(phi, yg)
+du_dx = u.d(xg);  du_dy = u.d(yg)
+phi_x = phi.d(xg); phi_y = phi.d(yg)
 
 vol          = du_dx*phi_x + du_dy*phi_y + sigma*u*phi - source_f(xg, yg)*phi
 robin_right  = alpha_right * u * phi - robin_rhs_right(xr, yr) * phi
@@ -60,7 +60,7 @@ u_gauss = apply_hard_bc(net(xg2, yg2), xg2, yg2)
 
 pde  = weak.assemble(train_domain, u_net=u_gauss, target="vpinn")
 crux = jno.core(constraints=[pde.mse], domain=train_domain)
-net.optimizer(optax.adam, lr=lrs.warmup_cosine(100, 2, 1e-3, 1e-5))
+net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=1e-3, warmup_steps=2, decay_steps=100, end_value=1e-5)))
 crux.solve(epochs=1000)
 ```
 

@@ -52,13 +52,13 @@ An MLP with 2 inputs `(x, t)` takes both coordinates directly. The `x*(1-x)` fac
 
 ```python
 net = jno.nn.wrap(foundax.mlp(2, hidden_dims=64, num_layers=4, key=jax.random.PRNGKey(3)))
-net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(10, 1, 1e-3, 1e-5))
+net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=1e-3, warmup_steps=1, decay_steps=10, end_value=1e-5)))
 
 u = net(x, t) * x * (1 - x)
 
-u_t  = jno.np.grad(u, t)
-u_x  = jno.np.grad(u, x)
-u_xx = jno.np.grad(u_x, x)
+u_t  = u.d(t)
+u_x  = u.d(x)
+u_xx = u_x.d(x)
 pde  = u_t + u * u_x - ν * u_xx - source
 ```
 

@@ -19,7 +19,6 @@ import jax
 import optax
 
 import jno
-from jno import LearningRateSchedule as lrs
 
 π = jno.np.pi
 # ── Domain ────────────────────────────────────────────────────────────────────
@@ -38,7 +37,7 @@ u_net = jno.nn.wrap(
         num_layers=4,
         key=jax.random.PRNGKey(0),
     )
-).optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 1000, 1e-5))
+).optimizer(optax.adam(optax.exponential_decay(1e-3, 1000, 0.5, end_value=1e-5)))
 
 u = u_net(x)
 

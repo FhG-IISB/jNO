@@ -42,7 +42,7 @@ The field is defined with an `x(1-x)` factor so endpoint values are zero by cons
 ```python
 u_net = jno.nn.wrap(
     foundax.mlp(in_features=1, hidden_dims=64, num_layers=4, key=jax.random.PRNGKey(0))
-).optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 10, 1e-5))
+).optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.5, end_value=1e-5)))
 
 u = u_net(x) * x * (1 - x)
 ```
@@ -52,7 +52,7 @@ u = u_net(x) * x * (1 - x)
 The residual is assembled as `-u_xx + sigma u - forcing`, making this a clean example of multiple physical effects in one PDE.
 
 ```python
-u_xx = jno.np.grad(jno.np.grad(u, x), x)
+u_xx = u.d2(x)
 pde  = -u_xx + σ * u - forcing
 ```
 

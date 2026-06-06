@@ -31,10 +31,10 @@ domain.init_fem(
 u, phi = domain.fem_symbols()
 xg, yg, _ = domain.variable("fem_gauss", split=True)
 
-ux   = jno.np.grad(u, xg)
-uy   = jno.np.grad(u, yg)
-phix = jno.np.grad(phi, xg)
-phiy = jno.np.grad(phi, yg)
+ux   = u.d(xg)
+uy   = u.d(yg)
+phix = phi.d(xg)
+phiy = phi.d(yg)
 
 # Weak form: ∫ eps^2 grad(u)·grad(phi) + (u^3 - u) phi dΩ = 0
 weak = eps**2 * (ux * phix + uy * phiy) + (u**3 - u) * phi

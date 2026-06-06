@@ -34,8 +34,8 @@ xr, yr, _ = domain.variable("gauss_right", split=True)
 xt, yt, _ = domain.variable("gauss_top",   split=True)
 
 k_sq = 0.0 * xg + k_val**2
-vol  = (jno.np.grad(u, xg) * jno.np.grad(phi, xg)
-      + jno.np.grad(u, yg) * jno.np.grad(phi, yg)
+vol  = (u.d(xg) * phi.d(xg)
+      + u.d(yg) * phi.d(yg)
       - k_sq * u * phi
       - source_f(xg, yg) * phi)
 
@@ -61,7 +61,7 @@ u_gauss = apply_hard_bc(net(xg2, yg2), xg2, yg2)
 
 pde  = weak.assemble(train_domain, u_net=u_gauss, target="vpinn")
 crux = jno.core(constraints=[pde.mse], domain=train_domain)
-net.optimizer(optax.adam, lr=lrs.warmup_cosine(10, 1, 1e-3, 1e-5))
+net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=1e-3, warmup_steps=1, decay_steps=10, end_value=1e-5)))
 crux.solve(epochs=10)
 ```
 

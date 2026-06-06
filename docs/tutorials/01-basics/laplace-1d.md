@@ -5,120 +5,61 @@
 <a class="md-button" href="/jNO_docs/tutorials/01-basics/">Back to chapter</a>
 </div>
 
-This is the smallest complete jNO example. It solves a 1D Poisson or Laplace-type equation with homogeneous Dirichlet boundary conditions and compares the learned solution against the analytical one.
+The smallest complete jNO example. Solves the 1-D Laplace equation with **non-homogeneous** Dirichlet boundary conditions and a hard-enforced linear-interpolant ansatz.
 
 ## Problem Setup
 
-We solve
-
 ```text
--u''(x) = sin(pi x),   x in [0, 1],   u(0) = u(1) = 0
+u''(x) = 0,   x in [0, 1],   u(0) = 0,  u(1) = 1
 ```
 
-with exact solution
-
-```text
-u(x) = sin(pi x) / pi^2
-```
+Exact solution: `u(x) = x` (the straight line between the two boundary values).
 
 ## Step 1: Create the Domain
 
-The script initializes jNO, creates a 1D line domain, and extracts interior points.
-
 ```python
-π = jnn.pi
-dire = jno.setup(__file__)
-
-domain = jno.domain.line(mesh_size=pick(0.01, 0.1))
+domain = jno.domain.line(mesh_size=0.1)
 x, _ = domain.variable("interior")
 ```
 
-What this does:
+## Step 2: Build the Network with a Non-Homogeneous Hard Ansatz
 
-- `jno.setup(__file__)` creates the run directory for outputs.
-- `jno.domain.line(...)` builds the 1D geometry.
-- `domain.variable("interior")` gives the collocation points used for the PDE residual.
-
-## Step 2: Define the Analytical Reference
-
-The exact solution is only used for monitoring error, not for training supervision.
+The boundary values are non-zero (`u(0)=0`, `u(1)=1`), so the multiplicative `x(1-x)` trick alone won't enforce them. Instead, use a **linear interpolant + correction** ansatz:
 
 ```python
-u_exact = jnn.sin(π * x) / π**2
+u_net = jno.nn.wrap(
+    foundax.mlp(in_features=1, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(0))
+).optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.5, end_value=1e-5)))
+
+u = x + x * (1 - x) * u_net(x)
 ```
 
-This is useful because you can track whether the PINN is converging toward the known solution.
+Why this works:
 
-## Step 3: Build the Network with Hard Boundary Conditions
+- `x` alone satisfies `u(0)=0` and `u(1)=1` exactly — it's the linear interpolant of the BCs.
+- `x*(1-x)` vanishes at both endpoints, so `u_net(x)` can never break the BCs no matter what it learns.
+- The network only has to learn the **deviation** from the linear interpolant. For pure Laplace `u''=0` that deviation is exactly zero, so this is a clean test of whether the optimiser can drive `u_net` to the constant-zero function.
 
-The model is a small MLP. Boundary conditions are enforced by multiplying the network output by `x(1-x)`.
+## Step 3: Build the PDE Residual
 
 ```python
-u_net = jnn.nn.mlp(
-    in_features=1,
-    hidden_dims=32,
-    num_layers=3,
-    key=jax.random.PRNGKey(0),
-).optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, pick(5_000, 10), 1e-5))
-
-u = u_net(x) * x * (1 - x)
+pde = u.d2(x)  # Laplace: u'' = 0
 ```
 
-Why this matters:
+`.d2(x)` is the second-derivative shortcut on any `Placeholder`. Equivalent to `u.d(x).d(x)` but more compact.
 
-- `u_net(x)` is unconstrained.
-- Multiplying by `x(1-x)` forces `u(0)=u(1)=0` exactly.
-- This removes the need for a separate boundary loss term.
-
-## Step 4: Build the PDE Residual and Error Tracker
-
-The residual uses automatic differentiation twice to compute the second derivative.
+## Step 4: Solve
 
 ```python
-pde = -jnn.grad(jnn.grad(u, x), x) - jnn.sin(π * x)
-error = jnn.tracker((u - u_exact).mse, interval=pick(100, 1))
+crux = jno.core([pde.mse], domain)
+history = crux.solve(5000)
 ```
-
-This gives you:
-
-- `pde.mse`: the physics loss to minimize
-- `error`: a tracked metric that reports the solution error during training
-
-## Step 5: Solve the Problem
-
-```python
-crux = jno.core([pde.mse, error], domain)
-history = crux.solve(pick(5_000, 10))
-```
-
-This is the standard jNO flow:
-
-1. Bundle constraints and tracked metrics into `jno.core(...)`
-2. Call `solve(...)`
-3. Use the returned history for diagnostics
-
-## Step 6: Evaluate and Plot
-
-After training, the script sorts points, evaluates the learned field, and saves both the training history and solution plot.
-
-```python
-pts = np.array(crux.domain_data.context["interior"][0, 0, :, 0])
-idx = np.argsort(pts)
-xs = pts[idx]
-pred = np.array(crux.eval(u)).reshape(xs.shape[0], 1)[:, 0][idx]
-true = np.array(crux.eval(u_exact)).reshape(xs.shape[0], 1)[:, 0][idx]
-```
-
-You end up with:
-
-- `training_history.png`
-- `solution.png`
 
 ## What To Notice
 
-- This example uses hard constraints, which keeps the loss simple.
-- The exact solution is not part of the PDE loss, only the tracker.
-- For many introductory PDEs, this is the cleanest pattern to start from.
+- The non-homogeneous BCs require an ansatz that **adds** to a satisfying solution rather than just multiplying. The general recipe is `u = boundary_lift(x) + zero_at_boundary(x) * net(x)`.
+- For more interesting Poisson-style problems with a non-zero forcing, see [Poisson 1D](poisson-1d.md) — same domain, but adds a soft-BC pattern with `scheme="finite_difference"`.
+- This is a *trivial* PDE in the sense that the exact solution is in the trial-space class; jNO is being asked to confirm convergence, not discover anything new.
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/01_basics/laplace_1d.py" download>Download full script</a>
