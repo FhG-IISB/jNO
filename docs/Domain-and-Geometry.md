@@ -4,162 +4,92 @@ The `jno.domain` class manages mesh generation, physical group labelling, and sa
 
 ---
 
-## Creating a Domain
+## Constructing a domain
 
-### From a Built-in Geometry
+A `jno.domain` is built in one of three ways. **Reach for the meshed path first** — it is the only construction route that produces a triangulated/tetrahedral mesh, which is required for `.integrate()` (integration operators) and for any differential operator with `scheme="finite_difference"`. The polygon and point-cloud paths skip mesh generation and lose both capabilities; they exist for cases where you genuinely don't need a mesh.
 
-Pass a geometry constructor to `jno.domain(constructor=...)`:
+### 1. Meshed domain — `jno.domain(constructor=...)` (recommended)
+
+Pass any `pygmsh`-compatible callable to `jno.domain(constructor=...)`. The constructor builds an OpenCASCADE geometry, registers physical groups (the tags later accessed via `.variable(tag)`), and returns `(geo, spatial_dim, mesh_size)`.
+
+```python
+def my_geometry(mesh_size=0.1):
+    def constructor(geo):
+        p0 = geo.add_point([0, 0], mesh_size=mesh_size)
+        # ... add lines, surfaces, physical groups ...
+        geo.add_physical(surface, "interior")
+        geo.add_physical(lines, "boundary")
+        return geo, 2, mesh_size   # (geo, spatial_dim, mesh_size)
+    return constructor
+
+dom = jno.domain(constructor=my_geometry(mesh_size=0.05))
+```
+
+The [built-in geometries](#built-in-geometries) below (`jno.domain.rect`, `.disk`, `.cube`, …) are named constructors written against the same protocol — start there if your shape is in the table, switch to a custom constructor when it isn't.
+
+You can also load a pre-meshed file (`.msh`, `.vtk`, `.med`, …) directly — physical groups in the file become `.variable(tag)` keys:
+
+```python
+dom = jno.domain('./mesh.msh')
+```
+
+### 2. Polygon-backed domain — `jno.PolygonDomain` (shapely)
+
+For 2-D regions defined by a [shapely](https://shapely.readthedocs.io/) geometry where you only need points *inside* the region and not a mesh. CSG operations (union / difference / intersection) come for free via shapely, which makes irregular footprints, multi-region scenes, or "rectangle with a tilted hole" shapes easy to express.
 
 ```python
 import jno
+from shapely.geometry import box
 
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05))
+# Square with a square hole
+geo = box(0, 0, 1, 1).difference(box(0.4, 0.4, 0.6, 0.6))
+dom = jno.PolygonDomain(geometry=geo)
+x, y, _ = dom.variable("polygon", 256)   # 256 interior samples
+
+# Or from a vertex list — simple polygons skip the shapely import
+dom = jno.PolygonDomain(vertices=[[0, 0], [1, 0], [1, 0.5], [0.5, 1], [0, 1]])
 ```
 
-### From an Existing Mesh File
+**Trade-off:** no mesh is built — `.integrate()` and `scheme="finite_difference"` are unavailable on this domain. Use the meshed path above if you need either.
 
-```python
-domain = jno.domain('./mesh.msh')
-```
+### 3. Point cloud — `jno.domain.from_array`
 
-### From In-Memory Arrays
-
-`jno.domain.from_array` creates a point-cloud domain directly from numpy arrays — no file I/O required. This is the recommended way to add sparse sensor observations to an inverse problem.
+When the points are already known (sensor coordinates, observation grids, externally generated meshes), skip geometry entirely and pass arrays directly:
 
 ```python
 import numpy as np
 
-# 20 sensor locations in 2-D
 sensor_coords = np.array([[0.1, 0.2], [0.5, 0.5], ...])  # shape (N, 2)
+dom = jno.domain.from_array({"obs": sensor_coords})
 
-sensor_dom = jno.domain.from_array({"obs": sensor_coords})
-x_s, y_s, _ = sensor_dom.variable("obs")
-```
-
-Multiple tags can be packed into the same domain:
-
-```python
+# Multiple tags can be packed into the same domain
 dom = jno.domain.from_array({
     "interior_sensors": interior_coords,
     "boundary_sensors": boundary_coords,
 })
-x_i, y_i, _ = dom.variable("interior_sensors")
-x_b, y_b, _ = dom.variable("boundary_sensors")
 ```
+
+**Trade-off:** same as `PolygonDomain` — no mesh, no integration, no FD.
 
 ---
 
-## Built-in Geometry Constructors
+## Built-in geometries
 
-All constructors are static methods on `jno.domain` (equivalently `Geometries`).
+For common shapes, jno ships named constructors under `jno.domain.*`. Each is a small pygmsh script that follows the protocol of option 1 above and registers the listed physical groups.
 
-### 1D
+| Constructor              | Dim | Signature                                                         | Physical groups                                                                  |
+|--------------------------|-----|-------------------------------------------------------------------|----------------------------------------------------------------------------------|
+| `line`                   | 1D  | `line(x_range, mesh_size)`                                        | `interior`, `left`, `right`, `boundary`                                          |
+| `rect`                   | 2D  | `rect(x_range, y_range, mesh_size)`                               | `interior`, `boundary`, `bottom`, `top`, `left`, `right`                         |
+| `equi_distant_rect`      | 2D  | `equi_distant_rect(x_range, y_range, nx, ny)` — structured        | same as `rect`                                                                   |
+| `disk`                   | 2D  | `disk(center, radius, mesh_size, num_points)`                     | `interior`, `boundary`                                                           |
+| `l_shape`                | 2D  | `l_shape(size, mesh_size, separate_boundary=False)`               | `interior`, `boundary` (+ per-side groups when `separate_boundary=True`)         |
+| `rectangle_with_hole`    | 2D  | `rectangle_with_hole(outer_size, hole_size, mesh_size, ...)`      | `interior`, `boundary`, hole sides                                               |
+| `rectangle_with_holes`   | 2D  | `rectangle_with_holes(outer_size, holes=[{...}], mesh_size, ...)` | `interior`, `boundary`, `hole_boundary` (+ per-hole groups)                      |
+| `rect_pml`               | 2D  | `rect_pml(..., pml_thickness_top, pml_thickness_bottom)`          | + `pml_top`, `pml_bottom` — wave-equation absorbing layers                       |
+| `cube`                   | 3D  | `cube(x_range, y_range, z_range, mesh_size)`                      | `interior`, `boundary`, 6 face groups                                            |
 
-#### `line`
-
-```python
-jno.domain.line(x_range=(0, 1), mesh_size=0.1)
-```
-
-Physical groups: `"interior"`, `"left"`, `"right"`, `"boundary"`.
-
----
-
-### 2D
-
-#### `rect`
-
-Unstructured triangular mesh generated by pygmsh.
-
-```python
-jno.domain.rect(x_range=(0,1), y_range=(0,1), mesh_size=0.1)
-```
-
-Physical groups: `"interior"`, `"boundary"`, `"bottom"`, `"top"`, `"left"`, `"right"`.
-
-#### `equi_distant_rect`
-
-Structured (equidistant) triangular mesh — avoids mesh randomness.
-
-```python
-jno.domain.equi_distant_rect(x_range=(0,1), y_range=(0,1), nx=20, ny=20)
-```
-
-Physical groups: same as `rect`.
-
-#### `disk`
-
-Circular domain (polygon approximation).
-
-```python
-jno.domain.disk(center=(0,0), radius=1.0, mesh_size=0.1, num_points=32)
-```
-
-Physical groups: `"interior"`, `"boundary"`.
-
-#### `l_shape`
-
-L-shaped domain.
-
-```python
-jno.domain.l_shape(size=1.0, mesh_size=0.1, separate_boundary=False)
-```
-
-Physical groups: `"interior"`, `"boundary"`.  
-With `separate_boundary=True`: also `"bottom"`, `"right_lower"`, `"inner_horizontal"`, `"inner_vertical"`, `"top"`, `"left"`.
-
-#### `rectangle_with_hole`
-
-Rectangle with a centred rectangular hole (hollow domain).
-
-```python
-jno.domain.rectangle_with_hole(outer_size=1.0, hole_size=0.4, mesh_size=0.1, separate_boundary=False)
-```
-
-Physical groups: `"interior"`, `"boundary"`.  
-With `separate_boundary=True`: outer sides + `"_bottom"`, `"_right"`, `"_top"`, `"_left"`, `"_boundary"` for the hole.
-
-#### `rectangle_with_holes`
-
-Rectangle with multiple user-defined holes.
-
-```python
-holes = [
-    {"origin": (0.3, 0.3), "size": (0.2, 0.2), "type": "obstacle"},
-    {"origin": (0.7, 0.3), "size": (0.15, 0.3), "type": "heater"},
-]
-jno.domain.rectangle_with_holes(outer_size=(2.0,1.0), holes=holes, mesh_size=0.05)
-```
-
-Physical groups: `"interior"`, `"boundary"`, `"hole_boundary"`.  
-With `separate_boundary=True`: outer sides + per-hole sides (e.g. `"obstacle_boundary"`, `"heater_bottom"`, …).
-
-#### `rect_pml`
-
-Rectangle with top and bottom Perfectly-Matched-Layer (PML) absorbing regions — useful for wave equations.
-
-```python
-jno.domain.rect_pml(
-    x_range=(0,1), y_range=(0,1),
-    mesh_size=0.1,
-    pml_thickness_top=0.2,
-    pml_thickness_bottom=0.2,
-)
-```
-
-Physical groups: `"interior"`, `"pml_bottom"`, `"pml_top"`, `"boundary"`, `"bottom"`, `"top"`, `"left"`, `"right"`.
-
----
-
-### 3D
-
-#### `cube`
-
-```python
-jno.domain.cube(x_range=(0,1), y_range=(0,1), z_range=(0,1), mesh_size=0.1)
-```
-
-Physical groups: `"interior"`, `"boundary"`, `"bottom"`, `"top"`, `"front"`, `"back"`, `"left"`, `"right"`.
+Per-constructor quirks (PML thickness semantics, the `holes` list dict format, `separate_boundary` expansions) live in the constructor docstrings — reach them with `help(jno.domain.rect_pml)` and friends.
 
 ---
 
@@ -239,25 +169,3 @@ domain.variable("interior") # Set variables to trigger mesh generation
 domain.plot("domain.png")   # saves a figure with mesh, boundaries, and normals
 ```
 
----
-
-## Custom Geometries
-
-You can define your own pygmsh-compatible geometry constructor:
-
-```python
-def my_geometry(mesh_size=0.1):
-    def constructor(geo):
-        # Use the pygmsh OpenCASCADE kernel to add points, lines, surfaces, ...
-        p0 = geo.add_point([0, 0], mesh_size=mesh_size)
-        p1 = geo.add_point([1, 0], mesh_size=mesh_size)
-        # ...
-        geo.add_physical(surface, "interior")
-        geo.add_physical(lines, "boundary")
-        return geo, 2, mesh_size   # (geo, spatial_dim, mesh_size)
-    return constructor
-
-domain = jno.domain(constructor=my_geometry(mesh_size=0.05))
-```
-
-The constructor receives a `pygmsh.occ.Geometry` object and must return `(geo, spatial_dim, mesh_size)`.

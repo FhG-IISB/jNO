@@ -24,6 +24,8 @@
     </a>
 </p>
 
+**[Features](#what-you-can-do-with-jno)** · [Install](#install) · [Example](#example) · [Docs](https://fhg-iisb.github.io/jNO/) · [Citation](#citation)
+
 **jNO** (jax Neural Operators) is a JAX-native library for training neural
 operators and physics-informed networks. It unifies data-driven operator
 regression, residual-based PINN training, mesh-aware FEM/variational
@@ -31,8 +33,8 @@ PINNs, and foundation-model fine-tuning under one symbolic tracing
 language — write the PDE once, compile once, train, evaluate, and
 checkpoint without rewriting the surrounding code.
 
-> Status: research-level repository under active development. Public API
-> is stabilising but may change between minor versions.
+> [!NOTE]
+> Research-level repository under active development. The public API is stabilising but may change between minor versions.
 
 ## What you can do with jNO
 
@@ -74,6 +76,9 @@ their own.
 
 ## Example
 
+<details>
+<summary><strong>2-D Poisson with DeepONet — full end-to-end script</strong> (click to expand)</summary>
+
 ```python
 import jno
 import jax
@@ -114,6 +119,8 @@ tst_dom.variable("k", jax.random.uniform(jax.random.PRNGKey(0), shape=(16, 1, 1)
 pred, x, y, k = crux.eval([u, x, y, k], domain=tst_dom)
 print(pred.shape, x.shape, y.shape, k.shape)
 ```
+
+</details>
 
 ## Citation
 

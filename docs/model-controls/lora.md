@@ -2,6 +2,54 @@
 
 LoRA inserts trainable low-rank adapter matrices into matching layers while keeping base weights frozen. By default both linear and conv layers are wrapped automatically.
 
+## Build your own adapter
+
+Any subclass of `LoRAWrapper` is a valid adapter — implement `applies_to(cls, leaf)` (which leaf types to wrap), `__init__(base, rank, alpha, *, key)` (build the adapter parameters around the wrapped module), `__call__(x)` (forward pass that combines base + adapter contribution), and `merge()` (fold the adapter back into a single weight tensor for inference).
+
+```python
+from jno.lora import LoRAWrapper
+import equinox as eqx
+import jax, jax.numpy as jnp
+
+class MyEmbeddingAdapter(LoRAWrapper):
+    adapter_fields = ("delta",)
+    base: eqx.Module
+    delta: jax.Array
+    rank: int = eqx.field(static=True)
+    alpha: float = eqx.field(static=True)
+
+    @classmethod
+    def applies_to(cls, leaf):
+        return isinstance(leaf, eqx.nn.Embedding) and not isinstance(leaf, LoRAWrapper)
+
+    def __init__(self, base, rank, alpha, *, key):
+        self.base, self.rank, self.alpha = base, rank, alpha
+        self.delta = jnp.zeros_like(base.weight)
+
+    def __call__(self, x):
+        return self.base(x) + self.delta[x] * (self.alpha / self.rank)
+
+    def merge(self):
+        w = self.base.weight + self.delta * (self.alpha / self.rank)
+        return eqx.tree_at(lambda m: m.weight, self.base, w)
+
+net.lora(rank=4, wrapper=MyEmbeddingAdapter)
+net.lora(rank=4, wrapper=[LoRALinear, LoRAConv, MyEmbeddingAdapter])
+```
+
+Per-target specs may carry their own `"wrapper"` key:
+
+```python
+net.lora(
+    specs=[
+        {"target": "linear", "rank": 4, "alpha": 1.0},
+        {"target": "embed",  "rank": 8, "alpha": 2.0, "wrapper": MyEmbeddingAdapter},
+    ]
+)
+```
+
+The built-in adapters in the [LoRA Zoo](#lora-zoo-linear) below all subclass `LoRAWrapper` themselves — they cover the published variants (DoRA, PiSSA, VeRA, …); your own subclass plugs in the same way.
+
 ## Selecting Layers
 
 ```python
@@ -47,52 +95,6 @@ Without `wrapper=`, jNO wraps Linear and Conv layers (ConvTranspose excluded):
 net.lora(rank=4, alpha=1.0)           # Linear + Conv1d/2d/3d
 net.lora(rank=4, wrapper=LoRALinear)  # linear only
 net.lora(rank=4, wrapper=LoRAConv)    # conv only
-```
-
-## Custom Adapters
-
-Subclass `LoRAWrapper` to support layer types not in the zoo:
-
-```python
-from jno.lora import LoRAWrapper
-import equinox as eqx
-import jax.numpy as jnp
-
-class MyEmbeddingAdapter(LoRAWrapper):
-    adapter_fields = ("delta",)
-    base: eqx.Module
-    delta: jax.Array
-    rank: int = eqx.field(static=True)
-    alpha: float = eqx.field(static=True)
-
-    @classmethod
-    def applies_to(cls, leaf):
-        return isinstance(leaf, eqx.nn.Embedding) and not isinstance(leaf, LoRAWrapper)
-
-    def __init__(self, base, rank, alpha, *, key):
-        self.base, self.rank, self.alpha = base, rank, alpha
-        self.delta = jnp.zeros_like(base.weight)
-
-    def __call__(self, x):
-        return self.base(x) + self.delta[x] * (self.alpha / self.rank)
-
-    def merge(self):
-        w = self.base.weight + self.delta * (self.alpha / self.rank)
-        return eqx.tree_at(lambda m: m.weight, self.base, w)
-
-net.lora(rank=4, wrapper=MyEmbeddingAdapter)
-net.lora(rank=4, wrapper=[LoRALinear, LoRAConv, MyEmbeddingAdapter])
-```
-
-Per-target specs may carry their own `"wrapper"` key:
-
-```python
-net.lora(
-    specs=[
-        {"target": "linear", "rank": 4, "alpha": 1.0},
-        {"target": "embed",  "rank": 8, "alpha": 2.0, "wrapper": MyEmbeddingAdapter},
-    ]
-)
 ```
 
 ## LoRA Zoo — Linear
