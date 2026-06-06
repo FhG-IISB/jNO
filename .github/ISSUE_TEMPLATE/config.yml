@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://fhg-iisb.github.io/jNO/
+    about: API reference, tutorials, and conceptual guides — start here before filing an issue.
+  - name: Report a security vulnerability
+    url: https://github.com/FhG-IISB/jno/blob/main/SECURITY.md
+    about: Please do not file public issues for security problems. Follow the private disclosure process in SECURITY.md.
