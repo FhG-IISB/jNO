@@ -40,18 +40,18 @@ jno.setup(__file__, wandb={"project": "jNO", "tags": ["poisson", "1d"]})
 We solve the 1-D Poisson equation with a **soft** boundary condition so the solver has two separate loss terms — necessary to make the explainability metrics meaningful.
 
 ```python
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.05))
+domain = jno.domain.line(mesh_size=0.05)
 x,  _ = domain.variable("interior")
 xb, _ = domain.variable("boundary")
 
 u_net = jno.nn.wrap(
     foundax.mlp(in_features=1, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(0))
-).optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 1_000, 1e-5))
+).optimizer(optax.adam(optax.exponential_decay(1e-3, 1_000, 0.5, end_value=1e-5)))
 
 u  = u_net(x)
 ub = u_net(xb)
 
-pde = -jno.np.grad(jno.np.grad(u, x), x) - jno.np.sin(π * x)
+pde = -u.d2(x) - jno.np.sin(π * x)
 bc  = ub   # u = 0 on boundary
 ```
 
@@ -91,11 +91,11 @@ $$\text{sim}_{ij} = \frac{\nabla L_i \cdot \nabla L_j}{\|\nabla L_i\| \|\nabla L
 cb_align = jno.callbacks.gradient_alignment(interval=50)
 ```
 
-A single scalar in $[0, 1]$ measuring global agreement across all gradients (Eq. 3.1, [2502.00604]):
+A single scalar in $[-1, 1]$ measuring global agreement across all gradients (Eq. 3.1, [2502.00604]):
 
-$$\text{alignment} = \frac{\|\sum_i \nabla L_i\|}{\sum_i \|\nabla L_i\|}$$
+$$\text{alignment} \;=\; 2\left\|\frac{1}{N}\sum_{i=1}^{N} \frac{\nabla L_i}{\|\nabla L_i\|}\right\|^2 - 1$$
 
-A value near 1 means all loss terms pull in the same direction. Near 0 means destructive interference.
+Near $+1$ means all loss terms pull in the same direction; $0$ means orthogonal; near $-1$ means anti-aligned (destructive interference).
 
 ### 2-D loss landscape
 

@@ -56,7 +56,7 @@ import jno
 
 # ── Domain & target data ──────────────────────────────────────────────────────
 π = jno.np.pi
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.02))
+domain = jno.domain.line(mesh_size=0.02)
 x, _ = domain.variable("interior")
 
 A_true, B_true = 3.14, -2.71

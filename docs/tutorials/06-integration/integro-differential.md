@@ -63,7 +63,7 @@ residual = du + u - g - C    # IDE residual
 **Step 1 — Domain and variable**
 
 ```python
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.05))
+domain = jno.domain.line(mesh_size=0.05)
 x, _ = domain.variable("interior")
 ```
 
@@ -79,6 +79,15 @@ u = net(x) * x   # u(0) = 0 for any net weights
 C  = u.integrate()   # scalar: feeds into every row of the residual
 du = u.d(x)          # pointwise: (N, 1)
 ```
+
+!!! tip "Finite-difference derivative on the integration mesh"
+    The integration uses the mesh nodes as quadrature points. Since the same mesh is already available, swapping the pointwise derivative to a finite-difference scheme avoids the autodiff tape and runs noticeably faster on dense 1-D meshes:
+
+    ```python
+    du = u.d(x, scheme="finite_difference")
+    ```
+
+    For 2-D and 3-D meshes you'd also need `compute_mesh_connectivity=True` on the domain (the 1-D case here precomputes connectivity by default). FD and autodiff agree to within mesh-resolution error; pick FD when the per-step gradient tape dominates training time.
 
 **Step 4 — Form and solve**
 

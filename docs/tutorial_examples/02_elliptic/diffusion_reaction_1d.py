@@ -18,14 +18,13 @@ import jax
 import optax
 
 import jno
-from jno import LearningRateSchedule as lrs
 
 π = jno.np.pi
 # ── Physical parameter ────────────────────────────────────────────────────────
 σ = 10.0  # reaction coefficient — increase to make the problem stiffer
 
 # ── Domain ────────────────────────────────────────────────────────────────────
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+domain = jno.domain.line(mesh_size=0.1)
 x, _ = domain.variable("interior")
 xb, _ = domain.variable("boundary")
 
@@ -41,12 +40,12 @@ u_net = jno.nn.wrap(
         num_layers=4,
         key=jax.random.PRNGKey(0),
     )
-).optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 10, 1e-5))
+).optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.5, end_value=1e-5)))
 
 u = u_net(x) * x * (1 - x)
 
 # ── PDE residual:  −u'' + σu − f = 0 ──────────────────────────────────────────
-u_xx = jno.np.grad(jno.np.grad(u, x), x)
+u_xx = u.d2(x)
 pde = -u_xx + σ * u - forcing
 
 # ── Solve ─────────────────────────────────────────────────────────────────────

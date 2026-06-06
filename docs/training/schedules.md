@@ -4,11 +4,23 @@
 
 ## Learning Rate Schedules
 
-`LearningRateSchedule` is a callable `(epoch, individual_losses) → scalar`.
+`LearningRateSchedule` wraps **any** callable `(epoch, individual_losses) → scalar` so it can be passed to `optimizer(..., lr=...)`. Build your own:
 
 ```python
 from jno import LearningRateSchedule as lrs
 
+# Any (epoch, losses) -> scalar callable is a schedule
+lrs(lambda epoch, losses: 1e-4 * (0.9 ** (epoch / 500)))
+
+# Drop the LR when the PDE residual loss plateaus
+lrs(lambda epoch, losses: 1e-3 if losses[0] > 1e-2 else 1e-5)
+```
+
+### Built-in schedule factories
+
+For common shapes, `lrs` ships these factories:
+
+```python
 # Constant
 lrs.constant(1e-3)
 lrs(1e-3)          # shorthand
@@ -27,12 +39,9 @@ lrs.piecewise_constant(
     boundaries=[1000, 3000],
     values=[1e-3, 5e-4, 1e-4],   # len(boundaries) + 1 values
 )
-
-# Custom function
-lrs(lambda epoch, losses: 1e-4 * (0.9 ** (epoch / 500)))
 ```
 
-All schedules accept `min_lr` and `max_lr` keyword arguments to clamp the output.
+All factories — built-in and custom — accept `min_lr` and `max_lr` keyword arguments to clamp the output.
 
 ---
 

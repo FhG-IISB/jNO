@@ -1,4 +1,4 @@
-# Glossary
+# Concepts
 
 Short definitions for jNO-specific terminology that appears repeatedly
 across the docs. Linked from the [Home page](index.md).
@@ -7,16 +7,13 @@ across the docs. Linked from the [Home page](index.md).
 
 ### Trace / tracing system
 
-jNO's central abstraction. Domain points, network calls, derivatives,
-residuals, supervised losses, FEM weak forms, and noise terms are all
-represented as symbolic nodes in a single computation graph (a
-"trace"). At `jno.core(constraints, domain)`, the trace is JIT-compiled
-once into a JAX function and reused for every training and evaluation
-step. This is why the same expression can serve as both a residual
-loss during training and as a quantity of interest during `crux.eval()`.
-
-The paper [`arXiv:2605.10159`](https://arxiv.org/abs/2605.10159)
-describes the design in detail.
+jNO's central abstraction — a single symbolic graph holding domain
+points, network calls, derivatives, residuals, supervised losses, FEM
+weak forms, and noise terms. `jno.core(...)` JIT-compiles the graph
+once into a JAX function reused for both `crux.solve()` (training) and
+`crux.eval()` (evaluation), which is why the same expression can serve
+as both a residual loss and a quantity of interest. Design details:
+[`arXiv:2605.10159`](https://arxiv.org/abs/2605.10159).
 
 ### Placeholder
 
@@ -31,9 +28,9 @@ expression-building API produces.
 
 ### Constraint
 
-A single optimisable scalar expression handed to `jno.core`. The
-canonical form is `<expression>.mse` (or `.mae`, `.rmse`, ...). Anything
-that ends in a reduction to a scalar can be a constraint:
+A scalar expression handed to `jno.core`. Canonical form is
+`<expression>.mse` (also `.mae`, `.rmse`, …); any reduction to a scalar
+qualifies.
 
 ```python
 pde      = (-u.laplacian(x, y) - forcing).mse
@@ -42,44 +39,32 @@ data_fit = (u_pred - u_obs).mse
 crux = jno.core([pde, bc, data_fit], domain)
 ```
 
-The term **constraint** is used in jNO for both *physics* (PDE residual)
-and *data* (supervised loss). It is *not* used for parameter bounds —
-those are configured via `Model.constrain(...)` and called *parameter
-constraints* in `docs/Model-Controls.md` for disambiguation.
+Covers both *physics* (PDE residuals) and *data* (supervised losses).
+*Not* used for parameter bounds — those are configured via
+`Model.constrain(...)` and called *parameter constraints* for
+disambiguation.
 
 ### Model controls
 
-The collection of per-parameter knobs you set on a network wrapped via
-`jno.nn.wrap(...)`:
-
-- `model.freeze()` / `model.unfreeze()` — exclude parameters from training.
-- `model.lora(rank, alpha)` — replace dense layers with LoRA low-rank
-  adapters.
-- `model.dtype(jnp.float32)` — cast parameters/inputs.
-- `model.optimizer(optax.adam(1e-3))` and `model.lr(schedule)` — attach a
-  per-model optimiser and learning-rate schedule.
-- `model.mask(bool_pytree).optimizer(...)` — apply the next mutator to
-  a specific parameter subset only.
-
-The full reference lives in
-[`docs/model-controls/index.md`](model-controls/index.md).
+The collection of per-parameter knobs set on a network wrapped via
+`jno.nn.wrap(...)` — `optimizer`, `lr`, `freeze` / `unfreeze`, `mask`,
+`lora`, `dtype`, `constrain`, `initialize`. Chain `.mask(M)` before any
+of these to scope the next call to a parameter subset. Full reference
+and worked examples in [Model Controls](model-controls/index.md).
 
 ### Mesh (overloaded)
 
 Two distinct concepts share the word "mesh":
 
-- **PDE / spatial mesh** — the unstructured tetrahedral / triangular /
-  line mesh that defines the simulation domain. Created via
-  `jno.domain.rect(mesh_size=...)`, loaded from `.msh` / `.npz`, or
-  built from a polygon outline. The collocation / integration points
-  come from this mesh.
-- **Device mesh** — the JAX `(batch, model)` device topology passed as
-  `jno.core(constraints, domain, mesh=(n_batch, n_model))`. Controls
-  data parallelism (batch axis) and model parallelism (model axis).
-  Unrelated to the PDE mesh.
+- **Spatial mesh** — the unstructured triangular / tetrahedral / line
+  mesh defining the simulation domain (`jno.domain.rect(mesh_size=...)`,
+  loaded from `.msh` / `.npz`, or built from a polygon). Collocation
+  and integration points come from this mesh.
+- **Device mesh** — the JAX `(batch, model)` device topology passed via
+  `jno.core(..., mesh=(n_batch, n_model))`. Controls data and model
+  parallelism. Unrelated to the spatial mesh.
 
-Where the context is ambiguous, the docs use *spatial mesh* vs
-*device mesh*.
+When ambiguous, the docs say *spatial mesh* vs *device mesh*.
 
 ### Variable vs TensorTag
 
@@ -87,9 +72,8 @@ Where the context is ambiguous, the docs use *spatial mesh* vs
   mesh tag (`domain.variable("interior")` → `x, y, t`). Has a `dim`
   slice into the tag's array.
 - **`TensorTag`** — a non-coordinate quantity stored on the domain
-  context (e.g., a per-sample diffusion field). Built via
-  `domain.add_tensor_tag(name, array)` and referenced as
-  `domain.variable(name)`.
+  context (e.g., a per-sample diffusion field). Attached and
+  referenced through the same call: `domain.variable(name, array)`.
 
 ### Tag (domain tag)
 

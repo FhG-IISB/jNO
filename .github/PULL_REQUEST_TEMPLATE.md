@@ -25,7 +25,7 @@ Please fill in the sections below. Anything irrelevant can be deleted.
 - [ ] `pixi run fmt` passes (no formatting changes)
 - [ ] `pixi run lint` passes (no warnings)
 - [ ] `pixi run test` passes (or specify which tests are intentionally skipped/slow)
-- [ ] Public-API change → docs updated (`docs/*.md`, docstrings, [`Glossary.md`](../docs/Glossary.md))
+- [ ] Public-API change → docs updated (`docs/*.md`, docstrings, [Concepts page](../docs/Glossary.md))
 - [ ] If touching `jno.core`, `jno.domain`, `jno.trace`, or `jno.trace_compiler`: added or extended a test under `tests/test_*.py`
 - [ ] If user-visible behaviour changed: changelog entry / migration note in PR body
 - [ ] No accidental `print(...)` / `breakpoint()` / temporary files committed

@@ -132,7 +132,7 @@ head_var = max(float(jnp.mean(jnp.var(chain_leaves[i], axis=1))) for i in head_i
 print(f"[pattern-b] head leaf max var-along-N : {head_var:.3e}  (should be > 0)")
 
 # ── Predictive bands on a dense eval grid ───────────────────────────────────
-eval_dom = jno.domain(constructor=jno.domain.line(x_range=(-1.0, 1.0), mesh_size=0.02))
+eval_dom = jno.domain.line(x_range=(-1.0, 1.0), mesh_size=0.02)
 x_eval, _ = eval_dom.variable("interior")
 
 u_chain = crux.eval([u_net(x_eval)], domain=eval_dom)  # (1, keep, n_eval, 1)

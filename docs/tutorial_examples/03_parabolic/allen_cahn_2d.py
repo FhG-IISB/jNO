@@ -23,7 +23,6 @@ import jax
 import optax
 
 import jno
-from jno import LearningRateSchedule as lrs
 
 π = jno.np.pi
 sin = jno.np.sin
@@ -57,13 +56,17 @@ net = jno.nn.wrap(
         key=jax.random.PRNGKey(42),
     )
 )
-net.optimizer(optax.adam(1), lr=lrs.warmup_cosine(500, 1, 1e-3, 1e-5))
+net.optimizer(
+    optax.adam(
+        optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=1e-3, warmup_steps=1, decay_steps=500, end_value=1e-5)
+    )
+)
 
 xy = jno.np.concat([x, y])
 u = net(t, xy) * x * (1 - x) * y * (1 - y)
 
 # ── PDE residual ──────────────────────────────────────────────────────────────
-pde = jno.np.grad(u, t) - eps**2 * jno.np.laplacian(u, [x, y]) - u + u**3 - source
+pde = u.d(t) - eps**2 * jno.np.laplacian(u, [x, y]) - u + u**3 - source
 
 # ── Initial condition  (t=0 via 0*t trick) ──────────────────────────────────
 u_at_0 = net(0 * t, xy) * x * (1 - x) * y * (1 - y)

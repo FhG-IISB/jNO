@@ -6,7 +6,7 @@ looks wrong, fix the docstring — not this file.
 
 For conceptual prose (what these objects *are* and *why* they exist),
 see the [Getting Started](Getting-Started.md) guide and the
-[Glossary](Glossary.md).
+[Concepts](Glossary.md) page.
 
 ---
 
@@ -38,7 +38,6 @@ sampling, and tensor tags.
         - __init__
         - variable
         - sample
-        - add_tensor_tag
         - summary
         - line
         - rect

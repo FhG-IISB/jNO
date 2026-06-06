@@ -26,6 +26,7 @@ domain = jno.domain(
 )
 x, t   = domain.variable("interior")
 x0, t0 = domain.variable("initial")
+xb, tb = domain.variable("boundary")
 
 u_exact = jno.np.exp(-t) * jno.np.sin(π * x)
 source  = jno.np.exp(-t) * ((ν * π**2 - 1) * jno.np.sin(π * x) + c * π * jno.np.cos(π * x))
@@ -43,33 +44,34 @@ net = jno.nn.wrap(
         key=jax.random.PRNGKey(1),
     )
 )
-net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.6, 10, 1e-5))
+net.optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.6, end_value=1e-5)))
 
-u = net(t, x) * x * (1 - x)
+u = net(t, x)
 ```
 
-## Step 3: Encode Transport and Diffusion Together
+## Step 3: Three Soft Constraints — PDE + IC + BC
 
-The residual contains both a first derivative in space and a second derivative in space, so it mixes advective and diffusive behavior.
+The residual mixes a first space derivative (advection) and a second space derivative (diffusion); the IC and BC are passed as separate loss terms.
 
 ```python
-u_t  = jno.np.grad(u, t)
-u_x  = jno.np.grad(u, x)
-u_xx = jno.np.grad(u_x, x)
-pde  = u_t + c * u_x - ν * u_xx - source
+# PDE:  u_t + c u_x − ν u_xx − f = 0
+pde = u.d(t) + c * u.d(x) - ν * u.d2(x) - source
 
-u_0 = net(t0, x0) * x0 * (1 - x0)
-ini = u_0 - jno.np.sin(π * x0)
+# IC:   u(x, 0) = sin(πx)
+ic = net(t0, x0) - jno.np.sin(π * x0)
 
-crux    = jno.core([pde.mse, ini.mse], domain)
+# BC:   u(0, t) = u(1, t) = 0
+bc = net(tb, xb)
+
+crux    = jno.core([pde.mse, ic.mse, bc.mse], domain)
 history = crux.solve(5000)
 ```
 
 ## What To Notice
 
-- This is a good first transport example before moving to nonlinear convection.
-- Advection and diffusion terms can differ strongly in scale.
-- The overall workflow still matches the other PINN examples.
+- Same soft IC + BC pattern as [Heat 1D](../03-parabolic/heat-1d.md) and [Wave 1D](wave-1d.md) — three explicit constraints make the role of each condition obvious.
+- Advection and diffusion residual terms can differ strongly in scale; small `ν` (here `0.05`) makes the problem convection-dominated and harder to converge — that's why this example uses a longer training run than pure diffusion.
+- The manufactured forcing `source` is what makes the prescribed `u_exact = e^{-t} sin(πx)` actually satisfy the PDE; without it the equation would have a different solution.
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/04_hyperbolic/advection_diffusion_1d.py" download>Download full script</a>

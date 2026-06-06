@@ -1,10 +1,15 @@
-site_name: jNO Documentation
+site_name: Documentation
+site_url: https://fhg-iisb.github.io/jNO/
+repo_url: https://github.com/FhG-IISB/jno
+repo_name: FhG-IISB/jno
 docs_dir: docs
 site_dir: site
 use_directory_urls: true
 
 theme:
   name: material
+  logo: assets/logo.svg
+  favicon: assets/favicon.svg
 
 plugins:
   - search
@@ -46,6 +51,9 @@ markdown_extensions:
       alternate_style: true
   - pymdownx.arithmatex:
       generic: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
 
 extra_css:
   - stylesheets/extra.css
@@ -70,7 +78,7 @@ nav:
   - Installation: Installation.md
   - Getting Started: Getting-Started.md
   - API Reference: API.md
-  - Glossary: Glossary.md
+  - Concepts: Glossary.md
   - Getting to Know jNO:
     - Domain and Geometry: Domain-and-Geometry.md
     - Operators:
@@ -158,3 +166,8 @@ nav:
       - Laplace Warm-Start: tutorials/10-bayesian-pinns/laplace-init.md
       - SVGD Warm-Start: tutorials/10-bayesian-pinns/svgd-init.md
       - Pattern B BNN Head: tutorials/10-bayesian-pinns/pattern-b-bnn-head.md
+    - 11 Operator Learning:
+      - Overview: tutorials/11-operator-learning/index.md
+      - DeepONet — parametric Poisson 2D: tutorials/11-operator-learning/deeponet-poisson-2d.md
+      - FNO2D — supervised Poisson 2D: tutorials/11-operator-learning/fno-poisson-2d.md
+      - U-Net 2D — supervised Poisson 2D: tutorials/11-operator-learning/unet-poisson-2d.md

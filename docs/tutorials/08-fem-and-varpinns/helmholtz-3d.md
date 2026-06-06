@@ -62,8 +62,8 @@ xg, yg, zg, _ = domain.variable("fem_gauss", split=True)
 xt, yt, zt, _ = domain.variable("gauss_top",  split=True)
 xw, yw, zw, _ = domain.variable("gauss_wall", split=True)
 
-ux = jno.np.grad(u, xg); uy = jno.np.grad(u, yg); uz = jno.np.grad(u, zg)
-phix = jno.np.grad(phi, xg); phiy = jno.np.grad(phi, yg); phiz = jno.np.grad(phi, zg)
+ux = u.d(xg); uy = u.d(yg); uz = u.d(zg)
+phix = phi.d(xg); phiy = phi.d(yg); phiz = phi.d(zg)
 
 volume        = ux*phix + uy*phiy + uz*phiz + sigma*u*phi - source_f(xg, yg, zg)*phi
 top_boundary  = flux_top(xt, yt, zt) * phi

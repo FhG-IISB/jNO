@@ -38,7 +38,6 @@ import jax.numpy as jnp
 import optax
 
 import jno
-from jno import LearningRateSchedule as lrs
 
 π = jno.np.pi
 
@@ -70,14 +69,14 @@ net = jno.nn.wrap(
         key=jax.random.PRNGKey(0),
     )
 )
-net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.9, 5_000, 1e-5))
+net.optimizer(optax.adam(optax.exponential_decay(1e-3, 5_000, 0.9, end_value=1e-5)))
 
 # Hard-enforce IC u(x,0) = sin(πx) and zero Dirichlet BCs u(0,t) = u(1,t) = 0.
 u = jno.np.sin(π * x) + t * net(t, x) * x * (1 - x)
 
 # ── Losses ────────────────────────────────────────────────────────────────────
 # 1. Pointwise PDE residual: ∂u/∂t − α ∂²u/∂x² = 0
-pde = jno.np.grad(u, t) - α * jno.np.grad(jno.np.grad(u, x), x)
+pde = u.d(t) - α * u.d2(x)
 
 # 2. Heat-dose constraint: ∫₀ᵀ u(x,t) dt = ū_exact(x)
 #    .integrate(t) reduces over the temporal axis → spatial field (N_x, 1).

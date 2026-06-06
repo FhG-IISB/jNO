@@ -1,20 +1,41 @@
 ---
 name: Feature request
-about: Suggest an idea for this project
+about: Propose a new capability or API for jNO
 title: ''
-labels: ''
+labels: enhancement
 assignees: ''
 
 ---
 
-**Is your feature request related to a problem? Please describe.**
-A clear and concise description of what the problem is. Ex. I'm always frustrated when [...]
+## Problem
 
-**Describe the solution you'd like**
-A clear and concise description of what you want to happen.
+<!--
+What are you trying to do that you can't do cleanly today? Concrete
+example beats abstract framing — e.g. "I want to enforce a periodic BC
+on a 2-D rectangle without writing a custom boundary tag" rather than
+"jNO should support periodic BCs".
+-->
 
-**Describe alternatives you've considered**
-A clear and concise description of any alternative solutions or features you've considered.
+## Proposed solution
 
-**Additional context**
-Add any other context or screenshots about the feature request here.
+<!--
+A sketch of the API or behaviour you'd like. If you have a specific
+shape in mind, show it as a small code snippet. If the request maps to
+a paper or to a pattern in a sibling library (PyTorch, JAX, blackjax,
+foundax, optax, deepxde, etc.), link it.
+-->
+
+```python
+# Example of how this could look from the user side
+```
+
+## Alternatives considered
+
+<!--
+Anything you tried first, or other approaches you weighed. Helps
+maintainers understand what is wrong with the existing escape hatches.
+-->
+
+## Additional context
+
+<!-- Papers, related issues, blocking work, deadlines if any. -->

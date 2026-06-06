@@ -22,7 +22,7 @@ with exact solution `u(x,y) = sin(pi x) cos(pi y)`.
 The script requests `top` and `bottom` variables from the domain in addition to interior points. This lets it apply separate Neumann terms to those boundaries.
 
 ```python
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05))
+domain = jno.domain.rect(mesh_size=0.05)
 x,  y,  _ = domain.variable("interior")
 xt, yt, _ = domain.variable("top")
 xb, yb, _ = domain.variable("bottom")
@@ -50,8 +50,8 @@ The top and bottom boundary losses are built by differentiating the boundary-eva
 
 ```python
 pde           = -jno.np.laplacian(u, [x, y]) - forcing
-neumann_top   = jno.np.grad(u_top,    yt)
-neumann_bottom = jno.np.grad(u_bottom, yb)
+neumann_top   = u_top.d(yt)
+neumann_bottom = u_bottom.d(yb)
 ```
 
 ## Step 4: Solve With Multiple Loss Terms

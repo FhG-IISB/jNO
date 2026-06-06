@@ -5,95 +5,60 @@
 <a class="md-button" href="/jNO_docs/tutorials/01-basics/">Back to chapter</a>
 </div>
 
-This example raises the order of the PDE. Instead of a second derivative, it solves a fourth-order biharmonic problem with clamped boundary conditions.
+Raises the PDE order. Solves a fourth-order biharmonic equation with **clamped** boundary conditions (both `u` and `u'` vanish at the endpoints) using a hard-enforced ansatz.
 
 ## Problem Setup
 
-We solve
-
 ```text
-u''''(x) = 24,   x in [0, 1]
-```
+u''''(x) = sin(π x),   x in [0, 1]
 
-with clamped boundary conditions
-
-```text
 u(0) = u(1) = 0
 u'(0) = u'(1) = 0
 ```
 
-and exact solution
-
-```text
-u(x) = x^2 (1-x)^2
-```
+Exact solution: `u(x) = sin(π x) / π⁴`.
 
 ## Step 1: Create the Domain
 
 ```python
-domain = jno.domain(constructor=jno.domain.line(mesh_size=pick(0.01, 0.1)))
+domain = jno.domain.line(mesh_size=0.05)
 x, _ = domain.variable("interior")
 ```
 
-The domain setup is the same as the earlier 1D examples.
-
-## Step 2: Define the Exact Solution
+## Step 2: Hard-Enforce the Clamped Boundary Conditions
 
 ```python
-u_exact = x**2 * (1 - x) ** 2
-```
-
-This exact form is especially useful here because it also suggests a natural hard-constraint ansatz.
-
-## Step 3: Encode the Boundary Conditions Directly
-
-```python
-net = jnn.nn.mlp(
-    in_features=1,
-    hidden_dims=32,
-    num_layers=3,
-    key=jax.random.PRNGKey(11),
+net = jno.nn.wrap(
+    foundax.mlp(in_features=1, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(11))
 )
-net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.6, pick(8_000, 10), 1e-5))
+net.optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.6, end_value=1e-5)))
 
 u = net(x) * x**2 * (1 - x) ** 2
 ```
 
-Why this is powerful:
+The `x²(1−x)²` factor and **its first derivative** both vanish at `x=0` and `x=1`, so all four clamped boundary conditions are enforced exactly by construction. The network only has to learn the *interior* shape that, when multiplied by `x²(1−x)²`, gives `sin(π x) / π⁴`.
 
-- `x^2(1-x)^2` vanishes at both endpoints.
-- Its derivative also vanishes at both endpoints.
-- That means the clamped boundary conditions are hard-enforced by construction.
-
-## Step 4: Build the Fourth-Order Residual
+## Step 3: Build the Fourth-Order Residual
 
 ```python
-u_xxxx = jnn.grad(jnn.grad(jnn.grad(jnn.grad(u, x), x), x), x)
-pde = u_xxxx - 24.0
-error = jnn.tracker((u - u_exact).mse, interval=pick(200, 1))
+u_xxxx = u.d2(x).d2(x)
+pde = u_xxxx - jno.np.sin(π * x)
 ```
 
-This is the key learning point of the example: higher-order PDEs can still be expressed compactly when the symbolic operations remain composable.
+`.d2(x).d2(x)` is the fourth derivative via two stacked second-derivative shortcuts — equivalent to `u.d(x).d(x).d(x).d(x)` but more compact, and far cleaner than four nested `jno.np.grad(...)` calls.
 
-## Step 5: Solve and Visualize
+## Step 4: Solve
 
 ```python
-crux = jno.core([pde.mse, error], domain)
-history = crux.solve(pick(8_000, 10), profile=True)
+crux = jno.core([pde.mse], domain)
+history = crux.solve(5000)
 ```
-
-The remainder of the script follows the same pattern as the other examples:
-
-- plot training history
-- evaluate predictions on sorted points
-- compare with the exact solution
-- save `solution.png`
 
 ## What To Notice
 
-- Hard constraints become even more useful for higher-order problems.
-- The symbolic gradient chain stays readable even for fourth derivatives.
-- This is a strong template for beam-like or plate-like toy problems.
+- The clamped-BC ansatz `net(x) · x²(1−x)²` is genuinely doing work here — the exact solution `sin(πx)/π⁴` is **not** equal to the ansatz, so the network has to learn a non-trivial correction.
+- Higher-order PDEs stay readable when you use the `.d2()` shortcut. Four nested `jno.np.grad(...)` calls would obscure the structure.
+- Fourth-order accuracy is harder than second-order — expect to need a smaller mesh and longer training than `Laplace 1D` or `Poisson 1D`.
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/01_basics/biharmonic_1d.py" download>Download full script</a>

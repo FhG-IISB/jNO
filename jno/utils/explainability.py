@@ -357,7 +357,8 @@ def make_per_loss_grad_fn(
     where
       norms           : float32 (n_constraints,)  — gradient norm per loss term
       cos_matrix      : float32 (n_constraints, n_constraints)  — pairwise cosine sim
-      total_alignment : float32 scalar  — ||Σgᵢ|| / Σ||gᵢ||  (Eq. 3.1, [2502.00604])
+      total_alignment : float32 scalar  — 2‖(1/N) Σ ĝᵢ‖² − 1   (Eq. 3.1, [2502.00604]),
+                                          where ĝᵢ = gᵢ / ‖gᵢ‖; value in [-1, 1]
 
     Args:
         compiled_constraints_fn: Combined compiled JAX function for all constraints.
@@ -413,8 +414,10 @@ def make_per_loss_grad_fn(
         G_hat = G / (norms[:, None] + 1e-12)
         cos_matrix = G_hat @ G_hat.T  # (N, N)
 
-        g_sum = jnp.sum(G, axis=0)
-        total_alignment = jnp.linalg.norm(g_sum) / (jnp.sum(norms) + 1e-12)
+        # Eq. 3.1 of arXiv:2502.00604: average the unit-normalized gradients
+        # (rows of G_hat), then map ‖·‖² ∈ [0, 1] to alignment ∈ [-1, 1].
+        mean_unit = jnp.mean(G_hat, axis=0)
+        total_alignment = 2.0 * jnp.sum(mean_unit**2) - 1.0
 
         return norms, cos_matrix, total_alignment
 

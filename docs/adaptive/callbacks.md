@@ -10,7 +10,42 @@ Each callback's `on_epoch_end` is called after every outer training step and can
 
 ---
 
-## Early Stopping
+## Build your own callback
+
+Any subclass of `Callback` is a valid callback — override one or more of three hooks:
+
+| Hook | Signature | When it fires |
+|------|-----------|---------------|
+| `on_solve_begin(**kw)` | returns `None` | Once, after `solve()` finishes JIT setup, before the loop |
+| `on_epoch_end(**kw)` | returns `bool` (`True` to stop training) | After every outer training step |
+| `on_training_end(**kw)` | returns `None` | Once, after the loop finishes |
+
+The `**kw` for each hook is documented in the [base class source](https://github.com/FhG-IISB/jno/blob/main/jno/utils/adaptive/callbacks.py) — the most useful keys inside `on_epoch_end` are `epoch`, `total_loss`, `individual_losses`, `trainable`, `rng`, and `log`.
+
+```python
+from jno.utils.adaptive.callbacks import Callback
+
+class LossPrinter(Callback):
+    def __init__(self, every: int = 100):
+        self.every = every
+
+    def on_epoch_end(self, **kw) -> bool:
+        if kw["epoch"] % self.every == 0:
+            print(f"epoch {kw['epoch']}: loss = {float(kw['total_loss']):.4e}")
+        return False   # never request early stop
+
+crux.solve(10_000, callbacks=[LossPrinter(every=500)])
+```
+
+Hooks you don't need can simply be omitted — the base class supplies no-op defaults. The built-in callbacks below all subclass `Callback` themselves; they are convenience helpers, not the only thing the system supports.
+
+---
+
+## Built-in callbacks
+
+For the common cases, jno ships these out of the box. Each is a `jno.callbacks.*` factory that returns a pre-configured `Callback` instance.
+
+### Early Stopping
 
 Stop training automatically when a monitored metric stops improving.
 
@@ -27,7 +62,7 @@ print(cb.stopped_epoch)   # epoch at which training halted (None if not triggere
 print(cb.best_metric)     # best metric value observed
 ```
 
-### Modes
+#### Modes
 
 | `mode` | Stops when |
 |--------|-----------|
@@ -37,7 +72,7 @@ print(cb.best_metric)     # best metric value observed
 
 `"rel"` is useful when loss magnitudes vary across runs — a `min_delta=0.01` means "stop if the loss hasn't improved by at least 1%".
 
-### Monitoring a custom metric
+#### Monitoring a custom metric
 
 By default early stopping watches the total loss. Pass `metric_fn` to monitor anything available at the end of each step:
 
@@ -50,7 +85,7 @@ cb = jno.callbacks.early_stopping(
 
 The keyword arguments available inside `metric_fn` are: `epoch`, `total_loss`, `individual_losses`, `trainable`, `opt_states`, `rng`, `log`.
 
-### Starting from a baseline
+#### Starting from a baseline
 
 ```python
 cb = jno.callbacks.early_stopping(
@@ -61,7 +96,7 @@ cb = jno.callbacks.early_stopping(
 
 ---
 
-## Checkpointing
+### Checkpointing
 
 Save model weights, optimizer states, and PRNG key to disk at regular intervals.
 
@@ -75,7 +110,7 @@ cb = jno.callbacks.checkpoint(
 crux.solve(10000, callbacks=[cb])
 ```
 
-### Keeping the best checkpoint
+#### Keeping the best checkpoint
 
 Pass `best_fn` to always retain the checkpoint with the lowest returned value, regardless of `max_to_keep`:
 
@@ -87,7 +122,7 @@ cb = jno.callbacks.checkpoint(
 )
 ```
 
-### Restoring a checkpoint
+#### Restoring a checkpoint
 
 ```python
 state = cb.restore()          # latest checkpoint
@@ -105,7 +140,7 @@ crux.set_optimizer(optax.adam(1e-4))
 crux.solve(5000)
 ```
 
-### Async checkpointing
+#### Async checkpointing
 
 Checkpoints are written in a background thread by default (`async_checkpointing=True`). Set to `False` for synchronous writes if you need guaranteed consistency before the process exits:
 
@@ -115,7 +150,7 @@ cb = jno.callbacks.checkpoint(async_checkpointing=False)
 
 ---
 
-## Explainability callbacks
+### Explainability callbacks
 
 jNO also provides callbacks for analysing gradient conflict, cosine similarity, and the loss landscape during training. See [Explainability](../training/explainability.md).
 

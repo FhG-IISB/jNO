@@ -37,12 +37,11 @@ import jax.numpy as jnp
 import optax
 
 import jno
-from jno import LearningRateSchedule as lrs
 
 π = jno.np.pi
 
 # ── Domain (centred at origin so the stationary Gaussian is symmetric) ────────
-domain = jno.domain(constructor=jno.domain.rect(x_range=(-3.0, 3.0), y_range=(-3.0, 3.0), mesh_size=0.15))
+domain = jno.domain.rect(x_range=(-3.0, 3.0), y_range=(-3.0, 3.0), mesh_size=0.15)
 x, y, _ = domain.variable("interior")
 xb, yb, _ = domain.variable("boundary")
 
@@ -60,13 +59,13 @@ net = jno.nn.wrap(
         key=jax.random.PRNGKey(0),
     )
 )
-net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.5, 10, 1e-5))
+net.optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.5, end_value=1e-5)))
 
 p = net(x, y)  # probability density field
 
 # ── Fokker-Planck residual ─────────────────────────────────────────────────────
 # drift term:  ∂(xp)/∂x + ∂(yp)/∂y
-drift = jno.np.grad(x * p, x) + jno.np.grad(y * p, y)
+drift = (x * p).d(x) + (y * p).d(y)
 # diffusion term:  ½ ∆p
 diff = 0.5 * jno.np.laplacian(p, [x, y])
 fp = drift + diff  # residual = 0

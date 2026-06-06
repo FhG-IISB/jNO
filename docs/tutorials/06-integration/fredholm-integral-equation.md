@@ -40,7 +40,7 @@ $C$ is a **scalar** independent of $x$.  jno computes it with one `.integrate()`
 ## Step 1: Set up the domain
 
 ```python
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.01))
+domain = jno.domain.line(mesh_size=0.01)
 x, _ = domain.variable("interior")
 ```
 

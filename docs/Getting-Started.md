@@ -90,17 +90,3 @@ Epoch  1000/20000| L: 1.2345e-03 | C0: 1.1000e-03
 - `C0`, `C1`, … — per-constraint losses.
 - `T0`, `T1`, … — tracker values (when trackers are enabled).
 
-## Documentation Map
-
-| Topic | Page |
-|------|------|
-| Installation methods and Docker | [Installation](Installation.md) |
-| Geometry and variable sampling | [Domain and Geometry](Domain-and-Geometry.md) |
-| Symbolic operators and math helpers | [Differential Operators](Differential-Operators.md) |
-| Training schedules and solver setup | [Training](Training.md) |
-| Freeze, masks, LoRA, initialization | [Model Controls](Model-Controls.md) |
-| Residual-adaptive sampling | [Adaptive Resampling](Adaptive-Resampling.md) |
-| Hyperparameter search | [Hyperparameter Tuning](Hyperparameter-Tuning.md) |
-| Save, load, and reproducibility | [Save, Load and Configuration](Save-Load-and-Configuration.md) |
-| Architecture families | [Foundax Core Architectures](foundation_models/Core-Architectures.md) |
-| Foundation-model families | [Foundation Models](foundation_models/Foundation-Models.md) |

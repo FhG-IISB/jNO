@@ -49,7 +49,7 @@ import jno
 π = jno.np.pi
 
 # ── Domain ─────────────────────────────────────────────────────────────────────
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.01))
+domain = jno.domain.line(mesh_size=0.01)
 x, _ = domain.variable("interior")
 
 domain.summary()
