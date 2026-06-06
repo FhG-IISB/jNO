@@ -27,7 +27,7 @@ from jno import LearningRateSchedule as lrs
 π = jno.np.pi
 
 # ── Domain ─────────────────────────────────────────────────────────────────────
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.001))
+domain = jno.domain.line(mesh_size=0.001)
 x, _ = domain.variable("interior")
 xb, _ = domain.variable("boundary")
 

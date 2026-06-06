@@ -63,7 +63,7 @@ residual = du + u - g - C    # IDE residual
 **Step 1 — Domain and variable**
 
 ```python
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.05))
+domain = jno.domain.line(mesh_size=0.05)
 x, _ = domain.variable("interior")
 ```
 

@@ -54,7 +54,7 @@ This example solves a **2-D Poisson equation whose source term is random** — a
 ### Step 1 — Domain and forcing
 
 ```python
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05))
+domain = jno.domain.rect(mesh_size=0.05)
 x, y, _ = domain.variable("interior")
 
 f       = 2 * π**2 * jno.np.sin(π * x) * jno.np.sin(π * y)

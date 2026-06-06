@@ -58,7 +58,7 @@ $$-u''(x) = \sin(\pi x), \quad x \in [0, 1], \quad u(0) = u(1) = 0$$
 Exact solution: $u(x) = \sin(\pi x) / \pi^2$.
 
 ```python
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+domain = jno.domain.line(mesh_size=0.1)
 x, _ = domain.variable("interior")
 
 u_net = jno.nn.wrap(

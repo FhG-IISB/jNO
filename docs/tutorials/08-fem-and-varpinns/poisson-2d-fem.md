@@ -16,7 +16,7 @@ The script assembles the weak form of a manufactured Poisson problem and solves 
 Instead of writing a pointwise PDE residual, the script builds bilinear and linear forms using FEM symbols.
 
 ```python
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.18))
+domain = jno.domain.rect(mesh_size=0.18)
 domain.init_fem(
     element_type="TRI3",
     quad_degree=3,

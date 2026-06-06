@@ -16,7 +16,7 @@ The script solves a coupled system of the form `-Delta u + v = f` and `-Delta v 
 Instead of one neural network, the script defines one model for `u` and one model for `v`.
 
 ```python
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.2))
+domain = jno.domain.rect(mesh_size=0.2)
 x, y, _ = domain.variable("interior")
 
 u_exact = sin(π * x) * sin(π * y)

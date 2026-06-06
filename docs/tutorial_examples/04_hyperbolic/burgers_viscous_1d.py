@@ -70,12 +70,10 @@ strategy = sampler.rad(
 # 2D rect domain with x ∈ [0,1] (space) and y ∈ [0,1] (time, labelled t below).
 # mesh_size=0.05 → 513 interior nodes in the candidate pool.
 # sample=(60, None) → 60-point working set (8× pool-to-sample ratio).
-domain = 1 * jno.domain(
-    constructor=jno.domain.rect(
-        mesh_size=0.05,
-        x_range=(0.0, 1.0),
-        y_range=(0.0, T_end),
-    )
+domain = 1 * jno.domain.rect(
+    mesh_size=0.05,
+    x_range=(0.0, 1.0),
+    y_range=(0.0, T_end),
 )
 vars_int = domain.variable("interior", sample=(60, None), resampling_strategy=strategy)
 x, t = vars_int[0], vars_int[1]

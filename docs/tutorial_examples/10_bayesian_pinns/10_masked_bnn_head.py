@@ -153,7 +153,7 @@ print(f"[masked-bnn-head] body  max var-along-N : {body_var_max:.3e}  (should be
 print(f"[masked-bnn-head] head  min var-along-N : {head_var_min:.3e}  (should be > 0)")
 
 # ── Predictive bands at a dense eval grid ───────────────────────────
-eval_dom = jno.domain(constructor=jno.domain.line(x_range=(-1.0, 1.0), mesh_size=0.02))
+eval_dom = jno.domain.line(x_range=(-1.0, 1.0), mesh_size=0.02)
 x_eval, _ = eval_dom.variable("interior")
 
 # auto-chain: u_net carries posterior_samples on its head; bodies are

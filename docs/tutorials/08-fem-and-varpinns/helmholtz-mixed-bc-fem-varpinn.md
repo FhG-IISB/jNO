@@ -16,7 +16,7 @@ The PDE has the Helmholtz form with mixed Dirichlet and Neumann data and a manuf
 The residual is assembled in variational form rather than as a pointwise strong-form loss.
 
 ```python
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.22))
+domain = jno.domain.rect(mesh_size=0.22)
 domain.init_fem(
     element_type="TRI3",
     quad_degree=3,

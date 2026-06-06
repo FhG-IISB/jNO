@@ -51,7 +51,7 @@ def to_dense(A):
 # Domain and FEAX-FEM setup
 # ---------------------------------------------------------------------
 
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.18))
+domain = jno.domain.rect(mesh_size=0.18)
 
 domain.init_fem(
     element_type="TRI3",

@@ -26,7 +26,7 @@ u(x) = sin(pi x) / pi^2
 Unlike the hard-constraint example, this script explicitly asks for both interior and boundary points.
 
 ```python
-domain = jno.domain(constructor=jno.domain.line(mesh_size=pick(0.01, 0.1)))
+domain = jno.domain.line(mesh_size=pick(0.01, 0.1))
 x, _ = domain.variable("interior")
 xb, _ = domain.variable("boundary")
 ```

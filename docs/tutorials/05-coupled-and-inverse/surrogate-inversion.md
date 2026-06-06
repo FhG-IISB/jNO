@@ -39,7 +39,7 @@ Exact solution: $u(x) = \sin(\pi x)$.
 Train a PINN in the usual way:
 
 ```python
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.01))
+domain = jno.domain.line(mesh_size=0.01)
 x, _ = domain.variable("interior")
 
 u_net = jno.nn.wrap(foundax.mlp(in_features=1, output_dim=1, hidden_dims=32, num_layers=3, key=k1))

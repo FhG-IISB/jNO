@@ -28,7 +28,7 @@ The parameter `sigma` determines how strongly the reaction term competes with di
 The script samples the domain, builds a manufactured forcing term, and keeps the exact solution for error tracking.
 
 ```python
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+domain = jno.domain.line(mesh_size=0.1)
 x, _ = domain.variable("interior")
 
 u_exact = jno.np.sin(π * x)

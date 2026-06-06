@@ -40,7 +40,7 @@ jno.setup(__file__, wandb={"project": "jNO", "tags": ["poisson", "1d"]})
 We solve the 1-D Poisson equation with a **soft** boundary condition so the solver has two separate loss terms — necessary to make the explainability metrics meaningful.
 
 ```python
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.05))
+domain = jno.domain.line(mesh_size=0.05)
 x,  _ = domain.variable("interior")
 xb, _ = domain.variable("boundary")
 

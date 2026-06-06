@@ -20,7 +20,7 @@ import optax
 import jno
 
 pi = jno.np.pi
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05))
+domain = jno.domain.rect(mesh_size=0.05)
 x, y, _ = domain.variable("interior")
 
 kappa = 1 + x + y

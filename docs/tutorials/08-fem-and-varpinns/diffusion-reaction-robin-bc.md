@@ -16,7 +16,7 @@ The PDE is a diffusion-reaction or Helmholtz-like problem on a 2D domain with bo
 The script includes boundary quadrature contributions directly in the variational residual.
 
 ```python
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.22))
+domain = jno.domain.rect(mesh_size=0.22)
 domain.init_fem(
     element_type="TRI3",
     quad_degree=3,

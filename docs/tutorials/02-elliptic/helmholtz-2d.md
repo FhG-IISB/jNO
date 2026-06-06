@@ -29,7 +29,7 @@ k = 2.0  # wave number — change to test different regimes
 The manufactured forcing is derived by substituting the exact solution into the PDE.
 
 ```python
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05))
+domain = jno.domain.rect(mesh_size=0.05)
 x, y, _ = domain.variable("interior")
 
 u_exact = jno.np.sin(π * x) * jno.np.sin(π * y)

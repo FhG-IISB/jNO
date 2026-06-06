@@ -31,7 +31,7 @@ from jno import LearningRateSchedule as lrs
 π = jno.np.pi
 sin = jno.np.sin
 # ── Domain ────────────────────────────────────────────────────────────────────
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.2))
+domain = jno.domain.rect(mesh_size=0.2)
 x, y, _ = domain.variable("interior")
 
 # ── Manufactured solutions and source terms ───────────────────────────────────
