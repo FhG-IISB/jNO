@@ -1037,11 +1037,42 @@ class PolygonDomain(domain):
         return_indices: bool = False,
         time_value: float | None = None,
     ):
-        batch_count = self._effective_batch_count()
-        last_tag = None
-        last_idx = None
+        # After build_mesh(), tags with sample count None and a matching
+        # _mesh_pool entry are delegated to the parent's mesh sampler so the
+        # mesh-node path drives .integrate() and FD. Tags with an explicit
+        # count keep using the PolygonDomain geometric sampler.
+        mesh_spec: Dict[str, Tuple[int, Optional[Any]]] = {}
+        poly_spec: Dict[str, Tuple[int, Optional[Any]]] = {}
+        for tag, spec in sample_spec.items():
+            n_samples, _ = spec
+            if n_samples is None and self._mesh_pool and tag in self._mesh_pool:
+                mesh_spec[tag] = spec
+            else:
+                poly_spec[tag] = spec
 
-        for requested_tag, (n_samples, sampler) in sample_spec.items():
+        last_tag: Optional[str] = None
+        last_idx: Optional[np.ndarray] = None
+
+        if mesh_spec:
+            _, idx, mesh_last = super().sample(
+                mesh_spec,
+                normals=normals,
+                return_indices=return_indices,
+                time_value=time_value,
+            )
+            last_tag = mesh_last
+            last_idx = idx
+
+        if not poly_spec:
+            if last_tag is None:
+                raise ValueError("sample_spec must contain at least one tag")
+            if return_indices:
+                return self.context[last_tag], last_idx, last_tag
+            return self.context[last_tag], None, last_tag
+
+        batch_count = self._effective_batch_count()
+
+        for requested_tag, (n_samples, sampler) in poly_spec.items():
             if requested_tag not in self._polygon_tags:
                 available = sorted(self._polygon_tags)
                 raise ValueError(f"Tag '{requested_tag}' not found on PolygonDomain. Available polygon tags: {available}")
@@ -1135,8 +1166,16 @@ class PolygonDomain(domain):
             if kind != "boundary":
                 raise ValueError(f"View factors are only available for boundary tags, got '{tag}'")
 
+        # After build_mesh(), a tag may be available both as a Shapely lazy tag
+        # and as a mesh tag (_mesh_pool entry). Default behavior:
+        #   - sample=(n, None) with positive n: lazy Shapely sample (unchanged).
+        #   - sample=(None, None) (the default): if a mesh exists for this tag,
+        #     defer to the parent's mesh path; otherwise raise the lazy error.
+        has_mesh_entry = bool(self._mesh_pool) and tag in self._mesh_pool
+        wants_lazy_count = isinstance(sample, tuple) and len(sample) > 0 and isinstance(sample[0], int)
+
         sampled_indices = None
-        if polygon_tag:
+        if polygon_tag and (wants_lazy_count or not has_mesh_entry):
             if isinstance(sample, tuple) and len(sample) > 0 and isinstance(sample[0], (int, type(None))):
                 self.sample_dict.append([tag, sample, resampling_strategy, normals, view_factor])
                 _, sampled_indices, sampled_tag = self.sample(
@@ -1149,7 +1188,8 @@ class PolygonDomain(domain):
                 sample = None  # type: ignore[assignment]
             elif tag not in self.context:
                 raise ValueError(
-                    f"PolygonDomain tag '{tag}' is lazy. Use variable('{tag}', sample=(n, None)) to materialize points."
+                    f"PolygonDomain tag '{tag}' is lazy. Use variable('{tag}', sample=(n, None)) to materialize points, "
+                    f"or call build_mesh() first to enable the mesh-backed path."
                 )
 
         result = super().variable(
@@ -1274,3 +1314,400 @@ class PolygonDomain(domain):
 
     def __xor__(self, other: Any) -> "PolygonDomain":
         return self.symmetric_difference(other)
+
+    def build_mesh(
+        self,
+        mesh_size: float = 0.1,
+        *,
+        algorithm: int = 6,
+        region_mesh_sizes: Optional[Mapping[str, float]] = None,
+    ) -> "PolygonDomain":
+        """Generate a gmsh mesh from the active Shapely CSG geometry.
+
+        After this call, ``self.mesh_connectivity`` and ``self._boundary_registry``
+        are populated and downstream operations that need a mesh
+        (``expr.integrate()``, ``scheme="finite_difference"`` derivatives) become
+        available. The lazy sampling path is untouched: previously materialized
+        collocation samples in ``self.context`` survive and automatic-
+        differentiation derivatives keep using them.
+
+        Args:
+            mesh_size: Default target element size for points that don't fall on
+                any per-region boundary override.
+            algorithm: pygmsh algorithm (passed through to ``generate_mesh``).
+            region_mesh_sizes: Per-source-region mesh size overrides keyed by
+                the names used to construct the source regions (e.g. the
+                ``name`` argument of ``jno.domain.csg`` or keys of
+                ``from_polygons`` / ``from_regions``). For each gmsh point on a
+                source-region boundary, the per-region size wins; if a point
+                lies on several overridden region boundaries, the smallest size
+                is used. Interior mesh sizes propagate from the boundary via
+                gmsh's standard size field.
+
+        Re-calling ``build_mesh`` re-meshes from scratch and clears the integral
+        weight cache.
+        """
+        _require_shapely()
+        if self._active_geometry is None or self._active_geometry.is_empty or self._active_geometry.area <= _GEOM_TOL:
+            raise ValueError("Cannot build mesh from empty active geometry")
+
+        import pygmsh
+        from shapely.geometry.polygon import orient
+
+        self.compute_mesh_connectivity = True
+        # Invalidate cached integration weights (trace_evaluator sets this on the
+        # domain when an integrate() expression first runs).
+        if hasattr(self, "_integral_region_cache"):
+            self._integral_region_cache = {}
+
+        size_overrides = self._validate_region_mesh_sizes(region_mesh_sizes)
+        source_endpoints = self._collect_source_edge_endpoints()
+        # Mesh region-by-region (each source-region's clipped piece is one
+        # gmsh surface) so that interfaces between regions are constrained
+        # straight lines rather than triangle paths through merged geometry.
+        # ``_partition_active_by_source_region`` carves the active geometry
+        # disjointly across source regions in iteration order; any active
+        # leftover (no source claims it) is meshed as an unnamed remainder.
+        region_parts = self._partition_active_by_source_region()
+
+        with pygmsh.geo.Geometry() as geo:
+            point_cache: Dict[Tuple[float, float], Any] = {}
+            line_cache: Dict[Tuple[Tuple[float, float], Tuple[float, float]], Any] = {}
+            lines_with_midpoints: List[Tuple[Any, np.ndarray]] = []
+            surfaces_per_part: List[Tuple[BaseGeometry, Any]] = []
+
+            def size_for_point(xy: Tuple[float, float]) -> float:
+                if not size_overrides:
+                    return mesh_size
+                point = Point(float(xy[0]), float(xy[1]))  # type: ignore[operator]
+                chosen = mesh_size
+                for boundary, region_size in size_overrides:
+                    if boundary.distance(point) < self._normal_eps and region_size < chosen:
+                        chosen = region_size
+                return chosen
+
+            def get_point(xy: Tuple[float, float]):
+                key = (round(float(xy[0]), 14), round(float(xy[1]), 14))
+                if key not in point_cache:
+                    point_cache[key] = geo.add_point(
+                        [float(xy[0]), float(xy[1])],
+                        mesh_size=size_for_point(xy),
+                    )
+                return point_cache[key]
+
+            def get_line(p0: Tuple[float, float], p1: Tuple[float, float]):
+                # Direction-aware line cache. Two adjacent regions share the
+                # same gmsh line on their interface but traverse it in
+                # opposite directions; for the second region we need the
+                # reversed line (pygmsh's ``-line``) so the curve loop
+                # closes. Without this the cache returns a forward line
+                # whose endpoints don't chain.
+                k0 = (round(float(p0[0]), 14), round(float(p0[1]), 14))
+                k1 = (round(float(p1[0]), 14), round(float(p1[1]), 14))
+                cache_key = tuple(sorted([k0, k1]))  # type: ignore[arg-type]
+                if cache_key not in line_cache:
+                    line = geo.add_line(get_point(p0), get_point(p1))
+                    # Remember the original (forward) direction so we can
+                    # detect when a later traversal needs the negated line.
+                    line_cache[cache_key] = (line, k0, k1)
+                    midpoint = np.array([(p0[0] + p1[0]) / 2.0, (p0[1] + p1[1]) / 2.0])
+                    lines_with_midpoints.append((line, midpoint))
+                cached_line, cached_k0, cached_k1 = line_cache[cache_key]
+                if (cached_k0, cached_k1) == (k0, k1):
+                    return cached_line
+                return -cached_line
+
+            def emit_ring(ring) -> Any:
+                coords = self._ring_coords_with_endpoints(ring, source_endpoints)
+                ring_lines = [get_line(coords[i], coords[(i + 1) % len(coords)]) for i in range(len(coords))]
+                return geo.add_curve_loop(ring_lines)
+
+            for part, _region_name in region_parts:
+                oriented = orient(part, sign=1.0)  # CCW exterior, CW holes
+                outer_loop = emit_ring(oriented.exterior)
+                hole_loops = [emit_ring(interior) for interior in oriented.interiors]
+                if hole_loops:
+                    surface = geo.add_plane_surface(outer_loop, holes=hole_loops)
+                else:
+                    surface = geo.add_plane_surface(outer_loop)
+                surfaces_per_part.append((part, surface))
+
+            self._emit_polygon_tag_physicals(geo, surfaces_per_part, lines_with_midpoints)
+
+            mesh = geo.generate_mesh(dim=2, algorithm=algorithm, verbose=False)
+
+        # When CSG merges several source regions into a single mesh surface,
+        # gmsh's representative-point dispatch cannot split per-region tags.
+        # Re-derive sub-region cell sets directly from triangle centroids and
+        # line midpoints so `interior_<name>` / `boundary_<name>_*` work even
+        # in the fully merged case. This also overwrites any per-region
+        # cell_sets that gmsh did emit, keeping the two paths consistent.
+        self._attach_polygon_subregion_cell_sets(mesh)
+
+        self.ds = float(mesh_size)
+        # _extract_points_from_mesh appends to avaiable_mesh_tags; the
+        # Shapely-side pass during __init__ pre-populated it with the analytic
+        # tag names, so clear it here to make the mesh the source of truth and
+        # avoid duplicate entries.
+        self.avaiable_mesh_tags = []
+        self._apply_mesh(mesh)
+
+        if self._verbose:
+            n_pts = int(np.asarray(mesh.points).shape[0])
+            self.log.info(
+                f"PolygonDomain.build_mesh: meshed {len(region_parts)} CSG piece(s) into {n_pts} nodes "
+                f"(mesh_size={mesh_size}, algorithm={algorithm})"
+            )
+        return self
+
+    def _partition_active_by_source_region(self) -> List[Tuple[BaseGeometry, Optional[str]]]:
+        """Carve the active geometry into one piece per source region.
+
+        Returns ``[(polygon_part, source_region_name_or_None), ...]`` such that
+        the parts are pairwise disjoint (apart from shared boundaries) and
+        together cover the active geometry. Each source region is clipped to
+        the active geometry and then to the complement of previously emitted
+        regions, so overlapping source regions are handled in iteration order.
+        Active area not claimed by any source region is appended at the end
+        with ``name=None``.
+
+        Iterating these parts as separate gmsh surfaces makes inter-region
+        interfaces (e.g. between a half-circle and the rectangle above it)
+        appear as constrained, conforming mesh edges instead of triangles
+        that cross the analytic boundary.
+        """
+        if self._active_geometry.is_empty:
+            return []
+
+        active = self._active_geometry
+        emitted = GeometryCollection()  # type: ignore[operator]
+        parts: List[Tuple[BaseGeometry, Optional[str]]] = []
+        for name, region in self._source_regions.items():
+            clipped = _as_polygonal_geometry(region.intersection(active))
+            if not emitted.is_empty:
+                clipped = _as_polygonal_geometry(clipped.difference(emitted))
+            if clipped.is_empty or clipped.area <= _GEOM_TOL:
+                continue
+            for piece in _polygon_parts(clipped):
+                parts.append((piece, str(name)))
+            emitted = _as_polygonal_geometry(unary_union([emitted, clipped]))  # type: ignore[misc]
+
+        remaining = _as_polygonal_geometry(active.difference(emitted))
+        if not remaining.is_empty and remaining.area > _GEOM_TOL:
+            for piece in _polygon_parts(remaining):
+                parts.append((piece, None))
+        return parts
+
+    def _attach_polygon_subregion_cell_sets(self, mesh) -> None:
+        """Inject per-region cell_sets into the meshio Mesh by centroid/midpoint
+        match against ``_polygon_tags``.
+
+        Required when the active geometry is a single connected piece spanning
+        multiple source regions: gmsh's per-surface physical group can only
+        assign that one surface to one region (via the surface's representative
+        point), so `interior_<name>` for the other regions would be empty.
+        This pass walks every triangle/line of the produced mesh and matches it
+        against each Shapely tag geometry, overriding any prior entry.
+        """
+        if mesh is None:
+            return
+
+        # Locate the triangle and line cell blocks. Indices in the injected
+        # cell_sets are emitted as block-local; ``_extract_points_from_mesh``
+        # uses a per-cell-set max-vs-block-length test to tell local from
+        # global apart, so we don't need to match gmsh's internal cell IDs
+        # here.
+        line_block_idx: Optional[int] = None
+        tri_block_idx: Optional[int] = None
+        for i, cb in enumerate(mesh.cells):
+            if cb.type == "line" and line_block_idx is None:
+                line_block_idx = i
+            elif cb.type == "triangle" and tri_block_idx is None:
+                tri_block_idx = i
+        if tri_block_idx is None:
+            return
+
+        n_blocks = len(mesh.cells)
+        points = np.asarray(mesh.points)[:, :2]
+        tris = np.asarray(mesh.cells[tri_block_idx].data)
+        tri_centroids = points[tris].mean(axis=1)
+        if line_block_idx is not None:
+            lines = np.asarray(mesh.cells[line_block_idx].data)
+            line_midpoints = points[lines].mean(axis=1)
+        else:
+            line_midpoints = None
+
+        def _empty_blocks() -> List[np.ndarray]:
+            return [np.array([], dtype=np.int64) for _ in range(n_blocks)]
+
+        tol = self._normal_eps
+
+        for tag, (kind, geom) in self._polygon_tags.items():
+            if tag in ("interior", "boundary") or geom is None or geom.is_empty:
+                continue
+
+            if kind == "interior":
+                if contains_xy is not None:
+                    inside = np.asarray(
+                        contains_xy(geom, tri_centroids[:, 0], tri_centroids[:, 1]),
+                        dtype=bool,
+                    )
+                else:  # pragma: no cover - shapely<2 fallback
+                    inside = np.asarray(
+                        [geom.contains(Point(float(c[0]), float(c[1]))) for c in tri_centroids],  # type: ignore[operator]
+                        dtype=bool,
+                    )
+                matched_idx = np.flatnonzero(inside).astype(np.int64)
+                blocks = _empty_blocks()
+                blocks[tri_block_idx] = matched_idx
+                if matched_idx.size > 0:
+                    mesh.cell_sets[tag] = blocks
+                elif tag in mesh.cell_sets:
+                    mesh.cell_sets[tag] = blocks
+            else:  # boundary
+                if line_midpoints is None or len(line_midpoints) == 0:
+                    if tag in mesh.cell_sets:
+                        mesh.cell_sets[tag] = _empty_blocks()
+                    continue
+                # Clip the source edge to the active boundary so we don't pull
+                # in interface lines between two regions (those are mesh-side
+                # constraints but not on the active boundary, and they have
+                # ``nodal_ds = 0`` because adjacent triangles cover them on
+                # both sides).
+                clipped = _as_line_geometry(geom.intersection(self._active_geometry.boundary))
+                if clipped.is_empty:
+                    if tag in mesh.cell_sets:
+                        mesh.cell_sets[tag] = _empty_blocks()
+                    continue
+                matched: List[int] = []
+                for li, mp in enumerate(line_midpoints):
+                    p = Point(float(mp[0]), float(mp[1]))  # type: ignore[operator]
+                    if clipped.distance(p) < tol:
+                        matched.append(li)
+                blocks = _empty_blocks()
+                if matched:
+                    blocks[line_block_idx] = np.asarray(matched, dtype=np.int64)
+                    mesh.cell_sets[tag] = blocks
+                elif tag in mesh.cell_sets:
+                    mesh.cell_sets[tag] = blocks
+
+    def _validate_region_mesh_sizes(
+        self,
+        region_mesh_sizes: Optional[Mapping[str, float]],
+    ) -> List[Tuple[BaseGeometry, float]]:
+        """Validate per-region mesh-size overrides and return (boundary, size) pairs."""
+        if not region_mesh_sizes:
+            return []
+        overrides: List[Tuple[BaseGeometry, float]] = []
+        for name, size in region_mesh_sizes.items():
+            key = str(name)
+            if key not in self._source_regions:
+                raise ValueError(
+                    f"region_mesh_sizes references unknown region '{key}'. "
+                    f"Known source regions: {sorted(self._source_regions)}"
+                )
+            value = float(size)
+            if not (value > 0):
+                raise ValueError(f"region_mesh_sizes['{key}'] must be a positive float, got {size}")
+            overrides.append((self._source_regions[key].boundary, value))
+        return overrides
+
+    def _collect_source_edge_endpoints(self) -> List[Tuple[float, float]]:
+        """Endpoints of all clipped source edges, deduped to 14 decimals.
+
+        These are inserted into mesh-ring vertex lists so gmsh segments never
+        straddle two source-edge tags.
+        """
+        if self._active_geometry.is_empty:
+            return []
+        active_boundary = self._active_geometry.boundary
+        seen: set = set()
+        endpoints: List[Tuple[float, float]] = []
+        for edge_list in self._source_edges.values():
+            for edge in edge_list:
+                edge = _as_line_geometry(edge)
+                if edge.is_empty or edge.length <= _GEOM_TOL:
+                    continue
+                clipped = _as_line_geometry(edge.intersection(active_boundary))
+                for line in _line_parts(clipped):
+                    coords = np.asarray(line.coords, dtype=np.float64)
+                    if len(coords) < 2:
+                        continue
+                    for pt in (coords[0], coords[-1]):
+                        key = (round(float(pt[0]), 14), round(float(pt[1]), 14))
+                        if key not in seen:
+                            seen.add(key)
+                            endpoints.append((float(pt[0]), float(pt[1])))
+        return endpoints
+
+    def _ring_coords_with_endpoints(
+        self,
+        ring,
+        source_endpoints: Sequence[Tuple[float, float]],
+    ) -> List[Tuple[float, float]]:
+        """Return ordered ring vertices with any source-edge endpoints inserted at their parametric position on the ring."""
+        ring_coords = list(ring.coords)
+        if len(ring_coords) > 1 and ring_coords[0] == ring_coords[-1]:
+            ring_coords = ring_coords[:-1]
+        base_coords: List[Tuple[float, float]] = [(float(c[0]), float(c[1])) for c in ring_coords]
+        if not base_coords:
+            return []
+
+        ring_line = LineString(list(ring.coords))  # type: ignore[operator]
+        existing_keys = {(round(c[0], 14), round(c[1], 14)) for c in base_coords}
+
+        extras: List[Tuple[float, Tuple[float, float]]] = []
+        for pt in source_endpoints:
+            key = (round(pt[0], 14), round(pt[1], 14))
+            if key in existing_keys:
+                continue
+            point = Point(pt[0], pt[1])  # type: ignore[operator]
+            if ring_line.distance(point) < self._normal_eps:
+                param = float(ring_line.project(point))
+                extras.append((param, pt))
+                existing_keys.add(key)
+
+        if not extras:
+            return base_coords
+
+        # Compute parametric position (arc length from ring start) of each base
+        # vertex so we can merge with extras and sort.
+        base_with_param: List[Tuple[float, Tuple[float, float]]] = [(0.0, base_coords[0])]
+        cum = 0.0
+        for i in range(1, len(base_coords)):
+            cum += float(np.hypot(base_coords[i][0] - base_coords[i - 1][0], base_coords[i][1] - base_coords[i - 1][1]))
+            base_with_param.append((cum, base_coords[i]))
+
+        merged = base_with_param + extras
+        merged.sort(key=lambda x: x[0])
+        return [c for _, c in merged]
+
+    def _emit_polygon_tag_physicals(
+        self,
+        geo: Any,
+        surfaces_per_part: Sequence[Tuple[BaseGeometry, Any]],
+        lines_with_midpoints: Sequence[Tuple[Any, np.ndarray]],
+    ) -> None:
+        """Emit gmsh physical groups for the two global polygon tags.
+
+        Only ``"interior"`` and ``"boundary"`` go through gmsh — they cover
+        the whole active geometry and its full boundary, which gmsh can
+        always represent. Every per-region or per-edge tag
+        (``interior_<name>``, ``boundary_<name>``, ``boundary_<name>_<i>``)
+        is materialized by ``_attach_polygon_subregion_cell_sets`` after
+        meshing, so that the merged-surface CSG case works the same as the
+        disjoint-piece case.
+        """
+        for tag, (kind, geom) in self._polygon_tags.items():
+            if tag == "interior":
+                matched_surfaces = [s for _part, s in surfaces_per_part]
+                if matched_surfaces:
+                    geo.add_physical(matched_surfaces, tag)
+            elif tag == "boundary":
+                matched_lines = []
+                for line, midpoint in lines_with_midpoints:
+                    point = Point(float(midpoint[0]), float(midpoint[1]))  # type: ignore[operator]
+                    if geom.distance(point) < self._normal_eps:
+                        matched_lines.append(line)
+                if matched_lines:
+                    geo.add_physical(matched_lines, tag)

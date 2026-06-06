@@ -486,15 +486,7 @@ class domain(MeshIOMixin):
         else:
             raise ValueError("Must provide either geometry_func, mesh file, or NPZ tag file")
 
-        if self.mesh is not None:
-            boundary_indices = self._extract_points_from_mesh(self.mesh)
-        else:
-            boundary_indices = np.asarray([], dtype=np.int64)
-
-        # Preprocess mesh for finite differences
-        if self.mesh is not None and self.compute_mesh_connectivity:
-            self.mesh_connectivity, msg = self._preprocess_mesh_connectivity(self.mesh, self.dimension, boundary_indices)
-            self.log.info(msg)
+        self._apply_mesh(self.mesh)
 
         # Add time dimension if needed
         if self._is_time_dependent:
@@ -1659,6 +1651,24 @@ class domain(MeshIOMixin):
         self.dimension = explicit_dim
         self.ds = ds
 
+    def _apply_mesh(self, mesh) -> None:
+        """Run the post-mesh pipeline on a freshly attached mesh.
+
+        Extracts boundary indices into ``_boundary_registry`` and (if
+        ``compute_mesh_connectivity`` is set) builds ``mesh_connectivity``.
+        Shared by the mesh-backed ``domain.__init__`` path and by
+        ``PolygonDomain.build_mesh``.
+        """
+        if mesh is None:
+            boundary_indices = np.asarray([], dtype=np.int64)
+        else:
+            self.mesh = mesh
+            boundary_indices = self._extract_points_from_mesh(mesh)
+
+        if mesh is not None and self.compute_mesh_connectivity:
+            self.mesh_connectivity, msg = self._preprocess_mesh_connectivity(mesh, self.dimension, boundary_indices)
+            self.log.info(msg)
+
     def _extract_points_from_mesh(self, mesh):
         """Extract points and normals from mesh and organize by tag."""
         index_to_normal_pos = {}
@@ -1738,22 +1748,38 @@ class domain(MeshIOMixin):
                                             elif cell_block.type == "triangle":
                                                 tag_tris.append(tuple(cell))
                 else:
-                    # Handle list-style cell_data
+                    # Handle list-style cell_data. meshio cell-set indices
+                    # can be either block-local (manually written `.inp`
+                    # files) or global gmsh cell IDs. Per-cell-set rule: if
+                    # ``max(indices) >= block_len`` the indices must be
+                    # global (a local index can't exceed block_len-1), so
+                    # subtract ``min(indices)`` to convert to local;
+                    # otherwise treat as local. This is robust to gmsh's
+                    # internal numbering not aligning with meshio's
+                    # cumulative block ordering.
                     for block_idx, indices in enumerate(cell_data):
                         if indices is None or len(indices) == 0:
                             continue
                         if block_idx < len(mesh.cells):
                             cell_block = mesh.cells[block_idx]
+                            block_len = len(cell_block.data)
+                            idx_array = np.asarray(indices)
+                            if idx_array.max() >= block_len:
+                                sub = int(idx_array.min())
+                            else:
+                                sub = 0
 
                             if cell_block.type == "vertex":
-                                for idx in indices:
-                                    if 0 <= idx < len(cell_block.data):
-                                        point_idx = int(cell_block.data[idx].flatten()[0])
+                                for idx in idx_array:
+                                    local_idx = int(idx) - sub
+                                    if 0 <= local_idx < block_len:
+                                        point_idx = int(cell_block.data[local_idx].flatten()[0])
                                         tag_points.add(point_idx)
                             else:
-                                for idx in indices:
-                                    if 0 <= idx < len(cell_block.data):
-                                        cell = cell_block.data[idx]
+                                for idx in idx_array:
+                                    local_idx = int(idx) - sub
+                                    if 0 <= local_idx < block_len:
+                                        cell = cell_block.data[local_idx]
                                         tag_points.update(cell.flatten())
                                         if cell_block.type == "line":
                                             tag_edges.append(tuple(cell))

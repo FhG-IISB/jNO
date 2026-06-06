@@ -46,7 +46,7 @@ sampling, and tensor tags.
         - export
         - plot_mesh
 
-::: jno.PolygonDomain
+::: jno.domain.csg
 
 ---
 

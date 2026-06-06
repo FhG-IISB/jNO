@@ -474,7 +474,7 @@ def test_polygon_draw_candidates_exceeds_sample_size():
     """
     pytest.importorskip("shapely")
     SQUARE = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
-    dom = jno.PolygonDomain(SQUARE, name="sq")
+    dom = jno.domain.csg(SQUARE, name="sq")
     dom.variable("interior", sample=(50, None))
 
     pts, nrm = dom.draw_candidates("interior")
@@ -492,7 +492,7 @@ def test_polygon_draw_candidates_returns_fresh_points():
     """
     pytest.importorskip("shapely")
     SQUARE = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
-    dom = jno.PolygonDomain(SQUARE, name="sq")
+    dom = jno.domain.csg(SQUARE, name="sq")
     dom.variable("interior", sample=(50, None))
 
     pts1, _ = dom.draw_candidates("interior")

@@ -1632,8 +1632,36 @@ class TraceEvaluator:
                 if stored is not None:
                     normals_np = np.asarray(stored)
             else:
-                region_pts_np = np.asarray(mc["points"])
-                weights_np = IntegrationOperators.nodal_volumes(mc)
+                tag_tris = getattr(domain, "_tag_triangles", {}).get(tag)
+                full_tris = mc.get("triangles") if hasattr(mc, "get") else None
+                has_subregion = (
+                    tag_tris is not None and full_tris is not None and len(tag_tris) > 0 and len(tag_tris) < len(full_tris)
+                )
+                if has_subregion:
+                    # Non-boundary tag with its own triangle subset (e.g.
+                    # ``interior_<name>`` on a CSG mesh): compute weights
+                    # from just those triangles so disjoint sub-regions
+                    # don't share nodal volume from each other's incident
+                    # elements.
+                    tris = np.asarray(tag_tris)
+                    points_arr = np.asarray(mc["points"])
+                    vols = np.zeros(points_arr.shape[0], dtype=np.float64)
+                    a = points_arr[tris[:, 0]]
+                    b = points_arr[tris[:, 1]]
+                    c = points_arr[tris[:, 2]]
+                    areas = 0.5 * np.abs(
+                        (b[:, 0] - a[:, 0]) * (c[:, 1] - a[:, 1]) - (b[:, 1] - a[:, 1]) * (c[:, 0] - a[:, 0])
+                    )
+                    share = areas / 3.0
+                    np.add.at(vols, tris[:, 0], share)
+                    np.add.at(vols, tris[:, 1], share)
+                    np.add.at(vols, tris[:, 2], share)
+                    reg_indices = np.unique(tris.flatten()).astype(int)
+                    region_pts_np = points_arr[reg_indices]
+                    weights_np = vols[reg_indices]
+                else:
+                    region_pts_np = np.asarray(mc["points"])
+                    weights_np = IntegrationOperators.nodal_volumes(mc)
                 normals_np = None
 
             domain._integral_region_cache[tag] = {

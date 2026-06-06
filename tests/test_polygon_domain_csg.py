@@ -11,7 +11,7 @@ SQUARE_B = [(0.5, 0.0), (1.5, 0.0), (1.5, 1.0), (0.5, 1.0)]
 
 
 def test_polygon_domain_is_domain_and_lazy():
-    dom = jno.PolygonDomain(SQUARE_A, name="a")
+    dom = jno.domain.csg(SQUARE_A, name="a")
 
     assert isinstance(dom, jno.domain)
     assert dom.mesh is None
@@ -23,7 +23,7 @@ def test_polygon_domain_is_domain_and_lazy():
 
 def test_polygon_domain_accepts_constant_z_vertices():
     verts = [(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (0.0, 1.0, 0.0)]
-    dom = jno.PolygonDomain(verts, name="z")
+    dom = jno.domain.csg(verts, name="z")
 
     assert dom.dimension == 2
     assert "boundary_z_0" in dom.boundary_tags()
@@ -33,14 +33,14 @@ def test_domain_poly_factory_returns_polygon_domain_without_changing_mesh_polygo
     dom = jno.domain.poly(SQUARE_A, name="a")
     mesh_dom = jno.domain.polygon(SQUARE_A, mesh_size=0.5, compute_mesh_connectivity=False)
 
-    assert isinstance(dom, jno.PolygonDomain)
+    assert isinstance(dom, jno.domain.csg)
     assert dom.mesh is None
     assert mesh_dom.mesh is not None
 
 
 def test_lazy_interior_sampling_has_exact_context_shape_and_points_inside():
     np.random.seed(0)
-    dom = jno.PolygonDomain(SQUARE_A, name="a")
+    dom = jno.domain.csg(SQUARE_A, name="a")
 
     x, y, t = dom.variable("interior", sample=(128, None))
     pts = dom.context[x.tag][0, 0]
@@ -55,7 +55,7 @@ def test_lazy_interior_sampling_has_exact_context_shape_and_points_inside():
 
 def test_boundary_edge_sampling_uses_input_order_and_exact_normals():
     np.random.seed(1)
-    dom = jno.PolygonDomain(SQUARE_A, name="a")
+    dom = jno.domain.csg(SQUARE_A, name="a")
 
     xb, yb, tb, nx, ny = dom.variable("boundary_a_0", sample=(64, None), normals=True)
     pts = dom.context[xb.tag][0, 0]
@@ -73,15 +73,15 @@ def test_boundary_edge_sampling_uses_input_order_and_exact_normals():
 
 def test_union_operator_is_true_csg_not_batch_stacking():
     np.random.seed(2)
-    a = jno.PolygonDomain(SQUARE_A, name="a")
-    b = jno.PolygonDomain(SQUARE_B, name="b")
+    a = jno.domain.csg(SQUARE_A, name="a")
+    b = jno.domain.csg(SQUARE_B, name="b")
 
     c = a + b
     c_alt = a | b
     x, y, t = c.variable("interior", sample=(200, None))
     pts = c.context[x.tag][0, 0]
 
-    assert isinstance(c, jno.PolygonDomain)
+    assert isinstance(c, jno.domain.csg)
     assert c.total_samples == 1
     assert c.context[x.tag].shape == (1, 1, 200, 2)
     assert c._active_geometry.area == pytest.approx(1.5)
@@ -91,8 +91,8 @@ def test_union_operator_is_true_csg_not_batch_stacking():
 
 def test_intersection_samples_only_overlap():
     np.random.seed(3)
-    a = jno.PolygonDomain(SQUARE_A, name="a")
-    b = jno.PolygonDomain(SQUARE_B, name="b")
+    a = jno.domain.csg(SQUARE_A, name="a")
+    b = jno.domain.csg(SQUARE_B, name="b")
 
     c = a & b
     x, y, t = c.variable("interior", sample=(100, None))
@@ -105,8 +105,8 @@ def test_intersection_samples_only_overlap():
 
 def test_difference_exposes_subtrahend_boundary_as_hole_boundary():
     np.random.seed(4)
-    outer = jno.PolygonDomain(SQUARE_A, name="outer")
-    inner = jno.PolygonDomain([(0.4, 0.4), (0.6, 0.4), (0.6, 0.6), (0.4, 0.6)], name="hole")
+    outer = jno.domain.csg(SQUARE_A, name="outer")
+    inner = jno.domain.csg([(0.4, 0.4), (0.6, 0.4), (0.6, 0.6), (0.4, 0.6)], name="hole")
 
     dom = outer - inner
     xb, yb, tb, nx, ny = dom.variable("boundary_hole_0", sample=(64, None), normals=True)
@@ -119,7 +119,7 @@ def test_difference_exposes_subtrahend_boundary_as_hole_boundary():
 
 
 def test_from_polygons_registers_named_region_and_edge_tags():
-    dom = jno.PolygonDomain.from_polygons(
+    dom = jno.domain.csg.from_polygons(
         {
             "Air": SQUARE_A,
             "Wall": [(1.2, 0.0), (1.5, 0.0), (1.5, 1.0), (1.2, 1.0)],
@@ -140,7 +140,7 @@ def test_from_regions_uses_preprocessed_air_geometry_for_interior_sampling():
     right_solid = Polygon([(2.6, 0.4), (3.0, 0.4), (3.0, 0.6), (2.6, 0.6)])
     explicit_air = Polygon([(0.0, 0.0), (0.2, 0.0), (0.2, 0.2), (0.0, 0.2)])
 
-    dom = jno.PolygonDomain.from_regions(
+    dom = jno.domain.csg.from_regions(
         {
             "Air": scene_box.difference(left_solid.union(right_solid)),
             "LeftSolid": left_solid,
@@ -161,7 +161,7 @@ def test_from_regions_uses_preprocessed_air_geometry_for_interior_sampling():
 
 def test_enclosure_view_factor_uses_cross_tag_blocks_only():
     np.random.seed(5)
-    dom = jno.PolygonDomain.from_polygons(
+    dom = jno.domain.csg.from_polygons(
         {
             "Air": [(0.0, 0.0), (3.0, 0.0), (3.0, 1.0), (0.0, 1.0)],
             "LeftSolid": [(-0.2, 0.25), (0.0, 0.25), (0.0, 0.75), (-0.2, 0.75)],
@@ -185,7 +185,7 @@ def test_enclosure_view_factor_uses_cross_tag_blocks_only():
 
 def test_enclosure_visibility_filters_rays_outside_solid_subtracted_medium():
     np.random.seed(6)
-    dom = jno.PolygonDomain.from_polygons(
+    dom = jno.domain.csg.from_polygons(
         {
             "Air": [(0.0, 0.0), (3.0, 0.0), (3.0, 1.0), (0.0, 1.0)],
             "Block": [(1.25, 0.2), (1.75, 0.2), (1.75, 0.8), (1.25, 0.8)],
@@ -203,7 +203,7 @@ def test_enclosure_visibility_filters_rays_outside_solid_subtracted_medium():
 
 
 def test_air_medium_is_inferred_as_scene_box_void_not_explicit_air_polygon():
-    dom = jno.PolygonDomain.from_polygons(
+    dom = jno.domain.csg.from_polygons(
         {
             "Air": [(0.0, 0.0), (0.25, 0.0), (0.25, 0.25), (0.0, 0.25)],
             "LeftSolid": [(0.0, 0.4), (0.2, 0.4), (0.2, 0.6), (0.0, 0.6)],
@@ -220,7 +220,7 @@ def test_air_medium_is_inferred_as_scene_box_void_not_explicit_air_polygon():
 
 
 def test_visibility_filter_requires_positive_cosines_at_both_endpoints():
-    dom = jno.PolygonDomain(SQUARE_A, name="box")
+    dom = jno.domain.csg(SQUARE_A, name="box")
 
     points = np.array(
         [
