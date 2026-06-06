@@ -77,7 +77,7 @@ def to_dense(A):
 α_true = 1.0
 sigma_obs = 0.005  # observation noise
 
-fem_domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.15))
+fem_domain = jno.domain.rect(mesh_size=0.15)
 fem_domain.init_fem(
     element_type="TRI3",
     quad_degree=3,

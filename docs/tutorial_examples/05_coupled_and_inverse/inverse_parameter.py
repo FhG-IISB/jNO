@@ -32,7 +32,7 @@ import jno
 A_true, B_true, C_true = 3.14, -2.71, 42.0
 
 # ── Domain ────────────────────────────────────────────────────────────────────
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.01))
+domain = jno.domain.line(mesh_size=0.01)
 x, _ = domain.variable("interior")
 
 # Target (observed) field — no noise here, but you can add jnp.normal(...) * σ

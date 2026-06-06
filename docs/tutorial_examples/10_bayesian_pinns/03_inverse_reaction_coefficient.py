@@ -53,7 +53,7 @@ k_true = 0.7
 sigma_obs = 0.005  # noise on observed f(x)
 
 # ── Domain ────────────────────────────────────────────────────────────────────
-domain = jno.domain(constructor=jno.domain.line(x_range=(-0.7, 0.7), mesh_size=0.05))
+domain = jno.domain.line(x_range=(-0.7, 0.7), mesh_size=0.05)
 x, _ = domain.variable("interior")
 
 # ── Analytical solution + noisy forcing observations under k_true ────────────

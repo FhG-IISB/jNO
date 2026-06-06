@@ -62,7 +62,7 @@ rng = np.random.default_rng(0)
 
 # ── Domain ────────────────────────────────────────────────────────────────────
 # Standard 1D line domain — provides the dense interior collocation points
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.02))
+domain = jno.domain.line(mesh_size=0.02)
 x, _ = domain.variable("interior")
 
 # Sparse sensor observations — noisy samples of the true solution

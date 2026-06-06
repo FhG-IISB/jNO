@@ -18,7 +18,7 @@ Instead of only training a neural field, the script creates scalar parameter mod
 ```python
 A_true, B_true, C_true = 3.14, -2.71, 42.0
 
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.01))
+domain = jno.domain.line(mesh_size=0.01)
 x, _ = domain.variable("interior")
 
 target = A_true * jno.np.sin(π * x) + B_true * jno.np.cos(π * x) + C_true * x * (1 - x)

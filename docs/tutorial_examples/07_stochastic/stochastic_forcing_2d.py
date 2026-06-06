@@ -53,7 +53,7 @@ from jno import LearningRateSchedule as lrs
 σ = 0.5  # noise amplitude on the forcing
 
 # ── Domain ─────────────────────────────────────────────────────────────────────
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05))
+domain = jno.domain.rect(mesh_size=0.05)
 x, y, _ = domain.variable("interior")
 
 # ── Deterministic forcing and exact solution ───────────────────────────────────

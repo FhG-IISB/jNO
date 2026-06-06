@@ -42,7 +42,7 @@ from jno import LearningRateSchedule as lrs
 π = jno.np.pi
 
 # ── Domain (centred at origin so the stationary Gaussian is symmetric) ────────
-domain = jno.domain(constructor=jno.domain.rect(x_range=(-3.0, 3.0), y_range=(-3.0, 3.0), mesh_size=0.15))
+domain = jno.domain.rect(x_range=(-3.0, 3.0), y_range=(-3.0, 3.0), mesh_size=0.15)
 x, y, _ = domain.variable("interior")
 xb, yb, _ = domain.variable("boundary")
 

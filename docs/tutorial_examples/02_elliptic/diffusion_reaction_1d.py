@@ -25,7 +25,7 @@ from jno import LearningRateSchedule as lrs
 σ = 10.0  # reaction coefficient — increase to make the problem stiffer
 
 # ── Domain ────────────────────────────────────────────────────────────────────
-domain = jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+domain = jno.domain.line(mesh_size=0.1)
 x, _ = domain.variable("interior")
 xb, _ = domain.variable("boundary")
 

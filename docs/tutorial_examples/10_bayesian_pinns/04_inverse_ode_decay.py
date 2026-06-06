@@ -63,7 +63,7 @@ T_end = 4.0
 sigma_obs = 0.05  # observation-noise standard deviation
 
 # ── Domain (1-D line over the time axis: x ≡ t) ───────────────────────────────
-domain = jno.domain(constructor=jno.domain.line(x_range=(0.0, T_end), mesh_size=0.1))
+domain = jno.domain.line(x_range=(0.0, T_end), mesh_size=0.1)
 t, _ = domain.variable("interior")
 
 # ── Synthetic noisy observations of u(t) under k_true ─────────────────────────

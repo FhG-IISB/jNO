@@ -17,7 +17,7 @@ The script expresses the nonlinear form directly in terms of FEM operators rathe
 
 ```python
 eps = 0.05
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.12))
+domain = jno.domain.rect(mesh_size=0.12)
 domain.init_fem(
     element_type="TRI3",
     quad_degree=3,

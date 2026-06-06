@@ -21,7 +21,7 @@ with `kappa(x,y) = 1 + x + y` and exact solution `sin(pi x) sin(pi y)`.
 The script constructs `kappa` directly from the sampled coordinates, so the PDE coefficients vary pointwise across the domain.
 
 ```python
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05))
+domain = jno.domain.rect(mesh_size=0.05)
 x, y, _ = domain.variable("interior")
 
 kappa    = 1 + x + y

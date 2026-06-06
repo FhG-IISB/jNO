@@ -31,7 +31,7 @@ u(x) = x^2 (1-x)^2
 ## Step 1: Create the Domain
 
 ```python
-domain = jno.domain(constructor=jno.domain.line(mesh_size=pick(0.01, 0.1)))
+domain = jno.domain.line(mesh_size=pick(0.01, 0.1))
 x, _ = domain.variable("interior")
 ```
 

@@ -29,7 +29,7 @@ The script initializes jNO, creates a 1D line domain, and extracts interior poin
 π = jnn.pi
 dire = jno.setup(__file__)
 
-domain = jno.domain(constructor=jno.domain.line(mesh_size=pick(0.01, 0.1)))
+domain = jno.domain.line(mesh_size=pick(0.01, 0.1))
 x, _ = domain.variable("interior")
 ```
 

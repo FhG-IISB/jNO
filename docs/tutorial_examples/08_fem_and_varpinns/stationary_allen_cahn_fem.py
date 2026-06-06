@@ -56,7 +56,7 @@ def to_dense(A):
 # Domain and weak form
 # ---------------------------------------------------------------------
 
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.12))
+domain = jno.domain.rect(mesh_size=0.12)
 
 domain.init_fem(
     element_type="TRI3",

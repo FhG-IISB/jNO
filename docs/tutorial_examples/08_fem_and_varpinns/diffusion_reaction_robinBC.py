@@ -113,7 +113,7 @@ def build_robin_weak_form(domain):
 
 
 def make_domain(mesh_size=0.22):
-    domain = jno.domain(constructor=jno.domain.rect(mesh_size=mesh_size))
+    domain = jno.domain.rect(mesh_size=mesh_size)
     domain.init_fem(
         element_type="TRI3",
         quad_degree=3,
