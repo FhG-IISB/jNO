@@ -55,7 +55,6 @@ checkpoint without rewriting the surrounding code.
 | IREE / MLIR compiled inference for deployment | [stable](docs/model-controls/iree.md) | |
 | Hyperparameter / architecture search | [beta](docs/Hyperparameter-Tuning.md) | Grid + Nevergrad |
 | Multi-physics coupling | [beta](docs/tutorials/05-coupled-and-inverse/hyco-poisson-1d.md) | HyCo patterns developing |
-| Pretrained operator model zoo | planned | |
 
 ~50 worked tutorials across elliptic, parabolic, hyperbolic, coupled, inverse, integral, stochastic, FEM/variational, and Bayesian groups — see [`docs/tutorials/`](docs/tutorials/).
 
