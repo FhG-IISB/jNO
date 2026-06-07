@@ -43,6 +43,7 @@ def _default_float_dtype():
 from .differential_operators import DifferentialOperators
 from .integration_operators import IntegrationOperators
 from .utils import get_logger
+from .utils.ad_mode import ad_fn, parse_ad_scheme, parse_hessian_scheme
 
 
 class TraceEvaluator:
@@ -1102,9 +1103,18 @@ class TraceEvaluator:
                     out = evaluator_self._dispatch(base_target, new_ctx)
                     return _scalar_from_point_output(out)
 
+                if temporal_derivative_order == 1:
+                    _grad = ad_fn(parse_ad_scheme(scheme))
+                    return _grad(u_of_t_scalar)(time_scalar0)
+
+                if temporal_derivative_order == 2:
+                    _outer, _inner = parse_hessian_scheme(scheme)
+                    return ad_fn(_outer)(ad_fn(_inner)(u_of_t_scalar))(time_scalar0)
+
+                _grad = ad_fn(parse_ad_scheme(scheme))
                 fn = u_of_t_scalar
                 for _ in range(temporal_derivative_order):
-                    fn = jax.grad(fn)
+                    fn = _grad(fn)
                 return fn(time_scalar0)
 
             result = jax.vmap(temporal_derivative_single_point)(jnp.arange(N))
@@ -1189,8 +1199,9 @@ class TraceEvaluator:
             jac_full = jnp.stack(jac_components, axis=-1)
             return self._map_mesh_to_sampled(mesh_points, points, jac_full)
 
-        elif scheme == "automatic_differentiation":
+        elif scheme.startswith("automatic_differentiation"):
             evaluator_self = self
+            _jac = ad_fn(parse_ad_scheme(scheme))
 
             def make_u_fn(local_ctx):
                 def u_fn(p):
@@ -1214,7 +1225,7 @@ class TraceEvaluator:
                     u_fn = make_u_fn(local_ctx)
 
                     val0 = u_fn(pt)
-                    jac = jax.jacobian(u_fn)(pt)
+                    jac = _jac(u_fn)(pt)
 
                     # scalar output -> shape (1,)
                     if jnp.ndim(val0) == 0:
@@ -1233,7 +1244,7 @@ class TraceEvaluator:
                     u_fn = make_u_fn(local_ctx)
 
                     val0 = u_fn(pt)
-                    jac = jax.jacobian(u_fn)(pt)
+                    jac = _jac(u_fn)(pt)
 
                     # scalar output -> (n_vars,)
                     if jnp.ndim(val0) == 0:
@@ -1425,8 +1436,14 @@ class TraceEvaluator:
                     return hess_full.reshape(*image_shape[:-1], n, n)
                 return self._map_mesh_to_sampled(mesh_points, points, hess_full)
 
-        elif scheme == "automatic_differentiation":
+        elif scheme.startswith("automatic_differentiation"):
             evaluator_self = self
+            _outer_mode, _inner_mode = parse_hessian_scheme(scheme)
+            _outer = ad_fn(_outer_mode)
+            _inner = ad_fn(_inner_mode)
+
+            def _hess(f):
+                return _outer(_inner(f))
 
             if points is not None and points.ndim == 3:
                 n_time, n_points, _ = points.shape
@@ -1446,7 +1463,7 @@ class TraceEvaluator:
 
                     def lap_time_point(t_idx, p_idx):
                         pt = points[t_idx, p_idx]
-                        hess = jax.hessian(lambda p: _windowed_scalar(t_idx, p_idx, p))(pt)
+                        hess = _hess(lambda p: _windowed_scalar(t_idx, p_idx, p))(pt)
                         return sum(hess[d, d] for d in dims)
 
                     result = jax.vmap(
@@ -1456,7 +1473,7 @@ class TraceEvaluator:
 
                 def hess_time_point(t_idx, p_idx):
                     pt = points[t_idx, p_idx]
-                    hess = jax.hessian(lambda p: _windowed_scalar(t_idx, p_idx, p))(pt)
+                    hess = _hess(lambda p: _windowed_scalar(t_idx, p_idx, p))(pt)
                     result = jnp.zeros((n, n))
                     for i, vi_dim, j, vj_dim in var_dims:
                         result = result.at[i, j].set(hess[vi_dim, vj_dim])
@@ -1482,7 +1499,7 @@ class TraceEvaluator:
                         )
                         return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
 
-                    hess = jax.hessian(u_scalar)(pt)
+                    hess = _hess(u_scalar)(pt)
                     return sum(hess[d, d] for d in dims)
 
                 return jax.vmap(lap_single)(jnp.arange(points.shape[0]))[:, jnp.newaxis]
@@ -1498,7 +1515,7 @@ class TraceEvaluator:
                         )
                         return jnp.squeeze(evaluator_self._dispatch(target, new_ctx))
 
-                    hess = jax.hessian(u_scalar)(pt)
+                    hess = _hess(u_scalar)(pt)
                     result = jnp.zeros((n, n))
                     for i, vi_dim, j, vj_dim in var_dims:
                         result = result.at[i, j].set(hess[vi_dim, vj_dim])

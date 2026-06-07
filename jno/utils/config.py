@@ -169,7 +169,30 @@ def get_seed() -> int:
 # ---------------------------------------------------------------------------
 
 
-def setup(script_file: str, name: str | None = None, wandb: bool | dict = False) -> str:
+def apply_ad_mode_defaults(diff_type: str | None = None, hessian_type: str | None = None) -> None:
+    """Apply AD mode globals from explicit kwargs, falling back to ``[jno]`` TOML.
+
+    Precedence: explicit kwarg > ``[jno] diff_type`` / ``[jno] hessian_type`` >
+    historical defaults already set in :mod:`jno.utils.ad_mode`.
+    """
+    from . import ad_mode as _ad_mode
+
+    cfg = get_config().get("jno", {})
+    diff = diff_type if diff_type is not None else cfg.get("diff_type")
+    hess = hessian_type if hessian_type is not None else cfg.get("hessian_type")
+    if diff is not None:
+        _ad_mode.set_ad_mode(diff)
+    if hess is not None:
+        _ad_mode.set_hessian_mode(hess)
+
+
+def setup(
+    script_file: str,
+    name: str | None = None,
+    wandb: bool | dict = False,
+    diff_type: str | None = None,
+    hessian_type: str | None = None,
+) -> str:
     """Initialise logging and return the run directory for *script_file*.
 
     Replaces the two-line boilerplate at the top of every example::
@@ -188,11 +211,14 @@ def setup(script_file: str, name: str | None = None, wandb: bool | dict = False)
     directory so output paths are stable regardless of current shell cwd.
     Pass an explicit *name* to override the stem.
 
-    A global RNG seed can be set in ``.jno.toml`` under ``[jno] seed`` so that
-    all ``jno.core(...)`` instances use it automatically::
+    A global RNG seed and the default AD modes can be set in ``.jno.toml``
+    under ``[jno]`` so that all ``jno.core(...)`` instances use them
+    automatically::
 
         [jno]
-        seed = 42
+        seed         = 42
+        diff_type    = "forward"        # first-order AD default
+        hessian_type = "fwd-over-rev"   # second-order AD default
 
     Args:
         script_file: Pass ``__file__`` from the calling script.
@@ -207,6 +233,15 @@ def setup(script_file: str, name: str | None = None, wandb: bool | dict = False)
             Requires the ``wandb`` package to be installed. When the
             import fails and *wandb* is not ``False``, a warning is
             printed and training continues without W&B logging.
+        diff_type: Global default for first-order AD on ``.d`` / ``.diff`` /
+            ``d/dt``. One of ``"forward"`` / ``"reverse"``. ``None`` reads
+            ``[jno] diff_type`` from the TOML config, or keeps the historical
+            default (``"reverse"``).
+        hessian_type: Global default for second-order AD on ``.laplacian`` /
+            ``.hessian`` / ``.d2`` / ``.dd``. One of ``"fwd-over-rev"``,
+            ``"fwd-over-fwd"``, ``"rev-over-rev"``, ``"rev-over-fwd"``.
+            ``None`` reads ``[jno] hessian_type`` from the TOML config, or
+            keeps the historical default (``"fwd-over-rev"``).
 
     Returns:
         The path of the run directory (created if absent).
@@ -243,6 +278,10 @@ def setup(script_file: str, name: str | None = None, wandb: bool | dict = False)
     except Exception:
         # Keep setup robust even if architecture modules are unavailable.
         pass
+
+    # Apply AD mode defaults — explicit kwargs win over TOML, which wins
+    # over the historical defaults already in ad_mode.py.
+    apply_ad_mode_defaults(diff_type, hessian_type)
 
     # --- Optional Weights & Biases ---
     _init_wandb(wandb, stem, str(dire))
