@@ -389,8 +389,14 @@ class Placeholder:
 
         Args:
             variable: The Variable to differentiate with respect to.
-            scheme: ``'automatic_differentiation'`` (default) or
-                ``'finite_difference'``.
+            scheme: First-order scheme string.
+
+                * ``"automatic_differentiation"`` (default) — uses the global
+                  AD mode set via :func:`jno.setup` (see :mod:`jno.utils.ad_mode`).
+                * ``"automatic_differentiation:forward"`` — ``jax.jacfwd``.
+                * ``"automatic_differentiation:reverse"`` — ``jax.jacrev``.
+                * ``"finite_difference"`` (optional sub-schemes:
+                  ``":lsq"`` / ``":uniform"`` / ``":inverse_distance"``).
         """
         return Jacobian(self, [variable], scheme)
 
@@ -403,8 +409,7 @@ class Placeholder:
 
         Args:
             variable: The Variable to differentiate with respect to.
-            scheme: ``'automatic_differentiation'`` (default) or
-                ``'finite_difference'``.
+            scheme: Second-order scheme string — see :meth:`laplacian`.
         """
         return Hessian(self, [variable], scheme, trace=True)
 
@@ -425,8 +430,21 @@ class Placeholder:
 
         Args:
             *variables: Variables to include in the Laplacian.
-            scheme: ``'automatic_differentiation'`` (default) or
-                ``'finite_difference'``.
+            scheme: Second-order scheme string.
+
+                * ``"automatic_differentiation"`` (default) — uses the global
+                  Hessian mode set via :func:`jno.setup`
+                  (see :mod:`jno.utils.ad_mode`).
+                * ``"automatic_differentiation:fwd-over-rev"`` —
+                  ``jacfwd(jacrev(f))`` (equivalent to historical ``jax.hessian``).
+                * ``"automatic_differentiation:fwd-over-fwd"`` —
+                  ``jacfwd(jacfwd(f))``.
+                * ``"automatic_differentiation:rev-over-rev"`` —
+                  ``jacrev(jacrev(f))``.
+                * ``"automatic_differentiation:rev-over-fwd"`` —
+                  ``jacrev(jacfwd(f))``.
+                * ``"finite_difference"`` (optional sub-schemes:
+                  ``":cotangent"`` (2-D), ``":lsq"``).
         """
         return Hessian(self, list(variables) if variables else None, scheme, trace=True)
 
@@ -443,8 +461,7 @@ class Placeholder:
 
         Args:
             *variables: Variables for the Hessian.
-            scheme: ``'automatic_differentiation'`` (default) or
-                ``'finite_difference'``.
+            scheme: Second-order scheme string — see :meth:`laplacian`.
         """
         return Hessian(self, list(variables), scheme, trace=False)
 
