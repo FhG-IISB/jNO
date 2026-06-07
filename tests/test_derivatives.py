@@ -544,6 +544,112 @@ class TestTemporalDerivative:
         result = _eval(u.d(t), {"x": pts, "__time__": jnp.array([1.0])})
         assert result.shape == (8, 1)
 
+    def test_du_dt_on_non_uniform_time_grid(self):
+        """u(t) = exp(-t) + sin(2πt) evaluated point-by-point at a
+        non-uniform sequence of time values — anchors the temporal AD path
+        at ``trace_evaluator.py:1090–1114``. ``jax.grad(u_of_t_scalar)``
+        produces ``du/dt`` regardless of grid spacing; this test asserts
+        that the AD-evaluator returns the correct value at *every* sampled
+        ``t``, not just at a uniformly-spaced sequence."""
+        from tests.conftest import MockDomain
+
+        d = MockDomain(tags=["x"], dim=1)
+        d.context["__time__"] = jnp.zeros((1, 1))
+        _x = Variable("x", [0, 1], domain=d, axis="spatial")
+        t = Variable("__time__", [0, 1], domain=d, axis="temporal")
+
+        # u(t) = exp(-t) + sin(2πt)  →  du/dt = -exp(-t) + 2π cos(2πt)
+        two_pi_t = Literal(2.0 * float(jnp.pi)) * t
+        u = FunctionCall(jnp.exp, [-t], "exp") + FunctionCall(jnp.sin, [two_pi_t], "sin")
+        pts = jnp.ones((4, 1))  # 4 dummy spatial points
+        t_values = jnp.array([0.0, 0.1, 0.4, 1.0])  # deliberately non-uniform
+
+        for t_val in t_values:
+            result = _eval(u.d(t), {"x": pts, "__time__": jnp.array([float(t_val)])})
+            expected = -jnp.exp(-t_val) + 2.0 * jnp.pi * jnp.cos(2.0 * jnp.pi * t_val)
+            assert jnp.allclose(result, expected, atol=1e-5), (
+                f"du/dt at t={float(t_val):.2f}: got {float(result[0, 0]):.4f}, expected {float(expected):.4f}"
+            )
+
+    def test_d2u_dt2_on_non_uniform_time_grid(self):
+        """Second-order temporal derivative on a non-uniform sequence —
+        exercises the ``temporal_derivative_order == 2`` path at
+        ``trace_evaluator.py:1108–1110``."""
+        from tests.conftest import MockDomain
+
+        d = MockDomain(tags=["x"], dim=1)
+        d.context["__time__"] = jnp.zeros((1, 1))
+        _x = Variable("x", [0, 1], domain=d, axis="spatial")
+        t = Variable("__time__", [0, 1], domain=d, axis="temporal")
+
+        # u(t) = sin(2πt)  →  d²u/dt² = -(2π)² sin(2πt)
+        two_pi_t = Literal(2.0 * float(jnp.pi)) * t
+        u = FunctionCall(jnp.sin, [two_pi_t], "sin")
+        pts = jnp.ones((3, 1))
+        t_values = jnp.array([0.05, 0.27, 0.83])  # non-uniform
+
+        for t_val in t_values:
+            result = _eval(u.d(t).d(t), {"x": pts, "__time__": jnp.array([float(t_val)])})
+            expected = -((2.0 * jnp.pi) ** 2) * jnp.sin(2.0 * jnp.pi * t_val)
+            assert jnp.allclose(result, expected, atol=1e-4), (
+                f"d²u/dt² at t={float(t_val):.2f}: got {float(result[0, 0]):.4f}, expected {float(expected):.4f}"
+            )
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 8b. Windowed Hessian — _eval_hessian path with points.ndim == 3
+#
+# When the spatial context is shaped (T, N, D) instead of (N, D) the Hessian
+# / Laplacian evaluator enters the windowed code path at
+# trace_evaluator.py:1374–1411. This branch is exercised end-to-end by
+# parabolic / spatiotemporal solvers (e.g. tests/tutorial_examples_tests/
+# 03_parabolic/heat_1d.py) but never anchored to an analytic Laplacian.
+# ───────────────────────────────────────────────────────────────────────────────
+
+
+class TestWindowedHessianPath:
+    """``u(x, t) = sin(πx) exp(-π²t)``  →  ``Δu = ∂²u/∂x² = -π² u``.
+
+    Build a time-windowed spatial context where ``ctx["x"]`` has shape
+    ``(T, N, 1)``. The Hessian evaluator detects ``points.ndim == 3`` and
+    runs the windowed scalar-of-(t_idx, p_idx, p) path which loops via
+    ``jax.vmap`` over both axes. Compare against the analytic Laplacian at
+    every (t, x) cell.
+    """
+
+    def test_laplacian_via_windowed_path(self):
+        from tests.conftest import MockDomain
+
+        d = MockDomain(tags=["x"], dim=1)
+        # Spatial context: (T, N, 1) — triggers the windowed path
+        T_steps = 3
+        x_values = jnp.linspace(0.1, 0.9, 5).reshape(5, 1)
+        spatial_window = jnp.broadcast_to(x_values[jnp.newaxis, :, :], (T_steps, 5, 1))
+        t_values = jnp.array([0.0, 0.05, 0.1])  # uniform here, just need >1 step
+        d.context["x"] = spatial_window
+        d.context["__time__"] = t_values.reshape(T_steps, 1)
+
+        x = Variable("x", [0, 1], domain=d, axis="spatial")
+        t = Variable("__time__", [0, 1], domain=d, axis="temporal")
+
+        # u(x, t) = sin(πx) · exp(-π² t)
+        sin_pi_x = FunctionCall(jnp.sin, [Literal(float(jnp.pi)) * x], "sin")
+        exp_term = FunctionCall(jnp.exp, [Literal(-((float(jnp.pi)) ** 2)) * t], "exp")
+        u = sin_pi_x * exp_term
+
+        # Result shape: (T, N, 1). Anchor against analytic Δu = -π² u(x,t).
+        result = _eval(u.laplacian(x), {"x": spatial_window, "__time__": t_values.reshape(T_steps, 1)})
+
+        # Analytic Laplacian at each (t_idx, x): -π² sin(πx) exp(-π² t)
+        x_flat = x_values[:, 0]
+        analytic = -(jnp.pi**2) * jnp.sin(jnp.pi * x_flat[None, :]) * jnp.exp(-(jnp.pi**2) * t_values[:, None])
+
+        result_2d = jnp.squeeze(result, axis=-1)  # (T, N)
+        assert result_2d.shape == (T_steps, 5), f"Windowed Laplacian shape {result_2d.shape} != (T, N)"
+        assert jnp.allclose(result_2d, analytic, atol=1e-3), (
+            f"Windowed Δu max abs diff = {float(jnp.max(jnp.abs(result_2d - analytic))):.4e}"
+        )
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # 9. DifferentialOperators.parse_fd_scheme

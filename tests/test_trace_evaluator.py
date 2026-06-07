@@ -368,6 +368,20 @@ def _make_tiny_net():
     return net
 
 
+class _LinearWB(eqx.Module):
+    """Tiny linear model ``u(x) = w · x + b`` with two scalar parameters.
+
+    Used by ``test_grad_matches_analytic_parameter_jacobian`` below — the
+    parameter Jacobian is closed-form: ``∂u/∂w = x``, ``∂u/∂b = 1``.
+    """
+
+    w: jax.Array
+    b: jax.Array
+
+    def __call__(self, x):
+        return self.w * x + self.b
+
+
 class TestNetworkGradientEval:
     """Evaluate NetworkGradient through TraceEvaluator directly (no crux.core)."""
 
@@ -393,6 +407,42 @@ class TestNetworkGradientEval:
         trainable, _ = eqx.partition(net.module, eqx.is_array)
         P = sum(leaf.size for leaf in jax.tree_util.tree_leaves(trainable))
         assert result.shape == (N, P)
+
+    def test_grad_matches_analytic_parameter_jacobian(self):
+        """Anchor ``_eval_network_gradient`` to a closed-form parameter
+        Jacobian. For ``u(x) = w·x + b`` the parameter Jacobian is
+        ``∂u/∂w = x`` and ``∂u/∂b = 1`` at every spatial point, so the
+        flattened (N, P=2) output of ``u.grad(net)`` must equal
+        ``[[x_0, 1], [x_1, 1], ..., [x_{N-1}, 1]]``.
+
+        This is the only test that anchors the NetworkGradient values
+        against ground truth — existing tests only check shape and the
+        ``stop_gradient`` equivalence.
+        """
+        import jno.jnp_ops as jnn
+
+        w0 = jnp.array([2.5])
+        b0 = jnp.array([-0.7])
+        net = jnn.nn.wrap(_LinearWB(w=w0, b=b0))
+        x = make_var("interior")
+        u = net(x)
+        J = u.grad(net)
+
+        N = 6
+        context = {"interior": jnp.linspace(0.1, 0.9, N).reshape(N, 1)}
+        params = {net.layer_id: net.module}
+        ev = TraceEvaluator(params)
+        result = ev._dispatch(J, ev._EvalCtx(context, {}, None))
+
+        # eqx.partition with eqx.is_array preserves the field order
+        # declared on _LinearWB: w first, then b. So column 0 of J is
+        # ∂u/∂w = x, column 1 is ∂u/∂b = 1.
+        assert result.shape == (N, 2), f"expected (N=6, P=2), got {result.shape}"
+        x_col = context["interior"][:, 0]
+        assert jnp.allclose(result[:, 0], x_col, atol=1e-6), (
+            f"∂u/∂w column should be x; got {result[:, 0]}, expected {x_col}"
+        )
+        assert jnp.allclose(result[:, 1], jnp.ones(N), atol=1e-6), f"∂u/∂b column should be ones; got {result[:, 1]}"
 
     def test_stop_gradient_values_unchanged(self):
         """J and J.stop_gradient() must produce identical numerical values."""
