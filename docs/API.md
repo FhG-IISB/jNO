@@ -131,9 +131,40 @@ the adaptive loss balancers under `jno.fn.adaptive.*`.
 These provide the residuals you put inside constraints
 (`u.laplacian(x, y)`, `u.d(x)`, `(grad_u * n).integrate()`).
 
+### Scheme strings
+
+Every differential operator (`.d`, `.diff`, `.d2`, `.dd`, `.laplacian`,
+`.hessian`) accepts a `scheme=` kwarg that selects the backend:
+
+| Scheme | Backend |
+| --- | --- |
+| `"automatic_differentiation"` *(default)* | global default — see `jno.setup(diff_type=..., hessian_type=...)` |
+| `"automatic_differentiation:forward"` | first-order via `jax.jacfwd` |
+| `"automatic_differentiation:reverse"` | first-order via `jax.jacrev` |
+| `"automatic_differentiation:fwd-over-rev"` | second-order `jacfwd(jacrev(f))` *(= historical `jax.hessian`)* |
+| `"automatic_differentiation:fwd-over-fwd"` | second-order `jacfwd(jacfwd(f))` |
+| `"automatic_differentiation:rev-over-rev"` | second-order `jacrev(jacrev(f))` |
+| `"automatic_differentiation:rev-over-fwd"` | second-order `jacrev(jacfwd(f))` |
+| `"finite_difference"` | central-difference stencils on mesh (with `:lsq` / `:uniform` / `:inverse_distance` / `:cotangent` sub-schemes) |
+
+Forward-mode is typically cheaper when the input dim (≤ 3 spatial dims for
+PINNs) is ≤ the output dim; reverse-mode is cheaper for scalar losses with
+many inputs. Set the project-wide default once via `.jno.toml`:
+
+```toml
+[jno]
+diff_type    = "forward"        # default for first-order operators
+hessian_type = "fwd-over-rev"   # default for second-order operators
+```
+
+or per script via `jno.setup(__file__, diff_type="forward")`. Per-call
+`scheme=` always overrides the default.
+
 ::: jno.differential_operators.DifferentialOperators
 
 ::: jno.integration_operators.IntegrationOperators
+
+::: jno.utils.ad_mode
 
 ---
 
