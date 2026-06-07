@@ -245,6 +245,85 @@ class TestLaplacianMMS2D:
 
 
 # ────────────────────────────────────────────────────────────────────────
+# 2b. Gradient + Laplacian FD sub-schemes
+#
+# The MMS suite above already pins `area_weighted` gradient,
+# `gradient_of_gradient` Laplacian, and `cotangent` Laplacian. The remaining
+# sub-schemes exposed by ``DifferentialOperators.parse_fd_scheme`` are
+# exercised below with a single shared tolerance per operator family so a
+# silent regression in any sub-scheme parser branch surfaces.
+#
+# Observed L² rel errs at h=0.05 across L-shape + square-with-hole:
+#   gradient — uniform 0.7–0.8%, inverse_distance 0.7–0.8%, least_squares 1.3–2.0%
+#   laplacian — lsq_of_gradient 10–14%
+# ────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "build_dom,name,mesh_size",
+    [
+        (_build_lshape, "L-shape", 0.05),
+        (_build_square_with_hole, "square-with-hole", 0.05),
+    ],
+)
+@pytest.mark.parametrize("method", ["uniform", "inverse_distance", "least_squares"])
+class TestGradientSubSchemesMMS2D:
+    """Gradient via uniform / inverse_distance / least_squares.
+    Threshold 2.5% gives ~1.3× headroom on the worst (least_squares = 2.0%)."""
+
+    def test_du_dx(self, build_dom, name, mesh_size, method):
+        dom = build_dom(mesh_size)
+        mc = dom.mesh_connectivity
+        points = jnp.asarray(mc["points"])
+        triangles = jnp.asarray(mc["triangles"])
+        interior = _interior_indices_2d(mc)
+        u = _u_smooth_2d(points[:, 0], points[:, 1])
+        d = DifferentialOperators.compute_fd_gradient_2d_simple(u, points, triangles, dim=0, method=method)
+        analytic, _ = _grad_smooth_2d(points[:, 0], points[:, 1])
+        rel = _rel_l2(d[interior], analytic[interior])
+        assert rel < 0.025, f"{name}/{method}: ∂u/∂x L² rel err {rel * 100:.2f}% > 2.5%"
+
+    def test_du_dy(self, build_dom, name, mesh_size, method):
+        dom = build_dom(mesh_size)
+        mc = dom.mesh_connectivity
+        points = jnp.asarray(mc["points"])
+        triangles = jnp.asarray(mc["triangles"])
+        interior = _interior_indices_2d(mc)
+        u = _u_smooth_2d(points[:, 0], points[:, 1])
+        d = DifferentialOperators.compute_fd_gradient_2d_simple(u, points, triangles, dim=1, method=method)
+        _, analytic = _grad_smooth_2d(points[:, 0], points[:, 1])
+        rel = _rel_l2(d[interior], analytic[interior])
+        assert rel < 0.025, f"{name}/{method}: ∂u/∂y L² rel err {rel * 100:.2f}% > 2.5%"
+
+
+@pytest.mark.parametrize(
+    "build_dom,name,mesh_size",
+    [
+        (_build_lshape, "L-shape", 0.05),
+        (_build_square_with_hole, "square-with-hole", 0.05),
+    ],
+)
+class TestLaplacianSubSchemesMMS2D:
+    """Laplacian via lsq_of_gradient (least-squares of the gradient stencil).
+    Observed worst L² rel err = 14% on the square-with-hole; threshold 18%
+    gives ~1.3× headroom."""
+
+    def test_lsq_of_gradient(self, build_dom, name, mesh_size):
+        dom = build_dom(mesh_size)
+        mc = dom.mesh_connectivity
+        points = jnp.asarray(mc["points"])
+        triangles = jnp.asarray(mc["triangles"])
+        interior = _interior_indices_2d(mc)
+        u = _u_smooth_2d(points[:, 0], points[:, 1])
+        lap = DifferentialOperators.compute_fd_laplacian_2d_simple(
+            u, points, triangles, dims=(0, 1), method="lsq_of_gradient"
+        )
+        analytic = _lap_smooth_2d(points[:, 0], points[:, 1])
+        rel = _rel_l2(lap[interior], analytic[interior])
+        assert rel < 0.18, f"{name}: lsq_of_gradient L² rel err {rel * 100:.2f}% > 18%"
+
+
+# ────────────────────────────────────────────────────────────────────────
 # 3. Hessian MMS — full Hessian via FD on the L-shape
 # ────────────────────────────────────────────────────────────────────────
 
