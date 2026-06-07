@@ -200,6 +200,44 @@ class TestLaplacianConvergence:
         assert all(r > 0.6 for r in rates), f"Δu (gradient-of-gradient) rates {rates} (h={self.H_VALUES}, err={errors})"
 
 
+class TestHessianConvergence:
+    """FD Hessian rate on the hexagon.
+
+    Companion to ``TestLaplacianConvergence`` — the Hessian is also a
+    double-FD operator and shares the gradient-of-gradient stencil. Was
+    not separately rate-tested before this; a stencil regression could
+    show up in the Hessian without breaking the Laplacian (since the
+    Laplacian only uses the trace).
+
+    Observed L² rates on H[0,0] (= u_xx): ≈ 1.28, 0.81. Floor at 0.6
+    matches the Laplacian floor and gives ~1.3× headroom.
+    """
+
+    H_VALUES = [0.20, 0.10, 0.05]
+
+    def _errors(self):
+        errors = []
+        for h in self.H_VALUES:
+            dom = _hexagon(h)
+            mc = dom.mesh_connectivity
+            points = jnp.asarray(mc["points"])
+            triangles = jnp.asarray(mc["triangles"])
+            interior = _interior_indices(mc)
+
+            u = _u(points[:, 0], points[:, 1])
+            uxx_an = -(jnp.pi**2) * u
+            var_dims = [(0, 0, 0, 0), (0, 0, 1, 1), (1, 1, 0, 0), (1, 1, 1, 1)]
+            H = DifferentialOperators.compute_fd_hessian_2d_simple(u, points, triangles, var_dims)
+            diff = H[interior, 0, 0] - uxx_an[interior]
+            errors.append(float(jnp.sqrt(jnp.mean(diff**2))))
+        return errors
+
+    def test_hessian_xx_converges(self):
+        errors = self._errors()
+        rates = _empirical_order(errors, self.H_VALUES)
+        assert all(r > 0.6 for r in rates), f"H[0,0] (= u_xx) rates {rates} (h={self.H_VALUES}, err={errors})"
+
+
 # ────────────────────────────────────────────────────────────────────────
 # 3. Quadrature (nodal_volumes) convergence on a smooth integrand
 # ────────────────────────────────────────────────────────────────────────

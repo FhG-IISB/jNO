@@ -158,6 +158,57 @@ class TestGradientMMS3D:
         assert rel < 0.10, f"∂u/∂z L² rel err {rel * 100:.2f}% > 10%"
 
 
+class TestGradientSubSchemesMMS3D:
+    """3-D gradient via uniform / inverse_distance / least_squares.
+
+    Observed L² rel errs at h=0.10 (worst dim, ∂z):
+      - uniform           ≈ 8.0%
+      - inverse_distance  ≈ 7.9%
+      - least_squares     ≈ 19.7%
+
+    Threshold per-method gives ~1.3× headroom. The 2-D analogues are
+    tested in ``tests/test_operators_mms.py::TestGradientSubSchemesMMS2D``;
+    this is the symmetric 3-D coverage.
+    """
+
+    @pytest.mark.parametrize(
+        "method,tol",
+        [
+            ("uniform", 0.12),
+            ("inverse_distance", 0.12),
+            ("least_squares", 0.25),
+        ],
+    )
+    @pytest.mark.parametrize("dim,name,fn", [(0, "x", _ux), (1, "y", _uy), (2, "z", _uz)])
+    def test_3d_gradient_sub_scheme(self, cube_mesh, method, tol, dim, name, fn):
+        points, tetrahedra, interior = cube_mesh
+        u = _u(points[:, 0], points[:, 1], points[:, 2])
+        d = DifferentialOperators.compute_fd_gradient_3d_simple(u, points, tetrahedra, dim=dim, method=method)
+        analytic = fn(points[:, 0], points[:, 1], points[:, 2])
+        rel = _rel_l2(d[interior], analytic[interior])
+        assert rel < tol, f"3-D {method} ∂u/∂{name}: L² rel err {rel * 100:.2f}% > {tol * 100:.1f}%"
+
+
+class TestLaplacianSubSchemesMMS3D:
+    """3-D Laplacian via ``lsq_of_gradient``.
+
+    Observed L² rel err at h=0.10 ≈ 34%; threshold 45% gives ~1.3× headroom.
+    Considerably noisier than the gradient-of-gradient 3-D Laplacian
+    (16.9% on the same mesh) — the LSQ stencil weights are less regular
+    on tetrahedral meshes near boundary faces.
+    """
+
+    def test_lsq_of_gradient_3d(self, cube_mesh):
+        points, tetrahedra, interior = cube_mesh
+        u = _u(points[:, 0], points[:, 1], points[:, 2])
+        lap = DifferentialOperators.compute_fd_laplacian_3d_simple(
+            u, points, tetrahedra, dims=(0, 1, 2), method="lsq_of_gradient"
+        )
+        analytic = _laplacian(points[:, 0], points[:, 1], points[:, 2])
+        rel = _rel_l2(lap[interior], analytic[interior])
+        assert rel < 0.45, f"3-D lsq_of_gradient Δu L² rel err {rel * 100:.2f}% > 45%"
+
+
 # ────────────────────────────────────────────────────────────────────────
 # 2. Laplacian — gradient-of-gradient
 # ────────────────────────────────────────────────────────────────────────
