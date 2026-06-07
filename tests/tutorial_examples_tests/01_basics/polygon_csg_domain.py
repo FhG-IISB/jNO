@@ -1,6 +1,6 @@
 """Tutorial: lazy polygon CSG domains.
 
-This example uses the Shapely-backed ``jno.PolygonDomain`` class to build a
+This example uses the Shapely-backed ``jno.domain.csg`` class to build a
 2D computational domain from ordered polygon vertices. Unlike the historical
 mesh-backed ``jno.domain.polygon(...)`` constructor, ``PolygonDomain`` keeps the
 geometry analytic and samples points only when ``variable(..., sample=...)`` is
@@ -26,9 +26,9 @@ BOUNDARY_SAMPLES = 96
 EDGE_SAMPLES = 64
 
 
-def build_polygon_csg_domain() -> jno.PolygonDomain:
+def build_polygon_csg_domain() -> jno.domain.csg:
     """Build a named CSG geometry from ordered vertex loops."""
-    chamber = jno.PolygonDomain(
+    chamber = jno.domain.csg(
         [
             (0.0, 0.0),
             (2.0, 0.0),
@@ -37,7 +37,7 @@ def build_polygon_csg_domain() -> jno.PolygonDomain:
         ],
         name="chamber",
     )
-    inlet = jno.PolygonDomain(
+    inlet = jno.domain.csg(
         [
             (2.0, 0.35),
             (2.5, 0.35),
@@ -46,7 +46,7 @@ def build_polygon_csg_domain() -> jno.PolygonDomain:
         ],
         name="inlet",
     )
-    obstacle = jno.PolygonDomain(
+    obstacle = jno.domain.csg(
         [
             (0.8, 0.35),
             (1.2, 0.35),

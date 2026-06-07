@@ -13,7 +13,7 @@ from . import jnp_ops as np
 from .architectures.models import nn, parameter
 from .core import core
 from .differential_operators import DifferentialOperators
-from .domain import PolygonDomain, domain
+from .domain import domain
 from .integration_operators import IntegrationOperators
 from .noise import noise
 from .trace import (
@@ -87,7 +87,6 @@ __all__ = [
     "sampler",
     "domain",
     "do",
-    "PolygonDomain",
     "Model",
     "Variable",
     "Placeholder",
