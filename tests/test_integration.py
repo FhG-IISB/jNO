@@ -878,6 +878,77 @@ class TestIntegralTime:
         # Spatial integral of 1 over [0,1] ≈ 1.0; time integral of 1 over [0,1] = 1.0
         assert jnp.allclose(val, 1.0, atol=5e-2), f"∫∫ 1 dx dt expected ≈1.0, got {float(val):.6f}"
 
+    def test_integral_time_non_uniform_grid_linear(self):
+        """``∫₀¹ t dt = 0.5`` on the deliberately non-uniform grid
+        ``[0.0, 0.1, 0.4, 1.0]``.
+
+        Trapezoidal weights on this grid sum to::
+
+            (0.0+0.1)/2·0.1 + (0.1+0.4)/2·0.3 + (0.4+1.0)/2·0.6
+            = 0.005 + 0.075 + 0.42 = 0.5
+
+        which is *exact* because the trapezoidal rule is order-2 (exact on
+        linear integrands). Anchors ``_eval_integral_time`` at
+        ``jno/trace_evaluator.py:1570`` for non-uniform time spacing — the
+        evaluator already uses ``jnp.diff(t_vals)`` weights so the gap was
+        test coverage, not capability.
+
+        The standard domain API (``time=(start, end, n_steps)``) only
+        produces uniform grids, so we bypass it and call
+        ``TraceEvaluator.evaluate`` directly with a hand-crafted context
+        whose ``__time_window__`` is the non-uniform array.
+        """
+        from jno.trace import Variable
+        from jno.trace_evaluator import TraceEvaluator
+        from tests.conftest import MockDomain
+
+        d = MockDomain(tags=["x"], dim=1)
+        d.context["__time__"] = jnp.zeros((1, 1))
+        _x = Variable("x", [0, 1], domain=d, axis="spatial")
+        t = Variable("__time__", [0, 1], domain=d, axis="temporal")
+
+        expr = t.integrate(t)  # IntegralTime node
+
+        t_vals = jnp.array([0.0, 0.1, 0.4, 1.0])
+        ctx = {
+            "x": jnp.zeros((1, 1)),
+            "__time__": jnp.zeros((1,)),
+            "__time_window__": t_vals.reshape(-1, 1),
+        }
+
+        ev = TraceEvaluator({})
+        result = float(jnp.squeeze(ev.evaluate(expr, ctx, {}, key=jax.random.PRNGKey(0))))
+        assert abs(result - 0.5) < 1e-6, f"non-uniform ∫t dt = {result:.8f}, expected 0.5 (trapezoidal exact on linear)"
+
+    def test_integral_time_non_uniform_grid_constant(self):
+        """``∫₀¹ 1 dt = 1`` on the non-uniform grid ``[0.0, 0.1, 0.4, 1.0]``.
+
+        Trapezoidal weights sum to the total span (1.0) regardless of grid
+        uniformity — a sanity guard that ``jnp.diff`` weighting is correct.
+        """
+        from jno.trace import Literal, Variable
+        from jno.trace_evaluator import TraceEvaluator
+        from tests.conftest import MockDomain
+
+        d = MockDomain(tags=["x"], dim=1)
+        d.context["__time__"] = jnp.zeros((1, 1))
+        _x = Variable("x", [0, 1], domain=d, axis="spatial")
+        t = Variable("__time__", [0, 1], domain=d, axis="temporal")
+
+        # Constant 1 expressed with t so the IntegralTime node sees a target.
+        expr = (t * Literal(0.0) + Literal(1.0)).integrate(t)
+
+        t_vals = jnp.array([0.0, 0.1, 0.4, 1.0])
+        ctx = {
+            "x": jnp.zeros((1, 1)),
+            "__time__": jnp.zeros((1,)),
+            "__time_window__": t_vals.reshape(-1, 1),
+        }
+
+        ev = TraceEvaluator({})
+        result = float(jnp.squeeze(ev.evaluate(expr, ctx, {}, key=jax.random.PRNGKey(0))))
+        assert abs(result - 1.0) < 1e-6, f"non-uniform ∫1 dt = {result:.8f}, expected 1.0"
+
 
 class TestIntegralTimeGuard:
     """Guard: min_consecutive < 2 with IntegralTime in graph raises ValueError."""

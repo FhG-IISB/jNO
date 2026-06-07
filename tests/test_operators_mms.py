@@ -428,6 +428,38 @@ class TestIntegrationMMS2D:
         moment_x = float(_eval(x.integrate(), dom))
         assert moment_x == pytest.approx(2.5, rel=5e-3), f"∫x dA = {moment_x:.4f}"
 
+    def test_chamber_obstacle_named_boundary_flux(self):
+        """``∮_∂obstacle (x·nx + y·ny) dS`` on the chamber-with-obstacle.
+
+        Anchors the named-boundary-tag code path. The ``boundary_obstacle``
+        tag is the full perimeter of the rectangular hole (centred at
+        (1.0, 0.5), size 0.4 × 0.3). By the 2-D divergence theorem applied
+        to the obstacle's interior with F = (x, y):
+
+            ∮_∂obstacle F·n dS = ∫_obstacle ∇·F dV = 2 · (0.4 · 0.3) = 0.24
+
+        Sign convention: ``dom.variable("boundary_obstacle", normals=True)``
+        returns the normal that points *outward from the fluid domain* —
+        which is *inward to the obstacle*. The boundary integral with that
+        normal therefore comes out **negative**, magnitude ≈ 0.24.
+
+        Observed at h=0.03: |flux| ≈ 0.265 (10.6% over the analytic 0.24);
+        threshold 15% gives ~1.4× headroom on the boundary-quadrature
+        error on a coarse rectangular boundary.
+        """
+        dom = _build_chamber_with_obstacle(mesh_size=0.03)
+        x_b, y_b, _, nx, ny = dom.variable("boundary_obstacle", normals=True)
+
+        # Perimeter is exact (constant integrand on `nodal_ds`).
+        perimeter = float(_eval((x_b * 0.0 + 1.0).integrate(), dom))
+        assert perimeter == pytest.approx(1.4, rel=1e-5), f"obstacle perimeter = {perimeter:.4f}, expected 2·(0.4+0.3)=1.4"
+
+        flux = float(_eval((x_b * nx + y_b * ny).integrate(), dom))
+        assert flux < 0, f"obstacle flux should be negative (fluid-outward normal); got {flux:.4f}"
+        assert abs(flux) == pytest.approx(0.24, rel=0.15), (
+            f"|∮_∂obstacle F·n dS| = {abs(flux):.4f}, expected 2·(0.4·0.3)=0.24"
+        )
+
     def test_lshape_divergence_theorem_2d(self):
         """∮_∂L (x nₓ + y nᵧ) dS = 2 ∫_L 1 dA = 6 — divergence theorem in 2-D.
 
@@ -493,6 +525,63 @@ class TestGreensFirstIdentity:
         )
 
 
+class TestGreensSecondIdentity:
+    """``∫_Ω (u·Δv − v·Δu) dV = ∮_∂Ω (u·(∇v·n) − v·(∇u·n)) dS``
+
+    Companion to ``TestGreensFirstIdentity`` — the second identity is a
+    different coupling of gradient + Laplacian + volume + surface, and
+    catches different sign / asymmetry bugs.
+
+    Choose ``u(x, y) = x² + y²`` and ``v(x, y) = x³ + y³``. Then:
+      Δu = 4,  Δv = 6x + 6y
+      ∇u = (2x, 2y),  ∇v = (3x², 3y²)
+
+    Volume integrand expanded:
+      (x² + y²)·(6x + 6y) − (x³ + y³)·4
+      = 6x³ + 6x²y + 6xy² + 6y³ − 4x³ − 4y³
+      = 2x³ + 2y³ + 6x²y + 6xy²
+
+    On the L-shape (= [0,2]×[0,1] ∪ [0,1]×[1,2]):
+      - Rectangle 1 ([0,2]×[0,1]): ∫ = 21
+      - Rectangle 2 ([0,1]×[1,2]): ∫ = 18
+      - Total volume side = 39 (closed-form reference, used as a strong-form check)
+
+    Identity assertion: ``LHS ≈ RHS`` to within 12% relative — same
+    boundary-quadrature-dominated tolerance as Green's first.
+    """
+
+    def test_identity_holds_on_lshape(self):
+        dom = _build_lshape(mesh_size=0.04)
+
+        # Volume side: u·Δv − v·Δu via .laplacian() (default AD scheme).
+        x_v, y_v, _ = dom.variable("interior")
+        u_v = x_v**2 + y_v**2
+        v_v = x_v**3 + y_v**3
+        lap_u = u_v.laplacian(x_v, y_v)
+        lap_v = v_v.laplacian(x_v, y_v)
+        volume_integrand = u_v * lap_v - v_v * lap_u
+        lhs = float(_eval(volume_integrand.integrate(), dom))
+
+        # Surface side: ∮ (u·(∇v·n) − v·(∇u·n)) dS
+        x_b, y_b, _, nx, ny = dom.variable("boundary", normals=True)
+        u_b = x_b**2 + y_b**2
+        v_b = x_b**3 + y_b**3
+        # ∇u·n = 2x·nx + 2y·ny;  ∇v·n = 3x²·nx + 3y²·ny
+        grad_u_dot_n = 2.0 * x_b * nx + 2.0 * y_b * ny
+        grad_v_dot_n = 3.0 * x_b**2 * nx + 3.0 * y_b**2 * ny
+        rhs = float(_eval((u_b * grad_v_dot_n - v_b * grad_u_dot_n).integrate(), dom))
+
+        # Strong-form check: volume side should match the analytic 39.
+        # Quadrature is O(h²) on smooth integrands → expect tight match.
+        assert lhs == pytest.approx(39.0, rel=0.05), f"Green's-2 volume side = {lhs:.4f}, expected analytic 39"
+
+        # Identity: LHS == RHS within boundary-quadrature tolerance.
+        scale = max(abs(lhs), abs(rhs), 1.0)
+        assert abs(lhs - rhs) / scale < 0.12, (
+            f"Green's second identity: LHS={lhs:.4f}, RHS={rhs:.4f}, rel diff = {abs(lhs - rhs) / scale * 100:.2f}%"
+        )
+
+
 # ────────────────────────────────────────────────────────────────────────
 # 6. 3-D divergence theorem on a unit cube (tetrahedral mesh)
 # ────────────────────────────────────────────────────────────────────────
@@ -522,3 +611,34 @@ class TestDivergenceTheorem3D:
         # Observed err essentially 0 at h=0.10 (constant integrand is exact
         # for nodal_volumes); threshold 2% is regression guard.
         assert volume == pytest.approx(1.0, rel=0.02), f"3-D volume = {volume:.4f}, expected 1.0"
+
+    def test_unit_cube_x_squared_volume(self):
+        """``∫_cube x² dV = 1/3`` — non-constant integrand on 3-D
+        ``nodal_volumes``. Exercises the volume-quadrature weights against
+        a smooth polynomial integrand (was previously only ``∫1 dV``)."""
+        dom = _build_cube_3d(mesh_size=0.10)
+        x, _y, _z, _ = dom.variable("interior")
+        result = float(_eval((x * x).integrate(), dom))
+        # Quadrature on a smooth degree-2 integrand → O(h²); tolerance 5%
+        # gives ~3× headroom on the typical 1–2% rel err.
+        assert result == pytest.approx(1.0 / 3.0, rel=0.05), f"∫_cube x² dV = {result:.4f}, expected 1/3 ≈ {1 / 3:.4f}"
+
+    def test_unit_cube_x_squared_boundary(self):
+        """``∮_cube x² dS = 7/3`` — non-constant integrand on 3-D ``nodal_ds``.
+
+        Face-by-face decomposition on the unit cube:
+          - z=0, z=1 faces (integrand x², area element dx·dy): each
+            ``∫₀¹∫₀¹ x² dx dy = 1/3`` → contributes 2/3.
+          - y=0, y=1 faces (integrand x², area element dx·dz): each
+            ``∫₀¹∫₀¹ x² dx dz = 1/3`` → contributes 2/3.
+          - x=0 face: integrand = 0 → contributes 0.
+          - x=1 face: integrand = 1 → contributes 1.
+        Total = 2/3 + 2/3 + 0 + 1 = **7/3**.
+        """
+        dom = _build_cube_3d(mesh_size=0.10)
+        x_b, _y_b, _z_b, _t, _nx, _ny, _nz = dom.variable("boundary", normals=True)
+        result = float(_eval((x_b * x_b).integrate(), dom))
+        # 3-D boundary quadrature on unstructured tet meshes is noisier
+        # than volume quadrature; threshold 10% matches the existing
+        # divergence-theorem flux tolerance.
+        assert result == pytest.approx(7.0 / 3.0, rel=0.10), f"∮_cube x² dS = {result:.4f}, expected 7/3 ≈ {7 / 3:.4f}"

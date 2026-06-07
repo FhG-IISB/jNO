@@ -215,6 +215,48 @@ def _build_context(domain):
     return ctx
 
 
+class TestBoundaryQuadratureConvergence:
+    """Boundary quadrature on the regular hexagon.
+
+    ``nodal_ds`` is a nodal assembly of the 1-D trapezoidal rule along
+    boundary edges → theoretically O(h²) on smooth boundary integrands.
+    Companion to ``TestQuadratureConvergence`` (volume); previously only
+    volume quadrature had a convergence-rate test.
+
+    Closed-form ``∮_∂hex x² dS = 5/2`` derived by 6-fold rotational
+    symmetry:
+
+        ∮ x² dS = (1/2) ∮ (x² + y²) dS
+
+    (because Σ_{k=0..5} cos²(kπ/3) = Σ_{k=0..5} sin²(kπ/3) = 3 and the
+    cross terms ``Σ cos·sin`` cancel). On one unit-length side from
+    (1, 0) to (0.5, √3/2): ``x² + y² = 1 - t + t²`` (t ∈ [0,1]), and
+    ``∫₀¹ (1-t+t²) dt = 5/6``. Six sides → ``∮(x²+y²) dS = 5``, so
+    ``∮x² dS = 5/2``.
+
+    Observed rates on the hexagon: ≈ 2.00, 2.00 — exactly O(h²).
+    Floor at 1.8 gives 10% headroom.
+    """
+
+    H_VALUES = [0.20, 0.10, 0.05]
+    EXACT = 5.0 / 2.0
+
+    def _err(self, h: float) -> float:
+        dom = _hexagon(h)
+        x_b, _y_b, _t = dom.variable("boundary")
+        expr = (x_b * x_b).integrate()
+        ctx = _build_context(dom)
+        ev = TraceEvaluator(params={})
+        return abs(float(ev.evaluate(expr, context=ctx, var_bindings={})) - self.EXACT)
+
+    def test_boundary_quadrature_converges(self):
+        errors = [self._err(h) for h in self.H_VALUES]
+        rates = _empirical_order(errors, self.H_VALUES)
+        assert all(r > 1.8 for r in rates), (
+            f"boundary quadrature rates {rates} (h={self.H_VALUES}, err={errors}, exact={self.EXACT:.6f}) — expected ≥ O(h²)."
+        )
+
+
 class TestQuadratureConvergence:
     """∫_hex (x² + y²) dV on the regular hexagon (radius 1).
 
