@@ -288,6 +288,50 @@ def test_per_region_mesh_size_refines_locally():
     assert _eval_area(refined) == pytest.approx(CHAMBER_AREA - OBSTACLE_AREA, rel=1e-3)
 
 
+def test_interpolate_false_delivers_uniform_inner_refinement():
+    """``interpolate=False`` enforces ``region_mesh_sizes[name]`` uniformly
+    inside the region's bounding box via a gmsh Box size field, instead of
+    only setting the size on boundary vertices and letting gmsh smoothly
+    interpolate (and undershoot) through the interior.
+
+    Concrete failure mode this guards: with the default ``interpolate=True``,
+    a disk + 0.2×0.2 inner rectangle at ``mesh_size=0.10`` and
+    ``region_mesh_sizes={"inner": 0.005}`` produces only ~10 inner nodes
+    instead of the requested ~1600 — gmsh smoothly transitions size from
+    boundary to interior. ``interpolate=False`` should fix this to within
+    ~2× of the expected count.
+    """
+    n_disk = 64
+    theta = np.linspace(0, 2 * np.pi, n_disk, endpoint=False)
+    disk_verts = [(float(np.cos(t)), float(np.sin(t))) for t in theta]
+    inner_w = 0.20
+    rect_verts = [
+        (-inner_w / 2, -inner_w / 2),
+        (inner_w / 2, -inner_w / 2),
+        (inner_w / 2, inner_w / 2),
+        (-inner_w / 2, inner_w / 2),
+    ]
+
+    np.random.seed(0)
+    dom_interp = jno.domain.csg.from_polygons({"outer": disk_verts, "inner": rect_verts})
+    dom_interp.build_mesh(mesh_size=0.10, region_mesh_sizes={"inner": 0.02}, interpolate=True)
+    n_inner_interp = len(dom_interp._mesh_pool.get("interior_inner", []))
+
+    np.random.seed(0)
+    dom_uniform = jno.domain.csg.from_polygons({"outer": disk_verts, "inner": rect_verts})
+    dom_uniform.build_mesh(mesh_size=0.10, region_mesh_sizes={"inner": 0.02}, interpolate=False)
+    n_inner_uniform = len(dom_uniform._mesh_pool.get("interior_inner", []))
+
+    # interpolate=False should produce many more inner nodes than the
+    # smooth-interpolation default. At inner_h=0.02 on a 0.2×0.2 box we
+    # expect ~100 inner nodes; the default delivers ~10. Require at least
+    # a 4× improvement to give safety margin against pygmsh version drift.
+    assert n_inner_uniform >= 4 * n_inner_interp, (
+        f"interpolate=False expected to deliver ≥4× more inner nodes than the smooth-interpolation default; "
+        f"got interpolate=True={n_inner_interp}, interpolate=False={n_inner_uniform}"
+    )
+
+
 def test_region_mesh_sizes_validation_errors():
     np.random.seed(16)
     dom = jno.domain.csg(CHAMBER, name="chamber") - jno.domain.csg(OBSTACLE, name="obstacle")

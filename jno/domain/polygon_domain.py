@@ -1321,6 +1321,7 @@ class PolygonDomain(domain):
         *,
         algorithm: int = 6,
         region_mesh_sizes: Optional[Mapping[str, float]] = None,
+        interpolate: bool = True,
     ) -> "PolygonDomain":
         """Generate a gmsh mesh from the active Shapely CSG geometry.
 
@@ -1338,11 +1339,25 @@ class PolygonDomain(domain):
             region_mesh_sizes: Per-source-region mesh size overrides keyed by
                 the names used to construct the source regions (e.g. the
                 ``name`` argument of ``jno.domain.csg`` or keys of
-                ``from_polygons`` / ``from_regions``). For each gmsh point on a
-                source-region boundary, the per-region size wins; if a point
-                lies on several overridden region boundaries, the smallest size
-                is used. Interior mesh sizes propagate from the boundary via
-                gmsh's standard size field.
+                ``from_polygons`` / ``from_regions``).
+            interpolate: Controls how ``region_mesh_sizes`` is enforced inside
+                each region (default ``True``).
+
+                * ``True`` (smooth interpolation, original behaviour) — the
+                  per-region size is set only on gmsh **vertex points** that
+                  lie on the region boundary; gmsh then smoothly interpolates
+                  the size field through the domain. For small or irregular
+                  regions the interior can end up substantially coarser than
+                  the requested ``region_mesh_sizes[name]``.
+                * ``False`` (uniform refinement) — a per-region gmsh ``Box``
+                  size field enforces the requested ``h_inner`` uniformly
+                  inside each region's axis-aligned bounding box. This
+                  produces dense homogeneous refinement (matches the
+                  requested density to within a few percent) at the cost of
+                  slight over-refinement for non-rectangular polygons (the
+                  Box field covers the bounding box, not the polygon shape).
+                  Use this when you actually need many FD-stencil nodes
+                  inside a small region.
 
         Re-calling ``build_mesh`` re-meshes from scratch and clears the integral
         weight cache.
@@ -1433,6 +1448,52 @@ class PolygonDomain(domain):
                 surfaces_per_part.append((part, surface))
 
             self._emit_polygon_tag_physicals(geo, surfaces_per_part, lines_with_midpoints)
+
+            # Uniform-refinement mode: enforce ``region_mesh_sizes[name]``
+            # everywhere inside each region's bounding box via a gmsh ``Box``
+            # size field, combined with the ambient ``mesh_size`` via a
+            # ``Min`` field. Without this, gmsh interpolates the size field
+            # from boundary vertices and the interior of small regions ends
+            # up much coarser than requested.
+            if not interpolate and size_overrides:
+                import gmsh
+
+                # Disable the point-based and boundary-extension size
+                # contributions so the Box field below is the authoritative
+                # source of mesh density. Otherwise gmsh blends our field
+                # with the per-vertex sizes set via ``geo.add_point(mesh_size=…)``
+                # and the inner region collapses back to a coarser mesh.
+                gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
+                gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
+                gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
+                # Don't let gmsh's lower clamp swallow the requested fine
+                # size. The smallest requested override sets the floor.
+                min_requested = min(s for _, s in size_overrides)
+                gmsh.option.setNumber("Mesh.MeshSizeMin", float(min_requested * 0.5))
+
+                box_field_tags: List[int] = []
+                for boundary, region_size in size_overrides:
+                    xmin, ymin, xmax, ymax = boundary.bounds
+                    tag = gmsh.model.mesh.field.add("Box")
+                    gmsh.model.mesh.field.setNumber(tag, "VIn", float(region_size))
+                    gmsh.model.mesh.field.setNumber(tag, "VOut", float(mesh_size))
+                    gmsh.model.mesh.field.setNumber(tag, "XMin", float(xmin))
+                    gmsh.model.mesh.field.setNumber(tag, "XMax", float(xmax))
+                    gmsh.model.mesh.field.setNumber(tag, "YMin", float(ymin))
+                    gmsh.model.mesh.field.setNumber(tag, "YMax", float(ymax))
+                    # Transition band: scale with the requested size ratio
+                    # so gmsh has room to grade from VIn → VOut at its
+                    # default ~1.1-per-cell limit. ``n_cells * region_size``
+                    # gives just enough room without the outer ring
+                    # over-refining unnecessarily.
+                    ratio = float(mesh_size) / float(region_size) if region_size > 0 else 1.0
+                    n_cells = max(3.0, np.log(max(ratio, 1.001)) / np.log(1.1))
+                    gmsh.model.mesh.field.setNumber(tag, "Thickness", float(n_cells * region_size))
+                    box_field_tags.append(tag)
+                if box_field_tags:
+                    min_tag = gmsh.model.mesh.field.add("Min")
+                    gmsh.model.mesh.field.setNumbers(min_tag, "FieldsList", box_field_tags)
+                    gmsh.model.mesh.field.setAsBackgroundMesh(min_tag)
 
             mesh = geo.generate_mesh(dim=2, algorithm=algorithm, verbose=False)
 
