@@ -1102,13 +1102,10 @@ class TraceEvaluator:
                     out = evaluator_self._dispatch(base_target, new_ctx)
                     return _scalar_from_point_output(out)
 
-                if temporal_derivative_order == 1:
-                    return jax.grad(u_of_t_scalar)(time_scalar0)
-
-                if temporal_derivative_order == 2:
-                    return jax.grad(jax.grad(u_of_t_scalar))(time_scalar0)
-
-                raise NotImplementedError(f"Temporal AD derivative order {temporal_derivative_order} is not supported.")
+                fn = u_of_t_scalar
+                for _ in range(temporal_derivative_order):
+                    fn = jax.grad(fn)
+                return fn(time_scalar0)
 
             result = jax.vmap(temporal_derivative_single_point)(jnp.arange(N))
             return result[:, jnp.newaxis]
@@ -1249,6 +1246,65 @@ class TraceEvaluator:
                     return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
 
                 return jax.vmap(jac_single)(jnp.arange(points.shape[0]))
+
+        elif scheme.startswith("spectral_fourier"):
+            from .differential_operators import SpectralDifferentiators as _SD
+
+            domain = bound_var._domain
+            mesh_points = jnp.array(domain.mesh_connectivity["points"])
+            mesh_dim = domain.mesh_connectivity["dimension"]
+
+            def _u_at_pts(pts):
+                ctx_dict = {**ctx.context, tag: pts}
+                new_ctx = self._EvalCtx(ctx_dict, ctx.var_bindings, ctx.key, active_region=ctx.active_region)
+                return self._dispatch(target, new_ctx)
+
+            u_full = _u_at_pts(mesh_points)
+            u_full_1d = u_full.squeeze(-1) if (u_full.ndim > 1 and u_full.shape[-1] == 1) else u_full
+            if u_full_1d.ndim > 1:
+                u_full_1d = u_full_1d.ravel()
+
+            grid_shape = getattr(domain, "_grid_shape", None)
+            jac_components = []
+            for _i, vi_dim in var_dims:
+                if mesh_dim == 1:
+                    grad_full = _SD.fourier_derivative_1d(u_full_1d, mesh_points, order=1)
+                elif mesh_dim == 2 and grid_shape is not None:
+                    grad_full = _SD.fourier_derivative_2d(u_full_1d, mesh_points, grid_shape, vi_dim, order=1)
+                else:
+                    raise ValueError(
+                        "scheme='spectral_fourier' requires a structured grid domain "
+                        "(domain.equi_distant_rect or domain.poseidon). "
+                        "For unstructured meshes use scheme='finite_difference'."
+                    )
+                jac_components.append(grad_full)
+
+            if n_vars == 1:
+                result = self._map_mesh_to_sampled(mesh_points, points, jac_components[0])
+                return result[:, jnp.newaxis] if result.ndim == 1 else result
+            jac_full = jnp.stack(jac_components, axis=-1)
+            return self._map_mesh_to_sampled(mesh_points, points, jac_full)
+
+        elif scheme.startswith("spectral_chebyshev"):
+            from .differential_operators import SpectralDifferentiators as _SD
+
+            domain = bound_var._domain
+            mesh_points = jnp.array(domain.mesh_connectivity["points"])
+            mesh_dim = domain.mesh_connectivity["dimension"]
+            if mesh_dim != 1:
+                raise ValueError("scheme='spectral_chebyshev' is currently supported for 1-D domains only.")
+
+            def _u_at_pts_cheb(pts):
+                ctx_dict = {**ctx.context, tag: pts}
+                new_ctx = self._EvalCtx(ctx_dict, ctx.var_bindings, ctx.key, active_region=ctx.active_region)
+                return self._dispatch(target, new_ctx)
+
+            u_full = _u_at_pts_cheb(mesh_points)
+            u_full_1d = u_full.squeeze(-1) if (u_full.ndim > 1 and u_full.shape[-1] == 1) else u_full
+
+            grad_full = _SD.chebyshev_derivative_1d(u_full_1d, mesh_points, order=1)
+            result = self._map_mesh_to_sampled(mesh_points, points, grad_full)
+            return result[:, jnp.newaxis] if result.ndim == 1 else result
 
     def _eval_hessian(self, expr, ctx):
         """Evaluate Hessian (second-order derivatives).
@@ -1449,6 +1505,62 @@ class TraceEvaluator:
                     return result
 
                 return jax.vmap(hess_single)(points)
+
+        elif scheme.startswith("spectral_fourier"):
+            from .differential_operators import SpectralDifferentiators as _SD
+
+            domain = bound_var._domain
+            mesh_points = jnp.array(domain.mesh_connectivity["points"])
+            mesh_dim = domain.mesh_connectivity["dimension"]
+            grid_shape = getattr(domain, "_grid_shape", None)
+
+            def _u_at_pts_f(pts):
+                ctx_dict = {**ctx.context, tag: pts}
+                new_ctx = self._EvalCtx(ctx_dict, ctx.var_bindings, ctx.key, active_region=ctx.active_region)
+                return self._dispatch(target, new_ctx)
+
+            u_full = _u_at_pts_f(mesh_points)
+            u_full_1d = u_full.squeeze(-1) if (u_full.ndim > 1 and u_full.shape[-1] == 1) else u_full
+            if u_full_1d.ndim > 1:
+                u_full_1d = u_full_1d.ravel()
+
+            if compute_trace:
+                # Laplacian = sum of second derivatives in each spatial dim
+                lap_full = jnp.zeros_like(u_full_1d)
+                for d in dims:
+                    if mesh_dim == 1:
+                        lap_full = lap_full + _SD.fourier_derivative_1d(u_full_1d, mesh_points, order=2)
+                    elif mesh_dim == 2 and grid_shape is not None:
+                        lap_full = lap_full + _SD.fourier_derivative_2d(u_full_1d, mesh_points, grid_shape, d, order=2)
+                    else:
+                        raise ValueError(
+                            "scheme='spectral_fourier' requires a structured grid domain "
+                            "(domain.equi_distant_rect or domain.poseidon)."
+                        )
+                result = self._map_mesh_to_sampled(mesh_points, points, lap_full)
+                return result[:, jnp.newaxis] if result.ndim == 1 else result
+
+        elif scheme.startswith("spectral_chebyshev"):
+            from .differential_operators import SpectralDifferentiators as _SD
+
+            domain = bound_var._domain
+            mesh_points = jnp.array(domain.mesh_connectivity["points"])
+            mesh_dim = domain.mesh_connectivity["dimension"]
+            if mesh_dim != 1:
+                raise ValueError("scheme='spectral_chebyshev' is currently supported for 1-D domains only.")
+
+            def _u_at_pts_c(pts):
+                ctx_dict = {**ctx.context, tag: pts}
+                new_ctx = self._EvalCtx(ctx_dict, ctx.var_bindings, ctx.key, active_region=ctx.active_region)
+                return self._dispatch(target, new_ctx)
+
+            u_full = _u_at_pts_c(mesh_points)
+            u_full_1d = u_full.squeeze(-1) if (u_full.ndim > 1 and u_full.shape[-1] == 1) else u_full
+
+            if compute_trace:
+                lap_full = _SD.chebyshev_derivative_1d(u_full_1d, mesh_points, order=2)
+                result = self._map_mesh_to_sampled(mesh_points, points, lap_full)
+                return result[:, jnp.newaxis] if result.ndim == 1 else result
 
     def _eval_integral(self, expr: "Integral", ctx):
         """Evaluate a mesh-based integral reduction.

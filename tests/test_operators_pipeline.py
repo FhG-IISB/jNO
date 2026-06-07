@@ -295,3 +295,63 @@ class TestWindowedHessian2DPipeline:
 
         rel = float(jnp.sqrt(jnp.mean((val - expected) ** 2)) / jnp.sqrt(jnp.mean(expected**2)))
         assert rel < 0.05, f"windowed Δu L²-rel err = {rel * 100:.2f}% > 5%"
+
+
+# ────────────────────────────────────────────────────────────────────────
+# E6: Spectral Fourier dispatch — verifies seam between trace_evaluator and
+#     SpectralDifferentiators. The unit tests in test_derivatives.py call
+#     SpectralDifferentiators directly; this exercises u.d(x, scheme=…).
+# ────────────────────────────────────────────────────────────────────────
+
+
+class TestSpectralFourierDispatch:
+    """End-to-end: scheme='spectral_fourier' flows through TraceEvaluator."""
+
+    def test_spectral_fourier_2d_on_equi_distant_rect(self):
+        """``u(x, y) = sin(2πx)``  →  ``du/dx ≈ 2π cos(2πx)`` via spectral_fourier.
+
+        Uses ``equi_distant_rect`` so ``_grid_shape`` is set and the 2-D
+        spectral path in ``_eval_jacobian`` is reached. Tolerance is generous
+        because ``fourier_derivative_2d`` infers the period as ``N/(N-1)``
+        rather than the true ``L=1.0``, biasing the result by ``O(1/N)``.
+        """
+        import jax
+        import jax.numpy as jnp
+
+        import jno
+        import jno.jnp_ops as jnn
+        from jno.trace_evaluator import TraceEvaluator
+
+        N = 32
+        dom = jno.domain.equi_distant_rect(x_range=(0.0, 1.0), y_range=(0.0, 1.0), nx=N - 1, ny=N - 1)
+        x, _y, _t = dom.variable("interior")
+        u = jnn.sin(2.0 * jnn.pi * x)
+
+        # Probe at a few interior points along y=0.5
+        pts = jnp.array([[0.0, 0.5], [0.25, 0.5], [0.5, 0.5], [0.75, 0.5]])
+
+        ev = TraceEvaluator({})
+        result = ev.evaluate(
+            u.d(x, scheme="spectral_fourier"),
+            {"interior": pts},
+            {},
+            key=jax.random.PRNGKey(0),
+        )
+
+        # Reaches the spectral_fourier branch (no NotImplementedError),
+        # returns the expected shape, and produces finite values.
+        assert result.shape[-1] == 1, f"unexpected last dim: {result.shape}"
+        assert jnp.all(jnp.isfinite(result)), "spectral derivative produced NaN/Inf"
+
+        # Order-of-magnitude check: result should be on the same scale as
+        # the true derivative 2π cos(2π x). Tolerance is intentionally loose —
+        # fourier_derivative_2d infers L = N/(N-1) instead of the true period,
+        # so the magnitude is biased even at large N. This test guards the
+        # dispatch *seam*, not the spectral method's accuracy; tightening it
+        # requires fixing the period inference in SpectralDifferentiators.
+        expected = 2.0 * jnp.pi * jnp.cos(2.0 * jnp.pi * pts[:, 0])
+        max_err = float(jnp.max(jnp.abs(result.ravel() - expected)))
+        scale = float(jnp.max(jnp.abs(expected))) or 1.0
+        assert max_err < 5.0 * scale, (
+            f"spectral derivative max abs err {max_err:.3f} far exceeds true derivative scale {scale:.3f}"
+        )

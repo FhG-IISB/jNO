@@ -1083,3 +1083,107 @@ class TestFEMGuardOnStackedDomains:
         dom += 1 * jno.domain.disk(mesh_size=0.3)
         with pytest.raises(ValueError, match="not supported on stacked domains"):
             dom.init_fem()
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Temporal AD order > 2
+# ───────────────────────────────────────────────────────────────────────────────
+
+
+class TestTemporalDerivativeOrder3:
+    """Third-order temporal derivative — exercises the jax.grad loop fix."""
+
+    def test_third_order_temporal_derivative(self):
+        """u(t) = sin(2πt)  →  d³u/dt³ = -(2π)³ cos(2πt)."""
+        from tests.conftest import MockDomain
+
+        d = MockDomain(tags=["x"], dim=1)
+        d.context["__time__"] = jnp.zeros((1, 1))
+        _x = Variable("x", [0, 1], domain=d, axis="spatial")
+        t = Variable("__time__", [0, 1], domain=d, axis="temporal")
+
+        two_pi_t = Literal(2.0 * float(jnp.pi)) * t
+        u = FunctionCall(jnp.sin, [two_pi_t], "sin")
+        pts = jnp.ones((3, 1))
+
+        t_val = 0.17
+        result = _eval(u.d(t).d(t).d(t), {"x": pts, "__time__": jnp.array([t_val])})
+        expected = -((2.0 * jnp.pi) ** 3) * jnp.cos(2.0 * jnp.pi * t_val)
+        assert jnp.allclose(result, expected, atol=1e-3), (
+            f"d³u/dt³ at t={t_val:.2f}: got {float(result[0, 0]):.5f}, expected {float(expected):.5f}"
+        )
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# SpectralDifferentiators unit tests
+# ───────────────────────────────────────────────────────────────────────────────
+
+
+class TestSpectralDifferentiators:
+    """Verify SpectralDifferentiators on analytic functions."""
+
+    def test_fourier_derivative_1d_sine(self):
+        """du/dx of sin(2πx) on [0, 1) = 2π cos(2πx) — spectral accuracy."""
+        from jno.differential_operators import SpectralDifferentiators as SD
+
+        N = 32
+        x = jnp.linspace(0.0, 1.0, N, endpoint=False)
+        u = jnp.sin(2 * jnp.pi * x)
+        du_exact = 2 * jnp.pi * jnp.cos(2 * jnp.pi * x)
+        du_spectral = SD.fourier_derivative_1d(u, x.reshape(N, 1), order=1)
+        # Spectral methods achieve near machine-precision for smooth periodic fns
+        assert jnp.max(jnp.abs(du_spectral - du_exact)) < 1e-4
+
+    def test_fourier_derivative_1d_second_order(self):
+        """d²u/dx² of sin(2πx) = -(2π)² sin(2πx)."""
+        from jno.differential_operators import SpectralDifferentiators as SD
+
+        N = 32
+        x = jnp.linspace(0.0, 1.0, N, endpoint=False)
+        u = jnp.sin(2 * jnp.pi * x)
+        d2u_exact = -((2 * jnp.pi) ** 2) * jnp.sin(2 * jnp.pi * x)
+        d2u_spectral = SD.fourier_derivative_1d(u, x.reshape(N, 1), order=2)
+        assert jnp.max(jnp.abs(d2u_spectral - d2u_exact)) < 1e-3
+
+    def test_chebyshev_diff_matrix_shape(self):
+        """chebyshev_diff_matrix(N) should return an (N+1)×(N+1) matrix."""
+        from jno.differential_operators import SpectralDifferentiators as SD
+
+        for N in (4, 8, 16):
+            D = SD.chebyshev_diff_matrix(N)
+            assert D.shape == (N + 1, N + 1), f"N={N}: shape {D.shape}"
+
+    def test_chebyshev_derivative_1d_polynomial(self):
+        """Chebyshev derivative of x² on [-1, 1] = 2x (exact for polynomials)."""
+        from jno.differential_operators import SpectralDifferentiators as SD
+
+        N = 8
+        j = jnp.arange(N + 1, dtype=jnp.float32)
+        x = jnp.cos(jnp.pi * j / N)  # CGL nodes on [-1, 1]
+        u = x**2
+        du_exact = 2.0 * x
+        du_cheb = SD.chebyshev_derivative_1d(u, x.reshape(N + 1, 1), order=1)
+        assert jnp.max(jnp.abs(du_cheb - du_exact)) < 1e-5
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# parse_fd_scheme: spectral schemes pass through
+# ───────────────────────────────────────────────────────────────────────────────
+
+
+class TestParseFDSchemeSpectral:
+    def test_spectral_fourier_passthrough(self):
+        from jno.differential_operators import DifferentialOperators
+
+        scheme, gm, lm = DifferentialOperators.parse_fd_scheme("spectral_fourier")
+        assert scheme == "spectral_fourier"
+        assert gm is None
+        assert lm is None
+
+    def test_spectral_chebyshev_passthrough(self):
+        from jno.differential_operators import DifferentialOperators
+
+        scheme, gm, lm = DifferentialOperators.parse_fd_scheme("spectral_chebyshev")
+        assert scheme == "spectral_chebyshev"
+        assert gm is None
+        assert lm is None

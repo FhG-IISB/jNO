@@ -1997,12 +1997,6 @@ class core:
             # (multiple disjoint Bayesian groups) and Pattern E (mixed
             # VI + MCMC on disjoint masks) both fall out of this scheme.
             if _non_optax_groups:
-                if _optax_groups:
-                    raise NotImplementedError(
-                        f"Model (layer {lid}): combining .mask().bayesian()/.vi() with "
-                        ".mask().optimizer() groups is not yet supported."
-                    )
-
                 # Pattern E strict matching: when a layer mixes VI and
                 # MCMC handles on disjoint masks, the MCMC ``keep`` and
                 # the VI ``posterior_draws`` must match — they share the

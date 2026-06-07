@@ -162,12 +162,14 @@ class domain(MeshIOMixin):
         compute_mesh_connectivity: bool = True,
     ) -> "domain":
         """Instantiate a structured rectangular triangulation."""
-        return cls._from_geometry(
+        dom = cls._from_geometry(
             Geometries.equi_distant_rect(x_range=x_range, y_range=y_range, nx=nx, ny=ny),
             algorithm=algorithm,
             time=time,
             compute_mesh_connectivity=compute_mesh_connectivity,
         )
+        dom._grid_shape = (nx + 1, ny + 1)
+        return dom
 
     @classmethod
     def poseidon(
@@ -180,12 +182,14 @@ class domain(MeshIOMixin):
         compute_mesh_connectivity: bool = True,
     ) -> "domain":
         """Instantiate the structured Poseidon-style 2D grid."""
-        return cls._from_geometry(
+        dom = cls._from_geometry(
             Geometries.poseidon(nx=nx, ny=ny),
             algorithm=algorithm,
             time=time,
             compute_mesh_connectivity=compute_mesh_connectivity,
         )
+        dom._grid_shape = (nx, ny)
+        return dom
 
     @classmethod
     def cube(
@@ -2198,6 +2202,70 @@ class domain(MeshIOMixin):
             coord_vars += [idx]
 
         return tuple(coord_vars)
+
+    def distance_function(
+        self,
+        tag: str = "interior",
+        boundary_tags=None,
+        name=None,
+    ):
+        """Compute minimum distance from boundary to each sampled point at *tag*.
+
+        Returns a Variable placeholder of shape (N, 1) per batch — suitable
+        for hard Dirichlet BC enforcement::
+
+            d = dom.distance_function("interior")
+            u_phys = net(jno.np.concat([x, y], axis=-1)) * d  # u=0 on ∂Ω
+
+        Args:
+            tag:           Source tag whose points get distances computed.
+            boundary_tags: Tags used as boundary reference. Defaults to
+                           ["boundary"] if present, else all non-interior tags.
+            name:          Context key for the result. Auto-generated if None.
+        """
+        import numpy as _np
+
+        # --- resolve interior points ---
+        if tag in self._mesh_pool:
+            pts = _np.asarray(self._mesh_pool[tag])
+        elif tag in self.context:
+            raw = self.context[tag]
+            # context shape is (B, 1, N, D) or (1, 1, N, D); use first batch
+            pts = _np.asarray(raw[0, 0])
+        else:
+            raise ValueError(f"distance_function: tag '{tag}' not found in mesh_pool or context.")
+
+        pts_spatial = pts[:, : self.dimension]
+
+        # --- resolve boundary points ---
+        if boundary_tags is None:
+            if "boundary" in self._mesh_pool:
+                boundary_tags = ["boundary"]
+            else:
+                boundary_tags = [t for t in self._mesh_pool if t not in (tag, "initial")]
+
+        bdry_parts = [_np.asarray(self._mesh_pool[t])[:, : self.dimension] for t in boundary_tags if t in self._mesh_pool]
+        if not bdry_parts:
+            raise ValueError(f"distance_function: no boundary tags found (tried {boundary_tags}).")
+        bdry_pts = _np.vstack(bdry_parts)
+
+        # --- compute distances ---
+        try:
+            from scipy.spatial import cKDTree
+
+            tree = cKDTree(bdry_pts)
+            dists, _ = tree.query(pts_spatial)
+        except ImportError:
+            diffs = pts_spatial[:, None, :] - bdry_pts[None, :, :]
+            dists = _np.sqrt((diffs**2).sum(-1)).min(-1)
+
+        # Store as (1, 1, N, 1) — same layout as other context entries
+        dist_arr = dists.astype(_np.float32)[_np.newaxis, _np.newaxis, :, _np.newaxis]
+        dist_tag = name or f"__dist_{tag}__"
+        self.context[dist_tag] = dist_arr
+        self._param_tags.add(dist_tag)
+
+        return Variable(tag=dist_tag, dim=[0, 1], domain=self, axis="spatial")
 
     def __getitem__(self, tag: str) -> Tuple[Variable, ...]:
         """Shorthand for domain.variable(tag).
