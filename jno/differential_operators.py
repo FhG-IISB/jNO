@@ -780,8 +780,6 @@ class DifferentialOperators:
             "finite_difference:uniform"          → fd, "uniform",       "gradient_of_gradient"
             "finite_difference:inverse_distance" → fd, "inverse_distance", "gradient_of_gradient"
             "automatic_differentiation"          → ad, None, None
-            "spectral_fourier"                   → spectral_fourier, None, None
-            "spectral_chebyshev"                 → spectral_chebyshev, None, None
 
         Returns:
             Tuple ``(main_scheme, grad_method, lap_method)``.
@@ -789,8 +787,6 @@ class DifferentialOperators:
         if ":" not in scheme:
             if scheme == "automatic_differentiation":
                 return "automatic_differentiation", None, None
-            if scheme.startswith("spectral_"):
-                return scheme, None, None
             return "finite_difference", "area_weighted", "gradient_of_gradient"
 
         main, sub = scheme.split(":", 1)
@@ -802,109 +798,3 @@ class DifferentialOperators:
             return main, "least_squares", "lsq_of_gradient"
         # uniform / inverse_distance / area_weighted
         return main, sub, "gradient_of_gradient"
-
-
-class SpectralDifferentiators:
-    """Spectral differentiation on uniform (Fourier) or Chebyshev grids."""
-
-    @staticmethod
-    def fourier_derivative_1d(u, points, order: int = 1):
-        """Periodic Fourier spectral d^order/dx^order on a 1-D uniform grid.
-
-        Args:
-            u:      Function values at N uniform periodic points, shape (N,).
-            points: Grid coordinates, shape (N,) or (N, 1).
-            order:  Derivative order (default 1).
-        Returns:
-            d^order u / dx^order at each point, shape (N,).
-        """
-        import jax.numpy as jnp
-
-        x = points[:, 0] if points.ndim == 2 else points
-        N = x.shape[0]
-        L = jnp.max(x) - jnp.min(x) + (jnp.max(x) - jnp.min(x)) / (N - 1)  # period
-        k = jnp.fft.rfftfreq(N, d=1.0 / N).astype(jnp.complex64)
-        u_hat = jnp.fft.rfft(u.astype(jnp.float32))
-        factor = (2j * jnp.pi * k / L) ** order
-        return jnp.fft.irfft(factor * u_hat, n=N)
-
-    @staticmethod
-    def fourier_derivative_2d(u, points, grid_shape: tuple, dim: int, order: int = 1):
-        """2-D Fourier spectral derivative on a tensor-product uniform grid.
-
-        Args:
-            u:           Function values at N = Nx*Ny points, shape (N,).
-            points:      Grid coordinates (N, 2), row-major (x varies slowest).
-            grid_shape:  (Nx, Ny) — number of grid points in each direction.
-            dim:         Differentiation direction: 0 = x, 1 = y.
-            order:       Derivative order.
-        Returns:
-            Derivative at each point, shape (N,).
-        """
-        import jax.numpy as jnp
-
-        Nx, Ny = grid_shape
-        u_2d = u.reshape(Nx, Ny)
-
-        if dim == 0:
-            xs = points[::Ny, 0]
-            L = (jnp.max(xs) - jnp.min(xs)) * Nx / max(Nx - 1, 1)
-            k = jnp.fft.rfftfreq(Nx, d=1.0 / Nx).astype(jnp.complex64)
-            factor = (2j * jnp.pi * k / L) ** order
-            u_hat = jnp.fft.rfft(u_2d, axis=0)
-            du_2d = jnp.fft.irfft(factor[:, None] * u_hat, n=Nx, axis=0)
-        else:
-            ys = points[:Ny, 1]
-            L = (jnp.max(ys) - jnp.min(ys)) * Ny / max(Ny - 1, 1)
-            k = jnp.fft.rfftfreq(Ny, d=1.0 / Ny).astype(jnp.complex64)
-            factor = (2j * jnp.pi * k / L) ** order
-            u_hat = jnp.fft.rfft(u_2d, axis=1)
-            du_2d = jnp.fft.irfft(factor[None, :] * u_hat, n=Ny, axis=1)
-
-        return du_2d.reshape(-1)
-
-    @staticmethod
-    def chebyshev_diff_matrix(N: int):
-        """Standard Chebyshev differentiation matrix D of size (N+1)×(N+1).
-
-        Operates on values at Chebyshev-Gauss-Lobatto nodes
-        x_j = cos(π j / N), j = 0, …, N (on [-1, 1]).
-        """
-        import jax.numpy as jnp
-
-        if N == 0:
-            return jnp.zeros((1, 1))
-        c = jnp.concatenate([jnp.array([2.0]), jnp.ones(N - 1), jnp.array([2.0])])
-        j = jnp.arange(N + 1, dtype=jnp.float32)
-        x = jnp.cos(jnp.pi * j / N)
-        Xi, Xj = jnp.meshgrid(x, x, indexing="ij")
-        Ci, Cj = jnp.meshgrid(c, c, indexing="ij")
-        sign = (-1.0) ** (j[:, None] + j[None, :])
-        eye = jnp.eye(N + 1, dtype=bool)
-        # Zero diagonal before computing off-diagonal entries to avoid 1/0
-        off_diag = jnp.where(eye, 0.0, (Ci / Cj) * sign / (Xi - Xj + 1e-30))
-        diag = -jnp.sum(off_diag, axis=1)  # rowsum rule
-        return jnp.where(eye, jnp.diag(diag), off_diag)
-
-    @staticmethod
-    def chebyshev_derivative_1d(u, points, order: int = 1):
-        """Chebyshev spectral derivative on a 1-D Chebyshev-Gauss-Lobatto grid.
-
-        Assumes *points* are the N+1 CGL nodes mapped to [x_min, x_max].
-
-        Args:
-            u:      Values at N+1 CGL points, shape (N+1,).
-            points: CGL coordinates, shape (N+1,) or (N+1, 1).
-            order:  Derivative order.
-        Returns:
-            d^order u / dx^order at each CGL point, shape (N+1,).
-        """
-        x = points[:, 0] if points.ndim == 2 else points
-        x_min, x_max = x.min(), x.max()
-        scale = 2.0 / (x_max - x_min)  # chain rule: d/dx = (2/L) * d/dξ
-        N = len(x) - 1
-        D = SpectralDifferentiators.chebyshev_diff_matrix(N)
-        result = u
-        for _ in range(order):
-            result = scale * (D @ result)
-        return result

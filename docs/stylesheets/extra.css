@@ -41,6 +41,11 @@
   background: color-mix(in srgb, var(--jno-brand-3) 55%, white);
 }
 
+.md-typeset table:not([class]) td code,
+.md-typeset table:not([class]) th code {
+  white-space: nowrap;
+}
+
 .md-header {
   background: linear-gradient(90deg, #02434a, #006d77);
 }
@@ -49,20 +54,15 @@
   margin-top: 0.8rem;
 }
 
-/* Keep the content focused while preserving an always-present left navigation on desktop. */
+/* Wide layout: fill the viewport, narrow left nav, no content cap. */
 @media screen and (min-width: 76.25em) {
   .md-grid {
-    max-width: 1680px;
+    max-width: 100%;
   }
 
   .md-sidebar--primary {
     display: block;
-    width: 19rem;
-  }
-
-  .md-content {
-    margin: 0 auto;
-    max-width: 900px;
+    width: 14rem;
   }
 }
 
