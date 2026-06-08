@@ -227,6 +227,13 @@ class PolygonDomain(domain):
         resampling_strategy: Optional[Any] = None,
         resampling_strategies: Optional[Mapping[str, Any]] = None,
     ):
+        # Guard against double-init: domain.__new__ may call PolygonDomain(...)
+        # to construct the instance, after which Python's type.__call__ invokes
+        # __init__ a second time on the same object.
+        if getattr(self, "_poly_initialized", False):
+            return
+        self._poly_initialized = True
+
         _require_shapely()
 
         # Plan A: accept a shapely geometry as the first positional arg.
@@ -1336,6 +1343,77 @@ class PolygonDomain(domain):
     def __mul__(self, n: int) -> "PolygonDomain":
         return self.__rmul__(n)
 
+    @classmethod
+    def stack(
+        cls,
+        *batched_domains: "PolygonDomain",
+        n_interior: int = 256,
+        n_boundary: int = 64,
+    ) -> "domain":
+        """Stack multiple PolygonDomains into one batched domain for multi-geometry training.
+
+        Use ``n * dom`` to set how many independent samplings of a geometry appear
+        in the training batch before passing it here.  Points are drawn by rejection
+        sampling so ``n_interior`` / ``n_boundary`` are exact regardless of mesh size.
+
+        Args:
+            *batched_domains: PolygonDomain instances, typically ``n * dom``.
+            n_interior: Interior collocation points per geometry sample.
+            n_boundary: Boundary points per geometry sample.
+
+        Returns:
+            A ``jno.domain`` with per-sample point pools — ``variable("interior")``
+            yields ``(B_total, 1, n_interior, 1)`` per coordinate, one independent
+            sampling per geometry instance.
+
+        Example::
+
+            from shapely.geometry import box, Point
+            import jno
+
+            d1 = jno.domain(box(0, 0, 1, 1))
+            d2 = jno.domain(Point(0.5, 0.5).buffer(0.5))
+            dom = jno.domain.stack(100 * d1, 100 * d2, n_interior=512, n_boundary=128)
+            x, y = dom.variable("interior")   # (200, 1, 512, 1) each
+            xb, yb = dom.variable("boundary") # (200, 1, 128, 1) each
+        """
+        from ..domain.domain_class import domain as _Domain
+
+        int_samples: list = []
+        bnd_samples: list = []
+
+        for poly_dom in batched_domains:
+            if not isinstance(poly_dom, cls):
+                raise TypeError(f"Expected PolygonDomain, got {type(poly_dom).__name__}")
+            B = int(getattr(poly_dom, "_batch_count", getattr(poly_dom, "total_samples", 1)))
+            for _ in range(B):
+                int_samples.append(poly_dom._sample_interior("interior", poly_dom._active_geometry, n_interior))
+                pts, _ = poly_dom._sample_boundary("boundary", n_boundary, False)
+                bnd_samples.append(pts)
+
+        # Bootstrap from the first sample — this sets mesh=None, dimension=2,
+        # _mesh_pool, logging, and all other domain bookkeeping.
+        dom = _Domain.from_array({"interior": int_samples[0], "boundary": bnd_samples[0]})
+
+        # Remove the bootstrap context entries so variable() materialises clean tags
+        # ("interior" / "boundary") instead of falling back to renamed ones ("interior_0").
+        dom.context.pop("interior", None)
+        dom.context.pop("boundary", None)
+
+        # Wire up per-batch sampling.  domain.sample() iterates _mesh_pool_groups
+        # when same_domain=False: each (1, pts_i) entry becomes one batch row,
+        # giving final shape (B_total, 1, N, 2) after stacking.
+        dom._mesh_pool_groups = {
+            "interior": [(1, pts) for pts in int_samples],
+            "boundary": [(1, pts) for pts in bnd_samples],
+        }
+        B_total = len(int_samples)
+        dom._batch_count = B_total
+        dom.total_samples = B_total
+        dom.same_domain = False
+
+        return dom
+
     def _time_for_result(self, other: "PolygonDomain") -> Optional[Tuple[float, float, int]]:
         if self.time is None:
             return other.time
@@ -1454,7 +1532,7 @@ class PolygonDomain(domain):
             algorithm: pygmsh algorithm (passed through to ``generate_mesh``).
             region_mesh_sizes: Per-source-region mesh size overrides keyed by
                 the names used to construct the source regions (e.g. the
-                ``name`` argument of ``jno.domain.csg`` or keys of
+                ``name`` argument of ``jno.domain`` or keys of
                 ``from_polygons`` / ``from_regions``).
             interpolate: Controls how ``region_mesh_sizes`` is enforced inside
                 each region (default ``True``).
