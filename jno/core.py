@@ -63,6 +63,22 @@ from .utils import (
 from .utils.config import get_wandb_run, wandb_alert, wandb_log, wandb_log_model
 
 
+def _cpu_device():
+    """Return a CPU JAX device.
+
+    Raises RuntimeError if no CPU backend is available — jNO requires
+    JAX_PLATFORMS=cuda,cpu (or cpu) so that pure_callback and host-side
+    data staging always have a CPU device.
+    """
+    cpu_devs = jax.devices("cpu")
+    if not cpu_devs:
+        raise RuntimeError(
+            "No CPU JAX device found. Set JAX_PLATFORMS=cuda,cpu (or cpu) "
+            "so that domain data can be staged on the host before training."
+        )
+    return cpu_devs[0]
+
+
 def _find_temporal_variable(expr: Placeholder):
     """Walk an expression tree and return the first temporal Variable, or None."""
     from .trace import Variable as _Variable
@@ -630,8 +646,10 @@ class core:
             for tag, arr in domain.context.items():
                 # If it's a nested dictionary (like our VPINN surface_data), map safely
                 if isinstance(arr, dict):
-                    # 1. Convert leaves to arrays
-                    arr = jax.tree_util.tree_map(jnp.asarray, arr)
+                    # 1. Convert leaves to JAX arrays pinned to CPU — GPU placement happens in solve()
+                    arr = jax.tree_util.tree_map(
+                        lambda x: jax.device_put(x, _cpu_device()), arr
+                    )
                     # 2. Add the batch dimension [None, ...] to every array in the dict, FEM/static metadata dicts must stay unbatched
                     if tag in metadata_tags:
                         context[tag] = arr
@@ -640,7 +658,8 @@ class core:
                     # 3. Skip the rest of the loop for dictionaries!
                     continue
                     # Standard behavior for everything else (preserves backward compatibility)
-                arr = jnp.asarray(arr)
+                # Pin to CPU JAX array — GPU placement happens in solve()
+                arr = jax.device_put(arr, _cpu_device())
 
                 if tag in metadata_tags:
                     context[tag] = arr
@@ -2323,8 +2342,8 @@ class core:
         full_context = self.domain_data.context
 
         if offload_data:
-            # Keep full dataset as numpy on host — only a mini-batch is
-            # transferred to the device each step.
+            # full_context holds CPU-pinned JAX arrays (prepare_domain_data never goes to GPU).
+            # Convert to numpy so the host_context is plain numpy for per-batch streaming.
             host_context = {k: np.asarray(v) for k, v in full_context.items()}
             total_samples = _infer_total_samples(host_context)
             effective_batchsize = None  # data is already pre-sliced
@@ -2332,7 +2351,9 @@ class core:
                 f"Data offloading enabled: {total_samples} total samples, streaming batches of {batchsize} from host"
             )
         else:
-            # Replicate / shard full dataset on device (original behaviour)
+            # Replicate / shard full dataset on device.
+            # _shard_data uses jax.device_put with NamedSharding which moves
+            # CPU-pinned arrays to the target accelerator.
             domain_data = DomainData(context=full_context, dimension=self.domain_data.dimension)
             domain_data = DomainData(
                 context=self._replicate_for_devices(domain_data.context, n_devices),
