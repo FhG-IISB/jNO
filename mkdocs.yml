@@ -66,7 +66,6 @@ not_in_nav: |
   /Docker.md
   /Model-Controls.md
   /Training.md
-  /Differential-Operators.md
   /Integration-Operators.md
   /Adaptive-Resampling.md
   /training/schedules.md
@@ -82,7 +81,7 @@ nav:
   - Getting to Know jNO:
     - Domain and Geometry: Domain-and-Geometry.md
     - Operators:
-      - Differential Operators: operators/differential.md
+      - Differential Operators: Differential-Operators.md
       - Integral Operators: operators/integral.md
       - jno.numpy Reference: operators/numpy-reference.md
     - Hyperparameter Tuning: Hyperparameter-Tuning.md

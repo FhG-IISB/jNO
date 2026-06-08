@@ -8,7 +8,7 @@ jNO: Physics-Informed Neural Operators.
 
 import sys
 
-from . import bayesian, fn, lora
+from . import bayesian, fn, lora, trackers
 from . import jnp_ops as np
 from .architectures.models import nn, parameter
 from .core import core
@@ -96,6 +96,7 @@ __all__ = [
     "LearningRateSchedule",
     "WeightSchedule",
     "callbacks",
+    "trackers",
     "logger",
     "TraceEvaluator",
     "TraceCompiler",

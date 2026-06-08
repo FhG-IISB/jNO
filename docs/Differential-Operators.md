@@ -8,6 +8,58 @@ import jno.numpy as jnn
 
 ---
 
+## Differentiation Schemes
+
+Pass any scheme string via the `scheme=` keyword on `jnn.grad`, `jnn.laplacian`, `jnn.hessian`, etc.
+
+### All scheme strings
+
+| Scheme string | Grad | Lap | Hessian | 1D | 2D | 3D | Temporal | Notes |
+|---------------|:----:|:---:|:-------:|:--:|:--:|:--:|:--------:|-------|
+| `"automatic_differentiation"` *(default)* | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Exact; any domain |
+| `"automatic_differentiation:forward"` | ✅ | — | — | ✅ | ✅ | ✅ | ✅ | `jacfwd`; best when outputs ≫ inputs |
+| `"automatic_differentiation:reverse"` | ✅ | — | — | ✅ | ✅ | ✅ | ✅ | `jacrev`; best when inputs ≫ outputs |
+| `"automatic_differentiation:fwd-over-rev"` | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | `jacfwd∘jacrev`; default Hessian |
+| `"automatic_differentiation:fwd-over-fwd"` | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Fastest for many-input problems |
+| `"automatic_differentiation:rev-over-rev"` | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Low memory |
+| `"automatic_differentiation:rev-over-fwd"` | — | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | |
+| `"finite_difference"` | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | Area-weighted; general unstructured meshes |
+| `"finite_difference:lsq"` | ✅ | ✅ | — | ✅ | ✅ | ✅ | — | Least-squares; more accurate on irregular meshes |
+| `"finite_difference:uniform"` | ✅ | ✅ | — | ✅ | ✅ | ✅ | — | Equal neighbour weights; fast on near-uniform meshes |
+| `"finite_difference:inverse_distance"` | ✅ | ✅ | — | ✅ | ✅ | ✅ | — | Distance-weighted; better on highly stretched meshes |
+| `"finite_difference:cotangent"` | — | ✅ | — | — | ✅ | — | — | Cotangent-weighted Laplacian; **2D only**; most accurate on triangulations |
+
+FD schemes require `compute_mesh_connectivity=True`.
+
+---
+
+### Automatic Differentiation
+
+Uses JAX `jax.jacrev` / `jax.jacfwd` — exact to machine precision on any domain.
+
+```python
+u_x  = jnn.grad(u, x)                             # reverse mode (default)
+u_x  = jnn.grad(u, x, scheme="automatic_differentiation:forward")
+lap  = jnn.laplacian(u, [x, y])                    # fwd-over-rev (default)
+lap  = jnn.laplacian(u, [x, y], scheme="automatic_differentiation:fwd-over-fwd")
+```
+
+Set a project-wide default with `jno.setup(__file__, diff_type="forward", hessian_type="fwd-over-fwd")`.
+
+---
+
+### Finite Difference
+
+Mesh-based; approximates derivatives using element stencils. Requires `compute_mesh_connectivity=True` on the domain.
+
+```python
+u_x = jnn.grad(u, x, scheme="finite_difference")                   # default sub-scheme
+u_x = jnn.grad(u, x, scheme="finite_difference:lsq")               # least-squares
+lap = jnn.laplacian(u, [x, y], scheme="finite_difference:cotangent")
+```
+
+---
+
 ## Differentiation
 
 ### Gradient (first derivative)
@@ -145,238 +197,3 @@ ntk_reg = (J_sg @ J_sg.T - target_K).mse   # penalise NTK shape cheaply
 ```
 
 See the [Gradient Conflict Analysis tutorial](tutorials/07-analysis/gradient-conflict.md) for a complete worked example.
-
----
-
-## Differentiation Schemes
-
-| Scheme | Flag | Notes |
-|--------|------|-------|
-| Automatic Differentiation | `"automatic_differentiation"` (default) | Exact; uses JAX `jax.grad` / `jax.jacfwd`. |
-| Finite Difference (mesh-based) | `"finite_difference"` | Approximation; uses FEM stencils. Requires `compute_mesh_connectivity=True` in the domain. |
-
----
-
-## Mathematical Functions
-
-### Trigonometric
-
-```python
-jnn.sin(x), jnn.cos(x), jnn.tan(x)
-jnn.arcsin(x), jnn.arccos(x), jnn.arctan(x)
-jnn.arctan2(y, x)   # alias: jnn.atan2
-```
-
-### Hyperbolic
-
-```python
-jnn.sinh(x), jnn.cosh(x), jnn.tanh(x)
-jnn.arcsinh(x), jnn.arccosh(x), jnn.arctanh(x)
-```
-
-### Exponential / Logarithm
-
-```python
-jnn.exp(x), jnn.exp2(x), jnn.expm1(x)
-jnn.log(x), jnn.log2(x), jnn.log10(x), jnn.log1p(x)
-```
-
-### Power / Root
-
-```python
-jnn.sqrt(x), jnn.cbrt(x), jnn.square(x)
-jnn.power(x, n)
-```
-
-### Absolute / Rounding
-
-```python
-jnn.abs(x)
-jnn.floor(x), jnn.ceil(x), jnn.round(x)
-jnn.sign(x)
-```
-
-### Constants
-
-```python
-jnn.pi    # π
-jnn.e     # e
-jnn.inf   # ∞
-jnn.nan   # NaN
-```
-
----
-
-## Reduction Operations
-
-```python
-jnn.sum(x)
-jnn.mean(x)
-jnn.std(x)
-jnn.var(x)
-jnn.min(x)
-jnn.max(x)
-jnn.median(x)
-jnn.prod(x)
-jnn.norm(x, ord=None, axis=None)
-```
-
-All support `axis=` and `keepdims=` keyword arguments.
-
----
-
-## Reduction Properties on Placeholders
-
-Every `Placeholder` expression exposes reduction properties. These return **scalar** Placeholder nodes suitable for use as constraints or trackers:
-
-```python
-expr.mse     # mean(expr²)      — most common loss term
-expr.mae     # mean(|expr|)
-expr.mean    # mean(expr)
-expr.sum     # sum(expr)
-expr.max     # max(expr)
-expr.min     # min(expr)
-expr.std     # std(expr)
-```
-
-Example:
-```python
-pde = jnn.laplacian(u, [x, y]) + 1.0
-crux = jno.core([pde.mse], domain)       # minimise  mean((Δu+1)²)
-```
-
----
-
-## Array Operations
-
-```python
-jnn.concat([x, y], axis=-1)       # concatenate along last axis (default)
-jnn.concatenate([x, y])           # alias for concat
-jnn.stack([x, y], axis=0)         # stack along new axis
-jnn.reshape(x, shape)
-jnn.squeeze(x, axis=None)
-jnn.expand_dims(x, axis)
-jnn.transpose(x, axes=None)
-```
-
----
-
-## Comparison / Conditional
-
-```python
-jnn.where(condition, x, y)
-jnn.maximum(x, y)
-jnn.minimum(x, y)
-```
-
-Comparison operators are also available as methods on Placeholder objects:
-
-```python
-x > 0.5          # FunctionCall(greater, [x, Literal(0.5)])
-x.equal(y)       # element-wise equality (traced)
-x.not_equal(y)
-```
-
----
-
-## Linear Algebra
-
-```python
-jnn.dot(x, y)
-jnn.matmul(x, y)
-jnn.cross(x, y)
-
-# Matrix multiply on Placeholder: x @ A
-result = x @ A
-```
-
----
-
-## View Factor Operator (Radiation)
-
-For radiation boundary conditions the domain can compute a view-factor matrix. Use `jnn.view_factor` to create an operator that applies it symbolically:
-
-```python
-# Get view factor matrix from domain
-xb, yb, tb, nx, ny, VF = domain.variable("boundary", normals=True, view_factor=True)
-
-# Wrap as a symbolic linear operator
-VF_op = jnn.view_factor(VF)
-
-# Apply: radiative heat flux received by each boundary point
-q_inc = VF_op @ q_emitted      # F @ q (matrix-vector product)
-q_inc = q_emitted @ VF_op      # q @ F
-
-# Solve (I - αF)x = rhs
-x = VF_op.solve(rhs, alpha)
-```
-
----
-
-## Custom Functions
-
-Wrap arbitrary JAX functions for use inside symbolic expressions:
-
-```python
-def my_fn(x, y):
-    return jnp.exp(-x**2) * jnp.sin(y)
-
-result = jnn.function(my_fn, [x, y])
-```
-
----
-
-## Symbolic Arithmetic
-
-Placeholders support standard Python arithmetic, enabling natural PDE notation:
-
-```python
-u = u_net(x, y)
-v = v_net(x, y)
-
-# Arithmetic
-w = u + v
-w = u * 2.0
-w = u ** 2
-w = -u
-
-# Matrix multiplication
-w = A @ u
-```
-
----
-
-## Trackers
-
-Mark an expression as a *tracked metric* — it is evaluated and logged during training but **does not** contribute to the loss:
-
-```python
-from jno.numpy import tracker
-
-val_error = tracker(jnn.mean(u(x, y) - u_exact(x, y)), interval=100)  # log every 100 epochs
-crux = jno.core([pde.mse, boc.mse, val_error], domain)
-```
-
----
-
-## Constants Namespace
-
-Load constant values from a file or dict and use them symbolically in expressions:
-
-```python
-C = jnn.constant("C", {
-    "k": 1.5,
-    "rho": 2700,
-    "cp": 900,
-    "physics": {"g": 9.81, "nu": 1.5e-5},
-})
-
-# Use in constraints
-pde = -C.k * jnn.laplacian(u, [x, y]) - C.rho * jnn.grad(u, t)
-
-# Load from file
-C = jnn.constant("C", "params.json")      # JSON
-C = jnn.constant("C", "params.yaml")      # YAML
-C = jnn.constant("C", "params.toml")      # TOML
-C = jnn.constant("C", "data.npz")         # NumPy npz
-```

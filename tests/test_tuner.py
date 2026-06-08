@@ -131,3 +131,66 @@ class TestGroupAccessors:
         s = ArchSpace().unique("activation", ["relu", "tanh"])
         assert s.has_architecture_params()
         assert not s.has_training_params()
+
+
+# ---------------------------------------------------------------------------
+# Multiple TunableModules — guard removed, tunable_list threaded through
+# ---------------------------------------------------------------------------
+
+
+class TestMultipleTunableModulesGuardRemoved:
+    """Verify that passing multiple TunableModules no longer raises."""
+
+    def test_no_notimplementederror_with_two_tunables(self):
+        """_merge_spaces must accept a list of two TunableModules without error."""
+        from unittest.mock import MagicMock
+
+        from jno.tuner import Tuner
+
+        # Build two minimal mock TunableModules with empty spaces
+        t1 = MagicMock()
+        t1.space = None
+        t2 = MagicMock()
+        t2.space = None
+
+        core = MagicMock()
+        core._collect_flax_modules.return_value = {}
+        core.constraints = []
+        core._find_choice_nodes.return_value = []
+        core.log = MagicMock()
+
+        tuner = Tuner(core)
+        from jno.tuner import ArchSpace
+
+        space = ArchSpace()
+        # Should not raise — the NotImplementedError guard is gone
+        merged = tuner._merge_spaces(space, [t1, t2])
+        assert merged is not None
+
+    def test_merge_spaces_deduplicates_groups(self):
+        """If two TunableModules share a group name, only one is registered."""
+        from unittest.mock import MagicMock
+
+        from jno.tuner import ArchSpace, Tuner, UniqueGroup
+
+        def _make_tunable(name, opts):
+            t = MagicMock()
+            t.space = MagicMock()
+            g = UniqueGroup(name=name, options=opts, category="architecture")
+            t.space.groups = [g]
+            return t
+
+        t1 = _make_tunable("depth", [2, 4])
+        t2 = _make_tunable("depth", [2, 4, 8])  # same name — should be ignored
+
+        core = MagicMock()
+        core._collect_flax_modules.return_value = {}
+        core.constraints = []
+        core._find_choice_nodes.return_value = []
+        core.log = MagicMock()
+
+        tuner = Tuner(core)
+        merged = tuner._merge_spaces(ArchSpace(), [t1, t2])
+        arch_groups = merged.get_architecture_groups()
+        names = [g.name for g in arch_groups]
+        assert names.count("depth") == 1

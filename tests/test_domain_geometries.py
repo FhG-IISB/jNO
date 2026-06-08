@@ -9,6 +9,7 @@ Mesh sizes are kept deliberately coarse to keep the suite fast.
 
 import inspect
 
+import jax.numpy as jnp
 import pytest
 
 import jno
@@ -520,3 +521,58 @@ class TestDomainStacking:
         dom = 5 * jno.domain.rect(mesh_size=0.3)
         dom += 3 * jno.domain.disk(mesh_size=0.3)
         assert dom.total_samples == 8
+
+
+# ---------------------------------------------------------------------------
+# distance_function
+# ---------------------------------------------------------------------------
+
+
+class TestDistanceFunction:
+    """Verify domain.distance_function() returns correct boundary distances."""
+
+    def test_distances_nonnegative(self):
+        import jno
+
+        dom = jno.domain.rect(mesh_size=0.3)
+        dom.variable("interior")  # populate context
+        d = dom.distance_function("interior")
+        # Variable tag should exist in context
+        assert d.tag in dom.context
+        dist_arr = dom.context[d.tag]
+        assert float(jnp.min(jnp.array(dist_arr))) >= 0.0
+
+    def test_boundary_points_have_zero_distance(self):
+        """Points ON the boundary should have distance ≈ 0."""
+        import numpy as np
+
+        import jno
+
+        dom = jno.domain.rect(mesh_size=0.3)
+        dom.variable("boundary")
+        dom.variable("interior")
+        d_var = dom.distance_function("boundary", boundary_tags=["interior"])
+        dist_arr = np.array(dom.context[d_var.tag])  # (1, 1, N, 1)
+        assert dist_arr.min() < 0.05  # at least some boundary pts very close to interior
+
+    def test_interior_distances_positive(self):
+        """Interior points that are not on the boundary should have d > 0."""
+        import numpy as np
+
+        import jno
+
+        dom = jno.domain.rect(mesh_size=0.2)
+        dom.variable("interior")
+        d_var = dom.distance_function("interior")
+        dist_arr = np.array(dom.context[d_var.tag])
+        # The mean distance should be meaningfully positive (> mesh_size/2)
+        assert float(dist_arr.mean()) > 0.05
+
+    def test_custom_name(self):
+        import jno
+
+        dom = jno.domain.rect(mesh_size=0.3)
+        dom.variable("interior")
+        d_var = dom.distance_function("interior", name="my_dist")
+        assert d_var.tag == "my_dist"
+        assert "my_dist" in dom.context

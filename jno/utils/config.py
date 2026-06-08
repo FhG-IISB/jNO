@@ -24,6 +24,7 @@ unencrypted pickle, just as before.
 from __future__ import annotations
 
 import os
+import sys
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -186,6 +187,56 @@ def apply_ad_mode_defaults(diff_type: str | None = None, hessian_type: str | Non
         _ad_mode.set_hessian_mode(hess)
 
 
+def _log_setup_info(log, script_path: Path, dire: Path, stem: str, wandb_arg) -> None:
+    """Log environment and configuration at the start of a run."""
+    import jax
+
+    try:
+        from importlib.metadata import version as _pkg_version
+
+        jno_ver = _pkg_version("jax-neural-operators")
+    except Exception:
+        jno_ver = "unknown"
+
+    from . import ad_mode as _ad_mode
+
+    devs = jax.devices()
+    seed = get_seed()
+    diff_type = _ad_mode.get_ad_mode()
+    hessian_type = _ad_mode.get_hessian_mode()
+
+    log.info(f"jNO {jno_ver}")
+    log.info(f"Python {sys.version.split()[0]}")
+    log.info(f"JAX {jax.__version__}  backend={jax.default_backend()}")
+    log.info(f"Devices ({len(devs)}): {[str(d) for d in devs]}")
+    log.info(f"Script: {script_path}")
+    log.info(f"Run directory: {dire}")
+    log.info(f"RNG seed: {seed}")
+    log.info(f"diff_type: {diff_type}")
+    log.info(f"hessian_type: {hessian_type}")
+    if wandb_arg is not False:
+        log.info(f"Weights & Biases: enabled (project={stem})")
+    else:
+        log.info("Weights & Biases: disabled")
+
+    if _WANDB_RUN is not None:
+        _WANDB_RUN.config.update(
+            {
+                "jno_version": jno_ver,
+                "python_version": sys.version.split()[0],
+                "jax_version": jax.__version__,
+                "jax_backend": jax.default_backend(),
+                "num_devices": len(devs),
+                "script": str(script_path),
+                "run_directory": str(dire),
+                "seed": seed,
+                "diff_type": diff_type,
+                "hessian_type": hessian_type,
+            },
+            allow_val_change=True,
+        )
+
+
 def setup(
     script_file: str,
     name: str | None = None,
@@ -285,6 +336,8 @@ def setup(
 
     # --- Optional Weights & Biases ---
     _init_wandb(wandb, stem, str(dire))
+
+    _log_setup_info(_logger_mod._default_logger, script_path, dire, stem, wandb)
 
     return str(dire)
 

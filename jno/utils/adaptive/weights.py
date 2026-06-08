@@ -786,6 +786,158 @@ def rlw(
 
 
 # =============================================================================
+# Tracker-driven loss balancing
+# =============================================================================
+#
+# Both schemes hold a reference to an explainability tracker (see
+# ``jno.trackers``) and read its ``.value`` attribute inside the host
+# callback to compute per-loss weights.  The tracker updates ``.value`` on
+# its own ``interval`` from inside the training loop; the weight scheme
+# reads the most recent cached value every loss eval — the same staleness
+# pattern as ``ReLoBRaLo``.
+#
+# Until the tracker has fired at least once, both schemes return uniform
+# weights — the cold-start fallback.
+
+
+class GradientNormBalanced:
+    """Per-loss weights inversely proportional to gradient norms.
+
+    Reads ``tracker.value["norms"]`` from a :class:`jno.trackers.gradient_norms`
+    tracker and returns ``w_i ∝ 1 / ‖∇L_i‖``, normalised so the weights sum
+    to ``N``.  Until the first tracker measurement, returns uniform
+    ``ones(N)``.
+
+    Args:
+        tracker: A :class:`~jno.utils.adaptive.callbacks.GradientNormsCallback`
+            instance — register it in the same ``callbacks=[...]`` list as
+            this weight scheme.
+        eps: Floor on each gradient norm to avoid division by zero
+            (default ``1e-12``).
+    """
+
+    def __init__(self, tracker, eps: float = 1e-12):
+        self.tracker = tracker
+        self.eps = float(eps)
+        self.num_losses: Optional[int] = None
+
+    def _weights_host(self, losses_np):
+        L = np.asarray(losses_np, dtype=np.float32).reshape(-1)
+        if self.num_losses is None:
+            self.num_losses = int(L.shape[0])
+
+        value = getattr(self.tracker, "value", None)
+        if value is None or "norms" not in value:
+            return np.ones((self.num_losses,), dtype=np.float32)
+
+        norms = np.asarray(value["norms"], dtype=np.float32).reshape(-1)
+        if norms.shape[0] != self.num_losses:
+            return np.ones((self.num_losses,), dtype=np.float32)
+
+        inv = 1.0 / np.maximum(norms, self.eps)
+        w = inv / inv.sum() * self.num_losses
+        return w.astype(np.float32)
+
+    def __call__(self, *losses: jnp.ndarray) -> tuple[jnp.ndarray, ...]:
+        """Return one weight per loss term."""
+        losses_arr = _normalize_losses(losses)
+        if self.num_losses is None:
+            self.num_losses = int(losses_arr.shape[0])
+
+        result_shape = jax.ShapeDtypeStruct((self.num_losses,), jnp.float32)
+        weights = _host_callback_nondiff(self._weights_host, result_shape, losses_arr)
+        return tuple(weights[i] for i in range(self.num_losses))
+
+
+def gradient_norm_balanced(tracker, eps: float = 1e-12) -> GradientNormBalanced:
+    """Per-loss inverse-gradient-norm weighting from a
+    :class:`jno.trackers.gradient_norms` tracker.
+
+    Args:
+        tracker: The gradient-norms tracker driving the weights. Both objects
+            must be registered in the solver's ``callbacks=[...]`` list.
+        eps: Norm floor for numerical stability.
+    """
+    return GradientNormBalanced(tracker=tracker, eps=eps)
+
+
+class NTKBalanced:
+    """NTK-trace loss balancing à la Wang, Yu & Perdikaris (2022).
+
+    Reads the per-constraint NTK traces from a list of
+    :class:`jno.trackers.ntk_spectrum` trackers — one per loss term — and
+    returns ``w_i = tr(K_total) / tr(K_i)`` (where ``tr(K_total) = Σ
+    tr(K_i)``), normalised so the weights sum to ``N``.
+
+    A constraint with a small NTK trace converges slowly (the canonical
+    spectral-bias mechanism), so it receives more weight; conversely, a
+    fast-converging constraint is down-weighted.
+
+    Until *every* tracker has fired at least once, returns uniform
+    ``ones(N)`` — the cold-start fallback. (Reference: Sec. 3 of
+    [`2007.14527 <https://arxiv.org/abs/2007.14527>`_].)
+
+    Args:
+        trackers: List of :class:`~jno.utils.adaptive.callbacks.NTKSpectrumCallback`
+            instances, one per loss term, in the same order as the
+            constraints.  Each must be a separate tracker — typically built
+            with ``net.grad`` on the network output for that constraint.
+        ema: Exponential-moving-average smoothing factor on the weights
+            (default ``0.9``; ``1.0`` disables smoothing).
+        eps: Floor on each tracker's trace to avoid division by zero
+            (default ``1e-12``).
+    """
+
+    def __init__(self, trackers: Sequence, ema: float = 0.9, eps: float = 1e-12):
+        self.trackers = list(trackers)
+        self.ema = float(ema)
+        self.eps = float(eps)
+        self.num_losses = len(self.trackers)
+        self.lambdas: np.ndarray = np.ones(self.num_losses, dtype=np.float32)
+
+    def _weights_host(self, losses_np):
+        L = np.asarray(losses_np, dtype=np.float32).reshape(-1)
+        if L.shape[0] != self.num_losses:
+            return np.ones((self.num_losses,), dtype=np.float32)
+
+        traces = np.empty((self.num_losses,), dtype=np.float32)
+        for i, tracker in enumerate(self.trackers):
+            value = getattr(tracker, "value", None)
+            if value is None or "trace" not in value:
+                return np.ones((self.num_losses,), dtype=np.float32)
+            traces[i] = float(value["trace"])
+
+        traces = np.maximum(traces, self.eps)
+        total = float(traces.sum())
+        # w_i = tr(K_total) / tr(K_i)  → re-normalise to sum to N
+        raw = total / traces
+        new = raw / raw.sum() * self.num_losses
+
+        self.lambdas = (self.ema * self.lambdas + (1.0 - self.ema) * new).astype(np.float32)
+        return self.lambdas
+
+    def __call__(self, *losses: jnp.ndarray) -> tuple[jnp.ndarray, ...]:
+        """Return one weight per loss term."""
+        losses_arr = _normalize_losses(losses)
+        result_shape = jax.ShapeDtypeStruct((self.num_losses,), jnp.float32)
+        weights = _host_callback_nondiff(self._weights_host, result_shape, losses_arr)
+        return tuple(weights[i] for i in range(self.num_losses))
+
+
+def ntk_balanced(trackers: Sequence, ema: float = 0.9, eps: float = 1e-12) -> NTKBalanced:
+    """NTK-trace-based loss balancing (Wang, Yu & Perdikaris, 2022).
+
+    Args:
+        trackers: One :class:`jno.trackers.ntk_spectrum` per loss term, in
+            the same order as the constraints.  Register each tracker AND
+            this weight scheme in the solver's ``callbacks=[...]`` list.
+        ema: EMA smoothing on the resulting weights (default ``0.9``).
+        eps: Trace floor for numerical stability.
+    """
+    return NTKBalanced(trackers=trackers, ema=ema, eps=eps)
+
+
+# =============================================================================
 # Exports
 # =============================================================================
 
@@ -801,4 +953,8 @@ __all__ = [
     "dwa",
     "RLW",
     "rlw",
+    "GradientNormBalanced",
+    "gradient_norm_balanced",
+    "NTKBalanced",
+    "ntk_balanced",
 ]

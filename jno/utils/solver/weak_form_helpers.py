@@ -547,7 +547,7 @@ def wrap_primary_state(node, target, *, state_name="u", value_shape=()):
         )
 
         if new_expr is not node.expr:
-            rebuilt_tracker = Tracker(new_expr, interval=node.interval)
+            rebuilt_tracker = Tracker(new_expr, interval=node.interval, reduce=node.reduce)
             rebuilt_tracker.op_id = node.op_id
             return rebuilt_tracker
 
@@ -843,7 +843,7 @@ def rebind_variational_variables(domain, node, target_support: str, target_regio
         )
 
         if new_expr is not node.expr:
-            rebuilt_tracker = Tracker(new_expr, interval=node.interval)
+            rebuilt_tracker = Tracker(new_expr, interval=node.interval, reduce=node.reduce)
             rebuilt_tracker.op_id = node.op_id
             return rebuilt_tracker
 
@@ -1278,7 +1278,7 @@ def substitute_trial_for_vpinn(
         )
 
         if new_expr is not node.expr:
-            rebuilt_tracker = Tracker(new_expr, interval=node.interval)
+            rebuilt_tracker = Tracker(new_expr, interval=node.interval, reduce=node.reduce)
             rebuilt_tracker.op_id = node.op_id
             return rebuilt_tracker
 
