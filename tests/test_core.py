@@ -350,3 +350,53 @@ class TestSubsteps:
         active = _active_model_lids([L_int1])
         assert n1.layer_id in active
         assert n2.layer_id not in active
+
+
+# ---------------------------------------------------------------------------
+# Non-scalar tracker + reduce= callable
+# ---------------------------------------------------------------------------
+
+
+class TestTrackerNonScalar:
+    def _build(self, key_seed=0):
+        import numpy as np  # noqa: F401
+
+        dom = _stationary_1d_domain(mesh_size=0.05)
+        x, *_ = dom.variable("interior")
+        net = _tiny_net(key_seed=key_seed)
+        net.optimizer(optax.adam(1e-3))
+        u = net(x) * x * (1 - x)
+        pde = jnn.laplacian(u, [x]).mse
+        return dom, x, u, pde
+
+    def test_nonscalar_tracker_stores_arrays_in_track_stats(self):
+        """A tracker on a vector expression must not crash and must store
+        arrays (not scalars) in track_stats when no reduce= is given."""
+        import numpy as np
+
+        dom, x, u, pde = self._build(key_seed=1)
+        # u has shape (n_points, 1) — non-scalar per collocation point
+        crux = jno.core([pde, u.tracker(1)], dom)
+        stats = crux.solve(3)
+
+        raw = stats.training_logs[-1]["track_stats"]
+        # mixed shapes → stored as list, not a 2-D numpy array
+        assert isinstance(raw, list), "expected list for non-scalar track_stats"
+        # each log step has one tracker entry; it should be an array with ndim > 0
+        assert all(isinstance(row[0], np.ndarray) and row[0].ndim > 0 for row in raw)
+
+    def test_tracker_reduce_callable_yields_scalar_track_stats(self):
+        """With reduce=, every tracker value collapses to a scalar and
+        track_stats is stored as a 2-D numpy array (backward-compat path)."""
+        import numpy as np
+
+        dom, x, u, pde = self._build(key_seed=2)
+        # reduce to L2 norm — user-provided Python callable
+        crux = jno.core([pde, u.tracker(1, reduce=lambda v: float(np.linalg.norm(v)))], dom)
+        stats = crux.solve(3)
+
+        raw = stats.training_logs[-1]["track_stats"]
+        assert isinstance(raw, np.ndarray), "expected ndarray for all-scalar track_stats"
+        assert raw.ndim == 2
+        assert raw.shape[1] == 1  # one tracker column
+        assert np.all(np.isfinite(raw))

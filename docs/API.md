@@ -45,7 +45,13 @@ sampling, and tensor tags.
         - export
         - plot_mesh
 
-::: jno.domain.csg
+### `jno.domain.csg`
+
+::: jno.domain.polygon_domain.PolygonDomain
+    options:
+      show_root_heading: false
+      show_root_toc_entry: false
+      show_root_full_path: false
 
 ---
 

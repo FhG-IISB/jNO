@@ -464,20 +464,17 @@ class Tuner:
         has_arch_tuning = space.has_architecture_params() and len(tunable_modules) > 0
         has_training_tuning = space.has_training_params()
 
-        if has_arch_tuning and len(tunable_modules) > 1:
-            raise NotImplementedError("Multiple TunableModules not yet supported")
-
-        tunable = tunable_modules[0] if tunable_modules else None
+        tunable_list = tunable_modules
 
         # Merge architecture space from TunableModule if present
-        space = self._merge_spaces(space, tunable)
+        space = self._merge_spaces(space, tunable_list)
         has_arch_tuning = space.has_architecture_params()
 
         # Grid search mode
         if optimizer is None:
             return self._sweep_grid(
                 space=space,
-                tunable=tunable,
+                tunable_list=tunable_list,
                 choices=choice_nodes,
                 has_arch_tuning=has_arch_tuning,
                 has_training_tuning=has_training_tuning,
@@ -513,7 +510,7 @@ class Tuner:
                 ng_optim,
                 space,
                 budget,
-                tunable,
+                tunable_list,
                 choice_nodes,
                 has_arch_tuning,
                 device_config.devices[0],
@@ -523,7 +520,7 @@ class Tuner:
                 ng_optim,
                 space,
                 budget,
-                tunable,
+                tunable_list,
                 choice_nodes,
                 has_arch_tuning,
                 device_config,
@@ -539,14 +536,14 @@ class Tuner:
         self.core.log.info("Running final training...")
 
         # Run final training with best config
-        stats = self._run_final_training(final_config, space, tunable, choice_nodes, has_arch_tuning, tuning_history)
+        stats = self._run_final_training(final_config, space, tunable_list, choice_nodes, has_arch_tuning, tuning_history)
 
         return stats
 
     def _sweep_grid(
         self,
         space: ArchSpace,
-        tunable,
+        tunable_list,
         choices,
         has_arch_tuning: bool,
         has_training_tuning: bool,
@@ -573,7 +570,7 @@ class Tuner:
                 self.core.log.info(f"[{i + 1}/{total_configs}] {config}")
 
                 try:
-                    loss = self._evaluate_config(None, config, space, tunable, choices, has_arch_tuning)
+                    loss = self._evaluate_config(None, config, space, tunable_list, choices, has_arch_tuning)
                     tuning_history.append({"iteration": i + 1, "config": config, "loss": loss})
 
                     if loss < best_loss:
@@ -596,7 +593,7 @@ class Tuner:
         else:
             # Parallel grid search
             tuning_history, best_loss, best_config = self._sweep_grid_parallel(
-                grid, space, tunable, choices, has_arch_tuning, device_config
+                grid, space, tunable_list, choices, has_arch_tuning, device_config
             )
 
         self.core.log.info("\n=== Grid search complete ===")
@@ -606,7 +603,7 @@ class Tuner:
         self.core.log.info("Running final training...")
 
         # Run final training with best config
-        stats = self._run_final_training(best_config, space, tunable, choices, has_arch_tuning, tuning_history)
+        stats = self._run_final_training(best_config, space, tunable_list, choices, has_arch_tuning, tuning_history)
 
         return stats
 
@@ -614,7 +611,7 @@ class Tuner:
         self,
         grid: List[Arch],
         space: ArchSpace,
-        tunable,
+        tunable_list,
         choices,
         has_arch_tuning: bool,
         device_config: DeviceConfig,
@@ -635,7 +632,7 @@ class Tuner:
             try:
                 with jax.default_device(device):
                     solver_copy = self._create_trial_solver()
-                    loss = self._evaluate_config(solver_copy, config, space, tunable, choices, has_arch_tuning)
+                    loss = self._evaluate_config(solver_copy, config, space, tunable_list, choices, has_arch_tuning)
                 return config, iteration, loss, None
             except Exception as e:
                 return config, iteration, float("inf"), str(e)
@@ -709,7 +706,7 @@ class Tuner:
         tuning_history.sort(key=lambda x: x["iteration"])
         return tuning_history, best_loss, best_config
 
-    def _sweep_sequential(self, ng_optim, space, budget, tunable, choices, has_arch_tuning, device):
+    def _sweep_sequential(self, ng_optim, space, budget, tunable_list, choices, has_arch_tuning, device):
         """Original sequential sweep implementation."""
         best_loss = float("inf")
         best_config = None
@@ -722,7 +719,7 @@ class Tuner:
             self.core.log.info(f"[{i + 1}/{budget}] Trying: {config}")
 
             with jax.default_device(device):
-                final_loss = self._evaluate_config(None, config, space, tunable, choices, has_arch_tuning)
+                final_loss = self._evaluate_config(None, config, space, tunable_list, choices, has_arch_tuning)
 
             ng_optim.tell(candidate, final_loss)
             tuning_history.append({"iteration": i + 1, "config": config, "loss": final_loss})
@@ -736,7 +733,7 @@ class Tuner:
 
         return tuning_history, best_loss, best_config
 
-    def _sweep_parallel(self, ng_optim, space, budget, tunable, choices, has_arch_tuning, device_config):
+    def _sweep_parallel(self, ng_optim, space, budget, tunable_list, choices, has_arch_tuning, device_config):
         """Parallel sweep implementation using ThreadPoolExecutor."""
         best_loss = float("inf")
         best_config = None
@@ -757,7 +754,7 @@ class Tuner:
                     # Create a fresh solver copy for this trial
                     solver_copy = self._create_trial_solver()
 
-                    loss = self._evaluate_config(solver_copy, config, space, tunable, choices, has_arch_tuning)
+                    loss = self._evaluate_config(solver_copy, config, space, tunable_list, choices, has_arch_tuning)
 
                 return candidate, config, iteration, loss, None
             except Exception as e:
@@ -854,7 +851,7 @@ class Tuner:
         solver_copy.compile((1, 1))
         return solver_copy
 
-    def _evaluate_config(self, core_copy, config, space, tunable, choices, has_arch_tuning):
+    def _evaluate_config(self, core_copy, config, space, tunable_list, choices, has_arch_tuning):
         """Evaluate a single configuration and return the loss.
 
         When core_copy is provided (parallel sweeps), only the copy is mutated.
@@ -877,8 +874,8 @@ class Tuner:
         )
         trial_batchsize = config.get("batchsize", None)
 
-        # Set architecture if tunable module exists
-        if tunable is not None and has_arch_tuning:
+        # Set architecture for all tunable modules
+        if tunable_list and has_arch_tuning:
             from .trace import Model
 
             arch_config = Arch(
@@ -886,9 +883,10 @@ class Tuner:
                     (name, config(name)) for name in [g.name for g in space.get_architecture_groups()] if config.has(name)
                 )
             )
-            module_instance = tunable.instantiate(arch_config, key=jax.random.PRNGKey(0))
-            tunable._current_instance = Model(module_instance)
-            tunable._current_instance.layer_id = tunable.layer_id
+            for tunable in tunable_list:
+                module_instance = tunable.instantiate(arch_config, key=jax.random.PRNGKey(0))
+                tunable._current_instance = Model(module_instance)
+                tunable._current_instance.layer_id = tunable.layer_id
 
         # Set explicit Choice node selections from this trial config.
         for ch in choices or []:
@@ -921,23 +919,26 @@ class Tuner:
             traceback.print_exc()
             return float("inf")
 
-    def _merge_spaces(self, space, tunable):
-        """Merge architecture space from TunableModule if present.
+    def _merge_spaces(self, space, tunable_list):
+        """Merge architecture space from TunableModule(s) if present.
 
         Also injects per-model tunable options declared via
         :meth:`FlaxModule.tune` into the combined search space.
         """
         combined_space = ArchSpace()
 
-        # 1. Architecture params from TunableModule
-        if tunable is not None and hasattr(tunable, "space") and tunable.space is not None:
-            for g in tunable.space.groups:
-                if isinstance(g, UniqueGroup):
-                    combined_space.unique(g.name, g.options, "architecture")
-                elif isinstance(g, FloatGroup):
-                    combined_space.float_range(g.name, g.low, g.high, g.log_scale, "architecture")
-                elif isinstance(g, IntGroup):
-                    combined_space.int_range(g.name, g.low, g.high, "architecture")
+        # 1. Architecture params from all TunableModules
+        for tunable in tunable_list or []:
+            if tunable is not None and hasattr(tunable, "space") and tunable.space is not None:
+                for g in tunable.space.groups:
+                    if g.name in combined_space._name_to_group:
+                        continue  # already registered by an earlier TunableModule
+                    if isinstance(g, UniqueGroup):
+                        combined_space.unique(g.name, g.options, "architecture")
+                    elif isinstance(g, FloatGroup):
+                        combined_space.float_range(g.name, g.low, g.high, g.log_scale, "architecture")
+                    elif isinstance(g, IntGroup):
+                        combined_space.int_range(g.name, g.low, g.high, "architecture")
 
         # 2. Training params from the user-supplied space
         for g in space.get_training_groups():
@@ -1030,14 +1031,14 @@ class Tuner:
             else:
                 fm.optimizer(fallback_optimizer, lr=fallback_lr)
 
-    def _run_final_training(self, final_config, space, tunable, choices, has_arch_tuning, tuning_history):
+    def _run_final_training(self, final_config, space, tunable_list, choices, has_arch_tuning, tuning_history):
         """Run final training with the best configuration."""
 
         if final_config is None:
             raise RuntimeError("All sweep configurations failed; no valid final configuration found.")
 
-        # Set best architecture for final training
-        if tunable is not None and has_arch_tuning:
+        # Set best architecture for final training (all tunable modules)
+        if tunable_list and has_arch_tuning:
             from .trace import Model
 
             arch_config = Arch(
@@ -1047,9 +1048,10 @@ class Tuner:
                     if final_config.has(name)
                 )
             )
-            final_module = tunable.instantiate(arch_config, key=jax.random.PRNGKey(0))
-            tunable._current_instance = Model(final_module)
-            tunable._current_instance.layer_id = tunable.layer_id
+            for tunable in tunable_list:
+                final_module = tunable.instantiate(arch_config, key=jax.random.PRNGKey(0))
+                tunable._current_instance = Model(final_module)
+                tunable._current_instance.layer_id = tunable.layer_id
 
         for ch in choices or []:
             if final_config.has(ch.name):

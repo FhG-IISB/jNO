@@ -320,7 +320,7 @@ class Placeholder:
 
         return FunctionCall(_debug_print, [self], name="print")
 
-    def tracker(self, interval: int = 1) -> "Tracker":
+    def tracker(self, interval: int = 1, reduce=None) -> "Tracker":
         """Mark this expression as a tracked metric.
 
         Trackers are evaluated during training logs but do not contribute to
@@ -328,13 +328,18 @@ class Placeholder:
 
         Args:
             interval: Evaluate every ``interval`` epochs (must be >= 1).
+            reduce: Optional callable applied to the numpy array after device
+                transfer to produce a scalar for W&B and the progress line.
+                Defaults to ``np.mean`` for non-scalar outputs.  Example::
+
+                    u.d(x).tracker(100, reduce=lambda v: v.max())
 
         Returns:
             ``Tracker`` wrapper for this expression.
         """
         if not isinstance(interval, int) or interval < 1:
             raise ValueError(f"interval must be an integer >= 1, got {interval}")
-        return Tracker(self, interval)
+        return Tracker(self, interval, reduce=reduce)
 
     @property
     def shape(self) -> FunctionCall:
@@ -1043,9 +1048,10 @@ class BinaryOp(Placeholder):
 class Tracker(Placeholder):
     """Wraps an expression to be monitored during training without contributing to the loss."""
 
-    def __init__(self, expr: Placeholder, interval: int = 1):
+    def __init__(self, expr: Placeholder, interval: int = 1, reduce=None):
         self.expr = expr
         self.interval = interval
+        self.reduce = reduce
         self.op_id = _next_op_id()
 
     def __repr__(self):
@@ -1175,7 +1181,7 @@ class Model(Placeholder):
         """Print and persist a complete model-control summary.
 
         The summary is always printed to stdout. If a default jNO logger is
-        active, the same content is appended to ``<logger.path>/log.txt``.
+        active, the same content is appended to ``<logger.path>/log.log``.
 
         Returns:
             self (for chaining).

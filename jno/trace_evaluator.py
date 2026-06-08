@@ -1111,7 +1111,11 @@ class TraceEvaluator:
                     _outer, _inner = parse_hessian_scheme(scheme)
                     return ad_fn(_outer)(ad_fn(_inner)(u_of_t_scalar))(time_scalar0)
 
-                raise NotImplementedError(f"Temporal AD derivative order {temporal_derivative_order} is not supported.")
+                _grad = ad_fn(parse_ad_scheme(scheme))
+                fn = u_of_t_scalar
+                for _ in range(temporal_derivative_order):
+                    fn = _grad(fn)
+                return fn(time_scalar0)
 
             result = jax.vmap(temporal_derivative_single_point)(jnp.arange(N))
             return result[:, jnp.newaxis]

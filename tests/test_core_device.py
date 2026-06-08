@@ -107,6 +107,67 @@ class TestSetupParallelism:
 
 
 # ---------------------------------------------------------------------------
+# Domain-data CPU pinning — core invariant introduced by the fix for eager
+# GPU placement in prepare_domain_data(). Runs on CPU; no GPU required.
+# ---------------------------------------------------------------------------
+
+
+class TestDomainDataCPUPinning:
+    """prepare_domain_data() must pin context arrays to CPU, not default device.
+
+    The fix: replacing jnp.asarray() with jax.device_put(arr, _cpu_device())
+    in prepare_domain_data() ensures domain data never hits GPU at compile()
+    time. GPU placement only happens inside solve() (via _shard_data for
+    offload_data=False, or stays as numpy for offload_data=True).
+    """
+
+    def _build_solver(self):
+        dom = 1 * jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+        x, *_ = dom.variable("interior")
+        key = jax.random.PRNGKey(7)
+        u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=1, key=key))
+        u = u_net(x) * x * (1 - x)
+        pde = jnn.laplacian(u, [x])
+        return jno.core([pde.mse], dom)
+
+    def test_context_arrays_are_cpu_pinned_after_compile(self):
+        """Every JAX array in domain_data.context must live on a CPU device.
+
+        This is the primary invariant of the eager-placement fix: compile()
+        must not consume GPU memory, regardless of whether the user will call
+        solve(offload_data=True) or solve(offload_data=False).
+        """
+        cpu_devices = set(jax.devices("cpu"))
+        s = self._build_solver()
+        for key_name, v in s.domain_data.context.items():
+            if not isinstance(v, jax.Array) or v.ndim == 0:
+                continue
+            arr_devices = v.devices()
+            assert arr_devices.issubset(cpu_devices), (
+                f"domain_data.context['{key_name}'] is on {arr_devices}, expected CPU. "
+                "prepare_domain_data() must not call jnp.asarray() — use "
+                "jax.device_put(arr, _cpu_device()) instead."
+            )
+
+    def test_context_arrays_are_jax_arrays_not_numpy(self):
+        """Context values must be JAX arrays (CPU-pinned), not plain numpy.
+
+        Plain numpy would break JAX tracer indexing inside jit'd functions
+        (TracerArrayConversionError). CPU-pinned JAX arrays satisfy both
+        constraints: no GPU allocation at compile time, and compatible with
+        JAX tracing.
+        """
+        s = self._build_solver()
+        for key_name, v in s.domain_data.context.items():
+            if isinstance(v, dict) or isinstance(v, str):
+                continue
+            assert isinstance(v, jax.Array), (
+                f"domain_data.context['{key_name}'] is {type(v).__name__}, expected jax.Array. "
+                "CPU-pinned JAX arrays are required so downstream JIT'd code can index them."
+            )
+
+
+# ---------------------------------------------------------------------------
 # _shard_params
 # ---------------------------------------------------------------------------
 
@@ -399,12 +460,11 @@ class TestGPUPlacement:
 
     @requires_gpu
     def test_data_sharded_on_gpu_during_solve(self, monkeypatch):
-        """_shard_data is called with GPU-placed arrays during a standard solve.
+        """_shard_data input is CPU-pinned JAX arrays; output is on GPU.
 
-        We spy on core._shard_data to capture the dict it receives on the
-        first call made from within solve().  The arrays must already be on
-        the GPU (placed there by jnp.zeros / domain initialisation) and the
-        outputs must also be on the GPU.
+        prepare_domain_data() pins context to CPU. _shard_data (called from
+        solve()) moves the arrays to the target accelerator via NamedSharding.
+        We verify the *output* of _shard_data is on the GPU.
         """
         import optax
 
@@ -440,16 +500,16 @@ class TestGPUPlacement:
 
     @requires_gpu
     def test_offload_data_full_dataset_stays_on_host(self, monkeypatch):
-        """With offload_data=True, core.solve() stores the full dataset as plain
-        NumPy arrays on the host instead of loading everything onto the GPU.
+        """With offload_data=True, solve() converts CPU-pinned JAX arrays to numpy.
 
-        We spy on ``np.asarray`` inside the ``jno.core`` module to intercept
-        the conversion call made inside solve() and verify it receives JAX GPU
-        arrays (the domain context lives on GPU) and converts them to
-        host-resident numpy arrays.
+        prepare_domain_data() pins context to CPU (not GPU). When offload_data=True,
+        solve() calls np.asarray() on those CPU-pinned JAX arrays to obtain plain
+        numpy for per-batch streaming. We spy on np.asarray to verify:
+          - it is called (the offload path is entered), and
+          - input arrays are CPU-pinned JAX arrays (not GPU).
 
-        ``20 * domain`` sets ``total_samples=20``; ``batchsize=int(jax.device_count())`` is less than
-        20, so the guard in solve() does not suppress the offload path.
+        ``20 * domain`` sets ``total_samples=20``; ``batchsize=int(jax.device_count())``
+        is less than 20 so the offload path is not suppressed.
         """
         import sys
 
@@ -490,8 +550,9 @@ class TestGPUPlacement:
             "the host-offload path may not have been reached"
         )
         for arr_id, info in converted_types.items():
-            assert "gpu" in info["input_platform"], (
-                f"Expected input to np.asarray to be a GPU array, got {info['input_platform']}"
+            assert "cpu" in info["input_platform"], (
+                f"Expected input to np.asarray to be a CPU-pinned JAX array, got {info['input_platform']}. "
+                "prepare_domain_data() must not place domain data on GPU before solve()."
             )
             assert info["output_type"] == "ndarray", f"Expected np.asarray to return ndarray, got {info['output_type']}"
 

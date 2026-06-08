@@ -1133,3 +1133,79 @@ class TestBoundaryNormal:
         dom = self._make_2d_domain()
         with pytest.raises(ValueError, match="no outward normals found for tag 'interior'"):
             dom.variable("interior", normals=True)
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Fundamental Theorem of Calculus roundtrip
+# ───────────────────────────────────────────────────────────────────────────────
+
+
+class TestFTCRoundtrip:
+    """Compose temporal differentiation and integration end-to-end.
+
+    FTC: ∫₀ᵀ (∂u/∂t) dt = u(T) − u(0)
+
+    This exercises the composition path where an IntegralTime node wraps a
+    temporal Jacobian node — _eval_integral_time calls eval_at_t for each
+    time step, which dispatches to _eval_jacobian for the inner Jacobian.
+    """
+
+    def test_ftc_quadratic(self):
+        """u(t) = t²  →  ∫₀¹ 2t dt = 1.0  (exact, trapezoidal is order-2)."""
+        import jax
+
+        from jno.trace import Variable
+        from jno.trace_evaluator import TraceEvaluator
+        from tests.conftest import MockDomain
+
+        d = MockDomain(tags=["x"], dim=1)
+        d.context["__time__"] = jnp.zeros((1, 1))
+        _x = Variable("x", [0, 1], domain=d, axis="spatial")
+        t = Variable("__time__", [0, 1], domain=d, axis="temporal")
+
+        u = t * t  # u(t) = t²
+        ftc_expr = u.d(t).integrate(t)  # ∫ 2t dt  →  should equal u(1) − u(0) = 1
+
+        t_vals = jnp.linspace(0.0, 1.0, 200)
+        ctx = {
+            "x": jnp.zeros((1, 1)),
+            "__time__": jnp.zeros((1,)),
+            "__time_window__": t_vals.reshape(-1, 1),
+        }
+
+        ev = TraceEvaluator({})
+        result = float(jnp.squeeze(ev.evaluate(ftc_expr, ctx, {}, key=jax.random.PRNGKey(0))))
+        assert abs(result - 1.0) < 1e-3, f"FTC (t²): got {result:.6f}, expected 1.0"
+
+    def test_ftc_cosine(self):
+        """u(t) = sin(2πt)  →  ∫₀^(1/4) 2π cos(2πt) dt = sin(π/2) − sin(0) = 1.
+
+        Uses T = 0.25 so that u(T) − u(0) = 1, an easy exact reference.
+        """
+        import jax
+
+        from jno.trace import FunctionCall, Literal, Variable
+        from jno.trace_evaluator import TraceEvaluator
+        from tests.conftest import MockDomain
+
+        d = MockDomain(tags=["x"], dim=1)
+        d.context["__time__"] = jnp.zeros((1, 1))
+        _x = Variable("x", [0, 1], domain=d, axis="spatial")
+        t = Variable("__time__", [0, 1], domain=d, axis="temporal")
+
+        two_pi_t = Literal(2.0 * float(jnp.pi)) * t
+        u = FunctionCall(jnp.sin, [two_pi_t], "sin")  # sin(2πt)
+        ftc_expr = u.d(t).integrate(t)  # ∫ 2π cos(2πt) dt = sin(2πT) − sin(0)
+
+        T = 0.25  # u(T) − u(0) = sin(π/2) − 0 = 1
+        t_vals = jnp.linspace(0.0, T, 500)
+        ctx = {
+            "x": jnp.zeros((1, 1)),
+            "__time__": jnp.zeros((1,)),
+            "__time_window__": t_vals.reshape(-1, 1),
+        }
+
+        ev = TraceEvaluator({})
+        result = float(jnp.squeeze(ev.evaluate(ftc_expr, ctx, {}, key=jax.random.PRNGKey(0))))
+        expected = float(jnp.sin(2.0 * jnp.pi * T))  # = 1.0
+        assert abs(result - expected) < 2e-3, f"FTC (sin): got {result:.6f}, expected {expected:.6f}"

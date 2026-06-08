@@ -34,7 +34,7 @@ inf = jnp.inf
 nan = jnp.nan
 
 
-def tracker(op: Placeholder, interval: int = 1) -> Tracker:
+def tracker(op: Placeholder, interval: int = 1, reduce=None) -> Tracker:
     """Mark an expression as a tracked metric.
 
     Trackers are monitored during training but do NOT contribute to
@@ -43,9 +43,12 @@ def tracker(op: Placeholder, interval: int = 1) -> Tracker:
     Args:
         op: The expression to monitor.
         interval: Evaluate every *interval* epochs (default: every epoch).
+        reduce: Optional callable applied to the numpy array after device
+            transfer to produce a scalar for W&B and the progress line.
+            Defaults to ``np.mean`` for non-scalar outputs.
     """
 
-    return Tracker(op, interval)
+    return Tracker(op, interval, reduce=reduce)
 
 
 def constant(tag: str, data: Union[dict, str, Path]) -> ConstantNamespace:

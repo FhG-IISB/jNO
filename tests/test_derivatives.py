@@ -1083,3 +1083,52 @@ class TestFEMGuardOnStackedDomains:
         dom += 1 * jno.domain.disk(mesh_size=0.3)
         with pytest.raises(ValueError, match="not supported on stacked domains"):
             dom.init_fem()
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Temporal AD order > 2
+# ───────────────────────────────────────────────────────────────────────────────
+
+
+class TestTemporalDerivativeOrder3:
+    """Third-order temporal derivative — exercises the jax.grad loop fix."""
+
+    def test_third_order_temporal_derivative(self):
+        """u(t) = sin(2πt)  →  d³u/dt³ = -(2π)³ cos(2πt)."""
+        from tests.conftest import MockDomain
+
+        d = MockDomain(tags=["x"], dim=1)
+        d.context["__time__"] = jnp.zeros((1, 1))
+        _x = Variable("x", [0, 1], domain=d, axis="spatial")
+        t = Variable("__time__", [0, 1], domain=d, axis="temporal")
+
+        two_pi_t = Literal(2.0 * float(jnp.pi)) * t
+        u = FunctionCall(jnp.sin, [two_pi_t], "sin")
+        pts = jnp.ones((3, 1))
+
+        t_val = 0.17
+        result = _eval(u.d(t).d(t).d(t), {"x": pts, "__time__": jnp.array([t_val])})
+        expected = -((2.0 * jnp.pi) ** 3) * jnp.cos(2.0 * jnp.pi * t_val)
+        assert jnp.allclose(result, expected, atol=1e-3), (
+            f"d³u/dt³ at t={t_val:.2f}: got {float(result[0, 0]):.5f}, expected {float(expected):.5f}"
+        )
+
+    def test_fourth_order_temporal_derivative(self):
+        """u(t) = sin(2πt)  →  d⁴u/dt⁴ = (2π)⁴ sin(2πt)."""
+        from tests.conftest import MockDomain
+
+        d = MockDomain(tags=["x"], dim=1)
+        d.context["__time__"] = jnp.zeros((1, 1))
+        _x = Variable("x", [0, 1], domain=d, axis="spatial")
+        t = Variable("__time__", [0, 1], domain=d, axis="temporal")
+
+        two_pi_t = Literal(2.0 * float(jnp.pi)) * t
+        u = FunctionCall(jnp.sin, [two_pi_t], "sin")
+        pts = jnp.ones((3, 1))
+
+        t_val = 0.31
+        result = _eval(u.d(t).d(t).d(t).d(t), {"x": pts, "__time__": jnp.array([t_val])})
+        expected = (2.0 * jnp.pi) ** 4 * jnp.sin(2.0 * jnp.pi * t_val)
+        assert jnp.allclose(result, expected, atol=1e-2), (
+            f"d⁴u/dt⁴ at t={t_val:.2f}: got {float(result[0, 0]):.5f}, expected {float(expected):.5f}"
+        )

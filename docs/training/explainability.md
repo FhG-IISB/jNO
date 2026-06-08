@@ -1,8 +1,27 @@
 # Explainability
 
-A family of callbacks that give insight into what is happening inside the training loop. They work by differentiating through the constraint functions after each outer step, or by directly inspecting the residuals, independently of the gradient updates that drive training. Results are stored as numpy arrays on the callback object and, when a W&B run is active, pushed automatically to your dashboard.
+A family of trackers that give insight into what is happening inside the training loop. They work by differentiating through the constraint functions after each outer step, or by directly inspecting the residuals, independently of the gradient updates that drive training. Results are stored as numpy arrays on the tracker object and, when a W&B run is active, pushed automatically to your dashboard.
 
-Each callback registers itself in `on_solve_begin` — called once after the initial JIT compilation — and pre-compiles its JAX function against the current parameter shapes. The first call at `epoch % interval == 0` therefore runs a pre-warmed XLA kernel with no recompilation overhead. Internally, the three gradient callbacks share a single `jacrev`-based function that computes the full gradient matrix $G \in \mathbb{R}^{N \times P}$ where $N$ is the number of constraints and $P$ the number of (selected) parameters.
+Each tracker registers itself in `on_solve_begin` — called once after the initial JIT compilation — and pre-compiles its JAX function against the current parameter shapes. The first call at `epoch % interval == 0` therefore runs a pre-warmed XLA kernel with no recompilation overhead. Internally, the three gradient trackers share a single `jacrev`-based function that computes the full gradient matrix $G \in \mathbb{R}^{N \times P}$ where $N$ is the number of constraints and $P$ the number of (selected) parameters.
+
+Trackers are surfaced under two equivalent namespaces:
+
+- **`jno.trackers.*`** — preferred; matches the tracker mental model and ships factories that mirror `jno.callbacks.*` 1-for-1.
+- **`jno.callbacks.*`** — the historical entry point; remains supported. Both return the same classes.
+
+---
+
+## Live access: `tracker.value` vs `tracker.result`
+
+Each tracker exposes two complementary views of its data:
+
+| Attribute             | Updated when                                  | Type                | Used for                                                                                  |
+|-----------------------|-----------------------------------------------|---------------------|-------------------------------------------------------------------------------------------|
+| `tracker.value`       | Every time `epoch % interval == 0` fires      | `dict | None`       | **Live**: read by adaptive components (loss balancing) at the next step. `None` until the first interval. |
+| `tracker.latest_epoch`| Same as `tracker.value`                       | `int | None`        | Tells consumers how stale `value` is.                                                     |
+| `tracker.result`      | After `crux.solve()` returns                  | `dict[str, ndarray]`| **Post-training**: full history of every fire — `epochs` plus the per-metric stacked array. |
+
+The live channel is what enables tracker-driven loss balancing (next section). Until the first measurement, consumers see `tracker.value is None` and must fall back to a default (typically uniform weights).
 
 ---
 
@@ -295,6 +314,47 @@ cb_land  = jno.callbacks.loss_landscape(interval=500, mask=output_mask, n_grid=1
 ```
 
 The output-layer weight matrix typically gives the dominant gradient directions at a fraction of the cost of the full parameter set.
+
+---
+
+## Driving adaptive loss balancing from a tracker
+
+Two weight schemes consume tracker objects directly, reading their live `.value` inside the loss evaluation. Both follow the same staleness pattern as `ReLoBRaLo`: the tracker updates on its `interval`, the weight scheme reads the most recent cached value every step.
+
+```python
+from jno.utils.adaptive.weights import gradient_norm_balanced, ntk_balanced
+```
+
+### Gradient-norm balancing
+
+`gradient_norm_balanced(tracker)` reads `tracker.value["norms"]` and emits $w_i \propto 1 / \lVert\nabla L_i\rVert$, normalised so the weights sum to $N$. A constraint with a large gradient norm is down-weighted so it stops dominating the parameter update.
+
+```python
+gn = jno.trackers.gradient_norms(interval=50)
+w  = gradient_norm_balanced(gn)
+
+# Use the balancer just like any other host-side weight scheme — pass the
+# scalar per-loss values and multiply by the returned weights inside the
+# constraint expression.
+w_pde, w_bc = w(pde_loss_scalar, bc_loss_scalar)
+```
+
+### NTK-trace balancing (Wang, Yu & Perdikaris, 2022)
+
+`ntk_balanced([ntk_a, ntk_b, ...])` takes one NTK tracker per loss term — each measuring the kernel of *that* loss's network output — and emits $w_i = \mathrm{tr}(K_\text{total}) / \mathrm{tr}(K_i)$, normalised to sum to $N$. Constraints whose NTK trace is small converge slowly and receive more weight.
+
+```python
+ntk_pde = jno.trackers.ntk_spectrum(pde.grad(net), n_points=128, interval=200)
+ntk_bc  = jno.trackers.ntk_spectrum(bc.grad(net),  n_points=128, interval=200)
+w       = ntk_balanced([ntk_pde, ntk_bc], ema=0.9)
+
+# Register both trackers AND the balancer in the solver's callback list so
+# the trackers actually fire during training.
+crux.solve(10_000, callbacks=[ntk_pde, ntk_bc])
+w_pde, w_bc = w(pde_loss_scalar, bc_loss_scalar)
+```
+
+Until *every* listed tracker has fired at least once, the scheme returns uniform weights — the cold-start fallback. Reference: Sec. 3 of [[2007.14527](https://arxiv.org/abs/2007.14527)]. EMA convention: `ema=0.0` means "use the latest measurement immediately"; higher values smooth toward history (same direction as `ReLoBRaLo`'s `alpha`).
 
 ---
 
