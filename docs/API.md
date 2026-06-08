@@ -45,7 +45,7 @@ sampling, and tensor tags.
         - export
         - plot_mesh
 
-### Shapely / CSG path
+### `jno.domain.csg`
 
 ::: jno.domain.polygon_domain.PolygonDomain
     options:
