@@ -11,7 +11,7 @@ def test_logger_reports_log_file_path_once(tmp_path: Path):
     )
     logger.close()
 
-    log_file = tmp_path / "log.txt"
+    log_file = tmp_path / "log.log"
     contents = log_file.read_text()
 
     expected_line = f"Log file: {log_file.resolve()}"

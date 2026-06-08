@@ -13,7 +13,7 @@ class Logger:
         self,
         path: Union[str, Path] = Path("./"),
         log_print: Tuple[bool, bool] = (True, True),
-        name: str = "log.txt",
+        name: str = "jno.default",
     ):
         path = Path(path) if isinstance(path, str) else path
         self.path: Path = path
@@ -65,7 +65,7 @@ class Logger:
 
         # Recreate file handler
         if self.do_log and self.path is not None:
-            log_file = self.path / "log.txt"
+            log_file = self.path / "log.log"
             log_file.parent.mkdir(parents=True, exist_ok=True)
             self.file_handler = logging.FileHandler(str(log_file))
             self.file_handler.setLevel(log_level)
@@ -229,7 +229,7 @@ def init_default_logger(path: Path, log_print: Tuple[bool, bool] = (True, True),
     """Initialize (or rebind) the default logger.
 
     Args:
-        path: Directory where ``log.txt`` will be written.
+        path: Directory where ``log.log`` will be written.
         log_print: Tuple ``(log_to_file, print_to_console)``.
         force: If ``True``, always recreate the singleton logger for *path*.
     """

@@ -1175,7 +1175,7 @@ class Model(Placeholder):
         """Print and persist a complete model-control summary.
 
         The summary is always printed to stdout. If a default jNO logger is
-        active, the same content is appended to ``<logger.path>/log.txt``.
+        active, the same content is appended to ``<logger.path>/log.log``.
 
         Returns:
             self (for chaining).

@@ -537,7 +537,7 @@ class TraceCompiler:
         )
         logger.info(summary)
 
-        # Write detailed per-parameter report to a text file next to log.txt
+        # Write detailed per-parameter report to a text file next to log.log
         log_dir = getattr(logger, "path", None)
         if log_dir is not None:
             log_dir = Path(log_dir)
