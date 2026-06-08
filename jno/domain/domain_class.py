@@ -392,12 +392,38 @@ class domain(MeshIOMixin):
         finally:
             os.unlink(tmp.name)
 
+    def __new__(cls, constructor=None, **kwargs):
+        """Dispatch to PolygonDomain when constructor is a shapely geometry, vertex list, or dict."""
+        if cls is domain and constructor is not None:
+            if not isinstance(constructor, (str, domain)) and not callable(constructor):
+                from .polygon_domain import PolygonDomain
+
+                _POLY_KWARGS = frozenset(
+                    {
+                        "name",
+                        "geometry",
+                        "regions",
+                        "source_edges",
+                        "time",
+                        "compute_mesh_connectivity",
+                        "mesh_size",
+                        "sampler",
+                        "samplers",
+                        "resampling_strategy",
+                        "resampling_strategies",
+                    }
+                )
+                poly_kwargs = {k: v for k, v in kwargs.items() if k in _POLY_KWARGS}
+                return PolygonDomain(constructor, **poly_kwargs)
+        return super().__new__(cls)
+
     def __init__(
         self,
         constructor: Union[Callable, str, "domain", None] = None,
         algorithm: Optional[int] = None,
         time: Optional[Tuple[float, float, int]] = None,
         compute_mesh_connectivity: Optional[bool] = None,
+        **_ignored_kwargs,
     ):
         """
         Initialize the domain.

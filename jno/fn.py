@@ -753,6 +753,69 @@ def stop_gradient(field: "Placeholder") -> "FunctionCall":
 
 
 # ============================================================================
+# Gradient analysis
+# ============================================================================
+
+
+def cosine_similarity(a: Placeholder, b: Placeholder, eps: float = 1e-8) -> FunctionCall:
+    """Per-row cosine similarity between two Placeholder expressions.
+
+    For ``(N, P)`` inputs (e.g. two parameter Jacobians from ``u.grad(net)``)
+    returns an ``(N,)`` array of per-point similarities in ``[-1, 1]``.
+    For 1-D ``(P,)`` inputs returns a scalar.
+
+    Examples::
+
+        J1 = u_interior.grad(net)     # (N_int, P)
+        J2 = u_bc.grad(net)           # (N_bc, P)
+
+        # track per-point similarity during training
+        sim = jno.fn.cosine_similarity(J1, J2)
+        crux = jno.core([pde, bc, sim.tracker(100)], dom)
+
+        # or penalise gradient conflict directly
+        conflict = (jno.fn.cosine_similarity(J1, J2) + 1).mse
+    """
+
+    def _impl(x, y, _eps=eps):
+        dot = jnp.sum(x * y, axis=-1)
+        norm_x = jnp.sqrt(jnp.sum(x**2, axis=-1))
+        norm_y = jnp.sqrt(jnp.sum(y**2, axis=-1))
+        return dot / (norm_x * norm_y + _eps)
+
+    return FunctionCall(_impl, [a, b], name="cosine_similarity")
+
+
+def gradient_alignment(a: Placeholder, b: Placeholder, eps: float = 1e-8) -> FunctionCall:
+    """Scalar gradient alignment between two sets of parameter gradients.
+
+    Aggregates each ``(N, P)`` Jacobian over the spatial dimension first
+    (mean over rows) to obtain a single ``(P,)`` gradient vector per loss,
+    then returns their cosine similarity — a scalar in ``[-1, 1]``.
+
+    ``+1`` means the two losses pull the parameters in the same direction;
+    ``-1`` means direct conflict; ``0`` means orthogonal.
+
+    Example::
+
+        J_pde = residual.grad(net)    # (N_pde, P)
+        J_bc  = bc_res.grad(net)      # (N_bc,  P)
+
+        alignment = jno.fn.gradient_alignment(J_pde, J_bc)
+        crux = jno.core([pde, bc, alignment.tracker(100)], dom)
+    """
+
+    def _impl(x, y, _eps=eps):
+        gx = jnp.mean(x.reshape(-1, x.shape[-1]), axis=0) if x.ndim > 1 else x
+        gy = jnp.mean(y.reshape(-1, y.shape[-1]), axis=0) if y.ndim > 1 else y
+        dot = jnp.dot(gx, gy)
+        denom = jnp.sqrt(jnp.dot(gx, gx)) * jnp.sqrt(jnp.dot(gy, gy))
+        return dot / (denom + _eps)
+
+    return FunctionCall(_impl, [a, b], name="gradient_alignment")
+
+
+# ============================================================================
 # Loss functions
 # ============================================================================
 
