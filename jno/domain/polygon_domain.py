@@ -213,7 +213,7 @@ class PolygonDomain(domain):
 
     def __init__(
         self,
-        vertices: Optional[Sequence[Sequence[float]]] = None,
+        vertices: Any = None,
         *,
         name: str = "polygon",
         geometry: Optional[BaseGeometry] = None,
@@ -221,8 +221,41 @@ class PolygonDomain(domain):
         source_edges: Optional[Mapping[str, Sequence[BaseGeometry]]] = None,
         time: Optional[Tuple[float, float, int]] = None,
         compute_mesh_connectivity: bool = False,
+        mesh_size: Optional[float] = None,
+        sampler: Optional[Any] = None,
+        samplers: Optional[Mapping[str, Any]] = None,
+        resampling_strategy: Optional[Any] = None,
+        resampling_strategies: Optional[Mapping[str, Any]] = None,
     ):
         _require_shapely()
+
+        # Plan A: accept a shapely geometry as the first positional arg.
+        # Duck-type via geom_type — present on every shapely BaseGeometry subclass.
+        if vertices is not None and hasattr(vertices, "geom_type"):
+            if geometry is not None:
+                raise ValueError("Pass a shapely geometry as the first positional arg or via geometry=, not both.")
+            geometry = vertices  # type: ignore[assignment]
+            vertices = None
+
+        # Plan B: accept a dict of named regions as the first positional arg
+        elif isinstance(vertices, dict) and geometry is None and regions is None:
+            _regs: Dict[str, BaseGeometry] = {}
+            _sedges: Dict[str, List[BaseGeometry]] = {}
+            for _nm, _geom in vertices.items():
+                _poly = _as_polygonal_geometry(_geom)
+                if _poly.is_empty or _poly.area <= _GEOM_TOL:
+                    continue
+                _key = str(_nm)
+                if _key in _regs:
+                    raise ValueError(f"Duplicate polygon region name: {_key!r}")
+                _regs[_key] = _poly
+                _sedges[_key] = _edge_geometries_from_region(_poly)
+            _active = unary_union(list(_regs.values())) if _regs else GeometryCollection()  # type: ignore[misc, operator]
+            vertices = None
+            geometry = _as_polygonal_geometry(_active)
+            regions = _regs
+            source_edges = _sedges
+
         if compute_mesh_connectivity:
             compute_mesh_connectivity = False
 
@@ -251,6 +284,10 @@ class PolygonDomain(domain):
             geometry = polygon
         else:
             geometry = _as_polygonal_geometry(geometry)
+            # Plan C: explicit name registers the geometry as a named source region
+            if regions is None and name != "polygon":
+                regions = {name: geometry}
+                source_edges = {name: _edge_geometries_from_region(geometry)}
 
         self._active_geometry = geometry
         self._source_regions: Dict[str, BaseGeometry] = {
@@ -270,7 +307,29 @@ class PolygonDomain(domain):
         else:
             self.context["__time__"] = np.ones((1, 1))
 
+        # Build per-region sampler registry.
+        # sampler=fn   → applies to every interior region ("*" key)
+        # samplers={k: fn} → per named region; merged on top of sampler=
+        self._custom_region_samplers: Dict[str, Any] = {}
+        if sampler is not None:
+            self._custom_region_samplers["*"] = sampler
+        if samplers:
+            self._custom_region_samplers.update(samplers)
+
+        # Build per-region resampling-strategy registry.
+        # Entries are stored by region name (or "*" for global) and applied
+        # lazily when variable() resolves the final context tag.
+        self._pending_resamplers: Dict[str, Any] = {}
+        if resampling_strategy is not None:
+            self._pending_resamplers["*"] = resampling_strategy
+        if resampling_strategies:
+            self._pending_resamplers.update(resampling_strategies)
+
         self._rebuild_polygon_tags()
+
+        # Plan D: immediate mesh generation when mesh_size is given at construction
+        if mesh_size is not None:
+            self.build_mesh(mesh_size)
 
     @classmethod
     def from_polygons(
@@ -279,6 +338,11 @@ class PolygonDomain(domain):
         *,
         time: Optional[Tuple[float, float, int]] = None,
         compute_mesh_connectivity: bool = False,
+        mesh_size: Optional[float] = None,
+        sampler: Optional[Any] = None,
+        samplers: Optional[Mapping[str, Any]] = None,
+        resampling_strategy: Optional[Any] = None,
+        resampling_strategies: Optional[Mapping[str, Any]] = None,
     ) -> "PolygonDomain":
         """Create one CSG domain from a mapping of region names to vertices."""
         _require_shapely()
@@ -299,6 +363,11 @@ class PolygonDomain(domain):
             source_edges=source_edges,
             time=time,
             compute_mesh_connectivity=compute_mesh_connectivity,
+            mesh_size=mesh_size,
+            sampler=sampler,
+            samplers=samplers,
+            resampling_strategy=resampling_strategy,
+            resampling_strategies=resampling_strategies,
         )
 
     @classmethod
@@ -308,6 +377,11 @@ class PolygonDomain(domain):
         *,
         time: Optional[Tuple[float, float, int]] = None,
         compute_mesh_connectivity: bool = False,
+        mesh_size: Optional[float] = None,
+        sampler: Optional[Any] = None,
+        samplers: Optional[Mapping[str, Any]] = None,
+        resampling_strategy: Optional[Any] = None,
+        resampling_strategies: Optional[Mapping[str, Any]] = None,
     ) -> "PolygonDomain":
         """Create one CSG domain from named Shapely polygonal regions."""
         _require_shapely()
@@ -331,6 +405,11 @@ class PolygonDomain(domain):
             source_edges=source_edges,
             time=time,
             compute_mesh_connectivity=compute_mesh_connectivity,
+            mesh_size=mesh_size,
+            sampler=sampler,
+            samplers=samplers,
+            resampling_strategy=resampling_strategy,
+            resampling_strategies=resampling_strategies,
         )
 
     def _estimate_polygon_tol(self, geom: BaseGeometry) -> float:
@@ -523,7 +602,12 @@ class PolygonDomain(domain):
             remaining -= take
         return np.concatenate(accepted, axis=0)
 
-    def _sample_interior(self, tag: str, geom: BaseGeometry, n_samples: int) -> np.ndarray:
+    def _sample_interior(self, tag: str, geom: BaseGeometry, n_samples: int, sampler: Any = None) -> np.ndarray:
+        if sampler is not None:
+            pts = np.asarray(sampler(geom, n_samples), dtype=np.float64)
+            if pts.ndim != 2 or pts.shape[1] != 2:
+                raise ValueError(f"Custom sampler for '{tag}' must return an (n, 2) array, got shape {pts.shape}")
+            return pts
         parts, probs = self._area_parts_for_tag(tag, geom)
         choices = np.random.choice(len(parts), size=n_samples, p=probs)
         result = np.zeros((n_samples, 2), dtype=np.float64)
@@ -1024,7 +1108,13 @@ class PolygonDomain(domain):
         n_candidates = max(10 * n_base, 1000)
 
         if kind == "interior":
-            pts = self._sample_interior(base, geom, n_candidates)
+            region_name = base[len("interior_") :] if base.startswith("interior_") else None
+            custom_sampler = (
+                (self._custom_region_samplers.get(region_name) if region_name else None)
+                or self._custom_region_samplers.get("interior")
+                or self._custom_region_samplers.get("*")
+            )
+            pts = self._sample_interior(base, geom, n_candidates, sampler=custom_sampler)
             return pts, None
         else:
             pts, nrm = self._sample_boundary(base, n_candidates, with_normals=True)
@@ -1076,10 +1166,6 @@ class PolygonDomain(domain):
             if requested_tag not in self._polygon_tags:
                 available = sorted(self._polygon_tags)
                 raise ValueError(f"Tag '{requested_tag}' not found on PolygonDomain. Available polygon tags: {available}")
-            if sampler is not None:
-                raise ValueError(
-                    "PolygonDomain currently uses its built-in geometric samplers; custom samplers are not supported"
-                )
             if n_samples is None:
                 raise ValueError(
                     "PolygonDomain tags are lazy and require an explicit sample count, e.g. sample=(500, None)"
@@ -1091,12 +1177,22 @@ class PolygonDomain(domain):
             if normals and kind != "boundary":
                 raise ValueError(f"Normals are only available for boundary tags, got '{requested_tag}'")
 
+            # Resolve effective interior sampler:
+            # priority: per-call arg > per-region name > global "*" > built-in default
+            if sampler is None and kind == "interior":
+                region_name = requested_tag[len("interior_") :] if requested_tag.startswith("interior_") else None
+                sampler = (
+                    (self._custom_region_samplers.get(region_name) if region_name else None)
+                    or self._custom_region_samplers.get("interior")
+                    or self._custom_region_samplers.get("*")
+                )
+
             tag = self._next_context_tag(requested_tag)
             all_points = []
             all_normals = []
             for _ in range(batch_count):
                 if kind == "interior":
-                    pts = self._sample_interior(requested_tag, geom, n_samples)
+                    pts = self._sample_interior(requested_tag, geom, n_samples, sampler=sampler)
                     nrm = None
                 else:
                     pts, nrm = self._sample_boundary(requested_tag, n_samples, normals)
@@ -1175,6 +1271,15 @@ class PolygonDomain(domain):
         wants_lazy_count = isinstance(sample, tuple) and len(sample) > 0 and isinstance(sample[0], int)
 
         sampled_indices = None
+        # Inject a constructor-level resampling strategy if none was passed explicitly.
+        if resampling_strategy is None and self._pending_resamplers:
+            region_name = tag[len("interior_") :] if tag.startswith("interior_") else None
+            resampling_strategy = (
+                (self._pending_resamplers.get(region_name) if region_name else None)
+                or self._pending_resamplers.get("interior")
+                or self._pending_resamplers.get("*")
+            )
+
         if polygon_tag and (wants_lazy_count or not has_mesh_entry):
             if isinstance(sample, tuple) and len(sample) > 0 and isinstance(sample[0], (int, type(None))):
                 self.sample_dict.append([tag, sample, resampling_strategy, normals, view_factor])
@@ -1254,7 +1359,7 @@ class PolygonDomain(domain):
 
     def _new_from_csg(self, other: "PolygonDomain", geometry: BaseGeometry, op_name: str) -> "PolygonDomain":
         regions, edges = self._merged_sources(other)
-        return PolygonDomain(
+        result = PolygonDomain(
             geometry=_as_polygonal_geometry(geometry),
             name=f"{self._polygon_name}_{op_name}_{other._polygon_name}",
             regions=regions,
@@ -1262,6 +1367,16 @@ class PolygonDomain(domain):
             time=self._time_for_result(other),
             compute_mesh_connectivity=False,
         )
+        # Merge sampler/resampler registries: left operand (self) wins on key conflicts.
+        result._custom_region_samplers = {
+            **getattr(other, "_custom_region_samplers", {}),
+            **self._custom_region_samplers,
+        }
+        result._pending_resamplers = {
+            **getattr(other, "_pending_resamplers", {}),
+            **self._pending_resamplers,
+        }
+        return result
 
     def _coerce_other(self, other: Any) -> "PolygonDomain":
         if isinstance(other, PolygonDomain):
@@ -1321,6 +1436,7 @@ class PolygonDomain(domain):
         *,
         algorithm: int = 6,
         region_mesh_sizes: Optional[Mapping[str, float]] = None,
+        sizes: Optional[Mapping[str, float]] = None,
         interpolate: bool = True,
     ) -> "PolygonDomain":
         """Generate a gmsh mesh from the active Shapely CSG geometry.
@@ -1362,6 +1478,8 @@ class PolygonDomain(domain):
         Re-calling ``build_mesh`` re-meshes from scratch and clears the integral
         weight cache.
         """
+        if sizes is not None:
+            region_mesh_sizes = dict(sizes) if region_mesh_sizes is None else {**sizes, **region_mesh_sizes}
         _require_shapely()
         if self._active_geometry is None or self._active_geometry.is_empty or self._active_geometry.area <= _GEOM_TOL:
             raise ValueError("Cannot build mesh from empty active geometry")

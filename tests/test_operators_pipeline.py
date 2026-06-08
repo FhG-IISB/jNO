@@ -295,4 +295,3 @@ class TestWindowedHessian2DPipeline:
 
         rel = float(jnp.sqrt(jnp.mean((val - expected) ** 2)) / jnp.sqrt(jnp.mean(expected**2)))
         assert rel < 0.05, f"windowed Δu L²-rel err = {rel * 100:.2f}% > 5%"
-

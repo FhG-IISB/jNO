@@ -471,11 +471,47 @@ class EarlyStoppingCallback(Callback):
 
 
 # ---------------------------------------------------------------------------
+# Live-value mixin — shared by all explainability trackers
+# ---------------------------------------------------------------------------
+
+
+class _LiveValue:
+    """Expose the latest computed metric values to other in-loop components.
+
+    Adaptive weight schemes (see :mod:`jno.utils.adaptive.weights`) read
+    ``tracker.value`` inside their host callback to balance losses based on
+    a tracker's current measurement (NTK eigenvalues, per-loss gradient
+    norms, etc.).  Until the first time the metric fires, ``value`` is
+    ``None`` and ``latest_epoch`` is ``None`` — consumers must handle that
+    cold-start case (typically by falling back to uniform weights).
+    """
+
+    def _init_live_value(self) -> None:
+        self._latest: Optional[Dict[str, Any]] = None
+        self._latest_epoch: Optional[int] = None
+
+    def _publish(self, epoch: int, value: Dict[str, Any]) -> None:
+        self._latest = value
+        self._latest_epoch = int(epoch)
+
+    @property
+    def value(self) -> Optional[Dict[str, Any]]:
+        """Latest computed metric values (numpy dict) or ``None`` until the
+        first interval fires."""
+        return self._latest
+
+    @property
+    def latest_epoch(self) -> Optional[int]:
+        """Epoch index when :attr:`value` was last updated, or ``None``."""
+        return self._latest_epoch
+
+
+# ---------------------------------------------------------------------------
 # Shared base for gradient-analysis callbacks (1–3)
 # ---------------------------------------------------------------------------
 
 
-class _PerLossGradCallback(Callback):
+class _PerLossGradCallback(Callback, _LiveValue):
     """Base class for callbacks that require per-loss gradients.
 
     Builds and pre-compiles a single ``jacrev``-based function in
@@ -488,6 +524,7 @@ class _PerLossGradCallback(Callback):
         self._mask = mask
         self._grad_fn = None
         self._epochs: list = []
+        self._init_live_value()
 
     def on_solve_begin(self, **kwargs) -> None:
         from jno.utils.explainability import make_per_loss_grad_fn
@@ -545,8 +582,10 @@ class GradientNormsCallback(_PerLossGradCallback):
         if out is not None:
             norms, _, _ = out
             epoch = kwargs["epoch"]
+            norms_np = np.asarray(norms)
             self._epochs.append(epoch)
-            self._norms.append(np.asarray(norms))
+            self._norms.append(norms_np)
+            self._publish(epoch, {"norms": norms_np})
             if get_wandb_run() is not None:
                 wandb_log(
                     {f"explainability/gradient_norm/constraint_{i}": float(v) for i, v in enumerate(norms)},
@@ -602,6 +641,7 @@ class CosSimilarityCallback(_PerLossGradCallback):
             self._epochs.append(epoch)
             cos_np = np.asarray(cos_matrix)
             self._cos.append(cos_np)
+            self._publish(epoch, {"cos_sim_matrix": cos_np})
             if get_wandb_run() is not None:
                 N = cos_np.shape[0]
                 wb: dict = {
@@ -672,9 +712,11 @@ class GradientAlignmentCallback(_PerLossGradCallback):
             _, _, alignment = out
             epoch = kwargs["epoch"]
             self._epochs.append(epoch)
-            self._align.append(float(alignment))
+            align_v = float(alignment)
+            self._align.append(align_v)
+            self._publish(epoch, {"alignment": align_v})
             if get_wandb_run() is not None:
-                wandb_log({"explainability/gradient_alignment": float(alignment)}, step=epoch)
+                wandb_log({"explainability/gradient_alignment": align_v}, step=epoch)
         return False
 
     @property
@@ -696,7 +738,7 @@ class GradientAlignmentCallback(_PerLossGradCallback):
 # ---------------------------------------------------------------------------
 
 
-class LossLandscapeCallback(Callback):
+class LossLandscapeCallback(Callback, _LiveValue):
     """Evaluate the 2-D loss landscape periodically during training.
 
     At every ``interval`` outer steps, samples two random filter-normalized
@@ -737,6 +779,7 @@ class LossLandscapeCallback(Callback):
         self._landscape_fn = None
         self._epochs: list = []
         self._landscapes: list = []
+        self._init_live_value()
 
     def on_solve_begin(self, **kwargs) -> None:
         from jno.utils.explainability import make_landscape_fn
@@ -765,6 +808,7 @@ class LossLandscapeCallback(Callback):
         self._epochs.append(epoch)
         ls_np = np.asarray(ls)
         self._landscapes.append(ls_np)
+        self._publish(epoch, {"landscape": ls_np})
         if get_wandb_run() is not None:
             wb: dict = {}
             try:
@@ -803,7 +847,7 @@ class LossLandscapeCallback(Callback):
 # ---------------------------------------------------------------------------
 
 
-class ResidualStatsCallback(Callback):
+class ResidualStatsCallback(Callback, _LiveValue):
     """Track per-constraint residual distributions during training.
 
     At every ``interval`` outer steps, evaluates each constraint's
@@ -846,6 +890,7 @@ class ResidualStatsCallback(Callback):
         self._stds: list = []
         self._maxes: list = []
         self._p99: list = []
+        self._init_live_value()
 
     def on_solve_begin(self, **kwargs) -> None:
         from jno.utils.explainability import make_residual_stats_fn
@@ -899,6 +944,16 @@ class ResidualStatsCallback(Callback):
         self._stds.append(stds_sel)
         self._maxes.append(maxes_sel)
         self._p99.append(p99_sel)
+        self._publish(
+            epoch,
+            {
+                "means": means_sel,
+                "stds": stds_sel,
+                "maxes": maxes_sel,
+                "p99": p99_sel,
+                "indices": np.array(idx, dtype=int),
+            },
+        )
 
         if get_wandb_run() is not None:
             wb: dict = {}
@@ -950,7 +1005,7 @@ class ResidualStatsCallback(Callback):
 # ---------------------------------------------------------------------------
 
 
-class InputSensitivityCallback(Callback):
+class InputSensitivityCallback(Callback, _LiveValue):
     """Evaluate any placeholder expression at training collocation points.
 
     Most useful for input-saliency: pass ``u.d(x)`` (single coordinate) or
@@ -992,6 +1047,7 @@ class InputSensitivityCallback(Callback):
         self._fn = None
         self._epochs: list = []
         self._values: list = []
+        self._init_live_value()
 
     def on_solve_begin(self, **kwargs) -> None:
         from jno.utils.explainability import make_expression_eval_fn
@@ -1022,6 +1078,7 @@ class InputSensitivityCallback(Callback):
         values = np.asarray(jax.device_get(self._fn(kwargs["trainable"], kwargs["context"], kwargs["rng"])))
         self._epochs.append(epoch)
         self._values.append(values)
+        self._publish(epoch, {"values": values})
         if get_wandb_run() is not None:
             abs_v = np.abs(values)
             wb: dict = {
@@ -1057,7 +1114,7 @@ class InputSensitivityCallback(Callback):
 # ---------------------------------------------------------------------------
 
 
-class NTKSpectrumCallback(Callback):
+class NTKSpectrumCallback(Callback, _LiveValue):
     """Track the empirical Neural Tangent Kernel eigenvalue spectrum.
 
     For a :class:`~jno.trace.NetworkGradient` placeholder ``u.grad(net)``
@@ -1119,6 +1176,7 @@ class NTKSpectrumCallback(Callback):
         self._lam_max: list = []
         self._cond: list = []
         self._all: list = []
+        self._init_live_value()
 
     def on_solve_begin(self, **kwargs) -> None:
         from jno.utils.explainability import make_ntk_spectrum_fn
@@ -1161,6 +1219,17 @@ class NTKSpectrumCallback(Callback):
         self._lam_max.append(lam_max_v)
         self._cond.append(cond_v)
         self._all.append(all_np)
+        self._publish(
+            epoch,
+            {
+                "eigvals_topk": top_np,
+                "lambda_min": lam_min_v,
+                "lambda_max": lam_max_v,
+                "condition_number": cond_v,
+                "all_eigvals": all_np,
+                "trace": float(all_np.sum()),
+            },
+        )
 
         if get_wandb_run() is not None:
             wb: dict = {f"explainability/ntk/eigval_{i}": float(v) for i, v in enumerate(top_np)}
@@ -1195,7 +1264,7 @@ class NTKSpectrumCallback(Callback):
 # ---------------------------------------------------------------------------
 
 
-class HessianSpectrumCallback(Callback):
+class HessianSpectrumCallback(Callback, _LiveValue):
     """Track the top-k Hessian eigenvalues of the total training loss.
 
     Constructs :math:`\\nabla^2_\\theta L` implicitly via Hessian-vector
@@ -1239,6 +1308,7 @@ class HessianSpectrumCallback(Callback):
         self._epochs: list = []
         self._eigvals: list = []
         self._sharpness: list = []
+        self._init_live_value()
 
     def on_solve_begin(self, **kwargs) -> None:
         from jno.utils.explainability import make_hessian_spectrum_fn
@@ -1273,9 +1343,11 @@ class HessianSpectrumCallback(Callback):
             return False
         top, lambda_max, _all = self._fn(kwargs["trainable"], kwargs["context"], kwargs["rng"])
         top_np = np.asarray(top)
+        sharp_v = float(lambda_max)
         self._epochs.append(epoch)
         self._eigvals.append(top_np)
-        self._sharpness.append(float(lambda_max))
+        self._sharpness.append(sharp_v)
+        self._publish(epoch, {"eigvals": top_np, "sharpness": sharp_v})
 
         if get_wandb_run() is not None:
             wb: dict = {f"explainability/hessian/eigval_{i}": float(v) for i, v in enumerate(top_np)}

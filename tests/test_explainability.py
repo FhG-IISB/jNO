@@ -354,3 +354,160 @@ def test_hessian_spectrum_subset_rejects_unknown_constraint():
     cb_bad = HessianSpectrumCallback(k=2, n_iter=4, interval=1, constraints=[u.mse])
     with pytest.raises(ValueError, match="constraint .* not found"):
         solver.solve(1, callbacks=[cb_bad])
+
+
+# ---------------------------------------------------------------------------
+# Live-value channel (tracker.value / tracker.latest_epoch)
+# ---------------------------------------------------------------------------
+
+
+def test_tracker_value_starts_none_then_populates_after_first_interval():
+    """tracker.value is None before any computation, then a dict with the
+    advertised keys after the first interval fires."""
+    import foundax
+    import optax
+
+    import jno
+    import jno.jnp_ops as jnn
+    from jno import LearningRateSchedule as lrs
+
+    domain = jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+    x, _ = domain.variable("interior")
+    key = jax.random.PRNGKey(0)
+
+    u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=4, num_layers=2, key=key))
+    u_net.optimizer(optax.sgd, lr=lrs.exponential(0.0, 1.0, 1, 0.0))
+    u = u_net(x)
+
+    solver = jno.core([u.mse], domain)
+
+    gn = jno.trackers.gradient_norms(interval=2)
+    ntk = jno.trackers.ntk_spectrum(u.grad(u_net), n_points=4, top_k=2, interval=2)
+    res = jno.trackers.residual_stats(interval=2)
+
+    # Before solve(): both trackers are unfired.
+    assert gn.value is None and gn.latest_epoch is None
+    assert ntk.value is None
+    assert res.value is None
+
+    # One outer step: interval=2 hasn't fired yet (epoch 0 fires only when
+    # 0 % 2 == 0 ✓ — so it DOES fire at epoch 0). Verify after solve.
+    solver.solve(2, callbacks=[gn, ntk, res])
+
+    assert gn.value is not None
+    assert set(gn.value.keys()) == {"norms"}
+    assert gn.value["norms"].shape == (1,)
+    assert gn.latest_epoch is not None
+
+    assert ntk.value is not None
+    assert {"eigvals_topk", "lambda_max", "trace", "condition_number"}.issubset(ntk.value.keys())
+    assert ntk.value["eigvals_topk"].shape == (2,)
+
+    assert res.value is not None
+    assert {"means", "stds", "maxes", "p99", "indices"}.issubset(res.value.keys())
+
+
+# ---------------------------------------------------------------------------
+# Tracker-driven weight schemes
+# ---------------------------------------------------------------------------
+
+
+def test_gradient_norm_balanced_returns_uniform_then_inverse_of_norms():
+    """GradientNormBalanced returns ones() before the tracker fires and
+    weights inversely proportional to tracker.value['norms'] afterwards."""
+    import numpy as _np
+
+    from jno.utils.adaptive.weights import GradientNormBalanced
+
+    class _StubTracker:
+        value = None
+
+    tracker = _StubTracker()
+    w = GradientNormBalanced(tracker)
+
+    # Cold start — no value yet → uniform weights.
+    w0, w1 = w(jnp.array(0.5), jnp.array(0.7))
+    _np.testing.assert_allclose(_np.asarray([w0, w1]), _np.array([1.0, 1.0]), atol=1e-6)
+
+    # Populate the tracker with known norms.
+    tracker.value = {"norms": _np.array([1.0, 4.0], dtype=_np.float32)}
+    w0, w1 = w(jnp.array(0.5), jnp.array(0.7))
+    out = _np.asarray([w0, w1], dtype=_np.float32)
+    # inv = [1.0, 0.25] → normalised to sum=2 → [1.6, 0.4]
+    _np.testing.assert_allclose(out, _np.array([1.6, 0.4], dtype=_np.float32), atol=1e-5)
+
+
+def test_ntk_balanced_returns_uniform_until_all_trackers_fire():
+    """NTKBalanced waits until every tracker has a 'trace' value."""
+    import numpy as _np
+
+    from jno.utils.adaptive.weights import NTKBalanced
+
+    class _StubTracker:
+        def __init__(self):
+            self.value = None
+
+    t0, t1 = _StubTracker(), _StubTracker()
+    w = NTKBalanced([t0, t1], ema=0.0)  # ema=0 ⇒ no smoothing, use latest
+
+    # Both unset → uniform.
+    out = _np.asarray(w(jnp.array(0.1), jnp.array(0.2)))
+    _np.testing.assert_allclose(out, _np.array([1.0, 1.0]), atol=1e-6)
+
+    # Only one set → still uniform.
+    t0.value = {"trace": 1.0}
+    out = _np.asarray(w(jnp.array(0.1), jnp.array(0.2)))
+    _np.testing.assert_allclose(out, _np.array([1.0, 1.0]), atol=1e-6)
+
+    # Both set → w_i = tr(K_total) / tr(K_i), re-normalised to sum to N.
+    # traces = [1.0, 4.0]; total = 5.0; raw = [5, 1.25]; sum=6.25; *2/6.25 = [1.6, 0.4]
+    t1.value = {"trace": 4.0}
+    out = _np.asarray(w(jnp.array(0.1), jnp.array(0.2)))
+    _np.testing.assert_allclose(out, _np.array([1.6, 0.4], dtype=_np.float32), atol=1e-5)
+
+
+def test_ntk_balanced_end_to_end_against_live_solver():
+    """Wire an NTK tracker + NTKBalanced through crux.solve() and verify
+    the scheme emits non-uniform weights once the tracker has fired."""
+    import foundax
+    import optax
+
+    import jno
+    import jno.jnp_ops as jnn
+    from jno import LearningRateSchedule as lrs
+
+    domain = jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+    x, _ = domain.variable("interior")
+    key = jax.random.PRNGKey(0)
+
+    u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=4, num_layers=2, key=key))
+    u_net.optimizer(optax.sgd, lr=lrs.exponential(0.0, 1.0, 1, 0.0))
+    u = u_net(x)
+
+    # Two trackers — different network outputs so their traces differ
+    # measurably. We use u and u*u as the scalar projections.
+    ntk_a = jno.trackers.ntk_spectrum(u.grad(u_net), n_points=4, top_k=2, interval=1)
+    ntk_b = jno.trackers.ntk_spectrum((u * 2.0).grad(u_net), n_points=4, top_k=2, interval=1)
+
+    solver = jno.core([u.mse, (u * 2.0).mse], domain)
+    solver.solve(2, callbacks=[ntk_a, ntk_b])
+
+    # Both trackers should have fired.
+    assert ntk_a.value is not None and ntk_b.value is not None
+    # Traces differ by a factor proportional to the chain rule (scale on u → factor 4 on K).
+    assert ntk_a.value["trace"] > 0.0
+    assert ntk_b.value["trace"] > 0.0
+
+    # Now use the trackers to drive a weight scheme. Disable EMA so the
+    # cold-start uniform doesn't dominate.
+    from jno.utils.adaptive.weights import ntk_balanced
+
+    w = ntk_balanced([ntk_a, ntk_b], ema=0.0)
+    w0, w1 = w(jnp.array(0.1), jnp.array(0.2))
+    import numpy as _np
+
+    out = _np.asarray([w0, w1], dtype=_np.float32)
+    # Weights must sum to N=2 (within tolerance).
+    _np.testing.assert_allclose(out.sum(), 2.0, atol=1e-4)
+    # And non-uniform (traces differ).
+    assert not _np.allclose(out, _np.array([1.0, 1.0]))

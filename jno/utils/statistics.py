@@ -82,7 +82,12 @@ class statistics:
             total_loss = np.array(log_dict.get("total_loss", []))
             losses = np.array(log_dict.get("losses", []))
             ts = np.array(log_dict.get("timestamps", []))
-            track = np.array(log_dict.get("track_stats", []))
+            raw_track = log_dict.get("track_stats", [])
+            if isinstance(raw_track, list):
+                # mixed shapes: reduce every entry to its mean so the panel can plot
+                track = np.array([[float(np.mean(v)) for v in row] for row in raw_track]) if raw_track else np.array([])
+            else:
+                track = np.array(raw_track)
 
             all_epochs.append(epochs + epoch_offset)
             all_total_loss.append(total_loss)

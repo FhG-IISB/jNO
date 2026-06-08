@@ -647,9 +647,7 @@ class core:
                 # If it's a nested dictionary (like our VPINN surface_data), map safely
                 if isinstance(arr, dict):
                     # 1. Convert leaves to JAX arrays pinned to CPU — GPU placement happens in solve()
-                    arr = jax.tree_util.tree_map(
-                        lambda x: jax.device_put(x, _cpu_device()), arr
-                    )
+                    arr = jax.tree_util.tree_map(lambda x: jax.device_put(x, _cpu_device()), arr)
                     # 2. Add the batch dimension [None, ...] to every array in the dict, FEM/static metadata dicts must stay unbatched
                     if tag in metadata_tags:
                         context[tag] = arr
@@ -738,7 +736,7 @@ class core:
         elif isinstance(node, Tracker):
             new_expr = self._materialize_marked_weak(node.expr, parent_is_weak=is_weak)
             if new_expr is not node.expr:
-                rebuilt_tracker = Tracker(new_expr, interval=node.interval)
+                rebuilt_tracker = Tracker(new_expr, interval=node.interval, reduce=node.reduce)
                 if is_weak:
                     setattr(rebuilt_tracker, "_is_weak_expr", True)
                     setattr(
@@ -813,7 +811,7 @@ class core:
             full_models = _paramax.unwrap(full_models)
             results = []
             for _, fn in compiled_trackers:
-                results.append(jnp.mean(fn(full_models, context, batchsize=batchsize, key=rng)))
+                results.append(fn(full_models, context, batchsize=batchsize, key=rng))
             return results
 
         return track_fn
@@ -1450,6 +1448,7 @@ class core:
 
         # === Compile constraints and trackers ===
         self.compiled_trackers = []
+        self._tracker_reduce_fns = []
         self._constraint_exprs = []  # raw expressions for shape tracing
         # Original (pre-wrap, pre-CSE) constraint expressions in the same order
         # as ``_constraint_exprs`` — used by callbacks like residual_stats /
@@ -1462,16 +1461,20 @@ class core:
         for orig_expr, expr in zip(self.constraints, constraints):
             inner = expr
             tracker_interval = None
+            tracker_reduce = None
             if isinstance(expr, OperationDef) and isinstance(expr.expr, Tracker):
                 tracker_interval = expr.expr.interval
+                tracker_reduce = expr.expr.reduce
                 inner = OperationDef(expr.expr.expr)
             elif isinstance(expr, Tracker):
                 tracker_interval = expr.interval
+                tracker_reduce = expr.reduce
                 inner = expr.expr
 
             if tracker_interval is not None:
                 fn_expr = TraceCompiler.compile_traced_expression(inner, self.all_ops)
                 self.compiled_trackers.append((tracker_interval, fn_expr))
+                self._tracker_reduce_fns.append(tracker_reduce)
                 self._tracker_exprs.append(inner)
             else:
                 constraint_exprs.append(inner)
@@ -3681,19 +3684,29 @@ class core:
                     track_stats_np = None
                     if has_trackers and any(outer_epoch % (max(1, intv // inner_steps)) == 0 for intv in tracker_intervals):
                         track_vals = jit_track(trainable, context, self.rng)
-                        track_stats_np = [float(v) for v in jax.device_get(track_vals)]
+                        track_stats_np = []
+                        for _v, _rfn in zip(jax.device_get(track_vals), self._tracker_reduce_fns):
+                            _arr = np.asarray(_v)
+                            if _rfn is not None:
+                                _arr = np.asarray(_rfn(_arr))
+                            track_stats_np.append(_arr)
                         log_track_stats.append(track_stats_np)
                         # Log trackers to wandb
                         if _wandb_run is not None:
                             _wb_track = {}
                             for _ti, _tv in enumerate(track_stats_np):
-                                _wb_track[f"tracker_{_ti}"] = _tv
+                                _wb_track[f"tracker_{_ti}"] = float(np.mean(_tv))
                             wandb_log(_wb_track, step=displayed_epoch)
 
                     # Progress line
                     loss_strs = " | ".join(f"C{i}: {v:>10.4e}" for i, v in enumerate(losses_np))
                     if track_stats_np is not None:
-                        track_strs = " | ".join(f"T{i}: {v:>10.4e}" for i, v in enumerate(track_stats_np))
+                        track_strs = " | ".join(
+                            f"T{i}: {float(v):>10.4e}"
+                            if v.ndim == 0
+                            else f"T{i}: shape={v.shape} mean={float(np.mean(v)):.4e}"
+                            for i, v in enumerate(track_stats_np)
+                        )
                         self.log.info(
                             f"Epoch {displayed_epoch:>6}/{epochs}| L:{total_np:>10.4e} | {loss_strs} | {track_strs}"
                         )
@@ -3873,7 +3886,8 @@ class core:
                 "lora_params": n_lora_params_total,
             }
             if log_track_stats:
-                logs["track_stats"] = np.array(log_track_stats)
+                _all_scalar = all(v.ndim == 0 for row in log_track_stats for v in row)
+                logs["track_stats"] = np.array(log_track_stats) if _all_scalar else log_track_stats
             self.training_logs.append(logs)
             _t = int(logs["training_time"])
             self.log.info(f"Training took {_t // 3600}h {(_t % 3600) // 60}m {_t % 60}s")
