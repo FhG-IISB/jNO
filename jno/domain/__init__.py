@@ -22,9 +22,9 @@ __all__ = [
 
 from_array = _domain.from_array
 
-# User-facing entry point for the lazy Shapely-backed CSG domain.
-# `jno.domain.csg([...])` constructs a single-polygon CSG domain;
-# `jno.domain.csg.from_polygons({...})` and `.from_regions({...})` come along
-# unchanged. The underlying class itself is intentionally not re-exported
-# at the package top level.
+# jno.domain(geo) now dispatches to PolygonDomain via domain.__new__.
+# .csg kept as a backward-compatible alias for code that still uses it.
 _domain.csg = _PolygonDomain
+
+# Expose multi-geometry batch stacking as jno.domain.stack(n*d1, n*d2, ...)
+_domain.stack = staticmethod(_PolygonDomain.stack)

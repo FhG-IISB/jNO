@@ -1,6 +1,8 @@
+import functools
 import gc
 import os
 import time
+import weakref
 from typing import Any, Dict, List, Optional, Tuple, Union, cast
 
 import equinox as eqx
@@ -290,6 +292,10 @@ class core:
         self.dots: List = []
         self.all_ops: List[OperationDef] = []
         self._resume_from: Optional[str] = resume_from
+        # WeakKeyDictionary so entries die when the op expression is GC'd,
+        # preventing both id() recycling bugs and unbounded cache growth.
+        # Structure: op → {min_consecutive: eqx.filter_jit(compiled_fn)}
+        self._eval_cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
         super().__init__()
 
@@ -1494,6 +1500,9 @@ class core:
         # wrappers (which reference all losses) don't contaminate the tag set.
         self._constraint_tags = self.get_constraint_tags(self._resample_exprs)
         self.compiled_resample_constraints_fn = TraceCompiler.compile_multi_expression(self._resample_exprs, self.all_ops)
+
+        # Clear cached eval JITs — all_ops changed so compiled closures are stale.
+        self._eval_cache.clear()
 
         # self.log.info(f"There are a total of {self.count(self.models)} trainable parameters in the network/s.")
         return None
@@ -4382,12 +4391,20 @@ class core:
             raise ValueError(f"crux.eval(samples=...) expects 'auto' | 'chain' | 'point', got {samples!r}.")
 
         domain_data = self.domain_data if domain is None else self.prepare_domain_data(domain)
-        _models = self._unwrapped_models
+        _models = eqx.tree_inference(self._unwrapped_models)
         ctx = domain_data.context
 
         def _point_eval(op):
-            fn = TraceCompiler.compile_traced_expression(op, self.all_ops)
-            return fn(_models, ctx, batchsize=None, key=key, min_consecutive=min_consecutive)
+            op_entry = self._eval_cache.get(op)
+            if op_entry is None:
+                self._eval_cache[op] = op_entry = {}
+            if min_consecutive not in op_entry:
+                raw_fn = TraceCompiler.compile_traced_expression(op, self.all_ops)
+                # Bake min_consecutive into the closure — it controls array shapes
+                # inside the compiled function and must remain a static Python int
+                # for XLA to reuse the compiled kernel across calls.
+                op_entry[min_consecutive] = eqx.filter_jit(functools.partial(raw_fn, min_consecutive=min_consecutive))
+            return op_entry[min_consecutive](_models, ctx, batchsize=None, key=key)
 
         if samples == "point":
             results = [_point_eval(op) for op in operation]
@@ -4479,12 +4496,20 @@ class core:
         state["mesh"] = None
         state["data_sharding"] = None
         state["param_sharding"] = None
+        # eqx.filter_jit wrappers are not picklable; drop the cache.
+        # It will be rebuilt lazily on the next eval() call.
+        state["_eval_cache"] = None
 
         return state
 
     def __setstate__(self, state):
         """Restore state after unpickling."""
         self.__dict__.update(state)
+
+        # Rebuild the eval cache (dropped during pickling).
+        import weakref as _weakref
+
+        self._eval_cache = _weakref.WeakKeyDictionary()
 
         # Restore mesh and sharding
         mesh_shape = state.get("_mesh_shape")

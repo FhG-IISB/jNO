@@ -18,7 +18,7 @@ The `jno.domain` class manages mesh generation, physical group labelling, and sa
     geo = geo.difference(Point(0.5, 0.75).buffer(0.22))
     geo = geo.difference(Point(1.5, 0.38).buffer(0.18))
     geo = geo.difference(Point(2.45, 1.1).buffer(0.28))
-    dom = jno.domain.csg(geo).build_mesh(0.07)
+    dom = jno.domain(geo).build_mesh(0.07)
     x, y = dom.variable("interior")
     xb, yb = dom.variable("boundary")
     ```
@@ -29,7 +29,7 @@ The `jno.domain` class manages mesh generation, physical group labelling, and sa
     from shapely.geometry import Point
     big   = Point(0, 0).buffer(1.0, resolution=80)
     small = Point(0.42, 0.18).buffer(0.75, resolution=80)
-    dom = jno.domain.csg(big.difference(small)).build_mesh(0.05)
+    dom = jno.domain(big.difference(small)).build_mesh(0.05)
     ```
 
 === "3 · Wavy channel"
@@ -40,7 +40,7 @@ The `jno.domain` class manages mesh generation, physical group labelling, and sa
     x = np.linspace(0, 4 * np.pi, 120)
     top = list(zip(x,        0.55 + 0.22 * np.sin(x)))
     bot = list(zip(x[::-1], -0.55 + 0.22 * np.sin(x[::-1] + np.pi / 2.5)))
-    dom = jno.domain.csg(Polygon(top + bot), mesh_size=0.12)
+    dom = jno.domain(Polygon(top + bot), mesh_size=0.12)
     ```
 
 === "4 · 8-pointed star"
@@ -52,14 +52,14 @@ The `jno.domain` class manages mesh generation, physical group labelling, and sa
     angles = np.linspace(0, 2 * np.pi, 2 * n, endpoint=False)
     radii  = [1.0 if i % 2 == 0 else 0.45 for i in range(2 * n)]
     pts    = [(r * np.cos(a), r * np.sin(a)) for r, a in zip(radii, angles)]
-    dom = jno.domain.csg(Polygon(pts)).build_mesh(0.06)
+    dom = jno.domain(Polygon(pts)).build_mesh(0.06)
     ```
 
 === "5 · Three-region pipe"
 
     ```python
     from shapely.geometry import box
-    dom = jno.domain.csg({
+    dom = jno.domain({
         "inlet":  box(0.0, 0.15, 0.8, 0.85),
         "pipe":   box(0.8, 0.35, 2.2, 0.65),
         "outlet": box(2.2, 0.05, 3.0, 0.95),
@@ -75,7 +75,7 @@ The `jno.domain` class manages mesh generation, physical group labelling, and sa
 
     ```python
     from shapely.geometry import box
-    dom = jno.domain.csg({
+    dom = jno.domain({
         "stem": box(0.38, 0.00, 0.62, 0.82),
         "bar":  box(0.00, 0.82, 1.00, 1.06),
     }).build_mesh(0.05)
@@ -91,7 +91,7 @@ The `jno.domain` class manages mesh generation, physical group labelling, and sa
     fluid = Point(0, 0).buffer(0.52, resolution=64).difference(solid)
     wall  = box(-0.78, -0.78, 0.78, 0.78).difference(
                 Point(0, 0).buffer(0.52, resolution=64))
-    dom = jno.domain.csg(
+    dom = jno.domain(
         {"solid": solid, "fluid": fluid, "wall": wall}
     ).build_mesh(0.07, sizes={"solid": 0.015, "fluid": 0.025})
     x_s, y_s = dom.variable("interior_solid")
@@ -104,8 +104,8 @@ The `jno.domain` class manages mesh generation, physical group labelling, and sa
 
     ```python
     from shapely.geometry import box
-    left  = jno.domain.csg(box(0, 0, 0.5, 1), name="left")
-    right = jno.domain.csg(box(0.5, 0, 1, 1), name="right")
+    left  = jno.domain(box(0, 0, 0.5, 1), name="left")
+    right = jno.domain(box(0.5, 0, 1, 1), name="right")
     dom   = (left + right).build_mesh(0.05)
     x_l, y_l = dom.variable("interior_left")
     x_r, y_r = dom.variable("interior_right")
@@ -120,7 +120,7 @@ The `jno.domain` class manages mesh generation, physical group labelling, and sa
     first_q = box(0, 0, 1.05, 1.05)
     sector  = Point(0, 0).buffer(1.0, resolution=80).intersection(first_q)
     inner   = Point(0, 0).buffer(0.38, resolution=40)
-    dom = jno.domain.csg(sector.difference(inner)).build_mesh(0.05)
+    dom = jno.domain(sector.difference(inner)).build_mesh(0.05)
     ```
 
 === "10 · Horseshoe (C-shape)"
@@ -130,7 +130,7 @@ The `jno.domain` class manages mesh generation, physical group labelling, and sa
     outer = Point(0, 0).buffer(1.0, resolution=80)
     inner = Point(0, 0).buffer(0.52, resolution=80)
     clip  = box(-1.1, -1.1, 1.1, 0.08)
-    dom = jno.domain.csg(outer.difference(inner).difference(clip)).build_mesh(0.05)
+    dom = jno.domain(outer.difference(inner).difference(clip)).build_mesh(0.05)
     ```
 
 === "11 · Gear (8 notches + hub)"
@@ -144,13 +144,13 @@ The `jno.domain` class manages mesh generation, physical group labelling, and sa
         gear = gear.difference(
             Point(np.cos(a) * 0.80, np.sin(a) * 0.80).buffer(0.23, resolution=12))
     gear = gear.difference(Point(0, 0).buffer(0.22, resolution=48))
-    dom = jno.domain.csg(gear).build_mesh(0.05)
+    dom = jno.domain(gear).build_mesh(0.05)
     ```
 
 === "12 · L-shape (vertex list)"
 
     ```python
-    dom = jno.domain.csg(
+    dom = jno.domain(
         [[0,0],[2,0],[2,1],[1,1],[1,2],[0,2]]
     ).build_mesh(0.07)
     x, y = dom.variable("interior")
@@ -280,9 +280,9 @@ The `jno.domain` class manages mesh generation, physical group labelling, and sa
 
 ## Constructing a domain
 
-For **2-D problems**, the recommended path is `jno.domain.csg` — define your geometry with [shapely](https://shapely.readthedocs.io/) CSG arithmetic, call `.build_mesh()`, and you have a fully meshed domain that supports `.integrate()` and FD derivatives. For **3-D geometry**, PML absorbing layers, or cases that need raw gmsh control, use a [built-in named constructor](#2-built-in-named-constructors) or a [custom constructor](#3-custom-constructor-advanced-3-d) instead.
+For **2-D problems**, the recommended path is `jno.domain(geo)` — define your geometry with [shapely](https://shapely.readthedocs.io/) CSG arithmetic, call `.build_mesh()`, and you have a fully meshed domain that supports `.integrate()` and FD derivatives. For **3-D geometry**, PML absorbing layers, or cases that need raw gmsh control, use a [built-in named constructor](#2-built-in-named-constructors) or a [custom constructor](#3-custom-constructor-advanced-3-d) instead.
 
-### 1. `jno.domain.csg` — shapely → gmsh (2-D, recommended)
+### 1. `jno.domain` — shapely → gmsh (2-D, recommended)
 
 #### Basic usage
 
@@ -293,7 +293,7 @@ import jno
 from shapely.geometry import box, Point
 
 geo = box(0, 0, 2, 1).difference(Point(1, 0.5).buffer(0.3))
-dom = jno.domain.csg(geo).mesh(0.05)
+dom = jno.domain(geo).mesh(0.05)
 
 x, y   = dom.variable("interior")
 xb, yb, nx, ny = dom.variable("boundary", normals=True)
@@ -302,13 +302,13 @@ xb, yb, nx, ny = dom.variable("boundary", normals=True)
 For a simple polygon, pass a vertex list directly — no shapely import needed:
 
 ```python
-dom = jno.domain.csg([[0,0],[1,0],[1,0.5],[0.5,1],[0,1]]).mesh(0.05)
+dom = jno.domain([[0,0],[1,0],[1,0.5],[0.5,1],[0,1]]).mesh(0.05)
 ```
 
-Add `mesh_size=` to the constructor for a one-liner when no per-region refinement is needed:
+Add `mesh_size=` for a one-liner when no per-region refinement is needed:
 
 ```python
-dom = jno.domain.csg(geo, mesh_size=0.05)
+dom = jno.domain(geo, mesh_size=0.05)
 ```
 
 #### CSG arithmetic and named regions
@@ -323,7 +323,7 @@ from shapely.geometry import box, Point
 fluid_geo = box(0, 0, 1, 1).difference(Point(0.5, 0.5).buffer(0.2))
 solid_geo = Point(0.5, 0.5).buffer(0.2)
 
-dom = jno.domain.csg({
+dom = jno.domain({
     "fluid": fluid_geo,
     "solid": solid_geo,
 }).build_mesh(0.08, sizes={"solid": 0.01})
@@ -333,7 +333,7 @@ x_s, y_s = dom.variable("interior_solid")      # solid sub-region only
 xb, yb   = dom.variable("boundary_solid")      # fluid-solid interface
 ```
 
-You can also apply CSG operators directly on `jno.domain.csg` instances — the source-region registry is merged and preserved on every operation:
+You can also apply CSG operators directly on `jno.domain` instances — the source-region registry is merged and preserved on every operation:
 
 | Operator | Method | Effect |
 |---|---|---|
@@ -343,8 +343,8 @@ You can also apply CSG operators directly on `jno.domain.csg` instances — the 
 | `a ^ b` | `.symmetric_difference(b)` | XOR |
 
 ```python
-left  = jno.domain.csg(box(0, 0, 0.5, 1), name="left")
-right = jno.domain.csg(box(0.5, 0, 1, 1), name="right")
+left  = jno.domain(box(0, 0, 0.5, 1), name="left")
+right = jno.domain(box(0.5, 0, 1, 1), name="right")
 
 dom = (left + right).build_mesh(0.05)
 x_l, y_l = dom.variable("interior_left")
@@ -386,11 +386,11 @@ def grid_sampler(geometry, n):
     return pts[mask][:n]
 
 # Single-region: sampler= applies to all interior tags
-dom = jno.domain.csg(box(0, 0, 1, 1), sampler=grid_sampler)
+dom = jno.domain(box(0, 0, 1, 1), sampler=grid_sampler)
 x, y, _ = dom.variable("interior", (256, None))
 
 # Multi-region: samplers= sets a different strategy per named region
-dom = jno.domain.csg({
+dom = jno.domain({
     "fluid": box(0, 0, 1, 1).difference(box(0.3, 0.3, 0.7, 0.7)),
     "solid": box(0.3, 0.3, 0.7, 0.7),
 }, samplers={"solid": grid_sampler})   # fluid uses the default, solid uses grid
@@ -555,7 +555,7 @@ theta = ...  # shape (B, 4)
 
 ## Mesh Connectivity (for Finite Differences and Finite Elements)
 
-Some schemes (e.g., `scheme="finite_difference"` in `jnn.grad`) require mesh topology to be pre-processed. `jno.domain.csg.build_mesh()` does this automatically. For the pygmsh constructor path, pass `compute_mesh_connectivity=True` explicitly:
+Some schemes (e.g., `scheme="finite_difference"` in `jnn.grad`) require mesh topology to be pre-processed. `jno.domain(geo).build_mesh()` does this automatically. For the pygmsh constructor path, pass `compute_mesh_connectivity=True` explicitly:
 
 ```python
 domain = jno.domain(
