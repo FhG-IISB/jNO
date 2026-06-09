@@ -4516,6 +4516,15 @@ class core:
         _models = eqx.tree_inference(self._unwrapped_models)
         ctx = domain_data.context
 
+        # After solve(), model weights carry NamedSharding from the training
+        # mesh while context arrays are CPU-pinned by prepare_domain_data.
+        # Passing mixed-device inputs to a plain filter_jit raises
+        # "incompatible devices".  Normalise both to the default device so
+        # the eval JIT sees a consistent, unsharded device set.
+        _eval_dev = jax.devices()[0]
+        _models = jax.device_put(_models, _eval_dev)
+        ctx = jax.device_put(ctx, _eval_dev)
+
         def _point_eval(op):
             op_entry = self._eval_cache.get(op)
             if op_entry is None:
