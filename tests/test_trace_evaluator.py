@@ -445,12 +445,12 @@ class TestNetworkGradientEval:
         assert jnp.allclose(result[:, 1], jnp.ones(N), atol=1e-6), f"∂u/∂b column should be ones; got {result[:, 1]}"
 
     def test_stop_gradient_values_unchanged(self):
-        """J and J.stop_gradient() must produce identical numerical values."""
+        """J and J.stop_gradient must produce identical numerical values."""
         net = _make_tiny_net()
         x = make_var("interior")
         u = net(x)
         J = u.grad(net)
-        J_sg = J.stop_gradient()
+        J_sg = J.stop_gradient
 
         ev, ctx = self._ctx(net, N=4)
         j_val = ev._dispatch(J, ctx)
@@ -458,12 +458,12 @@ class TestNetworkGradientEval:
         assert jnp.allclose(j_val, j_sg_val)
 
     def test_stop_gradient_blocks_second_order_grad(self):
-        """jax.grad through J.stop_gradient() must return all-zero leaves."""
+        """jax.grad through J.stop_gradient must return all-zero leaves."""
         net = _make_tiny_net()
         x = make_var("interior")
         u = net(x)
         J = u.grad(net)
-        J_sg = J.stop_gradient()
+        J_sg = J.stop_gradient
 
         N = 3
         context = {"interior": jnp.linspace(0.1, 0.9, N).reshape(N, 1)}
@@ -563,7 +563,7 @@ class TestNetworkGradientEval:
 
         all_false = jax.tree_util.tree_map(lambda _: False, net.module)
         mask = eqx.tree_at(lambda m: m.output_layer.weight, all_false, True)
-        J_sg = u.grad(net.mask(mask)).stop_gradient()
+        J_sg = u.grad(net.mask(mask)).stop_gradient
 
         N = 3
         context = {"interior": jnp.linspace(0.1, 0.9, N).reshape(N, 1)}

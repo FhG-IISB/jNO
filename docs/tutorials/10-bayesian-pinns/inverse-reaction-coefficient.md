@@ -17,7 +17,7 @@ intervals — matching Yang et al. 2021's textbook B-PINN HMC result
 
 If `u` were unknown (a real PDE solve), the two-stage surrogate
 pattern via `substeps=[([surrogate_constraints], n_train), ([pde], 1)]`
-with `.stop_gradient()` on the surrogate in the PDE residual is the
+with `.stop_gradient` on the surrogate in the PDE residual is the
 recommended alternative.  Tutorial 06 ([Inverse FEM
 Diffusivity](./inverse-fem-diffusivity.md)) shows the more general
 case where the forward model is fully numerical (FEM).

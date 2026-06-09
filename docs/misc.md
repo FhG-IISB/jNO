@@ -155,10 +155,10 @@ J_norm = tracker(jno.np.mean(J_out ** 2), interval=50)
 
 ### Using the Jacobian as a loss term
 
-`u.grad(net)` can appear directly in a constraint, but differentiating *through* `jax.jacrev` is second-order AD and expensive. Use `.stop_gradient()` to treat the current Jacobian as a constant regulariser:
+`u.grad(net)` can appear directly in a constraint, but differentiating *through* `jax.jacrev` is second-order AD and expensive. Use `.stop_gradient` to treat the current Jacobian as a constant regulariser:
 
 ```python
-J_sg    = u.grad(u_net).stop_gradient()
+J_sg    = u.grad(u_net).stop_gradient
 ntk_reg = (J_sg @ J_sg.T - target_K).mse
 crux    = jno.core([pde.mse, ntk_reg], domain)
 ```
