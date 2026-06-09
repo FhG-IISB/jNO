@@ -110,6 +110,56 @@ def _find_temporal_variable(expr: Placeholder):
     return visit(expr)
 
 
+def _infer_domain_from_constraints(constraints: List[Placeholder]):
+    """Walk the constraint trees and return the unique domain referenced by
+    every Variable / TensorTag inside.
+
+    Raises ``ValueError`` if zero (no Variables at all) or more than one
+    distinct domain is found — the caller must then pass ``domain=`` explicitly.
+    """
+    from .trace import TensorTag, Variable
+
+    domains: list = []  # preserve insertion order for nicer error messages
+    seen_domains: set = set()
+    seen_nodes: set = set()
+
+    def visit(node):
+        if node is None or id(node) in seen_nodes:
+            return
+        seen_nodes.add(id(node))
+        if isinstance(node, (Variable, TensorTag)):
+            d = getattr(node, "_domain", None)
+            if d is not None and id(d) not in seen_domains:
+                seen_domains.add(id(d))
+                domains.append(d)
+        for attr in ("target", "left", "right", "expr", "operation"):
+            child = getattr(node, attr, None)
+            if isinstance(child, Placeholder):
+                visit(child)
+        for attr in ("args", "variables", "options"):
+            for child in getattr(node, attr, []):
+                if isinstance(child, Placeholder):
+                    visit(child)
+
+    for expr in constraints:
+        visit(expr)
+
+    if len(domains) == 1:
+        return domains[0]
+    if not constraints:
+        raise ValueError("jno.core requires at least one constraint.")
+    if not domains:
+        raise ValueError(
+            "Cannot infer domain: no Variables or TensorTags were found in the "
+            "constraints. Every loss must reference at least one Variable so the "
+            "core can resolve its domain."
+        )
+    raise ValueError(
+        f"Cannot infer domain: constraints reference {len(domains)} distinct "
+        f"domains ({domains!r}). All constraints must share a single domain."
+    )
+
+
 def _active_model_lids(exprs):
     """Return layer_ids of Model nodes reachable without crossing stop_gradient.
 
@@ -236,7 +286,6 @@ class core:
     def __init__(
         self,
         constraints: List[Placeholder],
-        domain: domain,
         mesh: Optional[Tuple[int, ...]] = (1, 1),
         resume_from: Optional[str] = None,
     ):
@@ -249,9 +298,12 @@ class core:
                 minimized during training (e.g., PDE residuals, boundary conditions,
                 data fitting terms).
 
-            domain: Domain object containing the computational domain and sampled points.
-                Defines the spatial/temporal coordinates where constraints are evaluated,
-                along with any tensor data (e.g., input functions for operator learning).
+            (Domain inference) the computational domain is auto-discovered by
+                walking ``constraints`` and collecting the unique
+                ``Variable._domain`` reference. Constraints with no Variables
+                (e.g. pure parametric losses) or constraints that mix Variables
+                from multiple domains raise ``ValueError`` — at that point the
+                graph itself is ambiguous and the user must restructure.
 
             rng_seed: Random seed for reproducibility. Controls parameter initialization
                 and any stochastic operations during training.
@@ -302,7 +354,7 @@ class core:
         self.log = get_logger()
         self.constraints: List[Placeholder] = constraints
 
-        self.domain = domain
+        self.domain = _infer_domain_from_constraints(constraints)
         self.models: Dict[int, Any] = {}
         self._trained_ops: Dict[int, Any] = {}
         self.training_logs: List[Dict[str, jnp.ndarray]] = []
@@ -1414,7 +1466,7 @@ class core:
 
         Example::
 
-            crux = jno.core([pde.mse, ini.mse], domain)
+            crux = jno.core([pde.mse, ini.mse])
             crux.print_tree("tree.txt")
         """
         constraints = self.wrap_constraints(self.constraints)
@@ -1594,7 +1646,6 @@ class core:
 
                     crux = jno.core(
                         [L_pde, beta * L_int_phy, alpha * L_data, beta * L_int_syn],
-                        domain,
                     )
                     crux.solve(1_500, substeps=[[0, 1], [2, 3]])
                     # 1500 outer epochs × 2 substeps = 3000 effective gradient steps
@@ -1609,7 +1660,7 @@ class core:
         if not self.constraints:
             raise ValueError(
                 "solve() requires at least one constraint. "
-                "Pass a non-empty list to jno.core([...], domain) — typically a "
+                "Pass a non-empty list to jno.core([...]) — typically a "
                 "PDE residual .mse, a boundary-condition loss, or a data-fitting term."
             )
 
@@ -4317,7 +4368,7 @@ class core:
         Can be called any time after ``compile()`` or ``solve()`` has
         run.  Useful for troubleshooting shape mismatches::
 
-            crux = jno.core([pde.mse, ini.mse], domain)
+            crux = jno.core([pde.mse, ini.mse])
             crux.print_shapes()
         """
         ctx_single = self._build_shape_context(min_consecutive=min_consecutive)

@@ -39,12 +39,11 @@ def _stationary_1d_domain(mesh_size=0.1):
 
 
 class TestEmptyConstraints:
-    def test_solve_with_empty_constraints_raises_clear_error(self):
-        dom = _stationary_1d_domain()
-        dom.variable("interior")  # sample so the domain has something
-        crux = jno.core([], dom)
+    def test_construct_with_empty_constraints_raises_clear_error(self):
+        # jno.core([]) now fails fast at construction (domain inference walks
+        # the constraints — an empty list has nothing to resolve a domain from).
         with pytest.raises(ValueError, match="at least one constraint"):
-            crux.solve(2)
+            jno.core([])
 
 
 # ---------------------------------------------------------------------------
@@ -60,7 +59,7 @@ class TestMissingOptimizer:
         # Intentionally NOT calling net.optimizer(...)
         pde = (net(x) - x).mse
         with pytest.raises(ValueError, match=r"(?s)has no optimizer.*model\.optimizer"):
-            jno.core([pde], dom).solve(2)
+            jno.core([pde]).solve(2)
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +77,7 @@ class TestTemporalOnStationaryDomain:
         u = net(jno.np.concat([x, t], axis=-1))
         pde = (u.d(t)).mse
         with pytest.raises(ValueError, match="temporal Variable"):
-            jno.core([pde], dom)
+            jno.core([pde])
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +93,7 @@ class TestMinConsecutiveGuards:
         net.optimizer(optax.adam(1e-3))
         u = net(jno.np.concat([t, x], axis=-1))
         integral = u.integrate(t)
-        crux = jno.core([integral.mse], dom)
+        crux = jno.core([integral.mse])
         with pytest.raises(ValueError, match="min_consecutive"):
             crux.solve(2, min_consecutive=1)
 
@@ -105,7 +104,7 @@ class TestMinConsecutiveGuards:
         net.optimizer(optax.adam(1e-3))
         u = net(jno.np.concat([t, x], axis=-1))
         pde = u.d(t).mse  # no IntegralTime, so min_consecutive=1 is legal
-        crux = jno.core([pde], dom)
+        crux = jno.core([pde])
         # Just verify it doesn't raise — the nudge is a logger.info call which
         # is not easily captured here without configuring caplog for jno's logger.
         crux.solve(2, min_consecutive=1)
@@ -124,7 +123,7 @@ class TestReentry:
         net.optimizer(optax.adam(1e-3))
         u = net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x]).mse
-        crux = jno.core([pde], dom)
+        crux = jno.core([pde])
 
         h1 = crux.solve(2)
         h2 = crux.solve(2)
@@ -190,7 +189,7 @@ class TestSubsteps:
         L_int1 = (u1 - jno.fn.stop_gradient(u2)).mse
         L_data = (u2 - x).mse
         L_int2 = (u2 - jno.fn.stop_gradient(u1)).mse
-        crux = jno.core([L_pde, L_int1, L_data, L_int2], dom)
+        crux = jno.core([L_pde, L_int1, L_data, L_int2])
         return crux, n1, n2
 
     @staticmethod
@@ -376,7 +375,7 @@ class TestTrackerNonScalar:
 
         dom, x, u, pde = self._build(key_seed=1)
         # u has shape (n_points, 1) — non-scalar per collocation point
-        crux = jno.core([pde, u.tracker(1)], dom)
+        crux = jno.core([pde, u.tracker(1)])
         stats = crux.solve(3)
 
         raw = stats.training_logs[-1]["track_stats"]
@@ -392,7 +391,7 @@ class TestTrackerNonScalar:
 
         dom, x, u, pde = self._build(key_seed=2)
         # reduce to L2 norm — user-provided Python callable
-        crux = jno.core([pde, u.tracker(1, reduce=lambda v: float(np.linalg.norm(v)))], dom)
+        crux = jno.core([pde, u.tracker(1, reduce=lambda v: float(np.linalg.norm(v)))])
         stats = crux.solve(3)
 
         raw = stats.training_logs[-1]["track_stats"]
@@ -421,27 +420,27 @@ class TestPlaceholderName:
     def test_constraint_name_stored(self):
         dom, x, u = self._build()
         pde = jno.jnp_ops.laplacian(u, [x]).mse.name("my_pde")
-        crux = jno.core([pde], dom)
+        crux = jno.core([pde])
         assert crux._constraint_names == ["my_pde"]
 
     def test_unnamed_constraint_is_none(self):
         dom, x, u = self._build()
         pde = jno.jnp_ops.laplacian(u, [x]).mse
-        crux = jno.core([pde], dom)
+        crux = jno.core([pde])
         assert crux._constraint_names == [None]
 
     def test_mixed_named_unnamed(self):
         dom, x, u = self._build()
         pde = jno.jnp_ops.laplacian(u, [x]).mse.name("pde")
         bc = u.mse
-        crux = jno.core([pde, bc], dom)
+        crux = jno.core([pde, bc])
         assert crux._constraint_names == ["pde", None]
 
     def test_tracker_name_stored(self):
         dom, x, u = self._build()
         pde = jno.jnp_ops.laplacian(u, [x]).mse
         trk = u.tracker(1).name("u_monitor")
-        crux = jno.core([pde, trk], dom)
+        crux = jno.core([pde, trk])
         assert crux._tracker_names == ["u_monitor"]
 
     def test_name_returns_self(self):
@@ -453,7 +452,45 @@ class TestPlaceholderName:
     def test_name_used_in_log_output(self, capsys):
         dom, x, u = self._build(key_seed=3)
         pde = jno.jnp_ops.laplacian(u, [x]).mse.name("pde_loss")
-        crux = jno.core([pde], dom)
+        crux = jno.core([pde])
         crux.solve(2)
         captured = capsys.readouterr()
         assert "pde_loss" in captured.out
+
+
+# ---------------------------------------------------------------------------
+# Domain auto-inference
+# ---------------------------------------------------------------------------
+
+
+class TestDomainInference:
+    """``jno.core(constraints)`` walks the constraint trees and resolves the
+    domain from the ``Variable._domain`` references."""
+
+    def _tiny_domain_and_loss(self, mesh_size=0.1, key_seed=0):
+        dom = _stationary_1d_domain(mesh_size=mesh_size)
+        x, _ = dom.variable("interior")
+        net = _tiny_net()
+        net.optimizer(optax.adam(1e-3))
+        u = net(x) * x * (1 - x)
+        pde = (u.d(x).d(x) + 1.0).mse
+        return dom, pde
+
+    def test_single_domain_inferred(self):
+        dom, pde = self._tiny_domain_and_loss()
+        crux = jno.core([pde])
+        assert crux.domain is dom
+
+    def test_no_variables_raises(self):
+        # Pure parametric loss — no Variables means no domain to resolve.
+        param = jnn.parameter((1,), key=jax.random.PRNGKey(0), name="a")
+        loss = (param - 1.0).mse
+        with pytest.raises(ValueError, match="no Variables or TensorTags"):
+            jno.core([loss])
+
+    def test_multi_domain_raises(self):
+        dom_a, pde_a = self._tiny_domain_and_loss(mesh_size=0.1, key_seed=1)
+        dom_b, pde_b = self._tiny_domain_and_loss(mesh_size=0.05, key_seed=2)
+        assert dom_a is not dom_b
+        with pytest.raises(ValueError, match="2 distinct domains"):
+            jno.core([pde_a, pde_b])
