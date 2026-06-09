@@ -174,6 +174,17 @@ class Placeholder:
             return other
         return Literal(other)
 
+    def name(self, label: str) -> "Placeholder":
+        """Tag this expression with a human-readable label for logs and W&B.
+
+        Returns *self* so it can be used inline::
+
+            pde_loss = (k * (u.dd(x) + u.dd(y)) + 1.0).mse.name("pde")
+            bc_loss  = u_bc.mse.name("bc")
+        """
+        self._user_name = label
+        return self
+
     def __add__(self, other) -> BinaryOp:
         return BinaryOp("+", self, self._wrap(other))
 

@@ -50,6 +50,7 @@ from .utils.config import (
     get_seed,
     load_config,
     setup,
+    wandb_finish,
 )
 from .utils.load_save import load, save
 from .utils.solver.fem_route import dirichlet, neumann
@@ -108,6 +109,7 @@ __all__ = [
     "save",
     "load",
     "setup",
+    "wandb_finish",
     "load_config",
     "get_config",
     "get_runs_base_dir",
