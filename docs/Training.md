@@ -16,8 +16,7 @@ This page covers every aspect of the jNO training pipeline: constructing the cor
 
 ```python
 crux = jno.core(
-    constraints=[pde.mse, boc.mse],   # list of scalar Placeholder expressions
-    domain=domain,
+    constraints=[pde.mse, boc.mse], 
     rng_seed=42,                       # optional; also set in .jno.toml → [jno] seed
     mesh=(1, 1),                       # (batch_devices, model_devices)
 )
@@ -254,20 +253,20 @@ jNO supports data parallelism, model parallelism, and hybrid parallelism via JAX
 
 ```python
 # No parallelism (single device, default)
-crux = jno.core(constraints, domain, mesh=(1, 1))
+crux = jno.core(constraints,  mesh=(1, 1))
 
 # Pure data parallelism: split batches across 4 GPUs
-crux = jno.core(constraints, domain, mesh=(4, 1))
+crux = jno.core(constraints,  mesh=(4, 1))
 
 # Pure model parallelism: shard model weights across 2 GPUs
-crux = jno.core(constraints, domain, mesh=(1, 2))
+crux = jno.core(constraints,  mesh=(1, 2))
 
 # Hybrid (2 data × 2 model = 4 GPUs total)
-crux = jno.core(constraints, domain, mesh=(2, 2))
+crux = jno.core(constraints,  mesh=(2, 2))
 
 # Auto-scale to all available devices
 n = len(jax.devices())
-crux = jno.core(constraints, domain, mesh=(n, 1))
+crux = jno.core(constraints,  mesh=(n, 1))
 ```
 
 **Mesh shape rules:**

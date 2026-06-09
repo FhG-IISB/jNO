@@ -61,7 +61,7 @@ The time-dependent PDE residual and the initial-condition loss are optimized tog
 pde = u.d(t) - nu * jno.np.laplacian(u, [x, y]) + lam * u - source
 ini = u0 - jno.np.sin(pi * x0) * jno.np.sin(pi * y0)
 
-crux = jno.core([pde.mse, ini.mse], domain)
+crux = jno.core([pde.mse, ini.mse])
 ```
 
 ## Step 4: Use a Standard Training Schedule

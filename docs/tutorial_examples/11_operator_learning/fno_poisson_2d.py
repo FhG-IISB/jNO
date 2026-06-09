@@ -62,5 +62,5 @@ u.optimizer(
 )
 
 # ── Supervised loss + solve ─────────────────────────────────────────────────
-crux = jno.core([(_u - u(_f)).mse], domain)
+crux = jno.core([(_u - u(_f)).mse])
 crux.solve(epochs=EPOCHS, batchsize=BATCH)

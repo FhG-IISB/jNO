@@ -1123,7 +1123,7 @@ class TestCruxEvalAcceptsViews:
         dom = jno.domain.rect(mesh_size=0.5)
         x, y, _ = dom.variable("interior")
         u = net(x, y)
-        crux = jno.core([u.mse], dom)
+        crux = jno.core([u.mse])
         # No solve() — just verify eval accepts a ScalarView
         sv = u.scalar
         out = crux.eval(sv)  # single ScalarView

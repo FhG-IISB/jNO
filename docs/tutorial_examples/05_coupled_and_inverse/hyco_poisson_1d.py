@@ -61,7 +61,7 @@ L_int_phy = (u_phy - u_syn.stop_gradient).mse
 L_int_syn = (u_syn - u_phy.stop_gradient).mse
 
 α, β = 1.0, 1.0
-crux = jno.core([L_pde, β * L_int_phy, α * L_data, β * L_int_syn], domain)
+crux = jno.core([L_pde, β * L_int_phy, α * L_data, β * L_int_syn])
 # Alternating updates: first u_phy (constraints 0, 1), then u_syn (constraints 2, 3).
 crux.solve(3_000, substeps=[[0, 1], [2, 3]])
 

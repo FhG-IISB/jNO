@@ -64,7 +64,7 @@ pde_v = v.t - (v.xx + v.yy) + u - g
 ini_u = u0 - jno.np.sin(π * x0) * jno.np.sin(π * y0)
 ini_v = v0 - jno.np.sin(2 * π * x0) * jno.np.sin(π * y0)
 
-crux = jno.core([pde_u.mse, pde_v.mse, ini_u.mse, ini_v.mse], domain)
+crux = jno.core([pde_u.mse, pde_v.mse, ini_u.mse, ini_v.mse])
 crux.solve(5_000)
 
 _u, _u_exact, _v, _v_exact = crux.eval([u, u_exact, v, v_exact])

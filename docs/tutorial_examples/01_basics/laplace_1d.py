@@ -28,7 +28,7 @@ net.optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.5, end_value=1e-5))
 u = (x + x * (1 - x) * net(x)).scalar.bind(x=x)
 pde = u.xx  # Laplace: u'' = 0
 
-crux = jno.core([pde.mse], domain)
+crux = jno.core([pde.mse])
 crux.solve(5000)
 
 _u, _u_exact = crux.eval([u, u_exact])

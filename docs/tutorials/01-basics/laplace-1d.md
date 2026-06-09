@@ -51,7 +51,7 @@ pde = u.d2(x)  # Laplace: u'' = 0
 ## Step 4: Solve
 
 ```python
-crux = jno.core([pde.mse], domain)
+crux = jno.core([pde.mse])
 history = crux.solve(5000)
 ```
 

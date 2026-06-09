@@ -107,7 +107,7 @@ N_obs = float(x_train_np.shape[0])
 y_pred = u_net(x_train_var)
 residual = (y_pred - y_train_const) / sigma_obs * jnp.sqrt(N_obs)
 
-crux = jno.core([residual.mse], train_dom)
+crux = jno.core([residual.mse])
 crux.solve(6000)  # 6000 ELBO optimisation steps
 
 # ── Predict on a dense eval grid (same as T07) ──────────────────────────────

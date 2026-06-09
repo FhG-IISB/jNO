@@ -16,8 +16,7 @@ This section covers every aspect of the jNO training pipeline: constructing the 
 
 ```python
 crux = jno.core(
-    constraints=[pde.mse, boc.mse],   # list of scalar Placeholder expressions
-    domain=domain,
+    constraints=[pde.mse, boc.mse], 
     rng_seed=42,                       # optional; also set in .jno.toml → [jno] seed
     mesh=(1, 1),                       # (batch_devices, model_devices)
 )

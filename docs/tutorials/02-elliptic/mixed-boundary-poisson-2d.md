@@ -59,7 +59,7 @@ neumann_bottom = u_bottom.d(yb)
 The core includes the PDE residual and both Neumann losses.
 
 ```python
-crux    = jno.core([pde.mse, neumann_top.mse, neumann_bottom.mse], domain)
+crux    = jno.core([pde.mse, neumann_top.mse, neumann_bottom.mse])
 history = crux.solve(40_000)
 ```
 

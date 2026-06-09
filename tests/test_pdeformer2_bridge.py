@@ -653,7 +653,7 @@ class TestAutoAttach:
     def test_attach_is_idempotent_via_jno_core(self):
         """Constructing jno.core a second time on the same net should not crash."""
         domain, net, pde, ini, _ = _heat_problem()
-        jno.core([pde.mse, ini.mse], domain)
+        jno.core([pde.mse, ini.mse])
         assert isinstance(net.module, PDEformer2Wrapper)
 
     def test_arg_order_baked_into_wrapper(self):
@@ -683,7 +683,7 @@ class TestAutoAttach:
         u = net(x)
         loss = (u - jno.np.sin(jno.np.pi * x)).mse
         pre = net.module
-        jno.core([loss], domain)
+        jno.core([loss])
         assert net.module is pre
 
     def test_mixed_pdeformer_and_mlp_models(self):
@@ -703,7 +703,7 @@ class TestAutoAttach:
         pde = jno.np.grad(u, t) - 0.1 * jno.np.laplacian(u, [x, y])
         ini = u0 - jno.np.sin(jno.np.pi * x0) * jno.np.sin(jno.np.pi * y0)
         pre_aux = aux_net.module
-        jno.core([pde.mse, ini.mse], domain)
+        jno.core([pde.mse, ini.mse])
         assert isinstance(pde_net.module, PDEformer2Wrapper)
         assert aux_net.module is pre_aux
 
@@ -728,7 +728,7 @@ class TestErrorPaths:
         pde = jno.np.grad(u, t) - jno.np.tanh(u)
         ini = u0 - jno.np.sin(jno.np.pi * x0) * jno.np.sin(jno.np.pi * y0)
         with pytest.raises(UnsupportedPDEOperatorError):
-            jno.core([pde.mse, ini.mse], domain)
+            jno.core([pde.mse, ini.mse])
 
     def test_no_pde_term_raises(self):
         """If the user only supplies an IC, the bridge should complain."""
@@ -743,7 +743,7 @@ class TestErrorPaths:
         u0 = net(t0, x0, y0)
         ini = u0 - jno.np.sin(jno.np.pi * x0) * jno.np.sin(jno.np.pi * y0)
         with pytest.raises(UnsupportedPDEOperatorError, match="no PDE residual"):
-            jno.core([ini.mse], domain)
+            jno.core([ini.mse])
 
 
 # =====================================================================
@@ -795,7 +795,7 @@ class TestBoundaryConditions:
 
     def test_jno_core_trains_with_bc(self):
         domain, net, pde, ini, bc = self._problem_with_bc()
-        crux = jno.core([pde.mse, ini.mse, bc.mse], domain)
+        crux = jno.core([pde.mse, ini.mse, bc.mse])
         stats = crux.solve(3)
         last = float(stats.training_logs[-1]["total_loss"][-1])
         assert np.isfinite(last)
@@ -804,7 +804,7 @@ class TestBoundaryConditions:
         """A purely boundary problem (no interior PDE) must still raise."""
         domain, net, _, ini, bc = self._problem_with_bc()
         with pytest.raises(UnsupportedPDEOperatorError, match="no PDE residual"):
-            jno.core([ini.mse, bc.mse], domain)
+            jno.core([ini.mse, bc.mse])
 
 
 # =====================================================================
@@ -816,7 +816,7 @@ class TestBoundaryConditions:
 class TestTraining:
     def test_solve_finite_loss(self):
         domain, net, pde, ini, _ = _heat_problem()
-        crux = jno.core([pde.mse, ini.mse], domain)
+        crux = jno.core([pde.mse, ini.mse])
         stats = crux.solve(3)
         last = float(stats.training_logs[-1]["total_loss"][-1])
         assert np.isfinite(last)
@@ -824,14 +824,14 @@ class TestTraining:
     def test_eval_after_training_runs(self):
         domain, net, pde, ini, (x, y, t, *_) = _heat_problem()
         u = net(t, x, y)
-        crux = jno.core([pde.mse, ini.mse], domain)
+        crux = jno.core([pde.mse, ini.mse])
         crux.solve(2)
         u_val = crux.eval([u])[0]
         assert np.all(np.isfinite(np.asarray(u_val)))
 
     def test_loss_decreases_a_bit(self):
         domain, net, pde, ini, _ = _heat_problem()
-        crux = jno.core([pde.mse, ini.mse], domain)
+        crux = jno.core([pde.mse, ini.mse])
         stats = crux.solve(10)
         log = stats.training_logs[-1]["total_loss"]
         # not guaranteed monotonic, but the average of the second half should

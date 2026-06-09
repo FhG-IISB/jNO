@@ -34,7 +34,7 @@ u = (net(x, y) * x * (1 - x) * y * (1 - y)).scalar.bind(x=x, y=y)
 #  ∇²u + k²u + f = 0
 pde = (u.xx + u.yy) + k**2 * u + forcing
 
-crux = jno.core([pde.mse], domain)
+crux = jno.core([pde.mse])
 crux.solve(5000)
 
 _u, _u_exact = crux.eval([u, u_exact])

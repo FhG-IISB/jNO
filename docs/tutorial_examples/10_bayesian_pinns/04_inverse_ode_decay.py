@@ -94,7 +94,7 @@ u_model = jno.np.exp(-k * t)
 residual = (u_model - u_obs) / sigma_obs
 
 # ── Solve — pure Bayesian, no surrogate, no substeps needed ──────────────────
-crux = jno.core([residual.mse], domain)
+crux = jno.core([residual.mse])
 crux.solve(1000)
 
 # ── Posterior summary ────────────────────────────────────────────────────────

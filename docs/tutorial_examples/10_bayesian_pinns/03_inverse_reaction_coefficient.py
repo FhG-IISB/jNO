@@ -79,7 +79,7 @@ k.bayesian(
 residual = (λ * u_xx + k * jno.np.tanh(u) - f_obs) / sigma_obs
 
 # ── Solve — pure Bayesian, no surrogate, no substeps needed ──────────────────
-crux = jno.core([residual.mse], domain)
+crux = jno.core([residual.mse])
 crux.solve(600)
 
 # ── Posterior summary ────────────────────────────────────────────────────────

@@ -59,7 +59,7 @@ p_bc = net(xb, yb) - (p_exact_bc + jno.noise.gaussian(std=1e-4))
 
 # --8<-- [start:solve]
 residuals = jno.trackers.residual_stats(interval=1000)
-crux = jno.core([fp.mse, norm.mse, p_bc.mse], domain)
+crux = jno.core([fp.mse, norm.mse, p_bc.mse])
 crux.solve(15_000, callbacks=[residuals])
 # --8<-- [end:solve]
 

@@ -134,7 +134,7 @@ u_net.mask(head_mask).bayesian(
 y_pred = u_net(x_train_var)
 residual = (y_pred - y_train_const) / sigma_obs
 
-crux = jno.core([residual.mse], train_dom)
+crux = jno.core([residual.mse])
 crux.solve(2300)
 
 # ── Diagnostics: confirm Pattern A's contract ───────────────────────

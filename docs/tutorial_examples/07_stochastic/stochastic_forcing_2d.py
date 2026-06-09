@@ -81,7 +81,7 @@ noise = jno.noise.gaussian(std=σ)
 pde = -(u.xx + u.yy) - f - noise
 
 # ── Solve ──────────────────────────────────────────────────────────────────────
-crux = jno.core([pde.mse], domain)
+crux = jno.core([pde.mse])
 history = crux.solve(40_000)
 
 # ── Evaluate ───────────────────────────────────────────────────────────────────

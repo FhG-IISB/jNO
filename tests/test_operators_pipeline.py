@@ -6,7 +6,7 @@ directly with hand-crafted contexts, these tests drive each operator
 through the actual user-facing path:
 
     dom = jno.domain(...)
-    crux = jno.core([...], dom)
+    crux = jno.core([...])
     (val,) = crux.eval([expr], domain=dom, min_consecutive=...)
 
 This catches bugs that live in the compiler, the per-step vmap, the time
@@ -63,7 +63,7 @@ class TestMixedSpatialTemporalChain:
         u = x * t * t
         d2 = u.d(x).d(t)
 
-        (val,) = jno.core([], dom).eval([d2], domain=dom, min_consecutive=None)
+        (val,) = jno.core([]).eval([d2], domain=dom, min_consecutive=None)
         # Shape (T, N, 1); analytic value is 2t (independent of x).
         time_pts = jnp.asarray(dom._time_points)  # (T,)
         expected = (2.0 * time_pts)[:, None, None]  # broadcast to (T, 1, 1)
@@ -82,7 +82,7 @@ class TestMixedSpatialTemporalChain:
         u = x * t * t
         d2 = u.d(t).d(x)
 
-        (val,) = jno.core([], dom).eval([d2], domain=dom, min_consecutive=None)
+        (val,) = jno.core([]).eval([d2], domain=dom, min_consecutive=None)
         time_pts = jnp.asarray(dom._time_points)
         expected = (2.0 * time_pts)[:, None, None]
         assert jnp.allclose(val, expected, atol=1e-5), (
@@ -98,7 +98,7 @@ class TestMixedSpatialTemporalChain:
         u = x * x * t
         d2 = u.d(x).d(t)
 
-        (val,) = jno.core([], dom).eval([d2], domain=dom, min_consecutive=None)
+        (val,) = jno.core([]).eval([d2], domain=dom, min_consecutive=None)
         x_pts = jnp.asarray(dom.context["interior"])[0, 0, :, 0]  # (N,)
         expected = jnp.broadcast_to((2.0 * x_pts)[None, :, None], val.shape)
         assert jnp.allclose(val, expected, atol=1e-5), (
@@ -140,7 +140,7 @@ class TestGreensFirstIdentity3D:
 
     def test_identity_holds_on_cube(self):
         dom = _build_cube_3d(mesh_size=0.10)
-        crux = jno.core([], dom)
+        crux = jno.core([])
 
         # Volume side via .d() (default AD) and .integrate().
         x_v, y_v, z_v, _ = dom.variable("interior")
@@ -190,7 +190,7 @@ class TestGreensSecondIdentity3D:
 
     def test_identity_holds_on_cube(self):
         dom = _build_cube_3d(mesh_size=0.10)
-        crux = jno.core([], dom)
+        crux = jno.core([])
 
         x_v, y_v, z_v, _ = dom.variable("interior")
         u_v = x_v**2 + y_v**2 + z_v**2
@@ -239,7 +239,7 @@ class TestThirdOrderTemporalComposition:
         # u(t) = t³  →  ∂³u/∂t³ = 6 (constant)
         u = t * t * t
         expr = u.d(t).d(t).d(t)
-        result = jno.core([], dom).eval([expr], domain=dom, min_consecutive=None)
+        result = jno.core([]).eval([expr], domain=dom, min_consecutive=None)
         val = result[0] if isinstance(result, list) else result
         assert jnp.allclose(val, 6.0, atol=1e-5), f"∂³(t³)/∂t³ should be 6, got {val}"
 
@@ -272,7 +272,7 @@ class TestWindowedHessian2DPipeline:
 
         # min_consecutive=None → full time window → exercises the
         # points.ndim == 3 branch of _eval_hessian.
-        (val,) = jno.core([], dom).eval([lap], domain=dom, min_consecutive=None)
+        (val,) = jno.core([]).eval([lap], domain=dom, min_consecutive=None)
         # val shape: (T, N, 1)
         assert val.ndim == 3 and val.shape[-1] == 1, f"unexpected shape {val.shape}"
 

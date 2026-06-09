@@ -50,7 +50,7 @@ pde = -(u.xx + u.yy) - forcing
 # --8<-- [end:residual]
 
 # --8<-- [start:solve]
-crux = jno.core([pde.mse], domain)
+crux = jno.core([pde.mse])
 crux.solve(5_000)
 # --8<-- [end:solve]
 

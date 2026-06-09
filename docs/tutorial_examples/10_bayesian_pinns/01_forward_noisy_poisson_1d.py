@@ -107,7 +107,7 @@ pde = u.d2(x, scheme="finite_difference") - f_clean
 bc = u_net(xb) - u_b_obs
 
 # ── Solve ─────────────────────────────────────────────────────────────────────
-crux = jno.core([pde.mse, bc.mse], domain)
+crux = jno.core([pde.mse, bc.mse])
 crux.solve(2800)
 
 # ── Posterior prediction bands (auto-chain default) ──────────────────────────

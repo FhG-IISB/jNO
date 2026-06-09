@@ -92,7 +92,7 @@ losses = [pde.mse, vol_mean]
 
 # ── Solve ──────────────────────────────────────────────────────────────────────
 EPOCHS = 30_000
-crux = jno.core(losses, domain).print_shapes()
+crux = jno.core(losses).print_shapes()
 _history = crux.solve(EPOCHS)
 
 # ── Evaluate ───────────────────────────────────────────────────────────────────

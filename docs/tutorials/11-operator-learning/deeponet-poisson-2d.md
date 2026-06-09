@@ -60,7 +60,7 @@ The multiplicative ansatz `x(2-x)y(1-y)` vanishes on all four edges and enforces
 ## Step 4: Solve
 
 ```python
-crux = jno.core(constraints=[pde.mse], domain=dom)
+crux = jno.core(constraints=[pde.mse])
 crux.solve(epochs=20_000, batchsize=32)
 ```
 

@@ -82,7 +82,7 @@ Use as a loss term:
 # Enforce prescribed volume average
 target_mean = 2.0 / 3.0
 integral_loss = (u.integrate() - target_mean).square()
-crux = jno.core([pde_loss, integral_loss], domain)
+crux = jno.core([pde_loss, integral_loss])
 ```
 
 Use as a tracker (logged, not differentiated):
@@ -91,7 +91,7 @@ Use as a tracker (logged, not differentiated):
 from jno.numpy import tracker
 
 vol_mean = tracker(u.integrate(), interval=500)
-crux = jno.core([pde_loss, vol_mean], domain)
+crux = jno.core([pde_loss, vol_mean])
 ```
 
 ---
@@ -206,5 +206,5 @@ x, y, _ = dom.variable("interior")
 u = net(jno.np.concat([x, y], axis=-1))
 
 vol_mean = tracker(u.integrate(), interval=200)   # logged every 200 epochs
-crux = jno.core([pde.mse, bc.mse, vol_mean], domain)
+crux = jno.core([pde.mse, bc.mse, vol_mean])
 ```

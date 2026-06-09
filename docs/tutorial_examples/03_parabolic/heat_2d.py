@@ -50,7 +50,7 @@ pde = u.t - α * (u.xx + u.yy)
 ini = u0 - jno.np.sin(π * x0) * jno.np.sin(π * y0)
 
 residuals = jno.trackers.residual_stats(interval=1000)
-crux = jno.core([pde.mse, ini.mse], domain)
+crux = jno.core([pde.mse, ini.mse])
 crux.solve(5_000, callbacks=[residuals])
 
 _u, _u_exact = crux.eval([u, u_exact])

@@ -68,7 +68,7 @@ pde  = u_t + u * u_x - ν * u_xx - source
 u_0 = net(x0, t0) * x0 * (1 - x0)
 ini = u_0 - jno.np.sin(π * x0)
 
-crux    = jno.core([pde.mse, ini.mse], domain)
+crux    = jno.core([pde.mse, ini.mse])
 history = crux.solve(5000)
 
 _u, _u_exact = crux.eval([u, u_exact])

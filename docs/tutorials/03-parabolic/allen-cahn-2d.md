@@ -66,7 +66,7 @@ The script uses the same PDE infrastructure but anchors the solution at the init
 u_at_0 = net(0 * t, xy) * x * (1 - x) * y * (1 - y)
 ini     = u_at_0 - sin(π * x) * sin(π * y)
 
-crux    = jno.core([pde.mse, ini.mse], domain)
+crux    = jno.core([pde.mse, ini.mse])
 history = crux.solve(5000)
 ```
 

@@ -53,7 +53,7 @@ bc  = u_net(xb)   # soft: u(0) = u(1) = 0
 ## Step 4: Solve With Two Constraints
 
 ```python
-crux    = jno.core([pde.mse, bc.mse], domain)
+crux    = jno.core([pde.mse, bc.mse])
 history = crux.solve(5000)
 ```
 

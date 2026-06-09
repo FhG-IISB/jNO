@@ -47,7 +47,7 @@ ic_disp = u0 - jno.np.sin(π * x0)
 ic_vel = u0.t
 bc = net(tb, xb)
 
-crux = jno.core([pde.mse, ic_disp.mse, ic_vel.mse, bc.mse], domain)
+crux = jno.core([pde.mse, ic_disp.mse, ic_vel.mse, bc.mse])
 crux.solve(10_000)
 
 _u, _u_exact = crux.eval([u, u_exact])

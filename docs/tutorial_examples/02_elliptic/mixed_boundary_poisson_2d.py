@@ -40,7 +40,7 @@ pde = -(u.xx + u.yy) - forcing
 neumann_top = u_top.y  # ∂u/∂y at y = 1
 neumann_bot = u_bot.y  # ∂u/∂y at y = 0
 
-crux = jno.core([pde.mse, neumann_top.mse, neumann_bot.mse], domain)
+crux = jno.core([pde.mse, neumann_top.mse, neumann_bot.mse])
 crux.solve(5000)
 
 _u, _u_exact = crux.eval([u, u_exact])

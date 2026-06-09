@@ -64,7 +64,7 @@ pde = -(a * u.d2(x) + b * u.d2(y)) - forcing
 The script tracks error against the exact solution and plots exact, predicted, and absolute-error fields.
 
 ```python
-crux    = jno.core([pde.mse], domain)
+crux    = jno.core([pde.mse])
 history = crux.solve(40_000)
 
 _u, _u_exact = crux.eval([u, u_exact])

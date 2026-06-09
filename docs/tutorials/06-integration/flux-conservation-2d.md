@@ -72,7 +72,7 @@ Without the constraint the PDE residual alone is usually sufficient.  With it, t
 ## Step 6: Solve
 
 ```python
-crux = jno.core(losses, domain)
+crux = jno.core(losses)
 crux.solve(30_000)
 ```
 

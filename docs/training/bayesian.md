@@ -39,7 +39,7 @@ for p in [a, b]:
     p.bayesian(blackjax.nuts, step_size=1e-2, warmup=500, keep=1000)
 
 residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
-crux = jno.core([residual.mse], dom)
+crux = jno.core([residual.mse])
 crux.solve(1500)
 
 # Raw chains — leading axis = sample
@@ -200,7 +200,7 @@ u_xx = jno.diff(u, x, order=2)
 pde  = u_xx + (π ** 2) * jno.np.sin(π * x)        # u'' = -π² sin(πx)
 bc   = net(xb) - 0.0
 
-crux = jno.core([pde.mse, bc.mse], dom)
+crux = jno.core([pde.mse, bc.mse])
 crux.solve(3000)
 
 u_chain = crux.eval([u], samples="chain")

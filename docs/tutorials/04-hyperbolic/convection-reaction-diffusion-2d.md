@@ -75,7 +75,7 @@ A manufactured forcing term keeps the problem verifiable while still exposing th
 ```python
 ini = u0 - jno.np.sin(pi * x0) * jno.np.sin(pi * y0)
 
-crux    = jno.core([pde.mse, ini.mse], domain)
+crux    = jno.core([pde.mse, ini.mse])
 history = crux.solve(40000)
 
 _u, _u_exact = crux.eval([u, u_exact])

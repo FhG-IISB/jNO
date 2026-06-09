@@ -61,7 +61,7 @@ pde  = -u_xx + σ * u - forcing
 After solving, the script prints mean absolute error and saves solution and error plots.
 
 ```python
-crux    = jno.core([pde.mse], domain)
+crux    = jno.core([pde.mse])
 history = crux.solve(5000)
 
 _u, _u_exact = crux.eval([u, u_exact])

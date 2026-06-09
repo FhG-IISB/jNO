@@ -81,7 +81,7 @@ Both uses of the network â€” as the integrand inside `C` and as the outer `u` â€
 
 ```python
 EPOCHS = 50_000
-crux = jno.core([residual.mse], domain)
+crux = jno.core([residual.mse])
 crux.solve(EPOCHS)
 ```
 

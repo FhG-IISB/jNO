@@ -75,7 +75,7 @@ class TestCSE:
         # Build two constraints that share `u`
         loss_a = (u * u).mse
         loss_b = (u + u).mse
-        crux = jno.core([loss_a, loss_b], dom)
+        crux = jno.core([loss_a, loss_b])
         # If CSE breaks evaluation, solve() will produce NaNs or shape errors.
         hist = crux.solve(3)
         final = hist.total_loss
@@ -106,7 +106,7 @@ class TestCompileMultiExpression:
             (u + jno.np.sin(x)).mse,
             (u - jno.np.cos(x)).mse,
         ]
-        crux = jno.core(cs, dom)
+        crux = jno.core(cs)
         hist = crux.solve(2)
         assert len(hist.training_logs) >= 1
 
@@ -119,7 +119,7 @@ class TestCompileMultiExpression:
         net.optimizer(optax.adam(1e-3))
         u = net(x) * x * (1 - x)
         loss = jnn.laplacian(u, [x]).mse
-        crux = jno.core([loss], dom)
+        crux = jno.core([loss])
         hist = crux.solve(2)
         final = hist.total_loss
         assert final is None or jnp.isfinite(jnp.array(final))

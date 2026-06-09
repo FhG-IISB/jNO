@@ -48,7 +48,7 @@ u0 = net(t0, xy0) * x0 * (1 - x0) * y0 * (1 - y0)
 pde = u.t - ν * (u.xx + u.yy) + λ * u - source
 ini = u0 - jno.np.sin(π * x0) * jno.np.sin(π * y0)
 
-crux = jno.core([pde.mse, ini.mse], domain)
+crux = jno.core([pde.mse, ini.mse])
 crux.solve(5_000)
 
 _u, _u_exact = crux.eval([u, u_exact])

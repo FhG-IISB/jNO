@@ -127,7 +127,7 @@ cb_ckpt = jno.callbacks.checkpoint(
 )
 
 # ── Solve ─────────────────────────────────────────────────────────────────────
-crux = jno.core([pde.mse, bc.mse], domain)
+crux = jno.core([pde.mse, bc.mse])
 crux.solve(
     2_000,
     callbacks=[cb_norms, cb_cos, cb_align, cb_landscape, cb_residual, cb_saliency, cb_ntk, cb_hess, cb_ckpt],

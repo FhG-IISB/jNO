@@ -67,7 +67,7 @@ residual = u_x - f - integral_term   # (N, 1)
 ## Step 4: Solve
 
 ```python
-crux = jno.core([residual.mse], domain)
+crux = jno.core([residual.mse])
 crux.solve(30_000)
 ```
 

@@ -65,7 +65,7 @@ pde = (u.d2(t)
        - c**2 * u.d2(x)
        - source)
 
-crux    = jno.core([pde.mse, ini_u.mse, ini_ut.mse], domain)
+crux    = jno.core([pde.mse, ini_u.mse, ini_ut.mse])
 history = crux.solve(5000)
 ```
 

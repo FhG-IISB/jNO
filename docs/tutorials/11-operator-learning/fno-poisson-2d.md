@@ -53,7 +53,7 @@ Each FNO layer lifts the input to a hidden channel, transforms to Fourier space,
 ## Step 3: Supervised Loss + Solve
 
 ```python
-crux = jno.core([(_u - u(_f)).mse], domain)
+crux = jno.core([(_u - u(_f)).mse])
 crux.solve(epochs=50, batchsize=10)
 ```
 

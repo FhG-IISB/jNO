@@ -144,7 +144,7 @@ u_base, u_meas, _ = inv_domain.variable("nodes", split=True)
 residual = (u_base / α - u_meas) / sigma_obs
 
 # ── Solve — pure Bayesian via crux.solve, no manual blackjax loop ────────────
-crux = jno.core([residual.mse], inv_domain)
+crux = jno.core([residual.mse])
 crux.solve(1300)
 
 # ── Posterior summary ────────────────────────────────────────────────────────

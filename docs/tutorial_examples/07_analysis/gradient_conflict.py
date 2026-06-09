@@ -64,7 +64,7 @@ J2 = ub.mse.grad(u_net.mask(output_mask))
 cos_tracker = jno.np.dot(J1, J2).tracker(100)
 
 # ── Solve ──────────────────────────────────────────────────────────────────────
-crux = jno.core([pde.mse, ub.mse, cos_tracker], domain)
+crux = jno.core([pde.mse, ub.mse, cos_tracker])
 crux.solve(5000)
 
 _u, _u_exact = crux.eval([u, u_exact])

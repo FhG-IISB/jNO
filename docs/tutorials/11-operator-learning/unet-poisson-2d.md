@@ -51,7 +51,7 @@ Each encoder stage downsamples and doubles the channel count; each decoder stage
 ## Step 3: Supervised Loss + Solve
 
 ```python
-crux = jno.core([(_u - u(_f[0, ...])).mse], domain)
+crux = jno.core([(_u - u(_f[0, ...])).mse])
 crux.solve(epochs=50, batchsize=10)
 ```
 

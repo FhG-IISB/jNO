@@ -50,7 +50,7 @@ pde = -((κ * u.x).d(x) + (κ * u.y).d(y)) - (
 
 # --8<-- [start:solve]
 grad_norms = jno.trackers.gradient_norms(interval=500)
-crux = jno.core([pde.mse], domain)
+crux = jno.core([pde.mse])
 crux.solve(5_000, callbacks=[grad_norms])
 # --8<-- [end:solve]
 

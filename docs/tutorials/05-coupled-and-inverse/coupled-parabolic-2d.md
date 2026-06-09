@@ -64,7 +64,7 @@ All losses are optimized together so the two models remain consistent with each 
 pde_u = u.d(t) - jno.np.laplacian(u, [x, y]) + v - f
 pde_v = v.d(t) - jno.np.laplacian(v, [x, y]) + u - g
 
-crux    = jno.core([pde_u.mse, pde_v.mse, ini_u.mse, ini_v.mse], domain)
+crux    = jno.core([pde_u.mse, pde_v.mse, ini_u.mse, ini_v.mse])
 history = crux.solve(40_000)
 
 _u, _u_exact, _v, _v_exact = crux.eval([u, u_exact, v, v_exact])

@@ -200,7 +200,7 @@ u_int = apply_hard_bc(net(x_int, y_int), x_int, y_int)
 
 pde = weak_vpinn.assemble(train_domain, u_net=u_gauss, target="vpinn")
 
-crux = jno.core(constraints=[pde.mse], domain=train_domain)
+crux = jno.core(constraints=[pde.mse])
 
 net.optimizer(
     optax.adam(

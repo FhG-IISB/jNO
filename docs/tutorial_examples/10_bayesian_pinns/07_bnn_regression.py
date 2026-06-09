@@ -128,7 +128,7 @@ y_pred = u_net(x_train_var)
 residual = (y_pred - y_train_const) / sigma_obs
 
 # ── Solve through crux.solve — no manual blackjax loop ──────────────────────
-crux = jno.core([residual.mse], train_dom)
+crux = jno.core([residual.mse])
 crux.solve(4200)
 
 # ── Predict on a dense eval grid ─────────────────────────────────────────────

@@ -67,7 +67,7 @@ u_0 = net(t0, x0) * x0 * (1 - x0)
 ini = u_0 - jno.np.sin(π * x0)
 
 # ── Solve ────────────────────────────────────────────────────────────────────
-crux = jno.core([pde.mse, ini.mse], domain)
+crux = jno.core([pde.mse, ini.mse])
 crux.solve(5000)
 
 _u, _u_exact = crux.eval([u, u_exact])

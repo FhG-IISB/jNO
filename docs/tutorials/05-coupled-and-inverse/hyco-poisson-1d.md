@@ -125,8 +125,7 @@ The `substeps` argument to `solve()` expresses the alternating schedule:
 α, β = 1.0, 1.0
 
 crux = jno.core(
-    [L_pde, β * L_int_phy, α * L_data, β * L_int_syn],
-    domain,
+    [L_pde, β * L_int_phy, α * L_data, β * L_int_syn], 
 )
 # Each outer epoch runs two gradient steps in sequence:
 #   substep 0: constraints [0, 1] → only u_phy_net updates

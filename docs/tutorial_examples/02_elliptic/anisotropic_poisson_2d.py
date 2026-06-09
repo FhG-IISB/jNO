@@ -32,7 +32,7 @@ net.optimizer(optax.adam(optax.exponential_decay(1e-3, 1000, 0.5, end_value=1e-5
 u = (net(x, y) * x * (1 - x) * y * (1 - y)).scalar.bind(x=x, y=y)
 pde = -(a * u.xx + b * u.yy) - forcing
 
-crux = jno.core([pde.mse], domain)
+crux = jno.core([pde.mse])
 crux.solve(5000)
 
 _u, _u_exact = crux.eval([u, u_exact])

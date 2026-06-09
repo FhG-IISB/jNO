@@ -72,7 +72,7 @@ A few jNO-specific terms appear throughout the docs. See the
 - **Placeholder** — any symbolic node in that graph (a Variable, a
   network call, an operator).
 - **Constraint** — a single optimisable expression passed to
-  `jno.core([…], dom)`. Typically `pde.mse`, but can be any scalar.
+  `jno.core([…])`. Typically `pde.mse`, but can be any scalar.
 - **Model controls** — fine-grained per-parameter knobs (freeze, LoRA,
   initialisation, dtype) configured on a wrapped network.
 - **Mesh** — overloaded: a spatial mesh for the PDE domain *and* a

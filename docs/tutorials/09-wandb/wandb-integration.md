@@ -142,7 +142,7 @@ Each time a checkpoint is saved, jNO uploads it to W&B as a versioned `checkpoin
 ## Step 5: Solve
 
 ```python
-crux = jno.core([pde.mse, bc.mse], domain)
+crux = jno.core([pde.mse, bc.mse])
 crux.solve(
     2_000,
     callbacks=[cb_norms, cb_cos, cb_align, cb_landscape, cb_ckpt],

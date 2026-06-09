@@ -35,7 +35,7 @@ residual = (a * jno.np.sin(π * x) + b * jno.np.cos(π * x) + c * x * (1 - x)) -
 for param in (a, b, c):
     param.optimizer(optax.adam(1e-2))
 
-crux = jno.core([residual.mse], domain)
+crux = jno.core([residual.mse])
 crux.solve(15_000)
 
 _a, _b, _c = crux.eval([a, b, c])

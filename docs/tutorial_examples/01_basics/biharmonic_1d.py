@@ -42,7 +42,7 @@ u_xxxx = u.d2(x).d2(x)
 
 pde = u_xxxx - 24.0
 
-crux = jno.core([pde.mse], domain)
+crux = jno.core([pde.mse])
 crux.solve(5000)
 
 _u, _u_exact = crux.eval([u, u_exact])

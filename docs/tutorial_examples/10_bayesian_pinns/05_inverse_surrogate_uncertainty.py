@@ -71,7 +71,7 @@ u_net.optimizer(optax.adam(1e-3))
 u = u_net(x) * x * (1 - x)  # hard zero Dirichlet BCs
 pde = u.dd(x) + π**2 * jno.np.sin(π * x)  # u'' + π² sin(πx) = 0
 
-crux_fwd = jno.core([pde.mse], domain)
+crux_fwd = jno.core([pde.mse])
 crux_fwd.solve(3_000)
 
 # Sanity-check forward accuracy before inverting.
@@ -114,7 +114,7 @@ residual = (u_at_query - u_obs) / sigma_obs
 
 # Single-point inverse domain — loss has no spatial dependence on a mesh.
 inv_domain = jno.domain.from_array({"pt": np.zeros((1, 1))})
-crux_inv = jno.core([residual.mse], inv_domain)
+crux_inv = jno.core([residual.mse])
 crux_inv.solve(800)
 
 # ── Posterior summary ────────────────────────────────────────────────────────

@@ -60,7 +60,7 @@ for p in [a, b]:
 
 # ── Residual + solve ──────────────────────────────────────────────────────────
 residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
-crux = jno.core([residual.mse], domain)
+crux = jno.core([residual.mse])
 crux.solve(800)
 
 # ── Posterior summary — raw chain → user post-processes ───────────────────────

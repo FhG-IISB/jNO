@@ -113,7 +113,7 @@ cos_tracker = tracker(jno.np.function(_cos_sim_halves, [J]), interval=200)
 ## Step 3: Solve
 
 ```python
-crux = jno.core([pde.mse, cos_tracker], domain)
+crux = jno.core([pde.mse, cos_tracker])
 crux.solve(5000)
 ```
 

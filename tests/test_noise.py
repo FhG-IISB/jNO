@@ -67,7 +67,7 @@ class TestConstructors:
         net = _tiny_net()
         net.optimizer(optax.adam(1e-3))
         u = net(x)
-        crux = jno.core([(u + 0.0).mse], dom)
+        crux = jno.core([(u + 0.0).mse])
         with pytest.raises(ValueError, match="Unknown noise distribution"):
             crux.eval([u + bogus], key=jax.random.PRNGKey(0))
 
@@ -84,7 +84,7 @@ class TestEvalModeReturnsZeros:
         net = _tiny_net()
         net.optimizer(optax.adam(1e-3))
         u = net(x)
-        crux = jno.core([(u + 0.0).mse], dom)
+        crux = jno.core([(u + 0.0).mse])
 
         # gaussian(std=10) is large; in eval mode it should still return zeros.
         n = jno.noise.gaussian(std=10.0)
@@ -105,7 +105,7 @@ class TestOutputShape:
         net = _tiny_net()
         net.optimizer(optax.adam(1e-3))
         u = net(x)
-        crux = jno.core([(u + 0.0).mse], dom)
+        crux = jno.core([(u + 0.0).mse])
 
         n = jno.noise.gaussian(std=0.01, ndim=ndim)
         (val,) = crux.eval([n])

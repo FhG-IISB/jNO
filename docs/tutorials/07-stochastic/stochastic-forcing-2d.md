@@ -93,7 +93,7 @@ pde   = -jno.np.laplacian(u, [x, y]) - f - noise
 ### Step 4 — Single-loss solve
 
 ```python
-crux    = jno.core([pde.mse], domain)
+crux    = jno.core([pde.mse])
 history = crux.solve(40_000)
 ```
 

@@ -60,7 +60,7 @@ xg2, yg2, _ = train_domain.variable("fem_gauss", split=True)
 u_gauss = apply_hard_bc(net(xg2, yg2), xg2, yg2)
 
 pde  = weak.assemble(train_domain, u_net=u_gauss, target="vpinn")
-crux = jno.core(constraints=[pde.mse], domain=train_domain)
+crux = jno.core(constraints=[pde.mse])
 net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=1e-3, warmup_steps=1, decay_steps=10, end_value=1e-5)))
 crux.solve(epochs=10)
 ```

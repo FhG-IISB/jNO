@@ -55,7 +55,7 @@ pde = u.t - α * (u.xx + u.yy)
 ini = u0 - jno.np.sin(π * x0) * jno.np.sin(π * y0)
 bc = ub
 
-crux = jno.core([pde.mse, ini.mse, bc.mse], domain)
+crux = jno.core([pde.mse, ini.mse, bc.mse])
 crux.solve(2_000)
 
 _u, _u_exact = crux.eval([u, u_exact])

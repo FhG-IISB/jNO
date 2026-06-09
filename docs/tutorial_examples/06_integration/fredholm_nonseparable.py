@@ -92,7 +92,7 @@ residual = u_x - f - integral_term
 
 # ── Solve ──────────────────────────────────────────────────────────────────────
 EPOCHS = 30_000
-crux = jno.core([residual.mse], domain).print_shapes()
+crux = jno.core([residual.mse]).print_shapes()
 _history = crux.solve(EPOCHS)
 
 # ── Evaluate ───────────────────────────────────────────────────────────────────

@@ -59,5 +59,5 @@ u = net(k, jno.np.concat([x, y], axis=-1)) * x * (2 - x) * y * (1 - y)
 pde = k * (u.d2(x) + u.d2(y)) + 1.0
 
 # ── Solve ────────────────────────────────────────────────────────────────────
-crux = jno.core(constraints=[pde.mse], domain=dom)
+crux = jno.core(constraints=[pde.mse])
 crux.solve(epochs=EPOCHS, batchsize=32)

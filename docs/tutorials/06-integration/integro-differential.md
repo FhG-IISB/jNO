@@ -93,7 +93,7 @@ du = u.d(x)          # pointwise: (N, 1)
 
 ```python
 residual = du + u - g - C
-crux = jno.core([residual.mse], domain)
+crux = jno.core([residual.mse])
 crux.solve(30_000)
 ```
 

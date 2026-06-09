@@ -39,7 +39,7 @@ def make_solver(scheme: str, epochs: int = 5000) -> float:
     # into independent .d2(x) + .d2(y) calls).
     pde = -u.laplacian(x, y, scheme=scheme) - forcing
 
-    crux = jno.core([pde.mse], domain)
+    crux = jno.core([pde.mse])
     crux.solve(epochs)
 
     _u, _u_exact = crux.eval([u, u_exact])

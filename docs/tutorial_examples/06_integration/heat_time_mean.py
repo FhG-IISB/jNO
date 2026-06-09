@@ -88,7 +88,7 @@ heat_dose_residual = u_mean - u_mean_exact
 # min_consecutive=None uses all N_t time steps each iteration, giving the full
 # temporal integral.  This is required for .integrate(t) (min_consecutive ≥ 2).
 EPOCHS = 10_000
-crux = jno.core([pde.mse, heat_dose_residual.mse], domain).print_shapes()
+crux = jno.core([pde.mse, heat_dose_residual.mse]).print_shapes()
 history = crux.solve(EPOCHS, min_consecutive=None)
 
 # ── Evaluate ──────────────────────────────────────────────────────────────────

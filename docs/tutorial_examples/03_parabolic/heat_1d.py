@@ -46,7 +46,7 @@ pde = u.t - α * u.xx  # PDE residual
 ic = net(t0, x0) - jno.np.sin(π * x0)  # initial condition (t=0 slice)
 bc = net(tb, xb)  # spatial boundary (u=0)
 
-crux = jno.core([pde.mse, ic.mse, bc.mse], domain)
+crux = jno.core([pde.mse, ic.mse, bc.mse])
 crux.solve(5000)
 
 _u, _u_exact = crux.eval([u, u_exact])

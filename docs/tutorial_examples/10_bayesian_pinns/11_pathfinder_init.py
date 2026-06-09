@@ -90,7 +90,7 @@ def _run(label, configure_a, configure_b, total_epochs):
     domain, a, b, residual = _build_problem()
     configure_a(a)
     configure_b(b)
-    crux = jno.core([residual.mse], domain)
+    crux = jno.core([residual.mse])
     t0 = time.perf_counter()
     crux.solve(total_epochs)
     wall = time.perf_counter() - t0

@@ -104,7 +104,7 @@ u = jnn.nn.wrap(MyMLP, space=a_space)(x, y)
 _u = u * x * (1 - x) * y * (1 - y)
 
 pde = -jnn.laplacian(_u, [x, y]) - 1.0
-crux = jno.core([pde.mse], domain)
+crux = jno.core([pde.mse])
 ```
 
 ---
@@ -195,7 +195,7 @@ u = jnn.nn.wrap(TuneMLP, space=a_space)(x, y)
 _u = u * x * (1 - x) * y * (1 - y)
 pde = -jnn.laplacian(_u, [x, y]) - 1.0
 
-crux = jno.core([pde.mse], domain)
+crux = jno.core([pde.mse])
 
 # Training search space
 t_space = jnn.tune.space()

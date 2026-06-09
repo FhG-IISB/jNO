@@ -46,7 +46,7 @@ Each PDE residual depends on both unknowns, so the optimization must update the 
 pde1 = -Δu + v - f
 pde2 = -Δv + u - g
 
-crux    = jno.core([pde1.mse, pde2.mse], domain)
+crux    = jno.core([pde1.mse, pde2.mse])
 history = crux.solve(10000)
 ```
 

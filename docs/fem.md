@@ -187,7 +187,7 @@ phiy = jnn.grad(phi, yg)
 
 weak_vpinn = ux * phix + uy * phiy - 1.0 * phi
 
-crux = jno.core([weak_vpinn.mse], domain)
+crux = jno.core([weak_vpinn.mse])
 crux.solve(10000)
 ```
 

@@ -46,7 +46,7 @@ pde = u.t + c * u.x - ν * u.xx - source
 ic = net(t0, x0) - jno.np.sin(π * x0)
 bc = net(tb, xb)
 
-crux = jno.core([pde.mse, ic.mse, bc.mse], domain)
+crux = jno.core([pde.mse, ic.mse, bc.mse])
 crux.solve(5000)
 
 _u, _u_exact = crux.eval([u, u_exact])

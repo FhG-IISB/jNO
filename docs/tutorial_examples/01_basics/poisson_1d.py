@@ -35,7 +35,7 @@ u = net(x).scalar.bind(x=x)
 pde = -u.d2(x, scheme="finite_difference") - jno.np.sin(π * x)
 bc = net(xb)  # soft BC
 
-crux = jno.core([pde.mse, bc.mse], domain)
+crux = jno.core([pde.mse, bc.mse])
 crux.solve(5000)
 
 _u, _u_exact = crux.eval([u, u_exact])

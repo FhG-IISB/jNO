@@ -45,7 +45,7 @@ for net in [a, b, c]:
 After optimization, the identified parameters are printed from the trained model set.
 
 ```python
-crux    = jno.core([residual.mse], domain)
+crux    = jno.core([residual.mse])
 history = crux.solve(30000)
 
 _a, _b, _c = crux.eval([a, b, c])

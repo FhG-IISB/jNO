@@ -48,7 +48,7 @@ u_net.optimizer(optax.adam(1e-3))
 u = u_net(x) * x * (1 - x)                  # hard zero Dirichlet BCs
 pde = u.dd(x) + π**2 * jno.np.sin(π * x)    # PDE residual
 
-crux_fwd = jno.core([pde.mse], domain)
+crux_fwd = jno.core([pde.mse])
 crux_fwd.solve(3_000)
 ```
 
@@ -93,7 +93,7 @@ The loss has no spatial dependence on a mesh — it is purely a function of `x_q
 import numpy as np
 
 inv_domain = jno.domain.from_array({"pt": np.zeros((1, 1))})
-crux_inv = jno.core([inv_loss.mean], inv_domain)
+crux_inv = jno.core([inv_loss.mean])
 crux_inv.solve(500)
 ```
 

@@ -52,7 +52,7 @@ ic = net(t0, x0) - jno.np.sin(π * x0)
 # Spatial boundary:  net(t, 0) = net(t, 1) = 0
 bc = net(tb, xb)
 
-crux = jno.core([pde.mse, ic.mse, bc.mse], domain)
+crux = jno.core([pde.mse, ic.mse, bc.mse])
 history = crux.solve(10000)
 ```
 

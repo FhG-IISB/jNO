@@ -180,7 +180,7 @@ class TestRegressions:
 
         raw = net(jnn.concat([x, y], axis=-1))
         u = jnn.choice([raw, raw * 0.0], name="bc_form", default=0)
-        crux = jno.core([u.mse], dom)
+        crux = jno.core([u.mse])
 
         # Grid-search mode (optimizer=None) over one training param; the
         # choice node is auto-injected into the architecture space.
@@ -210,7 +210,7 @@ def _make_solver():
     u = u_net(x) * x * (1 - x)
     pde = jnn.laplacian(u, [x]) - jnn.sin(jnn.pi * x)
 
-    solver = jno.core([pde.mse], domain)
+    solver = jno.core([pde.mse])
     return solver, u_net
 
 
@@ -435,7 +435,7 @@ class TestParamMask:
         pde = jnn.laplacian(u, [x])
         param_mask = mask_fn(u_net.module)
         u_net.mask(param_mask)
-        return jno.core([pde.mse], domain), u_net
+        return jno.core([pde.mse]), u_net
 
     def test_partial_mask_solve_produces_finite_loss(self):
         """Solve with a partial mask (first hidden layer only) runs without
@@ -514,7 +514,7 @@ class TestParamMask:
             return (
                 u_net,
                 domain,
-                jno.core([jnn.laplacian(u_net(x) * x * (1 - x), [x]).mse], domain),
+                jno.core([jnn.laplacian(u_net(x) * x * (1 - x), [x]).mse]),
             )
 
         u_masked, dom_m, solver_m = make_masked(7)
@@ -562,7 +562,7 @@ class TestParamMask:
         u_net.mask(partial_mask).optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
 
         pde = jnn.laplacian(u, [x])
-        solver = jno.core([pde.mse], domain)
+        solver = jno.core([pde.mse])
         stats = solver.solve(5)
         assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
 
@@ -653,7 +653,7 @@ def test_mask_initialize_freeze_lora_combined():
     pde_v = jnn.laplacian(v, [x]) - jnn.sin(jnn.pi * x)
 
     # ── Solver ───────────────────────────────────────────────
-    solver = jno.core([pde_u.mse, pde_v.mse], domain)
+    solver = jno.core([pde_u.mse, pde_v.mse])
 
     lid_u = u_net.layer_id
     lid_v = v_net.layer_id
@@ -799,7 +799,7 @@ def _eval_time_integral(expr, domain, *, min_consecutive=None):
     """Compile and evaluate a single expression directly (no training)."""
     import jno
 
-    (val,) = jno.core([], domain).eval([expr], domain=domain, min_consecutive=min_consecutive)
+    (val,) = jno.core([]).eval([expr], domain=domain, min_consecutive=min_consecutive)
     return val
 
 
@@ -967,7 +967,7 @@ class TestIntegralTimeGuard:
         key = jax.random.PRNGKey(0)
         u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=8, num_layers=2, key=key))
         loss = (u_net(x) * (t * 0 + 1)).integrate(t)
-        solver = jno.core([loss], dom)
+        solver = jno.core([loss])
         u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
         return solver
 
@@ -1016,7 +1016,7 @@ class TestIntegralTimeIntegration:
         u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=32, num_layers=3, key=key))
         TARGET = 0.5
         loss = ((u_net(x) * (t * 0 + 1)).integrate(t) - TARGET) ** 2
-        solver = jno.core([loss], dom)
+        solver = jno.core([loss])
         u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
         stats = solver.solve(epochs=200, min_consecutive=None)
         logs = stats.training_logs[-1]["total_loss"]
@@ -1038,7 +1038,7 @@ class TestIntegralTimeIntegration:
         key = jax.random.PRNGKey(7)
         u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=16, num_layers=2, key=key))
         loss = ((u_net(x) * (t * 0 + 1)).integrate(t) - 0.5) ** 2
-        solver = jno.core([loss], dom)
+        solver = jno.core([loss])
         u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
         stats = solver.solve(epochs=5, min_consecutive=2)
         assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
@@ -1079,7 +1079,7 @@ class TestBoundaryNormal:
         dom = self._make_1d_domain()
         x, _, n = dom.variable("right", normals=True)
         flux = n.integrate()
-        (val,) = jno.core([], dom).eval([flux], domain=dom)
+        (val,) = jno.core([]).eval([flux], domain=dom)
         assert float(val) > 0, f"Right normal should be positive, got {float(val):.4f}"
 
     def test_normal_sign_left_is_negative(self):
@@ -1089,7 +1089,7 @@ class TestBoundaryNormal:
         dom = self._make_1d_domain()
         x, _, n = dom.variable("left", normals=True)
         flux = n.integrate()
-        (val,) = jno.core([], dom).eval([flux], domain=dom)
+        (val,) = jno.core([]).eval([flux], domain=dom)
         assert float(val) < 0, f"Left normal should be negative, got {float(val):.4f}"
 
     def test_normal_right_plus_left_opposite_signs(self):
@@ -1099,8 +1099,8 @@ class TestBoundaryNormal:
         dom = self._make_1d_domain()
         _, _, nr = dom.variable("right", normals=True)
         _, _, nl = dom.variable("left", normals=True)
-        (vr,) = jno.core([], dom).eval([nr.integrate()], domain=dom)
-        (vl,) = jno.core([], dom).eval([nl.integrate()], domain=dom)
+        (vr,) = jno.core([]).eval([nr.integrate()], domain=dom)
+        (vl,) = jno.core([]).eval([nl.integrate()], domain=dom)
         assert float(vr) > 0 and float(vl) < 0
         assert jnp.allclose(vr, -vl, atol=1e-5), (
             f"right flux={float(vr):.6f}, left flux={float(vl):.6f} should be equal and opposite"
@@ -1120,7 +1120,7 @@ class TestBoundaryNormal:
         vol = u_int.laplacian(x, y).integrate()
         flux = (u_bnd.d(x_b) * nx + u_bnd.d(y_b) * ny).integrate()
 
-        crux = jno.core([], dom)
+        crux = jno.core([])
         vol_val, flux_val = crux.eval([vol, flux], domain=dom)
         vol_s = jnp.squeeze(vol_val)
         flux_s = jnp.squeeze(flux_val)

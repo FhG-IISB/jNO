@@ -50,7 +50,7 @@ pde = u_xxxx - jno.np.sin(π * x)
 ## Step 4: Solve
 
 ```python
-crux = jno.core([pde.mse], domain)
+crux = jno.core([pde.mse])
 history = crux.solve(5000)
 ```
 

@@ -49,7 +49,7 @@ pde = k * (u.dd(x) + u.dd(y)) + 1.0  # PDE residual
 cb = jno.callbacks.checkpoint(save_interval_epochs=5000, best_fn=lambda m: m["total_loss"])
 
 # Compile → train → save
-crux = jno.core(constraints=[pde.mse], domain=dom)
+crux = jno.core(constraints=[pde.mse])
 crux.print_shapes()
 crux.solve(epochs=20_000, batchsize=32, callbacks=[cb]).plot(f"{dir}/training.png")
 jno.save(crux, f"{dir}/model.pkl")

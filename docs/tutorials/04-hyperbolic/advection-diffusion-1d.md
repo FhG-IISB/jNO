@@ -63,7 +63,7 @@ ic = net(t0, x0) - jno.np.sin(π * x0)
 # BC:   u(0, t) = u(1, t) = 0
 bc = net(tb, xb)
 
-crux    = jno.core([pde.mse, ic.mse, bc.mse], domain)
+crux    = jno.core([pde.mse, ic.mse, bc.mse])
 history = crux.solve(5000)
 ```
 

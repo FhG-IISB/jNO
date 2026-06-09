@@ -1666,7 +1666,7 @@ class Model(Placeholder):
                 warmup=500,
                 keep=1000,
             )
-            crux = jno.core([residual.mse], domain)
+            crux = jno.core([residual.mse])
             crux.solve(2000)
             chain = a.posterior_samples            # (1000, 1)
 
@@ -1813,7 +1813,7 @@ class Model(Placeholder):
                 num_samples=8,
                 posterior_draws=500,
             )
-            crux = jno.core([residual.mse], domain)
+            crux = jno.core([residual.mse])
             crux.solve(2000)            # 2000 ELBO optimisation steps
             chain = a.posterior_samples  # (1, 500, 1) — draws from fitted q
 

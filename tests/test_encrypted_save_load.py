@@ -68,7 +68,7 @@ def _make_solver():
     u = u_net(x) * x * (1 - x)
     pde = jnn.laplacian(u, [x]) - jnn.sin(jnn.pi * x)
 
-    solver = jno.core([pde.mse], domain)
+    solver = jno.core([pde.mse])
     solver.solve(10)
     return solver
 

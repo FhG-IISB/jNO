@@ -60,7 +60,7 @@ The transient residual enforces the heat equation, while a dedicated initial-con
 pde = u.d(t) - α * jno.np.laplacian(u, [x, y])
 ini = u0 - jno.np.sin(π * x0) * jno.np.sin(π * y0)
 
-crux    = jno.core([pde.mse, ini.mse], domain)
+crux    = jno.core([pde.mse, ini.mse])
 history = crux.solve(40000)
 ```
 

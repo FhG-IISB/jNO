@@ -59,7 +59,7 @@ u_at_0 = net(0 * t, xy) * x * (1 - x) * y * (1 - y)
 ini = u_at_0 - S
 
 grad_norms = jno.trackers.gradient_norms(interval=500)
-crux = jno.core([pde.mse, ini.mse], domain)
+crux = jno.core([pde.mse, ini.mse])
 
 print(f"Allen–Cahn 2-D  (ε = {ε})")
 crux.solve(5000, callbacks=[grad_norms])

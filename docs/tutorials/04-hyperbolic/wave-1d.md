@@ -58,7 +58,7 @@ ic_vel = u0.d(t0)
 # Spatial boundary:        u(0, t) = u(1, t) = 0
 bc = net(tb, xb)
 
-crux = jno.core([pde.mse, ic_disp.mse, ic_vel.mse, bc.mse], domain)
+crux = jno.core([pde.mse, ic_disp.mse, ic_vel.mse, bc.mse])
 history = crux.solve(50000)
 ```
 

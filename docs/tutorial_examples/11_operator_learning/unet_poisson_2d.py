@@ -62,5 +62,5 @@ u.optimizer(
 
 # ── Supervised loss + solve ─────────────────────────────────────────────────
 # u(_f[0, ...]) drops a leading singleton axis because UNet expects (B, H, W, C).
-crux = jno.core([(_u - u(_f[0, ...])).mse], domain)
+crux = jno.core([(_u - u(_f[0, ...])).mse])
 crux.solve(epochs=EPOCHS, batchsize=BATCH)

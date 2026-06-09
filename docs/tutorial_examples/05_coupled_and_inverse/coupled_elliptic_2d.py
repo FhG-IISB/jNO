@@ -42,7 +42,7 @@ v = (v_net(x, y) * ansatz).scalar.bind(x=x, y=y)
 pde_u = -(u.xx + u.yy) + v - f
 pde_v = -(v.xx + v.yy) + u - g
 
-crux = jno.core([pde_u.mse, pde_v.mse], domain)
+crux = jno.core([pde_u.mse, pde_v.mse])
 crux.solve(5_000)
 
 _u, _u_exact, _v, _v_exact = crux.eval([u, u_exact, v, v_exact])

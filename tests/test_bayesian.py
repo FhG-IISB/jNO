@@ -64,7 +64,7 @@ class TestNUTSInverseProblem:
         )
 
         residual = a * jno.np.sin(π * x) - target
-        crux = jno.core([residual.mse], dom)
+        crux = jno.core([residual.mse])
         crux.solve(warmup + keep)
         return a
 
@@ -100,7 +100,7 @@ class TestSGLDOnMLP:
         net = _tiny_net()
         net.bayesian(blackjax.sgld, step_size=1e-4, warmup=10, keep=20)
         residual = net(x) - 0.0
-        crux = jno.core([residual.mse], dom)
+        crux = jno.core([residual.mse])
         crux.solve(30)
         chain = net.posterior_samples
         assert chain is not None
@@ -137,7 +137,7 @@ class TestMixedOptimizerBayesian:
         b.optimizer(optax.adam(1e-2))
 
         residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
-        crux = jno.core([residual.mse], dom)
+        crux = jno.core([residual.mse])
         crux.solve(30)
 
         assert a.posterior_samples is not None
@@ -169,7 +169,7 @@ class TestEvalChainSamples:
             keep=10,
         )
         residual = a * jno.np.sin(π * x) - target
-        crux = jno.core([residual.mse], dom)
+        crux = jno.core([residual.mse])
         crux.solve(15)
 
         a_chain = crux.eval([a], samples="chain")
@@ -188,7 +188,7 @@ class TestEvalChainSamples:
         a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
         a.optimizer(optax.adam(1e-2))
         residual = a * jno.np.sin(jno.np.pi * x) - jno.np.sin(jno.np.pi * x)
-        crux = jno.core([residual.mse], dom)
+        crux = jno.core([residual.mse])
         crux.solve(5)
         with pytest.raises(ValueError, match="samples='chain'"):
             crux.eval([a], samples="chain")
@@ -221,7 +221,7 @@ class TestEvalAutoChainDefault:
         b.optimizer(optax.adam(1e-2))
         target = 1.0 * jno.np.sin(π * x)
         residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
-        crux = jno.core([residual.mse], dom)
+        crux = jno.core([residual.mse])
         crux.solve(15)
         return a, b, x, crux
 
@@ -270,7 +270,7 @@ class TestNoBayesianBitIdentical:
         a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
         a.optimizer(optax.adam(1e-2))
         residual = a * jno.np.sin(π * x) - target
-        crux = jno.core([residual.mse], dom)
+        crux = jno.core([residual.mse])
         crux.solve(20)
         return float(crux.eval([a])[0])
 
@@ -379,7 +379,7 @@ class TestPriorsNamespace:
             adapt=False,
         )
         residual = a * jno.np.sin(π * x) - target
-        jno.core([residual.mse], dom).solve(15)
+        jno.core([residual.mse]).solve(15)
         assert a.posterior_samples is not None
         assert a.posterior_samples.shape == (1, 10, 1)
 
@@ -398,7 +398,7 @@ class TestPriorsNamespace:
             posterior_draws=20,
         )
         residual = a * jno.np.sin(π * x) - target
-        jno.core([residual.mse], dom).solve(20)
+        jno.core([residual.mse]).solve(20)
         assert a.posterior_samples.shape == (1, 20, 1)
 
     def test_priors_skip_integer_leaves(self):
@@ -437,7 +437,7 @@ class TestCustomPrior:
             keep=40,
         )
         residual = a * jno.np.sin(π * x) - target
-        crux = jno.core([residual.mse], dom)
+        crux = jno.core([residual.mse])
         crux.solve(60)
         post_mean = float(jnp.mean(a.posterior_samples))
         # Strong prior should drag the posterior closer to 0 than the truth (2.0).
@@ -476,7 +476,7 @@ class TestLikelihoodScale:
                 likelihood_scale=scale,
             )
             residual = a * jno.np.sin(π * x) - target
-            jno.core([residual.mse], dom).solve(250)
+            jno.core([residual.mse]).solve(250)
             return jnp.std(a.posterior_samples)
 
         std_low = _solve(1.0)
@@ -512,7 +512,7 @@ class TestLikelihoodScale:
                 likelihood_scale=scale,
             )
             residual = a * jno.np.sin(π * x) - target
-            jno.core([residual.mse], dom).solve(400)
+            jno.core([residual.mse]).solve(400)
             return float(jnp.mean(a.posterior_samples))
 
         mean_unscaled = _solve(1.0)
@@ -552,7 +552,7 @@ class TestSubstepsWithBayesian:
         a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
         a.bayesian(blackjax.nuts, step_size=1e-2, warmup=5, keep=10, adapt=False)
         residual = a * jno.np.sin(π * x) - target
-        crux = jno.core([residual.mse, residual.mse], dom)
+        crux = jno.core([residual.mse, residual.mse])
         crux.solve(15, substeps=[[0], [1]])
         # Bayesian model collects samples once per outer epoch from whichever
         # substep updated its position.
@@ -568,7 +568,7 @@ class TestSubstepsWithBayesian:
         # adapt=True is the default — make it explicit for clarity.
         a.bayesian(blackjax.nuts, step_size=1e-2, warmup=5, keep=5, adapt=True)
         residual = a * jno.np.sin(π * x) - target
-        crux = jno.core([residual.mse, residual.mse], dom)
+        crux = jno.core([residual.mse, residual.mse])
         with pytest.raises(ValueError, match="substeps.*adapt=True"):
             crux.solve(10, substeps=[[0], [1]])
 
@@ -587,7 +587,7 @@ class TestMissingStepSize:
         dom = _line_domain()
         x, _ = dom.variable("interior")
         residual = a * jno.np.sin(jno.np.pi * x) - jno.np.sin(jno.np.pi * x)
-        crux = jno.core([residual.mse], dom)
+        crux = jno.core([residual.mse])
         with pytest.raises(ValueError, match="requires a step_size"):
             crux.solve(2)
 
@@ -599,7 +599,7 @@ class TestMissingStepSize:
         dom = _line_domain()
         x, _ = dom.variable("interior")
         residual = a * jno.np.sin(jno.np.pi * x) - jno.np.sin(jno.np.pi * x)
-        crux = jno.core([residual.mse], dom)
+        crux = jno.core([residual.mse])
         with pytest.raises(ValueError, match="requires a step_size"):
             crux.solve(4)
 
@@ -612,7 +612,7 @@ class TestMissingStepSize:
         dom = _line_domain()
         x, _ = dom.variable("interior")
         residual = a * jno.np.sin(jno.np.pi * x) - jno.np.sin(jno.np.pi * x)
-        jno.core([residual.mse], dom).solve(30)
+        jno.core([residual.mse]).solve(30)
         assert a.posterior_samples is not None
         assert a.posterior_samples.shape == (1, 10, 1)
 
@@ -623,7 +623,7 @@ class TestMissingStepSize:
         dom = _line_domain()
         x, _ = dom.variable("interior")
         residual = a * jno.np.sin(jno.np.pi * x) - jno.np.sin(jno.np.pi * x)
-        jno.core([residual.mse], dom).solve(30)
+        jno.core([residual.mse]).solve(30)
         assert a.posterior_samples.shape == (1, 10, 1)
 
     def test_adapt_true_zero_warmup_still_raises(self):
@@ -635,7 +635,7 @@ class TestMissingStepSize:
         dom = _line_domain()
         x, _ = dom.variable("interior")
         residual = a * jno.np.sin(jno.np.pi * x) - jno.np.sin(jno.np.pi * x)
-        crux = jno.core([residual.mse], dom)
+        crux = jno.core([residual.mse])
         with pytest.raises(ValueError, match="requires a step_size"):
             crux.solve(2)
 
@@ -661,7 +661,7 @@ def _trivial_bayesian_param(*, warmup, keep, thin=1, step_size=1e-2):
         thin=thin,
     )
     residual = a * jno.np.sin(π * x) - target
-    return a, jno.core([residual.mse], dom)
+    return a, jno.core([residual.mse])
 
 
 # ---------------------------------------------------------------------------
@@ -710,7 +710,7 @@ def _kernel_recovery(kernel_factory, *, kernel_kwargs, step_size, warmup=80, kee
         **kernel_kwargs,
     )
     residual = a * jno.np.sin(π * x) - target
-    jno.core([residual.mse], dom).solve(warmup + keep)
+    jno.core([residual.mse]).solve(warmup + keep)
     return a
 
 
@@ -756,7 +756,7 @@ class TestSGHMC:
         a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
         a.bayesian(blackjax.sghmc, step_size=1e-4, warmup=5, keep=10)
         residual = a * jno.np.sin(π * x) - jno.np.sin(π * x)
-        jno.core([residual.mse], dom).solve(15)
+        jno.core([residual.mse]).solve(15)
         assert a.posterior_samples.shape == (1, 10, 1)
 
 
@@ -781,7 +781,7 @@ class TestVectorAndMultiLeafShapes:
         )
         # build expression a*sin + b*cos + c*x where (a, b, c) = p[0], p[1], p[2]
         residual = p[0] * jno.np.sin(π * x) + p[1] * jno.np.cos(π * x) + p[2] * x - target
-        jno.core([residual.mse], dom).solve(50)
+        jno.core([residual.mse]).solve(50)
         assert p.posterior_samples.shape == (1, 30, 3)
 
     def test_multi_leaf_mlp_chain_pytree(self):
@@ -790,7 +790,7 @@ class TestVectorAndMultiLeafShapes:
         net = _tiny_net(in_dim=1, out_dim=1, hidden=4)
         net.bayesian(blackjax.sgld, step_size=1e-4, warmup=5, keep=10)
         residual = net(x) - 0.0
-        jno.core([residual.mse], dom).solve(15)
+        jno.core([residual.mse]).solve(15)
 
         chain = net.posterior_samples
         assert chain is not None
@@ -822,7 +822,7 @@ class TestFreezeBayesianClearsFreeze:
         )
         assert a.model._frozen is False, "bayesian() must clear the freeze flag"
         residual = a * jno.np.sin(π * x) - jno.np.sin(π * x)
-        jno.core([residual.mse], dom).solve(15)
+        jno.core([residual.mse]).solve(15)
         assert a.posterior_samples is not None
         assert a.posterior_samples.shape == (1, 10, 1)
 
@@ -844,7 +844,7 @@ class TestLoRABayesian:
         net.bayesian(blackjax.sgld, step_size=1e-4, warmup=5, keep=10)
 
         residual = net(x) - 0.0
-        jno.core([residual.mse], dom).solve(15)
+        jno.core([residual.mse]).solve(15)
 
         chain = net.posterior_samples
         assert chain is not None
@@ -874,7 +874,7 @@ class TestWindowAdaptation:
             adapt=adapt,
         )
         residual = p * jno.np.sin(π * x) - target
-        jno.core([residual.mse], dom).solve(warmup + keep)
+        jno.core([residual.mse]).solve(warmup + keep)
         return p
 
     def test_adapt_recovers_with_bad_initial_step_size(self):
@@ -900,7 +900,7 @@ class TestWindowAdaptation:
         p = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="p")
         p.bayesian(blackjax.mala, step_size=1e-2, warmup=5, keep=10, adapt=True)
         residual = p * jno.np.sin(π * x) - jno.np.sin(π * x)
-        jno.core([residual.mse], dom).solve(15)
+        jno.core([residual.mse]).solve(15)
         assert p.posterior_samples.shape == (1, 10, 1)
 
 
@@ -917,7 +917,7 @@ class TestAutoInverseMassMatrix:
         # Deliberately do NOT pass inverse_mass_matrix.
         p.bayesian(kernel, step_size=1e-2, warmup=warmup, keep=keep, **kernel_kwargs)
         residual = p * jno.np.sin(π * x) - jno.np.sin(π * x)
-        crux = jno.core([residual.mse], dom)
+        crux = jno.core([residual.mse])
         crux.solve(warmup + keep)
 
     def test_nuts_scalar_param_no_imm_runs(self):
@@ -933,7 +933,7 @@ class TestAutoInverseMassMatrix:
         p = jno.np.parameter((3,), key=jax.random.PRNGKey(0), name="abc")
         p.bayesian(blackjax.nuts, step_size=5e-3, warmup=2, keep=3)
         residual = p[0] * jno.np.sin(π * x) + p[1] * jno.np.cos(π * x) + p[2] * x - target
-        jno.core([residual.mse], dom).solve(5)
+        jno.core([residual.mse]).solve(5)
         assert p.posterior_samples.shape == (1, 3, 3)
 
     def test_nuts_mlp_no_imm_runs(self):
@@ -942,7 +942,7 @@ class TestAutoInverseMassMatrix:
         net = _tiny_net(in_dim=1, out_dim=1, hidden=4)
         net.bayesian(blackjax.nuts, step_size=1e-3, warmup=1, keep=2)
         residual = net(x) - 0.0
-        jno.core([residual.mse], dom).solve(3)
+        jno.core([residual.mse]).solve(3)
         leaves = jax.tree_util.tree_leaves(net.posterior_samples)
         assert all(leaf.shape[:2] == (1, 2) for leaf in leaves)
 
@@ -955,7 +955,7 @@ class TestAutoInverseMassMatrix:
         dom = _line_domain()
         x, _ = dom.variable("interior")
         residual = p * jno.np.sin(π * x) - jno.np.sin(π * x)
-        jno.core([residual.mse], dom).solve(3)
+        jno.core([residual.mse]).solve(3)
         assert p.model._bayesian_cfg["kernel_kwargs"]["inverse_mass_matrix"] is custom
 
     def test_mala_does_not_get_imm_injected(self):
@@ -966,7 +966,7 @@ class TestAutoInverseMassMatrix:
         dom = _line_domain()
         x, _ = dom.variable("interior")
         residual = p * jno.np.sin(π * x) - jno.np.sin(π * x)
-        jno.core([residual.mse], dom).solve(3)
+        jno.core([residual.mse]).solve(3)
         assert "inverse_mass_matrix" not in p.model._bayesian_cfg["kernel_kwargs"]
 
     def test_scalar_imm_broadcasts_to_position_shape(self):
@@ -977,7 +977,7 @@ class TestAutoInverseMassMatrix:
         p = jno.np.parameter((3,), key=jax.random.PRNGKey(0), name="abc")
         p.bayesian(blackjax.nuts, step_size=5e-3, inverse_mass_matrix=2.0, warmup=2, keep=3)
         residual = p[0] * jno.np.sin(π * x) + p[1] * jno.np.cos(π * x) + p[2] * x - target
-        jno.core([residual.mse], dom).solve(5)
+        jno.core([residual.mse]).solve(5)
         # After injection, the kwarg in extra_kwargs gets broadcast to a length-3 vector.
         # Look at the handle on the model — it was built inside solve(), so the cfg
         # itself still holds the original scalar (we only mutate handle.extra_kwargs,
@@ -1009,7 +1009,7 @@ class TestPosteriorDiagnostics:
         a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
         a.bayesian(blackjax.nuts, step_size=1e-2, warmup=0, keep=8, adapt=False)
         residual = a * jno.np.sin(π * x) - target
-        jno.core([residual.mse], dom).solve(8)
+        jno.core([residual.mse]).solve(8)
         diag = a.model.posterior_diagnostics
         assert diag is not None
         assert set(diag.keys()) == {"is_divergent", "acceptance_rate", "energy"}
@@ -1028,7 +1028,7 @@ class TestPosteriorDiagnostics:
         a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
         a.bayesian(blackjax.mala, step_size=1e-2, warmup=0, keep=5)
         residual = a * jno.np.sin(π * x) - target
-        jno.core([residual.mse], dom).solve(5)
+        jno.core([residual.mse]).solve(5)
         diag = a.model.posterior_diagnostics
         assert diag is not None
         # MALA has no Hamiltonian integrator → no divergence / energy.
@@ -1042,7 +1042,7 @@ class TestPosteriorDiagnostics:
         net = _tiny_net(in_dim=1, out_dim=1, hidden=4, key_seed=1)
         net.bayesian(blackjax.sgld, step_size=1e-5, warmup=0, keep=3)
         residual = net(x) - target
-        jno.core([residual.mse], dom).solve(3)
+        jno.core([residual.mse]).solve(3)
         assert net.posterior_diagnostics is None
 
     def test_diagnostics_multi_chain_shape(self):
@@ -1059,7 +1059,7 @@ class TestPosteriorDiagnostics:
             init_jitter=0.1,
         )
         residual = a * jno.np.sin(π * x) - target
-        jno.core([residual.mse], dom).solve(6)
+        jno.core([residual.mse]).solve(6)
         diag = a.model.posterior_diagnostics
         assert diag is not None
         # Shape mirrors posterior_samples: (K=3, N=6).
@@ -1074,7 +1074,7 @@ class TestPosteriorDiagnostics:
         a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
         a.bayesian(blackjax.nuts, step_size=1e-2, warmup=0, keep=3, adapt=False)
         residual = a * jno.np.sin(π * x) - target
-        jno.core([residual.mse], dom).solve(3)
+        jno.core([residual.mse]).solve(3)
         # ``a`` is the ModelCall; ``a.posterior_diagnostics`` must
         # resolve to the underlying Model's dict.
         assert a.posterior_diagnostics is a.model.posterior_diagnostics
@@ -1088,7 +1088,7 @@ class TestPosteriorDiagnostics:
         a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="diag_a")
         a.bayesian(blackjax.nuts, step_size=1e-2, warmup=0, keep=4, adapt=False)
         residual = a * jno.np.sin(π * x) - target
-        jno.core([residual.mse], dom).solve(4)
+        jno.core([residual.mse]).solve(4)
         captured = capsys.readouterr().out
         assert "diag_a" in captured
         assert "divergent" in captured
@@ -1113,7 +1113,7 @@ class TestPosteriorDiagnostics:
         a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="wb_a")
         a.bayesian(blackjax.nuts, step_size=1e-2, warmup=0, keep=3, adapt=False)
         residual = a * jno.np.sin(π * x) - target
-        jno.core([residual.mse], dom).solve(4)
+        jno.core([residual.mse]).solve(4)
         keys: set[str] = set()
         for m in recorded:
             keys.update(m.keys())
@@ -1158,7 +1158,7 @@ class TestWandbChainStatsSmoke:
         a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="alpha")
         a.bayesian(blackjax.nuts, step_size=1e-2, warmup=0, keep=3, adapt=False)
         residual = a * jno.np.sin(π * x) - jno.np.sin(π * x)
-        jno.core([residual.mse], dom).solve(4)
+        jno.core([residual.mse]).solve(4)
 
         # Collect all keys logged across all calls.
         all_keys = set()
@@ -1188,7 +1188,7 @@ class TestModelCallProxy:
         dom = _line_domain()
         x, _ = dom.variable("interior")
         residual = a * jno.np.sin(jno.np.pi * x) - jno.np.sin(jno.np.pi * x)
-        jno.core([residual.mse], dom).solve(5)
+        jno.core([residual.mse]).solve(5)
         assert a.posterior_samples is not None
         assert a.posterior_samples.shape == (1, 3, 1)
 
@@ -1216,7 +1216,7 @@ def _multichain_solve(K: int, *, warmup=50, keep=80, init_jitter=0.0):
         init_jitter=init_jitter,
     )
     residual = a * jno.np.sin(π * x) - target
-    jno.core([residual.mse], dom).solve(warmup + keep)
+    jno.core([residual.mse]).solve(warmup + keep)
     return a
 
 
@@ -1269,7 +1269,7 @@ class TestMultiChain:
             num_chains=3,
         )
         residual = a * jno.np.sin(π * x) - target
-        crux = jno.core([residual.mse], dom)
+        crux = jno.core([residual.mse])
         crux.solve(15)
         # crux.eval with auto-chain mode vmaps over (K, N) → output has
         # leading (K, N) axes.
@@ -1286,7 +1286,7 @@ class TestMultiChain:
         a.bayesian(blackjax.nuts, step_size=1e-2, warmup=2, keep=3, adapt=False, num_chains=2)
         b.bayesian(blackjax.nuts, step_size=1e-2, warmup=2, keep=3, adapt=False, num_chains=4)
         residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - jno.np.sin(π * x)
-        crux = jno.core([residual.mse], dom)
+        crux = jno.core([residual.mse])
         with pytest.raises(ValueError, match="num_chains"):
             crux.solve(5)
 
@@ -1395,7 +1395,7 @@ class TestMCMCFastpath:
             num_chains=num_chains,
         )
         residual = a * jno.np.sin(π * x) - target
-        jno.core([residual.mse], dom).solve(warmup + keep * thin)
+        jno.core([residual.mse]).solve(warmup + keep * thin)
         return a
 
     def test_fastpath_k1_recovers(self):
@@ -1433,7 +1433,7 @@ class TestMCMCFastpath:
                 adapt=False,
             )
         residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
-        jno.core([residual.mse], dom).solve(400)
+        jno.core([residual.mse]).solve(400)
         assert a.posterior_samples.shape == (1, 200, 1)
         assert b.posterior_samples.shape == (1, 200, 1)
         # Both posterior means roughly recover truth (loose tolerance).
@@ -1450,7 +1450,7 @@ class TestMCMCFastpath:
         a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
         a.bayesian(blackjax.nuts, step_size=1e-2, warmup=5, keep=10, adapt=False)
         residual = a * jno.np.sin(π * x) - target
-        jno.core([residual.mse, residual.mse], dom).solve(15, substeps=[[0], [1]])
+        jno.core([residual.mse, residual.mse]).solve(15, substeps=[[0], [1]])
         assert a.posterior_samples.shape == (1, 10, 1)
 
     def test_mixed_mode_falls_through_to_slow_path(self):
@@ -1472,7 +1472,7 @@ class TestMCMCFastpath:
         )
         b.optimizer(optax.adam(1e-2))
         residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
-        jno.core([residual.mse], dom).solve(15)
+        jno.core([residual.mse]).solve(15)
         assert a.posterior_samples.shape == (1, 10, 1)
         assert b.posterior_samples is None
 
@@ -1505,7 +1505,7 @@ class TestMCMCFastpath:
             adapt=False,
         )
         residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
-        jno.core([residual.mse], dom).solve(22)
+        jno.core([residual.mse]).solve(22)
         # Slow-path collection still respects per-handle thin.
         assert a.posterior_samples.shape == (1, 10, 1)
         assert b.posterior_samples.shape == (1, 10, 1)
@@ -1542,7 +1542,7 @@ class TestMCMCFastpath:
                 adapt=False,
             )
             residual = a * jno.np.sin(π * x) - target
-            crux = jno.core([residual.mse, residual.mse], dom) if use_substeps else jno.core([residual.mse], dom)
+            crux = jno.core([residual.mse, residual.mse]) if use_substeps else jno.core([residual.mse])
             kwargs = {"substeps": [[0], [1]]} if use_substeps else {}
             # Warmup the JIT — first call compiles.
             crux.solve(10, **kwargs)
@@ -1584,7 +1584,7 @@ class TestVIMeanField:
             posterior_draws=posterior_draws,
         )
         residual = a * jno.np.sin(π * x) - target
-        jno.core([residual.mse], dom).solve(num_iters)
+        jno.core([residual.mse]).solve(num_iters)
         return a
 
     def test_scalar_recovery(self):
@@ -1608,7 +1608,7 @@ class TestVIMeanField:
             posterior_draws=150,
         )
         residual = p[0] * jno.np.sin(π * x) + p[1] * jno.np.cos(π * x) + p[2] * x - target
-        jno.core([residual.mse], dom).solve(1500)
+        jno.core([residual.mse]).solve(1500)
         chain = p.posterior_samples
         assert chain.shape == (1, 150, 3)
         # Per-component means within reasonable tolerance.  Mean-field
@@ -1632,7 +1632,7 @@ class TestVIMeanField:
             posterior_draws=50,
         )
         residual = net(x) - 0.0
-        jno.core([residual.mse], dom).solve(200)
+        jno.core([residual.mse]).solve(200)
         chain = net.posterior_samples
         assert chain is not None
         leaves = jax.tree_util.tree_leaves(chain)
@@ -1669,7 +1669,7 @@ class TestVIMeanField:
         a.vi(blackjax.meanfield_vi, optimizer=optax.adam(1e-2), num_samples=4, posterior_draws=50)
         b.bayesian(blackjax.nuts, step_size=1e-2, inverse_mass_matrix=jnp.ones(1), warmup=10, keep=50, adapt=False)
         residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
-        jno.core([residual.mse], dom).solve(60)
+        jno.core([residual.mse]).solve(60)
         assert a.posterior_samples.shape == (1, 50, 1)
         assert b.posterior_samples.shape == (1, 50, 1)
 
@@ -1698,7 +1698,7 @@ class TestVIMeanField:
         # Patch init_state on the module the solve loop imports.
         bay_mod.init_state = _spy
         try:
-            jno.core([residual.mse], dom).solve(2)
+            jno.core([residual.mse]).solve(2)
         finally:
             bay_mod.init_state = orig_init
         assert "rho" in captured
@@ -1733,7 +1733,7 @@ class TestVIMeanField:
         residual = a * jno.np.sin(π * x) - jno.np.sin(π * x)
         bay_mod.init_state = _spy
         try:
-            jno.core([residual.mse], dom).solve(2)
+            jno.core([residual.mse]).solve(2)
         finally:
             bay_mod.init_state = orig_init
         for leaf in jax.tree_util.tree_leaves(captured["rho"]):
@@ -1768,7 +1768,7 @@ class TestVIMeanField:
         residual = a * jno.np.sin(π * x) - jno.np.sin(π * x)
         bay_mod.init_state = _spy
         try:
-            jno.core([residual.mse], dom).solve(2)
+            jno.core([residual.mse]).solve(2)
         finally:
             bay_mod.init_state = orig_init
         # blackjax default = zeros for every mu leaf.
@@ -1789,7 +1789,7 @@ class TestVIMeanField:
             a = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="a")
             a.vi(blackjax.meanfield_vi, optimizer=optax.adam(1e-2), num_samples=4, posterior_draws=10)
             residual = a * jno.np.sin(π * x) - target
-            crux = jno.core([residual.mse], dom)
+            crux = jno.core([residual.mse])
             history = crux.solve(num_iters)
             return float(history.total_loss)
 
@@ -1833,7 +1833,7 @@ class TestMaskedBackends:
         net.mask(mask).bayesian(blackjax.sgld, step_size=1e-4, warmup=5, keep=10)
 
         residual = net(x) - 0.0
-        jno.core([residual.mse], dom).solve(15)
+        jno.core([residual.mse]).solve(15)
 
         chain = net.posterior_samples
         assert chain is not None
@@ -1872,7 +1872,7 @@ class TestMaskedBackends:
         net.optimizer(optax.adam(1e-1))
         net.mask(mask).bayesian(blackjax.sgld, step_size=1e-3, warmup=5, keep=20)
         residual = net(x) - 0.0
-        crux = jno.core([residual.mse], dom)
+        crux = jno.core([residual.mse])
         crux.solve(30)
 
         # Bayesian contract: masked leaf varies across the chain.
@@ -1908,7 +1908,7 @@ class TestMaskedBackends:
         )
 
         residual = net(x) - 0.0
-        jno.core([residual.mse], dom).solve(60)
+        jno.core([residual.mse]).solve(60)
 
         chain = net.posterior_samples
         assert chain is not None
@@ -1938,7 +1938,7 @@ class TestMaskedBackends:
             posterior_draws=20,
         )
         residual = net(x) - 0.0
-        jno.core([residual.mse], dom).solve(60)
+        jno.core([residual.mse]).solve(60)
         chain = net.posterior_samples
         assert chain is not None
         leaves = jax.tree_util.tree_leaves(chain)
@@ -1958,7 +1958,7 @@ class TestMaskedBackends:
         mask, _ = _build_last_leaf_mask(net)
         net.mask(mask).bayesian(blackjax.sgld, step_size=1e-4, warmup=5, keep=8)
         residual = net(x) - 0.0
-        jno.core([residual.mse], dom).solve(13)
+        jno.core([residual.mse]).solve(13)
         chain_leaves = jax.tree_util.tree_leaves(net.posterior_samples)
         assert len(chain_leaves) == expected_n_leaves, (
             f"chain has {len(chain_leaves)} leaves, expected {expected_n_leaves} (full pytree)"
@@ -1981,7 +1981,7 @@ class TestMaskedBackends:
             num_chains=4,
         )
         residual = net(x) - 0.0
-        jno.core([residual.mse], dom).solve(8)
+        jno.core([residual.mse]).solve(8)
         chain = net.posterior_samples
         assert chain is not None
         # Each leaf should now have leading (K, N) = (4, 5).
@@ -2006,7 +2006,7 @@ class TestMaskedBackends:
         net.mask(mask).bayesian(blackjax.sgld, step_size=1e-4, warmup=2, keep=3)
         residual = net(x) - 0.0
         with pytest.raises(ValueError, match="global .bayesian"):
-            jno.core([residual.mse], dom).solve(5)
+            jno.core([residual.mse]).solve(5)
 
     def test_multiple_masked_bayesian_runs(self):
         """Phase 16 lifts the block on multiple disjoint masked
@@ -2029,7 +2029,7 @@ class TestMaskedBackends:
         net.mask(m2).bayesian(blackjax.sgld, step_size=1e-4, warmup=2, keep=5)
 
         residual = net(x) - 0.0
-        jno.core([residual.mse], dom).solve(7)
+        jno.core([residual.mse]).solve(7)
         chain = net.posterior_samples
         assert chain is not None
         # Both group leaves vary across the chain (each group's kernel
@@ -2077,7 +2077,7 @@ class TestMaskedBackends:
         )
         net.mask(full_mask).bayesian(blackjax.sgld, step_size=1e-3, warmup=100, keep=100)
         residual = net(x) - target
-        jno.core([residual.mse], dom).solve(200)
+        jno.core([residual.mse]).solve(200)
         chain = net.posterior_samples
         # All inexact leaves vary (they're all in the mask).
         leaves = jax.tree_util.tree_leaves(chain)
@@ -2137,7 +2137,7 @@ class TestUnderTheHood:
                 adapt=False,
             )
             residual = a * jno.np.sin(π * x) - target
-            crux = jno.core([residual.mse], dom)
+            crux = jno.core([residual.mse])
             crux.solve(300, offload_data=offload)
             return a.posterior_samples
 
@@ -2185,7 +2185,7 @@ class TestUnderTheHood:
 
         net.mask(head_mask).bayesian(blackjax.sgld, step_size=1e-3, warmup=10, keep=30)
         residual = net(x) - 0.0
-        jno.core([residual.mse], dom).solve(40)
+        jno.core([residual.mse]).solve(40)
 
         chain = net.posterior_samples
         all_leaves = jax.tree_util.tree_leaves(chain)
@@ -2244,7 +2244,7 @@ class TestUnderTheHood:
             adapt=True,
         )
         residual = a * jno.np.sin(π * x) - target
-        jno.core([residual.mse], dom).solve(300)
+        jno.core([residual.mse]).solve(300)
 
         # The spy fired exactly once for this single Bayesian model.
         assert "step_size" in captured, "run_window_adaptation was never called — adapt=True did nothing"
@@ -2293,7 +2293,7 @@ class TestUnderTheHood:
                 thin=thin,
             )
             residual = a * jno.np.sin(π * x) - target
-            jno.core([residual.mse], dom).solve(warmup + keep * thin)
+            jno.core([residual.mse]).solve(warmup + keep * thin)
             return a.posterior_samples
 
         # Three different configurations that produce different chunk
@@ -2341,7 +2341,7 @@ class TestUnderTheHood:
         b.optimizer(optax.adam(1e-1))
 
         residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
-        crux = jno.core([residual.mse], dom)
+        crux = jno.core([residual.mse])
         crux.solve(50)
 
         # Existing contract: only the Bayesian model carries a chain.
@@ -2394,7 +2394,7 @@ class TestUnderTheHood:
                 init_jitter=0.0,
             )
             residual = a * jno.np.sin(π * x) - target
-            jno.core([residual.mse], dom).solve(60)
+            jno.core([residual.mse]).solve(60)
             return a.posterior_samples
 
         chain_a = _solve()
@@ -2445,7 +2445,7 @@ class TestPathfinderInitializer:
             adapt=adapt,
         )
         residual = a * jno.np.sin(π * x) - target
-        jno.core([residual.mse], dom).solve(warmup + keep)
+        jno.core([residual.mse]).solve(warmup + keep)
         return a
 
     # ─── 1. spy: initializer invoked and IMM merged ───────────────────
@@ -2630,7 +2630,7 @@ class TestPathfinderInitializer:
             init_jitter=0.5,  # would normally disperse; should be overridden
         )
         residual = a * jno.np.sin(π * x) - target
-        jno.core([residual.mse], dom).solve(10)
+        jno.core([residual.mse]).solve(10)
         chain = a.posterior_samples
         assert chain.shape == (4, 8, 1)
         # K=4 first samples must differ pairwise — pathfinder samples
@@ -2653,7 +2653,7 @@ class TestPathfinderInitializer:
         net.initialize(jno.bayesian.pathfinder(maxiter=10, num_samples=30))
         net.mask(mask).bayesian(blackjax.sgld, step_size=1e-4, warmup=5, keep=10)
         residual = net(x) - 0.0
-        jno.core([residual.mse], dom).solve(15)
+        jno.core([residual.mse]).solve(15)
 
         chain = net.posterior_samples
         leaves = jax.tree_util.tree_leaves(chain)
@@ -2686,7 +2686,7 @@ class TestPathfinderInitializer:
         residual_a = a * jno.np.sin(π * x) - target
         residual_b = b * jno.np.sin(π * x) - target
         with pytest.raises(ValueError, match="substeps"):
-            jno.core([residual_a.mse, residual_b.mse], dom).solve(7, substeps=[([0], 1), ([1], 1)])
+            jno.core([residual_a.mse, residual_b.mse]).solve(7, substeps=[([0], 1), ([1], 1)])
 
     # ─── 9. VI guard ──────────────────────────────────────────────────
 
@@ -2703,7 +2703,7 @@ class TestPathfinderInitializer:
         a.vi(blackjax.meanfield_vi, optimizer=optax.adam(1e-2), num_samples=4, posterior_draws=10)
         residual = a * jno.np.sin(π * x) - target
         with pytest.raises(ValueError, match=".vi"):
-            jno.core([residual.mse], dom).solve(5)
+            jno.core([residual.mse]).solve(5)
 
     # ─── 10. non-IMM kernel drops IMM, keeps warm position ───────────
 
@@ -2720,7 +2720,7 @@ class TestPathfinderInitializer:
         # MALA doesn't accept inverse_mass_matrix in its factory signature.
         a.bayesian(blackjax.mala, step_size=1e-3, warmup=5, keep=20, adapt=False)
         residual = a * jno.np.sin(π * x) - target
-        jno.core([residual.mse], dom).solve(25)
+        jno.core([residual.mse]).solve(25)
         chain = a.posterior_samples
         assert chain.shape == (1, 20, 1)
         # The warm position landed the chain near truth (within MALA's
@@ -2848,7 +2848,7 @@ class TestLaplaceInitializer:
             **bayes_kwargs,
         )
         residual = a * jno.np.sin(π * x) - target
-        jno.core([residual.mse], dom).solve(warmup + keep)
+        jno.core([residual.mse]).solve(warmup + keep)
         return a
 
     # ─── 1. spy: invoked and IMM merged ───────────────────────────────
@@ -2937,7 +2937,7 @@ class TestLaplaceInitializer:
             adapt=False,
         )
         residual = a * jno.np.sin(π * x) - target
-        jno.core([residual.mse], dom).solve(10)
+        jno.core([residual.mse]).solve(10)
         chain = a.posterior_samples
         assert chain.shape == (4, 8, 1)
         firsts = chain[:, 0, 0]
@@ -2956,7 +2956,7 @@ class TestLaplaceInitializer:
         net.initialize(jno.bayesian.laplace(map_steps=20, hessian_strategy="diagonal"))
         net.mask(mask).bayesian(blackjax.sgld, step_size=1e-4, warmup=5, keep=10)
         residual = net(x) - 0.0
-        jno.core([residual.mse], dom).solve(15)
+        jno.core([residual.mse]).solve(15)
 
         chain = net.posterior_samples
         leaves = jax.tree_util.tree_leaves(chain)
@@ -3019,7 +3019,7 @@ class TestSVGDInitializer:
             **bayes_kwargs,
         )
         residual = a * jno.np.sin(π * x) - target
-        jno.core([residual.mse], dom).solve(warmup + keep)
+        jno.core([residual.mse]).solve(warmup + keep)
         return a
 
     # ─── 1. spy: invoked and IMM merged ───────────────────────────────
@@ -3079,7 +3079,7 @@ class TestSVGDInitializer:
             adapt=False,
         )
         residual = a * jno.np.sin(π * x) - target
-        jno.core([residual.mse], dom).solve(10)
+        jno.core([residual.mse]).solve(10)
         chain = a.posterior_samples
         assert chain.shape == (4, 8, 1)
         firsts = chain[:, 0, 0]
@@ -3111,7 +3111,7 @@ class TestSVGDInitializer:
         net.initialize(jno.bayesian.svgd(num_iters=20, num_particles=8, init_jitter=0.5))
         net.mask(mask).bayesian(blackjax.sgld, step_size=1e-4, warmup=5, keep=10)
         residual = net(x) - 0.0
-        jno.core([residual.mse], dom).solve(15)
+        jno.core([residual.mse]).solve(15)
 
         chain = net.posterior_samples
         leaves = jax.tree_util.tree_leaves(chain)
@@ -3186,7 +3186,7 @@ class TestSVGDInitializer:
         dom = _line_domain()
         x, _ = dom.variable("interior")
         residual = net(x) - 0.0
-        jno.core([residual.mse], dom).solve(2)
+        jno.core([residual.mse]).solve(2)
         # Scale-aware default is in (0, 1.0) — never the historical 1.0.
         assert 0.0 < captured["expected"] < 1.0
 
@@ -3204,7 +3204,7 @@ class TestSVGDInitializer:
         x, _ = dom.variable("interior")
         residual = a * jno.np.sin(jno.np.pi * x) - jno.np.sin(jno.np.pi * x)
         with pytest.raises(ValueError, match="init_jitter must be > 0"):
-            jno.core([residual.mse], dom).solve(2)
+            jno.core([residual.mse]).solve(2)
 
 
 # ---------------------------------------------------------------------------
@@ -3262,7 +3262,7 @@ class TestInitializerComposition:
         b.bayesian(blackjax.nuts, step_size=1e-2, inverse_mass_matrix=jnp.ones(1), warmup=2, keep=15, adapt=False)
 
         residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
-        jno.core([residual.mse], dom).solve(17)
+        jno.core([residual.mse]).solve(17)
 
         # Each initializer ran exactly once — for its own model.
         assert pf_count[0] == 1, f"pathfinder ran {pf_count[0]} times; expected 1"
@@ -3307,7 +3307,7 @@ class TestInitializerComposition:
         b.optimizer(optax.adam(1e-1))
 
         residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
-        crux = jno.core([residual.mse], dom)
+        crux = jno.core([residual.mse])
         crux.solve(50)
 
         # Pathfinder ran exactly once — on the Bayesian model only.
@@ -3363,7 +3363,7 @@ class TestInitializerComposition:
             p.bayesian(blackjax.nuts, step_size=1e-2, inverse_mass_matrix=jnp.ones(1), warmup=2, keep=15, adapt=False)
 
         residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) + c * x * (1 - x) - target
-        jno.core([residual.mse], dom).solve(17)
+        jno.core([residual.mse]).solve(17)
 
         # Each initializer ran on exactly its own model.
         assert counts == {"pf": 1, "lap": 1, "svgd": 1}, f"unexpected initializer call counts: {counts}"
@@ -3402,7 +3402,7 @@ class TestInitializerComposition:
         b.bayesian(blackjax.nuts, step_size=1e-2, inverse_mass_matrix=jnp.ones(1), warmup=2, keep=10, adapt=False)
 
         residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
-        jno.core([residual.mse], dom).solve(12)
+        jno.core([residual.mse]).solve(12)
 
         # Pathfinder ran exactly once — for a only, not for b.
         assert pf_count[0] == 1, f"pathfinder ran {pf_count[0]} times; expected 1 (a only, not b)"
@@ -3454,7 +3454,7 @@ class TestPatternB:
         net.optimizer(optax.adam(1e-1))
         net.mask(mask).bayesian(blackjax.sgld, step_size=1e-3, warmup=5, keep=30)
 
-        jno.core([residual.mse], dom).solve(40)
+        jno.core([residual.mse]).solve(40)
         chain = net.posterior_samples
         chain_leaves = jax.tree_util.tree_leaves(chain)
 
@@ -3476,7 +3476,7 @@ class TestPatternB:
         mask, masked_idx = _build_last_leaf_mask(net)
         net.optimizer(optax.adam(1e-1))
         net.mask(mask).bayesian(blackjax.sgld, step_size=1e-3, warmup=3, keep=8, num_chains=4)
-        jno.core([residual.mse], dom).solve(12)
+        jno.core([residual.mse]).solve(12)
 
         chain = net.posterior_samples
         chain_leaves = jax.tree_util.tree_leaves(chain)
@@ -3505,7 +3505,7 @@ class TestPatternB:
         net.optimizer(optax.adam(1e-2))
         # Use SGLD with step_size=0 so the head doesn't move by SGLD either
         net.mask(mask).bayesian(blackjax.sgld, step_size=0.0, warmup=2, keep=5)
-        jno.core([residual.mse], dom).solve(8)
+        jno.core([residual.mse]).solve(8)
 
         final_head = jax.tree_util.tree_leaves(net.module)[masked_idx]
         # With SGLD step_size=0 the head should be EXACTLY at init
@@ -3526,7 +3526,7 @@ class TestPatternB:
             mask, _ = _build_last_leaf_mask(net)
             net.optimizer(optax.adam(1e-1))
             net.mask(mask).bayesian(blackjax.sgld, step_size=1e-3, warmup=3, keep=10)
-            jno.core([residual.mse], dom).solve(13)
+            jno.core([residual.mse]).solve(13)
             return (
                 net.posterior_samples,
                 jax.tree_util.tree_leaves(net.module),
@@ -3560,7 +3560,7 @@ class TestPatternB:
         net.initialize(jno.bayesian.pathfinder(maxiter=10, num_samples=30))
         net.optimizer(optax.adam(1e-1))
         net.mask(mask).bayesian(blackjax.sgld, step_size=1e-3, warmup=2, keep=10)
-        jno.core([residual.mse], dom).solve(12)
+        jno.core([residual.mse]).solve(12)
 
         assert pf_count[0] == 1, f"pathfinder ran {pf_count[0]} times; expected 1"
         chain = net.posterior_samples
@@ -3579,7 +3579,7 @@ class TestPatternB:
         mask, _ = _build_last_leaf_mask(net)
         net.optimizer(optax.adam(1e-2))
         net.mask(mask).bayesian(blackjax.sgld, step_size=1e-3, warmup=2, keep=3, num_chains=1)
-        jno.core([residual.mse], dom).solve(5)
+        jno.core([residual.mse]).solve(5)
         out = capsys.readouterr().out
         assert "Pattern B + num_chains>1" not in out
 
@@ -3591,7 +3591,7 @@ class TestPatternB:
         mask, _ = _build_last_leaf_mask(net)
         net.optimizer(optax.adam(1e-2))
         net.mask(mask).bayesian(blackjax.sgld, step_size=1e-3, warmup=2, keep=3, num_chains=4)
-        jno.core([residual.mse], dom).solve(5)
+        jno.core([residual.mse]).solve(5)
         out = capsys.readouterr().out
         assert "Pattern B + num_chains>1" in out
         assert "K=4" in out
@@ -3652,7 +3652,7 @@ class TestPatternD:
         dom, net, m1, m2, residual = self._build_two_groups()
         net.mask(m1).bayesian(blackjax.sgld, step_size=1e-3, warmup=3, keep=15)
         net.mask(m2).bayesian(blackjax.sgld, step_size=1e-3, warmup=3, keep=15)
-        jno.core([residual.mse], dom).solve(18)
+        jno.core([residual.mse]).solve(18)
 
         chain = net.posterior_samples
         assert chain is not None
@@ -3681,7 +3681,7 @@ class TestPatternD:
         net.optimizer(optax.adam(1e-1))
         net.mask(m1).bayesian(blackjax.sgld, step_size=1e-3, warmup=3, keep=15)
         net.mask(m2).bayesian(blackjax.sgld, step_size=1e-3, warmup=3, keep=15)
-        jno.core([residual.mse], dom).solve(18)
+        jno.core([residual.mse]).solve(18)
 
         chain = net.posterior_samples
         chain_leaves = jax.tree_util.tree_leaves(chain)
@@ -3700,7 +3700,7 @@ class TestPatternD:
         dom, net, m1, m2, residual = self._build_two_groups()
         net.mask(m1).bayesian(blackjax.sgld, step_size=1e-3, warmup=2, keep=6, num_chains=4)
         net.mask(m2).bayesian(blackjax.sgld, step_size=1e-3, warmup=2, keep=6, num_chains=4)
-        jno.core([residual.mse], dom).solve(8)
+        jno.core([residual.mse]).solve(8)
 
         chain = net.posterior_samples
         chain_leaves = jax.tree_util.tree_leaves(chain)
@@ -3773,7 +3773,7 @@ class TestPatternE:
             num_samples=4,
             posterior_draws=N,  # must match MCMC keep
         )
-        jno.core([residual.mse], dom).solve(22)
+        jno.core([residual.mse]).solve(22)
 
         chain = net.posterior_samples
         assert chain is not None
@@ -3798,7 +3798,7 @@ class TestPatternE:
             posterior_draws=20,  # mismatch on purpose
         )
         with pytest.raises(ValueError, match="Pattern E requires"):
-            jno.core([residual.mse], dom).solve(12)
+            jno.core([residual.mse]).solve(12)
 
     # ─── 3. Composite-key contract — both kinds at distinct keys ────
 
@@ -3814,7 +3814,7 @@ class TestPatternE:
             num_samples=4,
             posterior_draws=15,
         )
-        jno.core([residual.mse], dom).solve(17)
+        jno.core([residual.mse]).solve(17)
         chain = net.posterior_samples
         leaves = jax.tree_util.tree_leaves(chain)
         # Both group leaves vary
