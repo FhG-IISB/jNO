@@ -624,3 +624,31 @@ class TestGPUPlacement:
         assert jnp.isfinite(loss), f"GPU solve produced non-finite loss: {loss}"
         # The RNG should now live on a GPU device after the step
         assert all(d.platform == "gpu" for d in s.rng.devices()), f"Expected rng on GPU after solve, got {s.rng.devices()}"
+
+
+# ---------------------------------------------------------------------------
+# eval() after solve() — device compatibility
+# ---------------------------------------------------------------------------
+
+
+class TestEvalAfterSolve:
+    """eval() must work after solve() even though solve() shards model weights
+    onto the training mesh while prepare_domain_data() pins context to CPU."""
+
+    @requires_gpu
+    def test_eval_after_solve_no_device_error(self):
+        """crux.eval(expr) after crux.solve() must not raise incompatible-devices."""
+        import optax
+
+        dom = jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+        x, *_ = dom.variable("interior")
+        net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(0)))
+        net.optimizer(optax.adam(1e-3))
+        u = net(x) * x * (1 - x)
+        crux = jno.core([jnn.laplacian(u, [x]).mse], dom)
+        crux.solve(2)
+
+        result = crux.eval(u)
+        arr = jnp.asarray(result)
+        assert arr.shape[-1] == 1
+        assert jnp.all(jnp.isfinite(arr))

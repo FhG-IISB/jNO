@@ -430,6 +430,17 @@ def wandb_log(metrics: dict[str, Any], *, step: int | None = None) -> None:
         _WANDB_RUN.log(metrics, step=step)
 
 
+def wandb_commit(step: int) -> None:
+    """Commit the buffered W&B row for *step* (no-op if W&B is not enabled).
+
+    When ``step=`` is passed to :func:`wandb_log`, W&B buffers the row and
+    only flushes it when a higher step is seen.  Call this once after all
+    per-epoch log calls to make the row visible in the UI immediately.
+    """
+    if _WANDB_RUN is not None:
+        _WANDB_RUN.log({}, step=step, commit=True)
+
+
 def wandb_alert(title: str, text: str, level: str = "WARN") -> None:
     """Send a W&B alert if a run is active (no-op otherwise).
 

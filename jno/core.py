@@ -62,7 +62,7 @@ from .utils import (
     get_seed,
     statistics,
 )
-from .utils.config import get_wandb_run, wandb_alert, wandb_log, wandb_log_model
+from .utils.config import get_wandb_run, wandb_alert, wandb_commit, wandb_log, wandb_log_model
 
 
 def _cpu_device():
@@ -3338,7 +3338,7 @@ class core:
                                         _wb[f"posterior/{_name_w}/mean_{_f_w}"] = float(jnp.nanmean(_joined_w))
                         _bay_step = _epoch_counter - 1
                         wandb_log(_wb, step=_bay_step)
-                        _wandb_run.log({}, step=_bay_step, commit=True)
+                        wandb_commit(_bay_step)
                         if (not _wandb_nan_alerted) and not np.isfinite(_total_np):
                             wandb_alert(
                                 "NaN/Inf loss detected",
@@ -3861,8 +3861,7 @@ class core:
                 # higher step is seen.  Without an explicit commit the current
                 # epoch's metrics are invisible until the next epoch starts,
                 # and the very last epoch's metrics are never uploaded at all.
-                if _wandb_run is not None:
-                    _wandb_run.log({}, step=displayed_epoch, commit=True)
+                wandb_commit(displayed_epoch)
 
             if _profile_active:
                 _profile_ctx.__exit__(None, None, None)
@@ -4516,6 +4515,15 @@ class core:
         domain_data = self.domain_data if domain is None else self.prepare_domain_data(domain)
         _models = eqx.tree_inference(self._unwrapped_models)
         ctx = domain_data.context
+
+        # After solve(), model weights carry NamedSharding from the training
+        # mesh while context arrays are CPU-pinned by prepare_domain_data.
+        # Passing mixed-device inputs to a plain filter_jit raises
+        # "incompatible devices".  Normalise both to the default device so
+        # the eval JIT sees a consistent, unsharded device set.
+        _eval_dev = jax.devices()[0]
+        _models = jax.device_put(_models, _eval_dev)
+        ctx = jax.device_put(ctx, _eval_dev)
 
         def _point_eval(op):
             op_entry = self._eval_cache.get(op)
