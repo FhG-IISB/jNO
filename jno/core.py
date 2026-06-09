@@ -213,6 +213,23 @@ def _bay_key(lid: int, group_idx: int = 0) -> str:
     return f"{lid}.{group_idx}"
 
 
+def _extract_user_name(orig_expr) -> str | None:
+    """Return the user-supplied ``.name()`` label from a constraint/tracker expression, or None."""
+    name = getattr(orig_expr, "_user_name", None)
+    if name:
+        return name
+    if isinstance(orig_expr, OperationDef):
+        inner = orig_expr.expr
+        name = getattr(inner, "_user_name", None)
+        if name:
+            return name
+        if isinstance(inner, Tracker):
+            return getattr(inner.expr, "_user_name", None)
+    elif isinstance(orig_expr, Tracker):
+        return getattr(orig_expr.expr, "_user_name", None)
+    return None
+
+
 class core:
     """core solver using traced operations."""
 
@@ -904,20 +921,22 @@ class core:
                     value_fn=lambda p, _lid=lid: loss_fn({**trainable, _lid: p}, context, step_rng)[0],
                 )
 
-                # Update LR — either per-group (masked chain) or single global
+                # Update LR — either per-group (masked chain) or single global.
+                # _build_opt_chain wraps every optimizer with inject_hyperparams,
+                # exposing the LR as state.hyperparams["learning_rate"].
                 if k in _group_lr:
                     # new_state is a tuple: (masked_g0, masked_g1, ..., masked_default)
-                    # Each MaskedState has .inner_state = (base_opt_state, inject_scale_state)
+                    # Each MaskedState has .inner_state = InjectStatefulHyperparamsState
                     for i, sched in enumerate(_group_lr[k]):
                         lr_val = sched(base_epoch + start_epoch, individual_losses)
-                        new_state[i].inner_state[-1].hyperparams["step_size"] = jnp.asarray(
+                        new_state[i].inner_state.hyperparams["learning_rate"] = jnp.asarray(
                             lr_val,
-                            dtype=new_state[i].inner_state[-1].hyperparams["step_size"].dtype,
+                            dtype=new_state[i].inner_state.hyperparams["learning_rate"].dtype,
                         )
                 else:
                     lr_val = lr_schedules[k](base_epoch + start_epoch, individual_losses)
-                    new_state[-1].hyperparams["step_size"] = jnp.asarray(
-                        lr_val, dtype=opt_states[k][-1].hyperparams["step_size"].dtype
+                    new_state.hyperparams["learning_rate"] = jnp.asarray(
+                        lr_val, dtype=opt_states[k].hyperparams["learning_rate"].dtype
                     )
 
                 trainable = {
@@ -1355,19 +1374,19 @@ class core:
                     model_params,
                 )
 
-                # Update LR — either per-group or single global
+                # Update LR via inject_hyperparams (see make_step_fn for shape).
                 if k in _group_lr:
                     for i, sched in enumerate(_group_lr[k]):
                         lr_val = sched(base_epoch + epoch, prev_losses)
-                        new_state[i].inner_state[-1].hyperparams["step_size"] = jnp.asarray(
+                        new_state[i].inner_state.hyperparams["learning_rate"] = jnp.asarray(
                             lr_val,
-                            dtype=new_state[i].inner_state[-1].hyperparams["step_size"].dtype,
+                            dtype=new_state[i].inner_state.hyperparams["learning_rate"].dtype,
                         )
                 else:
                     lr_val = lr_schedules[k](base_epoch + epoch, prev_losses)
-                    new_state[-1].hyperparams["step_size"] = jnp.asarray(
+                    new_state.hyperparams["learning_rate"] = jnp.asarray(
                         lr_val,
-                        dtype=opt_states[k][-1].hyperparams["step_size"].dtype,
+                        dtype=opt_states[k].hyperparams["learning_rate"].dtype,
                     )
 
                 trainable = {
@@ -1462,6 +1481,8 @@ class core:
         # identity-match the user's original Python objects.
         self._user_constraint_exprs = []
         self._tracker_exprs = []
+        self._constraint_names: list[str | None] = []
+        self._tracker_names: list[str | None] = []
         constraint_exprs = []
 
         for orig_expr, expr in zip(self.constraints, constraints):
@@ -1482,10 +1503,12 @@ class core:
                 self.compiled_trackers.append((tracker_interval, fn_expr))
                 self._tracker_reduce_fns.append(tracker_reduce)
                 self._tracker_exprs.append(inner)
+                self._tracker_names.append(_extract_user_name(orig_expr))
             else:
                 constraint_exprs.append(inner)
                 self._constraint_exprs.append(inner)
                 self._user_constraint_exprs.append(orig_expr)
+                self._constraint_names.append(_extract_user_name(orig_expr))
 
         # Compile all normal constraints in ONE combined function so XLA
         # can apply CSE across shared sub-expressions.
@@ -1940,27 +1963,102 @@ class core:
                 "gradient accumulation does not apply to them."
             )
 
+        def _normalize_lr_sched(lr_sched):
+            """Coerce supported LR shapes into a ``(t, losses) → scalar`` callable.
+
+            Accepts:
+            * jNO ``LearningRateSchedule`` (returned unchanged).
+            * Scalars (wrapped as a constant schedule).
+            * Optax-style ``(count,) → scalar`` schedules (e.g.
+              ``optax.schedules.cosine_decay_schedule(...)``) — wrapped so the
+              ``losses`` argument is ignored.
+
+            The train loop calls ``schedule(epoch, individual_losses)``; this
+            adapter ensures optax schedules play nicely without a separate code
+            path.
+            """
+            if lr_sched is None or isinstance(lr_sched, LearningRateSchedule):
+                return lr_sched
+            if isinstance(lr_sched, (int, float)):
+                return LearningRateSchedule(float(lr_sched))
+            if callable(lr_sched):
+                try:
+                    lr_sched(0, zeros)
+                    return lr_sched  # already a (t, losses) → scalar
+                except TypeError:
+                    pass
+                _raw = lr_sched
+                return LearningRateSchedule(lambda t, _losses, _f=_raw: _f(t))
+            return lr_sched
+
         def _build_opt_chain(opt_fn, lr_sched):
-            """Build an optax chain with inject_hyperparams LR scaling."""
+            """Wrap the user optimizer with ``optax.inject_hyperparams`` so the
+            learning rate lives in the optimizer state as
+            ``state.hyperparams["learning_rate"]``.
+
+            Two input shapes are accepted:
+
+            * **Factory** (e.g. ``optax.adam``) — the factory is wrapped
+              directly, so the schedule's value is the actual ``learning_rate``
+              argument adam sees on every step. ``optax.inject_hyperparams``
+              rebuilds the inner optimizer per step (cheap) while persisting
+              moment estimates through ``inner_state``.
+
+            * **Pre-built transform** (e.g. ``optax.adam(lr=schedule)``) — the
+              transform is used as-is and ``optax.scale(learning_rate)`` is
+              chained on top, all under ``inject_hyperparams``. jNO's
+              ``learning_rate`` then multiplies whatever the user's embedded
+              schedule produces. Useful when callers want their own optax
+              schedule but still want jNO to log/adapt a global scale.
+
+            See https://github.com/google-deepmind/optax/issues/206 for the
+            canonical reasoning behind this pattern.
+            """
             if opt_fn is None:
                 raise ValueError("Optimizer function cannot be None for trainable models.")
-
-            if callable(opt_fn) and not isinstance(opt_fn, optax.GradientTransformation):
-                try:
-                    base = opt_fn(1.0)
-                except TypeError:
-                    base = opt_fn
-            else:
-                base = opt_fn
-
-            if not isinstance(base, optax.GradientTransformation):
-                raise TypeError(f"Unsupported optimizer type: {type(base)}")
 
             if lr_sched is None:
                 lr_sched = LearningRateSchedule(1e-3)
 
-            scale = optax.inject_hyperparams(optax.scale)(step_size=lr_sched(0, zeros))
-            return optax.chain(base, scale)
+            initial_lr = float(lr_sched(0, zeros)) if callable(lr_sched) else float(lr_sched)
+
+            # Probe the factory once with a concrete LR to decide between the
+            # factory and pre-built-transform branches. A bare ``optax.adam``
+            # accepts a positional ``learning_rate``; a fully-bound
+            # ``partial(optax.adam, learning_rate=schedule)`` does not (the
+            # probe raises ``TypeError``), so we fall through to chain+scale.
+            base_transform = None
+            if callable(opt_fn) and not isinstance(opt_fn, optax.GradientTransformation):
+                try:
+                    opt_fn(1.0)
+                    is_lr_factory = True
+                except TypeError:
+                    is_lr_factory = False
+                    try:
+                        base_transform = opt_fn()
+                    except TypeError as exc:
+                        raise TypeError(
+                            f"Could not instantiate optimizer factory {opt_fn!r}: it neither "
+                            "accepts a learning_rate argument nor builds without one."
+                        ) from exc
+            else:
+                is_lr_factory = False
+                base_transform = opt_fn
+
+            if is_lr_factory:
+
+                @optax.inject_hyperparams
+                def _wrapped(learning_rate):
+                    return opt_fn(learning_rate)
+            else:
+                if not isinstance(base_transform, optax.GradientTransformation):
+                    raise TypeError(f"Unsupported optimizer type: {type(base_transform)}")
+
+                @optax.inject_hyperparams
+                def _wrapped(learning_rate):
+                    return optax.chain(base_transform, optax.scale(learning_rate))
+
+            return _wrapped(learning_rate=initial_lr)
 
         for lid, fm in flax_mods.items():
             # Skip only if truly frozen with no LoRA override.
@@ -2088,7 +2186,7 @@ class core:
                 # Build one masked transform per group, plus a "default" for
                 # any trainable params not covered by an explicit group.
                 global_opt_fn = fm._opt_fn
-                global_lr = fm._lr if fm._lr is not None else LearningRateSchedule(1e-3)
+                global_lr = _normalize_lr_sched(fm._lr if fm._lr is not None else LearningRateSchedule(1e-3))
 
                 if global_opt_fn is None:
                     raise ValueError(
@@ -2153,7 +2251,7 @@ class core:
 
                 for g, gmask_norm in zip(_optax_groups, group_masks_norm):
                     g_opt = g["opt_fn"] or global_opt_fn
-                    g_lr = g["lr"] if g["lr"] is not None else global_lr
+                    g_lr = _normalize_lr_sched(g["lr"]) if g["lr"] is not None else global_lr
                     chain = _build_opt_chain(g_opt, g_lr)
                     masked_transforms.append(optax.masked(chain, gmask_norm))
                     group_scheds.append(g_lr)
@@ -2236,7 +2334,7 @@ class core:
             else:
                 # ── Single global optimizer (original behaviour) ──
                 opt_fn = fm._opt_fn
-                lr_sched = fm._lr if fm._lr is not None else LearningRateSchedule(1e-3)
+                lr_sched = _normalize_lr_sched(fm._lr if fm._lr is not None else LearningRateSchedule(1e-3))
 
                 if opt_fn is None:
                     raise ValueError(
@@ -2245,19 +2343,7 @@ class core:
                         f"or freeze the model with model.freeze()."
                     )
 
-                if callable(opt_fn) and not isinstance(opt_fn, optax.GradientTransformation):
-                    try:
-                        base_opt = opt_fn(1.0)
-                    except TypeError:
-                        base_opt = opt_fn
-                else:
-                    base_opt = opt_fn
-
-                if not isinstance(base_opt, optax.GradientTransformation):
-                    raise TypeError(f"Unsupported optimizer type for model {lid}: {type(base_opt)}")
-
-                scale = optax.inject_hyperparams(optax.scale)(step_size=lr_sched(0, zeros))
-                per_model_opts[k] = optax.chain(base_opt, scale)
+                per_model_opts[k] = _build_opt_chain(opt_fn, lr_sched)
                 lr_schedules[k] = lr_sched
 
         # Validate that all Bayesian models in this solve share the same
@@ -2964,6 +3050,7 @@ class core:
                         rng=self.rng,
                         min_consecutive=min_consecutive,
                         constraint_exprs=self._user_constraint_exprs,
+                        constraint_names=self._constraint_names,
                         all_ops=self.all_ops,
                         domain=self.domain,
                     )
@@ -3203,7 +3290,13 @@ class core:
                     log_timestamps.append(time.time())
 
                     # Progress message.
-                    _msg = " | ".join([f"C{ci}: {float(v):.4e}" for ci, v in enumerate(_ind_np)])
+                    _cn_bay = getattr(self, "_constraint_names", [])
+                    _msg = " | ".join(
+                        [
+                            f"{(_cn_bay[ci] if ci < len(_cn_bay) and _cn_bay[ci] else f'C{ci}')}: {float(v):.4e}"
+                            for ci, v in enumerate(_ind_np)
+                        ]
+                    )
                     self.log.info(f"Epoch {_epoch_counter - 1:>6}/{epochs}| L:{_total_np:.4e} | {_msg}")
 
                     # Wandb (per chunk) — mirror the slow-path block:
@@ -3212,7 +3305,8 @@ class core:
                     if _wandb_run is not None:
                         _wb = {"total_loss": _total_np, "epoch": _epoch_counter - 1}
                         for _ci, _cv in enumerate(_ind_np):
-                            _wb[f"constraint_{_ci}"] = float(_cv)
+                            _ckey_bay = _cn_bay[_ci] if _ci < len(_cn_bay) and _cn_bay[_ci] else f"constraint_{_ci}"
+                            _wb[_ckey_bay] = float(_cv)
                         for _bk_w, _h_w in bayesian_handles.items():
                             _fm_w = flax_mods.get(_lid_of(_bk_w))
                             if _fm_w is None:
@@ -3242,11 +3336,13 @@ class core:
                                         _wb[f"posterior/{_name_w}/n_{_f_w}"] = int(jnp.sum(_joined_w.astype(jnp.int32)))
                                     else:
                                         _wb[f"posterior/{_name_w}/mean_{_f_w}"] = float(jnp.nanmean(_joined_w))
-                        wandb_log(_wb, step=_epoch_counter - 1)
+                        _bay_step = _epoch_counter - 1
+                        wandb_log(_wb, step=_bay_step)
+                        _wandb_run.log({}, step=_bay_step, commit=True)
                         if (not _wandb_nan_alerted) and not np.isfinite(_total_np):
                             wandb_alert(
                                 "NaN/Inf loss detected",
-                                f"total_loss became {_total_np} at epoch {_epoch_counter - 1}",
+                                f"total_loss became {_total_np} at epoch {_bay_step}",
                                 level="ERROR",
                             )
                             _wandb_nan_alerted = True
@@ -3264,6 +3360,7 @@ class core:
                     _profile_active = True
 
                 epoch = outer_epoch * inner_steps  # first epoch of this outer step
+                _step_t0 = time.perf_counter()
 
                 # --- adaptive host-side resampling at outer-step boundaries ---
                 if has_resampling and strategies:
@@ -3606,20 +3703,31 @@ class core:
                 displayed_epoch = epoch + inner_steps - 1
                 if _wandb_run is not None:
                     _wb_losses, _wb_total = jax.device_get((individual_losses, total_loss))
+                    # device_get above synchronises the accelerator, so the
+                    # elapsed time since _step_t0 is the true wall-clock step
+                    # time (dispatch + GPU execution).  Divide by inner_steps
+                    # to get a per-epoch figure when gradient accumulation or
+                    # multi-step modes fold several epochs into one outer step.
+                    _step_ms = (time.perf_counter() - _step_t0) * 1e3 / inner_steps
                     _wb_metrics: dict = {
                         "total_loss": float(_wb_total),
                         "epoch": displayed_epoch,
+                        "step_time_ms": _step_ms,
                     }
+                    _cnames = getattr(self, "_constraint_names", [])
                     for _ci, _cl in enumerate(np.asarray(_wb_losses)):
-                        _wb_metrics[f"constraint_{_ci}"] = float(_cl)
-                    # Learning rates (one per model)
+                        _ckey = _cnames[_ci] if _ci < len(_cnames) and _cnames[_ci] else f"constraint_{_ci}"
+                        _wb_metrics[_ckey] = float(_cl)
+                    # Learning rates (one per model). _build_opt_chain wraps
+                    # every optimizer with inject_hyperparams; for masked
+                    # groups the inject state sits inside each MaskedState.
                     for _wk in sorted(opt_states.keys()):
                         _wst = opt_states[_wk]
                         try:
-                            _lr = float(jax.device_get(_wst[-1].hyperparams["step_size"]))
-                        except (IndexError, KeyError, AttributeError):
+                            _lr = float(jax.device_get(_wst.hyperparams["learning_rate"]))
+                        except (IndexError, KeyError, AttributeError, TypeError):
                             try:
-                                _lr = float(jax.device_get(_wst[0].inner_state[-1].hyperparams["step_size"]))
+                                _lr = float(jax.device_get(_wst[0].inner_state.hyperparams["learning_rate"]))
                             except (IndexError, KeyError, AttributeError, TypeError):
                                 _lr = None
                         if _lr is not None:
@@ -3703,17 +3811,24 @@ class core:
                         # Log trackers to wandb
                         if _wandb_run is not None:
                             _wb_track = {}
+                            _tnames = getattr(self, "_tracker_names", [])
                             for _ti, _tv in enumerate(track_stats_np):
-                                _wb_track[f"tracker_{_ti}"] = float(np.mean(_tv))
+                                _tkey = _tnames[_ti] if _ti < len(_tnames) and _tnames[_ti] else f"tracker_{_ti}"
+                                _wb_track[_tkey] = float(np.mean(_tv))
                             wandb_log(_wb_track, step=displayed_epoch)
 
                     # Progress line
-                    loss_strs = " | ".join(f"C{i}: {v:>10.4e}" for i, v in enumerate(losses_np))
+                    _cn_log = getattr(self, "_constraint_names", [])
+                    _tn_log = getattr(self, "_tracker_names", [])
+                    loss_strs = " | ".join(
+                        f"{(_cn_log[i] if i < len(_cn_log) and _cn_log[i] else f'C{i}')}: {v:>10.4e}"
+                        for i, v in enumerate(losses_np)
+                    )
                     if track_stats_np is not None:
                         track_strs = " | ".join(
-                            f"T{i}: {float(v):>10.4e}"
+                            f"{(_tn_log[i] if i < len(_tn_log) and _tn_log[i] else f'T{i}')}: {float(v):>10.4e}"
                             if v.ndim == 0
-                            else f"T{i}: shape={v.shape} mean={float(np.mean(v)):.4e}"
+                            else f"{(_tn_log[i] if i < len(_tn_log) and _tn_log[i] else f'T{i}')}: shape={v.shape} mean={float(np.mean(v)):.4e}"
                             for i, v in enumerate(track_stats_np)
                         )
                         self.log.info(
@@ -3740,6 +3855,14 @@ class core:
                             _stop_requested = True
                     if _stop_requested:
                         break
+
+                # Commit the W&B row for this step.  When step= is passed to
+                # wandb.log(), W&B buffers the row and only flushes it when a
+                # higher step is seen.  Without an explicit commit the current
+                # epoch's metrics are invisible until the next epoch starts,
+                # and the very last epoch's metrics are never uploaded at all.
+                if _wandb_run is not None:
+                    _wandb_run.log({}, step=displayed_epoch, commit=True)
 
             if _profile_active:
                 _profile_ctx.__exit__(None, None, None)

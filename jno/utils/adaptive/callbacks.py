@@ -269,7 +269,10 @@ class CheckpointCallback(Callback):
         except ImportError:
             return
 
+        self._manager.wait_until_finished()
         ckpt_path = os.path.join(self._directory, str(epoch))
+        if not os.path.isdir(ckpt_path):
+            return
         artifact = wandb.Artifact(
             f"checkpoint-{epoch}",
             type="checkpoint",
@@ -529,6 +532,7 @@ class _PerLossGradCallback(Callback, _LiveValue):
     def on_solve_begin(self, **kwargs) -> None:
         from jno.utils.explainability import make_per_loss_grad_fn
 
+        self._constraint_names: list = kwargs.get("constraint_names", [])
         self._grad_fn = jax.jit(
             make_per_loss_grad_fn(
                 kwargs["compiled_constraints_fn"],
@@ -587,8 +591,12 @@ class GradientNormsCallback(_PerLossGradCallback):
             self._norms.append(norms_np)
             self._publish(epoch, {"norms": norms_np})
             if get_wandb_run() is not None:
+                cn = getattr(self, "_constraint_names", [])
                 wandb_log(
-                    {f"explainability/gradient_norm/constraint_{i}": float(v) for i, v in enumerate(norms)},
+                    {
+                        f"explainability/gradient_norm/{cn[i] if i < len(cn) and cn[i] else f'constraint_{i}'}": float(v)
+                        for i, v in enumerate(norms)
+                    },
                     step=epoch,
                 )
         return False
@@ -644,8 +652,15 @@ class CosSimilarityCallback(_PerLossGradCallback):
             self._publish(epoch, {"cos_sim_matrix": cos_np})
             if get_wandb_run() is not None:
                 N = cos_np.shape[0]
+                cn = getattr(self, "_constraint_names", [])
+
+                def _clabel(k):
+                    return cn[k] if k < len(cn) and cn[k] else str(k)
+
                 wb: dict = {
-                    f"explainability/cos_sim/{i}_{j}": float(cos_np[i, j]) for i in range(N) for j in range(i + 1, N)
+                    f"explainability/cos_sim/{_clabel(i)}_{_clabel(j)}": float(cos_np[i, j])
+                    for i in range(N)
+                    for j in range(i + 1, N)
                 }
                 try:
                     import matplotlib.pyplot as plt
@@ -896,6 +911,7 @@ class ResidualStatsCallback(Callback, _LiveValue):
         from jno.utils.explainability import make_residual_stats_fn
 
         self._n_constraints = kwargs["n_constraints"]
+        self._constraint_names: list = kwargs.get("constraint_names", [])
         # Resolve the optional constraint subset to solver-side indices.
         # `constraint_exprs` is added by the solver hook; defensively fall back
         # to the full range if absent (older solvers without the hook).
@@ -957,18 +973,21 @@ class ResidualStatsCallback(Callback, _LiveValue):
 
         if get_wandb_run() is not None:
             wb: dict = {}
-            # Use the *solver-side* index for the W&B key so the dashboard
-            # remains stable when users add/remove unrelated constraints.
+            cn = getattr(self, "_constraint_names", [])
+            # Use the user name when available; fall back to solver-side index
+            # so the dashboard remains stable when unrelated constraints are added.
             for slot, i in enumerate(idx):
-                wb[f"explainability/residual/constraint_{i}/mean"] = float(means_sel[slot])
-                wb[f"explainability/residual/constraint_{i}/std"] = float(stds_sel[slot])
-                wb[f"explainability/residual/constraint_{i}/max"] = float(maxes_sel[slot])
-                wb[f"explainability/residual/constraint_{i}/p99"] = float(p99_sel[slot])
+                label = cn[i] if i < len(cn) and cn[i] else f"constraint_{i}"
+                wb[f"explainability/residual/{label}/mean"] = float(means_sel[slot])
+                wb[f"explainability/residual/{label}/std"] = float(stds_sel[slot])
+                wb[f"explainability/residual/{label}/max"] = float(maxes_sel[slot])
+                wb[f"explainability/residual/{label}/p99"] = float(p99_sel[slot])
             try:
                 import wandb as _wandb
 
                 for slot, i in enumerate(idx):
-                    wb[f"explainability/residual/constraint_{i}/histogram"] = _wandb.Histogram(raw_sel[slot])
+                    label = cn[i] if i < len(cn) and cn[i] else f"constraint_{i}"
+                    wb[f"explainability/residual/{label}/histogram"] = _wandb.Histogram(raw_sel[slot])
             except ImportError:
                 pass
             wandb_log(wb, step=epoch)

@@ -114,13 +114,24 @@ class TestWandbLog:
         cfg_module.wandb_log({"loss": 1.0}, step=0)  # should not raise
 
     def test_delegates_to_run(self):
-        """wandb_log forwards to the active run's .log()."""
+        """wandb_log forwards to the active run's .log(), injecting epoch key."""
         mock_run = MagicMock()
         cfg_module._WANDB_RUN = mock_run
 
         cfg_module.wandb_log({"loss": 0.5}, step=42)
 
-        mock_run.log.assert_called_once_with({"loss": 0.5}, step=42)
+        # wandb_log stamps "epoch" into every dict when step is provided
+        # so users can use either _step or epoch as the chart X axis.
+        mock_run.log.assert_called_once_with({"loss": 0.5, "epoch": 42}, step=42)
+
+    def test_does_not_duplicate_epoch_key(self):
+        """wandb_log does not overwrite an explicit epoch key."""
+        mock_run = MagicMock()
+        cfg_module._WANDB_RUN = mock_run
+
+        cfg_module.wandb_log({"loss": 0.5, "epoch": 10}, step=42)
+
+        mock_run.log.assert_called_once_with({"loss": 0.5, "epoch": 10}, step=42)
 
 
 class TestWandbLogModel:

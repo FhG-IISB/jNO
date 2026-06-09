@@ -400,3 +400,60 @@ class TestTrackerNonScalar:
         assert raw.ndim == 2
         assert raw.shape[1] == 1  # one tracker column
         assert np.all(np.isfinite(raw))
+
+
+# ---------------------------------------------------------------------------
+# Placeholder .name() label propagation
+# ---------------------------------------------------------------------------
+
+
+class TestPlaceholderName:
+    """Verify that .name('label') tags propagate to _constraint_names / _tracker_names."""
+
+    def _build(self, key_seed=0):
+        dom = _stationary_1d_domain(mesh_size=0.05)
+        x, *_ = dom.variable("interior")
+        net = _tiny_net(key_seed=key_seed)
+        net.optimizer(optax.adam(1e-3))
+        u = net(x) * x * (1 - x)
+        return dom, x, u
+
+    def test_constraint_name_stored(self):
+        dom, x, u = self._build()
+        pde = jno.jnp_ops.laplacian(u, [x]).mse.name("my_pde")
+        crux = jno.core([pde], dom)
+        assert crux._constraint_names == ["my_pde"]
+
+    def test_unnamed_constraint_is_none(self):
+        dom, x, u = self._build()
+        pde = jno.jnp_ops.laplacian(u, [x]).mse
+        crux = jno.core([pde], dom)
+        assert crux._constraint_names == [None]
+
+    def test_mixed_named_unnamed(self):
+        dom, x, u = self._build()
+        pde = jno.jnp_ops.laplacian(u, [x]).mse.name("pde")
+        bc = u.mse
+        crux = jno.core([pde, bc], dom)
+        assert crux._constraint_names == ["pde", None]
+
+    def test_tracker_name_stored(self):
+        dom, x, u = self._build()
+        pde = jno.jnp_ops.laplacian(u, [x]).mse
+        trk = u.tracker(1).name("u_monitor")
+        crux = jno.core([pde, trk], dom)
+        assert crux._tracker_names == ["u_monitor"]
+
+    def test_name_returns_self(self):
+        dom, x, u = self._build()
+        expr = jno.jnp_ops.laplacian(u, [x]).mse
+        returned = expr.name("foo")
+        assert returned is expr
+
+    def test_name_used_in_log_output(self, capsys):
+        dom, x, u = self._build(key_seed=3)
+        pde = jno.jnp_ops.laplacian(u, [x]).mse.name("pde_loss")
+        crux = jno.core([pde], dom)
+        crux.solve(2)
+        captured = capsys.readouterr()
+        assert "pde_loss" in captured.out
