@@ -269,3 +269,65 @@ def test_visibility_filter_requires_positive_cosines_at_both_endpoints():
     filtered_perpendicular = dom._filter_visibility_by_normals(points, perpendicular_normals, visible)
     assert filtered_perpendicular[0, 1] == pytest.approx(0.0)
     assert filtered_perpendicular[1, 0] == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# Numbered boundary sub-tag existence and geometry
+# ---------------------------------------------------------------------------
+
+
+def test_from_regions_produces_per_edge_subtags():
+    """from_regions must decompose each polygon into per-edge sub-tags, not one combined tag."""
+    from shapely.geometry import Polygon
+
+    dom = jno.domain.csg.from_regions({"WallO": Polygon(SQUARE_A)})
+    tags = dom.boundary_tags()
+
+    for i in range(4):
+        assert f"boundary_WallO_{i}" in tags, f"boundary_WallO_{i} missing — from_regions returned only: " + str(
+            [t for t in tags if "WallO" in t]
+        )
+
+
+def test_all_numbered_boundary_subtags_present_for_square():
+    """A 4-sided polygon must expose boundary_{name}_0 … _3 and the combined tag."""
+    dom = jno.domain.csg(SQUARE_A, name="wall")
+    tags = dom.boundary_tags()
+
+    for i in range(4):
+        assert f"boundary_wall_{i}" in tags, f"boundary_wall_{i} missing from {tags}"
+    assert "boundary_wall" in tags
+
+
+def test_numbered_boundary_subtags_are_geometrically_distinct():
+    """Each boundary_{name}_{i} sub-tag must sample from a different edge of the square.
+
+    For an axis-aligned unit square every edge has one coordinate that is constant
+    (either x=0, x=1, y=0, or y=1).  The four sub-tags must cover four distinct
+    constant-coordinate values, confirming they are separate faces.
+    """
+    np.random.seed(42)
+    dom = jno.domain.csg(SQUARE_A, name="wall")
+
+    constant_coords = set()
+    for i in range(4):
+        tag = f"boundary_wall_{i}"
+        xb, yb, _ = dom.variable(tag, sample=(64, None))
+        pts = dom.context[tag][0, 0]  # (64, 2)
+
+        x_spread = pts[:, 0].max() - pts[:, 0].min()
+        y_spread = pts[:, 1].max() - pts[:, 1].min()
+
+        # One coordinate must be (near-)constant — it's an axis-aligned edge
+        assert min(x_spread, y_spread) < 1e-10, (
+            f"{tag}: neither x_spread={x_spread:.2e} nor y_spread={y_spread:.2e} is constant — not an axis-aligned edge"
+        )
+
+        # Record which (axis, value) this edge sits on
+        if x_spread < 1e-10:
+            constant_coords.add(("x", round(float(pts[0, 0]), 6)))
+        else:
+            constant_coords.add(("y", round(float(pts[0, 1]), 6)))
+
+    # Four distinct faces ↔ four distinct (axis, value) pairs
+    assert len(constant_coords) == 4, f"Expected 4 distinct edges, got {len(constant_coords)}: {constant_coords}"
