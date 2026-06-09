@@ -15,11 +15,11 @@ import equinox as eqx
 import jax
 import jax.numpy as jnp
 
-from .architectures.lora import LoRAWrapper, _normalize_wrappers
-from .tuner import Arch, ArchSpace
-from .utils.adaptive import LearningRateSchedule
-from .utils.iree import IREEModel
-from .utils.logger import get_logger
+from ..architectures.lora import LoRAWrapper, _normalize_wrappers
+from ..tuner import Arch, ArchSpace
+from ..utils.adaptive import LearningRateSchedule
+from ..utils.iree import IREEModel
+from ..utils.logger import get_logger
 
 __all__ = [
     "Placeholder",
@@ -56,6 +56,13 @@ __all__ = [
     "FemLinearSystem",
     "FemResidualOperator",
     "StateField",
+    # Typed semantic views (re-exported at the bottom of this module)
+    "ScalarView",
+    "VectorView",
+    "ComplexView",
+    "MatrixView",
+    "NamedMatrixView",
+    "VoigtView",
 ]
 
 # Global counter for unique operation IDs
@@ -169,9 +176,17 @@ class Placeholder:
         return FunctionCall(jnp.less_equal, [self, other])
 
     def _wrap(self, other) -> Placeholder:
-        """Wrap non-Placeholder types."""
+        """Wrap non-Placeholder types.
+
+        Typed semantic views (``ScalarView``, ``MatrixView``, …) expose their
+        underlying Placeholder via ``._expr`` — unwrap those so mixed-direction
+        arithmetic like ``placeholder + u.scalar`` works without surprise.
+        """
         if isinstance(other, Placeholder):
             return other
+        inner = getattr(other, "_expr", None)
+        if isinstance(inner, Placeholder):
+            return inner
         return Literal(other)
 
     def name(self, label: str) -> "Placeholder":
@@ -263,7 +278,7 @@ class Placeholder:
         If domain is omitted, try to infer it from Variables/TestFunction/etc.
         target=None lets weak_form.py infer the steady solver route in Phase 1.
         """
-        from .utils.solver.weak_form import assemble_weak_form
+        from ..utils.solver.weak_form import assemble_weak_form
 
         return assemble_weak_form(domain, self, target=target, **kwargs)
 
@@ -390,6 +405,66 @@ class Placeholder:
     @property
     def T(self) -> FunctionCall:
         return FunctionCall(lambda x: x.T, [self], "transpose", True)
+
+    # ------------------------------------------------------------------
+    # Native complex-dtype helpers (work on jnp.complex64/complex128)
+    # ------------------------------------------------------------------
+
+    @property
+    def real(self) -> FunctionCall:
+        """Real part via ``jnp.real`` (works on native complex arrays)."""
+        return FunctionCall(jnp.real, [self], "real")
+
+    @property
+    def imag(self) -> FunctionCall:
+        """Imaginary part via ``jnp.imag``."""
+        return FunctionCall(jnp.imag, [self], "imag")
+
+    # ------------------------------------------------------------------
+    # Typed semantic views — see jno.trace.views for the full API
+    # ------------------------------------------------------------------
+
+    @property
+    def scalar(self):
+        """Scalar view — typed scalar ops and cross-type ``*`` dispatch."""
+        from .views import ScalarView
+
+        return ScalarView(self)
+
+    @property
+    def vector(self):
+        """Vector field view — ``.div(*v)``, ``.curl(*v)``, ``.norm()``, ``.dot(other)``,
+        ``.cross(other)``, ``.normalize()``, ``.outer(other)``, ``v @ A``."""
+        from .views import VectorView
+
+        return VectorView(self)
+
+    @property
+    def complex(self):
+        """Complex field view (last dim = 2, ``[re, im]``) — ``.real``, ``.imag``,
+        ``.abs``, ``.angle``, ``.conj``, ``.mul(other)``, ``.to_native()``."""
+        from .views import ComplexView
+
+        return ComplexView(self)
+
+    @property
+    def matrix(self):
+        """Full matrix view (``[..., n, m]``) — ``.trace()``, ``.det()``, ``.inv()``,
+        ``.eigvals()``, ``.sym()``, ``.skew()``, ``.log()``, ``.exp()``, ``.pow(n)``,
+        plus packed constructors ``.from_upper_tri()`` / ``.from_lower_tri()`` /
+        ``.from_flat(n, m)`` / ``.from_diag()`` and ``.coords([names])``."""
+        from .views import MatrixView
+
+        return MatrixView(self)
+
+    @property
+    def voigt(self):
+        """Voigt symmetric-tensor view (last dim = 3 for 2-D, 6 for 3-D) —
+        ``.von_mises()``, ``.trace()``, ``.hydrostatic()``, ``.deviatoric()``,
+        ``.principal()``, ``.invariants()``, ``.max_shear()``, ``.to_full()``."""
+        from .views import VoigtView
+
+        return VoigtView(self)
 
     # ------------------------------------------------------------------
     # Differential operators — method-style API
@@ -3213,3 +3288,15 @@ def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
 
     _visit(expr, indent)
     return "\n".join(lines)
+
+
+# Re-export typed semantic views. Imported at module bottom so that all
+# classes referenced inside views.py (FunctionCall, Placeholder) already exist.
+from .views import (  # noqa: E402
+    ComplexView,
+    MatrixView,
+    NamedMatrixView,
+    ScalarView,
+    VectorView,
+    VoigtView,
+)

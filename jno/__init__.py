@@ -35,6 +35,14 @@ from .trace import (
     TrialFunction,
     Variable,
 )
+from .trace.views import (
+    ComplexView,
+    MatrixView,
+    NamedMatrixView,
+    ScalarView,
+    VectorView,
+    VoigtView,
+)
 from .trace_compiler import TraceCompiler
 from .trace_evaluator import TraceEvaluator
 from .utils import IREEModel as iree
@@ -132,4 +140,10 @@ __all__ = [
     "noise",
     "callback",
     "StateField",
+    "ScalarView",
+    "VectorView",
+    "ComplexView",
+    "MatrixView",
+    "NamedMatrixView",
+    "VoigtView",
 ]
