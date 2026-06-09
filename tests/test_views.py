@@ -19,6 +19,7 @@ import pytest
 import jno
 from jno.trace import (
     ComplexView,
+    Jacobian,
     MatrixView,
     NamedComplexViewWithPartials,
     NamedMatrixView,
@@ -630,11 +631,11 @@ class TestFallthrough:
         assert isinstance(a, Placeholder)
         assert isinstance(b, Placeholder)
 
-    def test_d_method_fallthrough(self):
+    def test_d_method_preserves_view_type(self):
         u, x, y, _ = _vec_field_2d(None)
-        # u.vector.d(x) forwards to u.d(x) — Jacobian of the full vector
+        # ``u.vector.d(x)`` is now first-class on VectorView and returns a VectorView.
         j = u.vector.d(x)
-        assert isinstance(j, Placeholder)
+        assert isinstance(j, VectorView)
 
 
 # ---------------------------------------------------------------------------
@@ -941,25 +942,11 @@ class TestCoordsKwargsForm:
         with pytest.raises(AttributeError):
             _ = u.z  # not a registered coord, and _expr has no .z
 
-    def test_grad_no_args_uses_registered(self):
+    def test_explicit_partials_match_laplacian(self):
+        """``u.xx + u.yy`` reads like the math and equals ``Δu``."""
         d, x, y = _domain_xy()
-        u = x * y
-        u_named = u.scalar.coords(x=x, y=y)
-        g = u_named.grad()  # no args
-        assert isinstance(g, NamedVectorViewWithPartials)
-        # The result still carries the coord registration
-        assert set(g._coord_vars.keys()) == {"x", "y"}
-        # And the partials match
-        ctx = {"xy": jnp.array([[0.5, 0.7]])}
-        # g is a VectorView with [∂u/∂x, ∂u/∂y] = [y, x] = [0.7, 0.5]
-        out = jnp.asarray(_eval(g.expr, ctx))
-        np.testing.assert_allclose(out.reshape(2), [0.7, 0.5], atol=1e-6)
-
-    def test_laplacian_no_args_uses_registered(self):
-        d, x, y = _domain_xy()
-        u = x * x + y * y  # Δu = 4
-        u_named = u.scalar.coords(x=x, y=y)
-        lap = u_named.laplacian()
+        u_named = (x * x + y * y).scalar.bind(x=x, y=y)
+        lap = u_named.xx + u_named.yy  # = 4 everywhere
         ctx = {"xy": jnp.array([[0.5, 0.7]])}
         np.testing.assert_allclose(_eval(lap.expr, ctx), [[4.0]], atol=1e-6)
 
@@ -1004,6 +991,126 @@ class TestCoordsKwargsForm:
         # ScalarView, not NamedScalarViewWithPartials
         assert isinstance(result, ScalarView)
         assert type(result) is ScalarView
+
+    def test_arithmetic_merges_disjoint_bindings(self):
+        """``a.bind(x=x) + b.bind(y=y)`` → result carries both bindings."""
+        d, x, y = _domain_xy()
+        u = (x * y).scalar.bind(x=x)
+        v = (x * y).scalar.bind(y=y)
+        combined = u + v
+        assert sorted(object.__getattribute__(combined, "_coord_vars").keys()) == ["x", "y"]
+        # Both partials are reachable on the result
+        assert type(combined.x).__name__ == "ScalarView"
+        assert type(combined.y).__name__ == "ScalarView"
+
+    def test_arithmetic_with_matching_bindings_succeeds(self):
+        d, x, y = _domain_xy()
+        u = (x * y).scalar.bind(x=x, y=y)
+        v = (x * y).scalar.bind(x=x, y=y)  # same Variables
+        combined = u + v
+        # Still a Named*WithPartials, named partials still work
+        assert type(combined).__name__ == "NamedScalarViewWithPartials"
+        ctx = {"xy": jnp.array([[0.5, 0.7]])}
+        # ∂(2xy)/∂x = 2y → 1.4
+        np.testing.assert_allclose(_eval(combined.x.expr, ctx), [[1.4]], atol=1e-6)
+
+    def test_conflicting_bindings_raise(self):
+        """Same name → different Variable must error rather than silently picking one."""
+        d, x, y = _domain_xy()
+        x_alt = Variable("xy", [0, 1], domain=d)  # different Python object, same role
+        u = (x * y).scalar.bind(x=x, y=y)
+        v = (x * y).scalar.bind(x=x_alt, y=y)
+        with pytest.raises(ValueError, match="coord binding conflict for 'x'"):
+            _ = u + v
+        with pytest.raises(ValueError, match="coord binding conflict for 'x'"):
+            _ = u - v
+        with pytest.raises(ValueError, match="coord binding conflict for 'x'"):
+            _ = u * v
+
+
+class TestStopGradientMethod:
+    """``.stop_gradient`` should work as a property on Placeholder and every view,
+    return the same view type, and preserve named-partial bindings."""
+
+    def test_placeholder_property_form(self):
+        d, x, y = _domain_xy()
+        p = (x * y).stop_gradient
+        # FunctionCall is a Placeholder subclass
+        assert hasattr(p, "_user_name") or hasattr(p, "name")
+
+    def test_scalar_view_preserves_type(self):
+        d, x, y = _domain_xy()
+        sv = (x * y).scalar.stop_gradient
+        assert type(sv).__name__ == "ScalarView"
+
+    def test_named_view_preserves_bindings(self):
+        """``u.bind(x=x).stop_gradient.x`` still works → AD on stop-grad'd output."""
+        d, x, y = _domain_xy()
+        u = (x * y).scalar.bind(x=x, y=y)
+        sg = u.stop_gradient
+        assert type(sg).__name__ == "NamedScalarViewWithPartials"
+        # Named partials still reachable through the stop-grad'd view
+        assert type(sg.x).__name__ == "ScalarView"
+
+    def test_hyco_style_arithmetic(self):
+        """``(u_phy - u_syn.stop_gradient).mse`` flows through cleanly."""
+        d, x, y = _domain_xy()
+        u_phy = (x * y).scalar.bind(x=x, y=y)
+        u_syn = (x * y).scalar.bind(x=x, y=y)
+        L = (u_phy - u_syn.stop_gradient).mse
+        # Result is a Placeholder (FunctionCall from .mse)
+        assert L is not None
+
+
+class TestSchemeNamespace:
+    """``u.fd.x`` / ``u.fd.xx`` mirror the AD attribute syntax but thread
+    ``scheme="finite_difference"`` through every partial-derivative call."""
+
+    def test_fd_first_order_matches_explicit_kwarg(self):
+        d, x, y = _domain_xy()
+        u = (x * y).scalar.bind(x=x, y=y)
+        proxy_result = u.fd.x
+        explicit = u.d(x, scheme="finite_difference")
+        # Both should produce a Jacobian with the FD scheme.
+        assert isinstance(proxy_result, ScalarView)
+        assert isinstance(proxy_result._expr, Jacobian)
+        assert proxy_result._expr.scheme == "finite_difference"
+        assert proxy_result._expr.scheme == explicit._expr.scheme
+        # Same variable bound on both paths.
+        assert proxy_result._expr.variables == explicit._expr.variables
+
+    def test_fd_second_order_chains_two_jacobians(self):
+        """``u.fd.xx`` chains ``.d(x).d(x)`` with FD on each step — same construction
+        as the AD attribute path (``u.xx``), just with the scheme threaded through."""
+        d, x, y = _domain_xy()
+        u = (x * y).scalar.bind(x=x, y=y)
+        result = u.fd.xx
+        assert isinstance(result, ScalarView)
+        # Outer Jacobian — second derivative.
+        assert isinstance(result._expr, Jacobian)
+        assert result._expr.scheme == "finite_difference"
+        # Inner Jacobian — first derivative, also FD.
+        inner = result._expr.target
+        assert isinstance(inner, Jacobian)
+        assert inner.scheme == "finite_difference"
+
+    def test_fd_mixed_partial(self):
+        """``u.fd.xy`` registers as two distinct variables, both FD."""
+        d, x, y = _domain_xy()
+        u = (x * y).scalar.bind(x=x, y=y)
+        result = u.fd.xy
+        assert isinstance(result, ScalarView)
+        assert isinstance(result._expr, Jacobian)
+        assert result._expr.scheme == "finite_difference"
+        # Variables consumed left-to-right: outer call differentiates against the
+        # last-seen name 'y'.
+        assert result._expr.variables == [y]
+
+    def test_fd_unknown_name_raises(self):
+        d, x, y = _domain_xy()
+        u = (x * y).scalar.bind(x=x, y=y)
+        with pytest.raises(AttributeError, match="not a registered partial-name sequence"):
+            _ = u.fd.z
 
 
 class TestCruxEvalAcceptsViews:

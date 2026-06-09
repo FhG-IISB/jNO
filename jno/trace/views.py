@@ -58,6 +58,38 @@ def _parse_partial_sequence(key: str, coord_vars: dict) -> list | None:
     return None
 
 
+class _SchemeProxy:
+    """Re-uses the partial-derivative parsing of a ``Named<View>WithPartials``,
+    but threads a fixed differentiation ``scheme`` through every ``.d(...)`` call.
+
+    Surfaced via ``view.fd`` (finite-difference namespace): ``u.fd.x`` mirrors
+    ``u.x`` but evaluates the partial via the FD scheme instead of AD.
+    """
+
+    __slots__ = ("_view", "_scheme")
+
+    def __init__(self, view, scheme: str):
+        object.__setattr__(self, "_view", view)
+        object.__setattr__(self, "_scheme", scheme)
+
+    def __getattr__(self, key: str):
+        if key.startswith("_"):
+            raise AttributeError(key)
+        view = object.__getattribute__(self, "_view")
+        scheme = object.__getattribute__(self, "_scheme")
+        cv = object.__getattribute__(view, "_coord_vars")
+        seq = _parse_partial_sequence(key, cv)
+        if seq is None:
+            raise AttributeError(
+                f"{key!r} is not a registered partial-name sequence "
+                f"(known names: {sorted(cv)}; use .bind(...) to register more)."
+            )
+        result = view._expr
+        for name in seq:
+            result = result.d(cv[name], scheme=scheme)
+        return type(view)._base_view(result)
+
+
 def _coords_dispatch(view_self, args: tuple, named_vars: dict, *, positional_factory=None):
     """Shared dispatch logic for ``ScalarView.coords``, ``VectorView.coords``, etc.
 
@@ -117,19 +149,53 @@ class ScalarView:
             raise AttributeError(name)
         return getattr(object.__getattribute__(self, "_expr"), name)
 
+    def _rewrap(self, new_expr, other=None) -> "ScalarView":
+        """Wrap ``new_expr`` in the same view subclass as ``self``.
+
+        The optional ``other`` argument names the original second operand of
+        the arithmetic / differential op, so subclasses with extra state
+        (``Named*WithPartials``) can validate that the binding remains
+        consistent — e.g. raising on a name collision with a different Variable.
+        Base view: ignores ``other``.
+        """
+        return ScalarView(new_expr)
+
     def integrate(self, **kwargs) -> "ScalarView":
         """Integrate the underlying scalar, preserving the ScalarView type."""
-        return ScalarView(self._expr.integrate(**kwargs))
+        return self._rewrap(self._expr.integrate(**kwargs))
+
+    @property
+    def stop_gradient(self) -> "ScalarView":
+        """Block gradient flow through this view, preserving the ScalarView type."""
+        return self._rewrap(self._expr.stop_gradient)
+
+    def d(self, v, scheme: str = "automatic_differentiation") -> "ScalarView":
+        """``∂self/∂v`` — same view type."""
+        return self._rewrap(self._expr.d(v, scheme=scheme))
+
+    def d2(self, v, scheme: str = "automatic_differentiation") -> "ScalarView":
+        """``∂²self/∂v²`` — same view type."""
+        return self._rewrap(self._expr.d2(v, scheme=scheme))
+
+    def dd(self, v, w=None, scheme: str = "automatic_differentiation") -> "ScalarView":
+        """Mixed second derivative ``∂²self/∂v∂w`` — same view type."""
+        return self._rewrap(self._expr.dd(v, w, scheme=scheme))
+
+    def partials(self, **named_vars):
+        """Bind Variables to names for partial-derivative-by-attribute access.
+
+        ``u.scalar.partials(x=x, y=y, t=t).x`` → ``ScalarView`` of ``∂u/∂x``;
+        ``u.xy`` → ``∂²u/∂x∂y`` (up to 4th order; see :func:`_parse_partial_sequence`).
+        ``u.t`` works the same as any other bound name — registration is
+        purely lexical, no spatial-vs-temporal distinction.
+        """
+        return _coords_dispatch(self, (), named_vars)
+
+    # ``bind`` is a synonym — programming flavour, same semantics.
+    bind = partials
 
     def coords(self, *args, **named_vars):
-        """Bind coordinate Variables for derivative-by-name access.
-
-        ``u.scalar.coords(x=x_var, y=y_var).x`` → ScalarView of ``∂u/∂x``;
-        ``.xy`` is the mixed second derivative; up to 4th order.
-        Convenience methods that auto-fill registered coord vars are also
-        available — ``.grad()`` returns the full gradient, ``.laplacian()``
-        returns Δu.
-        """
+        """Deprecated alias — use :meth:`partials` (kwargs) instead."""
         return _coords_dispatch(self, args, named_vars)
 
     # -- scalar operations --
@@ -151,27 +217,28 @@ class ScalarView:
     def pow(self, n: float) -> "ScalarView":
         return ScalarView(self._expr**n)
 
-    # -- arithmetic with cross-type dispatch --
+    # -- arithmetic with cross-type dispatch (all paths go through _rewrap so
+    #    subclasses like NamedScalarViewWithPartials keep their state) --
     def __add__(self, other):
-        return ScalarView(self._expr + _unwrap(other))
+        return self._rewrap(self._expr + _unwrap(other), other=other)
 
     def __radd__(self, other):
-        return ScalarView(_unwrap(other) + self._expr)
+        return self._rewrap(_unwrap(other) + self._expr, other=other)
 
     def __sub__(self, other):
-        return ScalarView(self._expr - _unwrap(other))
+        return self._rewrap(self._expr - _unwrap(other), other=other)
 
     def __rsub__(self, other):
-        return ScalarView(_unwrap(other) - self._expr)
+        return self._rewrap(_unwrap(other) - self._expr, other=other)
 
     def __neg__(self):
-        return ScalarView(-self._expr)
+        return self._rewrap(-self._expr)
 
     def __truediv__(self, other):
-        return ScalarView(self._expr / _unwrap(other))
+        return self._rewrap(self._expr / _unwrap(other), other=other)
 
     def __rtruediv__(self, other):
-        return ScalarView(_unwrap(other) / self._expr)
+        return self._rewrap(_unwrap(other) / self._expr, other=other)
 
     def __mul__(self, other):
         if isinstance(other, VectorView):
@@ -182,10 +249,13 @@ class ScalarView:
             return VoigtView(self._expr * other._expr)
         if isinstance(other, ComplexView):
             return ComplexView(self._expr * other._expr)
-        return ScalarView(self._expr * _unwrap(other))
+        return self._rewrap(self._expr * _unwrap(other), other=other)
 
     def __rmul__(self, other):
-        return ScalarView(_unwrap(other) * self._expr)
+        return self._rewrap(_unwrap(other) * self._expr, other=other)
+
+    def __pow__(self, n):
+        return self._rewrap(self._expr ** _unwrap(n))
 
 
 # ---------------------------------------------------------------------------
@@ -208,17 +278,46 @@ class VectorView:
             raise AttributeError(name)
         return getattr(object.__getattribute__(self, "_expr"), name)
 
+    def _rewrap(self, new_expr, other=None) -> "VectorView":
+        """Wrap ``new_expr`` in the same view subclass as ``self``."""
+        return VectorView(new_expr)
+
     def integrate(self, **kwargs) -> "VectorView":
         """Component-wise integral, preserving VectorView type."""
-        return VectorView(self._expr.integrate(**kwargs))
+        return self._rewrap(self._expr.integrate(**kwargs))
+
+    @property
+    def stop_gradient(self) -> "VectorView":
+        """Block gradient flow component-wise, preserving the VectorView type."""
+        return self._rewrap(self._expr.stop_gradient)
+
+    def d(self, v, scheme: str = "automatic_differentiation") -> "VectorView":
+        """Component-wise ``∂self/∂v`` — same view type."""
+        return self._rewrap(self._expr.d(v, scheme=scheme))
+
+    def d2(self, v, scheme: str = "automatic_differentiation") -> "VectorView":
+        return self._rewrap(self._expr.d2(v, scheme=scheme))
+
+    def dd(self, v, w=None, scheme: str = "automatic_differentiation") -> "VectorView":
+        return self._rewrap(self._expr.dd(v, w, scheme=scheme))
+
+    def partials(self, **named_vars):
+        """Bind Variables to names for component-wise partial-derivative-by-attribute access.
+
+        ``v.vector.partials(x=x, y=y).x`` → ``VectorView`` of ``∂v/∂x``.
+        """
+        return _coords_dispatch(self, (), named_vars, positional_factory=NamedVectorView)
+
+    bind = partials  # synonym
 
     def coords(self, *args, **named_vars):
-        """Two forms.
+        """Two forms:
 
-        * ``v.coords(x=x_var, y=y_var)`` (kwargs) → partial-derivative wrapper.
-          ``v.x`` returns a ``VectorView`` of ``∂v/∂x`` (component-wise partial).
-        * ``v.coords("x", "y")`` or ``v.coords(["x", "y"])`` (positional strings)
-          → component-access wrapper. ``v.x`` returns ``ScalarView`` of v[..., 0].
+        * ``v.coords("x", "y")`` / ``v.coords(["x", "y"])`` — positional string
+          labels for component access via ``.x``, ``.y`` (``ScalarView`` of one
+          component).
+        * ``v.coords(x=x_var, y=y_var)`` — *deprecated* alias for
+          :meth:`partials`; use ``.partials(...)`` or ``.bind(...)`` for new code.
         """
         return _coords_dispatch(self, args, named_vars, positional_factory=NamedVectorView)
 
@@ -317,33 +416,36 @@ class VectorView:
         """
         return self.jacobian(*vars)
 
-    # -- arithmetic --
+    # -- arithmetic — all paths go through _rewrap so subclasses keep state --
     def __add__(self, other):
-        return VectorView(self._expr + _unwrap(other))
+        return self._rewrap(self._expr + _unwrap(other), other=other)
 
     def __radd__(self, other):
-        return VectorView(_unwrap(other) + self._expr)
+        return self._rewrap(_unwrap(other) + self._expr, other=other)
 
     def __sub__(self, other):
-        return VectorView(self._expr - _unwrap(other))
+        return self._rewrap(self._expr - _unwrap(other), other=other)
 
     def __rsub__(self, other):
-        return VectorView(_unwrap(other) - self._expr)
+        return self._rewrap(_unwrap(other) - self._expr, other=other)
 
     def __neg__(self):
-        return VectorView(-self._expr)
+        return self._rewrap(-self._expr)
 
     def __mul__(self, other):
-        return VectorView(self._expr * _unwrap(other))
+        return self._rewrap(self._expr * _unwrap(other), other=other)
 
     def __rmul__(self, other):
-        return VectorView(_unwrap(other) * self._expr)
+        return self._rewrap(_unwrap(other) * self._expr, other=other)
 
     def __truediv__(self, other):
-        return VectorView(self._expr / _unwrap(other))
+        return self._rewrap(self._expr / _unwrap(other), other=other)
 
     def __rtruediv__(self, other):
-        return VectorView(_unwrap(other) / self._expr)
+        return self._rewrap(_unwrap(other) / self._expr, other=other)
+
+    def __pow__(self, n):
+        return self._rewrap(self._expr ** _unwrap(n))
 
     def __matmul__(self, other):
         """``v @ A`` (row-vec times matrix) → VectorView; ``v @ w`` → Placeholder dot."""
@@ -382,16 +484,41 @@ class ComplexView:
             raise AttributeError(name)
         return getattr(object.__getattribute__(self, "_expr"), name)
 
+    def _rewrap(self, new_expr, other=None) -> "ComplexView":
+        """Wrap ``new_expr`` in the same view subclass as ``self``."""
+        return ComplexView(new_expr)
+
     def integrate(self, **kwargs) -> "ComplexView":
         """Component-wise integral of the [re, im] split, preserving ComplexView."""
-        return ComplexView(self._expr.integrate(**kwargs))
+        return self._rewrap(self._expr.integrate(**kwargs))
 
-    def coords(self, *args, **named_vars):
-        """Bind coordinate Variables for partial-derivative-by-name access.
+    @property
+    def stop_gradient(self) -> "ComplexView":
+        """Block gradient flow through the [re, im] pair, preserving ComplexView."""
+        return self._rewrap(self._expr.stop_gradient)
 
-        ``ψ.complex.coords(x=x_var, y=y_var).x`` → ComplexView of ``∂ψ/∂x`` —
+    def d(self, v, scheme: str = "automatic_differentiation") -> "ComplexView":
+        """Component-wise ``∂self/∂v`` — same view type."""
+        return self._rewrap(self._expr.d(v, scheme=scheme))
+
+    def d2(self, v, scheme: str = "automatic_differentiation") -> "ComplexView":
+        return self._rewrap(self._expr.d2(v, scheme=scheme))
+
+    def dd(self, v, w=None, scheme: str = "automatic_differentiation") -> "ComplexView":
+        return self._rewrap(self._expr.dd(v, w, scheme=scheme))
+
+    def partials(self, **named_vars):
+        """Bind Variables to names for partial-derivative-by-attribute access.
+
+        ``ψ.complex.partials(x=x, y=y).x`` → ``ComplexView`` of ``∂ψ/∂x`` —
         the partial is taken element-wise across the ``[re, im]`` split.
         """
+        return _coords_dispatch(self, (), named_vars)
+
+    bind = partials  # synonym
+
+    def coords(self, *args, **named_vars):
+        """Deprecated alias — use :meth:`partials` (kwargs) instead."""
         return _coords_dispatch(self, args, named_vars)
 
     @property
@@ -439,31 +566,34 @@ class ComplexView:
 
     # -- elementwise (scalar) arithmetic; for complex product use .mul --
     def __add__(self, other):
-        return ComplexView(self._expr + _unwrap(other))
+        return self._rewrap(self._expr + _unwrap(other), other=other)
 
     def __radd__(self, other):
-        return ComplexView(_unwrap(other) + self._expr)
+        return self._rewrap(_unwrap(other) + self._expr, other=other)
 
     def __sub__(self, other):
-        return ComplexView(self._expr - _unwrap(other))
+        return self._rewrap(self._expr - _unwrap(other), other=other)
 
     def __rsub__(self, other):
-        return ComplexView(_unwrap(other) - self._expr)
+        return self._rewrap(_unwrap(other) - self._expr, other=other)
 
     def __neg__(self):
-        return ComplexView(-self._expr)
+        return self._rewrap(-self._expr)
 
     def __mul__(self, other):
-        return ComplexView(self._expr * _unwrap(other))
+        return self._rewrap(self._expr * _unwrap(other), other=other)
 
     def __rmul__(self, other):
-        return ComplexView(_unwrap(other) * self._expr)
+        return self._rewrap(_unwrap(other) * self._expr, other=other)
 
     def __truediv__(self, other):
-        return ComplexView(self._expr / _unwrap(other))
+        return self._rewrap(self._expr / _unwrap(other), other=other)
 
     def __rtruediv__(self, other):
-        return ComplexView(_unwrap(other) / self._expr)
+        return self._rewrap(_unwrap(other) / self._expr, other=other)
+
+    def __pow__(self, n):
+        return self._rewrap(self._expr ** _unwrap(n))
 
 
 # ---------------------------------------------------------------------------
@@ -493,9 +623,28 @@ class MatrixView:
             raise AttributeError(name)
         return getattr(object.__getattribute__(self, "_expr"), name)
 
+    def _rewrap(self, new_expr, other=None) -> "MatrixView":
+        """Wrap ``new_expr`` in the same view subclass as ``self``."""
+        return MatrixView(new_expr)
+
     def integrate(self, **kwargs) -> "MatrixView":
         """Element-wise integral, preserving MatrixView type."""
-        return MatrixView(self._expr.integrate(**kwargs))
+        return self._rewrap(self._expr.integrate(**kwargs))
+
+    @property
+    def stop_gradient(self) -> "MatrixView":
+        """Block gradient flow element-wise, preserving the MatrixView type."""
+        return self._rewrap(self._expr.stop_gradient)
+
+    def d(self, v, scheme: str = "automatic_differentiation") -> "MatrixView":
+        """Element-wise ``∂self/∂v`` — same view type."""
+        return self._rewrap(self._expr.d(v, scheme=scheme))
+
+    def d2(self, v, scheme: str = "automatic_differentiation") -> "MatrixView":
+        return self._rewrap(self._expr.d2(v, scheme=scheme))
+
+    def dd(self, v, w=None, scheme: str = "automatic_differentiation") -> "MatrixView":
+        return self._rewrap(self._expr.dd(v, w, scheme=scheme))
 
     # ------------------------------------------------------------------
     # Basic matrix operations
@@ -644,14 +793,23 @@ class MatrixView:
 
         return FunctionCall(_fn, [self._expr], "to_lower_tri")
 
-    def coords(self, *args, **named_vars):
-        """Two forms.
+    def partials(self, **named_vars):
+        """Bind Variables to names for element-wise partial-derivative access.
 
-        * ``A.coords(["x", "y"])`` or ``A.coords("x", "y")`` (positional strings)
-          → element-access wrapper :class:`NamedMatrixView`; ``A.xy`` returns
-          ``ScalarView`` of ``A[..., 0, 1]``.
-        * ``A.coords(x=x_var, y=y_var)`` (kwargs) → partial-derivative wrapper;
-          ``A.x`` returns ``MatrixView`` of ``∂A/∂x_var`` (element-wise partial).
+        ``A.matrix.partials(x=x, y=y).x`` → ``MatrixView`` of ``∂A/∂x``.
+        """
+        return _coords_dispatch(self, (), named_vars, positional_factory=NamedMatrixView)
+
+    bind = partials  # synonym
+
+    def coords(self, *args, **named_vars):
+        """Two forms:
+
+        * ``A.coords("x", "y")`` / ``A.coords(["x", "y"])`` — positional string
+          labels for element access via ``A.xy``, ``A.yy`` (``ScalarView`` of
+          ``A[..., 0, 1]``, etc.).
+        * ``A.coords(x=x_var, y=y_var)`` — *deprecated* alias for
+          :meth:`partials`; use ``.partials(...)`` or ``.bind(...)`` for new code.
         """
         return _coords_dispatch(self, args, named_vars, positional_factory=NamedMatrixView)
 
@@ -660,35 +818,35 @@ class MatrixView:
     # ------------------------------------------------------------------
 
     def __add__(self, other):
-        return MatrixView(self._expr + _unwrap(other))
+        return self._rewrap(self._expr + _unwrap(other), other=other)
 
     def __radd__(self, other):
-        return MatrixView(_unwrap(other) + self._expr)
+        return self._rewrap(_unwrap(other) + self._expr, other=other)
 
     def __sub__(self, other):
-        return MatrixView(self._expr - _unwrap(other))
+        return self._rewrap(self._expr - _unwrap(other), other=other)
 
     def __rsub__(self, other):
-        return MatrixView(_unwrap(other) - self._expr)
+        return self._rewrap(_unwrap(other) - self._expr, other=other)
 
     def __mul__(self, other):
-        return MatrixView(self._expr * _unwrap(other))
+        return self._rewrap(self._expr * _unwrap(other), other=other)
 
     def __rmul__(self, other):
-        return MatrixView(_unwrap(other) * self._expr)
+        return self._rewrap(_unwrap(other) * self._expr, other=other)
 
     def __neg__(self):
-        return MatrixView(-self._expr)
+        return self._rewrap(-self._expr)
 
     def __truediv__(self, other):
-        return MatrixView(self._expr / _unwrap(other))
+        return self._rewrap(self._expr / _unwrap(other), other=other)
 
     def __rtruediv__(self, other):
-        return MatrixView(_unwrap(other) / self._expr)
+        return self._rewrap(_unwrap(other) / self._expr, other=other)
 
     def __pow__(self, n):
         """Elementwise power. For matrix power use ``.pow(n)``."""
-        return MatrixView(self._expr**n)
+        return self._rewrap(self._expr**n)
 
     def __matmul__(self, other):
         """``A @ B`` → MatrixView. ``A @ v`` (VectorView) → VectorView."""
@@ -778,16 +936,40 @@ class VoigtView:
             raise AttributeError(name)
         return getattr(object.__getattribute__(self, "_expr"), name)
 
+    def _rewrap(self, new_expr, other=None) -> "VoigtView":
+        """Wrap ``new_expr`` in the same view subclass as ``self``."""
+        return VoigtView(new_expr)
+
     def integrate(self, **kwargs) -> "VoigtView":
         """Component-wise integral over the Voigt-packed tensor → VoigtView."""
-        return VoigtView(self._expr.integrate(**kwargs))
+        return self._rewrap(self._expr.integrate(**kwargs))
+
+    @property
+    def stop_gradient(self) -> "VoigtView":
+        """Block gradient flow component-wise, preserving the VoigtView type."""
+        return self._rewrap(self._expr.stop_gradient)
+
+    def d(self, v, scheme: str = "automatic_differentiation") -> "VoigtView":
+        """Component-wise ``∂self/∂v`` — same view type."""
+        return self._rewrap(self._expr.d(v, scheme=scheme))
+
+    def d2(self, v, scheme: str = "automatic_differentiation") -> "VoigtView":
+        return self._rewrap(self._expr.d2(v, scheme=scheme))
+
+    def dd(self, v, w=None, scheme: str = "automatic_differentiation") -> "VoigtView":
+        return self._rewrap(self._expr.dd(v, w, scheme=scheme))
+
+    def partials(self, **named_vars):
+        """Bind Variables to names for component-wise partial-derivative access.
+
+        ``σ.voigt.partials(x=x, y=y).x`` → ``VoigtView`` of ``∂σ/∂x``.
+        """
+        return _coords_dispatch(self, (), named_vars)
+
+    bind = partials  # synonym
 
     def coords(self, *args, **named_vars):
-        """Bind coordinate Variables for partial-derivative-by-name access.
-
-        ``σ.voigt.coords(x=x_var, y=y_var).x`` → VoigtView of ``∂σ/∂x`` —
-        the partial is taken component-wise across the Voigt packing.
-        """
+        """Deprecated alias — use :meth:`partials` (kwargs) instead."""
         return _coords_dispatch(self, args, named_vars)
 
     # ------------------------------------------------------------------
@@ -914,31 +1096,34 @@ class VoigtView:
     # ------------------------------------------------------------------
 
     def __add__(self, other):
-        return VoigtView(self._expr + _unwrap(other))
+        return self._rewrap(self._expr + _unwrap(other), other=other)
 
     def __radd__(self, other):
-        return VoigtView(_unwrap(other) + self._expr)
+        return self._rewrap(_unwrap(other) + self._expr, other=other)
 
     def __sub__(self, other):
-        return VoigtView(self._expr - _unwrap(other))
+        return self._rewrap(self._expr - _unwrap(other), other=other)
 
     def __rsub__(self, other):
-        return VoigtView(_unwrap(other) - self._expr)
+        return self._rewrap(_unwrap(other) - self._expr, other=other)
 
     def __mul__(self, other):
-        return VoigtView(self._expr * _unwrap(other))
+        return self._rewrap(self._expr * _unwrap(other), other=other)
 
     def __rmul__(self, other):
-        return VoigtView(_unwrap(other) * self._expr)
+        return self._rewrap(_unwrap(other) * self._expr, other=other)
 
     def __neg__(self):
-        return VoigtView(-self._expr)
+        return self._rewrap(-self._expr)
 
     def __truediv__(self, other):
-        return VoigtView(self._expr / _unwrap(other))
+        return self._rewrap(self._expr / _unwrap(other), other=other)
 
     def __rtruediv__(self, other):
-        return VoigtView(_unwrap(other) / self._expr)
+        return self._rewrap(_unwrap(other) / self._expr, other=other)
+
+    def __pow__(self, n):
+        return self._rewrap(self._expr ** _unwrap(n))
 
 
 # ---------------------------------------------------------------------------
@@ -999,6 +1184,35 @@ def _make_named_with_partials_cls(view_cls):
             view_cls.__init__(self, expr)
             object.__setattr__(self, "_coord_vars", dict(coord_vars))
 
+        def _rewrap(self, new_expr, other=None):
+            """Preserve the ``coord_vars`` binding through arithmetic / ``.d``.
+
+            So ``(u - source).x`` works just like ``u.x``: the result of
+            arithmetic is still a ``Named<View>WithPartials`` and inherits
+            the original ``{name: Variable}`` registration.
+
+            If ``other`` is itself a ``Named*WithPartials``, its bindings are
+            merged into ``self``'s — but only if every shared name maps to the
+            *same* Variable. A conflicting name (e.g. ``u.bind(x=x1) + v.bind(x=x2)``)
+            raises ``ValueError`` rather than silently picking one side, since
+            ``(u + v).x`` would otherwise depend on operand order.
+            """
+            cv = object.__getattribute__(self, "_coord_vars")
+            other_cv = getattr(other, "_coord_vars", None) if other is not None else None
+            if other_cv:
+                merged = dict(cv)
+                for name, var in other_cv.items():
+                    if name in merged and merged[name] is not var:
+                        raise ValueError(
+                            f"coord binding conflict for {name!r}: cannot combine "
+                            f"two named views that map {name!r} to different "
+                            f"Variables (left={merged[name]!r}, right={var!r}). "
+                            f"Re-bind the result explicitly with .bind(...) to resolve."
+                        )
+                    merged[name] = var
+                cv = merged
+            return type(self)(new_expr, cv)
+
         def __getattr__(self, key: str):
             if key.startswith("_"):
                 raise AttributeError(key)
@@ -1011,25 +1225,20 @@ def _make_named_with_partials_cls(view_cls):
                 return type(self)._base_view(result)
             return getattr(object.__getattribute__(self, "_expr"), key)
 
-        # -- convenience overrides that auto-fill the registered coord vars --
+        # No no-args ``grad()`` / ``laplacian()`` convenience methods —
+        # tutorials write the explicit form ``u.xx + u.yy`` etc., which reads
+        # like the math and is unambiguous about which axes participate.
 
-        def grad(self, *vars):
-            """Spatial gradient — uses registered coords if no args given."""
-            cv = object.__getattribute__(self, "_coord_vars")
-            if not vars:
-                names = tuple(cv.keys())
-                vars_used = tuple(cv.values())
-                from ..jnp_ops import concat
+        @property
+        def fd(self):
+            """Finite-difference partial-derivative namespace.
 
-                inner = concat([self._expr.d(v) for v in vars_used])
-                return NamedVectorViewWithPartials(inner, dict(zip(names, vars_used)))
-            return view_cls.grad(self, *vars)  # delegate to base view's grad
-
-        def laplacian(self, *vars):
-            """Δself — uses registered coords if no args given."""
-            cv = object.__getattribute__(self, "_coord_vars")
-            vars_used = vars or tuple(cv.values())
-            return ScalarView(self._expr.laplacian(*vars_used))
+            ``u.fd.x``, ``u.fd.xx``, ``u.fd.xy`` etc. mirror the attribute
+            syntax of ``u.x`` / ``u.xx`` / ``u.xy`` but evaluate each partial
+            via the finite-difference scheme instead of automatic
+            differentiation.
+            """
+            return _SchemeProxy(self, "finite_difference")
 
     NamedWithPartials.__name__ = f"Named{view_cls.__name__}WithPartials"
     NamedWithPartials.__qualname__ = NamedWithPartials.__name__

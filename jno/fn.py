@@ -749,6 +749,10 @@ def stop_gradient(field: "Placeholder") -> "FunctionCall":
 
     Equivalent to ``jax.lax.stop_gradient`` applied inside the trace graph.
     """
+    from .trace.views import _VIEW_TYPES
+
+    if isinstance(field, _VIEW_TYPES):
+        field = field._expr
     return FunctionCall(jax.lax.stop_gradient, [field], name="stop_gradient")
 
 

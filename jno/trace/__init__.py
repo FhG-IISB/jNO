@@ -206,6 +206,24 @@ class Placeholder:
         self._user_name = label
         return self
 
+    @property
+    def stop_gradient(self) -> "FunctionCall":
+        """Block gradient flow through this expression.
+
+        Identity in the forward pass, zero in the backward pass — property form
+        of :func:`jno.fn.stop_gradient`. Decouple cooperating models so each
+        interaction term only updates *its own* parameters::
+
+            L_int_phy = (u_phy - u_syn.stop_gradient).mse
+            L_int_syn = (u_syn - u_phy.stop_gradient).mse
+
+        Or treat a costly quantity (e.g. a parameter Jacobian) as a constant
+        when penalising it, without differentiating through its computation::
+
+            loss = (u.grad(net).stop_gradient ** 2).mean()
+        """
+        return FunctionCall(jax.lax.stop_gradient, [self], name="stop_gradient")
+
     def __add__(self, other) -> BinaryOp:
         if isinstance(other, _VIEW_TYPES):
             return NotImplemented
@@ -654,26 +672,6 @@ class Placeholder:
         from .views import VectorView
 
         return VectorView(concat([self.d(v) for v in args]))
-
-    def stop_gradient(self) -> "FunctionCall":
-        """Treat this expression as a constant during backpropagation.
-
-        Wraps the expression in ``jax.lax.stop_gradient`` so no gradient
-        flows through it.  Useful for penalising a quantity (e.g. the
-        parameter Jacobian) without differentiating through its computation::
-
-            # Cheap Jacobian regularisation — first-order, J treated as constant
-            loss = (u.grad(net).stop_gradient() ** 2).mean()
-
-            # Full second-order version (expensive — differentiates through jacrev)
-            loss = (u.grad(net) ** 2).mean()
-
-        Returns a :class:`FunctionCall` node, so further symbolic operations
-        can be chained normally.
-        """
-        import jax
-
-        return FunctionCall(jax.lax.stop_gradient, [self], name="stop_gradient")
 
 
 class Literal(Placeholder):
