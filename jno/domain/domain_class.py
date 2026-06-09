@@ -671,6 +671,33 @@ class domain(MeshIOMixin):
             for tag, pts in self._mesh_pool.items():
                 lines.append(f"    • {tag:20s}  shape {pts.shape}")
 
+        if self._boundary_registry:
+            lines.append(f"  Boundary tags ({len(self._boundary_registry)}):")
+            coord_labels = self.spatial if self.spatial else [f"x{i}" for i in range(self.dimension)]
+            for tag in sorted(self._boundary_registry):
+                pts = self._boundary_registry[tag].get("points")
+                parts: list = [f"    • {tag}"]
+                if pts is not None and len(pts) > 0:
+                    pts_xy = np.asarray(pts)[:, : self.dimension]
+                    extents = []
+                    for axis, label in enumerate(coord_labels):
+                        lo, hi = float(pts_xy[:, axis].min()), float(pts_xy[:, axis].max())
+                        if hi - lo < 1e-10:
+                            extents.append(f"{label}={lo:.3g}")
+                        else:
+                            extents.append(f"{label}=[{lo:.3g},{hi:.3g}]")
+                    parts.append("  " + "  ".join(extents))
+                normals = self.normals_by_tag.get(tag)
+                if normals is None:
+                    ctx_n = self.context.get(f"n_{tag}")
+                    if ctx_n is not None:
+                        normals = np.asarray(ctx_n).reshape(-1, self.dimension)
+                if normals is not None and len(normals) > 0:
+                    mean_n = np.asarray(normals).mean(axis=0)[: self.dimension]
+                    n_str = "(" + ", ".join(f"{v:+.2f}" for v in mean_n) + ")"
+                    parts.append(f"  n={n_str}")
+                lines.append("".join(parts))
+
         if self._param_tags:
             lines.append(f"  Tensor tags ({len(self._param_tags)}):")
             for tag in sorted(self._param_tags):

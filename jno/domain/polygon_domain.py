@@ -192,7 +192,15 @@ def _segments_from_line_geometry(geom: BaseGeometry) -> np.ndarray:
 
 
 def _edge_geometries_from_region(geom: BaseGeometry) -> List[BaseGeometry]:
-    return [_as_line_geometry(line) for line in _line_parts(geom.boundary)]
+    # Decompose each ring into individual LineString segments so that
+    # from_regions / geometry-based paths produce per-edge sub-tags
+    # (boundary_{name}_0, _1, …) matching the _polygon_from_vertices path.
+    edges: List[BaseGeometry] = []
+    for ring in _line_parts(geom.boundary):
+        coords = list(ring.coords)
+        for i in range(len(coords) - 1):
+            edges.append(LineString([coords[i], coords[i + 1]]))
+    return edges if edges else [_as_line_geometry(geom.boundary)]
 
 
 def _unique_segment_points(segments: np.ndarray) -> np.ndarray:
