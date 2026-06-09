@@ -27,7 +27,7 @@ posterior; hyperparameters affect chain efficiency only.
 When ``u`` is **not** known analytically (e.g. a real PDE solve), use
 the *two-stage* pattern via ``substeps=[([0, 1], 20), ([2], 1)]``:
 substep 0 trains a surrogate from data, substep 1 samples ``k`` against
-the PDE residual with ``surrogate.stop_gradient()``.  See
+the PDE residual with ``surrogate.stop_gradient``.  See
 ``docs/training/bayesian.md`` for the trade-offs.
 
 Reference

@@ -1,13 +1,19 @@
-import jax
+import os
+
+# FEM surface_data arrays are currently CPU-pinned; running on CPU
+# avoids a known device-mismatch when training on GPU.
+os.environ["JAX_PLATFORMS"] = "cpu"
+
+import jax  # noqa: E402
 
 jax.config.update("jax_enable_x64", False)
 
-import foundax
-import jax.numpy as jnp
-import numpy as np
-import optax
+import foundax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
+import numpy as np  # noqa: E402
+import optax  # noqa: E402
 
-import jno
+import jno  # noqa: E402
 
 """02 - 2-D Helmholtz equation with FEAX-FEM and variational PINNs
 

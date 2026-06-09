@@ -1,48 +1,24 @@
-"""05 — HyCo: Hybrid-Cooperative Learning for PINNs (1D Poisson)
+"""05 — HyCo: Hybrid-Cooperative Learning for PINNs (1-D Poisson)
 
-Based on: Liverani, Steynberg & Zuazua (2025) — arXiv:2509.14123
+Based on Liverani, Steynberg & Zuazua (2025) — arXiv:2509.14123.
 
 Idea
 ----
 Train two networks that cooperate via a shared interaction loss:
+  * **u_phy** — physical model, enforces the PDE residual
+  * **u_syn** — synthetic model, fits sparse noisy sensor observations
 
-  u_phy  — physical model: enforces the PDE residual
-  u_syn  — synthetic model: fits sparse, noisy sensor observations
-
-Both models are encouraged to agree at interior collocation points through
-a mutual alignment term.  ``jno.fn.stop_gradient`` ensures that, when
-optimising u_phy via the interaction, gradients do NOT flow into u_syn
-(and vice versa), so each model only updates its own parameters.
-
-Loss decomposition
-------------------
-  Physical model optimises:   L_pde  +  β · L_int_phy
-  Synthetic model optimises:  α · L_data  +  β · L_int_syn
-
-  L_pde      = MSE of PDE residual at interior points          (u_phy only)
-  L_data     = MSE of u_syn vs. observations at sensor points  (u_syn only)
-  L_int_phy  = MSE(u_phy, stop_gradient(u_syn))  at interior  (u_phy only)
-  L_int_syn  = MSE(u_syn, stop_gradient(u_phy))  at interior  (u_syn only)
-
-Alternating updates via ``substeps``
-------------------------------------
-The HyCo procedure prescribes *alternating* updates: first update u_phy,
-then update u_syn using the freshly updated u_phy.  We use the ``substeps``
-argument to ``solve()`` to express this:
-
-  substeps=[[0, 1], [2, 3]]
-
-means each outer epoch runs two gradient steps in sequence — first on
-constraints [0, 1] (the u_phy losses), then on constraints [2, 3] (the u_syn
-losses).  Each substep keeps its own optimizer state, so Adam momentum for
-u_phy only accumulates from u_phy gradients (and likewise for u_syn).
+Both models are encouraged to agree at interior collocation points via a
+mutual alignment term, with ``jno.fn.stop_gradient`` blocking cross-talk in
+the optimiser updates. Alternating updates are expressed through ``substeps``:
+each outer epoch runs one ``u_phy`` step followed by one ``u_syn`` step,
+each with its own Adam state.
 
 Problem
 -------
-    u'' + π² sin(πx) = 0,   u(0) = u(1) = 0   on [0, 1]
+    u'' + π² sin(πx) = 0,    u(0) = u(1) = 0   on [0, 1]
     Exact solution: u(x) = sin(πx)
-
-    Sensors: 7 observations with additive Gaussian noise (σ = 0.05)
+    Sensors: 7 noisy observations  (σ = 0.05)
 """
 
 from pathlib import Path
@@ -56,81 +32,51 @@ import optax
 import jno
 
 π = jno.np.pi
-
-# ── Reproducible noise ────────────────────────────────────────────────────────
 rng = np.random.default_rng(0)
 
-# ── Domain ────────────────────────────────────────────────────────────────────
-# Standard 1D line domain — provides the dense interior collocation points
 domain = jno.domain.line(mesh_size=0.02)
 x, _ = domain.variable("interior")
 
-# Sparse sensor observations — noisy samples of the true solution
+# Sparse noisy sensors, registered as a named point set on the same domain.
 x_sen = np.linspace(0.1, 0.9, 7).reshape(-1, 1)
 u_sen = np.sin(np.pi * x_sen) + rng.normal(0, 0.05, x_sen.shape)
-
-# Register sensor coordinates on the same domain as a named point set
 (x_s,) = domain.variable("sensors", sample=x_sen, split=True, point_data=True)
 
-# ── Networks ──────────────────────────────────────────────────────────────────
-key = jax.random.PRNGKey(0)
-k1, k2 = jax.random.split(key)
-
+# Two networks, one optimiser each.
+k1, k2 = jax.random.split(jax.random.PRNGKey(0))
 u_phy_net = jno.nn.wrap(foundax.mlp(in_features=1, output_dim=1, hidden_dims=32, num_layers=3, key=k1))
 u_syn_net = jno.nn.wrap(foundax.mlp(in_features=1, output_dim=1, hidden_dims=32, num_layers=3, key=k2))
-for net in [u_phy_net, u_syn_net]:
+for net in (u_phy_net, u_syn_net):
     net.optimizer(optax.adam(1e-3))
 
-# Fields — boundary factor enforces u(0) = u(1) = 0 exactly
-u_phy = u_phy_net(x) * x * (1 - x)  # physical model at collocation pts
-u_syn = u_syn_net(x) * x * (1 - x)  # synthetic model at collocation pts
+# Hard Dirichlet ansatz; .bind(x=x) so the PDE residual reads as u.xx.
+u_phy = (u_phy_net(x) * x * (1 - x)).scalar.bind(x=x)
+u_syn = (u_syn_net(x) * x * (1 - x)).scalar.bind(x=x)
 
-# ── Losses ────────────────────────────────────────────────────────────────────
+# Loss components
+L_pde = (u_phy.xx + π**2 * jno.np.sin(π * x)).mse
+u_syn_at_sensors = u_syn_net(x_s) * x_s * (1 - x_s)
+L_data = (u_syn_at_sensors - jno.np.array(u_sen)).mse
+L_int_phy = (u_phy - u_syn.stop_gradient).mse
+L_int_syn = (u_syn - u_phy.stop_gradient).mse
 
-# 1. PDE residual — drives u_phy to satisfy the Poisson equation
-L_pde = (u_phy.dd(x) + π**2 * jno.np.sin(π * x)).mse
-
-# 2. Data fidelity — drives u_syn to match the noisy sensor readings
-u_syn_s = u_syn_net(x_s) * x_s * (1 - x_s)  # at sensor pts
-u_obs = jno.np.array(u_sen)  # Constant: noisy observations
-L_data = (u_syn_s - u_obs).mse
-
-# 3. Interaction — mutual alignment at collocation points
-#    stop_gradient blocks gradient flow into the "reference" model so that
-#    each interaction term only updates the "student" model's parameters.
-L_int_phy = (u_phy - jno.fn.stop_gradient(u_syn)).mse  # u_phy learns from u_syn
-L_int_syn = (u_syn - jno.fn.stop_gradient(u_phy)).mse  # u_syn learns from u_phy
-
-# ── Solve — alternating updates: u_phy first, then u_syn ──────────────────────
-α, β = 1.0, 1.0  # weighting: interaction vs. primary objectives
-
-crux = jno.core(
-    [L_pde, β * L_int_phy, α * L_data, β * L_int_syn],
-    domain,
-)
-# Each outer epoch: 1 u_phy step (constraints 0, 1) → 1 u_syn step (constraints 2, 3)
+α, β = 1.0, 1.0
+crux = jno.core([L_pde, β * L_int_phy, α * L_data, β * L_int_syn], domain)
+# Alternating updates: first u_phy (constraints 0, 1), then u_syn (constraints 2, 3).
 crux.solve(3_000, substeps=[[0, 1], [2, 3]])
 
-# ── Evaluation ────────────────────────────────────────────────────────────────
 u_exact_expr = jno.np.sin(π * x)
 _u_phy, _u_syn, _u_exact = crux.eval([u_phy, u_syn, u_exact_expr])
-
 rel_phy = float(jnp.linalg.norm(_u_phy - _u_exact) / (jnp.linalg.norm(_u_exact) + 1e-8))
 rel_syn = float(jnp.linalg.norm(_u_syn - _u_exact) / (jnp.linalg.norm(_u_exact) + 1e-8))
 
-print(f"u_phy rel-L2 error : {rel_phy:.3e}  (physics model)")
-print(f"u_syn rel-L2 error : {rel_syn:.3e}  (synthetic model)")
-
-# ── Assertions ────────────────────────────────────────────────────────────────
+print(f"u_phy rel-L2 : {rel_phy:.3e}    u_syn rel-L2 : {rel_syn:.3e}")
 assert rel_phy < 0.05, f"Physical model error too large: {rel_phy:.3e}"
 assert rel_syn < 0.10, f"Synthetic model error too large: {rel_syn:.3e}"
 
-# ── Result tracking ───────────────────────────────────────────────────────────
 results_file = Path(__file__).parent.parent.parent / "tutorial_results.txt"
 with open(results_file, "a") as f:
     f.write(
-        f"05_coupled_and_inverse/hyco_poisson_1d.py"
-        f" | epochs=3000 | alpha={α} | beta={β}"
-        f" | rel_L2_phy={rel_phy:.6e}"
-        f" | rel_L2_syn={rel_syn:.6e}\n"
+        f"05_coupled_and_inverse/hyco_poisson_1d.py | epochs=3000 | alpha={α} | beta={β}"
+        f" | rel_L2_phy={rel_phy:.6e} | rel_L2_syn={rel_syn:.6e}\n"
     )

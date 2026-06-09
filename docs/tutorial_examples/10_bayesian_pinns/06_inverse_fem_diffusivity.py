@@ -88,10 +88,10 @@ fem_domain.init_fem(
 u_sym, phi_sym = fem_domain.fem_symbols()
 xg, yg, _ = fem_domain.variable("fem_gauss", split=True)
 
-du_dx = jno.np.grad(u_sym, xg)
-du_dy = jno.np.grad(u_sym, yg)
-phi_x = jno.np.grad(phi_sym, xg)
-phi_y = jno.np.grad(phi_sym, yg)
+du_dx = u_sym.d(xg)
+du_dy = u_sym.d(yg)
+phi_x = phi_sym.d(xg)
+phi_y = phi_sym.d(yg)
 
 # Weak form for α = 1; A(α=1) = A_base.
 weak_base = du_dx * phi_x + du_dy * phi_y - source_f(xg, yg, alpha_true=1.0) * phi_sym

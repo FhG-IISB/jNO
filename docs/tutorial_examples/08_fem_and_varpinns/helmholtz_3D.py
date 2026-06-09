@@ -25,13 +25,19 @@ Showcases
 - VPINN on 3D geometry
 """
 
-import foundax
-import jax
-import jax.numpy as jnp
-import numpy as np
-import optax
+import os
 
-import jno
+# FEM surface_data arrays are currently CPU-pinned; running on CPU
+# avoids a known device-mismatch when training on GPU.
+os.environ["JAX_PLATFORMS"] = "cpu"
+
+import foundax  # noqa: E402
+import jax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
+import numpy as np  # noqa: E402
+import optax  # noqa: E402
+
+import jno  # noqa: E402
 
 jax.config.update("jax_enable_x64", False)
 

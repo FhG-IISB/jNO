@@ -24,6 +24,7 @@ Showcases
 import jax.numpy as jnp
 import numpy as np
 import scipy.optimize as spo
+from shapely.geometry import box
 
 import jno
 
@@ -56,7 +57,7 @@ def to_dense(A):
 # Domain and weak form
 # ---------------------------------------------------------------------
 
-domain = jno.domain.rect(mesh_size=0.12)
+domain = jno.domain(box(0, 0, 1, 1), mesh_size=0.12)
 
 domain.init_fem(
     element_type="TRI3",

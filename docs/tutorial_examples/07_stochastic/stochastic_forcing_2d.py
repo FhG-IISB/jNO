@@ -45,6 +45,7 @@ import foundax
 import jax
 import jax.numpy as jnp
 import optax
+from shapely.geometry import box
 
 import jno
 
@@ -52,7 +53,7 @@ import jno
 σ = 0.5  # noise amplitude on the forcing
 
 # ── Domain ─────────────────────────────────────────────────────────────────────
-domain = jno.domain.rect(mesh_size=0.05)
+domain = jno.domain(box(0, 0, 1, 1), mesh_size=0.05)
 x, y, _ = domain.variable("interior")
 
 # ── Deterministic forcing and exact solution ───────────────────────────────────
@@ -71,13 +72,13 @@ net = jno.nn.wrap(
 )
 net.optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.5, end_value=1e-5)))
 
-u = net(x, y) * x * (1 - x) * y * (1 - y)  # u = 0 on ∂Ω by construction
+u = (net(x, y) * x * (1 - x) * y * (1 - y)).scalar.bind(x=x, y=y)  # u = 0 on ∂Ω by construction
 
 # ── Stochastic PDE residual ────────────────────────────────────────────────────
 # The noise term is resampled every training step.  Its expectation is zero,
 # so E[loss] is minimised by the deterministic solution u*(x,y) = sin(πx)sin(πy).
 noise = jno.noise.gaussian(std=σ)
-pde = -jno.np.laplacian(u, [x, y]) - f - noise
+pde = -(u.xx + u.yy) - f - noise
 
 # ── Solve ──────────────────────────────────────────────────────────────────────
 crux = jno.core([pde.mse], domain)

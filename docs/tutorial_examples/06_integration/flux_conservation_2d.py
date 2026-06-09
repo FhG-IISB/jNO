@@ -27,13 +27,14 @@ import jax
 import jax.numpy as jnp
 import optax
 from jno.numpy import tracker
+from shapely.geometry import box
 
 import jno
 
 π = jno.np.pi
 
 # ── Domain ─────────────────────────────────────────────────────────────────────
-domain = jno.domain.rect(mesh_size=0.05)
+domain = jno.domain(box(0, 0, 1, 1), mesh_size=0.05)
 
 x, y, _ = domain.variable("interior")
 x_b, y_b, _ = domain.variable("boundary")
@@ -70,11 +71,11 @@ net.optimizer(
 
 # Hard-enforce u=0 on ∂Ω by multiplying by x(1-x)y(1-y).
 # The network then only needs to learn the interior shape.
-u = net(jno.np.concat([x, y], axis=-1)) * x * (1 - x) * y * (1 - y)
+u = (net(jno.np.concat([x, y], axis=-1)) * x * (1 - x) * y * (1 - y)).scalar.bind(x=x, y=y)
 
 # ── Losses ─────────────────────────────────────────────────────────────────────
 # Standard PDE residual
-pde = -u.laplacian(x, y) - forcing
+pde = -(u.xx + u.yy) - forcing
 
 # Volume-mean tracker — logged every 200 epochs, does not enter the gradient.
 # After convergence this should approach TARGET_INTEGRAL ≈ 0.405.

@@ -24,7 +24,7 @@ analytical solution directly into the likelihood and let NUTS sample a
 the target.  When a closed form is *not* available (a real PDE with no
 analytical solution), the recommended pattern is the **two-stage**
 approach via ``substeps=[([surrogate_constraints], n_train), ([pde], 1)]``
-with ``surrogate.stop_gradient()`` applied to the surrogate output in the
+with ``surrogate.stop_gradient`` applied to the surrogate output in the
 PDE residual — substep 0 trains the surrogate, substep 1 samples the
 coefficient with the surrogate frozen.  See
 ``docs/training/bayesian.md`` for the trade-offs.
