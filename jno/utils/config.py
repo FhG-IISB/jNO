@@ -347,6 +347,22 @@ def setup(
 # ---------------------------------------------------------------------------
 
 
+def wandb_finish() -> None:
+    """Flush and close the active W&B run (no-op if W&B is not enabled).
+
+    jNO registers this automatically via :mod:`atexit`, so you only need to
+    call it explicitly when you want to close the run before the process exits
+    (e.g. to start a second run in the same script).
+    """
+    global _WANDB_RUN
+    if _WANDB_RUN is not None:
+        try:
+            _WANDB_RUN.finish()
+        except Exception:
+            pass
+        _WANDB_RUN = None
+
+
 def _init_wandb(wandb_arg: bool | dict, project: str, run_dir: str) -> None:
     """Initialise a W&B run based on the *wandb* argument to :func:`setup`."""
     global _WANDB_RUN
@@ -378,6 +394,14 @@ def _init_wandb(wandb_arg: bool | dict, project: str, run_dir: str) -> None:
     _WANDB_RUN = wandb.init(**kwargs)
     _WANDB_RUN.log_code()
 
+    # Ensure metrics are flushed and the run is marked finished when the
+    # Python process exits (covers normal exit, sys.exit, and unhandled
+    # exceptions).  The atexit handler is a no-op if wandb_finish() was
+    # already called explicitly beforehand.
+    import atexit
+
+    atexit.register(wandb_finish)
+
     try:
         import weave  # type: ignore[import-untyped]
 
@@ -392,8 +416,17 @@ def get_wandb_run() -> Any:
 
 
 def wandb_log(metrics: dict[str, Any], *, step: int | None = None) -> None:
-    """Log *metrics* to W&B if a run is active (no-op otherwise)."""
+    """Log *metrics* to W&B if a run is active (no-op otherwise).
+
+    Multiple ``wandb_log`` calls per epoch (main metrics → trackers →
+    callbacks) all forward the same ``step`` value so W&B merges them into a
+    single row at ``_step=epoch``. The ``epoch`` key is also stamped into
+    every dict so users can pick either ``_step`` or ``epoch`` as the chart
+    X axis.
+    """
     if _WANDB_RUN is not None:
+        if step is not None and "epoch" not in metrics:
+            metrics = {**metrics, "epoch": step}
         _WANDB_RUN.log(metrics, step=step)
 
 
