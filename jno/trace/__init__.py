@@ -62,7 +62,13 @@ __all__ = [
     "ComplexView",
     "MatrixView",
     "NamedMatrixView",
+    "NamedVectorView",
     "VoigtView",
+    "NamedScalarViewWithPartials",
+    "NamedVectorViewWithPartials",
+    "NamedComplexViewWithPartials",
+    "NamedMatrixViewWithPartials",
+    "NamedVoigtViewWithPartials",
 ]
 
 # Global counter for unique operation IDs
@@ -201,24 +207,32 @@ class Placeholder:
         return self
 
     def __add__(self, other) -> BinaryOp:
+        if isinstance(other, _VIEW_TYPES):
+            return NotImplemented
         return BinaryOp("+", self, self._wrap(other))
 
     def __radd__(self, other) -> BinaryOp:
         return BinaryOp("+", self._wrap(other), self)
 
     def __sub__(self, other) -> BinaryOp:
+        if isinstance(other, _VIEW_TYPES):
+            return NotImplemented
         return BinaryOp("-", self, self._wrap(other))
 
     def __rsub__(self, other) -> BinaryOp:
         return BinaryOp("-", self._wrap(other), self)
 
     def __mul__(self, other) -> BinaryOp:
+        if isinstance(other, _VIEW_TYPES):
+            return NotImplemented
         return BinaryOp("*", self, self._wrap(other))
 
     def __rmul__(self, other) -> BinaryOp:
         return BinaryOp("*", self._wrap(other), self)
 
     def __truediv__(self, other) -> BinaryOp:
+        if isinstance(other, _VIEW_TYPES):
+            return NotImplemented
         return BinaryOp("/", self, self._wrap(other))
 
     def __rtruediv__(self, other) -> BinaryOp:
@@ -599,12 +613,19 @@ class Placeholder:
             return IntegralTime(self, time_var=var)
         return Integral(self, integration_var=var)
 
-    def grad(self, model: "Model") -> "NetworkGradient":
-        """Parameter Jacobian ∂self/∂θ where θ are the trainable weights of *model*.
+    def grad(self, *args):
+        """Gradient operator with two forms (dispatched by argument type).
 
-        Returns an ``(N, P)`` array — N spatial points × P selected trainable
-        parameters (flattened).  For multi-dimensional output ``(N, D)`` the
-        result is ``(N, D, P)``.
+        **1. Spatial gradient** — ``grad(x, y, [z])`` with ``Variable`` arguments
+        returns a :class:`VectorView` of the spatial gradient
+        ``[∂self/∂x, ∂self/∂y, ...]``. Use inside PDE residuals — e.g.
+        ``flux = kappa * u.grad(x, y)`` builds a flux vector that chains
+        into ``.div(x, y)``.
+
+        **2. Parameter gradient** — ``grad(model)`` with a single :class:`Model`
+        argument returns a :class:`NetworkGradient` ``(N, P)`` array — N
+        spatial points × P selected trainable parameters (flattened). For
+        multi-dimensional output ``(N, D)`` the result is ``(N, D, P)``.
 
         To restrict to a subset of parameters, call ``model.mask(bool_pytree)``
         first using a boolean pytree built with :func:`equinox.tree_at`.  Since
@@ -621,14 +642,18 @@ class Placeholder:
             mask = eqx.tree_at(lambda m: m.output_layer.weight, all_false, True)
             J_w = crux.eval([u.grad(net.mask(mask))])[0]  # (N, P_weight)
         """
-        if not isinstance(model, Model):
-            raise TypeError(
-                f"grad() expects a Model placeholder, got {type(model).__name__!r}. "
-                "For spatial derivatives use .d(variable) or jno.np.grad(expr, var)."
-            )
-        # Capture any mask set via net.mask(bool_pytree) at call time.
-        selector = getattr(model, "_param_mask", None)
-        return NetworkGradient(self, model, selector=selector)
+        if not args:
+            raise TypeError("grad() requires at least one Variable (spatial gradient) or a Model (parameter gradient).")
+        if len(args) == 1 and isinstance(args[0], Model):
+            # Parameter-gradient form (existing behaviour).
+            model = args[0]
+            selector = getattr(model, "_param_mask", None)
+            return NetworkGradient(self, model, selector=selector)
+        # Spatial-gradient form (new): one or more Variables → VectorView.
+        from ..jnp_ops import concat
+        from .views import VectorView
+
+        return VectorView(concat([self.d(v) for v in args]))
 
     def stop_gradient(self) -> "FunctionCall":
         """Treat this expression as a constant during backpropagation.
@@ -3293,9 +3318,16 @@ def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
 # Re-export typed semantic views. Imported at module bottom so that all
 # classes referenced inside views.py (FunctionCall, Placeholder) already exist.
 from .views import (  # noqa: E402
+    _VIEW_TYPES,
     ComplexView,
     MatrixView,
+    NamedComplexViewWithPartials,
     NamedMatrixView,
+    NamedMatrixViewWithPartials,
+    NamedScalarViewWithPartials,
+    NamedVectorView,
+    NamedVectorViewWithPartials,
+    NamedVoigtViewWithPartials,
     ScalarView,
     VectorView,
     VoigtView,

@@ -41,9 +41,8 @@ Rather than writing `Delta u`, the script forms flux components and then compute
 net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=80, num_layers=5, key=jax.random.PRNGKey(13)))
 net.optimizer(optax.adam(optax.exponential_decay(1e-3, 80, 0.5, end_value=1e-5)))
 
-u      = net(x, y) * x * (1 - x) * y * (1 - y)
-flux_x = kappa * u.d(x)
-flux_y = kappa * u.d(y)
+u    = net(x, y) * x * (1 - x) * y * (1 - y)
+flux = kappa * u.grad(x, y)   # ScalarView gradient × kappa → VectorView
 ```
 
 ## Step 3: Enforce Boundary Conditions Hard
@@ -55,7 +54,7 @@ The `x(1-x)y(1-y)` factor wraps the raw network output so the boundary condition
 Once coefficients vary in space, the forcing term becomes more complex, but the overall jNO workflow remains: residual → core → solve.
 
 ```python
-pde     = -jno.np.divergence([flux_x, flux_y], [x, y]) - forcing
+pde     = -flux.div(x, y) - forcing
 crux    = jno.core([pde.mse], domain)
 history = crux.solve(40_000)
 ```

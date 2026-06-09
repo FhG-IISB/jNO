@@ -693,11 +693,16 @@ class TestNetworkGradient:
         assert J.target is u
         assert J.model_node is net
 
-    def test_grad_type_error_for_variable(self):
+    def test_grad_with_variable_returns_vectorview(self):
+        """Phase 2: ``grad(x)`` with a Variable is the spatial-gradient form
+        (returns a ``VectorView``), distinct from the parameter-gradient form
+        ``grad(model)`` which returns a ``NetworkGradient``."""
+        from jno.trace import VectorView
+
         net, x = _make_net_and_var()
         u = net(x)
-        with pytest.raises(TypeError, match="grad\\(\\) expects a Model"):
-            u.grad(x)
+        result = u.grad(x)
+        assert isinstance(result, VectorView)
 
     def test_repr_contains_class_name(self):
         net, x = _make_net_and_var()

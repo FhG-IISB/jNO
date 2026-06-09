@@ -79,12 +79,13 @@ A tanh MLP is a natural fit because the target $e^{-(x^2+y^2)}$ is smooth and be
 ### Step 3 — Fokker-Planck residual
 
 ```python
-drift = (x * p).d(x) + (y * p).d(y)
-diff  = 0.5 * jno.np.laplacian(p, [x, y])
-fp    = drift + diff
+prob_flux = jno.np.vector(x * p, y * p)   # VectorView for the drift flux
+drift     = prob_flux.div(x, y)           # ∇·(b·p)  = ∂(xp)/∂x + ∂(yp)/∂y
+diff      = 0.5 * jno.np.laplacian(p, [x, y])
+fp        = drift + diff
 ```
 
-`(x * p).d(x)` computes $\partial(x\,p)/\partial x$ via automatic differentiation.  The Laplacian $\Delta p$ is computed by `jno.np.laplacian`.
+`jno.np.vector(...)` builds a typed `VectorView` from scalar components without manual `concat`, and `.div(x, y)` reads exactly like the math $\nabla \cdot (\mathbf{b} p)$. The Laplacian $\Delta p$ is computed by `jno.np.laplacian`.
 
 ### Step 4 — Normalization constraint
 

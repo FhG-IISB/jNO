@@ -4506,8 +4506,18 @@ class core:
                 posterior (``f(mean(θ)) ≠ mean(f(θ))``).
         """
 
-        if isinstance(operation, Placeholder):
-            operation = [operation]
+        # Accept typed semantic views (ScalarView, VectorView, ...) — unwrap
+        # to the underlying Placeholder so callers can pass `grad_u.dot(n).integrate()`
+        # (a ScalarView) directly to eval without `.expr` boilerplate.
+        from .trace.views import _VIEW_TYPES as _eval_view_types
+
+        def _unwrap_view(op):
+            return op._expr if isinstance(op, _eval_view_types) else op
+
+        if isinstance(operation, _eval_view_types) or isinstance(operation, Placeholder):
+            operation = [_unwrap_view(operation)]
+        else:
+            operation = [_unwrap_view(op) for op in operation]
 
         if samples not in ("auto", "chain", "point"):
             raise ValueError(f"crux.eval(samples=...) expects 'auto' | 'chain' | 'point', got {samples!r}.")

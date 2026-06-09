@@ -14,12 +14,20 @@ from __future__ import annotations
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 import jno
 from jno.trace import (
     ComplexView,
     MatrixView,
+    NamedComplexViewWithPartials,
     NamedMatrixView,
+    NamedMatrixViewWithPartials,
+    NamedScalarViewWithPartials,
+    NamedVectorView,
+    NamedVectorViewWithPartials,
+    NamedVoigtViewWithPartials,
+    NetworkGradient,
     Placeholder,
     ScalarView,
     Variable,
@@ -664,26 +672,356 @@ class TestCrossType:
         assert isinstance(s, ScalarView)
 
     def test_placeholder_op_view_mixed_direction(self):
-        """``placeholder + view`` must work, not just ``view + placeholder``.
+        """``placeholder + view`` preserves the view type via NotImplemented dispatch.
 
-        Python dispatches `placeholder + view` to ``Placeholder.__add__``, so
-        ``Placeholder._wrap`` must recognize views and pull out ``._expr``.
-        Otherwise the view would be embedded as a ``Literal`` and crash at eval.
+        Phase 2: ``Placeholder.__add__/__sub__/__mul__/__truediv__`` return
+        ``NotImplemented`` when the other operand is a view, so Python falls
+        back to ``View.__radd__/...`` which returns the matching view type.
         """
         d = _domain_with(("p", 1))
         p = Variable("p", [0, 1], domain=d)
         s = p.scalar
-        # placeholder + scalarview: dispatches to Placeholder.__add__
+        # placeholder + scalarview: NotImplemented dispatch → ScalarView.__radd__
         result = p + s
-        assert isinstance(result, Placeholder)  # raw, since LHS is Placeholder
+        assert isinstance(result, ScalarView)
         ctx = {"p": jnp.array([[3.0]])}
-        out = _eval(result, ctx)
-        np.testing.assert_allclose(out, [[6.0]])  # 3 + 3
+        np.testing.assert_allclose(_eval(result.expr, ctx), [[6.0]])  # 3 + 3
 
         # Same for matrix
         A, ctxA = _make_2x2([[1.0, 2.0, 3.0, 4.0]])
-        # A.expr + A (Placeholder + MatrixView) — both yield equal results
         mixed = A.expr + A
-        out = _eval(mixed, ctxA)
-        out_direct = _eval((A + A).expr, ctxA)
-        np.testing.assert_allclose(out, out_direct)
+        assert isinstance(mixed, MatrixView)
+        np.testing.assert_allclose(_eval(mixed.expr, ctxA), _eval((A + A).expr, ctxA))
+
+
+# ===========================================================================
+# Phase 2 — ergonomic additions
+#   * Placeholder.grad(*vars)         → VectorView
+#   * jno.np.vector(*components)      → VectorView
+#   * NotImplemented dispatch across all view types
+#   * VectorView.jacobian / .grad     → MatrixView
+#   * .integrate() preserves view type
+#   * Unified .coords(**vars) with higher-order partial parsing
+# ===========================================================================
+
+
+def _domain_xy():
+    """Single domain with tag ``xy`` (10 points × 2 dims), x and y Variables."""
+    d = _domain_with(("xy", 2))
+    x = Variable("xy", [0, 1], domain=d)
+    y = Variable("xy", [1, 2], domain=d)
+    return d, x, y
+
+
+class TestPlaceholderGradDispatch:
+    def test_grad_with_variables_returns_vectorview(self):
+        d, x, y = _domain_xy()
+        u = x * y  # scalar field
+        g = u.grad(x, y)
+        assert isinstance(g, VectorView)
+        ctx = {"xy": jnp.array([[0.5, 0.7]])}
+        # ∂u/∂x = y = 0.7, ∂u/∂y = x = 0.5
+        out = jnp.asarray(_eval(g.expr, ctx))
+        np.testing.assert_allclose(out.reshape(2), [0.7, 0.5], atol=1e-6)
+
+    def test_grad_no_args_raises(self):
+        d, x, _ = _domain_xy()
+        with pytest.raises(TypeError):
+            x.grad()  # neither Variable nor Model
+
+    def test_grad_with_model_still_returns_network_gradient(self):
+        """Backward-compatibility: the existing parameter-gradient form."""
+        import foundax
+
+        net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=4, num_layers=2, key=jax.random.PRNGKey(0)))
+        # Build a Placeholder that depends on `net`
+        d, x, y = _domain_xy()
+        u = net(x, y)
+        ng = u.grad(net)
+        assert isinstance(ng, NetworkGradient)
+
+
+class TestVectorConstructor:
+    def test_basic(self):
+        d, x, y = _domain_xy()
+        v = jno.np.vector(x, y)
+        assert isinstance(v, VectorView)
+        ctx = {"xy": jnp.array([[0.3, 0.7]])}
+        out = _eval(v.expr, ctx)
+        np.testing.assert_allclose(out, [[0.3, 0.7]])
+
+    def test_three_components(self):
+        d, x, y = _domain_xy()
+        v = jno.np.vector(x, y, x + y)
+        ctx = {"xy": jnp.array([[0.3, 0.7]])}
+        out = _eval(v.expr, ctx)
+        np.testing.assert_allclose(out, [[0.3, 0.7, 1.0]])
+
+
+class TestMixedArithmeticPreservation:
+    """Placeholder OP View → View (NotImplemented dispatch fires).
+
+    Sweeps each operator (+, -, *, /) and each view type.
+    """
+
+    @pytest.mark.parametrize(
+        "make_view, expected_cls",
+        [
+            (lambda v: v.scalar, ScalarView),
+            (lambda v: v.vector, VectorView),
+            (lambda v: v.complex, ComplexView),
+            (lambda v: v.matrix.from_diag(), MatrixView),
+            (lambda v: v.voigt, VoigtView),
+        ],
+        ids=["Scalar", "Vector", "Complex", "Matrix", "Voigt"],
+    )
+    @pytest.mark.parametrize("op", ["add", "sub", "mul", "truediv"], ids=["+", "-", "*", "/"])
+    def test_placeholder_op_view(self, make_view, expected_cls, op):
+        d, x, y = _domain_xy()
+        v = Variable("xy", [0, 2], domain=d)  # generic 2-component carrier
+        view = make_view(v)
+        ops = {
+            "add": lambda a, b: a + b,
+            "sub": lambda a, b: a - b,
+            "mul": lambda a, b: a * b,
+            "truediv": lambda a, b: a / b,
+        }
+        # x is a plain Placeholder; the OP should yield the view type
+        result = ops[op](x, view)
+        assert isinstance(result, expected_cls)
+
+    def test_literal_division_via_rtruediv(self):
+        """``1 / vec_view`` exercises the new VectorView.__rtruediv__."""
+        d, x, y = _domain_xy()
+        v = Variable("xy", [0, 2], domain=d)
+        for vw, cls in (
+            (v.vector, VectorView),
+            (v.complex, ComplexView),
+            (v.matrix.from_diag(), MatrixView),
+            (v.voigt, VoigtView),
+        ):
+            assert isinstance(1 / vw, cls)
+
+
+class TestVectorViewJacobian:
+    def test_jacobian_shape_and_values(self):
+        d, x, y = _domain_xy()
+        # v = (x*y, x+y) → J = [[y, x], [1, 1]]
+        v = jno.np.vector(x * y, x + y)
+        J = v.jacobian(x, y)
+        assert isinstance(J, MatrixView)
+        ctx = {"xy": jnp.array([[0.5, 0.7]])}
+        out = jnp.asarray(_eval(J.expr, ctx))
+        # Result shape: [1, n_components=2, n_vars=2]
+        assert out.shape == (1, 2, 2)
+        np.testing.assert_allclose(out[0], [[0.7, 0.5], [1.0, 1.0]], atol=1e-6)
+
+    def test_grad_alias(self):
+        d, x, y = _domain_xy()
+        v = jno.np.vector(x * y, x + y)
+        assert isinstance(v.grad(x, y), MatrixView)
+        # Same values as .jacobian
+        ctx = {"xy": jnp.array([[0.5, 0.7]])}
+        np.testing.assert_allclose(_eval(v.grad(x, y).expr, ctx), _eval(v.jacobian(x, y).expr, ctx))
+
+
+class TestIntegratePreservation:
+    """Each view's .integrate() returns the same view type wrapping the result."""
+
+    def _setup(self):
+        d, x, y = _domain_xy()
+        v2 = Variable("xy", [0, 2], domain=d)
+        return d, v2
+
+    def test_scalar_integrate(self):
+        d, v2 = self._setup()
+        # use first component to make a scalar
+        s = v2.vector.component(0)
+        assert isinstance(s.integrate(), ScalarView)
+
+    def test_vector_integrate(self):
+        d, v2 = self._setup()
+        assert isinstance(v2.vector.integrate(), VectorView)
+
+    def test_matrix_integrate(self):
+        d, v2 = self._setup()
+        A = v2.matrix.from_diag()
+        assert isinstance(A.integrate(), MatrixView)
+
+    def test_complex_integrate(self):
+        d, v2 = self._setup()
+        assert isinstance(v2.complex.integrate(), ComplexView)
+
+    def test_voigt_integrate(self):
+        d = _domain_with(("s", 3))
+        s = Variable("s", [0, 3], domain=d)
+        assert isinstance(s.voigt.integrate(), VoigtView)
+
+
+class TestCoordsKwargsForm:
+    """`view.coords(x=x_var, ...)` returns a Named<View>WithPartials.
+
+    Attribute access by registered name yields the partial derivative in
+    the same view type. Up-to-4th-order parsing supported.
+    """
+
+    def test_each_view_partial_returns_same_type(self):
+        d, x, y = _domain_xy()
+        v2 = Variable("xy", [0, 2], domain=d)
+        # ScalarView → ScalarView
+        s = (x * y).scalar.coords(x=x, y=y)
+        assert isinstance(s, NamedScalarViewWithPartials)
+        assert isinstance(s.x, ScalarView)
+        # VectorView → VectorView
+        vec = v2.vector.coords(x=x, y=y)
+        assert isinstance(vec, NamedVectorViewWithPartials)
+        assert isinstance(vec.x, VectorView)
+        # ComplexView → ComplexView
+        cplx = v2.complex.coords(x=x, y=y)
+        assert isinstance(cplx, NamedComplexViewWithPartials)
+        assert isinstance(cplx.x, ComplexView)
+        # MatrixView → MatrixView
+        mat = v2.matrix.from_diag().coords(x=x, y=y)
+        assert isinstance(mat, NamedMatrixViewWithPartials)
+        assert isinstance(mat.x, MatrixView)
+        # VoigtView → VoigtView
+        dV = _domain_with(("sigma", 3))
+        sig = Variable("sigma", [0, 3], domain=dV)
+        voi = sig.voigt.coords(x=x, y=y)
+        assert isinstance(voi, NamedVoigtViewWithPartials)
+        assert isinstance(voi.x, VoigtView)
+
+    def test_higher_order_single_char(self):
+        d, x, y = _domain_xy()
+        # u = x²y → ∂u/∂x = 2xy, ∂²u/∂x² = 2y, ∂²u/∂x∂y = 2x, ∂³u/∂x²∂y = 2
+        u = x * x * y
+        u_named = u.scalar.coords(x=x, y=y)
+        ctx = {"xy": jnp.array([[0.5, 0.7]])}
+        np.testing.assert_allclose(_eval(u_named.x.expr, ctx), [[2 * 0.5 * 0.7]], atol=1e-6)
+        np.testing.assert_allclose(_eval(u_named.xx.expr, ctx), [[2 * 0.7]], atol=1e-6)
+        np.testing.assert_allclose(_eval(u_named.xy.expr, ctx), [[2 * 0.5]], atol=1e-6)
+        np.testing.assert_allclose(_eval(u_named.xxy.expr, ctx), [[2.0]], atol=1e-6)
+        # 4th order: u.xxxy = 0
+        np.testing.assert_allclose(_eval(u_named.xxxy.expr, ctx), [[0.0]], atol=1e-6)
+
+    def test_fifth_order_falls_through(self):
+        """5th+-order names aren't parsed as partial sequences."""
+        d, x, _ = _domain_xy()
+        u = (x * x).scalar.coords(x=x)
+        with pytest.raises(AttributeError):
+            _ = u.xxxxx  # 5 chars > max_order=4 → falls through, then _expr has no `xxxxx`
+
+    def test_multi_char_underscore_regime(self):
+        d = _domain_with(("rt", 2))
+        r = Variable("rt", [0, 1], domain=d)
+        t = Variable("rt", [1, 2], domain=d)
+        u = r * t
+        u_named = u.scalar.coords(r=r, theta=t)
+        # ∂u/∂r = theta = t
+        ctx = {"rt": jnp.array([[0.4, 0.6]])}
+        np.testing.assert_allclose(_eval(u_named.r.expr, ctx), [[0.6]], atol=1e-6)
+        # ∂²u/∂r∂theta = 1
+        np.testing.assert_allclose(_eval(u_named.r_theta.expr, ctx), [[1.0]], atol=1e-6)
+        # ∂²u/∂theta∂r = 1 (same)
+        np.testing.assert_allclose(_eval(u_named.theta_r.expr, ctx), [[1.0]], atol=1e-6)
+
+    def test_xy_symmetry_with_smooth_field(self):
+        """∂²/∂x∂y = ∂²/∂y∂x for smooth fields."""
+        d, x, y = _domain_xy()
+        u = x * x * y * y * y  # x²y³
+        u_named = u.scalar.coords(x=x, y=y)
+        ctx = {"xy": jnp.array([[0.4, 0.6], [0.2, 0.9]])}
+        a = jnp.asarray(_eval(u_named.xy.expr, ctx))
+        b = jnp.asarray(_eval(u_named.yx.expr, ctx))
+        np.testing.assert_allclose(a, b, atol=1e-6)
+
+    def test_unknown_coord_falls_through(self):
+        d, x, _ = _domain_xy()
+        u = (x * x).scalar.coords(x=x)
+        with pytest.raises(AttributeError):
+            _ = u.z  # not a registered coord, and _expr has no .z
+
+    def test_grad_no_args_uses_registered(self):
+        d, x, y = _domain_xy()
+        u = x * y
+        u_named = u.scalar.coords(x=x, y=y)
+        g = u_named.grad()  # no args
+        assert isinstance(g, NamedVectorViewWithPartials)
+        # The result still carries the coord registration
+        assert set(g._coord_vars.keys()) == {"x", "y"}
+        # And the partials match
+        ctx = {"xy": jnp.array([[0.5, 0.7]])}
+        # g is a VectorView with [∂u/∂x, ∂u/∂y] = [y, x] = [0.7, 0.5]
+        out = jnp.asarray(_eval(g.expr, ctx))
+        np.testing.assert_allclose(out.reshape(2), [0.7, 0.5], atol=1e-6)
+
+    def test_laplacian_no_args_uses_registered(self):
+        d, x, y = _domain_xy()
+        u = x * x + y * y  # Δu = 4
+        u_named = u.scalar.coords(x=x, y=y)
+        lap = u_named.laplacian()
+        ctx = {"xy": jnp.array([[0.5, 0.7]])}
+        np.testing.assert_allclose(_eval(lap.expr, ctx), [[4.0]], atol=1e-6)
+
+    def test_mixing_kwargs_and_positionals_raises(self):
+        d, x, _ = _domain_xy()
+        v2 = Variable("xy", [0, 2], domain=d)
+        with pytest.raises(TypeError):
+            v2.vector.coords("x", x=x)  # positional + kwarg
+
+    def test_vector_positional_string_form_unchanged(self):
+        """VectorView.coords("x", "y") → NamedVectorView with component access."""
+        d, x, y = _domain_xy()
+        v2 = Variable("xy", [0, 2], domain=d)
+        nv = v2.vector.coords("x", "y")
+        assert isinstance(nv, NamedVectorView)
+        ctx = {"xy": jnp.array([[0.3, 0.7]])}
+        np.testing.assert_allclose(_eval(nv.x.expr, ctx), [0.3])
+        np.testing.assert_allclose(_eval(nv.y.expr, ctx), [0.7])
+
+    def test_matrix_positional_string_form_still_works(self):
+        """MatrixView.coords(["x", "y"]) → NamedMatrixView with element access."""
+        A, ctxA = _make_2x2([[1.0, 2.0, 3.0, 4.0]])
+        nA = A.coords(["x", "y"])
+        assert isinstance(nA, NamedMatrixView)
+        np.testing.assert_allclose(_eval(nA.xy.expr, ctxA), [2.0])
+
+    def test_matrix_kwargs_form_returns_partial(self):
+        d, x, y = _domain_xy()
+        # A = diag(x, y) → ∂A/∂x = diag(1, 0)
+        v2 = Variable("xy", [0, 2], domain=d)
+        A = v2.matrix.from_diag().coords(x=x, y=y)
+        assert isinstance(A, NamedMatrixViewWithPartials)
+        ctx = {"xy": jnp.array([[0.5, 0.7]])}
+        out = jnp.asarray(_eval(A.x.expr, ctx))
+        # shape (1, 2, 2); ∂(diag(x, y))/∂x = diag(1, 0)
+        np.testing.assert_allclose(out[0], [[1.0, 0.0], [0.0, 0.0]], atol=1e-6)
+
+    def test_indexing_strips_named_view_type(self):
+        d, x, y = _domain_xy()
+        u = (x * y).scalar.coords(x=x, y=y)
+        result = u.x  # ∂u/∂x
+        # ScalarView, not NamedScalarViewWithPartials
+        assert isinstance(result, ScalarView)
+        assert type(result) is ScalarView
+
+
+class TestCruxEvalAcceptsViews:
+    """``crux.eval(view)`` and ``crux.eval([view, ...])`` should unwrap views."""
+
+    def test_eval_scalar_view(self):
+        import foundax
+
+        net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=4, num_layers=2, key=jax.random.PRNGKey(0)))
+        dom = jno.domain.rect(mesh_size=0.5)
+        x, y, _ = dom.variable("interior")
+        u = net(x, y)
+        crux = jno.core([u.mse], dom)
+        # No solve() — just verify eval accepts a ScalarView
+        sv = u.scalar
+        out = crux.eval(sv)  # single ScalarView
+        assert out is not None
+
+        # And as part of a list
+        outs = crux.eval([sv, u])
+        assert len(outs) == 2

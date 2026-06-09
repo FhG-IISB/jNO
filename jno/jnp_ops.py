@@ -296,6 +296,21 @@ def concatenate(items, axis: int = -1) -> FunctionCall:
     return concat(items, axis=axis)
 
 
+def vector(*components):
+    """Build a :class:`VectorView` directly from scalar component Placeholders.
+
+    Equivalent to ``VectorView(concat([*components]))`` but skips the manual
+    list and the ``.vector`` re-wrap step::
+
+        n    = jno.np.vector(nx, ny)          # 2-D normal as VectorView
+        flux = jno.np.vector(jx, jy, jz)      # 3-D current density
+        prob = jno.np.vector(x * p, y * p)    # OU drift flux
+    """
+    from .trace.views import VectorView
+
+    return VectorView(concat(list(components)))
+
+
 def stack(items, axis: int = 0) -> FunctionCall:
     """Stack placeholders along a new axis."""
     if axis == -1:

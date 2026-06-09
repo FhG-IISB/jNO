@@ -64,8 +64,9 @@ net.optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.5, end_value=1e-5))
 p = net(x, y)  # probability density field
 
 # ── Fokker-Planck residual ─────────────────────────────────────────────────────
-# drift term:  ∂(xp)/∂x + ∂(yp)/∂y
-drift = (x * p).d(x) + (y * p).d(y)
+# Probability flux j = (xp, yp); drift = ∇·j
+prob_flux = jno.np.vector(x * p, y * p)  # VectorView built directly from components
+drift = prob_flux.div(x, y)  # ∂(xp)/∂x + ∂(yp)/∂y
 # diffusion term:  ½ ∆p
 diff = 0.5 * jno.np.laplacian(p, [x, y])
 fp = drift + diff  # residual = 0

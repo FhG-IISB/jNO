@@ -25,6 +25,8 @@ from ..jnp_ops import concat
 from . import FunctionCall, Placeholder
 
 _VIEW_TYPES: tuple = ()  # filled at end of module
+_NAMED_PARTIALS_CLS_FOR: dict = {}  # filled at end of module: type(view) → Named<View>WithPartials
+_MAX_PARTIAL_ORDER = 4
 
 
 def _unwrap(other):
@@ -32,6 +34,58 @@ def _unwrap(other):
     if isinstance(other, _VIEW_TYPES):
         return other._expr
     return other
+
+
+def _parse_partial_sequence(key: str, coord_vars: dict) -> list | None:
+    """Parse ``key`` as a sequence of registered coord names (≤ 4 names).
+
+    Two parsing regimes, chosen by inspecting the registered names:
+      * **all single-char names** → concatenated form (``xy``, ``xxx``, ``txyt``).
+      * **any multi-char name**  → underscore-separated form (``r_theta``).
+
+    Returns the ordered list of names if parseable as 1..MAX_PARTIAL_ORDER
+    names, else ``None`` (so ``__getattr__`` can fall through).
+    """
+    names = set(coord_vars)
+    if not names:
+        return None
+    if all(len(n) == 1 for n in names):
+        seq = list(key)
+    else:
+        seq = key.split("_")
+    if 1 <= len(seq) <= _MAX_PARTIAL_ORDER and all(s in names for s in seq):
+        return seq
+    return None
+
+
+def _coords_dispatch(view_self, args: tuple, named_vars: dict, *, positional_factory=None):
+    """Shared dispatch logic for ``ScalarView.coords``, ``VectorView.coords``, etc.
+
+    * ``coords(**vars)`` (kwargs) → partial-derivative wrapper (all views).
+    * ``coords(*strings)`` / ``coords([strings])`` (positional) → component /
+      element-access wrapper. Only valid where ``positional_factory`` is
+      provided (currently ``MatrixView`` and ``VectorView``).
+    * Mixing kwargs with positional strings raises ``TypeError``.
+    """
+    if named_vars and args:
+        raise TypeError("coords() expects either kwargs (name=Variable) or positional names, not both")
+    if named_vars:
+        cls = _NAMED_PARTIALS_CLS_FOR[type(view_self)]
+        return cls(view_self._expr, named_vars)
+    if args:
+        if positional_factory is None:
+            raise TypeError(
+                f"{type(view_self).__name__}.coords() expects kwargs (name=Variable); "
+                "positional string names are only supported on VectorView and MatrixView"
+            )
+        # Allow both coords(["x", "y"]) and coords("x", "y")
+        if len(args) == 1 and isinstance(args[0], (list, tuple)):
+            args = tuple(args[0])
+        # Backward-compat: if non-string objects are passed (e.g. Variables),
+        # fall back to their ``tag`` attribute or ``str(...)`` representation.
+        resolved = tuple(n if isinstance(n, str) else getattr(n, "tag", str(n)) for n in args)
+        return positional_factory(view_self._expr, resolved)
+    raise TypeError("coords() requires at least one argument (kwargs or positional names)")
 
 
 # ---------------------------------------------------------------------------
@@ -62,6 +116,21 @@ class ScalarView:
         if name.startswith("_"):
             raise AttributeError(name)
         return getattr(object.__getattribute__(self, "_expr"), name)
+
+    def integrate(self, **kwargs) -> "ScalarView":
+        """Integrate the underlying scalar, preserving the ScalarView type."""
+        return ScalarView(self._expr.integrate(**kwargs))
+
+    def coords(self, *args, **named_vars):
+        """Bind coordinate Variables for derivative-by-name access.
+
+        ``u.scalar.coords(x=x_var, y=y_var).x`` → ScalarView of ``∂u/∂x``;
+        ``.xy`` is the mixed second derivative; up to 4th order.
+        Convenience methods that auto-fill registered coord vars are also
+        available — ``.grad()`` returns the full gradient, ``.laplacian()``
+        returns Δu.
+        """
+        return _coords_dispatch(self, args, named_vars)
 
     # -- scalar operations --
     def abs(self) -> "ScalarView":
@@ -139,6 +208,20 @@ class VectorView:
             raise AttributeError(name)
         return getattr(object.__getattribute__(self, "_expr"), name)
 
+    def integrate(self, **kwargs) -> "VectorView":
+        """Component-wise integral, preserving VectorView type."""
+        return VectorView(self._expr.integrate(**kwargs))
+
+    def coords(self, *args, **named_vars):
+        """Two forms.
+
+        * ``v.coords(x=x_var, y=y_var)`` (kwargs) → partial-derivative wrapper.
+          ``v.x`` returns a ``VectorView`` of ``∂v/∂x`` (component-wise partial).
+        * ``v.coords("x", "y")`` or ``v.coords(["x", "y"])`` (positional strings)
+          → component-access wrapper. ``v.x`` returns ``ScalarView`` of v[..., 0].
+        """
+        return _coords_dispatch(self, args, named_vars, positional_factory=NamedVectorView)
+
     # -- component access --
     def _c(self, i: int) -> "ScalarView":
         return ScalarView(self._expr[..., i])
@@ -210,6 +293,30 @@ class VectorView:
             )
         )
 
+    def jacobian(self, *vars) -> "MatrixView":
+        """Full Jacobian ``∂u_i/∂x_j`` of this vector field → MatrixView.
+
+        Stacks ``self._expr.d(v)`` for each variable along a new last axis,
+        so for an ``[..., n]`` vector and ``m`` variables the result is
+        ``[..., n, m]`` with ``J[..., i, j] = ∂u_i/∂x_j``.
+        """
+        cols = [self._expr.d(v) for v in vars]
+        return MatrixView(
+            FunctionCall(
+                lambda *cs: jnp.stack(cs, axis=-1),
+                cols,
+                "jacobian",
+            )
+        )
+
+    def grad(self, *vars) -> "MatrixView":
+        """Spatial gradient of a vector field = Jacobian → MatrixView.
+
+        Alias for :meth:`jacobian` so that ``vec.grad(x, y)`` mirrors the
+        scalar ``u.grad(x, y) → VectorView`` pattern in dimension.
+        """
+        return self.jacobian(*vars)
+
     # -- arithmetic --
     def __add__(self, other):
         return VectorView(self._expr + _unwrap(other))
@@ -234,6 +341,9 @@ class VectorView:
 
     def __truediv__(self, other):
         return VectorView(self._expr / _unwrap(other))
+
+    def __rtruediv__(self, other):
+        return VectorView(_unwrap(other) / self._expr)
 
     def __matmul__(self, other):
         """``v @ A`` (row-vec times matrix) → VectorView; ``v @ w`` → Placeholder dot."""
@@ -271,6 +381,18 @@ class ComplexView:
         if name.startswith("_"):
             raise AttributeError(name)
         return getattr(object.__getattribute__(self, "_expr"), name)
+
+    def integrate(self, **kwargs) -> "ComplexView":
+        """Component-wise integral of the [re, im] split, preserving ComplexView."""
+        return ComplexView(self._expr.integrate(**kwargs))
+
+    def coords(self, *args, **named_vars):
+        """Bind coordinate Variables for partial-derivative-by-name access.
+
+        ``ψ.complex.coords(x=x_var, y=y_var).x`` → ComplexView of ``∂ψ/∂x`` —
+        the partial is taken element-wise across the ``[re, im]`` split.
+        """
+        return _coords_dispatch(self, args, named_vars)
 
     @property
     def real(self) -> "ScalarView":
@@ -340,6 +462,9 @@ class ComplexView:
     def __truediv__(self, other):
         return ComplexView(self._expr / _unwrap(other))
 
+    def __rtruediv__(self, other):
+        return ComplexView(_unwrap(other) / self._expr)
+
 
 # ---------------------------------------------------------------------------
 # MatrixView
@@ -367,6 +492,10 @@ class MatrixView:
         if name.startswith("_"):
             raise AttributeError(name)
         return getattr(object.__getattribute__(self, "_expr"), name)
+
+    def integrate(self, **kwargs) -> "MatrixView":
+        """Element-wise integral, preserving MatrixView type."""
+        return MatrixView(self._expr.integrate(**kwargs))
 
     # ------------------------------------------------------------------
     # Basic matrix operations
@@ -515,14 +644,16 @@ class MatrixView:
 
         return FunctionCall(_fn, [self._expr], "to_lower_tri")
 
-    def coords(self, names) -> "NamedMatrixView":
-        """Attach coordinate labels for named component access.
+    def coords(self, *args, **named_vars):
+        """Two forms.
 
-        ``A.coords(["x", "y"]).xy`` → ScalarView of ``A[..., 0, 1]``.
-        Multi-char names use underscore: ``A.coords(["r", "theta"]).r_theta``.
+        * ``A.coords(["x", "y"])`` or ``A.coords("x", "y")`` (positional strings)
+          → element-access wrapper :class:`NamedMatrixView`; ``A.xy`` returns
+          ``ScalarView`` of ``A[..., 0, 1]``.
+        * ``A.coords(x=x_var, y=y_var)`` (kwargs) → partial-derivative wrapper;
+          ``A.x`` returns ``MatrixView`` of ``∂A/∂x_var`` (element-wise partial).
         """
-        resolved = [n if isinstance(n, str) else getattr(n, "tag", str(n)) for n in names]
-        return NamedMatrixView(self._expr, resolved)
+        return _coords_dispatch(self, args, named_vars, positional_factory=NamedMatrixView)
 
     # ------------------------------------------------------------------
     # Arithmetic
@@ -551,6 +682,9 @@ class MatrixView:
 
     def __truediv__(self, other):
         return MatrixView(self._expr / _unwrap(other))
+
+    def __rtruediv__(self, other):
+        return MatrixView(_unwrap(other) / self._expr)
 
     def __pow__(self, n):
         """Elementwise power. For matrix power use ``.pow(n)``."""
@@ -643,6 +777,18 @@ class VoigtView:
         if name.startswith("_"):
             raise AttributeError(name)
         return getattr(object.__getattribute__(self, "_expr"), name)
+
+    def integrate(self, **kwargs) -> "VoigtView":
+        """Component-wise integral over the Voigt-packed tensor → VoigtView."""
+        return VoigtView(self._expr.integrate(**kwargs))
+
+    def coords(self, *args, **named_vars):
+        """Bind coordinate Variables for partial-derivative-by-name access.
+
+        ``σ.voigt.coords(x=x_var, y=y_var).x`` → VoigtView of ``∂σ/∂x`` —
+        the partial is taken component-wise across the Voigt packing.
+        """
+        return _coords_dispatch(self, args, named_vars)
 
     # ------------------------------------------------------------------
     # Invariants and physics-style operations
@@ -791,9 +937,125 @@ class VoigtView:
     def __truediv__(self, other):
         return VoigtView(self._expr / _unwrap(other))
 
+    def __rtruediv__(self, other):
+        return VoigtView(_unwrap(other) / self._expr)
+
+
+# ---------------------------------------------------------------------------
+# NamedVectorView — positional component access (mirrors NamedMatrixView)
+# ---------------------------------------------------------------------------
+
+
+class NamedVectorView(VectorView):
+    """VectorView with string-labelled components.
+
+    Created by :meth:`VectorView.coords` with positional string arguments.
+    Attribute access selects a component::
+
+        v = velocity.vector.coords("x", "y")   # VectorView → NamedVectorView
+        v.x   # ScalarView of v[..., 0]
+        v.y   # ScalarView of v[..., 1]
+
+    For partial-derivative-by-name semantics use the keyword form
+    :meth:`VectorView.coords` with Variables — that returns a
+    ``NamedVectorViewWithPartials`` instead.
+    """
+
+    def __init__(self, expr: Placeholder, names) -> None:
+        super().__init__(expr)
+        object.__setattr__(self, "_names", tuple(names))
+
+    def __getattr__(self, key: str):
+        if key.startswith("_"):
+            raise AttributeError(key)
+        names = object.__getattribute__(self, "_names")
+        if key in names:
+            return ScalarView(self._expr[..., names.index(key)])
+        return getattr(object.__getattribute__(self, "_expr"), key)
+
+    def component(self, name: str) -> "ScalarView":
+        """Explicit component lookup by name."""
+        i = self._names.index(name)
+        return ScalarView(self._expr[..., i])
+
+
+# ---------------------------------------------------------------------------
+# Named<View>WithPartials — partial-derivative-by-name (kwargs form)
+# ---------------------------------------------------------------------------
+
+
+def _make_named_with_partials_cls(view_cls):
+    """Build a Named<view_cls>WithPartials class.
+
+    Records ``{name: Variable}`` bindings, and resolves attribute access
+    against sequences of registered names (up to 4th order) by chaining
+    ``self._expr.d(var)`` and wrapping the result in ``view_cls``.
+    """
+
+    class NamedWithPartials(view_cls):
+        _base_view = view_cls
+
+        def __init__(self, expr, coord_vars: dict) -> None:
+            view_cls.__init__(self, expr)
+            object.__setattr__(self, "_coord_vars", dict(coord_vars))
+
+        def __getattr__(self, key: str):
+            if key.startswith("_"):
+                raise AttributeError(key)
+            cv = object.__getattribute__(self, "_coord_vars")
+            seq = _parse_partial_sequence(key, cv)
+            if seq is not None:
+                result = self._expr
+                for name in seq:
+                    result = result.d(cv[name])
+                return type(self)._base_view(result)
+            return getattr(object.__getattribute__(self, "_expr"), key)
+
+        # -- convenience overrides that auto-fill the registered coord vars --
+
+        def grad(self, *vars):
+            """Spatial gradient — uses registered coords if no args given."""
+            cv = object.__getattribute__(self, "_coord_vars")
+            if not vars:
+                names = tuple(cv.keys())
+                vars_used = tuple(cv.values())
+                from ..jnp_ops import concat
+
+                inner = concat([self._expr.d(v) for v in vars_used])
+                return NamedVectorViewWithPartials(inner, dict(zip(names, vars_used)))
+            return view_cls.grad(self, *vars)  # delegate to base view's grad
+
+        def laplacian(self, *vars):
+            """Δself — uses registered coords if no args given."""
+            cv = object.__getattribute__(self, "_coord_vars")
+            vars_used = vars or tuple(cv.values())
+            return ScalarView(self._expr.laplacian(*vars_used))
+
+    NamedWithPartials.__name__ = f"Named{view_cls.__name__}WithPartials"
+    NamedWithPartials.__qualname__ = NamedWithPartials.__name__
+    return NamedWithPartials
+
+
+NamedScalarViewWithPartials = _make_named_with_partials_cls(ScalarView)
+NamedVectorViewWithPartials = _make_named_with_partials_cls(VectorView)
+NamedComplexViewWithPartials = _make_named_with_partials_cls(ComplexView)
+NamedMatrixViewWithPartials = _make_named_with_partials_cls(MatrixView)
+NamedVoigtViewWithPartials = _make_named_with_partials_cls(VoigtView)
+
 
 # Populate the tuple now that all classes exist (used by _unwrap()).
 _VIEW_TYPES = (ScalarView, VectorView, ComplexView, MatrixView, VoigtView)
+
+# Dispatch table used by `_coords_dispatch` to pick the Named<View>WithPartials
+# wrapper for each base view type.
+_NAMED_PARTIALS_CLS_FOR = {
+    ScalarView: NamedScalarViewWithPartials,
+    VectorView: NamedVectorViewWithPartials,
+    ComplexView: NamedComplexViewWithPartials,
+    MatrixView: NamedMatrixViewWithPartials,
+    VoigtView: NamedVoigtViewWithPartials,
+}
+
 
 __all__ = [
     "ScalarView",
@@ -801,5 +1063,11 @@ __all__ = [
     "ComplexView",
     "MatrixView",
     "NamedMatrixView",
+    "NamedVectorView",
     "VoigtView",
+    "NamedScalarViewWithPartials",
+    "NamedVectorViewWithPartials",
+    "NamedComplexViewWithPartials",
+    "NamedMatrixViewWithPartials",
+    "NamedVoigtViewWithPartials",
 ]

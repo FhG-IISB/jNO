@@ -19,7 +19,9 @@ dimension and resolve to the outward unit normal components at the boundary
 mesh nodes.  They are valid inside any ``.integrate()`` expression:
 
     x_b, y_b, _, nx, ny = domain.variable("boundary", normals=True)
-    flux = (u.d(x_b) * nx + u.d(y_b) * ny).integrate()   # ∫_∂Ω ∇u · n dS
+    grad_u = u.grad(x_b, y_b)                  # VectorView of ∇u at the boundary
+    n      = jno.np.vector(nx, ny)             # VectorView of the outward normal
+    flux   = grad_u.dot(n).integrate()         # ∫_∂Ω ∇u · n dS
 
 This is the 2-D analogue of the 1-D endpoint formula u'(1) − u'(0).
 
@@ -81,7 +83,9 @@ history = crux.solve(EPOCHS)
 # Volume integral:   ∫_Ω Δu dΩ
 # Boundary flux:     ∫_∂Ω ∇u · n dS   (should equal volume integral by Gauss)
 volume_laplacian = u.laplacian(x, y).integrate()
-boundary_flux = (u_bnd.d(x_b) * nx + u_bnd.d(y_b) * ny).integrate()
+grad_u_bnd = u_bnd.grad(x_b, y_b)  # VectorView of ∇u at the boundary
+normal = jno.np.vector(nx, ny)  # VectorView of outward normal
+boundary_flux = grad_u_bnd.dot(normal).integrate()
 
 vol_val, flux_val = crux.eval([volume_laplacian, boundary_flux])
 vol_s = float(jnp.squeeze(vol_val))

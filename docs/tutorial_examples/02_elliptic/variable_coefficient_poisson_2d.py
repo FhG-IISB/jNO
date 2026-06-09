@@ -35,9 +35,8 @@ net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=80, num_layers=5, key=j
 net.optimizer(optax.adam(optax.exponential_decay(init_value=1e-3, transition_steps=80, decay_rate=0.5, end_value=1e-5)))
 
 u = net(x, y) * x * (1 - x) * y * (1 - y)
-flux_x = kappa * u.d(x)
-flux_y = kappa * u.d(y)
-pde = -jno.np.divergence([flux_x, flux_y], [x, y]) - forcing
+flux = kappa * u.grad(x, y)  # Placeholder * VectorView → VectorView
+pde = -flux.div(x, y) - forcing
 
 crux = jno.core([pde.mse], domain)
 history = crux.solve(40000)
