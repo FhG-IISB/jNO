@@ -1,14 +1,4 @@
-"""05 — Inverse parameter identification
-
-Problem
--------
-Given the 1-D model
-
-    a · sin(πx) + b · cos(πx) + c · x(1 − x) = d(x)
-
-recover the unknown scalars ``a, b, c`` from observations ``d(x)`` whose
-ground truth is generated with  A = 3.14, B = −2.71, C = 42.0.
-"""
+"""05 — Inverse parameter identification"""
 
 from pathlib import Path
 

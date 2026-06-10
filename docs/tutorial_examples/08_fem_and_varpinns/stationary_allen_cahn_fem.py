@@ -1,25 +1,4 @@
-"""
-02 - Stationary Allen-Cahn equation with nonlinear FEAX-FEM residual route
-
-Problem
--------
-    -eps^2 Δu + (u^3 - u) = 0      in Ω = [0, 1]^2
-
-Boundary conditions
--------------------
-    u = tanh((x - 0.5) / (sqrt(2) eps))  on x = 0 and x = 1
-
-Manufactured profile
---------------------
-    u(x, y) = tanh((x - 0.5) / (sqrt(2) eps))
-
-Showcases
----------
-- weak.assemble(target="fem_residual")
-- FemResidualOperator
-- residual_fn(u), jacobian_fn(u)
-- external nonlinear solve using scipy.optimize.root
-"""
+"""02 - Stationary Allen-Cahn equation with nonlinear FEAX-FEM residual route"""
 
 import jax.numpy as jnp
 import numpy as np

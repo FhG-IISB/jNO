@@ -1,24 +1,4 @@
-"""06 — Integral constraints and flux monitoring (2-D Poisson)
-
-Problem
--------
-    −∇²u(x,y) = 2π² sin(πx) sin(πy),   (x,y) ∈ [0,1]²,   u = 0 on ∂Ω
-
-Analytical solution
--------------------
-    u(x,y) = sin(πx) sin(πy)
-
-This tutorial demonstrates how to use .integrate() for two distinct purposes:
-
-1. As a **tracker** — monitor the volume mean ∫_Ω u dA during training.
-   The exact value is 4/π² ≈ 0.405.  A network that only satisfies the zero
-   Dirichlet BC would give ∫ u = 0, so this metric reveals interior accuracy.
-
-2. As a **soft constraint** — enforce a prescribed integral value in the loss,
-   in addition to the PDE residual and boundary condition.
-
-Both uses are JIT-compatible and fully differentiable w.r.t. model parameters.
-"""
+"""06 — Integral constraints and flux monitoring (2-D Poisson)"""
 
 from pathlib import Path
 

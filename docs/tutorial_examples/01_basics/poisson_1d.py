@@ -1,18 +1,4 @@
-"""01 — 1-D Poisson equation (soft Dirichlet BCs + finite-difference Laplacian)
-
-Problem
--------
-    −u''(x) = sin(πx)   on [0, 1],    u(0) = u(1) = 0
-
-Analytical solution: u(x) = sin(πx) / π²
-
-Showcases
----------
-* Soft BCs via a separate ``boundary`` tag (loss term in ``jno.core``)
-* Finite-difference second derivative (``scheme="finite_difference"``)
-* ``.scalar.coords(x=x)`` registers the spatial variable so ``u.xx`` reads
-  the same as the math.
-"""
+"""01 — 1-D Poisson equation (soft Dirichlet BCs + finite-difference Laplacian)"""
 
 import foundax
 import jax

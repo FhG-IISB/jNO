@@ -1,20 +1,4 @@
-"""02 — 2-D variable-coefficient Poisson  (shapely domain + named partials + tracker)
-
-Problem
--------
-    −∇·(κ(x, y) ∇u(x, y)) = f(x, y)   on [0, 1]²,    u = 0 on ∂Ω
-
-with κ(x, y) = 1 + x + y and exact solution sin(πx) sin(πy).
-
-Showcases
----------
-* ``jno.domain(box(...))`` — shapely-backed geometry, ``mesh_size=`` triggers
-  meshing inline.
-* ``.scalar.coords(x=x, y=y)`` — registered partial-derivative names; ``.grad()``
-  uses them implicitly so ``κ * u.grad()`` reads as ``κ ∇u``.
-* ``jno.trackers.gradient_norms`` — per-loss ∇L₂ norms during training,
-  exposing the relative loss budgets for free.
-"""
+"""02 — 2-D variable-coefficient Poisson  (shapely domain + named partials + tracker)"""
 
 from pathlib import Path
 

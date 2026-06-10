@@ -1,17 +1,4 @@
-"""03 — 2-D heat equation with a PDEformer-2 backbone
-
-Problem
--------
-    ∂u/∂t = α ∇²u   on [0, 1]²,    u = 0 on ∂Ω,    u(x, y, 0) = sin(πx) sin(πy)
-
-Analytical: u(x, y, t) = exp(−2απ²t) sin(πx) sin(πy)
-
-PDEformer-2 was pre-trained on canonical PDE graphs. The standard PINN
-multiplicative ansatz (``net * x(1-x)y(1-y)``) is incompatible with the
-graph encoder (raw Variable(x), Variable(y) aren't in its vocabulary), so
-this tutorial uses **soft BCs** — the boundary residual is a separate loss
-term that the trainer minimises alongside the PDE residual.
-"""
+"""03 — 2-D heat equation with a PDEformer-2 backbone"""
 
 from pathlib import Path
 

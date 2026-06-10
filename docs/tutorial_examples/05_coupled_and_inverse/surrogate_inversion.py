@@ -1,25 +1,4 @@
-"""05 — Surrogate inversion: recover a hidden input from a frozen PINN
-
-Workflow
---------
-Phase 1 (forward): train a PINN that maps x → u(x).
-Phase 2 (inverse): freeze the PINN and optimise a trainable input parameter
-                   x_query so that u_net(x_query) matches an observation.
-
-Problem
--------
-    PDE: u'' + π²sin(πx) = 0,  u(0) = u(1) = 0   on [0, 1]
-    Exact solution: u(x) = sin(πx)
-
-    Given the measurement u_obs = sin(π · x_true), recover x_true.
-
-Why this matters
-----------------
-After training a forward PINN you have a cheap, differentiable surrogate of
-the PDE solution.  Passing a jno.np.parameter as its *input* turns the network
-into an inverse solver: gradient descent on the input space finds which input
-reproduces the observed output.
-"""
+"""05 — Surrogate inversion: recover a hidden input from a frozen PINN"""
 
 from pathlib import Path
 

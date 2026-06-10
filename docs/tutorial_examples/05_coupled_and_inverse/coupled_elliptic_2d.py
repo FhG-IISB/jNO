@@ -1,15 +1,4 @@
-"""05 — Coupled elliptic PDE system (manufactured solution)
-
-Problem
--------
-    −∇²u + v = f(x, y)   on [0, 1]²
-    −∇²v + u = g(x, y)
-    u = v = 0 on ∂Ω
-
-Manufactured solutions
-    u(x, y) = sin(πx) sin(πy)
-    v(x, y) = sin(2πx) sin(πy)
-"""
+"""05 — Coupled elliptic PDE system (manufactured solution)"""
 
 import foundax
 import jax

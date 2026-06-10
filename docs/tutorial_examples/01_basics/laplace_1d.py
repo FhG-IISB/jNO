@@ -1,15 +1,4 @@
-"""01 — 1-D Laplace equation (simplest possible PINN)
-
-Problem
--------
-    u''(x) = 0   on [0, 1],    u(0) = 0,  u(1) = 1
-
-Analytical solution: u(x) = x
-
-Techniques shown
-* Non-homogeneous hard-Dirichlet ansatz  ``u = x + x(1-x)·net(x)``
-* Named-partial syntax via ``.bind(x=x)`` so ``u.xx`` reads as the residual.
-"""
+"""01 — 1-D Laplace equation (simplest possible PINN)"""
 
 import foundax
 import jax

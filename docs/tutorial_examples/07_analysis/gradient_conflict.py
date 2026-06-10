@@ -1,19 +1,4 @@
-"""07 — Gradient and sensitivity analysis with u.grad(net)
-
-Problem
--------
-    −u''(x) = sin(πx),   x ∈ [0, 1],   u(0) = u(1) = 0
-
-Exact solution
---------------
-    u(x) = sin(πx) / π²
-
-Techniques shown
-----------------
-* Cosine similarity between left/right domain halves as a .tracker() during training
-* Sparse-mask Jacobian via  net.mask(bool_pytree)  for fast in-training monitoring
-* Post-training: full Jacobian, Neural Tangent Kernel, eigenspectrum
-"""
+"""07 — Gradient and sensitivity analysis with u.grad(net)"""
 
 import equinox as eqx
 import foundax

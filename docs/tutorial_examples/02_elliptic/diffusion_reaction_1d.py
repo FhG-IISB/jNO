@@ -1,12 +1,4 @@
-"""02 — 1-D diffusion-reaction equation (steady)
-
-Problem
--------
-    −u''(x) + σ u(x) = f(x)   on [0, 1],    u(0) = u(1) = 0
-
-Manufactured solution:  u(x) = sin(πx)
-Forcing:                f(x) = (π² + σ) sin(πx)
-"""
+"""02 — 1-D diffusion-reaction equation (steady)"""
 
 import foundax
 import jax

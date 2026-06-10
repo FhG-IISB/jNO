@@ -1,30 +1,4 @@
-"""02 — Bayesian PINN inverse problem: multi-coefficient regression
-
-Problem
--------
-Recover two coefficients (A, B) of a parametric model
-
-    d(x) = A · sin(πx) + B · cos(πx),     truth: A = 3.14, B = -2.71
-
-from observations of ``d``.  Each scalar parameter is *sampled* with NUTS
-rather than point-optimised, so we get a posterior mean *and* a credible
-interval.
-
-This is the purest demonstration of jno's per-parameter ``.bayesian()``
-configurator: every scalar carries its own kernel, no PDE residual is
-involved, and ``solve()`` dispatches per-parameter automatically.  Once
-this works, swapping the parametric model for a PDE residual (see the
-later tutorials in this section) follows the same recipe.
-
-References
-----------
-Hoffman, M. D., & Gelman, A. (2014).  *The No-U-Turn Sampler: Adaptively
-Setting Path Lengths in Hamiltonian Monte Carlo.*  JMLR 15(1), 1593-1623.
-
-Yang, L., Meng, X., & Karniadakis, G. E. (2021).  *B-PINNs: Bayesian
-physics-informed neural networks for forward and inverse PDE problems
-with noisy data.*  Journal of Computational Physics, 425, 109913.
-"""
+"""02 — Bayesian PINN inverse problem: multi-coefficient regression"""
 
 from pathlib import Path
 

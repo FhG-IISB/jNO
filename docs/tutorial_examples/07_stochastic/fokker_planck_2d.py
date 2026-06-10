@@ -1,23 +1,4 @@
-"""07 — 2-D Fokker–Planck on a disc  (shapely + RAD resampling + residual tracker)
-
-Stochastic process (Itô SDE)
-    dX = −X dt + dW₁ ,    dY = −Y dt + dW₂
-
-Steady-state Fokker–Planck PDE
-    ∂(x p)/∂x + ∂(y p)/∂y + ½ ∆p = 0   on the disc of radius 3,    p ≈ 0 on ∂Ω
-
-Analytical stationary distribution
-    p∞(x, y) = (1/π) exp(−x² − y²)
-
-Showcases
----------
-* ``jno.domain(Point(...).buffer(r))`` — non-rectangular shapely disc, meshed
-  inline via ``mesh_size=``.
-* ``jno.np.vector(...).div(x, y)`` — drift flux as a typed VectorView.
-* ``jno.trackers.residual_stats`` — per-constraint mean/std/max residuals so
-  the user can spot loss imbalance during training.
-* ``jno.noise.gaussian`` — fresh boundary-observation noise each epoch.
-"""
+"""07 — 2-D Fokker–Planck on a disc  (shapely + RAD resampling + residual tracker)"""
 
 from pathlib import Path
 

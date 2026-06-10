@@ -132,14 +132,24 @@ def _infer_domain_from_constraints(constraints: List[Placeholder]):
             if d is not None and id(d) not in seen_domains:
                 seen_domains.add(id(d))
                 domains.append(d)
-        for attr in ("target", "left", "right", "expr", "operation"):
-            child = getattr(node, attr, None)
-            if isinstance(child, Placeholder):
-                visit(child)
-        for attr in ("args", "variables", "options"):
-            for child in getattr(node, attr, []):
-                if isinstance(child, Placeholder):
-                    visit(child)
+        # Generic descent: visit every instance attribute that holds a
+        # Placeholder (or a list/dict of them).  This covers GroupedAssembly
+        # and any future Placeholder subclass without enumerating attr names.
+        try:
+            attr_vals = vars(node).values()
+        except TypeError:
+            return
+        for v in attr_vals:
+            if isinstance(v, Placeholder):
+                visit(v)
+            elif isinstance(v, (list, tuple)):
+                for item in v:
+                    if isinstance(item, Placeholder):
+                        visit(item)
+            elif isinstance(v, dict):
+                for item in v.values():
+                    if isinstance(item, Placeholder):
+                        visit(item)
 
     for expr in constraints:
         visit(expr)

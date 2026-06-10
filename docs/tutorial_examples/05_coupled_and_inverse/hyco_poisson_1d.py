@@ -1,25 +1,4 @@
-"""05 — HyCo: Hybrid-Cooperative Learning for PINNs (1-D Poisson)
-
-Based on Liverani, Steynberg & Zuazua (2025) — arXiv:2509.14123.
-
-Idea
-----
-Train two networks that cooperate via a shared interaction loss:
-  * **u_phy** — physical model, enforces the PDE residual
-  * **u_syn** — synthetic model, fits sparse noisy sensor observations
-
-Both models are encouraged to agree at interior collocation points via a
-mutual alignment term, with ``.stop_gradient`` blocking cross-talk in
-the optimiser updates. Alternating updates are expressed through ``substeps``:
-each outer epoch runs one ``u_phy`` step followed by one ``u_syn`` step,
-each with its own Adam state.
-
-Problem
--------
-    u'' + π² sin(πx) = 0,    u(0) = u(1) = 0   on [0, 1]
-    Exact solution: u(x) = sin(πx)
-    Sensors: 7 noisy observations  (σ = 0.05)
-"""
+"""05 — HyCo: Hybrid-Cooperative Learning for PINNs (1-D Poisson)"""
 
 from pathlib import Path
 

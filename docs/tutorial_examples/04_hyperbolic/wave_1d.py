@@ -1,12 +1,4 @@
-"""04 — 1-D wave equation
-
-Problem
--------
-    ∂²u/∂t² = c² ∂²u/∂x²   on [0, 1],
-    u(0, t) = u(1, t) = 0,    u(x, 0) = sin(πx),    u_t(x, 0) = 0
-
-Analytical solution:  u(x, t) = cos(cπt) sin(πx)  (standing wave).
-"""
+"""04 — 1-D wave equation"""
 
 import foundax
 import jax

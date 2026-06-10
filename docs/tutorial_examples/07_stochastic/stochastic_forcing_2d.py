@@ -1,43 +1,4 @@
-"""07 — 2-D Poisson equation with stochastic forcing
-
-Problem
--------
-    −∆u(x,y) = f(x,y) + σ·ξ(x,y),   (x,y) ∈ [0,1]²,   u = 0 on ∂Ω
-
-where f(x,y) = 2π² sin(πx) sin(πy) is a known deterministic forcing and
-ξ(x,y) ~ N(0,1) is a pointwise Gaussian noise field with amplitude σ = 0.5.
-
-This models a PDE driven by an uncertain or turbulent source term — only the
-mean forcing f is known exactly; the fluctuation σ·ξ represents aleatory
-uncertainty that is freshly realised at every training step.
-
-Mean-field solution
--------------------
-    u*(x,y) = sin(πx) sin(πy)
-
-Why the stochastic PINN recovers the deterministic solution
------------------------------------------------------------
-The MSE loss at step k is
-
-    L_k(θ) = mean_x [ −∆u_θ − f − σ ξ_k ]²
-
-Expanding the square and taking the expectation over the i.i.d. noise ξ_k:
-
-    E[L_k(θ)] = mean_x(−∆u_θ − f)² + σ²
-
-The noise contributes only a constant σ² that is independent of θ.
-Therefore the minimiser of E[L_k] is identical to the minimiser of the
-deterministic MSE, and the network converges to u*(x,y) = sin(πx) sin(πy)
-despite seeing a different noisy residual at every epoch.
-
-Techniques shown
-----------------
-* jno.noise.gaussian() on the PDE interior residual — noise on the physics,
-  not the boundary
-* Hard Dirichlet BCs via the x(1−x)y(1−y) ansatz so no boundary loss is needed
-* Noise is resampled automatically from the solver's PRNG every step —
-  fully reproducible when the seed is fixed via jno.setup(seed=...)
-"""
+"""07 — 2-D Poisson equation with stochastic forcing"""
 
 from pathlib import Path
 

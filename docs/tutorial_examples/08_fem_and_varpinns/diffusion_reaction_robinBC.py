@@ -1,29 +1,4 @@
-"""
-03 - 2D reaction-diffusion equation with Robin BCs: FEAX-FEM + VPINN
-
-Problem
--------
-    -Δu + sigma u = f       in Ω = [0, 1]^2
-
-Boundary conditions
--------------------
-    u = y                  on x = 0
-    u = 0                  on y = 0
-
-    du/dn + alpha_right u = r_right   on x = 1
-    du/dn + alpha_top   u = r_top     on y = 1
-
-Manufactured solution
----------------------
-    u(x, y) = x sin(pi y) + y
-
-Showcases
----------
-- mixed Dirichlet + Robin weak form
-- FEAX-FEM linear system route
-- VPINN weak-form route
-- hard Dirichlet ansatz for VPINN
-"""
+"""03 - 2D reaction-diffusion equation with Robin BCs: FEAX-FEM + VPINN"""
 
 import os
 
@@ -200,7 +175,7 @@ u_int = apply_hard_bc(net(x_int, y_int), x_int, y_int)
 
 pde = weak_vpinn.assemble(train_domain, u_net=u_gauss, target="vpinn")
 
-crux = jno.core(constraints=[pde.mse], domain=train_domain)
+crux = jno.core(constraints=[pde.mse])
 
 net.optimizer(
     optax.adam(

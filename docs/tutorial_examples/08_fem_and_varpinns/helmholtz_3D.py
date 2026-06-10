@@ -1,29 +1,4 @@
-"""
-3D F-domain showcase: FEAX-FEM + VPINN
-
-Problem
--------
-    -Δu + sigma u = f       in Ω
-
-Boundary conditions
--------------------
-    u = 0                   on bottom face z = 0
-    du/dn = g_top           on top face z = 1
-    du/dn = 0               on side walls
-
-Manufactured solution
----------------------
-    u(x, y, z) = z + alpha sin(pi z)
-
-Showcases
----------
-- complex 3D extruded F-shaped geometry
-- TET4 FEAX-FEM assembly
-- mixed Dirichlet + Neumann boundary conditions
-- weak.assemble(target="fem_system")
-- weak.assemble(target="vpinn")
-- VPINN on 3D geometry
-"""
+"""3D F-domain showcase: FEAX-FEM + VPINN"""
 
 import os
 
@@ -322,7 +297,7 @@ u_int = apply_hard_bottom_bc(net(x_int, y_int, z_int), x_int, y_int, z_int)
 
 pde = weak_vpinn.assemble(vpinn_domain, u_net=u_gauss, target="vpinn")
 
-crux = jno.core(constraints=[pde.mse], domain=vpinn_domain)
+crux = jno.core(constraints=[pde.mse])
 
 net.optimizer(
     optax.adam(

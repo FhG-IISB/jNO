@@ -1,15 +1,4 @@
-"""03 — 2-D reaction-diffusion equation with a PDEformer-2 backbone
-
-Problem
--------
-    ∂u/∂t = α ∇²u − λ u   on [0, 1]²,    u = 0 on ∂Ω,    u(x, y, 0) = sin(πx) sin(πy)
-
-Analytical: u(x, y, t) = exp(−(2απ² + λ)·t) · sin(πx) sin(πy)
-
-Soft BCs are required for the PDEformer-2 backbone (multiplicative ansatz
-would expand into raw Variable(x), Variable(y) nodes that aren't in the
-graph encoder's operator vocabulary).
-"""
+"""03 — 2-D reaction-diffusion equation with a PDEformer-2 backbone"""
 
 from pathlib import Path
 

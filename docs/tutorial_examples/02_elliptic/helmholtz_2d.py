@@ -1,12 +1,4 @@
-"""02 — 2-D Helmholtz equation
-
-Problem
--------
-    ∇²u(x, y) + k² u(x, y) = −f(x, y)   on [0, 1]²,    u = 0 on ∂Ω
-
-Manufactured solution:  u(x, y) = sin(πx) sin(πy)
-Forcing:                f(x, y) = (2π² − k²) sin(πx) sin(πy)
-"""
+"""02 — 2-D Helmholtz equation"""
 
 from pathlib import Path
 

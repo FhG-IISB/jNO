@@ -1,20 +1,4 @@
-"""01 - 1-D biharmonic equation (beam-like fourth-order problem)
-
-Problem
--------
-    u''''(x) = 24,   x in [0, 1]
-
-    u(0) = u(1) = 0,
-    u'(0) = u'(1) = 0   (clamped)
-
-Analytical solution
--------------------
-    u(x) = x²(1 − x)²
-
-The hard-enforced ansatz ``u = net(x) · x²(1 − x)²`` exactly satisfies the
-clamped BCs (both u and u' vanish at the endpoints), reducing the problem to
-learning a smooth correction factor on top of the boundary-respecting polynomial.
-"""
+"""01 - 1-D biharmonic equation (beam-like fourth-order problem)"""
 
 import foundax
 import jax

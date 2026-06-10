@@ -1,12 +1,4 @@
-"""04 — 1-D telegraph equation
-
-Problem
--------
-    u_tt + β u_t = c² u_xx + f(x, t)   on [0, 1],
-    u(0, t) = u(1, t) = 0,   u(x, 0) = sin(πx),   u_t(x, 0) = −sin(πx)
-
-Analytical solution:  u(x, t) = exp(−t) sin(πx)
-"""
+"""04 — 1-D telegraph equation"""
 
 import foundax
 import jax

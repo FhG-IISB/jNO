@@ -1,27 +1,4 @@
-"""11 — DeepONet 2D for parametric Poisson
-
-Problem
--------
-Parametric Poisson with a scalar diffusion coefficient
-    k Δu + 1 = 0   on [0, 2] × [0, 1],   u = 0 on ∂Ω,
-    k ~ U(0.5, 1.5)
-
-The operator learnt by the network maps k → u(·).  Hard boundary
-enforcement via the multiplicative ansatz removes the need for a
-separate boundary loss.
-
-Architecture
-------------
-foundax.deeponet uses the branch / trunk decomposition: the *branch*
-encodes the parameter (here the scalar k), the *trunk* encodes the
-query coordinates (x, y), and the network output is the inner product
-of the two.  This factorisation is cheap to train and works well for
-parametric PDEs with a scalar or low-dimensional parameter family.
-
-Reference: Lu et al., "DeepONet: Learning nonlinear operators for
-identifying differential equations based on the universal approximation
-theorem of operators", Nature Mach. Intell. 2021.
-"""
+"""11 — DeepONet 2D for parametric Poisson"""
 
 import foundax
 import jax

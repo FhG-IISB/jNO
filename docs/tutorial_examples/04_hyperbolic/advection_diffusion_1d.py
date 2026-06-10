@@ -1,12 +1,4 @@
-"""04 — 1-D advection-diffusion equation (manufactured solution)
-
-Problem
--------
-    ∂u/∂t + c ∂u/∂x = ν ∂²u/∂x² + f(x, t)   on [0, 1],
-    u(0, t) = u(1, t) = 0,   u(x, 0) = sin(πx)
-
-Analytical solution: u(x, t) = exp(−t) sin(πx)
-"""
+"""04 — 1-D advection-diffusion equation (manufactured solution)"""
 
 import foundax
 import jax

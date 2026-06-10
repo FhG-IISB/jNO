@@ -1,14 +1,4 @@
-"""02 — 2-D Poisson equation with mixed boundary conditions
-
-Problem
--------
-    −∇²u = f(x, y)   on [0, 1]²
-    u = 0            on x = 0 and x = 1   (hard Dirichlet via ansatz)
-    ∂u/∂y = 0        on y = 0 and y = 1   (soft Neumann loss)
-
-Manufactured solution:  u(x, y) = sin(πx) cos(πy)
-Forcing:                f(x, y) = 2π² sin(πx) cos(πy)
-"""
+"""02 — 2-D Poisson equation with mixed boundary conditions"""
 
 from pathlib import Path
 

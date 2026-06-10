@@ -1,11 +1,4 @@
-"""03 — 2-D reaction-diffusion equation
-
-Problem
--------
-    u_t − ν ∇²u + λ u = f(x, y, t)   on [0, 1]²,    u = 0 on ∂Ω
-
-Analytical solution: u(x, y, t) = exp(−t) sin(πx) sin(πy)
-"""
+"""03 — 2-D reaction-diffusion equation"""
 
 from pathlib import Path
 

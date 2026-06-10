@@ -1,15 +1,4 @@
-"""03 — 2-D Allen–Cahn equation (manufactured-solution verification)
-
-Problem
--------
-    ∂u/∂t = ε² ∇²u + u − u³ + f(x, y, t)   on [0, 1]²,   t ∈ [0, 1]
-
-Manufactured solution (homogeneous Dirichlet on ∂Ω built into the ansatz)
-    u(x, y, t) = e^{−t} sin(πx) sin(πy)
-
-Source by substitution
-    f = u_t − ε² ∇²u − u + u³
-"""
+"""03 — 2-D Allen–Cahn equation (manufactured-solution verification)"""
 
 import foundax
 import jax

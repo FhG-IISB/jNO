@@ -1,23 +1,4 @@
-"""06 — Boundary flux & the divergence theorem  (shapely + view-API dot product)
-
-Problem
--------
-    −∇²u(x, y) = f(x, y)   on the unit square,    u = 0 on ∂Ω
-
-Analytical
-----------
-    u(x, y) = sin(πx) sin(πy)
-    f(x, y) = 2π² sin(πx) sin(πy)
-    ∫_∂Ω ∇u · n dS  =  ∫_Ω Δu dΩ  =  −2π² · 4/π²  =  −8
-
-Showcases
----------
-* ``jno.domain(box(...), compute_mesh_connectivity=True)`` — shapely-backed
-  square with mesh connectivity required by integration / normals.
-* ``jno.np.vector(u.x, u.y).dot(jno.np.vector(nx, ny)).integrate()`` —
-  the boundary integral ∫_∂Ω ∇u · n dS reads as one line of code.
-* Boundary-normal Variables (``normals=True``) returned alongside coords.
-"""
+"""06 — Boundary flux & the divergence theorem  (shapely + view-API dot product)"""
 
 from pathlib import Path
 

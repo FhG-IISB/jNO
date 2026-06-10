@@ -1,42 +1,4 @@
-"""06 — Bayesian inverse with jNO-FEM as the differentiable forward
-
-Problem
--------
-2-D Poisson with an unknown scalar diffusivity ``α``:
-
-    -α Δu = f       in Ω = [0, 1]²
-        u = 0      on ∂Ω
-
-Manufactured ground truth:
-
-    u_exact(x, y) = x(1 - x) y(1 - y)
-    f(x, y)       = 2·α_true · [x(1 - x) + y(1 - y)]
-
-Given noisy observations of ``u`` at the FEM mesh nodes (under the true
-``α = 1``), recover the posterior over ``α``.
-
-Why this matters
-----------------
-The Bayesian inverse tutorials up to this point (`03`, `04`) used
-**closed-form** forward models (`exp(-kt)`, `sin(πx)/π²`).  Real
-engineering inverse problems rarely have closed forms — they have
-numerical PDE solvers.  This tutorial shows the pattern when the
-forward is the **FEAX-backed FEM solver** that jNO already exposes.
-
-Architecture
-------------
-* jNO's ``domain.init_fem`` + ``weak.assemble`` build the JAX-traceable
-  stiffness matrix ``A`` and load vector ``b``.  We solve the α = 1
-  problem once to get ``u_baseline``.
-* Because the diffusion term is **linear in α**, ``A(α) = α · A_base``
-  and therefore ``u(α) = u_baseline / α``.  We express the forward as a
-  jNO expression of the trainable ``α`` and a constant per-node
-  ``u_baseline`` array — so the whole loss flows through
-  ``crux.solve()`` with NUTS attached via ``.bayesian()``.
-* For nonlinear PDEs the scaling identity fails; you'd then need to
-  wrap the per-step ``assemble + linalg.solve`` in a jNO FunctionCall
-  placeholder.  Same architecture, just slower.
-"""
+"""06 — Bayesian inverse with jNO-FEM as the differentiable forward"""
 
 from pathlib import Path
 

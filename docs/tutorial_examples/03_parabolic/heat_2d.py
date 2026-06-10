@@ -1,12 +1,4 @@
-"""03 — 2-D heat equation (parabolic, time-dependent)
-
-Problem
--------
-    ∂u/∂t = α ∇²u   on [0, 1]²,    u = 0 on ∂Ω,    u(x, y, 0) = sin(πx) sin(πy)
-
-Analytical solution
-    u(x, y, t) = exp(−2απ²t) sin(πx) sin(πy)
-"""
+"""03 — 2-D heat equation (parabolic, time-dependent)"""
 
 from pathlib import Path
 

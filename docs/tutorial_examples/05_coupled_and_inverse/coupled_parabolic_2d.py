@@ -1,16 +1,4 @@
-"""05 — Coupled parabolic system in 2-D
-
-Problem
--------
-    u_t − ∇²u + v = f(x, y, t)
-    v_t − ∇²v + u = g(x, y, t)
-
-on [0, 1]² with homogeneous Dirichlet BCs.
-
-Analytical
-    u(x, y, t) = exp(−t) sin(πx) sin(πy)
-    v(x, y, t) = exp(−t) sin(2πx) sin(πy)
-"""
+"""05 — Coupled parabolic system in 2-D"""
 
 from pathlib import Path
 

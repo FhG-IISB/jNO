@@ -1,16 +1,4 @@
-"""02 — 2-D Poisson equation  (AD vs finite-difference comparison)
-
-Problem
--------
-    −∇²u(x,y) = 2π² sin(πx) sin(πy),   (x,y) ∈ [0,1]²,   u = 0 on ∂Ω
-
-Analytical solution
--------------------
-    u(x,y) = sin(πx) sin(πy)
-
-Both automatic differentiation (AD) and finite-difference (FD) Laplacians are
-used for the same network architecture so the results can be compared directly.
-"""
+"""02 — 2-D Poisson equation  (AD vs finite-difference comparison)"""
 
 from pathlib import Path
 

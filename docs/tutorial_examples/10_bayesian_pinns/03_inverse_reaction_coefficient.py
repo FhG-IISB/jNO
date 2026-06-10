@@ -1,41 +1,4 @@
-"""03 — Bayesian inverse: recover nonlinear reaction coefficient k
-
-Problem (Yang et al. 2021, §3.3.1, steady-state form)
------------------------------------------------------
-    λ u''(x) + k · tanh(u(x)) = f(x),   x ∈ [-0.7, 0.7],   λ = 0.01,
-
-with Dirichlet boundary conditions matching the analytical reference
-
-    u_exact(x) = sin(πx) / π² ,
-
-from which ``f`` is generated under the **true** value ``k_true = 0.7``.
-Given noisy observations of the forcing ``f(x)`` plus knowledge of the
-solution ``u(x)``, recover the posterior over ``k``.
-
-Why no neural surrogate?
-------------------------
-This tutorial deliberately avoids a PINN surrogate.  In a mixed-mode
-B-PINN (optax-trained surrogate + NUTS-sampled coefficient), the kernel
-sees a moving-target logdensity because the surrogate shifts every
-step.  That isn't proper MCMC on a fixed posterior, and the chain
-becomes brittle to hyperparameters.
-
-Here ``u(x)`` is known analytically, so we plug ``u_exact`` directly
-into the PDE-residual likelihood.  NUTS samples a **fixed-target**
-posterior; hyperparameters affect chain efficiency only.
-
-When ``u`` is **not** known analytically (e.g. a real PDE solve), use
-the *two-stage* pattern via ``substeps=[([0, 1], 20), ([2], 1)]``:
-substep 0 trains a surrogate from data, substep 1 samples ``k`` against
-the PDE residual with ``surrogate.stop_gradient``.  See
-``docs/training/bayesian.md`` for the trade-offs.
-
-Reference
----------
-Yang, L., Meng, X., & Karniadakis, G. E. (2021).  *B-PINNs: Bayesian
-physics-informed neural networks for forward and inverse PDE problems
-with noisy data.*  Journal of Computational Physics, 425, 109913.
-"""
+"""03 — Bayesian inverse: recover nonlinear reaction coefficient k"""
 
 from pathlib import Path
 

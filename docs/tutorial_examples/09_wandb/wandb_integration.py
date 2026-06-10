@@ -1,30 +1,4 @@
-"""09 — W&B + Weave integration with explainability callbacks
-
-Problem
--------
-    −u''(x) = sin(πx),   x ∈ [0, 1]
-    u(0) = u(1) = 0   (soft boundary condition as second constraint)
-
-Exact solution
---------------
-    u(x) = sin(πx) / π²
-
-Techniques shown
-----------------
-* jno.setup(..., wandb=True)  — starts a W&B + Weave run automatically
-* GradientNormsCallback        — ‖∇Lᵢ‖₂ per constraint, logged to W&B
-* CosSimilarityCallback        — pairwise cosine similarity matrix (heatmap)
-* GradientAlignmentCallback    — total alignment scalar ‖Σgᵢ‖ / Σ‖gᵢ‖
-* LossLandscapeCallback        — 2-D loss landscape around current params
-* ResidualStatsCallback        — per-constraint residual mean/std/max/p99 + histogram
-* InputSensitivityCallback     — |∂u/∂x| at collocation points (saliency)
-* NTKSpectrumCallback          — empirical NTK eigenvalue spectrum
-* HessianSpectrumCallback      — top-k Hessian eigenvalues + sharpness
-* CheckpointCallback           — periodic Orbax save + W&B artifact upload
-
-Run this script directly to see all metrics appear in your W&B dashboard
-under the project configured in jno.setup() (default: the script stem).
-"""
+"""09 — W&B + Weave integration with explainability callbacks"""
 
 import foundax
 import jax

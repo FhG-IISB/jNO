@@ -1,14 +1,4 @@
-"""03 — 1-D heat equation (parabolic, time-dependent)
-
-Problem
--------
-    ∂u/∂t = α ∂²u/∂x²   on [0, 1],    u(0, t) = u(1, t) = 0,    u(x, 0) = sin(πx)
-
-Analytical solution: u(x, t) = exp(−απ²t) sin(πx)
-
-Showcases the soft IC + soft BC pattern — three constraints compete in the
-loss: PDE residual, initial condition, spatial boundary.
-"""
+"""03 — 1-D heat equation (parabolic, time-dependent)"""
 
 import foundax
 import jax

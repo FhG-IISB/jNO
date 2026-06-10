@@ -1,12 +1,4 @@
-"""02 — 2-D anisotropic Poisson equation
-
-Problem
--------
-    −(a u_xx + b u_yy) = f(x, y)   on [0, 1]²,    u = 0 on ∂Ω
-
-Manufactured solution:  u(x, y) = sin(πx) sin(πy)
-Forcing:                f(x, y) = (a + b) π² sin(πx) sin(πy)
-"""
+"""02 — 2-D anisotropic Poisson equation"""
 
 from pathlib import Path
 

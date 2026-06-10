@@ -1,39 +1,4 @@
-"""06 — Integro-Differential Equation (IDE)
-
-Equation
---------
-    u'(x) + u(x) = g(x) + ∫₀¹ u(t) dt,   x ∈ [0, 1],   u(0) = 0
-
-The right-hand side contains both the unknown u at the same point AND a
-scalar integral of u over the full domain.  This requires mixing the
-differential operator (.d(x)) and the scalar integral (.integrate()) in the
-same residual — the key demonstration of this tutorial.
-
-Exact solution:  u*(x) = sin(πx)
-
-Derivation of g
----------------
-    u'(x)        = π cos(πx)
-    u(x)         = sin(πx)
-    ∫₀¹ u(t) dt  = ∫₀¹ sin(πt) dt = 2/π
-
-    g(x) = π cos(πx) + sin(πx) − 2/π
-
-Boundary condition: u(0) = 0  (hard, enforced via the ansatz u = net(x)·x)
-
-Network residual
-----------------
-    R(x) = u'(x) + u(x) − g(x) − ∫₀¹ u(t) dt  =  0
-
-API used
---------
-Two operators compose naturally on the same placeholder:
-
-    u  = net(x) * x                # hard BC: u(0) = 0 automatically
-    C  = u.integrate()             # scalar: ∫₀¹ u(t) dt
-    du = u.d(x)                    # pointwise derivative u'(x)
-    residual = du + u - g - C      # IDE residual at every collocation point
-"""
+"""06 — Integro-Differential Equation (IDE)"""
 
 from pathlib import Path
 

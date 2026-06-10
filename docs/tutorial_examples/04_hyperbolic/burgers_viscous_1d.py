@@ -1,21 +1,4 @@
-"""04 — 1-D viscous Burgers equation  (manufactured solution)
-
-Problem
--------
-    ∂u/∂t + u ∂u/∂x = ν ∂²u/∂x² + f(x, t)   on x ∈ [0, 1], t ∈ [0, 1]
-    u(0, t) = u(1, t) = 0
-    u(x, 0) = sin(πx)
-
-Manufactured solution
----------------------
-    u_exact(x, t) = e^{−t} sin(πx)
-
-Substituting into Burgers gives the source term
-    f = e^{−t}(νπ² − 1) sin(πx)  +  (π/2) e^{−2t} sin(2πx)
-
-The nonlinear term u u_x produces a higher-frequency component in the forcing,
-making this a good stress-test of network capacity.
-"""
+"""04 — 1-D viscous Burgers equation  (manufactured solution)"""
 
 import foundax
 import jax
