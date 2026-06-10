@@ -83,7 +83,7 @@ inv_loss = (u_at_query - u_obs) ** 2
 # Single-point domain — the loss has no spatial dependence on the mesh
 inv_domain = jno.domain.from_array({"pt": np.zeros((1, 1))})
 
-crux_inv = jno.core([inv_loss.mean])
+crux_inv = jno.core([inv_loss.mean], domain=inv_domain)
 crux_inv.solve(500)
 
 # ── Results ──────────────────────────────────────────────────────────────────

@@ -114,7 +114,7 @@ residual = (u_at_query - u_obs) / sigma_obs
 
 # Single-point inverse domain — loss has no spatial dependence on a mesh.
 inv_domain = jno.domain.from_array({"pt": np.zeros((1, 1))})
-crux_inv = jno.core([residual.mse])
+crux_inv = jno.core([residual.mse], domain=inv_domain)
 crux_inv.solve(800)
 
 # ── Posterior summary ────────────────────────────────────────────────────────

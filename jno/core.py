@@ -288,6 +288,8 @@ class core:
         constraints: List[Placeholder],
         mesh: Optional[Tuple[int, ...]] = (1, 1),
         resume_from: Optional[str] = None,
+        *,
+        domain=None,
     ):
         """
         Initialize core solver.
@@ -298,12 +300,13 @@ class core:
                 minimized during training (e.g., PDE residuals, boundary conditions,
                 data fitting terms).
 
-            (Domain inference) the computational domain is auto-discovered by
-                walking ``constraints`` and collecting the unique
-                ``Variable._domain`` reference. Constraints with no Variables
-                (e.g. pure parametric losses) or constraints that mix Variables
-                from multiple domains raise ``ValueError`` — at that point the
-                graph itself is ambiguous and the user must restructure.
+            domain: Optional domain override.  When omitted (``None``), the
+                domain is auto-discovered by walking ``constraints`` and
+                collecting the unique ``Variable._domain`` reference.  Pass
+                ``domain=`` explicitly when the constraint tree contains no
+                standard ``Variable`` nodes — e.g. FEM/VPINN weak-form
+                assemblies or pure-parametric inverse losses built from
+                ``jno.domain.from_array``.
 
             rng_seed: Random seed for reproducibility. Controls parameter initialization
                 and any stochastic operations during training.
@@ -354,7 +357,7 @@ class core:
         self.log = get_logger()
         self.constraints: List[Placeholder] = constraints
 
-        self.domain = _infer_domain_from_constraints(constraints)
+        self.domain = domain if domain is not None else _infer_domain_from_constraints(constraints)
         self.models: Dict[int, Any] = {}
         self._trained_ops: Dict[int, Any] = {}
         self.training_logs: List[Dict[str, jnp.ndarray]] = []

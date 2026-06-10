@@ -36,7 +36,7 @@ for param in (a, b, c):
     param.optimizer(optax.adam(1e-2))
 
 crux = jno.core([residual.mse])
-crux.solve(15_000)
+crux.solve(30_000)
 
 _a, _b, _c = crux.eval([a, b, c])
 print(f"Recovered: a={_a[0]:.3f}  b={_b[0]:.3f}  c={_c[0]:.3f}    (truth: {A_true}, {B_true}, {C_true})")
@@ -48,7 +48,7 @@ rel_l2_c = float(jax.numpy.linalg.norm(_c - C_true) / (jax.numpy.linalg.norm(C_t
 results_file = Path(__file__).parent.parent.parent / "tutorial_results.txt"
 with open(results_file, "a") as f:
     f.write(
-        f"05_coupled_and_inverse/inverse_parameter.py | epochs=15000"
+        f"05_coupled_and_inverse/inverse_parameter.py | epochs=30000"
         f" | rel_L2_a={rel_l2_a:.6e} | rel_L2_b={rel_l2_b:.6e} | rel_L2_c={rel_l2_c:.6e}\n"
     )
 

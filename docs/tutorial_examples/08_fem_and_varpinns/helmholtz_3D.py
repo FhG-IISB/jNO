@@ -322,7 +322,7 @@ u_int = apply_hard_bottom_bc(net(x_int, y_int, z_int), x_int, y_int, z_int)
 
 pde = weak_vpinn.assemble(vpinn_domain, u_net=u_gauss, target="vpinn")
 
-crux = jno.core(constraints=[pde.mse])
+crux = jno.core(constraints=[pde.mse], domain=vpinn_domain)
 
 net.optimizer(
     optax.adam(

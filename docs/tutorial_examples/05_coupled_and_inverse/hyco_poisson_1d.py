@@ -9,7 +9,7 @@ Train two networks that cooperate via a shared interaction loss:
   * **u_syn** — synthetic model, fits sparse noisy sensor observations
 
 Both models are encouraged to agree at interior collocation points via a
-mutual alignment term, with ``jno.fn.stop_gradient`` blocking cross-talk in
+mutual alignment term, with ``.stop_gradient`` blocking cross-talk in
 the optimiser updates. Alternating updates are expressed through ``substeps``:
 each outer epoch runs one ``u_phy`` step followed by one ``u_syn`` step,
 each with its own Adam state.
