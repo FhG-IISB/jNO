@@ -1026,6 +1026,8 @@ class TestCoordsKwargsForm:
             _ = u - v
         with pytest.raises(ValueError, match="coord binding conflict for 'x'"):
             _ = u * v
+        with pytest.raises(ValueError, match="coord binding conflict for 'x'"):
+            _ = u / v
 
 
 class TestStopGradientMethod:
@@ -1060,6 +1062,29 @@ class TestStopGradientMethod:
         L = (u_phy - u_syn.stop_gradient).mse
         # Result is a Placeholder (FunctionCall from .mse)
         assert L is not None
+
+    def test_vector_view_preserves_type(self):
+        d = _domain_with(("xy", 2))
+        v = Variable("xy", [0, 2], domain=d)
+        sg = v.vector.stop_gradient
+        assert isinstance(sg, VectorView)
+
+    def test_complex_view_preserves_type(self):
+        d = _domain_with(("z", 2))
+        v = Variable("z", [0, 2], domain=d)
+        sg = v.complex.stop_gradient
+        assert isinstance(sg, ComplexView)
+
+    def test_matrix_view_preserves_type(self):
+        A, _ = _make_2x2([[1.0, 2.0, 3.0, 4.0]])
+        sg = A.stop_gradient
+        assert isinstance(sg, MatrixView)
+
+    def test_voigt_view_preserves_type(self):
+        d = _domain_with(("s", 3))
+        s = Variable("s", [0, 3], domain=d)
+        sg = s.voigt.stop_gradient
+        assert isinstance(sg, VoigtView)
 
 
 class TestSchemeNamespace:
@@ -1111,6 +1136,46 @@ class TestSchemeNamespace:
         u = (x * y).scalar.bind(x=x, y=y)
         with pytest.raises(AttributeError, match="not a registered partial-name sequence"):
             _ = u.fd.z
+
+    def test_fd_on_named_vector_partials(self):
+        """``v.bind(x=x, y=y).fd.x`` returns the base VectorView (no Named wrapper)."""
+        d, x, y = _domain_xy()
+        v = Variable("xy", [0, 2], domain=d).vector.bind(x=x, y=y)
+        result = v.fd.x
+        assert isinstance(result, VectorView)
+        assert isinstance(result._expr, Jacobian)
+        assert result._expr.scheme == "finite_difference"
+
+    def test_fd_on_named_matrix_partials(self):
+        d, x, y = _domain_xy()
+        A = Variable("xy", [0, 2], domain=d).matrix.from_diag().bind(x=x, y=y)
+        result = A.fd.x
+        assert isinstance(result, MatrixView)
+        assert isinstance(result._expr, Jacobian)
+        assert result._expr.scheme == "finite_difference"
+
+    def test_fd_on_named_complex_partials(self):
+        d = _domain_with(("z", 2))
+        x = Variable("z", [0, 1], domain=d)
+        y = Variable("z", [1, 2], domain=d)
+        z = Variable("z", [0, 2], domain=d).complex.bind(x=x, y=y)
+        result = z.fd.x
+        assert isinstance(result, ComplexView)
+        assert isinstance(result._expr, Jacobian)
+        assert result._expr.scheme == "finite_difference"
+
+    def test_fd_on_named_voigt_partials(self):
+        # Voigt requires last-dim 3 (2-D symmetric tensor). Use coord vars from
+        # a separate spatial domain so `.bind` doesn't collide with the Voigt tag.
+        d2 = _domain_with(("s", 3), ("xy", 2))
+        s = Variable("s", [0, 3], domain=d2)
+        x = Variable("xy", [0, 1], domain=d2)
+        y = Variable("xy", [1, 2], domain=d2)
+        sv = s.voigt.bind(x=x, y=y)
+        result = sv.fd.x
+        assert isinstance(result, VoigtView)
+        assert isinstance(result._expr, Jacobian)
+        assert result._expr.scheme == "finite_difference"
 
 
 class TestCruxEvalAcceptsViews:

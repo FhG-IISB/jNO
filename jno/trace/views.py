@@ -628,7 +628,12 @@ class MatrixView:
         return MatrixView(new_expr)
 
     def integrate(self, **kwargs) -> "MatrixView":
-        """Element-wise integral, preserving MatrixView type."""
+        """Element-wise integral of each matrix component over the integration
+        domain (not a matrix-algebra integral) — MatrixView preserved.
+
+        Useful for things like the spatial average of an anisotropic
+        diffusivity field.  Each ``[i, j]`` entry is integrated independently.
+        """
         return self._rewrap(self._expr.integrate(**kwargs))
 
     @property
@@ -941,7 +946,9 @@ class VoigtView:
         return VoigtView(new_expr)
 
     def integrate(self, **kwargs) -> "VoigtView":
-        """Component-wise integral over the Voigt-packed tensor → VoigtView."""
+        """Component-wise integral over the Voigt-packed tensor — VoigtView
+        preserved; each Voigt slot is integrated independently.
+        """
         return self._rewrap(self._expr.integrate(**kwargs))
 
     @property
