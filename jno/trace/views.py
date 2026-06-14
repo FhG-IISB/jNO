@@ -1172,6 +1172,275 @@ class NamedVectorView(VectorView):
 
 
 # ---------------------------------------------------------------------------
+# FieldView — FD-only partial derivatives on neural-operator field outputs
+# ---------------------------------------------------------------------------
+
+# Boundary slices for 2-D spatial fields (H, W, C) — works with any leading
+# batch / time dimensions thanks to the Ellipsis prefix.
+# Axis ordering follows equi_distant_rect with indexing="ij": axis 0 = x, 1 = y.
+_BOUNDARY_SLICES = {
+    "left": (..., slice(None, 1), slice(None), slice(None)),
+    "right": (..., slice(-1, None), slice(None), slice(None)),
+    "bottom": (..., slice(None), slice(None, 1), slice(None)),
+    "top": (..., slice(None), slice(-1, None), slice(None)),
+}
+
+
+class FieldView(ScalarView):
+    """Semantic view of a Placeholder as a full mesh-shaped field.
+
+    Used when the wrapped expression is the output of a neural operator
+    (Poseidon, FNO, etc.) where x, y, z, t are **not** inputs to the
+    network — AD-based partials would be 0.  All derivatives returned by
+    this view (via ``.bind(...)``) are evaluated with the structured-grid
+    finite-difference scheme.
+
+    The actual derivative attribute access lives on
+    :class:`FieldViewWithPartials` — created by ``.bind(...)``.
+
+    Example::
+
+        u = NN(a_phys).field.bind(x=x_var, y=y_var, t=t_var)
+        residual = u.t - 220.0**2 * (u.xx + u.yy) + u**3 - u
+    """
+
+    def partials(self, **named_vars):
+        """Bind Variables to names; returns a :class:`FieldViewWithPartials`."""
+        return FieldViewWithPartials(self._expr, named_vars)
+
+    bind = partials
+
+
+class FieldViewWithPartials(ScalarView):
+    """Field view with name → Variable bindings and FD-only derivatives.
+
+    Resolves attribute access (``.x``, ``.xx``, ``.t``, ``.tt``, ``.xt``,
+    ``.xxt`` …) by parsing the attribute as a sequence of registered names
+    and emitting:
+
+    * one :class:`TemporalDerivative` node per occurrence of a temporal
+      Variable (``var.axis == "temporal"``);
+    * one :class:`Jacobian` (single occurrence) or :class:`Hessian` (two
+      occurrences of the same spatial Variable, ``trace=True``) per spatial
+      Variable;
+    * mixed spatial pairs (``.xy``) → one :class:`Hessian` with
+      ``trace=False``;
+    * higher-order chains alternate naturally (e.g. ``.xt`` → spatial-FD
+      around an inner ``TemporalDerivative``).
+
+    Optional keyword arguments to ``.bind`` of the form ``<name>_coords``
+    (numpy / jnp arrays with the same shape as the field) are validated
+    against the bound Variable's domain mesh and emit a warning if the
+    distance exceeds ``1e-6``.  The validation is purely diagnostic — the
+    FD computation always reads coordinates from the domain mesh.
+    """
+
+    _base_view = ScalarView
+
+    def __init__(self, expr, coord_vars: dict) -> None:
+        # Separate Variable bindings from optional *_coords ndarrays.
+        import numpy as np
+
+        spatial_coords: dict = {}
+        vars_only: dict = {}
+        for k, v in coord_vars.items():
+            if k.endswith("_coords"):
+                spatial_coords[k[: -len("_coords")]] = v
+            else:
+                vars_only[k] = v
+
+        ScalarView.__init__(self, expr)
+        object.__setattr__(self, "_coord_vars", dict(vars_only))
+        object.__setattr__(self, "_spatial_coords", spatial_coords)
+
+        # Diagnostic mismatch check against the domain mesh.
+        if spatial_coords:
+            self._validate_field_coords(np)
+
+    def _validate_field_coords(self, np_mod) -> None:
+        import warnings
+
+        cv = object.__getattribute__(self, "_coord_vars")
+        spatial_coords = object.__getattribute__(self, "_spatial_coords")
+
+        domain = None
+        for name, coord_arr in spatial_coords.items():
+            var = cv.get(name)
+            if var is None:
+                continue
+            d = getattr(var, "_domain", None)
+            if d is not None:
+                domain = d
+                break
+
+        if domain is None or getattr(domain, "mesh_connectivity", None) is None:
+            return
+
+        try:
+            mesh_pts = np_mod.asarray(domain.mesh_connectivity["points"])
+        except Exception:  # pragma: no cover - defensive
+            return
+
+        # Order user coords by axis index so the columns line up with
+        # mesh_pts (which is N_mesh × ndim, columns ordered by dim index).
+        ordered_names = sorted(
+            spatial_coords,
+            key=lambda nm: cv[nm].dim[0] if nm in cv and hasattr(cv[nm], "dim") else 0,
+        )
+        try:
+            cols = [np_mod.asarray(spatial_coords[nm]).ravel() for nm in ordered_names]
+        except Exception:  # pragma: no cover - defensive
+            return
+
+        n_user = cols[0].size
+        n_mesh = mesh_pts.shape[0]
+        if n_user != n_mesh:
+            warnings.warn(
+                f"FieldView coordinate mismatch: user provided {n_user} points but "
+                f"domain mesh has {n_mesh}. FD stencils use the domain mesh — adjust "
+                f"the domain resolution (e.g. equi_distant_rect(nx=H-1)) to match."
+            )
+            return
+
+        ndim_user = len(cols)
+        ndim_mesh = mesh_pts.shape[1]
+        cmp_dim = min(ndim_user, ndim_mesh)
+        diffs = np_mod.stack(cols[:cmp_dim], axis=-1) - mesh_pts[:, :cmp_dim]
+        norms = np_mod.linalg.norm(diffs, axis=-1)
+        mean = float(norms.mean())
+        mx = float(norms.max())
+        if mx > 1e-6:
+            warnings.warn(
+                f"FieldView coordinate mismatch: mean={mean:.3e}, max={mx:.3e}. "
+                "FD stencils use the domain mesh coordinates — ensure your field's "
+                "grid aligns with the domain (consider equi_distant_rect with the "
+                "same range and resolution)."
+            )
+
+    # ------------------------------------------------------------------
+    # Type preservation through arithmetic and .d(...)
+    # ------------------------------------------------------------------
+
+    def _rewrap(self, new_expr, other=None):
+        cv = object.__getattribute__(self, "_coord_vars")
+        sc = object.__getattribute__(self, "_spatial_coords")
+        other_cv = getattr(other, "_coord_vars", None) if other is not None else None
+        if other_cv:
+            merged = dict(cv)
+            for name, var in other_cv.items():
+                if name in merged and merged[name] is not var:
+                    raise ValueError(
+                        f"coord binding conflict for {name!r}: cannot combine "
+                        f"two FieldView bindings that map {name!r} to different "
+                        f"Variables (left={merged[name]!r}, right={var!r}). "
+                        f"Re-bind the result explicitly with .bind(...) to resolve."
+                    )
+                merged[name] = var
+            cv = merged
+        new = FieldViewWithPartials.__new__(FieldViewWithPartials)
+        ScalarView.__init__(new, new_expr)
+        object.__setattr__(new, "_coord_vars", cv)
+        object.__setattr__(new, "_spatial_coords", sc)
+        return new
+
+    # ------------------------------------------------------------------
+    # Attribute access — derivative sequence parsing
+    # ------------------------------------------------------------------
+
+    @property
+    def grid_shape(self) -> "tuple | None":
+        """Spatial grid shape ``(H, W)`` (or ``(H, W, D)`` for 3-D) from the
+        bound domain, or ``None`` if unavailable.
+
+        Useful for determining boundary indices::
+
+            H, W = u.grid_shape
+            # left x-boundary is row 0; right is row H-1.
+        """
+        cv = object.__getattribute__(self, "_coord_vars")
+        for var in cv.values():
+            d = getattr(var, "_domain", None)
+            if d is not None:
+                gs = getattr(d, "_grid_shape", None)
+                if gs is not None:
+                    return gs
+        return None
+
+    def __getattr__(self, key: str):
+        if key.startswith("_"):
+            raise AttributeError(key)
+        # Boundary slicing (2-D spatial): left/right → x-axis, bottom/top → y-axis.
+        # Derivative-first is the correct order for Neumann/Robin BCs:
+        #   u.x.right (FD on full field then slice) ✓
+        #   u.right   (field value at boundary)     ✓
+        # Returns ScalarView so that further FD chaining is blocked (calling u.right.x
+        # would take FD of a 1-point boundary slice, which gives incorrect results).
+        if key in _BOUNDARY_SLICES:
+            return ScalarView(self._expr[_BOUNDARY_SLICES[key]])
+        cv = object.__getattribute__(self, "_coord_vars")
+        seq = _parse_partial_sequence(key, cv)
+        if seq is not None:
+            return self._build_partial(seq)
+        return getattr(object.__getattribute__(self, "_expr"), key)
+
+    def _build_partial(self, seq):
+        """Build a derivative node from a parsed name sequence.
+
+        The sequence is consumed left-to-right.  Spatial runs of length 1 or 2
+        collapse into a single :class:`Jacobian` / :class:`Hessian` node;
+        temporal occurrences each become a :class:`TemporalDerivative`.  This
+        yields the natural chained form for mixed spatiotemporal derivatives
+        (e.g. ``"xt"`` → ``Jacobian(TemporalDerivative(u, t), [x_var], "fd")``).
+
+        Returns a :class:`FieldViewWithPartials` (via ``_rewrap``) so that
+        further boundary slicing chains correctly, e.g.::
+
+            u.x.right   # FieldViewWithPartials(Jacobian) → ScalarView of right slice ✓
+            u.t.left    # FieldViewWithPartials(TD) → ScalarView of left slice ✓
+        """
+        from . import Hessian, Jacobian, TemporalDerivative
+
+        cv = object.__getattribute__(self, "_coord_vars")
+        result = self._expr
+
+        i = 0
+        n = len(seq)
+        while i < n:
+            name = seq[i]
+            var = cv[name]
+            is_temporal = getattr(var, "axis", None) == "temporal"
+            if is_temporal:
+                result = TemporalDerivative(result, var)
+                i += 1
+                continue
+
+            # Spatial: greedily group with the next slot if it is also spatial
+            # AND it is a (possibly different) spatial name; this collapses
+            # `.xx`, `.yy`, `.xy` into a single Hessian per step.
+            if i + 1 < n:
+                next_name = seq[i + 1]
+                next_var = cv[next_name]
+                next_is_temporal = getattr(next_var, "axis", None) == "temporal"
+                if not next_is_temporal:
+                    if next_name == name:
+                        # Repeated spatial: ∂²/∂var² via Hessian(trace=True)
+                        result = Hessian(result, [var], "finite_difference", trace=True)
+                    else:
+                        # Mixed spatial: ∂²/∂var₁∂var₂ via Hessian(trace=False)
+                        result = Hessian(result, [var, next_var], "finite_difference", trace=False)
+                    i += 2
+                    continue
+
+            # Single spatial: ∂/∂var via Jacobian
+            result = Jacobian(result, [var], "finite_difference")
+            i += 1
+
+        # Return FieldViewWithPartials (not plain ScalarView) so boundary attrs
+        # like .right and .left chain correctly: u.x.right, u.t.left, etc.
+        return self._rewrap(result)
+
+
+# ---------------------------------------------------------------------------
 # Named<View>WithPartials — partial-derivative-by-name (kwargs form)
 # ---------------------------------------------------------------------------
 
@@ -1260,7 +1529,7 @@ NamedVoigtViewWithPartials = _make_named_with_partials_cls(VoigtView)
 
 
 # Populate the tuple now that all classes exist (used by _unwrap()).
-_VIEW_TYPES = (ScalarView, VectorView, ComplexView, MatrixView, VoigtView)
+_VIEW_TYPES = (ScalarView, VectorView, ComplexView, MatrixView, VoigtView, FieldView)
 
 # Dispatch table used by `_coords_dispatch` to pick the Named<View>WithPartials
 # wrapper for each base view type.
@@ -1286,4 +1555,6 @@ __all__ = [
     "NamedComplexViewWithPartials",
     "NamedMatrixViewWithPartials",
     "NamedVoigtViewWithPartials",
+    "FieldView",
+    "FieldViewWithPartials",
 ]

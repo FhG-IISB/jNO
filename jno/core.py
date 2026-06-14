@@ -1691,29 +1691,39 @@ class core:
             )
             accumulation_steps = 1
 
-        # Guard: IntegralTime requires min_consecutive >= 2
-        def _has_integral_time(node):
-            if isinstance(node, IntegralTime):
+        # Guard: IntegralTime / TemporalDerivative require min_consecutive >= 2
+        def _has_node_type(node, target_type):
+            if isinstance(node, target_type):
                 return True
             for attr in ("target", "left", "right", "expr"):
                 child = getattr(node, attr, None)
-                if isinstance(child, Placeholder) and _has_integral_time(child):
+                if isinstance(child, Placeholder) and _has_node_type(child, target_type):
                     return True
             for attr in ("args", "variables"):
                 for child in getattr(node, attr, []):
-                    if isinstance(child, Placeholder) and _has_integral_time(child):
+                    if isinstance(child, Placeholder) and _has_node_type(child, target_type):
                         return True
             return False
 
         if min_consecutive is not None and min_consecutive < 2:
+            from .trace import TemporalDerivative as _TD  # noqa: PLC0415
+
             for expr in getattr(self, "_constraint_exprs", []):
-                if _has_integral_time(expr):
+                if _has_node_type(expr, IntegralTime):
                     raise ValueError(
                         f"IntegralTime (.integrate(t)) requires min_consecutive >= 2 "
                         f"(trapezoidal integration over a single time step is identically zero). "
                         f"Got min_consecutive={min_consecutive} (the default is 1). "
                         f"Pass min_consecutive=None to use all T time steps, "
                         f"or min_consecutive=2 for the minimum valid windowed integration."
+                    )
+                if _has_node_type(expr, _TD):
+                    raise ValueError(
+                        f"TemporalDerivative (.field.bind(t=...).t) requires min_consecutive >= 2 "
+                        f"(needs at least two consecutive time steps for a finite difference). "
+                        f"Got min_consecutive={min_consecutive}. "
+                        f"Pass min_consecutive=None to use all T time steps, or "
+                        f"min_consecutive=3 for central differences at interior steps."
                     )
 
         if (

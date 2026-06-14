@@ -42,6 +42,7 @@ __all__ = [
     "Integral",
     "IntegralTime",
     "Jacobian",
+    "TemporalDerivative",
     "NetworkGradient",
     "Noise",
     "collect_operations",
@@ -69,6 +70,8 @@ __all__ = [
     "NamedComplexViewWithPartials",
     "NamedMatrixViewWithPartials",
     "NamedVoigtViewWithPartials",
+    "FieldView",
+    "FieldViewWithPartials",
 ]
 
 # Global counter for unique operation IDs
@@ -497,6 +500,20 @@ class Placeholder:
         from .views import VoigtView
 
         return VoigtView(self)
+
+    @property
+    def field(self):
+        """Field view for neural-operator outputs — FD-only partial derivatives.
+
+        Use ``.field.bind(x=x_var, y=y_var, t=t_var)`` when the underlying
+        ``Placeholder`` is the full mesh-shaped output of a neural operator
+        (Poseidon, FNO, etc.) and ``x``/``y``/``t`` are NOT inputs to the
+        network. All derivatives via the returned view are evaluated with
+        the structured-grid finite-difference scheme.
+        """
+        from .views import FieldView
+
+        return FieldView(self)
 
     # ------------------------------------------------------------------
     # Differential operators — method-style API
@@ -2538,6 +2555,35 @@ class IntegralTime(Placeholder):
         return f"IntegralTime({self.target})"
 
 
+class TemporalDerivative(Placeholder):
+    """First-order time derivative via cross-step finite differences.
+
+    Created by :class:`FieldView` when a temporally-tagged Variable is bound
+    via ``.field.bind(t=t_var)``.  Higher-order temporal derivatives are
+    expressed by chaining (``.tt`` → ``TemporalDerivative(TemporalDerivative(u, t), t)``).
+
+    At evaluation time the handler reads:
+
+    * ``ctx["__temporal_fd_cache__"][id(target)]`` — the pre-computed window
+      ``u_window`` of shape ``(W, ...)`` injected by the compiler before the
+      per-step vmap;
+    * ``ctx["__step_index__"]`` — the current step index within the window;
+    * ``ctx["__time_window__"]`` — the ``(W, 1)`` array of time values.
+
+    Applies a clamped central difference at interior steps and one-sided
+    differences at window edges.  Requires ``min_consecutive >= 2`` in
+    :meth:`Crux.solve` (>= 3 recommended for proper central differences).
+    """
+
+    def __init__(self, target: "Placeholder", time_var: "Variable"):
+        self.target = target
+        self.time_var = time_var
+        _propagate_weak(self, target)
+
+    def __repr__(self):
+        return f"TemporalDerivative({self.target})"
+
+
 class NetworkGradient(Placeholder):
     """Per-point Jacobian of an expression w.r.t. a model's trainable parameters.
 
@@ -3093,6 +3139,10 @@ def collect_operations(expr: Placeholder) -> List[OperationDef]:
             visit(node.target)
         elif isinstance(node, (Integral, IntegralTime)):
             visit(node.target)
+        elif isinstance(node, TemporalDerivative):
+            visit(node.target)
+            if isinstance(node.time_var, Placeholder):
+                visit(node.time_var)
         elif isinstance(node, Tracker):
             visit(node.expr)
         elif isinstance(node, Assembly):
@@ -3152,6 +3202,10 @@ def collect_tags(expr: Placeholder) -> set:
             visit(node.target)
         elif isinstance(node, (Integral, IntegralTime)):
             visit(node.target)
+        elif isinstance(node, TemporalDerivative):
+            visit(node.target)
+            if isinstance(node.time_var, Placeholder):
+                visit(node.time_var)
         elif isinstance(node, Tracker):
             visit(node.expr)
         elif isinstance(node, (TrialFunction, TestFunction)):
@@ -3318,6 +3372,8 @@ def dump_tree(expr, indent: int = 0, seen: set = None) -> str:
 from .views import (  # noqa: E402
     _VIEW_TYPES,
     ComplexView,
+    FieldView,
+    FieldViewWithPartials,
     MatrixView,
     NamedComplexViewWithPartials,
     NamedMatrixView,
