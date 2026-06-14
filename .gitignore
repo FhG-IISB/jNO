@@ -42,6 +42,9 @@ mode_summary.txt
 tests/tutorial_results.txt
 docs/tutorial_results.txt
 
+# Whitepaper skill build artifacts (LaTeX intermediates, generated figures)
+whitepapers/
+
 # pixi environments
 .pixi/*
 !.pixi/config.toml
