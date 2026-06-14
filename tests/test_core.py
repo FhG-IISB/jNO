@@ -263,11 +263,20 @@ class TestSubsteps:
         sub_exprs = [crux._constraint_exprs[0], crux._constraint_exprs[1]]
         compiled_phy = TraceCompiler.compile_multi_expression(sub_exprs, crux.all_ops)
 
+        # solve() re-places the (CPU-resident) domain context onto the compute
+        # mesh before each step. Replicate that here: pin params and context to a
+        # single device so a multi-device run (e.g. JAX_PLATFORMS=cuda,cpu) does
+        # not mix a CPU context with GPU params (ARG_SHARDING device mismatch).
+        _dev = jax.devices()[0]
+        trainable = jax.device_put(trainable, _dev)
+        frozen_arrays = jax.device_put(frozen_arrays, _dev)
+        ctx = jax.tree_util.tree_map(lambda a: jax.device_put(a, _dev), crux.domain_data.context)
+
         def loss_fn(params):
             import paramax as _paramax
 
             full = _paramax.unwrap(eqx.combine(params, frozen_arrays, static))
-            residuals = compiled_phy(full, crux.domain_data.context, batchsize=None, key=jax.random.PRNGKey(0))
+            residuals = compiled_phy(full, ctx, batchsize=None, key=jax.random.PRNGKey(0))
             return jnp.mean(jnp.stack([jnp.mean(r) for r in residuals]))
 
         grads = jax.grad(loss_fn)(trainable)
