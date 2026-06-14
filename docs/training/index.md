@@ -53,4 +53,4 @@ crux.solve(1000)
 
 ## Per-Model Controls
 
-Each model is fully independent with respect to its optimiser, trainability, LoRA configuration, and pretrained weight initialisation. See the **[Model Controls](model-controls/index.md)** sub-section for the full API covering freeze, masks, LoRA, dtype conversion, and diagnostics.
+Each model is fully independent with respect to its optimiser, trainability, LoRA configuration, and pretrained weight initialisation. See the **[Model Controls](../model-controls/index.md)** sub-section for the full API covering freeze, masks, LoRA, dtype conversion, and diagnostics.
