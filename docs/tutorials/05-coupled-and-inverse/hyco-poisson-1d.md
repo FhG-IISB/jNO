@@ -1,8 +1,8 @@
 # HyCo: Hybrid-Cooperative PINN
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/05_coupled_and_inverse/hyco_poisson_1d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/05-coupled-and-inverse/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/05_coupled_and_inverse/hyco_poisson_1d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/05-coupled-and-inverse/">Back to chapter</a>
 </div>
 
 This tutorial implements the **Hybrid-Cooperative (HyCo)** learning framework from [Liverani, Steynberg & Zuazua (2025)](https://arxiv.org/abs/2509.14123) using `jno.fn.stop_gradient`.
@@ -174,8 +174,8 @@ The physics model, guided by both the PDE and alignment with the data-fitted syn
 - See [Liverani et al. (2025)](https://arxiv.org/abs/2509.14123) for analysis of the Gray-Scott and Helmholtz cases.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/05_coupled_and_inverse/hyco_poisson_1d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/05-coupled-and-inverse/">Back to 05 Coupled and Inverse</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/05_coupled_and_inverse/hyco_poisson_1d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/05-coupled-and-inverse/">Back to 05 Coupled and Inverse</a>
 </div>
 
 ## Script Snippet

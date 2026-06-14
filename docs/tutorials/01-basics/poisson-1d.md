@@ -1,8 +1,8 @@
 # Poisson 1D
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/01_basics/poisson_1d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/01-basics/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/01_basics/poisson_1d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/01-basics/">Back to chapter</a>
 </div>
 
 The soft-BC + finite-difference companion to [Laplace 1D](laplace-1d.md). Same domain, harder PDE, two pedagogical patterns at once: **soft Dirichlet enforcement** via a boundary loss term, and **finite-difference derivatives** via `scheme="finite_difference"` instead of autodiff.
@@ -66,8 +66,8 @@ The optimiser balances the interior PDE residual against the boundary mismatch. 
 - The exact solution `sin(π x)/π²` naturally satisfies `u(0)=u(1)=0`, so the soft BCs only need to break the **other** local minima where the network solves the PDE residual exactly but with a non-zero constant offset.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/01_basics/poisson_1d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/01-basics/">Back to 01 Basics</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/01_basics/poisson_1d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/01-basics/">Back to 01 Basics</a>
 </div>
 
 ## Script Snippet

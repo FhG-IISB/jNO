@@ -1,8 +1,8 @@
 # FieldView — physics-informed FNO operator
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/11_operator_learning/field_view_physics.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/11-operator-learning/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/11_operator_learning/field_view_physics.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/11-operator-learning/">Back to chapter</a>
 </div>
 
 A Fourier Neural Operator learns the solution operator $f \mapsto u$ of the 2-D
@@ -107,8 +107,8 @@ evaluated on the operator's own prediction — a physics audit of the learned ma
   from the wall).
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/11_operator_learning/field_view_physics.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/11-operator-learning/">Back to 11 Operator Learning</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/11_operator_learning/field_view_physics.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/11-operator-learning/">Back to 11 Operator Learning</a>
 </div>
 
 ## Script

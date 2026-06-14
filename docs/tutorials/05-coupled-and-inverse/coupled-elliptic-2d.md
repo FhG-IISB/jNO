@@ -1,8 +1,8 @@
 # Coupled Elliptic 2D
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/05_coupled_and_inverse/coupled_elliptic_2d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/05-coupled-and-inverse/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/05_coupled_and_inverse/coupled_elliptic_2d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/05-coupled-and-inverse/">Back to chapter</a>
 </div>
 
 This example solves a stationary system with two interacting unknown fields.
@@ -67,8 +67,8 @@ rel_l2_v = float(jax.numpy.linalg.norm(_v - _v_exact) / (jax.numpy.linalg.norm(_
 - The pattern extends naturally to larger coupled systems.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/05_coupled_and_inverse/coupled_elliptic_2d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/05-coupled-and-inverse/">Back to 05 Coupled and Inverse</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/05_coupled_and_inverse/coupled_elliptic_2d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/05-coupled-and-inverse/">Back to 05 Coupled and Inverse</a>
 </div>
 
 ## Script Snippet

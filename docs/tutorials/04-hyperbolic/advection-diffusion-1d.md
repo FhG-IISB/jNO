@@ -1,8 +1,8 @@
 # Advection-Diffusion 1D
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/04_hyperbolic/advection_diffusion_1d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/04-hyperbolic/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/04_hyperbolic/advection_diffusion_1d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/04-hyperbolic/">Back to chapter</a>
 </div>
 
 This example combines transport and diffusion in a transient 1D problem.
@@ -74,8 +74,8 @@ history = crux.solve(5000)
 - The manufactured forcing `source` is what makes the prescribed `u_exact = e^{-t} sin(πx)` actually satisfy the PDE; without it the equation would have a different solution.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/04_hyperbolic/advection_diffusion_1d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/04-hyperbolic/">Back to 04 Hyperbolic</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/04_hyperbolic/advection_diffusion_1d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/04-hyperbolic/">Back to 04 Hyperbolic</a>
 </div>
 
 ## Script Snippet

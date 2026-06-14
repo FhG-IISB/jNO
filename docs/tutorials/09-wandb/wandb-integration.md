@@ -1,8 +1,8 @@
 # W&B Integration and Explainability Callbacks
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/09_wandb/wandb_integration.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/09-wandb/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/09_wandb/wandb_integration.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/09-wandb/">Back to chapter</a>
 </div>
 
 This tutorial shows how to connect a jNO training run to [Weights & Biases](https://wandb.ai) and use the built-in explainability callbacks to understand what is happening inside the training loop.
@@ -182,8 +182,8 @@ landscapes = cb_landscape.result["landscapes"]
 - The gradient alignment scalar dropping during training is a reliable early warning of constraint conflict.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/09_wandb/wandb_integration.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/09-wandb/">Back to 09 W&B</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/09_wandb/wandb_integration.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/09-wandb/">Back to 09 W&B</a>
 </div>
 
 ## Script Snippet

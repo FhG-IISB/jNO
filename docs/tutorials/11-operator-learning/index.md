@@ -5,7 +5,7 @@ Operator learning trains a network to map **inputs** (parameters, forcing functi
 - **PDE-residual operator learning** — the network sees one parametric instance per batch sample; the PDE residual is enforced at the collocation points. The network never sees ground-truth solutions, only the physics. Closest to "PINN with a parameter".
 - **Data-driven operator learning** — the network is supervised on a dataset of `(input, solution)` pairs. No PDE residual is computed during training; the solution operator is learnt purely from examples.
 
-The three architecture tutorials showcase **three foundax architectures** on the **same Poisson problem**, so the only variable is the architecture itself. A further tutorial covers **FieldView** — the physics API for operators that emit a full grid field in one shot, where PDE derivatives come from finite differences instead of autodiff:
+The three architecture tutorials showcase **three foundax architectures** on the **same Poisson problem**, so the only variable is the architecture itself. Two further tutorials cover **FieldView** — the physics API for operators that emit a full grid field in one shot, where PDE derivatives come from finite differences instead of autodiff:
 
 | Tutorial | Architecture | Pattern | What it teaches |
 |---|---|---|---|

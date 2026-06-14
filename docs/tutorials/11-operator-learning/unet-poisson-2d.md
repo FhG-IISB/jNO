@@ -1,8 +1,8 @@
 # U-Net 2D — supervised Poisson 2D
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/11_operator_learning/unet_poisson_2d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/11-operator-learning/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/11_operator_learning/unet_poisson_2d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/11-operator-learning/">Back to chapter</a>
 </div>
 
 Same problem and dataset as the [FNO tutorial](fno-poisson-2d.md), different architecture: a convolutional encoder-decoder with skip connections. **Data-driven** supervised learning, just like FNO.
@@ -64,8 +64,8 @@ crux.solve(epochs=50, batchsize=10)
 - **Compared to [FNO](fno-poisson-2d.md):** U-Net is convolutional and local; FNO is spectral and global. FNO converges faster on smooth elliptic problems; U-Net generalises better when the solution operator has sharp features or when the input resolution differs from training.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/11_operator_learning/unet_poisson_2d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/11-operator-learning/">Back to 11 Operator Learning</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/11_operator_learning/unet_poisson_2d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/11-operator-learning/">Back to 11 Operator Learning</a>
 </div>
 
 ## Script Snippet

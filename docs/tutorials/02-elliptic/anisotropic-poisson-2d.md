@@ -1,8 +1,8 @@
 # Anisotropic Poisson 2D
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/02_elliptic/anisotropic_poisson_2d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/02-elliptic/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/02_elliptic/anisotropic_poisson_2d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/02-elliptic/">Back to chapter</a>
 </div>
 
 This example modifies Poisson's equation so diffusion acts with different strength in the horizontal and vertical directions.
@@ -78,8 +78,8 @@ rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_
 - This pattern extends naturally to diffusion tensors and heterogeneous media.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/02_elliptic/anisotropic_poisson_2d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/02-elliptic/">Back to 02 Elliptic</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/02_elliptic/anisotropic_poisson_2d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/02-elliptic/">Back to 02 Elliptic</a>
 </div>
 
 ## Script Snippet

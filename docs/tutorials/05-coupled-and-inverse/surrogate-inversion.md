@@ -1,8 +1,8 @@
 # Surrogate Inversion
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/05_coupled_and_inverse/surrogate_inversion.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/05-coupled-and-inverse/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/05_coupled_and_inverse/surrogate_inversion.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/05-coupled-and-inverse/">Back to chapter</a>
 </div>
 
 This tutorial shows how to flip a trained PINN into an inverse solver by turning its **input** into a trainable parameter.
@@ -122,8 +122,8 @@ print(f"Recovered x = {float(_x_q):.4f}")   # → 0.3000
 - Extend to 2-D: the query becomes `jno.np.parameter((2,))` and the frozen 2D PINN evaluates at that point.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/05_coupled_and_inverse/surrogate_inversion.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/05-coupled-and-inverse/">Back to 05 Coupled and Inverse</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/05_coupled_and_inverse/surrogate_inversion.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/05-coupled-and-inverse/">Back to 05 Coupled and Inverse</a>
 </div>
 
 ## Script Snippet

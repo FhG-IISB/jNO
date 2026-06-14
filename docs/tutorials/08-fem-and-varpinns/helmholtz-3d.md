@@ -1,8 +1,8 @@
 # Helmholtz 3D
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/08_fem_and_varpinns/helmholtz_3D.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/08-fem-and-varpinns/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/08_fem_and_varpinns/helmholtz_3D.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/08-fem-and-varpinns/">Back to chapter</a>
 </div>
 
 This is the most geometrically complex example in the tutorial set: a 3D Helmholtz problem on an extruded letter-F style geometry.
@@ -96,8 +96,8 @@ print(f"Relative L2 error (FEM): {float(rel_l2):.6e}")
 - The workflow shows how jNO scales beyond unit-interval and unit-square toy problems.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/08_fem_and_varpinns/helmholtz_3D.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/08-fem-and-varpinns/">Back to 08 FEM and Variational PINNs</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/08_fem_and_varpinns/helmholtz_3D.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/08-fem-and-varpinns/">Back to 08 FEM and Variational PINNs</a>
 </div>
 
 ## Script Snippet

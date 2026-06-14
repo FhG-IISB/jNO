@@ -1,8 +1,8 @@
 # Mixed-Boundary Poisson 2D
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/02_elliptic/mixed_boundary_poisson_2d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/02-elliptic/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/02_elliptic/mixed_boundary_poisson_2d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/02-elliptic/">Back to chapter</a>
 </div>
 
 This example shows how to combine different boundary conditions on different parts of the same domain.
@@ -70,8 +70,8 @@ history = crux.solve(40_000)
 - You do not need to choose between all-hard or all-soft boundary handling.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/02_elliptic/mixed_boundary_poisson_2d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/02-elliptic/">Back to 02 Elliptic</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/02_elliptic/mixed_boundary_poisson_2d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/02-elliptic/">Back to 02 Elliptic</a>
 </div>
 
 ## Script Snippet

@@ -1,8 +1,8 @@
 # Integral Constraints and Flux Monitoring (2-D)
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/06_integration/flux_conservation_2d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/06-integration/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/06_integration/flux_conservation_2d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/06-integration/">Back to chapter</a>
 </div>
 
 This example solves the 2-D Poisson equation and shows two uses of `.integrate()` that are not possible with pointwise losses like `.mse`:
@@ -99,8 +99,8 @@ flux_tracker  = tracker(outward_flux, interval=500)
 jno does not dot F with n automatically — you specify the integrand explicitly.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/06_integration/flux_conservation_2d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/06-integration/">Back to 06 Integration</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/06_integration/flux_conservation_2d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/06-integration/">Back to 06 Integration</a>
 </div>
 
 ## Script

@@ -48,9 +48,11 @@ jobs:
           pip install -e .
 
       - name: Build docs site
-        # `--strict` would be ideal but is blocked by a pre-existing broken
-        # cross-link in training/index.md. Drop the comment + add strict
-        # after that link is fixed.
+        # NOTE: `--strict` is not enabled yet — the build still emits griffe
+        # "no type/annotation" warnings from the API-reference docstrings, which
+        # `--strict` would treat as errors. Enable it once those are cleared.
+        # (Absolute links such as the tutorial download buttons are not validated
+        # by mkdocs at all, strict or not — keep those base-correct manually.)
         run: mkdocs build
 
       - name: Upload Pages artifact

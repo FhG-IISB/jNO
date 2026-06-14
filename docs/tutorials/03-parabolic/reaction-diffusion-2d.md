@@ -1,8 +1,8 @@
 # Reaction-Diffusion 2D
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/03_parabolic/reaction_diffusion_2d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/03-parabolic/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/03_parabolic/reaction_diffusion_2d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/03-parabolic/">Back to chapter</a>
 </div>
 
 This example augments diffusion with a linear reaction term in a transient 2D setting.
@@ -82,8 +82,8 @@ rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_
 - This is a useful bridge from heat equations to nonlinear parabolic systems.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/03_parabolic/reaction_diffusion_2d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/03-parabolic/">Back to 03 Parabolic</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/03_parabolic/reaction_diffusion_2d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/03-parabolic/">Back to 03 Parabolic</a>
 </div>
 
 ## Script Snippet

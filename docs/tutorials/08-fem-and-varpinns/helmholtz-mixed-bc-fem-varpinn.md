@@ -1,8 +1,8 @@
 # Helmholtz Mixed BC FEM VarPINN
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/08_fem_and_varpinns/helmholtz_mixedBC_fem_varpinn.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/08-fem-and-varpinns/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/08_fem_and_varpinns/helmholtz_mixedBC_fem_varpinn.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/08-fem-and-varpinns/">Back to chapter</a>
 </div>
 
 This example trains a variational PINN for a 2D Helmholtz problem and compares it against a fine FEM reference solution.
@@ -87,8 +87,8 @@ print(f"FEM   relative L2: {float(rel_l2_fem):.6e}")
 - Direct FEM comparison makes the example especially useful for benchmarking.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/08_fem_and_varpinns/helmholtz_mixedBC_fem_varpinn.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/08-fem-and-varpinns/">Back to 08 FEM and Variational PINNs</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/08_fem_and_varpinns/helmholtz_mixedBC_fem_varpinn.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/08-fem-and-varpinns/">Back to 08 FEM and Variational PINNs</a>
 </div>
 
 ## Script Snippet

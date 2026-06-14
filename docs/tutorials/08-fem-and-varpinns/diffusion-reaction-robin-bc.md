@@ -1,8 +1,8 @@
 # Diffusion-Reaction Robin BC
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/08_fem_and_varpinns/diffusion_reaction_robinBC.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/08-fem-and-varpinns/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/08_fem_and_varpinns/diffusion_reaction_robinBC.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/08-fem-and-varpinns/">Back to chapter</a>
 </div>
 
 This example compares a variational PINN against a classical FEM reference under mixed Dirichlet and Robin boundary conditions.
@@ -84,8 +84,8 @@ print(f"FEM  relative L2: {float(rel_l2_fem):.6e}")
 - Boundary quadrature tags are one of the key implementation ideas.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/08_fem_and_varpinns/diffusion_reaction_robinBC.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/08-fem-and-varpinns/">Back to 08 FEM and Variational PINNs</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/08_fem_and_varpinns/diffusion_reaction_robinBC.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/08-fem-and-varpinns/">Back to 08 FEM and Variational PINNs</a>
 </div>
 
 ## Script Snippet

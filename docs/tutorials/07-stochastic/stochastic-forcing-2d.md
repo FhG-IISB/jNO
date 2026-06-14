@@ -1,8 +1,8 @@
 # 2-D Poisson with Stochastic Forcing
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/07_stochastic/stochastic_forcing_2d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/07-stochastic/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/07_stochastic/stochastic_forcing_2d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/07-stochastic/">Back to chapter</a>
 </div>
 
 This example solves a **2-D Poisson equation whose source term is random** — a model for PDEs driven by turbulent forces, uncertain body loads, or random media.  Unlike the Fokker-Planck tutorial (where noise appeared on boundary observations), here `jno.noise` is placed **directly inside the PDE residual**.  The network still recovers the correct deterministic solution; the tutorial explains exactly why.
@@ -129,6 +129,6 @@ Because hard BCs remove the boundary term, there is only one loss.  The optimize
 ```
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/07_stochastic/stochastic_forcing_2d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/07-stochastic/">Back to 07 Stochastic</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/07_stochastic/stochastic_forcing_2d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/07-stochastic/">Back to 07 Stochastic</a>
 </div>

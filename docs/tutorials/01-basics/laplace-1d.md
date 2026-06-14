@@ -1,8 +1,8 @@
 # Laplace 1D
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/01_basics/laplace_1d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/01-basics/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/01_basics/laplace_1d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/01-basics/">Back to chapter</a>
 </div>
 
 The smallest complete jNO example. Solves the 1-D Laplace equation with **non-homogeneous** Dirichlet boundary conditions and a hard-enforced linear-interpolant ansatz.
@@ -62,8 +62,8 @@ history = crux.solve(5000)
 - This is a *trivial* PDE in the sense that the exact solution is in the trial-space class; jNO is being asked to confirm convergence, not discover anything new.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/01_basics/laplace_1d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/01-basics/">Back to 01 Basics</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/01_basics/laplace_1d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/01-basics/">Back to 01 Basics</a>
 </div>
 
 ## Script Snippet

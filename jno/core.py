@@ -304,6 +304,10 @@ class core:
         """
         Initialize core solver.
 
+        The random seed is read from config — ``JNO_SEED`` (env), else
+        ``[jno] seed`` in ``.jno.toml`` / ``~/.jno/config.toml``, else ``42``
+        (via ``jno.get_seed``); it is not a constructor argument.
+
         Args:
             constraints: List of constraint expressions defining the problem to solve.
                 Each constraint represents an equation or condition that should be
@@ -317,16 +321,6 @@ class core:
                 standard ``Variable`` nodes — e.g. FEM/VPINN weak-form
                 assemblies or pure-parametric inverse losses built from
                 ``jno.domain.from_array``.
-
-            rng_seed: Random seed for reproducibility. Controls parameter initialization
-                and any stochastic operations during training.
-                If ``None`` (default), reads ``[jno] seed`` from ``.jno.toml`` (or
-                ``~/.jno/config.toml``); falls back to ``21`` when no config is found.
-
-                To pin the seed for your whole project, add to ``.jno.toml``::
-
-                    [jno]
-                    seed = 42
 
             mesh: Shape of the device mesh for hybrid parallelism as a tuple (batch, model).
                 Controls how computation is distributed across multiple GPUs/TPUs.

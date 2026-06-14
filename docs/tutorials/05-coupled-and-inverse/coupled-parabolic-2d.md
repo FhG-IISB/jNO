@@ -1,8 +1,8 @@
 # Coupled Parabolic 2D
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/05_coupled_and_inverse/coupled_parabolic_2d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/05-coupled-and-inverse/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/05_coupled_and_inverse/coupled_parabolic_2d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/05-coupled-and-inverse/">Back to chapter</a>
 </div>
 
 This example takes the coupled-field idea into a transient setting.
@@ -77,8 +77,8 @@ _u, _u_exact, _v, _v_exact = crux.eval([u, u_exact, v, v_exact])
 - This is a good reference for multi-field transient PDEs.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/05_coupled_and_inverse/coupled_parabolic_2d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/05-coupled-and-inverse/">Back to 05 Coupled and Inverse</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/05_coupled_and_inverse/coupled_parabolic_2d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/05-coupled-and-inverse/">Back to 05 Coupled and Inverse</a>
 </div>
 
 ## Script Snippet
