@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import inspect
 import types
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -37,7 +37,7 @@ from .utils.adaptive import weights as _adaptive_weights
 _MODULE_NAME = __name__
 
 
-def _module_call(fn, args: list = [], name: str = "", reduces_axis: Optional[int] = None):
+def _module_call(fn: Callable, args: list = [], name: str = "", reduces_axis: Optional[int] = None) -> FunctionCall:
     """Wrap an arbitrary function into the tracing graph.
 
     Args:

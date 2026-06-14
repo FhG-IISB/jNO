@@ -299,7 +299,7 @@ class core:
         mesh: Optional[Tuple[int, ...]] = (1, 1),
         resume_from: Optional[str] = None,
         *,
-        domain=None,
+        domain: Optional[domain] = None,
     ):
         """
         Initialize core solver.
@@ -376,8 +376,7 @@ class core:
         super().__init__()
 
         self._total_epochs = 0
-        seed_cfg = get_seed()
-        seed = int(seed_cfg) if seed_cfg is not None else 21
+        seed = int(get_seed())
         self.seed = seed
         self.rng = jax.random.PRNGKey(seed)
         self.log.info(f"RNG seed: {seed}")
@@ -1600,8 +1599,8 @@ class core:
         min_consecutive: Optional[int] = 1,
         profile: bool = False,
         callbacks: Optional[List] = None,
-        substeps=None,
-    ):
+        substeps: list | None = None,
+    ) -> "statistics":
         """Train using per-model optimizers attached via ``model.optimizer()``.
 
         Every model used in the constraints **must** have an optimizer
@@ -4420,7 +4419,7 @@ class core:
         optimizer: Union[str, type],
         budget: int,
         devices: Union[None, int, str, List[int], DeviceConfig] = None,
-    ):
+    ) -> "statistics":
         """Run architecture and hyperparameter search with optional parallelism.
 
         Args:
@@ -4544,7 +4543,7 @@ class core:
         operation: Union[List[BinaryOp], BinaryOp],
         domain: Optional[domain] = None,
         min_consecutive: Optional[int] = 1,
-        key=None,
+        key: Any = None,
         samples: str = "auto",
     ):
         """Evaluate an operation (or list of operations) on the current models.

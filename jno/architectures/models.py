@@ -144,7 +144,7 @@ class nn:
 
     @classmethod
     def wrap(
-        cls, module, space: "ArchSpace" = None, name: str = "", weight_path: str = None
+        cls, module: Any, space: "ArchSpace" = None, name: str = "", weight_path: str = None
     ) -> Union["Model", "TunableModule"]:
         """
         Wrap a module for use in the jno pipeline.

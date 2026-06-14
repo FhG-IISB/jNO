@@ -64,13 +64,6 @@ extra_javascript:
 
 not_in_nav: |
   /Docker.md
-  /Model-Controls.md
-  /Training.md
-  /Integration-Operators.md
-  /Adaptive-Resampling.md
-  /training/schedules.md
-  /foundation_models/Core-Architectures.md
-  /foundation_models/Foundation-Models.md
 
 nav:
   - Home: index.md

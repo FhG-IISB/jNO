@@ -1202,7 +1202,7 @@ class Model(Placeholder):
         u = uv_net(x, y)[..., 0]
     """
 
-    def __init__(self, module, name: str = "", weight_path: str | None = None):
+    def __init__(self, module: Any, name: str = "", weight_path: str | None = None):
         """Create a Model wrapper.
 
         Args:
@@ -1451,7 +1451,7 @@ class Model(Placeholder):
         self._trainable_param_mask = None
         return self
 
-    def constrain(self, transform) -> "Model":
+    def constrain(self, transform: Callable) -> "Model":
         """Apply a paramax reparameterization to trainable parameter leaves.
 
         Parameters are stored in their unconstrained form and transformed by
@@ -1592,7 +1592,7 @@ class Model(Placeholder):
 
         return self
 
-    def optimizer(self, opt_fn, *, lr=None):
+    def optimizer(self, opt_fn: Callable, *, lr: LearningRateSchedule | float | None = None):
         """Attach an optimizer to this model.
 
         When preceded by ``mask(param_mask)``, the optimizer applies only
@@ -1925,7 +1925,7 @@ class Model(Placeholder):
         self._trainable_param_mask = None
         return self
 
-    def lr(self, lr):
+    def lr(self, lr: LearningRateSchedule | float | None):
         """Attach an LR schedule to this model.
 
         When preceded by ``mask(param_mask)``, the schedule applies only to
@@ -1963,7 +1963,7 @@ class Model(Placeholder):
         self._param_groups.append(g)
         return g
 
-    def initialize(self, weights, *, key=None):
+    def initialize(self, weights: Any, *, key: Any = None) -> "Model":
         """Load pretrained weights into this model at init time.
 
                 Accepted ``weights`` inputs:
@@ -2030,7 +2030,7 @@ class Model(Placeholder):
             self.weight_path = None
         return self
 
-    def dtype(self, dtype):
+    def dtype(self, dtype: Any) -> "Model":
         """Cast all floating-point parameters to *dtype* before training.
 
         Reduces memory usage (e.g. ``jnp.bfloat16`` halves float32 memory)
@@ -2058,7 +2058,15 @@ class Model(Placeholder):
         """Stable key identifying this model in a sweep space."""
         return self.name if self.name else f"model_{self.layer_id}"
 
-    def tune(self, *, freeze=None, lora=None, optimizer=None, lr=None, dtype=None):
+    def tune(
+        self,
+        *,
+        freeze: list | None = None,
+        lora: list | None = None,
+        optimizer: list | None = None,
+        lr: list | None = None,
+        dtype: list | None = None,
+    ) -> "Model":
         """Declare per-model tunable options for hyperparameter sweeps.
 
         Each argument accepts a list of candidate values.  During a sweep
@@ -2223,7 +2231,7 @@ class ModelCall(Placeholder):
         self.model.lora(rank, alpha, target=target, wrapper=wrapper, specs=specs)
         return self
 
-    def optimizer(self, opt_fn, *, lr=None):
+    def optimizer(self, opt_fn: Callable, *, lr: LearningRateSchedule | float | None = None) -> "ModelCall":
         self.model.optimizer(opt_fn, lr=lr)
         return self
 
@@ -2262,11 +2270,11 @@ class ModelCall(Placeholder):
         """Shortcut to the underlying :attr:`Model.posterior_diagnostics`."""
         return self.model.posterior_diagnostics
 
-    def initialize(self, weights, *, key=None):
+    def initialize(self, weights: Any, *, key: Any = None) -> "ModelCall":
         self.model.initialize(weights, key=key)
         return self
 
-    def dtype(self, dtype):
+    def dtype(self, dtype: Any) -> "ModelCall":
         self.model.dtype(dtype)
         return self
 

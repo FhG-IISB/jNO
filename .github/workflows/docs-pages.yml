@@ -48,12 +48,12 @@ jobs:
           pip install -e .
 
       - name: Build docs site
-        # NOTE: `--strict` is not enabled yet — the build still emits griffe
-        # "no type/annotation" warnings from the API-reference docstrings, which
-        # `--strict` would treat as errors. Enable it once those are cleared.
-        # (Absolute links such as the tutorial download buttons are not validated
-        # by mkdocs at all, strict or not — keep those base-correct manually.)
-        run: mkdocs build
+        # Strict: any mkdocs/griffe warning fails the build, catching doc
+        # regressions (broken cross-links, undocumented params) early.
+        # NOTE: absolute links such as the tutorial download buttons are NOT
+        # validated by mkdocs even in strict mode — keep those base-correct
+        # (/jNO/, matching site_url) manually.
+        run: mkdocs build --strict
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

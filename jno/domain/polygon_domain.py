@@ -990,7 +990,12 @@ class PolygonDomain(domain):
         self.context[f"f_{tag}"] = view_factor[None, ...]
         self._param_tags.add(f"f_{tag}")
 
-    def compute_enclosure_view_factor(self, tags, opaque_tags=None, medium_tags: Optional[Sequence[str]] = None):
+    def compute_enclosure_view_factor(
+        self,
+        tags: Sequence[str],
+        opaque_tags: Optional[Sequence[str]] = None,
+        medium_tags: Optional[Sequence[str]] = None,
+    ):
         """Compute cross-tag polygon boundary view factors for radiative BCs.
 
         All *tags* must be polygon boundary tags that have already been sampled

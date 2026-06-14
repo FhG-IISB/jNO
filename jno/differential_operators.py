@@ -75,7 +75,7 @@ class DifferentialOperators:
     def compute_fd_gradient_1d_simple(
         u_values: jnp.ndarray,
         points: jnp.ndarray,
-        lines,
+        lines: jnp.ndarray,
         method: str = "area_weighted",
     ) -> jnp.ndarray:
         """Gradient on a 1-D line mesh.
@@ -137,11 +137,11 @@ class DifferentialOperators:
 
     @staticmethod
     def compute_fd_laplacian_1d_simple(
-        u_values,
-        points,
-        lines,
+        u_values: jnp.ndarray,
+        points: jnp.ndarray,
+        lines: jnp.ndarray,
         method: str = "gradient_of_gradient",
-    ):
+    ) -> jnp.ndarray:
         """Laplacian on a 1-D line mesh.
 
         Args:
@@ -157,7 +157,12 @@ class DifferentialOperators:
         return DifferentialOperators.compute_fd_gradient_1d_simple(grad, points, lines)
 
     @staticmethod
-    def compute_fd_hessian_1d_simple(u_values, points, lines, var_dims=None):
+    def compute_fd_hessian_1d_simple(
+        u_values: jnp.ndarray,
+        points: jnp.ndarray,
+        lines: jnp.ndarray,
+        var_dims: list | None = None,
+    ) -> jnp.ndarray:
         """Hessian (= d²u/dx²) on a 1-D line mesh.
 
         Args:
@@ -190,7 +195,7 @@ class DifferentialOperators:
     def compute_fd_gradient_2d_simple(
         u_values: jnp.ndarray,
         points: jnp.ndarray,
-        triangles,
+        triangles: jnp.ndarray,
         dim: int,
         method: str = "area_weighted",
     ) -> jnp.ndarray:
@@ -250,7 +255,7 @@ class DifferentialOperators:
     def compute_gradient_2d_lsq(
         u_values: jnp.ndarray,
         points: jnp.ndarray,
-        triangles,
+        triangles: jnp.ndarray,
         dim: int,
     ) -> jnp.ndarray:
         """Least-squares gradient on a 2-D triangular mesh.
@@ -317,12 +322,12 @@ class DifferentialOperators:
 
     @staticmethod
     def compute_fd_laplacian_2d_simple(
-        u_values,
-        points,
-        triangles,
-        dims,
+        u_values: jnp.ndarray,
+        points: jnp.ndarray,
+        triangles: jnp.ndarray,
+        dims: tuple,
         method: str = "gradient_of_gradient",
-    ):
+    ) -> jnp.ndarray:
         """Laplacian on a 2-D triangular mesh.
 
         Args:
@@ -355,7 +360,7 @@ class DifferentialOperators:
     def compute_laplacian_2d_cotangent(
         u_values: jnp.ndarray,
         points: jnp.ndarray,
-        triangles,
+        triangles: jnp.ndarray,
     ) -> jnp.ndarray:
         """Cotangent-weight (Laplace–Beltrami) Laplacian on a 2-D mesh.
 
@@ -438,7 +443,12 @@ class DifferentialOperators:
         return jnp.where(A_i > 1e-12, lap / safe_A, 0.0)
 
     @staticmethod
-    def compute_fd_hessian_2d_simple(u_values, points, triangles, var_dims):
+    def compute_fd_hessian_2d_simple(
+        u_values: jnp.ndarray,
+        points: jnp.ndarray,
+        triangles: jnp.ndarray,
+        var_dims: list,
+    ) -> jnp.ndarray:
         """Hessian on a 2-D triangular mesh (area-weighted FD).
 
         Args:
@@ -484,7 +494,7 @@ class DifferentialOperators:
     def compute_fd_gradient_3d_simple(
         u_values: jnp.ndarray,
         points: jnp.ndarray,
-        tetrahedra,
+        tetrahedra: jnp.ndarray,
         dim: int,
         method: str = "area_weighted",
     ) -> jnp.ndarray:
@@ -587,7 +597,7 @@ class DifferentialOperators:
     def compute_gradient_3d_lsq(
         u_values: jnp.ndarray,
         points: jnp.ndarray,
-        tetrahedra,
+        tetrahedra: jnp.ndarray,
         dim: int,
     ) -> jnp.ndarray:
         """Least-squares gradient on a 3-D tetrahedral mesh.
@@ -680,12 +690,12 @@ class DifferentialOperators:
 
     @staticmethod
     def compute_fd_laplacian_3d_simple(
-        u_values,
-        points,
-        tetrahedra,
-        dims,
+        u_values: jnp.ndarray,
+        points: jnp.ndarray,
+        tetrahedra: jnp.ndarray,
+        dims: tuple,
         method: str = "gradient_of_gradient",
-    ):
+    ) -> jnp.ndarray:
         """Laplacian on a 3-D tetrahedral mesh.
 
         Args:
@@ -712,7 +722,12 @@ class DifferentialOperators:
         return result
 
     @staticmethod
-    def compute_fd_hessian_3d_simple(u_values, points, tetrahedra, var_dims):
+    def compute_fd_hessian_3d_simple(
+        u_values: jnp.ndarray,
+        points: jnp.ndarray,
+        tetrahedra: jnp.ndarray,
+        var_dims: list,
+    ) -> jnp.ndarray:
         """Hessian on a 3-D tetrahedral mesh (volume-weighted FD).
 
         Args:
