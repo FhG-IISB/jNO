@@ -1978,42 +1978,6 @@ class domain(MeshIOMixin):
 
         return None
 
-    def add_tensor_tag(self, name: str, tensor: Union[np.ndarray, jnp.ndarray]) -> "domain":
-        """Attach a tensor to this domain for parametric PDEs.
-
-        Tensor tags allow parameters to vary across batched domains.
-        The first dimension is the batch dimension and must match the
-        domain's batch count exactly.
-
-        Args:
-            name: Name for this tensor (used in vars(name))
-            tensor: Array with shape (B, ...) where B equals the domain's batch count.
-
-        Returns:
-            Self for method chaining.
-
-        Example:
-            domain = 2 * domain.from_mesh(...)
-            domain.add_tensor_tag('diffusivity', jnp.array([[1.0], [2.0]]))  # shape (2, 1)
-            a = domain.variable('diffusivity')  # Returns TensorTag
-        """
-        tensor = jnp.asarray(tensor)
-        if tensor.ndim < 1:
-            tensor = tensor.reshape(1, 1)
-
-        # Validate batch dimension - must match exactly
-        batch_count = self._effective_batch_count()
-        tensor_batch = tensor.shape[0]
-        if tensor_batch != batch_count:
-            self.log.warning(
-                f"Tensor '{name}' has batch dimension {tensor_batch}, but domain has "
-                f"effective batch count {batch_count}. Was this intended?"
-            )
-
-        self.context[name] = tensor
-        self._param_tags.add(name)
-        return self
-
     # The dominant call ``x, y, _ = dom.variable("interior")`` returns a tuple of
     # coordinate ``Variable``s; typing it (rather than ``Any``) is what makes the
     # whole traced-DSL chain — ``x.d(x)``, ``u.scalar``, … — discoverable in an
@@ -2047,7 +2011,6 @@ class domain(MeshIOMixin):
         return_indices: bool = False,
         time_value: Optional[float] = None,
     ) -> Any: ...
-
     def variable(
         self,
         tag: str,
@@ -2068,7 +2031,18 @@ class domain(MeshIOMixin):
                  or tensor tag (e.g., 'diffusivity')
             sample: Optional sampling specification for this tag:
                     - (n_samples, sampler) tuple to trigger sampling
-                    - jax.numpy array to register a tensor tag
+                    - np.ndarray / jnp.ndarray to register a tensor tag
+
+                When ``sample`` is an array, the leading dimension determines
+                how the tensor is routed by the compiler:
+
+                  * ``shape[0] == B`` (the domain's effective batch count) —
+                    vmapped over the batch axis, one row per sample.
+                  * ``shape[0] == 1`` — broadcast across the batch.
+                  * ``shape[0]`` anything else — *shared*: the full array is
+                    exposed at every step (use this for labeled supervised
+                    data, lookup tables, or gather indices that are not
+                    aligned with the physics batch).
 
             resampling_strategy: Optional ResamplingStrategy for adaptive point selection
             normals: If True, also compute and return normal vectors for this tag
@@ -2084,11 +2058,18 @@ class domain(MeshIOMixin):
         # Optional sampling / tensor-tag attachment
         if sample is not None:
             if isinstance(sample, jnp.ndarray) or isinstance(sample, np.ndarray):
-                # Attach as tensor tag (parameter field) or point data
+                # Attach as tensor tag (parameter field) or point data.
+                # Three shape conventions for tensor tags are documented above
+                # and routed in jno/trace_compiler.py at attach time; we do
+                # not validate the leading dim here.
                 if point_data:
                     self.context[tag] = sample
                 else:
-                    self.add_tensor_tag(tag, sample)
+                    tensor = jnp.asarray(sample)
+                    if tensor.ndim < 1:
+                        tensor = tensor.reshape(1, 1)
+                    self.context[tag] = tensor
+                    self._param_tags.add(tag)
 
         # ------------------------------------------------------------------
         # Clean API for initial condition:

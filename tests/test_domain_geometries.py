@@ -576,3 +576,65 @@ class TestDistanceFunction:
         d_var = dom.distance_function("interior", name="my_dist")
         assert d_var.tag == "my_dist"
         assert "my_dist" in dom.context
+
+
+# Tensor-tag attachment via domain.variable(sample=array)
+# ---------------------------------------------------------------------------
+
+
+class TestVariableTensorAttach:
+    """Attach arrays of varying leading-dim length via ``variable(sample=...)``.
+
+    The compiler routes by ``shape[0]`` (see ``jno/trace_compiler.py``):
+
+      * ``shape[0] == B`` → per-batch (vmapped)
+      * ``shape[0] == 1`` → broadcast across the batch
+      * ``shape[0]`` anything else → shared, full array exposed every step
+
+    All three paths must accept the attached tensor without warning.
+    """
+
+    def _dom(self):
+        return jno.domain(constructor=jno.domain.line(mesh_size=0.2))
+
+    def test_per_batch_shape(self):
+        import numpy as np
+
+        dom = self._dom()
+        B = dom._effective_batch_count()
+        arr = np.zeros((B, 3), dtype=np.float32)
+        dom.variable("per_batch", sample=arr)
+        assert dom.context["per_batch"].shape == (B, 3)
+        assert "per_batch" in dom._param_tags
+
+    def test_broadcast_shape(self):
+        import numpy as np
+
+        dom = self._dom()
+        arr = np.zeros((1, 3), dtype=np.float32)
+        dom.variable("bcast", sample=arr)
+        assert dom.context["bcast"].shape == (1, 3)
+        assert "bcast" in dom._param_tags
+
+    def test_shared_length_mismatch_no_warning(self, caplog):
+        """Length-mismatched tensor stores cleanly and emits no warning."""
+        import logging
+
+        import numpy as np
+
+        dom = self._dom()
+        arr = np.zeros((16, 3), dtype=np.float32)
+        with caplog.at_level(logging.WARNING):
+            dom.variable("u_labels", sample=arr)
+        assert dom.context["u_labels"].shape == (16, 3)
+        assert "u_labels" in dom._param_tags
+        assert not any("Was this intended" in r.message for r in caplog.records)
+
+    def test_returned_object_is_tensor_tag(self):
+        import numpy as np
+
+        from jno.trace import TensorTag
+
+        dom = self._dom()
+        result = dom.variable("coeff", sample=np.zeros((1, 1), dtype=np.float32))
+        assert isinstance(result, TensorTag)
