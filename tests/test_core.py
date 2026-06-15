@@ -39,11 +39,13 @@ def _stationary_1d_domain(mesh_size=0.1):
 
 
 class TestEmptyConstraints:
-    def test_construct_with_empty_constraints_raises_clear_error(self):
-        # jno.core([]) now fails fast at construction (domain inference walks
-        # the constraints — an empty list has nothing to resolve a domain from).
+    def test_empty_constraints_is_eval_only_and_solve_raises(self):
+        # An empty-constraint core is eval-only: it constructs without a domain
+        # (the domain is supplied per call to eval()). Only *training* rejects
+        # it, and that error is raised at solve() — not at construction.
+        crux = jno.core([])  # no raise at construction
         with pytest.raises(ValueError, match="at least one constraint"):
-            jno.core([])
+            crux.solve(1)
 
 
 # ---------------------------------------------------------------------------

@@ -361,7 +361,17 @@ class core:
         self.log = get_logger()
         self.constraints: List[Placeholder] = constraints
 
-        self.domain = domain if domain is not None else _infer_domain_from_constraints(constraints)
+        # An empty-constraint core is eval-only (no training); its domain is
+        # supplied per call to eval(). Only infer a domain when constraints
+        # exist, so `jno.core([]).eval([expr], domain=dom)` works without a
+        # domain at construction. Training with no constraints is rejected in
+        # solve() instead.
+        if domain is not None:
+            self.domain = domain
+        elif constraints:
+            self.domain = _infer_domain_from_constraints(constraints)
+        else:
+            self.domain = None
         self.models: Dict[int, Any] = {}
         self._trained_ops: Dict[int, Any] = {}
         self.training_logs: List[Dict[str, jnp.ndarray]] = []
@@ -1518,16 +1528,23 @@ class core:
         self.all_ops = self.collect_unique_operations(constraints)
 
         # === Prepare domain data ===
-        self.domain_data = self.prepare_domain_data(self.domain)
-        tensor_dims = self.compute_tensor_dims(self.domain)
+        # An eval-only core (no constraints) may carry no domain yet — it is
+        # supplied to eval(). Skip the domain-dependent setup in that case;
+        # with no ops there are no models to initialise anyway.
+        if self.domain is not None:
+            self.domain_data = self.prepare_domain_data(self.domain)
+            tensor_dims = self.compute_tensor_dims(self.domain)
 
-        # === Initialize models ===
-        self.models, self.rng = TraceCompiler.init_layer_params(
-            self.all_ops, self.domain_data.dimension, tensor_dims, self.rng, self.log
-        )
+            # === Initialize models ===
+            self.models, self.rng = TraceCompiler.init_layer_params(
+                self.all_ops, self.domain_data.dimension, tensor_dims, self.rng, self.log
+            )
 
-        # === Apply sharding to model arrays ===
-        self.models = self._shard_params(self.models)
+            # === Apply sharding to model arrays ===
+            self.models = self._shard_params(self.models)
+        else:
+            self.domain_data = None
+            self.models = {}
 
         # === Compile constraints and trackers ===
         self.compiled_trackers = []
