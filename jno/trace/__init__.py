@@ -1650,7 +1650,7 @@ class Model(Placeholder):
 
         return self
 
-    def optimizer(self, opt_fn: Callable, *, lr: LearningRateSchedule | float | None = None):
+    def optimizer(self, opt_fn: Any, *, lr: Any = None):
         """Attach an optimizer to this model.
 
         When preceded by ``mask(param_mask)``, the optimizer applies only
@@ -2289,7 +2289,7 @@ class ModelCall(Placeholder):
         self.model.lora(rank, alpha, target=target, wrapper=wrapper, specs=specs)
         return self
 
-    def optimizer(self, opt_fn: Callable, *, lr: LearningRateSchedule | float | None = None) -> "ModelCall":
+    def optimizer(self, opt_fn: Any, *, lr: Any = None) -> "ModelCall":
         self.model.optimizer(opt_fn, lr=lr)
         return self
 
