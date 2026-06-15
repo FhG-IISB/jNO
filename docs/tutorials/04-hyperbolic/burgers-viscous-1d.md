@@ -1,8 +1,8 @@
 # Burgers Viscous 1D
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/04_hyperbolic/burgers_viscous_1d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/04-hyperbolic/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/04_hyperbolic/burgers_viscous_1d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/04-hyperbolic/">Back to chapter</a>
 </div>
 
 This example solves the viscous Burgers equation with a manufactured exact solution and demonstrates **RAD adaptive resampling** — a technique that concentrates collocation points in high-residual regions to accelerate convergence.
@@ -68,7 +68,7 @@ pde  = u_t + u * u_x - ν * u_xx - source
 u_0 = net(x0, t0) * x0 * (1 - x0)
 ini = u_0 - jno.np.sin(π * x0)
 
-crux    = jno.core([pde.mse, ini.mse], domain)
+crux    = jno.core([pde.mse, ini.mse])
 history = crux.solve(5000)
 
 _u, _u_exact = crux.eval([u, u_exact])
@@ -83,8 +83,8 @@ rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_
 - For the classic inviscid-limit Burgers benchmark (`ν = 0.01/π`, no forcing, IC `u(x,0) = -sin(πx)`), the steep gradient forms near `x = 0` at late times and RAD provides the largest gains. See [`adaptive/resampling.md`](../../adaptive/resampling.md) for that setup.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/04_hyperbolic/burgers_viscous_1d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/04-hyperbolic/">Back to 04 Hyperbolic</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/04_hyperbolic/burgers_viscous_1d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/04-hyperbolic/">Back to 04 Hyperbolic</a>
 </div>
 
 ## Script Snippet

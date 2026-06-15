@@ -110,6 +110,66 @@ def _find_temporal_variable(expr: Placeholder):
     return visit(expr)
 
 
+def _infer_domain_from_constraints(constraints: List[Placeholder]):
+    """Walk the constraint trees and return the unique domain referenced by
+    every Variable / TensorTag inside.
+
+    Raises ``ValueError`` if zero (no Variables at all) or more than one
+    distinct domain is found — the caller must then pass ``domain=`` explicitly.
+    """
+    from .trace import TensorTag, Variable
+
+    domains: list = []  # preserve insertion order for nicer error messages
+    seen_domains: set = set()
+    seen_nodes: set = set()
+
+    def visit(node):
+        if node is None or id(node) in seen_nodes:
+            return
+        seen_nodes.add(id(node))
+        if isinstance(node, (Variable, TensorTag)):
+            d = getattr(node, "_domain", None)
+            if d is not None and id(d) not in seen_domains:
+                seen_domains.add(id(d))
+                domains.append(d)
+        # Generic descent: visit every instance attribute that holds a
+        # Placeholder (or a list/dict of them).  This covers GroupedAssembly
+        # and any future Placeholder subclass without enumerating attr names.
+        try:
+            attr_vals = vars(node).values()
+        except TypeError:
+            return
+        for v in attr_vals:
+            if isinstance(v, Placeholder):
+                visit(v)
+            elif isinstance(v, (list, tuple)):
+                for item in v:
+                    if isinstance(item, Placeholder):
+                        visit(item)
+            elif isinstance(v, dict):
+                for item in v.values():
+                    if isinstance(item, Placeholder):
+                        visit(item)
+
+    for expr in constraints:
+        visit(expr)
+
+    if len(domains) == 1:
+        return domains[0]
+    if not constraints:
+        raise ValueError("jno.core requires at least one constraint.")
+    if not domains:
+        raise ValueError(
+            "Cannot infer domain: no Variables or TensorTags were found in the "
+            "constraints. Every loss must reference at least one Variable so the "
+            "core can resolve its domain."
+        )
+    raise ValueError(
+        f"Cannot infer domain: constraints reference {len(domains)} distinct "
+        f"domains ({domains!r}). All constraints must share a single domain."
+    )
+
+
 def _active_model_lids(exprs):
     """Return layer_ids of Model nodes reachable without crossing stop_gradient.
 
@@ -236,12 +296,17 @@ class core:
     def __init__(
         self,
         constraints: List[Placeholder],
-        domain: domain,
         mesh: Optional[Tuple[int, ...]] = (1, 1),
         resume_from: Optional[str] = None,
+        *,
+        domain: Optional[domain] = None,
     ):
         """
         Initialize core solver.
+
+        The random seed is read from config — ``JNO_SEED`` (env), else
+        ``[jno] seed`` in ``.jno.toml`` / ``~/.jno/config.toml``, else ``42``
+        (via ``jno.get_seed``); it is not a constructor argument.
 
         Args:
             constraints: List of constraint expressions defining the problem to solve.
@@ -249,19 +314,13 @@ class core:
                 minimized during training (e.g., PDE residuals, boundary conditions,
                 data fitting terms).
 
-            domain: Domain object containing the computational domain and sampled points.
-                Defines the spatial/temporal coordinates where constraints are evaluated,
-                along with any tensor data (e.g., input functions for operator learning).
-
-            rng_seed: Random seed for reproducibility. Controls parameter initialization
-                and any stochastic operations during training.
-                If ``None`` (default), reads ``[jno] seed`` from ``.jno.toml`` (or
-                ``~/.jno/config.toml``); falls back to ``21`` when no config is found.
-
-                To pin the seed for your whole project, add to ``.jno.toml``::
-
-                    [jno]
-                    seed = 42
+            domain: Optional domain override.  When omitted (``None``), the
+                domain is auto-discovered by walking ``constraints`` and
+                collecting the unique ``Variable._domain`` reference.  Pass
+                ``domain=`` explicitly when the constraint tree contains no
+                standard ``Variable`` nodes — e.g. FEM/VPINN weak-form
+                assemblies or pure-parametric inverse losses built from
+                ``jno.domain.from_array``.
 
             mesh: Shape of the device mesh for hybrid parallelism as a tuple (batch, model).
                 Controls how computation is distributed across multiple GPUs/TPUs.
@@ -302,7 +361,17 @@ class core:
         self.log = get_logger()
         self.constraints: List[Placeholder] = constraints
 
-        self.domain = domain
+        # An empty-constraint core is eval-only (no training); its domain is
+        # supplied per call to eval(). Only infer a domain when constraints
+        # exist, so `jno.core([]).eval([expr], domain=dom)` works without a
+        # domain at construction. Training with no constraints is rejected in
+        # solve() instead.
+        if domain is not None:
+            self.domain = domain
+        elif constraints:
+            self.domain = _infer_domain_from_constraints(constraints)
+        else:
+            self.domain = None
         self.models: Dict[int, Any] = {}
         self._trained_ops: Dict[int, Any] = {}
         self.training_logs: List[Dict[str, jnp.ndarray]] = []
@@ -317,8 +386,7 @@ class core:
         super().__init__()
 
         self._total_epochs = 0
-        seed_cfg = get_seed()
-        seed = int(seed_cfg) if seed_cfg is not None else 21
+        seed = int(get_seed())
         self.seed = seed
         self.rng = jax.random.PRNGKey(seed)
         self.log.info(f"RNG seed: {seed}")
@@ -1414,7 +1482,7 @@ class core:
 
         Example::
 
-            crux = jno.core([pde.mse, ini.mse], domain)
+            crux = jno.core([pde.mse, ini.mse])
             crux.print_tree("tree.txt")
         """
         constraints = self.wrap_constraints(self.constraints)
@@ -1460,16 +1528,23 @@ class core:
         self.all_ops = self.collect_unique_operations(constraints)
 
         # === Prepare domain data ===
-        self.domain_data = self.prepare_domain_data(self.domain)
-        tensor_dims = self.compute_tensor_dims(self.domain)
+        # An eval-only core (no constraints) may carry no domain yet — it is
+        # supplied to eval(). Skip the domain-dependent setup in that case;
+        # with no ops there are no models to initialise anyway.
+        if self.domain is not None:
+            self.domain_data = self.prepare_domain_data(self.domain)
+            tensor_dims = self.compute_tensor_dims(self.domain)
 
-        # === Initialize models ===
-        self.models, self.rng = TraceCompiler.init_layer_params(
-            self.all_ops, self.domain_data.dimension, tensor_dims, self.rng, self.log
-        )
+            # === Initialize models ===
+            self.models, self.rng = TraceCompiler.init_layer_params(
+                self.all_ops, self.domain_data.dimension, tensor_dims, self.rng, self.log
+            )
 
-        # === Apply sharding to model arrays ===
-        self.models = self._shard_params(self.models)
+            # === Apply sharding to model arrays ===
+            self.models = self._shard_params(self.models)
+        else:
+            self.domain_data = None
+            self.models = {}
 
         # === Compile constraints and trackers ===
         self.compiled_trackers = []
@@ -1541,8 +1616,8 @@ class core:
         min_consecutive: Optional[int] = 1,
         profile: bool = False,
         callbacks: Optional[List] = None,
-        substeps=None,
-    ):
+        substeps: list | None = None,
+    ) -> "statistics":
         """Train using per-model optimizers attached via ``model.optimizer()``.
 
         Every model used in the constraints **must** have an optimizer
@@ -1594,7 +1669,6 @@ class core:
 
                     crux = jno.core(
                         [L_pde, beta * L_int_phy, alpha * L_data, beta * L_int_syn],
-                        domain,
                     )
                     crux.solve(1_500, substeps=[[0, 1], [2, 3]])
                     # 1500 outer epochs × 2 substeps = 3000 effective gradient steps
@@ -1609,7 +1683,7 @@ class core:
         if not self.constraints:
             raise ValueError(
                 "solve() requires at least one constraint. "
-                "Pass a non-empty list to jno.core([...], domain) — typically a "
+                "Pass a non-empty list to jno.core([...]) — typically a "
                 "PDE residual .mse, a boundary-condition loss, or a data-fitting term."
             )
 
@@ -1627,29 +1701,39 @@ class core:
             )
             accumulation_steps = 1
 
-        # Guard: IntegralTime requires min_consecutive >= 2
-        def _has_integral_time(node):
-            if isinstance(node, IntegralTime):
+        # Guard: IntegralTime / TemporalDerivative require min_consecutive >= 2
+        def _has_node_type(node, target_type):
+            if isinstance(node, target_type):
                 return True
             for attr in ("target", "left", "right", "expr"):
                 child = getattr(node, attr, None)
-                if isinstance(child, Placeholder) and _has_integral_time(child):
+                if isinstance(child, Placeholder) and _has_node_type(child, target_type):
                     return True
             for attr in ("args", "variables"):
                 for child in getattr(node, attr, []):
-                    if isinstance(child, Placeholder) and _has_integral_time(child):
+                    if isinstance(child, Placeholder) and _has_node_type(child, target_type):
                         return True
             return False
 
         if min_consecutive is not None and min_consecutive < 2:
+            from .trace import TemporalDerivative as _TD  # noqa: PLC0415
+
             for expr in getattr(self, "_constraint_exprs", []):
-                if _has_integral_time(expr):
+                if _has_node_type(expr, IntegralTime):
                     raise ValueError(
                         f"IntegralTime (.integrate(t)) requires min_consecutive >= 2 "
                         f"(trapezoidal integration over a single time step is identically zero). "
                         f"Got min_consecutive={min_consecutive} (the default is 1). "
                         f"Pass min_consecutive=None to use all T time steps, "
                         f"or min_consecutive=2 for the minimum valid windowed integration."
+                    )
+                if _has_node_type(expr, _TD):
+                    raise ValueError(
+                        f"TemporalDerivative (.field.bind(t=...).t) requires min_consecutive >= 2 "
+                        f"(needs at least two consecutive time steps for a finite difference). "
+                        f"Got min_consecutive={min_consecutive}. "
+                        f"Pass min_consecutive=None to use all T time steps, or "
+                        f"min_consecutive=3 for central differences at interior steps."
                     )
 
         if (
@@ -4317,7 +4401,7 @@ class core:
         Can be called any time after ``compile()`` or ``solve()`` has
         run.  Useful for troubleshooting shape mismatches::
 
-            crux = jno.core([pde.mse, ini.mse], domain)
+            crux = jno.core([pde.mse, ini.mse])
             crux.print_shapes()
         """
         ctx_single = self._build_shape_context(min_consecutive=min_consecutive)
@@ -4352,7 +4436,7 @@ class core:
         optimizer: Union[str, type],
         budget: int,
         devices: Union[None, int, str, List[int], DeviceConfig] = None,
-    ):
+    ) -> "statistics":
         """Run architecture and hyperparameter search with optional parallelism.
 
         Args:
@@ -4476,7 +4560,7 @@ class core:
         operation: Union[List[BinaryOp], BinaryOp],
         domain: Optional[domain] = None,
         min_consecutive: Optional[int] = 1,
-        key=None,
+        key: Any = None,
         samples: str = "auto",
     ):
         """Evaluate an operation (or list of operations) on the current models.
@@ -4506,8 +4590,18 @@ class core:
                 posterior (``f(mean(θ)) ≠ mean(f(θ))``).
         """
 
-        if isinstance(operation, Placeholder):
-            operation = [operation]
+        # Accept typed semantic views (ScalarView, VectorView, ...) — unwrap
+        # to the underlying Placeholder so callers can pass `grad_u.dot(n).integrate()`
+        # (a ScalarView) directly to eval without `.expr` boilerplate.
+        from .trace.views import _VIEW_TYPES as _eval_view_types
+
+        def _unwrap_view(op):
+            return op._expr if isinstance(op, _eval_view_types) else op
+
+        if isinstance(operation, _eval_view_types) or isinstance(operation, Placeholder):
+            operation = [_unwrap_view(operation)]
+        else:
+            operation = [_unwrap_view(op) for op in operation]
 
         if samples not in ("auto", "chain", "point"):
             raise ValueError(f"crux.eval(samples=...) expects 'auto' | 'chain' | 'point', got {samples!r}.")

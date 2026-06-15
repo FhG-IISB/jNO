@@ -1,25 +1,4 @@
-"""11 — U-Net 2D for Poisson operator learning
-
-Problem
--------
-Learn the solution operator of the 2-D Poisson equation
-    −∇²u = f   on [0,1]²,   u = 0 on ∂[0,1]²
-from a dataset of (f, u) pairs generated analytically with a truncated
-sinusoidal basis.
-
-Architecture
-------------
-foundax.unet2d is a convolutional encoder-decoder with skip connections.
-The encoder progressively downsamples the input through ``depth`` levels;
-the decoder upsamples and merges with the corresponding encoder feature
-maps via concatenation.  This makes the network naturally multiscale,
-which is useful when the solution operator has both local and large-scale
-structure.
-
-``padding_mode="reflect"`` mirrors the boundary values rather than
-zero-padding — preferred over circular padding for non-periodic
-Dirichlet problems like this one.
-"""
+"""11 — U-Net 2D for Poisson operator learning"""
 
 import foundax
 import jax
@@ -62,5 +41,5 @@ u.optimizer(
 
 # ── Supervised loss + solve ─────────────────────────────────────────────────
 # u(_f[0, ...]) drops a leading singleton axis because UNet expects (B, H, W, C).
-crux = jno.core([(_u - u(_f[0, ...])).mse], domain)
+crux = jno.core([(_u - u(_f[0, ...])).mse])
 crux.solve(epochs=EPOCHS, batchsize=BATCH)

@@ -1,53 +1,4 @@
-"""09 — BNN regression via Variational Inference (mean-field)
-
-Same regression problem as Tutorial 07 — approximate
-
-    u(x) = sin³(6x),     x ∈ [-1, 1],
-
-from 32 noisy observations placed in ``[-0.8, -0.2] ∪ [0.2, 0.8]`` —
-a deliberate gap around ``x = 0`` — but trained via **mean-field
-Variational Inference** (``blackjax.meanfield_vi``) instead of SGLD.
-
-Compared with T07's vanilla SGLD result on the same dataset, VI is:
-
-* **optimisation-based** — fits a Gaussian product ``q(θ)`` to the
-  posterior by maximising the evidence lower bound (ELBO), then draws
-  i.i.d. samples from the fitted ``q``.  Each ELBO step is one optax
-  update — feels just like training a regular network.
-* **much faster** at producing usable predictive bands — typically a
-  few hundred steps for a small MLP versus the thousands-of-steps
-  budget SGLD needs to wander far enough through the posterior.
-* **tighter but less calibrated** in the data-dense region —
-  mean-field assumes per-weight independence and can underestimate
-  posterior variance for correlated weights.  Trade-off vs SGLD's
-  wider but better-mixed chain.
-
-Both methods produce the same headline B-PINN behaviour: the
-predictive band **widens in the data gap** because the posterior
-weight distribution disagrees more strongly there.
-
-Wiring
-------
-Same as T07 — 32 training inputs as a 1-D point cloud, ``y_train`` as
-a plain ``jnp`` constant in the residual, inference on a dense
-``jno.domain.line(...)`` grid via ``crux.eval``.  The only change is
-swapping ``.bayesian(blackjax.sgld, ...)`` for ``.vi(blackjax.meanfield_vi,
-optimizer=optax.adam(1e-3), ...)`` — same downstream API.
-
-References
-----------
-Kucukelbir, A., Tran, D., Ranganath, R., Gelman, A., & Blei, D. M.
-(2017).  *Automatic Differentiation Variational Inference.*  JMLR
-18(1), 430-474.
-
-Hoffman, M. D., Blei, D. M., Wang, C., & Paisley, J. (2013).
-*Stochastic Variational Inference.*  JMLR 14(1), 1303-1347.
-
-Yang, L., Meng, X., & Karniadakis, G. E. (2021).  *B-PINNs: Bayesian
-physics-informed neural networks for forward and inverse PDE problems
-with noisy data.*  Journal of Computational Physics, 425, 109913
-(see §3.2 for VI on BNN-PINNs).
-"""
+"""09 — BNN regression via Variational Inference (mean-field)"""
 
 from pathlib import Path
 
@@ -107,7 +58,7 @@ N_obs = float(x_train_np.shape[0])
 y_pred = u_net(x_train_var)
 residual = (y_pred - y_train_const) / sigma_obs * jnp.sqrt(N_obs)
 
-crux = jno.core([residual.mse], train_dom)
+crux = jno.core([residual.mse])
 crux.solve(6000)  # 6000 ELBO optimisation steps
 
 # ── Predict on a dense eval grid (same as T07) ──────────────────────────────

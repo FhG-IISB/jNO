@@ -10,7 +10,7 @@ The example below solves a **parametric 2-D Poisson equation** with a random dif
 
 $$-\nabla \cdot (k \, \nabla u) = 1, \quad u\big|_{\partial\Omega} = 0, \quad k \sim \mathcal{U}(0.5, 1.5)$$
 
-It uses a [DeepONet](foundation_models/Core-Architectures.md) to learn the solution operator — mapping any realisation of $k$ to the corresponding field $u$ — and demonstrates the full jNO pipeline: domain setup, operator network, hard boundary enforcement, checkpointing, and inference on a finer test mesh.
+It uses a [DeepONet](foundation_models/index.md) to learn the solution operator — mapping any realisation of $k$ to the corresponding field $u$ — and demonstrates the full jNO pipeline: domain setup, operator network, hard boundary enforcement, checkpointing, and inference on a finer test mesh.
 
 ```python
 import jno
@@ -49,7 +49,7 @@ pde = k * (u.dd(x) + u.dd(y)) + 1.0  # PDE residual
 cb = jno.callbacks.checkpoint(save_interval_epochs=5000, best_fn=lambda m: m["total_loss"])
 
 # Compile → train → save
-crux = jno.core(constraints=[pde.mse], domain=dom)
+crux = jno.core(constraints=[pde.mse])
 crux.print_shapes()
 crux.solve(epochs=20_000, batchsize=32, callbacks=[cb]).plot(f"{dir}/training.png")
 jno.save(crux, f"{dir}/model.pkl")
@@ -66,9 +66,9 @@ print(pred.shape, x_t.shape, y_t.shape, k_t.shape)
 
 1. Run the example above (or a tutorial from `docs/tutorial_examples/`).
 2. Learn domain construction in [Domain and Geometry](Domain-and-Geometry.md).
-3. Configure optimization in [Training](Training.md).
-4. Control trainability in [Model Controls](Model-Controls.md).
-5. Explore model families in [Foundax Core Architectures](foundation_models/Core-Architectures.md).
+3. Configure optimization in [Training](training/index.md).
+4. Control trainability in [Model Controls](model-controls/index.md).
+5. Explore model families in [Foundation Models](foundation_models/index.md).
 
 ## Project Setup Helper
 

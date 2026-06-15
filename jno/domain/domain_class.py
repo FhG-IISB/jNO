@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union, cast
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union, cast, overload
 
 import cloudpickle
 import jax
@@ -921,6 +921,20 @@ class domain(MeshIOMixin):
         return self
 
     # FEM/ variational interface
+
+    @property
+    def built_mesh(self) -> "meshio.Mesh":
+        """The constructed mesh, guaranteed non-``None``.
+
+        Use this instead of ``.mesh`` when reading mesh data (``.points``,
+        ``.cells_dict``): ``.mesh`` is ``meshio.Mesh | None`` until a mesh is
+        built/loaded, so a type checker flags member access on it. This accessor
+        asserts the mesh exists and returns it, clearing that noise. Raises
+        ``RuntimeError`` if called before ``build_mesh()`` (or a mesh load).
+        """
+        if self.mesh is None:
+            raise RuntimeError("Mesh has not been built — call build_mesh() (or load a mesh) first.")
+        return self.mesh
 
     @property
     def _domain_mesh_connectivities(self) -> List:
@@ -1999,6 +2013,40 @@ class domain(MeshIOMixin):
         self.context[name] = tensor
         self._param_tags.add(name)
         return self
+
+    # The dominant call ``x, y, _ = dom.variable("interior")`` returns a tuple of
+    # coordinate ``Variable``s; typing it (rather than ``Any``) is what makes the
+    # whole traced-DSL chain — ``x.d(x)``, ``u.scalar``, … — discoverable in an
+    # IDE. The tensor-tag / flagged forms stay ``Any`` (unchanged permissiveness).
+    @overload
+    def variable(
+        self,
+        tag: str,
+        sample: Tuple[Optional[int], Optional[Callable]] = (None, None),
+        resampling_strategy=None,
+        normals: bool = False,
+        reverse_normals: bool = False,
+        view_factor: bool = False,
+        point_data: bool = False,
+        split: bool = False,
+        return_indices: Literal[False] = False,
+        time_value: Optional[float] = None,
+    ) -> "tuple[Variable, ...]": ...
+
+    @overload
+    def variable(
+        self,
+        tag: str,
+        sample: Any = (None, None),
+        resampling_strategy=None,
+        normals: bool = False,
+        reverse_normals: bool = False,
+        view_factor: bool = False,
+        point_data: bool = False,
+        split: bool = False,
+        return_indices: bool = False,
+        time_value: Optional[float] = None,
+    ) -> Any: ...
 
     def variable(
         self,

@@ -207,7 +207,7 @@ class TestJaxKANWrap:
         u = net(jnn.concat([x, y], axis=-1))
         zero = (u * 0.0).mse
 
-        crux = jno.core([zero], domain)
+        crux = jno.core([zero])
 
         # Regression target: this used to fail with
         # "grad requires real- or complex-valued inputs ... got uint32".

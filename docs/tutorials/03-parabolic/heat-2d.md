@@ -1,8 +1,8 @@
 # Heat 2D
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/03_parabolic/heat_2d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/03-parabolic/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/03_parabolic/heat_2d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/03-parabolic/">Back to chapter</a>
 </div>
 
 This example extends the heat equation to a square domain and shows how to inspect the learned solution at multiple time slices.
@@ -60,7 +60,7 @@ The transient residual enforces the heat equation, while a dedicated initial-con
 pde = u.d(t) - α * jno.np.laplacian(u, [x, y])
 ini = u0 - jno.np.sin(π * x0) * jno.np.sin(π * y0)
 
-crux    = jno.core([pde.mse, ini.mse], domain)
+crux    = jno.core([pde.mse, ini.mse])
 history = crux.solve(40000)
 ```
 
@@ -89,8 +89,8 @@ rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_
 - The same ideas generalize to more complex transient PDEs.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/03_parabolic/heat_2d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/03-parabolic/">Back to 03 Parabolic</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/03_parabolic/heat_2d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/03-parabolic/">Back to 03 Parabolic</a>
 </div>
 
 ## Script Snippet

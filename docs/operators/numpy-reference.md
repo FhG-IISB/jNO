@@ -94,7 +94,7 @@ Example:
 
 ```python
 pde = jnn.laplacian(u, [x, y]) + 1.0
-crux = jno.core([pde.mse], domain)       # minimise  mean((Δu+1)²)
+crux = jno.core([pde.mse])       # minimise  mean((Δu+1)²)
 ```
 
 ---

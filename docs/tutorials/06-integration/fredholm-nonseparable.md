@@ -1,8 +1,8 @@
 # Fredholm Equation with Non-Separable Kernel
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/06_integration/fredholm_nonseparable.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/06-integration/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/06_integration/fredholm_nonseparable.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/06-integration/">Back to chapter</a>
 </div>
 
 This example solves a Fredholm integral equation of the second kind whose kernel depends on **both** the evaluation point and the integration dummy simultaneously.  It requires the `.integrate(var=x)` API introduced for non-separable kernels.
@@ -67,7 +67,7 @@ residual = u_x - f - integral_term   # (N, 1)
 ## Step 4: Solve
 
 ```python
-crux = jno.core([residual.mse], domain)
+crux = jno.core([residual.mse])
 crux.solve(30_000)
 ```
 
@@ -103,6 +103,6 @@ The inner call sweeps `t`; the outer scalar call then integrates `g(x)` over `x`
 ```
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/06_integration/fredholm_nonseparable.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/06-integration/">Back to 06 Integration</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/06_integration/fredholm_nonseparable.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/06-integration/">Back to 06 Integration</a>
 </div>

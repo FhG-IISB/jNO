@@ -26,6 +26,7 @@ from .trace import (
     OperationDef,
     Placeholder,
     StateField,
+    TemporalDerivative,
     TensorTag,
     TestFunction,
     TunableModule,
@@ -305,6 +306,7 @@ class TraceEvaluator:
         (Hessian, "_eval_hessian"),
         (Integral, "_eval_integral"),
         (IntegralTime, "_eval_integral_time"),
+        (TemporalDerivative, "_eval_temporal_derivative"),
         (OperationDef, "_eval_operation_def"),
         (TestFunction, "_eval_test_function"),
         (Assembly, "_eval_assembly"),
@@ -1149,42 +1151,60 @@ class TraceEvaluator:
 
             # FD operators expect flat 1-D (N,) values.  Operator-learning
             # models (Poseidon, FNO, …) return image-shaped tensors whose
-            # total size equals N_mesh.  Auto-flatten them and remember the
-            # original shape so we can restore it afterwards.
+            # spatial axes flatten to N_mesh.  Auto-flatten them and remember
+            # the original shape so we can restore it afterwards.  Multi-
+            # channel outputs (C > 1) are handled by vmapping the stencil
+            # over the channel axis.  The multi-channel branch is gated on
+            # ``ndim > 2`` so plain ``(N_points, 1)`` per-point scalars do
+            # not get reinterpreted as an image.
             u_squeezed = u_full.squeeze(-1) if (u_full.ndim > 1 and u_full.shape[-1] == 1) else u_full
             image_shape = None
+            n_channels = 1
             if u_squeezed.ndim > 1 and u_squeezed.size == N_mesh:
+                # Image-shaped, single channel: (H, W, 1) or (H, W).
                 image_shape = u_full.shape
-                u_full_1d = u_squeezed.ravel()
+                u_full_flat = u_squeezed.reshape(N_mesh)
+            elif u_full.ndim > 2 and int(np.prod(u_full.shape[:-1])) == N_mesh:
+                # Image-shaped, multi-channel: (H, W, C) with C > 1.
+                image_shape = u_full.shape
+                n_channels = u_full.shape[-1]
+                u_full_flat = u_full.reshape(N_mesh, n_channels)
             else:
-                u_full_1d = u_squeezed if u_squeezed.ndim == 1 else u_squeezed.ravel()
+                u_full_flat = u_squeezed if u_squeezed.ndim == 1 else u_squeezed.ravel()
 
             _, grad_method, _lap_method = DifferentialOperators.parse_fd_scheme(scheme)
-            jac_components = []
-            for _i, vi_dim in var_dims:
+
+            def _grad_one_channel(u_1d, vi_dim):
                 if mesh_dim == 1:
-                    grad_full = DifferentialOperators.compute_fd_gradient_1d_simple(
-                        u_full_1d,
+                    return DifferentialOperators.compute_fd_gradient_1d_simple(
+                        u_1d,
                         mesh_points,
                         domain.mesh_connectivity["lines"],
                         method=grad_method,
                     )
-                elif mesh_dim == 2:
-                    grad_full = DifferentialOperators.compute_fd_gradient_2d_simple(
-                        u_full_1d,
+                if mesh_dim == 2:
+                    return DifferentialOperators.compute_fd_gradient_2d_simple(
+                        u_1d,
                         mesh_points,
                         domain.mesh_connectivity["triangles"],
                         vi_dim,
                         method=grad_method,
                     )
-                elif mesh_dim == 3:
-                    grad_full = DifferentialOperators.compute_fd_gradient_3d_simple(
-                        u_full_1d,
-                        mesh_points,
-                        domain.mesh_connectivity["tetrahedra"],
-                        vi_dim,
-                        method=grad_method,
-                    )
+                return DifferentialOperators.compute_fd_gradient_3d_simple(
+                    u_1d,
+                    mesh_points,
+                    domain.mesh_connectivity["tetrahedra"],
+                    vi_dim,
+                    method=grad_method,
+                )
+
+            jac_components = []
+            for _i, vi_dim in var_dims:
+                if image_shape is not None and n_channels > 1:
+                    # (N_mesh, C) → per-channel FD → (C, N_mesh) → (N_mesh, C)
+                    grad_full = jax.vmap(lambda u_c, _vd=vi_dim: _grad_one_channel(u_c, _vd))(u_full_flat.T).T
+                else:
+                    grad_full = _grad_one_channel(u_full_flat, vi_dim)
                 jac_components.append(grad_full)
 
             if image_shape is not None:
@@ -1307,46 +1327,74 @@ class TraceEvaluator:
             u_full = u_at_pts(mesh_points)
             N_mesh = mesh_points.shape[0]
 
-            # Auto-flatten image-shaped model outputs to (N_mesh,).
+            # Auto-flatten image-shaped model outputs and handle multi-channel.
             # See the Jacobian FD path for the same logic.
             u_squeezed = u_full.squeeze(-1) if (u_full.ndim > 1 and u_full.shape[-1] == 1) else u_full
             image_shape = None
+            n_channels = 1
             if u_squeezed.ndim > 1 and u_squeezed.size == N_mesh:
                 image_shape = u_full.shape
-                u_full_1d = u_squeezed.ravel()
+                u_full_flat = u_squeezed.reshape(N_mesh)
+            elif u_full.ndim > 2 and int(np.prod(u_full.shape[:-1])) == N_mesh:
+                image_shape = u_full.shape
+                n_channels = u_full.shape[-1]
+                u_full_flat = u_full.reshape(N_mesh, n_channels)
             else:
-                u_full_1d = u_squeezed if u_squeezed.ndim == 1 else u_squeezed.ravel()
+                u_full_flat = u_squeezed if u_squeezed.ndim == 1 else u_squeezed.ravel()
 
             _main, _grad_method, lap_method = DifferentialOperators.parse_fd_scheme(scheme)
 
-            if compute_trace:
-                # Laplacian: sum of second derivatives on diagonal
+            def _lap_one_channel(u_1d):
                 if mesh_dim == 1:
-                    lap_full = DifferentialOperators.compute_fd_laplacian_1d_simple(
-                        u_full_1d,
+                    return DifferentialOperators.compute_fd_laplacian_1d_simple(
+                        u_1d,
                         mesh_points,
                         domain.mesh_connectivity["lines"],
                         method=lap_method,
                     )
-                elif mesh_dim == 2:
-                    lap_full = DifferentialOperators.compute_fd_laplacian_2d_simple(
-                        u_full_1d,
+                if mesh_dim == 2:
+                    return DifferentialOperators.compute_fd_laplacian_2d_simple(
+                        u_1d,
                         mesh_points,
                         domain.mesh_connectivity["triangles"],
                         dims,
                         method=lap_method,
                     )
-                elif mesh_dim == 3:
-                    lap_full = DifferentialOperators.compute_fd_laplacian_3d_simple(
-                        u_full_1d,
-                        mesh_points,
-                        domain.mesh_connectivity["tetrahedra"],
-                        dims,
-                        method=lap_method,
+                return DifferentialOperators.compute_fd_laplacian_3d_simple(
+                    u_1d,
+                    mesh_points,
+                    domain.mesh_connectivity["tetrahedra"],
+                    dims,
+                    method=lap_method,
+                )
+
+            def _hess_one_channel(u_1d):
+                if mesh_dim == 1:
+                    return DifferentialOperators.compute_fd_hessian_1d_simple(
+                        u_1d, mesh_points, domain.mesh_connectivity["lines"]
                     )
+                if mesh_dim == 2:
+                    return DifferentialOperators.compute_fd_hessian_2d_simple(
+                        u_1d,
+                        mesh_points,
+                        domain.mesh_connectivity["triangles"],
+                        var_dims,
+                    )
+                return DifferentialOperators.compute_fd_hessian_3d_simple(
+                    u_1d,
+                    mesh_points,
+                    domain.mesh_connectivity["tetrahedra"],
+                    var_dims,
+                )
+
+            if compute_trace:
+                # Laplacian: sum of second derivatives on diagonal
+                if image_shape is not None and n_channels > 1:
+                    lap_full = jax.vmap(_lap_one_channel)(u_full_flat.T).T  # (N_mesh, C)
+                else:
+                    lap_full = _lap_one_channel(u_full_flat)
 
                 if image_shape is not None:
-                    # Return in the same image shape as the model output
                     return lap_full.reshape(image_shape)
 
                 if points is not None:
@@ -1355,25 +1403,16 @@ class TraceEvaluator:
                 return lap_full[:, jnp.newaxis] if lap_full.ndim == 1 else lap_full
             else:
                 # Full Hessian matrix
-                if mesh_dim == 1:
-                    hess_full = DifferentialOperators.compute_fd_hessian_1d_simple(
-                        u_full_1d, mesh_points, domain.mesh_connectivity["lines"]
-                    )
-                elif mesh_dim == 2:
-                    hess_full = DifferentialOperators.compute_fd_hessian_2d_simple(
-                        u_full_1d,
-                        mesh_points,
-                        domain.mesh_connectivity["triangles"],
-                        var_dims,
-                    )
-                elif mesh_dim == 3:
-                    hess_full = DifferentialOperators.compute_fd_hessian_3d_simple(
-                        u_full_1d,
-                        mesh_points,
-                        domain.mesh_connectivity["tetrahedra"],
-                        var_dims,
-                    )
+                if image_shape is not None and n_channels > 1:
+                    # Per-channel: (N_mesh, C) → (C, N_mesh, n, n) → (N_mesh, C, n, n)
+                    hess_per_c = jax.vmap(_hess_one_channel)(u_full_flat.T)
+                    hess_full = jnp.moveaxis(hess_per_c, 0, 1)
+                else:
+                    hess_full = _hess_one_channel(u_full_flat)
+
                 if image_shape is not None:
+                    if n_channels > 1:
+                        return hess_full.reshape(*image_shape[:-1], n_channels, n, n)
                     return hess_full.reshape(*image_shape[:-1], n, n)
                 return self._map_mesh_to_sampled(mesh_points, points, hess_full)
 
@@ -1621,6 +1660,56 @@ class TraceEvaluator:
         # Broadcast w to match results shape and sum over time axis
         w_idx = (slice(None),) + (None,) * (results.ndim - 1)
         return jnp.sum(results * w[w_idx], axis=0)
+
+    def _eval_temporal_derivative(self, expr: "TemporalDerivative", ctx):
+        """First-order time derivative via cross-step finite differences.
+
+        The compiler pre-computes ``expr.target`` on all W consecutive time
+        steps before the per-step vmap and injects the resulting window into
+        ``ctx["__temporal_fd_cache__"][id(expr.target)]``.  Here we read that
+        window, identify the current step via ``ctx["__step_index__"]``, and
+        return a clamped central difference.  At the interior of the window
+        this is a 2-point central diff ``(u[i+1] - u[i-1]) / (2*dt)``; at the
+        first/last step the indices clamp to the boundary, yielding a one-
+        sided forward/backward diff ``(u[1] - u[0]) / dt`` or its mirror.
+
+        Raises if the compiler did not populate the cache (i.e.
+        ``min_consecutive`` is missing or ``< 2`` for the current solve).
+        """
+        cache = ctx.context.get("__temporal_fd_cache__")
+        t_window = ctx.context.get("__time_window__")
+        step_idx = ctx.context.get("__step_index__")
+
+        if cache is None or t_window is None or step_idx is None:
+            raise RuntimeError(
+                "TemporalDerivative: temporal-FD cache not populated. "
+                "Use crux.solve(..., min_consecutive>=2) (>=3 recommended) "
+                "on a time-dependent domain to enable cross-step temporal FD."
+            )
+
+        tid = id(expr.target)
+        if tid not in cache:
+            raise RuntimeError(
+                "TemporalDerivative: target was not pre-computed by the compiler. "
+                "This indicates a bug in trace traversal — please report it."
+            )
+
+        u_window = cache[tid]  # (W, ...)
+        W = u_window.shape[0]
+        if W < 2:
+            raise RuntimeError(
+                f"TemporalDerivative requires window size W >= 2 but got W={W}. Pass min_consecutive >= 2 to crux.solve()."
+            )
+
+        step_idx = jnp.asarray(step_idx, dtype=jnp.int32)
+        i_prev = jnp.maximum(step_idx - 1, 0)
+        i_next = jnp.minimum(step_idx + 1, W - 1)
+        t_prev = t_window[i_prev, 0]
+        t_next = t_window[i_next, 0]
+        dt_eff = t_next - t_prev  # 2*dt interior, dt at edge
+        u_prev = u_window[i_prev]
+        u_next = u_window[i_next]
+        return (u_next - u_prev) / dt_eff
 
     @staticmethod
     def _get_integral_cache(domain, tag: str, mc: dict) -> dict:

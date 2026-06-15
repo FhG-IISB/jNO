@@ -40,7 +40,7 @@ def _make_pde_bc_solver(*, hidden_dims=16, num_layers=2, mesh_size=0.05, key=Non
     u = u_net(x)
     pde = -jnn.laplacian(u, [x]) - jnn.sin(jnn.pi * x)
     bc = u_net(xb)
-    solver = jno.core([pde.mse, bc.mse], domain)
+    solver = jno.core([pde.mse, bc.mse])
     return solver, u_net
 
 
@@ -53,7 +53,7 @@ def _make_simple_solver(*, key=None):
     u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=key))
     u = u_net(x) * x * (1 - x)
     pde = jnn.laplacian(u, [x]) - jnn.sin(jnn.pi * x)
-    solver = jno.core([pde.mse], domain)
+    solver = jno.core([pde.mse])
     return solver, u_net
 
 
@@ -314,7 +314,7 @@ class TestResamplingCorrectness:
         u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=jax.random.PRNGKey(0)))
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x]) - jnn.sin(jnn.pi * x)
-        solver = jno.core([pde], domain)
+        solver = jno.core([pde])
         u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
         solver.solve(epochs=5)
 
@@ -333,7 +333,7 @@ class TestResamplingCorrectness:
         u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=jax.random.PRNGKey(1)))
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x]) - jnn.sin(jnn.pi * x)
-        solver = jno.core([pde], domain)
+        solver = jno.core([pde])
         u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
         solver.solve(epochs=5)
 
@@ -558,7 +558,7 @@ class TestStopGradient:
         """L_int_phy = (u_phy - stop_gradient(u_syn)).mse must not change syn weights."""
         domain, x, phy, syn, u_phy, u_syn = self._setup()
         L = (u_phy - jno.fn.stop_gradient(u_syn)).mse
-        crux = jno.core([L], domain)
+        crux = jno.core([L])
 
         before_phy = _model_leaves(crux, phy.layer_id)
         before_syn = _model_leaves(crux, syn.layer_id)
@@ -573,7 +573,7 @@ class TestStopGradient:
         """L_int_syn = (u_syn - stop_gradient(u_phy)).mse must not change phy weights."""
         domain, x, phy, syn, u_phy, u_syn = self._setup()
         L = (u_syn - jno.fn.stop_gradient(u_phy)).mse
-        crux = jno.core([L], domain)
+        crux = jno.core([L])
 
         before_phy = _model_leaves(crux, phy.layer_id)
         before_syn = _model_leaves(crux, syn.layer_id)
@@ -588,7 +588,7 @@ class TestStopGradient:
         """Negative control: without stop_gradient, the interaction loss updates both models."""
         domain, x, phy, syn, u_phy, u_syn = self._setup()
         L = (u_phy - u_syn).mse  # no stop_gradient
-        crux = jno.core([L], domain)
+        crux = jno.core([L])
 
         before_phy = _model_leaves(crux, phy.layer_id)
         before_syn = _model_leaves(crux, syn.layer_id)

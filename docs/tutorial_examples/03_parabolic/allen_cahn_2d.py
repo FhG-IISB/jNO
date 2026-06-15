@@ -1,22 +1,4 @@
-"""03 — 2-D Allen–Cahn equation  (manufactured-solution verification)
-
-Problem (Allen–Cahn with source)
----------------------------------
-    ∂u/∂t = ε² ∇²u + u − u³ + f(x,y,t),   (x,y) ∈ [0,1]²,  t ∈ [0,1]
-
-Manufactured solution
----------------------
-    u(x,y,t) = e^{−t} sin(πx) sin(πy)
-
-This automatically satisfies homogeneous Dirichlet BCs on ∂[0,1]².
-The source term is computed by substitution:
-
-    f = u_t − ε² ∇²u − u + u³
-      = e^{−t} sin(πx) sin(πy) (2ε²π² − 2)
-        + e^{−3t} sin³(πx) sin³(πy)
-
-Parameters: ε = 0.1  (interface width)
-"""
+"""03 — 2-D Allen–Cahn equation (manufactured-solution verification)"""
 
 import foundax
 import jax
@@ -25,26 +7,19 @@ import optax
 import jno
 
 π = jno.np.pi
-sin = jno.np.sin
-exp = jno.np.exp
-eps = 0.1
+ε = 0.1
 T_end = 1.0
 
-# ── Domain ────────────────────────────────────────────────────────────────────
-domain = jno.domain(
-    constructor=jno.domain.rect(mesh_size=0.05),
-    time=(0, T_end, 4),
-)
+# Time-dependent rectangle (jno.domain.rect produces the time-extended sampler;
+# PolygonDomain doesn't yet support the ``time=`` axis).
+domain = jno.domain.rect(mesh_size=0.05, time=(0, T_end, 4))
 x, y, t = domain.variable("interior")
 
-# ── Manufactured solution + source ───────────────────────────────────────────
-S = sin(π * x) * sin(π * y)
-u_exact = exp(-t) * S
+S = jno.np.sin(π * x) * jno.np.sin(π * y)
+u_exact = jno.np.exp(-t) * S
+source = jno.np.exp(-t) * S * (2 * ε**2 * π**2 - 2) + jno.np.exp(-3 * t) * S**3
 
-coeff = 2 * eps**2 * π**2 - 2
-source = exp(-t) * S * coeff + exp(-3 * t) * S**3
-
-# ── Network ───────────────────────────────────────────────────────────────────
+# Network with hard Dirichlet BCs in space; t is fed via the trunk input.
 net = jno.nn.wrap(
     foundax.deeponet(
         n_sensors=1,
@@ -63,21 +38,25 @@ net.optimizer(
 )
 
 xy = jno.np.concat([x, y])
-u = net(t, xy) * x * (1 - x) * y * (1 - y)
+# Bind names so partials read like the math:  u.t, u.xx, u.yy, u.xy, ...
+u = (net(t, xy) * x * (1 - x) * y * (1 - y)).scalar.bind(x=x, y=y, t=t)
 
-# ── PDE residual ──────────────────────────────────────────────────────────────
-pde = u.d(t) - eps**2 * jno.np.laplacian(u, [x, y]) - u + u**3 - source
+pde = u.t - ε**2 * (u.xx + u.yy) - u + u**3 - source
 
-# ── Initial condition  (t=0 via 0*t trick) ──────────────────────────────────
+# Initial condition  (t=0 via 0*t trick)
 u_at_0 = net(0 * t, xy) * x * (1 - x) * y * (1 - y)
-ini = u_at_0 - sin(π * x) * sin(π * y)
+ini = u_at_0 - S
 
-# ── Solve ─────────────────────────────────────────────────────────────────────
-crux = jno.core([pde.mse, ini.mse], domain)
+grad_norms = jno.trackers.gradient_norms(interval=500)
+crux = jno.core([pde.mse, ini.mse])
 
-print(f"Allen–Cahn 2-D  (ε={eps})")
-history = crux.solve(5000)
+print(f"Allen–Cahn 2-D  (ε = {ε})")
+crux.solve(5000, callbacks=[grad_norms])
 
 _u, _u_exact = crux.eval([u, u_exact])
 rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_exact) + 1e-8))
+print(f"Relative L2 error: {rel_l2:.4e}")
+if grad_norms.value is not None:
+    print(f"Final ∇L norms (pde, ini): {grad_norms.value['norms']}")
+
 assert rel_l2 < 1e-1, f"relative L2 error too large: {rel_l2:.3e}"

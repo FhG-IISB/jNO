@@ -82,7 +82,7 @@ Loss weights are **traced placeholders** — call an adaptive balancer with your
 ```python
 w_pde, w_bc = jno.fn.adaptive.relobralo([pde, bc])
 
-crux = jno.core([w_pde * pde, w_bc * bc], domain)
+crux = jno.core([w_pde * pde, w_bc * bc])
 ```
 
 The weights are recomputed inside the compiled JAX function every step — no Python callback overhead.
@@ -92,7 +92,7 @@ The weights are recomputed inside the compiled JAX function every step — no Py
 Each weight placeholder exposes a `.tracker()` method that logs its value during training without contributing to the loss:
 
 ```python
-crux = jno.core([w_pde * pde, w_bc * bc, w_pde.tracker(), w_bc.tracker()], domain)
+crux = jno.core([w_pde * pde, w_bc * bc, w_pde.tracker(), w_bc.tracker()])
 ```
 
 ### Available balancers

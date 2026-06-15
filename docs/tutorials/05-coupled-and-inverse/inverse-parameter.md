@@ -1,8 +1,8 @@
 # Inverse Parameter
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/05_coupled_and_inverse/inverse_parameter.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/05-coupled-and-inverse/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/05_coupled_and_inverse/inverse_parameter.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/05-coupled-and-inverse/">Back to chapter</a>
 </div>
 
 This example is an inverse problem rather than a field solve: it learns unknown scalar coefficients from residual constraints.
@@ -45,7 +45,7 @@ for net in [a, b, c]:
 After optimization, the identified parameters are printed from the trained model set.
 
 ```python
-crux    = jno.core([residual.mse], domain)
+crux    = jno.core([residual.mse])
 history = crux.solve(30000)
 
 _a, _b, _c = crux.eval([a, b, c])
@@ -67,8 +67,8 @@ For field identification (recovering a spatially-varying `k(x,y)` rather than a 
 - `jno.domain.from_array` — attaching sparse sensor observations without file I/O
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/05_coupled_and_inverse/inverse_parameter.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/05-coupled-and-inverse/">Back to 05 Coupled and Inverse</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/05_coupled_and_inverse/inverse_parameter.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/05-coupled-and-inverse/">Back to 05 Coupled and Inverse</a>
 </div>
 
 ## Script Snippet

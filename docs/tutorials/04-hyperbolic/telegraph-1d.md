@@ -1,8 +1,8 @@
 # Telegraph 1D
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/04_hyperbolic/telegraph_1d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/04-hyperbolic/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/04_hyperbolic/telegraph_1d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/04-hyperbolic/">Back to chapter</a>
 </div>
 
 This example adds damping to a wave equation and produces the classical telegraph equation.
@@ -65,7 +65,7 @@ pde = (u.d2(t)
        - c**2 * u.d2(x)
        - source)
 
-crux    = jno.core([pde.mse, ini_u.mse, ini_ut.mse], domain)
+crux    = jno.core([pde.mse, ini_u.mse, ini_ut.mse])
 history = crux.solve(5000)
 ```
 
@@ -76,8 +76,8 @@ history = crux.solve(5000)
 - The example is useful for understanding how multiple time-derivative orders coexist in one residual.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/04_hyperbolic/telegraph_1d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/04-hyperbolic/">Back to 04 Hyperbolic</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/04_hyperbolic/telegraph_1d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/04-hyperbolic/">Back to 04 Hyperbolic</a>
 </div>
 
 ## Script Snippet

@@ -189,10 +189,10 @@ A value near +1 means both groups reinforce the same parameter updates; near -1 
 
 ### Using the Jacobian in a training loss
 
-`u.grad(net)` can be included directly in a training constraint — for example to encourage the NTK to be well-conditioned — but this requires differentiating *through* `jax.jacrev`, which is second-order AD and expensive. Wrap in `.stop_gradient()` when you only want the current Jacobian as a constant regulariser:
+`u.grad(net)` can be included directly in a training constraint — for example to encourage the NTK to be well-conditioned — but this requires differentiating *through* `jax.jacrev`, which is second-order AD and expensive. Wrap in `.stop_gradient` when you only want the current Jacobian as a constant regulariser:
 
 ```python
-J_sg = u.grad(u_net).stop_gradient()        # J treated as a constant
+J_sg = u.grad(u_net).stop_gradient        # J treated as a constant
 ntk_reg = (J_sg @ J_sg.T - target_K).mse   # penalise NTK shape cheaply
 ```
 

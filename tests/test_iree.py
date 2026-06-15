@@ -190,7 +190,7 @@ def laplace1d_solver():
     u = u_net(x) * x * (1 - x)
     pde = jnn.grad(jnn.grad(u, x), x) + jnn.sin(jnn.pi * x)
 
-    solver = jno.core([pde.mse], domain)
+    solver = jno.core([pde.mse])
     solver.solve(300)
     return solver, u
 

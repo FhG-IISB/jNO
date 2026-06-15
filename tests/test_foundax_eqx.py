@@ -422,7 +422,7 @@ class TestJNOPipeline:
         u = net(x)
         loss_expr = (u - jnn.sin(jnn.pi * x)).mse
 
-        solver = jno.core([loss_expr], domain)
+        solver = jno.core([loss_expr])
         stats = solver.solve(5)
         assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
 
@@ -440,7 +440,7 @@ class TestJNOPipeline:
         u = train_net(x) + frozen_net(x)
         loss_expr = (u - jnn.sin(jnn.pi * x)).mse
 
-        solver = jno.core([loss_expr], domain)
+        solver = jno.core([loss_expr])
         stats = solver.solve(3)
         assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
 
@@ -456,7 +456,7 @@ class TestJNOPipeline:
         u = net(x)
         loss_expr = (u - jnn.sin(jnn.pi * x)).mse
 
-        solver = jno.core([loss_expr], domain)
+        solver = jno.core([loss_expr])
         stats = solver.solve(3)
         assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
 
@@ -477,6 +477,6 @@ class TestJNOPipeline:
         u = net(x)
         loss_expr = (u - jnn.sin(jnn.pi * x)).mse
 
-        solver = jno.core([loss_expr], domain)
+        solver = jno.core([loss_expr])
         stats = solver.solve(3)
         assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])

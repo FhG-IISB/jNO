@@ -16,8 +16,7 @@ This section covers every aspect of the jNO training pipeline: constructing the 
 
 ```python
 crux = jno.core(
-    constraints=[pde.mse, boc.mse],   # list of scalar Placeholder expressions
-    domain=domain,
+    constraints=[pde.mse, boc.mse], 
     rng_seed=42,                       # optional; also set in .jno.toml → [jno] seed
     mesh=(1, 1),                       # (batch_devices, model_devices)
 )
@@ -54,4 +53,4 @@ crux.solve(1000)
 
 ## Per-Model Controls
 
-Each model is fully independent with respect to its optimiser, trainability, LoRA configuration, and pretrained weight initialisation. See the **[Model Controls](model-controls/index.md)** sub-section for the full API covering freeze, masks, LoRA, dtype conversion, and diagnostics.
+Each model is fully independent with respect to its optimiser, trainability, LoRA configuration, and pretrained weight initialisation. See the **[Model Controls](../model-controls/index.md)** sub-section for the full API covering freeze, masks, LoRA, dtype conversion, and diagnostics.

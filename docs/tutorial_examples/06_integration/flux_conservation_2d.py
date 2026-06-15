@@ -1,24 +1,4 @@
-"""06 — Integral constraints and flux monitoring (2-D Poisson)
-
-Problem
--------
-    −∇²u(x,y) = 2π² sin(πx) sin(πy),   (x,y) ∈ [0,1]²,   u = 0 on ∂Ω
-
-Analytical solution
--------------------
-    u(x,y) = sin(πx) sin(πy)
-
-This tutorial demonstrates how to use .integrate() for two distinct purposes:
-
-1. As a **tracker** — monitor the volume mean ∫_Ω u dA during training.
-   The exact value is 4/π² ≈ 0.405.  A network that only satisfies the zero
-   Dirichlet BC would give ∫ u = 0, so this metric reveals interior accuracy.
-
-2. As a **soft constraint** — enforce a prescribed integral value in the loss,
-   in addition to the PDE residual and boundary condition.
-
-Both uses are JIT-compatible and fully differentiable w.r.t. model parameters.
-"""
+"""06 — Integral constraints and flux monitoring (2-D Poisson)"""
 
 from pathlib import Path
 
@@ -27,13 +7,14 @@ import jax
 import jax.numpy as jnp
 import optax
 from jno.numpy import tracker
+from shapely.geometry import box
 
 import jno
 
 π = jno.np.pi
 
 # ── Domain ─────────────────────────────────────────────────────────────────────
-domain = jno.domain.rect(mesh_size=0.05)
+domain = jno.domain(box(0, 0, 1, 1), mesh_size=0.05)
 
 x, y, _ = domain.variable("interior")
 x_b, y_b, _ = domain.variable("boundary")
@@ -70,11 +51,11 @@ net.optimizer(
 
 # Hard-enforce u=0 on ∂Ω by multiplying by x(1-x)y(1-y).
 # The network then only needs to learn the interior shape.
-u = net(jno.np.concat([x, y], axis=-1)) * x * (1 - x) * y * (1 - y)
+u = (net(jno.np.concat([x, y], axis=-1)) * x * (1 - x) * y * (1 - y)).scalar.bind(x=x, y=y)
 
 # ── Losses ─────────────────────────────────────────────────────────────────────
 # Standard PDE residual
-pde = -u.laplacian(x, y) - forcing
+pde = -(u.xx + u.yy) - forcing
 
 # Volume-mean tracker — logged every 200 epochs, does not enter the gradient.
 # After convergence this should approach TARGET_INTEGRAL ≈ 0.405.
@@ -91,7 +72,7 @@ losses = [pde.mse, vol_mean]
 
 # ── Solve ──────────────────────────────────────────────────────────────────────
 EPOCHS = 30_000
-crux = jno.core(losses, domain).print_shapes()
+crux = jno.core(losses).print_shapes()
 _history = crux.solve(EPOCHS)
 
 # ── Evaluate ───────────────────────────────────────────────────────────────────

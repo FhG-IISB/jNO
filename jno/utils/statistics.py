@@ -49,7 +49,7 @@ class statistics:
                 chunks.append(arr)
         return np.concatenate(chunks) if chunks else np.array([])
 
-    def plot(self, path: str = None):
+    def plot(self, path: str = None) -> "statistics":
         """Plot training statistics from all solve() calls.
 
         Creates a multi-panel figure showing:

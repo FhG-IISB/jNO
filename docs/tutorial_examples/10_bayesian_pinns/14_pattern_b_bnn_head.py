@@ -1,62 +1,4 @@
-"""14 — Pattern B: Bayesian last layer (head sampled, body Adam-trained)
-
-The practical *Bayesian Last Layer* (BLL) recipe — a feature extractor
-fit deterministically with Adam, plus a Bayesian head sampled via MCMC
-to quantify predictive uncertainty.  Compared with Tutorial 10
-(head-only Bayesian, body **frozen at init**), Pattern B trains the
-body simultaneously so the head sees a *learned* feature map rather
-than a random one.
-
-Pattern B (head Bayesian + body Adam on the same model) was a
-v1 limitation when masked Bayesian inference first landed.  Phase 15
-lifted that block (later refactored in Phase 16): ``opt_states`` uses
-composite keys (``"<lid>"`` for the optax body and ``"<lid>.<gi>"``
-for each masked Bayesian/VI group) so each backend's state lives at
-its own slot.
-
-Bayesian Last Layer in jno
---------------------------
-
-.. code-block:: python
-
-    net.optimizer(optax.adam(1e-3))                  # body
-    net.mask(head_mask).bayesian(blackjax.sgld,      # head
-                                  step_size=1e-4)
-
-That's the entire user-facing change vs Tutorial 10.
-
-Pattern B in motion
--------------------
-
-At each step:
-
-1. Compute the full-loss gradient.
-2. Apply the optax update — masked to the **complement** of the
-   Bayesian region, so the body moves but the head doesn't.
-3. Run one MCMC kernel step on the head, using the just-updated
-   body inside the log-density closure.
-
-This is a natural Metropolis-within-Gibbs / stochastic-approximation
-EM scheme: each kernel step samples conditional on the latest body.
-The body's gradient is computed at the current head sample (chain-0
-representative for K>1).
-
-Reference
----------
-Snoek, J., Rippel, O., Swersky, K., Kiros, R., Satish, N.,
-Sundaram, N., Patwary, M. M. A., Prabhat, & Adams, R. P. (2015).
-*Scalable Bayesian Optimization Using Deep Neural Networks.*
-ICML 2015.  https://arxiv.org/abs/1502.05700
-
-Bayesian-Last-Layer / Approximate-Bayesian-NN derivation by Daxberger
-et al. 2021 (*Laplace Redux*) §3 also discusses the head-only
-posterior approximation in the broader Laplace context.
-
-For SAEM convergence theory for the body-as-point-estimate /
-head-as-MCMC scheme, see Cappé & Moulines (2009) *On-line
-Expectation-Maximization Algorithm for Latent Data Models*, JRSS-B
-71(3), 593-613.
-"""
+"""14 — Pattern B: Bayesian last layer (head sampled, body Adam-trained)"""
 
 from pathlib import Path
 
@@ -116,7 +58,7 @@ u_net.mask(head_mask).bayesian(  # ← head
 y_pred = u_net(x_train_var)
 residual = (y_pred - y_train_const) / sigma_obs
 
-crux = jno.core([residual.mse], train_dom)
+crux = jno.core([residual.mse])
 crux.solve(2300)
 
 # ── Diagnostics ─────────────────────────────────────────────────────────────

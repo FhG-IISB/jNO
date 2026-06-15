@@ -850,7 +850,7 @@ class TestLoraIntegration:
         x, *_ = domain.variable("interior")
         u = net(x)
         loss = (u - jnn.sin(jnn.pi * x)).mse
-        stats = jno.core([loss], domain).solve(3)
+        stats = jno.core([loss]).solve(3)
         return stats.training_logs[-1]["total_loss"][-1]
 
     def test_standard_lora_trains(self):
@@ -1058,7 +1058,7 @@ class TestIntegrationCombinations:
     def _solve_single(self, net):
         domain, x = self._domain_and_x()
         loss = (net(x) - jnn.sin(jnn.pi * x)).mse
-        stats = jno.core([loss], domain).solve(3)
+        stats = jno.core([loss]).solve(3)
         return stats.training_logs[-1]["total_loss"][-1]
 
     # ── lora without freeze: base + adapters both update ─────────────────────
@@ -1082,7 +1082,7 @@ class TestIntegrationCombinations:
 
         domain, x = self._domain_and_x()
         loss = (feat(x) + adapter(x) - jnn.sin(jnn.pi * x)).mse
-        stats = jno.core([loss], domain).solve(3)
+        stats = jno.core([loss]).solve(3)
         assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
 
     # ── two LoRA models with different wrappers in one solve ─────────────────
@@ -1095,7 +1095,7 @@ class TestIntegrationCombinations:
         net2.freeze().lora(rank=4, alpha=1.0, wrapper=LoRAFALinear).optimizer(optax.adam, lr=lrs(1e-3))
         domain, x = self._domain_and_x()
         loss = (net1(x) + net2(x) - jnn.sin(jnn.pi * x)).mse
-        stats = jno.core([loss], domain).solve(3)
+        stats = jno.core([loss]).solve(3)
         assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
 
     # ── partial freeze via mask (no LoRA) ─────────────────────────────────────
@@ -1204,7 +1204,7 @@ class TestIntegrationCombinations:
         domain, x = self._domain_and_x()
         loss1 = (net1(x) - jnn.sin(jnn.pi * x)).mse
         loss2 = (net2(x) - jnn.cos(jnn.pi * x)).mse
-        stats = jno.core([loss1, loss2], domain).solve(3)
+        stats = jno.core([loss1, loss2]).solve(3)
         assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
 
     # ── reset then re-configure ───────────────────────────────────────────────
@@ -1235,7 +1235,7 @@ class TestIntegrationCombinations:
         domain, x = self._domain_and_x()
         u = backbone(x) + adapter(x) + head(x)
         loss = (u - jnn.sin(jnn.pi * x)).mse
-        stats = jno.core([loss], domain).solve(3)
+        stats = jno.core([loss]).solve(3)
         assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
 
 

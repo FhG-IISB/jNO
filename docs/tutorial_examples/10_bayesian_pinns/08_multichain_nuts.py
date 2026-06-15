@@ -1,50 +1,4 @@
-"""08 — Multi-chain NUTS with R-hat / ESS convergence diagnostics
-
-Problem
--------
-Same recovery problem as Tutorial 02 — fit ``d(x) = A·sin(πx) +
-B·cos(πx)`` for ``A = 3.14``, ``B = -2.71`` — but this time we run
-**four parallel chains** per Bayesian parameter via
-``.bayesian(blackjax.nuts, num_chains=4, ...)`` and report
-**Gelman-Rubin R-hat** and **effective sample size (ESS)** to confirm
-convergence.
-
-Why multi-chain?
-----------------
-A single MCMC chain can look stationary yet still be stuck in a local
-mode.  R-hat compares between-chain to within-chain variance: values
-close to 1.0 (≤ 1.05 by community convention) indicate the chains are
-exploring the same posterior; values much larger flag non-convergence.
-
-ESS quantifies how many *independent* draws the chain is worth, given
-its autocorrelation.  An ESS of ≈ 100+ per parameter is typically
-considered sufficient for stable posterior summaries.
-
-Technique
----------
-* Per-parameter ``.bayesian(blackjax.nuts, num_chains=4,
-  init_jitter=0.1)`` — four chains, each starting from a slightly
-  jittered position so R-hat is conservative.
-* All four chains share the same window-adapted step size + inverse
-  mass matrix (PyMC convention; cheaper than per-chain adaptation,
-  negligible robustness loss for HMC-family kernels).
-* ``a.posterior_samples`` has shape ``(K, N, *param) = (4, keep, 1)``.
-* ``jno.bayesian.rhat`` and ``jno.bayesian.ess`` take this shape and
-  return per-parameter diagnostics — both pure-JAX, no arviz dep.
-
-References
-----------
-Gelman, A., & Rubin, D. B. (1992).  *Inference from iterative
-simulation using multiple sequences.*  Statistical Science, 7(4),
-457-511.
-
-Vehtari, A., Gelman, A., Simpson, D., Carpenter, B., & Bürkner, P.-C.
-(2021).  *Rank-Normalization, Folding, and Localization: An Improved R̂
-for Assessing Convergence of MCMC.*  Bayesian Analysis, 16(2), 667-718.
-
-Hoffman, M. D., & Gelman, A. (2014).  *The No-U-Turn Sampler.*  JMLR,
-15(1), 1593-1623.
-"""
+"""08 — Multi-chain NUTS with R-hat / ESS convergence diagnostics"""
 
 from pathlib import Path
 
@@ -80,7 +34,7 @@ for p in (a, b):
 
 # ── Residual + solve ──────────────────────────────────────────────────────────
 residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) - target
-crux = jno.core([residual.mse], domain)
+crux = jno.core([residual.mse])
 crux.solve(700)
 
 # ── Per-chain summaries + cross-chain diagnostics ────────────────────────────

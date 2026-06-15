@@ -1,8 +1,8 @@
 # Diffusion-Reaction 1D
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/02_elliptic/diffusion_reaction_1d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/02-elliptic/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/02_elliptic/diffusion_reaction_1d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/02-elliptic/">Back to chapter</a>
 </div>
 
 This example solves a steady 1D PDE that combines diffusion and a linear reaction term.
@@ -61,7 +61,7 @@ pde  = -u_xx + σ * u - forcing
 After solving, the script prints mean absolute error and saves solution and error plots.
 
 ```python
-crux    = jno.core([pde.mse], domain)
+crux    = jno.core([pde.mse])
 history = crux.solve(5000)
 
 _u, _u_exact = crux.eval([u, u_exact])
@@ -75,8 +75,8 @@ rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_
 - This is a useful template before adding time dependence.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/02_elliptic/diffusion_reaction_1d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/02-elliptic/">Back to 02 Elliptic</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/02_elliptic/diffusion_reaction_1d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/02-elliptic/">Back to 02 Elliptic</a>
 </div>
 
 ## Script Snippet

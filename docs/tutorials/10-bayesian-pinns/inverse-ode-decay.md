@@ -1,8 +1,8 @@
 # Inverse: ODE rate constant (no surrogate)
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/10_bayesian_pinns/04_inverse_ode_decay.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/10-bayesian-pinns/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/10_bayesian_pinns/04_inverse_ode_decay.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/10-bayesian-pinns/">Back to chapter</a>
 </div>
 
 **Bayesian rate-constant inference for a first-order ODE with a fixed

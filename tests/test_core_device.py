@@ -48,7 +48,7 @@ def solver():
     u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=key))
     u = u_net(x) * x * (1 - x)
     pde = jnn.laplacian(u, [x])
-    return jno.core([pde.mse], dom)
+    return jno.core([pde.mse])
 
 
 # ---------------------------------------------------------------------------
@@ -100,7 +100,7 @@ class TestSetupParallelism:
         u = u_net(x)
         pde = jnn.laplacian(u, [x])
         # (2, 3) = 6 devices but we almost certainly don't have 6 → fallback
-        solver_bad = jno.core([pde.mse], dom, mesh=(2, 3))
+        solver_bad = jno.core([pde.mse], mesh=(2, 3))
         # After fallback the mesh must still cover all devices
         shape = solver_bad.mesh.shape
         assert shape["batch"] * shape["model"] == n
@@ -128,7 +128,7 @@ class TestDomainDataCPUPinning:
         u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=1, key=key))
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x])
-        return jno.core([pde.mse], dom)
+        return jno.core([pde.mse])
 
     def test_context_arrays_are_cpu_pinned_after_compile(self):
         """Every JAX array in domain_data.context must live on a CPU device.
@@ -395,7 +395,7 @@ class TestCoreInit:
         u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=1, key=key))
         u = u_net(x)
         pde = jnn.laplacian(u, [x])
-        s = jno.core([pde.mse], dom)
+        s = jno.core([pde.mse])
         assert s.seed == 42
 
     def test_seed_read_from_config(self, monkeypatch):
@@ -410,7 +410,7 @@ class TestCoreInit:
         u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=1, key=key))
         u = u_net(x)
         pde = jnn.laplacian(u, [x])
-        s = jno.core([pde.mse], dom)
+        s = jno.core([pde.mse])
         assert s.seed == 77
 
 
@@ -449,7 +449,7 @@ class TestGPUPlacement:
         u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=key))
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x])
-        s = jno.core([pde.mse], dom)
+        s = jno.core([pde.mse])
         u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         s.solve(5)
 
@@ -476,7 +476,7 @@ class TestGPUPlacement:
         u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=1, key=key))
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x])
-        s = jno.core([pde.mse], dom)
+        s = jno.core([pde.mse])
         u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
 
         shard_data_outputs = []
@@ -527,7 +527,7 @@ class TestGPUPlacement:
         u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=1, key=key))
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x])
-        s = jno.core([pde.mse], dom)
+        s = jno.core([pde.mse])
         u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
 
         converted_types = {}
@@ -579,7 +579,7 @@ class TestGPUPlacement:
         u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=1, key=key))
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x])
-        s = jno.core([pde.mse], dom)
+        s = jno.core([pde.mse])
         u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
 
         shard_data_inputs = []
@@ -616,7 +616,7 @@ class TestGPUPlacement:
         u_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=key))
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x])
-        s = jno.core([pde.mse], dom)
+        s = jno.core([pde.mse])
         u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         stats = s.solve(1)
 
@@ -645,7 +645,7 @@ class TestEvalAfterSolve:
         net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(0)))
         net.optimizer(optax.adam(1e-3))
         u = net(x) * x * (1 - x)
-        crux = jno.core([jnn.laplacian(u, [x]).mse], dom)
+        crux = jno.core([jnn.laplacian(u, [x]).mse])
         crux.solve(2)
 
         result = crux.eval(u)

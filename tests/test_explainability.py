@@ -86,7 +86,7 @@ def test_residual_stats_subset_selects_one_constraint():
     c0 = (u * u).mse  # arbitrary residual
     c1 = u.mse  # second constraint, different residual
 
-    solver = jno.core([c0, c1], domain)
+    solver = jno.core([c0, c1])
 
     # Subset: only c0 → result should have 1 column, and only the
     # solver-side index 0 should appear in W&B keys (we can't inspect those
@@ -138,7 +138,7 @@ def test_input_saliency_records_finite_values_with_consistent_shape():
     u = u_net(x)
     pde = u
 
-    solver = jno.core([pde.mse], domain)
+    solver = jno.core([pde.mse])
     cb = InputSensitivityCallback(u.d(x), interval=1)
     solver.solve(2, callbacks=[cb])
 
@@ -189,7 +189,7 @@ def test_ntk_spectrum_records_finite_eigenvalues_with_consistent_shape():
     n_points = 8
     top_k = 5
 
-    solver = jno.core([pde.mse], domain)
+    solver = jno.core([pde.mse])
     cb = NTKSpectrumCallback(u.grad(u_net), n_points=n_points, top_k=top_k, interval=1)
     solver.solve(2, callbacks=[cb])
 
@@ -243,7 +243,7 @@ def test_hessian_spectrum_records_finite_eigenvalues_with_consistent_shape():
     k = 4
     n_iter = 8
 
-    solver = jno.core([pde.mse], domain)
+    solver = jno.core([pde.mse])
     cb = HessianSpectrumCallback(k=k, n_iter=n_iter, interval=1)
     solver.solve(2, callbacks=[cb])
 
@@ -349,7 +349,7 @@ def test_hessian_spectrum_subset_rejects_unknown_constraint():
     u = u_net(x)
     pde_loss = u.mse
 
-    solver = jno.core([pde_loss], domain)
+    solver = jno.core([pde_loss])
 
     cb_bad = HessianSpectrumCallback(k=2, n_iter=4, interval=1, constraints=[u.mse])
     with pytest.raises(ValueError, match="constraint .* not found"):
@@ -379,7 +379,7 @@ def test_tracker_value_starts_none_then_populates_after_first_interval():
     u_net.optimizer(optax.sgd, lr=lrs.exponential(0.0, 1.0, 1, 0.0))
     u = u_net(x)
 
-    solver = jno.core([u.mse], domain)
+    solver = jno.core([u.mse])
 
     gn = jno.trackers.gradient_norms(interval=2)
     ntk = jno.trackers.ntk_spectrum(u.grad(u_net), n_points=4, top_k=2, interval=2)
@@ -489,7 +489,7 @@ def test_ntk_balanced_end_to_end_against_live_solver():
     ntk_a = jno.trackers.ntk_spectrum(u.grad(u_net), n_points=4, top_k=2, interval=1)
     ntk_b = jno.trackers.ntk_spectrum((u * 2.0).grad(u_net), n_points=4, top_k=2, interval=1)
 
-    solver = jno.core([u.mse, (u * 2.0).mse], domain)
+    solver = jno.core([u.mse, (u * 2.0).mse])
     solver.solve(2, callbacks=[ntk_a, ntk_b])
 
     # Both trackers should have fired.

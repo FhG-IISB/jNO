@@ -888,7 +888,7 @@ class ResidualStatsCallback(Callback, _LiveValue):
 
         pde_loss = pde.mse                       # assign once
         bc_loss  = bc.mse
-        solver = jno.core([pde_loss, bc_loss], domain)
+        solver = jno.core([pde_loss, bc_loss])
         cb = jno.callbacks.residual_stats(interval=100, constraints=[pde_loss])
         crux.solve(5000, callbacks=[cb])
         print(cb.result["maxes"])   # (n_samples, 1)  — just pde_loss

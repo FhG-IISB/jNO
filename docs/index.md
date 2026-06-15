@@ -45,7 +45,7 @@ Each status badge links to the tutorial (or, where no dedicated tutorial exists,
 | Capability | Status | Notes |
 |------------|--------|-------|
 | Forward PINNs (residual minimisation) | [✅ stable](tutorials/01-basics/poisson-1d.md) | Hard or soft BC enforcement |
-| Operator learning (DeepONet, FNO, PROSE via [foundax](https://github.com/FhG-IISB/foundax)) | [✅ stable](Getting-Started.md) | Combine with PDE residual or train purely data-driven |
+| Operator learning (DeepONet, FNO, U-Net, PROSE via [foundax](https://github.com/FhG-IISB/foundax)) | [✅ stable](tutorials/11-operator-learning/index.md) | PDE-residual or data-driven; FieldView adds FD physics on grid outputs |
 | Inverse problems (parameter recovery, surrogate inversion) | [✅ stable](tutorials/05-coupled-and-inverse/inverse-parameter.md) | See [Inverse Problems](inverse-problems.md) |
 | FEM / Variational PINNs | [✅ stable](tutorials/08-fem-and-varpinns/poisson-2d-fem.md) | TRI3 / TRI6 / QUAD4 elements, weak-form assembly |
 | Adaptive resampling (RAD, RARD, CR3, R3, pinnfluence) | [✅ stable](adaptive/resampling.md) | See [Adaptive Resampling](adaptive/resampling.md) |
@@ -72,7 +72,7 @@ A few jNO-specific terms appear throughout the docs. See the
 - **Placeholder** — any symbolic node in that graph (a Variable, a
   network call, an operator).
 - **Constraint** — a single optimisable expression passed to
-  `jno.core([…], dom)`. Typically `pde.mse`, but can be any scalar.
+  `jno.core([…])`. Typically `pde.mse`, but can be any scalar.
 - **Model controls** — fine-grained per-parameter knobs (freeze, LoRA,
   initialisation, dtype) configured on a wrapped network.
 - **Mesh** — overloaded: a spatial mesh for the PDE domain *and* a

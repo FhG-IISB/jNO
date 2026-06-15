@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import copy
-from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Mapping, Optional, Sequence, Tuple, overload
 
 import numpy as np
 
@@ -10,6 +10,8 @@ from .domain_class import domain
 
 if TYPE_CHECKING:
     from shapely.geometry.base import BaseGeometry
+
+    from ..trace import Variable
 else:
     BaseGeometry = Any
 
@@ -990,7 +992,12 @@ class PolygonDomain(domain):
         self.context[f"f_{tag}"] = view_factor[None, ...]
         self._param_tags.add(f"f_{tag}")
 
-    def compute_enclosure_view_factor(self, tags, opaque_tags=None, medium_tags: Optional[Sequence[str]] = None):
+    def compute_enclosure_view_factor(
+        self,
+        tags: Sequence[str],
+        opaque_tags: Optional[Sequence[str]] = None,
+        medium_tags: Optional[Sequence[str]] = None,
+    ):
         """Compute cross-tag polygon boundary view factors for radiative BCs.
 
         All *tags* must be polygon boundary tags that have already been sampled
@@ -1257,6 +1264,41 @@ class PolygonDomain(domain):
         if return_indices:
             return self.context[last_tag], last_idx, last_tag
         return self.context[last_tag], None, last_tag
+
+    # Mirror the base ``domain.variable`` typing: the point-set call returns a
+    # tuple of coordinate Variables (so ``x, y, _ = dom.variable("interior")`` is
+    # discoverable in an IDE); tensor-tag / flagged forms stay ``Any``. Without
+    # this the subclass's loose ``sample: Tuple[...]`` shadows the base and
+    # rejects a value array (``dom.variable("k", arr)``) on CSG/box domains.
+    @overload
+    def variable(
+        self,
+        tag: str,
+        sample: Tuple[Optional[int], Optional[Any]] = (None, None),
+        resampling_strategy=None,
+        normals: bool = False,
+        reverse_normals: bool = False,
+        view_factor: bool = False,
+        point_data: bool = False,
+        split: bool = False,
+        return_indices: Literal[False] = False,
+        time_value: Optional[float] = None,
+    ) -> "tuple[Variable, ...]": ...
+
+    @overload
+    def variable(
+        self,
+        tag: str,
+        sample: Any = (None, None),
+        resampling_strategy=None,
+        normals: bool = False,
+        reverse_normals: bool = False,
+        view_factor: bool = False,
+        point_data: bool = False,
+        split: bool = False,
+        return_indices: bool = False,
+        time_value: Optional[float] = None,
+    ) -> Any: ...
 
     def variable(
         self,

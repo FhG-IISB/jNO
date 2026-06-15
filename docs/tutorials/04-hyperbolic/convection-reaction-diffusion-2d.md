@@ -1,8 +1,8 @@
 # Convection-Reaction-Diffusion 2D
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/04_hyperbolic/convection_reaction_diffusion_2d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/04-hyperbolic/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/04_hyperbolic/convection_reaction_diffusion_2d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/04-hyperbolic/">Back to chapter</a>
 </div>
 
 This example mixes transport, diffusion, and reaction in a transient 2D PDE.
@@ -75,7 +75,7 @@ A manufactured forcing term keeps the problem verifiable while still exposing th
 ```python
 ini = u0 - jno.np.sin(pi * x0) * jno.np.sin(pi * y0)
 
-crux    = jno.core([pde.mse, ini.mse], domain)
+crux    = jno.core([pde.mse, ini.mse])
 history = crux.solve(40000)
 
 _u, _u_exact = crux.eval([u, u_exact])
@@ -89,8 +89,8 @@ rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_
 - It is a good template for realistic advection-diffusion-reaction systems.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/04_hyperbolic/convection_reaction_diffusion_2d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/04-hyperbolic/">Back to 04 Hyperbolic</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/04_hyperbolic/convection_reaction_diffusion_2d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/04-hyperbolic/">Back to 04 Hyperbolic</a>
 </div>
 
 ## Script Snippet

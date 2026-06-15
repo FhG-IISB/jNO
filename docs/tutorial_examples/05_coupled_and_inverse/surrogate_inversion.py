@@ -1,25 +1,4 @@
-"""05 — Surrogate inversion: recover a hidden input from a frozen PINN
-
-Workflow
---------
-Phase 1 (forward): train a PINN that maps x → u(x).
-Phase 2 (inverse): freeze the PINN and optimise a trainable input parameter
-                   x_query so that u_net(x_query) matches an observation.
-
-Problem
--------
-    PDE: u'' + π²sin(πx) = 0,  u(0) = u(1) = 0   on [0, 1]
-    Exact solution: u(x) = sin(πx)
-
-    Given the measurement u_obs = sin(π · x_true), recover x_true.
-
-Why this matters
-----------------
-After training a forward PINN you have a cheap, differentiable surrogate of
-the PDE solution.  Passing a jno.np.parameter as its *input* turns the network
-into an inverse solver: gradient descent on the input space finds which input
-reproduces the observed output.
-"""
+"""05 — Surrogate inversion: recover a hidden input from a frozen PINN"""
 
 from pathlib import Path
 
@@ -50,7 +29,7 @@ u_net.optimizer(optax.adam(1e-3))
 u = u_net(x) * x * (1 - x)  # hard zero Dirichlet BCs
 pde = u.dd(x) + π**2 * jno.np.sin(π * x)  # residual: u'' + π²sin(πx) = 0
 
-crux_fwd = jno.core([pde.mse], domain)
+crux_fwd = jno.core([pde.mse])
 crux_fwd.solve(3_000)
 
 # Verify forward accuracy before inverting
@@ -83,7 +62,7 @@ inv_loss = (u_at_query - u_obs) ** 2
 # Single-point domain — the loss has no spatial dependence on the mesh
 inv_domain = jno.domain.from_array({"pt": np.zeros((1, 1))})
 
-crux_inv = jno.core([inv_loss.mean], inv_domain)
+crux_inv = jno.core([inv_loss.mean], domain=inv_domain)
 crux_inv.solve(500)
 
 # ── Results ──────────────────────────────────────────────────────────────────

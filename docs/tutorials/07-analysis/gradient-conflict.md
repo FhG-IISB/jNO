@@ -1,8 +1,8 @@
 # Gradient and Sensitivity Analysis
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/07_analysis/gradient_conflict.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/07-analysis/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/07_analysis/gradient_conflict.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/07-analysis/">Back to chapter</a>
 </div>
 
 This tutorial shows how to use `u.grad(net)` — the **parameter Jacobian** — to monitor what a PINN is learning *during* training. The key technique is computing the **cosine similarity** between domain regions as a `.tracker()`, so you can spot gradient conflict before the solve finishes.
@@ -113,7 +113,7 @@ cos_tracker = tracker(jno.np.function(_cos_sim_halves, [J]), interval=200)
 ## Step 3: Solve
 
 ```python
-crux = jno.core([pde.mse, cos_tracker], domain)
+crux = jno.core([pde.mse, cos_tracker])
 crux.solve(5000)
 ```
 
@@ -180,8 +180,8 @@ The **effective rank** (participation ratio) tells you how many independent lear
 - Cosine similarity $< 0.3$ between two groups that should behave similarly is a warning: consider adding more collocation points or using adaptive resampling.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/07_analysis/gradient_conflict.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/07-analysis/">Back to 07 Analysis</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/07_analysis/gradient_conflict.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/07-analysis/">Back to 07 Analysis</a>
 </div>
 
 ## Script Snippet

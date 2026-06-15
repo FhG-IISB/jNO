@@ -82,7 +82,7 @@ def _build_solver(strategy: ResamplingStrategy, *, time: tuple[float, float, int
 
     # Keep this pointwise (not .mse) so solve()'s resampling pipeline can
     # consume per-point residual geometry.
-    solver = jno.core([pde], domain)
+    solver = jno.core([pde])
     u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
     return solver, domain
 
@@ -119,7 +119,7 @@ def _build_solver_nd(
         u = u * c * (1.0 - c)
 
     pde = jnn.laplacian(u, list(coords)) - jnn.sin(jnn.pi * coords[0])
-    solver = jno.core([pde], domain)
+    solver = jno.core([pde])
     u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
     return solver, domain
 
@@ -379,7 +379,7 @@ def test_solve_resampling_works_with_adaptive_weight_wrapped_losses():
 
     w0, w1 = jno.fn.adaptive.relobralo([pde, bcs])
 
-    solver = jno.core([w0 * pde, w1 * bcs, w0.tracker(), w1.tracker()], domain)
+    solver = jno.core([w0 * pde, w1 * bcs, w0.tracker(), w1.tracker()])
     u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
 
     stats = solver.solve(epochs=3)
@@ -529,7 +529,7 @@ def test_boundary_normals_updated_after_resample():
     pde = jnn.laplacian(u_net(xi, yi), [xi, yi])
     bc = (u_net(xb, yb) - 0.0).mse
 
-    solver = jno.core([pde, bc], domain)
+    solver = jno.core([pde, bc])
     u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
     solver.solve(epochs=3)
 
@@ -665,7 +665,7 @@ def test_burgers_rad_resampling_concentrates_near_steep_gradient():
     # with correct spatial structure for the RAD scoring step.
     pde = (u.d(t) + u * u.d(x) - _BURGERS_NU * jnn.laplacian(u, [x])).mse
 
-    solver = jno.core([pde], domain)
+    solver = jno.core([pde])
     u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
 
     initial_pts = np.asarray(domain.context["interior"])[0, 0]  # (N, 2)
@@ -715,7 +715,7 @@ def test_temporal_derivative_with_mixed_spatial_tag_counts():
     pde = u_t - 0.05 * u_xx
     ini = net(x0) * x0 * (1.0 - x0) - jnn.sin(jnn.pi * x0)
 
-    solver = jno.core([pde.mse, ini.mse], domain)
+    solver = jno.core([pde.mse, ini.mse])
     net.optimizer(optax.adam, lr=lrs.constant(1e-3))
 
     stats = solver.solve(epochs=2)
