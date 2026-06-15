@@ -64,7 +64,7 @@ b_dense = jnp.asarray(b)
 u_baseline = jnp.linalg.solve(A_base_dense, b_dense).reshape(-1)
 
 # ── Sanity-check the FEM forward against the manufactured solution ───────────
-coords = np.asarray(fem_domain.mesh.points)[:, :2]
+coords = np.asarray(fem_domain.built_mesh.points)[:, :2]
 x_nodes = jnp.asarray(coords[:, 0:1])
 y_nodes = jnp.asarray(coords[:, 1:2])
 u_exact_nodes = exact_u(x_nodes, y_nodes).reshape(-1)

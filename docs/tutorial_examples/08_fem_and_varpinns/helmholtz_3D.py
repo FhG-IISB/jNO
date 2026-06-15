@@ -235,7 +235,7 @@ u_fem = jnp.linalg.solve(A_dense, b).reshape(-1)
 
 residual_rel = jnp.linalg.norm(A_dense @ u_fem - b) / (jnp.linalg.norm(b) + 1.0e-14)
 
-coords = np.asarray(fem_domain.mesh.points[:, :3])
+coords = np.asarray(fem_domain.built_mesh.points[:, :3])
 
 x_nodes = jnp.asarray(coords[:, 0:1])
 y_nodes = jnp.asarray(coords[:, 1:2])
@@ -250,7 +250,7 @@ rms_abs_fem = jnp.sqrt(jnp.mean((u_fem - u_exact_nodes) ** 2))
 print("\nFEAX-FEM results")
 print("-" * 72)
 print(f"Number of mesh nodes       : {coords.shape[0]}")
-print(f"Number of tetrahedra       : {fem_domain.mesh.cells_dict['tetra'].shape[0]}")
+print(f"Number of tetrahedra       : {fem_domain.built_mesh.cells_dict['tetra'].shape[0]}")
 print(f"System matrix shape        : {A_dense.shape}")
 print(f"Linear residual ||Au-b||   : {float(residual_rel):.6e}")
 print(f"Relative L2 error          : {float(rel_l2_fem):.6e}")

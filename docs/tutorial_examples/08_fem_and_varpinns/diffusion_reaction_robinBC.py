@@ -123,7 +123,7 @@ u_fem = jnp.linalg.solve(A_dense, b_dense).reshape(-1)
 
 lin_res = jnp.linalg.norm(A_dense @ u_fem - b_dense) / (jnp.linalg.norm(b_dense) + 1e-14)
 
-coords = np.asarray(fem_domain.mesh.points)[:, :2]
+coords = np.asarray(fem_domain.built_mesh.points)[:, :2]
 x_nodes = jnp.asarray(coords[:, 0:1])
 y_nodes = jnp.asarray(coords[:, 1:2])
 

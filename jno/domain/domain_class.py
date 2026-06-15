@@ -923,6 +923,20 @@ class domain(MeshIOMixin):
     # FEM/ variational interface
 
     @property
+    def built_mesh(self) -> "meshio.Mesh":
+        """The constructed mesh, guaranteed non-``None``.
+
+        Use this instead of ``.mesh`` when reading mesh data (``.points``,
+        ``.cells_dict``): ``.mesh`` is ``meshio.Mesh | None`` until a mesh is
+        built/loaded, so a type checker flags member access on it. This accessor
+        asserts the mesh exists and returns it, clearing that noise. Raises
+        ``RuntimeError`` if called before ``build_mesh()`` (or a mesh load).
+        """
+        if self.mesh is None:
+            raise RuntimeError("Mesh has not been built — call build_mesh() (or load a mesh) first.")
+        return self.mesh
+
+    @property
     def _domain_mesh_connectivities(self) -> List:
         """Return mesh connectivities for the primary and all sub-domains."""
         mcs = [self.mesh_connectivity]

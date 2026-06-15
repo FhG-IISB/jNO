@@ -229,7 +229,7 @@ u_true_eval = jnp.asarray(u_true_eval).reshape(-1)
 rel_l2_vpinn = jnp.linalg.norm(u_true_eval - u_vpinn_eval) / (jnp.linalg.norm(u_true_eval) + 1e-14)
 max_abs_vpinn = jnp.max(jnp.abs(u_true_eval - u_vpinn_eval))
 
-coords_fem = np.asarray(fem_domain.mesh.points)[:, :2]
+coords_fem = np.asarray(fem_domain.built_mesh.points)[:, :2]
 x_f = jnp.asarray(coords_fem[:, 0:1])
 y_f = jnp.asarray(coords_fem[:, 1:2])
 

@@ -62,7 +62,7 @@ weak = eps**2 * (ux * phix + uy * phiy) + (u**3 - u) * phi
 
 op = weak.assemble(domain, target="fem_residual")
 
-coords = np.asarray(domain.mesh.points)[:, :2]
+coords = np.asarray(domain.built_mesh.points)[:, :2]
 x_nodes = jnp.asarray(coords[:, 0:1])
 y_nodes = jnp.asarray(coords[:, 1:2])
 
