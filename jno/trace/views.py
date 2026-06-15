@@ -17,12 +17,52 @@ For operations that don't have a dedicated method (``.mse``, ``.mean``,
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import jax.numpy as jnp
 
 from ..jnp_ops import concat
 from . import FunctionCall, Placeholder
+
+if TYPE_CHECKING:
+    from . import Tracker
+
+    class _DelegatesToPlaceholder:
+        """Type-checker-only declaration of the :class:`Placeholder` conveniences
+        that every view reaches at runtime through its ``__getattr__`` →
+        ``self._expr.<name>``.
+
+        Without this, those fall-through names (``u.scalar.mse``, ``.mean``,
+        ``.name(...)``, …) are typed ``Any`` and an IDE shows nothing on hover.
+        The class is *empty at runtime* (see the ``else`` branch) — ``__getattr__``
+        still does the real delegation; this only informs the type checker. A view
+        that defines one of these names itself (e.g. ``ComplexView.real``) overrides
+        the stub as usual.
+        """
+
+        mse: FunctionCall
+        mae: FunctionCall
+        mean: FunctionCall
+        sum: FunctionCall
+        min: FunctionCall
+        max: FunctionCall
+        std: FunctionCall
+        shape: FunctionCall
+        T: FunctionCall
+        real: FunctionCall
+        imag: FunctionCall
+
+        def name(self, label: str) -> Placeholder: ...
+        def tracker(self, interval: int = 1, reduce=None) -> Tracker: ...
+        def reshape(self, *shape) -> FunctionCall: ...
+        def equal(self, other) -> FunctionCall: ...
+        def not_equal(self, other) -> FunctionCall: ...
+
+else:
+
+    class _DelegatesToPlaceholder:  # empty at runtime
+        pass
+
 
 _VIEW_TYPES: tuple = ()  # filled at end of module
 _NAMED_PARTIALS_CLS_FOR: dict = {}  # filled at end of module: type(view) → Named<View>WithPartials
@@ -125,7 +165,7 @@ def _coords_dispatch(view_self, args: tuple, named_vars: dict, *, positional_fac
 # ---------------------------------------------------------------------------
 
 
-class ScalarView:
+class ScalarView(_DelegatesToPlaceholder):
     """Semantic view of a scalar Placeholder.
 
     Exposes named scalar operations (``.abs()``, ``.exp()``, ...) and acts as
@@ -263,7 +303,7 @@ class ScalarView:
 # ---------------------------------------------------------------------------
 
 
-class VectorView:
+class VectorView(_DelegatesToPlaceholder):
     """Semantic view of a Placeholder as a spatial vector field ``[..., n]``."""
 
     def __init__(self, expr: Placeholder) -> None:
@@ -465,7 +505,7 @@ class VectorView:
 # ---------------------------------------------------------------------------
 
 
-class ComplexView:
+class ComplexView(_DelegatesToPlaceholder):
     """Semantic view of a Placeholder as a complex field, last dim = 2 = [re, im].
 
     For native JAX ``complex64`` Placeholders, use ``placeholder.real`` /
@@ -601,7 +641,7 @@ class ComplexView:
 # ---------------------------------------------------------------------------
 
 
-class MatrixView:
+class MatrixView(_DelegatesToPlaceholder):
     """Semantic view of a Placeholder as a full matrix field ``[..., n, m]``.
 
     For symmetric tensors in Voigt packing (``[..., 3]`` 2-D, ``[..., 6]`` 3-D)
@@ -917,7 +957,7 @@ class NamedMatrixView(MatrixView):
 # ---------------------------------------------------------------------------
 
 
-class VoigtView:
+class VoigtView(_DelegatesToPlaceholder):
     """Semantic view of a Placeholder as a symmetric tensor in Voigt notation.
 
     Last-dim layout selects the dimension:
