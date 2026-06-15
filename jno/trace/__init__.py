@@ -108,6 +108,58 @@ def _contains_node_type_local(node, cls) -> bool:
     return False
 
 
+def _contains_fd_partial(node) -> bool:
+    """True if ``node``'s subtree contains a finite-difference partial.
+
+    FieldView emits FD ``Jacobian`` / ``Hessian`` (``scheme`` starting with
+    ``"finite_difference"``) and ``TemporalDerivative`` nodes on a grid output
+    whose coordinates are not network inputs.  Re-applying an automatic-
+    differentiation operator on top of these silently returns zero, so callers
+    detect them and raise instead.
+    """
+    if isinstance(node, TemporalDerivative):
+        return True
+    if isinstance(node, (Jacobian, Hessian)) and str(getattr(node, "scheme", "")).startswith("finite_difference"):
+        return True
+    for attr in ("left", "right", "target", "expr", "operation", "model"):
+        child = getattr(node, attr, None)
+        if child is not None and _contains_fd_partial(child):
+            return True
+    for attr in ("args", "variables", "options"):
+        vals = getattr(node, attr, None)
+        if vals is None:
+            continue
+        for v in vals:
+            if isinstance(v, (list, tuple)):
+                if any(_contains_fd_partial(vv) for vv in v):
+                    return True
+            elif _contains_fd_partial(v):
+                return True
+    return False
+
+
+def _guard_ad_on_fd(target, scheme: str) -> None:
+    """Raise if an automatic-differentiation derivative is requested over a
+    FieldView finite-difference partial.
+
+    The field is a grid output (its coordinates are not network inputs), so AD
+    over an FD partial silently evaluates to zero — a wrong answer that looks
+    plausible.  Requesting an explicit ``finite_difference`` scheme is allowed
+    (that is how FieldView builds higher-order partials internally).
+    """
+    if str(scheme).startswith("finite_difference"):
+        return
+    if _contains_fd_partial(target):
+        raise ValueError(
+            "Cannot apply an automatic-differentiation derivative to an expression built "
+            "from FieldView finite-difference partials: the field is a grid output (its "
+            "coordinates are not network inputs), so AD silently returns 0. Use the "
+            "FieldView FD API for higher-order derivatives instead — e.g. `u.xx + u.yy` "
+            "rather than `jno.np.vector(u.x, u.y).div(x, y)`, and `u.xx` rather than "
+            "`u.x.d(x)`."
+        )
+
+
 def _mark_weak(node, root_id=None):
     if root_id is None:
         root_id = getattr(node, "op_id", id(node))
@@ -538,10 +590,12 @@ class Placeholder:
                 * ``"finite_difference"`` (optional sub-schemes:
                   ``":lsq"`` / ``":uniform"`` / ``":inverse_distance"``).
         """
+        _guard_ad_on_fd(self, scheme)
         return Jacobian(self, [variable], scheme)
 
     def diff(self, variable: "Variable", scheme: str = "automatic_differentiation") -> "Jacobian":
         """Alias for :meth:`d`."""
+        _guard_ad_on_fd(self, scheme)
         return Jacobian(self, [variable], scheme)
 
     def d2(self, variable: "Variable", scheme: str = "automatic_differentiation") -> "Hessian":
@@ -551,10 +605,12 @@ class Placeholder:
             variable: The Variable to differentiate with respect to.
             scheme: Second-order scheme string — see :meth:`laplacian`.
         """
+        _guard_ad_on_fd(self, scheme)
         return Hessian(self, [variable], scheme, trace=True)
 
     def dd(self, variable: "Variable", scheme: str = "automatic_differentiation") -> "Hessian":
         """Alias for :meth:`d2`."""
+        _guard_ad_on_fd(self, scheme)
         return Hessian(self, [variable], scheme, trace=True)
 
     def laplacian(
@@ -586,6 +642,7 @@ class Placeholder:
                 * ``"finite_difference"`` (optional sub-schemes:
                   ``":cotangent"`` (2-D), ``":lsq"``).
         """
+        _guard_ad_on_fd(self, scheme)
         return Hessian(self, list(variables) if variables else None, scheme, trace=True)
 
     def hessian(
@@ -603,6 +660,7 @@ class Placeholder:
             *variables: Variables for the Hessian.
             scheme: Second-order scheme string — see :meth:`laplacian`.
         """
+        _guard_ad_on_fd(self, scheme)
         return Hessian(self, list(variables), scheme, trace=False)
 
     # ------------------------------------------------------------------

@@ -1197,3 +1197,243 @@ class TestCruxEvalAcceptsViews:
         # And as part of a list
         outs = crux.eval([sv, u])
         assert len(outs) == 2
+
+
+# ===========================================================================
+# Complex multi-step interactions ACROSS view types.
+#
+# The classes above mostly assert the *return type* of a single op.  These
+# verify the numerical *value* of chained cross-type pipelines (matrix @ vector,
+# scalar · (A @ v), Voigt → full → eigen, divergence = trace Jacobian, …) and
+# exercise 3-D, which the rest of the file barely touches.  A wrong answer here
+# would survive the type-only checks, so these are the higher-yield regression
+# tests for the views' interactions.
+# ===========================================================================
+
+
+def _vec3(values):
+    """([N, 3] VectorView, ctx) on tag ``v3``."""
+    d = _domain_with(("v3", 3))
+    return Variable("v3", [0, 3], domain=d).vector, {"v3": jnp.asarray(values)}
+
+
+def _make_3x3(values):
+    """([N, 3, 3] MatrixView, ctx) from a [N, 9] flat field on tag ``m9``."""
+    d = _domain_with(("m9", 9))
+    return Variable("m9", [0, 9], domain=d).matrix.from_flat(3), {"m9": jnp.asarray(values)}
+
+
+def _make_voigt_3d(values):
+    """([N, 6] VoigtView = [xx, yy, zz, yz, xz, xy], ctx) on tag ``s6``."""
+    d = _domain_with(("s6", 6))
+    return Variable("s6", [0, 6], domain=d).voigt, {"s6": jnp.asarray(values)}
+
+
+class TestComplexInteractions:
+    # -- VectorView ⇄ ScalarView / MatrixView -------------------------------
+    def test_outer_trace_equals_dot_equals_norm_squared(self):
+        v, ctx = _vec3([[1.0, 2.0, 3.0]])
+        o_tr = _eval(v.outer(v).trace().expr, ctx)  # tr(v⊗v) = Σ vᵢ²
+        dot = _eval(v.dot(v).expr, ctx)
+        nrm2 = np.asarray(_eval(v.norm().expr, ctx)) ** 2
+        np.testing.assert_allclose(o_tr, dot, atol=1e-6)
+        np.testing.assert_allclose(o_tr, nrm2, atol=1e-6)
+        np.testing.assert_allclose(np.asarray(o_tr).reshape(-1), [14.0], atol=1e-6)
+
+    def test_cross_is_orthogonal_to_both_operands(self):
+        d = _domain_with(("v3", 3), ("w3", 3))
+        v = Variable("v3", [0, 3], domain=d).vector
+        w = Variable("w3", [0, 3], domain=d).vector
+        ctx = {"v3": jnp.array([[1.0, 2.0, 3.0]]), "w3": jnp.array([[2.0, 0.0, -1.0]])}
+        c = v.cross(w)
+        np.testing.assert_allclose(_eval(c.dot(v).expr, ctx), 0.0, atol=1e-5)
+        np.testing.assert_allclose(_eval(c.dot(w).expr, ctx), 0.0, atol=1e-5)
+
+    def test_matrix_at_vector_matches_numpy(self):
+        d = _domain_with(("m", 4), ("v", 2))
+        A = Variable("m", [0, 4], domain=d).matrix.from_flat(2)
+        v = Variable("v", [0, 2], domain=d).vector
+        ctx = {"m": jnp.array([[1.0, 2.0, 3.0, 4.0]]), "v": jnp.array([[5.0, 6.0]])}
+        out = np.asarray(_eval((A @ v).expr, ctx)).reshape(-1)
+        np.testing.assert_allclose(out, np.array([[1.0, 2.0], [3.0, 4.0]]) @ np.array([5.0, 6.0]))
+
+    def test_vector_at_matrix_matches_numpy(self):
+        d = _domain_with(("m", 4), ("v", 2))
+        A = Variable("m", [0, 4], domain=d).matrix.from_flat(2)
+        v = Variable("v", [0, 2], domain=d).vector
+        ctx = {"m": jnp.array([[1.0, 2.0, 3.0, 4.0]]), "v": jnp.array([[5.0, 6.0]])}
+        out = np.asarray(_eval((v @ A).expr, ctx)).reshape(-1)
+        np.testing.assert_allclose(out, np.array([5.0, 6.0]) @ np.array([[1.0, 2.0], [3.0, 4.0]]))
+
+    # -- MatrixView algebra -------------------------------------------------
+    def test_sym_plus_skew_reconstructs_matrix(self):
+        A, ctx = _make_2x2([[1.0, 2.0, 3.0, 4.0]])
+        recon = np.asarray(_eval((A.sym() + A.skew()).expr, ctx)).reshape(2, 2)
+        np.testing.assert_allclose(recon, [[1.0, 2.0], [3.0, 4.0]], atol=1e-6)
+
+    def test_trace_is_cyclic(self):
+        d = _domain_with(("m", 4), ("mb", 4))
+        A = Variable("m", [0, 4], domain=d).matrix.from_flat(2)
+        B = Variable("mb", [0, 4], domain=d).matrix.from_flat(2)
+        ctx = {"m": jnp.array([[1.0, 2.0, 3.0, 4.0]]), "mb": jnp.array([[5.0, 6.0, 7.0, 8.0]])}
+        np.testing.assert_allclose(_eval((A @ B).trace().expr, ctx), _eval((B @ A).trace().expr, ctx), atol=1e-5)
+
+    def test_inverse_times_self_is_identity_2d(self):
+        A, ctx = _make_2x2([[1.0, 2.0, 3.0, 4.0]])
+        ii = np.asarray(_eval((A.inv() @ A).expr, ctx)).reshape(2, 2)
+        np.testing.assert_allclose(ii, np.eye(2), atol=1e-5)
+
+    def test_inverse_times_self_is_identity_3d(self):
+        A, ctx = _make_3x3([[4.0, 1.0, 0.0, 1.0, 3.0, 1.0, 0.0, 1.0, 2.0]])
+        ii = np.asarray(_eval((A.inv() @ A).expr, ctx)).reshape(3, 3)
+        np.testing.assert_allclose(ii, np.eye(3), atol=1e-4)
+
+    def test_scalar_matrix_vector_linearity(self):
+        d = _domain_with(("p", 1), ("m", 4), ("v", 2))
+        p = Variable("p", [0, 1], domain=d)
+        A = Variable("m", [0, 4], domain=d).matrix.from_flat(2)
+        v = Variable("v", [0, 2], domain=d).vector
+        ctx = {"p": jnp.array([[3.0]]), "m": jnp.array([[1.0, 2.0, 3.0, 4.0]]), "v": jnp.array([[5.0, 6.0]])}
+        lhs = _eval((p.scalar * (A @ v)).expr, ctx)
+        mid = _eval(((p.scalar * A) @ v).expr, ctx)
+        rhs = _eval((A @ (p.scalar * v)).expr, ctx)
+        np.testing.assert_allclose(lhs, mid, atol=1e-5)
+        np.testing.assert_allclose(lhs, rhs, atol=1e-5)
+
+    def test_from_diag_times_vector_is_elementwise(self):
+        d = _domain_with(("dg", 2), ("v", 2))
+        D = Variable("dg", [0, 2], domain=d).matrix.from_diag()  # diag([2, 3])
+        v = Variable("v", [0, 2], domain=d).vector
+        ctx = {"dg": jnp.array([[2.0, 3.0]]), "v": jnp.array([[5.0, 6.0]])}
+        out = np.asarray(_eval((D @ v).expr, ctx)).reshape(-1)
+        np.testing.assert_allclose(out, [10.0, 18.0], atol=1e-6)
+
+    # -- divergence = trace of the Jacobian (VectorView → MatrixView → Scalar)
+    def test_divergence_equals_trace_of_jacobian(self):
+        d, x, y = _domain_xy()
+        F = jno.np.vector(x * x, x * y)  # F = (x², xy);  ∇·F = 2x + x = 3x
+        ctx = {"xy": jnp.array([[0.5, 0.7]])}
+        # div → (N, 1), jacobian.trace → (N,): equal values, flatten to compare.
+        jtr = np.asarray(_eval(F.jacobian(x, y).trace().expr, ctx)).reshape(-1)
+        dv = np.asarray(_eval(F.div(x, y).expr, ctx)).reshape(-1)
+        np.testing.assert_allclose(jtr, dv, atol=1e-6)
+        np.testing.assert_allclose(dv, [3 * 0.5], atol=1e-5)
+
+    # -- VoigtView 3-D (6-component) ----------------------------------------
+    def test_voigt3d_to_full_is_symmetric(self):
+        sig, ctx = _make_voigt_3d([[10.0, 8.0, 6.0, 1.0, 2.0, 3.0]])
+        full = np.asarray(_eval(sig.to_full().expr, ctx)).reshape(3, 3)
+        np.testing.assert_allclose(full, full.T, atol=1e-6)
+
+    def test_voigt3d_principal_equals_eigvalsh(self):
+        sig, ctx = _make_voigt_3d([[10.0, 8.0, 6.0, 1.0, 2.0, 3.0]])
+        full = np.asarray(_eval(sig.to_full().expr, ctx)).reshape(3, 3)
+        prin = np.sort(np.asarray(_eval(sig.principal().expr, ctx)).reshape(-1))
+        np.testing.assert_allclose(prin, np.sort(np.linalg.eigvalsh(full)), atol=1e-5)
+
+    def test_voigt3d_von_mises_value(self):
+        sig, ctx = _make_voigt_3d([[10.0, 8.0, 6.0, 1.0, 2.0, 3.0]])
+        # √(½[(10−8)²+(8−6)²+(6−10)²] + 3[1²+2²+3²]) = √54
+        vm = float(np.asarray(_eval(sig.von_mises().expr, ctx)).reshape(-1)[0])
+        np.testing.assert_allclose(vm, np.sqrt(54.0), atol=1e-4)
+
+
+# ===========================================================================
+# Views on a COMPLEX, unstructured domain.
+#
+# Every class above runs on MockDomain synthetic arrays or a structured grid.
+# These build a real CSG mesh (concave L-shape, unstructured triangulation) and
+# a 3-D tetrahedral cube, then verify the view API end-to-end on it: AD
+# differential ops are exact at every node regardless of geometry, and the FD
+# scheme is checked (interior-node L²) on the unstructured triangulation.
+# ===========================================================================
+
+
+def _interior_idx(mc):
+    bnd = np.asarray(mc["boundary_indices"], dtype=np.int64)
+    return np.setdiff1d(np.arange(int(mc["n_points"])), bnd)
+
+
+def _rel_l2_at(computed, analytic, idx):
+    c = np.asarray(computed).reshape(-1)[idx]
+    a = np.asarray(analytic).reshape(-1)[idx]
+    return float(np.sqrt(np.mean((c - a) ** 2)) / (np.sqrt(np.mean(a**2)) + 1e-12))
+
+
+@pytest.fixture(scope="module")
+def lshape():
+    """Concave L-shape (area 3) on an unstructured triangular mesh — built once."""
+    dom = jno.domain.csg(
+        [(0.0, 0.0), (2.0, 0.0), (2.0, 1.0), (1.0, 1.0), (1.0, 2.0), (0.0, 2.0)],
+        name="L",
+    )
+    dom.build_mesh(mesh_size=0.12)
+    x, y, _ = dom.variable("interior")
+    pts = np.asarray(dom.mesh_connectivity["points"])
+    return dom, x, y, {"interior": jnp.asarray(pts)}, _interior_idx(dom.mesh_connectivity), pts[:, 0], pts[:, 1]
+
+
+@pytest.fixture(scope="module")
+def cube3d():
+    """3-D unit cube on a tetrahedral mesh — built once."""
+    dom = jno.domain(constructor=jno.domain.cube(mesh_size=0.25), compute_mesh_connectivity=True)
+    v = dom.variable("interior")
+    x, y, z = v[0], v[1], v[2]
+    pts = np.asarray(dom.mesh_connectivity["points"])
+    return dom, x, y, z, {"interior": jnp.asarray(pts)}, _interior_idx(dom.mesh_connectivity), pts
+
+
+class TestViewsOnComplexDomain:
+    """Typed views exercised on a concave unstructured (2-D) and tetrahedral
+    (3-D) mesh — AD ops are exact; FD is checked in L²."""
+
+    # -- 2-D concave L-shape, automatic differentiation (exact at every node) --
+    def test_vector_div_ad(self, lshape):
+        _, x, y, ctx, idx, X, _Y = lshape
+        out = _eval(jno.np.vector(x * x, x * y).div(x, y).expr, ctx)  # ∇·(x², xy) = 3x
+        assert _rel_l2_at(out, 3 * X, idx) < 1e-4
+
+    def test_vector_curl_ad(self, lshape):
+        _, x, y, ctx, idx, X, _Y = lshape
+        out = _eval(jno.np.vector(-y, x).curl(x, y).expr, ctx)  # curl(−y, x) = 2
+        assert _rel_l2_at(out, np.full_like(X, 2.0), idx) < 1e-4
+
+    def test_scalar_laplacian_ad(self, lshape):
+        _, x, y, ctx, idx, X, _Y = lshape
+        # ScalarView has no .laplacian → falls through to Placeholder.laplacian (a Hessian).
+        out = _eval((x * x + y * y).scalar.laplacian(x, y), ctx)  # Δ(x²+y²) = 4
+        assert _rel_l2_at(out, np.full_like(X, 4.0), idx) < 1e-4
+
+    def test_voigt_von_mises_ad(self, lshape):
+        _, x, y, ctx, idx, X, Y = lshape
+        s = jno.np.concat([x, y, 0.0 * x]).voigt  # [σ_xx, σ_yy, σ_xy] = [x, y, 0]
+        out = _eval(s.von_mises().expr, ctx)  # √(x² − xy + y²)
+        assert _rel_l2_at(out, np.sqrt(X**2 - X * Y + Y**2), idx) < 1e-4
+
+    def test_matrix_jacobian_trace_equals_div_ad(self, lshape):
+        _, x, y, ctx, idx, X, _Y = lshape
+        F = jno.np.vector(x * x, x * y)
+        jtr = _eval(F.jacobian(x, y).trace().expr, ctx)  # tr ∂Fᵢ/∂xⱼ = ∇·F = 3x
+        assert _rel_l2_at(jtr, 3 * X, idx) < 1e-4
+
+    # -- 2-D, finite-difference scheme on the unstructured triangulation --
+    def test_scalar_fd_gradient_on_triangulation(self, lshape):
+        dom, x, y, ctx, idx, X, Y = lshape
+        uvals = (X**2 + Y**2).astype(np.float32)  # ∂/∂x = 2x
+        uvar = dom.variable("uf", uvals[None, :, None])
+        ctx2 = dict(ctx)
+        ctx2["uf"] = uvals[:, None]
+        fdx = _eval(uvar.scalar.d(x, scheme="finite_difference").expr, ctx2)
+        assert _rel_l2_at(fdx, 2 * X, idx) < 0.05  # FD on a coarse unstructured mesh
+
+    # -- 3-D tetrahedral cube, automatic differentiation --
+    def test_3d_vector_div_ad(self, cube3d):
+        _, x, y, z, ctx, idx, pts = cube3d
+        out = _eval(jno.np.vector(x * x, y * y, z * z).div(x, y, z).expr, ctx)  # 2(x+y+z)
+        analytic = 2.0 * (pts[:, 0] + pts[:, 1] + pts[:, 2])
+        assert _rel_l2_at(out, analytic, idx) < 1e-4
+
+    def test_3d_scalar_laplacian_ad(self, cube3d):
+        _, x, y, z, ctx, idx, pts = cube3d
+        out = _eval((x * x + y * y + z * z).scalar.laplacian(x, y, z), ctx)  # Δ = 6
+        assert _rel_l2_at(out, np.full(pts.shape[0], 6.0), idx) < 1e-4

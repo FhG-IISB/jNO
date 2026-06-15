@@ -689,3 +689,126 @@ class TestSpatialOnlyBind:
         u = a_var.field.bind(x=x_var, y=y_var)  # no t
         with pytest.raises(AttributeError):
             _ = u.t  # "t" is not a registered name → falls through to expr.t → AttributeError
+
+
+class TestFieldViewComposition:
+    """FieldView FD partials composing into vector / matrix arithmetic.
+
+    Assembling a gradient vector from FD partials, taking its norm, or applying
+    a constant material matrix is valid — the partials are ordinary
+    Placeholders.  Re-*differentiating* them is not (see
+    :class:`TestFieldViewADGuard`).
+    """
+
+    def test_fd_gradient_as_vector_norm(self, cpu_only):
+        H = 16
+        xs, ys = _grid(nx_minus_1=H - 1)
+        f = xs**2 + ys**2  # ∇f = (2x, 2y); |∇f| = 2·√(x²+y²)
+        _, a_var, x_var, y_var, ctx = _make_spatial_setup(f)
+        u = a_var.field.bind(x=x_var, y=y_var)
+        gradvec = jno.np.vector(u.x, u.y)  # FieldViewWithPartials unwrap → FD Jacobians
+        gnorm = np.squeeze(_eval_direct(gradvec.norm().expr, ctx))
+        expected = 2.0 * np.sqrt(xs**2 + ys**2)
+        np.testing.assert_allclose(_interior_slice(gnorm, k=2), _interior_slice(expected, k=2), atol=2e-2)
+
+    def test_constant_matrix_times_fd_gradient(self, cpu_only):
+        from jno.trace import Variable
+        from tests.conftest import MockDomain
+
+        H = 16
+        xs, ys = _grid(nx_minus_1=H - 1)
+        f = xs**2 + ys**2
+        _, a_var, x_var, y_var, ctx = _make_spatial_setup(f)
+        u = a_var.field.bind(x=x_var, y=y_var)
+        gradvec = jno.np.vector(u.x, u.y)
+        kd = MockDomain()
+        kd.context["k"] = jnp.zeros((1, 4))
+        K = Variable("k", [0, 4], domain=kd).matrix.from_flat(2)
+        flux = K @ gradvec  # material flux K·∇u
+        ctx2 = dict(ctx)
+        ctx2["k"] = jnp.array([[1.0, 0.0, 0.0, 1.0]])  # K = I → flux = ∇u
+        out = np.squeeze(_eval_direct(flux.expr, ctx2))
+        assert out.shape == (H, H, 2)
+        np.testing.assert_allclose(_interior_slice(out[..., 0], k=2), _interior_slice(2.0 * xs, k=2), atol=2e-2)
+        np.testing.assert_allclose(_interior_slice(out[..., 1], k=2), _interior_slice(2.0 * ys, k=2), atol=2e-2)
+
+
+class TestFieldViewADGuard:
+    """AD differential operators over FieldView FD partials must raise.
+
+    The field is a grid output whose coordinates are not network inputs, so
+    automatic differentiation of an FD partial silently evaluates to 0 — a
+    plausible-looking wrong answer.  These ops raise ``ValueError`` instead;
+    use the FieldView FD API (``u.xx`` / ``u.yy`` / ``u.tt``) for higher orders.
+    The guard fires at trace-construction time, so no evaluation is needed.
+    """
+
+    @pytest.fixture
+    def fv(self):
+        H = 8
+        f = np.zeros((H, H), dtype=np.float32)
+        _, a_var, x_var, y_var, _ = _make_spatial_setup(f)
+        return a_var.field.bind(x=x_var, y=y_var), x_var, y_var
+
+    def test_div_of_fd_grad_raises(self, fv):
+        u, x, y = fv
+        with pytest.raises(ValueError, match="finite-difference"):
+            jno.np.vector(u.x, u.y).div(x, y)
+
+    def test_curl_of_fd_grad_raises(self, fv):
+        u, x, y = fv
+        with pytest.raises(ValueError, match="finite-difference"):
+            jno.np.vector(u.x, u.y).curl(x, y)
+
+    def test_jacobian_of_fd_grad_raises(self, fv):
+        u, x, y = fv
+        with pytest.raises(ValueError, match="finite-difference"):
+            jno.np.vector(u.x, u.y).jacobian(x, y)
+
+    def test_second_ad_derivative_on_fd_partial_raises(self, fv):
+        u, x, y = fv
+        with pytest.raises(ValueError, match="finite-difference"):
+            u.x.d(x)
+
+    def test_ad_laplacian_on_fd_partial_raises(self, fv):
+        u, x, y = fv
+        with pytest.raises(ValueError, match="finite-difference"):
+            u.x.laplacian(x, y)
+
+    def test_fieldview_fd_higher_order_still_allowed(self, fv):
+        """Contrast: the FD API itself must NOT raise."""
+        u, x, y = fv
+        _ = u.xx + u.yy  # FD Laplacian
+        _ = u.x.x  # FD chain
+        _ = u.x.d(x, scheme="finite_difference")  # explicit FD scheme
+
+    # The functional jno.np.* API must guard the same way as the method/view API.
+    def test_functional_divergence_of_fd_grad_raises(self, fv):
+        u, x, y = fv
+        with pytest.raises(ValueError, match="finite-difference"):
+            jno.np.divergence([u.x, u.y], [x, y])
+
+    def test_functional_laplacian_of_fd_partial_raises(self, fv):
+        u, x, y = fv
+        with pytest.raises(ValueError, match="finite-difference"):
+            jno.np.laplacian(u.x, [x, y])
+
+    def test_functional_grad_of_fd_partial_raises(self, fv):
+        u, x, y = fv
+        with pytest.raises(ValueError, match="finite-difference"):
+            jno.np.grad(u.x, x)
+
+    def test_functional_jacobian_of_fd_partial_raises(self, fv):
+        u, x, y = fv
+        with pytest.raises(ValueError, match="finite-difference"):
+            jno.np.jacobian(u.x, [x, y])
+
+    def test_functional_hessian_of_fd_partial_raises(self, fv):
+        u, x, y = fv
+        with pytest.raises(ValueError, match="finite-difference"):
+            jno.np.hessian(u.x, [x, y])
+
+    def test_functional_curl_2d_of_fd_partials_raises(self, fv):
+        u, x, y = fv
+        with pytest.raises(ValueError, match="finite-difference"):
+            jno.np.curl_2d(u.x, u.y, x, y)

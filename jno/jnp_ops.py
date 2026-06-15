@@ -20,6 +20,7 @@ from .trace import (
     Tracker,
     TrialFunction,
     Variable,
+    _guard_ad_on_fd,
 )
 from .tuner import Arch, ArchSpace, tune  # noqa: F401
 
@@ -33,6 +34,14 @@ def _u(x):
     from .trace.views import _VIEW_TYPES
 
     return x._expr if isinstance(x, _VIEW_TYPES) else x
+
+
+def _guard(target, scheme: str = "automatic_differentiation") -> None:
+    """Functional-API mirror of ``Placeholder``'s method-level guard: block an
+    automatic-differentiation differential operator over a FieldView
+    finite-difference partial (which would silently return 0).
+    """
+    _guard_ad_on_fd(_u(target), scheme)
 
 
 # ============================================================================
@@ -599,6 +608,7 @@ def grad(target: Placeholder, variable: Variable, scheme: str = "automatic_diffe
     Example:
         u_x = pnp.grad(u(x, y), x)  # ∂u/∂x
     """
+    _guard(target, scheme)
     if isinstance(variable, (list, tuple)):
         if len(variable) == 0:
             raise ValueError("grad(..., variables) requires at least one variable")
@@ -632,6 +642,7 @@ def laplacian(
     Example:
         lap_u = pnp.laplacian(u(x, y), [x, y])  # ∂²u/∂x² + ∂²u/∂y²
     """
+    _guard(target, scheme)
     if scheme == "finite_difference" and variables is not None:
         print(
             "Variables were selected for the finite difference laplacian which are not used. The finite difference derivatives are computed on the entire spatial grid."
@@ -646,6 +657,7 @@ def laplace(
     scheme: str = "automatic_differentiation",
 ) -> Hessian:
     """Alias for laplacian."""
+    _guard(target, scheme)
     return Hessian(_u(target), variables, scheme, trace=True)
 
 
@@ -670,6 +682,7 @@ def hessian(
     Example:
         H = pnp.hessian(u(x, y), [x, y])  # 2x2 Hessian matrix
     """
+    _guard(target, scheme)
     return Hessian(_u(target), variables, scheme)
 
 
@@ -694,6 +707,7 @@ def jacobian(
     Example:
         J = pnp.jacobian(u(x, y), [x, y])  # 2-element Jacobian vector
     """
+    _guard(target, scheme)
     return Jacobian(_u(target), variables, scheme)
 
 
@@ -716,6 +730,8 @@ def divergence(vector_field: List[Placeholder], variables: List[Variable]) -> Pl
     if len(vector_field) != len(variables):
         raise ValueError("vector_field and variables must have same length")
 
+    for vf in vector_field:
+        _guard(vf)
     result: Placeholder = Jacobian(_u(vector_field[0]), [variables[0]])
     for i in range(1, len(vector_field)):
         result = result + Jacobian(_u(vector_field[i]), [variables[i]])
@@ -735,6 +751,8 @@ def curl_2d(Fx: Placeholder, Fy: Placeholder, x: Variable, y: Variable) -> Place
     Returns:
         Scalar curl
     """
+    _guard(Fx)
+    _guard(Fy)
     return Jacobian(_u(Fy), [x]) - Jacobian(_u(Fx), [y])
 
 
@@ -761,6 +779,9 @@ def curl_3d(
         A 3-component Placeholder representing the curl vector
     """
     Fx, Fy, Fz = _u(Fx), _u(Fy), _u(Fz)
+    _guard(Fx)
+    _guard(Fy)
+    _guard(Fz)
     curl_x = Jacobian(Fz, [y]) - Jacobian(Fy, [z])
     curl_y = Jacobian(Fx, [z]) - Jacobian(Fz, [x])
     curl_z = Jacobian(Fy, [x]) - Jacobian(Fx, [y])
