@@ -7,6 +7,7 @@ import numpy as np
 
 from .boundary_region import BoundaryRegion
 from .domain_class import domain
+from .simplex_pool import SimplexPool
 
 if TYPE_CHECKING:
     from shapely.geometry.base import BaseGeometry
@@ -291,6 +292,9 @@ class PolygonDomain(domain):
         self._polygon_boundary_segments: Dict[str, np.ndarray] = {}
         self._polygon_boundary_normal_geometries: Dict[str, BaseGeometry] = {}
         self._area_part_cache: Dict[str, Tuple[List[BaseGeometry], np.ndarray]] = {}
+        # Precomputed simplex pools for in-JIT collocation sampling — populated
+        # lazily by _register_interior_tag / _register_boundary_tag.
+        self._simplex_pools: Dict[str, SimplexPool] = {}
 
         if geometry is None:
             if vertices is None:
@@ -1339,6 +1343,15 @@ class PolygonDomain(domain):
 
         if polygon_tag and (wants_lazy_count or not has_mesh_entry):
             if isinstance(sample, tuple) and len(sample) > 0 and isinstance(sample[0], (int, type(None))):
+                # No explicit count → default to 1 point with per-step fresh resampling.
+                # This makes ``domain.variable("interior")`` a one-liner for Monte-Carlo
+                # PINN mode: one fresh random collocation point at every training epoch.
+                if sample[0] is None and not has_mesh_entry:
+                    from ..utils.adaptive.resampling import RandomResampling
+
+                    sample = (1, sample[1])
+                    if resampling_strategy is None:
+                        resampling_strategy = RandomResampling(resample_every=1, resample_fraction=1.0)
                 self.sample_dict.append([tag, sample, resampling_strategy, normals, view_factor])
                 _, sampled_indices, sampled_tag = self.sample(
                     {tag: sample},

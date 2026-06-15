@@ -120,8 +120,9 @@ def test_build_mesh_is_idempotent_and_refines():
 
 
 def test_lazy_path_unchanged_without_build_mesh():
-    """Without ``build_mesh``, AD on lazy samples still works; the
-    explicit-count-required error stays put."""
+    """Without ``build_mesh``, AD on lazy samples still works; a missing sample
+    count auto-defaults to a single Monte-Carlo point with per-step resampling
+    (the pinn-gaps default), rather than raising."""
     np.random.seed(0)
     dom = jno.domain.csg([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)])
 
@@ -132,9 +133,11 @@ def test_lazy_path_unchanged_without_build_mesh():
     exact = np.asarray(ev.evaluate(2 * x, context=dom.context)).reshape(ad.shape)
     assert float(np.max(np.abs(ad - exact))) < 1e-10
 
+    # No explicit count → auto-default to one Monte-Carlo point (+ per-step
+    # RandomResampling); see tests/test_polygon_domain_csg.py for the full spec.
     dom_no_mesh = jno.domain.csg([(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)])
-    with pytest.raises(ValueError, match="explicit sample count"):
-        dom_no_mesh.variable("interior")
+    xn, _yn, _tn = dom_no_mesh.variable("interior")
+    assert dom_no_mesh.context[xn.tag][0, 0].shape == (1, 2)
 
 
 def test_build_mesh_rejects_empty_geometry():
