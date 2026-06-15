@@ -33,6 +33,12 @@ class ResamplingStrategy(ABC):
     interesting dynamics.
     """
 
+    # Whether ``resample()`` actually reads its ``residuals`` argument.
+    # Subclasses that ignore residuals (e.g. uniform random resampling)
+    # override to False so the training loop can skip an expensive
+    # residual forward pass on resample epochs.
+    needs_residuals: bool = True
+
     def __init__(
         self,
         resample_every: int = 100,
@@ -799,6 +805,8 @@ class RandomResampling(ResamplingStrategy):
 
     Useful as a baseline to prevent overfitting to specific points.
     """
+
+    needs_residuals = False
 
     def resample(
         self,
