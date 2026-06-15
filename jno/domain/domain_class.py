@@ -19,6 +19,7 @@ from ..utils.logger import get_logger
 from .boundary_region import BoundaryRegion
 from .geometries import Geometries
 from .meshio_mixin import MeshIOMixin
+from .simplex_pool import SimplexPool
 
 
 def _scalar_float(value: Any) -> float:
@@ -571,6 +572,10 @@ class domain(MeshIOMixin):
         self._tag_edges: Dict[str, np.ndarray] = {}
         self._tag_triangles: Dict[str, np.ndarray] = {}
         self._boundary_regions: Dict[str, BoundaryRegion] = {}
+        # Precomputed simplex pools (segments / triangles + optional normals)
+        # for in-JIT collocation sampling — populated by ``_build_simplex_pools``
+        # after each ``_apply_mesh``.
+        self._simplex_pools: Dict[str, SimplexPool] = {}
         # self._boundary_predicates: Dict[str, Callable] = {}
 
         # Neural operator storage
@@ -1735,10 +1740,72 @@ class domain(MeshIOMixin):
         else:
             self.mesh = mesh
             boundary_indices = self._extract_points_from_mesh(mesh)
+            self._build_simplex_pools()
 
         if mesh is not None and self.compute_mesh_connectivity:
             self.mesh_connectivity, msg = self._preprocess_mesh_connectivity(mesh, self.dimension, boundary_indices)
             self.log.info(msg)
+
+    def _build_simplex_pools(self) -> None:
+        """Populate ``self._simplex_pools`` from ``_tag_edges`` / ``_tag_triangles``.
+
+        Runs after ``_extract_points_from_mesh`` so the per-tag cell-membership
+        tables are filled in.  For each mesh tag we materialise a
+        ``SimplexPool``:
+
+        * ``_tag_triangles[tag]`` (dim-2 interior) → V=3 barycentric pool.
+        * ``_tag_edges[tag]`` (1-D interior or 2-D boundary) → V=2 lerp pool;
+          if the tag has a per-point normal in ``normals_by_tag`` we average
+          the two endpoint normals to get a per-segment normal.  Falls back to
+          a geometric normal (rotate the segment vector 90° and pick the
+          half-space pointing away from the mesh centroid) when no per-point
+          normals are available.
+
+        Existing pools for tags not touched by the current mesh (e.g. the
+        Shapely-side pools that ``PolygonDomain._register_*_tag`` populated
+        before a later ``build_mesh()``) are left intact — only tags present
+        in ``_tag_triangles`` / ``_tag_edges`` are overwritten.
+        """
+        points = getattr(self, "points", None)
+        if points is None or len(points) == 0:
+            return
+        points_d = points[:, : self.dimension]
+        mesh_centroid = points_d.mean(axis=0) if len(points_d) else None
+
+        # Track which tags get a triangle pool in this build so the segment
+        # loop knows to skip them (a tag with both triangles + boundary edges
+        # is sampled as an interior — boundary edges are auxiliary).
+        triangle_tags_this_build: set = set()
+
+        # 2-D interior tags (triangle pool, no normals).
+        for tag, tri_indices in self._tag_triangles.items():
+            tri_coords = points_d[tri_indices]
+            if tri_coords.ndim == 3 and tri_coords.shape[1] == 3 and tri_coords.shape[2] == 2:
+                self._simplex_pools[tag] = SimplexPool.from_triangles(tri_coords)
+                triangle_tags_this_build.add(tag)
+
+        # 1-D interior + 2-D boundary tags (segment pool, with normals on dim=2).
+        for tag, edge_indices in self._tag_edges.items():
+            if tag in triangle_tags_this_build:
+                continue  # this tag is being sampled as an interior
+            seg_coords = points_d[edge_indices]
+            if seg_coords.ndim != 3 or seg_coords.shape[1] != 2:
+                continue
+
+            normals = None
+            if self.dimension == 2 and mesh_centroid is not None:
+                vectors = seg_coords[:, 1, :] - seg_coords[:, 0, :]
+                lengths = np.linalg.norm(vectors, axis=1, keepdims=True)
+                lengths = np.where(lengths > 0, lengths, 1.0)
+                tangents = vectors / lengths
+                cand = np.stack([-tangents[:, 1], tangents[:, 0]], axis=-1)
+                midpoints = 0.5 * (seg_coords[:, 0, :] + seg_coords[:, 1, :])
+                outward = midpoints - mesh_centroid
+                flip = (cand * outward).sum(axis=-1) < 0.0
+                cand[flip] *= -1.0
+                normals = cand.astype(np.float32)
+
+            self._simplex_pools[tag] = SimplexPool.from_segments(seg_coords, normals=normals)
 
     def _extract_points_from_mesh(self, mesh):
         """Extract points and normals from mesh and organize by tag."""

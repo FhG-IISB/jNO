@@ -3453,13 +3453,45 @@ class core:
                         full_models = eqx.combine(trainable, frozen_arrays, static)
                         full_models = _paramax.unwrap(full_models)
 
-                        residuals_all = self.compiled_resample_constraints_fn(
-                            full_models,
-                            full_context,
-                            batchsize=None,
-                            key=self.rng,
-                            min_consecutive=min_consecutive,
-                        )
+                        # Only compute residuals when at least one due strategy
+                        # actually consumes them. Skipping avoids an expensive
+                        # un-jit'd forward pass for residual-agnostic strategies
+                        # (e.g. RandomResampling) where the residuals would be
+                        # ignored anyway.
+                        if any(s.needs_residuals for _, s in due):
+                            # Pin both operands to the default device (the GPU
+                            # under JAX_PLATFORMS=cuda,cpu) so the residual
+                            # forward pass has consistent device placement.
+                            #
+                            # Why: ``compiled_resample_constraints_fn`` is not
+                            # ``jax.jit``'d with explicit ``in_shardings``, so
+                            # JAX can't reconcile mesh-sharded model params
+                            # (NamedSharding from the training-step jit setup,
+                            # which becomes ARG_SHARDING inside the resample
+                            # function's internal vmap) with the CPU-resident
+                            # context arrays — the MLP matmul errors out.
+                            #
+                            # Cost: the model ``device_put`` is a metadata-only
+                            # resharding (NamedSharding→SingleDeviceSharding)
+                            # when the mesh is a single device; the context
+                            # ``device_put`` moves CPU→GPU but only fires on
+                            # resample epochs, and the transferred slice is
+                            # small (one (B, T, N, D) per resample-relevant
+                            # tag). For the Monte-Carlo auto-default path
+                            # (RandomResampling, needs_residuals=False) this
+                            # branch is skipped entirely.
+                            _resample_dev = jax.devices()[0]
+                            _models_local = jax.device_put(full_models, _resample_dev)
+                            _ctx_local = jax.device_put(full_context, _resample_dev)
+                            residuals_all = self.compiled_resample_constraints_fn(
+                                _models_local,
+                                _ctx_local,
+                                batchsize=None,
+                                key=self.rng,
+                                min_consecutive=min_consecutive,
+                            )
+                        else:
+                            residuals_all = None
 
                         updated = False
                         for tag, strategy in due:
@@ -3480,31 +3512,46 @@ class core:
                             points_bn = jnp.asarray(tag_points[:, 0, :, :])
                             n_batch, n_points = points_bn.shape[0], points_bn.shape[1]
 
-                            idxs = tag_to_constraint_indices.get(tag, [])
-                            if not idxs:
-                                self.log.warning(
-                                    f"Resampling skipped for tag '{tag}': no constraints associated with this tag"
-                                )
-                                continue
+                            if strategy.needs_residuals:
+                                idxs = tag_to_constraint_indices.get(tag, [])
+                                if not idxs:
+                                    self.log.warning(
+                                        f"Resampling skipped for tag '{tag}': no constraints associated with this tag"
+                                    )
+                                    continue
 
-                            scored = []
-                            for idx in idxs:
-                                collapsed = _collapse_residual_for_tag(residuals_all[idx], n_points, n_batch)
-                                if collapsed is not None:
-                                    scored.append(collapsed)
+                                scored = []
+                                for idx in idxs:
+                                    collapsed = _collapse_residual_for_tag(residuals_all[idx], n_points, n_batch)
+                                    if collapsed is not None:
+                                        scored.append(collapsed)
 
-                            if not scored:
-                                self.log.warning(f"Resampling skipped for tag '{tag}': no compatible pointwise residuals")
-                                continue
+                                if not scored:
+                                    self.log.warning(
+                                        f"Resampling skipped for tag '{tag}': no compatible pointwise residuals"
+                                    )
+                                    continue
 
-                            # Normalize each constraint to [0, 1] then take per-point max.
-                            stacked = jnp.stack(scored, axis=0)  # (C, B, N)
-                            per_max = jnp.max(stacked, axis=-1, keepdims=True)  # (C, B, 1)
-                            normalized = stacked / (per_max + 1e-12)
-                            combined = jnp.max(normalized, axis=0)  # (B, N)
+                                # Normalize each constraint to [0, 1] then take per-point max.
+                                stacked = jnp.stack(scored, axis=0)  # (C, B, N)
+                                per_max = jnp.max(stacked, axis=-1, keepdims=True)  # (C, B, 1)
+                                normalized = stacked / (per_max + 1e-12)
+                                combined = jnp.max(normalized, axis=0)  # (B, N)
+                            else:
+                                # Strategy ignores residuals — pass a zero placeholder.
+                                combined = jnp.zeros((n_batch, n_points))
 
                             # Draw candidates once — reused by every batch and for normals.
                             candidates_pts, candidates_nrms = self.domain.draw_candidates(tag)
+
+                            # Resampling mixes host-side context arrays (potentially
+                            # on CPU under JAX_PLATFORMS=cuda,cpu) with JAX-random
+                            # outputs that land on the default device. Co-locate
+                            # them so primitives like scatter don't error on the
+                            # device mismatch.
+                            _default_device = jax.devices()[0]
+                            points_bn = jax.device_put(points_bn, _default_device)
+                            combined = jax.device_put(combined, _default_device)
 
                             new_batches = []
                             for b in range(n_batch):

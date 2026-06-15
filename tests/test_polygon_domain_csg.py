@@ -331,3 +331,77 @@ def test_numbered_boundary_subtags_are_geometrically_distinct():
 
     # Four distinct faces ↔ four distinct (axis, value) pairs
     assert len(constant_coords) == 4, f"Expected 4 distinct edges, got {len(constant_coords)}: {constant_coords}"
+
+
+# ---------------------------------------------------------------------------
+# Auto-default sampling (no explicit sample count)
+# ---------------------------------------------------------------------------
+
+
+def test_variable_no_sample_defaults_to_one_point():
+    """Calling variable() without a sample count materializes exactly 1 point."""
+    dom = jno.domain.csg(SQUARE_A, name="a")
+    x, y, _ = dom.variable("interior")
+    pts = dom.context[x.tag][0, 0]
+    assert pts.shape == (1, 2), f"expected (1, 2), got {pts.shape}"
+    # Point must lie inside the unit square
+    assert 0.0 < pts[0, 0] < 1.0
+    assert 0.0 < pts[0, 1] < 1.0
+
+
+def test_variable_no_sample_attaches_per_step_resampling():
+    """Auto-default path attaches RandomResampling(resample_every=1, fraction=1.0)."""
+    from jno.utils.adaptive.resampling import RandomResampling
+
+    dom = jno.domain.csg(SQUARE_A, name="a")
+    x, y, _ = dom.variable("interior")
+    tag = x.tag
+    assert tag in dom._resampling_strategies, "no resampling strategy was registered"
+    strat = dom._resampling_strategies[tag]
+    assert isinstance(strat, RandomResampling)
+    assert strat.resample_every == 1
+    assert strat.resample_fraction == 1.0
+
+
+def test_variable_explicit_count_unchanged():
+    """variable('interior', (64, None)) still works, uses the given count, no auto-resample."""
+    np.random.seed(0)
+    dom = jno.domain.csg(SQUARE_A, name="a")
+    x, y, _ = dom.variable("interior", (64, None))
+    pts = dom.context[x.tag][0, 0]
+    assert pts.shape == (64, 2)
+    # Explicit count → no auto-resampling strategy attached
+    assert x.tag not in dom._resampling_strategies
+
+
+def test_variable_no_sample_explicit_resampling_strategy_respected():
+    """If the user explicitly passes a resampling_strategy, it is not overridden."""
+    from jno.utils.adaptive.resampling import RandomResampling
+
+    custom = RandomResampling(resample_every=50, resample_fraction=0.5)
+    dom = jno.domain.csg(SQUARE_A, name="a")
+    x, y, _ = dom.variable("interior", resampling_strategy=custom)
+    tag = x.tag
+    assert dom._resampling_strategies[tag] is custom
+    assert dom._resampling_strategies[tag].resample_every == 50
+
+
+@pytest.mark.integration
+def test_variable_no_sample_drives_crux_solve_end_to_end():
+    """Auto-default + crux.solve must run: 1 point + per-step random resample."""
+    import foundax
+    import jax
+    import optax
+
+    dom = jno.domain.csg(SQUARE_A, name="a")
+    x, y, _ = dom.variable("interior")
+    net = jno.nn(foundax.mlp(in_features=2, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(0)))
+    net.optimizer(optax.adam(1e-3))
+    u = net(jno.np.concat([x, y], axis=-1)) * x * (1 - x) * y * (1 - y)
+    pde = u.laplacian(x, y)
+    crux = jno.core([pde.mse], domain=dom)
+    stats = crux.solve(3)
+    # End-to-end smoke: solve runs without crashing and the loop exercised the
+    # resample → step pipeline at every epoch (resample_every=1) — that's what
+    # the auto-default + RandomResampling combination is supposed to deliver.
+    assert stats is not None
