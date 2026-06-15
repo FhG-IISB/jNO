@@ -12,7 +12,7 @@ A **tracker** is an expression that is evaluated and logged each training step b
 from jno.numpy import tracker
 
 val_error = tracker(jno.np.mean(jno.np.abs(u - u_exact)), interval=100)
-crux = jno.core([pde.mse, bc.mse, val_error], domain)
+crux = jno.core([pde.mse, bc.mse, val_error])
 ```
 
 `interval` controls how often the value is recorded (default: every step). The logged values appear in the `statistics` object returned by `solve()` alongside the loss curves.
@@ -21,7 +21,7 @@ Adaptive weight placeholders also expose `.tracker()`:
 
 ```python
 w_pde, w_bc = jno.fn.adaptive.relobralo([pde.mse, bc.mse])
-crux = jno.core([w_pde * pde.mse, w_bc * bc.mse, w_pde.tracker(), w_bc.tracker()], domain)
+crux = jno.core([w_pde * pde.mse, w_bc * bc.mse, w_pde.tracker(), w_bc.tracker()])
 ```
 
 ---
@@ -66,7 +66,7 @@ The parameters can be used in any symbolic expression:
 ```python
 residual = a * jno.np.sin(π * x) + b * jno.np.cos(π * x) + c * x * (1 - x) - target
 
-crux    = jno.core([residual.mse], domain)
+crux    = jno.core([residual.mse])
 history = crux.solve(30000)
 
 _a, _b, _c = crux.eval([a, b, c])
@@ -99,7 +99,7 @@ from jno.numpy import tracker
 J    = u.grad(u_net)                              # (B, N, P)
 J_norm = tracker(jno.np.mean(J ** 2), interval=50)  # scalar, logged every 50 steps
 
-crux = jno.core([pde.mse, bc.mse, J_norm], domain)
+crux = jno.core([pde.mse, bc.mse, J_norm])
 history = crux.solve(10000)
 ```
 
@@ -115,7 +115,7 @@ K      = J_flat @ J_flat.T       # (N, N)
 # Log the ratio of largest to smallest eigenvalue as a proxy for conditioning
 K_norm = tracker(jno.np.max(K) / (jno.np.min(K) + 1e-8), interval=100)
 
-crux = jno.core([pde.mse, K_norm], domain)
+crux = jno.core([pde.mse, K_norm])
 ```
 
 ### Tracking gradient cosine similarity
@@ -134,7 +134,7 @@ cos_sim = tracker(
     interval=100,
 )
 
-crux = jno.core([pde.mse, bc.mse, cos_sim], domain)
+crux = jno.core([pde.mse, bc.mse, cos_sim])
 ```
 
 A value near +1 means the two losses reinforce the same weight update each step; near −1 means they conflict and stall each other.
@@ -155,10 +155,10 @@ J_norm = tracker(jno.np.mean(J_out ** 2), interval=50)
 
 ### Using the Jacobian as a loss term
 
-`u.grad(net)` can appear directly in a constraint, but differentiating *through* `jax.jacrev` is second-order AD and expensive. Use `.stop_gradient()` to treat the current Jacobian as a constant regulariser:
+`u.grad(net)` can appear directly in a constraint, but differentiating *through* `jax.jacrev` is second-order AD and expensive. Use `.stop_gradient` to treat the current Jacobian as a constant regulariser:
 
 ```python
-J_sg    = u.grad(u_net).stop_gradient()
+J_sg    = u.grad(u_net).stop_gradient
 ntk_reg = (J_sg @ J_sg.T - target_K).mse
-crux    = jno.core([pde.mse, ntk_reg], domain)
+crux    = jno.core([pde.mse, ntk_reg])
 ```

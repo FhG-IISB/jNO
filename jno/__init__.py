@@ -35,6 +35,20 @@ from .trace import (
     TrialFunction,
     Variable,
 )
+from .trace.views import (
+    ComplexView,
+    MatrixView,
+    NamedComplexViewWithPartials,
+    NamedMatrixView,
+    NamedMatrixViewWithPartials,
+    NamedScalarViewWithPartials,
+    NamedVectorView,
+    NamedVectorViewWithPartials,
+    NamedVoigtViewWithPartials,
+    ScalarView,
+    VectorView,
+    VoigtView,
+)
 from .trace_compiler import TraceCompiler
 from .trace_evaluator import TraceEvaluator
 from .utils import IREEModel as iree
@@ -93,7 +107,6 @@ __all__ = [
     "Placeholder",
     "OperationDef",
     "OperationCall",
-    "resampling",
     "LearningRateSchedule",
     "WeightSchedule",
     "callbacks",
@@ -130,6 +143,17 @@ __all__ = [
     "fn",
     "lora",
     "noise",
-    "callback",
     "StateField",
+    "ScalarView",
+    "VectorView",
+    "ComplexView",
+    "MatrixView",
+    "NamedMatrixView",
+    "NamedVectorView",
+    "VoigtView",
+    "NamedScalarViewWithPartials",
+    "NamedVectorViewWithPartials",
+    "NamedComplexViewWithPartials",
+    "NamedMatrixViewWithPartials",
+    "NamedVoigtViewWithPartials",
 ]

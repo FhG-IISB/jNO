@@ -1,8 +1,8 @@
 # DeepONet — parametric Poisson 2D
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/11_operator_learning/deeponet_poisson_2d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/11-operator-learning/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/11_operator_learning/deeponet_poisson_2d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/11-operator-learning/">Back to chapter</a>
 </div>
 
 Train a DeepONet to solve a 1-parameter family of Poisson problems via PDE-residual learning. The network sees no ground-truth solutions — only the physics — and learns the operator `k → u(·)` for the entire range `k ∈ [0.5, 1.5]`.
@@ -60,7 +60,7 @@ The multiplicative ansatz `x(2-x)y(1-y)` vanishes on all four edges and enforces
 ## Step 4: Solve
 
 ```python
-crux = jno.core(constraints=[pde.mse], domain=dom)
+crux = jno.core(constraints=[pde.mse])
 crux.solve(epochs=20_000, batchsize=32)
 ```
 
@@ -73,8 +73,8 @@ crux.solve(epochs=20_000, batchsize=32)
 - **Pure PDE-residual training.** No solution data is supplied — the network learns from physics alone. Compare with the [FNO](fno-poisson-2d.md) and [U-Net](unet-poisson-2d.md) tutorials, which use a precomputed `(f, u)` dataset.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/11_operator_learning/deeponet_poisson_2d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/11-operator-learning/">Back to 11 Operator Learning</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/11_operator_learning/deeponet_poisson_2d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/11-operator-learning/">Back to 11 Operator Learning</a>
 </div>
 
 ## Script Snippet

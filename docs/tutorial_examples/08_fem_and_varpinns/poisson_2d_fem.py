@@ -1,25 +1,4 @@
-"""
-01 - 2D Poisson equation with FEAX-FEM assembly
-
-Problem
--------
-    -Δu = f      in Ω = [0, 1]^2
-     u = 0      on ∂Ω
-
-Manufactured solution
----------------------
-    u(x, y) = x(1 - x)y(1 - y)
-
-Then
-----
-    f(x, y) = 2[x(1 - x) + y(1 - y)]
-
-Showcases
----------
-- domain.init_fem(...)
-- weak.assemble(target="fem_system")
-- FEAX-backed linear FEM system A u = b
-"""
+"""01 - 2D Poisson equation with FEAX-FEM assembly"""
 
 import jax.numpy as jnp
 import numpy as np
@@ -87,7 +66,7 @@ u_fem = jnp.linalg.solve(A_dense, b_dense).reshape(-1)
 
 lin_res = jnp.linalg.norm(A_dense @ u_fem - b_dense) / (jnp.linalg.norm(b_dense) + 1e-14)
 
-coords = np.asarray(domain.mesh.points)[:, :2]
+coords = np.asarray(domain.built_mesh.points)[:, :2]
 x = jnp.asarray(coords[:, 0:1])
 y = jnp.asarray(coords[:, 1:2])
 

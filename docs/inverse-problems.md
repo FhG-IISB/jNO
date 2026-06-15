@@ -24,7 +24,7 @@ for p in [a, b]:
 
 residual = (a * jno.np.sin(jnp.pi * x) + b * jno.np.cos(jnp.pi * x)) - target
 
-crux = jno.core([residual.mse], domain)
+crux = jno.core([residual.mse])
 crux.solve(10_000)
 
 _a, _b = crux.eval([a, b])
@@ -49,7 +49,7 @@ Penalises rapid spatial variation. Good default for smooth physical fields.
 k = jno.nn.wrap(k_net)(x, y)
 reg = jno.fn.regularize.smooth(k, x, y)
 
-crux = jno.core([pde.mse, data.mse, reg.mean], domain=dom)
+crux = jno.core([pde.mse, data.mse, reg.mean])
 ```
 
 #### `tv(field, *variables)` — total variation
@@ -58,7 +58,7 @@ Promotes piecewise-constant fields; better when the unknown has sharp interfaces
 
 ```python
 reg = jno.fn.regularize.tv(k, x, y)
-crux = jno.core([pde.mse, reg.mean], domain=dom)
+crux = jno.core([pde.mse, reg.mean])
 ```
 
 #### `nonneg(field, strength=1.0)` — soft positivity
@@ -67,7 +67,7 @@ Zero cost when `field >= 0`; penalises negative values linearly. Useful for phys
 
 ```python
 reg = jno.fn.regularize.nonneg(k)
-crux = jno.core([pde.mse, reg.mean], domain=dom)
+crux = jno.core([pde.mse, reg.mean])
 ```
 
 #### `bounded(field, lo, hi)` — two-sided barrier
@@ -76,7 +76,7 @@ Penalises values outside `[lo, hi]`.
 
 ```python
 reg = jno.fn.regularize.bounded(k, lo=0.1, hi=2.0)
-crux = jno.core([pde.mse, reg.mean], domain=dom)
+crux = jno.core([pde.mse, reg.mean])
 ```
 
 ---
@@ -180,7 +180,7 @@ pde  = k * u.dd(x) - f_pde
 data = u - u_obs
 reg  = jno.fn.regularize.smooth(k, x)
 
-crux = jno.core([pde.mse, data.mse, reg.mean], domain=domain)
+crux = jno.core([pde.mse, data.mse, reg.mean])
 crux.solve(5_000)
 
 _u, _k, _u_obs = crux.eval([u, k, u_obs])

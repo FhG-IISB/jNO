@@ -1,24 +1,4 @@
-"""11 — Fourier Neural Operator 2D for Poisson operator learning
-
-Problem
--------
-Learn the solution operator of the 2-D Poisson equation
-    −∇²u = f   on [0,1]²,   u = 0 on ∂[0,1]²
-from a dataset of (f, u) pairs generated analytically with a truncated
-sinusoidal basis.
-
-Architecture
-------------
-foundax.fno2d performs global spectral convolutions: at each layer the
-input is lifted to a hidden channel, transformed to Fourier space, the
-low-mode coefficients are mixed via a learnable linear map, transformed
-back, combined with a residual conv, and normalised.  This is well
-suited to smooth solution fields with global coupling such as those of
-elliptic PDEs.
-
-Reference: Li et al., "Fourier Neural Operator for Parametric Partial
-Differential Equations", ICLR 2021.
-"""
+"""11 — Fourier Neural Operator 2D for Poisson operator learning"""
 
 import foundax
 import jax
@@ -62,5 +42,5 @@ u.optimizer(
 )
 
 # ── Supervised loss + solve ─────────────────────────────────────────────────
-crux = jno.core([(_u - u(_f)).mse], domain)
+crux = jno.core([(_u - u(_f)).mse])
 crux.solve(epochs=EPOCHS, batchsize=BATCH)

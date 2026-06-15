@@ -1,45 +1,4 @@
-"""05 — Bayesian inverse surrogate: posterior over an inverted input
-
-Workflow
---------
-**Phase 1 (forward, deterministic).**  Train a PINN that maps `x → u(x)`
-for the standard 1-D Poisson `u'' + π² sin(πx) = 0` on `[0, 1]` with
-zero Dirichlet BCs.  Closed-form reference: `u_exact(x) = sin(πx)`.
-
-**Phase 2 (inverse, Bayesian).**  Freeze the surrogate.  Declare the
-input `x_query` as a *Bayesian* parameter and use NUTS to sample the
-posterior over `x_query` given a noisy observation `u_obs ≈ u_exact(x_true)`.
-
-What's new versus the deterministic ``surrogate_inversion`` tutorial in
-``05_coupled_and_inverse``: jNO's per-parameter ``.bayesian()`` now
-attaches a kernel directly to the input variable, so the inverse
-problem returns a **posterior over the inverted input** with a
-credible interval, not just a single point estimate.
-
-Non-identifiability caveat
---------------------------
-`u(x) = sin(πx)` is symmetric about `x = 0.5`, so `u(0.3) = u(0.7) ≈
-0.809`.  The true posterior given `u_obs ≈ 0.809` is **bimodal** with
-mass at both `0.3` and `0.7`.  A single-chain NUTS started near `0.3`
-will discover the left mode and stay there; the credible interval
-reported below characterises that mode only.  This is a feature, not
-a bug — the CI is calibrated *within* the discovered mode, and the
-multi-modal structure could be revealed by running multiple chains
-from different initialisations.
-
-Technique
----------
-* `x_query` is a scalar Bayesian parameter; NUTS targets the posterior
-  `p(x_query | u_obs)` against the *frozen* forward surrogate, so the
-  kernel sees a fixed-target logdensity — proper MCMC.
-* `u_obs` is a fixed scalar (set once outside the trace), so the
-  likelihood NUTS sees is consistent across the chain.
-
-References
-----------
-Hoffman, M. D., & Gelman, A. (2014).  *The No-U-Turn Sampler.*  JMLR
-15(1), 1593-1623.
-"""
+"""05 — Bayesian inverse surrogate: posterior over an inverted input"""
 
 from pathlib import Path
 
@@ -71,7 +30,7 @@ u_net.optimizer(optax.adam(1e-3))
 u = u_net(x) * x * (1 - x)  # hard zero Dirichlet BCs
 pde = u.dd(x) + π**2 * jno.np.sin(π * x)  # u'' + π² sin(πx) = 0
 
-crux_fwd = jno.core([pde.mse], domain)
+crux_fwd = jno.core([pde.mse])
 crux_fwd.solve(3_000)
 
 # Sanity-check forward accuracy before inverting.
@@ -114,7 +73,7 @@ residual = (u_at_query - u_obs) / sigma_obs
 
 # Single-point inverse domain — loss has no spatial dependence on a mesh.
 inv_domain = jno.domain.from_array({"pt": np.zeros((1, 1))})
-crux_inv = jno.core([residual.mse], inv_domain)
+crux_inv = jno.core([residual.mse], domain=inv_domain)
 crux_inv.solve(800)
 
 # ── Posterior summary ────────────────────────────────────────────────────────

@@ -36,7 +36,7 @@ qualifies.
 pde      = (-u.laplacian(x, y) - forcing).mse
 bc       = (u_bnd - 0.0).mse
 data_fit = (u_pred - u_obs).mse
-crux = jno.core([pde, bc, data_fit], domain)
+crux = jno.core([pde, bc, data_fit])
 ```
 
 Covers both *physics* (PDE residuals) and *data* (supervised losses).

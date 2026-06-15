@@ -1,8 +1,8 @@
 # Allen-Cahn 2D
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/03_parabolic/allen_cahn_2d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/03-parabolic/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/03_parabolic/allen_cahn_2d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/03-parabolic/">Back to chapter</a>
 </div>
 
 This example solves a manufactured 2D Allen-Cahn problem and introduces a nonlinear cubic reaction term.
@@ -66,7 +66,7 @@ The script uses the same PDE infrastructure but anchors the solution at the init
 u_at_0 = net(0 * t, xy) * x * (1 - x) * y * (1 - y)
 ini     = u_at_0 - sin(π * x) * sin(π * y)
 
-crux    = jno.core([pde.mse, ini.mse], domain)
+crux    = jno.core([pde.mse, ini.mse])
 history = crux.solve(5000)
 ```
 
@@ -77,8 +77,8 @@ history = crux.solve(5000)
 - This example is a good template for phase-field style problems.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/03_parabolic/allen_cahn_2d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/03-parabolic/">Back to 03 Parabolic</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/03_parabolic/allen_cahn_2d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/03-parabolic/">Back to 03 Parabolic</a>
 </div>
 
 ## Script Snippet

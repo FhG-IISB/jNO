@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import inspect
 import types
-from typing import TYPE_CHECKING, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -37,7 +37,7 @@ from .utils.adaptive import weights as _adaptive_weights
 _MODULE_NAME = __name__
 
 
-def _module_call(fn, args: list = [], name: str = "", reduces_axis: Optional[int] = None):
+def _module_call(fn: Callable, args: list = [], name: str = "", reduces_axis: Optional[int] = None) -> FunctionCall:
     """Wrap an arbitrary function into the tracing graph.
 
     Args:
@@ -579,7 +579,7 @@ class _Regularize:
     the caller controls the final reduction::
 
         reg = jno.fn.regularize.smooth(k, x, y)
-        crux = jno.core([pde.mse, reg.mean], domain=dom)
+        crux = jno.core([pde.mse, reg.mean])
     """
 
     def smooth(self, field: "Placeholder", *variables: "Variable") -> "Placeholder":
@@ -749,6 +749,10 @@ def stop_gradient(field: "Placeholder") -> "FunctionCall":
 
     Equivalent to ``jax.lax.stop_gradient`` applied inside the trace graph.
     """
+    from .trace.views import _VIEW_TYPES
+
+    if isinstance(field, _VIEW_TYPES):
+        field = field._expr
     return FunctionCall(jax.lax.stop_gradient, [field], name="stop_gradient")
 
 
@@ -771,7 +775,7 @@ def cosine_similarity(a: Placeholder, b: Placeholder, eps: float = 1e-8) -> Func
 
         # track per-point similarity during training
         sim = jno.fn.cosine_similarity(J1, J2)
-        crux = jno.core([pde, bc, sim.tracker(100)], dom)
+        crux = jno.core([pde, bc, sim.tracker(100)])
 
         # or penalise gradient conflict directly
         conflict = (jno.fn.cosine_similarity(J1, J2) + 1).mse
@@ -802,7 +806,7 @@ def gradient_alignment(a: Placeholder, b: Placeholder, eps: float = 1e-8) -> Fun
         J_bc  = bc_res.grad(net)      # (N_bc,  P)
 
         alignment = jno.fn.gradient_alignment(J_pde, J_bc)
-        crux = jno.core([pde, bc, alignment.tracker(100)], dom)
+        crux = jno.core([pde, bc, alignment.tracker(100)])
     """
 
     def _impl(x, y, _eps=eps):

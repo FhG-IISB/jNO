@@ -78,7 +78,7 @@ The trace path follows the jNO logger, which defaults to the current working dir
 import jno
 jno.setup("runs/my_experiment")   # traces go to runs/my_experiment/traces/
 
-crux = jno.core([pde.mse], domain)
+crux = jno.core([pde.mse])
 history = crux.solve(5000, profile=True)
 ```
 

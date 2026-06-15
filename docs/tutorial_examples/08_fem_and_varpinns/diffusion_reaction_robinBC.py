@@ -1,37 +1,18 @@
-"""
-03 - 2D reaction-diffusion equation with Robin BCs: FEAX-FEM + VPINN
+"""03 - 2D reaction-diffusion equation with Robin BCs: FEAX-FEM + VPINN"""
 
-Problem
--------
-    -Δu + sigma u = f       in Ω = [0, 1]^2
+import os
 
-Boundary conditions
--------------------
-    u = y                  on x = 0
-    u = 0                  on y = 0
+# FEM surface_data arrays are currently CPU-pinned; running the VPINN training
+# on the same platform avoids a known device-mismatch in the step compile.
+os.environ["JAX_PLATFORMS"] = "cpu"
 
-    du/dn + alpha_right u = r_right   on x = 1
-    du/dn + alpha_top   u = r_top     on y = 1
+import foundax  # noqa: E402
+import jax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
+import numpy as np  # noqa: E402
+import optax  # noqa: E402
 
-Manufactured solution
----------------------
-    u(x, y) = x sin(pi y) + y
-
-Showcases
----------
-- mixed Dirichlet + Robin weak form
-- FEAX-FEM linear system route
-- VPINN weak-form route
-- hard Dirichlet ansatz for VPINN
-"""
-
-import foundax
-import jax
-import jax.numpy as jnp
-import numpy as np
-import optax
-
-import jno
+import jno  # noqa: E402
 
 pi = jno.np.pi
 sin = jno.np.sin
@@ -142,7 +123,7 @@ u_fem = jnp.linalg.solve(A_dense, b_dense).reshape(-1)
 
 lin_res = jnp.linalg.norm(A_dense @ u_fem - b_dense) / (jnp.linalg.norm(b_dense) + 1e-14)
 
-coords = np.asarray(fem_domain.mesh.points)[:, :2]
+coords = np.asarray(fem_domain.built_mesh.points)[:, :2]
 x_nodes = jnp.asarray(coords[:, 0:1])
 y_nodes = jnp.asarray(coords[:, 1:2])
 
@@ -194,7 +175,7 @@ u_int = apply_hard_bc(net(x_int, y_int), x_int, y_int)
 
 pde = weak_vpinn.assemble(train_domain, u_net=u_gauss, target="vpinn")
 
-crux = jno.core(constraints=[pde.mse], domain=train_domain)
+crux = jno.core(constraints=[pde.mse])
 
 net.optimizer(
     optax.adam(

@@ -1,54 +1,4 @@
-"""01 — Bayesian PINN forward problem: 1-D Poisson with noisy boundary data
-
-Problem
--------
-    u''(x) = -sin(πx),    x ∈ [0, 1],    u(0) = u(1) = 0,
-
-with closed-form reference ``u_exact(x) = sin(πx) / π²``.
-
-(Compared with the Yang-et-al. §3.2.1 setup, which uses
-``u = sin³(6x)`` on ``[-0.7, 0.7]`` with ``λ = 0.01``, we use the
-simpler unit-coefficient Poisson here so a small SGLD chain on CPU
-recovers the solution within seconds.  The Bayesian setup is otherwise
-identical.)
-
-The PDE residual is enforced exactly at interior collocation points;
-the two boundary observations carry Gaussian noise of standard
-deviation ``σ_b = 0.01``.  The B-PINN's posterior over the network
-weights then has two visible features:
-
-* the predictive mean fits the analytical solution near the data,
-* the credible band widens in regions with fewer observations.
-
-Technique
----------
-Each outer epoch performs one **Stochastic Gradient Langevin Dynamics**
-(SGLD) transition over the full network pytree.  After training, the
-post-warmup chain is stacked into ``net.posterior_samples`` and
-``crux.eval([u])`` auto-vmaps the evaluator over the chain to yield
-posterior **prediction bands** at the interior points.
-
-A caveat on calibration
------------------------
-Vanilla SGLD on a ~300-parameter MLP without preconditioning does not
-fully concentrate the chain around the data-fit MAP in a tractable
-step budget, so the in-data rel-L2 is RNG-path sensitive (different
-seeds can land anywhere from rel_L2 ≈ 0.5 to several).  For tightly
-calibrated bands on neural-network weights the literature recommends
-preconditioned variants (pSGLD), SGHMC with mass-matrix adaptation,
-or variational inference — those are out of scope here.  We commit
-instead to the **qualitative** B-PINN behaviour: the chain doesn't
-diverge, and the credible band has non-trivial width.
-
-References
-----------
-Yang, L., Meng, X., & Karniadakis, G. E. (2021).  *B-PINNs: Bayesian
-physics-informed neural networks for forward and inverse PDE problems
-with noisy data.*  Journal of Computational Physics, 425, 109913.
-
-Welling, M., & Teh, Y. W. (2011).  *Bayesian learning via stochastic
-gradient Langevin dynamics.*  ICML 2011, 681-688.
-"""
+"""01 — Bayesian PINN forward problem: 1-D Poisson with noisy boundary data"""
 
 from pathlib import Path
 
@@ -107,7 +57,7 @@ pde = u.d2(x, scheme="finite_difference") - f_clean
 bc = u_net(xb) - u_b_obs
 
 # ── Solve ─────────────────────────────────────────────────────────────────────
-crux = jno.core([pde.mse, bc.mse], domain)
+crux = jno.core([pde.mse, bc.mse])
 crux.solve(2800)
 
 # ── Posterior prediction bands (auto-chain default) ──────────────────────────

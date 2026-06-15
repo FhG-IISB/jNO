@@ -1,40 +1,4 @@
-"""06 — Fredholm integral equation with non-separable kernel
-
-Equation
---------
-    u(x) = f(x) + ∫₀¹ (x + t) · u(t) dt,   x ∈ [0, 1]
-
-The kernel K(x, t) = x + t depends on both the evaluation point x and
-the integration dummy t.  It cannot be collapsed to a single scalar
-without evaluating it for every x simultaneously — exactly what
-.integrate(var=x) enables.
-
-Exact solution:  u*(x) = sin(πx)
-
-Derivation of f
----------------
-    ∫₀¹ (x + t) sin(πt) dt
-        = x · ∫₀¹ sin(πt) dt  +  ∫₀¹ t · sin(πt) dt
-        = x · (2/π)            +  1/π
-
-    f(x) = sin(πx) − 2x/π − 1/π
-
-Network residual
-----------------
-    R(x) = u(x) − f(x) − ∫₀¹ (x + t) · u(t) dt  =  0
-
-API used
---------
-Two variables are obtained from the same domain tag — one acting as the
-outer collocation variable, one as the inner integration dummy.  The outer
-variable is passed to .integrate(var=x), so the result is an (N, 1) array
-(a function of x) rather than a scalar:
-
-    x, _ = domain.variable("interior")   # outer / collocation
-    t, _ = domain.variable("interior")   # inner / dummy  — no flag needed!
-
-    integral_term = ((x + t) * u(t)).integrate(var=x)
-"""
+"""06 — Fredholm integral equation with non-separable kernel"""
 
 from pathlib import Path
 
@@ -92,7 +56,7 @@ residual = u_x - f - integral_term
 
 # ── Solve ──────────────────────────────────────────────────────────────────────
 EPOCHS = 30_000
-crux = jno.core([residual.mse], domain).print_shapes()
+crux = jno.core([residual.mse]).print_shapes()
 _history = crux.solve(EPOCHS)
 
 # ── Evaluate ───────────────────────────────────────────────────────────────────

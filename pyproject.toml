@@ -40,7 +40,14 @@ dependencies = [
     "pylotte>=0.3",
     "shapely>=2.0",
     "paramax>=0.0.5",
-    "blackjax>=1.2"
+    "blackjax>=1.2",
+
+    # FEM / weak-form solver — required by the variational PINN tutorials
+    # under docs/tutorial_examples/08_fem_and_varpinns and a Bayesian inverse.
+    "feax>=0.5.1",
+    "diffrax",
+    "optimistix",
+    "lineax",
 ]
 
 [project.urls]
@@ -55,12 +62,6 @@ Issues = "https://github.com/FhG-IISB/jno/issues"
 # the JAX wheel for a specific CUDA version, install JAX from its own
 # index (see docs/Installation.md).
 
-fem = [
-    "feax>=0.5.1",
-    "diffrax",
-    "optimistix",
-    "lineax",
-]
 dev = ["pytest>=7.0",
         "black>=22.0",
         "flake8>=4.0",

@@ -64,6 +64,59 @@ def _default_float_dtype():
     return jnp.asarray(0.0).dtype
 
 
+def _collect_temporal_derivative_targets(expr_or_exprs):
+    """Walk the trace graph and return ``(target, id(target))`` pairs for every
+    distinct :class:`TemporalDerivative` target, in **post-order**.
+
+    Post-order ensures that inner targets appear before outer ones so the
+    compiler can populate the temporal-FD cache incrementally — when an outer
+    ``TemporalDerivative`` is pre-computed, its target (an inner
+    ``TemporalDerivative``) already has its own window in the cache.
+
+    The traversal follows the same attribute conventions as
+    :func:`jno.trace._contains_node_type_local`: ``"left"``, ``"right"``,
+    ``"target"``, ``"expr"``, ``"operation"``, ``"model"``, plus the iterable
+    fields ``"args"`` and ``"variables"``.
+    """
+    from .trace import Placeholder, TemporalDerivative  # noqa: PLC0415
+
+    exprs = expr_or_exprs if isinstance(expr_or_exprs, (list, tuple)) else [expr_or_exprs]
+    seen_nodes: set[int] = set()
+    seen_targets: set[int] = set()
+    results: list = []
+
+    def walk(node):
+        if not isinstance(node, Placeholder):
+            return
+        if id(node) in seen_nodes:
+            return
+        seen_nodes.add(id(node))
+        # Visit children first (post-order)
+        for attr in ("left", "right", "target", "expr", "operation", "model"):
+            child = getattr(node, attr, None)
+            if isinstance(child, Placeholder):
+                walk(child)
+        for attr in ("args", "variables"):
+            vals = getattr(node, attr, None) or []
+            for v in vals:
+                if isinstance(v, (list, tuple)):
+                    for vv in v:
+                        if isinstance(vv, Placeholder):
+                            walk(vv)
+                elif isinstance(v, Placeholder):
+                    walk(v)
+        # After children: append this node's target
+        if isinstance(node, TemporalDerivative):
+            tid = id(node.target)
+            if tid not in seen_targets:
+                seen_targets.add(tid)
+                results.append((node.target, tid))
+
+    for e in exprs:
+        walk(e)
+    return results
+
+
 def _find_fd_domain(expr):
     """Walk expression tree to find a domain that uses FD + sub-domains.
 
@@ -1175,6 +1228,51 @@ class TraceCompiler:
                     augmented_passive_ctx = dict(passive_ctx)
                     augmented_passive_ctx["__time_window__"] = t_wind  # (W, 1)
 
+                    # Pre-compute every TemporalDerivative.target on all W steps
+                    # before the per-step vmap.  This avoids the W² cost that
+                    # would arise from each per-step evaluation re-running the
+                    # target W times internally.  Targets are processed in
+                    # post-order (innermost first) so nested TDs see populated
+                    # cache entries during their own pre-compute pass.
+                    temporal_fd_cache: dict = {}
+                    td_targets = _collect_temporal_derivative_targets(expr)
+                    if td_targets:
+                        TraceEvaluator = _get_evaluator_class()
+                        for td_target, tid in td_targets:
+                            captured_cache = dict(temporal_fd_cache)
+                            in_axes_pc = []
+                            for arr in windowed_ctx:
+                                if hasattr(arr, "ndim") and arr.ndim >= 3:
+                                    in_axes_pc.append(0)
+                                else:
+                                    in_axes_pc.append(None)
+                            in_axes_pc.append(0)  # t_wind axis
+                            in_axes_pc.append(0)  # step index axis
+                            step_indices = jnp.arange(t_wind.shape[0], dtype=jnp.int32)
+
+                            def _eval_target_at_step(*args, _target=td_target, _cache=captured_cache):
+                                step_idx = args[-1]
+                                step_t = args[-2]
+                                step_spatial = args[:-2]
+                                ctx_dict = dict(metadata_ctx)
+                                ctx_dict.update(passive_ctx)
+                                ctx_dict["__time_window__"] = t_wind
+                                ctx_dict["__temporal_fd_cache__"] = _cache
+                                ctx_dict["__step_index__"] = step_idx
+                                for tag, step_arr in zip(spatial_tag_order, step_spatial):
+                                    ctx_dict[tag] = step_arr
+                                if time_arr is not None:
+                                    ctx_dict[TIME_TAG] = step_t
+                                return TraceEvaluator(params).evaluate(_target, ctx_dict, {}, rng_key)
+
+                            u_window = jax.vmap(
+                                _eval_target_at_step,
+                                in_axes=tuple(in_axes_pc),
+                            )(*windowed_ctx, t_wind, step_indices)
+                            temporal_fd_cache[tid] = u_window
+
+                        augmented_passive_ctx["__temporal_fd_cache__"] = temporal_fd_cache
+
                     if W > 1:
                         # Vmap over the time-window dimension so each step
                         # sees (N, D) spatial + (1,) time — identical to W=1.
@@ -1185,12 +1283,16 @@ class TraceCompiler:
                             else:
                                 in_axes_list.append(None)
                         in_axes_list.append(0)  # for t_wind
+                        in_axes_list.append(0)  # for step indices
+                        step_indices = jnp.arange(W, dtype=jnp.int32)
 
-                        def _eval_single_step(*step_spatial_and_t):
-                            step_t = step_spatial_and_t[-1]
-                            step_spatial = step_spatial_and_t[:-1]
+                        def _eval_single_step(*step_spatial_and_t_and_idx):
+                            step_idx = step_spatial_and_t_and_idx[-1]
+                            step_t = step_spatial_and_t_and_idx[-2]
+                            step_spatial = step_spatial_and_t_and_idx[:-2]
                             ctx_dict = dict(metadata_ctx)
                             ctx_dict.update(augmented_passive_ctx)
+                            ctx_dict["__step_index__"] = step_idx
                             active_spatial_n = None
                             for tag, step_arr in zip(spatial_tag_order, step_spatial):
                                 ctx_dict[tag] = step_arr
@@ -1205,10 +1307,11 @@ class TraceCompiler:
                         return jax.vmap(
                             _eval_single_step,
                             in_axes=tuple(in_axes_list),
-                        )(*windowed_ctx, t_wind)
+                        )(*windowed_ctx, t_wind, step_indices)
                     else:
                         ctx_dict = dict(metadata_ctx)
                         ctx_dict.update(augmented_passive_ctx)
+                        ctx_dict["__step_index__"] = jnp.zeros((), dtype=jnp.int32)
                         active_spatial_n = None
                         for tag, arr in zip(spatial_tag_order, windowed_ctx):
                             if hasattr(arr, "ndim") and arr.ndim >= 2:
@@ -1450,6 +1553,49 @@ class TraceCompiler:
                     augmented_passive_ctx = dict(passive_ctx)
                     augmented_passive_ctx["__time_window__"] = t_wind  # (W, 1)
 
+                    # Pre-compute every TemporalDerivative.target on all W steps
+                    # before the per-step vmap (post-order so nested TDs see their
+                    # dependencies populated).  See the analogous block in
+                    # compile_traced_expression for the rationale.
+                    temporal_fd_cache: dict = {}
+                    td_targets = _collect_temporal_derivative_targets(exprs)
+                    if td_targets:
+                        TraceEvaluator = _get_evaluator_class()
+                        for td_target, tid in td_targets:
+                            captured_cache = dict(temporal_fd_cache)
+                            in_axes_pc = []
+                            for arr in windowed_ctx:
+                                if hasattr(arr, "ndim") and arr.ndim >= 3:
+                                    in_axes_pc.append(0)
+                                else:
+                                    in_axes_pc.append(None)
+                            in_axes_pc.append(0)  # t_wind axis
+                            in_axes_pc.append(0)  # step index axis
+                            step_indices = jnp.arange(t_wind.shape[0], dtype=jnp.int32)
+
+                            def _eval_target_at_step(*args, _target=td_target, _cache=captured_cache):
+                                step_idx = args[-1]
+                                step_t = args[-2]
+                                step_spatial = args[:-2]
+                                ctx_dict = dict(metadata_ctx)
+                                ctx_dict.update(passive_ctx)
+                                ctx_dict["__time_window__"] = t_wind
+                                ctx_dict["__temporal_fd_cache__"] = _cache
+                                ctx_dict["__step_index__"] = step_idx
+                                for tag, step_arr in zip(spatial_tag_order, step_spatial):
+                                    ctx_dict[tag] = step_arr
+                                if time_arr is not None:
+                                    ctx_dict[TIME_TAG] = step_t
+                                return TraceEvaluator(params).evaluate(_target, ctx_dict, {}, rng_key)
+
+                            u_window = jax.vmap(
+                                _eval_target_at_step,
+                                in_axes=tuple(in_axes_pc),
+                            )(*windowed_ctx, t_wind, step_indices)
+                            temporal_fd_cache[tid] = u_window
+
+                        augmented_passive_ctx["__temporal_fd_cache__"] = temporal_fd_cache
+
                     if W > 1:
                         # Vmap over the W (time-window) dimension so each
                         # step sees (N, D) spatial + (1,) time — identical
@@ -1463,12 +1609,16 @@ class TraceCompiler:
                             else:
                                 in_axes_list.append(None)
                         in_axes_list.append(0)  # for t_wind
+                        in_axes_list.append(0)  # for step indices
+                        step_indices = jnp.arange(W, dtype=jnp.int32)
 
-                        def _eval_single_step(*step_spatial_and_t):
-                            step_t = step_spatial_and_t[-1]
-                            step_spatial = step_spatial_and_t[:-1]
+                        def _eval_single_step(*step_spatial_and_t_and_idx):
+                            step_idx = step_spatial_and_t_and_idx[-1]
+                            step_t = step_spatial_and_t_and_idx[-2]
+                            step_spatial = step_spatial_and_t_and_idx[:-2]
                             ctx_dict = dict(metadata_ctx)
                             ctx_dict.update(augmented_passive_ctx)
+                            ctx_dict["__step_index__"] = step_idx
                             active_spatial_n = None
                             for tag, step_arr in zip(spatial_tag_order, step_spatial):
                                 ctx_dict[tag] = step_arr
@@ -1483,11 +1633,12 @@ class TraceCompiler:
                         return jax.vmap(
                             _eval_single_step,
                             in_axes=tuple(in_axes_list),
-                        )(*windowed_ctx, t_wind)
+                        )(*windowed_ctx, t_wind, step_indices)
                     else:
                         # W == 1: squeeze the window dimension
                         ctx_dict = dict(metadata_ctx)
                         ctx_dict.update(augmented_passive_ctx)
+                        ctx_dict["__step_index__"] = jnp.zeros((), dtype=jnp.int32)
                         active_spatial_n = None
                         for tag, arr in zip(spatial_tag_order, windowed_ctx):
                             if hasattr(arr, "ndim") and arr.ndim >= 2:

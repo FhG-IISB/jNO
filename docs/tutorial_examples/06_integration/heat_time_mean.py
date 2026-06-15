@@ -1,34 +1,4 @@
-"""06 — Temporal integral: time-mean heat dose (1-D heat equation)
-
-Problem
--------
-    ∂u/∂t = α ∂²u/∂x²,   x ∈ [0, 1],  t ∈ [0, T]
-    u(0, t) = u(1, t) = 0          (homogeneous Dirichlet, hard-enforced)
-    u(x, 0) = sin(πx)              (initial condition, hard-enforced)
-
-Analytical solution
--------------------
-    u(x, t) = exp(−α π² t) sin(πx)
-
-Time-mean temperature ("heat dose")
--------------------------------------
-    ū(x) ≡ ∫₀ᵀ u(x, t) dt = sin(πx) · (1 − exp(−α π² T)) / (α π²)
-
-API demonstrated
-----------------
-    u.integrate(t)   — trapezoidal integral over the temporal axis for a
-                        function u(x, t), returning the spatial field ū(x).
-
-Two training losses
--------------------
-    1. PDE residual:     ‖∂u/∂t − α ∂²u/∂x²‖²  (pointwise)
-    2. Heat-dose loss:   ‖∫₀ᵀ u dt − ū_exact‖²  (global integral constraint)
-
-The heat-dose loss uses `.integrate(t)`, which reduces the temporal axis via
-a trapezoidal sum, producing a spatial field of the same shape as u(x, ·).
-This is the temporal analogue of the spatial `.integrate()` shown in
-`flux_conservation_2d.py`.
-"""
+"""06 — Temporal integral: time-mean heat dose (1-D heat equation)"""
 
 from pathlib import Path
 
@@ -88,7 +58,7 @@ heat_dose_residual = u_mean - u_mean_exact
 # min_consecutive=None uses all N_t time steps each iteration, giving the full
 # temporal integral.  This is required for .integrate(t) (min_consecutive ≥ 2).
 EPOCHS = 10_000
-crux = jno.core([pde.mse, heat_dose_residual.mse], domain).print_shapes()
+crux = jno.core([pde.mse, heat_dose_residual.mse]).print_shapes()
 history = crux.solve(EPOCHS, min_consecutive=None)
 
 # ── Evaluate ──────────────────────────────────────────────────────────────────

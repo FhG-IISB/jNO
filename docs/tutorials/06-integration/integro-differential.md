@@ -1,8 +1,8 @@
 # Integro-Differential Equation
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/06_integration/integro_differential.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/06-integration/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/06_integration/integro_differential.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/06-integration/">Back to chapter</a>
 </div>
 
 This example solves an **integro-differential equation (IDE)** — an equation where the unknown appears under both a derivative and an integral at the same time.  It shows how `.d(x)` and `.integrate()` compose naturally in the same residual.
@@ -93,7 +93,7 @@ du = u.d(x)          # pointwise: (N, 1)
 
 ```python
 residual = du + u - g - C
-crux = jno.core([residual.mse], domain)
+crux = jno.core([residual.mse])
 crux.solve(30_000)
 ```
 
@@ -120,6 +120,6 @@ crux.solve(30_000)
 ```
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/06_integration/integro_differential.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/06-integration/">Back to 06 Integration</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/06_integration/integro_differential.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/06-integration/">Back to 06 Integration</a>
 </div>

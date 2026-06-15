@@ -64,13 +64,6 @@ extra_javascript:
 
 not_in_nav: |
   /Docker.md
-  /Model-Controls.md
-  /Training.md
-  /Integration-Operators.md
-  /Adaptive-Resampling.md
-  /training/schedules.md
-  /foundation_models/Core-Architectures.md
-  /foundation_models/Foundation-Models.md
 
 nav:
   - Home: index.md
@@ -140,6 +133,13 @@ nav:
       - Inverse Parameter: tutorials/05-coupled-and-inverse/inverse-parameter.md
       - Surrogate Inversion: tutorials/05-coupled-and-inverse/surrogate-inversion.md
       - HyCo Poisson 1D: tutorials/05-coupled-and-inverse/hyco-poisson-1d.md
+    - 06 Integration:
+      - Flux Conservation 2D: tutorials/06-integration/flux-conservation-2d.md
+      - Fredholm Integral Equation: tutorials/06-integration/fredholm-integral-equation.md
+      - Fredholm Non-Separable Kernel: tutorials/06-integration/fredholm-nonseparable.md
+      - Integro-Differential Equation: tutorials/06-integration/integro-differential.md
+    - 07 Analysis:
+      - Gradient Conflict: tutorials/07-analysis/gradient-conflict.md
     - 07 Stochastic:
       - Fokker-Planck 2D: tutorials/07-stochastic/fokker-planck-2d.md
       - Stochastic Forcing 2D: tutorials/07-stochastic/stochastic-forcing-2d.md
@@ -149,6 +149,8 @@ nav:
       - Diffusion-Reaction Robin BC: tutorials/08-fem-and-varpinns/diffusion-reaction-robin-bc.md
       - Helmholtz Mixed BC FEM VarPINN: tutorials/08-fem-and-varpinns/helmholtz-mixed-bc-fem-varpinn.md
       - Helmholtz 3D: tutorials/08-fem-and-varpinns/helmholtz-3d.md
+    - 09 Weights & Biases:
+      - W&B Integration: tutorials/09-wandb/wandb-integration.md
     - 10 Bayesian PINNs:
       - Overview: tutorials/10-bayesian-pinns/index.md
       - Forward Noisy Poisson 1D: tutorials/10-bayesian-pinns/forward-noisy-poisson-1d.md
@@ -170,3 +172,5 @@ nav:
       - DeepONet — parametric Poisson 2D: tutorials/11-operator-learning/deeponet-poisson-2d.md
       - FNO2D — supervised Poisson 2D: tutorials/11-operator-learning/fno-poisson-2d.md
       - U-Net 2D — supervised Poisson 2D: tutorials/11-operator-learning/unet-poisson-2d.md
+      - FieldView — physics-informed FNO: tutorials/11-operator-learning/field-view-physics.md
+      - FieldView — wave-equation PINN audit: tutorials/11-operator-learning/field-view-wave-equation.md

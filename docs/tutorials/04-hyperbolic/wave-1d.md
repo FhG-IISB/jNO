@@ -1,8 +1,8 @@
 # Wave 1D
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/04_hyperbolic/wave_1d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/04-hyperbolic/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/04_hyperbolic/wave_1d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/04-hyperbolic/">Back to chapter</a>
 </div>
 
 Second-order-in-time wave equation — needs **both** an initial displacement and an initial velocity. Demonstrated with **soft enforcement** of all four conditions (displacement IC, velocity IC, and two Dirichlet BCs).
@@ -58,7 +58,7 @@ ic_vel = u0.d(t0)
 # Spatial boundary:        u(0, t) = u(1, t) = 0
 bc = net(tb, xb)
 
-crux = jno.core([pde.mse, ic_disp.mse, ic_vel.mse, bc.mse], domain)
+crux = jno.core([pde.mse, ic_disp.mse, ic_vel.mse, bc.mse])
 history = crux.solve(50000)
 ```
 
@@ -69,8 +69,8 @@ history = crux.solve(50000)
 - Four competing losses takes longer to converge than the parabolic case. The warmup-cosine schedule above gives the optimiser time to find a balanced minimum before the LR decays.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/04_hyperbolic/wave_1d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/04-hyperbolic/">Back to 04 Hyperbolic</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/04_hyperbolic/wave_1d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/04-hyperbolic/">Back to 04 Hyperbolic</a>
 </div>
 
 ## Script Snippet

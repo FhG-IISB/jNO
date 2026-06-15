@@ -1,29 +1,9 @@
-"""
-02 - Stationary Allen-Cahn equation with nonlinear FEAX-FEM residual route
-
-Problem
--------
-    -eps^2 Δu + (u^3 - u) = 0      in Ω = [0, 1]^2
-
-Boundary conditions
--------------------
-    u = tanh((x - 0.5) / (sqrt(2) eps))  on x = 0 and x = 1
-
-Manufactured profile
---------------------
-    u(x, y) = tanh((x - 0.5) / (sqrt(2) eps))
-
-Showcases
----------
-- weak.assemble(target="fem_residual")
-- FemResidualOperator
-- residual_fn(u), jacobian_fn(u)
-- external nonlinear solve using scipy.optimize.root
-"""
+"""02 - Stationary Allen-Cahn equation with nonlinear FEAX-FEM residual route"""
 
 import jax.numpy as jnp
 import numpy as np
 import scipy.optimize as spo
+from shapely.geometry import box
 
 import jno
 
@@ -56,7 +36,7 @@ def to_dense(A):
 # Domain and weak form
 # ---------------------------------------------------------------------
 
-domain = jno.domain.rect(mesh_size=0.12)
+domain = jno.domain(box(0, 0, 1, 1), mesh_size=0.12)
 
 domain.init_fem(
     element_type="TRI3",
@@ -82,7 +62,7 @@ weak = eps**2 * (ux * phix + uy * phiy) + (u**3 - u) * phi
 
 op = weak.assemble(domain, target="fem_residual")
 
-coords = np.asarray(domain.mesh.points)[:, :2]
+coords = np.asarray(domain.built_mesh.points)[:, :2]
 x_nodes = jnp.asarray(coords[:, 0:1])
 y_nodes = jnp.asarray(coords[:, 1:2])
 

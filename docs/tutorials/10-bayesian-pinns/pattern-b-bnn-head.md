@@ -1,8 +1,8 @@
 # Pattern B — Bayesian Last Layer (head sampled, body Adam-trained)
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/10_bayesian_pinns/14_pattern_b_bnn_head.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/10-bayesian-pinns/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/10_bayesian_pinns/14_pattern_b_bnn_head.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/10-bayesian-pinns/">Back to chapter</a>
 </div>
 
 **The practical Bayesian Last Layer recipe.**  A feature-extractor MLP

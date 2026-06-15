@@ -1,37 +1,18 @@
-"""
-3D F-domain showcase: FEAX-FEM + VPINN
+"""3D F-domain showcase: FEAX-FEM + VPINN"""
 
-Problem
--------
-    -Δu + sigma u = f       in Ω
+import os
 
-Boundary conditions
--------------------
-    u = 0                   on bottom face z = 0
-    du/dn = g_top           on top face z = 1
-    du/dn = 0               on side walls
+# FEM surface_data arrays are currently CPU-pinned; running on CPU
+# avoids a known device-mismatch when training on GPU.
+os.environ["JAX_PLATFORMS"] = "cpu"
 
-Manufactured solution
----------------------
-    u(x, y, z) = z + alpha sin(pi z)
+import foundax  # noqa: E402
+import jax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
+import numpy as np  # noqa: E402
+import optax  # noqa: E402
 
-Showcases
----------
-- complex 3D extruded F-shaped geometry
-- TET4 FEAX-FEM assembly
-- mixed Dirichlet + Neumann boundary conditions
-- weak.assemble(target="fem_system")
-- weak.assemble(target="vpinn")
-- VPINN on 3D geometry
-"""
-
-import foundax
-import jax
-import jax.numpy as jnp
-import numpy as np
-import optax
-
-import jno
+import jno  # noqa: E402
 
 jax.config.update("jax_enable_x64", False)
 
@@ -254,7 +235,7 @@ u_fem = jnp.linalg.solve(A_dense, b).reshape(-1)
 
 residual_rel = jnp.linalg.norm(A_dense @ u_fem - b) / (jnp.linalg.norm(b) + 1.0e-14)
 
-coords = np.asarray(fem_domain.mesh.points[:, :3])
+coords = np.asarray(fem_domain.built_mesh.points[:, :3])
 
 x_nodes = jnp.asarray(coords[:, 0:1])
 y_nodes = jnp.asarray(coords[:, 1:2])
@@ -269,7 +250,7 @@ rms_abs_fem = jnp.sqrt(jnp.mean((u_fem - u_exact_nodes) ** 2))
 print("\nFEAX-FEM results")
 print("-" * 72)
 print(f"Number of mesh nodes       : {coords.shape[0]}")
-print(f"Number of tetrahedra       : {fem_domain.mesh.cells_dict['tetra'].shape[0]}")
+print(f"Number of tetrahedra       : {fem_domain.built_mesh.cells_dict['tetra'].shape[0]}")
 print(f"System matrix shape        : {A_dense.shape}")
 print(f"Linear residual ||Au-b||   : {float(residual_rel):.6e}")
 print(f"Relative L2 error          : {float(rel_l2_fem):.6e}")
@@ -316,7 +297,7 @@ u_int = apply_hard_bottom_bc(net(x_int, y_int, z_int), x_int, y_int, z_int)
 
 pde = weak_vpinn.assemble(vpinn_domain, u_net=u_gauss, target="vpinn")
 
-crux = jno.core(constraints=[pde.mse], domain=vpinn_domain)
+crux = jno.core(constraints=[pde.mse])
 
 net.optimizer(
     optax.adam(

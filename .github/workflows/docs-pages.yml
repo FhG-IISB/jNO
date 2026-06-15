@@ -48,10 +48,12 @@ jobs:
           pip install -e .
 
       - name: Build docs site
-        # `--strict` would be ideal but is blocked by a pre-existing broken
-        # cross-link in training/index.md. Drop the comment + add strict
-        # after that link is fixed.
-        run: mkdocs build
+        # Strict: any mkdocs/griffe warning fails the build, catching doc
+        # regressions (broken cross-links, undocumented params) early.
+        # NOTE: absolute links such as the tutorial download buttons are NOT
+        # validated by mkdocs even in strict mode — keep those base-correct
+        # (/jNO/, matching site_url) manually.
+        run: mkdocs build --strict
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3

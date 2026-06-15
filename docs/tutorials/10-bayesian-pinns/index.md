@@ -72,7 +72,7 @@ Two patterns avoid the moving-target problem:
 * **Two-stage via `substeps=`.**  When the surrogate is genuinely
   needed (the PDE has no tractable closed form), use jNO's
   `substeps=[([surrogate-constraints], n_train), ([pde-constraint], 1)]`
-  with `.stop_gradient()` on the surrogate in the PDE-residual term.
+  with `.stop_gradient` on the surrogate in the PDE-residual term.
   Substep 0 trains the surrogate (`n_train` steps); substep 1 runs one
   NUTS proposal with the surrogate frozen.  The 20:1 ratio (or higher)
   approximates an idealised two-stage where the surrogate fully

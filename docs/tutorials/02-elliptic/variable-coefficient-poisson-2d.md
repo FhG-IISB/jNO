@@ -1,11 +1,11 @@
 # Variable-Coefficient Poisson 2D
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/02_elliptic/variable_coefficient_poisson_2d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/02-elliptic/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/02_elliptic/variable_coefficient_poisson_2d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/02-elliptic/">Back to chapter</a>
 </div>
 
-This example keeps the same square geometry but replaces constant diffusion with a spatially varying conductivity field.
+Same square geometry as the constant-coefficient example, but with a spatially varying conductivity field.
 
 ## Problem Setup
 
@@ -16,62 +16,42 @@ u = 0 on the boundary
 
 with `kappa(x,y) = 1 + x + y` and exact solution `sin(pi x) sin(pi y)`.
 
-## Step 1: Define the Coefficient Field
+## Step 1 — Domain and coefficient field
 
-The script constructs `kappa` directly from the sampled coordinates, so the PDE coefficients vary pointwise across the domain.
-
-```python
-domain = jno.domain.rect(mesh_size=0.05)
-x, y, _ = domain.variable("interior")
-
-kappa    = 1 + x + y
-u_exact  = jno.np.sin(pi * x) * jno.np.sin(pi * y)
-forcing  = (
-    2 * pi**2 * kappa * u_exact
-    - pi * jno.np.cos(pi * x) * jno.np.sin(pi * y)
-    - pi * jno.np.sin(pi * x) * jno.np.cos(pi * y)
-)
-```
-
-## Step 2: Build the Flux Instead of Just the Laplacian
-
-Rather than writing `Delta u`, the script forms flux components and then computes their divergence.
+`kappa` is built directly from the sampled coordinates, so the PDE coefficients vary pointwise across the domain.
 
 ```python
-net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=80, num_layers=5, key=jax.random.PRNGKey(13)))
-net.optimizer(optax.adam(optax.exponential_decay(1e-3, 80, 0.5, end_value=1e-5)))
-
-u      = net(x, y) * x * (1 - x) * y * (1 - y)
-flux_x = kappa * u.d(x)
-flux_y = kappa * u.d(y)
+--8<-- "tutorial_examples/02_elliptic/variable_coefficient_poisson_2d.py:setup"
 ```
 
-## Step 3: Enforce Boundary Conditions Hard
+## Step 2 — Build the flux, then take its divergence
 
-The `x(1-x)y(1-y)` factor wraps the raw network output so the boundary condition is built into the ansatz (handled above in Step 2).
-
-## Step 4: Train Against a Spatially Heterogeneous PDE
-
-Once coefficients vary in space, the forcing term becomes more complex, but the overall jNO workflow remains: residual → core → solve.
+Rather than writing `Delta u`, the script forms the flux vector `kappa · grad u` directly and takes its divergence. The `x(1 - x) y(1 - y)` factor on `net(x, y)` enforces the homogeneous Dirichlet BC hard.
 
 ```python
-pde     = -jno.np.divergence([flux_x, flux_y], [x, y]) - forcing
-crux    = jno.core([pde.mse], domain)
-history = crux.solve(40_000)
+--8<-- "tutorial_examples/02_elliptic/variable_coefficient_poisson_2d.py:residual"
 ```
 
-## What To Notice
+## Step 3 — Train
 
+The residual → core → solve workflow is unchanged from the constant-coefficient case; only the forcing term and the spatially varying `kappa` differ.
+
+```python
+--8<-- "tutorial_examples/02_elliptic/variable_coefficient_poisson_2d.py:solve"
+```
+
+## What to notice
+
+- `u.grad(x, y)` returns a `VectorView`; multiplying by the scalar `kappa` preserves the view type (`Placeholder × VectorView → VectorView`), so the chain `kappa * u.grad(x, y) → .div(x, y)` reads exactly like the math `∇·(κ∇u)`.
+- Hard BC enforcement via the multiplicative ansatz keeps the loss focused on the PDE residual alone — no boundary-loss weighting to tune.
 - Variable coefficients are a common bridge from toy PDEs to physically meaningful media.
-- Forming fluxes explicitly keeps the PDE readable.
-- The example shows how spatial heterogeneity enters both forcing and residual construction.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/02_elliptic/variable_coefficient_poisson_2d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/02-elliptic/">Back to 02 Elliptic</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/02_elliptic/variable_coefficient_poisson_2d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/02-elliptic/">Back to 02 Elliptic</a>
 </div>
 
-## Script Snippet
+## Full script
 
 ```python
 --8<-- "tutorial_examples/02_elliptic/variable_coefficient_poisson_2d.py"

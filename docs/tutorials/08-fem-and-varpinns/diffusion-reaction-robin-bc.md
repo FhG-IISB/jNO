@@ -1,8 +1,8 @@
 # Diffusion-Reaction Robin BC
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/08_fem_and_varpinns/diffusion_reaction_robinBC.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/08-fem-and-varpinns/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/08_fem_and_varpinns/diffusion_reaction_robinBC.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/08-fem-and-varpinns/">Back to chapter</a>
 </div>
 
 This example compares a variational PINN against a classical FEM reference under mixed Dirichlet and Robin boundary conditions.
@@ -59,7 +59,7 @@ xg2, yg2, _ = train_domain.variable("fem_gauss", split=True)
 u_gauss = apply_hard_bc(net(xg2, yg2), xg2, yg2)
 
 pde  = weak.assemble(train_domain, u_net=u_gauss, target="vpinn")
-crux = jno.core(constraints=[pde.mse], domain=train_domain)
+crux = jno.core(constraints=[pde.mse])
 net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=1e-3, warmup_steps=2, decay_steps=100, end_value=1e-5)))
 crux.solve(epochs=1000)
 ```
@@ -84,8 +84,8 @@ print(f"FEM  relative L2: {float(rel_l2_fem):.6e}")
 - Boundary quadrature tags are one of the key implementation ideas.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/08_fem_and_varpinns/diffusion_reaction_robinBC.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/08-fem-and-varpinns/">Back to 08 FEM and Variational PINNs</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/08_fem_and_varpinns/diffusion_reaction_robinBC.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/08-fem-and-varpinns/">Back to 08 FEM and Variational PINNs</a>
 </div>
 
 ## Script Snippet

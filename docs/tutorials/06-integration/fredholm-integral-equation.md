@@ -1,8 +1,8 @@
 # Fredholm Integral Equation of the Second Kind
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/06_integration/fredholm_integral_equation.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/06-integration/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/06_integration/fredholm_integral_equation.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/06-integration/">Back to chapter</a>
 </div>
 
 This example solves a **Fredholm integral equation of the second kind** — an equation where the unknown function appears both outside and inside an integral.  The exact solution is known, so the trained network's accuracy can be measured directly.
@@ -81,7 +81,7 @@ Both uses of the network — as the integrand inside `C` and as the outer `u` �
 
 ```python
 EPOCHS = 50_000
-crux = jno.core([residual.mse], domain)
+crux = jno.core([residual.mse])
 crux.solve(EPOCHS)
 ```
 
@@ -99,6 +99,6 @@ crux.solve(EPOCHS)
 ```
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/06_integration/fredholm_integral_equation.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/06-integration/">Back to 06 Integration</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/06_integration/fredholm_integral_equation.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/06-integration/">Back to 06 Integration</a>
 </div>

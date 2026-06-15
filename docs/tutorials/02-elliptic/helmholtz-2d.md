@@ -1,8 +1,8 @@
 # Helmholtz 2D
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/02_elliptic/helmholtz_2d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/02-elliptic/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/02_elliptic/helmholtz_2d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/02-elliptic/">Back to chapter</a>
 </div>
 
 This example adds an oscillatory Helmholtz term to the elliptic residual, which makes the solution behavior more wave-like than Poisson-like.
@@ -55,7 +55,7 @@ pde = u.laplacian(x, y, scheme="automatic_differentiation") + k**2 * u + forcing
 After solving, the script computes a relative L2 error and plots exact, predicted, and absolute-error fields.
 
 ```python
-crux    = jno.core([pde.mse], domain)
+crux    = jno.core([pde.mse])
 history = crux.solve(40_000)
 
 _u, _u_exact = crux.eval([u, u_exact])
@@ -69,8 +69,8 @@ rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_
 - This example is a good first step toward frequency-domain PDEs.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/02_elliptic/helmholtz_2d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/02-elliptic/">Back to 02 Elliptic</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/02_elliptic/helmholtz_2d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/02-elliptic/">Back to 02 Elliptic</a>
 </div>
 
 ## Script Snippet

@@ -33,7 +33,7 @@ def _make_solver(epochs=10):
     u = u_net(x) * x * (1 - x)
     pde = jnn.laplacian(u, [x]) - jnn.sin(jnn.pi * x)
 
-    solver = jno.core([pde.mse], domain)
+    solver = jno.core([pde.mse])
     if epochs > 0:
         solver.solve(epochs)
     return solver

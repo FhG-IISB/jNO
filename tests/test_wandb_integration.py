@@ -263,7 +263,7 @@ class TestExplainabilityCallbacksWandBLogging:
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x]) - jnn.sin(jnn.pi * x)
         # Two identical constraints exercise the N=2 code paths in all callbacks.
-        solver = jno.core([pde.mse, pde.mse], domain)
+        solver = jno.core([pde.mse, pde.mse])
 
         # ── callbacks (tiny grid / interval so the test stays fast) ─────────
         cb_norms = GradientNormsCallback(interval=1)

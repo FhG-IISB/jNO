@@ -117,7 +117,7 @@ net.optimizer(optax.adam(1e-3))
 u = net(x, y) * x * (1 - x) * y * (1 - y)
 pde = jno.np.laplacian(u, [x, y]) + 1.0
 
-crux = jno.core([pde.mse], domain)
+crux = jno.core([pde.mse])
 crux.solve(5000)
 
 # --- deploy ---

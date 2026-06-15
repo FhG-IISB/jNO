@@ -1,8 +1,8 @@
 # Poisson 2D FEM
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/08_fem_and_varpinns/poisson_2d_fem.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/08-fem-and-varpinns/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/08_fem_and_varpinns/poisson_2d_fem.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/08-fem-and-varpinns/">Back to chapter</a>
 </div>
 
 This example is a pure finite-element solve with no neural network component.
@@ -69,8 +69,8 @@ print(f"Relative L2 error: {float(rel_l2):.6e}")
 - Pure FEM examples help validate the underlying PDE setup.
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/08_fem_and_varpinns/poisson_2d_fem.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/08-fem-and-varpinns/">Back to 08 FEM and Variational PINNs</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/08_fem_and_varpinns/poisson_2d_fem.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/08-fem-and-varpinns/">Back to 08 FEM and Variational PINNs</a>
 </div>
 
 ## Script Snippet

@@ -1,8 +1,8 @@
 # Mean-field Variational Inference on a BNN regressor
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/10_bayesian_pinns/09_vi_bnn_regression.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/10-bayesian-pinns/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/10_bayesian_pinns/09_vi_bnn_regression.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/10-bayesian-pinns/">Back to chapter</a>
 </div>
 
 **Same gapped regression problem as [Tutorial 07](./bnn-regression.md),

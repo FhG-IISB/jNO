@@ -1,8 +1,8 @@
 # Fokker-Planck 2D (Ornstein-Uhlenbeck)
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/07_stochastic/fokker_planck_2d.py" download>Download .py</a>
-<a class="md-button" href="/jNO_docs/tutorials/07-stochastic/">Back to chapter</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/07_stochastic/fokker_planck_2d.py" download>Download .py</a>
+<a class="md-button" href="/jNO/tutorials/07-stochastic/">Back to chapter</a>
 </div>
 
 This example solves the **stationary Fokker-Planck equation** for a 2-D Ornstein-Uhlenbeck process — a PDE that describes how a probability density evolves under drift and diffusion.  It introduces `jno.noise` to add stochastic measurement uncertainty to the boundary observations, so the network sees freshly-sampled noisy data every training step.
@@ -52,69 +52,42 @@ This example solves the **stationary Fokker-Planck equation** for a 2-D Ornstein
 
 ## Code Walkthrough
 
-### Step 1 — Domain centred at the origin
+### Step 1 — Domain centred at the origin and analytical boundary
+
+The domain is centred at $(0, 0)$ so the Gaussian peak sits at the domain centre. The analytical boundary value $p_\text{exact}$ is reused later as the (near-zero) target for the noisy boundary observations.
 
 ```python
-domain = jno.domain.rect(x_range=(-3.0, 3.0), y_range=(-3.0, 3.0), mesh_size=0.15)
-x,  y,  _ = domain.variable("interior")
-xb, yb, _ = domain.variable("boundary")
+--8<-- "tutorial_examples/07_stochastic/fokker_planck_2d.py:setup"
 ```
 
-The domain is centred at $(0, 0)$ so the Gaussian peak sits at the domain centre.  `mesh_size=0.15` gives roughly 1 900 interior points and 160 boundary points.
+### Step 2 — Fokker-Planck residual
 
-### Step 2 — Network
+`jno.np.vector(...)` builds a typed `VectorView` from scalar components without manual `concat`, and `.div(x, y)` reads exactly like the math $\nabla \cdot (\mathbf{b} p)$. The Laplacian $\Delta p$ is computed by `jno.np.laplacian`.
 
 ```python
-net = jno.nn.wrap(
-    foundax.mlp(in_features=2, hidden_dims=64, num_layers=5,
-                activation=jax.nn.tanh, key=jax.random.PRNGKey(0))
-)
-net.optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.5, end_value=1e-5)))
-
-p = net(x, y)
+--8<-- "tutorial_examples/07_stochastic/fokker_planck_2d.py:residual"
 ```
 
-A tanh MLP is a natural fit because the target $e^{-(x^2+y^2)}$ is smooth and bell-shaped.
+### Step 3 — Normalization and noisy boundary
 
-### Step 3 — Fokker-Planck residual
+`.integrate()` reduces $p(x, y)$ to the scalar $\iint_\Omega p \, dx \, dy$ using mesh-based quadrature weights. Subtracting 1 creates a loss that drives total probability mass to 1.
+
+`jno.noise.gaussian(std=1e-4)` is a **lazy Placeholder** — each training step the solver splits its PRNG key and samples a fresh $(N_b, 1)$ array, simulating noisy physical measurements at the boundary.
 
 ```python
-drift = (x * p).d(x) + (y * p).d(y)
-diff  = 0.5 * jno.np.laplacian(p, [x, y])
-fp    = drift + diff
+--8<-- "tutorial_examples/07_stochastic/fokker_planck_2d.py:constraints"
 ```
-
-`(x * p).d(x)` computes $\partial(x\,p)/\partial x$ via automatic differentiation.  The Laplacian $\Delta p$ is computed by `jno.np.laplacian`.
-
-### Step 4 — Normalization constraint
-
-```python
-norm = p.integrate() - 1.0
-```
-
-`.integrate()` reduces the field $p(x, y)$ to the scalar $\iint_\Omega p \, dx \, dy$ using mesh-based quadrature weights precomputed at domain creation.  Subtracting 1 creates a loss that drives the total probability mass to 1 — an essential physical constraint for any density.
-
-### Step 5 — Noisy boundary condition
-
-```python
-p_bc = net(xb, yb) - (p_exact_bc + jno.noise.gaussian(std=1e-4))
-```
-
-`jno.noise.gaussian(std=1e-4)` is a **lazy Placeholder** — no random numbers are generated at graph-build time.  Each training step the solver splits its PRNG key, calls `jax.random.fold_in` with the node's unique ID, and samples a fresh $(N_b, 1)$ array.
-
-This simulates the scenario where boundary observations come from noisy physical measurements (e.g., estimated from Monte Carlo paths of the SDE that happen to cross the domain boundary).
 
 !!! note "Reproducibility"
     The noise sequence is fully determined by the global seed.  Set it with `jno.setup(seed=42)` or in `.jno.toml` to reproduce the exact same training run.
 
-### Step 6 — Solve
+### Step 4 — Solve
+
+Three losses compete: PDE residual, normalization, and noisy boundary data. The solver balances them using its built-in loss weighting.
 
 ```python
-crux = jno.core([fp.mse, norm.mse, p_bc.mse], domain)
-history = crux.solve(50_000)
+--8<-- "tutorial_examples/07_stochastic/fokker_planck_2d.py:solve"
 ```
-
-Three losses compete: PDE residual, normalization, and noisy boundary data.  The solver balances them using its built-in loss weighting.
 
 ---
 
@@ -134,6 +107,6 @@ Three losses compete: PDE residual, normalization, and noisy boundary data.  The
 ```
 
 <div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO_docs/tutorial_examples/07_stochastic/fokker_planck_2d.py" download>Download full script</a>
-<a class="md-button" href="/jNO_docs/tutorials/07-stochastic/">Back to 07 Stochastic</a>
+<a class="md-button md-button--primary" href="/jNO/tutorial_examples/07_stochastic/fokker_planck_2d.py" download>Download full script</a>
+<a class="md-button" href="/jNO/tutorials/07-stochastic/">Back to 07 Stochastic</a>
 </div>

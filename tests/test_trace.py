@@ -693,11 +693,16 @@ class TestNetworkGradient:
         assert J.target is u
         assert J.model_node is net
 
-    def test_grad_type_error_for_variable(self):
+    def test_grad_with_variable_returns_vectorview(self):
+        """Phase 2: ``grad(x)`` with a Variable is the spatial-gradient form
+        (returns a ``VectorView``), distinct from the parameter-gradient form
+        ``grad(model)`` which returns a ``NetworkGradient``."""
+        from jno.trace import VectorView
+
         net, x = _make_net_and_var()
         u = net(x)
-        with pytest.raises(TypeError, match="grad\\(\\) expects a Model"):
-            u.grad(x)
+        result = u.grad(x)
+        assert isinstance(result, VectorView)
 
     def test_repr_contains_class_name(self):
         net, x = _make_net_and_var()
@@ -726,10 +731,10 @@ class TestNetworkGradient:
         assert expr.op == "*"
 
     def test_stop_gradient_on_network_gradient(self):
-        """u.grad(net).stop_gradient() should wrap in a FunctionCall."""
+        """u.grad(net).stop_gradient should wrap in a FunctionCall."""
         net, x = _make_net_and_var()
         J = net(x).grad(net)
-        J_sg = J.stop_gradient()
+        J_sg = J.stop_gradient
         assert isinstance(J_sg, FunctionCall)
         assert J_sg._name == "stop_gradient"
         assert J_sg.args[0] is J
@@ -768,27 +773,27 @@ class TestNetworkGradient:
 class TestStopGradient:
     def test_returns_function_call(self):
         x = make_var("x")
-        result = x.stop_gradient()
+        result = x.stop_gradient
         assert isinstance(result, FunctionCall)
 
     def test_name_is_stop_gradient(self):
         x = make_var("x")
-        assert x.stop_gradient()._name == "stop_gradient"
+        assert x.stop_gradient._name == "stop_gradient"
 
     def test_wraps_self(self):
         x = make_var("x")
-        result = x.stop_gradient()
+        result = x.stop_gradient
         assert result.args[0] is x
 
     def test_chainable_with_arithmetic(self):
         """Result is a Placeholder so further symbolic ops work."""
         x = make_var("x")
-        expr = x.stop_gradient() * 2.0
+        expr = x.stop_gradient * 2.0
         assert isinstance(expr, BinaryOp)
 
     def test_double_stop_gradient(self):
         """Stacking stop_gradient() twice is valid."""
         x = make_var("x")
-        result = x.stop_gradient().stop_gradient()
+        result = x.stop_gradient.stop_gradient
         assert isinstance(result, FunctionCall)
         assert result._name == "stop_gradient"

@@ -20,8 +20,29 @@ from .trace import (
     Tracker,
     TrialFunction,
     Variable,
+    _guard_ad_on_fd,
 )
 from .tuner import Arch, ArchSpace, tune  # noqa: F401
+
+
+def _u(x):
+    """Strip a typed-view wrapper, if any, to get the underlying Placeholder.
+
+    All top-level ``jno.np.*`` wrappers call this on Placeholder arguments so
+    users can pass ``u.scalar`` / ``u.vector`` / etc. directly without ``.expr``.
+    """
+    from .trace.views import _VIEW_TYPES
+
+    return x._expr if isinstance(x, _VIEW_TYPES) else x
+
+
+def _guard(target, scheme: str = "automatic_differentiation") -> None:
+    """Functional-API mirror of ``Placeholder``'s method-level guard: block an
+    automatic-differentiation differential operator over a FieldView
+    finite-difference partial (which would silently return 0).
+    """
+    _guard_ad_on_fd(_u(target), scheme)
+
 
 # ============================================================================
 # Constants
@@ -48,7 +69,7 @@ def tracker(op: Placeholder, interval: int = 1, reduce=None) -> Tracker:
             Defaults to ``np.mean`` for non-scalar outputs.
     """
 
-    return Tracker(op, interval, reduce=reduce)
+    return Tracker(_u(op), interval, reduce=reduce)
 
 
 def constant(tag: str, data: Union[dict, str, Path]) -> ConstantNamespace:
@@ -114,10 +135,10 @@ def choice(options, name: str | None = None, default: int = 0) -> Choice:
 
 
 def _unary(jnp_fn):
-    """Create a unary wrapper for Placeholder args."""
+    """Create a unary wrapper for Placeholder args (auto-unwraps typed views)."""
 
     def wrapper(x):
-        return FunctionCall(jnp_fn, [x])
+        return FunctionCall(jnp_fn, [_u(x)])
 
     wrapper.__name__ = jnp_fn.__name__
     wrapper.__doc__ = jnp_fn.__doc__
@@ -125,10 +146,10 @@ def _unary(jnp_fn):
 
 
 def _binary(jnp_fn):
-    """Create a binary wrapper for Placeholder args."""
+    """Create a binary wrapper for Placeholder args (auto-unwraps typed views)."""
 
     def wrapper(x, y):
-        return FunctionCall(jnp_fn, [x, y])
+        return FunctionCall(jnp_fn, [_u(x), _u(y)])
 
     wrapper.__name__ = jnp_fn.__name__
     wrapper.__doc__ = jnp_fn.__doc__
@@ -288,7 +309,7 @@ def concat(items, axis: int = -1) -> FunctionCall:
         broadcasted = [jnp.broadcast_to(a, target_prefix + (a.shape[-1],)) for a in aligned]
         return jnp.concatenate(broadcasted, axis=-1)
 
-    return FunctionCall(_fn, list(items), name="concat")
+    return FunctionCall(_fn, [_u(i) for i in items], name="concat")
 
 
 def concatenate(items, axis: int = -1) -> FunctionCall:
@@ -296,31 +317,46 @@ def concatenate(items, axis: int = -1) -> FunctionCall:
     return concat(items, axis=axis)
 
 
+def vector(*components):
+    """Build a :class:`VectorView` directly from scalar component Placeholders.
+
+    Equivalent to ``VectorView(concat([*components]))`` but skips the manual
+    list and the ``.vector`` re-wrap step::
+
+        n    = jno.np.vector(nx, ny)          # 2-D normal as VectorView
+        flux = jno.np.vector(jx, jy, jz)      # 3-D current density
+        prob = jno.np.vector(x * p, y * p)    # OU drift flux
+    """
+    from .trace.views import VectorView
+
+    return VectorView(concat(list(components)))
+
+
 def stack(items, axis: int = 0) -> FunctionCall:
     """Stack placeholders along a new axis."""
     if axis == -1:
         return concat(items, axis=-1)
-    return FunctionCall(lambda *args: jnp.stack(args, axis=axis), list(items), name="stack")
+    return FunctionCall(lambda *args: jnp.stack(args, axis=axis), [_u(i) for i in items], name="stack")
 
 
 def reshape(x, shape: tuple) -> FunctionCall:
     """Reshape a placeholder to a new shape."""
-    return FunctionCall(lambda a: jnp.reshape(a, shape), [x])
+    return FunctionCall(lambda a: jnp.reshape(a, shape), [_u(x)])
 
 
 def squeeze(x, axis: int = None) -> FunctionCall:
     """Remove single-dimensional entries."""
-    return FunctionCall(lambda a: jnp.squeeze(a, axis=axis), [x])
+    return FunctionCall(lambda a: jnp.squeeze(a, axis=axis), [_u(x)])
 
 
 def expand_dims(x, axis: int) -> FunctionCall:
     """Expand array dimensions."""
-    return FunctionCall(lambda a: jnp.expand_dims(a, axis=axis), [x])
+    return FunctionCall(lambda a: jnp.expand_dims(a, axis=axis), [_u(x)])
 
 
 def transpose(x, axes: tuple = None) -> FunctionCall:
     """Transpose array."""
-    return FunctionCall(lambda a: jnp.transpose(a, axes=axes), [x])
+    return FunctionCall(lambda a: jnp.transpose(a, axes=axes), [_u(x)])
 
 
 def trace(x) -> FunctionCall:
@@ -334,7 +370,7 @@ def trace(x) -> FunctionCall:
     """
     return FunctionCall(
         lambda a: jnp.trace(a, axis1=-2, axis2=-1),
-        [x],
+        [_u(x)],
         name="trace",
     )
 
@@ -347,7 +383,7 @@ def sym(x) -> FunctionCall:
     """
     return FunctionCall(
         lambda a: 0.5 * (a + jnp.swapaxes(a, -1, -2)),
-        [x],
+        [_u(x)],
         name="sym",
     )
 
@@ -360,7 +396,7 @@ def antisym(x) -> FunctionCall:
     """
     return FunctionCall(
         lambda a: 0.5 * (a - jnp.swapaxes(a, -1, -2)),
-        [x],
+        [_u(x)],
         name="antisym",
     )
 
@@ -407,7 +443,7 @@ def symgrad(
     so the last axis is the derivative direction and the second-last block
     corresponds to field components.
     """
-    G = jacobian(target, variables, scheme=scheme)
+    G = jacobian(_u(target), variables, scheme=scheme)
     return FunctionCall(
         lambda a: 0.5 * (a + jnp.swapaxes(a, -1, -2)),
         [G],
@@ -421,12 +457,12 @@ def symgrad(
 
 
 def _reduction(jnp_fn, name):
-    """Create a reduction wrapper for Placeholder args."""
+    """Create a reduction wrapper for Placeholder args (auto-unwraps typed views)."""
 
     def wrapper(x, axis=None, keepdims=False):
         return FunctionCall(
             lambda a: jnp_fn(a, axis=axis, keepdims=keepdims),
-            [x],
+            [_u(x)],
             name=name,
             reduces_axis=axis,
         )
@@ -450,7 +486,7 @@ def norm(x, ord=None, axis=None, keepdims=False) -> FunctionCall:
     """Vector/matrix norm."""
     return FunctionCall(
         lambda a: jnp.linalg.norm(a, ord=ord, axis=axis, keepdims=keepdims),
-        [x],
+        [_u(x)],
         name="norm",
         reduces_axis=axis,
     )
@@ -467,7 +503,7 @@ minimum = _binary(jnp.minimum)
 
 def where(condition, x, y) -> FunctionCall:
     """Return elements chosen from x or y depending on condition."""
-    return FunctionCall(jnp.where, [condition, x, y])
+    return FunctionCall(jnp.where, [_u(condition), _u(x), _u(y)])
 
 
 # ============================================================================
@@ -523,7 +559,7 @@ def inner(x, y, n_contract: int = 1, keepdims: bool = False) -> FunctionCall:
         axes = tuple(range(-_n, 0))
         return jnp.sum(a * b, axis=axes, keepdims=_keep)
 
-    return FunctionCall(_fn, [x, y], name="inner", reduces_axis=-1)
+    return FunctionCall(_fn, [_u(x), _u(y)], name="inner", reduces_axis=-1)
 
 
 def double_dot(x, y) -> FunctionCall:
@@ -540,7 +576,7 @@ def einsum(subscripts: str, *operands) -> FunctionCall:
     """Traced jnp.einsum wrapper for compact tensor/vector contractions."""
     return FunctionCall(
         lambda *args, _subs=subscripts: jnp.einsum(_subs, *args),
-        list(operands),
+        [_u(o) for o in operands],
         name="einsum",
     )
 
@@ -572,11 +608,12 @@ def grad(target: Placeholder, variable: Variable, scheme: str = "automatic_diffe
     Example:
         u_x = pnp.grad(u(x, y), x)  # ∂u/∂x
     """
+    _guard(target, scheme)
     if isinstance(variable, (list, tuple)):
         if len(variable) == 0:
             raise ValueError("grad(..., variables) requires at least one variable")
-        return Jacobian(target, list(variable), scheme)
-    return Jacobian(target, [variable], scheme)
+        return Jacobian(_u(target), list(variable), scheme)
+    return Jacobian(_u(target), [variable], scheme)
 
 
 def laplacian(
@@ -605,12 +642,13 @@ def laplacian(
     Example:
         lap_u = pnp.laplacian(u(x, y), [x, y])  # ∂²u/∂x² + ∂²u/∂y²
     """
+    _guard(target, scheme)
     if scheme == "finite_difference" and variables is not None:
         print(
             "Variables were selected for the finite difference laplacian which are not used. The finite difference derivatives are computed on the entire spatial grid."
         )
 
-    return Hessian(target, variables, scheme, trace=True)
+    return Hessian(_u(target), variables, scheme, trace=True)
 
 
 def laplace(
@@ -619,7 +657,8 @@ def laplace(
     scheme: str = "automatic_differentiation",
 ) -> Hessian:
     """Alias for laplacian."""
-    return Hessian(target, variables, scheme, trace=True)
+    _guard(target, scheme)
+    return Hessian(_u(target), variables, scheme, trace=True)
 
 
 def hessian(
@@ -643,7 +682,8 @@ def hessian(
     Example:
         H = pnp.hessian(u(x, y), [x, y])  # 2x2 Hessian matrix
     """
-    return Hessian(target, variables, scheme)
+    _guard(target, scheme)
+    return Hessian(_u(target), variables, scheme)
 
 
 def jacobian(
@@ -667,7 +707,8 @@ def jacobian(
     Example:
         J = pnp.jacobian(u(x, y), [x, y])  # 2-element Jacobian vector
     """
-    return Jacobian(target, variables, scheme)
+    _guard(target, scheme)
+    return Jacobian(_u(target), variables, scheme)
 
 
 def divergence(vector_field: List[Placeholder], variables: List[Variable]) -> Placeholder:
@@ -689,9 +730,11 @@ def divergence(vector_field: List[Placeholder], variables: List[Variable]) -> Pl
     if len(vector_field) != len(variables):
         raise ValueError("vector_field and variables must have same length")
 
-    result: Placeholder = Jacobian(vector_field[0], [variables[0]])
+    for vf in vector_field:
+        _guard(vf)
+    result: Placeholder = Jacobian(_u(vector_field[0]), [variables[0]])
     for i in range(1, len(vector_field)):
-        result = result + Jacobian(vector_field[i], [variables[i]])
+        result = result + Jacobian(_u(vector_field[i]), [variables[i]])
     return result
 
 
@@ -708,7 +751,9 @@ def curl_2d(Fx: Placeholder, Fy: Placeholder, x: Variable, y: Variable) -> Place
     Returns:
         Scalar curl
     """
-    return Jacobian(Fy, [x]) - Jacobian(Fx, [y])
+    _guard(Fx)
+    _guard(Fy)
+    return Jacobian(_u(Fy), [x]) - Jacobian(_u(Fx), [y])
 
 
 def curl_3d(
@@ -733,6 +778,10 @@ def curl_3d(
     Returns:
         A 3-component Placeholder representing the curl vector
     """
+    Fx, Fy, Fz = _u(Fx), _u(Fy), _u(Fz)
+    _guard(Fx)
+    _guard(Fy)
+    _guard(Fz)
     curl_x = Jacobian(Fz, [y]) - Jacobian(Fy, [z])
     curl_y = Jacobian(Fx, [z]) - Jacobian(Fz, [x])
     curl_z = Jacobian(Fy, [x]) - Jacobian(Fx, [y])
@@ -759,7 +808,7 @@ def integrate(expr: Placeholder) -> "Integral":
     Returns:
         Integral node that evaluates to a scalar.
     """
-    return Integral(expr)
+    return Integral(_u(expr))
 
 
 def test(name: str = "phi") -> TestFunction:
