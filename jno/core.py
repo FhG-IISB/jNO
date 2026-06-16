@@ -3381,7 +3381,7 @@ class core:
                             for ci, v in enumerate(_ind_np)
                         ]
                     )
-                    self.log.info(f"Epoch {_epoch_counter - 1:>6}/{epochs}| L:{_total_np:.4e} | {_msg}")
+                    self.log.info(f"Epoch {_epoch_counter - 1:>6}/{epochs}| L:{float(_total_np):.4e} | {_msg}")
 
                     # Wandb (per chunk) — mirror the slow-path block:
                     # n_samples, n_chains, plus a running posterior mean
@@ -3952,7 +3952,7 @@ class core:
                     _cn_log = getattr(self, "_constraint_names", [])
                     _tn_log = getattr(self, "_tracker_names", [])
                     loss_strs = " | ".join(
-                        f"{(_cn_log[i] if i < len(_cn_log) and _cn_log[i] else f'C{i}')}: {v:>10.4e}"
+                        f"{(_cn_log[i] if i < len(_cn_log) and _cn_log[i] else f'C{i}')}: {float(v):>10.4e}"
                         for i, v in enumerate(losses_np)
                     )
                     if track_stats_np is not None:
@@ -3963,10 +3963,10 @@ class core:
                             for i, v in enumerate(track_stats_np)
                         )
                         self.log.info(
-                            f"Epoch {displayed_epoch:>6}/{epochs}| L:{total_np:>10.4e} | {loss_strs} | {track_strs}"
+                            f"Epoch {displayed_epoch:>6}/{epochs}| L:{float(total_np):>10.4e} | {loss_strs} | {track_strs}"
                         )
                     else:
-                        self.log.info(f"Epoch {displayed_epoch:>6}/{epochs}| L:{total_np:>10.4e} | {loss_strs}")
+                        self.log.info(f"Epoch {displayed_epoch:>6}/{epochs}| L:{float(total_np):>10.4e} | {loss_strs}")
 
                 # --- callbacks ---
                 if callbacks:

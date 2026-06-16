@@ -20,6 +20,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from ..dtypes import default_float_dtype, default_np_float_dtype
+
 LRFunction = Callable[[Union[int, jnp.ndarray], jnp.ndarray], jnp.ndarray]
 
 
@@ -260,7 +262,7 @@ class DLRS:
             self.loss_hist = [total_loss]
             self.lr = np.float32(np.clip(self.lr0, self.min_lr, self.max_lr))
             self.initialized = True
-            return np.asarray(self.lr, dtype=np.float32)
+            return np.asarray(self.lr, dtype=default_np_float_dtype())
 
         # Update rolling window
         self.loss_hist.append(total_loss)
@@ -292,14 +294,14 @@ class DLRS:
         lr_new = float(np.clip(lr_new, self.min_lr, self.max_lr))
 
         self.lr = np.float32(lr_new)
-        return np.asarray(self.lr, dtype=np.float32)
+        return np.asarray(self.lr, dtype=default_np_float_dtype())
 
     def __call__(self, t: int, losses: jnp.ndarray) -> jnp.ndarray:
         # Convert per-constraint losses to a scalar total loss for DLRS logic
         losses = jnp.asarray(losses)
         total_loss = jnp.sum(losses) if losses.ndim > 0 else losses
 
-        result_shape = jax.ShapeDtypeStruct((), jnp.float32)
+        result_shape = jax.ShapeDtypeStruct((), default_float_dtype())
         lr = jax.pure_callback(
             self._update_state_host,
             result_shape,

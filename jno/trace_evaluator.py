@@ -607,6 +607,23 @@ class TraceEvaluator:
         if _is_foundax_pointwise_mlp(model):
             shaped_args = _broadcast_pointwise_args(shaped_args)
 
+        # Mixed precision: when a model is *explicitly* opted into a dtype via
+        # Model.dtype(), cast its inputs to that dtype so it actually computes in
+        # it (e.g. bf16 -> real bf16 matmuls, not bf16 storage promoted to f32).
+        # Keyed on the explicit opt-in, NOT the inferred param dtype: a plain f32
+        # model under jax_enable_x64 must still compute in f64 by promotion rather
+        # than be silently downcast.  Applies to training and inference alike.
+        _compute_dtype = getattr(flax_mod, "_dtype", None)
+        if _compute_dtype is not None:
+            shaped_args = [
+                a.astype(_compute_dtype)
+                if getattr(a, "dtype", None) is not None
+                and jnp.issubdtype(a.dtype, jnp.floating)
+                and a.dtype != _compute_dtype
+                else a
+                for a in shaped_args
+            ]
+
         # Call equinox model directly (it IS the pytree, no init/apply split)
         import inspect
 
