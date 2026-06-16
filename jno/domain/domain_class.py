@@ -15,6 +15,7 @@ from ..trace import (
     TrialFunction,
     Variable,
 )
+from ..utils.dtypes import default_np_float_dtype
 from ..utils.logger import get_logger
 from .boundary_region import BoundaryRegion
 from .geometries import Geometries
@@ -734,10 +735,10 @@ class domain(MeshIOMixin):
             self.parameters[name] = float(value)
             self.log.info(f"Attached parameter '{name}' = {value}")
         elif isinstance(value, np.ndarray):
-            self.arrays[name] = value.astype(np.float32)
+            self.arrays[name] = value.astype(default_np_float_dtype())
             self.log.info(f"Attached array '{name}' with shape {value.shape}")
         elif isinstance(value, (list, tuple)):
-            arr = np.array(value, dtype=np.float32)
+            arr = np.array(value, dtype=default_np_float_dtype())
             self.arrays[name] = arr
             self.log.info(f"Attached array '{name}' with shape {arr.shape}")
         else:
@@ -899,7 +900,7 @@ class domain(MeshIOMixin):
                 self._parameter_list[name] = [value]
 
         for name, values in self._parameter_list.items():
-            self.parameters[name] = np.array(values, dtype=np.float32)
+            self.parameters[name] = np.array(values, dtype=default_np_float_dtype())
 
         # Keep batch metadata consistent after domain stacking.
         self_batch = int(getattr(self, "_batch_count", getattr(self, "total_samples", 1)))
@@ -2191,7 +2192,7 @@ class domain(MeshIOMixin):
                 if sampled_time_tag in self.context:
                     self.context[requested_time_tag] = self.context[sampled_time_tag]
                 elif time_value is not None:
-                    base_time = self.context.get("__time__", np.asarray([[time_value]], dtype=np.float32))
+                    base_time = self.context.get("__time__", np.asarray([[time_value]], dtype=default_np_float_dtype()))
                     dtype = np.asarray(base_time).dtype
                     self.context[requested_time_tag] = np.asarray([[time_value]], dtype=dtype)
 
@@ -2207,7 +2208,7 @@ class domain(MeshIOMixin):
             if time_value is not None:
                 requested_time_tag = f"__time_{tag}__"
                 if requested_time_tag not in self.context:
-                    base_time = self.context.get("__time__", np.asarray([[time_value]], dtype=np.float32))
+                    base_time = self.context.get("__time__", np.asarray([[time_value]], dtype=default_np_float_dtype()))
                     dtype = np.asarray(base_time).dtype
                     self.context[requested_time_tag] = np.asarray([[time_value]], dtype=dtype)
 

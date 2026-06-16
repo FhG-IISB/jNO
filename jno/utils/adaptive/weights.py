@@ -30,6 +30,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from ..dtypes import default_float_dtype
+
 WeightFunction = Callable[[jnp.ndarray, jnp.ndarray], jnp.ndarray]
 
 
@@ -41,10 +43,15 @@ def _host_callback_nondiff(host_fn, result_shape, losses: jnp.ndarray) -> jnp.nd
     set their tangent contribution to zero.
     """
 
+    def _host_fn_cast(x):
+        # Match the declared struct dtype so the callback does not error under
+        # jax_enable_x64 (host weights are computed in f32; cast to the graph dtype).
+        return np.asarray(host_fn(x), dtype=result_shape.dtype)
+
     @jax.custom_jvp
     def _call(x):
         return jax.pure_callback(
-            host_fn,
+            _host_fn_cast,
             result_shape,
             x,
             vmap_method="sequential",
@@ -216,7 +223,7 @@ class ReLoBRaLo:
             self.num_losses = int(losses_arr.shape[0])
             self.lambdas = np.ones(self.num_losses, dtype=np.float32)
 
-        result_shape = jax.ShapeDtypeStruct((self.num_losses,), jnp.float32)
+        result_shape = jax.ShapeDtypeStruct((self.num_losses,), default_float_dtype())
         weights = _host_callback_nondiff(
             self._update_state_host,
             result_shape,
@@ -395,7 +402,7 @@ class LbPINNsLossBalancing:
         if self.num_losses is None:
             self.num_losses = int(losses_arr.shape[0])
 
-        result_shape = jax.ShapeDtypeStruct((self.num_losses,), jnp.float32)
+        result_shape = jax.ShapeDtypeStruct((self.num_losses,), default_float_dtype())
         weights = _host_callback_nondiff(
             self._update_state_host,
             result_shape,
@@ -535,7 +542,7 @@ class SoftAdapt:
         if self.num_losses is None:
             self.num_losses = int(losses_arr.shape[0])
 
-        result_shape = jax.ShapeDtypeStruct((self.num_losses,), jnp.float32)
+        result_shape = jax.ShapeDtypeStruct((self.num_losses,), default_float_dtype())
         weights = _host_callback_nondiff(
             self._update_state_host,
             result_shape,
@@ -654,7 +661,7 @@ class DWA:
         if self.num_losses is None:
             self.num_losses = int(losses_arr.shape[0])
 
-        result_shape = jax.ShapeDtypeStruct((self.num_losses,), jnp.float32)
+        result_shape = jax.ShapeDtypeStruct((self.num_losses,), default_float_dtype())
         weights = _host_callback_nondiff(
             self._update_state_host,
             result_shape,
@@ -749,7 +756,7 @@ class RLW:
         if self.num_losses is None:
             self.num_losses = int(losses_arr.shape[0])
 
-        result_shape = jax.ShapeDtypeStruct((self.num_losses,), jnp.float32)
+        result_shape = jax.ShapeDtypeStruct((self.num_losses,), default_float_dtype())
         weights = _host_callback_nondiff(
             self._update_state_host,
             result_shape,
@@ -844,7 +851,7 @@ class GradientNormBalanced:
         if self.num_losses is None:
             self.num_losses = int(losses_arr.shape[0])
 
-        result_shape = jax.ShapeDtypeStruct((self.num_losses,), jnp.float32)
+        result_shape = jax.ShapeDtypeStruct((self.num_losses,), default_float_dtype())
         weights = _host_callback_nondiff(self._weights_host, result_shape, losses_arr)
         return tuple(weights[i] for i in range(self.num_losses))
 
@@ -919,7 +926,7 @@ class NTKBalanced:
     def __call__(self, *losses: jnp.ndarray) -> tuple[jnp.ndarray, ...]:
         """Return one weight per loss term."""
         losses_arr = _normalize_losses(losses)
-        result_shape = jax.ShapeDtypeStruct((self.num_losses,), jnp.float32)
+        result_shape = jax.ShapeDtypeStruct((self.num_losses,), default_float_dtype())
         weights = _host_callback_nondiff(self._weights_host, result_shape, losses_arr)
         return tuple(weights[i] for i in range(self.num_losses))
 
