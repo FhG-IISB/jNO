@@ -183,3 +183,39 @@ Poisson, mixed Dirichlet/Robin reaction–diffusion, a nonlinear Allen–Cahn in
 Helmholtz solve on an extruded domain, mixed-BC Helmholtz, a linear-elastic cantilever beam,
 Poiseuille channel flow (Stokes), transient heat, and two inverse problems (a hidden
 diffusivity field and a transient rate).
+
+---
+
+## Known limitations
+
+The FEM / weak-form path is stable for the cases the tutorials cover, but the
+FEAX-backed lowering has a few boundaries worth knowing. They apply only when you
+**assemble a weak form** (`target="fem_system"` / `"fem_residual"`) or solve a
+**transient problem through the FEAX time route** — the residual-PINN path is
+unaffected. Each boundary is an explicit, fail-loud `NotImplementedError`, never a
+silently wrong result.
+
+- **Transient mass terms must be parameter-free.** In a time-dependent solve the
+  mass term (`u_t * phi`) may not carry a trainable/runtime parameter. Keep it
+  constant and place affine trainable parameters in the operator/residual instead
+  — e.g. a diffusivity `nu` on the stiffness term, not on the time derivative.
+
+- **First order in time only.** The Diffrax and FEAX time-stepping adapters handle
+  first-order semidiscrete systems. A second-order-in-time PDE (such as the
+  undamped wave equation, `u_tt = c² Δu`) must be rewritten as a first-order
+  system; it cannot be assembled as a single second-order block.
+
+- **No runtime Dirichlet parameters.** A trainable parameter may sit in the
+  operator (stiffness) but not in an essential/Dirichlet boundary *value*: a
+  runtime contribution that lifts Dirichlet data (a non-zero right-hand side) is
+  rejected. Operator-coefficient inverse problems (e.g. recovering `nu`) are fine.
+
+- **Affine parameter lowering expects a single, direct factor.** For trainable FEM
+  coefficients, the affine fast-path recovers a parameter that is a *direct* scalar
+  factor of a weak-form term (`nu * grad(u) · grad(phi)`). One trainable scalar per
+  additive term — not nested inside another parameter or buried in a nonlinear
+  expression — is the well-supported shape.
+
+Hitting one of these is a signal to reformulate (move the parameter, reduce the
+time order) rather than a bug — the error message names the offending term.
+

@@ -43,7 +43,7 @@ checkpoint without rewriting the surrounding code.
 | Forward PINNs (residual minimisation) | [stable](https://fhg-iisb.github.io/jNO/tutorials/01-basics/poisson-1d/) | Hard or soft BC enforcement |
 | Operator learning (DeepONet, FNO, U-Net, PROSE via [foundax](https://github.com/FhG-IISB/foundax)) | [stable](https://fhg-iisb.github.io/jNO/tutorials/11-operator-learning/) | PDE-residual or data-driven; three architectures showcased |
 | Inverse problems (parameter recovery, surrogate inversion) | [stable](https://fhg-iisb.github.io/jNO/tutorials/05-coupled-and-inverse/inverse-parameter/) | |
-| FEM / Variational PINNs | [stable](https://fhg-iisb.github.io/jNO/tutorials/08-fem-and-varpinns/poisson-2d-fem/) | TRI3 / TRI6 / QUAD4 elements, weak-form assembly |
+| FEM / Variational PINNs | [stable](https://fhg-iisb.github.io/jNO/tutorials/08-fem-and-varpinns/poisson-2d-fem/) | TRI3 / TRI6 / QUAD4 elements, weak-form assembly — see [known limitations](https://fhg-iisb.github.io/jNO/fem/#known-limitations) |
 | Adaptive resampling (RAD, RARD, CR3, R3, pinnfluence) | [stable](https://fhg-iisb.github.io/jNO/adaptive/resampling/) | |
 | Stochastic PDEs and noise nodes (gaussian / uniform / laplace) | [stable](https://fhg-iisb.github.io/jNO/tutorials/07-stochastic/fokker-planck-2d/) | Fokker–Planck, stochastic forcing |
 | Bayesian PINNs (NUTS, HMC, MALA, SGLD, SGHMC, VI) | [stable](https://fhg-iisb.github.io/jNO/tutorials/10-bayesian-pinns/) | 14 worked tutorials |
