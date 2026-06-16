@@ -2089,25 +2089,45 @@ class Model(Placeholder):
         return self
 
     def dtype(self, dtype: Any) -> "Model":
-        """Cast all floating-point parameters to *dtype* before training.
+        """Set this model's working dtype (parameters **and** compute).
 
-        Reduces memory usage (e.g. ``jnp.bfloat16`` halves float32 memory)
-        while maintaining training stability for many models.
+        Casts all floating-point parameters to *dtype* and — at the forward
+        seam — casts the model's inputs to match, so the network actually
+        *computes* in *dtype* rather than promoting back to float32.  The cast is
+        symmetric: it lowers (float32 → bfloat16) **and** promotes (load a
+        bfloat16 checkpoint, then ``.dtype(jnp.float32)``), and applies to both
+        training and inference.  Integer arrays (e.g. indices) are left unchanged.
 
-        The cast is applied **after** pretrained weights are loaded (if any)
-        and before the training loop starts.  Integer arrays (e.g. indices)
-        are left unchanged.
+        This is the model-precision knob.  **Data** precision (float32 vs
+        float64) is JAX's ``jax_enable_x64`` flag — *not* a jNO setting.  Enable
+        it before building models/domains (``JAX_ENABLE_X64=1`` or
+        ``jax.config.update("jax_enable_x64", True)``).
 
         Args:
-            dtype: Target JAX dtype, e.g. ``jnp.bfloat16`` or
-                ``jnp.float16``.
+            dtype: A JAX floating dtype object, e.g. ``jnp.bfloat16``,
+                ``jnp.float16``, ``jnp.float32`` or ``jnp.float64``.
+
+        Caveats:
+            * bfloat16 *compute* degrades autodiff derivatives
+              (``.laplacian`` / ``.hessian``) — keep derivative-critical (PINN)
+              models in float32 and opt only data-loss / operator backbones into
+              bf16.
+            * bfloat16 parameters mean the optimizer update also runs in
+              bfloat16, which can stall on very small updates.
 
         Example::
 
-            u = nn.walrus((1,1,128,128,1), num_out_channels=1)
-            u.initialize("walrus.msgpack")
-            u.dtype(jnp.bfloat16)
+            backbone.dtype(jnp.bfloat16)   # real bf16 compute for this model
+            pinn_net.dtype(jnp.float32)    # keep its derivatives full precision
         """
+        if isinstance(dtype, str):
+            raise ValueError(
+                f"Model.dtype() takes a JAX dtype object, not a string {dtype!r}. "
+                "Pass e.g. jnp.bfloat16 / jnp.float32 for model precision. "
+                "Data precision (float32 vs float64) is JAX's jax_enable_x64 flag "
+                "(set JAX_ENABLE_X64=1 or jax.config.update('jax_enable_x64', True) "
+                "before building models) — it is not a jNO setting."
+            )
         self._dtype = dtype
         return self
 

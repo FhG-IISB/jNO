@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import contextlib
 
+import foundax
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
+import pytest
 
 import jno
 
@@ -125,3 +128,119 @@ def test_x64_no_float32_leak_in_context():
             if np.asarray(val).dtype == np.float32
         }
         assert not leaks, f"float32 leak under jax_enable_x64: {leaks}"
+
+
+# ---------------------------------------------------------------------------
+# Model precision — Model.dtype() makes real compute (Part B)
+# ---------------------------------------------------------------------------
+
+
+def _tiny_net(key_seed=0):
+    return jno.nn(foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=3, key=jax.random.PRNGKey(key_seed)))
+
+
+def test_dtype_bf16_gives_real_bf16_output():
+    # .dtype(bf16) casts params AND (at the seam) inputs, so the forward truly
+    # computes in bf16 rather than promoting back to f32.
+    dom = _line_domain()
+    x, *_ = dom.variable("interior")
+    net = _tiny_net()
+    net.dtype(jnp.bfloat16)
+    net.optimizer(optax.adam(1e-3))
+    u = net(x)
+    crux = jno.core([u.mse])
+    crux.solve(2)
+    assert np.asarray(crux.eval(u)).dtype == jnp.bfloat16
+
+
+def test_dtype_default_output_is_f32():
+    # Control: without .dtype(), the forward stays at the default float (f32).
+    dom = _line_domain()
+    x, *_ = dom.variable("interior")
+    net = _tiny_net(key_seed=1)
+    net.optimizer(optax.adam(1e-3))
+    u = net(x)
+    crux = jno.core([u.mse])
+    crux.solve(2)
+    assert np.asarray(crux.eval(u)).dtype == jnp.float32
+
+
+def test_dtype_bf16_pinn_derivative_trains():
+    # The primary jNO path: a bf16 model behind a second-derivative PINN residual
+    # must run through jacfwd/jacrev and the loss must decrease (bf16 *accuracy*
+    # is a documented caveat; here we only require it trains, not its precision).
+    dom = jno.domain(constructor=jno.domain.line(mesh_size=0.05))
+    x, *_ = dom.variable("interior")
+    net = _tiny_net()
+    net.dtype(jnp.bfloat16)
+    net.optimizer(optax.adam(1e-3))
+    u = net(x)
+    pde = (u.d(x).d(x) + 1.0).mse
+    crux = jno.core([pde])
+    stats = crux.solve(30)
+    losses = stats.training_logs[-1]["total_loss"]
+    assert np.isfinite(float(losses[-1]))
+    assert float(losses[-1]) < float(losses[0]), "bf16 PINN residual did not train"
+
+
+def test_dtype_f64_data_f32_model_downcasts_at_seam():
+    # f64 data (x64) + a deliberately f32 network: the seam casts the f64 input
+    # down to f32 so the forward runs in f32 without crashing.
+    with x64_enabled():
+        dom = _line_domain()
+        x, *_ = dom.variable("interior")
+        net = _tiny_net(key_seed=2)
+        net.dtype(jnp.float32)
+        net.optimizer(optax.adam(1e-3))
+        u = net(x)
+        crux = jno.core([u.mse])
+        crux.solve(2)
+        assert np.asarray(crux.eval(u)).dtype == jnp.float32
+
+
+def test_dtype_rejects_string_with_jax_flag_hint():
+    net = _tiny_net(key_seed=3)
+    with pytest.raises(ValueError, match="jax_enable_x64"):
+        net.dtype("float64")
+
+
+def test_x64_f32_params_not_downcast_without_explicit_dtype():
+    # Regression: the seam fires only on an EXPLICIT .dtype() opt-in. A plain
+    # f32-param model (e.g. a loaded f32 checkpoint) under x64 must still compute
+    # in f64 by promotion — the seam must NOT silently downcast the f64 data,
+    # which would partly undo the Part-A x64 propagation.
+    net = _tiny_net(key_seed=5)  # params created at the default → float32
+    with x64_enabled():
+        net.optimizer(optax.adam(1e-3))
+        dom = _line_domain()
+        x, *_ = dom.variable("interior")
+        u = net(x)
+        crux = jno.core([u.mse])
+        assert np.asarray(crux.eval(u)).dtype == np.float64
+
+
+@pytest.mark.slow
+def test_dtype_bf16_vs_f32_speed_informational(capsys):
+    # Best-effort speed comparison. Real bf16 speedups need bf16-capable
+    # hardware (GPU); on CPU bf16 is emulated and may be slower. This logs the
+    # ratio and only asserts both runs produce finite losses — it is NOT a gate.
+    import time
+
+    def _run(dtype):
+        dom = jno.domain(constructor=jno.domain.line(mesh_size=0.02))
+        x, *_ = dom.variable("interior")
+        net = _tiny_net(key_seed=7)
+        if dtype is not None:
+            net.dtype(dtype)
+        net.optimizer(optax.adam(1e-3))
+        crux = jno.core([(net(x).d(x).d(x) + 1.0).mse])
+        crux.solve(3)  # warm up / compile
+        t0 = time.perf_counter()
+        stats = crux.solve(20)
+        return time.perf_counter() - t0, float(stats.training_logs[-1]["total_loss"][-1])
+
+    t_f32, l_f32 = _run(None)
+    t_bf16, l_bf16 = _run(jnp.bfloat16)
+    with capsys.disabled():
+        print(f"\n[dtype speed] f32={t_f32:.3f}s  bf16={t_bf16:.3f}s  ratio={t_bf16 / t_f32:.2f}x")
+    assert np.isfinite(l_f32) and np.isfinite(l_bf16)
