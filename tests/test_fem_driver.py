@@ -15,6 +15,7 @@ Covers:
 
 from __future__ import annotations
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -147,3 +148,72 @@ def test_position_dependent_dirichlet(kind):
     u_exact = c[:, 0] ** 2 + c[:, 1] ** 2
     rel = np.linalg.norm(u_exact - u_sol) / np.linalg.norm(u_exact)
     assert rel < 1e-2
+
+
+# ---------------------------------------------------------------------------
+# transient (semidiscrete) assembly — M + operator, state0 from the IC,
+# integration window from jno.domain(time=...)
+# ---------------------------------------------------------------------------
+def _heat_fem(mesh_size=0.12, n_time=6):
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size, time=(0.0, 0.1, n_time))
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi0, yi0, _ = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    nu = 0.1
+    weak = ui.t * vi + nu * (ui.x * vi.x + ui.y * vi.y)
+    bc = u(xb, yb) - 0.0
+    ic = u(xi0, yi0) - jno.fn(lambda x, y: jnp.sin(jnp.pi * x) * jnp.sin(jnp.pi * y), [xi0, yi0])
+    return d, jno.fem([weak, bc, ic], quad_degree=3), nu
+
+
+def test_transient_assembles_to_mass_and_operator():
+    d, fem, _ = _heat_fem()
+    assert fem.is_transient and fem.is_linear
+    n = fem.dofs
+    assert _dense(fem.M).shape == (n, n)
+    assert np.asarray(fem.state0).shape == (n,)
+    # time window comes from jno.domain(time=(0, 0.1, 6)) -> dt = 0.1/5
+    assert (fem.t0, fem.t1) == (0.0, 0.1)
+    assert abs(fem.dt - 0.02) < 1e-9
+
+
+def test_transient_state0_from_initial_condition():
+    d, fem, _ = _heat_fem()
+    c = np.asarray(d.mesh.points)[:, :2]
+    ic_exact = np.sin(np.pi * c[:, 0]) * np.sin(np.pi * c[:, 1])
+    assert np.allclose(np.asarray(fem.state0), ic_exact, atol=1e-6)
+
+
+def test_transient_backward_euler_step_decays():
+    # one implicit step of M u_dot + nu K u = 0 must decay like 1/(1 + 2 nu pi^2 dt)
+    d, fem, nu = _heat_fem()
+    M, A = _dense(fem.M), _dense(fem.operator.A)
+    u0, dt = np.asarray(fem.state0), float(fem.dt)
+    u1 = np.linalg.solve(M + dt * A, M @ u0)
+    ratio = np.max(np.abs(u1)) / np.max(np.abs(u0))
+    analytic = 1.0 / (1.0 + 2 * nu * np.pi**2 * dt)
+    assert abs(ratio - analytic) < 0.02
+
+
+def test_initial_condition_without_time_derivative_raises():
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3, time=(0.0, 0.1, 6))
+    u, phi = d.fem_symbols()
+    xi, yi, _ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi0, yi0, _ = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    steady_weak = ui.x * vi.x + ui.y * vi.y - 1.0 * vi  # no time derivative
+    with pytest.raises(ValueError):
+        jno.fem([steady_weak, u(xb, yb) - 0.0, u(xi0, yi0) - 0.0])
+
+
+def test_transient_accessor_guards():
+    _, fem, _ = _heat_fem(mesh_size=0.3)
+    assert fem.is_transient
+    with pytest.raises(AttributeError):
+        _ = fem.A  # steady-only accessor
+    _, steady = _poisson_fem(mesh_size=0.3)
+    with pytest.raises(AttributeError):
+        _ = steady.M  # transient-only accessor
