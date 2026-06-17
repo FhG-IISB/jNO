@@ -480,6 +480,101 @@ class PolygonDomain(domain):
                     normal_geometry=region if region_is_active else self._active_geometry,
                 )  # type: ignore[misc]
 
+        self._maybe_register_box_edges()
+
+    def _maybe_register_box_edges(self) -> None:
+        """Auto-register ``left``/``right``/``bottom``/``top`` boundary tags when the
+        active geometry is (approximately) an axis-aligned rectangle.
+
+        A bare shapely ``box`` otherwise exposes only the single ``boundary`` tag, so
+        per-edge Dirichlet/Neumann conditions are not addressable. These auto tags match
+        the names produced by the legacy ``jno.domain.rect`` path. Existing tags (user or
+        source regions named ``left``/… ) are never overwritten.
+        """
+        geom = self._active_geometry
+        if geom is None or geom.is_empty or geom.geom_type != "Polygon" or len(geom.interiors) > 0:
+            return
+        minx, miny, maxx, maxy = geom.bounds
+        if (maxx - minx) <= _GEOM_TOL or (maxy - miny) <= _GEOM_TOL:
+            return
+        from shapely.geometry import box as _box
+
+        rect = _box(minx, miny, maxx, maxy)
+        # Only treat as a box when the polygon actually fills its bounding rectangle.
+        if geom.symmetric_difference(rect).area > self._normal_eps * max(1.0, rect.area):
+            return
+        edges = {
+            "left": LineString([(minx, miny), (minx, maxy)]),
+            "right": LineString([(maxx, miny), (maxx, maxy)]),
+            "bottom": LineString([(minx, miny), (maxx, miny)]),
+            "top": LineString([(minx, maxy), (maxx, maxy)]),
+        }
+        for tag, edge in edges.items():
+            if tag not in self._polygon_tags:
+                self._register_boundary_tag(tag, edge, normal_geometry=geom)
+
+    def region(self, name: str, where: Any, *, kind: Optional[str] = None) -> "PolygonDomain":
+        """Define a named sub-region addressable via ``domain.variable(name)`` and usable
+        as a FEM boundary-condition location.
+
+        Parameters
+        ----------
+        name:
+            Region tag name (e.g. ``"inlet"``, ``"right_top"``).
+        where:
+            * a shapely geometry — a boundary ``LineString``/``MultiLineString`` or an area
+              ``Polygon``/``MultiPolygon`` registered directly;
+            * a point predicate ``f(x, y) -> bool`` selecting the part of the active
+              **boundary** where it holds (evaluated per analytic edge-segment midpoint, so
+              it selects whole polygon edges);
+            * a ``str`` aliasing an already-registered tag.
+        kind:
+            ``"boundary"`` or ``"interior"``. ``None`` auto-detects from the geometry
+            (area → interior, line → boundary); predicates are boundary-only for now.
+
+        Returns ``self`` for chaining.
+        """
+        _require_shapely()
+        name = str(name)
+
+        if isinstance(where, str):
+            if where not in self._polygon_tags:
+                raise ValueError(f"region({name!r}): unknown source tag {where!r}.")
+            src_kind, src_geom = self._polygon_tags[where]
+            where, kind = src_geom, (kind or src_kind)
+
+        if hasattr(where, "geom_type"):
+            as_interior = kind == "interior" or (
+                kind is None and where.geom_type in {"Polygon", "MultiPolygon"} and where.area > _GEOM_TOL
+            )
+            if as_interior:
+                self._register_interior_tag(name, _as_polygonal_geometry(where))
+            else:
+                self._register_boundary_tag(name, _as_line_geometry(where))
+            return self
+
+        if callable(where):
+            if kind == "interior":
+                raise NotImplementedError(
+                    "Interior predicate regions are not supported yet; pass a shapely Polygon instead."
+                )
+            segments = _segments_from_line_geometry(self._active_geometry.boundary)
+            kept = []
+            for seg in segments:
+                mx = 0.5 * (seg[0, 0] + seg[1, 0])
+                my = 0.5 * (seg[0, 1] + seg[1, 1])
+                if bool(where(float(mx), float(my))):
+                    kept.append(LineString([tuple(seg[0]), tuple(seg[1])]))
+            if not kept:
+                raise ValueError(f"region({name!r}): predicate selected no boundary segments.")
+            self._register_boundary_tag(name, unary_union(kept))
+            return self
+
+        raise TypeError(
+            f"region({name!r}): `where` must be a shapely geometry, a predicate f(x, y) -> bool, "
+            f"or a tag string, got {type(where).__name__}."
+        )
+
     def _register_interior_tag(self, tag: str, geom: BaseGeometry) -> None:
         geom = _as_polygonal_geometry(geom)
         if geom.is_empty or geom.area <= _GEOM_TOL:
