@@ -175,9 +175,22 @@ def _essential_value_node(bare: Any) -> Any:
         left, right = bare.left, bare.right
         left_has_trial = _contains(left, TrialFunction)
         right_has_trial = _contains(right, TrialFunction)
-        node = right if left_has_trial and not right_has_trial else (left if right_has_trial else None)
-        if node is not None:
-            return node
+        if left_has_trial and not right_has_trial:
+            trial_side, value_node = left, right
+        elif right_has_trial and not left_has_trial:
+            trial_side, value_node = right, left
+        else:
+            trial_side = value_node = None
+        if value_node is not None:
+            # The unknown must appear linearly with unit coefficient: an essential
+            # condition is `u(region) - value`, not a nonlinear function of u
+            # (e.g. `u**2 - 1` would otherwise be silently read as `u - 1`).
+            if not isinstance(trial_side, TrialFunction):
+                raise ValueError(
+                    "jno.fem: an essential boundary/initial condition must be affine in the unknown — "
+                    f"write `u(region) - value`, not a nonlinear/scaled trial expression. Got: {trial_side!r}."
+                )
+            return value_node
     if isinstance(bare, TrialFunction):
         return 0.0
     raise ValueError(
