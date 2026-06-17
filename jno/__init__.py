@@ -10,6 +10,7 @@ import sys
 
 from . import bayesian, fn, lora, trackers
 from . import jnp_ops as np
+from ._fem import fem
 from .architectures.models import nn, parameter
 from .core import core
 from .differential_operators import DifferentialOperators
@@ -102,6 +103,7 @@ __all__ = [
     "sampler",
     "domain",
     "do",
+    "fem",
     "Model",
     "Variable",
     "Placeholder",
