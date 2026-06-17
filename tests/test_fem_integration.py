@@ -205,6 +205,34 @@ class TestFeaxFemVectorAssembly:
         assert jnp.isfinite(A_dense).all()
         assert jnp.isfinite(b).all()
 
+    def test_full_elasticity_volumetric_term_recovers_manufactured(self):
+        # Full lambda-mu linear elasticity *including* the volumetric div(u)*div(phi)
+        # term (trace(symgrad)*trace(symgrad)) — this requires the kernel's
+        # prefix-alignment of trial- vs test-derived quantities. u_exact = (a x, b y)
+        # has constant strain so div(sigma) = 0 (f = 0); clamping it on the whole
+        # boundary must recover it exactly on TRI3 (linear field).
+        import numpy as np
+
+        lam, mu, a, bcoef = 1.0, 1.0, 0.1, -0.05
+        dom = make_domain()
+        dom.init_fem(
+            element_type="TRI3",
+            quad_degree=2,
+            bcs=[dom.dirichlet(["left", "right", "top", "bottom"], [lambda p: a * p[0], lambda p: bcoef * p[1]])],
+            fem_solver=True,
+            vec=2,
+        )
+        u, phi = dom.fem_symbols(value_shape=(2,))
+        xg, yg, _ = dom.variable("fem_gauss", split=True)
+        eps_u, eps_phi = jnn.symgrad(u, [xg, yg]), jnn.symgrad(phi, [xg, yg])
+        weak = lam * jnn.trace(eps_u) * jnn.trace(eps_phi) + 2.0 * mu * jnn.inner(eps_u, eps_phi, n_contract=2)
+        A, rhs = weak.assemble(dom, target="fem_system")
+        sol = np.linalg.solve(to_dense(A), np.asarray(rhs).reshape(-1))
+        c = np.asarray(dom.mesh.points)[:, :2]
+        exact = np.stack([a * c[:, 0], bcoef * c[:, 1]], axis=-1).reshape(-1)
+        rel = np.linalg.norm(exact - sol) / (np.linalg.norm(exact) + 1e-30)
+        assert rel < 1e-8
+
 
 # ============================================================
 # Boundary-tagged weak forms

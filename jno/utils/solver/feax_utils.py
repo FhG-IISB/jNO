@@ -586,6 +586,36 @@ def _temporal_value_from_internal_vars(local, tag, dim_start=0, dim_end=1):
 # --------------------------------
 
 
+def _prefix_align(a, b):
+    """Broadcast-align two kernel quantities for an elementwise op.
+
+    In the FEAX kernel, trial-derived quantities are laid out as ``(n_quad,
+    *value)`` while test-derived ones carry extra leading test-DOF axes
+    ``(n_quad, *dof, *value)`` (the per-DOF basis expansion). Their shared axis
+    is the leading quadrature axis and their value axes are trailing, so when the
+    ranks differ we pad the lower-rank operand with singleton axes **right after
+    the quad axis** until the ranks match. The trailing value axes then align by
+    normal right-broadcasting and the test-DOF axes broadcast against the inserted
+    singletons. This mirrors the prefix-padding ``jno.np.inner`` already does, so
+    arbitrary tensor algebra between trial- and test-derived quantities works
+    (e.g. ``div(u) * div(phi)``), not just explicit contractions.
+
+    Only activates when ranks differ (and both operands are arrays), so
+    equal-rank expressions keep their exact current broadcasting.
+    """
+    a = jnp.asarray(a)
+    b = jnp.asarray(b)
+    if a.ndim == b.ndim or a.ndim == 0 or b.ndim == 0:
+        return a, b
+    if a.ndim < b.ndim:
+        pad = (1,) * (b.ndim - a.ndim)
+        a = jnp.reshape(a, a.shape[:1] + pad + a.shape[1:])
+    else:
+        pad = (1,) * (a.ndim - b.ndim)
+        b = jnp.reshape(b, b.shape[:1] + pad + b.shape[1:])
+    return a, b
+
+
 def _eval_expr_for_feax(domain, node, local):
     """
     Evaluate a jNO symbolic expression inside a FEAX local kernel.
@@ -729,6 +759,7 @@ def _eval_expr_for_feax(domain, node, local):
     if isinstance(node, BinaryOp):
         a = _eval_expr_for_feax(domain, node.left, local)
         b = _eval_expr_for_feax(domain, node.right, local)
+        a, b = _prefix_align(a, b)
         if node.op == "+":
             return a + b
         if node.op == "-":
