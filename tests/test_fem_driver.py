@@ -123,3 +123,27 @@ def test_fem_accessor_guards():
         _ = fem.residual
     with pytest.raises(AttributeError):
         _ = fem.jacobian
+
+
+@pytest.mark.parametrize("kind", ["jno_fn", "arith"])
+def test_position_dependent_dirichlet(kind):
+    # Manufactured u = x^2 + y^2  ->  -lap(u) = -4, with u = x^2+y^2 on the boundary.
+    # The position-dependent value is evaluated through the existing TraceEvaluator.
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    weak = ui.x * vi.x + ui.y * vi.y + 4.0 * vi
+    if kind == "jno_fn":
+        g = jno.fn(lambda x, y: x**2 + y**2, [xb, yb])
+    else:
+        g = xb**2 + yb**2
+
+    fem = jno.fem([weak, u(xb, yb) - g], quad_degree=3)
+    A = _dense(fem.A)
+    u_sol = np.linalg.solve(A, np.asarray(fem.b).reshape(-1))
+    c = np.asarray(d.mesh.points)[:, :2]
+    u_exact = c[:, 0] ** 2 + c[:, 1] ** 2
+    rel = np.linalg.norm(u_exact - u_sol) / np.linalg.norm(u_exact)
+    assert rel < 1e-2

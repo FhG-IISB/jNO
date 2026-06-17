@@ -23,7 +23,7 @@ This module does **not** solve. Users drive their own solve (``jnp.linalg.solve`
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Tuple
 
 import jax.numpy as jnp
 
@@ -146,12 +146,35 @@ def _constant_of(node: Any) -> Optional[float]:
         return None
 
 
-def _extract_dirichlet_value(bare: Any) -> Any:
-    """Extract the prescribed value ``g`` from an essential residual ``u - g``.
+def _coord_value_fn(value_node: Any) -> Callable:
+    """Wrap a coordinate value expression as feax's ``value(point)`` callable.
 
-    Supports the canonical affine form ``trial_side - value`` (or ``value -
-    trial_side``). Only constant values are supported for now; a
-    position-dependent ``g(x, y)`` raises a clear error.
+    The boundary coordinates are concrete (the mesh is built), so the value is
+    obtained with a single evaluation through the existing
+    :class:`~jno.trace_evaluator.TraceEvaluator` at the boundary node(s) feax
+    supplies — the same per-point value hook ``domain.dirichlet("left", lambda
+    p: p[1])`` uses. No bespoke expression walker is introduced.
+    """
+    from .trace_evaluator import TraceEvaluator
+
+    tags = {v.tag for v in _walk(value_node) if isinstance(v, Variable)}
+    evaluator = TraceEvaluator({})
+
+    def value_fn(p):
+        p_arr = jnp.asarray(p)
+        pts = jnp.atleast_2d(p_arr)
+        out = jnp.reshape(evaluator.evaluate(value_node, context={t: pts for t in tags}), (-1,))
+        return out[0] if p_arr.ndim == 1 else out
+
+    return value_fn
+
+
+def _extract_dirichlet_value(bare: Any) -> Any:
+    """Extract the prescribed value from an essential residual ``u(region) - g``.
+
+    Returns a constant for ``u - c``, or a ``value(point)`` callable (backed by
+    :class:`TraceEvaluator`) for a coordinate expression ``u - g(x, y)`` such as
+    ``u(xl, yl) - jno.fn(func, [xl, yl])`` or ``u(xl, yl) - yl``.
     """
     op = getattr(bare, "op", None)
     if op == "-" and hasattr(bare, "left") and hasattr(bare, "right"):
@@ -161,16 +184,12 @@ def _extract_dirichlet_value(bare: Any) -> Any:
         value_node = right if left_has_trial and not right_has_trial else (left if right_has_trial else None)
         if value_node is not None:
             const = _constant_of(value_node)
-            if const is not None:
-                return const
-            raise NotImplementedError(
-                "jno.fem: position-dependent Dirichlet values are not supported yet; use a constant `u(boundary) - c`."
-            )
+            return const if const is not None else _coord_value_fn(value_node)
     if isinstance(bare, TrialFunction):
         return 0.0
     raise ValueError(
         "jno.fem: could not read an essential boundary condition from the residual. "
-        "Write it as `u(region) - value` (value constant for now)."
+        "Write it as `u(region) - value`, e.g. `u(xl, yl) - 0.0` or `u(xl, yl) - jno.fn(g, [xl, yl])`."
     )
 
 
