@@ -1366,18 +1366,22 @@ class domain(MeshIOMixin):
                         bc_config.add(loc_fn, "all", fn)
                         continue
 
-                    # Vector case: value_obj may already be normalized into a list/tuple
-                    # of callables/scalars, or may be a single callable/scalar for all comps.
-                    if callable(value_obj) or onp.isscalar(value_obj):
-                        vals = [value_obj for _ in range(vec)]
+                    # Vector case: value_obj may be a length-vec list/tuple of
+                    # callables/scalars, a partial {component: value} dict (roller /
+                    # symmetry — only the named components are constrained), or a
+                    # single callable/scalar broadcast to all components.
+                    if isinstance(value_obj, dict):
+                        comp_values = {int(c): v for c, v in value_obj.items()}
+                    elif callable(value_obj) or onp.isscalar(value_obj):
+                        comp_values = {c: value_obj for c in range(vec)}
                     elif isinstance(value_obj, (list, tuple)):
                         if len(value_obj) != vec:
                             raise ValueError(f"Dirichlet BC for tag '{tag}' has {len(value_obj)} entries, but vec={vec}.")
-                        vals = list(value_obj)
+                        comp_values = dict(enumerate(value_obj))
                     else:
                         raise TypeError(f"Unsupported Dirichlet BC value type for tag '{tag}': {type(value_obj).__name__}")
 
-                    for comp, v in enumerate(vals):
+                    for comp, v in comp_values.items():
                         if callable(v):
                             fn = v
                         elif onp.isscalar(v):

@@ -261,7 +261,10 @@ def _normalize_dirichlet_value(value, vec: int):
     Normalize user Dirichlet data into FEAX-compatible value functions.
 
     Accepts None, scalar, callable, component list/tuple, or component dict.
-    Returns one callable for scalar fields or a list of callables for vector fields.
+    Returns one callable for scalar fields, a length-``vec`` list of callables for
+    a fully specified vector field, or a partial ``{component_index: callable}`` dict
+    when only some components are constrained (e.g. a roller/symmetry BC
+    ``{"y": 0.0}`` pins only ``u_y`` and leaves the other components free).
     """
     if value is None:
         value = 0.0
@@ -297,7 +300,10 @@ def _normalize_dirichlet_value(value, vec: int):
 
     if isinstance(value, dict):
         keymap = {"x": 0, "y": 1, "z": 2}
-        out = [_const_bc_fn(0.0) for _ in range(vec)]
+        # Partial spec: only the named components are constrained; the rest stay
+        # free. (Zero-filling here would silently clamp the other components, which
+        # breaks roller/symmetry BCs and conflicts at shared corner nodes.)
+        out: dict[int, Any] = {}
         for k, v in value.items():
             c = keymap[k.lower()] if isinstance(k, str) else int(k)
             if c < 0 or c >= vec:
@@ -309,7 +315,7 @@ def _normalize_dirichlet_value(value, vec: int):
             else:
                 raise TypeError("Dirichlet dict entries must be callables or scalars.")
         if vec == 1:
-            return out[0]
+            return out.get(0, _const_bc_fn(0.0))
         return out
 
     raise TypeError(f"Unsupported Dirichlet BC value type: {type(value).__name__}")
@@ -1072,6 +1078,12 @@ def _make_feax_dirichlet_specs(domain, vec: int):
 
         if callable(normalized):
             specs.append(fe.DirichletBCSpec(location=loc_fn, component="all", value=normalized))
+            continue
+
+        if isinstance(normalized, dict):
+            # Partial / per-component (roller) BC: one spec per named component only.
+            for comp, fn in normalized.items():
+                specs.append(fe.DirichletBCSpec(location=loc_fn, component=component_names.get(comp, comp), value=fn))
             continue
 
         if isinstance(normalized, (list, tuple)):

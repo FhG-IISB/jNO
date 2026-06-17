@@ -3,9 +3,10 @@
 Covers: ``vec`` inferred from the trial's ``value_shape``; a vector elliptic
 solve recovers a manufactured solution; full lambda-mu linear elasticity (with
 the volumetric ``div(u)*div(phi)`` term enabled by the kernel prefix-alignment
-fix) assembles symmetrically; and a vector Neumann *traction* assembles and
-contributes to the load. All-component Dirichlet is via the scalar-broadcast
-form ``u(region) - 0.0``; per-component (roller) Dirichlet is a follow-up.
+fix) assembles symmetrically. All-component Dirichlet is via the scalar-broadcast
+form ``u(region) - 0.0``; per-component (roller/symmetry) Dirichlet is via the
+component-indexed form ``u(region)[i] - g``, which pins only component ``i`` and
+leaves the others free.
 """
 
 from __future__ import annotations
@@ -72,15 +73,68 @@ def test_full_elasticity_assembles_symmetric():
     assert np.allclose(A, A.T, atol=1e-7)
 
 
-# NOTE (follow-up): vector Neumann *traction* (`t·phi`) and per-component
-# (roller) Dirichlet (`u(region).component(i) - g`) are not yet exposed through
-# jno.fem because the vector view ops drop region/component metadata:
-#   - `.component(i)` / `inner(...)` discard the bound view's `_coord_vars`, so a
-#     vector boundary term can't be classified onto its region (scalar `g_N*phi`
-#     keeps it via the ScalarView `_rewrap`);
-#   - `.component(i)` hides the component index inside a `getitem` closure.
-# Both are view-layer fixes (preserve `_coord_vars` + expose the component index),
-# independent of the kernel/assembly, which handle vector fields correctly.
+def test_roller_per_component_dirichlet_recovers_manufactured():
+    # Per-component (roller / symmetry) Dirichlet via `u(region)[i] - g`.
+    # Decoupled vector Laplacian (f = 0): pin u_x on left/right and u_y on
+    # bottom/top; the orthogonal component on each edge is left FREE (natural
+    # zero-flux). Unique solution u = (x, y); linear field -> TRI3 exact.
+    # This exercises the part the all-component clamp can't: only the named
+    # component is constrained, and shared corner nodes get *both* edges' pins.
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
+    u, phi = d.fem_symbols(value_shape=(2,))
+    xi, yi, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+    weak = jno.np.inner(jno.np.grad(u, [xi, yi]), jno.np.grad(phi, [xi, yi]), n_contract=2)
+    fem = jno.fem([weak, u(xl, yl)[0] - 0.0, u(xr, yr)[0] - 1.0, u(xb, yb)[1] - 0.0, u(xt, yt)[1] - 1.0])
+
+    # component-indexed constraints are classified per component (not all-component)
+    assert "dirichlet@left[x]" in fem.classification
+    assert "dirichlet@bottom[y]" in fem.classification
+
+    sol = np.linalg.solve(_dense(fem.A), np.asarray(fem.b).reshape(-1)).reshape(-1, 2)
+    c = np.asarray(d.mesh.points)[:, :2]
+    exact = np.stack([c[:, 0], c[:, 1]], axis=-1)
+    assert np.linalg.norm(exact - sol) / np.linalg.norm(exact) < 1e-9
+
+    # "u_x = 0, u_y free" on the left edge: the pinned component is exact, while
+    # the freed component follows the solution (u_y = y) rather than being clamped.
+    left = np.isclose(c[:, 0], 0.0)
+    assert np.allclose(sol[left, 0], 0.0, atol=1e-12)  # u_x pinned to 0
+    assert np.linalg.norm(sol[left, 1] - c[left, 1]) < 1e-9  # u_y free -> equals y
+    assert np.ptp(sol[left, 1]) > 0.5  # and genuinely varies (not silently pinned)
+
+
+def test_roller_mixed_components_across_boundaries():
+    # User scenario: u_x = 0 on one boundary (u_y free) and u_y = 0 on another
+    # (u_x free). A diagonal body load f = (1, 1) drives both components; with a
+    # roller on left (u_x) and bottom (u_y) the problem is well posed (each
+    # decoupled component has a Dirichlet patch). Check the pinned components are
+    # exact and the freed components are non-trivial.
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
+    u, phi = d.fem_symbols(value_shape=(2,))
+    xi, yi, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    vi = phi.bind(x=xi, y=yi)
+    weak = jno.np.inner(jno.np.grad(u, [xi, yi]), jno.np.grad(phi, [xi, yi]), n_contract=2) - (
+        1.0 * vi.component(0) + 1.0 * vi.component(1)
+    )
+    fem = jno.fem([weak, u(xl, yl)[0] - 0.0, u(xb, yb)[1] - 0.0])
+    assert "dirichlet@left[x]" in fem.classification
+    assert "dirichlet@bottom[y]" in fem.classification
+
+    sol = np.linalg.solve(_dense(fem.A), np.asarray(fem.b).reshape(-1)).reshape(-1, 2)
+    c = np.asarray(d.mesh.points)[:, :2]
+    left = np.isclose(c[:, 0], 0.0)
+    bottom = np.isclose(c[:, 1], 0.0)
+    assert np.allclose(sol[left, 0], 0.0, atol=1e-10)  # u_x pinned on left
+    assert np.allclose(sol[bottom, 1], 0.0, atol=1e-10)  # u_y pinned on bottom
+    # freed components are not clamped: u_y on left and u_x on bottom are nonzero
+    assert np.max(np.abs(sol[left, 1])) > 1e-3
+    assert np.max(np.abs(sol[bottom, 0])) > 1e-3
 
 
 def test_vec3_field_assembles():

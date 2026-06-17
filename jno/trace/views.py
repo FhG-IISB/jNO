@@ -363,10 +363,21 @@ class VectorView(_DelegatesToPlaceholder):
 
     # -- component access --
     def _c(self, i: int) -> "ScalarView":
-        return ScalarView(self._expr[..., i])
+        comp = ScalarView(self._expr[..., i])
+        # Preserve the region binding so a bound view's component
+        # (e.g. ``u.bind(x=xr, y=yr)[1]``) still carries ``_coord_vars`` — needed
+        # for per-component (roller) Dirichlet and vector boundary terms.
+        cv = getattr(self, "_coord_vars", None)
+        if cv:
+            return comp.bind(**cv)
+        return comp
 
     def component(self, i: int) -> "ScalarView":
         """i-th component → ScalarView."""
+        return self._c(i)
+
+    def __getitem__(self, i: int) -> "ScalarView":
+        """``v[i]`` — i-th component (alias for :meth:`component`)."""
         return self._c(i)
 
     # -- differential operators --

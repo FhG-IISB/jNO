@@ -324,7 +324,11 @@ class Placeholder:
         if not isinstance(key, tuple):
             key = (key,)
         concrete_key = tuple(None if k is None else k for k in key)
-        return FunctionCall(lambda x, k=concrete_key: x[k], [self], name="getitem")
+        fc = FunctionCall(lambda x, k=concrete_key: x[k], [self], name="getitem")
+        # Record the key so consumers (e.g. the FEM driver) can recover a
+        # component index from `u[..., i]` rather than it being hidden in the closure.
+        fc.getitem_key = concrete_key
+        return fc
 
     def __call__(self, *args):
         """Call this expression with different variables (auto-wraps in operation)."""

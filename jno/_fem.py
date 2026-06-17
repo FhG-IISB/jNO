@@ -31,6 +31,9 @@ from .trace import FemLinearSystem, TestFunction, TrialFunction, Variable
 
 __all__ = ["fem", "FEM"]
 
+# Component names feax uses for per-component (roller/symmetry) Dirichlet specs.
+_COMPONENT_NAMES = {0: "x", 1: "y", 2: "z"}
+
 
 # ---------------------------------------------------------------------------
 # expression helpers
@@ -163,12 +166,29 @@ def _constant_of(node: Any) -> Optional[float]:
         return None
 
 
-def _essential_value_node(bare: Any) -> Any:
-    """Return the value side ``g`` of an essential residual ``u(region) - g``.
+def _component_index_of(node: Any) -> Optional[int]:
+    """If ``node`` is a single component of the trial (``u[..., i]``), return ``i``.
 
-    Returns a Placeholder expression (or ``0.0`` for a bare ``u``); raises if the
-    residual is not the affine ``u - g`` form. Used for both Dirichlet values and
-    initial conditions.
+    Reads the index recorded on the ``getitem`` node (``Placeholder.__getitem__``),
+    so a per-component (roller) BC ``u(region)[i] - g`` is recoverable. Returns
+    ``None`` for the bare trial (all components).
+    """
+    if getattr(node, "_name", None) == "getitem" and hasattr(node, "getitem_key"):
+        args = getattr(node, "args", None) or []
+        if len(args) == 1 and _contains(args[0], TrialFunction):
+            ints = [k for k in node.getitem_key if isinstance(k, int)]
+            if len(ints) == 1:
+                return ints[0]
+    return None
+
+
+def _essential_spec(bare: Any) -> Tuple[Optional[int], Any]:
+    """``(component_index_or_None, value_node)`` for an essential residual.
+
+    Handles ``u(region) - g`` (component ``None`` = all components) and
+    ``u(region)[i] - g`` (component ``i``). The unknown side must be the bare
+    trial or a single component of it — a nonlinear/scaled form (e.g. ``u**2 - 1``)
+    raises rather than being silently read as ``u - 1``.
     """
     op = getattr(bare, "op", None)
     if op == "-" and hasattr(bare, "left") and hasattr(bare, "right"):
@@ -182,20 +202,19 @@ def _essential_value_node(bare: Any) -> Any:
         else:
             trial_side = value_node = None
         if value_node is not None:
-            # The unknown must appear linearly with unit coefficient: an essential
-            # condition is `u(region) - value`, not a nonlinear function of u
-            # (e.g. `u**2 - 1` would otherwise be silently read as `u - 1`).
-            if not isinstance(trial_side, TrialFunction):
+            comp = _component_index_of(trial_side)
+            if not (isinstance(trial_side, TrialFunction) or comp is not None):
                 raise ValueError(
                     "jno.fem: an essential boundary/initial condition must be affine in the unknown — "
-                    f"write `u(region) - value`, not a nonlinear/scaled trial expression. Got: {trial_side!r}."
+                    f"write `u(region) - value` or `u(region)[i] - value`, not a nonlinear/scaled trial "
+                    f"expression. Got: {trial_side!r}."
                 )
-            return value_node
+            return comp, value_node
     if isinstance(bare, TrialFunction):
-        return 0.0
+        return None, 0.0
     raise ValueError(
         "jno.fem: could not read an essential condition from the residual. "
-        "Write it as `u(region) - value`, e.g. `u(xl, yl) - 0.0` or `u(xl, yl) - jno.fn(g, [xl, yl])`."
+        "Write it as `u(region) - value` (e.g. `u(xl, yl) - 0.0`) or `u(xl, yl)[i] - value`."
     )
 
 
@@ -225,11 +244,20 @@ def _coord_value_fn(value_node: Any) -> Callable:
     return value_fn
 
 
-def _dirichlet_value(bare: Any) -> Any:
-    """Constant or ``value(point)`` callable for an essential Dirichlet ``u - g``."""
-    node = _essential_value_node(bare)
+def _value_from_node(node: Any) -> Any:
+    """Constant or ``value(point)`` callable from an essential value node."""
     const = _constant_of(node)
     return const if const is not None else _coord_value_fn(node)
+
+
+def _dirichlet_spec(bare: Any) -> Tuple[Optional[int], Any]:
+    """``(component_index_or_None, value)`` for an essential Dirichlet residual.
+
+    ``component`` is ``None`` for an all-component clamp (``u(region) - g``) or an
+    integer for a per-component / roller BC (``u(region)[i] - g``).
+    """
+    comp, value_node = _essential_spec(bare)
+    return comp, _value_from_node(value_node)
 
 
 def _initial_state(bare: Any, domain: Any) -> Any:
@@ -238,7 +266,7 @@ def _initial_state(bare: Any, domain: Any) -> Any:
     ``u0`` is evaluated at the mesh nodes (concrete, since the mesh is built) via
     the existing evaluator — a single forward pass.
     """
-    node = _essential_value_node(bare)
+    _comp, node = _essential_spec(bare)
     n_nodes = int(jnp.asarray(domain.mesh.points).shape[0])
     const = _constant_of(node)
     if const is not None:
@@ -442,8 +470,24 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: str = "TRI3", v
                     "jno.fem: a residual with the trial but no test function must live on a boundary "
                     "region (Dirichlet) or the 'initial' region (IC). Got a volume region — did you forget the test function?"
                 )
-            dirichlet_values[region] = _dirichlet_value(_bare(c))
-            classification.append(f"dirichlet@{region}")
+            comp, value = _dirichlet_spec(_bare(c))
+            if comp is None:  # all components: u(region) - g
+                if isinstance(dirichlet_values.get(region), dict):
+                    raise ValueError(f"jno.fem: region {region!r} mixes all-component and per-component Dirichlet.")
+                dirichlet_values[region] = value
+                classification.append(f"dirichlet@{region}")
+            else:  # one component (roller/symmetry): u(region)[i] - g
+                if comp not in _COMPONENT_NAMES:
+                    raise ValueError(
+                        f"jno.fem: Dirichlet component index {comp} out of range (vector components are 0..2)."
+                    )
+                current = dirichlet_values.get(region)
+                if current is not None and not isinstance(current, dict):
+                    raise ValueError(f"jno.fem: region {region!r} mixes all-component and per-component Dirichlet.")
+                current = dict(current or {})
+                current[_COMPONENT_NAMES[comp]] = value
+                dirichlet_values[region] = current
+                classification.append(f"dirichlet@{region}[{_COMPONENT_NAMES[comp]}]")
         else:
             raise ValueError("jno.fem: a residual contains neither the trial nor the test function.")
 
