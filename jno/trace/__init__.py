@@ -2909,6 +2909,38 @@ class TrialFunction(Placeholder):
             n *= int(s)
         return n
 
+    def _field_view(self):
+        n = len(self.value_shape)
+        if n == 0:
+            return self.scalar
+        if n == 1:
+            return self.vector
+        return self.matrix
+
+    def partials(self, **named_vars):
+        """Bind named coordinate Variables for attribute-style derivatives.
+
+        ``u.bind(x=xi, y=yi).x`` -> ``du/dx`` (a ``Jacobian`` node identical to
+        ``u.d(xi)``); ``.xx`` / ``.xy`` give higher partials. Mirrors the PINN
+        field idiom ``net(x).scalar.bind(x=x)``.
+        """
+        return self._field_view().partials(**named_vars)
+
+    bind = partials
+
+    def __call__(self, *coords, **named):
+        """Evaluate this field symbol on the region carried by ``coords``.
+
+        Positional coordinates bind to ``x`` / ``y`` / ``z`` in order; extra
+        keyword bindings (e.g. ``t=...``) pass through. ``u(x, y)`` is sugar for
+        ``u.bind(x=x, y=y)`` so the same gesture works as in a PINN (``net(x)``).
+        """
+        binding = {axis: c for axis, c in zip(("x", "y", "z"), coords)}
+        binding.update(named)
+        if not binding:
+            raise TypeError(f"{type(self).__name__} must be called with coordinate variables, e.g. u(x, y).")
+        return self.partials(**binding)
+
     def __repr__(self):
         return f"TrialFunction({self.name}, value_shape={self.value_shape})"
 
@@ -2945,6 +2977,37 @@ class TestFunction(Placeholder):
         for s in self.value_shape:
             n *= int(s)
         return n
+
+    def _field_view(self):
+        n = len(self.value_shape)
+        if n == 0:
+            return self.scalar
+        if n == 1:
+            return self.vector
+        return self.matrix
+
+    def partials(self, **named_vars):
+        """Bind named coordinate Variables for attribute-style derivatives.
+
+        ``phi.bind(x=xi, y=yi).x`` -> ``dphi/dx`` (a ``Jacobian`` node identical
+        to ``phi.d(xi)``); ``.xx`` / ``.xy`` give higher partials.
+        """
+        return self._field_view().partials(**named_vars)
+
+    bind = partials
+
+    def __call__(self, *coords, **named):
+        """Evaluate this test-function symbol on the region carried by ``coords``.
+
+        Positional coordinates bind to ``x`` / ``y`` / ``z`` in order; extra
+        keyword bindings pass through. ``phi(x, y)`` is sugar for
+        ``phi.bind(x=x, y=y)``.
+        """
+        binding = {axis: c for axis, c in zip(("x", "y", "z"), coords)}
+        binding.update(named)
+        if not binding:
+            raise TypeError(f"{type(self).__name__} must be called with coordinate variables, e.g. phi(x, y).")
+        return self.partials(**binding)
 
     def __repr__(self):
         return f"TestFunction({self.name}, value_shape={self.value_shape})"
