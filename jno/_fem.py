@@ -98,6 +98,20 @@ def _discover_domain(constraints: List[Any]):
     )
 
 
+def _infer_vec(constraints: List[Any]) -> int:
+    """Infer the vector size from the trial's ``value_shape`` across the constraints.
+
+    Scalar → 1, ``value_shape=(2,)`` → 2, etc. (reuses ``_infer_trial_metadata``).
+    """
+    from .utils.solver.feax_utils import _infer_trial_metadata
+
+    for c in constraints:
+        meta = _infer_trial_metadata(_bare(c))
+        if meta.get("has_trial"):
+            return max(1, int(meta.get("vec", 1)))
+    return 1
+
+
 def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
     """Return ``(support, region_id)`` for a constraint.
 
@@ -350,7 +364,7 @@ class FEM:
 # ---------------------------------------------------------------------------
 # the driver
 # ---------------------------------------------------------------------------
-def fem(constraints: Any, *, quad_degree: int = 2, element_type: str = "TRI3", vec: int = 1) -> FEM:
+def fem(constraints: Any, *, quad_degree: int = 2, element_type: str = "TRI3", vec: Optional[int] = None) -> FEM:
     """Assemble a flat list of traced residuals into an :class:`FEM`.
 
     Parameters
@@ -358,8 +372,11 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: str = "TRI3", v
     constraints:
         A residual expression or list of them. Weak terms (containing the test
         function) and essential conditions (``u(region) - g``) are auto-classified.
-    quad_degree, element_type, vec:
+    quad_degree, element_type:
         FEM discretisation options (forwarded to the quadrature setup).
+    vec:
+        Vector size of the unknown. ``None`` (default) infers it from the trial's
+        ``value_shape`` (scalar → 1, ``(2,)`` → 2, …); pass an int to override.
     """
     from .utils.solver.fem_route import _assemble_fem_residual_from_ir, _assemble_fem_system_from_ir, neumann
     from .utils.solver.weak_form import (
@@ -377,6 +394,8 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: str = "TRI3", v
         raise ValueError("jno.fem: no constraints provided.")
 
     domain = _discover_domain(constraints)
+    if vec is None:
+        vec = _infer_vec(constraints)
 
     volume_terms: List[Any] = []
     boundary_terms: dict[str, List[Any]] = {}
