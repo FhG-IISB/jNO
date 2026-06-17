@@ -11,6 +11,7 @@ leaves the others free.
 
 from __future__ import annotations
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -135,6 +136,57 @@ def test_roller_mixed_components_across_boundaries():
     # freed components are not clamped: u_y on left and u_x on bottom are nonzero
     assert np.max(np.abs(sol[left, 1])) > 1e-3
     assert np.max(np.abs(sol[bottom, 0])) > 1e-3
+
+
+def test_vector_neumann_traction_inner_form_recovers_manufactured():
+    # Vector Neumann traction written the natural way: inner(t, phi(region)).
+    # Vector Laplacian, clamp u=(0,0) on the left, traction t=(1,0) on the right.
+    # Residual convention matches scalar Neumann (boundary term is -t·phi), so
+    # du_x/dn = 1 and the decoupled x-component solves to u_x = x while u_y stays
+    # 0. Linear field -> TRI3 exact. This is the form that previously misclassified
+    # as a volume term (inner stripped the bound view's region); it must now ride
+    # the surface path.
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
+    u, phi = d.fem_symbols(value_shape=(2,))
+    xi, yi, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    t = jnp.array([1.0, 0.0])
+    weak = jno.np.inner(jno.np.grad(u, [xi, yi]), jno.np.grad(phi, [xi, yi]), n_contract=2)
+    traction = -1.0 * jno.np.inner(t, phi.bind(x=xr, y=yr), n_contract=1)
+    fem = jno.fem([weak, u(xl, yl) - (0.0, 0.0), traction])
+
+    assert "surface@right" in fem.classification  # NOT silently classified as volume
+    b = np.asarray(fem.b).reshape(-1)
+    assert np.linalg.norm(b) > 0.0  # the traction contributes to the load vector
+
+    sol = np.linalg.solve(_dense(fem.A), b).reshape(-1, 2)
+    c = np.asarray(d.mesh.points)[:, :2]
+    exact = np.stack([c[:, 0], np.zeros_like(c[:, 1])], axis=-1)  # u = (x, 0)
+    assert np.linalg.norm(exact - sol) / np.linalg.norm(exact) < 1e-9
+
+
+def test_vector_traction_inner_and_component_forms_agree():
+    # The natural vector form inner(t, phi(region)) and the component form
+    # t_x * phi(region)[0] describe the same traction; both must classify onto the
+    # boundary (coords survive the reduction / the component index) and assemble to
+    # the same system. Fresh domain/vars per solve so the in-place quadrature
+    # retagging of one solve can't leak into the other.
+    def solve(make_traction):
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25)
+        u, phi = d.fem_symbols(value_shape=(2,))
+        xi, yi, _ = d.variable("interior", split=True)
+        xl, yl, _ = d.variable("left", split=True)
+        xr, yr, _ = d.variable("right", split=True)
+        weak = jno.np.inner(jno.np.grad(u, [xi, yi]), jno.np.grad(phi, [xi, yi]), n_contract=2)
+        fem = jno.fem([weak, u(xl, yl) - (0.0, 0.0), make_traction(phi, xr, yr)])
+        assert "surface@right" in fem.classification
+        return np.linalg.solve(_dense(fem.A), np.asarray(fem.b).reshape(-1))
+
+    t = jnp.array([1.0, 0.0])
+    sol_inner = solve(lambda phi, xr, yr: -1.0 * jno.np.inner(t, phi.bind(x=xr, y=yr), n_contract=1))
+    sol_comp = solve(lambda phi, xr, yr: -1.0 * phi.bind(x=xr, y=yr)[0])
+    assert np.linalg.norm(sol_inner - sol_comp) / np.linalg.norm(sol_comp) < 1e-12
 
 
 def test_vec3_field_assembles():

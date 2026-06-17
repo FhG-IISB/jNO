@@ -36,6 +36,45 @@ def _u(x):
     return x._expr if isinstance(x, _VIEW_TYPES) else x
 
 
+def _coord_vars_of(*operands) -> dict:
+    """Merge ``_coord_vars`` (name → Variable) from any view operands.
+
+    A reduction like ``inner``/``trace`` unwraps its operands with :func:`_u`,
+    which discards a bound view's coordinate registration. Re-collecting it here
+    lets a region binding survive the reduction, so a bound boundary term such as
+    ``inner(t, phi.bind(x=xr, y=yr))`` still exposes its region to the FEM driver.
+
+    A name mapping to two *different* Variables across operands is ambiguous and
+    is dropped (order-independent), mirroring the view ``_rewrap`` merge.
+    """
+    merged: dict = {}
+    conflicting: set = set()
+    for o in operands:
+        cv = getattr(o, "_coord_vars", None)
+        if not cv:
+            continue
+        for name, var in cv.items():
+            if name in merged and merged[name] is not var:
+                conflicting.add(name)
+            else:
+                merged[name] = var
+    for name in conflicting:
+        merged.pop(name, None)
+    return merged
+
+
+def _attach_coords(call, raw_operands):
+    """Attach merged operand ``_coord_vars`` to a freshly built ``FunctionCall``.
+
+    ``raw_operands`` are the *pre-unwrap* arguments (views), so their coordinate
+    bindings can be read before :func:`_u` strips them.
+    """
+    cv = _coord_vars_of(*raw_operands)
+    if cv:
+        call._coord_vars = cv
+    return call
+
+
 def _guard(target, scheme: str = "automatic_differentiation") -> None:
     """Functional-API mirror of ``Placeholder``'s method-level guard: block an
     automatic-differentiation differential operator over a FieldView
@@ -138,7 +177,7 @@ def _unary(jnp_fn):
     """Create a unary wrapper for Placeholder args (auto-unwraps typed views)."""
 
     def wrapper(x):
-        return FunctionCall(jnp_fn, [_u(x)])
+        return _attach_coords(FunctionCall(jnp_fn, [_u(x)]), [x])
 
     wrapper.__name__ = jnp_fn.__name__
     wrapper.__doc__ = jnp_fn.__doc__
@@ -149,7 +188,7 @@ def _binary(jnp_fn):
     """Create a binary wrapper for Placeholder args (auto-unwraps typed views)."""
 
     def wrapper(x, y):
-        return FunctionCall(jnp_fn, [_u(x), _u(y)])
+        return _attach_coords(FunctionCall(jnp_fn, [_u(x), _u(y)]), [x, y])
 
     wrapper.__name__ = jnp_fn.__name__
     wrapper.__doc__ = jnp_fn.__doc__
@@ -368,10 +407,13 @@ def trace(x) -> FunctionCall:
     trace(A)              -> scalar trace for (..., n, n)
     trace(symgrad(u))     -> volumetric strain
     """
-    return FunctionCall(
-        lambda a: jnp.trace(a, axis1=-2, axis2=-1),
-        [_u(x)],
-        name="trace",
+    return _attach_coords(
+        FunctionCall(
+            lambda a: jnp.trace(a, axis1=-2, axis2=-1),
+            [_u(x)],
+            name="trace",
+        ),
+        [x],
     )
 
 
@@ -381,10 +423,13 @@ def sym(x) -> FunctionCall:
 
     sym(A) = 0.5 * (A + A^T)
     """
-    return FunctionCall(
-        lambda a: 0.5 * (a + jnp.swapaxes(a, -1, -2)),
-        [_u(x)],
-        name="sym",
+    return _attach_coords(
+        FunctionCall(
+            lambda a: 0.5 * (a + jnp.swapaxes(a, -1, -2)),
+            [_u(x)],
+            name="sym",
+        ),
+        [x],
     )
 
 
@@ -394,10 +439,13 @@ def antisym(x) -> FunctionCall:
 
     antisym(A) = 0.5 * (A - A^T)
     """
-    return FunctionCall(
-        lambda a: 0.5 * (a - jnp.swapaxes(a, -1, -2)),
-        [_u(x)],
-        name="antisym",
+    return _attach_coords(
+        FunctionCall(
+            lambda a: 0.5 * (a - jnp.swapaxes(a, -1, -2)),
+            [_u(x)],
+            name="antisym",
+        ),
+        [x],
     )
 
 
@@ -559,7 +607,7 @@ def inner(x, y, n_contract: int = 1, keepdims: bool = False) -> FunctionCall:
         axes = tuple(range(-_n, 0))
         return jnp.sum(a * b, axis=axes, keepdims=_keep)
 
-    return FunctionCall(_fn, [_u(x), _u(y)], name="inner", reduces_axis=-1)
+    return _attach_coords(FunctionCall(_fn, [_u(x), _u(y)], name="inner", reduces_axis=-1), [x, y])
 
 
 def double_dot(x, y) -> FunctionCall:
@@ -574,10 +622,13 @@ def double_dot(x, y) -> FunctionCall:
 
 def einsum(subscripts: str, *operands) -> FunctionCall:
     """Traced jnp.einsum wrapper for compact tensor/vector contractions."""
-    return FunctionCall(
-        lambda *args, _subs=subscripts: jnp.einsum(_subs, *args),
-        [_u(o) for o in operands],
-        name="einsum",
+    return _attach_coords(
+        FunctionCall(
+            lambda *args, _subs=subscripts: jnp.einsum(_subs, *args),
+            [_u(o) for o in operands],
+            name="einsum",
+        ),
+        list(operands),
     )
 
 

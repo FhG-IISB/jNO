@@ -72,12 +72,19 @@ def _spatial_coord_vars(constraint: Any) -> List[Variable]:
     exposes its region.
     """
     out: dict[int, Variable] = {}
-    cv = getattr(constraint, "_coord_vars", None)
-    if cv:
-        for v in cv.values():
-            if isinstance(v, Variable) and getattr(v, "axis", None) != "temporal":
-                out[id(v)] = v
+
+    def _add_coords(cv):
+        # `_coord_vars` ({name: Variable}) is carried by bound views and, after a
+        # `jno.np` reduction, by the resulting FunctionCall — so a bound boundary
+        # term keeps its region even through `inner(...)` / arithmetic wrapping.
+        if cv:
+            for v in cv.values():
+                if isinstance(v, Variable) and getattr(v, "axis", None) != "temporal":
+                    out[id(v)] = v
+
+    _add_coords(getattr(constraint, "_coord_vars", None))
     for n in _walk(_bare(constraint)):
+        _add_coords(getattr(n, "_coord_vars", None))
         if isinstance(n, Variable) and getattr(n, "axis", None) != "temporal":
             out[id(n)] = n
     return list(out.values())
