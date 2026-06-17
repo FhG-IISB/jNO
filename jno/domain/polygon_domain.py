@@ -1867,6 +1867,13 @@ class PolygonDomain(domain):
         self.avaiable_mesh_tags = []
         self._apply_mesh(mesh)
 
+        # Time-dependent PolygonDomains must follow jNO's (B, T, ..., C) pool
+        # convention: broadcast the freshly-extracted spatial pools over time and
+        # register the "initial" (t=t0) slice — reusing the same path the
+        # mesh-backed domain uses in __init__, rather than a parallel mechanism.
+        if self._is_time_dependent and self.time is not None:
+            self._add_time_dimension(self.time[0], self.time[1], int(self.time[2]))
+
         if self._verbose:
             n_pts = int(np.asarray(mesh.points).shape[0])
             self.log.info(

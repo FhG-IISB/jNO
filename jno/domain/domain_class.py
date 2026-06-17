@@ -2025,16 +2025,27 @@ class domain(MeshIOMixin):
         self._n_time = n_time
         new_mesh_pool = {}
         for tag, points in self._mesh_pool.items():
-            # points has shape (N, D_spatial)
+            # The "initial" tag is always (re)derived from "interior" below, so
+            # skip any pre-existing one (idempotent across re-meshing).
+            if tag == "initial":
+                continue
 
+            pts = np.asarray(points)
+            # Already time-broadcast (e.g. a second build_mesh on the same
+            # time-dependent domain) — keep the (T, N, D) pool as is.
+            if pts.ndim >= 3:
+                new_mesh_pool[tag] = pts
+                continue
+
+            # points has shape (N, D_spatial)
             if tag == "interior":
                 # Initial tag: spatial points at t=0 → (1, N, D_spatial)
-                new_mesh_pool["initial"] = points[np.newaxis, :, :]  # T=1
+                new_mesh_pool["initial"] = pts[np.newaxis, :, :]  # T=1
 
             # Tile spatial points across T time steps → (T, N, D_spatial)
             new_mesh_pool[tag] = np.broadcast_to(
-                points[np.newaxis, :, :],  # (1, N, D_spatial)
-                (n_time, *points.shape),  # (T, N, D_spatial)
+                pts[np.newaxis, :, :],  # (1, N, D_spatial)
+                (n_time, *pts.shape),  # (T, N, D_spatial)
             ).copy()  # copy so it's contiguous
 
         self._mesh_pool = new_mesh_pool
