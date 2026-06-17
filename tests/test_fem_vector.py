@@ -81,3 +81,18 @@ def test_full_elasticity_assembles_symmetric():
 #   - `.component(i)` hides the component index inside a `getitem` closure.
 # Both are view-layer fixes (preserve `_coord_vars` + expose the component index),
 # independent of the kernel/assembly, which handle vector fields correctly.
+
+
+def test_vec3_field_assembles():
+    # 3-component vector unknown: vec inferred as 3, dofs == 3 * n_nodes.
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3)
+    u, phi = d.fem_symbols(value_shape=(3,))
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    weak = jno.np.inner(jno.np.grad(u, [xi, yi]), jno.np.grad(phi, [xi, yi]), n_contract=2)
+    fem = jno.fem([weak, u(xb, yb) - 0.0])
+    A = _dense(fem.A)
+    n_nodes = int(np.asarray(d.mesh.points).shape[0])
+    assert fem.dofs == 3 * n_nodes
+    assert A.shape[0] == A.shape[1] == 3 * n_nodes
+    assert np.allclose(A, A.T, atol=1e-7)

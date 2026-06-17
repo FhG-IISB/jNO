@@ -165,3 +165,20 @@ def test_non_affine_dirichlet_raises():
     xb, yb, _ = d.variable("boundary", split=True)
     with pytest.raises(ValueError):
         jno.fem([weak, u(xb, yb) ** 2 - 1.0])  # nonlinear in u -> not an essential BC
+
+
+def test_transient_nonlinear_assembles_to_residual_block():
+    # Transient Allen-Cahn-style reaction: u_t*phi + grad.grad + (u^3 - u)*phi.
+    # Must classify as a *nonlinear* transient block carrying mass/residual/jacobian.
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2, time=(0.0, 0.1, 6))
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi0, yi0, _ = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    fem = jno.fem([ui.t * vi + (ui.x * vi.x + ui.y * vi.y) + (u * u * u - u) * vi, u(xb, yb) - 0.0, u(xi0, yi0) - 0.0])
+    assert fem.is_transient and not fem.is_linear
+    block = fem.operator
+    assert block.residual is not None and block.jacobian is not None and block.mass is not None
+    R0 = np.asarray(block.residual(np.asarray(fem.state0), float(fem.t0), None))
+    assert R0.shape == (fem.dofs,)
