@@ -655,7 +655,10 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
         _op_u0 = jnp.zeros((int(op_rt["size"]),), dtype=_op_dt)
 
         def operator_fn(args=None, _rt=op_rt, _tags=_op_tags, _dt=_op_dt, _u0=_op_u0):
-            values = {name: _runtime_scalar_arg(args, name, dtype=_dt) for name in _tags}
+            # Keep the raw shape: a scalar parameter stays 0-d; a field parameter
+            # (a nodal array) is threaded whole and gathered/interpolated per cell.
+            _a = args or {}
+            values = {name: jnp.asarray(_a[name], dtype=_dt) for name in _tags}
             iv = _make_internal_vars(
                 fe,
                 (),

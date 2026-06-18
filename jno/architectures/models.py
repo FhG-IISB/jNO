@@ -80,6 +80,26 @@ def parameter(shape: tuple, *, key: jax.Array | None = None, name: str = "value"
         >>> K = parameter((3, 3), key=key)
     """
 
+    # Field parameter: pass a FEM symbol (``u``/``phi`` from ``fem_symbols()``)
+    # instead of a shape tuple to get a **P1 nodal coefficient field** sized to that
+    # symbol's FE space (one trainable value per mesh node). The symbol carries its
+    # owning domain (see ``variational_symbols``), so the size is known up front.
+    fem_field = None
+    fem_field_key = None
+    if hasattr(shape, "field_key") and getattr(shape, "_domain", None) is not None:
+        sym = shape
+        if int(getattr(sym, "order", 1)) != 1:
+            raise NotImplementedError(
+                "jno.np.parameter(<symbol>): nodal field parameters support P1 (order=1) "
+                "symbols only for now (higher-order spaces add nodes during init_fem)."
+            )
+        mesh = getattr(sym._domain, "built_mesh", None)
+        if mesh is None:
+            raise ValueError("jno.np.parameter(<symbol>): the symbol's domain has no mesh yet.")
+        shape = (int(mesh.points.shape[0]),)
+        fem_field = "node"
+        fem_field_key = getattr(sym, "field_key", None)
+
     class _Parameter(eqx.Module):
         value: jnp.ndarray
 
@@ -91,6 +111,10 @@ def parameter(shape: tuple, *, key: jax.Array | None = None, name: str = "value"
     # physical coefficients from ordinary neural-network ModelCall nodes.
     model._is_parameter = True
     model._parameter_name = str(name)
+    # A nodal field coefficient is re-assembled (parameter inside the integrand,
+    # interpolated to quad points), not factored into a constant basis.
+    model._fem_field = fem_field
+    model._fem_field_key = fem_field_key
 
     model._initializer_key = _resolve_key(key)
     # Mark this Model so .posterior_samples unwraps the single-leaf wrapper

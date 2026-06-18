@@ -614,8 +614,17 @@ def _runtime_parameter_value_from_internal_vars(local, name):
     if idx >= len(volume_vars):
         return None
     arr = jnp.asarray(volume_vars[idx])
-    # Broadcast the per-cell scalar to the quadrature-point axis, like time.
-    return jnp.reshape(arr, (-1,))[0]
+    flat = jnp.reshape(arr, (-1,))
+    # Scalar coefficient (incl. per-cell-constant): one value -> broadcast to quad.
+    if flat.shape[0] == 1:
+        return flat[0]
+    # Node-based field coefficient: feax has gathered the cell's local nodal values
+    # (size = nodes-per-element); interpolate to quadrature points with the field's
+    # shape functions, mirroring the solution interpolation (cf. feax interpolate_var:
+    # shape_vals . nodal). Returns (n_quad, 1) like a field value.
+    shape_vals = local.get("shape_vals")  # (n_quad, n_local)
+    cell_nodal = flat.reshape(flat.shape[0], 1)  # (n_local, 1)
+    return jnp.sum(shape_vals[:, :, None] * cell_nodal[None, :, :], axis=1)
 
 
 def _temporal_value_from_internal_vars(local, tag, dim_start=0, dim_end=1):
@@ -1784,8 +1793,15 @@ def _make_internal_vars(
     # Parameter values, in runtime_parameter_tags order, broadcast per cell.
     rpv = runtime_parameter_values or {}
     for name in runtime_parameter_tags:
-        p = jnp.asarray(rpv[name], dtype=dtype).reshape(())
-        vol.append(jnp.full((int(n_cells), 1), p, dtype=p.dtype))
+        p = jnp.asarray(rpv[name], dtype=dtype)
+        flat = p.reshape(-1)
+        if flat.shape[0] == 1:
+            # scalar parameter -> same value in every cell (broadcast to quad in-kernel)
+            vol.append(jnp.full((int(n_cells), 1), flat[0], dtype=p.dtype))
+        else:
+            # field parameter (node- or cell-based) -> pass the global array through;
+            # feax's gather_internal_vars slices it per cell, the kernel interpolates.
+            vol.append(flat)
     for v in extra_volume_vars:
         arr = jnp.asarray(v, dtype=dtype)
         if arr.ndim == 0:

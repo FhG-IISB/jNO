@@ -189,3 +189,67 @@ def test_global_solve_runs_once_per_step_not_per_node():
         f"solve ran {calls[0]}x for {steps} steps on a {n_nodes}-node mesh "
         "-- the global solve appears to be vmapped per node"
     )
+
+
+def test_nodal_field_parameter_recovers_via_crux():
+    """jno.np.parameter(phi) -> a P1 nodal coefficient field k(x): trainable nodal
+    values, interpolated to quad points during a re-assembled solve. Recover a smooth
+    k(x) end-to-end through crux.solve."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = 2.0 * (xi * (1.0 - xi) + yi * (1.0 - yi))
+
+    k = jno.np.parameter(phi, name="k")  # nodal field on the trial's FE space
+    assert getattr(k.model, "_fem_field", None) == "node"
+    fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    assert fem.is_linear
+    assert fem.operator.metadata.get("nonaffine_operator") is True
+    assert list(fem.operator.runtime_parameter_exprs) == ["k"]
+
+    nodes = np.asarray(d.built_mesh.points)[:, :2]
+    k_true = jnp.asarray(0.6 + 0.8 * nodes[:, 0] + 0.5 * nodes[:, 1])  # smooth, positive
+
+    # Correctness: a *linear* nodal field must assemble the same operator as the same
+    # coordinate-function coefficient (P1 interpolation of a linear field is exact) --
+    # this catches any gather/node-order error.
+    fem_ref = jno.fem(
+        [(0.6 + 0.8 * xi + 0.5 * yi) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0],
+        quad_degree=3,
+    )
+    A_field, _ = fem.operator.evaluate({"k": k_true})
+    A_ref = np.asarray(fem_ref.A.todense() if hasattr(fem_ref.A, "todense") else fem_ref.A)
+    assert np.max(np.abs(np.asarray(A_field) - A_ref)) < 1e-9, "nodal interpolation/gather mismatch"
+
+    A_t, b = fem.operator.evaluate({"k": k_true})
+    u_obs = jnp.linalg.solve(jnp.asarray(A_t), jnp.asarray(b).reshape(-1))
+
+    # Recovery by differentiating the re-assembled solve w.r.t. the nodal field.
+    # (Well-posed enough here from full-field data; field inversion in general needs
+    # regularization -- jno.fn.regularize.smooth -- which composes as an extra term.)
+    def loss(kn):
+        A, bb = fem.operator.evaluate({"k": kn})
+        uu = jnp.linalg.solve(jnp.asarray(A), jnp.asarray(bb).reshape(-1))
+        return jnp.mean((uu - u_obs) ** 2)
+
+    vg = jax.jit(jax.value_and_grad(loss))
+    kn = jnp.ones_like(k_true)
+    opt = optax.adam(2e-2)
+    st = opt.init(kn)
+    for _ in range(400):
+        _, g = vg(kn)
+        upd, st = opt.update(g, st)
+        kn = optax.apply_updates(kn, upd)
+    rel = float(jnp.linalg.norm(kn - k_true) / jnp.linalg.norm(k_true))
+    assert rel < 0.1, f"nodal field recovery rel-err {rel:.3e}"
+
+    # crux integration: the (n_nodes,) field trains through crux.solve via fem.solve().
+    k.dtype(jnp.float64)
+    k.initialize(jax.nn.initializers.constant(1.0))
+    k.optimizer(optax.adam(2e-2))
+    crux = jno.core([(fem.solve() - u_obs).mse], domain=_DUMMY)
+    crux.solve(50)
+    rec = np.asarray(crux.eval([k])[0]).reshape(-1)
+    assert not np.allclose(rec, 1.0), "field parameter did not train through crux.solve"
