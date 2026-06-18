@@ -2770,6 +2770,40 @@ class FemLinearSystem:
         b = self.b if self.rhs_fn is None else self.rhs_fn(args)
         return A, b
 
+    def solve(self, solve_fn=None):
+        """Differentiable forward solve ``u = solve_fn(A(θ), b(θ))`` as a trace node.
+
+        Returns a :class:`FunctionCall` field. When it is evaluated (e.g. inside
+        ``crux.solve``), any runtime parameters ``θ`` are resolved to their current
+        values, :meth:`evaluate` forms ``A(θ), b(θ)``, and ``solve_fn`` solves them.
+        Gradients flow back to the parameters through ``solve_fn`` — so an inverse
+        problem is just ``crux([(fem.solve() - u_obs).mse], domain=...)`` where
+        ``fem = jno.fem([...])`` (see ``docs/inverse-problems.md``).
+
+        ``solve_fn`` is **your** solver: any ``(A, b) -> u`` callable. jNO writes no
+        solver code and imposes no library — the default is
+        :func:`jax.numpy.linalg.solve` (dense); pass e.g.
+        ``lambda A, b: lineax.linear_solve(lineax.MatrixLinearOperator(A), b).value`` to
+        choose another. Use a differentiable solver so ``∂u/∂θ`` exists.
+
+        Note: the FEM solve is global (one ``A``, ``b``, ``u``); enable x64
+        (``jax_enable_x64``) and set the parameter dtype to match — the feax
+        assembly is float64.
+        """
+        if solve_fn is None:
+
+            def solve_fn(A, b):
+                return jnp.linalg.solve(A, b)
+
+        names = list(self.runtime_parameter_exprs)
+        params = [self.runtime_parameter_exprs[n] for n in names]
+
+        def _solve(*values):
+            A, b = self.evaluate(dict(zip(names, values)))
+            return solve_fn(jnp.asarray(A), jnp.asarray(b).reshape(-1))
+
+        return FunctionCall(_solve, params, name="fem_solve")
+
     def __iter__(self):
         if self.is_parametric:
             raise TypeError(
@@ -2843,6 +2877,54 @@ class FemResidualOperator:
             self.jacobian(u, args),
             -self.residual(u, args),
         )
+
+    def solve(self, solve_fn=None, *, u0=None):
+        """Differentiable nonlinear forward solve of ``R(u, θ) = 0`` as a trace node.
+
+        Returns a :class:`FunctionCall` field. When evaluated (e.g. inside
+        ``crux.solve``), runtime parameters ``θ`` are resolved to their current
+        values, ``residual_fn(u) = R(u, θ)`` is built, and ``solve_fn`` solves it.
+        Gradients reach the parameters when ``solve_fn`` is implicit-diff aware, so
+        an inverse problem is ``crux([(fem.solve() - u_obs).mse], domain=...)`` where
+        ``fem = jno.fem([...])``.
+
+        ``solve_fn`` is **your** solver: any ``(residual_fn, u0) -> u`` callable. The
+        default is a Newton ``optimistix.root_find`` (implicit differentiation, so
+        ``∂u/∂θ`` is exact without unrolling Newton); pass your own to choose a
+        different optimistix solver or library. jNO's analytic Jacobian
+        (:attr:`jacobian`) is available as an optional speed-up — by default the
+        solver auto-differentiates the residual.
+
+        ``u0`` is the initial guess (default: zeros of the operator size; enable
+        x64 — the feax residual is float64).
+        """
+        if u0 is None:
+            if self.size is None:
+                raise ValueError("FemResidualOperator.solve: pass u0= (operator size is unknown).")
+            u0 = jnp.zeros((int(self.size),), dtype=jnp.result_type(float))
+
+        if solve_fn is None:
+
+            def solve_fn(residual_fn, y0):
+                import optimistix as optx
+
+                sol = optx.root_find(
+                    lambda u, _a: residual_fn(u),
+                    optx.Newton(rtol=1e-8, atol=1e-8),
+                    y0,
+                    args=None,
+                    max_steps=100,
+                )
+                return sol.value
+
+        names = list(self.runtime_parameter_exprs)
+        params = [self.runtime_parameter_exprs[n] for n in names]
+
+        def _solve(*values):
+            args = dict(zip(names, values))
+            return solve_fn(lambda u: self.residual(u, args), u0)
+
+        return FunctionCall(_solve, params, name="fem_solve")
 
     def __repr__(self):
         return (
