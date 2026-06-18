@@ -124,23 +124,41 @@ def test_coupled_neumann_not_yet_supported():
         )
 
 
-def test_coupled_nonlinear_not_yet_supported():
-    # Nonlinear coupled is guarded (not silently routed through the linear path).
-    # This also confirms the nonlinearity detector fires for a coupled field: if it
-    # misfired (returned False), jno.fem would NOT raise and this test would fail.
-    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3)
+def test_coupled_nonlinear_newton_recovers_manufactured():
+    # Nonlinear coupled: -lap u + u*p = f1 ; -lap p + u^3 = f2 ; u=p=0 on boundary.
+    # Manufactured u*=g, p*=2g (g=x(1-x)y(1-y)). feax autodiffs the block residual/
+    # Jacobian on the multi-field problem, so a scipy Newton solve recovers both.
+    spo = pytest.importorskip("scipy.optimize")
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.08)
+    n = int(np.asarray(d.mesh.points).shape[0])
     u, v = d.fem_symbols(names=("u", "v"))
     p, q = d.fem_symbols(names=("p", "q"))
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
     ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
     pi, qi = p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
-    with pytest.raises(NotImplementedError):
-        jno.fem(
-            [
-                ui.x * vi.x + ui.y * vi.y + (u * u * u) * vi + p * vi,  # nonlinear u^3, coupled to p
-                pi.x * qi.x + pi.y * qi.y + u * qi,
-                u(xb, yb) - 0.0,
-                p(xb, yb) - 0.0,
-            ]
-        )
+    g = xi * (1 - xi) * yi * (1 - yi)
+    lg = 2 * (xi * (1 - xi) + yi * (1 - yi))
+    f1 = lg + g * (2 * g)  # -lap(u*) + u* p*
+    f2 = 2 * lg + g**3  # -lap(p*) + u*^3
+    fem = jno.fem(
+        [
+            ui.x * vi.x + ui.y * vi.y + (u * p) * vi - f1 * vi,  # nonlinear u*p coupling
+            pi.x * qi.x + pi.y * qi.y + (u * u * u) * qi - f2 * qi,  # nonlinear u^3
+            u(xb, yb) - 0.0,
+            p(xb, yb) - 0.0,
+        ]
+    )
+    assert not fem.is_linear
+    assert fem.dofs == 2 * n
+    sol = spo.root(
+        lambda w: np.asarray(fem.residual(w)),
+        np.zeros(fem.dofs),
+        jac=lambda w: _dense(fem.jacobian(w)),
+        method="hybr",
+    )
+    assert sol.success
+    c = np.asarray(d.mesh.points)[:, :2]
+    gg = c[:, 0] * (1 - c[:, 0]) * c[:, 1] * (1 - c[:, 1])
+    assert np.linalg.norm(sol.x[:n] - gg) / np.linalg.norm(gg) < 1e-2
+    assert np.linalg.norm(sol.x[n:] - 2 * gg) / np.linalg.norm(2 * gg) < 1e-2

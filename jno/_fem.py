@@ -668,7 +668,7 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
     multi-field branch of ``_build_feax_problem`` (multi-variable feax Problem +
     per-field kernel) and lets feax autodiff the block matrix."""
     from .utils.solver.feax_utils import _infer_fields
-    from .utils.solver.fem_route import _assemble_fem_system_from_ir
+    from .utils.solver.fem_route import _assemble_fem_residual_from_ir, _assemble_fem_system_from_ir
     from .utils.solver.weak_form import (
         LoweredChannelTerm,
         LoweredWeakForm,
@@ -726,13 +726,11 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
             region_values[region] = current
     domain._fem_dirichlet_by_field = by_field
 
-    # Nonlinear coupled is guarded, not silently routed: the single-field nonlinearity
-    # detector isn't validated for coupled fields, and a misfire would assemble a
-    # nonlinear problem through the linear path (Jacobian frozen at u=0) with no error.
+    # Nonlinear coupled: feax autodiffs the block residual/Jacobian on the multi-field
+    # problem (same _build_feax_problem path as linear), so the nonlinear route works
+    # for coupled fields too.
     if any(_is_obviously_nonlinear_in_unknown(domain, b) for b in volume_terms):
-        raise NotImplementedError(
-            "jno.fem: nonlinear coupled (multi-field) problems are not supported yet "
-            "(the coupled path is verified for linear systems, including Taylor-Hood Stokes)."
-        )
+        op = _assemble_fem_residual_from_ir(domain, ir)
+        return FEM(domain=domain, op=op, classification=classification, mode="nonlinear")
     op = _assemble_fem_system_from_ir(domain, ir)
     return FEM(domain=domain, op=op, classification=classification, mode="linear")
