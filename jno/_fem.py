@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, List, Optional, Tuple
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -336,9 +337,8 @@ def _value_from_node(node: Any) -> Any:
 def _is_complex_form(domain: Any, ir: Any) -> bool:
     """True if any lowered term's expression contains a complex constant — the signal to route a
     (steady, linear) weak form through the real-equivalent complex solver instead of feax's real
-    assembly. We walk the tree for a complex-valued literal (a user-written ``jno.np.i`` / ``1j``)
-    rather than evaluating, because the lowered coeff embeds the (non-evaluable) trial/test
-    channel."""
+    assembly. We walk the tree for a complex-valued literal (a user-written ``1j``) rather than
+    evaluating, because the lowered coeff embeds the (non-evaluable) trial/test channel."""
     del domain
     for term in ir.terms:
         for node in _walk(term.coeff):
@@ -381,6 +381,51 @@ def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None) -> Any:
     solve_fn = solve_fn or (lambda A, b: jnp.linalg.solve(A, b))
     sol = jnp.asarray(solve_fn(block, rhs))
     return sol[:n] + 1j * sol[n:]
+
+
+def _solve_complex_transient(blocks: Any, save_ts: Any = None) -> Any:
+    """Integrate a complex *transient* system via the real-equivalent block (feax untouched):
+    ``(M_r + i M_i) u_dot + (A_r + i A_i) u = (c_r + i c_i)`` becomes the real ``2N`` system
+    ``M_blk u_dot + A_blk u = c_blk`` with ``M_blk=[[M_r,-M_i],[M_i,M_r]]`` (likewise A, c) and
+    ``u=[u_r;u_i]``. Backward Euler over the block, then recombine to ``u_r + i u_i``. ``blocks =
+    (block_r, block_i)`` are the Re-coeff and Im-coeff real ``FeaxTimeBlock``s. This covers
+    Schrodinger (``i u_t = H u`` -> M_r = 0) since the *block* mass stays non-singular."""
+
+    def _dn(a):
+        return jnp.asarray(a.todense()) if hasattr(a, "todense") else jnp.asarray(a)
+
+    def _MAc(b):
+        M = _dn(b.M)
+        A = _dn(b.operator_fn(0.0, {}) if b.operator_fn is not None else b.A)
+        c = jnp.zeros((M.shape[0],), M.dtype) if b.affine_bias is None else jnp.asarray(b.affine_bias).reshape(-1)
+        return M, A, c
+
+    br, bi = blocks
+    Mr, Ar, cr = _MAc(br)
+    Mi, Ai, ci = _MAc(bi)
+    n = Mr.shape[0]
+    M_blk = jnp.block([[Mr, -Mi], [Mi, Mr]])
+    A_blk = jnp.block([[Ar, -Ai], [Ai, Ar]])
+    c_blk = jnp.concatenate([cr, ci])
+    w0 = jnp.concatenate([jnp.asarray(br.state0).reshape(-1), jnp.asarray(bi.state0).reshape(-1)])
+    t0, t1, dt = float(br.t0), float(br.t1), float(br.dt)
+    grid = jnp.linspace(t0, t1, max(1, round((t1 - t0) / dt)) + 1)
+    fr, fi = br.forcing_vector_fn, bi.forcing_vector_fn
+
+    def step(w, t_next):  # backward Euler: (M_blk + dt A_blk) w_next = M_blk w + dt (c_blk + f)
+        rhs = M_blk @ w + dt * c_blk
+        if fr is not None or fi is not None:
+            f_r = jnp.asarray(fr(t_next, {})).reshape(-1) if fr is not None else jnp.zeros((n,), c_blk.dtype)
+            f_i = jnp.asarray(fi(t_next, {})).reshape(-1) if fi is not None else jnp.zeros((n,), c_blk.dtype)
+            rhs = rhs + dt * jnp.concatenate([f_r, f_i])
+        w_next = jnp.linalg.solve(M_blk + dt * A_blk, rhs)
+        return w_next, w_next
+
+    _, ws = jax.lax.scan(step, w0, grid[1:])
+    traj = jnp.concatenate([w0[None, :], ws], axis=0)  # (n_grid, 2N)
+    save_ts = grid if save_ts is None else jnp.asarray(save_ts)
+    traj = jax.vmap(lambda col: jnp.interp(save_ts, grid, col), in_axes=1, out_axes=1)(traj)
+    return traj[:, :n] + 1j * traj[:, n:]  # (n_save, N) complex
 
 
 def _is_temporal_value_node(node: Any) -> bool:
@@ -511,7 +556,7 @@ class FEM:
 
     @property
     def is_transient(self) -> bool:
-        return self._mode == "transient"
+        return self._mode in ("transient", "complex_transient")
 
     @property
     def is_linear(self) -> bool:
@@ -521,7 +566,9 @@ class FEM:
 
     @property
     def is_complex(self) -> bool:
-        """A complex-valued steady linear problem, solved via the real-equivalent block."""
+        """A complex-valued problem (steady or transient), solved via the real-equivalent block."""
+        if self._mode == "complex_transient":
+            return True
         return self._mode == "complex"
 
     @property
@@ -565,6 +612,8 @@ class FEM:
         """
         if self._mode == "complex":
             return _solve_complex_block(self._op, solve_fn)
+        if self._mode == "complex_transient":
+            return _solve_complex_transient(self._op, save_ts=kwargs.get("save_ts"))
         return self._op.solve(solve_fn, **kwargs)
 
     @property
@@ -623,17 +672,22 @@ class FEM:
             raise AttributeError("FEM is steady; .state0 is only for a transient problem.")
         return self._op.state0
 
+    def _time_block(self):
+        """The (real) FeaxTimeBlock carrying the integration window — for complex_transient it is
+        the Re-coeff block of the (block_r, block_i) pair."""
+        return self._op[0] if self._mode == "complex_transient" else self._op
+
     @property
     def t0(self):
-        return self._op.t0 if self._mode == "transient" else None
+        return self._time_block().t0 if self.is_transient else None
 
     @property
     def t1(self):
-        return self._op.t1 if self._mode == "transient" else None
+        return self._time_block().t1 if self.is_transient else None
 
     @property
     def dt(self):
-        return self._op.dt if self._mode == "transient" else None
+        return self._time_block().dt if self.is_transient else None
 
     @property
     def dofs(self) -> Optional[int]:
@@ -643,11 +697,12 @@ class FEM:
             size = getattr(self._op, "size", None)
             if size is not None:
                 return int(size)
-        if self._mode == "transient":
-            if getattr(self._op, "state0", None) is not None:
-                return int(jnp.asarray(self._op.state0).reshape(-1).shape[0])
-            if getattr(self._op, "M", None) is not None:
-                return int(jnp.asarray(self._op.M).shape[0])
+        if self.is_transient:
+            tb = self._time_block()
+            if getattr(tb, "state0", None) is not None:
+                return int(jnp.asarray(tb.state0).reshape(-1).shape[0])
+            if getattr(tb, "M", None) is not None:
+                return int(jnp.asarray(tb.M).shape[0])
         prob = self.problem
         return int(prob.num_total_dofs_all_vars) if prob is not None else None
 
@@ -843,6 +898,16 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         n_nodes = int(jnp.asarray(domain.mesh.points).shape[0])
         state0 = _initial_state(ic_residuals[0], domain) if ic_residuals else jnp.zeros((n_nodes,))
         # The integration window (t0, t1, dt) is read from jno.domain(time=...).
+        # ---- complex transient (e.g. Schrodinger): real-equivalent split of M, A, and the IC ----
+        if _is_complex_form(domain, ir):
+            from .utils.solver.parametric_helpers import _clone_term_with_coeff
+
+            s0 = jnp.asarray(state0)
+            real_ir = LoweredWeakForm(domain=domain, terms=[_clone_term_with_coeff(t, t.coeff.real) for t in ir.terms])
+            imag_ir = LoweredWeakForm(domain=domain, terms=[_clone_term_with_coeff(t, t.coeff.imag) for t in ir.terms])
+            block_r = _assemble_feax_time_from_ir(domain, real_ir, state0=jnp.real(s0))
+            block_i = _assemble_feax_time_from_ir(domain, imag_ir, state0=jnp.imag(s0))
+            return FEM(domain=domain, op=(block_r, block_i), classification=classification, mode="complex_transient")
         block = _assemble_feax_time_from_ir(domain, ir, state0=state0)
         return FEM(domain=domain, op=block, classification=classification, mode="transient")
 

@@ -640,7 +640,10 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
 
         name = _function_name(expr)
 
-        # Structural / linear-ish wrappers that should not force nonlinear classification
+        # Structural / linear-ish wrappers that should not force nonlinear classification.
+        # real/imag are R-linear operators: Re(c.u.v) stays linear in u, so the real-equivalent
+        # split of a complex *linear* weak form (jno.fem complex / complex_transient) must not be
+        # misread as nonlinear just because the unknown sits inside a real()/imag() wrapper.
         linearish = {
             "inner",
             "reshape",
@@ -651,6 +654,8 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
             "symgrad",
             "trace",
             "einsum",
+            "real",
+            "imag",
         }
 
         # Jacobian/Hessian are handled through their own nodes

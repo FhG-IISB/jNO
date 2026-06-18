@@ -92,10 +92,6 @@ pi = jnp.pi
 e = jnp.e
 inf = jnp.inf
 nan = jnp.nan
-# Imaginary unit — readable, greppable marker of a complex weak form (jno.fem detects a complex
-# coefficient and solves via the real-equivalent block). `jno.np.i * x` is just `1j * x`.
-i = 1j
-j = 1j  # engineering alias
 
 
 def tracker(op: Placeholder, interval: int = 1, reduce=None) -> Tracker:

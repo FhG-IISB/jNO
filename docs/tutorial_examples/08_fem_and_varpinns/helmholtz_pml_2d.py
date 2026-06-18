@@ -4,7 +4,7 @@ A point source radiates outward; a PML frame absorbs the outgoing wave with no r
 truncated box behaves like open space. The PML is a *complex coordinate stretch* s = 1 + i sigma/k
 (sigma ramps up in the frame, 0 in the physical core) -- so the weak form has complex coefficients.
 
-jno.fem detects the complex form (the readable ``jno.np.i`` marker) and solves it via the
+jno.fem detects the complex form (a ``1j`` coefficient) and solves it via the
 real-equivalent block (it splits each term into real Re/Im sub-forms, assembles both through the
 ordinary REAL feax path, solves [[A_r,-A_i],[A_i,A_r]], and recombines to u = u_r + i u_i). feax is
 never asked to assemble complex.
@@ -45,7 +45,7 @@ def solve_pml(sigma0):
     ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
     sx = sigma0 * (relu(w - xi) ** 2 + relu(xi - (L - w)) ** 2) / w**2  # quadratic PML profile, per axis
     sy = sigma0 * (relu(w - yi) ** 2 + relu(yi - (L - w)) ** 2) / w**2
-    Sx, Sy = 1.0 + jno.np.i * sx / k, 1.0 + jno.np.i * sy / k  # complex coordinate stretch
+    Sx, Sy = 1.0 + 1j * sx / k, 1.0 + 1j * sy / k  # complex coordinate stretch
     src = jno.np.exp(-(((xi - 0.5) ** 2 + (yi - 0.5) ** 2) / (2 * 0.025**2)))  # ~point source at centre
     weak = (Sy / Sx) * (ui.x * vi.x) + (Sx / Sy) * (ui.y * vi.y) - k**2 * Sx * Sy * (u * vi) - src * vi
     fem = jno.fem([weak, u(xb, yb) - 0.0], quad_degree=3)  # u = 0 outer wall (PML absorbs first)

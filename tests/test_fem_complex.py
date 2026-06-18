@@ -66,7 +66,7 @@ def test_complex_helmholtz_real_equivalent_recovers_manufactured():
 def test_pml_helmholtz_absorbs_reflection_free():
     """2D Helmholtz with a perfectly-matched layer (PML) -- the headline use case. The complex
     coordinate stretch ``s = 1 + i sigma/k`` (sigma ramps in a frame, 0 in the physical core)
-    absorbs outgoing waves; the outer wall is u=0. Authored with the readable ``jno.np.i``.
+    absorbs outgoing waves; the outer wall is u=0. The imaginary unit is Python's native ``1j``.
 
     PML-quality gate = sigma-insensitivity: a *converged* PML's physical-core solution does not
     depend on the absorber strength (a poor/absent PML would reflect and change with sigma)."""
@@ -81,7 +81,7 @@ def test_pml_helmholtz_absorbs_reflection_free():
         ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
         sx = sigma0 * (relu(w - xi) ** 2 + relu(xi - (L - w)) ** 2) / w**2  # per-axis PML depth
         sy = sigma0 * (relu(w - yi) ** 2 + relu(yi - (L - w)) ** 2) / w**2
-        Sx, Sy = 1.0 + jno.np.i * sx / k, 1.0 + jno.np.i * sy / k  # complex coordinate stretch
+        Sx, Sy = 1.0 + 1j * sx / k, 1.0 + 1j * sy / k  # complex coordinate stretch
         src = jno.np.exp(-(((xi - 0.5) ** 2 + (yi - 0.5) ** 2) / (2 * 0.03**2)))  # ~point source
         weak = (Sy / Sx) * (ui.x * vi.x) + (Sx / Sy) * (ui.y * vi.y) - k**2 * Sx * Sy * (u * vi) - src * vi
         fem = jno.fem([weak, u(xb, yb) - 0.0], quad_degree=3)
@@ -95,3 +95,45 @@ def test_pml_helmholtz_absorbs_reflection_free():
     sigma_insens = float(np.linalg.norm(u1[core] - u2[core]) / np.linalg.norm(u1[core]))
     assert sigma_insens < 1e-2, f"PML not reflection-free: sigma-insensitivity {sigma_insens:.3e}"
     assert float(np.abs(u1[core].imag).max()) > 1e-3  # a propagating (complex) wave, not a static field
+
+
+def test_complex_transient_recovers_mode_and_conserves_schrodinger_norm():
+    """Complex *transient* FEM via the real-equivalent block (the M, A, and IC are each split into
+    real Re/Im parts; backward Euler runs on the ``2N`` real block ``[[M_r,-M_i],[M_i,M_r]]`` etc.).
+
+        psi_t = c lap psi   on the unit square, psi = 0 walls,
+        IC psi0 = sin(pi x) sin(pi y)  (real)  ->  psi(t) = exp(-c 2 pi^2 t) psi0.
+
+    Two regimes from the *same* machinery:
+      * c = 0.5 + 1j : a complex diffusion (decay + oscillation), recovered vs the analytic mode.
+      * c = 1j       : free-particle Schrodinger (i psi_t = -lap psi) -- unitary, so |psi| is
+                       conserved; backward Euler is only mildly dissipative."""
+
+    def solve(c):
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.07, time=(0.0, 0.05, 51))
+        u, phi = d.fem_symbols()
+        xi, yi, ti = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        ci = d.variable("initial", split=True)
+        ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+        psi0 = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])  # real IC; the dynamics make psi complex
+        fem = jno.fem([ui.t * vi + c * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - psi0])
+        return fem, np.asarray(fem.solve()), np.asarray(fem.points)
+
+    # complex diffusion: decay + oscillation, checked against the analytic mode
+    fem, traj, pts = solve(0.5 + 1j)
+    assert fem.is_complex and fem.is_transient and np.iscomplexobj(traj)
+    t1 = float(fem.t1)
+    mode = np.sin(PI * pts[:, 0]) * np.sin(PI * pts[:, 1])
+    analytic = np.exp(-(0.5 + 1j) * 2 * PI**2 * t1) * mode
+    rel = float(np.linalg.norm(traj[-1] - analytic) / np.linalg.norm(analytic))
+    assert rel < 3e-2, f"complex transient recovery rel-L2 {rel:.3e}"
+    assert float(np.abs(traj[-1].imag).max()) > 1e-2  # genuinely complex trajectory, not a real solve
+
+    # Schrodinger free particle: unitary -> |psi| conserved (BE only mildly dissipative)
+    fem_s, traj_s, pts_s = solve(1j)
+    mode_s = np.sin(PI * pts_s[:, 0]) * np.sin(PI * pts_s[:, 1])
+    rel_s = float(np.linalg.norm(traj_s[-1] - np.exp(-1j * 2 * PI**2 * t1) * mode_s) / np.linalg.norm(mode_s))
+    assert rel_s < 3e-2, f"Schrodinger recovery rel-L2 {rel_s:.3e}"
+    ratio = float(np.linalg.norm(traj_s[-1]) / np.linalg.norm(traj_s[0]))
+    assert 0.97 < ratio < 1.01, f"Schrodinger norm not conserved: |psi(t1)|/|psi(0)| {ratio:.4f}"
