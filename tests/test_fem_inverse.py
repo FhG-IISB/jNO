@@ -337,3 +337,152 @@ def test_nodal_field_regularizers():
     assert float(np.asarray(bd.fn(2.0 * ones)).sum()) > 0.0
     with pytest.raises(ValueError):
         k.regularize("bounded")  # missing lo/hi
+
+
+# --------------------------------------------------------------------------- transient
+# A *time-dependent* inverse problem: recover a parameter in a transient weak form from a
+# u(t) trajectory. FEM.solve hosts the integrator as a trace node, so the gradient flows
+# through the time integration to the parameter. The integrator is the user's callable
+# (default: a backward-Euler lax.scan over the block's assembled dt); diffrax
+# (block.as_diffrax) and a feax pipeline (block.as_feax_pipeline) are documented overrides.
+# (diffrax forms u_dot = M^-1(...), and a Dirichlet problem zeroes M's Dirichlet rows -> a
+# DAE, so the implicit backward-Euler default/override is the right one for Dirichlet BCs;
+# the diffrax route is exercised on a periodic problem in test_periodic_parametric_integration.)
+TRANSIENT_TOL = 0.05
+
+
+def _transient_heat_fem(alpha, *, mesh_size=0.2, time=(0.0, 0.1, 11)):
+    """Parametric transient heat  u_t = alpha * lap u  on the unit square, homogeneous
+    Dirichlet, IC sin(pi x) sin(pi y) (the mode decays at rate alpha * 2 pi^2)."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size, time=time)
+    u, v = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    u0 = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
+    fem = jno.fem([ui.t * vi + alpha * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - u0])
+    return d, fem
+
+
+def _grid_ts(block):
+    n_steps = int(round((float(block.t1) - float(block.t0)) / float(block.dt)))
+    return jnp.linspace(float(block.t0), float(block.t1), n_steps + 1)
+
+
+def test_transient_recovers_default_scan():
+    """Transient inverse: recover the scalar alpha in u_t = alpha*lap u from the u(t)
+    trajectory through the default backward-Euler scan in FEM.solve -- the gradient flows
+    through the time integration (lax.scan) to alpha. Also freezes the fully-parametric
+    operator Dirichlet-identity fix (without it M + dt A is singular) and the trajectory
+    readback shape (n_save, n_dofs)."""
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    alpha = _alpha()
+    d, fem = _transient_heat_fem(alpha)
+    assert fem.is_transient
+    block = fem.operator
+    assert block.is_linear() and list(block.runtime_parameter_exprs) == ["alpha"]
+
+    # Regression guard for the fully-parametric-operator fix: the entire operator is
+    # parametric (no static term), so without restoring the Dirichlet identity in A the
+    # backward-Euler matrix M + dt A would be singular (rank-deficient on the bc rows).
+    M = np.asarray(block.M)
+    dt = float(block.dt)
+    S = M + dt * np.asarray(block.operator_fn(dt, {"alpha": 1.0}))
+    assert np.linalg.matrix_rank(S) == S.shape[0], "M + dt A is singular -- Dirichlet identity missing from A"
+
+    n_dofs = int(M.shape[0])
+    save_ts = _grid_ts(block)
+    u_obs = _default_transient_integrate(block, {"alpha": 1.0}, save_ts)  # truth trajectory at alpha=1
+    assert u_obs.shape == (len(save_ts), n_dofs)
+    assert not bool(jnp.isnan(u_obs).any())
+
+    # Forward physics: the recovery loss alone cannot catch a *self-consistent* forward bug
+    # (u_obs and fem.solve() share the integrator, so e.g. a 2x operator scale cancels and
+    # still "recovers" 1.0). The IC is a single Laplacian eigenmode sin(pi x) sin(pi y)
+    # (eigenvalue 2 pi^2), so the exact solution decays as u(t) = exp(-alpha*2*pi^2*t) u(0).
+    # Check the backward-Euler trajectory decays at that rate -- order-safe (uses only the
+    # state vector). BE is O(dt) here (~10%); a 2x operator-scale bug would be ~77%.
+    decay = np.exp(-1.0 * 2.0 * PI**2 * float(save_ts[-1]))
+    ref = decay * np.asarray(u_obs[0])
+    fwd_rel = float(np.linalg.norm(np.asarray(u_obs[-1]) - ref) / np.linalg.norm(ref))
+    assert fwd_rel < 0.15, f"forward backward-Euler heat decay rel-err {fwd_rel:.3f} -- physics wrong?"
+
+    u_node = fem.solve()
+    crux = jno.core([(u_node - u_obs).mse], domain=_DUMMY)
+    crux.solve(200)
+    rec = float(np.asarray(crux.eval([alpha])).reshape(-1)[0])
+    # crux.eval([single_op]) returns the array itself: the full trajectory, NOT a list and
+    # NOT a single time-slice -- so its shape is (n_save, n_dofs), do not index [0].
+    traj = np.asarray(crux.eval([u_node]))
+    assert traj.shape == (len(save_ts), n_dofs), f"trajectory readback {traj.shape}"
+
+    assert abs(rec - 2.0) > 0.5, "alpha did not move -- gradient did not reach it through the integrator"
+    assert abs(rec - 1.0) < TRANSIENT_TOL, f"transient (default scan): recovered alpha={rec:.4f}"
+
+
+def test_transient_save_ts_decouples_from_dt():
+    """save_ts only samples the output; the step is the block's assembled dt. A coarse
+    save_ts keeps full-dt accuracy (sampled by interpolation) and its shape follows save_ts
+    -- the step size is never an accident of how the output is sampled."""
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    _, fem = _transient_heat_fem(_alpha())
+    block = fem.operator
+    n_dofs = int(np.asarray(block.M).shape[0])
+
+    fine = _default_transient_integrate(block, {"alpha": 1.0}, _grid_ts(block))
+    coarse_ts = jnp.array([float(block.t0), float(block.t1)])  # only 2 output points
+    coarse = _default_transient_integrate(block, {"alpha": 1.0}, coarse_ts)
+
+    assert coarse.shape == (2, n_dofs)  # shape follows save_ts
+    # end state at t1 is integrated at block.dt regardless of how few points we save:
+    assert float(jnp.linalg.norm(coarse[-1] - fine[-1])) < 1e-10
+
+
+def test_transient_solve_fn_override_feax_pipeline():
+    """fem.solve(my_integrator) -- bring-your-own integrator (same role as the steady
+    (A,b)->u escape hatch). A feax backward-Euler pipeline driven from
+    block.as_feax_pipeline is a documented override and recovers alpha through crux too."""
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    alpha = _alpha()
+    _, fem = _transient_heat_fem(alpha)
+    block = fem.operator
+    u_obs = _default_transient_integrate(block, {"alpha": 1.0}, _grid_ts(block))
+
+    def feax_pipeline_solve(blk, args, ts):
+        pblock = blk.as_feax_pipeline(scheme="backward_euler", args=args)
+        pipe = pblock.pipeline
+        pipe.build(pblock.mesh)
+        ts = np.asarray(ts)
+        state = jnp.asarray(pipe.initial_state())
+        states = [state]
+        t = 0.0
+        for i in range(1, len(ts)):
+            step_dt = float(ts[i] - ts[i - 1])
+            state = pipe.step(state, t, step_dt)
+            t += step_dt
+            states.append(state)
+        return jnp.stack(states)
+
+    rec = _recover(fem.solve(feax_pipeline_solve), alpha, u_obs, n=200)
+    assert abs(rec - 1.0) < TRANSIENT_TOL, f"transient (feax-pipeline override): recovered alpha={rec:.4f}"
+
+
+def test_transient_nonlinear_default_raises_cleanly():
+    """The default transient integrator is backward-Euler for a LINEAR block; a nonlinear
+    transient (residual path, A/operator_fn are None) must raise a clear NotImplementedError
+    that points at solve_fn=, not fail deep in the scan on jnp.asarray(None)."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3, time=(0.0, 0.1, 6))
+    u, v = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    u0 = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
+    fem = jno.fem([ui.t * vi + (u * u * u) * vi + ui.x * vi.x + ui.y * vi.y, u(xb, yb) - 0.0, u(ci[0], ci[1]) - u0])
+    assert fem.is_transient and not fem.operator.is_linear()
+    with pytest.raises(NotImplementedError, match="nonlinear"):
+        fem.solve()

@@ -454,28 +454,31 @@ class FEM:
     def solve(self, solve_fn=None, **kwargs) -> Any:
         """Differentiable forward solve as a trace node — the inverse-problem entry.
 
-        Delegates to :meth:`FemLinearSystem.solve` (linear) or
-        :meth:`FemResidualOperator.solve` (nonlinear). The result is a jNO field:
-        compare it to data and train any ``jno.np.parameter`` in the weak form
-        through ``crux.solve``::
+        Delegates to :meth:`FemLinearSystem.solve` (steady linear),
+        :meth:`FemResidualOperator.solve` (steady nonlinear), or
+        :meth:`FeaxTimeBlock.solve` (transient). The result is a jNO field: compare it
+        to data and train any ``jno.np.parameter`` in the weak form through
+        ``crux.solve``::
 
             alpha = jno.np.parameter((1,), name="alpha")
             fem = jno.fem([alpha * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
             crux = jno.core([(fem.solve() - u_obs).mse], domain=obs_domain)
             crux.solve(n)                      # recovers alpha
 
-        ``solve_fn`` is **your** solver (jNO writes none): ``(A, b) -> u`` for a
-        linear system (default :func:`jax.numpy.linalg.solve`; e.g. ``lineax``) or
-        ``(residual_fn, u0) -> u`` for a nonlinear one (default an
-        ``optimistix.root_find`` Newton, implicit-diff). Pass ``u0=`` for the
-        nonlinear initial guess. Enable x64 — the feax assembly is float64.
+        ``solve_fn`` is **your** solver (jNO writes none):
+
+        * steady linear: ``(A, b) -> u`` (default :func:`jax.numpy.linalg.solve`; e.g.
+          ``lineax``);
+        * steady nonlinear: ``(residual_fn, u0) -> u`` (default an
+          ``optimistix.root_find`` Newton, implicit-diff; pass ``u0=`` for the guess);
+        * transient: ``(block, args, save_ts) -> ys`` returning a ``(len(save_ts),
+          n_dofs)`` trajectory (default a backward-Euler ``lax.scan`` over the block's
+          assembled ``dt``; ``save_ts=`` overrides the sample times, default the domain's
+          time grid). diffrax (``block.as_diffrax``) and a feax pipeline
+          (``block.as_feax_pipeline``) are documented overrides.
+
+        Enable x64 — the feax assembly is float64.
         """
-        if self._mode == "transient":
-            raise NotImplementedError(
-                "FEM.solve is for steady problems. Transient time-integration "
-                "(diffrax / a scan over .M, .operator) is a follow-up; use the "
-                "matrices on .operator to march."
-            )
         return self._op.solve(solve_fn, **kwargs)
 
     @property

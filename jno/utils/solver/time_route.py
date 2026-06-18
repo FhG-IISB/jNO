@@ -1735,6 +1735,29 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             A0_sys, bA0 = _assemble_fem_system_from_ir(domain, static_op_ir)
             A = _dense_array(A0_sys)
             affine_bias = jnp.asarray(bA0).reshape(-1)
+        elif len(operator_parameter_irs) > 0 and len(nonaffine_op_ir.terms) == 0:
+            # Fully-parametric *affine* operator (no static term): the per-parameter bases
+            # below carry K = K_bc - K_zero_bc, which *cancels* their Dirichlet identity
+            # rows, and M has its Dirichlet rows zeroed too -- so without a static base
+            # nothing would hold the Dirichlet identity and (M + dt A) would be singular.
+            # Assemble a zero (parameter-free) basis with Dirichlet applied to recover
+            # exactly the bc-identity rows in A and the Dirichlet value g in affine_bias
+            # (the case `_make_zero_ir_like` was written for: "every physical term is
+            # parameter-dependent but static Dirichlet enforcement still has to be assembled
+            # exactly once"). When a non-affine term is present its jac_bc already supplies
+            # the identity (apply_dirichlet=True), so A must stay 0 there to avoid doubling.
+            #
+            # affine_bias here carries the Dirichlet value g on the Dirichlet *rows* (the
+            # zero IR has no physics, so its interior rows are 0 and only the bc rows get g),
+            # which is correct-by-construction. Note: a *non-homogeneous* g (g != 0) with a
+            # fully-parametric operator is still rejected just below -- the parametric
+            # Dirichlet *lifting* `coeff * K_ib * g` makes bK != 0 ("Runtime Dirichlet
+            # parameters are not supported yet") -- so in practice this branch runs with
+            # g == 0 / affine_bias == 0; the g term is kept for correctness/forward-compat.
+            zero_basis_ir = _make_zero_ir_like(next(iter(operator_parameter_irs.values())))
+            A0_sys, bA0 = _assemble_fem_system_from_ir(domain, zero_basis_ir)
+            A = jnp.asarray(_dense_array(A0_sys))
+            affine_bias = jnp.asarray(bA0).reshape(-1)
         else:
             A = jnp.zeros_like(M)
             affine_bias = jnp.zeros((M.shape[0],), dtype=M.dtype)
