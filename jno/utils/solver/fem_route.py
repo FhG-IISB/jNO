@@ -250,6 +250,7 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
     import feax as fe
 
     symmetric_bc = kwargs.get("symmetric_bc", True)
+    fields_override = kwargs.get("fields_override", None)
 
     has_runtime_parameters = any(_contains_runtime_parameter(term.coeff) for term in ir.terms)
 
@@ -257,7 +258,7 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
     # Original parameter-free route
     # ------------------------------------------------------------
     if not has_runtime_parameters:
-        problem, bc = _build_feax_problem(domain, ir)
+        problem, bc = _build_feax_problem(domain, ir, fields_override=fields_override)
         internal_vars = fe.InternalVars()
 
         res_bc = fe.create_res_bc_function(problem, bc)

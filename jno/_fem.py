@@ -786,25 +786,25 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
 
 
 def _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals, classification):
-    """Assemble a coupled (multi-field) first-order *linear* transient weak form.
+    """Assemble a coupled (multi-field) first-order transient weak form.
 
     Reuses the steady block assembly: the IR is split into a mass IR (additive terms
     carrying a temporal derivative, with ``u_t`` rewritten to ``u``) and a spatial
-    operator IR. Each is assembled into a block matrix through
-    ``_assemble_fem_system_from_ir`` with a **shared** ``(fields, field_index)`` so the
-    separately-built mass ``M`` and operator ``A`` blocks share one field ordering (and
-    a block is built for every field). Per-field initial conditions form the block
-    ``state0``; the user drives backward Euler ``(M + dt·A) w = M w``.
+    operator IR. The constant block mass ``M`` is assembled from the mass IR; the
+    spatial part is assembled from the operator IR — as a block matrix ``A`` when the
+    weak form is linear, or as a block residual/Jacobian (feax autodiff) when it is
+    nonlinear. A **shared** ``(fields, field_index)`` is threaded into every block
+    assembly so the separately-built pieces line up (one field ordering, a block for
+    every field). Per-field initial conditions form the block ``state0``; the user
+    drives backward Euler — ``(M + dt·A) w = M w`` (linear) or a Newton solve of
+    ``M (w-w_old)/dt + R(w) = 0`` (nonlinear).
 
-    Scope: linear, and every field must carry a time derivative (algebraic/DAE fields —
-    a zero mass block, e.g. transient Stokes pressure — are not handled yet)."""
+    Scope: every field must carry a time derivative (algebraic/DAE fields — a zero
+    mass block, e.g. transient Stokes pressure — are not handled yet)."""
     from .utils.solver.backend_blocks import FeaxTimeBlock
     from .utils.solver.feax_utils import _dense_array, _infer_fields, _lower_statefield_to_trial
-    from .utils.solver.fem_route import _assemble_fem_system_from_ir
+    from .utils.solver.fem_route import _assemble_fem_residual_from_ir, _assemble_fem_system_from_ir
     from .utils.solver.time_route import _infer_time_window, _is_linear_first_order_ir, _split_first_order_linear_terms
-
-    if not _is_linear_first_order_ir(ir):
-        raise NotImplementedError("jno.fem: nonlinear coupled transient is not supported yet (linear coupled only).")
 
     mass_ir, op_ir, src_ir = _split_first_order_linear_terms(ir)
     if len(src_ir.terms) > 0:
@@ -816,29 +816,41 @@ def _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals
             "algebraic (DAE) fields are not supported yet."
         )
 
-    # Shared field layout so the separately-assembled M and A blocks line up exactly.
+    # Shared field layout so the separately-assembled mass and operator blocks align.
     override = (fields, field_index)
-    M_sys, _bM = _assemble_fem_system_from_ir(domain, mass_ir, fields_override=override)
-    A_sys, bA = _assemble_fem_system_from_ir(domain, op_ir, fields_override=override)
-    M = jnp.asarray(_dense_array(M_sys))
-    A = jnp.asarray(_dense_array(A_sys))
-
-    prob = domain._feax_problem  # op_ir block problem (same block layout as mass_ir via override)
-    state0 = _multifield_initial_state(domain, prob, fields, field_index, ic_residuals)
+    M = jnp.asarray(_dense_array(_assemble_fem_system_from_ir(domain, mass_ir, fields_override=override)[0]))
     t0, t1, dt = _infer_time_window(domain)
-    block = FeaxTimeBlock(
+    common = dict(
         backend="feax_time",
         mode="implicit",
         time_order=1,
         spatial_kind="weak_form",
         ir=ir,
-        M=M,
-        A=A,
-        affine_bias=jnp.asarray(bA).reshape(-1),
-        state0=state0,
         t0=t0,
         t1=t1,
         dt=dt,
         feax_context=getattr(domain, "_feax_context", {}) or {},
+    )
+
+    if _is_linear_first_order_ir(ir):
+        A_sys, bA = _assemble_fem_system_from_ir(domain, op_ir, fields_override=override)
+        prob = domain._feax_problem  # op_ir block problem (same block layout as mass_ir via override)
+        state0 = _multifield_initial_state(domain, prob, fields, field_index, ic_residuals)
+        block = FeaxTimeBlock(
+            M=M, A=jnp.asarray(_dense_array(A_sys)), affine_bias=jnp.asarray(bA).reshape(-1), state0=state0, **common
+        )
+        return FEM(domain=domain, op=block, classification=classification, mode="transient")
+
+    # Nonlinear: M u_dot + R(u) = 0, with R/J the block spatial residual/Jacobian that
+    # feax autodiffs on the multi-field problem (same path as steady nonlinear coupled).
+    spatial = _assemble_fem_residual_from_ir(domain, op_ir, fields_override=override)
+    prob = domain._feax_problem
+    state0 = _multifield_initial_state(domain, prob, fields, field_index, ic_residuals)
+    block = FeaxTimeBlock(
+        mass=lambda t, args=None, _M=M: _M,
+        residual=lambda u, t, args=None, _r=spatial.residual: _r(jnp.asarray(u)),
+        jacobian=lambda u, t, args=None, _j=spatial.jacobian: _j(jnp.asarray(u)),
+        state0=state0,
+        **common,
     )
     return FEM(domain=domain, op=block, classification=classification, mode="transient")
