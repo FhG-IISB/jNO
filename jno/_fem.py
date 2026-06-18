@@ -610,11 +610,16 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     # same (op, mode) the FEM container expects; it needs none of init_fem's feax
     # scaffolding (coordinate vars resolve from the per-element quadrature points).
     if getattr(domain, "dimension", None) == 1:
-        from .utils.solver.fem_1d import assemble_fem_1d
+        from .utils.solver.fem_1d import assemble_fem_1d, assemble_fem_1d_multifield
 
-        op, mode = assemble_fem_1d(
-            domain, volume_terms, boundary_terms, dirichlet_values, ic_residuals, vec=vec, quad_degree=quad_degree
-        )
+        if multifield:  # coupled 1D -> native block assembly (feax has no LINE2 element)
+            op, mode = assemble_fem_1d_multifield(
+                domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, quad_degree=quad_degree
+            )
+        else:
+            op, mode = assemble_fem_1d(
+                domain, volume_terms, boundary_terms, dirichlet_values, ic_residuals, vec=vec, quad_degree=quad_degree
+            )
         return FEM(domain=domain, op=op, classification=classification, mode=mode)
 
     order = _infer_order(constraints)
