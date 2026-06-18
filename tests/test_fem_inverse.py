@@ -246,3 +246,54 @@ def test_nodal_field_parameter_recovers_via_crux():
     assert (rec.max() - rec.min()) > 1e-2, "recovered field is uniform -- not trained per node"
     rel = float(np.linalg.norm(rec - np.asarray(k_true)) / np.linalg.norm(np.asarray(k_true)))
     assert rel < 0.1, f"nodal field recovery via crux rel-err {rel:.3e}"
+
+
+def test_nodal_field_h1_regularizer():
+    """k.regularize('h1seminorm') is the exact FE H1 seminorm integral|grad k|^2 = k^T L k
+    (L = the stiffness/discrete Laplacian on the field's space): a differentiable smoothness
+    loss term that composes through crux.solve."""
+    from jno._fem import _assemble_h1_stiffness
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)  # unit square, area = 1
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = 2.0 * (xi * (1.0 - xi) + yi * (1.0 - yi))
+    k = jno.np.parameter(phi, name="k")
+    jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    n = int(d.built_mesh.points.shape[0])
+
+    # L sanity: symmetric Laplacian with a constant null space.
+    L = np.asarray(_assemble_h1_stiffness(d))
+    assert L.shape == (n, n)
+    assert np.allclose(L, L.T, atol=1e-9)
+    assert np.max(np.abs(L @ np.ones(n))) < 1e-9
+
+    # Exact H1 seminorm for a linear field: integral|grad k|^2 = (a^2 + b^2) * area.
+    nodes = np.asarray(d.built_mesh.points)[:, :2]
+    a, b = 0.7, -1.3
+    klin = jnp.asarray(a * nodes[:, 0] + b * nodes[:, 1])
+    sem = float(klin @ (jnp.asarray(L) @ klin))
+    assert abs(sem - (a * a + b * b)) < 1e-9, f"H1 seminorm {sem} != {a * a + b * b}"
+
+    # The reg term composes + flattens a rough field through crux.solve (grad reaches k).
+    k2 = jno.np.parameter(phi, name="k2")
+    k2.dtype(jnp.float64)
+    k2.initialize(jax.nn.initializers.normal(1.0))  # rough random per-node init
+    k2.optimizer(optax.adam(5e-2))
+    reg = k2.regularize("h1seminorm")
+    crux = jno.core([reg.mean], domain=_DUMMY)
+    k0 = np.asarray(crux.eval([k2])).reshape(-1)
+    s0 = float(k0 @ (L @ k0))
+    crux.solve(300)
+    kf = np.asarray(crux.eval([k2])).reshape(-1)
+    sf = float(kf @ (L @ kf))
+    assert not np.allclose(k0, kf), "reg gradient did not reach the field"
+    assert sf < 1e-2 * s0, f"pure-reg did not flatten the field: {s0} -> {sf}"
+
+    # Guards: not a field parameter, and an unknown kind.
+    with pytest.raises(ValueError):
+        jno.np.parameter((1,), name="s").regularize("h1seminorm")
+    with pytest.raises(ValueError):
+        k.regularize("nope")

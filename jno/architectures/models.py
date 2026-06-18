@@ -86,6 +86,7 @@ def parameter(shape: tuple, *, key: jax.Array | None = None, name: str = "value"
     # owning domain (see ``variational_symbols``), so the size is known up front.
     fem_field = None
     fem_field_key = None
+    fem_field_domain = None
     if hasattr(shape, "field_key") and getattr(shape, "_domain", None) is not None:
         sym = shape
         if int(getattr(sym, "order", 1)) != 1:
@@ -99,6 +100,7 @@ def parameter(shape: tuple, *, key: jax.Array | None = None, name: str = "value"
         shape = (int(mesh.points.shape[0]),)
         fem_field = "node"
         fem_field_key = getattr(sym, "field_key", None)
+        fem_field_domain = sym._domain  # so the regularizer can recover the FE space
 
     class _Parameter(eqx.Module):
         value: jnp.ndarray
@@ -115,6 +117,7 @@ def parameter(shape: tuple, *, key: jax.Array | None = None, name: str = "value"
     # interpolated to quad points), not factored into a constant basis.
     model._fem_field = fem_field
     model._fem_field_key = fem_field_key
+    model._fem_field_domain = fem_field_domain
 
     model._initializer_key = _resolve_key(key)
     # Mark this Model so .posterior_samples unwraps the single-leaf wrapper

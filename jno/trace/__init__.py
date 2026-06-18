@@ -2325,6 +2325,31 @@ class ModelCall(Placeholder):
         self.model.constrain(transform)
         return self
 
+    def regularize(self, kind: str = "h1seminorm", **kwargs):
+        """Smoothness regularization loss term for a FEM **field** parameter
+        (``jno.np.parameter(phi)``).
+
+        ``kind``:
+          * ``'h1seminorm'`` (aliases ``'h1'``, ``'smooth'``) -- the exact finite-element
+            H1 seminorm ``integral |grad k|^2 = k^T L k`` (``L`` = the stiffness / discrete
+            Laplacian on the field's space). Returns the per-node energy; reduce with
+            ``.mean`` / ``.sum`` and weight it::
+
+                crux([data.mse, alpha * k.regularize('h1seminorm').mean])
+
+        Only valid for a nodal field parameter; other parameters raise.
+        """
+        if getattr(self.model, "_fem_field", None) is None:
+            raise ValueError(
+                "ModelCall.regularize(...) is only for a FEM field parameter "
+                "(jno.np.parameter(<fem symbol>)); this parameter is not one."
+            )
+        if kind in ("h1seminorm", "h1", "smooth"):
+            from .._fem import _h1_seminorm_term
+
+            return _h1_seminorm_term(self)
+        raise ValueError(f"Unknown regularizer kind {kind!r}; supported: 'h1seminorm'.")
+
     def bayesian(self, kernel_factory, *, prior=None, warmup=500, keep=1000, thin=1, adapt=True, **kernel_kwargs):
         """Proxy for :meth:`Model.bayesian`."""
         self.model.bayesian(

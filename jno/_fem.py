@@ -1041,3 +1041,72 @@ def _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals
         **common,
     )
     return FEM(domain=domain, op=block, classification=classification, mode="transient")
+
+
+# ---------------------------------------------------------------------------
+# H1 smoothness regularization for nodal field parameters
+# ---------------------------------------------------------------------------
+def _assemble_h1_stiffness(domain: Any):
+    """Raw P1 stiffness ``L = integral grad(phi_i) . grad(phi_j)`` on ``domain``'s scalar space.
+
+    The discrete-Laplacian Gram matrix (no Dirichlet): ``k^T L k = integral |grad k|^2``
+    is the H1 seminorm of a nodal field ``k``. Assembled with ``store_on_domain=False``
+    so it does not clobber any FEM problem already cached on the domain, and reusing the
+    domain's element / quadrature settings (no ``init_fem``).
+    """
+    from .utils.solver.fem_route import _assemble_fem_system_from_ir
+    from .utils.solver.weak_form import (
+        LoweredChannelTerm,
+        LoweredWeakForm,
+        _apply_sign,
+        _split_additive_terms,
+    )
+
+    u_sym, v_sym = domain.fem_symbols()
+    coords = domain.variable("interior", split=True)
+    axes = ("x", "y", "z")[: int(domain.dimension)]
+    ui = u_sym.bind(**{ax: coords[i] for i, ax in enumerate(axes)})
+    vi = v_sym.bind(**{ax: coords[i] for i, ax in enumerate(axes)})
+
+    stiff = None
+    for ax in axes:
+        term = getattr(ui, ax) * getattr(vi, ax)
+        stiff = term if stiff is None else stiff + term
+
+    terms: List[Any] = []
+    for sign, sub in _split_additive_terms(domain, _bare(stiff)):
+        terms.append(
+            LoweredChannelTerm(
+                sign=sign,
+                support="volume",
+                region_id="volume",
+                channel="raw",
+                coeff=_apply_sign(domain, sign, sub),
+                variable_id=0,
+                value_shape=(),
+                original_expr=sub,
+            )
+        )
+    ir = LoweredWeakForm(domain=domain, terms=terms)
+    A, _b = _assemble_fem_system_from_ir(domain, ir, apply_dirichlet=False, store_on_domain=False)
+    return jnp.asarray(A.todense() if hasattr(A, "todense") else A)
+
+
+def _h1_seminorm_term(param: Any):
+    """Per-node H1 energy ``k * (L k)`` for a nodal field parameter (``jno.np.parameter(phi)``).
+
+    Returns a :class:`FunctionCall` loss term; its ``.mean`` / ``.sum`` is the (averaged /
+    total) H1 seminorm ``integral |grad k|^2``, differentiable in the nodal values.
+    """
+    from .trace import FunctionCall
+
+    domain = getattr(param.model, "_fem_field_domain", None)
+    if domain is None:
+        raise ValueError("_h1_seminorm_term: parameter is not a FEM field parameter (no domain).")
+    stiffness = _assemble_h1_stiffness(domain)
+
+    def _energy(kv, _L=stiffness):
+        kf = jnp.asarray(kv).reshape(-1)
+        return kf * (_L @ kf)
+
+    return FunctionCall(_energy, [param], name="h1seminorm")
