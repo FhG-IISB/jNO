@@ -2904,6 +2904,9 @@ class TrialFunction(Placeholder):
         self.value_shape = tuple(value_shape)
         self.order = int(order)  # element polynomial degree for this field (P1=1, P2=2)
         self.op_id = _next_op_id()
+        # Identifies the field this symbol belongs to; a (trial, test) pair from one
+        # fem_symbols() call shares a key so the coupled kernel can pair u<->v.
+        self.field_key = self.op_id
 
     @property
     def num_components(self) -> int:
@@ -2974,6 +2977,8 @@ class TestFunction(Placeholder):
         self.value_shape = tuple(value_shape)
         self.order = int(order)  # element polynomial degree for this field (P1=1, P2=2)
         self.op_id = _next_op_id()
+        # Shared with the paired trial (set by variational_symbols) to identify the field.
+        self.field_key = self.op_id
 
     @property
     def num_components(self) -> int:

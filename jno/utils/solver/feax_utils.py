@@ -12,7 +12,7 @@ Responsibilities:
 - evaluate symbolic expressions inside FEAX volume/surface kernels,
 - prepare residual/Jacobian runtime objects for time-dependent assembly.
 """
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import jax.numpy as jnp
 import numpy as np
@@ -426,6 +426,64 @@ def _infer_trial_metadata(expr) -> Dict[str, Any]:
     }
 
 
+def _infer_fields(expr) -> Tuple[List[Dict[str, Any]], Dict[Any, int]]:
+    """All distinct trial *fields* in ``expr``, ordered by first appearance.
+
+    A field is one coupled unknown (one ``fem_symbols()`` call — its trial and test
+    share a ``field_key``). Returns ``(fields, field_key->index)`` where each field is
+    ``{field_key, value_shape, vec, order}``. The index order is the single source of
+    truth threaded into the feax ``Problem`` lists and the multi-field kernel.
+    """
+    fields: List[Dict[str, Any]] = []
+    seen: Dict[Any, int] = {}
+
+    def walk(node):
+        if node is None:
+            return
+        if isinstance(node, TrialFunction):
+            key = getattr(node, "field_key", node.op_id)
+            if key not in seen:
+                seen[key] = len(fields)
+                vs = getattr(node, "value_shape", ())
+                fields.append(
+                    {
+                        "field_key": key,
+                        "value_shape": vs,
+                        "vec": _value_shape_num_components(vs),
+                        "order": int(getattr(node, "order", 1)),
+                    }
+                )
+            return
+        for child in iter_children(node):
+            walk(child)
+
+    walk(expr)
+    return fields, dict(seen)
+
+
+def _test_field_index(expr, field_index: Dict[Any, int]) -> Optional[int]:
+    """Index of the single test field in an additive weak term (or ``None``).
+
+    Each additive term must contain exactly one test field (it determines the
+    equation/row block); a term with zero or several distinct test fields is
+    ambiguous and the caller errors."""
+    keys = set()
+
+    def walk(node):
+        if node is None:
+            return
+        if isinstance(node, TestFunction):
+            keys.add(getattr(node, "field_key", node.op_id))
+            return
+        for child in iter_children(node):
+            walk(child)
+
+    walk(expr)
+    if len(keys) != 1:
+        return None
+    return field_index.get(next(iter(keys)))
+
+
 def _collect_runtime_parameter_tags_for_feax(node, out=None):
     """Collect names of trainable runtime parameters (ModelCall) used in a coeff."""
     from .parametric_helpers import _is_runtime_scalar_parameter, _parameter_name
@@ -622,6 +680,21 @@ def _prefix_align(a, b):
     return a, b
 
 
+def _field_data(local, node):
+    """``(shape_vals, shape_grads, cell_sol)`` for ``node``'s field.
+
+    A multi-field kernel puts per-field arrays in ``local["fields"]`` (indexed by
+    field index) and a ``field_key -> index`` map in ``local["field_index"]``. A
+    single-field kernel has neither, so this falls back to the flat ``local`` entries
+    — leaving the single-field evaluation path byte-identical."""
+    fields = local.get("fields")
+    if fields is None:
+        return local["shape_vals"], local.get("shape_grads"), local.get("cell_sol")
+    key = getattr(node, "field_key", getattr(node, "op_id", None))
+    fd = fields[local["field_index"][key]]
+    return fd["shape_vals"], fd["shape_grads"], fd["cell_sol"]
+
+
 def _eval_expr_for_feax(domain, node, local):
     """
     Evaluate a jNO symbolic expression inside a FEAX local kernel.
@@ -715,11 +788,12 @@ def _eval_expr_for_feax(domain, node, local):
 
     if isinstance(node, TestFunction):
         n_comp = _value_shape_num_components(getattr(node, "value_shape", ()))
-        return _expand_test_shape_vals(local["shape_vals"], n_comp)
+        shape_vals, _, _ = _field_data(local, node)
+        return _expand_test_shape_vals(shape_vals, n_comp)
 
     if isinstance(node, TrialFunction):
-        vals = local["shape_vals"]
-        flat_interp = jnp.sum(vals[:, :, None] * local["cell_sol"][None, :, :], axis=1)
+        vals, _, cell_sol = _field_data(local, node)
+        flat_interp = jnp.sum(vals[:, :, None] * cell_sol[None, :, :], axis=1)
         value_shape = getattr(node, "value_shape", ())
         if len(value_shape) == 0:
             return flat_interp
@@ -738,7 +812,7 @@ def _eval_expr_for_feax(domain, node, local):
 
         if isinstance(node.target, TestFunction):
             n_comp = _value_shape_num_components(getattr(node.target, "value_shape", ()))
-            grads = local["shape_grads"]
+            _, grads, _ = _field_data(local, node.target)
             if n_comp == 1:
                 comps = [grads[..., dim0] for dim0 in dims]
                 return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
@@ -749,8 +823,7 @@ def _eval_expr_for_feax(domain, node, local):
             return jnp.stack(comps, axis=-1)
 
         if isinstance(node.target, TrialFunction):
-            grads = local["shape_grads"]
-            cell_sol = local["cell_sol"]
+            _, grads, cell_sol = _field_data(local, node.target)
             grad_list = [jnp.sum(grads[:, :, dim0 : dim0 + 1] * cell_sol[None, :, :], axis=1) for dim0 in dims]
             flat = grad_list[0] if len(dims) == 1 else jnp.stack(grad_list, axis=-1)
             value_shape = getattr(node.target, "value_shape", ())
@@ -997,6 +1070,93 @@ def _make_universal_volume_kernel(domain, expr, value_shape, temporal_tags, runt
     return kernel
 
 
+def _eval_multifield_volume_integrand(
+    domain,
+    term_list,
+    fields,
+    field_index,
+    temporal_tags,
+    runtime_parameter_tags,
+    problem_ref,
+    cell_sol_flat,
+    physical_quad_points,
+    cell_shape_grads,
+    cell_JxW,
+    cell_v_grads_JxW,
+    *cell_internal_vars,
+):
+    """Evaluate all coupled volume terms on one cell -> flat block-local residual.
+
+    Splits the cell DOFs per field (``unflatten_fn_dof``), evaluates each additive
+    term ``(coeff, test_field_index)`` with per-field shape data (reusing
+    ``_eval_expr_for_feax``), and accumulates into its test field's residual slot.
+    ``ravel_pytree`` concatenates the per-field residuals in field order (matching
+    ``unflatten_fn_dof``) so feax autodiffs the full block matrix."""
+    problem = problem_ref["problem"]
+    if problem is None:
+        raise RuntimeError("FEAX problem_ref['problem'] was not initialized before kernel evaluation.")
+
+    cell_sol_list = problem.unflatten_fn_dof(cell_sol_flat)
+    nfields = len(fields)
+    nnodes = [int(problem.fes[i].shape_vals.shape[1]) for i in range(nfields)]
+    nc = [0]
+    for n in nnodes:
+        nc.append(nc[-1] + n)
+    per_field = [
+        {
+            "shape_vals": problem.fes[i].shape_vals,
+            "shape_grads": cell_shape_grads[:, nc[i] : nc[i + 1], :],
+            "cell_sol": cell_sol_list[i],
+        }
+        for i in range(nfields)
+    ]
+    local = {
+        "physical_quad_points": physical_quad_points,
+        "fields": per_field,
+        "field_index": field_index,
+        "tag": "fem_gauss",
+        "surface": False,
+        "domain_context": domain.context,
+        "temporal_tags": tuple(temporal_tags),
+        "runtime_parameter_tags": tuple(runtime_parameter_tags),
+        "volume_vars": tuple(cell_internal_vars),
+    }
+
+    residuals = [jnp.zeros((nnodes[i] * int(fields[i]["vec"]),), dtype=cell_sol_flat.dtype) for i in range(nfields)]
+    for coeff, test_idx in term_list:
+        val = _eval_expr_for_feax(domain, coeff, local)
+        weights = cell_JxW[test_idx]
+        wshape = (weights.shape[0],) + (1,) * (val.ndim - 1)
+        contrib = ravel_pytree(jnp.sum(val * weights.reshape(wshape), axis=0))[0]
+        residuals[test_idx] = residuals[test_idx] + contrib
+    return ravel_pytree(residuals)[0]
+
+
+def _make_multifield_volume_kernel(
+    domain, term_list, fields, field_index, temporal_tags, runtime_parameter_tags, problem_ref
+):
+    """FEAX universal volume kernel for a coupled (multi-field) weak form."""
+
+    def kernel(cell_sol_flat, physical_quad_points, cell_shape_grads, cell_JxW, cell_v_grads_JxW, *cell_internal_vars):
+        return _eval_multifield_volume_integrand(
+            domain,
+            term_list,
+            fields,
+            field_index,
+            temporal_tags,
+            runtime_parameter_tags,
+            problem_ref,
+            cell_sol_flat,
+            physical_quad_points,
+            cell_shape_grads,
+            cell_JxW,
+            cell_v_grads_JxW,
+            *cell_internal_vars,
+        )
+
+    return kernel
+
+
 def _make_universal_surface_kernel(domain, expr, tag, value_shape, runtime_parameter_tags, temporal_tags):
     def kernel(
         cell_sol_flat,
@@ -1154,6 +1314,110 @@ def _make_feax_dirichlet_specs(domain, vec: int):
     return specs
 
 
+_ELEMENT_FOR_ORDER = {(2, 1): "TRI3", (2, 2): "TRI6", (3, 1): "TET4", (3, 2): "TET10"}
+
+
+def _element_for_order(dimension: int, order: int) -> str:
+    """Simplex element type for a coupled field's ``(dimension, order)``."""
+    et = _ELEMENT_FOR_ORDER.get((int(dimension), int(order)))
+    if et is None:
+        raise ValueError(
+            f"jno.fem: no element for dimension {dimension}, order {order} (coupled fields support order 1, 2)."
+        )
+    return et
+
+
+def _make_multifield_dirichlet_specs(domain, fields, field_index):
+    """Per-field Dirichlet specs (with ``variable_index``) for a coupled problem.
+
+    Reads ``domain._fem_dirichlet_by_field`` = ``{field_index: {region: value}}`` and
+    mirrors ``_make_feax_dirichlet_specs`` per field, tagging each spec with its
+    ``variable_index`` so feax constrains the right block."""
+    import feax as fe
+
+    component_names = {0: "x", 1: "y", 2: "z"}
+    by_field = getattr(domain, "_fem_dirichlet_by_field", {}) or {}
+    specs = []
+    for fidx, region_values in by_field.items():
+        vec = int(fields[fidx]["vec"])
+        for tag, value in region_values.items():
+            loc_fn = domain._make_tag_location_fn(tag)
+            if loc_fn is None:
+                domain.log.warning(f"Dirichlet tag '{tag}' not found in mesh tags. Skipping.")
+                continue
+            normalized = _normalize_dirichlet_value(value, vec)
+            if vec == 1:
+                fn = normalized if callable(normalized) else _const_bc_fn(normalized)
+                specs.append(fe.DirichletBCSpec(location=loc_fn, component="all", value=fn, variable_index=fidx))
+            elif callable(normalized):
+                specs.append(fe.DirichletBCSpec(location=loc_fn, component="all", value=normalized, variable_index=fidx))
+            elif isinstance(normalized, dict):
+                for comp, fn in normalized.items():
+                    specs.append(
+                        fe.DirichletBCSpec(
+                            location=loc_fn, component=component_names.get(comp, comp), value=fn, variable_index=fidx
+                        )
+                    )
+            elif isinstance(normalized, (list, tuple)):
+                for comp, fn in enumerate(normalized):
+                    specs.append(
+                        fe.DirichletBCSpec(
+                            location=loc_fn, component=component_names.get(comp, comp), value=fn, variable_index=fidx
+                        )
+                    )
+    return specs
+
+
+def _build_multifield_feax_problem(domain, ir, fields, field_index, *, apply_dirichlet, store_on_domain):
+    """Build a multi-variable FEAX Problem + block Dirichlet BC for coupled fields.
+
+    Each field gets its own mesh/vec/element; one universal kernel groups the weak
+    terms by their test field. feax autodiffs this into the block matrix downstream
+    (``_assemble_fem_system_concrete`` is unchanged)."""
+    import feax as fe
+
+    dim = domain.dimension
+    quad_degree = getattr(domain, "_fem_quad_degree", None) or 2
+    eles = [_element_for_order(dim, f["order"]) for f in fields]
+    meshes = [_build_feax_mesh(domain, et) for et in eles]
+    vecs = [int(f["vec"]) for f in fields]
+
+    term_list = []
+    for t in ir.terms:
+        if t.support != "volume" or t.channel != "raw":
+            continue
+        coeff = _lower_statefield_to_trial(t.coeff, {})
+        tfi = _test_field_index(coeff, field_index)
+        if tfi is None:
+            raise ValueError(
+                "jno.fem: each coupled weak term must contain exactly one test field "
+                "(it determines the equation block); got a term with zero or several."
+            )
+        term_list.append((coeff, tfi))
+
+    problem_ref: dict[str, Any] = {"problem": None}
+    kernel = _make_multifield_volume_kernel(domain, term_list, fields, field_index, (), (), problem_ref)
+
+    class GeneratedMultifieldProblem(fe.Problem):
+        def get_universal_kernel(self_inner):
+            return kernel
+
+        def get_universal_kernels_surface(self_inner):
+            return []
+
+    problem = GeneratedMultifieldProblem(meshes, vec=vecs, dim=dim, ele_type=eles, gauss_order=quad_degree, location_fns=[])
+    problem_ref["problem"] = problem
+
+    bc_specs = _make_multifield_dirichlet_specs(domain, fields, field_index) if apply_dirichlet else []
+    bc = fe.DirichletBCConfig(bc_specs).create_bc(problem)
+
+    if store_on_domain:
+        domain._feax_problem = problem
+        domain._feax_bc = bc
+
+    return problem, bc
+
+
 def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_domain: bool = True):
     """
     Build a FEAX Problem and Dirichlet BC object from lowered weak-form IR.
@@ -1171,6 +1435,13 @@ def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_do
 
     if volume_expr is None and len(boundary_exprs) == 0:
         raise ValueError("No terms found for FEM assembly.")
+
+    # Coupled (multi-field) weak form -> multi-variable block assembly.
+    _mf_fields, _mf_index = _infer_fields(volume_expr)
+    if len(_mf_fields) > 1:
+        return _build_multifield_feax_problem(
+            domain, ir, _mf_fields, _mf_index, apply_dirichlet=apply_dirichlet, store_on_domain=store_on_domain
+        )
 
     metadata = _infer_trial_metadata(volume_expr if volume_expr is not None else next(iter(boundary_exprs.values())))
     vec = int(metadata["vec"])

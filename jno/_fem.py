@@ -148,6 +148,31 @@ def _order_of_element(element_type: str) -> int:
     return 2 if element_type in _P2_ELEMENTS else 1
 
 
+def _field_keys(constraints: List[Any]) -> List[Any]:
+    """Ordered distinct trial ``field_key``s across constraints (first appearance).
+
+    Each ``fem_symbols()`` call is one coupled field (its trial + test share a key).
+    More than one key ⇒ a coupled / mixed multi-field problem."""
+    keys: List[Any] = []
+    seen: set = set()
+    for c in constraints:
+        for n in _walk(_bare(c)):
+            if isinstance(n, TrialFunction):
+                k = getattr(n, "field_key", n.op_id)
+                if k not in seen:
+                    seen.add(k)
+                    keys.append(k)
+    return keys
+
+
+def _field_key_of(constraint: Any) -> Any:
+    """The trial ``field_key`` of an essential (Dirichlet) constraint."""
+    for n in _walk(_bare(constraint)):
+        if isinstance(n, TrialFunction):
+            return getattr(n, "field_key", n.op_id)
+    return None
+
+
 def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
     """Return ``(support, region_id)`` for a constraint.
 
@@ -483,12 +508,14 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         raise ValueError("jno.fem: no constraints provided.")
 
     domain = _discover_domain(constraints)
-    if vec is None:
-        vec = _infer_vec(constraints)
+    multifield = len(_field_keys(constraints)) > 1
+    if vec is None and not multifield:
+        vec = _infer_vec(constraints)  # single-field only (coupled fields carry per-field vec)
 
     volume_terms: List[Any] = []
     boundary_terms: dict[str, List[Any]] = {}
     dirichlet_values: dict[str, Any] = {}
+    dirichlet_raw: List[Any] = []  # (field_key, region, comp, value) for the multi-field path
     ic_residuals: List[Any] = []
     classification: List[str] = []
 
@@ -519,6 +546,7 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
                     "region (Dirichlet) or the 'initial' region (IC). Got a volume region — did you forget the test function?"
                 )
             comp, value = _dirichlet_spec(_bare(c))
+            dirichlet_raw.append((_field_key_of(c), region, comp, value))
             if comp is None:  # all components: u(region) - g
                 if isinstance(dirichlet_values.get(region), dict):
                     raise ValueError(f"jno.fem: region {region!r} mixes all-component and per-component Dirichlet.")
@@ -551,14 +579,20 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         )
         return FEM(domain=domain, op=op, classification=classification, mode=mode)
 
-    # ---- element + quadrature for the field order (2D/3D) ----
-    # The element defaults to the field's polynomial order (P1->TRI3/TET4, P2->TRI6/
-    # TET10); a higher-order field bumps the quadrature so the integrand is exact.
     order = _infer_order(constraints)
+    quad_degree = max(quad_degree, 2 * order)
+
+    # ---- coupled / mixed multi-field -> block (multi-variable) assembly ----
+    if multifield:
+        return _assemble_multifield(
+            domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, classification, quad_degree=quad_degree
+        )
+
+    # ---- single field: element defaults to the field order (P1->TRI3/TET4,
+    # P2->TRI6/TET10); a higher-order field bumps the quadrature for exactness. ----
     if element_type is None:
         element_type = _element_for(domain.dimension, order)
-    eff_order = max(order, _order_of_element(element_type))
-    quad_degree = max(quad_degree, 2 * eff_order)
+    quad_degree = max(quad_degree, 2 * _order_of_element(element_type))
 
     # ---- quadrature + BC setup (reuse init_fem) ----
     bcs = [domain.dirichlet(tag, value) for tag, value in dirichlet_values.items()]
@@ -624,3 +658,76 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
 
     op = _assemble_fem_residual_from_ir(domain, ir)
     return FEM(domain=domain, op=op, classification=classification, mode="nonlinear")
+
+
+def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, classification, *, quad_degree):
+    """Assemble a coupled (multi-field) steady weak form into a block ``FEM``.
+
+    Builds the same IR as the single-field path, buckets Dirichlet per field, and
+    hands off to ``_assemble_fem_system_from_ir`` — which routes through the
+    multi-field branch of ``_build_feax_problem`` (multi-variable feax Problem +
+    per-field kernel) and lets feax autodiff the block matrix."""
+    from .utils.solver.feax_utils import _infer_fields
+    from .utils.solver.fem_route import _assemble_fem_residual_from_ir, _assemble_fem_system_from_ir
+    from .utils.solver.weak_form import (
+        LoweredChannelTerm,
+        LoweredWeakForm,
+        _apply_sign,
+        _contains_temporal_derivative,
+        _is_obviously_nonlinear_in_unknown,
+        _split_additive_terms,
+    )
+
+    if ic_residuals or any(_contains_temporal_derivative(b) for b in volume_terms):
+        raise NotImplementedError("jno.fem: coupled transient (multi-field + time) is not supported yet (Phase 3).")
+    if boundary_terms:
+        raise NotImplementedError(
+            "jno.fem: coupled Neumann/Robin (surface terms with multiple fields) is not supported yet; "
+            "use Dirichlet conditions for now."
+        )
+
+    domain._fem_quad_degree = quad_degree
+    domain._variational_initialized = True
+
+    terms: List[Any] = []
+    for bare in volume_terms:
+        for sign, sub in _split_additive_terms(domain, bare):
+            terms.append(
+                LoweredChannelTerm(
+                    sign=sign,
+                    support="volume",
+                    region_id="volume",
+                    channel="raw",
+                    coeff=_apply_sign(domain, sign, sub),
+                    variable_id=0,
+                    value_shape=(),
+                    original_expr=sub,
+                )
+            )
+    if not terms:
+        raise ValueError("jno.fem: no weak-form (test-function) terms found to assemble.")
+    ir = LoweredWeakForm(domain=domain, terms=terms)
+
+    # Field ordering is taken from ir.volume_expr — the same source _build_feax_problem
+    # uses — so the Dirichlet field indices match the kernel/Problem field order.
+    _, field_index = _infer_fields(ir.volume_expr)
+    by_field: dict[int, dict[str, Any]] = {}
+    for field_key, region, comp, value in dirichlet_raw:
+        fidx = field_index.get(field_key)
+        if fidx is None:
+            continue
+        region_values = by_field.setdefault(fidx, {})
+        if comp is None:
+            region_values[region] = value
+        else:
+            current = region_values.get(region)
+            current = dict(current) if isinstance(current, dict) else {}
+            current[_COMPONENT_NAMES[comp]] = value
+            region_values[region] = current
+    domain._fem_dirichlet_by_field = by_field
+
+    if any(_is_obviously_nonlinear_in_unknown(domain, b) for b in volume_terms):
+        op = _assemble_fem_residual_from_ir(domain, ir)
+        return FEM(domain=domain, op=op, classification=classification, mode="nonlinear")
+    op = _assemble_fem_system_from_ir(domain, ir)
+    return FEM(domain=domain, op=op, classification=classification, mode="linear")

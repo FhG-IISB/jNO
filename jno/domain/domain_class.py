@@ -1154,10 +1154,10 @@ class domain(MeshIOMixin):
             u, v = domain.fem_symbols(value_shape=(3,))
         """
         trial_name, test_name = names
-        return (
-            TrialFunction(name=trial_name, value_shape=value_shape, order=order),
-            TestFunction(name=test_name, value_shape=value_shape, order=order),
-        )
+        trial = TrialFunction(name=trial_name, value_shape=value_shape, order=order)
+        test = TestFunction(name=test_name, value_shape=value_shape, order=order)
+        test.field_key = trial.field_key  # one field per fem_symbols() call (pairs u<->phi)
+        return (trial, test)
 
     def fem_symbols(self, value_shape=(), names=("u", "phi"), order=1):
         """
