@@ -30,7 +30,20 @@ import numpy as np
 import jno
 import jno.jnp_ops as jnn
 
-jax.config.update("jax_enable_x64", False)
+
+@pytest.fixture(autouse=True)
+def _x64_off():
+    """These periodic tests run in float32 by design (loose-tol FD / backward-Euler
+    checks). Set x64 False *per-test* with save/restore so the global flag never leaks
+    into FEM modules co-run after this one (they need x64). See the symmetric `_x64`
+    fixture in test_fem_inverse.py."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", False)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
 
 # ============================================================
 # Shared constants
