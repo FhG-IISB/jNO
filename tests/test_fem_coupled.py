@@ -67,6 +67,41 @@ def test_coupled_p1_recovers_manufactured_with_offdiagonal():
     assert np.linalg.norm(pp - 2 * gg) / np.linalg.norm(2 * gg) < 1e-2
 
 
+def test_taylor_hood_stokes_recovers_manufactured():
+    # Taylor-Hood Stokes (inf-sup stable): P2 velocity, P1 pressure on the same
+    # triangulation (the pressure mesh is the velocity P2 mesh's vertex block).
+    # Manufactured u = (x, -y), p = x, body force f = (1, 0); div u = 0. All live in
+    # the P2/P1 spaces, so the discrete solution is exact. Velocity is unique;
+    # pressure is determined up to a constant (pure-Dirichlet velocity -> pressure
+    # null space), so solve the saddle system with lstsq and compare p up to its mean.
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
+    nv = int(np.asarray(d.mesh.points).shape[0])
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)  # P2 velocity
+    p, q = d.fem_symbols(names=("p", "q"), order=1)  # P1 pressure
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    gu, gv = jno.np.grad(u, [xi, yi]), jno.np.grad(v, [xi, yi])
+    pp, qq, vv = p.bind(x=xi, y=yi), q.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    weak_mom = jno.np.inner(gu, gv, n_contract=2) - pp * jno.np.trace(gv) - 1.0 * vv[0]  # f = (1, 0)
+    weak_cont = -qq * jno.np.trace(gu)
+    fem = jno.fem([weak_mom, weak_cont, u(xb, yb)[0] - xb, u(xb, yb)[1] - (-1.0 * yb)])
+
+    prob = fem.problem
+    off = prob.offset
+    assert len(off) == 2  # two coupled fields
+    assert (off[1] - off[0]) > 2 * nv  # velocity carries edge dofs -> genuinely P2
+
+    sol = np.linalg.lstsq(_dense(fem.A), np.asarray(fem.b).reshape(-1), rcond=None)[0]
+    pts_v = np.asarray(prob.mesh[0].points)
+    pts_p = np.asarray(prob.mesh[1].points)
+    uu = sol[off[0] : off[1]].reshape(-1, 2)
+    ppres = sol[off[1] :]
+    u_ex = np.stack([pts_v[:, 0], -pts_v[:, 1]], axis=-1)
+    p_ex = pts_p[:, 0]
+    assert np.linalg.norm(uu - u_ex) / np.linalg.norm(u_ex) < 1e-9
+    assert np.linalg.norm((ppres - ppres.mean()) - (p_ex - p_ex.mean())) / np.linalg.norm(p_ex - p_ex.mean()) < 1e-8
+
+
 def test_coupled_neumann_not_yet_supported():
     # Coupled surface (Neumann/Robin) terms aren't supported yet -> clear error.
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3)
