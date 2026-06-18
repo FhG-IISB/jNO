@@ -605,8 +605,12 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
         left_has = _contains_unknown_symbol(domain, expr.left)
         right_has = _contains_unknown_symbol(domain, expr.right)
 
-        # product/division of two unknown-dependent factors -> nonlinear
-        if expr.op in {"*", "/"} and left_has and right_has:
+        # product of two unknown-dependent factors -> nonlinear (c * u stays linear)
+        if expr.op == "*" and left_has and right_has:
+            return True
+        # division with the unknown in the denominator -> nonlinear, e.g. 1/u, c/u, u/u
+        # (u / c, a constant denominator, stays linear)
+        if expr.op == "/" and right_has:
             return True
 
         # powers of the unknown are nonlinear except u**1
