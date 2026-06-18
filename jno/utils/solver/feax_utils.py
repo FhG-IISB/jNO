@@ -1515,8 +1515,21 @@ def _build_multifield_feax_problem(domain, ir, fields, field_index, *, apply_dir
         elif t.support == "boundary":
             boundary_terms_by_tag.setdefault(t.region_id, []).append(_typed_term(t))
 
+    # Temporal tags (and runtime parameters) used by the coupled coefficients, so a
+    # t-dependent coefficient (e.g. a body force e^{-t}, a source f(x,t)) is evaluated at
+    # the runtime time via feax InternalVars rather than baked at a fixed t.
+    temporal_tags: set = set()
+    runtime_parameter_tags: list = []
+    for _coeff, _tfi in term_list + [t for terms in boundary_terms_by_tag.values() for t in terms]:
+        temporal_tags.update(_collect_temporal_tags_for_feax(_coeff))
+        _collect_runtime_parameter_tags_for_feax(_coeff, runtime_parameter_tags)
+    temporal_tags = tuple(sorted(temporal_tags))
+    runtime_parameter_tags = tuple(runtime_parameter_tags)
+
     problem_ref: dict[str, Any] = {"problem": None}
-    kernel = _make_multifield_volume_kernel(domain, term_list, fields, field_index, (), (), problem_ref)
+    kernel = _make_multifield_volume_kernel(
+        domain, term_list, fields, field_index, temporal_tags, runtime_parameter_tags, problem_ref
+    )
 
     # Coupled surface (Neumann/Robin) terms: one universal surface kernel per boundary
     # tag, grouping that tag's terms by test field into the block residual. feax matches
@@ -1531,7 +1544,9 @@ def _build_multifield_feax_problem(domain, ir, fields, field_index, *, apply_dir
             continue
         location_fns.append(loc_fn)
         surface_kernels.append(
-            _make_multifield_surface_kernel(domain, tag_terms, fields, field_index, tag, (), (), problem_ref)
+            _make_multifield_surface_kernel(
+                domain, tag_terms, fields, field_index, tag, temporal_tags, runtime_parameter_tags, problem_ref
+            )
         )
 
     class GeneratedMultifieldProblem(fe.Problem):
@@ -1573,6 +1588,26 @@ def _zero_mass_dirichlet_rows(M, bc):
     if rows.shape[0] == 0:
         return M
     return jnp.asarray(M).at[rows, :].set(0.0).at[:, rows].set(0.0)
+
+
+def _zero_forcing_dirichlet_rows(forcing_fn, bc):
+    """Wrap a forcing callback ``f(t)`` to zero its Dirichlet rows.
+
+    The transient forcing is the *raw* source load (assembled without Dirichlet
+    elimination), so it has entries at constrained DOFs. The Dirichlet rows must read
+    ``u[d]=g`` from the load ``c`` alone — a source contributes only to free DOFs — so the
+    forcing is zeroed there before it enters the stepper ``M w_old + dt·(c + f(t))``."""
+    rows = None if bc is None else getattr(bc, "bc_rows", None)
+    if forcing_fn is None or rows is None:
+        return forcing_fn
+    rows = jnp.asarray(rows).reshape(-1)
+    if rows.shape[0] == 0:
+        return forcing_fn
+
+    def cleaned(t, args=None):
+        return jnp.asarray(forcing_fn(t, args)).reshape(-1).at[rows].set(0.0)
+
+    return cleaned
 
 
 def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_domain: bool = True, fields_override=None):

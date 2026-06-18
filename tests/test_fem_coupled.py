@@ -243,10 +243,11 @@ def test_coupled_transient_diffusion_decays_to_analytic():
     assert np.linalg.norm(w[n:]) > 0.1  # p rose from zero through the coupling
 
 
-def test_coupled_transient_requires_time_derivative_per_field():
-    # Every coupled transient field must carry a time derivative; an algebraic (DAE)
-    # field (here p has no p_t) would need a zero mass block + a careful solve and
-    # is not supported yet -> a clear error rather than a silently mis-sized M.
+def test_coupled_transient_algebraic_field_gets_zero_mass_block():
+    # An algebraic (DAE) field -- here p has no p_t -- is supported: it gets a ZERO mass
+    # block (the mass is built against the full field set), not a guard error. The user
+    # makes the resulting saddle well-posed (e.g. the pressure pin in the transient Stokes
+    # test, test_fem_transient_bc.py::test_transient_stokes_dae_recovers).
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2, time=(0.0, 0.05, 6))
     u, v = d.fem_symbols(names=("u", "v"))
     p, q = d.fem_symbols(names=("p", "q"))
@@ -255,10 +256,14 @@ def test_coupled_transient_requires_time_derivative_per_field():
     ci = d.variable("initial", split=True)
     ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
     pi, qi = p.bind(x=xi, y=yi, t=ti), q.bind(x=xi, y=yi, t=ti)
-    u_eq = ui.t * vi + (ui.x * vi.x + ui.y * vi.y) + pi * vi
+    u_eq = ui.t * vi + (ui.x * vi.x + ui.y * vi.y) + pi * vi  # u transient
     p_eq = (pi.x * qi.x + pi.y * qi.y) + u.bind(x=xi, y=yi, t=ti) * qi  # no p_t -> algebraic
-    with pytest.raises(NotImplementedError, match="every field to carry a time derivative"):
-        jno.fem([u_eq, p_eq, u(xb, yb) - 0.0, p(xb, yb) - 0.0, u(ci[0], ci[1]) - 0.0])
+    n = int(np.asarray(d.mesh.points).shape[0])
+    fem = jno.fem([u_eq, p_eq, u(xb, yb) - 0.0, p(xb, yb) - 0.0, u(ci[0], ci[1]) - 0.0])
+    assert fem.is_transient and fem.dofs == 2 * n
+    M = _dense(fem.M)
+    assert np.allclose(M[n:, n:], 0.0)  # p's mass block is zero (algebraic field)
+    assert np.abs(M[:n, :n]).max() > 0.0  # u carries mass
 
 
 def test_coupled_neumann_robin_mixed_order_recovers_manufactured():

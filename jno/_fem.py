@@ -348,7 +348,8 @@ def _multifield_initial_state(domain: Any, prob: Any, fields: List[Any], field_i
         fidx = field_index.get(_field_key_of(ic))
         if fidx is None:
             continue
-        _comp, node = _essential_spec(_bare(ic))
+        comp, node = _essential_spec(_bare(ic))
+        vec = int(fields[fidx]["vec"])
         pts = jnp.asarray(prob.mesh[fidx].points)[:, : domain.dimension]
         n_i = int(pts.shape[0])
         const = _constant_of(node)
@@ -357,13 +358,21 @@ def _multifield_initial_state(domain: Any, prob: Any, fields: List[Any], field_i
         else:
             v = jnp.asarray(_eval_value_node_at(node, pts))
             vals = jnp.broadcast_to(v, (n_i,)) if v.shape[0] == 1 else v
-        block = jnp.asarray(vals).reshape(-1)
-        if block.shape[0] != offsets[fidx + 1] - offsets[fidx]:
-            raise NotImplementedError(
-                "jno.fem: vector-field initial conditions in coupled transient are not supported yet "
-                f"(field {fidx}: got {block.shape[0]} values for {offsets[fidx + 1] - offsets[fidx]} dofs)."
-            )
-        state0 = state0.at[offsets[fidx] : offsets[fidx + 1]].set(block)
+        vals = jnp.asarray(vals).reshape(-1)
+        if comp is not None:  # one component c of a vector field: place at node*vec + c
+            idx = offsets[fidx] + jnp.arange(n_i) * vec + comp
+        elif vec == 1:  # scalar field
+            idx = offsets[fidx] + jnp.arange(n_i)
+        else:  # all components from one (vector-valued) IC node -> node-major flatten
+            if vals.shape[0] != n_i * vec:
+                raise NotImplementedError(
+                    "jno.fem: write a vector-field initial condition per component "
+                    "(u(initial)[i] - g_i) for coupled transient."
+                )
+            idx = offsets[fidx] + jnp.arange(n_i * vec)
+        if vals.shape[0] != idx.shape[0]:
+            raise ValueError(f"jno.fem: IC value count {vals.shape[0]} != {idx.shape[0]} dofs for field {fidx}.")
+        state0 = state0.at[idx].set(vals)
     return state0
 
 
@@ -804,10 +813,14 @@ def _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals
     drives backward Euler — ``(M + dt·A) w = M w`` (linear) or a Newton solve of
     ``M (w-w_old)/dt + R(w) = 0`` (nonlinear).
 
-    Scope: every field must carry a time derivative (algebraic/DAE fields — a zero
-    mass block, e.g. transient Stokes pressure — are not handled yet)."""
+    An **algebraic / DAE field** (one with no time derivative — e.g. the pressure of a
+    transient Stokes problem) is handled structurally: building the mass against the full
+    field set gives it a **zero mass block**. The resulting ``(M + dt·A)`` is then a saddle
+    system, well-posed exactly when the steady block is (inf-sup + a pressure pin via
+    ``domain.point_region``). jno constructs it faithfully; the user's solve reveals an
+    ill-posed setup (e.g. a forgotten ``u_t``)."""
     from .utils.solver.backend_blocks import FeaxTimeBlock
-    from .utils.solver.feax_utils import _dense_array, _infer_fields, _lower_statefield_to_trial, _zero_mass_dirichlet_rows
+    from .utils.solver.feax_utils import _dense_array, _zero_forcing_dirichlet_rows, _zero_mass_dirichlet_rows
     from .utils.solver.fem_route import _assemble_fem_residual_from_ir, _assemble_fem_system_from_ir
     from .utils.solver.time_route import (
         _build_auto_forcing_vector_fn,
@@ -818,14 +831,10 @@ def _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals
     from .utils.solver.weak_form import LoweredWeakForm
 
     mass_ir, op_ir, src_ir = _split_first_order_linear_terms(ir)
-    mass_keys = {f["field_key"] for f in _infer_fields(_lower_statefield_to_trial(mass_ir.volume_expr, {}))[0]}
-    if mass_keys != {f["field_key"] for f in fields}:
-        raise NotImplementedError(
-            "jno.fem: coupled transient requires every field to carry a time derivative (u_t * test); "
-            "algebraic (DAE) fields are not supported yet."
-        )
 
     # Shared field layout so the separately-assembled mass and operator blocks align.
+    # Threaded into the mass assembly too, so a field with no temporal term gets a zero
+    # mass block (the DAE case) rather than a mis-sized M.
     override = (fields, field_index)
     M_sys, _bM = _assemble_fem_system_from_ir(domain, mass_ir, fields_override=override)
     # Zero the mass's Dirichlet rows/cols (feax leaves identity rows): a constrained DOF
@@ -856,6 +865,8 @@ def _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals
             forcing_vector_fn = _build_auto_forcing_vector_fn(
                 domain, src_ir, size=int(A.shape[0]), dtype=A.dtype, fields_override=override
             )[0]
+            # the raw source must not pollute Dirichlet rows (those read g from c)
+            forcing_vector_fn = _zero_forcing_dirichlet_rows(forcing_vector_fn, domain._feax_bc)
         prob = domain._feax_problem  # op_ir block problem (same block layout as mass_ir via override)
         state0 = _multifield_initial_state(domain, prob, fields, field_index, ic_residuals)
         block = FeaxTimeBlock(

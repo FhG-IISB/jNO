@@ -121,3 +121,84 @@ def test_coupled_transient_source_recovers():
     p_ex = 2.0 - 2.0 * np.exp(-fem.t1) * (1.0 + fem.t1)
     assert abs(w[:n].mean() - u_ex) / u_ex < 1e-2 and w[:n].std() < 1e-8
     assert abs(w[n:].mean() - p_ex) / p_ex < 1e-2 and w[n:].std() < 1e-8
+
+
+def test_coupled_transient_time_dependent_source():
+    # Time-dependent coupled source: u_t = -u + e^{-t} (resonant) -> u = t e^{-t};
+    # p_t = -p + u -> p = (t^2/2) e^{-t}. Spatially uniform (zero-flux), mesh-independent.
+    # Exercises a temporal coefficient inside the block kernel (forcing evaluated at run-time t).
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3, time=(0.0, 1.0, 101))
+    u, v = d.fem_symbols(names=("u", "v"))
+    p, q = d.fem_symbols(names=("p", "q"))
+    xi, yi, ti = d.variable("interior", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    pi, qi = p.bind(x=xi, y=yi, t=ti), q.bind(x=xi, y=yi, t=ti)
+    fem = jno.fem(
+        [
+            ui.t * vi + ui * vi - jno.np.exp(-1.0 * ti) * vi,  # u_t = -u + e^{-t}
+            pi.t * qi + pi * qi - u.bind(x=xi, y=yi, t=ti) * qi,  # p_t = -p + u
+            u(ci[0], ci[1]) - 0.0,
+            p(ci[0], ci[1]) - 0.0,
+        ]
+    )
+    n = int(np.asarray(d.mesh.points).shape[0])
+    f = fem.operator.forcing_vector_fn
+    assert f is not None and not np.allclose(np.asarray(f(0.1)), np.asarray(f(0.9)))  # genuinely time-varying
+    w = _march(fem)
+    u_ex = fem.t1 * np.exp(-fem.t1)
+    p_ex = (fem.t1**2 / 2.0) * np.exp(-fem.t1)
+    assert abs(w[:n].mean() - u_ex) / u_ex < 2e-2 and w[:n].std() < 1e-8
+    assert abs(w[n:].mean() - p_ex) / p_ex < 2e-2 and w[n:].std() < 1e-8
+
+
+def test_transient_stokes_dae_recovers():
+    # Transient (unsteady) Stokes: pressure has no p_t -> algebraic (DAE) field, which gets a
+    # ZERO mass block; the single-node pressure pin (domain.point_region) makes the
+    # (M + dt A) saddle solvable. Manufactured u=(x,-y) (steady, so a time-CONSTANT velocity
+    # Dirichlet -> no time-varying BC needed) and p=e^{-t} x (decaying), driven by the
+    # t-dependent body force f=e^{-t}(1,0). P2 velocity / P1 pressure -> exact recovery.
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2, time=(0.0, 0.3, 31))
+    d.point_region("ppin", (0.0, 0.0))
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)  # P2 velocity
+    p, q = d.fem_symbols(names=("p", "q"), order=1)  # P1 pressure (no p_t -> algebraic)
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xpn, ypn, _ = d.variable("ppin", split=True)
+    ci = d.variable("initial", split=True)
+    gu, gv = jno.np.grad(u, [xi, yi]), jno.np.grad(v, [xi, yi])
+    pp, qq = p.bind(x=xi, y=yi, t=ti), q.bind(x=xi, y=yi, t=ti)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    mom = (
+        jno.np.inner(ui.t, vi, n_contract=1)
+        + jno.np.inner(gu, gv, n_contract=2)
+        - pp * jno.np.trace(gv)
+        - jno.np.exp(-1.0 * ti) * vi[0]  # body force f = e^{-t} (1, 0)
+    )
+    cont = -qq * jno.np.trace(gu)
+    fem = jno.fem(
+        [
+            mom,
+            cont,
+            u(xb, yb)[0] - xb,
+            u(xb, yb)[1] - (-1.0 * yb),
+            p(xpn, ypn) - 0.0,  # pressure pin (the manufactured p = e^{-t} x is 0 at the origin)
+            u(ci[0], ci[1])[0] - ci[0],
+            u(ci[0], ci[1])[1] - (-1.0 * ci[1]),
+        ]
+    )
+    assert fem.is_transient and fem.is_linear
+    off = fem.problem.offset
+    nu = off[1] - off[0]
+    M = _dense(fem.M)
+    assert np.allclose(M[nu:, nu:], 0.0)  # DAE: pressure carries a zero mass block
+    assert np.abs(M[:nu, :nu]).max() > 0.0  # velocity mass present
+    w = _march(fem)
+    pts_v = np.asarray(fem.problem.mesh[0].points)
+    pts_p = np.asarray(fem.problem.mesh[1].points)
+    uu = w[off[0] : off[1]].reshape(-1, 2)
+    pr = w[off[1] :]
+    u_ex = np.stack([pts_v[:, 0], -pts_v[:, 1]], axis=-1)
+    p_ex = np.exp(-fem.t1) * pts_p[:, 0]
+    assert np.linalg.norm(uu - u_ex) / np.linalg.norm(u_ex) < 1e-9
+    assert np.linalg.norm(pr - p_ex) / np.linalg.norm(p_ex) < 1e-8

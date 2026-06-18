@@ -1250,7 +1250,14 @@ class domain(MeshIOMixin):
         coord = pts[nid : nid + 1].copy()  # (1, D)
         bbox = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
         tol = 1e-6 * bbox if bbox > 0 else 1e-7
-        self._mesh_pool[name] = coord
+        # Time-dependent domains store pools as (n_time, n_pts, D); broadcast the pin node
+        # across the time slices so domain.variable(name) samples it like any other region.
+        interior_pool = self._mesh_pool.get("interior")
+        if interior_pool is not None and np.asarray(interior_pool).ndim == 3:
+            n_time = int(np.asarray(interior_pool).shape[0])
+            self._mesh_pool[name] = np.broadcast_to(coord, (n_time,) + coord.shape).copy()  # (n_time, 1, D)
+        else:
+            self._mesh_pool[name] = coord
         self._boundary_regions[name] = BoundaryRegion(
             tag=name, dim=self.dimension, points=coord, edges=None, triangles=None, tol=tol
         )

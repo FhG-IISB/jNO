@@ -43,6 +43,7 @@ from .feax_utils import (
     _dense_array,
     _make_internal_vars,
     _prepare_feax_runtime,
+    _zero_forcing_dirichlet_rows,
     _zero_mass_dirichlet_rows,
 )
 from .parametric_helpers import (
@@ -1840,6 +1841,8 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             forcing_vector_fn, forcing_basis, forcing_parameter_exprs = _build_auto_forcing_vector_fn(
                 domain, src_ir, size=full_size, dtype=M.dtype
             )
+            # the raw source must not pollute Dirichlet rows (those read g from affine_bias)
+            forcing_vector_fn = _zero_forcing_dirichlet_rows(forcing_vector_fn, domain._feax_bc)
             auto_forcing = True
             forcing_mode = "weak_auto"
 
