@@ -396,15 +396,17 @@ def _block_offsets(fields: List[Any], n_nodes: int) -> List[int]:
 
 
 def _multifield_dirichlet_dofs_1d(domain, dirichlet_raw, fields, field_index, n_nodes):
-    """``dirichlet_raw`` ``(field_key, region, comp, value)`` -> block ``(dof, g)`` pairs.
+    """``dirichlet_raw`` ``(field_key, region, comp, value, value_node)`` -> block ``(dof, g)`` pairs.
 
     Mirrors :func:`_dirichlet_dofs` per field but offsets each DOF into the field's
     block; ``value`` is a constant or a ``value(point)`` callable (so coordinate-
-    dependent Dirichlet such as ``u(xb) - xb`` works)."""
+    dependent Dirichlet such as ``u(xb) - xb`` works). ``value_node`` (the raw trace
+    node) is consumed only by the 2D/3D time-varying path; the 1D path handles
+    coordinate dependence through ``value`` and ignores it."""
     pts = np.asarray(domain.mesh.points)
     offs = _block_offsets(fields, n_nodes)
     pairs: List[Tuple[int, float]] = []
-    for field_key, region, comp, value in dirichlet_raw:
+    for field_key, region, comp, value, _value_node in dirichlet_raw:
         fidx = field_index.get(field_key)
         if fidx is None:
             continue

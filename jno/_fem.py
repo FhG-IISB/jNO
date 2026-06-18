@@ -26,6 +26,7 @@ from __future__ import annotations
 from typing import Any, Callable, List, Optional, Tuple
 
 import jax.numpy as jnp
+import numpy as np
 
 from .trace import FemLinearSystem, TestFunction, TrialFunction, Variable
 
@@ -308,14 +309,38 @@ def _value_from_node(node: Any) -> Any:
     return const if const is not None else _coord_value_fn(node)
 
 
-def _dirichlet_spec(bare: Any) -> Tuple[Optional[int], Any]:
-    """``(component_index_or_None, value)`` for an essential Dirichlet residual.
+def _is_temporal_value_node(node: Any) -> bool:
+    """True if an essential value carries a temporal Variable (time-varying ``g(x,t)``)."""
+    return any(isinstance(v, Variable) and getattr(v, "axis", None) == "temporal" for v in _walk(node))
 
-    ``component`` is ``None`` for an all-component clamp (``u(region) - g``) or an
-    integer for a per-component / roller BC (``u(region)[i] - g``).
-    """
+
+def _eval_value_node_at_time(value_node: Any, points: Any, t: Any) -> Any:
+    """Evaluate a time-dependent coordinate value ``g(x, t)`` at ``points`` and time ``t``.
+
+    Like :func:`_eval_value_node_at`, but the **temporal** Variable carries its own tag
+    (``'__time__'``, separate from the spatial coordinate tag), so its context entry is a
+    ``(n, 1)`` array filled with ``t`` while each spatial tag maps to the points. (Mapping
+    every tag to the points, as the steady evaluator does, makes the time variable read a
+    spatial column.) Reuses the existing ``TraceEvaluator``."""
+    from .trace_evaluator import TraceEvaluator
+
+    pts = jnp.atleast_2d(jnp.asarray(points))
+    ctx: dict = {}
+    for v in _walk(value_node):
+        if isinstance(v, Variable):
+            ctx[v.tag] = jnp.full((pts.shape[0], 1), t, dtype=pts.dtype) if getattr(v, "axis", None) == "temporal" else pts
+    return jnp.reshape(TraceEvaluator({}).evaluate(value_node, context=ctx), (-1,))
+
+
+def _dirichlet_spec(bare: Any) -> Tuple[Optional[int], Any, Any]:
+    """``(component_index_or_None, value, value_node)`` for an essential Dirichlet residual.
+
+    ``component`` is ``None`` for an all-component clamp (``u(region) - g``) or an integer
+    for a per-component / roller BC. ``value`` is a constant or ``value(point)`` callable;
+    ``value_node`` is the raw expression (kept so the transient route can detect/evaluate a
+    time-varying ``g(x,t)``)."""
     comp, value_node = _essential_spec(bare)
-    return comp, _value_from_node(value_node)
+    return comp, _value_from_node(value_node), value_node
 
 
 def _initial_state(bare: Any, domain: Any) -> Any:
@@ -592,8 +617,8 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
                     "jno.fem: a residual with the trial but no test function must live on a boundary "
                     "region (Dirichlet) or the 'initial' region (IC). Got a volume region — did you forget the test function?"
                 )
-            comp, value = _dirichlet_spec(_bare(c))
-            dirichlet_raw.append((_field_key_of(c), region, comp, value))
+            comp, value, value_node = _dirichlet_spec(_bare(c))
+            dirichlet_raw.append((_field_key_of(c), region, comp, value, value_node))
             if comp is None:  # all components: u(region) - g
                 if isinstance(dirichlet_values.get(region), dict):
                     raise ValueError(f"jno.fem: region {region!r} mixes all-component and per-component Dirichlet.")
@@ -691,6 +716,12 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     if is_transient:
         from .utils.solver.time_route import _assemble_feax_time_from_ir
 
+        if any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw):
+            raise NotImplementedError(
+                "jno.fem: time-varying Dirichlet g(x,t) on a single-field transient problem "
+                "is not wired yet; it is supported on the coupled (multi-field) transient path. "
+                "(Constant non-homogeneous Dirichlet works on both.)"
+            )
         if len(ic_residuals) > 1:
             raise NotImplementedError("jno.fem: multiple initial conditions (multi-field) are not supported yet.")
         n_nodes = int(jnp.asarray(domain.mesh.points).shape[0])
@@ -770,7 +801,8 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
     # uses — so the Dirichlet field indices match the kernel/Problem field order.
     fields, field_index = _infer_fields(ir.volume_expr)
     by_field: dict[int, dict[str, Any]] = {}
-    for field_key, region, comp, value in dirichlet_raw:
+    dirichlet_tv: List[Any] = []  # (field_idx, region, comp, value_node) for time-varying g(x,t)
+    for field_key, region, comp, value, value_node in dirichlet_raw:
         fidx = field_index.get(field_key)
         if fidx is None:
             continue
@@ -782,11 +814,13 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
             current = dict(current) if isinstance(current, dict) else {}
             current[_COMPONENT_NAMES[comp]] = value
             region_values[region] = current
+        if _is_temporal_value_node(value_node):
+            dirichlet_tv.append((fidx, region, comp, value_node))
     domain._fem_dirichlet_by_field = by_field
 
     # Coupled transient (multi-field + time): block M + block spatial operator A.
     if is_transient:
-        return _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals, classification)
+        return _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals, classification, dirichlet_tv)
 
     # Nonlinear coupled: feax autodiffs the block residual/Jacobian on the multi-field
     # problem (same _build_feax_problem path as linear), so the nonlinear route works
@@ -799,7 +833,81 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
     return FEM(domain=domain, op=op, classification=classification, mode="linear")
 
 
-def _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals, classification):
+def _sum_forcings(f1, f2):
+    """Sum two optional forcing callables ``f(t, args) -> vector`` (None acts as 0)."""
+    if f1 is None:
+        return f2
+    if f2 is None:
+        return f1
+
+    def summed(t, args=None):
+        return jnp.asarray(f1(t, args)).reshape(-1) + jnp.asarray(f2(t, args)).reshape(-1)
+
+    return summed
+
+
+def _time_varying_dirichlet_lift(domain, prob, bc, A, dirichlet_tv, fields, field_index):
+    """JIT-friendly time-varying Dirichlet load ``c_dir(t)`` (or ``None`` if no time-varying BC).
+
+    Returns the per-time load that makes ``A w = c_dir(t)`` carry ``g(.,t)`` on the Dirichlet
+    rows and the lift ``-A_fd·g(t)`` on the free rows — i.e. the steady RHS for the Dirichlet
+    values at time ``t``, computed exactly as the steady path does: ``c(t) = A·u0(t) -
+    res_bc(u0(t), bc_t)`` with ``u0(t)`` the ``g(t)``-lifted state (``g`` on the Dirichlet
+    DOFs). ``g_vals(t)`` evaluates each time-varying spec's ``g(x,t)`` at the Dirichlet DOFs'
+    coordinates (precomputed once) and masks it onto that spec's rows; constant rows keep
+    ``bc.bc_vals``. All per-``t`` work is pure JAX (``where`` + ``replace_vals`` + a matvec +
+    the parametric residual), so it traces under ``jax.jit`` / ``lax.scan``."""
+    if not dirichlet_tv:
+        return None
+    import feax as fe
+    import jax
+    from feax.assembler import create_res_bc_parametric
+
+    rows = np.asarray(bc.bc_rows).reshape(-1)
+    if rows.shape[0] == 0:
+        return None
+    offsets = list(prob.offset) + [int(prob.num_total_dofs_all_vars)]
+    dim = domain.dimension
+    # per-row (field, component, coordinate)
+    row_field = np.searchsorted(np.asarray(offsets), rows, side="right") - 1
+    bc_coords = np.zeros((rows.shape[0], dim))
+    row_comp = np.zeros(rows.shape[0], dtype=int)
+    for i, r in enumerate(rows):
+        f = int(row_field[i])
+        vt = int(fields[f]["vec"])
+        local = int(r) - offsets[f]
+        bc_coords[i] = np.asarray(prob.mesh[f].points)[local // vt][:dim]
+        row_comp[i] = local % vt
+    bc_coords_j = jnp.asarray(bc_coords)
+    # per-spec mask over the bc rows + the value node
+    tv = []
+    for fidx, region, comp, value_node in dirichlet_tv:
+        loc = domain._make_tag_location_fn(region)
+        in_region = np.asarray(jax.vmap(loc)(bc_coords_j)).reshape(-1)
+        mask = (row_field == fidx) & in_region
+        if comp is not None:
+            mask = mask & (row_comp == comp)
+        tv.append((jnp.asarray(mask), value_node))
+
+    res_bc_param = create_res_bc_parametric(prob)
+    iv = fe.InternalVars()
+    A = jnp.asarray(A)
+    rows_j = jnp.asarray(rows)
+    zeros = jnp.zeros((offsets[-1],), dtype=A.dtype)
+    base_vals = jnp.asarray(bc.bc_vals)
+
+    def lift_fn(t, args=None):
+        g_vals = base_vals
+        for mask, node in tv:
+            g_vals = jnp.where(mask, _eval_value_node_at_time(node, bc_coords_j, t), g_vals)
+        u0 = zeros.at[rows_j].set(g_vals)  # g(t)-lifted state (g on the Dirichlet DOFs)
+        res = jnp.asarray(res_bc_param(u0, iv, bc.replace_vals(g_vals))).reshape(-1)
+        return A @ u0 - res  # steady RHS for g(t): g on Dirichlet rows, -A_fd·g on free rows
+
+    return lift_fn
+
+
+def _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals, classification, dirichlet_tv=()):
     """Assemble a coupled (multi-field) first-order transient weak form.
 
     Reuses the steady block assembly: the IR is split into a mass IR (additive terms
@@ -834,13 +942,19 @@ def _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals
 
     # Shared field layout so the separately-assembled mass and operator blocks align.
     # Threaded into the mass assembly too, so a field with no temporal term gets a zero
-    # mass block (the DAE case) rather than a mis-sized M.
+    # mass block (the DAE case) rather than a mis-sized M. The mass is assembled *raw*
+    # (apply_dirichlet=False) and only its Dirichlet ROWS are zeroed below — the Dirichlet
+    # columns are kept so the stepper's M(w_new-w_old) captures M_fd·ġ for time-varying
+    # Dirichlet (it cancels when ġ=0). store_on_domain=False keeps this scratch problem
+    # off the domain so the operator problem/bc remain the ones exposed on `fem`.
     override = (fields, field_index)
-    M_sys, _bM = _assemble_fem_system_from_ir(domain, mass_ir, fields_override=override)
-    # Zero the mass's Dirichlet rows/cols (feax leaves identity rows): a constrained DOF
-    # carries no time derivative, so M u̇ + A u = c reads u[d]=g there (faithful for
-    # non-homogeneous Dirichlet). domain._feax_bc is the mass problem's bc (same Dirichlet).
-    M = _zero_mass_dirichlet_rows(jnp.asarray(_dense_array(M_sys)), domain._feax_bc)
+    M_raw = jnp.asarray(
+        _dense_array(
+            _assemble_fem_system_from_ir(
+                domain, mass_ir, fields_override=override, apply_dirichlet=False, store_on_domain=False
+            )[0]
+        )
+    )
     t0, t1, dt = _infer_time_window(domain)
     common = dict(
         backend="feax_time",
@@ -857,25 +971,30 @@ def _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals
     if _is_linear_first_order_ir(ir):
         A_sys, bA = _assemble_fem_system_from_ir(domain, op_ir, fields_override=override)
         A = jnp.asarray(_dense_array(A_sys))
-        # Source/forcing terms (no trial) -> a block forcing f(t); constant or temporal.
-        # The user marches the canonical (M+dt·A)w_next = M·w + dt·(c + f(t_next)); a
-        # constant source is just f0(t)=const, so the same path covers both.
-        forcing_vector_fn = None
+        bc, prob = domain._feax_bc, domain._feax_problem  # operator block problem + Dirichlet
+        M = _zero_mass_dirichlet_rows(M_raw, bc)
+        # Source/forcing terms (no trial) -> a block forcing f(t), zeroed at Dirichlet rows
+        # (a source contributes only to free DOFs); constant or temporal.
+        source_fn = None
         if len(src_ir.terms) > 0:
-            forcing_vector_fn = _build_auto_forcing_vector_fn(
-                domain, src_ir, size=int(A.shape[0]), dtype=A.dtype, fields_override=override
-            )[0]
-            # the raw source must not pollute Dirichlet rows (those read g from c)
-            forcing_vector_fn = _zero_forcing_dirichlet_rows(forcing_vector_fn, domain._feax_bc)
-        prob = domain._feax_problem  # op_ir block problem (same block layout as mass_ir via override)
+            source_fn = _zero_forcing_dirichlet_rows(
+                _build_auto_forcing_vector_fn(
+                    domain, src_ir, size=int(A.shape[0]), dtype=A.dtype, fields_override=override
+                )[0],
+                bc,
+            )
+        # Time-varying Dirichlet g(x,t) -> a t-dependent lift c_dir(t) (carries g(.,t) on the
+        # Dirichlet rows); the constant lift `bA` is then subsumed, so affine_bias = 0.
+        tv_lift_fn = _time_varying_dirichlet_lift(domain, prob, bc, A, dirichlet_tv, fields, field_index)
+        if tv_lift_fn is not None:
+            forcing_vector_fn = _sum_forcings(tv_lift_fn, source_fn)
+            affine_bias = jnp.zeros((int(A.shape[0]),), dtype=A.dtype)
+        else:
+            forcing_vector_fn = source_fn
+            affine_bias = jnp.asarray(bA).reshape(-1)
         state0 = _multifield_initial_state(domain, prob, fields, field_index, ic_residuals)
         block = FeaxTimeBlock(
-            M=M,
-            A=A,
-            affine_bias=jnp.asarray(bA).reshape(-1),
-            forcing_vector_fn=forcing_vector_fn,
-            state0=state0,
-            **common,
+            M=M, A=A, affine_bias=affine_bias, forcing_vector_fn=forcing_vector_fn, state0=state0, **common
         )
         return FEM(domain=domain, op=block, classification=classification, mode="transient")
 
@@ -885,6 +1004,7 @@ def _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals
     residual_ir = LoweredWeakForm(domain=domain, terms=list(op_ir.terms) + list(src_ir.terms))
     spatial = _assemble_fem_residual_from_ir(domain, residual_ir, fields_override=override)
     prob = domain._feax_problem
+    M = _zero_mass_dirichlet_rows(M_raw, domain._feax_bc)
     state0 = _multifield_initial_state(domain, prob, fields, field_index, ic_residuals)
     block = FeaxTimeBlock(
         mass=lambda t, args=None, _M=M: _M,

@@ -492,6 +492,7 @@ def _assemble_fem_system_concrete(
     apply_dirichlet=True,
     symmetric_bc=True,
     fields_override=None,
+    store_on_domain=True,
 ):
     """
     Assemble one concrete steady linear FEAX contribution.
@@ -499,7 +500,10 @@ def _assemble_fem_system_concrete(
     This helper deliberately receives an IR that no longer contains runtime
     parameter ModelCall nodes. ``fields_override`` forces the multi-field block
     layout (used by the coupled transient route so mass and operator blocks share
-    one field ordering).
+    one field ordering). ``apply_dirichlet=False`` returns the *raw* matrix (no
+    Dirichlet rows/cols eliminated) — used to keep the transient mass's Dirichlet
+    columns for the time-varying-Dirichlet coupling; ``store_on_domain=False`` keeps
+    that scratch problem off the domain.
     """
     import feax as fe
 
@@ -508,6 +512,7 @@ def _assemble_fem_system_concrete(
         ir,
         apply_dirichlet=apply_dirichlet,
         fields_override=fields_override,
+        store_on_domain=store_on_domain,
     )
     internal_vars = fe.InternalVars()
 
@@ -552,6 +557,8 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
     """Assemble ``A(args) u = b(args)`` for affine runtime weak-form terms."""
     symmetric_bc = kwargs.get("symmetric_bc", True)
     fields_override = kwargs.get("fields_override", None)
+    apply_dirichlet = kwargs.get("apply_dirichlet", True)
+    store_on_domain = kwargs.get("store_on_domain", True)
 
     has_runtime_parameters = any(_contains_runtime_parameter(term.coeff) for term in ir.terms)
 
@@ -559,9 +566,10 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
         return _assemble_fem_system_concrete(
             domain,
             ir,
-            apply_dirichlet=True,
+            apply_dirichlet=apply_dirichlet,
             symmetric_bc=symmetric_bc,
             fields_override=fields_override,
+            store_on_domain=store_on_domain,
         )
 
     static_ir, parameter_irs, runtime_parameter_exprs, _ = _split_parametric_operator_ir(ir)

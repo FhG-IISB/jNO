@@ -1572,22 +1572,23 @@ def _build_multifield_feax_problem(domain, ir, fields, field_index, *, apply_dir
 
 
 def _zero_mass_dirichlet_rows(M, bc):
-    """Zero a mass matrix's Dirichlet rows + columns so ``M u̇ + A u = c`` reads ``u[d]=g``.
+    """Zero a mass matrix's Dirichlet **rows** so ``M u̇ + A u = c`` reads ``u[d]=g``.
 
     feax applies symmetric Dirichlet (identity rows) to *every* assembled matrix — correct
     for a stiffness operator, but wrong for the **mass**: a constrained DOF must carry no
-    time derivative, otherwise the assembled semidiscrete system is not a faithful
-    representation of a non-homogeneous transient Dirichlet condition. With these rows/cols
-    zeroed (and ``A``'s Dirichlet rows = identity, ``c`` carrying ``g``), the Dirichlet row
-    of ``(M + dt A) w = M w_old + dt c`` reduces to ``u[d] = g``. Mirrors the native 1D
-    reference :func:`jno.utils.solver.fem_1d._apply_dirichlet_transient`."""
+    time derivative. Zeroing the Dirichlet rows (``A``'s Dirichlet rows are identity, ``c``
+    carries ``g``) makes the Dirichlet row of ``(M + dt A) w = M w_old + dt c`` reduce to
+    ``u[d] = g``. The Dirichlet *columns* are deliberately kept: they couple a free row to a
+    constrained DOF's time derivative (``M_fd·ġ``), which the stepper's ``M(w_new−w_old)``
+    captures — essential for **time-varying** Dirichlet and harmless when ``ġ=0`` (the
+    constant case). So M is asymmetric here, by design."""
     rows = None if bc is None else getattr(bc, "bc_rows", None)
     if rows is None:
         return M
     rows = jnp.asarray(rows).reshape(-1)
     if rows.shape[0] == 0:
         return M
-    return jnp.asarray(M).at[rows, :].set(0.0).at[:, rows].set(0.0)
+    return jnp.asarray(M).at[rows, :].set(0.0)
 
 
 def _zero_forcing_dirichlet_rows(forcing_fn, bc):

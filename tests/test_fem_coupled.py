@@ -222,7 +222,9 @@ def test_coupled_transient_diffusion_decays_to_analytic():
     assert fem.dofs == 2 * n
     M, A = _dense(fem.M), _dense(fem.operator.A)
     assert np.allclose(M[:n, n:], 0.0) and np.allclose(M[n:, :n], 0.0)  # M block-diagonal
-    assert np.allclose(M[:n, :n], M[:n, :n].T) and np.any(np.abs(M[n:, n:]) > 1e-12)  # both masses present
+    # both field masses present (M is intentionally asymmetric: Dirichlet rows zeroed but
+    # columns kept, so the stepper captures M_fd·ġ for time-varying Dirichlet)
+    assert np.any(np.abs(M[:n, :n]) > 1e-12) and np.any(np.abs(M[n:, n:]) > 1e-12)
     # coupling is one-directional: p depends on u, u does NOT depend on p. A transposed
     # block layout would swap these, so this is the block-ordering guard.
     assert np.allclose(A[:n, n:], 0.0)  # u-rows / p-cols: no coupling

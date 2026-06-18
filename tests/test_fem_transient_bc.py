@@ -202,3 +202,44 @@ def test_transient_stokes_dae_recovers():
     p_ex = np.exp(-fem.t1) * pts_p[:, 0]
     assert np.linalg.norm(uu - u_ex) / np.linalg.norm(u_ex) < 1e-9
     assert np.linalg.norm(pr - p_ex) / np.linalg.norm(p_ex) < 1e-8
+
+
+def test_coupled_transient_time_varying_dirichlet():
+    # General time-varying Dirichlet g(x,t) in a coupled block: u carries u=x+t on the
+    # boundary (time-varying) with a constant source 1 (u_t = lap u + 1 -> u=x+t); p carries
+    # the constant Dirichlet p=y (steady). Both linear in space AND time -> P1-exact and
+    # backward-Euler-exact, so recovery is ~machine precision. jno builds a JIT-traceable
+    # forcing_vector_fn(t) (the Dirichlet lift via replace_vals + the parametric residual);
+    # the user marches the canonical stepper.
+    import jax
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2, time=(0.0, 0.4, 41))
+    u, v = d.fem_symbols(names=("u", "v"))
+    p, q = d.fem_symbols(names=("p", "q"))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, tb = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    pi, qi = p.bind(x=xi, y=yi, t=ti), q.bind(x=xi, y=yi, t=ti)
+    fem = jno.fem(
+        [
+            ui.t * vi + ui.x * vi.x + ui.y * vi.y - 1.0 * vi,  # u_t = lap u + 1 -> u=x+t
+            pi.t * qi + pi.x * qi.x + pi.y * qi.y,  # p_t = lap p -> p=y (steady)
+            u(xb, yb) - (xb + tb),  # time-varying Dirichlet u = x + t
+            p(xb, yb) - yb,  # constant Dirichlet p = y
+            u(ci[0], ci[1]) - ci[0],  # IC u = x
+            p(ci[0], ci[1]) - ci[1],  # IC p = y
+        ]
+    )
+    n = int(np.asarray(d.mesh.points).shape[0])
+    assert fem.is_transient and fem.is_linear and fem.dofs == 2 * n
+    f = fem.operator.forcing_vector_fn
+    assert f is not None
+    # the time-varying Dirichlet load is genuinely t-varying and JAX-traceable (replace_vals path)
+    jax.jit(lambda t: f(t))(0.1)
+    assert not np.allclose(np.asarray(f(0.1)), np.asarray(f(0.3)))
+    w = _march(fem)
+    cc = np.asarray(d.mesh.points)[:, :2]
+    u_ex, p_ex = cc[:, 0] + fem.t1, cc[:, 1]
+    assert np.linalg.norm(w[:n] - u_ex) / np.linalg.norm(u_ex) < 1e-9  # u = x + t
+    assert np.linalg.norm(w[n:] - p_ex) / np.linalg.norm(p_ex) < 1e-9  # p = y
