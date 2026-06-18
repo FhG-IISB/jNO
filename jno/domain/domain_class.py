@@ -1157,6 +1157,11 @@ class domain(MeshIOMixin):
         trial = TrialFunction(name=trial_name, value_shape=value_shape, order=order)
         test = TestFunction(name=test_name, value_shape=value_shape, order=order)
         test.field_key = trial.field_key  # one field per fem_symbols() call (pairs u<->phi)
+        # Carry the owning domain so a consumer can recover the mesh / FE space from a
+        # symbol alone -- e.g. jno.np.parameter(phi) sizing a field parameter to the
+        # space (mirrors how Variable carries its _domain).
+        trial._domain = self
+        test._domain = self
         return (trial, test)
 
     def fem_symbols(self, value_shape=(), names=("u", "phi"), order=1):
