@@ -134,6 +134,37 @@ def test_nonlinear_recovers_optimistix():
     assert abs(rec - 1.0) < TOL, f"nonlinear (optimistix): recovered alpha={rec:.4f}"
 
 
+def test_nonaffine_scalar_recovers_via_reassembly():
+    """A parameter inside a nonlinear function (``exp(logk)``) can't be factored into
+    a constant basis, so the operator is re-assembled each call with the parameter
+    threaded as feax InternalVars. The feax kernel is JAX, so the gradient still
+    reaches the parameter."""
+    logk = jno.np.parameter((1,), key=jax.random.PRNGKey(1), name="logk")
+    logk.initialize(jax.nn.initializers.constant(0.7))  # k = e^0.7 ~ 2 (truth: logk=0)
+    logk.dtype(jnp.float64)
+    logk.optimizer(optax.adam(5e-2))
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = 2.0 * (xi * (1.0 - xi) + yi * (1.0 - yi))  # -k lap u = f at k=1
+    weak = jno.np.exp(logk) * (ui.x * vi.x + ui.y * vi.y) - f * vi
+    fem = jno.fem([weak, u(xb, yb) - 0.0], quad_degree=3)
+
+    assert fem.is_linear
+    assert fem.operator.metadata.get("nonaffine_operator") is True  # re-assembly route
+    assert list(fem.operator.runtime_parameter_exprs) == ["logk"]
+
+    A1, b1 = fem.operator.evaluate({"logk": 0.0})  # truth k = exp(0) = 1
+    u_obs = jnp.linalg.solve(jnp.asarray(A1), jnp.asarray(b1).reshape(-1))
+
+    rec = _recover(fem.solve(), logk, u_obs, n=150)
+    assert abs(rec - 0.7) > 0.3, "parameter did not move -- gradient did not reach it through re-assembly"
+    assert abs(rec) < TOL, f"non-affine (exp(logk)): recovered logk={rec:.4f} (truth 0)"
+
+
 def test_global_solve_runs_once_per_step_not_per_node():
     """Freeze the invariant: the global FEM solve is evaluated ~once per optimizer
     step, not vmapped once per mesh node."""
