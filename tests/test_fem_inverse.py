@@ -226,30 +226,23 @@ def test_nodal_field_parameter_recovers_via_crux():
     A_t, b = fem.operator.evaluate({"k": k_true})
     u_obs = jnp.linalg.solve(jnp.asarray(A_t), jnp.asarray(b).reshape(-1))
 
-    # Recovery by differentiating the re-assembled solve w.r.t. the nodal field.
-    # (Well-posed enough here from full-field data; field inversion in general needs
-    # regularization -- jno.fn.regularize.smooth -- which composes as an extra term.)
-    def loss(kn):
-        A, bb = fem.operator.evaluate({"k": kn})
-        uu = jnp.linalg.solve(jnp.asarray(A), jnp.asarray(bb).reshape(-1))
-        return jnp.mean((uu - u_obs) ** 2)
+    A_t, b = fem.operator.evaluate({"k": k_true})
+    u_obs = jnp.linalg.solve(jnp.asarray(A_t), jnp.asarray(b).reshape(-1))
 
-    vg = jax.jit(jax.value_and_grad(loss))
-    kn = jnp.ones_like(k_true)
-    opt = optax.adam(2e-2)
-    st = opt.init(kn)
-    for _ in range(400):
-        _, g = vg(kn)
-        upd, st = opt.update(g, st)
-        kn = optax.apply_updates(kn, upd)
-    rel = float(jnp.linalg.norm(kn - k_true) / jnp.linalg.norm(k_true))
-    assert rel < 0.1, f"nodal field recovery rel-err {rel:.3e}"
-
-    # crux integration: the (n_nodes,) field trains through crux.solve via fem.solve().
+    # Recover the full nodal field k(x) through crux.solve (the differentiable
+    # re-assembled solve). Well-posed enough here from full-field data; field
+    # inversion in general needs regularization (jno.fn.regularize), which composes
+    # as an extra loss term.
     k.dtype(jnp.float64)
-    k.initialize(jax.nn.initializers.constant(1.0))
+    k.initialize(jax.nn.initializers.constant(1.0))  # start k=1 everywhere (nonsingular)
     k.optimizer(optax.adam(2e-2))
     crux = jno.core([(fem.solve() - u_obs).mse], domain=_DUMMY)
-    crux.solve(50)
-    rec = np.asarray(crux.eval([k])[0]).reshape(-1)
-    assert not np.allclose(rec, 1.0), "field parameter did not train through crux.solve"
+    crux.solve(400)
+
+    # crux.eval([single_op]) returns the array itself (a (n_nodes, 1) field), NOT a
+    # one-element list -- so reshape it; do not index [0] (that reads a single node).
+    rec = np.asarray(crux.eval([k])).reshape(-1)
+    assert rec.shape[0] == int(k_true.shape[0]), f"expected the full nodal field, got {rec.shape}"
+    assert (rec.max() - rec.min()) > 1e-2, "recovered field is uniform -- not trained per node"
+    rel = float(np.linalg.norm(rec - np.asarray(k_true)) / np.linalg.norm(np.asarray(k_true)))
+    assert rel < 0.1, f"nodal field recovery via crux rel-err {rel:.3e}"
