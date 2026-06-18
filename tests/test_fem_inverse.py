@@ -486,3 +486,49 @@ def test_transient_nonlinear_default_raises_cleanly():
     assert fem.is_transient and not fem.operator.is_linear()
     with pytest.raises(NotImplementedError, match="nonlinear"):
         fem.solve()
+
+
+# --------------------------------------------------------- non-homogeneous Dirichlet + parametric
+# A parametric operator (e.g. k * stiffness) lifts a non-homogeneous Dirichlet value g into a
+# parameter-scaled RHS term; jno.fem now carries that term (b(theta) = b0 + sum theta*bK) instead
+# of rejecting it. (Only a parameter that scales the Dirichlet *value* itself stays unsupported.)
+
+
+def test_steady_nonhomog_dirichlet_parametric_recovers():
+    """Steady: -k lap u = f with u = 1 on the boundary (non-homogeneous g). Manufactured
+    u* = 1 + x(1-x)y(1-y); recover the scalar k (was 'Runtime Dirichlet parameters not supported')."""
+    k = _alpha()  # trainable scalar named "alpha", start 2.0
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = 2.0 * (xi * (1 - xi) + yi * (1 - yi))
+    fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 1.0], quad_degree=3)
+    A1, b1 = fem.operator.evaluate({"alpha": 1.0})
+    u_obs = jnp.linalg.solve(jnp.asarray(A1), jnp.asarray(b1).reshape(-1))
+    rec = _recover(fem.solve(), k, u_obs)
+    assert abs(rec - 1.0) < TOL, f"steady non-homogeneous parametric: recovered k={rec:.4f}"
+
+
+def test_transient_nonhomog_dirichlet_parametric_recovers():
+    """Transient: u_t = alpha lap u with u = 1 on the boundary (non-homogeneous g), IC
+    1 + sin(pi x) sin(pi y). The lifting is threaded into the time-block forcing; recover alpha
+    from the u(t) trajectory through fem.solve()."""
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    alpha = _alpha()
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.12, time=(0.0, 0.1, 21))
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    u0 = 1.0 + jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
+    fem = jno.fem([ui.t * vi + alpha * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 1.0, u(ci[0], ci[1]) - u0])
+    u_obs = _default_transient_integrate(fem.operator, {"alpha": 1.0}, _grid_ts(fem.operator))
+    bdry = np.asarray(fem.points)
+    on_bdry = np.isclose(bdry[:, 0], 0) | np.isclose(bdry[:, 0], 1) | np.isclose(bdry[:, 1], 0) | np.isclose(bdry[:, 1], 1)
+    assert np.allclose(np.asarray(u_obs[-1])[on_bdry], 1.0, atol=1e-6)  # non-homog g=1 held
+    rec = _recover(fem.solve(), alpha, u_obs, n=200)
+    assert abs(rec - 1.0) < TRANSIENT_TOL, f"transient non-homogeneous parametric: recovered alpha={rec:.4f}"

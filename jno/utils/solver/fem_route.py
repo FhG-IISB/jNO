@@ -596,17 +596,27 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
             )
             K = jnp.asarray(_dense_array(K_bc)) - jnp.asarray(_dense_array(K_zero_bc))
             bK = jnp.asarray(bK_bc).reshape(-1) - jnp.asarray(bK_zero_bc).reshape(-1)
-            if not np.allclose(np.asarray(bK), 0.0, atol=1.0e-8):
-                raise NotImplementedError(
-                    "A runtime operator basis produced a non-zero RHS contribution. "
-                    "Runtime Dirichlet parameters are not supported yet."
-                )
             operator_basis[name] = K
+            # A non-homogeneous Dirichlet value g lifted by this parametric operator basis
+            # appears as a parameter-scaled RHS term: bK = -theta * K_ib * g on the interior
+            # rows, and *zero on the Dirichlet rows* (g itself is fixed, carried by b0). Carry
+            # it so b(theta) = b0 + sum theta * bK. If bK is non-zero on the Dirichlet rows the
+            # Dirichlet *value* would scale with theta -- a genuine runtime-Dirichlet-value
+            # parameter, which is still unsupported.
+            if not np.allclose(np.asarray(bK), 0.0, atol=1.0e-8):
+                _dir = np.asarray(_dense_array(K_zero_bc)).diagonal() > 0.5  # bc-identity rows
+                if not np.allclose(np.asarray(bK)[_dir], 0.0, atol=1.0e-7):
+                    raise NotImplementedError(
+                        "Runtime Dirichlet *value* parameters are not supported (the prescribed "
+                        "Dirichlet value scales with the parameter)."
+                    )
+                rhs_basis[name] = rhs_basis.get(name, jnp.zeros_like(bK)) + bK
 
         if len(rhs_basis_ir.terms) > 0:
             rhs_vec = _assemble_static_source_vector_from_ir(domain, rhs_basis_ir, dtype=_default_float_dtype())
             if rhs_vec is not None:
-                rhs_basis[name] = jnp.asarray(rhs_vec)
+                rv = jnp.asarray(rhs_vec)
+                rhs_basis[name] = rhs_basis.get(name, jnp.zeros_like(rv)) + rv
 
     if len(static_ir.terms) == 0:
         structural_op_ir = None

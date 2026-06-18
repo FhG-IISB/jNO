@@ -1749,11 +1749,11 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             #
             # affine_bias here carries the Dirichlet value g on the Dirichlet *rows* (the
             # zero IR has no physics, so its interior rows are 0 and only the bc rows get g),
-            # which is correct-by-construction. Note: a *non-homogeneous* g (g != 0) with a
-            # fully-parametric operator is still rejected just below -- the parametric
-            # Dirichlet *lifting* `coeff * K_ib * g` makes bK != 0 ("Runtime Dirichlet
-            # parameters are not supported yet") -- so in practice this branch runs with
-            # g == 0 / affine_bias == 0; the g term is kept for correctness/forward-compat.
+            # which is correct-by-construction. A *non-homogeneous* g (g != 0) is supported: the
+            # parametric operator's Dirichlet lifting `coeff * K_ib * g` is carried below as a
+            # parameter-scaled, constant-in-time forcing term (op_lift_basis), so b(t, theta) =
+            # affine_bias + forcing + sum theta * bK. (Only a parameter that scales the Dirichlet
+            # *value* itself stays unsupported.)
             zero_basis_ir = _make_zero_ir_like(next(iter(operator_parameter_irs.values())))
             A0_sys, bA0 = _assemble_fem_system_from_ir(domain, zero_basis_ir)
             A = jnp.asarray(_dense_array(A0_sys))
@@ -1763,15 +1763,27 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             affine_bias = jnp.zeros((M.shape[0],), dtype=M.dtype)
 
         operator_basis = {}
+        op_lift_basis = {}  # non-homogeneous Dirichlet lifting per param: a constant-in-time RHS
         for name, basis_ir in operator_parameter_irs.items():
             zero_basis_ir = _make_zero_ir_like(basis_ir)
             K_bc, bK_bc = _assemble_fem_system_from_ir(domain, basis_ir)
             K_zero_bc, bK_zero_bc = _assemble_fem_system_from_ir(domain, zero_basis_ir)
             K = jnp.asarray(_dense_array(K_bc)) - jnp.asarray(_dense_array(K_zero_bc))
             bK = jnp.asarray(bK_bc).reshape(-1) - jnp.asarray(bK_zero_bc).reshape(-1)
-            if not np.allclose(np.asarray(bK), 0.0, atol=1.0e-8):
-                raise NotImplementedError("Runtime Dirichlet parameters are not supported yet.")
             operator_basis[name] = K
+            # A non-homogeneous Dirichlet g lifted by this parametric operator basis is a
+            # parameter-scaled, constant-in-time RHS term (zero on the Dirichlet rows; g itself is
+            # fixed, carried by affine_bias). Threaded into the forcing below. A non-zero
+            # contribution ON the Dirichlet rows would mean the Dirichlet *value* scales with the
+            # parameter, which is still unsupported.
+            if not np.allclose(np.asarray(bK), 0.0, atol=1.0e-8):
+                _dir = np.asarray(_dense_array(K_zero_bc)).diagonal() > 0.5  # bc-identity rows
+                if not np.allclose(np.asarray(bK)[_dir], 0.0, atol=1.0e-7):
+                    raise NotImplementedError(
+                        "Runtime Dirichlet *value* parameters are not supported (the prescribed "
+                        "Dirichlet value scales with the parameter)."
+                    )
+                op_lift_basis[name] = bK
 
         # ---- Periodic reduction (if a prolongation matrix was built) ----
         _feax_ctx = getattr(domain, "_feax_context", {}) or {}
@@ -1784,6 +1796,7 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             A = reduce_matrix(P_block, A)
             affine_bias = reduce_vector(P_block, affine_bias)
             operator_basis = {name: reduce_matrix(P_block, K) for name, K in operator_basis.items()}
+            op_lift_basis = {name: reduce_vector(P_block, v) for name, v in op_lift_basis.items()}
             if state0 is not None:
                 state0 = restrict_state(P_block, state0, periodic_info["kept_nodes"], vec=periodic_info["vec"])
 
@@ -1878,6 +1891,22 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
                     return _rv(P_block, _f(t, args))
 
                 forcing_basis = {n: (lambda t, _b=b: _rv(P_block, _b(t))) for n, b in forcing_basis.items()}
+
+        # Thread the non-homogeneous-Dirichlet operator lifting into the forcing as a
+        # parameter-scaled, constant-in-time term: M u_dot + A(t,args) u = affine_bias +
+        # forcing(t,args) + sum_name theta_name * bK_name.
+        if op_lift_basis:
+            _base_forcing = forcing_vector_fn
+            _lift_sz, _lift_dt = int(M.shape[0]), M.dtype
+
+            def forcing_vector_fn(t, args=None, _base=_base_forcing, _lift=op_lift_basis, _sz=_lift_sz, _dt=_lift_dt):
+                out = _base(t, args) if _base is not None else jnp.zeros((_sz,), dtype=_dt)
+                for _name, _bK in _lift.items():
+                    out = out + _runtime_scalar_arg(args, _name, dtype=_dt) * jnp.asarray(_bK, dtype=_dt)
+                return out
+
+            if forcing_mode == "none":
+                forcing_mode = "weak_auto"
 
         combined_runtime_parameter_exprs = _merge_runtime_parameter_exprs(operator_parameter_exprs, forcing_parameter_exprs)
 
