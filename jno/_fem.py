@@ -333,6 +333,55 @@ def _value_from_node(node: Any) -> Any:
     return const if const is not None else _coord_value_fn(node)
 
 
+def _is_complex_form(domain: Any, ir: Any) -> bool:
+    """True if any lowered term's expression contains a complex constant — the signal to route a
+    (steady, linear) weak form through the real-equivalent complex solver instead of feax's real
+    assembly. We walk the tree for a complex-valued literal (e.g. a user-written ``1j``) rather
+    than evaluating, because the lowered coeff embeds the (non-evaluable) trial/test channel."""
+    del domain
+    for term in ir.terms:
+        for node in _walk(term.coeff):
+            for attr in ("value", "val", "data", "constant"):
+                v = getattr(node, attr, None)
+                if v is None:
+                    continue
+                try:
+                    if jnp.iscomplexobj(jnp.asarray(v)):
+                        return True
+                except Exception:  # not array-like; ignore
+                    continue
+    return False
+
+
+def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None) -> Any:
+    """Solve a complex linear FEM system via the real-equivalent block (feax untouched —
+    everything was assembled as two *real* systems)::
+
+        [[A_r, -A_i], [A_i, A_r]] [u_r; u_i] = [b_r; b_i],     u = u_r + i u_i.
+
+    ``ops = (op_r, op_i)`` are the Re-coeff and Im-coeff real systems (each a raw ``(A, b)``)."""
+    from .trace import FemLinearSystem
+
+    def _ab(op):
+        if isinstance(op, FemLinearSystem):
+            raise NotImplementedError(
+                "Complex FEM with a runtime jno.np.parameter (the complex *inverse*) is a follow-on; "
+                "this path is the forward complex solve. (A real parameter recovered through a complex "
+                "forward works under the same real-equivalent block, but is not wired here yet.)"
+            )
+        A, b = op
+        A = jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)
+        return A, jnp.asarray(b).reshape(-1)
+
+    (A_r, b_r), (A_i, b_i) = _ab(ops[0]), _ab(ops[1])
+    n = A_r.shape[0]
+    block = jnp.block([[A_r, -A_i], [A_i, A_r]])
+    rhs = jnp.concatenate([b_r, b_i])
+    solve_fn = solve_fn or (lambda A, b: jnp.linalg.solve(A, b))
+    sol = jnp.asarray(solve_fn(block, rhs))
+    return sol[:n] + 1j * sol[n:]
+
+
 def _is_temporal_value_node(node: Any) -> bool:
     """True if an essential value carries a temporal Variable (time-varying ``g(x,t)``)."""
     return any(isinstance(v, Variable) and getattr(v, "axis", None) == "temporal" for v in _walk(node))
@@ -470,6 +519,11 @@ class FEM:
         return self._mode == "linear"
 
     @property
+    def is_complex(self) -> bool:
+        """A complex-valued steady linear problem, solved via the real-equivalent block."""
+        return self._mode == "complex"
+
+    @property
     def operator(self) -> Any:
         """The raw assembled block — ``(A, b)`` / ``FemLinearSystem`` /
         ``FemResidualOperator`` (steady) or ``FeaxTimeBlock`` (transient)."""
@@ -502,7 +556,14 @@ class FEM:
           (``block.as_feax_pipeline``) are documented overrides.
 
         Enable x64 — the feax assembly is float64.
+
+        For a **complex** steady linear problem (complex coefficients in the weak form),
+        ``solve()`` returns the complex solution ``u_r + i·u_i`` via the real-equivalent block
+        ``[[A_r,-A_i],[A_i,A_r]]`` (feax assembled only real systems); pass ``solve_fn=(A, b) -> u``
+        to choose the real block solver.
         """
+        if self._mode == "complex":
+            return _solve_complex_block(self._op, solve_fn)
         return self._op.solve(solve_fn, **kwargs)
 
     @property
@@ -786,6 +847,19 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
 
     if ic_residuals:
         raise ValueError("jno.fem: an initial condition was given but the weak form has no time derivative.")
+
+    # ---- complex (steady linear): real-equivalent split, feax sees only real forms ----
+    if _is_complex_form(domain, ir):
+        from .utils.solver.parametric_helpers import _clone_term_with_coeff
+
+        # Re(c·T) = Re(c)·T and Im(c·T) = Im(c)·T (the FE trial/test T is real), so two ordinary
+        # real assemblies give A_r/b_r and A_i/b_i; FEM.solve() then forms the real-equivalent
+        # block and recombines to a complex u. No feax change, no native-complex reliance.
+        real_ir = LoweredWeakForm(domain=domain, terms=[_clone_term_with_coeff(t, t.coeff.real) for t in ir.terms])
+        imag_ir = LoweredWeakForm(domain=domain, terms=[_clone_term_with_coeff(t, t.coeff.imag) for t in ir.terms])
+        op_r = _assemble_fem_system_from_ir(domain, real_ir)
+        op_i = _assemble_fem_system_from_ir(domain, imag_ir)
+        return FEM(domain=domain, op=(op_r, op_i), classification=classification, mode="complex")
 
     probe = ir.volume_expr if ir.volume_expr is not None else next(iter(ir.boundary_exprs.values()))
     target = _infer_solver_target(domain, probe)
