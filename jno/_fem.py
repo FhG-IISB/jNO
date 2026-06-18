@@ -334,6 +334,39 @@ def _initial_state(bare: Any, domain: Any) -> Any:
     return jnp.broadcast_to(vals, (n_nodes,)) if vals.shape[0] == 1 else vals
 
 
+def _multifield_initial_state(domain: Any, prob: Any, fields: List[Any], field_index: dict, ic_residuals: List[Any]) -> Any:
+    """Block initial-state vector from per-field IC residuals ``u(initial) - u0``.
+
+    Each field's IC is evaluated at **that field's** assembly-mesh nodes (a P2 field
+    carries edge nodes, so ``domain.mesh`` is wrong for it) and written into its block
+    ``offset[i]:offset[i+1]``. Fields without an IC default to zero. Mirrors the
+    per-field Dirichlet bucketing used for the steady coupled path.
+    """
+    offsets = list(prob.offset) + [int(prob.num_total_dofs_all_vars)]
+    state0 = jnp.zeros((int(prob.num_total_dofs_all_vars),))
+    for ic in ic_residuals:
+        fidx = field_index.get(_field_key_of(ic))
+        if fidx is None:
+            continue
+        _comp, node = _essential_spec(_bare(ic))
+        pts = jnp.asarray(prob.mesh[fidx].points)[:, : domain.dimension]
+        n_i = int(pts.shape[0])
+        const = _constant_of(node)
+        if const is not None:
+            vals = jnp.full((n_i,), float(const))
+        else:
+            v = jnp.asarray(_eval_value_node_at(node, pts))
+            vals = jnp.broadcast_to(v, (n_i,)) if v.shape[0] == 1 else v
+        block = jnp.asarray(vals).reshape(-1)
+        if block.shape[0] != offsets[fidx + 1] - offsets[fidx]:
+            raise NotImplementedError(
+                "jno.fem: vector-field initial conditions in coupled transient are not supported yet "
+                f"(field {fidx}: got {block.shape[0]} values for {offsets[fidx + 1] - offsets[fidx]} dofs)."
+            )
+        state0 = state0.at[offsets[fidx] : offsets[fidx + 1]].set(block)
+    return state0
+
+
 # ---------------------------------------------------------------------------
 # the FEM container
 # ---------------------------------------------------------------------------
@@ -684,8 +717,7 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
     )
 
     weak_bares = volume_terms + [e for exprs in boundary_terms.values() for e in exprs]
-    if ic_residuals or any(_contains_temporal_derivative(b) for b in weak_bares):
-        raise NotImplementedError("jno.fem: coupled transient (multi-field + time) is not supported yet (Phase 3).")
+    is_transient = bool(ic_residuals) or any(_contains_temporal_derivative(b) for b in weak_bares)
 
     domain._fem_quad_degree = quad_degree
     domain._variational_initialized = True
@@ -722,7 +754,7 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
 
     # Field ordering is taken from ir.volume_expr — the same source _build_feax_problem
     # uses — so the Dirichlet field indices match the kernel/Problem field order.
-    _, field_index = _infer_fields(ir.volume_expr)
+    fields, field_index = _infer_fields(ir.volume_expr)
     by_field: dict[int, dict[str, Any]] = {}
     for field_key, region, comp, value in dirichlet_raw:
         fidx = field_index.get(field_key)
@@ -738,6 +770,10 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
             region_values[region] = current
     domain._fem_dirichlet_by_field = by_field
 
+    # Coupled transient (multi-field + time): block M + block spatial operator A.
+    if is_transient:
+        return _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals, classification)
+
     # Nonlinear coupled: feax autodiffs the block residual/Jacobian on the multi-field
     # problem (same _build_feax_problem path as linear), so the nonlinear route works
     # for coupled fields too. A nonlinear volume *or* surface term routes here (a linear
@@ -747,3 +783,62 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
         return FEM(domain=domain, op=op, classification=classification, mode="nonlinear")
     op = _assemble_fem_system_from_ir(domain, ir)
     return FEM(domain=domain, op=op, classification=classification, mode="linear")
+
+
+def _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals, classification):
+    """Assemble a coupled (multi-field) first-order *linear* transient weak form.
+
+    Reuses the steady block assembly: the IR is split into a mass IR (additive terms
+    carrying a temporal derivative, with ``u_t`` rewritten to ``u``) and a spatial
+    operator IR. Each is assembled into a block matrix through
+    ``_assemble_fem_system_from_ir`` with a **shared** ``(fields, field_index)`` so the
+    separately-built mass ``M`` and operator ``A`` blocks share one field ordering (and
+    a block is built for every field). Per-field initial conditions form the block
+    ``state0``; the user drives backward Euler ``(M + dt·A) w = M w``.
+
+    Scope: linear, and every field must carry a time derivative (algebraic/DAE fields —
+    a zero mass block, e.g. transient Stokes pressure — are not handled yet)."""
+    from .utils.solver.backend_blocks import FeaxTimeBlock
+    from .utils.solver.feax_utils import _dense_array, _infer_fields, _lower_statefield_to_trial
+    from .utils.solver.fem_route import _assemble_fem_system_from_ir
+    from .utils.solver.time_route import _infer_time_window, _is_linear_first_order_ir, _split_first_order_linear_terms
+
+    if not _is_linear_first_order_ir(ir):
+        raise NotImplementedError("jno.fem: nonlinear coupled transient is not supported yet (linear coupled only).")
+
+    mass_ir, op_ir, src_ir = _split_first_order_linear_terms(ir)
+    if len(src_ir.terms) > 0:
+        raise NotImplementedError("jno.fem: standalone source/forcing terms in coupled transient are not supported yet.")
+    mass_keys = {f["field_key"] for f in _infer_fields(_lower_statefield_to_trial(mass_ir.volume_expr, {}))[0]}
+    if mass_keys != {f["field_key"] for f in fields}:
+        raise NotImplementedError(
+            "jno.fem: coupled transient requires every field to carry a time derivative (u_t * test); "
+            "algebraic (DAE) fields are not supported yet."
+        )
+
+    # Shared field layout so the separately-assembled M and A blocks line up exactly.
+    override = (fields, field_index)
+    M_sys, _bM = _assemble_fem_system_from_ir(domain, mass_ir, fields_override=override)
+    A_sys, bA = _assemble_fem_system_from_ir(domain, op_ir, fields_override=override)
+    M = jnp.asarray(_dense_array(M_sys))
+    A = jnp.asarray(_dense_array(A_sys))
+
+    prob = domain._feax_problem  # op_ir block problem (same block layout as mass_ir via override)
+    state0 = _multifield_initial_state(domain, prob, fields, field_index, ic_residuals)
+    t0, t1, dt = _infer_time_window(domain)
+    block = FeaxTimeBlock(
+        backend="feax_time",
+        mode="implicit",
+        time_order=1,
+        spatial_kind="weak_form",
+        ir=ir,
+        M=M,
+        A=A,
+        affine_bias=jnp.asarray(bA).reshape(-1),
+        state0=state0,
+        t0=t0,
+        t1=t1,
+        dt=dt,
+        feax_context=getattr(domain, "_feax_context", {}) or {},
+    )
+    return FEM(domain=domain, op=block, classification=classification, mode="transient")

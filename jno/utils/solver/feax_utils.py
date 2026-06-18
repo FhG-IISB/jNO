@@ -1556,13 +1556,19 @@ def _build_multifield_feax_problem(domain, ir, fields, field_index, *, apply_dir
     return problem, bc
 
 
-def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_domain: bool = True):
+def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_domain: bool = True, fields_override=None):
     """
     Build a FEAX Problem and Dirichlet BC object from lowered weak-form IR.
 
     The returned FEAX problem owns the generated volume and surface kernels.
     When `store_on_domain=True`, the FEAX problem and BC are cached on the
     domain for later reuse.
+
+    ``fields_override`` is an optional ``(fields, field_index)`` pair forcing the
+    multi-field block layout instead of inferring it from this IR's own terms. The
+    transient route passes it so the separately-assembled mass and operator blocks
+    share one field ordering (and so a block is built for every field even if this
+    IR only mentions some of them).
     """
     import feax as fe
 
@@ -1575,7 +1581,7 @@ def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_do
         raise ValueError("No terms found for FEM assembly.")
 
     # Coupled (multi-field) weak form -> multi-variable block assembly.
-    _mf_fields, _mf_index = _infer_fields(volume_expr)
+    _mf_fields, _mf_index = fields_override if fields_override is not None else _infer_fields(volume_expr)
     if len(_mf_fields) > 1:
         return _build_multifield_feax_problem(
             domain, ir, _mf_fields, _mf_index, apply_dirichlet=apply_dirichlet, store_on_domain=store_on_domain

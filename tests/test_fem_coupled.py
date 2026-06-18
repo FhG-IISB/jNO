@@ -9,6 +9,7 @@ single-field path is unchanged (one field → existing assembly).
 
 from __future__ import annotations
 
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -192,6 +193,72 @@ def test_coupled_robin_surface_term_enters_stiffness_block():
     A_r, A_n = _dense(fem_robin.A), _dense(fem_neumann.A)
     assert not np.allclose(A_r, A_n)  # the Robin surface term modifies the matrix
     assert float(np.sum(np.abs(A_r - A_n))) > 1e-9
+
+
+def test_coupled_transient_diffusion_decays_to_analytic():
+    # Coupled first-order transient (block M + block spatial operator A), backward Euler.
+    # Maximally ASYMMETRIC coupling: u diffuses on its own, p diffuses and is driven by u
+    #   u_t = lap u ,  p_t = lap p + c*u ,  u = p = 0 on the boundary.
+    # IC u0 = sin(pi x) sin(pi y), p0 = 0. In the leading mode (eigenvalue lam = 2 pi^2):
+    #   u = e^{-lam t} u0 ,  p = c*t*e^{-lam t} u0   (resonant forcing -> the t factor).
+    # A block transposition would make u couple to p instead -> a completely different
+    # solution, so this also pins the block ordering of the separately-assembled M and A.
+    c = 5.0
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.08, time=(0.0, 0.05, 51))
+    n = int(np.asarray(d.mesh.points).shape[0])
+    u, v = d.fem_symbols(names=("u", "v"))
+    p, q = d.fem_symbols(names=("p", "q"))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    pi, qi = p.bind(x=xi, y=yi, t=ti), q.bind(x=xi, y=yi, t=ti)
+    u_eq = ui.t * vi + (ui.x * vi.x + ui.y * vi.y)
+    p_eq = pi.t * qi + (pi.x * qi.x + pi.y * qi.y) - c * u.bind(x=xi, y=yi, t=ti) * qi
+    icu = u(ci[0], ci[1]) - jno.fn(lambda x, y: jnp.sin(jnp.pi * x) * jnp.sin(jnp.pi * y), [ci[0], ci[1]])
+    fem = jno.fem([u_eq, p_eq, u(xb, yb) - 0.0, p(xb, yb) - 0.0, icu, p(ci[0], ci[1]) - 0.0])
+
+    assert fem.is_transient and fem.is_linear
+    assert fem.dofs == 2 * n
+    M, A = _dense(fem.M), _dense(fem.operator.A)
+    assert np.allclose(M[:n, n:], 0.0) and np.allclose(M[n:, :n], 0.0)  # M block-diagonal
+    assert np.allclose(M[:n, :n], M[:n, :n].T) and np.any(np.abs(M[n:, n:]) > 1e-12)  # both masses present
+    # coupling is one-directional: p depends on u, u does NOT depend on p. A transposed
+    # block layout would swap these, so this is the block-ordering guard.
+    assert np.allclose(A[:n, n:], 0.0)  # u-rows / p-cols: no coupling
+    assert np.any(np.abs(A[n:, :n]) > 1e-9)  # p-rows / u-cols: coupling present
+
+    w = np.asarray(fem.state0).copy()
+    assert np.allclose(w[n:], 0.0)  # p starts at zero
+    dt = float(fem.dt)
+    for _ in range(round((fem.t1 - fem.t0) / dt)):  # backward Euler (M + dt A) w = M w
+        w = np.linalg.solve(M + dt * A, M @ w)
+
+    cc = np.asarray(d.mesh.points)[:, :2]
+    phi = np.sin(np.pi * cc[:, 0]) * np.sin(np.pi * cc[:, 1])
+    decay = np.exp(-2.0 * np.pi**2 * fem.t1)
+    u_ex, p_ex = decay * phi, c * fem.t1 * decay * phi
+    assert np.linalg.norm(w[:n] - u_ex) / np.linalg.norm(u_ex) < 1e-2
+    assert np.linalg.norm(w[n:] - p_ex) / np.linalg.norm(p_ex) < 3e-2
+    assert np.linalg.norm(w[n:]) > 0.1  # p rose from zero through the coupling
+
+
+def test_coupled_transient_requires_time_derivative_per_field():
+    # Every coupled transient field must carry a time derivative; an algebraic (DAE)
+    # field (here p has no p_t) would need a zero mass block + a careful solve and
+    # is not supported yet -> a clear error rather than a silently mis-sized M.
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2, time=(0.0, 0.05, 6))
+    u, v = d.fem_symbols(names=("u", "v"))
+    p, q = d.fem_symbols(names=("p", "q"))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    pi, qi = p.bind(x=xi, y=yi, t=ti), q.bind(x=xi, y=yi, t=ti)
+    u_eq = ui.t * vi + (ui.x * vi.x + ui.y * vi.y) + pi * vi
+    p_eq = (pi.x * qi.x + pi.y * qi.y) + u.bind(x=xi, y=yi, t=ti) * qi  # no p_t -> algebraic
+    with pytest.raises(NotImplementedError, match="every field to carry a time derivative"):
+        jno.fem([u_eq, p_eq, u(xb, yb) - 0.0, p(xb, yb) - 0.0, u(ci[0], ci[1]) - 0.0])
 
 
 def test_coupled_neumann_robin_mixed_order_recovers_manufactured():

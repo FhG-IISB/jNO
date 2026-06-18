@@ -490,12 +490,15 @@ def _assemble_fem_system_concrete(
     *,
     apply_dirichlet=True,
     symmetric_bc=True,
+    fields_override=None,
 ):
     """
     Assemble one concrete steady linear FEAX contribution.
 
     This helper deliberately receives an IR that no longer contains runtime
-    parameter ModelCall nodes.
+    parameter ModelCall nodes. ``fields_override`` forces the multi-field block
+    layout (used by the coupled transient route so mass and operator blocks share
+    one field ordering).
     """
     import feax as fe
 
@@ -503,6 +506,7 @@ def _assemble_fem_system_concrete(
         domain,
         ir,
         apply_dirichlet=apply_dirichlet,
+        fields_override=fields_override,
     )
     internal_vars = fe.InternalVars()
 
@@ -546,6 +550,7 @@ def _assemble_fem_system_concrete(
 def _assemble_fem_system_from_ir(domain, ir, **kwargs):
     """Assemble ``A(args) u = b(args)`` for affine runtime weak-form terms."""
     symmetric_bc = kwargs.get("symmetric_bc", True)
+    fields_override = kwargs.get("fields_override", None)
 
     has_runtime_parameters = any(_contains_runtime_parameter(term.coeff) for term in ir.terms)
 
@@ -555,6 +560,7 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
             ir,
             apply_dirichlet=True,
             symmetric_bc=symmetric_bc,
+            fields_override=fields_override,
         )
 
     static_ir, parameter_irs, runtime_parameter_exprs, _ = _split_parametric_operator_ir(ir)
