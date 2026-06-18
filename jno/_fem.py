@@ -1044,17 +1044,10 @@ def _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals
 
 
 # ---------------------------------------------------------------------------
-# H1 smoothness regularization for nodal field parameters
+# Regularization for nodal field parameters (jno.np.parameter(phi))
 # ---------------------------------------------------------------------------
-def _assemble_h1_stiffness(domain: Any):
-    """Raw P1 stiffness ``L = integral grad(phi_i) . grad(phi_j)`` on ``domain``'s scalar space.
-
-    The discrete-Laplacian Gram matrix (no Dirichlet): ``k^T L k = integral |grad k|^2``
-    is the H1 seminorm of a nodal field ``k``. Assembled with ``store_on_domain=False``
-    so it does not clobber any FEM problem already cached on the domain, and reusing the
-    domain's element / quadrature settings (no ``init_fem``).
-    """
-    from .utils.solver.fem_route import _assemble_fem_system_from_ir
+def _lower_volume_form(domain: Any, expr: Any):
+    """Lower one scalar **volume** weak form to a ``LoweredWeakForm`` (no ``init_fem``)."""
     from .utils.solver.weak_form import (
         LoweredChannelTerm,
         LoweredWeakForm,
@@ -1062,19 +1055,8 @@ def _assemble_h1_stiffness(domain: Any):
         _split_additive_terms,
     )
 
-    u_sym, v_sym = domain.fem_symbols()
-    coords = domain.variable("interior", split=True)
-    axes = ("x", "y", "z")[: int(domain.dimension)]
-    ui = u_sym.bind(**{ax: coords[i] for i, ax in enumerate(axes)})
-    vi = v_sym.bind(**{ax: coords[i] for i, ax in enumerate(axes)})
-
-    stiff = None
-    for ax in axes:
-        term = getattr(ui, ax) * getattr(vi, ax)
-        stiff = term if stiff is None else stiff + term
-
     terms: List[Any] = []
-    for sign, sub in _split_additive_terms(domain, _bare(stiff)):
+    for sign, sub in _split_additive_terms(domain, _bare(expr)):
         terms.append(
             LoweredChannelTerm(
                 sign=sign,
@@ -1087,26 +1069,129 @@ def _assemble_h1_stiffness(domain: Any):
                 original_expr=sub,
             )
         )
-    ir = LoweredWeakForm(domain=domain, terms=terms)
+    return LoweredWeakForm(domain=domain, terms=terms)
+
+
+def _fe_symbols_bound(domain: Any):
+    """``(ui, vi, axes)`` -- P1 trial/test bound to the domain's interior coordinates."""
+    u_sym, v_sym = domain.fem_symbols()
+    coords = domain.variable("interior", split=True)
+    axes = ("x", "y", "z")[: int(domain.dimension)]
+    ui = u_sym.bind(**{ax: coords[i] for i, ax in enumerate(axes)})
+    vi = v_sym.bind(**{ax: coords[i] for i, ax in enumerate(axes)})
+    return ui, vi, axes
+
+
+def _assemble_fe_gram(domain: Any, kind: str = "stiffness"):
+    """Raw P1 Gram matrix on the domain's scalar space (no Dirichlet, no ``init_fem``,
+    ``store_on_domain=False`` so it never clobbers a cached FEM problem):
+
+    * ``'stiffness'`` -> ``L = integral grad(phi_i).grad(phi_j)``  (``k^T L k = integral |grad k|^2``)
+    * ``'mass'``      -> ``M = integral phi_i phi_j``              (``k^T M k = integral k^2``)
+    """
+    from .utils.solver.fem_route import _assemble_fem_system_from_ir
+
+    ui, vi, axes = _fe_symbols_bound(domain)
+    if kind == "stiffness":
+        form = None
+        for ax in axes:
+            t = getattr(ui, ax) * getattr(vi, ax)
+            form = t if form is None else form + t
+    elif kind == "mass":
+        form = ui * vi
+    else:
+        raise ValueError(f"_assemble_fe_gram: unknown kind {kind!r}")
+    ir = _lower_volume_form(domain, form)
     A, _b = _assemble_fem_system_from_ir(domain, ir, apply_dirichlet=False, store_on_domain=False)
     return jnp.asarray(A.todense() if hasattr(A, "todense") else A)
 
 
-def _h1_seminorm_term(param: Any):
-    """Per-node H1 energy ``k * (L k)`` for a nodal field parameter (``jno.np.parameter(phi)``).
+def _assemble_h1_stiffness(domain: Any):  # back-compat alias
+    return _assemble_fe_gram(domain, "stiffness")
 
-    Returns a :class:`FunctionCall` loss term; its ``.mean`` / ``.sum`` is the (averaged /
-    total) H1 seminorm ``integral |grad k|^2``, differentiable in the nodal values.
-    """
+
+def _fe_element_gradient_data(domain: Any):
+    """``(shape_grads, JxW, cells)`` for the domain's P1 space -- per-element gradient
+    geometry for total variation ``integral |grad k|``. Built standalone (no clobber)."""
+    from .utils.solver.feax_utils import _build_feax_problem
+
+    ui, vi, axes = _fe_symbols_bound(domain)
+    form = None
+    for ax in axes:
+        t = getattr(ui, ax) * getattr(vi, ax)
+        form = t if form is None else form + t
+    ir = _lower_volume_form(domain, form)
+    problem, _bc = _build_feax_problem(domain, ir, apply_dirichlet=False, store_on_domain=False)
+    return (
+        jnp.asarray(problem.shape_grads),
+        jnp.asarray(problem.JxW),
+        jnp.asarray(problem.fes[0].cells),
+    )
+
+
+_REG_KINDS = ("h1seminorm", "tv", "l2", "nonneg", "bounded")
+
+
+def _field_regularizer_term(param: Any, kind: str = "h1seminorm", **kwargs):
+    """Build a regularization loss term (a :class:`FunctionCall` over ``param``) for a
+    nodal field parameter. See :meth:`ModelCall.regularize` for the kinds + options."""
     from .trace import FunctionCall
 
     domain = getattr(param.model, "_fem_field_domain", None)
     if domain is None:
-        raise ValueError("_h1_seminorm_term: parameter is not a FEM field parameter (no domain).")
-    stiffness = _assemble_h1_stiffness(domain)
+        raise ValueError("regularize(...) is only for a FEM field parameter (jno.np.parameter(<fem symbol>)).")
+    k = str(kind).lower()
 
-    def _energy(kv, _L=stiffness):
-        kf = jnp.asarray(kv).reshape(-1)
-        return kf * (_L @ kf)
+    if k in ("h1seminorm", "h1", "smooth"):  # integral |grad k|^2 = k^T L k
+        L = _assemble_fe_gram(domain, "stiffness")
 
-    return FunctionCall(_energy, [param], name="h1seminorm")
+        def _h1(kv, _L=L):
+            kf = jnp.asarray(kv).reshape(-1)
+            return kf * (_L @ kf)
+
+        return FunctionCall(_h1, [param], name="h1seminorm")
+
+    if k in ("l2", "tikhonov", "ridge"):  # integral (k - ref)^2 = (k-ref)^T M (k-ref)
+        M = _assemble_fe_gram(domain, "mass")
+        ref = jnp.asarray(kwargs.get("ref", 0.0))
+
+        def _l2(kv, _M=M, _ref=ref):
+            kf = jnp.asarray(kv).reshape(-1)
+            kf = kf - (_ref.reshape(-1) if _ref.ndim else _ref)
+            return kf * (_M @ kf)
+
+        return FunctionCall(_l2, [param], name="l2")
+
+    if k in ("tv", "totalvariation"):  # integral |grad k|  (edge-preserving; eps-smoothed)
+        sg, jxw, cells = _fe_element_gradient_data(domain)
+        eps = float(kwargs.get("eps", 1.0e-8))
+
+        def _tv(kv, _sg=sg, _jxw=jxw, _cells=cells, _eps=eps):
+            kc = jnp.asarray(kv).reshape(-1)[_cells]  # (n_cells, n_local)
+            gradk = jnp.einsum("cqld,cl->cqd", _sg, kc)  # (n_cells, n_quad, dim)
+            mag = jnp.sqrt(jnp.sum(gradk**2, axis=-1) + _eps)  # (n_cells, n_quad)
+            jxw = jnp.reshape(_jxw, mag.shape)  # JxW arrives (n_cells, 1, n_quad)
+            return jnp.sum(mag * jxw, axis=1)  # (n_cells,) per-element TV
+
+        return FunctionCall(_tv, [param], name="tv")
+
+    if k == "nonneg":  # soft positivity barrier strength * relu(-k)
+        strength = float(kwargs.get("strength", 1.0))
+
+        def _nn(kv, _s=strength):
+            return _s * jnp.maximum(0.0, -jnp.asarray(kv).reshape(-1))
+
+        return FunctionCall(_nn, [param], name="nonneg")
+
+    if k == "bounded":  # soft two-sided barrier outside [lo, hi]
+        if "lo" not in kwargs or "hi" not in kwargs:
+            raise ValueError("regularize('bounded', lo=..., hi=...) requires both lo and hi.")
+        lo, hi = float(kwargs["lo"]), float(kwargs["hi"])
+
+        def _bd(kv, _lo=lo, _hi=hi):
+            kf = jnp.asarray(kv).reshape(-1)
+            return jnp.maximum(0.0, kf - _hi) + jnp.maximum(0.0, _lo - kf)
+
+        return FunctionCall(_bd, [param], name="bounded")
+
+    raise ValueError(f"Unknown regularizer kind {kind!r}; supported: {_REG_KINDS}.")

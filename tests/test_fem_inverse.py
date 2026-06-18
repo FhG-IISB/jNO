@@ -297,3 +297,43 @@ def test_nodal_field_h1_regularizer():
         jno.np.parameter((1,), name="s").regularize("h1seminorm")
     with pytest.raises(ValueError):
         k.regularize("nope")
+
+
+def test_nodal_field_regularizers():
+    """The full field-parameter regularizer set on k.regularize(kind): l2/tikhonov
+    (mass-weighted integral k^2), tv (total variation integral|grad k|), nonneg, bounded.
+    Checked directly on each node's fn (FE-exact / pointwise, deterministic)."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15)  # unit square, area = 1
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = 2.0 * (xi * (1.0 - xi) + yi * (1.0 - yi))
+    k = jno.np.parameter(phi, name="k")
+    jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    nodes = np.asarray(d.built_mesh.points)[:, :2]
+    ones = jnp.ones(nodes.shape[0])
+
+    # l2 / tikhonov: integral k^2 = c^2 * area (mass-weighted); a reference shifts it.
+    l2 = k.regularize("l2")
+    assert abs(float(np.asarray(l2.fn(2.0 * ones)).sum()) - 4.0) < 1e-9  # c=2 -> 4*area
+    assert abs(float(np.asarray(k.regularize("tikhonov").fn(ones)).sum()) - 1.0) < 1e-9  # integral 1 = area
+    l2r = k.regularize("l2", ref=2.0)
+    assert float(np.asarray(l2r.fn(2.0 * ones)).sum()) < 1e-9  # k == ref -> 0
+
+    # tv: integral|grad k| = |a| * area for k = a*x; ~0 for a constant field.
+    tv = k.regularize("tv")
+    assert abs(float(np.asarray(tv.fn(jnp.asarray(1.5 * nodes[:, 0]))).sum()) - 1.5) < 1e-6
+    assert float(np.asarray(tv.fn(ones)).sum()) < 1e-3  # constant -> ~0 (eps floor)
+
+    # nonneg: zero for positive values, positive penalty for negative.
+    nn = k.regularize("nonneg")
+    assert float(np.asarray(nn.fn(ones)).sum()) == 0.0
+    assert float(np.asarray(nn.fn(-ones)).sum()) > 0.0
+
+    # bounded: zero inside [lo, hi], positive outside.
+    bd = k.regularize("bounded", lo=0.0, hi=1.0)
+    assert float(np.asarray(bd.fn(0.5 * ones)).sum()) == 0.0
+    assert float(np.asarray(bd.fn(2.0 * ones)).sum()) > 0.0
+    with pytest.raises(ValueError):
+        k.regularize("bounded")  # missing lo/hi

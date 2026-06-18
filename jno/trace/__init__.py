@@ -2326,16 +2326,22 @@ class ModelCall(Placeholder):
         return self
 
     def regularize(self, kind: str = "h1seminorm", **kwargs):
-        """Smoothness regularization loss term for a FEM **field** parameter
-        (``jno.np.parameter(phi)``).
+        """Regularization loss term for a FEM **field** parameter (``jno.np.parameter(phi)``).
 
-        ``kind``:
-          * ``'h1seminorm'`` (aliases ``'h1'``, ``'smooth'``) -- the exact finite-element
-            H1 seminorm ``integral |grad k|^2 = k^T L k`` (``L`` = the stiffness / discrete
-            Laplacian on the field's space). Returns the per-node energy; reduce with
-            ``.mean`` / ``.sum`` and weight it::
+        Returns a (pointwise) loss term; reduce with ``.mean`` / ``.sum`` and weight it::
 
-                crux([data.mse, alpha * k.regularize('h1seminorm').mean])
+            crux([data.mse, alpha * k.regularize('h1seminorm').mean])
+
+        ``kind`` (finite-element exact, assembled on the field's space):
+          * ``'h1seminorm'`` (``'h1'``, ``'smooth'``) -- H1 seminorm ``integral |grad k|^2 = k^T L k``
+            (``L`` = stiffness / discrete Laplacian). Smooth fields.
+          * ``'tv'`` -- total variation ``integral |grad k|`` (eps-smoothed; ``eps=`` kwarg).
+            Edge-preserving / piecewise-constant fields.
+          * ``'l2'`` (``'tikhonov'``, ``'ridge'``) -- ``integral (k - ref)^2 = (k-ref)^T M (k-ref)``
+            (``M`` = mass; ``ref=`` kwarg, default 0). Magnitude / prior penalty.
+          * ``'nonneg'`` -- soft positivity ``strength * relu(-k)`` (``strength=`` kwarg). For a
+            hard ``k > 0`` use :meth:`constrain` (e.g. ``jax.nn.softplus``).
+          * ``'bounded'`` -- soft two-sided barrier outside ``[lo, hi]`` (``lo=``, ``hi=`` kwargs).
 
         Only valid for a nodal field parameter; other parameters raise.
         """
@@ -2344,11 +2350,9 @@ class ModelCall(Placeholder):
                 "ModelCall.regularize(...) is only for a FEM field parameter "
                 "(jno.np.parameter(<fem symbol>)); this parameter is not one."
             )
-        if kind in ("h1seminorm", "h1", "smooth"):
-            from .._fem import _h1_seminorm_term
+        from .._fem import _field_regularizer_term
 
-            return _h1_seminorm_term(self)
-        raise ValueError(f"Unknown regularizer kind {kind!r}; supported: 'h1seminorm'.")
+        return _field_regularizer_term(self, kind, **kwargs)
 
     def bayesian(self, kernel_factory, *, prior=None, warmup=500, keep=1000, thin=1, adapt=True, **kernel_kwargs):
         """Proxy for :meth:`Model.bayesian`."""
