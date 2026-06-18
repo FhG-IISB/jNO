@@ -540,3 +540,38 @@ def test_transient_nonhomog_dirichlet_parametric_recovers():
     assert np.allclose(np.asarray(u_obs[-1])[on_bdry], 1.0, atol=1e-6)  # non-homog g=1 held
     rec = _recover(fem.solve(), alpha, u_obs, n=200)
     assert abs(rec - 1.0) < TRANSIENT_TOL, f"transient non-homogeneous parametric: recovered alpha={rec:.4f}"
+
+
+def test_transient_field_parameter_recovers():
+    """A jno.np.parameter(phi) FIELD coefficient in a *transient* form: u_t = div(k(x) grad u).
+    The transient non-affine route threads the node field as InternalVars (per-cell gather +
+    shape-fn interpolation), the same machinery as the steady field route. Recover the full
+    nodal k(x) field from the u(t) trajectory through fem.solve()."""
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2, time=(0.0, 0.05, 11))
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    u0 = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
+    k = jno.np.parameter(phi, name="k")  # nodal FIELD parameter
+    assert getattr(k.model, "_fem_field", None) == "node"
+    fem = jno.fem([ui.t * vi + k * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - u0])
+    assert fem.is_transient
+
+    nodes = np.asarray(d.built_mesh.points)[:, :2]
+    k_true = jnp.asarray(1.0 + 0.5 * nodes[:, 0] + 0.3 * nodes[:, 1])  # smooth, positive
+    u_obs = _default_transient_integrate(fem.operator, {"k": k_true}, _grid_ts(fem.operator))
+    assert u_obs.shape[0] == 11 and not bool(jnp.isnan(u_obs).any())
+
+    k.dtype(jnp.float64)
+    k.initialize(jax.nn.initializers.constant(1.0))
+    k.optimizer(optax.adam(3e-2))
+    crux = jno.core([(fem.solve() - u_obs).mse], domain=_DUMMY)
+    crux.solve(300)
+    rec = np.asarray(crux.eval([k])).reshape(-1)  # the recovered nodal field
+    assert rec.shape[0] == int(k_true.shape[0]), f"expected the full nodal field, got {rec.shape}"
+    rel = float(np.linalg.norm(rec - np.asarray(k_true)) / np.linalg.norm(np.asarray(k_true)))
+    assert rel < 0.1, f"transient field k(x) recovery rel_L2 {rel:.3e}"

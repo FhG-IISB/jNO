@@ -1833,7 +1833,12 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             na_u0 = jnp.zeros((na_rt["size"],), dtype=na_dt)  # module-level jnp; do NOT import here
 
             def _na_full(t, args, _rt=na_rt, _tags=na_tags, _temp=na_temp, _u0=na_u0, _dt=na_dt):
-                values = {name: _runtime_scalar_arg(args, name, dtype=_dt) for name in _tags}
+                # Keep the raw shape: a scalar parameter stays 0-d; a field parameter (a nodal
+                # array) is threaded whole and gathered/interpolated per cell by feax (same as
+                # the steady non-affine route, fem_route.operator_fn). Scalarizing here would
+                # break a transient jno.np.parameter(phi) field.
+                _a = args or {}
+                values = {name: jnp.asarray(_a[name], dtype=_dt) for name in _tags}
                 iv = _make_internal_vars(
                     fe,
                     _temp,
