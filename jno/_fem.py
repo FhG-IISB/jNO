@@ -498,6 +498,18 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: str = "TRI3", v
         else:
             raise ValueError("jno.fem: a residual contains neither the trial nor the test function.")
 
+    # ---- 1D (segment): feax has no LINE2 element, so assemble natively ----
+    # The native 1D assembler reuses the same integrand evaluator and returns the
+    # same (op, mode) the FEM container expects; it needs none of init_fem's feax
+    # scaffolding (coordinate vars resolve from the per-element quadrature points).
+    if getattr(domain, "dimension", None) == 1:
+        from .utils.solver.fem_1d import assemble_fem_1d
+
+        op, mode = assemble_fem_1d(
+            domain, volume_terms, boundary_terms, dirichlet_values, ic_residuals, vec=vec, quad_degree=quad_degree
+        )
+        return FEM(domain=domain, op=op, classification=classification, mode=mode)
+
     # ---- quadrature + BC setup (reuse init_fem) ----
     bcs = [domain.dirichlet(tag, value) for tag, value in dirichlet_values.items()]
     if boundary_terms:
