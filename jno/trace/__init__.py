@@ -2317,6 +2317,14 @@ class ModelCall(Placeholder):
         self.model.optimizer(opt_fn, lr=lr)
         return self
 
+    def constrain(self, transform: Callable) -> "ModelCall":
+        """Proxy for :meth:`Model.constrain` -- paramax reparameterization applied
+        before every forward pass (e.g. ``jax.nn.softplus`` to keep a parameter or a
+        ``jno.np.parameter(phi)`` coefficient field positive). Chains after
+        :meth:`mask`."""
+        self.model.constrain(transform)
+        return self
+
     def bayesian(self, kernel_factory, *, prior=None, warmup=500, keep=1000, thin=1, adapt=True, **kernel_kwargs):
         """Proxy for :meth:`Model.bayesian`."""
         self.model.bayesian(
