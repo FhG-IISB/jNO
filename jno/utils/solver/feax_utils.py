@@ -1556,6 +1556,25 @@ def _build_multifield_feax_problem(domain, ir, fields, field_index, *, apply_dir
     return problem, bc
 
 
+def _zero_mass_dirichlet_rows(M, bc):
+    """Zero a mass matrix's Dirichlet rows + columns so ``M u̇ + A u = c`` reads ``u[d]=g``.
+
+    feax applies symmetric Dirichlet (identity rows) to *every* assembled matrix — correct
+    for a stiffness operator, but wrong for the **mass**: a constrained DOF must carry no
+    time derivative, otherwise the assembled semidiscrete system is not a faithful
+    representation of a non-homogeneous transient Dirichlet condition. With these rows/cols
+    zeroed (and ``A``'s Dirichlet rows = identity, ``c`` carrying ``g``), the Dirichlet row
+    of ``(M + dt A) w = M w_old + dt c`` reduces to ``u[d] = g``. Mirrors the native 1D
+    reference :func:`jno.utils.solver.fem_1d._apply_dirichlet_transient`."""
+    rows = None if bc is None else getattr(bc, "bc_rows", None)
+    if rows is None:
+        return M
+    rows = jnp.asarray(rows).reshape(-1)
+    if rows.shape[0] == 0:
+        return M
+    return jnp.asarray(M).at[rows, :].set(0.0).at[:, rows].set(0.0)
+
+
 def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_domain: bool = True, fields_override=None):
     """
     Build a FEAX Problem and Dirichlet BC object from lowered weak-form IR.
@@ -1747,13 +1766,15 @@ def _prepare_feax_runtime(
     apply_dirichlet=True,
     need_jacobian=True,
     symmetric_bc=True,
+    fields_override=None,
 ):
     """
     Prepare reusable FEAX residual/Jacobian runtime objects for an IR.
 
     Returns a dictionary containing the FEAX problem, BC, residual callable,
     optional Jacobian callable, reference state, dtype, temporal tags, and
-    number of mesh cells.
+    number of mesh cells. ``fields_override`` forces the multi-field block layout
+    (used by the coupled transient forcing path).
     """
     import feax as fe
 
@@ -1762,6 +1783,7 @@ def _prepare_feax_runtime(
         ir,
         apply_dirichlet=apply_dirichlet,
         store_on_domain=False,
+        fields_override=fields_override,
     )
 
     res_bc = fe.create_res_bc_function(problem, bc)

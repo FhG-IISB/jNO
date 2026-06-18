@@ -807,13 +807,17 @@ def _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals
     Scope: every field must carry a time derivative (algebraic/DAE fields — a zero
     mass block, e.g. transient Stokes pressure — are not handled yet)."""
     from .utils.solver.backend_blocks import FeaxTimeBlock
-    from .utils.solver.feax_utils import _dense_array, _infer_fields, _lower_statefield_to_trial
+    from .utils.solver.feax_utils import _dense_array, _infer_fields, _lower_statefield_to_trial, _zero_mass_dirichlet_rows
     from .utils.solver.fem_route import _assemble_fem_residual_from_ir, _assemble_fem_system_from_ir
-    from .utils.solver.time_route import _infer_time_window, _is_linear_first_order_ir, _split_first_order_linear_terms
+    from .utils.solver.time_route import (
+        _build_auto_forcing_vector_fn,
+        _infer_time_window,
+        _is_linear_first_order_ir,
+        _split_first_order_linear_terms,
+    )
+    from .utils.solver.weak_form import LoweredWeakForm
 
     mass_ir, op_ir, src_ir = _split_first_order_linear_terms(ir)
-    if len(src_ir.terms) > 0:
-        raise NotImplementedError("jno.fem: standalone source/forcing terms in coupled transient are not supported yet.")
     mass_keys = {f["field_key"] for f in _infer_fields(_lower_statefield_to_trial(mass_ir.volume_expr, {}))[0]}
     if mass_keys != {f["field_key"] for f in fields}:
         raise NotImplementedError(
@@ -823,7 +827,11 @@ def _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals
 
     # Shared field layout so the separately-assembled mass and operator blocks align.
     override = (fields, field_index)
-    M = jnp.asarray(_dense_array(_assemble_fem_system_from_ir(domain, mass_ir, fields_override=override)[0]))
+    M_sys, _bM = _assemble_fem_system_from_ir(domain, mass_ir, fields_override=override)
+    # Zero the mass's Dirichlet rows/cols (feax leaves identity rows): a constrained DOF
+    # carries no time derivative, so M u̇ + A u = c reads u[d]=g there (faithful for
+    # non-homogeneous Dirichlet). domain._feax_bc is the mass problem's bc (same Dirichlet).
+    M = _zero_mass_dirichlet_rows(jnp.asarray(_dense_array(M_sys)), domain._feax_bc)
     t0, t1, dt = _infer_time_window(domain)
     common = dict(
         backend="feax_time",
@@ -839,16 +847,32 @@ def _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals
 
     if _is_linear_first_order_ir(ir):
         A_sys, bA = _assemble_fem_system_from_ir(domain, op_ir, fields_override=override)
+        A = jnp.asarray(_dense_array(A_sys))
+        # Source/forcing terms (no trial) -> a block forcing f(t); constant or temporal.
+        # The user marches the canonical (M+dt·A)w_next = M·w + dt·(c + f(t_next)); a
+        # constant source is just f0(t)=const, so the same path covers both.
+        forcing_vector_fn = None
+        if len(src_ir.terms) > 0:
+            forcing_vector_fn = _build_auto_forcing_vector_fn(
+                domain, src_ir, size=int(A.shape[0]), dtype=A.dtype, fields_override=override
+            )[0]
         prob = domain._feax_problem  # op_ir block problem (same block layout as mass_ir via override)
         state0 = _multifield_initial_state(domain, prob, fields, field_index, ic_residuals)
         block = FeaxTimeBlock(
-            M=M, A=jnp.asarray(_dense_array(A_sys)), affine_bias=jnp.asarray(bA).reshape(-1), state0=state0, **common
+            M=M,
+            A=A,
+            affine_bias=jnp.asarray(bA).reshape(-1),
+            forcing_vector_fn=forcing_vector_fn,
+            state0=state0,
+            **common,
         )
         return FEM(domain=domain, op=block, classification=classification, mode="transient")
 
-    # Nonlinear: M u_dot + R(u) = 0, with R/J the block spatial residual/Jacobian that
-    # feax autodiffs on the multi-field problem (same path as steady nonlinear coupled).
-    spatial = _assemble_fem_residual_from_ir(domain, op_ir, fields_override=override)
+    # Nonlinear: M u_dot + R(u) = 0, with R/J the block spatial residual/Jacobian that feax
+    # autodiffs on the multi-field problem (same path as steady nonlinear coupled). A
+    # (time-constant) source rides the residual by folding src_ir into the operator IR.
+    residual_ir = LoweredWeakForm(domain=domain, terms=list(op_ir.terms) + list(src_ir.terms))
+    spatial = _assemble_fem_residual_from_ir(domain, residual_ir, fields_override=override)
     prob = domain._feax_problem
     state0 = _multifield_initial_state(domain, prob, fields, field_index, ic_residuals)
     block = FeaxTimeBlock(

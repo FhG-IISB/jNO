@@ -43,6 +43,7 @@ from .feax_utils import (
     _dense_array,
     _make_internal_vars,
     _prepare_feax_runtime,
+    _zero_mass_dirichlet_rows,
 )
 from .parametric_helpers import (
     _clone_term_with_coeff,
@@ -1547,13 +1548,14 @@ def _ir_temporal_tags(ir) -> list[str]:
     return sorted(tags)
 
 
-def _prepare_src_runtime(domain, src_ir):
+def _prepare_src_runtime(domain, src_ir, *, fields_override=None):
     """
     Build FEAX source-only runtime ONCE.
 
     Source/load vector is evaluated as:
         b(t) = -r_src(0, t)
-    with no Dirichlet elimination.
+    with no Dirichlet elimination. ``fields_override`` forces the multi-field block
+    layout so a coupled source lands in the right field block.
     """
     rt = _prepare_feax_runtime(
         domain,
@@ -1561,6 +1563,7 @@ def _prepare_src_runtime(domain, src_ir):
         apply_dirichlet=False,
         need_jacobian=False,
         symmetric_bc=True,
+        fields_override=fields_override,
     )
 
     u_zero = jnp.zeros((rt["size"],), dtype=rt["dtype"])
@@ -1568,14 +1571,14 @@ def _prepare_src_runtime(domain, src_ir):
     return rt
 
 
-def _build_source_vector_fn(domain, src_ir, *, size, dtype):
+def _build_source_vector_fn(domain, src_ir, *, size, dtype, fields_override=None):
     """Build one transient volume-source or Neumann-load vector callback."""
     import feax as fe
 
     if src_ir is None or len(src_ir.terms) == 0:
         return None
 
-    rt = _prepare_src_runtime(domain, src_ir)
+    rt = _prepare_src_runtime(domain, src_ir, fields_override=fields_override)
     if int(rt["size"]) != int(size):
         raise ValueError(f"Auto forcing runtime size mismatch: runtime size={rt['size']}, expected {size}.")
 
@@ -1596,15 +1599,19 @@ def _build_source_vector_fn(domain, src_ir, *, size, dtype):
     return source_vector_fn
 
 
-def _build_auto_forcing_vector_fn(domain, src_ir, *, size, dtype):
-    """Build ``f(t,args) = f0(t) + sum_i args[name_i] * f_i(t)``."""
+def _build_auto_forcing_vector_fn(domain, src_ir, *, size, dtype, fields_override=None):
+    """Build ``f(t,args) = f0(t) + sum_i args[name_i] * f_i(t)``.
+
+    ``fields_override`` forces the multi-field block layout so a coupled source assembles
+    into the correct field block (used by the coupled transient path)."""
     if src_ir is None or len(src_ir.terms) == 0:
         return None, {}, {}
 
     static_src_ir, parameter_irs, runtime_parameter_exprs, _ = _split_parametric_operator_ir(src_ir)
-    static_fn = _build_source_vector_fn(domain, static_src_ir, size=size, dtype=dtype)
+    static_fn = _build_source_vector_fn(domain, static_src_ir, size=size, dtype=dtype, fields_override=fields_override)
     forcing_basis = {
-        name: _build_source_vector_fn(domain, basis_ir, size=size, dtype=dtype) for name, basis_ir in parameter_irs.items()
+        name: _build_source_vector_fn(domain, basis_ir, size=size, dtype=dtype, fields_override=fields_override)
+        for name, basis_ir in parameter_irs.items()
     }
     zero = jnp.zeros((int(size),), dtype=dtype)
 
@@ -1716,7 +1723,9 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             raise NotImplementedError("Runtime parameters inside transient mass terms are not supported yet.")
 
         M_sys, _bM = _assemble_fem_system_from_ir(domain, mass_ir)
-        M = _dense_array(M_sys)
+        # Zero the mass's Dirichlet rows/cols so M u̇ + A u = c reads u[d]=g there (feax
+        # leaves identity rows, which only happens to be right for homogeneous g).
+        M = _zero_mass_dirichlet_rows(_dense_array(M_sys), domain._feax_bc)
         full_size = int(M.shape[0])
         static_op_ir, operator_parameter_irs, operator_parameter_exprs, nonaffine_op_ir = _split_parametric_operator_ir(
             op_ir, allow_nonaffine=True
