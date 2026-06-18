@@ -149,6 +149,7 @@ nav:
       - Reaction-Diffusion (Robin BC): tutorials/08-fem-and-varpinns/diffusion-reaction-robin-bc.md
       - Helmholtz (Mixed BC): tutorials/08-fem-and-varpinns/helmholtz-mixed-bc-fem.md
       - Helmholtz 3D (F-domain): tutorials/08-fem-and-varpinns/helmholtz-3d.md
+      - Helmholtz + PML (complex): tutorials/08-fem-and-varpinns/helmholtz-pml-2d.md
       - Linear Elasticity (Cantilever): tutorials/08-fem-and-varpinns/linear-elasticity-cantilever.md
       - Stokes Channel (Poiseuille): tutorials/08-fem-and-varpinns/stokes-channel-poiseuille.md
       - Transient Heat: tutorials/08-fem-and-varpinns/transient-heat-2d.md
