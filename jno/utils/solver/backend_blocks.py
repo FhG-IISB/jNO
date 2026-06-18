@@ -552,18 +552,6 @@ class FeaxTimeBlock:
         from ...trace import FunctionCall  # lazy: avoid an import cycle with jno.trace
 
         if solve_fn is None:
-            if not self.is_linear():
-                # The default integrator is backward-Euler for a LINEAR block (M + dt A);
-                # a nonlinear block carries a residual (A/operator_fn are None). Keep the
-                # old clean message and point at the escape hatch rather than failing deep
-                # inside the scan on `jnp.asarray(None)`.
-                raise NotImplementedError(
-                    "The default transient integrator is backward-Euler for a linear block "
-                    "(M + dt A); this block is nonlinear. Pass solve_fn=(block, args, save_ts) "
-                    "-> ys -- e.g. a diffrax integrator over block.as_diffrax(), whose "
-                    "nonlinear path solves u_dot = M^-1(-R(u, t)). A nonlinear-transient "
-                    "default is a follow-on."
-                )
             solve_fn = _default_transient_integrate
         if save_ts is None:
             save_ts = _block_time_grid(self)
@@ -588,42 +576,62 @@ def _block_time_grid(block):
 
 
 def _default_transient_integrate(block, args, save_ts):
-    """Default transient integrator: backward-Euler at the block's *own* assembled step
-    ``dt`` -- the implicit scheme the transient assembly is built for (see
-    :meth:`FeaxTimeBlock.as_feax_pipeline`, ``backend_blocks`` notes)::
+    """Default transient integrator: backward Euler at the block's *own* assembled step ``dt``,
+    advanced with ``jax.lax.scan`` (reverse-mode differentiable) and sampled at ``save_ts`` by
+    linear interpolation, so the integration step is always the assembled ``dt`` and never an
+    accident of how the output is sampled.
 
-        (M + dt A(t_next, args)) u_next = M u + dt (c + f(t_next, args))
+    * **Linear** block -- the implicit scheme the transient assembly is built for::
 
-    advanced with ``jax.lax.scan`` (reverse-mode differentiable, constant memory) and then
-    sampled at ``save_ts`` by linear interpolation, so the integration step is always the
-    assembled ``dt`` and never an accident of how the output is sampled. This is a
-    *default*: pass any ``solve_fn(block, args, save_ts) -> ys`` to :meth:`FeaxTimeBlock.solve`
-    (diffrax via ``block.as_diffrax``, a feax pipeline via ``block.as_feax_pipeline``, or a
-    hand-rolled stepper) to use a different integrator.
+          (M + dt A(t_next, args)) u_next = M u + dt (c + f(t_next, args))
+
+    * **Nonlinear** block (residual route, ``M(t) u_dot = -R(u, t, args)``) -- backward Euler
+      solves, per step, ``G(u_next) = M (u_next - u)/dt + R(u_next, t_next, args) = 0`` with an
+      ``optimistix`` Newton ``root_find`` (implicit-diff, so the gradient reaches ``args``
+      without unrolling Newton -- the same library the steady nonlinear ``.solve`` uses).
+
+    This is a *default*: pass any ``solve_fn(block, args, save_ts) -> ys`` to
+    :meth:`FeaxTimeBlock.solve` (diffrax via ``block.as_diffrax``, a feax pipeline via
+    ``block.as_feax_pipeline``, or a hand-rolled stepper) to use a different integrator.
     """
     import jax
     import jax.numpy as jnp
 
-    M = jnp.asarray(block.M)
-    n = M.shape[0]
-    dtype = M.dtype
-    c = jnp.zeros((n,), dtype) if block.affine_bias is None else jnp.asarray(block.affine_bias, dtype).reshape(-1)
-    s0 = jnp.asarray(block.state0, dtype).reshape(-1)
+    s0 = jnp.asarray(block.state0).reshape(-1)
+    dtype = s0.dtype
     grid_ts = jnp.asarray(_block_time_grid(block), dtype)
     dt = float(block.dt)
 
-    def step(w, t_next):
-        if block.operator_fn is not None:
-            A = jnp.asarray(block.operator_fn(t_next, args), dtype)
-        else:
-            A = jnp.asarray(block.A, dtype)
-        rhs = M @ w + dt * c
-        if block.forcing_vector_fn is not None:
-            rhs = rhs + dt * jnp.asarray(block.forcing_vector_fn(t_next, args), dtype).reshape(-1)
-        w_next = jnp.linalg.solve(M + dt * A, rhs)
-        return w_next, w_next
+    if block.is_nonlinear():
+        import optimistix as optx
 
-    _, ys = jax.lax.scan(step, s0, grid_ts[1:])
+        mass_fn, residual_fn = block.mass, block.residual
+
+        def step(w, t_next):
+            M_t = jnp.asarray(mass_fn(t_next, args), dtype)
+
+            def _resid(wn, _):  # backward-Euler residual G(wn) = 0
+                return (M_t @ (wn - w)) / dt + jnp.asarray(residual_fn(wn, t_next, args), dtype).reshape(-1)
+
+            sol = optx.root_find(_resid, optx.Newton(rtol=1e-8, atol=1e-8), w, max_steps=64, throw=False)
+            return sol.value, sol.value
+
+        _, ys = jax.lax.scan(step, s0, grid_ts[1:])
+    else:
+        M = jnp.asarray(block.M, dtype)
+        n = M.shape[0]
+        c = jnp.zeros((n,), dtype) if block.affine_bias is None else jnp.asarray(block.affine_bias, dtype).reshape(-1)
+
+        def step(w, t_next):
+            A = jnp.asarray(block.operator_fn(t_next, args) if block.operator_fn is not None else block.A, dtype)
+            rhs = M @ w + dt * c
+            if block.forcing_vector_fn is not None:
+                rhs = rhs + dt * jnp.asarray(block.forcing_vector_fn(t_next, args), dtype).reshape(-1)
+            w_next = jnp.linalg.solve(M + dt * A, rhs)
+            return w_next, w_next
+
+        _, ys = jax.lax.scan(step, s0, grid_ts[1:])
+
     traj = jnp.concatenate([s0[None, :], ys], axis=0)  # (n_grid, n_dofs) at grid_ts
     save_ts = jnp.asarray(save_ts, dtype)
     # sample at save_ts (identity when save_ts == the grid); decouples output from the step

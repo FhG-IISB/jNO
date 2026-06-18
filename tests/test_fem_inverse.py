@@ -471,21 +471,29 @@ def test_transient_solve_fn_override_feax_pipeline():
     assert abs(rec - 1.0) < TRANSIENT_TOL, f"transient (feax-pipeline override): recovered alpha={rec:.4f}"
 
 
-def test_transient_nonlinear_default_raises_cleanly():
-    """The default transient integrator is backward-Euler for a LINEAR block; a nonlinear
-    transient (residual path, A/operator_fn are None) must raise a clear NotImplementedError
-    that points at solve_fn=, not fail deep in the scan on jnp.asarray(None)."""
-    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3, time=(0.0, 0.1, 6))
-    u, v = d.fem_symbols()
+def test_transient_nonlinear_recovers_via_inner_newton():
+    """The default transient integrator handles a NONLINEAR block too: backward Euler with an
+    optimistix Newton root_find per step (implicit-diff). Recover a scalar alpha in
+    u_t = lap u - alpha*u^3 from the trajectory through fem.solve() -- the gradient flows
+    through the per-step Newton to alpha without unrolling it."""
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    alpha = _alpha()
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15, time=(0.0, 0.05, 11))
+    u, phi = d.fem_symbols()
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
     ci = d.variable("initial", split=True)
-    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
     u0 = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
-    fem = jno.fem([ui.t * vi + (u * u * u) * vi + ui.x * vi.x + ui.y * vi.y, u(xb, yb) - 0.0, u(ci[0], ci[1]) - u0])
+    fem = jno.fem(
+        [ui.t * vi + (ui.x * vi.x + ui.y * vi.y) + alpha * (u * u * u) * vi, u(xb, yb) - 0.0, u(ci[0], ci[1]) - u0]
+    )
     assert fem.is_transient and not fem.operator.is_linear()
-    with pytest.raises(NotImplementedError, match="nonlinear"):
-        fem.solve()
+    u_obs = _default_transient_integrate(fem.operator, {"alpha": 1.0}, _grid_ts(fem.operator))
+    assert u_obs.ndim == 2 and not bool(jnp.isnan(u_obs).any())
+    rec = _recover(fem.solve(), alpha, u_obs, n=200)
+    assert abs(rec - 1.0) < TRANSIENT_TOL, f"nonlinear-transient (inner Newton): recovered alpha={rec:.4f}"
 
 
 # --------------------------------------------------------- non-homogeneous Dirichlet + parametric
