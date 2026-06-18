@@ -1222,6 +1222,41 @@ class domain(MeshIOMixin):
             "context_tag": context_tag if context_tag is not None else sample_tag,
         }
 
+    def point_region(self, name: str, xy) -> "domain":
+        """Register a single-node boundary region at the mesh vertex nearest ``xy``.
+
+        Unlike :meth:`region` (which selects whole boundary *segments*), this pins
+        one mesh vertex so a Dirichlet term such as ``p(domain.variable(name)) - 0``
+        constrains exactly that node. The canonical use is fixing the pressure
+        null space of a pure-Dirichlet Stokes problem so the saddle system is
+        non-singular and solvable directly (no ``lstsq``/zero-mean workaround).
+
+        Parameters
+        ----------
+        name : str
+            Tag for the pinned node; usable in :meth:`variable` and as a Dirichlet
+            region in :func:`jno.fem`.
+        xy : array-like
+            Target coordinates; the nearest mesh vertex is pinned (vertices are
+            shared by P1 and P2 fields, so the pin lands on a node of either).
+        """
+        from .boundary_region import BoundaryRegion
+
+        if self.mesh is None:
+            raise ValueError("Mesh must be loaded before registering a point region.")
+        pts = np.asarray(self.mesh.points)[:, : self.dimension]
+        target = np.asarray(xy, dtype=float).reshape(-1)[: self.dimension]
+        nid = int(((pts - target) ** 2).sum(axis=1).argmin())
+        coord = pts[nid : nid + 1].copy()  # (1, D)
+        bbox = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
+        tol = 1e-6 * bbox if bbox > 0 else 1e-7
+        self._mesh_pool[name] = coord
+        self._boundary_regions[name] = BoundaryRegion(
+            tag=name, dim=self.dimension, points=coord, edges=None, triangles=None, tol=tol
+        )
+        self._register_variational_sample(sample_tag=name, support="boundary", region_id=name, context_tag=name)
+        return self
+
     def init_fem(
         self,
         element_type: str = "TRI3",
