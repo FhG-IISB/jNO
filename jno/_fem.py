@@ -174,6 +174,25 @@ def _field_key_of(constraint: Any) -> Any:
     return None
 
 
+def _normalize_quad_tag(tag: Any, boundary_regions: Any) -> Any:
+    """Undo a quadrature retag this module produced, so region detection is robust to a
+    coordinate Variable that was already retagged by an earlier (or interleaved) ``jno.fem``
+    call (``_retag_coords_for_quadrature`` mutates ``Variable.tag`` in place; reusing a stored
+    coord var across two ``fem()`` calls otherwise leaves its tag as ``"gauss_<region>"`` and
+    silently misclassifies the term as volume). The retag is total + reserved
+    (``boundary -> "gauss_{region}"``), so stripping ``gauss_`` recovers the region exactly.
+
+    Defensive: only strip ``gauss_<r>`` when ``<r>`` is an actual boundary region, so a
+    user region with an unusual name is never silently rewritten -- we only ever undo a tag
+    we ourselves produced. ``"fem_gauss"`` (volume) is left as-is and falls through to volume.
+    """
+    if isinstance(tag, str) and tag.startswith("gauss_"):
+        region = tag[len("gauss_") :]
+        if region in (boundary_regions or {}):
+            return region
+    return tag
+
+
 def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
     """Return ``(support, region_id)`` for a constraint.
 
@@ -182,7 +201,12 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
     of the constraint's coordinate Variables; a constraint must resolve to a
     single region.
     """
-    tags = {v.tag for v in _spatial_coord_vars(constraint) if isinstance(v.tag, str) and not v.tag.startswith("__")}
+    _bregions = getattr(domain, "_boundary_regions", {})
+    tags = {
+        _normalize_quad_tag(v.tag, _bregions)
+        for v in _spatial_coord_vars(constraint)
+        if isinstance(v.tag, str) and not v.tag.startswith("__")
+    }
     # The t=t0 slice is its own support; an IC residual lives here.
     if "initial" in tags:
         return "initial", "initial"

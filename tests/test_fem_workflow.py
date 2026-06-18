@@ -182,3 +182,32 @@ def test_transient_nonlinear_assembles_to_residual_block():
     assert block.residual is not None and block.jacobian is not None and block.mass is not None
     R0 = np.asarray(block.residual(np.asarray(fem.state0), float(fem.t0), None))
     assert R0.shape == (fem.dofs,)
+
+
+def test_reused_coord_var_across_fem_calls_assembles_consistently():
+    """Reusing a stored coordinate Variable across two jno.fem() calls must not corrupt the
+    second call's region classification. _retag_coords_for_quadrature mutates Variable.tag in
+    place (-> "gauss_right"); region detection now normalizes already-retagged tags, so the
+    reused boundary term still classifies as surface and assembles the SAME system. Numerical
+    check (integral-right, not just label-right): the second assembly equals a fresh one."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xr, yr, _ = d.variable("right", split=True)  # stored boundary coords, reused below
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+
+    def build():  # -lap u = 0, du/dn = 1 on right (Neumann), u = 0 on left  -> u = x
+        xl, yl, _ = d.variable("left", split=True)
+        return jno.fem([ui.x * vi.x + ui.y * vi.y, -1.0 * phi.bind(x=xr, y=yr), u(xl, yl) - 0.0])
+
+    fem1 = build()
+    assert "surface@right" in fem1.classification
+    b1 = np.asarray(fem1.b).reshape(-1)
+    assert np.linalg.norm(b1) > 0.0  # the Neumann term contributed to the load
+
+    # xr/yr are now retagged in place to "gauss_right"; the second call must STILL classify the
+    # right term as surface (not volume) and assemble an identical system.
+    fem2 = build()
+    assert "surface@right" in fem2.classification
+    assert np.allclose(b1, np.asarray(fem2.b).reshape(-1))
+    assert np.allclose(_dense(fem1.A), _dense(fem2.A))
