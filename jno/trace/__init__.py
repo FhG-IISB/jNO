@@ -2899,9 +2899,10 @@ class TrialFunction(Placeholder):
           (2,2) -> second-order tensor, etc.
     """
 
-    def __init__(self, name="u", value_shape=()):
+    def __init__(self, name="u", value_shape=(), order=1):
         self.name = name
         self.value_shape = tuple(value_shape)
+        self.order = int(order)  # element polynomial degree for this field (P1=1, P2=2)
         self.op_id = _next_op_id()
 
     @property
@@ -2968,9 +2969,10 @@ class TestFunction(Placeholder):
           (2,2) -> second-order tensor, etc.
     """
 
-    def __init__(self, name="phi", value_shape=()):
+    def __init__(self, name="phi", value_shape=(), order=1):
         self.name = name
         self.value_shape = tuple(value_shape)
+        self.order = int(order)  # element polynomial degree for this field (P1=1, P2=2)
         self.op_id = _next_op_id()
 
     @property

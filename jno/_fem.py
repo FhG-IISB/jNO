@@ -122,6 +122,32 @@ def _infer_vec(constraints: List[Any]) -> int:
     return 1
 
 
+# (dimension, polynomial order) -> simplex element type; 1D uses the native LINE2 path.
+_ELEMENT_FOR = {(2, 1): "TRI3", (2, 2): "TRI6", (3, 1): "TET4", (3, 2): "TET10"}
+_P2_ELEMENTS = {"TRI6", "TET10", "QUAD8"}
+
+
+def _infer_order(constraints: List[Any]) -> int:
+    """Max element polynomial order across the trial fields (P1=1, P2=2)."""
+    orders = [int(getattr(n, "order", 1)) for c in constraints for n in _walk(_bare(c)) if isinstance(n, TrialFunction)]
+    return max(orders) if orders else 1
+
+
+def _element_for(dimension: int, order: int) -> str:
+    """Simplex element type for a ``(dimension, order)`` pair (2D/3D; orders 1, 2)."""
+    et = _ELEMENT_FOR.get((int(dimension), int(order)))
+    if et is None:
+        raise ValueError(
+            f"jno.fem: no built-in element for dimension {dimension}, order {order} "
+            "(supported: 2D/3D at order 1 or 2; pass element_type=... to override)."
+        )
+    return et
+
+
+def _order_of_element(element_type: str) -> int:
+    return 2 if element_type in _P2_ELEMENTS else 1
+
+
 def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
     """Return ``(support, region_id)`` for a constraint.
 
@@ -333,6 +359,21 @@ class FEM:
         ``FemResidualOperator`` (steady) or ``FeaxTimeBlock`` (transient)."""
         return self._op
 
+    @property
+    def points(self):
+        """Node coordinates the DOFs live on.
+
+        For a higher-order (P2) element these are the assembly-mesh nodes
+        (vertices + edge midpoints), which differ from the linear ``mesh`` the
+        domain keeps — use these to interpret the solution vector."""
+        prob = self.problem
+        meshes = getattr(prob, "mesh", None) if prob is not None else None
+        if meshes:
+            return jnp.asarray(meshes[0].points)
+        if self.mesh is not None:
+            return jnp.asarray(self.mesh.points)[:, : self.domain.dimension]
+        return None
+
     # -- steady linear --
     @property
     def A(self):
@@ -412,7 +453,7 @@ class FEM:
 # ---------------------------------------------------------------------------
 # the driver
 # ---------------------------------------------------------------------------
-def fem(constraints: Any, *, quad_degree: int = 2, element_type: str = "TRI3", vec: Optional[int] = None) -> FEM:
+def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] = None, vec: Optional[int] = None) -> FEM:
     """Assemble a flat list of traced residuals into an :class:`FEM`.
 
     Parameters
@@ -509,6 +550,15 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: str = "TRI3", v
             domain, volume_terms, boundary_terms, dirichlet_values, ic_residuals, vec=vec, quad_degree=quad_degree
         )
         return FEM(domain=domain, op=op, classification=classification, mode=mode)
+
+    # ---- element + quadrature for the field order (2D/3D) ----
+    # The element defaults to the field's polynomial order (P1->TRI3/TET4, P2->TRI6/
+    # TET10); a higher-order field bumps the quadrature so the integrand is exact.
+    order = _infer_order(constraints)
+    if element_type is None:
+        element_type = _element_for(domain.dimension, order)
+    eff_order = max(order, _order_of_element(element_type))
+    quad_degree = max(quad_degree, 2 * eff_order)
 
     # ---- quadrature + BC setup (reuse init_fem) ----
     bcs = [domain.dirichlet(tag, value) for tag, value in dirichlet_values.items()]

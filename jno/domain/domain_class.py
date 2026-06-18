@@ -1118,9 +1118,14 @@ class domain(MeshIOMixin):
 
         return [loc_fns, vec_ids, val_fns]
 
-    def variational_symbols(self, value_shape=(), names=("u", "phi")):
+    def variational_symbols(self, value_shape=(), names=("u", "phi"), order=1):
         """
         Return generic variational symbols.
+
+        ``order`` is the element polynomial degree for this field (1 = P1, 2 = P2).
+        It is per-field (mixed methods like Taylor-Hood use different orders for
+        different fields); the domain mesh stays linear and the FEM assembly mesh is
+        promoted as needed.
 
         Parameters
         ----------
@@ -1150,11 +1155,11 @@ class domain(MeshIOMixin):
         """
         trial_name, test_name = names
         return (
-            TrialFunction(name=trial_name, value_shape=value_shape),
-            TestFunction(name=test_name, value_shape=value_shape),
+            TrialFunction(name=trial_name, value_shape=value_shape, order=order),
+            TestFunction(name=test_name, value_shape=value_shape, order=order),
         )
 
-    def fem_symbols(self, value_shape=(), names=("u", "phi")):
+    def fem_symbols(self, value_shape=(), names=("u", "phi"), order=1):
         """
         Backward-compatible alias for variational_symbols().
 
@@ -1165,10 +1170,14 @@ class domain(MeshIOMixin):
 
         Vector:
             u, v = domain.fem_symbols(value_shape=(2,))
-        """
-        return self.variational_symbols(value_shape=value_shape, names=names)
 
-    def test_function(self, value_shape=(), name="phi"):
+        Mixed order (Taylor-Hood: P2 velocity, P1 pressure):
+            u, v = domain.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
+            p, q = domain.fem_symbols(names=("p", "q"))  # order=1
+        """
+        return self.variational_symbols(value_shape=value_shape, names=names, order=order)
+
+    def test_function(self, value_shape=(), name="phi", order=1):
         """Return only the weak-form test function.
 
         Intended for NN-first weak VPINN authoring:
@@ -1176,11 +1185,11 @@ class domain(MeshIOMixin):
             u   = net(...)
             weak = ...
         """
-        return TestFunction(name=name, value_shape=value_shape)
+        return TestFunction(name=name, value_shape=value_shape, order=order)
 
-    def trial_function(self, value_shape=(), name="u"):
+    def trial_function(self, value_shape=(), name="u", order=1):
         """Advanced helper for explicit FEM-only authoring."""
-        return TrialFunction(name=name, value_shape=value_shape)
+        return TrialFunction(name=name, value_shape=value_shape, order=order)
 
     def _register_variational_sample(
         self,
@@ -1261,20 +1270,11 @@ class domain(MeshIOMixin):
             dirichlet_tags, dirichlet_value_fns, neumann_tags, bc_periodic_pairs = expand_bcs(bcs, vec=vec)
             periodic_pairs = periodic_pairs + list(bc_periodic_pairs)
 
-        meshio_type_map = {
-            "TRI3": "triangle",
-            "QUAD4": "quad",
-            "TET4": "tetra",
-        }
-        meshio_type = meshio_type_map.get(element_type)
-        if meshio_type is None:
-            raise ValueError(f"Unsupported FEM element_type '{element_type}'.")
+        # Build the feax assembly mesh (promotes the linear domain mesh to P2 for
+        # higher-order elements; the domain mesh itself stays linear).
+        from ..utils.solver.feax_utils import _build_feax_mesh
 
-        feax_mesh = fe.Mesh(
-            self.mesh.points[:, : self.dimension],
-            self.mesh.cells_dict[meshio_type],
-            ele_type=element_type,
-        )
+        feax_mesh = _build_feax_mesh(self, element_type)
 
         # ---------------------------------------------------------
         # Boundary tags -> FEAX location functions

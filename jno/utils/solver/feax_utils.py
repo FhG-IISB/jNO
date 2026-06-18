@@ -1046,13 +1046,65 @@ def _meshio_type_for_element(element_type: str) -> str:
     return meshio_type_map[element_type]
 
 
+# Quadratic (P2) meshio cell type -> (linear source type, per-element edge node list
+# in meshio ordering). feax has no P2 mesh source and jno's domain machinery assumes
+# linear cells, so the domain mesh stays linear (P1) and we promote *only* the feax
+# assembly mesh here: insert edge-midpoint nodes, vertices preserved (so a P1 field on
+# a P2 problem -- e.g. Taylor-Hood pressure -- is just the vertex block).
+_P2_FROM_P1 = {
+    "triangle6": ("triangle", [(0, 1), (1, 2), (2, 0)]),
+    "tetra10": ("tetra", [(0, 1), (1, 2), (2, 0), (0, 3), (1, 3), (2, 3)]),
+}
+
+
+def _promote_to_quadratic(points, cells_p1, edge_local):
+    """Promote a linear simplex mesh to quadratic (P1 -> P2).
+
+    Inserts one node at each *unique* edge midpoint (canonical sorted-vertex-pair
+    key, so an edge shared by two cells maps to a single node), preserving the
+    original vertices (indices ``0..nverts-1``) and appending the edge nodes.
+    Returns ``(points_p2, cells_p2)`` with cells in meshio ``*6``/``*10`` ordering
+    (corners first, then ``edge_local`` midpoints)."""
+    points = np.asarray(points)
+    cells_p1 = np.asarray(cells_p1)
+    ncorner = cells_p1.shape[1]
+    edge_map: dict[tuple[int, int], int] = {}
+    edge_nodes: List[Any] = []
+    cells_p2 = np.zeros((cells_p1.shape[0], ncorner + len(edge_local)), dtype=np.int64)
+    cells_p2[:, :ncorner] = cells_p1
+    nid = points.shape[0]
+    for c in range(cells_p1.shape[0]):
+        for k, (i, j) in enumerate(edge_local):
+            a, b = int(cells_p1[c, i]), int(cells_p1[c, j])
+            key = (a, b) if a < b else (b, a)
+            n = edge_map.get(key)
+            if n is None:
+                n = nid
+                edge_map[key] = nid
+                edge_nodes.append(0.5 * (points[a] + points[b]))
+                nid += 1
+            cells_p2[c, ncorner + k] = n
+    pts = np.vstack([points, np.asarray(edge_nodes)]) if edge_nodes else points
+    return pts, cells_p2
+
+
 def _build_feax_mesh(domain, element_type: str):
     import feax as fe
 
     meshio_type = _meshio_type_for_element(element_type)
-    points = jnp.asarray(domain.mesh.points[:, : domain.dimension])
-    cells = jnp.asarray(domain.mesh.cells_dict[meshio_type], dtype=jnp.int32)
-    return fe.Mesh(points, cells, ele_type=element_type)
+    dim = domain.dimension
+    cells_dict = domain.mesh.cells_dict
+    if meshio_type in cells_dict:
+        points = np.asarray(domain.mesh.points)[:, :dim]
+        cells = np.asarray(cells_dict[meshio_type])
+    elif meshio_type in _P2_FROM_P1:  # promote the (linear) domain mesh for assembly only
+        p1_type, edge_local = _P2_FROM_P1[meshio_type]
+        if p1_type not in cells_dict:
+            raise ValueError(f"Cannot build '{element_type}': no '{p1_type}' cells to promote to '{meshio_type}'.")
+        points, cells = _promote_to_quadratic(np.asarray(domain.mesh.points)[:, :dim], cells_dict[p1_type], edge_local)
+    else:
+        raise KeyError(f"No mesh cells of type '{meshio_type}' for element '{element_type}'.")
+    return fe.Mesh(jnp.asarray(points), jnp.asarray(cells, dtype=jnp.int32), ele_type=element_type)
 
 
 def _make_feax_dirichlet_specs(domain, vec: int):
