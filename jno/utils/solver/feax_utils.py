@@ -930,6 +930,27 @@ def _eval_volume_integrand(
     return ravel_pytree(jnp.sum(weighted, axis=0))[0]
 
 
+def _lookup_boundary_normals(domain, tag, physical_surface_quad_points):
+    """Outward normals at the face quad points for ``tag`` (or ``None``).
+
+    Nearest-neighbour lookup against ``domain.normals_by_tag`` (keyed by the sampled
+    ``gauss_<tag>`` or ``<tag>``), matching the single-field surface path. Shared by
+    the single- and multi-field surface integrands so normal-dependent boundary terms
+    (e.g. a pressure traction ``p_ext * n``) behave identically in coupled problems."""
+    if not hasattr(domain, "normals_by_tag"):
+        return None
+    normal_lookup_tag = f"gauss_{tag}" if f"gauss_{tag}" in domain.normals_by_tag else tag
+    if normal_lookup_tag in domain.normals_by_tag and normal_lookup_tag in getattr(domain, "_mesh_pool", {}):
+        normal_pts = jnp.asarray(np.asarray(domain._mesh_pool[normal_lookup_tag])[:, : domain.dimension])
+        normal_vals = jnp.asarray(np.asarray(domain.normals_by_tag[normal_lookup_tag])[:, : domain.dimension])
+        if len(normal_pts) > 0 and len(normal_pts) == len(normal_vals):
+            x_use = physical_surface_quad_points[:, : domain.dimension]
+            d2 = jnp.sum((normal_pts[None, :, :] - x_use[:, None, :]) ** 2, axis=-1)
+            nn_idx = jnp.argmin(d2, axis=1)
+            return normal_vals[nn_idx]
+    return None
+
+
 def _eval_surface_integrand(
     domain,
     expr,
@@ -1005,17 +1026,7 @@ def _eval_surface_integrand(
     if weights.shape[0] != nq:
         raise ValueError(f"Boundary weight/quadrature mismatch on '{tag}': weights.shape={weights.shape}, nq={nq}.")
 
-    boundary_normals = None
-    if hasattr(domain, "normals_by_tag"):
-        normal_lookup_tag = f"gauss_{tag}" if f"gauss_{tag}" in domain.normals_by_tag else tag
-        if normal_lookup_tag in domain.normals_by_tag and normal_lookup_tag in getattr(domain, "_mesh_pool", {}):
-            normal_pts = jnp.asarray(np.asarray(domain._mesh_pool[normal_lookup_tag])[:, : domain.dimension])
-            normal_vals = jnp.asarray(np.asarray(domain.normals_by_tag[normal_lookup_tag])[:, : domain.dimension])
-            if len(normal_pts) > 0 and len(normal_pts) == len(normal_vals):
-                x_use = physical_surface_quad_points[:, : domain.dimension]
-                d2 = jnp.sum((normal_pts[None, :, :] - x_use[:, None, :]) ** 2, axis=-1)
-                nn_idx = jnp.argmin(d2, axis=1)
-                boundary_normals = normal_vals[nn_idx]
+    boundary_normals = _lookup_boundary_normals(domain, tag, physical_surface_quad_points)
 
     local = {
         "physical_quad_points": physical_surface_quad_points,
@@ -1152,6 +1163,107 @@ def _make_multifield_volume_kernel(
             cell_JxW,
             cell_v_grads_JxW,
             *cell_internal_vars,
+        )
+
+    return kernel
+
+
+def _eval_multifield_surface_integrand(
+    domain,
+    term_list,
+    fields,
+    field_index,
+    tag,
+    temporal_tags,
+    runtime_parameter_tags,
+    problem_ref,
+    cell_sol_flat,
+    physical_surface_quad_points,
+    face_shape_vals,
+    face_shape_grads,
+    face_nanson_scale,
+    *cell_internal_vars_surface,
+):
+    """Evaluate all coupled boundary terms on one face -> flat block-local residual.
+
+    The surface analogue of :func:`_eval_multifield_volume_integrand`. feax passes the
+    full multi-field parent-cell DOFs and the per-field face shape data concatenated
+    along the node axis (assembler concatenates in ``problem.fes`` order, identical to
+    the volume ``shape_grads``), so we split DOFs with ``unflatten_fn_dof`` and slice the
+    face shape arrays per field. Each term ``(coeff, test_field_index)`` accumulates into
+    its test field's residual slot; ``ravel_pytree`` concatenates in field order so feax
+    autodiffs the surface contribution into the right block(s) of the load and matrix."""
+    problem = problem_ref["problem"]
+    if problem is None:
+        raise RuntimeError("FEAX problem_ref['problem'] was not initialized before kernel evaluation.")
+
+    cell_sol_list = problem.unflatten_fn_dof(cell_sol_flat)
+    nfields = len(fields)
+    nnodes = [int(problem.fes[i].shape_vals.shape[1]) for i in range(nfields)]
+    nc = [0]
+    for n in nnodes:
+        nc.append(nc[-1] + n)
+    per_field = [
+        {
+            "shape_vals": face_shape_vals[:, nc[i] : nc[i + 1]],
+            "shape_grads": face_shape_grads[:, nc[i] : nc[i + 1], :],
+            "cell_sol": cell_sol_list[i],
+        }
+        for i in range(nfields)
+    ]
+    local = {
+        "physical_quad_points": physical_surface_quad_points,
+        "fields": per_field,
+        "field_index": field_index,
+        "tag": tag,
+        "surface": True,
+        "domain_context": domain.context,
+        "boundary_normals": _lookup_boundary_normals(domain, tag, jnp.asarray(physical_surface_quad_points)),
+        "temporal_tags": tuple(temporal_tags),
+        "runtime_parameter_tags": tuple(runtime_parameter_tags),
+        "volume_vars": tuple(cell_internal_vars_surface),
+    }
+
+    face_nanson_scale = jnp.asarray(face_nanson_scale)
+    weights = face_nanson_scale[0] if face_nanson_scale.ndim == 2 else face_nanson_scale
+
+    residuals = [jnp.zeros((nnodes[i] * int(fields[i]["vec"]),), dtype=cell_sol_flat.dtype) for i in range(nfields)]
+    for coeff, test_idx in term_list:
+        val = _eval_expr_for_feax(domain, coeff, local)
+        wshape = (weights.shape[0],) + (1,) * (val.ndim - 1)
+        contrib = ravel_pytree(jnp.sum(val * weights.reshape(wshape), axis=0))[0]
+        residuals[test_idx] = residuals[test_idx] + contrib
+    return ravel_pytree(residuals)[0]
+
+
+def _make_multifield_surface_kernel(
+    domain, term_list, fields, field_index, tag, temporal_tags, runtime_parameter_tags, problem_ref
+):
+    """FEAX universal surface kernel for the coupled boundary terms on one tag."""
+
+    def kernel(
+        cell_sol_flat,
+        physical_surface_quad_points,
+        face_shape_vals,
+        face_shape_grads,
+        face_nanson_scale,
+        *cell_internal_vars_surface,
+    ):
+        return _eval_multifield_surface_integrand(
+            domain,
+            term_list,
+            fields,
+            field_index,
+            tag,
+            temporal_tags,
+            runtime_parameter_tags,
+            problem_ref,
+            cell_sol_flat,
+            physical_surface_quad_points,
+            face_shape_vals,
+            face_shape_grads,
+            face_nanson_scale,
+            *cell_internal_vars_surface,
         )
 
     return kernel
@@ -1382,13 +1494,8 @@ def _build_multifield_feax_problem(domain, ir, fields, field_index, *, apply_dir
     meshes = [_build_feax_mesh(domain, et) for et in eles]
     vecs = [int(f["vec"]) for f in fields]
 
-    if any(t.support == "boundary" for t in ir.terms):
-        raise NotImplementedError("jno.fem: coupled surface (Neumann/Robin) terms are not supported yet.")
-
-    term_list = []
-    for t in ir.terms:
-        if t.support != "volume" or t.channel != "raw":
-            continue
+    def _typed_term(t):
+        """Lower one IR weak term to ``(coeff, test_field_index)`` for the block kernel."""
         coeff = _lower_statefield_to_trial(t.coeff, {})
         tfi = _test_field_index(coeff, field_index)
         if tfi is None:
@@ -1396,19 +1503,47 @@ def _build_multifield_feax_problem(domain, ir, fields, field_index, *, apply_dir
                 "jno.fem: each coupled weak term must contain exactly one test field "
                 "(it determines the equation block); got a term with zero or several."
             )
-        term_list.append((coeff, tfi))
+        return coeff, tfi
+
+    term_list = []
+    boundary_terms_by_tag: dict[str, list] = {}
+    for t in ir.terms:
+        if t.channel != "raw":
+            continue
+        if t.support == "volume":
+            term_list.append(_typed_term(t))
+        elif t.support == "boundary":
+            boundary_terms_by_tag.setdefault(t.region_id, []).append(_typed_term(t))
 
     problem_ref: dict[str, Any] = {"problem": None}
     kernel = _make_multifield_volume_kernel(domain, term_list, fields, field_index, (), (), problem_ref)
+
+    # Coupled surface (Neumann/Robin) terms: one universal surface kernel per boundary
+    # tag, grouping that tag's terms by test field into the block residual. feax matches
+    # location_fns[i] <-> get_universal_kernels_surface()[i] by index, so both lists are
+    # built in lockstep over the same ordered tags.
+    location_fns = []
+    surface_kernels = []
+    for tag, tag_terms in boundary_terms_by_tag.items():
+        loc_fn = domain._make_tag_location_fn(tag)
+        if loc_fn is None:
+            domain.log.warning(f"Boundary tag '{tag}' not found while building coupled surface locations. Skipping.")
+            continue
+        location_fns.append(loc_fn)
+        surface_kernels.append(
+            _make_multifield_surface_kernel(domain, tag_terms, fields, field_index, tag, (), (), problem_ref)
+        )
 
     class GeneratedMultifieldProblem(fe.Problem):
         def get_universal_kernel(self_inner):
             return kernel
 
         def get_universal_kernels_surface(self_inner):
-            return []
+            return surface_kernels
 
-    problem = GeneratedMultifieldProblem(meshes, vec=vecs, dim=dim, ele_type=eles, gauss_order=quad_degree, location_fns=[])
+    problem = GeneratedMultifieldProblem(
+        meshes, vec=vecs, dim=dim, ele_type=eles, gauss_order=quad_degree, location_fns=location_fns
+    )
     problem_ref["problem"] = problem
 
     bc_specs = _make_multifield_dirichlet_specs(domain, fields, field_index) if apply_dirichlet else []

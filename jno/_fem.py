@@ -519,11 +519,16 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     ic_residuals: List[Any] = []
     classification: List[str] = []
 
-    for c in constraints:
-        has_test = _contains(c, TestFunction)
-        has_trial = _contains(c, TrialFunction)
-        support, region = _region_and_support(c, domain)
+    # Classify every constraint against its ORIGINAL coordinate tags before touching
+    # any of them. `_retag_coords_for_quadrature` mutates the shared coordinate
+    # Variables in place, so classifying up front prevents one constraint's retag from
+    # leaking into another's region detection — e.g. two surface terms on the same
+    # region (a Neumann load + a Robin term) that share the bound boundary coordinates.
+    classified = [
+        (c, _contains(c, TestFunction), _contains(c, TrialFunction), *_region_and_support(c, domain)) for c in constraints
+    ]
 
+    for c, has_test, has_trial, support, region in classified:
         if support == "initial":
             # initial condition: a trial-only residual `u(initial) - u0` on the t0 slice
             if has_test:
@@ -678,25 +683,26 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
         _split_additive_terms,
     )
 
-    if ic_residuals or any(_contains_temporal_derivative(b) for b in volume_terms):
+    weak_bares = volume_terms + [e for exprs in boundary_terms.values() for e in exprs]
+    if ic_residuals or any(_contains_temporal_derivative(b) for b in weak_bares):
         raise NotImplementedError("jno.fem: coupled transient (multi-field + time) is not supported yet (Phase 3).")
-    if boundary_terms:
-        raise NotImplementedError(
-            "jno.fem: coupled Neumann/Robin (surface terms with multiple fields) is not supported yet; "
-            "use Dirichlet conditions for now."
-        )
 
     domain._fem_quad_degree = quad_degree
     domain._variational_initialized = True
 
+    # Same IR as the single-field path: one LoweredChannelTerm per additive sub-term.
+    # Coupled surface (Neumann/Robin) terms are emitted on their boundary region_id;
+    # _build_multifield_feax_problem groups them per tag into per-field surface kernels.
+    # (Coords were retagged to gauss_<region> by the classifier's _retag_coords_for_quadrature.)
     terms: List[Any] = []
-    for bare in volume_terms:
+
+    def _emit(bare: Any, support: str, region_id: str) -> None:
         for sign, sub in _split_additive_terms(domain, bare):
             terms.append(
                 LoweredChannelTerm(
                     sign=sign,
-                    support="volume",
-                    region_id="volume",
+                    support=support,
+                    region_id=region_id,
                     channel="raw",
                     coeff=_apply_sign(domain, sign, sub),
                     variable_id=0,
@@ -704,6 +710,12 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
                     original_expr=sub,
                 )
             )
+
+    for bare in volume_terms:
+        _emit(bare, "volume", "volume")
+    for tag, exprs in boundary_terms.items():
+        for bare in exprs:
+            _emit(bare, "boundary", tag)
     if not terms:
         raise ValueError("jno.fem: no weak-form (test-function) terms found to assemble.")
     ir = LoweredWeakForm(domain=domain, terms=terms)
@@ -728,8 +740,9 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
 
     # Nonlinear coupled: feax autodiffs the block residual/Jacobian on the multi-field
     # problem (same _build_feax_problem path as linear), so the nonlinear route works
-    # for coupled fields too.
-    if any(_is_obviously_nonlinear_in_unknown(domain, b) for b in volume_terms):
+    # for coupled fields too. A nonlinear volume *or* surface term routes here (a linear
+    # Robin term stays on the linear path, where its surface contribution lands in A).
+    if any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares):
         op = _assemble_fem_residual_from_ir(domain, ir)
         return FEM(domain=domain, op=op, classification=classification, mode="nonlinear")
     op = _assemble_fem_system_from_ir(domain, ir)
