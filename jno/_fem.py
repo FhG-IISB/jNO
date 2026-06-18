@@ -336,8 +336,9 @@ def _value_from_node(node: Any) -> Any:
 def _is_complex_form(domain: Any, ir: Any) -> bool:
     """True if any lowered term's expression contains a complex constant — the signal to route a
     (steady, linear) weak form through the real-equivalent complex solver instead of feax's real
-    assembly. We walk the tree for a complex-valued literal (e.g. a user-written ``1j``) rather
-    than evaluating, because the lowered coeff embeds the (non-evaluable) trial/test channel."""
+    assembly. We walk the tree for a complex-valued literal (a user-written ``jno.np.i`` / ``1j``)
+    rather than evaluating, because the lowered coeff embeds the (non-evaluable) trial/test
+    channel."""
     del domain
     for term in ir.terms:
         for node in _walk(term.coeff):

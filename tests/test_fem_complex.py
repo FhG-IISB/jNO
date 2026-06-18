@@ -61,3 +61,37 @@ def test_complex_helmholtz_real_equivalent_recovers_manufactured():
     rel = float(np.linalg.norm(u_num - u_star) / np.linalg.norm(u_star))
     assert rel < 1e-2, f"complex Helmholtz recovery rel-L2 {rel:.3e}"
     assert float(np.abs(u_num.imag).max()) > 0.1  # genuinely complex, not a real solve in disguise
+
+
+def test_pml_helmholtz_absorbs_reflection_free():
+    """2D Helmholtz with a perfectly-matched layer (PML) -- the headline use case. The complex
+    coordinate stretch ``s = 1 + i sigma/k`` (sigma ramps in a frame, 0 in the physical core)
+    absorbs outgoing waves; the outer wall is u=0. Authored with the readable ``jno.np.i``.
+
+    PML-quality gate = sigma-insensitivity: a *converged* PML's physical-core solution does not
+    depend on the absorber strength (a poor/absent PML would reflect and change with sigma)."""
+    L, w, k = 1.0, 0.3, 12.0
+    relu = lambda z: jno.np.maximum(z, 0.0)  # noqa: E731
+
+    def solve_pml(sigma0):
+        dom = jno.domain(box(0.0, 0.0, L, L), mesh_size=0.045)
+        u, phi = dom.fem_symbols()
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+        sx = sigma0 * (relu(w - xi) ** 2 + relu(xi - (L - w)) ** 2) / w**2  # per-axis PML depth
+        sy = sigma0 * (relu(w - yi) ** 2 + relu(yi - (L - w)) ** 2) / w**2
+        Sx, Sy = 1.0 + jno.np.i * sx / k, 1.0 + jno.np.i * sy / k  # complex coordinate stretch
+        src = jno.np.exp(-(((xi - 0.5) ** 2 + (yi - 0.5) ** 2) / (2 * 0.03**2)))  # ~point source
+        weak = (Sy / Sx) * (ui.x * vi.x) + (Sx / Sy) * (ui.y * vi.y) - k**2 * Sx * Sy * (u * vi) - src * vi
+        fem = jno.fem([weak, u(xb, yb) - 0.0], quad_degree=3)
+        return fem, np.asarray(fem.solve()), np.asarray(fem.points)
+
+    fem, u1, pts = solve_pml(40.0)
+    _, u2, _ = solve_pml(60.0)  # 1.5x absorber strength, fresh mesh
+    assert fem.is_complex and np.iscomplexobj(u1) and not bool(np.isnan(u1).any())
+
+    core = (pts[:, 0] > w) & (pts[:, 0] < L - w) & (pts[:, 1] > w) & (pts[:, 1] < L - w)
+    sigma_insens = float(np.linalg.norm(u1[core] - u2[core]) / np.linalg.norm(u1[core]))
+    assert sigma_insens < 1e-2, f"PML not reflection-free: sigma-insensitivity {sigma_insens:.3e}"
+    assert float(np.abs(u1[core].imag).max()) > 1e-3  # a propagating (complex) wave, not a static field
