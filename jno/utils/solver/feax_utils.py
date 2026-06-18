@@ -1382,6 +1382,9 @@ def _build_multifield_feax_problem(domain, ir, fields, field_index, *, apply_dir
     meshes = [_build_feax_mesh(domain, et) for et in eles]
     vecs = [int(f["vec"]) for f in fields]
 
+    if any(t.support == "boundary" for t in ir.terms):
+        raise NotImplementedError("jno.fem: coupled surface (Neumann/Robin) terms are not supported yet.")
+
     term_list = []
     for t in ir.terms:
         if t.support != "volume" or t.channel != "raw":

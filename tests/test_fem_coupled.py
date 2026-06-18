@@ -122,3 +122,25 @@ def test_coupled_neumann_not_yet_supported():
                 p(xb, yb) - 0.0,
             ]
         )
+
+
+def test_coupled_nonlinear_not_yet_supported():
+    # Nonlinear coupled is guarded (not silently routed through the linear path).
+    # This also confirms the nonlinearity detector fires for a coupled field: if it
+    # misfired (returned False), jno.fem would NOT raise and this test would fail.
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3)
+    u, v = d.fem_symbols(names=("u", "v"))
+    p, q = d.fem_symbols(names=("p", "q"))
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    pi, qi = p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+    with pytest.raises(NotImplementedError):
+        jno.fem(
+            [
+                ui.x * vi.x + ui.y * vi.y + (u * u * u) * vi + p * vi,  # nonlinear u^3, coupled to p
+                pi.x * qi.x + pi.y * qi.y + u * qi,
+                u(xb, yb) - 0.0,
+                p(xb, yb) - 0.0,
+            ]
+        )
