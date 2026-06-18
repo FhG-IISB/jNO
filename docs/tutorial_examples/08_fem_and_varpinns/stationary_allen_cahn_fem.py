@@ -1,4 +1,12 @@
-"""02 - Stationary Allen-Cahn equation with nonlinear FEAX-FEM residual route"""
+"""02 - Stationary Allen-Cahn via the nonlinear ``jno.fem`` residual route.
+
+    -eps^2 Delta u + (u^3 - u) = 0,    u = tanh((x - 0.5) / (sqrt(2) eps)) on the left/right walls.
+
+The cubic reaction makes the weak form nonlinear in ``u``, so ``jno.fem`` returns a residual
+operator (``fem.residual(u)`` / ``fem.jacobian(u)``) instead of a linear ``A, b``. Newton starts
+from a smooth (over-wide) interface and sharpens it to the analytic Allen-Cahn phase interface
+(Allen & Cahn, *Acta Metall.* 1979).
+"""
 
 import jax.numpy as jnp
 import numpy as np
@@ -7,104 +15,32 @@ from shapely.geometry import box
 
 import jno
 
-eps = 0.05
+eps = 0.15
+exact = lambda x: np.tanh((x - 0.5) / (np.sqrt(2.0) * eps))  # noqa: E731
+dense = lambda A: jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)  # noqa: E731
 
+d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06)
+u, phi = d.fem_symbols()
+xi, yi, _ = d.variable("interior", split=True)
+xl, yl, _ = d.variable("left", split=True)
+xr, yr, _ = d.variable("right", split=True)
+ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
 
-# ---------------------------------------------------------------------
-# Exact interface profile
-# ---------------------------------------------------------------------
-
-
-def exact_u_num(x, y):
-    del y
-    return jnp.tanh((x - 0.5) / (jnp.sqrt(2.0) * eps))
-
-
-u_left = float(exact_u_num(jnp.array([[0.0]]), jnp.array([[0.0]])).reshape(()))
-u_right = float(exact_u_num(jnp.array([[1.0]]), jnp.array([[0.0]])).reshape(()))
-
-
-def to_dense(A):
-    if hasattr(A, "todense"):
-        return jnp.asarray(A.todense())
-    if hasattr(A, "toarray"):
-        return jnp.asarray(A.toarray())
-    return jnp.asarray(A)
-
-
-# ---------------------------------------------------------------------
-# Domain and weak form
-# ---------------------------------------------------------------------
-
-domain = jno.domain(box(0, 0, 1, 1), mesh_size=0.12)
-
-domain.init_fem(
-    element_type="TRI3",
-    quad_degree=3,
-    bcs=[
-        domain.dirichlet("left", u_left),
-        domain.dirichlet("right", u_right),
-    ],
-    fem_solver=True,
+# eps^2 grad(u).grad(phi) + (u^3 - u) phi = 0 (cubic -> nonlinear -> residual operator)
+fem = jno.fem(
+    [eps**2 * (ui.x * vi.x + ui.y * vi.y) + (u**3 - u) * vi, u(xl, yl) - exact(0.0), u(xr, yr) - exact(1.0)], quad_degree=3
 )
+assert not fem.is_linear
 
-u, phi = domain.fem_symbols()
-xg, yg, _ = domain.variable("fem_gauss", split=True)
-
-ux = u.d(xg)
-uy = u.d(yg)
-phix = phi.d(xg)
-phiy = phi.d(yg)
-
-# Weak form:
-#   ∫ eps^2 grad(u)·grad(phi) dΩ + ∫ (u^3 - u) phi dΩ = 0
-weak = eps**2 * (ux * phix + uy * phiy) + (u**3 - u) * phi
-
-op = weak.assemble(domain, target="fem_residual")
-
-coords = np.asarray(domain.built_mesh.points)[:, :2]
-x_nodes = jnp.asarray(coords[:, 0:1])
-y_nodes = jnp.asarray(coords[:, 1:2])
-
-u0 = exact_u_num(x_nodes, y_nodes).reshape(-1)
-
-R0 = op.residual(u0)
-print("\n" + "=" * 70)
-print("Stationary Allen-Cahn nonlinear FEAX-FEM example")
-print("=" * 70)
-print(f"Number of FEM DOFs       : {op.size}")
-print(f"Initial residual norm    : {float(jnp.linalg.norm(R0)):.6e}")
-
-
-def residual_np(u_np):
-    return np.asarray(op.residual(jnp.asarray(u_np)))
-
-
-def jacobian_np(u_np):
-    J = op.jacobian(jnp.asarray(u_np))
-    return np.asarray(to_dense(J))
-
-
+pts = np.asarray(fem.points)
+u0 = np.tanh((pts[:, 0] - 0.5) / (np.sqrt(2.0) * 0.30))  # over-wide interface = the Newton start
 sol = spo.root(
-    residual_np,
-    np.asarray(u0),
-    jac=jacobian_np,
+    lambda v: np.asarray(fem.residual(jnp.asarray(v))),
+    u0,
+    jac=lambda v: np.asarray(dense(fem.jacobian(jnp.asarray(v)))),
     method="hybr",
 )
+rel_l2 = float(jnp.linalg.norm(exact(pts[:, 0]) - sol.x) / jnp.linalg.norm(exact(pts[:, 0])))
 
-u_fem = jnp.asarray(sol.x).reshape(-1)
-R_fem = op.residual(u_fem)
-
-u_exact = exact_u_num(x_nodes, y_nodes).reshape(-1)
-
-rel_l2 = jnp.linalg.norm(u_exact - u_fem) / (jnp.linalg.norm(u_exact) + 1e-14)
-max_abs = jnp.max(jnp.abs(u_exact - u_fem))
-
-print(f"SciPy root success       : {sol.success}")
-print(f"SciPy root status        : {sol.status}")
-print(f"Final residual norm      : {float(jnp.linalg.norm(R_fem)):.6e}")
-print(f"Relative L2 error        : {float(rel_l2):.6e}")
-print(f"Maximum absolute error   : {float(max_abs):.6e}")
-
-assert sol.success
-assert float(rel_l2) < 5e-1
+print(f"\nAllen-Cahn (nonlinear residual route): dofs={fem.dofs}  Newton converged={sol.success}  rel_L2={rel_l2:.3e}")
+assert sol.success and rel_l2 < 1e-2

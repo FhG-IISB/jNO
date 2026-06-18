@@ -1,79 +1,35 @@
-# Poisson 2D FEM
+# Poisson 2D (FEM)
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/08_fem_and_varpinns/poisson_2d_fem.py" download>Download .py</a>
 <a class="md-button" href="/jNO/tutorials/08-fem-and-varpinns/">Back to chapter</a>
 </div>
 
-This example is a pure finite-element solve with no neural network component.
+A pure finite-element solve of $-\Delta u = f$ on the unit square with $u = 0$ on the boundary,
+assembled through `jno.fem`. It is the primer for the API: write the weak form as a list of
+residual terms — the volume physics plus the essential boundary condition as `u(region) - g` —
+and solve the assembled `A u = b`.
 
-## Problem Setup
+## The weak form
 
-The script assembles the weak form of a manufactured Poisson problem and solves the resulting linear system.
-
-## Step 1: Define the Weak Form
-
-Instead of writing a pointwise PDE residual, the script builds bilinear and linear forms using FEM symbols.
-
-```python
-domain = jno.domain.rect(mesh_size=0.18)
-domain.init_fem(
-    element_type="TRI3",
-    quad_degree=3,
-    bcs=[domain.dirichlet(["left", "right", "bottom", "top"], 0.0)],
-    fem_solver=True,
-)
-
-u, phi = domain.fem_symbols()
-xg, yg, _ = domain.variable("fem_gauss", split=True)
-
-du_dx = u.d(xg)
-du_dy = u.d(yg)
-phi_x = phi.d(xg)
-phi_y = phi.d(yg)
-
-# Weak form: ∫ grad(u)·grad(phi) dΩ - ∫ f phi dΩ = 0
-weak = du_dx * phi_x + du_dy * phi_y - source_f(xg, yg) * phi
-```
-
-## Step 2: Assemble the Linear System
-
-The weak form is transformed into a matrix system through jNO's FEM assembly workflow.
+The trial/test functions come from `d.fem_symbols()`; binding them to the quadrature
+coordinates gives the `.x` / `.y` derivatives, and the Dirichlet condition is simply the term
+`u(xb, yb) - 0.0`:
 
 ```python
-A, b = weak.assemble(domain, target="fem_system")
-
-A_dense = to_dense(A)
-b_dense = jnp.asarray(b)
-u_fem = jnp.linalg.solve(A_dense, b_dense).reshape(-1)
+ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+f = 2.0 * (xi * (1 - xi) + yi * (1 - yi))
+fem = jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+u_fem = jnp.linalg.solve(dense(fem.A), jnp.asarray(fem.b).reshape(-1))
 ```
 
-## Step 3: Solve and Compare
+## What to notice
 
-The script computes the FEM solution and compares it to a known exact field.
+- One call, `jno.fem([...])`, assembles the stiffness `fem.A` and load `fem.b`.
+- Boundary conditions are terms in the same list — no separate BC objects.
+- The solution is audited against the manufactured field $u^\*=x(1-x)y(1-y)$ (rel-$L^2 \approx 8\times10^{-3}$).
 
-```python
-coords = np.asarray(domain.mesh.points)[:, :2]
-x = jnp.asarray(coords[:, 0:1])
-y = jnp.asarray(coords[:, 1:2])
-
-u_exact = exact_u_num(x, y).reshape(-1)
-rel_l2 = jnp.linalg.norm(u_exact - u_fem) / (jnp.linalg.norm(u_exact) + 1e-14)
-print(f"Relative L2 error: {float(rel_l2):.6e}")
-```
-
-## What To Notice
-
-- This chapter is about weak forms rather than PINN residuals.
-- The assembly pipeline is useful as a reference even if your final method is neural.
-- Pure FEM examples help validate the underlying PDE setup.
-
-<div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO/tutorial_examples/08_fem_and_varpinns/poisson_2d_fem.py" download>Download full script</a>
-<a class="md-button" href="/jNO/tutorials/08-fem-and-varpinns/">Back to 08 FEM and Variational PINNs</a>
-</div>
-
-## Script Snippet
+## Full script
 
 ```python
 --8<-- "tutorial_examples/08_fem_and_varpinns/poisson_2d_fem.py"

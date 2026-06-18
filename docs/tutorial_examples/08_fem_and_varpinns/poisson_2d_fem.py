@@ -1,87 +1,33 @@
-"""01 - 2D Poisson equation with FEAX-FEM assembly"""
+"""01 - 2D Poisson equation assembled + solved through ``jno.fem``.
+
+    -Delta u = f on the unit square, u = 0 on the boundary.
+    Manufactured  u*(x, y) = x(1-x) y(1-y),   f = -Delta u* = 2[x(1-x) + y(1-y)].
+
+A pure finite-element solve: write the weak form as a list of residual terms (volume physics
++ the essential condition ``u(region) - g``), hand it to ``jno.fem`` -- the single FEM entry --
+and solve the assembled ``A u = b``.
+"""
 
 import jax.numpy as jnp
 import numpy as np
+from shapely.geometry import box
 
 import jno
 
-# ---------------------------------------------------------------------
-# Manufactured solution
-# ---------------------------------------------------------------------
+exact = lambda x, y: x * (1 - x) * y * (1 - y)  # noqa: E731
+dense = lambda A: jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)  # noqa: E731
 
+d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.18)
+u, phi = d.fem_symbols()
+xi, yi, _ = d.variable("interior", split=True)
+xb, yb, _ = d.variable("boundary", split=True)
+ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
 
-def exact_u_num(x, y):
-    return x * (1.0 - x) * y * (1.0 - y)
+f = 2.0 * (xi * (1 - xi) + yi * (1 - yi))
+fem = jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0], quad_degree=3)  # weak form + u = 0
+u_fem = jnp.linalg.solve(dense(fem.A), jnp.asarray(fem.b).reshape(-1))  # solve A u = b
 
-
-def source_f(x, y):
-    return 2.0 * (x * (1.0 - x) + y * (1.0 - y))
-
-
-def to_dense(A):
-    if hasattr(A, "todense"):
-        return jnp.asarray(A.todense())
-    if hasattr(A, "toarray"):
-        return jnp.asarray(A.toarray())
-    return jnp.asarray(A)
-
-
-# ---------------------------------------------------------------------
-# Domain and FEAX-FEM setup
-# ---------------------------------------------------------------------
-
-domain = jno.domain.rect(mesh_size=0.18)
-
-domain.init_fem(
-    element_type="TRI3",
-    quad_degree=3,
-    bcs=[
-        domain.dirichlet(["left", "right", "bottom", "top"], 0.0),
-    ],
-    fem_solver=True,
-)
-
-u, phi = domain.fem_symbols()
-xg, yg, _ = domain.variable("fem_gauss", split=True)
-
-du_dx = u.d(xg)
-du_dy = u.d(yg)
-phi_x = phi.d(xg)
-phi_y = phi.d(yg)
-
-# Weak form:
-#   ∫ grad(u)·grad(phi) dΩ - ∫ f phi dΩ = 0
-weak = du_dx * phi_x + du_dy * phi_y - source_f(xg, yg) * phi
-
-A, b = weak.assemble(domain, target="fem_system")
-
-A_dense = to_dense(A)
-b_dense = jnp.asarray(b)
-
-u_fem = jnp.linalg.solve(A_dense, b_dense).reshape(-1)
-
-# ---------------------------------------------------------------------
-# Diagnostics
-# ---------------------------------------------------------------------
-
-lin_res = jnp.linalg.norm(A_dense @ u_fem - b_dense) / (jnp.linalg.norm(b_dense) + 1e-14)
-
-coords = np.asarray(domain.built_mesh.points)[:, :2]
-x = jnp.asarray(coords[:, 0:1])
-y = jnp.asarray(coords[:, 1:2])
-
-u_exact = exact_u_num(x, y).reshape(-1)
-
-rel_l2 = jnp.linalg.norm(u_exact - u_fem) / (jnp.linalg.norm(u_exact) + 1e-14)
-max_abs = jnp.max(jnp.abs(u_exact - u_fem))
-
-print("\n" + "=" * 70)
-print("2D Poisson FEAX-FEM example")
-print("=" * 70)
-print(f"Number of FEM DOFs       : {u_fem.shape[0]}")
-print(f"Linear solve residual    : {float(lin_res):.6e}")
-print(f"Relative L2 error        : {float(rel_l2):.6e}")
-print(f"Maximum absolute error   : {float(max_abs):.6e}")
-
-assert float(lin_res) < 1e-5
-assert float(rel_l2) < 5e-1
+pts = np.asarray(fem.points)  # coordinates the DOFs live on
+rel_l2 = float(jnp.linalg.norm(exact(pts[:, 0], pts[:, 1]) - u_fem) / jnp.linalg.norm(exact(pts[:, 0], pts[:, 1])))
+print(f"\nPoisson via jno.fem: dofs={fem.dofs}  rel_L2={rel_l2:.3e}")
+assert fem.is_linear and rel_l2 < 5e-2

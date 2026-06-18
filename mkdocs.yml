@@ -103,7 +103,7 @@ nav:
       - IREE Deployment: model-controls/iree.md
   - Inverse Problems: inverse-problems.md
   - Save, Load and Configuration: Save-Load-and-Configuration.md
-  - FEM & Variational PINNs: fem.md
+  - Finite Element Method: fem.md
   - Foundation Models: foundation_models/index.md
   - Tutorials:
     - 01 Basics:
@@ -143,12 +143,17 @@ nav:
     - 07 Stochastic:
       - Fokker-Planck 2D: tutorials/07-stochastic/fokker-planck-2d.md
       - Stochastic Forcing 2D: tutorials/07-stochastic/stochastic-forcing-2d.md
-    - 08 FEM and Variational PINNs:
-      - Poisson 2D FEM: tutorials/08-fem-and-varpinns/poisson-2d-fem.md
-      - Stationary Allen-Cahn FEM: tutorials/08-fem-and-varpinns/stationary-allen-cahn-fem.md
-      - Diffusion-Reaction Robin BC: tutorials/08-fem-and-varpinns/diffusion-reaction-robin-bc.md
-      - Helmholtz Mixed BC FEM VarPINN: tutorials/08-fem-and-varpinns/helmholtz-mixed-bc-fem-varpinn.md
-      - Helmholtz 3D: tutorials/08-fem-and-varpinns/helmholtz-3d.md
+    - 08 Finite Element Method:
+      - Poisson 2D: tutorials/08-fem-and-varpinns/poisson-2d-fem.md
+      - Stationary Allen-Cahn: tutorials/08-fem-and-varpinns/stationary-allen-cahn-fem.md
+      - Reaction-Diffusion (Robin BC): tutorials/08-fem-and-varpinns/diffusion-reaction-robin-bc.md
+      - Helmholtz (Mixed BC): tutorials/08-fem-and-varpinns/helmholtz-mixed-bc-fem.md
+      - Helmholtz 3D (F-domain): tutorials/08-fem-and-varpinns/helmholtz-3d.md
+      - Linear Elasticity (Cantilever): tutorials/08-fem-and-varpinns/linear-elasticity-cantilever.md
+      - Stokes Channel (Poiseuille): tutorials/08-fem-and-varpinns/stokes-channel-poiseuille.md
+      - Transient Heat: tutorials/08-fem-and-varpinns/transient-heat-2d.md
+      - Inverse Diffusivity Field: tutorials/08-fem-and-varpinns/inverse-diffusivity-field.md
+      - Transient Inverse (Rate): tutorials/08-fem-and-varpinns/transient-inverse-heat.md
     - 09 Weights & Biases:
       - W&B Integration: tutorials/09-wandb/wandb-integration.md
     - 10 Bayesian PINNs:

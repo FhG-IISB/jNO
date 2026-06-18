@@ -81,6 +81,31 @@ crux = jno.core([pde.mse, reg.mean])
 
 ---
 
+## Inverse problems through a FEM forward (`fem.solve`)
+
+When the forward model is a finite-element solve rather than a neural network, use
+`fem.solve()` as the differentiable forward (see [Finite Element Method](fem.md)). Put a
+`jno.np.parameter` in the weak form, compare the solve to data, and train through
+`crux.solve` — the gradient flows through the assembled solve to the parameter.
+
+```python
+# scalar coefficient: recover k in  -k Δu = f
+k = jno.np.parameter((1,), name="k")
+k.dtype(jnp.float64); k.initialize(jax.nn.initializers.constant(2.0)); k.optimizer(optax.adam(5e-2))
+fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
+crux = jno.core([(fem.solve() - u_obs).mse], domain=obs)
+crux.solve(200)                       # recovers k
+```
+
+A **diffusivity field** `k(x)` is `jno.np.parameter(phi)` (one DOF per node); regularize it
+with `k.regularize("h1seminorm" | "l2" | "tv" | "nonneg" | "bounded")` — the FE-exact analogue
+of `jno.fn.regularize`. For a **transient** weak form, `fem.solve()` returns the trajectory
+`u(save_ts)`, so a rate constant is recovered from a time series. Worked examples:
+[hidden diffusivity field](tutorials/08-fem-and-varpinns/inverse-diffusivity-field.md) and
+[transient rate](tutorials/08-fem-and-varpinns/transient-inverse-heat.md).
+
+---
+
 ## Hard parameter constraints via `Model.constrain()`
 
 `constrain(transform)` uses [paramax](https://github.com/danielward27/paramax) to reparameterize the model's **weights** so that `transform(raw_weight)` is used at every forward pass. This is a **hard** constraint on the weights — it holds at every step without adding a penalty.
