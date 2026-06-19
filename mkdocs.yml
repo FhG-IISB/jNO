@@ -151,6 +151,7 @@ nav:
       - Helmholtz 3D (F-domain): tutorials/08-fem-and-varpinns/helmholtz-3d.md
       - Helmholtz + PML (complex): tutorials/08-fem-and-varpinns/helmholtz-pml-2d.md
       - 2D Schrödinger Wave Packet: tutorials/08-fem-and-varpinns/schrodinger-wavepacket-2d.md
+      - 2D Maxwell (complex vector E): tutorials/08-fem-and-varpinns/maxwell-2d-vector.md
       - Linear Elasticity (Cantilever): tutorials/08-fem-and-varpinns/linear-elasticity-cantilever.md
       - Elasticity: Plate with a Hole: tutorials/08-fem-and-varpinns/elasticity-plate-with-hole.md
       - Stokes Channel (Poiseuille): tutorials/08-fem-and-varpinns/stokes-channel-poiseuille.md
