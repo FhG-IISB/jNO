@@ -719,6 +719,24 @@ class PolygonDomain(domain):
         return np.concatenate(accepted, axis=0)
 
     def _sample_interior(self, tag: str, geom: BaseGeometry, n_samples: int, sampler: Any = None) -> np.ndarray:
+        # A domain.tag(name, where) region: rejection-sample the parent geometry, keeping points that
+        # satisfy the spatial predicate (fresh each call -> resampled every step for PINNs).
+        where = getattr(self, "_tag_predicates", {}).get(tag)
+        if where is not None and sampler is None:
+            accepted: List[np.ndarray] = []
+            remaining, attempts = n_samples, 0
+            while remaining > 0 and attempts < 10_000:
+                attempts += 1
+                cand = self._sample_points_in_polygon(geom, max(256, remaining * 6))
+                keep = np.asarray(where(cand[:, 0], cand[:, 1]), dtype=bool)
+                sel = cand[keep]
+                if len(sel):
+                    take = min(remaining, len(sel))
+                    accepted.append(sel[:take])
+                    remaining -= take
+            if not accepted:
+                raise RuntimeError(f"tag '{tag}': no sampled points satisfy the predicate (empty region?)")
+            return np.concatenate(accepted, axis=0)
         if sampler is not None:
             pts = np.asarray(sampler(geom, n_samples), dtype=np.float64)
             if pts.ndim != 2 or pts.shape[1] != 2:

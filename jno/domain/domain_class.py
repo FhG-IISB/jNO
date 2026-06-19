@@ -573,6 +573,10 @@ class domain(MeshIOMixin):
         self._tag_edges: Dict[str, np.ndarray] = {}
         self._tag_triangles: Dict[str, np.ndarray] = {}
         self._boundary_regions: Dict[str, BoundaryRegion] = {}
+        # User-defined predicate regions from domain.tag(name, where): name -> spatial predicate.
+        # Consulted by _make_tag_location_fn (FEM boundary location-fn, auto-restricted to the
+        # boundary by feax) and by tag() to build the sampling pool.
+        self._tag_predicates: Dict[str, Any] = {}
         # Precomputed simplex pools (segments / triangles + optional normals)
         # for in-JIT collocation sampling — populated by ``_build_simplex_pools``
         # after each ``_apply_mesh``.
@@ -1735,10 +1739,127 @@ class domain(MeshIOMixin):
             Function returning whether a point belongs to the tagged region,
             or ``None`` if the tag is unknown.
         """
+        # A predicate region registered via domain.tag(name, where) is itself the location
+        # function (feax only evaluates it against boundary facets/nodes, so it auto-selects the
+        # right boundary subset). Spatial coordinates only.
+        where = getattr(self, "_tag_predicates", {}).get(tag, None)
+        if where is not None:
+            dim = self.dimension
+
+            def _loc(p):  # feax requires a 1-argument location function
+                import jax.numpy as jnp
+
+                p = jnp.asarray(p)
+                return where(*(p[..., i] for i in range(dim)))
+
+            return _loc
+
         region = self._boundary_regions.get(tag, None)
         if region is None:
             return None
         return lambda p: region.contains(p)
+
+    def tag(self, name, where):
+        """Define a named region from a **spatial** predicate ``where(x, y[, z]) -> bool``.
+
+        One general method for naming any subset of the domain -- interior *or* boundary. The
+        region is abstract (predicate-based), so it is carried even without a mesh: the PINN
+        sampler draws the points satisfying ``where`` each step. After ``build_mesh`` it also maps
+        to mesh nodes/facets, and a ``jno.fem`` boundary condition bound to ``name`` is applied on
+        exactly the boundary facets where ``where`` holds (FEM location-functions are evaluated only
+        against the boundary, so a bare predicate selects the right subset -- there is no
+        interior/boundary flag). Untagged boundary stays natural (do-nothing), which is how you get a
+        natural outflow on a complex geometry.
+
+        Only the **spatial** coordinates are passed to ``where`` (never time): a region is the same
+        at every time level of a time-dependent domain. A shapely geometry may be passed instead of
+        a callable. Returns ``self`` (chainable). Example::
+
+            dom.tag("inlet",    lambda x, y: x < 1e-6)            # boundary subset -> Dirichlet there
+            dom.tag("cylinder", lambda x, y: (x-0.8)**2 + (y-0.5)**2 < 0.21**2)
+            # an untagged outlet edge is left as a natural (do-nothing) outflow
+        """
+        self._tag_predicates = getattr(self, "_tag_predicates", {})
+        if not callable(where):  # accept a shapely geometry
+            geom = where
+
+            def where(x, y, _g=geom):  # noqa: ANN001
+                from shapely import contains_xy as _cxy
+
+                return np.asarray(_cxy(_g, np.asarray(x), np.asarray(y)))
+
+        self._tag_predicates[name] = where
+        self._materialize_tag_pool(name, where)
+        self._register_tag_boundary_region(name, where)
+        # Lazy mesh-free sampling: register the parent geometry so PolygonDomain.sample can draw the
+        # region with sample=(n, None); _sample_interior filters by the predicate (resampled each step).
+        poly_tags = getattr(self, "_polygon_tags", None)
+        geom = getattr(self, "_active_geometry", None)
+        if poly_tags is not None and geom is not None and name not in poly_tags:
+            poly_tags[name] = ("interior", geom)
+        if name not in self.avaiable_mesh_tags:
+            self.avaiable_mesh_tags.append(name)
+        return self
+
+    def _register_tag_boundary_region(self, name, where):
+        """If any **boundary** facets satisfy ``where``, register a ``BoundaryRegion`` for ``name``
+        so a ``jno.fem`` term bound to it classifies as a boundary (Dirichlet / Neumann) condition
+        and ``variable(name, normals=True)`` works. Interior-only tags add nothing here (they stay
+        interior sampling regions). 2-D edges; 3-D triangles."""
+        full = self._boundary_regions.get("boundary")
+        if full is None:
+            return
+        dim = self.dimension
+        ents = full.edges if dim == 2 else full.triangles
+        if ents is None or len(ents) == 0:
+            return
+        ents = np.asarray(ents)  # (E, k, dim)
+        mid = ents.mean(axis=1)  # facet centroids (E, dim)
+        keep = np.asarray(where(*[mid[:, i] for i in range(dim)])).reshape(-1).astype(bool)
+        if not keep.any():
+            return
+        sub = ents[keep]
+        bpts = np.unique(sub.reshape(-1, sub.shape[-1])[:, :dim], axis=0)
+        self._boundary_regions[name] = BoundaryRegion(
+            tag=name,
+            dim=dim,
+            points=bpts,
+            edges=sub if dim == 2 else None,
+            triangles=sub if dim == 3 else None,
+            tol=full.tol,
+        )
+
+    def _materialize_tag_pool(self, name, where):
+        """Populate ``_mesh_pool[name]`` with the spatial points (interior + boundary) satisfying
+        ``where`` -- so ``variable(name)`` can sample it. Spatial coords only; on a time-dependent
+        domain the same spatial selection is carried at every time level."""
+        dim = self.dimension
+        pools = {k: np.asarray(self._mesh_pool[k]) for k in ("interior", "boundary") if k in self._mesh_pool}
+        time_dep = bool(self._is_time_dependent and self.time is not None)
+        n_time = int(self.time[2]) if time_dep else 0
+
+        if pools:
+            # Meshed: keep the existing mesh nodes (interior + boundary) satisfying the predicate.
+            ref = pools.get("interior", next(iter(pools.values())))
+            time_dep = ref.ndim >= 3 or time_dep
+            n_time = ref.shape[0] if ref.ndim >= 3 else n_time
+            spatial = lambda a: (a[0] if a.ndim >= 3 else a)[:, :dim]  # noqa: E731  time-invariant coords
+            cand = np.unique(np.concatenate([spatial(a) for a in pools.values()], axis=0), axis=0)
+        else:
+            # Mesh-free: rejection-sample the domain geometry, then filter by the predicate, so the
+            # PINN sampler can draw from the region each step (subsampling this candidate pool).
+            sampler = getattr(self, "_sample_points_in_polygon", None)
+            geom = getattr(self, "_active_geometry", None)
+            if sampler is None or geom is None:
+                return  # cannot materialise yet; nothing to sample from
+            cand = np.asarray(sampler(geom, 8000))[:, :dim]
+
+        mask = np.asarray(where(*[cand[:, i] for i in range(dim)])).reshape(-1).astype(bool)
+        sel = cand[mask]
+        if time_dep and n_time > 0:
+            self._mesh_pool[name] = np.broadcast_to(sel[None], (n_time, sel.shape[0], dim)).copy()
+        else:
+            self._mesh_pool[name] = sel
 
     def assemble_weak_form(self, expr, target="vpinn", **kwargs):
         """
