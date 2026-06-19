@@ -91,6 +91,7 @@ nav:
       - Elasticity: Plate with a Hole: tutorials/08-fem-and-varpinns/elasticity-plate-with-hole.md
       - Stokes Channel (Poiseuille): tutorials/08-fem-and-varpinns/stokes-channel-poiseuille.md
       - Stokes Flow Past a Cylinder: tutorials/08-fem-and-varpinns/stokes-flow-around-cylinder.md
+      - Navier-Stokes Lid-Driven Cavity: tutorials/08-fem-and-varpinns/navier-stokes-cavity-2d.md
       - Coupled Multiphysics (Two-Temperature): tutorials/08-fem-and-varpinns/coupled-two-temperature-2d.md
       - Transient Heat: tutorials/08-fem-and-varpinns/transient-heat-2d.md
       - Transient via diffrax (custom integrator): tutorials/08-fem-and-varpinns/transient-diffrax-heat-spreader.md
