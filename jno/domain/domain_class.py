@@ -1739,18 +1739,24 @@ class domain(MeshIOMixin):
             Function returning whether a point belongs to the tagged region,
             or ``None`` if the tag is unknown.
         """
-        # A predicate region registered via domain.tag(name, where) is itself the location
-        # function (feax only evaluates it against boundary facets/nodes, so it auto-selects the
-        # right boundary subset). Spatial coordinates only.
+        # A domain.tag(name, where) region resolves to: the predicate AND on the domain boundary.
+        # feax applies a location-fn to EVERY node, so a bare predicate selecting a thick region
+        # would also pin interior dofs (a thick boundary predicate pinned the interior velocity and
+        # silently zeroed the interior pressure rows). Intersecting with the full-boundary region
+        # keeps Dirichlet boundary-restricted, while the exact predicate misses no boundary node
+        # (per-facet proximity alone can miss nodes on a curved boundary). NB: such a predicate is
+        # evaluated under JAX here, so it must be jax-traceable (jno.np / arithmetic, not bare numpy).
         where = getattr(self, "_tag_predicates", {}).get(tag, None)
         if where is not None:
             dim = self.dimension
+            full = self._boundary_regions.get("boundary", None)
 
             def _loc(p):  # feax requires a 1-argument location function
                 import jax.numpy as jnp
 
                 p = jnp.asarray(p)
-                return where(*(p[..., i] for i in range(dim)))
+                pred = where(*(p[..., i] for i in range(dim)))
+                return pred if full is None else (pred & full.contains(p))
 
             return _loc
 
