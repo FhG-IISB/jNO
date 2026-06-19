@@ -91,3 +91,45 @@ def test_coordinate_ops_are_linear_coefficients():
     assert fem.is_linear
     u_h = np.linalg.solve(np.asarray(dense(fem.A)), np.asarray(fem.b).reshape(-1))
     assert np.all(np.isfinite(u_h)) and np.linalg.norm(u_h) > 0.0
+
+
+def test_navier_stokes_convective_term_is_nonlinear_and_recovers_manufactured():
+    """The Navier-Stokes convective term ``inner(grad u, u)`` is the unknown contracted with itself,
+    so it must classify as NONLINEAR -- unlike the bilinear ``inner(grad u, grad v)`` (trial x test),
+    which stays linear. Manufactured steady NS with the Taylor-Green field
+    ``u* = (cos x sin y, -sin x cos y)``, ``p* = -1/4(cos 2x + cos 2y)``: there ``(u*.grad)u* +
+    grad p* = 0`` and ``lap u* = -2 u*``, so the forcing is ``f = 2 nu u*``. Newton (residual +
+    autodiff Jacobian through the convection) recovers ``u*`` -- which it could not if the convective
+    term were dropped/linearised."""
+    inner, grad, trace = jno.np.inner, jno.np.grad, jno.np.trace
+    nu = 0.1
+    ux = lambda x, y: jno.np.cos(x) * jno.np.sin(y)  # noqa: E731
+    uy = lambda x, y: -jno.np.sin(x) * jno.np.cos(y)  # noqa: E731
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.13)
+    d.point_region("ppin", (0.0, 0.0))  # p*(0, 0) = -1/2
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
+    p, q = d.fem_symbols(names=("p", "q"), order=1)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xpn, ypn, _ = d.variable("ppin", split=True)
+    gu, gv = grad(u, [xi, yi]), grad(v, [xi, yi])
+    ub, vb = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    pp, qq = p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+    conv = inner(gu, ub, n_contract=1)  # (u.grad)u
+    fx, fy = 2 * nu * ux(xi, yi), 2 * nu * uy(xi, yi)
+    momentum = inner(conv, vb, n_contract=1) + nu * inner(gu, gv, n_contract=2) - pp * trace(gv) - fx * vb[0] - fy * vb[1]
+    fem = jno.fem([momentum, -qq * trace(gu), u(xb, yb)[0] - ux(xb, yb), u(xb, yb)[1] - uy(xb, yb), p(xpn, ypn) - (-0.5)])
+    assert not fem.is_linear, "convective term inner(grad u, u) must classify as nonlinear"
+
+    off = fem.problem.offset
+    pts = np.asarray(fem.problem.mesh[0].points)
+    sol = spo.root(
+        lambda w: np.asarray(fem.residual(jnp.asarray(w))),
+        np.zeros(fem.dofs),
+        jac=lambda w: np.asarray(dense(fem.jacobian(jnp.asarray(w)))),
+        method="hybr",
+    )
+    uu = sol.x[off[0] : off[1]].reshape(-1, 2)
+    ref = np.stack([np.cos(pts[:, 0]) * np.sin(pts[:, 1]), -np.sin(pts[:, 0]) * np.cos(pts[:, 1])], 1)
+    rel = float(np.linalg.norm(uu - ref) / np.linalg.norm(ref))
+    assert sol.success and rel < 5e-3, f"manufactured NS recovery: converged={sol.success} rel_L2={rel:.2e}"

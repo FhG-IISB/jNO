@@ -658,6 +658,14 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
             "imag",
         }
 
+        # A contraction/product wrapper (inner, einsum) of TWO unknown-dependent factors is a
+        # genuine nonlinearity -- e.g. the Navier-Stokes convective term inner(grad u, u), or
+        # inner(grad u, grad u). It stays in ``linearish`` for the common bilinear case
+        # inner(grad u, grad v), where the second factor is the *test* function (not the unknown);
+        # so we count factors carrying the unknown (any node type, not only Placeholder args).
+        if name in {"inner", "einsum"} and sum(bool(_contains_unknown_symbol(domain, a)) for a in expr.args) >= 2:
+            return True
+
         # Jacobian/Hessian are handled through their own nodes
         if len(unknown_args) > 0 and name not in linearish:
             return True
