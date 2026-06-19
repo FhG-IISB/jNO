@@ -345,6 +345,13 @@ class VectorView(_DelegatesToPlaceholder):
         """Wrap ``new_expr`` in the same view subclass as ``self``."""
         return VectorView(new_expr)
 
+    @property
+    def complex(self) -> "ComplexVectorView":
+        """Reinterpret this vector field as a **complex vector** ``[..., d, 2]`` (last axis =
+        ``[re, im]``): ``.real`` / ``.imag`` then give the real / imaginary ``d``-vectors. The
+        underlying Placeholder must carry that layout. See :class:`ComplexVectorView`."""
+        return ComplexVectorView(self._expr)
+
     def integrate(self, **kwargs) -> "VectorView":
         """Component-wise integral, preserving VectorView type."""
         return self._rewrap(self._expr.integrate(**kwargs))
@@ -668,6 +675,113 @@ class ComplexView(_DelegatesToPlaceholder):
 
     def __pow__(self, n):
         return self._rewrap(self._expr ** _unwrap(n))
+
+
+# ---------------------------------------------------------------------------
+# ComplexVectorView
+# ---------------------------------------------------------------------------
+
+
+class ComplexVectorView(_DelegatesToPlaceholder):
+    """Semantic view of a Placeholder as a **complex vector** field, shape ``[..., d, 2]`` (``d``
+    vector components; last axis ``= 2 = [re, im]``). Reached via ``placeholder.vector.complex``.
+
+    ``.real`` / ``.imag`` return the real and imaginary parts as :class:`VectorView`\\s (each a real
+    ``d``-vector), so ``E.real.dot(n)`` / ``E.imag.div(x, y)`` work. Complex algebra (``.mul``,
+    ``.conj``) is componentwise (Hadamard) over the vector; ``.mul`` against a complex *scalar*
+    (:class:`ComplexView`) broadcasts. Mirrors :class:`ComplexView`, but each part is a vector. The
+    natural FEM realisation is two coupled real vector fields ``(E_r, E_i)``."""
+
+    def __init__(self, expr: Placeholder) -> None:
+        self._expr = expr
+
+    @property
+    def expr(self) -> Placeholder:
+        return self._expr
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(object.__getattribute__(self, "_expr"), name)
+
+    def _rewrap(self, new_expr, other=None) -> "ComplexVectorView":
+        return ComplexVectorView(new_expr)
+
+    @staticmethod
+    def _pack(re_expr, im_expr) -> Placeholder:
+        """Rebuild the ``[..., d, 2]`` layout from real/imag vector parts (new last axis = [re, im])."""
+        return FunctionCall(lambda a, b: jnp.stack([a, b], axis=-1), [re_expr, im_expr], "cvpack")
+
+    @property
+    def real(self) -> "VectorView":
+        """Real part ``expr[..., 0]`` (a real ``d``-vector) → VectorView."""
+        return VectorView(self._expr[..., 0])
+
+    @property
+    def imag(self) -> "VectorView":
+        """Imaginary part ``expr[..., 1]`` (a real ``d``-vector) → VectorView."""
+        return VectorView(self._expr[..., 1])
+
+    @property
+    def conj(self) -> "ComplexVectorView":
+        """Complex conjugate ``[re, -im]`` (componentwise) → ComplexVectorView."""
+        return ComplexVectorView(self._pack(self.real.expr, -self.imag.expr))
+
+    def mul(self, other) -> "ComplexVectorView":
+        """Componentwise complex product ``(a+bi)(c+di)=(ac-bd)+(ad+bc)i``. A real ``other`` scales
+        both parts; a :class:`ComplexView` (complex scalar) broadcasts against the vector."""
+        if not isinstance(other, (ComplexView, ComplexVectorView)):
+            return self._rewrap(self._expr * _unwrap(other))
+        re = self.real.expr * other.real.expr - self.imag.expr * other.imag.expr
+        im = self.real.expr * other.imag.expr + self.imag.expr * other.real.expr
+        return ComplexVectorView(self._pack(re, im))
+
+    @property
+    def abs(self) -> "VectorView":
+        """Per-component modulus ``sqrt(re² + im²)`` → VectorView."""
+        return VectorView(FunctionCall(lambda x: jnp.sqrt(x[..., 0] ** 2 + x[..., 1] ** 2), [self._expr], "cvabs"))
+
+    @property
+    def stop_gradient(self) -> "ComplexVectorView":
+        return self._rewrap(self._expr.stop_gradient)
+
+    def integrate(self, **kwargs) -> "ComplexVectorView":
+        return self._rewrap(self._expr.integrate(**kwargs))
+
+    def d(self, v, scheme: str = "automatic_differentiation") -> "ComplexVectorView":
+        return self._rewrap(self._expr.d(v, scheme=scheme))
+
+    def partials(self, **named_vars):
+        """Bind Variables for partial-by-attribute access; partials are component-wise over [re, im]."""
+        return _coords_dispatch(self, (), named_vars)
+
+    bind = partials
+
+    def to_native(self) -> Placeholder:
+        """Convert split ``[..., d, 2]`` → native complex ``[..., d]``."""
+        return FunctionCall(lambda x: x[..., 0] + 1j * x[..., 1], [self._expr], "to_native")
+
+    # elementwise (scalar) arithmetic; for the complex product use .mul — mirrors ComplexView
+    def __add__(self, other):
+        return self._rewrap(self._expr + _unwrap(other), other=other)
+
+    def __radd__(self, other):
+        return self._rewrap(_unwrap(other) + self._expr, other=other)
+
+    def __sub__(self, other):
+        return self._rewrap(self._expr - _unwrap(other), other=other)
+
+    def __rsub__(self, other):
+        return self._rewrap(_unwrap(other) - self._expr, other=other)
+
+    def __neg__(self):
+        return self._rewrap(-self._expr)
+
+    def __mul__(self, other):
+        return self._rewrap(self._expr * _unwrap(other), other=other)
+
+    def __rmul__(self, other):
+        return self._rewrap(_unwrap(other) * self._expr, other=other)
 
 
 # ---------------------------------------------------------------------------
@@ -1616,7 +1730,7 @@ NamedVoigtViewWithPartials = _make_named_with_partials_cls(VoigtView)
 
 
 # Populate the tuple now that all classes exist (used by _unwrap()).
-_VIEW_TYPES = (ScalarView, VectorView, ComplexView, MatrixView, VoigtView, FieldView)
+_VIEW_TYPES = (ScalarView, VectorView, ComplexView, ComplexVectorView, MatrixView, VoigtView, FieldView)
 
 # Dispatch table used by `_coords_dispatch` to pick the Named<View>WithPartials
 # wrapper for each base view type.
