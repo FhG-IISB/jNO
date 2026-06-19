@@ -544,6 +544,7 @@ class FEM:
         self.classification = classification
         self.mesh = getattr(domain, "mesh", None)
         self.problem = getattr(domain, "_feax_problem", None)
+        self._periodic = None  # periodic-tie reduction (prolongation P), attached by fem()
 
         self._A = self._b = None
         if mode == "linear":
@@ -620,8 +621,17 @@ class FEM:
             # BCOO. (The runtime-parametric case is a FemLinearSystem and falls through below.)
             A, b = self._op
             A = jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)
+            b = jnp.asarray(b).reshape(-1)
             _solve = solve_fn or (lambda A_, b_: jnp.linalg.solve(A_, b_))
-            return _solve(A, jnp.asarray(b).reshape(-1))
+            if self._periodic is not None:
+                # periodic tie: eliminate slave DOFs via the prolongation P, solve the reduced
+                # (P^T A P) u_red = P^T b, then prolong u = P u_red back to the full nodal layout.
+                from .utils.solver.feax_utils import prolong, reduce_matrix, reduce_vector
+
+                P = self._periodic["P"]
+                u_red = _solve(reduce_matrix(P, A), reduce_vector(P, b))
+                return prolong(P, u_red)
+            return _solve(A, b)
         return self._op.solve(solve_fn, **kwargs)
 
     @property
@@ -722,6 +732,76 @@ class FEM:
 
 
 # ---------------------------------------------------------------------------
+# periodic ties:  u(A) - u(B)  (same trial, two boundary regions)
+# ---------------------------------------------------------------------------
+def _periodic_tie_spec(constraint: Any, domain: Any) -> Optional[Tuple[str, str, Optional[int], Any]]:
+    """Recognise a **periodic tie** ``u(A) - u(B)`` and return ``(master_tag, slave_tag, comp,
+    field_key)``; ``None`` for any non-tie constraint.
+
+    The two regions are carried on the constraint's ``_periodic_tie`` attribute, stamped by the trace
+    layer when it builds ``u(A) - u(B)`` (the only point where each side's region survives — the
+    ``BinaryOp`` discards the per-side bound views). ``self`` (the left operand) is the eliminated
+    slave; ``other`` (right) is the retained master — the relation ``u(A)=u(B)`` is symmetric.
+    """
+    tie = getattr(constraint, "_periodic_tie", None)
+    if tie is None:
+        return None
+    # The trace stamps `_periodic_tie` on *any* trial-trial combination with clashing coords; only a
+    # plain `u(A) - u(B)` (bare trial sides, no scaling, not `+`) is a tie. Reject the rest loudly
+    # rather than silently mis-reading e.g. `u(A)+u(B)` (anti-periodic) or `2*u(A)-u(B)` as periodic.
+    bare = _bare(constraint)
+    if getattr(bare, "op", None) != "-" or any(
+        getattr(side, "op", None) in {"+", "-", "*", "/"} for side in (bare.left, bare.right)
+    ):
+        raise ValueError(
+            "jno.fem: a periodic tie must be `u(A) - u(B)` with bare trial sides (no scaling, no `+`). "
+            "Anti-periodic or scaled relations between two boundaries are not supported."
+        )
+    slave_tag, master_tag = tie
+    breg = getattr(domain, "_boundary_regions", {})
+    if not (isinstance(slave_tag, str) and isinstance(master_tag, str)):
+        return None
+    if slave_tag == master_tag or slave_tag not in breg or master_tag not in breg:
+        raise ValueError(
+            f"jno.fem: a periodic tie `u(A) - u(B)` must connect two distinct boundary regions; "
+            f"got {slave_tag!r} and {master_tag!r} (known boundary tags: {sorted(breg)})."
+        )
+    return (master_tag, slave_tag, None, _field_key_of(constraint))
+
+
+def _chain_facets_for_tag(domain: Any, points: Any, tag: str) -> Optional[np.ndarray]:
+    """Master-face facet connectivity (global node-id edges) for a **flat 2D** periodic face.
+
+    A flat face is a 1-D chain: its nodes share the periodic-axis coordinate and vary along one
+    transverse coordinate, so sorting the tag's nodes by that coordinate and pairing consecutive ones
+    gives the P1 boundary edges (in the same global numbering as ``points`` / ``tag_indices``). Robust
+    and assembly-mesh-correct, with no dependence on the mesh's local boundary-edge tables. ``None``
+    when there are < 2 nodes (1D faces are single nodes -> node-to-node, no interpolation)."""
+    ti = getattr(domain, "tag_indices", {})
+    if tag not in ti:
+        return None
+    ids = np.asarray(ti[tag], dtype=int).reshape(-1)
+    if ids.size < 2:
+        return None
+    pts = np.asarray(points)[ids]
+    tdim = int(np.argmax(pts.max(axis=0) - pts.min(axis=0)))  # the face's tangent (transverse) axis
+    chain = ids[np.argsort(pts[:, tdim])]
+    return np.column_stack([chain[:-1], chain[1:]])
+
+
+def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, vec: int) -> dict:
+    """Build the prolongation ``P`` for the collected ties on the assembly-mesh ``points``."""
+    from .utils.solver.feax_utils import build_periodic_prolongation
+
+    points = np.asarray(points)
+    pairs = [(master, slave) for (master, slave, _comp, _fk) in ties]
+    facets = {
+        master: f for (master, _s, _c, _fk) in ties if (f := _chain_facets_for_tag(domain, points, master)) is not None
+    }
+    return build_periodic_prolongation(points, pairs, getattr(domain, "tag_indices", {}), vec=vec, facets=facets)
+
+
+# ---------------------------------------------------------------------------
 # the driver
 # ---------------------------------------------------------------------------
 def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] = None, vec: Optional[int] = None) -> FEM:
@@ -754,9 +834,51 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         raise ValueError("jno.fem: no constraints provided.")
 
     domain = _discover_domain(constraints)
+
+    # Periodic ties `u(A) - u(B)` are enforced by algebraic reduction (a prolongation P that
+    # eliminates the slave-face DOFs), not by assembly. Separate them out *before* the weak/Dirichlet
+    # classification (`_region_and_support` would otherwise reject a residual that spans two regions).
+    periodic_ties: List[Any] = []
+    core_constraints: List[Any] = []
+    for c in constraints:
+        spec = _periodic_tie_spec(c, domain)
+        (periodic_ties.append(spec) if spec is not None else core_constraints.append(c))
+    constraints = core_constraints
+    if periodic_ties and not constraints:
+        raise ValueError("jno.fem: only periodic ties were given — add the PDE weak form (and any other conditions).")
+
     multifield = len(_field_keys(constraints)) > 1
     if vec is None and not multifield:
         vec = _infer_vec(constraints)  # single-field only (coupled fields carry per-field vec)
+
+    def _finalize(fem_obj: "FEM") -> "FEM":
+        """Attach the periodic reduction (if any). Scoped to scalar steady-linear P1 for now."""
+        if not periodic_ties:
+            return fem_obj
+        if fem_obj._mode != "linear":
+            raise NotImplementedError(
+                f"jno.fem: periodic ties (u(A)-u(B)) are currently supported only for steady linear "
+                f"problems; got mode={fem_obj._mode!r}."
+            )
+        if isinstance(fem_obj._op, FemLinearSystem):
+            # The reduction is applied on the non-parametric (A, b) branch of FEM.solve; the
+            # runtime-parametric FemLinearSystem.solve path would silently ignore it.
+            raise NotImplementedError("jno.fem: periodic ties are not yet supported on runtime-parametric linear problems.")
+        if multifield or (vec or 1) != 1:
+            raise NotImplementedError(
+                "jno.fem: periodic ties are currently supported only for scalar single-field problems."
+            )
+        if len(periodic_ties) > 1:
+            # A node that is a slave in two directions can interpolate off a master edge whose
+            # endpoint is itself a slave -> corner composition (handled in the next increment).
+            raise NotImplementedError(
+                "jno.fem: multi-direction periodicity (more than one u(A)-u(B) tie, e.g. a doubly-periodic "
+                "cell) is the next increment; M1 supports a single periodic direction."
+            )
+        if _infer_order(constraints) > 1 and getattr(domain, "dimension", 2) > 1:
+            raise NotImplementedError("jno.fem: periodic ties on P2 (higher-order) elements are the next increment.")
+        fem_obj._periodic = _build_periodic_reduction(domain, periodic_ties, fem_obj.points, vec or 1)
+        return fem_obj
 
     volume_terms: List[Any] = []
     boundary_terms: dict[str, List[Any]] = {}
@@ -833,15 +955,17 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             op, mode = assemble_fem_1d(
                 domain, volume_terms, boundary_terms, dirichlet_values, ic_residuals, vec=vec, quad_degree=quad_degree
             )
-        return FEM(domain=domain, op=op, classification=classification, mode=mode)
+        return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode))
 
     order = _infer_order(constraints)
     quad_degree = max(quad_degree, 2 * order)
 
     # ---- coupled / mixed multi-field -> block (multi-variable) assembly ----
     if multifield:
-        return _assemble_multifield(
-            domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, classification, quad_degree=quad_degree
+        return _finalize(
+            _assemble_multifield(
+                domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, classification, quad_degree=quad_degree
+            )
         )
 
     # ---- single field: element defaults to the field order (P1->TRI3/TET4,
@@ -915,9 +1039,11 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             imag_ir = LoweredWeakForm(domain=domain, terms=[_clone_term_with_coeff(t, t.coeff.imag) for t in ir.terms])
             block_r = _assemble_feax_time_from_ir(domain, real_ir, state0=jnp.real(s0))
             block_i = _assemble_feax_time_from_ir(domain, imag_ir, state0=jnp.imag(s0))
-            return FEM(domain=domain, op=(block_r, block_i), classification=classification, mode="complex_transient")
+            return _finalize(
+                FEM(domain=domain, op=(block_r, block_i), classification=classification, mode="complex_transient")
+            )
         block = _assemble_feax_time_from_ir(domain, ir, state0=state0)
-        return FEM(domain=domain, op=block, classification=classification, mode="transient")
+        return _finalize(FEM(domain=domain, op=block, classification=classification, mode="transient"))
 
     if ic_residuals:
         raise ValueError("jno.fem: an initial condition was given but the weak form has no time derivative.")
@@ -933,16 +1059,16 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         imag_ir = LoweredWeakForm(domain=domain, terms=[_clone_term_with_coeff(t, t.coeff.imag) for t in ir.terms])
         op_r = _assemble_fem_system_from_ir(domain, real_ir)
         op_i = _assemble_fem_system_from_ir(domain, imag_ir)
-        return FEM(domain=domain, op=(op_r, op_i), classification=classification, mode="complex")
+        return _finalize(FEM(domain=domain, op=(op_r, op_i), classification=classification, mode="complex"))
 
     probe = ir.volume_expr if ir.volume_expr is not None else next(iter(ir.boundary_exprs.values()))
     target = _infer_solver_target(domain, probe)
     if target == "fem_system":
         op = _assemble_fem_system_from_ir(domain, ir)
-        return FEM(domain=domain, op=op, classification=classification, mode="linear")
+        return _finalize(FEM(domain=domain, op=op, classification=classification, mode="linear"))
 
     op = _assemble_fem_residual_from_ir(domain, ir)
-    return FEM(domain=domain, op=op, classification=classification, mode="nonlinear")
+    return _finalize(FEM(domain=domain, op=op, classification=classification, mode="nonlinear"))
 
 
 def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, classification, *, quad_degree):

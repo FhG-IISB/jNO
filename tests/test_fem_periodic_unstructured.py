@@ -1,0 +1,242 @@
+"""Periodic ties on **unstructured** (non-matching) meshes via interpolatory prolongation.
+
+The structured/conforming case ties slave≡master node-to-node (exact 0/1 ``P``). When the two
+periodic faces carry *different* node layouts, a slave with no master node within ``tol`` is tied to
+the master *facet* it lands on by node-to-segment interpolation (linear P1 / quadratic P2). The
+primary correctness gate is a **patch test**: the prolongation reproduces a constant and a
+linear-along-the-face field exactly (P1), a quadratic exactly (P2) — partition of unity + facet
+completeness. (Interpolatory master--slave elimination, not full dual-mortar; see
+``_periodic_facet_weights``.)
+
+These exercise ``build_periodic_prolongation`` directly (no FEM assembly). x64 so the float64
+reduction reproduces the fields exactly.
+"""
+
+import numpy as np
+import pytest
+
+pytest.importorskip("feax", reason="feax required for the periodic solver utilities")
+
+import jax  # noqa: E402
+
+from jno.utils.solver.feax_utils import build_periodic_prolongation  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _x64():
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
+
+def _two_faces(n_master, n_slave, *, order=1):
+    """Right (master, x=1) and left (slave, x=0) faces with independent node layouts.
+
+    Returns ``(points, tag_indices, facets)``. For ``order==2`` the master face carries edge
+    midpoints and the facets are 3-node (a, b, mid)."""
+    ym = np.linspace(0.0, 1.0, n_master)
+    master = np.column_stack([np.ones_like(ym), ym])
+    ys = np.linspace(0.0, 1.0, n_slave)
+    slave = np.column_stack([np.zeros_like(ys), ys])
+    if order == 1:
+        pts = np.vstack([master, slave])
+        m_ids = np.arange(n_master)
+        s_ids = np.arange(n_master, n_master + n_slave)
+        edges = np.column_stack([m_ids[:-1], m_ids[1:]])  # (a, b)
+        return pts, {"right": m_ids, "left": s_ids}, {"right": edges}
+    # P2: insert master edge midpoints
+    mids = 0.5 * (ym[:-1] + ym[1:])
+    master_mid = np.column_stack([np.ones_like(mids), mids])
+    pts = np.vstack([master, master_mid, slave])
+    m_ids = np.arange(n_master)
+    mid_ids = np.arange(n_master, n_master + len(mids))
+    s_ids = np.arange(n_master + len(mids), len(pts))
+    edges = np.column_stack([m_ids[:-1], m_ids[1:], mid_ids])  # (a, b, mid)
+    return pts, {"right": m_ids, "left": s_ids}, {"right": edges}
+
+
+def test_patch_test_p1_reproduces_constant_and_linear():
+    """Non-matching faces (5 master vs 9 slave nodes): P-rows are a partition of unity and the
+    prolongation reproduces a constant and a linear-in-y field exactly."""
+    pts, tags, facets = _two_faces(5, 9, order=1)
+    res = build_periodic_prolongation(pts, [("right", "left")], tags, facets=facets)
+    P = np.asarray(res["P_node"])
+    kept = np.asarray(res["kept_nodes"])
+
+    assert res["n_red"] == 5  # all 9 left nodes eliminated; the 5 right nodes are retained
+    assert np.allclose(P.sum(axis=1), 1.0)  # partition of unity on every row
+
+    # constant
+    u_red = np.ones(len(kept))
+    assert np.allclose(P @ u_red, 1.0)
+    # linear in the transverse coord y -> reproduced exactly at every slave node
+    for a, b in [(2.0, 0.3), (-1.5, 1.0)]:
+        f = lambda y: a * y + b  # noqa: E731
+        u_full = P @ f(pts[kept, 1])
+        assert np.allclose(u_full, f(pts[:, 1]), atol=1e-10)
+
+
+def test_patch_test_p2_reproduces_quadratic():
+    """With 3-node (a, b, mid) master facets the interpolation reproduces a quadratic exactly."""
+    pts, tags, facets = _two_faces(3, 9, order=2)
+    res = build_periodic_prolongation(pts, [("right", "left")], tags, facets=facets)
+    P = np.asarray(res["P_node"])
+    kept = np.asarray(res["kept_nodes"])
+    assert np.allclose(P.sum(axis=1), 1.0)
+    f = lambda y: 0.7 * y**2 - 0.2 * y + 0.1  # noqa: E731
+    u_full = P @ f(pts[kept, 1])
+    assert np.allclose(u_full, f(pts[:, 1]), atol=1e-10)
+
+
+def test_conforming_stays_exact_0_1_permutation():
+    """Equal node layout on both faces -> exact node-to-node 0/1 P (no interpolation, no facets)."""
+    pts, tags, _ = _two_faces(5, 5, order=1)
+    res = build_periodic_prolongation(pts, [("right", "left")], tags)  # no facets needed
+    P = np.asarray(res["P_node"])
+    assert res["n_red"] == 5
+    assert set(np.unique(P).tolist()) <= {0.0, 1.0}  # pure permutation, no fractional weights
+    assert np.allclose(P.sum(axis=1), 1.0)
+
+
+def test_non_matching_without_facets_raises():
+    """Non-matching faces and no facet connectivity -> a clear error (can't interpolate)."""
+    pts, tags, _ = _two_faces(5, 9, order=1)
+    with pytest.raises(ValueError, match="no master facet connectivity"):
+        build_periodic_prolongation(pts, [("right", "left")], tags)
+
+
+def test_periodic_poisson_2d_p1_nonconforming():
+    """End-to-end: steady Poisson ``-Δu = f`` periodic in x (``u(left) - u(right)`` tie) and Dirichlet
+    in y, on a **non-conforming** mesh (fine left half, coarse right half -> the x=0 / x=1 faces carry
+    different node layouts). The manufactured solution has a *nonzero, matching* flux at the periodic
+    faces, so the natural (zero-flux) BC would be wrong -- the tie is doing real work. P1 elements."""
+    from shapely.geometry import box
+
+    import jno
+
+    pi = np.pi
+    dom = jno.domain({"fine": box(0, 0, 0.5, 1), "coarse": box(0.5, 0, 1, 1)}).build_mesh(0.10, sizes={"fine": 0.045})
+    # periodic faces are the OPEN edges (corners belong to the Dirichlet top/bottom, not the tie)
+    dom.tag("left", lambda x, y: (x < 1e-6) & (y > 1e-6) & (y < 1 - 1e-6))
+    dom.tag("right", lambda x, y: (x > 1 - 1e-6) & (y > 1e-6) & (y < 1 - 1e-6))
+    dom.tag("bottom", lambda x, y: y < 1e-6)
+    dom.tag("top", lambda x, y: y > 1 - 1e-6)
+    nl = len(np.asarray(dom.tag_indices["left"]).ravel())
+    nr = len(np.asarray(dom.tag_indices["right"]).ravel())
+    assert nl != nr, f"faces must be non-matching to exercise interpolation (got {nl} vs {nr})"
+
+    u, phi = dom.fem_symbols()
+    xi, yi, _ = dom.variable("interior", split=True)
+    xb, yb, _ = dom.variable("bottom", split=True)
+    xt, yt, _ = dom.variable("top", split=True)
+    xl, yl, _ = dom.variable("left", split=True)
+    xr, yr, _ = dom.variable("right", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    hh = jno.np.cos(2 * jno.np.pi * xi) + 0.5 * jno.np.sin(2 * jno.np.pi * xi)
+    f = 5 * jno.np.pi**2 * hh * jno.np.sin(jno.np.pi * yi)
+    fem = jno.fem(
+        [
+            ui.x * vi.x + ui.y * vi.y - f * vi,  # -Δu = f
+            u(xb, yb) - 0.0,
+            u(xt, yt) - 0.0,  # homogeneous Dirichlet on y = 0, 1
+            u(xl, yl) - u(xr, yr),  # periodic in x
+        ]
+    )
+    assert fem._periodic is not None, "the u(left)-u(right) tie must be recognised and reduce the system"
+    assert fem._periodic["n_red"] < fem._periodic["n_full"], "the tie must eliminate the slave-face DOFs"
+
+    uh = np.asarray(fem.solve())
+    pts = np.asarray(fem.points)
+    u_exact = (np.cos(2 * pi * pts[:, 0]) + 0.5 * np.sin(2 * pi * pts[:, 0])) * np.sin(pi * pts[:, 1])
+    rel = float(np.linalg.norm(uh - u_exact) / np.linalg.norm(u_exact))
+    assert rel < 0.05, f"periodic Poisson L2 relative error too large: {rel:.3f}"
+
+
+def test_periodic_1d_reaction_diffusion():
+    """1D periodic is the degenerate (node-to-node) case: ``-u'' + u = f`` on [0,1] with ``u(left) -
+    u(right)``. The reaction term makes the all-periodic problem well-posed (no null space); the tie
+    is exact (one endpoint eliminated) so the recovered ``u = cos(2πx)`` is near machine-accurate."""
+    import jno
+
+    d = jno.domain(constructor=jno.domain.line(mesh_size=0.01))
+    u, phi = d.fem_symbols()
+    xi = d.variable("interior", split=True)[0]
+    xl = d.variable("left", split=True)[0]
+    xr = d.variable("right", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    f = (4 * jno.np.pi**2 + 1) * jno.np.cos(2 * jno.np.pi * xi)
+    fem = jno.fem([ui.x * vi.x + ui * vi - f * vi, u(xl) - u(xr)])
+    assert fem._periodic is not None and fem._periodic["n_red"] == fem._periodic["n_full"] - 1
+    uh = np.asarray(fem.solve()).reshape(-1)
+    pts = np.asarray(fem.points).reshape(-1)
+    rel = float(np.linalg.norm(uh - np.cos(2 * np.pi * pts)) / np.linalg.norm(np.cos(2 * np.pi * pts)))
+    assert rel < 1e-3, f"1D periodic reaction-diffusion error too large: {rel:.2e}"
+
+
+def test_tie_to_non_boundary_region_raises():
+    """A tie whose region is not a boundary (e.g. an interior tag) is rejected with a clear error."""
+    from shapely.geometry import box
+
+    import jno
+
+    dom = jno.domain(box(0, 0, 1, 1)).build_mesh(0.2)
+    dom.tag("blob", lambda x, y: (x - 0.5) ** 2 + (y - 0.5) ** 2 < 0.04)  # interior region (no boundary facets)
+    dom.tag("left", lambda x, y: x < 1e-6)
+    u, phi = dom.fem_symbols()
+    xi, yi, _ = dom.variable("interior", split=True)
+    xbl, ybl, _ = dom.variable("blob", split=True)
+    xl, yl, _ = dom.variable("left", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    with pytest.raises(ValueError, match="distinct boundary regions"):
+        jno.fem([ui.x * vi.x + ui.y * vi.y - vi, u(xbl, ybl) - u(xl, yl)])
+
+
+def test_only_plain_minus_is_a_tie():
+    """`u(A)+u(B)` (anti-periodic) and `2*u(A)-u(B)` (scaled) must NOT be silently read as a periodic
+    tie -- they raise a clear error rather than quietly meaning `u(A)=u(B)`."""
+    from shapely.geometry import box
+
+    import jno
+
+    dom = jno.domain(box(0, 0, 1, 1)).build_mesh(0.25)
+    dom.tag("left", lambda x, y: x < 1e-6)
+    dom.tag("right", lambda x, y: x > 1 - 1e-6)
+    u, phi = dom.fem_symbols()
+    xi, yi, _ = dom.variable("interior", split=True)
+    xl, yl, _ = dom.variable("left", split=True)
+    xr, yr, _ = dom.variable("right", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    weak = ui.x * vi.x + ui.y * vi.y - vi
+    with pytest.raises(ValueError, match="must be `u\\(A\\) - u\\(B\\)`"):
+        jno.fem([weak, u(xl, yl) + u(xr, yr)])  # anti-periodic, not a tie
+    with pytest.raises(ValueError, match="must be `u\\(A\\) - u\\(B\\)`"):
+        jno.fem([weak, 2.0 * u(xl, yl) - u(xr, yr)])  # scaled, not a tie
+
+
+def test_multi_direction_periodicity_not_yet():
+    """Two ties (periodic in x AND y, a doubly-periodic cell) are rejected for now -- the corner
+    composition is the next increment. A single direction is supported."""
+    from shapely.geometry import box
+
+    import jno
+
+    dom = jno.domain(box(0, 0, 1, 1)).build_mesh(0.2)
+    for nm, pred in {
+        "left": lambda x, y: x < 1e-6,
+        "right": lambda x, y: x > 1 - 1e-6,
+        "bottom": lambda x, y: y < 1e-6,
+        "top": lambda x, y: y > 1 - 1e-6,
+    }.items():
+        dom.tag(nm, pred)
+    u, phi = dom.fem_symbols()
+    xi, yi, _ = dom.variable("interior", split=True)
+    xl, yl, _ = dom.variable("left", split=True)
+    xr, yr, _ = dom.variable("right", split=True)
+    xb, yb, _ = dom.variable("bottom", split=True)
+    xt, yt, _ = dom.variable("top", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    with pytest.raises(NotImplementedError, match="multi-direction"):
+        jno.fem([ui.x * vi.x + ui.y * vi.y + ui * vi - vi, u(xl, yl) - u(xr, yr), u(xb, yb) - u(xt, yt)])

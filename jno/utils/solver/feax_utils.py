@@ -1917,6 +1917,52 @@ node-level ``P`` via a Kronecker product with the identity.
 """
 
 
+def _periodic_facet_weights(
+    t_query: np.ndarray,
+    facet_node_ids: np.ndarray,
+    pts: np.ndarray,
+    transverse: List[int],
+) -> List[Tuple[int, float]] | None:
+    """Interpolation weights for a slave at transverse coord ``t_query`` on the
+    master boundary facets (node-to-segment / mortar-lite identification).
+
+    ``facet_node_ids`` is ``(n_facets, k)`` of global node ids. **2D** (transverse
+    1-D): facets are edges; columns 0,1 are the edge vertices and an optional
+    column 2 is the midside node (``k == 3`` ⇒ P2). Returns ``[(node_id, weight),
+    ...]`` whose weights sum to 1 (partition of unity ⇒ constants reproduced;
+    linear/quadratic-along-the-edge reproduced exactly). 3D is milestone M2.
+    """
+    tq = np.atleast_1d(np.asarray(t_query, dtype=float))
+    facet_node_ids = np.asarray(facet_node_ids, dtype=int)
+    if facet_node_ids.ndim != 2 or facet_node_ids.shape[0] == 0:
+        return None
+    k = facet_node_ids.shape[1]
+
+    if tq.shape[0] == 1:  # 2D: locate the master edge spanning the slave's transverse coord
+        t = float(tq[0])
+        tr = transverse[0]
+        a_ids, b_ids = facet_node_ids[:, 0], facet_node_ids[:, 1]
+        ta, tb = pts[a_ids, tr], pts[b_ids, tr]
+        lo, hi = np.minimum(ta, tb), np.maximum(ta, tb)
+        span = hi - lo
+        eps = 1.0e-9 * (float(np.max(span)) if span.size else 1.0)
+        inside = (t >= lo - eps) & (t <= hi + eps)
+        if inside.any():
+            idx = int(np.argmax(inside))
+        else:  # outside every edge (rounding at a face end) -> nearest edge
+            idx = int(np.argmin(np.minimum(np.abs(t - lo), np.abs(t - hi))))
+        a, b = int(a_ids[idx]), int(b_ids[idx])
+        L = float(tb[idx] - ta[idx])
+        xi = 0.0 if abs(L) < eps else (t - float(ta[idx])) / L  # local coord, a:0 -> b:1
+        xi = min(1.0, max(0.0, xi))
+        if k < 3:  # P1 edge: linear
+            return [(a, 1.0 - xi), (b, xi)]
+        m = int(facet_node_ids[idx, 2])  # P2 edge (a, b, mid): quadratic Lagrange at xi = 0, 1, 0.5
+        return [(a, 2.0 * (xi - 0.5) * (xi - 1.0)), (b, 2.0 * xi * (xi - 0.5)), (m, -4.0 * xi * (xi - 1.0))]
+
+    raise NotImplementedError("3D periodic interpolation (triangle facets) is milestone M2.")
+
+
 def build_periodic_prolongation(
     points: np.ndarray,
     pairs: Sequence[Tuple[str, str]],
@@ -1924,15 +1970,22 @@ def build_periodic_prolongation(
     *,
     vec: int = 1,
     tol: float | None = None,
+    facets: Dict[str, np.ndarray] | None = None,
 ) -> Dict[str, object]:
     """Build the node-level periodic prolongation matrix ``P``.
+
+    Identifies each slave-face node with the master face. When the two faces have
+    the **same node layout** (structured / conforming) this is an exact 0/1
+    node-to-node map. When they **don't** (unstructured / non-matching), a slave
+    that has no master node within ``tol`` is instead tied to the master *facet*
+    it lands on by **node-to-segment interpolation** (linear for P1, quadratic for
+    P2) — master–slave MPC elimination, consistent (partition of unity) though not
+    a full dual-mortar coupling. See :func:`_periodic_facet_weights`.
 
     Parameters
     ----------
     points:
-        ``(n_nodes, dim)`` array of FEM node coordinates. Node ordering must
-        match the FEAX mesh (it does: the FEAX mesh is built directly from
-        ``mesh.points``).
+        ``(n_nodes, dim)`` array of FEM node coordinates (the assembly mesh).
     pairs:
         Ordered ``(master_tag, slave_tag)`` boundary pairings, e.g.
         ``[("left", "right"), ("bottom", "top")]``.
@@ -1944,6 +1997,9 @@ def build_periodic_prolongation(
     tol:
         Coordinate-matching tolerance for the transverse coordinates. When
         ``None`` it is derived from the bounding-box diagonal.
+    facets:
+        Optional ``{master_tag: (n_facets, k) node-id array}`` of the master
+        boundary facets, required only for the non-matching (interpolatory) path.
 
     Returns
     -------
@@ -1951,20 +2007,22 @@ def build_periodic_prolongation(
         ``P``               : ``(n_full, n_red)`` dense jnp prolongation matrix.
         ``P_node``          : node-level prolongation (``vec == 1`` form).
         ``kept_nodes``      : sorted global ids of the retained (master/free) nodes.
-        ``slave_to_master`` : resolved slave-node -> master-node mapping.
+        ``slave_to_master`` : resolved slave-node -> master-node mapping (exact ties).
         ``n_full``          : full node count.
         ``n_red``           : reduced node count.
         ``vec``             : component count used.
     """
     pts = np.asarray(points, dtype=np.float64)
     n_nodes = pts.shape[0]
+    facets = facets or {}
 
     if tol is None:
         span = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
         tol = max(span, 1.0) * 1.0e-6
 
-    # slave global id -> master global id (one hop per pairing).
+    # slave -> master node (exact 0/1 tie); slave -> [(master node, weight)] (interpolated tie).
     slave_to_master: Dict[int, int] = {}
+    slave_interp: Dict[int, List[Tuple[int, float]]] = {}
 
     for master_tag, slave_tag in pairs:
         if master_tag not in tag_indices or slave_tag not in tag_indices:
@@ -1985,35 +2043,38 @@ def build_periodic_prolongation(
         m_trans = m_pts[:, transverse]
         s_trans = s_pts[:, transverse]
 
-        # Nearest transverse master for every slave node.
-        d2 = np.sum(
-            (s_trans[:, None, :] - m_trans[None, :, :]) ** 2,
-            axis=-1,
-        )
-        nn = np.argmin(d2, axis=1)
-        worst = float(np.sqrt(d2[np.arange(len(s_ids)), nn].max())) if len(s_ids) else 0.0
-        if worst > tol:
-            raise ValueError(
-                f"Periodic matching for ({master_tag!r}, {slave_tag!r}) failed: "
-                f"largest transverse mismatch {worst:.3e} exceeds tol {tol:.3e}. "
-                "Use a periodically compatible mesh (equal node layout on opposite "
-                "faces) or relax tol."
-            )
+        # Nearest transverse master node for every slave node.
+        d2 = np.sum((s_trans[:, None, :] - m_trans[None, :, :]) ** 2, axis=-1)
+        nn = np.argmin(d2, axis=1) if m_ids.size else np.zeros(len(s_ids), dtype=int)
+        dist = np.sqrt(d2[np.arange(len(s_ids)), nn]) if m_ids.size and len(s_ids) else np.zeros(len(s_ids))
 
         for k, sid in enumerate(s_ids):
-            slave_to_master[int(sid)] = int(m_ids[nn[k]])
+            if m_ids.size and dist[k] <= tol:  # conforming: exact node-to-node (corners land here too)
+                slave_to_master[int(sid)] = int(m_ids[nn[k]])
+                continue
+            # non-matching: tie to the master facet by interpolation
+            w = _periodic_facet_weights(s_trans[k], facets.get(master_tag), pts, transverse) if facets else None
+            if w is None:
+                raise ValueError(
+                    f"Periodic matching for ({master_tag!r}, {slave_tag!r}) failed at slave node {int(sid)}: "
+                    f"nearest master node is {float(dist[k]):.3e} away (tol {tol:.3e}) and no master facet "
+                    "connectivity was supplied for interpolation. Pass `facets=` (unstructured) or use a "
+                    "conforming mesh."
+                )
+            slave_interp[int(sid)] = w
 
-    # Resolve corner chains: a corner is a slave in two directions, so its
-    # master may itself be a slave. Follow until a free node is reached.
+    slave_set = set(slave_to_master) | set(slave_interp)
+
+    # Resolve exact chains: a corner is a slave in two directions, so its master
+    # may itself be a slave. Follow until a free (kept) node is reached.
     def _resolve(i: int) -> int:
-        seen = set()
+        seen: set = set()
         while i in slave_to_master and i not in seen:
             seen.add(i)
             i = slave_to_master[i]
         return i
 
     final_master = {sid: _resolve(sid) for sid in slave_to_master}
-    slave_set = set(slave_to_master)
 
     kept_nodes: List[int] = [i for i in range(n_nodes) if i not in slave_set]
     reduced_index = {node: r for r, node in enumerate(kept_nodes)}
@@ -2021,8 +2082,12 @@ def build_periodic_prolongation(
 
     P_node = np.zeros((n_nodes, n_red), dtype=np.float64)
     for i in range(n_nodes):
-        master = final_master[i] if i in slave_set else i
-        P_node[i, reduced_index[master]] = 1.0
+        if i in slave_interp:
+            for node, weight in slave_interp[i]:
+                P_node[i, reduced_index[_resolve(node)]] += weight
+        else:
+            master = final_master[i] if i in slave_to_master else i
+            P_node[i, reduced_index[master]] = 1.0
 
     P_node_j = jnp.asarray(P_node)
     if vec == 1:
