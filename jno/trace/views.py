@@ -785,6 +785,187 @@ class ComplexVectorView(_DelegatesToPlaceholder):
 
 
 # ---------------------------------------------------------------------------
+# ComplexPair — complex as two SEPARATE real parts (FEM-friendly)
+# ---------------------------------------------------------------------------
+
+
+def _is_complex_pair(o) -> bool:
+    return isinstance(o, ComplexPair)
+
+
+def _radd(a, b):
+    """``a + b`` with ``None`` standing for an identically-zero part."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a + b
+
+
+def _rsub(a, b):
+    if a is None and b is None:
+        return None
+    if a is None:
+        return -b
+    if b is None:
+        return a
+    return a - b
+
+
+def _rmul(a, b):
+    if a is None or b is None:
+        return None
+    return a * b
+
+
+def _as_pair(o):
+    """Coerce ``o`` to a :class:`ComplexPair` (``NotImplemented`` if not possible).
+
+    A Python ``complex`` becomes its ``(real, imag)`` constants; any real
+    expression/number becomes ``(o, 0)``."""
+    if isinstance(o, ComplexPair):
+        return o
+    if isinstance(o, complex):
+        return ComplexPair(o.real if o.real != 0 else None, o.imag if o.imag != 0 else None)
+    if isinstance(o, (int, float)) or isinstance(o, (Placeholder, ScalarView, VectorView)):
+        return ComplexPair(o, None)
+    return NotImplemented
+
+
+def _complex_times_real(real_view, c: complex) -> "ComplexPair":
+    """``c * (real field)`` → a :class:`ComplexPair` (``1j·field`` → ``(0, field)``)."""
+
+    def scale(coeff):
+        if coeff == 0:
+            return None
+        if coeff == 1:
+            return real_view
+        return coeff * real_view
+
+    return ComplexPair(scale(c.real), scale(c.imag))
+
+
+class ComplexPair:
+    """A complex quantity held as two **separate** real parts ``(re, im)``.
+
+    Unlike :class:`ComplexView` (which packs ``[re, im]`` into one Placeholder's
+    last axis), each part here is an independent expression — the FEM-friendly
+    representation of a complex field built from real ``fem_symbols``::
+
+        E = Er.bind(x=x, y=y) + 1j * Ei.bind(x=x, y=y)      # -> ComplexPair
+
+    ``1j`` is just the imaginary unit; the tracer carries the real and imaginary
+    parts through every operation (``*`` is the complex product, ``.conj``, ``.x``,
+    ``[i]`` map over both). ``.real`` / ``.imag`` hand back the two parts as the
+    user's own real fields, so a complex weak form's ``.real`` lowers directly onto
+    the coupled (multifield) real system that ``jno.fem`` already assembles — no
+    separate complex machinery. A ``None`` part means "identically zero"."""
+
+    __slots__ = ("_re", "_im")
+
+    def __init__(self, re, im=None):
+        self._re = re
+        self._im = im
+
+    # -- accessors --
+    @property
+    def real(self):
+        return self._re
+
+    @property
+    def imag(self):
+        return self._im if self._im is not None else 0.0
+
+    @property
+    def conj(self) -> "ComplexPair":
+        return ComplexPair(self._re, None if self._im is None else -self._im)
+
+    # -- field-like passthroughs (map over both parts) --
+    def _map(self, fn) -> "ComplexPair":
+        return ComplexPair(fn(self._re), None if self._im is None else fn(self._im))
+
+    @property
+    def x(self) -> "ComplexPair":
+        return self._map(lambda p: p.x)
+
+    @property
+    def y(self) -> "ComplexPair":
+        return self._map(lambda p: p.y)
+
+    @property
+    def z(self) -> "ComplexPair":
+        return self._map(lambda p: p.z)
+
+    @property
+    def t(self) -> "ComplexPair":
+        return self._map(lambda p: p.t)
+
+    def __getitem__(self, i) -> "ComplexPair":
+        return self._map(lambda p: p[i])
+
+    def bind(self, **kw) -> "ComplexPair":
+        return self._map(lambda p: p.bind(**kw))
+
+    partials = bind
+
+    def d(self, v, **kw) -> "ComplexPair":
+        return self._map(lambda p: p.d(v, **kw))
+
+    def dot(self, other) -> "ComplexPair":
+        """Complex dot ``∑_i self_i · other_i`` of two complex vectors → complex scalar."""
+        o = _as_pair(other)
+        if o is NotImplemented:
+            return NotImplemented
+        rr = self._re.dot(o._re) if (self._re is not None and o._re is not None) else None
+        ii = self._im.dot(o._im) if (self._im is not None and o._im is not None) else None
+        ri = self._re.dot(o._im) if (self._re is not None and o._im is not None) else None
+        ir = self._im.dot(o._re) if (self._im is not None and o._re is not None) else None
+        return ComplexPair(_rsub(rr, ii), _radd(ri, ir))
+
+    # -- complex algebra --
+    def __add__(self, other) -> "ComplexPair":
+        o = _as_pair(other)
+        if o is NotImplemented:
+            return NotImplemented
+        return ComplexPair(_radd(self._re, o._re), _radd(self._im, o._im))
+
+    __radd__ = __add__
+
+    def __sub__(self, other) -> "ComplexPair":
+        o = _as_pair(other)
+        if o is NotImplemented:
+            return NotImplemented
+        return ComplexPair(_rsub(self._re, o._re), _rsub(self._im, o._im))
+
+    def __rsub__(self, other) -> "ComplexPair":
+        o = _as_pair(other)
+        if o is NotImplemented:
+            return NotImplemented
+        return ComplexPair(_rsub(o._re, self._re), _rsub(o._im, self._im))
+
+    def __neg__(self) -> "ComplexPair":
+        return ComplexPair(-self._re, None if self._im is None else -self._im)
+
+    def __mul__(self, other) -> "ComplexPair":
+        o = _as_pair(other)
+        if o is NotImplemented:
+            return NotImplemented
+        re = _rsub(_rmul(self._re, o._re), _rmul(self._im, o._im))
+        im = _radd(_rmul(self._re, o._im), _rmul(self._im, o._re))
+        return ComplexPair(re, im)
+
+    __rmul__ = __mul__
+
+    def __truediv__(self, other) -> "ComplexPair":
+        if isinstance(other, ComplexPair):
+            raise TypeError("ComplexPair: division by a complex quantity is not supported")
+        return ComplexPair(self._re / other, None if self._im is None else self._im / other)
+
+    def __repr__(self) -> str:
+        return f"ComplexPair(re={self._re!r}, im={self._im!r})"
+
+
+# ---------------------------------------------------------------------------
 # MatrixView
 # ---------------------------------------------------------------------------
 

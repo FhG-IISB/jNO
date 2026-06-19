@@ -1122,7 +1122,7 @@ class domain(MeshIOMixin):
 
         return [loc_fns, vec_ids, val_fns]
 
-    def variational_symbols(self, value_shape=(), names=("u", "phi"), order=1):
+    def variational_symbols(self, value_shape=(), names=("u", "phi"), order=1, complex=False):
         """
         Return generic variational symbols.
 
@@ -1158,6 +1158,23 @@ class domain(MeshIOMixin):
             u, v = domain.fem_symbols(value_shape=(3,))
         """
         trial_name, test_name = names
+        if complex:
+            # A complex field is carried as TWO real fields (re, im) — the FEM-friendly
+            # representation. The user writes the weak form with ordinary complex algebra
+            # (`*` is the complex product, `1j`, `.conj`, `.real`/`.imag`); `jno.fem`
+            # lowers `weak.real` onto the coupled (multifield) real system it already
+            # assembles. Re-trial pairs with re-test, im-trial with im-test.
+            from ..trace.views import ComplexPair
+
+            re_tr = TrialFunction(name=f"{trial_name}_re", value_shape=value_shape, order=order)
+            im_tr = TrialFunction(name=f"{trial_name}_im", value_shape=value_shape, order=order)
+            re_te = TestFunction(name=f"{test_name}_re", value_shape=value_shape, order=order)
+            im_te = TestFunction(name=f"{test_name}_im", value_shape=value_shape, order=order)
+            re_te.field_key = re_tr.field_key
+            im_te.field_key = im_tr.field_key
+            for _s in (re_tr, im_tr, re_te, im_te):
+                _s._domain = self
+            return (ComplexPair(re_tr, im_tr), ComplexPair(re_te, im_te))
         trial = TrialFunction(name=trial_name, value_shape=value_shape, order=order)
         test = TestFunction(name=test_name, value_shape=value_shape, order=order)
         test.field_key = trial.field_key  # one field per fem_symbols() call (pairs u<->phi)
@@ -1168,7 +1185,7 @@ class domain(MeshIOMixin):
         test._domain = self
         return (trial, test)
 
-    def fem_symbols(self, value_shape=(), names=("u", "phi"), order=1):
+    def fem_symbols(self, value_shape=(), names=("u", "phi"), order=1, complex=False):
         """
         Backward-compatible alias for variational_symbols().
 
@@ -1183,8 +1200,14 @@ class domain(MeshIOMixin):
         Mixed order (Taylor-Hood: P2 velocity, P1 pressure):
             u, v = domain.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
             p, q = domain.fem_symbols(names=("p", "q"))  # order=1
+
+        Complex field (e.g. time-harmonic Maxwell / Helmholtz) — one symbol that is a
+        genuine complex trial/test (carried as two coupled real fields under the hood):
+            E, v = domain.fem_symbols(value_shape=(2,), complex=True)
+            weak = curl(E) * curl(v) - k2 * E.dot(v) - J.dot(v)   # `*` = complex product
+            fem  = jno.fem([weak.real, *bcs])                     # lowers to the real coupled solve
         """
-        return self.variational_symbols(value_shape=value_shape, names=names, order=order)
+        return self.variational_symbols(value_shape=value_shape, names=names, order=order, complex=complex)
 
     def test_function(self, value_shape=(), name="phi", order=1):
         """Return only the weak-form test function.

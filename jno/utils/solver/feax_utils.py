@@ -484,6 +484,31 @@ def _test_field_index(expr, field_index: Dict[Any, int]) -> Optional[int]:
     return field_index.get(next(iter(keys)))
 
 
+def _expand_product_terms(node, sign: float = 1.0):
+    """Distribute products/quotients over sums → a list of ``(sign, product_node)``.
+
+    Used only as a fallback when a coupled weak term carries several test fields
+    welded inside a product — e.g. the **real part of a complex weak form**, where
+    a coefficient multiplies a sum that straddles two test fields,
+    ``c·(u_r·p_r − u_i·q_i)``. Fully distributing yields ``c·u_r·p_r`` and
+    ``−c·u_i·q_i``, each of which classifies to a single test field/equation block.
+    The cross-product can grow, but weak-form terms are small and this runs only on
+    the (rare) terms that would otherwise be rejected."""
+    if isinstance(node, BinaryOp):
+        if node.op == "+":
+            return _expand_product_terms(node.left, sign) + _expand_product_terms(node.right, sign)
+        if node.op == "-":
+            return _expand_product_terms(node.left, sign) + _expand_product_terms(node.right, -sign)
+        if node.op == "*":
+            left = _expand_product_terms(node.left, 1.0)
+            right = _expand_product_terms(node.right, 1.0)
+            return [(sign * sl * sr, BinaryOp("*", lt, rt)) for sl, lt in left for sr, rt in right]
+        if node.op == "/":
+            # distribute the numerator only; the denominator is treated as a coefficient
+            return [(s, BinaryOp("/", t, node.right)) for s, t in _expand_product_terms(node.left, sign)]
+    return [(sign, node)]
+
+
 def _collect_runtime_parameter_tags_for_feax(node, out=None):
     """Collect names of trainable runtime parameters (ModelCall) used in a coeff."""
     from .parametric_helpers import _is_runtime_scalar_parameter, _parameter_name
@@ -1504,15 +1529,33 @@ def _build_multifield_feax_problem(domain, ir, fields, field_index, *, apply_dir
     vecs = [int(f["vec"]) for f in fields]
 
     def _typed_term(t):
-        """Lower one IR weak term to ``(coeff, test_field_index)`` for the block kernel."""
+        """Lower one IR weak term to a list of ``(coeff, test_field_index)`` for the block kernel.
+
+        Normally a term maps to exactly one test field (one entry). A term that welds
+        several test fields inside a product — the real part of a complex weak form, e.g.
+        ``c·(u_r·p_r − u_i·q_i)`` — is distributed into single-test sub-terms as a fallback,
+        so the user can author one complex form and let it lower onto the coupled blocks."""
         coeff = _lower_statefield_to_trial(t.coeff, {})
         tfi = _test_field_index(coeff, field_index)
-        if tfi is None:
-            raise ValueError(
-                "jno.fem: each coupled weak term must contain exactly one test field "
-                "(it determines the equation block); got a term with zero or several."
-            )
-        return coeff, tfi
+        if tfi is not None:
+            return [(coeff, tfi)]
+        # Fallback: distribute products over sums, then re-classify each sub-term.
+        expanded = _expand_product_terms(coeff)
+        if len(expanded) > 1:
+            split = []
+            for s, sub in expanded:
+                sub_signed = sub if s >= 0 else BinaryOp("*", Literal(-1.0), sub)
+                sfi = _test_field_index(sub_signed, field_index)
+                if sfi is None:
+                    split = None
+                    break
+                split.append((sub_signed, sfi))
+            if split is not None:
+                return split
+        raise ValueError(
+            "jno.fem: each coupled weak term must contain exactly one test field "
+            "(it determines the equation block); got a term with zero or several."
+        )
 
     term_list = []
     boundary_terms_by_tag: dict[str, list] = {}
@@ -1520,9 +1563,9 @@ def _build_multifield_feax_problem(domain, ir, fields, field_index, *, apply_dir
         if t.channel != "raw":
             continue
         if t.support == "volume":
-            term_list.append(_typed_term(t))
+            term_list.extend(_typed_term(t))
         elif t.support == "boundary":
-            boundary_terms_by_tag.setdefault(t.region_id, []).append(_typed_term(t))
+            boundary_terms_by_tag.setdefault(t.region_id, []).extend(_typed_term(t))
 
     # Temporal tags (and runtime parameters) used by the coupled coefficients, so a
     # t-dependent coefficient (e.g. a body force e^{-t}, a source f(x,t)) is evaluated at

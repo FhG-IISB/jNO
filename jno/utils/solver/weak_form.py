@@ -646,6 +646,7 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
         # misread as nonlinear just because the unknown sits inside a real()/imag() wrapper.
         linearish = {
             "inner",
+            "dot",
             "reshape",
             "transpose",
             "getitem",

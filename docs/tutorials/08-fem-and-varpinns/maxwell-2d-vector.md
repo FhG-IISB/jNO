@@ -13,28 +13,32 @@ $$ \nabla\times(\nabla\times E) \;-\; k^2\,E \;=\; J, \qquad k^2 = \omega^2\mu\v
 with $E$ **complex-valued** ($k^2$ is complex in a lossy medium). This is the genuine *vector* complex
 problem — not a scalar Helmholtz.
 
-## A complex vector = two coupled real vector fields
+## A complex field is one symbol — `complex=True`
 
-A complex field has no native FEM unknown in jNO. A complex **vector** is carried as **two real vector
-fields** $(E_r, E_i)$ — for a 2-D field that is $4$ real DOFs per node — and the complex equation is
-split into its real and imaginary parts, giving a **coupled multifield system** that `jno.fem`
-assembles and solves with the very same machine behind the two-temperature and Stokes examples. (At
-the trace level this is what `placeholder.vector.complex` → `ComplexVectorView` exposes: `.real` /
-`.imag` are the two vector parts.)
+`domain.fem_symbols(..., complex=True)` returns a **complex** trial/test. You write the weak form once
+with ordinary complex algebra (`*` is the complex product, `1j` is just the imaginary unit, `.real` /
+`.imag` / `.conj` / `.dot`), and `jno.fem` lowers `weak.real` for you. Under the hood a complex vector
+is carried as **two coupled real vector fields** $(E_r, E_i)$ — $4$ real DOFs per node — and the
+real-part lowering lands on the **coupled multifield system** `jno.fem` already assembles for the
+two-temperature and Stokes examples. There is no separate "complex solver": one notion of complex,
+`1j` everywhere, the tracer carries the rest.
 
 ```python
-Er, Pr = d.fem_symbols(value_shape=(2,), names=("Er", "Pr"), order=2)  # real part of E + its test
-Ei, Qi = d.fem_symbols(value_shape=(2,), names=("Ei", "Qi"), order=2)  # imaginary part of E + its test
+E, v = d.fem_symbols(value_shape=(2,), complex=True, order=2)   # a complex vector field + its test
+Eb, vb = E.bind(x=x, y=y), v.bind(x=x, y=y)
 
 curl = lambda F: F.x[1] - F.y[0]        # 2-D scalar curl  ∂Fy/∂x − ∂Fx/∂y
 div  = lambda F: F.x[0] + F.y[1]
-# real/imag split of  curl(curl E) + s·div-penalty − k²·E − J ,  k² = KR + i·KI
-eq_re = curl(erb)*curl(prb) + s*div(erb)*div(prb) - (KR*dot(erb,prb) - KI*dot(eib,prb)) - dot(Jr, prb)
-eq_im = curl(eib)*curl(qib) + s*div(eib)*div(qib) - (KR*dot(eib,qib) + KI*dot(erb,qib)) - dot(Ji, qib)
-fem = jno.fem([eq_re, eq_im, *boundary_conditions])   # ordinary real coupled solve
+k2 = KR + 1j*KI                         # complex coefficient — a plain Python complex
+J  = jno.complex(Jr, Ji)                # complex forcing (data) = re + 1j*im
+
+weak = curl(Eb)*curl(vb) + s*div(Eb)*div(vb) - k2*Eb.dot(vb) - J.dot(vb)   # `*` is the complex product
+fem  = jno.fem([weak.real, *boundary_conditions])   # `.real` lowers onto the coupled real solve
 ```
 
-Two details for a **nodal** (Lagrange) discretisation of curl–curl:
+`weak.real` is one expression whose real part mixes both test fields; `jno.fem` distributes it into the
+per-field ($E_r$, $E_i$) blocks automatically. Two details for a **nodal** (Lagrange) discretisation of
+curl–curl:
 
 - the scalar curl is `F.x[1] - F.y[0]` — *grad-then-index*, because the backend differentiates the
   trial, not a component of it (`F[1].x` is not supported);

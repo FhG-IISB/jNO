@@ -1,18 +1,20 @@
-"""11 - Time-harmonic 2D Maxwell (in-plane vector E field) via jno's complex-as-coupled-real-fields.
+"""11 - Time-harmonic 2D Maxwell (in-plane vector E field) with a genuine complex FEM field.
 
 Frequency-domain Maxwell for the in-plane electric field ``E = (Ex, Ey)`` (TE polarisation) is the
 **curl-curl** equation
 
     curl(curl E) - k^2 E = J ,     k^2 = omega^2 * mu * eps   (complex in a lossy medium),
 
-with ``E`` complex-valued. A complex field has no native FEM unknown in jno; instead a complex vector
-is carried as **two coupled real vector fields** ``(E_r, E_i)`` (4 real DOF/node) and the complex
-equation is split into its real and imaginary parts -- a coupled multifield system that jno.fem
-assembles and solves like any other (the same machine behind the two-temperature / Stokes examples).
+with ``E`` complex-valued. jno exposes this directly: ``d.fem_symbols(..., complex=True)`` returns a
+**complex** trial/test, so the weak form is written once with ordinary complex algebra (``*`` is the
+complex product, ``1j``, ``.real``/``.imag``). Under the hood a complex field is carried as **two
+coupled real fields** ``(E_r, E_i)`` and ``jno.fem`` lowers ``weak.real`` onto the coupled multifield
+real system it already assembles -- the same machine behind the two-temperature / Stokes examples. No
+separate "complex solver": ``1j`` is just the imaginary unit, the tracer carries the rest.
 
 Two practical points for a *nodal* (Lagrange) discretisation of curl-curl:
   * the 2-D scalar curl is ``curl F = dFy/dx - dFx/dy`` -- written ``F.x[1] - F.y[0]`` (grad-then-index,
-    since feax differentiates the trial, not a component of it);
+    since the backend differentiates the trial, not a component of it);
   * nodal elements need a **grad-div penalty** ``+ s * div(E) div(v)`` to kill the spurious curl
     kernel; it is consistent here because the exact field is divergence-free (so the penalty vanishes
     at the solution). With it, P1 converges ~O(h^2) and P2 is essentially exact.
@@ -42,46 +44,41 @@ import jno  # noqa: E402
 
 pi, sin, cos = np.pi, jno.np.sin, jno.np.cos
 KR, KI = 30.0, 4.0  # k^2 = 30 + 4i  (non-resonant, lossy -> complex, non-singular)
+k2 = KR + 1j * KI  # the complex coefficient, written as a plain Python complex
 
 # manufactured divergence-free fields: E_r is a curl-eigenfield (eig 2*pi^2), E_i a higher mode (8*pi^2)
 E_r = lambda X, Y: (pi * sin(pi * X) * cos(pi * Y), -pi * cos(pi * X) * sin(pi * Y))  # noqa: E731
 E_i = lambda X, Y: (2 * pi * sin(2 * pi * X) * cos(2 * pi * Y), -2 * pi * cos(2 * pi * X) * sin(2 * pi * Y))  # noqa: E731
 
 d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06)
-Er, Pr = d.fem_symbols(value_shape=(2,), names=("Er", "Pr"), order=2)  # P2 real part of E + its test
-Ei, Qi = d.fem_symbols(value_shape=(2,), names=("Ei", "Qi"), order=2)  # P2 imaginary part of E + its test
+E, v = d.fem_symbols(value_shape=(2,), names=("E", "v"), order=2, complex=True)  # a P2 COMPLEX vector field + its test
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
-erb, prb = Er.bind(x=xi, y=yi), Pr.bind(x=xi, y=yi)
-eib, qib = Ei.bind(x=xi, y=yi), Qi.bind(x=xi, y=yi)
+Eb, vb = E.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
 
 curl = lambda F: F.x[1] - F.y[0]  # dFy/dx - dFx/dy  # noqa: E731
 div = lambda F: F.x[0] + F.y[1]  # noqa: E731
-dot = lambda a, b: a[0] * b[0] + a[1] * b[1]  # noqa: E731
 s = KR  # grad-div penalty weight (consistent: exact E is divergence-free)
 
 exr, eyr = E_r(xi, yi)
 exi, eyi = E_i(xi, yi)
-# J = curl(curl E) - k^2 E, split: J_r = (2pi^2 - kr) E_r + ki E_i ; J_i = (8pi^2 - kr) E_i - ki E_r
+# J = curl(curl E) - k^2 E, as complex data: J_r = (2pi^2 - kr) E_r + ki E_i ; J_i = (8pi^2 - kr) E_i - ki E_r
 jxr, jyr = (2 * pi**2 - KR) * exr + KI * exi, (2 * pi**2 - KR) * eyr + KI * eyi
 jxi, jyi = (8 * pi**2 - KR) * exi - KI * exr, (8 * pi**2 - KR) * eyi - KI * eyr
+Jx, Jy = jno.complex(jxr, jxi), jno.complex(jyr, jyi)  # complex forcing components (re + 1j*im)
 
-eq_re = (
-    curl(erb) * curl(prb)
-    + s * div(erb) * div(prb)
-    - (KR * dot(erb, prb) - KI * dot(eib, prb))
-    - (jxr * prb[0] + jyr * prb[1])
-)
-eq_im = (
-    curl(eib) * curl(qib)
-    + s * div(eib) * div(qib)
-    - (KR * dot(eib, qib) + KI * dot(erb, qib))
-    - (jxi * qib[0] + jyi * qib[1])
-)
+# ONE complex weak form; `.real` lowers it onto the coupled (E_r, E_i) real system.
+weak = curl(Eb) * curl(vb) + s * div(Eb) * div(vb) - k2 * Eb.dot(vb) - (Jx * vb[0] + Jy * vb[1])
 brx, bry = E_r(xb, yb)
-bix, biy = E_i(xb, yb)  # E = exact on the wall (per-component: a coordinate-dependent vector BC is not yet a single term)
+bix, biy = E_i(xb, yb)  # E = exact on the wall (per-component: a coordinate-dependent vector BC is not yet one term)
 fem = jno.fem(
-    [eq_re, eq_im, Er(xb, yb)[0] - brx, Er(xb, yb)[1] - bry, Ei(xb, yb)[0] - bix, Ei(xb, yb)[1] - biy],
+    [
+        weak.real,
+        E.real(xb, yb)[0] - brx,
+        E.real(xb, yb)[1] - bry,
+        E.imag(xb, yb)[0] - bix,
+        E.imag(xb, yb)[1] - biy,
+    ],
     quad_degree=6,
 )
 
@@ -99,7 +96,7 @@ ex_im = np.stack(
     [2 * pi * np.sin(2 * pi * px) * np.cos(2 * pi * py), -2 * pi * np.cos(2 * pi * px) * np.sin(2 * pi * py)], axis=1
 )
 rel = float(np.linalg.norm(np.concatenate([E_re - ex_re, E_im - ex_im])) / np.linalg.norm(np.concatenate([ex_re, ex_im])))
-print("\n2D vector Maxwell (curl-curl, complex k^2) via complex-as-coupled-real-fields")
+print("\n2D vector Maxwell (curl-curl, complex k^2) via a complex=True FEM field")
 print(f"  4 real DOF/node, {fem.dofs} DOFs total;  L2 rel error vs manufactured E: {rel:.2e}")
 assert rel < 2e-3, f"manufactured Maxwell not recovered: {rel:.2e}"
 

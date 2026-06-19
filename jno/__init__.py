@@ -37,6 +37,7 @@ from .trace import (
     Variable,
 )
 from .trace.views import (
+    ComplexPair,
     ComplexView,
     MatrixView,
     NamedComplexViewWithPartials,
@@ -75,6 +76,14 @@ numpy = np
 # Backward compatibility: allow `import jno.numpy` after renaming internals.
 sys.modules[__name__ + ".numpy"] = np
 do = domain
+
+
+# `jno.complex(re, im)` builds a complex quantity from two real parts (the explicit form of
+# `re + 1j*im`) — for complex *data*/coefficients in a weak form, e.g. a complex forcing
+# `J = jno.complex(Jr, Ji)`. Complex *fields* come from `domain.fem_symbols(..., complex=True)`.
+def complex(re, im=0.0):  # noqa: A001  (intentionally shadows builtin on the jno namespace)
+    """A complex quantity as two real parts → :class:`ComplexPair` (``re + 1j*im``)."""
+    return ComplexPair(re, im)
 
 
 # Single source of truth: pyproject.toml. importlib.metadata reads the
