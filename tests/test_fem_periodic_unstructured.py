@@ -216,14 +216,18 @@ def test_only_plain_minus_is_a_tie():
         jno.fem([weak, 2.0 * u(xl, yl) - u(xr, yr)])  # scaled, not a tie
 
 
-def test_multi_direction_periodicity_not_yet():
-    """Two ties (periodic in x AND y, a doubly-periodic cell) are rejected for now -- the corner
-    composition is the next increment. A single direction is supported."""
+def test_doubly_periodic_reaction_diffusion():
+    """Multi-direction periodicity (a doubly-periodic cell): ``-Δu + u = f`` periodic in **both** x
+    and y, via two ties ``u(left)-u(right)`` and ``u(bottom)-u(top)``. The reaction term makes the
+    all-periodic problem well-posed. This exercises the general transitive corner resolution -- the
+    four corners are each a slave in two directions and must all collapse onto one kept master.
+    Manufactured ``u = cos(2πx) cos(2πy)``."""
     from shapely.geometry import box
 
     import jno
 
-    dom = jno.domain(box(0, 0, 1, 1)).build_mesh(0.2)
+    pi = np.pi
+    dom = jno.domain(box(0, 0, 1, 1)).build_mesh(0.06)
     for nm, pred in {
         "left": lambda x, y: x < 1e-6,
         "right": lambda x, y: x > 1 - 1e-6,
@@ -231,6 +235,11 @@ def test_multi_direction_periodicity_not_yet():
         "top": lambda x, y: y > 1 - 1e-6,
     }.items():
         dom.tag(nm, pred)
+    # the box triangulation is non-conforming across opposite faces -> this exercises interpolation
+    # AND corner resolution together (not just exact node-to-node ties)
+    lefty = np.sort(np.asarray(dom.mesh.points)[np.asarray(dom.tag_indices["left"]).ravel(), 1])
+    righty = np.sort(np.asarray(dom.mesh.points)[np.asarray(dom.tag_indices["right"]).ravel(), 1])
+    assert not (len(lefty) == len(righty) and np.allclose(lefty, righty)), "expected non-conforming faces"
     u, phi = dom.fem_symbols()
     xi, yi, _ = dom.variable("interior", split=True)
     xl, yl, _ = dom.variable("left", split=True)
@@ -238,5 +247,41 @@ def test_multi_direction_periodicity_not_yet():
     xb, yb, _ = dom.variable("bottom", split=True)
     xt, yt, _ = dom.variable("top", split=True)
     ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
-    with pytest.raises(NotImplementedError, match="multi-direction"):
+    f = (8 * jno.np.pi**2 + 1) * jno.np.cos(2 * jno.np.pi * xi) * jno.np.cos(2 * jno.np.pi * yi)
+    fem = jno.fem(
+        [
+            ui.x * vi.x + ui.y * vi.y + ui * vi - f * vi,  # -Δu + u = f
+            u(xl, yl) - u(xr, yr),  # periodic in x
+            u(xb, yb) - u(xt, yt),  # periodic in y
+        ]
+    )
+    assert fem._periodic is not None and fem._periodic["n_red"] < fem._periodic["n_full"]
+    uh = np.asarray(fem.solve())
+    pts = np.asarray(fem.points)
+    u_exact = np.cos(2 * pi * pts[:, 0]) * np.cos(2 * pi * pts[:, 1])
+    rel = float(np.linalg.norm(uh - u_exact) / np.linalg.norm(u_exact))
+    assert rel < 0.05, f"doubly-periodic reaction-diffusion L2 relative error too large: {rel:.3f}"
+
+    # the four corners are identified -> they must carry the same solution value
+    corner = lambda cx, cy: int(np.argmin(np.hypot(pts[:, 0] - cx, pts[:, 1] - cy)))  # noqa: E731
+    cvals = [uh[corner(cx, cy)] for cx in (0.0, 1.0) for cy in (0.0, 1.0)]
+    assert np.allclose(cvals, cvals[0], atol=1e-9), f"the four periodic corners must be identified: {cvals}"
+
+
+def test_multidirection_requires_tagged_faces():
+    """Multidirectional periodicity on **auto-generated** tags (no domain.tag predicate) cannot recover
+    the shared corners, so it is rejected with a clear error rather than silently mis-solving."""
+    from shapely.geometry import box
+
+    import jno
+
+    dom = jno.domain(box(0, 0, 1, 1)).build_mesh(0.2)  # auto left/right/bottom/top, no domain.tag
+    u, phi = dom.fem_symbols()
+    xi, yi, _ = dom.variable("interior", split=True)
+    xl, yl, _ = dom.variable("left", split=True)
+    xr, yr, _ = dom.variable("right", split=True)
+    xb, yb, _ = dom.variable("bottom", split=True)
+    xt, yt, _ = dom.variable("top", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    with pytest.raises(NotImplementedError, match="multidirectional periodicity requires"):
         jno.fem([ui.x * vi.x + ui.y * vi.y + ui * vi - vi, u(xl, yl) - u(xr, yr), u(xb, yb) - u(xt, yt)])

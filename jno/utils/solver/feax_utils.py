@@ -2065,16 +2065,29 @@ def build_periodic_prolongation(
 
     slave_set = set(slave_to_master) | set(slave_interp)
 
-    # Resolve exact chains: a corner is a slave in two directions, so its master
-    # may itself be a slave. Follow until a free (kept) node is reached.
-    def _resolve(i: int) -> int:
-        seen: set = set()
-        while i in slave_to_master and i not in seen:
-            seen.add(i)
-            i = slave_to_master[i]
-        return i
+    # Each slave is a linear combination of other nodes (exact: one master, weight 1; interpolated:
+    # facet shape-function weights). Those nodes may themselves be slaves — a corner is a slave in
+    # several directions, and an interpolation can land on a master edge whose endpoint is itself a
+    # slave — so resolve every slave **transitively** to kept (master) nodes. This handles any number
+    # of periodic directions (e.g. a doubly-periodic cell) with a single general mechanism.
+    raw: Dict[int, List[Tuple[int, float]]] = {sid: [(m, 1.0)] for sid, m in slave_to_master.items()}
+    raw.update({sid: list(ws) for sid, ws in slave_interp.items()})
+    resolved: Dict[int, Dict[int, float]] = {}
 
-    final_master = {sid: _resolve(sid) for sid in slave_to_master}
+    def _expand(node: int, stack: frozenset) -> Dict[int, float]:
+        if node not in slave_set:
+            return {node: 1.0}
+        if node in resolved:
+            return resolved[node]
+        if node in stack:
+            raise ValueError(f"Periodic identification is cyclic at node {node}; check the tie directions.")
+        down = stack | {node}
+        out: Dict[int, float] = {}
+        for n2, w in raw[node]:
+            for kept_node, wk in _expand(n2, down).items():
+                out[kept_node] = out.get(kept_node, 0.0) + w * wk
+        resolved[node] = out
+        return out
 
     kept_nodes: List[int] = [i for i in range(n_nodes) if i not in slave_set]
     reduced_index = {node: r for r, node in enumerate(kept_nodes)}
@@ -2082,12 +2095,14 @@ def build_periodic_prolongation(
 
     P_node = np.zeros((n_nodes, n_red), dtype=np.float64)
     for i in range(n_nodes):
-        if i in slave_interp:
-            for node, weight in slave_interp[i]:
-                P_node[i, reduced_index[_resolve(node)]] += weight
+        if i in slave_set:
+            for kept_node, weight in _expand(i, frozenset()).items():
+                P_node[i, reduced_index[kept_node]] += weight
         else:
-            master = final_master[i] if i in slave_to_master else i
-            P_node[i, reduced_index[master]] = 1.0
+            P_node[i, reduced_index[i]] = 1.0
+
+    # Informational exact-chain map (single kept master per exact slave); interpolated slaves omitted.
+    final_master = {sid: next(iter(_expand(sid, frozenset()))) for sid in slave_to_master}
 
     P_node_j = jnp.asarray(P_node)
     if vec == 1:

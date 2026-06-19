@@ -769,22 +769,36 @@ def _periodic_tie_spec(constraint: Any, domain: Any) -> Optional[Tuple[str, str,
     return (master_tag, slave_tag, None, _field_key_of(constraint))
 
 
-def _chain_facets_for_tag(domain: Any, points: Any, tag: str) -> Optional[np.ndarray]:
-    """Master-face facet connectivity (global node-id edges) for a **flat 2D** periodic face.
+def _face_nodes(domain: Any, points: Any, tag: str) -> Optional[np.ndarray]:
+    """Global node ids on a periodic face, taken from the tag's **predicate** (the user's intent).
 
-    A flat face is a 1-D chain: its nodes share the periodic-axis coordinate and vary along one
-    transverse coordinate, so sorting the tag's nodes by that coordinate and pairing consecutive ones
-    gives the P1 boundary edges (in the same global numbering as ``points`` / ``tag_indices``). Robust
-    and assembly-mesh-correct, with no dependence on the mesh's local boundary-edge tables. ``None``
-    when there are < 2 nodes (1D faces are single nodes -> node-to-node, no interpolation)."""
+    ``domain.tag`` partitions every boundary node into a *single* tag, so a corner shared by two
+    edges lands in only one of them. Multi-direction periodicity needs each corner in **both** its
+    faces (a corner is a slave in several directions), so re-evaluate the tag predicate over the
+    boundary nodes -- a full-edge predicate (``x < eps``) then includes the corners in every face it
+    satisfies, while a corner-excluding predicate (single-direction + Dirichlet corners) still omits
+    them. Tags without a stored predicate fall back to the (exclusive) ``tag_indices``."""
     ti = getattr(domain, "tag_indices", {})
-    if tag not in ti:
-        return None
-    ids = np.asarray(ti[tag], dtype=int).reshape(-1)
+    pred = getattr(domain, "_tag_predicates", {}).get(tag)
+    mc = getattr(domain, "mesh_connectivity", None)
+    if pred is not None and mc and "boundary_indices" in mc:
+        bnodes = np.asarray(mc["boundary_indices"], dtype=int).reshape(-1)
+        coords = np.asarray(points)[bnodes]
+        mask = np.asarray(pred(*(coords[:, i] for i in range(coords.shape[1]))), dtype=bool).reshape(-1)
+        if mask.any():
+            return bnodes[mask]
+    return np.asarray(ti[tag], dtype=int).reshape(-1) if tag in ti else None
+
+
+def _chain_facets(points: Any, ids: Any) -> Optional[np.ndarray]:
+    """Flat-face P1 boundary edges (global node-id pairs): a flat face is a 1-D chain, so sort its
+    nodes along their tangent (max-spread) coordinate and pair consecutive ones. ``None`` for < 2
+    nodes (a 1D face is a single node -> node-to-node tie, no interpolation)."""
+    ids = np.asarray(ids, dtype=int).reshape(-1)
     if ids.size < 2:
         return None
     pts = np.asarray(points)[ids]
-    tdim = int(np.argmax(pts.max(axis=0) - pts.min(axis=0)))  # the face's tangent (transverse) axis
+    tdim = int(np.argmax(pts.max(axis=0) - pts.min(axis=0)))
     chain = ids[np.argsort(pts[:, tdim])]
     return np.column_stack([chain[:-1], chain[1:]])
 
@@ -793,12 +807,29 @@ def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, vec: in
     """Build the prolongation ``P`` for the collected ties on the assembly-mesh ``points``."""
     from .utils.solver.feax_utils import build_periodic_prolongation
 
+    # Multidirectional periodicity needs each face to carry its shared corners (a corner is a slave
+    # in several directions). ``domain.tag`` partitions a corner into one edge, so we recover full
+    # faces from the tag predicate -- which an auto-generated tag (no `domain.tag` call) lacks. Reject
+    # that case loudly rather than silently under-identify the corners and mis-solve.
+    if len(ties) > 1:
+        preds = getattr(domain, "_tag_predicates", {})
+        missing = sorted({t for (m, s, _c, _fk) in ties for t in (m, s) if t not in preds})
+        if missing:
+            raise NotImplementedError(
+                "jno.fem: multidirectional periodicity requires each periodic face to be defined via "
+                f"`domain.tag(name, predicate)` so shared corners are included in every face; tag(s) "
+                f"{missing} are auto-generated (no predicate). Define them with domain.tag(...)."
+            )
+
     points = np.asarray(points)
     pairs = [(master, slave) for (master, slave, _comp, _fk) in ties]
-    facets = {
-        master: f for (master, _s, _c, _fk) in ties if (f := _chain_facets_for_tag(domain, points, master)) is not None
-    }
-    return build_periodic_prolongation(points, pairs, getattr(domain, "tag_indices", {}), vec=vec, facets=facets)
+    faces: dict = {}
+    for master, slave, _comp, _fk in ties:
+        for tag in (master, slave):
+            if tag not in faces and (f := _face_nodes(domain, points, tag)) is not None:
+                faces[tag] = f
+    facets = {m: ff for (m, _s, _c, _fk) in ties if (ff := _chain_facets(points, faces.get(m, ()))) is not None}
+    return build_periodic_prolongation(points, pairs, faces, vec=vec, facets=facets)
 
 
 # ---------------------------------------------------------------------------
@@ -867,13 +898,6 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         if multifield or (vec or 1) != 1:
             raise NotImplementedError(
                 "jno.fem: periodic ties are currently supported only for scalar single-field problems."
-            )
-        if len(periodic_ties) > 1:
-            # A node that is a slave in two directions can interpolate off a master edge whose
-            # endpoint is itself a slave -> corner composition (handled in the next increment).
-            raise NotImplementedError(
-                "jno.fem: multi-direction periodicity (more than one u(A)-u(B) tie, e.g. a doubly-periodic "
-                "cell) is the next increment; M1 supports a single periodic direction."
             )
         if _infer_order(constraints) > 1 and getattr(domain, "dimension", 2) > 1:
             raise NotImplementedError("jno.fem: periodic ties on P2 (higher-order) elements are the next increment.")
