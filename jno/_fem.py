@@ -632,6 +632,32 @@ class FEM:
                 u_red = _solve(reduce_matrix(P, A), reduce_vector(P, b))
                 return prolong(P, u_red)
             return _solve(A, b)
+        if self._mode == "nonlinear" and self._periodic is not None:
+            # Periodic nonlinear: solve Newton in the reduced space -- r_red(u_red) = P^T r(P u_red) = 0,
+            # then prolong u = P u_red (the tie is then satisfied exactly). Wraps the user's solve_fn
+            # (or the operator's default Newton) so it operates on the reduced residual.
+            from .utils.solver.feax_utils import restrict_state
+
+            P = jnp.asarray(self._periodic["P"])
+            kept, pvec = self._periodic["kept_nodes"], self._periodic["vec"]
+            user_fn = solve_fn
+
+            def _reduced(residual_fn, y0):
+                def _base(rf, y):
+                    if user_fn is not None:
+                        return user_fn(rf, y)
+                    import optimistix as optx
+
+                    return optx.root_find(
+                        lambda u, _a: rf(u), optx.Newton(rtol=1e-8, atol=1e-8), y, args=None, max_steps=100
+                    ).value
+
+                ur = _base(
+                    lambda ur: P.T @ jnp.asarray(residual_fn(P @ ur)).reshape(-1), restrict_state(P, y0, kept, vec=pvec)
+                )
+                return P @ ur
+
+            return self._op.solve(solve_fn=_reduced, **kwargs)
         return self._op.solve(solve_fn, **kwargs)
 
     @property
@@ -830,8 +856,19 @@ def _chain_facets(points: Any, ids: Any) -> Optional[np.ndarray]:
     return np.column_stack([chain[:-1], chain[1:]])
 
 
-def _build_periodic_reduction(domain: Any, ties: List[Any], fem_obj: "FEM", vec: int) -> dict:
-    """Build the prolongation ``P`` for the collected ties on the **assembly** mesh."""
+def _assembly_cells(prob: Any) -> Tuple[Optional[np.ndarray], int]:
+    """``(cells, element_order)`` of a feax problem's assembly mesh, or ``(None, 1)`` (e.g. native 1D)."""
+    meshes = getattr(prob, "mesh", None) if prob is not None else None
+    if not meshes:
+        return None, 1
+    am = meshes[0]
+    order = 2 if str(getattr(am, "ele_type", "")).upper() in _P2_ELEMENTS else 1
+    return np.asarray(am.cells, dtype=int), order
+
+
+def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, cells: Any, ele_order: int, vec: int) -> dict:
+    """Build the prolongation ``P`` for the collected ties on the **assembly** mesh (``points`` +
+    ``cells``; ``cells=None`` for the native 1D route falls back to flat-chain facets)."""
     from .utils.solver.feax_utils import build_periodic_prolongation
 
     # Multidirectional periodicity needs each face to carry its shared corners (a corner is a slave
@@ -848,16 +885,8 @@ def _build_periodic_reduction(domain: Any, ties: List[Any], fem_obj: "FEM", vec:
                 f"{missing} are auto-generated (no predicate). Define them with domain.tag(...)."
             )
 
-    points = np.asarray(fem_obj.points)
+    points = np.asarray(points)
     dim = int(getattr(domain, "dimension", points.shape[1]) or points.shape[1])
-
-    # assembly-mesh cells (vertices + higher-order nodes); None on the native 1D route.
-    cells = ele_order = None
-    prob = getattr(fem_obj, "problem", None)
-    meshes = getattr(prob, "mesh", None) if prob is not None else None
-    if meshes:
-        cells = np.asarray(meshes[0].cells, dtype=int)
-        ele_order = 2 if str(getattr(meshes[0], "ele_type", "")).upper() in _P2_ELEMENTS else 1
     bfacets = _boundary_facets(points, cells, dim, ele_order) if cells is not None else None
     bnodes = np.unique(bfacets) if bfacets is not None and bfacets.size else None
 
@@ -931,14 +960,20 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     if vec is None and not multifield:
         vec = _infer_vec(constraints)  # single-field only (coupled fields carry per-field vec)
 
+    # The transient route reduces M/A from the feax context at *assembly* time, so its P must be built
+    # and injected before the time block is assembled (see the single-field transient branch below).
+    # This holder carries that P so `_finalize` reuses it rather than rebuilding.
+    periodic_holder: List[Any] = []
+
     def _finalize(fem_obj: "FEM") -> "FEM":
-        """Attach the periodic reduction (if any). Scoped to scalar steady-linear P1 for now."""
+        """Attach the periodic reduction (if any): linear & nonlinear via ``FEM.solve``, transient via
+        the time route's existing context-driven reduction. Still scoped to scalar single-field real."""
         if not periodic_ties:
             return fem_obj
-        if fem_obj._mode != "linear":
+        if fem_obj._mode in ("complex", "complex_transient"):
             raise NotImplementedError(
-                f"jno.fem: periodic ties (u(A)-u(B)) are currently supported only for steady linear "
-                f"problems; got mode={fem_obj._mode!r}."
+                "jno.fem: periodic ties on complex problems are not supported yet (the real-equivalent "
+                "block would need the reduction applied to both the real and imaginary sub-blocks)."
             )
         if isinstance(fem_obj._op, FemLinearSystem):
             # The reduction is applied on the non-parametric (A, b) branch of FEM.solve; the
@@ -948,7 +983,14 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             raise NotImplementedError(
                 "jno.fem: periodic ties are currently supported only for scalar single-field problems."
             )
-        fem_obj._periodic = _build_periodic_reduction(domain, periodic_ties, fem_obj, vec or 1)
+        # Transient already had its P built + fed to the feax context *before* block assembly (the
+        # route reduces M/A at assembly time); reuse it. Linear & nonlinear build here and reduce in
+        # FEM.solve. (1D has no assembly cells -> flat-chain facets via points only.)
+        if periodic_holder:
+            fem_obj._periodic = periodic_holder[0]
+        else:
+            cells, ele_order = _assembly_cells(getattr(fem_obj, "problem", None))
+            fem_obj._periodic = _build_periodic_reduction(domain, periodic_ties, fem_obj.points, cells, ele_order, vec or 1)
         return fem_obj
 
     volume_terms: List[Any] = []
@@ -1086,6 +1128,20 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     # ---- transient (a weak term carries a temporal derivative) vs steady ----
     weak_bares = volume_terms + [e for exprs in boundary_terms.values() for e in exprs]
     is_transient = any(_contains_temporal_derivative(b) for b in weak_bares)
+
+    # Periodic + transient: the time route reduces M/A from the domain feax context *at assembly time*,
+    # so build P on the (now-built) assembly mesh and feed it in BEFORE the time block is assembled
+    # (mirrors what domain.periodic sets). FEM.solve then prolongs the trajectory via the route.
+    if periodic_ties and is_transient and not multifield and (vec or 1) == 1:
+        _am = domain._feax_context["mesh"]  # the assembly mesh init_fem just built
+        _eo = 2 if str(getattr(_am, "ele_type", "")).upper() in _P2_ELEMENTS else 1
+        periodic_holder.append(
+            _build_periodic_reduction(domain, periodic_ties, np.asarray(_am.points), np.asarray(_am.cells), _eo, vec or 1)
+        )
+        domain._feax_context["P"] = periodic_holder[0]["P"]
+        domain._feax_context["periodic"] = periodic_holder[0]
+        domain.fem_context["prolongation"] = periodic_holder[0]["P"]
+        domain.fem_context["periodic"] = periodic_holder[0]
 
     if is_transient:
         from .utils.solver.time_route import _assemble_feax_time_from_ir

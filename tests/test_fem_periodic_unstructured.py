@@ -478,6 +478,99 @@ def test_triply_periodic_3d_cube_p2():
     assert rel < 0.12, f"3D P2 triply-periodic L2 relative error too large: {rel:.3f}"
 
 
+def test_periodic_nonlinear_reaction_diffusion():
+    """Periodic ties on a **nonlinear** problem: ``-Δu + u + 0.2u³ = f``, periodic in x + Dirichlet y
+    on a non-conforming mesh. FEM.solve reduces the Newton residual (``r_red = Pᵀ r(P·u_red)``) so the
+    tie is enforced exactly. Manufactured ``u = cos(2πx)·sin(πy)``."""
+    from shapely.geometry import box
+
+    import jno
+
+    pi = np.pi
+    dom = jno.domain({"fine": box(0, 0, 0.5, 1), "coarse": box(0.5, 0, 1, 1)}).build_mesh(0.1, sizes={"fine": 0.06})
+    dom.tag("left", lambda x, y: (x < 1e-6) & (y > 1e-6) & (y < 1 - 1e-6))
+    dom.tag("right", lambda x, y: (x > 1 - 1e-6) & (y > 1e-6) & (y < 1 - 1e-6))
+    dom.tag("bottom", lambda x, y: y < 1e-6)
+    dom.tag("top", lambda x, y: y > 1 - 1e-6)
+    u, phi = dom.fem_symbols()
+    xi, yi, _ = dom.variable("interior", split=True)
+    xb, yb, _ = dom.variable("bottom", split=True)
+    xt, yt, _ = dom.variable("top", split=True)
+    xl, yl, _ = dom.variable("left", split=True)
+    xr, yr, _ = dom.variable("right", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    ue = jno.np.cos(2 * jno.np.pi * xi) * jno.np.sin(jno.np.pi * yi)
+    f = (5 * jno.np.pi**2 + 1) * ue + 0.2 * ue**3
+    fem = jno.fem(
+        [
+            ui.x * vi.x + ui.y * vi.y + ui * vi + 0.2 * (u * u * u) * vi - f * vi,  # -Δu + u + 0.2u³ = f
+            u(xb, yb) - 0.0,
+            u(xt, yt) - 0.0,
+            u(xl, yl) - u(xr, yr),  # periodic in x
+        ]
+    )
+    assert fem._mode == "nonlinear" and fem._periodic is not None
+    node = fem.solve()  # nonlinear solve is a traced node -> evaluate via a throwaway crux
+    crux = jno.core([node.mean], domain=jno.domain.from_array({"_": np.zeros((1, 1))}))
+    arr = np.asarray(crux.eval([node])).reshape(-1)
+    pts = np.asarray(fem.points)
+    u_exact = np.cos(2 * pi * pts[:, 0]) * np.sin(pi * pts[:, 1])
+    rel = float(np.linalg.norm(arr - u_exact) / np.linalg.norm(u_exact))
+    assert rel < 0.05, f"nonlinear periodic L2 relative error too large: {rel:.3f}"
+
+
+def test_periodic_transient_heat():
+    """Periodic ties on a **transient** problem: heat ``u_t = Δu``, periodic in x + Dirichlet y. The
+    time route reduces M/A from the tie's prolongation at assembly time; solve the reduced block and
+    prolong. Manufactured decay ``u = exp(-5π²t)·cos(2πx)·sin(πy)``."""
+    import jax.numpy as jnp
+    from shapely.geometry import box
+
+    import jno
+
+    pi = np.pi
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.1, time=(0.0, 0.01, 2))
+    d.tag("left", lambda x, y: (x < 1e-6) & (y > 1e-6) & (y < 1 - 1e-6))
+    d.tag("right", lambda x, y: (x > 1 - 1e-6) & (y > 1e-6) & (y < 1 - 1e-6))
+    d.tag("bottom", lambda x, y: y < 1e-6)
+    d.tag("top", lambda x, y: y > 1 - 1e-6)
+    u, v = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    ic = jno.np.cos(2 * jno.np.pi * ci[0]) * jno.np.sin(jno.np.pi * ci[1])
+    fem = jno.fem(
+        [
+            ui.t * vi + ui.x * vi.x + ui.y * vi.y,  # u_t = Δu
+            u(xb, yb) - 0.0,
+            u(xt, yt) - 0.0,
+            u(xl, yl) - u(xr, yr),  # periodic in x
+            u(ci[0], ci[1]) - ic,  # initial condition
+        ]
+    )
+    assert fem._mode == "transient" and fem._periodic is not None
+    assert fem._periodic["n_red"] < fem._periodic["n_full"], "the time block must be reduced"
+    # the block is assembled reduced (M, A, state0); step it (backward Euler) then prolong to full
+    P = jnp.asarray(fem._periodic["P"])
+    pblock = fem.operator.as_feax_pipeline(scheme="backward_euler", args=None)
+    pipe = pblock.pipeline
+    pipe.build(pblock.mesh)
+    state = jnp.asarray(pipe.initial_state())
+    dt, t = float(fem.t1) / 200, 0.0
+    for _ in range(200):
+        state = pipe.step(state, t, dt)
+        t += dt
+    full = np.asarray(state @ P.T).reshape(-1)
+    pts = np.asarray(fem.points)
+    u_exact = np.exp(-5 * pi**2 * float(fem.t1)) * np.cos(2 * pi * pts[:, 0]) * np.sin(pi * pts[:, 1])
+    rel = float(np.linalg.norm(full - u_exact) / np.linalg.norm(u_exact))
+    assert rel < 0.05, f"transient periodic heat L2 relative error too large: {rel:.3f}"
+
+
 def test_multidirection_requires_tagged_faces():
     """Multidirectional periodicity on **auto-generated** tags (no domain.tag predicate) cannot recover
     the shared corners, so it is rejected with a clear error rather than silently mis-solving."""
