@@ -91,6 +91,48 @@ def test_patch_test_p2_reproduces_quadratic():
     assert np.allclose(u_full, f(pts[:, 1]), atol=1e-10)
 
 
+def test_patch_test_3d_triangle_reproduces_linear():
+    """3D triangular facets: a slave face (z=0) ties to a master face (z=1) by point-in-triangle
+    barycentric interpolation. The prolongation reproduces a constant and a linear-in-(x,y) field
+    exactly (partition of unity + barycentric completeness)."""
+    # master face z=1: unit square as two triangles over its 4 corners
+    master = np.array([[0, 0, 1.0], [1, 0, 1.0], [1, 1, 1.0], [0, 1, 1.0]])
+    tris = np.array([[0, 1, 2], [0, 2, 3]])  # local -> these are master node ids 0..3
+    # slave face z=0: interior points (fall inside the master triangles)
+    slave = np.array([[0.3, 0.2, 0.0], [0.7, 0.6, 0.0], [0.5, 0.5, 0.0], [0.2, 0.8, 0.0], [0.9, 0.1, 0.0]])
+    pts = np.vstack([master, slave])
+    tags = {"top": np.arange(4), "bot": np.arange(4, 4 + len(slave))}
+    res = build_periodic_prolongation(pts, [("top", "bot")], tags, facets={"top": tris})
+    P = np.asarray(res["P_node"])
+    kept = np.asarray(res["kept_nodes"])
+    assert np.allclose(P.sum(axis=1), 1.0)  # partition of unity
+    # reproduce constant and a linear field a·x + b·y + c exactly at every slave node
+    for a, b, c in [(0.0, 0.0, 1.0), (2.0, -1.5, 0.3)]:
+        field = a * pts[:, 0] + b * pts[:, 1] + c
+        assert np.allclose(P @ field[kept], field, atol=1e-10)
+
+
+def test_patch_test_3d_triangle_p2_reproduces_quadratic():
+    """3D P2 triangular facets (6-node: 3 vertices + 3 edge midpoints) reproduce a quadratic-in-(x,y)
+    field exactly via the quadratic-triangle shape functions."""
+    # master face z=1: 4 corners + 5 edge midpoints, two 6-node triangles
+    c = np.array([[0, 0, 1.0], [1, 0, 1.0], [1, 1, 1.0], [0, 1, 1.0]])  # ids 0..3
+    mids = np.array(
+        [[0.5, 0, 1.0], [1, 0.5, 1.0], [0.5, 0.5, 1.0], [0.5, 1, 1.0], [0, 0.5, 1.0]]
+    )  # m01,m12,m20,m23,m30 -> ids 4..8
+    slave = np.array([[0.3, 0.2, 0.0], [0.6, 0.5, 0.0], [0.5, 0.5, 0.0], [0.2, 0.7, 0.0]])  # ids 9..12
+    pts = np.vstack([c, mids, slave])
+    tris = np.array([[0, 1, 2, 4, 5, 6], [0, 2, 3, 6, 7, 8]])  # (a,b,c, mab,mbc,mca)
+    tags = {"top": np.arange(9), "bot": np.arange(9, 13)}
+    res = build_periodic_prolongation(pts, [("top", "bot")], tags, facets={"top": tris})
+    P = np.asarray(res["P_node"])
+    kept = np.asarray(res["kept_nodes"])
+    assert np.allclose(P.sum(axis=1), 1.0)
+    q = lambda x, y: 0.5 * x**2 - 0.3 * y**2 + 0.7 * x * y + x - 0.2 * y + 0.1  # noqa: E731
+    field = q(pts[:, 0], pts[:, 1])
+    assert np.allclose(P @ field[kept], field, atol=1e-9)
+
+
 def test_conforming_stays_exact_0_1_permutation():
     """Equal node layout on both faces -> exact node-to-node 0/1 P (no interpolation, no facets)."""
     pts, tags, _ = _two_faces(5, 5, order=1)
@@ -320,6 +362,120 @@ def test_periodic_poisson_2d_p2_nonconforming():
     u_exact = (np.cos(2 * pi * pts[:, 0]) + 0.5 * np.sin(2 * pi * pts[:, 0])) * np.sin(pi * pts[:, 1])
     rel = float(np.linalg.norm(uh - u_exact) / np.linalg.norm(u_exact))
     assert rel < 0.05, f"P2 periodic Poisson L2 relative error too large: {rel:.3f}"
+
+
+def test_triply_periodic_3d_cube():
+    """3D: a **triply-periodic** unit cube (`-Δu + u = f`, periodic in x, y AND z) -- the full
+    corner→edge→face hierarchy. Exercises the transitive `_expand` composition (a master triangle's
+    edge/corner node is itself a slave on adjacent faces). Manufactured `u = cos2πx·cos2πy·cos2πz`;
+    assert the solve converges and the 8 cube corners are all identified."""
+    import jno
+
+    pi = np.pi
+    e = 1e-6
+    dom = jno.domain(constructor=jno.domain.cube(mesh_size=0.13))
+    faces = {
+        "xlo": lambda x, y, z: x < e,
+        "xhi": lambda x, y, z: x > 1 - e,
+        "ylo": lambda x, y, z: y < e,
+        "yhi": lambda x, y, z: y > 1 - e,
+        "zlo": lambda x, y, z: z < e,
+        "zhi": lambda x, y, z: z > 1 - e,
+    }
+    for nm, p in faces.items():
+        dom.tag(nm, p)
+    u, phi = dom.fem_symbols()
+    xi, yi, zi, _ = dom.variable("interior", split=True)
+    g = lambda t: dom.variable(t, split=True)  # noqa: E731
+    xlo, ylo, zlo, _ = g("xlo")
+    xhi, yhi, zhi, _ = g("xhi")
+    xa, ya, za, _ = g("ylo")
+    xb, yb, zb, _ = g("yhi")
+    xc, yc, zc, _ = g("zlo")
+    xd, yd, zd, _ = g("zhi")
+    ui, vi = u.bind(x=xi, y=yi, z=zi), phi.bind(x=xi, y=yi, z=zi)
+    f = (
+        (12 * jno.np.pi**2 + 1)
+        * jno.np.cos(2 * jno.np.pi * xi)
+        * jno.np.cos(2 * jno.np.pi * yi)
+        * jno.np.cos(2 * jno.np.pi * zi)
+    )
+    fem = jno.fem(
+        [
+            ui.x * vi.x + ui.y * vi.y + ui.z * vi.z + ui * vi - f * vi,
+            u(xlo, ylo, zlo) - u(xhi, yhi, zhi),  # periodic in x
+            u(xa, ya, za) - u(xb, yb, zb),  # periodic in y
+            u(xc, yc, zc) - u(xd, yd, zd),  # periodic in z
+        ]
+    )
+    assert fem._periodic is not None and fem._periodic["n_red"] < fem._periodic["n_full"]
+    uh = np.asarray(fem.solve())
+    pts = np.asarray(fem.points)
+    # the cube triangulation is non-conforming across opposite faces -> the 3D triangle interpolation
+    # AND the _expand composition (shared edge/corner nodes) are genuinely exercised end-to-end
+    xlo = pts[pts[:, 0] < 1e-6][:, 1:]
+    xhi = pts[pts[:, 0] > 1 - 1e-6][:, 1:]
+    xlo, xhi = xlo[np.lexsort(xlo.T)], xhi[np.lexsort(xhi.T)]
+    assert not (xlo.shape == xhi.shape and np.allclose(xlo, xhi)), "expected non-conforming cube faces"
+    u_exact = np.cos(2 * pi * pts[:, 0]) * np.cos(2 * pi * pts[:, 1]) * np.cos(2 * pi * pts[:, 2])
+    rel = float(np.linalg.norm(uh - u_exact) / np.linalg.norm(u_exact))
+    assert rel < 0.12, f"3D triply-periodic L2 relative error too large: {rel:.3f}"
+    cv = [
+        uh[int(np.argmin(np.sum((pts - np.array([cx, cy, cz])) ** 2, axis=1)))]
+        for cx in (0.0, 1.0)
+        for cy in (0.0, 1.0)
+        for cz in (0.0, 1.0)
+    ]
+    assert np.allclose(cv, cv[0], atol=1e-9), f"the 8 cube corners must be identified: {cv}"
+
+
+def test_triply_periodic_3d_cube_p2():
+    """3D triply-periodic cube with **P2** (TET10) elements -- face nodes carry edge midpoints tied
+    through quadratic-triangle interpolation. P2 is far more accurate than P1 even on a coarse mesh."""
+    import jno
+
+    pi = np.pi
+    e = 1e-6
+    dom = jno.domain(constructor=jno.domain.cube(mesh_size=0.28))
+    for nm, p in {
+        "xlo": lambda x, y, z: x < e,
+        "xhi": lambda x, y, z: x > 1 - e,
+        "ylo": lambda x, y, z: y < e,
+        "yhi": lambda x, y, z: y > 1 - e,
+        "zlo": lambda x, y, z: z < e,
+        "zhi": lambda x, y, z: z > 1 - e,
+    }.items():
+        dom.tag(nm, p)
+    u, phi = dom.fem_symbols(order=2)
+    xi, yi, zi, _ = dom.variable("interior", split=True)
+    g = lambda t: dom.variable(t, split=True)  # noqa: E731
+    xlo, ylo, zlo, _ = g("xlo")
+    xhi, yhi, zhi, _ = g("xhi")
+    xa, ya, za, _ = g("ylo")
+    xb, yb, zb, _ = g("yhi")
+    xc, yc, zc, _ = g("zlo")
+    xd, yd, zd, _ = g("zhi")
+    ui, vi = u.bind(x=xi, y=yi, z=zi), phi.bind(x=xi, y=yi, z=zi)
+    f = (
+        (12 * jno.np.pi**2 + 1)
+        * jno.np.cos(2 * jno.np.pi * xi)
+        * jno.np.cos(2 * jno.np.pi * yi)
+        * jno.np.cos(2 * jno.np.pi * zi)
+    )
+    fem = jno.fem(
+        [
+            ui.x * vi.x + ui.y * vi.y + ui.z * vi.z + ui * vi - f * vi,
+            u(xlo, ylo, zlo) - u(xhi, yhi, zhi),
+            u(xa, ya, za) - u(xb, yb, zb),
+            u(xc, yc, zc) - u(xd, yd, zd),
+        ]
+    )
+    assert fem._periodic is not None and fem._periodic["n_red"] < fem._periodic["n_full"]
+    uh = np.asarray(fem.solve())
+    pts = np.asarray(fem.points)
+    u_exact = np.cos(2 * pi * pts[:, 0]) * np.cos(2 * pi * pts[:, 1]) * np.cos(2 * pi * pts[:, 2])
+    rel = float(np.linalg.norm(uh - u_exact) / np.linalg.norm(u_exact))
+    assert rel < 0.12, f"3D P2 triply-periodic L2 relative error too large: {rel:.3f}"
 
 
 def test_multidirection_requires_tagged_faces():

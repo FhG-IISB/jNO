@@ -1927,10 +1927,11 @@ def _periodic_facet_weights(
     master boundary facets (node-to-segment / mortar-lite identification).
 
     ``facet_node_ids`` is ``(n_facets, k)`` of global node ids. **2D** (transverse
-    1-D): facets are edges; columns 0,1 are the edge vertices and an optional
-    column 2 is the midside node (``k == 3`` ⇒ P2). Returns ``[(node_id, weight),
-    ...]`` whose weights sum to 1 (partition of unity ⇒ constants reproduced;
-    linear/quadratic-along-the-edge reproduced exactly). 3D is milestone M2.
+    1-D): facets are edges -- columns 0,1 are the vertices, optional column 2 the
+    midside node (``k == 3`` ⇒ P2). **3D** (transverse 2-D): facets are triangles --
+    columns 0,1,2 the vertices, optional columns 3,4,5 the edge midpoints (``k == 6``
+    ⇒ P2). Returns ``[(node_id, weight), ...]`` whose weights sum to 1 (partition of
+    unity ⇒ constants reproduced; linear/quadratic-on-the-facet reproduced exactly).
     """
     tq = np.atleast_1d(np.asarray(t_query, dtype=float))
     facet_node_ids = np.asarray(facet_node_ids, dtype=int)
@@ -1959,6 +1960,41 @@ def _periodic_facet_weights(
             return [(a, 1.0 - xi), (b, xi)]
         m = int(facet_node_ids[idx, 2])  # P2 edge (a, b, mid): quadratic Lagrange at xi = 0, 1, 0.5
         return [(a, 2.0 * (xi - 0.5) * (xi - 1.0)), (b, 2.0 * xi * (xi - 0.5)), (m, -4.0 * xi * (xi - 1.0))]
+
+    if tq.shape[0] == 2:  # 3D: locate the master triangle containing the slave, barycentric weights
+        tr = transverse
+        pa = pts[facet_node_ids[:, 0]][:, tr]
+        pb = pts[facet_node_ids[:, 1]][:, tr]
+        pc = pts[facet_node_ids[:, 2]][:, tr]
+        v0, v1, v2 = pb - pa, pc - pa, tq[None, :] - pa
+        d00 = (v0 * v0).sum(1)
+        d01 = (v0 * v1).sum(1)
+        d11 = (v1 * v1).sum(1)
+        d20 = (v2 * v0).sum(1)
+        d21 = (v2 * v1).sum(1)
+        denom = d00 * d11 - d01 * d01
+        denom = np.where(np.abs(denom) < 1e-300, 1e-300, denom)
+        l1 = (d11 * d20 - d01 * d21) / denom  # vertex b
+        l2 = (d00 * d21 - d01 * d20) / denom  # vertex c
+        l0 = 1.0 - l1 - l2  # vertex a
+        # the containing triangle (all barycentrics >= 0); else the least-violating one (shared edge / rounding)
+        viol = np.maximum(0.0, -l0) + np.maximum(0.0, -l1) + np.maximum(0.0, -l2)
+        idx = int(np.argmin(viol))
+        a, b, c = (int(facet_node_ids[idx, j]) for j in range(3))
+        L0, L1, L2 = float(l0[idx]), float(l1[idx]), float(l2[idx])
+        if k < 6:  # P1 triangle: barycentric
+            return [(a, L0), (b, L1), (c, L2)]
+        # P2 triangle (a, b, c, mab, mbc, mca): quadratic shape functions in barycentric coords
+        mab, mbc, mca = (int(facet_node_ids[idx, j]) for j in range(3, 6))
+        return [
+            (a, L0 * (2.0 * L0 - 1.0)),
+            (b, L1 * (2.0 * L1 - 1.0)),
+            (c, L2 * (2.0 * L2 - 1.0)),
+            (mab, 4.0 * L0 * L1),
+            (mbc, 4.0 * L1 * L2),
+            (mca, 4.0 * L2 * L0),
+        ]
+    return None
 
     raise NotImplementedError("3D periodic interpolation (triangle facets) is milestone M2.")
 
