@@ -614,6 +614,14 @@ class FEM:
             return _solve_complex_block(self._op, solve_fn)
         if self._mode == "complex_transient":
             return _solve_complex_transient(self._op, save_ts=kwargs.get("save_ts"))
+        if self._mode == "linear" and not isinstance(self._op, FemLinearSystem):
+            # Non-parametric steady linear: solve the assembled (A, b) directly. ``solve_fn`` is
+            # your ``(A, b) -> u`` (default dense ``jnp.linalg.solve``); A is densified from feax's
+            # BCOO. (The runtime-parametric case is a FemLinearSystem and falls through below.)
+            A, b = self._op
+            A = jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)
+            _solve = solve_fn or (lambda A_, b_: jnp.linalg.solve(A_, b_))
+            return _solve(A, jnp.asarray(b).reshape(-1))
         return self._op.solve(solve_fn, **kwargs)
 
     @property
