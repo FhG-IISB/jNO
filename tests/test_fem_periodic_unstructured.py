@@ -268,6 +268,60 @@ def test_doubly_periodic_reaction_diffusion():
     assert np.allclose(cvals, cvals[0], atol=1e-9), f"the four periodic corners must be identified: {cvals}"
 
 
+def test_boundary_facets_extractor_p1_p2():
+    """The assembly-mesh facet extractor returns 2-node edges for P1 and 3-node (edge+midpoint) for
+    P2, with the midpoint at the average of the two endpoint vertices."""
+    from shapely.geometry import box
+
+    import jno
+    from jno._fem import _boundary_facets
+
+    for order, k in [(1, 2), (2, 3)]:
+        dom = jno.domain(box(0, 0, 1, 1)).build_mesh(0.4)
+        u, phi = dom.fem_symbols(order=order)
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+        fem = jno.fem([ui.x * vi.x + ui.y * vi.y - vi, u(xb, yb) - 0.0])
+        m = fem.problem.mesh[0]
+        pts = np.asarray(m.points)
+        bf = _boundary_facets(pts, np.asarray(m.cells), 2, order)
+        assert bf.shape[1] == k, f"order={order} should give {k}-node facets, got {bf.shape}"
+        if order == 2:
+            assert all(np.allclose(pts[r[2]], 0.5 * (pts[r[0]] + pts[r[1]])) for r in bf), "col2 must be the edge midpoint"
+
+
+def test_periodic_poisson_2d_p2_nonconforming():
+    """Same single-direction periodic Poisson as the P1 case, but with **P2** elements: the periodic
+    face now carries midpoint nodes, tied through quadratic edge interpolation."""
+    from shapely.geometry import box
+
+    import jno
+
+    pi = np.pi
+    dom = jno.domain({"fine": box(0, 0, 0.5, 1), "coarse": box(0.5, 0, 1, 1)}).build_mesh(0.12, sizes={"fine": 0.07})
+    dom.tag("left", lambda x, y: (x < 1e-6) & (y > 1e-6) & (y < 1 - 1e-6))
+    dom.tag("right", lambda x, y: (x > 1 - 1e-6) & (y > 1e-6) & (y < 1 - 1e-6))
+    dom.tag("bottom", lambda x, y: y < 1e-6)
+    dom.tag("top", lambda x, y: y > 1 - 1e-6)
+    u, phi = dom.fem_symbols(order=2)
+    xi, yi, _ = dom.variable("interior", split=True)
+    xb, yb, _ = dom.variable("bottom", split=True)
+    xt, yt, _ = dom.variable("top", split=True)
+    xl, yl, _ = dom.variable("left", split=True)
+    xr, yr, _ = dom.variable("right", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    hh = jno.np.cos(2 * jno.np.pi * xi) + 0.5 * jno.np.sin(2 * jno.np.pi * xi)
+    f = 5 * jno.np.pi**2 * hh * jno.np.sin(jno.np.pi * yi)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0, u(xt, yt) - 0.0, u(xl, yl) - u(xr, yr)])
+    assert fem._periodic is not None and fem._periodic["n_red"] < fem._periodic["n_full"]
+    uh = np.asarray(fem.solve())
+    pts = np.asarray(fem.points)
+    u_exact = (np.cos(2 * pi * pts[:, 0]) + 0.5 * np.sin(2 * pi * pts[:, 0])) * np.sin(pi * pts[:, 1])
+    rel = float(np.linalg.norm(uh - u_exact) / np.linalg.norm(u_exact))
+    assert rel < 0.05, f"P2 periodic Poisson L2 relative error too large: {rel:.3f}"
+
+
 def test_multidirection_requires_tagged_faces():
     """Multidirectional periodicity on **auto-generated** tags (no domain.tag predicate) cannot recover
     the shared corners, so it is rejected with a clear error rather than silently mis-solving."""

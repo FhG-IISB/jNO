@@ -769,31 +769,58 @@ def _periodic_tie_spec(constraint: Any, domain: Any) -> Optional[Tuple[str, str,
     return (master_tag, slave_tag, None, _field_key_of(constraint))
 
 
-def _face_nodes(domain: Any, points: Any, tag: str) -> Optional[np.ndarray]:
-    """Global node ids on a periodic face, taken from the tag's **predicate** (the user's intent).
+def _boundary_facets(points: Any, cells: Any, dim: int, order: int) -> Optional[np.ndarray]:
+    """Boundary facets of the **assembly** mesh as global node-id rows, with higher-order nodes.
 
-    ``domain.tag`` partitions every boundary node into a *single* tag, so a corner shared by two
-    edges lands in only one of them. Multi-direction periodicity needs each corner in **both** its
-    faces (a corner is a slave in several directions), so re-evaluate the tag predicate over the
-    boundary nodes -- a full-edge predicate (``x < eps``) then includes the corners in every face it
-    satisfies, while a corner-excluding predicate (single-direction + Dirichlet corners) still omits
-    them. Tags without a stored predicate fall back to the (exclusive) ``tag_indices``."""
+    Vertex sub-connectivity is the first ``dim+1`` columns of ``cells`` (meshio orders vertices
+    first); a facet is a cell edge (2D) / triangular face (3D) of those vertices that appears in
+    exactly **one** cell. For ``order == 2`` each facet's edge midpoints are attached by coordinate
+    (a P2 midpoint sits at the average of its two endpoint vertices) -- convention-light, with no
+    dependence on feax's higher-order node ordering. Returns ``(n_facets, k)`` with
+    ``k = 2/3`` (2D P1/P2) or ``3/6`` (3D P1/P2)."""
+    points = np.asarray(points, dtype=float)
+    cells = np.asarray(cells, dtype=int)
+    if cells.ndim != 2 or cells.shape[0] == 0:
+        return None
+    verts = cells[:, : dim + 1]
+    combos = [(0, 1), (1, 2), (2, 0)] if dim == 2 else [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)]
+    allf = np.concatenate([verts[:, list(c)] for c in combos], axis=0)
+    _uniq, idx, counts = np.unique(np.sort(allf, axis=1), axis=0, return_index=True, return_counts=True)
+    bverts = allf[idx[counts == 1]]  # boundary facets in original vertex orientation
+    if order < 2:
+        return bverts
+    span = float(np.linalg.norm(points.max(0) - points.min(0))) or 1.0
+    scale = span * 1.0e-7
+    keymap = {tuple(np.round(p / scale).astype(np.int64)): i for i, p in enumerate(points)}
+
+    def _mid(a: int, b: int) -> int:
+        return keymap[tuple(np.round(((points[a] + points[b]) / 2.0) / scale).astype(np.int64))]
+
+    edges_of = (lambda f: [(f[0], f[1])]) if dim == 2 else (lambda f: [(f[0], f[1]), (f[1], f[2]), (f[2], f[0])])
+    return np.asarray([list(f) + [_mid(a, b) for a, b in edges_of(f)] for f in bverts], dtype=int)
+
+
+def _face_nodes(domain: Any, points: Any, bnodes: Optional[np.ndarray], tag: str) -> Optional[np.ndarray]:
+    """Global node ids on a periodic face, taken from the tag's **predicate** (the user's intent),
+    evaluated over the **assembly** boundary nodes ``bnodes`` (so P2 midpoints and 3D face nodes are
+    included). ``domain.tag`` partitions each boundary node into a single tag, so a corner shared by
+    two faces lands in only one -- re-evaluating the predicate recovers it in every face it satisfies
+    (multi-direction needs that), while a corner-excluding predicate still omits the Dirichlet
+    corners. Tags without a stored predicate fall back to the (exclusive, P1-mesh) ``tag_indices``."""
     ti = getattr(domain, "tag_indices", {})
     pred = getattr(domain, "_tag_predicates", {}).get(tag)
-    mc = getattr(domain, "mesh_connectivity", None)
-    if pred is not None and mc and "boundary_indices" in mc:
-        bnodes = np.asarray(mc["boundary_indices"], dtype=int).reshape(-1)
+    if pred is not None and bnodes is not None and len(bnodes):
         coords = np.asarray(points)[bnodes]
         mask = np.asarray(pred(*(coords[:, i] for i in range(coords.shape[1]))), dtype=bool).reshape(-1)
         if mask.any():
-            return bnodes[mask]
+            return np.asarray(bnodes)[mask]
     return np.asarray(ti[tag], dtype=int).reshape(-1) if tag in ti else None
 
 
 def _chain_facets(points: Any, ids: Any) -> Optional[np.ndarray]:
-    """Flat-face P1 boundary edges (global node-id pairs): a flat face is a 1-D chain, so sort its
-    nodes along their tangent (max-spread) coordinate and pair consecutive ones. ``None`` for < 2
-    nodes (a 1D face is a single node -> node-to-node tie, no interpolation)."""
+    """Flat-face P1 boundary edges (global node-id pairs) as a fallback when assembly cells are
+    unavailable (e.g. the native 1D route): sort the face nodes along their tangent and pair
+    consecutive ones. ``None`` for < 2 nodes (a 1D face is a single node -> node-to-node tie)."""
     ids = np.asarray(ids, dtype=int).reshape(-1)
     if ids.size < 2:
         return None
@@ -803,8 +830,8 @@ def _chain_facets(points: Any, ids: Any) -> Optional[np.ndarray]:
     return np.column_stack([chain[:-1], chain[1:]])
 
 
-def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, vec: int) -> dict:
-    """Build the prolongation ``P`` for the collected ties on the assembly-mesh ``points``."""
+def _build_periodic_reduction(domain: Any, ties: List[Any], fem_obj: "FEM", vec: int) -> dict:
+    """Build the prolongation ``P`` for the collected ties on the **assembly** mesh."""
     from .utils.solver.feax_utils import build_periodic_prolongation
 
     # Multidirectional periodicity needs each face to carry its shared corners (a corner is a slave
@@ -821,14 +848,36 @@ def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, vec: in
                 f"{missing} are auto-generated (no predicate). Define them with domain.tag(...)."
             )
 
-    points = np.asarray(points)
+    points = np.asarray(fem_obj.points)
+    dim = int(getattr(domain, "dimension", points.shape[1]) or points.shape[1])
+
+    # assembly-mesh cells (vertices + higher-order nodes); None on the native 1D route.
+    cells = ele_order = None
+    prob = getattr(fem_obj, "problem", None)
+    meshes = getattr(prob, "mesh", None) if prob is not None else None
+    if meshes:
+        cells = np.asarray(meshes[0].cells, dtype=int)
+        ele_order = 2 if str(getattr(meshes[0], "ele_type", "")).upper() in _P2_ELEMENTS else 1
+    bfacets = _boundary_facets(points, cells, dim, ele_order) if cells is not None else None
+    bnodes = np.unique(bfacets) if bfacets is not None and bfacets.size else None
+
     pairs = [(master, slave) for (master, slave, _comp, _fk) in ties]
     faces: dict = {}
     for master, slave, _comp, _fk in ties:
         for tag in (master, slave):
-            if tag not in faces and (f := _face_nodes(domain, points, tag)) is not None:
+            if tag not in faces and (f := _face_nodes(domain, points, bnodes, tag)) is not None:
                 faces[tag] = f
-    facets = {m: ff for (m, _s, _c, _fk) in ties if (ff := _chain_facets(points, faces.get(m, ()))) is not None}
+
+    facets: dict = {}
+    if bfacets is not None and bfacets.size:
+        for master, _slave, _comp, _fk in ties:
+            fn = set(np.asarray(faces.get(master, np.empty(0, int))).tolist())
+            keep = np.array([set(row.tolist()).issubset(fn) for row in bfacets], dtype=bool)
+            if keep.any():
+                facets[master] = bfacets[keep]
+    else:  # native 1D / no assembly cells -> flat-chain fallback
+        facets = {m: ff for (m, _s, _c, _fk) in ties if (ff := _chain_facets(points, faces.get(m, ()))) is not None}
+
     return build_periodic_prolongation(points, pairs, faces, vec=vec, facets=facets)
 
 
@@ -899,9 +948,7 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             raise NotImplementedError(
                 "jno.fem: periodic ties are currently supported only for scalar single-field problems."
             )
-        if _infer_order(constraints) > 1 and getattr(domain, "dimension", 2) > 1:
-            raise NotImplementedError("jno.fem: periodic ties on P2 (higher-order) elements are the next increment.")
-        fem_obj._periodic = _build_periodic_reduction(domain, periodic_ties, fem_obj.points, vec or 1)
+        fem_obj._periodic = _build_periodic_reduction(domain, periodic_ties, fem_obj, vec or 1)
         return fem_obj
 
     volume_terms: List[Any] = []
