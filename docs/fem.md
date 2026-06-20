@@ -155,9 +155,9 @@ crux = jno.core([(fem.solve() - u_traj).mse], domain=obs).solve(200)   # recover
 ```
 
 `fem.solve(my_integrator, save_ts=...)` swaps the integrator: `my_integrator(block, args,
-save_ts) -> trajectory`. The block exposes `block.as_diffrax(args=...)` (a diffrax ODE term)
-and `block.as_feax_pipeline(args=...)` (a feax backward-Euler pipeline) as ready-made options;
-the implicit default is preferred for Dirichlet problems.
+save_ts) -> trajectory`. Build your own (e.g. diffrax) from the block's `block.M` / `block.A` /
+`block.state0` — form `u_dot = M⁻¹(c − A u)`; the implicit backward-Euler default is preferred for
+Dirichlet problems.
 
 ---
 

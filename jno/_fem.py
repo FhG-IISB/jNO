@@ -649,8 +649,8 @@ class FEM:
         * transient: ``(block, args, save_ts) -> ys`` returning a ``(len(save_ts),
           n_dofs)`` trajectory (default a backward-Euler ``lax.scan`` over the block's
           assembled ``dt``; ``save_ts=`` overrides the sample times, default the domain's
-          time grid). diffrax (``block.as_diffrax``) and a feax pipeline
-          (``block.as_feax_pipeline``) are documented overrides.
+          time grid). For a custom integrator (e.g. diffrax) build it from the block's
+          ``M`` / ``A`` / ``state0`` and pass it as ``solve_fn``.
 
         Enable x64 — the feax assembly is float64.
 
