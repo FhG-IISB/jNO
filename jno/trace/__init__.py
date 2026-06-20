@@ -1341,7 +1341,7 @@ class Model(Placeholder):
         self._param_mask = None  # current mask scope for grouped optimizer/lr calls
         self._trainable_param_mask = None  # persistent trainability mask used by mask(...).freeze()
         self._lora_param_mask = None  # param mask passed to mask().lora() → restricts which modules get LoRA
-        self._mask_scope_pending: bool = False  # transient flag for mask(...).optimizer()/lr() group scoping
+        self._mask_scope_pending: bool = False  # transient flag for mask(...).optimizer()/scale() group scoping
         self._param_groups: list = []  # [{target, mask, opt_fn, lr}] for per-group optimizer config
         self._weight_tree = None  # pretrained weights as a pytree (alternative to weight_path file)
         self._initialize_mask = None  # optional bool pytree consumed by initialize() for partial preload
@@ -1472,7 +1472,7 @@ class Model(Placeholder):
                 n_true = None
             lines.append(
                 f"  [{i}] target={target!r}, opt={getattr(opt_fn, '__name__', str(opt_fn))}, "
-                f"lr={lr}, matched_leaves={n_true}"
+                f"scale={lr}, matched_leaves={n_true}"
             )
 
         # Param summary
@@ -1615,7 +1615,7 @@ class Model(Placeholder):
                 lambda m: (m.layers[0].weight, m.layers[0].bias),
                 all_false, (True, True),
             )
-            model.mask(param_mask).optimizer(optax.adam, lr=1e-3)
+            model.mask(param_mask).optimizer(optax.adam(1e-3))
             J = crux.eval([u.grad(model.mask(param_mask))])[0]  # (N, P_selected)
         """
         self._param_mask = param_mask
@@ -1700,7 +1700,7 @@ class Model(Placeholder):
 
         return self
 
-    def optimizer(self, opt_fn: Any, *, lr: Any = None):
+    def optimizer(self, opt_fn: Any):
         """Attach an optimizer to this model.
 
         When preceded by ``mask(param_mask)``, the optimizer applies only
@@ -1711,14 +1711,13 @@ class Model(Placeholder):
             NN.mask(mask_encoder).optimizer(optax.sgd)   # encoder group
             NN.optimizer(optax.adam)                   # global fallback
 
-        ``mask(...)`` is one-shot: it applies only to the immediate next
-        mutator call. If you want a masked LR as well, call ``mask(...)``
-        again before ``lr(...)``::
+        Bake the learning rate into the optax optimizer (e.g. ``optax.adam(1e-3)``);
+        use :meth:`scale` to multiply it -- e.g. with a ``dlrs(...)`` schedule for
+        loss-adaptive learning-rate scaling. ``mask(...)`` is one-shot, so to scale a
+        masked group call ``mask(...)`` again before ``scale(...)``::
 
-            NN.mask(mask_decoder).optimizer(optax.adam)
-            NN.mask(mask_decoder).lr(my_schedule)
-
-        The ``lr`` keyword is a convenience shorthand for ``.lr(lr)``.
+            NN.mask(mask_decoder).optimizer(optax.adam(1e-3))
+            NN.mask(mask_decoder).scale(my_schedule)
 
         A bare/global call (not preceded by ``mask(...)``) replaces any
         previously configured parameter groups.
@@ -1726,8 +1725,6 @@ class Model(Placeholder):
         Args:
             opt_fn: An optax optimizer factory, e.g. ``optax.adam``,
                     or an already-constructed transform.
-            lr: Optional LR schedule/value shorthand (equivalent to chaining
-                ``.lr(lr)``).
         """
         if self._mask_scope_pending and self._param_mask is not None:
             # One-shot masked scope: consume mask on this call.
@@ -1735,18 +1732,12 @@ class Model(Placeholder):
             if self._opt_fn is None:
                 self._opt_fn = opt_fn
             group["opt_fn"] = opt_fn
-            if lr is not None:
-                if self._lr is None:
-                    self._lr = lr
-                group["lr"] = lr
             self._mask_scope_pending = False
         else:
             self._opt_fn = opt_fn
             # Global optimizer replacement should discard stale group overrides.
             self._param_groups = []
             self._mask_scope_pending = False
-            if lr is not None:
-                self._lr = lr
 
         return self
 
@@ -2033,27 +2024,33 @@ class Model(Placeholder):
         self._trainable_param_mask = None
         return self
 
-    def lr(self, lr: LearningRateSchedule | float | None):
-        """Attach an LR schedule to this model.
+    def scale(self, scale: LearningRateSchedule | float | None):
+        """Scale this model's learning rate.
 
-        When preceded by ``mask(param_mask)``, the schedule applies only to
-        that parameter group. ``mask(...)`` is one-shot, so call it
-        immediately before ``lr(...)``::
+        ``scale`` multiplies the rate the optimizer already carries (applied as
+        ``optax.scale(...)``). Pass a loss-adaptive ``dlrs(...)`` schedule here to
+        change the scale **dynamically during training**, a static float for a fixed
+        factor, or any ``LearningRateSchedule``. For a bare optimizer factory (e.g.
+        ``optax.adam`` with no baked-in rate) the scale *is* the learning rate.
 
-            NN.mask(mask_decoder).lr(my_schedule)
+        When preceded by ``mask(param_mask)``, the scale applies only to that
+        parameter group. ``mask(...)`` is one-shot, so call it immediately before
+        ``scale(...)``::
+
+            NN.mask(mask_decoder).scale(dlrs(lr0=1e-3))
 
         Args:
-            lr:     A ``LearningRateSchedule`` (or float) for this model.
-                    If *None*, a constant schedule of 1e-3 is used.
+            scale:  A ``LearningRateSchedule`` / ``dlrs(...)`` (or float) for this
+                    model. If *None*, a constant 1e-3 is used.
         """
         if self._mask_scope_pending and self._param_mask is not None:
             # Ensure a global fallback exists for uncovered leaves.
             if self._lr is None:
-                self._lr = lr
-            self._get_or_create_group()["lr"] = lr
+                self._lr = scale
+            self._get_or_create_group()["lr"] = scale
             self._mask_scope_pending = False
         else:
-            self._lr = lr
+            self._lr = scale
         return self
 
     def _current_group_key(self) -> str:
@@ -2359,8 +2356,14 @@ class ModelCall(Placeholder):
         self.model.lora(rank, alpha, target=target, wrapper=wrapper, specs=specs)
         return self
 
-    def optimizer(self, opt_fn: Any, *, lr: Any = None) -> "ModelCall":
-        self.model.optimizer(opt_fn, lr=lr)
+    def optimizer(self, opt_fn: Any) -> "ModelCall":
+        self.model.optimizer(opt_fn)
+        return self
+
+    def scale(self, scale: Any) -> "ModelCall":
+        """Proxy for :meth:`Model.scale` -- multiply the learning rate (e.g. with a
+        ``dlrs(...)`` schedule for loss-adaptive scaling). Chains after ``optimizer(...)``."""
+        self.model.scale(scale)
         return self
 
     def constrain(self, transform: Callable) -> "ModelCall":

@@ -39,7 +39,7 @@ After loading, all Python variable references (e.g., `u_net`, `v_net`) no longer
 
 ```python
 crux = jno.core.load("runs/crux.pkl")
-crux.set_optimizer(optax.adam, lr=lrs(1e-5))
+crux.set_optimizer(optax.adam, scale=lrs(1e-5))
 crux.solve(1000).plot("continued.png")
 ```
 

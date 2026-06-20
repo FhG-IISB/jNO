@@ -34,15 +34,15 @@ Call `solve()` multiple times with different optimisers or schedules. The solver
 
 ```python
 # Phase 1: Adam warm-up
-u_net.optimizer(optax.adam, lr=lrs.warmup_cosine(3000, 300, 1e-3, 1e-5))
+u_net.optimizer(optax.adam).scale(lrs.warmup_cosine(3000, 300, 1e-3, 1e-5))
 crux.solve(3000).plot("phase1.png")
 
 # Phase 2: L-BFGS quasi-Newton refinement
-u_net.optimizer(optax.lbfgs, lr=lrs(5e-5))
+u_net.optimizer(optax.lbfgs).scale(lrs(5e-5))
 crux.solve(500).plot("phase2.png")
 
 # Phase 3: SOAP second-order method
 from soap_jax import soap
-u_net.optimizer(soap(1), lr=lrs(1e-5))
+u_net.optimizer(soap(1)).scale(lrs(1e-5))
 crux.solve(500).plot("phase3.png")
 ```

@@ -450,7 +450,7 @@ class TestGPUPlacement:
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x])
         s = jno.core([pde.mse])
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         s.solve(5)
 
         gpu_leaves = [leaf for leaf in jax.tree_util.tree_leaves(s.models) if isinstance(leaf, jax.Array)]
@@ -477,7 +477,7 @@ class TestGPUPlacement:
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x])
         s = jno.core([pde.mse])
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
 
         shard_data_outputs = []
         original_shard_data = s._shard_data
@@ -528,7 +528,7 @@ class TestGPUPlacement:
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x])
         s = jno.core([pde.mse])
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
 
         converted_types = {}
         original_np_asarray = core_mod.np.asarray
@@ -580,7 +580,7 @@ class TestGPUPlacement:
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x])
         s = jno.core([pde.mse])
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
 
         shard_data_inputs = []
         original_shard_data = s._shard_data
@@ -617,7 +617,7 @@ class TestGPUPlacement:
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x])
         s = jno.core([pde.mse])
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         stats = s.solve(1)
 
         loss = stats.training_logs[-1]["total_loss"][-1]

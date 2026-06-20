@@ -329,7 +329,8 @@ class TestModelMask:
 
         u_net = self._make_eqx_model()
         all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
-        u_net.mask(all_true).optimizer(optax.adam, lr=1e-3)
+        u_net.mask(all_true).optimizer(optax.adam)
+        u_net.mask(all_true).scale(1e-3)
         assert u_net._param_mask is all_true
         assert u_net._opt_fn is optax.adam
 
@@ -364,8 +365,9 @@ class TestModelMask:
         u_net = self._make_eqx_model()
         all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
 
-        u_net.optimizer(optax.sgd, lr=1e-2)
-        u_net.mask(all_true).optimizer(optax.adam, lr=1e-3)
+        u_net.optimizer(optax.sgd).scale(1e-2)
+        u_net.mask(all_true).optimizer(optax.adam)
+        u_net.mask(all_true).scale(1e-3)
 
         assert u_net._opt_fn is optax.sgd
         assert len(u_net._param_groups) == 1
@@ -381,7 +383,8 @@ class TestModelMask:
         u_net = self._make_eqx_model()
         all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
 
-        u_net.mask(all_true).optimizer(optax.adam, lr=5e-4)
+        u_net.mask(all_true).optimizer(optax.adam)
+        u_net.mask(all_true).scale(5e-4)
 
         assert u_net._opt_fn is optax.adam
         assert len(u_net._param_groups) == 1
@@ -397,8 +400,9 @@ class TestModelMask:
         u_net = self._make_eqx_model()
         all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
 
-        u_net.optimizer(optax.sgd, lr=1e-2)
-        u_net.mask(all_true).optimizer(optax.adam, lr=1e-3)
+        u_net.optimizer(optax.sgd).scale(1e-2)
+        u_net.mask(all_true).optimizer(optax.adam)
+        u_net.mask(all_true).scale(1e-3)
         assert len(u_net._param_groups) == 1
 
         u_net.optimizer(optax.lbfgs)
@@ -414,9 +418,9 @@ class TestModelMask:
         u_net = self._make_eqx_model()
         all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
 
-        u_net.optimizer(optax.sgd, lr=1e-2)
+        u_net.optimizer(optax.sgd).scale(1e-2)
         u_net.mask(all_true).optimizer(optax.adam)
-        u_net.lr(1e-6)
+        u_net.scale(1e-6)
 
         assert len(u_net._param_groups) == 1
         group = u_net._param_groups[0]
@@ -515,7 +519,8 @@ class TestModelMask:
         u_net = self._make_eqx_model()
         x = make_var("x")
         all_true = jax.tree_util.tree_map(lambda _: True, u_net.module)
-        u_net(x).mask(all_true).optimizer(optax.adam, lr=1e-3)
+        u_net(x).mask(all_true).optimizer(optax.adam)
+        u_net(x).mask(all_true).scale(1e-3)
         assert u_net._param_mask is all_true
         assert u_net._opt_fn is optax.adam
 
