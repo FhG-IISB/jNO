@@ -10,6 +10,7 @@ import sys
 
 from . import bayesian, fn, lora, trackers
 from . import jnp_ops as np
+from ._fem import fem
 from .architectures.models import nn, parameter
 from .core import core
 from .differential_operators import DifferentialOperators
@@ -37,6 +38,7 @@ from .trace import (
     units,
 )
 from .trace.views import (
+    ComplexPair,
     ComplexView,
     MatrixView,
     NamedComplexViewWithPartials,
@@ -77,6 +79,14 @@ sys.modules[__name__ + ".numpy"] = np
 do = domain
 
 
+# `jno.complex(re, im)` builds a complex quantity from two real parts (the explicit form of
+# `re + 1j*im`) — for complex *data*/coefficients in a weak form, e.g. a complex forcing
+# `J = jno.complex(Jr, Ji)`. Complex *fields* come from `domain.fem_symbols(..., complex=True)`.
+def complex(re, im=0.0):  # noqa: A001  (intentionally shadows builtin on the jno namespace)
+    """A complex quantity as two real parts → :class:`ComplexPair` (``re + 1j*im``)."""
+    return ComplexPair(re, im)
+
+
 # Single source of truth: pyproject.toml. importlib.metadata reads the
 # installed-package metadata so __version__ stays aligned with the wheel
 # without manual edits. The fallback covers running from a source checkout
@@ -103,6 +113,7 @@ __all__ = [
     "sampler",
     "domain",
     "do",
+    "fem",
     "Model",
     "Variable",
     "Placeholder",

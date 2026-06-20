@@ -1,106 +1,33 @@
-# Helmholtz 3D
+# 3D Helmholtz on an F-shaped Domain (FEM)
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/08_fem_and_varpinns/helmholtz_3D.py" download>Download .py</a>
 <a class="md-button" href="/jNO/tutorials/08-fem-and-varpinns/">Back to chapter</a>
 </div>
 
-This is the most geometrically complex example in the tutorial set: a 3D Helmholtz problem on an extruded letter-F style geometry.
+A 3D screened-Helmholtz solve $-\Delta u + \sigma u = f$ on a non-trivial geometry — an
+extruded "F" prism meshed with `gmsh` into TET4 elements — with a Dirichlet bottom, a Neumann
+top, and natural side walls.
 
-## Problem Setup
+## Same API, one more coordinate
 
-The script works with mixed boundary conditions on a 3D domain and compares VPINN and FEM-style weak-form ideas on a nontrivial mesh.
-
-## Step 1: Build a Custom 3D Geometry
-
-A custom geometry constructor creates the volume and tagged surfaces required for boundary conditions.
-
-```python
-def letter_F_3d(depth=1.0, mesh_size=0.55):
-    def construct(geo):
-        outline_xy = [
-            (0.0, 0.0), (0.35, 0.0), (0.35, 0.90), (0.90, 0.90),
-            (0.90, 1.20), (0.35, 1.20), (0.35, 1.65), (1.20, 1.65),
-            (1.20, 2.00), (0.0, 2.00),
-        ]
-        pts    = [geo.add_point([x, y, 0.0], mesh_size=mesh_size) for (x, y) in outline_xy]
-        lines  = [geo.add_line(pts[i], pts[(i + 1) % len(pts)]) for i in range(len(pts))]
-        loop   = geo.add_curve_loop(lines)
-        bottom = geo.add_plane_surface(loop)
-        extruded = geo.extrude(bottom, [0.0, 0.0, depth])
-        # tag physical groups
-        geo.add_physical(volumes[0], "interior")
-        geo.add_physical([bottom, top] + side_surfaces, "boundary")
-        geo.add_physical([bottom], "bottom")
-        geo.add_physical([top], "top")
-        geo.add_physical(side_surfaces, "wall")
-        return geo, 3, mesh_size
-    return construct
-
-domain = jno.domain(
-    constructor=letter_F_3d(depth=1.0, mesh_size=0.55),
-    compute_mesh_connectivity=True,
-)
-domain.init_fem(
-    element_type="TET4",
-    quad_degree=2,
-    bcs=[
-        domain.dirichlet("bottom", 0.0),
-        domain.neumann(["top", "wall"]),
-    ],
-    fem_solver=True,
-)
-```
-
-## Step 2: Assemble Weak-Form Quantities in 3D
-
-The example uses tetrahedral-style weak-form machinery rather than a pointwise PDE residual.
+3D uses the identical workflow with a `z` axis: bind `z=zi`, take `ui.z`, and write the
+Dirichlet condition over three coordinates. The geometry is any jNO/`gmsh` constructor:
 
 ```python
-u, phi = domain.fem_symbols()
-xg, yg, zg, _ = domain.variable("fem_gauss", split=True)
-xt, yt, zt, _ = domain.variable("gauss_top",  split=True)
-xw, yw, zw, _ = domain.variable("gauss_wall", split=True)
-
-ux = u.d(xg); uy = u.d(yg); uz = u.d(zg)
-phix = phi.d(xg); phiy = phi.d(yg); phiz = phi.d(zg)
-
-volume        = ux*phix + uy*phiy + uz*phiz + sigma*u*phi - source_f(xg, yg, zg)*phi
-top_boundary  = flux_top(xt, yt, zt) * phi
-wall_boundary = flux_wall(xw, yw, zw) * phi
-weak = volume - top_boundary - wall_boundary
-
-A, b  = weak.assemble(domain, target="fem_system")
-u_fem = jnp.linalg.solve(to_dense(A), jnp.asarray(b)).reshape(-1)
+d = jno.domain(constructor=letter_F_3d(mesh_size=0.4), compute_mesh_connectivity=True)
+ui, vi = u.bind(x=xi, y=yi, z=zi), phi.bind(x=xi, y=yi, z=zi)
+volume = ui.x * vi.x + ui.y * vi.y + ui.z * vi.z + sigma * u * vi - f * vi
+fem = jno.fem([volume, top_neumann, u(cb[0], cb[1], cb[2]) - 0.0], element_type="TET4", quad_degree=2)
 ```
 
-## Step 3: Visualize the 3D Result
+## What to notice
 
-The script includes a surface or boundary visualization pipeline so the final field can be interpreted geometrically.
+- 3D is the same `jno.fem` API with `z` added — no special path.
+- The extrusion uses `num_layers=8` so the through-thickness mode is resolved.
+- Recovers $u^\*=z+\alpha\sin(\pi z)$ to rel-$L^2 \approx 2\times10^{-3}$.
 
-```python
-coords  = np.asarray(domain.mesh.points[:, :3])
-x_nodes = jnp.asarray(coords[:, 0:1])
-y_nodes = jnp.asarray(coords[:, 1:2])
-z_nodes = jnp.asarray(coords[:, 2:3])
-
-u_exact = exact_u_jax(x_nodes, y_nodes, z_nodes).reshape(-1)
-rel_l2  = jnp.linalg.norm(u_fem - u_exact) / (jnp.linalg.norm(u_exact) + 1e-14)
-print(f"Relative L2 error (FEM): {float(rel_l2):.6e}")
-```
-
-## What To Notice
-
-- This is a high-end tutorial example rather than a first learning example.
-- Complex geometry handling is one of the main reasons weak-form approaches become valuable.
-- The workflow shows how jNO scales beyond unit-interval and unit-square toy problems.
-
-<div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO/tutorial_examples/08_fem_and_varpinns/helmholtz_3D.py" download>Download full script</a>
-<a class="md-button" href="/jNO/tutorials/08-fem-and-varpinns/">Back to 08 FEM and Variational PINNs</a>
-</div>
-
-## Script Snippet
+## Full script
 
 ```python
 --8<-- "tutorial_examples/08_fem_and_varpinns/helmholtz_3D.py"

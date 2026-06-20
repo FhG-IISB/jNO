@@ -605,8 +605,12 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
         left_has = _contains_unknown_symbol(domain, expr.left)
         right_has = _contains_unknown_symbol(domain, expr.right)
 
-        # product/division of two unknown-dependent factors -> nonlinear
-        if expr.op in {"*", "/"} and left_has and right_has:
+        # product of two unknown-dependent factors -> nonlinear (c * u stays linear)
+        if expr.op == "*" and left_has and right_has:
+            return True
+        # division with the unknown in the denominator -> nonlinear, e.g. 1/u, c/u, u/u
+        # (u / c, a constant denominator, stays linear)
+        if expr.op == "/" and right_has:
             return True
 
         # powers of the unknown are nonlinear except u**1
@@ -636,9 +640,13 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
 
         name = _function_name(expr)
 
-        # Structural / linear-ish wrappers that should not force nonlinear classification
+        # Structural / linear-ish wrappers that should not force nonlinear classification.
+        # real/imag are R-linear operators: Re(c.u.v) stays linear in u, so the real-equivalent
+        # split of a complex *linear* weak form (jno.fem complex / complex_transient) must not be
+        # misread as nonlinear just because the unknown sits inside a real()/imag() wrapper.
         linearish = {
             "inner",
+            "dot",
             "reshape",
             "transpose",
             "getitem",
@@ -647,7 +655,17 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
             "symgrad",
             "trace",
             "einsum",
+            "real",
+            "imag",
         }
+
+        # A contraction/product wrapper (inner, einsum) of TWO unknown-dependent factors is a
+        # genuine nonlinearity -- e.g. the Navier-Stokes convective term inner(grad u, u), or
+        # inner(grad u, grad u). It stays in ``linearish`` for the common bilinear case
+        # inner(grad u, grad v), where the second factor is the *test* function (not the unknown);
+        # so we count factors carrying the unknown (any node type, not only Placeholder args).
+        if name in {"inner", "einsum"} and sum(bool(_contains_unknown_symbol(domain, a)) for a in expr.args) >= 2:
+            return True
 
         # Jacobian/Hessian are handled through their own nodes
         if len(unknown_args) > 0 and name not in linearish:

@@ -24,6 +24,29 @@ import jax.numpy as jnp
 from ..jnp_ops import concat
 from . import FunctionCall, Placeholder
 
+
+def _is_periodic_tie_combination(expr_a, expr_b) -> bool:
+    """True iff ``expr_a - expr_b`` is an FEM **periodic tie** ``u(A) - u(B)``: both sides reference a
+    ``TrialFunction`` and neither carries a ``TestFunction`` (a weak term would). This isolates the
+    tie from ordinary weak forms so the coord-binding merge only relaxes for a true tie; non-trial
+    views (e.g. two model fields) still raise. Imports are local to avoid a trace<->solver cycle."""
+    if expr_a is None or expr_b is None:
+        return False
+    from ..utils.solver.solver_helper import contains_node_type
+    from . import TestFunction, TrialFunction
+
+    if contains_node_type(expr_a, TestFunction) or contains_node_type(expr_b, TestFunction):
+        return False
+    return contains_node_type(expr_a, TrialFunction) and contains_node_type(expr_b, TrialFunction)
+
+
+def _tag_of_coord_vars(cv) -> Optional[str]:
+    """The single region tag shared by a bound view's coordinate Variables, or ``None``."""
+    tags = {getattr(v, "tag", None) for v in (cv or {}).values()}
+    tags = {t for t in tags if isinstance(t, str)}
+    return next(iter(tags)) if len(tags) == 1 else None
+
+
 if TYPE_CHECKING:
     from . import Tracker
 
@@ -322,6 +345,13 @@ class VectorView(_DelegatesToPlaceholder):
         """Wrap ``new_expr`` in the same view subclass as ``self``."""
         return VectorView(new_expr)
 
+    @property
+    def complex(self) -> "ComplexVectorView":
+        """Reinterpret this vector field as a **complex vector** ``[..., d, 2]`` (last axis =
+        ``[re, im]``): ``.real`` / ``.imag`` then give the real / imaginary ``d``-vectors. The
+        underlying Placeholder must carry that layout. See :class:`ComplexVectorView`."""
+        return ComplexVectorView(self._expr)
+
     def integrate(self, **kwargs) -> "VectorView":
         """Component-wise integral, preserving VectorView type."""
         return self._rewrap(self._expr.integrate(**kwargs))
@@ -363,10 +393,21 @@ class VectorView(_DelegatesToPlaceholder):
 
     # -- component access --
     def _c(self, i: int) -> "ScalarView":
-        return ScalarView(self._expr[..., i])
+        comp = ScalarView(self._expr[..., i])
+        # Preserve the region binding so a bound view's component
+        # (e.g. ``u.bind(x=xr, y=yr)[1]``) still carries ``_coord_vars`` — needed
+        # for per-component (roller) Dirichlet and vector boundary terms.
+        cv = getattr(self, "_coord_vars", None)
+        if cv:
+            return comp.bind(**cv)
+        return comp
 
     def component(self, i: int) -> "ScalarView":
         """i-th component → ScalarView."""
+        return self._c(i)
+
+    def __getitem__(self, i: int) -> "ScalarView":
+        """``v[i]`` — i-th component (alias for :meth:`component`)."""
         return self._c(i)
 
     # -- differential operators --
@@ -634,6 +675,294 @@ class ComplexView(_DelegatesToPlaceholder):
 
     def __pow__(self, n):
         return self._rewrap(self._expr ** _unwrap(n))
+
+
+# ---------------------------------------------------------------------------
+# ComplexVectorView
+# ---------------------------------------------------------------------------
+
+
+class ComplexVectorView(_DelegatesToPlaceholder):
+    """Semantic view of a Placeholder as a **complex vector** field, shape ``[..., d, 2]`` (``d``
+    vector components; last axis ``= 2 = [re, im]``). Reached via ``placeholder.vector.complex``.
+
+    ``.real`` / ``.imag`` return the real and imaginary parts as :class:`VectorView`\\s (each a real
+    ``d``-vector), so ``E.real.dot(n)`` / ``E.imag.div(x, y)`` work. Complex algebra (``.mul``,
+    ``.conj``) is componentwise (Hadamard) over the vector; ``.mul`` against a complex *scalar*
+    (:class:`ComplexView`) broadcasts. Mirrors :class:`ComplexView`, but each part is a vector. The
+    natural FEM realisation is two coupled real vector fields ``(E_r, E_i)``."""
+
+    def __init__(self, expr: Placeholder) -> None:
+        self._expr = expr
+
+    @property
+    def expr(self) -> Placeholder:
+        return self._expr
+
+    def __getattr__(self, name: str):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(object.__getattribute__(self, "_expr"), name)
+
+    def _rewrap(self, new_expr, other=None) -> "ComplexVectorView":
+        return ComplexVectorView(new_expr)
+
+    @staticmethod
+    def _pack(re_expr, im_expr) -> Placeholder:
+        """Rebuild the ``[..., d, 2]`` layout from real/imag vector parts (new last axis = [re, im])."""
+        return FunctionCall(lambda a, b: jnp.stack([a, b], axis=-1), [re_expr, im_expr], "cvpack")
+
+    @property
+    def real(self) -> "VectorView":
+        """Real part ``expr[..., 0]`` (a real ``d``-vector) → VectorView."""
+        return VectorView(self._expr[..., 0])
+
+    @property
+    def imag(self) -> "VectorView":
+        """Imaginary part ``expr[..., 1]`` (a real ``d``-vector) → VectorView."""
+        return VectorView(self._expr[..., 1])
+
+    @property
+    def conj(self) -> "ComplexVectorView":
+        """Complex conjugate ``[re, -im]`` (componentwise) → ComplexVectorView."""
+        return ComplexVectorView(self._pack(self.real.expr, -self.imag.expr))
+
+    def mul(self, other) -> "ComplexVectorView":
+        """Componentwise complex product ``(a+bi)(c+di)=(ac-bd)+(ad+bc)i``. A real ``other`` scales
+        both parts; a :class:`ComplexView` (complex scalar) broadcasts against the vector."""
+        if not isinstance(other, (ComplexView, ComplexVectorView)):
+            return self._rewrap(self._expr * _unwrap(other))
+        re = self.real.expr * other.real.expr - self.imag.expr * other.imag.expr
+        im = self.real.expr * other.imag.expr + self.imag.expr * other.real.expr
+        return ComplexVectorView(self._pack(re, im))
+
+    @property
+    def abs(self) -> "VectorView":
+        """Per-component modulus ``sqrt(re² + im²)`` → VectorView."""
+        return VectorView(FunctionCall(lambda x: jnp.sqrt(x[..., 0] ** 2 + x[..., 1] ** 2), [self._expr], "cvabs"))
+
+    @property
+    def stop_gradient(self) -> "ComplexVectorView":
+        return self._rewrap(self._expr.stop_gradient)
+
+    def integrate(self, **kwargs) -> "ComplexVectorView":
+        return self._rewrap(self._expr.integrate(**kwargs))
+
+    def d(self, v, scheme: str = "automatic_differentiation") -> "ComplexVectorView":
+        return self._rewrap(self._expr.d(v, scheme=scheme))
+
+    def partials(self, **named_vars):
+        """Bind Variables for partial-by-attribute access; partials are component-wise over [re, im]."""
+        return _coords_dispatch(self, (), named_vars)
+
+    bind = partials
+
+    def to_native(self) -> Placeholder:
+        """Convert split ``[..., d, 2]`` → native complex ``[..., d]``."""
+        return FunctionCall(lambda x: x[..., 0] + 1j * x[..., 1], [self._expr], "to_native")
+
+    # elementwise (scalar) arithmetic; for the complex product use .mul — mirrors ComplexView
+    def __add__(self, other):
+        return self._rewrap(self._expr + _unwrap(other), other=other)
+
+    def __radd__(self, other):
+        return self._rewrap(_unwrap(other) + self._expr, other=other)
+
+    def __sub__(self, other):
+        return self._rewrap(self._expr - _unwrap(other), other=other)
+
+    def __rsub__(self, other):
+        return self._rewrap(_unwrap(other) - self._expr, other=other)
+
+    def __neg__(self):
+        return self._rewrap(-self._expr)
+
+    def __mul__(self, other):
+        return self._rewrap(self._expr * _unwrap(other), other=other)
+
+    def __rmul__(self, other):
+        return self._rewrap(_unwrap(other) * self._expr, other=other)
+
+
+# ---------------------------------------------------------------------------
+# ComplexPair — complex as two SEPARATE real parts (FEM-friendly)
+# ---------------------------------------------------------------------------
+
+
+def _is_complex_pair(o) -> bool:
+    return isinstance(o, ComplexPair)
+
+
+def _radd(a, b):
+    """``a + b`` with ``None`` standing for an identically-zero part."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a + b
+
+
+def _rsub(a, b):
+    if a is None and b is None:
+        return None
+    if a is None:
+        return -b
+    if b is None:
+        return a
+    return a - b
+
+
+def _rmul(a, b):
+    if a is None or b is None:
+        return None
+    return a * b
+
+
+def _as_pair(o):
+    """Coerce ``o`` to a :class:`ComplexPair` (``NotImplemented`` if not possible).
+
+    A Python ``complex`` becomes its ``(real, imag)`` constants; any real
+    expression/number becomes ``(o, 0)``."""
+    if isinstance(o, ComplexPair):
+        return o
+    if isinstance(o, complex):
+        return ComplexPair(o.real if o.real != 0 else None, o.imag if o.imag != 0 else None)
+    if isinstance(o, (int, float)) or isinstance(o, (Placeholder, ScalarView, VectorView)):
+        return ComplexPair(o, None)
+    return NotImplemented
+
+
+def _complex_times_real(real_view, c: complex) -> "ComplexPair":
+    """``c * (real field)`` → a :class:`ComplexPair` (``1j·field`` → ``(0, field)``)."""
+
+    def scale(coeff):
+        if coeff == 0:
+            return None
+        if coeff == 1:
+            return real_view
+        return coeff * real_view
+
+    return ComplexPair(scale(c.real), scale(c.imag))
+
+
+class ComplexPair:
+    """A complex quantity held as two **separate** real parts ``(re, im)``.
+
+    Unlike :class:`ComplexView` (which packs ``[re, im]`` into one Placeholder's
+    last axis), each part here is an independent expression — the FEM-friendly
+    representation of a complex field built from real ``fem_symbols``::
+
+        E = Er.bind(x=x, y=y) + 1j * Ei.bind(x=x, y=y)      # -> ComplexPair
+
+    ``1j`` is just the imaginary unit; the tracer carries the real and imaginary
+    parts through every operation (``*`` is the complex product, ``.conj``, ``.x``,
+    ``[i]`` map over both). ``.real`` / ``.imag`` hand back the two parts as the
+    user's own real fields, so a complex weak form's ``.real`` lowers directly onto
+    the coupled (multifield) real system that ``jno.fem`` already assembles — no
+    separate complex machinery. A ``None`` part means "identically zero"."""
+
+    __slots__ = ("_re", "_im")
+
+    def __init__(self, re, im=None):
+        self._re = re
+        self._im = im
+
+    # -- accessors --
+    @property
+    def real(self):
+        return self._re
+
+    @property
+    def imag(self):
+        return self._im if self._im is not None else 0.0
+
+    @property
+    def conj(self) -> "ComplexPair":
+        return ComplexPair(self._re, None if self._im is None else -self._im)
+
+    # -- field-like passthroughs (map over both parts) --
+    def _map(self, fn) -> "ComplexPair":
+        return ComplexPair(fn(self._re), None if self._im is None else fn(self._im))
+
+    @property
+    def x(self) -> "ComplexPair":
+        return self._map(lambda p: p.x)
+
+    @property
+    def y(self) -> "ComplexPair":
+        return self._map(lambda p: p.y)
+
+    @property
+    def z(self) -> "ComplexPair":
+        return self._map(lambda p: p.z)
+
+    @property
+    def t(self) -> "ComplexPair":
+        return self._map(lambda p: p.t)
+
+    def __getitem__(self, i) -> "ComplexPair":
+        return self._map(lambda p: p[i])
+
+    def bind(self, **kw) -> "ComplexPair":
+        return self._map(lambda p: p.bind(**kw))
+
+    partials = bind
+
+    def d(self, v, **kw) -> "ComplexPair":
+        return self._map(lambda p: p.d(v, **kw))
+
+    def dot(self, other) -> "ComplexPair":
+        """Complex dot ``∑_i self_i · other_i`` of two complex vectors → complex scalar."""
+        o = _as_pair(other)
+        if o is NotImplemented:
+            return NotImplemented
+        rr = self._re.dot(o._re) if (self._re is not None and o._re is not None) else None
+        ii = self._im.dot(o._im) if (self._im is not None and o._im is not None) else None
+        ri = self._re.dot(o._im) if (self._re is not None and o._im is not None) else None
+        ir = self._im.dot(o._re) if (self._im is not None and o._re is not None) else None
+        return ComplexPair(_rsub(rr, ii), _radd(ri, ir))
+
+    # -- complex algebra --
+    def __add__(self, other) -> "ComplexPair":
+        o = _as_pair(other)
+        if o is NotImplemented:
+            return NotImplemented
+        return ComplexPair(_radd(self._re, o._re), _radd(self._im, o._im))
+
+    __radd__ = __add__
+
+    def __sub__(self, other) -> "ComplexPair":
+        o = _as_pair(other)
+        if o is NotImplemented:
+            return NotImplemented
+        return ComplexPair(_rsub(self._re, o._re), _rsub(self._im, o._im))
+
+    def __rsub__(self, other) -> "ComplexPair":
+        o = _as_pair(other)
+        if o is NotImplemented:
+            return NotImplemented
+        return ComplexPair(_rsub(o._re, self._re), _rsub(o._im, self._im))
+
+    def __neg__(self) -> "ComplexPair":
+        return ComplexPair(-self._re, None if self._im is None else -self._im)
+
+    def __mul__(self, other) -> "ComplexPair":
+        o = _as_pair(other)
+        if o is NotImplemented:
+            return NotImplemented
+        re = _rsub(_rmul(self._re, o._re), _rmul(self._im, o._im))
+        im = _radd(_rmul(self._re, o._im), _rmul(self._im, o._re))
+        return ComplexPair(re, im)
+
+    __rmul__ = __mul__
+
+    def __truediv__(self, other) -> "ComplexPair":
+        if isinstance(other, ComplexPair):
+            raise TypeError("ComplexPair: division by a complex quantity is not supported")
+        return ComplexPair(self._re / other, None if self._im is None else self._im / other)
+
+    def __repr__(self) -> str:
+        return f"ComplexPair(re={self._re!r}, im={self._im!r})"
 
 
 # ---------------------------------------------------------------------------
@@ -1515,19 +1844,32 @@ def _make_named_with_partials_cls(view_cls):
             """
             cv = object.__getattribute__(self, "_coord_vars")
             other_cv = getattr(other, "_coord_vars", None) if other is not None else None
+            tie_tags = None
             if other_cv:
-                merged = dict(cv)
-                for name, var in other_cv.items():
-                    if name in merged and merged[name] is not var:
-                        raise ValueError(
-                            f"coord binding conflict for {name!r}: cannot combine "
-                            f"two named views that map {name!r} to different "
-                            f"Variables (left={merged[name]!r}, right={var!r}). "
-                            f"Re-bind the result explicitly with .bind(...) to resolve."
-                        )
-                    merged[name] = var
-                cv = merged
-            return type(self)(new_expr, cv)
+                conflict = any(name in cv and cv[name] is not var for name, var in other_cv.items())
+                if conflict and _is_periodic_tie_combination(
+                    object.__getattribute__(self, "_expr"), getattr(other, "_expr", None)
+                ):
+                    # FEM periodic tie `u(A) - u(B)`: a constraint we never differentiate, so the
+                    # `.x`-ambiguity guard does not apply. The BinaryOp discards the per-side views, so
+                    # stash the two region tags here (the only place they survive) for jno.fem to read.
+                    tie_tags = (_tag_of_coord_vars(cv), _tag_of_coord_vars(other_cv))
+                else:
+                    merged = dict(cv)
+                    for name, var in other_cv.items():
+                        if name in merged and merged[name] is not var:
+                            raise ValueError(
+                                f"coord binding conflict for {name!r}: cannot combine "
+                                f"two named views that map {name!r} to different "
+                                f"Variables (left={merged[name]!r}, right={var!r}). "
+                                f"Re-bind the result explicitly with .bind(...) to resolve."
+                            )
+                        merged[name] = var
+                    cv = merged
+            res = type(self)(new_expr, cv)
+            if tie_tags is not None:
+                object.__setattr__(res, "_periodic_tie", tie_tags)
+            return res
 
         def __getattr__(self, key: str):
             if key.startswith("_"):
@@ -1569,7 +1911,7 @@ NamedVoigtViewWithPartials = _make_named_with_partials_cls(VoigtView)
 
 
 # Populate the tuple now that all classes exist (used by _unwrap()).
-_VIEW_TYPES = (ScalarView, VectorView, ComplexView, MatrixView, VoigtView, FieldView)
+_VIEW_TYPES = (ScalarView, VectorView, ComplexView, ComplexVectorView, MatrixView, VoigtView, FieldView)
 
 # Dispatch table used by `_coords_dispatch` to pick the Named<View>WithPartials
 # wrapper for each base view type.

@@ -250,6 +250,7 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
     import feax as fe
 
     symmetric_bc = kwargs.get("symmetric_bc", True)
+    fields_override = kwargs.get("fields_override", None)
 
     has_runtime_parameters = any(_contains_runtime_parameter(term.coeff) for term in ir.terms)
 
@@ -257,7 +258,7 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
     # Original parameter-free route
     # ------------------------------------------------------------
     if not has_runtime_parameters:
-        problem, bc = _build_feax_problem(domain, ir)
+        problem, bc = _build_feax_problem(domain, ir, fields_override=fields_override)
         internal_vars = fe.InternalVars()
 
         res_bc = fe.create_res_bc_function(problem, bc)
@@ -490,12 +491,19 @@ def _assemble_fem_system_concrete(
     *,
     apply_dirichlet=True,
     symmetric_bc=True,
+    fields_override=None,
+    store_on_domain=True,
 ):
     """
     Assemble one concrete steady linear FEAX contribution.
 
     This helper deliberately receives an IR that no longer contains runtime
-    parameter ModelCall nodes.
+    parameter ModelCall nodes. ``fields_override`` forces the multi-field block
+    layout (used by the coupled transient route so mass and operator blocks share
+    one field ordering). ``apply_dirichlet=False`` returns the *raw* matrix (no
+    Dirichlet rows/cols eliminated) — used to keep the transient mass's Dirichlet
+    columns for the time-varying-Dirichlet coupling; ``store_on_domain=False`` keeps
+    that scratch problem off the domain.
     """
     import feax as fe
 
@@ -503,6 +511,8 @@ def _assemble_fem_system_concrete(
         domain,
         ir,
         apply_dirichlet=apply_dirichlet,
+        fields_override=fields_override,
+        store_on_domain=store_on_domain,
     )
     internal_vars = fe.InternalVars()
 
@@ -546,6 +556,9 @@ def _assemble_fem_system_concrete(
 def _assemble_fem_system_from_ir(domain, ir, **kwargs):
     """Assemble ``A(args) u = b(args)`` for affine runtime weak-form terms."""
     symmetric_bc = kwargs.get("symmetric_bc", True)
+    fields_override = kwargs.get("fields_override", None)
+    apply_dirichlet = kwargs.get("apply_dirichlet", True)
+    store_on_domain = kwargs.get("store_on_domain", True)
 
     has_runtime_parameters = any(_contains_runtime_parameter(term.coeff) for term in ir.terms)
 
@@ -553,11 +566,16 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
         return _assemble_fem_system_concrete(
             domain,
             ir,
-            apply_dirichlet=True,
+            apply_dirichlet=apply_dirichlet,
             symmetric_bc=symmetric_bc,
+            fields_override=fields_override,
+            store_on_domain=store_on_domain,
         )
 
-    static_ir, parameter_irs, runtime_parameter_exprs, _ = _split_parametric_operator_ir(ir)
+    static_ir, parameter_irs, runtime_parameter_exprs, nonaffine_ir = _split_parametric_operator_ir(
+        ir, allow_nonaffine=True
+    )
+    has_nonaffine = len(nonaffine_ir.terms) > 0
 
     operator_basis = {}
     rhs_basis = {}
@@ -565,7 +583,10 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
     for name, basis_ir in parameter_irs.items():
         op_basis_ir, rhs_basis_ir = _split_trial_and_load_ir(basis_ir)
 
-        if len(op_basis_ir.terms) > 0:
+        # With any non-affine operator parameter present the whole operator is
+        # re-assembled each call (below), so skip the affine operator basis here to
+        # avoid double-counting the affine operator parameters.
+        if (not has_nonaffine) and len(op_basis_ir.terms) > 0:
             zero_basis_ir = _make_zero_ir_like(op_basis_ir)
             K_bc, bK_bc = _assemble_fem_system_concrete(
                 domain, op_basis_ir, apply_dirichlet=True, symmetric_bc=symmetric_bc
@@ -575,17 +596,27 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
             )
             K = jnp.asarray(_dense_array(K_bc)) - jnp.asarray(_dense_array(K_zero_bc))
             bK = jnp.asarray(bK_bc).reshape(-1) - jnp.asarray(bK_zero_bc).reshape(-1)
-            if not np.allclose(np.asarray(bK), 0.0, atol=1.0e-8):
-                raise NotImplementedError(
-                    "A runtime operator basis produced a non-zero RHS contribution. "
-                    "Runtime Dirichlet parameters are not supported yet."
-                )
             operator_basis[name] = K
+            # A non-homogeneous Dirichlet value g lifted by this parametric operator basis
+            # appears as a parameter-scaled RHS term: bK = -theta * K_ib * g on the interior
+            # rows, and *zero on the Dirichlet rows* (g itself is fixed, carried by b0). Carry
+            # it so b(theta) = b0 + sum theta * bK. If bK is non-zero on the Dirichlet rows the
+            # Dirichlet *value* would scale with theta -- a genuine runtime-Dirichlet-value
+            # parameter, which is still unsupported.
+            if not np.allclose(np.asarray(bK), 0.0, atol=1.0e-8):
+                _dir = np.asarray(_dense_array(K_zero_bc)).diagonal() > 0.5  # bc-identity rows
+                if not np.allclose(np.asarray(bK)[_dir], 0.0, atol=1.0e-7):
+                    raise NotImplementedError(
+                        "Runtime Dirichlet *value* parameters are not supported (the prescribed "
+                        "Dirichlet value scales with the parameter)."
+                    )
+                rhs_basis[name] = rhs_basis.get(name, jnp.zeros_like(bK)) + bK
 
         if len(rhs_basis_ir.terms) > 0:
             rhs_vec = _assemble_static_source_vector_from_ir(domain, rhs_basis_ir, dtype=_default_float_dtype())
             if rhs_vec is not None:
-                rhs_basis[name] = jnp.asarray(rhs_vec)
+                rv = jnp.asarray(rhs_vec)
+                rhs_basis[name] = rhs_basis.get(name, jnp.zeros_like(rv)) + rv
 
     if len(static_ir.terms) == 0:
         structural_op_ir = None
@@ -594,6 +625,10 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
             if len(op_basis_ir.terms) > 0:
                 structural_op_ir = op_basis_ir
                 break
+        if structural_op_ir is None and has_nonaffine:
+            na_op_ir, _ = _split_trial_and_load_ir(nonaffine_ir)
+            if len(na_op_ir.terms) > 0:
+                structural_op_ir = na_op_ir
         if structural_op_ir is None:
             raise ValueError(
                 "A static fem_system requires at least one operator term. Only runtime source/load terms were found."
@@ -605,7 +640,50 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
     b0 = jnp.asarray(b0, dtype=A0.dtype).reshape(-1)
 
     operator_fn = None
-    if operator_basis:
+    if has_nonaffine:
+        # Re-assembly route: a non-affine operator parameter (e.g. exp(k), k**2)
+        # cannot be factored into a constant basis, so re-run the feax operator
+        # assembly each call with ALL operator parameters threaded as InternalVars
+        # (the parameter stays inside the integrand). The feax kernel is pure-JAX,
+        # so operator_fn is differentiable in the parameters and Dirichlet is
+        # applied once by the single assembly. Slower per call than the affine
+        # A0 + sum theta*K basis, but exact for non-affine dependence. Mirrors the
+        # transient non-affine path (time_route._na_full).
+        import feax as fe
+
+        from .feax_utils import _make_internal_vars
+        from .parametric_helpers import _collect_runtime_parameter_exprs
+
+        op_only_ir, _ = _split_trial_and_load_ir(ir)
+        op_rt = _prepare_feax_runtime(
+            domain, op_only_ir, apply_dirichlet=True, need_jacobian=True, symmetric_bc=symmetric_bc
+        )
+        if op_rt["jac_bc"] is None:
+            raise ValueError("Non-affine FEM operator runtime did not produce a Jacobian.")
+        _op_tags = list(op_rt["runtime_parameter_tags"])
+        _op_dt = op_rt["dtype"]
+        _op_u0 = jnp.zeros((int(op_rt["size"]),), dtype=_op_dt)
+
+        def operator_fn(args=None, _rt=op_rt, _tags=_op_tags, _dt=_op_dt, _u0=_op_u0):
+            # Keep the raw shape: a scalar parameter stays 0-d; a field parameter
+            # (a nodal array) is threaded whole and gathered/interpolated per cell.
+            _a = args or {}
+            values = {name: jnp.asarray(_a[name], dtype=_dt) for name in _tags}
+            iv = _make_internal_vars(
+                fe,
+                (),
+                0.0,
+                n_cells=_rt["n_cells"],
+                dtype=_dt,
+                runtime_parameter_tags=_tags,
+                runtime_parameter_values=values,
+            )
+            return jnp.asarray(_dense_array(_rt["jac_bc"](_u0, iv)), dtype=_dt)
+
+        for term in nonaffine_ir.terms:
+            _collect_runtime_parameter_exprs(term.coeff, runtime_parameter_exprs)
+
+    elif operator_basis:
 
         def operator_fn(args=None):
             A = A0
@@ -633,11 +711,16 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
         operator_basis=operator_basis,
         rhs_basis=rhs_basis,
         metadata={
-            "dynamic_operator": bool(operator_basis),
+            "dynamic_operator": bool(operator_basis) or has_nonaffine,
             "dynamic_rhs": bool(rhs_basis),
+            "nonaffine_operator": has_nonaffine,
             "runtime_parameter_names": sorted(runtime_parameter_exprs),
             "operator_parameter_names": sorted(operator_basis),
             "rhs_parameter_names": sorted(rhs_basis),
-            "lowering": ("A(args) = A0 + sum_i args[name_i] * K_i; b(args) = b0 + sum_j args[name_j] * f_j"),
+            "lowering": (
+                "A(args) re-assembled with parameters as InternalVars (non-affine)"
+                if has_nonaffine
+                else "A(args) = A0 + sum_i args[name_i] * K_i; b(args) = b0 + sum_j args[name_j] * f_j"
+            ),
         },
     )

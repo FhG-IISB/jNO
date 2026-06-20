@@ -103,7 +103,7 @@ nav:
       - IREE Deployment: model-controls/iree.md
   - Inverse Problems: inverse-problems.md
   - Save, Load and Configuration: Save-Load-and-Configuration.md
-  - FEM & Variational PINNs: fem.md
+  - Finite Element Method: fem.md
   - Foundation Models: foundation_models/index.md
   - Tutorials:
     - 01 Basics:
@@ -143,12 +143,27 @@ nav:
     - 07 Stochastic:
       - Fokker-Planck 2D: tutorials/07-stochastic/fokker-planck-2d.md
       - Stochastic Forcing 2D: tutorials/07-stochastic/stochastic-forcing-2d.md
-    - 08 FEM and Variational PINNs:
-      - Poisson 2D FEM: tutorials/08-fem-and-varpinns/poisson-2d-fem.md
-      - Stationary Allen-Cahn FEM: tutorials/08-fem-and-varpinns/stationary-allen-cahn-fem.md
-      - Diffusion-Reaction Robin BC: tutorials/08-fem-and-varpinns/diffusion-reaction-robin-bc.md
-      - Helmholtz Mixed BC FEM VarPINN: tutorials/08-fem-and-varpinns/helmholtz-mixed-bc-fem-varpinn.md
-      - Helmholtz 3D: tutorials/08-fem-and-varpinns/helmholtz-3d.md
+    - 08 Finite Element Method:
+      - Poisson 2D: tutorials/08-fem-and-varpinns/poisson-2d-fem.md
+      - Stationary Allen-Cahn: tutorials/08-fem-and-varpinns/stationary-allen-cahn-fem.md
+      - Reaction-Diffusion (Robin BC): tutorials/08-fem-and-varpinns/diffusion-reaction-robin-bc.md
+      - Helmholtz (Mixed BC): tutorials/08-fem-and-varpinns/helmholtz-mixed-bc-fem.md
+      - Helmholtz 3D (F-domain): tutorials/08-fem-and-varpinns/helmholtz-3d.md
+      - Helmholtz + PML (complex): tutorials/08-fem-and-varpinns/helmholtz-pml-2d.md
+      - 2D Schrödinger Wave Packet: tutorials/08-fem-and-varpinns/schrodinger-wavepacket-2d.md
+      - 2D Maxwell (complex vector E): tutorials/08-fem-and-varpinns/maxwell-2d-vector.md
+      - Linear Elasticity (Cantilever): tutorials/08-fem-and-varpinns/linear-elasticity-cantilever.md
+      - Elasticity: Plate with a Hole: tutorials/08-fem-and-varpinns/elasticity-plate-with-hole.md
+      - Stokes Channel (Poiseuille): tutorials/08-fem-and-varpinns/stokes-channel-poiseuille.md
+      - Stokes Flow Past a Cylinder: tutorials/08-fem-and-varpinns/stokes-flow-around-cylinder.md
+      - Navier-Stokes Lid-Driven Cavity: tutorials/08-fem-and-varpinns/navier-stokes-cavity-2d.md
+      - Coupled Multiphysics (Two-Temperature): tutorials/08-fem-and-varpinns/coupled-two-temperature-2d.md
+      - Rayleigh–Bénard (heat + flow): tutorials/08-fem-and-varpinns/rayleigh-benard-2d.md
+      - Transient Heat: tutorials/08-fem-and-varpinns/transient-heat-2d.md
+      - Transient via diffrax (custom integrator): tutorials/08-fem-and-varpinns/transient-diffrax-heat-spreader.md
+      - Inverse Diffusivity Field: tutorials/08-fem-and-varpinns/inverse-diffusivity-field.md
+      - Inverse Conductivity (L-shape): tutorials/08-fem-and-varpinns/inverse-conductivity-lshape.md
+      - Transient Inverse (Rate): tutorials/08-fem-and-varpinns/transient-inverse-heat.md
     - 09 Weights & Biases:
       - W&B Integration: tutorials/09-wandb/wandb-integration.md
     - 10 Bayesian PINNs:

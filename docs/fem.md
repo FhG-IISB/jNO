@@ -1,228 +1,184 @@
-# FEM and Variational Formulations
+# Finite Element Method
 
-jNO supports two hybrid approaches that combine finite-element machinery with neural networks:
+jNO assembles and solves finite-element problems through a **single entry point**,
+`jno.fem([...])`. You write the weak form as a plain Python list of **residual terms** —
+volume physics, natural boundary terms, and essential boundary conditions, all in the same
+list — and `jno.fem` returns a `FEM` object carrying the assembled operators.
 
-- **VPINN** (Variational PINN): a neural network is the trial function; the weak-form residual is minimised with jNO's standard training loop.
-- **FEM system assembly**: the weak form is assembled into a linear system $Au = b$ or a nonlinear residual operator $R(u) = 0$ that can be solved with a direct or iterative linear solver.
-
-Both approaches use the same domain setup and weak-form syntax.
-
----
-
-## Domain setup
-
-Call `domain.init_fem` after creating the domain to activate FEM mode. This builds the mesh connectivity, quadrature points, and basis functions needed for assembly.
-
-```python
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.1))
-
-domain.init_fem(
-    element_type="TRI3",    # element family: "TRI3", "TRI6", "QUAD4", …
-    quad_degree=2,          # quadrature degree for numerical integration
-    bcs=[
-        jno.dirichlet(["left", "right", "top", "bottom"]),   # homogeneous Dirichlet
-    ],
-    fem_solver=True,        # True = enable direct FEM solve path
-)
-```
-
-For vector-valued unknowns (e.g. elasticity with displacement `(u_x, u_y)`):
-
-```python
-domain.init_fem(
-    element_type="TRI3",
-    quad_degree=2,
-    bcs=[jno.dirichlet(["left", "right"], (0.0, 0.0))],
-    vec=2,
-)
-```
-
----
-
-## Boundary conditions
-
-### Dirichlet (essential)
-
-`jno.dirichlet(tags, values=None)` marks boundaries where the unknown is prescribed.
-
-```python
-jno.dirichlet("left")                          # zero on "left"
-jno.dirichlet(["left", "right"], 0.0)          # zero on both sides
-jno.dirichlet("top", lambda x, y: jnp.sin(x)) # spatially varying
-jno.dirichlet("wall", (0.0, 1.0))             # vector: u_x=0, u_y=1
-jno.dirichlet("wall", {"x": 0.0, "y": 1.0})  # same, dict form
-```
-
-### Neumann (natural)
-
-`jno.neumann(tags)` marks boundaries where flux terms from the weak form should be assembled into the surface integrals. Zero Neumann (no flux) is the default and requires no explicit declaration.
-
-```python
-jno.neumann("right")          # include "right" boundary in surface assembly
-jno.neumann(["top", "right"])
-```
-
----
-
-## Weak-form symbols
-
-After `init_fem`, retrieve the trial and test function symbols from the domain:
-
-```python
-u, phi = domain.fem_symbols()
-# u   — TrialFunction (the unknown)
-# phi — TestFunction  (the test/weight function)
-```
-
-Quadrature coordinates are accessed as tagged variables:
-
-```python
-xg, yg, _ = domain.variable("fem_gauss", split=True)    # volume Gauss points
-xr, yr, _ = domain.variable("gauss_right", split=True)  # Gauss points on "right" boundary
-```
-
-The boundary Gauss variable name follows the pattern `"gauss_<tag>"`.
-
----
-
-## Building the weak form
-
-Use `jno.np.grad` on `u` and `phi` with respect to the Gauss-point coordinates. The syntax is identical to the PINN workflow.
-
-**Poisson equation** $-\Delta u = f$:
-
-```python
-import jno.numpy as jnn
-
-ux  = jnn.grad(u,   xg)
-uy  = jnn.grad(u,   yg)
-phix = jnn.grad(phi, xg)
-phiy = jnn.grad(phi, yg)
-f = 1.0  # forcing term
-
-# Weak form: ∫ ∇u · ∇φ dΩ − ∫ f φ dΩ = 0
-weak = ux * phix + uy * phiy - f * phi
-```
-
-**Neumann boundary flux** (add to weak form):
-
-```python
-xr, yr, _ = domain.variable("gauss_right", split=True)
-u_r  = u   # TrialFunction evaluated at right boundary Gauss points
-phi_r = phi
-
-# ∫_∂Ω_right g φ ds  with prescribed flux g = 1
-weak_bc = weak - 1.0 * phi_r   # subtract Neumann load
-```
-
----
-
-## Assembly
-
-### Linear system — `"fem_system"`
-
-For linear PDEs, assemble directly into a stiffness matrix and load vector:
-
-```python
-A, b = weak.assemble(domain, target="fem_system")
-# A — sparse or dense stiffness matrix
-# b — load vector
-```
-
-`FemLinearSystem` supports addition so separate volume and boundary contributions can be combined:
-
-```python
-sys_vol = vol_form.assemble(domain, target="fem_system")
-sys_bnd = bnd_form.assemble(domain, target="fem_system")
-A, b = sys_vol + sys_bnd
-```
-
-Solve with any linear solver:
+The same traced weak-form language powers the steady solve, the transient time-stepper, and
+the **differentiable** `fem.solve()` used for inverse problems.
 
 ```python
 import jax.numpy as jnp
-
-u_h = jnp.linalg.solve(A, b)
-```
-
-### Nonlinear residual — `"fem_residual"`
-
-For nonlinear PDEs, assemble a residual operator:
-
-```python
-R = weak.assemble(domain, target="fem_residual")
-# R — FemResidualOperator
-
-# Evaluate residual at a candidate solution
-r = R.residual(u_flat)      # R(u)
-
-# Linearise for Newton iterations
-J, rhs = R.linearize(u_flat)   # J, -R(u)  →  solve J Δu = -R(u)
-```
-
-A simple Newton loop:
-
-```python
-u_h = jnp.zeros(R.size)
-for _ in range(20):
-    J, rhs = R.linearize(u_h)
-    u_h = u_h + jnp.linalg.solve(J, rhs)
-```
-
-### VPINN path — use with jNO training
-
-When the trial function is a neural network rather than a FE basis, pass the weak form directly to `jno.core` as a residual:
-
-```python
-net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=64, num_layers=4,
-                               key=jax.random.PRNGKey(0)))
-net.optimizer(optax.adam(1e-3))
-
-u_nn = net(xg, yg) * xg * (1 - xg) * yg * (1 - yg)
-
-ux  = jnn.grad(u_nn,  xg)
-uy  = jnn.grad(u_nn,  yg)
-phix = jnn.grad(phi, xg)
-phiy = jnn.grad(phi, yg)
-
-weak_vpinn = ux * phix + uy * phiy - 1.0 * phi
-
-crux = jno.core([weak_vpinn.mse])
-crux.solve(10000)
-```
-
----
-
-## Complete example — Poisson FEM solve
-
-```python
-import jax.numpy as jnp
+from shapely.geometry import box
 import jno
-import jno.numpy as jnn
 
-domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.1))
+dense = lambda A: jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)  # A may be sparse or dense
 
-domain.init_fem(
-    element_type="TRI3",
-    quad_degree=2,
-    bcs=[jno.dirichlet(["left", "right", "top", "bottom"])],
-    fem_solver=True,
-)
+d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+u, phi = d.fem_symbols()                                   # trial / test functions
+xi, yi, _ = d.variable("interior", split=True)            # volume quadrature coords
+xb, yb, _ = d.variable("boundary", split=True)            # boundary coords
+ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)         # views with .x / .y derivatives
 
-u, phi = domain.fem_symbols()
-xg, yg, _ = domain.variable("fem_gauss", split=True)
-
-ux   = jnn.grad(u,   xg)
-uy   = jnn.grad(u,   yg)
-phix = jnn.grad(phi, xg)
-phiy = jnn.grad(phi, yg)
-
-f = 1.0 + 0.0 * xg   # uniform forcing
-
-weak = ux * phix + uy * phiy - f * phi
-
-A, b = weak.assemble(domain, target="fem_system")
-u_h  = jnp.linalg.solve(A, b)
+f = 2.0 * (xi * (1 - xi) + yi * (1 - yi))
+fem = jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0])   # weak form + u = 0 on the boundary
+u_h = jnp.linalg.solve(dense(fem.A), jnp.asarray(fem.b).reshape(-1))
 ```
 
-See the **[08 FEM and Variational PINNs](tutorials/08-fem-and-varpinns/poisson-2d-fem.md)** tutorials for worked VPINN and FEM examples.
+> `fem.A` and `fem.jacobian(u)` are sparse (`BCOO`); the transient `fem.M` and
+> `fem.operator.A` are dense. The `dense(...)` helper above handles both — it is used
+> throughout this page and in every tutorial script.
+
+---
+
+## Domain, symbols, and derivatives
+
+* **Domain** — any jNO domain works (`box`, `jno.domain.cube`, a CSG/`gmsh` constructor).
+  Add `time=(t0, t1, n_steps)` to make it transient.
+* **Symbols** — `u, phi = d.fem_symbols(value_shape=(), names=("u", "phi"), order=1)`.
+  Use `value_shape=(2,)` for a vector unknown (elasticity, flow velocity), `order=2` for P2
+  (quadratic) elements, and call `fem_symbols` once per field for coupled systems.
+* **Quadrature coordinates** — `d.variable("interior", split=True)` returns the volume
+  coordinates; `d.variable("<edge>", split=True)` returns a boundary edge's coordinates. A
+  `box` auto-tags `"left"`, `"right"`, `"bottom"`, `"top"` (and `"front"`/`"back"` for a cube);
+  `"boundary"` is the whole boundary and `"initial"` the `t = t0` slice.
+* **Bound views** — `ui = u.bind(x=xi, y=yi, t=ti)` ties a symbol to a set of coordinates.
+  The value is `ui`; spatial derivatives are `ui.x`, `ui.y`, `ui.z`; the time derivative is
+  `ui.t`. (This replaces the old `jno.np.grad(u, xg)` / `u.d(xg)` spelling.)
+
+---
+
+## Boundary conditions are residual terms
+
+There is no separate `jno.dirichlet(...)`/`neumann(...)` call — every condition is just a term
+in the `jno.fem([...])` list, and `jno.fem` classifies each by the region it is bound to (see
+`fem.classification`).
+
+| Condition | Term |
+|-----------|------|
+| Dirichlet `u = g` | `u(xb, yb) - g` |
+| Per-component (roller) `u_i = g` | `u(xb, yb)[i] - g` |
+| Neumann flux `du/dn = g` | `-g * phi.bind(x=xb, y=yb)` |
+| Robin `du/dn + a u = g` | `(a * u.bind(x=xb, y=yb) - g) * phi.bind(x=xb, y=yb)` |
+| Vector traction `t` | `-jno.np.inner(t, phi.bind(x=xb, y=yb), n_contract=1)` |
+
+`g` may be a constant or a coordinate expression (e.g. `u(xb, yb) - jno.np.sin(jno.np.pi * xb)`
+for a spatially varying Dirichlet value). A zero Neumann flux is the natural default and needs
+no term.
+
+---
+
+## What `jno.fem` returns
+
+`jno.fem` picks the operator type from the form:
+
+| Form | `fem.is_linear` / `is_transient` | Use |
+|------|----------------------------------|-----|
+| steady, linear in `u` | `True` / `False` | `fem.A`, `fem.b` → `jnp.linalg.solve` |
+| steady, nonlinear in `u` | `False` / `False` | `fem.residual(u)`, `fem.jacobian(u)`, `fem.dofs` (Newton) |
+| has a `u.t` term | — / `True` | `fem.M`, `fem.operator.A`, `fem.state0`, `fem.dt`, `fem.t0`, `fem.t1` |
+
+Always-available: `fem.dofs`, `fem.points` (the coordinates the DOFs live on — use these for P2,
+where they differ from the mesh vertices), `fem.operator`, and `fem.classification`.
+
+### Steady linear
+
+```python
+u_h = jnp.linalg.solve(dense(fem.A), jnp.asarray(fem.b).reshape(-1))
+```
+
+### Steady nonlinear (Newton)
+
+A cubic reaction `+ (u**3 - u) * vi` makes the form nonlinear, so `jno.fem` returns a residual
+operator — solve it with any Newton/root-finder using `fem.residual` and `fem.jacobian`:
+
+```python
+import scipy.optimize as spo
+sol = spo.root(lambda v: np.asarray(fem.residual(v)),
+               np.zeros(fem.dofs),
+               jac=lambda v: np.asarray(dense(fem.jacobian(v))), method="hybr")
+```
+
+### Transient (semidiscrete `M u̇ + A u = c`)
+
+```python
+M, A, dt = dense(fem.M), dense(fem.operator.A), float(fem.dt)
+w = jnp.asarray(fem.state0)
+for _ in range(round((fem.t1 - fem.t0) / dt)):          # backward Euler
+    w = jnp.linalg.solve(M + dt * A, M @ w)
+```
+
+---
+
+## Differentiable solve & inverse problems
+
+`fem.solve()` is the **differentiable forward solve as a trace node** — the entry point for
+inverse problems. Put a `jno.np.parameter` in the weak form, compare `fem.solve()` to data, and
+train the parameter through `crux.solve`. The gradient flows through the solve back to the
+parameter (see also [Inverse problems](inverse-problems.md)).
+
+```python
+import jax, optax
+k = jno.np.parameter((1,), name="k")                      # unknown scalar
+k.dtype(jnp.float64); k.initialize(jax.nn.initializers.constant(2.0)); k.optimizer(optax.adam(5e-2))
+fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
+crux = jno.core([(fem.solve() - u_obs).mse], domain=obs_domain)
+crux.solve(200)                                           # recovers k
+recovered = crux.eval([k])                                # the array (do not index [0])
+```
+
+`fem.solve(solve_fn)` lets you choose the solver (jNO writes none): the linear default is
+`jnp.linalg.solve`, the nonlinear default an `optimistix` Newton `root_find` (implicit-diff).
+
+### Field parameters `k(x)` + regularization
+
+`jno.np.parameter(phi)` is a **nodal field** on the trial space — a trainable value per node.
+Field inversion is ill-posed, so add a smoothness/structure prior with `k.regularize(...)`
+(`"h1seminorm"`, `"l2"`/`"tikhonov"`, `"tv"`, `"nonneg"`, `"bounded"`):
+
+```python
+k = jno.np.parameter(phi, name="k")                       # P1 field, one DOF per node
+crux = jno.core([(fem.solve() - u_obs).mse, 1e-3 * k.regularize("h1seminorm").mean], domain=obs)
+```
+
+### Transient inverse
+
+For a transient form, `fem.solve()` returns the **trajectory** `u(save_ts)` (default: backward
+Euler over the assembled `dt`, sampled at the domain time grid), differentiable in the
+parameters — so a rate constant is recovered from a time series:
+
+```python
+fem = jno.fem([ui.t * vi + alpha * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - u0])
+crux = jno.core([(fem.solve() - u_traj).mse], domain=obs).solve(200)   # recovers alpha
+```
+
+`fem.solve(my_integrator, save_ts=...)` swaps the integrator: `my_integrator(block, args,
+save_ts) -> trajectory`. The block exposes `block.as_diffrax(args=...)` (a diffrax ODE term)
+and `block.as_feax_pipeline(args=...)` (a feax backward-Euler pipeline) as ready-made options;
+the implicit default is preferred for Dirichlet problems.
+
+---
+
+## Vector, coupled, and higher-order problems
+
+* **Vector / elasticity** — `u, phi = d.fem_symbols(value_shape=(2,))`; use `vi.component(i)`,
+  `jno.np.symgrad`, `jno.np.trace`, and `jno.np.inner(..., n_contract=2)` to write the
+  elasticity bilinear form `λ (∇·u)(∇·φ) + 2μ ε(u):ε(φ)`.
+* **Coupled / mixed (Stokes)** — call `fem_symbols(...)` once per field and add one momentum and
+  one continuity term; an inf-sup-stable Taylor–Hood pair is `order=2` velocity + `order=1`
+  pressure, with a single-vertex pressure pin via `d.point_region("ppin", (x, y))` and
+  `p(xpn, ypn) - 0.0`.
+* **1D and 3D** — a 1D interval or a 3D `cube`/extruded `gmsh` volume use the identical API with
+  one fewer / one more coordinate (`ui.z`, `u(xb, yb, zb) - g`, `element_type="TET4"`).
+* **P2 elements** — `order=2` gives quadratic elements; read the solution at `fem.points`.
+
+---
+
+## Worked examples
+
+The [FEM tutorials](tutorials/08-fem-and-varpinns/poisson-2d-fem.md) cover every pattern above:
+Poisson, mixed Dirichlet/Robin reaction–diffusion, a nonlinear Allen–Cahn interface, a 3-D
+Helmholtz solve on an extruded domain, mixed-BC Helmholtz, a linear-elastic cantilever beam,
+Poiseuille channel flow (Stokes), transient heat, and two inverse problems (a hidden
+diffusivity field and a transient rate).

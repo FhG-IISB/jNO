@@ -43,6 +43,8 @@ from .feax_utils import (
     _dense_array,
     _make_internal_vars,
     _prepare_feax_runtime,
+    _zero_forcing_dirichlet_rows,
+    _zero_mass_dirichlet_rows,
 )
 from .parametric_helpers import (
     _clone_term_with_coeff,
@@ -1547,13 +1549,14 @@ def _ir_temporal_tags(ir) -> list[str]:
     return sorted(tags)
 
 
-def _prepare_src_runtime(domain, src_ir):
+def _prepare_src_runtime(domain, src_ir, *, fields_override=None):
     """
     Build FEAX source-only runtime ONCE.
 
     Source/load vector is evaluated as:
         b(t) = -r_src(0, t)
-    with no Dirichlet elimination.
+    with no Dirichlet elimination. ``fields_override`` forces the multi-field block
+    layout so a coupled source lands in the right field block.
     """
     rt = _prepare_feax_runtime(
         domain,
@@ -1561,6 +1564,7 @@ def _prepare_src_runtime(domain, src_ir):
         apply_dirichlet=False,
         need_jacobian=False,
         symmetric_bc=True,
+        fields_override=fields_override,
     )
 
     u_zero = jnp.zeros((rt["size"],), dtype=rt["dtype"])
@@ -1568,14 +1572,14 @@ def _prepare_src_runtime(domain, src_ir):
     return rt
 
 
-def _build_source_vector_fn(domain, src_ir, *, size, dtype):
+def _build_source_vector_fn(domain, src_ir, *, size, dtype, fields_override=None):
     """Build one transient volume-source or Neumann-load vector callback."""
     import feax as fe
 
     if src_ir is None or len(src_ir.terms) == 0:
         return None
 
-    rt = _prepare_src_runtime(domain, src_ir)
+    rt = _prepare_src_runtime(domain, src_ir, fields_override=fields_override)
     if int(rt["size"]) != int(size):
         raise ValueError(f"Auto forcing runtime size mismatch: runtime size={rt['size']}, expected {size}.")
 
@@ -1596,15 +1600,19 @@ def _build_source_vector_fn(domain, src_ir, *, size, dtype):
     return source_vector_fn
 
 
-def _build_auto_forcing_vector_fn(domain, src_ir, *, size, dtype):
-    """Build ``f(t,args) = f0(t) + sum_i args[name_i] * f_i(t)``."""
+def _build_auto_forcing_vector_fn(domain, src_ir, *, size, dtype, fields_override=None):
+    """Build ``f(t,args) = f0(t) + sum_i args[name_i] * f_i(t)``.
+
+    ``fields_override`` forces the multi-field block layout so a coupled source assembles
+    into the correct field block (used by the coupled transient path)."""
     if src_ir is None or len(src_ir.terms) == 0:
         return None, {}, {}
 
     static_src_ir, parameter_irs, runtime_parameter_exprs, _ = _split_parametric_operator_ir(src_ir)
-    static_fn = _build_source_vector_fn(domain, static_src_ir, size=size, dtype=dtype)
+    static_fn = _build_source_vector_fn(domain, static_src_ir, size=size, dtype=dtype, fields_override=fields_override)
     forcing_basis = {
-        name: _build_source_vector_fn(domain, basis_ir, size=size, dtype=dtype) for name, basis_ir in parameter_irs.items()
+        name: _build_source_vector_fn(domain, basis_ir, size=size, dtype=dtype, fields_override=fields_override)
+        for name, basis_ir in parameter_irs.items()
     }
     zero = jnp.zeros((int(size),), dtype=dtype)
 
@@ -1716,7 +1724,9 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             raise NotImplementedError("Runtime parameters inside transient mass terms are not supported yet.")
 
         M_sys, _bM = _assemble_fem_system_from_ir(domain, mass_ir)
-        M = _dense_array(M_sys)
+        # Zero the mass's Dirichlet rows/cols so M u̇ + A u = c reads u[d]=g there (feax
+        # leaves identity rows, which only happens to be right for homogeneous g).
+        M = _zero_mass_dirichlet_rows(_dense_array(M_sys), domain._feax_bc)
         full_size = int(M.shape[0])
         static_op_ir, operator_parameter_irs, operator_parameter_exprs, nonaffine_op_ir = _split_parametric_operator_ir(
             op_ir, allow_nonaffine=True
@@ -1725,20 +1735,55 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             A0_sys, bA0 = _assemble_fem_system_from_ir(domain, static_op_ir)
             A = _dense_array(A0_sys)
             affine_bias = jnp.asarray(bA0).reshape(-1)
+        elif len(operator_parameter_irs) > 0 and len(nonaffine_op_ir.terms) == 0:
+            # Fully-parametric *affine* operator (no static term): the per-parameter bases
+            # below carry K = K_bc - K_zero_bc, which *cancels* their Dirichlet identity
+            # rows, and M has its Dirichlet rows zeroed too -- so without a static base
+            # nothing would hold the Dirichlet identity and (M + dt A) would be singular.
+            # Assemble a zero (parameter-free) basis with Dirichlet applied to recover
+            # exactly the bc-identity rows in A and the Dirichlet value g in affine_bias
+            # (the case `_make_zero_ir_like` was written for: "every physical term is
+            # parameter-dependent but static Dirichlet enforcement still has to be assembled
+            # exactly once"). When a non-affine term is present its jac_bc already supplies
+            # the identity (apply_dirichlet=True), so A must stay 0 there to avoid doubling.
+            #
+            # affine_bias here carries the Dirichlet value g on the Dirichlet *rows* (the
+            # zero IR has no physics, so its interior rows are 0 and only the bc rows get g),
+            # which is correct-by-construction. A *non-homogeneous* g (g != 0) is supported: the
+            # parametric operator's Dirichlet lifting `coeff * K_ib * g` is carried below as a
+            # parameter-scaled, constant-in-time forcing term (op_lift_basis), so b(t, theta) =
+            # affine_bias + forcing + sum theta * bK. (Only a parameter that scales the Dirichlet
+            # *value* itself stays unsupported.)
+            zero_basis_ir = _make_zero_ir_like(next(iter(operator_parameter_irs.values())))
+            A0_sys, bA0 = _assemble_fem_system_from_ir(domain, zero_basis_ir)
+            A = jnp.asarray(_dense_array(A0_sys))
+            affine_bias = jnp.asarray(bA0).reshape(-1)
         else:
             A = jnp.zeros_like(M)
             affine_bias = jnp.zeros((M.shape[0],), dtype=M.dtype)
 
         operator_basis = {}
+        op_lift_basis = {}  # non-homogeneous Dirichlet lifting per param: a constant-in-time RHS
         for name, basis_ir in operator_parameter_irs.items():
             zero_basis_ir = _make_zero_ir_like(basis_ir)
             K_bc, bK_bc = _assemble_fem_system_from_ir(domain, basis_ir)
             K_zero_bc, bK_zero_bc = _assemble_fem_system_from_ir(domain, zero_basis_ir)
             K = jnp.asarray(_dense_array(K_bc)) - jnp.asarray(_dense_array(K_zero_bc))
             bK = jnp.asarray(bK_bc).reshape(-1) - jnp.asarray(bK_zero_bc).reshape(-1)
-            if not np.allclose(np.asarray(bK), 0.0, atol=1.0e-8):
-                raise NotImplementedError("Runtime Dirichlet parameters are not supported yet.")
             operator_basis[name] = K
+            # A non-homogeneous Dirichlet g lifted by this parametric operator basis is a
+            # parameter-scaled, constant-in-time RHS term (zero on the Dirichlet rows; g itself is
+            # fixed, carried by affine_bias). Threaded into the forcing below. A non-zero
+            # contribution ON the Dirichlet rows would mean the Dirichlet *value* scales with the
+            # parameter, which is still unsupported.
+            if not np.allclose(np.asarray(bK), 0.0, atol=1.0e-8):
+                _dir = np.asarray(_dense_array(K_zero_bc)).diagonal() > 0.5  # bc-identity rows
+                if not np.allclose(np.asarray(bK)[_dir], 0.0, atol=1.0e-7):
+                    raise NotImplementedError(
+                        "Runtime Dirichlet *value* parameters are not supported (the prescribed "
+                        "Dirichlet value scales with the parameter)."
+                    )
+                op_lift_basis[name] = bK
 
         # ---- Periodic reduction (if a prolongation matrix was built) ----
         _feax_ctx = getattr(domain, "_feax_context", {}) or {}
@@ -1751,6 +1796,7 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             A = reduce_matrix(P_block, A)
             affine_bias = reduce_vector(P_block, affine_bias)
             operator_basis = {name: reduce_matrix(P_block, K) for name, K in operator_basis.items()}
+            op_lift_basis = {name: reduce_vector(P_block, v) for name, v in op_lift_basis.items()}
             if state0 is not None:
                 state0 = restrict_state(P_block, state0, periodic_info["kept_nodes"], vec=periodic_info["vec"])
 
@@ -1787,7 +1833,12 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             na_u0 = jnp.zeros((na_rt["size"],), dtype=na_dt)  # module-level jnp; do NOT import here
 
             def _na_full(t, args, _rt=na_rt, _tags=na_tags, _temp=na_temp, _u0=na_u0, _dt=na_dt):
-                values = {name: _runtime_scalar_arg(args, name, dtype=_dt) for name in _tags}
+                # Keep the raw shape: a scalar parameter stays 0-d; a field parameter (a nodal
+                # array) is threaded whole and gathered/interpolated per cell by feax (same as
+                # the steady non-affine route, fem_route.operator_fn). Scalarizing here would
+                # break a transient jno.np.parameter(phi) field.
+                _a = args or {}
+                values = {name: jnp.asarray(_a[name], dtype=_dt) for name in _tags}
                 iv = _make_internal_vars(
                     fe,
                     _temp,
@@ -1831,6 +1882,8 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             forcing_vector_fn, forcing_basis, forcing_parameter_exprs = _build_auto_forcing_vector_fn(
                 domain, src_ir, size=full_size, dtype=M.dtype
             )
+            # the raw source must not pollute Dirichlet rows (those read g from affine_bias)
+            forcing_vector_fn = _zero_forcing_dirichlet_rows(forcing_vector_fn, domain._feax_bc)
             auto_forcing = True
             forcing_mode = "weak_auto"
 
@@ -1843,6 +1896,22 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
                     return _rv(P_block, _f(t, args))
 
                 forcing_basis = {n: (lambda t, _b=b: _rv(P_block, _b(t))) for n, b in forcing_basis.items()}
+
+        # Thread the non-homogeneous-Dirichlet operator lifting into the forcing as a
+        # parameter-scaled, constant-in-time term: M u_dot + A(t,args) u = affine_bias +
+        # forcing(t,args) + sum_name theta_name * bK_name.
+        if op_lift_basis:
+            _base_forcing = forcing_vector_fn
+            _lift_sz, _lift_dt = int(M.shape[0]), M.dtype
+
+            def forcing_vector_fn(t, args=None, _base=_base_forcing, _lift=op_lift_basis, _sz=_lift_sz, _dt=_lift_dt):
+                out = _base(t, args) if _base is not None else jnp.zeros((_sz,), dtype=_dt)
+                for _name, _bK in _lift.items():
+                    out = out + _runtime_scalar_arg(args, _name, dtype=_dt) * jnp.asarray(_bK, dtype=_dt)
+                return out
+
+            if forcing_mode == "none":
+                forcing_mode = "weak_auto"
 
         combined_runtime_parameter_exprs = _merge_runtime_parameter_exprs(operator_parameter_exprs, forcing_parameter_exprs)
 

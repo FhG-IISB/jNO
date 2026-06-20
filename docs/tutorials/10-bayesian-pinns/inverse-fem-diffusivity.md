@@ -17,9 +17,9 @@ FEM solver** that jNO already exposes.
 
 ## Architecture
 
-* jNO's `domain.init_fem` + `weak.assemble` build the JAX-traceable
-  stiffness matrix `A` and load vector `b`.  We solve the `α = 1`
-  problem once to get `u_baseline`.
+* `jno.fem([...])` builds the JAX-traceable stiffness matrix `fem.A` and
+  load vector `fem.b` from the weak form.  We solve the `α = 1` problem
+  once to get `u_baseline`.
 * For pure-diffusion linear PDEs (this tutorial), `A(α) = α · A_base`
   and therefore `u(α) = u_baseline / α`.  We express the forward as a
   jNO expression of the trainable `α` and a per-node `u_baseline`
@@ -32,7 +32,7 @@ FEM solver** that jNO already exposes.
 
 ## Result
 
-`α = 1.07 ± 0.14`, 90 % CI `[0.88, 1.33]`, truth `α = 1.0` —
+`α = 1.06 ± 0.14`, 90 % CI `[0.86, 1.30]`, truth `α = 1.0` —
 comfortably interior, CI width set by the observation noise level
 (`σ = 0.005`), the chain length (`keep = 1000`), and the per-node
 likelihood averaging.
