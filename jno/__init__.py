@@ -35,6 +35,7 @@ from .trace import (
     TestFunction,
     TrialFunction,
     Variable,
+    units,
 )
 from .trace.views import (
     ComplexPair,
@@ -154,6 +155,7 @@ __all__ = [
     "fn",
     "lora",
     "noise",
+    "units",
     "StateField",
     "ScalarView",
     "VectorView",

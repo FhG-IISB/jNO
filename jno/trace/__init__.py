@@ -261,6 +261,52 @@ class Placeholder:
         self._user_name = label
         return self
 
+    # Graph-time physical unit (dimensional metadata). ``None`` = undeclared.
+    # Only ever set explicitly here on a leaf; inferred units for intermediate
+    # nodes are computed non-destructively by ``jno.units.check`` and never
+    # written back onto the graph.
+    _unit: "object | None" = None
+
+    def unit(self, spec: "str") -> "Placeholder":
+        """Declare the physical unit of this expression for dimensional analysis.
+
+        Attaches graph-time metadata used by :func:`jno.units.check` to audit
+        that a PDE is dimensionally consistent.  Returns *self* so it chains
+        inline::
+
+            x = x.unit("m")
+            u = net(x, t).unit("K")
+
+        ``spec`` is a unit string such as ``"m"``, ``"m/s"``, ``"kg/m^3"`` or
+        ``"Pa"`` (see :meth:`jno.units.Unit.parse`).
+        """
+        from .units import Unit
+
+        self._unit = Unit.parse(spec)
+        return self
+
+    # Graph-time characteristic magnitude (the *scale* that complements the
+    # *dimension* set by ``.unit``). ``None`` = undeclared. Like ``_unit`` it is
+    # only ever set explicitly on a leaf; intermediate magnitudes are computed
+    # non-destructively by ``jno.units.nondimensionalize`` and never written back.
+    _scale: "float | None" = None
+
+    def scale(self, value: float) -> "Placeholder":
+        """Declare the characteristic *magnitude* of this variable/field.
+
+        Units give the *dimension* (``.unit("m")`` → a length); the scale gives
+        the *magnitude* in that unit (``.scale(0.1)`` → the characteristic length
+        is 0.1 m).  The two are orthogonal and used together by
+        :func:`jno.units.nondimensionalize` to derive dimensionless groups and
+        rescale a problem to ``O(1)``.  Returns *self* so it chains inline::
+
+            x = x.unit("m").scale(0.1)        # L  = 0.1 m
+            u = net(x, t).unit("K").scale(50.0)
+            alpha = alpha.unit("m^2/s").scale(1e-5)
+        """
+        self._scale = float(value)
+        return self
+
     @property
     def stop_gradient(self) -> "FunctionCall":
         """Block gradient flow through this expression.
