@@ -8,10 +8,23 @@ FEM realisation is two coupled real vector fields ``(E_r, E_i)`` (validated sepa
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
 from jno.trace import FunctionCall
 from jno.trace.views import ComplexVectorView, VectorView
 from jno.trace_evaluator import TraceEvaluator
+
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """The view algebra is compared at float64 tolerances; opt into x64 per-test (the session default
+    may be x64-off when co-run with test_periodic). Save/restore keeps the flag from leaking."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
 
 
 def _const(arr):

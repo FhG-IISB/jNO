@@ -4,11 +4,25 @@ import pytest
 
 pytest.importorskip("feax", reason="feax required for FEAX FEM integration tests")
 
+import jax  # noqa: E402
 import jax.numpy as jnp
 
 import jno
 import jno.jnp_ops as jnn
 from jno import dirichlet
+
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """feax assembly is float64, so these tests opt into x64 per-test. The session default is
+    x64-off (see tests/conftest.py); save/restore keeps the flag from leaking to other modules."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
 
 # ============================================================
 # Helpers

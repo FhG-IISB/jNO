@@ -20,7 +20,20 @@ import jno
 
 pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
+import jax  # noqa: E402
 from shapely.geometry import box  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """feax assembly is float64, so these tests opt into x64 per-test. The session default is
+    x64-off (see tests/conftest.py); save/restore keeps the flag from leaking to other modules."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
 
 
 def _dense(A):
