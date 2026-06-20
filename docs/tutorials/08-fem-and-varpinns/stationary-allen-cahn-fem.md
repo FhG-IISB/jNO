@@ -1,87 +1,39 @@
-# Stationary Allen-Cahn FEM
+# Stationary Allen-Cahn (nonlinear FEM)
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/08_fem_and_varpinns/stationary_allen_cahn_fem.py" download>Download .py</a>
 <a class="md-button" href="/jNO/tutorials/08-fem-and-varpinns/">Back to chapter</a>
 </div>
 
-This example solves a nonlinear stationary Allen-Cahn problem using classical FEM machinery.
+A nonlinear FEM solve: the stationary Allen-Cahn equation $-\varepsilon^2 \Delta u + (u^3 - u) = 0$,
+whose stable equilibrium is a sharp `tanh` phase interface (Allen & Cahn, *Acta Metall.* 1979).
 
-## Problem Setup
+## Nonlinear weak form → residual operator
 
-The weak form corresponds to a stationary Allen-Cahn equation with a nonlinear cubic term.
-
-## Step 1: Define the Nonlinear Weak Residual
-
-The script expresses the nonlinear form directly in terms of FEM operators rather than pointwise PINN losses.
+The cubic term `(u**3 - u) * vi` makes the form nonlinear in `u`, so `jno.fem` returns a
+**residual operator** (`fem.residual`, `fem.jacobian`) rather than a linear `A, b`:
 
 ```python
-eps = 0.05
-domain = jno.domain.rect(mesh_size=0.12)
-domain.init_fem(
-    element_type="TRI3",
-    quad_degree=3,
-    bcs=[
-        domain.dirichlet("left", u_left),
-        domain.dirichlet("right", u_right),
-    ],
-    fem_solver=True,
-)
-
-u, phi = domain.fem_symbols()
-xg, yg, _ = domain.variable("fem_gauss", split=True)
-
-ux   = u.d(xg)
-uy   = u.d(yg)
-phix = phi.d(xg)
-phiy = phi.d(yg)
-
-# Weak form: ∫ eps^2 grad(u)·grad(phi) + (u^3 - u) phi dΩ = 0
-weak = eps**2 * (ux * phix + uy * phiy) + (u**3 - u) * phi
+fem = jno.fem([eps**2 * (ui.x * vi.x + ui.y * vi.y) + (u**3 - u) * vi,
+               u(xl, yl) - exact(0.0), u(xr, yr) - exact(1.0)], quad_degree=3)
+assert not fem.is_linear
 ```
 
-## Step 2: Build the Jacobian and Nonlinear Solve Loop
-
-Because the problem is nonlinear, a residual alone is not enough; the script also uses Jacobian information for iterative solution.
+Newton (here SciPy's `root`) is driven by `fem.residual` and `fem.jacobian`, started from an
+over-wide interface and sharpened to the analytic equilibrium:
 
 ```python
-op = weak.assemble(domain, target="fem_residual")
-
-def residual_np(u_np):
-    return np.asarray(op.residual(jnp.asarray(u_np)))
-
-def jacobian_np(u_np):
-    J = op.jacobian(jnp.asarray(u_np))
-    return np.asarray(to_dense(J))
+sol = spo.root(lambda v: np.asarray(fem.residual(jnp.asarray(v))), u0,
+               jac=lambda v: np.asarray(dense(fem.jacobian(jnp.asarray(v)))), method="hybr")
 ```
 
-## Step 3: Solve With a Classical Nonlinear Method
+## What to notice
 
-A SciPy-style root or nonlinear solve routine is used to converge the weak-form system.
+- A nonlinear weak form switches `jno.fem` to the residual route automatically.
+- `fem.residual(u)` and `fem.jacobian(u)` plug into any Newton / root-finder.
+- Converges to the `tanh` interface at rel-$L^2 \approx 10^{-3}$.
 
-```python
-u0  = exact_u_num(x_nodes, y_nodes).reshape(-1)
-sol = spo.root(
-    residual_np,
-    np.asarray(u0),
-    jac=jacobian_np,
-    method="hybr",
-)
-u_fem = jnp.asarray(sol.x).reshape(-1)
-```
-
-## What To Notice
-
-- Weak-form nonlinear solves are structurally different from PINN optimization.
-- This example is useful for comparing classical and neural treatments of the same PDE family.
-- It also shows how jNO's weak-form abstractions extend beyond linear problems.
-
-<div class="hero-actions" markdown>
-<a class="md-button md-button--primary" href="/jNO/tutorial_examples/08_fem_and_varpinns/stationary_allen_cahn_fem.py" download>Download full script</a>
-<a class="md-button" href="/jNO/tutorials/08-fem-and-varpinns/">Back to 08 FEM and Variational PINNs</a>
-</div>
-
-## Script Snippet
+## Full script
 
 ```python
 --8<-- "tutorial_examples/08_fem_and_varpinns/stationary_allen_cahn_fem.py"

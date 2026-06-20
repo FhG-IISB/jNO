@@ -42,6 +42,19 @@ def _contains_runtime_parameter(node) -> bool:
     return any(_contains_runtime_parameter(child) for child in (_iter_children(node) or ()))
 
 
+def _is_fem_field_parameter(node) -> bool:
+    """True for a trainable parameter that is a FEM coefficient *field*
+    (``jno.np.parameter(phi)``) rather than a scalar."""
+    return _is_runtime_scalar_parameter(node) and getattr(node.model, "_fem_field", None) is not None
+
+
+def _contains_fem_field_parameter(node) -> bool:
+    """Recursively detect a FEM field parameter in one trace subtree."""
+    if _is_fem_field_parameter(node):
+        return True
+    return any(_contains_fem_field_parameter(child) for child in (_iter_children(node) or ()))
+
+
 def _flatten_product(node):
     """Flatten a symbolic multiplication tree into factors."""
     if isinstance(node, BinaryOp) and node.op == "*":
@@ -78,6 +91,11 @@ _NONAFFINE = object()  # module-level sentinel; identity-compared, never ==
 
 
 def _factor_runtime_parameter_from_term(coeff, *, allow_nonaffine=False):
+    # A FEM field parameter (nodal coefficient) can never be an affine scalar factor
+    # -- it stays inside the integrand and is re-assembled (interpolated to quad).
+    if _contains_fem_field_parameter(coeff):
+        return _NONAFFINE, coeff
+
     factors = _flatten_product(coeff)
     params = [f for f in factors if _is_runtime_scalar_parameter(f)]
 

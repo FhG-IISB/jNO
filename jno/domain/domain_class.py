@@ -573,6 +573,10 @@ class domain(MeshIOMixin):
         self._tag_edges: Dict[str, np.ndarray] = {}
         self._tag_triangles: Dict[str, np.ndarray] = {}
         self._boundary_regions: Dict[str, BoundaryRegion] = {}
+        # User-defined predicate regions from domain.tag(name, where): name -> spatial predicate.
+        # Consulted by _make_tag_location_fn (FEM boundary location-fn, auto-restricted to the
+        # boundary by feax) and by tag() to build the sampling pool.
+        self._tag_predicates: Dict[str, Any] = {}
         # Precomputed simplex pools (segments / triangles + optional normals)
         # for in-JIT collocation sampling — populated by ``_build_simplex_pools``
         # after each ``_apply_mesh``.
@@ -1118,9 +1122,14 @@ class domain(MeshIOMixin):
 
         return [loc_fns, vec_ids, val_fns]
 
-    def variational_symbols(self, value_shape=(), names=("u", "phi")):
+    def variational_symbols(self, value_shape=(), names=("u", "phi"), order=1, complex=False):
         """
         Return generic variational symbols.
+
+        ``order`` is the element polynomial degree for this field (1 = P1, 2 = P2).
+        It is per-field (mixed methods like Taylor-Hood use different orders for
+        different fields); the domain mesh stays linear and the FEM assembly mesh is
+        promoted as needed.
 
         Parameters
         ----------
@@ -1149,12 +1158,34 @@ class domain(MeshIOMixin):
             u, v = domain.fem_symbols(value_shape=(3,))
         """
         trial_name, test_name = names
-        return (
-            TrialFunction(name=trial_name, value_shape=value_shape),
-            TestFunction(name=test_name, value_shape=value_shape),
-        )
+        if complex:
+            # A complex field is carried as TWO real fields (re, im) — the FEM-friendly
+            # representation. The user writes the weak form with ordinary complex algebra
+            # (`*` is the complex product, `1j`, `.conj`, `.real`/`.imag`); `jno.fem`
+            # lowers `weak.real` onto the coupled (multifield) real system it already
+            # assembles. Re-trial pairs with re-test, im-trial with im-test.
+            from ..trace.views import ComplexPair
 
-    def fem_symbols(self, value_shape=(), names=("u", "phi")):
+            re_tr = TrialFunction(name=f"{trial_name}_re", value_shape=value_shape, order=order)
+            im_tr = TrialFunction(name=f"{trial_name}_im", value_shape=value_shape, order=order)
+            re_te = TestFunction(name=f"{test_name}_re", value_shape=value_shape, order=order)
+            im_te = TestFunction(name=f"{test_name}_im", value_shape=value_shape, order=order)
+            re_te.field_key = re_tr.field_key
+            im_te.field_key = im_tr.field_key
+            for _s in (re_tr, im_tr, re_te, im_te):
+                _s._domain = self
+            return (ComplexPair(re_tr, im_tr), ComplexPair(re_te, im_te))
+        trial = TrialFunction(name=trial_name, value_shape=value_shape, order=order)
+        test = TestFunction(name=test_name, value_shape=value_shape, order=order)
+        test.field_key = trial.field_key  # one field per fem_symbols() call (pairs u<->phi)
+        # Carry the owning domain so a consumer can recover the mesh / FE space from a
+        # symbol alone -- e.g. jno.np.parameter(phi) sizing a field parameter to the
+        # space (mirrors how Variable carries its _domain).
+        trial._domain = self
+        test._domain = self
+        return (trial, test)
+
+    def fem_symbols(self, value_shape=(), names=("u", "phi"), order=1, complex=False):
         """
         Backward-compatible alias for variational_symbols().
 
@@ -1165,10 +1196,20 @@ class domain(MeshIOMixin):
 
         Vector:
             u, v = domain.fem_symbols(value_shape=(2,))
-        """
-        return self.variational_symbols(value_shape=value_shape, names=names)
 
-    def test_function(self, value_shape=(), name="phi"):
+        Mixed order (Taylor-Hood: P2 velocity, P1 pressure):
+            u, v = domain.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
+            p, q = domain.fem_symbols(names=("p", "q"))  # order=1
+
+        Complex field (e.g. time-harmonic Maxwell / Helmholtz) — one symbol that is a
+        genuine complex trial/test (carried as two coupled real fields under the hood):
+            E, v = domain.fem_symbols(value_shape=(2,), complex=True)
+            weak = curl(E) * curl(v) - k2 * E.dot(v) - J.dot(v)   # `*` = complex product
+            fem  = jno.fem([weak.real, *bcs])                     # lowers to the real coupled solve
+        """
+        return self.variational_symbols(value_shape=value_shape, names=names, order=order, complex=complex)
+
+    def test_function(self, value_shape=(), name="phi", order=1):
         """Return only the weak-form test function.
 
         Intended for NN-first weak VPINN authoring:
@@ -1176,11 +1217,11 @@ class domain(MeshIOMixin):
             u   = net(...)
             weak = ...
         """
-        return TestFunction(name=name, value_shape=value_shape)
+        return TestFunction(name=name, value_shape=value_shape, order=order)
 
-    def trial_function(self, value_shape=(), name="u"):
+    def trial_function(self, value_shape=(), name="u", order=1):
         """Advanced helper for explicit FEM-only authoring."""
-        return TrialFunction(name=name, value_shape=value_shape)
+        return TrialFunction(name=name, value_shape=value_shape, order=order)
 
     def _register_variational_sample(
         self,
@@ -1212,6 +1253,48 @@ class domain(MeshIOMixin):
             "region_id": region_id,
             "context_tag": context_tag if context_tag is not None else sample_tag,
         }
+
+    def point_region(self, name: str, xy) -> "domain":
+        """Register a single-node boundary region at the mesh vertex nearest ``xy``.
+
+        Unlike :meth:`region` (which selects whole boundary *segments*), this pins
+        one mesh vertex so a Dirichlet term such as ``p(domain.variable(name)) - 0``
+        constrains exactly that node. The canonical use is fixing the pressure
+        null space of a pure-Dirichlet Stokes problem so the saddle system is
+        non-singular and solvable directly (no ``lstsq``/zero-mean workaround).
+
+        Parameters
+        ----------
+        name : str
+            Tag for the pinned node; usable in :meth:`variable` and as a Dirichlet
+            region in :func:`jno.fem`.
+        xy : array-like
+            Target coordinates; the nearest mesh vertex is pinned (vertices are
+            shared by P1 and P2 fields, so the pin lands on a node of either).
+        """
+        from .boundary_region import BoundaryRegion
+
+        if self.mesh is None:
+            raise ValueError("Mesh must be loaded before registering a point region.")
+        pts = np.asarray(self.mesh.points)[:, : self.dimension]
+        target = np.asarray(xy, dtype=float).reshape(-1)[: self.dimension]
+        nid = int(((pts - target) ** 2).sum(axis=1).argmin())
+        coord = pts[nid : nid + 1].copy()  # (1, D)
+        bbox = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
+        tol = 1e-6 * bbox if bbox > 0 else 1e-7
+        # Time-dependent domains store pools as (n_time, n_pts, D); broadcast the pin node
+        # across the time slices so domain.variable(name) samples it like any other region.
+        interior_pool = self._mesh_pool.get("interior")
+        if interior_pool is not None and np.asarray(interior_pool).ndim == 3:
+            n_time = int(np.asarray(interior_pool).shape[0])
+            self._mesh_pool[name] = np.broadcast_to(coord, (n_time,) + coord.shape).copy()  # (n_time, 1, D)
+        else:
+            self._mesh_pool[name] = coord
+        self._boundary_regions[name] = BoundaryRegion(
+            tag=name, dim=self.dimension, points=coord, edges=None, triangles=None, tol=tol
+        )
+        self._register_variational_sample(sample_tag=name, support="boundary", region_id=name, context_tag=name)
+        return self
 
     def init_fem(
         self,
@@ -1261,20 +1344,11 @@ class domain(MeshIOMixin):
             dirichlet_tags, dirichlet_value_fns, neumann_tags, bc_periodic_pairs = expand_bcs(bcs, vec=vec)
             periodic_pairs = periodic_pairs + list(bc_periodic_pairs)
 
-        meshio_type_map = {
-            "TRI3": "triangle",
-            "QUAD4": "quad",
-            "TET4": "tetra",
-        }
-        meshio_type = meshio_type_map.get(element_type)
-        if meshio_type is None:
-            raise ValueError(f"Unsupported FEM element_type '{element_type}'.")
+        # Build the feax assembly mesh (promotes the linear domain mesh to P2 for
+        # higher-order elements; the domain mesh itself stays linear).
+        from ..utils.solver.feax_utils import _build_feax_mesh
 
-        feax_mesh = fe.Mesh(
-            self.mesh.points[:, : self.dimension],
-            self.mesh.cells_dict[meshio_type],
-            ele_type=element_type,
-        )
+        feax_mesh = _build_feax_mesh(self, element_type)
 
         # ---------------------------------------------------------
         # Boundary tags -> FEAX location functions
@@ -1366,18 +1440,22 @@ class domain(MeshIOMixin):
                         bc_config.add(loc_fn, "all", fn)
                         continue
 
-                    # Vector case: value_obj may already be normalized into a list/tuple
-                    # of callables/scalars, or may be a single callable/scalar for all comps.
-                    if callable(value_obj) or onp.isscalar(value_obj):
-                        vals = [value_obj for _ in range(vec)]
+                    # Vector case: value_obj may be a length-vec list/tuple of
+                    # callables/scalars, a partial {component: value} dict (roller /
+                    # symmetry — only the named components are constrained), or a
+                    # single callable/scalar broadcast to all components.
+                    if isinstance(value_obj, dict):
+                        comp_values = {int(c): v for c, v in value_obj.items()}
+                    elif callable(value_obj) or onp.isscalar(value_obj):
+                        comp_values = {c: value_obj for c in range(vec)}
                     elif isinstance(value_obj, (list, tuple)):
                         if len(value_obj) != vec:
                             raise ValueError(f"Dirichlet BC for tag '{tag}' has {len(value_obj)} entries, but vec={vec}.")
-                        vals = list(value_obj)
+                        comp_values = dict(enumerate(value_obj))
                     else:
                         raise TypeError(f"Unsupported Dirichlet BC value type for tag '{tag}': {type(value_obj).__name__}")
 
-                    for comp, v in enumerate(vals):
+                    for comp, v in comp_values.items():
                         if callable(v):
                             fn = v
                         elif onp.isscalar(v):
@@ -1684,10 +1762,133 @@ class domain(MeshIOMixin):
             Function returning whether a point belongs to the tagged region,
             or ``None`` if the tag is unknown.
         """
+        # A domain.tag(name, where) region resolves to: the predicate AND on the domain boundary.
+        # feax applies a location-fn to EVERY node, so a bare predicate selecting a thick region
+        # would also pin interior dofs (a thick boundary predicate pinned the interior velocity and
+        # silently zeroed the interior pressure rows). Intersecting with the full-boundary region
+        # keeps Dirichlet boundary-restricted, while the exact predicate misses no boundary node
+        # (per-facet proximity alone can miss nodes on a curved boundary). NB: such a predicate is
+        # evaluated under JAX here, so it must be jax-traceable (jno.np / arithmetic, not bare numpy).
+        where = getattr(self, "_tag_predicates", {}).get(tag, None)
+        if where is not None:
+            dim = self.dimension
+            full = self._boundary_regions.get("boundary", None)
+
+            def _loc(p):  # feax requires a 1-argument location function
+                import jax.numpy as jnp
+
+                p = jnp.asarray(p)
+                pred = where(*(p[..., i] for i in range(dim)))
+                return pred if full is None else (pred & full.contains(p))
+
+            return _loc
+
         region = self._boundary_regions.get(tag, None)
         if region is None:
             return None
         return lambda p: region.contains(p)
+
+    def tag(self, name, where):
+        """Define a named region from a **spatial** predicate ``where(x, y[, z]) -> bool``.
+
+        One general method for naming any subset of the domain -- interior *or* boundary. The
+        region is abstract (predicate-based), so it is carried even without a mesh: the PINN
+        sampler draws the points satisfying ``where`` each step. After ``build_mesh`` it also maps
+        to mesh nodes/facets, and a ``jno.fem`` boundary condition bound to ``name`` is applied on
+        exactly the boundary facets where ``where`` holds (FEM location-functions are evaluated only
+        against the boundary, so a bare predicate selects the right subset -- there is no
+        interior/boundary flag). Untagged boundary stays natural (do-nothing), which is how you get a
+        natural outflow on a complex geometry.
+
+        Only the **spatial** coordinates are passed to ``where`` (never time): a region is the same
+        at every time level of a time-dependent domain. A shapely geometry may be passed instead of
+        a callable. Returns ``self`` (chainable). Example::
+
+            dom.tag("inlet",    lambda x, y: x < 1e-6)            # boundary subset -> Dirichlet there
+            dom.tag("cylinder", lambda x, y: (x-0.8)**2 + (y-0.5)**2 < 0.21**2)
+            # an untagged outlet edge is left as a natural (do-nothing) outflow
+        """
+        self._tag_predicates = getattr(self, "_tag_predicates", {})
+        if not callable(where):  # accept a shapely geometry
+            geom = where
+
+            def where(x, y, _g=geom):  # noqa: ANN001
+                from shapely import contains_xy as _cxy
+
+                return np.asarray(_cxy(_g, np.asarray(x), np.asarray(y)))
+
+        self._tag_predicates[name] = where
+        self._materialize_tag_pool(name, where)
+        self._register_tag_boundary_region(name, where)
+        # Lazy mesh-free sampling: register the parent geometry so PolygonDomain.sample can draw the
+        # region with sample=(n, None); _sample_interior filters by the predicate (resampled each step).
+        poly_tags = getattr(self, "_polygon_tags", None)
+        geom = getattr(self, "_active_geometry", None)
+        if poly_tags is not None and geom is not None and name not in poly_tags:
+            poly_tags[name] = ("interior", geom)
+        if name not in self.avaiable_mesh_tags:
+            self.avaiable_mesh_tags.append(name)
+        return self
+
+    def _register_tag_boundary_region(self, name, where):
+        """If any **boundary** facets satisfy ``where``, register a ``BoundaryRegion`` for ``name``
+        so a ``jno.fem`` term bound to it classifies as a boundary (Dirichlet / Neumann) condition
+        and ``variable(name, normals=True)`` works. Interior-only tags add nothing here (they stay
+        interior sampling regions). 2-D edges; 3-D triangles."""
+        full = self._boundary_regions.get("boundary")
+        if full is None:
+            return
+        dim = self.dimension
+        ents = full.edges if dim == 2 else full.triangles
+        if ents is None or len(ents) == 0:
+            return
+        ents = np.asarray(ents)  # (E, k, dim)
+        mid = ents.mean(axis=1)  # facet centroids (E, dim)
+        keep = np.asarray(where(*[mid[:, i] for i in range(dim)])).reshape(-1).astype(bool)
+        if not keep.any():
+            return
+        sub = ents[keep]
+        bpts = np.unique(sub.reshape(-1, sub.shape[-1])[:, :dim], axis=0)
+        self._boundary_regions[name] = BoundaryRegion(
+            tag=name,
+            dim=dim,
+            points=bpts,
+            edges=sub if dim == 2 else None,
+            triangles=sub if dim == 3 else None,
+            tol=full.tol,
+        )
+
+    def _materialize_tag_pool(self, name, where):
+        """Populate ``_mesh_pool[name]`` with the spatial points (interior + boundary) satisfying
+        ``where`` -- so ``variable(name)`` can sample it. Spatial coords only; on a time-dependent
+        domain the same spatial selection is carried at every time level."""
+        dim = self.dimension
+        pools = {k: np.asarray(self._mesh_pool[k]) for k in ("interior", "boundary") if k in self._mesh_pool}
+        time_dep = bool(self._is_time_dependent and self.time is not None)
+        n_time = int(self.time[2]) if time_dep else 0
+
+        if pools:
+            # Meshed: keep the existing mesh nodes (interior + boundary) satisfying the predicate.
+            ref = pools.get("interior", next(iter(pools.values())))
+            time_dep = ref.ndim >= 3 or time_dep
+            n_time = ref.shape[0] if ref.ndim >= 3 else n_time
+            spatial = lambda a: (a[0] if a.ndim >= 3 else a)[:, :dim]  # noqa: E731  time-invariant coords
+            cand = np.unique(np.concatenate([spatial(a) for a in pools.values()], axis=0), axis=0)
+        else:
+            # Mesh-free: rejection-sample the domain geometry, then filter by the predicate, so the
+            # PINN sampler can draw from the region each step (subsampling this candidate pool).
+            sampler = getattr(self, "_sample_points_in_polygon", None)
+            geom = getattr(self, "_active_geometry", None)
+            if sampler is None or geom is None:
+                return  # cannot materialise yet; nothing to sample from
+            cand = np.asarray(sampler(geom, 8000))[:, :dim]
+
+        mask = np.asarray(where(*[cand[:, i] for i in range(dim)])).reshape(-1).astype(bool)
+        sel = cand[mask]
+        if time_dep and n_time > 0:
+            self._mesh_pool[name] = np.broadcast_to(sel[None], (n_time, sel.shape[0], dim)).copy()
+        else:
+            self._mesh_pool[name] = sel
 
     def assemble_weak_form(self, expr, target="vpinn", **kwargs):
         """
@@ -2025,16 +2226,27 @@ class domain(MeshIOMixin):
         self._n_time = n_time
         new_mesh_pool = {}
         for tag, points in self._mesh_pool.items():
-            # points has shape (N, D_spatial)
+            # The "initial" tag is always (re)derived from "interior" below, so
+            # skip any pre-existing one (idempotent across re-meshing).
+            if tag == "initial":
+                continue
 
+            pts = np.asarray(points)
+            # Already time-broadcast (e.g. a second build_mesh on the same
+            # time-dependent domain) — keep the (T, N, D) pool as is.
+            if pts.ndim >= 3:
+                new_mesh_pool[tag] = pts
+                continue
+
+            # points has shape (N, D_spatial)
             if tag == "interior":
                 # Initial tag: spatial points at t=0 → (1, N, D_spatial)
-                new_mesh_pool["initial"] = points[np.newaxis, :, :]  # T=1
+                new_mesh_pool["initial"] = pts[np.newaxis, :, :]  # T=1
 
             # Tile spatial points across T time steps → (T, N, D_spatial)
             new_mesh_pool[tag] = np.broadcast_to(
-                points[np.newaxis, :, :],  # (1, N, D_spatial)
-                (n_time, *points.shape),  # (T, N, D_spatial)
+                pts[np.newaxis, :, :],  # (1, N, D_spatial)
+                (n_time, *pts.shape),  # (T, N, D_spatial)
             ).copy()  # copy so it's contiguous
 
         self._mesh_pool = new_mesh_pool

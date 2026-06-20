@@ -370,7 +370,11 @@ class Placeholder:
         if not isinstance(key, tuple):
             key = (key,)
         concrete_key = tuple(None if k is None else k for k in key)
-        return FunctionCall(lambda x, k=concrete_key: x[k], [self], name="getitem")
+        fc = FunctionCall(lambda x, k=concrete_key: x[k], [self], name="getitem")
+        # Record the key so consumers (e.g. the FEM driver) can recover a
+        # component index from `u[..., i]` rather than it being hidden in the closure.
+        fc.getitem_key = concrete_key
+        return fc
 
     def __call__(self, *args):
         """Call this expression with different variables (auto-wraps in operation)."""
@@ -2359,6 +2363,43 @@ class ModelCall(Placeholder):
         self.model.optimizer(opt_fn, lr=lr)
         return self
 
+    def constrain(self, transform: Callable) -> "ModelCall":
+        """Proxy for :meth:`Model.constrain` -- paramax reparameterization applied
+        before every forward pass (e.g. ``jax.nn.softplus`` to keep a parameter or a
+        ``jno.np.parameter(phi)`` coefficient field positive). Chains after
+        :meth:`mask`."""
+        self.model.constrain(transform)
+        return self
+
+    def regularize(self, kind: str = "h1seminorm", **kwargs):
+        """Regularization loss term for a FEM **field** parameter (``jno.np.parameter(phi)``).
+
+        Returns a (pointwise) loss term; reduce with ``.mean`` / ``.sum`` and weight it::
+
+            crux([data.mse, alpha * k.regularize('h1seminorm').mean])
+
+        ``kind`` (finite-element exact, assembled on the field's space):
+          * ``'h1seminorm'`` (``'h1'``, ``'smooth'``) -- H1 seminorm ``integral |grad k|^2 = k^T L k``
+            (``L`` = stiffness / discrete Laplacian). Smooth fields.
+          * ``'tv'`` -- total variation ``integral |grad k|`` (eps-smoothed; ``eps=`` kwarg).
+            Edge-preserving / piecewise-constant fields.
+          * ``'l2'`` (``'tikhonov'``, ``'ridge'``) -- ``integral (k - ref)^2 = (k-ref)^T M (k-ref)``
+            (``M`` = mass; ``ref=`` kwarg, default 0). Magnitude / prior penalty.
+          * ``'nonneg'`` -- soft positivity ``strength * relu(-k)`` (``strength=`` kwarg). For a
+            hard ``k > 0`` use :meth:`constrain` (e.g. ``jax.nn.softplus``).
+          * ``'bounded'`` -- soft two-sided barrier outside ``[lo, hi]`` (``lo=``, ``hi=`` kwargs).
+
+        Only valid for a nodal field parameter; other parameters raise.
+        """
+        if getattr(self.model, "_fem_field", None) is None:
+            raise ValueError(
+                "ModelCall.regularize(...) is only for a FEM field parameter "
+                "(jno.np.parameter(<fem symbol>)); this parameter is not one."
+            )
+        from .._fem import _field_regularizer_term
+
+        return _field_regularizer_term(self, kind, **kwargs)
+
     def bayesian(self, kernel_factory, *, prior=None, warmup=500, keep=1000, thin=1, adapt=True, **kernel_kwargs):
         """Proxy for :meth:`Model.bayesian`."""
         self.model.bayesian(
@@ -2812,6 +2853,40 @@ class FemLinearSystem:
         b = self.b if self.rhs_fn is None else self.rhs_fn(args)
         return A, b
 
+    def solve(self, solve_fn=None):
+        """Differentiable forward solve ``u = solve_fn(A(θ), b(θ))`` as a trace node.
+
+        Returns a :class:`FunctionCall` field. When it is evaluated (e.g. inside
+        ``crux.solve``), any runtime parameters ``θ`` are resolved to their current
+        values, :meth:`evaluate` forms ``A(θ), b(θ)``, and ``solve_fn`` solves them.
+        Gradients flow back to the parameters through ``solve_fn`` — so an inverse
+        problem is just ``crux([(fem.solve() - u_obs).mse], domain=...)`` where
+        ``fem = jno.fem([...])`` (see ``docs/inverse-problems.md``).
+
+        ``solve_fn`` is **your** solver: any ``(A, b) -> u`` callable. jNO writes no
+        solver code and imposes no library — the default is
+        :func:`jax.numpy.linalg.solve` (dense); pass e.g.
+        ``lambda A, b: lineax.linear_solve(lineax.MatrixLinearOperator(A), b).value`` to
+        choose another. Use a differentiable solver so ``∂u/∂θ`` exists.
+
+        Note: the FEM solve is global (one ``A``, ``b``, ``u``); enable x64
+        (``jax_enable_x64``) and set the parameter dtype to match — the feax
+        assembly is float64.
+        """
+        if solve_fn is None:
+
+            def solve_fn(A, b):
+                return jnp.linalg.solve(A, b)
+
+        names = list(self.runtime_parameter_exprs)
+        params = [self.runtime_parameter_exprs[n] for n in names]
+
+        def _solve(*values):
+            A, b = self.evaluate(dict(zip(names, values)))
+            return solve_fn(jnp.asarray(A), jnp.asarray(b).reshape(-1))
+
+        return FunctionCall(_solve, params, name="fem_solve")
+
     def __iter__(self):
         if self.is_parametric:
             raise TypeError(
@@ -2886,6 +2961,54 @@ class FemResidualOperator:
             -self.residual(u, args),
         )
 
+    def solve(self, solve_fn=None, *, u0=None):
+        """Differentiable nonlinear forward solve of ``R(u, θ) = 0`` as a trace node.
+
+        Returns a :class:`FunctionCall` field. When evaluated (e.g. inside
+        ``crux.solve``), runtime parameters ``θ`` are resolved to their current
+        values, ``residual_fn(u) = R(u, θ)`` is built, and ``solve_fn`` solves it.
+        Gradients reach the parameters when ``solve_fn`` is implicit-diff aware, so
+        an inverse problem is ``crux([(fem.solve() - u_obs).mse], domain=...)`` where
+        ``fem = jno.fem([...])``.
+
+        ``solve_fn`` is **your** solver: any ``(residual_fn, u0) -> u`` callable. The
+        default is a Newton ``optimistix.root_find`` (implicit differentiation, so
+        ``∂u/∂θ`` is exact without unrolling Newton); pass your own to choose a
+        different optimistix solver or library. jNO's analytic Jacobian
+        (:attr:`jacobian`) is available as an optional speed-up — by default the
+        solver auto-differentiates the residual.
+
+        ``u0`` is the initial guess (default: zeros of the operator size; enable
+        x64 — the feax residual is float64).
+        """
+        if u0 is None:
+            if self.size is None:
+                raise ValueError("FemResidualOperator.solve: pass u0= (operator size is unknown).")
+            u0 = jnp.zeros((int(self.size),), dtype=jnp.result_type(float))
+
+        if solve_fn is None:
+
+            def solve_fn(residual_fn, y0):
+                import optimistix as optx
+
+                sol = optx.root_find(
+                    lambda u, _a: residual_fn(u),
+                    optx.Newton(rtol=1e-8, atol=1e-8),
+                    y0,
+                    args=None,
+                    max_steps=100,
+                )
+                return sol.value
+
+        names = list(self.runtime_parameter_exprs)
+        params = [self.runtime_parameter_exprs[n] for n in names]
+
+        def _solve(*values):
+            args = dict(zip(names, values))
+            return solve_fn(lambda u: self.residual(u, args), u0)
+
+        return FunctionCall(_solve, params, name="fem_solve")
+
     def __repr__(self):
         return (
             "FemResidualOperator("
@@ -2941,10 +3064,14 @@ class TrialFunction(Placeholder):
           (2,2) -> second-order tensor, etc.
     """
 
-    def __init__(self, name="u", value_shape=()):
+    def __init__(self, name="u", value_shape=(), order=1):
         self.name = name
         self.value_shape = tuple(value_shape)
+        self.order = int(order)  # element polynomial degree for this field (P1=1, P2=2)
         self.op_id = _next_op_id()
+        # Identifies the field this symbol belongs to; a (trial, test) pair from one
+        # fem_symbols() call shares a key so the coupled kernel can pair u<->v.
+        self.field_key = self.op_id
 
     @property
     def num_components(self) -> int:
@@ -2954,6 +3081,38 @@ class TrialFunction(Placeholder):
         for s in self.value_shape:
             n *= int(s)
         return n
+
+    def _field_view(self):
+        n = len(self.value_shape)
+        if n == 0:
+            return self.scalar
+        if n == 1:
+            return self.vector
+        return self.matrix
+
+    def partials(self, **named_vars):
+        """Bind named coordinate Variables for attribute-style derivatives.
+
+        ``u.bind(x=xi, y=yi).x`` -> ``du/dx`` (a ``Jacobian`` node identical to
+        ``u.d(xi)``); ``.xx`` / ``.xy`` give higher partials. Mirrors the PINN
+        field idiom ``net(x).scalar.bind(x=x)``.
+        """
+        return self._field_view().partials(**named_vars)
+
+    bind = partials
+
+    def __call__(self, *coords, **named):
+        """Evaluate this field symbol on the region carried by ``coords``.
+
+        Positional coordinates bind to ``x`` / ``y`` / ``z`` in order; extra
+        keyword bindings (e.g. ``t=...``) pass through. ``u(x, y)`` is sugar for
+        ``u.bind(x=x, y=y)`` so the same gesture works as in a PINN (``net(x)``).
+        """
+        binding = {axis: c for axis, c in zip(("x", "y", "z"), coords)}
+        binding.update(named)
+        if not binding:
+            raise TypeError(f"{type(self).__name__} must be called with coordinate variables, e.g. u(x, y).")
+        return self.partials(**binding)
 
     def __repr__(self):
         return f"TrialFunction({self.name}, value_shape={self.value_shape})"
@@ -2978,10 +3137,13 @@ class TestFunction(Placeholder):
           (2,2) -> second-order tensor, etc.
     """
 
-    def __init__(self, name="phi", value_shape=()):
+    def __init__(self, name="phi", value_shape=(), order=1):
         self.name = name
         self.value_shape = tuple(value_shape)
+        self.order = int(order)  # element polynomial degree for this field (P1=1, P2=2)
         self.op_id = _next_op_id()
+        # Shared with the paired trial (set by variational_symbols) to identify the field.
+        self.field_key = self.op_id
 
     @property
     def num_components(self) -> int:
@@ -2991,6 +3153,37 @@ class TestFunction(Placeholder):
         for s in self.value_shape:
             n *= int(s)
         return n
+
+    def _field_view(self):
+        n = len(self.value_shape)
+        if n == 0:
+            return self.scalar
+        if n == 1:
+            return self.vector
+        return self.matrix
+
+    def partials(self, **named_vars):
+        """Bind named coordinate Variables for attribute-style derivatives.
+
+        ``phi.bind(x=xi, y=yi).x`` -> ``dphi/dx`` (a ``Jacobian`` node identical
+        to ``phi.d(xi)``); ``.xx`` / ``.xy`` give higher partials.
+        """
+        return self._field_view().partials(**named_vars)
+
+    bind = partials
+
+    def __call__(self, *coords, **named):
+        """Evaluate this test-function symbol on the region carried by ``coords``.
+
+        Positional coordinates bind to ``x`` / ``y`` / ``z`` in order; extra
+        keyword bindings pass through. ``phi(x, y)`` is sugar for
+        ``phi.bind(x=x, y=y)``.
+        """
+        binding = {axis: c for axis, c in zip(("x", "y", "z"), coords)}
+        binding.update(named)
+        if not binding:
+            raise TypeError(f"{type(self).__name__} must be called with coordinate variables, e.g. phi(x, y).")
+        return self.partials(**binding)
 
     def __repr__(self):
         return f"TestFunction({self.name}, value_shape={self.value_shape})"
