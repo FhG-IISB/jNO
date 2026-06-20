@@ -29,7 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .trace import FemLinearSystem, GaugePin, TestFunction, TrialFunction, Variable
+from .trace import FemLinearSystem, GaugePin, ModelCall, TestFunction, TrialFunction, Variable
 
 __all__ = ["fem", "FEM"]
 
@@ -1036,6 +1036,11 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     if periodic_ties and not constraints:
         raise ValueError("jno.fem: only periodic ties were given — add the PDE weak form (and any other conditions).")
 
+    # VPINN: a network trial (``u = net(x, y)`` written into the weak form) makes jno.fem
+    # test-project the weak form onto the FE test space -> a trainable residual loss, not an FE
+    # system. Detected by a ModelCall; lowered after the shared quadrature setup (see below).
+    is_vpinn = any(_contains(c, ModelCall) for c in constraints)
+
     multifield = len(_field_keys(constraints)) > 1
     if vec is None and not multifield:
         vec = _infer_vec(constraints)  # single-field only (coupled fields carry per-field vec)
@@ -1148,6 +1153,9 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         else:
             raise ValueError("jno.fem: a residual contains neither the trial nor the test function.")
 
+    if is_vpinn and (getattr(domain, "dimension", None) == 1 or multifield):
+        raise NotImplementedError("jno.fem VPINN (network trial) is currently single-field 2D/3D only.")
+
     # ---- 1D (segment): feax has no LINE2 element, so assemble natively ----
     # The native 1D assembler reuses the same integrand evaluator and returns the
     # same (op, mode) the FEM container expects; it needs none of init_fem's feax
@@ -1187,6 +1195,31 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     if boundary_terms:
         bcs.append(neumann(list(boundary_terms.keys())))
     domain.init_fem(element_type=element_type, quad_degree=quad_degree, bcs=bcs, vec=vec, fem_solver=True)
+
+    # ---- VPINN: test-project the (now fem_gauss-tagged) weak form onto the FE test space ----
+    # The network trial already sits inside the weak terms; assemble_weak_form(target="vpinn")
+    # returns a GroupedAssembly whose .mse is the trainable test-projected residual (for jno.core).
+    # The Dirichlet condition (u(boundary) - g) declares which test functions vanish on the
+    # boundary -> its nodes are masked from the residual (else the exact solution's du/dn flux is
+    # an irreducible loss term and training diverges from the solution).
+    if is_vpinn:
+        from .utils.solver.weak_form import assemble_weak_form
+
+        if not volume_terms:
+            raise ValueError("jno.fem VPINN: no volume weak term (expected the test-projected PDE residual).")
+        # The weak-term coords were retagged to the quadrature tags (fem_gauss / gauss_<region>);
+        # trigger those variables' sampling so the test-projected residual resolves them when it is
+        # re-evaluated each training step (crux.solve), not only during this assembly pass.
+        domain.variable("fem_gauss")
+        for region in boundary_terms:
+            domain.variable(f"gauss_{region}")
+        weak = volume_terms[0]
+        for t in volume_terms[1:]:
+            weak = weak + t
+        for region_terms in boundary_terms.values():
+            for t in region_terms:
+                weak = weak + t
+        return assemble_weak_form(domain, weak, target="vpinn")
 
     # ---- build IR with explicit regions, then assemble through feax ----
     # Split each weak constraint into additive sub-terms (one LoweredChannelTerm

@@ -242,3 +242,40 @@ def test_dump_tree_on_vpinn_weak_form():
 
     assert isinstance(tree, str)
     assert len(tree) > 0
+
+
+def test_vpinn_via_jno_fem_solves_poisson():
+    """VPINN entirely through dom.fem_symbols() + jno.fem (no init_fem, no weak.assemble): a network
+    trial u=net(x,y) written into the weak form is detected (ModelCall) and test-projected onto the
+    FE test space; the Dirichlet condition u(boundary)-0 declares which test functions vanish on the
+    boundary (so their du/dn-flux residual is masked). Trains to the analytic Poisson solution."""
+    import numpy as np
+
+    optax = pytest.importorskip("optax")
+
+    dom = make_domain(mesh_size=0.2)
+    u, phi = dom.fem_symbols()
+    xi, yi, _ = dom.variable("interior", split=True)
+    xb, yb, _ = dom.variable("boundary", split=True)
+    net = jnn.nn.wrap(foundax.mlp(2, hidden_dims=24, num_layers=3, activation=jax.nn.tanh, key=jax.random.PRNGKey(0)))
+    bc = xi * (1 - xi) * yi * (1 - yi)
+    u_net = net(xi, yi) * bc  # hard-BC ansatz: vanishes on the [0,1]^2 boundary
+    phii = phi.bind(x=xi, y=yi)
+    f = 2.0 * (xi * (1 - xi) + yi * (1 - yi))  # -lap(x(1-x)y(1-y)) = f
+
+    weak = jnn.grad(u_net, xi) * jnn.grad(phii, xi) + jnn.grad(u_net, yi) * jnn.grad(phii, yi) - f * phii
+    pde = jno.fem([weak, u(xb, yb) - 0.0])  # net trial + Dirichlet (masks boundary test functions)
+    assert type(pde).__name__ == "GroupedAssembly" and hasattr(pde, "mse")
+
+    net.optimizer(optax.adam(1e-2))
+    crux = jno.core([pde.mse], domain=dom)
+    crux.solve(1500)
+
+    # verify the trained net solves the PDE on a fresh grid (eval the prediction, not the loss)
+    test_dom = make_domain(mesh_size=0.12)
+    xt, yt, _ = test_dom.variable("interior", split=True)
+    bc_t = xt * (1 - xt) * yt * (1 - yt)
+    pred = np.asarray(crux.eval([net(xt, yt) * bc_t], domain=test_dom)).reshape(-1)
+    exact = np.asarray(crux.eval([bc_t], domain=test_dom)).reshape(-1)
+    rel = float(np.linalg.norm(pred - exact) / np.linalg.norm(exact))
+    assert rel < 1e-2, f"VPINN did not solve Poisson: rel-L2={rel:.3e}"
