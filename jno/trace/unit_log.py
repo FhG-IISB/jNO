@@ -349,15 +349,21 @@ def infer(node) -> Optional[Unit]:
 # ===========================================================================
 
 
-def _infer_scale(node, smap: Dict[int, Optional[float]]) -> Optional[float]:
+def _infer_scale(node, smap: Dict[int, Optional[float]], coeff_neutral: bool = False) -> Optional[float]:
     """Magnitude (float) of *node* from child magnitudes in *smap*.
 
     Sibling of :func:`_infer_unit` with identical dispatch and the same
     :func:`_children` traversal.  ``None`` = not derivable (an undeclared leaf,
     or an op on one).
+
+    When *coeff_neutral* is set, coefficient leaves (``Constant``/``TensorTag``)
+    contribute magnitude 1 instead of their declared scale — this yields the
+    coordinate-plus-field magnitude ``Kᵢ`` used by the rescale transform, as
+    opposed to the full magnitude ``Sᵢ``.
     """
     from . import (
         BinaryOp,
+        Constant,
         FunctionCall,
         Hessian,
         Integral,
@@ -365,12 +371,16 @@ def _infer_scale(node, smap: Dict[int, Optional[float]]) -> Optional[float]:
         Jacobian,
         Literal,
         TemporalDerivative,
+        TensorTag,
         TestFunction,
         Tracker,
     )
 
     def cs(child):  # child scale
         return smap.get(id(child))
+
+    if coeff_neutral and isinstance(node, (Constant, TensorTag)):
+        return 1.0
 
     # --- leaves --------------------------------------------------------------
     if isinstance(node, Literal):
@@ -455,8 +465,12 @@ def _infer_scale(node, smap: Dict[int, Optional[float]]) -> Optional[float]:
     return getattr(node, "_scale", None)
 
 
-def _scale_of(node) -> Optional[float]:
-    """Run a fresh non-mutating magnitude walk and return *node*'s magnitude."""
+def _scale_of(node, coeff_neutral: bool = False) -> Optional[float]:
+    """Run a fresh non-mutating magnitude walk and return *node*'s magnitude.
+
+    With *coeff_neutral*, coefficient leaves count as magnitude 1 (returns the
+    coordinate-plus-field magnitude ``Kᵢ`` rather than the full ``Sᵢ``).
+    """
     smap: Dict[int, Optional[float]] = {}
     visited = set()
 
@@ -466,7 +480,7 @@ def _scale_of(node) -> Optional[float]:
         visited.add(id(n))
         for child in _children(n):
             visit(child)
-        smap[id(n)] = _infer_scale(n, smap)
+        smap[id(n)] = _infer_scale(n, smap, coeff_neutral)
 
     visit(node)
     return smap[id(node)]
@@ -590,3 +604,152 @@ def nondimensionalize(nodes, ref: Optional[int] = None, report: Optional[str] = 
     if report is not None:
         result.write(report)
     return result
+
+
+# ===========================================================================
+# Non-dimensionalization (Phase B: transform a problem to dimensionless form)
+# ---------------------------------------------------------------------------
+# The transform is Phase A applied constructively.  Each additive term is
+# multiplied by ``gᵢ = Kᵢ / S_ref`` where ``Kᵢ`` is the term's *coordinate +
+# field* magnitude (coefficients excluded) and ``S_ref`` the reference term's
+# full magnitude.  On a coordinate context rescaled to O(1) — and with the
+# network/trial output representing the O(1) dimensionless field — the
+# transformed residual evaluates to ``Σ signᵢ·πᵢ·term̂ᵢ`` (the dimensionless
+# residual whose leading coefficients are the Fourier/Péclet numbers).
+#
+# Note: the transformed graph is *not* symbolically dimensionless — the
+# dimensional coordinates/coefficients remain in it; dimensionlessness is
+# realized numerically once the rescaled (O(1)) context and field are supplied.
+# Multiplying by ``gᵢ`` (rather than substituting coefficients) is the
+# least-invasive correct mechanism: it never touches Variable identity, so the
+# derivative semantics of Jacobian/Hessian are preserved.
+# ===========================================================================
+
+
+def _scale_columns(arr, d0: int, d1: Optional[int], factor: float):
+    """Return *arr* with last-axis columns ``[d0:d1]`` multiplied by *factor*."""
+    hi = arr.shape[-1] if d1 is None else d1
+    if hasattr(arr, "at"):  # jax array — functional update
+        return arr.at[..., d0:hi].multiply(factor)
+    import numpy as _np
+
+    out = _np.array(arr, copy=True)
+    out[..., d0:hi] = out[..., d0:hi] * factor
+    return out
+
+
+class Rescaler:
+    """Back-map between physical and dimensionless (O(1)) coordinates/fields.
+
+    Produced by :func:`rescale`.  Holds the characteristic length(s) ``L`` of
+    each coordinate and the field scale ``U`` so a rescaled problem can be set
+    up and its solution recovered: ``u_physical(x) = U · û(x / L)``.
+    """
+
+    def __init__(self, coords, field_scale: Optional[float]):
+        # coords: list of (tag, (d0, d1), L) — one per scaled coordinate column
+        self._coords = coords
+        self.field_scale = field_scale
+
+    def rescaled_context(self, context: dict) -> dict:
+        """Return a new context dict with each coordinate column scaled to O(1)."""
+        out = dict(context)
+        for tag, (d0, d1), L in self._coords:
+            if tag in out and L:
+                out[tag] = _scale_columns(out[tag], d0, d1, 1.0 / L)
+        return out
+
+    def rescaled_domain(self, domain):
+        """Return a shallow copy of *domain* whose context is rescaled to O(1).
+
+        The user's *domain* is never mutated.
+        """
+        import copy as _copy
+
+        dom = _copy.copy(domain)
+        dom.context = self.rescaled_context(domain.context)
+        return dom
+
+    def to_physical(self, field):
+        """Map a dimensionless field value ``û`` back to physical units (``U·û``)."""
+        return field if self.field_scale is None else field * self.field_scale
+
+    def __repr__(self):
+        return f"Rescaler(coords={len(self._coords)}, field_scale={self.field_scale})"
+
+
+def _collect_scaled_leaves(constraints):
+    """Find scaled coordinate Variables and the field scale across *constraints*."""
+    from . import Model, ModelCall, TrialFunction, Variable
+
+    coords: Dict[int, tuple] = {}
+    field_scales: List[float] = []
+    seen = set()
+    stack = list(constraints)
+    while stack:
+        n = stack.pop()
+        if id(n) in seen:
+            continue
+        seen.add(id(n))
+        s = getattr(n, "_scale", None)
+        if s is not None:
+            if isinstance(n, Variable):
+                d = tuple(n.dim) if n.dim is not None else (0, None)
+                coords[(n.tag, d)] = (n.tag, d, s)
+            elif isinstance(n, (Model, ModelCall, TrialFunction)):
+                field_scales.append(s)
+        stack.extend(_children(n))
+    return list(coords.values()), (field_scales[0] if field_scales else None)
+
+
+def rescale(constraints, domain=None):
+    """Transform residual constraint(s) into a solvable dimensionless form.
+
+    Multiplies each additive term of every residual by ``gᵢ = Kᵢ / S_ref`` so
+    that, evaluated on the :class:`Rescaler`'s O(1) coordinate context (and with
+    the network/trial output representing the dimensionless field), the residual
+    becomes ``Σ signᵢ·πᵢ·term̂ᵢ`` — O(1) and dimensionless, with the
+    dimensionless groups (Fourier/Péclet) as the leading coefficients.
+
+    Phase B — opt-in.  Returns ``(transformed_constraints, rescaler)``; nothing
+    is solved and the input *domain* is never mutated.
+
+    Parameters
+    ----------
+    constraints:
+        A residual expression or a sequence of them.
+    domain:
+        Unused for the transform itself; accepted so callers can pair it with
+        ``rescaler.rescaled_domain(domain)``.
+
+    Returns
+    -------
+    (list, Rescaler)
+        The transformed constraints (same length/order as the input) and the
+        back-map :class:`Rescaler`.
+    """
+    from . import BinaryOp, Literal
+
+    single = not isinstance(constraints, (list, tuple))
+    items = [constraints] if single else list(constraints)
+
+    transformed = []
+    for root in items:
+        terms = _additive_terms(root)
+        full = [_scale_of(t) for _, t in terms]
+        kvals = [_scale_of(t, coeff_neutral=True) for _, t in terms]
+
+        ref_index = next((i for i, s in enumerate(full) if s), None)
+        s_ref = full[ref_index] if ref_index is not None else None
+
+        node = None
+        for (sign, term), k in zip(terms, kvals):
+            g = (k / s_ref) if (k is not None and s_ref) else 1.0
+            coeff = sign * g
+            piece = term if coeff == 1.0 else BinaryOp("*", Literal(coeff), term)
+            node = piece if node is None else BinaryOp("+", node, piece)
+        transformed.append(node if node is not None else root)
+
+    coords, field_scale = _collect_scaled_leaves(items)
+    rescaler = Rescaler(coords, field_scale)
+    return (transformed[0] if single else transformed), rescaler

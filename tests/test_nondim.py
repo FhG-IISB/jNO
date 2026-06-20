@@ -119,3 +119,114 @@ class TestReport:
         assert path.exists()
         text = path.read_text()
         assert "π=" in text and "residual:" in text
+
+
+# ======================================================================
+# Phase B — transform to a solvable dimensionless problem
+# ======================================================================
+def _coefficient(value):
+    """A realistic dimensional coefficient leaf (Constant, not a bare Variable)."""
+    import jax.numpy as jnp
+
+    from jno.trace import Constant
+
+    return Constant("P", "c", jnp.asarray(value))
+
+
+def _leading_coeff(term_node):
+    """Effective scalar coefficient prepended to a transformed additive term."""
+    from jno.trace import BinaryOp, Literal
+
+    if isinstance(term_node, BinaryOp) and term_node.op == "*" and isinstance(term_node.left, Literal):
+        return float(term_node.left.value)
+    return 1.0
+
+
+class TestRescaleTransform:
+    def test_heat_transform_coefficient_is_fourier(self):
+        # The transformed diffusion term's effective dimensionless coefficient,
+        # combined with the physical α₀, is exactly the Fourier number ατ/L².
+        from jno.trace.unit_log import _additive_terms
+
+        L, tau, U, alpha0 = 0.1, 5.0, 50.0, 1e-5
+        x = make_var("x").unit("m").scale(L)
+        t = make_var("t").unit("s").scale(tau)
+        u = make_var("u").unit("K").scale(U)
+        alpha = _coefficient(alpha0).unit("m^2/s").scale(alpha0)
+
+        residual = u.d(t) - alpha * u.d2(x)
+        transformed, rescaler = jno.units.rescale(residual)
+
+        terms = _additive_terms(transformed)
+        assert len(terms) == 2
+        # time term is the reference → g = 1 (no Literal prepended)
+        assert _leading_coeff(terms[0][1]) == 1.0
+        # diffusion term: |g| = τ/L²  ⇒  |g|·α₀ = Fourier
+        g_diff = abs(_leading_coeff(terms[1][1]))
+        assert math.isclose(g_diff, tau / L**2, rel_tol=1e-9)
+        assert math.isclose(g_diff * alpha0, alpha0 * tau / L**2, rel_tol=1e-9)
+        assert isinstance(rescaler, jno.units.Rescaler)
+
+    def test_transform_is_not_symbolically_dimensionless(self):
+        # The graph keeps dimensional coords/coefficients; dimensionlessness is
+        # realized numerically on the rescaled context (documents the design).
+        x = make_var("x").unit("m").scale(0.1)
+        t = make_var("t").unit("s").scale(5.0)
+        u = make_var("u").unit("K").scale(50.0)
+        alpha = _coefficient(1e-5).unit("m^2/s").scale(1e-5)
+        transformed, _ = jno.units.rescale(u.d(t) - alpha * u.d2(x))
+        assert jno.units.infer(transformed) == Unit.parse("K/s")
+
+
+class TestRescaler:
+    def test_rescaled_context_scales_columns(self):
+        import numpy as np
+
+        from jno.trace.unit_log import Rescaler
+
+        # one tag "xy" with x in column 0 (L=0.1) and y in column 1 (L=0.2)
+        rescaler = Rescaler([("xy", (0, 1), 0.1), ("xy", (1, 2), 0.2)], field_scale=50.0)
+        ctx = {"xy": np.array([[2.0, 4.0], [6.0, 8.0]])}
+        out = rescaler.rescaled_context(ctx)
+        assert np.allclose(out["xy"][:, 0], [20.0, 60.0])  # /0.1
+        assert np.allclose(out["xy"][:, 1], [20.0, 40.0])  # /0.2
+        # original untouched
+        assert np.allclose(ctx["xy"], [[2.0, 4.0], [6.0, 8.0]])
+
+    def test_rescaled_domain_does_not_mutate_original(self):
+        import types
+
+        import numpy as np
+
+        from jno.trace.unit_log import Rescaler
+
+        dom = types.SimpleNamespace(context={"x": np.array([[1.0], [2.0]])})
+        rescaler = Rescaler([("x", (0, 1), 0.5)], field_scale=10.0)
+        new = rescaler.rescaled_domain(dom)
+        assert np.allclose(new.context["x"], [[2.0], [4.0]])  # /0.5
+        assert np.allclose(dom.context["x"], [[1.0], [2.0]])  # original intact
+
+    def test_to_physical_applies_field_scale(self):
+        import numpy as np
+
+        from jno.trace.unit_log import Rescaler
+
+        rescaler = Rescaler([], field_scale=50.0)
+        assert np.allclose(rescaler.to_physical(np.array([0.5, 1.0])), [25.0, 50.0])
+
+    def test_role_classification_by_node_type(self):
+        # The crux of a *solvable* transform: tell coordinates (domain Variables)
+        # apart from the field (TrialFunction/Model) and coefficients (Constant)
+        # by node type — they share units but get different rescaling operations.
+        from jno.trace import TrialFunction
+        from jno.trace.unit_log import _collect_scaled_leaves
+
+        x = make_var("x").unit("m").scale(0.1)
+        u = TrialFunction("u").unit("K").scale(50.0)  # the field
+        alpha = _coefficient(1e-5).unit("m^2/s").scale(1e-5)  # a coefficient
+
+        coords, field_scale = _collect_scaled_leaves([alpha * u.d2(x)])
+        assert field_scale == 50.0  # field U picked up from the TrialFunction
+        coord_tags = {tag for tag, _, _ in coords}
+        assert x.tag in coord_tags  # the coordinate is rescaled
+        assert "u" not in coord_tags  # the field is NOT a coordinate

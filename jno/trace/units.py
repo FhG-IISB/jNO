@@ -188,9 +188,27 @@ _ALIASES: _Dict[str, Unit] = {
 # Public entry points live in unit_log; re-export here so the whole feature is
 # reachable as ``jno.units.*`` (``jno.units.check``, ``jno.units.Unit``, …).
 # Imported last so the algebra above is fully defined before unit_log loads it.
-from .unit_log import NondimReport, UnitLogger, check, infer, nondimensionalize  # noqa: E402
+from .unit_log import (  # noqa: E402
+    NondimReport,
+    Rescaler,
+    UnitLogger,
+    check,
+    infer,
+    nondimensionalize,
+    rescale,
+)
 
-__all__ = ["Unit", "DIMENSIONLESS", "UnitLogger", "check", "infer", "nondimensionalize", "NondimReport"]
+__all__ = [
+    "Unit",
+    "DIMENSIONLESS",
+    "UnitLogger",
+    "check",
+    "infer",
+    "nondimensionalize",
+    "NondimReport",
+    "rescale",
+    "Rescaler",
+]
 
 
 def __dir__():
