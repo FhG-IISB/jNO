@@ -2374,34 +2374,63 @@ class ModelCall(Placeholder):
         self.model.constrain(transform)
         return self
 
-    def regularize(self, kind: str = "h1seminorm", **kwargs):
-        """Regularization loss term for a FEM **field** parameter (``jno.np.parameter(phi)``).
+    def regularize(self, kind: str = "h1seminorm", *variables, **kwargs):
+        """Regularization loss term for a field -- one surface for FEM and coordinate fields.
 
-        Returns a (pointwise) loss term; reduce with ``.mean`` / ``.sum`` and weight it::
+        For a **FEM nodal-parameter** field (``jno.np.parameter(<fem symbol>)``) this is the
+        FEM-exact penalty assembled on the field's element space. For any **other** field (e.g.
+        a coordinate network ``k(x, y)``) it is the autodiff form -- pass the spatial variables
+        to differentiate against. Returns a pointwise loss term; reduce with ``.mean`` / ``.sum``
+        and weight it::
 
-            crux([data.mse, alpha * k.regularize('h1seminorm').mean])
+            crux([data.mse, alpha * k.regularize('smooth', x, y).mean])   # coordinate field
+            crux([data.mse, alpha * k.regularize('h1seminorm').mean])     # FEM field parameter
 
-        ``kind`` (finite-element exact, assembled on the field's space):
-          * ``'h1seminorm'`` (``'h1'``, ``'smooth'``) -- H1 seminorm ``integral |grad k|^2 = k^T L k``
-            (``L`` = stiffness / discrete Laplacian). Smooth fields.
-          * ``'tv'`` -- total variation ``integral |grad k|`` (eps-smoothed; ``eps=`` kwarg).
-            Edge-preserving / piecewise-constant fields.
-          * ``'l2'`` (``'tikhonov'``, ``'ridge'``) -- ``integral (k - ref)^2 = (k-ref)^T M (k-ref)``
-            (``M`` = mass; ``ref=`` kwarg, default 0). Magnitude / prior penalty.
-          * ``'nonneg'`` -- soft positivity ``strength * relu(-k)`` (``strength=`` kwarg). For a
-            hard ``k > 0`` use :meth:`constrain` (e.g. ``jax.nn.softplus``).
+        ``kind``:
+          * ``'smooth'`` (``'h1seminorm'``, ``'h1'``) -- H1 seminorm ``∫|∇k|²`` (FEM: ``kᵀLk``).
+            Encourages smooth fields.
+          * ``'tv'`` -- total variation ``∫|∇k|`` (FEM: eps-smoothed, ``eps=`` kwarg). Sharp interfaces.
+          * ``'l2'`` (``'tikhonov'``, ``'ridge'``) -- ``∫(k-ref)²`` (``ref=`` kwarg). **FEM only.**
+          * ``'nonneg'`` -- soft positivity ``strength·relu(-k)`` (``strength=`` kwarg). For a hard
+            ``k > 0`` use :meth:`constrain` (e.g. ``jax.nn.softplus``).
           * ``'bounded'`` -- soft two-sided barrier outside ``[lo, hi]`` (``lo=``, ``hi=`` kwargs).
-
-        Only valid for a nodal field parameter; other parameters raise.
         """
-        if getattr(self.model, "_fem_field", None) is None:
-            raise ValueError(
-                "ModelCall.regularize(...) is only for a FEM field parameter "
-                "(jno.np.parameter(<fem symbol>)); this parameter is not one."
-            )
-        from .._fem import _field_regularizer_term
+        if getattr(self.model, "_fem_field", None) is not None:
+            from .._fem import _field_regularizer_term
 
-        return _field_regularizer_term(self, kind, **kwargs)
+            return _field_regularizer_term(self, kind, **kwargs)
+
+        # Coordinate field -> autodiff form (no FE space to assemble against).
+        k = kind.lower()
+        if k in ("smooth", "h1seminorm", "h1"):
+            if not variables:
+                raise ValueError(
+                    "regularize('smooth', ...) on a coordinate field needs the spatial variables, "
+                    "e.g. k.regularize('smooth', x, y)."
+                )
+            acc = self.d(variables[0]) ** 2
+            for v in variables[1:]:
+                acc = acc + self.d(v) ** 2
+            return acc
+        if k == "tv":
+            if not variables:
+                raise ValueError("regularize('tv', ...) needs the spatial variables, e.g. k.regularize('tv', x, y).")
+            sq = self.d(variables[0]) ** 2
+            for v in variables[1:]:
+                sq = sq + self.d(v) ** 2
+            return sq**0.5
+        if k == "nonneg":
+            return FunctionCall(lambda f, _s=kwargs.get("strength", 1.0): _s * jnp.maximum(0.0, -f), [self], name="nonneg")
+        if k == "bounded":
+            return FunctionCall(
+                lambda f, _lo=kwargs["lo"], _hi=kwargs["hi"]: jnp.maximum(0.0, f - _hi) + jnp.maximum(0.0, _lo - f),
+                [self],
+                name="bounded",
+            )
+        raise ValueError(
+            f"regularize: kind {kind!r} is not available for a coordinate field "
+            "('l2'/'tikhonov' is FEM-only); use 'smooth', 'tv', 'nonneg', or 'bounded'."
+        )
 
     def bayesian(self, kernel_factory, *, prior=None, warmup=500, keep=1000, thin=1, adapt=True, **kernel_kwargs):
         """Proxy for :meth:`Model.bayesian`."""

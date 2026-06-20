@@ -231,7 +231,7 @@ def test_nodal_field_parameter_recovers_via_crux():
 
     # Recover the full nodal field k(x) through crux.solve (the differentiable
     # re-assembled solve). Well-posed enough here from full-field data; field
-    # inversion in general needs regularization (jno.fn.regularize), which composes
+    # inversion in general needs regularization (k.regularize(...)), which composes
     # as an extra loss term.
     k.dtype(jnp.float64)
     k.initialize(jax.nn.initializers.constant(1.0))  # start k=1 everywhere (nonsingular)

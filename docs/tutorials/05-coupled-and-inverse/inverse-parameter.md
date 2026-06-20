@@ -62,7 +62,7 @@ print(f"Recovered parameters: a={_a[0]:.3f}, b={_b[0]:.3f}, c={_c[0]:.3f}")
 
 For field identification (recovering a spatially-varying `k(x,y)` rather than a scalar), see the **[Inverse Problems](../../inverse-problems.md)** guide, which covers:
 
-- `jno.fn.regularize` — smooth, TV, positivity and bounded penalties on identified fields
+- `field.regularize(...)` — smooth, TV, positivity and bounded penalties on identified fields
 - `Model.constrain(transform)` — hard parameter constraints via paramax reparameterization
 - `jno.domain.from_array` — attaching sparse sensor observations without file I/O
 
