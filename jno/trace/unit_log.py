@@ -374,10 +374,14 @@ def _infer_scale(node, smap: Dict[int, Optional[float]], coeff_neutral: bool = F
         TensorTag,
         TestFunction,
         Tracker,
+        Variable,
     )
 
     def cs(child):  # child scale
         return smap.get(id(child))
+
+    def vs(v):  # coordinate scale, read DIRECTLY (not from the possibly-neutralized smap)
+        return getattr(v, "_scale", None)
 
     if coeff_neutral and isinstance(node, (Constant, TensorTag)):
         return 1.0
@@ -410,10 +414,10 @@ def _infer_scale(node, smap: Dict[int, Optional[float]], coeff_neutral: bool = F
             return sl**exponent
         return None
 
-    # --- derivatives ---------------------------------------------------------
+    # --- derivatives (read coordinate scales DIRECTLY via vs(), see vs note) --
     if isinstance(node, Jacobian):
         st = cs(node.target)
-        var_scales = [cs(v) for v in node.variables]
+        var_scales = [vs(v) for v in node.variables]
         if st is None or any(s is None for s in var_scales):
             return None
         if len(set(var_scales)) > 1:
@@ -422,7 +426,7 @@ def _infer_scale(node, smap: Dict[int, Optional[float]], coeff_neutral: bool = F
 
     if isinstance(node, Hessian):
         st = cs(node.target)
-        var_scales = [cs(v) for v in node.variables]
+        var_scales = [vs(v) for v in node.variables]
         if st is None or any(s is None for s in var_scales):
             return None
         if node.trace:  # Laplacian
@@ -432,20 +436,20 @@ def _infer_scale(node, smap: Dict[int, Optional[float]], coeff_neutral: bool = F
         return None
 
     if isinstance(node, TemporalDerivative):
-        st, sv = cs(node.target), cs(getattr(node, "time_var", None))
+        st, sv = cs(node.target), vs(getattr(node, "time_var", None))
         return st / sv if st is not None and sv is not None else None
 
     if isinstance(node, Integral):
         st = cs(node.target)
         coord = _first_spatial_var(node.target)
-        sc = smap.get(id(coord)) if coord is not None else None
+        sc = vs(coord) if coord is not None else None
         if st is None or sc is None:
             return None
         ndim = int(getattr(coord, "size", 1) or 1)
         return st * (sc**ndim)
 
     if isinstance(node, IntegralTime):
-        st, sv = cs(node.target), cs(getattr(node, "time_var", None))
+        st, sv = cs(node.target), vs(getattr(node, "time_var", None))
         return st * sv if st is not None and sv is not None else None
 
     # --- function calls ------------------------------------------------------
@@ -461,7 +465,16 @@ def _infer_scale(node, smap: Dict[int, Optional[float]], coeff_neutral: bool = F
             return first
         return None
 
-    # --- leaves carrying a user-declared scale (Variable/TrialFunction/...) ---
+    # --- bare-coordinate leaf -------------------------------------------------
+    # A coordinate Variable appearing as a value (child of arithmetic/function)
+    # contributes magnitude 1 in the coefficient-excluded K-walk: its scale L is
+    # materialized in the graph by the bare-coordinate rewrite, so counting it
+    # here too would double-apply L.  Derivative rules above read the real L via
+    # vs() directly, independent of this neutralization.
+    if isinstance(node, Variable):
+        return 1.0 if coeff_neutral else getattr(node, "_scale", None)
+
+    # --- other leaves carrying a user-declared scale (TrialFunction/Model/...) -
     return getattr(node, "_scale", None)
 
 
@@ -702,6 +715,80 @@ def _collect_scaled_leaves(constraints):
     return list(coords.values()), (field_scales[0] if field_scales else None)
 
 
+def _unwrap_view(op):
+    """Unwrap a typed semantic view (ScalarView/FieldView/…) to its Placeholder."""
+    from .views import _VIEW_TYPES
+
+    return op._expr if isinstance(op, _VIEW_TYPES) else op
+
+
+def _scaled_coord_map(node):
+    """``{id(var): (var, L)}`` for every scaled coordinate Variable under *node*."""
+    from . import Variable
+
+    out: Dict[int, tuple] = {}
+    seen = set()
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if id(n) in seen:
+            continue
+        seen.add(id(n))
+        if isinstance(n, Variable) and getattr(n, "_scale", None) is not None:
+            out[id(n)] = (n, n._scale)
+        stack.extend(_children(n))
+    return out
+
+
+def _rewrite_bare_coords(node, coord_map):
+    """Return *node* with bare-coordinate leaves ``x`` replaced by ``L·x``.
+
+    A coordinate is rewritten only where it appears as a *value* (child of an
+    arithmetic/function node) — never as a network input (``ModelCall`` arg) or
+    a differentiation variable (``Jacobian``/``Hessian``/``TemporalDerivative``
+    ``.variables``/``.time_var``), which instead ride the rescaled context. This
+    keeps analytic targets like ``sin(π·x/L)`` physical on the rescaled context
+    while derivatives stay dimensionless. ``coord_map``: ``{id(var): (var, L)}``.
+    """
+    from . import (
+        BinaryOp,
+        FunctionCall,
+        Hessian,
+        Jacobian,
+        Literal,
+        ModelCall,
+        Placeholder,
+        TemporalDerivative,
+    )
+
+    def as_value(child):
+        # *child* used as a value: wrap a scaled coordinate, else recurse.
+        if not isinstance(child, Placeholder):
+            return child
+        info = coord_map.get(id(child))
+        if info is not None:
+            var, length = info
+            return BinaryOp("*", Literal(length), var)
+        return rewrite(child)
+
+    def rewrite(n):
+        if isinstance(n, BinaryOp):
+            return BinaryOp(n.op, as_value(n.left), as_value(n.right))
+        if isinstance(n, FunctionCall):
+            return n.copy_with_args([as_value(a) for a in n.args])
+        if isinstance(n, ModelCall):
+            return n  # network inputs ride the rescaled context — leave args
+        if isinstance(n, Jacobian):
+            return Jacobian(rewrite(n.target), n.variables, n.scheme)
+        if isinstance(n, Hessian):
+            return Hessian(rewrite(n.target), n.variables, n.scheme, n.trace)
+        if isinstance(n, TemporalDerivative):
+            return TemporalDerivative(rewrite(n.target), n.time_var)
+        return n  # leaves & other nodes unchanged
+
+    return as_value(node)
+
+
 def rescale(constraints, domain=None):
     """Transform residual constraint(s) into a solvable dimensionless form.
 
@@ -731,11 +818,14 @@ def rescale(constraints, domain=None):
     from . import BinaryOp, Literal
 
     single = not isinstance(constraints, (list, tuple))
-    items = [constraints] if single else list(constraints)
+    items = [_unwrap_view(c) for c in ([constraints] if single else list(constraints))]
 
     transformed = []
     for root in items:
+        coord_map = _scaled_coord_map(root)
         terms = _additive_terms(root)
+        # gᵢ is computed on the ORIGINAL term (pre-rewrite) so the rewrite's L
+        # factor is not counted twice; the rewrite then materializes it once.
         full = [_scale_of(t) for _, t in terms]
         kvals = [_scale_of(t, coeff_neutral=True) for _, t in terms]
 
@@ -745,8 +835,9 @@ def rescale(constraints, domain=None):
         node = None
         for (sign, term), k in zip(terms, kvals):
             g = (k / s_ref) if (k is not None and s_ref) else 1.0
+            rewritten = _rewrite_bare_coords(term, coord_map)
             coeff = sign * g
-            piece = term if coeff == 1.0 else BinaryOp("*", Literal(coeff), term)
+            piece = rewritten if coeff == 1.0 else BinaryOp("*", Literal(coeff), rewritten)
             node = piece if node is None else BinaryOp("+", node, piece)
         transformed.append(node if node is not None else root)
 

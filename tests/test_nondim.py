@@ -133,6 +133,15 @@ def _coefficient(value):
     return Constant("P", "c", jnp.asarray(value))
 
 
+def _field(scale_value, unit="K"):
+    """A realistic field leaf (non-coordinate, non-coefficient) standing in for
+    the network output net(...). A bare ``make_var`` would be misread as a
+    coordinate by the coefficient-excluded magnitude walk."""
+    from jno.trace import TrialFunction
+
+    return TrialFunction("u").unit(unit).scale(scale_value)
+
+
 def _leading_coeff(term_node):
     """Effective scalar coefficient prepended to a transformed additive term."""
     from jno.trace import BinaryOp, Literal
@@ -151,7 +160,7 @@ class TestRescaleTransform:
         L, tau, U, alpha0 = 0.1, 5.0, 50.0, 1e-5
         x = make_var("x").unit("m").scale(L)
         t = make_var("t").unit("s").scale(tau)
-        u = make_var("u").unit("K").scale(U)
+        u = _field(U)
         alpha = _coefficient(alpha0).unit("m^2/s").scale(alpha0)
 
         residual = u.d(t) - alpha * u.d2(x)
@@ -172,7 +181,7 @@ class TestRescaleTransform:
         # realized numerically on the rescaled context (documents the design).
         x = make_var("x").unit("m").scale(0.1)
         t = make_var("t").unit("s").scale(5.0)
-        u = make_var("u").unit("K").scale(50.0)
+        u = _field(50.0)
         alpha = _coefficient(1e-5).unit("m^2/s").scale(1e-5)
         transformed, _ = jno.units.rescale(u.d(t) - alpha * u.d2(x))
         assert jno.units.infer(transformed) == Unit.parse("K/s")
@@ -230,3 +239,105 @@ class TestRescaler:
         coord_tags = {tag for tag, _, _ in coords}
         assert x.tag in coord_tags  # the coordinate is rescaled
         assert "u" not in coord_tags  # the field is NOT a coordinate
+
+
+def _wraps_coord(node, var, L):
+    """True if *var* appears wrapped as ``L·var`` (the bare-coordinate rewrite)."""
+    from jno.trace import BinaryOp, Literal
+
+    seen = set()
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if id(n) in seen:
+            continue
+        seen.add(id(n))
+        if (
+            isinstance(n, BinaryOp)
+            and n.op == "*"
+            and isinstance(n.left, Literal)
+            and math.isclose(float(n.left.value), L, rel_tol=1e-5)
+            and n.right is var
+        ):
+            return True
+        for attr in ("left", "right", "target", "expr"):
+            child = getattr(n, attr, None)
+            if child is not None:
+                stack.append(child)
+        for attr in ("args", "variables"):
+            for c in getattr(n, attr, None) or []:
+                stack.append(c)
+    return False
+
+
+class TestBareCoordinateRewrite:
+    """The crux of the general transform: coordinate-dependent analytic targets.
+
+    These FAIL a double-count implementation (which would give g = L³/U for a
+    linear source instead of L²/U), so a sin-only suite cannot catch the bug.
+    """
+
+    def test_linear_source_coefficient_is_L2_over_U(self):
+        # residual:  u_xx − C·x   (Poisson with a linear source)
+        # u_xx scale = U/L²; source term g = L²/U; with the ×L rewrite the
+        # effective dimensionless source coefficient is C·L³/U.
+        from jno.trace.unit_log import _additive_terms
+
+        L, U, C0 = 0.2, 100.0, 3.0
+        x = make_var("x").unit("m").scale(L)
+        u = _field(U)
+        C = _coefficient(C0).unit("K/m^3").scale(C0)
+
+        residual = u.d2(x) - C * x
+        transformed, _ = jno.units.rescale(residual)
+
+        terms = _additive_terms(transformed)
+        assert len(terms) == 2
+        # source term g = L²/U  (a double-count bug yields L³/U).  Tolerance is
+        # float32-grade because Literal stores the coefficient as a jax array.
+        g_src = abs(_leading_coeff(terms[1][1]))
+        assert math.isclose(g_src, L**2 / U, rel_tol=1e-5)
+        # a double-count (g = L³/U) would be ~5× off here — well outside 1e-5
+        assert not math.isclose(g_src, L**3 / U, rel_tol=1e-2)
+        # and the bare coordinate x was rewritten to L·x exactly once
+        assert _wraps_coord(terms[1][1], x, L)
+        # effective dimensionless source coefficient = C·L³/U
+        assert math.isclose(g_src * C0 * L, C0 * L**3 / U, rel_tol=1e-5)
+
+    def test_variable_coefficient_bare_x_is_rewritten(self):
+        # residual: (1 + x)·u_xx  — the bare x inside the coefficient must be
+        # rewritten so it stays physical on the rescaled context.
+        L, U = 0.5, 10.0
+        x = make_var("x").unit("m").scale(L)
+        u = _field(U)
+
+        residual = (1.0 + x) * u.d2(x)
+        transformed, _ = jno.units.rescale(residual)
+
+        # the bare x in (1 + x) is wrapped as L·x; the x inside u.d2(x)
+        # (a derivative variable) is left alone.
+        assert _wraps_coord(transformed, x, L)
+
+
+class TestViewUnwrap:
+    def test_rescale_unwraps_a_view(self):
+        # The tutorial field API wraps expressions in views (ScalarView, …);
+        # rescale must unwrap (._expr) before transforming.
+        L, U, alpha0 = 0.3, 20.0, 1e-4
+        x = make_var("x").unit("m").scale(L)
+        t = make_var("t").unit("s").scale(4.0)
+        u = _field(U)
+        alpha = _coefficient(alpha0).unit("m^2/s").scale(alpha0)
+
+        residual = u.d(t) - alpha * u.d2(x)
+        view = residual.scalar  # wrap in a ScalarView
+        from jno.trace.views import _VIEW_TYPES
+
+        assert isinstance(view, _VIEW_TYPES)
+
+        transformed, rescaler = jno.units.rescale(view)
+        from jno.trace import Placeholder
+
+        assert isinstance(transformed, Placeholder)
+        assert not isinstance(transformed, _VIEW_TYPES)
+        assert jno.units.infer(transformed) == Unit.parse("K/s")
