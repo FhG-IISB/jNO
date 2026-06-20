@@ -20,8 +20,8 @@ ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
 ic = u(xi0, yi0) - jno.fn(lambda x, y: jnp.sin(jnp.pi * x) * jnp.sin(jnp.pi * y), [xi0, yi0])
 fem = jno.fem([ui.t * vi + nu * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, ic])
 
-M, A, dt = dense(fem.M), dense(fem.operator.A), float(fem.dt)
-w = jnp.asarray(fem.state0)
+M, A, dt = fem.M, dense(fem.operator.A), float(fem.dt)  # fem.M is dense; operator.A is raw sparse
+w = fem.state0
 for _ in range(round((fem.t1 - fem.t0) / dt)):
     w = jnp.linalg.solve(M + dt * A, M @ w)            # backward Euler
 ```

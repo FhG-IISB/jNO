@@ -23,12 +23,13 @@ ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)         # views with .x / .y d
 
 f = 2.0 * (xi * (1 - xi) + yi * (1 - yi))
 fem = jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0])   # weak form + u = 0 on the boundary
-u_h = jnp.linalg.solve(dense(fem.A), jnp.asarray(fem.b).reshape(-1))
+u_h = jnp.linalg.solve(fem.A, fem.b)
 ```
 
-> `fem.A` and `fem.jacobian(u)` are sparse (`BCOO`); the transient `fem.M` and
-> `fem.operator.A` are dense. The `dense(...)` helper above handles both — it is used
-> throughout this page and in every tutorial script.
+> The flat accessors — `fem.A`, `fem.b`, `fem.M`, `fem.state0`, and `fem.residual(u[, t])` /
+> `fem.jacobian(u[, t])` — return ready-to-use **dense** matrices and **flat** vectors, so no
+> `.todense()`/`reshape` is needed. `fem.operator` still exposes the raw sparse (`BCOO`) feax form
+> for large problems; the `dense(...)` helper above densifies those (e.g. `fem.operator.A`).
 
 ---
 
@@ -97,14 +98,14 @@ operator — solve it with any Newton/root-finder using `fem.residual` and `fem.
 import scipy.optimize as spo
 sol = spo.root(lambda v: np.asarray(fem.residual(v)),
                np.zeros(fem.dofs),
-               jac=lambda v: np.asarray(dense(fem.jacobian(v))), method="hybr")
+               jac=lambda v: np.asarray(fem.jacobian(v)), method="hybr")
 ```
 
 ### Transient (semidiscrete `M u̇ + A u = c`)
 
 ```python
-M, A, dt = dense(fem.M), dense(fem.operator.A), float(fem.dt)
-w = jnp.asarray(fem.state0)
+M, A, dt = fem.M, dense(fem.operator.A), float(fem.dt)  # fem.M is dense; operator.A is raw sparse
+w = fem.state0
 for _ in range(round((fem.t1 - fem.t0) / dt)):          # backward Euler
     w = jnp.linalg.solve(M + dt * A, M @ w)
 ```

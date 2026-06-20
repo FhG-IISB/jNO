@@ -44,7 +44,6 @@ import jno  # noqa: E402
 
 Pr, Ra = 1.0, 1.0e4  # Prandtl, Rayleigh (Ra >> Ra_c ~ 1708 -> vigorous convection)
 Lx, Ly = 2.0, 1.0  # a wide-ish pot -> a pair of counter-rotating rolls
-dn = lambda A: jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)  # noqa: E731
 
 d = jno.domain(box(0, 0, Lx, Ly), mesh_size=0.11, time=(0.0, 0.3, 2))
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)  # P2 velocity
@@ -86,19 +85,18 @@ fem = jno.fem(
 )
 assert fem.is_transient and not fem.is_linear, "Boussinesq convection is transient + nonlinear"
 off = fem.problem.offset
-blk = fem.operator
-M, dt, nsteps, nframes = dn(blk.mass(0.0, {})), 0.009, 26, 13  # stop ~when the rolls establish (no static tail)
+M, dt, nsteps, nframes = fem.M, 0.009, 26, 13  # stop ~when the rolls establish (no static tail)
 print(f"\n2D Rayleigh-Benard pot (Ra={Ra:g}, Pr={Pr:g}): dofs={fem.dofs}, steps={nsteps}")
 
 # bring-your-own implicit integrator: backward Euler + Newton  ((M/dt + dR/du) du = -G).
-# blk.residual / blk.jacobian are already jitted, so each step is fast after the first.
-w = jnp.asarray(blk.state0)
+# fem.residual / fem.jacobian are already jitted, so each step is fast after the first.
+w = fem.state0
 frames, save_every = [np.asarray(w)], max(1, nsteps // nframes)
 for step in range(nsteps):
     w_prev, t_next = w, (step + 1) * dt
     for _ in range(8):  # Newton
-        G = M @ (w - w_prev) / dt + jnp.asarray(blk.residual(w, t_next, {})).reshape(-1)
-        dw = jnp.linalg.solve(M / dt + dn(blk.jacobian(w, t_next, {})), -G)
+        G = M @ (w - w_prev) / dt + fem.residual(w, t_next)
+        dw = jnp.linalg.solve(M / dt + fem.jacobian(w, t_next), -G)
         w = w + dw
         if float(jnp.linalg.norm(dw)) < 1e-8:
             break

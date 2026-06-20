@@ -33,6 +33,17 @@ from .trace import FemLinearSystem, GaugePin, TestFunction, TrialFunction, Varia
 
 __all__ = ["fem", "FEM"]
 
+
+def _as_dense(x):
+    """Densify a feax/BCOO matrix to a plain JAX array (no-op if already dense)."""
+    return jnp.asarray(x.todense()) if hasattr(x, "todense") else jnp.asarray(x)
+
+
+def _as_flat(x):
+    """Flatten a nodal vector to a 1-D JAX array."""
+    return jnp.asarray(x).reshape(-1)
+
+
 # Component names feax uses for per-component (roller/symmetry) Dirichlet specs.
 _COMPONENT_NAMES = {0: "x", 1: "y", 2: "z"}
 
@@ -715,43 +726,67 @@ class FEM:
     # -- steady linear --
     @property
     def A(self):
+        """Dense ``(n_dofs, n_dofs)`` stiffness matrix of the steady linear system, ready for
+        ``jnp.linalg.solve`` (use ``fem.operator`` for the raw sparse form on large problems)."""
         if self._mode != "linear":
             raise AttributeError(f"FEM is {self._mode}; .A is only for a steady linear problem (see .operator / .M).")
-        return self._A
+        return _as_dense(self._A)
 
     @property
     def b(self):
+        """Load vector of the steady linear system as a flat ``(n_dofs,)`` JAX array."""
         if self._mode != "linear":
             raise AttributeError(f"FEM is {self._mode}; .b is only for a steady linear problem (see .operator / .M).")
-        return self._b
+        return _as_flat(self._b)
 
-    # -- steady nonlinear --
+    # -- nonlinear residual / Jacobian (steady and transient) --
     @property
     def residual(self):
-        if self._mode != "nonlinear":
-            raise AttributeError(f"FEM is {self._mode}; .residual is only for a steady nonlinear problem (see .operator).")
-        return self._op.residual
+        """Residual callable for a custom solver, returning a flat ``(n_dofs,)`` JAX array.
+
+        Steady nonlinear: ``residual(u)``. Transient: ``residual(u, t)`` — the per-step
+        semidiscrete residual (pass ``args=`` only for a runtime-parametric solve). Use
+        ``fem.operator`` for the raw (unflattened) feax form."""
+        if self._mode == "nonlinear":
+            r = self._op.residual
+            return lambda u: _as_flat(r(u))
+        if self._mode == "transient":
+            return lambda u, t, args=None: _as_flat(self._op.residual(u, t, args or {}))
+        raise AttributeError(f"FEM is {self._mode}; .residual is for a steady-nonlinear or transient problem.")
 
     @property
     def jacobian(self):
-        if self._mode != "nonlinear":
-            raise AttributeError(f"FEM is {self._mode}; .jacobian is only for a steady nonlinear problem (see .operator).")
-        return self._op.jacobian
+        """Jacobian callable for a custom solver, returning a dense ``(n_dofs, n_dofs)`` JAX
+        array — ``jacobian(u)`` (steady nonlinear) or ``jacobian(u, t)`` (transient). Use
+        ``fem.operator`` for the raw sparse (BCOO) form on large problems."""
+        if self._mode == "nonlinear":
+            j = self._op.jacobian
+            return lambda u: _as_dense(j(u))
+        if self._mode == "transient":
+            return lambda u, t, args=None: _as_dense(self._op.jacobian(u, t, args or {}))
+        raise AttributeError(f"FEM is {self._mode}; .jacobian is for a steady-nonlinear or transient problem.")
 
     # -- transient (semidiscrete: M u_dot + ... ; integration window from the domain) --
     @property
     def M(self):
-        """Mass matrix of the semidiscrete transient system."""
+        """Dense ``(n_dofs, n_dofs)`` mass matrix of the semidiscrete transient system
+        (use ``fem.operator`` for the raw sparse form on large problems)."""
         if self._mode != "transient":
             raise AttributeError("FEM is steady; .M (mass matrix) is only for a transient problem.")
-        return self._op.M
+        # the nonlinear-transient route carries the mass as a callable (the ``.M`` attribute is
+        # unset); evaluate it once at t0 -- the mass is constant in the standard ``u_t * v`` form.
+        M = self._op.M
+        if M is None:
+            M = self._op.mass(self.t0, {})
+        return _as_dense(M)
 
     @property
     def state0(self):
-        """Initial nodal state vector (from the `u(initial) - u0` residual, else zeros)."""
+        """Initial nodal state as a flat ``(n_dofs,)`` JAX array (from the `u(initial) - u0`
+        residual, else zeros)."""
         if self._mode != "transient":
             raise AttributeError("FEM is steady; .state0 is only for a transient problem.")
-        return self._op.state0
+        return _as_flat(self._op.state0)
 
     def _time_block(self):
         """The (real) FeaxTimeBlock carrying the integration window — for complex_transient it is

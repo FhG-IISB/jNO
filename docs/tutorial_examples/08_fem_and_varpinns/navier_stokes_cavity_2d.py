@@ -35,7 +35,6 @@ import jno  # noqa: E402
 
 inner, grad, trace = jno.np.inner, jno.np.grad, jno.np.trace
 nu = 0.005  # Re = U L / nu = 1 * 1 / 0.005 = 200
-dn = lambda X: jnp.asarray(X.todense()) if hasattr(X, "todense") else jnp.asarray(X)  # noqa: E731
 
 d = jno.domain(box(0, 0, 1, 1), mesh_size=0.045, time=(0.0, 8.0, 33))
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)  # P2 velocity
@@ -62,19 +61,18 @@ fem = jno.fem(
 )
 assert fem.is_transient and not fem.is_linear, "transient Navier-Stokes must be nonlinear"
 off = fem.problem.offset
-blk = fem.operator
-M, dt = dn(blk.mass(0.0, {})), float(blk.dt)
+M, dt = fem.M, float(fem.dt)
 print(f"\nTransient Navier-Stokes lid-driven cavity (Re={1 / nu:.0f}): dofs={fem.dofs}")
 
 # bring-your-own implicit integrator: backward Euler + Newton  ((M/dt + dR/du) du = -G)
 nsteps, nframes = round((float(fem.t1) - float(fem.t0)) / dt), 32
-w = jnp.asarray(blk.state0)
+w = fem.state0
 frames, save_every = [np.asarray(w)], max(1, nsteps // nframes)
 for step in range(nsteps):
     w_prev, t_next = w, (step + 1) * dt
     for _ in range(8):  # Newton
-        G = M @ (w - w_prev) / dt + jnp.asarray(blk.residual(w, t_next, {})).reshape(-1)
-        J = M / dt + dn(blk.jacobian(w, t_next, {}))
+        G = M @ (w - w_prev) / dt + fem.residual(w, t_next)
+        J = M / dt + fem.jacobian(w, t_next)
         dw = jnp.linalg.solve(J, -G)
         w = w + dw
         if float(jnp.linalg.norm(dw)) < 1e-9:
