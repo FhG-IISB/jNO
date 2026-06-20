@@ -43,8 +43,6 @@ custom_net = jno.nn.wrap(MyNet(jax.random.PRNGKey(0)))
 custom_net.optimizer(optax.adam(1e-3))
 ```
 
-Legacy shorthand constructors like `jno.numpy.nn.mlp(...)` are no longer the primary API.
-
 ## Available Methods
 
 `Model` (returned by `jno.nn.wrap(...)`) supports:
