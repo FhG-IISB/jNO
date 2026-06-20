@@ -16,13 +16,23 @@ pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for the box domain")
 
 import jax  # noqa: E402
-
-jax.config.update("jax_enable_x64", True)
-
 import numpy as np  # noqa: E402
 from shapely.geometry import box  # noqa: E402
 
 import jno  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """The coupled real system is float64, so these tests need x64. Set it *per-test* with
+    save/restore so the global flag never leaks into modules co-run after this one (a
+    module-level ``update`` runs at collection time and pollutes the whole session)."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
 
 
 def _solve_dense(fem):
