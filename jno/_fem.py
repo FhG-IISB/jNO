@@ -29,7 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .trace import FemLinearSystem, TestFunction, TrialFunction, Variable
+from .trace import FemLinearSystem, GaugePin, TestFunction, TrialFunction, Variable
 
 __all__ = ["fem", "FEM"]
 
@@ -108,6 +108,40 @@ def _discover_domain(constraints: List[Any]):
         "jno.fem: could not discover a domain from the constraints. "
         "Author the weak form with coordinates from domain.variable(...)."
     )
+
+
+def _lower_gauge_pin(pin: GaugePin) -> Any:
+    """Lower a ``p.pin()`` marker to a single-node Dirichlet residual ``field(node) - value``.
+
+    Picks a deterministic vertex (nearest the mesh min-corner) and reuses
+    ``domain.point_region`` + ``domain.variable``, so the synthesized residual is identical to a
+    hand-written ``p(xpn, ypn) - value`` -- the value side is the literal constant, so the
+    transient route treats it as a plain (time-independent) Dirichlet at every step. The pin's
+    coordinate Variables are cached per (domain, field) so a second ``jno.fem(...)`` on the same
+    domain neither re-registers the region nor re-samples (the cached vars are Dirichlet-only and
+    never retagged, so reuse is safe).
+    """
+    import numpy as _np
+
+    field = pin.field
+    domain = getattr(field, "_domain", None)
+    if domain is None:
+        raise ValueError(
+            "jno.fem: p.pin() needs a field from domain.fem_symbols(...); the pinned symbol carries no domain."
+        )
+    dim = int(domain.dimension)
+    # Single leading underscore (not "__...__"): the pin node is a genuine single-vertex boundary
+    # region that `_region_and_support` must SEE, so its tag must not match the reserved
+    # double-underscore filter that hides internal/temporal tags from region detection.
+    tag = f"_gauge_pin_{field.field_key}"
+    cache = domain.__dict__.setdefault("_gauge_pin_coords", {})
+    if tag not in cache:
+        pts = _np.asarray(domain.mesh.points)[:, :dim]
+        target = pts.min(axis=0)  # deterministic gauge node: the mesh min-corner vertex
+        domain.point_region(tag, target)
+        cache[tag] = domain.variable(tag, split=True)
+    spatial = cache[tag][:dim]
+    return field(*spatial) - pin.value
 
 
 def _infer_vec(constraints: List[Any]) -> int:
@@ -944,6 +978,14 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         constraints = [constraints]
     if len(constraints) == 0:
         raise ValueError("jno.fem: no constraints provided.")
+
+    # Gauge pins (`p.pin()`) remove a field's constant null space. Lower each to a single-node
+    # Dirichlet `p(node) - value` *before* domain discovery and classification: a GaugePin is a
+    # bare marker, not a walkable expression, so it must not reach `_discover_domain` (which walks
+    # coordinate Variables) or the `_region_and_support` classifier.
+    if any(isinstance(c, GaugePin) for c in constraints):
+        pins = [c for c in constraints if isinstance(c, GaugePin)]
+        constraints = [c for c in constraints if not isinstance(c, GaugePin)] + [_lower_gauge_pin(p) for p in pins]
 
     domain = _discover_domain(constraints)
 

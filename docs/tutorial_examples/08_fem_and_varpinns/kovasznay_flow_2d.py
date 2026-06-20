@@ -45,14 +45,12 @@ ue = lambda x, y: 1.0 - np.exp(lam * x) * np.cos(2 * np.pi * y)  # noqa: E731  a
 ve = lambda x, y: lam / (2 * np.pi) * np.exp(lam * x) * np.sin(2 * np.pi * y)  # noqa: E731
 pe = lambda x, y: 0.5 * (1.0 - np.exp(2 * lam * x))  # noqa: E731
 
-x0, y0 = -0.5, -0.5  # the channel [-0.5, 1] x [-0.5, 1.5]; pin the pressure at a corner
+x0, y0 = -0.5, -0.5  # the channel [-0.5, 1] x [-0.5, 1.5]
 d = jno.domain(box(x0, y0, 1.0, 1.5), mesh_size=0.08)
-d.point_region("ppin", (x0, y0))
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)  # P2 velocity
 p, q = d.fem_symbols(names=("p", "q"), order=1)  # P1 pressure (inf-sup stable)
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
-xpn, ypn, _ = d.variable("ppin", split=True)
 ub = u.bind(x=xi, y=yi)
 gu, gv = grad(u, [xi, yi]), grad(v, [xi, yi])
 pp, qq, vv = p.bind(x=xi, y=yi), q.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
@@ -66,7 +64,7 @@ fem = jno.fem(
         -qq * trace(gu),  # incompressibility
         u(xb, yb)[0] - bx,  # Dirichlet velocity = the analytic field
         u(xb, yb)[1] - by,
-        p(xpn, ypn) - float(pe(x0, y0)),  # single-node pressure pin
+        p.pin(float(pe(x0, y0))),  # gauge-fix to the analytic value (min-corner) so recovered p == p* exactly
     ]
 )
 assert not fem.is_linear and not fem.is_transient, "Kovasznay is a steady nonlinear system"

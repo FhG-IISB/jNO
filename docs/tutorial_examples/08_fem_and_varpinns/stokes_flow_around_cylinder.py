@@ -42,13 +42,11 @@ cyl = Point(1.5, 0.5).buffer(0.22)
 ring = Point(1.5, 0.5).buffer(0.46).difference(cyl).intersection(box(0, 0, L, H))
 dom = jno.domain({"bulk": box(0, 0, L, H).difference(cyl).difference(ring), "ring": ring})
 dom = dom.build_mesh(0.12, sizes={"ring": 0.05})  # coarse channel, fine collar at the cylinder
-dom.point_region("ppin", (0.0, 0.0))  # pin the pressure null space at one vertex
 
 u, v = dom.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)  # P2 velocity
 p, q = dom.fem_symbols(names=("p", "q"), order=1)  # P1 pressure
 xi, yi, _ = dom.variable("interior", split=True)
 xb, yb, _ = dom.variable("boundary", split=True)
-xpn, ypn, _ = dom.variable("ppin", split=True)
 gu, gv = grad(u, [xi, yi]), grad(v, [xi, yi])
 pp, qq = p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
 
@@ -60,7 +58,7 @@ fem = jno.fem(
         -qq * trace(gu),  # incompressibility
         u(xb, yb)[0] - u_in,  # x-velocity: parabola at inlet/outlet, 0 on walls + cylinder
         u(xb, yb)[1] - 0.0,  # y-velocity: 0 everywhere on the boundary
-        p(xpn, ypn) - 0.0,
+        p.pin(),  # gauge-fix: remove the pressure null space
     ]
 )
 

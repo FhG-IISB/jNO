@@ -3043,6 +3043,29 @@ class StateField(Placeholder):
         return f"StateField(name={self.name!r}, id={self.state_id}, shape={self.value_shape})"
 
 
+class GaugePin:
+    """Marker that gauge-fixes a field's constant null space (created by ``trial.pin()``).
+
+    An incompressible pressure -- or any pure-Neumann scalar -- is determined only up to an
+    additive constant, so its discrete operator has a one-dimensional (constant) null space and
+    the saddle system is singular. ``p.pin(value)`` removes it by fixing a single, *arbitrary*
+    degree of freedom to ``value``: this is **gauge-fixing**, not a boundary condition. ``jno.fem``
+    lowers each pin to a single-node Dirichlet ``p(node) - value`` at a deterministic vertex
+    (nearest the mesh min-corner) -- the same essential path the explicit ``p(xpn, ypn) - value``
+    form takes -- so assembly is unchanged. The location is intentionally not user-specified;
+    any single DOF removes the null space.
+    """
+
+    __slots__ = ("field", "value")
+
+    def __init__(self, field, value=0.0):
+        self.field = field
+        self.value = value
+
+    def __repr__(self):
+        return f"GaugePin(field={getattr(self.field, 'name', '?')!r}, value={self.value!r})"
+
+
 class TrialFunction(Placeholder):
     """
     Generic variational unknown symbol.
@@ -3100,6 +3123,27 @@ class TrialFunction(Placeholder):
         return self._field_view().partials(**named_vars)
 
     bind = partials
+
+    def pin(self, value=0.0):
+        """Gauge-fix this field's constant null space by pinning one arbitrary DOF to ``value``.
+
+        For an incompressible pressure or a pure-Neumann scalar, whose solution is defined only
+        up to an additive constant. Drop the result straight into the ``jno.fem`` constraint
+        list -- no ``domain.point_region`` / coordinate plumbing needed::
+
+            fem = jno.fem([momentum, -q * div(u), p.pin(), *wall_bcs])
+
+        ``jno.fem`` pins a deterministic vertex (nearest the mesh min-corner), so the gauge is
+        reproducible; the location is intentionally not user-specified -- any single DOF removes
+        the null space. See :class:`GaugePin`.
+        """
+        if self.num_components != 1:
+            raise ValueError(
+                "jno.fem: pin() gauge-fixes a *scalar* field's constant null space, but "
+                f"{self.name!r} has value_shape {self.value_shape}. Pin a scalar field "
+                "(e.g. the pressure); a fully Dirichlet vector field has no null space to fix."
+            )
+        return GaugePin(self, value)
 
     def __call__(self, *coords, **named):
         """Evaluate this field symbol on the region carried by ``coords``.
@@ -3171,6 +3215,13 @@ class TestFunction(Placeholder):
         return self._field_view().partials(**named_vars)
 
     bind = partials
+
+    def pin(self, value=0.0):
+        """Reject ``pin()`` on a test function -- only the unknown has a null space to fix."""
+        raise ValueError(
+            "jno.fem: pin() gauge-fixes the unknown's constant null space -- call it on the "
+            "trial symbol (e.g. p.pin()), not the test function."
+        )
 
     def __call__(self, *coords, **named):
         """Evaluate this test-function symbol on the region carried by ``coords``.

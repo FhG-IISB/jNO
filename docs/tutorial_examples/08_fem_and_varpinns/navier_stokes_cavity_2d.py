@@ -38,12 +38,10 @@ nu = 0.005  # Re = U L / nu = 1 * 1 / 0.005 = 200
 dn = lambda X: jnp.asarray(X.todense()) if hasattr(X, "todense") else jnp.asarray(X)  # noqa: E731
 
 d = jno.domain(box(0, 0, 1, 1), mesh_size=0.045, time=(0.0, 8.0, 33))
-d.point_region("ppin", (0.0, 0.0))  # pin the pressure null space
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)  # P2 velocity
 p, q = d.fem_symbols(names=("p", "q"), order=1)  # P1 pressure
 xi, yi, ti = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
-xpn, ypn, _ = d.variable("ppin", split=True)
 ci = d.variable("initial", split=True)
 ub, vb = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
 gu, gv = grad(u, [xi, yi]), grad(v, [xi, yi])
@@ -57,7 +55,7 @@ fem = jno.fem(
         -qq * trace(gu),
         u(xb, yb)[0] - jno.np.where(yb > 1 - 1e-6, lid, 0.0),  # moving lid on top, no-slip elsewhere
         u(xb, yb)[1] - 0.0,
-        p(xpn, ypn) - 0.0,
+        p.pin(),  # gauge-fix: remove the pressure null space (any single DOF)
         u(ci[0], ci[1])[0] - 0.0,  # start from rest
         u(ci[0], ci[1])[1] - 0.0,
     ]

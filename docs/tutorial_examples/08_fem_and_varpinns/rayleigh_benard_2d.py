@@ -47,14 +47,12 @@ Lx, Ly = 2.0, 1.0  # a wide-ish pot -> a pair of counter-rotating rolls
 dn = lambda A: jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)  # noqa: E731
 
 d = jno.domain(box(0, 0, Lx, Ly), mesh_size=0.11, time=(0.0, 0.3, 2))
-d.point_region("ppin", (0.0, 0.0))  # pin the pressure null space
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)  # P2 velocity
 p, q = d.fem_symbols(names=("p", "q"), order=1)  # P1 pressure
 T, sT = d.fem_symbols(names=("T", "sT"), order=1)  # P1 temperature
 xi, yi, ti = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
 ci = d.variable("initial", split=True)
-xpn, ypn, _ = d.variable("ppin", split=True)
 ub, vb = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
 pb, qb = p.bind(x=xi, y=yi, t=ti), q.bind(x=xi, y=yi, t=ti)
 Tb, sb = T.bind(x=xi, y=yi, t=ti), sT.bind(x=xi, y=yi, t=ti)
@@ -81,7 +79,7 @@ fem = jno.fem(
         energy,
         u(xb, yb) - 0.0,  # no-slip walls (all-component vector Dirichlet)
         T(xb, yb) - (1.0 - yb / Ly),  # hot floor / cold lid, conductive profile on the walls
-        p(xpn, ypn) - 0.0,
+        p.pin(),  # gauge-fix: remove the pressure null space
         u(ci[0], ci[1]) - 0.0,  # start at rest (all-component vector initial condition)
         T(ci[0], ci[1]) - T0,
     ]

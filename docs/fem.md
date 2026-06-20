@@ -167,8 +167,9 @@ the implicit default is preferred for Dirichlet problems.
   elasticity bilinear form `λ (∇·u)(∇·φ) + 2μ ε(u):ε(φ)`.
 * **Coupled / mixed (Stokes)** — call `fem_symbols(...)` once per field and add one momentum and
   one continuity term; an inf-sup-stable Taylor–Hood pair is `order=2` velocity + `order=1`
-  pressure, with a single-vertex pressure pin via `d.point_region("ppin", (x, y))` and
-  `p(xpn, ypn) - 0.0`.
+  pressure. Pure-Dirichlet velocity leaves the pressure defined only up to a constant; gauge-fix
+  that null space by adding `p.pin()` to the constraint list (it pins one arbitrary DOF — no
+  coordinates needed; pass `p.pin(value)` to set the gauge).
 * **1D and 3D** — a 1D interval or a 3D `cube`/extruded `gmsh` volume use the identical API with
   one fewer / one more coordinate (`ui.z`, `u(xb, yb, zb) - g`, `element_type="TET4"`).
 * **P2 elements** — `order=2` gives quadratic elements; read the solution at `fem.points`.

@@ -24,7 +24,7 @@ conv = inner(gu, ub, n_contract=1)  # (u.grad) u
 momentum = inner(conv, vv, n_contract=1) + nu * inner(gu, gv, n_contract=2) - pp * trace(gv)
 fem = jno.fem([momentum, -qq * trace(gu),
                u(xb, yb)[0] - bx, u(xb, yb)[1] - by,   # analytic velocity on the boundary
-               p(xpn, ypn) - p0])                       # single-node pressure pin
+               p.pin(p0)])                              # gauge-fix pressure to the analytic value p0
 ```
 
 ![Computed Kovasznay speed and streamlines, the laminar wake behind a grid.](/jNO/assets/kovasznay_flow_2d.png)
