@@ -507,11 +507,14 @@ def _multifield_initial_state(domain: Any, prob: Any, fields: List[Any], field_i
             idx = offsets[fidx] + jnp.arange(n_i) * vec + comp
         elif vec == 1:  # scalar field
             idx = offsets[fidx] + jnp.arange(n_i)
-        else:  # all components from one (vector-valued) IC node -> node-major flatten
-            if vals.shape[0] != n_i * vec:
+        else:  # all components of a vector field: u(initial) - g
+            if vals.shape[0] == n_i:
+                # a single scalar value (e.g. u(initial) - 0) applies to every component
+                vals = jnp.repeat(vals, vec)  # node-major: [n0c0, n0c1, n1c0, ...]
+            elif vals.shape[0] != n_i * vec:
                 raise NotImplementedError(
-                    "jno.fem: write a vector-field initial condition per component "
-                    "(u(initial)[i] - g_i) for coupled transient."
+                    "jno.fem: vector initial condition must be a scalar (u(initial) - g, broadcast to "
+                    "all components) or per component (u(initial)[i] - g_i) for coupled transient."
                 )
             idx = offsets[fidx] + jnp.arange(n_i * vec)
         if vals.shape[0] != idx.shape[0]:
@@ -996,6 +999,11 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     volume_terms: List[Any] = []
     boundary_terms: dict[str, List[Any]] = {}
     dirichlet_values: dict[str, Any] = {}
+    # All-component vs per-component Dirichlet is tracked per (field, region), not per region:
+    # in a multi-field problem a vector field's per-component BC and a scalar field's
+    # all-component BC may legitimately share a wall. (The actual coupled BCs come from the
+    # field-keyed `dirichlet_raw` below; `dirichlet_values` only feeds the single-field path.)
+    dirichlet_style: dict[tuple, str] = {}  # (field_key, region) -> "all" | "per_component"
     dirichlet_raw: List[Any] = []  # (field_key, region, comp, value) for the multi-field path
     ic_residuals: List[Any] = []
     classification: List[str] = []
@@ -1032,10 +1040,16 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
                     "region (Dirichlet) or the 'initial' region (IC). Got a volume region — did you forget the test function?"
                 )
             comp, value, value_node = _dirichlet_spec(_bare(c))
-            dirichlet_raw.append((_field_key_of(c), region, comp, value, value_node))
+            fk = _field_key_of(c)
+            dirichlet_raw.append((fk, region, comp, value, value_node))
+            style_key = (fk, region)
             if comp is None:  # all components: u(region) - g
-                if isinstance(dirichlet_values.get(region), dict):
-                    raise ValueError(f"jno.fem: region {region!r} mixes all-component and per-component Dirichlet.")
+                if dirichlet_style.get(style_key) == "per_component":
+                    raise ValueError(
+                        f"jno.fem: the same field on region {region!r} mixes all-component "
+                        f"(u({region})-g) and per-component (u({region})[i]-g) Dirichlet."
+                    )
+                dirichlet_style[style_key] = "all"
                 dirichlet_values[region] = value
                 classification.append(f"dirichlet@{region}")
             else:  # one component (roller/symmetry): u(region)[i] - g
@@ -1043,10 +1057,14 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
                     raise ValueError(
                         f"jno.fem: Dirichlet component index {comp} out of range (vector components are 0..2)."
                     )
+                if dirichlet_style.get(style_key) == "all":
+                    raise ValueError(
+                        f"jno.fem: the same field on region {region!r} mixes all-component "
+                        f"(u({region})-g) and per-component (u({region})[i]-g) Dirichlet."
+                    )
+                dirichlet_style[style_key] = "per_component"
                 current = dirichlet_values.get(region)
-                if current is not None and not isinstance(current, dict):
-                    raise ValueError(f"jno.fem: region {region!r} mixes all-component and per-component Dirichlet.")
-                current = dict(current or {})
+                current = dict(current) if isinstance(current, dict) else {}
                 current[_COMPONENT_NAMES[comp]] = value
                 dirichlet_values[region] = current
                 classification.append(f"dirichlet@{region}[{_COMPONENT_NAMES[comp]}]")
