@@ -341,3 +341,57 @@ class TestViewUnwrap:
         assert isinstance(transformed, Placeholder)
         assert not isinstance(transformed, _VIEW_TYPES)
         assert jno.units.infer(transformed) == Unit.parse("K/s")
+
+
+class TestEndToEndSolve:
+    def test_rescaled_solve_recovers_physical_field(self):
+        # Fit a network to a poorly-scaled physical target u*(x) = U·sin(π·x/L)
+        # on x ∈ [0, L] with L, U ≠ 1 (a coordinate-EXPRESSION target — exercises
+        # the bare-coordinate rewrite).  Solve the rescaled O(1) problem, then
+        # check to_physical(û) recovers u* — the genuine solvable round-trip.
+        # (heat_1d as-is has L=τ=U=1 and would pass even with a scale bug.)
+        import foundax
+        import jax
+        import optax
+
+        import jno
+        import jno.jnp_ops as jnn
+
+        L, U = 2.0, 5.0
+        pi = float(jno.np.pi)
+
+        dom = jno.domain(constructor=jno.domain.line(x_range=(0.0, L), mesh_size=L / 40))
+        (x,) = dom.variable("interior")[:1]
+        x = x.unit("m").scale(L)
+
+        net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(0)))
+        net.optimizer(optax.adam(2e-3))
+
+        u_field = net(x).unit("K").scale(U)  # scale attaches to the ModelCall
+        # The amplitude U is a DIMENSIONAL quantity → declare it as a Constant
+        # (a bare float would be a dimensionless Literal and would not be divided
+        # out, leaving the network to learn U·sin instead of the O(1) sin).
+        U_amp = _coefficient(U).unit("K").scale(U)
+        target = U_amp * jnn.sin(pi * x / L)  # physical, coordinate-expression target
+        data = u_field - target
+
+        transformed, rescaler = jno.units.rescale([data], dom)
+        rdom = rescaler.rescaled_domain(dom)
+
+        # original domain context is untouched by the transform
+        import numpy as np
+
+        assert not np.allclose(np.asarray(rdom.context["interior"]), np.asarray(dom.context["interior"]))
+
+        crux = jno.core([transformed[0].mse], domain=rdom)
+        crux.solve(4000)
+
+        # û on the rescaled (O(1)) domain; map back to physical units.
+        u_hat = np.asarray(crux.eval([net(x)], domain=rdom)).reshape(-1)
+        u_phys = rescaler.to_physical(u_hat)
+
+        x_hat = np.asarray(rdom.context["interior"]).reshape(-1)
+        u_exact = U * np.sin(pi * x_hat)  # = U·sin(π·x_phys/L)
+
+        rel_l2 = np.linalg.norm(u_phys - u_exact) / (np.linalg.norm(u_exact) + 1e-8)
+        assert rel_l2 < 0.1, f"rescaled-solve round-trip error too large: {rel_l2:.3e}"
