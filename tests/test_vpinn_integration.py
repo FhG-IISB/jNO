@@ -279,3 +279,41 @@ def test_vpinn_via_jno_fem_solves_poisson():
     exact = np.asarray(crux.eval([bc_t], domain=test_dom)).reshape(-1)
     rel = float(np.linalg.norm(pred - exact) / np.linalg.norm(exact))
     assert rel < 1e-2, f"VPINN did not solve Poisson: rel-L2={rel:.3e}"
+
+
+@pytest.mark.parametrize("opt_name", ["adam", "sgd", "adamw", "rmsprop"])
+def test_network_trains_under_x64_with_optax_optimizer(opt_name):
+    """Network training under jax_enable_x64 (float64 params) works for ANY optax optimizer: jNO
+    casts the optimizer state to the param precision, so optax's float32-default moment/LR state does
+    not clash with the float64 params (the optimizer-state dtype mismatch this guards against)."""
+    import numpy as np
+    import optax
+
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        opt = {
+            "adam": optax.adam(1e-2),
+            "sgd": optax.sgd(5e-2),
+            "adamw": optax.adamw(1e-2),
+            "rmsprop": optax.rmsprop(2e-3),
+        }[opt_name]
+        dom = make_domain(mesh_size=0.35)
+        u, phi = dom.fem_symbols()
+        xi, yi, _ = dom.variable("interior", split=True)
+        xb, yb, _ = dom.variable("boundary", split=True)
+        net = make_scalar_net()
+        bc = xi * (1 - xi) * yi * (1 - yi)
+        u_net = net(xi, yi) * bc
+        vi = phi.bind(x=xi, y=yi)
+        f = 2.0 * (xi * (1 - xi) + yi * (1 - yi))
+        weak = jnn.grad(u_net, xi) * jnn.grad(vi, xi) + jnn.grad(u_net, yi) * jnn.grad(vi, yi) - f * vi
+        pde = jno.fem([weak, u(xb, yb) - 0.0])
+        net.optimizer(opt)
+        crux = jno.core([pde.mse], domain=dom)
+        l0 = float(np.asarray(crux.eval([pde.mse])).mean())
+        crux.solve(300)
+        l1 = float(np.asarray(crux.eval([pde.mse])).mean())
+        assert l1 < 0.5 * l0, f"{opt_name} under x64 did not train: {l0:.2e} -> {l1:.2e}"
+    finally:
+        jax.config.update("jax_enable_x64", prev)

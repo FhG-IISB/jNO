@@ -2133,20 +2133,32 @@ class core:
                 is_lr_factory = False
                 base_transform = opt_fn
 
+            # Make every optax optimizer compose with jax_enable_x64. optax initialises moment/LR
+            # state at float32 by default, which mismatches float64 params under x64 and breaks the
+            # state init (make_array_from_callback float32-vs-float64). Since jNO wraps *every*
+            # optimizer here, fix it once generically: build the state at float32 (consistent, no
+            # init-time clash), then cast its float leaves to the param precision. A no-op under
+            # float32, so the default path is unchanged.
+            param_dtype = jnp.asarray(0.0).dtype  # JAX default float: float64 under x64, else float32
+
             if is_lr_factory:
 
-                @optax.inject_hyperparams
-                def _wrapped(learning_rate):
+                def _factory(learning_rate):
                     return opt_fn(learning_rate)
             else:
                 if not isinstance(base_transform, optax.GradientTransformation):
                     raise TypeError(f"Unsupported optimizer type: {type(base_transform)}")
 
-                @optax.inject_hyperparams
-                def _wrapped(learning_rate):
+                def _factory(learning_rate):
                     return optax.chain(base_transform, optax.scale(learning_rate))
 
-            return _wrapped(learning_rate=initial_lr)
+            built = optax.inject_hyperparams(_factory, hyperparam_dtype=param_dtype)(learning_rate=initial_lr)
+
+            def _init(params):
+                state = built.init(optax.tree_utils.tree_cast(params, jnp.float32))
+                return optax.tree_utils.tree_cast(state, param_dtype)
+
+            return optax.GradientTransformation(_init, built.update)
 
         for lid, fm in flax_mods.items():
             # Skip only if truly frozen with no LoRA override.

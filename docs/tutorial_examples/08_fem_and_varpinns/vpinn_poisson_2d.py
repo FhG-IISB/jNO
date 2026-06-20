@@ -26,6 +26,8 @@ import optax  # noqa: E402
 import jno  # noqa: E402
 import jno.jnp_ops as jnn  # noqa: E402
 
+jax.config.update("jax_enable_x64", True)  # feax assembly is float64
+
 # ---- domain, network trial, weak form -------------------------------------------------------
 dom = jno.domain(constructor=jno.domain.rect(mesh_size=0.07))
 u, phi = dom.fem_symbols()
@@ -43,9 +45,6 @@ pde = jno.fem([jnn.grad(u_net, xi) * jnn.grad(vi, xi) + jnn.grad(u_net, yi) * jn
 print(f"\nVPINN Poisson 2D: {type(pde).__name__} (test-projected residual); dofs={dom.mesh.points.shape[0]}")
 
 # ---- train the network through jno.core (minimise the test-projected residual) --------------
-# train in float32: VPINN does not need float64 (the FE test-projection is precomputed), and
-# network training under jax_enable_x64 currently hits a param/optimizer dtype mismatch (foundax
-# params follow x64 -> float64 while optax's adam moments stay float32) -- a separate jno issue.
 net.optimizer(optax.adam(1e-2))
 crux = jno.core([pde.mse], domain=dom)
 crux.solve(2500)
