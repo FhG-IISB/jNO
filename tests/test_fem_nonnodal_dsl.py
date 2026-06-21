@@ -367,3 +367,74 @@ def test_n1e_curl_curl_dirichlet_converges():
     e = [solve(h) for h in (0.5, 0.25, 0.125)]
     assert e[2] < e[1] < e[0], f"not monotone under refinement: {e}"
     assert np.log2(e[1] / e[2]) > 0.85, f"curl-curl Dirichlet rate {np.log2(e[1] / e[2]):.2f} below O(h)"
+
+
+def test_rt_mixed_bc_natural_pressure_and_essential_flux():
+    # MIXED boundary conditions in one problem -- the stress test that everything still registers when
+    # kinds are combined across regions. Natural pressure p=x on left+right AND essential flux u·n=0 on
+    # top+bottom (built-in box edge tags carry normals). The classifier must route each kind to its own
+    # region; exact recovery of u=(-1,0)∈RT0, p=x proves both register and target correctly. Extremes
+    # exercised: homogeneous flux g=0 (top/bottom) and a zero natural value p_D=0 (the left edge, x=0).
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.25)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")
+    p, q = d.fem_symbols(names=("p", "q"), space="P0")
+    xi, yi, _ = d.variable("interior", split=True)
+    xl, yl, _, nlx, nly = d.variable("left", normals=True, split=True)
+    xr, yr, _, nrx, nry = d.variable("right", normals=True, split=True)
+    xt, yt, _, ntx, nty = d.variable("top", normals=True, split=True)
+    xbo, ybo, _, nbx, nby = d.variable("bottom", normals=True, split=True)
+    ui, vi, pp, qq = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi), p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+    vl, vr, ut, ubo = v.bind(x=xl, y=yl), v.bind(x=xr, y=yr), u.bind(x=xt, y=yt), u.bind(x=xbo, y=ybo)
+    divu, divv = trace(grad(ui, [xi, yi])), trace(grad(vi, [xi, yi]))
+    fem = jno.fem(
+        [
+            inner(ui, vi) - pp * divv,
+            qq * divu,
+            xl * (vl[0] * nlx + vl[1] * nly),  # natural pressure p_D=x on left (p_D=0 there)
+            xr * (vr[0] * nrx + vr[1] * nry),  # natural pressure p_D=x on right (p_D=1)
+            ut[0] * ntx + ut[1] * nty - 0.0,  # essential flux u·n=0 on top
+            ubo[0] * nbx + ubo[1] * nby - 0.0,  # essential flux u·n=0 on bottom
+        ],
+        quad_degree=4,
+    )
+    off = fem.offsets
+    sol = np.linalg.solve(_dense(fem.A), np.asarray(jnp.asarray(fem.b)).reshape(-1))
+    pts, cells = _mesh(d)
+    cent = pts[cells].mean(1)
+    flux = np.asarray(rt_flux_at_centroids(pts, cells, build_edge_topology(cells), jnp.asarray(sol[off[0] : off[1]])))
+    np.testing.assert_allclose(flux, np.tile([-1.0, 0.0], (flux.shape[0], 1)), atol=1e-9)  # u exact in RT0
+    np.testing.assert_allclose(sol[off[1] : off[2]], cent[:, 0], atol=1e-9)  # p = x at centroids
+
+
+def test_n1e_tangential_bc_distinct_values_on_two_subregions():
+    # Two tangential traces with DIFFERENT values on two edge tags must register independently: left edges
+    # pin to g_left, right edges to g_right, and the untagged top/bottom stay natural. Per-region targeting
+    # for the N1E essential trace, with g_right<0 an extreme (sign of the prescribed value).
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.5)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="N1E")
+    xi, yi, _ = d.variable("interior", split=True)
+    xl, yl, _, nlx, nly = d.variable("left", normals=True, split=True)
+    xr, yr, _, nrx, nry = d.variable("right", normals=True, split=True)
+    ui, vi, ul, ur = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi), u.bind(x=xl, y=yl), u.bind(x=xr, y=yr)
+    gl, gr = 0.9, -0.4
+    fem = jno.fem([inner(ui, vi), ul[0] * nly - ul[1] * nlx - gl, ur[0] * nry - ur[1] * nrx - gr])
+    sol = np.linalg.solve(_dense(fem.A), np.asarray(jnp.asarray(fem.b)).reshape(-1))
+    pts, cells = _mesh(d)
+    top = build_edge_topology(cells)
+    counts = np.bincount(np.asarray(top.cell_edges).reshape(-1), minlength=top.n_edges)
+    loc = {int(top.cell_edges[c, k]): (c, k) for c in range(cells.shape[0]) for k in range(3)}
+    nl = nr = 0
+    for e, (c, k) in loc.items():
+        if counts[e] != 1:  # boundary edges
+            continue
+        va, vb = top.edge_vertices[e]
+        pa, pb = pts[va], pts[vb]
+        length = float(np.linalg.norm(pb - pa))
+        sgn = _tangential_sign(pts, top, e, c)
+        if abs(pa[0]) < 1e-9 and abs(pb[0]) < 1e-9:  # left edge (x=0)
+            np.testing.assert_allclose(sol[e], sgn * gl * length, atol=1e-10)
+            nl += 1
+        elif abs(pa[0] - 1.0) < 1e-9 and abs(pb[0] - 1.0) < 1e-9:  # right edge (x=1)
+            np.testing.assert_allclose(sol[e], sgn * gr * length, atol=1e-10)
+            nr += 1
+    assert nl == 2 and nr == 2  # left & right each split into 2 sub-edges at mesh_size 0.5
