@@ -207,7 +207,7 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
     zeros = jnp.zeros(total)
     A = jax.jacfwd(residual)(zeros)
     b = -residual(zeros)
-    return (A, b), "linear"
+    return (A, b), "linear", offs
 
 
 def rt_flux_at_centroids(points: np.ndarray, cells: np.ndarray, top: EdgeTopology, u_edge: jnp.ndarray) -> jnp.ndarray:

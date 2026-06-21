@@ -48,12 +48,12 @@ f = 2.0 * jnp.pi**2 * sin(jnp.pi * xi) * sin(jnp.pi * yi)
 # momentum (∫u·v - ∫p div v) tested by v ; continuity (∫q div u - ∫f q) tested by q
 fem = jno.fem([inner(ui, vi) - pp * divv, qq * divu - f * qq], quad_degree=4)
 
-# DOF layout: RT edge DOFs first, then the P0 cell DOFs. Solve the saddle system on host.
+# Solve the saddle system on host; slice per field via fem.offsets ([0, n_edges, n_edges + n_cells]).
 pts, cells = np.asarray(d.mesh.points)[:, :2], np.asarray(d.mesh.cells_dict["triangle"])
-top = build_edge_topology(cells)
-n_edges = top.n_edges
 sol = np.linalg.solve(dense(fem.A), np.asarray(jnp.asarray(fem.b)).reshape(-1))
-u_dofs, p_cells = sol[:n_edges], sol[n_edges:]
+off = fem.offsets
+u_dofs, p_cells = sol[off[0] : off[1]], sol[off[1] : off[2]]
+top = build_edge_topology(cells)  # still needed to evaluate the RT flux field at the centroids
 
 # Verify the computed fields against the exact solution (audit the prediction, not a hand-built field).
 centroid = pts[cells].mean(1)

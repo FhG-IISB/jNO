@@ -74,6 +74,23 @@ def test_rt_projection_of_constant_is_exact():
     np.testing.assert_allclose(flux, np.tile([1.0, 0.0], (flux.shape[0], 1)), atol=1e-10)
 
 
+def test_fem_offsets_expose_nonnodal_block_layout():
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.4)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")
+    p, q = d.fem_symbols(names=("p", "q"), space="P0")
+    xi, yi, _ = d.variable("interior", split=True)
+    ui, vi, pp, qq = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi), p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+    divu, divv = trace(grad(ui, [xi, yi])), trace(grad(vi, [xi, yi]))
+    f = 2 * jnp.pi**2 * sin(jnp.pi * xi) * sin(jnp.pi * yi)
+    pts, cells = _mesh(d)
+    ne = build_edge_topology(cells).n_edges
+    # mixed RT-P0: [0, n_edges, n_edges + n_cells]
+    fem = jno.fem([inner(ui, vi) - pp * divv, qq * divu - f * qq], quad_degree=4)
+    assert fem.offsets == [0, ne, ne + cells.shape[0]]
+    # single RT field: [0, n_edges]
+    assert jno.fem([inner(ui, vi)]).offsets == [0, ne]
+
+
 def test_mixed_poisson_rt_p0_via_dsl_matches_direct_assembler():
     # Full RT-P0 mixed Poisson written through jno.fem must assemble the SAME (A, b) as the proven
     # direct assembler (which is convergence-tested in test_fem_nonnodal). div = trace(grad(.)).

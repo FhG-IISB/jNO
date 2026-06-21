@@ -612,7 +612,7 @@ class FEM:
         human-readable summary of how each residual was bucketed.
     """
 
-    def __init__(self, domain: Any, op: Any, classification: List[str], *, mode: str):
+    def __init__(self, domain: Any, op: Any, classification: List[str], *, mode: str, offsets: Any = None):
         # mode: "linear" | "nonlinear" | "transient"
         self.domain = domain
         self._op = op
@@ -621,6 +621,7 @@ class FEM:
         self.mesh = getattr(domain, "mesh", None)
         self.problem = getattr(domain, "_feax_problem", None)
         self._periodic = None  # periodic-tie reduction (prolongation P), attached by fem()
+        self._offsets = offsets  # per-field block offsets for the native non-nodal path (else feax problem.offset)
 
         self._A = self._b = None
         if mode == "linear":
@@ -653,6 +654,16 @@ class FEM:
         """The raw assembled block — ``(A, b)`` / ``FemLinearSystem`` /
         ``FemResidualOperator`` (steady) or ``FeaxTimeBlock`` (transient)."""
         return self._op
+
+    @property
+    def offsets(self) -> Any:
+        """Per-field block offsets into the flat solution: ``sol[offsets[i]:offsets[i+1]]`` is field ``i``.
+
+        Set for the native non-nodal (RT/P0) path; falls back to the feax ``problem.offset`` for the
+        Lagrange multi-field path (``None`` for a single field with no block structure)."""
+        if self._offsets is not None:
+            return list(self._offsets)
+        return getattr(self.problem, "offset", None)
 
     def solve(self, solve_fn=None, **kwargs) -> Any:
         """Differentiable forward solve as a trace node — the inverse-problem entry.
@@ -1195,10 +1206,10 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     if _trial_spaces(constraints) - {"Lagrange"}:
         from .utils.solver.fem_nonnodal import assemble_fem_nonnodal
 
-        op, mode = assemble_fem_nonnodal(
+        op, mode, offsets = assemble_fem_nonnodal(
             domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, quad_degree=quad_degree
         )
-        return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode))
+        return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offsets))
 
     # ---- 1D (segment): feax has no LINE2 element, so assemble natively ----
     # The native 1D assembler reuses the same integrand evaluator and returns the
