@@ -298,12 +298,22 @@ def _apply_natural_boundary_terms(b, boundary_terms, domain, field_index, spaces
 
 
 def _apply_flux_bcs(A, b, flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree):
-    """Pin boundary-edge DOFs for essential normal-flux BCs ``u·n = g``, then symmetric-eliminate.
+    """Pin boundary-edge DOFs for an essential edge-trace BC, then symmetric-eliminate.
 
-    The RT0 edge DOF *is* the edge normal flux, so the pin (orientation sign locked empirically) is
-    ``σ_e = -sign_topo · ∫_edge g ds`` with ``sign_topo = top.cell_edge_signs[c, k]`` for the boundary
-    edge's single incident cell. Boundary edges are the globally single-use edges, filtered to the BC's
-    region by node membership. ``g`` is constant for now (general ``g(x)`` is a later extension)."""
+    The lowest-order edge DOF *is* an edge moment, so the BC is a value pin ``σ_e = sgn · ∫_edge g ds``
+    (``∫_edge g`` via 1-D edge quadrature; ``g`` may be constant or ``g(x)``). The trace and its sign
+    depend on the family:
+
+    * **RT (H(div))** — normal flux ``u·n = g``; ``σ_e = -sign_topo · ∫g`` with
+      ``sign_topo = top.cell_edge_signs[c, k]`` (locked empirically).
+    * **N1E (H(curl))** — tangential trace ``u×n = g`` (the canonical 2-D tangential component via the
+      *outward* normal). The DOF is the edge-topological tangential moment ``∫ u·t_topo``, so the sign
+      reconciles ``t_topo`` (low→high vertex) with ``(n_y, -n_x)``: ``sgn`` = orientation of the +90°
+      rotation of the edge vector relative to the outward direction (away from the opposite vertex).
+      Derived geometrically and checked against the (exact) projection of a constant field on every
+      boundary edge.
+
+    Boundary edges are the globally single-use edges, filtered to the BC's region by node membership."""
     from ..._fem import _eval_value_node_at
     from .fem_1d import _apply_dirichlet_symmetric, _line_quadrature, _region_node_ids
 
@@ -321,8 +331,11 @@ def _apply_flux_bcs(A, b, flux_bcs, domain, field_index, spaces, top, pts_np, of
     pins = []
     for field_key, region, value_node in flux_bcs:
         fidx = field_index.get(field_key)
-        if fidx is None or spaces[fidx] != "RT":
-            raise NotImplementedError("jno.fem (non-nodal): a normal-flux BC is only supported on an RT field.")
+        if fidx is None or spaces[fidx] not in ("RT", "N1E"):
+            raise NotImplementedError(
+                "jno.fem (non-nodal): an essential edge-trace BC is supported on RT (u·n) and N1E (u×n) only."
+            )
+        is_n1e = spaces[fidx] == "N1E"
         region_nodes = {int(n) for n in _region_node_ids(domain, region)}
         for eid in boundary:
             va, vb = (int(x) for x in top.edge_vertices[eid])
@@ -334,7 +347,13 @@ def _apply_flux_bcs(A, b, flux_bcs, domain, field_index, spaces, top, pts_np, of
             xq = pa[None, :] * (1.0 - gp[:, None]) + pb[None, :] * gp[:, None]  # physical edge quad points
             g_vals = np.asarray(_eval_value_node_at(value_node, jnp.asarray(xq))).reshape(-1)
             moment = length * float(np.sum(gw * g_vals))  # ∫_edge g ds
-            pins.append((offs[fidx] + eid, -int(top.cell_edge_signs[c, k]) * moment))
+            if is_n1e:  # tangential trace: reconcile the edge tangent with (n_y, -n_x) via the outward direction
+                vc = (set(int(x) for ek in cell_edges[c] for x in top.edge_vertices[ek]) - {va, vb}).pop()
+                rot90 = np.array([-(pb[1] - pa[1]), pb[0] - pa[0]])  # +90° rotation of the edge vector
+                sgn = 1.0 if float(np.dot(rot90, 0.5 * (pa + pb) - pts_np[vc])) > 0 else -1.0
+            else:  # RT normal flux
+                sgn = -float(top.cell_edge_signs[c, k])
+            pins.append((offs[fidx] + eid, sgn * moment))
     return _apply_dirichlet_symmetric(jnp.asarray(A), jnp.asarray(b), pins)
 
 

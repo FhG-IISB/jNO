@@ -302,3 +302,68 @@ def test_bind_aware_div_curl_match_explicit_form():
     A_noarg = _dense(jno.fem([inner(ui, vi) + ui.curl() * vi.curl()]).A)
     A_expl = _dense(jno.fem([inner(ui, vi) + u.vector.curl(xi, yi) * v.vector.curl(xi, yi)]).A)
     np.testing.assert_allclose(A_noarg, A_expl, atol=1e-13)
+
+
+def _tangential_sign(pts, top, e, c):
+    # geometric N1E tangential pin sign: orientation of the +90° rotation of the edge vector relative to
+    # the outward direction (away from the opposite vertex of the single incident cell). Mirrors _apply_flux_bcs.
+    va, vb = (int(x) for x in top.edge_vertices[e])
+    pa, pb = pts[va], pts[vb]
+    vc = (set(int(x) for ek in top.cell_edges[c] for x in top.edge_vertices[ek]) - {va, vb}).pop()
+    rot90 = np.array([-(pb[1] - pa[1]), pb[0] - pa[0]])
+    return 1.0 if float(np.dot(rot90, 0.5 * (pa + pb) - pts[vc])) > 0 else -1.0
+
+
+def test_n1e_tangential_bc_pins_boundary_dofs():
+    # Essential tangential trace u×n = g (constant) on N1E pins each boundary edge DOF to sgn·g·|edge|.
+    # Written via the outward normal (domain.variable(..., normals=True)): u[0]*ny - u[1]*nx - g, the same
+    # `dot(u, normal-data) - g` gesture as the RT u·n BC -- no new API. The sign is the geometric tangential
+    # reconciliation (verified against the exact projection of a constant field).
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.5)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="N1E")
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _, nx, ny = d.variable("boundary", normals=True, split=True)
+    ui, vi, ub = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi), u.bind(x=xb, y=yb)
+    g = 0.7
+    fem = jno.fem([inner(ui, vi), ub[0] * ny - ub[1] * nx - g])  # mass + tangential trace u×n = g
+    sol = np.linalg.solve(_dense(fem.A), np.asarray(jnp.asarray(fem.b)).reshape(-1))
+    pts, cells = _mesh(d)
+    top = build_edge_topology(cells)
+    counts = np.bincount(np.asarray(top.cell_edges).reshape(-1), minlength=top.n_edges)
+    loc = {int(top.cell_edges[c, k]): (c, k) for c in range(cells.shape[0]) for k in range(3)}
+    pinned = 0
+    for e, (c, k) in loc.items():
+        if counts[e] != 1:  # boundary edges are single-use
+            continue
+        va, vb = top.edge_vertices[e]
+        length = float(np.linalg.norm(pts[vb] - pts[va]))
+        np.testing.assert_allclose(sol[e], _tangential_sign(pts, top, e, c) * g * length, atol=1e-10)
+        pinned += 1
+    assert pinned == 8  # the unit-square boundary at mesh_size 0.5
+
+
+def test_n1e_curl_curl_dirichlet_converges():
+    # The canonical H(curl) validation: curl curl u + u = f with the homogeneous tangential BC u×n = 0.
+    # Manufactured u=(sin πy, sin πx) has u×n=0 on the unit square and curl curl u = π²u, so f=(π²+1)u.
+    # Lowest-order N1E is O(h) in L²: check the centroid error drops at ~rate 1 under refinement.
+    PI = float(np.pi)
+
+    def solve(ms):
+        d = jno.domain(box(0, 0, 1, 1), mesh_size=ms)
+        u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="N1E")
+        xi, yi, _ = d.variable("interior", split=True)
+        xb, yb, _, nx, ny = d.variable("boundary", normals=True, split=True)
+        ui, vi, ub = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi), u.bind(x=xb, y=yb)
+        fac = PI**2 + 1.0
+        fx, fy = fac * sin(PI * yi), fac * sin(PI * xi)  # f = (π²+1)·u_exact
+        fem = jno.fem([inner(ui, vi) + ui.curl() * vi.curl() - (fx * vi[0] + fy * vi[1]), ub[0] * ny - ub[1] * nx - 0.0])
+        sol = np.linalg.solve(_dense(fem.A), np.asarray(jnp.asarray(fem.b)).reshape(-1))
+        pts, cells = _mesh(d)
+        fc = np.asarray(n1e_field_at_centroids(pts, cells, build_edge_topology(cells), jnp.asarray(sol)))
+        cent = pts[cells].mean(1)
+        exact = np.stack([np.sin(PI * cent[:, 1]), np.sin(PI * cent[:, 0])], -1)
+        return float(np.sqrt(np.mean(np.sum((fc - exact) ** 2, 1))))
+
+    e = [solve(h) for h in (0.5, 0.25, 0.125)]
+    assert e[2] < e[1] < e[0], f"not monotone under refinement: {e}"
+    assert np.log2(e[1] / e[2]) > 0.85, f"curl-curl Dirichlet rate {np.log2(e[1] / e[2]):.2f} below O(h)"
