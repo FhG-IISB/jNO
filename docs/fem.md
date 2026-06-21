@@ -168,6 +168,48 @@ for _ in range(round((fem.t1 - fem.t0) / dt)):          # backward Euler
     w = jnp.linalg.solve(M + dt * A, M @ w)
 ```
 
+### Second order in time (`u_tt`) — wave / elastodynamics
+
+A weak form carrying a **second** time derivative (`ui.tt`) is auto-reduced to the equivalent
+first-order system in `y = [u, v]` (velocity `v = u_t`) and integrated by the energy-conserving
+**trapezoidal rule** (θ=½, equivalent to Newmark average-acceleration — Newmark 1959, *"A Method of
+Computation for Structural Dynamics"*, J. Eng. Mech. Div. ASCE 85(3), the constant-average-acceleration
+case β=¼, γ=½) — backward Euler would spuriously damp an undamped wave. A second-order
+problem needs **two** initial conditions: displacement `u(initial) - u0` and velocity
+`u.t(initial) - v0` (bind the velocity IC with the `"initial"`-slice coordinates *and time*,
+`u.bind(x=xi0, y=yi0, t=ti0).t`; a missing velocity IC defaults to zero).
+
+```python
+d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1, time=(0.0, 2.0, 200))
+u, phi = d.fem_symbols()
+xi, yi, ti = d.variable("interior", split=True)
+xb, yb, _ = d.variable("boundary", split=True)
+xi0, yi0, ti0 = d.variable("initial", split=True)          # initial slice: coords + time
+ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+ui0 = u.bind(x=xi0, y=yi0, t=ti0)
+
+# u_tt = Δu  ->  ∫ u_tt φ + ∫ ∇u·∇φ = 0
+fem = jno.fem([ui.tt * vi + (ui.x * vi.x + ui.y * vi.y),
+               u(xb, yb) - 0.0,                            # fixed boundary
+               u(xi0, yi0) - jno.fn(u0_fn, [xi0, yi0]),    # displacement IC
+               ui0.t - 0.0])                               # velocity IC (here: at rest)
+```
+
+The assembled block is a standard transient block, so `fem.M` / `fem.state0` and the differentiable
+`fem.solve()` work unchanged. The state is `y = [u; v]` of size `2N`; use `fem.offsets` (`[0, N, 2N]`)
+to split it — displacement is `y[:N]`, velocity `y[N:]`. Add a damping term `c * ui.t * vi` for a
+damped wave.
+
+> **Integrate with `fem.solve()` — or step with θ=½ yourself.** The energy-conserving trapezoidal
+> rule lives inside `fem.solve()`. Unlike the first-order (parabolic) block above, **do not** hand-roll
+> backward Euler `(M + dt·A) w = M·w` off `fem.M` / `fem.operator.A` on a second-order block: backward
+> Euler spuriously **damps** the wave. If you integrate manually, use the trapezoidal step
+> `(M + ½·dt·A) w_next = (M − ½·dt·A) w + dt·c`.
+
+*Scope: linear, single (scalar) field, nodal Lagrange, 2D/3D, constant Dirichlet;
+nonlinear / vector / multi-field / runtime-parameter / time-varying-Dirichlet second-order forms are
+rejected (fail-loud) — write those as a first-order system.*
+
 ---
 
 ## Differentiable solve & inverse problems
@@ -262,10 +304,14 @@ silently wrong result.
   constant and place affine trainable parameters in the operator/residual instead
   — e.g. a diffusivity `nu` on the stiffness term, not on the time derivative.
 
-- **First order in time only.** The Diffrax and FEAX time-stepping adapters handle
-  first-order semidiscrete systems. A second-order-in-time PDE (such as the
-  undamped wave equation, `u_tt = c² Δu`) must be rewritten as a first-order
-  system; it cannot be assembled as a single second-order block.
+- **Second-order in time is scoped.** A second-order-in-time weak form (`u_tt`, e.g.
+  the wave equation `u_tt = c² Δu`) **is** assembled — `jno.fem` auto-reduces it to a
+  first-order augmented `(u, v=u_t)` block, integrated by the energy-conserving
+  trapezoidal rule (see *Second order in time* above). It is scoped to **linear,
+  single (scalar) field, nodal Lagrange, 2D/3D, constant Dirichlet**; a nonlinear,
+  vector, multi-field, runtime-parameter, or time-varying-Dirichlet second-order form
+  is rejected (fail-loud) — rewrite those as a first-order system. The Diffrax /
+  residual-PINN strong-form adapters remain first-order (manual reduction).
 
 - **No runtime Dirichlet parameters.** A trainable parameter may sit in the
   operator (stiffness) but not in an essential/Dirichlet boundary *value*: a

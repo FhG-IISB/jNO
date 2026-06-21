@@ -401,15 +401,24 @@ def _default_transient_integrate(block, args, save_ts):
         M = _operand(block.M)
         n = M.shape[0]
         c = jnp.zeros((n,), dtype) if block.affine_bias is None else jnp.asarray(block.affine_bias, dtype).reshape(-1)
+        # theta-method on the linear semidiscrete system: theta=1 is backward Euler (the default);
+        # theta=1/2 is the trapezoidal rule (energy-conserving -- used by the second-order/wave route,
+        # where backward Euler would spuriously damp an undamped oscillation).
+        theta = float(block.metadata.get("theta", 1.0)) if getattr(block, "metadata", None) else 1.0
+
+        def _forcing(t):
+            if block.forcing_vector_fn is None:
+                return jnp.zeros((n,), dtype)
+            return jnp.asarray(block.forcing_vector_fn(t, args), dtype).reshape(-1)
 
         def step(w, t_next):
             A = _operand(block.operator_fn(t_next, args) if block.operator_fn is not None else block.A)
-            rhs = M @ w + dt * c
-            if block.forcing_vector_fn is not None:
-                rhs = rhs + dt * jnp.asarray(block.forcing_vector_fn(t_next, args), dtype).reshape(-1)
+            # (M + theta dt A) w_next = (M - (1-theta) dt A) w + dt c + dt(theta f_next + (1-theta) f_prev)
+            f_avg = theta * _forcing(t_next) + (1.0 - theta) * _forcing(t_next - dt)
+            rhs = M @ w - (1.0 - theta) * dt * (A @ w) + dt * c + dt * f_avg
 
-            def G(wn):  # affine residual: (M + dt A) wn - rhs ; root is the backward-Euler update
-                return M @ wn + dt * (A @ wn) - rhs
+            def G(wn):  # affine residual; root is the theta-method update (one BiCGStab solve)
+                return M @ wn + theta * dt * (A @ wn) - rhs
 
             wn = newton_krylov(G, w)
             return wn, wn
