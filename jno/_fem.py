@@ -545,6 +545,35 @@ def _dirichlet_spec(bare: Any) -> Tuple[Optional[int], Any, Any]:
     return comp, _value_from_node(value_node), value_node
 
 
+def _normal_flux_spec(constraint: Any, domain: Any) -> Optional[Tuple[Any, str, Any]]:
+    """Recognise an essential **normal-flux** BC ``u·n - g`` (H(div) RT) -> ``(field_key, region,
+    value_node)``; ``None`` otherwise.
+
+    The trial side is affine in ``u`` and references a boundary outward-normal Variable (tag
+    ``n_<region>``, from ``domain.variable(region, normals=True)``); there is no test function (it is
+    essential, not a weak Neumann term). The physical normal is recomputed per boundary edge at
+    assembly, so only the region and the prescribed value ``g`` (``value_node``) are carried. Separated
+    out before classification (like periodic ties) so it never reaches the Cartesian Dirichlet parser."""
+    bare = _bare(constraint)
+    if getattr(bare, "op", None) != "-" or _contains(bare, TestFunction):
+        return None
+    left, right = getattr(bare, "left", None), getattr(bare, "right", None)
+    if left is None or right is None:
+        return None
+    left_trial, right_trial = _contains(left, TrialFunction), _contains(right, TrialFunction)
+    if left_trial == right_trial:  # need exactly one side with the trial (the u·n expression)
+        return None
+    trial_side, value_node = (left, right) if left_trial else (right, left)
+    normals = [
+        n
+        for n in _walk(trial_side)
+        if isinstance(n, Variable) and isinstance(getattr(n, "tag", None), str) and n.tag.startswith("n_")
+    ]
+    if not normals:
+        return None
+    return _field_key_of(constraint), normals[0].tag[2:], value_node
+
+
 def _initial_state(bare: Any, domain: Any) -> Any:
     """Initial nodal state vector from an IC residual ``u(initial) - u0``.
 
@@ -1090,6 +1119,15 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     if periodic_ties and not constraints:
         raise ValueError("jno.fem: only periodic ties were given — add the PDE weak form (and any other conditions).")
 
+    # Essential normal-flux BCs `u·n - g` (H(div) RT) pin boundary-edge DOFs at assembly; like periodic
+    # ties they must be separated before classification (the Cartesian Dirichlet parser would reject them).
+    flux_bcs: List[Any] = []
+    _core: List[Any] = []
+    for c in constraints:
+        spec = _normal_flux_spec(c, domain)
+        (flux_bcs.append(spec) if spec is not None else _core.append(c))
+    constraints = _core
+
     # VPINN: a network trial (``u = net(x, y)`` written into the weak form) makes jno.fem
     # test-project the weak form onto the FE test space -> a trainable residual loss, not an FE
     # system. Detected by a ModelCall; lowered after the shared quadrature setup (see below).
@@ -1217,7 +1255,7 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         from .utils.solver.fem_nonnodal import assemble_fem_nonnodal
 
         op, mode, offsets = assemble_fem_nonnodal(
-            domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, quad_degree=quad_degree
+            domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, flux_bcs=flux_bcs, quad_degree=quad_degree
         )
         return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offsets))
 

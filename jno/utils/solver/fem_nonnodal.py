@@ -92,7 +92,7 @@ def assemble_mixed_poisson_rt(
     return A, b, top, spec
 
 
-def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, *, quad_degree=4):
+def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, *, flux_bcs=(), quad_degree=4):
     """Native push-forward assembler for non-nodal (RT, ...) fields, driven by the weak-form DSL.
 
     The n-D analogue of :func:`fem_1d.assemble_fem_1d_multifield`: it lowers each weak term, builds a
@@ -207,7 +207,50 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
     zeros = jnp.zeros(total)
     A = jax.jacfwd(residual)(zeros)
     b = -residual(zeros)
+
+    # essential normal-flux BCs (u·n = g): pin boundary-edge DOFs, then symmetric-eliminate
+    if flux_bcs:
+        A, b = _apply_flux_bcs(A, b, flux_bcs, domain, field_index, spaces, top, np.asarray(pts), offs, n_cells)
     return (A, b), "linear", offs
+
+
+def _apply_flux_bcs(A, b, flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_cells):
+    """Pin boundary-edge DOFs for essential normal-flux BCs ``u·n = g``, then symmetric-eliminate.
+
+    The RT0 edge DOF *is* the edge normal flux, so the pin (orientation sign locked empirically) is
+    ``σ_e = -sign_topo · ∫_edge g ds`` with ``sign_topo = top.cell_edge_signs[c, k]`` for the boundary
+    edge's single incident cell. Boundary edges are the globally single-use edges, filtered to the BC's
+    region by node membership. ``g`` is constant for now (general ``g(x)`` is a later extension)."""
+    from ..._fem import _constant_of
+    from .fem_1d import _apply_dirichlet_symmetric, _region_node_ids
+
+    cell_edges = np.asarray(top.cell_edges)
+    counts = np.bincount(cell_edges.reshape(-1), minlength=top.n_edges)
+    boundary = {int(e) for e in np.where(counts == 1)[0]}
+    loc = {}  # boundary edge id -> (cell, local k) of its single incident cell
+    for c in range(n_cells):
+        for k in range(3):
+            eid = int(cell_edges[c, k])
+            if eid in boundary:
+                loc[eid] = (c, k)
+
+    pins = []
+    for field_key, region, value_node in flux_bcs:
+        fidx = field_index.get(field_key)
+        if fidx is None or spaces[fidx] != "RT":
+            raise NotImplementedError("jno.fem (non-nodal): a normal-flux BC is only supported on an RT field.")
+        g = _constant_of(value_node)
+        if g is None:
+            raise NotImplementedError("jno.fem (non-nodal): only a constant u·n = g flux BC is wired so far.")
+        region_nodes = {int(n) for n in _region_node_ids(domain, region)}
+        for eid in boundary:
+            va, vb = (int(x) for x in top.edge_vertices[eid])
+            if va not in region_nodes or vb not in region_nodes:
+                continue
+            c, k = loc[eid]
+            length = float(np.linalg.norm(pts_np[vb] - pts_np[va]))
+            pins.append((offs[fidx] + eid, -int(top.cell_edge_signs[c, k]) * float(g) * length))
+    return _apply_dirichlet_symmetric(jnp.asarray(A), jnp.asarray(b), pins)
 
 
 def rt_flux_at_centroids(points: np.ndarray, cells: np.ndarray, top: EdgeTopology, u_edge: jnp.ndarray) -> jnp.ndarray:
