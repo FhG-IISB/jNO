@@ -275,6 +275,13 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
             raise ValueError("jno.fem (non-nodal): a transient weak form must contain a temporal term, e.g. inner(u.t, v).")
         if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in spatial):
             raise NotImplementedError("jno.fem (non-nodal): nonlinear-transient is not wired yet (linear transient works).")
+        if len(fields) > 1:
+            # A mixed/saddle transient where some field carries no ∂ₜ gives a singular mass M (and a NaN
+            # IC projection). Fail loudly rather than silently -- single-field transient is what's wired.
+            raise NotImplementedError(
+                "jno.fem (non-nodal): transient is single-field only; a mixed/saddle transient (a field "
+                f"with no time derivative -> singular mass) is not wired. Got {len(fields)} fields {spaces}."
+            )
         M = jax.jacfwd(_make_residual([_strip_temporal_trial_derivative(t) for t in temporal]))(zeros)  # mass
         spatial_res = _make_residual(spatial)
         A = jax.jacfwd(spatial_res)(zeros)
@@ -325,7 +332,14 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
     # --- steady nonlinear: a genuinely nonlinear weak term -> a Newton residual operator ---
     if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in volume_terms):
         res_bc = _apply_dirichlet_rows(full_residual, pins)  # essential pins as residual rows R[d]=u[d]-g
-        return FemResidualOperator(res_bc, jax.jacfwd(res_bc), total), "nonlinear", offs
+        jac = jax.jacfwd(res_bc)
+        # FemResidualOperator.solve calls residual(u, args)/jacobian(u, args); the non-nodal residual has no
+        # runtime parameters, so accept-and-ignore args (args=None keeps `fem.residual(u)` single-arg too).
+        return (
+            FemResidualOperator(lambda u, args=None: res_bc(u), lambda u, args=None: jac(u), total),
+            "nonlinear",
+            offs,
+        )
 
     # --- steady linear: A u = b (byte-identical to before the refactor) ---
     A = jax.jacfwd(full_residual)(zeros)

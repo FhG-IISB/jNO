@@ -473,24 +473,20 @@ def test_rt_mixed_bc_via_user_defined_tags():
     np.testing.assert_allclose(sol[off[1] : off[2]], cent[:, 0], atol=1e-9)  # p = x at centroids
 
 
-def test_n1e_nonlinear_reaction_newton_converges():
+def test_n1e_nonlinear_reaction_solve_converges():
     # A genuinely nonlinear weak form ∫(1+|u|²) u·v = ∫f·v routes to a Newton residual operator (mode
-    # "nonlinear"), and Newton drives the residual to a root. The residual-norm check is the robust test
-    # for these spaces (a manufactured nonlinear solution is fiddly); it also confirms residual(u) is
-    # evaluated correctly at NONZERO u (previously it was only ever called at 0 / through jacfwd).
+    # "nonlinear"); the USER API fem.solve() (-> FemResidualOperator.solve, Newton/JFNK) drives it to a
+    # root. ‖R(u_sol)‖→0 is the robust check for these spaces, and it confirms residual(u) is evaluated
+    # correctly at NONZERO u (previously it was only ever called at 0 / through jacfwd).
     d = jno.domain(box(0, 0, 1, 1), mesh_size=0.4)
     u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="N1E")
     xi, yi, _ = d.variable("interior", split=True)
     ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
     fem = jno.fem([inner(ui, vi) + inner(ui, ui) * inner(ui, vi) - (1.0 * vi[0] + 0.5 * vi[1])])
     assert not fem.is_linear and not fem.is_transient  # -> a steady nonlinear residual operator
-    pts, cells = _mesh(d)
-    size = build_edge_topology(cells).n_edges
-    R, J = fem.residual, fem.jacobian
-    uu = jnp.zeros(size)
-    for _ in range(8):  # Newton: u <- u - J(u)^{-1} R(u)
-        uu = uu - jnp.linalg.solve(jnp.asarray(J(uu)), jnp.asarray(R(uu)))
-    assert float(jnp.linalg.norm(R(uu))) < 1e-10  # converged to a root R(u)=0
+    node = fem.solve()  # the user API; dispatches to the Newton solver
+    usol = np.asarray(jno.core([(node * 0.0).mse], domain=d).eval([node])).reshape(-1)
+    assert float(jnp.linalg.norm(fem.residual(jnp.asarray(usol)))) < 1e-7  # solved to a root R(u)=0
 
 
 def test_n1e_transient_decay_matches_analytic():
@@ -519,3 +515,39 @@ def test_n1e_transient_decay_matches_analytic():
     decay = float(np.exp(-(fem.t1 - fem.t0)))
     assert np.linalg.norm(w - decay * s0) / np.linalg.norm(decay * s0) < 5e-3  # u(T) = exp(-T) u0
     assert 0.0 < np.linalg.norm(w) < np.linalg.norm(s0)  # the field decays
+
+
+def test_n1e_transient_forced_solve_exercises_forcing():
+    # Forced transient ∂ₜu + u = (1,0), u0=0 -> u(t)=(1-e^-t)(1,0). Driven through the REAL time integrator
+    # (_default_transient_integrate, which consumes the affine_bias c) -- the forcing path a manual
+    # backward-Euler loop on M/A would silently skip.
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.5, time=(0.0, 0.2, 21))
+    co = d.variable("interior", split=True)
+    ci = d.variable("initial", split=True)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="N1E")
+    ui, vi = u.bind(x=co[0], y=co[1], t=co[2]), v.bind(x=co[0], y=co[1], t=co[2])
+    ic = u(ci[0], ci[1]) - jno.np.vector(0.0 * ci[0], 0.0 * ci[1])  # u0 = 0
+    fem = jno.fem([inner(ui.t, vi) + inner(ui, vi) - 1.0 * vi[0], ic])  # ∂ₜu + u = (1, 0)
+    assert fem.is_transient
+    traj = np.asarray(_default_transient_integrate(fem.operator, {}, jnp.linspace(fem.t0, fem.t1, 21)))
+    assert np.linalg.norm(traj[0]) < 1e-10  # u(0) = 0 (zero IC)
+    pts, cells = _mesh(d)
+    fld = np.asarray(n1e_field_at_centroids(pts, cells, build_edge_topology(cells), jnp.asarray(traj[-1])))
+    np.testing.assert_allclose(fld.mean(0), [1.0 - np.exp(-0.2), 0.0], atol=2e-2)  # u(T)=(1-e^-T)(1,0)
+
+
+def test_n1e_multifield_transient_raises_not_silent():
+    # A mixed/saddle transient (the P0 field carries no ∂ₜ -> singular mass, NaN IC projection) must fail
+    # LOUDLY, not return a silent NaN state0.
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.5, time=(0.0, 0.1, 6))
+    co = d.variable("interior", split=True)
+    ci = d.variable("initial", split=True)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="N1E")
+    p, q = d.fem_symbols(names=("p", "q"), space="P0")
+    ui, vi = u.bind(x=co[0], y=co[1], t=co[2]), v.bind(x=co[0], y=co[1], t=co[2])
+    pi, qi = p.bind(x=co[0], y=co[1], t=co[2]), q.bind(x=co[0], y=co[1], t=co[2])
+    ic = u(ci[0], ci[1]) - jno.np.vector(-ci[1], ci[0])
+    with pytest.raises(NotImplementedError, match="single-field"):
+        jno.fem([inner(ui.t, vi) + inner(ui, vi) + pi * qi, ic])
