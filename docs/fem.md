@@ -39,7 +39,8 @@ u_h = jnp.linalg.solve(fem.A, fem.b)
   Add `time=(t0, t1, n_steps)` to make it transient.
 * **Symbols** — `u, phi = d.fem_symbols(value_shape=(), names=("u", "phi"), order=1)`.
   Use `value_shape=(2,)` for a vector unknown (elasticity, flow velocity), `order=2` for P2
-  (quadratic) elements, and call `fem_symbols` once per field for coupled systems.
+  (quadratic) elements, `space="RT"`/`"N1E"`/`"P0"` for the non-nodal families (see below), and
+  call `fem_symbols` once per field for coupled systems.
 * **Quadrature coordinates** — `d.variable("interior", split=True)` returns the volume
   coordinates; `d.variable("<edge>", split=True)` returns a boundary edge's coordinates. A
   `box` auto-tags `"left"`, `"right"`, `"bottom"`, `"top"` (and `"front"`/`"back"` for a cube);
@@ -67,6 +68,48 @@ in the `jno.fem([...])` list, and `jno.fem` classifies each by the region it is 
 `g` may be a constant or a coordinate expression (e.g. `u(xb, yb) - jno.np.sin(jno.np.pi * xb)`
 for a spatially varying Dirichlet value). A zero Neumann flux is the natural default and needs
 no term.
+
+---
+
+## Non-nodal element families: H(div) and H(curl)
+
+Beyond nodal Lagrange (P1/P2), `jno.fem` assembles **edge-DOF** families on 2-D triangles — for
+problems whose natural space is *not* H¹. Pick one with the `space=` knob on `fem_symbols`:
+
+| `space` | Space | DOF | Use |
+|---------|-------|-----|-----|
+| `"Lagrange"` (default) | H¹ | nodal value | standard PDEs |
+| `"RT"` | **H(div)** Raviart–Thomas | edge normal flux `∫ₑ u·n` | mixed Poisson, Darcy, conservation |
+| `"N1E"` | **H(curl)** Nédélec (1st kind) | edge tangential `∫ₑ u·t` | Maxwell, eddy currents |
+| `"P0"` | L² (piecewise constant) | one per cell | the pressure / multiplier of a mixed pair |
+
+```python
+u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")   # H(div) flux
+p, q = d.fem_symbols(names=("p", "q"), space="P0")                     # piecewise-constant scalar
+```
+
+jNO assembles these with its own push-forward engine (feax has none), but the weak form reads like
+any other coupled problem.
+
+**Vector operators** (on a bound vector view): `u.div(x, y)` is the divergence and `u.curl(x, y)` the
+2-D scalar curl `∂uy/∂x − ∂ux/∂y`; after binding, the no-arg `u.div()` / `u.curl()` reuse the bound
+coordinates. (`div` is equivalently `trace(grad(u, [x, y]))`.)
+
+**Essential (edge-trace) BCs** — the outward normal is `d.variable(region, normals=True, split=True)`:
+
+| Family | Trace | Term |
+|--------|-------|------|
+| RT  | normal flux `u·n = g` | `u(b)[0]*nx + u(b)[1]*ny - g` |
+| N1E | tangential `u×n = g`  | `u(b)[0]*ny - u(b)[1]*nx - g` |
+
+For the RT mixed-Poisson saddle, a Dirichlet condition on the scalar `p` is *natural* — add the weak
+term `p_D * (v[0]*nx + v[1]*ny)`, no essential constraint on the flux. A BC may target a sub-region
+(a `box` edge tag or any `d.tag(...)` boundary subset; sub-region normals are computed from the
+geometry). All solver modes work — **steady-linear**, **steady-nonlinear** (Newton), and **transient**
+(`M u̇ + A u = c`), including a mixed/saddle transient (a DAE with singular mass, e.g. transient Darcy).
+
+Tutorials: `mixed_poisson_rt_2d.py` (H(div)) and `maxwell_nedelec_2d.py` (H(curl): magnetostatics +
+eddy current). *Scope: lowest-order RT₀ / N1E₀ on 2-D triangular meshes.*
 
 ---
 
