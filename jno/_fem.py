@@ -286,10 +286,16 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
     single region.
     """
     _bregions = getattr(domain, "_boundary_regions", {})
+
+    def _region_of(tag: str) -> str:
+        # an outward-normal Variable `n_<region>` (from domain.variable(region, normals=True)) belongs
+        # to its region, not a separate one -- so `g*(v·n)` on a boundary is a single-region term.
+        if tag.startswith("n_") and tag[2:] in _bregions:
+            tag = tag[2:]
+        return _normalize_quad_tag(tag, _bregions)
+
     tags = {
-        _normalize_quad_tag(v.tag, _bregions)
-        for v in _spatial_coord_vars(constraint)
-        if isinstance(v.tag, str) and not v.tag.startswith("__")
+        _region_of(v.tag) for v in _spatial_coord_vars(constraint) if isinstance(v.tag, str) and not v.tag.startswith("__")
     }
     # The t=t0 slice is its own support; an IC residual lives here.
     if "initial" in tags:
@@ -315,7 +321,9 @@ def _retag_coords_for_quadrature(constraint: Any, support: str, region_id: str) 
     """
     target = "fem_gauss" if support == "volume" else f"gauss_{region_id}"
     for v in _spatial_coord_vars(constraint):
-        if isinstance(v.tag, str) and v.tag != "fem_gauss" and not v.tag.startswith("gauss_"):
+        # outward-normal Variables (`n_<region>`) are not quadrature coordinates -- leave their tag so a
+        # `v·n` boundary term keeps the normal identifiable downstream.
+        if isinstance(v.tag, str) and v.tag != "fem_gauss" and not v.tag.startswith(("gauss_", "n_")):
             v.tag = target
 
 

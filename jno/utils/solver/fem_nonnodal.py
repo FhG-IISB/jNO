@@ -6,18 +6,18 @@ zoo assembles on the jNO side from :mod:`fem_topology` (global edge numbering +
 orientation) and :mod:`fem_elements` (basix reference tabulation + per-cell
 push-forward).
 
-The first entry point is the **RT–P0 mixed Poisson** system — the canonical
-H(div) test problem — assembled directly (not yet via the weak-form DSL) so the
-engine (edge DOFs, orientation, contravariant Piola, divergence, saddle-block
-assembly) can be validated end-to-end against a manufactured solution by
-*convergence rate*. The DSL/``fem_symbols(space=...)`` routing builds on this
-once the engine is proven.
+Two entry points:
 
-Mixed Poisson ``u = -∇p``, ``div u = f`` with ``p = 0`` on ∂Ω (Dirichlet on ``p``
-is *natural* in the mixed form → no essential flux BC). Flux ``u ∈ RT``, scalar
-``p ∈ P0``; weak form ``∫u·v − ∫p div v = 0`` ∀v∈RT, ``∫q div u = ∫f q`` ∀q∈P0.
-Global DOFs are ``[edge DOFs (n_edges)] ++ [cell DOFs (n_cells)]`` and the block
-system is ``[[M, −Bᵀ], [B, 0]] [u; p] = [0; f]``.
+* :func:`assemble_mixed_poisson_rt` — a *direct* RT–P0 mixed-Poisson assembler, kept to
+  validate the engine (edge DOFs, orientation, contravariant Piola, divergence, saddle-block
+  assembly) end-to-end against a manufactured solution by *convergence rate*.
+* :func:`assemble_fem_nonnodal` — the DSL-driven assembler ``jno.fem`` routes RT/P0 fields to.
+  It covers the mixed-Poisson saddle system, the essential normal-flux BC ``u·n = g`` (pins
+  boundary-edge DOFs), and the natural pressure BC ``p = p_D`` (the weak term ``p_D·(v·n)``).
+
+Mixed Poisson ``u = -∇p``, ``div u = f``. Flux ``u ∈ RT``, scalar ``p ∈ P0``; weak form
+``∫u·v − ∫p div v = 0`` ∀v∈RT, ``∫q div u = ∫f q`` ∀q∈P0. Global DOFs are
+``[edge DOFs (n_edges)] ++ [cell DOFs (n_cells)]``; block system ``[[M, −Bᵀ], [B, 0]] [u; p]``.
 """
 
 from __future__ import annotations
@@ -100,8 +100,10 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
     through the shared integrand evaluator (:func:`feax_utils._eval_expr_for_feax`, which now has
     space-guarded RT branches). Returns ``(A, b)`` for the linear system (matrices-only contract).
 
-    Scope (#2a/#2b): RT (H(div), edge DOFs) and P0 (cell DOFs) fields, volume terms only -- the H(div)
-    mass / L²-projection and the RT-P0 mixed-Poisson saddle system. Essential BCs come next.
+    Scope: RT (H(div), edge DOFs) and P0 (cell DOFs) fields -- the H(div) mass / L²-projection and the
+    RT-P0 mixed-Poisson saddle system, with the essential normal-flux BC ``u·n = g`` (``flux_bcs``, pinned
+    via :func:`_apply_flux_bcs`) and the natural pressure BC ``p = p_D`` (``boundary_terms``, applied via
+    :func:`_apply_natural_boundary_terms`). Dirichlet/IC on these fields are not wired.
     """
     from .feax_utils import _infer_fields, _lower_statefield_to_trial, _test_field_index
     from .fem_1d import _integrate_term
@@ -109,8 +111,8 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
     from .fem_topology import build_edge_topology
     from .weak_form import _apply_sign, _split_additive_terms
 
-    if boundary_terms or dirichlet_raw or ic_residuals:
-        raise NotImplementedError("jno.fem (non-nodal): boundary / Dirichlet / IC terms are not wired yet.")
+    if dirichlet_raw or ic_residuals:
+        raise NotImplementedError("jno.fem (non-nodal): Dirichlet / IC terms are not wired yet.")
 
     # --- field layout: RT (edge DOFs) and/or P0 (cell DOFs) ---
     fields: List[Any] = []
@@ -208,12 +210,68 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
     A = jax.jacfwd(residual)(zeros)
     b = -residual(zeros)
 
+    # natural (weak) boundary terms -- for RT the natural pressure BC p_D*(v·n) (contributes to b)
+    if boundary_terms:
+        b = _apply_natural_boundary_terms(
+            b, boundary_terms, domain, field_index, spaces, top, np.asarray(pts), offs, n_cells, quad_degree
+        )
     # essential normal-flux BCs (u·n = g): pin boundary-edge DOFs, then symmetric-eliminate
     if flux_bcs:
         A, b = _apply_flux_bcs(
             A, b, flux_bcs, domain, field_index, spaces, top, np.asarray(pts), offs, n_cells, quad_degree
         )
     return (A, b), "linear", offs
+
+
+def _apply_natural_boundary_terms(b, boundary_terms, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree):
+    """Assemble RT natural (weak) boundary terms into ``b``. Supports the natural pressure BC
+    ``p_D · (v·n)`` (mixed Poisson with prescribed ``p = p_D``): in the momentum residual this is
+    ``+∮ p_D (v·n) ds``, and since the RT0 basis has ``v_e·n`` constant on its own edge it reduces to
+    ``b[edge_e] += sign_topo · avg_edge(p_D)`` (sign validated empirically; the ``1/L`` density cancels
+    the edge integral, leaving the average). Other weak boundary forms (e.g. Robin) raise."""
+    from ..._fem import _bare, _contains, _eval_value_node_at, _walk
+    from ...trace import BinaryOp, TestFunction, Variable
+    from .fem_1d import _line_quadrature, _region_node_ids
+
+    cell_edges = np.asarray(top.cell_edges)
+    counts = np.bincount(cell_edges.reshape(-1), minlength=top.n_edges)
+    boundary = {int(e) for e in np.where(counts == 1)[0]}
+    loc = {int(cell_edges[c, k]): (c, k) for c in range(n_cells) for k in range(3) if int(cell_edges[c, k]) in boundary}
+    gp, gw = (np.asarray(x).reshape(-1) for x in _line_quadrature(quad_degree))
+
+    b = np.asarray(b).copy()
+    for region, terms in boundary_terms.items():
+        region_nodes = {int(n) for n in _region_node_ids(domain, region)}
+        for term in terms:
+            bare = _bare(term)
+            # recognise p_D * (v·n): a product with the test on one side, p_D on the other
+            ok = isinstance(bare, BinaryOp) and bare.op == "*"
+            if ok and _contains(bare.left, TestFunction) and not _contains(bare.right, TestFunction):
+                vn_side, pd_node = bare.left, bare.right
+            elif ok and _contains(bare.right, TestFunction) and not _contains(bare.left, TestFunction):
+                vn_side, pd_node = bare.right, bare.left
+            else:
+                raise NotImplementedError(
+                    "jno.fem (non-nodal): only the natural pressure BC `p_D * (v·n)` weak boundary term is "
+                    "supported on an RT field (Robin / general surface terms are not wired yet)."
+                )
+            walked = list(_walk(vn_side))
+            if not any(isinstance(n, Variable) and str(getattr(n, "tag", "")).startswith("n_") for n in walked):
+                raise NotImplementedError("jno.fem (non-nodal): expected a normal projection `v·n` in the boundary term.")
+            fkeys = {n.field_key for n in walked if isinstance(n, TestFunction)}
+            fidx = field_index.get(next(iter(fkeys))) if fkeys else None
+            if fidx is None or spaces[fidx] != "RT":
+                raise NotImplementedError("jno.fem (non-nodal): a natural p_D*(v·n) BC is only supported on an RT field.")
+            for eid in boundary:
+                va, vb = (int(x) for x in top.edge_vertices[eid])
+                if va not in region_nodes or vb not in region_nodes:
+                    continue
+                c, k = loc[eid]
+                pa, pb = pts_np[va], pts_np[vb]
+                xq = pa[None, :] * (1.0 - gp[:, None]) + pb[None, :] * gp[:, None]
+                pd = np.asarray(_eval_value_node_at(pd_node, jnp.asarray(xq))).reshape(-1)
+                b[offs[fidx] + eid] += int(top.cell_edge_signs[c, k]) * float(np.sum(gw * pd))  # sign * avg_edge(p_D)
+    return jnp.asarray(b)
 
 
 def _apply_flux_bcs(A, b, flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree):
