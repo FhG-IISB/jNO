@@ -471,3 +471,23 @@ def test_rt_mixed_bc_via_user_defined_tags():
     flux = np.asarray(rt_flux_at_centroids(pts, cells, build_edge_topology(cells), jnp.asarray(sol[off[0] : off[1]])))
     np.testing.assert_allclose(flux, np.tile([-1.0, 0.0], (flux.shape[0], 1)), atol=1e-9)  # u exact in RT0
     np.testing.assert_allclose(sol[off[1] : off[2]], cent[:, 0], atol=1e-9)  # p = x at centroids
+
+
+def test_n1e_nonlinear_reaction_newton_converges():
+    # A genuinely nonlinear weak form ∫(1+|u|²) u·v = ∫f·v routes to a Newton residual operator (mode
+    # "nonlinear"), and Newton drives the residual to a root. The residual-norm check is the robust test
+    # for these spaces (a manufactured nonlinear solution is fiddly); it also confirms residual(u) is
+    # evaluated correctly at NONZERO u (previously it was only ever called at 0 / through jacfwd).
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.4)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="N1E")
+    xi, yi, _ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    fem = jno.fem([inner(ui, vi) + inner(ui, ui) * inner(ui, vi) - (1.0 * vi[0] + 0.5 * vi[1])])
+    assert not fem.is_linear and not fem.is_transient  # -> a steady nonlinear residual operator
+    pts, cells = _mesh(d)
+    size = build_edge_topology(cells).n_edges
+    R, J = fem.residual, fem.jacobian
+    uu = jnp.zeros(size)
+    for _ in range(8):  # Newton: u <- u - J(u)^{-1} R(u)
+        uu = uu - jnp.linalg.solve(jnp.asarray(J(uu)), jnp.asarray(R(uu)))
+    assert float(jnp.linalg.norm(R(uu))) < 1e-10  # converged to a root R(u)=0

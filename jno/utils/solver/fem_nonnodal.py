@@ -107,8 +107,9 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
     DOF map; they differ only in the push-forward (contravariant vs covariant). Dirichlet/IC are not wired;
     the H(curl) curl-curl operator and the tangential BC ``u·t = g`` come next.
     """
+    from ...trace import FemResidualOperator
     from .feax_utils import _infer_fields, _lower_statefield_to_trial, _test_field_index
-    from .fem_1d import _integrate_term
+    from .fem_1d import _apply_dirichlet_rows, _apply_dirichlet_symmetric, _integrate_term
     from .fem_elements import (
         nedelec_triangle,
         piola_contravariant,
@@ -118,7 +119,7 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
         raviart_thomas_triangle,
     )
     from .fem_topology import build_edge_topology
-    from .weak_form import _apply_sign, _split_additive_terms
+    from .weak_form import _apply_sign, _is_obviously_nonlinear_in_unknown, _split_additive_terms
 
     if dirichlet_raw or ic_residuals:
         raise NotImplementedError("jno.fem (non-nodal): Dirichlet / IC terms are not wired yet.")
@@ -173,16 +174,6 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
         for i in range(len(fields))
     ]  # (n_cells, 3) for RT/N1E, (n_cells, 1) for P0
 
-    # typed terms: (lowered coeff, test field index -> equation block)
-    typed = []
-    for bare in volume_terms:
-        for sign, sub in _split_additive_terms(domain, bare):
-            coeff = _lower_statefield_to_trial(_apply_sign(domain, sign, sub), {})
-            tfi = _test_field_index(coeff, field_index)
-            if tfi is None:
-                raise ValueError("jno.fem (non-nodal): each weak term must contain exactly one test field.")
-            typed.append((coeff, tfi))
-
     def _cell_fields(c, u_blocks):
         verts = pts[cells_j[c]]
         J = jnp.stack([verts[1] - verts[0], verts[2] - verts[0]], axis=1)
@@ -205,44 +196,77 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
                 )
         return per, verts[0][None, :] + qp @ J.T, jnp.abs(detJ)
 
-    def residual(u_flat):
-        u_blocks = [u_flat[offs[i] : offs[i + 1]] for i in range(len(fields))]
-        R = jnp.zeros(total, dtype=u_flat.dtype)
-        for coeff, tfi in typed:
+    def _make_residual(terms):
+        """Build a ``residual(u_flat)`` closure for the given weak ``terms`` over the shared field
+        layout. Reused for the steady system (``jacfwd`` -> A, ``-residual(0)`` -> b), the steady
+        nonlinear :class:`FemResidualOperator`, and the transient mass/spatial split (mirrors the 1D
+        :func:`fem_1d._make_residual`)."""
+        typed = []  # (lowered coeff, test field index -> equation block)
+        for bare in terms:
+            for sign, sub in _split_additive_terms(domain, bare):
+                coeff = _lower_statefield_to_trial(_apply_sign(domain, sign, sub), {})
+                tfi = _test_field_index(coeff, field_index)
+                if tfi is None:
+                    raise ValueError("jno.fem (non-nodal): each weak term must contain exactly one test field.")
+                typed.append((coeff, tfi))
 
-            def _cell(c, e=coeff):
-                per, xq, meas = _cell_fields(c, u_blocks)
-                local = {
-                    "physical_quad_points": xq,
-                    "fields": per,
-                    "field_index": field_index,
-                    "tag": "fem_gauss",
-                    "surface": False,
-                    "domain_context": ctx,
-                    "temporal_tags": (),
-                    "runtime_parameter_tags": (),
-                    "volume_vars": (),
-                }
-                return _integrate_term(domain, e, local, qw * meas)  # (ndof of the test field,)
+        def residual(u_flat):
+            u_blocks = [u_flat[offs[i] : offs[i + 1]] for i in range(len(fields))]
+            R = jnp.zeros(total, dtype=u_flat.dtype)
+            for coeff, tfi in typed:
 
-            elem = jax.vmap(_cell)(jnp.arange(n_cells))  # (n_cells, ndof_tfi)
-            R = R.at[cdofs[tfi].reshape(-1)].add(elem.reshape(-1))
-        return R
+                def _cell(c, e=coeff):
+                    per, xq, meas = _cell_fields(c, u_blocks)
+                    local = {
+                        "physical_quad_points": xq,
+                        "fields": per,
+                        "field_index": field_index,
+                        "tag": "fem_gauss",
+                        "surface": False,
+                        "domain_context": ctx,
+                        "temporal_tags": (),
+                        "runtime_parameter_tags": (),
+                        "volume_vars": (),
+                    }
+                    return _integrate_term(domain, e, local, qw * meas)  # (ndof of the test field,)
 
+                elem = jax.vmap(_cell)(jnp.arange(n_cells))  # (n_cells, ndof_tfi)
+                R = R.at[cdofs[tfi].reshape(-1)].add(elem.reshape(-1))
+            return R
+
+        return residual
+
+    # --- BCs computed once, separate from per-mode application: the natural BC (p_D·(v·n)) is a constant
+    #     RHS load; the essential edge-trace BC is a set of (dof, value) pins (mirrors 1D Dirichlet). ---
+    nat_load = (
+        _apply_natural_boundary_terms(
+            jnp.zeros(total), boundary_terms, domain, field_index, spaces, top, np.asarray(pts), offs, n_cells, quad_degree
+        )
+        if boundary_terms
+        else jnp.zeros(total)
+    )
+    pins = (
+        _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, np.asarray(pts), offs, n_cells, quad_degree)
+        if flux_bcs
+        else []
+    )
+
+    residual = _make_residual(volume_terms)
+
+    def full_residual(u_flat):  # the natural BC is a constant load on the RHS: R(u) = assembled(u) - load
+        return residual(u_flat) - nat_load
+
+    # --- steady nonlinear: a genuinely nonlinear weak term -> a Newton residual operator ---
+    if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in volume_terms):
+        res_bc = _apply_dirichlet_rows(full_residual, pins)  # essential pins as residual rows R[d]=u[d]-g
+        return FemResidualOperator(res_bc, jax.jacfwd(res_bc), total), "nonlinear", offs
+
+    # --- steady linear: A u = b (byte-identical to before the refactor) ---
     zeros = jnp.zeros(total)
-    A = jax.jacfwd(residual)(zeros)
-    b = -residual(zeros)
-
-    # natural (weak) boundary terms -- for RT the natural pressure BC p_D*(v·n) (contributes to b)
-    if boundary_terms:
-        b = _apply_natural_boundary_terms(
-            b, boundary_terms, domain, field_index, spaces, top, np.asarray(pts), offs, n_cells, quad_degree
-        )
-    # essential normal-flux BCs (u·n = g): pin boundary-edge DOFs, then symmetric-eliminate
-    if flux_bcs:
-        A, b = _apply_flux_bcs(
-            A, b, flux_bcs, domain, field_index, spaces, top, np.asarray(pts), offs, n_cells, quad_degree
-        )
+    A = jax.jacfwd(full_residual)(zeros)
+    b = -full_residual(zeros)
+    if pins:
+        A, b = _apply_dirichlet_symmetric(jnp.asarray(A), jnp.asarray(b), pins)
     return (A, b), "linear", offs
 
 
@@ -297,8 +321,10 @@ def _apply_natural_boundary_terms(b, boundary_terms, domain, field_index, spaces
     return jnp.asarray(b)
 
 
-def _apply_flux_bcs(A, b, flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree):
-    """Pin boundary-edge DOFs for an essential edge-trace BC, then symmetric-eliminate.
+def _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree):
+    """Compute the ``(dof, value)`` boundary pins for essential edge-trace BCs, separated from
+    *application* so the same pins can be enforced per solver mode (symmetric elimination for steady
+    linear, residual rows for nonlinear, M/A/c rows for transient).
 
     The lowest-order edge DOF *is* an edge moment, so the BC is a value pin ``σ_e = sgn · ∫_edge g ds``
     (``∫_edge g`` via 1-D edge quadrature; ``g`` may be constant or ``g(x)``). The trace and its sign
@@ -315,7 +341,7 @@ def _apply_flux_bcs(A, b, flux_bcs, domain, field_index, spaces, top, pts_np, of
 
     Boundary edges are the globally single-use edges, filtered to the BC's region by node membership."""
     from ..._fem import _eval_value_node_at
-    from .fem_1d import _apply_dirichlet_symmetric, _line_quadrature, _region_node_ids
+    from .fem_1d import _line_quadrature, _region_node_ids
 
     cell_edges = np.asarray(top.cell_edges)
     counts = np.bincount(cell_edges.reshape(-1), minlength=top.n_edges)
@@ -354,6 +380,14 @@ def _apply_flux_bcs(A, b, flux_bcs, domain, field_index, spaces, top, pts_np, of
             else:  # RT normal flux
                 sgn = -float(top.cell_edge_signs[c, k])
             pins.append((offs[fidx] + eid, sgn * moment))
+    return pins
+
+
+def _apply_flux_bcs(A, b, flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree):
+    """Steady-linear application of the essential edge-trace pins: symmetric elimination on ``(A, b)``."""
+    from .fem_1d import _apply_dirichlet_symmetric
+
+    pins = _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree)
     return _apply_dirichlet_symmetric(jnp.asarray(A), jnp.asarray(b), pins)
 
 
