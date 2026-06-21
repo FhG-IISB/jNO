@@ -11,14 +11,12 @@ from __future__ import annotations
 import sys
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
-jax.config.update("jax_enable_x64", True)
-import jax.numpy as jnp  # noqa: E402
-
-import jno  # noqa: E402
-from jno.utils.solver.newton_krylov import newton_krylov  # noqa: E402
+import jno
+from jno.utils.solver.newton_krylov import newton_krylov
 
 pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely")
