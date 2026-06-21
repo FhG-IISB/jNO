@@ -70,14 +70,14 @@ def test_poisson_dirichlet_assembles_and_solves():
 
 def test_linear_solve_default_and_custom_solver_match():
     """A non-parametric steady linear FEM is solvable through ``fem.solve()`` -- both the default
-    (dense ``jnp.linalg.solve``) and a user ``solve_fn=(A, b) -> u`` -- and both equal the direct
-    ``A^-1 b``."""
+    (matrix-free BiCGStab on the BCOO operator, to solver tolerance) and a user
+    ``solve_fn=(A, b) -> u`` (dense, exact) -- and both equal the direct ``A^-1 b``."""
     _, fem = _poisson_fem()
     direct = np.linalg.solve(_dense(fem.A), np.asarray(fem.b).reshape(-1))
     u_default = np.asarray(fem.solve())
     u_custom = np.asarray(fem.solve(solve_fn=lambda A, b: jnp.linalg.solve(A, b)))
-    assert np.allclose(u_default, direct, atol=1e-10)
-    assert np.allclose(u_custom, direct, atol=1e-10)
+    assert np.allclose(u_default, direct, atol=1e-6)   # iterative: converged to BiCGStab tol
+    assert np.allclose(u_custom, direct, atol=1e-10)   # dense direct: exact
 
 
 def test_matches_legacy_assembly_path():

@@ -3004,11 +3004,12 @@ class FemResidualOperator:
         ``fem = jno.fem([...])``.
 
         ``solve_fn`` is **your** solver: any ``(residual_fn, u0) -> u`` callable. The
-        default is a Newton ``optimistix.root_find`` (implicit differentiation, so
-        ``∂u/∂θ`` is exact without unrolling Newton); pass your own to choose a
-        different optimistix solver or library. jNO's analytic Jacobian
-        (:attr:`jacobian`) is available as an optional speed-up — by default the
-        solver auto-differentiates the residual.
+        default is a matrix-free Jacobian-free Newton-Krylov (Newton + BiCGStab on the
+        JVP, no external solver dependency); implicit differentiation via
+        ``jax.lax.custom_root`` keeps ``∂u/∂θ`` exact without unrolling Newton. Pass your
+        own to choose another solver/library (e.g. an ``optimistix`` Newton). jNO's
+        analytic Jacobian (:attr:`jacobian`) is available; by default ``J @ v`` is a JVP
+        of the residual.
 
         ``u0`` is the initial guess (default: zeros of the operator size; enable
         x64 — the feax residual is float64).
@@ -3021,16 +3022,11 @@ class FemResidualOperator:
         if solve_fn is None:
 
             def solve_fn(residual_fn, y0):
-                import optimistix as optx
+                # Default: matrix-free Jacobian-free Newton-Krylov (no optimistix dependency).
+                # Implicit-diff via custom_root, so the gradient still reaches the parameters.
+                from ..utils.solver.newton_krylov import newton_krylov
 
-                sol = optx.root_find(
-                    lambda u, _a: residual_fn(u),
-                    optx.Newton(rtol=1e-8, atol=1e-8),
-                    y0,
-                    args=None,
-                    max_steps=100,
-                )
-                return sol.value
+                return newton_krylov(residual_fn, y0)
 
         names = list(self.runtime_parameter_exprs)
         params = [self.runtime_parameter_exprs[n] for n in names]

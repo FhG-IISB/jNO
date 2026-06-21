@@ -357,9 +357,10 @@ def _default_transient_integrate(block, args, save_ts):
           (M + dt A(t_next, args)) u_next = M u + dt (c + f(t_next, args))
 
     * **Nonlinear** block (residual route, ``M(t) u_dot = -R(u, t, args)``) -- backward Euler
-      solves, per step, ``G(u_next) = M (u_next - u)/dt + R(u_next, t_next, args) = 0`` with an
-      ``optimistix`` Newton ``root_find`` (implicit-diff, so the gradient reaches ``args``
-      without unrolling Newton -- the same library the steady nonlinear ``.solve`` uses).
+      solves, per step, ``G(u_next) = M (u_next - u)/dt + R(u_next, t_next, args) = 0`` with the
+      matrix-free Newton-Krylov solver (``jno/utils/solver/newton_krylov.py``, no optimistix);
+      implicit-diff via ``jax.lax.custom_root`` keeps the gradient flowing to ``args`` without
+      unrolling Newton -- the same solver the steady nonlinear ``.solve`` now uses.
 
     This is a *default*: pass any ``solve_fn(block, args, save_ts) -> ys`` to
     :meth:`FeaxTimeBlock.solve` (a hand-rolled stepper, or diffrax built from the block's
@@ -368,38 +369,50 @@ def _default_transient_integrate(block, args, save_ts):
     import jax
     import jax.numpy as jnp
 
+    from .newton_krylov import newton_krylov
+
+    # keep a BCOO operator as-is (matrix-free matvec) but coerce a dense one to a JAX array
+    def _operand(x):
+        return x if hasattr(x, "todense") else jnp.asarray(x, dtype)
+
     s0 = jnp.asarray(block.state0).reshape(-1)
     dtype = s0.dtype
     grid_ts = jnp.asarray(_block_time_grid(block), dtype)
     dt = float(block.dt)
 
+    # One general backward-Euler step for both payloads: each step solves the root
+    # G(u_next) = 0 with the matrix-free Newton-Krylov solver (no optimistix). For the linear
+    # block G is affine, so Newton converges in one iteration -> one inner BiCGStab solve; the
+    # operators are only ever applied as matvecs (M @ v, A @ v), so a BCOO operator stays sparse.
     if block.is_nonlinear():
-        import optimistix as optx
-
         mass_fn, residual_fn = block.mass, block.residual
 
         def step(w, t_next):
-            M_t = jnp.asarray(mass_fn(t_next, args), dtype)
+            M_t = _operand(mass_fn(t_next, args))
 
-            def _resid(wn, _):  # backward-Euler residual G(wn) = 0
+            def G(wn):
                 return (M_t @ (wn - w)) / dt + jnp.asarray(residual_fn(wn, t_next, args), dtype).reshape(-1)
 
-            sol = optx.root_find(_resid, optx.Newton(rtol=1e-8, atol=1e-8), w, max_steps=64, throw=False)
-            return sol.value, sol.value
+            wn = newton_krylov(G, w)
+            return wn, wn
 
         _, ys = jax.lax.scan(step, s0, grid_ts[1:])
     else:
-        M = jnp.asarray(block.M, dtype)
+        M = _operand(block.M)
         n = M.shape[0]
         c = jnp.zeros((n,), dtype) if block.affine_bias is None else jnp.asarray(block.affine_bias, dtype).reshape(-1)
 
         def step(w, t_next):
-            A = jnp.asarray(block.operator_fn(t_next, args) if block.operator_fn is not None else block.A, dtype)
+            A = _operand(block.operator_fn(t_next, args) if block.operator_fn is not None else block.A)
             rhs = M @ w + dt * c
             if block.forcing_vector_fn is not None:
                 rhs = rhs + dt * jnp.asarray(block.forcing_vector_fn(t_next, args), dtype).reshape(-1)
-            w_next = jnp.linalg.solve(M + dt * A, rhs)
-            return w_next, w_next
+
+            def G(wn):  # affine residual: (M + dt A) wn - rhs ; root is the backward-Euler update
+                return M @ wn + dt * (A @ wn) - rhs
+
+            wn = newton_krylov(G, w)
+            return wn, wn
 
         _, ys = jax.lax.scan(step, s0, grid_ts[1:])
 

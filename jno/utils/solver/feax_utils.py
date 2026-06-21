@@ -1643,6 +1643,19 @@ def _zero_mass_dirichlet_rows(M, bc):
     return jnp.asarray(M).at[rows, :].set(0.0)
 
 
+def _zero_mass_dirichlet_rows_sparse(M, bc):
+    """BCOO version of :func:`_zero_mass_dirichlet_rows` — zeros the entries in Dirichlet rows
+    without densifying, so the transient mass stays sparse (matrix-free matvec, O(nnz) memory)."""
+    rows = None if bc is None else getattr(bc, "bc_rows", None)
+    if rows is None:
+        return M
+    rows = jnp.asarray(rows).reshape(-1)
+    if rows.shape[0] == 0:
+        return M
+    keep = jnp.logical_not(jnp.isin(M.indices[:, 0], rows)).astype(M.data.dtype)
+    return type(M)((M.data * keep, M.indices), shape=M.shape)
+
+
 def _zero_forcing_dirichlet_rows(forcing_fn, bc):
     """Wrap a forcing callback ``f(t)`` to zero its Dirichlet rows.
 
