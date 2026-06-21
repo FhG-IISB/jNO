@@ -273,56 +273,71 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
         spatial = [t for t in sub if not _contains_temporal_derivative(t)]
         if not temporal:
             raise ValueError("jno.fem (non-nodal): a transient weak form must contain a temporal term, e.g. inner(u.t, v).")
-        if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in spatial):
-            raise NotImplementedError("jno.fem (non-nodal): nonlinear-transient is not wired yet (linear transient works).")
-        if len(fields) > 1:
-            # A mixed/saddle transient where some field carries no ∂ₜ gives a singular mass M (and a NaN
-            # IC projection). Fail loudly rather than silently -- single-field transient is what's wired.
-            raise NotImplementedError(
-                "jno.fem (non-nodal): transient is single-field only; a mixed/saddle transient (a field "
-                f"with no time derivative -> singular mass) is not wired. Got {len(fields)} fields {spaces}."
-            )
-        M = jax.jacfwd(_make_residual([_strip_temporal_trial_derivative(t) for t in temporal]))(zeros)  # mass
+        M = jax.jacfwd(_make_residual([_strip_temporal_trial_derivative(t) for t in temporal]))(zeros)  # block mass
         spatial_res = _make_residual(spatial)
-        A = jax.jacfwd(spatial_res)(zeros)
-        c = -spatial_res(zeros) + nat_load  # spatial load + natural-BC constant load
         t0, t1, dt = _infer_time_window(domain)
-
-        # initial state = L²-projection of u0 onto the edge DOFs: assemble ∫ u0·Φ and solve M σ = ∫ u0·Φ.
-        # (The nodal _initial_state samples u0 at *nodes* and is the wrong size/meaning for edge DOFs.)
-        state0 = zeros
-        if ic_residuals:
-            _comp, u0_node = _essential_spec(_bare(ic_residuals[0]))
-            fidx = field_index.get(_field_key_of(ic_residuals[0]))
-            if fidx is None or spaces[fidx] not in ("RT", "N1E"):
-                raise NotImplementedError("jno.fem (non-nodal): a transient IC is supported on an RT/N1E field.")
-            u0_blocks = [jnp.zeros(offs[i + 1] - offs[i]) for i in range(len(fields))]
-
-            def _ic_cell(cidx):
-                per, xq, meas = _cell_fields(cidx, u0_blocks)
-                phi = per[fidx]["shape_vals"]  # (n_quad, n_dof, vsize)
-                u0 = jnp.asarray(_eval_value_node_at(u0_node, xq)).reshape(n_quad, -1)  # (n_quad, vsize)
-                return jnp.einsum("q,qnc,qc->n", qw * meas, phi, u0)
-
-            ic_load = jnp.zeros(total).at[cdofs[fidx].reshape(-1)].add(jax.vmap(_ic_cell)(jnp.arange(n_cells)).reshape(-1))
-            state0 = jnp.linalg.solve(M, ic_load)
-
-        M, A, c = _apply_dirichlet_transient(M, A, c, pins)  # essential edge-trace pins -> M/A/c rows
-        block = FeaxTimeBlock(
+        common = dict(
             backend="feax_time",
             mode="implicit",
             time_order=1,
             spatial_kind="weak_form",
-            M=M,
-            A=A,
-            affine_bias=c,
-            state0=state0,
+            state0=None,
             t0=t0,
             t1=t1,
             dt=dt,
             feax_context=getattr(domain, "_feax_context", {}) or {},
         )
-        return block, "transient", offs
+
+        # Initial state: L²-project each IC field's u0 onto its edge DOFs by solving that field's *mass
+        # block* M[blk, blk]. The full M is singular for a mixed/saddle transient (the algebraic field --
+        # e.g. RT flux in Darcy -- carries no ∂ₜ), so projecting per field avoids that; algebraic fields
+        # with no IC stay 0 and the implicit first step recovers their constraint-consistent value.
+        def _project_ic(ic):
+            _comp, u0_node = _essential_spec(_bare(ic))
+            fidx = field_index.get(_field_key_of(ic))
+            if fidx is None:
+                raise ValueError("jno.fem (non-nodal): the initial condition does not match any field.")
+            u0_blocks = [jnp.zeros(offs[i + 1] - offs[i]) for i in range(len(fields))]
+
+            def _ic_cell(cidx):
+                per, xq, meas = _cell_fields(cidx, u0_blocks)
+                phi = per[fidx]["shape_vals"]
+                u0 = jnp.asarray(_eval_value_node_at(u0_node, xq))
+                if phi.ndim == 3:  # RT/N1E vector basis (n_quad, n_dof, vsize): ∫ u0·Φ
+                    return jnp.einsum("q,qnc,qc->n", qw * meas, phi, u0.reshape(n_quad, -1))
+                return jnp.einsum("q,qn,q->n", qw * meas, phi, u0.reshape(n_quad))  # P0 scalar basis: ∫ u0 q
+
+            local = (cdofs[fidx] - offs[fidx]).reshape(-1)  # field-local DOFs (ce for RT/N1E, cell index for P0)
+            load = jnp.zeros(offs[fidx + 1] - offs[fidx]).at[local].add(jax.vmap(_ic_cell)(jnp.arange(n_cells)).reshape(-1))
+            sl = slice(offs[fidx], offs[fidx + 1])
+            return fidx, jnp.linalg.solve(M[sl, sl], load)  # the differential field's mass block is non-singular
+
+        state0 = zeros
+        for ic in ic_residuals:
+            fidx, block_sol = _project_ic(ic)
+            state0 = state0.at[offs[fidx] : offs[fidx + 1]].set(block_sol)
+        common["state0"] = state0
+
+        if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in spatial):
+            # nonlinear transient: M(t) u̇ + R(u) = 0 (matrix-free Newton-Krylov per step). Natural load
+            # folds into R; essential pins are residual rows + zeroed M rows/cols (the 1D pattern).
+            res_bc = _apply_dirichlet_rows(lambda u: spatial_res(u) - nat_load, pins)
+            jac = jax.jacfwd(res_bc)
+            pin_dofs = jnp.asarray([p[0] for p in pins], dtype=jnp.int32) if pins else None
+            M_nl = M if pin_dofs is None else M.at[pin_dofs, :].set(0.0).at[:, pin_dofs].set(0.0)
+            block = FeaxTimeBlock(
+                mass=lambda t, args=None, _M=M_nl: _M,
+                residual=lambda u, t, args=None: res_bc(u),
+                jacobian=lambda u, t, args=None: jac(u),
+                **common,
+            )
+            return block, "transient", offs
+
+        # linear transient: M u̇ + A u = c
+        A = jax.jacfwd(spatial_res)(zeros)
+        c = -spatial_res(zeros) + nat_load  # spatial load + natural-BC constant load
+        M, A, c = _apply_dirichlet_transient(M, A, c, pins)  # essential edge-trace pins -> M/A/c rows
+        return FeaxTimeBlock(M=M, A=A, affine_bias=c, **common), "transient", offs
 
     residual = _make_residual(volume_terms)
 

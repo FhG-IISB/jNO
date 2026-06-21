@@ -538,16 +538,45 @@ def test_n1e_transient_forced_solve_exercises_forcing():
     np.testing.assert_allclose(fld.mean(0), [1.0 - np.exp(-0.2), 0.0], atol=2e-2)  # u(T)=(1-e^-T)(1,0)
 
 
-def test_n1e_multifield_transient_raises_not_silent():
-    # A mixed/saddle transient (the P0 field carries no ∂ₜ -> singular mass, NaN IC projection) must fail
-    # LOUDLY, not return a silent NaN state0.
-    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.5, time=(0.0, 0.1, 6))
+def test_n1e_nonlinear_transient_decays():
+    # Nonlinear TRANSIENT: ∂ₜu + u + |u|²u = 0 (cubic reaction) -> a mass/residual/jacobian FeaxTimeBlock
+    # integrated by the matrix-free Newton-Krylov stepper. u0=(-y,x) decays (faster than the linear rate).
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.5, time=(0.0, 0.2, 21))
     co = d.variable("interior", split=True)
     ci = d.variable("initial", split=True)
     u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="N1E")
+    ui, vi = u.bind(x=co[0], y=co[1], t=co[2]), v.bind(x=co[0], y=co[1], t=co[2])
+    ic = u(ci[0], ci[1]) - jno.np.vector(-ci[1], ci[0])
+    fem = jno.fem([inner(ui.t, vi) + inner(ui, vi) + inner(ui, ui) * inner(ui, vi), ic])
+    assert fem.is_transient and not fem.is_linear  # nonlinear transient -> the mass/residual block
+    traj = np.asarray(_default_transient_integrate(fem.operator, {}, jnp.linspace(fem.t0, fem.t1, 21)))
+    assert np.all(np.isfinite(traj))
+    assert 0.0 < np.linalg.norm(traj[-1]) < np.linalg.norm(traj[0])  # the field decays
+
+
+def test_rt_p0_transient_mixed_poisson_dae():
+    # Multifield/saddle TRANSIENT (a DAE): transient mixed Poisson ∂ₜp + div u = 0, u = -∇p. The RT flux is
+    # algebraic (no ∂ₜ) so the block mass M is SINGULAR -> the IC is projected per field (the P0 pressure's
+    # mass block), and the matrix-free integrator handles the singular M. p0=sin πx sin πy decays (heat eqn).
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.3, time=(0.0, 0.05, 11))
+    co = d.variable("interior", split=True)
+    ci = d.variable("initial", split=True)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")
     p, q = d.fem_symbols(names=("p", "q"), space="P0")
     ui, vi = u.bind(x=co[0], y=co[1], t=co[2]), v.bind(x=co[0], y=co[1], t=co[2])
     pi, qi = p.bind(x=co[0], y=co[1], t=co[2]), q.bind(x=co[0], y=co[1], t=co[2])
-    ic = u(ci[0], ci[1]) - jno.np.vector(-ci[1], ci[0])
-    with pytest.raises(NotImplementedError, match="single-field"):
-        jno.fem([inner(ui.t, vi) + inner(ui, vi) + pi * qi, ic])
+    divu, divv = trace(grad(ui, [co[0], co[1]])), trace(grad(vi, [co[0], co[1]]))
+    icp = p(ci[0], ci[1]) - sin(np.pi * ci[0]) * sin(np.pi * ci[1])
+    fem = jno.fem([inner(ui, vi) - pi * divv, pi.t * qi + qi * divu, icp], quad_degree=4)
+    assert fem.is_transient and fem.is_linear
+    off = fem.offsets
+    s0 = np.asarray(fem.state0)
+    assert np.all(np.isfinite(s0)) and np.linalg.norm(s0[off[1] : off[2]]) > 0.5  # P0 IC projection, not NaN
+    traj = np.asarray(_default_transient_integrate(fem.operator, {}, jnp.linspace(fem.t0, fem.t1, 11)))
+    assert np.all(np.isfinite(traj))
+    p_traj = traj[:, off[1] : off[2]]
+    assert 0.0 < np.linalg.norm(p_traj[-1]) < np.linalg.norm(p_traj[0])  # pressure decays (heat eqn, mixed form)
