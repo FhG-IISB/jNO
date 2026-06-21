@@ -119,10 +119,18 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
         raviart_thomas_triangle,
     )
     from .fem_topology import build_edge_topology
-    from .weak_form import _apply_sign, _is_obviously_nonlinear_in_unknown, _split_additive_terms
+    from .weak_form import (
+        _apply_sign,
+        _contains_temporal_derivative,
+        _is_obviously_nonlinear_in_unknown,
+        _split_additive_terms,
+    )
 
-    if dirichlet_raw or ic_residuals:
-        raise NotImplementedError("jno.fem (non-nodal): Dirichlet / IC terms are not wired yet.")
+    if dirichlet_raw:
+        raise NotImplementedError(
+            "jno.fem (non-nodal): nodal Dirichlet is not applicable to RT/N1E; the essential BC is the "
+            "edge trace (u·n for RT, u×n for N1E) -- write it as `dot(u(region), n_region) - g`."
+        )
 
     # --- field layout: RT/N1E (edge DOFs) and/or P0 (cell DOFs) ---
     fields: List[Any] = []
@@ -250,6 +258,64 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
         if flux_bcs
         else []
     )
+    zeros = jnp.zeros(total)
+
+    # === transient: M u̇ + A u = c (mirrors fem_1d._assemble_1d_transient) -- split the temporal term
+    #     (∫ ∂ₜu·v -> mass M) from the spatial operator, project the IC onto the edge DOFs, time-block it. ===
+    if ic_residuals or any(_contains_temporal_derivative(t) for t in volume_terms):
+        from ..._fem import _bare, _essential_spec, _eval_value_node_at, _field_key_of
+        from .backend_blocks import FeaxTimeBlock
+        from .fem_1d import _apply_dirichlet_transient
+        from .time_route import _infer_time_window, _strip_temporal_trial_derivative
+
+        sub = [_apply_sign(domain, s, t) for bare in volume_terms for s, t in _split_additive_terms(domain, bare)]
+        temporal = [t for t in sub if _contains_temporal_derivative(t)]
+        spatial = [t for t in sub if not _contains_temporal_derivative(t)]
+        if not temporal:
+            raise ValueError("jno.fem (non-nodal): a transient weak form must contain a temporal term, e.g. inner(u.t, v).")
+        if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in spatial):
+            raise NotImplementedError("jno.fem (non-nodal): nonlinear-transient is not wired yet (linear transient works).")
+        M = jax.jacfwd(_make_residual([_strip_temporal_trial_derivative(t) for t in temporal]))(zeros)  # mass
+        spatial_res = _make_residual(spatial)
+        A = jax.jacfwd(spatial_res)(zeros)
+        c = -spatial_res(zeros) + nat_load  # spatial load + natural-BC constant load
+        t0, t1, dt = _infer_time_window(domain)
+
+        # initial state = L²-projection of u0 onto the edge DOFs: assemble ∫ u0·Φ and solve M σ = ∫ u0·Φ.
+        # (The nodal _initial_state samples u0 at *nodes* and is the wrong size/meaning for edge DOFs.)
+        state0 = zeros
+        if ic_residuals:
+            _comp, u0_node = _essential_spec(_bare(ic_residuals[0]))
+            fidx = field_index.get(_field_key_of(ic_residuals[0]))
+            if fidx is None or spaces[fidx] not in ("RT", "N1E"):
+                raise NotImplementedError("jno.fem (non-nodal): a transient IC is supported on an RT/N1E field.")
+            u0_blocks = [jnp.zeros(offs[i + 1] - offs[i]) for i in range(len(fields))]
+
+            def _ic_cell(cidx):
+                per, xq, meas = _cell_fields(cidx, u0_blocks)
+                phi = per[fidx]["shape_vals"]  # (n_quad, n_dof, vsize)
+                u0 = jnp.asarray(_eval_value_node_at(u0_node, xq)).reshape(n_quad, -1)  # (n_quad, vsize)
+                return jnp.einsum("q,qnc,qc->n", qw * meas, phi, u0)
+
+            ic_load = jnp.zeros(total).at[cdofs[fidx].reshape(-1)].add(jax.vmap(_ic_cell)(jnp.arange(n_cells)).reshape(-1))
+            state0 = jnp.linalg.solve(M, ic_load)
+
+        M, A, c = _apply_dirichlet_transient(M, A, c, pins)  # essential edge-trace pins -> M/A/c rows
+        block = FeaxTimeBlock(
+            backend="feax_time",
+            mode="implicit",
+            time_order=1,
+            spatial_kind="weak_form",
+            M=M,
+            A=A,
+            affine_bias=c,
+            state0=state0,
+            t0=t0,
+            t1=t1,
+            dt=dt,
+            feax_context=getattr(domain, "_feax_context", {}) or {},
+        )
+        return block, "transient", offs
 
     residual = _make_residual(volume_terms)
 
@@ -262,7 +328,6 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
         return FemResidualOperator(res_bc, jax.jacfwd(res_bc), total), "nonlinear", offs
 
     # --- steady linear: A u = b (byte-identical to before the refactor) ---
-    zeros = jnp.zeros(total)
     A = jax.jacfwd(full_residual)(zeros)
     b = -full_residual(zeros)
     if pins:

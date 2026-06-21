@@ -491,3 +491,31 @@ def test_n1e_nonlinear_reaction_newton_converges():
     for _ in range(8):  # Newton: u <- u - J(u)^{-1} R(u)
         uu = uu - jnp.linalg.solve(jnp.asarray(J(uu)), jnp.asarray(R(uu)))
     assert float(jnp.linalg.norm(R(uu))) < 1e-10  # converged to a root R(u)=0
+
+
+def test_n1e_transient_decay_matches_analytic():
+    # Transient H(curl): ∂ₜu + u = 0 with u0=(-y,x)∈N1E0 decays as u(t)=exp(-t)u0. Exercises the non-nodal
+    # transient path: temporal split -> mass M, the IC L²-PROJECTION onto edge DOFs (NOT the nodal
+    # _initial_state, which has the wrong size/meaning), the FeaxTimeBlock, and a backward-Euler trajectory
+    # matching the analytic decay rate (mirrors the nodal test_transient_heat_decays_to_analytic).
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.5, time=(0.0, 0.1, 11))
+    co = d.variable("interior", split=True)
+    xi, yi, ti = co[0], co[1], co[2]
+    ci = d.variable("initial", split=True)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="N1E")
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    u0 = jno.np.vector(-ci[1], ci[0])  # (-y, x), exactly representable in N1E0 -> exact projection
+    ic = u(ci[0], ci[1]) - u0
+    fem = jno.fem([inner(ui.t, vi) + inner(ui, vi), ic])  # ∂ₜu + u = 0
+    assert fem.is_transient and fem.is_linear
+    M, A = _dense(fem.M), _dense(fem.operator.A)
+    np.testing.assert_allclose(M, M.T, atol=1e-12)  # mass is symmetric
+    np.testing.assert_allclose(A, M, atol=1e-12)  # the reaction term IS the mass here
+    s0 = np.asarray(fem.state0)
+    assert np.linalg.norm(s0) > 0.5  # the IC projection is non-trivial (a zero/nodal state0 would fail)
+    w, dt = s0.copy(), float(fem.dt)
+    for _ in range(round((fem.t1 - fem.t0) / dt)):  # backward Euler: (M + dt A) w' = M w
+        w = np.linalg.solve(M + dt * A, M @ w)
+    decay = float(np.exp(-(fem.t1 - fem.t0)))
+    assert np.linalg.norm(w - decay * s0) / np.linalg.norm(decay * s0) < 5e-3  # u(T) = exp(-T) u0
+    assert 0.0 < np.linalg.norm(w) < np.linalg.norm(s0)  # the field decays
