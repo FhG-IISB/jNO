@@ -451,6 +451,7 @@ def _infer_fields(expr) -> Tuple[List[Dict[str, Any]], Dict[Any, int]]:
                         "value_shape": vs,
                         "vec": _value_shape_num_components(vs),
                         "order": int(getattr(node, "order", 1)),
+                        "space": str(getattr(node, "space", "Lagrange")),
                     }
                 )
             return

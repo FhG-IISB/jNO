@@ -201,6 +201,13 @@ def _infer_order(constraints: List[Any]) -> int:
     return max(orders) if orders else 1
 
 
+def _trial_spaces(constraints: List[Any]) -> set:
+    """Distinct element families declared across the trial fields (default ``"Lagrange"``)."""
+    return {
+        str(getattr(n, "space", "Lagrange")) for c in constraints for n in _walk(_bare(c)) if isinstance(n, TrialFunction)
+    }
+
+
 def _element_for(dimension: int, order: int) -> str:
     """Simplex element type for a ``(dimension, order)`` pair (2D/3D; orders 1, 2)."""
     et = _ELEMENT_FOR.get((int(dimension), int(order)))
@@ -1049,6 +1056,17 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         constraints = [c for c in constraints if not isinstance(c, GaugePin)] + [_lower_gauge_pin(p) for p in pins]
 
     domain = _discover_domain(constraints)
+
+    # Non-nodal element families (RT / Nedelec / Argyris) assemble through the native push-forward
+    # engine (jno/utils/solver/fem_nonnodal.py), not feax. DSL routing is being wired; until then,
+    # fail loudly rather than silently assembling a Lagrange system the user did not ask for.
+    _nonnodal_spaces = _trial_spaces(constraints) - {"Lagrange"}
+    if _nonnodal_spaces:
+        raise NotImplementedError(
+            f"jno.fem: non-nodal element space(s) {sorted(_nonnodal_spaces)} are not yet wired through the "
+            "weak-form DSL. The native push-forward engine is available directly via "
+            "jno.utils.solver.fem_nonnodal (e.g. assemble_mixed_poisson_rt)."
+        )
 
     # Periodic ties `u(A) - u(B)` are enforced by algebraic reduction (a prolongation P that
     # eliminates the slave-face DOFs), not by assembly. Separate them out *before* the weak/Dirichlet

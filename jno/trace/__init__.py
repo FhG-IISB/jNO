@@ -3115,10 +3115,11 @@ class TrialFunction(Placeholder):
           (2,2) -> second-order tensor, etc.
     """
 
-    def __init__(self, name="u", value_shape=(), order=1):
+    def __init__(self, name="u", value_shape=(), order=1, space="Lagrange"):
         self.name = name
         self.value_shape = tuple(value_shape)
         self.order = int(order)  # element polynomial degree for this field (P1=1, P2=2)
+        self.space = str(space)  # element family: "Lagrange" (nodal) | "RT" | "N1curl" | "Argyris"
         self.op_id = _next_op_id()
         # Identifies the field this symbol belongs to; a (trial, test) pair from one
         # fem_symbols() call shares a key so the coupled kernel can pair u<->v.
@@ -3209,10 +3210,11 @@ class TestFunction(Placeholder):
           (2,2) -> second-order tensor, etc.
     """
 
-    def __init__(self, name="phi", value_shape=(), order=1):
+    def __init__(self, name="phi", value_shape=(), order=1, space="Lagrange"):
         self.name = name
         self.value_shape = tuple(value_shape)
         self.order = int(order)  # element polynomial degree for this field (P1=1, P2=2)
+        self.space = str(space)  # element family: "Lagrange" (nodal) | "RT" | "N1curl" | "Argyris"
         self.op_id = _next_op_id()
         # Shared with the paired trial (set by variational_symbols) to identify the field.
         self.field_key = self.op_id
