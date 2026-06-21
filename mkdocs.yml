@@ -154,7 +154,7 @@ nav:
       - 2D Schrödinger Wave Packet: tutorials/08-fem-and-varpinns/schrodinger-wavepacket-2d.md
       - 2D Maxwell (complex vector E): tutorials/08-fem-and-varpinns/maxwell-2d-vector.md
       - Linear Elasticity (Cantilever): tutorials/08-fem-and-varpinns/linear-elasticity-cantilever.md
-      - Elasticity: Plate with a Hole: tutorials/08-fem-and-varpinns/elasticity-plate-with-hole.md
+      - "Elasticity: Plate with a Hole": tutorials/08-fem-and-varpinns/elasticity-plate-with-hole.md
       - Stokes Channel (Poiseuille): tutorials/08-fem-and-varpinns/stokes-channel-poiseuille.md
       - Stokes Flow Past a Cylinder: tutorials/08-fem-and-varpinns/stokes-flow-around-cylinder.md
       - Navier-Stokes Lid-Driven Cavity: tutorials/08-fem-and-varpinns/navier-stokes-cavity-2d.md
