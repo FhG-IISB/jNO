@@ -658,6 +658,40 @@ class PolygonDomain(domain):
         self._register_boundary_tag(str(tag), geom, normal_geometry=normal_geometry)
         return self
 
+    def _register_tag_boundary_region(self, name, where):
+        """Polygon override: promote a *pure-boundary* ``domain.tag(name, where)`` to a normals-bearing
+        boundary tag. The base method records the selected boundary facets as a region (so a Dirichlet
+        term binds there); here we additionally register those facets as boundary segments via
+        :meth:`add_boundary_segments`, so ``variable(name, normals=True)`` returns outward normals
+        (oriented by the polygon interior, just like the built-in ``left``/``right``/``top``/``bottom``
+        edge tags). A 2-D region that merely touches the boundary stays an interior sampling region."""
+        super()._register_tag_boundary_region(name, where)
+        region = self._boundary_regions.get(name)
+        edges = None if region is None else getattr(region, "edges", None)
+        if edges is None or len(np.asarray(edges)) == 0:
+            return  # no boundary facets -> interior tag, nothing to add
+        if not self._tag_selects_only_boundary(name):
+            return  # a 2-D region touching the boundary -> keep it interior (don't break PINN sampling)
+        self.add_boundary_segments(name, np.asarray(edges, dtype=float)[..., :2])
+        # Route like a built-in edge tag: drop the mesh-pool entry so variable(name, ...) goes through the
+        # polygon boundary sampler (geometric, computes outward normals -> n_{name}) instead of the
+        # mesh-node sampler (which only has normals for tags present at build_mesh time).
+        self._mesh_pool.pop(name, None)
+
+    def _tag_selects_only_boundary(self, name) -> bool:
+        """True if every mesh node of tag ``name`` lies on the domain boundary -- i.e. ``where`` selects a
+        boundary subset (e.g. ``x < 1e-6``), not a 2-D interior region. Exact mesh-node coordinate match
+        (the tag pool is drawn from the same mesh nodes), so a tight rounding key is robust."""
+        full = self._boundary_regions.get("boundary")
+        pool = self._mesh_pool.get(name)
+        if full is None or pool is None or len(np.asarray(pool)) == 0:
+            return False
+        bpts = np.asarray(full.points)[:, : self.dimension]
+        if len(bpts) == 0:
+            return False
+        bset = {tuple(np.round(p, 9)) for p in bpts}
+        return all(tuple(np.round(p, 9)) in bset for p in np.asarray(pool)[:, : self.dimension])
+
     def _next_context_tag(self, tag: str) -> str:
         if tag not in self.context or tag in self._param_tags:
             return tag

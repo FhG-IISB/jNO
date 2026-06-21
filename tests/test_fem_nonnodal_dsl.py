@@ -438,3 +438,36 @@ def test_n1e_tangential_bc_distinct_values_on_two_subregions():
             np.testing.assert_allclose(sol[e], sgn * gr * length, atol=1e-10)
             nr += 1
     assert nl == 2 and nr == 2  # left & right each split into 2 sub-edges at mesh_size 0.5
+
+
+def test_rt_mixed_bc_via_user_defined_tags():
+    # The mixed-region BC again, but on USER-defined domain.tag regions instead of the built-in box edges
+    # -- exercises the tag-normals fix end to end: a pure-boundary tag must carry outward normals for the
+    # flux/natural BCs to register. Natural pressure p=x on a custom 'lr', essential flux u·n=0 on 'tb'.
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.25)
+    d.tag("lr", lambda x, y: (x < 1e-6) | (x > 1 - 1e-6))
+    d.tag("tb", lambda x, y: (y < 1e-6) | (y > 1 - 1e-6))
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")
+    p, q = d.fem_symbols(names=("p", "q"), space="P0")
+    xi, yi, _ = d.variable("interior", split=True)
+    xlr, ylr, _, nlx, nly = d.variable("lr", normals=True, split=True)
+    xtb, ytb, _, ntx, nty = d.variable("tb", normals=True, split=True)
+    ui, vi, pp, qq = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi), p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+    vlr, utb = v.bind(x=xlr, y=ylr), u.bind(x=xtb, y=ytb)
+    divu, divv = trace(grad(ui, [xi, yi])), trace(grad(vi, [xi, yi]))
+    fem = jno.fem(
+        [
+            inner(ui, vi) - pp * divv,
+            qq * divu,
+            xlr * (vlr[0] * nlx + vlr[1] * nly),  # natural pressure p_D=x on the custom left+right tag
+            utb[0] * ntx + utb[1] * nty - 0.0,  # essential flux u·n=0 on the custom top+bottom tag
+        ],
+        quad_degree=4,
+    )
+    off = fem.offsets
+    sol = np.linalg.solve(_dense(fem.A), np.asarray(jnp.asarray(fem.b)).reshape(-1))
+    pts, cells = _mesh(d)
+    cent = pts[cells].mean(1)
+    flux = np.asarray(rt_flux_at_centroids(pts, cells, build_edge_topology(cells), jnp.asarray(sol[off[0] : off[1]])))
+    np.testing.assert_allclose(flux, np.tile([-1.0, 0.0], (flux.shape[0], 1)), atol=1e-9)  # u exact in RT0
+    np.testing.assert_allclose(sol[off[1] : off[2]], cent[:, 0], atol=1e-9)  # p = x at centroids
