@@ -81,7 +81,7 @@ def test_residual_stats_subset_selects_one_constraint():
     key = jax.random.PRNGKey(0)
 
     u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=4, num_layers=2, key=key))
-    u_net.optimizer(optax.sgd, lr=lrs.exponential(0.0, 1.0, 1, 0.0))  # frozen
+    u_net.optimizer(optax.sgd).scale(lrs.exponential(0.0, 1.0, 1, 0.0))  # frozen
     u = u_net(x)
     c0 = (u * u).mse  # arbitrary residual
     c1 = u.mse  # second constraint, different residual
@@ -134,7 +134,7 @@ def test_input_saliency_records_finite_values_with_consistent_shape():
     key = jax.random.PRNGKey(0)
 
     u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=4, num_layers=2, key=key))
-    u_net.optimizer(optax.sgd, lr=lrs.exponential(0.0, 1.0, 1, 0.0))  # lr=0
+    u_net.optimizer(optax.sgd).scale(lrs.exponential(0.0, 1.0, 1, 0.0))  # lr=0
     u = u_net(x)
     pde = u
 
@@ -182,7 +182,7 @@ def test_ntk_spectrum_records_finite_eigenvalues_with_consistent_shape():
     key = jax.random.PRNGKey(0)
 
     u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=4, num_layers=2, key=key))
-    u_net.optimizer(optax.sgd, lr=lrs.exponential(0.0, 1.0, 1, 0.0))
+    u_net.optimizer(optax.sgd).scale(lrs.exponential(0.0, 1.0, 1, 0.0))
     u = u_net(x)
     pde = u
 
@@ -236,7 +236,7 @@ def test_hessian_spectrum_records_finite_eigenvalues_with_consistent_shape():
     key = jax.random.PRNGKey(0)
 
     u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=4, num_layers=2, key=key))
-    u_net.optimizer(optax.sgd, lr=lrs.exponential(0.0, 1.0, 1, 0.0))
+    u_net.optimizer(optax.sgd).scale(lrs.exponential(0.0, 1.0, 1, 0.0))
     u = u_net(x)
     pde = u
 
@@ -345,7 +345,7 @@ def test_hessian_spectrum_subset_rejects_unknown_constraint():
     x, _ = domain.variable("interior")
     key = jax.random.PRNGKey(0)
     u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=4, num_layers=2, key=key))
-    u_net.optimizer(optax.sgd, lr=lrs.exponential(0.0, 1.0, 1, 0.0))
+    u_net.optimizer(optax.sgd).scale(lrs.exponential(0.0, 1.0, 1, 0.0))
     u = u_net(x)
     pde_loss = u.mse
 
@@ -376,7 +376,7 @@ def test_tracker_value_starts_none_then_populates_after_first_interval():
     key = jax.random.PRNGKey(0)
 
     u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=4, num_layers=2, key=key))
-    u_net.optimizer(optax.sgd, lr=lrs.exponential(0.0, 1.0, 1, 0.0))
+    u_net.optimizer(optax.sgd).scale(lrs.exponential(0.0, 1.0, 1, 0.0))
     u = u_net(x)
 
     solver = jno.core([u.mse])
@@ -481,7 +481,7 @@ def test_ntk_balanced_end_to_end_against_live_solver():
     key = jax.random.PRNGKey(0)
 
     u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=4, num_layers=2, key=key))
-    u_net.optimizer(optax.sgd, lr=lrs.exponential(0.0, 1.0, 1, 0.0))
+    u_net.optimizer(optax.sgd).scale(lrs.exponential(0.0, 1.0, 1, 0.0))
     u = u_net(x)
 
     # Two trackers — different network outputs so their traces differ

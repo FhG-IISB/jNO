@@ -559,18 +559,21 @@ class core:
                     result[layer.layer_id] = layer
         return result
 
-    def set_optimizer(self, opt_fn, *, lr=None):
-        """Set the same optimizer (and LR schedule) on **all** models.
+    def set_optimizer(self, opt_fn, *, scale=None):
+        """Set the same optimizer (and LR scale) on **all** models.
 
         Useful after ``core.load()`` when original Python variables are
         no longer connected to the loaded expression tree.
 
         Args:
-            opt_fn: Optimizer factory, e.g. ``optax.adam``.
-            lr:     ``LearningRateSchedule`` or float.
+            opt_fn: Optimizer factory with the rate baked in, e.g. ``optax.adam(1e-3)``.
+            scale:  Optional ``LearningRateSchedule`` / ``dlrs(...)`` / float that
+                    multiplies the optimizer's learning rate (see :meth:`Model.scale`).
         """
         for fm in self._collect_flax_modules().values():
-            fm.optimizer(opt_fn, lr=lr)
+            fm.optimizer(opt_fn)
+            if scale is not None:
+                fm.scale(scale)
         return self
 
     def get_constraint_tags(self, constraints: List) -> List[str]:
@@ -1881,7 +1884,7 @@ class core:
                     f"Example setup:\n"
                     f"    import jno, optax\n"
                     f"    model = jno.nn.wrap(my_eqx_module)\n"
-                    f"    model.optimizer(optax.adam, lr=1e-3)"
+                    f"    model.optimizer(optax.adam(1e-3))"
                 )
 
         # ── 2. Apply LoRA transforms ──
@@ -2088,12 +2091,13 @@ class core:
               rebuilds the inner optimizer per step (cheap) while persisting
               moment estimates through ``inner_state``.
 
-            * **Pre-built transform** (e.g. ``optax.adam(lr=schedule)``) — the
+            * **Pre-built transform** (e.g. ``optax.adam(schedule)``) — the
               transform is used as-is and ``optax.scale(learning_rate)`` is
               chained on top, all under ``inject_hyperparams``. jNO's
-              ``learning_rate`` then multiplies whatever the user's embedded
-              schedule produces. Useful when callers want their own optax
-              schedule but still want jNO to log/adapt a global scale.
+              ``learning_rate`` (set via :meth:`Model.scale`) then multiplies
+              whatever the user's embedded schedule produces. Useful when callers
+              want their own optax schedule but still want jNO to log/adapt a
+              global scale.
 
             See https://github.com/google-deepmind/optax/issues/206 for the
             canonical reasoning behind this pattern.
@@ -2129,20 +2133,32 @@ class core:
                 is_lr_factory = False
                 base_transform = opt_fn
 
+            # Make every optax optimizer compose with jax_enable_x64. optax initialises moment/LR
+            # state at float32 by default, which mismatches float64 params under x64 and breaks the
+            # state init (make_array_from_callback float32-vs-float64). Since jNO wraps *every*
+            # optimizer here, fix it once generically: build the state at float32 (consistent, no
+            # init-time clash), then cast its float leaves to the param precision. A no-op under
+            # float32, so the default path is unchanged.
+            param_dtype = jnp.asarray(0.0).dtype  # JAX default float: float64 under x64, else float32
+
             if is_lr_factory:
 
-                @optax.inject_hyperparams
-                def _wrapped(learning_rate):
+                def _factory(learning_rate):
                     return opt_fn(learning_rate)
             else:
                 if not isinstance(base_transform, optax.GradientTransformation):
                     raise TypeError(f"Unsupported optimizer type: {type(base_transform)}")
 
-                @optax.inject_hyperparams
-                def _wrapped(learning_rate):
+                def _factory(learning_rate):
                     return optax.chain(base_transform, optax.scale(learning_rate))
 
-            return _wrapped(learning_rate=initial_lr)
+            built = optax.inject_hyperparams(_factory, hyperparam_dtype=param_dtype)(learning_rate=initial_lr)
+
+            def _init(params):
+                state = built.init(optax.tree_utils.tree_cast(params, jnp.float32))
+                return optax.tree_utils.tree_cast(state, param_dtype)
+
+            return optax.GradientTransformation(_init, built.update)
 
         for lid, fm in flax_mods.items():
             # Skip only if truly frozen with no LoRA override.
@@ -2423,7 +2439,7 @@ class core:
                 if opt_fn is None:
                     raise ValueError(
                         f"Model (layer {lid}) has no optimizer. "
-                        f"Call model.optimizer(optax.adam, lr=...) before solve(), "
+                        f"Call model.optimizer(optax.adam(1e-3)) before solve(), "
                         f"or freeze the model with model.freeze()."
                     )
 

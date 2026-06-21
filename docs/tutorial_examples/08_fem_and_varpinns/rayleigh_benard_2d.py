@@ -44,17 +44,14 @@ import jno  # noqa: E402
 
 Pr, Ra = 1.0, 1.0e4  # Prandtl, Rayleigh (Ra >> Ra_c ~ 1708 -> vigorous convection)
 Lx, Ly = 2.0, 1.0  # a wide-ish pot -> a pair of counter-rotating rolls
-dn = lambda A: jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)  # noqa: E731
 
 d = jno.domain(box(0, 0, Lx, Ly), mesh_size=0.11, time=(0.0, 0.3, 2))
-d.point_region("ppin", (0.0, 0.0))  # pin the pressure null space
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)  # P2 velocity
 p, q = d.fem_symbols(names=("p", "q"), order=1)  # P1 pressure
 T, sT = d.fem_symbols(names=("T", "sT"), order=1)  # P1 temperature
 xi, yi, ti = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
 ci = d.variable("initial", split=True)
-xpn, ypn, _ = d.variable("ppin", split=True)
 ub, vb = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
 pb, qb = p.bind(x=xi, y=yi, t=ti), q.bind(x=xi, y=yi, t=ti)
 Tb, sb = T.bind(x=xi, y=yi, t=ti), sT.bind(x=xi, y=yi, t=ti)
@@ -81,26 +78,25 @@ fem = jno.fem(
         energy,
         u(xb, yb) - 0.0,  # no-slip walls (all-component vector Dirichlet)
         T(xb, yb) - (1.0 - yb / Ly),  # hot floor / cold lid, conductive profile on the walls
-        p(xpn, ypn) - 0.0,
+        p.pin(),  # gauge-fix: remove the pressure null space
         u(ci[0], ci[1]) - 0.0,  # start at rest (all-component vector initial condition)
         T(ci[0], ci[1]) - T0,
     ]
 )
 assert fem.is_transient and not fem.is_linear, "Boussinesq convection is transient + nonlinear"
 off = fem.problem.offset
-blk = fem.operator
-M, dt, nsteps, nframes = dn(blk.mass(0.0, {})), 0.009, 26, 13  # stop ~when the rolls establish (no static tail)
+M, dt, nsteps, nframes = fem.M, 0.009, 26, 13  # stop ~when the rolls establish (no static tail)
 print(f"\n2D Rayleigh-Benard pot (Ra={Ra:g}, Pr={Pr:g}): dofs={fem.dofs}, steps={nsteps}")
 
 # bring-your-own implicit integrator: backward Euler + Newton  ((M/dt + dR/du) du = -G).
-# blk.residual / blk.jacobian are already jitted, so each step is fast after the first.
-w = jnp.asarray(blk.state0)
+# fem.residual / fem.jacobian are already jitted, so each step is fast after the first.
+w = fem.state0
 frames, save_every = [np.asarray(w)], max(1, nsteps // nframes)
 for step in range(nsteps):
     w_prev, t_next = w, (step + 1) * dt
     for _ in range(8):  # Newton
-        G = M @ (w - w_prev) / dt + jnp.asarray(blk.residual(w, t_next, {})).reshape(-1)
-        dw = jnp.linalg.solve(M / dt + dn(blk.jacobian(w, t_next, {})), -G)
+        G = M @ (w - w_prev) / dt + fem.residual(w, t_next)
+        dw = jnp.linalg.solve(M / dt + fem.jacobian(w, t_next), -G)
         w = w + dw
         if float(jnp.linalg.norm(dw)) < 1e-8:
             break

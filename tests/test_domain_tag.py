@@ -155,3 +155,33 @@ def test_tag_is_spatial_only_on_time_dependent_domain():
     assert arr.shape[1] == n_time  # (batch, n_time, n, dim)
     sp = arr.reshape(-1, arr.shape[-1])
     assert bool((((sp[:, 0] - 0.5) ** 2 + (sp[:, 1] - 0.5) ** 2) < 0.04 + 1e-9).all())
+
+
+def test_tag_boundary_subset_has_outward_normals():
+    """A pure-boundary ``tag`` (every selected node on the boundary, e.g. x<1e-6) is promoted to a
+    normals-bearing boundary tag, so ``variable(name, normals=True)`` works -- the H(div)/H(curl) flux
+    and tangential BCs need it. The normals come from the polygon geometry (oriented outward via the
+    interior), so they equal the analytic edge normals. (Discriminating: a sign/orientation flip fails.)"""
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.34)
+    truth = {"left": (-1.0, 0.0), "right": (1.0, 0.0), "top": (0.0, 1.0), "bottom": (0.0, -1.0)}
+    preds = {
+        "left": lambda x, y: x < 1e-6,
+        "right": lambda x, y: x > 1 - 1e-6,
+        "top": lambda x, y: y > 1 - 1e-6,
+        "bottom": lambda x, y: y < 1e-6,
+    }
+    for name, pred in preds.items():
+        d.tag("my" + name, pred)
+        d.variable("my" + name, normals=True, split=True)
+        n = np.asarray(d.context["n_my" + name]).reshape(-1, 2)
+        assert np.allclose(np.linalg.norm(n, axis=1), 1.0)  # unit length
+        np.testing.assert_allclose(n, np.broadcast_to(truth[name], n.shape), atol=1e-9)  # correct & outward
+
+
+def test_tag_interior_region_keeps_no_normals():
+    """A 2-D region tag (selects interior nodes, not just boundary) must NOT be promoted to a boundary
+    tag -- it has no meaningful outward normal, and promoting it would break PINN interior sampling."""
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.3)
+    d.tag("blob", lambda x, y: (x - 0.5) ** 2 + (y - 0.5) ** 2 < 0.2**2)  # interior disk, off the boundary
+    with pytest.raises(ValueError, match="no outward normals"):
+        d.variable("blob", normals=True, split=True)

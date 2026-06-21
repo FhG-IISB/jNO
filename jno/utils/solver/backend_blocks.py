@@ -13,8 +13,7 @@ class DiffraxBlock:
     """
     Solver-facing block for Diffrax-based time integration.
 
-    A `DiffraxBlock` is returned by strong-form time assembly routes, or by
-    converting a semidiscrete `FeaxTimeBlock` through `FeaxTimeBlock.as_diffrax()`.
+    A `DiffraxBlock` is returned by strong-form time assembly routes.
 
     It stores the complete information needed to call Diffrax externally:
     the initial state, time interval, step-size hint, right-hand side function,
@@ -107,114 +106,6 @@ class DiffraxBlock:
         return _prolong(self.prolongation, reduced)
 
 
-@dataclass
-class FeaxPipelineBlock:
-    """
-    Solver-facing block wrapping a FEAX `TimePipeline`.
-
-    A `FeaxPipelineBlock` is produced by converting a semidiscrete
-    `FeaxTimeBlock` through `FeaxTimeBlock.as_feax_pipeline(...)`.
-
-    It stores the FEAX time pipeline together with the FEAX mesh, initial state,
-    time interval, time-step size, and conversion metadata.
-
-    This object does not itself perform time integration. It is a small container
-    around the FEAX pipeline and provides `make_time_config(...)` to construct a
-    FEAX `TimeConfig` using the stored time settings.
-
-    Important fields
-    ----------------
-    backend:
-        Backend identifier. Usually `"fem_time"`.
-    scheme:
-        Time-integration scheme used by the generated pipeline, for example
-        `"backward_euler"` or `"forward_euler"`.
-    pipeline:
-        FEAX `TimePipeline` instance.
-    mesh:
-        FEAX mesh used by the pipeline.
-    state0:
-        Initial state vector.
-    initial_conditions:
-        Raw initial-condition object, if supplied.
-    t0, t1:
-        Start and end time.
-    dt:
-        Time-step size.
-    metadata:
-        Conversion and diagnostic metadata.
-    """
-
-    backend: str = "feax_time"
-    scheme: str = "backward_euler"
-
-    pipeline: Any = None
-    mesh: Any = None
-
-    state0: Any = None
-    initial_conditions: Any = None
-
-    t0: float = 0.0
-    t1: float = 1.0
-    dt: Optional[float] = None
-
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-    def make_time_config(
-        self,
-        *,
-        dt: Optional[float] = None,
-        t_start: Optional[float] = None,
-        t_end: Optional[float] = None,
-        print_every: int = 1,
-        save_every: int = 10,
-        **kwargs,
-    ):
-        """
-        Create a FEAX `TimeConfig` from this pipeline block.
-
-        Parameters
-        ----------
-        dt:
-            Optional override for the time-step size. If omitted, `self.dt`
-            is used.
-        t_start:
-            Optional override for the start time. If omitted, `self.t0` is used.
-        t_end:
-            Optional override for the end time. If omitted, `self.t1` is used.
-        print_every:
-            FEAX monitor print interval.
-        save_every:
-            FEAX output/save interval.
-        **kwargs:
-            Additional keyword arguments forwarded to `feax.solvers.time_solver.TimeConfig`.
-
-        Returns
-        -------
-        TimeConfig
-            FEAX time-solver configuration object.
-
-        Raises
-        ------
-        ValueError
-            If no time-step size is available.
-        """
-        from feax.solvers.time_solver import TimeConfig
-
-        dt_use = self.dt if dt is None else float(dt)
-        if dt_use is None:
-            raise ValueError("No dt available on FeaxPipelineBlock. Pass dt=... explicitly.")
-
-        return TimeConfig(
-            dt=dt_use,
-            t_start=self.t0 if t_start is None else float(t_start),
-            t_end=self.t1 if t_end is None else float(t_end),
-            print_every=print_every,
-            save_every=save_every,
-            **kwargs,
-        )
-
-
 # ---------------------------------------------------------------------
 # Solver-agnostic semidiscrete block returned by weak.assemble(...)
 # ---------------------------------------------------------------------
@@ -230,9 +121,9 @@ class FeaxTimeBlock:
         weak_expr.assemble(target="fem_time")
 
     It represents the spatially discretized transient weak-form problem, but it
-    does not perform time integration by itself. It can be converted either to
-    a `DiffraxBlock` through `as_diffrax(...)` or to a FEAX time pipeline through
-    `as_feax_pipeline(...)`.
+    does not perform time integration by itself. Read its flat pieces (`M`, `A` /
+    `residual`, `state0`, `dt`) and step it with your own integrator, or hand it to
+    `fem.solve()`'s default backward-Euler.
 
     Supported payloads
     ------------------
@@ -403,123 +294,6 @@ class FeaxTimeBlock:
         """
         return self.mass is not None and self.residual is not None
 
-    def as_diffrax(self, *, forcing_vector_fn=None, operator_fn=None, args=None):
-        """
-        Convert this semidiscrete FEAX-time block into a `DiffraxBlock`.
-
-        Parameters
-        ----------
-        forcing_vector_fn:
-            Optional override for the forcing callback in the linear case.
-            If omitted, `self.forcing_vector_fn` is used.
-        operator_fn:
-            Optional override for the runtime linear operator callback. The
-            callback signature is ``operator_fn(t, args) -> matrix``. If
-            omitted, ``self.operator_fn`` is used, falling back to ``self.A``.
-        args:
-            Optional runtime arguments passed to the generated Diffrax RHS.
-
-        Returns
-        -------
-        DiffraxBlock
-            A Diffrax-compatible block containing `rhs`, `term`, `state0`,
-            time interval information, and conversion metadata.
-
-        Notes
-        -----
-        Linear conversion uses:
-
-            u_dot = solve(M, affine_bias + f(t, args) - A(t, args) u)
-
-        Nonlinear conversion uses:
-
-            u_dot = solve(M(t), -R(u, t))
-        """
-        from .time_adapters import make_diffrax_block
-
-        return make_diffrax_block(
-            self,
-            forcing_vector_fn=forcing_vector_fn,
-            operator_fn=operator_fn,
-            args=args,
-        )
-
-    def as_feax_pipeline(
-        self,
-        *,
-        scheme=None,
-        forcing_vector_fn=None,
-        operator_fn=None,
-        args=None,
-        monitor_index=None,
-        newton_tol=1e-8,
-        newton_maxiter=20,
-        snapshot_times=None,
-        newton_damping=1.0,
-        compile_step=True,
-    ):
-        """
-        Convert this semidiscrete FEAX-time block into a FEAX pipeline block.
-
-        Parameters
-        ----------
-        scheme:
-            Optional time-integration scheme. Supported adapter schemes are
-            `"backward_euler"` and `"forward_euler"`. If omitted, the scheme is
-            selected from `self.mode`.
-        forcing_vector_fn:
-            Optional override for the forcing callback in the linear case.
-        operator_fn:
-            Optional override for the runtime linear operator callback. The
-            callback signature is ``operator_fn(t, args) -> matrix``.
-        args:
-            Optional runtime arguments passed to generated step functions.
-        monitor_index:
-            Optional state index to report as `u_monitor` in FEAX monitors.
-        newton_tol:
-            Newton convergence tolerance for nonlinear backward Euler.
-        newton_maxiter:
-            Maximum Newton iterations for nonlinear backward Euler.
-        snapshot_times:
-            Optional list of times at which snapshots should be stored by the
-            generated FEAX pipeline.
-        newton_damping:
-            Damping factor applied to Newton updates.
-        compile_step:
-            If True, JIT-compile the generated per-step function.
-
-        Returns
-        -------
-        FeaxPipelineBlock
-            A block containing a FEAX `TimePipeline`, FEAX mesh, initial state,
-            time interval information, and conversion metadata.
-
-        Notes
-        -----
-        Linear backward Euler solves:
-
-            (M + dt A(t_next, args)) u_next = M u + dt(c + f(t_next, args))
-
-        Nonlinear backward Euler solves Newton iterations for:
-
-            M(t_next) (u_next - u) / dt + R(u_next, t_next) = 0
-        """
-        from .time_adapters import make_feax_pipeline
-
-        return make_feax_pipeline(
-            self,
-            scheme=scheme,
-            forcing_vector_fn=forcing_vector_fn,
-            operator_fn=operator_fn,
-            args=args,
-            monitor_index=monitor_index,
-            newton_tol=newton_tol,
-            newton_maxiter=newton_maxiter,
-            snapshot_times=snapshot_times,
-            newton_damping=newton_damping,
-            compile_step=compile_step,
-        )
-
     def solve(self, solve_fn=None, *, save_ts=None):
         """Differentiable transient forward solve -> the trajectory ``u(save_ts)`` as a
         trace node (mirrors :meth:`FemLinearSystem.solve` for the steady case).
@@ -538,14 +312,11 @@ class FeaxTimeBlock:
         ``solve_fn`` is **your** integrator: any ``(block, args, save_ts) -> ys`` callable
         returning a ``(len(save_ts), n_dofs)`` trajectory; jNO writes none and imposes no
         library. The default :func:`_default_transient_integrate` is a backward-Euler
-        ``lax.scan`` over the block's own assembled ``dt``. Documented overrides:
-
-        * ``solve_fn=lambda b, a, ts: b.as_diffrax(args=a) ...`` -- diffrax (their solver /
-          ``adjoint=`` / tolerances); correct for periodic / non-Dirichlet systems, but note
-          ``as_diffrax`` forms ``u_dot = M^-1(...)`` and a Dirichlet problem zeroes M's
-          Dirichlet rows (a DAE), so the implicit ``(M + dt A)`` default is preferred there.
-        * a feax backward-Euler pipeline driven from ``b.as_feax_pipeline(args=a)`` (proven
-          to compose; heavier -- rebuilds per gradient step).
+        ``lax.scan`` over the block's own assembled ``dt``. To bring your own (e.g. diffrax),
+        build it from the block's flat pieces -- ``block.M``, ``block.A`` (or
+        ``block.operator_fn(t, args)``) and ``block.state0`` -- and form ``u_dot = M^-1(c - A u)``.
+        Note a Dirichlet problem zeroes M's Dirichlet rows (a DAE), so the implicit
+        ``(M + dt A)`` default is preferred there; an explicit field must hold those rows.
 
         Enable x64 (``jax_enable_x64``); the feax assembly is float64.
         """
@@ -586,49 +357,62 @@ def _default_transient_integrate(block, args, save_ts):
           (M + dt A(t_next, args)) u_next = M u + dt (c + f(t_next, args))
 
     * **Nonlinear** block (residual route, ``M(t) u_dot = -R(u, t, args)``) -- backward Euler
-      solves, per step, ``G(u_next) = M (u_next - u)/dt + R(u_next, t_next, args) = 0`` with an
-      ``optimistix`` Newton ``root_find`` (implicit-diff, so the gradient reaches ``args``
-      without unrolling Newton -- the same library the steady nonlinear ``.solve`` uses).
+      solves, per step, ``G(u_next) = M (u_next - u)/dt + R(u_next, t_next, args) = 0`` with the
+      matrix-free Newton-Krylov solver (``jno/utils/solver/newton_krylov.py``, no optimistix);
+      implicit-diff via ``jax.lax.custom_root`` keeps the gradient flowing to ``args`` without
+      unrolling Newton -- the same solver the steady nonlinear ``.solve`` now uses.
 
     This is a *default*: pass any ``solve_fn(block, args, save_ts) -> ys`` to
-    :meth:`FeaxTimeBlock.solve` (diffrax via ``block.as_diffrax``, a feax pipeline via
-    ``block.as_feax_pipeline``, or a hand-rolled stepper) to use a different integrator.
+    :meth:`FeaxTimeBlock.solve` (a hand-rolled stepper, or diffrax built from the block's
+    ``M`` / ``A`` / ``state0``) to use a different integrator.
     """
     import jax
     import jax.numpy as jnp
+
+    from .newton_krylov import newton_krylov
+
+    # keep a BCOO operator as-is (matrix-free matvec) but coerce a dense one to a JAX array
+    def _operand(x):
+        return x if hasattr(x, "todense") else jnp.asarray(x, dtype)
 
     s0 = jnp.asarray(block.state0).reshape(-1)
     dtype = s0.dtype
     grid_ts = jnp.asarray(_block_time_grid(block), dtype)
     dt = float(block.dt)
 
+    # One general backward-Euler step for both payloads: each step solves the root
+    # G(u_next) = 0 with the matrix-free Newton-Krylov solver (no optimistix). For the linear
+    # block G is affine, so Newton converges in one iteration -> one inner BiCGStab solve; the
+    # operators are only ever applied as matvecs (M @ v, A @ v), so a BCOO operator stays sparse.
     if block.is_nonlinear():
-        import optimistix as optx
-
         mass_fn, residual_fn = block.mass, block.residual
 
         def step(w, t_next):
-            M_t = jnp.asarray(mass_fn(t_next, args), dtype)
+            M_t = _operand(mass_fn(t_next, args))
 
-            def _resid(wn, _):  # backward-Euler residual G(wn) = 0
+            def G(wn):
                 return (M_t @ (wn - w)) / dt + jnp.asarray(residual_fn(wn, t_next, args), dtype).reshape(-1)
 
-            sol = optx.root_find(_resid, optx.Newton(rtol=1e-8, atol=1e-8), w, max_steps=64, throw=False)
-            return sol.value, sol.value
+            wn = newton_krylov(G, w)
+            return wn, wn
 
         _, ys = jax.lax.scan(step, s0, grid_ts[1:])
     else:
-        M = jnp.asarray(block.M, dtype)
+        M = _operand(block.M)
         n = M.shape[0]
         c = jnp.zeros((n,), dtype) if block.affine_bias is None else jnp.asarray(block.affine_bias, dtype).reshape(-1)
 
         def step(w, t_next):
-            A = jnp.asarray(block.operator_fn(t_next, args) if block.operator_fn is not None else block.A, dtype)
+            A = _operand(block.operator_fn(t_next, args) if block.operator_fn is not None else block.A)
             rhs = M @ w + dt * c
             if block.forcing_vector_fn is not None:
                 rhs = rhs + dt * jnp.asarray(block.forcing_vector_fn(t_next, args), dtype).reshape(-1)
-            w_next = jnp.linalg.solve(M + dt * A, rhs)
-            return w_next, w_next
+
+            def G(wn):  # affine residual: (M + dt A) wn - rhs ; root is the backward-Euler update
+                return M @ wn + dt * (A @ wn) - rhs
+
+            wn = newton_krylov(G, w)
+            return wn, wn
 
         _, ys = jax.lax.scan(step, s0, grid_ts[1:])
 

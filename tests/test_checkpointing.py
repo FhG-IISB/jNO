@@ -29,7 +29,7 @@ def _make_solver(epochs=10):
 
     key = jax.random.PRNGKey(0)
     u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=8, num_layers=2, key=key))
-    u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 100, 1e-5))
+    u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 100, 1e-5))
     u = u_net(x) * x * (1 - x)
     pde = jnn.laplacian(u, [x]) - jnn.sin(jnn.pi * x)
 

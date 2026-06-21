@@ -23,12 +23,13 @@ ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)         # views with .x / .y d
 
 f = 2.0 * (xi * (1 - xi) + yi * (1 - yi))
 fem = jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0])   # weak form + u = 0 on the boundary
-u_h = jnp.linalg.solve(dense(fem.A), jnp.asarray(fem.b).reshape(-1))
+u_h = jnp.linalg.solve(fem.A, fem.b)
 ```
 
-> `fem.A` and `fem.jacobian(u)` are sparse (`BCOO`); the transient `fem.M` and
-> `fem.operator.A` are dense. The `dense(...)` helper above handles both — it is used
-> throughout this page and in every tutorial script.
+> The flat accessors — `fem.A`, `fem.b`, `fem.M`, `fem.state0`, and `fem.residual(u[, t])` /
+> `fem.jacobian(u[, t])` — return ready-to-use **dense** matrices and **flat** vectors, so no
+> `.todense()`/`reshape` is needed. `fem.operator` still exposes the raw sparse (`BCOO`) feax form
+> for large problems; the `dense(...)` helper above densifies those (e.g. `fem.operator.A`).
 
 ---
 
@@ -38,7 +39,8 @@ u_h = jnp.linalg.solve(dense(fem.A), jnp.asarray(fem.b).reshape(-1))
   Add `time=(t0, t1, n_steps)` to make it transient.
 * **Symbols** — `u, phi = d.fem_symbols(value_shape=(), names=("u", "phi"), order=1)`.
   Use `value_shape=(2,)` for a vector unknown (elasticity, flow velocity), `order=2` for P2
-  (quadratic) elements, and call `fem_symbols` once per field for coupled systems.
+  (quadratic) elements, `space="RT"`/`"N1E"`/`"P0"` for the non-nodal families (see below), and
+  call `fem_symbols` once per field for coupled systems.
 * **Quadrature coordinates** — `d.variable("interior", split=True)` returns the volume
   coordinates; `d.variable("<edge>", split=True)` returns a boundary edge's coordinates. A
   `box` auto-tags `"left"`, `"right"`, `"bottom"`, `"top"` (and `"front"`/`"back"` for a cube);
@@ -66,6 +68,63 @@ in the `jno.fem([...])` list, and `jno.fem` classifies each by the region it is 
 `g` may be a constant or a coordinate expression (e.g. `u(xb, yb) - jno.np.sin(jno.np.pi * xb)`
 for a spatially varying Dirichlet value). A zero Neumann flux is the natural default and needs
 no term.
+
+---
+
+## Non-nodal element families: H(div) and H(curl)
+
+> **⚠️ Experimental.** The non-nodal element zoo is new — validated on 2-D triangular meshes at lowest
+> order — and its API may still change.
+>
+> **Supported:** Raviart–Thomas `"RT"` (H(div)) and first-kind Nédélec `"N1E"` (H(curl)) edge elements
+> + `"P0"`; the `.div` / `.curl` view operators; essential edge-trace BCs — normal flux `u·n = g` (RT)
+> and tangential trace `u×n = g` (N1E) — and the natural pressure BC, on the whole boundary or any
+> sub-region tag (geometry-computed normals); **all solver modes** — steady-linear, steady-nonlinear
+> (Newton), and transient `M u̇ + A u = c` (including nonlinear-transient and the mixed/saddle **DAE**,
+> e.g. transient Darcy); and the differentiable `fem.solve()` for inverse problems.
+>
+> **Not yet / excluded:** 3-D (the zoo is 2-D only — 3-D uses nodal Lagrange); higher order (lowest
+> RT₀ / N1E₀ only); other families (BDM, second-kind Nédélec, **Argyris**/C¹); quad / non-triangular
+> meshes; and a constraint-consistent *algebraic* initial state at `t0` in the saddle-DAE transient
+> (the differential field and all `t > 0` values are correct; only the reported `t0` algebraic value is).
+
+Beyond nodal Lagrange (P1/P2), `jno.fem` assembles **edge-DOF** families on 2-D triangles — for
+problems whose natural space is *not* H¹. Pick one with the `space=` knob on `fem_symbols`:
+
+| `space` | Space | DOF | Use |
+|---------|-------|-----|-----|
+| `"Lagrange"` (default) | H¹ | nodal value | standard PDEs |
+| `"RT"` | **H(div)** Raviart–Thomas | edge normal flux `∫ₑ u·n` | mixed Poisson, Darcy, conservation |
+| `"N1E"` | **H(curl)** Nédélec (1st kind) | edge tangential `∫ₑ u·t` | Maxwell, eddy currents |
+| `"P0"` | L² (piecewise constant) | one per cell | the pressure / multiplier of a mixed pair |
+
+```python
+u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")   # H(div) flux
+p, q = d.fem_symbols(names=("p", "q"), space="P0")                     # piecewise-constant scalar
+```
+
+jNO assembles these with its own push-forward engine (feax has none), but the weak form reads like
+any other coupled problem.
+
+**Vector operators** (on a bound vector view): `u.div(x, y)` is the divergence and `u.curl(x, y)` the
+2-D scalar curl `∂uy/∂x − ∂ux/∂y`; after binding, the no-arg `u.div()` / `u.curl()` reuse the bound
+coordinates. (`div` is equivalently `trace(grad(u, [x, y]))`.)
+
+**Essential (edge-trace) BCs** — the outward normal is `d.variable(region, normals=True, split=True)`:
+
+| Family | Trace | Term |
+|--------|-------|------|
+| RT  | normal flux `u·n = g` | `u(b)[0]*nx + u(b)[1]*ny - g` |
+| N1E | tangential `u×n = g`  | `u(b)[0]*ny - u(b)[1]*nx - g` |
+
+For the RT mixed-Poisson saddle, a Dirichlet condition on the scalar `p` is *natural* — add the weak
+term `p_D * (v[0]*nx + v[1]*ny)`, no essential constraint on the flux. A BC may target a sub-region
+(a `box` edge tag or any `d.tag(...)` boundary subset; sub-region normals are computed from the
+geometry). All solver modes work — **steady-linear**, **steady-nonlinear** (Newton), and **transient**
+(`M u̇ + A u = c`), including a mixed/saddle transient (a DAE with singular mass, e.g. transient Darcy).
+
+Tutorials: `mixed_poisson_rt_2d.py` (H(div)) and `maxwell_nedelec_2d.py` (H(curl): magnetostatics +
+eddy current). *Scope: lowest-order RT₀ / N1E₀ on 2-D triangular meshes.*
 
 ---
 
@@ -97,14 +156,14 @@ operator — solve it with any Newton/root-finder using `fem.residual` and `fem.
 import scipy.optimize as spo
 sol = spo.root(lambda v: np.asarray(fem.residual(v)),
                np.zeros(fem.dofs),
-               jac=lambda v: np.asarray(dense(fem.jacobian(v))), method="hybr")
+               jac=lambda v: np.asarray(fem.jacobian(v)), method="hybr")
 ```
 
 ### Transient (semidiscrete `M u̇ + A u = c`)
 
 ```python
-M, A, dt = dense(fem.M), dense(fem.operator.A), float(fem.dt)
-w = jnp.asarray(fem.state0)
+M, A, dt = fem.M, dense(fem.operator.A), float(fem.dt)  # fem.M is dense; operator.A is raw sparse
+w = fem.state0
 for _ in range(round((fem.t1 - fem.t0) / dt)):          # backward Euler
     w = jnp.linalg.solve(M + dt * A, M @ w)
 ```
@@ -154,9 +213,9 @@ crux = jno.core([(fem.solve() - u_traj).mse], domain=obs).solve(200)   # recover
 ```
 
 `fem.solve(my_integrator, save_ts=...)` swaps the integrator: `my_integrator(block, args,
-save_ts) -> trajectory`. The block exposes `block.as_diffrax(args=...)` (a diffrax ODE term)
-and `block.as_feax_pipeline(args=...)` (a feax backward-Euler pipeline) as ready-made options;
-the implicit default is preferred for Dirichlet problems.
+save_ts) -> trajectory`. Build your own (e.g. diffrax) from the block's `block.M` / `block.A` /
+`block.state0` — form `u_dot = M⁻¹(c − A u)`; the implicit backward-Euler default is preferred for
+Dirichlet problems.
 
 ---
 
@@ -167,8 +226,9 @@ the implicit default is preferred for Dirichlet problems.
   elasticity bilinear form `λ (∇·u)(∇·φ) + 2μ ε(u):ε(φ)`.
 * **Coupled / mixed (Stokes)** — call `fem_symbols(...)` once per field and add one momentum and
   one continuity term; an inf-sup-stable Taylor–Hood pair is `order=2` velocity + `order=1`
-  pressure, with a single-vertex pressure pin via `d.point_region("ppin", (x, y))` and
-  `p(xpn, ypn) - 0.0`.
+  pressure. Pure-Dirichlet velocity leaves the pressure defined only up to a constant; gauge-fix
+  that null space by adding `p.pin()` to the constraint list (it pins one arbitrary DOF — no
+  coordinates needed; pass `p.pin(value)` to set the gauge).
 * **1D and 3D** — a 1D interval or a 3D `cube`/extruded `gmsh` volume use the identical API with
   one fewer / one more coordinate (`ui.z`, `u(xb, yb, zb) - g`, `element_type="TET4"`).
 * **P2 elements** — `order=2` gives quadratic elements; read the solution at `fem.points`.
@@ -181,4 +241,43 @@ The [FEM tutorials](tutorials/08-fem-and-varpinns/poisson-2d-fem.md) cover every
 Poisson, mixed Dirichlet/Robin reaction–diffusion, a nonlinear Allen–Cahn interface, a 3-D
 Helmholtz solve on an extruded domain, mixed-BC Helmholtz, a linear-elastic cantilever beam,
 Poiseuille channel flow (Stokes), transient heat, and two inverse problems (a hidden
-diffusivity field and a transient rate).
+diffusivity field and a transient rate). The non-nodal families add an **H(div) mixed Poisson**
+(Raviart–Thomas + P0) and an **H(curl) Maxwell / eddy-current** example (Nédélec edge elements,
+`maxwell_nedelec_2d.py`); a **variational PINN** writes a neural-network trial straight into the
+same `jno.fem` weak form.
+
+---
+
+## Known limitations
+
+The FEM / weak-form path is stable for the cases the tutorials cover, but the
+FEAX-backed lowering has a few boundaries worth knowing. They apply only when you
+**assemble a weak form** (`target="fem_system"` / `"fem_residual"`) or solve a
+**transient problem through the FEAX time route** — the residual-PINN path is
+unaffected. Each boundary is an explicit, fail-loud `NotImplementedError`, never a
+silently wrong result.
+
+- **Transient mass terms must be parameter-free.** In a time-dependent solve the
+  mass term (`u_t * phi`) may not carry a trainable/runtime parameter. Keep it
+  constant and place affine trainable parameters in the operator/residual instead
+  — e.g. a diffusivity `nu` on the stiffness term, not on the time derivative.
+
+- **First order in time only.** The Diffrax and FEAX time-stepping adapters handle
+  first-order semidiscrete systems. A second-order-in-time PDE (such as the
+  undamped wave equation, `u_tt = c² Δu`) must be rewritten as a first-order
+  system; it cannot be assembled as a single second-order block.
+
+- **No runtime Dirichlet parameters.** A trainable parameter may sit in the
+  operator (stiffness) but not in an essential/Dirichlet boundary *value*: a
+  runtime contribution that lifts Dirichlet data (a non-zero right-hand side) is
+  rejected. Operator-coefficient inverse problems (e.g. recovering `nu`) are fine.
+
+- **Affine parameter lowering expects a single, direct factor.** For trainable FEM
+  coefficients, the affine fast-path recovers a parameter that is a *direct* scalar
+  factor of a weak-form term (`nu * grad(u) · grad(phi)`). One trainable scalar per
+  additive term — not nested inside another parameter or buried in a nonlinear
+  expression — is the well-supported shape.
+
+Hitting one of these is a signal to reformulate (move the parameter, reduce the
+time order) rather than a bug — the error message names the offending term.
+

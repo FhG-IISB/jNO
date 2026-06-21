@@ -23,7 +23,7 @@ net = jno.nn.wrap(
     fx.mlp(in_features=2, output_dim=1, hidden_dims=64, num_layers=3),
     name="u_net",
 )
-net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 5000, 1e-5))
+net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 5000, 1e-5))
 
 # custom equinox model — works identically
 import equinox as eqx
@@ -43,8 +43,6 @@ custom_net = jno.nn.wrap(MyNet(jax.random.PRNGKey(0)))
 custom_net.optimizer(optax.adam(1e-3))
 ```
 
-Legacy shorthand constructors like `jno.numpy.nn.mlp(...)` are no longer the primary API.
-
 ## Available Methods
 
 `Model` (returned by `jno.nn.wrap(...)`) supports:
@@ -54,8 +52,8 @@ Legacy shorthand constructors like `jno.numpy.nn.mlp(...)` are no longer the pri
 - `freeze()` / `unfreeze()`
 - `mask(param_mask=None)`
 - `lora(rank=4, alpha=1.0, *, target=None, wrapper=None, specs=None)`
-- `optimizer(opt_fn, *, lr=None)`
-- `lr(schedule_or_scalar)`
+- `optimizer(opt_fn)`
+- `scale(schedule_or_scalar)`
 - `initialize(weights_or_path_or_initializer, *, key=None)`
 - `dtype(dtype)`
 - `tune(...)`

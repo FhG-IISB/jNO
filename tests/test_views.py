@@ -859,8 +859,8 @@ class TestIntegratePreservation:
         assert isinstance(s.voigt.integrate(), VoigtView)
 
 
-class TestCoordsKwargsForm:
-    """`view.coords(x=x_var, ...)` returns a Named<View>WithPartials.
+class TestBindKwargsForm:
+    """`view.bind(x=x_var, ...)` returns a Named<View>WithPartials.
 
     Attribute access by registered name yields the partial derivative in
     the same view type. Up-to-4th-order parsing supported.
@@ -870,25 +870,25 @@ class TestCoordsKwargsForm:
         d, x, y = _domain_xy()
         v2 = Variable("xy", [0, 2], domain=d)
         # ScalarView → ScalarView
-        s = (x * y).scalar.coords(x=x, y=y)
+        s = (x * y).scalar.bind(x=x, y=y)
         assert isinstance(s, NamedScalarViewWithPartials)
         assert isinstance(s.x, ScalarView)
         # VectorView → VectorView
-        vec = v2.vector.coords(x=x, y=y)
+        vec = v2.vector.bind(x=x, y=y)
         assert isinstance(vec, NamedVectorViewWithPartials)
         assert isinstance(vec.x, VectorView)
         # ComplexView → ComplexView
-        cplx = v2.complex.coords(x=x, y=y)
+        cplx = v2.complex.bind(x=x, y=y)
         assert isinstance(cplx, NamedComplexViewWithPartials)
         assert isinstance(cplx.x, ComplexView)
         # MatrixView → MatrixView
-        mat = v2.matrix.from_diag().coords(x=x, y=y)
+        mat = v2.matrix.from_diag().bind(x=x, y=y)
         assert isinstance(mat, NamedMatrixViewWithPartials)
         assert isinstance(mat.x, MatrixView)
         # VoigtView → VoigtView
         dV = _domain_with(("sigma", 3))
         sig = Variable("sigma", [0, 3], domain=dV)
-        voi = sig.voigt.coords(x=x, y=y)
+        voi = sig.voigt.bind(x=x, y=y)
         assert isinstance(voi, NamedVoigtViewWithPartials)
         assert isinstance(voi.x, VoigtView)
 
@@ -896,7 +896,7 @@ class TestCoordsKwargsForm:
         d, x, y = _domain_xy()
         # u = x²y → ∂u/∂x = 2xy, ∂²u/∂x² = 2y, ∂²u/∂x∂y = 2x, ∂³u/∂x²∂y = 2
         u = x * x * y
-        u_named = u.scalar.coords(x=x, y=y)
+        u_named = u.scalar.bind(x=x, y=y)
         ctx = {"xy": jnp.array([[0.5, 0.7]])}
         np.testing.assert_allclose(_eval(u_named.x.expr, ctx), [[2 * 0.5 * 0.7]], atol=1e-6)
         np.testing.assert_allclose(_eval(u_named.xx.expr, ctx), [[2 * 0.7]], atol=1e-6)
@@ -908,7 +908,7 @@ class TestCoordsKwargsForm:
     def test_fifth_order_falls_through(self):
         """5th+-order names aren't parsed as partial sequences."""
         d, x, _ = _domain_xy()
-        u = (x * x).scalar.coords(x=x)
+        u = (x * x).scalar.bind(x=x)
         with pytest.raises(AttributeError):
             _ = u.xxxxx  # 5 chars > max_order=4 → falls through, then _expr has no `xxxxx`
 
@@ -917,7 +917,7 @@ class TestCoordsKwargsForm:
         r = Variable("rt", [0, 1], domain=d)
         t = Variable("rt", [1, 2], domain=d)
         u = r * t
-        u_named = u.scalar.coords(r=r, theta=t)
+        u_named = u.scalar.bind(r=r, theta=t)
         # ∂u/∂r = theta = t
         ctx = {"rt": jnp.array([[0.4, 0.6]])}
         np.testing.assert_allclose(_eval(u_named.r.expr, ctx), [[0.6]], atol=1e-6)
@@ -930,7 +930,7 @@ class TestCoordsKwargsForm:
         """∂²/∂x∂y = ∂²/∂y∂x for smooth fields."""
         d, x, y = _domain_xy()
         u = x * x * y * y * y  # x²y³
-        u_named = u.scalar.coords(x=x, y=y)
+        u_named = u.scalar.bind(x=x, y=y)
         ctx = {"xy": jnp.array([[0.4, 0.6], [0.2, 0.9]])}
         a = jnp.asarray(_eval(u_named.xy.expr, ctx))
         b = jnp.asarray(_eval(u_named.yx.expr, ctx))
@@ -938,7 +938,7 @@ class TestCoordsKwargsForm:
 
     def test_unknown_coord_falls_through(self):
         d, x, _ = _domain_xy()
-        u = (x * x).scalar.coords(x=x)
+        u = (x * x).scalar.bind(x=x)
         with pytest.raises(AttributeError):
             _ = u.z  # not a registered coord, and _expr has no .z
 
@@ -977,7 +977,7 @@ class TestCoordsKwargsForm:
         d, x, y = _domain_xy()
         # A = diag(x, y) → ∂A/∂x = diag(1, 0)
         v2 = Variable("xy", [0, 2], domain=d)
-        A = v2.matrix.from_diag().coords(x=x, y=y)
+        A = v2.matrix.from_diag().bind(x=x, y=y)
         assert isinstance(A, NamedMatrixViewWithPartials)
         ctx = {"xy": jnp.array([[0.5, 0.7]])}
         out = jnp.asarray(_eval(A.x.expr, ctx))
@@ -986,7 +986,7 @@ class TestCoordsKwargsForm:
 
     def test_indexing_strips_named_view_type(self):
         d, x, y = _domain_xy()
-        u = (x * y).scalar.coords(x=x, y=y)
+        u = (x * y).scalar.bind(x=x, y=y)
         result = u.x  # ∂u/∂x
         # ScalarView, not NamedScalarViewWithPartials
         assert isinstance(result, ScalarView)
@@ -1437,3 +1437,13 @@ class TestViewsOnComplexDomain:
         _, x, y, z, ctx, idx, pts = cube3d
         out = _eval((x * x + y * y + z * z).scalar.laplacian(x, y, z), ctx)  # Δ = 6
         assert _rel_l2_at(out, np.full(pts.shape[0], 6.0), idx) < 1e-4
+
+
+def test_vector_div_curl_need_coords_or_bind():
+    # Bind-aware differential operators: ``.div()`` / ``.curl()`` with neither explicit coordinates nor a
+    # prior ``.bind(x=, y=)`` must raise a clear TypeError rather than failing obscurely downstream.
+    u = jno.trace.TrialFunction("u", value_shape=(2,))
+    with pytest.raises(TypeError, match="coordinate Variables"):
+        u.vector.div()
+    with pytest.raises(TypeError, match="coordinate Variables"):
+        u.vector.curl()

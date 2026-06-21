@@ -24,8 +24,8 @@ def _first_python_block(md_path: Path) -> str:
 
 def test_fem_md_intro_snippet_runs():
     """The fem.md front-page intro is a complete, self-contained jno.fem solve; it must execute.
-    This catches the sparse/dense ``.todense()`` footgun (fem.A is BCOO -> jnp.asarray(fem.A)
-    raises) and any drift in the headline API."""
+    The headline API hands back ready-to-use arrays (fem.A dense, fem.b flat) for jnp.linalg.solve;
+    this guards against drift in that intro and the flat-accessor contract."""
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)  # feax assembly is float64
     try:

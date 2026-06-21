@@ -28,15 +28,18 @@ assert fem.is_transient and not fem.is_linear                  # transient + non
 
 ## Bring your own implicit stepper (backward Euler + Newton)
 
-`fem.operator` is the semidiscrete `FeaxTimeBlock`; we step it implicitly, with a Newton solve per
-step (the Jacobian is `M/Δt + ∂R/∂u`), which converges quadratically:
+`fem` hands back the semidiscrete pieces as ready-to-use JAX arrays — `fem.M` (dense mass),
+`fem.state0`, and `fem.residual(w, t)` / `fem.jacobian(w, t)` (flat residual, dense Jacobian) — so we
+step it implicitly with a Newton solve per step (the Jacobian is `M/Δt + ∂R/∂u`), which converges
+quadratically:
 
 ```python
+M, w = fem.M, fem.state0                          # dense mass + initial state, ready to use
 for step in range(nsteps):                       # backward Euler
     w_prev = w
     for _ in range(8):                            # Newton
-        G  = M @ (w - w_prev)/dt + blk.residual(w, t_next, {})
-        dw = jnp.linalg.solve(M/dt + blk.jacobian(w, t_next, {}), -G)
+        G  = M @ (w - w_prev)/dt + fem.residual(w, t_next)
+        dw = jnp.linalg.solve(M/dt + fem.jacobian(w, t_next), -G)
         w  = w + dw
 ```
 

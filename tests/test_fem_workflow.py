@@ -100,6 +100,32 @@ def test_transient_heat_time_stepping_matches_analytic():
     assert np.linalg.norm(analytic - w) / np.linalg.norm(analytic) < 6e-2
 
 
+def test_transient_flat_api_returns_clean_arrays():
+    """The transient custom-solver API (fem.M / state0 / residual(u,t) / jacobian(u,t)) hands
+    back ready-to-use JAX arrays of the right shape -- no .todense()/reshape boilerplate -- and
+    agrees with the raw fem.operator form (which still takes the args dict)."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25, time=(0.0, 0.1, 3))
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi0, yi0, _ = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    ic = u(xi0, yi0) - 0.0
+    fem = jno.fem([ui.t * vi + (ui.x * vi.x + ui.y * vi.y) + (u * u * u) * vi, u(xb, yb) - 0.0, ic])
+    assert fem.is_transient and not fem.is_linear
+    n = fem.dofs
+    w, t0 = fem.state0, float(fem.t0)
+    # clean dense/flat JAX arrays of the right shape -- no densify/reshape needed
+    assert not hasattr(fem.M, "todense") and fem.M.shape == (n, n)
+    assert w.shape == (n,)
+    r, J = fem.residual(w, t0), fem.jacobian(w, t0)
+    assert r.shape == (n,) and bool(jnp.isfinite(r).all()) and not hasattr(r, "todense")
+    assert J.shape == (n, n) and bool(jnp.isfinite(J).all()) and not hasattr(J, "todense")
+    # agrees with the raw operator form (which still takes the args dict)
+    assert np.allclose(np.asarray(r), np.asarray(fem.operator.residual(w, t0, {})).reshape(-1))
+    assert np.allclose(np.asarray(J), _dense(fem.operator.jacobian(w, t0, {})))
+
+
 # --------------------------------------------------------------------------
 # nonlinear steady: Newton solve recovers a manufactured solution
 # --------------------------------------------------------------------------

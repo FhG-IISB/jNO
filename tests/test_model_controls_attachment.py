@@ -124,14 +124,14 @@ class TestLearningRateAttachment:
     def test_lr_stored_on_attribute(self):
         net = _make_net()
         sched = lrs.constant(1e-3)
-        net.optimizer(optax.adam, lr=sched)
+        net.optimizer(optax.adam).scale(sched)
         assert net._lr is sched
 
     def test_lr_via_separate_call(self):
         net = _make_net()
         sched = lrs.exponential(1e-3, 0.9, 100)
         net.optimizer(optax.adam)
-        net.lr(sched)
+        net.scale(sched)
         assert net._lr is sched
 
     def test_masked_lr_stored_in_group(self):
@@ -139,8 +139,8 @@ class TestLearningRateAttachment:
         sched_global = lrs.constant(1e-3)
         sched_layer0 = lrs.constant(1e-4)
         mask = _mask_first_layer(net.module)
-        net.optimizer(optax.adam, lr=sched_global)
-        net.mask(mask).lr(sched_layer0)
+        net.optimizer(optax.adam).scale(sched_global)
+        net.mask(mask).scale(sched_layer0)
         # Global LR unchanged
         assert net._lr is sched_global
         # Group has its own LR
@@ -150,13 +150,13 @@ class TestLearningRateAttachment:
     def test_warmup_cosine_schedule_stored_correctly(self):
         net = _make_net()
         sched = lrs.warmup_cosine(total_steps=1000, warmup_steps=100, lr0=1e-3)
-        net.optimizer(optax.adam, lr=sched)
+        net.optimizer(optax.adam).scale(sched)
         assert net._lr is sched
 
     def test_piecewise_constant_schedule_stored_correctly(self):
         net = _make_net()
         sched = lrs.piecewise_constant([100, 500], [1e-3, 1e-4, 1e-5])
-        net.optimizer(optax.adam, lr=sched)
+        net.optimizer(optax.adam).scale(sched)
         assert net._lr is sched
 
     def test_two_models_different_lr_do_not_cross_contaminate(self):
@@ -164,8 +164,8 @@ class TestLearningRateAttachment:
         net_b = _make_net()
         sched_a = lrs.constant(1e-3)
         sched_b = lrs.constant(1e-5)
-        net_a.optimizer(optax.adam, lr=sched_a)
-        net_b.optimizer(optax.adam, lr=sched_b)
+        net_a.optimizer(optax.adam).scale(sched_a)
+        net_b.optimizer(optax.adam).scale(sched_b)
         assert net_a._lr is sched_a
         assert net_b._lr is sched_b
 
@@ -314,9 +314,10 @@ class TestChainedControls:
     def test_optimizer_then_masked_optimizer_coexist(self):
         """Global optimizer + masked group must both survive on the same model."""
         net = _make_net()
-        net.optimizer(optax.sgd, lr=lrs.constant(1e-2))
+        net.optimizer(optax.sgd).scale(lrs.constant(1e-2))
         mask = _mask_first_layer(net.module)
-        net.mask(mask).optimizer(optax.adam, lr=lrs.constant(1e-3))
+        net.mask(mask).optimizer(optax.adam)
+        net.mask(mask).scale(lrs.constant(1e-3))
         assert net._opt_fn is optax.sgd
         assert len(net._param_groups) == 1
         grp = net._param_groups[0]
@@ -325,7 +326,7 @@ class TestChainedControls:
     def test_reset_clears_all_controls(self):
         """reset() must restore the model to its default (no optimizer, not frozen)."""
         net = _make_net()
-        net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         net.lora(rank=4)
         mask = _mask_first_layer(net.module)
         net.mask(mask).freeze()

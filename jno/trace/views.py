@@ -154,13 +154,11 @@ class _SchemeProxy:
 
 
 def _coords_dispatch(view_self, args: tuple, named_vars: dict, *, positional_factory=None):
-    """Shared dispatch logic for ``ScalarView.coords``, ``VectorView.coords``, etc.
+    """Shared dispatch for ``.partials``/``.bind`` (kwargs) and ``.coords`` (positional names).
 
-    * ``coords(**vars)`` (kwargs) → partial-derivative wrapper (all views).
-    * ``coords(*strings)`` / ``coords([strings])`` (positional) → component /
-      element-access wrapper. Only valid where ``positional_factory`` is
-      provided (currently ``MatrixView`` and ``VectorView``).
-    * Mixing kwargs with positional strings raises ``TypeError``.
+    * ``named_vars`` (kwargs, from ``.partials`` / ``.bind``) → partial-derivative wrapper.
+    * ``args`` (positional strings, from ``.coords``) → component / element-access wrapper,
+      valid only where ``positional_factory`` is provided (``VectorView`` / ``MatrixView``).
     """
     if named_vars and args:
         raise TypeError("coords() expects either kwargs (name=Variable) or positional names, not both")
@@ -256,10 +254,6 @@ class ScalarView(_DelegatesToPlaceholder):
 
     # ``bind`` is a synonym — programming flavour, same semantics.
     bind = partials
-
-    def coords(self, *args, **named_vars):
-        """Deprecated alias — use :meth:`partials` (kwargs) instead."""
-        return _coords_dispatch(self, args, named_vars)
 
     # -- scalar operations --
     def abs(self) -> "ScalarView":
@@ -380,16 +374,15 @@ class VectorView(_DelegatesToPlaceholder):
 
     bind = partials  # synonym
 
-    def coords(self, *args, **named_vars):
-        """Two forms:
+    def coords(self, *args):
+        """Name a vector's components for attribute access::
 
-        * ``v.coords("x", "y")`` / ``v.coords(["x", "y"])`` — positional string
-          labels for component access via ``.x``, ``.y`` (``ScalarView`` of one
-          component).
-        * ``v.coords(x=x_var, y=y_var)`` — *deprecated* alias for
-          :meth:`partials`; use ``.partials(...)`` or ``.bind(...)`` for new code.
+            v.coords("x", "y")        # or v.coords(["x", "y"])
+
+        returns a ``NamedVectorView`` whose components are reachable as ``.x``, ``.y``.
+        To bind coordinates for derivatives use ``.bind(**vars)`` / ``.partials(**vars)``.
         """
-        return _coords_dispatch(self, args, named_vars, positional_factory=NamedVectorView)
+        return _coords_dispatch(self, args, {}, positional_factory=NamedVectorView)
 
     # -- component access --
     def _c(self, i: int) -> "ScalarView":
@@ -411,11 +404,27 @@ class VectorView(_DelegatesToPlaceholder):
         return self._c(i)
 
     # -- differential operators --
+    def _ops_coords(self, vars):
+        """Coordinate Variables for a differential operator: the explicit ``vars`` if any, else the
+        spatial coords bound via ``.bind(x=.., y=..)`` -- so ``u.bind(x=x, y=y).curl()`` (and ``.div()`` /
+        ``.grad()``) need no re-passing. Only ``.bind(...)`` views carry ``_coord_vars``."""
+        if vars:
+            return vars
+        cv = getattr(self, "_coord_vars", None)
+        if not cv:
+            raise TypeError(
+                "div()/curl()/grad() need spatial coordinate Variables: pass them explicitly "
+                "(e.g. u.curl(x, y)) or bind them first (u.bind(x=x, y=y).curl())."
+            )
+        return tuple(cv[n] for n in ("x", "y", "z") if n in cv)
+
     def div(self, *vars) -> "ScalarView":
         """Divergence ∑ ∂u_i/∂x_i → ScalarView.
 
+        With no arguments, differentiates against the coordinates bound by ``.bind(x=.., y=..)``.
         Number of variables must equal the last dimension of the vector.
         """
+        vars = self._ops_coords(vars)
         terms = [self._c(i).expr.d(v) for i, v in enumerate(vars)]
         total = terms[0]
         for t in terms[1:]:
@@ -425,9 +434,11 @@ class VectorView(_DelegatesToPlaceholder):
     def curl(self, *vars):
         """Curl of the vector field.
 
+        With no arguments, differentiates against the coordinates bound by ``.bind(x=.., y=..)``.
         2 variables (2-D) → ``ScalarView`` (∂u_y/∂x − ∂u_x/∂y).
         3 variables (3-D) → ``VectorView`` (the curl vector).
         """
+        vars = self._ops_coords(vars)
         if len(vars) == 2:
             x, y = vars
             return ScalarView(self._c(1).expr.d(x) - self._c(0).expr.d(y))
@@ -478,8 +489,10 @@ class VectorView(_DelegatesToPlaceholder):
 
         Stacks ``self._expr.d(v)`` for each variable along a new last axis,
         so for an ``[..., n]`` vector and ``m`` variables the result is
-        ``[..., n, m]`` with ``J[..., i, j] = ∂u_i/∂x_j``.
+        ``[..., n, m]`` with ``J[..., i, j] = ∂u_i/∂x_j``. With no arguments, uses the
+        coordinates bound by ``.bind(x=.., y=..)``.
         """
+        vars = self._ops_coords(vars)
         cols = [self._expr.d(v) for v in vars]
         return MatrixView(
             FunctionCall(
@@ -597,10 +610,6 @@ class ComplexView(_DelegatesToPlaceholder):
         return _coords_dispatch(self, (), named_vars)
 
     bind = partials  # synonym
-
-    def coords(self, *args, **named_vars):
-        """Deprecated alias — use :meth:`partials` (kwargs) instead."""
-        return _coords_dispatch(self, args, named_vars)
 
     @property
     def real(self) -> "ScalarView":
@@ -1176,16 +1185,15 @@ class MatrixView(_DelegatesToPlaceholder):
 
     bind = partials  # synonym
 
-    def coords(self, *args, **named_vars):
-        """Two forms:
+    def coords(self, *args):
+        """Name a matrix's axes for attribute element access::
 
-        * ``A.coords("x", "y")`` / ``A.coords(["x", "y"])`` — positional string
-          labels for element access via ``A.xy``, ``A.yy`` (``ScalarView`` of
-          ``A[..., 0, 1]``, etc.).
-        * ``A.coords(x=x_var, y=y_var)`` — *deprecated* alias for
-          :meth:`partials`; use ``.partials(...)`` or ``.bind(...)`` for new code.
+            A.coords("x", "y")        # or A.coords(["x", "y"])
+
+        returns a ``NamedMatrixView`` with element access via ``A.xy``, ``A.yy`` (``ScalarView``
+        of ``A[..., 0, 1]``, etc.). To bind coordinates for derivatives use ``.bind(**vars)``.
         """
-        return _coords_dispatch(self, args, named_vars, positional_factory=NamedMatrixView)
+        return _coords_dispatch(self, args, {}, positional_factory=NamedMatrixView)
 
     # ------------------------------------------------------------------
     # Arithmetic
@@ -1343,10 +1351,6 @@ class VoigtView(_DelegatesToPlaceholder):
         return _coords_dispatch(self, (), named_vars)
 
     bind = partials  # synonym
-
-    def coords(self, *args, **named_vars):
-        """Deprecated alias — use :meth:`partials` (kwargs) instead."""
-        return _coords_dispatch(self, args, named_vars)
 
     # ------------------------------------------------------------------
     # Invariants and physics-style operations

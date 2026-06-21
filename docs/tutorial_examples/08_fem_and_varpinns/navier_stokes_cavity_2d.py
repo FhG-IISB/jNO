@@ -35,15 +35,12 @@ import jno  # noqa: E402
 
 inner, grad, trace = jno.np.inner, jno.np.grad, jno.np.trace
 nu = 0.005  # Re = U L / nu = 1 * 1 / 0.005 = 200
-dn = lambda X: jnp.asarray(X.todense()) if hasattr(X, "todense") else jnp.asarray(X)  # noqa: E731
 
 d = jno.domain(box(0, 0, 1, 1), mesh_size=0.045, time=(0.0, 8.0, 33))
-d.point_region("ppin", (0.0, 0.0))  # pin the pressure null space
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)  # P2 velocity
 p, q = d.fem_symbols(names=("p", "q"), order=1)  # P1 pressure
 xi, yi, ti = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
-xpn, ypn, _ = d.variable("ppin", split=True)
 ci = d.variable("initial", split=True)
 ub, vb = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
 gu, gv = grad(u, [xi, yi]), grad(v, [xi, yi])
@@ -57,26 +54,25 @@ fem = jno.fem(
         -qq * trace(gu),
         u(xb, yb)[0] - jno.np.where(yb > 1 - 1e-6, lid, 0.0),  # moving lid on top, no-slip elsewhere
         u(xb, yb)[1] - 0.0,
-        p(xpn, ypn) - 0.0,
+        p.pin(),  # gauge-fix: remove the pressure null space (any single DOF)
         u(ci[0], ci[1])[0] - 0.0,  # start from rest
         u(ci[0], ci[1])[1] - 0.0,
     ]
 )
 assert fem.is_transient and not fem.is_linear, "transient Navier-Stokes must be nonlinear"
 off = fem.problem.offset
-blk = fem.operator
-M, dt = dn(blk.mass(0.0, {})), float(blk.dt)
+M, dt = fem.M, float(fem.dt)
 print(f"\nTransient Navier-Stokes lid-driven cavity (Re={1 / nu:.0f}): dofs={fem.dofs}")
 
 # bring-your-own implicit integrator: backward Euler + Newton  ((M/dt + dR/du) du = -G)
 nsteps, nframes = round((float(fem.t1) - float(fem.t0)) / dt), 32
-w = jnp.asarray(blk.state0)
+w = fem.state0
 frames, save_every = [np.asarray(w)], max(1, nsteps // nframes)
 for step in range(nsteps):
     w_prev, t_next = w, (step + 1) * dt
     for _ in range(8):  # Newton
-        G = M @ (w - w_prev) / dt + jnp.asarray(blk.residual(w, t_next, {})).reshape(-1)
-        J = M / dt + dn(blk.jacobian(w, t_next, {}))
+        G = M @ (w - w_prev) / dt + fem.residual(w, t_next)
+        J = M / dt + fem.jacobian(w, t_next)
         dw = jnp.linalg.solve(J, -G)
         w = w + dw
         if float(jnp.linalg.norm(dw)) < 1e-9:

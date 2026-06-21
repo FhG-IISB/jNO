@@ -225,7 +225,7 @@ class TestMemoryStrategies:
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         stats = solver.solve(20)
 
         logs = stats.training_logs[-1]
@@ -290,7 +290,7 @@ class TestMemoryStrategies:
 
         assert paramax.contains_unwrappables(u_net.module)
 
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         stats = solver.solve(5)
 
         logs = stats.training_logs[-1]
@@ -303,7 +303,7 @@ class TestMemoryStrategies:
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         stats = solver.solve(20, checkpoint_gradients=True)
 
         logs = stats.training_logs[-1]
@@ -320,7 +320,7 @@ class TestMemoryStrategies:
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         stats = solver.solve(20, offload_data=True, batchsize=16)
 
         logs = stats.training_logs[-1]
@@ -336,7 +336,7 @@ class TestMemoryStrategies:
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         # Should not raise, just warn and ignore offload_data
         stats = solver.solve(20, offload_data=True)
 
@@ -351,7 +351,7 @@ class TestMemoryStrategies:
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         stats = solver.solve(
             20,
             checkpoint_gradients=True,
@@ -372,7 +372,7 @@ class TestMemoryStrategies:
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         stats = solver.solve(100)
 
         losses = stats.training_logs[-1]["total_loss"]
@@ -385,9 +385,9 @@ class TestMemoryStrategies:
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         solver.solve(20)
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         stats = solver.solve(20, checkpoint_gradients=True)
 
         assert len(stats.training_logs) == 2
@@ -399,7 +399,7 @@ class TestMemoryStrategies:
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         stats = solver.solve(20)
 
         logs = stats.training_logs[-1]
@@ -455,7 +455,7 @@ class TestParamMask:
             )
 
         solver, u_net = self._make_masked_solver(make_mask)
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         stats = solver.solve(10)
         loss = stats.training_logs[-1]["total_loss"][-1]
         assert jnp.isfinite(loss), f"Expected finite loss, got {loss}"
@@ -487,7 +487,7 @@ class TestParamMask:
         pre_w0 = jnp.array(solver.models[lid].hidden_layers[0].weight)
         pre_b0 = jnp.array(solver.models[lid].hidden_layers[0].bias)
 
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         solver.solve(20)
 
         # Hidden layer 0 must be numerically identical (frozen by mask+freeze)
@@ -523,9 +523,9 @@ class TestParamMask:
         all_true = jax.tree_util.tree_map(lambda _: True, u_masked.module)
         u_masked.mask(all_true)
 
-        opt_kw = dict(lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
-        u_masked.optimizer(optax.adam, **opt_kw)
-        u_nomask.optimizer(optax.adam, **opt_kw)
+        sched = lrs.exponential(1e-3, 0.8, 1000, 1e-5)
+        u_masked.optimizer(optax.adam).scale(sched)
+        u_nomask.optimizer(optax.adam).scale(sched)
 
         stats_m = solver_m.solve(5)
         stats_n = solver_n.solve(5)
@@ -559,7 +559,8 @@ class TestParamMask:
 
         # Chain via ModelCall (the result of u_net(x))
         u = u_net(x) * x * (1 - x)
-        u_net.mask(partial_mask).optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.mask(partial_mask).optimizer(optax.adam)
+        u_net.mask(partial_mask).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
 
         pde = jnn.laplacian(u, [x])
         solver = jno.core([pde.mse])
@@ -628,7 +629,8 @@ def test_mask_initialize_freeze_lora_combined():
         u_net.mask(mask_u)
         .initialize(pretrained.module)
         .freeze()
-        .optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        .optimizer(optax.adam)
+        .scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
     )  # load pretrained weights and partially freeze via mask+freeze
 
     u = u_net(x) * x * (1 - x)
@@ -646,7 +648,11 @@ def test_mask_initialize_freeze_lora_combined():
     )
 
     (
-        v_net.mask(mask_v).freeze().lora(rank=2, alpha=1.0).optimizer(optax.sgd, lr=lrs.exponential(5e-4, 0.9, 1000, 1e-6))
+        v_net.mask(mask_v)
+        .freeze()
+        .lora(rank=2, alpha=1.0)
+        .optimizer(optax.sgd)
+        .scale(lrs.exponential(5e-4, 0.9, 1000, 1e-6))
     )  # would freeze whole model, but ...  # ... LoRA takes priority: adapters trainable
 
     v = v_net(x) * x * (1 - x)
@@ -713,7 +719,7 @@ class TestGradientAccumulation:
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         stats = solver.solve(10, batchsize=16, accumulation_steps=2)
 
         logs = stats.training_logs[-1]
@@ -728,7 +734,7 @@ class TestGradientAccumulation:
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         stats = solver.solve(
             10,
             batchsize=16,
@@ -746,7 +752,7 @@ class TestGradientAccumulation:
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         # batchsize=None → full-batch → accumulation should be silently disabled
         stats = solver.solve(10, accumulation_steps=4)
 
@@ -760,7 +766,7 @@ class TestGradientAccumulation:
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         with pytest.raises(ValueError, match="accumulation_steps"):
             solver.solve(10, accumulation_steps=0)
 
@@ -771,7 +777,7 @@ class TestGradientAccumulation:
         from jno import LearningRateSchedule as lrs
 
         solver, u_net = _make_solver()
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.8, 1000, 1e-5))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.8, 1000, 1e-5))
         stats = solver.solve(
             10,
             batchsize=16,
@@ -968,7 +974,7 @@ class TestIntegralTimeGuard:
         u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=8, num_layers=2, key=key))
         loss = (u_net(x) * (t * 0 + 1)).integrate(t)
         solver = jno.core([loss])
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         return solver
 
     def test_min_consecutive_1_raises(self):
@@ -1017,7 +1023,7 @@ class TestIntegralTimeIntegration:
         TARGET = 0.5
         loss = ((u_net(x) * (t * 0 + 1)).integrate(t) - TARGET) ** 2
         solver = jno.core([loss])
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         stats = solver.solve(epochs=200, min_consecutive=None)
         logs = stats.training_logs[-1]["total_loss"]
         assert logs[-1] < logs[0], "Loss should decrease over 200 epochs"
@@ -1039,7 +1045,7 @@ class TestIntegralTimeIntegration:
         u_net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=16, num_layers=2, key=key))
         loss = ((u_net(x) * (t * 0 + 1)).integrate(t) - 0.5) ** 2
         solver = jno.core([loss])
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         stats = solver.solve(epochs=5, min_consecutive=2)
         assert jnp.isfinite(stats.training_logs[-1]["total_loss"][-1])
 

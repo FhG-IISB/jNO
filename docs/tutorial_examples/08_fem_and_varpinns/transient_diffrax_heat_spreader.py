@@ -6,10 +6,11 @@ bores:
 
     u_t = nu lap u - kappa u + f(x),     insulated (Neumann) on every edge, including the bores.
 
-``jno.fem`` gives you the semidiscrete block ``M u_dot + A u = c`` as ``fem.operator``; you turn it
-into a diffrax ``ODETerm`` with ``block.as_diffrax()`` and hand it to **your** solver -- an adaptive,
-stiff-aware ``Kvaerno5``. No call to ``fem.solve()`` anywhere; the integrator is entirely yours, and
-the same block also drives the default backward-Euler so we can cross-check the two.
+``jno.fem`` hands you the semidiscrete pieces ``M u_dot + A u = c`` directly -- ``fem.M`` (dense
+mass), ``fem.operator.A`` (stiffness), the forcing ``c``, and ``fem.state0`` -- so you build the
+diffrax ``ODETerm`` (``u_dot = M^-1(c - A u)``) yourself and hand it to **your** solver -- an
+adaptive, stiff-aware ``Kvaerno5``. No call to ``fem.solve()`` anywhere; the integrator is entirely
+yours, and the same pieces drive the default backward-Euler so we can cross-check the two.
 
 Two checks, no analytic solution needed: the diffrax trajectory **agrees with backward-Euler**, and
 the field is **at steady state** by the final frame (the last snapshots stop changing).
@@ -39,16 +40,20 @@ nu, kappa = 1.0, 16.0  # diffusivity, heat-loss rate (sets the steady scale and 
 dn = lambda X: jnp.asarray(X.todense()) if hasattr(X, "todense") else jnp.asarray(X)  # noqa: E731
 
 
-def diffrax_solve(block, args, save_ts):
-    """Integrate M u_dot + A u = c with diffrax -- as_diffrax() forms u_dot = M^-1(c - A u)."""
-    db = block.as_diffrax(args=args)
+def diffrax_solve(M, A, c, state0, save_ts):
+    """Integrate M u_dot + A u = c with diffrax -- you form u_dot = M^-1(c - A u) from the flat
+    block pieces and wrap it in an ODETerm; no built-in adapter needed."""
+
+    def rhs(t, u, _args):
+        return jnp.linalg.solve(M, c - A @ u)
+
     sol = diffrax.diffeqsolve(
-        db.term,
+        diffrax.ODETerm(rhs),
         diffrax.Kvaerno5(),  # ESDIRK: implicit/adaptive, for the stiff parabolic operator
         t0=float(save_ts[0]),
         t1=float(save_ts[-1]),
         dt0=float(save_ts[1] - save_ts[0]),
-        y0=jnp.asarray(db.state0),
+        y0=jnp.asarray(state0),
         saveat=diffrax.SaveAt(ts=save_ts),
         stepsize_controller=diffrax.PIDController(rtol=1e-7, atol=1e-9),
         max_steps=100_000,
@@ -67,18 +72,21 @@ src = 26.0 * jno.np.exp(-(((xi - 0.4) ** 2 + (yi - 0.5) ** 2) / (2 * 0.12**2))) 
 fem = jno.fem([ui.t * vi + nu * (ui.x * vi.x + ui.y * vi.y) + kappa * (u * vi) - src * vi, u(ci[0], ci[1]) - 0.0])
 assert fem.is_transient
 
-block = fem.operator  # the FeaxTimeBlock (M, A, c, state0, dt) -- integrate it however you like
-save_ts = jnp.linspace(float(fem.t0), float(fem.t1), 48)  # many frames for a smooth animation
-traj = np.asarray(diffrax_solve(block, {}, save_ts))  # YOUR diffrax solve, no fem.solve()
+# assemble the semidiscrete pieces once from the flat API: M u_dot + A u = c
+M = fem.M  # dense mass matrix (flat accessor)
+A = dn(fem.operator.A)  # stiffness (raw BCOO -> dense)
+c = jnp.zeros(M.shape[0])  # constant forcing (source) lives in affine_bias and/or forcing_vector_fn
+if fem.operator.affine_bias is not None:
+    c = c + dn(fem.operator.affine_bias).reshape(-1)
+if fem.operator.forcing_vector_fn is not None:
+    c = c + jnp.asarray(fem.operator.forcing_vector_fn(0.0, {})).reshape(-1)
+state0, dt = fem.state0, float(fem.dt)
 
-# default backward-Euler over the same block, for cross-check: (M + dt A) w_next = M w + dt c
-M, A, dt = dn(block.M), dn(block.A), float(block.dt)
-c = jnp.zeros(M.shape[0])  # the constant forcing (source) lives in affine_bias and/or forcing_vector_fn
-if block.affine_bias is not None:
-    c = c + dn(block.affine_bias).reshape(-1)
-if block.forcing_vector_fn is not None:
-    c = c + jnp.asarray(block.forcing_vector_fn(0.0, {})).reshape(-1)
-w = jnp.asarray(block.state0)
+save_ts = jnp.linspace(float(fem.t0), float(fem.t1), 48)  # many frames for a smooth animation
+traj = np.asarray(diffrax_solve(M, A, c, state0, save_ts))  # YOUR diffrax solve, no fem.solve()
+
+# default backward-Euler over the same M, A, c for cross-check: (M + dt A) w_next = M w + dt c
+w = state0
 for _ in range(round((float(fem.t1) - float(fem.t0)) / dt)):
     w = jnp.linalg.solve(M + dt * A, M @ w + dt * c)
 agree = float(np.linalg.norm(traj[-1] - np.asarray(w)) / np.linalg.norm(np.asarray(w)))

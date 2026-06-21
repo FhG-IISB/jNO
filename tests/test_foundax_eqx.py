@@ -293,7 +293,7 @@ class TestModelControls:
     @pytest.mark.parametrize("factory", ALL_FACTORIES)
     def test_optimizer_attaches(self, factory):
         net = nn.wrap(factory())
-        ret = net.optimizer(optax.adam, lr=lrs(1e-3))
+        ret = net.optimizer(optax.adam).scale(lrs(1e-3))
         assert ret is net
         assert net._opt_fn is not None
         assert net._lr is not None
@@ -301,7 +301,7 @@ class TestModelControls:
     @pytest.mark.parametrize("factory", ALL_FACTORIES)
     def test_optimizer_with_lr_schedule(self, factory):
         net = nn.wrap(factory())
-        net.optimizer(optax.adamw, lr=lrs.exponential(1e-3, decay_rate=0.9, decay_steps=100))
+        net.optimizer(optax.adamw).scale(lrs.exponential(1e-3, decay_rate=0.9, decay_steps=100))
         assert net._opt_fn is not None
 
     # -- freeze / unfreeze -----------------------------------------------
@@ -359,7 +359,7 @@ class TestModelControls:
     @pytest.mark.parametrize("factory", ALL_FACTORIES)
     def test_summary_does_not_crash(self, factory):
         net = nn.wrap(factory())
-        net.optimizer(optax.adam, lr=lrs(1e-3))
+        net.optimizer(optax.adam).scale(lrs(1e-3))
         net.summary()  # should print without error
 
     # -- reset -----------------------------------------------------------
@@ -367,7 +367,7 @@ class TestModelControls:
     @pytest.mark.parametrize("factory", ALL_FACTORIES)
     def test_reset_clears_config(self, factory):
         net = nn.wrap(factory())
-        net.optimizer(optax.adam, lr=lrs(1e-3))
+        net.optimizer(optax.adam).scale(lrs(1e-3))
         net.freeze()
         net.reset()
         assert net._frozen is False
@@ -417,7 +417,7 @@ class TestJNOPipeline:
         x, *_ = domain.variable("interior")
 
         net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=1))
-        net.optimizer(optax.adam, lr=lrs(1e-3))
+        net.optimizer(optax.adam).scale(lrs(1e-3))
 
         u = net(x)
         loss_expr = (u - jnn.sin(jnn.pi * x)).mse
@@ -435,7 +435,7 @@ class TestJNOPipeline:
         frozen_net.freeze()
 
         train_net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=1))
-        train_net.optimizer(optax.adam, lr=lrs(1e-3))
+        train_net.optimizer(optax.adam).scale(lrs(1e-3))
 
         u = train_net(x) + frozen_net(x)
         loss_expr = (u - jnn.sin(jnn.pi * x)).mse
@@ -450,7 +450,7 @@ class TestJNOPipeline:
         x, *_ = domain.variable("interior")
 
         net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=1))
-        net.optimizer(optax.adam, lr=lrs(1e-3))
+        net.optimizer(optax.adam).scale(lrs(1e-3))
         net.dtype(jnp.bfloat16)
 
         u = net(x)
@@ -472,7 +472,7 @@ class TestJNOPipeline:
 
         net = jnn.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=8, num_layers=1))
         net.initialize(path)
-        net.optimizer(optax.adam, lr=lrs(1e-3))
+        net.optimizer(optax.adam).scale(lrs(1e-3))
 
         u = net(x)
         loss_expr = (u - jnn.sin(jnn.pi * x)).mse
