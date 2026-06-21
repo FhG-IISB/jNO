@@ -214,6 +214,35 @@ system.*
 
 ---
 
+## Coefficient fields — known (`.freeze()`) vs trainable
+
+A coefficient in the weak form (a conductivity `k`, an emissivity, a source weight) can be a plain
+constant, a **coordinate function** `jno.fn(lambda x, y: ...)`, or a `jno.np.parameter` — written
+straight into the math like any other value:
+
+```python
+k = jno.np.parameter(phi).initialize(lambda x, y: 1.0 + 4.0 * x).freeze()   # KNOWN coefficient
+fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
+u_h = jnp.linalg.solve(fem.A, fem.b)                                        # non-parametric forward solve
+```
+
+A `jno.np.parameter` is a **trainable** unknown by default — it makes the system runtime-parametric
+(resolved through `crux`, see below). Marking it **`.freeze()`** declares it a *known* coefficient:
+`jno.fem` evaluates its `.initialize` value at the quadrature points — exactly like `jno.fn` — so the
+system assembles non-parametrically (`fem.A` / `fem.b`, no `crux`) **and works in every form**
+(steady-linear, nonlinear, transient, coupled). The frozen value is a **scalar** (`.initialize(3.0)`)
+or a **coordinate function** (`.initialize(lambda x, y: ...)`, scalar- or vector-valued); a raw
+per-node array, a JAX initializer, or no value all fail loud (a known coefficient is a function/const,
+not nodal data — for nodal data interpolate it into a function). Leave the parameter **un-frozen** to
+make it an inverse unknown — the next section.
+
+> `.freeze()` is equivalent to writing `jno.fn(...)` / the constant directly; it exists so one
+> `jno.np.parameter` can be *trained* (un-frozen) or *fixed* (frozen) without rewriting the form. A
+> vector-valued coefficient is best written **per component** with scalar functions (a single function
+> returning a tuple hits a FEAX-kernel limit shared with `jno.fn`).
+
+---
+
 ## Differentiable solve & inverse problems
 
 `fem.solve()` is the **differentiable forward solve as a trace node** — the entry point for

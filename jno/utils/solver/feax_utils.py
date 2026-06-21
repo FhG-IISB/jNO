@@ -744,6 +744,53 @@ def _field_space(local, node):
     return fields[local["field_index"][key]].get("space", "Lagrange")
 
 
+def _eval_frozen_coefficient(domain, model, local):
+    """Value of a ``.freeze()``d (known) coefficient at the kernel's quadrature points.
+
+    The known value is supplied via ``.initialize`` and read here at assembly time:
+
+    * a **coordinate function** ``(x, y[, z]) -> value`` (``.initialize(lambda x, y: ...)``) is called
+      on the physical quadrature coordinates — identical to ``jno.fn`` — and may return a scalar or a
+      vector (tuple / last-axis array) field;
+    * a **scalar constant** (``.initialize(0.8)``) is returned as-is.
+
+    A raw per-node value array is *not* supported (turning scattered nodal data into a coefficient
+    needs mesh interpolation — use ``jno.fn`` or a function instead); a frozen parameter with no value
+    fails loud."""
+    fn = getattr(model, "_initializer_fn", None)
+    if fn is not None:  # coordinate function, evaluated at the quad points (like jno.fn)
+        import inspect
+
+        try:
+            params = set(inspect.signature(fn).parameters)
+        except (TypeError, ValueError):
+            params = set()
+        if {"key", "shape"} & params:  # a JAX initializer (key, shape, dtype), not a coordinate fn
+            raise ValueError(
+                "jno.fem: a frozen (.freeze()d) coefficient takes a *scalar* or a coordinate function "
+                "(x, y[, z]) -> value — not a JAX initializer. For a uniform value use .initialize(<number>); "
+                "JAX initializers (jax.nn.initializers.*) are for *trainable* parameters."
+            )
+        qp = local["physical_quad_points"]
+        dim = int(getattr(domain, "dimension", qp.shape[-1]))
+        return jnp.asarray(fn(*(qp[..., i] for i in range(dim))))
+
+    weight = getattr(model, "_weight_tree", None)
+    if weight is not None:
+        arr = jnp.asarray(weight)
+        if arr.ndim == 0:  # scalar constant
+            return arr
+        raise NotImplementedError(
+            "jno.fem: a frozen (.freeze()d) coefficient must be a constant or a (x, y[, z]) -> value "
+            "function — a raw per-node array is not supported (use jno.fn(...) or a function)."
+        )
+
+    raise ValueError(
+        f"jno.fem: frozen parameter {getattr(model, '_parameter_name', '<param>')!r} has no value — "
+        "call .initialize(<scalar or (x, y[, z]) -> value function>) before .freeze()."
+    )
+
+
 def _eval_expr_for_feax(domain, node, local):
     """
     Evaluate a jNO symbolic expression inside a FEAX local kernel.
@@ -941,8 +988,13 @@ def _eval_expr_for_feax(domain, node, local):
         raise NotImplementedError(f"Unsupported binary operator: {node.op}")
 
     if isinstance(node, ModelCall):
-        from .parametric_helpers import _is_runtime_scalar_parameter, _parameter_name
+        from .parametric_helpers import _is_frozen_parameter, _is_runtime_scalar_parameter, _parameter_name
 
+        if _is_frozen_parameter(node):
+            # A .freeze()d (known) coefficient: evaluate its constant / coordinate function at the
+            # quadrature points -- exactly like jno.fn -- so it needs no runtime-parameter threading
+            # and works in every assembly path (steady/transient/nonlinear/coupled).
+            return _eval_frozen_coefficient(domain, node.model, local)
         if _is_runtime_scalar_parameter(node):
             name = _parameter_name(node)
             val = _runtime_parameter_value_from_internal_vars(local, name)

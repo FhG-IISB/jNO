@@ -1575,6 +1575,7 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
     if any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares):
         op = _assemble_fem_residual_from_ir(domain, ir)
         return FEM(domain=domain, op=op, classification=classification, mode="nonlinear")
+    # (frozen coefficients in a coupled form are rejected up front in fem(); this stays the plain path)
     op = _assemble_fem_system_from_ir(domain, ir)
     return FEM(domain=domain, op=op, classification=classification, mode="linear")
 
