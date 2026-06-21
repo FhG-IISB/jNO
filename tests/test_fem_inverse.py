@@ -385,7 +385,7 @@ def test_transient_recovers_default_scan():
     # Regression guard for the fully-parametric-operator fix: the entire operator is
     # parametric (no static term), so without restoring the Dirichlet identity in A the
     # backward-Euler matrix M + dt A would be singular (rank-deficient on the bc rows).
-    M = np.asarray(block.M)
+    M = np.asarray(block.M.todense() if hasattr(block.M, "todense") else block.M)  # block.M is a BCOO -> densify
     dt = float(block.dt)
     S = M + dt * np.asarray(block.operator_fn(dt, {"alpha": 1.0}))
     assert np.linalg.matrix_rank(S) == S.shape[0], "M + dt A is singular -- Dirichlet identity missing from A"
