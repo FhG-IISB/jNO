@@ -11,7 +11,8 @@ gradient chain rule already in feax. The edge/derivative-DOF families do:
 
 * Raviart–Thomas (H(div)): contravariant Piola
   ``Phi_phys = (1/detJ) J Phi_ref``, ``div Phi_phys = (1/detJ) div Phi_ref``.
-* Nédélec (H(curl)): covariant Piola ``Phi_phys = J^{-T} Phi_ref``  *(later)*.
+* Nédélec (H(curl)): covariant Piola ``Phi_phys = J^{-T} Phi_ref``,
+  ``curl Phi_phys = (1/detJ) curl Phi_ref`` (2-D scalar curl).
 * Argyris (C1): per-cell Kirby ``M(cell)`` on derivative DOFs  *(later)*.
 
 A per-DOF orientation sign (from :mod:`fem_topology`) multiplies the whole basis
@@ -22,6 +23,8 @@ References
 ----------
 P.-A. Raviart, J.-M. Thomas, *A mixed finite element method for 2nd order elliptic
 problems*, in Mathematical Aspects of FEM, Lecture Notes in Math. 606 (1977).
+J.-C. Nédélec, *Mixed finite elements in* R^3, Numer. Math. 35 (1980) 315–341
+(first-kind H(curl) edge elements; the 2-D triangle restriction used here).
 """
 
 from __future__ import annotations
@@ -45,6 +48,8 @@ class ElementSpec(NamedTuple):
                     push-forward; ``None`` for families that don't need it.
     ``local_edges`` the family's reference edge ordering (DOF k <-> edge k for the
                     lowest-order edge elements), matching :mod:`fem_topology`.
+    ``ref_curl``    reference (2-D scalar) curl ``(n_quad, n_dof)`` for H(curl) families
+                    (``None`` otherwise).
     """
 
     family: str
@@ -56,6 +61,7 @@ class ElementSpec(NamedTuple):
     ref_div: Optional[np.ndarray]  # (n_quad, n_dof) for H(div), else None
     ref_grads: Optional[np.ndarray]  # (n_quad, n_dof, value_size, tdim), reference d Phi_k / d xi_m
     local_edges: Tuple[Tuple[int, int], ...]
+    ref_curl: Optional[np.ndarray] = None  # (n_quad, n_dof) for H(curl), else None
 
 
 def raviart_thomas_triangle(degree: int = 1, quad_degree: int = 2) -> ElementSpec:
@@ -116,4 +122,67 @@ def piola_contravariant_grad(ref_grads: jnp.ndarray, J: jnp.ndarray, detJ: jnp.n
     """
     K = jnp.linalg.inv(J)
     grad = jnp.einsum("ik,qnkm,ml->qnil", J, ref_grads, K) / detJ
+    return grad * signs[None, :, None, None]
+
+
+def nedelec_triangle(degree: int = 1, quad_degree: int = 2) -> ElementSpec:
+    """Lowest-order (``degree=1``) Nédélec first-kind (edge) element on a triangle, via basix.
+
+    N1E(degree 1) has 3 DOFs, one tangential moment per edge (``num_entity_dofs ==
+    [[0,0,0],[1,1,1],[0]]``), a vector value (``value_size == 2``) and a per-basis-constant
+    (2-D scalar) curl. The H(curl) counterpart of :func:`raviart_thomas_triangle`.
+    """
+    import basix
+    from basix import CellType, ElementFamily
+
+    elem = basix.create_element(ElementFamily.N1E, CellType.triangle, degree)
+    qp, qw = basix.make_quadrature(CellType.triangle, quad_degree)
+    tab = elem.tabulate(1, qp)  # (1 + tdim, n_quad, n_dof, value_size)
+    ref_values = np.asarray(tab[0])  # (n_quad, n_dof, 2)
+    ref_grads = np.stack([np.asarray(tab[1]), np.asarray(tab[2])], axis=-1)  # (n_quad, n_dof, 2, 2)
+    # 2-D scalar curl = d(Phi_y)/dxi0 - d(Phi_x)/dxi1 (the antisymmetric part of the reference gradient)
+    ref_curl = ref_grads[:, :, 1, 0] - ref_grads[:, :, 0, 1]  # (n_quad, n_dof)
+    return ElementSpec(
+        family="N1E",
+        n_dof=elem.dim,
+        value_size=elem.value_size,
+        quad_points=np.asarray(qp),
+        quad_weights=np.asarray(qw),
+        ref_values=ref_values,
+        ref_div=None,
+        ref_grads=ref_grads,
+        local_edges=BASIX_TRIANGLE_EDGES,
+        ref_curl=ref_curl,
+    )
+
+
+def piola_covariant(
+    ref_values: jnp.ndarray, ref_curl: jnp.ndarray, J: jnp.ndarray, detJ: jnp.ndarray, signs: jnp.ndarray
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Map Nédélec reference data to one physical triangle (covariant Piola + sign).
+
+    ``Phi_phys = J^{-T} Phi_ref`` (preserves the tangential trace); the 2-D scalar curl transforms
+    as ``curl Phi_phys = (1/detJ) curl Phi_ref`` (signed ``detJ``). ``ref_values`` ``(n_quad, n_dof,
+    2)``, ``ref_curl`` ``(n_quad, n_dof)``, ``J`` the ``(2, 2)`` affine Jacobian, ``signs`` the
+    per-DOF edge orientation ``(n_dof,)``. Returns physical ``(values (n_quad, n_dof, 2), curl
+    (n_quad, n_dof))``; the orientation sign multiplies both.
+    """
+    K = jnp.linalg.inv(J)  # J^{-1}; the covariant map J^{-T} gives Phi_phys_i = K_ji Phi_ref_j
+    s = signs[None, :]  # (1, n_dof)
+    values = jnp.einsum("ji,qnj->qni", K, ref_values) * s[:, :, None]
+    curl = ref_curl / detJ * s
+    return values, curl
+
+
+def piola_covariant_grad(ref_grads: jnp.ndarray, J: jnp.ndarray, detJ: jnp.ndarray, signs: jnp.ndarray) -> jnp.ndarray:
+    """Physical gradient of the covariant-Piola Nédélec basis on one (affine) triangle.
+
+    For ``Phi_phys_i = K_ji Phi_ref_j`` (``K = J^{-1}``) the chain rule gives
+    ``d(Phi_phys)_i / dx_l = K_ji d(Phi_ref)_j/d(xi)_m K_ml`` — no ``detJ`` (the covariant value has
+    none). ``ref_grads`` is ``(n_quad, n_dof, value_size, tdim)``; returns ``(n_quad, n_dof, i, l)``
+    with the per-DOF ``signs`` applied. The off-diagonal ``grad[..., 1, 0] - grad[..., 0, 1]`` recovers
+    the physical curl ``(1/detJ) curl_ref`` (the invariant the test pins).
+    """
+    K = jnp.linalg.inv(J)
+    grad = jnp.einsum("ji,qnjm,ml->qnil", K, ref_grads, K)
     return grad * signs[None, :, None, None]
