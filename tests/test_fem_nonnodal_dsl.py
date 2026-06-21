@@ -116,6 +116,29 @@ def test_rt_normal_flux_bc_pins_boundary_dofs():
     assert pinned == 8  # the unit-square boundary at mesh_size 0.5
 
 
+def test_rt_normal_flux_bc_varying_g():
+    # u·n = g(x,y) varying: each boundary DOF == -sign * ∫_edge g ds (linear g is midpoint-exact).
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.5)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _, nx, ny = d.variable("boundary", normals=True, split=True)
+    ui, vi, ub = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi), u.bind(x=xb, y=yb)
+    fem = jno.fem([inner(ui, vi), ub[0] * nx + ub[1] * ny - (xb + 2.0 * yb)])  # u·n = x + 2y
+    sol = np.linalg.solve(_dense(fem.A), np.asarray(jnp.asarray(fem.b)).reshape(-1))
+    pts, cells = _mesh(d)
+    top = build_edge_topology(cells)
+    counts = np.bincount(np.asarray(top.cell_edges).reshape(-1), minlength=top.n_edges)
+    loc = {int(top.cell_edges[c, k]): (c, k) for c in range(cells.shape[0]) for k in range(3)}
+    for e, (c, k) in loc.items():
+        if counts[e] != 1:
+            continue
+        va, vb = top.edge_vertices[e]
+        pa, pb = pts[va], pts[vb]
+        length = float(np.linalg.norm(pb - pa))
+        mid = (pa + pb) / 2
+        np.testing.assert_allclose(sol[e], -int(top.cell_edge_signs[c, k]) * length * (mid[0] + 2.0 * mid[1]), atol=1e-10)
+
+
 def test_mixed_poisson_rt_p0_via_dsl_matches_direct_assembler():
     # Full RT-P0 mixed Poisson written through jno.fem must assemble the SAME (A, b) as the proven
     # direct assembler (which is convergence-tested in test_fem_nonnodal). div = trace(grad(.)).

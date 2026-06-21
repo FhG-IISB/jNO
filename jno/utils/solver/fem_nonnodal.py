@@ -210,19 +210,21 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
 
     # essential normal-flux BCs (u·n = g): pin boundary-edge DOFs, then symmetric-eliminate
     if flux_bcs:
-        A, b = _apply_flux_bcs(A, b, flux_bcs, domain, field_index, spaces, top, np.asarray(pts), offs, n_cells)
+        A, b = _apply_flux_bcs(
+            A, b, flux_bcs, domain, field_index, spaces, top, np.asarray(pts), offs, n_cells, quad_degree
+        )
     return (A, b), "linear", offs
 
 
-def _apply_flux_bcs(A, b, flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_cells):
+def _apply_flux_bcs(A, b, flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree):
     """Pin boundary-edge DOFs for essential normal-flux BCs ``u·n = g``, then symmetric-eliminate.
 
     The RT0 edge DOF *is* the edge normal flux, so the pin (orientation sign locked empirically) is
     ``σ_e = -sign_topo · ∫_edge g ds`` with ``sign_topo = top.cell_edge_signs[c, k]`` for the boundary
     edge's single incident cell. Boundary edges are the globally single-use edges, filtered to the BC's
     region by node membership. ``g`` is constant for now (general ``g(x)`` is a later extension)."""
-    from ..._fem import _constant_of
-    from .fem_1d import _apply_dirichlet_symmetric, _region_node_ids
+    from ..._fem import _eval_value_node_at
+    from .fem_1d import _apply_dirichlet_symmetric, _line_quadrature, _region_node_ids
 
     cell_edges = np.asarray(top.cell_edges)
     counts = np.bincount(cell_edges.reshape(-1), minlength=top.n_edges)
@@ -234,22 +236,24 @@ def _apply_flux_bcs(A, b, flux_bcs, domain, field_index, spaces, top, pts_np, of
             if eid in boundary:
                 loc[eid] = (c, k)
 
+    gp, gw = (np.asarray(x).reshape(-1) for x in _line_quadrature(quad_degree))  # 1-D Gauss on [0, 1]
     pins = []
     for field_key, region, value_node in flux_bcs:
         fidx = field_index.get(field_key)
         if fidx is None or spaces[fidx] != "RT":
             raise NotImplementedError("jno.fem (non-nodal): a normal-flux BC is only supported on an RT field.")
-        g = _constant_of(value_node)
-        if g is None:
-            raise NotImplementedError("jno.fem (non-nodal): only a constant u·n = g flux BC is wired so far.")
         region_nodes = {int(n) for n in _region_node_ids(domain, region)}
         for eid in boundary:
             va, vb = (int(x) for x in top.edge_vertices[eid])
             if va not in region_nodes or vb not in region_nodes:
                 continue
             c, k = loc[eid]
-            length = float(np.linalg.norm(pts_np[vb] - pts_np[va]))
-            pins.append((offs[fidx] + eid, -int(top.cell_edge_signs[c, k]) * float(g) * length))
+            pa, pb = pts_np[va], pts_np[vb]
+            length = float(np.linalg.norm(pb - pa))
+            xq = pa[None, :] * (1.0 - gp[:, None]) + pb[None, :] * gp[:, None]  # physical edge quad points
+            g_vals = np.asarray(_eval_value_node_at(value_node, jnp.asarray(xq))).reshape(-1)
+            moment = length * float(np.sum(gw * g_vals))  # ∫_edge g ds
+            pins.append((offs[fidx] + eid, -int(top.cell_edge_signs[c, k]) * moment))
     return _apply_dirichlet_symmetric(jnp.asarray(A), jnp.asarray(b), pins)
 
 
