@@ -730,6 +730,20 @@ def _field_data(local, node):
     return fd["shape_vals"], fd["shape_grads"], fd["cell_sol"]
 
 
+def _field_space(local, node):
+    """Element family of ``node``'s field (``"Lagrange"`` default).
+
+    Non-nodal families (``"RT"``, ...) are assembled by the native push-forward path
+    (:mod:`fem_nonnodal`), which tags each ``local["fields"]`` entry with its ``space`` and
+    supplies *physical* (push-forward) shape data. The value branches below switch on this so
+    the Lagrange path stays byte-identical (a single-field Lagrange kernel has no ``fields``)."""
+    fields = local.get("fields")
+    if fields is None:
+        return local.get("space", "Lagrange")
+    key = getattr(node, "field_key", getattr(node, "op_id", None))
+    return fields[local["field_index"][key]].get("space", "Lagrange")
+
+
 def _eval_expr_for_feax(domain, node, local):
     """
     Evaluate a jNO symbolic expression inside a FEAX local kernel.
@@ -822,12 +836,18 @@ def _eval_expr_for_feax(domain, node, local):
         raise KeyError(f"Variable tag '{node.tag}' not found in FEAX local/domain context.")
 
     if isinstance(node, TestFunction):
-        n_comp = _value_shape_num_components(getattr(node, "value_shape", ()))
         shape_vals, _, _ = _field_data(local, node)
+        if _field_space(local, node) != "Lagrange":
+            # non-nodal: shape_vals is already the per-DOF *physical* basis (n_quad, n_dof, *value)
+            return shape_vals
+        n_comp = _value_shape_num_components(getattr(node, "value_shape", ()))
         return _expand_test_shape_vals(shape_vals, n_comp)
 
     if isinstance(node, TrialFunction):
         vals, _, cell_sol = _field_data(local, node)
+        if _field_space(local, node) != "Lagrange":
+            # non-nodal: vector basis x scalar coeffs, u = sum_n cell_sol[n] Phi_n(x) -> (n_quad, *value)
+            return jnp.einsum("qnc,n->qc", vals, cell_sol)
         flat_interp = jnp.sum(vals[:, :, None] * cell_sol[None, :, :], axis=1)
         value_shape = getattr(node, "value_shape", ())
         if len(value_shape) == 0:

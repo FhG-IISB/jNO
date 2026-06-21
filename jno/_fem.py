@@ -1057,17 +1057,6 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
 
     domain = _discover_domain(constraints)
 
-    # Non-nodal element families (RT / Nedelec / Argyris) assemble through the native push-forward
-    # engine (jno/utils/solver/fem_nonnodal.py), not feax. DSL routing is being wired; until then,
-    # fail loudly rather than silently assembling a Lagrange system the user did not ask for.
-    _nonnodal_spaces = _trial_spaces(constraints) - {"Lagrange"}
-    if _nonnodal_spaces:
-        raise NotImplementedError(
-            f"jno.fem: non-nodal element space(s) {sorted(_nonnodal_spaces)} are not yet wired through the "
-            "weak-form DSL. The native push-forward engine is available directly via "
-            "jno.utils.solver.fem_nonnodal (e.g. assemble_mixed_poisson_rt)."
-        )
-
     # Periodic ties `u(A) - u(B)` are enforced by algebraic reduction (a prolongation P that
     # eliminates the slave-face DOFs), not by assembly. Separate them out *before* the weak/Dirichlet
     # classification (`_region_and_support` would otherwise reject a residual that spans two regions).
@@ -1199,6 +1188,17 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
 
     if is_vpinn and (getattr(domain, "dimension", None) == 1 or multifield):
         raise NotImplementedError("jno.fem VPINN (network trial) is currently single-field 2D/3D only.")
+
+    # ---- non-nodal element families (RT / Nedelec / Argyris): native push-forward assembler ----
+    # feax can't assemble these (no push-forward), so -- like the 1D path -- assemble natively and reuse
+    # the shared integrand evaluator (which carries space-guarded branches for the physical basis).
+    if _trial_spaces(constraints) - {"Lagrange"}:
+        from .utils.solver.fem_nonnodal import assemble_fem_nonnodal
+
+        op, mode = assemble_fem_nonnodal(
+            domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, quad_degree=quad_degree
+        )
+        return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode))
 
     # ---- 1D (segment): feax has no LINE2 element, so assemble natively ----
     # The native 1D assembler reuses the same integrand evaluator and returns the

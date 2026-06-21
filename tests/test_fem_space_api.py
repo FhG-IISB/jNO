@@ -40,7 +40,9 @@ def test_trial_spaces_detects_nonnodal():
     assert _trial_spaces([TrialFunction(space="RT")]) == {"RT"}
 
 
-def test_fem_rejects_nonnodal_space_until_wired():
+def test_fem_symbols_threads_space_and_rejects_not_yet_wired_family():
+    # RT is wired through the DSL (see test_fem_nonnodal_dsl); a family not yet implemented must
+    # still error clearly rather than silently assemble a Lagrange system.
     pytest.importorskip("feax", reason="feax required for jno.fem")
     pytest.importorskip("pygmsh", reason="pygmsh required for 2D meshing")
     from shapely.geometry import box
@@ -49,8 +51,8 @@ def test_fem_rejects_nonnodal_space_until_wired():
 
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.5)
     u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")
-    assert u.space == "RT" and v.space == "RT" and u.field_key == v.field_key
+    assert u.space == "RT" and v.space == "RT" and u.field_key == v.field_key  # threaded through
+    a, b = d.fem_symbols(names=("a", "b"), space="Argyris")  # C1, not yet wired
     xi, yi, _ = d.variable("interior", split=True)
-    weak = jno.np.inner(u.bind(x=xi, y=yi), v.bind(x=xi, y=yi))
-    with pytest.raises(NotImplementedError, match="non-nodal"):
-        jno.fem([weak])
+    with pytest.raises(NotImplementedError):
+        jno.fem([a.bind(x=xi, y=yi) * b.bind(x=xi, y=yi)])
