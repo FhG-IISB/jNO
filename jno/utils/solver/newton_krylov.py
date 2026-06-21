@@ -11,6 +11,7 @@ differentiate the solver's ``while_loop``.
 
 No external solver dependency (no optimistix / lineax).
 """
+
 from __future__ import annotations
 
 import jax
@@ -58,8 +59,7 @@ def _linsolve(matvec, b, *, tol, maxit):
     return jax.lax.custom_linear_solve(matvec, b, solve, transpose_solve=solve)
 
 
-def newton_krylov(residual_fn, u0, *, rtol=1e-8, atol=1e-8, max_steps=100,
-                  inner_tol=1e-10, inner_maxit=2000):
+def newton_krylov(residual_fn, u0, *, rtol=1e-8, atol=1e-8, max_steps=100, inner_tol=1e-10, inner_maxit=2000):
     """Root-find ``residual_fn(u) = 0`` from guess ``u0``; differentiable w.r.t. any value
     ``residual_fn`` closes over. Drop-in for the ``(residual_fn, u0) -> u`` solver contract."""
     # feax residuals can hand back a plain numpy array for concrete inputs; coerce so the
@@ -76,7 +76,7 @@ def newton_krylov(residual_fn, u0, *, rtol=1e-8, atol=1e-8, max_steps=100,
 
         def body(state):
             u, _r, k = state
-            ru, jvp = jax.linearize(f, u)           # ru = f(u); jvp(v) = J @ v, reused across inner iters
+            ru, jvp = jax.linearize(f, u)  # ru = f(u); jvp(v) = J @ v, reused across inner iters
             delta = _linsolve(jvp, -ru, tol=inner_tol, maxit=inner_maxit)
             u = u + delta
             return u, f(u), k + 1

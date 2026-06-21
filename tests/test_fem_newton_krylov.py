@@ -5,6 +5,7 @@ whole module on it), so these run on the new default and prove:
   * the implicit-diff gradient is exact (finite-diff vs autodiff), and
   * a steady nonlinear ``fem.solve()`` converges with optimistix forced absent.
 """
+
 from __future__ import annotations
 
 import sys
@@ -39,7 +40,7 @@ def _x64():
 def test_newton_krylov_gradient_matches_fd():
     """Implicit diff through the solve is exact: AD == central finite-difference."""
     n = 40
-    A = (2.0 * jnp.eye(n) - jnp.eye(n, k=1) - jnp.eye(n, k=-1))  # SPD tridiag
+    A = 2.0 * jnp.eye(n) - jnp.eye(n, k=1) - jnp.eye(n, k=-1)  # SPD tridiag
     b = jnp.ones(n)
     u_tgt = jnp.linspace(0.0, 1.0, n)
 
@@ -76,7 +77,7 @@ def test_nonlinear_default_solves_without_optimistix(monkeypatch):
     forced absent (proving the steady path never imports it)."""
     monkeypatch.setitem(sys.modules, "optimistix", None)  # any `import optimistix` now raises
     fem = _nonlinear_fem()
-    res_fn = fem.residual                          # the (u -> flat residual) feax callable
+    res_fn = fem.residual  # the (u -> flat residual) feax callable
     u = newton_krylov(res_fn, jnp.zeros(fem.dofs))  # same solver fem.solve() now defaults to
     res = float(jnp.linalg.norm(jnp.asarray(res_fn(u))))
     assert np.all(np.isfinite(np.asarray(u)))

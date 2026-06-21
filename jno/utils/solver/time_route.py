@@ -44,7 +44,6 @@ from .feax_utils import (
     _make_internal_vars,
     _prepare_feax_runtime,
     _zero_forcing_dirichlet_rows,
-    _zero_mass_dirichlet_rows,
     _zero_mass_dirichlet_rows_sparse,
 )
 from .parametric_helpers import (

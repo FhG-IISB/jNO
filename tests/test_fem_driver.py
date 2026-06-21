@@ -76,8 +76,8 @@ def test_linear_solve_default_and_custom_solver_match():
     direct = np.linalg.solve(_dense(fem.A), np.asarray(fem.b).reshape(-1))
     u_default = np.asarray(fem.solve())
     u_custom = np.asarray(fem.solve(solve_fn=lambda A, b: jnp.linalg.solve(A, b)))
-    assert np.allclose(u_default, direct, atol=1e-6)   # iterative: converged to BiCGStab tol
-    assert np.allclose(u_custom, direct, atol=1e-10)   # dense direct: exact
+    assert np.allclose(u_default, direct, atol=1e-6)  # iterative: converged to BiCGStab tol
+    assert np.allclose(u_custom, direct, atol=1e-10)  # dense direct: exact
 
 
 def test_matches_legacy_assembly_path():
