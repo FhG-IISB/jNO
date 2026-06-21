@@ -16,7 +16,11 @@ basix = pytest.importorskip("basix", reason="basix required for element tabulati
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
 
-from jno.utils.solver.fem_elements import piola_contravariant, raviart_thomas_triangle  # noqa: E402
+from jno.utils.solver.fem_elements import (  # noqa: E402
+    piola_contravariant,
+    piola_contravariant_grad,
+    raviart_thomas_triangle,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -68,6 +72,18 @@ def test_rt_flux_normalization_integral_of_div_is_pm_one():
     # div is constant per basis; ∫_cell = div * area_phys, area_phys = detJ * (ref-tri area 1/2)
     int_div = np.asarray(div)[0] * (detJ * 0.5)
     np.testing.assert_allclose(np.abs(int_div), np.ones(spec.n_dof), atol=1e-12)
+
+
+def test_rt_physical_gradient_trace_recovers_divergence():
+    spec = raviart_thomas_triangle(degree=1, quad_degree=2)
+    J, detJ = _phys_tri()
+    signs = jnp.ones(spec.n_dof)
+    grad = piola_contravariant_grad(jnp.asarray(spec.ref_grads), jnp.asarray(J), detJ, signs)
+    _, div = piola_contravariant(jnp.asarray(spec.ref_values), jnp.asarray(spec.ref_div), jnp.asarray(J), detJ, signs)
+    assert grad.shape == (spec.ref_values.shape[0], spec.n_dof, 2, 2)
+    # divergence is the trace over (component i, spatial direction l) of the physical gradient
+    div_from_grad = grad[:, :, 0, 0] + grad[:, :, 1, 1]
+    np.testing.assert_allclose(np.asarray(div_from_grad), np.asarray(div), atol=1e-12)
 
 
 def test_orientation_sign_flips_basis():

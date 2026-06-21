@@ -40,6 +40,9 @@ class ElementSpec(NamedTuple):
     ``ref_values``  basis values at quad points, ``(n_quad, n_dof, value_size)``.
     ``ref_div``     reference divergence ``(n_quad, n_dof)`` for H(div) families
                     (``None`` otherwise).
+    ``ref_grads``   reference gradient ``d(Phi_ref)_k / d(xi)_m`` of the vector basis,
+                    ``(n_quad, n_dof, value_size, tdim)`` — used by the divergence/gradient
+                    push-forward; ``None`` for families that don't need it.
     ``local_edges`` the family's reference edge ordering (DOF k <-> edge k for the
                     lowest-order edge elements), matching :mod:`fem_topology`.
     """
@@ -51,6 +54,7 @@ class ElementSpec(NamedTuple):
     quad_weights: np.ndarray  # (n_quad,)
     ref_values: np.ndarray  # (n_quad, n_dof, value_size)
     ref_div: Optional[np.ndarray]  # (n_quad, n_dof) for H(div), else None
+    ref_grads: Optional[np.ndarray]  # (n_quad, n_dof, value_size, tdim), reference d Phi_k / d xi_m
     local_edges: Tuple[Tuple[int, int], ...]
 
 
@@ -67,8 +71,10 @@ def raviart_thomas_triangle(degree: int = 1, quad_degree: int = 2) -> ElementSpe
     qp, qw = basix.make_quadrature(CellType.triangle, quad_degree)
     tab = elem.tabulate(1, qp)  # (1 + tdim, n_quad, n_dof, value_size)
     ref_values = np.asarray(tab[0])  # (n_quad, n_dof, 2)
-    # divergence = d(Phi_x)/dx + d(Phi_y)/dy  (tab[1] = d/dx, tab[2] = d/dy)
-    ref_div = np.asarray(tab[1][:, :, 0] + tab[2][:, :, 1])  # (n_quad, n_dof)
+    # reference gradient d(Phi_ref)_k / d(xi)_m: tab[1] = d/dxi0, tab[2] = d/dxi1 -> stack on m
+    ref_grads = np.stack([np.asarray(tab[1]), np.asarray(tab[2])], axis=-1)  # (n_quad, n_dof, 2, 2)
+    # divergence = d(Phi_x)/dxi0 + d(Phi_y)/dxi1 (trace of the reference gradient)
+    ref_div = ref_grads[:, :, 0, 0] + ref_grads[:, :, 1, 1]  # (n_quad, n_dof)
     return ElementSpec(
         family="RT",
         n_dof=elem.dim,
@@ -77,6 +83,7 @@ def raviart_thomas_triangle(degree: int = 1, quad_degree: int = 2) -> ElementSpe
         quad_weights=np.asarray(qw),
         ref_values=ref_values,
         ref_div=ref_div,
+        ref_grads=ref_grads,
         local_edges=BASIX_TRIANGLE_EDGES,
     )
 
@@ -96,3 +103,17 @@ def piola_contravariant(
     values = jnp.einsum("ij,qnj->qni", J, ref_values) / detJ * s[:, :, None]
     div = ref_div / detJ * s
     return values, div
+
+
+def piola_contravariant_grad(ref_grads: jnp.ndarray, J: jnp.ndarray, detJ: jnp.ndarray, signs: jnp.ndarray) -> jnp.ndarray:
+    """Physical gradient of the contravariant-Piola RT basis on one (affine) triangle.
+
+    For ``Phi_phys = (1/detJ) J Phi_ref`` the chain rule gives
+    ``d(Phi_phys)_i / dx_l = (1/detJ) J_ik d(Phi_ref)_k/d(xi)_m K_ml`` with ``K = J^{-1}``.
+    ``ref_grads`` is ``(n_quad, n_dof, value_size, tdim)``; returns the physical gradient
+    ``(n_quad, n_dof, value_size i, tdim l)`` with the per-DOF orientation ``signs`` applied.
+    Tracing over ``(i, l)`` recovers the RT divergence (the invariant the test pins).
+    """
+    K = jnp.linalg.inv(J)
+    grad = jnp.einsum("ik,qnkm,ml->qnil", J, ref_grads, K) / detJ
+    return grad * signs[None, :, None, None]
