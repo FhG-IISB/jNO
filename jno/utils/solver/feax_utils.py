@@ -901,6 +901,27 @@ def _eval_expr_for_feax(domain, node, local):
                 return _reshape_components_last(flat, value_shape)
             return jnp.reshape(flat, flat.shape[:1] + tuple(value_shape) + (len(dims),))
 
+        # Component-of-field gradient: ``u[i].d(x)`` lowers to ``Jacobian(getitem(field, i), [x])``. A
+        # non-nodal field's value-component cannot be differentiated directly (that is the rejected
+        # "Jacobian-of-getitem"), but ``d(u_i)/dx_l`` IS the (component i, direction l) entry of the
+        # whole-field *physical* gradient -- so select that row. This is what makes the existing
+        # ``.div()`` / ``.curl()`` / ``.x``-partial sugar (all of which build ``u[i].d(v)``) work for RT
+        # and N1E. Nodal FEM keeps the ``trace(grad(u, [x, y]))`` idiom: a nodal field's getitem-gradient
+        # has a different tensor structure and stays out of scope here.
+        tgt = node.target
+        if isinstance(tgt, FunctionCall) and getattr(tgt, "getitem_key", None) is not None and len(tgt.args) == 1:
+            field = tgt.args[0]
+            ints = [k for k in tgt.getitem_key if isinstance(k, int)]
+            if ints and isinstance(field, (TrialFunction, TestFunction)) and _field_space(local, field) != "Lagrange":
+                comp = ints[-1]
+                _, grads, cell_sol = _field_data(local, field)  # grads: (n_quad, n_dof, n_comp, n_dims)
+                gc = grads[:, :, comp, :]  # physical gradient of component `comp` -> (n_quad, n_dof, n_dims)
+                g = jnp.stack([gc[..., d] for d in dims], axis=-1)  # (n_quad, n_dof, len(dims))
+                g = g[..., 0] if len(dims) == 1 else g
+                if isinstance(field, TestFunction):
+                    return g  # per-DOF directional derivative of the component
+                return jnp.einsum("qn...,n->q...", g, cell_sol)  # contract the trial DOFs
+
         raise NotImplementedError("FEAX backend supports gradients of TrialFunction/TestFunction only.")
 
     if isinstance(node, BinaryOp):

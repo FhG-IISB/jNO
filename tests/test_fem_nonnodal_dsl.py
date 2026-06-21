@@ -253,3 +253,52 @@ def test_n1e_fem_offsets_single_field():
     pts, cells = _mesh(d)
     ne = build_edge_topology(cells).n_edges
     assert jno.fem([inner(ui, vi)]).offsets == [0, ne]  # single edge-DOF field
+
+
+def test_rt_div_via_view_matches_trace_grad():
+    # The `.div()` view sugar builds component-first `u[i].d(v)`; for a non-nodal field this now lowers
+    # via the whole-field physical gradient and must assemble *identically* to the proven trace(grad(.))
+    # idiom -- an exact anchor for the component-gradient evaluator branch.
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.5)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")
+    p, q = d.fem_symbols(names=("p", "q"), space="P0")
+    xi, yi, _ = d.variable("interior", split=True)
+    ui, vi, pp, qq = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi), p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+    A_view = _dense(jno.fem([inner(ui, vi) - pp * v.vector.div(xi, yi), qq * u.vector.div(xi, yi)]).A)
+    A_trace = _dense(jno.fem([inner(ui, vi) - pp * trace(grad(vi, [xi, yi])), qq * trace(grad(ui, [xi, yi]))]).A)
+    np.testing.assert_allclose(A_view, A_trace, atol=1e-12)
+
+
+def test_n1e_curl_curl_form_symmetric_pd_and_bilinear_exact():
+    # H(curl) curl-curl through the `.curl()` view sugar. With the coercive +mass the operator is
+    # symmetric positive-definite; the pure curl-curl block reproduces ∫(curl u)² exactly for a field in
+    # N1E0 (u=(-y,x), curl=2 -> ∫(curl u)² = 2²·area = 4 on the unit square).
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.4)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="N1E")
+    xi, yi, _ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    cu, cv = u.vector.curl(xi, yi), v.vector.curl(xi, yi)
+    pts, cells = _mesh(d)
+    ne = build_edge_topology(cells).n_edges
+    A = _dense(jno.fem([inner(ui, vi) + cu * cv]).A)  # curl-curl + mass -> coercive on all of H(curl)
+    assert A.shape == (ne, ne)
+    np.testing.assert_allclose(A, A.T, atol=1e-12)
+    assert float(np.linalg.eigvalsh(A).min()) > 0  # positive definite (the +u block; pure curl-curl is singular)
+    # exact bilinear form: project u=(-y,x) (in N1E0) for its DOFs, then uᵀ K u == ∫(curl u)² = 4
+    M = _dense(jno.fem([inner(ui, vi)]).A)
+    b = np.asarray(jnp.asarray(jno.fem([inner(ui, vi) - (-yi * vi[0] + xi * vi[1])]).b)).reshape(-1)
+    u_dof = np.linalg.solve(M, b)
+    K = _dense(jno.fem([cu * cv]).A)  # pure curl-curl (no mass)
+    np.testing.assert_allclose(u_dof @ K @ u_dof, 4.0, atol=1e-9)
+
+
+def test_bind_aware_div_curl_match_explicit_form():
+    # u.bind(x=xi, y=yi).curl() / .div() pull the coords from the bind, so they assemble identically to
+    # the explicit u.vector.curl(xi, yi) / .div(xi, yi) -- the ergonomic no-arg form for bound FEM symbols.
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.4)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="N1E")
+    xi, yi, _ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    A_noarg = _dense(jno.fem([inner(ui, vi) + ui.curl() * vi.curl()]).A)
+    A_expl = _dense(jno.fem([inner(ui, vi) + u.vector.curl(xi, yi) * v.vector.curl(xi, yi)]).A)
+    np.testing.assert_allclose(A_noarg, A_expl, atol=1e-13)

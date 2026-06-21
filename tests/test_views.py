@@ -1437,3 +1437,13 @@ class TestViewsOnComplexDomain:
         _, x, y, z, ctx, idx, pts = cube3d
         out = _eval((x * x + y * y + z * z).scalar.laplacian(x, y, z), ctx)  # Δ = 6
         assert _rel_l2_at(out, np.full(pts.shape[0], 6.0), idx) < 1e-4
+
+
+def test_vector_div_curl_need_coords_or_bind():
+    # Bind-aware differential operators: ``.div()`` / ``.curl()`` with neither explicit coordinates nor a
+    # prior ``.bind(x=, y=)`` must raise a clear TypeError rather than failing obscurely downstream.
+    u = jno.trace.TrialFunction("u", value_shape=(2,))
+    with pytest.raises(TypeError, match="coordinate Variables"):
+        u.vector.div()
+    with pytest.raises(TypeError, match="coordinate Variables"):
+        u.vector.curl()

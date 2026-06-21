@@ -404,11 +404,27 @@ class VectorView(_DelegatesToPlaceholder):
         return self._c(i)
 
     # -- differential operators --
+    def _ops_coords(self, vars):
+        """Coordinate Variables for a differential operator: the explicit ``vars`` if any, else the
+        spatial coords bound via ``.bind(x=.., y=..)`` -- so ``u.bind(x=x, y=y).curl()`` (and ``.div()`` /
+        ``.grad()``) need no re-passing. Only ``.bind(...)`` views carry ``_coord_vars``."""
+        if vars:
+            return vars
+        cv = getattr(self, "_coord_vars", None)
+        if not cv:
+            raise TypeError(
+                "div()/curl()/grad() need spatial coordinate Variables: pass them explicitly "
+                "(e.g. u.curl(x, y)) or bind them first (u.bind(x=x, y=y).curl())."
+            )
+        return tuple(cv[n] for n in ("x", "y", "z") if n in cv)
+
     def div(self, *vars) -> "ScalarView":
         """Divergence ∑ ∂u_i/∂x_i → ScalarView.
 
+        With no arguments, differentiates against the coordinates bound by ``.bind(x=.., y=..)``.
         Number of variables must equal the last dimension of the vector.
         """
+        vars = self._ops_coords(vars)
         terms = [self._c(i).expr.d(v) for i, v in enumerate(vars)]
         total = terms[0]
         for t in terms[1:]:
@@ -418,9 +434,11 @@ class VectorView(_DelegatesToPlaceholder):
     def curl(self, *vars):
         """Curl of the vector field.
 
+        With no arguments, differentiates against the coordinates bound by ``.bind(x=.., y=..)``.
         2 variables (2-D) → ``ScalarView`` (∂u_y/∂x − ∂u_x/∂y).
         3 variables (3-D) → ``VectorView`` (the curl vector).
         """
+        vars = self._ops_coords(vars)
         if len(vars) == 2:
             x, y = vars
             return ScalarView(self._c(1).expr.d(x) - self._c(0).expr.d(y))
@@ -471,8 +489,10 @@ class VectorView(_DelegatesToPlaceholder):
 
         Stacks ``self._expr.d(v)`` for each variable along a new last axis,
         so for an ``[..., n]`` vector and ``m`` variables the result is
-        ``[..., n, m]`` with ``J[..., i, j] = ∂u_i/∂x_j``.
+        ``[..., n, m]`` with ``J[..., i, j] = ∂u_i/∂x_j``. With no arguments, uses the
+        coordinates bound by ``.bind(x=.., y=..)``.
         """
+        vars = self._ops_coords(vars)
         cols = [self._expr.d(v) for v in vars]
         return MatrixView(
             FunctionCall(
