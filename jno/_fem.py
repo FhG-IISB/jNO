@@ -1653,28 +1653,50 @@ def _time_varying_dirichlet_lift(domain, prob, bc, A, dirichlet_tv, fields, fiel
     return lift_fn
 
 
-def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int) -> Any:
-    """Nodal value vector from an IC residual ``<trial-expr>(initial) - g``.
+def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -> Any:
+    """Nodal value vector (``n`` dofs, node-major interleaved for ``vec>1``) from an IC residual
+    ``<trial-expr>(initial) - g``.
 
     Like :func:`_initial_state` but tolerant of a temporal-derivative trial side, so it reads both
     the displacement IC (``u(initial) - u0``) and the velocity IC (``u.t(initial) - v0``) — the
     latter's trial side is ``Jacobian(u, [t])``, which :func:`_essential_spec` rejects. ``g`` is
     evaluated at the **assembly** nodes ``pts`` (P2 carries edge nodes, so they differ from the
-    linear mesh)."""
-    value_node = None
+    linear mesh); a vector ``g`` may be a constant per-component tuple (broadcast to every node), a
+    full ``(n_nodes·vec,)`` field, or a single scalar (broadcast to all components)."""
+    trial_side = value_node = None
     if getattr(bare, "op", None) == "-" and hasattr(bare, "left") and hasattr(bare, "right"):
         left, right = bare.left, bare.right
         if _contains(left, TrialFunction) and not _contains(right, TrialFunction):
-            value_node = right
+            trial_side, value_node = left, right
         elif _contains(right, TrialFunction) and not _contains(left, TrialFunction):
-            value_node = left
+            trial_side, value_node = right, left
     if value_node is None:
         return jnp.zeros((n,))
+    comp = _component_index_of(trial_side)  # one component (u(...)[i] - g) vs all (u(...) - g)
+    n_nodes = int(jnp.asarray(pts).shape[0])
     const = _constant_of(value_node)
     if const is not None:
-        return jnp.full((n,), float(const))
-    vals = _eval_value_node_at(value_node, jnp.asarray(pts))
-    return jnp.broadcast_to(vals, (n,)) if vals.shape[0] == 1 else vals
+        if comp is None:
+            return jnp.full((n,), float(const))  # scalar broadcast to every dof
+        return jnp.zeros((n,)).at[comp::vec].set(float(const))  # one component only
+    vals = jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts))).reshape(-1)
+    if comp is not None:  # one component: vals is a scalar field (or constant) over the nodes
+        per = jnp.broadcast_to(vals, (n_nodes,)) if vals.shape[0] != n_nodes else vals
+        return jnp.zeros((n,)).at[comp::vec].set(per)
+    if vals.shape[0] == n:  # full (n_nodes·vec,) interleaved field
+        return vals
+    if vec > 1 and vals.shape[0] == vec:  # constant per-component vector -> broadcast to every node
+        return jnp.tile(vals, n_nodes)
+    if vec > 1 and vals.shape[0] == n_nodes:  # one scalar field shared by every component
+        return jnp.repeat(vals, vec)
+    if vals.shape[0] == 1:  # single scalar -> every dof
+        return jnp.full((n,), vals[0])
+    if vals.shape[0] == n_nodes:  # scalar problem, scalar field
+        return vals
+    raise NotImplementedError(
+        f"jno.fem: could not place an initial condition of size {vals.shape[0]} into {n} dofs "
+        f"(vec={vec}); write it as a constant, a per-component value, or a full nodal field."
+    )
 
 
 def _assemble_second_order_time(
@@ -1708,10 +1730,11 @@ def _assemble_second_order_time(
     ``fem.state0`` accessors are unchanged; the state is ``y=[u; v]`` (size ``2N``), split via
     ``fem.offsets`` (``[0, N, 2N]``) — displacement ``y[:N]``, velocity ``y[N:]``.
 
-    Scope: linear, single (scalar) field, nodal Lagrange, 2D/3D, constant Dirichlet. Two initial
-    conditions — displacement ``u(initial) - u0`` and (optional) velocity ``u.t(initial) - v0``
-    (default zero). Nonlinear, vector/multi-field, runtime-parameter, or time-varying-Dirichlet
-    second-order forms are rejected (fail-loud) rather than silently mis-assembled.
+    Scope: linear, single field — **scalar or vector** (vector = elastodynamics, ``value_shape=(2,)``
+    / ``(3,)``) — nodal Lagrange, 2D/3D, constant Dirichlet. Two initial conditions: displacement
+    ``u(initial) - u0`` and (optional) velocity ``u.t(initial) - v0`` (default zero). Nonlinear,
+    multi-field, runtime-parameter, or time-varying-Dirichlet second-order forms are rejected
+    (fail-loud) rather than silently mis-assembled.
     """
     from .utils.solver.backend_blocks import FeaxTimeBlock
     from .utils.solver.feax_utils import _dense_array
@@ -1727,11 +1750,7 @@ def _assemble_second_order_time(
         _split_additive_terms,
     )
 
-    if int(vec) != 1:
-        raise NotImplementedError(
-            "jno.fem: second-order-in-time (u_tt) is scalar-only for now (vector elastodynamics is "
-            "future work); use value_shape=() or write a first-order system."
-        )
+    vec = int(vec)
 
     # ---- fail-loud guards (a mis-assembled second-order solve is a silently wrong result) ----
     weak_bares = list(volume_terms) + [e for exprs in boundary_terms.values() for e in exprs]
@@ -1851,7 +1870,7 @@ def _assemble_second_order_time(
     u0 = jnp.zeros((n,), dtype)
     v0 = jnp.zeros((n,), dtype)
     for ic in ic_residuals:
-        val = jnp.asarray(_ic_value_at_nodes(_bare(ic), domain, pts, n), dtype)
+        val = jnp.asarray(_ic_value_at_nodes(_bare(ic), domain, pts, n, vec), dtype)
         if _mto(_bare(ic)) >= 1:
             v0 = val
         else:

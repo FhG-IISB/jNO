@@ -9,8 +9,9 @@ solution. We verify against the analytic standing wave on the unit square::
     u_tt = Δu ,  u = sin(πx) sin(πy) cos(ω t) ,  ω = π√2 ,  T = 2π/ω = √2 ,
 
 check the amplitude is preserved over 4 periods (and that θ=1 would *not* preserve it), match the
-analytic solution over one period, exercise damping (decay) and a non-zero velocity IC, and confirm
-the fail-loud scope boundaries (1D, nonlinear, multi-field, vector).
+analytic solution over one period, exercise damping (decay), a non-zero velocity IC, and **vector
+elastodynamics** (energy conservation of the clamped elastic square), and confirm the fail-loud
+scope boundaries (1D, nonlinear, multi-field).
 """
 
 from __future__ import annotations
@@ -223,19 +224,71 @@ def test_second_order_1d_rejected():
         jno.fem(_second_order_1d())
 
 
-def test_second_order_vector_rejected():
-    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3, time=(0.0, 1.0, 10))
+def _elastodynamics_fem(mesh_size=0.12, n_periods=4, n_steps=240, E=1.0, nu=0.25, rho=1.0):
+    """Clamped elastic unit square, released from an initial x-displacement bump (at rest):
+    ρ u_tt = ∇·σ(u),  σ = λ(∇·u)I + 2μ ε(u)  — vector (elastodynamics) second-order-in-time."""
+    inner, symgrad, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
+    lam, mu = E * nu / ((1 + nu) * (1 - 2 * nu)), E / (2 * (1 + nu))
+    cs = np.sqrt(mu / rho)
+    t1 = n_periods * (2.0 / (cs * PI * np.sqrt(2.0)))  # a few shear transit times
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size, time=(0.0, float(t1), n_steps))
     u, phi = d.fem_symbols(value_shape=(2,))
     xi, yi, ti = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
     xi0, yi0, ti0 = d.variable("initial", split=True)
     ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
     ui0 = u.bind(x=xi0, y=yi0, t=ti0)
-    weak = jno.np.inner(ui.tt, vi, n_contract=1) + jno.np.inner(
-        jno.np.grad(u, [xi, yi]), jno.np.grad(phi, [xi, yi]), n_contract=2
+    eu, ep = symgrad(u, [xi, yi]), symgrad(phi, [xi, yi])
+    weak = rho * inner(ui.tt, vi, n_contract=1) + lam * trace(eu) * trace(ep) + 2.0 * mu * inner(eu, ep, n_contract=2)
+    u0 = u(xi0, yi0) - jno.fn(lambda x, y: jnp.stack([_mode11(x, y), 0.0 * x], axis=-1), [xi0, yi0])
+    return jno.fem([weak, u(xb, yb) - (0.0, 0.0), u0, ui0.t - (0.0, 0.0)])
+
+
+def test_vector_elastodynamics_conserves_energy():
+    """Vector (value_shape=(2,)) second-order-in-time — elastodynamics. The trapezoidal rule
+    conserves the discrete energy ``E = ½ vᵀM v + ½ uᵀK u`` of the undamped system, while backward
+    Euler dissipates it; the clamped boundary stays at zero. This covers the vector reduction,
+    the vector initial condition, and the vector Dirichlet path in one physical invariant."""
+    fem = _elastodynamics_fem(mesh_size=0.12, n_periods=4, n_steps=240)
+    assert fem.is_linear and fem.is_transient
+    n = fem.offsets[1]
+    M_uu = np.asarray(fem.M)[:n, :n]  # block mass M2 (Dirichlet rows zeroed)
+    A_aug = fem.operator.A
+    K_uu = np.asarray(A_aug.todense() if hasattr(A_aug, "todense") else A_aug)[n:, :n]  # stiffness block K
+    ts = np.asarray(_block_time_grid(fem.operator))
+
+    def energy(theta):
+        fem.operator.metadata["theta"] = theta
+        Y = np.asarray(_default_transient_integrate(fem.operator, {}, ts))
+        U, V = Y[:, :n], Y[:, n:]
+        return 0.5 * np.einsum("ti,ij,tj->t", V, M_uu, V) + 0.5 * np.einsum("ti,ij,tj->t", U, K_uu, U)
+
+    e_half = energy(0.5)
+    e_be = energy(1.0)
+    assert abs(e_half[-1] / e_half[0] - 1.0) < 0.02, (
+        f"trapezoidal should conserve energy (ratio {e_half[-1] / e_half[0]:.4f})"
     )
-    with pytest.raises(NotImplementedError, match="scalar-only|single"):
-        jno.fem([weak, u(xb, yb) - 0.0, u(xi0, yi0) - 0.0, ui0.t - 0.0])
+    # backward Euler clearly dissipates (and θ=½ clearly does not) -- the discriminator, not an
+    # absolute decay rate (which depends on how many oscillations fit the window).
+    assert e_be[-1] / e_be[0] < 0.8, f"backward Euler should dissipate energy (ratio {e_be[-1] / e_be[0]:.4f})"
+    assert e_half[-1] / e_half[0] > e_be[-1] / e_be[0] + 0.1, "θ=½ must conserve markedly better than backward Euler"
+
+
+def test_vector_elastodynamics_boundary_stays_clamped():
+    """The clamped (u = 0) boundary of the vector problem is held to ~machine precision for all
+    time — the vector Dirichlet rows of the augmented system are correct."""
+    fem = _elastodynamics_fem(mesh_size=0.15, n_periods=1, n_steps=60)
+    pts = np.asarray(fem.points)
+    on_b = (
+        (np.abs(pts[:, 0]) < 1e-9)
+        | (np.abs(pts[:, 0] - 1) < 1e-9)
+        | (np.abs(pts[:, 1]) < 1e-9)
+        | (np.abs(pts[:, 1] - 1) < 1e-9)
+    )
+    bdof = np.concatenate([np.where(on_b)[0] * 2, np.where(on_b)[0] * 2 + 1])  # both components, interleaved
+    fem.operator.metadata["theta"] = 0.5
+    Y = np.asarray(_default_transient_integrate(fem.operator, {}, np.asarray(_block_time_grid(fem.operator))))
+    assert np.max(np.abs(Y[:, bdof])) < 1e-8, "clamped boundary not held for the vector field"
 
 
 def test_second_order_nonlinear_rejected():

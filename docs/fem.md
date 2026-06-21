@@ -206,9 +206,11 @@ damped wave.
 > Euler spuriously **damps** the wave. If you integrate manually, use the trapezoidal step
 > `(M + ½·dt·A) w_next = (M − ½·dt·A) w + dt·c`.
 
-*Scope: linear, single (scalar) field, nodal Lagrange, 2D/3D, constant Dirichlet;
-nonlinear / vector / multi-field / runtime-parameter / time-varying-Dirichlet second-order forms are
-rejected (fail-loud) — write those as a first-order system.*
+A **vector** field works too (`value_shape=(2,)`/`(3,)`) — that is elastodynamics,
+`ρ u_tt = ∇·σ(u)` (see the vibrating-cantilever tutorial). *Scope: linear, single field (scalar or
+vector), nodal Lagrange, 2D/3D, constant Dirichlet; nonlinear / multi-field / runtime-parameter /
+time-varying-Dirichlet second-order forms are rejected (fail-loud) — write those as a first-order
+system.*
 
 ---
 
@@ -283,10 +285,12 @@ The [FEM tutorials](tutorials/08-fem-and-varpinns/poisson-2d-fem.md) cover every
 Poisson, mixed Dirichlet/Robin reaction–diffusion, a nonlinear Allen–Cahn interface, a 3-D
 Helmholtz solve on an extruded domain, mixed-BC Helmholtz, a linear-elastic cantilever beam,
 Poiseuille channel flow (Stokes), transient heat, and two inverse problems (a hidden
-diffusivity field and a transient rate). The non-nodal families add an **H(div) mixed Poisson**
-(Raviart–Thomas + P0) and an **H(curl) Maxwell / eddy-current** example (Nédélec edge elements,
-`maxwell_nedelec_2d.py`); a **variational PINN** writes a neural-network trial straight into the
-same `jno.fem` weak form.
+diffusivity field and a transient rate). Two **second-order-in-time** examples show the wave path:
+a **vibrating membrane** (`wave_membrane_2d.py`, verified against the analytic standing wave) and a
+**vibrating cantilever** (`elastodynamics_cantilever_2d.py`, vector elastodynamics verified by energy
+conservation). The non-nodal families add an **H(div) mixed Poisson** (Raviart–Thomas + P0) and an
+**H(curl) Maxwell / eddy-current** example (Nédélec edge elements, `maxwell_nedelec_2d.py`); a
+**variational PINN** writes a neural-network trial straight into the same `jno.fem` weak form.
 
 ---
 
@@ -305,11 +309,11 @@ silently wrong result.
   — e.g. a diffusivity `nu` on the stiffness term, not on the time derivative.
 
 - **Second-order in time is scoped.** A second-order-in-time weak form (`u_tt`, e.g.
-  the wave equation `u_tt = c² Δu`) **is** assembled — `jno.fem` auto-reduces it to a
-  first-order augmented `(u, v=u_t)` block, integrated by the energy-conserving
-  trapezoidal rule (see *Second order in time* above). It is scoped to **linear,
-  single (scalar) field, nodal Lagrange, 2D/3D, constant Dirichlet**; a nonlinear,
-  vector, multi-field, runtime-parameter, or time-varying-Dirichlet second-order form
+  the wave equation `u_tt = c² Δu`, or elastodynamics `ρ u_tt = ∇·σ`) **is** assembled —
+  `jno.fem` auto-reduces it to a first-order augmented `(u, v=u_t)` block, integrated by the
+  energy-conserving trapezoidal rule (see *Second order in time* above). It is scoped to
+  **linear, single field (scalar or vector), nodal Lagrange, 2D/3D, constant Dirichlet**;
+  a nonlinear, multi-field, runtime-parameter, or time-varying-Dirichlet second-order form
   is rejected (fail-loud) — rewrite those as a first-order system. The Diffrax /
   residual-PINN strong-form adapters remain first-order (manual reduction).
 
