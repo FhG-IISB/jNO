@@ -11,9 +11,9 @@ Two entry points:
 * :func:`assemble_mixed_poisson_rt` — a *direct* RT–P0 mixed-Poisson assembler, kept to
   validate the engine (edge DOFs, orientation, contravariant Piola, divergence, saddle-block
   assembly) end-to-end against a manufactured solution by *convergence rate*.
-* :func:`assemble_fem_nonnodal` — the DSL-driven assembler ``jno.fem`` routes RT/P0 fields to.
-  It covers the mixed-Poisson saddle system, the essential normal-flux BC ``u·n = g`` (pins
-  boundary-edge DOFs), and the natural pressure BC ``p = p_D`` (the weak term ``p_D·(v·n)``).
+* :func:`assemble_fem_nonnodal` — the DSL-driven assembler ``jno.fem`` routes RT/N1E/P0 fields to.
+  It covers the H(div)/H(curl) mass and L²-projection, the mixed-Poisson saddle system, the essential
+  normal-flux BC ``u·n = g`` (pins boundary-edge DOFs), and the natural pressure BC ``p = p_D``.
 
 Mixed Poisson ``u = -∇p``, ``div u = f``. Flux ``u ∈ RT``, scalar ``p ∈ P0``; weak form
 ``∫u·v − ∫p div v = 0`` ∀v∈RT, ``∫q div u = ∫f q`` ∀q∈P0. Global DOFs are
@@ -100,21 +100,30 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
     through the shared integrand evaluator (:func:`feax_utils._eval_expr_for_feax`, which now has
     space-guarded RT branches). Returns ``(A, b)`` for the linear system (matrices-only contract).
 
-    Scope: RT (H(div), edge DOFs) and P0 (cell DOFs) fields -- the H(div) mass / L²-projection and the
-    RT-P0 mixed-Poisson saddle system, with the essential normal-flux BC ``u·n = g`` (``flux_bcs``, pinned
-    via :func:`_apply_flux_bcs`) and the natural pressure BC ``p = p_D`` (``boundary_terms``, applied via
-    :func:`_apply_natural_boundary_terms`). Dirichlet/IC on these fields are not wired.
+    Scope: RT (H(div)) and N1E (H(curl)) edge-DOF fields plus P0 (cell DOFs) -- the H(div)/H(curl) mass /
+    L²-projection, the RT-P0 mixed-Poisson saddle system, the essential normal-flux BC ``u·n = g``
+    (``flux_bcs``, pinned via :func:`_apply_flux_bcs`) and the natural pressure BC ``p = p_D``
+    (``boundary_terms``, via :func:`_apply_natural_boundary_terms`). RT and N1E share the edge topology and
+    DOF map; they differ only in the push-forward (contravariant vs covariant). Dirichlet/IC are not wired;
+    the H(curl) curl-curl operator and the tangential BC ``u·t = g`` come next.
     """
     from .feax_utils import _infer_fields, _lower_statefield_to_trial, _test_field_index
     from .fem_1d import _integrate_term
-    from .fem_elements import piola_contravariant, piola_contravariant_grad, raviart_thomas_triangle
+    from .fem_elements import (
+        nedelec_triangle,
+        piola_contravariant,
+        piola_contravariant_grad,
+        piola_covariant,
+        piola_covariant_grad,
+        raviart_thomas_triangle,
+    )
     from .fem_topology import build_edge_topology
     from .weak_form import _apply_sign, _split_additive_terms
 
     if dirichlet_raw or ic_residuals:
         raise NotImplementedError("jno.fem (non-nodal): Dirichlet / IC terms are not wired yet.")
 
-    # --- field layout: RT (edge DOFs) and/or P0 (cell DOFs) ---
+    # --- field layout: RT/N1E (edge DOFs) and/or P0 (cell DOFs) ---
     fields: List[Any] = []
     field_index: dict = {}
     for bare in volume_terms:
@@ -124,32 +133,45 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
                 field_index[f["field_key"]] = len(fields)
                 fields.append(f)
     spaces = [f["space"] for f in fields]
-    if any(s not in ("RT", "P0") for s in spaces):
-        raise NotImplementedError(f"jno.fem (non-nodal): supported element spaces are RT and P0; got {spaces}.")
+    if any(s not in ("RT", "N1E", "P0") for s in spaces):
+        raise NotImplementedError(f"jno.fem (non-nodal): supported element spaces are RT, N1E and P0; got {spaces}.")
 
-    # --- mesh + RT element + edge topology ---
+    # --- mesh + edge element(s) + topology. RT (H(div), contravariant Piola) and N1E (H(curl),
+    # covariant Piola) share the edge ordering, topology and global edge DOFs; they differ only in the
+    # push-forward and the per-DOF reference shape data, so one dispatch (edge_ref) serves both. ---
     pts = jnp.asarray(np.asarray(domain.mesh.points))[:, :2]
     cells = np.asarray(domain.mesh.cells_dict["triangle"], dtype=np.int64)
     n_cells = int(cells.shape[0])
     cells_j = jnp.asarray(cells, dtype=jnp.int32)
-    spec = raviart_thomas_triangle(degree=1, quad_degree=quad_degree)
-    top = build_edge_topology(cells, spec.local_edges)
+    edge_ref = {}  # family -> (ref_values, ref_diffop, ref_grads, piola_fn, piola_grad_fn)
+    specs = {}
+    if "RT" in spaces:
+        specs["RT"] = raviart_thomas_triangle(degree=1, quad_degree=quad_degree)
+        s = specs["RT"]
+        edge_ref["RT"] = (s.ref_values, s.ref_div, s.ref_grads, piola_contravariant, piola_contravariant_grad)
+    if "N1E" in spaces:
+        specs["N1E"] = nedelec_triangle(degree=1, quad_degree=quad_degree)
+        s = specs["N1E"]
+        edge_ref["N1E"] = (s.ref_values, s.ref_curl, s.ref_grads, piola_covariant, piola_covariant_grad)
+    edge_ref = {k: tuple(jnp.asarray(a) for a in v[:3]) + v[3:] for k, v in edge_ref.items()}
+    ref_spec = specs.get("RT") or specs.get("N1E") or raviart_thomas_triangle(degree=1, quad_degree=quad_degree)
+    top = build_edge_topology(cells, ref_spec.local_edges)
     ce = jnp.asarray(top.cell_edges, dtype=jnp.int32)  # (n_cells, 3) global edge ids
     esigns = jnp.asarray(top.cell_edge_signs.astype(np.float64))  # (n_cells, 3)
-    qp, qw = jnp.asarray(spec.quad_points), jnp.asarray(spec.quad_weights)
-    rv, rd, rg = jnp.asarray(spec.ref_values), jnp.asarray(spec.ref_div), jnp.asarray(spec.ref_grads)
+    qp, qw = jnp.asarray(ref_spec.quad_points), jnp.asarray(ref_spec.quad_weights)
     n_quad = int(qw.shape[0])
     ctx = getattr(domain, "context", {}) or {}
 
-    # per-field DOF count (RT -> n_edges, P0 -> n_cells), block offsets, and per-cell global DOF map
-    ndof = [top.n_edges if s == "RT" else n_cells for s in spaces]
+    # per-field DOF count (RT/N1E -> n_edges, P0 -> n_cells), block offsets, and per-cell global DOF map
+    ndof = [top.n_edges if s in ("RT", "N1E") else n_cells for s in spaces]
     offs = [0]
     for n in ndof:
         offs.append(offs[-1] + n)
     total = offs[-1]
     cdofs = [
-        (offs[i] + ce) if spaces[i] == "RT" else (offs[i] + jnp.arange(n_cells)[:, None]) for i in range(len(fields))
-    ]  # (n_cells, 3) for RT, (n_cells, 1) for P0
+        (offs[i] + ce) if spaces[i] in ("RT", "N1E") else (offs[i] + jnp.arange(n_cells)[:, None])
+        for i in range(len(fields))
+    ]  # (n_cells, 3) for RT/N1E, (n_cells, 1) for P0
 
     # typed terms: (lowered coeff, test field index -> equation block)
     typed = []
@@ -167,10 +189,11 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
         detJ = jnp.linalg.det(J)
         per = []
         for i, s in enumerate(spaces):
-            if s == "RT":
-                phi, _d = piola_contravariant(rv, rd, J, detJ, esigns[c])  # (n_quad, 3, 2)
-                grad = piola_contravariant_grad(rg, J, detJ, esigns[c])  # (n_quad, 3, 2, 2)
-                per.append({"shape_vals": phi, "shape_grads": grad, "cell_sol": u_blocks[i][ce[c]], "space": "RT"})
+            if s in edge_ref:  # RT (contravariant) or N1E (covariant): same edge DOFs, family-specific push-forward
+                rval, rdop, rgr, pf, pgf = edge_ref[s]
+                phi, _d = pf(rval, rdop, J, detJ, esigns[c])  # (n_quad, 3, 2)
+                grad = pgf(rgr, J, detJ, esigns[c])  # (n_quad, 3, 2, 2)
+                per.append({"shape_vals": phi, "shape_grads": grad, "cell_sol": u_blocks[i][ce[c]], "space": s})
             else:  # P0: a single constant DOF per cell
                 per.append(
                     {
@@ -340,3 +363,32 @@ def rt_flux_at_centroids(points: np.ndarray, cells: np.ndarray, top: EdgeTopolog
         return jnp.einsum("a,ad->d", c, phi[0])  # (2,)
 
     return jax.vmap(_flux)(cells_j, signs, coeffs)
+
+
+def n1e_field_at_centroids(points: np.ndarray, cells: np.ndarray, top: EdgeTopology, u_edge: jnp.ndarray) -> jnp.ndarray:
+    """Evaluate the Nédélec (H(curl)) field ``u_h`` at each triangle centroid -> ``(n_cells, 2)``.
+
+    The H(curl) counterpart of :func:`rt_flux_at_centroids`: tabulates N1E at the reference centroid,
+    covariant-Piola-maps it per cell (with the edge-orientation signs used in assembly), and contracts
+    with the cell's three edge-DOF coefficients ``u_edge[cell_edges]``.
+    """
+    import basix
+
+    from .fem_elements import piola_covariant
+
+    elem = basix.create_element(basix.ElementFamily.N1E, basix.CellType.triangle, 1)
+    tab = elem.tabulate(1, np.array([[1.0 / 3.0, 1.0 / 3.0]]))  # (3, 1, 3, 2)
+    rv = jnp.asarray(tab[0])  # (1, 3, 2)
+    rc = jnp.asarray(tab[1][:, :, 1] - tab[2][:, :, 0])  # (1, 3) reference curl d Phi_y/dxi0 - d Phi_x/dxi1
+    pts = jnp.asarray(points)
+    cells_j = jnp.asarray(np.asarray(cells), dtype=jnp.int32)
+    signs = jnp.asarray(top.cell_edge_signs.astype(np.float64))
+    ce = jnp.asarray(top.cell_edges, dtype=jnp.int32)
+    coeffs = u_edge[ce]  # (n_cells, 3)
+
+    def _val(cell, sgn, c):
+        J, detJ = _cell_jacobian(pts[cell])
+        phi, _ = piola_covariant(rv, rc, J, detJ, sgn)  # (1, 3, 2)
+        return jnp.einsum("a,ad->d", c, phi[0])  # (2,)
+
+    return jax.vmap(_val)(cells_j, signs, coeffs)
