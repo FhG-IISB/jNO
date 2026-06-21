@@ -73,6 +73,18 @@ def test_vec_gt_1_rejected():
         jno.fem([weak, u(xb) - 0.0])
 
 
+def test_order2_p2_rejected_loudly():
+    # The native 1D assembler is LINE2 (P1) only; a P2 request must fail loud, not silently
+    # fall back to P1 (a wrong-order, silently-wrong solve). P2 is a 2D/3D capability.
+    d = _line(0.25)
+    u, phi = d.fem_symbols(order=2)
+    xi = d.variable("interior", split=True)[0]
+    xb = d.variable("boundary", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    with pytest.raises(NotImplementedError, match="P2.*1D|1D.*P2|LINE2"):
+        jno.fem([ui.x * vi.x - 1.0 * vi, u(xb) - 0.0])
+
+
 # ==========================================================================
 # steady scalar — linear, all BC kinds, recovered exactly
 # ==========================================================================

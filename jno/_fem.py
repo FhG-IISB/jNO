@@ -17,8 +17,10 @@ Classification rule
 * a trial-only residual on a volume region is an error (a forgotten test
   function).
 
-This module does **not** solve. Users drive their own solve (``jnp.linalg.solve``,
-``scipy``); a ``.solve()`` layer over lineax/optimistix/diffrax is future work.
+For a plain forward solve you can drive your own solver off the assembled artefacts
+(``jnp.linalg.solve(fem.A, fem.b)``, ``scipy``). :meth:`FEM.solve` additionally provides a
+**differentiable** forward solve as a trace node — the entry point for inverse problems — with
+matrix-free defaults (BiCGStab / Newton–Krylov / backward-Euler) you can override via ``solve_fn``.
 """
 
 from __future__ import annotations
@@ -1274,6 +1276,15 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     if getattr(domain, "dimension", None) == 1:
         from .utils.solver.fem_1d import assemble_fem_1d, assemble_fem_1d_multifield
 
+        # The native 1D assembler is LINE2 (P1) only; a P2 request would otherwise be silently
+        # ignored (the order is dropped on this path). Fail loud instead -- a wrong-order solve
+        # is a silently wrong result, which this stack never returns. (P2 is 2D/3D only.)
+        if _infer_order(constraints) > 1:
+            raise NotImplementedError(
+                "jno.fem: higher-order (P2) elements are not available on a 1D line domain -- the "
+                "native 1D assembler is P1 (LINE2) only. Use order=1, or refine the mesh "
+                "(smaller mesh_size) for accuracy. (P2 promotion is supported on 2D/3D domains.)"
+            )
         if multifield:  # coupled 1D -> native block assembly (feax has no LINE2 element)
             op, mode = assemble_fem_1d_multifield(
                 domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, quad_degree=quad_degree
