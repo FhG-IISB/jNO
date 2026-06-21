@@ -130,6 +130,16 @@ def _contains(constraint: Any, cls) -> bool:
     return contains_node_type(_bare(constraint), cls)
 
 
+def _contains_network_trial(constraint: Any) -> bool:
+    """True if a constraint embeds a *network* ModelCall (e.g. ``u = net(x, y)``) — the VPINN signal.
+
+    Excludes zero-arg runtime parameters (``jno.np.parameter(...)``, scalar or FEM field): a weak form with a
+    trainable *coefficient* parameter is an ordinary (runtime-parametric) FE system, not a network-trial VPINN."""
+    from .utils.solver.parametric_helpers import _is_runtime_scalar_parameter
+
+    return any(isinstance(n, ModelCall) and not _is_runtime_scalar_parameter(n) for n in _walk(_bare(constraint)))
+
+
 def _discover_domain(constraints: List[Any]):
     for c in constraints:
         for v in _spatial_coord_vars(c):
@@ -1083,7 +1093,7 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     # VPINN: a network trial (``u = net(x, y)`` written into the weak form) makes jno.fem
     # test-project the weak form onto the FE test space -> a trainable residual loss, not an FE
     # system. Detected by a ModelCall; lowered after the shared quadrature setup (see below).
-    is_vpinn = any(_contains(c, ModelCall) for c in constraints)
+    is_vpinn = any(_contains_network_trial(c) for c in constraints)
 
     multifield = len(_field_keys(constraints)) > 1
     if vec is None and not multifield:
