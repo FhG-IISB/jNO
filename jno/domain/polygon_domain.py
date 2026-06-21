@@ -684,13 +684,18 @@ class PolygonDomain(domain):
         (the tag pool is drawn from the same mesh nodes), so a tight rounding key is robust."""
         full = self._boundary_regions.get("boundary")
         pool = self._mesh_pool.get(name)
-        if full is None or pool is None or len(np.asarray(pool)) == 0:
+        if full is None or pool is None:
             return False
-        bpts = np.asarray(full.points)[:, : self.dimension]
-        if len(bpts) == 0:
+        bpts, tpts = np.asarray(full.points), np.asarray(pool)
+        if bpts.ndim < 2 or tpts.ndim < 2 or bpts.shape[-1] < self.dimension:
             return False
-        bset = {tuple(np.round(p, 9)) for p in bpts}
-        return all(tuple(np.round(p, 9)) in bset for p in np.asarray(pool)[:, : self.dimension])
+        # flatten any leading batch/time axes to a flat (n, point_dim) list of coordinates
+        bpts = bpts.reshape(-1, bpts.shape[-1])[:, : self.dimension]
+        tpts = tpts.reshape(-1, tpts.shape[-1])[:, : self.dimension]
+        if len(bpts) == 0 or len(tpts) == 0:
+            return False
+        bset = {tuple(round(float(c), 9) for c in row) for row in bpts}
+        return all(tuple(round(float(c), 9) for c in row) in bset for row in tpts)
 
     def _next_context_tag(self, tag: str) -> str:
         if tag not in self.context or tag in self._param_tags:
