@@ -47,7 +47,7 @@ Each status badge links to the tutorial (or, where no dedicated tutorial exists,
 | Forward PINNs (residual minimisation) | [✅ stable](tutorials/01-basics/poisson-1d.md) | Hard or soft BC enforcement |
 | Operator learning (DeepONet, FNO, U-Net, PROSE via [foundax](https://github.com/FhG-IISB/foundax)) | [✅ stable](tutorials/11-operator-learning/index.md) | PDE-residual or data-driven; FieldView adds FD physics on grid outputs |
 | Inverse problems (parameter recovery, surrogate inversion) | [✅ stable](tutorials/05-coupled-and-inverse/inverse-parameter.md) | See [Inverse Problems](inverse-problems.md) |
-| FEM / Variational PINNs | [✅ stable](tutorials/08-fem-and-varpinns/poisson-2d-fem.md) | TRI3 / TRI6 / QUAD4 elements, weak-form assembly — see [known limitations](fem.md#known-limitations) |
+| FEM / Variational PINNs | [✅ stable](tutorials/08-fem-and-varpinns/poisson-2d-fem.md) | Nodal TRI3 / TRI6 / QUAD4 weak-form assembly; **experimental** Raviart–Thomas / Nédélec edge elements ([H(div)/H(curl)](fem.md), 2-D) — see [known limitations](fem.md#known-limitations) |
 | Adaptive resampling (RAD, RARD, CR3, R3, pinnfluence) | [✅ stable](adaptive/resampling.md) | See [Adaptive Resampling](adaptive/resampling.md) |
 | Stochastic PDEs and noise nodes (gaussian / uniform / laplace) | [✅ stable](tutorials/07-stochastic/fokker-planck-2d.md) | Fokker–Planck, stochastic forcing |
 | Bayesian PINNs (NUTS, HMC, MALA, SGLD, SGHMC, VI) | [✅ stable](tutorials/10-bayesian-pinns/index.md) | 14 worked tutorials — see [Bayesian Sampling](training/bayesian.md) |

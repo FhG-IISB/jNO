@@ -73,6 +73,21 @@ no term.
 
 ## Non-nodal element families: H(div) and H(curl)
 
+> **⚠️ Experimental.** The non-nodal element zoo is new — validated on 2-D triangular meshes at lowest
+> order — and its API may still change.
+>
+> **Supported:** Raviart–Thomas `"RT"` (H(div)) and first-kind Nédélec `"N1E"` (H(curl)) edge elements
+> + `"P0"`; the `.div` / `.curl` view operators; essential edge-trace BCs — normal flux `u·n = g` (RT)
+> and tangential trace `u×n = g` (N1E) — and the natural pressure BC, on the whole boundary or any
+> sub-region tag (geometry-computed normals); **all solver modes** — steady-linear, steady-nonlinear
+> (Newton), and transient `M u̇ + A u = c` (including nonlinear-transient and the mixed/saddle **DAE**,
+> e.g. transient Darcy); and the differentiable `fem.solve()` for inverse problems.
+>
+> **Not yet / excluded:** 3-D (the zoo is 2-D only — 3-D uses nodal Lagrange); higher order (lowest
+> RT₀ / N1E₀ only); other families (BDM, second-kind Nédélec, **Argyris**/C¹); quad / non-triangular
+> meshes; and a constraint-consistent *algebraic* initial state at `t0` in the saddle-DAE transient
+> (the differential field and all `t > 0` values are correct; only the reported `t0` algebraic value is).
+
 Beyond nodal Lagrange (P1/P2), `jno.fem` assembles **edge-DOF** families on 2-D triangles — for
 problems whose natural space is *not* H¹. Pick one with the `space=` knob on `fem_symbols`:
 
@@ -226,7 +241,10 @@ The [FEM tutorials](tutorials/08-fem-and-varpinns/poisson-2d-fem.md) cover every
 Poisson, mixed Dirichlet/Robin reaction–diffusion, a nonlinear Allen–Cahn interface, a 3-D
 Helmholtz solve on an extruded domain, mixed-BC Helmholtz, a linear-elastic cantilever beam,
 Poiseuille channel flow (Stokes), transient heat, and two inverse problems (a hidden
-diffusivity field and a transient rate).
+diffusivity field and a transient rate). The non-nodal families add an **H(div) mixed Poisson**
+(Raviart–Thomas + P0) and an **H(curl) Maxwell / eddy-current** example (Nédélec edge elements,
+`maxwell_nedelec_2d.py`); a **variational PINN** writes a neural-network trial straight into the
+same `jno.fem` weak form.
 
 ---
 
