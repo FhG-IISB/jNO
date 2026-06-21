@@ -25,7 +25,7 @@ import jno  # noqa: E402
 from jno.utils.solver.fem_nonnodal import assemble_mixed_poisson_rt, rt_flux_at_centroids  # noqa: E402
 from jno.utils.solver.fem_topology import build_edge_topology  # noqa: E402
 
-inner = jno.np.inner
+inner, grad, trace, sin = jno.np.inner, jno.np.grad, jno.np.trace, jno.np.sin
 
 
 @pytest.fixture(autouse=True)
@@ -72,3 +72,23 @@ def test_rt_projection_of_constant_is_exact():
     pts, cells = _mesh(d)
     flux = np.asarray(rt_flux_at_centroids(pts, cells, build_edge_topology(cells), jnp.asarray(uu)))
     np.testing.assert_allclose(flux, np.tile([1.0, 0.0], (flux.shape[0], 1)), atol=1e-10)
+
+
+def test_mixed_poisson_rt_p0_via_dsl_matches_direct_assembler():
+    # Full RT-P0 mixed Poisson written through jno.fem must assemble the SAME (A, b) as the proven
+    # direct assembler (which is convergence-tested in test_fem_nonnodal). div = trace(grad(.)).
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.3)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")
+    p, q = d.fem_symbols(names=("p", "q"), space="P0")
+    xi, yi, _ = d.variable("interior", split=True)
+    ui, vi, pp, qq = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi), p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+    divu, divv = trace(grad(ui, [xi, yi])), trace(grad(vi, [xi, yi]))
+    f = 2 * jnp.pi**2 * sin(jnp.pi * xi) * sin(jnp.pi * yi)
+    fem = jno.fem([inner(ui, vi) - pp * divv, qq * divu - f * qq], quad_degree=4)
+    A, b = _dense(fem.A), np.asarray(jnp.asarray(fem.b)).reshape(-1)
+
+    pts, cells = _mesh(d)
+    src = lambda x, y: 2 * jnp.pi**2 * jnp.sin(jnp.pi * x) * jnp.sin(jnp.pi * y)  # noqa: E731
+    A_dir, b_dir, _, _ = assemble_mixed_poisson_rt(pts, cells, src, quad_degree=4)
+    np.testing.assert_allclose(A, np.asarray(A_dir), atol=1e-11)
+    np.testing.assert_allclose(b, np.asarray(b_dir), atol=1e-11)

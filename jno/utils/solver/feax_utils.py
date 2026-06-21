@@ -846,7 +846,10 @@ def _eval_expr_for_feax(domain, node, local):
     if isinstance(node, TrialFunction):
         vals, _, cell_sol = _field_data(local, node)
         if _field_space(local, node) != "Lagrange":
-            # non-nodal: vector basis x scalar coeffs, u = sum_n cell_sol[n] Phi_n(x) -> (n_quad, *value)
+            # non-nodal: u = sum_n cell_sol[n] Phi_n(x). Vector basis (RT) is (n_quad, n_dof, value_size);
+            # scalar basis (P0/DG) is (n_quad, n_dof).
+            if vals.ndim == 2:
+                return jnp.einsum("qn,n->q", vals, cell_sol)
             return jnp.einsum("qnc,n->qc", vals, cell_sol)
         flat_interp = jnp.sum(vals[:, :, None] * cell_sol[None, :, :], axis=1)
         value_shape = getattr(node, "value_shape", ())
@@ -866,8 +869,13 @@ def _eval_expr_for_feax(domain, node, local):
             raise ValueError("Jacobian node has no differentiation variables")
 
         if isinstance(node.target, TestFunction):
-            n_comp = _value_shape_num_components(getattr(node.target, "value_shape", ()))
             _, grads, _ = _field_data(local, node.target)
+            if _field_space(local, node.target) != "Lagrange":
+                # non-nodal: grads is the per-DOF *physical* gradient (n_quad, n_dof, n_comp, n_dims);
+                # pick the requested directions -> (n_quad, n_dof, n_comp[, len(dims)]). trace() then gives div.
+                g = jnp.stack([grads[..., d] for d in dims], axis=-1)
+                return g[..., 0] if len(dims) == 1 else g
+            n_comp = _value_shape_num_components(getattr(node.target, "value_shape", ()))
             if n_comp == 1:
                 comps = [grads[..., dim0] for dim0 in dims]
                 return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
@@ -879,6 +887,11 @@ def _eval_expr_for_feax(domain, node, local):
 
         if isinstance(node.target, TrialFunction):
             _, grads, cell_sol = _field_data(local, node.target)
+            if _field_space(local, node.target) != "Lagrange":
+                # non-nodal: du_i/dx_l = sum_n cell_sol[n] grad[n, i, l] -> (n_quad, n_comp[, len(dims)])
+                g = jnp.stack([grads[..., d] for d in dims], axis=-1)
+                contracted = jnp.einsum("qn...,n->q...", g, cell_sol)
+                return contracted[..., 0] if len(dims) == 1 else contracted
             grad_list = [jnp.sum(grads[:, :, dim0 : dim0 + 1] * cell_sol[None, :, :], axis=1) for dim0 in dims]
             flat = grad_list[0] if len(dims) == 1 else jnp.stack(grad_list, axis=-1)
             value_shape = getattr(node.target, "value_shape", ())
