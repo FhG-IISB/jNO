@@ -16,6 +16,7 @@ from .feax_utils import (
     _dense_array,
     _normalize_dirichlet_value,
     _prepare_feax_runtime,
+    _region_mask_arrays_for_domain,
 )
 from .parametric_helpers import (
     _contains_runtime_parameter,
@@ -259,7 +260,10 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
     # ------------------------------------------------------------
     if not has_runtime_parameters:
         problem, bc = _build_feax_problem(domain, ir, fields_override=fields_override)
-        internal_vars = fe.InternalVars()
+        # Sub-region terms: thread the per-cell masks (order set by _build_feax_problem) so a nonlinear
+        # weak form restricted to a sub-region integrates over that region's cells only.
+        _masks = _region_mask_arrays_for_domain(domain)
+        internal_vars = fe.InternalVars(volume_vars=_masks) if _masks else fe.InternalVars()
 
         res_bc = fe.create_res_bc_function(problem, bc)
         jac_bc = fe.create_J_bc_function(
@@ -308,6 +312,12 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
         first_basis_ir = next(iter(parameter_irs.values()))
         static_ir = _make_zero_ir_like(first_basis_ir)
 
+    # Each runtime gets its own InternalVars carrying that IR's sub-region masks (the order is set by
+    # the _build_feax_problem inside _prepare_feax_runtime, so capture immediately after each call).
+    def _iv_for_current():
+        masks = _region_mask_arrays_for_domain(domain)
+        return fe.InternalVars(volume_vars=masks) if masks else fe.InternalVars()
+
     static_rt = _prepare_feax_runtime(
         domain,
         static_ir,
@@ -315,6 +325,7 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
         need_jacobian=True,
         symmetric_bc=symmetric_bc,
     )
+    static_iv = _iv_for_current()
 
     basis_runtimes = {}
 
@@ -328,6 +339,7 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
             need_jacobian=True,
             symmetric_bc=symmetric_bc,
         )
+        basis_iv = _iv_for_current()
 
         zero_rt = _prepare_feax_runtime(
             domain,
@@ -336,10 +348,13 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
             need_jacobian=True,
             symmetric_bc=symmetric_bc,
         )
+        zero_iv = _iv_for_current()
 
         basis_runtimes[name] = {
             "basis": basis_rt,
             "zero": zero_rt,
+            "basis_iv": basis_iv,
+            "zero_iv": zero_iv,
         }
 
     if static_rt["jac_bc"] is None:
@@ -357,13 +372,12 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
 
     dtype = static_rt["dtype"]
     size = int(static_rt["size"])
-    internal_vars = fe.InternalVars()
 
     def residual_fn(u_flat, args=None):
         u_flat = jnp.asarray(u_flat, dtype=dtype).reshape(-1)
 
         out = jnp.asarray(
-            static_rt["res_bc"](u_flat, internal_vars),
+            static_rt["res_bc"](u_flat, static_iv),
             dtype=dtype,
         ).reshape(-1)
 
@@ -377,13 +391,13 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
             basis_res = jnp.asarray(
                 pair["basis"]["res_bc"](
                     u_flat,
-                    internal_vars,
+                    pair["basis_iv"],
                 ),
                 dtype=dtype,
             ).reshape(-1) - jnp.asarray(
                 pair["zero"]["res_bc"](
                     u_flat,
-                    internal_vars,
+                    pair["zero_iv"],
                 ),
                 dtype=dtype,
             ).reshape(-1)
@@ -396,7 +410,7 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
         u_flat = jnp.asarray(u_flat, dtype=dtype).reshape(-1)
 
         out = jnp.asarray(
-            _dense_array(static_rt["jac_bc"](u_flat, internal_vars)),
+            _dense_array(static_rt["jac_bc"](u_flat, static_iv)),
             dtype=dtype,
         )
 
@@ -411,7 +425,7 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
                 _dense_array(
                     pair["basis"]["jac_bc"](
                         u_flat,
-                        internal_vars,
+                        pair["basis_iv"],
                     )
                 ),
                 dtype=dtype,
@@ -420,7 +434,7 @@ def _assemble_fem_residual_from_ir(domain, ir, **kwargs):
                 _dense_array(
                     pair["zero"]["jac_bc"](
                         u_flat,
-                        internal_vars,
+                        pair["zero_iv"],
                     )
                 ),
                 dtype=dtype,
@@ -514,7 +528,12 @@ def _assemble_fem_system_concrete(
         fields_override=fields_override,
         store_on_domain=store_on_domain,
     )
-    internal_vars = fe.InternalVars()
+
+    # Per-region (sub-domain) terms: thread one constant per-cell 0/1 mask per region (cached, in the
+    # order _build_feax_problem just recorded). The kernel multiplies each sub-region term's integrand
+    # by its mask, so it integrates over that region's cells only.
+    region_masks = _region_mask_arrays_for_domain(domain)
+    internal_vars = fe.InternalVars(volume_vars=region_masks) if region_masks else fe.InternalVars()
 
     try:
         u0 = fe.zero_like_initial_guess(problem, bc)
@@ -663,8 +682,11 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
         _op_tags = list(op_rt["runtime_parameter_tags"])
         _op_dt = op_rt["dtype"]
         _op_u0 = jnp.zeros((int(op_rt["size"]),), dtype=_op_dt)
+        # Sub-region masks for this operator IR, captured now (the order was just set by op_rt's
+        # _build_feax_problem) so a non-affine parameter on a sub-region integrates over its cells only.
+        _op_masks = _region_mask_arrays_for_domain(domain)
 
-        def operator_fn(args=None, _rt=op_rt, _tags=_op_tags, _dt=_op_dt, _u0=_op_u0):
+        def operator_fn(args=None, _rt=op_rt, _tags=_op_tags, _dt=_op_dt, _u0=_op_u0, _masks=_op_masks):
             # Keep the raw shape: a scalar parameter stays 0-d; a field parameter
             # (a nodal array) is threaded whole and gathered/interpolated per cell.
             _a = args or {}
@@ -677,6 +699,7 @@ def _assemble_fem_system_from_ir(domain, ir, **kwargs):
                 dtype=_dt,
                 runtime_parameter_tags=_tags,
                 runtime_parameter_values=values,
+                region_mask_arrays=_masks,
             )
             return jnp.asarray(_dense_array(_rt["jac_bc"](_u0, iv)), dtype=_dt)
 

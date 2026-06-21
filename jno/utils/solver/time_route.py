@@ -43,6 +43,7 @@ from .feax_utils import (
     _dense_array,
     _make_internal_vars,
     _prepare_feax_runtime,
+    _region_mask_arrays_for_domain,
     _zero_forcing_dirichlet_rows,
     _zero_mass_dirichlet_rows_sparse,
 )
@@ -510,6 +511,7 @@ def _build_first_order_semidiscrete_operators(
         need_jacobian=True,
         symmetric_bc=True,
     )
+    mass_rt["region_masks"] = _region_mask_arrays_for_domain(domain)
 
     # --------------------------------------------------
     # Split residual:
@@ -542,6 +544,9 @@ def _build_first_order_semidiscrete_operators(
         need_jacobian=True,
         symmetric_bc=True,
     )
+    # Sub-region masks for each runtime, captured immediately (the order is set by each runtime's
+    # _build_feax_problem) so a transient sub-region term integrates over its cells in every step.
+    residual_rt["region_masks"] = _region_mask_arrays_for_domain(domain)
 
     # --------------------------------------------------
     # Build BC-safe affine residual bases
@@ -561,6 +566,7 @@ def _build_first_order_semidiscrete_operators(
             need_jacobian=True,
             symmetric_bc=True,
         )
+        basis_rt["region_masks"] = _region_mask_arrays_for_domain(domain)
 
         zero_rt = _prepare_feax_runtime(
             domain,
@@ -569,6 +575,7 @@ def _build_first_order_semidiscrete_operators(
             need_jacobian=True,
             symmetric_bc=True,
         )
+        zero_rt["region_masks"] = _region_mask_arrays_for_domain(domain)
 
         if basis_rt["jac_bc"] is None or zero_rt["jac_bc"] is None:
             raise ValueError(f"Nonlinear transient residual basis {name!r} did not produce a Jacobian.")
@@ -592,8 +599,9 @@ def _build_first_order_semidiscrete_operators(
     # FEAX InternalVars helper
     # --------------------------------------------------
     def _internal_vars(rt, t):
+        masks = rt.get("region_masks", ())
         if len(rt["temporal_tags"]) == 0:
-            return fe.InternalVars()
+            return fe.InternalVars(volume_vars=tuple(masks)) if masks else fe.InternalVars()
 
         return _make_internal_vars(
             fe,
@@ -601,6 +609,7 @@ def _build_first_order_semidiscrete_operators(
             t,
             n_cells=rt["n_cells"],
             dtype=rt["dtype"],
+            region_mask_arrays=masks,
         )
 
     # --------------------------------------------------
@@ -1583,8 +1592,12 @@ def _build_source_vector_fn(domain, src_ir, *, size, dtype, fields_override=None
     if int(rt["size"]) != int(size):
         raise ValueError(f"Auto forcing runtime size mismatch: runtime size={rt['size']}, expected {size}.")
 
+    # Sub-region masks for this source IR (order set by the runtime's _build_feax_problem), so a
+    # forcing/load term restricted to a sub-region integrates over that region's cells only.
+    _masks = _region_mask_arrays_for_domain(domain)
+
     if len(rt["temporal_tags"]) == 0:
-        iv0 = fe.InternalVars()
+        iv0 = fe.InternalVars(volume_vars=_masks) if _masks else fe.InternalVars()
         const_vec = -jnp.asarray(rt["res_bc"](rt["u_zero"], iv0), dtype=dtype).reshape(-1)
 
         def source_vector_fn(t):
@@ -1594,7 +1607,9 @@ def _build_source_vector_fn(domain, src_ir, *, size, dtype, fields_override=None
         return source_vector_fn
 
     def source_vector_fn(t):
-        iv = _make_internal_vars(fe, rt["temporal_tags"], t, n_cells=rt["n_cells"], dtype=rt["dtype"])
+        iv = _make_internal_vars(
+            fe, rt["temporal_tags"], t, n_cells=rt["n_cells"], dtype=rt["dtype"], region_mask_arrays=_masks
+        )
         return -jnp.asarray(rt["res_bc"](rt["u_zero"], iv), dtype=dtype).reshape(-1)
 
     return source_vector_fn
@@ -1836,8 +1851,9 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             na_temp = na_rt["temporal_tags"]
             na_dt = M.dtype
             na_u0 = jnp.zeros((na_rt["size"],), dtype=na_dt)  # module-level jnp; do NOT import here
+            na_masks = _region_mask_arrays_for_domain(domain)  # sub-region masks for this operator IR
 
-            def _na_full(t, args, _rt=na_rt, _tags=na_tags, _temp=na_temp, _u0=na_u0, _dt=na_dt):
+            def _na_full(t, args, _rt=na_rt, _tags=na_tags, _temp=na_temp, _u0=na_u0, _dt=na_dt, _masks=na_masks):
                 # Keep the raw shape: a scalar parameter stays 0-d; a field parameter (a nodal
                 # array) is threaded whole and gathered/interpolated per cell by feax (same as
                 # the steady non-affine route, fem_route.operator_fn). Scalarizing here would
@@ -1852,6 +1868,7 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
                     dtype=_dt,
                     runtime_parameter_tags=_tags,
                     runtime_parameter_values=values,
+                    region_mask_arrays=_masks,
                 )
                 return jnp.asarray(_dense_array(_rt["jac_bc"](_u0, iv)), dtype=_dt)
 

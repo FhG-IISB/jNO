@@ -31,7 +31,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .trace import FemLinearSystem, GaugePin, ModelCall, TestFunction, TrialFunction, Variable
+from .trace import FemLinearSystem, GaugePin, ModelCall, RegionMask, TestFunction, TrialFunction, Variable
 
 __all__ = ["fem", "FEM"]
 
@@ -296,8 +296,19 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
             tag = tag[2:]
         return _normalize_quad_tag(tag, _bregions)
 
+    def _effective_tag(v) -> str:
+        # A coord reused from an earlier jno.fem() call has its `.tag` already rebound to the quadrature
+        # pool ("fem_gauss" / "gauss_<tag>"); recover its original region from `_jno_region_tag` so a
+        # sub-region term is still detected on reuse (see `_retag_coords_for_quadrature`).
+        t = v.tag
+        if isinstance(t, str) and (t == "fem_gauss" or t.startswith("gauss_")):
+            return getattr(v, "_jno_region_tag", t)
+        return t
+
     tags = {
-        _region_of(v.tag) for v in _spatial_coord_vars(constraint) if isinstance(v.tag, str) and not v.tag.startswith("__")
+        _region_of(_effective_tag(v))
+        for v in _spatial_coord_vars(constraint)
+        if isinstance(_effective_tag(v), str) and not _effective_tag(v).startswith("__")
     }
     # The t=t0 slice is its own support; an IC residual lives here. A *velocity* IC `u.t(initial)-v0`
     # carries its region only on the temporal variable (the `.t` derivative drops the spatial bind),
@@ -317,6 +328,20 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
         )
     if boundary_tags:
         return "boundary", next(iter(boundary_tags))
+    # Interior sub-region (sub-domain) volume term: the coords carry a registered interior region --
+    # a geometry part (`_source_regions`) or a `domain.tag` predicate that is NOT a boundary region.
+    # The term integrates over that region's cells only (per-cell centroid mask, applied at assembly).
+    # The default whole-domain interior tags normalize to "volume", so they never match here.
+    src_regions = getattr(domain, "_source_regions", {}) or {}
+    tag_preds = getattr(domain, "_tag_predicates", {}) or {}
+    subregions = {t for t in interiorish if t in src_regions or (t in tag_preds and t not in _bregions)}
+    if len(subregions) > 1:
+        raise ValueError(
+            f"jno.fem: a volume residual spans multiple sub-regions {sorted(subregions)}; "
+            "each residual must live on a single region."
+        )
+    if subregions:
+        return "volume", next(iter(subregions))
     return "volume", "volume"
 
 
@@ -332,6 +357,12 @@ def _retag_coords_for_quadrature(constraint: Any, support: str, region_id: str) 
         # outward-normal Variables (`n_<region>`) are not quadrature coordinates -- leave their tag so a
         # `v·n` boundary term keeps the normal identifiable downstream.
         if isinstance(v.tag, str) and v.tag != "fem_gauss" and not v.tag.startswith(("gauss_", "n_")):
+            # Remember the region before rebinding to the quadrature pool. The retag must persist for
+            # lazy operators (nonlinear/transient re-read `.tag` at call time), but the SAME coord object
+            # is often reused in a later jno.fem() call, where region detection must still recover the
+            # original region -- `_region_and_support` reads `_jno_region_tag` when `.tag` is a quad tag.
+            if not hasattr(v, "_jno_region_tag"):
+                v._jno_region_tag = v.tag
             v.tag = target
 
 
@@ -1218,8 +1249,13 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             _retag_coords_for_quadrature(c, support, region)
             bare = _bare(c)
             if support == "volume":
+                if region != "volume":
+                    # Sub-domain term: multiply by the region's per-cell indicator so it integrates over
+                    # that region's cells only. Stays a plain volume term (whole-mesh quadrature); the
+                    # RegionMask zeroes the integrand outside the region (resolved in the FEAX kernel).
+                    bare = RegionMask(region) * bare
                 volume_terms.append(bare)
-                classification.append("volume")
+                classification.append("volume" if region == "volume" else f"volume@{region}")
             else:
                 boundary_terms.setdefault(region, []).append(bare)
                 classification.append(f"surface@{region}")
@@ -1286,6 +1322,11 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             )
         if _trial_spaces(constraints) - {"Lagrange"}:
             raise NotImplementedError("jno.fem: second-order-in-time (u_tt) is supported on nodal Lagrange elements only.")
+        if any(isinstance(n, RegionMask) for b in volume_terms for n in _walk(b)):
+            raise NotImplementedError(
+                "jno.fem per-region integration on a second-order-in-time problem is not wired yet — "
+                "sub-region terms are currently supported on steady problems only."
+            )
         return _assemble_second_order_time(
             domain,
             volume_terms,

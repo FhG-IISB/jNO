@@ -30,6 +30,7 @@ __all__ = [
     "Constant",
     "Variable",
     "TensorTag",
+    "RegionMask",
     "BinaryOp",
     "Tracker",
     "Model",
@@ -1260,6 +1261,24 @@ class TensorTag(Placeholder):
         if self.dim_index is not None:
             return f"Tensor({self.tag})[{self.dim_index}]"
         return f"Tensor({self.tag})"
+
+
+class RegionMask(Placeholder):
+    """Per-cell indicator for an interior sub-region, multiplied into a weak term by ``jno.fem`` so the
+    term integrates over that region's cells only.
+
+    A cell belongs to the region iff its **centroid** does -- classified once at assembly build time
+    against a geometry part (``domain._source_regions`` shapely polygon) or a ``domain.tag`` predicate
+    (concrete numpy/shapely, never traced). The FEAX volume kernel resolves it from a constant per-cell
+    ``volume_var``. It is a leaf (no children) and carries no coordinates, so it composes as a plain
+    scalar coefficient: ``RegionMask(region) * weak_term``.
+    """
+
+    def __init__(self, region: str):
+        self.region = str(region)
+
+    def __repr__(self):
+        return f"RegionMask({self.region})"
 
 
 class BinaryOp(Placeholder):

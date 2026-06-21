@@ -243,6 +243,43 @@ make it an inverse unknown — the next section.
 
 ---
 
+## Per-region (sub-domain) integration
+
+A weak term integrates over the **region of the coordinates it is written on** — exactly the rule that
+already routes boundary terms. Bind the trial/test to `domain.variable("interior")` and the term covers
+the whole domain; bind them to a **sub-region's** coordinates and the term integrates over that
+sub-domain's cells only. No new function — name a region with `domain.tag(name, predicate)` (or use a
+multi-part mesh's geometry parts) and ask for its coordinates with `domain.variable(name, split=True)`:
+
+```python
+d.tag("core", lambda x, y: (x - 0.5)**2 + (y - 0.5)**2 < 0.2**2)   # an interior sub-region
+xc, yc, _ = d.variable("core", split=True)
+uc, vc = u.bind(x=xc, y=yc), phi.bind(x=xc, y=yc)
+
+fem = jno.fem([
+    ui.x * vi.x + ui.y * vi.y,            # ∫_Ω   ∇u·∇v        (whole domain)
+    9.0 * (uc.x * vc.x + uc.y * vc.y),    # ∫_core 9 ∇u·∇v     (k = 1 outside, 10 inside `core`)
+    q * vc,                               # ∫_core q·v          (a localized source)
+    u(xb, yb) - 0.0,
+])
+```
+
+Multi-material conduction is then *one term per material* (each on its region's coordinates); a
+data-fit / QoI confined to a region is `(uc - u_data) * vc`. A cell belongs to a region iff its
+**centroid** does (classified once at assembly — exact when the mesh respects the region boundaries,
+e.g. gmsh meshing each part separately; for an arbitrary predicate on a non-conforming mesh it is
+centroid-accurate, O(h) at the interface). Region integration is a scalar mask on the integrand, so it
+**composes with everything**: constant / `jno.fn` / `.freeze()` / trainable coefficients, and the
+steady-linear, nonlinear, transient, coupled (multi-field), and 3-D forms. In particular a
+`jno.np.parameter` that multiplies a sub-region term is recovered **per sub-domain** through `crux` —
+fit a per-material property on its own region (see *Inverse problems*).
+
+> Not yet wired: second-order-in-time (`u_tt`) sub-region terms — they fail loud rather than silently
+> integrate over the whole domain. 3-D sub-regions are defined by a predicate `where(x, y, z)`
+> (shapely polygons are planar).
+
+---
+
 ## Differentiable solve & inverse problems
 
 `fem.solve()` is the **differentiable forward solve as a trace node** — the entry point for

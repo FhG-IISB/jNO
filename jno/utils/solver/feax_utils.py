@@ -28,6 +28,7 @@ from ...trace import (
     ModelCall,
     OperationCall,
     OperationDef,
+    RegionMask,
     StateField,
     TensorTag,
     TestFunction,
@@ -526,6 +527,57 @@ def _collect_runtime_parameter_tags_for_feax(node, out=None):
     return out
 
 
+def _collect_region_mask_names(node, out=None):
+    """Sorted-unique region names appearing as ``RegionMask`` leaves in a lowered expression/IR.
+
+    Used so the volume kernel knows the per-cell mask layout and the assembler builds the matching
+    masks (see ``_cell_region_mask``). Order is fixed by sorting so kernel and assembler agree."""
+    if out is None:
+        out = set()
+    if isinstance(node, RegionMask):
+        out.add(node.region)
+    for child in iter_children(node) or ():
+        _collect_region_mask_names(child, out)
+    return out
+
+
+def _cell_region_mask(domain, region):
+    """``(num_cells,)`` 0/1 indicator: a mesh cell is in ``region`` iff its **centroid** is.
+
+    ``region`` is a geometry part (``domain._source_regions`` shapely polygon) or a ``domain.tag``
+    predicate. Concrete (numpy/shapely), built once per assembly -- exact when the mesh respects the
+    region boundaries (gmsh meshes each part separately, so no cell straddles a material interface).
+
+    Classifies against the **assembly mesh** (the cell order the FEAX kernel vmaps over, stashed by
+    ``_build_feax_problem``) so the per-cell mask aligns with the kernel's cells; falls back to the
+    domain mesh only if no assembly mesh is recorded yet."""
+    dim = int(domain.dimension)
+    a_pts = getattr(domain, "_fem_assembly_points", None)
+    a_cells = getattr(domain, "_fem_assembly_cells", None)
+    if a_pts is not None and a_cells is not None:
+        pts = np.asarray(a_pts)[:, :dim]
+        cells = np.asarray(a_cells)
+    else:
+        mesh = domain.mesh
+        pts = np.asarray(mesh.points)[:, :dim]
+        cells = np.asarray(mesh.cells_dict["triangle" if dim == 2 else "tetra"])
+    centroids = pts[cells].mean(axis=1)  # (num_cells, dim)
+    src = getattr(domain, "_source_regions", {}) or {}
+    preds = getattr(domain, "_tag_predicates", {}) or {}
+    if region in src:
+        from shapely import contains_xy
+
+        m = np.asarray(contains_xy(src[region], centroids[:, 0], centroids[:, 1]))
+    elif region in preds:
+        m = np.asarray(preds[region](*[centroids[:, i] for i in range(dim)]))
+    else:
+        raise ValueError(
+            f"jno.fem per-region integration: unknown region {region!r}. Define it with "
+            f"domain.tag(name, predicate) or as a geometry part (domain._source_regions)."
+        )
+    return np.asarray(m, dtype=bool).astype(np.float64)
+
+
 def _collect_temporal_tags_for_feax(node, out=None):
     """
     Collect temporal Variable tags used inside FEAX kernels.
@@ -807,6 +859,7 @@ def _eval_expr_for_feax(domain, node, local):
             Literal,
             Constant,
             TensorTag,
+            RegionMask,
             Variable,
             TestFunction,
             TrialFunction,
@@ -826,6 +879,25 @@ def _eval_expr_for_feax(domain, node, local):
 
     if isinstance(node, Constant):
         return jnp.asarray(node.value)
+
+    if isinstance(node, RegionMask):
+        # Per-cell sub-region indicator: read the current cell's 0/1 value from the constant per-cell
+        # volume_var packed AFTER the temporal + runtime-parameter slots. Fail loud (never silently
+        # integrate over the whole domain) if this assembly path did not thread the mask.
+        mask_names = local.get("region_mask_names", ())
+        volume_vars = local.get("volume_vars", ())
+        idx = (
+            len(local.get("temporal_tags", ()))
+            + len(local.get("runtime_parameter_tags", ()))
+            + (list(mask_names).index(node.region) if node.region in mask_names else -1)
+        )
+        if node.region not in mask_names or idx >= len(volume_vars):
+            raise NotImplementedError(
+                f"jno.fem per-region integration: the per-cell mask for region '{node.region}' was not "
+                f"threaded into this assembly path. Sub-region terms are currently wired for the steady "
+                f"linear single-field path; nonlinear / transient / multifield / parametric are not yet."
+            )
+        return jnp.reshape(jnp.asarray(volume_vars[idx]), (-1,))[0]
 
     if isinstance(node, TensorTag):
         if node.tag not in local["domain_context"]:
@@ -1032,6 +1104,7 @@ def _eval_volume_integrand(
     cell_v_grads_JxW,
     temporal_tags,
     runtime_parameter_tags,
+    region_mask_names,
     problem_ref,
     *cell_internal_vars,
 ):
@@ -1061,6 +1134,7 @@ def _eval_volume_integrand(
         "trial_vec": vec,
         "temporal_tags": tuple(temporal_tags),
         "runtime_parameter_tags": tuple(runtime_parameter_tags),
+        "region_mask_names": tuple(region_mask_names),
         "volume_vars": tuple(cell_internal_vars),
     }
 
@@ -1191,7 +1265,9 @@ def _eval_surface_integrand(
     return ravel_pytree(jnp.sum(weighted, axis=0))[0]
 
 
-def _make_universal_volume_kernel(domain, expr, value_shape, temporal_tags, runtime_parameter_tags, problem_ref):
+def _make_universal_volume_kernel(
+    domain, expr, value_shape, temporal_tags, runtime_parameter_tags, region_mask_names, problem_ref
+):
     """
     Create the FEAX universal volume kernel for a lowered weak-form expression.
     """
@@ -1215,6 +1291,7 @@ def _make_universal_volume_kernel(domain, expr, value_shape, temporal_tags, runt
             cell_v_grads_JxW,
             temporal_tags,
             runtime_parameter_tags,
+            region_mask_names,
             problem_ref,
             *cell_internal_vars,
         )
@@ -1229,6 +1306,7 @@ def _eval_multifield_volume_integrand(
     field_index,
     temporal_tags,
     runtime_parameter_tags,
+    region_mask_names,
     problem_ref,
     cell_sol_flat,
     physical_quad_points,
@@ -1271,6 +1349,7 @@ def _eval_multifield_volume_integrand(
         "domain_context": domain.context,
         "temporal_tags": tuple(temporal_tags),
         "runtime_parameter_tags": tuple(runtime_parameter_tags),
+        "region_mask_names": tuple(region_mask_names),
         "volume_vars": tuple(cell_internal_vars),
     }
 
@@ -1285,7 +1364,7 @@ def _eval_multifield_volume_integrand(
 
 
 def _make_multifield_volume_kernel(
-    domain, term_list, fields, field_index, temporal_tags, runtime_parameter_tags, problem_ref
+    domain, term_list, fields, field_index, temporal_tags, runtime_parameter_tags, region_mask_names, problem_ref
 ):
     """FEAX universal volume kernel for a coupled (multi-field) weak form."""
 
@@ -1297,6 +1376,7 @@ def _make_multifield_volume_kernel(
             field_index,
             temporal_tags,
             runtime_parameter_tags,
+            region_mask_names,
             problem_ref,
             cell_sol_flat,
             physical_quad_points,
@@ -1685,9 +1765,15 @@ def _build_multifield_feax_problem(domain, ir, fields, field_index, *, apply_dir
     temporal_tags = tuple(sorted(temporal_tags))
     runtime_parameter_tags = tuple(runtime_parameter_tags)
 
+    # Sub-region (RegionMask) masks used by the coupled volume coefficients, in the fixed sorted order
+    # the InternalVars builder packs them (see _region_mask_arrays_for_domain). Recorded on the domain
+    # so _assemble_fem_system_concrete threads the matching per-cell masks.
+    region_mask_names = tuple(sorted({r for coeff, _tfi in term_list for r in _collect_region_mask_names(coeff)}))
+    domain._fem_region_mask_order = region_mask_names
+
     problem_ref: dict[str, Any] = {"problem": None}
     kernel = _make_multifield_volume_kernel(
-        domain, term_list, fields, field_index, temporal_tags, runtime_parameter_tags, problem_ref
+        domain, term_list, fields, field_index, temporal_tags, runtime_parameter_tags, region_mask_names, problem_ref
     )
 
     # Coupled surface (Neumann/Robin) terms: one universal surface kernel per boundary
@@ -1827,6 +1913,11 @@ def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_do
         quad_degree = 2
 
     mesh = _build_feax_mesh(domain, element_type)
+    # Stash the actual assembly mesh (the cell order the kernel vmaps over) so per-region masks are
+    # classified against *these* cells, not domain.mesh -- the two can differ (P2 promotion, or the
+    # domain mesh being finalized later), which would misalign the mask with the kernel's cells.
+    domain._fem_assembly_points = np.asarray(mesh.points)
+    domain._fem_assembly_cells = np.asarray(mesh.cells)
 
     temporal_tags_set = set()
     if volume_expr is not None:
@@ -1841,6 +1932,14 @@ def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_do
     for expr in boundary_exprs.values():
         _collect_runtime_parameter_tags_for_feax(expr, runtime_parameter_tags_set)
     runtime_parameter_tags = tuple(runtime_parameter_tags_set)
+
+    # Per-region (sub-domain) terms carry a RegionMask leaf; the kernel reads a constant per-cell mask
+    # for each region, in this fixed (sorted) order. Collected from the volume form only -- masks are a
+    # volume-integration concept (a boundary term is already restricted to its facets).
+    region_mask_names = tuple(sorted(_collect_region_mask_names(volume_expr))) if volume_expr is not None else ()
+    # Record the order so every InternalVars builder (steady, nonlinear, transient, parametric) packs
+    # the matching per-cell masks in the same slots the kernel reads (_region_mask_arrays_for_domain).
+    domain._fem_region_mask_order = region_mask_names
 
     problem_ref: dict[str, Any] = {"problem": None}
 
@@ -1868,6 +1967,7 @@ def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_do
             value_shape,
             temporal_tags,
             runtime_parameter_tags,
+            region_mask_names,
             problem_ref,
         )
     else:
@@ -1931,6 +2031,30 @@ def _dense_array(A):
         return jnp.asarray(np.asarray(A))
 
 
+def _region_mask_arrays_for_domain(domain):
+    """Per-cell sub-region masks for the regions this domain's FEM problem uses, in the kernel's fixed
+    (sorted) order -- the order ``_build_feax_problem`` recorded in ``domain._fem_region_mask_order``.
+
+    Each is a constant ``(num_cells, 1)`` 0/1 array (feax slices a scalar per cell). Cached per region
+    on the domain (depends only on the mesh + region geometry), so transient steps and parametric
+    re-evaluations don't rebuild them. Returns ``()`` when the problem has no sub-region terms."""
+    names = tuple(getattr(domain, "_fem_region_mask_order", ()) or ())
+    if not names:
+        return ()
+    a_cells = getattr(domain, "_fem_assembly_cells", None)
+    n_cells = int(np.asarray(a_cells).shape[0]) if a_cells is not None else None
+    cache = getattr(domain, "_fem_region_mask_cache", None)
+    if cache is None or cache.get("__ncells__") != n_cells:  # invalidate if the assembly mesh changed
+        cache = {"__ncells__": n_cells}
+        domain._fem_region_mask_cache = cache
+    out = []
+    for r in names:
+        if r not in cache:
+            cache[r] = jnp.asarray(_cell_region_mask(domain, r), dtype=_default_float_dtype()).reshape(-1, 1)
+        out.append(cache[r])
+    return tuple(out)
+
+
 def _make_internal_vars(
     fe_module,
     temporal_tags,
@@ -1940,12 +2064,16 @@ def _make_internal_vars(
     dtype=None,
     runtime_parameter_tags=(),
     runtime_parameter_values=None,
+    region_mask_arrays=(),
     extra_volume_vars=(),
 ):
     """
     Build FEAX InternalVars in a batched shape FEAX can slice.
 
-    Each temporal variable is broadcast to shape (n_cells, 1).
+    Volume-var layout (the order every kernel's ``local`` indexing assumes):
+    ``[ temporal ... , runtime_parameter ... , region_mask ... , extra ... ]``. Each temporal variable
+    is broadcast to shape (n_cells, 1); region masks are constant per-cell arrays (see
+    ``_region_mask_arrays_for_domain``) so any path that threads them gets per-region integration.
     """
     vol = []
 
@@ -1965,6 +2093,9 @@ def _make_internal_vars(
             # field parameter (node- or cell-based) -> pass the global array through;
             # feax's gather_internal_vars slices it per cell, the kernel interpolates.
             vol.append(flat)
+    # Sub-region masks, after the runtime parameters (matches the evaluator's RegionMask index).
+    for m in region_mask_arrays:
+        vol.append(jnp.asarray(m, dtype=dtype).reshape(int(n_cells), 1))
     for v in extra_volume_vars:
         arr = jnp.asarray(v, dtype=dtype)
         if arr.ndim == 0:
