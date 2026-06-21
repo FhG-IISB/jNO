@@ -27,12 +27,10 @@ G, mu, H, Lx = 1.0, 1.0, 1.0, 4.0
 u_profile = lambda y: (G / (2.0 * mu)) * y * (H - y)  # noqa: E731
 
 d = jno.domain(box(0.0, 0.0, Lx, H), mesh_size=0.2)
-d.point_region("ppin", (0.0, 0.0))  # pin the pressure at one vertex (p = -G x = 0 there)
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)  # P2 velocity
 p, q = d.fem_symbols(names=("p", "q"), order=1)  # P1 pressure
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
-xpn, ypn, _ = d.variable("ppin", split=True)
 gu, gv = grad(u, [xi, yi]), grad(v, [xi, yi])
 pp, qq = p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
 
@@ -43,7 +41,7 @@ fem = jno.fem(
         -qq * trace(gu),
         u(xb, yb)[0] - u_profile(yb),
         u(xb, yb)[1] - 0.0,
-        p(xpn, ypn) - 0.0,
+        p.pin(),  # gauge-fix: remove the pressure null space
     ]
 )
 

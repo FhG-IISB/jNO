@@ -71,14 +71,6 @@ def get_activation(name: str) -> Optional[Callable]:
 
 
 # ---------------------------------------------------------------------------
-# Flax → Equinox shims  (DEPRECATED — kept only for old checkpoint compat)
-# ---------------------------------------------------------------------------
-# FlaxModelWrapper and FlaxNNXWrapper have been removed from the runtime.
-# All foundation models in foundax are now Equinox-native.
-# If you need to load a legacy Flax checkpoint, convert it offline first.
-
-
-# ---------------------------------------------------------------------------
 # Fourier-mode computation (used by GeoFNO and PCNO)
 # ---------------------------------------------------------------------------
 

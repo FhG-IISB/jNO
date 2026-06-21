@@ -44,7 +44,7 @@ from .feax_utils import (
     _make_internal_vars,
     _prepare_feax_runtime,
     _zero_forcing_dirichlet_rows,
-    _zero_mass_dirichlet_rows,
+    _zero_mass_dirichlet_rows_sparse,
 )
 from .parametric_helpers import (
     _clone_term_with_coeff,
@@ -1725,15 +1725,17 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
 
         M_sys, _bM = _assemble_fem_system_from_ir(domain, mass_ir)
         # Zero the mass's Dirichlet rows/cols so M u̇ + A u = c reads u[d]=g there (feax
-        # leaves identity rows, which only happens to be right for homogeneous g).
-        M = _zero_mass_dirichlet_rows(_dense_array(M_sys), domain._feax_bc)
+        # leaves identity rows, which only happens to be right for homogeneous g). Kept as a
+        # BCOO operator (matrix-free matvec, O(nnz) memory); the periodic / no-static-operator
+        # branches below densify when they need a dense matrix.
+        M = _zero_mass_dirichlet_rows_sparse(M_sys, domain._feax_bc)
         full_size = int(M.shape[0])
         static_op_ir, operator_parameter_irs, operator_parameter_exprs, nonaffine_op_ir = _split_parametric_operator_ir(
             op_ir, allow_nonaffine=True
         )
         if len(static_op_ir.terms) > 0:
             A0_sys, bA0 = _assemble_fem_system_from_ir(domain, static_op_ir)
-            A = _dense_array(A0_sys)
+            A = A0_sys  # keep BCOO (matrix-free); densified only by the periodic branch / consumers
             affine_bias = jnp.asarray(bA0).reshape(-1)
         elif len(operator_parameter_irs) > 0 and len(nonaffine_op_ir.terms) == 0:
             # Fully-parametric *affine* operator (no static term): the per-parameter bases
@@ -1756,9 +1758,11 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
             # *value* itself stays unsupported.)
             zero_basis_ir = _make_zero_ir_like(next(iter(operator_parameter_irs.values())))
             A0_sys, bA0 = _assemble_fem_system_from_ir(domain, zero_basis_ir)
-            A = jnp.asarray(_dense_array(A0_sys))
+            A = A0_sys  # BCOO static base; the parametric operator_fn adds dense bases per step
             affine_bias = jnp.asarray(bA0).reshape(-1)
         else:
+            # No static spatial operator (degenerate / fully runtime-assembled): fall back to dense.
+            M = _dense_array(M)
             A = jnp.zeros_like(M)
             affine_bias = jnp.zeros((M.shape[0],), dtype=M.dtype)
 
@@ -1792,8 +1796,9 @@ def _assemble_feax_time_from_ir(domain, ir, **kwargs) -> FeaxTimeBlock:
         if P_block is not None:
             from .feax_utils import reduce_matrix, reduce_vector, restrict_state
 
-            M = reduce_matrix(P_block, M)
-            A = reduce_matrix(P_block, A)
+            # Periodic reduction P^T (·) P is a dense path: densify the BCOO operators first.
+            M = reduce_matrix(P_block, _dense_array(M))
+            A = reduce_matrix(P_block, _dense_array(A))
             affine_bias = reduce_vector(P_block, affine_bias)
             operator_basis = {name: reduce_matrix(P_block, K) for name, K in operator_basis.items()}
             op_lift_basis = {name: reduce_vector(P_block, v) for name, v in op_lift_basis.items()}

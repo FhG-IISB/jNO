@@ -7,7 +7,6 @@ time routing, and solver adapters.
 
 from .backend_blocks import (
     DiffraxBlock,
-    FeaxPipelineBlock,
     FeaxTimeBlock,
 )
 from .fem_route import (
@@ -34,10 +33,6 @@ from .solver_helper import (
     max_temporal_derivative_order,
     sum_terms,
     unique_by_id,
-)
-from .time_adapters import (
-    make_diffrax_block,
-    make_feax_pipeline,
 )
 from .weak_form import (
     LoweredChannelTerm,
@@ -77,8 +72,5 @@ __all__ = [
     "assemble_weak_form",
     "DiffraxBlock",
     "FeaxTimeBlock",
-    "FeaxPipelineBlock",
-    "make_diffrax_block",
-    "make_feax_pipeline",
     "split_weak_additive_terms",
 ]

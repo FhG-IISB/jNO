@@ -9,7 +9,8 @@ import equinox as eqx
 import jax
 
 all_true = jax.tree_util.tree_map(lambda _: True, eqx.filter(net.module, eqx.is_array))
-net.mask(all_true).optimizer(optax.adam, lr=lrs(1e-4))
+net.mask(all_true).optimizer(optax.adam)
+net.mask(all_true).scale(lrs(1e-4))
 ```
 
 ### Regex-style targeting
@@ -39,7 +40,8 @@ def regex_mask(module, pattern: str):
     return jax.tree_util.tree_unflatten(treedef, leaves)
 
 decoder_mask = regex_mask(net.module, r"decoder")
-net.mask(decoder_mask).optimizer(optax.adam, lr=lrs(3e-4))
+net.mask(decoder_mask).optimizer(optax.adam)
+net.mask(decoder_mask).scale(lrs(3e-4))
 ```
 
 ## Freeze / Unfreeze

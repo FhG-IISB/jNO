@@ -86,7 +86,7 @@ class TestMultiConstraintLosses:
     def test_per_constraint_losses_have_correct_shape(self):
         """With 2 constraints, losses.shape == (n_logged, 2) — 2 columns regardless of epochs."""
         solver, u_net = _make_pde_bc_solver()
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         stats = solver.solve(20)
         losses = stats.training_logs[-1]["losses"]
         assert losses.ndim == 2, f"Expected 2D losses array, got shape {losses.shape}"
@@ -96,7 +96,7 @@ class TestMultiConstraintLosses:
     def test_per_constraint_losses_are_finite_and_positive(self):
         """Every per-constraint loss at every epoch must be finite and > 0."""
         solver, u_net = _make_pde_bc_solver()
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         stats = solver.solve(10)
         losses = stats.training_logs[-1]["losses"]
         assert jnp.all(jnp.isfinite(losses)), "Some per-constraint losses are NaN/Inf"
@@ -105,7 +105,7 @@ class TestMultiConstraintLosses:
     def test_total_loss_equals_mean_of_per_constraint(self):
         """total_loss at every epoch must equal mean(losses, axis=1)."""
         solver, u_net = _make_pde_bc_solver()
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         stats = solver.solve(10)
         logs = stats.training_logs[-1]
         computed = jnp.mean(jnp.array(logs["losses"]), axis=1)
@@ -116,7 +116,7 @@ class TestMultiConstraintLosses:
     def test_per_constraint_losses_decrease_over_training(self):
         """Both PDE loss and BC loss should fall over 300 epochs."""
         solver, u_net = _make_pde_bc_solver(hidden_dims=32, num_layers=3)
-        u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.9, 100))
+        u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.9, 100))
         stats = solver.solve(300)
         losses = stats.training_logs[-1]["losses"]
         pde_loss = losses[:, 0]
@@ -135,11 +135,11 @@ class TestEarlyStoppingCallback:
     def test_early_stopping_halts_before_max_epochs(self):
         """With patience=5 and a converged loss, training stops well before 500."""
         solver, u_net = _make_simple_solver()
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         solver.solve(50)
         # min_delta=1e-5 means per-epoch improvements below ~1e-5 don't count.
         # With lr=1e-7 Adam steps are O(1e-7), well below that threshold.
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-7))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-7))
         cb = EarlyStoppingCallback(patience=5, min_delta=1e-5, mode="min")
         solver.solve(epochs=500, callbacks=[cb])
         assert cb.has_stopped, "EarlyStoppingCallback never triggered"
@@ -149,9 +149,9 @@ class TestEarlyStoppingCallback:
     def test_early_stopping_stopped_epoch_consistent_with_log_length(self):
         """Number of logged epochs must not exceed stopped_epoch + small buffer."""
         solver, u_net = _make_simple_solver()
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         solver.solve(30)
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-7))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-7))
         cb = EarlyStoppingCallback(patience=3, min_delta=1e-5, mode="min")
         stats = solver.solve(epochs=500, callbacks=[cb])
         n_logged = len(stats.training_logs[-1]["epoch"])
@@ -162,11 +162,11 @@ class TestEarlyStoppingCallback:
     def test_early_stopping_best_metric_is_minimum_observed(self):
         """best_metric must be <= initial loss (loss only decreases or stays)."""
         solver, u_net = _make_simple_solver()
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         stats = solver.solve(10)
         initial_loss = float(stats.training_logs[-1]["total_loss"][0])
 
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-7))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-7))
         cb = EarlyStoppingCallback(patience=3, min_delta=1e-5, mode="min")
         solver.solve(50, callbacks=[cb])
         assert cb.best_metric is not None
@@ -178,7 +178,7 @@ class TestGradientNormsCallback:
     def test_gradient_norms_result_has_correct_shape(self):
         """result['norms'] shape must be (n_samples, n_constraints)."""
         solver, u_net = _make_pde_bc_solver()
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         cb = GradientNormsCallback(interval=2)
         solver.solve(epochs=6, callbacks=[cb])
         result = cb.result
@@ -190,7 +190,7 @@ class TestGradientNormsCallback:
     def test_gradient_norms_values_are_finite_and_nonneg(self):
         """All computed gradient norms must be finite and >= 0."""
         solver, u_net = _make_pde_bc_solver()
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         cb = GradientNormsCallback(interval=1)
         solver.solve(epochs=4, callbacks=[cb])
         norms = cb.result["norms"]
@@ -200,7 +200,7 @@ class TestGradientNormsCallback:
     def test_gradient_norms_epochs_match_interval(self):
         """result['epochs'] must record every `interval`-th epoch."""
         solver, u_net = _make_pde_bc_solver()
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         cb = GradientNormsCallback(interval=2)
         solver.solve(epochs=8, callbacks=[cb])
         recorded = cb.result["epochs"]
@@ -216,7 +216,7 @@ class TestCheckpointCallback:
         pytest.importorskip("orbax.checkpoint", reason="orbax-checkpoint not installed")
 
         solver, u_net = _make_simple_solver()
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         from jno.utils.adaptive.callbacks import CheckpointCallback
 
         cb = CheckpointCallback(
@@ -243,7 +243,7 @@ class TestCheckpointCallback:
         ocp = pytest.importorskip("orbax.checkpoint", reason="orbax-checkpoint not installed")
 
         solver, u_net = _make_simple_solver()
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         from jno.utils.adaptive.callbacks import CheckpointCallback
 
         cb = CheckpointCallback(
@@ -315,7 +315,7 @@ class TestResamplingCorrectness:
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x]) - jnn.sin(jnn.pi * x)
         solver = jno.core([pde])
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         solver.solve(epochs=5)
 
         points_after = np.array(domain.context["interior"])
@@ -334,7 +334,7 @@ class TestResamplingCorrectness:
         u = u_net(x) * x * (1 - x)
         pde = jnn.laplacian(u, [x]) - jnn.sin(jnn.pi * x)
         solver = jno.core([pde])
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         solver.solve(epochs=5)
 
         n_after = domain.context["interior"].shape[-2]
@@ -459,7 +459,7 @@ class TestStatisticsCorrectness:
     def test_epoch_indices_are_sequential(self):
         """Logged epoch indices must be strictly increasing integers."""
         solver, u_net = _make_simple_solver()
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         # 100 epochs produces ~11 log entries (print_rate=10); enough to verify ordering
         stats = solver.solve(100)
         epochs = stats.training_logs[-1]["epoch"]
@@ -471,7 +471,7 @@ class TestStatisticsCorrectness:
     def test_total_loss_is_always_finite(self):
         """total_loss must be finite at every logged epoch."""
         solver, u_net = _make_simple_solver()
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         stats = solver.solve(20)
         total_loss = stats.training_logs[-1]["total_loss"]
         assert jnp.all(jnp.isfinite(jnp.array(total_loss))), "total_loss contains NaN or Inf"
@@ -479,26 +479,26 @@ class TestStatisticsCorrectness:
     def test_multiple_solve_calls_accumulate_logs(self):
         """Calling solve() twice must produce two separate training_log entries."""
         solver, u_net = _make_simple_solver()
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         solver.solve(10)
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         stats = solver.solve(10)
         assert len(stats.training_logs) == 2, f"Expected 2 log entries, got {len(stats.training_logs)}"
 
     def test_total_epochs_accumulate_across_solve_calls(self):
         """solver._total_epochs must accumulate across multiple solve() calls."""
         solver, u_net = _make_simple_solver()
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         solver.solve(10)
         assert solver._total_epochs == 10
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         solver.solve(10)
         assert solver._total_epochs == 20
 
     def test_timestamps_are_monotonically_non_decreasing(self):
         """Wall-clock timestamps must be non-decreasing across epochs."""
         solver, u_net = _make_simple_solver()
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         stats = solver.solve(20)
         ts = np.array(stats.training_logs[-1]["timestamps"])
         assert np.all(ts[1:] >= ts[:-1]), "Timestamps are not monotonically non-decreasing"
@@ -506,7 +506,7 @@ class TestStatisticsCorrectness:
     def test_trainable_param_count_matches_model_leaf_count(self):
         """trainable_params logged by solve() must match actual model parameter count."""
         solver, u_net = _make_simple_solver()
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         stats = solver.solve(1)
         logged = stats.training_logs[-1]["trainable_params"]
         expected = sum(leaf.size for leaf in jax.tree_util.tree_leaves(eqx.filter(u_net.module, eqx.is_inexact_array)))
@@ -515,7 +515,7 @@ class TestStatisticsCorrectness:
     def test_frozen_params_zero_for_fully_trainable_model(self):
         """When no freezing is applied, frozen_params must be 0."""
         solver, u_net = _make_simple_solver()
-        u_net.optimizer(optax.adam, lr=lrs.constant(1e-3))
+        u_net.optimizer(optax.adam).scale(lrs.constant(1e-3))
         stats = solver.solve(1)
         assert stats.training_logs[-1]["frozen_params"] == 0, "Expected 0 frozen params for a fully trainable model"
 

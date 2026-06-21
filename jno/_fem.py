@@ -29,12 +29,44 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .trace import FemLinearSystem, TestFunction, TrialFunction, Variable
+from .trace import FemLinearSystem, GaugePin, ModelCall, TestFunction, TrialFunction, Variable
 
 __all__ = ["fem", "FEM"]
 
+
+def _as_dense(x):
+    """Densify a feax/BCOO matrix to a plain JAX array (no-op if already dense)."""
+    return jnp.asarray(x.todense()) if hasattr(x, "todense") else jnp.asarray(x)
+
+
+def _as_flat(x):
+    """Flatten a nodal vector to a 1-D JAX array."""
+    return jnp.asarray(x).reshape(-1)
+
+
 # Component names feax uses for per-component (roller/symmetry) Dirichlet specs.
 _COMPONENT_NAMES = {0: "x", 1: "y", 2: "z"}
+
+
+def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000):
+    """Default steady-linear solve: matrix-free BiCGStab straight on the feax BCOO operator.
+
+    Never forms the dense ``N x N`` matrix — each iteration is a couple of sparse matvecs
+    ``A @ v`` (cost ``O(nnz)``), so memory stays ``O(nnz)`` and the solve runs at sizes where
+    a dense factorisation would not fit. BiCGStab (unlike CG) handles **general** linear
+    systems — symmetric *or* not — so it is a safe library default. Raises if it fails to
+    converge, so a hard / ill-posed system fails loudly instead of returning garbage; pass a
+    ``solve_fn`` to :meth:`FEM.solve` to choose your own solver in that case.
+    """
+    matvec = lambda v: A @ v
+    u, _info = jax.scipy.sparse.linalg.bicgstab(matvec, b, tol=tol, atol=0.0, maxiter=maxiter)
+    rel = float(jnp.linalg.norm(b - matvec(u)) / (jnp.linalg.norm(b) + 1e-30))
+    if not np.isfinite(rel) or rel > 1e-4:
+        raise RuntimeError(
+            f"fem.solve default (matrix-free BiCGStab) did not converge (relative residual "
+            f"{rel:.1e}). Pass your own solver, e.g. fem.solve(solve_fn=lambda A, b: ...)."
+        )
+    return u
 
 
 # ---------------------------------------------------------------------------
@@ -98,6 +130,16 @@ def _contains(constraint: Any, cls) -> bool:
     return contains_node_type(_bare(constraint), cls)
 
 
+def _contains_network_trial(constraint: Any) -> bool:
+    """True if a constraint embeds a *network* ModelCall (e.g. ``u = net(x, y)``) — the VPINN signal.
+
+    Excludes zero-arg runtime parameters (``jno.np.parameter(...)``, scalar or FEM field): a weak form with a
+    trainable *coefficient* parameter is an ordinary (runtime-parametric) FE system, not a network-trial VPINN."""
+    from .utils.solver.parametric_helpers import _is_runtime_scalar_parameter
+
+    return any(isinstance(n, ModelCall) and not _is_runtime_scalar_parameter(n) for n in _walk(_bare(constraint)))
+
+
 def _discover_domain(constraints: List[Any]):
     for c in constraints:
         for v in _spatial_coord_vars(c):
@@ -108,6 +150,40 @@ def _discover_domain(constraints: List[Any]):
         "jno.fem: could not discover a domain from the constraints. "
         "Author the weak form with coordinates from domain.variable(...)."
     )
+
+
+def _lower_gauge_pin(pin: GaugePin) -> Any:
+    """Lower a ``p.pin()`` marker to a single-node Dirichlet residual ``field(node) - value``.
+
+    Picks a deterministic vertex (nearest the mesh min-corner) and reuses
+    ``domain.point_region`` + ``domain.variable``, so the synthesized residual is identical to a
+    hand-written ``p(xpn, ypn) - value`` -- the value side is the literal constant, so the
+    transient route treats it as a plain (time-independent) Dirichlet at every step. The pin's
+    coordinate Variables are cached per (domain, field) so a second ``jno.fem(...)`` on the same
+    domain neither re-registers the region nor re-samples (the cached vars are Dirichlet-only and
+    never retagged, so reuse is safe).
+    """
+    import numpy as _np
+
+    field = pin.field
+    domain = getattr(field, "_domain", None)
+    if domain is None:
+        raise ValueError(
+            "jno.fem: p.pin() needs a field from domain.fem_symbols(...); the pinned symbol carries no domain."
+        )
+    dim = int(domain.dimension)
+    # Single leading underscore (not "__...__"): the pin node is a genuine single-vertex boundary
+    # region that `_region_and_support` must SEE, so its tag must not match the reserved
+    # double-underscore filter that hides internal/temporal tags from region detection.
+    tag = f"_gauge_pin_{field.field_key}"
+    cache = domain.__dict__.setdefault("_gauge_pin_coords", {})
+    if tag not in cache:
+        pts = _np.asarray(domain.mesh.points)[:, :dim]
+        target = pts.min(axis=0)  # deterministic gauge node: the mesh min-corner vertex
+        domain.point_region(tag, target)
+        cache[tag] = domain.variable(tag, split=True)
+    spatial = cache[tag][:dim]
+    return field(*spatial) - pin.value
 
 
 def _infer_vec(constraints: List[Any]) -> int:
@@ -133,6 +209,13 @@ def _infer_order(constraints: List[Any]) -> int:
     """Max element polynomial order across the trial fields (P1=1, P2=2)."""
     orders = [int(getattr(n, "order", 1)) for c in constraints for n in _walk(_bare(c)) if isinstance(n, TrialFunction)]
     return max(orders) if orders else 1
+
+
+def _trial_spaces(constraints: List[Any]) -> set:
+    """Distinct element families declared across the trial fields (default ``"Lagrange"``)."""
+    return {
+        str(getattr(n, "space", "Lagrange")) for c in constraints for n in _walk(_bare(c)) if isinstance(n, TrialFunction)
+    }
 
 
 def _element_for(dimension: int, order: int) -> str:
@@ -203,10 +286,16 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
     single region.
     """
     _bregions = getattr(domain, "_boundary_regions", {})
+
+    def _region_of(tag: str) -> str:
+        # an outward-normal Variable `n_<region>` (from domain.variable(region, normals=True)) belongs
+        # to its region, not a separate one -- so `g*(v·n)` on a boundary is a single-region term.
+        if tag.startswith("n_") and tag[2:] in _bregions:
+            tag = tag[2:]
+        return _normalize_quad_tag(tag, _bregions)
+
     tags = {
-        _normalize_quad_tag(v.tag, _bregions)
-        for v in _spatial_coord_vars(constraint)
-        if isinstance(v.tag, str) and not v.tag.startswith("__")
+        _region_of(v.tag) for v in _spatial_coord_vars(constraint) if isinstance(v.tag, str) and not v.tag.startswith("__")
     }
     # The t=t0 slice is its own support; an IC residual lives here.
     if "initial" in tags:
@@ -232,7 +321,9 @@ def _retag_coords_for_quadrature(constraint: Any, support: str, region_id: str) 
     """
     target = "fem_gauss" if support == "volume" else f"gauss_{region_id}"
     for v in _spatial_coord_vars(constraint):
-        if isinstance(v.tag, str) and v.tag != "fem_gauss" and not v.tag.startswith("gauss_"):
+        # outward-normal Variables (`n_<region>`) are not quadrature coordinates -- leave their tag so a
+        # `v·n` boundary term keeps the normal identifiable downstream.
+        if isinstance(v.tag, str) and v.tag != "fem_gauss" and not v.tag.startswith(("gauss_", "n_")):
             v.tag = target
 
 
@@ -462,6 +553,35 @@ def _dirichlet_spec(bare: Any) -> Tuple[Optional[int], Any, Any]:
     return comp, _value_from_node(value_node), value_node
 
 
+def _normal_flux_spec(constraint: Any, domain: Any) -> Optional[Tuple[Any, str, Any]]:
+    """Recognise an essential **normal-flux** BC ``u·n - g`` (H(div) RT) -> ``(field_key, region,
+    value_node)``; ``None`` otherwise.
+
+    The trial side is affine in ``u`` and references a boundary outward-normal Variable (tag
+    ``n_<region>``, from ``domain.variable(region, normals=True)``); there is no test function (it is
+    essential, not a weak Neumann term). The physical normal is recomputed per boundary edge at
+    assembly, so only the region and the prescribed value ``g`` (``value_node``) are carried. Separated
+    out before classification (like periodic ties) so it never reaches the Cartesian Dirichlet parser."""
+    bare = _bare(constraint)
+    if getattr(bare, "op", None) != "-" or _contains(bare, TestFunction):
+        return None
+    left, right = getattr(bare, "left", None), getattr(bare, "right", None)
+    if left is None or right is None:
+        return None
+    left_trial, right_trial = _contains(left, TrialFunction), _contains(right, TrialFunction)
+    if left_trial == right_trial:  # need exactly one side with the trial (the u·n expression)
+        return None
+    trial_side, value_node = (left, right) if left_trial else (right, left)
+    normals = [
+        n
+        for n in _walk(trial_side)
+        if isinstance(n, Variable) and isinstance(getattr(n, "tag", None), str) and n.tag.startswith("n_")
+    ]
+    if not normals:
+        return None
+    return _field_key_of(constraint), normals[0].tag[2:], value_node
+
+
 def _initial_state(bare: Any, domain: Any) -> Any:
     """Initial nodal state vector from an IC residual ``u(initial) - u0``.
 
@@ -539,7 +659,7 @@ class FEM:
         human-readable summary of how each residual was bucketed.
     """
 
-    def __init__(self, domain: Any, op: Any, classification: List[str], *, mode: str):
+    def __init__(self, domain: Any, op: Any, classification: List[str], *, mode: str, offsets: Any = None):
         # mode: "linear" | "nonlinear" | "transient"
         self.domain = domain
         self._op = op
@@ -548,6 +668,7 @@ class FEM:
         self.mesh = getattr(domain, "mesh", None)
         self.problem = getattr(domain, "_feax_problem", None)
         self._periodic = None  # periodic-tie reduction (prolongation P), attached by fem()
+        self._offsets = offsets  # per-field block offsets for the native non-nodal path (else feax problem.offset)
 
         self._A = self._b = None
         if mode == "linear":
@@ -581,6 +702,16 @@ class FEM:
         ``FemResidualOperator`` (steady) or ``FeaxTimeBlock`` (transient)."""
         return self._op
 
+    @property
+    def offsets(self) -> Any:
+        """Per-field block offsets into the flat solution: ``sol[offsets[i]:offsets[i+1]]`` is field ``i``.
+
+        Set for the native non-nodal (RT/P0) path; falls back to the feax ``problem.offset`` for the
+        Lagrange multi-field path (``None`` for a single field with no block structure)."""
+        if self._offsets is not None:
+            return list(self._offsets)
+        return getattr(self.problem, "offset", None)
+
     def solve(self, solve_fn=None, **kwargs) -> Any:
         """Differentiable forward solve as a trace node — the inverse-problem entry.
 
@@ -597,15 +728,18 @@ class FEM:
 
         ``solve_fn`` is **your** solver (jNO writes none):
 
-        * steady linear: ``(A, b) -> u`` (default :func:`jax.numpy.linalg.solve`; e.g.
-          ``lineax``);
-        * steady nonlinear: ``(residual_fn, u0) -> u`` (default an
-          ``optimistix.root_find`` Newton, implicit-diff; pass ``u0=`` for the guess);
+        * steady linear: ``(A, b) -> u``. The **default** is matrix-free BiCGStab straight on
+          feax's BCOO operator — never forms the ``N x N`` matrix (memory ``O(nnz)``) and solves
+          general (non-symmetric) systems, not just SPD. To use a dense / library solver, pass
+          your own ``solve_fn`` (it receives the densified ``(A, b)``; e.g. ``jnp.linalg.solve``
+          or a ``lineax`` solver). It raises if BiCGStab fails to converge;
+        * steady nonlinear: ``(residual_fn, u0) -> u`` (default a matrix-free Jacobian-free
+          Newton-Krylov, implicit-diff, no optimistix; pass ``u0=`` for the guess);
         * transient: ``(block, args, save_ts) -> ys`` returning a ``(len(save_ts),
-          n_dofs)`` trajectory (default a backward-Euler ``lax.scan`` over the block's
-          assembled ``dt``; ``save_ts=`` overrides the sample times, default the domain's
-          time grid). diffrax (``block.as_diffrax``) and a feax pipeline
-          (``block.as_feax_pipeline``) are documented overrides.
+          n_dofs)`` trajectory (default a backward-Euler ``lax.scan`` over the block's assembled
+          ``dt``, each step solved by the same matrix-free Newton-Krylov; ``save_ts=`` overrides
+          the sample times, default the domain's time grid). For a custom integrator build it
+          from the block's ``M`` / ``A`` / ``state0`` and pass it as ``solve_fn``.
 
         Enable x64 — the feax assembly is float64.
 
@@ -619,12 +753,15 @@ class FEM:
         if self._mode == "complex_transient":
             return _solve_complex_transient(self._op, save_ts=kwargs.get("save_ts"))
         if self._mode == "linear" and not isinstance(self._op, FemLinearSystem):
-            # Non-parametric steady linear: solve the assembled (A, b) directly. ``solve_fn`` is
-            # your ``(A, b) -> u`` (default dense ``jnp.linalg.solve``); A is densified from feax's
-            # BCOO. (The runtime-parametric case is a FemLinearSystem and falls through below.)
+            # Non-parametric steady linear. Default: matrix-free BiCGStab straight on feax's
+            # BCOO operator (never densifies -> memory O(nnz); solves general systems). Pass your
+            # own ``solve_fn=(A, b) -> u`` to use a dense / library solver instead -- it receives
+            # the densified (A, b). (The runtime-parametric case is a FemLinearSystem below.)
             A, b = self._op
-            A = jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)
             b = jnp.asarray(b).reshape(-1)
+            if solve_fn is None and self._periodic is None and hasattr(A, "todense"):
+                return _solve_linear_matrix_free(A, b)
+            A = jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)
             _solve = solve_fn or (lambda A_, b_: jnp.linalg.solve(A_, b_))
             if self._periodic is not None:
                 # periodic tie: eliminate slave DOFs via the prolongation P, solve the reduced
@@ -649,11 +786,10 @@ class FEM:
                 def _base(rf, y):
                     if user_fn is not None:
                         return user_fn(rf, y)
-                    import optimistix as optx
+                    # Matrix-free Newton-Krylov default (no optimistix); implicit-diff preserved.
+                    from .utils.solver.newton_krylov import newton_krylov
 
-                    return optx.root_find(
-                        lambda u, _a: rf(u), optx.Newton(rtol=1e-8, atol=1e-8), y, args=None, max_steps=100
-                    ).value
+                    return newton_krylov(rf, y)
 
                 ur = _base(
                     lambda ur: P.T @ jnp.asarray(residual_fn(P @ ur)).reshape(-1), restrict_state(P, y0, kept, vec=pvec)
@@ -681,43 +817,67 @@ class FEM:
     # -- steady linear --
     @property
     def A(self):
+        """Dense ``(n_dofs, n_dofs)`` stiffness matrix of the steady linear system, ready for
+        ``jnp.linalg.solve`` (use ``fem.operator`` for the raw sparse form on large problems)."""
         if self._mode != "linear":
             raise AttributeError(f"FEM is {self._mode}; .A is only for a steady linear problem (see .operator / .M).")
-        return self._A
+        return _as_dense(self._A)
 
     @property
     def b(self):
+        """Load vector of the steady linear system as a flat ``(n_dofs,)`` JAX array."""
         if self._mode != "linear":
             raise AttributeError(f"FEM is {self._mode}; .b is only for a steady linear problem (see .operator / .M).")
-        return self._b
+        return _as_flat(self._b)
 
-    # -- steady nonlinear --
+    # -- nonlinear residual / Jacobian (steady and transient) --
     @property
     def residual(self):
-        if self._mode != "nonlinear":
-            raise AttributeError(f"FEM is {self._mode}; .residual is only for a steady nonlinear problem (see .operator).")
-        return self._op.residual
+        """Residual callable for a custom solver, returning a flat ``(n_dofs,)`` JAX array.
+
+        Steady nonlinear: ``residual(u)``. Transient: ``residual(u, t)`` — the per-step
+        semidiscrete residual (pass ``args=`` only for a runtime-parametric solve). Use
+        ``fem.operator`` for the raw (unflattened) feax form."""
+        if self._mode == "nonlinear":
+            r = self._op.residual
+            return lambda u: _as_flat(r(u))
+        if self._mode == "transient":
+            return lambda u, t, args=None: _as_flat(self._op.residual(u, t, args or {}))
+        raise AttributeError(f"FEM is {self._mode}; .residual is for a steady-nonlinear or transient problem.")
 
     @property
     def jacobian(self):
-        if self._mode != "nonlinear":
-            raise AttributeError(f"FEM is {self._mode}; .jacobian is only for a steady nonlinear problem (see .operator).")
-        return self._op.jacobian
+        """Jacobian callable for a custom solver, returning a dense ``(n_dofs, n_dofs)`` JAX
+        array — ``jacobian(u)`` (steady nonlinear) or ``jacobian(u, t)`` (transient). Use
+        ``fem.operator`` for the raw sparse (BCOO) form on large problems."""
+        if self._mode == "nonlinear":
+            j = self._op.jacobian
+            return lambda u: _as_dense(j(u))
+        if self._mode == "transient":
+            return lambda u, t, args=None: _as_dense(self._op.jacobian(u, t, args or {}))
+        raise AttributeError(f"FEM is {self._mode}; .jacobian is for a steady-nonlinear or transient problem.")
 
     # -- transient (semidiscrete: M u_dot + ... ; integration window from the domain) --
     @property
     def M(self):
-        """Mass matrix of the semidiscrete transient system."""
+        """Dense ``(n_dofs, n_dofs)`` mass matrix of the semidiscrete transient system
+        (use ``fem.operator`` for the raw sparse form on large problems)."""
         if self._mode != "transient":
             raise AttributeError("FEM is steady; .M (mass matrix) is only for a transient problem.")
-        return self._op.M
+        # the nonlinear-transient route carries the mass as a callable (the ``.M`` attribute is
+        # unset); evaluate it once at t0 -- the mass is constant in the standard ``u_t * v`` form.
+        M = self._op.M
+        if M is None:
+            M = self._op.mass(self.t0, {})
+        return _as_dense(M)
 
     @property
     def state0(self):
-        """Initial nodal state vector (from the `u(initial) - u0` residual, else zeros)."""
+        """Initial nodal state as a flat ``(n_dofs,)`` JAX array (from the `u(initial) - u0`
+        residual, else zeros)."""
         if self._mode != "transient":
             raise AttributeError("FEM is steady; .state0 is only for a transient problem.")
-        return self._op.state0
+        return _as_flat(self._op.state0)
 
     def _time_block(self):
         """The (real) FeaxTimeBlock carrying the integration window — for complex_transient it is
@@ -945,6 +1105,14 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     if len(constraints) == 0:
         raise ValueError("jno.fem: no constraints provided.")
 
+    # Gauge pins (`p.pin()`) remove a field's constant null space. Lower each to a single-node
+    # Dirichlet `p(node) - value` *before* domain discovery and classification: a GaugePin is a
+    # bare marker, not a walkable expression, so it must not reach `_discover_domain` (which walks
+    # coordinate Variables) or the `_region_and_support` classifier.
+    if any(isinstance(c, GaugePin) for c in constraints):
+        pins = [c for c in constraints if isinstance(c, GaugePin)]
+        constraints = [c for c in constraints if not isinstance(c, GaugePin)] + [_lower_gauge_pin(p) for p in pins]
+
     domain = _discover_domain(constraints)
 
     # Periodic ties `u(A) - u(B)` are enforced by algebraic reduction (a prolongation P that
@@ -958,6 +1126,20 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     constraints = core_constraints
     if periodic_ties and not constraints:
         raise ValueError("jno.fem: only periodic ties were given — add the PDE weak form (and any other conditions).")
+
+    # Essential normal-flux BCs `u·n - g` (H(div) RT) pin boundary-edge DOFs at assembly; like periodic
+    # ties they must be separated before classification (the Cartesian Dirichlet parser would reject them).
+    flux_bcs: List[Any] = []
+    _core: List[Any] = []
+    for c in constraints:
+        spec = _normal_flux_spec(c, domain)
+        (flux_bcs.append(spec) if spec is not None else _core.append(c))
+    constraints = _core
+
+    # VPINN: a network trial (``u = net(x, y)`` written into the weak form) makes jno.fem
+    # test-project the weak form onto the FE test space -> a trainable residual loss, not an FE
+    # system. Detected by a ModelCall; lowered after the shared quadrature setup (see below).
+    is_vpinn = any(_contains_network_trial(c) for c in constraints)
 
     multifield = len(_field_keys(constraints)) > 1
     if vec is None and not multifield:
@@ -1071,6 +1253,20 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         else:
             raise ValueError("jno.fem: a residual contains neither the trial nor the test function.")
 
+    if is_vpinn and (getattr(domain, "dimension", None) == 1 or multifield):
+        raise NotImplementedError("jno.fem VPINN (network trial) is currently single-field 2D/3D only.")
+
+    # ---- non-nodal element families (RT / Nedelec / Argyris): native push-forward assembler ----
+    # feax can't assemble these (no push-forward), so -- like the 1D path -- assemble natively and reuse
+    # the shared integrand evaluator (which carries space-guarded branches for the physical basis).
+    if _trial_spaces(constraints) - {"Lagrange"}:
+        from .utils.solver.fem_nonnodal import assemble_fem_nonnodal
+
+        op, mode, offsets = assemble_fem_nonnodal(
+            domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, flux_bcs=flux_bcs, quad_degree=quad_degree
+        )
+        return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offsets))
+
     # ---- 1D (segment): feax has no LINE2 element, so assemble natively ----
     # The native 1D assembler reuses the same integrand evaluator and returns the
     # same (op, mode) the FEM container expects; it needs none of init_fem's feax
@@ -1110,6 +1306,31 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     if boundary_terms:
         bcs.append(neumann(list(boundary_terms.keys())))
     domain.init_fem(element_type=element_type, quad_degree=quad_degree, bcs=bcs, vec=vec, fem_solver=True)
+
+    # ---- VPINN: test-project the (now fem_gauss-tagged) weak form onto the FE test space ----
+    # The network trial already sits inside the weak terms; assemble_weak_form(target="vpinn")
+    # returns a GroupedAssembly whose .mse is the trainable test-projected residual (for jno.core).
+    # The Dirichlet condition (u(boundary) - g) declares which test functions vanish on the
+    # boundary -> its nodes are masked from the residual (else the exact solution's du/dn flux is
+    # an irreducible loss term and training diverges from the solution).
+    if is_vpinn:
+        from .utils.solver.weak_form import assemble_weak_form
+
+        if not volume_terms:
+            raise ValueError("jno.fem VPINN: no volume weak term (expected the test-projected PDE residual).")
+        # The weak-term coords were retagged to the quadrature tags (fem_gauss / gauss_<region>);
+        # trigger those variables' sampling so the test-projected residual resolves them when it is
+        # re-evaluated each training step (crux.solve), not only during this assembly pass.
+        domain.variable("fem_gauss")
+        for region in boundary_terms:
+            domain.variable(f"gauss_{region}")
+        weak = volume_terms[0]
+        for t in volume_terms[1:]:
+            weak = weak + t
+        for region_terms in boundary_terms.values():
+            for t in region_terms:
+                weak = weak + t
+        return assemble_weak_form(domain, weak, target="vpinn")
 
     # ---- build IR with explicit regions, then assemble through feax ----
     # Split each weak constraint into additive sub-terms (one LoweredChannelTerm

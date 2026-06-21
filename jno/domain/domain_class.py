@@ -1122,7 +1122,7 @@ class domain(MeshIOMixin):
 
         return [loc_fns, vec_ids, val_fns]
 
-    def variational_symbols(self, value_shape=(), names=("u", "phi"), order=1, complex=False):
+    def variational_symbols(self, value_shape=(), names=("u", "phi"), order=1, complex=False, space="Lagrange"):
         """
         Return generic variational symbols.
 
@@ -1166,17 +1166,17 @@ class domain(MeshIOMixin):
             # assembles. Re-trial pairs with re-test, im-trial with im-test.
             from ..trace.views import ComplexPair
 
-            re_tr = TrialFunction(name=f"{trial_name}_re", value_shape=value_shape, order=order)
-            im_tr = TrialFunction(name=f"{trial_name}_im", value_shape=value_shape, order=order)
-            re_te = TestFunction(name=f"{test_name}_re", value_shape=value_shape, order=order)
-            im_te = TestFunction(name=f"{test_name}_im", value_shape=value_shape, order=order)
+            re_tr = TrialFunction(name=f"{trial_name}_re", value_shape=value_shape, order=order, space=space)
+            im_tr = TrialFunction(name=f"{trial_name}_im", value_shape=value_shape, order=order, space=space)
+            re_te = TestFunction(name=f"{test_name}_re", value_shape=value_shape, order=order, space=space)
+            im_te = TestFunction(name=f"{test_name}_im", value_shape=value_shape, order=order, space=space)
             re_te.field_key = re_tr.field_key
             im_te.field_key = im_tr.field_key
             for _s in (re_tr, im_tr, re_te, im_te):
                 _s._domain = self
             return (ComplexPair(re_tr, im_tr), ComplexPair(re_te, im_te))
-        trial = TrialFunction(name=trial_name, value_shape=value_shape, order=order)
-        test = TestFunction(name=test_name, value_shape=value_shape, order=order)
+        trial = TrialFunction(name=trial_name, value_shape=value_shape, order=order, space=space)
+        test = TestFunction(name=test_name, value_shape=value_shape, order=order, space=space)
         test.field_key = trial.field_key  # one field per fem_symbols() call (pairs u<->phi)
         # Carry the owning domain so a consumer can recover the mesh / FE space from a
         # symbol alone -- e.g. jno.np.parameter(phi) sizing a field parameter to the
@@ -1185,9 +1185,13 @@ class domain(MeshIOMixin):
         test._domain = self
         return (trial, test)
 
-    def fem_symbols(self, value_shape=(), names=("u", "phi"), order=1, complex=False):
+    def fem_symbols(self, value_shape=(), names=("u", "phi"), order=1, complex=False, space="Lagrange"):
         """
         Backward-compatible alias for variational_symbols().
+
+        ``space`` selects the element family: ``"Lagrange"`` (default, nodal) or a non-nodal
+        family on triangles — ``"RT"`` (H(div) Raviart-Thomas), ``"N1curl"`` (H(curl) Nedelec),
+        ``"Argyris"`` (C1). Non-nodal families assemble through the native push-forward engine.
 
         Examples
         --------
@@ -1207,7 +1211,7 @@ class domain(MeshIOMixin):
             weak = curl(E) * curl(v) - k2 * E.dot(v) - J.dot(v)   # `*` = complex product
             fem  = jno.fem([weak.real, *bcs])                     # lowers to the real coupled solve
         """
-        return self.variational_symbols(value_shape=value_shape, names=names, order=order, complex=complex)
+        return self.variational_symbols(value_shape=value_shape, names=names, order=order, complex=complex, space=space)
 
     def test_function(self, value_shape=(), name="phi", order=1):
         """Return only the weak-form test function.

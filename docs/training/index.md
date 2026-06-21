@@ -29,14 +29,14 @@ crux = jno.core(
 **Every non-frozen model must have an optimiser before calling `solve()`.**
 
 ```python
-u_net.optimizer(optax.adam, lr=lrs.exponential(1e-3, 0.9, 2000, 1e-5))
-v_net.optimizer(optax.adamw, lr=lrs.warmup_cosine(5000, 500, 1e-3, 1e-4))
+u_net.optimizer(optax.adam).scale(lrs.exponential(1e-3, 0.9, 2000, 1e-5))
+v_net.optimizer(optax.adamw).scale(lrs.warmup_cosine(5000, 500, 1e-3, 1e-4))
 ```
 
 `model.optimizer()` returns `self` for chaining:
 
 ```python
-u_net = jno.nn.mlp(2, key=key).optimizer(optax.adam, lr=lrs(1e-3))
+u_net = jno.nn.mlp(2, key=key).optimizer(optax.adam).scale(lrs(1e-3))
 ```
 
 ### After `core.load()`
@@ -45,7 +45,7 @@ When loading a saved solver the `Model` references in the expression tree are di
 
 ```python
 crux = jno.core.load("runs/crux.pkl")
-crux.set_optimizer(optax.adam, lr=lrs(1e-4))
+crux.set_optimizer(optax.adam, scale=lrs(1e-4))
 crux.solve(1000)
 ```
 

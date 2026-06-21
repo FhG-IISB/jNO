@@ -4,7 +4,7 @@
 
 ## Learning Rate
 
-The simplest way to set a learning rate is to pass it directly to the optax constructor — no `lr=` argument needed:
+The simplest way to set a learning rate is to bake it into the optax constructor:
 
 ```python
 net.optimizer(optax.adam(1e-3))
@@ -22,19 +22,26 @@ net.optimizer(
 )
 ```
 
-For **dynamic schedules**, pass `lr=` separately. When `lr` is supplied the optimizer should be constructed with a placeholder rate of `1` — jNO scales it internally:
+For **dynamic schedules**, attach the schedule with `.scale(...)`. Construct the optimizer with a placeholder rate of `1` so `.scale` sets the effective learning rate — which it re-evaluates every step:
 
 ```python
 from jno import LearningRateSchedule as lrs
 
-net.optimizer(optax.adam(1), lr=lrs.exponential(1e-3, 0.9, 2000, 1e-5))
+net.optimizer(optax.adam(1)).scale(lrs.exponential(1e-3, 0.9, 2000, 1e-5))
+```
+
+A loss-adaptive `dlrs(...)` (Dynamic Learning Rate Scheduler) plugs in the same way — it
+raises or lowers the rate from the recent loss trend on every step:
+
+```python
+net.optimizer(optax.adam(1)).scale(jno.fn.adaptive.dlrs(lr0=1e-3, window=10))
 ```
 
 ---
 
 ## Learning Rate Schedules
 
-`LearningRateSchedule` wraps **any** callable `(epoch, individual_losses) → scalar` so it can be passed to `optimizer(..., lr=...)`. Build your own:
+`LearningRateSchedule` wraps **any** callable `(epoch, individual_losses) → scalar` so it can be passed to `.scale(...)`. Build your own:
 
 ```python
 from jno import LearningRateSchedule as lrs

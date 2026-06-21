@@ -231,7 +231,7 @@ def test_nodal_field_parameter_recovers_via_crux():
 
     # Recover the full nodal field k(x) through crux.solve (the differentiable
     # re-assembled solve). Well-posed enough here from full-field data; field
-    # inversion in general needs regularization (jno.fn.regularize), which composes
+    # inversion in general needs regularization (k.regularize(...)), which composes
     # as an extra loss term.
     k.dtype(jnp.float64)
     k.initialize(jax.nn.initializers.constant(1.0))  # start k=1 everywhere (nonsingular)
@@ -343,11 +343,9 @@ def test_nodal_field_regularizers():
 # A *time-dependent* inverse problem: recover a parameter in a transient weak form from a
 # u(t) trajectory. FEM.solve hosts the integrator as a trace node, so the gradient flows
 # through the time integration to the parameter. The integrator is the user's callable
-# (default: a backward-Euler lax.scan over the block's assembled dt); diffrax
-# (block.as_diffrax) and a feax pipeline (block.as_feax_pipeline) are documented overrides.
-# (diffrax forms u_dot = M^-1(...), and a Dirichlet problem zeroes M's Dirichlet rows -> a
-# DAE, so the implicit backward-Euler default/override is the right one for Dirichlet BCs;
-# the diffrax route is exercised on a periodic problem in test_periodic_parametric_integration.)
+# (default: a backward-Euler lax.scan over the block's assembled dt); pass solve_fn= to bring
+# your own stepper built from the block's M / A / residual. A Dirichlet problem zeroes M's
+# Dirichlet rows -> a DAE, so the implicit backward-Euler default suits Dirichlet BCs.
 TRANSIENT_TOL = 0.05
 
 
@@ -387,7 +385,7 @@ def test_transient_recovers_default_scan():
     # Regression guard for the fully-parametric-operator fix: the entire operator is
     # parametric (no static term), so without restoring the Dirichlet identity in A the
     # backward-Euler matrix M + dt A would be singular (rank-deficient on the bc rows).
-    M = np.asarray(block.M)
+    M = np.asarray(block.M.todense() if hasattr(block.M, "todense") else block.M)  # block.M is a BCOO -> densify
     dt = float(block.dt)
     S = M + dt * np.asarray(block.operator_fn(dt, {"alpha": 1.0}))
     assert np.linalg.matrix_rank(S) == S.shape[0], "M + dt A is singular -- Dirichlet identity missing from A"
@@ -441,10 +439,10 @@ def test_transient_save_ts_decouples_from_dt():
     assert float(jnp.linalg.norm(coarse[-1] - fine[-1])) < 1e-10
 
 
-def test_transient_solve_fn_override_feax_pipeline():
-    """fem.solve(my_integrator) -- bring-your-own integrator (same role as the steady
-    (A,b)->u escape hatch). A feax backward-Euler pipeline driven from
-    block.as_feax_pipeline is a documented override and recovers alpha through crux too."""
+def test_transient_solve_fn_override():
+    """fem.solve(my_integrator) -- bring-your-own transient integrator (same role as the steady
+    (A,b)->u escape hatch): fem.solve routes through the user-supplied stepper and the gradient
+    still flows through it to recover alpha."""
     from jno.utils.solver.backend_blocks import _default_transient_integrate
 
     alpha = _alpha()
@@ -452,23 +450,13 @@ def test_transient_solve_fn_override_feax_pipeline():
     block = fem.operator
     u_obs = _default_transient_integrate(block, {"alpha": 1.0}, _grid_ts(block))
 
-    def feax_pipeline_solve(blk, args, ts):
-        pblock = blk.as_feax_pipeline(scheme="backward_euler", args=args)
-        pipe = pblock.pipeline
-        pipe.build(pblock.mesh)
-        ts = np.asarray(ts)
-        state = jnp.asarray(pipe.initial_state())
-        states = [state]
-        t = 0.0
-        for i in range(1, len(ts)):
-            step_dt = float(ts[i] - ts[i - 1])
-            state = pipe.step(state, t, step_dt)
-            t += step_dt
-            states.append(state)
-        return jnp.stack(states)
+    def my_integrator(blk, args, ts):
+        # a user-supplied stepper handed to fem.solve (here, the built-in backward-Euler);
+        # extract M / A / residual from the block and integrate however you like.
+        return _default_transient_integrate(blk, args, ts)
 
-    rec = _recover(fem.solve(feax_pipeline_solve), alpha, u_obs, n=200)
-    assert abs(rec - 1.0) < TRANSIENT_TOL, f"transient (feax-pipeline override): recovered alpha={rec:.4f}"
+    rec = _recover(fem.solve(my_integrator), alpha, u_obs, n=200)
+    assert abs(rec - 1.0) < TRANSIENT_TOL, f"transient (solve_fn override): recovered alpha={rec:.4f}"
 
 
 def test_transient_nonlinear_recovers_via_inner_newton():

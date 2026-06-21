@@ -1,6 +1,6 @@
 # Inverse Problems
 
-Inverse problems identify unknown quantities from observations — e.g. recovering a spatially-varying diffusivity field from sparse temperature measurements. jNO supports two complementary approaches: **soft constraints** via `jno.fn.regularize`, and **hard parameter constraints** via `Model.constrain()`.
+Inverse problems identify unknown quantities from observations — e.g. recovering a spatially-varying diffusivity field from sparse temperature measurements. jNO supports two complementary approaches: **soft constraints** via `field.regularize(...)`, and **hard parameter constraints** via `Model.constrain()`.
 
 ---
 
@@ -37,45 +37,45 @@ print(f"a={float(_a):.3f}  b={float(_b):.3f}")  # → a≈3.14  b≈-2.71
 
 When the unknown is a spatially-varying field `k(x,y)`, represent it as a neural network and add regularization to the loss to make the problem well-posed.
 
-### `jno.fn.regularize`
+### `field.regularize(...)`
 
-All functions return an **unreduced pointwise** `Placeholder` — apply `.mean` or `.mse` to get a scalar loss term.
+Call `.regularize(kind, ...)` on the field itself. It returns an **unreduced pointwise** `Placeholder` — apply `.mean` or `.mse` to get a scalar loss term. (For a FEM nodal-parameter field the same call assembles the FEM-exact penalty on the element space; for a coordinate field it uses autodiff, so pass the spatial variables.)
 
-#### `smooth(field, *variables)` — H1 seminorm
+#### `regularize('smooth', *variables)` — H1 seminorm
 
 Penalises rapid spatial variation. Good default for smooth physical fields.
 
 ```python
 k = jno.nn.wrap(k_net)(x, y)
-reg = jno.fn.regularize.smooth(k, x, y)
+reg = k.regularize('smooth', x, y)
 
 crux = jno.core([pde.mse, data.mse, reg.mean])
 ```
 
-#### `tv(field, *variables)` — total variation
+#### `regularize('tv', *variables)` — total variation
 
 Promotes piecewise-constant fields; better when the unknown has sharp interfaces.
 
 ```python
-reg = jno.fn.regularize.tv(k, x, y)
+reg = k.regularize('tv', x, y)
 crux = jno.core([pde.mse, reg.mean])
 ```
 
-#### `nonneg(field, strength=1.0)` — soft positivity
+#### `regularize('nonneg', strength=1.0)` — soft positivity
 
 Zero cost when `field >= 0`; penalises negative values linearly. Useful for physically positive quantities (diffusivity, viscosity).
 
 ```python
-reg = jno.fn.regularize.nonneg(k)
+reg = k.regularize('nonneg')
 crux = jno.core([pde.mse, reg.mean])
 ```
 
-#### `bounded(field, lo, hi)` — two-sided barrier
+#### `regularize('bounded', lo, hi)` — two-sided barrier
 
 Penalises values outside `[lo, hi]`.
 
 ```python
-reg = jno.fn.regularize.bounded(k, lo=0.1, hi=2.0)
+reg = k.regularize('bounded', lo=0.1, hi=2.0)
 crux = jno.core([pde.mse, reg.mean])
 ```
 
@@ -98,8 +98,9 @@ crux.solve(200)                       # recovers k
 ```
 
 A **diffusivity field** `k(x)` is `jno.np.parameter(phi)` (one DOF per node); regularize it
-with `k.regularize("h1seminorm" | "l2" | "tv" | "nonneg" | "bounded")` — the FE-exact analogue
-of `jno.fn.regularize`. For a **transient** weak form, `fem.solve()` returns the trajectory
+with `k.regularize("h1seminorm" | "l2" | "tv" | "nonneg" | "bounded")` — the same `.regularize()`
+method, assembled FE-exact on the element space for a nodal-parameter field. For a **transient**
+weak form, `fem.solve()` returns the trajectory
 `u(save_ts)`, so a rate constant is recovered from a time series. Worked examples:
 [hidden diffusivity field](tutorials/08-fem-and-varpinns/inverse-diffusivity-field.md) and
 [transient rate](tutorials/08-fem-and-varpinns/transient-inverse-heat.md).
@@ -151,7 +152,7 @@ Under the hood, jNO wraps each selected leaf with [`paramax.Parameterize`](https
 
     This is what the full example below uses.
 
-`constrain()` and `jno.fn.regularize` are complementary: use `constrain` for hard weight-space constraints (monotone layers, weight normalization) and `regularize` for soft penalties on the field *output*.
+`constrain()` and `.regularize()` are complementary: use `constrain` for hard weight-space constraints (monotone layers, weight normalization) and `.regularize()` for soft penalties on the field *output*.
 
 ---
 
@@ -203,7 +204,7 @@ u = u_net(x) * x * (1 - x)      # hard zero Dirichlet BCs
 
 pde  = k * u.dd(x) - f_pde
 data = u - u_obs
-reg  = jno.fn.regularize.smooth(k, x)
+reg  = k.regularize('smooth', x)
 
 crux = jno.core([pde.mse, data.mse, reg.mean])
 crux.solve(5_000)

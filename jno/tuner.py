@@ -1021,15 +1021,15 @@ class Tuner:
                 # call fm.optimizer so that solve() can detect it
                 # gracefully.  Actually solve() just skips frozen
                 # models, so we just need _opt_fn to avoid a KeyError.
-                fm.optimizer(fallback_optimizer, lr=fallback_lr)
+                fm.optimizer(fallback_optimizer).scale(fallback_lr)
             elif has_tune and config.has(f"{mk}__optimizer"):
                 opt = config(f"{mk}__optimizer")
                 lr = config(f"{mk}__lr") if config.has(f"{mk}__lr") else fallback_lr
-                fm.optimizer(opt, lr=lr)
+                fm.optimizer(opt).scale(lr)
             elif has_tune and config.has(f"{mk}__lr"):
-                fm.optimizer(fallback_optimizer, lr=config(f"{mk}__lr"))
+                fm.optimizer(fallback_optimizer).scale(config(f"{mk}__lr"))
             else:
-                fm.optimizer(fallback_optimizer, lr=fallback_lr)
+                fm.optimizer(fallback_optimizer).scale(fallback_lr)
 
     def _run_final_training(self, final_config, space, tunable_list, choices, has_arch_tuning, tuning_history):
         """Run final training with the best configuration."""

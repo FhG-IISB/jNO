@@ -22,8 +22,8 @@ crux = jno.core([(fem.solve() - u_obs).mse], domain=obs)
 crux.solve(200)                                   # recovers alpha from the trajectory
 ```
 
-`fem.solve(my_integrator, save_ts=...)` swaps the integrator (e.g. `block.as_diffrax` or
-`block.as_feax_pipeline`); the implicit backward-Euler default suits Dirichlet problems.
+`fem.solve(my_integrator, save_ts=...)` swaps the integrator — build your own from the block's
+`M` / `A` / `state0`; the implicit backward-Euler default suits Dirichlet problems.
 
 ## What to notice
 

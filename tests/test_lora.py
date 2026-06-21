@@ -792,7 +792,7 @@ class TestModelLoraAPI:
 
     def test_chainable(self):
         net = self._net()
-        result = net.lora(rank=4).optimizer(optax.adam, lr=lrs(1e-3))
+        result = net.lora(rank=4).optimizer(optax.adam).scale(lrs(1e-3))
         assert result is net
 
 
@@ -855,7 +855,7 @@ class TestLoraIntegration:
 
     def test_standard_lora_trains(self):
         net = nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=KEY))
-        net.freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
+        net.freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam).scale(lrs(1e-3))
         assert jnp.isfinite(self._solve(net))
 
     @pytest.mark.parametrize(
@@ -875,7 +875,7 @@ class TestLoraIntegration:
     )
     def test_zoo_class_trains(self, cls):
         net = nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=KEY))
-        net.freeze().lora(rank=4, alpha=1.0, wrapper=cls).optimizer(optax.adam, lr=lrs(1e-3))
+        net.freeze().lora(rank=4, alpha=1.0, wrapper=cls).optimizer(optax.adam).scale(lrs(1e-3))
         assert jnp.isfinite(self._solve(net))
 
     def test_custom_wrapper_trains(self):
@@ -904,7 +904,7 @@ class TestLoraIntegration:
                 return self.base
 
         net = nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=KEY))
-        net.freeze().lora(rank=4, alpha=1.0, wrapper=LearnableBias).optimizer(optax.adam, lr=lrs(1e-3))
+        net.freeze().lora(rank=4, alpha=1.0, wrapper=LearnableBias).optimizer(optax.adam).scale(lrs(1e-3))
         assert jnp.isfinite(self._solve(net))
 
 
@@ -978,7 +978,7 @@ class TestModelControlStateCombinations:
         net = self._net()
         net.mask(self._all_true_mask()).freeze()
         net.mask(self._all_true_mask()).lora(rank=4, alpha=1.0)
-        net.optimizer(optax.adam, lr=lrs(1e-3))
+        net.optimizer(optax.adam).scale(lrs(1e-3))
         net.dtype(jnp.bfloat16)
         net.reset()
         assert net._frozen is False
@@ -1009,21 +1009,23 @@ class TestModelControlStateCombinations:
     def test_masked_optimizer_adds_param_group(self):
         """mask(m).optimizer(...) registers a parameter group."""
         net = self._net()
-        net.mask(self._all_true_mask()).optimizer(optax.adam, lr=lrs(1e-3))
+        net.mask(self._all_true_mask()).optimizer(optax.adam)
+        net.mask(self._all_true_mask()).scale(lrs(1e-3))
         assert len(net._param_groups) >= 1
 
     def test_global_optimizer_clears_param_groups(self):
         """A bare (non-masked) optimizer() call discards existing param groups."""
         net = self._net()
-        net.mask(self._all_true_mask()).optimizer(optax.adam, lr=lrs(1e-3))
+        net.mask(self._all_true_mask()).optimizer(optax.adam)
+        net.mask(self._all_true_mask()).scale(lrs(1e-3))
         assert len(net._param_groups) >= 1
-        net.optimizer(optax.adamw, lr=lrs(5e-4))
+        net.optimizer(optax.adamw).scale(lrs(5e-4))
         assert len(net._param_groups) == 0
 
     def test_freeze_lora_chainable_returns_self(self):
         """All model-control methods return self to support chaining."""
         net = self._net()
-        result = net.freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
+        result = net.freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam).scale(lrs(1e-3))
         assert result is net
 
     def test_freeze_and_lora_and_dtype_all_set(self):
@@ -1066,7 +1068,7 @@ class TestIntegrationCombinations:
     def test_lora_without_freeze_trains(self):
         """lora() alone keeps base params trainable; adapters and base both update."""
         net = self._net()
-        net.lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
+        net.lora(rank=4, alpha=1.0).optimizer(optax.adam).scale(lrs(1e-3))
         assert jnp.isfinite(self._solve_single(net))
 
     # ── two models: frozen feature extractor + LoRA adapter ──────────────────
@@ -1078,7 +1080,7 @@ class TestIntegrationCombinations:
         feat.freeze()
 
         adapter = self._net(key=k2)
-        adapter.freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
+        adapter.freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam).scale(lrs(1e-3))
 
         domain, x = self._domain_and_x()
         loss = (feat(x) + adapter(x) - jnn.sin(jnn.pi * x)).mse
@@ -1090,9 +1092,9 @@ class TestIntegrationCombinations:
     def test_two_lora_models_different_wrappers(self):
         k1, k2 = jax.random.split(KEY)
         net1 = self._net(key=k1)
-        net1.freeze().lora(rank=4, alpha=1.0, wrapper=rsLoRALinear).optimizer(optax.adam, lr=lrs(1e-3))
+        net1.freeze().lora(rank=4, alpha=1.0, wrapper=rsLoRALinear).optimizer(optax.adam).scale(lrs(1e-3))
         net2 = self._net(key=k2)
-        net2.freeze().lora(rank=4, alpha=1.0, wrapper=LoRAFALinear).optimizer(optax.adam, lr=lrs(1e-3))
+        net2.freeze().lora(rank=4, alpha=1.0, wrapper=LoRAFALinear).optimizer(optax.adam).scale(lrs(1e-3))
         domain, x = self._domain_and_x()
         loss = (net1(x) + net2(x) - jnn.sin(jnn.pi * x)).mse
         stats = jno.core([loss]).solve(3)
@@ -1109,7 +1111,7 @@ class TestIntegrationCombinations:
         half = len(leaves) // 2
         partial_mask = jax.tree_util.tree_unflatten(treedef, [i < half for i in range(len(leaves))])
         net.mask(partial_mask).freeze()
-        net.optimizer(optax.adam, lr=lrs(1e-3))
+        net.optimizer(optax.adam).scale(lrs(1e-3))
         assert jnp.isfinite(self._solve_single(net))
 
     # ── lora(target=...) partial coverage ────────────────────────────────────
@@ -1117,7 +1119,7 @@ class TestIntegrationCombinations:
     def test_lora_target_regex_partial_coverage(self):
         """lora(target='0') adapts only the first layer; model still converges."""
         net = self._net()
-        net.freeze().lora(rank=4, alpha=1.0, target="0").optimizer(optax.adam, lr=lrs(1e-3))
+        net.freeze().lora(rank=4, alpha=1.0, target="0").optimizer(optax.adam).scale(lrs(1e-3))
         assert jnp.isfinite(self._solve_single(net))
 
     # ── multi-spec: different ranks per layer group ───────────────────────────
@@ -1129,7 +1131,7 @@ class TestIntegrationCombinations:
                 {"target": "0", "rank": 2, "alpha": 1.0},
                 {"target": ".*", "rank": 8, "alpha": 2.0},
             ]
-        ).optimizer(optax.adam, lr=lrs(1e-3))
+        ).optimizer(optax.adam).scale(lrs(1e-3))
         assert jnp.isfinite(self._solve_single(net))
 
     # ── multi-spec: different wrappers per layer group ────────────────────────
@@ -1141,7 +1143,7 @@ class TestIntegrationCombinations:
                 {"target": "0", "rank": 4, "alpha": 1.0, "wrapper": rsLoRALinear},
                 {"target": ".*", "rank": 4, "alpha": 1.0, "wrapper": DoRALinear},
             ]
-        ).optimizer(optax.adam, lr=lrs(1e-3))
+        ).optimizer(optax.adam).scale(lrs(1e-3))
         assert jnp.isfinite(self._solve_single(net))
 
     # ── mask(m).lora(): adapters train, no crash ──────────────────────────────
@@ -1157,7 +1159,7 @@ class TestIntegrationCombinations:
         all_false = jax.tree_util.tree_map(lambda _: False, m)
         first_layer_mask = eqx.tree_at(lambda mod: mod.hidden_layers[0].weight, all_false, True)
 
-        net.mask(first_layer_mask).lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
+        net.mask(first_layer_mask).lora(rank=4, alpha=1.0).optimizer(optax.adam).scale(lrs(1e-3))
         assert jnp.isfinite(self._solve_single(net))
 
     def test_mask_all_false_lora_wraps_nothing(self):
@@ -1166,7 +1168,7 @@ class TestIntegrationCombinations:
         m = foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=KEY)
         net = nn.wrap(m)
         all_false = jax.tree_util.tree_map(lambda _: False, m)
-        net.mask(all_false).lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
+        net.mask(all_false).lora(rank=4, alpha=1.0).optimizer(optax.adam).scale(lrs(1e-3))
 
         # _lora_param_mask is all-False so no modules should be wrapped after solve
         # We verify via the state check (lora_config set, but mask was all-False)
@@ -1177,7 +1179,7 @@ class TestIntegrationCombinations:
 
     def test_dtype_bfloat16_with_freeze_and_lora(self):
         net = self._net()
-        net.dtype(jnp.bfloat16).freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
+        net.dtype(jnp.bfloat16).freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam).scale(lrs(1e-3))
         assert jnp.isfinite(self._solve_single(net))
 
     # ── initialize from file + freeze + lora (transfer learning) ─────────────
@@ -1189,7 +1191,7 @@ class TestIntegrationCombinations:
         eqx.tree_serialise_leaves(path, m)
 
         net = nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=16, num_layers=2, key=KEY))
-        net.initialize(path).freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
+        net.initialize(path).freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam).scale(lrs(1e-3))
         assert jnp.isfinite(self._solve_single(net))
 
     # ── two models with separate LoRA wrappers + separate losses ─────────────
@@ -1198,9 +1200,9 @@ class TestIntegrationCombinations:
         """Two independent LoRA models with different wrappers trained jointly."""
         k1, k2 = jax.random.split(KEY)
         net1 = self._net(key=k1)
-        net1.freeze().lora(rank=4, alpha=1.0, wrapper=LoRALinear).optimizer(optax.adam, lr=lrs(1e-3))
+        net1.freeze().lora(rank=4, alpha=1.0, wrapper=LoRALinear).optimizer(optax.adam).scale(lrs(1e-3))
         net2 = self._net(key=k2)
-        net2.freeze().lora(rank=4, alpha=1.0, wrapper=VeRALinear).optimizer(optax.adamw, lr=lrs(5e-4))
+        net2.freeze().lora(rank=4, alpha=1.0, wrapper=VeRALinear).optimizer(optax.adamw).scale(lrs(5e-4))
         domain, x = self._domain_and_x()
         loss1 = (net1(x) - jnn.sin(jnn.pi * x)).mse
         loss2 = (net2(x) - jnn.cos(jnn.pi * x)).mse
@@ -1212,10 +1214,10 @@ class TestIntegrationCombinations:
     def test_reset_and_reconfigure(self):
         """Calling reset() and then re-applying controls produces valid training."""
         net = self._net()
-        net.freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
+        net.freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam).scale(lrs(1e-3))
         net.reset()
         # Re-configure with a different wrapper
-        net.freeze().lora(rank=8, alpha=2.0, wrapper=rsLoRALinear).optimizer(optax.adamw, lr=lrs(5e-4))
+        net.freeze().lora(rank=8, alpha=2.0, wrapper=rsLoRALinear).optimizer(optax.adamw).scale(lrs(5e-4))
         assert jnp.isfinite(self._solve_single(net))
 
     # ── three models: frozen backbone, LoRA adapter, trainable head ───────────
@@ -1227,10 +1229,10 @@ class TestIntegrationCombinations:
         backbone.freeze()
 
         adapter = self._net(key=k2)
-        adapter.freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam, lr=lrs(1e-3))
+        adapter.freeze().lora(rank=4, alpha=1.0).optimizer(optax.adam).scale(lrs(1e-3))
 
         head = self._net(key=k3)
-        head.optimizer(optax.adam, lr=lrs(5e-3))
+        head.optimizer(optax.adam).scale(lrs(5e-3))
 
         domain, x = self._domain_and_x()
         u = backbone(x) + adapter(x) + head(x)

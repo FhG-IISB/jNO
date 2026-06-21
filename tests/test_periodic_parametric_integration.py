@@ -5,8 +5,8 @@ These lock in the behaviour verified by hand in check_periodic_bc.py:
   * periodic reduction builds a prolongation P and a reduced (n_red < n_full)
     semidiscrete system, on a structured (periodic-compatible) mesh;
   * an AFFINE runtime parameter (nu * grad u . grad phi) is exposed through the
-    operator and reproduces the analytical periodic-heat decay on both the
-    Diffrax and FEAX-pipeline routes;
+    operator and reproduces the analytical periodic-heat decay when stepped with
+    the default backward-Euler integrator;
   * a NON-AFFINE runtime parameter (exp(logk) * grad u . grad phi, parameter
     inside a nonlinear function) routes through the native non-affine operator
     path, is reported in the block metadata, and -- because exp(log 0.1) = 0.1 --
@@ -20,15 +20,14 @@ The analytical reference is the separable periodic heat mode
 import pytest
 
 pytest.importorskip("feax", reason="feax required for periodic / parametric route tests")
-pytest.importorskip("diffrax", reason="diffrax required for the Diffrax route test")
 
-import diffrax
 import jax
 import jax.numpy as jnp
 import numpy as np
 
 import jno
 import jno.jnp_ops as jnn
+from jno.utils.solver.backend_blocks import _default_transient_integrate
 
 
 @pytest.fixture(autouse=True)
@@ -137,40 +136,13 @@ def prolongation(dom):
     return jnp.asarray(dom._feax_context["P"])
 
 
-def solve_diffrax(dom, block, args, save_ts):
-    dblock = block.as_diffrax()
+def solve_transient(dom, block, args, save_ts):
+    """Integrate the reduced periodic block with jNO's default backward-Euler stepper, then
+    prolong (u_full = P u_red) to compare against the analytical solution. (The diffrax / feax
+    pipeline integrators are gone; the flat block + the default stepper cover this.)"""
     P = prolongation(dom)
-    sol = diffrax.diffeqsolve(
-        dblock.term,
-        diffrax.Tsit5(),
-        t0=0.0,
-        t1=T_END,
-        dt0=1e-3,
-        y0=jnp.asarray(dblock.state0),
-        args=args,
-        saveat=diffrax.SaveAt(ts=jnp.asarray(save_ts)),
-        stepsize_controller=diffrax.PIDController(rtol=1e-6, atol=1e-8),
-        max_steps=200_000,
-    )
-    return np.asarray(jnp.asarray(sol.ys) @ P.T)
-
-
-def solve_feax_pipeline(dom, block, args, save_ts, sub=8):
-    pblock = block.as_feax_pipeline(scheme="backward_euler", args=args)
-    pipe = pblock.pipeline
-    pipe.build(pblock.mesh)
-    P = prolongation(dom)
-    state = jnp.asarray(pipe.initial_state())
-    save_ts = np.asarray(save_ts)
-    dt = float(save_ts[1] - save_ts[0]) / sub
-    states = [state]
-    t = 0.0
-    for _ in range(1, len(save_ts)):
-        for _ in range(sub):
-            state = pipe.step(state, t, dt)
-            t += dt
-        states.append(state)
-    return np.asarray(jnp.stack(states) @ P.T)
+    ys = _default_transient_integrate(block, args, jnp.asarray(save_ts))
+    return np.asarray(jnp.asarray(ys) @ P.T)
 
 
 # ============================================================
@@ -225,23 +197,14 @@ class TestPeriodicAffineParameter:
         assert block.operator_fn is not None
         assert "nu" in list(block.metadata.get("runtime_parameter_names", []))
 
-    def test_affine_periodic_matches_analytical_diffrax(self):
+    def test_affine_periodic_matches_analytical(self):
         dom = init_periodic_fem(make_periodic_domain())
         block, args = build_periodic_heat_block(dom, "affine")
         save_ts = np.linspace(0.0, T_END, N_TIME, dtype=np.float32)
 
         mesh_xy = np.asarray(dom.mesh.points)[:, :2]
-        err = relative_l2(solve_diffrax(dom, block, args, save_ts), analytical(mesh_xy, save_ts))
-        assert err < PASS_TOL, f"affine/diffrax relL2={err:.3e}"
-
-    def test_affine_periodic_matches_analytical_feax_pipeline(self):
-        dom = init_periodic_fem(make_periodic_domain())
-        block, args = build_periodic_heat_block(dom, "affine")
-        save_ts = np.linspace(0.0, T_END, N_TIME, dtype=np.float32)
-
-        mesh_xy = np.asarray(dom.mesh.points)[:, :2]
-        err = relative_l2(solve_feax_pipeline(dom, block, args, save_ts), analytical(mesh_xy, save_ts))
-        assert err < PASS_TOL, f"affine/feax-pipeline relL2={err:.3e}"
+        err = relative_l2(solve_transient(dom, block, args, save_ts), analytical(mesh_xy, save_ts))
+        assert err < PASS_TOL, f"affine relL2={err:.3e}"
 
 
 # ============================================================
@@ -267,23 +230,14 @@ class TestPeriodicNonAffineParameter:
         assert A.shape == (n_red, n_red)  # operator is reduced
         assert float(jnp.linalg.norm(A)) > 0.0
 
-    def test_nonaffine_periodic_matches_analytical_diffrax(self):
+    def test_nonaffine_periodic_matches_analytical(self):
         dom = init_periodic_fem(make_periodic_domain())
         block, args = build_periodic_heat_block(dom, "nonaffine")
         save_ts = np.linspace(0.0, T_END, N_TIME, dtype=np.float32)
 
         mesh_xy = np.asarray(dom.mesh.points)[:, :2]
-        err = relative_l2(solve_diffrax(dom, block, args, save_ts), analytical(mesh_xy, save_ts))
-        assert err < PASS_TOL, f"nonaffine/diffrax relL2={err:.3e}"
-
-    def test_nonaffine_periodic_matches_analytical_feax_pipeline(self):
-        dom = init_periodic_fem(make_periodic_domain())
-        block, args = build_periodic_heat_block(dom, "nonaffine")
-        save_ts = np.linspace(0.0, T_END, N_TIME, dtype=np.float32)
-
-        mesh_xy = np.asarray(dom.mesh.points)[:, :2]
-        err = relative_l2(solve_feax_pipeline(dom, block, args, save_ts), analytical(mesh_xy, save_ts))
-        assert err < PASS_TOL, f"nonaffine/feax-pipeline relL2={err:.3e}"
+        err = relative_l2(solve_transient(dom, block, args, save_ts), analytical(mesh_xy, save_ts))
+        assert err < PASS_TOL, f"nonaffine relL2={err:.3e}"
 
     def test_nonaffine_operator_is_differentiable_in_parameter(self):
         """Autodiff gradient w.r.t. the non-affine parameter matches a
@@ -318,11 +272,11 @@ class TestAffineNonAffineConsistency:
 
         dom_a = init_periodic_fem(make_periodic_domain())
         block_a, args_a = build_periodic_heat_block(dom_a, "affine")
-        ys_a = solve_diffrax(dom_a, block_a, args_a, save_ts)
+        ys_a = solve_transient(dom_a, block_a, args_a, save_ts)
 
         dom_n = init_periodic_fem(make_periodic_domain())
         block_n, args_n = build_periodic_heat_block(dom_n, "nonaffine")
-        ys_n = solve_diffrax(dom_n, block_n, args_n, save_ts)
+        ys_n = solve_transient(dom_n, block_n, args_n, save_ts)
 
         # exp(log 0.1) == 0.1 == nu, so the two operators are identical physics.
         assert relative_l2(ys_a, ys_n) < 1e-3

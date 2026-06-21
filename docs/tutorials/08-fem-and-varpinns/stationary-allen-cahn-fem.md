@@ -24,7 +24,7 @@ over-wide interface and sharpened to the analytic equilibrium:
 
 ```python
 sol = spo.root(lambda v: np.asarray(fem.residual(jnp.asarray(v))), u0,
-               jac=lambda v: np.asarray(dense(fem.jacobian(jnp.asarray(v)))), method="hybr")
+               jac=lambda v: np.asarray(fem.jacobian(jnp.asarray(v))), method="hybr")
 ```
 
 ## What to notice

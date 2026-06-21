@@ -554,16 +554,16 @@ def test_periodic_transient_heat():
     )
     assert fem._mode == "transient" and fem._periodic is not None
     assert fem._periodic["n_red"] < fem._periodic["n_full"], "the time block must be reduced"
-    # the block is assembled reduced (M, A, state0); step it (backward Euler) then prolong to full
+    # the block is assembled reduced (M, A, state0); step it (backward Euler from the flat block
+    # matrices -- (M + dt A) u_next = M u) then prolong (u_full = P u_red) to the full layout.
     P = jnp.asarray(fem._periodic["P"])
-    pblock = fem.operator.as_feax_pipeline(scheme="backward_euler", args=None)
-    pipe = pblock.pipeline
-    pipe.build(pblock.mesh)
-    state = jnp.asarray(pipe.initial_state())
-    dt, t = float(fem.t1) / 200, 0.0
+    blk = fem.operator
+    M = jnp.asarray(blk.M.todense() if hasattr(blk.M, "todense") else blk.M)
+    A = jnp.asarray(blk.A.todense() if hasattr(blk.A, "todense") else blk.A)
+    state = jnp.asarray(blk.state0)
+    dt = float(fem.t1) / 200
     for _ in range(200):
-        state = pipe.step(state, t, dt)
-        t += dt
+        state = jnp.linalg.solve(M + dt * A, M @ state)
     full = np.asarray(state @ P.T).reshape(-1)
     pts = np.asarray(fem.points)
     u_exact = np.exp(-5 * pi**2 * float(fem.t1)) * np.cos(2 * pi * pts[:, 0]) * np.sin(pi * pts[:, 1])

@@ -36,7 +36,7 @@ fem = jno.fem([
     -qq * trace(gu),                                      # incompressibility
     u(xb, yb)[0] - u_in,                                  # parabola at inlet/outlet, 0 on walls+cylinder
     u(xb, yb)[1] - 0.0,
-    p(xpn, ypn) - 0.0,                                    # pin the pressure null space
+    p.pin(),                                              # gauge-fix the pressure null space
 ])
 sol = fem.solve(solve_fn=lambda A, b: lineax.linear_solve(lineax.MatrixLinearOperator(A), b).value)
 ```

@@ -1341,7 +1341,7 @@ class Model(Placeholder):
         self._param_mask = None  # current mask scope for grouped optimizer/lr calls
         self._trainable_param_mask = None  # persistent trainability mask used by mask(...).freeze()
         self._lora_param_mask = None  # param mask passed to mask().lora() → restricts which modules get LoRA
-        self._mask_scope_pending: bool = False  # transient flag for mask(...).optimizer()/lr() group scoping
+        self._mask_scope_pending: bool = False  # transient flag for mask(...).optimizer()/scale() group scoping
         self._param_groups: list = []  # [{target, mask, opt_fn, lr}] for per-group optimizer config
         self._weight_tree = None  # pretrained weights as a pytree (alternative to weight_path file)
         self._initialize_mask = None  # optional bool pytree consumed by initialize() for partial preload
@@ -1472,7 +1472,7 @@ class Model(Placeholder):
                 n_true = None
             lines.append(
                 f"  [{i}] target={target!r}, opt={getattr(opt_fn, '__name__', str(opt_fn))}, "
-                f"lr={lr}, matched_leaves={n_true}"
+                f"scale={lr}, matched_leaves={n_true}"
             )
 
         # Param summary
@@ -1615,7 +1615,7 @@ class Model(Placeholder):
                 lambda m: (m.layers[0].weight, m.layers[0].bias),
                 all_false, (True, True),
             )
-            model.mask(param_mask).optimizer(optax.adam, lr=1e-3)
+            model.mask(param_mask).optimizer(optax.adam(1e-3))
             J = crux.eval([u.grad(model.mask(param_mask))])[0]  # (N, P_selected)
         """
         self._param_mask = param_mask
@@ -1700,7 +1700,7 @@ class Model(Placeholder):
 
         return self
 
-    def optimizer(self, opt_fn: Any, *, lr: Any = None):
+    def optimizer(self, opt_fn: Any):
         """Attach an optimizer to this model.
 
         When preceded by ``mask(param_mask)``, the optimizer applies only
@@ -1711,14 +1711,13 @@ class Model(Placeholder):
             NN.mask(mask_encoder).optimizer(optax.sgd)   # encoder group
             NN.optimizer(optax.adam)                   # global fallback
 
-        ``mask(...)`` is one-shot: it applies only to the immediate next
-        mutator call. If you want a masked LR as well, call ``mask(...)``
-        again before ``lr(...)``::
+        Bake the learning rate into the optax optimizer (e.g. ``optax.adam(1e-3)``);
+        use :meth:`scale` to multiply it -- e.g. with a ``dlrs(...)`` schedule for
+        loss-adaptive learning-rate scaling. ``mask(...)`` is one-shot, so to scale a
+        masked group call ``mask(...)`` again before ``scale(...)``::
 
-            NN.mask(mask_decoder).optimizer(optax.adam)
-            NN.mask(mask_decoder).lr(my_schedule)
-
-        The ``lr`` keyword is a convenience shorthand for ``.lr(lr)``.
+            NN.mask(mask_decoder).optimizer(optax.adam(1e-3))
+            NN.mask(mask_decoder).scale(my_schedule)
 
         A bare/global call (not preceded by ``mask(...)``) replaces any
         previously configured parameter groups.
@@ -1726,8 +1725,6 @@ class Model(Placeholder):
         Args:
             opt_fn: An optax optimizer factory, e.g. ``optax.adam``,
                     or an already-constructed transform.
-            lr: Optional LR schedule/value shorthand (equivalent to chaining
-                ``.lr(lr)``).
         """
         if self._mask_scope_pending and self._param_mask is not None:
             # One-shot masked scope: consume mask on this call.
@@ -1735,18 +1732,12 @@ class Model(Placeholder):
             if self._opt_fn is None:
                 self._opt_fn = opt_fn
             group["opt_fn"] = opt_fn
-            if lr is not None:
-                if self._lr is None:
-                    self._lr = lr
-                group["lr"] = lr
             self._mask_scope_pending = False
         else:
             self._opt_fn = opt_fn
             # Global optimizer replacement should discard stale group overrides.
             self._param_groups = []
             self._mask_scope_pending = False
-            if lr is not None:
-                self._lr = lr
 
         return self
 
@@ -2033,27 +2024,33 @@ class Model(Placeholder):
         self._trainable_param_mask = None
         return self
 
-    def lr(self, lr: LearningRateSchedule | float | None):
-        """Attach an LR schedule to this model.
+    def scale(self, scale: LearningRateSchedule | float | None):
+        """Scale this model's learning rate.
 
-        When preceded by ``mask(param_mask)``, the schedule applies only to
-        that parameter group. ``mask(...)`` is one-shot, so call it
-        immediately before ``lr(...)``::
+        ``scale`` multiplies the rate the optimizer already carries (applied as
+        ``optax.scale(...)``). Pass a loss-adaptive ``dlrs(...)`` schedule here to
+        change the scale **dynamically during training**, a static float for a fixed
+        factor, or any ``LearningRateSchedule``. For a bare optimizer factory (e.g.
+        ``optax.adam`` with no baked-in rate) the scale *is* the learning rate.
 
-            NN.mask(mask_decoder).lr(my_schedule)
+        When preceded by ``mask(param_mask)``, the scale applies only to that
+        parameter group. ``mask(...)`` is one-shot, so call it immediately before
+        ``scale(...)``::
+
+            NN.mask(mask_decoder).scale(dlrs(lr0=1e-3))
 
         Args:
-            lr:     A ``LearningRateSchedule`` (or float) for this model.
-                    If *None*, a constant schedule of 1e-3 is used.
+            scale:  A ``LearningRateSchedule`` / ``dlrs(...)`` (or float) for this
+                    model. If *None*, a constant 1e-3 is used.
         """
         if self._mask_scope_pending and self._param_mask is not None:
             # Ensure a global fallback exists for uncovered leaves.
             if self._lr is None:
-                self._lr = lr
-            self._get_or_create_group()["lr"] = lr
+                self._lr = scale
+            self._get_or_create_group()["lr"] = scale
             self._mask_scope_pending = False
         else:
-            self._lr = lr
+            self._lr = scale
         return self
 
     def _current_group_key(self) -> str:
@@ -2359,8 +2356,14 @@ class ModelCall(Placeholder):
         self.model.lora(rank, alpha, target=target, wrapper=wrapper, specs=specs)
         return self
 
-    def optimizer(self, opt_fn: Any, *, lr: Any = None) -> "ModelCall":
-        self.model.optimizer(opt_fn, lr=lr)
+    def optimizer(self, opt_fn: Any) -> "ModelCall":
+        self.model.optimizer(opt_fn)
+        return self
+
+    def scale(self, scale: Any) -> "ModelCall":
+        """Proxy for :meth:`Model.scale` -- multiply the learning rate (e.g. with a
+        ``dlrs(...)`` schedule for loss-adaptive scaling). Chains after ``optimizer(...)``."""
+        self.model.scale(scale)
         return self
 
     def constrain(self, transform: Callable) -> "ModelCall":
@@ -2371,34 +2374,63 @@ class ModelCall(Placeholder):
         self.model.constrain(transform)
         return self
 
-    def regularize(self, kind: str = "h1seminorm", **kwargs):
-        """Regularization loss term for a FEM **field** parameter (``jno.np.parameter(phi)``).
+    def regularize(self, kind: str = "h1seminorm", *variables, **kwargs):
+        """Regularization loss term for a field -- one surface for FEM and coordinate fields.
 
-        Returns a (pointwise) loss term; reduce with ``.mean`` / ``.sum`` and weight it::
+        For a **FEM nodal-parameter** field (``jno.np.parameter(<fem symbol>)``) this is the
+        FEM-exact penalty assembled on the field's element space. For any **other** field (e.g.
+        a coordinate network ``k(x, y)``) it is the autodiff form -- pass the spatial variables
+        to differentiate against. Returns a pointwise loss term; reduce with ``.mean`` / ``.sum``
+        and weight it::
 
-            crux([data.mse, alpha * k.regularize('h1seminorm').mean])
+            crux([data.mse, alpha * k.regularize('smooth', x, y).mean])   # coordinate field
+            crux([data.mse, alpha * k.regularize('h1seminorm').mean])     # FEM field parameter
 
-        ``kind`` (finite-element exact, assembled on the field's space):
-          * ``'h1seminorm'`` (``'h1'``, ``'smooth'``) -- H1 seminorm ``integral |grad k|^2 = k^T L k``
-            (``L`` = stiffness / discrete Laplacian). Smooth fields.
-          * ``'tv'`` -- total variation ``integral |grad k|`` (eps-smoothed; ``eps=`` kwarg).
-            Edge-preserving / piecewise-constant fields.
-          * ``'l2'`` (``'tikhonov'``, ``'ridge'``) -- ``integral (k - ref)^2 = (k-ref)^T M (k-ref)``
-            (``M`` = mass; ``ref=`` kwarg, default 0). Magnitude / prior penalty.
-          * ``'nonneg'`` -- soft positivity ``strength * relu(-k)`` (``strength=`` kwarg). For a
-            hard ``k > 0`` use :meth:`constrain` (e.g. ``jax.nn.softplus``).
+        ``kind``:
+          * ``'smooth'`` (``'h1seminorm'``, ``'h1'``) -- H1 seminorm ``∫|∇k|²`` (FEM: ``kᵀLk``).
+            Encourages smooth fields.
+          * ``'tv'`` -- total variation ``∫|∇k|`` (FEM: eps-smoothed, ``eps=`` kwarg). Sharp interfaces.
+          * ``'l2'`` (``'tikhonov'``, ``'ridge'``) -- ``∫(k-ref)²`` (``ref=`` kwarg). **FEM only.**
+          * ``'nonneg'`` -- soft positivity ``strength·relu(-k)`` (``strength=`` kwarg). For a hard
+            ``k > 0`` use :meth:`constrain` (e.g. ``jax.nn.softplus``).
           * ``'bounded'`` -- soft two-sided barrier outside ``[lo, hi]`` (``lo=``, ``hi=`` kwargs).
-
-        Only valid for a nodal field parameter; other parameters raise.
         """
-        if getattr(self.model, "_fem_field", None) is None:
-            raise ValueError(
-                "ModelCall.regularize(...) is only for a FEM field parameter "
-                "(jno.np.parameter(<fem symbol>)); this parameter is not one."
-            )
-        from .._fem import _field_regularizer_term
+        if getattr(self.model, "_fem_field", None) is not None:
+            from .._fem import _field_regularizer_term
 
-        return _field_regularizer_term(self, kind, **kwargs)
+            return _field_regularizer_term(self, kind, **kwargs)
+
+        # Coordinate field -> autodiff form (no FE space to assemble against).
+        k = kind.lower()
+        if k in ("smooth", "h1seminorm", "h1"):
+            if not variables:
+                raise ValueError(
+                    "regularize('smooth', ...) on a coordinate field needs the spatial variables, "
+                    "e.g. k.regularize('smooth', x, y)."
+                )
+            acc = self.d(variables[0]) ** 2
+            for v in variables[1:]:
+                acc = acc + self.d(v) ** 2
+            return acc
+        if k == "tv":
+            if not variables:
+                raise ValueError("regularize('tv', ...) needs the spatial variables, e.g. k.regularize('tv', x, y).")
+            sq = self.d(variables[0]) ** 2
+            for v in variables[1:]:
+                sq = sq + self.d(v) ** 2
+            return sq**0.5
+        if k == "nonneg":
+            return FunctionCall(lambda f, _s=kwargs.get("strength", 1.0): _s * jnp.maximum(0.0, -f), [self], name="nonneg")
+        if k == "bounded":
+            return FunctionCall(
+                lambda f, _lo=kwargs["lo"], _hi=kwargs["hi"]: jnp.maximum(0.0, f - _hi) + jnp.maximum(0.0, _lo - f),
+                [self],
+                name="bounded",
+            )
+        raise ValueError(
+            f"regularize: kind {kind!r} is not available for a coordinate field "
+            "('l2'/'tikhonov' is FEM-only); use 'smooth', 'tv', 'nonneg', or 'bounded'."
+        )
 
     def bayesian(self, kernel_factory, *, prior=None, warmup=500, keep=1000, thin=1, adapt=True, **kernel_kwargs):
         """Proxy for :meth:`Model.bayesian`."""
@@ -2972,11 +3004,12 @@ class FemResidualOperator:
         ``fem = jno.fem([...])``.
 
         ``solve_fn`` is **your** solver: any ``(residual_fn, u0) -> u`` callable. The
-        default is a Newton ``optimistix.root_find`` (implicit differentiation, so
-        ``∂u/∂θ`` is exact without unrolling Newton); pass your own to choose a
-        different optimistix solver or library. jNO's analytic Jacobian
-        (:attr:`jacobian`) is available as an optional speed-up — by default the
-        solver auto-differentiates the residual.
+        default is a matrix-free Jacobian-free Newton-Krylov (Newton + BiCGStab on the
+        JVP, no external solver dependency); implicit differentiation via
+        ``jax.lax.custom_root`` keeps ``∂u/∂θ`` exact without unrolling Newton. Pass your
+        own to choose another solver/library (e.g. an ``optimistix`` Newton). jNO's
+        analytic Jacobian (:attr:`jacobian`) is available; by default ``J @ v`` is a JVP
+        of the residual.
 
         ``u0`` is the initial guess (default: zeros of the operator size; enable
         x64 — the feax residual is float64).
@@ -2989,16 +3022,11 @@ class FemResidualOperator:
         if solve_fn is None:
 
             def solve_fn(residual_fn, y0):
-                import optimistix as optx
+                # Default: matrix-free Jacobian-free Newton-Krylov (no optimistix dependency).
+                # Implicit-diff via custom_root, so the gradient still reaches the parameters.
+                from ..utils.solver.newton_krylov import newton_krylov
 
-                sol = optx.root_find(
-                    lambda u, _a: residual_fn(u),
-                    optx.Newton(rtol=1e-8, atol=1e-8),
-                    y0,
-                    args=None,
-                    max_steps=100,
-                )
-                return sol.value
+                return newton_krylov(residual_fn, y0)
 
         names = list(self.runtime_parameter_exprs)
         params = [self.runtime_parameter_exprs[n] for n in names]
@@ -3043,6 +3071,29 @@ class StateField(Placeholder):
         return f"StateField(name={self.name!r}, id={self.state_id}, shape={self.value_shape})"
 
 
+class GaugePin:
+    """Marker that gauge-fixes a field's constant null space (created by ``trial.pin()``).
+
+    An incompressible pressure -- or any pure-Neumann scalar -- is determined only up to an
+    additive constant, so its discrete operator has a one-dimensional (constant) null space and
+    the saddle system is singular. ``p.pin(value)`` removes it by fixing a single, *arbitrary*
+    degree of freedom to ``value``: this is **gauge-fixing**, not a boundary condition. ``jno.fem``
+    lowers each pin to a single-node Dirichlet ``p(node) - value`` at a deterministic vertex
+    (nearest the mesh min-corner) -- the same essential path the explicit ``p(xpn, ypn) - value``
+    form takes -- so assembly is unchanged. The location is intentionally not user-specified;
+    any single DOF removes the null space.
+    """
+
+    __slots__ = ("field", "value")
+
+    def __init__(self, field, value=0.0):
+        self.field = field
+        self.value = value
+
+    def __repr__(self):
+        return f"GaugePin(field={getattr(self.field, 'name', '?')!r}, value={self.value!r})"
+
+
 class TrialFunction(Placeholder):
     """
     Generic variational unknown symbol.
@@ -3064,10 +3115,11 @@ class TrialFunction(Placeholder):
           (2,2) -> second-order tensor, etc.
     """
 
-    def __init__(self, name="u", value_shape=(), order=1):
+    def __init__(self, name="u", value_shape=(), order=1, space="Lagrange"):
         self.name = name
         self.value_shape = tuple(value_shape)
         self.order = int(order)  # element polynomial degree for this field (P1=1, P2=2)
+        self.space = str(space)  # element family: "Lagrange" (nodal) | "RT" | "N1curl" | "Argyris"
         self.op_id = _next_op_id()
         # Identifies the field this symbol belongs to; a (trial, test) pair from one
         # fem_symbols() call shares a key so the coupled kernel can pair u<->v.
@@ -3100,6 +3152,27 @@ class TrialFunction(Placeholder):
         return self._field_view().partials(**named_vars)
 
     bind = partials
+
+    def pin(self, value=0.0):
+        """Gauge-fix this field's constant null space by pinning one arbitrary DOF to ``value``.
+
+        For an incompressible pressure or a pure-Neumann scalar, whose solution is defined only
+        up to an additive constant. Drop the result straight into the ``jno.fem`` constraint
+        list -- no ``domain.point_region`` / coordinate plumbing needed::
+
+            fem = jno.fem([momentum, -q * div(u), p.pin(), *wall_bcs])
+
+        ``jno.fem`` pins a deterministic vertex (nearest the mesh min-corner), so the gauge is
+        reproducible; the location is intentionally not user-specified -- any single DOF removes
+        the null space. See :class:`GaugePin`.
+        """
+        if self.num_components != 1:
+            raise ValueError(
+                "jno.fem: pin() gauge-fixes a *scalar* field's constant null space, but "
+                f"{self.name!r} has value_shape {self.value_shape}. Pin a scalar field "
+                "(e.g. the pressure); a fully Dirichlet vector field has no null space to fix."
+            )
+        return GaugePin(self, value)
 
     def __call__(self, *coords, **named):
         """Evaluate this field symbol on the region carried by ``coords``.
@@ -3137,10 +3210,11 @@ class TestFunction(Placeholder):
           (2,2) -> second-order tensor, etc.
     """
 
-    def __init__(self, name="phi", value_shape=(), order=1):
+    def __init__(self, name="phi", value_shape=(), order=1, space="Lagrange"):
         self.name = name
         self.value_shape = tuple(value_shape)
         self.order = int(order)  # element polynomial degree for this field (P1=1, P2=2)
+        self.space = str(space)  # element family: "Lagrange" (nodal) | "RT" | "N1curl" | "Argyris"
         self.op_id = _next_op_id()
         # Shared with the paired trial (set by variational_symbols) to identify the field.
         self.field_key = self.op_id
@@ -3171,6 +3245,13 @@ class TestFunction(Placeholder):
         return self._field_view().partials(**named_vars)
 
     bind = partials
+
+    def pin(self, value=0.0):
+        """Reject ``pin()`` on a test function -- only the unknown has a null space to fix."""
+        raise ValueError(
+            "jno.fem: pin() gauge-fixes the unknown's constant null space -- call it on the "
+            "trial symbol (e.g. p.pin()), not the test function."
+        )
 
     def __call__(self, *coords, **named):
         """Evaluate this test-function symbol on the region carried by ``coords``.

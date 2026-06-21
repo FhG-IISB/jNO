@@ -451,6 +451,7 @@ def _infer_fields(expr) -> Tuple[List[Dict[str, Any]], Dict[Any, int]]:
                         "value_shape": vs,
                         "vec": _value_shape_num_components(vs),
                         "order": int(getattr(node, "order", 1)),
+                        "space": str(getattr(node, "space", "Lagrange")),
                     }
                 )
             return
@@ -729,6 +730,20 @@ def _field_data(local, node):
     return fd["shape_vals"], fd["shape_grads"], fd["cell_sol"]
 
 
+def _field_space(local, node):
+    """Element family of ``node``'s field (``"Lagrange"`` default).
+
+    Non-nodal families (``"RT"``, ...) are assembled by the native push-forward path
+    (:mod:`fem_nonnodal`), which tags each ``local["fields"]`` entry with its ``space`` and
+    supplies *physical* (push-forward) shape data. The value branches below switch on this so
+    the Lagrange path stays byte-identical (a single-field Lagrange kernel has no ``fields``)."""
+    fields = local.get("fields")
+    if fields is None:
+        return local.get("space", "Lagrange")
+    key = getattr(node, "field_key", getattr(node, "op_id", None))
+    return fields[local["field_index"][key]].get("space", "Lagrange")
+
+
 def _eval_expr_for_feax(domain, node, local):
     """
     Evaluate a jNO symbolic expression inside a FEAX local kernel.
@@ -821,12 +836,21 @@ def _eval_expr_for_feax(domain, node, local):
         raise KeyError(f"Variable tag '{node.tag}' not found in FEAX local/domain context.")
 
     if isinstance(node, TestFunction):
-        n_comp = _value_shape_num_components(getattr(node, "value_shape", ()))
         shape_vals, _, _ = _field_data(local, node)
+        if _field_space(local, node) != "Lagrange":
+            # non-nodal: shape_vals is already the per-DOF *physical* basis (n_quad, n_dof, *value)
+            return shape_vals
+        n_comp = _value_shape_num_components(getattr(node, "value_shape", ()))
         return _expand_test_shape_vals(shape_vals, n_comp)
 
     if isinstance(node, TrialFunction):
         vals, _, cell_sol = _field_data(local, node)
+        if _field_space(local, node) != "Lagrange":
+            # non-nodal: u = sum_n cell_sol[n] Phi_n(x). Vector basis (RT) is (n_quad, n_dof, value_size);
+            # scalar basis (P0/DG) is (n_quad, n_dof).
+            if vals.ndim == 2:
+                return jnp.einsum("qn,n->q", vals, cell_sol)
+            return jnp.einsum("qnc,n->qc", vals, cell_sol)
         flat_interp = jnp.sum(vals[:, :, None] * cell_sol[None, :, :], axis=1)
         value_shape = getattr(node, "value_shape", ())
         if len(value_shape) == 0:
@@ -845,8 +869,13 @@ def _eval_expr_for_feax(domain, node, local):
             raise ValueError("Jacobian node has no differentiation variables")
 
         if isinstance(node.target, TestFunction):
-            n_comp = _value_shape_num_components(getattr(node.target, "value_shape", ()))
             _, grads, _ = _field_data(local, node.target)
+            if _field_space(local, node.target) != "Lagrange":
+                # non-nodal: grads is the per-DOF *physical* gradient (n_quad, n_dof, n_comp, n_dims);
+                # pick the requested directions -> (n_quad, n_dof, n_comp[, len(dims)]). trace() then gives div.
+                g = jnp.stack([grads[..., d] for d in dims], axis=-1)
+                return g[..., 0] if len(dims) == 1 else g
+            n_comp = _value_shape_num_components(getattr(node.target, "value_shape", ()))
             if n_comp == 1:
                 comps = [grads[..., dim0] for dim0 in dims]
                 return comps[0] if len(comps) == 1 else jnp.stack(comps, axis=-1)
@@ -858,6 +887,11 @@ def _eval_expr_for_feax(domain, node, local):
 
         if isinstance(node.target, TrialFunction):
             _, grads, cell_sol = _field_data(local, node.target)
+            if _field_space(local, node.target) != "Lagrange":
+                # non-nodal: du_i/dx_l = sum_n cell_sol[n] grad[n, i, l] -> (n_quad, n_comp[, len(dims)])
+                g = jnp.stack([grads[..., d] for d in dims], axis=-1)
+                contracted = jnp.einsum("qn...,n->q...", g, cell_sol)
+                return contracted[..., 0] if len(dims) == 1 else contracted
             grad_list = [jnp.sum(grads[:, :, dim0 : dim0 + 1] * cell_sol[None, :, :], axis=1) for dim0 in dims]
             flat = grad_list[0] if len(dims) == 1 else jnp.stack(grad_list, axis=-1)
             value_shape = getattr(node.target, "value_shape", ())
@@ -866,6 +900,27 @@ def _eval_expr_for_feax(domain, node, local):
             if len(dims) == 1:
                 return _reshape_components_last(flat, value_shape)
             return jnp.reshape(flat, flat.shape[:1] + tuple(value_shape) + (len(dims),))
+
+        # Component-of-field gradient: ``u[i].d(x)`` lowers to ``Jacobian(getitem(field, i), [x])``. A
+        # non-nodal field's value-component cannot be differentiated directly (that is the rejected
+        # "Jacobian-of-getitem"), but ``d(u_i)/dx_l`` IS the (component i, direction l) entry of the
+        # whole-field *physical* gradient -- so select that row. This is what makes the existing
+        # ``.div()`` / ``.curl()`` / ``.x``-partial sugar (all of which build ``u[i].d(v)``) work for RT
+        # and N1E. Nodal FEM keeps the ``trace(grad(u, [x, y]))`` idiom: a nodal field's getitem-gradient
+        # has a different tensor structure and stays out of scope here.
+        tgt = node.target
+        if isinstance(tgt, FunctionCall) and getattr(tgt, "getitem_key", None) is not None and len(tgt.args) == 1:
+            field = tgt.args[0]
+            ints = [k for k in tgt.getitem_key if isinstance(k, int)]
+            if ints and isinstance(field, (TrialFunction, TestFunction)) and _field_space(local, field) != "Lagrange":
+                comp = ints[-1]
+                _, grads, cell_sol = _field_data(local, field)  # grads: (n_quad, n_dof, n_comp, n_dims)
+                gc = grads[:, :, comp, :]  # physical gradient of component `comp` -> (n_quad, n_dof, n_dims)
+                g = jnp.stack([gc[..., d] for d in dims], axis=-1)  # (n_quad, n_dof, len(dims))
+                g = g[..., 0] if len(dims) == 1 else g
+                if isinstance(field, TestFunction):
+                    return g  # per-DOF directional derivative of the component
+                return jnp.einsum("qn...,n->q...", g, cell_sol)  # contract the trial DOFs
 
         raise NotImplementedError("FEAX backend supports gradients of TrialFunction/TestFunction only.")
 
@@ -1641,6 +1696,19 @@ def _zero_mass_dirichlet_rows(M, bc):
     if rows.shape[0] == 0:
         return M
     return jnp.asarray(M).at[rows, :].set(0.0)
+
+
+def _zero_mass_dirichlet_rows_sparse(M, bc):
+    """BCOO version of :func:`_zero_mass_dirichlet_rows` — zeros the entries in Dirichlet rows
+    without densifying, so the transient mass stays sparse (matrix-free matvec, O(nnz) memory)."""
+    rows = None if bc is None else getattr(bc, "bc_rows", None)
+    if rows is None:
+        return M
+    rows = jnp.asarray(rows).reshape(-1)
+    if rows.shape[0] == 0:
+        return M
+    keep = jnp.logical_not(jnp.isin(M.indices[:, 0], rows)).astype(M.data.dtype)
+    return type(M)((M.data * keep, M.indices), shape=M.shape)
 
 
 def _zero_forcing_dirichlet_rows(forcing_fn, bc):
