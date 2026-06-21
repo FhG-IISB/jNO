@@ -37,6 +37,27 @@ __all__ = ["fem", "FEM"]
 _COMPONENT_NAMES = {0: "x", 1: "y", 2: "z"}
 
 
+def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000):
+    """Default steady-linear solve: matrix-free BiCGStab straight on the feax BCOO operator.
+
+    Never forms the dense ``N x N`` matrix — each iteration is a couple of sparse matvecs
+    ``A @ v`` (cost ``O(nnz)``), so memory stays ``O(nnz)`` and the solve runs at sizes where
+    a dense factorisation would not fit. BiCGStab (unlike CG) handles **general** linear
+    systems — symmetric *or* not — so it is a safe library default. Raises if it fails to
+    converge, so a hard / ill-posed system fails loudly instead of returning garbage; pass a
+    ``solve_fn`` to :meth:`FEM.solve` to choose your own solver in that case.
+    """
+    matvec = lambda v: A @ v
+    u, _info = jax.scipy.sparse.linalg.bicgstab(matvec, b, tol=tol, atol=0.0, maxiter=maxiter)
+    rel = float(jnp.linalg.norm(b - matvec(u)) / (jnp.linalg.norm(b) + 1e-30))
+    if not np.isfinite(rel) or rel > 1e-4:
+        raise RuntimeError(
+            f"fem.solve default (matrix-free BiCGStab) did not converge (relative residual "
+            f"{rel:.1e}). Pass your own solver, e.g. fem.solve(solve_fn=lambda A, b: ...)."
+        )
+    return u
+
+
 # ---------------------------------------------------------------------------
 # expression helpers
 # ---------------------------------------------------------------------------
@@ -597,14 +618,17 @@ class FEM:
 
         ``solve_fn`` is **your** solver (jNO writes none):
 
-        * steady linear: ``(A, b) -> u`` (default :func:`jax.numpy.linalg.solve`; e.g.
-          ``lineax``);
-        * steady nonlinear: ``(residual_fn, u0) -> u`` (default an
-          ``optimistix.root_find`` Newton, implicit-diff; pass ``u0=`` for the guess);
+        * steady linear: ``(A, b) -> u``. The **default** is matrix-free BiCGStab straight on
+          feax's BCOO operator — never forms the ``N x N`` matrix (memory ``O(nnz)``) and solves
+          general (non-symmetric) systems, not just SPD. To use a dense / library solver, pass
+          your own ``solve_fn`` (it receives the densified ``(A, b)``; e.g. ``jnp.linalg.solve``
+          or a ``lineax`` solver). It raises if BiCGStab fails to converge;
+        * steady nonlinear: ``(residual_fn, u0) -> u`` (default a matrix-free Jacobian-free
+          Newton-Krylov, implicit-diff, no optimistix; pass ``u0=`` for the guess);
         * transient: ``(block, args, save_ts) -> ys`` returning a ``(len(save_ts),
-          n_dofs)`` trajectory (default a backward-Euler ``lax.scan`` over the block's
-          assembled ``dt``; ``save_ts=`` overrides the sample times, default the domain's
-          time grid). diffrax (``block.as_diffrax``) and a feax pipeline
+          n_dofs)`` trajectory (default a backward-Euler ``lax.scan`` over the block's assembled
+          ``dt``, each step solved by the same matrix-free Newton-Krylov; ``save_ts=`` overrides
+          the sample times, default the domain's time grid). diffrax (``block.as_diffrax``) and a feax pipeline
           (``block.as_feax_pipeline``) are documented overrides.
 
         Enable x64 — the feax assembly is float64.
@@ -619,12 +643,15 @@ class FEM:
         if self._mode == "complex_transient":
             return _solve_complex_transient(self._op, save_ts=kwargs.get("save_ts"))
         if self._mode == "linear" and not isinstance(self._op, FemLinearSystem):
-            # Non-parametric steady linear: solve the assembled (A, b) directly. ``solve_fn`` is
-            # your ``(A, b) -> u`` (default dense ``jnp.linalg.solve``); A is densified from feax's
-            # BCOO. (The runtime-parametric case is a FemLinearSystem and falls through below.)
+            # Non-parametric steady linear. Default: matrix-free BiCGStab straight on feax's
+            # BCOO operator (never densifies -> memory O(nnz); solves general systems). Pass your
+            # own ``solve_fn=(A, b) -> u`` to use a dense / library solver instead -- it receives
+            # the densified (A, b). (The runtime-parametric case is a FemLinearSystem below.)
             A, b = self._op
-            A = jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)
             b = jnp.asarray(b).reshape(-1)
+            if solve_fn is None and self._periodic is None and hasattr(A, "todense"):
+                return _solve_linear_matrix_free(A, b)
+            A = jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)
             _solve = solve_fn or (lambda A_, b_: jnp.linalg.solve(A_, b_))
             if self._periodic is not None:
                 # periodic tie: eliminate slave DOFs via the prolongation P, solve the reduced
@@ -649,11 +676,10 @@ class FEM:
                 def _base(rf, y):
                     if user_fn is not None:
                         return user_fn(rf, y)
-                    import optimistix as optx
+                    # Matrix-free Newton-Krylov default (no optimistix); implicit-diff preserved.
+                    from .utils.solver.newton_krylov import newton_krylov
 
-                    return optx.root_find(
-                        lambda u, _a: rf(u), optx.Newton(rtol=1e-8, atol=1e-8), y, args=None, max_steps=100
-                    ).value
+                    return newton_krylov(rf, y)
 
                 ur = _base(
                     lambda ur: P.T @ jnp.asarray(residual_fn(P @ ur)).reshape(-1), restrict_state(P, y0, kept, vec=pvec)
