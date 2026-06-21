@@ -2156,7 +2156,10 @@ class core:
 
             def _init(params):
                 state = built.init(optax.tree_utils.tree_cast(params, jnp.float32))
-                return optax.tree_utils.tree_cast(state, param_dtype)
+                return jax.tree.map(
+                    lambda t: t.astype(param_dtype) if jnp.issubdtype(t.dtype, jnp.floating) else t,
+                    state,
+                )
 
             return optax.GradientTransformation(_init, built.update)
 
