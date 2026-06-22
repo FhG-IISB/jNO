@@ -957,6 +957,55 @@ class MeshUtils:
         return jnp.ones(n_pts)
 
     @staticmethod
+    def get_view_factor_2d_element(E0, E1, Nrm, VM, n_quad: int = 3):
+        r"""Element-based 2D view-factor matrix ``F[i, j]`` by double-area Gauss quadrature.
+
+        Each radiating boundary element is a straight segment ``[E0_k, E1_k]`` with constant outward
+        normal ``Nrm_k`` (pointing into the enclosure). The diffuse exchange factor between elements is
+
+        .. math::
+            F_{ij} = \frac{1}{L_i} \int_{e_i}\!\int_{e_j}
+                      \frac{\cos\theta_i\,\cos\theta_j}{2\,r}\; \mathrm{d}s_j\,\mathrm{d}s_i ,
+
+        evaluated with ``n_quad`` Gauss-Legendre points per element (``n_quad=1`` reduces to the
+        midpoint/point kernel). Integrating over the element extent (rather than a single point) is what
+        makes the near-field self-view of concave surfaces accurate. ``VM`` is the element-to-element
+        visibility (0/1) carrying occlusion; only the self-pair (diagonal) is otherwise removed.
+
+        Reference: M. F. Modest, *Radiative Heat Transfer*, 3rd ed., Ch. 4 (diffuse view factors).
+        """
+        E0 = jnp.asarray(E0)
+        E1 = jnp.asarray(E1)
+        Nrm = jnp.asarray(Nrm)
+        m = E0.shape[0]
+
+        gx, gw = np.polynomial.legendre.leggauss(int(n_quad))  # nodes/weights on [-1, 1]
+        s = jnp.asarray((gx + 1.0) * 0.5)  # -> [0, 1]   (n_quad,)
+        wq = jnp.asarray(gw * 0.5)  # weights sum to 1 on [0, 1]
+
+        length = jnp.linalg.norm(E1 - E0, axis=-1)  # (m,)
+        qp = E0[:, None, :] + s[None, :, None] * (E1 - E0)[:, None, :]  # (m, n_quad, 2)
+        qw = wq[None, :] * length[:, None]  # (m, n_quad) -> sums to L_i over the element
+        qp = qp.reshape(m * int(n_quad), 2)
+        qw = qw.reshape(-1)  # (M,)
+        qn = jnp.repeat(Nrm, int(n_quad), axis=0)  # (M, 2) element normal per quad point
+
+        mq = qp.shape[0]
+        v = qp[None, :, :] - qp[:, None, :]  # (M, M, 2)
+        r = jnp.linalg.norm(v, axis=-1)
+        r_safe = r + jnp.eye(mq)
+        rh = v / r_safe[..., None]
+        cos_i = jnp.maximum(0.0, jnp.sum(qn[:, None, :] * rh, axis=-1))
+        cos_j = jnp.maximum(0.0, -jnp.sum(qn[None, :, :] * rh, axis=-1))
+        kernel = cos_i * cos_j / (2.0 * r_safe)  # (M, M)
+
+        g = qw[:, None] * qw[None, :] * kernel  # (M, M) quad-pair contributions
+        # Block-sum quad pairs back to elements (quads are grouped contiguously per element).
+        F = g.reshape(m, int(n_quad), m, int(n_quad)).sum(axis=(1, 3)) / length[:, None]  # (m, m)
+        F = F * jnp.asarray(VM) * (1.0 - jnp.eye(m))
+        return F
+
+    @staticmethod
     def precompute_p1_line_geometry(points, elements):
         """
         Precompute P1 line element geometry (lengths and shape function gradients).

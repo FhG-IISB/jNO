@@ -110,3 +110,59 @@ def test_view_factor_axisymmetric_tall_cylinder():
     F21 = (A[nz:, None] * F[nz:, :nz]).sum() / A[nz:].sum()
     assert abs(f12_mid - 1.0) < 3e-2, f"axisymmetric F12 (mid ring) should be ~1, got {f12_mid:.3f}"
     assert abs(F21 - r1 / r2) < 3e-2, f"axisymmetric F21 should be r1/r2={r1 / r2:.3f}, got {F21:.3f}"
+
+
+def _ray_crosses_disk(p, q, radius):
+    """True if the OPEN segment p-q dips inside the disk (closest approach strictly interior)."""
+    d = q - p
+    length2 = float(np.dot(d, d))
+    if length2 == 0.0:
+        return False
+    t = -float(np.dot(p, d)) / length2  # unclamped: a genuine crossing needs 0 < t < 1
+    if t <= 1e-9 or t >= 1.0 - 1e-9:
+        return False
+    closest = p + t * d
+    return float(np.hypot(*closest)) < radius - 1e-9
+
+
+def _concentric_2d_elements(r1, r2, n1, n2):
+    """Concentric circles as boundary *elements* (edges): endpoints, element normals, and element-level
+    visibility (midpoint occlusion by the inner cylinder)."""
+    th1 = np.linspace(0.0, 2 * np.pi, n1, endpoint=False)
+    th2 = np.linspace(0.0, 2 * np.pi, n2, endpoint=False)
+    v_in = np.c_[r1 * np.cos(th1), r1 * np.sin(th1)]
+    v_out = np.c_[r2 * np.cos(th2), r2 * np.sin(th2)]
+    e0 = np.vstack([v_in, v_out])
+    e1 = np.vstack([np.roll(v_in, -1, axis=0), np.roll(v_out, -1, axis=0)])
+    mids = 0.5 * (e0 + e1)
+    nrm = mids / np.linalg.norm(mids, axis=1, keepdims=True)
+    nrm[n1:] *= -1.0  # inner outward, outer inward -> both point into the gap
+    m = n1 + n2
+    vm = np.ones((m, m))
+    for i in range(m):
+        for j in range(m):
+            if i == j or _ray_crosses_disk(mids[i], mids[j], r1):
+                vm[i, j] = 0.0
+    return e0, e1, nrm, vm
+
+
+def test_view_factor_2d_element_concentric_cylinders():
+    """Element-based double-area kernel reproduces the analytic concentric-cylinder factors (closure,
+    reciprocity, F12=1, F21=r1/r2, concave self-view F22=1-r1/r2). Occlusion is element-level
+    (midpoint) and converges with resolution; the double-area quadrature sharpens the near field."""
+    r1, r2, n1, n2 = 0.20, 0.35, 240, 360
+    e0, e1, nrm, vm = _concentric_2d_elements(r1, r2, n1, n2)
+    A = np.linalg.norm(e1 - e0, axis=1)  # element lengths
+    F = np.asarray(
+        MeshUtils.get_view_factor_2d_element(jnp.asarray(e0), jnp.asarray(e1), jnp.asarray(nrm), jnp.asarray(vm), n_quad=3)
+    )
+    rows = F.sum(axis=1)
+    F12 = (A[:n1, None] * F[:n1, n1:]).sum() / A[:n1].sum()
+    F21 = (A[n1:, None] * F[n1:, :n1]).sum() / A[n1:].sum()
+    F22 = (A[n1:, None] * F[n1:, n1:]).sum() / A[n1:].sum()
+
+    assert np.allclose(rows, 1.0, atol=5e-3), f"closure: row sums {rows.min():.4f}..{rows.max():.4f}"
+    assert np.abs(A[:, None] * F - (A[:, None] * F).T).max() < 1e-12, "element reciprocity violated"
+    assert abs(F12 - 1.0) < 5e-3, f"F12 should be 1, got {F12:.4f}"
+    assert abs(F21 - r1 / r2) < 5e-3, f"F21 should be r1/r2={r1 / r2:.4f}, got {F21:.4f}"
+    assert abs(F22 - (1 - r1 / r2)) < 5e-3, f"concave self-view F22 should be {1 - r1 / r2:.4f}, got {F22:.4f}"
