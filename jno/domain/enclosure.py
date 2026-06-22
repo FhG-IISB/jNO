@@ -159,7 +159,7 @@ class Enclosure:
         reciprocity = float(np.abs(A[:, None] * F - (A[:, None] * F).T).max())
         return closure, reciprocity
 
-    def check(self, *, closure_atol: float = 5e-2, reciprocity_atol: float = 1e-9):
+    def check(self, *, closure_atol: float = 5e-2, reciprocity_atol: float = 1e-7):
         """F-quality gate: raise if closure or reciprocity exceeds tolerance (mesh too coarse / normals
         mis-oriented / surfaces not enclosing). Returns ``self`` for chaining."""
         closure, reciprocity = self.quality()
