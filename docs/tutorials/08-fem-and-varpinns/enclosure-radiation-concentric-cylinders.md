@@ -43,19 +43,28 @@ trainable `jno.np.parameter` emissivity flows through it for inverse problems.
 
 ## Couple and solve
 
-The radiation BC $-k\,\partial T/\partial n = q_{rad}$ enters `fem.residual` as a load, so you solve
+The radiation BC $-k\,\partial T/\partial n = q_{rad}$ enters the residual as a load, so you solve
 $A u = b - \texttt{gap.load}(q_{rad}(u))$. jNO imposes no solver; the Dirichlet conditions are
-penalty-enforced (so $A$ is ill-conditioned) — a **direct** sparse solve with a Picard/Newton outer loop
-on the radiation converges robustly:
+penalty-enforced (so $A$ is ill-conditioned) — a **direct** linear solve handles it (a matrix-free
+iterative solver may stall). The whole thing stays jax-native and **differentiable** with a short
+direct-solve Newton (`jax.lax.custom_root` for implicit diff), so `jax.grad`/`crux` recover an emissivity
+*through* the radiation:
 
 ```python
-A, b = fem.operator                  # A is BCOO sparse — do NOT densify
-lu   = scipy.sparse.linalg.splu(csr(A))
-T = lu.solve(b)
-for _ in range(200):                 # Picard on the (mild) radiation nonlinearity
-    Tn = lu.solve(b - gap.load(q_rad(T)))
-    if abs(Tn - T).max() < 1e-5: break
-    T = 0.7 * T + 0.3 * Tn
+A = fem.operator[0].todense()        # BCOO → dense via the jax path (.todense() is fast; np.asarray is NOT)
+b = fem.operator[1]
+
+def newton(residual, u0, steps=50, tol=1e-9):       # BYO; ~10 lines, no external solver
+    f = lambda u: jnp.asarray(residual(u)).reshape(-1)
+    def stepper(fn, x0):
+        def body(s):
+            du = jnp.linalg.solve(jax.jacfwd(fn)(s[0]), -fn(s[0]))   # DIRECT inner solve each step
+            return s[0] + du, jnp.linalg.norm(du), s[2] + 1
+        return jax.lax.while_loop(lambda s: (s[1] > tol) & (s[2] < steps), body, (x0, 1.0, 0))[0]
+    tangent = lambda g, y: jnp.linalg.solve(jax.jacfwd(g)(jnp.zeros_like(y)), y)
+    return jax.lax.custom_root(f, jnp.asarray(u0).reshape(-1), stepper, tangent)
+
+T = newton(lambda u: A @ u - b + gap.load(q_rad(u)), jnp.linalg.solve(A, b))
 ```
 
 ## It matches the closed form

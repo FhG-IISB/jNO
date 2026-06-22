@@ -314,20 +314,38 @@ def q_rad(u):                        # net radiative flux per element:  q = σ·
     J  = jno.np.linalg.solve(jno.np.eye(gap.size) - rho[:, None] * F, eps * SIGMA * (Ts + KELVIN)**4)
     return J - F @ J                 # (I − F)(I − diag(ρ)F)⁻¹ diag(ε) σ T⁴
 
-# −k ∂T/∂n = q_rad  enters fem.residual as a consistent load:  A u = b − gap.load(q_rad(u))
-A, b = fem.operator                  # conduction (A is sparse BCOO — do NOT densify)
-u = my_solver(lambda u: A @ u - b + gap.load(q_rad(u)))   # your Newton/Picard (see note)
+# −k ∂T/∂n = q_rad  enters the residual as a consistent load:  A u = b − gap.load(q_rad(u))
+A = fem.operator[0].todense()        # BCOO → dense via the jax path (.todense() is fast; np.asarray is NOT)
+b = fem.operator[1]
+u = newton(lambda u: A @ u - b + gap.load(q_rad(u)), jnp.linalg.solve(A, b))   # direct-solve Newton, below
 ```
 
 `gap.field(u)` gathers the per-element temperature; `gap.load(q)` scatters a per-element flux back to the
 FEM nodes as `∫_Γ q·v ds`. The radiosity `(I − ρF)⁻¹` solve is `jno.np` — it is **traced**, so a trainable
 `jno.np.parameter` emissivity flows through it for inverse problems.
 
-**Solver note.** jNO imposes no solver. The Dirichlet conditions are penalty-enforced, so the conduction
-`A` is ill-conditioned — a *direct* sparse solve (e.g. `scipy.sparse.linalg.splu`) with a Picard/Newton
-outer loop on the radiation converges robustly; a matrix-free iterative solver may not. Validated on two
-concentric cylinders against the closed-form two-surface series (`q = σ(T₁⁴−T₂⁴)/(1/ε₁ + (r₁/r₂)(1/ε₂−1))`)
-to <1% (`tests/test_fem_enclosure_radiation.py`).
+**Solver note (BYO, jax-native).** jNO imposes no solver. The Dirichlet conditions are penalty-enforced,
+so the conduction `A` is ill-conditioned — a **direct** linear solve handles it (a *matrix-free iterative*
+solver such as the built-in `newton_krylov` may stall). The whole coupled solve stays jax-native and
+**differentiable** (so `jax.grad`/`crux` recover an emissivity *through* the radiation) with a short
+direct-solve Newton wrapped in `jax.lax.custom_root`:
+
+```python
+def newton(residual, u0, steps=50, tol=1e-9):       # ~10 lines; no external solver
+    f = lambda u: jnp.asarray(residual(u)).reshape(-1)
+    def step(fn, x0):
+        def body(s):  # Newton step with a DIRECT linear solve (dense Jacobian via autodiff)
+            du = jnp.linalg.solve(jax.jacfwd(fn)(s[0]), -fn(s[0]))
+            return s[0] + du, jnp.linalg.norm(du), s[2] + 1
+        return jax.lax.while_loop(lambda s: (s[1] > tol) & (s[2] < steps), body, (x0, 1.0, 0))[0]
+    tangent = lambda g, y: jnp.linalg.solve(jax.jacfwd(g)(jnp.zeros_like(y)), y)
+    return jax.lax.custom_root(f, jnp.asarray(u0).reshape(-1), step, tangent)   # implicit-diff
+```
+
+Validated on two concentric cylinders against the closed-form two-surface series
+(`q = σ(T₁⁴−T₂⁴)/(1/ε₁ + (r₁/r₂)(1/ε₂−1))`) to <1%, including `jax.grad` of the surface temperature w.r.t.
+emissivity matching finite differences (`tests/test_fem_enclosure_radiation.py`). The dense Jacobian is
+fine for moderate meshes; for large problems, precondition a matrix-free Newton with the conduction solve.
 
 Reference: M. F. Modest, *Radiative Heat Transfer*, 3rd ed., Ch. 4–5 (view factors; the net-radiation /
 radiosity method for diffuse-grey enclosures).
@@ -451,8 +469,9 @@ silently wrong result.
 - **Enclosure radiation is a composition, not an auto-detected term.** `domain.enclosure`
   supplies the view matrix + gather/scatter; you write the radiosity in `jno.np` and couple it
   with your own solver (`A u = b − gap.load(q_rad(u))`). It is **2D / axisymmetric** (3-D view
-  factors are future work), and because Dirichlet is penalty-enforced it needs a **direct** sparse
-  solve (matrix-free iterative solvers may not converge). Auto-detecting a radiosity term inside the
+  factors are future work), and because Dirichlet is penalty-enforced it needs a **direct** linear
+  solve (the matrix-free `newton_krylov` may stall) — a short jax-native direct-solve Newton does it,
+  differentiably (see *Enclosure radiation* above). Auto-detecting a radiosity term inside the
   `jno.fem([...])` list (so `fem.solve()` handles it) is not wired yet.
 
 Hitting one of these is a signal to reformulate (move the parameter, reduce the

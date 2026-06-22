@@ -293,14 +293,27 @@ def test_coupled_conduction_radiation_concentric_cylinders():
         Q = 2*pi*k*(T_hot - Ts1)/ln(r1/r0) = 2*pi*r1*sigma*(Ts1^4 - Ts2^4)/D = 2*pi*k*(Ts2 - T_cold)/ln(r3/r2)
 
     with D = 1/eps1 + (r1/r2)(1/eps2 - 1). The radiosity is written over enclosure.view_factor; the net
-    flux enters fem.residual as a consistent surface load (A u = b - load(q_rad)). Penalty-Dirichlet A is
-    ill-conditioned, so a direct sparse solve (Picard on the radiation) is used."""
+    flux enters as a consistent surface load (A u = b - load(q_rad)). Penalty-Dirichlet A is
+    ill-conditioned, so the coupled system is solved jax-natively with a DIRECT-solve Newton (no scipy;
+    a matrix-free iterative solver stalls) wrapped in jax.lax.custom_root -> differentiable end to end."""
     import jno
 
     pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
-    import scipy.sparse as sp
-    import scipy.sparse.linalg as spla
     from shapely.geometry import Point
+
+    def newton(residual, u0, steps=50, tol=1e-9):  # BYO direct-solve Newton (jno imposes no solver)
+        f = lambda uu: jnp.asarray(residual(uu)).reshape(-1)
+
+        def _solve(fn, x0):
+            def body(s):
+                du = jnp.linalg.solve(jax.jacfwd(fn)(s[0]), -fn(s[0]))
+                return s[0] + du, jnp.linalg.norm(du), s[2] + 1
+
+            return jax.lax.while_loop(lambda s: (s[1] > tol) & (s[2] < steps), body, (x0, jnp.array(1.0, x0.dtype), 0))[0]
+
+        return jax.lax.custom_root(
+            f, jnp.asarray(u0).reshape(-1), _solve, lambda g, y: jnp.linalg.solve(jax.jacfwd(g)(jnp.zeros_like(y)), y)
+        )
 
     sigma = 5.670374419e-8
     r0, r1, r2, r3 = 0.10, 0.20, 0.25, 0.35
@@ -320,33 +333,28 @@ def test_coupled_conduction_radiation_concentric_cylinders():
     xh, yh, _ = d.variable("hot", split=True)
     xc, yc, _ = d.variable("cold", split=True)
     fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y), u(xh, yh) - T_hot, u(xc, yc) - T_cold])
-    A = fem.operator[0]  # BCOO (sparse)
-    b = np.asarray(fem.operator[1]).reshape(-1)
+    A = fem.operator[0].todense()  # BCOO -> dense via the jax path (.todense() fast; np.asarray hangs)
+    b = jnp.asarray(fem.operator[1]).reshape(-1)
     n = b.size
 
     gap = d.enclosure(["inner_gap", "outer_gap"])
     gap.check()
     F = gap.view_factor
     eps = gap.emissivity({"inner_gap": eps1, "outer_gap": eps2})
-    rho = 1.0 - eps
     mi, mo = gap.tag_mask("inner_gap"), gap.tag_mask("outer_gap")
     eye = jnp.eye(gap.size)
     ar = np.asarray(gap.areas)
 
-    def q_rad(uu):  # grey-body radiosity: q = (I - F)(I - diag(rho)F)^-1 diag(eps) sigma T^4
+    def q_rad(uu, eps_in=eps1):  # grey-body radiosity: q = (I - F)(I - diag(rho)F)^-1 diag(eps) sigma T^4
+        e = jnp.where(jnp.asarray(mi), eps_in, eps)  # eps_in lets us differentiate w.r.t. inner emissivity
         Ts = gap.field(uu)
-        J = jnp.linalg.solve(eye - rho[:, None] * F, eps * sigma * Ts**4)
+        J = jnp.linalg.solve(eye - (1.0 - e)[:, None] * F, e * sigma * Ts**4)
         return J - F @ J
 
-    ad, ai = np.asarray(A.data), np.asarray(A.indices)
-    lu = spla.splu(sp.coo_matrix((ad, (ai[:, 0], ai[:, 1])), shape=(n, n)).tocsc())
-    T = lu.solve(b)  # warm start: pure conduction
-    for _ in range(200):
-        Tn = lu.solve(b - np.asarray(gap.load(q_rad(jnp.asarray(T)), size=n)))
-        if float(np.abs(Tn - T).max()) < 1e-5:
-            T = Tn
-            break
-        T = 0.7 * T + 0.3 * Tn
+    def coupled(eps_in):  # the whole coupled solve, as a differentiable function of inner emissivity
+        return newton(lambda uu: A @ uu - b + gap.load(q_rad(uu, eps_in), size=n), jnp.linalg.solve(A, b))
+
+    T = np.asarray(coupled(eps1))
     assert np.all(np.isfinite(T)) and T.min() > T_cold - 1 and T.max() < T_hot + 1
 
     Tsf = np.asarray(gap.field(jnp.asarray(T)))
@@ -369,3 +377,14 @@ def test_coupled_conduction_radiation_concentric_cylinders():
     assert abs(Ts1 - ts1_a) / ts1_a < 5e-3, f"Ts1 {Ts1:.1f} vs analytic {ts1_a:.1f}"
     assert abs(Ts2 - ts2_a) / ts2_a < 5e-3, f"Ts2 {Ts2:.1f} vs analytic {ts2_a:.1f}"
     assert abs(Q_fem - Q_a) / abs(Q_a) < 1e-2, f"Q {Q_fem:.0f} vs analytic {Q_a:.0f}"
+
+    # Differentiable end to end: jax.grad of the inner-surface temperature w.r.t. its emissivity flows
+    # through the whole coupled radiation+conduction solve (inverse-through-radiation), matching FD.
+    def mean_inner_T(eps_in):
+        return (gap.field(coupled(eps_in))[jnp.asarray(mi)] * jnp.asarray(ar)[jnp.asarray(mi)]).sum() / jnp.asarray(ar)[
+            jnp.asarray(mi)
+        ].sum()
+
+    g = float(jax.grad(mean_inner_T)(eps1))
+    fd = float((mean_inner_T(eps1 + 1e-3) - mean_inner_T(eps1 - 1e-3)) / 2e-3)
+    assert np.isfinite(g) and abs(g - fd) / (abs(fd) + 1e-8) < 1.5e-2, f"grad {g:.3f} vs finite-diff {fd:.3f}"

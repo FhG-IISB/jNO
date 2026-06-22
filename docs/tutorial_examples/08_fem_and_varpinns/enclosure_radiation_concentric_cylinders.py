@@ -25,12 +25,34 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 import numpy as np
-import scipy.sparse as sp
-import scipy.sparse.linalg as spla
-from scipy.optimize import fsolve
+from scipy.optimize import fsolve  # only for the analytic reference
 from shapely.geometry import Point
 
 import jno
+
+
+def newton(residual, u0, *, steps=50, tol=1e-9):
+    """A direct-solve Newton — the BYO solver for this coupled problem (jNO imposes none).
+
+    Penalty-enforced Dirichlet makes the conduction operator ill-conditioned, so a *direct* linear
+    solve is used each step (a matrix-free iterative solver may stall). `jax.lax.custom_root` provides
+    implicit differentiation, so `jax.grad` flows through the whole coupled solve to any parameter
+    (e.g. recovering an emissivity). Dense Jacobian → moderate problem sizes; precondition a matrix-free
+    Newton for large meshes."""
+    f = lambda u: jnp.asarray(residual(u)).reshape(-1)
+
+    def _solve(fn, x0):
+        def body(s):
+            u, _, k = s
+            du = jnp.linalg.solve(jax.jacfwd(fn)(u), -fn(u))
+            return u + du, jnp.linalg.norm(du), k + 1
+
+        u, _, _ = jax.lax.while_loop(lambda s: (s[1] > tol) & (s[2] < steps), body, (x0, jnp.array(1.0, x0.dtype), 0))
+        return u
+
+    tangent = lambda g, y: jnp.linalg.solve(jax.jacfwd(g)(jnp.zeros_like(y)), y)
+    return jax.lax.custom_root(f, jnp.asarray(u0).reshape(-1), _solve, tangent)
+
 
 SIGMA = 5.670374419e-8  # Stefan-Boltzmann [W/m^2/K^4]
 r0, r1, r2, r3 = 0.10, 0.20, 0.25, 0.35  # hot edge | gap inner | gap outer | cold edge
@@ -53,8 +75,8 @@ ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
 xh, yh, _ = d.variable("hot", split=True)
 xc, yc, _ = d.variable("cold", split=True)
 fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y), u(xh, yh) - T_hot, u(xc, yc) - T_cold])
-A = fem.operator[0]  # BCOO sparse (do not densify)
-b = np.asarray(fem.operator[1]).reshape(-1)
+A = fem.operator[0].todense()  # BCOO -> dense via the jax path (.todense() is fast; np.asarray is not)
+b = jnp.asarray(fem.operator[1]).reshape(-1)
 n = b.size
 
 # --- enclosure radiation: view matrix + per-element emissivity (jNO supplies F; you write the math) ---
@@ -74,16 +96,9 @@ def q_rad(uu):  # full grey-body radiosity (reflections):  q = (I - F)(I - diag(
     return J - F @ J
 
 
-# --- couple: A u = b - gap.load(q_rad(u)). Penalty-Dirichlet A is ill-conditioned -> direct LU + Picard ---
-ad, ai = np.asarray(A.data), np.asarray(A.indices)
-lu = spla.splu(sp.coo_matrix((ad, (ai[:, 0], ai[:, 1])), shape=(n, n)).tocsc())
-T = lu.solve(b)  # warm start: pure conduction
-for _ in range(200):
-    Tn = lu.solve(b - np.asarray(gap.load(q_rad(jnp.asarray(T)), size=n)))
-    if float(np.abs(Tn - T).max()) < 1e-5:
-        T = Tn
-        break
-    T = 0.7 * T + 0.3 * Tn  # under-relax (radiation is stiff)
+# --- couple: −k ∂T/∂n = q_rad enters the residual as a consistent load:  A u = b − gap.load(q_rad(u)) ---
+# Solved jax-natively with the direct-solve Newton above (no scipy); differentiable end to end.
+T = np.asarray(newton(lambda uu: A @ uu - b + gap.load(q_rad(uu), size=n), jnp.linalg.solve(A, b)))
 
 # --- surface temperatures + heat flow vs the analytic series ---
 Tsf = np.asarray(gap.field(jnp.asarray(T)))
