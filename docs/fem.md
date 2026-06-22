@@ -280,6 +280,60 @@ fit a per-material property on its own region (see *Inverse problems*).
 
 ---
 
+## Enclosure radiation (nonlocal boundary flux)
+
+Grey-body radiation between surfaces is **nonlinear** (`T⁴`) and **nonlocal** (every surface element
+exchanges with every other via the view-factor matrix `F`), so it cannot be a local weak term. jNO
+provides the *geometric* building block — the view matrix — and you write the radiosity **as math** in
+`jno.np`; there is no `jno.radiation()` helper.
+
+`domain.enclosure(tags)` discretises the radiating boundary surfaces into **elements** aligned to the
+FEM mesh nodes and returns a handle:
+
+```python
+gap = d.enclosure(["inner_gap", "outer_gap"], axisymmetric=False)   # name the surfaces once
+gap.check()                          # F-quality gate: closure (Σ_j F_ij→1) + reciprocity (A_i F_ij=A_j F_ji)
+F   = gap.view_factor                # (m, m) element view factor — fully geometry-determined
+eps = gap.emissivity({"inner_gap": 0.8, "outer_gap": 0.6})         # per-element ε from a {tag: ε} map
+rho = 1.0 - eps
+```
+
+`F` is computed purely from geometry (occlusion + orientation; only the `i==i` self-pair is removed) by
+**double-area Gauss quadrature** of the diffuse kernel — so a *concave* surface keeps its self-view (the
+outer cylinder's `F₂₂ = 1 − r₁/r₂`). Tags only group elements (for per-surface emissivity); they never
+block exchange. Use `axisymmetric=True` for a body of revolution (the `(r, z)` meridional mesh).
+
+Write the **full grey-body radiosity** (reflections included) and couple it to the conduction FEM by
+adding the net flux as a consistent surface load to the residual:
+
+```python
+SIGMA, KELVIN = 5.670374419e-8, 273.15
+
+def q_rad(u):                        # net radiative flux per element:  q = σ·G·T⁴
+    Ts = gap.field(u)                # nonlocal gather: per-element temperature from the solution
+    J  = jno.np.linalg.solve(jno.np.eye(gap.size) - rho[:, None] * F, eps * SIGMA * (Ts + KELVIN)**4)
+    return J - F @ J                 # (I − F)(I − diag(ρ)F)⁻¹ diag(ε) σ T⁴
+
+# −k ∂T/∂n = q_rad  enters fem.residual as a consistent load:  A u = b − gap.load(q_rad(u))
+A, b = fem.operator                  # conduction (A is sparse BCOO — do NOT densify)
+u = my_solver(lambda u: A @ u - b + gap.load(q_rad(u)))   # your Newton/Picard (see note)
+```
+
+`gap.field(u)` gathers the per-element temperature; `gap.load(q)` scatters a per-element flux back to the
+FEM nodes as `∫_Γ q·v ds`. The radiosity `(I − ρF)⁻¹` solve is `jno.np` — it is **traced**, so a trainable
+`jno.np.parameter` emissivity flows through it for inverse problems.
+
+**Solver note.** jNO imposes no solver. The Dirichlet conditions are penalty-enforced, so the conduction
+`A` is ill-conditioned — a *direct* sparse solve (e.g. `scipy.sparse.linalg.splu`) with a Picard/Newton
+outer loop on the radiation converges robustly; a matrix-free iterative solver may not. Validated on two
+concentric cylinders against the closed-form two-surface series (`q = σ(T₁⁴−T₂⁴)/(1/ε₁ + (r₁/r₂)(1/ε₂−1))`)
+to <1% (`tests/test_fem_enclosure_radiation.py`).
+
+Reference: M. F. Modest, *Radiative Heat Transfer*, 3rd ed., Ch. 4–5 (view factors; the net-radiation /
+radiosity method for diffuse-grey enclosures).
+
+---
+
 ## Differentiable solve & inverse problems
 
 `fem.solve()` is the **differentiable forward solve as a trace node** — the entry point for
@@ -393,6 +447,13 @@ silently wrong result.
   factor of a weak-form term (`nu * grad(u) · grad(phi)`). One trainable scalar per
   additive term — not nested inside another parameter or buried in a nonlinear
   expression — is the well-supported shape.
+
+- **Enclosure radiation is a composition, not an auto-detected term.** `domain.enclosure`
+  supplies the view matrix + gather/scatter; you write the radiosity in `jno.np` and couple it
+  with your own solver (`A u = b − gap.load(q_rad(u))`). It is **2D / axisymmetric** (3-D view
+  factors are future work), and because Dirichlet is penalty-enforced it needs a **direct** sparse
+  solve (matrix-free iterative solvers may not converge). Auto-detecting a radiosity term inside the
+  `jno.fem([...])` list (so `fem.solve()` handles it) is not wired yet.
 
 Hitting one of these is a signal to reformulate (move the parameter, reduce the
 time order) rather than a bug — the error message names the offending term.
