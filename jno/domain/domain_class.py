@@ -1756,6 +1756,91 @@ class domain(MeshIOMixin):
         )
         return self
 
+    def init_fem_native(self, *, element_type: str = "TRI3", quad_degree: int = 2, bcs=None, vec: int = 1) -> "domain":
+        """Native, feax-free FEM-context init for the VPINN / grouped-weak-form path.
+
+        Mirrors the non-feax side effects of :meth:`init_fem` — populates ``self.fem_context`` (the
+        quadrature/shape-function/boundary tensors the grouped-weak-form evaluator reads), seeds the
+        volume + per-Neumann-tag quadrature pools, and registers the variational samples — but builds
+        the tensors from the native Lagrange element + facet machinery instead of a feax ``Problem``.
+        The volume/surface tensors are identical to feax's for the P1/P2 nodal bases (affine geometry).
+        """
+        import numpy as onp
+
+        from ..utils.solver.fem_native import build_native_fem_context
+        from ..utils.solver.fem_route import expand_bcs
+
+        if self.mesh is None:
+            raise ValueError("Mesh must be loaded before initializing FEM context.")
+        self._variational_initialized = True
+        self._variational_sampling_registry = {}
+
+        dirichlet_tags, dirichlet_value_fns, neumann_tags, _periodic = expand_bcs(bcs or [], vec=vec)
+
+        # Dirichlet node ids: P1 geometry nodes matching each Dirichlet tag's location predicate.
+        pts = onp.asarray(self.mesh.points)[:, : self.dimension]
+        dirichlet_node_ids: List[int] = []
+        for tag in dirichlet_tags:
+            loc_fn = self._make_tag_location_fn(tag)
+            if loc_fn is None:
+                continue
+            for i, p in enumerate(pts):
+                try:
+                    inside = bool(loc_fn(p))
+                except Exception:
+                    inside = False
+                if inside:
+                    dirichlet_node_ids.append(i)
+
+        fem_context, vol_quad, surf_quad_by_tag, surf_normals_by_tag = build_native_fem_context(
+            self,
+            element_type=element_type,
+            quad_degree=quad_degree,
+            vec=vec,
+            neumann_tags=list(neumann_tags),
+            dirichlet_node_ids=dirichlet_node_ids,
+        )
+
+        self._fem_backend = "native"
+        self._fem_element_type = element_type
+        self._fem_quad_degree = quad_degree
+        self._fem_default_vec = vec
+        self._fem_solver_enabled = True
+        self.fem_context = fem_context
+
+        # Volume quadrature sampling (mirrors init_fem; time-broadcast when the domain carries a window).
+        if getattr(self, "_is_time_dependent", False):
+            n_time = int(getattr(self, "_n_time", len(getattr(self, "_time_points", [0.0]))))
+            self._mesh_pool["fem_gauss"] = onp.broadcast_to(vol_quad[None, :, :], (n_time, *vol_quad.shape)).copy()
+        else:
+            self._mesh_pool["fem_gauss"] = vol_quad
+        self._register_variational_sample(
+            sample_tag="fem_gauss", support="volume", region_id="volume", context_tag="fem_gauss"
+        )
+
+        # Per-Neumann-tag boundary quadrature sampling + outward normals.
+        for tag, qpts in surf_quad_by_tag.items():
+            self._mesh_pool[f"gauss_{tag}"] = jnp.asarray(qpts)
+            nrm = surf_normals_by_tag.get(tag)
+            if nrm is not None and hasattr(self, "normals_by_tag"):
+                self.normals_by_tag[f"gauss_{tag}"] = onp.asarray(nrm)
+            self._register_variational_sample(
+                sample_tag=f"gauss_{tag}", support="boundary", region_id=tag, context_tag=f"gauss_{tag}"
+            )
+
+        self._fem_dirichlet_tags = list(dirichlet_tags)
+        self._fem_neumann_tags = list(neumann_tags)
+        self._fem_dirichlet_value_fns = dirichlet_value_fns if dirichlet_value_fns is not None else {}
+
+        self.context.update(
+            {
+                k: v
+                for k, v in self.fem_context.items()
+                if not (getattr(v, "ndim", 0) >= 1 and getattr(v, "shape", (1,))[0] == 0)
+            }
+        )
+        return self
+
     def _make_tag_location_fn(self, tag):
         """
         Build a point-membership function for a boundary tag.

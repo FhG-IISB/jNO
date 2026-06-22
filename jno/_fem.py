@@ -1513,12 +1513,18 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             )
             return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs))
 
-    # ---- quadrature + BC setup (reuse init_fem) -- feax-routed paths only (VPINN / complex /
-    # periodic / 3D / field-parameter / time-varying-Dirichlet / transient-parametric) ----
+    # ---- quadrature + BC setup -- feax-routed paths (complex / periodic / 3D / field-parameter /
+    # time-varying-Dirichlet / transient-parametric) and VPINN. VPINN on a 2D Lagrange mesh uses the
+    # native (feax-free) fem_context (its assembly is feax-independent and reads only fem_context);
+    # everything else still builds the feax assembly problem via init_fem. ----
     bcs = [domain.dirichlet(tag, value) for tag, value in dirichlet_values.items()]
     if boundary_terms:
         bcs.append(neumann(list(boundary_terms.keys())))
-    domain.init_fem(element_type=element_type, quad_degree=quad_degree, bcs=bcs, vec=vec, fem_solver=True)
+    if is_vpinn and getattr(domain, "dimension", None) == 2 and not periodic_ties:
+        domain._feax_problem = None
+        domain.init_fem_native(element_type=element_type, quad_degree=quad_degree, bcs=bcs, vec=vec or 1)
+    else:
+        domain.init_fem(element_type=element_type, quad_degree=quad_degree, bcs=bcs, vec=vec, fem_solver=True)
 
     # ---- VPINN: test-project the (now fem_gauss-tagged) weak form onto the FE test space ----
     # The network trial already sits inside the weak terms; assemble_weak_form(target="vpinn")

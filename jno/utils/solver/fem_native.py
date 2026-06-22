@@ -158,6 +158,142 @@ def _build_face_tables(elem_degree: int, quad_degree: int):
 
 
 # ---------------------------------------------------------------------------
+# Native fem_context (feax-free) for the VPINN / grouped-weak-form path
+# ---------------------------------------------------------------------------
+
+
+def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neumann_tags=(), dirichlet_node_ids=None):
+    """Native, feax-free equivalent of ``init_fem``'s ``domain.fem_context`` for the VPINN /
+    grouped-weak-form evaluator (``trace_evaluator._eval_grouped_assembly``).
+
+    Returns ``(fem_context, vol_quad_points, surface_quad_by_tag, surface_normals_by_tag)``:
+    the same tensor layout the feax path cached, computed from the native Lagrange element +
+    facet machinery instead of a feax ``Problem``. The geometry is affine-simplex (P1 vertices),
+    so the cell Jacobian, ``JxW`` and physical gradients are exact for P1/P2 nodal bases.
+    """
+    dim = int(domain.dimension)
+    order = 2 if element_type in ("TRI6", "TET10") else 1
+    quad_degree = max(quad_degree, 2 * order)
+
+    pts_p1, cells_p1, pts_f, cells_f = _get_mesh(domain, dim, order)
+    spec = lagrange_triangle(order, quad_degree)
+    ref_vals = jnp.asarray(spec.ref_values)  # (n_q, n_dof, 1)
+    ref_grads = jnp.asarray(spec.ref_grads)  # (n_q, n_dof, 1, dim)
+    qp = jnp.asarray(spec.quad_points)  # (n_q, dim)
+    qw = jnp.asarray(spec.quad_weights)  # (n_q,)
+    n_q, n_dof = int(qw.shape[0]), int(ref_vals.shape[1])
+    test_vec = int(vec)
+
+    pts_j = jnp.asarray(pts_p1)
+    cells_p1_j = jnp.asarray(cells_p1, dtype=jnp.int32)
+    cells_f_j = jnp.asarray(cells_f, dtype=jnp.int32)
+    n_cells = int(cells_f.shape[0])
+    num_total_nodes = int(pts_f.shape[0])
+
+    def _cell(c):
+        verts = pts_j[cells_p1_j[c]]  # (dim+1, dim) — P1 geometry vertices
+        J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)  # (dim, dim)
+        detJ = jnp.linalg.det(J)
+        phi, dphi = identity_pushforward(ref_vals, ref_grads, J, detJ)  # (n_q,n_dof), (n_q,n_dof,dim)
+        JxW = qw * jnp.abs(detJ)  # (n_q,)
+        xq = verts[0] + qp @ J.T  # (n_q, dim)
+        return phi, dphi, JxW, xq
+
+    phis, dphis, JxWs, xqs = jax.vmap(_cell)(jnp.arange(n_cells))
+
+    N_flat = phis.reshape(-1, n_dof)  # (n_cells*n_q, n_dof)
+    dN_dx_flat = dphis.reshape(-1, n_dof, dim)  # (n_cells*n_q, n_dof, dim)
+    # v_grads_JxW = physical test gradient * JxW, broadcast over the test-vec component axis
+    vg = (dphis * JxWs[:, :, None, None])[:, :, :, None, :]  # (n_cells,n_q,n_dof,1,dim)
+    v_grads_JxW_flat = jnp.broadcast_to(vg, (n_cells, n_q, n_dof, test_vec, dim)).reshape(-1, n_dof, test_vec, dim)
+    quad_points = xqs.reshape(-1, dim)
+
+    local_areas = jnp.einsum("cq,cqa->ca", JxWs, phis)  # lumped nodal areas
+    global_areas = jax.ops.segment_sum(local_areas.reshape(-1), cells_f_j.reshape(-1), num_segments=num_total_nodes)
+
+    dirichlet_nodes = (
+        jnp.asarray(sorted(set(int(i) for i in dirichlet_node_ids)), dtype=jnp.int32)
+        if dirichlet_node_ids
+        else jnp.asarray([], dtype=jnp.int32)
+    )
+
+    fem_context = {
+        "cells": cells_f_j,
+        "flat_cells": cells_f_j,
+        "global_areas": global_areas,
+        "N_flat": N_flat,
+        "dN_dx_flat": dN_dx_flat,
+        "v_grads_JxW_flat": v_grads_JxW_flat,
+        "JxW": JxWs,
+        "quad_points": quad_points,
+        "test_vec": test_vec,
+        "num_total_nodes": num_total_nodes,
+        "dirichlet_nodes": dirichlet_nodes,
+        "surface_data": {},
+    }
+
+    # ---- surface_data per Neumann tag (boundary weak terms) ----
+    surface_quad_by_tag: dict = {}
+    surface_normals_by_tag: dict = {}
+    if neumann_tags:
+        cell_key = "triangle" if dim == 2 else "tetrahedron"
+        conn = build_facet_connectivity(cells_p1, cell_key)
+        normals_all = compute_face_normals(pts_p1, conn, cells_p1, cell_key) if conn.n_bfaces > 0 else np.zeros((0, dim))
+        fp_phi, fp_dphi_ref, fp_qp, fp_tang, gw_face = _build_face_tables(order, quad_degree)
+        for tag in neumann_tags:
+            region_nodes = {int(n) for n in _region_node_ids_from_pts(domain, tag, pts_p1)}
+            face_ids = [
+                fi
+                for fi in range(conn.n_bfaces)
+                if all(int(conn.face_nodes[fi, j]) in region_nodes for j in range(conn.face_nodes.shape[1]))
+            ]
+            if not face_ids:
+                continue
+            face_ids_j = jnp.asarray(face_ids, dtype=jnp.int32)
+            parent = jnp.asarray(conn.parent_cell, dtype=jnp.int32)[face_ids_j]
+            lface = jnp.asarray(conn.local_face, dtype=jnp.int32)[face_ids_j]
+            normals_j = jnp.asarray(normals_all)[face_ids_j]
+
+            def _face(c, k, n_vec, _fp=fp_phi, _fd=fp_dphi_ref, _fq=fp_qp, _ft=fp_tang, _gw=gw_face):
+                verts = pts_j[cells_p1_j[c]]
+                J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)
+                K = jnp.linalg.inv(J)
+                phi_f = _fp[k]  # (n_fq, n_dof)
+                dphi_f = jnp.einsum("qnd,dD->qnD", _fd[k], K)  # (n_fq, n_dof, dim)
+                tang = _ft[k]
+                jac_f = jnp.linalg.norm(J @ tang)  # edge length / face area scale
+                nanson = _gw * jac_f  # (n_fq,)
+                xq_f = verts[0] + _fq[k] @ J.T  # (n_fq, dim)
+                return phi_f, dphi_f, nanson, xq_f
+
+            phi_fs, dphi_fs, nanson_fs, xq_fs = jax.vmap(_face)(parent, lface, normals_j)
+            # (n_faces, n_fq, n_dof), (n_faces, n_fq, n_dof, dim), (n_faces, n_fq), (n_faces, n_fq, dim)
+            n_fq = int(phi_fs.shape[1])
+            parent_nodes = cells_f_j[parent]  # (n_faces, n_loc) global parent-cell node ids
+            local_b_areas = jnp.einsum("fq,fqn->fn", nanson_fs, phi_fs)
+            global_b_areas = jax.ops.segment_sum(
+                local_b_areas.reshape(-1), parent_nodes.reshape(-1), num_segments=num_total_nodes
+            )
+            quad_pts_flat = xq_fs.reshape(-1, dim)
+            # outward normals broadcast to every face quad point
+            quad_normals = jnp.broadcast_to(normals_j[:, None, :], (len(face_ids), n_fq, dim)).reshape(-1, dim)
+
+            fem_context["surface_data"][tag] = {
+                "flat_parent_nodes": parent_nodes.reshape(-1),
+                "face_shape_vals": phi_fs,
+                "face_shape_grads": dphi_fs,
+                "nanson_scale": nanson_fs,
+                "global_boundary_areas": global_b_areas,
+                "quad_points": quad_pts_flat,
+                "quad_normals": quad_normals,
+            }
+            surface_quad_by_tag[tag] = np.asarray(quad_pts_flat)
+            surface_normals_by_tag[tag] = np.asarray(quad_normals)
+
+    return fem_context, np.asarray(quad_points), surface_quad_by_tag, surface_normals_by_tag
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 

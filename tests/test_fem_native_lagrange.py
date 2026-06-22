@@ -506,3 +506,39 @@ def test_native_parametric_gradient_matches_finite_difference():
     g_fd = float((loss(a0 + eps) - loss(a0 - eps)) / (2 * eps))
     assert abs(g_ad) > 1e-8  # the parameter genuinely moves the solution
     assert abs(g_ad - g_fd) <= 1e-5 * max(1.0, abs(g_fd))
+
+
+# ---------------------------------------------------------------------------
+# VPINN / grouped-weak-form: the native fem_context (quadrature, shape values &
+# gradients, JxW, surface data) must match feax's init_fem tensor-for-tensor on a
+# P1 mesh (same node ordering), so the network-trial test-projection is identical.
+# ---------------------------------------------------------------------------
+
+
+def test_native_fem_context_matches_feax():
+    from jno.utils.solver.fem_native import build_native_fem_context
+
+    # feax fem_context via init_fem
+    df = jno.domain(box(0, 0, 1, 1), mesh_size=0.2)
+    df.init_fem(
+        element_type="TRI3",
+        quad_degree=2,
+        bcs=[df.dirichlet("boundary", 0.0), jno.neumann(["right"])],
+        vec=1,
+        fem_solver=True,
+    )
+    fc_f = df.fem_context
+
+    # native fem_context
+    dn = jno.domain(box(0, 0, 1, 1), mesh_size=0.2)
+    fc_n, _qp, _sq, _sn = build_native_fem_context(dn, element_type="TRI3", quad_degree=2, vec=1, neumann_tags=["right"])
+
+    assert fc_n["num_total_nodes"] == fc_f["num_total_nodes"]
+    for k in ("cells", "N_flat", "dN_dx_flat", "v_grads_JxW_flat", "JxW", "quad_points", "global_areas"):
+        a, b = np.asarray(fc_f[k]), np.asarray(fc_n[k])
+        assert a.shape == b.shape, f"{k}: {a.shape} vs {b.shape}"
+        assert np.abs(a - b).max() < 1e-11, f"{k}: max diff {np.abs(a - b).max():.2e}"
+    sf, sn = fc_f["surface_data"]["right"], fc_n["surface_data"]["right"]
+    for k in ("face_shape_vals", "face_shape_grads", "nanson_scale", "global_boundary_areas", "quad_points"):
+        a, b = np.asarray(sf[k]), np.asarray(sn[k])
+        assert a.shape == b.shape and np.abs(a - b).max() < 1e-11, f"surface {k}"
