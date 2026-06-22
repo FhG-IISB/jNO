@@ -56,8 +56,8 @@ def lagrange_triangle(degree: int, quad_degree: Optional[int] = None) -> Element
     qd = quad_degree if quad_degree is not None else 2 * degree + 1
     elem = basix.create_element(ElementFamily.P, CellType.triangle, degree)
     qp, qw = basix.make_quadrature(CellType.triangle, qd)
-    tab = elem.tabulate(1, qp)          # (1 + tdim, n_quad, n_dof, 1)
-    ref_values = np.asarray(tab[0])     # (n_quad, n_dof, 1)
+    tab = elem.tabulate(1, qp)  # (1 + tdim, n_quad, n_dof, 1)
+    ref_values = np.asarray(tab[0])  # (n_quad, n_dof, 1)
     # Stack ∂φ/∂ξ₀ (tab[1]) and ∂φ/∂ξ₁ (tab[2]) into the last axis
     ref_grads = np.stack([np.asarray(tab[1]), np.asarray(tab[2])], axis=-1)  # (n_quad, n_dof, 1, 2)
     return ElementSpec(
@@ -93,8 +93,8 @@ def lagrange_tet(degree: int, quad_degree: Optional[int] = None) -> ElementSpec:
     qd = quad_degree if quad_degree is not None else 2 * degree + 1
     elem = basix.create_element(ElementFamily.P, CellType.tetrahedron, degree)
     qp, qw = basix.make_quadrature(CellType.tetrahedron, qd)
-    tab = elem.tabulate(1, qp)          # (1 + tdim, n_quad, n_dof, 1)
-    ref_values = np.asarray(tab[0])     # (n_quad, n_dof, 1)
+    tab = elem.tabulate(1, qp)  # (1 + tdim, n_quad, n_dof, 1)
+    ref_values = np.asarray(tab[0])  # (n_quad, n_dof, 1)
     ref_grads = np.stack([np.asarray(tab[i]) for i in range(1, 4)], axis=-1)  # (n_quad, n_dof, 1, 3)
     return ElementSpec(
         family=f"Lagrange-P{degree}-Tet",
@@ -134,8 +134,8 @@ def identity_pushforward(
     phi       : ``(n_quad, n_dof)``  physical shape values (``= ref_values[..., 0]``).
     dphi_phys : ``(n_quad, n_dof, tdim)``  physical gradients ``∂φ/∂x``.
     """
-    K = jnp.linalg.inv(J)                                          # J⁻¹, (tdim, tdim)
-    phi = ref_values[..., 0]                                        # (n_quad, n_dof)
-    dphi_ref = ref_grads[..., 0, :]                                 # (n_quad, n_dof, tdim)
-    dphi_phys = jnp.einsum("qnd,dD->qnD", dphi_ref, K)            # (n_quad, n_dof, tdim)
+    K = jnp.linalg.inv(J)  # J⁻¹, (tdim, tdim)
+    phi = ref_values[..., 0]  # (n_quad, n_dof)
+    dphi_ref = ref_grads[..., 0, :]  # (n_quad, n_dof, tdim)
+    dphi_phys = jnp.einsum("qnd,dD->qnD", dphi_ref, K)  # (n_quad, n_dof, tdim)
     return phi, dphi_phys

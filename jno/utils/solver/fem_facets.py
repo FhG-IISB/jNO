@@ -55,9 +55,9 @@ class FacetConnectivity(NamedTuple):
     n_bfaces    : total number of boundary faces.
     """
 
-    parent_cell: np.ndarray   # (n_bfaces,) int64
-    local_face: np.ndarray    # (n_bfaces,) int64
-    face_nodes: np.ndarray    # (n_bfaces, n_nodes_per_face) int64
+    parent_cell: np.ndarray  # (n_bfaces,) int64
+    local_face: np.ndarray  # (n_bfaces,) int64
+    face_nodes: np.ndarray  # (n_bfaces, n_nodes_per_face) int64
     n_bfaces: int
 
 
@@ -81,7 +81,9 @@ def build_facet_connectivity(cells: np.ndarray, cell_type: str = "triangle") -> 
         local_faces = _LOCAL_FACES_TET
         n_face_nodes = 3
     else:
-        raise NotImplementedError(f"build_facet_connectivity: cell_type {cell_type!r} not supported (triangle / tetrahedron only).")
+        raise NotImplementedError(
+            f"build_facet_connectivity: cell_type {cell_type!r} not supported (triangle / tetrahedron only)."
+        )
 
     # Map canonical (sorted) face-vertex key -> (cell, local_face_k, face_verts) or None (interior)
     face_map: dict = {}
@@ -145,13 +147,13 @@ def compute_face_normals(
         entry = local_faces[k]
         face_ids = [int(cells[c, j]) for j in entry[:n_face_nodes]]
         opp_id = int(cells[c, entry[n_face_nodes]])
-        verts = points[face_ids, :dim]           # (n_face_nodes, dim)
+        verts = points[face_ids, :dim]  # (n_face_nodes, dim)
         opp = points[opp_id, :dim]
 
-        if dim == 2:                             # 2-D: edge → rotate tangent 90° clockwise
+        if dim == 2:  # 2-D: edge → rotate tangent 90° clockwise
             t = verts[1] - verts[0]
             n = np.array([t[1], -t[0]])
-        else:                                    # 3-D: face → cross product of two edges
+        else:  # 3-D: face → cross product of two edges
             n = np.cross(verts[1] - verts[0], verts[2] - verts[0])
 
         mid = np.mean(verts, axis=0)
@@ -189,11 +191,11 @@ def facet_quad_data(
     gp = np.asarray(gp)
     n_face_nodes = verts.shape[0]
 
-    if n_face_nodes == 2:                               # 2-D edge: x = (1-t) v0 + t v1
+    if n_face_nodes == 2:  # 2-D edge: x = (1-t) v0 + t v1
         t = gp.reshape(-1, 1)
         xq = (1.0 - t) * verts[0] + t * verts[1]
         jac_scale = float(np.linalg.norm(verts[1] - verts[0]))
-    elif n_face_nodes == 3:                             # 3-D face: affine map from ref-triangle
+    elif n_face_nodes == 3:  # 3-D face: affine map from ref-triangle
         s, t_ref = gp[:, 0:1], gp[:, 1:2]
         xq = (1.0 - s - t_ref) * verts[0] + s * verts[1] + t_ref * verts[2]
         e1, e2 = verts[1] - verts[0], verts[2] - verts[0]

@@ -167,8 +167,8 @@ def test_n1e_orientation_sign_flips_basis():
 
 from jno.utils.solver.fem_lagrange import (  # noqa: E402
     identity_pushforward,
-    lagrange_triangle,
     lagrange_tet,
+    lagrange_triangle,
 )
 
 
@@ -207,8 +207,10 @@ def test_lagrange_partition_of_unity():
     # Sum of all Lagrange basis functions = 1 at every quad point
     for degree in (1, 2):
         spec = lagrange_triangle(degree)
-        phi = spec.ref_values[..., 0]   # (n_quad, n_dof)
-        np.testing.assert_allclose(phi.sum(axis=1), np.ones(phi.shape[0]), atol=1e-13, err_msg=f"P{degree} partition of unity")
+        phi = spec.ref_values[..., 0]  # (n_quad, n_dof)
+        np.testing.assert_allclose(
+            phi.sum(axis=1), np.ones(phi.shape[0]), atol=1e-13, err_msg=f"P{degree} partition of unity"
+        )
 
 
 def test_lagrange_gradient_sums_to_zero():
@@ -222,9 +224,7 @@ def test_lagrange_gradient_sums_to_zero():
 def test_identity_pushforward_phi_unchanged():
     spec = lagrange_triangle(1)
     J, detJ = _phys_tri()
-    phi, _ = identity_pushforward(
-        jnp.asarray(spec.ref_values), jnp.asarray(spec.ref_grads), jnp.asarray(J), detJ
-    )
+    phi, _ = identity_pushforward(jnp.asarray(spec.ref_values), jnp.asarray(spec.ref_grads), jnp.asarray(J), detJ)
     # For Lagrange, shape values are coordinate-invariant
     np.testing.assert_allclose(np.asarray(phi), spec.ref_values[..., 0], atol=1e-14)
 
@@ -234,12 +234,10 @@ def test_identity_pushforward_gradient_chain_rule():
     for degree in (1, 2):
         spec = lagrange_triangle(degree)
         J, detJ = _phys_tri()
-        _, dphi_phys = identity_pushforward(
-            jnp.asarray(spec.ref_values), jnp.asarray(spec.ref_grads), jnp.asarray(J), detJ
-        )
+        _, dphi_phys = identity_pushforward(jnp.asarray(spec.ref_values), jnp.asarray(spec.ref_grads), jnp.asarray(J), detJ)
         K = np.linalg.inv(J)
-        dphi_ref = spec.ref_grads[..., 0, :]                                    # (nq, n_dof, 2)
-        expected = np.einsum("qnd,dD->qnD", dphi_ref, K)                       # (nq, n_dof, 2)
+        dphi_ref = spec.ref_grads[..., 0, :]  # (nq, n_dof, 2)
+        expected = np.einsum("qnd,dD->qnD", dphi_ref, K)  # (nq, n_dof, 2)
         np.testing.assert_allclose(np.asarray(dphi_phys), expected, atol=1e-13, err_msg=f"P{degree}")
 
 
@@ -248,9 +246,7 @@ def test_identity_pushforward_partition_of_unity_gradients_physical():
     for degree in (1, 2):
         spec = lagrange_triangle(degree)
         J, detJ = _phys_tri()
-        _, dphi_phys = identity_pushforward(
-            jnp.asarray(spec.ref_values), jnp.asarray(spec.ref_grads), jnp.asarray(J), detJ
-        )
+        _, dphi_phys = identity_pushforward(jnp.asarray(spec.ref_values), jnp.asarray(spec.ref_grads), jnp.asarray(J), detJ)
         np.testing.assert_allclose(np.asarray(dphi_phys).sum(axis=1), 0.0, atol=1e-13, err_msg=f"P{degree}")
 
 
@@ -259,7 +255,6 @@ def test_identity_pushforward_partition_of_unity_gradients_physical():
 # =============================================================================
 
 from jno.utils.solver.fem_facets import (  # noqa: E402
-    FacetConnectivity,
     build_facet_connectivity,
     compute_face_normals,
     facet_quad_data,
@@ -276,7 +271,7 @@ def _unit_square_mesh():
 def test_facet_connectivity_counts():
     pts, cells = _unit_square_mesh()
     conn = build_facet_connectivity(cells, "triangle")
-    assert conn.n_bfaces == 4                       # 4 boundary edges, 1 interior diagonal
+    assert conn.n_bfaces == 4  # 4 boundary edges, 1 interior diagonal
     assert conn.parent_cell.shape == (4,)
     assert conn.local_face.shape == (4,)
     assert conn.face_nodes.shape == (4, 2)
@@ -330,5 +325,5 @@ def test_build_facet_connectivity_tet():
     # Two tets sharing a face: 3+3-1 = 5 boundary faces
     cells = np.array([[0, 1, 2, 3], [1, 2, 3, 4]])
     conn = build_facet_connectivity(cells, "tetrahedron")
-    assert conn.n_bfaces == 6          # 4 + 4 - 2 (shared face counted once from each, interior)
+    assert conn.n_bfaces == 6  # 4 + 4 - 2 (shared face counted once from each, interior)
     assert conn.face_nodes.shape[1] == 3
