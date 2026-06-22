@@ -1174,6 +1174,11 @@ class domain(MeshIOMixin):
             im_te.field_key = im_tr.field_key
             for _s in (re_tr, im_tr, re_te, im_te):
                 _s._domain = self
+                # Mark these as members of a complex (re, im) pair. The real-equivalent weak form
+                # couples re/im test functions within a single additive term, which the native
+                # assembler's one-test-field-per-term classifier rejects; jno.fem routes any form
+                # touching a complex field to the feax real-equivalent path.
+                _s._complex_field_member = True
             return (ComplexPair(re_tr, im_tr), ComplexPair(re_te, im_te))
         trial = TrialFunction(name=trial_name, value_shape=value_shape, order=order, space=space)
         test = TestFunction(name=test_name, value_shape=value_shape, order=order, space=space)

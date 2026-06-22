@@ -246,6 +246,15 @@ def _native_lagrange_ok(domain: Any, constraints: List[Any], weak_bares: List[An
         return False
     if any(_contains_fem_field_parameter(b) for b in weak_bares):
         return False
+    # complex=True fields: the real-equivalent form couples re/im test functions within one term,
+    # which the native one-test-field-per-term classifier rejects -> route to the feax real path.
+    if any(
+        getattr(n, "_complex_field_member", False)
+        for c in constraints
+        for n in _walk(_bare(c))
+        if isinstance(n, (TrialFunction, TestFunction))
+    ):
+        return False
     return True
 
 
@@ -1444,7 +1453,68 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         element_type = _element_for(domain.dimension, order)
     quad_degree = max(quad_degree, 2 * _order_of_element(element_type))
 
-    # ---- quadrature + BC setup (reuse init_fem) ----
+    # ---- build IR with explicit regions, then detect transient vs steady. This is done BEFORE
+    # init_fem so the native path can route without ever touching feax: split each weak constraint
+    # into additive sub-terms (one LoweredChannelTerm each), matching lower_weak_form's granularity --
+    # required so the transient route can separate the mass term (u_t * phi) from the spatial operator. ----
+    terms: List[LoweredChannelTerm] = []
+
+    def _emit_terms(bare: Any, support: str, region_id: str) -> None:
+        for sign, sub in _split_additive_terms(domain, bare):
+            terms.append(
+                LoweredChannelTerm(
+                    sign=sign,
+                    support=support,
+                    region_id=region_id,
+                    channel="raw",
+                    coeff=_apply_sign(domain, sign, sub),
+                    variable_id=0,
+                    value_shape=(),
+                    original_expr=sub,
+                )
+            )
+
+    for bare in volume_terms:
+        _emit_terms(bare, "volume", "volume")
+    for tag, exprs in boundary_terms.items():
+        for bare in exprs:
+            _emit_terms(bare, "boundary", tag)
+
+    if not terms:
+        raise ValueError("jno.fem: no weak-form (test-function) terms found to assemble.")
+
+    ir = LoweredWeakForm(domain=domain, terms=terms)
+    weak_bares = volume_terms + [e for exprs in boundary_terms.values() for e in exprs]
+    is_transient = any(_contains_temporal_derivative(b) for b in weak_bares)
+
+    # ---- native 2D Lagrange (single field): routed BEFORE init_fem so the native path never imports
+    # feax. Covers steady (incl. runtime-scalar-parametric) and transient (constant Dirichlet + a
+    # time-dependent source). complex / VPINN / periodic / 3D / field-param / time-varying-Dirichlet /
+    # transient-parametric fall through to the feax paths below. ----
+    if (
+        not is_vpinn
+        and _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
+        and not _is_complex_form(domain, ir)
+    ):
+        from .utils.solver.parametric_helpers import _contains_runtime_parameter as _crp
+
+        _native_now = True
+        if is_transient:
+            # native transient excludes runtime-parametric and time-varying Dirichlet g(x,t)
+            _native_now = not any(_crp(b) for b in weak_bares) and not any(
+                _is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw
+            )
+        if _native_now:
+            from .utils.solver.fem_native import assemble_fem_native
+
+            domain._feax_problem = None  # native owns this domain's FE state
+            op, mode, offs = assemble_fem_native(
+                domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=vec or 1, quad_degree=quad_degree
+            )
+            return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs))
+
+    # ---- quadrature + BC setup (reuse init_fem) -- feax-routed paths only (VPINN / complex /
+    # periodic / 3D / field-parameter / time-varying-Dirichlet / transient-parametric) ----
     bcs = [domain.dirichlet(tag, value) for tag, value in dirichlet_values.items()]
     if boundary_terms:
         bcs.append(neumann(list(boundary_terms.keys())))
@@ -1475,42 +1545,6 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
                 weak = weak + t
         return assemble_weak_form(domain, weak, target="vpinn")
 
-    # ---- build IR with explicit regions, then assemble through feax ----
-    # Split each weak constraint into additive sub-terms (one LoweredChannelTerm
-    # each), matching lower_weak_form's granularity — required so the transient
-    # route can separate the mass term (u_t * phi) from the spatial operator.
-    terms: List[LoweredChannelTerm] = []
-
-    def _emit_terms(bare: Any, support: str, region_id: str) -> None:
-        for sign, sub in _split_additive_terms(domain, bare):
-            terms.append(
-                LoweredChannelTerm(
-                    sign=sign,
-                    support=support,
-                    region_id=region_id,
-                    channel="raw",
-                    coeff=_apply_sign(domain, sign, sub),
-                    variable_id=0,
-                    value_shape=(),
-                    original_expr=sub,
-                )
-            )
-
-    for bare in volume_terms:
-        _emit_terms(bare, "volume", "volume")
-    for tag, exprs in boundary_terms.items():
-        for bare in exprs:
-            _emit_terms(bare, "boundary", tag)
-
-    if not terms:
-        raise ValueError("jno.fem: no weak-form (test-function) terms found to assemble.")
-
-    ir = LoweredWeakForm(domain=domain, terms=terms)
-
-    # ---- transient (a weak term carries a temporal derivative) vs steady ----
-    weak_bares = volume_terms + [e for exprs in boundary_terms.values() for e in exprs]
-    is_transient = any(_contains_temporal_derivative(b) for b in weak_bares)
-
     # Periodic + transient: the time route reduces M/A from the domain feax context *at assembly time*,
     # so build P on the (now-built) assembly mesh and feed it in BEFORE the time block is assembled
     # (mirrors what domain.periodic sets). FEM.solve then prolongs the trajectory via the route.
@@ -1526,25 +1560,8 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         domain.fem_context["periodic"] = periodic_holder[0]
 
     if is_transient:
-        # ---- native 2D Lagrange transient: constant (incl. non-homogeneous) Dirichlet + a
-        # time-dependent source. Excludes complex, runtime-parametric (native transient-parametric is
-        # not wired), periodic (via the gate), and time-varying Dirichlet g(x,t) -- those stay on feax. ----
-        from .utils.solver.parametric_helpers import _contains_runtime_parameter as _crp
-
-        if (
-            _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
-            and not _is_complex_form(domain, ir)
-            and not any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw)
-            and not any(_crp(b) for b in weak_bares)
-        ):
-            from .utils.solver.fem_native import assemble_fem_native
-
-            domain._feax_problem = None  # native owns this domain's FE state
-            op, mode, offs = assemble_fem_native(
-                domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=vec or 1, quad_degree=quad_degree
-            )
-            return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs))
-
+        # (Native transient already returned above, before init_fem; reaching here means a feax-only
+        # transient: complex, runtime-parametric, time-varying Dirichlet, periodic, or 3D.)
         from .utils.solver.time_route import _assemble_feax_time_from_ir
 
         if any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw):
@@ -1589,16 +1606,8 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         op_i = _assemble_fem_system_from_ir(domain, imag_ir)
         return _finalize(FEM(domain=domain, op=(op_r, op_i), classification=classification, mode="complex"))
 
-    # ---- native 2D Lagrange (steady, real, non-parametric): replaces feax on the nodal path ----
-    if _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties):
-        from .utils.solver.fem_native import assemble_fem_native
-
-        domain._feax_problem = None  # native owns this domain's FE state (avoid reading a stale feax mesh)
-        op, mode, offs = assemble_fem_native(
-            domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=vec or 1, quad_degree=quad_degree
-        )
-        return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs))
-
+    # (Native steady Lagrange already returned above, before init_fem; reaching here means a feax-only
+    # steady path: 3D, field-parameter, or another case the native gate excluded.)
     probe = ir.volume_expr if ir.volume_expr is not None else next(iter(ir.boundary_exprs.values()))
     target = _infer_solver_target(domain, probe)
     if target == "fem_system":
@@ -1693,6 +1702,8 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
         and all(str(f.get("space", "Lagrange")) == "Lagrange" for f in fields)
         and not _is_complex_form(domain, ir)
         and not any(_contains_runtime_parameter(b) for b in weak_bares)
+        # complex=True (re/im) fields couple two test functions per term -> feax real-equivalent path.
+        and not any(getattr(n, "_complex_field_member", False) for b in weak_bares for n in _walk(b))
     )
 
     # Coupled transient (multi-field + time): block M + block spatial operator A. Native handles
