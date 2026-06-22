@@ -17,8 +17,10 @@ Classification rule
 * a trial-only residual on a volume region is an error (a forgotten test
   function).
 
-This module does **not** solve. Users drive their own solve (``jnp.linalg.solve``,
-``scipy``); a ``.solve()`` layer over lineax/optimistix/diffrax is future work.
+For a plain forward solve you can drive your own solver off the assembled artefacts
+(``jnp.linalg.solve(fem.A, fem.b)``, ``scipy``). :meth:`FEM.solve` additionally provides a
+**differentiable** forward solve as a trace node — the entry point for inverse problems — with
+matrix-free defaults (BiCGStab / Newton–Krylov / backward-Euler) you can override via ``solve_fn``.
 """
 
 from __future__ import annotations
@@ -29,7 +31,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .trace import FemLinearSystem, GaugePin, ModelCall, TestFunction, TrialFunction, Variable
+from .trace import FemLinearSystem, GaugePin, ModelCall, RegionMask, TestFunction, TrialFunction, Variable
 
 __all__ = ["fem", "FEM"]
 
@@ -294,11 +296,28 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
             tag = tag[2:]
         return _normalize_quad_tag(tag, _bregions)
 
+    def _effective_tag(v) -> str:
+        # A coord reused from an earlier jno.fem() call has its `.tag` already rebound to the quadrature
+        # pool ("fem_gauss" / "gauss_<tag>"); recover its original region from `_jno_region_tag` so a
+        # sub-region term is still detected on reuse (see `_retag_coords_for_quadrature`).
+        t = v.tag
+        if isinstance(t, str) and (t == "fem_gauss" or t.startswith("gauss_")):
+            return getattr(v, "_jno_region_tag", t)
+        return t
+
     tags = {
-        _region_of(v.tag) for v in _spatial_coord_vars(constraint) if isinstance(v.tag, str) and not v.tag.startswith("__")
+        _region_of(_effective_tag(v))
+        for v in _spatial_coord_vars(constraint)
+        if isinstance(_effective_tag(v), str) and not _effective_tag(v).startswith("__")
     }
-    # The t=t0 slice is its own support; an IC residual lives here.
-    if "initial" in tags:
+    # The t=t0 slice is its own support; an IC residual lives here. A *velocity* IC `u.t(initial)-v0`
+    # carries its region only on the temporal variable (the `.t` derivative drops the spatial bind),
+    # tagged `__time_initial__` -- detect that so a second-order velocity IC classifies as 'initial'.
+    initial_temporal = any(
+        isinstance(n, Variable) and getattr(n, "axis", None) == "temporal" and getattr(n, "tag", None) == "__time_initial__"
+        for n in _walk(_bare(constraint))
+    )
+    if "initial" in tags or initial_temporal:
         return "initial", "initial"
     boundary_tags = {t for t in tags if t in getattr(domain, "_boundary_regions", {})}
     interiorish = tags - boundary_tags
@@ -309,6 +328,20 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
         )
     if boundary_tags:
         return "boundary", next(iter(boundary_tags))
+    # Interior sub-region (sub-domain) volume term: the coords carry a registered interior region --
+    # a geometry part (`_source_regions`) or a `domain.tag` predicate that is NOT a boundary region.
+    # The term integrates over that region's cells only (per-cell centroid mask, applied at assembly).
+    # The default whole-domain interior tags normalize to "volume", so they never match here.
+    src_regions = getattr(domain, "_source_regions", {}) or {}
+    tag_preds = getattr(domain, "_tag_predicates", {}) or {}
+    subregions = {t for t in interiorish if t in src_regions or (t in tag_preds and t not in _bregions)}
+    if len(subregions) > 1:
+        raise ValueError(
+            f"jno.fem: a volume residual spans multiple sub-regions {sorted(subregions)}; "
+            "each residual must live on a single region."
+        )
+    if subregions:
+        return "volume", next(iter(subregions))
     return "volume", "volume"
 
 
@@ -324,6 +357,12 @@ def _retag_coords_for_quadrature(constraint: Any, support: str, region_id: str) 
         # outward-normal Variables (`n_<region>`) are not quadrature coordinates -- leave their tag so a
         # `v·n` boundary term keeps the normal identifiable downstream.
         if isinstance(v.tag, str) and v.tag != "fem_gauss" and not v.tag.startswith(("gauss_", "n_")):
+            # Remember the region before rebinding to the quadrature pool. The retag must persist for
+            # lazy operators (nonlinear/transient re-read `.tag` at call time), but the SAME coord object
+            # is often reused in a later jno.fem() call, where region detection must still recover the
+            # original region -- `_region_and_support` reads `_jno_region_tag` when `.tag` is a quad tag.
+            if not hasattr(v, "_jno_region_tag"):
+                v._jno_region_tag = v.tag
             v.tag = target
 
 
@@ -1210,8 +1249,13 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             _retag_coords_for_quadrature(c, support, region)
             bare = _bare(c)
             if support == "volume":
+                if region != "volume":
+                    # Sub-domain term: multiply by the region's per-cell indicator so it integrates over
+                    # that region's cells only. Stays a plain volume term (whole-mesh quadrature); the
+                    # RegionMask zeroes the integrand outside the region (resolved in the FEAX kernel).
+                    bare = RegionMask(region) * bare
                 volume_terms.append(bare)
-                classification.append("volume")
+                classification.append("volume" if region == "volume" else f"volume@{region}")
             else:
                 boundary_terms.setdefault(region, []).append(bare)
                 classification.append(f"surface@{region}")
@@ -1256,6 +1300,46 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     if is_vpinn and (getattr(domain, "dimension", None) == 1 or multifield):
         raise NotImplementedError("jno.fem VPINN (network trial) is currently single-field 2D/3D only.")
 
+    # ---- second-order in time (`u_tt`): reduce to a first-order augmented (u, v=u_t) block ----
+    # A weak term carrying a SECOND temporal derivative is lowered to the equivalent first-order
+    # system in y=[u, v] (v=u_t) and integrated by the energy-conserving trapezoidal rule -- the
+    # canonical wave / elastodynamics path the first-order route cannot express. Intercept here,
+    # before the 1D / non-nodal / multifield branches, with explicit fail-loud scope guards.
+    from .utils.solver.solver_helper import max_temporal_derivative_order as _max_temporal_order
+
+    if any(_max_temporal_order(_bare(c)) >= 2 for c in constraints):
+        if periodic_ties:
+            raise NotImplementedError("jno.fem: periodic ties on a second-order-in-time problem are not supported yet.")
+        if getattr(domain, "dimension", None) == 1:
+            raise NotImplementedError(
+                "jno.fem: second-order-in-time (u_tt) is supported on 2D/3D domains only (the native 1D "
+                "assembler is first-order). Rewrite as a first-order system, or solve on a 2D domain."
+            )
+        if multifield:
+            raise NotImplementedError(
+                "jno.fem: second-order-in-time (u_tt) is single-field only for now; write the coupled "
+                "problem as a first-order system (one velocity field per second-order field)."
+            )
+        if _trial_spaces(constraints) - {"Lagrange"}:
+            raise NotImplementedError("jno.fem: second-order-in-time (u_tt) is supported on nodal Lagrange elements only.")
+        if any(isinstance(n, RegionMask) for b in volume_terms for n in _walk(b)):
+            raise NotImplementedError(
+                "jno.fem per-region integration on a second-order-in-time problem is not wired yet — "
+                "sub-region terms are currently supported on steady problems only."
+            )
+        return _assemble_second_order_time(
+            domain,
+            volume_terms,
+            boundary_terms,
+            dirichlet_values,
+            dirichlet_raw,
+            ic_residuals,
+            classification,
+            order=_infer_order(constraints),
+            vec=vec or 1,
+            quad_degree=quad_degree,
+        )
+
     # ---- non-nodal element families (RT / Nedelec / Argyris): native push-forward assembler ----
     # feax can't assemble these (no push-forward), so -- like the 1D path -- assemble natively and reuse
     # the shared integrand evaluator (which carries space-guarded branches for the physical basis).
@@ -1274,6 +1358,15 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     if getattr(domain, "dimension", None) == 1:
         from .utils.solver.fem_1d import assemble_fem_1d, assemble_fem_1d_multifield
 
+        # The native 1D assembler is LINE2 (P1) only; a P2 request would otherwise be silently
+        # ignored (the order is dropped on this path). Fail loud instead -- a wrong-order solve
+        # is a silently wrong result, which this stack never returns. (P2 is 2D/3D only.)
+        if _infer_order(constraints) > 1:
+            raise NotImplementedError(
+                "jno.fem: higher-order (P2) elements are not available on a 1D line domain -- the "
+                "native 1D assembler is P1 (LINE2) only. Use order=1, or refine the mesh "
+                "(smaller mesh_size) for accuracy. (P2 promotion is supported on 2D/3D domains.)"
+            )
         if multifield:  # coupled 1D -> native block assembly (feax has no LINE2 element)
             op, mode = assemble_fem_1d_multifield(
                 domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, quad_degree=quad_degree
@@ -1523,6 +1616,7 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
     if any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares):
         op = _assemble_fem_residual_from_ir(domain, ir)
         return FEM(domain=domain, op=op, classification=classification, mode="nonlinear")
+    # (frozen coefficients in a coupled form are rejected up front in fem(); this stays the plain path)
     op = _assemble_fem_system_from_ir(domain, ir)
     return FEM(domain=domain, op=op, classification=classification, mode="linear")
 
@@ -1599,6 +1693,249 @@ def _time_varying_dirichlet_lift(domain, prob, bc, A, dirichlet_tv, fields, fiel
         return A @ u0 - res  # steady RHS for g(t): g on Dirichlet rows, -A_fd·g on free rows
 
     return lift_fn
+
+
+def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -> Any:
+    """Nodal value vector (``n`` dofs, node-major interleaved for ``vec>1``) from an IC residual
+    ``<trial-expr>(initial) - g``.
+
+    Like :func:`_initial_state` but tolerant of a temporal-derivative trial side, so it reads both
+    the displacement IC (``u(initial) - u0``) and the velocity IC (``u.t(initial) - v0``) — the
+    latter's trial side is ``Jacobian(u, [t])``, which :func:`_essential_spec` rejects. ``g`` is
+    evaluated at the **assembly** nodes ``pts`` (P2 carries edge nodes, so they differ from the
+    linear mesh); a vector ``g`` may be a constant per-component tuple (broadcast to every node), a
+    full ``(n_nodes·vec,)`` field, or a single scalar (broadcast to all components)."""
+    trial_side = value_node = None
+    if getattr(bare, "op", None) == "-" and hasattr(bare, "left") and hasattr(bare, "right"):
+        left, right = bare.left, bare.right
+        if _contains(left, TrialFunction) and not _contains(right, TrialFunction):
+            trial_side, value_node = left, right
+        elif _contains(right, TrialFunction) and not _contains(left, TrialFunction):
+            trial_side, value_node = right, left
+    if value_node is None:
+        return jnp.zeros((n,))
+    comp = _component_index_of(trial_side)  # one component (u(...)[i] - g) vs all (u(...) - g)
+    n_nodes = int(jnp.asarray(pts).shape[0])
+    const = _constant_of(value_node)
+    if const is not None:
+        if comp is None:
+            return jnp.full((n,), float(const))  # scalar broadcast to every dof
+        return jnp.zeros((n,)).at[comp::vec].set(float(const))  # one component only
+    vals = jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts))).reshape(-1)
+    if comp is not None:  # one component: vals is a scalar field (or constant) over the nodes
+        per = jnp.broadcast_to(vals, (n_nodes,)) if vals.shape[0] != n_nodes else vals
+        return jnp.zeros((n,)).at[comp::vec].set(per)
+    if vals.shape[0] == n:  # full (n_nodes·vec,) interleaved field
+        return vals
+    if vec > 1 and vals.shape[0] == vec:  # constant per-component vector -> broadcast to every node
+        return jnp.tile(vals, n_nodes)
+    if vec > 1 and vals.shape[0] == n_nodes:  # one scalar field shared by every component
+        return jnp.repeat(vals, vec)
+    if vals.shape[0] == 1:  # single scalar -> every dof
+        return jnp.full((n,), vals[0])
+    if vals.shape[0] == n_nodes:  # scalar problem, scalar field
+        return vals
+    raise NotImplementedError(
+        f"jno.fem: could not place an initial condition of size {vals.shape[0]} into {n} dofs "
+        f"(vec={vec}); write it as a constant, a per-component value, or a full nodal field."
+    )
+
+
+def _assemble_second_order_time(
+    domain,
+    volume_terms,
+    boundary_terms,
+    dirichlet_values,
+    dirichlet_raw,
+    ic_residuals,
+    classification,
+    *,
+    order,
+    vec,
+    quad_degree,
+):
+    r"""Reduce a linear second-order-in-time weak form to a first-order augmented block.
+
+    A second-order semidiscrete system :math:`M_2 \ddot u + C \dot u + K u = F` is rewritten with
+    the velocity :math:`v = \dot u` as the first-order block
+    :math:`M_\text{aug}\,\dot y + A_\text{aug}\,y = c_\text{aug}` in :math:`y = [u; v]`::
+
+        [M2  0 ] [u']   [ 0   -M2] [u]   [0]
+        [0   M2] [v'] + [ K    C ] [v] = [F]
+
+    i.e. :math:`M_2\dot u = M_2 v` (the definition :math:`v=\dot u`) and
+    :math:`M_2\dot v + Cv + Ku = F` (the PDE). The block integrates with the **trapezoidal rule**
+    (the :math:`\theta=\tfrac12` default, equivalent to Newmark average-acceleration), which
+    conserves energy for an undamped wave where backward Euler would spuriously damp it
+    (Newmark 1959, "A Method of Computation for Structural Dynamics", §average-acceleration). It is a
+    standard :class:`FeaxTimeBlock`, so the differentiable :meth:`FEM.solve` and the flat ``fem.M`` /
+    ``fem.state0`` accessors are unchanged; the state is ``y=[u; v]`` (size ``2N``), split via
+    ``fem.offsets`` (``[0, N, 2N]``) — displacement ``y[:N]``, velocity ``y[N:]``.
+
+    Scope: linear, single field — **scalar or vector** (vector = elastodynamics, ``value_shape=(2,)``
+    / ``(3,)``) — nodal Lagrange, 2D/3D, constant Dirichlet. Two initial conditions: displacement
+    ``u(initial) - u0`` and (optional) velocity ``u.t(initial) - v0`` (default zero). Nonlinear,
+    multi-field, runtime-parameter, or time-varying-Dirichlet second-order forms are rejected
+    (fail-loud) rather than silently mis-assembled.
+    """
+    from .utils.solver.backend_blocks import FeaxTimeBlock
+    from .utils.solver.feax_utils import _dense_array
+    from .utils.solver.fem_route import _assemble_fem_system_from_ir, neumann
+    from .utils.solver.parametric_helpers import _contains_runtime_parameter
+    from .utils.solver.solver_helper import max_temporal_derivative_order as _mto
+    from .utils.solver.time_route import _infer_time_window, _strip_temporal_trial_derivative
+    from .utils.solver.weak_form import (
+        LoweredChannelTerm,
+        LoweredWeakForm,
+        _apply_sign,
+        _is_obviously_nonlinear_in_unknown,
+        _split_additive_terms,
+    )
+
+    vec = int(vec)
+
+    # ---- fail-loud guards (a mis-assembled second-order solve is a silently wrong result) ----
+    weak_bares = list(volume_terms) + [e for exprs in boundary_terms.values() for e in exprs]
+    if any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares):
+        raise NotImplementedError(
+            "jno.fem: a nonlinear second-order-in-time form is not supported; linearize it or write a first-order system."
+        )
+    if any(_contains_runtime_parameter(b) for b in weak_bares):
+        raise NotImplementedError(
+            "jno.fem: runtime/trainable parameters in a second-order-in-time form are not supported yet; "
+            "recover parameters on a first-order (reduced) form instead."
+        )
+    if any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw):
+        raise NotImplementedError(
+            "jno.fem: time-varying Dirichlet g(x,t) on a second-order-in-time problem is not supported "
+            "(the velocity boundary value v=g_t is taken as zero); use a constant Dirichlet value."
+        )
+
+    # ---- element + quadrature + BC setup (mirrors the single-field path) ----
+    element_type = _element_for(domain.dimension, order)
+    quad_degree = max(quad_degree, 2 * _order_of_element(element_type))
+    bcs = [domain.dirichlet(tag, value) for tag, value in dirichlet_values.items()]
+    if boundary_terms:
+        bcs.append(neumann(list(boundary_terms.keys())))
+    domain.init_fem(element_type=element_type, quad_degree=quad_degree, bcs=bcs, vec=vec, fem_solver=True)
+
+    # ---- split each volume term by its temporal order: 2 -> mass M2, 1 -> damping C, 0 -> stiffness/load ----
+    def _strip(coeff, times):
+        for _ in range(times):
+            coeff = _strip_temporal_trial_derivative(coeff)
+        return coeff
+
+    def _term(coeff, region_id="volume", support="volume"):
+        return LoweredChannelTerm(
+            sign=1,
+            support=support,
+            region_id=region_id,
+            channel="raw",
+            coeff=coeff,
+            variable_id=0,
+            value_shape=(),
+            original_expr=coeff,
+        )
+
+    mass2_terms, damp_terms, stiff_terms = [], [], []
+    for bare in volume_terms:
+        for sign, sub in _split_additive_terms(domain, bare):
+            coeff = _apply_sign(domain, sign, sub)
+            o = _mto(sub)
+            if o >= 2:
+                mass2_terms.append(_term(_strip(coeff, 2)))  # u_tt * phi -> mass bilinear (u, phi)
+            elif o == 1:
+                damp_terms.append(_term(_strip(coeff, 1)))  # u_t * phi -> damping bilinear (u, phi)
+            else:
+                stiff_terms.append(_term(coeff))  # spatial operator + load
+    for tag, exprs in boundary_terms.items():
+        for bare in exprs:
+            for sign, sub in _split_additive_terms(domain, bare):
+                stiff_terms.append(_term(_apply_sign(domain, sign, sub), region_id=tag, support="boundary"))
+
+    if not mass2_terms:
+        raise ValueError("jno.fem: second-order route found no `u_tt * phi` mass term.")
+
+    def _ir(terms):
+        return LoweredWeakForm(domain=domain, terms=terms)
+
+    # Raw (no-Dirichlet) physics blocks; Dirichlet is applied explicitly to the 2N system below
+    # (non-symmetric row replacement, as the first-order transient does -- keep columns, replace rows).
+    M2 = jnp.asarray(
+        _dense_array(
+            _assemble_fem_system_from_ir(domain, _ir(mass2_terms), apply_dirichlet=False, store_on_domain=False)[0]
+        )
+    )
+    n = int(M2.shape[0])
+    dtype = M2.dtype
+    C = (
+        jnp.asarray(
+            _dense_array(
+                _assemble_fem_system_from_ir(domain, _ir(damp_terms), apply_dirichlet=False, store_on_domain=False)[0]
+            )
+        )
+        if damp_terms
+        else jnp.zeros((n, n), dtype=dtype)
+    )
+    K_raw, F_raw = _assemble_fem_system_from_ir(domain, _ir(stiff_terms), apply_dirichlet=False, store_on_domain=False)
+    K = jnp.asarray(_dense_array(K_raw))
+    F = jnp.asarray(F_raw).reshape(-1)
+    # Dirichlet-applied stiffness: its load carries the prescribed value g on the Dirichlet rows,
+    # and it leaves the feax problem on the domain (so fem.points / fem.dofs resolve).
+    _, F_bc = _assemble_fem_system_from_ir(domain, _ir(stiff_terms))
+    F_bc = jnp.asarray(F_bc).reshape(-1)
+
+    bc = getattr(domain, "_feax_bc", None)
+    rows = jnp.asarray(getattr(bc, "bc_rows", np.zeros((0,), dtype=int))).reshape(-1).astype(int)
+    g = F_bc[rows] if int(rows.shape[0]) else F_bc[:0]
+
+    # ---- compose the 2N augmented system M_aug y' + A_aug y = c_aug, y = [u; v] ----
+    Z = jnp.zeros((n, n), dtype=dtype)
+    M_aug = jnp.block([[M2, Z], [Z, M2]])
+    A_aug = jnp.block([[Z, -M2], [K, C]])
+    c_aug = jnp.concatenate([jnp.zeros((n,), dtype), F])
+
+    # Dirichlet: u-block row d reads u[d]=g; v-block row d reads v[d]=0 (constant g => velocity zero).
+    if int(rows.shape[0]):
+        M_aug = M_aug.at[rows, :].set(0.0).at[rows + n, :].set(0.0)
+        A_aug = A_aug.at[rows, :].set(0.0).at[rows, rows].set(1.0)  # u[d] = g
+        A_aug = A_aug.at[rows + n, :].set(0.0).at[rows + n, rows + n].set(1.0)  # v[d] = 0
+        c_aug = c_aug.at[rows].set(g).at[rows + n].set(0.0)
+
+    # ---- initial state y0 = [u0; v0] from the displacement and (optional) velocity ICs ----
+    prob = getattr(domain, "_feax_problem", None)
+    pts = (
+        jnp.asarray(prob.mesh[0].points)[:, : domain.dimension]
+        if prob is not None
+        else jnp.asarray(domain.mesh.points)[:, : domain.dimension]
+    )
+    u0 = jnp.zeros((n,), dtype)
+    v0 = jnp.zeros((n,), dtype)
+    for ic in ic_residuals:
+        val = jnp.asarray(_ic_value_at_nodes(_bare(ic), domain, pts, n, vec), dtype)
+        if _mto(_bare(ic)) >= 1:
+            v0 = val
+        else:
+            u0 = val
+    state0 = jnp.concatenate([u0, v0])
+
+    t0, t1, dt = _infer_time_window(domain)
+    block = FeaxTimeBlock(
+        backend="feax_time",
+        mode="implicit",
+        time_order=2,
+        spatial_kind="weak_form",
+        M=M_aug,
+        A=A_aug,
+        affine_bias=c_aug,
+        state0=state0,
+        t0=t0,
+        t1=t1,
+        dt=dt,
+        feax_context=getattr(domain, "_feax_context", {}) or {},
+        metadata={"theta": 0.5, "second_order": True},
+    )
+    return FEM(domain=domain, op=block, classification=classification, mode="transient", offsets=[0, n, 2 * n])
 
 
 def _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals, classification, dirichlet_tv=()):

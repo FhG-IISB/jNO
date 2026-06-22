@@ -168,6 +168,116 @@ for _ in range(round((fem.t1 - fem.t0) / dt)):          # backward Euler
     w = jnp.linalg.solve(M + dt * A, M @ w)
 ```
 
+### Second order in time (`u_tt`) — wave / elastodynamics
+
+A weak form carrying a **second** time derivative (`ui.tt`) is auto-reduced to the equivalent
+first-order system in `y = [u, v]` (velocity `v = u_t`) and integrated by the energy-conserving
+**trapezoidal rule** (θ=½, equivalent to Newmark average-acceleration — Newmark 1959, *"A Method of
+Computation for Structural Dynamics"*, J. Eng. Mech. Div. ASCE 85(3), the constant-average-acceleration
+case β=¼, γ=½) — backward Euler would spuriously damp an undamped wave. A second-order
+problem needs **two** initial conditions: displacement `u(initial) - u0` and velocity
+`u.t(initial) - v0` (bind the velocity IC with the `"initial"`-slice coordinates *and time*,
+`u.bind(x=xi0, y=yi0, t=ti0).t`; a missing velocity IC defaults to zero).
+
+```python
+d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1, time=(0.0, 2.0, 200))
+u, phi = d.fem_symbols()
+xi, yi, ti = d.variable("interior", split=True)
+xb, yb, _ = d.variable("boundary", split=True)
+xi0, yi0, ti0 = d.variable("initial", split=True)          # initial slice: coords + time
+ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+ui0 = u.bind(x=xi0, y=yi0, t=ti0)
+
+# u_tt = Δu  ->  ∫ u_tt φ + ∫ ∇u·∇φ = 0
+fem = jno.fem([ui.tt * vi + (ui.x * vi.x + ui.y * vi.y),
+               u(xb, yb) - 0.0,                            # fixed boundary
+               u(xi0, yi0) - jno.fn(u0_fn, [xi0, yi0]),    # displacement IC
+               ui0.t - 0.0])                               # velocity IC (here: at rest)
+```
+
+The assembled block is a standard transient block, so `fem.M` / `fem.state0` and the differentiable
+`fem.solve()` work unchanged. The state is `y = [u; v]` of size `2N`; use `fem.offsets` (`[0, N, 2N]`)
+to split it — displacement is `y[:N]`, velocity `y[N:]`. Add a damping term `c * ui.t * vi` for a
+damped wave.
+
+> **Integrate with `fem.solve()` — or step with θ=½ yourself.** The energy-conserving trapezoidal
+> rule lives inside `fem.solve()`. Unlike the first-order (parabolic) block above, **do not** hand-roll
+> backward Euler `(M + dt·A) w = M·w` off `fem.M` / `fem.operator.A` on a second-order block: backward
+> Euler spuriously **damps** the wave. If you integrate manually, use the trapezoidal step
+> `(M + ½·dt·A) w_next = (M − ½·dt·A) w + dt·c`.
+
+A **vector** field works too (`value_shape=(2,)`/`(3,)`) — that is elastodynamics,
+`ρ u_tt = ∇·σ(u)` (see the vibrating-cantilever tutorial). *Scope: linear, single field (scalar or
+vector), nodal Lagrange, 2D/3D, constant Dirichlet; nonlinear / multi-field / runtime-parameter /
+time-varying-Dirichlet second-order forms are rejected (fail-loud) — write those as a first-order
+system.*
+
+---
+
+## Coefficient fields — known (`.freeze()`) vs trainable
+
+A coefficient in the weak form (a conductivity `k`, an emissivity, a source weight) can be a plain
+constant, a **coordinate function** `jno.fn(lambda x, y: ...)`, or a `jno.np.parameter` — written
+straight into the math like any other value:
+
+```python
+k = jno.np.parameter(phi).initialize(lambda x, y: 1.0 + 4.0 * x).freeze()   # KNOWN coefficient
+fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
+u_h = jnp.linalg.solve(fem.A, fem.b)                                        # non-parametric forward solve
+```
+
+A `jno.np.parameter` is a **trainable** unknown by default — it makes the system runtime-parametric
+(resolved through `crux`, see below). Marking it **`.freeze()`** declares it a *known* coefficient:
+`jno.fem` evaluates its `.initialize` value at the quadrature points — exactly like `jno.fn` — so the
+system assembles non-parametrically (`fem.A` / `fem.b`, no `crux`) **and works in every form**
+(steady-linear, nonlinear, transient, coupled). The frozen value is a **scalar** (`.initialize(3.0)`)
+or a **coordinate function** (`.initialize(lambda x, y: ...)`, scalar- or vector-valued); a raw
+per-node array, a JAX initializer, or no value all fail loud (a known coefficient is a function/const,
+not nodal data — for nodal data interpolate it into a function). Leave the parameter **un-frozen** to
+make it an inverse unknown — the next section.
+
+> `.freeze()` is equivalent to writing `jno.fn(...)` / the constant directly; it exists so one
+> `jno.np.parameter` can be *trained* (un-frozen) or *fixed* (frozen) without rewriting the form. A
+> vector-valued coefficient is best written **per component** with scalar functions (a single function
+> returning a tuple hits a FEAX-kernel limit shared with `jno.fn`).
+
+---
+
+## Per-region (sub-domain) integration
+
+A weak term integrates over the **region of the coordinates it is written on** — exactly the rule that
+already routes boundary terms. Bind the trial/test to `domain.variable("interior")` and the term covers
+the whole domain; bind them to a **sub-region's** coordinates and the term integrates over that
+sub-domain's cells only. No new function — name a region with `domain.tag(name, predicate)` (or use a
+multi-part mesh's geometry parts) and ask for its coordinates with `domain.variable(name, split=True)`:
+
+```python
+d.tag("core", lambda x, y: (x - 0.5)**2 + (y - 0.5)**2 < 0.2**2)   # an interior sub-region
+xc, yc, _ = d.variable("core", split=True)
+uc, vc = u.bind(x=xc, y=yc), phi.bind(x=xc, y=yc)
+
+fem = jno.fem([
+    ui.x * vi.x + ui.y * vi.y,            # ∫_Ω   ∇u·∇v        (whole domain)
+    9.0 * (uc.x * vc.x + uc.y * vc.y),    # ∫_core 9 ∇u·∇v     (k = 1 outside, 10 inside `core`)
+    q * vc,                               # ∫_core q·v          (a localized source)
+    u(xb, yb) - 0.0,
+])
+```
+
+Multi-material conduction is then *one term per material* (each on its region's coordinates); a
+data-fit / QoI confined to a region is `(uc - u_data) * vc`. A cell belongs to a region iff its
+**centroid** does (classified once at assembly — exact when the mesh respects the region boundaries,
+e.g. gmsh meshing each part separately; for an arbitrary predicate on a non-conforming mesh it is
+centroid-accurate, O(h) at the interface). Region integration is a scalar mask on the integrand, so it
+**composes with everything**: constant / `jno.fn` / `.freeze()` / trainable coefficients, and the
+steady-linear, nonlinear, transient, coupled (multi-field), and 3-D forms. In particular a
+`jno.np.parameter` that multiplies a sub-region term is recovered **per sub-domain** through `crux` —
+fit a per-material property on its own region (see *Inverse problems*).
+
+> Not yet wired: second-order-in-time (`u_tt`) sub-region terms — they fail loud rather than silently
+> integrate over the whole domain. 3-D sub-regions are defined by a predicate `where(x, y, z)`
+> (shapely polygons are planar).
+
 ---
 
 ## Differentiable solve & inverse problems
@@ -241,10 +351,12 @@ The [FEM tutorials](tutorials/08-fem-and-varpinns/poisson-2d-fem.md) cover every
 Poisson, mixed Dirichlet/Robin reaction–diffusion, a nonlinear Allen–Cahn interface, a 3-D
 Helmholtz solve on an extruded domain, mixed-BC Helmholtz, a linear-elastic cantilever beam,
 Poiseuille channel flow (Stokes), transient heat, and two inverse problems (a hidden
-diffusivity field and a transient rate). The non-nodal families add an **H(div) mixed Poisson**
-(Raviart–Thomas + P0) and an **H(curl) Maxwell / eddy-current** example (Nédélec edge elements,
-`maxwell_nedelec_2d.py`); a **variational PINN** writes a neural-network trial straight into the
-same `jno.fem` weak form.
+diffusivity field and a transient rate). Two **second-order-in-time** examples show the wave path:
+a **vibrating membrane** (`wave_membrane_2d.py`, verified against the analytic standing wave) and a
+**vibrating cantilever** (`elastodynamics_cantilever_2d.py`, vector elastodynamics verified by energy
+conservation). The non-nodal families add an **H(div) mixed Poisson** (Raviart–Thomas + P0) and an
+**H(curl) Maxwell / eddy-current** example (Nédélec edge elements, `maxwell_nedelec_2d.py`); a
+**variational PINN** writes a neural-network trial straight into the same `jno.fem` weak form.
 
 ---
 
@@ -262,10 +374,14 @@ silently wrong result.
   constant and place affine trainable parameters in the operator/residual instead
   — e.g. a diffusivity `nu` on the stiffness term, not on the time derivative.
 
-- **First order in time only.** The Diffrax and FEAX time-stepping adapters handle
-  first-order semidiscrete systems. A second-order-in-time PDE (such as the
-  undamped wave equation, `u_tt = c² Δu`) must be rewritten as a first-order
-  system; it cannot be assembled as a single second-order block.
+- **Second-order in time is scoped.** A second-order-in-time weak form (`u_tt`, e.g.
+  the wave equation `u_tt = c² Δu`, or elastodynamics `ρ u_tt = ∇·σ`) **is** assembled —
+  `jno.fem` auto-reduces it to a first-order augmented `(u, v=u_t)` block, integrated by the
+  energy-conserving trapezoidal rule (see *Second order in time* above). It is scoped to
+  **linear, single field (scalar or vector), nodal Lagrange, 2D/3D, constant Dirichlet**;
+  a nonlinear, multi-field, runtime-parameter, or time-varying-Dirichlet second-order form
+  is rejected (fail-loud) — rewrite those as a first-order system. The Diffrax /
+  residual-PINN strong-form adapters remain first-order (manual reduction).
 
 - **No runtime Dirichlet parameters.** A trainable parameter may sit in the
   operator (stiffness) but not in an essential/Dirichlet boundary *value*: a

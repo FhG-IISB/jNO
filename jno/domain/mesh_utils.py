@@ -895,9 +895,179 @@ class MeshUtils:
         return F_op
 
     @staticmethod
+    def get_view_factor_axisymmetric(P, VM, Nrm, ds, n_phi: int = 16):
+        r"""Axisymmetric (cylindrical) point-to-point view-factor matrix ``F_op[i, j]``.
+
+        For a body of revolution the enclosure is described in the meridional ``(r, z)`` half-plane
+        (``P[:, 0] = r``, ``P[:, 1] = z``); by rotational symmetry the receiver ``i`` is fixed at
+        azimuth ``phi = 0`` and the source ``j`` is a full ring, integrated over the azimuthal angle:
+
+        .. math::
+            F_{ij} \approx r_j \, \mathrm{ds}_j \, \frac{1}{n_\phi}
+                \sum_{m} \frac{\cos\theta_i(\phi_m)\,\cos\theta_j(\phi_m)}{\pi R(\phi_m)^2}
+
+        a midpoint quadrature (``n_phi`` uniform samples) of the diffuse point-to-ring kernel. The
+        factor ``r_j`` is the cylindrical Jacobian of the ring. Only the self-pair (diagonal) is
+        removed; same-surface concave self-view is left to the visibility matrix ``VM``.
+
+        Reference: M. F. Modest, *Radiative Heat Transfer*, 3rd ed., Ch. 4 (view factors;
+        bodies of revolution / the crossed-strings and ring-integration constructions).
+        """
+        n = P.shape[0]
+        r = P[:, 0]
+        z = P[:, 1]
+        nr = Nrm[:, 0]
+        nz = Nrm[:, 1]
+
+        phi = jnp.linspace(0.0, 2.0 * jnp.pi, n_phi, endpoint=False)  # (M,)
+
+        # Shape expansions: (N_i, N_j, M)
+        r_i, z_i, nr_i, nz_i = (a[:, None, None] for a in (r, z, nr, nz))
+        r_j, z_j, nr_j, nz_j = (a[None, :, None] for a in (r, z, nr, nz))
+        phi_m = phi[None, None, :]
+
+        # Displacement from receiver i (at phi=0) to source j (at angle phi_m)
+        dx = r_j * jnp.cos(phi_m) - r_i  # (N_i, N_j, M)
+        dy = r_j * jnp.sin(phi_m)
+        dz = z_j - z_i
+
+        R2 = dx**2 + dy**2 + dz**2
+        R = jnp.sqrt(R2 + 1e-30)
+
+        # cos theta_i: n_i (2D, in the r-z plane at phi=0) dotted with the 3D direction
+        cos_i = (nr_i * dx + nz_i * dz) / R
+        # cos theta_j: n_j rotated into 3D = (nr_j cos phi, nr_j sin phi, nz_j); take negative dot
+        dot_j = nr_j * jnp.cos(phi_m) * dx + nr_j * jnp.sin(phi_m) * dy + nz_j * dz
+        cos_j = -dot_j / R
+
+        cos_i = jnp.maximum(0.0, cos_i)
+        cos_j = jnp.maximum(0.0, cos_j)
+
+        # Azimuthal integral of the diffuse kernel: int_0^2pi (...) dphi ~= (2pi/n_phi) * sum_m (...).
+        # (A plain mean would compute the ring AVERAGE and underestimate the view factor by 2*pi.)
+        dphi = 2.0 * jnp.pi / n_phi
+        kernel = dphi * jnp.sum(cos_i * cos_j / (jnp.pi * R2 + 1e-30), axis=-1)  # (N_i, N_j)
+        F_op = kernel * r[None, :] * VM * ds[None, :]
+        F_op = F_op * (1 - jnp.eye(n))
+        return F_op
+
+    @staticmethod
     def get_view_factor_1d(P, VM, Nrm, ds):
         n_pts = P.shape[0]
         return jnp.ones(n_pts)
+
+    @staticmethod
+    def get_view_factor_2d_element(E0, E1, Nrm, VM, n_quad: int = 3):
+        r"""Element-based 2D view-factor matrix ``F[i, j]`` by double-area Gauss quadrature.
+
+        Each radiating boundary element is a straight segment ``[E0_k, E1_k]`` with constant outward
+        normal ``Nrm_k`` (pointing into the enclosure). The diffuse exchange factor between elements is
+
+        .. math::
+            F_{ij} = \frac{1}{L_i} \int_{e_i}\!\int_{e_j}
+                      \frac{\cos\theta_i\,\cos\theta_j}{2\,r}\; \mathrm{d}s_j\,\mathrm{d}s_i ,
+
+        evaluated with ``n_quad`` Gauss-Legendre points per element (``n_quad=1`` reduces to the
+        midpoint/point kernel). Integrating over the element extent (rather than a single point) is what
+        makes the near-field self-view of concave surfaces accurate. ``VM`` is the element-to-element
+        visibility (0/1) carrying occlusion; only the self-pair (diagonal) is otherwise removed.
+
+        Reference: M. F. Modest, *Radiative Heat Transfer*, 3rd ed., Ch. 4 (diffuse view factors).
+        """
+        E0 = jnp.asarray(E0)
+        E1 = jnp.asarray(E1)
+        Nrm = jnp.asarray(Nrm)
+        m = E0.shape[0]
+
+        gx, gw = np.polynomial.legendre.leggauss(int(n_quad))  # nodes/weights on [-1, 1]
+        s = jnp.asarray((gx + 1.0) * 0.5)  # -> [0, 1]   (n_quad,)
+        wq = jnp.asarray(gw * 0.5)  # weights sum to 1 on [0, 1]
+
+        length = jnp.linalg.norm(E1 - E0, axis=-1)  # (m,)
+        qp = E0[:, None, :] + s[None, :, None] * (E1 - E0)[:, None, :]  # (m, n_quad, 2)
+        qw = wq[None, :] * length[:, None]  # (m, n_quad) -> sums to L_i over the element
+        qp = qp.reshape(m * int(n_quad), 2)
+        qw = qw.reshape(-1)  # (M,)
+        qn = jnp.repeat(Nrm, int(n_quad), axis=0)  # (M, 2) element normal per quad point
+
+        mq = qp.shape[0]
+        v = qp[None, :, :] - qp[:, None, :]  # (M, M, 2)
+        r = jnp.linalg.norm(v, axis=-1)
+        r_safe = r + jnp.eye(mq)
+        rh = v / r_safe[..., None]
+        cos_i = jnp.maximum(0.0, jnp.sum(qn[:, None, :] * rh, axis=-1))
+        cos_j = jnp.maximum(0.0, -jnp.sum(qn[None, :, :] * rh, axis=-1))
+        kernel = cos_i * cos_j / (2.0 * r_safe)  # (M, M)
+
+        g = qw[:, None] * qw[None, :] * kernel  # (M, M) quad-pair contributions
+        # Block-sum quad pairs back to elements (quads are grouped contiguously per element).
+        F = g.reshape(m, int(n_quad), m, int(n_quad)).sum(axis=(1, 3)) / length[:, None]  # (m, m)
+        F = F * jnp.asarray(VM) * (1.0 - jnp.eye(m))
+        return F
+
+    @staticmethod
+    def get_view_factor_axisymmetric_element(E0, E1, Nrm, VM, n_quad: int = 3, n_phi: int = 16):
+        r"""Element-based axisymmetric view-factor matrix ``F[i, j]`` for a body of revolution.
+
+        Each element is a meridional segment ``[E0_k, E1_k]`` in the ``(r, z)`` half-plane (a frustum
+        ring when revolved), with constant normal ``Nrm_k`` pointing into the enclosure. The exchange
+        factor combines **meridional element quadrature** (``n_quad`` Gauss points along each element,
+        as in :meth:`get_view_factor_2d_element`) with **azimuthal integration** of the diffuse
+        point-to-ring kernel (``n_phi`` samples; the integral is ``(2π/n_phi)·Σ``, *not* a mean):
+
+        .. math::
+            F_{ij} = \frac{\sum_{q\in e_i} r_q w_q \big[\sum_{p\in e_j} r_p w_p
+                      \,(2\pi/n_\phi)\textstyle\sum_\phi \cos\theta_q \cos\theta_p/(\pi R^2)\big]}
+                     {\sum_{q\in e_i} r_q w_q}
+
+        i.e. the source-ring view factor (area-weighted by ``r_p w_p``) averaged over the receiver
+        element's rings (weighted by ``r_q w_q``). ``VM`` is element-to-element visibility (occlusion).
+        ``n_quad=1`` recovers the single-point-per-ring kernel.
+
+        Reference: M. F. Modest, *Radiative Heat Transfer*, 3rd ed., Ch. 4 (bodies of revolution).
+        """
+        E0 = jnp.asarray(E0)
+        E1 = jnp.asarray(E1)
+        Nrm = jnp.asarray(Nrm)
+        m = E0.shape[0]
+        nq = int(n_quad)
+
+        gx, gw = np.polynomial.legendre.leggauss(nq)
+        s = jnp.asarray((gx + 1.0) * 0.5)
+        wq = jnp.asarray(gw * 0.5)
+        length = jnp.linalg.norm(E1 - E0, axis=-1)  # (m,) meridional length
+        qp = (E0[:, None, :] + s[None, :, None] * (E1 - E0)[:, None, :]).reshape(m * nq, 2)  # (M, 2)
+        w_merid = (wq[None, :] * length[:, None]).reshape(-1)  # (M,) meridional ds per quad
+        qn = jnp.repeat(Nrm, nq, axis=0)  # (M, 2)
+
+        r = qp[:, 0]
+        z = qp[:, 1]
+        nr = qn[:, 0]
+        nz = qn[:, 1]
+        phi = jnp.linspace(0.0, 2.0 * jnp.pi, n_phi, endpoint=False)
+        dphi = 2.0 * jnp.pi / n_phi
+
+        r_i, z_i, nr_i, nz_i = (a[:, None, None] for a in (r, z, nr, nz))
+        r_j, z_j, nr_j, nz_j = (a[None, :, None] for a in (r, z, nr, nz))
+        phi_m = phi[None, None, :]
+        dx = r_j * jnp.cos(phi_m) - r_i
+        dy = r_j * jnp.sin(phi_m)
+        dz = z_j - z_i
+        R2 = dx**2 + dy**2 + dz**2
+        R = jnp.sqrt(R2 + 1e-30)
+        cos_i = jnp.maximum(0.0, (nr_i * dx + nz_i * dz) / R)
+        cos_j = jnp.maximum(0.0, -(nr_j * jnp.cos(phi_m) * dx + nr_j * jnp.sin(phi_m) * dy + nz_j * dz) / R)
+        ring = dphi * jnp.sum(cos_i * cos_j / (jnp.pi * R2 + 1e-30), axis=-1)  # (M, M) ring-to-ring kernel
+
+        # Differential view factor ring_q -> ring_p (source weighted by its ring area r_p * w_p):
+        fqq = ring * (r[None, :] * w_merid[None, :])  # (M, M)
+        # Aggregate quads -> elements: area-weighted over receiver rings (r_q w_q), summed over source.
+        a_q = r * w_merid  # (M,) ring-area weight (2*pi cancels in the ratio)
+        num = (a_q[:, None] * fqq).reshape(m, nq, m, nq).sum(axis=(1, 3))  # (m, m)
+        a_elem = a_q.reshape(m, nq).sum(axis=1)  # (m,)
+        F = num / a_elem[:, None]
+        F = F * jnp.asarray(VM) * (1.0 - jnp.eye(m))
+        return F
 
     @staticmethod
     def precompute_p1_line_geometry(points, elements):
