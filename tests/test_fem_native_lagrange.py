@@ -384,3 +384,72 @@ def test_large_mesh_assembles_without_blowup(vec):
     assert n > 1400
     sol = np.linalg.solve(np.asarray(fem.A), np.asarray(fem.b).reshape(-1))
     assert np.all(np.isfinite(sol))
+
+
+# ---------------------------------------------------------------------------
+# Transient: native assembles the semidiscrete block (M, A, time-dependent
+# forcing, state0); a backward-Euler march recovers the manufactured solution.
+# ---------------------------------------------------------------------------
+
+
+def _march(fem):
+    """Backward-Euler march of a native FeaxTimeBlock (M u̇ + A u = c + f(t))."""
+    M, A = np.asarray(fem.M), np.asarray(fem.operator.A)
+    c = np.asarray(fem.operator.affine_bias).reshape(-1)
+    f = fem.operator.forcing_vector_fn
+    w = np.asarray(fem.state0).reshape(-1).copy()
+    dt, t = float(fem.dt), float(fem.t0)
+    for _ in range(round((fem.t1 - fem.t0) / dt)):
+        t += dt
+        rhs = M @ w + dt * c
+        if f is not None:
+            rhs = rhs + dt * np.asarray(f(t)).reshape(-1)
+        w = np.linalg.solve(M + dt * A, rhs)
+    return w
+
+
+def test_transient_heat_time_dependent_source_routes_native():
+    """Heat ``u_t = α Δu + s(x,t)`` with the MMS ``u = (1+t) sin(πx) sin(πy)`` (backward Euler is
+    temporally exact for this time-linear field). Routes natively, assembles the time-dependent
+    forcing, and recovers the manufactured field at the final time."""
+    AL = 1.0
+    T = 0.5
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.1, time=(0.0, T, 26))
+    u, w = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb = d.variable("boundary", split=True)[:2]
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), w.bind(x=xi, y=yi, t=ti)
+    s = sin(PI * xi) * sin(PI * yi) * (1.0 + 2 * AL * PI**2 * (1.0 + ti))
+    weak = ui.t * vi + AL * (ui.x * vi.x + ui.y * vi.y) - s * vi
+    icf = jno.fn(lambda x, y: jnp.sin(PI * x) * jnp.sin(PI * y), [ci[0], ci[1]])
+    fem = jno.fem([weak, u(xb, yb) - 0.0, u(ci[0], ci[1]) - icf])
+
+    assert fem.is_transient and fem.is_linear
+    assert fem.problem is None  # native path
+    assert fem.operator.forcing_vector_fn is not None  # time-dependent source carried per step
+
+    w_final = _march(fem)
+    pts = np.asarray(fem.points)
+    exact = (1.0 + T) * np.sin(PI * pts[:, 0]) * np.sin(PI * pts[:, 1])
+    assert np.sqrt(np.mean((w_final - exact) ** 2)) < 2e-3  # spatial O(h^2) at mesh 0.1
+
+
+def test_transient_nonhomogeneous_dirichlet_relaxes_to_one():
+    """Autonomous heat ``u_t = Δu`` with ``u = 1`` held on the boundary and zero IC relaxes to
+    ``u ≡ 1``. Exercises constant non-homogeneous Dirichlet on the native transient path (zero mass
+    on Dirichlet rows, the lift carried in the affine bias)."""
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.2, time=(0.0, 0.5, 51))
+    u, w = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb = d.variable("boundary", split=True)[:2]
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), w.bind(x=xi, y=yi, t=ti)
+    fem = jno.fem([ui.t * vi + ui.x * vi.x + ui.y * vi.y, u(xb, yb) - 1.0, u(ci[0], ci[1]) - 0.0])
+
+    assert fem.is_transient and fem.problem is None
+    # Autonomous operator + no source: the time-dependent forcing increment is identically zero.
+    fvf = fem.operator.forcing_vector_fn
+    assert fvf is None or np.abs(np.asarray(fvf(0.3))).max() < 1e-12
+    w_final = _march(fem)
+    assert np.abs(w_final - 1.0).max() < 5e-3

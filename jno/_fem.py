@@ -1522,6 +1522,22 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         domain.fem_context["periodic"] = periodic_holder[0]
 
     if is_transient:
+        # ---- native 2D Lagrange transient: constant (incl. non-homogeneous) Dirichlet + a
+        # time-dependent source. Excludes complex, runtime-parametric, periodic (via the gate), and
+        # time-varying Dirichlet g(x,t) -- those stay on feax. ----
+        if (
+            _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
+            and not _is_complex_form(domain, ir)
+            and not any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw)
+        ):
+            from .utils.solver.fem_native import assemble_fem_native
+
+            domain._feax_problem = None  # native owns this domain's FE state
+            op, mode, offs = assemble_fem_native(
+                domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=vec or 1, quad_degree=quad_degree
+            )
+            return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs))
+
         from .utils.solver.time_route import _assemble_feax_time_from_ir
 
         if any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw):
@@ -1662,20 +1678,30 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
             dirichlet_tv.append((fidx, region, comp, value_node))
     domain._fem_dirichlet_by_field = by_field
 
-    # Coupled transient (multi-field + time): block M + block spatial operator A.
-    if is_transient:
-        return _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals, classification, dirichlet_tv)
-
-    # ---- native 2D Lagrange (steady, real, non-parametric) coupled block assembly ----
-    # Same coverage gate as the single-field path, expressed over the inferred fields (no
-    # `constraints` here): 2D, all-Lagrange, non-complex, non-runtime-parametric. Periodic + coupled
-    # is rejected by `_finalize` regardless, so it needs no separate guard here.
+    # Native 2D Lagrange coverage gate (expressed over the inferred fields -- no `constraints` here):
+    # 2D, all-Lagrange, non-complex, non-runtime-parametric. Periodic + coupled is rejected by
+    # `_finalize` regardless, so it needs no separate guard here.
     _native_ok = (
         getattr(domain, "dimension", None) == 2
         and all(str(f.get("space", "Lagrange")) == "Lagrange" for f in fields)
         and not _is_complex_form(domain, ir)
         and not any(_contains_runtime_parameter(b) for b in weak_bares)
     )
+
+    # Coupled transient (multi-field + time): block M + block spatial operator A. Native handles
+    # constant (incl. non-homogeneous) Dirichlet + a time-dependent source; time-varying Dirichlet
+    # g(x,t) (``dirichlet_tv``) stays on feax.
+    if is_transient:
+        if _native_ok and not dirichlet_tv:
+            from .utils.solver.fem_native import assemble_fem_native
+
+            domain._feax_problem = None
+            op, mode, offs = assemble_fem_native(
+                domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=1, quad_degree=quad_degree
+            )
+            return FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs)
+        return _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals, classification, dirichlet_tv)
+
     if _native_ok:
         from .utils.solver.fem_native import assemble_fem_native
 

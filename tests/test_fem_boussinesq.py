@@ -165,7 +165,7 @@ def test_boussinesq_transient_vector_ic_and_convection_onset():
 
     blk = fem.operator
     M, dt = _dn(blk.mass(0.0, {})), 0.01
-    off = list(np.asarray(fem.problem.offset)) + [fem.dofs]
+    off = fem.offsets  # [0, n_vel, n_vel+n_p, n_total]
     w = jnp.asarray(blk.state0)
     assert float(np.abs(np.asarray(w)[off[0] : off[1]]).max()) == 0.0  # starts at rest
     for step in range(12):

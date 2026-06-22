@@ -70,8 +70,10 @@ def test_transient_nonhomog_dirichlet_single_field():
     ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
     fem = jno.fem([ui.t * vi + ui.x * vi.x + ui.y * vi.y, u(xb, yb) - 1.0, u(ci[0], ci[1]) - 0.0])
     assert fem.is_transient and fem.is_linear
-    # construction check: the mass carries NO time derivative on Dirichlet DOFs
-    rows = np.asarray(fem.domain._feax_bc.bc_rows).reshape(-1)
+    # construction check: the mass carries NO time derivative on Dirichlet DOFs.
+    # Dirichlet DOFs = the boundary nodes (scalar P1: one DOF per node).
+    pts = np.asarray(fem.field_points[0])
+    rows = np.where(np.asarray(jax.vmap(d._make_tag_location_fn("boundary"))(jax.numpy.asarray(pts))).reshape(-1))[0]
     assert rows.size > 0 and np.allclose(_dense(fem.M)[rows], 0.0)
     # and the load c carries g=1 on those rows
     assert np.allclose(np.asarray(fem.operator.affine_bias).reshape(-1)[rows], 1.0)
@@ -201,14 +203,14 @@ def test_transient_stokes_dae_recovers():
         ]
     )
     assert fem.is_transient and fem.is_linear
-    off = fem.problem.offset
+    off = fem.offsets  # [0, n_vel, n_total]
     nu = off[1] - off[0]
     M = _dense(fem.M)
     assert np.allclose(M[nu:, nu:], 0.0)  # DAE: pressure carries a zero mass block
     assert np.abs(M[:nu, :nu]).max() > 0.0  # velocity mass present
     w = _march(fem)
-    pts_v = np.asarray(fem.problem.mesh[0].points)
-    pts_p = np.asarray(fem.problem.mesh[1].points)
+    pts_v = np.asarray(fem.field_points[0])
+    pts_p = np.asarray(fem.field_points[1])
     uu = w[off[0] : off[1]].reshape(-1, 2)
     pr = w[off[1] :]
     u_ex = np.stack([pts_v[:, 0], -pts_v[:, 1]], axis=-1)
