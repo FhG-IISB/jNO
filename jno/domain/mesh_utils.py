@@ -1006,6 +1006,70 @@ class MeshUtils:
         return F
 
     @staticmethod
+    def get_view_factor_axisymmetric_element(E0, E1, Nrm, VM, n_quad: int = 3, n_phi: int = 16):
+        r"""Element-based axisymmetric view-factor matrix ``F[i, j]`` for a body of revolution.
+
+        Each element is a meridional segment ``[E0_k, E1_k]`` in the ``(r, z)`` half-plane (a frustum
+        ring when revolved), with constant normal ``Nrm_k`` pointing into the enclosure. The exchange
+        factor combines **meridional element quadrature** (``n_quad`` Gauss points along each element,
+        as in :meth:`get_view_factor_2d_element`) with **azimuthal integration** of the diffuse
+        point-to-ring kernel (``n_phi`` samples; the integral is ``(2π/n_phi)·Σ``, *not* a mean):
+
+        .. math::
+            F_{ij} = \frac{\sum_{q\in e_i} r_q w_q \big[\sum_{p\in e_j} r_p w_p
+                      \,(2\pi/n_\phi)\textstyle\sum_\phi \cos\theta_q \cos\theta_p/(\pi R^2)\big]}
+                     {\sum_{q\in e_i} r_q w_q}
+
+        i.e. the source-ring view factor (area-weighted by ``r_p w_p``) averaged over the receiver
+        element's rings (weighted by ``r_q w_q``). ``VM`` is element-to-element visibility (occlusion).
+        ``n_quad=1`` recovers the single-point-per-ring kernel.
+
+        Reference: M. F. Modest, *Radiative Heat Transfer*, 3rd ed., Ch. 4 (bodies of revolution).
+        """
+        E0 = jnp.asarray(E0)
+        E1 = jnp.asarray(E1)
+        Nrm = jnp.asarray(Nrm)
+        m = E0.shape[0]
+        nq = int(n_quad)
+
+        gx, gw = np.polynomial.legendre.leggauss(nq)
+        s = jnp.asarray((gx + 1.0) * 0.5)
+        wq = jnp.asarray(gw * 0.5)
+        length = jnp.linalg.norm(E1 - E0, axis=-1)  # (m,) meridional length
+        qp = (E0[:, None, :] + s[None, :, None] * (E1 - E0)[:, None, :]).reshape(m * nq, 2)  # (M, 2)
+        w_merid = (wq[None, :] * length[:, None]).reshape(-1)  # (M,) meridional ds per quad
+        qn = jnp.repeat(Nrm, nq, axis=0)  # (M, 2)
+
+        r = qp[:, 0]
+        z = qp[:, 1]
+        nr = qn[:, 0]
+        nz = qn[:, 1]
+        phi = jnp.linspace(0.0, 2.0 * jnp.pi, n_phi, endpoint=False)
+        dphi = 2.0 * jnp.pi / n_phi
+
+        r_i, z_i, nr_i, nz_i = (a[:, None, None] for a in (r, z, nr, nz))
+        r_j, z_j, nr_j, nz_j = (a[None, :, None] for a in (r, z, nr, nz))
+        phi_m = phi[None, None, :]
+        dx = r_j * jnp.cos(phi_m) - r_i
+        dy = r_j * jnp.sin(phi_m)
+        dz = z_j - z_i
+        R2 = dx**2 + dy**2 + dz**2
+        R = jnp.sqrt(R2 + 1e-30)
+        cos_i = jnp.maximum(0.0, (nr_i * dx + nz_i * dz) / R)
+        cos_j = jnp.maximum(0.0, -(nr_j * jnp.cos(phi_m) * dx + nr_j * jnp.sin(phi_m) * dy + nz_j * dz) / R)
+        ring = dphi * jnp.sum(cos_i * cos_j / (jnp.pi * R2 + 1e-30), axis=-1)  # (M, M) ring-to-ring kernel
+
+        # Differential view factor ring_q -> ring_p (source weighted by its ring area r_p * w_p):
+        fqq = ring * (r[None, :] * w_merid[None, :])  # (M, M)
+        # Aggregate quads -> elements: area-weighted over receiver rings (r_q w_q), summed over source.
+        a_q = r * w_merid  # (M,) ring-area weight (2*pi cancels in the ratio)
+        num = (a_q[:, None] * fqq).reshape(m, nq, m, nq).sum(axis=(1, 3))  # (m, m)
+        a_elem = a_q.reshape(m, nq).sum(axis=1)  # (m,)
+        F = num / a_elem[:, None]
+        F = F * jnp.asarray(VM) * (1.0 - jnp.eye(m))
+        return F
+
+    @staticmethod
     def precompute_p1_line_geometry(points, elements):
         """
         Precompute P1 line element geometry (lengths and shape function gradients).

@@ -166,3 +166,33 @@ def test_view_factor_2d_element_concentric_cylinders():
     assert abs(F12 - 1.0) < 5e-3, f"F12 should be 1, got {F12:.4f}"
     assert abs(F21 - r1 / r2) < 5e-3, f"F21 should be r1/r2={r1 / r2:.4f}, got {F21:.4f}"
     assert abs(F22 - (1 - r1 / r2)) < 5e-3, f"concave self-view F22 should be {1 - r1 / r2:.4f}, got {F22:.4f}"
+
+
+def test_view_factor_axisymmetric_element_tall_cylinder():
+    """Element-based axisymmetric kernel (meridional element quadrature x azimuthal integration) on a
+    tall concentric cylinder: a mid inner element sees ~the whole outer wall (F12->1), F21->r1/r2, with
+    exact reciprocity (A_i F_ij = A_j F_ji, A = ring area)."""
+    r1, r2, height, nz = 0.20, 0.35, 6.0, 60
+    z = np.linspace(0.0, height, nz + 1)
+    z0, z1 = z[:-1], z[1:]
+    e0 = np.vstack([np.c_[np.full(nz, r1), z0], np.c_[np.full(nz, r2), z0]])
+    e1 = np.vstack([np.c_[np.full(nz, r1), z1], np.c_[np.full(nz, r2), z1]])
+    nrm = np.vstack([np.tile([1.0, 0.0], (nz, 1)), np.tile([-1.0, 0.0], (nz, 1))])
+    vm = np.ones((2 * nz, 2 * nz))  # tall thin gap; mid-element check ignores end occlusion
+
+    F = np.asarray(
+        MeshUtils.get_view_factor_axisymmetric_element(
+            jnp.asarray(e0), jnp.asarray(e1), jnp.asarray(nrm), jnp.asarray(vm), n_quad=3, n_phi=64
+        )
+    )
+    rmid = 0.5 * (e0[:, 0] + e1[:, 0])
+    length = np.linalg.norm(e1 - e0, axis=1)
+    A = 2 * np.pi * rmid * length  # ring areas
+    assert np.all(np.isfinite(F)) and np.allclose(np.diag(F), 0.0)
+    assert np.abs(A[:, None] * F - (A[:, None] * F).T).max() < 1e-12, "axisymmetric element reciprocity violated"
+
+    mid = nz // 2
+    f12_mid = F[mid, nz:].sum()
+    F21 = (A[nz:, None] * F[nz:, :nz]).sum() / A[nz:].sum()
+    assert abs(f12_mid - 1.0) < 3e-2, f"axisymmetric element F12 (mid) should be ~1, got {f12_mid:.3f}"
+    assert abs(F21 - r1 / r2) < 3e-2, f"axisymmetric element F21 should be r1/r2={r1 / r2:.3f}, got {F21:.3f}"
