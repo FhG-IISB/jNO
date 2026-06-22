@@ -230,3 +230,41 @@ def test_grey_body_radiosity_two_surface_flux():
     total = float((A * q).sum())  # energy balance over the closed enclosure
     scale = float((A[:n1] * np.abs(q[:n1])).sum())
     assert abs(total) / scale < 5e-3, f"energy balance |sum A q| / scale = {abs(total) / scale:.2e}"
+
+
+def test_enclosure_handle_concentric_cylinders():
+    """The d.enclosure(tags) handle builds an FEM-node-aligned element view factor from a real mesh:
+    two solid rings with a vacuum gap. Validates the full pipeline (boundary-edge elements, into-gap
+    normals, occlusion, element kernel) against the analytic concentric-cylinder factors, and the
+    F-quality gate."""
+    import jno
+
+    pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
+    from shapely.geometry import Point
+
+    r1, r2 = 0.20, 0.25
+    ring = lambda a, b: Point(0, 0).buffer(b, 48).difference(Point(0, 0).buffer(a, 48))  # noqa: E731
+    d = jno.domain(ring(0.10, r1).union(ring(r2, 0.35)), mesh_size=0.08)
+    radius = lambda x, y: np.hypot(x, y)  # noqa: E731
+    d.tag("inner_gap", lambda x, y: np.abs(radius(x, y) - r1) < 1.5e-2)
+    d.tag("outer_gap", lambda x, y: np.abs(radius(x, y) - r2) < 1.5e-2)
+
+    gap = d.enclosure(["inner_gap", "outer_gap"])
+    gap.check()  # F-quality gate (closure + reciprocity) must pass
+    closure, recip = gap.quality()
+    assert closure < 5e-3 and recip < 1e-12
+
+    # node indices are valid FEM DOFs (scalar P1: DOF == mesh node)
+    n_pts = np.asarray(d.mesh.points).shape[0]
+    assert gap.nodes.min() >= 0 and gap.nodes.max() < n_pts
+
+    F = np.asarray(gap.view_factor)
+    A = np.asarray(gap.areas)
+    mi, mo = gap.tag_mask("inner_gap"), gap.tag_mask("outer_gap")
+    assert mi.sum() > 0 and mo.sum() > 0
+    F12 = (A[mi, None] * F[np.ix_(mi, mo)]).sum() / A[mi].sum()
+    F21 = (A[mo, None] * F[np.ix_(mo, mi)]).sum() / A[mo].sum()
+    F22 = (A[mo, None] * F[np.ix_(mo, mo)]).sum() / A[mo].sum()
+    assert abs(F12 - 1.0) < 1e-2, f"F12 should be 1, got {F12:.4f}"
+    assert abs(F21 - r1 / r2) < 1e-2, f"F21 should be r1/r2={r1 / r2:.4f}, got {F21:.4f}"
+    assert abs(F22 - (1 - r1 / r2)) < 1e-2, f"concave self-view F22 should be {1 - r1 / r2:.4f}, got {F22:.4f}"

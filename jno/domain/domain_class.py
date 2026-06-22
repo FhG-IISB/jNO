@@ -2760,6 +2760,26 @@ class domain(MeshIOMixin):
         angles = np.arctan2(pts[:, 1] - centroid[1], pts[:, 0] - centroid[0])
         return np.argsort(angles)
 
+    def enclosure(self, tags, *, axisymmetric=False, n_quad=3, opaque_tags=None):
+        """Build an :class:`~jno.domain.enclosure.Enclosure` from radiating boundary ``tags``.
+
+        Discretises the listed boundary surfaces into mesh-edge **elements** (aligned to FEM nodes) and
+        returns a handle exposing the element-to-element view factor ``enclosure.view_factor`` (fully
+        geometry-determined — self-view included), per-element ``areas``/``normals``, the global node
+        ``elements``, and an F-quality gate (``.check()`` / ``.quality()``). Write the grey-body
+        radiosity in ``jno.np`` on top of ``enclosure.view_factor``; see ``docs/fem.md``.
+
+        Args:
+            tags: Boundary tags forming the enclosure (each a radiating surface; tags only group
+                elements for per-surface emissivity — they never block exchange).
+            axisymmetric: Treat the 2D mesh as a meridional ``(r, z)`` half-plane (bodies of revolution).
+            n_quad: Gauss points per element for the double-area view-factor quadrature.
+            opaque_tags: Optional boundary tags that block rays (occluders) without radiating.
+        """
+        from .enclosure import build_enclosure
+
+        return build_enclosure(self, tags, axisymmetric=axisymmetric, n_quad=n_quad, opaque_tags=opaque_tags)
+
     def compute_enclosure_view_factor(self, tags, opaque_tags=None):
         """Compute view factors over a combined radiation enclosure.
 
