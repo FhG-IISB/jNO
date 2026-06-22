@@ -196,3 +196,37 @@ def test_view_factor_axisymmetric_element_tall_cylinder():
     F21 = (A[nz:, None] * F[nz:, :nz]).sum() / A[nz:].sum()
     assert abs(f12_mid - 1.0) < 3e-2, f"axisymmetric element F12 (mid) should be ~1, got {f12_mid:.3f}"
     assert abs(F21 - r1 / r2) < 3e-2, f"axisymmetric element F21 should be r1/r2={r1 / r2:.3f}, got {F21:.3f}"
+
+
+def test_grey_body_radiosity_two_surface_flux():
+    """Full grey-body radiosity ``q = (I-F)(I-diag(rho)F)^-1 diag(eps) sigma T^4`` (reflections
+    included) reproduces the closed-form two-surface concentric-cylinder net flux
+
+        q1 = sigma (T1^4 - T2^4) / (1/eps1 + (r1/r2)(1/eps2 - 1)),
+
+    and conserves energy (A1 q1 + A2 q2 ~ 0). This is the radiosity the user writes in ``jno.np``;
+    here it is checked in numpy against the analytic result using the committed element view factor."""
+    sigma = 5.670374419e-8
+    r1, r2, n1, n2 = 0.20, 0.35, 240, 360
+    eps1, eps2, t1, t2 = 0.8, 0.6, 1000.0, 400.0
+
+    e0, e1, nrm, vm = _concentric_2d_elements(r1, r2, n1, n2)
+    A = np.linalg.norm(e1 - e0, axis=1)
+    F = np.asarray(
+        MeshUtils.get_view_factor_2d_element(jnp.asarray(e0), jnp.asarray(e1), jnp.asarray(nrm), jnp.asarray(vm), n_quad=3)
+    )
+
+    eps = np.concatenate([np.full(n1, eps1), np.full(n2, eps2)])
+    rho = 1.0 - eps
+    temp = np.concatenate([np.full(n1, t1), np.full(n2, t2)])
+    emissive = eps * sigma * temp**4
+    radiosity = np.linalg.solve(np.eye(n1 + n2) - rho[:, None] * F, emissive)
+    q = (np.eye(n1 + n2) - F) @ radiosity  # net radiative flux per element (per area)
+
+    q1 = float((A[:n1] * q[:n1]).sum() / A[:n1].sum())
+    q1_analytic = sigma * (t1**4 - t2**4) / (1.0 / eps1 + (r1 / r2) * (1.0 / eps2 - 1.0))
+    assert abs(q1 - q1_analytic) / q1_analytic < 5e-3, f"radiosity flux {q1:.1f} vs analytic {q1_analytic:.1f}"
+
+    total = float((A * q).sum())  # energy balance over the closed enclosure
+    scale = float((A[:n1] * np.abs(q[:n1])).sum())
+    assert abs(total) / scale < 5e-3, f"energy balance |sum A q| / scale = {abs(total) / scale:.2e}"
