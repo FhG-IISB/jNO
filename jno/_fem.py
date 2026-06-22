@@ -221,18 +221,22 @@ def _trial_spaces(constraints: List[Any]) -> set:
 
 
 def _native_lagrange_ok(domain: Any, constraints: List[Any], weak_bares: List[Any], periodic_ties: List[Any]) -> bool:
-    """Whether the native 2D Lagrange assembler should handle this *steady* problem.
+    """Whether the native 2D Lagrange assembler should handle this problem.
 
     Native covers scalar/vector Lagrange P1/P2 on 2D triangle meshes — single- and multi-field,
-    linear/nonlinear, Dirichlet + Neumann/Robin + per-region/frozen-coefficient terms. Complex and
-    transient problems are excluded by the caller's control flow (those branches return first); this
-    gate additionally rules out the cases the native path does not yet cover, which stay on feax:
+    linear/nonlinear, steady & transient, Dirichlet + Neumann/Robin + per-region/frozen-coefficient
+    terms, and runtime-parametric *scalar* coefficients (steady inverse). Complex and transient
+    problems are excluded by the caller's control flow (those branches return first); this gate rules
+    out what the native path does not yet cover, which stays on feax:
 
     * 3D (tet) — the native assembler is 2D-only for now;
     * periodic ties — the prolongation reduction reads a feax assembly problem;
-    * runtime-parametric coefficients — the parametric residual/lift stays on feax (Commit 4 scope).
+    * FEM *field* (nodal ``k(x)``) parameters — native threads scalar parameters only.
+
+    Note: a runtime-*scalar* parameter is allowed here, but the transient call sites add their own
+    exclusion (native transient-parametric is not wired yet).
     """
-    from .utils.solver.parametric_helpers import _contains_runtime_parameter
+    from .utils.solver.parametric_helpers import _contains_fem_field_parameter
 
     if getattr(domain, "dimension", None) != 2:
         return False
@@ -240,7 +244,7 @@ def _native_lagrange_ok(domain: Any, constraints: List[Any], weak_bares: List[An
         return False
     if _trial_spaces(constraints) - {"Lagrange"}:
         return False
-    if any(_contains_runtime_parameter(b) for b in weak_bares):
+    if any(_contains_fem_field_parameter(b) for b in weak_bares):
         return False
     return True
 
@@ -1523,12 +1527,15 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
 
     if is_transient:
         # ---- native 2D Lagrange transient: constant (incl. non-homogeneous) Dirichlet + a
-        # time-dependent source. Excludes complex, runtime-parametric, periodic (via the gate), and
-        # time-varying Dirichlet g(x,t) -- those stay on feax. ----
+        # time-dependent source. Excludes complex, runtime-parametric (native transient-parametric is
+        # not wired), periodic (via the gate), and time-varying Dirichlet g(x,t) -- those stay on feax. ----
+        from .utils.solver.parametric_helpers import _contains_runtime_parameter as _crp
+
         if (
             _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
             and not _is_complex_form(domain, ir)
             and not any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw)
+            and not any(_crp(b) for b in weak_bares)
         ):
             from .utils.solver.fem_native import assemble_fem_native
 

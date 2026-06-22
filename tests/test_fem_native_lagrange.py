@@ -453,3 +453,56 @@ def test_transient_nonhomogeneous_dirichlet_relaxes_to_one():
     assert fvf is None or np.abs(np.asarray(fvf(0.3))).max() < 1e-12
     w_final = _march(fem)
     assert np.abs(w_final - 1.0).max() < 5e-3
+
+
+# ---------------------------------------------------------------------------
+# Runtime-parametric (inverse): the operator is re-assembled at the runtime args and
+# stays differentiable in them. A finite-difference check guards the gradient itself
+# (a forward-value oracle would pass even with a silently wrong/severed gradient).
+# ---------------------------------------------------------------------------
+
+
+def _parametric_poisson(mesh_size=0.2):
+    """Parametric Poisson ``-alpha Δu = f`` (recovers exact ``u`` at alpha=1)."""
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=mesh_size)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    alpha = jno.np.parameter((1,), name="alpha")
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = 2.0 * (xi * (1.0 - xi) + yi * (1.0 - yi))
+    weak = alpha * (ui.x * vi.x + ui.y * vi.y) - f * vi
+    return jno.fem([weak, u(xb, yb) - 0.0], quad_degree=3)
+
+
+def test_native_parametric_routes_native_and_is_parametric():
+    fem = _parametric_poisson()
+    assert fem.problem is None  # native path
+    sys = fem.operator
+    assert sys.is_parametric and list(sys.runtime_parameter_exprs) == ["alpha"]
+    # The operator genuinely depends on alpha: the free (non-Dirichlet) rows scale by alpha for
+    # -alpha*lap (Dirichlet rows are the identity regardless, so compare only the free block).
+    a1 = np.asarray(sys.evaluate({"alpha": 1.0})[0])
+    a2 = np.asarray(sys.evaluate({"alpha": 2.0})[0])
+    free = ~np.isclose(np.abs(a1).sum(axis=1), 1.0)  # interior rows (Dirichlet rows have a unit diagonal only)
+    assert free.any()
+    assert np.abs(a2[free] - 2.0 * a1[free]).max() < 1e-10
+
+
+def test_native_parametric_gradient_matches_finite_difference():
+    """The key inverse property: ∂(solve)/∂alpha must flow through the native re-assembly.
+    A forward A-vs-A oracle cannot see a severed gradient — finite difference can."""
+    fem = _parametric_poisson()
+    sys = fem.operator
+
+    def loss(a):
+        A, b = sys.evaluate({"alpha": a})
+        u = jnp.linalg.solve(jnp.asarray(A), jnp.asarray(b).reshape(-1))
+        return jnp.sum(u**2)
+
+    a0 = 1.3
+    g_ad = float(jax.grad(loss)(a0))
+    eps = 1e-6
+    g_fd = float((loss(a0 + eps) - loss(a0 - eps)) / (2 * eps))
+    assert abs(g_ad) > 1e-8  # the parameter genuinely moves the solution
+    assert abs(g_ad - g_fd) <= 1e-5 * max(1.0, abs(g_fd))

@@ -61,6 +61,7 @@ from .fem_1d import (
 from .fem_facets import build_facet_connectivity, compute_face_normals
 from .fem_lagrange import BASIX_TET_EDGES, identity_pushforward, lagrange_triangle
 from .fem_topology import BASIX_TRIANGLE_EDGES
+from .parametric_helpers import _collect_runtime_parameter_exprs
 from .weak_form import (
     _apply_sign,
     _contains_temporal_derivative,
@@ -303,6 +304,18 @@ def assemble_fem_native(
             _collect_temporal_tags_for_feax(bare, _temporal_tag_set)
     temporal_tags: Tuple[str, ...] = tuple(sorted(_temporal_tag_set))
 
+    # Runtime scalar parameters (trainable ``jno.np.parameter(...)`` coefficients, e.g. an unknown
+    # diffusivity in an inverse problem). Their values arrive at solve time in an ``args`` dict; the
+    # builders pack them into volume_vars right AFTER the temporal slots so ``_eval_expr_for_feax``
+    # resolves each parameter node. Field (nodal) parameters are not handled here -- they stay on feax.
+    _rt_param_exprs: Dict[str, Any] = {}
+    for bare in volume_terms:
+        _collect_runtime_parameter_exprs(bare, _rt_param_exprs)
+    for _exprs in boundary_terms.values():
+        for bare in _exprs:
+            _collect_runtime_parameter_exprs(bare, _rt_param_exprs)
+    runtime_parameter_tags: Tuple[str, ...] = tuple(sorted(_rt_param_exprs))
+
     # -------------------------------------------------------------------------
     # Surface integration setup
     # -------------------------------------------------------------------------
@@ -357,13 +370,14 @@ def assemble_fem_native(
         """This cell's local DOFs across all fields, concatenated (matches ``cell_all_dofs[c]``)."""
         return jnp.concatenate([u_blocks[i][cells_f_j[i][c]].reshape(-1) for i in range(len(fields))])
 
-    def _t_vals(t, dtype):
-        """Runtime temporal scalar(s) packed for the kernel's volume_vars (one ``(1,)`` value per
-        temporal tag; all tags share the single physical time ``t``). Empty for an autonomous form."""
-        if not temporal_tags:
-            return ()
-        ts = jnp.reshape(jnp.asarray(t, dtype=dtype), (-1,))[:1]
-        return tuple(ts for _ in temporal_tags)
+    def _runtime_vals(t, args, dtype):
+        """Runtime scalars packed for the kernel's volume_vars prefix, in the order
+        ``[temporal..., runtime_param...]`` (region masks follow per cell). Each is a ``(1,)`` array
+        (read back as a scalar). Empty when the form is autonomous and non-parametric."""
+        tv = tuple(jnp.reshape(jnp.asarray(t, dtype=dtype), (-1,))[:1] for _ in temporal_tags)
+        a = args or {}
+        pv = tuple(jnp.reshape(jnp.asarray(a[name], dtype=dtype), (-1,))[:1] for name in runtime_parameter_tags)
+        return tv + pv
 
     # -------------------------------------------------------------------------
     # Generic residual builder (volume + optional surface terms)
@@ -374,12 +388,12 @@ def assemble_fem_native(
     parent_j = jnp.asarray(conn.parent_cell, dtype=jnp.int32)
     lface_j = jnp.asarray(conn.local_face, dtype=jnp.int32)
 
-    def _vol_elem_res(c, local_all, coeff, tfi, rnames, t_vals=()):
+    def _vol_elem_res(c, local_all, coeff, tfi, rnames, rt_vals=()):
         """Element residual of one volume term on cell ``c`` as a function of that cell's gathered
         all-field local DOFs ``local_all`` -> ``(n_test_dofs_tfi,)``. Driving the AD off this
         element-sized input (not the global state) is what keeps the per-cell Jacobian's intermediate
-        O(n_local) instead of O(n_dofs). ``t_vals`` carries the runtime temporal scalar(s) for a
-        transient time-dependent coefficient, packed BEFORE the region masks (the kernel layout is
+        O(n_local) instead of O(n_dofs). ``rt_vals`` carries the runtime scalar(s) (temporal time and
+        any runtime parameters), packed BEFORE the region masks (the kernel layout is
         [temporal..., runtime_param..., region_mask...])."""
         cell_sols = _split_cell_local(local_all)
         per, xq, meas = _cell_fields(c, cell_sols)
@@ -392,15 +406,15 @@ def assemble_fem_native(
             "surface": False,
             "domain_context": ctx,
             "temporal_tags": temporal_tags,
-            "runtime_parameter_tags": (),
+            "runtime_parameter_tags": runtime_parameter_tags,
             "region_mask_names": rnames,
-            "volume_vars": tuple(t_vals) + cell_masks,
+            "volume_vars": tuple(rt_vals) + cell_masks,
             "trial_value_shape": fields[tfi]["value_shape"],
             "trial_vec": vecs[tfi],
         }
         return _integrate_term(domain, coeff, loc, qw_shared * meas)
 
-    def _surf_elem_res(fi, local_all, bcoeff, btfi, region, t_vals=()):
+    def _surf_elem_res(fi, local_all, bcoeff, btfi, region, rt_vals=()):
         """Element residual of one surface term on boundary face ``fi`` as a function of the parent
         cell's gathered all-field local DOFs ``local_all`` -> ``(n_test_dofs_btfi,)``."""
         c = parent_j[fi]
@@ -436,9 +450,9 @@ def assemble_fem_native(
             "surface": True,
             "domain_context": {**ctx, f"n_{region}": n_vec},
             "temporal_tags": temporal_tags,
-            "runtime_parameter_tags": (),
+            "runtime_parameter_tags": runtime_parameter_tags,
             "region_mask_names": (),
-            "volume_vars": tuple(t_vals),
+            "volume_vars": tuple(rt_vals),
             "trial_value_shape": fields[btfi]["value_shape"],
             "trial_vec": vecs[btfi],
         }
@@ -493,13 +507,13 @@ def assemble_fem_native(
         where boundary contributions must not appear."""
         typed_with_masks, surface_work = _preprocess_terms(terms, bterms)
 
-        def residual(u_flat, t=0.0):
+        def residual(u_flat, t=0.0, args=None):
             R = jnp.zeros(total, dtype=u_flat.dtype)
             local_all = u_flat[cell_all_dofs]  # (n_cell, n_local_all)
-            tv = _t_vals(t, u_flat.dtype)
+            rt = _runtime_vals(t, args, u_flat.dtype)
 
             for coeff, tfi, rnames in typed_with_masks:
-                elem = jax.vmap(lambda c, la, _e=coeff, _t=tfi, _r=rnames: _vol_elem_res(c, la, _e, _t, _r, tv))(
+                elem = jax.vmap(lambda c, la, _e=coeff, _t=tfi, _r=rnames: _vol_elem_res(c, la, _e, _t, _r, rt))(
                     jnp.arange(n_cells), local_all
                 )
                 R = R.at[cdofs[tfi].reshape(-1)].add(elem.reshape(-1))
@@ -510,7 +524,7 @@ def assemble_fem_native(
                 lv = u_flat[cell_all_dofs[pcells]]  # (n_face, n_local_all)
                 for bcoeff, btfi in btyped:
                     contribs = jax.vmap(
-                        lambda fi, la, _e=bcoeff, _t=btfi, _r=region: _surf_elem_res(fi, la, _e, _t, _r, tv)
+                        lambda fi, la, _e=bcoeff, _t=btfi, _r=region: _surf_elem_res(fi, la, _e, _t, _r, rt)
                     )(fids, lv)
                     R = R.at[cdofs[btfi][pcells].reshape(-1)].add(contribs.reshape(-1))
             return R
@@ -528,15 +542,15 @@ def assemble_fem_native(
         entry-for-entry on a matched DOF numbering."""
         typed_with_masks, surface_work = _preprocess_terms(terms, bterms)
 
-        def jacobian(u_flat, t=0.0):
+        def jacobian(u_flat, t=0.0, args=None):
             A = jnp.zeros((total, total), dtype=u_flat.dtype)
             local_all = u_flat[cell_all_dofs]  # (n_cell, n_local_all)
-            tv = _t_vals(t, u_flat.dtype)
+            rt = _runtime_vals(t, args, u_flat.dtype)
 
             for coeff, tfi, rnames in typed_with_masks:
 
                 def _ke(c, la, _e=coeff, _t=tfi, _r=rnames):
-                    return jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, tv))(la)
+                    return jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, rt))(la)
 
                 Ke = jax.vmap(_ke)(jnp.arange(n_cells), local_all)  # (n_cell, n_test_tfi, n_local_all)
                 rows = cdofs[tfi]  # (n_cell, n_test_tfi)
@@ -550,7 +564,7 @@ def assemble_fem_native(
                 for bcoeff, btfi in btyped:
 
                     def _kef(fi, la, _e=bcoeff, _t=btfi, _r=region):
-                        return jax.jacfwd(lambda v: _surf_elem_res(fi, v, _e, _t, _r, tv))(la)
+                        return jax.jacfwd(lambda v: _surf_elem_res(fi, v, _e, _t, _r, rt))(la)
 
                     Kef = jax.vmap(_kef)(fids, lv)  # (n_face, n_test_btfi, n_local_all)
                     frows = cdofs[btfi][pcells]  # (n_face, n_test_btfi)
@@ -721,11 +735,58 @@ def assemble_fem_native(
     # === steady ===
     dirichlet_pairs = _build_dirichlet_pairs()
     residual = _make_residual(volume_terms, boundary_terms)
+    jacobian = _make_jacobian(volume_terms, boundary_terms)
+    nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms)
+    s_d_dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
+    s_d_vals = jnp.asarray([p[1] for p in dirichlet_pairs], dtype=zeros.dtype) if dirichlet_pairs else None
 
-    # nonlinear
-    if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in all_terms):
+    # ---- runtime-parametric (inverse): the operator/residual is re-evaluated at the runtime args
+    # each call, kept differentiable in args -- the parameter flows as a JAX array through the kernel
+    # coefficient into the per-cell assembly (no float() cast). The same re-assembly handles affine,
+    # non-affine and (scalar) parameters uniformly. ----
+    if runtime_parameter_tags:
+        from ...trace import FemLinearSystem
+
+        if nonlinear:
+
+            def res_p(u, args=None, _d=s_d_dofs, _g=s_d_vals):
+                R = residual(jnp.asarray(u), 0.0, args)
+                return R if _d is None else R.at[_d].set(jnp.asarray(u)[_d] - _g)
+
+            def jac_p(u, args=None, _d=s_d_dofs):
+                J = jacobian(jnp.asarray(u), 0.0, args)
+                return J if _d is None else J.at[_d, :].set(0.0).at[_d, _d].set(1.0)
+
+            return (
+                FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_rt_param_exprs)),
+                "nonlinear",
+                offs,
+            )
+
+        def _assemble_at(args):
+            A = jacobian(zeros, 0.0, args)
+            b = -residual(zeros, 0.0, args)
+            if dirichlet_pairs:
+                A, b = _apply_dirichlet_symmetric(A, b, dirichlet_pairs)
+            return A, b
+
+        a0, b0 = _assemble_at({n: 0.0 for n in runtime_parameter_tags})  # static placeholder for .A/.b
+        op = FemLinearSystem(
+            a0,
+            b0,
+            operator_fn=lambda args=None: _assemble_at(args)[0],
+            rhs_fn=lambda args=None: _assemble_at(args)[1],
+            runtime_parameter_exprs=dict(_rt_param_exprs),
+            # The native parametric path re-assembles the operator at each args (it builds no affine
+            # parameter basis), so every runtime parameter -- affine or not -- takes the re-assembly route.
+            metadata={"nonaffine_operator": True},
+        )
+        return op, "linear", offs
+
+    # nonlinear (non-parametric)
+    if nonlinear:
         res_bc = _apply_dirichlet_rows(residual, dirichlet_pairs)
-        jac = _dirichlet_jac_rows(_make_jacobian(volume_terms, boundary_terms), dirichlet_pairs)
+        jac = _dirichlet_jac_rows(jacobian, dirichlet_pairs)
         return (
             FemResidualOperator(
                 lambda u, args=None: res_bc(jnp.asarray(u)),
@@ -736,8 +797,8 @@ def assemble_fem_native(
             offs,
         )
 
-    # linear
-    A = _make_jacobian(volume_terms, boundary_terms)(zeros)
+    # linear (non-parametric)
+    A = jacobian(zeros)
     b = -residual(zeros)
     if dirichlet_pairs:
         A, b = _apply_dirichlet_symmetric(jnp.asarray(A), jnp.asarray(b), dirichlet_pairs)
