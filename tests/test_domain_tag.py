@@ -129,9 +129,9 @@ def test_tag_dirichlet_is_boundary_restricted_and_enables_natural_outflow():
     assert int((np.abs(A).sum(1) == 0).sum()) == 0, "thick boundary predicate must not over-constrain the interior"
     sol = np.linalg.solve(A, np.asarray(fem.b).reshape(-1))
     assert np.all(np.isfinite(sol))
-    off = fem.problem.offset
+    off = fem.offsets
     uu = sol[off[0] : off[1]].reshape(-1, 2)
-    pts = np.asarray(fem.problem.mesh[0].points)
+    pts = np.asarray(fem.field_points[0])
     dist = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy)
     # no-slip on the exact cylinder boundary (the velocity nodes the 'cyl' tag actually constrains)
     on_cyl = np.asarray(jax.vmap(dom._make_tag_location_fn("cyl"))(jnp.asarray(pts))).astype(bool)

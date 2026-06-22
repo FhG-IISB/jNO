@@ -220,6 +220,31 @@ def _trial_spaces(constraints: List[Any]) -> set:
     }
 
 
+def _native_lagrange_ok(domain: Any, constraints: List[Any], weak_bares: List[Any], periodic_ties: List[Any]) -> bool:
+    """Whether the native 2D Lagrange assembler should handle this *steady* problem.
+
+    Native covers scalar/vector Lagrange P1/P2 on 2D triangle meshes — single- and multi-field,
+    linear/nonlinear, Dirichlet + Neumann/Robin + per-region/frozen-coefficient terms. Complex and
+    transient problems are excluded by the caller's control flow (those branches return first); this
+    gate additionally rules out the cases the native path does not yet cover, which stay on feax:
+
+    * 3D (tet) — the native assembler is 2D-only for now;
+    * periodic ties — the prolongation reduction reads a feax assembly problem;
+    * runtime-parametric coefficients — the parametric residual/lift stays on feax (Commit 4 scope).
+    """
+    from .utils.solver.parametric_helpers import _contains_runtime_parameter
+
+    if getattr(domain, "dimension", None) != 2:
+        return False
+    if periodic_ties:
+        return False
+    if _trial_spaces(constraints) - {"Lagrange"}:
+        return False
+    if any(_contains_runtime_parameter(b) for b in weak_bares):
+        return False
+    return True
+
+
 def _element_for(dimension: int, order: int) -> str:
     """Simplex element type for a ``(dimension, order)`` pair (2D/3D; orders 1, 2)."""
     et = _ELEMENT_FOR.get((int(dimension), int(order)))
@@ -849,9 +874,30 @@ class FEM:
         meshes = getattr(prob, "mesh", None) if prob is not None else None
         if meshes:
             return jnp.asarray(meshes[0].points)
+        # Native Lagrange path (no feax problem): the assembler records the DOF coordinates
+        # (vertices + edge midpoints for P2) the flat solution lives on.
+        native_pts = getattr(self.domain, "_fem_native_dof_points", None)
+        if native_pts is not None:
+            return jnp.asarray(native_pts)
         if self.mesh is not None:
             return jnp.asarray(self.mesh.points)[:, : self.domain.dimension]
         return None
+
+    @property
+    def field_points(self):
+        """Per-field DOF coordinates: ``field_points[i]`` is the ``(n_nodes_i, dim)`` node array the
+        block ``sol[offsets[i]:offsets[i+1]]`` lives on. For a coupled problem the fields may use
+        different nodes (e.g. Taylor-Hood P2 velocity vs P1 pressure). Backed by the per-field meshes
+        of the feax problem, or the native assembler's recorded per-field DOF points."""
+        prob = self.problem
+        meshes = getattr(prob, "mesh", None) if prob is not None else None
+        if meshes:
+            return [jnp.asarray(m.points) for m in meshes]
+        native_all = getattr(self.domain, "_fem_native_dof_points_all", None)
+        if native_all is not None:
+            return [jnp.asarray(p) for p in native_all]
+        pts = self.points
+        return [pts] if pts is not None else []
 
     # -- steady linear --
     @property
@@ -1520,6 +1566,16 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         op_i = _assemble_fem_system_from_ir(domain, imag_ir)
         return _finalize(FEM(domain=domain, op=(op_r, op_i), classification=classification, mode="complex"))
 
+    # ---- native 2D Lagrange (steady, real, non-parametric): replaces feax on the nodal path ----
+    if _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties):
+        from .utils.solver.fem_native import assemble_fem_native
+
+        domain._feax_problem = None  # native owns this domain's FE state (avoid reading a stale feax mesh)
+        op, mode, offs = assemble_fem_native(
+            domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=vec or 1, quad_degree=quad_degree
+        )
+        return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs))
+
     probe = ir.volume_expr if ir.volume_expr is not None else next(iter(ir.boundary_exprs.values()))
     target = _infer_solver_target(domain, probe)
     if target == "fem_system":
@@ -1539,6 +1595,7 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
     per-field kernel) and lets feax autodiff the block matrix."""
     from .utils.solver.feax_utils import _infer_fields
     from .utils.solver.fem_route import _assemble_fem_residual_from_ir, _assemble_fem_system_from_ir
+    from .utils.solver.parametric_helpers import _contains_runtime_parameter
     from .utils.solver.weak_form import (
         LoweredChannelTerm,
         LoweredWeakForm,
@@ -1608,6 +1665,25 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
     # Coupled transient (multi-field + time): block M + block spatial operator A.
     if is_transient:
         return _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals, classification, dirichlet_tv)
+
+    # ---- native 2D Lagrange (steady, real, non-parametric) coupled block assembly ----
+    # Same coverage gate as the single-field path, expressed over the inferred fields (no
+    # `constraints` here): 2D, all-Lagrange, non-complex, non-runtime-parametric. Periodic + coupled
+    # is rejected by `_finalize` regardless, so it needs no separate guard here.
+    _native_ok = (
+        getattr(domain, "dimension", None) == 2
+        and all(str(f.get("space", "Lagrange")) == "Lagrange" for f in fields)
+        and not _is_complex_form(domain, ir)
+        and not any(_contains_runtime_parameter(b) for b in weak_bares)
+    )
+    if _native_ok:
+        from .utils.solver.fem_native import assemble_fem_native
+
+        domain._feax_problem = None  # native owns this domain's FE state (avoid reading a stale feax mesh)
+        op, mode, offs = assemble_fem_native(
+            domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=1, quad_degree=quad_degree
+        )
+        return FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs)
 
     # Nonlinear coupled: feax autodiffs the block residual/Jacobian on the multi-field
     # problem (same _build_feax_problem path as linear), so the nonlinear route works

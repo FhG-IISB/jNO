@@ -544,7 +544,7 @@ def study_kovasznay():
         )
         assert not fem.is_linear and not fem.is_transient
         sol = _newton(fem)
-        off = fem.problem.offset
+        off = fem.offsets  # [0, n_vel, n_total]
         l2v = _true_l2(d, 2, sol[off[0] : off[1]], (uex, vex))  # same domain -> matching P2 node order
         l2p = _true_l2(d, 1, sol[off[1] :], pex)
         return l2v, l2p
@@ -631,7 +631,7 @@ def study_boussinesq():
         fem = jno.fem([mom, cont, ener, u(xb, yb)[0] - UXb, u(xb, yb)[1] - UYb, T(xb, yb) - Tmb, p(xpn, ypn) - 1.0])
         assert not fem.is_linear
         w = _newton(fem)
-        off = list(np.asarray(fem.problem.offset)) + [fem.dofs]
+        off = fem.offsets  # [0, n_vel, n_vel+n_p, n_total]
         l2v = _true_l2(d, 2, w[off[0] : off[1]], (uex, vex))  # same domain -> matching P2 node order
         l2T = _true_l2(d, 2, w[off[2] : off[3]], Tex)
         return l2v, l2T

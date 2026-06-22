@@ -104,13 +104,13 @@ def test_boussinesq_mms_steady_coordinate_dependent_bcs():
         w = w + jnp.linalg.solve(_dn(J(w)), -g)
         if float(jnp.linalg.norm(jnp.asarray(r(w)).reshape(-1))) < 1e-10:
             break
-    off = list(np.asarray(fem.problem.offset)) + [fem.dofs]
+    off = fem.offsets  # [0, n_vel, n_vel+n_p, n_total]
     w = np.asarray(w)
-    pts = np.asarray(fem.problem.mesh[0].points)
+    pts = np.asarray(fem.field_points[0])
     uu = w[off[0] : off[1]].reshape(-1, 2)
     UXn = PI * np.sin(PI * pts[:, 0]) * np.cos(PI * pts[:, 1])
     UYn = -PI * np.cos(PI * pts[:, 0]) * np.sin(PI * pts[:, 1])
-    ptsT = np.asarray(fem.problem.mesh[2].points)
+    ptsT = np.asarray(fem.field_points[2])
     Tn = np.sin(PI * ptsT[:, 0]) * np.cos(PI * ptsT[:, 1])
     TT = w[off[2] : off[3]]
     assert np.linalg.norm(uu - np.stack([UXn, UYn], 1)) / np.linalg.norm(np.stack([UXn, UYn], 1)) < 1e-3

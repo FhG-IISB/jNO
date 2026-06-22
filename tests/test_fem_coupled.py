@@ -114,15 +114,14 @@ def test_taylor_hood_stokes_recovers_manufactured():
     )
     assert "dirichlet@ppin" in fem.classification
 
-    prob = fem.problem
-    off = prob.offset
-    assert len(off) == 2  # two coupled fields
+    off = fem.offsets  # [0, n_vel, n_total]
+    assert len(off) == 3  # two coupled fields -> three block boundaries
     assert (off[1] - off[0]) > 2 * nv  # velocity carries edge dofs -> genuinely P2
 
     # pinned -> non-singular -> direct solve recovers both fields to machine precision
     sol = np.linalg.solve(_dense(fem.A), np.asarray(fem.b).reshape(-1))
-    pts_v = np.asarray(prob.mesh[0].points)
-    pts_p = np.asarray(prob.mesh[1].points)
+    pts_v = np.asarray(fem.field_points[0])
+    pts_p = np.asarray(fem.field_points[1])
     uu = sol[off[0] : off[1]].reshape(-1, 2)
     ppres = sol[off[1] :]
     u_ex = np.stack([pts_v[:, 0], -pts_v[:, 1]], axis=-1)
@@ -171,12 +170,11 @@ def _coupled_robin_fem(with_robin=True, order_u=1, mesh_size=0.1):
 
 def _check_up_recovery(fem, tol=1e-9):
     """Direct-solve a coupled (u*, p*) = (x, y) system and assert per-field recovery."""
-    prob = fem.problem
-    off = prob.offset
+    off = fem.offsets  # [0, n_u, n_total]
     sol = np.linalg.solve(_dense(fem.A), np.asarray(fem.b).reshape(-1))
     uu, pp = sol[off[0] : off[1]], sol[off[1] :]
-    x_u = np.asarray(prob.mesh[0].points)[:, 0]  # u nodes (P2 carries edge nodes)
-    y_p = np.asarray(prob.mesh[1].points)[:, 1]  # p nodes (P1 vertices)
+    x_u = np.asarray(fem.field_points[0])[:, 0]  # u nodes (P2 carries edge nodes)
+    y_p = np.asarray(fem.field_points[1])[:, 1]  # p nodes (P1 vertices)
     assert np.linalg.norm(uu - x_u) / np.linalg.norm(x_u) < tol
     assert np.linalg.norm(pp - y_p) / np.linalg.norm(y_p) < tol
 
@@ -290,7 +288,7 @@ def test_coupled_neumann_robin_mixed_order_recovers_manufactured():
     d, fem = _coupled_robin_fem(with_robin=True, order_u=2, mesh_size=0.15)
     assert fem.is_linear
     assert "surface@right" in fem.classification
-    off = fem.problem.offset
+    off = fem.offsets
     assert (off[1] - off[0]) > int(np.asarray(d.mesh.points).shape[0])  # u carries P2 edge dofs
     _check_up_recovery(fem)
 

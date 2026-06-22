@@ -121,8 +121,8 @@ def test_navier_stokes_convective_term_is_nonlinear_and_recovers_manufactured():
     fem = jno.fem([momentum, -qq * trace(gu), u(xb, yb)[0] - ux(xb, yb), u(xb, yb)[1] - uy(xb, yb), p(xpn, ypn) - (-0.5)])
     assert not fem.is_linear, "convective term inner(grad u, u) must classify as nonlinear"
 
-    off = fem.problem.offset
-    pts = np.asarray(fem.problem.mesh[0].points)
+    off = fem.offsets
+    pts = np.asarray(fem.field_points[0])
     sol = spo.root(
         lambda w: np.asarray(fem.residual(jnp.asarray(w))),
         np.zeros(fem.dofs),

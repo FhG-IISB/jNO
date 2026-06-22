@@ -316,3 +316,71 @@ def test_p2_scalar_poisson_converges():
     assert e_fine < 1e-3
     rate = np.log(e_coarse / e_fine) / np.log(2.0)
     assert rate > 2.0
+
+
+# ---------------------------------------------------------------------------
+# Public-path wiring: jno.fem must route 2D Lagrange to the native assembler and
+# expose the correct DOF coordinates via fem.points (esp. the promoted P2 nodes).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("order", [1, 2])
+def test_public_jno_fem_routes_native_and_points_match(order):
+    """Through the public ``jno.fem`` API: a 2D Lagrange Poisson is assembled by the
+    native path (no feax problem), and ``fem.points`` returns the coordinates the flat
+    solution actually lives on — vertices for P1, vertices+edge-midpoints for P2 — so
+    evaluating the manufactured field at ``fem.points`` recovers the solution.
+    """
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.15)
+    u, w = d.fem_symbols(names=("u", "w"), order=order)
+    xi, yi = d.variable("interior", split=True)[:2]
+    xb, yb = d.variable("boundary", split=True)[:2]
+    vv = w.bind(x=xi, y=yi)
+    f = 2 * PI**2 * sin(PI * xi) * sin(PI * yi)
+    fem = jno.fem([inner(grad(u, [xi, yi]), grad(w, [xi, yi]), n_contract=1) - f * vv, u(xb, yb) - 0.0])
+
+    assert fem.problem is None  # routed natively (no feax problem object)
+    sol = np.linalg.solve(np.asarray(fem.A), np.asarray(fem.b).reshape(-1))
+    pts = np.asarray(fem.points)
+    assert pts.shape[0] == sol.shape[0] == fem.dofs  # points index the solution one-to-one
+
+    exact = np.sin(PI * pts[:, 0]) * np.sin(PI * pts[:, 1])
+    # P2 (more DOFs / higher order) resolves the field far better than P1.
+    tol = 1e-2 if order == 1 else 1e-3
+    assert np.abs(sol - exact).max() < tol
+
+
+@pytest.mark.parametrize("vec", [1, 2])
+def test_large_mesh_assembles_without_blowup(vec):
+    """The Jacobian is assembled per element (``jacfwd`` of each element residual), so a fine mesh
+    assembles in O(n_cells × n_local²) memory. A regression to a single global ``jacfwd(residual)``
+    materialises an O(n_dofs × n_cells) tangent tensor and OOMs here (this mesh has ~thousands of DOFs
+    — large enough that the global form allocated multiple GB and failed). Guards that scaling.
+    """
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.03)  # ~1.4k P1 nodes / ~2.8k cells
+    if vec == 1:
+        u, w = d.fem_symbols(names=("u", "w"))
+        xi, yi = d.variable("interior", split=True)[:2]
+        xb, yb = d.variable("boundary", split=True)[:2]
+        vv = w.bind(x=xi, y=yi)
+        f = 2 * PI**2 * sin(PI * xi) * sin(PI * yi)
+        cons = [inner(grad(u, [xi, yi]), grad(w, [xi, yi]), n_contract=1) - f * vv, u(xb, yb) - 0.0]
+    else:
+        u, w = d.fem_symbols(value_shape=(2,), names=("u", "w"))
+        xi, yi = d.variable("interior", split=True)[:2]
+        xb, yb = d.variable("boundary", split=True)[:2]
+        eu, ev = symgrad(u, [xi, yi]), symgrad(w, [xi, yi])
+        vv = w.bind(x=xi, y=yi)
+        cons = [
+            1.0 * trace(eu) * trace(ev) + 2 * inner(eu, ev, n_contract=2) - (1.0 * vv[0] + 0.5 * vv[1]),
+            u(xb, yb) - (0.0, 0.0),
+        ]
+    fem = jno.fem(cons)
+    assert fem.problem is None  # native path
+    n = fem.dofs
+    # 1.4k+ DOFs over ~2.8k cells: the global-jacfwd intermediate (n_dofs × n_cells × n_local) was
+    # multiple GB here and OOM'd the 8 GB GPU (elasticity blew up at ~940 DOFs); per-element
+    # assembly stays in megabytes.
+    assert n > 1400
+    sol = np.linalg.solve(np.asarray(fem.A), np.asarray(fem.b).reshape(-1))
+    assert np.all(np.isfinite(sol))
