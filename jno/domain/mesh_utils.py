@@ -895,6 +895,63 @@ class MeshUtils:
         return F_op
 
     @staticmethod
+    def get_view_factor_axisymmetric(P, VM, Nrm, ds, n_phi: int = 16):
+        r"""Axisymmetric (cylindrical) point-to-point view-factor matrix ``F_op[i, j]``.
+
+        For a body of revolution the enclosure is described in the meridional ``(r, z)`` half-plane
+        (``P[:, 0] = r``, ``P[:, 1] = z``); by rotational symmetry the receiver ``i`` is fixed at
+        azimuth ``phi = 0`` and the source ``j`` is a full ring, integrated over the azimuthal angle:
+
+        .. math::
+            F_{ij} \approx r_j \, \mathrm{ds}_j \, \frac{1}{n_\phi}
+                \sum_{m} \frac{\cos\theta_i(\phi_m)\,\cos\theta_j(\phi_m)}{\pi R(\phi_m)^2}
+
+        a midpoint quadrature (``n_phi`` uniform samples) of the diffuse point-to-ring kernel. The
+        factor ``r_j`` is the cylindrical Jacobian of the ring. Only the self-pair (diagonal) is
+        removed; same-surface concave self-view is left to the visibility matrix ``VM``.
+
+        Reference: M. F. Modest, *Radiative Heat Transfer*, 3rd ed., Ch. 4 (view factors;
+        bodies of revolution / the crossed-strings and ring-integration constructions).
+        """
+        n = P.shape[0]
+        r = P[:, 0]
+        z = P[:, 1]
+        nr = Nrm[:, 0]
+        nz = Nrm[:, 1]
+
+        phi = jnp.linspace(0.0, 2.0 * jnp.pi, n_phi, endpoint=False)  # (M,)
+
+        # Shape expansions: (N_i, N_j, M)
+        r_i, z_i, nr_i, nz_i = (a[:, None, None] for a in (r, z, nr, nz))
+        r_j, z_j, nr_j, nz_j = (a[None, :, None] for a in (r, z, nr, nz))
+        phi_m = phi[None, None, :]
+
+        # Displacement from receiver i (at phi=0) to source j (at angle phi_m)
+        dx = r_j * jnp.cos(phi_m) - r_i  # (N_i, N_j, M)
+        dy = r_j * jnp.sin(phi_m)
+        dz = z_j - z_i
+
+        R2 = dx**2 + dy**2 + dz**2
+        R = jnp.sqrt(R2 + 1e-30)
+
+        # cos theta_i: n_i (2D, in the r-z plane at phi=0) dotted with the 3D direction
+        cos_i = (nr_i * dx + nz_i * dz) / R
+        # cos theta_j: n_j rotated into 3D = (nr_j cos phi, nr_j sin phi, nz_j); take negative dot
+        dot_j = nr_j * jnp.cos(phi_m) * dx + nr_j * jnp.sin(phi_m) * dy + nz_j * dz
+        cos_j = -dot_j / R
+
+        cos_i = jnp.maximum(0.0, cos_i)
+        cos_j = jnp.maximum(0.0, cos_j)
+
+        # Azimuthal integral of the diffuse kernel: int_0^2pi (...) dphi ~= (2pi/n_phi) * sum_m (...).
+        # (A plain mean would compute the ring AVERAGE and underestimate the view factor by 2*pi.)
+        dphi = 2.0 * jnp.pi / n_phi
+        kernel = dphi * jnp.sum(cos_i * cos_j / (jnp.pi * R2 + 1e-30), axis=-1)  # (N_i, N_j)
+        F_op = kernel * r[None, :] * VM * ds[None, :]
+        F_op = F_op * (1 - jnp.eye(n))
+        return F_op
+
+    @staticmethod
     def get_view_factor_1d(P, VM, Nrm, ds):
         n_pts = P.shape[0]
         return jnp.ones(n_pts)
