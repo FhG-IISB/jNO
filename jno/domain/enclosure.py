@@ -117,6 +117,37 @@ class Enclosure:
         """Boolean (m,) mask of elements belonging to ``tag`` — e.g. to build a per-element emissivity."""
         return self.element_tags == tag
 
+    def emissivity(self, values) -> jnp.ndarray:
+        """Per-element emissivity ``(m,)`` from a ``{tag: eps}`` mapping (or a scalar for all surfaces)."""
+        if np.isscalar(values):
+            return jnp.full(self.size, float(values))
+        eps = np.zeros(self.size)
+        for tag, val in dict(values).items():
+            eps[self.tag_mask(tag)] = float(val)
+        return jnp.asarray(eps)
+
+    def field(self, u) -> jnp.ndarray:
+        """Per-element temperature ``(m,)`` from the global solution ``u`` — the **nonlocal gather**.
+
+        Radiosity is piecewise-constant per boundary element, so each element's temperature is the mean
+        of its two endpoint (FEM node) values. Differentiable in ``u`` (used inside the Newton residual)."""
+        u = jnp.asarray(u).reshape(-1)
+        return 0.5 * (u[self.elements[:, 0]] + u[self.elements[:, 1]])
+
+    def load(self, q, *, size: Optional[int] = None) -> jnp.ndarray:
+        """Consistent global surface load ``(n_dofs,)`` from a per-element flux ``q`` ``(m,)``.
+
+        Scatters ``∫_Γ q v ds`` onto the FEM nodes: for piecewise-constant ``q`` and P1 test functions
+        ``∫_elem q N_i ds = q · (measure/2)`` per endpoint, so each element contributes ``q·area/2`` to
+        each of its two nodes. ``size`` defaults to the mesh node count (scalar P1 DOF layout)."""
+        q = jnp.asarray(q).reshape(-1)
+        n = int(size) if size is not None else int(np.asarray(self.domain.mesh.points).shape[0])
+        half = q * self.areas * 0.5
+        load = jnp.zeros(n, dtype=half.dtype)
+        load = load.at[jnp.asarray(self.elements[:, 0])].add(half)
+        load = load.at[jnp.asarray(self.elements[:, 1])].add(half)
+        return load
+
     def quality(self):
         """Return ``(closure_error, reciprocity_error)`` for the assembled ``F`` (raw, un-normalized).
 

@@ -268,3 +268,19 @@ def test_enclosure_handle_concentric_cylinders():
     assert abs(F12 - 1.0) < 1e-2, f"F12 should be 1, got {F12:.4f}"
     assert abs(F21 - r1 / r2) < 1e-2, f"F21 should be r1/r2={r1 / r2:.4f}, got {F21:.4f}"
     assert abs(F22 - (1 - r1 / r2)) < 1e-2, f"concave self-view F22 should be {1 - r1 / r2:.4f}, got {F22:.4f}"
+
+    # --- gather (field) + consistent scatter (load) + emissivity plumbing ---
+    n_dofs = n_pts
+    pts = np.asarray(d.mesh.points)
+    # field(u): per-element mean of endpoint values. Use a linear field u = x to check exactly.
+    u_lin = jnp.asarray(pts[:, 0])
+    elem_mid_x = 0.5 * (pts[gap.elements[:, 0], 0] + pts[gap.elements[:, 1], 0])
+    assert np.allclose(np.asarray(gap.field(u_lin)), elem_mid_x, atol=1e-12), "field() gather is wrong"
+    # load(q): total scattered load equals the surface integral of q (here q=1 -> total area).
+    load1 = np.asarray(gap.load(jnp.ones(gap.size), size=n_dofs))
+    assert load1.shape == (n_dofs,)
+    assert abs(load1.sum() - float(np.asarray(gap.areas).sum())) < 1e-9, "load() does not conserve the integral"
+    assert np.all(load1[gap.nodes] > 0) and abs(load1.sum() - load1[gap.nodes].sum()) < 1e-9, "load() leaked off-surface"
+    # emissivity({tag: eps}) -> per-element vector
+    eps = np.asarray(gap.emissivity({"inner_gap": 0.8, "outer_gap": 0.6}))
+    assert np.allclose(eps[mi], 0.8) and np.allclose(eps[mo], 0.6)
