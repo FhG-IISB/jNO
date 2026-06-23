@@ -1,9 +1,10 @@
-"""Native 2D Lagrange assembler for ``jno.fem`` (replaces the feax-backed path).
+"""Native Lagrange assembler for ``jno.fem`` (replaces the feax-backed path).
 
 Implements the full assembly pipeline for scalar/vector Lagrange P1/P2 fields on 2D
-triangle meshes (single- and multi-field, linear/nonlinear/transient),
+triangle and 3D tetrahedral meshes (single- and multi-field, linear/nonlinear/transient),
 mirroring the contract of :func:`fem_1d.assemble_fem_1d` and
-:func:`fem_nonnodal.assemble_fem_nonnodal`.
+:func:`fem_nonnodal.assemble_fem_nonnodal`. The assembler is dimension-generic: the cell
+Jacobian, element factory and facet machinery all key off ``dim``.
 
 Key components re-used without change:
 
@@ -15,8 +16,9 @@ Key components re-used without change:
 
 New components (this module only; no feax imports):
 
-* :func:`fem_lagrange.lagrange_triangle` / :func:`fem_lagrange.identity_pushforward`
-  — basix-backed Lagrange reference tabulation + isoparametric gradient map.
+* :func:`fem_lagrange.lagrange_triangle` / :func:`fem_lagrange.lagrange_tet` /
+  :func:`fem_lagrange.identity_pushforward` — basix-backed Lagrange reference tabulation +
+  isoparametric gradient map.
 * :func:`fem_facets.build_facet_connectivity` / :func:`fem_facets.compute_face_normals`
   — boundary face connectivity + outward normals for surface integration.
 
@@ -28,9 +30,11 @@ and :mod:`fem_nonnodal`.
 
 Scope
 -----
-Lagrange P1/P2 fields on 2D triangle meshes (single- and multi-field, linear,
-nonlinear, and transient).  3D (tet), runtime parameters, VPINN (:class:`ModelCall`),
-complex FEM, and periodic BCs remain on the feax path.
+Lagrange P1/P2 fields on 2D triangle and 3D tetrahedral meshes (single- and multi-field,
+linear, nonlinear, and transient).  2D additionally carries Neumann/Robin surface terms;
+a 3D surface (Neumann/Robin) term needs tet-face quadrature this assembler does not
+tabulate yet, so the caller routes it to feax.  Runtime FEM *field* parameters,
+VPINN (:class:`ModelCall`), complex FEM, and periodic BCs also remain on the feax path.
 """
 
 from __future__ import annotations
@@ -59,7 +63,7 @@ from .fem_1d import (
     _region_node_ids,
 )
 from .fem_facets import build_facet_connectivity, compute_face_normals
-from .fem_lagrange import BASIX_TET_EDGES, identity_pushforward, lagrange_triangle
+from .fem_lagrange import BASIX_TET_EDGES, identity_pushforward, lagrange_tet, lagrange_triangle
 from .fem_topology import BASIX_TRIANGLE_EDGES
 from .parametric_helpers import _collect_runtime_parameter_exprs
 from .weak_form import (
@@ -89,9 +93,11 @@ def _get_mesh(domain, dim: int, order: int):
     * ``pts_p1, cells_p1`` — the original P1 mesh (used for region masks and facets).
     * ``pts_f, cells_f`` — same as P1 when ``order=1``; promoted P2 when ``order=2``.
     """
-    cell_key = "triangle" if dim == 2 else "tetrahedron"
+    # meshio names the simplex cell block "triangle" (2D) / "tetra" (3D) -- distinct from the basix
+    # CellType name "tetrahedron" the facet machinery uses.
+    meshio_key = "triangle" if dim == 2 else "tetra"
     pts_p1 = np.asarray(domain.mesh.points)[:, :dim]
-    cells_p1 = np.asarray(domain.mesh.cells_dict[cell_key], dtype=np.int64)
+    cells_p1 = np.asarray(domain.mesh.cells_dict[meshio_key], dtype=np.int64)
     if order == 1:
         return pts_p1, cells_p1, pts_p1, cells_p1
     if dim == 2:
@@ -308,21 +314,24 @@ def assemble_fem_native(
     vec: int,
     quad_degree: int,
 ) -> Tuple[Any, str]:
-    """Assemble a 2D Lagrange FEM system into ``(op, mode, offs)`` for :class:`FEM`.
+    """Assemble a Lagrange FEM system into ``(op, mode, offs)`` for :class:`FEM`.
 
     ``mode`` is ``"linear"``, ``"nonlinear"``, or ``"transient"``; ``op`` matches the
     return-type contract of :func:`fem_1d.assemble_fem_1d` and
     :func:`fem_nonnodal.assemble_fem_nonnodal`.
 
-    Scope: scalar/vector Lagrange P1/P2 fields on 2D triangle meshes (single- and
-    multi-field, with Dirichlet and Neumann/Robin boundary conditions).  3D (tet), runtime
-    parameters, VPINN, complex FEM, and periodic BCs remain on the feax path.
+    Scope: scalar/vector Lagrange P1/P2 fields on 2D triangle and 3D tetrahedral meshes
+    (single- and multi-field).  2D carries Dirichlet and Neumann/Robin boundary conditions;
+    3D carries Dirichlet only -- a 3D surface (Neumann/Robin) term needs the tet-face
+    quadrature this assembler does not tabulate yet, so the caller routes it to feax.  VPINN,
+    complex FEM, and periodic BCs remain on the feax path.
     """
     from ...trace import FemResidualOperator
 
     dim = int(domain.dimension)
-    if dim != 2:
-        raise NotImplementedError(f"assemble_fem_native: only dim=2 is supported; got dim={dim}.")
+    if dim not in (2, 3):
+        raise NotImplementedError(f"assemble_fem_native: only dim=2 and dim=3 are supported; got dim={dim}.")
+    cell_key = "triangle" if dim == 2 else "tetrahedron"
 
     ctx = dict(getattr(domain, "context", {}) or {})
 
@@ -357,8 +366,8 @@ def assemble_fem_native(
     # -------------------------------------------------------------------------
 
     mesh_data = [_get_mesh(domain, dim, f["order"]) for f in fields]
-    pts_p1 = mesh_data[0][0]  # (n_pts_p1, 2)  — P1 node coordinates (shared)
-    cells_p1 = mesh_data[0][1]  # (n_cells, 3)   — P1 triangle connectivity (shared)
+    pts_p1 = mesh_data[0][0]  # (n_pts_p1, dim)    — P1 node coordinates (shared)
+    cells_p1 = mesh_data[0][1]  # (n_cells, dim+1)  — P1 simplex connectivity (shared)
 
     pts_f_all = [d[2] for d in mesh_data]  # per-field node coords (P2 or P1)
     cells_f_all = [d[3] for d in mesh_data]  # per-field connectivity
@@ -387,9 +396,10 @@ def assemble_fem_native(
     # Element specs and JAX constants
     # -------------------------------------------------------------------------
 
-    specs = [lagrange_triangle(f["order"], quad_degree) for f in fields]
-    # All specs share the same triangle quadrature rule (basix is deterministic)
-    qp_shared = jnp.asarray(specs[0].quad_points)  # (n_quad, 2)
+    _lagrange_simplex = lagrange_tet if dim == 3 else lagrange_triangle
+    specs = [_lagrange_simplex(f["order"], quad_degree) for f in fields]
+    # All specs share the same simplex quadrature rule (basix is deterministic)
+    qp_shared = jnp.asarray(specs[0].quad_points)  # (n_quad, dim)
     qw_shared = jnp.asarray(specs[0].quad_weights)  # (n_quad,)
 
     pts_j = jnp.asarray(pts_p1)
@@ -397,7 +407,7 @@ def assemble_fem_native(
     n_cells = int(cells_p1.shape[0])
 
     ref_vals_all = [jnp.asarray(s.ref_values) for s in specs]  # list of (n_quad, n_dof_i, 1)
-    ref_grads_all = [jnp.asarray(s.ref_grads) for s in specs]  # list of (n_quad, n_dof_i, 1, 2)
+    ref_grads_all = [jnp.asarray(s.ref_grads) for s in specs]  # list of (n_quad, n_dof_i, 1, dim)
     cells_f_j = [jnp.asarray(cf, dtype=jnp.int32) for cf in cells_f_all]  # list of (n_cells, n_local_i)
 
     # Per-field cell DOF index arrays: (n_cells, n_local_i * vec_i)
@@ -465,13 +475,17 @@ def assemble_fem_native(
     # Surface integration setup
     # -------------------------------------------------------------------------
 
-    # Per-field face tables (one set per distinct element order)
-    face_tables_per_field = [_build_face_tables(f["order"], quad_degree) for f in fields]
+    # Per-field face tables (one set per distinct element order). These tabulate the parent basis
+    # on a *triangle*'s edges for 2D surface (Neumann/Robin) integration; 3D surface terms are routed
+    # to feax by the caller, so 3D never needs them -- skip the build when there are no boundary terms.
+    face_tables_per_field = (
+        [_build_face_tables(f["order"], quad_degree) for f in fields] if boundary_terms else [None] * len(fields)
+    )
     # face_tables_per_field[i] = (face_phi, face_dphi_ref, face_ref_qp, face_ref_tang, gw_1d)
     # shapes: (3, n_q, n_dof_i), (3, n_q, n_dof_i, 2), (3, n_q, 2), (3, 2), (n_q,)
 
-    conn = build_facet_connectivity(cells_p1, "triangle")
-    normals_np = compute_face_normals(pts_p1, conn, cells_p1, "triangle") if conn.n_bfaces > 0 else np.zeros((0, 2))
+    conn = build_facet_connectivity(cells_p1, cell_key)
+    normals_np = compute_face_normals(pts_p1, conn, cells_p1, cell_key) if conn.n_bfaces > 0 else np.zeros((0, dim))
 
     # -------------------------------------------------------------------------
     # Cell-level field data builder (called inside vmap'd kernels)
@@ -485,10 +499,10 @@ def assemble_fem_native(
         per-cell Jacobian path passes a *differentiated* local slice so ``jax.jacfwd`` sees
         an element-sized (not global) input — keeping the AD intermediate O(n_local), not
         O(n_dofs)."""
-        verts = pts_j[cells_j[c]]  # (3, 2)
-        J = jnp.stack([verts[1] - verts[0], verts[2] - verts[0]], axis=1)  # (2, 2) columns = edges
+        verts = pts_j[cells_j[c]]  # (dim+1, dim)
+        J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)  # (dim, dim) columns = edges
         detJ = jnp.linalg.det(J)
-        xq = verts[0][None, :] + qp_shared @ J.T  # (n_quad, 2) physical qp
+        xq = verts[0][None, :] + qp_shared @ J.T  # (n_quad, dim) physical qp
         meas = jnp.abs(detJ)
 
         per = []
@@ -752,6 +766,41 @@ def assemble_fem_native(
     # Dirichlet pair builder
     # -------------------------------------------------------------------------
 
+    def _boundary_node_ids(fidx: int, region: str) -> List[int]:
+        """Robust boundary-DOF-node ids of ``region`` for field ``fidx``.
+
+        Boundary nodes are taken from the assembly mesh's boundary FACETS (a node on a boundary
+        facet -- P2 edge-midpoints attached by coordinate), not a geometric containment test: the
+        latter can miss a P2 midpoint sitting exactly on a face (the discrete proximity test catches
+        the P1 vertices but not the new midpoint). The catch-all ``"boundary"`` region is every
+        boundary-facet node; a named region filters those by its spatial predicate (exact even for an
+        on-face midpoint) or, lacking one, by geometric containment -- but only ever among true
+        boundary nodes, so an on-boundary node is never lost to a flaky test. Falls back to the
+        plain predicate-over-all-nodes finder when there are no facets (degenerate mesh) or the
+        boundary set is empty (e.g. an interior pin), which keeps interior Dirichlet points working.
+        """
+        from ..._fem import _boundary_facets
+
+        pts_all = np.asarray(pts_f_all[fidx])
+        bf = _boundary_facets(pts_all, np.asarray(cells_f_all[fidx]), dim, fields[fidx]["order"])
+        if bf is None:
+            return list(_region_node_ids_from_pts(domain, region, pts_all))
+        bnodes = np.unique(np.asarray(bf).reshape(-1))
+        if region != "boundary":
+            coords = pts_all[bnodes]
+            pred = getattr(domain, "_tag_predicates", {}).get(region)
+            if pred is not None:
+                mask = np.asarray(pred(*(coords[:, i] for i in range(dim))), dtype=bool).reshape(-1)
+            else:
+                loc = domain._make_tag_location_fn(region)
+                if loc is None:
+                    return []
+                mask = np.asarray(jax.vmap(loc)(jnp.asarray(coords)), dtype=bool).reshape(-1)
+            bnodes = bnodes[mask]
+        if bnodes.size == 0:  # interior pin (no boundary facet matched) -> predicate over all nodes
+            return list(_region_node_ids_from_pts(domain, region, pts_all))
+        return [int(n) for n in bnodes]
+
     def _build_dirichlet_pairs() -> List[Tuple[int, float]]:
         from ..._fem import _eval_value_node_at
 
@@ -762,7 +811,7 @@ def assemble_fem_native(
                 continue
             vt = vecs[fidx]
             pts_all = pts_f_all[fidx]
-            for nid in _region_node_ids_from_pts(domain, region, pts_all):
+            for nid in _boundary_node_ids(fidx, region):
                 p = np.asarray(pts_all[nid])
                 if value_node is not None:
                     raw = _eval_value_node_at(value_node, jnp.asarray(p)[None])

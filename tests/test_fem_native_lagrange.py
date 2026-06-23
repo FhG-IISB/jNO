@@ -350,6 +350,77 @@ def test_public_jno_fem_routes_native_and_points_match(order):
     assert np.abs(sol - exact).max() < tol
 
 
+# ---------------------------------------------------------------------------
+# 3D (tetrahedral) Lagrange: the assembler is dimension-generic (the cell Jacobian,
+# element factory and facet machinery all key off `dim`). 3D carries Dirichlet only --
+# a 3D surface (Neumann/Robin) term needs tet-face quadrature the assembler does not
+# tabulate, so the caller routes it to feax instead.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("order", [1, 2])
+def test_3d_tet_poisson_routes_native_and_solves(order):
+    """A 3D tet Poisson (Dirichlet on every cube face) is assembled natively and solves the
+    manufactured ``sin·sin·sin`` problem; ``fem.points`` indexes the flat solution one-to-one
+    (vertices for P1, vertices+edge-midpoints for P2)."""
+    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.3))
+    u, w = d.fem_symbols(names=("u", "w"), order=order)
+    xi, yi, zi = d.variable("interior", split=True)[:3]
+    vv = w.bind(x=xi, y=yi, z=zi)
+    f = 3 * PI**2 * sin(PI * xi) * sin(PI * yi) * sin(PI * zi)
+    xb, yb, zb = d.variable("boundary", split=True)[:3]
+    fem = jno.fem([inner(grad(u, [xi, yi, zi]), grad(w, [xi, yi, zi]), n_contract=1) - f * vv, u(xb, yb, zb) - 0.0])
+
+    assert fem.problem is None  # routed natively (no feax problem object)
+    sol = np.linalg.solve(np.asarray(fem.A), np.asarray(fem.b).reshape(-1))
+    pts = np.asarray(fem.points)
+    assert pts.shape[0] == sol.shape[0] == fem.dofs
+    exact = np.sin(PI * pts[:, 0]) * np.sin(PI * pts[:, 1]) * np.sin(PI * pts[:, 2])
+    rel = np.linalg.norm(sol - exact) / np.linalg.norm(exact)
+    assert rel < (0.12 if order == 1 else 0.06)
+
+
+def test_3d_tet_p2_reproduces_quadratic_exactly():
+    """A P2 tet must represent a quadratic field exactly (patch test). This pins both the basix
+    tet edge-DOF ordering used by ``_promote_to_quadratic`` (a permutation bug silently scrambles
+    the local DOFs) and the robust facet-based boundary-node detection (the geometric containment
+    test misses P2 edge-midpoints sitting exactly on a cube face, leaving them unconstrained)."""
+    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.4))
+    u, w = d.fem_symbols(names=("u", "w"), order=2)
+    xi, yi, zi = d.variable("interior", split=True)[:3]
+    vv = w.bind(x=xi, y=yi, z=zi)
+    f = -12.0 + 0.0 * xi  # u = x^2 + 2y^2 + 3z^2 + xy  =>  -lap u = -(2 + 4 + 6) = -12
+    xb, yb, zb = d.variable("boundary", split=True)[:3]
+    gb = xb**2 + 2 * yb**2 + 3 * zb**2 + xb * yb
+    fem = jno.fem([inner(grad(u, [xi, yi, zi]), grad(w, [xi, yi, zi]), n_contract=1) - f * vv, u(xb, yb, zb) - gb])
+
+    assert fem.problem is None
+    sol = np.linalg.solve(np.asarray(fem.A), np.asarray(fem.b).reshape(-1))
+    pts = np.asarray(fem.points)
+    exact = pts[:, 0] ** 2 + 2 * pts[:, 1] ** 2 + 3 * pts[:, 2] ** 2 + pts[:, 0] * pts[:, 1]
+    assert np.abs(sol - exact).max() < 1e-9  # exact up to the linear solve (x64)
+
+
+def test_3d_tet_neumann_routes_to_feax():
+    """3D surface (Neumann/Robin) integration is not native (no tet-face quadrature yet): a 3D
+    problem carrying a boundary flux term must route to feax (a feax problem object is built)."""
+    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.5))
+    u, w = d.fem_symbols(names=("u", "w"))
+    xi, yi, zi = d.variable("interior", split=True)[:3]
+    xr, yr, zr = d.variable("right", split=True)[:3]
+    vv = w.bind(x=xi, y=yi, z=zi)
+    vr = w.bind(x=xr, y=yr, z=zr)
+    xl, yl, zl = d.variable("left", split=True)[:3]
+    fem = jno.fem(
+        [
+            inner(grad(u, [xi, yi, zi]), grad(w, [xi, yi, zi]), n_contract=1) - 1.0 * vv,
+            1.0 * vr,  # Neumann flux on the 'right' face -> 3D surface -> feax
+            u(xl, yl, zl) - 0.0,
+        ]
+    )
+    assert fem.problem is not None  # native correctly declined; feax handled the surface term
+
+
 @pytest.mark.parametrize("vec", [1, 2])
 def test_large_mesh_assembles_without_blowup(vec):
     """The Jacobian is assembled per element (``jacfwd`` of each element residual), so a fine mesh

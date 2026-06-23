@@ -28,10 +28,12 @@ import numpy as np
 from .fem_elements import ElementSpec
 from .fem_topology import BASIX_TRIANGLE_EDGES
 
-# Basix edge ordering for a tetrahedron (6 edges, one P2 midpoint DOF each).
-# Matches basix entity_dofs for P, CellType.tetrahedron, degree=2:
-# edges (0,1), (0,2), (0,3), (1,2), (1,3), (2,3) in that order.
-BASIX_TET_EDGES: Tuple[Tuple[int, int], ...] = ((0, 1), (0, 2), (0, 3), (1, 2), (1, 3), (2, 3))
+# Basix edge ordering for a tetrahedron (6 edges, one P2 midpoint DOF each). The order MUST match
+# basix's P2 tetrahedron DOF layout: the 6 edge-midpoint DOFs (after the 4 vertices) sit at the
+# midpoints of vertex pairs (2,3), (1,3), (1,2), (0,3), (0,2), (0,1) -- in that order (read off the
+# basix interpolation points). `_promote_to_quadratic` appends midpoint nodes to each cell in this
+# order, so a mismatch silently scrambles the P2 local DOFs against the tabulated basis.
+BASIX_TET_EDGES: Tuple[Tuple[int, int], ...] = ((2, 3), (1, 3), (1, 2), (0, 3), (0, 2), (0, 1))
 
 
 def lagrange_triangle(degree: int, quad_degree: Optional[int] = None) -> ElementSpec:

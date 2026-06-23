@@ -221,15 +221,16 @@ def _trial_spaces(constraints: List[Any]) -> set:
 
 
 def _native_lagrange_ok(domain: Any, constraints: List[Any], weak_bares: List[Any], periodic_ties: List[Any]) -> bool:
-    """Whether the native 2D Lagrange assembler should handle this problem.
+    """Whether the native Lagrange assembler should handle this problem.
 
-    Native covers scalar/vector Lagrange P1/P2 on 2D triangle meshes — single- and multi-field,
-    linear/nonlinear, steady & transient, Dirichlet + Neumann/Robin + per-region/frozen-coefficient
-    terms, and runtime-parametric *scalar* coefficients (steady inverse). Complex and transient
-    problems are excluded by the caller's control flow (those branches return first); this gate rules
-    out what the native path does not yet cover, which stays on feax:
+    Native covers scalar/vector Lagrange P1/P2 on 2D triangle and 3D tetrahedral meshes — single-
+    and multi-field, linear/nonlinear, steady & transient, Dirichlet + per-region/frozen-coefficient
+    terms, and runtime-parametric *scalar* coefficients (steady inverse). 2D additionally carries
+    Neumann/Robin surface terms. This gate rules out what the native path does not yet cover, which
+    stays on feax:
 
-    * 3D (tet) — the native assembler is 2D-only for now;
+    * 3D (tet) *surface* (Neumann/Robin) terms — the tet-face quadrature is not tabulated yet, so a
+      3D problem with boundary terms is excluded by the caller (it inspects ``boundary_terms``);
     * periodic ties — the prolongation reduction reads a feax assembly problem;
     * FEM *field* (nodal ``k(x)``) parameters — native threads scalar parameters only.
 
@@ -237,7 +238,7 @@ def _native_lagrange_ok(domain: Any, constraints: List[Any], weak_bares: List[An
     (this gate only runs on single-field problems -- multifield returns earlier). The transient call
     sites add their own runtime-parameter exclusion (native transient-parametric is not wired yet).
     """
-    if getattr(domain, "dimension", None) != 2:
+    if getattr(domain, "dimension", None) not in (2, 3):
         return False
     if periodic_ties:
         return False
@@ -1484,14 +1485,17 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     weak_bares = volume_terms + [e for exprs in boundary_terms.values() for e in exprs]
     is_transient = any(_contains_temporal_derivative(b) for b in weak_bares)
 
-    # ---- native 2D Lagrange (single field): routed BEFORE init_fem so the native path never imports
-    # feax. Covers steady (incl. runtime-scalar-parametric) and transient (constant Dirichlet + a
-    # time-dependent source). complex / VPINN / periodic / 3D / field-param / time-varying-Dirichlet /
-    # transient-parametric fall through to the feax paths below. ----
+    # ---- native Lagrange (single field): routed BEFORE init_fem so the native path never imports
+    # feax. Covers 2D triangle and 3D tet, steady (incl. runtime-scalar-parametric) and transient
+    # (constant Dirichlet + a time-dependent source). complex / VPINN / periodic / 3D-surface /
+    # field-param / time-varying-Dirichlet / transient-parametric fall through to the feax paths
+    # below. ----
     if (
         not is_vpinn
         and _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
         and not _is_complex_form(domain, ir)
+        # 3D surface (Neumann/Robin) needs tet-face quadrature the native assembler does not tabulate.
+        and not (int(domain.dimension) == 3 and boundary_terms)
     ):
         from .utils.solver.parametric_helpers import _contains_fem_field_parameter as _cfp
 
