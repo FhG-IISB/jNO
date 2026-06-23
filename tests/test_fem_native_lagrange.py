@@ -455,6 +455,29 @@ def test_transient_nonhomogeneous_dirichlet_relaxes_to_one():
     assert np.abs(w_final - 1.0).max() < 5e-3
 
 
+def test_transient_scalar_parametric_routes_native():
+    """A transient with an unknown scalar coefficient ``u_t = alpha Δu`` routes natively to a
+    parametric FeaxTimeBlock whose ``operator_fn(t, args)`` re-assembles A(alpha) per step (used by the
+    differentiable inverse solve). The free-row operator scales linearly with alpha here."""
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.2, time=(0.0, 0.3, 16))
+    u, w = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb = d.variable("boundary", split=True)[:2]
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), w.bind(x=xi, y=yi, t=ti)
+    alpha = jno.np.parameter((1,), name="alpha")
+    icf = jno.fn(lambda x, y: jnp.sin(PI * x) * jnp.sin(PI * y), [ci[0], ci[1]])
+    fem = jno.fem([ui.t * vi + alpha * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - icf])
+
+    assert fem.is_transient and fem.problem is None
+    blk = fem.operator
+    assert blk.operator_fn is not None and list(blk.runtime_parameter_exprs) == ["alpha"]
+    a1 = np.asarray(blk.operator_fn(0.0, {"alpha": 1.0}))
+    a2 = np.asarray(blk.operator_fn(0.0, {"alpha": 2.0}))
+    free = ~np.isclose(np.abs(a1).sum(axis=1), 1.0)  # interior rows (Dirichlet rows -> unit diagonal)
+    assert free.any() and np.abs(a2[free] - 2.0 * a1[free]).max() < 1e-10
+
+
 # ---------------------------------------------------------------------------
 # Runtime-parametric (inverse): the operator is re-assembled at the runtime args and
 # stays differentiable in them. A finite-difference check guards the gradient itself

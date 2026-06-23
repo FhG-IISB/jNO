@@ -525,6 +525,12 @@ def assemble_fem_native(
         a = args or {}
         pv = []
         for name in runtime_parameter_tags:
+            if name not in a:
+                # Parameter not supplied for this assembly (e.g. the mass matrix, which references no
+                # parameter): pack a zero placeholder of the right width. It is only ever read back if
+                # the term actually contains the parameter node, in which case args carries its value.
+                pv.append(jnp.zeros((n_local_f[0] if name in _field_param_names else 1,), dtype))
+                continue
             flat = jnp.reshape(jnp.asarray(a[name], dtype=dtype), (-1,))
             # Single-field nodal field parameter -> this cell's local nodal values (field 0).
             pv.append(flat[cells_f_j[0][c]] if name in _field_param_names else flat[:1])
@@ -848,22 +854,53 @@ def assemble_fem_native(
 
         nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in spatial)
         if nonlinear:
-            # Row-replacement Dirichlet (constant g), threaded through the runtime time t so a
-            # time-dependent spatial coefficient is re-evaluated each step.
-            def res_bc(u, t, _d=d_dofs, _g=d_vals):
-                R = spatial_res(jnp.asarray(u), t)
+            # Row-replacement Dirichlet (constant g), threaded through the runtime time t AND the
+            # runtime args so a time-dependent / parametric spatial coefficient is re-evaluated each step.
+            def res_bc(u, t, args=None, _d=d_dofs, _g=d_vals):
+                R = spatial_res(jnp.asarray(u), t, args)
                 return R if _d is None else R.at[_d].set(jnp.asarray(u)[_d] - _g)
 
-            def jac_bc(u, t, _d=d_dofs):
-                J = spatial_jac(jnp.asarray(u), t)
+            def jac_bc(u, t, args=None, _d=d_dofs):
+                J = spatial_jac(jnp.asarray(u), t, args)
                 return J if _d is None else J.at[_d, :].set(0.0).at[_d, _d].set(1.0)
 
             M_bc = M if d_dofs is None else M.at[d_dofs, :].set(0.0).at[:, d_dofs].set(0.0)
             return (
                 FeaxTimeBlock(
                     mass=lambda t, args=None, _M=M_bc: _M,
-                    residual=lambda u, t, args=None: res_bc(u, t),
-                    jacobian=lambda u, t, args=None: jac_bc(u, t),
+                    residual=res_bc,
+                    jacobian=jac_bc,
+                    runtime_parameter_exprs=dict(_rt_param_exprs),
+                    **common,
+                ),
+                "transient",
+                offs,
+            )
+
+        # ---- linear parametric transient: the operator A(t, args) is re-evaluated each step.
+        # Row-replacement Dirichlet (rows -> identity, columns kept) needs no args-dependent lift --
+        # the coupling to the held Dirichlet value sits on the LHS, the constant g in the affine bias. ----
+        if runtime_parameter_tags:
+            M_bc = M if d_dofs is None else M.at[d_dofs, :].set(0.0).at[:, d_dofs].set(0.0)
+            c_bias = zeros if d_dofs is None else zeros.at[d_dofs].set(d_vals)
+            free_mask = jnp.ones((total,), dtype=zeros.dtype)
+            if d_dofs is not None:
+                free_mask = free_mask.at[d_dofs].set(0.0)
+
+            def operator_fn(t, args=None, _d=d_dofs):
+                A = spatial_jac(zeros, t, args)
+                return A if _d is None else A.at[_d, :].set(0.0).at[_d, _d].set(1.0)
+
+            def forcing_vector_fn(t, args=None, _mask=free_mask):
+                return _mask * (-spatial_res(zeros, t, args))
+
+            return (
+                FeaxTimeBlock(
+                    M=M_bc,
+                    operator_fn=operator_fn,
+                    affine_bias=c_bias,
+                    forcing_vector_fn=forcing_vector_fn,
+                    runtime_parameter_exprs=dict(_rt_param_exprs),
                     **common,
                 ),
                 "transient",

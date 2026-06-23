@@ -1493,12 +1493,13 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         and _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
         and not _is_complex_form(domain, ir)
     ):
-        from .utils.solver.parametric_helpers import _contains_runtime_parameter as _crp
+        from .utils.solver.parametric_helpers import _contains_fem_field_parameter as _cfp
 
         _native_now = True
         if is_transient:
-            # native transient excludes runtime-parametric and time-varying Dirichlet g(x,t)
-            _native_now = not any(_crp(b) for b in weak_bares) and not any(
+            # native transient covers a runtime SCALAR parameter (operator_fn(t, args)) but not a
+            # nodal FIELD parameter or a time-varying Dirichlet g(x,t) -- those stay on feax.
+            _native_now = not any(_cfp(b) for b in weak_bares) and not any(
                 _is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw
             )
         if _native_now:
