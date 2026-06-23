@@ -1,13 +1,13 @@
 """
 Solver utility layer for jNO backend routing.
 
-This package contains shared helpers used by FEM/FEAX, weak-form routing,
+This package contains shared helpers used by FEM, weak-form routing,
 time routing, and solver adapters.
 """
 
 from .backend_blocks import (
     DiffraxBlock,
-    FeaxTimeBlock,
+    SemidiscreteTimeBlock,
 )
 from .fem_route import (
     DirichletBC,
@@ -71,6 +71,6 @@ __all__ = [
     "lower_weak_form",
     "assemble_weak_form",
     "DiffraxBlock",
-    "FeaxTimeBlock",
+    "SemidiscreteTimeBlock",
     "split_weak_additive_terms",
 ]

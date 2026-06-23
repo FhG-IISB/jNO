@@ -1,5 +1,5 @@
 """The ``jno.fem([...])`` driver: classify traced residuals (test-function
-presence x region) and assemble through feax into an ``FEM`` container of
+presence x region) and assemble into an ``FEM`` container of
 matrices/operators (no solve).
 
 Covers:
@@ -28,7 +28,7 @@ from shapely.geometry import box  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """feax assembly is float64; opt into x64 per-test (the session default may be x64-off when
+    """FEM assembly is float64; opt into x64 per-test (the session default may be x64-off when
     co-run with test_periodic). Save/restore keeps the flag from leaking to other modules."""
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)

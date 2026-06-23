@@ -3,7 +3,6 @@
 import pytest
 
 pytest.importorskip("foundax", reason="foundax required for neural VPINN tests")
-pytest.importorskip("feax", reason="feax required for FEM/VPINN tests")
 
 import foundax
 import jax
@@ -26,7 +25,7 @@ def init_vpinn_fem(dom, with_neumann_tags=True):
     """
     Initialize FEM quadrature tags used by the VPINN route.
 
-    VPINN uses the same sampled tags as the FEAX/FEM route:
+    VPINN uses the same sampled tags as the FEM route:
     - fem_gauss
     - gauss_<boundary_tag>
     """
@@ -34,7 +33,7 @@ def init_vpinn_fem(dom, with_neumann_tags=True):
     if with_neumann_tags:
         bcs.append(dom.neumann(["right", "top"]))
 
-    # Native (feax-free) FEM context: the same quadrature / shape-function / boundary tensors the
+    # Native FEM context: the same quadrature / shape-function / boundary tensors the
     # grouped-weak-form evaluator reads, built from the native Lagrange + facet machinery.
     dom.init_fem_native(
         element_type="TRI3",

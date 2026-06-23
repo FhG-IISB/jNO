@@ -1269,7 +1269,7 @@ class RegionMask(Placeholder):
 
     A cell belongs to the region iff its **centroid** does -- classified once at assembly build time
     against a geometry part (``domain._source_regions`` shapely polygon) or a ``domain.tag`` predicate
-    (concrete numpy/shapely, never traced). The FEAX volume kernel resolves it from a constant per-cell
+    (concrete numpy/shapely, never traced). The volume kernel resolves it from a constant per-cell
     ``volume_var``. It is a leaf (no children) and carries no coordinates, so it composes as a plain
     scalar coefficient: ``RegionMask(region) * weak_term``.
     """
@@ -2921,7 +2921,7 @@ class FemLinearSystem:
         choose another. Use a differentiable solver so ``∂u/∂θ`` exists.
 
         Note: the FEM solve is global (one ``A``, ``b``, ``u``); enable x64
-        (``jax_enable_x64``) and set the parameter dtype to match — the feax
+        (``jax_enable_x64``) and set the parameter dtype to match — the
         assembly is float64.
         """
         if solve_fn is None:
@@ -3031,7 +3031,7 @@ class FemResidualOperator:
         of the residual.
 
         ``u0`` is the initial guess (default: zeros of the operator size; enable
-        x64 — the feax residual is float64).
+        x64 — the residual is float64).
         """
         if u0 is None:
             if self.size is None:
@@ -3310,7 +3310,7 @@ class Assembly(Placeholder):
 
 class GroupedAssembly(Placeholder):
     """
-    Internal node for grouped FEAX-style variational assembly.
+    Internal node for grouped variational assembly.
 
     Separate channels:
       - volume_value_expr   : terms multiplied by TestFunction(phi)

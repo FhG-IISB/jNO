@@ -28,7 +28,7 @@ u_h = jnp.linalg.solve(fem.A, fem.b)
 
 > The flat accessors — `fem.A`, `fem.b`, `fem.M`, `fem.state0`, and `fem.residual(u[, t])` /
 > `fem.jacobian(u[, t])` — return ready-to-use **dense** matrices and **flat** vectors, so no
-> `.todense()`/`reshape` is needed. `fem.operator` still exposes the raw sparse (`BCOO`) feax form
+> `.todense()`/`reshape` is needed. `fem.operator` still exposes the raw sparse (`BCOO`) operator
 > for large problems; the `dense(...)` helper above densifies those (e.g. `fem.operator.A`).
 
 ---
@@ -103,7 +103,7 @@ u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")   # H(div) 
 p, q = d.fem_symbols(names=("p", "q"), space="P0")                     # piecewise-constant scalar
 ```
 
-jNO assembles these with its own push-forward engine (feax has none), but the weak form reads like
+jNO assembles these with its own push-forward engine, but the weak form reads like
 any other coupled problem.
 
 **Vector operators** (on a bound vector view): `u.div(x, y)` is the divergence and `u.curl(x, y)` the
@@ -239,7 +239,7 @@ make it an inverse unknown — the next section.
 > `.freeze()` is equivalent to writing `jno.fn(...)` / the constant directly; it exists so one
 > `jno.np.parameter` can be *trained* (un-frozen) or *fixed* (frozen) without rewriting the form. A
 > vector-valued coefficient is best written **per component** with scalar functions (a single function
-> returning a tuple hits a FEAX-kernel limit shared with `jno.fn`).
+> returning a tuple hits a kernel limit shared with `jno.fn`).
 
 ---
 
@@ -363,9 +363,9 @@ conservation). The non-nodal families add an **H(div) mixed Poisson** (Raviart�
 ## Known limitations
 
 The FEM / weak-form path is stable for the cases the tutorials cover, but the
-FEAX-backed lowering has a few boundaries worth knowing. They apply only when you
+lowering has a few boundaries worth knowing. They apply only when you
 **assemble a weak form** (`target="fem_system"` / `"fem_residual"`) or solve a
-**transient problem through the FEAX time route** — the residual-PINN path is
+**transient problem through the time route** — the residual-PINN path is
 unaffected. Each boundary is an explicit, fail-loud `NotImplementedError`, never a
 silently wrong result.
 

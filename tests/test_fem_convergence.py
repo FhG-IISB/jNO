@@ -41,7 +41,6 @@ import pytest
 
 import jno
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
@@ -56,7 +55,7 @@ PI = np.pi
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """feax assembly is float64, so these tests opt into x64 per-test. The session default is
+    """FEM assembly/solves run in float64, so these tests opt into x64 per-test. The session default is
     x64-off (see tests/conftest.py); save/restore keeps the flag from leaking to other modules."""
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
@@ -580,7 +579,7 @@ def study_complex_helmholtz():
         fem = jno.fem([weak.real, u.real(xb, yb) - 0.0, u.imag(xb, yb) - 0.0])
         assert fem._mode == "linear"
         sol = _solve_linear(fem)
-        n = int(fem.offsets[1])  # [0, n_re, n_total] -- the real/imag field split (native, no feax problem)
+        n = int(fem.offsets[1])  # [0, n_re, n_total] -- the real/imag field split (native assembly)
         er = _true_l2(d, 1, sol[:n], lambda co: sin(PI * co[0]) * sin(PI * co[1]))
         ei = _true_l2(d, 1, sol[n:], lambda co: sin(2 * PI * co[0]) * sin(PI * co[1]))
         return float(np.hypot(er, ei))

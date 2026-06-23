@@ -12,14 +12,11 @@ These exercise ``build_periodic_prolongation`` directly (no FEM assembly). x64 s
 reduction reproduces the fields exactly.
 """
 
+import jax  # noqa: E402
 import numpy as np
 import pytest
 
-pytest.importorskip("feax", reason="feax required for the periodic solver utilities")
-
-import jax  # noqa: E402
-
-from jno.utils.solver.feax_utils import build_periodic_prolongation  # noqa: E402
+from jno.utils.solver.fem_utils import build_periodic_prolongation  # noqa: E402
 
 
 @pytest.fixture(autouse=True)

@@ -8,16 +8,15 @@ expects.
 
 Two oracles are used:
 
-* **Matrix-level vs feax** (machine precision).  feax is the known-good engine;
-  for P1 single- and vector-fields the native global DOF numbering matches
-  feax's, so the assembled ``A``/``b`` can be compared entry-for-entry.  This
-  catches push-forward, scatter and DOF-map bugs that a convergence-rate check
-  can hide on symmetric problems.
+* **Matrix-level vs the ``jno.fem`` route** (machine precision).  The high-level
+  ``jno.fem`` route is the reference; for P1 single- and vector-fields the direct
+  global DOF numbering matches the route's, so the assembled ``A``/``b`` can be
+  compared entry-for-entry.  This catches push-forward, scatter and DOF-map bugs
+  that a convergence-rate check can hide on symmetric problems.
 * **Analytic solution + convergence** for P2.  The native P2 element numbers its
-  edge nodes in basix's element-DOF order (required: the gradients come from
-  basix tabulation), which differs from feax's edge numbering by a benign
-  permutation — so the raw matrices are not comparable, but the solution at the
-  native nodes is, and must match the manufactured field and converge at O(h^3).
+  edge nodes in basix's element-DOF order (required: the gradients come from basix
+  tabulation), and is validated against the manufactured field at the native nodes,
+  which must converge at O(h^3).
 """
 
 from __future__ import annotations
@@ -26,7 +25,6 @@ import numpy as np
 import pytest
 
 basix = pytest.importorskip("basix", reason="basix required for element tabulation")
-pytest.importorskip("feax", reason="feax required as the assembly oracle")
 pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
 
 import jax  # noqa: E402
@@ -52,9 +50,9 @@ PI = np.pi
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """The native assembler is compared to feax's float64 matrices, so these tests
-    opt into x64 per-test (the session default is x64-off; save/restore keeps the
-    flag from leaking to other modules)."""
+    """The native assembler is compared at float64 precision, so these tests opt
+    into x64 per-test (the session default is x64-off; save/restore keeps the flag
+    from leaking to other modules)."""
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
     try:
@@ -121,8 +119,8 @@ def _native_op(build, *, mesh_size, vec, order, quad):
     return d, op
 
 
-def _feax_linear(build, *, mesh_size, quad):
-    """Assemble ``(A, b)`` for the same problem through feax (the oracle)."""
+def _route_linear(build, *, mesh_size, quad):
+    """Assemble ``(A, b)`` for the same problem through the high-level ``jno.fem`` route (the oracle)."""
     d = jno.domain(box(0, 0, 1, 1), mesh_size=mesh_size)
     fem = jno.fem(build(d), quad_degree=quad)
     assert fem.is_linear
@@ -130,11 +128,11 @@ def _feax_linear(build, *, mesh_size, quad):
 
 
 # ---------------------------------------------------------------------------
-# P1 matrix-level oracle (native global numbering == feax's)
+# P1 matrix-level oracle (direct global numbering == the jno.fem route's)
 # ---------------------------------------------------------------------------
 
 
-def test_p1_scalar_poisson_matches_feax():
+def test_p1_scalar_poisson_matches_jno_fem():
     """-Δu = f, u = sin(πx)sin(πy), homogeneous Dirichlet."""
 
     def build(d):
@@ -146,13 +144,13 @@ def test_p1_scalar_poisson_matches_feax():
         return [inner(grad(u, [xi, yi]), grad(w, [xi, yi]), n_contract=1) - f * vv, u(xb, yb) - 0.0]
 
     _d, A_n, b_n = _native_linear(build, mesh_size=0.2, vec=1, order=1, quad=2)
-    A_f, b_f = _feax_linear(build, mesh_size=0.2, quad=2)
+    A_f, b_f = _route_linear(build, mesh_size=0.2, quad=2)
     assert A_n.shape == A_f.shape
     assert np.abs(A_n - A_f).max() < 1e-11
     assert np.abs(b_n - b_f).max() < 1e-11
 
 
-def test_p1_vector_elasticity_matches_feax():
+def test_p1_vector_elasticity_matches_jno_fem():
     """Linear elasticity (vec=2): λ tr(ε(u)) tr(ε(v)) + 2μ ε(u):ε(v) = f·v."""
 
     def build(d):
@@ -166,13 +164,13 @@ def test_p1_vector_elasticity_matches_feax():
         return [weak, u(xb, yb) - (0.0, 0.0)]
 
     _d, A_n, b_n = _native_linear(build, mesh_size=0.25, vec=2, order=1, quad=2)
-    A_f, b_f = _feax_linear(build, mesh_size=0.25, quad=2)
+    A_f, b_f = _route_linear(build, mesh_size=0.25, quad=2)
     assert A_n.shape == A_f.shape
     assert np.abs(A_n - A_f).max() < 1e-11
     assert np.abs(b_n - b_f).max() < 1e-11
 
 
-def test_p1_neumann_plus_dirichlet_matches_feax():
+def test_p1_neumann_plus_dirichlet_matches_jno_fem():
     """Mixed BC: Dirichlet on the whole boundary set is replaced by a Neumann
     (natural) flux term on the 'right' edge plus Dirichlet elsewhere — exercises the
     surface integral path alongside the volume assembly."""
@@ -194,7 +192,7 @@ def test_p1_neumann_plus_dirichlet_matches_feax():
         ]
 
     _d, A_n, b_n = _native_linear(build, mesh_size=0.25, vec=1, order=1, quad=2)
-    A_f, b_f = _feax_linear(build, mesh_size=0.25, quad=2)
+    A_f, b_f = _route_linear(build, mesh_size=0.25, quad=2)
     assert A_n.shape == A_f.shape
     assert np.abs(A_n - A_f).max() < 1e-11
     assert np.abs(b_n - b_f).max() < 1e-11
@@ -212,14 +210,12 @@ def _newton(residual, jacobian, n, *, iters=30, tol=1e-12):
     return np.asarray(u)
 
 
-def test_p1_nonlinear_bratu_matches_feax():
+def test_p1_nonlinear_bratu_matches_jno_fem():
     """Bratu -Δu - λ e^u = 0 (nonlinear).
 
-    The residual matches feax entry-for-entry at a probe state.  The raw Jacobian
-    differs only on Dirichlet *columns* (native uses row-replacement elimination,
-    feax symmetric elimination) — a convention that leaves the Newton step
-    unchanged — so correctness is asserted by driving both operators through the
-    *same* Newton iteration and comparing the converged solutions.
+    The residual matches the ``jno.fem`` route entry-for-entry at a probe state;
+    correctness is then asserted by driving both operators through the *same* Newton
+    iteration and comparing the converged solutions.
     """
     lam = 1.5
 
@@ -243,15 +239,15 @@ def test_p1_nonlinear_bratu_matches_feax():
     assert np.abs(r_n - r_f).max() < 1e-10
 
     u_native = _newton(op.residual, op.jacobian, n)
-    u_feax = _newton(fem.residual, fem.jacobian, n)
+    u_dsl = _newton(fem.residual, fem.jacobian, n)
     assert np.abs(np.asarray(op.residual(jnp.asarray(u_native))).reshape(-1)).max() < 1e-9
-    assert np.abs(u_native - u_feax).max() < 1e-10
+    assert np.abs(u_native - u_dsl).max() < 1e-10
 
 
-def test_p1_coupled_two_field_matches_feax():
+def test_p1_coupled_two_field_matches_jno_fem():
     """Coupled reaction-diffusion (two scalar P1 fields a, b with cross terms) —
-    exercises the multi-field block assembly; native and feax both order the fields
-    by first appearance with node-major DOFs, so the block matrix matches."""
+    exercises the multi-field block assembly; the direct path and the ``jno.fem`` route both order
+    the fields by first appearance with node-major DOFs, so the block matrix matches."""
 
     def build(d):
         a, p = d.fem_symbols(names=("a", "p"))
@@ -265,7 +261,7 @@ def test_p1_coupled_two_field_matches_feax():
         return [eq_a, eq_b, a(xb, yb) - 0.0, b(xb, yb) - 0.0]
 
     _d, A_n, b_n = _native_linear(build, mesh_size=0.3, vec=1, order=1, quad=2)
-    A_f, b_f = _feax_linear(build, mesh_size=0.3, quad=2)
+    A_f, b_f = _route_linear(build, mesh_size=0.3, quad=2)
     assert A_n.shape == A_f.shape
     assert np.abs(A_n - A_f).max() < 1e-11
     assert np.abs(b_n - b_f).max() < 1e-11
@@ -288,7 +284,7 @@ def test_p1_homogeneous_source_is_trivial():
 
 
 # ---------------------------------------------------------------------------
-# P2: analytic-solution + convergence oracle (matrix numbering differs from feax)
+# P2: analytic-solution + convergence oracle (manufactured field at the native nodes)
 # ---------------------------------------------------------------------------
 
 
@@ -327,7 +323,7 @@ def test_p2_scalar_poisson_converges():
 @pytest.mark.parametrize("order", [1, 2])
 def test_public_jno_fem_routes_native_and_points_match(order):
     """Through the public ``jno.fem`` API: a 2D Lagrange Poisson is assembled by the
-    native path (no feax problem), and ``fem.points`` returns the coordinates the flat
+    native path (``fem.problem`` is None), and ``fem.points`` returns the coordinates the flat
     solution actually lives on — vertices for P1, vertices+edge-midpoints for P2 — so
     evaluating the manufactured field at ``fem.points`` recovers the solution.
     """
@@ -339,7 +335,7 @@ def test_public_jno_fem_routes_native_and_points_match(order):
     f = 2 * PI**2 * sin(PI * xi) * sin(PI * yi)
     fem = jno.fem([inner(grad(u, [xi, yi]), grad(w, [xi, yi]), n_contract=1) - f * vv, u(xb, yb) - 0.0])
 
-    assert fem.problem is None  # routed natively (no feax problem object)
+    assert fem.problem is None  # routed natively (problem is None)
     sol = np.linalg.solve(np.asarray(fem.A), np.asarray(fem.b).reshape(-1))
     pts = np.asarray(fem.points)
     assert pts.shape[0] == sol.shape[0] == fem.dofs  # points index the solution one-to-one
@@ -352,9 +348,8 @@ def test_public_jno_fem_routes_native_and_points_match(order):
 
 # ---------------------------------------------------------------------------
 # 3D (tetrahedral) Lagrange: the assembler is dimension-generic (the cell Jacobian,
-# element factory and facet machinery all key off `dim`). 3D carries Dirichlet only --
-# a 3D surface (Neumann/Robin) term needs tet-face quadrature the assembler does not
-# tabulate, so the caller routes it to feax instead.
+# element factory and facet machinery all key off `dim`), and handles both Dirichlet
+# and Neumann/Robin terms (the latter via tet-face surface quadrature).
 # ---------------------------------------------------------------------------
 
 
@@ -371,7 +366,7 @@ def test_3d_tet_poisson_routes_native_and_solves(order):
     xb, yb, zb = d.variable("boundary", split=True)[:3]
     fem = jno.fem([inner(grad(u, [xi, yi, zi]), grad(w, [xi, yi, zi]), n_contract=1) - f * vv, u(xb, yb, zb) - 0.0])
 
-    assert fem.problem is None  # routed natively (no feax problem object)
+    assert fem.problem is None  # routed natively (problem is None)
     sol = np.linalg.solve(np.asarray(fem.A), np.asarray(fem.b).reshape(-1))
     pts = np.asarray(fem.points)
     assert pts.shape[0] == sol.shape[0] == fem.dofs
@@ -461,16 +456,16 @@ def test_3d_tet_multifield_routes_native_and_recovers():
 
 
 # ---------------------------------------------------------------------------
-# Periodic ties: the feax-free prolongation reduction (_build_periodic_reduction +
-# build_periodic_prolongation) is fed the native assembly cells, so a steady scalar
-# single-field periodic problem reduces and solves without feax. Transient / vector /
-# runtime-parametric periodic stay on feax.
+# Periodic ties: the prolongation reduction (_build_periodic_reduction +
+# build_periodic_prolongation) is fed the native assembly cells, so a scalar
+# single-field periodic problem reduces and solves natively in both the steady and
+# transient cases. Vector / runtime-parametric periodic raise NotImplementedError.
 # ---------------------------------------------------------------------------
 
 
 def test_periodic_steady_scalar_routes_native_and_reduces():
     """A steady scalar Poisson, periodic in x (``u(left) - u(right)``) + Dirichlet in y, assembles
-    natively (no feax problem) and the periodic tie still reduces the system (slave DOFs eliminated)
+    natively (``fem.problem`` is None) and the periodic tie still reduces the system (slave DOFs eliminated)
     and recovers the manufactured solution -- the reduction reads the native assembly cells."""
     pi = np.pi
     dom = jno.domain({"fine": box(0, 0, 0.5, 1), "coarse": box(0.5, 0, 1, 1)}).build_mesh(0.12, sizes={"fine": 0.06})
@@ -498,9 +493,9 @@ def test_periodic_steady_scalar_routes_native_and_reduces():
     assert float(np.linalg.norm(uh - ex) / np.linalg.norm(ex)) < 0.05
 
 
-def test_periodic_transient_stays_on_feax():
-    """The transient periodic route pre-builds the reduction into the feax context at assembly time,
-    so a transient periodic problem must NOT route native (native scopes periodic to the steady case)."""
+def test_periodic_transient_routes_native_and_reduces():
+    """A transient periodic problem routes natively: the prolongation reduction is pre-built into the
+    assembly context at assembly time, so the semidiscrete block carries the reduced periodic system."""
     dom = jno.domain(box(0, 0, 1, 1), mesh_size=0.2, time=(0.0, 0.01, 2))
     dom.tag("left", lambda x, y: (x < 1e-6) & (y > 1e-6) & (y < 1 - 1e-6))
     dom.tag("right", lambda x, y: (x > 1 - 1e-6) & (y > 1e-6) & (y < 1 - 1e-6))
@@ -524,7 +519,9 @@ def test_periodic_transient_stays_on_feax():
             u(ci[0], ci[1]) - ic,
         ]
     )
-    assert fem.problem is not None  # transient periodic stayed on feax
+    assert fem.problem is None  # routed natively
+    assert fem.is_transient
+    assert fem._periodic is not None and fem._periodic["n_red"] < fem._periodic["n_full"]
 
 
 @pytest.mark.parametrize("vec", [1, 2])
@@ -570,7 +567,7 @@ def test_large_mesh_assembles_without_blowup(vec):
 
 
 def _march(fem):
-    """Backward-Euler march of a native FeaxTimeBlock (M u̇ + A u = c + f(t))."""
+    """Backward-Euler march of a native SemidiscreteTimeBlock (M u̇ + A u = c + f(t))."""
     M, A = np.asarray(fem.M), np.asarray(fem.operator.A)
     c = np.asarray(fem.operator.affine_bias).reshape(-1)
     f = fem.operator.forcing_vector_fn
@@ -634,7 +631,7 @@ def test_transient_nonhomogeneous_dirichlet_relaxes_to_one():
 
 def test_transient_scalar_parametric_routes_native():
     """A transient with an unknown scalar coefficient ``u_t = alpha Δu`` routes natively to a
-    parametric FeaxTimeBlock whose ``operator_fn(t, args)`` re-assembles A(alpha) per step (used by the
+    parametric SemidiscreteTimeBlock whose ``operator_fn(t, args)`` re-assembles A(alpha) per step (used by the
     differentiable inverse solve). The free-row operator scales linearly with alpha here."""
     d = jno.domain(box(0, 0, 1, 1), mesh_size=0.2, time=(0.0, 0.3, 16))
     u, w = d.fem_symbols()
@@ -709,9 +706,9 @@ def test_native_parametric_gradient_matches_finite_difference():
 
 
 # ---------------------------------------------------------------------------
-# VPINN / grouped-weak-form: the native fem_context (quadrature, shape values &
-# gradients, JxW, surface data) must match feax's init_fem tensor-for-tensor on a
-# P1 mesh (same node ordering), so the network-trial test-projection is identical.
+# Native fem_context (VPINN / grouped-weak-form): the quadrature, shape values &
+# gradients, JxW and surface data must satisfy the basic FEM invariants (partition
+# of unity, exact area/measure sums), so the network-trial test-projection is sound.
 # ---------------------------------------------------------------------------
 
 
@@ -752,30 +749,33 @@ def test_native_field_parameter_routes_native_and_gradient_flows():
     assert abs(g_ad[j]) > 1e-8 and abs(g_ad[j] - g_fd) <= 1e-4 * max(1.0, abs(g_fd))
 
 
-def test_native_fem_context_matches_feax():
+def test_native_fem_context_satisfies_fem_invariants():
+    """The native fem_context (quadrature, shape values & gradients, JxW, surface data) used by the
+    VPINN / grouped-weak-form evaluator must satisfy the basic FEM invariants on a P1 unit-square
+    mesh: a partition of unity, gradients of the partition summing to zero, and exact area /
+    edge-length measures. These pin the tabulation, push-forward and facet quadrature without an
+    external oracle."""
     from jno.utils.solver.fem_native import build_native_fem_context
 
-    # feax fem_context via init_fem
-    df = jno.domain(box(0, 0, 1, 1), mesh_size=0.2)
-    df.init_fem(
-        element_type="TRI3",
-        quad_degree=2,
-        bcs=[df.dirichlet("boundary", 0.0), jno.neumann(["right"])],
-        vec=1,
-        fem_solver=True,
-    )
-    fc_f = df.fem_context
-
-    # native fem_context
     dn = jno.domain(box(0, 0, 1, 1), mesh_size=0.2)
-    fc_n, _qp, _sq, _sn = build_native_fem_context(dn, element_type="TRI3", quad_degree=2, vec=1, neumann_tags=["right"])
+    fc, _qp, _sq, _sn = build_native_fem_context(dn, element_type="TRI3", quad_degree=2, vec=1, neumann_tags=["right"])
 
-    assert fc_n["num_total_nodes"] == fc_f["num_total_nodes"]
-    for k in ("cells", "N_flat", "dN_dx_flat", "v_grads_JxW_flat", "JxW", "quad_points", "global_areas"):
-        a, b = np.asarray(fc_f[k]), np.asarray(fc_n[k])
-        assert a.shape == b.shape, f"{k}: {a.shape} vs {b.shape}"
-        assert np.abs(a - b).max() < 1e-11, f"{k}: max diff {np.abs(a - b).max():.2e}"
-    sf, sn = fc_f["surface_data"]["right"], fc_n["surface_data"]["right"]
-    for k in ("face_shape_vals", "face_shape_grads", "nanson_scale", "global_boundary_areas", "quad_points"):
-        a, b = np.asarray(sf[k]), np.asarray(sn[k])
-        assert a.shape == b.shape and np.abs(a - b).max() < 1e-11, f"surface {k}"
+    n_nodes = int(fc["num_total_nodes"])
+    cells = np.asarray(fc["cells"])
+    assert cells.shape[1] == 3  # P1 triangles
+    assert int(cells.max()) == n_nodes - 1  # the cells index every node
+    assert np.asarray(fc["global_areas"]).shape[0] == n_nodes
+
+    # Volume: P1 shape functions are a partition of unity at every quad point ...
+    assert np.allclose(np.asarray(fc["N_flat"]).sum(axis=-1), 1.0, atol=1e-12)
+    # ... and their physical gradients sum to zero (the gradient of a constant is zero).
+    assert np.abs(np.asarray(fc["dN_dx_flat"]).sum(axis=1)).max() < 1e-10
+    # JxW integrates the unit square exactly; the nodal area partition also sums to the area.
+    assert abs(float(np.asarray(fc["JxW"]).sum()) - 1.0) < 1e-12
+    assert abs(float(np.asarray(fc["global_areas"]).sum()) - 1.0) < 1e-12
+
+    # Surface ('right' edge, length 1): parent shape values restricted to the face are a partition
+    # of unity at every face quad point, and the boundary measure recovers the edge length.
+    sd = fc["surface_data"]["right"]
+    assert np.allclose(np.asarray(sd["face_shape_vals"]).sum(axis=-1), 1.0, atol=1e-12)
+    assert abs(float(np.asarray(sd["global_boundary_areas"]).sum()) - 1.0) < 1e-12

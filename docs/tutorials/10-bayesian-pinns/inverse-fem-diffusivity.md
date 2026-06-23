@@ -12,7 +12,7 @@ the scalar diffusivity `α` in the 2-D Poisson equation
 The earlier tutorials in this section (`03`, `04`) used closed-form
 forward models (`sin(πx)/π²`, `exp(-kt)`).  Real engineering inverse
 problems rarely have closed forms — they have numerical PDE solvers.
-This tutorial shows the pattern when the forward is the **FEAX-backed
+This tutorial shows the pattern when the forward is the **native
 FEM solver** that jNO already exposes.
 
 ## Architecture

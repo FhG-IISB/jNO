@@ -8,7 +8,7 @@ families (P1, P2) on triangles and tetrahedra, and exposes :func:`identity_pushf
 
 This is the Lagrange analogue of the contravariant and covariant Piola maps in
 :mod:`fem_elements`.  The DOF ordering produced by :func:`lagrange_triangle` (degree 2)
-matches the edge-midpoint layout of :func:`feax_utils._promote_to_quadratic` with
+matches the edge-midpoint layout of :func:`fem_utils._promote_to_quadratic` with
 ``edge_local = BASIX_TRIANGLE_EDGES``, so a promoted P2 mesh indexes correctly into the
 shape functions.
 

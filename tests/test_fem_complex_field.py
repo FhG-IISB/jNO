@@ -12,7 +12,6 @@ Run with x64 (the coupled real system is float64): ``JAX_ENABLE_X64=1``.
 
 import pytest
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for the box domain")
 
 import jax  # noqa: E402

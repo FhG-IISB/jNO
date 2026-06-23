@@ -18,14 +18,13 @@ import pytest
 import jno
 from jno.utils.solver.newton_krylov import newton_krylov
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely")
 from shapely.geometry import box  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """feax assembly is float64; the global x64 flag is shared across modules and other
+    """FEM assembly/solves run in float64; the global x64 flag is shared across modules and other
     suites flip it at import, so set it per-test with save/restore."""
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
@@ -71,11 +70,11 @@ def _nonlinear_fem(mesh_size=0.2):
 
 
 def test_nonlinear_default_solves_without_optimistix(monkeypatch):
-    """The default nonlinear engine converges on the real feax residual with optimistix
+    """The default nonlinear engine converges on the assembled residual with optimistix
     forced absent (proving the steady path never imports it)."""
     monkeypatch.setitem(sys.modules, "optimistix", None)  # any `import optimistix` now raises
     fem = _nonlinear_fem()
-    res_fn = fem.residual  # the (u -> flat residual) feax callable
+    res_fn = fem.residual  # the (u -> flat residual) callable
     u = newton_krylov(res_fn, jnp.zeros(fem.dofs))  # same solver fem.solve() now defaults to
     res = float(jnp.linalg.norm(jnp.asarray(res_fn(u))))
     assert np.all(np.isfinite(np.asarray(u)))

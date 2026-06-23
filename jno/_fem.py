@@ -1,11 +1,12 @@
-"""``jno.fem`` — assemble a traced weak form into feax FEM matrices/operators.
+"""``jno.fem`` — assemble a traced weak form into FEM matrices/operators.
 
 Author the physics as ordinary jNO residual expressions and hand the flat list
 to :func:`fem`. Each residual is classified by **role** (does it contain the
 test function?) and **region** (carried by the bound coordinates), then
-assembled through feax. The returned :class:`FEM` exposes the assembled
-artefacts — ``A``/``b`` for a linear problem, ``residual``/``jacobian`` for a
-nonlinear one — plus the feax ``problem``, ``mesh`` and ``dofs``.
+assembled by the native Lagrange assembler. The returned :class:`FEM` exposes
+the assembled artefacts — ``A``/``b`` for a linear problem,
+``residual``/``jacobian`` for a nonlinear one — plus the ``problem``, ``mesh``
+and ``dofs``.
 
 Classification rule
 -------------------
@@ -37,7 +38,7 @@ __all__ = ["fem", "FEM"]
 
 
 def _as_dense(x):
-    """Densify a feax/BCOO matrix to a plain JAX array (no-op if already dense)."""
+    """Densify a sparse/BCOO matrix to a plain JAX array (no-op if already dense)."""
     return jnp.asarray(x.todense()) if hasattr(x, "todense") else jnp.asarray(x)
 
 
@@ -46,12 +47,12 @@ def _as_flat(x):
     return jnp.asarray(x).reshape(-1)
 
 
-# Component names feax uses for per-component (roller/symmetry) Dirichlet specs.
+# Component names for per-component (roller/symmetry) Dirichlet specs.
 _COMPONENT_NAMES = {0: "x", 1: "y", 2: "z"}
 
 
 def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000):
-    """Default steady-linear solve: matrix-free BiCGStab straight on the feax BCOO operator.
+    """Default steady-linear solve: matrix-free BiCGStab straight on the sparse BCOO operator.
 
     Never forms the dense ``N x N`` matrix — each iteration is a couple of sparse matvecs
     ``A @ v`` (cost ``O(nnz)``), so memory stays ``O(nnz)`` and the solve runs at sizes where
@@ -193,7 +194,7 @@ def _infer_vec(constraints: List[Any]) -> int:
 
     Scalar → 1, ``value_shape=(2,)`` → 2, etc. (reuses ``_infer_trial_metadata``).
     """
-    from .utils.solver.feax_utils import _infer_trial_metadata
+    from .utils.solver.fem_utils import _infer_trial_metadata
 
     for c in constraints:
         meta = _infer_trial_metadata(_bare(c))
@@ -226,8 +227,8 @@ def _native_lagrange_ok(domain: Any, constraints: List[Any], weak_bares: List[An
     Native covers scalar/vector Lagrange P1/P2 on 2D triangle and 3D tetrahedral meshes — single-
     and multi-field, linear/nonlinear, steady & transient, Dirichlet + Neumann/Robin (2D edge / 3D
     tet-face quadrature) + per-region/frozen-coefficient terms, and runtime-parametric *scalar*
-    coefficients (steady inverse). This gate rules out what the native path does not yet cover, which
-    stays on feax:
+    coefficients (steady inverse). This gate rules out what the native Lagrange path does not yet
+    cover, which the specialized branches in :func:`fem` handle (or reject as unsupported):
 
     * FEM *field* (nodal ``k(x)``) parameters — native threads scalar parameters only.
 
@@ -235,8 +236,8 @@ def _native_lagrange_ok(domain: Any, constraints: List[Any], weak_bares: List[An
     (this gate only runs on single-field problems -- multifield returns earlier). The transient call
     sites add their own runtime-parameter exclusion (native transient-parametric is not wired yet).
     Periodic ties are allowed here for the steady scalar single-field case (the caller scopes out the
-    transient / vector / parametric periodic sub-cases, which still build the reduction on feax); the
-    feax-free reduction (``_build_periodic_reduction``) is fed the native assembly cells in
+    transient / vector / parametric periodic sub-cases, which build the reduction in their own
+    branches); the reduction (``_build_periodic_reduction``) is fed the native assembly cells in
     ``_finalize``.
     """
     if getattr(domain, "dimension", None) not in (2, 3):
@@ -244,7 +245,7 @@ def _native_lagrange_ok(domain: Any, constraints: List[Any], weak_bares: List[An
     if _trial_spaces(constraints) - {"Lagrange"}:
         return False
     # complex=True fields: the real-equivalent form couples re/im test functions within one term,
-    # which the native one-test-field-per-term classifier rejects -> route to the feax real path.
+    # which the native one-test-field-per-term classifier rejects -> route to the complex branch.
     if any(
         getattr(n, "_complex_field_member", False)
         for c in constraints
@@ -383,7 +384,7 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
 def _retag_coords_for_quadrature(constraint: Any, support: str, region_id: str) -> None:
     """Point a weak term's coordinate Variables at the FEM quadrature pool.
 
-    The feax kernels bind a coordinate Variable to the live quadrature points
+    The assembly kernels bind a coordinate Variable to the live quadrature points
     only when its tag is ``"fem_gauss"`` (volume) or ``"gauss_<tag>"`` (surface);
     Jacobians use the coordinate's ``dim`` (axis), so derivatives are unaffected.
     """
@@ -482,7 +483,7 @@ def _eval_value_node_at(value_node: Any, points: Any) -> Any:
 
 
 def _coord_value_fn(value_node: Any) -> Callable:
-    """feax ``value(point)`` callable for a coordinate Dirichlet value — the same
+    """A ``value(point)`` callable for a coordinate Dirichlet value — the same
     per-point hook ``domain.dirichlet("left", lambda p: p[1])`` uses."""
 
     def value_fn(p):
@@ -501,7 +502,7 @@ def _value_from_node(node: Any) -> Any:
 
 def _is_complex_form(domain: Any, ir: Any) -> bool:
     """True if any lowered term's expression contains a complex constant — the signal to route a
-    (steady, linear) weak form through the real-equivalent complex solver instead of feax's real
+    (steady, linear) weak form through the real-equivalent complex solver instead of the plain real
     assembly. We walk the tree for a complex-valued literal (a user-written ``1j``) rather than
     evaluating, because the lowered coeff embeds the (non-evaluable) trial/test channel."""
     del domain
@@ -520,8 +521,8 @@ def _is_complex_form(domain: Any, ir: Any) -> bool:
 
 
 def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None) -> Any:
-    """Solve a complex linear FEM system via the real-equivalent block (feax untouched —
-    everything was assembled as two *real* systems)::
+    """Solve a complex linear FEM system via the real-equivalent block (everything was
+    assembled as two *real* systems)::
 
         [[A_r, -A_i], [A_i, A_r]] [u_r; u_i] = [b_r; b_i],     u = u_r + i u_i.
 
@@ -549,11 +550,12 @@ def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None) -> Any:
 
 
 def _solve_complex_transient(blocks: Any, save_ts: Any = None) -> Any:
-    """Integrate a complex *transient* system via the real-equivalent block (feax untouched):
-    ``(M_r + i M_i) u_dot + (A_r + i A_i) u = (c_r + i c_i)`` becomes the real ``2N`` system
+    """Integrate a complex *transient* system via the real-equivalent block (everything was
+    assembled as real systems): ``(M_r + i M_i) u_dot + (A_r + i A_i) u = (c_r + i c_i)`` becomes
+    the real ``2N`` system
     ``M_blk u_dot + A_blk u = c_blk`` with ``M_blk=[[M_r,-M_i],[M_i,M_r]]`` (likewise A, c) and
     ``u=[u_r;u_i]``. Backward Euler over the block, then recombine to ``u_r + i u_i``. ``blocks =
-    (block_r, block_i)`` are the Re-coeff and Im-coeff real ``FeaxTimeBlock``s. This covers
+    (block_r, block_i)`` are the Re-coeff and Im-coeff real ``SemidiscreteTimeBlock``s. This covers
     Schrodinger (``i u_t = H u`` -> M_r = 0) since the *block* mass stays non-singular."""
 
     def _dn(a):
@@ -656,67 +658,6 @@ def _normal_flux_spec(constraint: Any, domain: Any) -> Optional[Tuple[Any, str, 
     return _field_key_of(constraint), normals[0].tag[2:], value_node
 
 
-def _initial_state(bare: Any, domain: Any) -> Any:
-    """Initial nodal state vector from an IC residual ``u(initial) - u0``.
-
-    ``u0`` is evaluated at the mesh nodes (concrete, since the mesh is built) via
-    the existing evaluator — a single forward pass.
-    """
-    _comp, node = _essential_spec(bare)
-    n_nodes = int(jnp.asarray(domain.mesh.points).shape[0])
-    const = _constant_of(node)
-    if const is not None:
-        return jnp.full((n_nodes,), float(const))
-    pts = jnp.asarray(domain.mesh.points)[:, : domain.dimension]
-    vals = _eval_value_node_at(node, pts)
-    return jnp.broadcast_to(vals, (n_nodes,)) if vals.shape[0] == 1 else vals
-
-
-def _multifield_initial_state(domain: Any, prob: Any, fields: List[Any], field_index: dict, ic_residuals: List[Any]) -> Any:
-    """Block initial-state vector from per-field IC residuals ``u(initial) - u0``.
-
-    Each field's IC is evaluated at **that field's** assembly-mesh nodes (a P2 field
-    carries edge nodes, so ``domain.mesh`` is wrong for it) and written into its block
-    ``offset[i]:offset[i+1]``. Fields without an IC default to zero. Mirrors the
-    per-field Dirichlet bucketing used for the steady coupled path.
-    """
-    offsets = list(prob.offset) + [int(prob.num_total_dofs_all_vars)]
-    state0 = jnp.zeros((int(prob.num_total_dofs_all_vars),))
-    for ic in ic_residuals:
-        fidx = field_index.get(_field_key_of(ic))
-        if fidx is None:
-            continue
-        comp, node = _essential_spec(_bare(ic))
-        vec = int(fields[fidx]["vec"])
-        pts = jnp.asarray(prob.mesh[fidx].points)[:, : domain.dimension]
-        n_i = int(pts.shape[0])
-        const = _constant_of(node)
-        if const is not None:
-            vals = jnp.full((n_i,), float(const))
-        else:
-            v = jnp.asarray(_eval_value_node_at(node, pts))
-            vals = jnp.broadcast_to(v, (n_i,)) if v.shape[0] == 1 else v
-        vals = jnp.asarray(vals).reshape(-1)
-        if comp is not None:  # one component c of a vector field: place at node*vec + c
-            idx = offsets[fidx] + jnp.arange(n_i) * vec + comp
-        elif vec == 1:  # scalar field
-            idx = offsets[fidx] + jnp.arange(n_i)
-        else:  # all components of a vector field: u(initial) - g
-            if vals.shape[0] == n_i:
-                # a single scalar value (e.g. u(initial) - 0) applies to every component
-                vals = jnp.repeat(vals, vec)  # node-major: [n0c0, n0c1, n1c0, ...]
-            elif vals.shape[0] != n_i * vec:
-                raise NotImplementedError(
-                    "jno.fem: vector initial condition must be a scalar (u(initial) - g, broadcast to "
-                    "all components) or per component (u(initial)[i] - g_i) for coupled transient."
-                )
-            idx = offsets[fidx] + jnp.arange(n_i * vec)
-        if vals.shape[0] != idx.shape[0]:
-            raise ValueError(f"jno.fem: IC value count {vals.shape[0]} != {idx.shape[0]} dofs for field {fidx}.")
-        state0 = state0.at[idx].set(vals)
-    return state0
-
-
 # ---------------------------------------------------------------------------
 # the FEM container
 # ---------------------------------------------------------------------------
@@ -726,7 +667,7 @@ class FEM:
     Attributes
     ----------
     domain, mesh, problem:
-        the owning jNO domain, its meshio mesh, and the feax problem.
+        the owning jNO domain, its meshio mesh, and the assembled problem object.
     dofs:
         total number of degrees of freedom.
     classification:
@@ -740,14 +681,14 @@ class FEM:
         self._mode = mode
         self.classification = classification
         self.mesh = getattr(domain, "mesh", None)
-        self.problem = getattr(domain, "_feax_problem", None)
+        self.problem = getattr(domain, "_fem_problem", None)
         self._periodic = None  # periodic-tie reduction (prolongation P), attached by fem()
-        self._offsets = offsets  # per-field block offsets for the native non-nodal path (else feax problem.offset)
+        self._offsets = offsets  # per-field block offsets for the native non-nodal path (else problem.offset)
 
         self._A = self._b = None
         if mode == "linear":
-            # _assemble_fem_system_from_ir returns either a raw (A, b) tuple
-            # (non-parametric) or a FemLinearSystem (runtime-parametric).
+            # the assembler returns either a raw (A, b) tuple (non-parametric)
+            # or a FemLinearSystem (runtime-parametric).
             if isinstance(op, FemLinearSystem):
                 self._A, self._b = op.A, op.b
             else:
@@ -773,14 +714,14 @@ class FEM:
     @property
     def operator(self) -> Any:
         """The raw assembled block — ``(A, b)`` / ``FemLinearSystem`` /
-        ``FemResidualOperator`` (steady) or ``FeaxTimeBlock`` (transient)."""
+        ``FemResidualOperator`` (steady) or ``SemidiscreteTimeBlock`` (transient)."""
         return self._op
 
     @property
     def offsets(self) -> Any:
         """Per-field block offsets into the flat solution: ``sol[offsets[i]:offsets[i+1]]`` is field ``i``.
 
-        Set for the native non-nodal (RT/P0) path; falls back to the feax ``problem.offset`` for the
+        Set for the native non-nodal (RT/P0) path; falls back to the ``problem.offset`` for the
         Lagrange multi-field path (``None`` for a single field with no block structure)."""
         if self._offsets is not None:
             return list(self._offsets)
@@ -791,7 +732,7 @@ class FEM:
 
         Delegates to :meth:`FemLinearSystem.solve` (steady linear),
         :meth:`FemResidualOperator.solve` (steady nonlinear), or
-        :meth:`FeaxTimeBlock.solve` (transient). The result is a jNO field: compare it
+        :meth:`SemidiscreteTimeBlock.solve` (transient). The result is a jNO field: compare it
         to data and train any ``jno.np.parameter`` in the weak form through
         ``crux.solve``::
 
@@ -803,7 +744,7 @@ class FEM:
         ``solve_fn`` is **your** solver (jNO writes none):
 
         * steady linear: ``(A, b) -> u``. The **default** is matrix-free BiCGStab straight on
-          feax's BCOO operator — never forms the ``N x N`` matrix (memory ``O(nnz)``) and solves
+          the sparse BCOO operator — never forms the ``N x N`` matrix (memory ``O(nnz)``) and solves
           general (non-symmetric) systems, not just SPD. To use a dense / library solver, pass
           your own ``solve_fn`` (it receives the densified ``(A, b)``; e.g. ``jnp.linalg.solve``
           or a ``lineax`` solver). It raises if BiCGStab fails to converge;
@@ -815,11 +756,11 @@ class FEM:
           the sample times, default the domain's time grid). For a custom integrator build it
           from the block's ``M`` / ``A`` / ``state0`` and pass it as ``solve_fn``.
 
-        Enable x64 — the feax assembly is float64.
+        Enable x64 — the assembly is float64.
 
         For a **complex** steady linear problem (complex coefficients in the weak form),
         ``solve()`` returns the complex solution ``u_r + i·u_i`` via the real-equivalent block
-        ``[[A_r,-A_i],[A_i,A_r]]`` (feax assembled only real systems); pass ``solve_fn=(A, b) -> u``
+        ``[[A_r,-A_i],[A_i,A_r]]`` (the assembly produces only real systems); pass ``solve_fn=(A, b) -> u``
         to choose the real block solver.
         """
         if self._mode == "complex":
@@ -827,7 +768,7 @@ class FEM:
         if self._mode == "complex_transient":
             return _solve_complex_transient(self._op, save_ts=kwargs.get("save_ts"))
         if self._mode == "linear" and not isinstance(self._op, FemLinearSystem):
-            # Non-parametric steady linear. Default: matrix-free BiCGStab straight on feax's
+            # Non-parametric steady linear. Default: matrix-free BiCGStab straight on the sparse
             # BCOO operator (never densifies -> memory O(nnz); solves general systems). Pass your
             # own ``solve_fn=(A, b) -> u`` to use a dense / library solver instead -- it receives
             # the densified (A, b). (The runtime-parametric case is a FemLinearSystem below.)
@@ -840,7 +781,7 @@ class FEM:
             if self._periodic is not None:
                 # periodic tie: eliminate slave DOFs via the prolongation P, solve the reduced
                 # (P^T A P) u_red = P^T b, then prolong u = P u_red back to the full nodal layout.
-                from .utils.solver.feax_utils import prolong, reduce_matrix, reduce_vector
+                from .utils.solver.fem_utils import prolong, reduce_matrix, reduce_vector
 
                 P = self._periodic["P"]
                 u_red = _solve(reduce_matrix(P, A), reduce_vector(P, b))
@@ -850,7 +791,7 @@ class FEM:
             # Periodic nonlinear: solve Newton in the reduced space -- r_red(u_red) = P^T r(P u_red) = 0,
             # then prolong u = P u_red (the tie is then satisfied exactly). Wraps the user's solve_fn
             # (or the operator's default Newton) so it operates on the reduced residual.
-            from .utils.solver.feax_utils import restrict_state
+            from .utils.solver.fem_utils import restrict_state
 
             P = jnp.asarray(self._periodic["P"])
             kept, pvec = self._periodic["kept_nodes"], self._periodic["vec"]
@@ -884,7 +825,7 @@ class FEM:
         meshes = getattr(prob, "mesh", None) if prob is not None else None
         if meshes:
             return jnp.asarray(meshes[0].points)
-        # Native Lagrange path (no feax problem): the assembler records the DOF coordinates
+        # Native Lagrange path (no problem object): the assembler records the DOF coordinates
         # (vertices + edge midpoints for P2) the flat solution lives on.
         native_pts = getattr(self.domain, "_fem_native_dof_points", None)
         if native_pts is not None:
@@ -898,7 +839,7 @@ class FEM:
         """Per-field DOF coordinates: ``field_points[i]`` is the ``(n_nodes_i, dim)`` node array the
         block ``sol[offsets[i]:offsets[i+1]]`` lives on. For a coupled problem the fields may use
         different nodes (e.g. Taylor-Hood P2 velocity vs P1 pressure). Backed by the per-field meshes
-        of the feax problem, or the native assembler's recorded per-field DOF points."""
+        of the problem object, or the native assembler's recorded per-field DOF points."""
         prob = self.problem
         meshes = getattr(prob, "mesh", None) if prob is not None else None
         if meshes:
@@ -932,7 +873,7 @@ class FEM:
 
         Steady nonlinear: ``residual(u)``. Transient: ``residual(u, t)`` — the per-step
         semidiscrete residual (pass ``args=`` only for a runtime-parametric solve). Use
-        ``fem.operator`` for the raw (unflattened) feax form."""
+        ``fem.operator`` for the raw (unflattened) form."""
         if self._mode == "nonlinear":
             r = self._op.residual
             return lambda u: _as_flat(r(u))
@@ -975,7 +916,7 @@ class FEM:
         return _as_flat(self._op.state0)
 
     def _time_block(self):
-        """The (real) FeaxTimeBlock carrying the integration window — for complex_transient it is
+        """The (real) SemidiscreteTimeBlock carrying the integration window — for complex_transient it is
         the Re-coeff block of the (block_r, block_i) pair."""
         return self._op[0] if self._mode == "complex_transient" else self._op
 
@@ -1060,7 +1001,7 @@ def _boundary_facets(points: Any, cells: Any, dim: int, order: int) -> Optional[
     first); a facet is a cell edge (2D) / triangular face (3D) of those vertices that appears in
     exactly **one** cell. For ``order == 2`` each facet's edge midpoints are attached by coordinate
     (a P2 midpoint sits at the average of its two endpoint vertices) -- convention-light, with no
-    dependence on feax's higher-order node ordering. Returns ``(n_facets, k)`` with
+    dependence on any higher-order node ordering. Returns ``(n_facets, k)`` with
     ``k = 2/3`` (2D P1/P2) or ``3/6`` (3D P1/P2)."""
     points = np.asarray(points, dtype=float)
     cells = np.asarray(cells, dtype=int)
@@ -1115,7 +1056,7 @@ def _chain_facets(points: Any, ids: Any) -> Optional[np.ndarray]:
 
 
 def _assembly_cells(prob: Any) -> Tuple[Optional[np.ndarray], int]:
-    """``(cells, element_order)`` of a feax problem's assembly mesh, or ``(None, 1)`` (e.g. native 1D)."""
+    """``(cells, element_order)`` of a problem object's assembly mesh, or ``(None, 1)`` (e.g. native 1D)."""
     meshes = getattr(prob, "mesh", None) if prob is not None else None
     if not meshes:
         return None, 1
@@ -1127,7 +1068,7 @@ def _assembly_cells(prob: Any) -> Tuple[Optional[np.ndarray], int]:
 def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, cells: Any, ele_order: int, vec: int) -> dict:
     """Build the prolongation ``P`` for the collected ties on the **assembly** mesh (``points`` +
     ``cells``; ``cells=None`` for the native 1D route falls back to flat-chain facets)."""
-    from .utils.solver.feax_utils import build_periodic_prolongation
+    from .utils.solver.fem_utils import build_periodic_prolongation
 
     # Multidirectional periodicity needs each face to carry its shared corners (a corner is a slave
     # in several directions). ``domain.tag`` partitions a corner into one edge, so we recover full
@@ -1169,7 +1110,7 @@ def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, cells: 
 
 
 def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
-    """Reduce a native transient ``FeaxTimeBlock`` by the periodic prolongation ``P`` and return a
+    """Reduce a native transient ``SemidiscreteTimeBlock`` by the periodic prolongation ``P`` and return a
     reduced block that carries ``P`` for prolongation (``u_full = P u_red``).
 
     Galerkin reduction is applied to every populated payload: ``M -> P^T M P``, a constant
@@ -1180,7 +1121,7 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
     reduction of a matrix-free Newton residual is a separate, unbuilt path)."""
     import dataclasses
 
-    from .utils.solver.feax_utils import reduce_matrix, reduce_vector, restrict_state
+    from .utils.solver.fem_utils import reduce_matrix, reduce_vector, restrict_state
 
     if block.is_nonlinear():
         raise NotImplementedError(
@@ -1238,13 +1179,12 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         Vector size of the unknown. ``None`` (default) infers it from the trial's
         ``value_shape`` (scalar → 1, ``(2,)`` → 2, …); pass an int to override.
     """
-    from .utils.solver.fem_route import _assemble_fem_residual_from_ir, _assemble_fem_system_from_ir, neumann
+    from .utils.solver.fem_route import neumann
     from .utils.solver.weak_form import (
         LoweredChannelTerm,
         LoweredWeakForm,
         _apply_sign,
         _contains_temporal_derivative,
-        _infer_solver_target,
         _split_additive_terms,
     )
 
@@ -1293,8 +1233,8 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     if vec is None and not multifield:
         vec = _infer_vec(constraints)  # single-field only (coupled fields carry per-field vec)
 
-    # The transient route reduces M/A from the feax context at *assembly* time, so its P must be built
-    # and injected before the time block is assembled (see the single-field transient branch below).
+    # The transient route reduces M/A from the assembly context at *assembly* time, so its P must be
+    # built and injected before the time block is assembled (see the single-field transient branch below).
     # This holder carries that P so `_finalize` reuses it rather than rebuilding.
     periodic_holder: List[Any] = []
 
@@ -1316,7 +1256,7 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             raise NotImplementedError(
                 "jno.fem: periodic ties are currently supported only for scalar single-field problems."
             )
-        # Transient already had its P built + fed to the feax context *before* block assembly (the
+        # Transient already had its P built + applied to the time block *before* it was returned (the
         # route reduces M/A at assembly time); reuse it. Linear & nonlinear build here and reduce in
         # FEM.solve. (1D has no assembly cells -> flat-chain facets via points only.)
         if periodic_holder:
@@ -1326,7 +1266,7 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             if prob is not None:
                 cells, ele_order = _assembly_cells(prob)
             else:
-                # Native path: no feax problem -- read the assembly cells the native assembler stashed
+                # Native path: no problem object -- read the assembly cells the native assembler stashed
                 # (``None`` for the native 1D route, which falls back to flat-chain facets on points).
                 cells = getattr(domain, "_fem_native_assembly_cells", None)
                 ele_order = int(getattr(domain, "_fem_native_assembly_order", 1))
@@ -1368,7 +1308,7 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
                 if region != "volume":
                     # Sub-domain term: multiply by the region's per-cell indicator so it integrates over
                     # that region's cells only. Stays a plain volume term (whole-mesh quadrature); the
-                    # RegionMask zeroes the integrand outside the region (resolved in the FEAX kernel).
+                    # RegionMask zeroes the integrand outside the region (resolved in the assembly kernel).
                     bare = RegionMask(region) * bare
                 volume_terms.append(bare)
                 classification.append("volume" if region == "volume" else f"volume@{region}")
@@ -1457,7 +1397,7 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         )
 
     # ---- non-nodal element families (RT / Nedelec / Argyris): native push-forward assembler ----
-    # feax can't assemble these (no push-forward), so -- like the 1D path -- assemble natively and reuse
+    # These families need a basis push-forward, so -- like the 1D path -- assemble natively and reuse
     # the shared integrand evaluator (which carries space-guarded branches for the physical basis).
     if _trial_spaces(constraints) - {"Lagrange"}:
         from .utils.solver.fem_nonnodal import assemble_fem_nonnodal
@@ -1467,9 +1407,9 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         )
         return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offsets))
 
-    # ---- 1D (segment): feax has no LINE2 element, so assemble natively ----
+    # ---- 1D (segment): a 1D line domain is assembled by the native 1D path ----
     # The native 1D assembler reuses the same integrand evaluator and returns the
-    # same (op, mode) the FEM container expects; it needs none of init_fem's feax
+    # same (op, mode) the FEM container expects; it needs no problem-object
     # scaffolding (coordinate vars resolve from the per-element quadrature points).
     if getattr(domain, "dimension", None) == 1:
         from .utils.solver.fem_1d import assemble_fem_1d, assemble_fem_1d_multifield
@@ -1483,7 +1423,7 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
                 "native 1D assembler is P1 (LINE2) only. Use order=1, or refine the mesh "
                 "(smaller mesh_size) for accuracy. (P2 promotion is supported on 2D/3D domains.)"
             )
-        if multifield:  # coupled 1D -> native block assembly (feax has no LINE2 element)
+        if multifield:  # coupled 1D -> native block assembly
             op, mode = assemble_fem_1d_multifield(
                 domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, quad_degree=quad_degree
             )
@@ -1510,9 +1450,9 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         element_type = _element_for(domain.dimension, order)
     quad_degree = max(quad_degree, 2 * _order_of_element(element_type))
 
-    # ---- build IR with explicit regions, then detect transient vs steady. This is done BEFORE
-    # init_fem so the native path can route without ever touching feax: split each weak constraint
-    # into additive sub-terms (one LoweredChannelTerm each), matching lower_weak_form's granularity --
+    # ---- build IR with explicit regions, then detect transient vs steady. This is done so the
+    # native path can route from the IR alone: split each weak constraint into additive sub-terms
+    # (one LoweredChannelTerm each), matching lower_weak_form's granularity --
     # required so the transient route can separate the mass term (u_t * phi) from the spatial operator. ----
     terms: List[LoweredChannelTerm] = []
 
@@ -1544,16 +1484,17 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     weak_bares = volume_terms + [e for exprs in boundary_terms.values() for e in exprs]
     is_transient = any(_contains_temporal_derivative(b) for b in weak_bares)
 
-    # ---- native Lagrange (single field): routed BEFORE init_fem so the native path never imports
-    # feax. Covers 2D triangle and 3D tet (incl. Neumann/Robin surfaces), steady (incl. runtime-
-    # scalar-parametric) and transient (constant Dirichlet + a time-dependent source). complex / VPINN /
-    # field-param / time-varying-Dirichlet / transient-parametric / vector-or-parametric-periodic fall
-    # through to the feax paths below. ----
+    # ---- native Lagrange (single field): the standard fast path. Covers 2D triangle and 3D tet (incl.
+    # Neumann/Robin surfaces), steady (incl. runtime-scalar-parametric) and transient (constant
+    # Dirichlet + a time-dependent source). complex / VPINN / field-param / time-varying-Dirichlet /
+    # transient-parametric / vector-or-parametric-periodic fall through to the specialized branches
+    # below. ----
     from .utils.solver.parametric_helpers import _contains_runtime_parameter as _crp
 
     # Native periodic is wired only for the steady, scalar, non-parametric single-field case that
     # ``_finalize`` reduces (it raises on vector / runtime-parametric, and the transient route pre-
-    # builds the reduction into the feax context). Those periodic sub-cases stay on feax.
+    # builds the reduction into its own time block). Those periodic sub-cases route to the dedicated
+    # periodic-transient branch below.
     _native_periodic_ok = not periodic_ties or (
         not is_transient and (vec or 1) == 1 and not any(_crp(b) for b in weak_bares)
     )
@@ -1568,24 +1509,24 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             # native transient covers a runtime SCALAR parameter and a single-field nodal FIELD
             # parameter k(x). A time-varying Dirichlet g(x,t) routes native only for the LINEAR,
             # non-parametric transient (the row-replacement + per-step Dirichlet-lift forcing path);
-            # combined with a runtime parameter or a nonlinear residual it stays on feax.
+            # combined with a runtime parameter or a nonlinear residual it is rejected below.
             from .utils.solver.weak_form import _is_obviously_nonlinear_in_unknown as _nlin
 
             _native_now = not any(_crp(b) for b in weak_bares) and not any(_nlin(domain, b) for b in weak_bares)
         if _native_now:
             from .utils.solver.fem_native import assemble_fem_native
 
-            domain._feax_problem = None  # native owns this domain's FE state
+            domain._fem_problem = None  # native owns this domain's FE state
             op, mode, offs = assemble_fem_native(
                 domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=vec or 1, quad_degree=quad_degree
             )
             return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs))
 
-    # ---- native complex (steady, single field): the Re/Im-coefficient split, assembled natively, so
-    # the real-equivalent block needs no feax. ``Re(c·T) = Re(c)·T`` for a real FE trial/test ``T``, so
-    # wrapping each term in ``.real`` / ``.imag`` gives two ordinary real systems A_r/b_r and A_i/b_i;
-    # FEM.solve() forms ``[[A_r, -A_i], [A_i, A_r]]`` and recombines to a complex ``u``. A complex
-    # *inverse* (runtime parameter) and the complex *transient* (Schrodinger) path stay on feax below. ----
+    # ---- native complex (steady, single field): the Re/Im-coefficient split, assembled natively.
+    # ``Re(c·T) = Re(c)·T`` for a real FE trial/test ``T``, so wrapping each term in ``.real`` /
+    # ``.imag`` gives two ordinary real systems A_r/b_r and A_i/b_i; FEM.solve() forms
+    # ``[[A_r, -A_i], [A_i, A_r]]`` and recombines to a complex ``u``. A complex *inverse* (runtime
+    # parameter) and the complex *transient* (Schrodinger) path are handled separately below. ----
     if (
         not is_vpinn
         and _is_complex_form(domain, ir)
@@ -1598,7 +1539,7 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
 
         real_bd = {tag: [e.real for e in exprs] for tag, exprs in boundary_terms.items()}
         imag_bd = {tag: [e.imag for e in exprs] for tag, exprs in boundary_terms.items()}
-        domain._feax_problem = None
+        domain._fem_problem = None
         op_r, _mode_r, offs = assemble_fem_native(
             domain, [b.real for b in volume_terms], real_bd, dirichlet_raw, [], vec=vec or 1, quad_degree=quad_degree
         )
@@ -1622,7 +1563,7 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         and not any(_crp(b) for b in weak_bares)
         and not any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw)
     ):
-        from .utils.solver.backend_blocks import FeaxTimeBlock as _FTB
+        from .utils.solver.backend_blocks import SemidiscreteTimeBlock as _FTB
         from .utils.solver.fem_native import assemble_fem_native
         from .utils.solver.time_route import _infer_time_window, _strip_temporal_trial_derivative
         from .utils.solver.weak_form import _apply_sign, _split_additive_terms
@@ -1637,7 +1578,7 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
                     spatial_raw.append(coeff)
         real_bd = {tag: [e.real for e in exprs] for tag, exprs in boundary_terms.items()}
         imag_bd = {tag: [e.imag for e in exprs] for tag, exprs in boundary_terms.items()}
-        domain._feax_problem = None
+        domain._fem_problem = None
         # Mass (real): a steady assembly of the stripped u_t * phi term -> M (raw, no Dirichlet).
         (M_raw, _bm), _mm, offs = assemble_fem_native(
             domain, mass_stripped, {}, [], [], vec=vec or 1, quad_degree=quad_degree
@@ -1662,14 +1603,14 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         )
         t0, t1, dt = _infer_time_window(domain)
         _common = dict(
-            backend="feax_time",
+            backend="transient",
             mode="implicit",
             time_order=1,
             spatial_kind="weak_form",
             t0=t0,
             t1=t1,
             dt=dt,
-            feax_context={},
+            eval_context={},
         )
         block_r = _FTB(M=M_bc, A=jnp.asarray(A_r), affine_bias=jnp.asarray(c_r).reshape(-1), state0=jnp.real(s0), **_common)
         block_i = _FTB(
@@ -1684,7 +1625,7 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     # ---- native periodic transient (scalar single-field, linear, incl. runtime-parametric): assemble
     # the full native transient block, build the prolongation P from the native assembly mesh, then
     # reduce the block (P^T M P, P^T·operator_fn·P, ...). The reduced block carries P, so its trajectory
-    # prolongs back with u = P u_red. Vector / coupled / nonlinear periodic transient stay on feax. ----
+    # prolongs back with u = P u_red. Vector / coupled / nonlinear periodic transient are rejected. ----
     if (
         not is_vpinn
         and periodic_ties
@@ -1697,7 +1638,7 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     ):
         from .utils.solver.fem_native import assemble_fem_native
 
-        domain._feax_problem = None
+        domain._fem_problem = None
         op, mode, offs = assemble_fem_native(
             domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=1, quad_degree=quad_degree
         )
@@ -1721,18 +1662,16 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         fem_obj._periodic = periodic
         return fem_obj
 
-    # ---- quadrature + BC setup -- feax-routed paths (complex / periodic / 3D / field-parameter /
-    # time-varying-Dirichlet / transient-parametric) and VPINN. VPINN on a 2D Lagrange mesh uses the
-    # native (feax-free) fem_context (its assembly is feax-independent and reads only fem_context);
-    # everything else still builds the feax assembly problem via init_fem. ----
-    bcs = [domain.dirichlet(tag, value) for tag, value in dirichlet_values.items()]
-    if boundary_terms:
-        bcs.append(neumann(list(boundary_terms.keys())))
+    # ---- VPINN (network-trial) on a 2D Lagrange mesh: the only single-field path that reaches here.
+    # It builds the native fem_context (init_fem_native) and test-projects the weak form. Every
+    # standard single-field FEM problem has already returned natively above; anything else is rejected
+    # explicitly below (fail loud -- never silently mis-assemble). ----
     if is_vpinn and getattr(domain, "dimension", None) == 2 and not periodic_ties:
-        domain._feax_problem = None
+        bcs = [domain.dirichlet(tag, value) for tag, value in dirichlet_values.items()]
+        if boundary_terms:
+            bcs.append(neumann(list(boundary_terms.keys())))
+        domain._fem_problem = None
         domain.init_fem_native(element_type=element_type, quad_degree=quad_degree, bcs=bcs, vec=vec or 1)
-    else:
-        domain.init_fem(element_type=element_type, quad_degree=quad_degree, bcs=bcs, vec=vec, fem_solver=True)
 
     # ---- VPINN: test-project the (now fem_gauss-tagged) weak form onto the FE test space ----
     # The network trial already sits inside the weak terms; assemble_weak_form(target="vpinn")
@@ -1759,88 +1698,44 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
                 weak = weak + t
         return assemble_weak_form(domain, weak, target="vpinn")
 
-    # Periodic + transient: the time route reduces M/A from the domain feax context *at assembly time*,
-    # so build P on the (now-built) assembly mesh and feed it in BEFORE the time block is assembled
-    # (mirrors what domain.periodic sets). FEM.solve then prolongs the trajectory via the route.
-    if periodic_ties and is_transient and not multifield and (vec or 1) == 1:
-        _am = domain._feax_context["mesh"]  # the assembly mesh init_fem just built
-        _eo = 2 if str(getattr(_am, "ele_type", "")).upper() in _P2_ELEMENTS else 1
-        periodic_holder.append(
-            _build_periodic_reduction(domain, periodic_ties, np.asarray(_am.points), np.asarray(_am.cells), _eo, vec or 1)
-        )
-        domain._feax_context["P"] = periodic_holder[0]["P"]
-        domain._feax_context["periodic"] = periodic_holder[0]
-        domain.fem_context["prolongation"] = periodic_holder[0]["P"]
-        domain.fem_context["periodic"] = periodic_holder[0]
-
-    if is_transient:
-        # (Native transient already returned above, before init_fem; reaching here means a feax-only
-        # transient: complex, runtime-parametric, time-varying Dirichlet, periodic, or 3D.)
-        from .utils.solver.time_route import _assemble_feax_time_from_ir
-
-        if any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw):
-            raise NotImplementedError(
-                "jno.fem: time-varying Dirichlet g(x,t) on a single-field transient problem "
-                "is not wired yet; it is supported on the coupled (multi-field) transient path. "
-                "(Constant non-homogeneous Dirichlet works on both.)"
-            )
-        if len(ic_residuals) > 1:
-            raise NotImplementedError("jno.fem: multiple initial conditions (multi-field) are not supported yet.")
-        n_nodes = int(jnp.asarray(domain.mesh.points).shape[0])
-        state0 = _initial_state(ic_residuals[0], domain) if ic_residuals else jnp.zeros((n_nodes,))
-        # The integration window (t0, t1, dt) is read from jno.domain(time=...).
-        # ---- complex transient (e.g. Schrodinger): real-equivalent split of M, A, and the IC ----
-        if _is_complex_form(domain, ir):
-            from .utils.solver.parametric_helpers import _clone_term_with_coeff
-
-            s0 = jnp.asarray(state0)
-            real_ir = LoweredWeakForm(domain=domain, terms=[_clone_term_with_coeff(t, t.coeff.real) for t in ir.terms])
-            imag_ir = LoweredWeakForm(domain=domain, terms=[_clone_term_with_coeff(t, t.coeff.imag) for t in ir.terms])
-            block_r = _assemble_feax_time_from_ir(domain, real_ir, state0=jnp.real(s0))
-            block_i = _assemble_feax_time_from_ir(domain, imag_ir, state0=jnp.imag(s0))
-            return _finalize(
-                FEM(domain=domain, op=(block_r, block_i), classification=classification, mode="complex_transient")
-            )
-        block = _assemble_feax_time_from_ir(domain, ir, state0=state0)
-        return _finalize(FEM(domain=domain, op=block, classification=classification, mode="transient"))
-
-    if ic_residuals:
+    if ic_residuals and not is_transient:
         raise ValueError("jno.fem: an initial condition was given but the weak form has no time derivative.")
 
-    # ---- complex (steady linear): real-equivalent split, feax sees only real forms ----
-    if _is_complex_form(domain, ir):
-        from .utils.solver.parametric_helpers import _clone_term_with_coeff
+    # A single-field weak form that matched none of the native branches above. The native assembler
+    # covers every standard single-field problem (2D/3D Lagrange, steady/transient, linear/nonlinear,
+    # complex, periodic, runtime/field parameters), so reaching here means an unsupported *combination*.
+    # Reject it explicitly with the specific reason -- never silently mis-assemble.
+    from .utils.solver.weak_form import _is_obviously_nonlinear_in_unknown as _nlin
 
-        # Re(c·T) = Re(c)·T and Im(c·T) = Im(c)·T (the FE trial/test T is real), so two ordinary
-        # real assemblies give A_r/b_r and A_i/b_i; FEM.solve() then forms the real-equivalent
-        # block and recombines to a complex u. No feax change, no native-complex reliance.
-        real_ir = LoweredWeakForm(domain=domain, terms=[_clone_term_with_coeff(t, t.coeff.real) for t in ir.terms])
-        imag_ir = LoweredWeakForm(domain=domain, terms=[_clone_term_with_coeff(t, t.coeff.imag) for t in ir.terms])
-        op_r = _assemble_fem_system_from_ir(domain, real_ir)
-        op_i = _assemble_fem_system_from_ir(domain, imag_ir)
-        return _finalize(FEM(domain=domain, op=(op_r, op_i), classification=classification, mode="complex"))
-
-    # (Native steady Lagrange already returned above, before init_fem; reaching here means a feax-only
-    # steady path: 3D, field-parameter, or another case the native gate excluded.)
-    probe = ir.volume_expr if ir.volume_expr is not None else next(iter(ir.boundary_exprs.values()))
-    target = _infer_solver_target(domain, probe)
-    if target == "fem_system":
-        op = _assemble_fem_system_from_ir(domain, ir)
-        return _finalize(FEM(domain=domain, op=op, classification=classification, mode="linear"))
-
-    op = _assemble_fem_residual_from_ir(domain, ir)
-    return _finalize(FEM(domain=domain, op=op, classification=classification, mode="nonlinear"))
+    _parametric = any(_crp(b) for b in weak_bares)
+    _nonlinear = any(_nlin(domain, b) for b in weak_bares)
+    if periodic_ties:
+        raise NotImplementedError(
+            "jno.fem: a periodic tie is supported natively on a steady or transient SCALAR single field "
+            f"(linear, with optional runtime parameters for the transient case). This form has "
+            f"vec={vec or 1}, nonlinear={_nonlinear}, parametric+steady={_parametric and not is_transient}. "
+            "Write the periodic field as a scalar, linearize it, or drop the periodic tie."
+        )
+    if is_transient and any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw):
+        raise NotImplementedError(
+            "jno.fem: a time-varying Dirichlet g(x, t) on a transient form is supported natively only for a "
+            f"LINEAR, non-parametric problem (got nonlinear={_nonlinear}, parametric={_parametric}). "
+            "Linearize the form, or remove the runtime parameter."
+        )
+    raise NotImplementedError(
+        "jno.fem: this single-field weak form is not handled by the native assembler. Please report the "
+        "form (and its dimension / element / boundary conditions) so the case can be supported."
+    )
 
 
 def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, classification, *, quad_degree):
     """Assemble a coupled (multi-field) steady weak form into a block ``FEM``.
 
-    Builds the same IR as the single-field path, buckets Dirichlet per field, and
-    hands off to ``_assemble_fem_system_from_ir`` — which routes through the
-    multi-field branch of ``_build_feax_problem`` (multi-variable feax Problem +
-    per-field kernel) and lets feax autodiff the block matrix."""
-    from .utils.solver.feax_utils import _infer_fields
-    from .utils.solver.fem_route import _assemble_fem_residual_from_ir, _assemble_fem_system_from_ir
+    Builds the same IR as the single-field path, buckets Dirichlet per field
+    (field ordering taken from ``ir.volume_expr``), and hands off to the native
+    assembler, which groups the per-tag surface terms into per-field surface
+    kernels and differentiates the coupled block matrix."""
+    from .utils.solver.fem_utils import _infer_fields
     from .utils.solver.parametric_helpers import _contains_runtime_parameter
     from .utils.solver.weak_form import (
         LoweredChannelTerm,
@@ -1859,7 +1754,7 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
 
     # Same IR as the single-field path: one LoweredChannelTerm per additive sub-term.
     # Coupled surface (Neumann/Robin) terms are emitted on their boundary region_id;
-    # _build_multifield_feax_problem groups them per tag into per-field surface kernels.
+    # the native assembler groups them per tag into per-field surface kernels.
     # (Coords were retagged to gauss_<region> by the classifier's _retag_coords_for_quadrature.)
     terms: List[Any] = []
 
@@ -1887,8 +1782,8 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
         raise ValueError("jno.fem: no weak-form (test-function) terms found to assemble.")
     ir = LoweredWeakForm(domain=domain, terms=terms)
 
-    # Field ordering is taken from ir.volume_expr — the same source _build_feax_problem
-    # uses — so the Dirichlet field indices match the kernel/Problem field order.
+    # Field ordering is taken from ir.volume_expr — the same source the native assembler
+    # uses — so the Dirichlet field indices match the kernel's field order.
     fields, field_index = _infer_fields(ir.volume_expr)
     by_field: dict[int, dict[str, Any]] = {}
     dirichlet_tv: List[Any] = []  # (field_idx, region, comp, value_node) for time-varying g(x,t)
@@ -1912,8 +1807,8 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
     # 2D, all-Lagrange, non-complex, non-runtime-parametric. Periodic + coupled is rejected by
     # `_finalize` regardless, so it needs no separate guard here.
     # complex=True (re/im ComplexPair) lowers `weak.real` onto two coupled real fields; its terms can
-    # weld both test functions in a product, which the native classifier now distributes per test field
-    # (the same fallback the feax block uses), so it no longer needs to route to feax.
+    # weld both test functions in a product, which the native classifier distributes per test field,
+    # so the coupled real form assembles directly here.
     _native_ok = (
         getattr(domain, "dimension", None) in (2, 3)
         and all(str(f.get("space", "Lagrange")) == "Lagrange" for f in fields)
@@ -1924,38 +1819,45 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
     # Coupled transient (multi-field + time): block M + block spatial operator A. Native handles
     # constant (incl. non-homogeneous) Dirichlet + a time-dependent source, and a time-varying Dirichlet
     # g(x,t) for the LINEAR block (row-replacement + per-step Dirichlet-lift forcing); a nonlinear block
-    # with a time-varying Dirichlet stays on feax (its native branch carries only constant Dirichlet).
+    # with a time-varying Dirichlet is rejected below (the native branch carries only constant Dirichlet).
     if is_transient:
         _tv_native = not dirichlet_tv or not any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares)
         if _native_ok and _tv_native:
             from .utils.solver.fem_native import assemble_fem_native
 
-            domain._feax_problem = None
+            domain._fem_problem = None
             op, mode, offs = assemble_fem_native(
                 domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=1, quad_degree=quad_degree
             )
             return FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs)
-        return _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals, classification, dirichlet_tv)
+        # Coupled transient that the native block does not cover (a runtime parameter, or a time-varying
+        # Dirichlet on a nonlinear block) -- reject explicitly rather than mis-assemble.
+        raise NotImplementedError(
+            "jno.fem: this coupled (multi-field) transient is not supported natively. The native coupled "
+            "transient covers a constant/time-dependent source and a time-varying Dirichlet on a LINEAR "
+            f"block (got nonlinear={any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares)}, "
+            f"parametric={any(_contains_runtime_parameter(b) for b in weak_bares)}, "
+            f"time_varying_dirichlet={bool(dirichlet_tv)})."
+        )
 
     if _native_ok:
         from .utils.solver.fem_native import assemble_fem_native
 
-        domain._feax_problem = None  # native owns this domain's FE state (avoid reading a stale feax mesh)
+        domain._fem_problem = None  # the native assembler owns this domain's FE state
         op, mode, offs = assemble_fem_native(
             domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=1, quad_degree=quad_degree
         )
         return FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs)
 
-    # Nonlinear coupled: feax autodiffs the block residual/Jacobian on the multi-field
-    # problem (same _build_feax_problem path as linear), so the nonlinear route works
-    # for coupled fields too. A nonlinear volume *or* surface term routes here (a linear
-    # Robin term stays on the linear path, where its surface contribution lands in A).
-    if any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares):
-        op = _assemble_fem_residual_from_ir(domain, ir)
-        return FEM(domain=domain, op=op, classification=classification, mode="nonlinear")
-    # (frozen coefficients in a coupled form are rejected up front in fem(); this stays the plain path)
-    op = _assemble_fem_system_from_ir(domain, ir)
-    return FEM(domain=domain, op=op, classification=classification, mode="linear")
+    # A coupled steady form `_native_ok` excluded -- a complex coefficient (vs the real-equivalent
+    # complex=True), or a runtime parameter. The native coupled assembler covers linear and nonlinear
+    # real forms (incl. complex=True); reject the rest explicitly rather than mis-assemble.
+    raise NotImplementedError(
+        "jno.fem: this coupled (multi-field) steady form is not supported natively -- it has a complex "
+        f"coefficient ({_is_complex_form(domain, ir)}) or a runtime parameter "
+        f"({any(_contains_runtime_parameter(b) for b in weak_bares)}). Use complex=True for a complex "
+        "field, or recover the parameter on a single-field reduced form."
+    )
 
 
 def _sum_forcings(f1, f2):
@@ -1971,74 +1873,13 @@ def _sum_forcings(f1, f2):
     return summed
 
 
-def _time_varying_dirichlet_lift(domain, prob, bc, A, dirichlet_tv, fields, field_index):
-    """JIT-friendly time-varying Dirichlet load ``c_dir(t)`` (or ``None`` if no time-varying BC).
-
-    Returns the per-time load that makes ``A w = c_dir(t)`` carry ``g(.,t)`` on the Dirichlet
-    rows and the lift ``-A_fd·g(t)`` on the free rows — i.e. the steady RHS for the Dirichlet
-    values at time ``t``, computed exactly as the steady path does: ``c(t) = A·u0(t) -
-    res_bc(u0(t), bc_t)`` with ``u0(t)`` the ``g(t)``-lifted state (``g`` on the Dirichlet
-    DOFs). ``g_vals(t)`` evaluates each time-varying spec's ``g(x,t)`` at the Dirichlet DOFs'
-    coordinates (precomputed once) and masks it onto that spec's rows; constant rows keep
-    ``bc.bc_vals``. All per-``t`` work is pure JAX (``where`` + ``replace_vals`` + a matvec +
-    the parametric residual), so it traces under ``jax.jit`` / ``lax.scan``."""
-    if not dirichlet_tv:
-        return None
-    import feax as fe
-    import jax
-    from feax.assembler import create_res_bc_parametric
-
-    rows = np.asarray(bc.bc_rows).reshape(-1)
-    if rows.shape[0] == 0:
-        return None
-    offsets = list(prob.offset) + [int(prob.num_total_dofs_all_vars)]
-    dim = domain.dimension
-    # per-row (field, component, coordinate)
-    row_field = np.searchsorted(np.asarray(offsets), rows, side="right") - 1
-    bc_coords = np.zeros((rows.shape[0], dim))
-    row_comp = np.zeros(rows.shape[0], dtype=int)
-    for i, r in enumerate(rows):
-        f = int(row_field[i])
-        vt = int(fields[f]["vec"])
-        local = int(r) - offsets[f]
-        bc_coords[i] = np.asarray(prob.mesh[f].points)[local // vt][:dim]
-        row_comp[i] = local % vt
-    bc_coords_j = jnp.asarray(bc_coords)
-    # per-spec mask over the bc rows + the value node
-    tv = []
-    for fidx, region, comp, value_node in dirichlet_tv:
-        loc = domain._make_tag_location_fn(region)
-        in_region = np.asarray(jax.vmap(loc)(bc_coords_j)).reshape(-1)
-        mask = (row_field == fidx) & in_region
-        if comp is not None:
-            mask = mask & (row_comp == comp)
-        tv.append((jnp.asarray(mask), value_node))
-
-    res_bc_param = create_res_bc_parametric(prob)
-    iv = fe.InternalVars()
-    A = jnp.asarray(A)
-    rows_j = jnp.asarray(rows)
-    zeros = jnp.zeros((offsets[-1],), dtype=A.dtype)
-    base_vals = jnp.asarray(bc.bc_vals)
-
-    def lift_fn(t, args=None):
-        g_vals = base_vals
-        for mask, node in tv:
-            g_vals = jnp.where(mask, _eval_value_node_at_time(node, bc_coords_j, t), g_vals)
-        u0 = zeros.at[rows_j].set(g_vals)  # g(t)-lifted state (g on the Dirichlet DOFs)
-        res = jnp.asarray(res_bc_param(u0, iv, bc.replace_vals(g_vals))).reshape(-1)
-        return A @ u0 - res  # steady RHS for g(t): g on Dirichlet rows, -A_fd·g on free rows
-
-    return lift_fn
-
-
 def _ic_value_at_nodes(bare: Any, domain: Any, pts: Any, n: int, vec: int = 1) -> Any:
     """Nodal value vector (``n`` dofs, node-major interleaved for ``vec>1``) from an IC residual
     ``<trial-expr>(initial) - g``.
 
-    Like :func:`_initial_state` but tolerant of a temporal-derivative trial side, so it reads both
-    the displacement IC (``u(initial) - u0``) and the velocity IC (``u.t(initial) - v0``) — the
-    latter's trial side is ``Jacobian(u, [t])``, which :func:`_essential_spec` rejects. ``g`` is
+    Tolerant of a temporal-derivative trial side, so it reads both the displacement IC
+    (``u(initial) - u0``) and the velocity IC (``u.t(initial) - v0``) — the latter's trial side is
+    ``Jacobian(u, [t])``, which :func:`_essential_spec` rejects. ``g`` is
     evaluated at the **assembly** nodes ``pts`` (P2 carries edge nodes, so they differ from the
     linear mesh); a vector ``g`` may be a constant per-component tuple (broadcast to every node), a
     full ``(n_nodes·vec,)`` field, or a single scalar (broadcast to all components)."""
@@ -2105,7 +1946,7 @@ def _assemble_second_order_time(
     (the :math:`\theta=\tfrac12` default, equivalent to Newmark average-acceleration), which
     conserves energy for an undamped wave where backward Euler would spuriously damp it
     (Newmark 1959, "A Method of Computation for Structural Dynamics", §average-acceleration). It is a
-    standard :class:`FeaxTimeBlock`, so the differentiable :meth:`FEM.solve` and the flat ``fem.M`` /
+    standard :class:`SemidiscreteTimeBlock`, so the differentiable :meth:`FEM.solve` and the flat ``fem.M`` /
     ``fem.state0`` accessors are unchanged; the state is ``y=[u; v]`` (size ``2N``), split via
     ``fem.offsets`` (``[0, N, 2N]``) — displacement ``y[:N]``, velocity ``y[N:]``.
 
@@ -2115,7 +1956,7 @@ def _assemble_second_order_time(
     multi-field, runtime-parameter, or time-varying-Dirichlet second-order forms are rejected
     (fail-loud) rather than silently mis-assembled.
     """
-    from .utils.solver.backend_blocks import FeaxTimeBlock
+    from .utils.solver.backend_blocks import SemidiscreteTimeBlock
     from .utils.solver.fem_native import assemble_fem_native
     from .utils.solver.parametric_helpers import _contains_runtime_parameter
     from .utils.solver.solver_helper import max_temporal_derivative_order as _mto
@@ -2145,7 +1986,7 @@ def _assemble_second_order_time(
             "(the velocity boundary value v=g_t is taken as zero); use a constant Dirichlet value."
         )
 
-    # ---- quadrature setup (native owns the FE state; no feax problem) ----
+    # ---- quadrature setup (the native assembler owns the FE state; no problem object) ----
     quad_degree = max(quad_degree, 2 * _order_of_element(_element_for(domain.dimension, order)))
 
     # ---- split each volume term by its temporal order: 2 -> mass M2, 1 -> damping C, 0 -> stiffness/load ----
@@ -2217,11 +2058,11 @@ def _assemble_second_order_time(
             u0 = val
     state0 = jnp.concatenate([u0, v0])
 
-    domain._feax_problem = None  # native owns this domain's FE state -> FEM.points reads the native DOFs
+    domain._fem_problem = None  # native owns this domain's FE state -> FEM.points reads the native DOFs
 
     t0, t1, dt = _infer_time_window(domain)
-    block = FeaxTimeBlock(
-        backend="feax_time",
+    block = SemidiscreteTimeBlock(
+        backend="transient",
         mode="implicit",
         time_order=2,
         spatial_kind="weak_form",
@@ -2232,119 +2073,10 @@ def _assemble_second_order_time(
         t0=t0,
         t1=t1,
         dt=dt,
-        feax_context={},
+        eval_context={},
         metadata={"theta": 0.5, "second_order": True},
     )
     return FEM(domain=domain, op=block, classification=classification, mode="transient", offsets=[0, n, 2 * n])
-
-
-def _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals, classification, dirichlet_tv=()):
-    """Assemble a coupled (multi-field) first-order transient weak form.
-
-    Reuses the steady block assembly: the IR is split into a mass IR (additive terms
-    carrying a temporal derivative, with ``u_t`` rewritten to ``u``) and a spatial
-    operator IR. The constant block mass ``M`` is assembled from the mass IR; the
-    spatial part is assembled from the operator IR — as a block matrix ``A`` when the
-    weak form is linear, or as a block residual/Jacobian (feax autodiff) when it is
-    nonlinear. A **shared** ``(fields, field_index)`` is threaded into every block
-    assembly so the separately-built pieces line up (one field ordering, a block for
-    every field). Per-field initial conditions form the block ``state0``; the user
-    drives backward Euler — ``(M + dt·A) w = M w`` (linear) or a Newton solve of
-    ``M (w-w_old)/dt + R(w) = 0`` (nonlinear).
-
-    An **algebraic / DAE field** (one with no time derivative — e.g. the pressure of a
-    transient Stokes problem) is handled structurally: building the mass against the full
-    field set gives it a **zero mass block**. The resulting ``(M + dt·A)`` is then a saddle
-    system, well-posed exactly when the steady block is (inf-sup + a pressure pin via
-    ``domain.point_region``). jno constructs it faithfully; the user's solve reveals an
-    ill-posed setup (e.g. a forgotten ``u_t``)."""
-    from .utils.solver.backend_blocks import FeaxTimeBlock
-    from .utils.solver.feax_utils import _dense_array, _zero_forcing_dirichlet_rows, _zero_mass_dirichlet_rows
-    from .utils.solver.fem_route import _assemble_fem_residual_from_ir, _assemble_fem_system_from_ir
-    from .utils.solver.time_route import (
-        _build_auto_forcing_vector_fn,
-        _infer_time_window,
-        _is_linear_first_order_ir,
-        _split_first_order_linear_terms,
-    )
-    from .utils.solver.weak_form import LoweredWeakForm
-
-    mass_ir, op_ir, src_ir = _split_first_order_linear_terms(ir)
-
-    # Shared field layout so the separately-assembled mass and operator blocks align.
-    # Threaded into the mass assembly too, so a field with no temporal term gets a zero
-    # mass block (the DAE case) rather than a mis-sized M. The mass is assembled *raw*
-    # (apply_dirichlet=False) and only its Dirichlet ROWS are zeroed below — the Dirichlet
-    # columns are kept so the stepper's M(w_new-w_old) captures M_fd·ġ for time-varying
-    # Dirichlet (it cancels when ġ=0). store_on_domain=False keeps this scratch problem
-    # off the domain so the operator problem/bc remain the ones exposed on `fem`.
-    override = (fields, field_index)
-    M_raw = jnp.asarray(
-        _dense_array(
-            _assemble_fem_system_from_ir(
-                domain, mass_ir, fields_override=override, apply_dirichlet=False, store_on_domain=False
-            )[0]
-        )
-    )
-    t0, t1, dt = _infer_time_window(domain)
-    common = dict(
-        backend="feax_time",
-        mode="implicit",
-        time_order=1,
-        spatial_kind="weak_form",
-        ir=ir,
-        t0=t0,
-        t1=t1,
-        dt=dt,
-        feax_context=getattr(domain, "_feax_context", {}) or {},
-    )
-
-    if _is_linear_first_order_ir(ir):
-        A_sys, bA = _assemble_fem_system_from_ir(domain, op_ir, fields_override=override)
-        A = jnp.asarray(_dense_array(A_sys))
-        bc, prob = domain._feax_bc, domain._feax_problem  # operator block problem + Dirichlet
-        M = _zero_mass_dirichlet_rows(M_raw, bc)
-        # Source/forcing terms (no trial) -> a block forcing f(t), zeroed at Dirichlet rows
-        # (a source contributes only to free DOFs); constant or temporal.
-        source_fn = None
-        if len(src_ir.terms) > 0:
-            source_fn = _zero_forcing_dirichlet_rows(
-                _build_auto_forcing_vector_fn(
-                    domain, src_ir, size=int(A.shape[0]), dtype=A.dtype, fields_override=override
-                )[0],
-                bc,
-            )
-        # Time-varying Dirichlet g(x,t) -> a t-dependent lift c_dir(t) (carries g(.,t) on the
-        # Dirichlet rows); the constant lift `bA` is then subsumed, so affine_bias = 0.
-        tv_lift_fn = _time_varying_dirichlet_lift(domain, prob, bc, A, dirichlet_tv, fields, field_index)
-        if tv_lift_fn is not None:
-            forcing_vector_fn = _sum_forcings(tv_lift_fn, source_fn)
-            affine_bias = jnp.zeros((int(A.shape[0]),), dtype=A.dtype)
-        else:
-            forcing_vector_fn = source_fn
-            affine_bias = jnp.asarray(bA).reshape(-1)
-        state0 = _multifield_initial_state(domain, prob, fields, field_index, ic_residuals)
-        block = FeaxTimeBlock(
-            M=M, A=A, affine_bias=affine_bias, forcing_vector_fn=forcing_vector_fn, state0=state0, **common
-        )
-        return FEM(domain=domain, op=block, classification=classification, mode="transient")
-
-    # Nonlinear: M u_dot + R(u) = 0, with R/J the block spatial residual/Jacobian that feax
-    # autodiffs on the multi-field problem (same path as steady nonlinear coupled). A
-    # (time-constant) source rides the residual by folding src_ir into the operator IR.
-    residual_ir = LoweredWeakForm(domain=domain, terms=list(op_ir.terms) + list(src_ir.terms))
-    spatial = _assemble_fem_residual_from_ir(domain, residual_ir, fields_override=override)
-    prob = domain._feax_problem
-    M = _zero_mass_dirichlet_rows(M_raw, domain._feax_bc)
-    state0 = _multifield_initial_state(domain, prob, fields, field_index, ic_residuals)
-    block = FeaxTimeBlock(
-        mass=lambda t, args=None, _M=M: _M,
-        residual=lambda u, t, args=None, _r=spatial.residual: _r(jnp.asarray(u)),
-        jacobian=lambda u, t, args=None, _j=spatial.jacobian: _j(jnp.asarray(u)),
-        state0=state0,
-        **common,
-    )
-    return FEM(domain=domain, op=block, classification=classification, mode="transient")
 
 
 # ---------------------------------------------------------------------------
@@ -2367,7 +2099,7 @@ def _assemble_fe_gram(domain: Any, kind: str = "stiffness"):
     * ``'stiffness'`` -> ``L = integral grad(phi_i).grad(phi_j)``  (``k^T L k = integral |grad k|^2``)
     * ``'mass'``      -> ``M = integral phi_i phi_j``              (``k^T M k = integral k^2``)
 
-    Assembled natively (no feax): the bilinear form is retagged to the quadrature pool and run through
+    Assembled natively: the bilinear form is retagged to the quadrature pool and run through
     ``assemble_fem_native`` with no Dirichlet, giving the raw Gram matrix on the field's P1 nodes.
     """
     from .utils.solver.fem_native import assemble_fem_native
@@ -2396,7 +2128,7 @@ def _assemble_h1_stiffness(domain: Any):  # back-compat alias
 
 def _fe_element_gradient_data(domain: Any):
     """``(shape_grads, JxW, cells)`` for the domain's P1 space -- per-element gradient
-    geometry for total variation ``integral |grad k|``. Built natively (no feax) from the native
+    geometry for total variation ``integral |grad k|``. Built natively from the native
     fem_context, which carries the physical shape gradients and ``JxW`` per element."""
     from .utils.solver.fem_native import build_native_fem_context
 

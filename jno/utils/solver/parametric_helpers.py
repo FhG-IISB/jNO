@@ -36,8 +36,8 @@ def _is_runtime_scalar_parameter(node) -> bool:
 
 def _is_frozen_parameter(node) -> bool:
     """A parameter marked ``.freeze()`` — a **known**, non-trainable coefficient. It is *not* a runtime
-    (trainable) unknown: the FEAX integrand evaluator resolves it as a coordinate function / constant at
-    the quadrature points (see ``feax_utils._eval_frozen_coefficient``), so the system assembles
+    (trainable) unknown: the integrand evaluator resolves it as a coordinate function / constant at
+    the quadrature points (see ``fem_utils._eval_frozen_coefficient``), so the system assembles
     non-parametrically. Excluded from runtime-parameter detection/collection below."""
     return _is_runtime_scalar_parameter(node) and bool(getattr(getattr(node, "model", None), "_frozen", False))
 

@@ -6,12 +6,11 @@ jno.fem routes it to the residual operator and the Jacobian comes from JAX autod
 coefficient field. These tests pin down that breadth (write Helmholtz / reaction / Schrodinger-style
 nonlinearities natively, no special API).
 
-Run with x64 (the feax assembly is float64): ``JAX_ENABLE_X64=1``.
+Run with x64 (the FEM assembly is float64): ``JAX_ENABLE_X64=1``.
 """
 
 import pytest
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for the box domain")
 pytest.importorskip("scipy", reason="scipy.optimize for the Newton solve")
 

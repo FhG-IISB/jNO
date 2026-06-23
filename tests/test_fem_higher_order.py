@@ -1,6 +1,6 @@
 """Higher-order (P2) element coverage for ``jno.fem``.
 
-feax has no P2 mesh source and jno's domain machinery assumes linear cells, so the
+jno's domain machinery assumes linear cells, so the
 domain mesh stays P1 and the FEM *assembly* mesh is promoted to P2 (edge-midpoint
 nodes inserted; vertices preserved) only for assembly. A P2 element captures
 quadratics exactly, which P1 cannot — the manufactured ``u = xy`` recovery is the
@@ -18,7 +18,6 @@ import pytest
 
 import jno
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
 import jax  # noqa: E402
 from shapely.geometry import box  # noqa: E402
@@ -26,7 +25,7 @@ from shapely.geometry import box  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """feax assembly is float64, so these tests opt into x64 per-test. The session default is
+    """FEM assembly/solves run in float64, so these tests opt into x64 per-test. The session default is
     x64-off (see tests/conftest.py); save/restore keeps the flag from leaking to other modules."""
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)

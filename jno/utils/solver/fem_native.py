@@ -1,4 +1,4 @@
-"""Native Lagrange assembler for ``jno.fem`` (replaces the feax-backed path).
+"""Native Lagrange assembler for ``jno.fem``.
 
 Implements the full assembly pipeline for scalar/vector Lagrange P1/P2 fields on 2D
 triangle and 3D tetrahedral meshes (single- and multi-field, linear/nonlinear/transient),
@@ -8,13 +8,13 @@ Jacobian, element factory and facet machinery all key off ``dim``.
 
 Key components re-used without change:
 
-* :func:`feax_utils._eval_expr_for_feax` — the DSL integrand evaluator.
+* :func:`fem_utils._eval_integrand` — the DSL integrand evaluator.
 * :func:`fem_1d._integrate_term` — weighted sum over quad points.
 * :func:`fem_1d._apply_dirichlet_*` — Dirichlet enforcement (symmetric/row/transient).
-* :func:`feax_utils._promote_to_quadratic` — P1→P2 mesh promotion.
-* :func:`feax_utils._cell_region_mask` — per-cell sub-region indicator.
+* :func:`fem_utils._promote_to_quadratic` — P1→P2 mesh promotion.
+* :func:`fem_utils._cell_region_mask` — per-cell sub-region indicator.
 
-New components (this module only; no feax imports):
+New components (this module only):
 
 * :func:`fem_lagrange.lagrange_triangle` / :func:`fem_lagrange.lagrange_tet` /
   :func:`fem_lagrange.identity_pushforward` — basix-backed Lagrange reference tabulation +
@@ -32,8 +32,8 @@ Scope
 -----
 Lagrange P1/P2 fields on 2D triangle and 3D tetrahedral meshes (single- and multi-field,
 linear, nonlinear, and transient), with Dirichlet and Neumann/Robin boundary conditions
-(2D edge / 3D tet-face surface quadrature).  Runtime FEM *field* parameters and complex FEM
-remain on the feax path.
+(2D edge / 3D tet-face surface quadrature).  Niches outside this scope raise a clear
+``NotImplementedError`` from ``jno.fem`` rather than assembling silently.
 """
 
 from __future__ import annotations
@@ -44,15 +44,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .feax_utils import (
-    _cell_region_mask,
-    _collect_region_mask_names,
-    _collect_temporal_tags_for_feax,
-    _infer_fields,
-    _lower_statefield_to_trial,
-    _promote_to_quadratic,
-    _test_field_index,
-)
 from .fem_1d import (
     _apply_dirichlet_rows,
     _apply_dirichlet_symmetric,
@@ -64,6 +55,15 @@ from .fem_1d import (
 from .fem_facets import _LOCAL_FACES_TET, build_facet_connectivity, compute_face_normals
 from .fem_lagrange import BASIX_TET_EDGES, identity_pushforward, lagrange_tet, lagrange_triangle
 from .fem_topology import BASIX_TRIANGLE_EDGES
+from .fem_utils import (
+    _cell_region_mask,
+    _collect_region_mask_names,
+    _gather_temporal_tags,
+    _infer_fields,
+    _lower_statefield_to_trial,
+    _promote_to_quadratic,
+    _test_field_index,
+)
 from .parametric_helpers import _collect_runtime_parameter_exprs
 from .weak_form import (
     _apply_sign,
@@ -195,18 +195,18 @@ def _facet_area_element(J, tangs):
 
 
 # ---------------------------------------------------------------------------
-# Native fem_context (feax-free) for the VPINN / grouped-weak-form path
+# Native fem_context for the VPINN / grouped-weak-form path
 # ---------------------------------------------------------------------------
 
 
 def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neumann_tags=(), dirichlet_node_ids=None):
-    """Native, feax-free equivalent of ``init_fem``'s ``domain.fem_context`` for the VPINN /
-    grouped-weak-form evaluator (``trace_evaluator._eval_grouped_assembly``).
+    """Build ``domain.fem_context`` for the VPINN / grouped-weak-form evaluator
+    (``trace_evaluator._eval_grouped_assembly``).
 
-    Returns ``(fem_context, vol_quad_points, surface_quad_by_tag, surface_normals_by_tag)``:
-    the same tensor layout the feax path cached, computed from the native Lagrange element +
-    facet machinery instead of a feax ``Problem``. The geometry is affine-simplex (P1 vertices),
-    so the cell Jacobian, ``JxW`` and physical gradients are exact for P1/P2 nodal bases.
+    Returns ``(fem_context, vol_quad_points, surface_quad_by_tag, surface_normals_by_tag)``,
+    computed from the native Lagrange element + facet machinery. The geometry is affine-simplex
+    (P1 vertices), so the cell Jacobian, ``JxW`` and physical gradients are exact for P1/P2 nodal
+    bases.
     """
     dim = int(domain.dimension)
     order = 2 if element_type in ("TRI6", "TET10") else 1
@@ -352,8 +352,7 @@ def assemble_fem_native(
 
     Scope: scalar/vector Lagrange P1/P2 fields on 2D triangle and 3D tetrahedral meshes
     (single- and multi-field), with Dirichlet and Neumann/Robin boundary conditions (2D edge /
-    3D tet-face surface quadrature).  Complex FEM and runtime FEM *field* parameters remain on
-    the feax path.
+    3D tet-face surface quadrature).
     """
     from ...trace import FemResidualOperator
 
@@ -414,16 +413,15 @@ def assemble_fem_native(
     domain._fem_assembly_cells = cells_p1
 
     # The DOF coordinates the flat solution lives on (vertices + edge midpoints for P2).
-    # ``FEM.points`` reads ``[0]`` on the native path (there is no feax problem to query) so the
-    # solution can be interpreted at the right coordinates -- the first field's nodes, matching
-    # the feax convention (``problem.mesh[0].points``). The full per-field list backs
-    # ``FEM.field_points`` for coupled problems (e.g. Taylor-Hood velocity vs pressure nodes).
+    # ``FEM.points`` reads ``[0]`` so the solution can be interpreted at the right coordinates --
+    # the first field's nodes. The full per-field list backs ``FEM.field_points`` for coupled
+    # problems (e.g. Taylor-Hood velocity vs pressure nodes).
     domain._fem_native_dof_points = np.asarray(pts_f_all[0])
     domain._fem_native_dof_points_all = [np.asarray(p) for p in pts_f_all]
 
     # Field-0 assembly cells + element order, for the periodic-tie reduction (``_build_periodic_
-    # reduction`` reads the assembly mesh's cells to extract boundary facets). On the native path
-    # there is no feax problem to query, so ``_finalize`` reads these instead of ``_assembly_cells``.
+    # reduction`` reads the assembly mesh's cells to extract boundary facets); ``_finalize`` reads
+    # these.
     domain._fem_native_assembly_cells = np.asarray(cells_f_all[0])
     domain._fem_native_assembly_order = int(fields[0]["order"])
 
@@ -475,19 +473,19 @@ def assemble_fem_native(
 
     # Temporal variable tags (e.g. "__time__") used inside the weak form's coefficients -- a
     # time-dependent source s(x,t) or operator. The residual/Jacobian builders thread the runtime time
-    # `t` into the kernel's volume_vars at the matching slots so `_eval_expr_for_feax` resolves them;
+    # `t` into the kernel's volume_vars at the matching slots so `_eval_integrand` resolves them;
     # the packing order is [temporal..., runtime_param..., region_mask...] (see _make_internal_vars).
     _temporal_tag_set: set = set()
     for bare in volume_terms:
-        _collect_temporal_tags_for_feax(bare, _temporal_tag_set)
+        _gather_temporal_tags(bare, _temporal_tag_set)
     for _exprs in boundary_terms.values():
         for bare in _exprs:
-            _collect_temporal_tags_for_feax(bare, _temporal_tag_set)
+            _gather_temporal_tags(bare, _temporal_tag_set)
     temporal_tags: Tuple[str, ...] = tuple(sorted(_temporal_tag_set))
 
     # Runtime parameters (trainable ``jno.np.parameter(...)`` coefficients, e.g. an unknown diffusivity
     # in an inverse problem). Their values arrive at solve time in an ``args`` dict; the builders pack
-    # them into volume_vars right AFTER the temporal slots so ``_eval_expr_for_feax`` resolves each
+    # them into volume_vars right AFTER the temporal slots so ``_eval_integrand`` resolves each
     # parameter node (layout [temporal..., runtime_param..., region_mask...]). A SCALAR parameter is
     # broadcast; a nodal FIELD parameter k(x) (``jno.np.parameter(phi)``) has its per-cell nodal values
     # gathered and interpolated to the quad points via the field's shape functions.
@@ -673,10 +671,10 @@ def assemble_fem_native(
     def _classify_one(coeff, where: str) -> List[Tuple[Any, int]]:
         """``[(coeff, test_field_idx), ...]`` for one lowered term. Normally one entry; a term that
         welds several test fields inside a product (the real part of a ``complex=True`` form, e.g.
-        ``c·(u_r·w_r − u_i·w_i)``) is distributed over its sums into single-test sub-terms -- the same
-        fallback the feax multifield path uses, so one complex form lowers onto the coupled blocks."""
+        ``c·(u_r·w_r − u_i·w_i)``) is distributed over its sums into single-test sub-terms, so one
+        complex form lowers onto the coupled blocks."""
         from ...trace import BinaryOp, Literal
-        from .feax_utils import _expand_product_terms
+        from .fem_utils import _expand_product_terms
 
         tfi = _test_field_index(coeff, field_index)
         if tfi is not None:
@@ -767,8 +765,8 @@ def assemble_fem_native(
         that element's local DOFs — an ``(n_test, n_local)`` block — then scatter-added into the global
         matrix. The AD never sees the global state, so the intermediate is element-sized; this is what
         a single global ``jacfwd(residual)`` cannot do (it materialises an ``O(n_dofs × n_cells)``
-        tangent tensor and OOMs on any non-trivial mesh). The dense result matches the feax matrix
-        entry-for-entry on a matched DOF numbering."""
+        tangent tensor and OOMs on any non-trivial mesh). The dense result is entry-for-entry
+        identical to that global ``jacfwd``, just assembled within a per-element memory budget."""
         typed_with_masks, surface_work = _preprocess_terms(terms, bterms)
 
         def jacobian(u_flat, t=0.0, args=None):
@@ -926,7 +924,7 @@ def assemble_fem_native(
     # === transient (Mu̇ + Au = c or M u̇ + R(u) = 0) ===
     if ic_residuals or any(_contains_temporal_derivative(t) for t in all_terms):
         from ..._fem import _bare, _essential_spec, _eval_value_node_at, _field_key_of
-        from .backend_blocks import FeaxTimeBlock
+        from .backend_blocks import SemidiscreteTimeBlock
         from .time_route import _infer_time_window, _strip_temporal_trial_derivative
 
         sub_signed = [
@@ -948,7 +946,7 @@ def assemble_fem_native(
 
         t0, t1, dt = _infer_time_window(domain)
         common = dict(
-            backend="feax_time",
+            backend="transient",
             mode="implicit",
             time_order=1,
             spatial_kind="weak_form",
@@ -956,7 +954,7 @@ def assemble_fem_native(
             t0=t0,
             t1=t1,
             dt=dt,
-            feax_context=getattr(domain, "_feax_context", {}) or {},
+            eval_context=getattr(domain, "_fem_eval_context", {}) or {},
         )
 
         # --- initial state: nodal interpolation (exact for Lagrange) ---
@@ -1006,7 +1004,7 @@ def assemble_fem_native(
 
             M_bc = M if d_dofs is None else M.at[d_dofs, :].set(0.0).at[:, d_dofs].set(0.0)
             return (
-                FeaxTimeBlock(
+                SemidiscreteTimeBlock(
                     mass=lambda t, args=None, _M=M_bc: _M,
                     residual=res_bc,
                     jacobian=jac_bc,
@@ -1035,7 +1033,7 @@ def assemble_fem_native(
                 return _mask * (-spatial_res(zeros, t, args))
 
             return (
-                FeaxTimeBlock(
+                SemidiscreteTimeBlock(
                     M=M_bc,
                     operator_fn=operator_fn,
                     affine_bias=c_bias,
@@ -1074,7 +1072,7 @@ def assemble_fem_native(
                 return f
 
             return (
-                FeaxTimeBlock(M=M_tv, A=A_tv, affine_bias=c_tv, forcing_vector_fn=forcing_vector_fn, **common),
+                SemidiscreteTimeBlock(M=M_tv, A=A_tv, affine_bias=c_tv, forcing_vector_fn=forcing_vector_fn, **common),
                 "transient",
                 offs,
             )
@@ -1094,8 +1092,12 @@ def assemble_fem_native(
             def forcing_vector_fn(t, args=None, _c0=c0, _mask=free_mask):
                 return _mask * (-spatial_res(zeros, t) - _c0)
 
-            return FeaxTimeBlock(M=M, A=A, affine_bias=c, forcing_vector_fn=forcing_vector_fn, **common), "transient", offs
-        return FeaxTimeBlock(M=M, A=A, affine_bias=c, **common), "transient", offs
+            return (
+                SemidiscreteTimeBlock(M=M, A=A, affine_bias=c, forcing_vector_fn=forcing_vector_fn, **common),
+                "transient",
+                offs,
+            )
+        return SemidiscreteTimeBlock(M=M, A=A, affine_bias=c, **common), "transient", offs
 
     # === steady ===
     dirichlet_pairs = _build_dirichlet_pairs()

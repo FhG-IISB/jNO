@@ -1,16 +1,15 @@
-"""Complex-valued FEM through the real-equivalent block (feax assembled real-only).
+"""Complex-valued FEM through the real-equivalent block (real-only assembly).
 
 ``jno.fem`` detects a complex weak form, splits each term into real Re/Im sub-forms
 (``Re(c·T)=Re(c)·T`` since the FE trial/test ``T`` is real), assembles both through the ordinary
-**real** feax path, solves the real block ``[[A_r,-A_i],[A_i,A_r]]``, and returns ``u_r + i·u_i``.
-No feax change, no reliance on feax's native-complex behavior.
+**real** assembly path, solves the real block ``[[A_r,-A_i],[A_i,A_r]]``, and returns ``u_r + i·u_i``.
+The complex problem is handled entirely by the two coupled real systems.
 
 Run with x64 (the solution is complex128): ``JAX_ENABLE_X64=1``.
 """
 
 import pytest
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for the box domain")
 
 import jax  # noqa: E402
@@ -53,7 +52,7 @@ def test_complex_helmholtz_real_equivalent_recovers_manufactured():
 
     fem = jno.fem([c * (ui.x * vi.x + ui.y * vi.y) + d_coef * (u * vi) - f * vi])
     assert fem.is_complex
-    assert fem.problem is None  # the Re/Im real systems are assembled natively (no feax problem)
+    assert fem.problem is None  # the Re/Im real systems are assembled natively
 
     u_num = np.asarray(fem.solve())
     assert np.iscomplexobj(u_num)
@@ -91,7 +90,7 @@ def test_pml_helmholtz_absorbs_reflection_free():
     fem, u1, pts = solve_pml(40.0)
     _, u2, _ = solve_pml(60.0)  # 1.5x absorber strength, fresh mesh
     assert fem.is_complex and np.iscomplexobj(u1) and not bool(np.isnan(u1).any())
-    assert fem.problem is None  # native real-equivalent assembly (Dirichlet wall included), no feax
+    assert fem.problem is None  # native real-equivalent assembly (Dirichlet wall included)
 
     core = (pts[:, 0] > w) & (pts[:, 0] < L - w) & (pts[:, 1] > w) & (pts[:, 1] < L - w)
     sigma_insens = float(np.linalg.norm(u1[core] - u2[core]) / np.linalg.norm(u1[core]))
@@ -125,7 +124,7 @@ def test_complex_transient_recovers_mode_and_conserves_schrodinger_norm():
     # complex diffusion: decay + oscillation, checked against the analytic mode
     fem, traj, pts = solve(0.5 + 1j)
     assert fem.is_complex and fem.is_transient and np.iscomplexobj(traj)
-    assert fem.problem is None  # M_r/A_r and M_i=0/A_i blocks are assembled natively (no feax)
+    assert fem.problem is None  # M_r/A_r and M_i=0/A_i blocks are assembled natively
     t1 = float(fem.t1)
     mode = np.sin(PI * pts[:, 0]) * np.sin(PI * pts[:, 1])
     analytic = np.exp(-(0.5 + 1j) * 2 * PI**2 * t1) * mode

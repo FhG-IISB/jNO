@@ -2,8 +2,8 @@
 
 Each field is its own ``(trial, test)`` pair from a ``fem_symbols()`` call (they
 share a ``field_key``); ``jno.fem`` detects several fields and assembles a block
-(multi-variable) system via feax. Cross-field weak terms populate the off-diagonal
-blocks, and feax autodiffs the universal kernel into the full block matrix. The
+(multi-variable) system. Cross-field weak terms populate the off-diagonal
+blocks, and the universal kernel is autodiffed into the full block matrix. The
 single-field path is unchanged (one field → existing assembly).
 """
 
@@ -15,7 +15,6 @@ import pytest
 
 import jno
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
 import jax  # noqa: E402
 from shapely.geometry import box  # noqa: E402
@@ -23,7 +22,7 @@ from shapely.geometry import box  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """feax assembly is float64, so these tests opt into x64 per-test. The session default is
+    """FEM assembly/solves run in float64, so these tests opt into x64 per-test. The session default is
     x64-off (see tests/conftest.py); save/restore keeps the flag from leaking to other modules."""
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
@@ -139,7 +138,7 @@ def _coupled_robin_fem(with_robin=True, order_u=1, mesh_size=0.1):
     contributes a trial-dependent ``alpha*u*v`` surface term (-> stiffness block A) and a
     pure ``-g_R*v`` load (-> b); u is Dirichlet (=x) on the other three edges, p is
     Dirichlet (=y) on the whole boundary. ``order_u`` promotes u to P2 (mixed-order vs
-    the P1 pressure) to exercise feax's per-field face-shape concat across orders."""
+    the P1 pressure) to exercise the per-field face-shape concat across orders."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size)
     u, v = d.fem_symbols(names=("u", "v"), order=order_u)
     p, q = d.fem_symbols(names=("p", "q"), order=1)
@@ -282,9 +281,9 @@ def test_coupled_transient_algebraic_field_gets_zero_mass_block():
 def test_coupled_neumann_robin_mixed_order_recovers_manufactured():
     # Escalation: same coupled Neumann/Robin problem but u is P2 and p is P1, so the two
     # fields have different face-node counts on the shared right edge. The multi-field
-    # surface kernel must slice the per-field face shape data feax concatenates by order;
+    # surface kernel must slice the per-field face shape data concatenated by order;
     # if that mixed-order concat were wrong, recovery fails here while the equal-order
-    # surface test still passes -- localizing the bug to feax rather than the kernel.
+    # surface test still passes -- localizing the bug to the mixed-order concat.
     d, fem = _coupled_robin_fem(with_robin=True, order_u=2, mesh_size=0.15)
     assert fem.is_linear
     assert "surface@right" in fem.classification
@@ -295,8 +294,8 @@ def test_coupled_neumann_robin_mixed_order_recovers_manufactured():
 
 def test_coupled_nonlinear_newton_recovers_manufactured():
     # Nonlinear coupled: -lap u + u*p = f1 ; -lap p + u^3 = f2 ; u=p=0 on boundary.
-    # Manufactured u*=g, p*=2g (g=x(1-x)y(1-y)). feax autodiffs the block residual/
-    # Jacobian on the multi-field problem, so a scipy Newton solve recovers both.
+    # Manufactured u*=g, p*=2g (g=x(1-x)y(1-y)). The block residual/Jacobian on the
+    # multi-field problem is autodiffed, so a scipy Newton solve recovers both.
     spo = pytest.importorskip("scipy.optimize")
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.08)
     n = int(np.asarray(d.mesh.points).shape[0])

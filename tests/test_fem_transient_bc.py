@@ -7,9 +7,9 @@ These tests assert the **assembly is faithful** (structure of ``M``/``c``/``f``)
 it with a throwaway few-line backward-Euler ``(M + dt·A) w_next = M·w + dt·(c + f(t_next))``;
 that loop is verification, not a jno feature.
 
-Earlier the feax (2D/3D) transient path left identity rows on ``M`` and never exposed the
-load, so only homogeneous, source-free problems were faithful. The fix zeros ``M``'s
-Dirichlet rows (a constrained DOF carries no time derivative) and exposes ``c``/``f``.
+For non-homogeneous Dirichlet and forced problems the assembly zeros ``M``'s Dirichlet rows
+(a constrained DOF carries no time derivative) and exposes the load ``c`` and forcing ``f(t)``,
+so source-driven and non-homogeneous problems march faithfully.
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ import pytest
 
 import jno
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
 import jax  # noqa: E402
 from shapely.geometry import box  # noqa: E402
@@ -27,7 +26,7 @@ from shapely.geometry import box  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """feax assembly is float64, so these tests opt into x64 per-test. The session default is
+    """FEM assembly/solves run in float64, so these tests opt into x64 per-test. The session default is
     x64-off (see tests/conftest.py); save/restore keeps the flag from leaking to other modules."""
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)

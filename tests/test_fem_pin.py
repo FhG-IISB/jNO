@@ -17,7 +17,6 @@ import pytest
 
 import jno
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
 import jax  # noqa: E402
 from shapely.geometry import box  # noqa: E402
@@ -27,7 +26,7 @@ inner, grad, trace, where = jno.np.inner, jno.np.grad, jno.np.trace, jno.np.wher
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """feax assembly is float64; opt into x64 per-test and restore (session default is x64-off)."""
+    """FEM assembly is float64; opt into x64 per-test and restore (session default is x64-off)."""
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
     try:

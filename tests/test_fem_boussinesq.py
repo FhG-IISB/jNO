@@ -19,7 +19,6 @@ Run with x64: ``JAX_ENABLE_X64=1``.
 
 import pytest
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for the box domain")
 
 import jax  # noqa: E402
@@ -35,7 +34,7 @@ _dn = lambda A: np.asarray(A.todense()) if hasattr(A, "todense") else np.asarray
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """feax assembly is float64; opt into x64 per-test (the session default may be x64-off when
+    """FEM assembly is float64; opt into x64 per-test (the session default may be x64-off when
     co-run with test_periodic). Save/restore keeps the flag from leaking to other modules."""
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
