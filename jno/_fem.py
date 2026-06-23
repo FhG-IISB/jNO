@@ -233,18 +233,15 @@ def _native_lagrange_ok(domain: Any, constraints: List[Any], weak_bares: List[An
     * periodic ties — the prolongation reduction reads a feax assembly problem;
     * FEM *field* (nodal ``k(x)``) parameters — native threads scalar parameters only.
 
-    Note: a runtime-*scalar* parameter is allowed here, but the transient call sites add their own
-    exclusion (native transient-parametric is not wired yet).
+    Note: a runtime-*scalar* parameter AND a single-field nodal FIELD parameter k(x) are allowed here
+    (this gate only runs on single-field problems -- multifield returns earlier). The transient call
+    sites add their own runtime-parameter exclusion (native transient-parametric is not wired yet).
     """
-    from .utils.solver.parametric_helpers import _contains_fem_field_parameter
-
     if getattr(domain, "dimension", None) != 2:
         return False
     if periodic_ties:
         return False
     if _trial_spaces(constraints) - {"Lagrange"}:
-        return False
-    if any(_contains_fem_field_parameter(b) for b in weak_bares):
         return False
     # complex=True fields: the real-equivalent form couples re/im test functions within one term,
     # which the native one-test-field-per-term classifier rejects -> route to the feax real path.

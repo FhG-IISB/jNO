@@ -515,6 +515,43 @@ def test_native_parametric_gradient_matches_finite_difference():
 # ---------------------------------------------------------------------------
 
 
+def test_native_field_parameter_routes_native_and_gradient_flows():
+    """A nodal FIELD parameter k(x) = jno.np.parameter(phi) routes natively: its per-cell nodal
+    values are gathered and interpolated to the quad points. A linear field equals the same
+    coordinate-function coefficient (P1 interpolation is exact) -> catches gather/node-order bugs;
+    and ∂(solve)/∂k flows through the gather (finite-difference check)."""
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.25)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = 2.0 * (xi * (1.0 - xi) + yi * (1.0 - yi))
+    k = jno.np.parameter(phi, name="k")
+    fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    assert fem.problem is None  # native path
+    sys = fem.operator
+    assert sys.is_parametric and list(sys.runtime_parameter_exprs) == ["k"]
+
+    nodes = np.asarray(d.built_mesh.points)[:, :2]
+    k_true = jnp.asarray(0.6 + 0.8 * nodes[:, 0] + 0.5 * nodes[:, 1])  # smooth, exactly P1-representable
+    fem_ref = jno.fem([(0.6 + 0.8 * xi + 0.5 * yi) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    A_field = np.asarray(sys.evaluate({"k": k_true})[0])
+    A_ref = np.asarray(fem_ref.A)
+    assert np.abs(A_field - A_ref).max() < 1e-9  # nodal interpolation/gather is exact for a linear k
+
+    def loss(kv):
+        A, b = sys.evaluate({"k": kv})
+        return jnp.sum(jnp.linalg.solve(jnp.asarray(A), jnp.asarray(b).reshape(-1)) ** 2)
+
+    g_ad = np.asarray(jax.grad(loss)(k_true))
+    j = int(np.argmax(np.abs(g_ad)))  # check the most-sensitive nodal component
+    eps = 1e-6
+    kp = k_true.at[j].add(eps)
+    km = k_true.at[j].add(-eps)
+    g_fd = float((loss(kp) - loss(km)) / (2 * eps))
+    assert abs(g_ad[j]) > 1e-8 and abs(g_ad[j] - g_fd) <= 1e-4 * max(1.0, abs(g_fd))
+
+
 def test_native_fem_context_matches_feax():
     from jno.utils.solver.fem_native import build_native_fem_context
 

@@ -440,10 +440,14 @@ def assemble_fem_native(
             _collect_temporal_tags_for_feax(bare, _temporal_tag_set)
     temporal_tags: Tuple[str, ...] = tuple(sorted(_temporal_tag_set))
 
-    # Runtime scalar parameters (trainable ``jno.np.parameter(...)`` coefficients, e.g. an unknown
-    # diffusivity in an inverse problem). Their values arrive at solve time in an ``args`` dict; the
-    # builders pack them into volume_vars right AFTER the temporal slots so ``_eval_expr_for_feax``
-    # resolves each parameter node. Field (nodal) parameters are not handled here -- they stay on feax.
+    # Runtime parameters (trainable ``jno.np.parameter(...)`` coefficients, e.g. an unknown diffusivity
+    # in an inverse problem). Their values arrive at solve time in an ``args`` dict; the builders pack
+    # them into volume_vars right AFTER the temporal slots so ``_eval_expr_for_feax`` resolves each
+    # parameter node (layout [temporal..., runtime_param..., region_mask...]). A SCALAR parameter is
+    # broadcast; a nodal FIELD parameter k(x) (``jno.np.parameter(phi)``) has its per-cell nodal values
+    # gathered and interpolated to the quad points via the field's shape functions.
+    from .parametric_helpers import _is_fem_field_parameter
+
     _rt_param_exprs: Dict[str, Any] = {}
     for bare in volume_terms:
         _collect_runtime_parameter_exprs(bare, _rt_param_exprs)
@@ -451,6 +455,11 @@ def assemble_fem_native(
         for bare in _exprs:
             _collect_runtime_parameter_exprs(bare, _rt_param_exprs)
     runtime_parameter_tags: Tuple[str, ...] = tuple(sorted(_rt_param_exprs))
+    _field_param_names: set = {n for n, expr in _rt_param_exprs.items() if _is_fem_field_parameter(expr)}
+    if _field_param_names and len(fields) > 1:
+        raise NotImplementedError(
+            "jno.fem (native): a FEM field parameter k(x) is supported on single-field problems only."
+        )
 
     # -------------------------------------------------------------------------
     # Surface integration setup
@@ -506,14 +515,20 @@ def assemble_fem_native(
         """This cell's local DOFs across all fields, concatenated (matches ``cell_all_dofs[c]``)."""
         return jnp.concatenate([u_blocks[i][cells_f_j[i][c]].reshape(-1) for i in range(len(fields))])
 
-    def _runtime_vals(t, args, dtype):
-        """Runtime scalars packed for the kernel's volume_vars prefix, in the order
-        ``[temporal..., runtime_param...]`` (region masks follow per cell). Each is a ``(1,)`` array
-        (read back as a scalar). Empty when the form is autonomous and non-parametric."""
+    def _runtime_vals(c, t, args, dtype):
+        """Cell ``c``'s runtime values for the kernel's volume_vars prefix, ordered
+        ``[temporal..., runtime_param...]`` (region masks follow). Temporal + scalar parameters are
+        single ``(1,)`` values (read back as scalars); a nodal FIELD parameter contributes this cell's
+        local nodal slice ``(n_local,)`` which ``_runtime_parameter_value_from_internal_vars``
+        interpolates to the quad points. Empty prefix when the form is autonomous and non-parametric."""
         tv = tuple(jnp.reshape(jnp.asarray(t, dtype=dtype), (-1,))[:1] for _ in temporal_tags)
         a = args or {}
-        pv = tuple(jnp.reshape(jnp.asarray(a[name], dtype=dtype), (-1,))[:1] for name in runtime_parameter_tags)
-        return tv + pv
+        pv = []
+        for name in runtime_parameter_tags:
+            flat = jnp.reshape(jnp.asarray(a[name], dtype=dtype), (-1,))
+            # Single-field nodal field parameter -> this cell's local nodal values (field 0).
+            pv.append(flat[cells_f_j[0][c]] if name in _field_param_names else flat[:1])
+        return tv + tuple(pv)
 
     # -------------------------------------------------------------------------
     # Generic residual builder (volume + optional surface terms)
@@ -524,13 +539,13 @@ def assemble_fem_native(
     parent_j = jnp.asarray(conn.parent_cell, dtype=jnp.int32)
     lface_j = jnp.asarray(conn.local_face, dtype=jnp.int32)
 
-    def _vol_elem_res(c, local_all, coeff, tfi, rnames, rt_vals=()):
+    def _vol_elem_res(c, local_all, coeff, tfi, rnames, t=0.0, args=None):
         """Element residual of one volume term on cell ``c`` as a function of that cell's gathered
         all-field local DOFs ``local_all`` -> ``(n_test_dofs_tfi,)``. Driving the AD off this
         element-sized input (not the global state) is what keeps the per-cell Jacobian's intermediate
-        O(n_local) instead of O(n_dofs). ``rt_vals`` carries the runtime scalar(s) (temporal time and
-        any runtime parameters), packed BEFORE the region masks (the kernel layout is
-        [temporal..., runtime_param..., region_mask...])."""
+        O(n_local) instead of O(n_dofs). ``t`` / ``args`` carry the runtime time and parameters, packed
+        per cell into volume_vars BEFORE the region masks (layout [temporal..., runtime_param...,
+        region_mask...])."""
         cell_sols = _split_cell_local(local_all)
         per, xq, meas = _cell_fields(c, cell_sols)
         cell_masks = tuple(region_mask_arrays[list(region_mask_names).index(r)][c] for r in rnames)
@@ -544,13 +559,18 @@ def assemble_fem_native(
             "temporal_tags": temporal_tags,
             "runtime_parameter_tags": runtime_parameter_tags,
             "region_mask_names": rnames,
-            "volume_vars": tuple(rt_vals) + cell_masks,
+            "volume_vars": _runtime_vals(c, t, args, local_all.dtype) + cell_masks,
             "trial_value_shape": fields[tfi]["value_shape"],
             "trial_vec": vecs[tfi],
         }
+        if _field_param_names:
+            # The field parameter's nodal slice is interpolated to the quad points with the field's
+            # shape functions (single-field: field 0). _runtime_parameter_value_from_internal_vars
+            # reads this top-level shape_vals.
+            loc["shape_vals"] = per[0]["shape_vals"]
         return _integrate_term(domain, coeff, loc, qw_shared * meas)
 
-    def _surf_elem_res(fi, local_all, bcoeff, btfi, region, rt_vals=()):
+    def _surf_elem_res(fi, local_all, bcoeff, btfi, region, t=0.0, args=None):
         """Element residual of one surface term on boundary face ``fi`` as a function of the parent
         cell's gathered all-field local DOFs ``local_all`` -> ``(n_test_dofs_btfi,)``."""
         c = parent_j[fi]
@@ -588,10 +608,12 @@ def assemble_fem_native(
             "temporal_tags": temporal_tags,
             "runtime_parameter_tags": runtime_parameter_tags,
             "region_mask_names": (),
-            "volume_vars": tuple(rt_vals),
+            "volume_vars": _runtime_vals(c, t, args, local_all.dtype),
             "trial_value_shape": fields[btfi]["value_shape"],
             "trial_vec": vecs[btfi],
         }
+        if _field_param_names:
+            loc["shape_vals"] = per_f[0]["shape_vals"]
         return _integrate_term(domain, bcoeff, loc, gw_face * jac_f)
 
     def _preprocess_terms(terms, bterms):
@@ -646,10 +668,9 @@ def assemble_fem_native(
         def residual(u_flat, t=0.0, args=None):
             R = jnp.zeros(total, dtype=u_flat.dtype)
             local_all = u_flat[cell_all_dofs]  # (n_cell, n_local_all)
-            rt = _runtime_vals(t, args, u_flat.dtype)
 
             for coeff, tfi, rnames in typed_with_masks:
-                elem = jax.vmap(lambda c, la, _e=coeff, _t=tfi, _r=rnames: _vol_elem_res(c, la, _e, _t, _r, rt))(
+                elem = jax.vmap(lambda c, la, _e=coeff, _t=tfi, _r=rnames: _vol_elem_res(c, la, _e, _t, _r, t, args))(
                     jnp.arange(n_cells), local_all
                 )
                 R = R.at[cdofs[tfi].reshape(-1)].add(elem.reshape(-1))
@@ -660,7 +681,7 @@ def assemble_fem_native(
                 lv = u_flat[cell_all_dofs[pcells]]  # (n_face, n_local_all)
                 for bcoeff, btfi in btyped:
                     contribs = jax.vmap(
-                        lambda fi, la, _e=bcoeff, _t=btfi, _r=region: _surf_elem_res(fi, la, _e, _t, _r, rt)
+                        lambda fi, la, _e=bcoeff, _t=btfi, _r=region: _surf_elem_res(fi, la, _e, _t, _r, t, args)
                     )(fids, lv)
                     R = R.at[cdofs[btfi][pcells].reshape(-1)].add(contribs.reshape(-1))
             return R
@@ -681,12 +702,11 @@ def assemble_fem_native(
         def jacobian(u_flat, t=0.0, args=None):
             A = jnp.zeros((total, total), dtype=u_flat.dtype)
             local_all = u_flat[cell_all_dofs]  # (n_cell, n_local_all)
-            rt = _runtime_vals(t, args, u_flat.dtype)
 
             for coeff, tfi, rnames in typed_with_masks:
 
                 def _ke(c, la, _e=coeff, _t=tfi, _r=rnames):
-                    return jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, rt))(la)
+                    return jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, t, args))(la)
 
                 Ke = jax.vmap(_ke)(jnp.arange(n_cells), local_all)  # (n_cell, n_test_tfi, n_local_all)
                 rows = cdofs[tfi]  # (n_cell, n_test_tfi)
@@ -700,7 +720,7 @@ def assemble_fem_native(
                 for bcoeff, btfi in btyped:
 
                     def _kef(fi, la, _e=bcoeff, _t=btfi, _r=region):
-                        return jax.jacfwd(lambda v: _surf_elem_res(fi, v, _e, _t, _r, rt))(la)
+                        return jax.jacfwd(lambda v: _surf_elem_res(fi, v, _e, _t, _r, t, args))(la)
 
                     Kef = jax.vmap(_kef)(fids, lv)  # (n_face, n_test_btfi, n_local_all)
                     frows = cdofs[btfi][pcells]  # (n_face, n_test_btfi)
