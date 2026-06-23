@@ -1920,14 +1920,11 @@ def _assemble_second_order_time(
     (fail-loud) rather than silently mis-assembled.
     """
     from .utils.solver.backend_blocks import FeaxTimeBlock
-    from .utils.solver.feax_utils import _dense_array
-    from .utils.solver.fem_route import _assemble_fem_system_from_ir, neumann
+    from .utils.solver.fem_native import assemble_fem_native
     from .utils.solver.parametric_helpers import _contains_runtime_parameter
     from .utils.solver.solver_helper import max_temporal_derivative_order as _mto
     from .utils.solver.time_route import _infer_time_window, _strip_temporal_trial_derivative
     from .utils.solver.weak_form import (
-        LoweredChannelTerm,
-        LoweredWeakForm,
         _apply_sign,
         _is_obviously_nonlinear_in_unknown,
         _split_additive_terms,
@@ -1952,13 +1949,8 @@ def _assemble_second_order_time(
             "(the velocity boundary value v=g_t is taken as zero); use a constant Dirichlet value."
         )
 
-    # ---- element + quadrature + BC setup (mirrors the single-field path) ----
-    element_type = _element_for(domain.dimension, order)
-    quad_degree = max(quad_degree, 2 * _order_of_element(element_type))
-    bcs = [domain.dirichlet(tag, value) for tag, value in dirichlet_values.items()]
-    if boundary_terms:
-        bcs.append(neumann(list(boundary_terms.keys())))
-    domain.init_fem(element_type=element_type, quad_degree=quad_degree, bcs=bcs, vec=vec, fem_solver=True)
+    # ---- quadrature setup (native owns the FE state; no feax problem) ----
+    quad_degree = max(quad_degree, 2 * _order_of_element(_element_for(domain.dimension, order)))
 
     # ---- split each volume term by its temporal order: 2 -> mass M2, 1 -> damping C, 0 -> stiffness/load ----
     def _strip(coeff, times):
@@ -1966,69 +1958,41 @@ def _assemble_second_order_time(
             coeff = _strip_temporal_trial_derivative(coeff)
         return coeff
 
-    def _term(coeff, region_id="volume", support="volume"):
-        return LoweredChannelTerm(
-            sign=1,
-            support=support,
-            region_id=region_id,
-            channel="raw",
-            coeff=coeff,
-            variable_id=0,
-            value_shape=(),
-            original_expr=coeff,
-        )
-
-    mass2_terms, damp_terms, stiff_terms = [], [], []
+    mass2_raw, damp_raw, stiff_raw = [], [], []
     for bare in volume_terms:
         for sign, sub in _split_additive_terms(domain, bare):
             coeff = _apply_sign(domain, sign, sub)
             o = _mto(sub)
             if o >= 2:
-                mass2_terms.append(_term(_strip(coeff, 2)))  # u_tt * phi -> mass bilinear (u, phi)
+                mass2_raw.append(_strip(coeff, 2))  # u_tt * phi -> mass bilinear (u, phi)
             elif o == 1:
-                damp_terms.append(_term(_strip(coeff, 1)))  # u_t * phi -> damping bilinear (u, phi)
+                damp_raw.append(_strip(coeff, 1))  # u_t * phi -> damping bilinear (u, phi)
             else:
-                stiff_terms.append(_term(coeff))  # spatial operator + load
-    for tag, exprs in boundary_terms.items():
-        for bare in exprs:
-            for sign, sub in _split_additive_terms(domain, bare):
-                stiff_terms.append(_term(_apply_sign(domain, sign, sub), region_id=tag, support="boundary"))
+                stiff_raw.append(coeff)  # spatial operator + load
 
-    if not mass2_terms:
+    if not mass2_raw:
         raise ValueError("jno.fem: second-order route found no `u_tt * phi` mass term.")
 
-    def _ir(terms):
-        return LoweredWeakForm(domain=domain, terms=terms)
+    # Raw (no-Dirichlet) physics blocks assembled natively; the mass/damping bilinears (`u*phi`,
+    # which carry no gradient to anchor field inference on their own) are assembled here in the same
+    # preprocessed-term context the dispatch produced, where the field is established. Dirichlet is
+    # applied explicitly to the 2N augmented system below (row replacement, columns kept).
+    def _native_matrix(terms, bterms):
+        op, _mode, _offs = assemble_fem_native(domain, terms, bterms, [], [], vec=vec, quad_degree=quad_degree)
+        return jnp.asarray(op[0]), jnp.asarray(op[1]).reshape(-1)
 
-    # Raw (no-Dirichlet) physics blocks; Dirichlet is applied explicitly to the 2N system below
-    # (non-symmetric row replacement, as the first-order transient does -- keep columns, replace rows).
-    M2 = jnp.asarray(
-        _dense_array(
-            _assemble_fem_system_from_ir(domain, _ir(mass2_terms), apply_dirichlet=False, store_on_domain=False)[0]
-        )
-    )
+    M2, _ = _native_matrix(mass2_raw, {})
     n = int(M2.shape[0])
     dtype = M2.dtype
-    C = (
-        jnp.asarray(
-            _dense_array(
-                _assemble_fem_system_from_ir(domain, _ir(damp_terms), apply_dirichlet=False, store_on_domain=False)[0]
-            )
-        )
-        if damp_terms
-        else jnp.zeros((n, n), dtype=dtype)
-    )
-    K_raw, F_raw = _assemble_fem_system_from_ir(domain, _ir(stiff_terms), apply_dirichlet=False, store_on_domain=False)
-    K = jnp.asarray(_dense_array(K_raw))
-    F = jnp.asarray(F_raw).reshape(-1)
-    # Dirichlet-applied stiffness: its load carries the prescribed value g on the Dirichlet rows,
-    # and it leaves the feax problem on the domain (so fem.points / fem.dofs resolve).
-    _, F_bc = _assemble_fem_system_from_ir(domain, _ir(stiff_terms))
-    F_bc = jnp.asarray(F_bc).reshape(-1)
+    C = _native_matrix(damp_raw, {})[0] if damp_raw else jnp.zeros((n, n), dtype=dtype)
+    K, F = _native_matrix(stiff_raw, boundary_terms)  # spatial operator (K) + load (F), Neumann in K/F
 
-    bc = getattr(domain, "_feax_bc", None)
-    rows = jnp.asarray(getattr(bc, "bc_rows", np.zeros((0,), dtype=int))).reshape(-1).astype(int)
-    g = F_bc[rows] if int(rows.shape[0]) else F_bc[:0]
+    # Dirichlet (dof, value) pairs from the native assembler (it stashes them); the augmented block
+    # below reads u[d]=g on the displacement rows and v[d]=0 on the velocity rows.
+    assemble_fem_native(domain, stiff_raw, boundary_terms, dirichlet_raw, [], vec=vec, quad_degree=quad_degree)
+    pairs = list(getattr(domain, "_fem_native_dirichlet_pairs", []) or [])
+    rows = jnp.asarray([p[0] for p in pairs], dtype=int) if pairs else jnp.zeros((0,), dtype=int)
+    g = jnp.asarray([p[1] for p in pairs], dtype=dtype) if pairs else jnp.zeros((0,), dtype=dtype)
 
     # ---- compose the 2N augmented system M_aug y' + A_aug y = c_aug, y = [u; v] ----
     Z = jnp.zeros((n, n), dtype=dtype)
@@ -2044,12 +2008,9 @@ def _assemble_second_order_time(
         c_aug = c_aug.at[rows].set(g).at[rows + n].set(0.0)
 
     # ---- initial state y0 = [u0; v0] from the displacement and (optional) velocity ICs ----
-    prob = getattr(domain, "_feax_problem", None)
-    pts = (
-        jnp.asarray(prob.mesh[0].points)[:, : domain.dimension]
-        if prob is not None
-        else jnp.asarray(domain.mesh.points)[:, : domain.dimension]
-    )
+    # The IC is sampled at the native assembly DOF coordinates (vertices + P2 edge-midpoints), which
+    # the native assembler stashed; ``n = N*vec`` flattens node-major, matching the block layout.
+    pts = jnp.asarray(getattr(domain, "_fem_native_dof_points", domain.mesh.points))[:, : domain.dimension]
     u0 = jnp.zeros((n,), dtype)
     v0 = jnp.zeros((n,), dtype)
     for ic in ic_residuals:
@@ -2059,6 +2020,8 @@ def _assemble_second_order_time(
         else:
             u0 = val
     state0 = jnp.concatenate([u0, v0])
+
+    domain._feax_problem = None  # native owns this domain's FE state -> FEM.points reads the native DOFs
 
     t0, t1, dt = _infer_time_window(domain)
     block = FeaxTimeBlock(
@@ -2073,7 +2036,7 @@ def _assemble_second_order_time(
         t0=t0,
         t1=t1,
         dt=dt,
-        feax_context=getattr(domain, "_feax_context", {}) or {},
+        feax_context={},
         metadata={"theta": 0.5, "second_order": True},
     )
     return FEM(domain=domain, op=block, classification=classification, mode="transient", offsets=[0, n, 2 * n])

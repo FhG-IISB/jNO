@@ -857,6 +857,9 @@ def assemble_fem_native(
                 comps_range = range(vt) if comp is None else [int(comp)]
                 for c in comps_range:
                     pairs.append((offs[fidx] + nid * vt + c, g))
+        # Expose the (dof, value) pairs for callers that compose their own system from native blocks
+        # (e.g. the second-order-in-time augmented [u, v] block applies them to the 2N system itself).
+        domain._fem_native_dirichlet_pairs = pairs
         return pairs
 
     # -------------------------------------------------------------------------

@@ -81,6 +81,7 @@ def _trajectory(fem, theta=None):
 # ==========================================================================
 def test_second_order_routes_to_transient_augmented_block():
     fem = _wave_fem(mesh_size=0.2, n_periods=1, n_steps=10)
+    assert fem.problem is None  # the M2/C/K/F blocks are assembled natively (no feax problem)
     assert fem.is_transient and fem.is_linear
     n = fem.offsets[1]
     assert fem.offsets == [0, n, 2 * n]  # y = [u; v]
