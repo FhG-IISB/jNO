@@ -1528,6 +1528,32 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             )
             return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs))
 
+    # ---- native complex (steady, single field): the Re/Im-coefficient split, assembled natively, so
+    # the real-equivalent block needs no feax. ``Re(c·T) = Re(c)·T`` for a real FE trial/test ``T``, so
+    # wrapping each term in ``.real`` / ``.imag`` gives two ordinary real systems A_r/b_r and A_i/b_i;
+    # FEM.solve() forms ``[[A_r, -A_i], [A_i, A_r]]`` and recombines to a complex ``u``. A complex
+    # *inverse* (runtime parameter) and the complex *transient* (Schrodinger) path stay on feax below. ----
+    if (
+        not is_vpinn
+        and _is_complex_form(domain, ir)
+        and not is_transient
+        and not periodic_ties
+        and _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
+        and not any(_crp(b) for b in weak_bares)
+    ):
+        from .utils.solver.fem_native import assemble_fem_native
+
+        real_bd = {tag: [e.real for e in exprs] for tag, exprs in boundary_terms.items()}
+        imag_bd = {tag: [e.imag for e in exprs] for tag, exprs in boundary_terms.items()}
+        domain._feax_problem = None
+        op_r, _mode_r, offs = assemble_fem_native(
+            domain, [b.real for b in volume_terms], real_bd, dirichlet_raw, [], vec=vec or 1, quad_degree=quad_degree
+        )
+        op_i, _mode_i, _offs_i = assemble_fem_native(
+            domain, [b.imag for b in volume_terms], imag_bd, dirichlet_raw, [], vec=vec or 1, quad_degree=quad_degree
+        )
+        return _finalize(FEM(domain=domain, op=(op_r, op_i), classification=classification, mode="complex", offsets=offs))
+
     # ---- quadrature + BC setup -- feax-routed paths (complex / periodic / 3D / field-parameter /
     # time-varying-Dirichlet / transient-parametric) and VPINN. VPINN on a 2D Lagrange mesh uses the
     # native (feax-free) fem_context (its assembly is feax-independent and reads only fem_context);

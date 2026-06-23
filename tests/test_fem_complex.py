@@ -53,6 +53,7 @@ def test_complex_helmholtz_real_equivalent_recovers_manufactured():
 
     fem = jno.fem([c * (ui.x * vi.x + ui.y * vi.y) + d_coef * (u * vi) - f * vi])
     assert fem.is_complex
+    assert fem.problem is None  # the Re/Im real systems are assembled natively (no feax problem)
 
     u_num = np.asarray(fem.solve())
     assert np.iscomplexobj(u_num)
@@ -90,6 +91,7 @@ def test_pml_helmholtz_absorbs_reflection_free():
     fem, u1, pts = solve_pml(40.0)
     _, u2, _ = solve_pml(60.0)  # 1.5x absorber strength, fresh mesh
     assert fem.is_complex and np.iscomplexobj(u1) and not bool(np.isnan(u1).any())
+    assert fem.problem is None  # native real-equivalent assembly (Dirichlet wall included), no feax
 
     core = (pts[:, 0] > w) & (pts[:, 0] < L - w) & (pts[:, 1] > w) & (pts[:, 1] < L - w)
     sigma_insens = float(np.linalg.norm(u1[core] - u2[core]) / np.linalg.norm(u1[core]))
