@@ -2180,32 +2180,6 @@ def _assemble_multifield_transient(domain, ir, fields, field_index, ic_residuals
 # ---------------------------------------------------------------------------
 # Regularization for nodal field parameters (jno.np.parameter(phi))
 # ---------------------------------------------------------------------------
-def _lower_volume_form(domain: Any, expr: Any):
-    """Lower one scalar **volume** weak form to a ``LoweredWeakForm`` (no ``init_fem``)."""
-    from .utils.solver.weak_form import (
-        LoweredChannelTerm,
-        LoweredWeakForm,
-        _apply_sign,
-        _split_additive_terms,
-    )
-
-    terms: List[Any] = []
-    for sign, sub in _split_additive_terms(domain, _bare(expr)):
-        terms.append(
-            LoweredChannelTerm(
-                sign=sign,
-                support="volume",
-                region_id="volume",
-                channel="raw",
-                coeff=_apply_sign(domain, sign, sub),
-                variable_id=0,
-                value_shape=(),
-                original_expr=sub,
-            )
-        )
-    return LoweredWeakForm(domain=domain, terms=terms)
-
-
 def _fe_symbols_bound(domain: Any):
     """``(ui, vi, axes)`` -- P1 trial/test bound to the domain's interior coordinates."""
     u_sym, v_sym = domain.fem_symbols()
@@ -2222,8 +2196,11 @@ def _assemble_fe_gram(domain: Any, kind: str = "stiffness"):
 
     * ``'stiffness'`` -> ``L = integral grad(phi_i).grad(phi_j)``  (``k^T L k = integral |grad k|^2``)
     * ``'mass'``      -> ``M = integral phi_i phi_j``              (``k^T M k = integral k^2``)
+
+    Assembled natively (no feax): the bilinear form is retagged to the quadrature pool and run through
+    ``assemble_fem_native`` with no Dirichlet, giving the raw Gram matrix on the field's P1 nodes.
     """
-    from .utils.solver.fem_route import _assemble_fem_system_from_ir
+    from .utils.solver.fem_native import assemble_fem_native
 
     ui, vi, axes = _fe_symbols_bound(domain)
     if kind == "stiffness":
@@ -2235,8 +2212,11 @@ def _assemble_fe_gram(domain: Any, kind: str = "stiffness"):
         form = ui * vi
     else:
         raise ValueError(f"_assemble_fe_gram: unknown kind {kind!r}")
-    ir = _lower_volume_form(domain, form)
-    A, _b = _assemble_fem_system_from_ir(domain, ir, apply_dirichlet=False, store_on_domain=False)
+    bare = _bare(form)
+    _retag_coords_for_quadrature(bare, "volume", "volume")
+    qd = int(getattr(domain, "_fem_quad_degree", 0) or 2)
+    op, _mode, _offs = assemble_fem_native(domain, [bare], {}, [], [], vec=1, quad_degree=qd)
+    A = op[0]
     return jnp.asarray(A.todense() if hasattr(A, "todense") else A)
 
 
@@ -2246,20 +2226,23 @@ def _assemble_h1_stiffness(domain: Any):  # back-compat alias
 
 def _fe_element_gradient_data(domain: Any):
     """``(shape_grads, JxW, cells)`` for the domain's P1 space -- per-element gradient
-    geometry for total variation ``integral |grad k|``. Built standalone (no clobber)."""
-    from .utils.solver.feax_utils import _build_feax_problem
+    geometry for total variation ``integral |grad k|``. Built natively (no feax) from the native
+    fem_context, which carries the physical shape gradients and ``JxW`` per element."""
+    from .utils.solver.fem_native import build_native_fem_context
 
-    ui, vi, axes = _fe_symbols_bound(domain)
-    form = None
-    for ax in axes:
-        t = getattr(ui, ax) * getattr(vi, ax)
-        form = t if form is None else form + t
-    ir = _lower_volume_form(domain, form)
-    problem, _bc = _build_feax_problem(domain, ir, apply_dirichlet=False, store_on_domain=False)
+    dim = int(domain.dimension)
+    cells = np.asarray(domain.mesh.cells_dict["triangle" if dim == 2 else "tetra"])
+    n_cells, n_local = cells.shape
+    qd = int(getattr(domain, "_fem_quad_degree", 0) or 2)
+    ctx, _qp, _sq, _sn = build_native_fem_context(
+        domain, element_type="TRI3" if dim == 2 else "TET4", quad_degree=qd, vec=1
+    )
+    dN = jnp.asarray(ctx["dN_dx_flat"])  # (n_cells*n_q, n_local, dim)
+    n_q = int(dN.shape[0]) // n_cells
     return (
-        jnp.asarray(problem.shape_grads),
-        jnp.asarray(problem.JxW),
-        jnp.asarray(problem.fes[0].cells),
+        dN.reshape(n_cells, n_q, n_local, dim),  # (n_cells, n_quad, n_local, dim)
+        jnp.asarray(ctx["JxW"]),  # (n_cells, n_quad)
+        jnp.asarray(cells),
     )
 
 
