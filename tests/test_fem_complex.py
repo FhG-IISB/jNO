@@ -125,6 +125,7 @@ def test_complex_transient_recovers_mode_and_conserves_schrodinger_norm():
     # complex diffusion: decay + oscillation, checked against the analytic mode
     fem, traj, pts = solve(0.5 + 1j)
     assert fem.is_complex and fem.is_transient and np.iscomplexobj(traj)
+    assert fem.problem is None  # M_r/A_r and M_i=0/A_i blocks are assembled natively (no feax)
     t1 = float(fem.t1)
     mode = np.sin(PI * pts[:, 0]) * np.sin(PI * pts[:, 1])
     analytic = np.exp(-(0.5 + 1j) * 2 * PI**2 * t1) * mode

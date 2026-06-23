@@ -1554,6 +1554,80 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         )
         return _finalize(FEM(domain=domain, op=(op_r, op_i), classification=classification, mode="complex", offsets=offs))
 
+    # ---- native complex transient (e.g. Schrodinger i u_t = H u): the real-equivalent block, assembled
+    # natively. Split the volume terms into the mass (u_t) terms and the spatial terms FIRST -- the mass
+    # is real (a real density), so a single steady assembly of the stripped mass gives M (and M_i = 0);
+    # the spatial operator's Re/Im parts give A_r, A_i (with the Dirichlet rows handled). The complex IC
+    # splits Re/Im across the two blocks. (A complex *mass* coefficient is rejected below.) ----
+    if (
+        not is_vpinn
+        and is_transient
+        and _is_complex_form(domain, ir)
+        and not periodic_ties
+        and not multifield
+        and _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
+        and not any(_crp(b) for b in weak_bares)
+        and not any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw)
+    ):
+        from .utils.solver.backend_blocks import FeaxTimeBlock as _FTB
+        from .utils.solver.fem_native import assemble_fem_native
+        from .utils.solver.time_route import _infer_time_window, _strip_temporal_trial_derivative
+        from .utils.solver.weak_form import _apply_sign, _split_additive_terms
+
+        mass_stripped, spatial_raw = [], []
+        for bare in volume_terms:
+            for sign, sub in _split_additive_terms(domain, bare):
+                coeff = _apply_sign(domain, sign, sub)
+                if _contains_temporal_derivative(sub):
+                    mass_stripped.append(_strip_temporal_trial_derivative(coeff))
+                else:
+                    spatial_raw.append(coeff)
+        real_bd = {tag: [e.real for e in exprs] for tag, exprs in boundary_terms.items()}
+        imag_bd = {tag: [e.imag for e in exprs] for tag, exprs in boundary_terms.items()}
+        domain._feax_problem = None
+        # Mass (real): a steady assembly of the stripped u_t * phi term -> M (raw, no Dirichlet).
+        (M_raw, _bm), _mm, offs = assemble_fem_native(
+            domain, mass_stripped, {}, [], [], vec=vec or 1, quad_degree=quad_degree
+        )
+        # Spatial Re/Im parts, with the Dirichlet conditions applied to each block.
+        (A_r, c_r), _mr, _o1 = assemble_fem_native(
+            domain, [s.real for s in spatial_raw], real_bd, dirichlet_raw, [], vec=vec or 1, quad_degree=quad_degree
+        )
+        (A_i, c_i), _mi, _o2 = assemble_fem_native(
+            domain, [s.imag for s in spatial_raw], imag_bd, dirichlet_raw, [], vec=vec or 1, quad_degree=quad_degree
+        )
+        M = jnp.asarray(M_raw)
+        n = int(M.shape[0])
+        d_pairs = list(getattr(domain, "_fem_native_dirichlet_pairs", []) or [])
+        d_dofs = jnp.asarray([p[0] for p in d_pairs], dtype=jnp.int32) if d_pairs else jnp.zeros((0,), jnp.int32)
+        M_bc = M.at[d_dofs, :].set(0.0)  # a constrained dof carries no time derivative
+        pts = jnp.asarray(domain._fem_native_dof_points)
+        s0 = (
+            jnp.asarray(_ic_value_at_nodes(_bare(ic_residuals[0]), domain, pts, n, vec or 1))
+            if ic_residuals
+            else jnp.zeros((n,), jnp.complex128)
+        )
+        t0, t1, dt = _infer_time_window(domain)
+        _common = dict(
+            backend="feax_time",
+            mode="implicit",
+            time_order=1,
+            spatial_kind="weak_form",
+            t0=t0,
+            t1=t1,
+            dt=dt,
+            feax_context={},
+        )
+        block_r = _FTB(M=M_bc, A=jnp.asarray(A_r), affine_bias=jnp.asarray(c_r).reshape(-1), state0=jnp.real(s0), **_common)
+        block_i = _FTB(
+            M=jnp.zeros((n, n), M.dtype),
+            A=jnp.asarray(A_i),
+            affine_bias=jnp.asarray(c_i).reshape(-1),
+            state0=jnp.imag(s0),
+            **_common,
+        )
+        return _finalize(FEM(domain=domain, op=(block_r, block_i), classification=classification, mode="complex_transient"))
+
     # ---- quadrature + BC setup -- feax-routed paths (complex / periodic / 3D / field-parameter /
     # time-varying-Dirichlet / transient-parametric) and VPINN. VPINN on a 2D Lagrange mesh uses the
     # native (feax-free) fem_context (its assembly is feax-independent and reads only fem_context);
