@@ -2760,7 +2760,20 @@ class domain(MeshIOMixin):
         angles = np.arctan2(pts[:, 1] - centroid[1], pts[:, 0] - centroid[0])
         return np.argsort(angles)
 
-    def enclosure(self, tags, *, axisymmetric=False, n_quad=3, opaque_tags=None):
+    def enclosure(
+        self,
+        tags,
+        *,
+        axisymmetric=False,
+        n_quad=3,
+        n_phi=16,
+        opaque_tags=None,
+        medium_tags=None,
+        enforce_closure=False,
+        closure_iters=200,
+        occlude=True,
+        inward=False,
+    ):
         """Build an :class:`~jno.domain.enclosure.Enclosure` from radiating boundary ``tags``.
 
         Discretises the listed boundary surfaces into mesh-edge **elements** (aligned to FEM nodes) and
@@ -2775,10 +2788,31 @@ class domain(MeshIOMixin):
             axisymmetric: Treat the 2D mesh as a meridional ``(r, z)`` half-plane (bodies of revolution).
             n_quad: Gauss points per element for the double-area view-factor quadrature.
             opaque_tags: Optional boundary tags that block rays (occluders) without radiating.
+            medium_tags: Optional transparent (meshed) medium regions, by geometry-part name. When given,
+                ``tags`` are solid geometry-part names and the radiating elements are the internal
+                solid|medium **interface** edges (the common furnace case where the gas/air gap is meshed),
+                with normals pointing out of the solid into the medium. When ``None`` (default), the
+                radiating elements are domain **boundary** edges on ``tags`` (an un-meshed/vacuum gap).
+            inward: Boundary mode only. When ``True``, element normals point *into* the meshed domain —
+                use when the radiating ``tags`` are the outer walls of a **meshed cavity** (an oven /
+                furnace filled with a transparent fluid) and radiation crosses the meshed interior, so
+                the facing walls see one another. Default ``False`` (normals out of the mesh, vacuum gap).
         """
         from .enclosure import build_enclosure
 
-        return build_enclosure(self, tags, axisymmetric=axisymmetric, n_quad=n_quad, opaque_tags=opaque_tags)
+        return build_enclosure(
+            self,
+            tags,
+            axisymmetric=axisymmetric,
+            n_quad=n_quad,
+            n_phi=n_phi,
+            opaque_tags=opaque_tags,
+            medium_tags=medium_tags,
+            enforce_closure=enforce_closure,
+            closure_iters=closure_iters,
+            occlude=occlude,
+            inward=inward,
+        )
 
     def compute_enclosure_view_factor(self, tags, opaque_tags=None):
         """Compute view factors over a combined radiation enclosure.

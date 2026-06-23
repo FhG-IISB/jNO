@@ -286,6 +286,57 @@ def test_enclosure_handle_concentric_cylinders():
     assert np.allclose(eps[mi], 0.8) and np.allclose(eps[mo], 0.6)
 
 
+def test_enclosure_handle_square_cavity_inward():
+    """``d.enclosure(..., inward=True)`` builds the enclosure for a *meshed* cavity (an oven: the air
+    inside is the mesh, the four walls are the outer boundary). Radiation then crosses the meshed
+    interior, so element normals must point INTO the mesh. Validates the 2D square view factors
+    (opposite walls F = sqrt(2)-1, adjacent walls F = (2-sqrt(2))/2, flat self-view 0) and that the
+    default (outward) normals fail closure -- the case that motivated the flag."""
+    import jno
+
+    pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
+    from shapely.geometry import box
+
+    L = 1.0
+    d = jno.domain(box(0, 0, L, L), mesh_size=0.05)
+    d.tag("hot", lambda x, y: x < 1e-6)
+    d.tag("cold", lambda x, y: x > L - 1e-6)
+    d.tag("bottom", lambda x, y: y < 1e-6)
+    d.tag("top", lambda x, y: y > L - 1e-6)
+    walls = ["hot", "cold", "top", "bottom"]
+
+    gap = d.enclosure(walls, inward=True)
+    gap.check()  # closure + reciprocity gate must pass for the closed square enclosure
+    closure, recip = gap.quality()
+    assert closure < 5e-2 and recip < 1e-10
+
+    F = np.asarray(gap.view_factor)
+    A = np.asarray(gap.areas)
+    tags = np.asarray(gap.element_tags)
+
+    def s2s(a, b):  # area-weighted surface-to-surface view factor (mean over receivers in a)
+        ia, ib = tags == a, tags == b
+        return float((A[ia, None] * F[np.ix_(ia, ib)]).sum() / A[ia].sum())
+
+    f_opp = 0.5 * (s2s("hot", "cold") + s2s("top", "bottom"))  # opposite walls
+    f_adj = 0.25 * (s2s("hot", "top") + s2s("hot", "bottom") + s2s("cold", "top") + s2s("cold", "bottom"))
+    assert abs(f_opp - (np.sqrt(2) - 1)) < 1e-2, (
+        f"opposite-wall F should be sqrt(2)-1={np.sqrt(2) - 1:.4f}, got {f_opp:.4f}"
+    )
+    assert abs(f_adj - (2 - np.sqrt(2)) / 2) < 2e-2, (
+        f"adjacent-wall F should be {(2 - np.sqrt(2)) / 2:.4f}, got {f_adj:.4f}"
+    )
+    assert s2s("hot", "hot") < 1e-6, "a flat wall cannot see itself"
+    assert abs(F.sum(axis=1) - 1.0).max() < 5e-2, "closed enclosure: row sums -> 1"
+
+    # default (outward) normals are wrong for a meshed cavity: the walls face away from each other,
+    # so no element sees another and the enclosure fails the closure gate.
+    bad = d.enclosure(walls)
+    assert np.asarray(bad.view_factor).max() < 1e-6, "outward normals must yield zero view factors here"
+    with pytest.raises(ValueError, match="closure"):
+        bad.check()
+
+
 def test_coupled_conduction_radiation_concentric_cylinders():
     """End-to-end: steady conduction in two solid rings + grey-body radiation across the vacuum gap,
     coupled, matches the closed-form two-surface series solution

@@ -1006,8 +1006,11 @@ class MeshUtils:
         return F
 
     @staticmethod
-    def get_view_factor_axisymmetric_element(E0, E1, Nrm, VM, n_quad: int = 3, n_phi: int = 16):
+    def get_view_factor_axisymmetric_element(E0, E1, Nrm, VM, n_quad: int = 3, n_phi: int = 16, r_min: float = 0.0):
         r"""Element-based axisymmetric view-factor matrix ``F[i, j]`` for a body of revolution.
+
+        ``r_min`` softens the near-field ``1/R^2`` singularity (``R^2 -> R^2 + r_min^2``); set it to a
+        fraction of the element size to keep close/coincident element pairs finite (else they blow up).
 
         Each element is a meridional segment ``[E0_k, E1_k]`` in the ``(r, z)`` half-plane (a frustum
         ring when revolved), with constant normal ``Nrm_k`` pointing into the enclosure. The exchange
@@ -1053,7 +1056,7 @@ class MeshUtils:
         dx = r_j * jnp.cos(phi_m) - r_i
         dy = r_j * jnp.sin(phi_m)
         dz = z_j - z_i
-        R2 = dx**2 + dy**2 + dz**2
+        R2 = dx**2 + dy**2 + dz**2 + r_min**2
         R = jnp.sqrt(R2 + 1e-30)
         cos_i = jnp.maximum(0.0, (nr_i * dx + nz_i * dz) / R)
         cos_j = jnp.maximum(0.0, -(nr_j * jnp.cos(phi_m) * dx + nr_j * jnp.sin(phi_m) * dy + nz_j * dz) / R)
