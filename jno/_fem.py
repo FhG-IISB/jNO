@@ -1168,6 +1168,59 @@ def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, cells: 
     return build_periodic_prolongation(points, pairs, faces, vec=vec, facets=facets)
 
 
+def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
+    """Reduce a native transient ``FeaxTimeBlock`` by the periodic prolongation ``P`` and return a
+    reduced block that carries ``P`` for prolongation (``u_full = P u_red``).
+
+    Galerkin reduction is applied to every populated payload: ``M -> P^T M P``, a constant
+    ``A -> P^T A P``, a runtime ``operator_fn(t, args) -> P^T A(t, args) P`` (so the reduction
+    composes with re-assembly and stays differentiable in ``args``), the loads ``affine_bias`` and
+    ``forcing_vector_fn(t, args) -> P^T(...)``, and the initial state is restricted to the master
+    DOFs. Linear blocks only -- a nonlinear periodic transient is rejected loudly (the periodic
+    reduction of a matrix-free Newton residual is a separate, unbuilt path)."""
+    import dataclasses
+
+    from .utils.solver.feax_utils import reduce_matrix, reduce_vector, restrict_state
+
+    if block.is_nonlinear():
+        raise NotImplementedError(
+            "jno.fem: a nonlinear periodic transient is not supported natively yet -- the periodic "
+            "reduction is wired only for the linear time block. Write it as a first-order linear "
+            "system, or drop the periodic tie."
+        )
+    P = jnp.asarray(periodic["P"])
+    kept, pvec = periodic["kept_nodes"], periodic["vec"]
+
+    def _dn(x):
+        return jnp.asarray(x.todense()) if hasattr(x, "todense") else jnp.asarray(x)
+
+    op_red = None
+    if block.operator_fn is not None:
+
+        def op_red(t, args=None, _P=P, _op=block.operator_fn):
+            return reduce_matrix(_P, _dn(_op(t, args)))
+
+    f_red = None
+    if block.forcing_vector_fn is not None:
+
+        def f_red(t, args=None, _P=P, _f=block.forcing_vector_fn):
+            return reduce_vector(_P, jnp.asarray(_f(t, args)).reshape(-1))
+
+    meta = dict(getattr(block, "metadata", None) or {})
+    meta.update(periodic=True, full_state_size=int(P.shape[0]), reduced_state_size=int(P.shape[1]))
+    return dataclasses.replace(
+        block,
+        M=reduce_matrix(P, _dn(block.M)),
+        A=reduce_matrix(P, _dn(block.A)) if block.A is not None else None,
+        operator_fn=op_red,
+        affine_bias=reduce_vector(P, jnp.asarray(block.affine_bias).reshape(-1)) if block.affine_bias is not None else None,
+        forcing_vector_fn=f_red,
+        state0=restrict_state(P, jnp.asarray(block.state0).reshape(-1), kept, pvec),
+        prolongation=P,
+        metadata=meta,
+    )
+
+
 # ---------------------------------------------------------------------------
 # the driver
 # ---------------------------------------------------------------------------
@@ -1627,6 +1680,46 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             **_common,
         )
         return _finalize(FEM(domain=domain, op=(block_r, block_i), classification=classification, mode="complex_transient"))
+
+    # ---- native periodic transient (scalar single-field, linear, incl. runtime-parametric): assemble
+    # the full native transient block, build the prolongation P from the native assembly mesh, then
+    # reduce the block (P^T M P, P^T·operator_fn·P, ...). The reduced block carries P, so its trajectory
+    # prolongs back with u = P u_red. Vector / coupled / nonlinear periodic transient stay on feax. ----
+    if (
+        not is_vpinn
+        and periodic_ties
+        and is_transient
+        and not multifield
+        and (vec or 1) == 1
+        and _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
+        and not _is_complex_form(domain, ir)
+        and not any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw)
+    ):
+        from .utils.solver.fem_native import assemble_fem_native
+
+        domain._feax_problem = None
+        op, mode, offs = assemble_fem_native(
+            domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=1, quad_degree=quad_degree
+        )
+        if mode != "transient":
+            # fail loud rather than silently mis-reduce a steady/nonlinear op as a time block
+            raise NotImplementedError(
+                f"jno.fem: native periodic transient expected a transient block but assembled mode={mode!r}."
+            )
+        periodic = _build_periodic_reduction(
+            domain,
+            periodic_ties,
+            domain._fem_native_dof_points,
+            domain._fem_native_assembly_cells,
+            int(getattr(domain, "_fem_native_assembly_order", 1)),
+            1,
+        )
+        reduced = _reduce_transient_block_periodic(op, periodic)
+        fem_obj = FEM(domain=domain, op=reduced, classification=classification, mode="transient", offsets=offs)
+        # The time block is already reduced and carries P (transient solve() uses the block directly);
+        # expose the reduction on the FEM too, mirroring the steady periodic path (P / n_red / n_full).
+        fem_obj._periodic = periodic
+        return fem_obj
 
     # ---- quadrature + BC setup -- feax-routed paths (complex / periodic / 3D / field-parameter /
     # time-varying-Dirichlet / transient-parametric) and VPINN. VPINN on a 2D Lagrange mesh uses the

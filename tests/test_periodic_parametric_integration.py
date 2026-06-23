@@ -19,7 +19,7 @@ The analytical reference is the separable periodic heat mode
 
 import pytest
 
-pytest.importorskip("feax", reason="feax required for periodic / parametric route tests")
+pytest.importorskip("shapely", reason="shapely required for the box domain")
 
 import jax
 import jax.numpy as jnp
@@ -61,63 +61,57 @@ PASS_TOL = 0.05  # P1 + backward-Euler discretisation error is a few %
 # ============================================================
 
 
+_FACES = {
+    "left": lambda x, y: x < 1e-6,
+    "right": lambda x, y: x > 1 - 1e-6,
+    "bottom": lambda x, y: y < 1e-6,
+    "top": lambda x, y: y > 1 - 1e-6,
+}
+
+
 def make_periodic_domain():
-    """Structured (periodic-compatible) rectangular domain on [0,1]^2."""
-    return jno.domain(
+    """Structured (periodic-compatible) rectangular domain on [0,1]^2, with each face named via
+    ``domain.tag`` -- required for multi-direction periodicity so the shared corners are recovered."""
+    dom = jno.domain(
         constructor=jno.domain.equi_distant_rect(x_range=(0.0, 1.0), y_range=(0.0, 1.0), nx=N_GRID, ny=N_GRID),
         time=(0.0, T_END, N_TIME),
         compute_mesh_connectivity=False,
     )
-
-
-def init_periodic_fem(dom):
-    dom.init_fem(
-        element_type="TRI3",
-        quad_degree=3,
-        bcs=[dom.periodic(("left", "right"), ("bottom", "top"))],
-        fem_solver=True,
-    )
+    for nm, pred in _FACES.items():
+        dom.tag(nm, pred)
     return dom
 
 
-def periodic_state0(dom):
-    xy = np.asarray(dom.mesh.points)[:, :2]
-    u0 = np.sin(TWO_PI * xy[:, 0]) * np.sin(TWO_PI * xy[:, 1])
-    return jnp.asarray(u0, dtype=jnp.float32)
-
-
 def build_periodic_heat_block(dom, kind):
-    """kind in {'affine', 'nonaffine'}; returns (block, args)."""
+    """Doubly-periodic heat ``u_t = nu * lap u`` (periodic in x and y), authored through ``jno.fem``
+    (the sole entry -- no ``init_fem`` / ``weak.assemble``). ``kind`` in {'affine', 'nonaffine'};
+    returns ``(block, args)`` where ``block = fem.operator`` is the periodic-reduced time block."""
     u, phi = dom.fem_symbols()
-    xg, yg, tg = dom.variable("fem_gauss", split=True)
-    u_t = jnn.grad(u, tg)
-    ux = jnn.grad(u, xg)
-    uy = jnn.grad(u, yg)
-    phix = jnn.grad(phi, xg)
-    phiy = jnn.grad(phi, yg)
-    diffusion = ux * phix + uy * phiy
+    xi, yi, ti = dom.variable("interior", split=True)
+    ci = dom.variable("initial", split=True)
+    xl, yl, _ = dom.variable("left", split=True)
+    xr, yr, _ = dom.variable("right", split=True)
+    xb, yb, _ = dom.variable("bottom", split=True)
+    xt, yt, _ = dom.variable("top", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    diffusion = ui.x * vi.x + ui.y * vi.y
+    ic = jnn.sin(TWO_PI * ci[0]) * jnn.sin(TWO_PI * ci[1])
 
     if kind == "affine":
         nu = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="nu")
         nu.initialize(jax.nn.initializers.constant(NU))
-        weak = u_t * phi + nu * diffusion
+        weak = ui.t * vi + nu * diffusion
         args = {"nu": NU}
     elif kind == "nonaffine":
         logk = jno.np.parameter((1,), key=jax.random.PRNGKey(0), name="logk")
         logk.initialize(jax.nn.initializers.constant(float(np.log(NU))))
-        weak = u_t * phi + jno.np.exp(logk) * diffusion  # parameter inside exp
+        weak = ui.t * vi + jno.np.exp(logk) * diffusion  # parameter inside exp
         args = {"logk": float(np.log(NU))}
     else:
         raise ValueError(kind)
 
-    block = weak.assemble(
-        dom,
-        target="fem_time",
-        linear=True,
-        state0=periodic_state0(dom),
-        mode="implicit",
-    )
-    return block, args
+    fem = jno.fem([weak, u(xl, yl) - u(xr, yr), u(xb, yb) - u(xt, yt), u(ci[0], ci[1]) - ic])
+    return fem.operator, args
 
 
 def analytical(mesh_xy, save_ts):
@@ -132,15 +126,11 @@ def relative_l2(pred, true):
     return float(np.linalg.norm(pred - true) / (np.linalg.norm(true) + 1e-12))
 
 
-def prolongation(dom):
-    return jnp.asarray(dom._feax_context["P"])
-
-
 def solve_transient(dom, block, args, save_ts):
     """Integrate the reduced periodic block with jNO's default backward-Euler stepper, then
-    prolong (u_full = P u_red) to compare against the analytical solution. (The diffrax / feax
-    pipeline integrators are gone; the flat block + the default stepper cover this.)"""
-    P = prolongation(dom)
+    prolong (``u_full = P u_red``) to compare against the analytical solution. ``P`` lives on the
+    block itself (the native periodic reduction attaches it as ``block.prolongation``)."""
+    P = jnp.asarray(block.prolongation)
     ys = _default_transient_integrate(block, args, jnp.asarray(save_ts))
     return np.asarray(jnp.asarray(ys) @ P.T)
 
@@ -151,26 +141,23 @@ def solve_transient(dom, block, args, save_ts):
 
 
 class TestPeriodicReductionStructure:
-    def test_init_fem_builds_prolongation_and_reduces_dofs(self):
-        dom = init_periodic_fem(make_periodic_domain())
+    def test_block_carries_prolongation_and_reduces_dofs(self):
+        dom = make_periodic_domain()
+        block, _ = build_periodic_heat_block(dom, "affine")
 
-        assert "P" in dom._feax_context
-        assert "periodic" in dom._feax_context
-
-        P = np.asarray(dom._feax_context["P"])
-        info = dom._feax_context["periodic"]
+        P = np.asarray(block.prolongation)
         n_full = int(np.asarray(dom.mesh.points).shape[0])
 
         assert P.ndim == 2
         assert P.shape[0] == n_full  # full rows
         assert P.shape[1] < n_full  # reduced columns
-        assert info["n_full"] == n_full
-        assert info["n_red"] == P.shape[1]
+        assert block.metadata["full_state_size"] == n_full
+        assert block.metadata["reduced_state_size"] == P.shape[1]
         # Each row of P selects exactly one master DOF (partition-of-unity rows).
         assert np.allclose(P.sum(axis=1), 1.0)
 
     def test_periodic_block_carries_reduced_system_and_prolongation(self):
-        dom = init_periodic_fem(make_periodic_domain())
+        dom = make_periodic_domain()
         block, _ = build_periodic_heat_block(dom, "affine")
 
         n_full = int(np.asarray(dom.mesh.points).shape[0])
@@ -191,14 +178,14 @@ class TestPeriodicReductionStructure:
 
 class TestPeriodicAffineParameter:
     def test_affine_parameter_reported(self):
-        dom = init_periodic_fem(make_periodic_domain())
+        dom = make_periodic_domain()
         block, _ = build_periodic_heat_block(dom, "affine")
 
         assert block.operator_fn is not None
         assert "nu" in list(block.metadata.get("runtime_parameter_names", []))
 
     def test_affine_periodic_matches_analytical(self):
-        dom = init_periodic_fem(make_periodic_domain())
+        dom = make_periodic_domain()
         block, args = build_periodic_heat_block(dom, "affine")
         save_ts = np.linspace(0.0, T_END, N_TIME, dtype=np.float32)
 
@@ -214,7 +201,7 @@ class TestPeriodicAffineParameter:
 
 class TestPeriodicNonAffineParameter:
     def test_nonaffine_parameter_routed_and_reported(self):
-        dom = init_periodic_fem(make_periodic_domain())
+        dom = make_periodic_domain()
         block, _ = build_periodic_heat_block(dom, "nonaffine")
 
         assert block.operator_fn is not None
@@ -222,7 +209,7 @@ class TestPeriodicNonAffineParameter:
         assert "logk" in list(block.metadata.get("runtime_parameter_names", []))
 
     def test_nonaffine_operator_is_nonzero_at_args(self):
-        dom = init_periodic_fem(make_periodic_domain())
+        dom = make_periodic_domain()
         block, args = build_periodic_heat_block(dom, "nonaffine")
 
         A = jnp.asarray(block.operator_fn(0.0, {k: jnp.asarray(v) for k, v in args.items()}))
@@ -231,7 +218,7 @@ class TestPeriodicNonAffineParameter:
         assert float(jnp.linalg.norm(A)) > 0.0
 
     def test_nonaffine_periodic_matches_analytical(self):
-        dom = init_periodic_fem(make_periodic_domain())
+        dom = make_periodic_domain()
         block, args = build_periodic_heat_block(dom, "nonaffine")
         save_ts = np.linspace(0.0, T_END, N_TIME, dtype=np.float32)
 
@@ -242,7 +229,7 @@ class TestPeriodicNonAffineParameter:
     def test_nonaffine_operator_is_differentiable_in_parameter(self):
         """Autodiff gradient w.r.t. the non-affine parameter matches a
         4th-order finite difference (loose tol: float32 + exp nonlinearity)."""
-        dom = init_periodic_fem(make_periodic_domain())
+        dom = make_periodic_domain()
         block, _ = build_periodic_heat_block(dom, "nonaffine")
 
         def scalar(logk_val):
@@ -270,11 +257,11 @@ class TestAffineNonAffineConsistency:
     def test_affine_and_nonaffine_give_same_field(self):
         save_ts = np.linspace(0.0, T_END, N_TIME, dtype=np.float32)
 
-        dom_a = init_periodic_fem(make_periodic_domain())
+        dom_a = make_periodic_domain()
         block_a, args_a = build_periodic_heat_block(dom_a, "affine")
         ys_a = solve_transient(dom_a, block_a, args_a, save_ts)
 
-        dom_n = init_periodic_fem(make_periodic_domain())
+        dom_n = make_periodic_domain()
         block_n, args_n = build_periodic_heat_block(dom_n, "nonaffine")
         ys_n = solve_transient(dom_n, block_n, args_n, save_ts)
 
@@ -288,18 +275,31 @@ class TestAffineNonAffineConsistency:
 
 
 class TestPeriodicMeshGuard:
-    def test_unstructured_mesh_rejected_for_periodic(self):
-        """Periodic identification needs node-matched opposite faces; an
-        unstructured mesh must be rejected rather than silently mismatched."""
+    def test_multidirection_without_tag_predicates_rejected(self):
+        """Multi-direction periodicity needs each face defined via ``domain.tag(name, predicate)`` so
+        the shared corners (a slave in two directions) are recovered. Auto-generated face tags (no
+        predicate) cannot resolve the corners, so jno.fem rejects them loudly rather than silently
+        under-identifying the corners and mis-solving."""
         dom = jno.domain(
-            constructor=jno.domain.rect(mesh_size=0.3),  # unstructured pygmsh
+            constructor=jno.domain.rect(mesh_size=0.3),  # auto-generated left/right/... tags (no predicate)
             time=(0.0, T_END, N_TIME),
             compute_mesh_connectivity=False,
         )
-        with pytest.raises((ValueError, KeyError)):
-            dom.init_fem(
-                element_type="TRI3",
-                quad_degree=3,
-                bcs=[dom.periodic(("left", "right"), ("bottom", "top"))],
-                fem_solver=True,
+        u, phi = dom.fem_symbols()
+        xi, yi, ti = dom.variable("interior", split=True)
+        ci = dom.variable("initial", split=True)
+        xl, yl, _ = dom.variable("left", split=True)
+        xr, yr, _ = dom.variable("right", split=True)
+        xb, yb, _ = dom.variable("bottom", split=True)
+        xt, yt, _ = dom.variable("top", split=True)
+        ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+        ic = jnn.sin(TWO_PI * ci[0]) * jnn.sin(TWO_PI * ci[1])
+        with pytest.raises(NotImplementedError):
+            jno.fem(
+                [
+                    ui.t * vi + 0.1 * (ui.x * vi.x + ui.y * vi.y),
+                    u(xl, yl) - u(xr, yr),
+                    u(xb, yb) - u(xt, yt),
+                    u(ci[0], ci[1]) - ic,
+                ]
             )

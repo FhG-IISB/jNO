@@ -1041,6 +1041,9 @@ def assemble_fem_native(
                     affine_bias=c_bias,
                     forcing_vector_fn=forcing_vector_fn,
                     runtime_parameter_exprs=dict(_rt_param_exprs),
+                    # The operator is re-assembled at each (t, args) -- a general (non-affine) operator,
+                    # so it covers a parameter inside a nonlinear coefficient (e.g. exp(logk)) too.
+                    metadata={"runtime_parameter_names": list(runtime_parameter_tags), "nonaffine_operator": True},
                     **common,
                 ),
                 "transient",
