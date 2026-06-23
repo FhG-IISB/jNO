@@ -128,9 +128,11 @@ def test_coupled_transient_source_recovers():
         ]
     )
     n = int(np.asarray(d.mesh.points).shape[0])
-    assert fem.operator.forcing_vector_fn is not None
-    f0 = np.asarray(fem.operator.forcing_vector_fn(0.0)).reshape(-1)
-    assert np.linalg.norm(f0[:n]) > 0 and np.allclose(f0[n:], 0.0)  # source lands in u-block only
+    # The +2 constant load is time-independent, so it lands in the (constant) affine bias, not the
+    # time-varying forcing_vector_fn (which carries only the per-step increment; a time-dependent
+    # source is exercised by test_coupled_transient_time_dependent_source). It is u-block only.
+    c0 = np.asarray(fem.operator.affine_bias).reshape(-1)
+    assert np.linalg.norm(c0[:n]) > 0 and np.allclose(c0[n:], 0.0)
     w = _march(fem)
     u_ex = 2.0 * (1.0 - np.exp(-fem.t1))
     p_ex = 2.0 - 2.0 * np.exp(-fem.t1) * (1.0 + fem.t1)
