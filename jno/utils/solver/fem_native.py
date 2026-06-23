@@ -670,6 +670,34 @@ def assemble_fem_native(
             loc["shape_vals"] = per_f[0]["shape_vals"]
         return _integrate_term(domain, bcoeff, loc, face_w * jac_f)
 
+    def _classify_one(coeff, where: str) -> List[Tuple[Any, int]]:
+        """``[(coeff, test_field_idx), ...]`` for one lowered term. Normally one entry; a term that
+        welds several test fields inside a product (the real part of a ``complex=True`` form, e.g.
+        ``c·(u_r·w_r − u_i·w_i)``) is distributed over its sums into single-test sub-terms -- the same
+        fallback the feax multifield path uses, so one complex form lowers onto the coupled blocks."""
+        from ...trace import BinaryOp, Literal
+        from .feax_utils import _expand_product_terms
+
+        tfi = _test_field_index(coeff, field_index)
+        if tfi is not None:
+            return [(coeff, tfi)]
+        expanded = _expand_product_terms(coeff)
+        if len(expanded) > 1:
+            split: List[Tuple[Any, int]] = []
+            for s, sub in expanded:
+                sub_signed = sub if s >= 0 else BinaryOp("*", Literal(-1.0), sub)
+                sfi = _test_field_index(sub_signed, field_index)
+                if sfi is None:
+                    split = None
+                    break
+                split.append((sub_signed, sfi))
+            if split is not None:
+                return split
+        raise ValueError(
+            f"jno.fem (native): each {where} weak-form term must contain exactly one test field "
+            "(it determines the equation block)."
+        )
+
     def _preprocess_terms(terms, bterms):
         """``(typed_with_masks, surface_work)``: lower each additive sub-term to
         ``(coeff, test_field_idx[, mask_names])`` and bucket boundary faces per region."""
@@ -677,13 +705,7 @@ def assemble_fem_native(
         for bare in terms:
             for sign, sub in _split_additive_terms(domain, bare):
                 coeff = _lower_statefield_to_trial(_apply_sign(domain, sign, sub), {})
-                tfi = _test_field_index(coeff, field_index)
-                if tfi is None:
-                    raise ValueError(
-                        "jno.fem (native): each weak-form term must contain exactly one test "
-                        "field (it determines the equation block)."
-                    )
-                typed.append((coeff, tfi))
+                typed.extend(_classify_one(coeff, "volume"))
         typed_with_masks = [(coeff, tfi, tuple(sorted(_collect_region_mask_names(coeff)))) for coeff, tfi in typed]
 
         surface_work: List[Tuple[str, np.ndarray, List[Tuple[Any, int]]]] = []
@@ -701,13 +723,9 @@ def assemble_fem_native(
                     continue
                 btyped = []
                 for bexpr in bexprs:
-                    bcoeff = _lower_statefield_to_trial(_apply_sign(domain, 1, bexpr), {})
-                    btfi = _test_field_index(bcoeff, field_index)
-                    if btfi is None:
-                        raise ValueError(
-                            f"jno.fem (native): boundary term in region {region!r} must contain exactly one test field."
-                        )
-                    btyped.append((bcoeff, btfi))
+                    for sign, sub in _split_additive_terms(domain, bexpr):
+                        bcoeff = _lower_statefield_to_trial(_apply_sign(domain, sign, sub), {})
+                        btyped.extend(_classify_one(bcoeff, f"boundary ({region!r})"))
                 surface_work.append((region, np.asarray(face_ids, dtype=np.int32), btyped))
         return typed_with_masks, surface_work
 

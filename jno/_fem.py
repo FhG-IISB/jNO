@@ -1744,13 +1744,14 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
     # Native 2D Lagrange coverage gate (expressed over the inferred fields -- no `constraints` here):
     # 2D, all-Lagrange, non-complex, non-runtime-parametric. Periodic + coupled is rejected by
     # `_finalize` regardless, so it needs no separate guard here.
+    # complex=True (re/im ComplexPair) lowers `weak.real` onto two coupled real fields; its terms can
+    # weld both test functions in a product, which the native classifier now distributes per test field
+    # (the same fallback the feax block uses), so it no longer needs to route to feax.
     _native_ok = (
         getattr(domain, "dimension", None) in (2, 3)
         and all(str(f.get("space", "Lagrange")) == "Lagrange" for f in fields)
         and not _is_complex_form(domain, ir)
         and not any(_contains_runtime_parameter(b) for b in weak_bares)
-        # complex=True (re/im) fields couple two test functions per term -> feax real-equivalent path.
-        and not any(getattr(n, "_complex_field_member", False) for b in weak_bares for n in _walk(b))
     )
 
     # Coupled transient (multi-field + time): block M + block spatial operator A. Native handles
