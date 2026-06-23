@@ -1510,15 +1510,12 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         and not _is_complex_form(domain, ir)
         and _native_periodic_ok
     ):
-        from .utils.solver.parametric_helpers import _contains_fem_field_parameter as _cfp
-
         _native_now = True
         if is_transient:
-            # native transient covers a runtime SCALAR parameter (operator_fn(t, args)) but not a
-            # nodal FIELD parameter or a time-varying Dirichlet g(x,t) -- those stay on feax.
-            _native_now = not any(_cfp(b) for b in weak_bares) and not any(
-                _is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw
-            )
+            # native transient covers a runtime SCALAR parameter and a single-field nodal FIELD
+            # parameter k(x) (both threaded through operator_fn(t, args) via the per-cell gather), but
+            # not a time-varying Dirichlet g(x,t) -- that stays on feax.
+            _native_now = not any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw)
         if _native_now:
             from .utils.solver.fem_native import assemble_fem_native
 
