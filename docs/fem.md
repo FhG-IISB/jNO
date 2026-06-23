@@ -301,7 +301,11 @@ rho = 1.0 - eps
 `F` is computed purely from geometry (occlusion + orientation; only the `i==i` self-pair is removed) by
 **double-area Gauss quadrature** of the diffuse kernel — so a *concave* surface keeps its self-view (the
 outer cylinder's `F₂₂ = 1 − r₁/r₂`). Tags only group elements (for per-surface emissivity); they never
-block exchange. Use `axisymmetric=True` for a body of revolution (the `(r, z)` meridional mesh).
+block exchange. Use `axisymmetric=True` for a body of revolution (the `(r, z)` meridional mesh). By
+default the boundary normals point *out of* the mesh — radiation across an un-meshed gap (a vacuum
+between solid parts). For an **oven/furnace cavity** where the fluid inside is meshed and radiation
+crosses that meshed interior, pass `inward=True` so the wall normals point into the cavity and the facing
+walls see one another (see the *Oven* tutorial). For a meshed *medium* between solids, use `medium_tags`.
 
 Write the **full grey-body radiosity** (reflections included) and couple it to the conduction FEM by
 adding the net flux as a consistent surface load to the residual:
@@ -369,8 +373,12 @@ crux.solve(200)                                           # recovers k
 recovered = crux.eval([k])                                # the array (do not index [0])
 ```
 
-`fem.solve(solve_fn)` lets you choose the solver (jNO writes none): the linear default is
-`jnp.linalg.solve`, the nonlinear default an `optimistix` Newton `root_find` (implicit-diff).
+`fem.solve(solve_fn)` lets you choose the solver, but every problem ships with a differentiable
+default (no external dependency): the linear default is a sparse-direct factorisation
+(`sparse_lu_solve`, JAX `spsolve` — robust on saddle-point systems), with a Jacobi-preconditioned
+matrix-free BiCGStab as the iterative alternative; the nonlinear default is a matrix-free
+Newton-Krylov, and the transient default backward-Euler over those. All are implicit-diff, so
+`crux.solve` recovers parameters through them. Bring your own `solve_fn` for anything else.
 
 ### Field parameters `k(x)` + regularization
 

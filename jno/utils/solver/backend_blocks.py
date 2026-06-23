@@ -398,6 +398,8 @@ def _default_transient_integrate(block, args, save_ts):
 
         _, ys = jax.lax.scan(step, s0, grid_ts[1:])
     else:
+        from .linear import matrix_diagonal
+
         M = _operand(block.M)
         n = M.shape[0]
         c = jnp.zeros((n,), dtype) if block.affine_bias is None else jnp.asarray(block.affine_bias, dtype).reshape(-1)
@@ -405,6 +407,7 @@ def _default_transient_integrate(block, args, save_ts):
         # theta=1/2 is the trapezoidal rule (energy-conserving -- used by the second-order/wave route,
         # where backward Euler would spuriously damp an undamped oscillation).
         theta = float(block.metadata.get("theta", 1.0)) if getattr(block, "metadata", None) else 1.0
+        diagM = matrix_diagonal(M)
 
         def _forcing(t):
             if block.forcing_vector_fn is None:
@@ -416,11 +419,13 @@ def _default_transient_integrate(block, args, save_ts):
             # (M + theta dt A) w_next = (M - (1-theta) dt A) w + dt c + dt(theta f_next + (1-theta) f_prev)
             f_avg = theta * _forcing(t_next) + (1.0 - theta) * _forcing(t_next - dt)
             rhs = M @ w - (1.0 - theta) * dt * (A @ w) + dt * c + dt * f_avg
-
-            def G(wn):  # affine residual; root is the theta-method update (one BiCGStab solve)
-                return M @ wn + theta * dt * (A @ wn) - rhs
-
-            wn = newton_krylov(G, w)
+            step_op = lambda wn: M @ wn + theta * dt * (A @ wn)  # the theta-method step operator
+            # diagonal (Jacobi) preconditioner 1/diag(M + theta dt A); zero diagonals left unscaled
+            d = diagM + theta * dt * matrix_diagonal(A)
+            inv = 1.0 / jnp.where(jnp.abs(d) > 1e-30, d, 1.0)
+            wn, _ = jax.scipy.sparse.linalg.bicgstab(
+                step_op, rhs, x0=w, tol=1e-10, atol=0.0, maxiter=20_000, M=lambda x: inv * x
+            )
             return wn, wn
 
         _, ys = jax.lax.scan(step, s0, grid_ts[1:])

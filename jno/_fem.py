@@ -50,25 +50,35 @@ def _as_flat(x):
 _COMPONENT_NAMES = {0: "x", 1: "y", 2: "z"}
 
 
-def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000):
-    """Default steady-linear solve: matrix-free BiCGStab straight on the feax BCOO operator.
-
-    Never forms the dense ``N x N`` matrix — each iteration is a couple of sparse matvecs
-    ``A @ v`` (cost ``O(nnz)``), so memory stays ``O(nnz)`` and the solve runs at sizes where
-    a dense factorisation would not fit. BiCGStab (unlike CG) handles **general** linear
-    systems — symmetric *or* not — so it is a safe library default. Raises if it fails to
-    converge, so a hard / ill-posed system fails loudly instead of returning garbage; pass a
-    ``solve_fn`` to :meth:`FEM.solve` to choose your own solver in that case.
-    """
-    matvec = lambda v: A @ v
-    u, _info = jax.scipy.sparse.linalg.bicgstab(matvec, b, tol=tol, atol=0.0, maxiter=maxiter)
+def _residual_check(A, b, u, who):
+    """Raise (eagerly) if ``A u = b`` is not solved -- a hard fail beats silently returning garbage."""
+    matvec = (lambda v: A @ v) if hasattr(A, "__matmul__") else (lambda v: jnp.asarray(A) @ v)
     rel = float(jnp.linalg.norm(b - matvec(u)) / (jnp.linalg.norm(b) + 1e-30))
     if not np.isfinite(rel) or rel > 1e-4:
         raise RuntimeError(
-            f"fem.solve default (matrix-free BiCGStab) did not converge (relative residual "
-            f"{rel:.1e}). Pass your own solver, e.g. fem.solve(solve_fn=lambda A, b: ...)."
+            f"fem.solve default ({who}) did not solve the system (relative residual {rel:.1e}); the "
+            "problem may be singular/ill-posed. Pass your own solver: fem.solve(solve_fn=lambda A, b: ...)."
         )
     return u
+
+
+def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000):
+    """Default steady-linear solve: matrix-free **Jacobi-preconditioned** BiCGStab on the BCOO operator.
+
+    Never forms the dense ``N x N`` matrix — each iteration is a couple of sparse matvecs ``A @ v`` (cost
+    ``O(nnz)``), so memory stays ``O(nnz)`` and it runs at sizes where a factorisation would not fit;
+    GPU-safe (unlike a sparse direct factorisation, which can exhaust cuSolver). BiCGStab handles
+    **general** (non-symmetric) systems and a diagonal **Jacobi** preconditioner (cheap ``1/diag(A)``)
+    accelerates diagonally-dominant (elliptic) problems. Raises if it fails to converge instead of
+    returning garbage — for the indefinite saddle-point systems where Jacobi does not help, pass a
+    direct solver via ``solve_fn`` (e.g. ``jno.utils.solver.linear.sparse_lu_solve`` on CPU, or
+    ``jnp.linalg.solve``).
+    """
+    from .utils.solver.linear import jacobi
+
+    matvec = lambda v: A @ v
+    u, _info = jax.scipy.sparse.linalg.bicgstab(matvec, b, tol=tol, atol=0.0, maxiter=maxiter, M=jacobi(A))
+    return _residual_check(A, b, u, "Jacobi-preconditioned BiCGStab")
 
 
 # ---------------------------------------------------------------------------
@@ -767,11 +777,13 @@ class FEM:
 
         ``solve_fn`` is **your** solver (jNO writes none):
 
-        * steady linear: ``(A, b) -> u``. The **default** is matrix-free BiCGStab straight on
-          feax's BCOO operator — never forms the ``N x N`` matrix (memory ``O(nnz)``) and solves
-          general (non-symmetric) systems, not just SPD. To use a dense / library solver, pass
-          your own ``solve_fn`` (it receives the densified ``(A, b)``; e.g. ``jnp.linalg.solve``
-          or a ``lineax`` solver). It raises if BiCGStab fails to converge;
+        * steady linear: ``(A, b) -> u``. The **default** is a matrix-free **Jacobi-preconditioned**
+          BiCGStab on feax's BCOO operator — never forms the ``N x N`` matrix (memory ``O(nnz)``),
+          GPU-safe, handles general (non-symmetric) systems, ``jit`` + grad; it raises on
+          non-convergence. For the indefinite saddle-point systems where Jacobi does not help, pass a
+          **direct** ``solve_fn`` — ``jno.utils.solver.linear.sparse_lu_solve`` (JAX ``spsolve``, no
+          dependency, robust on CPU) or ``jnp.linalg.solve`` (dense); it receives the densified
+          ``(A, b)``;
         * steady nonlinear: ``(residual_fn, u0) -> u`` (default a matrix-free Jacobian-free
           Newton-Krylov, implicit-diff, no optimistix; pass ``u0=`` for the guess);
         * transient: ``(block, args, save_ts) -> ys`` returning a ``(len(save_ts),
@@ -792,9 +804,9 @@ class FEM:
         if self._mode == "complex_transient":
             return _solve_complex_transient(self._op, save_ts=kwargs.get("save_ts"))
         if self._mode == "linear" and not isinstance(self._op, FemLinearSystem):
-            # Non-parametric steady linear. Default: matrix-free BiCGStab straight on feax's
-            # BCOO operator (never densifies -> memory O(nnz); solves general systems). Pass your
-            # own ``solve_fn=(A, b) -> u`` to use a dense / library solver instead -- it receives
+            # Non-parametric steady linear. Default: differentiable sparse-direct factorisation on feax's
+            # BCOO operator (robust on saddle-point systems; jit + grad; no external dep). Pass your own
+            # ``solve_fn=(A, b) -> u`` to use a dense / iterative / library solver instead -- it receives
             # the densified (A, b). (The runtime-parametric case is a FemLinearSystem below.)
             A, b = self._op
             b = jnp.asarray(b).reshape(-1)

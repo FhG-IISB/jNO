@@ -3,9 +3,9 @@ through ``jno.fem([...])`` (no ``init_fem`` / ``assemble``).
 
 ``FEM.solve`` hosts a *real* parametric solve in the trace so ``crux.solve``
 recovers a ``jno.np.parameter`` from data. The solver is the user's own callable
-(jNO writes none): the linear default is ``jnp.linalg.solve`` (a ``lineax`` backend
-is exercised too); the nonlinear default is an ``optimistix`` Newton ``root_find``
-(implicit-diff, so the gradient reaches the parameter without unrolling Newton).
+or the built-in default (the differentiable sparse-direct ``sparse_lu_solve`` for
+linear, matrix-free Newton-Krylov for nonlinear); a bring-your-own dense solver is
+exercised too. Implicit-diff lets the gradient reach the parameter without unrolling.
 
 Run with x64 (the feax assembly is float64): ``JAX_ENABLE_X64=1``.
 """
@@ -14,15 +14,11 @@ import pytest
 
 pytest.importorskip("feax", reason="feax required for FEM inverse tests")
 pytest.importorskip("shapely", reason="shapely required for the box domain")
-pytest.importorskip("optimistix", reason="optimistix required for the nonlinear solve")
-pytest.importorskip("lineax", reason="lineax required for the lineax-backend test")
 
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
-import lineax  # noqa: E402
 import numpy as np  # noqa: E402
 import optax  # noqa: E402
-import optimistix as optx  # noqa: E402
 from shapely.geometry import box  # noqa: E402
 
 import jno  # noqa: E402
@@ -102,18 +98,20 @@ def test_linear_recovers_default_solver():
     assert abs(rec - 1.0) < TOL, f"linear (default solver): recovered alpha={rec:.4f}"
 
 
-def test_linear_recovers_with_lineax_backend():
+def test_linear_recovers_with_byo_dense_solver():
     alpha = _alpha()
     fem = _linear_fem(alpha)
     A1, b1 = fem.operator.evaluate({"alpha": 1.0})
     u_obs = jnp.linalg.solve(jnp.asarray(A1), jnp.asarray(b1).reshape(-1))
 
-    u_node = fem.solve(lambda A, b: lineax.linear_solve(lineax.MatrixLinearOperator(A), b).value)
+    u_node = fem.solve(lambda A, b: jnp.linalg.solve(A, b))  # bring-your-own dense solver
     rec = _recover(u_node, alpha, u_obs)
-    assert abs(rec - 1.0) < TOL, f"linear (lineax backend): recovered alpha={rec:.4f}"
+    assert abs(rec - 1.0) < TOL, f"linear (BYO dense): recovered alpha={rec:.4f}"
 
 
-def test_nonlinear_recovers_optimistix():
+def test_nonlinear_recovers():
+    from jno.utils.solver.newton_krylov import newton_krylov
+
     alpha = _alpha()
     fem = _nonlinear_fem(alpha)
     assert not fem.is_linear
@@ -121,17 +119,11 @@ def test_nonlinear_recovers_optimistix():
     assert type(op).__name__ == "FemResidualOperator" and op.is_parametric
 
     u0 = jnp.zeros((int(op.size),), dtype=jnp.float64)
-    u_obs = optx.root_find(
-        lambda uu, _a: op.residual(uu, {"alpha": 1.0}),
-        optx.Newton(rtol=1e-8, atol=1e-8),
-        u0,
-        args=None,
-        max_steps=100,
-    ).value
+    u_obs = newton_krylov(lambda uu: jnp.asarray(op.residual(uu, {"alpha": 1.0})).reshape(-1), u0)
 
-    rec = _recover(fem.solve(), alpha, u_obs)
+    rec = _recover(fem.solve(), alpha, u_obs)  # default: matrix-free Newton-Krylov, implicit-diff
     assert abs(rec - 2.0) > 0.5, "parameter did not move -- implicit-diff gradient did not reach it"
-    assert abs(rec - 1.0) < TOL, f"nonlinear (optimistix): recovered alpha={rec:.4f}"
+    assert abs(rec - 1.0) < TOL, f"nonlinear: recovered alpha={rec:.4f}"
 
 
 def test_nonaffine_scalar_recovers_via_reassembly():
@@ -460,8 +452,8 @@ def test_transient_solve_fn_override():
 
 
 def test_transient_nonlinear_recovers_via_inner_newton():
-    """The default transient integrator handles a NONLINEAR block too: backward Euler with an
-    optimistix Newton root_find per step (implicit-diff). Recover a scalar alpha in
+    """The default transient integrator handles a NONLINEAR block too: backward Euler with the
+    matrix-free Newton-Krylov root find per step (implicit-diff). Recover a scalar alpha in
     u_t = lap u - alpha*u^3 from the trajectory through fem.solve() -- the gradient flows
     through the per-step Newton to alpha without unrolling it."""
     from jno.utils.solver.backend_blocks import _default_transient_integrate

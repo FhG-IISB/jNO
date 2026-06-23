@@ -2915,10 +2915,10 @@ class FemLinearSystem:
         ``fem = jno.fem([...])`` (see ``docs/inverse-problems.md``).
 
         ``solve_fn`` is **your** solver: any ``(A, b) -> u`` callable. jNO writes no
-        solver code and imposes no library — the default is
-        :func:`jax.numpy.linalg.solve` (dense); pass e.g.
-        ``lambda A, b: lineax.linear_solve(lineax.MatrixLinearOperator(A), b).value`` to
-        choose another. Use a differentiable solver so ``∂u/∂θ`` exists.
+        solver code and imposes no library — the default is a dense ``jnp.linalg.solve``
+        (this runtime-parametric path is for inverse problems, usually modest in size). For
+        a robust differentiable **direct** solve pass ``jno.utils.solver.linear.sparse_lu_solve``
+        (JAX ``spsolve``, no dependency). Use a differentiable solver so ``∂u/∂θ`` exists.
 
         Note: the FEM solve is global (one ``A``, ``b``, ``u``); enable x64
         (``jax_enable_x64``) and set the parameter dtype to match — the feax
@@ -3026,7 +3026,7 @@ class FemResidualOperator:
         default is a matrix-free Jacobian-free Newton-Krylov (Newton + BiCGStab on the
         JVP, no external solver dependency); implicit differentiation via
         ``jax.lax.custom_root`` keeps ``∂u/∂θ`` exact without unrolling Newton. Pass your
-        own to choose another solver/library (e.g. an ``optimistix`` Newton). jNO's
+        own to choose another solver/library (e.g. your own Newton). jNO's
         analytic Jacobian (:attr:`jacobian`) is available; by default ``J @ v`` is a JVP
         of the residual.
 
