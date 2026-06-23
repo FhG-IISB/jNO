@@ -428,6 +428,38 @@ def test_3d_tet_neumann_routes_native_and_recovers_flux():
     assert np.abs(sol - pts[:, 0]).max() < 1e-7  # recovers u = x (x64)
 
 
+def test_3d_tet_multifield_routes_native_and_recovers():
+    """A coupled (two-field) steady problem on a 3D tet mesh assembles natively -- the multifield
+    gate admits 3D now that the assembler is dimension-generic. Manufactured ``u = p = sin·sin·sin``
+    with the symmetric coupling ``-Δu + p = (3π²+1)g`` / ``-Δp + u = (3π²+1)g`` (which ``u = p = g``
+    solves) is recovered in both blocks."""
+    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.25))
+    u, wu = d.fem_symbols(names=("u", "wu"))
+    p, wp = d.fem_symbols(names=("p", "wp"))
+    xi, yi, zi = d.variable("interior", split=True)[:3]
+    ui, vi = u.bind(x=xi, y=yi, z=zi), wu.bind(x=xi, y=yi, z=zi)
+    pp, qi = p.bind(x=xi, y=yi, z=zi), wp.bind(x=xi, y=yi, z=zi)
+    g = sin(PI * xi) * sin(PI * yi) * sin(PI * zi)
+    fac = 3 * PI**2 + 1.0
+    xb, yb, zb = d.variable("boundary", split=True)[:3]
+    fem = jno.fem(
+        [
+            inner(grad(u, [xi, yi, zi]), grad(wu, [xi, yi, zi]), n_contract=1) + pp * vi - fac * g * vi,
+            inner(grad(p, [xi, yi, zi]), grad(wp, [xi, yi, zi]), n_contract=1) + ui * qi - fac * g * qi,
+            u(xb, yb, zb) - 0.0,
+            p(xb, yb, zb) - 0.0,
+        ]
+    )
+    assert fem.problem is None  # 3D multifield routed natively
+    sol = np.linalg.solve(np.asarray(fem.A), np.asarray(fem.b).reshape(-1))
+    offs = fem.offsets
+    for i in range(2):
+        pts = np.asarray(fem.field_points[i])
+        block = sol[offs[i] : offs[i + 1]]
+        exact = np.sin(PI * pts[:, 0]) * np.sin(PI * pts[:, 1]) * np.sin(PI * pts[:, 2])
+        assert np.linalg.norm(block - exact) / np.linalg.norm(exact) < 0.08
+
+
 # ---------------------------------------------------------------------------
 # Periodic ties: the feax-free prolongation reduction (_build_periodic_reduction +
 # build_periodic_prolongation) is fed the native assembly cells, so a steady scalar

@@ -1719,7 +1719,7 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
     # 2D, all-Lagrange, non-complex, non-runtime-parametric. Periodic + coupled is rejected by
     # `_finalize` regardless, so it needs no separate guard here.
     _native_ok = (
-        getattr(domain, "dimension", None) == 2
+        getattr(domain, "dimension", None) in (2, 3)
         and all(str(f.get("space", "Lagrange")) == "Lagrange" for f in fields)
         and not _is_complex_form(domain, ir)
         and not any(_contains_runtime_parameter(b) for b in weak_bares)
