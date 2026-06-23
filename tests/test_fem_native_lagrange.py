@@ -401,24 +401,31 @@ def test_3d_tet_p2_reproduces_quadratic_exactly():
     assert np.abs(sol - exact).max() < 1e-9  # exact up to the linear solve (x64)
 
 
-def test_3d_tet_neumann_routes_to_feax():
-    """3D surface (Neumann/Robin) integration is not native (no tet-face quadrature yet): a 3D
-    problem carrying a boundary flux term must route to feax (a feax problem object is built)."""
-    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.5))
+def test_3d_tet_neumann_routes_native_and_recovers_flux():
+    """A 3D tet problem with a Neumann (surface flux) term assembles natively over the tet faces (4
+    triangular faces, 2-D triangle quadrature). Manufactured ``u = x``: ``-Δu = 0``, Dirichlet ``u = 0``
+    on the left face, ``∂u/∂n = +1`` on the right (written ``-1·v`` in the residual convention), and the
+    y/z faces left natural (zero flux, which ``u = x`` satisfies). The native solution recovers ``u = x``
+    to the linear-solve tolerance -- pinning the tet-face area element, the parent-basis face
+    tabulation and the local-face indexing against ``build_facet_connectivity``."""
+    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.3))
     u, w = d.fem_symbols(names=("u", "w"))
     xi, yi, zi = d.variable("interior", split=True)[:3]
     xr, yr, zr = d.variable("right", split=True)[:3]
+    xl, yl, zl = d.variable("left", split=True)[:3]
     vv = w.bind(x=xi, y=yi, z=zi)
     vr = w.bind(x=xr, y=yr, z=zr)
-    xl, yl, zl = d.variable("left", split=True)[:3]
     fem = jno.fem(
         [
-            inner(grad(u, [xi, yi, zi]), grad(w, [xi, yi, zi]), n_contract=1) - 1.0 * vv,
-            1.0 * vr,  # Neumann flux on the 'right' face -> 3D surface -> feax
+            inner(grad(u, [xi, yi, zi]), grad(w, [xi, yi, zi]), n_contract=1) - 0.0 * vv,
+            -1.0 * vr,  # ∂u/∂n = +1 on the right face (3D tet-face surface integral)
             u(xl, yl, zl) - 0.0,
         ]
     )
-    assert fem.problem is not None  # native correctly declined; feax handled the surface term
+    assert fem.problem is None  # routed natively (tet-face surface quadrature)
+    sol = np.linalg.solve(np.asarray(fem.A), np.asarray(fem.b).reshape(-1))
+    pts = np.asarray(fem.points)
+    assert np.abs(sol - pts[:, 0]).max() < 1e-7  # recovers u = x (x64)
 
 
 # ---------------------------------------------------------------------------

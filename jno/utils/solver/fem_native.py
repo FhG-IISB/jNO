@@ -31,10 +31,9 @@ and :mod:`fem_nonnodal`.
 Scope
 -----
 Lagrange P1/P2 fields on 2D triangle and 3D tetrahedral meshes (single- and multi-field,
-linear, nonlinear, and transient).  2D additionally carries Neumann/Robin surface terms;
-a 3D surface (Neumann/Robin) term needs tet-face quadrature this assembler does not
-tabulate yet, so the caller routes it to feax.  Runtime FEM *field* parameters,
-VPINN (:class:`ModelCall`), complex FEM, and periodic BCs also remain on the feax path.
+linear, nonlinear, and transient), with Dirichlet and Neumann/Robin boundary conditions
+(2D edge / 3D tet-face surface quadrature).  Runtime FEM *field* parameters and complex FEM
+remain on the feax path.
 """
 
 from __future__ import annotations
@@ -62,7 +61,7 @@ from .fem_1d import (
     _line_quadrature,
     _region_node_ids,
 )
-from .fem_facets import build_facet_connectivity, compute_face_normals
+from .fem_facets import _LOCAL_FACES_TET, build_facet_connectivity, compute_face_normals
 from .fem_lagrange import BASIX_TET_EDGES, identity_pushforward, lagrange_tet, lagrange_triangle
 from .fem_topology import BASIX_TRIANGLE_EDGES
 from .parametric_helpers import _collect_runtime_parameter_exprs
@@ -73,8 +72,9 @@ from .weak_form import (
     _split_additive_terms,
 )
 
-# Reference triangle vertex coordinates (basix convention): v0=(0,0), v1=(1,0), v2=(0,1).
-_REF_TRI_VERTS = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+# Reference simplex vertex coordinates (basix convention).
+_REF_TRI_VERTS = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])  # v0=(0,0), v1=(1,0), v2=(0,1)
+_REF_TET_VERTS = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
 
 # Local face ordering for a triangle: entry k = (local_node_a, local_node_b, opp_node).
 _LOCAL_FACES_TRI = ((0, 1, 2), (1, 2, 0), (2, 0, 1))
@@ -127,40 +127,71 @@ def _region_node_ids_from_pts(domain, region: str, pts_all: np.ndarray) -> List[
 # ---------------------------------------------------------------------------
 
 
-def _build_face_tables(elem_degree: int, quad_degree: int):
-    """Pre-tabulate the parent-cell Lagrange basis at the quad points of each local face.
+def _build_face_tables(elem_degree: int, quad_degree: int, dim: int = 2):
+    """Pre-tabulate the parent-cell Lagrange basis at the quad points of each local facet.
 
-    Returns ``(face_phi, face_dphi_ref, face_ref_qp, face_ref_tang, gw_1d)``:
+    Dimension-generic: a 2D triangle's facets are its 3 edges (1-D Gauss quadrature); a 3D tet's
+    facets are its 4 triangular faces (2-D triangle quadrature). The facet ordering matches
+    ``build_facet_connectivity`` (``_LOCAL_FACES_TRI`` / ``_LOCAL_FACES_TET``) so a connectivity
+    ``local_face`` index ``k`` selects the right table.
 
-    * ``face_phi``       ``(3, n_q, n_dof)``     parent basis values at face qp.
-    * ``face_dphi_ref``  ``(3, n_q, n_dof, 2)``  reference-domain gradients.
-    * ``face_ref_qp``    ``(3, n_q, 2)``          reference coords of face qp.
-    * ``face_ref_tang``  ``(3, 2)``               reference edge tangent vectors.
-    * ``gw_1d``          ``(n_q,)``               1-D Gauss weights on [0, 1].
+    Returns ``(face_phi, face_dphi_ref, face_ref_qp, face_ref_tangs, face_w)``:
+
+    * ``face_phi``       ``(n_faces, n_q, n_dof)``       parent basis values at facet qp.
+    * ``face_dphi_ref``  ``(n_faces, n_q, n_dof, dim)``  reference-domain gradients.
+    * ``face_ref_qp``    ``(n_faces, n_q, dim)``         parent-reference coords of facet qp.
+    * ``face_ref_tangs`` ``(n_faces, dim-1, dim)``       the ``dim-1`` reference tangent vectors that
+      span each facet (one edge tangent in 2D; two face tangents in 3D). The physical area element is
+      ``|J·t|`` (2D edge length) or ``|（J·t0) × (J·t1)|`` (3D face area), formed in ``_surf_elem_res``.
+    * ``face_w``         ``(n_q,)``                      reference-facet quadrature weights (1-D Gauss
+      on [0, 1] summing to 1 in 2D; triangle weights summing to 1/2 in 3D).
     """
     import basix
     from basix import CellType, ElementFamily
 
-    gp_1d, gw_1d = (np.asarray(x) for x in _line_quadrature(quad_degree))
-    elem = basix.create_element(ElementFamily.P, CellType.triangle, elem_degree)
+    if dim == 2:
+        cell, ref_verts, local_faces = CellType.triangle, _REF_TRI_VERTS, _LOCAL_FACES_TRI
+        gp_1d, face_w = (np.asarray(x) for x in _line_quadrature(quad_degree))
 
+        def _facet_qp_tangs(nodes):  # an edge between two vertices
+            va, vb = ref_verts[nodes[0]], ref_verts[nodes[1]]
+            ref_qp = va[None, :] * (1.0 - gp_1d[:, None]) + vb[None, :] * gp_1d[:, None]  # (n_q, 2)
+            return ref_qp, np.stack([vb - va])  # tangs (1, 2)
+    else:
+        cell, ref_verts, local_faces = CellType.tetrahedron, _REF_TET_VERTS, _LOCAL_FACES_TET
+        qp_tri, face_w = (np.asarray(x) for x in basix.make_quadrature(CellType.triangle, quad_degree))
+
+        def _facet_qp_tangs(nodes):  # a triangular face spanned by three vertices
+            va, vb, vc = ref_verts[nodes[0]], ref_verts[nodes[1]], ref_verts[nodes[2]]
+            xi, eta = qp_tri[:, 0], qp_tri[:, 1]
+            ref_qp = va[None] * (1 - xi - eta)[:, None] + vb[None] * xi[:, None] + vc[None] * eta[:, None]
+            return ref_qp, np.stack([vb - va, vc - va])  # tangs (2, 3)
+
+    elem = basix.create_element(ElementFamily.P, cell, elem_degree)
     phi_list, dphi_list, qp_list, tang_list = [], [], [], []
-    for node_a, node_b, _ in _LOCAL_FACES_TRI:
-        va, vb = _REF_TRI_VERTS[node_a], _REF_TRI_VERTS[node_b]
-        ref_qp = va[None, :] * (1.0 - gp_1d[:, None]) + vb[None, :] * gp_1d[:, None]  # (n_q, 2)
-        tab = elem.tabulate(1, ref_qp)  # (3, n_q, n_dof, 1)
+    for entry in local_faces:
+        ref_qp, tangs = _facet_qp_tangs(entry[:dim])  # entry[:dim] = the facet's vertex local ids
+        tab = elem.tabulate(1, ref_qp)  # (1 + dim, n_q, n_dof, 1)
         phi_list.append(tab[0, :, :, 0])  # (n_q, n_dof)
-        dphi_list.append(np.stack([tab[1, :, :, 0], tab[2, :, :, 0]], axis=-1))  # (n_q, n_dof, 2)
+        dphi_list.append(np.stack([tab[1 + d, :, :, 0] for d in range(dim)], axis=-1))  # (n_q, n_dof, dim)
         qp_list.append(ref_qp)
-        tang_list.append(vb - va)
+        tang_list.append(tangs)
 
     return (
-        jnp.asarray(np.stack(phi_list)),  # (3, n_q, n_dof)
-        jnp.asarray(np.stack(dphi_list)),  # (3, n_q, n_dof, 2)
-        jnp.asarray(np.stack(qp_list)),  # (3, n_q, 2)
-        jnp.asarray(np.stack(tang_list)),  # (3, 2)
-        jnp.asarray(gw_1d),  # (n_q,)
+        jnp.asarray(np.stack(phi_list)),  # (n_faces, n_q, n_dof)
+        jnp.asarray(np.stack(dphi_list)),  # (n_faces, n_q, n_dof, dim)
+        jnp.asarray(np.stack(qp_list)),  # (n_faces, n_q, dim)
+        jnp.asarray(np.stack(tang_list)),  # (n_faces, dim-1, dim)
+        jnp.asarray(face_w),  # (n_q,)
     )
+
+
+def _facet_area_element(J, tangs):
+    """Physical facet measure element from the reference tangents ``tangs`` (``dim-1, dim``) pushed
+    forward by the cell Jacobian ``J`` (``dim, dim``): the edge length ``|J·t|`` in 2D, the face area
+    ``|(J·t0) × (J·t1)|`` in 3D. Multiplying it by the reference-facet weights gives ``dS``."""
+    T = tangs @ J.T  # (dim-1, dim) physical tangents
+    return jnp.linalg.norm(T[0]) if T.shape[0] == 1 else jnp.linalg.norm(jnp.cross(T[0], T[1]))
 
 
 # ---------------------------------------------------------------------------
@@ -245,7 +276,7 @@ def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neuman
         cell_key = "triangle" if dim == 2 else "tetrahedron"
         conn = build_facet_connectivity(cells_p1, cell_key)
         normals_all = compute_face_normals(pts_p1, conn, cells_p1, cell_key) if conn.n_bfaces > 0 else np.zeros((0, dim))
-        fp_phi, fp_dphi_ref, fp_qp, fp_tang, gw_face = _build_face_tables(order, quad_degree)
+        fp_phi, fp_dphi_ref, fp_qp, fp_tangs, gw_face = _build_face_tables(order, quad_degree, dim)
         for tag in neumann_tags:
             region_nodes = {int(n) for n in _region_node_ids_from_pts(domain, tag, pts_p1)}
             face_ids = [
@@ -260,14 +291,13 @@ def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neuman
             lface = jnp.asarray(conn.local_face, dtype=jnp.int32)[face_ids_j]
             normals_j = jnp.asarray(normals_all)[face_ids_j]
 
-            def _face(c, k, n_vec, _fp=fp_phi, _fd=fp_dphi_ref, _fq=fp_qp, _ft=fp_tang, _gw=gw_face):
+            def _face(c, k, n_vec, _fp=fp_phi, _fd=fp_dphi_ref, _fq=fp_qp, _ft=fp_tangs, _gw=gw_face):
                 verts = pts_j[cells_p1_j[c]]
                 J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)
                 K = jnp.linalg.inv(J)
                 phi_f = _fp[k]  # (n_fq, n_dof)
                 dphi_f = jnp.einsum("qnd,dD->qnD", _fd[k], K)  # (n_fq, n_dof, dim)
-                tang = _ft[k]
-                jac_f = jnp.linalg.norm(J @ tang)  # edge length / face area scale
+                jac_f = _facet_area_element(J, _ft[k])  # edge length (2D) / face area (3D)
                 nanson = _gw * jac_f  # (n_fq,)
                 xq_f = verts[0] + _fq[k] @ J.T  # (n_fq, dim)
                 return phi_f, dphi_f, nanson, xq_f
@@ -321,10 +351,9 @@ def assemble_fem_native(
     :func:`fem_nonnodal.assemble_fem_nonnodal`.
 
     Scope: scalar/vector Lagrange P1/P2 fields on 2D triangle and 3D tetrahedral meshes
-    (single- and multi-field).  2D carries Dirichlet and Neumann/Robin boundary conditions;
-    3D carries Dirichlet only -- a 3D surface (Neumann/Robin) term needs the tet-face
-    quadrature this assembler does not tabulate yet, so the caller routes it to feax.  VPINN,
-    complex FEM, and periodic BCs remain on the feax path.
+    (single- and multi-field), with Dirichlet and Neumann/Robin boundary conditions (2D edge /
+    3D tet-face surface quadrature).  Complex FEM and runtime FEM *field* parameters remain on
+    the feax path.
     """
     from ...trace import FemResidualOperator
 
@@ -481,14 +510,14 @@ def assemble_fem_native(
     # Surface integration setup
     # -------------------------------------------------------------------------
 
-    # Per-field face tables (one set per distinct element order). These tabulate the parent basis
-    # on a *triangle*'s edges for 2D surface (Neumann/Robin) integration; 3D surface terms are routed
-    # to feax by the caller, so 3D never needs them -- skip the build when there are no boundary terms.
+    # Per-field facet tables (one set per distinct element order). These tabulate the parent basis on
+    # the simplex facets for surface (Neumann/Robin) integration -- a triangle's 3 edges in 2D, a tet's
+    # 4 triangular faces in 3D -- so they are skipped when there are no boundary terms.
     face_tables_per_field = (
-        [_build_face_tables(f["order"], quad_degree) for f in fields] if boundary_terms else [None] * len(fields)
+        [_build_face_tables(f["order"], quad_degree, dim) for f in fields] if boundary_terms else [None] * len(fields)
     )
-    # face_tables_per_field[i] = (face_phi, face_dphi_ref, face_ref_qp, face_ref_tang, gw_1d)
-    # shapes: (3, n_q, n_dof_i), (3, n_q, n_dof_i, 2), (3, n_q, 2), (3, 2), (n_q,)
+    # face_tables_per_field[i] = (face_phi, face_dphi_ref, face_ref_qp, face_ref_tangs, face_w);
+    # shapes: (n_faces, n_q, n_dof_i), (..., dim), (n_faces, n_q, dim), (n_faces, dim-1, dim), (n_q,)
 
     conn = build_facet_connectivity(cells_p1, cell_key)
     normals_np = compute_face_normals(pts_p1, conn, cells_p1, cell_key) if conn.n_bfaces > 0 else np.zeros((0, dim))
@@ -601,10 +630,10 @@ def assemble_fem_native(
         cell's gathered all-field local DOFs ``local_all`` -> ``(n_test_dofs_btfi,)``."""
         c = parent_j[fi]
         k = lface_j[fi]
-        n_vec = normals_j[fi]  # (2,) outward unit normal
+        n_vec = normals_j[fi]  # (dim,) outward unit normal
         cell_sols = _split_cell_local(local_all)
         verts = pts_j[cells_j[c]]
-        J = jnp.stack([verts[1] - verts[0], verts[2] - verts[0]], axis=1)
+        J = jnp.stack([verts[i + 1] - verts[0] for i in range(dim)], axis=1)  # (dim, dim)
         K = jnp.linalg.inv(J)
 
         # All-field surface data (needed for coupled Robin terms).
@@ -620,10 +649,9 @@ def assemble_fem_native(
                 }
             )
 
-        _, _, fp_qp, fp_tang, gw_face = face_tables_per_field[btfi]
-        tang = fp_tang[k]  # (2,) ref tangent
-        jac_f = jnp.linalg.norm(J @ tang)  # physical edge length
-        xq_f = verts[0] + fp_qp[k] @ J.T  # (n_q, 2)
+        _, _, fp_qp, fp_tangs, face_w = face_tables_per_field[btfi]
+        jac_f = _facet_area_element(J, fp_tangs[k])  # physical edge length (2D) / face area (3D)
+        xq_f = verts[0] + fp_qp[k] @ J.T  # (n_q, dim)
         loc = {
             "physical_quad_points": xq_f,
             "fields": per_f,
@@ -640,7 +668,7 @@ def assemble_fem_native(
         }
         if _field_param_names:
             loc["shape_vals"] = per_f[0]["shape_vals"]
-        return _integrate_term(domain, bcoeff, loc, gw_face * jac_f)
+        return _integrate_term(domain, bcoeff, loc, face_w * jac_f)
 
     def _preprocess_terms(terms, bterms):
         """``(typed_with_masks, surface_work)``: lower each additive sub-term to
