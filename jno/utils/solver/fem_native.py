@@ -862,6 +862,42 @@ def assemble_fem_native(
         domain._fem_native_dirichlet_pairs = pairs
         return pairs
 
+    def _build_dirichlet_tv_entries():
+        """Time-varying Dirichlet ``g(x, t)`` entries: a list of ``(dofs, value_node, coords)`` for each
+        ``dirichlet_raw`` whose value carries the temporal variable. The transient block evaluates
+        ``g`` at ``coords`` and time ``t`` each step (``_eval_value_node_at_time``) and writes it onto
+        ``dofs`` in the forcing. The constant-valued conditions are returned separately as ordinary
+        pairs (their ``t``-independent value goes in the affine bias)."""
+        from ..._fem import _eval_value_node_at, _is_temporal_value_node
+
+        const_pairs: List[Tuple[int, float]] = []
+        tv_entries: List[Tuple[Any, Any, Any]] = []
+        for field_key, region, comp, value, value_node in dirichlet_raw:
+            fidx = field_index.get(field_key)
+            if fidx is None:
+                continue
+            vt = vecs[fidx]
+            pts_all = np.asarray(pts_f_all[fidx])
+            nids = _boundary_node_ids(fidx, region)
+            comps_range = range(vt) if comp is None else [int(comp)]
+            if value_node is not None and _is_temporal_value_node(value_node):
+                coords = jnp.asarray(pts_all[np.asarray(nids, dtype=int)]) if nids else jnp.zeros((0, dim))
+                for c in comps_range:
+                    dofs = jnp.asarray([offs[fidx] + nid * vt + c for nid in nids], dtype=jnp.int32)
+                    tv_entries.append((dofs, value_node, coords))
+                continue
+            for nid in nids:
+                p = pts_all[nid]
+                if value_node is not None:
+                    g = float(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(p)[None])).reshape(-1)[0])
+                elif callable(value):
+                    g = float(value(p))
+                else:
+                    g = float(value)
+                for c in comps_range:
+                    const_pairs.append((offs[fidx] + nid * vt + c, g))
+        return const_pairs, tv_entries
+
     # -------------------------------------------------------------------------
     # Mode detection
     # -------------------------------------------------------------------------
@@ -989,6 +1025,35 @@ def assemble_fem_native(
                     runtime_parameter_exprs=dict(_rt_param_exprs),
                     **common,
                 ),
+                "transient",
+                offs,
+            )
+
+        # ---- time-varying Dirichlet g(x, t) (linear, non-parametric): row-replacement Dirichlet whose
+        # held value is supplied by the forcing each step. Constant conditions go to the affine bias;
+        # the constrained dofs carry no time derivative (their mass row is zeroed) and the held value
+        # u[d] = g(x_d, t) is written into forcing_vector_fn(t) (the per-step Dirichlet lift). ----
+        _const_pairs, _tv_entries = _build_dirichlet_tv_entries()
+        if _tv_entries:
+            from ..._fem import _eval_value_node_at_time
+
+            _cd = jnp.asarray([p[0] for p in _const_pairs], dtype=jnp.int32) if _const_pairs else jnp.zeros((0,), jnp.int32)
+            _cv = jnp.asarray([p[1] for p in _const_pairs], dtype=zeros.dtype) if _const_pairs else zeros[:0]
+            _tvd = jnp.concatenate([e[0] for e in _tv_entries])
+            _all_d = jnp.concatenate([_cd, _tvd])
+            A_tv = spatial_jac(zeros, 0.0).at[_all_d, :].set(0.0).at[_all_d, _all_d].set(1.0)
+            M_tv = M.at[_all_d, :].set(0.0)
+            c_tv = zeros.at[_cd].set(_cv)
+            free_tv = jnp.ones((total,), dtype=zeros.dtype).at[_all_d].set(0.0)
+
+            def forcing_vector_fn(t, args=None, _mask=free_tv, _tv=_tv_entries):
+                f = _mask * (-spatial_res(zeros, t))  # source load on the free rows
+                for dofs, vnode, coords in _tv:
+                    f = f.at[dofs].set(jnp.asarray(_eval_value_node_at_time(vnode, coords, t)).reshape(-1))
+                return f
+
+            return (
+                FeaxTimeBlock(M=M_tv, A=A_tv, affine_bias=c_tv, forcing_vector_fn=forcing_vector_fn, **common),
                 "transient",
                 offs,
             )

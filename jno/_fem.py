@@ -1511,11 +1511,14 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         and _native_periodic_ok
     ):
         _native_now = True
-        if is_transient:
+        if is_transient and any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw):
             # native transient covers a runtime SCALAR parameter and a single-field nodal FIELD
-            # parameter k(x) (both threaded through operator_fn(t, args) via the per-cell gather), but
-            # not a time-varying Dirichlet g(x,t) -- that stays on feax.
-            _native_now = not any(_is_temporal_value_node(vnode) for *_rest, vnode in dirichlet_raw)
+            # parameter k(x). A time-varying Dirichlet g(x,t) routes native only for the LINEAR,
+            # non-parametric transient (the row-replacement + per-step Dirichlet-lift forcing path);
+            # combined with a runtime parameter or a nonlinear residual it stays on feax.
+            from .utils.solver.weak_form import _is_obviously_nonlinear_in_unknown as _nlin
+
+            _native_now = not any(_crp(b) for b in weak_bares) and not any(_nlin(domain, b) for b in weak_bares)
         if _native_now:
             from .utils.solver.fem_native import assemble_fem_native
 
@@ -1751,10 +1754,12 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
     )
 
     # Coupled transient (multi-field + time): block M + block spatial operator A. Native handles
-    # constant (incl. non-homogeneous) Dirichlet + a time-dependent source; time-varying Dirichlet
-    # g(x,t) (``dirichlet_tv``) stays on feax.
+    # constant (incl. non-homogeneous) Dirichlet + a time-dependent source, and a time-varying Dirichlet
+    # g(x,t) for the LINEAR block (row-replacement + per-step Dirichlet-lift forcing); a nonlinear block
+    # with a time-varying Dirichlet stays on feax (its native branch carries only constant Dirichlet).
     if is_transient:
-        if _native_ok and not dirichlet_tv:
+        _tv_native = not dirichlet_tv or not any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares)
+        if _native_ok and _tv_native:
             from .utils.solver.fem_native import assemble_fem_native
 
             domain._feax_problem = None
