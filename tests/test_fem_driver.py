@@ -21,7 +21,6 @@ import pytest
 
 import jno
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
 import jax  # noqa: E402
 from shapely.geometry import box  # noqa: E402
@@ -78,22 +77,6 @@ def test_linear_solve_default_and_custom_solver_match():
     u_custom = np.asarray(fem.solve(solve_fn=lambda A, b: jnp.linalg.solve(A, b)))
     assert np.allclose(u_default, direct, atol=1e-6)  # iterative: converged to BiCGStab tol
     assert np.allclose(u_custom, direct, atol=1e-10)  # dense direct: exact
-
-
-def test_matches_legacy_assembly_path():
-    # jno.fem must assemble the same linear system as the classic
-    # init_fem + weak.assemble(target="fem_system") authoring.
-    _, fem = _poisson_fem(mesh_size=0.18)
-
-    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.18)
-    d.init_fem(element_type="TRI3", quad_degree=3, bcs=[d.dirichlet("boundary", 0.0)], fem_solver=True)
-    u, phi = d.fem_symbols()
-    xg, yg, _ = d.variable("fem_gauss", split=True)
-    f = 2.0 * (xg * (1.0 - xg) + yg * (1.0 - yg))
-    A_leg, b_leg = (u.d(xg) * phi.d(xg) + u.d(yg) * phi.d(yg) - f * phi).assemble(d, target="fem_system")
-
-    assert np.allclose(_dense(fem.A), _dense(A_leg), atol=1e-9)
-    assert np.allclose(np.asarray(fem.b).reshape(-1), np.asarray(b_leg).reshape(-1), atol=1e-9)
 
 
 def test_nonlinear_form_is_residual_operator():

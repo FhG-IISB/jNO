@@ -580,7 +580,7 @@ def study_complex_helmholtz():
         fem = jno.fem([weak.real, u.real(xb, yb) - 0.0, u.imag(xb, yb) - 0.0])
         assert fem._mode == "linear"
         sol = _solve_linear(fem)
-        n = int(np.asarray(fem.problem.offset)[1])
+        n = int(fem.offsets[1])  # [0, n_re, n_total] -- the real/imag field split (native, no feax problem)
         er = _true_l2(d, 1, sol[:n], lambda co: sin(PI * co[0]) * sin(PI * co[1]))
         ei = _true_l2(d, 1, sol[n:], lambda co: sin(2 * PI * co[0]) * sin(PI * co[1]))
         return float(np.hypot(er, ei))
