@@ -231,16 +231,17 @@ def _native_lagrange_ok(domain: Any, constraints: List[Any], weak_bares: List[An
 
     * 3D (tet) *surface* (Neumann/Robin) terms — the tet-face quadrature is not tabulated yet, so a
       3D problem with boundary terms is excluded by the caller (it inspects ``boundary_terms``);
-    * periodic ties — the prolongation reduction reads a feax assembly problem;
     * FEM *field* (nodal ``k(x)``) parameters — native threads scalar parameters only.
 
     Note: a runtime-*scalar* parameter AND a single-field nodal FIELD parameter k(x) are allowed here
     (this gate only runs on single-field problems -- multifield returns earlier). The transient call
     sites add their own runtime-parameter exclusion (native transient-parametric is not wired yet).
+    Periodic ties are allowed here for the steady scalar single-field case (the caller scopes out the
+    transient / vector / parametric periodic sub-cases, which still build the reduction on feax); the
+    feax-free reduction (``_build_periodic_reduction``) is fed the native assembly cells in
+    ``_finalize``.
     """
     if getattr(domain, "dimension", None) not in (2, 3):
-        return False
-    if periodic_ties:
         return False
     if _trial_spaces(constraints) - {"Lagrange"}:
         return False
@@ -1270,7 +1271,14 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         if periodic_holder:
             fem_obj._periodic = periodic_holder[0]
         else:
-            cells, ele_order = _assembly_cells(getattr(fem_obj, "problem", None))
+            prob = getattr(fem_obj, "problem", None)
+            if prob is not None:
+                cells, ele_order = _assembly_cells(prob)
+            else:
+                # Native path: no feax problem -- read the assembly cells the native assembler stashed
+                # (``None`` for the native 1D route, which falls back to flat-chain facets on points).
+                cells = getattr(domain, "_fem_native_assembly_cells", None)
+                ele_order = int(getattr(domain, "_fem_native_assembly_order", 1))
             fem_obj._periodic = _build_periodic_reduction(domain, periodic_ties, fem_obj.points, cells, ele_order, vec or 1)
         return fem_obj
 
@@ -1490,12 +1498,21 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     # (constant Dirichlet + a time-dependent source). complex / VPINN / periodic / 3D-surface /
     # field-param / time-varying-Dirichlet / transient-parametric fall through to the feax paths
     # below. ----
+    from .utils.solver.parametric_helpers import _contains_runtime_parameter as _crp
+
+    # Native periodic is wired only for the steady, scalar, non-parametric single-field case that
+    # ``_finalize`` reduces (it raises on vector / runtime-parametric, and the transient route pre-
+    # builds the reduction into the feax context). Those periodic sub-cases stay on feax.
+    _native_periodic_ok = not periodic_ties or (
+        not is_transient and (vec or 1) == 1 and not any(_crp(b) for b in weak_bares)
+    )
     if (
         not is_vpinn
         and _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
         and not _is_complex_form(domain, ir)
         # 3D surface (Neumann/Robin) needs tet-face quadrature the native assembler does not tabulate.
         and not (int(domain.dimension) == 3 and boundary_terms)
+        and _native_periodic_ok
     ):
         from .utils.solver.parametric_helpers import _contains_fem_field_parameter as _cfp
 

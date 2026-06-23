@@ -421,6 +421,73 @@ def test_3d_tet_neumann_routes_to_feax():
     assert fem.problem is not None  # native correctly declined; feax handled the surface term
 
 
+# ---------------------------------------------------------------------------
+# Periodic ties: the feax-free prolongation reduction (_build_periodic_reduction +
+# build_periodic_prolongation) is fed the native assembly cells, so a steady scalar
+# single-field periodic problem reduces and solves without feax. Transient / vector /
+# runtime-parametric periodic stay on feax.
+# ---------------------------------------------------------------------------
+
+
+def test_periodic_steady_scalar_routes_native_and_reduces():
+    """A steady scalar Poisson, periodic in x (``u(left) - u(right)``) + Dirichlet in y, assembles
+    natively (no feax problem) and the periodic tie still reduces the system (slave DOFs eliminated)
+    and recovers the manufactured solution -- the reduction reads the native assembly cells."""
+    pi = np.pi
+    dom = jno.domain({"fine": box(0, 0, 0.5, 1), "coarse": box(0.5, 0, 1, 1)}).build_mesh(0.12, sizes={"fine": 0.06})
+    dom.tag("left", lambda x, y: (x < 1e-6) & (y > 1e-6) & (y < 1 - 1e-6))
+    dom.tag("right", lambda x, y: (x > 1 - 1e-6) & (y > 1e-6) & (y < 1 - 1e-6))
+    dom.tag("bottom", lambda x, y: y < 1e-6)
+    dom.tag("top", lambda x, y: y > 1 - 1e-6)
+
+    u, phi = dom.fem_symbols()
+    xi, yi, _ = dom.variable("interior", split=True)
+    xb, yb, _ = dom.variable("bottom", split=True)
+    xt, yt, _ = dom.variable("top", split=True)
+    xl, yl, _ = dom.variable("left", split=True)
+    xr, yr, _ = dom.variable("right", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    hh = jno.np.cos(2 * pi * xi) + 0.5 * jno.np.sin(2 * pi * xi)
+    f = 5 * pi**2 * hh * sin(PI * yi)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0, u(xt, yt) - 0.0, u(xl, yl) - u(xr, yr)])
+
+    assert fem.problem is None  # routed natively
+    assert fem._periodic is not None and fem._periodic["n_red"] < fem._periodic["n_full"]
+    uh = np.asarray(fem.solve())
+    pts = np.asarray(fem.points)
+    ex = (np.cos(2 * pi * pts[:, 0]) + 0.5 * np.sin(2 * pi * pts[:, 0])) * np.sin(pi * pts[:, 1])
+    assert float(np.linalg.norm(uh - ex) / np.linalg.norm(ex)) < 0.05
+
+
+def test_periodic_transient_stays_on_feax():
+    """The transient periodic route pre-builds the reduction into the feax context at assembly time,
+    so a transient periodic problem must NOT route native (native scopes periodic to the steady case)."""
+    dom = jno.domain(box(0, 0, 1, 1), mesh_size=0.2, time=(0.0, 0.01, 2))
+    dom.tag("left", lambda x, y: (x < 1e-6) & (y > 1e-6) & (y < 1 - 1e-6))
+    dom.tag("right", lambda x, y: (x > 1 - 1e-6) & (y > 1e-6) & (y < 1 - 1e-6))
+    dom.tag("bottom", lambda x, y: y < 1e-6)
+    dom.tag("top", lambda x, y: y > 1 - 1e-6)
+    u, phi = dom.fem_symbols()
+    xi, yi, ti = dom.variable("interior", split=True)
+    xb, yb, _ = dom.variable("bottom", split=True)
+    xt, yt, _ = dom.variable("top", split=True)
+    xl, yl, _ = dom.variable("left", split=True)
+    xr, yr, _ = dom.variable("right", split=True)
+    ci = dom.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    ic = sin(PI * ci[0]) * sin(PI * ci[1])
+    fem = jno.fem(
+        [
+            ui.t * vi + ui.x * vi.x + ui.y * vi.y,  # u_t = Δu
+            u(xb, yb) - 0.0,
+            u(xt, yt) - 0.0,
+            u(xl, yl) - u(xr, yr),  # periodic in x
+            u(ci[0], ci[1]) - ic,
+        ]
+    )
+    assert fem.problem is not None  # transient periodic stayed on feax
+
+
 @pytest.mark.parametrize("vec", [1, 2])
 def test_large_mesh_assembles_without_blowup(vec):
     """The Jacobian is assembled per element (``jacfwd`` of each element residual), so a fine mesh

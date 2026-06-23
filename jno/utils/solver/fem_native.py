@@ -392,6 +392,12 @@ def assemble_fem_native(
     domain._fem_native_dof_points = np.asarray(pts_f_all[0])
     domain._fem_native_dof_points_all = [np.asarray(p) for p in pts_f_all]
 
+    # Field-0 assembly cells + element order, for the periodic-tie reduction (``_build_periodic_
+    # reduction`` reads the assembly mesh's cells to extract boundary facets). On the native path
+    # there is no feax problem to query, so ``_finalize`` reads these instead of ``_assembly_cells``.
+    domain._fem_native_assembly_cells = np.asarray(cells_f_all[0])
+    domain._fem_native_assembly_order = int(fields[0]["order"])
+
     # -------------------------------------------------------------------------
     # Element specs and JAX constants
     # -------------------------------------------------------------------------
