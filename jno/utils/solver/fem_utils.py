@@ -13,6 +13,7 @@ Responsibilities:
 """
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import jax.experimental.sparse as jsparse
 import jax.numpy as jnp
 import numpy as np
 from jax.flatten_util import ravel_pytree
@@ -1972,6 +1973,48 @@ def build_periodic_prolongation(
         "n_red": n_red_full,
         "vec": int(vec),
     }
+
+
+# ---------------------------------------------------------------------------
+# Sparse (BCOO) Dirichlet row/column operations
+#
+# The native assembler returns the global matrix as a BCOO (``O(nnz)``, never the
+# dense ``O(n^2)`` array). These keep the three dense Dirichlet primitives
+# (``.at[d,:].set(0)``, ``.at[:,d].set(0)``, ``.at[d,d].set(1)``) sparse: a row/col
+# is "zeroed" by masking the stored values (nse unchanged — zeroed entries stay as
+# explicit-zero triplets, harmless to matvec); a unit diagonal is appended as
+# ``(d, d, 1)`` triplets (BCOO sums duplicates on matvec / todense / sum_duplicates,
+# so the zeroed original ``(d,d)`` plus the appended ``1`` is exactly ``1``). All are
+# static-``nse``, ``jit``-safe and differentiable in the stored values.
+# ---------------------------------------------------------------------------
+
+
+def bcoo_zero_rows(A, dofs):
+    """``A.at[dofs, :].set(0)`` for a BCOO ``A`` — mask out every stored entry on a ``dofs`` row."""
+    isd = jnp.zeros(A.shape[0], A.data.dtype).at[dofs].set(1.0)
+    keep = 1.0 - isd[A.indices[:, 0]]
+    return jsparse.BCOO((A.data * keep, A.indices), shape=A.shape)
+
+
+def bcoo_zero_rows_cols(A, dofs):
+    """``A.at[dofs, :].set(0).at[:, dofs].set(0)`` for a BCOO ``A`` (symmetric elimination, no diagonal)."""
+    isd = jnp.zeros(A.shape[0], A.data.dtype).at[dofs].set(1.0)
+    keep = (1.0 - isd[A.indices[:, 0]]) * (1.0 - isd[A.indices[:, 1]])
+    return jsparse.BCOO((A.data * keep, A.indices), shape=A.shape)
+
+
+def bcoo_set_unit_diag(A, dofs):
+    """Append unit-diagonal triplets ``(d, d, 1)`` for ``d in dofs`` to a BCOO ``A`` (after the rows
+    were zeroed, this makes ``A[d, d] == 1`` exactly — duplicate indices are summed)."""
+    eye_idx = jnp.stack([dofs, dofs], axis=1).astype(A.indices.dtype)
+    eye_dat = jnp.ones(jnp.asarray(dofs).shape[0], A.data.dtype)
+    return jsparse.BCOO((jnp.concatenate([A.data, eye_dat]), jnp.concatenate([A.indices, eye_idx])), shape=A.shape)
+
+
+def bcoo_set_dirichlet_rows(A, dofs):
+    """``A.at[dofs, :].set(0).at[dofs, dofs].set(1)`` for a BCOO ``A`` — row-replacement (identity row,
+    columns kept): the matrix-level analogue of the Newton row-replacement residual."""
+    return bcoo_set_unit_diag(bcoo_zero_rows(A, dofs), dofs)
 
 
 # ---------------------------------------------------------------------------

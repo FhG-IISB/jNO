@@ -90,7 +90,7 @@ def test_linear_recovers_default_solver():
     assert sys.is_parametric and list(sys.runtime_parameter_exprs) == ["alpha"]
 
     A1, b1 = sys.evaluate({"alpha": 1.0})
-    u_obs = jnp.linalg.solve(jnp.asarray(A1), jnp.asarray(b1).reshape(-1))
+    u_obs = jnp.linalg.solve(A1.todense(), jnp.asarray(b1).reshape(-1))
 
     rec = _recover(fem.solve(), alpha, u_obs)
     assert abs(rec - 2.0) > 0.5, "parameter did not move -- gradient did not reach it"
@@ -101,9 +101,10 @@ def test_linear_recovers_with_byo_dense_solver():
     alpha = _alpha()
     fem = _linear_fem(alpha)
     A1, b1 = fem.operator.evaluate({"alpha": 1.0})
-    u_obs = jnp.linalg.solve(jnp.asarray(A1), jnp.asarray(b1).reshape(-1))
+    u_obs = jnp.linalg.solve(A1.todense(), jnp.asarray(b1).reshape(-1))
 
-    u_node = fem.solve(lambda A, b: jnp.linalg.solve(A, b))  # bring-your-own dense solver
+    # bring-your-own dense solver: solve_fn receives the raw BCOO operator, so densify it
+    u_node = fem.solve(lambda A, b: jnp.linalg.solve(A.todense() if hasattr(A, "todense") else A, b))
     rec = _recover(u_node, alpha, u_obs)
     assert abs(rec - 1.0) < TOL, f"linear (BYO dense): recovered alpha={rec:.4f}"
 
@@ -149,7 +150,7 @@ def test_nonaffine_scalar_recovers_via_reassembly():
     assert list(fem.operator.runtime_parameter_exprs) == ["logk"]
 
     A1, b1 = fem.operator.evaluate({"logk": 0.0})  # truth k = exp(0) = 1
-    u_obs = jnp.linalg.solve(jnp.asarray(A1), jnp.asarray(b1).reshape(-1))
+    u_obs = jnp.linalg.solve(A1.todense(), jnp.asarray(b1).reshape(-1))
 
     rec = _recover(fem.solve(), logk, u_obs, n=150)
     assert abs(rec - 0.7) > 0.3, "parameter did not move -- gradient did not reach it through re-assembly"
@@ -162,14 +163,14 @@ def test_global_solve_runs_once_per_step_not_per_node():
     alpha = _alpha()
     fem = _linear_fem(alpha)
     A1, b1 = fem.operator.evaluate({"alpha": 1.0})
-    u_obs = jnp.linalg.solve(jnp.asarray(A1), jnp.asarray(b1).reshape(-1))
+    u_obs = jnp.linalg.solve(A1.todense(), jnp.asarray(b1).reshape(-1))
     n_nodes = int(fem.dofs)
 
     calls = [0]
 
     def counting_solve(A, b):
         jax.debug.callback(lambda: calls.__setitem__(0, calls[0] + 1))
-        return jnp.linalg.solve(A, b)
+        return jnp.linalg.solve(A.todense() if hasattr(A, "todense") else A, b)
 
     u_node = fem.solve(counting_solve)
     crux = jno.core([(u_node - u_obs).mse], domain=_DUMMY)
@@ -212,13 +213,13 @@ def test_nodal_field_parameter_recovers_via_crux():
     )
     A_field, _ = fem.operator.evaluate({"k": k_true})
     A_ref = np.asarray(fem_ref.A.todense() if hasattr(fem_ref.A, "todense") else fem_ref.A)
-    assert np.max(np.abs(np.asarray(A_field) - A_ref)) < 1e-9, "nodal interpolation/gather mismatch"
+    assert np.max(np.abs(np.asarray(A_field.todense()) - A_ref)) < 1e-9, "nodal interpolation/gather mismatch"
 
     A_t, b = fem.operator.evaluate({"k": k_true})
-    u_obs = jnp.linalg.solve(jnp.asarray(A_t), jnp.asarray(b).reshape(-1))
+    u_obs = jnp.linalg.solve(A_t.todense(), jnp.asarray(b).reshape(-1))
 
     A_t, b = fem.operator.evaluate({"k": k_true})
-    u_obs = jnp.linalg.solve(jnp.asarray(A_t), jnp.asarray(b).reshape(-1))
+    u_obs = jnp.linalg.solve(A_t.todense(), jnp.asarray(b).reshape(-1))
 
     # Recover the full nodal field k(x) through crux.solve (the differentiable
     # re-assembled solve). Well-posed enough here from full-field data; field
@@ -378,7 +379,7 @@ def test_transient_recovers_default_scan():
     # backward-Euler matrix M + dt A would be singular (rank-deficient on the bc rows).
     M = np.asarray(block.M.todense() if hasattr(block.M, "todense") else block.M)  # block.M is a BCOO -> densify
     dt = float(block.dt)
-    S = M + dt * np.asarray(block.operator_fn(dt, {"alpha": 1.0}))
+    S = M + dt * np.asarray(block.operator_fn(dt, {"alpha": 1.0}).todense())
     assert np.linalg.matrix_rank(S) == S.shape[0], "M + dt A is singular -- Dirichlet identity missing from A"
 
     n_dofs = int(M.shape[0])
@@ -419,7 +420,7 @@ def test_transient_save_ts_decouples_from_dt():
 
     _, fem = _transient_heat_fem(_alpha())
     block = fem.operator
-    n_dofs = int(np.asarray(block.M).shape[0])
+    n_dofs = int(block.M.shape[0])  # BCOO or dense — both expose .shape
 
     fine = _default_transient_integrate(block, {"alpha": 1.0}, _grid_ts(block))
     coarse_ts = jnp.array([float(block.t0), float(block.t1)])  # only 2 output points
@@ -493,7 +494,7 @@ def test_steady_nonhomog_dirichlet_parametric_recovers():
     f = 2.0 * (xi * (1 - xi) + yi * (1 - yi))
     fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 1.0], quad_degree=3)
     A1, b1 = fem.operator.evaluate({"alpha": 1.0})
-    u_obs = jnp.linalg.solve(jnp.asarray(A1), jnp.asarray(b1).reshape(-1))
+    u_obs = jnp.linalg.solve(A1.todense(), jnp.asarray(b1).reshape(-1))
     rec = _recover(fem.solve(), k, u_obs)
     assert abs(rec - 1.0) < TOL, f"steady non-homogeneous parametric: recovered k={rec:.4f}"
 

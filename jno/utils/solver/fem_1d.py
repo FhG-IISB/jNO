@@ -31,7 +31,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.flatten_util import ravel_pytree
 
-from .fem_utils import _eval_integrand
+from .fem_utils import _eval_integrand, bcoo_set_unit_diag, bcoo_zero_rows_cols
 
 _COMPONENT_NAMES = {"x": 0, "y": 1, "z": 2}
 
@@ -205,6 +205,12 @@ def _apply_dirichlet_symmetric(A, b, dirichlet_pairs: List[Tuple[int, float]]):
         return A, b
     dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32)
     vals = jnp.asarray([p[1] for p in dirichlet_pairs], dtype=b.dtype)
+    if hasattr(A, "indices"):  # BCOO (native 2D/3D assembler) — keep it sparse, never densify
+        e = jnp.zeros(A.shape[0], b.dtype).at[dofs].set(vals)  # the known-column lift
+        b = b - A @ e  # carry the known columns to the load (a BCOO matvec, no dense column slice)
+        A = bcoo_set_unit_diag(bcoo_zero_rows_cols(A, dofs), dofs)
+        b = b.at[dofs].set(vals)
+        return A, b
     b = b - A[:, dofs] @ vals  # carry the known columns to the load
     A = A.at[dofs, :].set(0.0).at[:, dofs].set(0.0).at[dofs, dofs].set(1.0)
     b = b.at[dofs].set(vals)
@@ -294,7 +300,7 @@ def _apply_dirichlet_transient(M, A, c, dirichlet_pairs: List[Tuple[int, float]]
     A, c = _apply_dirichlet_symmetric(A, c, dirichlet_pairs)
     if dirichlet_pairs:
         dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32)
-        M = M.at[dofs, :].set(0.0).at[:, dofs].set(0.0)
+        M = bcoo_zero_rows_cols(M, dofs) if hasattr(M, "indices") else M.at[dofs, :].set(0.0).at[:, dofs].set(0.0)
     return M, A, c
 
 

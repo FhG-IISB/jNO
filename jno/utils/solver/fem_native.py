@@ -41,6 +41,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Tuple
 
 import jax
+import jax.experimental.sparse as jsparse
 import jax.numpy as jnp
 import numpy as np
 
@@ -63,6 +64,9 @@ from .fem_utils import (
     _lower_statefield_to_trial,
     _promote_to_quadratic,
     _test_field_index,
+    bcoo_set_dirichlet_rows,
+    bcoo_zero_rows,
+    bcoo_zero_rows_cols,
 )
 from .parametric_helpers import _collect_runtime_parameter_exprs
 from .weak_form import (
@@ -778,7 +782,11 @@ def assemble_fem_native(
         typed_with_masks, surface_work = _preprocess_terms(terms, bterms)
 
         def jacobian(u_flat, t=0.0, args=None):
-            A = jnp.zeros((total, total), dtype=u_flat.dtype)
+            # Assemble into COO triplets and build a BCOO -- never materialises the dense (total, total)
+            # matrix (O(nnz), GPU-able at large N). Each per-element block is element-sized; duplicate
+            # (i, j) triplets from neighbouring cells are summed by BCOO on matvec / todense, so the
+            # per-cell blocks are simply concatenated (no pre-summation).
+            rows_l, cols_l, data_l = [], [], []
             local_all = u_flat[cell_all_dofs]  # (n_cell, n_local_all)
 
             for coeff, tfi, rnames in typed_with_masks:
@@ -787,8 +795,11 @@ def assemble_fem_native(
                     return jax.jacfwd(lambda v: _vol_elem_res(c, v, _e, _t, _r, t, args))(la)
 
                 Ke = jax.vmap(_ke)(jnp.arange(n_cells), local_all)  # (n_cell, n_test_tfi, n_local_all)
-                rows = cdofs[tfi]  # (n_cell, n_test_tfi)
-                A = A.at[rows[:, :, None], cell_all_dofs[:, None, :]].add(Ke)
+                r = jnp.broadcast_to(cdofs[tfi][:, :, None], Ke.shape)
+                c = jnp.broadcast_to(cell_all_dofs[:, None, :], Ke.shape)
+                rows_l.append(r.reshape(-1))
+                cols_l.append(c.reshape(-1))
+                data_l.append(Ke.reshape(-1))
 
             for region, face_ids, btyped in surface_work:
                 fids = jnp.asarray(face_ids, dtype=jnp.int32)
@@ -801,9 +812,16 @@ def assemble_fem_native(
                         return jax.jacfwd(lambda v: _surf_elem_res(fi, v, _e, _t, _r, t, args))(la)
 
                     Kef = jax.vmap(_kef)(fids, lv)  # (n_face, n_test_btfi, n_local_all)
-                    frows = cdofs[btfi][pcells]  # (n_face, n_test_btfi)
-                    A = A.at[frows[:, :, None], fcols[:, None, :]].add(Kef)
-            return A
+                    fr = jnp.broadcast_to(cdofs[btfi][pcells][:, :, None], Kef.shape)
+                    fc = jnp.broadcast_to(fcols[:, None, :], Kef.shape)
+                    rows_l.append(fr.reshape(-1))
+                    cols_l.append(fc.reshape(-1))
+                    data_l.append(Kef.reshape(-1))
+
+            if not data_l:  # no terms -> empty operator
+                return jsparse.BCOO((jnp.zeros((0,), u_flat.dtype), jnp.zeros((0, 2), jnp.int32)), shape=(total, total))
+            idx = jnp.stack([jnp.concatenate(rows_l).astype(jnp.int32), jnp.concatenate(cols_l).astype(jnp.int32)], axis=1)
+            return jsparse.BCOO((jnp.concatenate(data_l), idx), shape=(total, total))
 
         return jacobian
 
@@ -816,7 +834,7 @@ def assemble_fem_native(
         dofs = jnp.asarray([p[0] for p in pairs], dtype=jnp.int32)
 
         def jac(u_flat):
-            return jac_fn(jnp.asarray(u_flat)).at[dofs, :].set(0.0).at[dofs, dofs].set(1.0)
+            return bcoo_set_dirichlet_rows(jac_fn(jnp.asarray(u_flat)), dofs)
 
         return jac
 
@@ -1008,9 +1026,9 @@ def assemble_fem_native(
 
             def jac_bc(u, t, args=None, _d=d_dofs):
                 J = spatial_jac(jnp.asarray(u), t, args)
-                return J if _d is None else J.at[_d, :].set(0.0).at[_d, _d].set(1.0)
+                return J if _d is None else bcoo_set_dirichlet_rows(J, _d)
 
-            M_bc = M if d_dofs is None else M.at[d_dofs, :].set(0.0).at[:, d_dofs].set(0.0)
+            M_bc = M if d_dofs is None else bcoo_zero_rows_cols(M, d_dofs)
             return (
                 SemidiscreteTimeBlock(
                     mass=lambda t, args=None, _M=M_bc: _M,
@@ -1027,7 +1045,7 @@ def assemble_fem_native(
         # Row-replacement Dirichlet (rows -> identity, columns kept) needs no args-dependent lift --
         # the coupling to the held Dirichlet value sits on the LHS, the constant g in the affine bias. ----
         if runtime_parameter_tags:
-            M_bc = M if d_dofs is None else M.at[d_dofs, :].set(0.0).at[:, d_dofs].set(0.0)
+            M_bc = M if d_dofs is None else bcoo_zero_rows_cols(M, d_dofs)
             c_bias = zeros if d_dofs is None else zeros.at[d_dofs].set(d_vals)
             free_mask = jnp.ones((total,), dtype=zeros.dtype)
             if d_dofs is not None:
@@ -1035,7 +1053,7 @@ def assemble_fem_native(
 
             def operator_fn(t, args=None, _d=d_dofs):
                 A = spatial_jac(zeros, t, args)
-                return A if _d is None else A.at[_d, :].set(0.0).at[_d, _d].set(1.0)
+                return A if _d is None else bcoo_set_dirichlet_rows(A, _d)
 
             def forcing_vector_fn(t, args=None, _mask=free_mask):
                 return _mask * (-spatial_res(zeros, t, args))
@@ -1068,8 +1086,8 @@ def assemble_fem_native(
             _cv = jnp.asarray([p[1] for p in _const_pairs], dtype=zeros.dtype) if _const_pairs else zeros[:0]
             _tvd = jnp.concatenate([e[0] for e in _tv_entries])
             _all_d = jnp.concatenate([_cd, _tvd])
-            A_tv = spatial_jac(zeros, 0.0).at[_all_d, :].set(0.0).at[_all_d, _all_d].set(1.0)
-            M_tv = M.at[_all_d, :].set(0.0)
+            A_tv = bcoo_set_dirichlet_rows(spatial_jac(zeros, 0.0), _all_d)
+            M_tv = bcoo_zero_rows(M, _all_d)
             c_tv = zeros.at[_cd].set(_cv)
             free_tv = jnp.ones((total,), dtype=zeros.dtype).at[_all_d].set(0.0)
 
@@ -1130,7 +1148,7 @@ def assemble_fem_native(
 
             def jac_p(u, args=None, _d=s_d_dofs):
                 J = jacobian(jnp.asarray(u), 0.0, args)
-                return J if _d is None else J.at[_d, :].set(0.0).at[_d, _d].set(1.0)
+                return J if _d is None else bcoo_set_dirichlet_rows(J, _d)
 
             return (
                 FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_rt_param_exprs)),
@@ -1176,5 +1194,5 @@ def assemble_fem_native(
     A = jacobian(zeros)
     b = -residual(zeros)
     if dirichlet_pairs:
-        A, b = _apply_dirichlet_symmetric(jnp.asarray(A), jnp.asarray(b), dirichlet_pairs)
+        A, b = _apply_dirichlet_symmetric(A, jnp.asarray(b).reshape(-1), dirichlet_pairs)
     return (A, b), "linear", offs

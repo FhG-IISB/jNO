@@ -2923,26 +2923,32 @@ class FemLinearSystem:
         ``fem = jno.fem([...])`` (see ``docs/inverse-problems.md``).
 
         ``solve_fn`` is **your** solver: any ``(A, b) -> u`` callable. jNO writes no
-        solver code and imposes no library — the default is a dense ``jnp.linalg.solve``
-        (this runtime-parametric path is for inverse problems, usually modest in size). For
-        a robust differentiable **direct** solve pass ``jno.utils.solver.linear.sparse_lu_solve``
-        (JAX ``spsolve``, no dependency). Use a differentiable solver so ``∂u/∂θ`` exists.
+        solver code and imposes no library — the default is the differentiable sparse-direct
+        ``jno.utils.solver.linear.sparse_lu_solve`` (JAX ``spsolve``, no dependency), which takes
+        the assembler's BCOO operator **without densifying** (``O(nnz)``, large-``N`` friendly) and
+        is reverse-mode differentiable in both ``A``'s entries and ``b``. Pass your own
+        ``(A, b) -> u`` to choose another solver/library — it receives the **BCOO** operator, so a
+        dense solver must densify (``jnp.linalg.solve(A.todense(), b)``). Use a differentiable solver
+        so ``∂u/∂θ`` exists.
 
         Note: the FEM solve is global (one ``A``, ``b``, ``u``); enable x64
         (``jax_enable_x64``) and set the parameter dtype to match — the
-        assembly is float64.
+        assembly is float64. (``spsolve``'s cuSolver-GPU path can be flaky; pass your own
+        ``solve_fn`` if you hit it on GPU.)
         """
         if solve_fn is None:
+            from ..utils.solver.linear import sparse_lu_solve
 
-            def solve_fn(A, b):
-                return jnp.linalg.solve(A, b)
+            solve_fn = sparse_lu_solve  # sparse-direct on the BCOO operator; never densifies
 
         names = list(self.runtime_parameter_exprs)
         params = [self.runtime_parameter_exprs[n] for n in names]
 
         def _solve(*values):
             A, b = self.evaluate(dict(zip(names, values)))
-            return solve_fn(jnp.asarray(A), jnp.asarray(b).reshape(-1))
+            # keep a BCOO ``A`` sparse for the sparse solver (only coerce a plain dense operator)
+            A = A if hasattr(A, "todense") else jnp.asarray(A)
+            return solve_fn(A, jnp.asarray(b).reshape(-1))
 
         return FunctionCall(_solve, params, name="fem_solve")
 

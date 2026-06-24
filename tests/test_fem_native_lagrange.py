@@ -567,7 +567,7 @@ def test_large_mesh_assembles_without_blowup(vec):
 
 def _march(fem):
     """Backward-Euler march of a native SemidiscreteTimeBlock (M u̇ + A u = c + f(t))."""
-    M, A = np.asarray(fem.M), np.asarray(fem.operator.A)
+    M, A = _dense(fem.M), _dense(fem.operator.A)
     c = np.asarray(fem.operator.affine_bias).reshape(-1)
     f = fem.operator.forcing_vector_fn
     w = np.asarray(fem.state0).reshape(-1).copy()
@@ -645,8 +645,8 @@ def test_transient_scalar_parametric_routes_native():
     assert fem.is_transient and fem.problem is None
     blk = fem.operator
     assert blk.operator_fn is not None and list(blk.runtime_parameter_exprs) == ["alpha"]
-    a1 = np.asarray(blk.operator_fn(0.0, {"alpha": 1.0}))
-    a2 = np.asarray(blk.operator_fn(0.0, {"alpha": 2.0}))
+    a1 = np.asarray(blk.operator_fn(0.0, {"alpha": 1.0}).todense())
+    a2 = np.asarray(blk.operator_fn(0.0, {"alpha": 2.0}).todense())
     free = ~np.isclose(np.abs(a1).sum(axis=1), 1.0)  # interior rows (Dirichlet rows -> unit diagonal)
     assert free.any() and np.abs(a2[free] - 2.0 * a1[free]).max() < 1e-10
 
@@ -678,8 +678,8 @@ def test_native_parametric_routes_native_and_is_parametric():
     assert sys.is_parametric and list(sys.runtime_parameter_exprs) == ["alpha"]
     # The operator genuinely depends on alpha: the free (non-Dirichlet) rows scale by alpha for
     # -alpha*lap (Dirichlet rows are the identity regardless, so compare only the free block).
-    a1 = np.asarray(sys.evaluate({"alpha": 1.0})[0])
-    a2 = np.asarray(sys.evaluate({"alpha": 2.0})[0])
+    a1 = _dense(sys.evaluate({"alpha": 1.0})[0])
+    a2 = _dense(sys.evaluate({"alpha": 2.0})[0])
     free = ~np.isclose(np.abs(a1).sum(axis=1), 1.0)  # interior rows (Dirichlet rows have a unit diagonal only)
     assert free.any()
     assert np.abs(a2[free] - 2.0 * a1[free]).max() < 1e-10
@@ -693,7 +693,7 @@ def test_native_parametric_gradient_matches_finite_difference():
 
     def loss(a):
         A, b = sys.evaluate({"alpha": a})
-        u = jnp.linalg.solve(jnp.asarray(A), jnp.asarray(b).reshape(-1))
+        u = jnp.linalg.solve(A.todense(), jnp.asarray(b).reshape(-1))
         return jnp.sum(u**2)
 
     a0 = 1.3
@@ -731,13 +731,13 @@ def test_native_field_parameter_routes_native_and_gradient_flows():
     nodes = np.asarray(d.built_mesh.points)[:, :2]
     k_true = jnp.asarray(0.6 + 0.8 * nodes[:, 0] + 0.5 * nodes[:, 1])  # smooth, exactly P1-representable
     fem_ref = jno.fem([(0.6 + 0.8 * xi + 0.5 * yi) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
-    A_field = np.asarray(sys.evaluate({"k": k_true})[0])
+    A_field = _dense(sys.evaluate({"k": k_true})[0])
     A_ref = np.asarray(fem_ref.A)
     assert np.abs(A_field - A_ref).max() < 1e-9  # nodal interpolation/gather is exact for a linear k
 
     def loss(kv):
         A, b = sys.evaluate({"k": kv})
-        return jnp.sum(jnp.linalg.solve(jnp.asarray(A), jnp.asarray(b).reshape(-1)) ** 2)
+        return jnp.sum(jnp.linalg.solve(A.todense(), jnp.asarray(b).reshape(-1)) ** 2)
 
     g_ad = np.asarray(jax.grad(loss)(k_true))
     j = int(np.argmax(np.abs(g_ad)))  # check the most-sensitive nodal component

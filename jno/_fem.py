@@ -977,7 +977,7 @@ class FEM:
             if getattr(tb, "state0", None) is not None:
                 return int(jnp.asarray(tb.state0).reshape(-1).shape[0])
             if getattr(tb, "M", None) is not None:
-                return int(jnp.asarray(tb.M).shape[0])
+                return int(tb.M.shape[0])  # BCOO or dense — both expose .shape
         prob = self.problem
         return int(prob.num_total_dofs_all_vars) if prob is not None else None
 
@@ -1719,7 +1719,7 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         (A_i, c_i), _mi, _o2 = assemble_fem_native(
             domain, [s.imag for s in spatial_raw], imag_bd, dirichlet_raw, [], vec=vec or 1, quad_degree=quad_degree
         )
-        M = jnp.asarray(M_raw)
+        M = _as_dense(M_raw)  # complex path composes via jnp.block -> densify the BCOO assembler output
         n = int(M.shape[0])
         d_pairs = list(getattr(domain, "_fem_native_dirichlet_pairs", []) or [])
         d_dofs = jnp.asarray([p[0] for p in d_pairs], dtype=jnp.int32) if d_pairs else jnp.zeros((0,), jnp.int32)
@@ -1741,10 +1741,10 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             dt=dt,
             eval_context={},
         )
-        block_r = _FTB(M=M_bc, A=jnp.asarray(A_r), affine_bias=jnp.asarray(c_r).reshape(-1), state0=jnp.real(s0), **_common)
+        block_r = _FTB(M=M_bc, A=_as_dense(A_r), affine_bias=jnp.asarray(c_r).reshape(-1), state0=jnp.real(s0), **_common)
         block_i = _FTB(
             M=jnp.zeros((n, n), M.dtype),
-            A=jnp.asarray(A_i),
+            A=_as_dense(A_i),
             affine_bias=jnp.asarray(c_i).reshape(-1),
             state0=jnp.imag(s0),
             **_common,
@@ -2146,7 +2146,8 @@ def _assemble_second_order_time(
     # applied explicitly to the 2N augmented system below (row replacement, columns kept).
     def _native_matrix(terms, bterms):
         op, _mode, _offs = assemble_fem_native(domain, terms, bterms, [], [], vec=vec, quad_degree=quad_degree)
-        return jnp.asarray(op[0]), jnp.asarray(op[1]).reshape(-1)
+        # second-order augmentation composes via jnp.block -> densify the BCOO assembler output
+        return _as_dense(op[0]), jnp.asarray(op[1]).reshape(-1)
 
     M2, _ = _native_matrix(mass2_raw, {})
     n = int(M2.shape[0])
