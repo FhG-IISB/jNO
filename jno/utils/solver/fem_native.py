@@ -362,6 +362,7 @@ def assemble_fem_native(
     cell_key = "triangle" if dim == 2 else "tetrahedron"
 
     ctx = dict(getattr(domain, "context", {}) or {})
+    ctx.pop("cell_size", None)  # `dom.cell_size` placeholder; the real per-cell h is packed per volume element below
 
     # -------------------------------------------------------------------------
     # Field layout inference
@@ -601,6 +602,9 @@ def assemble_fem_native(
         region_mask...])."""
         cell_sols = _split_cell_local(local_all)
         per, xq, meas = _cell_fields(c, cell_sols)
+        # Element size h = |detJ|^(1/dim) at the quad points -> the `dom.cell_size` symbol (SUPG/GLS).
+        # Constant w.r.t. the cell DOFs (geometry only), so the per-cell Jacobian sees it as a constant.
+        h_qp = jnp.broadcast_to(meas ** (1.0 / dim), (qw_shared.shape[0], 1))
         cell_masks = tuple(region_mask_arrays[list(region_mask_names).index(r)][c] for r in rnames)
         loc = {
             "physical_quad_points": xq,
@@ -608,7 +612,7 @@ def assemble_fem_native(
             "field_index": field_index,
             "tag": "fem_gauss",
             "surface": False,
-            "domain_context": ctx,
+            "domain_context": {**ctx, "cell_size": h_qp},
             "temporal_tags": temporal_tags,
             "runtime_parameter_tags": runtime_parameter_tags,
             "region_mask_names": rnames,

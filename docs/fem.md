@@ -6,7 +6,10 @@ volume physics, natural boundary terms, and essential boundary conditions, all i
 list — and `jno.fem` returns a `FEM` object carrying the assembled operators.
 
 The same traced weak-form language powers the steady solve, the transient time-stepper, and
-the **differentiable** `fem.solve()` used for inverse problems.
+the **differentiable** `fem.solve()` used for inverse problems. For a catalog of the symbolic
+primitives you can write into a term — fields, derivatives, conditionals, non-local integrals,
+geometry symbols (normals, `cell_size`), and the `jno.fn` escape hatch — see the
+[weak-form vocabulary](weak_form_vocabulary.md).
 
 ```python
 import jax.numpy as jnp

@@ -1916,6 +1916,29 @@ class domain(MeshIOMixin):
         return_indices: bool = False,
         time_value: Optional[float] = None,
     ) -> Any: ...
+    @property
+    def cell_size(self):
+        """Element size ``h`` as a symbol usable directly in a weak form.
+
+        Isotropic per-cell size ``|det J|^(1/dim)`` (an edge-length scale), resolved at each
+        quadrature point during FEM assembly. This is the handle for mesh-dependent stabilization
+        — e.g. SUPG/GLS for advection-dominated transport::
+
+            h    = dom.cell_size
+            tau  = h / (2 * beta.norm())
+            supg = tau * (beta[0]*ui.x + beta[1]*ui.y) * (beta[0]*vi.x + beta[1]*vi.y)
+
+        Resolved on the native 2D/3D assembler's volume terms. A ``cell_size`` coefficient adds no
+        trial/test gradient, so a stabilized term still classifies (``term_kind``) by its u/v
+        gradient structure, and ``h`` is geometry (constant w.r.t. the unknown) so differentiable
+        assembly is unaffected. (Not meaningful for PINN / boundary-facet terms.)
+        """
+        if "cell_size" not in self.context:
+            # Placeholder so the Variable constructs; the real per-cell h is packed at assembly time
+            # (jno/utils/solver/fem_native.py) and overrides this everywhere it is actually used.
+            self.context["cell_size"] = np.ones((1, 1), dtype=default_np_float_dtype())
+        return Variable(tag="cell_size", dim=[0, 1], domain=self, axis="spatial")
+
     def variable(
         self,
         tag: str,
