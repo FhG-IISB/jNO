@@ -141,6 +141,14 @@ eddy current). *Scope: lowest-order RT₀ / N1E₀ on 2-D triangular meshes.*
 Always-available: `fem.dofs`, `fem.points` (the coordinates the DOFs live on — use these for P2,
 where they differ from the mesh vertices), `fem.operator`, and `fem.classification`.
 
+> **Term introspection (provisional).** `fem.term_kinds` returns a `list[TermKind]` — each
+> additively-split PDE (volume) term classified by `support`, `time_order`, `trial_channel` /
+> `test_channel` (spatial-gradient presence), and `linear`, with `is_local` flagging a spatially
+> pointwise term (reaction/mass: no spatial gradient on trial or test) vs. a neighbour-coupling
+> global one (diffusion/advection). This is the basis for operator-splitting routing; the API is
+> provisional until that routing lands. A mass term `u.t·v` is `is_local` (its derivative is
+> temporal, not spatial).
+
 ### Steady linear
 
 ```python

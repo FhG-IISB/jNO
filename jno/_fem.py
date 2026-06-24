@@ -694,6 +694,7 @@ class FEM:
         self.problem = getattr(domain, "_fem_problem", None)
         self._periodic = None  # periodic-tie reduction (prolongation P), attached by fem()
         self._offsets = offsets  # per-field block offsets for the native non-nodal path (else problem.offset)
+        self._term_source = None  # (domain, volume_terms); attached by fem() for the provisional term_kinds accessor
 
         self._A = self._b = None
         if mode == "linear":
@@ -726,6 +727,23 @@ class FEM:
         """The raw assembled block — ``(A, b)`` / ``FemLinearSystem`` /
         ``FemResidualOperator`` (steady) or ``SemidiscreteTimeBlock`` (transient)."""
         return self._op
+
+    @property
+    def term_kinds(self):
+        """PROVISIONAL — structural classification of each additively-split volume (PDE) term.
+
+        Returns ``list[TermKind]`` (see :mod:`jno.utils.solver.term_kind`) labelling each term
+        local/global (``is_local``), its temporal order, trial/test spatial-gradient channel, and
+        linearity — the basis for operator-splitting routing. ``None`` on assembly paths that do
+        not expose their source terms. API may change once the routing pass lands.
+        """
+        if self._term_source is None:
+            return None
+        from .utils.solver.term_kind import classify_term
+        from .utils.solver.weak_form import _split_additive_terms
+
+        domain, vterms = self._term_source
+        return [classify_term(domain, sub) for vt in vterms for _sign, sub in _split_additive_terms(domain, vt)]
 
     @property
     def offsets(self) -> Any:
@@ -1253,6 +1271,7 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     def _finalize(fem_obj: "FEM") -> "FEM":
         """Attach the periodic reduction (if any): linear & nonlinear via ``FEM.solve``, transient via
         the time route's existing context-driven reduction. Still scoped to scalar single-field real."""
+        fem_obj._term_source = (domain, volume_terms)
         if not periodic_ties:
             return fem_obj
         if fem_obj._mode in ("complex", "complex_transient"):
@@ -1395,7 +1414,7 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
                 "jno.fem per-region integration on a second-order-in-time problem is not wired yet — "
                 "sub-region terms are currently supported on steady problems only."
             )
-        return _assemble_second_order_time(
+        _so = _assemble_second_order_time(
             domain,
             volume_terms,
             boundary_terms,
@@ -1407,6 +1426,8 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             vec=vec or 1,
             quad_degree=quad_degree,
         )
+        _so._term_source = (domain, volume_terms)
+        return _so
 
     # ---- non-nodal element families (RT / Nedelec / Argyris): native push-forward assembler ----
     # These families need a basis push-forward, so -- like the 1D path -- assemble natively and reuse
