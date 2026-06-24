@@ -232,6 +232,18 @@ def test_nonlinear_multifield_periodic_assembles_and_steps(_x64):
     assert np.all(np.isfinite(np.asarray(block.prolong(U))))
 
 
+def test_periodic_prolongation_is_sparse(_x64):
+    """The prolongation is a BCOO selection matrix — O(n_full) nonzeros, not a dense O(n_full*n_red)
+    array (the fix for the dense-P / large-N memory blow-up)."""
+    dom = _periodic_domain(16)
+    block = _nl_periodic(dom, with_reaction=False).operator  # single-field linear periodic
+    P = block.prolongation
+    assert hasattr(P, "todense") and not isinstance(P, dict)  # BCOO, single-field
+    n_full, n_red = int(P.shape[0]), int(P.shape[1])
+    assert n_red < n_full
+    assert int(P.nse) <= n_full + 8  # ~one nonzero per full node, NOT the dense n_full*n_red
+
+
 def test_heterogeneous_order_coupled_periodic_matches_analytic(_x64):
     """Taylor-Hood-style: a P2 field and a P1 field, both periodic, with DIFFERENT DOF counts. Each
     gets its own P_i (built from its own nodes/order) and matches its analytic heat decay."""

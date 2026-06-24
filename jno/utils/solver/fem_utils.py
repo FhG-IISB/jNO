@@ -1929,30 +1929,47 @@ def build_periodic_prolongation(
     reduced_index = {node: r for r, node in enumerate(kept_nodes)}
     n_red = len(kept_nodes)
 
-    P_node = np.zeros((n_nodes, n_red), dtype=np.float64)
+    # The prolongation is a SELECTION matrix (0/1, plus interpolation weights for non-matching faces)
+    # -- it must be SPARSE, never dense: O(n_full) nonzeros vs O(n_full * n_red) dense (GBs at large
+    # N). Collect (row, col, weight) entries node-by-node, then a BCOO; a vector field expands each
+    # node entry to ``vec`` component entries (a Kronecker of the node map with I_vec).
+    import jax.experimental.sparse as jsparse
+
+    rows: List[int] = []
+    cols: List[int] = []
+    data: List[float] = []
     for i in range(n_nodes):
         if i in slave_set:
             for kept_node, weight in _expand(i, frozenset()).items():
-                P_node[i, reduced_index[kept_node]] += weight
+                rows.append(i)
+                cols.append(reduced_index[kept_node])
+                data.append(float(weight))
         else:
-            P_node[i, reduced_index[i]] = 1.0
+            rows.append(i)
+            cols.append(reduced_index[i])
+            data.append(1.0)
 
     # Informational exact-chain map (single kept master per exact slave); interpolated slaves omitted.
     final_master = {sid: next(iter(_expand(sid, frozenset()))) for sid in slave_to_master}
 
-    P_node_j = jnp.asarray(P_node)
-    if vec == 1:
-        P = P_node_j
-    else:
-        P = jnp.kron(P_node_j, jnp.eye(vec, dtype=P_node_j.dtype))
+    rows_a = np.asarray(rows, dtype=np.int64)
+    cols_a = np.asarray(cols, dtype=np.int64)
+    data_a = np.asarray(data, dtype=np.float64)
+    if vec > 1:  # kron(P_node, I_vec): each node entry -> vec component entries
+        comp = np.arange(vec, dtype=np.int64)
+        rows_a = (rows_a[:, None] * vec + comp[None, :]).reshape(-1)
+        cols_a = (cols_a[:, None] * vec + comp[None, :]).reshape(-1)
+        data_a = np.repeat(data_a, vec)
+    n_full, n_red_full = int(n_nodes * vec), int(n_red * vec)
+    P = jsparse.BCOO((jnp.asarray(data_a), jnp.asarray(np.stack([rows_a, cols_a], axis=1))), shape=(n_full, n_red_full))
 
     return {
         "P": P,
-        "P_node": P_node_j,
+        "P_node": P,  # sparse; equals the node-level map when vec == 1
         "kept_nodes": np.asarray(kept_nodes, dtype=np.int64),
         "slave_to_master": final_master,
-        "n_full": int(n_nodes * vec),
-        "n_red": int(n_red * vec),
+        "n_full": n_full,
+        "n_red": n_red_full,
         "vec": int(vec),
     }
 
@@ -1963,17 +1980,17 @@ def build_periodic_prolongation(
 
 
 def reduce_matrix(P, mat):
-    """Galerkin reduction ``P^T mat P``."""
-    P = jnp.asarray(P)
-    mat = jnp.asarray(mat, dtype=P.dtype)
-    return P.T @ mat @ P
+    """Galerkin reduction ``P^T mat P``. ``P`` may be a dense array or a BCOO selection matrix
+    (kept sparse — ``BCOO.T @ dense @ BCOO`` is exact and avoids materialising a dense ``P``)."""
+    mat = mat.todense() if hasattr(mat, "todense") else mat
+    P = P if hasattr(P, "todense") else jnp.asarray(P)  # keep a BCOO P sparse
+    return P.T @ jnp.asarray(mat, P.dtype) @ P
 
 
 def reduce_vector(P, vec):
-    """Reduce a full-space load/bias vector via ``P^T vec``."""
-    P = jnp.asarray(P)
-    vec = jnp.asarray(vec, dtype=P.dtype).reshape(-1)
-    return P.T @ vec
+    """Reduce a full-space load/bias vector via ``P^T vec`` (dense or BCOO ``P``)."""
+    P = P if hasattr(P, "todense") else jnp.asarray(P)
+    return P.T @ jnp.asarray(vec, P.dtype).reshape(-1)
 
 
 def restrict_state(P, state_full, kept_nodes, vec: int = 1):
@@ -1997,8 +2014,8 @@ def prolong(P, reduced):
     Accepts a single ``(n_red,)`` vector or a batched ``(..., n_red)`` array
     (e.g. a Diffrax ``solution.ys`` trajectory of shape ``(T, n_red)``).
     """
-    P = jnp.asarray(P)
-    reduced = jnp.asarray(reduced, dtype=P.dtype)
+    P = P if hasattr(P, "todense") else jnp.asarray(P)  # keep a BCOO P sparse
+    reduced = jnp.asarray(reduced, P.dtype)
     if reduced.ndim == 1:
         return P @ reduced
     # (..., n_red) @ (n_red, n_full) -> (..., n_full)
@@ -2034,10 +2051,11 @@ def reduce_matrix_periodic(periodic, mat):
         return reduce_matrix(blocks[0]["P"], mat)  # fast path == legacy single-field
     mat = jnp.asarray(mat.todense()) if hasattr(mat, "todense") else jnp.asarray(mat)
     out = jnp.zeros((int(off_r[-1]), int(off_r[-1])), mat.dtype)
+    _sp = lambda P: P if hasattr(P, "todense") else jnp.asarray(P, mat.dtype)  # keep BCOO sparse  # noqa: E731
     for i, bi in enumerate(blocks):
-        Pi = jnp.asarray(bi["P"], mat.dtype)
+        Pi = _sp(bi["P"])
         for j, bj in enumerate(blocks):
-            Pj = jnp.asarray(bj["P"], mat.dtype)
+            Pj = _sp(bj["P"])
             blk = mat[off_f[i] : off_f[i + 1], off_f[j] : off_f[j + 1]]
             out = out.at[off_r[i] : off_r[i + 1], off_r[j] : off_r[j + 1]].set(Pi.T @ blk @ Pj)
     return out
@@ -2049,7 +2067,8 @@ def reduce_vector_periodic(periodic, vec):
     if len(blocks) == 1:
         return reduce_vector(blocks[0]["P"], vec)
     vec = jnp.asarray(vec).reshape(-1)
-    return jnp.concatenate([jnp.asarray(b["P"], vec.dtype).T @ vec[off_f[i] : off_f[i + 1]] for i, b in enumerate(blocks)])
+    _sp = lambda P: P if hasattr(P, "todense") else jnp.asarray(P, vec.dtype)  # keep BCOO sparse  # noqa: E731
+    return jnp.concatenate([_sp(b["P"]).T @ vec[off_f[i] : off_f[i + 1]] for i, b in enumerate(blocks)])
 
 
 def restrict_state_periodic(periodic, state):

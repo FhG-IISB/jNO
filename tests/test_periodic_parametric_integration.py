@@ -130,7 +130,7 @@ def solve_transient(dom, block, args, save_ts):
     """Integrate the reduced periodic block with jNO's default backward-Euler stepper, then
     prolong (``u_full = P u_red``) to compare against the analytical solution. ``P`` lives on the
     block itself (the native periodic reduction attaches it as ``block.prolongation``)."""
-    P = jnp.asarray(block.prolongation)
+    P = jnp.asarray(block.prolongation.todense())  # prolongation is a BCOO selection matrix
     ys = _default_transient_integrate(block, args, jnp.asarray(save_ts))
     return np.asarray(jnp.asarray(ys) @ P.T)
 
@@ -145,7 +145,7 @@ class TestPeriodicReductionStructure:
         dom = make_periodic_domain()
         block, _ = build_periodic_heat_block(dom, "affine")
 
-        P = np.asarray(block.prolongation)
+        P = np.asarray(block.prolongation.todense())  # prolongation is a BCOO selection matrix
         n_full = int(np.asarray(dom.mesh.points).shape[0])
 
         assert P.ndim == 2

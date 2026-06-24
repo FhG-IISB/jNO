@@ -1173,7 +1173,7 @@ def _build_periodic_reduction_multifield(
         uniq = [t for t in ties if (t[0], t[1]) not in seen and not seen.add((t[0], t[1]))]
         red = _build_periodic_reduction(domain, uniq, pts_all[0], cells_all[0], int(orders[0]), int(vec))
         P, kept, v = red["P"], red["kept_nodes"], red["vec"]
-        nrf = int(np.asarray(P).shape[1])
+        nrf = int(P.shape[1])
         blocks = [{"P": P, "kept": kept, "vec": v} for _ in range(n_fields)]
         off_full = [i * sizes[0] for i in range(n_fields + 1)]
         off_red = [i * nrf for i in range(n_fields + 1)]
@@ -1188,11 +1188,16 @@ def _build_periodic_reduction_multifield(
         if ties_i:
             red_i = _build_periodic_reduction(domain, ties_i, pts_i, cells_all[i], int(orders[i]), int(vec_i))
             P_i, kept_i, v_i = red_i["P"], red_i["kept_nodes"], red_i["vec"]
-        else:  # a field with no periodic tie -> identity (no DOF eliminated)
-            P_i, kept_i, v_i = jnp.eye(sizes[i]), np.arange(int(pts_i.shape[0])), vec_i
+        else:  # a field with no periodic tie -> sparse identity (no DOF eliminated)
+            import jax.experimental.sparse as jsparse
+
+            ni = int(sizes[i])
+            di = jnp.arange(ni)
+            P_i = jsparse.BCOO((jnp.ones(ni), jnp.stack([di, di], axis=1)), shape=(ni, ni))
+            kept_i, v_i = np.arange(int(pts_i.shape[0])), vec_i
         blocks.append({"P": P_i, "kept": kept_i, "vec": v_i})
-        off_full.append(off_full[-1] + int(np.asarray(P_i).shape[0]))
-        off_red.append(off_red[-1] + int(np.asarray(P_i).shape[1]))
+        off_full.append(off_full[-1] + int(P_i.shape[0]))
+        off_red.append(off_red[-1] + int(P_i.shape[1]))
     return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
 
 

@@ -60,7 +60,7 @@ def test_patch_test_p1_reproduces_constant_and_linear():
     prolongation reproduces a constant and a linear-in-y field exactly."""
     pts, tags, facets = _two_faces(5, 9, order=1)
     res = build_periodic_prolongation(pts, [("right", "left")], tags, facets=facets)
-    P = np.asarray(res["P_node"])
+    P = np.asarray(res["P_node"].todense())  # P_node is BCOO
     kept = np.asarray(res["kept_nodes"])
 
     assert res["n_red"] == 5  # all 9 left nodes eliminated; the 5 right nodes are retained
@@ -80,7 +80,7 @@ def test_patch_test_p2_reproduces_quadratic():
     """With 3-node (a, b, mid) master facets the interpolation reproduces a quadratic exactly."""
     pts, tags, facets = _two_faces(3, 9, order=2)
     res = build_periodic_prolongation(pts, [("right", "left")], tags, facets=facets)
-    P = np.asarray(res["P_node"])
+    P = np.asarray(res["P_node"].todense())  # P_node is BCOO
     kept = np.asarray(res["kept_nodes"])
     assert np.allclose(P.sum(axis=1), 1.0)
     f = lambda y: 0.7 * y**2 - 0.2 * y + 0.1  # noqa: E731
@@ -100,7 +100,7 @@ def test_patch_test_3d_triangle_reproduces_linear():
     pts = np.vstack([master, slave])
     tags = {"top": np.arange(4), "bot": np.arange(4, 4 + len(slave))}
     res = build_periodic_prolongation(pts, [("top", "bot")], tags, facets={"top": tris})
-    P = np.asarray(res["P_node"])
+    P = np.asarray(res["P_node"].todense())  # P_node is BCOO
     kept = np.asarray(res["kept_nodes"])
     assert np.allclose(P.sum(axis=1), 1.0)  # partition of unity
     # reproduce constant and a linear field a·x + b·y + c exactly at every slave node
@@ -122,7 +122,7 @@ def test_patch_test_3d_triangle_p2_reproduces_quadratic():
     tris = np.array([[0, 1, 2, 4, 5, 6], [0, 2, 3, 6, 7, 8]])  # (a,b,c, mab,mbc,mca)
     tags = {"top": np.arange(9), "bot": np.arange(9, 13)}
     res = build_periodic_prolongation(pts, [("top", "bot")], tags, facets={"top": tris})
-    P = np.asarray(res["P_node"])
+    P = np.asarray(res["P_node"].todense())  # P_node is BCOO
     kept = np.asarray(res["kept_nodes"])
     assert np.allclose(P.sum(axis=1), 1.0)
     q = lambda x, y: 0.5 * x**2 - 0.3 * y**2 + 0.7 * x * y + x - 0.2 * y + 0.1  # noqa: E731
@@ -134,7 +134,7 @@ def test_conforming_stays_exact_0_1_permutation():
     """Equal node layout on both faces -> exact node-to-node 0/1 P (no interpolation, no facets)."""
     pts, tags, _ = _two_faces(5, 5, order=1)
     res = build_periodic_prolongation(pts, [("right", "left")], tags)  # no facets needed
-    P = np.asarray(res["P_node"])
+    P = np.asarray(res["P_node"].todense())  # P_node is BCOO
     assert res["n_red"] == 5
     assert set(np.unique(P).tolist()) <= {0.0, 1.0}  # pure permutation, no fractional weights
     assert np.allclose(P.sum(axis=1), 1.0)
@@ -550,7 +550,7 @@ def test_periodic_transient_heat():
     assert fem._periodic["n_red"] < fem._periodic["n_full"], "the time block must be reduced"
     # the block is assembled reduced (M, A, state0); step it (backward Euler from the flat block
     # matrices -- (M + dt A) u_next = M u) then prolong (u_full = P u_red) to the full layout.
-    P = jnp.asarray(fem._periodic["P"])
+    P = jnp.asarray(fem._periodic["P"].todense())  # prolongation is a BCOO selection matrix
     blk = fem.operator
     M = jnp.asarray(blk.M.todense() if hasattr(blk.M, "todense") else blk.M)
     A = jnp.asarray(blk.A.todense() if hasattr(blk.A, "todense") else blk.A)
