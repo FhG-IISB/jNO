@@ -65,9 +65,9 @@ fem = jno.fem(
 
 # bring-your-own solver: a dense direct solve (the default matrix-free Krylov is for large elliptic systems)
 sol = np.asarray(fem.solve(solve_fn=lambda A, b: jnp.linalg.solve(A, b)))
-off = fem.problem.offset
+off = fem.offsets
 uu = sol[off[0] : off[1]].reshape(-1, 2)  # velocity (n_vel_nodes, 2)
-pts_v = np.asarray(fem.problem.mesh[0].points)
+pts_v = np.asarray(fem.field_points[0])
 
 # regular grid (mask the cylinder), used for both the symmetry gate and the figure
 gx, gy = np.meshgrid(np.linspace(0, L, 300), np.linspace(0, H, 100))

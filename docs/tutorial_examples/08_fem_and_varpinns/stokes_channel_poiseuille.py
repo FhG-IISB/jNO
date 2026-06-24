@@ -45,10 +45,10 @@ fem = jno.fem(
     ]
 )
 
-off = fem.problem.offset  # per-field DOF offsets in the coupled solution vector
+off = fem.offsets  # per-field DOF offsets in the coupled solution vector
 sol = jnp.linalg.solve(dense(fem.A), jnp.asarray(fem.b).reshape(-1))
 uu = np.asarray(sol[off[0] : off[1]]).reshape(-1, 2)  # velocity (n_vel_nodes, 2)
-pts_v = np.asarray(fem.problem.mesh[0].points)
+pts_v = np.asarray(fem.field_points[0])
 rel_ux = float(np.linalg.norm(uu[:, 0] - u_profile(pts_v[:, 1])) / np.linalg.norm(u_profile(pts_v[:, 1])))
 max_uy = float(np.max(np.abs(uu[:, 1])))  # u_y == 0 and u_x x-independent => div u == 0
 print(f"\nStokes Poiseuille channel (Taylor-Hood P2/P1): dofs={fem.dofs}  u_x rel_L2={rel_ux:.3e}  max|u_y|={max_uy:.3e}")

@@ -84,7 +84,7 @@ fem = jno.fem(
     ]
 )
 assert fem.is_transient and not fem.is_linear, "Boussinesq convection is transient + nonlinear"
-off = fem.problem.offset
+off = fem.offsets
 M, dt, nsteps, nframes = fem.M, 0.009, 26, 13  # stop ~when the rolls establish (no static tail)
 print(f"\n2D Rayleigh-Benard pot (Ra={Ra:g}, Pr={Pr:g}): dofs={fem.dofs}, steps={nsteps}")
 
@@ -104,8 +104,8 @@ for step in range(nsteps):
         frames.append(np.asarray(w))
 frames = np.stack(frames)
 
-pts_v = np.asarray(fem.problem.mesh[0].points)  # P2 velocity nodes
-pts_T = np.asarray(fem.problem.mesh[2].points)  # P1 temperature nodes
+pts_v = np.asarray(fem.field_points[0])  # P2 velocity nodes
+pts_T = np.asarray(fem.field_points[2])  # P1 temperature nodes
 vel = frames[:, off[0] : off[1]].reshape(frames.shape[0], -1, 2)
 Tf = frames[:, off[2] :]  # temperature frames
 tris = np.asarray(d.built_mesh.cells_dict["triangle"])

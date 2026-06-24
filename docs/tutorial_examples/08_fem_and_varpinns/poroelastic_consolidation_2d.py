@@ -92,10 +92,10 @@ fem = jno.fem(
     ]
 )
 assert fem.is_transient and fem.is_linear, "linear transient Biot poroelasticity"
-off = fem.problem.offset
+off = fem.offsets
 nU = int(off[1])  # displacement is field 0: DOFs w[:nU]; pressure is field 1: w[nU:]
-pts_u = np.asarray(fem.problem.mesh[0].points)[:, :2]  # P2 displacement nodes
-pts_p = np.asarray(fem.problem.mesh[1].points)[:, :2]  # P1 pressure nodes
+pts_u = np.asarray(fem.field_points[0])[:, :2]  # P2 displacement nodes
+pts_p = np.asarray(fem.field_points[1])[:, :2]  # P1 pressure nodes
 tris = np.asarray(d.built_mesh.cells_dict["triangle"])
 triP = mtri.Triangulation(pts_p[:, 0], pts_p[:, 1], tris)
 

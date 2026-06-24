@@ -73,7 +73,7 @@ fem = jno.fem(
 
 # bring-your-own solver: a dense direct solve (the default matrix-free Krylov is for large elliptic systems)
 sol = np.asarray(fem.solve(solve_fn=lambda A, b: jnp.linalg.solve(A, b)))
-off = fem.problem.offset  # per-field slices into the coupled solution vector
+off = fem.offsets  # per-field slices into the coupled solution vector
 Th_s, Th_f = sol[off[0] : off[1]], sol[off[1] :]
 pts = np.asarray(fem.points)
 xs, ys = pts[:, 0], pts[:, 1]

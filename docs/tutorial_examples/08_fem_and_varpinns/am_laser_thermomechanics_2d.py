@@ -82,10 +82,10 @@ fem = jno.fem(
     ]
 )
 assert fem.is_transient and fem.is_linear, "linear transient thermo-elasticity"
-off = fem.problem.offset
+off = fem.offsets
 nT = int(off[1])  # temperature is field 0: DOFs w[:nT]; displacement is field 1: w[nT:]
-pts_T = np.asarray(fem.problem.mesh[0].points)[:, :2]  # P1 temperature nodes
-pts_u = np.asarray(fem.problem.mesh[1].points)[:, :2]  # P2 displacement nodes
+pts_T = np.asarray(fem.field_points[0])[:, :2]  # P1 temperature nodes
+pts_u = np.asarray(fem.field_points[1])[:, :2]  # P2 displacement nodes
 tris = np.asarray(d.built_mesh.cells_dict["triangle"])
 triT = mtri.Triangulation(pts_T[:, 0], pts_T[:, 1], tris)
 

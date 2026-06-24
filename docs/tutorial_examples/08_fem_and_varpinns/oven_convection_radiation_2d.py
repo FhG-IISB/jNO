@@ -114,11 +114,11 @@ fem = jno.fem(
     ]
 )
 assert fem.is_transient and not fem.is_linear, "the box is transient + nonlinear (Boussinesq)"
-off = fem.problem.offset
+off = fem.offsets
 o2 = int(off[2])  # temperature is the last field: DOFs w[o2:] are the P1 nodal temperature
 nT = int(fem.dofs) - o2
-pts_v = np.asarray(fem.problem.mesh[0].points)  # P2 velocity nodes
-pts_T = np.asarray(fem.problem.mesh[2].points)  # P1 temperature nodes (== base mesh nodes)
+pts_v = np.asarray(fem.field_points[0])  # P2 velocity nodes
+pts_T = np.asarray(fem.field_points[2])  # P1 temperature nodes (== base mesh nodes)
 tris = np.asarray(d.built_mesh.cells_dict["triangle"])
 triT = mtri.Triangulation(pts_T[:, 0], pts_T[:, 1], tris)
 
