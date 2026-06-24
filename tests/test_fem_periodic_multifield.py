@@ -144,3 +144,89 @@ def test_coupled_multifield_periodic_assembles_and_couples(_x64):
     li = left[np.argsort(pts[left, 1])]
     ri = right[np.argsort(pts[right, 1])]
     assert np.allclose(ul[li], ul[ri], atol=1e-8)
+
+
+def _nl_periodic(dom, D=0.1, alpha=0.5, with_reaction=True):
+    """Single-field cubic-damped periodic heat: u_t = D Lap u - alpha u^3 (nonlinear when reaction on)."""
+    u, p = dom.fem_symbols()
+    xi, yi, ti = dom.variable("interior", split=True)
+    ci = dom.variable("initial", split=True)
+    xl, yl, _ = dom.variable("left", split=True)
+    xr, yr, _ = dom.variable("right", split=True)
+    xb, yb, _ = dom.variable("bottom", split=True)
+    xt, yt, _ = dom.variable("top", split=True)
+    ui, pii = u.bind(x=xi, y=yi, t=ti), p.bind(x=xi, y=yi, t=ti)
+    ic = jnn.sin(2 * np.pi * ci[0]) * jnn.sin(2 * np.pi * ci[1])
+    weak = ui.t * pii + D * (ui.x * pii.x + ui.y * pii.y)
+    if with_reaction:
+        weak = weak + alpha * ui * ui * ui * pii
+    return jno.fem([weak, u(xl, yl) - u(xr, yr), u(xb, yb) - u(xt, yt), u(ci[0], ci[1]) - ic])
+
+
+def test_nonlinear_periodic_transient_matches_splitting(_x64):
+    """A nonlinear (cubic) periodic transient solves monolithically in the reduced space (Newton) and
+    matches the trusted Strang split (linear diffusion via block.step + pointwise -alpha u^3)."""
+    import jax.numpy as jnp
+
+    n, D, alpha = 12, 0.1, 0.5
+    dom = _periodic_domain(n)
+    mono = _nl_periodic(dom, D, alpha, with_reaction=True).operator
+    assert mono.is_nonlinear()
+    assert mono.metadata.get("periodic") is True
+    assert mono.metadata["reduced_state_size"] < mono.metadata["full_state_size"]
+    u_mono = _march(mono)  # block.step nonlinear branch -> reduced-space Newton, then prolong
+    assert np.all(np.isfinite(u_mono))
+
+    diff = _nl_periodic(_periodic_domain(n), D, alpha, with_reaction=False).operator  # linear diffusion only
+
+    def react_half(c, dt):
+        f = lambda x: -alpha * x**3  # noqa: E731
+        hh = 0.5 * dt
+        return c + hh * f(c + 0.5 * hh * f(c))
+
+    w = jnp.asarray(diff.state0)
+    t, dt = float(diff.t0), float(diff.dt)
+    for _ in range(round((diff.t1 - diff.t0) / dt)):
+        w = react_half(w, dt)
+        w = diff.step(w, t, dt)
+        w = react_half(w, dt)
+        t += dt
+    u_split = np.asarray(diff.prolong(w))
+    assert float(np.linalg.norm(u_mono - u_split) / np.linalg.norm(u_split)) < 0.1
+
+
+def test_nonlinear_multifield_periodic_assembles_and_steps(_x64):
+    """The full hard combination — nonlinear + transient + multi-field + periodic — assembles and steps."""
+    import jax.numpy as jnp
+
+    n = 10
+    dom = _periodic_domain(n)
+    u, pu = dom.fem_symbols(names=("u", "pu"))
+    w, pw = dom.fem_symbols(names=("w", "pw"))
+    xi, yi, ti = dom.variable("interior", split=True)
+    ci = dom.variable("initial", split=True)
+    xl, yl, _ = dom.variable("left", split=True)
+    xr, yr, _ = dom.variable("right", split=True)
+    xb, yb, _ = dom.variable("bottom", split=True)
+    xt, yt, _ = dom.variable("top", split=True)
+    ui, pui = u.bind(x=xi, y=yi, t=ti), pu.bind(x=xi, y=yi, t=ti)
+    wi, pwi = w.bind(x=xi, y=yi, t=ti), pw.bind(x=xi, y=yi, t=ti)
+    ic = jnn.sin(2 * np.pi * ci[0]) * jnn.sin(2 * np.pi * ci[1])
+    fem = jno.fem(
+        [
+            ui.t * pui + 0.1 * (ui.x * pui.x + ui.y * pui.y) + 0.5 * ui * wi * pui,  # bilinear coupling
+            wi.t * pwi + 0.1 * (wi.x * pwi.x + wi.y * pwi.y) + 0.5 * ui * wi * pwi,
+            u(xl, yl) - u(xr, yr),
+            u(xb, yb) - u(xt, yt),
+            w(xl, yl) - w(xr, yr),
+            w(xb, yb) - w(xt, yt),
+            u(ci[0], ci[1]) - ic,
+            w(ci[0], ci[1]) - 0.5 * ic,
+        ]
+    )
+    block = fem.operator
+    assert block.is_nonlinear()
+    assert block.metadata.get("periodic") is True
+    U = jnp.asarray(block.state0)
+    U = block.step(U, float(block.t0), float(block.dt))  # one reduced-space Newton step
+    assert np.all(np.isfinite(np.asarray(block.prolong(U))))

@@ -1183,25 +1183,51 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
     ``A -> P^T A P``, a runtime ``operator_fn(t, args) -> P^T A(t, args) P`` (so the reduction
     composes with re-assembly and stays differentiable in ``args``), the loads ``affine_bias`` and
     ``forcing_vector_fn(t, args) -> P^T(...)``, and the initial state is restricted to the master
-    DOFs. Linear blocks only -- a nonlinear periodic transient is rejected loudly (the periodic
-    reduction of a matrix-free Newton residual is a separate, unbuilt path)."""
+    DOFs. A NONLINEAR block is reduced in the same spirit: ``mass`` / ``residual`` / ``jacobian`` are
+    wrapped to act on the reduced state (prolong the input, reduce the output), so the integrator's
+    matrix-free Newton then solves ``M_red(u_red⁺ - u_red)/dt + r_red(u_red⁺, t) = 0`` in the reduced
+    space -- the reduced Jacobian ``P^T J P`` comes from autodiff through ``residual_red`` (mirrors the
+    steady nonlinear periodic path)."""
     import dataclasses
 
     from .utils.solver.fem_utils import (
         _periodic_blocks,
+        prolong_periodic,
         reduce_matrix_periodic,
         reduce_vector_periodic,
         restrict_state_periodic,
     )
 
-    if block.is_nonlinear():
-        raise NotImplementedError(
-            "jno.fem: a nonlinear periodic transient is not supported natively yet -- the periodic "
-            "reduction is wired only for the linear time block (single- or multi-field). Write it as a "
-            "first-order linear system, or drop the periodic tie."
-        )
     blocks, off_f, off_r = _periodic_blocks(periodic)
     n_full, n_red = int(off_f[-1]), int(off_r[-1])
+    meta = dict(getattr(block, "metadata", None) or {})
+    meta.update(periodic=True, full_state_size=n_full, reduced_state_size=n_red)
+    prol = blocks[0]["P"] if len(blocks) == 1 else periodic
+
+    if block.is_nonlinear():
+        _mass, _res, _jac = block.mass, block.residual, block.jacobian
+
+        def mass_red(t, args=None, _p=periodic, _m=_mass):
+            return reduce_matrix_periodic(_p, _m(t, args))
+
+        def residual_red(u_red, t, args=None, _p=periodic, _r=_res):
+            return reduce_vector_periodic(_p, jnp.asarray(_r(prolong_periodic(_p, u_red), t, args)).reshape(-1))
+
+        jac_red = None
+        if _jac is not None:
+
+            def jac_red(u_red, t, args=None, _p=periodic, _j=_jac):
+                return reduce_matrix_periodic(_p, _j(prolong_periodic(_p, u_red), t, args))
+
+        return dataclasses.replace(
+            block,
+            mass=mass_red,
+            residual=residual_red,
+            jacobian=jac_red,
+            state0=restrict_state_periodic(periodic, jnp.asarray(block.state0).reshape(-1)),
+            prolongation=prol,
+            metadata=meta,
+        )
 
     op_red = None
     if block.operator_fn is not None:
@@ -1215,8 +1241,6 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
         def f_red(t, args=None, _p=periodic, _f=block.forcing_vector_fn):
             return reduce_vector_periodic(_p, jnp.asarray(_f(t, args)).reshape(-1))
 
-    meta = dict(getattr(block, "metadata", None) or {})
-    meta.update(periodic=True, full_state_size=n_full, reduced_state_size=n_red)
     return dataclasses.replace(
         block,
         M=reduce_matrix_periodic(periodic, block.M),
@@ -1227,7 +1251,7 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
         else None,
         forcing_vector_fn=f_red,
         state0=restrict_state_periodic(periodic, jnp.asarray(block.state0).reshape(-1)),
-        prolongation=(blocks[0]["P"] if len(blocks) == 1 else periodic),
+        prolongation=prol,
         metadata=meta,
     )
 
