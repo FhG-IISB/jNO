@@ -1,10 +1,9 @@
 """Native assembler for non-nodal (push-forward) element families.
 
-This is the n-D analogue of the native 1D path (:mod:`fem_1d`): feax cannot
-assemble derivative/edge-DOF elements (it has no push-forward), so the element
-zoo assembles on the jNO side from :mod:`fem_topology` (global edge numbering +
-orientation) and :mod:`fem_elements` (basix reference tabulation + per-cell
-push-forward).
+n-D assembler for derivative/edge-DOF element families, which need a per-cell
+push-forward. The element zoo assembles from :mod:`fem_topology` (global edge
+numbering + orientation) and :mod:`fem_elements` (basix reference tabulation +
+per-cell push-forward).
 
 Two entry points:
 
@@ -97,7 +96,7 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
 
     The n-D analogue of :func:`fem_1d.assemble_fem_1d_multifield`: it lowers each weak term, builds a
     per-cell ``local`` carrying the field's *physical* (push-forward) shape data, and evaluates the term
-    through the shared integrand evaluator (:func:`feax_utils._eval_expr_for_feax`, which now has
+    through the shared integrand evaluator (:func:`fem_utils._eval_integrand`, which now has
     space-guarded RT branches). Returns ``(A, b)`` for the linear system (matrices-only contract).
 
     Scope: RT (H(div)) and N1E (H(curl)) edge-DOF fields plus P0 (cell DOFs) -- the H(div)/H(curl) mass /
@@ -108,7 +107,6 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
     the H(curl) curl-curl operator and the tangential BC ``u·t = g`` come next.
     """
     from ...trace import FemResidualOperator
-    from .feax_utils import _infer_fields, _lower_statefield_to_trial, _test_field_index
     from .fem_1d import _apply_dirichlet_rows, _apply_dirichlet_symmetric, _integrate_term
     from .fem_elements import (
         nedelec_triangle,
@@ -119,6 +117,7 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
         raviart_thomas_triangle,
     )
     from .fem_topology import build_edge_topology
+    from .fem_utils import _infer_fields, _lower_statefield_to_trial, _test_field_index
     from .weak_form import (
         _apply_sign,
         _contains_temporal_derivative,
@@ -264,7 +263,7 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
     #     (∫ ∂ₜu·v -> mass M) from the spatial operator, project the IC onto the edge DOFs, time-block it. ===
     if ic_residuals or any(_contains_temporal_derivative(t) for t in volume_terms):
         from ..._fem import _bare, _essential_spec, _eval_value_node_at, _field_key_of
-        from .backend_blocks import FeaxTimeBlock
+        from .backend_blocks import SemidiscreteTimeBlock
         from .fem_1d import _apply_dirichlet_transient
         from .time_route import _infer_time_window, _strip_temporal_trial_derivative
 
@@ -277,7 +276,7 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
         spatial_res = _make_residual(spatial)
         t0, t1, dt = _infer_time_window(domain)
         common = dict(
-            backend="feax_time",
+            backend="transient",
             mode="implicit",
             time_order=1,
             spatial_kind="weak_form",
@@ -285,7 +284,7 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
             t0=t0,
             t1=t1,
             dt=dt,
-            feax_context=getattr(domain, "_feax_context", {}) or {},
+            eval_context=getattr(domain, "_fem_eval_context", {}) or {},
         )
 
         # Initial state: L²-project each IC field's u0 onto its edge DOFs by solving that field's *mass
@@ -325,7 +324,7 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
             jac = jax.jacfwd(res_bc)
             pin_dofs = jnp.asarray([p[0] for p in pins], dtype=jnp.int32) if pins else None
             M_nl = M if pin_dofs is None else M.at[pin_dofs, :].set(0.0).at[:, pin_dofs].set(0.0)
-            block = FeaxTimeBlock(
+            block = SemidiscreteTimeBlock(
                 mass=lambda t, args=None, _M=M_nl: _M,
                 residual=lambda u, t, args=None: res_bc(u),
                 jacobian=lambda u, t, args=None: jac(u),
@@ -337,7 +336,7 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
         A = jax.jacfwd(spatial_res)(zeros)
         c = -spatial_res(zeros) + nat_load  # spatial load + natural-BC constant load
         M, A, c = _apply_dirichlet_transient(M, A, c, pins)  # essential edge-trace pins -> M/A/c rows
-        return FeaxTimeBlock(M=M, A=A, affine_bias=c, **common), "transient", offs
+        return SemidiscreteTimeBlock(M=M, A=A, affine_bias=c, **common), "transient", offs
 
     residual = _make_residual(volume_terms)
 

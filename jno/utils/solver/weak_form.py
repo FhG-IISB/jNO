@@ -8,7 +8,7 @@ This module is the central routing layer behind:
     expr.assemble(target=...)
 
 It converts symbolic jNO weak forms into backend-neutral IR and dispatches that
-IR to VPINN, steady FEM, transient FEAX-time, or strong-form Diffrax routes.
+IR to VPINN, steady FEM, transient semidiscrete-time, or strong-form Diffrax routes.
 
 Main responsibilities:
 - represent lowered weak-form terms through LoweredChannelTerm / LoweredWeakForm,
@@ -16,15 +16,15 @@ Main responsibilities:
 - lower weak expressions into VPINN or FEM-compatible IR,
 - assemble VPINN GroupedAssembly objects for training,
 - dispatch linear/nonlinear steady FEM assembly,
-- dispatch transient weak-form FEAX-time assembly,
+- dispatch transient weak-form semidiscrete-time assembly,
 - dispatch strong-form time-dependent expressions to Diffrax.
 
 Supported assemble targets:
-    "vpinn"        -> GroupedAssembly
-    "fem_system"   -> (A, b)
-    "fem_residual" -> FemResidualOperator
-    "fem_time"    -> FemTimeBlock
-    "diffrax"      -> DiffraxBlock
+    "vpinn"   -> GroupedAssembly
+    "diffrax" -> DiffraxBlock
+
+FEM systems (steady, transient, nonlinear) are assembled through ``jno.fem``,
+not via an assemble target.
 """
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple, cast
@@ -135,7 +135,7 @@ class LoweredChannelTerm:
             `"boundary_test_value"`:
                 boundary term multiplying the test function value.
 
-        For FEM/FEAX lowering:
+        For FEM lowering:
             `"raw"`:
                 original weak-form term kept in raw symbolic form.
     coeff:
@@ -166,7 +166,7 @@ class LoweredWeakForm:
     `LoweredWeakForm` stores a list of `LoweredChannelTerm` objects and exposes
     convenience properties for the different backend routes.
 
-    FEM/FEAX routes use:
+    FEM routes use:
         volume_expr:
             Sum of raw volume weak-form expressions.
         boundary_exprs:
@@ -231,7 +231,7 @@ class LoweredWeakForm:
     @property
     def volume_expr(self):
         """
-        Raw summed volume expression used by FEM/FEAX assembly routes.
+        Raw summed volume expression used by FEM assembly routes.
         """
         exprs = [t.coeff for t in self.terms if t.support == "volume" and t.channel == "raw"]
         return _sum_terms(self.domain, exprs)
@@ -480,7 +480,7 @@ def _extract_test_channel(domain, expr) -> Tuple[str, Placeholder, Dict[str, Any
                 )
 
             # elasticity-like inner(sigma, symgrad(phi), n_contract=2)
-            # canonical FEAX grad channel uses sigma itself
+            # canonical grad channel uses sigma itself
             if _is_symgrad_test(a0):
                 return (
                     "test_grad",
@@ -500,9 +500,7 @@ def _extract_test_channel(domain, expr) -> Tuple[str, Placeholder, Dict[str, Any
                     },
                 )
 
-    raise ValueError(
-        f"Could not extract a canonical FEAX-style test channel from weak-form term. Unsupported term structure: {expr}"
-    )
+    raise ValueError(f"Could not extract a canonical test channel from weak-form term. Unsupported term structure: {expr}")
 
 
 # --------------------------------
@@ -736,8 +734,8 @@ def lower_weak_form(domain, expr, trial_value=None, for_target="vpinn"):
             test-value, test-gradient, and boundary-test-value.
 
         `"fem"`:
-            Keeps each weak-form term in raw symbolic form so FEAX can evaluate
-            TrialFunction/TestFunction values and gradients directly.
+            Keeps each weak-form term in raw symbolic form so the assembler can
+            evaluate TrialFunction/TestFunction values and gradients directly.
 
     Returns
     -------
@@ -752,9 +750,9 @@ def lower_weak_form(domain, expr, trial_value=None, for_target="vpinn"):
         StateField is replaced by the wrapped neural expression and rebound to
         the active quadrature region.
 
-    - FEM/FEAX:
-        StateField is replaced by a shared TrialFunction so FEAX can assemble
-        matrix/residual operators.
+    - FEM:
+        StateField is replaced by a shared TrialFunction so the assembler can
+        build matrix/residual operators.
     """
     # print("DEBUG lower_weak_form has StateField before wrap:",
     # _contains_node_type(domain, expr, StateField))
@@ -881,16 +879,15 @@ def assemble_weak_form(domain, expr, target=None, **kwargs):
     object
         Depending on target:
 
-        - `"vpinn"`        -> GroupedAssembly
-        - `"fem_system"`   -> tuple(A, b)
-        - `"fem_residual"` -> FemResidualOperator
-        - `"fem_time"`    -> FemTimeBlock
-        - `"diffrax"`      -> DiffraxBlock
+        - `"vpinn"`   -> GroupedAssembly
+        - `"diffrax"` -> DiffraxBlock
+
+        FEM systems are assembled through ``jno.fem`` rather than an assemble target.
 
     Notes
     -----
     Strong-form Diffrax lowering is dispatched before weak-form StateField
-    wrapping. All weak/FEM/VPINN/FEAX-time routes go through the weak-form
+    wrapping. All weak/FEM/VPINN/semidiscrete-time routes go through the weak-form
     lowering path.
     """
     if domain is None:
@@ -926,26 +923,13 @@ def assemble_weak_form(domain, expr, target=None, **kwargs):
         )
         return _assemble_vpinn_from_ir(ir, **kwargs)
 
-    if target in {"fem_system", "fem_residual"}:
-        ir = lower_weak_form(domain, expr, for_target="fem")
-        if target == "fem_system":
-            from .fem_route import _assemble_fem_system_from_ir
+    if target in {"fem_system", "fem_residual", "fem_time"}:
+        raise NotImplementedError(
+            f"weak.assemble(target={target!r}) is no longer supported. Assemble FEM problems through "
+            "jno.fem([...]), the sole FEM entry."
+        )
 
-            return _assemble_fem_system_from_ir(domain, ir, **kwargs)
-
-        from .fem_route import _assemble_fem_residual_from_ir
-
-        return _assemble_fem_residual_from_ir(domain, ir, **kwargs)
-
-    if target == "fem_time":
-        ir = lower_weak_form(domain, expr, for_target="fem")
-        from .time_route import _assemble_feax_time_from_ir
-
-        return _assemble_feax_time_from_ir(domain, ir, **kwargs)
-
-    raise ValueError(
-        f"Unknown assembly target '{target}'. Supported: 'vpinn', 'fem_system', 'fem_residual', 'fem_time', 'diffrax'"
-    )
+    raise ValueError(f"Unknown assembly target '{target}'. Supported: 'vpinn', 'diffrax'.")
 
 
 def _assemble_vpinn_from_ir(ir: LoweredWeakForm, **kwargs):

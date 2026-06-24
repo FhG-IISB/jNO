@@ -4,7 +4,7 @@ A weak term written on a *sub-region's* coordinates integrates over that sub-reg
 instead of the whole domain. The region is carried by the coordinate tag (exactly like a boundary
 term), and a cell belongs to a region iff its **centroid** does -- classified once at assembly build
 time against a ``domain.tag`` predicate (or a geometry part). Internally the term is multiplied by a
-``RegionMask`` leaf that the FEAX kernel resolves from a constant per-cell ``volume_var``; because the
+``RegionMask`` leaf that the assembly kernel resolves from a constant per-cell ``volume_var``; because the
 mask is just a scalar coefficient on the integrand, it composes with every coefficient kind
 (constant / ``jno.fn`` / ``.freeze()`` / trainable) and every solve form.
 
@@ -25,7 +25,6 @@ import pytest
 
 import jno
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402

@@ -19,7 +19,6 @@ import pytest
 
 import jno
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
@@ -123,7 +122,7 @@ def test_frozen_in_multifield_builds():
 
 def test_frozen_per_component_vector_coefficient():
     """A vector-valued coefficient is expressed per component with scalar frozen functions (a single
-    callable returning a tuple hits a pre-existing FEAX-kernel limit — same for jno.fn)."""
+    callable returning a tuple hits an assembly-kernel limit — same for jno.fn)."""
     d, u, phi, xi, yi, xb, yb, ui, vi = _setup()
     kx = jno.np.parameter(phi, name="kx").initialize(lambda x, y: 1.0 + 4.0 * x).freeze()
     ky = jno.np.parameter(phi, name="ky").initialize(lambda x, y: 2.0 + 0.0 * y).freeze()

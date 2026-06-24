@@ -19,7 +19,6 @@ Run with x64: ``JAX_ENABLE_X64=1``.
 
 import pytest
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for the box domain")
 
 import jax  # noqa: E402
@@ -35,7 +34,7 @@ _dn = lambda A: np.asarray(A.todense()) if hasattr(A, "todense") else np.asarray
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """feax assembly is float64; opt into x64 per-test (the session default may be x64-off when
+    """FEM assembly is float64; opt into x64 per-test (the session default may be x64-off when
     co-run with test_periodic). Save/restore keeps the flag from leaking to other modules."""
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
@@ -104,13 +103,13 @@ def test_boussinesq_mms_steady_coordinate_dependent_bcs():
         w = w + jnp.linalg.solve(_dn(J(w)), -g)
         if float(jnp.linalg.norm(jnp.asarray(r(w)).reshape(-1))) < 1e-10:
             break
-    off = list(np.asarray(fem.problem.offset)) + [fem.dofs]
+    off = fem.offsets  # [0, n_vel, n_vel+n_p, n_total]
     w = np.asarray(w)
-    pts = np.asarray(fem.problem.mesh[0].points)
+    pts = np.asarray(fem.field_points[0])
     uu = w[off[0] : off[1]].reshape(-1, 2)
     UXn = PI * np.sin(PI * pts[:, 0]) * np.cos(PI * pts[:, 1])
     UYn = -PI * np.cos(PI * pts[:, 0]) * np.sin(PI * pts[:, 1])
-    ptsT = np.asarray(fem.problem.mesh[2].points)
+    ptsT = np.asarray(fem.field_points[2])
     Tn = np.sin(PI * ptsT[:, 0]) * np.cos(PI * ptsT[:, 1])
     TT = w[off[2] : off[3]]
     assert np.linalg.norm(uu - np.stack([UXn, UYn], 1)) / np.linalg.norm(np.stack([UXn, UYn], 1)) < 1e-3
@@ -165,7 +164,7 @@ def test_boussinesq_transient_vector_ic_and_convection_onset():
 
     blk = fem.operator
     M, dt = _dn(blk.mass(0.0, {})), 0.01
-    off = list(np.asarray(fem.problem.offset)) + [fem.dofs]
+    off = fem.offsets  # [0, n_vel, n_vel+n_p, n_total]
     w = jnp.asarray(blk.state0)
     assert float(np.abs(np.asarray(w)[off[0] : off[1]]).max()) == 0.0  # starts at rest
     for step in range(12):

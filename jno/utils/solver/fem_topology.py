@@ -10,7 +10,7 @@ tangential trace is discontinuous and the method does not converge).
 
 This module builds both from the linear (P1) triangle connectivity. It is the
 persisted, orientation-carrying generalisation of the throwaway ``edge_map`` in
-:func:`feax_utils._promote_to_quadratic` (which dedups edges only to place P2
+:func:`fem_utils._promote_to_quadratic` (which dedups edges only to place P2
 midpoints, then discards the map).
 
 Orientation convention (standard, e.g. DOLFINx): the *global* direction of an

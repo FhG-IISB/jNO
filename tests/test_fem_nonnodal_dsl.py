@@ -13,7 +13,6 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-pytest.importorskip("feax", reason="feax required for jno.fem")
 pytest.importorskip("pygmsh", reason="pygmsh required for 2D meshing")
 pytest.importorskip("basix", reason="basix required for RT tabulation")
 
@@ -492,7 +491,7 @@ def test_n1e_nonlinear_reaction_solve_converges():
 def test_n1e_transient_decay_matches_analytic():
     # Transient H(curl): ∂ₜu + u = 0 with u0=(-y,x)∈N1E0 decays as u(t)=exp(-t)u0. Exercises the non-nodal
     # transient path: temporal split -> mass M, the IC L²-PROJECTION onto edge DOFs (NOT the nodal
-    # _initial_state, which has the wrong size/meaning), the FeaxTimeBlock, and a backward-Euler trajectory
+    # _initial_state, which has the wrong size/meaning), the SemidiscreteTimeBlock, and a backward-Euler trajectory
     # matching the analytic decay rate (mirrors the nodal test_transient_heat_decays_to_analytic).
     d = jno.domain(box(0, 0, 1, 1), mesh_size=0.5, time=(0.0, 0.1, 11))
     co = d.variable("interior", split=True)
@@ -539,7 +538,7 @@ def test_n1e_transient_forced_solve_exercises_forcing():
 
 
 def test_n1e_nonlinear_transient_decays():
-    # Nonlinear TRANSIENT: ∂ₜu + u + |u|²u = 0 (cubic reaction) -> a mass/residual/jacobian FeaxTimeBlock
+    # Nonlinear TRANSIENT: ∂ₜu + u + |u|²u = 0 (cubic reaction) -> a mass/residual/jacobian SemidiscreteTimeBlock
     # integrated by the matrix-free Newton-Krylov stepper. u0=(-y,x) decays (faster than the linear rate).
     from jno.utils.solver.backend_blocks import _default_transient_integrate
 

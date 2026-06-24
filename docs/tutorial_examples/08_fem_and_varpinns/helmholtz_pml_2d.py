@@ -6,8 +6,8 @@ truncated box behaves like open space. The PML is a *complex coordinate stretch*
 
 jno.fem detects the complex form (a ``1j`` coefficient) and solves it via the
 real-equivalent block (it splits each term into real Re/Im sub-forms, assembles both through the
-ordinary REAL feax path, solves [[A_r,-A_i],[A_i,A_r]], and recombines to u = u_r + i u_i). feax is
-never asked to assemble complex.
+ordinary REAL assembly path, solves [[A_r,-A_i],[A_i,A_r]], and recombines to u = u_r + i u_i). The
+assembler is never asked to build a complex matrix.
 
 PML-quality check (no analytic solution needed): a *converged* PML's physical-core field does not
 depend on the absorber strength sigma0 -- a poor / absent PML reflects and changes with sigma0.

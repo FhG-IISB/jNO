@@ -7,12 +7,11 @@ or the built-in default (the differentiable sparse-direct ``sparse_lu_solve`` fo
 linear, matrix-free Newton-Krylov for nonlinear); a bring-your-own dense solver is
 exercised too. Implicit-diff lets the gradient reach the parameter without unrolling.
 
-Run with x64 (the feax assembly is float64): ``JAX_ENABLE_X64=1``.
+Run with x64 (assembly runs in float64): ``JAX_ENABLE_X64=1``.
 """
 
 import pytest
 
-pytest.importorskip("feax", reason="feax required for FEM inverse tests")
 pytest.importorskip("shapely", reason="shapely required for the box domain")
 
 import jax  # noqa: E402
@@ -33,7 +32,7 @@ _DUMMY = jno.domain.from_array({"_": np.zeros((1, 1))})
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """feax assembly is float64, so these tests need x64. Set it per-test with
+    """FEM assembly/solves run in float64, so these tests need x64. Set it per-test with
     save/restore — the global flag is shared across modules and other suites flip it
     at import (e.g. the periodic-parametric tests force it False)."""
     prev = jax.config.jax_enable_x64
@@ -129,7 +128,7 @@ def test_nonlinear_recovers():
 def test_nonaffine_scalar_recovers_via_reassembly():
     """A parameter inside a nonlinear function (``exp(logk)``) can't be factored into
     a constant basis, so the operator is re-assembled each call with the parameter
-    threaded as feax InternalVars. The feax kernel is JAX, so the gradient still
+    threaded as InternalVars. The kernel is JAX, so the gradient still
     reaches the parameter."""
     logk = jno.np.parameter((1,), key=jax.random.PRNGKey(1), name="logk")
     logk.initialize(jax.nn.initializers.constant(0.7))  # k = e^0.7 ~ 2 (truth: logk=0)

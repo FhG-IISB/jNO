@@ -22,7 +22,7 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")  # play nice on a
 
 import jax
 
-jax.config.update("jax_enable_x64", True)  # feax assembly is float64; psi is complex128
+jax.config.update("jax_enable_x64", True)  # the assembler builds in float64; psi is complex128
 
 from pathlib import Path  # noqa: E402
 

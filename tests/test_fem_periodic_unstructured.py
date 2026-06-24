@@ -12,14 +12,11 @@ These exercise ``build_periodic_prolongation`` directly (no FEM assembly). x64 s
 reduction reproduces the fields exactly.
 """
 
+import jax  # noqa: E402
 import numpy as np
 import pytest
 
-pytest.importorskip("feax", reason="feax required for the periodic solver utilities")
-
-import jax  # noqa: E402
-
-from jno.utils.solver.feax_utils import build_periodic_prolongation  # noqa: E402
+from jno.utils.solver.fem_utils import build_periodic_prolongation  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -317,17 +314,14 @@ def test_boundary_facets_extractor_p1_p2():
 
     import jno
     from jno._fem import _boundary_facets
+    from jno.utils.solver.fem_native import _get_mesh
 
     for order, k in [(1, 2), (2, 3)]:
         dom = jno.domain(box(0, 0, 1, 1)).build_mesh(0.4)
-        u, phi = dom.fem_symbols(order=order)
-        xi, yi, _ = dom.variable("interior", split=True)
-        xb, yb, _ = dom.variable("boundary", split=True)
-        ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
-        fem = jno.fem([ui.x * vi.x + ui.y * vi.y - vi, u(xb, yb) - 0.0])
-        m = fem.problem.mesh[0]
-        pts = np.asarray(m.points)
-        bf = _boundary_facets(pts, np.asarray(m.cells), 2, order)
+        # The assembly mesh the DOFs live on (vertices, plus edge midpoints for P2).
+        _, _, pts_f, cells_f = _get_mesh(dom, 2, order)
+        pts = np.asarray(pts_f)
+        bf = _boundary_facets(pts, np.asarray(cells_f), 2, order)
         assert bf.shape[1] == k, f"order={order} should give {k}-node facets, got {bf.shape}"
         if order == 2:
             assert all(np.allclose(pts[r[2]], 0.5 * (pts[r[0]] + pts[r[1]])) for r in bf), "col2 must be the edge midpoint"

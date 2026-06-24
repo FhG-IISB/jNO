@@ -12,7 +12,6 @@ Run with x64 (the coupled real system is float64): ``JAX_ENABLE_X64=1``.
 
 import pytest
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for the box domain")
 
 import jax  # noqa: E402
@@ -39,7 +38,7 @@ def _solve_dense(fem):
     """Solve the assembled steady linear block densely (small test meshes)."""
     A = np.asarray(fem.A.todense() if hasattr(fem.A, "todense") else fem.A)
     b = np.asarray(fem.b).reshape(-1)
-    return np.linalg.solve(A, b), int(np.asarray(fem.problem.offset)[1]), np.asarray(fem.problem.mesh[0].points)
+    return np.linalg.solve(A, b), int(fem.offsets[1]), np.asarray(fem.field_points[0])
 
 
 def test_complex_true_returns_complex_pair():

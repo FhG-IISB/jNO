@@ -25,7 +25,7 @@ class DiffraxBlock:
 
         y_dot = rhs(t, y, args)
 
-    For converted FEAX-time blocks, the RHS is usually created from either:
+    For converted semidiscrete time blocks, the RHS is usually created from either:
 
         M u_dot + A u = c + f(t)
 
@@ -101,7 +101,7 @@ class DiffraxBlock:
         """Map reduced periodic DOFs back to the full nodal layout."""
         if self.prolongation is None:
             return reduced
-        from .feax_utils import prolong as _prolong
+        from .fem_utils import prolong as _prolong
 
         return _prolong(self.prolongation, reduced)
 
@@ -112,11 +112,11 @@ class DiffraxBlock:
 
 
 @dataclass
-class FeaxTimeBlock:
+class SemidiscreteTimeBlock:
     """
     Solver-agnostic semidiscrete transient block.
 
-    A `FeaxTimeBlock` is returned by:
+    A `SemidiscreteTimeBlock` is returned by:
 
         weak_expr.assemble(target="fem_time")
 
@@ -173,7 +173,7 @@ class FeaxTimeBlock:
     boundary_exprs:
         Boundary weak-form terms grouped by boundary region id.
     rhs:
-        Optional RHS callable. Usually unused for FEAX-time weak-form blocks.
+        Optional RHS callable. Usually unused for semidiscrete weak-form blocks.
     jacobian:
         Nonlinear residual Jacobian callable `jacobian(u, t, args)`.
     mass:
@@ -181,7 +181,7 @@ class FeaxTimeBlock:
     residual:
         Nonlinear residual callable `residual(u, t, args)`.
     nonlinear_runtime:
-        Runtime diagnostics for nonlinear FEAX-time assembly.
+        Runtime diagnostics for nonlinear semidiscrete-time assembly.
     state0:
         Initial state vector.
     initial_conditions:
@@ -190,8 +190,8 @@ class FeaxTimeBlock:
         Start and end time.
     dt:
         Time-step size or time-step hint.
-    feax_context:
-        FEAX/FEM context copied from the domain.
+    eval_context:
+        FEM evaluation context copied from the domain.
     metadata:
         Classification, lowering, and diagnostic metadata.
     M, A:
@@ -205,14 +205,12 @@ class FeaxTimeBlock:
         Constant affine vector `c` in `M u_dot + A u = c + f(t)`.
     forcing_vector_fn:
         Optional forcing callback `f(t, args)`.
-    feax_mesh:
-        FEAX mesh used by FEAX pipeline conversion.
     forcing_mode:
         Text label describing how forcing is represented, for example
         `"none"`, `"weak_auto"`, `"user_callback"`, or `"embedded_residual"`.
     """
 
-    backend: str = "feax_time"
+    backend: str = "transient"
     mode: str = "implicit"
     time_order: int = 1
     spatial_kind: str = "weak_form"
@@ -237,7 +235,7 @@ class FeaxTimeBlock:
     t1: float = 1.0
     dt: Optional[float] = None
 
-    feax_context: Dict[str, Any] = field(default_factory=dict)
+    eval_context: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     # linear semidiscrete payload
@@ -260,8 +258,7 @@ class FeaxTimeBlock:
     # Periodic prolongation matrix P (n_full x n_red); None when absent.
     prolongation: Any = None
 
-    # optional mesh / hints
-    feax_mesh: Any = None
+    # optional hints
     forcing_mode: str = "none"
 
     def is_linear(self) -> bool:
@@ -279,7 +276,7 @@ class FeaxTimeBlock:
         """Map reduced periodic DOFs back to the full nodal layout."""
         if self.prolongation is None:
             return reduced
-        from .feax_utils import prolong as _prolong
+        from .fem_utils import prolong as _prolong
 
         return _prolong(self.prolongation, reduced)
 
@@ -318,7 +315,7 @@ class FeaxTimeBlock:
         Note a Dirichlet problem zeroes M's Dirichlet rows (a DAE), so the implicit
         ``(M + dt A)`` default is preferred there; an explicit field must hold those rows.
 
-        Enable x64 (``jax_enable_x64``); the feax assembly is float64.
+        Enable x64 (``jax_enable_x64``); the assembly is float64.
         """
         from ...trace import FunctionCall  # lazy: avoid an import cycle with jno.trace
 
@@ -363,7 +360,7 @@ def _default_transient_integrate(block, args, save_ts):
       unrolling Newton -- the same solver the steady nonlinear ``.solve`` now uses.
 
     This is a *default*: pass any ``solve_fn(block, args, save_ts) -> ys`` to
-    :meth:`FeaxTimeBlock.solve` (a hand-rolled stepper, or diffrax built from the block's
+    :meth:`SemidiscreteTimeBlock.solve` (a hand-rolled stepper, or diffrax built from the block's
     ``M`` / ``A`` / ``state0``) to use a different integrator.
     """
     import jax

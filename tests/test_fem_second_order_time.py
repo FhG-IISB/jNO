@@ -21,7 +21,6 @@ import pytest
 
 import jno
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
@@ -36,7 +35,7 @@ PERIOD = 2.0 * PI / OMEGA  # = √2
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """feax assembly is float64, so opt into x64 per-test (session default is x64-off)."""
+    """FEM assembly/solves run in float64, so opt into x64 per-test (session default is x64-off)."""
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
     try:
@@ -81,6 +80,7 @@ def _trajectory(fem, theta=None):
 # ==========================================================================
 def test_second_order_routes_to_transient_augmented_block():
     fem = _wave_fem(mesh_size=0.2, n_periods=1, n_steps=10)
+    assert fem.problem is None  # the M2/C/K/F blocks are assembled natively
     assert fem.is_transient and fem.is_linear
     n = fem.offsets[1]
     assert fem.offsets == [0, n, 2 * n]  # y = [u; v]
