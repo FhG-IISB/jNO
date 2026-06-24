@@ -188,6 +188,69 @@ class SemidiscreteTimeBlock:
         """
         return self.mass is not None and self.residual is not None
 
+    def step(self, u, t, dt, args=None, theta=None):
+        """Advance the semidiscrete state by one implicit step: ``u(t) -> u(t + dt)``.
+
+        The composable one-step primitive behind :func:`_default_transient_integrate` (which is just
+        a ``lax.scan`` over this method) and the building block for operator-splitting / IMEX schemes.
+        Functional (returns the next state) and reverse-mode differentiable.
+
+        * **linear** block -> one theta-step
+          ``(M + theta dt A) u_next = (M - (1-theta) dt A) u + dt c + dt f`` via the matrix-free
+          BiCGStab + Jacobi solver (operators applied only as matvecs, so a BCOO ``A`` stays sparse);
+        * **nonlinear** block -> one backward-Euler Newton solve
+          ``M(t+dt)(u_next - u)/dt + R(u_next, t+dt, args) = 0`` (matrix-free Newton-Krylov).
+
+        ``theta`` defaults to ``metadata["theta"]`` (1 backward Euler / 1/2 trapezoidal). Operates in
+        the block's (periodic-reduced) DOF space; use :meth:`prolong` for the full nodal field.
+        """
+        import jax
+        import jax.numpy as jnp
+
+        args = args or {}
+        u = jnp.asarray(u).reshape(-1)
+        dtype = u.dtype
+        t_next = t + dt
+
+        # keep a BCOO operator as-is (matrix-free matvec) but coerce a dense one to a JAX array
+        def _operand(x):
+            return x if hasattr(x, "todense") else jnp.asarray(x, dtype)
+
+        if self.is_nonlinear():
+            from .newton_krylov import newton_krylov
+
+            M_t = _operand(self.mass(t_next, args))
+
+            def G(wn):
+                return (M_t @ (wn - u)) / dt + jnp.asarray(self.residual(wn, t_next, args), dtype).reshape(-1)
+
+            return newton_krylov(G, u)
+
+        from .linear import matrix_diagonal
+
+        th = theta if theta is not None else (float(self.metadata.get("theta", 1.0)) if self.metadata else 1.0)
+        M = _operand(self.M)
+        n = M.shape[0]
+        c = jnp.zeros((n,), dtype) if self.affine_bias is None else jnp.asarray(self.affine_bias, dtype).reshape(-1)
+        A = _operand(self.operator_fn(t_next, args) if self.operator_fn is not None else self.A)
+
+        def _forcing(tt):
+            if self.forcing_vector_fn is None:
+                return jnp.zeros((n,), dtype)
+            return jnp.asarray(self.forcing_vector_fn(tt, args), dtype).reshape(-1)
+
+        # (M + theta dt A) u_next = (M - (1-theta) dt A) u + dt c + dt(theta f_next + (1-theta) f_now)
+        f_avg = th * _forcing(t_next) + (1.0 - th) * _forcing(t)
+        rhs = M @ u - (1.0 - th) * dt * (A @ u) + dt * c + dt * f_avg
+        step_op = lambda wn: M @ wn + th * dt * (A @ wn)  # noqa: E731  the theta-method step operator
+        # diagonal (Jacobi) preconditioner 1/diag(M + theta dt A); zero diagonals left unscaled
+        d = matrix_diagonal(M) + th * dt * matrix_diagonal(A)
+        inv = 1.0 / jnp.where(jnp.abs(d) > 1e-30, d, 1.0)
+        wn, _ = jax.scipy.sparse.linalg.bicgstab(
+            step_op, rhs, x0=u, tol=1e-10, atol=0.0, maxiter=20_000, M=lambda x: inv * x
+        )
+        return wn
+
     def solve(self, solve_fn=None, *, save_ts=None):
         """Differentiable transient forward solve -> the trajectory ``u(save_ts)`` as a
         trace node (mirrors :meth:`FemLinearSystem.solve` for the steady case).
@@ -263,66 +326,22 @@ def _default_transient_integrate(block, args, save_ts):
     import jax
     import jax.numpy as jnp
 
-    from .newton_krylov import newton_krylov
-
-    # keep a BCOO operator as-is (matrix-free matvec) but coerce a dense one to a JAX array
-    def _operand(x):
-        return x if hasattr(x, "todense") else jnp.asarray(x, dtype)
-
     s0 = jnp.asarray(block.state0).reshape(-1)
     dtype = s0.dtype
     grid_ts = jnp.asarray(_block_time_grid(block), dtype)
     dt = float(block.dt)
 
-    # One general backward-Euler step for both payloads: each step solves the root
-    # G(u_next) = 0 with the matrix-free Newton-Krylov solver (no optimistix). For the linear
-    # block G is affine, so Newton converges in one iteration -> one inner BiCGStab solve; the
-    # operators are only ever applied as matvecs (M @ v, A @ v), so a BCOO operator stays sparse.
-    if block.is_nonlinear():
-        mass_fn, residual_fn = block.mass, block.residual
+    # One scan step = one implicit advance of the block. `block.step` is the single definition of
+    # that step (theta-method for a linear block, backward-Euler Newton for a nonlinear one); read
+    # theta from the block so a linear step uses the assembled scheme. Operators are only applied as
+    # matvecs inside block.step, so a BCOO operator stays sparse.
+    theta = float(block.metadata.get("theta", 1.0)) if getattr(block, "metadata", None) else 1.0
 
-        def step(w, t_next):
-            M_t = _operand(mass_fn(t_next, args))
+    def step(w, t_next):
+        wn = block.step(w, t_next - dt, dt, args=args, theta=theta)
+        return wn, wn
 
-            def G(wn):
-                return (M_t @ (wn - w)) / dt + jnp.asarray(residual_fn(wn, t_next, args), dtype).reshape(-1)
-
-            wn = newton_krylov(G, w)
-            return wn, wn
-
-        _, ys = jax.lax.scan(step, s0, grid_ts[1:])
-    else:
-        from .linear import matrix_diagonal
-
-        M = _operand(block.M)
-        n = M.shape[0]
-        c = jnp.zeros((n,), dtype) if block.affine_bias is None else jnp.asarray(block.affine_bias, dtype).reshape(-1)
-        # theta-method on the linear semidiscrete system: theta=1 is backward Euler (the default);
-        # theta=1/2 is the trapezoidal rule (energy-conserving -- used by the second-order/wave route,
-        # where backward Euler would spuriously damp an undamped oscillation).
-        theta = float(block.metadata.get("theta", 1.0)) if getattr(block, "metadata", None) else 1.0
-        diagM = matrix_diagonal(M)
-
-        def _forcing(t):
-            if block.forcing_vector_fn is None:
-                return jnp.zeros((n,), dtype)
-            return jnp.asarray(block.forcing_vector_fn(t, args), dtype).reshape(-1)
-
-        def step(w, t_next):
-            A = _operand(block.operator_fn(t_next, args) if block.operator_fn is not None else block.A)
-            # (M + theta dt A) w_next = (M - (1-theta) dt A) w + dt c + dt(theta f_next + (1-theta) f_prev)
-            f_avg = theta * _forcing(t_next) + (1.0 - theta) * _forcing(t_next - dt)
-            rhs = M @ w - (1.0 - theta) * dt * (A @ w) + dt * c + dt * f_avg
-            step_op = lambda wn: M @ wn + theta * dt * (A @ wn)  # the theta-method step operator
-            # diagonal (Jacobi) preconditioner 1/diag(M + theta dt A); zero diagonals left unscaled
-            d = diagM + theta * dt * matrix_diagonal(A)
-            inv = 1.0 / jnp.where(jnp.abs(d) > 1e-30, d, 1.0)
-            wn, _ = jax.scipy.sparse.linalg.bicgstab(
-                step_op, rhs, x0=w, tol=1e-10, atol=0.0, maxiter=20_000, M=lambda x: inv * x
-            )
-            return wn, wn
-
-        _, ys = jax.lax.scan(step, s0, grid_ts[1:])
+    _, ys = jax.lax.scan(step, s0, grid_ts[1:])
 
     traj = jnp.concatenate([s0[None, :], ys], axis=0)  # (n_grid, n_dofs) at grid_ts
     save_ts = jnp.asarray(save_ts, dtype)
