@@ -36,15 +36,11 @@ dependencies = [
     "pygmsh>=7.0.0",
     "cloudpickle>=3.0.0",
     "einops>=0.7.0",
-    "matplotlib>=3.8.0",
-    "pylotte>=0.3",
     "shapely>=2.0",
     "paramax>=0.0.5",
     "blackjax>=1.2",
 
-    # FEM / weak-form solver — required by the variational PINN tutorials
-    # under docs/tutorial_examples/08_fem_and_varpinns and a Bayesian inverse.
-    "diffrax",
+    "fenics-basix",
 ]
 
 [project.urls]
@@ -63,14 +59,11 @@ dev = ["pytest>=7.0",
         "black>=22.0",
         "flake8>=4.0",
         "mypy>=0.950",
-        "diffrax",
         "paramax",
         "flax",
         "xprof",
-        "pylotte",
         "nevergrad",
         "pyfiglet",
-        "fenics-basix"
 ]
 iree = [
     "iree-base-compiler",
@@ -110,10 +103,13 @@ ignore = [
 exclude = '^(build/|jNO\.egg-info/|runs/)'
 
 [dependency-groups]
+# Test/tutorial env extras. matplotlib + diffrax are NOT runtime deps (the library
+# only imports them lazily, inside try/except); they live here so the tutorial suite
+# and the explainability-callback plotting run unmodified in tests.
 fem = [
-    "diffrax",
     "pyfiglet",
-    "fenics-basix",
+    "diffrax",
+    "matplotlib",
 ]
 dev = [
     "pytest-xdist>=3.8.0",

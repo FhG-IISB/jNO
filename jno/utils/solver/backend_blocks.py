@@ -4,109 +4,6 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
 # ---------------------------------------------------------------------
-# Solver-facing output blocks
-# ---------------------------------------------------------------------
-
-
-@dataclass
-class DiffraxBlock:
-    """
-    Solver-facing block for Diffrax-based time integration.
-
-    A `DiffraxBlock` is returned by strong-form time assembly routes.
-
-    It stores the complete information needed to call Diffrax externally:
-    the initial state, time interval, step-size hint, right-hand side function,
-    optional mass operator, and metadata describing how the block was produced.
-
-    Typical equation represented
-    ----------------------------
-    First-order explicit system:
-
-        y_dot = rhs(t, y, args)
-
-    For converted semidiscrete time blocks, the RHS is usually created from either:
-
-        M u_dot + A u = c + f(t)
-
-    or:
-
-        M(t) u_dot + R(u, t) = 0
-
-    Important fields
-    ----------------
-    backend:
-        Backend identifier. Usually `"diffrax"`.
-    form:
-        Description of the lowered system form, for example
-        `"explicit_first_order"` or `"explicit_first_order_nonlinear"`.
-    time_order:
-        Original temporal order of the symbolic problem.
-    original_expr:
-        Original symbolic expression or weak-form IR used to build the block.
-    lowered_rhs:
-        Optional lowered symbolic RHS expression, when available.
-    rewritten_system:
-        Optional metadata for rewritten systems, such as second-order to
-        first-order reductions.
-    state0:
-        Initial solver state.
-    initial_conditions:
-        Raw user-provided initial-condition object, if supplied.
-    t0, t1:
-        Start and end time.
-    dt0:
-        Initial time-step hint for Diffrax.
-    rhs:
-        Callable with signature `rhs(t, y, args)`.
-    term:
-        Diffrax term object, usually `diffrax.ODETerm(rhs)`.
-    args:
-        Optional static/runtime arguments passed to the RHS.
-    mass:
-        Optional mass operator callable.
-    state_meta:
-        Metadata about the state layout.
-    metadata:
-        Diagnostic and lowering metadata.
-    """
-
-    backend: str = "diffrax"
-    form: str = "explicit_first_order"
-    time_order: int = 1
-
-    original_expr: Any = None
-    lowered_rhs: Any = None
-    rewritten_system: Any = None
-
-    state0: Any = None
-    initial_conditions: Any = None
-
-    t0: float = 0.0
-    t1: float = 1.0
-    dt0: Optional[float] = None
-
-    rhs: Optional[Callable] = None
-    term: Any = None
-    args: Any = None
-    mass: Optional[Callable] = None
-
-    state_meta: Dict[str, Any] = field(default_factory=dict)
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-    # Periodic prolongation matrix P (n_full x n_red); None when absent.
-    prolongation: Any = None
-
-    def prolong(self, reduced):
-        """Map reduced periodic DOFs back to the full nodal layout."""
-        if self.prolongation is None:
-            return reduced
-        from .fem_utils import prolong as _prolong
-
-        return _prolong(self.prolongation, reduced)
-
-
-# ---------------------------------------------------------------------
 # Solver-agnostic semidiscrete block returned by weak.assemble(...)
 # ---------------------------------------------------------------------
 
@@ -309,7 +206,7 @@ class SemidiscreteTimeBlock:
         ``solve_fn`` is **your** integrator: any ``(block, args, save_ts) -> ys`` callable
         returning a ``(len(save_ts), n_dofs)`` trajectory; jNO writes none and imposes no
         library. The default :func:`_default_transient_integrate` is a backward-Euler
-        ``lax.scan`` over the block's own assembled ``dt``. To bring your own (e.g. diffrax),
+        ``lax.scan`` over the block's own assembled ``dt``. To bring your own integrator,
         build it from the block's flat pieces -- ``block.M``, ``block.A`` (or
         ``block.operator_fn(t, args)``) and ``block.state0`` -- and form ``u_dot = M^-1(c - A u)``.
         Note a Dirichlet problem zeroes M's Dirichlet rows (a DAE), so the implicit
@@ -360,7 +257,7 @@ def _default_transient_integrate(block, args, save_ts):
       unrolling Newton -- the same solver the steady nonlinear ``.solve`` now uses.
 
     This is a *default*: pass any ``solve_fn(block, args, save_ts) -> ys`` to
-    :meth:`SemidiscreteTimeBlock.solve` (a hand-rolled stepper, or diffrax built from the block's
+    :meth:`SemidiscreteTimeBlock.solve` (a hand-rolled stepper built from the block's
     ``M`` / ``A`` / ``state0``) to use a different integrator.
     """
     import jax

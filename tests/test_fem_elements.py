@@ -13,13 +13,11 @@ by Stokes), and check the edge-orientation sign flips the basis.
 
 from __future__ import annotations
 
-import numpy as np
-import pytest
-
-basix = pytest.importorskip("basix", reason="basix required for element tabulation")
-
+import basix
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
+import numpy as np
+import pytest
 
 from jno.utils.solver.fem_elements import (  # noqa: E402
     nedelec_triangle,

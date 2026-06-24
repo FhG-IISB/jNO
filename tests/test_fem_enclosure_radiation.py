@@ -384,7 +384,8 @@ def test_coupled_conduction_radiation_concentric_cylinders():
     xh, yh, _ = d.variable("hot", split=True)
     xc, yc, _ = d.variable("cold", split=True)
     fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y), u(xh, yh) - T_hot, u(xc, yc) - T_cold])
-    A = fem.operator[0].todense()  # BCOO -> dense via the jax path (.todense() fast; np.asarray hangs)
+    A0 = fem.operator[0]  # dense JAX array (native assembler) or BCOO -> densify either way
+    A = A0.todense() if hasattr(A0, "todense") else jnp.asarray(A0)
     b = jnp.asarray(fem.operator[1]).reshape(-1)
     n = b.size
 

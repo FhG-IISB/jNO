@@ -14,7 +14,6 @@ import numpy as np
 import pytest
 
 pytest.importorskip("pygmsh", reason="pygmsh required for 2D meshing")
-pytest.importorskip("basix", reason="basix required for RT tabulation")
 
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402

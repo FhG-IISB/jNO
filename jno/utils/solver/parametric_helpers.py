@@ -234,15 +234,7 @@ def _runtime_scalar_arg(args, name: str, *, dtype):
 
 
 def _collect_runtime_parameter_exprs(node, out=None):
-    """
-    Collect zero-argument ``jno.np.parameter(...)`` calls by public name.
-
-    Strong-form Diffrax lowering replaces these symbolic parameter ModelCalls
-    with private TensorTags. Concrete values are supplied by the external
-    solver through:
-
-        diffrax.diffeqsolve(..., args={"parameter_name": value})
-    """
+    """Collect zero-argument ``jno.np.parameter(...)`` calls by public name."""
     if out is None:
         out = {}
 

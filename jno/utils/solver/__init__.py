@@ -6,7 +6,6 @@ time routing, and solver adapters.
 """
 
 from .backend_blocks import (
-    DiffraxBlock,
     SemidiscreteTimeBlock,
 )
 from .fem_route import (
@@ -70,7 +69,6 @@ __all__ = [
     "LoweredWeakForm",
     "lower_weak_form",
     "assemble_weak_form",
-    "DiffraxBlock",
     "SemidiscreteTimeBlock",
     "split_weak_additive_terms",
 ]

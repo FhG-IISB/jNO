@@ -89,7 +89,6 @@ def test_jacobi_guards_zero_diagonal():
 
 def test_fem_steady_linear_default_is_sparse_direct():
     """The fem.solve steady-linear default (sparse-direct) matches a dense solve on a real Poisson."""
-    pytest.importorskip("feax")
     pytest.importorskip("shapely")
     from shapely.geometry import box
 
@@ -102,5 +101,7 @@ def test_fem_steady_linear_default_is_sparse_direct():
     ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
     fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
     x = np.asarray(fem.solve())  # default = sparse_lu_solve
-    A, b = jnp.asarray(fem.operator[0].todense()), jnp.asarray(fem.operator[1]).reshape(-1)
+    A0 = fem.operator[0]
+    A = jnp.asarray(A0.todense() if hasattr(A0, "todense") else A0)
+    b = jnp.asarray(fem.operator[1]).reshape(-1)
     assert np.allclose(x, np.asarray(jnp.linalg.solve(A, b)), atol=1e-9)

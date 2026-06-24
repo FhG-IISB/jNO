@@ -1686,8 +1686,8 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         domain.init_fem_native(element_type=element_type, quad_degree=quad_degree, bcs=bcs, vec=vec or 1)
 
     # ---- VPINN: test-project the (now fem_gauss-tagged) weak form onto the FE test space ----
-    # The network trial already sits inside the weak terms; assemble_weak_form(target="vpinn")
-    # returns a GroupedAssembly whose .mse is the trainable test-projected residual (for jno.core).
+    # The network trial already sits inside the weak terms; assemble_weak_form returns a
+    # GroupedAssembly whose .mse is the trainable test-projected residual (for jno.core).
     # The Dirichlet condition (u(boundary) - g) declares which test functions vanish on the
     # boundary -> its nodes are masked from the residual (else the exact solution's du/dn flux is
     # an irreducible loss term and training diverges from the solution).
@@ -1708,7 +1708,7 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         for region_terms in boundary_terms.values():
             for t in region_terms:
                 weak = weak + t
-        return assemble_weak_form(domain, weak, target="vpinn")
+        return assemble_weak_form(domain, weak)
 
     if ic_residuals and not is_transient:
         raise ValueError("jno.fem: an initial condition was given but the weak form has no time derivative.")

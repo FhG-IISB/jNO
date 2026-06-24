@@ -1531,27 +1531,11 @@ class domain(MeshIOMixin):
         else:
             self._mesh_pool[name] = sel
 
-    def assemble_weak_form(self, expr, target="vpinn", **kwargs):
-        """
-        Assemble a symbolic weak form for the requested backend.
-
-        Parameters
-        ----------
-        expr : object
-            Symbolic weak-form expression.
-        target : str, default="vpinn"
-            Assembly backend or lowering target.
-        **kwargs
-            Additional backend-specific options.
-
-        Returns
-        -------
-        object
-            Assembled backend-specific representation of the weak form.
-        """
+    def assemble_weak_form(self, expr, **kwargs):
+        """Assemble a symbolic weak-form expression into a VPINN GroupedAssembly."""
         from ..utils.solver.weak_form import assemble_weak_form
 
-        return assemble_weak_form(self, expr, target=target, **kwargs)
+        return assemble_weak_form(self, expr, **kwargs)
 
     # Generators
     def _generate_mesh(self, geometry_func: Callable, algorithm: int):

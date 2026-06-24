@@ -24,7 +24,6 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-basix = pytest.importorskip("basix", reason="basix required for element tabulation")
 pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
 
 import jax  # noqa: E402
