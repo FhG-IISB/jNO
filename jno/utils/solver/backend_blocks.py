@@ -170,9 +170,13 @@ class SemidiscreteTimeBlock:
         return self.M is not None and (self.A is not None or self.operator_fn is not None)
 
     def prolong(self, reduced):
-        """Map reduced periodic DOFs back to the full nodal layout."""
+        """Map reduced periodic DOFs back to the full nodal layout (single- or multi-field)."""
         if self.prolongation is None:
             return reduced
+        if isinstance(self.prolongation, dict):  # multifield periodic carries the per-field reduction
+            from .fem_utils import prolong_periodic
+
+            return prolong_periodic(self.prolongation, reduced)
         from .fem_utils import prolong as _prolong
 
         return _prolong(self.prolongation, reduced)

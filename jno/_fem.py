@@ -811,20 +811,19 @@ class FEM:
             if self._periodic is not None:
                 # periodic tie: eliminate slave DOFs via the prolongation P, solve the reduced
                 # (P^T A P) u_red = P^T b, then prolong u = P u_red back to the full nodal layout.
-                from .utils.solver.fem_utils import prolong, reduce_matrix, reduce_vector
+                # The *_periodic helpers reduce block-wise per field, so this serves coupled problems too.
+                from .utils.solver.fem_utils import prolong_periodic, reduce_matrix_periodic, reduce_vector_periodic
 
-                P = self._periodic["P"]
-                u_red = _solve(reduce_matrix(P, A), reduce_vector(P, b))
-                return prolong(P, u_red)
+                u_red = _solve(reduce_matrix_periodic(self._periodic, A), reduce_vector_periodic(self._periodic, b))
+                return prolong_periodic(self._periodic, u_red)
             return _solve(A, b)
         if self._mode == "nonlinear" and self._periodic is not None:
             # Periodic nonlinear: solve Newton in the reduced space -- r_red(u_red) = P^T r(P u_red) = 0,
             # then prolong u = P u_red (the tie is then satisfied exactly). Wraps the user's solve_fn
             # (or the operator's default Newton) so it operates on the reduced residual.
-            from .utils.solver.fem_utils import restrict_state
+            from .utils.solver.fem_utils import prolong_periodic, reduce_vector_periodic, restrict_state_periodic
 
-            P = jnp.asarray(self._periodic["P"])
-            kept, pvec = self._periodic["kept_nodes"], self._periodic["vec"]
+            periodic = self._periodic
             user_fn = solve_fn
 
             def _reduced(residual_fn, y0):
@@ -837,9 +836,12 @@ class FEM:
                     return newton_krylov(rf, y)
 
                 ur = _base(
-                    lambda ur: P.T @ jnp.asarray(residual_fn(P @ ur)).reshape(-1), restrict_state(P, y0, kept, vec=pvec)
+                    lambda ur: reduce_vector_periodic(
+                        periodic, jnp.asarray(residual_fn(prolong_periodic(periodic, ur))).reshape(-1)
+                    ),
+                    restrict_state_periodic(periodic, y0),
                 )
-                return P @ ur
+                return prolong_periodic(periodic, ur)
 
             return self._op.solve(solve_fn=_reduced, **kwargs)
         return self._op.solve(solve_fn, **kwargs)
@@ -1139,6 +1141,40 @@ def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, cells: 
     return build_periodic_prolongation(points, pairs, faces, vec=vec, facets=facets)
 
 
+def _build_periodic_reduction_multifield(
+    domain: Any, ties: List[Any], points: Any, cells: Any, ele_order: int, offsets: Any
+) -> dict:
+    """Periodic reduction for a coupled (multi-field) problem: one block per field, sharing a single
+    node-level ``P`` when all fields use the same mesh + element order (the supported case). The
+    Galerkin reduction stays block-wise (``P_i^T M[i,j] P_j``) — see the block-aware helpers in
+    ``fem_utils`` — so no block-diagonal ``P`` is ever materialised.
+
+    Heterogeneous-order coupled periodic (e.g. Taylor-Hood, different per-field DOF counts) is
+    rejected loudly: the reduction *machinery* handles per-field ``P_i``, but building distinct
+    per-field ``P_i`` is not wired yet."""
+    offs = [int(o) for o in offsets]
+    n_fields = len(offs) - 1
+    sizes = [offs[i + 1] - offs[i] for i in range(n_fields)]
+    if len(set(sizes)) != 1:
+        raise NotImplementedError(
+            "jno.fem: periodic ties on a coupled problem are supported for fields that share the same "
+            f"mesh and element order (equal DOF blocks); got block sizes {sizes}. Heterogeneous-order "
+            "coupled periodic (e.g. Taylor-Hood) is not wired yet."
+        )
+    n_nodes = int(np.asarray(points).shape[0])
+    vec = max(1, sizes[0] // n_nodes)  # per-field vec (uniform across fields); scalar fields -> 1
+    # The same (master, slave) geometry repeats once per field -> de-dup to the unique direction pairs.
+    seen: set = set()
+    uniq = [t for t in ties if (t[0], t[1]) not in seen and not seen.add((t[0], t[1]))]
+    red = _build_periodic_reduction(domain, uniq, points, cells, ele_order, int(vec))
+    P, kept, v = red["P"], red["kept_nodes"], red["vec"]
+    n_red_field = int(np.asarray(P).shape[1])
+    blocks = [{"P": P, "kept": kept, "vec": v} for _ in range(n_fields)]
+    off_full = [i * sizes[0] for i in range(n_fields + 1)]
+    off_red = [i * n_red_field for i in range(n_fields + 1)]
+    return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+
+
 def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
     """Reduce a native transient ``SemidiscreteTimeBlock`` by the periodic prolongation ``P`` and return a
     reduced block that carries ``P`` for prolongation (``u_full = P u_red``).
@@ -1151,43 +1187,47 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
     reduction of a matrix-free Newton residual is a separate, unbuilt path)."""
     import dataclasses
 
-    from .utils.solver.fem_utils import reduce_matrix, reduce_vector, restrict_state
+    from .utils.solver.fem_utils import (
+        _periodic_blocks,
+        reduce_matrix_periodic,
+        reduce_vector_periodic,
+        restrict_state_periodic,
+    )
 
     if block.is_nonlinear():
         raise NotImplementedError(
             "jno.fem: a nonlinear periodic transient is not supported natively yet -- the periodic "
-            "reduction is wired only for the linear time block. Write it as a first-order linear "
-            "system, or drop the periodic tie."
+            "reduction is wired only for the linear time block (single- or multi-field). Write it as a "
+            "first-order linear system, or drop the periodic tie."
         )
-    P = jnp.asarray(periodic["P"])
-    kept, pvec = periodic["kept_nodes"], periodic["vec"]
-
-    def _dn(x):
-        return jnp.asarray(x.todense()) if hasattr(x, "todense") else jnp.asarray(x)
+    blocks, off_f, off_r = _periodic_blocks(periodic)
+    n_full, n_red = int(off_f[-1]), int(off_r[-1])
 
     op_red = None
     if block.operator_fn is not None:
 
-        def op_red(t, args=None, _P=P, _op=block.operator_fn):
-            return reduce_matrix(_P, _dn(_op(t, args)))
+        def op_red(t, args=None, _p=periodic, _op=block.operator_fn):
+            return reduce_matrix_periodic(_p, _op(t, args))
 
     f_red = None
     if block.forcing_vector_fn is not None:
 
-        def f_red(t, args=None, _P=P, _f=block.forcing_vector_fn):
-            return reduce_vector(_P, jnp.asarray(_f(t, args)).reshape(-1))
+        def f_red(t, args=None, _p=periodic, _f=block.forcing_vector_fn):
+            return reduce_vector_periodic(_p, jnp.asarray(_f(t, args)).reshape(-1))
 
     meta = dict(getattr(block, "metadata", None) or {})
-    meta.update(periodic=True, full_state_size=int(P.shape[0]), reduced_state_size=int(P.shape[1]))
+    meta.update(periodic=True, full_state_size=n_full, reduced_state_size=n_red)
     return dataclasses.replace(
         block,
-        M=reduce_matrix(P, _dn(block.M)),
-        A=reduce_matrix(P, _dn(block.A)) if block.A is not None else None,
+        M=reduce_matrix_periodic(periodic, block.M),
+        A=reduce_matrix_periodic(periodic, block.A) if block.A is not None else None,
         operator_fn=op_red,
-        affine_bias=reduce_vector(P, jnp.asarray(block.affine_bias).reshape(-1)) if block.affine_bias is not None else None,
+        affine_bias=reduce_vector_periodic(periodic, jnp.asarray(block.affine_bias).reshape(-1))
+        if block.affine_bias is not None
+        else None,
         forcing_vector_fn=f_red,
-        state0=restrict_state(P, jnp.asarray(block.state0).reshape(-1), kept, pvec),
-        prolongation=P,
+        state0=restrict_state_periodic(periodic, jnp.asarray(block.state0).reshape(-1)),
+        prolongation=(blocks[0]["P"] if len(blocks) == 1 else periodic),
         metadata=meta,
     )
 
@@ -1270,7 +1310,8 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
 
     def _finalize(fem_obj: "FEM") -> "FEM":
         """Attach the periodic reduction (if any): linear & nonlinear via ``FEM.solve``, transient via
-        the time route's existing context-driven reduction. Still scoped to scalar single-field real."""
+        the time route's existing context-driven reduction. Single-field, vector, and coupled
+        multi-field are all reduced block-wise (P_i^T M[i,j] P_j); complex / runtime-parametric remain out."""
         fem_obj._term_source = (domain, volume_terms)
         if not periodic_ties:
             return fem_obj
@@ -1283,25 +1324,30 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             # The reduction is applied on the non-parametric (A, b) branch of FEM.solve; the
             # runtime-parametric FemLinearSystem.solve path would silently ignore it.
             raise NotImplementedError("jno.fem: periodic ties are not yet supported on runtime-parametric linear problems.")
-        if multifield or (vec or 1) != 1:
-            raise NotImplementedError(
-                "jno.fem: periodic ties are currently supported only for scalar single-field problems."
-            )
-        # Transient already had its P built + applied to the time block *before* it was returned (the
-        # route reduces M/A at assembly time); reuse it. Linear & nonlinear build here and reduce in
-        # FEM.solve. (1D has no assembly cells -> flat-chain facets via points only.)
+        # Single-field transient was already reduced by the dedicated native branch -> reuse its P.
         if periodic_holder:
             fem_obj._periodic = periodic_holder[0]
+            return fem_obj
+        # Build the reduction (single-field / vector, or coupled multifield). (1D has no assembly cells
+        # -> flat-chain facets via points only.)
+        prob = getattr(fem_obj, "problem", None)
+        if prob is not None:
+            cells, ele_order = _assembly_cells(prob)
         else:
-            prob = getattr(fem_obj, "problem", None)
-            if prob is not None:
-                cells, ele_order = _assembly_cells(prob)
-            else:
-                # Native path: no problem object -- read the assembly cells the native assembler stashed
-                # (``None`` for the native 1D route, which falls back to flat-chain facets on points).
-                cells = getattr(domain, "_fem_native_assembly_cells", None)
-                ele_order = int(getattr(domain, "_fem_native_assembly_order", 1))
-            fem_obj._periodic = _build_periodic_reduction(domain, periodic_ties, fem_obj.points, cells, ele_order, vec or 1)
+            # Native path: no problem object -- read the assembly cells the native assembler stashed
+            # (``None`` for the native 1D route, which falls back to flat-chain facets on points).
+            cells = getattr(domain, "_fem_native_assembly_cells", None)
+            ele_order = int(getattr(domain, "_fem_native_assembly_order", 1))
+        if multifield:
+            periodic = _build_periodic_reduction_multifield(
+                domain, periodic_ties, fem_obj.points, cells, ele_order, fem_obj.offsets
+            )
+        else:
+            periodic = _build_periodic_reduction(domain, periodic_ties, fem_obj.points, cells, ele_order, vec or 1)
+        # A transient block is reduced now (P^T M P, ...); the steady/nonlinear ops reduce lazily in FEM.solve.
+        if fem_obj.is_transient:
+            fem_obj._op = _reduce_transient_block_periodic(fem_obj._op, periodic)
+        fem_obj._periodic = periodic
         return fem_obj
 
     volume_terms: List[Any] = []
@@ -1658,7 +1704,8 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     # ---- native periodic transient (scalar single-field, linear, incl. runtime-parametric): assemble
     # the full native transient block, build the prolongation P from the native assembly mesh, then
     # reduce the block (P^T M P, P^T·operator_fn·P, ...). The reduced block carries P, so its trajectory
-    # prolongs back with u = P u_red. Vector / coupled / nonlinear periodic transient are rejected. ----
+    # prolongs back with u = P u_red. This is the optimized scalar single-field fast path; vector and
+    # coupled multi-field fall through to the general assembly + `_finalize` block-wise reduction. ----
     if (
         not is_vpinn
         and periodic_ties

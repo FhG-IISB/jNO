@@ -2003,3 +2003,71 @@ def prolong(P, reduced):
         return P @ reduced
     # (..., n_red) @ (n_red, n_full) -> (..., n_full)
     return reduced @ P.T
+
+
+# ---------------------------------------------------------------------------
+# Periodic reduction over a (possibly multifield) block.  A `periodic` dict is
+# either single-field (legacy `{"P", "kept_nodes", "vec"}`) or multifield
+# (`{"blocks": [{"P", "kept", "vec"}, ...], "off_full": [...], "off_red": [...]}`).
+# The Galerkin reduction of a blocked operator decomposes per field-pair,
+# `reduced[i,j] = P_i^T M[i,j] P_j`, so we NEVER materialise a block-diagonal P
+# (which would be O(F^2) dense and force one global vec/order); each field keeps
+# its own P_i / kept / vec and only one P_i is held at a time.
+# ---------------------------------------------------------------------------
+
+
+def _periodic_blocks(periodic):
+    """Normalise a periodic dict to ``(blocks, off_full, off_red)``; a legacy single-field
+    dict is wrapped as a single block (so the multifield path is the general case)."""
+    if "blocks" in periodic:
+        return periodic["blocks"], np.asarray(periodic["off_full"]), np.asarray(periodic["off_red"])
+    P = periodic["P"]
+    nf, nr = int(P.shape[0]), int(P.shape[1])
+    block = [{"P": P, "kept": periodic["kept_nodes"], "vec": periodic.get("vec", 1)}]
+    return block, np.array([0, nf]), np.array([0, nr])
+
+
+def reduce_matrix_periodic(periodic, mat):
+    """``P^T mat P`` for a single- or multi-field periodic reduction (block-wise, no dense P_mf)."""
+    blocks, off_f, off_r = _periodic_blocks(periodic)
+    if len(blocks) == 1:
+        return reduce_matrix(blocks[0]["P"], mat)  # fast path == legacy single-field
+    mat = jnp.asarray(mat.todense()) if hasattr(mat, "todense") else jnp.asarray(mat)
+    out = jnp.zeros((int(off_r[-1]), int(off_r[-1])), mat.dtype)
+    for i, bi in enumerate(blocks):
+        Pi = jnp.asarray(bi["P"], mat.dtype)
+        for j, bj in enumerate(blocks):
+            Pj = jnp.asarray(bj["P"], mat.dtype)
+            blk = mat[off_f[i] : off_f[i + 1], off_f[j] : off_f[j + 1]]
+            out = out.at[off_r[i] : off_r[i + 1], off_r[j] : off_r[j + 1]].set(Pi.T @ blk @ Pj)
+    return out
+
+
+def reduce_vector_periodic(periodic, vec):
+    """``P^T vec`` for a single- or multi-field periodic reduction (per-field block)."""
+    blocks, off_f, _ = _periodic_blocks(periodic)
+    if len(blocks) == 1:
+        return reduce_vector(blocks[0]["P"], vec)
+    vec = jnp.asarray(vec).reshape(-1)
+    return jnp.concatenate([jnp.asarray(b["P"], vec.dtype).T @ vec[off_f[i] : off_f[i + 1]] for i, b in enumerate(blocks)])
+
+
+def restrict_state_periodic(periodic, state):
+    """Restrict a full state to the reduced master DOFs (per-field block)."""
+    blocks, off_f, _ = _periodic_blocks(periodic)
+    if len(blocks) == 1:
+        return restrict_state(blocks[0]["P"], state, blocks[0]["kept"], blocks[0]["vec"])
+    state = jnp.asarray(state).reshape(-1)
+    return jnp.concatenate(
+        [restrict_state(b["P"], state[off_f[i] : off_f[i + 1]], b["kept"], b["vec"]) for i, b in enumerate(blocks)]
+    )
+
+
+def prolong_periodic(periodic, reduced):
+    """Prolong reduced DOFs to the full space (per-field block); supports a batched leading axis."""
+    blocks, _, off_r = _periodic_blocks(periodic)
+    if len(blocks) == 1:
+        return prolong(blocks[0]["P"], reduced)
+    reduced = jnp.asarray(reduced)
+    parts = [prolong(b["P"], reduced[..., off_r[i] : off_r[i + 1]]) for i, b in enumerate(blocks)]
+    return jnp.concatenate(parts, axis=-1)
