@@ -124,7 +124,7 @@ off = fem.offsets
 print(f"\nSmoke plume (Ra={Ra:.0e}, Pr={Pr}, Sc={Sc}): dofs={fem.dofs}, fields={len(off)}")
 
 # ── Time integration: backward Euler + Newton ─────────────────────────────────
-M, dt, nsteps, nframes = fem.M, 0.015, 40, 8
+M, dt, nsteps, nframes = fem.M, 0.003, 80, 16
 w = fem.state0
 frames, save_every = [np.asarray(w)], max(1, nsteps // nframes)
 for step in range(nsteps):
