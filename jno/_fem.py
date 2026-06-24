@@ -804,19 +804,31 @@ class FEM:
             # the densified (A, b). (The runtime-parametric case is a FemLinearSystem below.)
             A, b = self._op
             b = jnp.asarray(b).reshape(-1)
-            if solve_fn is None and self._periodic is None and hasattr(A, "todense"):
-                return _solve_linear_matrix_free(A, b)
-            A = jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)
-            _solve = solve_fn or (lambda A_, b_: jnp.linalg.solve(A_, b_))
             if self._periodic is not None:
                 # periodic tie: eliminate slave DOFs via the prolongation P, solve the reduced
                 # (P^T A P) u_red = P^T b, then prolong u = P u_red back to the full nodal layout.
-                # The *_periodic helpers reduce block-wise per field, so this serves coupled problems too.
+                # The reduction stays sparse (BCOO triplet-remap) -- it never materialises the dense
+                # full operator, so it is GPU-able at large N. The *_periodic helpers reduce block-wise
+                # per field, so this serves coupled problems too.
                 from .utils.solver.fem_utils import prolong_periodic, reduce_matrix_periodic, reduce_vector_periodic
 
-                u_red = _solve(reduce_matrix_periodic(self._periodic, A), reduce_vector_periodic(self._periodic, b))
+                A_red = reduce_matrix_periodic(self._periodic, A)
+                b_red = reduce_vector_periodic(self._periodic, b)
+                if solve_fn is not None:
+                    u_red = solve_fn(A_red, b_red)  # user solver receives the (BCOO) reduced operator
+                elif hasattr(A_red, "todense"):
+                    # sparse-direct on the reduced BCOO (robust on the indefinite/saddle reduced systems
+                    # a coupled periodic problem can produce; never densifies the full operator)
+                    from .utils.solver.linear import sparse_lu_solve
+
+                    u_red = sparse_lu_solve(A_red, b_red)
+                else:
+                    u_red = jnp.linalg.solve(jnp.asarray(A_red), b_red)  # dense reduced (1D / dense fallback)
                 return prolong_periodic(self._periodic, u_red)
-            return _solve(A, b)
+            if solve_fn is None and hasattr(A, "todense"):
+                return _solve_linear_matrix_free(A, b)
+            A = jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)
+            return (solve_fn or (lambda A_, b_: jnp.linalg.solve(A_, b_)))(A, b)
         if self._mode == "nonlinear" and self._periodic is not None:
             # Periodic nonlinear: solve Newton in the reduced space -- r_red(u_red) = P^T r(P u_red) = 0,
             # then prolong u = P u_red (the tie is then satisfied exactly). Wraps the user's solve_fn
@@ -1174,7 +1186,7 @@ def _build_periodic_reduction_multifield(
         red = _build_periodic_reduction(domain, uniq, pts_all[0], cells_all[0], int(orders[0]), int(vec))
         P, kept, v = red["P"], red["kept_nodes"], red["vec"]
         nrf = int(P.shape[1])
-        blocks = [{"P": P, "kept": kept, "vec": v} for _ in range(n_fields)]
+        blocks = [{"P": P, "kept": kept, "vec": v, "is_selection": red["is_selection"]} for _ in range(n_fields)]
         off_full = [i * sizes[0] for i in range(n_fields + 1)]
         off_red = [i * nrf for i in range(n_fields + 1)]
         return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
@@ -1187,15 +1199,15 @@ def _build_periodic_reduction_multifield(
         ties_i = [t for t in ties if _tie_field_index(t) in (i, None)]
         if ties_i:
             red_i = _build_periodic_reduction(domain, ties_i, pts_i, cells_all[i], int(orders[i]), int(vec_i))
-            P_i, kept_i, v_i = red_i["P"], red_i["kept_nodes"], red_i["vec"]
-        else:  # a field with no periodic tie -> sparse identity (no DOF eliminated)
+            P_i, kept_i, v_i, sel_i = red_i["P"], red_i["kept_nodes"], red_i["vec"], red_i["is_selection"]
+        else:  # a field with no periodic tie -> sparse identity (a selection: one master per row)
             import jax.experimental.sparse as jsparse
 
             ni = int(sizes[i])
             di = jnp.arange(ni)
             P_i = jsparse.BCOO((jnp.ones(ni), jnp.stack([di, di], axis=1)), shape=(ni, ni))
-            kept_i, v_i = np.arange(int(pts_i.shape[0])), vec_i
-        blocks.append({"P": P_i, "kept": kept_i, "vec": v_i})
+            kept_i, v_i, sel_i = np.arange(int(pts_i.shape[0])), vec_i, True
+        blocks.append({"P": P_i, "kept": kept_i, "vec": v_i, "is_selection": sel_i})
         off_full.append(off_full[-1] + int(P_i.shape[0]))
         off_red.append(off_red[-1] + int(P_i.shape[1]))
     return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}

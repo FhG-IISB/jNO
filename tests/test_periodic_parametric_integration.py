@@ -165,7 +165,7 @@ class TestPeriodicReductionStructure:
         assert block.metadata["full_state_size"] == n_full
         assert block.metadata["reduced_state_size"] < n_full
 
-        M = jnp.asarray(block.M)
+        M = block.M  # reduced operator is BCOO (sparse periodic reduction) -- .shape works on both
         assert M.shape[0] == M.shape[1]
         assert M.shape[0] == block.metadata["reduced_state_size"]
         assert getattr(block, "prolongation", None) is not None
@@ -212,10 +212,11 @@ class TestPeriodicNonAffineParameter:
         dom = make_periodic_domain()
         block, args = build_periodic_heat_block(dom, "nonaffine")
 
-        A = jnp.asarray(block.operator_fn(0.0, {k: jnp.asarray(v) for k, v in args.items()}))
+        A = block.operator_fn(0.0, {k: jnp.asarray(v) for k, v in args.items()})
         n_red = block.metadata["reduced_state_size"]
-        assert A.shape == (n_red, n_red)  # operator is reduced
-        assert float(jnp.linalg.norm(A)) > 0.0
+        assert A.shape == (n_red, n_red)  # operator is reduced (BCOO)
+        A_dense = A.todense() if hasattr(A, "todense") else jnp.asarray(A)
+        assert float(jnp.linalg.norm(A_dense)) > 0.0
 
     def test_nonaffine_periodic_matches_analytical(self):
         dom = make_periodic_domain()
@@ -234,7 +235,8 @@ class TestPeriodicNonAffineParameter:
 
         def scalar(logk_val):
             A = block.operator_fn(0.0, {"logk": jnp.asarray(logk_val).reshape(())})
-            return jnp.sum(jnp.asarray(A) ** 2)
+            A = A.todense() if hasattr(A, "todense") else jnp.asarray(A)  # reduced op is BCOO; densify keeps the AD trace
+            return jnp.sum(A**2)
 
         x0 = float(np.log(NU))
         g = float(jax.grad(scalar)(x0))

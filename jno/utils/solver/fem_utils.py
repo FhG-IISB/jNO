@@ -1972,6 +1972,9 @@ def build_periodic_prolongation(
         "n_full": n_full,
         "n_red": n_red_full,
         "vec": int(vec),
+        # whether P is a one-master-per-slave selection (conforming) -> the sparse remap reduction is
+        # exact; computed once here (eager, concrete P) so the reduce path never inspects P under trace.
+        "is_selection": _is_selection(P),
     }
 
 
@@ -2022,9 +2025,57 @@ def bcoo_set_dirichlet_rows(A, dofs):
 # ---------------------------------------------------------------------------
 
 
-def reduce_matrix(P, mat):
-    """Galerkin reduction ``P^T mat P``. ``P`` may be a dense array or a BCOO selection matrix
-    (kept sparse — ``BCOO.T @ dense @ BCOO`` is exact and avoids materialising a dense ``P``)."""
+def _is_selection(P):
+    """True iff BCOO ``P`` has exactly one nonzero per full row — a periodic *selection* (each slave
+    DOF equals a single master), for which the remap-sum reduction is exact. A **nonconforming** tie
+    builds an *interpolation* ``P`` (several weighted masters per slave row), which needs a genuine
+    ``P^T M P`` (the dense fallback). ``P.indices`` is static (built from connectivity), so this is a
+    trace-time constant even when ``reduce_matrix`` runs inside a jitted ``operator_fn``."""
+    if not hasattr(P, "indices"):
+        return False
+    rows = np.asarray(P.indices[:, 0])
+    n = int(P.shape[0])
+    return rows.shape[0] == n and int(np.bincount(rows, minlength=n).max()) == 1
+
+
+def _selection_maps(P, dtype):
+    """For a periodic selection ``P`` (BCOO, one nonzero per full row), return ``(master, pval)``:
+    ``master[i]`` = the reduced DOF that full DOF ``i`` maps to; ``pval[i]`` = the tie coefficient
+    (``1``, or ``-1`` for an antiperiodic tie)."""
+    master = jnp.zeros(P.shape[0], P.indices.dtype).at[P.indices[:, 0]].set(P.indices[:, 1])
+    pval = jnp.zeros(P.shape[0], dtype).at[P.indices[:, 0]].set(jnp.asarray(P.data, dtype))
+    return master, pval
+
+
+def _remap_bcoo(mat, m_row, p_row, m_col, p_col, shape):
+    """Sparse Galerkin remap: send each BCOO triplet ``(r, c, v)`` of ``mat`` to
+    ``(m_row[r], m_col[c], v·p_row[r]·p_col[c])`` and let BCOO sum duplicates. This is exactly
+    ``P_row^T mat P_col`` for selection matrices, in ``O(nnz(mat))`` and **without** ever forming a
+    dense ``n_full × n_full`` intermediate (``nnz`` is static = ``nnz(mat)`` → ``jit``-safe)."""
+    r, c = mat.indices[:, 0], mat.indices[:, 1]
+    ridx = jnp.stack([m_row[r], m_col[c]], axis=1)
+    rdata = mat.data * p_row[r] * p_col[c]
+    return jsparse.BCOO((rdata, ridx), shape=shape)
+
+
+def reduce_matrix(P, mat, is_selection=None):
+    """Galerkin reduction ``P^T mat P``.
+
+    When ``mat`` is BCOO and ``P`` is a BCOO *selection* (conforming/structured tie, one master per
+    slave — e.g. the doubly-periodic PEB) the reduction remaps ``mat``'s triplets to their master
+    indices: it stays sparse and never materialises the dense ``n_full × n_full`` matrix (``O(nnz)``;
+    the reduction is otherwise the dominant memory peak of a periodic solve). An *interpolation* ``P``
+    (nonconforming tie) or a dense ``P``/``mat`` (1D path) falls back to the exact dense ``P^T mat P``.
+
+    ``is_selection`` (whether ``P`` is a one-master-per-slave selection) is passed precomputed by the
+    periodic builders so the reduction never inspects ``P.indices`` at run time — that matters because
+    a parametric ``operator_fn`` reduces inside a jitted ``scan`` where ``P.indices`` is a tracer. When
+    ``None`` (a direct/eager call) it is computed once here."""
+    if is_selection is None:
+        is_selection = _is_selection(P)
+    if hasattr(mat, "indices") and is_selection:
+        master, pval = _selection_maps(P, mat.data.dtype)
+        return _remap_bcoo(mat, master, pval, master, pval, (int(P.shape[1]), int(P.shape[1])))
     mat = mat.todense() if hasattr(mat, "todense") else mat
     P = P if hasattr(P, "todense") else jnp.asarray(P)  # keep a BCOO P sparse
     return P.T @ jnp.asarray(mat, P.dtype) @ P
@@ -2083,15 +2134,44 @@ def _periodic_blocks(periodic):
         return periodic["blocks"], np.asarray(periodic["off_full"]), np.asarray(periodic["off_red"])
     P = periodic["P"]
     nf, nr = int(P.shape[0]), int(P.shape[1])
-    block = [{"P": P, "kept": periodic["kept_nodes"], "vec": periodic.get("vec", 1)}]
+    block = [
+        {
+            "P": P,
+            "kept": periodic["kept_nodes"],
+            "vec": periodic.get("vec", 1),
+            "is_selection": periodic.get("is_selection"),
+        }
+    ]
     return block, np.array([0, nf]), np.array([0, nr])
 
 
 def reduce_matrix_periodic(periodic, mat):
-    """``P^T mat P`` for a single- or multi-field periodic reduction (block-wise, no dense P_mf)."""
+    """``P^T mat P`` for a single- or multi-field periodic reduction.
+
+    When ``mat`` and every field's ``P_i`` are BCOO, the whole blocked reduction
+    ``reduced[i,j] = P_i^T mat[i,j] P_j`` is one global triplet-remap (the per-field offsets are
+    folded into a single full→reduced master map), so it stays sparse and never densifies — the fix
+    for the ``O(n^2)`` reduction peak at large ``N``. A dense ``mat`` falls back to the per-block
+    dense reduction (no block-diagonal ``P`` is ever materialised)."""
     blocks, off_f, off_r = _periodic_blocks(periodic)
+
+    def _sel(b):  # prefer the precomputed flag (built eagerly); compute only when called eagerly
+        return b["is_selection"] if b.get("is_selection") is not None else _is_selection(b["P"])
+
     if len(blocks) == 1:
-        return reduce_matrix(blocks[0]["P"], mat)  # fast path == legacy single-field
+        return reduce_matrix(blocks[0]["P"], mat, is_selection=_sel(blocks[0]))  # fast path == single-field
+    if hasattr(mat, "indices") and all(_sel(b) for b in blocks):
+        n_full, n_red = int(off_f[-1]), int(off_r[-1])
+        gmaster = jnp.zeros(n_full, mat.indices.dtype)
+        gpval = jnp.zeros(n_full, mat.data.dtype)
+        for i, b in enumerate(blocks):
+            Pi = b["P"]
+            full_local = Pi.indices[:, 0]  # field-i local full DOF
+            gmaster = gmaster.at[int(off_f[i]) + full_local].set(
+                (int(off_r[i]) + Pi.indices[:, 1]).astype(mat.indices.dtype)
+            )
+            gpval = gpval.at[int(off_f[i]) + full_local].set(jnp.asarray(Pi.data, mat.data.dtype))
+        return _remap_bcoo(mat, gmaster, gpval, gmaster, gpval, (n_red, n_red))
     mat = jnp.asarray(mat.todense()) if hasattr(mat, "todense") else jnp.asarray(mat)
     out = jnp.zeros((int(off_r[-1]), int(off_r[-1])), mat.dtype)
     _sp = lambda P: P if hasattr(P, "todense") else jnp.asarray(P, mat.dtype)  # keep BCOO sparse  # noqa: E731

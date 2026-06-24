@@ -46,6 +46,43 @@ def test_block_reduction_matches_dense_blockdiag_P(_x64):
     assert np.allclose(red, ref, atol=1e-10)
 
 
+def test_block_reduction_sparse_bcoo_matches_dense(_x64):
+    """The BCOO path of reduce_matrix_periodic (selection P_i + sparse M) equals P_mf^T M P_mf AND
+    stays sparse -- the never-densify reduction (no dense O(n_full^2) intermediate, incl. off-diagonal
+    coupling blocks)."""
+    import jax.experimental.sparse as jsparse
+    import jax.numpy as jnp
+
+    from jno.utils.solver.fem_utils import reduce_matrix_periodic
+
+    rng = np.random.default_rng(2)
+
+    def sel(nf, nr):  # periodic selection: each full row -> one reduced col, value 1
+        m = rng.integers(0, nr, size=nf)
+        m[:nr] = np.arange(nr)
+        P = np.zeros((nf, nr))
+        P[np.arange(nf), m] = 1.0
+        return P
+
+    P0, P1 = sel(6, 4), sel(5, 3)
+    periodic = {
+        "blocks": [
+            {"P": jsparse.BCOO.fromdense(jnp.asarray(P0)), "kept": np.arange(4), "vec": 1},
+            {"P": jsparse.BCOO.fromdense(jnp.asarray(P1)), "kept": np.arange(3), "vec": 1},
+        ],
+        "off_full": [0, 6, 11],
+        "off_red": [0, 4, 7],
+    }
+    Md = rng.standard_normal((11, 11))
+    Md = Md + Md.T
+    Md[np.abs(Md) < 0.6] = 0.0  # sparse, with off-diagonal field coupling
+    red = reduce_matrix_periodic(periodic, jsparse.BCOO.fromdense(jnp.asarray(Md)))
+    assert hasattr(red, "indices")  # stays BCOO -- never densified the full operator
+    z = np.zeros((6, 3))
+    Pmf = np.block([[P0, z], [np.zeros((5, 4)), P1]])
+    assert np.allclose(np.asarray(red.todense()), Pmf.T @ Md @ Pmf, atol=1e-10)
+
+
 def _periodic_domain(n):
     dom = jno.domain(
         constructor=jno.domain.equi_distant_rect(x_range=(0.0, 1.0), y_range=(0.0, 1.0), nx=n, ny=n),
@@ -242,6 +279,18 @@ def test_periodic_prolongation_is_sparse(_x64):
     n_full, n_red = int(P.shape[0]), int(P.shape[1])
     assert n_red < n_full
     assert int(P.nse) <= n_full + 8  # ~one nonzero per full node, NOT the dense n_full*n_red
+
+
+def test_periodic_reduced_operator_is_sparse(_x64):
+    """The reduced transient operator stays BCOO — the periodic reduction P^T M P no longer densifies
+    the O(n_full^2) full operator (the large-N reduction-peak fix; this is what unblocks the periodic
+    PEB at N>=256, where the dense reduction would be tens of GB)."""
+    block = _nl_periodic(_periodic_domain(12), with_reaction=False).operator  # single-field linear periodic
+    assert hasattr(block.M, "indices")  # reduced mass is BCOO, not a dense n_red x n_red array
+    assert hasattr(block.A, "indices")
+    n_red = block.metadata["reduced_state_size"]
+    assert block.M.shape == (n_red, n_red)
+    assert int(block.M.nse) < n_red * n_red  # O(n_red) stencil entries, far below the dense n_red^2
 
 
 def test_heterogeneous_order_coupled_periodic_matches_analytic(_x64):
