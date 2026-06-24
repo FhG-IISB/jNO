@@ -1144,34 +1144,55 @@ def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, cells: 
 def _build_periodic_reduction_multifield(
     domain: Any, ties: List[Any], points: Any, cells: Any, ele_order: int, offsets: Any
 ) -> dict:
-    """Periodic reduction for a coupled (multi-field) problem: one block per field, sharing a single
-    node-level ``P`` when all fields use the same mesh + element order (the supported case). The
-    Galerkin reduction stays block-wise (``P_i^T M[i,j] P_j``) — see the block-aware helpers in
-    ``fem_utils`` — so no block-diagonal ``P`` is ever materialised.
-
-    Heterogeneous-order coupled periodic (e.g. Taylor-Hood, different per-field DOF counts) is
-    rejected loudly: the reduction *machinery* handles per-field ``P_i``, but building distinct
-    per-field ``P_i`` is not wired yet."""
+    """Periodic reduction for a coupled (multi-field) problem: one block per field. Each field's
+    ``P_i`` is built from its own DOF nodes / element order / vec and its own ties (matched by
+    ``field_key``), so heterogeneous-order couplings (e.g. Taylor-Hood: P2 velocity + P1 pressure)
+    are supported. The Galerkin reduction stays block-wise (``P_i^T M[i,j] P_j``) via the
+    ``fem_utils`` helpers — no block-diagonal ``P`` is materialised — and when all fields share a
+    mesh + order a single node-``P`` is built once and shared (the common case)."""
     offs = [int(o) for o in offsets]
     n_fields = len(offs) - 1
     sizes = [offs[i + 1] - offs[i] for i in range(n_fields)]
-    if len(set(sizes)) != 1:
-        raise NotImplementedError(
-            "jno.fem: periodic ties on a coupled problem are supported for fields that share the same "
-            f"mesh and element order (equal DOF blocks); got block sizes {sizes}. Heterogeneous-order "
-            "coupled periodic (e.g. Taylor-Hood) is not wired yet."
-        )
-    n_nodes = int(np.asarray(points).shape[0])
-    vec = max(1, sizes[0] // n_nodes)  # per-field vec (uniform across fields); scalar fields -> 1
-    # The same (master, slave) geometry repeats once per field -> de-dup to the unique direction pairs.
-    seen: set = set()
-    uniq = [t for t in ties if (t[0], t[1]) not in seen and not seen.add((t[0], t[1]))]
-    red = _build_periodic_reduction(domain, uniq, points, cells, ele_order, int(vec))
-    P, kept, v = red["P"], red["kept_nodes"], red["vec"]
-    n_red_field = int(np.asarray(P).shape[1])
-    blocks = [{"P": P, "kept": kept, "vec": v} for _ in range(n_fields)]
-    off_full = [i * sizes[0] for i in range(n_fields + 1)]
-    off_red = [i * n_red_field for i in range(n_fields + 1)]
+
+    pts_all = getattr(domain, "_fem_native_dof_points_all", None) or [points] * n_fields
+    cells_all = getattr(domain, "_fem_native_assembly_cells_all", None) or [cells] * n_fields
+    orders = getattr(domain, "_fem_native_field_orders", None) or [ele_order] * n_fields
+    field_keys = getattr(domain, "_fem_native_field_keys", None)
+
+    def _tie_field_index(t):
+        """The offset-order field index a tie belongs to (its trial ``field_key``); ``None`` if the
+        key is unknown (then the tie is applied to every field — single-field-direction fallback)."""
+        fk = t[3]
+        return field_keys.index(fk) if (field_keys is not None and fk in field_keys) else None
+
+    # Fast path: all fields share the same DOF-block size + element order -> one node-P, shared.
+    if len(set(sizes)) == 1 and len(set(orders)) == 1:
+        n_nodes = int(np.asarray(pts_all[0]).shape[0])
+        vec = max(1, sizes[0] // n_nodes)
+        seen: set = set()
+        uniq = [t for t in ties if (t[0], t[1]) not in seen and not seen.add((t[0], t[1]))]
+        red = _build_periodic_reduction(domain, uniq, pts_all[0], cells_all[0], int(orders[0]), int(vec))
+        P, kept, v = red["P"], red["kept_nodes"], red["vec"]
+        nrf = int(np.asarray(P).shape[1])
+        blocks = [{"P": P, "kept": kept, "vec": v} for _ in range(n_fields)]
+        off_full = [i * sizes[0] for i in range(n_fields + 1)]
+        off_red = [i * nrf for i in range(n_fields + 1)]
+        return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+
+    # Heterogeneous: a distinct P_i per field, from its own nodes/order/vec and its own ties.
+    blocks, off_full, off_red = [], [0], [0]
+    for i in range(n_fields):
+        pts_i = np.asarray(pts_all[i])
+        vec_i = max(1, sizes[i] // int(pts_i.shape[0]))
+        ties_i = [t for t in ties if _tie_field_index(t) in (i, None)]
+        if ties_i:
+            red_i = _build_periodic_reduction(domain, ties_i, pts_i, cells_all[i], int(orders[i]), int(vec_i))
+            P_i, kept_i, v_i = red_i["P"], red_i["kept_nodes"], red_i["vec"]
+        else:  # a field with no periodic tie -> identity (no DOF eliminated)
+            P_i, kept_i, v_i = jnp.eye(sizes[i]), np.arange(int(pts_i.shape[0])), vec_i
+        blocks.append({"P": P_i, "kept": kept_i, "vec": v_i})
+        off_full.append(off_full[-1] + int(np.asarray(P_i).shape[0]))
+        off_red.append(off_red[-1] + int(np.asarray(P_i).shape[1]))
     return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
 
 

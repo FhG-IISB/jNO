@@ -230,3 +230,46 @@ def test_nonlinear_multifield_periodic_assembles_and_steps(_x64):
     U = jnp.asarray(block.state0)
     U = block.step(U, float(block.t0), float(block.dt))  # one reduced-space Newton step
     assert np.all(np.isfinite(np.asarray(block.prolong(U))))
+
+
+def test_heterogeneous_order_coupled_periodic_matches_analytic(_x64):
+    """Taylor-Hood-style: a P2 field and a P1 field, both periodic, with DIFFERENT DOF counts. Each
+    gets its own P_i (built from its own nodes/order) and matches its analytic heat decay."""
+    n = 12
+    dom = _periodic_domain(n)
+    u, pu = dom.fem_symbols(names=("u", "pu"), order=2)  # P2
+    w, pw = dom.fem_symbols(names=("w", "pw"), order=1)  # P1
+    xi, yi, ti = dom.variable("interior", split=True)
+    ci = dom.variable("initial", split=True)
+    xl, yl, _ = dom.variable("left", split=True)
+    xr, yr, _ = dom.variable("right", split=True)
+    xb, yb, _ = dom.variable("bottom", split=True)
+    xt, yt, _ = dom.variable("top", split=True)
+    ui, pui = u.bind(x=xi, y=yi, t=ti), pu.bind(x=xi, y=yi, t=ti)
+    wi, pwi = w.bind(x=xi, y=yi, t=ti), pw.bind(x=xi, y=yi, t=ti)
+    ic = jnn.sin(2 * np.pi * ci[0]) * jnn.sin(2 * np.pi * ci[1])
+    fem = jno.fem(
+        [
+            ui.t * pui + 0.1 * (ui.x * pui.x + ui.y * pui.y),
+            wi.t * pwi + 0.2 * (wi.x * pwi.x + wi.y * pwi.y),
+            u(xl, yl) - u(xr, yr),
+            u(xb, yb) - u(xt, yt),
+            w(xl, yl) - w(xr, yr),
+            w(xb, yb) - w(xt, yt),
+            u(ci[0], ci[1]) - ic,
+            w(ci[0], ci[1]) - ic,
+        ]
+    )
+    block = fem.operator
+    assert block.metadata.get("periodic") is True
+    pts_u = np.asarray(fem.field_points[0])
+    pts_w = np.asarray(fem.field_points[1])
+    assert pts_u.shape[0] != pts_w.shape[0]  # P2 has more nodes than P1 -> heterogeneous path
+
+    U_full = _march(block)
+    off = fem.offsets
+    rel = lambda a, b: float(np.linalg.norm(a - b) / np.linalg.norm(b))  # noqa: E731
+    u_an = np.exp(-8.0 * np.pi**2 * 0.1 * block.t1) * np.sin(2 * np.pi * pts_u[:, 0]) * np.sin(2 * np.pi * pts_u[:, 1])
+    w_an = np.exp(-8.0 * np.pi**2 * 0.2 * block.t1) * np.sin(2 * np.pi * pts_w[:, 0]) * np.sin(2 * np.pi * pts_w[:, 1])
+    assert rel(U_full[off[0] : off[1]], u_an) < 5e-2
+    assert rel(U_full[off[1] : off[2]], w_an) < 5e-2

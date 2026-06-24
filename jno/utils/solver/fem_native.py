@@ -422,9 +422,13 @@ def assemble_fem_native(
 
     # Field-0 assembly cells + element order, for the periodic-tie reduction (``_build_periodic_
     # reduction`` reads the assembly mesh's cells to extract boundary facets); ``_finalize`` reads
-    # these.
+    # these. The full per-field lists back the heterogeneous-order coupled periodic reduction
+    # (Taylor-Hood: per-field P_i from each field's own cells/order, matched to its ties by field_key).
     domain._fem_native_assembly_cells = np.asarray(cells_f_all[0])
     domain._fem_native_assembly_order = int(fields[0]["order"])
+    domain._fem_native_assembly_cells_all = [np.asarray(cf) for cf in cells_f_all]
+    domain._fem_native_field_orders = [int(f["order"]) for f in fields]
+    domain._fem_native_field_keys = [f["field_key"] for f in fields]
 
     # -------------------------------------------------------------------------
     # Element specs and JAX constants
