@@ -2382,11 +2382,11 @@ class ModelCall(Placeholder):
     def scale(self, scale: float) -> "ModelCall":
         """Declare the characteristic magnitude of this model output.
 
-        Equivalent to :meth:`Placeholder.scale` -- sets the dimensional scale used
+        Equivalent to :meth:`Placeholder.scale` — sets the dimensional scale used
         by :func:`jno.units.rescale` to map the network output back to physical
         units::
 
-            u = net(x).unit("K").scale(50.0)   # output in O(1); physical = 50 K
+            u = net(x).unit("K").scale(50.0)   # output ∈ O(1); physical = 50 K
 
         To set the model learning-rate scale, call :meth:`Model.scale` on the model
         object directly (e.g. ``net.optimizer(optax.adam).scale(lrs(1e-3))``)."""
