@@ -4,9 +4,16 @@ import os
 
 import jax
 import pytest
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+
+# Signed save/load is an optional feature: jno.load_save imports pylotte lazily and
+# pylotte pulls cryptography. Both are optional deps (not in the core runtime), so
+# skip this suite cleanly when they are absent rather than erroring at collection.
+pytest.importorskip("cryptography", reason="cryptography required for RSA-signed save/load")
+pytest.importorskip("pylotte", reason="pylotte required for signed save/load")
+
+from cryptography.hazmat.backends import default_backend  # noqa: E402
+from cryptography.hazmat.primitives import serialization  # noqa: E402
+from cryptography.hazmat.primitives.asymmetric import rsa  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Helpers

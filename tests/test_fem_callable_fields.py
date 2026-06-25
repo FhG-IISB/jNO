@@ -13,7 +13,6 @@ import pytest
 
 import jno
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
 import jax  # noqa: E402
 from shapely.geometry import box  # noqa: E402
@@ -21,8 +20,8 @@ from shapely.geometry import box  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """feax assembly is float64; opt into x64 per-test (the session default may be x64-off when
-    co-run with test_periodic). Save/restore keeps the flag from leaking to other modules."""
+    """The native assembly is compared entry-for-entry, so opt into x64 per-test (the session
+    default may be x64-off when co-run with test_periodic). Save/restore keeps the flag local."""
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
     try:
@@ -31,48 +30,41 @@ def _x64():
         jax.config.update("jax_enable_x64", prev)
 
 
-def _dense(J):
-    return np.asarray(J.todense() if hasattr(J, "todense") else J)
+def _dense(A):
+    return np.asarray(A.todense() if hasattr(A, "todense") else A)
 
 
-def _poisson_operators():
+def _poisson_systems():
+    """The same Poisson assembled through three authoring idioms, each via ``jno.fem`` (the sole
+    entry): the classic ``u.d(xg)``, the bound ``u.bind(x=xg).x`` and the positional-call
+    ``u(xg, yg).x``. They must lower to the same ``Jacobian`` node and so assemble the same (A, b)."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25)
-    d.init_fem(
-        element_type="TRI3",
-        quad_degree=3,
-        bcs=[d.dirichlet("boundary", 0.0)],
-        fem_solver=True,
-    )
     u, phi = d.fem_symbols()
-    xg, yg, _ = d.variable("fem_gauss", split=True)
+    xg, yg, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
     f = 2.0 * (xg * (1.0 - xg) + yg * (1.0 - yg))
 
-    op_d = (u.d(xg) * phi.d(xg) + u.d(yg) * phi.d(yg) - f * phi).assemble(d, target="fem_residual")
+    fem_d = jno.fem([u.d(xg) * phi.d(xg) + u.d(yg) * phi.d(yg) - f * phi, u(xb, yb) - 0.0], quad_degree=3)
 
     ub, vb = u.bind(x=xg, y=yg), phi.bind(x=xg, y=yg)
-    op_bind = (ub.x * vb.x + ub.y * vb.y - f * vb).assemble(d, target="fem_residual")
+    fem_bind = jno.fem([ub.x * vb.x + ub.y * vb.y - f * vb, u(xb, yb) - 0.0], quad_degree=3)
 
     uc, vc = u(xg, yg), phi(xg, yg)
-    op_call = (uc.x * vc.x + uc.y * vc.y - f * vc).assemble(d, target="fem_residual")
+    fem_call = jno.fem([uc.x * vc.x + uc.y * vc.y - f * vc, u(xb, yb) - 0.0], quad_degree=3)
 
-    return op_d, op_bind, op_call
+    return fem_d, fem_bind, fem_call
 
 
 def test_bind_authoring_matches_d_form():
-    op_d, op_bind, _ = _poisson_operators()
-    assert op_bind.size == op_d.size
-    rng = np.random.default_rng(0)
-    u0 = rng.standard_normal(op_d.size)
-    assert np.allclose(np.asarray(op_d.residual(u0)), np.asarray(op_bind.residual(u0)))
-    assert np.allclose(_dense(op_d.jacobian(u0)), _dense(op_bind.jacobian(u0)))
+    fem_d, fem_bind, _ = _poisson_systems()
+    assert np.allclose(_dense(fem_d.A), _dense(fem_bind.A))
+    assert np.allclose(np.asarray(fem_d.b).reshape(-1), np.asarray(fem_bind.b).reshape(-1))
 
 
 def test_positional_call_authoring_matches_d_form():
-    op_d, _, op_call = _poisson_operators()
-    rng = np.random.default_rng(1)
-    u0 = rng.standard_normal(op_d.size)
-    assert np.allclose(np.asarray(op_d.residual(u0)), np.asarray(op_call.residual(u0)))
-    assert np.allclose(_dense(op_d.jacobian(u0)), _dense(op_call.jacobian(u0)))
+    fem_d, _, fem_call = _poisson_systems()
+    assert np.allclose(_dense(fem_d.A), _dense(fem_call.A))
+    assert np.allclose(np.asarray(fem_d.b).reshape(-1), np.asarray(fem_call.b).reshape(-1))
 
 
 def test_call_without_coords_raises():

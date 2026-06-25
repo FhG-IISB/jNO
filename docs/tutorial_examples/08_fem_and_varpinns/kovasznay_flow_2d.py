@@ -24,7 +24,7 @@ os.environ["MPLBACKEND"] = "Agg"
 
 import jax
 
-jax.config.update("jax_enable_x64", True)  # feax assembly is float64
+jax.config.update("jax_enable_x64", True)  # the assembler builds in float64
 
 from pathlib import Path  # noqa: E402
 
@@ -78,8 +78,8 @@ for _ in range(15):
     if float(np.linalg.norm(dw)) < 1e-10:
         break
 resid = float(np.linalg.norm(np.asarray(fem.residual(w))))
-off = fem.problem.offset
-pts_v = np.asarray(fem.problem.mesh[0].points)
+off = fem.offsets
+pts_v = np.asarray(fem.field_points[0])
 uu = w[off[0] : off[1]].reshape(-1, 2)
 u_ex = np.stack([ue(pts_v[:, 0], pts_v[:, 1]), ve(pts_v[:, 0], pts_v[:, 1])], axis=-1)
 rel = float(np.linalg.norm(uu - u_ex) / np.linalg.norm(u_ex))

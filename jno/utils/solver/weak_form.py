@@ -7,24 +7,20 @@ This module is the central routing layer behind:
 
     expr.assemble(target=...)
 
-It converts symbolic jNO weak forms into backend-neutral IR and dispatches that
-IR to VPINN, steady FEM, transient FEAX-time, or strong-form Diffrax routes.
+It converts symbolic jNO weak forms into backend-neutral IR and dispatches
+them to the VPINN assembly route.
 
 Main responsibilities:
 - represent lowered weak-form terms through LoweredChannelTerm / LoweredWeakForm,
 - infer the solver target when target=None,
 - lower weak expressions into VPINN or FEM-compatible IR,
-- assemble VPINN GroupedAssembly objects for training,
-- dispatch linear/nonlinear steady FEM assembly,
-- dispatch transient weak-form FEAX-time assembly,
-- dispatch strong-form time-dependent expressions to Diffrax.
+- assemble VPINN GroupedAssembly objects for training.
 
 Supported assemble targets:
-    "vpinn"        -> GroupedAssembly
-    "fem_system"   -> (A, b)
-    "fem_residual" -> FemResidualOperator
-    "fem_time"    -> FemTimeBlock
-    "diffrax"      -> DiffraxBlock
+    "vpinn" -> GroupedAssembly
+
+FEM systems (steady, transient, nonlinear) are assembled through ``jno.fem``,
+not via an assemble target.
 """
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple, cast
@@ -49,14 +45,14 @@ from .solver_helper import (
 from .solver_helper import (
     contains_node_type as _contains_node_type,
 )
-from .solver_helper import (
+
+# Re-exported for the FEM route modules (_fem, fem_native, fem_nonnodal, fem_1d),
+# which import it from here; not used within this module, hence the noqa.
+from .solver_helper import (  # noqa: F401
     contains_temporal_derivative as _contains_temporal_derivative,
 )
 from .solver_helper import (
     sum_terms as _sum_terms,
-)
-from .weak_form_helpers import (
-    bind_statefield_for_fem as _bind_statefield_for_fem,
 )
 from .weak_form_helpers import (
     bind_statefield_for_vpinn as _bind_statefield_for_vpinn,
@@ -69,9 +65,6 @@ from .weak_form_helpers import (
 )
 from .weak_form_helpers import (
     ensure_statefield_wrapped as _ensure_statefield_wrapped,
-)
-from .weak_form_helpers import (
-    find_first_statefield as _find_first_statefield,
 )
 from .weak_form_helpers import (
     function_name as _function_name,
@@ -135,7 +128,7 @@ class LoweredChannelTerm:
             `"boundary_test_value"`:
                 boundary term multiplying the test function value.
 
-        For FEM/FEAX lowering:
+        For FEM lowering:
             `"raw"`:
                 original weak-form term kept in raw symbolic form.
     coeff:
@@ -166,7 +159,7 @@ class LoweredWeakForm:
     `LoweredWeakForm` stores a list of `LoweredChannelTerm` objects and exposes
     convenience properties for the different backend routes.
 
-    FEM/FEAX routes use:
+    FEM routes use:
         volume_expr:
             Sum of raw volume weak-form expressions.
         boundary_exprs:
@@ -231,7 +224,7 @@ class LoweredWeakForm:
     @property
     def volume_expr(self):
         """
-        Raw summed volume expression used by FEM/FEAX assembly routes.
+        Raw summed volume expression used by FEM assembly routes.
         """
         exprs = [t.coeff for t in self.terms if t.support == "volume" and t.channel == "raw"]
         return _sum_terms(self.domain, exprs)
@@ -480,7 +473,7 @@ def _extract_test_channel(domain, expr) -> Tuple[str, Placeholder, Dict[str, Any
                 )
 
             # elasticity-like inner(sigma, symgrad(phi), n_contract=2)
-            # canonical FEAX grad channel uses sigma itself
+            # canonical grad channel uses sigma itself
             if _is_symgrad_test(a0):
                 return (
                     "test_grad",
@@ -500,9 +493,7 @@ def _extract_test_channel(domain, expr) -> Tuple[str, Placeholder, Dict[str, Any
                     },
                 )
 
-    raise ValueError(
-        f"Could not extract a canonical FEAX-style test channel from weak-form term. Unsupported term structure: {expr}"
-    )
+    raise ValueError(f"Could not extract a canonical test channel from weak-form term. Unsupported term structure: {expr}")
 
 
 # --------------------------------
@@ -679,45 +670,12 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
     return False
 
 
-def _infer_solver_target(domain, expr):
-    """
-    Infer the default assembly target for a symbolic expression.
-
-    Rules:
-    - strong time-dependent expressions without weak symbols -> `"diffrax"`
-    - weak time-dependent expressions -> `"fem_time"`
-    - steady weak forms that are linear in the unknown -> `"fem_system"`
-    - steady weak forms that are nonlinear in the unknown -> `"fem_residual"`
-
-    The inference is only used when `target=None`.
-    """
-    if _contains_temporal_derivative(expr):
-        if (
-            _contains_node_type(expr, TestFunction)
-            or _contains_node_type(expr, TrialFunction)
-            or _contains_node_type(expr, StateField)
-        ):
-            if getattr(domain, "_fem_context", None) is not None:
-                return "fem_time"
-            raise ValueError(
-                "A time-dependent weak form was detected, but domain.init_fem(...) "
-                "has not been called. For transient weak forms, initialize FEM first "
-                "and use target='fem_time' (or let auto-inference choose it)."
-            )
-
-        return "diffrax"
-
-    if _is_obviously_nonlinear_in_unknown(domain, expr):
-        return "fem_residual"
-    return "fem_system"
-
-
 # -----------------------------------------------------------------------------
 # Lower once, dispatch many
 # -----------------------------------------------------------------------------
-def lower_weak_form(domain, expr, trial_value=None, for_target="vpinn"):
+def lower_weak_form(domain, expr, trial_value=None):
     """
-    Lower a symbolic weak-form expression into backend-neutral weak-form IR.
+    Lower a symbolic weak-form expression into backend-neutral VPINN IR.
 
     Parameters
     ----------
@@ -728,224 +686,81 @@ def lower_weak_form(domain, expr, trial_value=None, for_target="vpinn"):
     trial_value:
         Optional neural trial expression used when substituting TrialFunction
         symbols for VPINN training.
-    for_target:
-        Lowering mode.
-
-        `"vpinn"`:
-            Converts each term into canonical VPINN channels:
-            test-value, test-gradient, and boundary-test-value.
-
-        `"fem"`:
-            Keeps each weak-form term in raw symbolic form so FEAX can evaluate
-            TrialFunction/TestFunction values and gradients directly.
 
     Returns
     -------
     LoweredWeakForm
-        Backend-neutral IR containing lowered weak-form terms.
-
-    Notes
-    -----
-    StateField nodes are rebound differently depending on the target:
-
-    - VPINN:
-        StateField is replaced by the wrapped neural expression and rebound to
-        the active quadrature region.
-
-    - FEM/FEAX:
-        StateField is replaced by a shared TrialFunction so FEAX can assemble
-        matrix/residual operators.
+        Backend-neutral IR containing lowered weak-form terms, each split into
+        canonical VPINN channels: test-value, test-gradient, boundary-test-value.
     """
-    # print("DEBUG lower_weak_form has StateField before wrap:",
-    # _contains_node_type(domain, expr, StateField))
-    # expr = _ensure_statefield_wrapped(domain, expr)
-    # print("DEBUG lower_weak_form has StateField after wrap:",
-    # _contains_node_type(domain, expr, StateField))
-    shared_trial_symbol = None
-    if for_target == "fem":
-        sf = _find_first_statefield(expr)
-        if sf is not None:
-            shared_trial_symbol = TrialFunction(name=sf.name, value_shape=sf.value_shape)
-
     terms = _split_additive_terms(domain, expr)
     lowered_terms = []
 
     for sign, term in terms:
         support, region_id = _infer_term_bucket(domain, term)
-        term_for_target = term
 
-        if for_target == "vpinn":
-            term_for_target = _bind_statefield_for_vpinn(
-                domain,
-                term_for_target,
-                target_support=support,
-                target_region_id=region_id,
+        term = _bind_statefield_for_vpinn(domain, term, target_support=support, target_region_id=region_id)
+
+        if trial_value is not None:
+            term = _substitute_trial_for_vpinn(
+                domain, term, trial_value, target_support=support, target_region_id=region_id
             )
 
-            if trial_value is not None:
-                term_for_target = _substitute_trial_for_vpinn(
-                    domain,
-                    term_for_target,
-                    trial_value,
-                    target_support=support,
-                    target_region_id=region_id,
-                )
+        signed_expr = _apply_sign(domain, sign, term)
+        channel, coeff, meta = _extract_test_channel(domain, signed_expr)
 
-        else:
-            term_for_target = _bind_statefield_for_fem(
-                term_for_target,
-                trial_symbol=shared_trial_symbol,
+        if support == "boundary":
+            if channel != "test_value":
+                raise NotImplementedError(f"Boundary grad(test)-type terms are not supported on region '{region_id}'.")
+            channel = "boundary_test_value"
+
+        lowered_terms.append(
+            LoweredChannelTerm(
+                sign=sign,
+                support=support,
+                region_id=region_id,
+                channel=channel,
+                coeff=coeff,
+                variable_id=int(meta.get("variable_id", 0)),
+                value_shape=tuple(meta.get("value_shape", ())),
+                original_expr=term,
             )
-
-        signed_expr = _apply_sign(domain, sign, term_for_target)
-
-        if for_target == "vpinn":
-            channel, coeff, meta = _extract_test_channel(domain, signed_expr)
-
-            if support == "boundary":
-                if channel != "test_value":
-                    raise NotImplementedError(f"Boundary grad(test)-type terms are not supported on region '{region_id}'.")
-                channel = "boundary_test_value"
-
-            lowered_terms.append(
-                LoweredChannelTerm(
-                    sign=sign,
-                    support=support,
-                    region_id=region_id,
-                    channel=channel,
-                    coeff=coeff,
-                    variable_id=int(meta.get("variable_id", 0)),
-                    value_shape=tuple(meta.get("value_shape", ())),
-                    original_expr=term,
-                )
-            )
-        else:
-            lowered_terms.append(
-                LoweredChannelTerm(
-                    sign=sign,
-                    support=support,
-                    region_id=region_id,
-                    channel="raw",
-                    coeff=signed_expr,
-                    variable_id=0,
-                    value_shape=(),
-                    original_expr=term,
-                )
-            )
+        )
 
     return LoweredWeakForm(domain=domain, terms=lowered_terms)
 
 
-def assemble_weak_form(domain, expr, target=None, **kwargs):
+def assemble_weak_form(domain, expr, **kwargs):
     """
-    Assemble or lower a jNO expression into the requested solver backend.
+    Assemble a jNO weak-form expression into a differentiable VPINN GroupedAssembly.
 
-    This is the central implementation behind:
-
-        expr.assemble(target=...)
+    This is the implementation behind VPINN training in ``jno.core`` and ``jno.fem``.
+    FEM matrix/residual assembly goes through ``jno.fem([...])``, not this function.
 
     Parameters
     ----------
     domain:
-        Domain owning the expression and FEM/VPINN context. If None, the domain
-        is inferred from symbolic variables inside `expr`.
+        Domain owning the expression. If None, inferred from symbolic variables in ``expr``.
     expr:
-        Symbolic expression to assemble or lower.
-    target:
-        Backend target. Supported values:
-
-        None:
-            Infer the target automatically.
-
-        `"vpinn"`:
-            Return a differentiable `GroupedAssembly` object for VPINN training.
-
-        `"fem_system"`:
-            Return a steady linear FEM system `(A, b)` such that `A @ u = b`.
-
-        `"fem_residual"`:
-            Return a `FemResidualOperator` with residual and Jacobian callables.
-
-        `"fem_time"`:
-            Return a `FemTimeBlock` representing a transient semidiscrete
-            weak-form FEM problem.
-
-        `"diffrax"`:
-            Return a `DiffraxBlock` for strong-form time-dependent problems.
-
+        Symbolic weak-form expression.
     **kwargs:
-        Backend-specific options forwarded to the selected route.
+        ``trial_value`` (or legacy ``u_net``): optional neural trial expression.
 
     Returns
     -------
-    object
-        Depending on target:
-
-        - `"vpinn"`        -> GroupedAssembly
-        - `"fem_system"`   -> tuple(A, b)
-        - `"fem_residual"` -> FemResidualOperator
-        - `"fem_time"`    -> FemTimeBlock
-        - `"diffrax"`      -> DiffraxBlock
-
-    Notes
-    -----
-    Strong-form Diffrax lowering is dispatched before weak-form StateField
-    wrapping. All weak/FEM/VPINN/FEAX-time routes go through the weak-form
-    lowering path.
+    GroupedAssembly
     """
     if domain is None:
         domain = _infer_domain_from_expr(expr)
 
-    # IMPORTANT:
-    # Infer target first from the raw user expression.
-    if target is None:
-        target = _infer_solver_target(domain, expr)
-
-    # Strong-form Diffrax lowering should not go through weak/state wrapping.
-    if target == "diffrax":
-        from .time_route import _assemble_diffrax_from_strong_form
-
-        return _assemble_diffrax_from_strong_form(domain, expr, **kwargs)
-
-    # All weak/FEM/VPINN routes still use the wrapped weak expression path.
     expr = _ensure_statefield_wrapped(domain, expr)
 
-    if target == "vpinn":
-        trial_value = kwargs.pop("trial_value", None)
+    trial_value = kwargs.pop("trial_value", None)
+    if trial_value is None:
+        trial_value = kwargs.pop("u_net", None)
 
-        # Backward-compatible alias used in examples:
-        #     weak.assemble(domain, u_net=u_gauss, target="vpinn")
-        if trial_value is None:
-            trial_value = kwargs.pop("u_net", None)
-
-        ir = lower_weak_form(
-            domain,
-            expr,
-            trial_value=trial_value,
-            for_target="vpinn",
-        )
-        return _assemble_vpinn_from_ir(ir, **kwargs)
-
-    if target in {"fem_system", "fem_residual"}:
-        ir = lower_weak_form(domain, expr, for_target="fem")
-        if target == "fem_system":
-            from .fem_route import _assemble_fem_system_from_ir
-
-            return _assemble_fem_system_from_ir(domain, ir, **kwargs)
-
-        from .fem_route import _assemble_fem_residual_from_ir
-
-        return _assemble_fem_residual_from_ir(domain, ir, **kwargs)
-
-    if target == "fem_time":
-        ir = lower_weak_form(domain, expr, for_target="fem")
-        from .time_route import _assemble_feax_time_from_ir
-
-        return _assemble_feax_time_from_ir(domain, ir, **kwargs)
-
-    raise ValueError(
-        f"Unknown assembly target '{target}'. Supported: 'vpinn', 'fem_system', 'fem_residual', 'fem_time', 'diffrax'"
-    )
+    ir = lower_weak_form(domain, expr, trial_value=trial_value)
+    return _assemble_vpinn_from_ir(ir, **kwargs)
 
 
 def _assemble_vpinn_from_ir(ir: LoweredWeakForm, **kwargs):

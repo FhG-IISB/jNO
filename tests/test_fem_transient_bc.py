@@ -7,9 +7,9 @@ These tests assert the **assembly is faithful** (structure of ``M``/``c``/``f``)
 it with a throwaway few-line backward-Euler ``(M + dt·A) w_next = M·w + dt·(c + f(t_next))``;
 that loop is verification, not a jno feature.
 
-Earlier the feax (2D/3D) transient path left identity rows on ``M`` and never exposed the
-load, so only homogeneous, source-free problems were faithful. The fix zeros ``M``'s
-Dirichlet rows (a constrained DOF carries no time derivative) and exposes ``c``/``f``.
+For non-homogeneous Dirichlet and forced problems the assembly zeros ``M``'s Dirichlet rows
+(a constrained DOF carries no time derivative) and exposes the load ``c`` and forcing ``f(t)``,
+so source-driven and non-homogeneous problems march faithfully.
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ import pytest
 
 import jno
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
 import jax  # noqa: E402
 from shapely.geometry import box  # noqa: E402
@@ -27,7 +26,7 @@ from shapely.geometry import box  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """feax assembly is float64, so these tests opt into x64 per-test. The session default is
+    """FEM assembly/solves run in float64, so these tests opt into x64 per-test. The session default is
     x64-off (see tests/conftest.py); save/restore keeps the flag from leaking to other modules."""
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
@@ -70,8 +69,10 @@ def test_transient_nonhomog_dirichlet_single_field():
     ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
     fem = jno.fem([ui.t * vi + ui.x * vi.x + ui.y * vi.y, u(xb, yb) - 1.0, u(ci[0], ci[1]) - 0.0])
     assert fem.is_transient and fem.is_linear
-    # construction check: the mass carries NO time derivative on Dirichlet DOFs
-    rows = np.asarray(fem.domain._feax_bc.bc_rows).reshape(-1)
+    # construction check: the mass carries NO time derivative on Dirichlet DOFs.
+    # Dirichlet DOFs = the boundary nodes (scalar P1: one DOF per node).
+    pts = np.asarray(fem.field_points[0])
+    rows = np.where(np.asarray(jax.vmap(d._make_tag_location_fn("boundary"))(jax.numpy.asarray(pts))).reshape(-1))[0]
     assert rows.size > 0 and np.allclose(_dense(fem.M)[rows], 0.0)
     # and the load c carries g=1 on those rows
     assert np.allclose(np.asarray(fem.operator.affine_bias).reshape(-1)[rows], 1.0)
@@ -126,9 +127,11 @@ def test_coupled_transient_source_recovers():
         ]
     )
     n = int(np.asarray(d.mesh.points).shape[0])
-    assert fem.operator.forcing_vector_fn is not None
-    f0 = np.asarray(fem.operator.forcing_vector_fn(0.0)).reshape(-1)
-    assert np.linalg.norm(f0[:n]) > 0 and np.allclose(f0[n:], 0.0)  # source lands in u-block only
+    # The +2 constant load is time-independent, so it lands in the (constant) affine bias, not the
+    # time-varying forcing_vector_fn (which carries only the per-step increment; a time-dependent
+    # source is exercised by test_coupled_transient_time_dependent_source). It is u-block only.
+    c0 = np.asarray(fem.operator.affine_bias).reshape(-1)
+    assert np.linalg.norm(c0[:n]) > 0 and np.allclose(c0[n:], 0.0)
     w = _march(fem)
     u_ex = 2.0 * (1.0 - np.exp(-fem.t1))
     p_ex = 2.0 - 2.0 * np.exp(-fem.t1) * (1.0 + fem.t1)
@@ -201,14 +204,14 @@ def test_transient_stokes_dae_recovers():
         ]
     )
     assert fem.is_transient and fem.is_linear
-    off = fem.problem.offset
+    off = fem.offsets  # [0, n_vel, n_total]
     nu = off[1] - off[0]
     M = _dense(fem.M)
     assert np.allclose(M[nu:, nu:], 0.0)  # DAE: pressure carries a zero mass block
     assert np.abs(M[:nu, :nu]).max() > 0.0  # velocity mass present
     w = _march(fem)
-    pts_v = np.asarray(fem.problem.mesh[0].points)
-    pts_p = np.asarray(fem.problem.mesh[1].points)
+    pts_v = np.asarray(fem.field_points[0])
+    pts_p = np.asarray(fem.field_points[1])
     uu = w[off[0] : off[1]].reshape(-1, 2)
     pr = w[off[1] :]
     u_ex = np.stack([pts_v[:, 0], -pts_v[:, 1]], axis=-1)

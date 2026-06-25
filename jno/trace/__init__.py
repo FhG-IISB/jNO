@@ -30,6 +30,7 @@ __all__ = [
     "Constant",
     "Variable",
     "TensorTag",
+    "RegionMask",
     "BinaryOp",
     "Tracker",
     "Model",
@@ -1260,6 +1261,24 @@ class TensorTag(Placeholder):
         if self.dim_index is not None:
             return f"Tensor({self.tag})[{self.dim_index}]"
         return f"Tensor({self.tag})"
+
+
+class RegionMask(Placeholder):
+    """Per-cell indicator for an interior sub-region, multiplied into a weak term by ``jno.fem`` so the
+    term integrates over that region's cells only.
+
+    A cell belongs to the region iff its **centroid** does -- classified once at assembly build time
+    against a geometry part (``domain._source_regions`` shapely polygon) or a ``domain.tag`` predicate
+    (concrete numpy/shapely, never traced). The volume kernel resolves it from a constant per-cell
+    ``volume_var``. It is a leaf (no children) and carries no coordinates, so it composes as a plain
+    scalar coefficient: ``RegionMask(region) * weak_term``.
+    """
+
+    def __init__(self, region: str):
+        self.region = str(region)
+
+    def __repr__(self):
+        return f"RegionMask({self.region})"
 
 
 class BinaryOp(Placeholder):
@@ -2904,26 +2923,32 @@ class FemLinearSystem:
         ``fem = jno.fem([...])`` (see ``docs/inverse-problems.md``).
 
         ``solve_fn`` is **your** solver: any ``(A, b) -> u`` callable. jNO writes no
-        solver code and imposes no library — the default is
-        :func:`jax.numpy.linalg.solve` (dense); pass e.g.
-        ``lambda A, b: lineax.linear_solve(lineax.MatrixLinearOperator(A), b).value`` to
-        choose another. Use a differentiable solver so ``∂u/∂θ`` exists.
+        solver code and imposes no library — the default is the differentiable sparse-direct
+        ``jno.utils.solver.linear.sparse_lu_solve`` (JAX ``spsolve``, no dependency), which takes
+        the assembler's BCOO operator **without densifying** (``O(nnz)``, large-``N`` friendly) and
+        is reverse-mode differentiable in both ``A``'s entries and ``b``. Pass your own
+        ``(A, b) -> u`` to choose another solver/library — it receives the **BCOO** operator, so a
+        dense solver must densify (``jnp.linalg.solve(A.todense(), b)``). Use a differentiable solver
+        so ``∂u/∂θ`` exists.
 
         Note: the FEM solve is global (one ``A``, ``b``, ``u``); enable x64
-        (``jax_enable_x64``) and set the parameter dtype to match — the feax
-        assembly is float64.
+        (``jax_enable_x64``) and set the parameter dtype to match — the
+        assembly is float64. (``spsolve``'s cuSolver-GPU path can be flaky; pass your own
+        ``solve_fn`` if you hit it on GPU.)
         """
         if solve_fn is None:
+            from ..utils.solver.linear import sparse_lu_solve
 
-            def solve_fn(A, b):
-                return jnp.linalg.solve(A, b)
+            solve_fn = sparse_lu_solve  # sparse-direct on the BCOO operator; never densifies
 
         names = list(self.runtime_parameter_exprs)
         params = [self.runtime_parameter_exprs[n] for n in names]
 
         def _solve(*values):
             A, b = self.evaluate(dict(zip(names, values)))
-            return solve_fn(jnp.asarray(A), jnp.asarray(b).reshape(-1))
+            # keep a BCOO ``A`` sparse for the sparse solver (only coerce a plain dense operator)
+            A = A if hasattr(A, "todense") else jnp.asarray(A)
+            return solve_fn(A, jnp.asarray(b).reshape(-1))
 
         return FunctionCall(_solve, params, name="fem_solve")
 
@@ -3015,12 +3040,12 @@ class FemResidualOperator:
         default is a matrix-free Jacobian-free Newton-Krylov (Newton + BiCGStab on the
         JVP, no external solver dependency); implicit differentiation via
         ``jax.lax.custom_root`` keeps ``∂u/∂θ`` exact without unrolling Newton. Pass your
-        own to choose another solver/library (e.g. an ``optimistix`` Newton). jNO's
+        own to choose another solver/library (e.g. your own Newton). jNO's
         analytic Jacobian (:attr:`jacobian`) is available; by default ``J @ v`` is a JVP
         of the residual.
 
         ``u0`` is the initial guess (default: zeros of the operator size; enable
-        x64 — the feax residual is float64).
+        x64 — the residual is float64).
         """
         if u0 is None:
             if self.size is None:
@@ -3299,7 +3324,7 @@ class Assembly(Placeholder):
 
 class GroupedAssembly(Placeholder):
     """
-    Internal node for grouped FEAX-style variational assembly.
+    Internal node for grouped variational assembly.
 
     Separate channels:
       - volume_value_expr   : terms multiplied by TestFunction(phi)

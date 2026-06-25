@@ -10,7 +10,6 @@ from pathlib import Path
 import jax
 import pytest
 
-pytest.importorskip("feax", reason="feax required for the FEM doc snippet")
 pytest.importorskip("shapely", reason="shapely required for the box domain")
 
 DOCS = Path(__file__).parent.parent / "docs"
@@ -27,7 +26,7 @@ def test_fem_md_intro_snippet_runs():
     The headline API hands back ready-to-use arrays (fem.A dense, fem.b flat) for jnp.linalg.solve;
     this guards against drift in that intro and the flat-accessor contract."""
     prev = jax.config.jax_enable_x64
-    jax.config.update("jax_enable_x64", True)  # feax assembly is float64
+    jax.config.update("jax_enable_x64", True)  # FEM assembly is float64
     try:
         ns: dict = {}
         exec(compile(_first_python_block(DOCS / "fem.md"), "<fem.md intro>", "exec"), ns)

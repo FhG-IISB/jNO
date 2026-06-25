@@ -1,6 +1,6 @@
 """1D ("segment" / ``LINE2``) FEM coverage through ``jno.fem``.
 
-feax has no 1D volume element, so 1D is assembled by a small native ``LINE2``
+1D is assembled by a small dedicated ``LINE2``
 assembler (``jno/utils/solver/fem_1d.py``) that reuses the same integrand
 evaluator as the 2D/3D path. These tests mirror ``test_fem_3d.py`` on a line
 domain (``jno.domain.line`` -> pygmsh): steady (linear + nonlinear, all BCs) and
@@ -19,7 +19,6 @@ import pytest
 
 import jno
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("pygmsh", reason="pygmsh required for line meshing")
 
 import jax  # noqa: E402
@@ -27,7 +26,7 @@ import jax  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """feax assembly is float64, so these tests opt into x64 per-test. The session default is
+    """FEM assembly/solves run in float64, so these tests opt into x64 per-test. The session default is
     x64-off (see tests/conftest.py); save/restore keeps the flag from leaking to other modules."""
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
@@ -71,6 +70,18 @@ def test_vec_gt_1_rejected():
     weak = jno.np.inner(jno.np.grad(u, [xi]), jno.np.grad(phi, [xi]), n_contract=2)
     with pytest.raises(NotImplementedError):
         jno.fem([weak, u(xb) - 0.0])
+
+
+def test_order2_p2_rejected_loudly():
+    # The native 1D assembler is LINE2 (P1) only; a P2 request must fail loud, not silently
+    # fall back to P1 (a wrong-order, silently-wrong solve). P2 is a 2D/3D capability.
+    d = _line(0.25)
+    u, phi = d.fem_symbols(order=2)
+    xi = d.variable("interior", split=True)[0]
+    xb = d.variable("boundary", split=True)[0]
+    ui, vi = u.bind(x=xi), phi.bind(x=xi)
+    with pytest.raises(NotImplementedError, match="P2.*1D|1D.*P2|LINE2"):
+        jno.fem([ui.x * vi.x - 1.0 * vi, u(xb) - 0.0])
 
 
 # ==========================================================================
@@ -213,11 +224,11 @@ def test_transient_nonlinear_assembles_residual_block():
 
 
 # ==========================================================================
-# coupled / mixed multi-field 1D (native block assembly; no feax)
+# coupled / mixed multi-field 1D (native block assembly)
 # ==========================================================================
-# feax has no LINE2 element, so coupled 1D is assembled by a native block residual
-# (jno/utils/solver/fem_1d.py::assemble_fem_1d_multifield). There is no feax problem
-# here (fem.problem is None), so the block layout is hand-computed: field i occupies
+# coupled 1D is assembled by a dedicated block residual
+# (jno/utils/solver/fem_1d.py::assemble_fem_1d_multifield). There is no separate problem
+# object here (fem.problem is None), so the block layout is hand-computed: field i occupies
 # sol[i*n : (i+1)*n] for scalar fields. The manufactured pairs use ASYMMETRIC cross-
 # coupling so a transposed/mis-scattered block would change the solution.
 def test_coupled_linear_recovers():

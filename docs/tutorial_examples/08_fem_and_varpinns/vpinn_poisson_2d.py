@@ -26,7 +26,7 @@ import optax  # noqa: E402
 import jno  # noqa: E402
 import jno.jnp_ops as jnn  # noqa: E402
 
-jax.config.update("jax_enable_x64", True)  # feax assembly is float64
+jax.config.update("jax_enable_x64", True)  # the assembler builds in float64
 
 # ---- domain, network trial, weak form -------------------------------------------------------
 dom = jno.domain(constructor=jno.domain.rect(mesh_size=0.07))

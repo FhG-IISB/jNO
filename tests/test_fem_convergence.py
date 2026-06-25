@@ -41,7 +41,6 @@ import pytest
 
 import jno
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
@@ -56,7 +55,7 @@ PI = np.pi
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """feax assembly is float64, so these tests opt into x64 per-test. The session default is
+    """FEM assembly/solves run in float64, so these tests opt into x64 per-test. The session default is
     x64-off (see tests/conftest.py); save/restore keeps the flag from leaking to other modules."""
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
@@ -544,7 +543,7 @@ def study_kovasznay():
         )
         assert not fem.is_linear and not fem.is_transient
         sol = _newton(fem)
-        off = fem.problem.offset
+        off = fem.offsets  # [0, n_vel, n_total]
         l2v = _true_l2(d, 2, sol[off[0] : off[1]], (uex, vex))  # same domain -> matching P2 node order
         l2p = _true_l2(d, 1, sol[off[1] :], pex)
         return l2v, l2p
@@ -580,7 +579,7 @@ def study_complex_helmholtz():
         fem = jno.fem([weak.real, u.real(xb, yb) - 0.0, u.imag(xb, yb) - 0.0])
         assert fem._mode == "linear"
         sol = _solve_linear(fem)
-        n = int(np.asarray(fem.problem.offset)[1])
+        n = int(fem.offsets[1])  # [0, n_re, n_total] -- the real/imag field split (native assembly)
         er = _true_l2(d, 1, sol[:n], lambda co: sin(PI * co[0]) * sin(PI * co[1]))
         ei = _true_l2(d, 1, sol[n:], lambda co: sin(2 * PI * co[0]) * sin(PI * co[1]))
         return float(np.hypot(er, ei))
@@ -631,7 +630,7 @@ def study_boussinesq():
         fem = jno.fem([mom, cont, ener, u(xb, yb)[0] - UXb, u(xb, yb)[1] - UYb, T(xb, yb) - Tmb, p(xpn, ypn) - 1.0])
         assert not fem.is_linear
         w = _newton(fem)
-        off = list(np.asarray(fem.problem.offset)) + [fem.dofs]
+        off = fem.offsets  # [0, n_vel, n_vel+n_p, n_total]
         l2v = _true_l2(d, 2, w[off[0] : off[1]], (uex, vex))  # same domain -> matching P2 node order
         l2T = _true_l2(d, 2, w[off[2] : off[3]], Tex)
         return l2v, l2T

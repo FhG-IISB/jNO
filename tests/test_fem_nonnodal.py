@@ -15,13 +15,10 @@ is ``O(h²)`` superconvergent at cell centroids. The dense solve runs on the hos
 
 from __future__ import annotations
 
-import numpy as np
-import pytest
-
-basix = pytest.importorskip("basix", reason="basix required for element tabulation")
-
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
+import numpy as np
+import pytest
 
 from jno.utils.solver.fem_nonnodal import assemble_mixed_poisson_rt, rt_flux_at_centroids  # noqa: E402
 

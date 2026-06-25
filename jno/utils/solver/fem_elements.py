@@ -7,7 +7,7 @@ linear algebra in the cell Jacobian, so it is JAX-friendly (vmappable over cells
 differentiable in the geometry).
 
 The nodal-Lagrange path needs none of this — its only map is the isoparametric
-gradient chain rule already in feax. The edge/derivative-DOF families do:
+gradient chain rule. The edge/derivative-DOF families do:
 
 * Raviart–Thomas (H(div)): contravariant Piola
   ``Phi_phys = (1/detJ) J Phi_ref``, ``div Phi_phys = (1/detJ) div Phi_ref``.

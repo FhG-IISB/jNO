@@ -10,7 +10,7 @@ from pathlib import Path
 
 import jax
 
-# feax assembles in float64; enable x64 once so the FEM solve, the inverse domain, and the
+# the assembler builds in float64; enable x64 once so the FEM solve, the inverse domain, and the
 # NUTS kernel state share one dtype (NUTS errors on a mixed-precision pytree).
 jax.config.update("jax_enable_x64", True)
 

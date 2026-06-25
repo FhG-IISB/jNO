@@ -842,7 +842,7 @@ class core:
 
         # Replace only the OUTERMOST marked weak subtree, after wrapper recursion.
         if self._is_marked_weak(node) and not parent_is_weak:
-            return assemble_weak_form(self.domain, node, target="vpinn")
+            return assemble_weak_form(self.domain, node)
 
         return node
 
@@ -2156,6 +2156,9 @@ class core:
 
             def _init(params):
                 state = built.init(optax.tree_utils.tree_cast(params, jnp.float32))
+                # Cast only floating leaves to the param dtype; integer book-keeping
+                # fields (e.g. L-BFGS's `count`, used as a scatter index) must stay
+                # integer or `x.at[count].set(...)` fails on a float32 indexer.
                 return jax.tree.map(
                     lambda t: t.astype(param_dtype) if jnp.issubdtype(t.dtype, jnp.floating) else t,
                     state,

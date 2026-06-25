@@ -30,13 +30,22 @@ from .solver_helper import iter_children as _iter_children
 
 
 def _is_runtime_scalar_parameter(node) -> bool:
-    """Return True for zero-argument trainable jNO physical parameters."""
+    """Return True for zero-argument jNO physical parameters (``jno.np.parameter(...)``)."""
     return isinstance(node, ModelCall) and len(node.args) == 0 and bool(getattr(node.model, "_is_parameter", False))
 
 
+def _is_frozen_parameter(node) -> bool:
+    """A parameter marked ``.freeze()`` — a **known**, non-trainable coefficient. It is *not* a runtime
+    (trainable) unknown: the integrand evaluator resolves it as a coordinate function / constant at
+    the quadrature points (see ``fem_utils._eval_frozen_coefficient``), so the system assembles
+    non-parametrically. Excluded from runtime-parameter detection/collection below."""
+    return _is_runtime_scalar_parameter(node) and bool(getattr(getattr(node, "model", None), "_frozen", False))
+
+
 def _contains_runtime_parameter(node) -> bool:
-    """Recursively detect trainable physical parameters in one trace subtree."""
-    if _is_runtime_scalar_parameter(node):
+    """Recursively detect **trainable** physical parameters in one trace subtree (frozen ones don't
+    count — they are baked in as known coefficients, keeping the system non-parametric)."""
+    if _is_runtime_scalar_parameter(node) and not _is_frozen_parameter(node):
         return True
 
     return any(_contains_runtime_parameter(child) for child in (_iter_children(node) or ()))
@@ -225,19 +234,11 @@ def _runtime_scalar_arg(args, name: str, *, dtype):
 
 
 def _collect_runtime_parameter_exprs(node, out=None):
-    """
-    Collect zero-argument ``jno.np.parameter(...)`` calls by public name.
-
-    Strong-form Diffrax lowering replaces these symbolic parameter ModelCalls
-    with private TensorTags. Concrete values are supplied by the external
-    solver through:
-
-        diffrax.diffeqsolve(..., args={"parameter_name": value})
-    """
+    """Collect zero-argument ``jno.np.parameter(...)`` calls by public name."""
     if out is None:
         out = {}
 
-    if _is_runtime_scalar_parameter(node):
+    if _is_runtime_scalar_parameter(node) and not _is_frozen_parameter(node):
         name = _parameter_name(node)
         previous = out.get(name)
 

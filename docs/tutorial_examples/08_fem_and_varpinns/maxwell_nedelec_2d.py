@@ -7,7 +7,7 @@ contrast with the *nodal* (Lagrange) curl-curl in ``maxwell_2d_vector.py``: edge
 grad-div penalty**. The discrete gradient fields lie exactly in the curl kernel, so the spurious modes
 that force a penalty on nodal elements simply do not appear -- you write the curl-curl form and solve.
 
-jNO assembles N1E with its native push-forward engine (feax has no push-forward); the 2-D curl is the
+jNO assembles N1E with its native push-forward engine; the 2-D curl is the
 view sugar ``u.curl(x, y)`` and the essential BC is the tangential trace ``u×n`` -- the perfect-electric
 -conductor (PEC) wall ``u×n = 0``, written through the outward normal as ``u[0]·ny - u[1]·nx``.
 

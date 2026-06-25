@@ -101,14 +101,14 @@ def get_grad_axis_from_test_grad(node) -> int:
     """
     Infer the spatial derivative axis from Jacobian(TestFunction, variable).
 
-    Used when lowering test-gradient terms into canonical VPINN/FEAX channels.
+    Used when lowering test-gradient terms into canonical VPINN/FEM channels.
     """
     if not (isinstance(node, Jacobian) and isinstance(node.target, TestFunction)):
         raise TypeError(f"Expected Jacobian(TestFunction), got {type(node).__name__}")
 
     if len(node.variables) != 1:
         raise ValueError(
-            "Canonical FEAX-style test_grad lowering currently expects exactly one "
+            "Canonical test_grad lowering currently expects exactly one "
             f"spatial variable in Jacobian(TestFunction,...), got {len(node.variables)}"
         )
 
@@ -366,7 +366,7 @@ def wrap_primary_state(node, target, *, state_name="u", value_shape=()):
     """
     Replace the selected symbolic unknown subtree by a StateField wrapper.
 
-    The wrapper marks the primary unknown for FEM/FEAX lowering while preserving
+    The wrapper marks the primary unknown for FEM lowering while preserving
     the original neural expression inside the StateField.
     """
     if node is target:

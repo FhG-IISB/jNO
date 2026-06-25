@@ -3,26 +3,21 @@ through ``jno.fem([...])`` (no ``init_fem`` / ``assemble``).
 
 ``FEM.solve`` hosts a *real* parametric solve in the trace so ``crux.solve``
 recovers a ``jno.np.parameter`` from data. The solver is the user's own callable
-(jNO writes none): the linear default is ``jnp.linalg.solve`` (a ``lineax`` backend
-is exercised too); the nonlinear default is an ``optimistix`` Newton ``root_find``
-(implicit-diff, so the gradient reaches the parameter without unrolling Newton).
+or the built-in default (the differentiable sparse-direct ``sparse_lu_solve`` for
+linear, matrix-free Newton-Krylov for nonlinear); a bring-your-own dense solver is
+exercised too. Implicit-diff lets the gradient reach the parameter without unrolling.
 
-Run with x64 (the feax assembly is float64): ``JAX_ENABLE_X64=1``.
+Run with x64 (assembly runs in float64): ``JAX_ENABLE_X64=1``.
 """
 
 import pytest
 
-pytest.importorskip("feax", reason="feax required for FEM inverse tests")
 pytest.importorskip("shapely", reason="shapely required for the box domain")
-pytest.importorskip("optimistix", reason="optimistix required for the nonlinear solve")
-pytest.importorskip("lineax", reason="lineax required for the lineax-backend test")
 
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
-import lineax  # noqa: E402
 import numpy as np  # noqa: E402
 import optax  # noqa: E402
-import optimistix as optx  # noqa: E402
 from shapely.geometry import box  # noqa: E402
 
 import jno  # noqa: E402
@@ -37,7 +32,7 @@ _DUMMY = jno.domain.from_array({"_": np.zeros((1, 1))})
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """feax assembly is float64, so these tests need x64. Set it per-test with
+    """FEM assembly/solves run in float64, so these tests need x64. Set it per-test with
     save/restore — the global flag is shared across modules and other suites flip it
     at import (e.g. the periodic-parametric tests force it False)."""
     prev = jax.config.jax_enable_x64
@@ -95,25 +90,28 @@ def test_linear_recovers_default_solver():
     assert sys.is_parametric and list(sys.runtime_parameter_exprs) == ["alpha"]
 
     A1, b1 = sys.evaluate({"alpha": 1.0})
-    u_obs = jnp.linalg.solve(jnp.asarray(A1), jnp.asarray(b1).reshape(-1))
+    u_obs = jnp.linalg.solve(A1.todense(), jnp.asarray(b1).reshape(-1))
 
     rec = _recover(fem.solve(), alpha, u_obs)
     assert abs(rec - 2.0) > 0.5, "parameter did not move -- gradient did not reach it"
     assert abs(rec - 1.0) < TOL, f"linear (default solver): recovered alpha={rec:.4f}"
 
 
-def test_linear_recovers_with_lineax_backend():
+def test_linear_recovers_with_byo_dense_solver():
     alpha = _alpha()
     fem = _linear_fem(alpha)
     A1, b1 = fem.operator.evaluate({"alpha": 1.0})
-    u_obs = jnp.linalg.solve(jnp.asarray(A1), jnp.asarray(b1).reshape(-1))
+    u_obs = jnp.linalg.solve(A1.todense(), jnp.asarray(b1).reshape(-1))
 
-    u_node = fem.solve(lambda A, b: lineax.linear_solve(lineax.MatrixLinearOperator(A), b).value)
+    # bring-your-own dense solver: solve_fn receives the raw BCOO operator, so densify it
+    u_node = fem.solve(lambda A, b: jnp.linalg.solve(A.todense() if hasattr(A, "todense") else A, b))
     rec = _recover(u_node, alpha, u_obs)
-    assert abs(rec - 1.0) < TOL, f"linear (lineax backend): recovered alpha={rec:.4f}"
+    assert abs(rec - 1.0) < TOL, f"linear (BYO dense): recovered alpha={rec:.4f}"
 
 
-def test_nonlinear_recovers_optimistix():
+def test_nonlinear_recovers():
+    from jno.utils.solver.newton_krylov import newton_krylov
+
     alpha = _alpha()
     fem = _nonlinear_fem(alpha)
     assert not fem.is_linear
@@ -121,23 +119,17 @@ def test_nonlinear_recovers_optimistix():
     assert type(op).__name__ == "FemResidualOperator" and op.is_parametric
 
     u0 = jnp.zeros((int(op.size),), dtype=jnp.float64)
-    u_obs = optx.root_find(
-        lambda uu, _a: op.residual(uu, {"alpha": 1.0}),
-        optx.Newton(rtol=1e-8, atol=1e-8),
-        u0,
-        args=None,
-        max_steps=100,
-    ).value
+    u_obs = newton_krylov(lambda uu: jnp.asarray(op.residual(uu, {"alpha": 1.0})).reshape(-1), u0)
 
-    rec = _recover(fem.solve(), alpha, u_obs)
+    rec = _recover(fem.solve(), alpha, u_obs)  # default: matrix-free Newton-Krylov, implicit-diff
     assert abs(rec - 2.0) > 0.5, "parameter did not move -- implicit-diff gradient did not reach it"
-    assert abs(rec - 1.0) < TOL, f"nonlinear (optimistix): recovered alpha={rec:.4f}"
+    assert abs(rec - 1.0) < TOL, f"nonlinear: recovered alpha={rec:.4f}"
 
 
 def test_nonaffine_scalar_recovers_via_reassembly():
     """A parameter inside a nonlinear function (``exp(logk)``) can't be factored into
     a constant basis, so the operator is re-assembled each call with the parameter
-    threaded as feax InternalVars. The feax kernel is JAX, so the gradient still
+    threaded as InternalVars. The kernel is JAX, so the gradient still
     reaches the parameter."""
     logk = jno.np.parameter((1,), key=jax.random.PRNGKey(1), name="logk")
     logk.initialize(jax.nn.initializers.constant(0.7))  # k = e^0.7 ~ 2 (truth: logk=0)
@@ -158,7 +150,7 @@ def test_nonaffine_scalar_recovers_via_reassembly():
     assert list(fem.operator.runtime_parameter_exprs) == ["logk"]
 
     A1, b1 = fem.operator.evaluate({"logk": 0.0})  # truth k = exp(0) = 1
-    u_obs = jnp.linalg.solve(jnp.asarray(A1), jnp.asarray(b1).reshape(-1))
+    u_obs = jnp.linalg.solve(A1.todense(), jnp.asarray(b1).reshape(-1))
 
     rec = _recover(fem.solve(), logk, u_obs, n=150)
     assert abs(rec - 0.7) > 0.3, "parameter did not move -- gradient did not reach it through re-assembly"
@@ -171,14 +163,14 @@ def test_global_solve_runs_once_per_step_not_per_node():
     alpha = _alpha()
     fem = _linear_fem(alpha)
     A1, b1 = fem.operator.evaluate({"alpha": 1.0})
-    u_obs = jnp.linalg.solve(jnp.asarray(A1), jnp.asarray(b1).reshape(-1))
+    u_obs = jnp.linalg.solve(A1.todense(), jnp.asarray(b1).reshape(-1))
     n_nodes = int(fem.dofs)
 
     calls = [0]
 
     def counting_solve(A, b):
         jax.debug.callback(lambda: calls.__setitem__(0, calls[0] + 1))
-        return jnp.linalg.solve(A, b)
+        return jnp.linalg.solve(A.todense() if hasattr(A, "todense") else A, b)
 
     u_node = fem.solve(counting_solve)
     crux = jno.core([(u_node - u_obs).mse], domain=_DUMMY)
@@ -221,13 +213,13 @@ def test_nodal_field_parameter_recovers_via_crux():
     )
     A_field, _ = fem.operator.evaluate({"k": k_true})
     A_ref = np.asarray(fem_ref.A.todense() if hasattr(fem_ref.A, "todense") else fem_ref.A)
-    assert np.max(np.abs(np.asarray(A_field) - A_ref)) < 1e-9, "nodal interpolation/gather mismatch"
+    assert np.max(np.abs(np.asarray(A_field.todense()) - A_ref)) < 1e-9, "nodal interpolation/gather mismatch"
 
     A_t, b = fem.operator.evaluate({"k": k_true})
-    u_obs = jnp.linalg.solve(jnp.asarray(A_t), jnp.asarray(b).reshape(-1))
+    u_obs = jnp.linalg.solve(A_t.todense(), jnp.asarray(b).reshape(-1))
 
     A_t, b = fem.operator.evaluate({"k": k_true})
-    u_obs = jnp.linalg.solve(jnp.asarray(A_t), jnp.asarray(b).reshape(-1))
+    u_obs = jnp.linalg.solve(A_t.todense(), jnp.asarray(b).reshape(-1))
 
     # Recover the full nodal field k(x) through crux.solve (the differentiable
     # re-assembled solve). Well-posed enough here from full-field data; field
@@ -387,7 +379,7 @@ def test_transient_recovers_default_scan():
     # backward-Euler matrix M + dt A would be singular (rank-deficient on the bc rows).
     M = np.asarray(block.M.todense() if hasattr(block.M, "todense") else block.M)  # block.M is a BCOO -> densify
     dt = float(block.dt)
-    S = M + dt * np.asarray(block.operator_fn(dt, {"alpha": 1.0}))
+    S = M + dt * np.asarray(block.operator_fn(dt, {"alpha": 1.0}).todense())
     assert np.linalg.matrix_rank(S) == S.shape[0], "M + dt A is singular -- Dirichlet identity missing from A"
 
     n_dofs = int(M.shape[0])
@@ -428,7 +420,7 @@ def test_transient_save_ts_decouples_from_dt():
 
     _, fem = _transient_heat_fem(_alpha())
     block = fem.operator
-    n_dofs = int(np.asarray(block.M).shape[0])
+    n_dofs = int(block.M.shape[0])  # BCOO or dense — both expose .shape
 
     fine = _default_transient_integrate(block, {"alpha": 1.0}, _grid_ts(block))
     coarse_ts = jnp.array([float(block.t0), float(block.t1)])  # only 2 output points
@@ -460,8 +452,8 @@ def test_transient_solve_fn_override():
 
 
 def test_transient_nonlinear_recovers_via_inner_newton():
-    """The default transient integrator handles a NONLINEAR block too: backward Euler with an
-    optimistix Newton root_find per step (implicit-diff). Recover a scalar alpha in
+    """The default transient integrator handles a NONLINEAR block too: backward Euler with the
+    matrix-free Newton-Krylov root find per step (implicit-diff). Recover a scalar alpha in
     u_t = lap u - alpha*u^3 from the trajectory through fem.solve() -- the gradient flows
     through the per-step Newton to alpha without unrolling it."""
     from jno.utils.solver.backend_blocks import _default_transient_integrate
@@ -502,7 +494,7 @@ def test_steady_nonhomog_dirichlet_parametric_recovers():
     f = 2.0 * (xi * (1 - xi) + yi * (1 - yi))
     fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 1.0], quad_degree=3)
     A1, b1 = fem.operator.evaluate({"alpha": 1.0})
-    u_obs = jnp.linalg.solve(jnp.asarray(A1), jnp.asarray(b1).reshape(-1))
+    u_obs = jnp.linalg.solve(A1.todense(), jnp.asarray(b1).reshape(-1))
     rec = _recover(fem.solve(), k, u_obs)
     assert abs(rec - 1.0) < TOL, f"steady non-homogeneous parametric: recovered k={rec:.4f}"
 

@@ -18,7 +18,6 @@ import pytest
 
 import jno
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
 import jax  # noqa: E402
 from shapely.geometry import Point, box  # noqa: E402
@@ -26,7 +25,7 @@ from shapely.geometry import Point, box  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """feax assembly is float64, so these tests opt into x64 per-test. The session default is
+    """FEM assembly/solves run in float64, so these tests opt into x64 per-test. The session default is
     x64-off (see tests/conftest.py); save/restore keeps the flag from leaking to other modules."""
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
@@ -123,7 +122,7 @@ def test_coupled_3d_cube_recovers():
 def test_coupled_nonlinear_recovers_on_disk():
     # Nonlinear coupled on a non-box domain (disk): -lap u + u*p = x*y, -lap p + u^2 = x^2,
     # u=x, p=y on the boundary. u*=x, p*=y is the exact solution (the nonlinear terms equal
-    # their sources at the solution), recovered by a Newton solve via feax's block residual/
+    # their sources at the solution), recovered by a Newton solve via the assembled block residual/
     # Jacobian -> shows the nonlinear coupled path is domain-independent too.
     spo = pytest.importorskip("scipy.optimize")
     d = jno.domain(Point(0.5, 0.5).buffer(0.5, resolution=28), mesh_size=0.22)
@@ -159,8 +158,8 @@ def test_coupled_nonlinear_transient_recovers_manufactured():
     # The full triple: nonlinear + coupled + transient. Zero-flux (natural Neumann) so a
     # spatially-uniform field is exact in space; the system reduces to the ODEs
     #   u_t = -u ,  p_t = u^2   (the u^2 coupling makes it nonlinear: dR/du carries 2u),
-    # with u(0)=1, p(0)=0 -> u = e^{-t}, p = (1 - e^{-2t})/2. feax autodiffs the block
-    # residual/Jacobian; a Newton backward-Euler march recovers the analytic solution.
+    # with u(0)=1, p(0)=0 -> u = e^{-t}, p = (1 - e^{-2t})/2. The block residual/Jacobian
+    # is autodiffed; a Newton backward-Euler march recovers the analytic solution.
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25, time=(0.0, 0.1, 11))
     u, v = d.fem_symbols(names=("u", "v"))
     p, q = d.fem_symbols(names=("p", "q"))

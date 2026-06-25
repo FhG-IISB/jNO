@@ -6,7 +6,7 @@ Solves the Poisson problem ``-Δp = f`` in its first-order (dual) mixed form
 
 with an **H(div)-conforming** Raviart-Thomas flux ``u`` and a piecewise-constant ``P0`` pressure
 ``p`` -- the first non-nodal element family wired through ``jno.fem``. RT/P0 are assembled by jNO's
-native push-forward engine (feax has no push-forward), but the weak form is written exactly like any
+native push-forward engine, but the weak form is written exactly like any
 other coupled problem: two ``fem_symbols`` field pairs, with the field's ``space`` the only new knob.
 ``div`` is ``trace(grad(.))`` (as in the Stokes tutorial). A Dirichlet condition on ``p`` is *natural*
 in the mixed form, so ``p = 0`` needs no essential constraint on the flux.
