@@ -15,6 +15,10 @@ inlet/outlet), pin the pressure at one vertex to remove its constant null space,
 the analytic Poiseuille solution to machine precision.
 """
 
+import jax
+
+jax.config.update("jax_enable_x64", True)  # the saddle (Taylor-Hood) system is solved in float64
+
 import jax.numpy as jnp
 import numpy as np
 from shapely.geometry import box

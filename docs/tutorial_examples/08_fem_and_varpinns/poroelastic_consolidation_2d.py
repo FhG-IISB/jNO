@@ -110,7 +110,12 @@ def _csc(B):  # jax operator (BCOO or dense) -> scipy CSC
 
 # --- the Biot coupling lives in the mass matrix (cross-field p-u block); factor M + dt*A ONCE ---
 M, A = _csc(fem.M), _csc(fem.operator.A)
-b = np.asarray(fem.operator.forcing_vector_fn(0.0, {}))  # constant top-load vector
+# constant top-load: the semidiscrete RHS is M u̇ + A u = affine_bias + forcing(t). The constant
+# Dirichlet/Neumann load is carried by ``affine_bias``; ``forcing_vector_fn`` is the time-varying part.
+_ab = fem.operator.affine_bias
+b = np.zeros(fem.dofs) if _ab is None else np.asarray(_ab).reshape(-1)
+if fem.operator.forcing_vector_fn is not None:
+    b = b + np.asarray(fem.operator.forcing_vector_fn(0.0, {})).reshape(-1)
 dt, nsteps, nframes = 0.005, 60, 20
 lu = splu((M + dt * A).tocsc())
 coupling = abs(M[nU:, :nU]).sum()

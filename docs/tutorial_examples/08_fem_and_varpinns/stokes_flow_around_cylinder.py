@@ -77,7 +77,7 @@ UY = np.where(inside, griddata(pts_v, uu[:, 1], (gx, gy), method="linear"), np.n
 m = np.isfinite(UX) & np.isfinite(UX[::-1])  # nodes whose mirror is also valid
 sym = float(np.linalg.norm(np.r_[(UX - UX[::-1])[m], (UY + UY[::-1])[m]]) / np.linalg.norm(np.r_[UX[m], UY[m]]))
 print("\nStokes flow past a cylinder (Taylor-Hood P2/P1, dense solve)")
-print(f"  fields={len(off)}  dofs={fem.dofs}  channel/ring mesh = 0.12 / 0.05")
+print(f"  fields={len(off) - 1}  dofs={fem.dofs}  channel/ring mesh = 0.12 / 0.05")  # offsets = [0, n_v, n_v+n_p]
 print(f"  top-bottom symmetry error (should be ~0): {sym:.3e}")
 
 # ---- render the actual computed flow (streamlines squeezing past the obstacle) ----
@@ -94,4 +94,4 @@ ax.set_title("Stokes flow past a cylinder — Taylor-Hood P2/P1 on a refined CSG
 fig.tight_layout()
 fig.savefig(Path(__file__).parents[2] / "assets" / "stokes_flow_around_cylinder.png", dpi=130, bbox_inches="tight")
 
-assert len(off) == 2 and sym < 2e-2, f"Stokes flow not top-bottom symmetric: {sym:.3e}"
+assert len(off) == 3 and sym < 2e-2, f"Stokes flow not top-bottom symmetric: {sym:.3e}"  # [0, n_v, n_v+n_p]
