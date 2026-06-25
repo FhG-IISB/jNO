@@ -12,7 +12,7 @@ with a sinusoidal perturbation,
 
 gives the body force ``f = (0.3 mu s pi^2 sin pi y, 0)``; we impose ``u*`` on the whole boundary
 (outer edges AND the hole) and recover it. The plate stretches in x and the circular hole deforms to
-an ellipse. Solved with a CUSTOM ``lineax`` solver, not the built-in.
+an ellipse. Solved with the built-in matrix-free (Jacobi-preconditioned) default.
 """
 
 import os
@@ -21,11 +21,10 @@ os.environ["MPLBACKEND"] = "Agg"
 
 import jax
 
-jax.config.update("jax_enable_x64", True)  # feax assembly is float64
+jax.config.update("jax_enable_x64", True)  # the assembler builds in float64
 
 from pathlib import Path  # noqa: E402
 
-import lineax  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import matplotlib.tri as mtri  # noqa: E402
 import numpy as np  # noqa: E402
@@ -62,13 +61,12 @@ fem = jno.fem(
     ]
 )
 
-# bring-your-own solver: lineax on the elasticity block
-sol = np.asarray(fem.solve(solve_fn=lambda A, b: lineax.linear_solve(lineax.MatrixLinearOperator(A), b).value))
+sol = np.asarray(fem.solve())  # matrix-free Jacobi-preconditioned BiCGStab default (O(nnz) memory)
 uu = sol.reshape(-1, 2)  # displacement (n_nodes, 2)
 pts = np.asarray(fem.points)
 ref = np.stack([s * (pts[:, 0] + 0.3 * np.sin(PI * pts[:, 1])), -nu * s * pts[:, 1]], 1)
 rel_u = float(np.linalg.norm(uu - ref) / np.linalg.norm(ref))
-print("\nElasticity: plate with a hole under tension (P2, lineax solve)")
+print("\nElasticity: plate with a hole under tension (P2, matrix-free default solve)")
 print(f"  dofs={fem.dofs}  plate/ring mesh = 0.12 / 0.045")
 print(f"  MMS displacement recovery rel-L2: {rel_u:.3e}")
 

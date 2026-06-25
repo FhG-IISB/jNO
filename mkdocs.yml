@@ -166,6 +166,12 @@ nav:
       - Laplacian Eigenmodes (spectral): tutorials/08-fem-and-varpinns/laplacian-eigenmodes-2d.md
       - Transient Heat: tutorials/08-fem-and-varpinns/transient-heat-2d.md
       - Transient via diffrax (custom integrator): tutorials/08-fem-and-varpinns/transient-diffrax-heat-spreader.md
+      - Vibrating Membrane (2D wave, 2nd-order time): tutorials/08-fem-and-varpinns/wave-membrane-2d.md
+      - Ringing Cantilever (elastodynamics + modal): tutorials/08-fem-and-varpinns/elastodynamics-cantilever-2d.md
+      - Conduction + Enclosure Radiation (concentric cylinders): tutorials/08-fem-and-varpinns/enclosure-radiation-concentric-cylinders.md
+      - Heated Box (conduction + convection + radiation): tutorials/08-fem-and-varpinns/oven-convection-radiation-2d.md
+      - Additive Manufacturing (laser thermo-mechanics): tutorials/08-fem-and-varpinns/am-laser-thermomechanics-2d.md
+      - Poroelastic Consolidation (Biot): tutorials/08-fem-and-varpinns/poroelastic-consolidation-2d.md
       - Inverse Diffusivity Field: tutorials/08-fem-and-varpinns/inverse-diffusivity-field.md
       - Inverse Conductivity (L-shape): tutorials/08-fem-and-varpinns/inverse-conductivity-lshape.md
       - Transient Inverse (Rate): tutorials/08-fem-and-varpinns/transient-inverse-heat.md

@@ -34,7 +34,8 @@ k_true = 1.0 + 0.8 * np.exp(
 k = jno.np.parameter(phi, name="k")
 fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
 A_true, b = fem.operator.evaluate({"k": jnp.asarray(k_true)})
-u_obs = jnp.linalg.solve(jnp.asarray(A_true), jnp.asarray(b).reshape(-1))
+A_true = A_true.todense() if hasattr(A_true, "todense") else jnp.asarray(A_true)  # operator is BCOO
+u_obs = jnp.linalg.solve(A_true, jnp.asarray(b).reshape(-1))
 
 # ... then recover k(x) from u_obs through the differentiable solve + an H1 smoothness prior.
 k.dtype(jnp.float64)

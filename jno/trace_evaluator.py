@@ -2016,7 +2016,7 @@ class TraceEvaluator:
 
         Notes
         -----
-        FEAX may provide test_vec = 1 even for vector-valued problems. In that case
+        The assembler may provide test_vec = 1 even for vector-valued problems. In that case
         the test gradient weights are broadcast over the coefficient component axis.
         """
         coeff_vec = jnp.asarray(coeff_vec)
@@ -2081,7 +2081,7 @@ class TraceEvaluator:
             if coeff_dim != dim:
                 raise ValueError(f"Vector grad coeff last dimension {coeff_dim} does not match dim={dim}")
 
-            # FEAX may provide singleton component axis in v_grads_JxW_flat.
+            # the assembler may provide singleton component axis in v_grads_JxW_flat.
             # Broadcast it to the coefficient component count if needed.
             if test_vec != coeff_vec_dim:
                 if test_vec == 1:
@@ -2095,7 +2095,7 @@ class TraceEvaluator:
                         f"grad coeff shape {coeff_vec.shape} incompatible with v_grads_JxW_flat {v_grads_JxW_flat.shape}"
                     )
 
-            # FEAX-style double contraction over component and spatial direction
+            # double contraction over component and spatial direction
             # -> local_q shape (Nq_total, n_loc)
             local_q = jnp.sum(
                 coeff_vec[:, None, :, :] * v_grads_JxW_flat,

@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 """
-Internal FEAX backend utilities.
+Internal FEM assembly utilities.
 
 This module contains low-level helpers shared by the steady FEM route and the
-transient FEAX-time route. It is intentionally not a public API.
+transient semidiscrete-time route. It is intentionally not a public API.
 
 Responsibilities:
-- convert jNO weak-form symbols into FEAX-compatible kernels,
-- build FEAX meshes/problems/Dirichlet BC configs,
-- evaluate symbolic expressions inside FEAX volume/surface kernels,
-- prepare residual/Jacobian runtime objects for time-dependent assembly.
+- lower jNO weak-form symbols into assembly kernels,
+- evaluate symbolic expressions at quadrature points inside volume/surface kernels,
+- normalize Dirichlet data and prepare residual/Jacobian runtime objects.
 """
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import jax.experimental.sparse as jsparse
 import jax.numpy as jnp
 import numpy as np
 from jax.flatten_util import ravel_pytree
@@ -28,6 +28,7 @@ from ...trace import (
     ModelCall,
     OperationCall,
     OperationDef,
+    RegionMask,
     StateField,
     TensorTag,
     TestFunction,
@@ -258,7 +259,7 @@ def _const_bc_fn(value):
 
 def _normalize_dirichlet_value(value, vec: int):
     """
-    Normalize user Dirichlet data into FEAX-compatible value functions.
+    Normalize user Dirichlet data into value functions.
 
     Accepts None, scalar, callable, component list/tuple, or component dict.
     Returns one callable for scalar fields, a length-``vec`` list of callables for
@@ -409,7 +410,7 @@ def _infer_trial_metadata(expr) -> Dict[str, Any]:
     unique_trials = list(trial_nodes.values())
     if len(unique_trials) > 1:
         raise NotImplementedError(
-            "FEAX backend currently supports exactly one TrialFunction "
+            "The FEM assembler currently supports exactly one TrialFunction "
             "(scalar or vector valued). Multiple coupled FEM unknowns will "
             "come in the next refactor step."
         )
@@ -432,7 +433,7 @@ def _infer_fields(expr) -> Tuple[List[Dict[str, Any]], Dict[Any, int]]:
     A field is one coupled unknown (one ``fem_symbols()`` call — its trial and test
     share a ``field_key``). Returns ``(fields, field_key->index)`` where each field is
     ``{field_key, value_shape, vec, order}``. The index order is the single source of
-    truth threaded into the feax ``Problem`` lists and the multi-field kernel.
+    truth threaded into the per-field DOF blocks and the multi-field kernel.
     """
     fields: List[Dict[str, Any]] = []
     seen: Dict[Any, int] = {}
@@ -510,7 +511,7 @@ def _expand_product_terms(node, sign: float = 1.0):
     return [(sign, node)]
 
 
-def _collect_runtime_parameter_tags_for_feax(node, out=None):
+def _gather_runtime_parameter_tags(node, out=None):
     """Collect names of trainable runtime parameters (ModelCall) used in a coeff."""
     from .parametric_helpers import _is_runtime_scalar_parameter, _parameter_name
 
@@ -522,16 +523,67 @@ def _collect_runtime_parameter_tags_for_feax(node, out=None):
             out.append(name)
         return out
     for child in iter_children(node) or ():
-        _collect_runtime_parameter_tags_for_feax(child, out)
+        _gather_runtime_parameter_tags(child, out)
     return out
 
 
-def _collect_temporal_tags_for_feax(node, out=None):
-    """
-    Collect temporal Variable tags used inside FEAX kernels.
+def _collect_region_mask_names(node, out=None):
+    """Sorted-unique region names appearing as ``RegionMask`` leaves in a lowered expression/IR.
 
-    These tags determine which time values must be passed through FEAX
-    InternalVars during transient assembly.
+    Used so the volume kernel knows the per-cell mask layout and the assembler builds the matching
+    masks (see ``_cell_region_mask``). Order is fixed by sorting so kernel and assembler agree."""
+    if out is None:
+        out = set()
+    if isinstance(node, RegionMask):
+        out.add(node.region)
+    for child in iter_children(node) or ():
+        _collect_region_mask_names(child, out)
+    return out
+
+
+def _cell_region_mask(domain, region):
+    """``(num_cells,)`` 0/1 indicator: a mesh cell is in ``region`` iff its **centroid** is.
+
+    ``region`` is a geometry part (``domain._source_regions`` shapely polygon) or a ``domain.tag``
+    predicate. Concrete (numpy/shapely), built once per assembly -- exact when the mesh respects the
+    region boundaries (gmsh meshes each part separately, so no cell straddles a material interface).
+
+    Classifies against the **assembly mesh** (the cell order the kernel vmaps over, stashed by
+    ``_build_fem_problem``) so the per-cell mask aligns with the kernel's cells; falls back to the
+    domain mesh only if no assembly mesh is recorded yet."""
+    dim = int(domain.dimension)
+    a_pts = getattr(domain, "_fem_assembly_points", None)
+    a_cells = getattr(domain, "_fem_assembly_cells", None)
+    if a_pts is not None and a_cells is not None:
+        pts = np.asarray(a_pts)[:, :dim]
+        cells = np.asarray(a_cells)
+    else:
+        mesh = domain.mesh
+        pts = np.asarray(mesh.points)[:, :dim]
+        cells = np.asarray(mesh.cells_dict["triangle" if dim == 2 else "tetra"])
+    centroids = pts[cells].mean(axis=1)  # (num_cells, dim)
+    src = getattr(domain, "_source_regions", {}) or {}
+    preds = getattr(domain, "_tag_predicates", {}) or {}
+    if region in src:
+        from shapely import contains_xy
+
+        m = np.asarray(contains_xy(src[region], centroids[:, 0], centroids[:, 1]))
+    elif region in preds:
+        m = np.asarray(preds[region](*[centroids[:, i] for i in range(dim)]))
+    else:
+        raise ValueError(
+            f"jno.fem per-region integration: unknown region {region!r}. Define it with "
+            f"domain.tag(name, predicate) or as a geometry part (domain._source_regions)."
+        )
+    return np.asarray(m, dtype=bool).astype(np.float64)
+
+
+def _gather_temporal_tags(node, out=None):
+    """
+    Collect temporal Variable tags used inside the kernels.
+
+    These tags determine which time values must be passed through the
+    batched volume-variable arrays during transient assembly.
     """
     if out is None:
         out = set()
@@ -541,8 +593,8 @@ def _collect_temporal_tags_for_feax(node, out=None):
         return out
 
     if isinstance(node, BinaryOp):
-        _collect_temporal_tags_for_feax(node.left, out)
-        _collect_temporal_tags_for_feax(node.right, out)
+        _gather_temporal_tags(node.left, out)
+        _gather_temporal_tags(node.right, out)
         return out
 
     if isinstance(node, FunctionCall):
@@ -567,11 +619,11 @@ def _collect_temporal_tags_for_feax(node, out=None):
                     StateField,
                 ),
             ):
-                _collect_temporal_tags_for_feax(a, out)
+                _gather_temporal_tags(a, out)
         return out
 
     if isinstance(node, Jacobian):
-        _collect_temporal_tags_for_feax(node.target, out)
+        _gather_temporal_tags(node.target, out)
         for v in node.variables:
             if isinstance(
                 v,
@@ -593,11 +645,11 @@ def _collect_temporal_tags_for_feax(node, out=None):
                     StateField,
                 ),
             ):
-                _collect_temporal_tags_for_feax(v, out)
+                _gather_temporal_tags(v, out)
         return out
 
     if isinstance(node, Hessian):
-        _collect_temporal_tags_for_feax(node.target, out)
+        _gather_temporal_tags(node.target, out)
         for v in node.variables:
             if isinstance(
                 v,
@@ -619,7 +671,7 @@ def _collect_temporal_tags_for_feax(node, out=None):
                     StateField,
                 ),
             ):
-                _collect_temporal_tags_for_feax(v, out)
+                _gather_temporal_tags(v, out)
         return out
 
     return out
@@ -644,10 +696,10 @@ def _runtime_parameter_value_from_internal_vars(local, name):
     # Scalar coefficient (incl. per-cell-constant): one value -> broadcast to quad.
     if flat.shape[0] == 1:
         return flat[0]
-    # Node-based field coefficient: feax has gathered the cell's local nodal values
+    # Node-based field coefficient: the kernel has gathered the cell's local nodal values
     # (size = nodes-per-element); interpolate to quadrature points with the field's
-    # shape functions, mirroring the solution interpolation (cf. feax interpolate_var:
-    # shape_vals . nodal). Returns (n_quad, 1) like a field value.
+    # shape functions, mirroring the solution interpolation (shape_vals . nodal).
+    # Returns (n_quad, 1) like a field value.
     shape_vals = local.get("shape_vals")  # (n_quad, n_local)
     cell_nodal = flat.reshape(flat.shape[0], 1)  # (n_local, 1)
     return jnp.sum(shape_vals[:, :, None] * cell_nodal[None, :, :], axis=1)
@@ -655,10 +707,10 @@ def _runtime_parameter_value_from_internal_vars(local, name):
 
 def _temporal_value_from_internal_vars(local, tag, dim_start=0, dim_end=1):
     """
-    Read a temporal variable value from FEAX InternalVars.
+    Read a temporal variable value from the batched volume-variable arrays.
 
     Returns None when the requested temporal tag is not part of the current
-    FEAX kernel call.
+    kernel call.
     """
     temporal_tags = local.get("temporal_tags", ())
     volume_vars = local.get("volume_vars", ())
@@ -669,8 +721,7 @@ def _temporal_value_from_internal_vars(local, tag, dim_start=0, dim_end=1):
     idx = temporal_tags.index(tag)
     if idx >= len(volume_vars):
         raise IndexError(
-            f"Temporal FEAX variable tag '{tag}' mapped to slot {idx}, "
-            f"but only {len(volume_vars)} volume_vars were provided."
+            f"Temporal variable tag '{tag}' mapped to slot {idx}, but only {len(volume_vars)} volume_vars were provided."
         )
 
     arr = jnp.asarray(volume_vars[idx])
@@ -681,14 +732,14 @@ def _temporal_value_from_internal_vars(local, tag, dim_start=0, dim_end=1):
 
 
 # --------------------------------
-# FEAX expression evaluation helpers
+# Expression evaluation helpers
 # --------------------------------
 
 
 def _prefix_align(a, b):
     """Broadcast-align two kernel quantities for an elementwise op.
 
-    In the FEAX kernel, trial-derived quantities are laid out as ``(n_quad,
+    In the kernel, trial-derived quantities are laid out as ``(n_quad,
     *value)`` while test-derived ones carry extra leading test-DOF axes
     ``(n_quad, *dof, *value)`` (the per-DOF basis expansion). Their shared axis
     is the leading quadrature axis and their value axes are trailing, so when the
@@ -744,15 +795,62 @@ def _field_space(local, node):
     return fields[local["field_index"][key]].get("space", "Lagrange")
 
 
-def _eval_expr_for_feax(domain, node, local):
+def _eval_frozen_coefficient(domain, model, local):
+    """Value of a ``.freeze()``d (known) coefficient at the kernel's quadrature points.
+
+    The known value is supplied via ``.initialize`` and read here at assembly time:
+
+    * a **coordinate function** ``(x, y[, z]) -> value`` (``.initialize(lambda x, y: ...)``) is called
+      on the physical quadrature coordinates — identical to ``jno.fn`` — and may return a scalar or a
+      vector (tuple / last-axis array) field;
+    * a **scalar constant** (``.initialize(0.8)``) is returned as-is.
+
+    A raw per-node value array is *not* supported (turning scattered nodal data into a coefficient
+    needs mesh interpolation — use ``jno.fn`` or a function instead); a frozen parameter with no value
+    fails loud."""
+    fn = getattr(model, "_initializer_fn", None)
+    if fn is not None:  # coordinate function, evaluated at the quad points (like jno.fn)
+        import inspect
+
+        try:
+            params = set(inspect.signature(fn).parameters)
+        except (TypeError, ValueError):
+            params = set()
+        if {"key", "shape"} & params:  # a JAX initializer (key, shape, dtype), not a coordinate fn
+            raise ValueError(
+                "jno.fem: a frozen (.freeze()d) coefficient takes a *scalar* or a coordinate function "
+                "(x, y[, z]) -> value — not a JAX initializer. For a uniform value use .initialize(<number>); "
+                "JAX initializers (jax.nn.initializers.*) are for *trainable* parameters."
+            )
+        qp = local["physical_quad_points"]
+        dim = int(getattr(domain, "dimension", qp.shape[-1]))
+        return jnp.asarray(fn(*(qp[..., i] for i in range(dim))))
+
+    weight = getattr(model, "_weight_tree", None)
+    if weight is not None:
+        arr = jnp.asarray(weight)
+        if arr.ndim == 0:  # scalar constant
+            return arr
+        raise NotImplementedError(
+            "jno.fem: a frozen (.freeze()d) coefficient must be a constant or a (x, y[, z]) -> value "
+            "function — a raw per-node array is not supported (use jno.fn(...) or a function)."
+        )
+
+    raise ValueError(
+        f"jno.fem: frozen parameter {getattr(model, '_parameter_name', '<param>')!r} has no value — "
+        "call .initialize(<scalar or (x, y[, z]) -> value function>) before .freeze()."
+    )
+
+
+def _eval_integrand(domain, node, local):
     """
-    Evaluate a jNO symbolic expression inside a FEAX local kernel.
+    Evaluate a jNO symbolic expression inside a local kernel.
 
     The `local` dictionary contains quadrature coordinates, shape values,
-    shape gradients, local cell DOFs, domain context, and optional temporal
-    InternalVars. This evaluator supports literals, constants, variables,
-    tensor tags, TrialFunction/TestFunction values, their Jacobians, binary
-    operations, and FunctionCall nodes.
+    shape gradients, local cell DOFs, domain context, and the optional batched
+    temporal volume-variable arrays. This evaluator supports literals, constants,
+    variables, tensor tags, TrialFunction/TestFunction values, their Jacobians,
+    binary operations, and FunctionCall nodes.
     """
     if not isinstance(
         node,
@@ -760,6 +858,7 @@ def _eval_expr_for_feax(domain, node, local):
             Literal,
             Constant,
             TensorTag,
+            RegionMask,
             Variable,
             TestFunction,
             TrialFunction,
@@ -780,6 +879,25 @@ def _eval_expr_for_feax(domain, node, local):
     if isinstance(node, Constant):
         return jnp.asarray(node.value)
 
+    if isinstance(node, RegionMask):
+        # Per-cell sub-region indicator: read the current cell's 0/1 value from the constant per-cell
+        # volume_var packed AFTER the temporal + runtime-parameter slots. Fail loud (never silently
+        # integrate over the whole domain) if this assembly path did not thread the mask.
+        mask_names = local.get("region_mask_names", ())
+        volume_vars = local.get("volume_vars", ())
+        idx = (
+            len(local.get("temporal_tags", ()))
+            + len(local.get("runtime_parameter_tags", ()))
+            + (list(mask_names).index(node.region) if node.region in mask_names else -1)
+        )
+        if node.region not in mask_names or idx >= len(volume_vars):
+            raise NotImplementedError(
+                f"jno.fem per-region integration: the per-cell mask for region '{node.region}' was not "
+                f"threaded into this assembly path. Sub-region terms are currently wired for the steady "
+                f"linear single-field path; nonlinear / transient / multifield / parametric are not yet."
+            )
+        return jnp.reshape(jnp.asarray(volume_vars[idx]), (-1,))[0]
+
     if isinstance(node, TensorTag):
         if node.tag not in local["domain_context"]:
             raise KeyError(f"TensorTag '{node.tag}' not found in FEM domain context.")
@@ -788,7 +906,7 @@ def _eval_expr_for_feax(domain, node, local):
             tensor = tensor[0]
         elif tensor.ndim >= 1 and tensor.shape[0] > 1:
             raise NotImplementedError(
-                "FEAX backend currently supports singleton-batch TensorTag coefficients only. "
+                "The FEM assembler currently supports singleton-batch TensorTag coefficients only. "
                 f"Got shape {tensor.shape} for tag '{node.tag}'."
             )
         if node.dim_index is not None and tensor.ndim >= 1:
@@ -798,7 +916,7 @@ def _eval_expr_for_feax(domain, node, local):
     if isinstance(node, Variable):
         dim_start, dim_end = node.dim
 
-        # FEAX local quadrature coordinates
+        # Local quadrature coordinates
         if local.get("surface", False):
             if isinstance(node.tag, str) and node.tag.startswith("gauss_"):
                 return local["physical_quad_points"][..., dim_start:dim_end]
@@ -806,9 +924,9 @@ def _eval_expr_for_feax(domain, node, local):
             if node.tag == "fem_gauss":
                 return local["physical_quad_points"][..., dim_start:dim_end]
 
-        # Temporal variable in FEAX assembly:
-        # prefer FEAX InternalVars volume_vars (pure JAX / no domain mutation),
-        # then fall back to domain.context for older steady / legacy paths.
+        # Temporal variable in assembly:
+        # prefer the batched volume_vars arrays (pure JAX / no domain mutation),
+        # then fall back to domain.context for the steady-context path.
         if getattr(node, "axis", None) == "temporal":
             from_iv = _temporal_value_from_internal_vars(
                 local,
@@ -820,7 +938,7 @@ def _eval_expr_for_feax(domain, node, local):
                 return from_iv
 
             if node.tag not in local["domain_context"]:
-                raise KeyError(f"Temporal Variable tag '{node.tag}' not found in FEAX local/domain context.")
+                raise KeyError(f"Temporal Variable tag '{node.tag}' not found in local/domain context.")
             arr = jnp.asarray(local["domain_context"][node.tag])
             t_scalar = jnp.reshape(arr, (-1,))[0]
             out = jnp.asarray([t_scalar])
@@ -833,7 +951,7 @@ def _eval_expr_for_feax(domain, node, local):
                 arr = arr[0]
             return arr[..., dim_start:dim_end]
 
-        raise KeyError(f"Variable tag '{node.tag}' not found in FEAX local/domain context.")
+        raise KeyError(f"Variable tag '{node.tag}' not found in local/domain context.")
 
     if isinstance(node, TestFunction):
         shape_vals, _, _ = _field_data(local, node)
@@ -862,7 +980,7 @@ def _eval_expr_for_feax(domain, node, local):
         for var in node.variables:
             if not isinstance(var, Variable):
                 raise NotImplementedError(
-                    "FEAX backend expects Jacobian variables to be domain.variable(...) placeholders."
+                    "The FEM assembler expects Jacobian variables to be domain.variable(...) placeholders."
                 )
             dims.append(var.dim[0])
         if len(dims) == 0:
@@ -922,11 +1040,11 @@ def _eval_expr_for_feax(domain, node, local):
                     return g  # per-DOF directional derivative of the component
                 return jnp.einsum("qn...,n->q...", g, cell_sol)  # contract the trial DOFs
 
-        raise NotImplementedError("FEAX backend supports gradients of TrialFunction/TestFunction only.")
+        raise NotImplementedError("The FEM assembler supports gradients of TrialFunction/TestFunction only.")
 
     if isinstance(node, BinaryOp):
-        a = _eval_expr_for_feax(domain, node.left, local)
-        b = _eval_expr_for_feax(domain, node.right, local)
+        a = _eval_integrand(domain, node.left, local)
+        b = _eval_integrand(domain, node.right, local)
         a, b = _prefix_align(a, b)
         if node.op == "+":
             return a + b
@@ -941,31 +1059,36 @@ def _eval_expr_for_feax(domain, node, local):
         raise NotImplementedError(f"Unsupported binary operator: {node.op}")
 
     if isinstance(node, ModelCall):
-        from .parametric_helpers import _is_runtime_scalar_parameter, _parameter_name
+        from .parametric_helpers import _is_frozen_parameter, _is_runtime_scalar_parameter, _parameter_name
 
+        if _is_frozen_parameter(node):
+            # A .freeze()d (known) coefficient: evaluate its constant / coordinate function at the
+            # quadrature points -- exactly like jno.fn -- so it needs no runtime-parameter threading
+            # and works in every assembly path (steady/transient/nonlinear/coupled).
+            return _eval_frozen_coefficient(domain, node.model, local)
         if _is_runtime_scalar_parameter(node):
             name = _parameter_name(node)
             val = _runtime_parameter_value_from_internal_vars(local, name)
             if val is None:
                 raise KeyError(
-                    f"Runtime parameter '{name}' not supplied to the FEAX kernel. "
+                    f"Runtime parameter '{name}' not supplied to the kernel. "
                     "Ensure it was registered in runtime_parameter_tags and packed "
                     "into InternalVars.volume_vars."
                 )
             return val
         # Non-parameter ModelCall (e.g. a neural coefficient) -> not handled here.
-        raise NotImplementedError("FEAX kernel cannot evaluate non-parameter ModelCall coefficients yet.")
+        raise NotImplementedError("the kernel cannot evaluate non-parameter ModelCall coefficients yet.")
 
     if isinstance(node, FunctionCall):
-        args = [_eval_expr_for_feax(domain, arg, local) for arg in node.args]
+        args = [_eval_integrand(domain, arg, local) for arg in node.args]
         kwargs = node.kwargs if node.kwargs else {}
         return node.fn(*args, **kwargs)
 
-    raise NotImplementedError(f"Unsupported weak-form node for FEAX backend: {type(node).__name__}")
+    raise NotImplementedError(f"Unsupported weak-form node for the FEM assembler: {type(node).__name__}")
 
 
 # --------------------------------
-# FEAX kernel builders
+# Kernel builders
 # --------------------------------
 
 
@@ -980,13 +1103,14 @@ def _eval_volume_integrand(
     cell_v_grads_JxW,
     temporal_tags,
     runtime_parameter_tags,
+    region_mask_names,
     problem_ref,
     *cell_internal_vars,
 ):
     """
-    Evaluate and integrate one volume weak-form expression on one FEAX cell.
+    Evaluate and integrate one volume weak-form expression on one cell.
 
-    Returns the flattened cell residual contribution expected by FEAX.
+    Returns the flattened cell residual contribution the assembler expects.
     """
     num_nodes = cell_shape_grads.shape[1]
     vec = _value_shape_num_components(value_shape)
@@ -994,7 +1118,7 @@ def _eval_volume_integrand(
 
     problem = problem_ref["problem"]
     if problem is None:
-        raise RuntimeError("FEAX problem_ref['problem'] was not initialized before kernel evaluation.")
+        raise RuntimeError("The assembly problem_ref['problem'] was not initialized before kernel evaluation.")
 
     shape_vals = problem.fes[0].shape_vals
     local = {
@@ -1009,10 +1133,11 @@ def _eval_volume_integrand(
         "trial_vec": vec,
         "temporal_tags": tuple(temporal_tags),
         "runtime_parameter_tags": tuple(runtime_parameter_tags),
+        "region_mask_names": tuple(region_mask_names),
         "volume_vars": tuple(cell_internal_vars),
     }
 
-    val = _eval_expr_for_feax(domain, expr, local)
+    val = _eval_integrand(domain, expr, local)
     weights = cell_JxW[0]
     wshape = (weights.shape[0],) + (1,) * (val.ndim - 1)
     weighted = val * weights.reshape(wshape)
@@ -1055,9 +1180,9 @@ def _eval_surface_integrand(
     *cell_internal_vars_surface,
 ):
     """
-    Evaluate and integrate one boundary weak-form expression on one FEAX face.
+    Evaluate and integrate one boundary weak-form expression on one face.
 
-    Returns the flattened surface residual contribution expected by FEAX.
+    Returns the flattened surface residual contribution the assembler expects.
     """
     vec = _value_shape_num_components(value_shape)
 
@@ -1133,15 +1258,17 @@ def _eval_surface_integrand(
         "runtime_parameter_tags": tuple(runtime_parameter_tags),
     }
 
-    val = _eval_expr_for_feax(domain, expr, local)
+    val = _eval_integrand(domain, expr, local)
     wshape = (weights.shape[0],) + (1,) * (val.ndim - 1)
     weighted = val * weights.reshape(wshape)
     return ravel_pytree(jnp.sum(weighted, axis=0))[0]
 
 
-def _make_universal_volume_kernel(domain, expr, value_shape, temporal_tags, runtime_parameter_tags, problem_ref):
+def _make_universal_volume_kernel(
+    domain, expr, value_shape, temporal_tags, runtime_parameter_tags, region_mask_names, problem_ref
+):
     """
-    Create the FEAX universal volume kernel for a lowered weak-form expression.
+    Create the universal volume kernel for a lowered weak-form expression.
     """
 
     def kernel(
@@ -1163,6 +1290,7 @@ def _make_universal_volume_kernel(domain, expr, value_shape, temporal_tags, runt
             cell_v_grads_JxW,
             temporal_tags,
             runtime_parameter_tags,
+            region_mask_names,
             problem_ref,
             *cell_internal_vars,
         )
@@ -1177,6 +1305,7 @@ def _eval_multifield_volume_integrand(
     field_index,
     temporal_tags,
     runtime_parameter_tags,
+    region_mask_names,
     problem_ref,
     cell_sol_flat,
     physical_quad_points,
@@ -1189,12 +1318,12 @@ def _eval_multifield_volume_integrand(
 
     Splits the cell DOFs per field (``unflatten_fn_dof``), evaluates each additive
     term ``(coeff, test_field_index)`` with per-field shape data (reusing
-    ``_eval_expr_for_feax``), and accumulates into its test field's residual slot.
+    ``_eval_integrand``), and accumulates into its test field's residual slot.
     ``ravel_pytree`` concatenates the per-field residuals in field order (matching
-    ``unflatten_fn_dof``) so feax autodiffs the full block matrix."""
+    ``unflatten_fn_dof``) so the assembler autodiffs the full block matrix."""
     problem = problem_ref["problem"]
     if problem is None:
-        raise RuntimeError("FEAX problem_ref['problem'] was not initialized before kernel evaluation.")
+        raise RuntimeError("The assembly problem_ref['problem'] was not initialized before kernel evaluation.")
 
     cell_sol_list = problem.unflatten_fn_dof(cell_sol_flat)
     nfields = len(fields)
@@ -1219,12 +1348,13 @@ def _eval_multifield_volume_integrand(
         "domain_context": domain.context,
         "temporal_tags": tuple(temporal_tags),
         "runtime_parameter_tags": tuple(runtime_parameter_tags),
+        "region_mask_names": tuple(region_mask_names),
         "volume_vars": tuple(cell_internal_vars),
     }
 
     residuals = [jnp.zeros((nnodes[i] * int(fields[i]["vec"]),), dtype=cell_sol_flat.dtype) for i in range(nfields)]
     for coeff, test_idx in term_list:
-        val = _eval_expr_for_feax(domain, coeff, local)
+        val = _eval_integrand(domain, coeff, local)
         weights = cell_JxW[test_idx]
         wshape = (weights.shape[0],) + (1,) * (val.ndim - 1)
         contrib = ravel_pytree(jnp.sum(val * weights.reshape(wshape), axis=0))[0]
@@ -1233,9 +1363,9 @@ def _eval_multifield_volume_integrand(
 
 
 def _make_multifield_volume_kernel(
-    domain, term_list, fields, field_index, temporal_tags, runtime_parameter_tags, problem_ref
+    domain, term_list, fields, field_index, temporal_tags, runtime_parameter_tags, region_mask_names, problem_ref
 ):
-    """FEAX universal volume kernel for a coupled (multi-field) weak form."""
+    """Universal volume kernel for a coupled (multi-field) weak form."""
 
     def kernel(cell_sol_flat, physical_quad_points, cell_shape_grads, cell_JxW, cell_v_grads_JxW, *cell_internal_vars):
         return _eval_multifield_volume_integrand(
@@ -1245,6 +1375,7 @@ def _make_multifield_volume_kernel(
             field_index,
             temporal_tags,
             runtime_parameter_tags,
+            region_mask_names,
             problem_ref,
             cell_sol_flat,
             physical_quad_points,
@@ -1275,16 +1406,16 @@ def _eval_multifield_surface_integrand(
 ):
     """Evaluate all coupled boundary terms on one face -> flat block-local residual.
 
-    The surface analogue of :func:`_eval_multifield_volume_integrand`. feax passes the
+    The surface analogue of :func:`_eval_multifield_volume_integrand`. The kernel receives the
     full multi-field parent-cell DOFs and the per-field face shape data concatenated
     along the node axis (assembler concatenates in ``problem.fes`` order, identical to
     the volume ``shape_grads``), so we split DOFs with ``unflatten_fn_dof`` and slice the
     face shape arrays per field. Each term ``(coeff, test_field_index)`` accumulates into
-    its test field's residual slot; ``ravel_pytree`` concatenates in field order so feax
+    its test field's residual slot; ``ravel_pytree`` concatenates in field order so the assembler
     autodiffs the surface contribution into the right block(s) of the load and matrix."""
     problem = problem_ref["problem"]
     if problem is None:
-        raise RuntimeError("FEAX problem_ref['problem'] was not initialized before kernel evaluation.")
+        raise RuntimeError("The assembly problem_ref['problem'] was not initialized before kernel evaluation.")
 
     cell_sol_list = problem.unflatten_fn_dof(cell_sol_flat)
     nfields = len(fields)
@@ -1318,7 +1449,7 @@ def _eval_multifield_surface_integrand(
 
     residuals = [jnp.zeros((nnodes[i] * int(fields[i]["vec"]),), dtype=cell_sol_flat.dtype) for i in range(nfields)]
     for coeff, test_idx in term_list:
-        val = _eval_expr_for_feax(domain, coeff, local)
+        val = _eval_integrand(domain, coeff, local)
         wshape = (weights.shape[0],) + (1,) * (val.ndim - 1)
         contrib = ravel_pytree(jnp.sum(val * weights.reshape(wshape), axis=0))[0]
         residuals[test_idx] = residuals[test_idx] + contrib
@@ -1328,7 +1459,7 @@ def _eval_multifield_surface_integrand(
 def _make_multifield_surface_kernel(
     domain, term_list, fields, field_index, tag, temporal_tags, runtime_parameter_tags, problem_ref
 ):
-    """FEAX universal surface kernel for the coupled boundary terms on one tag."""
+    """Universal surface kernel for the coupled boundary terms on one tag."""
 
     def kernel(
         cell_sol_flat,
@@ -1386,7 +1517,7 @@ def _make_universal_surface_kernel(domain, expr, tag, value_shape, runtime_param
 
 
 # --------------------------------
-# FEAX problem assembly
+# Problem assembly
 # --------------------------------
 
 
@@ -1408,10 +1539,10 @@ def _meshio_type_for_element(element_type: str) -> str:
 
 
 # Quadratic (P2) meshio cell type -> (linear source type, per-element edge node list
-# in meshio ordering). feax has no P2 mesh source and jno's domain machinery assumes
-# linear cells, so the domain mesh stays linear (P1) and we promote *only* the feax
-# assembly mesh here: insert edge-midpoint nodes, vertices preserved (so a P1 field on
-# a P2 problem -- e.g. Taylor-Hood pressure -- is just the vertex block).
+# in meshio ordering). jno's domain machinery assumes linear cells, so the domain mesh
+# stays linear (P1) and we promote *only* the assembly mesh here: insert edge-midpoint
+# nodes, vertices preserved (so a P1 field on a P2 problem -- e.g. Taylor-Hood pressure
+# -- is just the vertex block).
 _P2_FROM_P1 = {
     "triangle6": ("triangle", [(0, 1), (1, 2), (2, 0)]),
     "tetra10": ("tetra", [(0, 1), (1, 2), (2, 0), (0, 3), (1, 3), (2, 3)]),
@@ -1449,239 +1580,10 @@ def _promote_to_quadratic(points, cells_p1, edge_local):
     return pts, cells_p2
 
 
-def _build_feax_mesh(domain, element_type: str):
-    import feax as fe
-
-    meshio_type = _meshio_type_for_element(element_type)
-    dim = domain.dimension
-    cells_dict = domain.mesh.cells_dict
-    if meshio_type in cells_dict:
-        points = np.asarray(domain.mesh.points)[:, :dim]
-        cells = np.asarray(cells_dict[meshio_type])
-    elif meshio_type in _P2_FROM_P1:  # promote the (linear) domain mesh for assembly only
-        p1_type, edge_local = _P2_FROM_P1[meshio_type]
-        if p1_type not in cells_dict:
-            raise ValueError(f"Cannot build '{element_type}': no '{p1_type}' cells to promote to '{meshio_type}'.")
-        points, cells = _promote_to_quadratic(np.asarray(domain.mesh.points)[:, :dim], cells_dict[p1_type], edge_local)
-    else:
-        raise KeyError(f"No mesh cells of type '{meshio_type}' for element '{element_type}'.")
-    return fe.Mesh(jnp.asarray(points), jnp.asarray(cells, dtype=jnp.int32), ele_type=element_type)
-
-
-def _make_feax_dirichlet_specs(domain, vec: int):
-    import feax as fe
-
-    specs = []
-    tags = list(getattr(domain, "_fem_dirichlet_tags", []))
-    value_fns = getattr(domain, "_fem_dirichlet_value_fns", {}) or {}
-
-    component_names = {0: "x", 1: "y", 2: "z"}
-
-    for tag in tags:
-        loc_fn = domain._make_tag_location_fn(tag)
-        if loc_fn is None:
-            domain.log.warning(f"Dirichlet tag '{tag}' not found in mesh tags. Skipping.")
-            continue
-
-        normalized = _normalize_dirichlet_value(value_fns.get(tag, 0.0), vec)
-        if vec == 1:
-            fn = normalized if callable(normalized) else _const_bc_fn(normalized)
-            specs.append(fe.DirichletBCSpec(location=loc_fn, component="all", value=fn))
-            continue
-
-        if callable(normalized):
-            specs.append(fe.DirichletBCSpec(location=loc_fn, component="all", value=normalized))
-            continue
-
-        if isinstance(normalized, dict):
-            # Partial / per-component (roller) BC: one spec per named component only.
-            for comp, fn in normalized.items():
-                specs.append(fe.DirichletBCSpec(location=loc_fn, component=component_names.get(comp, comp), value=fn))
-            continue
-
-        if isinstance(normalized, (list, tuple)):
-            for comp, fn in enumerate(normalized):
-                specs.append(
-                    fe.DirichletBCSpec(
-                        location=loc_fn,
-                        component=component_names.get(comp, comp),
-                        value=fn,
-                    )
-                )
-            continue
-
-        raise TypeError(f"Unsupported normalized Dirichlet value type for tag '{tag}': {type(normalized).__name__}")
-
-    return specs
-
-
-_ELEMENT_FOR_ORDER = {(2, 1): "TRI3", (2, 2): "TRI6", (3, 1): "TET4", (3, 2): "TET10"}
-
-
-def _element_for_order(dimension: int, order: int) -> str:
-    """Simplex element type for a coupled field's ``(dimension, order)``."""
-    et = _ELEMENT_FOR_ORDER.get((int(dimension), int(order)))
-    if et is None:
-        raise ValueError(
-            f"jno.fem: no element for dimension {dimension}, order {order} (coupled fields support order 1, 2)."
-        )
-    return et
-
-
-def _make_multifield_dirichlet_specs(domain, fields, field_index):
-    """Per-field Dirichlet specs (with ``variable_index``) for a coupled problem.
-
-    Reads ``domain._fem_dirichlet_by_field`` = ``{field_index: {region: value}}`` and
-    mirrors ``_make_feax_dirichlet_specs`` per field, tagging each spec with its
-    ``variable_index`` so feax constrains the right block."""
-    import feax as fe
-
-    component_names = {0: "x", 1: "y", 2: "z"}
-    by_field = getattr(domain, "_fem_dirichlet_by_field", {}) or {}
-    specs = []
-    for fidx, region_values in by_field.items():
-        vec = int(fields[fidx]["vec"])
-        for tag, value in region_values.items():
-            loc_fn = domain._make_tag_location_fn(tag)
-            if loc_fn is None:
-                domain.log.warning(f"Dirichlet tag '{tag}' not found in mesh tags. Skipping.")
-                continue
-            normalized = _normalize_dirichlet_value(value, vec)
-            if vec == 1:
-                fn = normalized if callable(normalized) else _const_bc_fn(normalized)
-                specs.append(fe.DirichletBCSpec(location=loc_fn, component="all", value=fn, variable_index=fidx))
-            elif callable(normalized):
-                specs.append(fe.DirichletBCSpec(location=loc_fn, component="all", value=normalized, variable_index=fidx))
-            elif isinstance(normalized, dict):
-                for comp, fn in normalized.items():
-                    specs.append(
-                        fe.DirichletBCSpec(
-                            location=loc_fn, component=component_names.get(comp, comp), value=fn, variable_index=fidx
-                        )
-                    )
-            elif isinstance(normalized, (list, tuple)):
-                for comp, fn in enumerate(normalized):
-                    specs.append(
-                        fe.DirichletBCSpec(
-                            location=loc_fn, component=component_names.get(comp, comp), value=fn, variable_index=fidx
-                        )
-                    )
-    return specs
-
-
-def _build_multifield_feax_problem(domain, ir, fields, field_index, *, apply_dirichlet, store_on_domain):
-    """Build a multi-variable FEAX Problem + block Dirichlet BC for coupled fields.
-
-    Each field gets its own mesh/vec/element; one universal kernel groups the weak
-    terms by their test field. feax autodiffs this into the block matrix downstream
-    (``_assemble_fem_system_concrete`` is unchanged)."""
-    import feax as fe
-
-    dim = domain.dimension
-    quad_degree = getattr(domain, "_fem_quad_degree", None) or 2
-    eles = [_element_for_order(dim, f["order"]) for f in fields]
-    meshes = [_build_feax_mesh(domain, et) for et in eles]
-    vecs = [int(f["vec"]) for f in fields]
-
-    def _typed_term(t):
-        """Lower one IR weak term to a list of ``(coeff, test_field_index)`` for the block kernel.
-
-        Normally a term maps to exactly one test field (one entry). A term that welds
-        several test fields inside a product — the real part of a complex weak form, e.g.
-        ``c·(u_r·p_r − u_i·q_i)`` — is distributed into single-test sub-terms as a fallback,
-        so the user can author one complex form and let it lower onto the coupled blocks."""
-        coeff = _lower_statefield_to_trial(t.coeff, {})
-        tfi = _test_field_index(coeff, field_index)
-        if tfi is not None:
-            return [(coeff, tfi)]
-        # Fallback: distribute products over sums, then re-classify each sub-term.
-        expanded = _expand_product_terms(coeff)
-        if len(expanded) > 1:
-            split = []
-            for s, sub in expanded:
-                sub_signed = sub if s >= 0 else BinaryOp("*", Literal(-1.0), sub)
-                sfi = _test_field_index(sub_signed, field_index)
-                if sfi is None:
-                    split = None
-                    break
-                split.append((sub_signed, sfi))
-            if split is not None:
-                return split
-        raise ValueError(
-            "jno.fem: each coupled weak term must contain exactly one test field "
-            "(it determines the equation block); got a term with zero or several."
-        )
-
-    term_list = []
-    boundary_terms_by_tag: dict[str, list] = {}
-    for t in ir.terms:
-        if t.channel != "raw":
-            continue
-        if t.support == "volume":
-            term_list.extend(_typed_term(t))
-        elif t.support == "boundary":
-            boundary_terms_by_tag.setdefault(t.region_id, []).extend(_typed_term(t))
-
-    # Temporal tags (and runtime parameters) used by the coupled coefficients, so a
-    # t-dependent coefficient (e.g. a body force e^{-t}, a source f(x,t)) is evaluated at
-    # the runtime time via feax InternalVars rather than baked at a fixed t.
-    temporal_tags: set = set()
-    runtime_parameter_tags: list = []
-    for _coeff, _tfi in term_list + [t for terms in boundary_terms_by_tag.values() for t in terms]:
-        temporal_tags.update(_collect_temporal_tags_for_feax(_coeff))
-        _collect_runtime_parameter_tags_for_feax(_coeff, runtime_parameter_tags)
-    temporal_tags = tuple(sorted(temporal_tags))
-    runtime_parameter_tags = tuple(runtime_parameter_tags)
-
-    problem_ref: dict[str, Any] = {"problem": None}
-    kernel = _make_multifield_volume_kernel(
-        domain, term_list, fields, field_index, temporal_tags, runtime_parameter_tags, problem_ref
-    )
-
-    # Coupled surface (Neumann/Robin) terms: one universal surface kernel per boundary
-    # tag, grouping that tag's terms by test field into the block residual. feax matches
-    # location_fns[i] <-> get_universal_kernels_surface()[i] by index, so both lists are
-    # built in lockstep over the same ordered tags.
-    location_fns = []
-    surface_kernels = []
-    for tag, tag_terms in boundary_terms_by_tag.items():
-        loc_fn = domain._make_tag_location_fn(tag)
-        if loc_fn is None:
-            domain.log.warning(f"Boundary tag '{tag}' not found while building coupled surface locations. Skipping.")
-            continue
-        location_fns.append(loc_fn)
-        surface_kernels.append(
-            _make_multifield_surface_kernel(
-                domain, tag_terms, fields, field_index, tag, temporal_tags, runtime_parameter_tags, problem_ref
-            )
-        )
-
-    class GeneratedMultifieldProblem(fe.Problem):
-        def get_universal_kernel(self_inner):
-            return kernel
-
-        def get_universal_kernels_surface(self_inner):
-            return surface_kernels
-
-    problem = GeneratedMultifieldProblem(
-        meshes, vec=vecs, dim=dim, ele_type=eles, gauss_order=quad_degree, location_fns=location_fns
-    )
-    problem_ref["problem"] = problem
-
-    bc_specs = _make_multifield_dirichlet_specs(domain, fields, field_index) if apply_dirichlet else []
-    bc = fe.DirichletBCConfig(bc_specs).create_bc(problem)
-
-    if store_on_domain:
-        domain._feax_problem = problem
-        domain._feax_bc = bc
-
-    return problem, bc
-
-
 def _zero_mass_dirichlet_rows(M, bc):
     """Zero a mass matrix's Dirichlet **rows** so ``M u̇ + A u = c`` reads ``u[d]=g``.
 
-    feax applies symmetric Dirichlet (identity rows) to *every* assembled matrix — correct
+    Symmetric Dirichlet (identity rows) is applied to *every* assembled matrix — correct
     for a stiffness operator, but wrong for the **mass**: a constrained DOF must carry no
     time derivative. Zeroing the Dirichlet rows (``A``'s Dirichlet rows are identity, ``c``
     carries ``g``) makes the Dirichlet row of ``(M + dt A) w = M w_old + dt c`` reduce to
@@ -1731,143 +1633,6 @@ def _zero_forcing_dirichlet_rows(forcing_fn, bc):
     return cleaned
 
 
-def _build_feax_problem(domain, ir, *, apply_dirichlet: bool = True, store_on_domain: bool = True, fields_override=None):
-    """
-    Build a FEAX Problem and Dirichlet BC object from lowered weak-form IR.
-
-    The returned FEAX problem owns the generated volume and surface kernels.
-    When `store_on_domain=True`, the FEAX problem and BC are cached on the
-    domain for later reuse.
-
-    ``fields_override`` is an optional ``(fields, field_index)`` pair forcing the
-    multi-field block layout instead of inferring it from this IR's own terms. The
-    transient route passes it so the separately-assembled mass and operator blocks
-    share one field ordering (and so a block is built for every field even if this
-    IR only mentions some of them).
-    """
-    import feax as fe
-
-    trial_cache: dict[tuple[int, str, tuple[Any, ...]], TrialFunction] = {}
-
-    volume_expr = _lower_statefield_to_trial(ir.volume_expr, trial_cache)
-    boundary_exprs = {k: _lower_statefield_to_trial(v, trial_cache) for k, v in ir.boundary_exprs.items()}
-
-    if volume_expr is None and len(boundary_exprs) == 0:
-        raise ValueError("No terms found for FEM assembly.")
-
-    # Coupled (multi-field) weak form -> multi-variable block assembly.
-    _mf_fields, _mf_index = fields_override if fields_override is not None else _infer_fields(volume_expr)
-    if len(_mf_fields) > 1:
-        return _build_multifield_feax_problem(
-            domain, ir, _mf_fields, _mf_index, apply_dirichlet=apply_dirichlet, store_on_domain=store_on_domain
-        )
-
-    metadata = _infer_trial_metadata(volume_expr if volume_expr is not None else next(iter(boundary_exprs.values())))
-    vec = int(metadata["vec"])
-    value_shape = metadata["value_shape"]
-
-    element_type = getattr(domain, "_fem_element_type", None)
-    quad_degree = getattr(domain, "_fem_quad_degree", None)
-
-    if element_type is None:
-        element_type = "TRI3"
-    if quad_degree is None:
-        quad_degree = 2
-
-    mesh = _build_feax_mesh(domain, element_type)
-
-    temporal_tags_set = set()
-    if volume_expr is not None:
-        temporal_tags_set.update(_collect_temporal_tags_for_feax(volume_expr))
-    for expr in boundary_exprs.values():
-        temporal_tags_set.update(_collect_temporal_tags_for_feax(expr))
-    temporal_tags = tuple(sorted(temporal_tags_set))
-
-    runtime_parameter_tags_set = []
-    if volume_expr is not None:
-        _collect_runtime_parameter_tags_for_feax(volume_expr, runtime_parameter_tags_set)
-    for expr in boundary_exprs.values():
-        _collect_runtime_parameter_tags_for_feax(expr, runtime_parameter_tags_set)
-    runtime_parameter_tags = tuple(runtime_parameter_tags_set)
-
-    problem_ref: dict[str, Any] = {"problem": None}
-
-    active_boundary_tags: List[str] = []
-    location_fns = []
-    surface_kernels = []
-    for tag, expr in boundary_exprs.items():
-        loc_fn = domain._make_tag_location_fn(tag)
-        if loc_fn is None:
-            domain.log.warning(f"Boundary tag '{tag}' not found while building FEAX surface locations. Skipping.")
-            continue
-        active_boundary_tags.append(tag)
-        location_fns.append(loc_fn)
-        surface_kernels.append(
-            _make_universal_surface_kernel(domain, expr, tag, value_shape, runtime_parameter_tags, temporal_tags)
-        )
-
-    # FEAX always evaluates the volume kernel before adding optional surface
-    # contributions. A boundary-only source, such as a pure Neumann load,
-    # therefore still needs a valid zero-valued volume kernel.
-    if volume_expr is not None:
-        volume_kernel = _make_universal_volume_kernel(
-            domain,
-            volume_expr,
-            value_shape,
-            temporal_tags,
-            runtime_parameter_tags,
-            problem_ref,
-        )
-    else:
-
-        def volume_kernel(
-            cell_sol_flat,
-            physical_quad_points,
-            cell_shape_grads,
-            cell_JxW,
-            cell_v_grads_JxW,
-            *cell_internal_vars,
-        ):
-            del (
-                physical_quad_points,
-                cell_shape_grads,
-                cell_JxW,
-                cell_v_grads_JxW,
-                cell_internal_vars,
-            )
-
-            # FEAX expects one local residual vector per cell. For a
-            # boundary-only weak form, the volume contribution is identically
-            # zero and the actual load is assembled by the surface kernels.
-            return jnp.zeros_like(jnp.asarray(cell_sol_flat))
-
-    class GeneratedProblem(fe.Problem):
-        def get_universal_kernel(self_inner):
-            return volume_kernel
-
-        def get_universal_kernels_surface(self_inner):
-            return surface_kernels
-
-    problem = GeneratedProblem(
-        mesh,
-        vec=vec,
-        dim=domain.dimension,
-        ele_type=element_type,
-        gauss_order=quad_degree,
-        location_fns=location_fns,
-    )
-    problem_ref["problem"] = problem
-
-    bc_specs = _make_feax_dirichlet_specs(domain, vec) if apply_dirichlet else []
-    bc = fe.DirichletBCConfig(bc_specs).create_bc(problem)
-
-    if store_on_domain:
-        domain._feax_problem = problem
-        domain._feax_bc = bc
-
-    return problem, bc
-
-
 def _dense_array(A):
     if hasattr(A, "todense"):
         return jnp.asarray(A.todense())
@@ -1879,6 +1644,30 @@ def _dense_array(A):
         return jnp.asarray(np.asarray(A))
 
 
+def _region_mask_arrays_for_domain(domain):
+    """Per-cell sub-region masks for the regions this domain's FEM problem uses, in the kernel's fixed
+    (sorted) order -- the order ``_build_fem_problem`` recorded in ``domain._fem_region_mask_order``.
+
+    Each is a constant ``(num_cells, 1)`` 0/1 array (the kernel slices a scalar per cell). Cached per region
+    on the domain (depends only on the mesh + region geometry), so transient steps and parametric
+    re-evaluations don't rebuild them. Returns ``()`` when the problem has no sub-region terms."""
+    names = tuple(getattr(domain, "_fem_region_mask_order", ()) or ())
+    if not names:
+        return ()
+    a_cells = getattr(domain, "_fem_assembly_cells", None)
+    n_cells = int(np.asarray(a_cells).shape[0]) if a_cells is not None else None
+    cache = getattr(domain, "_fem_region_mask_cache", None)
+    if cache is None or cache.get("__ncells__") != n_cells:  # invalidate if the assembly mesh changed
+        cache = {"__ncells__": n_cells}
+        domain._fem_region_mask_cache = cache
+    out = []
+    for r in names:
+        if r not in cache:
+            cache[r] = jnp.asarray(_cell_region_mask(domain, r), dtype=_default_float_dtype()).reshape(-1, 1)
+        out.append(cache[r])
+    return tuple(out)
+
+
 def _make_internal_vars(
     fe_module,
     temporal_tags,
@@ -1888,12 +1677,16 @@ def _make_internal_vars(
     dtype=None,
     runtime_parameter_tags=(),
     runtime_parameter_values=None,
+    region_mask_arrays=(),
     extra_volume_vars=(),
 ):
     """
-    Build FEAX InternalVars in a batched shape FEAX can slice.
+    Build the batched volume-variable arrays the kernel slices per cell.
 
-    Each temporal variable is broadcast to shape (n_cells, 1).
+    Volume-var layout (the order every kernel's ``local`` indexing assumes):
+    ``[ temporal ... , runtime_parameter ... , region_mask ... , extra ... ]``. Each temporal variable
+    is broadcast to shape (n_cells, 1); region masks are constant per-cell arrays (see
+    ``_region_mask_arrays_for_domain``) so any path that threads them gets per-region integration.
     """
     vol = []
 
@@ -1911,8 +1704,11 @@ def _make_internal_vars(
             vol.append(jnp.full((int(n_cells), 1), flat[0], dtype=p.dtype))
         else:
             # field parameter (node- or cell-based) -> pass the global array through;
-            # feax's gather_internal_vars slices it per cell, the kernel interpolates.
+            # the per-cell gather slices it, the kernel interpolates.
             vol.append(flat)
+    # Sub-region masks, after the runtime parameters (matches the evaluator's RegionMask index).
+    for m in region_mask_arrays:
+        vol.append(jnp.asarray(m, dtype=dtype).reshape(int(n_cells), 1))
     for v in extra_volume_vars:
         arr = jnp.asarray(v, dtype=dtype)
         if arr.ndim == 0:
@@ -1920,112 +1716,6 @@ def _make_internal_vars(
         vol.append(arr)
 
     return fe_module.InternalVars(volume_vars=tuple(vol))
-
-
-def _prepare_feax_runtime(
-    domain,
-    ir,
-    *,
-    apply_dirichlet=True,
-    need_jacobian=True,
-    symmetric_bc=True,
-    fields_override=None,
-):
-    """
-    Prepare reusable FEAX residual/Jacobian runtime objects for an IR.
-
-    Returns a dictionary containing the FEAX problem, BC, residual callable,
-    optional Jacobian callable, reference state, dtype, temporal tags, and
-    number of mesh cells. ``fields_override`` forces the multi-field block layout
-    (used by the coupled transient forcing path).
-    """
-    import feax as fe
-
-    problem, bc = _build_feax_problem(
-        domain,
-        ir,
-        apply_dirichlet=apply_dirichlet,
-        store_on_domain=False,
-        fields_override=fields_override,
-    )
-
-    res_bc = fe.create_res_bc_function(problem, bc)
-    jac_bc = fe.create_J_bc_function(problem, bc, symmetric=symmetric_bc) if need_jacobian else None
-
-    size = int(problem.num_total_dofs_all_vars)
-    dtype = _default_float_dtype()
-
-    try:
-        u_ref = fe.zero_like_initial_guess(problem, bc)
-    except Exception:
-        u_ref = jnp.zeros((size,), dtype=dtype)
-
-    u_ref = jnp.asarray(u_ref, dtype=dtype)
-
-    temporal_tags = set()
-    for term in getattr(ir, "terms", []):
-        temporal_tags.update(_collect_temporal_tags_for_feax(term.coeff))
-    temporal_tags = tuple(sorted(temporal_tags))
-    runtime_parameter_tags = []
-    for term in getattr(ir, "terms", []):
-        _collect_runtime_parameter_tags_for_feax(term.coeff, runtime_parameter_tags)
-    runtime_parameter_tags = tuple(runtime_parameter_tags)
-
-    element_type = getattr(domain, "_fem_element_type", None)
-    if element_type is None:
-        element_type = "TRI3"
-
-    meshio_type = _meshio_type_for_element(element_type)
-
-    if meshio_type not in domain.mesh.cells_dict:
-        raise KeyError(
-            f"Mesh cell type '{meshio_type}' for element_type='{element_type}' "
-            f"not found in domain.mesh.cells_dict. "
-            f"Available: {list(domain.mesh.cells_dict.keys())}"
-        )
-
-    n_cells = int(np.asarray(domain.mesh.cells_dict[meshio_type]).shape[0])
-
-    return {
-        "problem": problem,
-        "bc": bc,
-        "res_bc": res_bc,
-        "jac_bc": jac_bc,
-        "size": size,
-        "dtype": dtype,
-        "u_ref": u_ref,
-        "temporal_tags": temporal_tags,
-        "runtime_parameter_tags": runtime_parameter_tags,
-        "n_cells": n_cells,
-    }
-
-
-"""
-Periodic boundary-condition support for the FEAX-backed time/static routes.
-
-The FEAX assembly produces *full* unconstrained Galerkin operators (mass M,
-operator A, parametric basis K_i, affine bias, forcing). Periodicity is not a
-property of those matrices: left/right (or bottom/top) boundary nodes are
-independent free DOFs that, left alone, satisfy a natural zero-flux condition
-rather than a periodic one.
-
-Periodicity is enforced algebraically through a prolongation matrix ``P`` that
-identifies slave DOFs with their master DOFs:
-
-    u_full = P @ u_red                          (n_full x n_red)
-
-The reduced semidiscrete system that the time integrator actually solves is
-
-    (P^T M P) u_red_dot + (P^T A P) u_red = P^T (c + f).
-
-This module builds ``P`` by coordinate matching on the user-declared periodic
-tag pairs and provides the small reduction/prolongation helpers used by the
-time route and the Diffrax adapter.
-
-Only node-level (scalar, vec=1) and node-major vector layouts
-(dof = node*vec + comp) are handled; the vector case is obtained from the
-node-level ``P`` via a Kronecker product with the identity.
-"""
 
 
 def _periodic_facet_weights(
@@ -2240,32 +1930,94 @@ def build_periodic_prolongation(
     reduced_index = {node: r for r, node in enumerate(kept_nodes)}
     n_red = len(kept_nodes)
 
-    P_node = np.zeros((n_nodes, n_red), dtype=np.float64)
+    # The prolongation is a SELECTION matrix (0/1, plus interpolation weights for non-matching faces)
+    # -- it must be SPARSE, never dense: O(n_full) nonzeros vs O(n_full * n_red) dense (GBs at large
+    # N). Collect (row, col, weight) entries node-by-node, then a BCOO; a vector field expands each
+    # node entry to ``vec`` component entries (a Kronecker of the node map with I_vec).
+    import jax.experimental.sparse as jsparse
+
+    rows: List[int] = []
+    cols: List[int] = []
+    data: List[float] = []
     for i in range(n_nodes):
         if i in slave_set:
             for kept_node, weight in _expand(i, frozenset()).items():
-                P_node[i, reduced_index[kept_node]] += weight
+                rows.append(i)
+                cols.append(reduced_index[kept_node])
+                data.append(float(weight))
         else:
-            P_node[i, reduced_index[i]] = 1.0
+            rows.append(i)
+            cols.append(reduced_index[i])
+            data.append(1.0)
 
     # Informational exact-chain map (single kept master per exact slave); interpolated slaves omitted.
     final_master = {sid: next(iter(_expand(sid, frozenset()))) for sid in slave_to_master}
 
-    P_node_j = jnp.asarray(P_node)
-    if vec == 1:
-        P = P_node_j
-    else:
-        P = jnp.kron(P_node_j, jnp.eye(vec, dtype=P_node_j.dtype))
+    rows_a = np.asarray(rows, dtype=np.int64)
+    cols_a = np.asarray(cols, dtype=np.int64)
+    data_a = np.asarray(data, dtype=np.float64)
+    if vec > 1:  # kron(P_node, I_vec): each node entry -> vec component entries
+        comp = np.arange(vec, dtype=np.int64)
+        rows_a = (rows_a[:, None] * vec + comp[None, :]).reshape(-1)
+        cols_a = (cols_a[:, None] * vec + comp[None, :]).reshape(-1)
+        data_a = np.repeat(data_a, vec)
+    n_full, n_red_full = int(n_nodes * vec), int(n_red * vec)
+    P = jsparse.BCOO((jnp.asarray(data_a), jnp.asarray(np.stack([rows_a, cols_a], axis=1))), shape=(n_full, n_red_full))
 
     return {
         "P": P,
-        "P_node": P_node_j,
+        "P_node": P,  # sparse; equals the node-level map when vec == 1
         "kept_nodes": np.asarray(kept_nodes, dtype=np.int64),
         "slave_to_master": final_master,
-        "n_full": int(n_nodes * vec),
-        "n_red": int(n_red * vec),
+        "n_full": n_full,
+        "n_red": n_red_full,
         "vec": int(vec),
+        # whether P is a one-master-per-slave selection (conforming) -> the sparse remap reduction is
+        # exact; computed once here (eager, concrete P) so the reduce path never inspects P under trace.
+        "is_selection": _is_selection(P),
     }
+
+
+# ---------------------------------------------------------------------------
+# Sparse (BCOO) Dirichlet row/column operations
+#
+# The native assembler returns the global matrix as a BCOO (``O(nnz)``, never the
+# dense ``O(n^2)`` array). These keep the three dense Dirichlet primitives
+# (``.at[d,:].set(0)``, ``.at[:,d].set(0)``, ``.at[d,d].set(1)``) sparse: a row/col
+# is "zeroed" by masking the stored values (nse unchanged — zeroed entries stay as
+# explicit-zero triplets, harmless to matvec); a unit diagonal is appended as
+# ``(d, d, 1)`` triplets (BCOO sums duplicates on matvec / todense / sum_duplicates,
+# so the zeroed original ``(d,d)`` plus the appended ``1`` is exactly ``1``). All are
+# static-``nse``, ``jit``-safe and differentiable in the stored values.
+# ---------------------------------------------------------------------------
+
+
+def bcoo_zero_rows(A, dofs):
+    """``A.at[dofs, :].set(0)`` for a BCOO ``A`` — mask out every stored entry on a ``dofs`` row."""
+    isd = jnp.zeros(A.shape[0], A.data.dtype).at[dofs].set(1.0)
+    keep = 1.0 - isd[A.indices[:, 0]]
+    return jsparse.BCOO((A.data * keep, A.indices), shape=A.shape)
+
+
+def bcoo_zero_rows_cols(A, dofs):
+    """``A.at[dofs, :].set(0).at[:, dofs].set(0)`` for a BCOO ``A`` (symmetric elimination, no diagonal)."""
+    isd = jnp.zeros(A.shape[0], A.data.dtype).at[dofs].set(1.0)
+    keep = (1.0 - isd[A.indices[:, 0]]) * (1.0 - isd[A.indices[:, 1]])
+    return jsparse.BCOO((A.data * keep, A.indices), shape=A.shape)
+
+
+def bcoo_set_unit_diag(A, dofs):
+    """Append unit-diagonal triplets ``(d, d, 1)`` for ``d in dofs`` to a BCOO ``A`` (after the rows
+    were zeroed, this makes ``A[d, d] == 1`` exactly — duplicate indices are summed)."""
+    eye_idx = jnp.stack([dofs, dofs], axis=1).astype(A.indices.dtype)
+    eye_dat = jnp.ones(jnp.asarray(dofs).shape[0], A.data.dtype)
+    return jsparse.BCOO((jnp.concatenate([A.data, eye_dat]), jnp.concatenate([A.indices, eye_idx])), shape=A.shape)
+
+
+def bcoo_set_dirichlet_rows(A, dofs):
+    """``A.at[dofs, :].set(0).at[dofs, dofs].set(1)`` for a BCOO ``A`` — row-replacement (identity row,
+    columns kept): the matrix-level analogue of the Newton row-replacement residual."""
+    return bcoo_set_unit_diag(bcoo_zero_rows(A, dofs), dofs)
 
 
 # ---------------------------------------------------------------------------
@@ -2273,18 +2025,66 @@ def build_periodic_prolongation(
 # ---------------------------------------------------------------------------
 
 
-def reduce_matrix(P, mat):
-    """Galerkin reduction ``P^T mat P``."""
-    P = jnp.asarray(P)
-    mat = jnp.asarray(mat, dtype=P.dtype)
-    return P.T @ mat @ P
+def _is_selection(P):
+    """True iff BCOO ``P`` has exactly one nonzero per full row — a periodic *selection* (each slave
+    DOF equals a single master), for which the remap-sum reduction is exact. A **nonconforming** tie
+    builds an *interpolation* ``P`` (several weighted masters per slave row), which needs a genuine
+    ``P^T M P`` (the dense fallback). ``P.indices`` is static (built from connectivity), so this is a
+    trace-time constant even when ``reduce_matrix`` runs inside a jitted ``operator_fn``."""
+    if not hasattr(P, "indices"):
+        return False
+    rows = np.asarray(P.indices[:, 0])
+    n = int(P.shape[0])
+    return rows.shape[0] == n and int(np.bincount(rows, minlength=n).max()) == 1
+
+
+def _selection_maps(P, dtype):
+    """For a periodic selection ``P`` (BCOO, one nonzero per full row), return ``(master, pval)``:
+    ``master[i]`` = the reduced DOF that full DOF ``i`` maps to; ``pval[i]`` = the tie coefficient
+    (``1``, or ``-1`` for an antiperiodic tie)."""
+    master = jnp.zeros(P.shape[0], P.indices.dtype).at[P.indices[:, 0]].set(P.indices[:, 1])
+    pval = jnp.zeros(P.shape[0], dtype).at[P.indices[:, 0]].set(jnp.asarray(P.data, dtype))
+    return master, pval
+
+
+def _remap_bcoo(mat, m_row, p_row, m_col, p_col, shape):
+    """Sparse Galerkin remap: send each BCOO triplet ``(r, c, v)`` of ``mat`` to
+    ``(m_row[r], m_col[c], v·p_row[r]·p_col[c])`` and let BCOO sum duplicates. This is exactly
+    ``P_row^T mat P_col`` for selection matrices, in ``O(nnz(mat))`` and **without** ever forming a
+    dense ``n_full × n_full`` intermediate (``nnz`` is static = ``nnz(mat)`` → ``jit``-safe)."""
+    r, c = mat.indices[:, 0], mat.indices[:, 1]
+    ridx = jnp.stack([m_row[r], m_col[c]], axis=1)
+    rdata = mat.data * p_row[r] * p_col[c]
+    return jsparse.BCOO((rdata, ridx), shape=shape)
+
+
+def reduce_matrix(P, mat, is_selection=None):
+    """Galerkin reduction ``P^T mat P``.
+
+    When ``mat`` is BCOO and ``P`` is a BCOO *selection* (conforming/structured tie, one master per
+    slave — e.g. the doubly-periodic PEB) the reduction remaps ``mat``'s triplets to their master
+    indices: it stays sparse and never materialises the dense ``n_full × n_full`` matrix (``O(nnz)``;
+    the reduction is otherwise the dominant memory peak of a periodic solve). An *interpolation* ``P``
+    (nonconforming tie) or a dense ``P``/``mat`` (1D path) falls back to the exact dense ``P^T mat P``.
+
+    ``is_selection`` (whether ``P`` is a one-master-per-slave selection) is passed precomputed by the
+    periodic builders so the reduction never inspects ``P.indices`` at run time — that matters because
+    a parametric ``operator_fn`` reduces inside a jitted ``scan`` where ``P.indices`` is a tracer. When
+    ``None`` (a direct/eager call) it is computed once here."""
+    if is_selection is None:
+        is_selection = _is_selection(P)
+    if hasattr(mat, "indices") and is_selection:
+        master, pval = _selection_maps(P, mat.data.dtype)
+        return _remap_bcoo(mat, master, pval, master, pval, (int(P.shape[1]), int(P.shape[1])))
+    mat = mat.todense() if hasattr(mat, "todense") else mat
+    P = P if hasattr(P, "todense") else jnp.asarray(P)  # keep a BCOO P sparse
+    return P.T @ jnp.asarray(mat, P.dtype) @ P
 
 
 def reduce_vector(P, vec):
-    """Reduce a full-space load/bias vector via ``P^T vec``."""
-    P = jnp.asarray(P)
-    vec = jnp.asarray(vec, dtype=P.dtype).reshape(-1)
-    return P.T @ vec
+    """Reduce a full-space load/bias vector via ``P^T vec`` (dense or BCOO ``P``)."""
+    P = P if hasattr(P, "todense") else jnp.asarray(P)
+    return P.T @ jnp.asarray(vec, P.dtype).reshape(-1)
 
 
 def restrict_state(P, state_full, kept_nodes, vec: int = 1):
@@ -2308,9 +2108,108 @@ def prolong(P, reduced):
     Accepts a single ``(n_red,)`` vector or a batched ``(..., n_red)`` array
     (e.g. a Diffrax ``solution.ys`` trajectory of shape ``(T, n_red)``).
     """
-    P = jnp.asarray(P)
-    reduced = jnp.asarray(reduced, dtype=P.dtype)
+    P = P if hasattr(P, "todense") else jnp.asarray(P)  # keep a BCOO P sparse
+    reduced = jnp.asarray(reduced, P.dtype)
     if reduced.ndim == 1:
         return P @ reduced
     # (..., n_red) @ (n_red, n_full) -> (..., n_full)
     return reduced @ P.T
+
+
+# ---------------------------------------------------------------------------
+# Periodic reduction over a (possibly multifield) block.  A `periodic` dict is
+# either single-field (legacy `{"P", "kept_nodes", "vec"}`) or multifield
+# (`{"blocks": [{"P", "kept", "vec"}, ...], "off_full": [...], "off_red": [...]}`).
+# The Galerkin reduction of a blocked operator decomposes per field-pair,
+# `reduced[i,j] = P_i^T M[i,j] P_j`, so we NEVER materialise a block-diagonal P
+# (which would be O(F^2) dense and force one global vec/order); each field keeps
+# its own P_i / kept / vec and only one P_i is held at a time.
+# ---------------------------------------------------------------------------
+
+
+def _periodic_blocks(periodic):
+    """Normalise a periodic dict to ``(blocks, off_full, off_red)``; a legacy single-field
+    dict is wrapped as a single block (so the multifield path is the general case)."""
+    if "blocks" in periodic:
+        return periodic["blocks"], np.asarray(periodic["off_full"]), np.asarray(periodic["off_red"])
+    P = periodic["P"]
+    nf, nr = int(P.shape[0]), int(P.shape[1])
+    block = [
+        {
+            "P": P,
+            "kept": periodic["kept_nodes"],
+            "vec": periodic.get("vec", 1),
+            "is_selection": periodic.get("is_selection"),
+        }
+    ]
+    return block, np.array([0, nf]), np.array([0, nr])
+
+
+def reduce_matrix_periodic(periodic, mat):
+    """``P^T mat P`` for a single- or multi-field periodic reduction.
+
+    When ``mat`` and every field's ``P_i`` are BCOO, the whole blocked reduction
+    ``reduced[i,j] = P_i^T mat[i,j] P_j`` is one global triplet-remap (the per-field offsets are
+    folded into a single full→reduced master map), so it stays sparse and never densifies — the fix
+    for the ``O(n^2)`` reduction peak at large ``N``. A dense ``mat`` falls back to the per-block
+    dense reduction (no block-diagonal ``P`` is ever materialised)."""
+    blocks, off_f, off_r = _periodic_blocks(periodic)
+
+    def _sel(b):  # prefer the precomputed flag (built eagerly); compute only when called eagerly
+        return b["is_selection"] if b.get("is_selection") is not None else _is_selection(b["P"])
+
+    if len(blocks) == 1:
+        return reduce_matrix(blocks[0]["P"], mat, is_selection=_sel(blocks[0]))  # fast path == single-field
+    if hasattr(mat, "indices") and all(_sel(b) for b in blocks):
+        n_full, n_red = int(off_f[-1]), int(off_r[-1])
+        gmaster = jnp.zeros(n_full, mat.indices.dtype)
+        gpval = jnp.zeros(n_full, mat.data.dtype)
+        for i, b in enumerate(blocks):
+            Pi = b["P"]
+            full_local = Pi.indices[:, 0]  # field-i local full DOF
+            gmaster = gmaster.at[int(off_f[i]) + full_local].set(
+                (int(off_r[i]) + Pi.indices[:, 1]).astype(mat.indices.dtype)
+            )
+            gpval = gpval.at[int(off_f[i]) + full_local].set(jnp.asarray(Pi.data, mat.data.dtype))
+        return _remap_bcoo(mat, gmaster, gpval, gmaster, gpval, (n_red, n_red))
+    mat = jnp.asarray(mat.todense()) if hasattr(mat, "todense") else jnp.asarray(mat)
+    out = jnp.zeros((int(off_r[-1]), int(off_r[-1])), mat.dtype)
+    _sp = lambda P: P if hasattr(P, "todense") else jnp.asarray(P, mat.dtype)  # keep BCOO sparse  # noqa: E731
+    for i, bi in enumerate(blocks):
+        Pi = _sp(bi["P"])
+        for j, bj in enumerate(blocks):
+            Pj = _sp(bj["P"])
+            blk = mat[off_f[i] : off_f[i + 1], off_f[j] : off_f[j + 1]]
+            out = out.at[off_r[i] : off_r[i + 1], off_r[j] : off_r[j + 1]].set(Pi.T @ blk @ Pj)
+    return out
+
+
+def reduce_vector_periodic(periodic, vec):
+    """``P^T vec`` for a single- or multi-field periodic reduction (per-field block)."""
+    blocks, off_f, _ = _periodic_blocks(periodic)
+    if len(blocks) == 1:
+        return reduce_vector(blocks[0]["P"], vec)
+    vec = jnp.asarray(vec).reshape(-1)
+    _sp = lambda P: P if hasattr(P, "todense") else jnp.asarray(P, vec.dtype)  # keep BCOO sparse  # noqa: E731
+    return jnp.concatenate([_sp(b["P"]).T @ vec[off_f[i] : off_f[i + 1]] for i, b in enumerate(blocks)])
+
+
+def restrict_state_periodic(periodic, state):
+    """Restrict a full state to the reduced master DOFs (per-field block)."""
+    blocks, off_f, _ = _periodic_blocks(periodic)
+    if len(blocks) == 1:
+        return restrict_state(blocks[0]["P"], state, blocks[0]["kept"], blocks[0]["vec"])
+    state = jnp.asarray(state).reshape(-1)
+    return jnp.concatenate(
+        [restrict_state(b["P"], state[off_f[i] : off_f[i + 1]], b["kept"], b["vec"]) for i, b in enumerate(blocks)]
+    )
+
+
+def prolong_periodic(periodic, reduced):
+    """Prolong reduced DOFs to the full space (per-field block); supports a batched leading axis."""
+    blocks, _, off_r = _periodic_blocks(periodic)
+    if len(blocks) == 1:
+        return prolong(blocks[0]["P"], reduced)
+    reduced = jnp.asarray(reduced)
+    parts = [prolong(b["P"], reduced[..., off_r[i] : off_r[i + 1]]) for i, b in enumerate(blocks)]
+    return jnp.concatenate(parts, axis=-1)

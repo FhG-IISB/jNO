@@ -7,7 +7,8 @@ recirculating vortex that spins up and settles to steady state.
 The point of this example is the **convective term** ``(u.grad)u`` -- written as ``inner(grad u, u)``.
 That is the unknown contracted with itself (a genuine nonlinearity), so ``jno.fem`` routes the whole
 system to its nonlinear coupled operator and the Jacobian comes from autodiff. We bring our own
-implicit time stepper: **backward Euler + Newton** on the FeaxTimeBlock's mass / residual / jacobian.
+implicit time stepper: **backward Euler + Newton** on the mass / residual / jacobian that ``jno.fem``
+exposes for the transient system.
 
 Inf-sup-stable Taylor-Hood elements (P2 velocity, P1 pressure); all-Dirichlet (a regularised moving
 lid + no-slip walls), so no outflow boundary is needed.
@@ -20,7 +21,7 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")  # play nice on a
 
 import jax
 
-jax.config.update("jax_enable_x64", True)  # feax assembly is float64
+jax.config.update("jax_enable_x64", True)  # the assembler builds in float64
 
 from pathlib import Path  # noqa: E402
 
@@ -60,7 +61,7 @@ fem = jno.fem(
     ]
 )
 assert fem.is_transient and not fem.is_linear, "transient Navier-Stokes must be nonlinear"
-off = fem.problem.offset
+off = fem.offsets
 M, dt = fem.M, float(fem.dt)
 print(f"\nTransient Navier-Stokes lid-driven cavity (Re={1 / nu:.0f}): dofs={fem.dofs}")
 
@@ -82,7 +83,7 @@ for step in range(nsteps):
 frames = np.stack(frames)
 settle = float(np.linalg.norm(frames[-1] - frames[-2]) / np.linalg.norm(frames[-1]))
 
-pts_v = np.asarray(fem.problem.mesh[0].points)
+pts_v = np.asarray(fem.field_points[0])
 vel = frames[:, off[0] : off[1]].reshape(frames.shape[0], -1, 2)  # (frame, n_vel_nodes, 2)
 uxN = vel[-1, :, 0]  # steady x-velocity, for the recirculation check
 cl = np.abs(pts_v[:, 0] - 0.5) < 0.06  # near the vertical centre-line

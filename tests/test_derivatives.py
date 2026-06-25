@@ -1073,18 +1073,6 @@ class TestFDOnStackedDomains:
             assert abs(mean_lap - 4.0) < 2.0, f"Batch {b}: mean Laplacian = {mean_lap:.2f}, expected ≈ 4.0"
 
 
-class TestFEMGuardOnStackedDomains:
-    """Verify that init_fem() raises on stacked domains."""
-
-    def test_init_fem_raises_on_stacked_domain(self):
-        import jno
-
-        dom = 2 * jno.domain.rect(mesh_size=0.3)
-        dom += 1 * jno.domain.disk(mesh_size=0.3)
-        with pytest.raises(ValueError, match="not supported on stacked domains"):
-            dom.init_fem()
-
-
 # ───────────────────────────────────────────────────────────────────────────────
 # Temporal AD order > 2
 # ───────────────────────────────────────────────────────────────────────────────

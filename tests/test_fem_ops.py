@@ -6,12 +6,11 @@ jno.fem routes it to the residual operator and the Jacobian comes from JAX autod
 coefficient field. These tests pin down that breadth (write Helmholtz / reaction / Schrodinger-style
 nonlinearities natively, no special API).
 
-Run with x64 (the feax assembly is float64): ``JAX_ENABLE_X64=1``.
+Run with x64 (the FEM assembly is float64): ``JAX_ENABLE_X64=1``.
 """
 
 import pytest
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for the box domain")
 pytest.importorskip("scipy", reason="scipy.optimize for the Newton solve")
 
@@ -121,8 +120,8 @@ def test_navier_stokes_convective_term_is_nonlinear_and_recovers_manufactured():
     fem = jno.fem([momentum, -qq * trace(gu), u(xb, yb)[0] - ux(xb, yb), u(xb, yb)[1] - uy(xb, yb), p(xpn, ypn) - (-0.5)])
     assert not fem.is_linear, "convective term inner(grad u, u) must classify as nonlinear"
 
-    off = fem.problem.offset
-    pts = np.asarray(fem.problem.mesh[0].points)
+    off = fem.offsets
+    pts = np.asarray(fem.field_points[0])
     sol = spo.root(
         lambda w: np.asarray(fem.residual(jnp.asarray(w))),
         np.zeros(fem.dofs),

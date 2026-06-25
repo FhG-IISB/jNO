@@ -1,17 +1,16 @@
 """``domain.tag(name, where)`` -- name an abstract region from a spatial predicate.
 
 One general method (no interior/boundary flag): the predicate is registered as a FEM boundary
-location-function (feax restricts it to the boundary, so it selects the right subset for mixed /
-natural BCs on a complex geometry) and as a sampling region (the PINN sampler draws the points
-satisfying ``where`` each step). Spatial coordinates only, so a region is the same at every time
-level of a time-dependent domain.
+location-function (the assembler restricts it to the boundary, so it selects the right subset for
+mixed / natural BCs on a complex geometry) and as a sampling region (the PINN sampler draws the
+points satisfying ``where`` each step). Spatial coordinates only, so a region is the same at every
+time level of a time-dependent domain.
 
-FEM tests need x64 (the feax assembly is float64).
+FEM tests need x64 (assembly runs in float64).
 """
 
 import pytest
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for the CSG domains")
 
 import jax  # noqa: E402
@@ -63,8 +62,8 @@ def test_tag_fem_mixed_dirichlet_and_natural_on_csg_domain():
 
 
 def test_tag_location_fn_selects_only_the_predicate_boundary():
-    """The registered loc-fn (consumed by feax) selects exactly the boundary nodes satisfying the
-    spatial predicate -- the rest of the boundary is left for other BCs / natural."""
+    """The registered loc-fn (consumed by the assembler) selects exactly the boundary nodes satisfying
+    the spatial predicate -- the rest of the boundary is left for other BCs / natural."""
     d = jno.domain(box(0, 0, 2, 1).difference(Point(1, 0.5).buffer(0.2))).build_mesh(0.1)
     d.tag("inlet", lambda x, y: x < 1e-6)
     loc = d._make_tag_location_fn("inlet")
@@ -89,7 +88,7 @@ def test_tag_mesh_free_sampling_resamples_in_region():
 
 def test_tag_dirichlet_is_boundary_restricted_and_enables_natural_outflow():
     """A tagged Dirichlet must constrain ONLY the boundary, even when the predicate selects a *thick*
-    region (a band around a cylinder, not just its surface) -- otherwise feax (which applies a
+    region (a band around a cylinder, not just its surface) -- otherwise the assembler (which applies a
     location-fn to every node) would pin the interior velocity and silently zero the interior
     pressure rows. Here: Stokes past a cylinder, inlet + no-slip walls/cylinder via tags, **untagged
     outlet** = natural outflow. Assert the system is non-singular (the bug gave many zero rows), the
@@ -129,9 +128,9 @@ def test_tag_dirichlet_is_boundary_restricted_and_enables_natural_outflow():
     assert int((np.abs(A).sum(1) == 0).sum()) == 0, "thick boundary predicate must not over-constrain the interior"
     sol = np.linalg.solve(A, np.asarray(fem.b).reshape(-1))
     assert np.all(np.isfinite(sol))
-    off = fem.problem.offset
+    off = fem.offsets
     uu = sol[off[0] : off[1]].reshape(-1, 2)
-    pts = np.asarray(fem.problem.mesh[0].points)
+    pts = np.asarray(fem.field_points[0])
     dist = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy)
     # no-slip on the exact cylinder boundary (the velocity nodes the 'cyl' tag actually constrains)
     on_cyl = np.asarray(jax.vmap(dom._make_tag_location_fn("cyl"))(jnp.asarray(pts))).astype(bool)

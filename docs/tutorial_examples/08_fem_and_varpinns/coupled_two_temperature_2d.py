@@ -12,7 +12,7 @@ This shows off the FEM solver on the things that matter in practice, not a unit 
   (steep gradients) while the ``bulk`` stays coarse (``build_mesh(..., sizes={"ring": ...})``);
 * genuine multi-field COUPLING -- two ``fem_symbols`` fields with a cross term, assembled as one
   block system;
-* a CUSTOM solver -- the coupled system is solved with ``lineax`` via ``fem.solve(solve_fn=...)``;
+* the coupled system is solved with a bring-your-own dense solver (jnp.linalg.solve);
   you never call jno's built-in solver.
 
 Verified by the method of manufactured solutions (impose a known ``T_s*, T_f*`` on the full
@@ -25,11 +25,11 @@ os.environ["MPLBACKEND"] = "Agg"
 
 import jax
 
-jax.config.update("jax_enable_x64", True)  # feax assembly is float64
+jax.config.update("jax_enable_x64", True)  # the assembler builds in float64
 
 from pathlib import Path  # noqa: E402
 
-import lineax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import matplotlib.tri as mtri  # noqa: E402
 import numpy as np  # noqa: E402
@@ -71,9 +71,9 @@ fem = jno.fem(
     ]
 )
 
-# bring-your-own solver: lineax on the coupled block (no jno-written solve)
-sol = np.asarray(fem.solve(solve_fn=lambda A, b: lineax.linear_solve(lineax.MatrixLinearOperator(A), b).value))
-off = fem.problem.offset  # per-field slices into the coupled solution vector
+# bring-your-own solver: a dense direct solve (the default matrix-free Krylov is for large elliptic systems)
+sol = np.asarray(fem.solve(solve_fn=lambda A, b: jnp.linalg.solve(A, b)))
+off = fem.offsets  # per-field slices into the coupled solution vector
 Th_s, Th_f = sol[off[0] : off[1]], sol[off[1] :]
 pts = np.asarray(fem.points)
 xs, ys = pts[:, 0], pts[:, 1]
@@ -81,8 +81,8 @@ ref_s = 1 + 0.40 * np.sin(PI * xs / 2) * np.sin(PI * ys)
 ref_f = 1 + 0.25 * np.sin(PI * xs) * np.sin(PI * ys)
 rels = float(np.linalg.norm(Th_s - ref_s) / np.linalg.norm(ref_s))
 relf = float(np.linalg.norm(Th_f - ref_f) / np.linalg.norm(ref_f))
-print("\nCoupled two-temperature model on a plate with a cooling channel (lineax solve)")
-print(f"  fields={len(off)}  dofs={fem.dofs}  bulk/ring mesh = 0.06 / 0.025")
+print("\nCoupled two-temperature model on a plate with a cooling channel (dense solve)")
+print(f"  fields={len(off) - 1}  dofs={fem.dofs}  bulk/ring mesh = 0.06 / 0.025")  # offsets = [0, n1, n2]
 print(f"  MMS recovery rel-L2:  T_s={rels:.3e}  T_f={relf:.3e}")
 
 # ---- render the actual computed fields (no invented structure) ----
@@ -106,5 +106,5 @@ fig.suptitle("Two-temperature heat exchange — coupled fields on a plate with a
 fig.tight_layout()
 fig.savefig(Path(__file__).parents[2] / "assets" / "coupled_two_temperature_2d.png", dpi=130, bbox_inches="tight")
 
-assert fem.is_linear and len(off) == 2
+assert fem.is_linear and len(off) == 3  # 2 coupled fields -> offsets [0, n1, n1+n2]
 assert rels < 2e-3 and relf < 2e-3, f"MMS recovery too loose: T_s={rels:.3e} T_f={relf:.3e}"

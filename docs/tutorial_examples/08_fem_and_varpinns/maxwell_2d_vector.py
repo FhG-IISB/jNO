@@ -84,8 +84,8 @@ fem = jno.fem(
 
 A = jno.np.asarray(fem.A.todense()) if hasattr(fem.A, "todense") else jno.np.asarray(fem.A)
 sol = np.asarray(np.linalg.solve(np.asarray(A), np.asarray(fem.b).reshape(-1)))
-off = np.asarray(fem.problem.offset)
-pts = np.asarray(fem.problem.mesh[0].points)
+off = np.asarray(fem.offsets)
+pts = np.asarray(fem.field_points[0])
 n = int(off[1])
 E_re = sol[:n].reshape(-1, 2)  # computed Re(E) = (Ex_r, Ey_r) at every node
 E_im = sol[n:].reshape(-1, 2)  # computed Im(E)

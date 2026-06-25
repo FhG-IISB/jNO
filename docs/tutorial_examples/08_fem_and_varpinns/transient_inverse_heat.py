@@ -34,7 +34,7 @@ blk, dt = fem.operator, float(fem.operator.dt)
 M, ts = dense(blk.M), jnp.linspace(float(blk.t0), float(blk.t1), round((blk.t1 - blk.t0) / dt) + 1)
 w, traj = jnp.asarray(blk.state0).reshape(-1), [jnp.asarray(blk.state0).reshape(-1)]
 for tn in ts[1:]:
-    w = jnp.linalg.solve(M + dt * jnp.asarray(blk.operator_fn(tn, {"alpha": alpha_true})), M @ w)
+    w = jnp.linalg.solve(M + dt * dense(blk.operator_fn(tn, {"alpha": alpha_true})), M @ w)
     traj.append(w)
 u_obs = jnp.stack(traj)
 

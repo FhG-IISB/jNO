@@ -8,7 +8,7 @@ Taylor-Hood pair (P2 velocity, P1 pressure) coupled in one block:
   meshed finer than the rest of the channel (steep gradients hug the obstacle);
 * a parabolic profile drives the inlet AND the outlet -- exact for *Stokes* flow, which is
   fore-aft symmetric (Re = 0) -- while the walls and the cylinder are no-slip;
-* solved with a CUSTOM ``lineax`` solver via ``fem.solve(solve_fn=...)``.
+* solved with a bring-your-own dense direct solver via `fem.solve(solve_fn=...)`.
 
 Verified without an analytic solution by a physical invariant: a centred cylinder makes the Stokes
 flow top-bottom symmetric, so the computed field must satisfy ``u_x(x, y) = u_x(x, H-y)`` and
@@ -18,14 +18,15 @@ flow top-bottom symmetric, so the computed field must satisfy ``u_x(x, y) = u_x(
 import os
 
 os.environ["MPLBACKEND"] = "Agg"
+os.environ["FEAX_X64"] = "1"  # float64 feax assembly (the test session defaults FEAX_X64=0; this subprocess opts in)
 
 import jax
 
-jax.config.update("jax_enable_x64", True)  # feax assembly is float64
+jax.config.update("jax_enable_x64", True)  # the assembler builds in float64
 
 from pathlib import Path  # noqa: E402
 
-import lineax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 from scipy.interpolate import griddata  # noqa: E402
@@ -62,11 +63,11 @@ fem = jno.fem(
     ]
 )
 
-# bring-your-own solver: lineax on the coupled Stokes block
-sol = np.asarray(fem.solve(solve_fn=lambda A, b: lineax.linear_solve(lineax.MatrixLinearOperator(A), b).value))
-off = fem.problem.offset
+# bring-your-own solver: a dense direct solve (the default matrix-free Krylov is for large elliptic systems)
+sol = np.asarray(fem.solve(solve_fn=lambda A, b: jnp.linalg.solve(A, b)))
+off = fem.offsets
 uu = sol[off[0] : off[1]].reshape(-1, 2)  # velocity (n_vel_nodes, 2)
-pts_v = np.asarray(fem.problem.mesh[0].points)
+pts_v = np.asarray(fem.field_points[0])
 
 # regular grid (mask the cylinder), used for both the symmetry gate and the figure
 gx, gy = np.meshgrid(np.linspace(0, L, 300), np.linspace(0, H, 100))
@@ -75,8 +76,8 @@ UX = np.where(inside, griddata(pts_v, uu[:, 0], (gx, gy), method="linear"), np.n
 UY = np.where(inside, griddata(pts_v, uu[:, 1], (gx, gy), method="linear"), np.nan)
 m = np.isfinite(UX) & np.isfinite(UX[::-1])  # nodes whose mirror is also valid
 sym = float(np.linalg.norm(np.r_[(UX - UX[::-1])[m], (UY + UY[::-1])[m]]) / np.linalg.norm(np.r_[UX[m], UY[m]]))
-print("\nStokes flow past a cylinder (Taylor-Hood P2/P1, lineax solve)")
-print(f"  fields={len(off)}  dofs={fem.dofs}  channel/ring mesh = 0.12 / 0.05")
+print("\nStokes flow past a cylinder (Taylor-Hood P2/P1, dense solve)")
+print(f"  fields={len(off) - 1}  dofs={fem.dofs}  channel/ring mesh = 0.12 / 0.05")  # offsets = [0, n_v, n_v+n_p]
 print(f"  top-bottom symmetry error (should be ~0): {sym:.3e}")
 
 # ---- render the actual computed flow (streamlines squeezing past the obstacle) ----
@@ -93,4 +94,4 @@ ax.set_title("Stokes flow past a cylinder — Taylor-Hood P2/P1 on a refined CSG
 fig.tight_layout()
 fig.savefig(Path(__file__).parents[2] / "assets" / "stokes_flow_around_cylinder.png", dpi=130, bbox_inches="tight")
 
-assert len(off) == 2 and sym < 2e-2, f"Stokes flow not top-bottom symmetric: {sym:.3e}"
+assert len(off) == 3 and sym < 2e-2, f"Stokes flow not top-bottom symmetric: {sym:.3e}"  # [0, n_v, n_v+n_p]

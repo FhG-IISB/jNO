@@ -17,7 +17,6 @@ import pytest
 
 import jno
 
-pytest.importorskip("feax", reason="feax required for FEM assembly")
 pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
 import jax  # noqa: E402
 from shapely.geometry import box  # noqa: E402
@@ -27,7 +26,7 @@ inner, grad, trace, where = jno.np.inner, jno.np.grad, jno.np.trace, jno.np.wher
 
 @pytest.fixture(autouse=True)
 def _x64():
-    """feax assembly is float64; opt into x64 per-test and restore (session default is x64-off)."""
+    """FEM assembly is float64; opt into x64 per-test and restore (session default is x64-off)."""
     prev = jax.config.jax_enable_x64
     jax.config.update("jax_enable_x64", True)
     try:
@@ -75,7 +74,7 @@ def test_pin_matches_explicit_point_region_steady():
     assert any(c.startswith("dirichlet@_gauge_pin_") for c in fem_p.classification)
     assert [t for t in d_p._boundary_regions if t.startswith("_gauge_pin_")]  # region was registered
 
-    off_e, off_p = fem_e.problem.offset, fem_p.problem.offset
+    off_e, off_p = fem_e.offsets, fem_p.offsets
     assert off_e == off_p  # identical block structure
     s_e = np.linalg.solve(_dense(fem_e.A), np.asarray(fem_e.b).reshape(-1))
     s_p = np.linalg.solve(_dense(fem_p.A), np.asarray(fem_p.b).reshape(-1))
@@ -89,7 +88,7 @@ def test_pin_value_shifts_pressure_gauge():
     c = 3.5
     _, fem0 = _stokes("pin", 0.0)
     _, femc = _stokes("pin", c)
-    off = fem0.problem.offset
+    off = fem0.offsets
     s0 = np.linalg.solve(_dense(fem0.A), np.asarray(fem0.b).reshape(-1))
     sc = np.linalg.solve(_dense(femc.A), np.asarray(femc.b).reshape(-1))
     assert np.allclose(s0[off[0] : off[1]], sc[off[0] : off[1]], atol=1e-9)  # velocity unchanged

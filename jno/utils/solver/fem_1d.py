@@ -1,14 +1,12 @@
 """Native 1D (segment / ``LINE2``) FEM assembly for ``jno.fem``.
 
-feax has no 1D volume element (its ``get_elements`` covers 2D/3D only), so a 1D
-``jno.domain.line(...)`` problem can't go through the feax assembly path. This
-module is a small native assembler for the 1D case that reuses jNO's existing
-weak-form integrand evaluator (:func:`_eval_expr_for_feax`) — it only adds the
+Small native assembler for a 1D ``jno.domain.line(...)`` problem that reuses
+jNO's weak-form integrand evaluator (:func:`_eval_integrand`) — it adds the
 1D geometry (``LINE2`` shape functions + Gauss quadrature), an element loop with
 a global scatter, and native boundary handling. Same matrices-only contract as
 the 2D/3D path: it returns the assembled system, never a solve.
 
-Assembly strategy (mirrors how feax forms an element matrix):
+Assembly strategy (how an element matrix is formed):
 - build a global residual ``R(u)`` by evaluating each weak term at the 1D
   quadrature points and scattering element contributions;
 - boundary (Neumann/Robin) terms ride the *same* residual path as a degenerate
@@ -33,7 +31,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.flatten_util import ravel_pytree
 
-from .feax_utils import _eval_expr_for_feax
+from .fem_utils import _eval_integrand, bcoo_set_unit_diag, bcoo_zero_rows_cols
 
 _COMPONENT_NAMES = {"x": 0, "y": 1, "z": 2}
 
@@ -106,7 +104,7 @@ def _integrate_term(domain: Any, expr: Any, local: dict, weights: jnp.ndarray) -
 
     Mirrors ``_eval_volume_integrand``: ``sum_q val(q) * weight(q)`` flattened to
     the element's local DOF layout (node-major)."""
-    val = _eval_expr_for_feax(domain, expr, local)
+    val = _eval_integrand(domain, expr, local)
     wshape = (weights.shape[0],) + (1,) * (val.ndim - 1)
     return ravel_pytree(jnp.sum(val * weights.reshape(wshape), axis=0))[0]
 
@@ -201,12 +199,18 @@ def _apply_dirichlet_symmetric(A, b, dirichlet_pairs: List[Tuple[int, float]]):
     """Symmetric Dirichlet elimination on a linear system ``A u = b``.
 
     Moves known columns to the RHS, then zeros the constrained rows *and* columns
-    and sets a unit diagonal — so ``A`` stays symmetric (matching the 2D/3D feax
+    and sets a unit diagonal — so ``A`` stays symmetric (as in the 2D/3D
     path), unlike a row-only replacement."""
     if not dirichlet_pairs:
         return A, b
     dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32)
     vals = jnp.asarray([p[1] for p in dirichlet_pairs], dtype=b.dtype)
+    if hasattr(A, "indices"):  # BCOO (native 2D/3D assembler) — keep it sparse, never densify
+        e = jnp.zeros(A.shape[0], b.dtype).at[dofs].set(vals)  # the known-column lift
+        b = b - A @ e  # carry the known columns to the load (a BCOO matvec, no dense column slice)
+        A = bcoo_set_unit_diag(bcoo_zero_rows_cols(A, dofs), dofs)
+        b = b.at[dofs].set(vals)
+        return A, b
     b = b - A[:, dofs] @ vals  # carry the known columns to the load
     A = A.at[dofs, :].set(0.0).at[:, dofs].set(0.0).at[dofs, dofs].set(1.0)
     b = b.at[dofs].set(vals)
@@ -246,7 +250,7 @@ def assemble_fem_1d(
     """Assemble a 1D (``LINE2``) weak form into ``(op, mode)`` for :class:`FEM`.
 
     ``mode`` is ``"linear"`` (``op = (A, b)``), ``"nonlinear"`` (``op`` a
-    :class:`FemResidualOperator`), or ``"transient"`` (``op`` a ``FeaxTimeBlock``).
+    :class:`FemResidualOperator`), or ``"transient"`` (``op`` a ``SemidiscreteTimeBlock``).
     """
     from ...trace import FemResidualOperator
     from .weak_form import _contains_temporal_derivative, _is_obviously_nonlinear_in_unknown
@@ -296,20 +300,20 @@ def _apply_dirichlet_transient(M, A, c, dirichlet_pairs: List[Tuple[int, float]]
     A, c = _apply_dirichlet_symmetric(A, c, dirichlet_pairs)
     if dirichlet_pairs:
         dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32)
-        M = M.at[dofs, :].set(0.0).at[:, dofs].set(0.0)
+        M = bcoo_zero_rows_cols(M, dofs) if hasattr(M, "indices") else M.at[dofs, :].set(0.0).at[:, dofs].set(0.0)
     return M, A, c
 
 
 def _assemble_1d_transient(domain, volume_terms, boundary_terms, dirichlet_values, ic_residuals, *, vec, quad_degree):
-    """Assemble a first-order transient 1D weak form into a ``FeaxTimeBlock``.
+    """Assemble a first-order transient 1D weak form into a ``SemidiscreteTimeBlock``.
 
     Splits the volume terms into a temporal part (``u_t``) and a spatial part: the
     temporal part becomes the mass matrix ``M`` (rewriting ``u_t`` -> ``u`` via
     ``_strip_temporal_trial_derivative``); the spatial part + boundary terms become
     the operator. Linear -> ``M``/``A`` payload; nonlinear -> ``mass``/``residual``/
     ``jacobian`` callables."""
-    from ..._fem import _initial_state
-    from .backend_blocks import FeaxTimeBlock
+    from ..._fem import _bare, _ic_value_at_nodes
+    from .backend_blocks import SemidiscreteTimeBlock
     from .time_route import _infer_time_window, _strip_temporal_trial_derivative
     from .weak_form import (
         _apply_sign,
@@ -333,7 +337,11 @@ def _assemble_1d_transient(domain, volume_terms, boundary_terms, dirichlet_value
     mass_terms = [_strip_temporal_trial_derivative(t) for t in temporal_terms]
 
     dirichlet_pairs = _dirichlet_dofs(domain, dirichlet_values, vec)
-    state0 = _initial_state(ic_residuals[0], domain) if ic_residuals else jnp.zeros(ndof)
+    if ic_residuals:
+        pts = jnp.asarray(domain.mesh.points)[:, : domain.dimension]
+        state0 = _ic_value_at_nodes(_bare(ic_residuals[0]), domain, pts, ndof, vec)
+    else:
+        state0 = jnp.zeros(ndof)
     t0, t1, dt = _infer_time_window(domain)
 
     mass_res = _make_residual(domain, mass_terms, {}, n_nodes=n_nodes, vec=vec, quad_degree=quad_degree)
@@ -345,7 +353,7 @@ def _assemble_1d_transient(domain, volume_terms, boundary_terms, dirichlet_value
     M = jax.jacfwd(mass_res)(jnp.zeros(ndof))
 
     common = dict(
-        backend="feax_time",
+        backend="transient",
         mode="implicit",
         time_order=1,
         spatial_kind="weak_form",
@@ -353,7 +361,7 @@ def _assemble_1d_transient(domain, volume_terms, boundary_terms, dirichlet_value
         t0=t0,
         t1=t1,
         dt=dt,
-        feax_context=getattr(domain, "_feax_context", {}) or {},
+        eval_context=getattr(domain, "_fem_eval_context", {}) or {},
     )
 
     if nonlinear:
@@ -361,7 +369,7 @@ def _assemble_1d_transient(domain, volume_terms, boundary_terms, dirichlet_value
         residual = _apply_dirichlet_rows(spatial_res, dirichlet_pairs)
         dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
         M_nl = M if dofs is None else M.at[dofs, :].set(0.0).at[:, dofs].set(0.0)
-        block = FeaxTimeBlock(
+        block = SemidiscreteTimeBlock(
             mass=lambda t, args=None, _M=M_nl: _M,
             residual=lambda u, t, args=None: residual(jnp.asarray(u)),
             jacobian=lambda u, t, args=None: jax.jacfwd(residual)(jnp.asarray(u)),
@@ -373,18 +381,18 @@ def _assemble_1d_transient(domain, volume_terms, boundary_terms, dirichlet_value
     A = jax.jacfwd(spatial_res)(jnp.zeros(ndof))
     c = -spatial_res(jnp.zeros(ndof))
     M, A, c = _apply_dirichlet_transient(M, A, c, dirichlet_pairs)
-    block = FeaxTimeBlock(M=M, A=A, affine_bias=c, **common)
+    block = SemidiscreteTimeBlock(M=M, A=A, affine_bias=c, **common)
     return block, "transient"
 
 
 # ==========================================================================
 # coupled / mixed multi-field 1D (block native assembly)
 # ==========================================================================
-# The native analogue of the 2D/3D feax block path: feax has no LINE2 element, so
-# we hand-build the block residual. Each field is a scalar/vector unknown on the
+# The 1D analogue of the 2D/3D block path: hand-build the block residual for
+# LINE2 elements. Each field is a scalar/vector unknown on the
 # shared LINE2 mesh; the global DOF vector is laid out by field block —
-# ``offset[i] = sum_{j<i} n_nodes * vec_j`` (matching the feax ``problem.offset``
-# convention) — so the user slices the solution exactly as in 2D/3D coupled.
+# ``offset[i] = sum_{j<i} n_nodes * vec_j`` — so the user slices the solution
+# exactly as in 2D/3D coupled.
 
 
 def _block_offsets(fields: List[Any], n_nodes: int) -> List[int]:
@@ -425,7 +433,7 @@ def _make_multifield_residual_1d(domain, term_list, boundary_term_list, fields, 
 
     The native analogue of ``_eval_multifield_volume_integrand``: per element it builds
     one ``local`` with per-field shape data (``local["fields"]``) and evaluates each
-    ``(coeff, test_field_index)`` via the shared ``_eval_expr_for_feax``, scattering the
+    ``(coeff, test_field_index)`` via the shared ``_eval_integrand``, scattering the
     element residual into the **test field's** block DOFs. Boundary (Neumann/Robin)
     terms ride the degenerate one-node element, same as the single-field path."""
     nodes = jnp.asarray(domain.mesh.points)[:, 0]
@@ -507,7 +515,7 @@ def _make_multifield_residual_1d(domain, term_list, boundary_term_list, fields, 
 
 def _typed_terms_1d(domain, bares, field_index):
     """Lower + sign-split each bare into ``(coeff, test_field_index)`` pairs."""
-    from .feax_utils import _lower_statefield_to_trial, _test_field_index
+    from .fem_utils import _lower_statefield_to_trial, _test_field_index
     from .weak_form import _apply_sign, _split_additive_terms
 
     out = []
@@ -527,12 +535,12 @@ def _typed_terms_1d(domain, bares, field_index):
 def assemble_fem_1d_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, *, quad_degree):
     """Assemble a coupled (multi-field) 1D weak form into ``(op, mode)`` for :class:`FEM`.
 
-    Native block analogue of ``_assemble_multifield`` (which uses feax for 2D/3D). The
+    1D block analogue of the 2D/3D ``_assemble_multifield``. The
     field layout ``(fields, field_index)`` is inferred once from the volume trial
     functions and threaded into every block builder so the mass / operator / residual
     blocks share one ordering."""
     from ...trace import FemResidualOperator
-    from .feax_utils import _infer_fields, _lower_statefield_to_trial
+    from .fem_utils import _infer_fields, _lower_statefield_to_trial
     from .weak_form import _contains_temporal_derivative, _is_obviously_nonlinear_in_unknown
 
     n_nodes = int(np.asarray(domain.mesh.points).shape[0])
@@ -629,12 +637,12 @@ def _assemble_1d_multifield_transient(
 ):
     """Coupled 1D first-order transient: block mass + block spatial operator/residual.
 
-    Mirrors ``_assemble_multifield_transient`` (2D/3D) natively: split the volume terms
-    into a mass list (temporal-derivative terms, ``u_t``->``u``) and a spatial list,
-    build a block ``M`` and the block spatial operator/residual sharing one field index.
-    Scope (as in 2D/3D): every field must carry a time derivative; homogeneous Dirichlet."""
-    from .backend_blocks import FeaxTimeBlock
-    from .feax_utils import _lower_statefield_to_trial, _test_field_index
+    Mirrors the 2D/3D coupled transient path: split the volume terms into a mass list
+    (temporal-derivative terms, ``u_t``->``u``) and a spatial list, build a block ``M`` and the
+    block spatial operator/residual sharing one field index. Scope (as in 2D/3D): every field must
+    carry a time derivative; homogeneous Dirichlet."""
+    from .backend_blocks import SemidiscreteTimeBlock
+    from .fem_utils import _lower_statefield_to_trial, _test_field_index
     from .time_route import _infer_time_window, _strip_temporal_trial_derivative
     from .weak_form import (
         _apply_sign,
@@ -681,7 +689,7 @@ def _assemble_1d_multifield_transient(
     state0 = _multifield_initial_state_1d(domain, fields, field_index, ic_residuals, n_nodes)
     t0, t1, dt = _infer_time_window(domain)
     common = dict(
-        backend="feax_time",
+        backend="transient",
         mode="implicit",
         time_order=1,
         spatial_kind="weak_form",
@@ -689,7 +697,7 @@ def _assemble_1d_multifield_transient(
         t0=t0,
         t1=t1,
         dt=dt,
-        feax_context=getattr(domain, "_feax_context", {}) or {},
+        eval_context=getattr(domain, "_fem_eval_context", {}) or {},
     )
 
     all_terms = list(volume_terms) + [t for ts in boundary_terms.values() for t in ts]
@@ -697,7 +705,7 @@ def _assemble_1d_multifield_transient(
         residual = _apply_dirichlet_rows(spatial_res, dirichlet_pairs)
         dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
         M_nl = M if dofs is None else M.at[dofs, :].set(0.0).at[:, dofs].set(0.0)
-        block = FeaxTimeBlock(
+        block = SemidiscreteTimeBlock(
             mass=lambda t, args=None, _M=M_nl: _M,
             residual=lambda u, t, args=None: residual(jnp.asarray(u)),
             jacobian=lambda u, t, args=None: jax.jacfwd(residual)(jnp.asarray(u)),
@@ -708,5 +716,5 @@ def _assemble_1d_multifield_transient(
     A = jax.jacfwd(spatial_res)(jnp.zeros(total))
     c = -spatial_res(jnp.zeros(total))
     M, A, c = _apply_dirichlet_transient(M, A, c, dirichlet_pairs)
-    block = FeaxTimeBlock(M=M, A=A, affine_bias=c, **common)
+    block = SemidiscreteTimeBlock(M=M, A=A, affine_bias=c, **common)
     return block, "transient"

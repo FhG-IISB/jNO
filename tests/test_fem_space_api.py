@@ -23,7 +23,7 @@ def test_symbol_space_defaults_to_lagrange_and_is_settable():
 
 
 def test_infer_fields_carries_space():
-    from jno.utils.solver.feax_utils import _infer_fields
+    from jno.utils.solver.fem_utils import _infer_fields
 
     fields, _ = _infer_fields(TrialFunction(value_shape=(2,), space="RT"))
     assert len(fields) == 1
@@ -43,7 +43,6 @@ def test_trial_spaces_detects_nonnodal():
 def test_fem_symbols_threads_space_and_rejects_not_yet_wired_family():
     # RT is wired through the DSL (see test_fem_nonnodal_dsl); a family not yet implemented must
     # still error clearly rather than silently assemble a Lagrange system.
-    pytest.importorskip("feax", reason="feax required for jno.fem")
     pytest.importorskip("pygmsh", reason="pygmsh required for 2D meshing")
     from shapely.geometry import box
 

@@ -4,119 +4,16 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
 # ---------------------------------------------------------------------
-# Solver-facing output blocks
-# ---------------------------------------------------------------------
-
-
-@dataclass
-class DiffraxBlock:
-    """
-    Solver-facing block for Diffrax-based time integration.
-
-    A `DiffraxBlock` is returned by strong-form time assembly routes.
-
-    It stores the complete information needed to call Diffrax externally:
-    the initial state, time interval, step-size hint, right-hand side function,
-    optional mass operator, and metadata describing how the block was produced.
-
-    Typical equation represented
-    ----------------------------
-    First-order explicit system:
-
-        y_dot = rhs(t, y, args)
-
-    For converted FEAX-time blocks, the RHS is usually created from either:
-
-        M u_dot + A u = c + f(t)
-
-    or:
-
-        M(t) u_dot + R(u, t) = 0
-
-    Important fields
-    ----------------
-    backend:
-        Backend identifier. Usually `"diffrax"`.
-    form:
-        Description of the lowered system form, for example
-        `"explicit_first_order"` or `"explicit_first_order_nonlinear"`.
-    time_order:
-        Original temporal order of the symbolic problem.
-    original_expr:
-        Original symbolic expression or weak-form IR used to build the block.
-    lowered_rhs:
-        Optional lowered symbolic RHS expression, when available.
-    rewritten_system:
-        Optional metadata for rewritten systems, such as second-order to
-        first-order reductions.
-    state0:
-        Initial solver state.
-    initial_conditions:
-        Raw user-provided initial-condition object, if supplied.
-    t0, t1:
-        Start and end time.
-    dt0:
-        Initial time-step hint for Diffrax.
-    rhs:
-        Callable with signature `rhs(t, y, args)`.
-    term:
-        Diffrax term object, usually `diffrax.ODETerm(rhs)`.
-    args:
-        Optional static/runtime arguments passed to the RHS.
-    mass:
-        Optional mass operator callable.
-    state_meta:
-        Metadata about the state layout.
-    metadata:
-        Diagnostic and lowering metadata.
-    """
-
-    backend: str = "diffrax"
-    form: str = "explicit_first_order"
-    time_order: int = 1
-
-    original_expr: Any = None
-    lowered_rhs: Any = None
-    rewritten_system: Any = None
-
-    state0: Any = None
-    initial_conditions: Any = None
-
-    t0: float = 0.0
-    t1: float = 1.0
-    dt0: Optional[float] = None
-
-    rhs: Optional[Callable] = None
-    term: Any = None
-    args: Any = None
-    mass: Optional[Callable] = None
-
-    state_meta: Dict[str, Any] = field(default_factory=dict)
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-    # Periodic prolongation matrix P (n_full x n_red); None when absent.
-    prolongation: Any = None
-
-    def prolong(self, reduced):
-        """Map reduced periodic DOFs back to the full nodal layout."""
-        if self.prolongation is None:
-            return reduced
-        from .feax_utils import prolong as _prolong
-
-        return _prolong(self.prolongation, reduced)
-
-
-# ---------------------------------------------------------------------
 # Solver-agnostic semidiscrete block returned by weak.assemble(...)
 # ---------------------------------------------------------------------
 
 
 @dataclass
-class FeaxTimeBlock:
+class SemidiscreteTimeBlock:
     """
     Solver-agnostic semidiscrete transient block.
 
-    A `FeaxTimeBlock` is returned by:
+    A `SemidiscreteTimeBlock` is returned by:
 
         weak_expr.assemble(target="fem_time")
 
@@ -173,7 +70,7 @@ class FeaxTimeBlock:
     boundary_exprs:
         Boundary weak-form terms grouped by boundary region id.
     rhs:
-        Optional RHS callable. Usually unused for FEAX-time weak-form blocks.
+        Optional RHS callable. Usually unused for semidiscrete weak-form blocks.
     jacobian:
         Nonlinear residual Jacobian callable `jacobian(u, t, args)`.
     mass:
@@ -181,7 +78,7 @@ class FeaxTimeBlock:
     residual:
         Nonlinear residual callable `residual(u, t, args)`.
     nonlinear_runtime:
-        Runtime diagnostics for nonlinear FEAX-time assembly.
+        Runtime diagnostics for nonlinear semidiscrete-time assembly.
     state0:
         Initial state vector.
     initial_conditions:
@@ -190,8 +87,8 @@ class FeaxTimeBlock:
         Start and end time.
     dt:
         Time-step size or time-step hint.
-    feax_context:
-        FEAX/FEM context copied from the domain.
+    eval_context:
+        FEM evaluation context copied from the domain.
     metadata:
         Classification, lowering, and diagnostic metadata.
     M, A:
@@ -205,14 +102,12 @@ class FeaxTimeBlock:
         Constant affine vector `c` in `M u_dot + A u = c + f(t)`.
     forcing_vector_fn:
         Optional forcing callback `f(t, args)`.
-    feax_mesh:
-        FEAX mesh used by FEAX pipeline conversion.
     forcing_mode:
         Text label describing how forcing is represented, for example
         `"none"`, `"weak_auto"`, `"user_callback"`, or `"embedded_residual"`.
     """
 
-    backend: str = "feax_time"
+    backend: str = "transient"
     mode: str = "implicit"
     time_order: int = 1
     spatial_kind: str = "weak_form"
@@ -237,7 +132,7 @@ class FeaxTimeBlock:
     t1: float = 1.0
     dt: Optional[float] = None
 
-    feax_context: Dict[str, Any] = field(default_factory=dict)
+    eval_context: Dict[str, Any] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     # linear semidiscrete payload
@@ -260,8 +155,7 @@ class FeaxTimeBlock:
     # Periodic prolongation matrix P (n_full x n_red); None when absent.
     prolongation: Any = None
 
-    # optional mesh / hints
-    feax_mesh: Any = None
+    # optional hints
     forcing_mode: str = "none"
 
     def is_linear(self) -> bool:
@@ -276,10 +170,14 @@ class FeaxTimeBlock:
         return self.M is not None and (self.A is not None or self.operator_fn is not None)
 
     def prolong(self, reduced):
-        """Map reduced periodic DOFs back to the full nodal layout."""
+        """Map reduced periodic DOFs back to the full nodal layout (single- or multi-field)."""
         if self.prolongation is None:
             return reduced
-        from .feax_utils import prolong as _prolong
+        if isinstance(self.prolongation, dict):  # multifield periodic carries the per-field reduction
+            from .fem_utils import prolong_periodic
+
+            return prolong_periodic(self.prolongation, reduced)
+        from .fem_utils import prolong as _prolong
 
         return _prolong(self.prolongation, reduced)
 
@@ -293,6 +191,69 @@ class FeaxTimeBlock:
             mass(t) u_dot + residual(u, t) = 0
         """
         return self.mass is not None and self.residual is not None
+
+    def step(self, u, t, dt, args=None, theta=None):
+        """Advance the semidiscrete state by one implicit step: ``u(t) -> u(t + dt)``.
+
+        The composable one-step primitive behind :func:`_default_transient_integrate` (which is just
+        a ``lax.scan`` over this method) and the building block for operator-splitting / IMEX schemes.
+        Functional (returns the next state) and reverse-mode differentiable.
+
+        * **linear** block -> one theta-step
+          ``(M + theta dt A) u_next = (M - (1-theta) dt A) u + dt c + dt f`` via the matrix-free
+          BiCGStab + Jacobi solver (operators applied only as matvecs, so a BCOO ``A`` stays sparse);
+        * **nonlinear** block -> one backward-Euler Newton solve
+          ``M(t+dt)(u_next - u)/dt + R(u_next, t+dt, args) = 0`` (matrix-free Newton-Krylov).
+
+        ``theta`` defaults to ``metadata["theta"]`` (1 backward Euler / 1/2 trapezoidal). Operates in
+        the block's (periodic-reduced) DOF space; use :meth:`prolong` for the full nodal field.
+        """
+        import jax
+        import jax.numpy as jnp
+
+        args = args or {}
+        u = jnp.asarray(u).reshape(-1)
+        dtype = u.dtype
+        t_next = t + dt
+
+        # keep a BCOO operator as-is (matrix-free matvec) but coerce a dense one to a JAX array
+        def _operand(x):
+            return x if hasattr(x, "todense") else jnp.asarray(x, dtype)
+
+        if self.is_nonlinear():
+            from .newton_krylov import newton_krylov
+
+            M_t = _operand(self.mass(t_next, args))
+
+            def G(wn):
+                return (M_t @ (wn - u)) / dt + jnp.asarray(self.residual(wn, t_next, args), dtype).reshape(-1)
+
+            return newton_krylov(G, u)
+
+        from .linear import matrix_diagonal
+
+        th = theta if theta is not None else (float(self.metadata.get("theta", 1.0)) if self.metadata else 1.0)
+        M = _operand(self.M)
+        n = M.shape[0]
+        c = jnp.zeros((n,), dtype) if self.affine_bias is None else jnp.asarray(self.affine_bias, dtype).reshape(-1)
+        A = _operand(self.operator_fn(t_next, args) if self.operator_fn is not None else self.A)
+
+        def _forcing(tt):
+            if self.forcing_vector_fn is None:
+                return jnp.zeros((n,), dtype)
+            return jnp.asarray(self.forcing_vector_fn(tt, args), dtype).reshape(-1)
+
+        # (M + theta dt A) u_next = (M - (1-theta) dt A) u + dt c + dt(theta f_next + (1-theta) f_now)
+        f_avg = th * _forcing(t_next) + (1.0 - th) * _forcing(t)
+        rhs = M @ u - (1.0 - th) * dt * (A @ u) + dt * c + dt * f_avg
+        step_op = lambda wn: M @ wn + th * dt * (A @ wn)  # noqa: E731  the theta-method step operator
+        # diagonal (Jacobi) preconditioner 1/diag(M + theta dt A); zero diagonals left unscaled
+        d = matrix_diagonal(M) + th * dt * matrix_diagonal(A)
+        inv = 1.0 / jnp.where(jnp.abs(d) > 1e-30, d, 1.0)
+        wn, _ = jax.scipy.sparse.linalg.bicgstab(
+            step_op, rhs, x0=u, tol=1e-10, atol=0.0, maxiter=20_000, M=lambda x: inv * x
+        )
+        return wn
 
     def solve(self, solve_fn=None, *, save_ts=None):
         """Differentiable transient forward solve -> the trajectory ``u(save_ts)`` as a
@@ -312,13 +273,13 @@ class FeaxTimeBlock:
         ``solve_fn`` is **your** integrator: any ``(block, args, save_ts) -> ys`` callable
         returning a ``(len(save_ts), n_dofs)`` trajectory; jNO writes none and imposes no
         library. The default :func:`_default_transient_integrate` is a backward-Euler
-        ``lax.scan`` over the block's own assembled ``dt``. To bring your own (e.g. diffrax),
+        ``lax.scan`` over the block's own assembled ``dt``. To bring your own integrator,
         build it from the block's flat pieces -- ``block.M``, ``block.A`` (or
         ``block.operator_fn(t, args)``) and ``block.state0`` -- and form ``u_dot = M^-1(c - A u)``.
         Note a Dirichlet problem zeroes M's Dirichlet rows (a DAE), so the implicit
         ``(M + dt A)`` default is preferred there; an explicit field must hold those rows.
 
-        Enable x64 (``jax_enable_x64``); the feax assembly is float64.
+        Enable x64 (``jax_enable_x64``); the assembly is float64.
         """
         from ...trace import FunctionCall  # lazy: avoid an import cycle with jno.trace
 
@@ -363,58 +324,28 @@ def _default_transient_integrate(block, args, save_ts):
       unrolling Newton -- the same solver the steady nonlinear ``.solve`` now uses.
 
     This is a *default*: pass any ``solve_fn(block, args, save_ts) -> ys`` to
-    :meth:`FeaxTimeBlock.solve` (a hand-rolled stepper, or diffrax built from the block's
+    :meth:`SemidiscreteTimeBlock.solve` (a hand-rolled stepper built from the block's
     ``M`` / ``A`` / ``state0``) to use a different integrator.
     """
     import jax
     import jax.numpy as jnp
-
-    from .newton_krylov import newton_krylov
-
-    # keep a BCOO operator as-is (matrix-free matvec) but coerce a dense one to a JAX array
-    def _operand(x):
-        return x if hasattr(x, "todense") else jnp.asarray(x, dtype)
 
     s0 = jnp.asarray(block.state0).reshape(-1)
     dtype = s0.dtype
     grid_ts = jnp.asarray(_block_time_grid(block), dtype)
     dt = float(block.dt)
 
-    # One general backward-Euler step for both payloads: each step solves the root
-    # G(u_next) = 0 with the matrix-free Newton-Krylov solver (no optimistix). For the linear
-    # block G is affine, so Newton converges in one iteration -> one inner BiCGStab solve; the
-    # operators are only ever applied as matvecs (M @ v, A @ v), so a BCOO operator stays sparse.
-    if block.is_nonlinear():
-        mass_fn, residual_fn = block.mass, block.residual
+    # One scan step = one implicit advance of the block. `block.step` is the single definition of
+    # that step (theta-method for a linear block, backward-Euler Newton for a nonlinear one); read
+    # theta from the block so a linear step uses the assembled scheme. Operators are only applied as
+    # matvecs inside block.step, so a BCOO operator stays sparse.
+    theta = float(block.metadata.get("theta", 1.0)) if getattr(block, "metadata", None) else 1.0
 
-        def step(w, t_next):
-            M_t = _operand(mass_fn(t_next, args))
+    def step(w, t_next):
+        wn = block.step(w, t_next - dt, dt, args=args, theta=theta)
+        return wn, wn
 
-            def G(wn):
-                return (M_t @ (wn - w)) / dt + jnp.asarray(residual_fn(wn, t_next, args), dtype).reshape(-1)
-
-            wn = newton_krylov(G, w)
-            return wn, wn
-
-        _, ys = jax.lax.scan(step, s0, grid_ts[1:])
-    else:
-        M = _operand(block.M)
-        n = M.shape[0]
-        c = jnp.zeros((n,), dtype) if block.affine_bias is None else jnp.asarray(block.affine_bias, dtype).reshape(-1)
-
-        def step(w, t_next):
-            A = _operand(block.operator_fn(t_next, args) if block.operator_fn is not None else block.A)
-            rhs = M @ w + dt * c
-            if block.forcing_vector_fn is not None:
-                rhs = rhs + dt * jnp.asarray(block.forcing_vector_fn(t_next, args), dtype).reshape(-1)
-
-            def G(wn):  # affine residual: (M + dt A) wn - rhs ; root is the backward-Euler update
-                return M @ wn + dt * (A @ wn) - rhs
-
-            wn = newton_krylov(G, w)
-            return wn, wn
-
-        _, ys = jax.lax.scan(step, s0, grid_ts[1:])
+    _, ys = jax.lax.scan(step, s0, grid_ts[1:])
 
     traj = jnp.concatenate([s0[None, :], ys], axis=0)  # (n_grid, n_dofs) at grid_ts
     save_ts = jnp.asarray(save_ts, dtype)
