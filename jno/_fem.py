@@ -365,15 +365,6 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
     )
     if "initial" in tags or initial_temporal:
         return "initial", "initial"
-    boundary_tags = {t for t in tags if t in getattr(domain, "_boundary_regions", {})}
-    interiorish = tags - boundary_tags
-
-    if len(boundary_tags) > 1 or (boundary_tags and interiorish):
-        raise ValueError(
-            f"jno.fem: a residual spans multiple regions {sorted(tags)}; each residual must live on a single region."
-        )
-    if boundary_tags:
-        return "boundary", next(iter(boundary_tags))
     # Interior sub-region (sub-domain) volume term: the coords carry a registered interior region --
     # a geometry part (`_source_regions`) or a `domain.tag` predicate that is NOT a boundary region.
     # The term integrates over that region's cells only (per-cell centroid mask, applied at assembly).
@@ -395,6 +386,27 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
         if t in tag_preds and t not in _bregions:
             return t
         return None
+
+    # An interior sub-region tag takes precedence over a coincidental boundary-region collision:
+    # `from_regions` may also register a fully-enclosed part's `interior_<name>` tag in
+    # `_boundary_regions` (its mesh boundary is a closed internal interface). For a VOLUME term (test
+    # function present) that part must integrate over its *cells*, not be misread as a (face-less)
+    # boundary term -> b == 0. But a TRIAL-ONLY Dirichlet `u(interior_<name>) - g` legitimately pins
+    # that region's *node set* (a volumetric hard constraint), so there the boundary/node-set
+    # classification is exactly what we want -- keep it.
+    has_test = _contains(constraint, TestFunction)
+    if has_test:
+        boundary_tags = {t for t in tags if t in _bregions and _subregion_id(t) is None}
+    else:
+        boundary_tags = {t for t in tags if t in _bregions}
+    interiorish = tags - boundary_tags
+
+    if len(boundary_tags) > 1 or (boundary_tags and interiorish):
+        raise ValueError(
+            f"jno.fem: a residual spans multiple regions {sorted(tags)}; each residual must live on a single region."
+        )
+    if boundary_tags:
+        return "boundary", next(iter(boundary_tags))
 
     subregions = {r for r in (_subregion_id(t) for t in interiorish) if r is not None}
     if len(subregions) > 1:

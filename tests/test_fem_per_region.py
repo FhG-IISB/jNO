@@ -167,6 +167,33 @@ def test_from_regions_per_region_conductivity_restricts():
         )
 
 
+def test_from_regions_enclosed_part_load_integrates_over_its_cells():
+    """A volume LOAD/source over a *fully enclosed* ``from_regions`` part (e.g. a heater island inside a
+    surrounding medium) must integrate over that part's cells -- ``sum(b) ~ area``.
+
+    Regression: ``from_regions`` also registers an enclosed part's ``interior_<name>`` tag in
+    ``_boundary_regions`` (its mesh boundary is a closed internal interface), so ``_region_and_support``
+    misread the volume term as a *boundary* term -- which has no boundary face, so the load silently
+    assembled to **zero** (and an all-sub-region system raised "no trial fields"). The interior sub-region
+    interpretation must take precedence over the boundary-region collision. The surrounding part's load
+    (which touches the domain boundary) was unaffected, so this is specifically the enclosed-part case."""
+    from shapely.geometry import box
+
+    inner = box(0.3, 0.3, 0.7, 0.7)  # fully enclosed island
+    outer = box(0.0, 0.0, 1.0, 1.0).difference(inner)
+    d = jno.domain.csg.from_regions({"inner": inner, "outer": outer}, mesh_size=0.06, time=None)
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior_inner", split=True)
+    xo, yo, _ = d.variable("interior_outer", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    uo, vo = u.bind(x=xo, y=yo), v.bind(x=xo, y=yo)
+    # stiffness over both parts (trial everywhere) + a unit load over the ENCLOSED part
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y, uo.x * vo.x + uo.y * vo.y, -1.0 * vi, u(xb, yb) - 0.0])
+    area = float(np.asarray(fem.b).sum())
+    assert abs(area - 0.16) < 5e-3, f"enclosed-part load should integrate to its area (0.16), got {area:.4f}"
+
+
 def test_from_regions_multi_region_residual_is_rejected():
     """A single residual that spans two ``from_regions`` parts must raise (the same single-region guard as
     for ``domain.tag`` regions) -- proves the parts are recognized as distinct regions, not silently fused
