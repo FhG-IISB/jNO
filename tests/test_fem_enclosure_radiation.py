@@ -479,3 +479,98 @@ def test_coupled_conduction_radiation_concentric_cylinders():
     g = float(jax.grad(mean_inner_T)(eps1))
     fd = float((mean_inner_T(eps1 + 1e-3) - mean_inner_T(eps1 - 1e-3)) / 2e-3)
     assert np.isfinite(g) and abs(g - fd) / (abs(fd) + 1e-8) < 1.5e-2, f"grad {g:.3f} vs finite-diff {fd:.3f}"
+
+
+def test_radiation_coupling_term_in_jno_fem_matches_analytic():
+    """``gap.radiation(T, ...)`` passed IN the ``jno.fem([...])`` list folds the nonlocal grey-body load
+    into the residual (promoting the linear conduction form to nonlinear); the coupled conduction+radiation
+    system then reproduces the closed-form concentric-cylinder series solution -- i.e. the first-class term
+    assembles the same physics as the hand-rolled ``A u - b + load(q_rad(u))`` above. A ``jno.np.parameter``
+    (conductivity, here in the form via the operator's runtime args) stays differentiable through it, so it
+    trains through ``jno.core``. (The matrix-free default solver stalls on this penalty-Dirichlet case, so
+    we drive the operator's residual with a direct-solve Newton -- jno imposes no solver.)"""
+    from shapely.geometry import Point
+
+    import jno
+
+    pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
+    from scipy.optimize import fsolve
+
+    def newton(residual, u0, steps=60, tol=1e-9):  # BYO direct-solve Newton (custom_root -> differentiable)
+        f = lambda uu: jnp.asarray(residual(uu)).reshape(-1)  # noqa: E731
+
+        def _solve(fn, x0):
+            def body(s):
+                du = jnp.linalg.solve(jax.jacfwd(fn)(s[0]), -fn(s[0]))
+                return s[0] + du, jnp.linalg.norm(du), s[2] + 1
+
+            return jax.lax.while_loop(lambda s: (s[1] > tol) & (s[2] < steps), body, (x0, jnp.array(1.0, x0.dtype), 0))[0]
+
+        return jax.lax.custom_root(
+            f, jnp.asarray(u0).reshape(-1), _solve, lambda g, y: jnp.linalg.solve(jax.jacfwd(g)(jnp.zeros_like(y)), y)
+        )
+
+    sigma = 5.670374419e-8
+    r0, r1, r2, r3 = 0.10, 0.20, 0.25, 0.35
+    k0, eps1, eps2, T_hot, T_cold = 20.0, 0.8, 0.6, 1000.0, 300.0
+    ring = lambda a, b: Point(0, 0).buffer(b, 16).difference(Point(0, 0).buffer(a, 16))  # noqa: E731
+    d = jno.domain(ring(r0, r1).union(ring(r2, r3)), mesh_size=0.45)
+    rad = lambda x, y: jnp.hypot(x, y)  # noqa: E731
+    d.tag("hot", lambda x, y: jnp.abs(rad(x, y) - r0) < 4e-2)
+    d.tag("cold", lambda x, y: jnp.abs(rad(x, y) - r3) < 4e-2)
+    d.tag("inner_gap", lambda x, y: jnp.abs(rad(x, y) - r1) < 4e-2)
+    d.tag("outer_gap", lambda x, y: jnp.abs(rad(x, y) - r2) < 4e-2)
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    xh, yh, _ = d.variable("hot", split=True)
+    xc, yc, _ = d.variable("cold", split=True)
+    gap = d.enclosure(["inner_gap", "outer_gap"])
+    gap.check()
+    mi, mo = gap.tag_mask("inner_gap"), gap.tag_mask("outer_gap")
+    ar = np.asarray(gap.areas)
+
+    # conductivity as a runtime parameter; radiation as a FIRST-CLASS term in the jno.fem list
+    kp = jno.np.parameter((1,), name="kcond")
+    kp.initialize(jax.nn.initializers.constant(k0))
+    fem = jno.fem(
+        [
+            kp * (ui.x * vi.x + ui.y * vi.y),
+            gap.radiation(u, emissivity={"inner_gap": eps1, "outer_gap": eps2}, sigma=sigma),
+            u(xh, yh) - T_hot,
+            u(xc, yc) - T_cold,
+        ]
+    )
+    assert fem._mode == "nonlinear", "the radiation coupling must promote the linear conduction form to nonlinear"
+    op = fem.operator
+    nd = int(fem.dofs)
+
+    def coupled(kval):  # the coupled solve as a function of the conductivity parameter (via the operator's args)
+        res = lambda w: jnp.asarray(op.residual(w, {"kcond": jnp.atleast_1d(kval)})).reshape(-1)  # noqa: E731
+        return newton(res, jnp.full((nd,), 0.5 * (T_hot + T_cold)))
+
+    T = np.asarray(coupled(k0))
+    assert np.all(np.isfinite(T)) and T.min() > T_cold - 1 and T.max() < T_hot + 1
+    Tsf = np.asarray(gap.field(jnp.asarray(T)))
+    Ts1 = float((Tsf[mi] * ar[mi]).sum() / ar[mi].sum())
+    Ts2 = float((Tsf[mo] * ar[mo]).sum() / ar[mo].sum())
+    D = 1 / eps1 + (r1 / r2) * (1 / eps2 - 1)
+    ts1_a, ts2_a = fsolve(
+        lambda x: [
+            2 * np.pi * k0 * (T_hot - x[0]) / np.log(r1 / r0) - 2 * np.pi * r1 * sigma * (x[0] ** 4 - x[1] ** 4) / D,
+            2 * np.pi * r1 * sigma * (x[0] ** 4 - x[1] ** 4) / D - 2 * np.pi * k0 * (x[1] - T_cold) / np.log(r3 / r2),
+        ],
+        [800.0, 500.0],
+    )
+    assert T_hot > Ts1 > Ts2 > T_cold
+    assert abs(Ts1 - ts1_a) / ts1_a < 1.5e-2 and abs(Ts2 - ts2_a) / ts2_a < 1.5e-2, (
+        f"coupling-term Ts1 {Ts1:.1f}/{ts1_a:.1f}, Ts2 {Ts2:.1f}/{ts2_a:.1f}"
+    )
+
+    # the conductivity parameter is differentiable THROUGH the coupled (conduction+radiation) solve
+    qoi = lambda kv: (gap.field(coupled(kv))[jnp.asarray(mi)]).mean()  # noqa: E731
+    g = float(jax.grad(qoi)(k0))
+    fd = float((qoi(k0 + 1e-2) - qoi(k0 - 1e-2)) / 2e-2)
+    assert np.isfinite(g) and abs(g) > 1e-6 and abs(g - fd) / (abs(fd) + 1e-8) < 3e-2, (
+        f"parameter grad through the radiation coupling {g:.4f} vs FD {fd:.4f}"
+    )

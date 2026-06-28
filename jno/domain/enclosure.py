@@ -179,6 +179,42 @@ class Enclosure:
         load = load.at[jnp.asarray(self.elements[:, 1])].add(half)
         return load
 
+    def radiation(self, field, *, emissivity, sigma: float = 5.670374419e-8, scale=1.0, offset=0.0, size=None):
+        """A grey-body enclosure-radiation **coupling term** for ``jno.fem([...])``.
+
+        Returns a :class:`jno._fem.Coupling` whose residual is the net radiative surface load this
+        enclosure exerts on the temperature ``field``: with absolute per-element temperatures
+        ``Tk = field(u) + offset``, the radiosity is ``J = (I - rho F)^{-1} eps sigma Tk^4`` (``rho=1-eps``),
+        the net flux per element is ``s_row*J - F@J``, and the consistent nodal load is scattered back.
+        ``jno.fem`` adds ``scale * load`` to the assembled residual and ``fem.solve()`` solves the coupled
+        conduction+radiation system **implicitly** (Newton-Krylov, ``custom_root``), so it is differentiable
+        in any ``jno.np.parameter`` in the form and trains through ``jno.core`` -- no bring-your-own loop::
+
+            gap  = d.enclosure(solids, axisymmetric=True, medium_tags=["Gas","Air"])
+            fem  = jno.fem([conduction, gap.radiation(T, emissivity=eps_map), u(xc,yc)-T_COOL])
+            Tsol = fem.solve(u0=T_guess)        # conduction + radiation, one implicit solve
+
+        ``emissivity`` is a ``{tag: eps}`` map or a scalar (see :meth:`emissivity`); ``sigma`` the
+        Stefan-Boltzmann constant (use a non-dimensional value with ``offset`` = absolute-temperature
+        offset, since ``T^4`` is not offset-invariant); ``scale`` an optional conduction-radiation number.
+        The temperature must be a **scalar P1** field on the mesh nodes (this enclosure's global node
+        indices address its DOFs); ``size`` defaults to the node count. Multifield / transient coupling is
+        not yet wired (``jno.fem`` raises). Pure-JAX, so it composes with autodiff and ``jno.core``."""
+        from .._fem import Coupling
+
+        F = jnp.asarray(self.view_factor)
+        eps = self.emissivity(emissivity)
+        rho = 1.0 - eps
+        eye = jnp.eye(self.size)
+        s_row = F.sum(axis=1)
+
+        def residual_fn(u):
+            Tk = self.field(u) + offset
+            J = jnp.linalg.solve(eye - rho[:, None] * F, eps * sigma * Tk**4)
+            return scale * self.load(s_row * J - F @ J, size=size)
+
+        return Coupling(residual_fn, name="radiation", field_key=getattr(field, "field_key", None))
+
     def quality(self):
         """Return ``(closure_error, reciprocity_error)`` for the assembled ``F`` (raw, un-normalized).
 
@@ -429,8 +465,13 @@ def build_enclosure(
         # the element size — callers can override via ``r_min``.
         rmin = 0.5 * float(np.median(length)) if r_min is None else float(r_min)
         F = MeshUtils.get_view_factor_axisymmetric_element(
-            jnp.asarray(e0), jnp.asarray(e1), jnp.asarray(normals), jnp.asarray(vm),
-            n_quad=n_quad, n_phi=n_phi, r_min=rmin,
+            jnp.asarray(e0),
+            jnp.asarray(e1),
+            jnp.asarray(normals),
+            jnp.asarray(vm),
+            n_quad=n_quad,
+            n_phi=n_phi,
+            r_min=rmin,
         )
         areas = 2.0 * np.pi * mids[:, 0] * length  # ring areas
     else:
