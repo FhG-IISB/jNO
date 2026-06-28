@@ -542,6 +542,9 @@ def test_radiation_coupling_term_in_jno_fem_matches_analytic():
         ]
     )
     assert fem._mode == "nonlinear", "the radiation coupling must promote the linear conduction form to nonlinear"
+    from jno._fem import Coupling  # the weak-form `flux * test` spelling builds the same radiation Coupling
+
+    assert isinstance(gap.flux(u, {"inner_gap": eps1, "outer_gap": eps2}, sigma=sigma) * vi, Coupling)
     op = fem.operator
     nd = int(fem.dofs)
 

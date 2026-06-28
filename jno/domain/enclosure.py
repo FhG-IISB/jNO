@@ -102,6 +102,24 @@ def _solid_polygon_visibility(domain, elem_tag, mids, normals, length):
     return vm
 
 
+class _RadiationFlux:
+    """Result of :meth:`Enclosure.flux` — a net grey-body surface flux that becomes a radiation
+    :class:`jno._fem.Coupling` when multiplied by a test function (``gap.flux(T, eps) * sT``), so radiation
+    reads as ``flux * test`` like any other weak-form term. The test function only marks the equation; the
+    flux already knows its surface DOFs from the enclosure."""
+
+    def __init__(self, gap, field, kw):
+        self._gap, self._field, self._kw = gap, field, kw
+
+    def _as_coupling(self):
+        return self._gap.radiation(self._field, **self._kw)
+
+    def __mul__(self, test):
+        return self._as_coupling()
+
+    __rmul__ = __mul__
+
+
 class Enclosure:
     """Geometric handle for an enclosure-radiation surface set (see module docstring).
 
@@ -214,6 +232,17 @@ class Enclosure:
             return scale * self.load(s_row * J - F @ J, size=size)
 
         return Coupling(residual_fn, name="radiation", field_key=getattr(field, "field_key", None))
+
+    def flux(self, field, emissivity, *, sigma: float = 5.670374419e-8, offset=0.0, scale=1.0):
+        """The net grey-body radiative flux this enclosure exerts on ``field`` -- written like a weak-form
+        **surface flux**: multiply it by the test function to add it to the temperature equation, exactly
+        parallel to a Robin term ``Bi*(T - T_ext)*sT``::
+
+            radiation = gap.flux(T, eps, offset=273.15) * sT      # ∫_Γ q_rad · v   (grey-body net flux)
+
+        Same physics as :meth:`radiation` (which returns the ready-made coupling directly); this form just
+        reads as ``flux * test`` so the radiation line matches the other equations in ``jno.fem([...])``."""
+        return _RadiationFlux(self, field, dict(emissivity=emissivity, sigma=sigma, offset=offset, scale=scale))
 
     def quality(self):
         """Return ``(closure_error, reciprocity_error)`` for the assembled ``F`` (raw, un-normalized).
