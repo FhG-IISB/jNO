@@ -274,6 +274,7 @@ def build_enclosure(
     closure_iters: int = 200,
     occlude: bool = True,
     inward: bool = False,
+    r_min: Optional[float] = None,
 ) -> Enclosure:
     """Assemble an :class:`Enclosure` from radiating ``tags`` on a meshed 2D / axisymmetric domain.
 
@@ -290,6 +291,10 @@ def build_enclosure(
       **solid|medium interface edges** between a ``tags`` region (a solid, by geometry-part name) and a
       ``medium_tags`` region; normals point out of the solid into the medium. This is the common furnace
       case where every region is meshed.
+
+    ``r_min`` (axisymmetric only) softens the ring kernel's near-field ``1/R^2`` singularity; it defaults
+    to half the median element length, which keeps near-coincident and on-axis (``r -> 0``) view factors
+    physical (<= 1). Pass an explicit value to override.
     """
     if isinstance(tags, str):
         tags = [tags]
@@ -419,8 +424,13 @@ def build_enclosure(
         vm = _element_visibility(mids, own_edge, occ0, occ1)
 
     if axisymmetric:
+        # Near-field 1/R^2 floor: without it, near-coincident ring pairs (and the on-axis r->0 elements)
+        # produce spuriously large (>1) view factors. Default to half the median element length, matching
+        # the element size — callers can override via ``r_min``.
+        rmin = 0.5 * float(np.median(length)) if r_min is None else float(r_min)
         F = MeshUtils.get_view_factor_axisymmetric_element(
-            jnp.asarray(e0), jnp.asarray(e1), jnp.asarray(normals), jnp.asarray(vm), n_quad=n_quad, n_phi=n_phi
+            jnp.asarray(e0), jnp.asarray(e1), jnp.asarray(normals), jnp.asarray(vm),
+            n_quad=n_quad, n_phi=n_phi, r_min=rmin,
         )
         areas = 2.0 * np.pi * mids[:, 0] * length  # ring areas
     else:

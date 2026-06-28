@@ -2417,6 +2417,7 @@ class domain(MeshIOMixin):
         closure_iters=200,
         occlude=True,
         inward=False,
+        r_min=None,
     ):
         """Build an :class:`~jno.domain.enclosure.Enclosure` from radiating boundary ``tags``.
 
@@ -2441,6 +2442,10 @@ class domain(MeshIOMixin):
                 use when the radiating ``tags`` are the outer walls of a **meshed cavity** (an oven /
                 furnace filled with a transparent fluid) and radiation crosses the meshed interior, so
                 the facing walls see one another. Default ``False`` (normals out of the mesh, vacuum gap).
+            r_min: Axisymmetric only. Near-field floor for the ring view-factor kernel (``R^2 -> R^2 +
+                r_min^2``), which suppresses the spuriously large (>1) view factors that near-coincident
+                or on-axis (``r -> 0``) ring pairs otherwise produce. Defaults to half the median element
+                length (matched to the mesh resolution); pass a value to override.
         """
         from .enclosure import build_enclosure
 
@@ -2456,6 +2461,7 @@ class domain(MeshIOMixin):
             closure_iters=closure_iters,
             occlude=occlude,
             inward=inward,
+            r_min=r_min,
         )
 
     def compute_enclosure_view_factor(self, tags, opaque_tags=None):

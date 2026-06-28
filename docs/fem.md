@@ -312,7 +312,9 @@ rho = 1.0 - eps
 `F` is computed purely from geometry (occlusion + orientation; only the `i==i` self-pair is removed) by
 **double-area Gauss quadrature** of the diffuse kernel — so a *concave* surface keeps its self-view (the
 outer cylinder's `F₂₂ = 1 − r₁/r₂`). Tags only group elements (for per-surface emissivity); they never
-block exchange. Use `axisymmetric=True` for a body of revolution (the `(r, z)` meridional mesh). By
+block exchange. Use `axisymmetric=True` for a body of revolution (the `(r, z)` meridional mesh); its ring kernel applies
+a near-field floor `r_min` (default: half the median element length) so near-coincident / on-axis pairs
+stay physical (`F ≤ 1`) — override via `r_min=` if needed. By
 default the boundary normals point *out of* the mesh — radiation across an un-meshed gap (a vacuum
 between solid parts). For an **oven/furnace cavity** where the fluid inside is meshed and radiation
 crosses that meshed interior, pass `inward=True` so the wall normals point into the cavity and the facing

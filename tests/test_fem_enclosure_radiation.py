@@ -337,6 +337,45 @@ def test_enclosure_handle_square_cavity_inward():
         bad.check()
 
 
+def test_enclosure_axisymmetric_r_min_keeps_view_factors_physical():
+    """The axisymmetric ring kernel has a ``1/R^2`` near-field singularity: near-coincident / on-axis
+    ring pairs blow up to F > 1 unless a near-field floor ``r_min`` is applied. ``d.enclosure`` defaults
+    ``r_min`` to half the median element length, keeping the assembled view factors physical (<= 1).
+    Regression for the axisymmetric branch passing ``r_min`` through to the kernel.
+
+    Geometry: two coaxial cylinders in the meridional ``(r, z)`` half-plane (inner r1, outer r2) with a
+    vacuum gap; analytic surface factors are ``F12 = 1`` and ``F21 = r1/r2`` (Modest, Ch. 4)."""
+    import jno
+
+    pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
+    from shapely.geometry import box
+
+    r1, r2, w, H = 0.20, 0.25, 0.03, 1.6  # tall (aspect ~6) so end losses are small and F12 -> 1
+    inner = box(r1 - w, 0.0, r1, H)  # inner solid, gap-facing surface at r = r1
+    outer = box(r2, 0.0, r2 + w, H)  # outer solid, gap-facing surface at r = r2
+    d = jno.domain(inner.union(outer), mesh_size=0.04)
+    d.tag("inner_gap", lambda x, y: np.abs(x - r1) < 1e-2)
+    d.tag("outer_gap", lambda x, y: np.abs(x - r2) < 1e-2)
+
+    gap = d.enclosure(["inner_gap", "outer_gap"], axisymmetric=True)  # r_min defaulted
+    F = np.asarray(gap.view_factor)
+    assert F.max() <= 1.05, f"default r_min must keep axisymmetric view factors physical, got max {F.max():.3f}"
+
+    A = np.asarray(gap.areas)
+    mi, mo = gap.tag_mask("inner_gap"), gap.tag_mask("outer_gap")
+    assert mi.sum() > 0 and mo.sum() > 0
+    F12 = (A[mi, None] * F[np.ix_(mi, mo)]).sum() / A[mi].sum()
+    F21 = (A[mo, None] * F[np.ix_(mo, mi)]).sum() / A[mo].sum()
+    # finite cylinder (aspect ~6): inner surface still sees mostly the outer one, with small end losses
+    assert 0.88 < F12 <= 1.0, f"axisymmetric F12 should be ~1 (small end losses), got {F12:.3f}"
+    assert abs(F21 - r1 / r2) < 6e-2, f"axisymmetric F21 should be ~r1/r2={r1 / r2:.3f}, got {F21:.3f}"
+
+    # The r_min kwarg must be threaded to the kernel: a large near-field floor softens the 1/R^2 kernel
+    # and measurably shrinks every view factor (vs the default floor) — proving it is wired through.
+    soft = np.asarray(d.enclosure(["inner_gap", "outer_gap"], axisymmetric=True, r_min=0.5).view_factor)
+    assert soft.max() < 0.8 * F.max(), f"explicit r_min must soften F (got soft {soft.max():.3f} vs {F.max():.3f})"
+
+
 def test_coupled_conduction_radiation_concentric_cylinders():
     """End-to-end: steady conduction in two solid rings + grey-body radiation across the vacuum gap,
     coupled, matches the closed-form two-surface series solution
