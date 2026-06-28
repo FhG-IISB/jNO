@@ -380,7 +380,23 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
     # The default whole-domain interior tags normalize to "volume", so they never match here.
     src_regions = getattr(domain, "_source_regions", {}) or {}
     tag_preds = getattr(domain, "_tag_predicates", {}) or {}
-    subregions = {t for t in interiorish if t in src_regions or (t in tag_preds and t not in _bregions)}
+
+    def _subregion_id(t: str):
+        # `from_regions` registers a geometry part's interior under the tag ``interior_<name>`` (see
+        # PolygonDomain._register_interior_tag) while the part itself is keyed *bare* in
+        # ``_source_regions``. Map the tag back to the bare region so the per-cell ``RegionMask``
+        # (resolved via ``_cell_region_mask`` -> ``_source_regions[name]``) restricts integration to it.
+        # Without this, a term on ``interior_<name>`` falls through to whole-domain "volume" and the
+        # per-region material / source is silently integrated over the entire mesh.
+        if t in src_regions:
+            return t
+        if t.startswith("interior_") and t[len("interior_") :] in src_regions:
+            return t[len("interior_") :]
+        if t in tag_preds and t not in _bregions:
+            return t
+        return None
+
+    subregions = {r for r in (_subregion_id(t) for t in interiorish) if r is not None}
     if len(subregions) > 1:
         raise ValueError(
             f"jno.fem: a volume residual spans multiple sub-regions {sorted(subregions)}; "

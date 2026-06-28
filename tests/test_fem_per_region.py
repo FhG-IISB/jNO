@@ -129,6 +129,62 @@ def test_region_survives_coord_reuse_across_fem_calls():
 
 
 # ==========================================================================
+# from_regions geometry parts (interior_<name> tag) restrict the same as a domain.tag predicate
+# ==========================================================================
+def test_from_regions_per_region_conductivity_restricts():
+    """``from_regions`` registers a geometry part's interior under the tag ``interior_<name>`` while the
+    part is keyed *bare* in ``_source_regions``. ``_region_and_support`` must map ``interior_<name>`` back
+    to the bare region so per-region terms restrict to that part.
+
+    Regression: previously the ``interior_<name>`` tag matched neither ``_source_regions`` (bare keys) nor
+    ``_tag_predicates`` (``domain.tag`` only), so the term fell through to whole-domain and every part's
+    conductivity was integrated over the entire mesh -- the stiffness silently collapsed to
+    ``(sum_p k_p) * K`` and per-material properties had no effect. Two-region series conduction across a
+    vertical interface has interface temperature ``kL / (kL + kR)``; the buggy whole-domain assembly gives
+    ``0.5`` for every ratio (the scalar ``kL + kR`` cancels)."""
+    from shapely.geometry import box
+
+    d = jno.domain.csg.from_regions({"L": box(0, 0, 0.5, 1), "R": box(0.5, 0, 1, 1)}, mesh_size=0.08, time=None)
+    pts = np.asarray(d.mesh.points)[:, :2]
+    u, v = d.fem_symbols()
+    xl, yl, _ = d.variable("interior_L", split=True)
+    xr, yr, _ = d.variable("interior_R", split=True)
+    ul, vl = u.bind(x=xl, y=yl), v.bind(x=xl, y=yl)
+    ur, vr = u.bind(x=xr, y=yr), v.bind(x=xr, y=yr)
+    d.tag("xlo", lambda x, y: x < 1e-9)
+    d.tag("xhi", lambda x, y: x > 1 - 1e-9)
+    xlo, ylo, _ = d.variable("xlo", split=True)
+    xhi, yhi, _ = d.variable("xhi", split=True)
+    mid = np.abs(pts[:, 0] - 0.5) < 1e-9
+    for kL, kR in [(1.0, 100.0), (100.0, 1.0), (1.0, 10.0)]:
+        fem = jno.fem(
+            [kL * (ul.x * vl.x + ul.y * vl.y), kR * (ur.x * vr.x + ur.y * vr.y), u(xlo, ylo) - 1.0, u(xhi, yhi) - 0.0]
+        )
+        got = float(_solve(fem)[mid].mean())
+        exact = kL / (kL + kR)
+        assert abs(got - exact) < 0.03, (
+            f"per-region series interface {got:.3f} != kL/(kL+kR)={exact:.3f} (kL={kL}, kR={kR})"
+        )
+
+
+def test_from_regions_multi_region_residual_is_rejected():
+    """A single residual that spans two ``from_regions`` parts must raise (the same single-region guard as
+    for ``domain.tag`` regions) -- proves the parts are recognized as distinct regions, not silently fused
+    into one whole-domain term."""
+    from shapely.geometry import box
+
+    d = jno.domain.csg.from_regions({"L": box(0, 0, 0.5, 1), "R": box(0.5, 0, 1, 1)}, mesh_size=0.15, time=None)
+    u, v = d.fem_symbols()
+    xl, yl, _ = d.variable("interior_L", split=True)
+    xr, yr, _ = d.variable("interior_R", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ul, vl = u.bind(x=xl, y=yl), v.bind(x=xl, y=yl)
+    ur, vr = u.bind(x=xr, y=yr), v.bind(x=xr, y=yr)
+    with pytest.raises(ValueError, match="multiple regions|single region"):
+        jno.fem([ul.x * vl.x + ul.y * vl.y + ur.x * vr.x + ur.y * vr.y, u(xb, yb) - 0.0])
+
+
+# ==========================================================================
 # composes with every solve form
 # ==========================================================================
 def test_region_in_nonlinear_form():
