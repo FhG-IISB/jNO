@@ -1372,15 +1372,29 @@ class Coupling:
         Tsol = fem.solve(u0=T_guess)                         # conduction + radiation, one implicit solve
 
     Wrapping it in ``jno.Coupling(fn, name=...)`` explicitly is still accepted -- needed only for a
-    *callable object* (an instance with ``__call__``, which the bare-function detection deliberately skips)
-    or to give it a label. Caveats (must be a *pure-JAX* function of the DOFs): a numpy/scipy-only coupling
-    cannot go in-residual; and the matrix-free default solver may need a tailored ``fem.solve(solve_fn=...)``
-    for a stiff/dense coupling. The contribution must address the same scalar-P1 DOF layout as the local form."""
+    *callable object* (an instance with ``__call__``, which the bare-function detection deliberately skips),
+    to give it a label, or to declare **trainable parameters** that live only inside the coupling. A
+    ``jno.np.parameter`` in a *weak* term is found by walking the trace, but a coupling is an opaque
+    pure-JAX function, so name its parameters explicitly with ``params=[...]``; the residual then takes a
+    second argument, the ``{name: value}`` dict, so ``fem.solve()`` threads the trained values in and
+    ``jno.core`` recovers them (e.g. a calibrated emissivity)::
 
-    def __init__(self, residual_fn: Callable, *, name: str = "coupling", field_key: Any = None):
-        self.residual_fn = residual_fn  # (u_flat,) -> residual contribution of shape (n_dofs,)
+        eps = jno.np.parameter((1,), name="eps")
+        def radiation(u, p):                                 # p -> {"eps": value}
+            J = jnp.linalg.solve(eye - (1 - p["eps"])[:, None] * F, p["eps"] * SIGMA * (gap.field(u) + 273.15)**4)
+            return gap.load(s_row * J - F @ J)
+        fem = jno.fem([conduction, jno.Coupling(radiation, params=[eps]), u(xc, yc) - T_COOL])
+
+    Caveats (must be a *pure-JAX* function of the DOFs): a numpy/scipy-only coupling cannot go in-residual;
+    and the matrix-free default solver may need a tailored ``fem.solve(solve_fn=...)`` for a stiff/dense
+    coupling. The contribution must address the same scalar-P1 DOF layout as the local form."""
+
+    def __init__(self, residual_fn: Callable, *, name: str = "coupling", field_key: Any = None, params=None):
+        # residual_fn: (u_flat,) -> (n_dofs,), or (u_flat, {name: value}) -> (n_dofs,) when params are declared
+        self.residual_fn = residual_fn
         self.name = str(name)
         self.field_key = field_key
+        self.params = list(params or [])  # jno.np.parameter nodes used only inside this coupling
 
     def __repr__(self):
         return f"Coupling({self.name!r})"
@@ -1402,15 +1416,26 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
     pairs = getattr(domain, "_fem_native_dirichlet_pairs", None) or []
     d_dofs = jnp.asarray([int(p[0]) for p in pairs], dtype=jnp.int32) if pairs else None
 
-    def coupling_residual(u):  # sum of the per-coupling contributions, zeroed on pinned rows
+    def coupling_residual(u, args=None):  # sum of the per-coupling contributions, zeroed on pinned rows
         u = jnp.asarray(u).reshape(-1)
         total = jnp.zeros((n,), dtype=u.dtype)
         for c in couplings:
-            total = total + jnp.asarray(c.residual_fn(u), dtype=u.dtype).reshape(-1)
+            # a coupling that declared `params=[...]` reads them from the threaded {name: value} dict
+            contrib = c.residual_fn(u, args or {}) if c.params else c.residual_fn(u)
+            total = total + jnp.asarray(contrib, dtype=u.dtype).reshape(-1)
         return total if d_dofs is None else total.at[d_dofs].set(0.0)
 
     op = fem_obj._op
     rpe = dict(getattr(op, "runtime_parameter_exprs", {}) or {})
+    # Merge in parameters declared on the couplings so they appear in the solve's runtime args (and thus
+    # as trainable inputs of the fem.solve() FunctionCall) -- the trace walk that finds weak-form params
+    # never sees an opaque coupling function. `_collect_runtime_parameter_exprs` keys by name and raises on
+    # a name reused for a different parameter, so a coupling param that also drives the weak form is shared.
+    from .utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
+
+    for c in couplings:
+        for p in c.params:
+            _collect_runtime_parameter_exprs(p, rpe)
     if fem_obj._mode == "linear":
         # local residual R_local(u, args) = A(args) u - b(args)
         def residual(u, args=None, _op=op):
@@ -1419,7 +1444,7 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
                 A, b = _op.evaluate(args)
             else:  # raw (A, b) tuple (non-parametric)
                 A, b = _op
-            return (A @ u) - jnp.asarray(b).reshape(-1) + coupling_residual(u)
+            return (A @ u) - jnp.asarray(b).reshape(-1) + coupling_residual(u, args)
 
         fem_obj._op = FemResidualOperator(residual, size=n, runtime_parameter_exprs=rpe)
         fem_obj._mode = "nonlinear"
@@ -1428,7 +1453,7 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
         base_residual = op.residual
 
         def residual(u, args=None, _base=base_residual):
-            return jnp.asarray(_base(u, args)).reshape(-1) + coupling_residual(u)
+            return jnp.asarray(_base(u, args)).reshape(-1) + coupling_residual(u, args)
 
         fem_obj._op = FemResidualOperator(
             residual, jacobian_fn=None, size=n, runtime_parameter_exprs=rpe, metadata=getattr(op, "metadata", None)

@@ -596,3 +596,84 @@ def test_radiation_coupling_term_in_jno_fem_matches_analytic():
         [kp * (ui.x * vi.x + ui.y * vi.y), jno.Coupling(jax.jit(radiation)), u(xh, yh) - T_hot, u(xc, yc) - T_cold]
     )
     assert femj._mode == "nonlinear"
+
+
+def test_radiation_coupling_parameter_flows_and_is_differentiable():
+    """A ``jno.np.parameter`` that lives only inside a coupling (here the emissivity) is invisible to the
+    weak-form trace walk, so it is declared with ``jno.Coupling(fn, params=[eps])`` and read from the
+    threaded ``{name: value}`` dict. This test checks the two things ``jno.core`` rides on: the parameter
+    appears in the solve's runtime args (so the ``fem.solve()`` FunctionCall lists it as a trainable input),
+    and the coupled solve is differentiable in it (nonzero, FD-consistent) -- i.e. it would calibrate."""
+    pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
+    from shapely.geometry import Point
+
+    import jno
+
+    sigma = 5.670374419e-8
+    r0, r1, r2, r3 = 0.10, 0.20, 0.25, 0.35
+    k0, eps0, T_hot, T_cold = 20.0, 0.7, 1000.0, 300.0
+    ring = lambda a, b: Point(0, 0).buffer(b, 16).difference(Point(0, 0).buffer(a, 16))  # noqa: E731
+    d = jno.domain(ring(r0, r1).union(ring(r2, r3)), mesh_size=0.45)
+    rad = lambda x, y: jnp.hypot(x, y)  # noqa: E731
+    d.tag("hot", lambda x, y: jnp.abs(rad(x, y) - r0) < 4e-2)
+    d.tag("cold", lambda x, y: jnp.abs(rad(x, y) - r3) < 4e-2)
+    d.tag("inner_gap", lambda x, y: jnp.abs(rad(x, y) - r1) < 4e-2)
+    d.tag("outer_gap", lambda x, y: jnp.abs(rad(x, y) - r2) < 4e-2)
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    xh, yh, _ = d.variable("hot", split=True)
+    xc, yc, _ = d.variable("cold", split=True)
+    gap = d.enclosure(["inner_gap", "outer_gap"])
+    gap.check()
+    mi = gap.tag_mask("inner_gap")
+    F = jnp.asarray(gap.view_factor)
+    eye, s_row = jnp.eye(gap.size), F.sum(axis=1)
+
+    # emissivity as a coupling-only trainable parameter, read from the threaded args dict
+    eps = jno.np.parameter((1,), name="eps")
+    eps.initialize(jax.nn.initializers.constant(eps0))
+
+    def radiation(w, p):  # uniform grey emissivity p["eps"]; net radiosity load
+        e = p["eps"].reshape(())
+        J = jnp.linalg.solve(eye - (1.0 - e) * F, e * sigma * gap.field(w) ** 4)
+        return gap.load(s_row * J - F @ J)
+
+    fem = jno.fem(
+        [
+            k0 * (ui.x * vi.x + ui.y * vi.y),
+            jno.Coupling(radiation, params=[eps]),
+            u(xh, yh) - T_hot,
+            u(xc, yc) - T_cold,
+        ]
+    )
+    assert fem._mode == "nonlinear"
+    # the coupling-only parameter reached the solve's runtime args -> it is a trainable input of fem.solve()
+    assert "eps" in fem.operator.runtime_parameter_exprs, "coupling param did not flow into the solve args"
+
+    op, nd = fem.operator, int(fem.dofs)
+
+    def coupled(eps_val):  # direct-solve Newton (penalty-Dirichlet stalls the matrix-free default)
+        res = lambda w: jnp.asarray(op.residual(w, {"eps": jnp.atleast_1d(eps_val)})).reshape(-1)  # noqa: E731
+
+        def _solve(fn, x0):
+            def body(s):
+                du = jnp.linalg.solve(jax.jacfwd(fn)(s[0]), -fn(s[0]))
+                return s[0] + du, jnp.linalg.norm(du), s[2] + 1
+
+            return jax.lax.while_loop(lambda s: (s[1] > 1e-9) & (s[2] < 60), body, (x0, jnp.array(1.0), 0))[0]
+
+        return jax.lax.custom_root(
+            res,
+            jnp.full((nd,), 0.5 * (T_hot + T_cold)),
+            _solve,
+            lambda g, y: jnp.linalg.solve(jax.jacfwd(g)(jnp.zeros_like(y)), y),
+        )
+
+    qoi = lambda e: (gap.field(coupled(e))[jnp.asarray(mi)]).mean()  # noqa: E731
+    g = float(jax.grad(qoi)(eps0))
+    fd = float((qoi(eps0 + 1e-3) - qoi(eps0 - 1e-3)) / 2e-3)
+    # more emissive inner wall radiates more across the gap -> cooler inner surface: grad must be real, < 0
+    assert np.isfinite(g) and g < -1e-6 and abs(g - fd) / (abs(fd) + 1e-8) < 3e-2, (
+        f"coupling-parameter grad through the solve {g:.3f} vs FD {fd:.3f}"
+    )
