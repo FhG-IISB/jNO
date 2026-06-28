@@ -548,7 +548,7 @@ def test_radiation_coupling_term_in_jno_fem_matches_analytic():
     fem = jno.fem(
         [
             kp * (ui.x * vi.x + ui.y * vi.y),
-            jno.Coupling(radiation),
+            radiation,  # the bare residual function IS the coupling -- no wrapper needed
             u(xh, yh) - T_hot,
             u(xc, yc) - T_cold,
         ]

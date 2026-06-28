@@ -26,6 +26,8 @@ matrix-free defaults (BiCGStab / Newton–Krylov / backward-Euler) you can overr
 
 from __future__ import annotations
 
+import functools
+import inspect
 from typing import Any, Callable, List, Optional, Tuple
 
 import jax
@@ -1351,10 +1353,11 @@ class Coupling:
     stays differentiable in any ``jno.np.parameter`` in the form, and trains through ``jno.core``). The
     contribution is zeroed on Dirichlet-pinned DOFs so it never corrupts a prescribed value.
 
-    You write the nonlocal physics yourself as a pure-JAX residual of the DOFs and wrap it in a
-    ``Coupling``. Grey-body enclosure radiation, for instance, is the radiosity solve on top of the
-    enclosure geometry (``gap.field``/``view_factor``/``emissivity``/``load`` -- the geometry only;
-    ``jno.fem`` never writes the physics for you)::
+    You write the nonlocal physics yourself as a pure-JAX residual of the DOFs and just **put the function
+    in the** ``jno.fem([...])`` **list** -- no wrapper needed (a plain function/lambda is unambiguous next
+    to the trace-node weak/Dirichlet terms). Grey-body enclosure radiation, for instance, is the radiosity
+    solve on top of the enclosure geometry (``gap.field``/``view_factor``/``emissivity``/``load`` -- the
+    geometry only; ``jno.fem`` never writes the physics for you)::
 
         F, eps = gap.view_factor, gap.emissivity({"hot": 0.8, "cold": 0.5})
         rho, eye, s_row = 1 - eps, jnp.eye(gap.size), F.sum(axis=1)
@@ -1364,12 +1367,14 @@ class Coupling:
             J = jnp.linalg.solve(eye - rho[:, None] * F, eps * SIGMA * Tk**4)   # radiosity
             return gap.load(s_row * J - F @ J)               # net flux -> consistent nodal load
 
-        fem = jno.fem([conduction, jno.Coupling(radiation), u(xc, yc) - T_COOL])
+        fem = jno.fem([conduction, radiation, u(xc, yc) - T_COOL])   # radiation is the bare function
         Tsol = fem.solve(u0=T_guess)                         # conduction + radiation, one implicit solve
 
-    Caveats (must be a *pure-JAX* function of the DOFs): a numpy/scipy-only coupling cannot go in-residual;
-    and the matrix-free default solver may need a tailored ``fem.solve(solve_fn=...)`` for a stiff/dense
-    coupling. The contribution must address the same scalar-P1 DOF layout as the local form."""
+    Wrapping it in ``jno.Coupling(fn, name=...)`` explicitly is still accepted -- needed only for a
+    *callable object* (an instance with ``__call__``, which the bare-function detection deliberately skips)
+    or to give it a label. Caveats (must be a *pure-JAX* function of the DOFs): a numpy/scipy-only coupling
+    cannot go in-residual; and the matrix-free default solver may need a tailored ``fem.solve(solve_fn=...)``
+    for a stiff/dense coupling. The contribution must address the same scalar-P1 DOF layout as the local form."""
 
     def __init__(self, residual_fn: Callable, *, name: str = "coupling", field_key: Any = None):
         self.residual_fn = residual_fn  # (u_flat,) -> residual contribution of shape (n_dofs,)
@@ -1469,11 +1474,22 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         pins = [c for c in constraints if isinstance(c, GaugePin)]
         constraints = [c for c in constraints if not isinstance(c, GaugePin)] + [_lower_gauge_pin(p) for p in pins]
 
-    # Nonlocal Coupling terms (radiation, integral/non-reflecting BCs, ...) are not local weak forms and
-    # not walkable trace expressions; separate them up front (before domain discovery / classification)
-    # and fold them into the residual after assembly (see _wrap_couplings / _finalize).
-    couplings: List[Coupling] = [c for c in constraints if isinstance(c, Coupling)]
-    constraints = [c for c in constraints if not isinstance(c, Coupling)]
+    # Nonlocal coupling terms (radiation, integral/non-reflecting BCs, ...) are not local weak forms and
+    # not walkable trace expressions: a plain pure-JAX residual function ``f(u) -> (n_dofs,)``. A bare
+    # Python function/lambda/partial in the list is taken as one (weak-form and Dirichlet terms are trace
+    # nodes, never plain callables), so no wrapper is needed; an explicit ``Coupling`` is still accepted.
+    # Separate them up front (before domain discovery / classification) and fold them into the residual
+    # after assembly (see _wrap_couplings / _finalize).
+    couplings: List[Coupling] = []
+    _rest: List[Any] = []
+    for c in constraints:
+        if isinstance(c, Coupling):
+            couplings.append(c)
+        elif inspect.isfunction(c) or inspect.ismethod(c) or isinstance(c, functools.partial):
+            couplings.append(Coupling(c, name=getattr(c, "__name__", "coupling")))
+        else:
+            _rest.append(c)
+    constraints = _rest
 
     domain = _discover_domain(constraints)
 
