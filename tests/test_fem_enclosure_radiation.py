@@ -677,3 +677,109 @@ def test_radiation_coupling_parameter_flows_and_is_differentiable():
     assert np.isfinite(g) and g < -1e-6 and abs(g - fd) / (abs(fd) + 1e-8) < 3e-2, (
         f"coupling-parameter grad through the solve {g:.3f} vs FD {fd:.3f}"
     )
+
+
+def _newton_direct(res_fn, x0, steps=60, tol=1e-9):
+    """BYO direct-solve Newton (matrix-free default stalls on penalty-Dirichlet)."""
+    f = lambda x: jnp.asarray(res_fn(x)).reshape(-1)  # noqa: E731
+
+    def _solve(fn, y0):
+        def body(s):
+            du = jnp.linalg.solve(jax.jacfwd(fn)(s[0]), -fn(s[0]))
+            return s[0] + du, jnp.linalg.norm(du), s[2] + 1
+
+        return jax.lax.while_loop(lambda s: (s[1] > tol) & (s[2] < steps), body, (y0, jnp.array(1.0), 0))[0]
+
+    return jax.lax.custom_root(
+        f, jnp.asarray(x0).reshape(-1), _solve, lambda g, y: jnp.linalg.solve(jax.jacfwd(g)(jnp.zeros_like(y)), y)
+    )
+
+
+def test_radiation_coupling_targets_one_field_in_a_multifield_system():
+    """A coupling with ``field_key=`` acts on *one* field's DOF block. Build a two-scalar-field system --
+    field T (conduction + a gap-radiation coupling) and an independent Laplace field w -- and check the
+    coupling lands only in T's block: the multifield T-block reproduces the standalone coupled-radiation
+    solve, while the w-block reproduces its own radiation-free Laplace solve (the coupling did not leak)."""
+    pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
+    from shapely.geometry import Point
+
+    import jno
+
+    sigma = 5.670374419e-8
+    r0, r1, r2, r3 = 0.10, 0.20, 0.25, 0.35
+    k0, eps0, T_hot, T_cold, w_hot, w_cold = 20.0, 0.7, 1000.0, 300.0, 5.0, 1.0
+    ring = lambda a, b: Point(0, 0).buffer(b, 16).difference(Point(0, 0).buffer(a, 16))  # noqa: E731
+    d = jno.domain(ring(r0, r1).union(ring(r2, r3)), mesh_size=0.45)
+    rad = lambda x, y: jnp.hypot(x, y)  # noqa: E731
+    d.tag("hot", lambda x, y: jnp.abs(rad(x, y) - r0) < 4e-2)
+    d.tag("cold", lambda x, y: jnp.abs(rad(x, y) - r3) < 4e-2)
+    d.tag("inner_gap", lambda x, y: jnp.abs(rad(x, y) - r1) < 4e-2)
+    d.tag("outer_gap", lambda x, y: jnp.abs(rad(x, y) - r2) < 4e-2)
+    xi, yi, _ = d.variable("interior", split=True)
+    xh, yh, _ = d.variable("hot", split=True)
+    xc, yc, _ = d.variable("cold", split=True)
+    gap = d.enclosure(["inner_gap", "outer_gap"])
+    gap.check()
+    F = jnp.asarray(gap.view_factor)
+    eye, s_row = jnp.eye(gap.size), F.sum(axis=1)
+
+    def radiation(wT):  # net grey-body load on the T field's nodes (same code single- or multi-field)
+        Tk = gap.field(wT)
+        J = jnp.linalg.solve(eye - (1.0 - eps0) * F, eps0 * sigma * Tk**4)
+        return gap.load(s_row * J - F @ J)
+
+    # --- single-field references -----------------------------------------------------------------
+    T, sT = d.fem_symbols(names=("T", "sT"))
+    Ti, sTi = T.bind(x=xi, y=yi), sT.bind(x=xi, y=yi)
+    femT = jno.fem([k0 * (Ti.x * sTi.x + Ti.y * sTi.y), radiation, T(xh, yh) - T_hot, T(xc, yc) - T_cold])
+    T_ref = np.asarray(_newton_direct(lambda u: femT.operator.residual(u, {}), jnp.full((int(femT.dofs),), 650.0)))
+
+    w, sw = d.fem_symbols(names=("w", "sw"))
+    wi, swi = w.bind(x=xi, y=yi), sw.bind(x=xi, y=yi)
+    femW = jno.fem([wi.x * swi.x + wi.y * swi.y, w(xh, yh) - w_hot, w(xc, yc) - w_cold])
+    w_ref = np.asarray(femW.solve())  # linear, radiation-free
+
+    # --- the coupled two-field system: radiation targets the T block via field_key ---------------
+    Tkey = getattr(T, "field_key", None)
+    fem = jno.fem(
+        [
+            k0 * (Ti.x * sTi.x + Ti.y * sTi.y),
+            jno.Coupling(radiation, field_key=Tkey),  # only T's block
+            wi.x * swi.x + wi.y * swi.y,
+            T(xh, yh) - T_hot,
+            T(xc, yc) - T_cold,
+            w(xh, yh) - w_hot,
+            w(xc, yc) - w_cold,
+        ]
+    )
+    assert fem._mode == "nonlinear"
+    fk = list(getattr(d, "_fem_native_field_keys"))
+    offs = list(fem.offsets)
+    iT, iw = fk.index(Tkey), fk.index(getattr(w, "field_key", None))
+    nd = int(fem.dofs)
+    x0 = jnp.zeros((nd,)).at[offs[iT] : offs[iT + 1]].set(650.0).at[offs[iw] : offs[iw + 1]].set(3.0)
+    sol = np.asarray(_newton_direct(lambda u: fem.operator.residual(u, {}), x0))
+    T_blk = sol[offs[iT] : offs[iT + 1]]
+    w_blk = sol[offs[iw] : offs[iw + 1]]
+
+    # the coupling acted on T (matches the standalone coupled solve) and NOT on w (matches plain Laplace)
+    assert np.allclose(T_blk, T_ref, rtol=2e-3, atol=1.0), f"T block off coupled ref: max {np.abs(T_blk - T_ref).max():.2f}"
+    assert np.allclose(w_blk, w_ref, rtol=2e-3, atol=1e-3), (
+        f"w block perturbed by coupling: max {np.abs(w_blk - w_ref).max():.3e}"
+    )
+    # and the radiation genuinely did something to T (so the match above is not a no-op)
+    assert np.abs(T_blk - T_blk.mean()).max() > 50.0
+
+    # a field_key that names no field fails loud rather than silently mis-placing the load
+    with pytest.raises(ValueError, match="not among the fields"):
+        jno.fem(
+            [
+                k0 * (Ti.x * sTi.x + Ti.y * sTi.y),
+                jno.Coupling(radiation, field_key="nope"),
+                wi.x * swi.x + wi.y * swi.y,
+                T(xh, yh) - T_hot,
+                T(xc, yc) - T_cold,
+                w(xh, yh) - w_hot,
+                w(xc, yc) - w_cold,
+            ]
+        )

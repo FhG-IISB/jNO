@@ -1385,9 +1385,15 @@ class Coupling:
             return gap.load(s_row * J - F @ J)
         fem = jno.fem([conduction, jno.Coupling(radiation, params=[eps]), u(xc, yc) - T_COOL])
 
+    In a **multifield** system, pass ``field_key=`` to act on one field's DOF sub-block: the residual then
+    receives and returns *that field's* sub-vector (so the same ``gap.field``/``load`` scalar-T code works
+    whether T stands alone or is one field of a heat+flow / thermo-mechanical system), and ``jno.fem``
+    scatters it into the field's global block. Without ``field_key`` the coupling spans the whole vector
+    (single field). The ``field_key`` is the trial field's key (its ``value_shape``/name, as elsewhere).
+
     Caveats (must be a *pure-JAX* function of the DOFs): a numpy/scipy-only coupling cannot go in-residual;
     and the matrix-free default solver may need a tailored ``fem.solve(solve_fn=...)`` for a stiff/dense
-    coupling. The contribution must address the same scalar-P1 DOF layout as the local form."""
+    coupling. The targeted field must be scalar P1 (its block is node-indexed, as ``gap.load`` assumes)."""
 
     def __init__(self, residual_fn: Callable, *, name: str = "coupling", field_key: Any = None, params=None):
         # residual_fn: (u_flat,) -> (n_dofs,), or (u_flat, {name: value}) -> (n_dofs,) when params are declared
@@ -1403,8 +1409,9 @@ class Coupling:
 def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) -> "FEM":
     """Fold nonlocal :class:`Coupling` terms into ``fem_obj``'s residual: ``R(u) = R_local(u) + sum_k c_k(u)``,
     zeroed on the Dirichlet-pinned DOFs. A *linear* local form is promoted to a nonlinear residual operator
-    (so ``fem.solve()`` uses ``newton_krylov``); a *nonlinear* one gains the extra term. Steady single-field
-    only for now -- transient / multi-field coupling **fail loud** rather than silently dropping the term."""
+    (so ``fem.solve()`` uses ``newton_krylov``); a *nonlinear* one gains the extra term. A coupling with a
+    ``field_key`` acts on that field's DOF sub-block (multifield, e.g. radiation on T in a heat+flow system);
+    without one it acts on the whole vector (single field). Transient coupling still **fails loud**."""
     if fem_obj._mode == "transient":
         raise NotImplementedError(
             "jno.fem: nonlocal Coupling terms are not yet wired for transient forms. Lag the coupling via "
@@ -1416,13 +1423,31 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
     pairs = getattr(domain, "_fem_native_dirichlet_pairs", None) or []
     d_dofs = jnp.asarray([int(p[0]) for p in pairs], dtype=jnp.int32) if pairs else None
 
+    # Resolve each coupling's target DOF slice. A `field_key` selects one field's block [off_k:off_{k+1}]
+    # (authoritative order: domain._fem_native_field_keys; boundaries: fem_obj.offsets) -- the coupling then
+    # sees and returns *that field's* sub-vector, so the same residual (e.g. gap.field/load on the scalar T
+    # nodes) works whether T stands alone or is one field of a coupled system. No field_key -> whole vector.
+    offsets = fem_obj.offsets
+    field_keys = getattr(domain, "_fem_native_field_keys", None)
+
+    def _slice_for(c):
+        if c.field_key is None or not offsets or not field_keys:
+            return 0, n
+        if c.field_key not in field_keys:
+            raise ValueError(f"jno.fem: Coupling field_key {c.field_key!r} is not among the fields {list(field_keys)}.")
+        k = field_keys.index(c.field_key)
+        return int(offsets[k]), int(offsets[k + 1])
+
+    slices = [_slice_for(c) for c in couplings]
+
     def coupling_residual(u, args=None):  # sum of the per-coupling contributions, zeroed on pinned rows
         u = jnp.asarray(u).reshape(-1)
         total = jnp.zeros((n,), dtype=u.dtype)
-        for c in couplings:
+        for c, (lo, hi) in zip(couplings, slices):
+            u_c = u[lo:hi]  # the targeted field's sub-block (whole vector when no field_key)
             # a coupling that declared `params=[...]` reads them from the threaded {name: value} dict
-            contrib = c.residual_fn(u, args or {}) if c.params else c.residual_fn(u)
-            total = total + jnp.asarray(contrib, dtype=u.dtype).reshape(-1)
+            contrib = c.residual_fn(u_c, args or {}) if c.params else c.residual_fn(u_c)
+            total = total.at[lo:hi].add(jnp.asarray(contrib, dtype=u.dtype).reshape(-1))
         return total if d_dofs is None else total.at[d_dofs].set(0.0)
 
     op = fem_obj._op
