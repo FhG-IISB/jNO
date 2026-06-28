@@ -893,6 +893,11 @@ class FEM:
                 return prolong_periodic(periodic, ur)
 
             return self._op.solve(solve_fn=_reduced, **kwargs)
+        if self._mode == "nonlinear" and not getattr(self._op, "is_parametric", False):
+            # Non-parametric steady nonlinear: return the numeric solution eagerly (mirrors the linear
+            # branch above). `fem.solve()` builds a FunctionCall trace node so a trainable parameter can
+            # flow to crux; with no parameter it is just a forward solve, so evaluate it to an array.
+            return self._op.solve(solve_fn, **kwargs).fn()
         return self._op.solve(solve_fn, **kwargs)
 
     @property
