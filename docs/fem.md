@@ -285,6 +285,28 @@ steady-linear, nonlinear, transient, coupled (multi-field), and 3-D forms. In pa
 `jno.np.parameter` that multiplies a sub-region term is recovered **per sub-domain** through `crux` —
 fit a per-material property on its own region (see *Inverse problems*).
 
+### `domain.by_region` — many materials as one equation
+
+For *many* regions, writing one term per region is noisy. `domain.by_region({region: value})` returns a
+single coefficient whose value is chosen, per cell, by the region the cell's centroid lies in — so the
+whole multi-material weak form is **one equation** over the whole `interior`:
+
+```python
+xi, yi, _ = d.variable("interior", split=True)        # whole domain, bound once
+ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+
+k = d.by_region({"steel": 16.0, "air": 0.026, "core": 25.0})   # per-region conductivity
+Q = d.by_region(heat_source, default=0.0)                      # 0 in any unlisted region
+fem = jno.fem([k * (ui.x*vi.x + ui.y*vi.y) - Q * vi, u(xb, yb) - 0.0])
+```
+
+It is *general* — a value can be a scalar, a `jno.fn` field, or a trainable `jno.np.parameter`, so the
+same primitive expresses conductivity, a source, a density, a reaction rate, an elastic modulus — and
+trainable per-region values compose for free (`d.by_region({**k, "air": nu*0.026})`, calibrated through
+`crux`). Each key must be a geometry part (`from_regions`) or a `domain.tag` predicate; `default` fills
+cells in no listed region. It desugars to `sum_r RegionMask(r)·value_r` — exactly the per-region terms
+above, so it inherits the centroid classification and composes with every solve form.
+
 > Not yet wired: second-order-in-time (`u_tt`) sub-region terms — they fail loud rather than silently
 > integrate over the whole domain. 3-D sub-regions are defined by a predicate `where(x, y, z)`
 > (shapely polygons are planar).
