@@ -39,6 +39,7 @@ from .trace import (
     FemResidualOperator,
     GaugePin,
     ModelCall,
+    Placeholder,
     RegionMask,
     TestFunction,
     TrialFunction,
@@ -1490,6 +1491,20 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         else:
             _rest.append(c)
     constraints = _rest
+
+    # The bare-function shorthand only catches a *plain* function/lambda/partial -- it deliberately skips
+    # callable trace nodes (a bare symbol, `jno.fn(...)`) so it can never swallow a real term. The flip side
+    # is it also can't see a callable *object* meant as a coupling -- a `jax.jit(residual)` or an instance
+    # with `__call__`. Rather than let that fall through to weak/Dirichlet classification and fail with an
+    # opaque error, point the user at the explicit wrapper. (Trace expressions are not callable; the only
+    # callable list-items are Placeholders, which keep their own handling.)
+    for c in constraints:
+        if callable(c) and not isinstance(c, Placeholder):
+            raise TypeError(
+                f"jno.fem: got a callable {type(c).__name__!s} in the constraint list. A *plain* function "
+                "is taken as a nonlocal coupling residual automatically, but a jitted/object callable is "
+                "not -- wrap it explicitly as jno.Coupling(fn) to use it as a coupling term."
+            )
 
     domain = _discover_domain(constraints)
 

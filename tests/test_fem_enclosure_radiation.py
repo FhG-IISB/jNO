@@ -586,3 +586,13 @@ def test_radiation_coupling_term_in_jno_fem_matches_analytic():
     assert np.isfinite(g) and abs(g) > 1e-6 and abs(g - fd) / (abs(fd) + 1e-8) < 3e-2, (
         f"parameter grad through the radiation coupling {g:.4f} vs FD {fd:.4f}"
     )
+
+    # a jitted residual is a callable *object*, not a plain function: the bare shorthand cannot see it, so
+    # jno.fem must reject it with a clear "wrap it in jno.Coupling" message rather than fail obscurely later.
+    with pytest.raises(TypeError, match="jno.Coupling"):
+        jno.fem([kp * (ui.x * vi.x + ui.y * vi.y), jax.jit(radiation), u(xh, yh) - T_hot, u(xc, yc) - T_cold])
+    # and wrapping the jitted residual explicitly is accepted (same coupling, just an object callable)
+    femj = jno.fem(
+        [kp * (ui.x * vi.x + ui.y * vi.y), jno.Coupling(jax.jit(radiation)), u(xh, yh) - T_hot, u(xc, yc) - T_cold]
+    )
+    assert femj._mode == "nonlinear"
