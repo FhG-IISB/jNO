@@ -1351,9 +1351,25 @@ class Coupling:
     stays differentiable in any ``jno.np.parameter`` in the form, and trains through ``jno.core``). The
     contribution is zeroed on Dirichlet-pinned DOFs so it never corrupts a prescribed value.
 
+    You write the nonlocal physics yourself as a pure-JAX residual of the DOFs and wrap it in a
+    ``Coupling``. Grey-body enclosure radiation, for instance, is the radiosity solve on top of the
+    enclosure geometry (``gap.field``/``view_factor``/``emissivity``/``load`` -- the geometry only;
+    ``jno.fem`` never writes the physics for you)::
+
+        F, eps = gap.view_factor, gap.emissivity({"hot": 0.8, "cold": 0.5})
+        rho, eye, s_row = 1 - eps, jnp.eye(gap.size), F.sum(axis=1)
+
+        def radiation(u):                                    # net grey-body surface load (n_dofs,)
+            Tk = gap.field(u) + 273.15                       # absolute per-element temperature
+            J = jnp.linalg.solve(eye - rho[:, None] * F, eps * SIGMA * Tk**4)   # radiosity
+            return gap.load(s_row * J - F @ J)               # net flux -> consistent nodal load
+
+        fem = jno.fem([conduction, jno.Coupling(radiation), u(xc, yc) - T_COOL])
+        Tsol = fem.solve(u0=T_guess)                         # conduction + radiation, one implicit solve
+
     Caveats (must be a *pure-JAX* function of the DOFs): a numpy/scipy-only coupling cannot go in-residual;
     and the matrix-free default solver may need a tailored ``fem.solve(solve_fn=...)`` for a stiff/dense
-    coupling. Build one with a domain helper, e.g. ``gap.radiation(T, ...)``."""
+    coupling. The contribution must address the same scalar-P1 DOF layout as the local form."""
 
     def __init__(self, residual_fn: Callable, *, name: str = "coupling", field_key: Any = None):
         self.residual_fn = residual_fn  # (u_flat,) -> residual contribution of shape (n_dofs,)

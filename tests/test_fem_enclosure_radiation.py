@@ -482,10 +482,12 @@ def test_coupled_conduction_radiation_concentric_cylinders():
 
 
 def test_radiation_coupling_term_in_jno_fem_matches_analytic():
-    """``gap.radiation(T, ...)`` passed IN the ``jno.fem([...])`` list folds the nonlocal grey-body load
-    into the residual (promoting the linear conduction form to nonlinear); the coupled conduction+radiation
-    system then reproduces the closed-form concentric-cylinder series solution -- i.e. the first-class term
-    assembles the same physics as the hand-rolled ``A u - b + load(q_rad(u))`` above. A ``jno.np.parameter``
+    """A user-written radiosity wrapped in ``jno.Coupling`` and passed IN the ``jno.fem([...])`` list folds
+    the nonlocal grey-body load into the residual (promoting the linear conduction form to nonlinear); the
+    coupled conduction+radiation system then reproduces the closed-form concentric-cylinder series solution
+    -- i.e. the term assembles the same physics as the hand-rolled ``A u - b + load(q_rad(u))`` above. The
+    enclosure supplies only the geometry (``field``/``view_factor``/``emissivity``/``load``); the radiosity
+    is the user's, on top of it. A ``jno.np.parameter``
     (conductivity, here in the form via the operator's runtime args) stays differentiable through it, so it
     trains through ``jno.core``. (The matrix-free default solver stalls on this penalty-Dirichlet case, so
     we drive the operator's residual with a direct-solve Newton -- jno imposes no solver.)"""
@@ -530,21 +532,28 @@ def test_radiation_coupling_term_in_jno_fem_matches_analytic():
     mi, mo = gap.tag_mask("inner_gap"), gap.tag_mask("outer_gap")
     ar = np.asarray(gap.areas)
 
-    # conductivity as a runtime parameter; radiation as a FIRST-CLASS term in the jno.fem list
+    # the user writes the grey-body radiosity on top of the enclosure geometry, then wraps it in a Coupling
+    F = jnp.asarray(gap.view_factor)
+    eps = gap.emissivity({"inner_gap": eps1, "outer_gap": eps2})
+    rho, eye, s_row = 1.0 - eps, jnp.eye(gap.size), F.sum(axis=1)
+
+    def radiation(w):  # net grey-body surface load (n_dofs,) -- pure JAX, differentiable in w
+        Tk = gap.field(w)
+        J = jnp.linalg.solve(eye - rho[:, None] * F, eps * sigma * Tk**4)
+        return gap.load(s_row * J - F @ J)
+
+    # conductivity as a runtime parameter; radiation as a Coupling term in the jno.fem list
     kp = jno.np.parameter((1,), name="kcond")
     kp.initialize(jax.nn.initializers.constant(k0))
     fem = jno.fem(
         [
             kp * (ui.x * vi.x + ui.y * vi.y),
-            gap.radiation(u, emissivity={"inner_gap": eps1, "outer_gap": eps2}, sigma=sigma),
+            jno.Coupling(radiation),
             u(xh, yh) - T_hot,
             u(xc, yc) - T_cold,
         ]
     )
     assert fem._mode == "nonlinear", "the radiation coupling must promote the linear conduction form to nonlinear"
-    from jno._fem import Coupling  # the weak-form `flux * test` spelling builds the same radiation Coupling
-
-    assert isinstance(gap.flux(u, {"inner_gap": eps1, "outer_gap": eps2}, sigma=sigma) * vi, Coupling)
     op = fem.operator
     nd = int(fem.dofs)
 
