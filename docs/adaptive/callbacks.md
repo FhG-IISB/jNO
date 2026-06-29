@@ -12,13 +12,16 @@ Each callback's `on_epoch_end` is called after every outer training step and can
 
 ## Build your own callback
 
-Any subclass of `Callback` is a valid callback — override one or more of three hooks:
+Any subclass of `Callback` is a valid callback — override one or more of four hooks:
 
 | Hook | Signature | When it fires |
 |------|-----------|---------------|
 | `on_solve_begin(**kw)` | returns `None` | Once, after `solve()` finishes JIT setup, before the loop |
+| `on_before_update(**kw)` | returns modified grads or `None` | Between grad computation and optimizer update (split path) |
 | `on_epoch_end(**kw)` | returns `bool` (`True` to stop training) | After every outer training step |
 | `on_training_end(**kw)` | returns `None` | Once, after the loop finishes |
+
+`on_before_update` intercepts the gradient dict before the optimizer applies its update.  Returning a modified dict redirects the optimizer (for example to apply a preconditioner); returning `None` leaves the gradients unchanged.  The hook requires `inner_steps=1` and no Bayesian models; the solver raises a `ValueError` if those constraints are violated.
 
 The `**kw` for each hook is documented in the [base class source](https://github.com/FhG-IISB/jno/blob/main/jno/utils/adaptive/callbacks.py) — the most useful keys inside `on_epoch_end` are `epoch`, `total_loss`, `individual_losses`, `trainable`, `rng`, and `log`.
 
@@ -149,6 +152,71 @@ cb = jno.callbacks.checkpoint(async_checkpointing=False)
 ```
 
 ---
+
+### Energy Natural Gradient Descent (ENGD)
+
+Preconditions parameter gradients with the inverse energy Gram matrix `G⁻¹`, converting gradient descent into an approximate Newton step in the PDE function-space norm.  In practice ENGD can achieve several orders of magnitude lower error than Adam or L-BFGS in far fewer iterations (Zeinhofer, Cakir & Mardal, ICML 2023, Sec 3, arXiv:2302.13163).
+
+**Recommended — `jno.optimizers.engd()` (auto-wires `gram_terms` and the inner `sgd` step):**
+
+```python
+import jax, jno
+jax.config.update("jax_enable_x64", True)   # float64 for full accuracy
+
+# raw residual expressions (NOT .mse — those are scalar losses)
+pde = u.laplacian(x, y) + forcing
+bc  = u_bc
+
+net.optimizer(jno.optimizers.engd(line_search=True))   # gram_terms auto-detected
+crux = jno.core([pde.mse, bc.mse])
+crux.solve(500)
+```
+
+`jno.core.solve()` detects the `ENGDOptimizer` sentinel, builds `gram_terms` from every constraint that involves the model, injects `optax.sgd(1.0)` as the update transform, and prepends an `ENGDCallback` — all without any extra boilerplate.
+
+**Manual form — `jno.callbacks.engd()` (full control over `gram_terms`):**
+
+```python
+import jax, optax
+jax.config.update("jax_enable_x64", True)
+
+engd = jno.callbacks.engd(
+    gram_terms=[
+        (pde.grad(net), 1.0),   # ∫_Ω (Δu_i)(Δu_j) dx
+        (bc.grad(net),  1.0),   # ∫_∂Ω u_i u_j ds
+    ],
+    gram_interval=1,   # recompute G every step (set > 1 to amortise)
+)
+net.optimizer(optax.sgd(1.0))   # lr=1.0 → G⁻¹∇L is the Newton step
+
+crux = jno.core([pde.mse, bc.mse])
+crux.solve(500, callbacks=[engd])
+```
+
+**Grid line search (`line_search=True`):** Reproduces the paper's headline accuracy by searching over α ∈ {0.5⁰, …, 0.5³⁰} each iteration to find the optimal step size.  This is the recommended setting for faithful reproduction of §4.1 results: the energy Gram is initially ill-conditioned, making the natural-gradient *direction* correct but its *magnitude* unreliable.  The line search removes the need for manual step-size tuning.  Use `optax.sgd(1.0)` — the selected α is folded into the returned gradient:
+
+```python
+engd = jno.callbacks.engd(
+    gram_terms=[
+        (pde.grad(net), 1.0),
+        (bc.grad(net),  1.0),
+    ],
+    line_search=True,   # 31-point grid search α∈{0.5^k: k=0,…,30} per step
+)
+net.optimizer(optax.sgd(1.0))   # lr=1 because line search handles step scale
+```
+
+**Key constraints:**
+- Requires `inner_steps=1` (the hook cannot fire inside the XLA loop).
+- Not compatible with `.bayesian()` / `.vi()` models.
+- `gram_terms` must all reference the **same** model.
+- Pass **raw residual** expressions to `.grad(model)`, not `.mse`-wrapped ones.
+
+**`gram_interval > 1`:** Cache `G` between recomputations (cheap on stable problems):
+
+```python
+engd = jno.callbacks.engd(gram_terms=[...], gram_interval=5)
+```
 
 ### Explainability callbacks
 

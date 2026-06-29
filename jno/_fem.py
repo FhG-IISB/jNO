@@ -26,13 +26,25 @@ matrix-free defaults (BiCGStab / Newton–Krylov / backward-Euler) you can overr
 
 from __future__ import annotations
 
+import functools
+import inspect
 from typing import Any, Callable, List, Optional, Tuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 
-from .trace import FemLinearSystem, GaugePin, ModelCall, RegionMask, TestFunction, TrialFunction, Variable
+from .trace import (
+    FemLinearSystem,
+    FemResidualOperator,
+    GaugePin,
+    ModelCall,
+    Placeholder,
+    RegionMask,
+    TestFunction,
+    TrialFunction,
+    Variable,
+)
 
 __all__ = ["fem", "FEM"]
 
@@ -365,7 +377,40 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
     )
     if "initial" in tags or initial_temporal:
         return "initial", "initial"
-    boundary_tags = {t for t in tags if t in getattr(domain, "_boundary_regions", {})}
+    # Interior sub-region (sub-domain) volume term: the coords carry a registered interior region --
+    # a geometry part (`_source_regions`) or a `domain.tag` predicate that is NOT a boundary region.
+    # The term integrates over that region's cells only (per-cell centroid mask, applied at assembly).
+    # The default whole-domain interior tags normalize to "volume", so they never match here.
+    src_regions = getattr(domain, "_source_regions", {}) or {}
+    tag_preds = getattr(domain, "_tag_predicates", {}) or {}
+
+    def _subregion_id(t: str):
+        # `from_regions` registers a geometry part's interior under the tag ``interior_<name>`` (see
+        # PolygonDomain._register_interior_tag) while the part itself is keyed *bare* in
+        # ``_source_regions``. Map the tag back to the bare region so the per-cell ``RegionMask``
+        # (resolved via ``_cell_region_mask`` -> ``_source_regions[name]``) restricts integration to it.
+        # Without this, a term on ``interior_<name>`` falls through to whole-domain "volume" and the
+        # per-region material / source is silently integrated over the entire mesh.
+        if t in src_regions:
+            return t
+        if t.startswith("interior_") and t[len("interior_") :] in src_regions:
+            return t[len("interior_") :]
+        if t in tag_preds and t not in _bregions:
+            return t
+        return None
+
+    # An interior sub-region tag takes precedence over a coincidental boundary-region collision:
+    # `from_regions` may also register a fully-enclosed part's `interior_<name>` tag in
+    # `_boundary_regions` (its mesh boundary is a closed internal interface). For a VOLUME term (test
+    # function present) that part must integrate over its *cells*, not be misread as a (face-less)
+    # boundary term -> b == 0. But a TRIAL-ONLY Dirichlet `u(interior_<name>) - g` legitimately pins
+    # that region's *node set* (a volumetric hard constraint), so there the boundary/node-set
+    # classification is exactly what we want -- keep it.
+    has_test = _contains(constraint, TestFunction)
+    if has_test:
+        boundary_tags = {t for t in tags if t in _bregions and _subregion_id(t) is None}
+    else:
+        boundary_tags = {t for t in tags if t in _bregions}
     interiorish = tags - boundary_tags
 
     if len(boundary_tags) > 1 or (boundary_tags and interiorish):
@@ -374,13 +419,8 @@ def _region_and_support(constraint: Any, domain: Any) -> Tuple[str, str]:
         )
     if boundary_tags:
         return "boundary", next(iter(boundary_tags))
-    # Interior sub-region (sub-domain) volume term: the coords carry a registered interior region --
-    # a geometry part (`_source_regions`) or a `domain.tag` predicate that is NOT a boundary region.
-    # The term integrates over that region's cells only (per-cell centroid mask, applied at assembly).
-    # The default whole-domain interior tags normalize to "volume", so they never match here.
-    src_regions = getattr(domain, "_source_regions", {}) or {}
-    tag_preds = getattr(domain, "_tag_predicates", {}) or {}
-    subregions = {t for t in interiorish if t in src_regions or (t in tag_preds and t not in _bregions)}
+
+    subregions = {r for r in (_subregion_id(t) for t in interiorish) if r is not None}
     if len(subregions) > 1:
         raise ValueError(
             f"jno.fem: a volume residual spans multiple sub-regions {sorted(subregions)}; "
@@ -856,6 +896,11 @@ class FEM:
                 return prolong_periodic(periodic, ur)
 
             return self._op.solve(solve_fn=_reduced, **kwargs)
+        if self._mode == "nonlinear" and not getattr(self._op, "is_parametric", False):
+            # Non-parametric steady nonlinear: return the numeric solution eagerly (mirrors the linear
+            # branch above). `fem.solve()` builds a FunctionCall trace node so a trainable parameter can
+            # flow to crux; with no parameter it is just a forward solve, so evaluate it to an array.
+            return self._op.solve(solve_fn, **kwargs).fn()
         return self._op.solve(solve_fn, **kwargs)
 
     @property
@@ -1294,6 +1339,192 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
     )
 
 
+class Coupling:
+    """A **nonlocal** residual term passed in the ``jno.fem([...])`` list.
+
+    A weak term is *local* (a per-quadrature-point integrand, assembled element-by-element). Some physics
+    is irreducibly *nonlocal* — enclosure radiation (every surface sees every other through the radiosity
+    solve), integral / non-reflecting BCs, contact, peridynamics — and cannot be written as a local
+    integrand. A ``Coupling`` carries a pure-JAX residual contribution ``residual_fn(u) -> (n_dofs,)`` that
+    ``jno.fem`` **adds to the assembled residual**: ``R(u) = R_local(u) + sum_k coupling_k(u)``.
+
+    This composes generally: a linear local form is *promoted* to a nonlinear residual operator
+    (``R(u)=A u - b + sum_k coupling_k(u)``), a nonlinear one just gains the extra term; either way
+    ``fem.solve()`` drives it with the matrix-free, ``custom_root``-differentiable ``newton_krylov`` (so it
+    stays differentiable in any ``jno.np.parameter`` in the form, and trains through ``jno.core``). The
+    contribution is zeroed on Dirichlet-pinned DOFs so it never corrupts a prescribed value.
+
+    You write the nonlocal physics yourself as a pure-JAX residual of the DOFs and just **put the function
+    in the** ``jno.fem([...])`` **list** -- no wrapper needed (a plain function/lambda is unambiguous next
+    to the trace-node weak/Dirichlet terms). Grey-body enclosure radiation, for instance, is the radiosity
+    solve on top of the enclosure geometry (``gap.field``/``view_factor``/``emissivity``/``load`` -- the
+    geometry only; ``jno.fem`` never writes the physics for you)::
+
+        F, eps = gap.view_factor, gap.emissivity({"hot": 0.8, "cold": 0.5})
+        rho, eye, s_row = 1 - eps, jnp.eye(gap.size), F.sum(axis=1)
+
+        def radiation(u):                                    # net grey-body surface load (n_dofs,)
+            Tk = gap.field(u) + 273.15                       # absolute per-element temperature
+            J = jnp.linalg.solve(eye - rho[:, None] * F, eps * SIGMA * Tk**4)   # radiosity
+            return gap.load(s_row * J - F @ J)               # net flux -> consistent nodal load
+
+        fem = jno.fem([conduction, radiation, u(xc, yc) - T_COOL])   # radiation is the bare function
+        Tsol = fem.solve(u0=T_guess)                         # conduction + radiation, one implicit solve
+
+    Wrapping it in ``jno.Coupling(fn, name=...)`` explicitly is still accepted -- needed only for a
+    *callable object* (an instance with ``__call__``, which the bare-function detection deliberately skips),
+    to give it a label, or to declare **trainable parameters** that live only inside the coupling. A
+    ``jno.np.parameter`` in a *weak* term is found by walking the trace, but a coupling is an opaque
+    pure-JAX function, so name its parameters explicitly with ``params=[...]``; the residual then takes a
+    second argument, the ``{name: value}`` dict, so ``fem.solve()`` threads the trained values in and
+    ``jno.core`` recovers them (e.g. a calibrated emissivity)::
+
+        eps = jno.np.parameter((1,), name="eps")
+        def radiation(u, p):                                 # p -> {"eps": value}
+            J = jnp.linalg.solve(eye - (1 - p["eps"])[:, None] * F, p["eps"] * SIGMA * (gap.field(u) + 273.15)**4)
+            return gap.load(s_row * J - F @ J)
+        fem = jno.fem([conduction, jno.Coupling(radiation, params=[eps]), u(xc, yc) - T_COOL])
+
+    In a **multifield** system, pass ``field_key=`` to act on one field's DOF sub-block: the residual then
+    receives and returns *that field's* sub-vector (so the same ``gap.field``/``load`` scalar-T code works
+    whether T stands alone or is one field of a heat+flow / thermo-mechanical system), and ``jno.fem``
+    scatters it into the field's global block. Without ``field_key`` the coupling spans the whole vector
+    (single field). The ``field_key`` is the trial field's key (its ``value_shape``/name, as elsewhere).
+
+    Caveats (must be a *pure-JAX* function of the DOFs): a numpy/scipy-only coupling cannot go in-residual;
+    and the matrix-free default solver may need a tailored ``fem.solve(solve_fn=...)`` for a stiff/dense
+    coupling. The targeted field must be scalar P1 (its block is node-indexed, as ``gap.load`` assumes)."""
+
+    def __init__(self, residual_fn: Callable, *, name: str = "coupling", field_key: Any = None, params=None):
+        # residual_fn: (u_flat,) -> (n_dofs,), or (u_flat, {name: value}) -> (n_dofs,) when params are declared
+        self.residual_fn = residual_fn
+        self.name = str(name)
+        self.field_key = field_key
+        self.params = list(params or [])  # jno.np.parameter nodes used only inside this coupling
+
+    def __repr__(self):
+        return f"Coupling({self.name!r})"
+
+
+def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) -> "FEM":
+    """Fold nonlocal :class:`Coupling` terms into ``fem_obj``'s residual: ``R(u) = R_local(u) + sum_k c_k(u)``,
+    zeroed on the Dirichlet-pinned DOFs. A *linear* local form is promoted to a nonlinear residual operator
+    (so ``fem.solve()`` uses ``newton_krylov``); a *nonlinear* one gains the extra term. A coupling with a
+    ``field_key`` acts on that field's DOF sub-block (multifield, e.g. radiation on T in a heat+flow system);
+    without one it acts on the whole vector (single field). For a **transient** form the coupling enters each
+    implicit step: a nonlinear time block gains the term in its residual, a linear one is promoted to a
+    nonlinear (backward-Euler) block -- so e.g. enclosure radiation over a heating cycle solves in-residual."""
+    if fem_obj._mode not in ("linear", "nonlinear", "transient"):
+        raise NotImplementedError(f"jno.fem: nonlocal Coupling terms are not supported for mode {fem_obj._mode!r}.")
+    n = int(fem_obj.dofs)
+    pairs = getattr(domain, "_fem_native_dirichlet_pairs", None) or []
+    d_dofs = jnp.asarray([int(p[0]) for p in pairs], dtype=jnp.int32) if pairs else None
+
+    # Resolve each coupling's target DOF slice. A `field_key` selects one field's block [off_k:off_{k+1}]
+    # (authoritative order: domain._fem_native_field_keys; boundaries: fem_obj.offsets) -- the coupling then
+    # sees and returns *that field's* sub-vector, so the same residual (e.g. gap.field/load on the scalar T
+    # nodes) works whether T stands alone or is one field of a coupled system. No field_key -> whole vector.
+    offsets = fem_obj.offsets
+    field_keys = getattr(domain, "_fem_native_field_keys", None)
+
+    def _slice_for(c):
+        if c.field_key is None or not offsets or not field_keys:
+            return 0, n
+        if c.field_key not in field_keys:
+            raise ValueError(f"jno.fem: Coupling field_key {c.field_key!r} is not among the fields {list(field_keys)}.")
+        k = field_keys.index(c.field_key)
+        return int(offsets[k]), int(offsets[k + 1])
+
+    slices = [_slice_for(c) for c in couplings]
+
+    def coupling_residual(u, args=None):  # sum of the per-coupling contributions, zeroed on pinned rows
+        u = jnp.asarray(u).reshape(-1)
+        total = jnp.zeros((n,), dtype=u.dtype)
+        for c, (lo, hi) in zip(couplings, slices):
+            u_c = u[lo:hi]  # the targeted field's sub-block (whole vector when no field_key)
+            # a coupling that declared `params=[...]` reads them from the threaded {name: value} dict
+            contrib = c.residual_fn(u_c, args or {}) if c.params else c.residual_fn(u_c)
+            total = total.at[lo:hi].add(jnp.asarray(contrib, dtype=u.dtype).reshape(-1))
+        return total if d_dofs is None else total.at[d_dofs].set(0.0)
+
+    # Merge parameters declared on the couplings into the operator's runtime params so they appear in the
+    # solve's runtime args (and thus as trainable inputs of the fem.solve() FunctionCall) -- the trace walk
+    # that finds weak-form params never sees an opaque coupling function. `_collect_runtime_parameter_exprs`
+    # keys by name and raises on a name reused for a different parameter, so a param shared with the weak
+    # form is deduped.
+    from .utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
+
+    def _merge_coupling_params(base):
+        out = dict(base or {})
+        for c in couplings:
+            for p in c.params:
+                _collect_runtime_parameter_exprs(p, out)
+        return out
+
+    if fem_obj._mode == "transient":
+        # Inject the coupling into the implicit time step. The step prefers the nonlinear payload
+        # (M(t)(u_next-u)/dt + R(u_next,t,args)=0, matrix-free Newton-Krylov), so a nonlinear block just
+        # gains the term; a linear block (M u_dot + A u = c + f) is promoted to that nonlinear (backward-
+        # Euler) form with R(u,t,args) = A(t,args) u - c - f(t,args) + coupling. Periodic transient runs in
+        # a reduced DOF space the coupling cannot address, so it is refused.
+        block = fem_obj._op
+        if getattr(block, "prolongation", None) is not None:
+            raise NotImplementedError("jno.fem: transient Coupling is not supported together with periodic ties.")
+        block.runtime_parameter_exprs = _merge_coupling_params(getattr(block, "runtime_parameter_exprs", {}))
+        if block.is_nonlinear():
+            _base = block.residual
+
+            def _t_residual(u, t, args=None, _b=_base):
+                return jnp.asarray(_b(u, t, args)).reshape(-1) + coupling_residual(u, args)
+
+            block.residual = _t_residual
+        else:  # promote the linear payload -> nonlinear so the coupling enters the backward-Euler step
+            _M, _A, _opfn = block.M, block.A, block.operator_fn
+            _fvfn, _cbias = block.forcing_vector_fn, block.affine_bias
+
+            def _operand(x):
+                return x if hasattr(x, "todense") else jnp.asarray(x)
+
+            def _t_mass(t, args=None, _m=_M):
+                return _m
+
+            def _t_residual(u, t, args=None):
+                u = jnp.asarray(u).reshape(-1)
+                A = _operand(_opfn(t, args or {}) if _opfn is not None else _A)
+                c = 0.0 if _cbias is None else jnp.asarray(_cbias, u.dtype).reshape(-1)
+                f = 0.0 if _fvfn is None else jnp.asarray(_fvfn(t, args or {}), u.dtype).reshape(-1)
+                return (A @ u) - c - f + coupling_residual(u, args)
+
+            block.mass, block.residual = _t_mass, _t_residual
+        return fem_obj
+
+    op = fem_obj._op
+    rpe = _merge_coupling_params(getattr(op, "runtime_parameter_exprs", {}))
+    if fem_obj._mode == "linear":
+        # local residual R_local(u, args) = A(args) u - b(args)
+        def residual(u, args=None, _op=op):
+            u = jnp.asarray(u).reshape(-1)
+            if isinstance(_op, FemLinearSystem):
+                A, b = _op.evaluate(args)
+            else:  # raw (A, b) tuple (non-parametric)
+                A, b = _op
+            return (A @ u) - jnp.asarray(b).reshape(-1) + coupling_residual(u, args)
+
+        fem_obj._op = FemResidualOperator(residual, size=n, runtime_parameter_exprs=rpe)
+        fem_obj._mode = "nonlinear"
+        fem_obj._A = fem_obj._b = None
+    else:  # already a nonlinear residual operator -> add the coupling
+        base_residual = op.residual
+
+        def residual(u, args=None, _base=base_residual):
+            return jnp.asarray(_base(u, args)).reshape(-1) + coupling_residual(u, args)
+
+        fem_obj._op = FemResidualOperator(
+            residual, jacobian_fn=None, size=n, runtime_parameter_exprs=rpe, metadata=getattr(op, "metadata", None)
+        )
+    return fem_obj
+
+
 # ---------------------------------------------------------------------------
 # the driver
 # ---------------------------------------------------------------------------
@@ -1332,6 +1563,37 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     if any(isinstance(c, GaugePin) for c in constraints):
         pins = [c for c in constraints if isinstance(c, GaugePin)]
         constraints = [c for c in constraints if not isinstance(c, GaugePin)] + [_lower_gauge_pin(p) for p in pins]
+
+    # Nonlocal coupling terms (radiation, integral/non-reflecting BCs, ...) are not local weak forms and
+    # not walkable trace expressions: a plain pure-JAX residual function ``f(u) -> (n_dofs,)``. A bare
+    # Python function/lambda/partial in the list is taken as one (weak-form and Dirichlet terms are trace
+    # nodes, never plain callables), so no wrapper is needed; an explicit ``Coupling`` is still accepted.
+    # Separate them up front (before domain discovery / classification) and fold them into the residual
+    # after assembly (see _wrap_couplings / _finalize).
+    couplings: List[Coupling] = []
+    _rest: List[Any] = []
+    for c in constraints:
+        if isinstance(c, Coupling):
+            couplings.append(c)
+        elif inspect.isfunction(c) or inspect.ismethod(c) or isinstance(c, functools.partial):
+            couplings.append(Coupling(c, name=getattr(c, "__name__", "coupling")))
+        else:
+            _rest.append(c)
+    constraints = _rest
+
+    # The bare-function shorthand only catches a *plain* function/lambda/partial -- it deliberately skips
+    # callable trace nodes (a bare symbol, `jno.fn(...)`) so it can never swallow a real term. The flip side
+    # is it also can't see a callable *object* meant as a coupling -- a `jax.jit(residual)` or an instance
+    # with `__call__`. Rather than let that fall through to weak/Dirichlet classification and fail with an
+    # opaque error, point the user at the explicit wrapper. (Trace expressions are not callable; the only
+    # callable list-items are Placeholders, which keep their own handling.)
+    for c in constraints:
+        if callable(c) and not isinstance(c, Placeholder):
+            raise TypeError(
+                f"jno.fem: got a callable {type(c).__name__!s} in the constraint list. A *plain* function "
+                "is taken as a nonlocal coupling residual automatically, but a jitted/object callable is "
+                "not -- wrap it explicitly as jno.Coupling(fn) to use it as a coupling term."
+            )
 
     domain = _discover_domain(constraints)
 
@@ -1375,6 +1637,12 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         the time route's existing context-driven reduction. Single-field, vector, and coupled
         multi-field are all reduced block-wise (P_i^T M[i,j] P_j); complex / runtime-parametric remain out."""
         fem_obj._term_source = (domain, volume_terms)
+        if couplings:
+            if periodic_ties:
+                raise NotImplementedError(
+                    "jno.fem: periodic ties combined with nonlocal Coupling terms are not yet supported."
+                )
+            return _wrap_couplings(domain, fem_obj, couplings)
         if not periodic_ties:
             return fem_obj
         if fem_obj._mode in ("complex", "complex_transient"):
@@ -1964,7 +2232,19 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
     # with a time-varying Dirichlet is rejected below (the native branch carries only constant Dirichlet).
     if is_transient:
         _tv_native = not dirichlet_tv or not any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares)
-        if _native_ok and _tv_native:
+        # The native coupled-transient assembler threads runtime SCALAR parameters through ``args``
+        # (``fem_native._runtime_vals`` packs each parameter per cell, re-evaluated every step), so a
+        # *parametric* coupled transient -- e.g. trainable rate constants recovered through the
+        # differentiable solve in an inverse problem -- assembles natively too. It needs the same
+        # 2D/3D-Lagrange-real gate as the non-parametric case, just WITHOUT the runtime-parameter
+        # exclusion baked into ``_native_ok``. (A nodal FIELD parameter ``k(x)`` in a multi-field form
+        # is still rejected -- by ``assemble_fem_native`` itself, with a clear single-field-only error.)
+        _native_transient_ok = (
+            getattr(domain, "dimension", None) in (2, 3)
+            and all(str(f.get("space", "Lagrange")) == "Lagrange" for f in fields)
+            and not _is_complex_form(domain, ir)
+        )
+        if _native_transient_ok and _tv_native:
             from .utils.solver.fem_native import assemble_fem_native
 
             domain._fem_problem = None
@@ -1972,13 +2252,14 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
                 domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=1, quad_degree=quad_degree
             )
             return FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs)
-        # Coupled transient that the native block does not cover (a runtime parameter, or a time-varying
+        # Coupled transient that the native block does not cover (a complex coefficient, or a time-varying
         # Dirichlet on a nonlinear block) -- reject explicitly rather than mis-assemble.
         raise NotImplementedError(
             "jno.fem: this coupled (multi-field) transient is not supported natively. The native coupled "
-            "transient covers a constant/time-dependent source and a time-varying Dirichlet on a LINEAR "
-            f"block (got nonlinear={any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares)}, "
-            f"parametric={any(_contains_runtime_parameter(b) for b in weak_bares)}, "
+            "transient covers constant / time-dependent / runtime-parametric coefficients (incl. nonlinear) "
+            "and a time-varying Dirichlet on a LINEAR block "
+            f"(got nonlinear={any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares)}, "
+            f"complex={_is_complex_form(domain, ir)}, "
             f"time_varying_dirichlet={bool(dirichlet_tv)})."
         )
 

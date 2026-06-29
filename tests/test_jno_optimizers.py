@@ -45,7 +45,15 @@ def _minimise_grad(opt, steps):
 def test_namespace_is_just_the_optimizers():
     o = jno.optimizers
     # exactly the custom optimizers — each an optax GradientTransformation
-    assert set(o.__all__) == {"ssbroyden", "ssbfgs", "scale_by_ss_quasi_newton", "soap", "scale_by_soap"}
+    assert set(o.__all__) == {
+        "ssbroyden",
+        "ssbfgs",
+        "scale_by_ss_quasi_newton",
+        "soap",
+        "scale_by_soap",
+        "engd",
+        "ENGDOptimizer",
+    }
     for factory in (o.ssbroyden, o.ssbfgs, o.soap):
         opt = factory()
         assert hasattr(opt, "init") and hasattr(opt, "update")

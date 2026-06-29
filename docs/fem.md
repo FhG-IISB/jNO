@@ -285,6 +285,28 @@ steady-linear, nonlinear, transient, coupled (multi-field), and 3-D forms. In pa
 `jno.np.parameter` that multiplies a sub-region term is recovered **per sub-domain** through `crux` —
 fit a per-material property on its own region (see *Inverse problems*).
 
+### `domain.by_region` — many materials as one equation
+
+For *many* regions, writing one term per region is noisy. `domain.by_region({region: value})` returns a
+single coefficient whose value is chosen, per cell, by the region the cell's centroid lies in — so the
+whole multi-material weak form is **one equation** over the whole `interior`:
+
+```python
+xi, yi, _ = d.variable("interior", split=True)        # whole domain, bound once
+ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+
+k = d.by_region({"steel": 16.0, "air": 0.026, "core": 25.0})   # per-region conductivity
+Q = d.by_region(heat_source, default=0.0)                      # 0 in any unlisted region
+fem = jno.fem([k * (ui.x*vi.x + ui.y*vi.y) - Q * vi, u(xb, yb) - 0.0])
+```
+
+It is *general* — a value can be a scalar, a `jno.fn` field, or a trainable `jno.np.parameter`, so the
+same primitive expresses conductivity, a source, a density, a reaction rate, an elastic modulus — and
+trainable per-region values compose for free (`d.by_region({**k, "air": nu*0.026})`, calibrated through
+`crux`). Each key must be a geometry part (`from_regions`) or a `domain.tag` predicate; `default` fills
+cells in no listed region. It desugars to `sum_r RegionMask(r)·value_r` — exactly the per-region terms
+above, so it inherits the centroid classification and composes with every solve form.
+
 > Not yet wired: second-order-in-time (`u_tt`) sub-region terms — they fail loud rather than silently
 > integrate over the whole domain. 3-D sub-regions are defined by a predicate `where(x, y, z)`
 > (shapely polygons are planar).
@@ -312,7 +334,9 @@ rho = 1.0 - eps
 `F` is computed purely from geometry (occlusion + orientation; only the `i==i` self-pair is removed) by
 **double-area Gauss quadrature** of the diffuse kernel — so a *concave* surface keeps its self-view (the
 outer cylinder's `F₂₂ = 1 − r₁/r₂`). Tags only group elements (for per-surface emissivity); they never
-block exchange. Use `axisymmetric=True` for a body of revolution (the `(r, z)` meridional mesh). By
+block exchange. Use `axisymmetric=True` for a body of revolution (the `(r, z)` meridional mesh); its ring kernel applies
+a near-field floor `r_min` (default: half the median element length) so near-coincident / on-axis pairs
+stay physical (`F ≤ 1`) — override via `r_min=` if needed. By
 default the boundary normals point *out of* the mesh — radiation across an un-meshed gap (a vacuum
 between solid parts). For an **oven/furnace cavity** where the fluid inside is meshed and radiation
 crosses that meshed interior, pass `inward=True` so the wall normals point into the cavity and the facing
@@ -361,6 +385,39 @@ Validated on two concentric cylinders against the closed-form two-surface series
 (`q = σ(T₁⁴−T₂⁴)/(1/ε₁ + (r₁/r₂)(1/ε₂−1))`) to <1%, including `jax.grad` of the surface temperature w.r.t.
 emissivity matching finite differences (`tests/test_fem_enclosure_radiation.py`). The dense Jacobian is
 fine for moderate meshes; for large problems, precondition a matrix-free Newton with the conduction solve.
+
+### In-residual coupling (`jno.Coupling`) — implicit, trainable, transient
+
+The bring-your-own-loop above is operator-splitting: you reach into `fem.operator` and march the radiation
+yourself. To instead solve conduction **and** radiation as one implicit system, pass the nonlocal residual
+**in the `jno.fem([...])` list**. A plain function `f(u) -> (n_dofs,)` there is taken as a nonlocal
+*coupling* (weak/Dirichlet terms are trace nodes, never plain callables): `jno.fem` adds it to the assembled
+residual `R(u) = R_local(u) + Σ_k coupling_k(u)`, promoting a linear form to a nonlinear one, and
+`fem.solve()` drives the whole thing with the matrix-free, `custom_root`-differentiable `newton_krylov`:
+
+```python
+def radiation(u):                         # the same radiosity, now a residual contribution
+    Ts = gap.field(u)
+    J  = jnp.linalg.solve(jnp.eye(gap.size) - rho[:, None] * F, eps * SIGMA * (Ts + KELVIN)**4)
+    return gap.load(J - F @ J)             # net flux scattered to nodes
+
+fem  = jno.fem([conduction, radiation, u(xc, yc) - T_COOL])    # radiation is the bare function
+Tsol = fem.solve(u0=T_guess)                                   # conduction + radiation, one implicit solve
+```
+
+(A jitted residual / callable *object* isn't a plain function — wrap it as `jno.Coupling(fn)`, which is also
+how you reach the options below. A stiff/dense coupling may still need a tailored `fem.solve(solve_fn=…)`.)
+
+- **Trainable coupling parameters.** A `jno.np.parameter` in a *weak* term is found by the trace walk, but a
+  coupling is opaque — declare its parameters so they thread through the solve and `crux` recovers them:
+  `jno.Coupling(fn, params=[eps])`, with the residual taking the `{name: value}` dict, `fn(u, p)`.
+- **Multifield.** `jno.Coupling(fn, field_key=T_key)` acts on one field's DOF block (e.g. radiation on `T`
+  in a heat+flow / thermo-mechanical solve); the residual sees and returns that field's sub-vector.
+- **Transient.** The coupling enters each implicit step — a nonlinear time block gains the term, a linear one
+  is promoted to a nonlinear (backward-Euler) block — so enclosure radiation over a heating cycle solves
+  in-residual. (Not combined with periodic ties.)
+
+All four (bare function, `params`, `field_key`, transient) are covered in `tests/test_fem_enclosure_radiation.py`.
 
 Reference: M. F. Modest, *Radiative Heat Transfer*, 3rd ed., Ch. 4–5 (view factors; the net-radiation /
 radiosity method for diffuse-grey enclosures).

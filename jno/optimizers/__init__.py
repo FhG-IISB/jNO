@@ -23,7 +23,16 @@ building your own optax chains.
 this package and re-export it below.
 """
 
+from .engd import ENGDOptimizer, engd
 from .soap import scale_by_soap, soap
 from .ssbroyden import scale_by_ss_quasi_newton, ssbfgs, ssbroyden
 
-__all__ = ["ssbroyden", "ssbfgs", "scale_by_ss_quasi_newton", "soap", "scale_by_soap"]
+__all__ = [
+    "engd",
+    "ENGDOptimizer",
+    "ssbroyden",
+    "ssbfgs",
+    "scale_by_ss_quasi_newton",
+    "soap",
+    "scale_by_soap",
+]

@@ -500,3 +500,96 @@ def make_landscape_fn(
         )
 
     return landscape
+
+
+def make_engd_fn(
+    gram_terms,
+    all_ops,
+    batchsize,
+    frozen,
+    static,
+    lid: int,
+    trainable_template,
+    rcond: float | None = None,
+    min_consecutive: int = 1,
+):
+    """Build JIT-friendly functions for Energy Natural Gradient Descent (ENGD).
+
+    Constructs the energy Gram matrix
+    :math:`G = \\sum_k (w_k / N_k) \\, J_k^\\top J_k`
+    where :math:`J_k \\in \\mathbb{R}^{N_k \\times P}` is the per-point
+    parameter Jacobian of the :math:`k`-th constraint residual, and solves
+    :math:`G \\mathbf{d} = \\nabla L` via ``jnp.linalg.lstsq`` for the
+    natural gradient direction :math:`\\mathbf{d}`
+    (Sec. 3, arXiv:2302.13163).
+
+    The :math:`1/N_k` normalisation makes each Gram term weight-consistent
+    with the corresponding :math:`\\operatorname{mean}`-reduced loss term, so
+    the user-supplied weight :math:`w_k` directly mirrors the loss weight for
+    that constraint.
+
+    Returns a pair of JIT-friendly callables::
+
+        gram_and_solve_fn(trainable, context, rng, flat_model_grad)
+            -> (nat_flat, G)
+
+        cached_solve_fn(G, flat_model_grad)
+            -> nat_flat
+
+    Use ``gram_and_solve_fn`` every ``gram_interval`` steps to recompute G
+    and ``cached_solve_fn`` in between for cheap updates with the cached G.
+
+    Args:
+        gram_terms: Sequence of ``(NetworkGradient_expr, weight)`` pairs.
+            Each ``NetworkGradient_expr`` must be a
+            :class:`~jno.trace.NetworkGradient` placeholder — the result of
+            calling ``residual.grad(model)`` on a *raw* residual expression
+            (not ``.mse.grad``, which gives the scalar loss gradient rather
+            than the per-point Jacobian).  The weight is a positive scalar
+            that scales this term's contribution to the metric.
+        all_ops: Solver's ``self.all_ops``.
+        batchsize: Mini-batch size (``None`` for full-batch).
+        frozen: Frozen parameter pytree (from ``eqx.partition``).
+        static: Static (non-array) pytree.
+        lid: Layer ID (integer) of the model to precondition.
+        trainable_template: The initial ``trainable`` pytree — used to infer
+            *P* and build the unravel closure for the natural gradient.
+        rcond: Relative condition-number cutoff for ``jnp.linalg.lstsq``.
+            ``None`` (default) uses machine epsilon — correct for float64.
+            Increase to regularise a near-singular G; but this floors accuracy.
+        min_consecutive: Forwarded to each compiled expression.
+    """
+    from jno.trace_compiler import TraceCompiler
+
+    flat_template, _ = jax.flatten_util.ravel_pytree(trainable_template[lid])
+    P = int(flat_template.shape[0])
+
+    compiled_fns = []
+    for expr, w in gram_terms:
+        compiled_fn = TraceCompiler.compile_multi_expression([expr], all_ops)
+        compiled_fns.append((compiled_fn, float(w)))
+
+    def gram_and_solve_fn(trainable, context, rng, flat_model_grad):
+        full_models = eqx.combine(trainable, frozen, static)
+        G = jnp.zeros((P, P), dtype=flat_model_grad.dtype)
+        for comp_fn, w in compiled_fns:
+            results = comp_fn(
+                full_models,
+                context,
+                batchsize=batchsize,
+                key=rng,
+                min_consecutive=min_consecutive,
+            )
+            J = results[0]  # (B, N, [D,] P): scalar residual ndim=3, vector ndim=4
+            J_flat = J.reshape(-1, J.shape[-1])  # (N_total, P)
+            N = J_flat.shape[0]
+            G = G + (w / N) * (J_flat.T @ J_flat)
+        nat_flat_raw = jnp.linalg.lstsq(G, flat_model_grad, rcond=rcond)[0]
+        nat_flat = jnp.where(jnp.any(jnp.isnan(nat_flat_raw)), jnp.zeros_like(nat_flat_raw), nat_flat_raw)
+        return nat_flat, G
+
+    def cached_solve_fn(G, flat_model_grad):
+        nat_flat_raw = jnp.linalg.lstsq(G, flat_model_grad, rcond=rcond)[0]
+        return jnp.where(jnp.any(jnp.isnan(nat_flat_raw)), jnp.zeros_like(nat_flat_raw), nat_flat_raw)
+
+    return gram_and_solve_fn, cached_solve_fn
