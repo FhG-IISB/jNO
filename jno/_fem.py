@@ -2232,7 +2232,19 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
     # with a time-varying Dirichlet is rejected below (the native branch carries only constant Dirichlet).
     if is_transient:
         _tv_native = not dirichlet_tv or not any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares)
-        if _native_ok and _tv_native:
+        # The native coupled-transient assembler threads runtime SCALAR parameters through ``args``
+        # (``fem_native._runtime_vals`` packs each parameter per cell, re-evaluated every step), so a
+        # *parametric* coupled transient -- e.g. trainable rate constants recovered through the
+        # differentiable solve in an inverse problem -- assembles natively too. It needs the same
+        # 2D/3D-Lagrange-real gate as the non-parametric case, just WITHOUT the runtime-parameter
+        # exclusion baked into ``_native_ok``. (A nodal FIELD parameter ``k(x)`` in a multi-field form
+        # is still rejected -- by ``assemble_fem_native`` itself, with a clear single-field-only error.)
+        _native_transient_ok = (
+            getattr(domain, "dimension", None) in (2, 3)
+            and all(str(f.get("space", "Lagrange")) == "Lagrange" for f in fields)
+            and not _is_complex_form(domain, ir)
+        )
+        if _native_transient_ok and _tv_native:
             from .utils.solver.fem_native import assemble_fem_native
 
             domain._fem_problem = None
@@ -2240,13 +2252,14 @@ def _assemble_multifield(domain, volume_terms, boundary_terms, dirichlet_raw, ic
                 domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, vec=1, quad_degree=quad_degree
             )
             return FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offs)
-        # Coupled transient that the native block does not cover (a runtime parameter, or a time-varying
+        # Coupled transient that the native block does not cover (a complex coefficient, or a time-varying
         # Dirichlet on a nonlinear block) -- reject explicitly rather than mis-assemble.
         raise NotImplementedError(
             "jno.fem: this coupled (multi-field) transient is not supported natively. The native coupled "
-            "transient covers a constant/time-dependent source and a time-varying Dirichlet on a LINEAR "
-            f"block (got nonlinear={any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares)}, "
-            f"parametric={any(_contains_runtime_parameter(b) for b in weak_bares)}, "
+            "transient covers constant / time-dependent / runtime-parametric coefficients (incl. nonlinear) "
+            "and a time-varying Dirichlet on a LINEAR block "
+            f"(got nonlinear={any(_is_obviously_nonlinear_in_unknown(domain, b) for b in weak_bares)}, "
+            f"complex={_is_complex_form(domain, ir)}, "
             f"time_varying_dirichlet={bool(dirichlet_tv)})."
         )
 

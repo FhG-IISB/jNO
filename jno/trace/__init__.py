@@ -258,8 +258,17 @@ class Placeholder:
 
             pde_loss = (k * (u.dd(x) + u.dd(y)) + 1.0).mse.name("pde")
             bc_loss  = u_bc.mse.name("bc")
+
+        When called on a ``jno.np.parameter(...)`` node the label is *also* adopted as the
+        parameter's stable identity (``model._parameter_name``) — the key the FEM assembler uses
+        to thread its runtime value through ``args``. So ``jno.np.parameter((1,)).name("k1")`` is
+        equivalent to ``jno.np.parameter((1,), name="k1")``; without it, unnamed parameters all
+        share the default ``"value"`` and collide inside one solver block.
         """
         self._user_name = label
+        model = getattr(self, "model", None)
+        if model is not None and getattr(model, "_is_parameter", False):
+            model._parameter_name = str(label)
         return self
 
     # Graph-time physical unit (dimensional metadata). ``None`` = undeclared.

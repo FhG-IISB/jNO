@@ -20,20 +20,34 @@ def _assert_nonempty(path: Path):
         jno.domain.cube(mesh_size=0.6),
     ],
 )
-def test_export_png_vtk_msh(constructor, tmp_path):
+def test_export_vtk_msh(constructor, tmp_path):
     dom = jno.domain(constructor=constructor, compute_mesh_connectivity=True)
 
-    png_path = tmp_path / "mesh.png"
     vtk_path = tmp_path / "mesh.vtk"
     msh_path = tmp_path / "mesh.msh"
 
-    dom.export(str(png_path), show_sampled=False)
     dom.export(str(vtk_path))
     dom.export(str(msh_path))
 
-    _assert_nonempty(png_path)
     _assert_nonempty(vtk_path)
     _assert_nonempty(msh_path)
+
+
+@pytest.mark.parametrize(
+    "constructor",
+    [
+        jno.domain.line(mesh_size=0.2),
+        jno.domain.equi_distant_rect(nx=6, ny=6),
+        jno.domain.cube(mesh_size=0.6),
+    ],
+)
+def test_export_png_if_matplotlib_available(constructor, tmp_path):
+    pytest.importorskip("matplotlib")
+
+    dom = jno.domain(constructor=constructor, compute_mesh_connectivity=True)
+    png_path = tmp_path / "mesh.png"
+    dom.export(str(png_path), show_sampled=False)
+    _assert_nonempty(png_path)
 
 
 def test_export_dispatch_with_explicit_format(tmp_path):

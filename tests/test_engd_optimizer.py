@@ -4,12 +4,77 @@ from __future__ import annotations
 
 import math
 
+import equinox as eqx
+import jax
+import numpy as _np
 import optax
 
 import jno
-import jno.baseline as B
 from jno.optimizers import ENGDOptimizer, engd
 from jno.optimizers.engd import ENGDOptimizer as _ENGDOptimizerDirect
+
+# ---------------------------------------------------------------------------
+# Inline Poisson2D fixture (jno.baseline lives on a separate branch)
+# -Δu = 2π²sin(πx)sin(πy) on [0,1]², u=0 on ∂Ω, exact u*=sin(πx)sin(πy).
+# ---------------------------------------------------------------------------
+
+_N_INT = 30
+_N_BDY = 30
+
+
+def _int_pts():
+    k = _np.linspace(1 / (_N_INT + 1), _N_INT / (_N_INT + 1), _N_INT)
+    X, Y = _np.meshgrid(k, k, indexing="ij")
+    return _np.stack([X.ravel(), Y.ravel()], axis=1).astype(_np.float64)
+
+
+def _bdy_pts():
+    t = _np.linspace(0, 1, _N_BDY + 1)[:-1]
+    return _np.concatenate(
+        [
+            _np.stack([t, _np.zeros(_N_BDY)], 1),
+            _np.stack([t, _np.ones(_N_BDY)], 1),
+            _np.stack([_np.zeros(_N_BDY), t], 1),
+            _np.stack([_np.ones(_N_BDY), t], 1),
+        ]
+    ).astype(_np.float64)
+
+
+def _build_poisson2d(seed: int = 0, hidden_dims: int = 32, num_layers: int = 1):
+    """Return (net, losses, gram_terms, eval_error) for Poisson2D on [0,1]²."""
+    import foundax
+
+    dom = jno.domain.rect(mesh_size=0.05)
+    x, y, _ = dom.variable("interior")
+    xb, yb, _ = dom.variable("boundary")
+    dom.context["interior"] = _int_pts()[None, None]
+    dom.context["boundary"] = _bdy_pts()[None, None]
+
+    base = foundax.mlp(
+        in_features=2,
+        hidden_dims=hidden_dims,
+        num_layers=num_layers,
+        activation=jax.nn.tanh,
+        key=jax.random.PRNGKey(seed),
+    )
+    scaled = jax.tree_util.tree_map(lambda w: w * 0.1 if eqx.is_array(w) else w, base)
+    net = jno.nn.wrap(scaled)
+
+    pi = jno.np.pi
+    u = net(x, y)
+    pde_res = -u.laplacian(x, y) - 2 * pi**2 * jno.np.sin(pi * x) * jno.np.sin(pi * y)
+    bc_res = net(xb, yb)
+    pred = u
+    exact = jno.np.sin(pi * x) * jno.np.sin(pi * y)
+    gram_terms = [(pde_res.grad(net), 1.0), (bc_res.grad(net), 1.0)]
+    losses = [pde_res.mse, bc_res.mse]
+
+    def eval_error(crux):
+        p, r = crux.eval([pred, exact])
+        p_arr, r_arr = _np.asarray(p).ravel(), _np.asarray(r).ravel()
+        return float(_np.linalg.norm(p_arr - r_arr) / (_np.linalg.norm(r_arr) + 1e-30))
+
+    return net, losses, gram_terms, eval_error
 
 # ---------------------------------------------------------------------------
 # Sentinel construction
@@ -56,7 +121,7 @@ def test_engd_optimizer_auto_detect_smoke():
 
     jax.config.update("jax_enable_x64", True)
 
-    net, losses, _, eval_error = B.Poisson2D().build(seed=0)
+    net, losses, _, eval_error = _build_poisson2d(seed=0)
     net.optimizer(engd())  # no optax.sgd, no gram_terms
     crux = jno.core(losses)
     crux.solve(5)  # just check it doesn't crash
@@ -77,7 +142,7 @@ def test_engd_optimizer_explicit_gram_terms():
 
     jax.config.update("jax_enable_x64", True)
 
-    net, losses, gram_terms, eval_error = B.Poisson2D().build(seed=0)
+    net, losses, gram_terms, eval_error = _build_poisson2d(seed=0)
     net.optimizer(engd(gram_terms=gram_terms))
     crux = jno.core(losses)
     crux.solve(5)
@@ -97,7 +162,7 @@ def test_engd_optimizer_convergence():
 
     jax.config.update("jax_enable_x64", True)
 
-    net, losses, _, eval_error = B.Poisson2D().build(seed=0)
+    net, losses, _, eval_error = _build_poisson2d(seed=0)
     net.optimizer(engd(line_search=True))
     crux = jno.core(losses)
     crux.solve(200)
@@ -122,7 +187,7 @@ def test_engd_optimizer_orphan_model_is_ignored():
 
     import foundax
 
-    net, losses, _, eval_error = B.Poisson2D().build(seed=0)
+    net, losses, _, eval_error = _build_poisson2d(seed=0)
     orphan_net = jno.nn.wrap(
         foundax.mlp(
             in_features=2,
@@ -154,7 +219,7 @@ def test_engd_optimizer_idempotent_solve():
 
     jax.config.update("jax_enable_x64", True)
 
-    net, losses, _, eval_error = B.Poisson2D().build(seed=0)
+    net, losses, _, eval_error = _build_poisson2d(seed=0)
     net.optimizer(engd(gram_interval=2))
     crux = jno.core(losses)
 
@@ -184,7 +249,7 @@ def test_engd_optimizer_custom_reduction_unwrapped_via_reduces_axis():
 
     jax.config.update("jax_enable_x64", True)
 
-    net, losses, _, eval_error = B.Poisson2D().build(seed=0)
+    net, losses, _, eval_error = _build_poisson2d(seed=0)
 
     # Verify that the losses use FunctionCall with reduces_axis set (the
     # property our code relies on — not _name).
@@ -204,15 +269,16 @@ def test_engd_optimizer_custom_reduction_unwrapped_via_reduces_axis():
 
 
 def test_engd_optimizer_in_compare():
-    """compare() with the new engd() dict style (no lambda) works end-to-end."""
-    result = B.Poisson2D().compare(
-        {
-            "Adam": {"optimizer": optax.adam(1e-3)},
-            "ENGD-new": {"optimizer": engd(line_search=True)},
-        },
-        seeds=1,
-        epochs=10,
-        interval=5,
-    )
-    assert "ENGD-new" in result.data
-    assert math.isfinite(result.data["ENGD-new"]["final_mean"])
+    """engd() dict style works end-to-end when run against Adam."""
+    jax.config.update("jax_enable_x64", True)
+
+    results = {}
+    for name, opt in [("Adam", optax.adam(1e-3)), ("ENGD-new", engd(line_search=True))]:
+        net, losses, _, eval_error = _build_poisson2d(seed=0)
+        net.optimizer(opt)
+        crux = jno.core(losses)
+        crux.solve(10)
+        results[name] = eval_error(crux)
+
+    assert "ENGD-new" in results
+    assert math.isfinite(results["ENGD-new"])
