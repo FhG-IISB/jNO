@@ -55,7 +55,7 @@ def _resolve_key(key: jax.Array | None):
     return key_out
 
 
-def parameter(shape: tuple, *, key: jax.Array | None = None, name: str = "value") -> ModelCall:
+def parameter(shape: tuple, *, key: jax.Array | None = None, name: str | None = None) -> ModelCall:
     """
     Create a trainable parameter tensor.
 
@@ -66,7 +66,9 @@ def parameter(shape: tuple, *, key: jax.Array | None = None, name: str = "value"
         shape: Shape of the parameter tensor.
         key: Optional JAX PRNG key used as default when calling
             ``.initialize(<jax initializer>)`` later.
-        name: Name of the parameter model.
+        name: Optional readable label. Omit it and each parameter gets a unique id-based
+            name automatically (so several unnamed parameters never collide); set it here or
+            via ``.name("k1")`` only when you want a readable label in logs / the FEM solver.
 
     Returns:
         ModelCall: A scalar/tensor parameter expression that can be optimized by jno.
@@ -108,11 +110,14 @@ def parameter(shape: tuple, *, key: jax.Array | None = None, name: str = "value"
         def __call__(self):
             return self.value
 
-    model = nn.wrap(_Parameter(value=jnp.zeros(shape, dtype=jnp.float32)), name=name)
+    model = nn.wrap(_Parameter(value=jnp.zeros(shape, dtype=jnp.float32)), name=name or "")
     # Metadata used by the FEM-time lowering route to distinguish trainable
     # physical coefficients from ordinary neural-network ModelCall nodes.
     model._is_parameter = True
-    model._parameter_name = str(name)
+    # Naming is optional: when no name is given, fall back to a unique id-based name so that
+    # several unnamed parameters never collide on a shared default (the FEM assembler keys runtime
+    # parameters by this name). Pass name=... or call .name(...) for a readable label.
+    model._parameter_name = str(name) if name is not None else f"parameter_{model.layer_id}"
     # A nodal field coefficient is re-assembled (parameter inside the integrand,
     # interpolated to quad points), not factored into a constant basis.
     model._fem_field = fem_field

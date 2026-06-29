@@ -160,3 +160,6 @@ mkdocstrings-python = ">=1.10"
 pre-commit = ">=4.0"
 pymdown-extensions = ">=10.0"
 wandb = ">=0.26.1,<0.27"
+
+[tool.pixi.feature.dev.dependencies]
+matplotlib = ">=3.11.0,<4"

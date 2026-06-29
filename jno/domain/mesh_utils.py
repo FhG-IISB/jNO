@@ -273,7 +273,8 @@ class MeshUtils:
         elif dimension == 2:
             for tri in mesh_connectivity["triangles"]:
                 a, b, c = points[tri[0]], points[tri[1]], points[tri[2]]
-                area = 0.5 * abs(float(np.cross(b - a, c - a)))
+                ba, ca = b - a, c - a
+                area = 0.5 * abs(float(ba[0] * ca[1] - ba[1] * ca[0]))
                 for n in tri:
                     vols[n] += area / 3.0
 

@@ -63,6 +63,30 @@ class Callback:
         """
         return False
 
+    def on_before_update(self, *, grads, trainable, context, rng, epoch, **kwargs):
+        """Called between gradient computation and the optimizer update.
+
+        Subclasses may return a modified ``grads`` dict to redirect the
+        optimizer (e.g. to apply a preconditioner), or ``None`` to leave the
+        gradients unchanged.  The returned dict must have the same pytree
+        structure as ``grads``.
+
+        Called only when the solver detects that at least one active callback
+        overrides this method (it is a no-op in the base class).  Requires
+        ``inner_steps=1`` and no Bayesian models.
+
+        Keyword Args:
+            grads: Parameter gradient pytree ``{lid: model_params}``.
+            trainable: Current trainable parameter pytree.
+            context: Domain context (current batch).
+            rng: Current JAX PRNG key (Python-side; not consumed here).
+            epoch (int): Current outer epoch (Python integer, 0-indexed).
+
+        Returns:
+            Modified ``grads`` dict, or ``None`` to leave unchanged.
+        """
+        return None
+
     def on_training_end(self, **kwargs) -> None:
         """Called once after the training loop finishes."""
 
@@ -1386,6 +1410,230 @@ class HessianSpectrumCallback(Callback, _LiveValue):
         }
 
 
+# ---------------------------------------------------------------------------
+# Energy Natural Gradient Descent (ENGD) callback
+# ---------------------------------------------------------------------------
+
+
+class ENGDCallback(Callback):
+    """Precondition parameter gradients with the energy Gram matrix (ENGD).
+
+    At every training step (or every ``gram_interval`` steps), assembles the
+    energy Gram matrix
+
+    .. math::
+
+        G = \\sum_k \\frac{w_k}{N_k} J_k^\\top J_k \\in \\mathbb{R}^{P \\times P}
+
+    where :math:`J_k \\in \\mathbb{R}^{N_k \\times P}` is the per-point
+    parameter Jacobian of the :math:`k`-th residual expression and :math:`w_k`
+    is its weight.  The natural gradient direction
+
+    .. math::
+
+        \\mathbf{d} = G^{-1} \\nabla_\\theta L
+
+    replaces the standard gradient before the attached optimizer applies its
+    update.  With a learning rate of 1 and a quadratic loss this is an exact
+    Newton step; empirically it achieves several orders of magnitude lower
+    error than first-order methods in far fewer iterations
+    (Zeinhofer et al., ICML 2023, Sec. 3, arXiv:2302.13163).
+
+    **Residual vs loss Jacobian.** Pass *raw residual* expressions — not
+    ``.mse``-wrapped ones.  For a PDE ``r = u.d(x, x) + u.d(y, y) + f``,
+    use ``r.grad(net)``, which gives the :math:`(N \\times P)` Jacobian of
+    the per-point residual.  ``r.mse.grad(net)`` gives the scalar loss
+    gradient — a very different object.
+
+    **float64.** ENGD's accuracy benefit (reaching ~1e-7 vs ~1e-3 for Adam)
+    requires float64. Enable it with
+    ``jax.config.update("jax_enable_x64", True)`` before training.
+
+    **Constraints.** Requires ``inner_steps=1`` (the hook fires between grad
+    and optimizer, not inside the XLA loop).  Not compatible with
+    ``.bayesian()`` models.
+
+    **Line search.** Setting ``line_search=True`` enables a grid line search
+    over 31 step sizes :math:`\\alpha \\in \\{0.5^0, 0.5^1, \\ldots, 0.5^{30}\\}`
+    (Sec. 4.1, arXiv:2302.13163) to find the optimal per-step learning rate.
+    This is essential for convergence when the Gram matrix is ill-conditioned
+    (e.g. near initialisation), and allows reaching the paper's headline
+    accuracy of ~2.4e-7.  Use ``optax.sgd(1.0)`` as the optimizer — the
+    line search handles the step-size selection.  Without ``line_search=True``
+    a fixed learning rate must be tuned manually.
+
+    Args:
+        gram_terms: List of ``(NetworkGradient_expr, weight)`` pairs.  Each
+            expression must be a :class:`~jno.trace.NetworkGradient` — the
+            result of ``residual.grad(model)`` — and all terms must reference
+            the *same* model.  The weight mirrors the corresponding loss
+            weight for correct metric scaling.
+        gram_interval: Recompute the Gram matrix every *n* outer steps.
+            Setting ``gram_interval > 1`` caches :math:`G` between
+            recomputations and only re-solves with the new gradient — cheap
+            but approximate when parameters move significantly.  Default
+            ``1`` (full recomputation every step).
+        rcond: Relative condition-number cutoff passed to
+            ``jnp.linalg.lstsq``.  ``None`` (default) uses machine epsilon
+            — correct for float64.  Increase to regularise a near-singular G.
+        line_search: If ``True``, perform a 31-point grid line search
+            :math:`\\alpha \\in \\{0.5^k : k=0,\\ldots,30\\}` each step to
+            select the optimal step size.  The callback then returns
+            :math:`\\alpha^* \\cdot G^{-1} \\nabla L` as the effective
+            gradient so that an ``optax.sgd(1.0)`` optimizer applies the
+            correct step.  Default ``False``.
+
+    Example::
+
+        pde = u.d(x, x) + u.d(y, y) + f          # raw residual
+        bc  = u_bc                                  # raw residual
+
+        engd = jno.callbacks.engd(
+            gram_terms=[(pde.grad(net), 1.0), (bc.grad(net), 1.0)],
+            line_search=True,                       # grid line search (paper §4.1)
+        )
+        net.optimizer(optax.sgd(1.0))              # lr=1.0; line search scales step
+        crux.solve(500, callbacks=[engd])
+    """
+
+    def __init__(
+        self,
+        gram_terms: list,
+        gram_interval: int = 1,
+        rcond: Optional[float] = None,
+        line_search: bool = False,
+    ) -> None:
+        from jno.trace import NetworkGradient
+
+        if not gram_terms:
+            raise ValueError("ENGDCallback: gram_terms must not be empty.")
+        for i, (expr, w) in enumerate(gram_terms):
+            if not isinstance(expr, NetworkGradient):
+                raise TypeError(
+                    f"ENGDCallback: gram_terms[{i}][0] must be a NetworkGradient "
+                    f"placeholder (e.g. residual.grad(model)), got "
+                    f"{type(expr).__name__!r}.  Build one via ``expr.grad(model)``."
+                )
+
+        # All terms must reference the same model.
+        lids = [expr.model_node.layer_id for expr, _ in gram_terms]
+        if len(set(lids)) != 1:
+            raise ValueError(
+                "ENGDCallback: all gram_terms must reference the same model "
+                f"(found layer_ids {lids}).  Use a separate ENGDCallback per model."
+            )
+
+        self._gram_terms = list(gram_terms)
+        self._gram_interval = gram_interval
+        self._rcond = rcond
+        self._line_search = line_search
+        self._lid: int = lids[0]
+        self._gram_and_solve_jit = None
+        self._cached_solve_jit = None
+        self._ls_jit = None
+        self._unravel = None
+        self._G_cache = None
+
+    def on_solve_begin(self, **kwargs) -> None:
+        import equinox as eqx
+        import paramax as _paramax
+
+        from jno.utils.explainability import make_engd_fn
+
+        if "all_ops" not in kwargs:
+            raise RuntimeError(
+                "ENGDCallback requires the solver to pass `all_ops` via on_solve_begin (jno >= feat/engd-callback)."
+            )
+
+        trainable = kwargs["trainable"]
+        if self._lid not in trainable:
+            raise ValueError(
+                f"ENGDCallback: model with layer_id={self._lid} not found in "
+                f"trainable (keys: {list(trainable.keys())}).  Ensure the model "
+                "referenced in gram_terms is a trainable model in this solver."
+            )
+
+        flat_template, self._unravel = jax.flatten_util.ravel_pytree(trainable[self._lid])
+        P = flat_template.shape[0]
+
+        gram_and_solve_fn, cached_solve_fn = make_engd_fn(
+            gram_terms=self._gram_terms,
+            all_ops=kwargs["all_ops"],
+            batchsize=None,  # always use all context points for the Gram
+            frozen=kwargs["frozen"],
+            static=kwargs["static"],
+            lid=self._lid,
+            trainable_template=trainable,
+            rcond=self._rcond,
+            min_consecutive=kwargs.get("min_consecutive", 1),
+        )
+
+        self._gram_and_solve_jit = jax.jit(gram_and_solve_fn)
+        self._cached_solve_jit = jax.jit(cached_solve_fn)
+
+        # Warm up: pre-compile both JIT functions.
+        flat_g = jax.numpy.zeros(P, dtype=flat_template.dtype)
+        nat, G = self._gram_and_solve_jit(trainable, kwargs["context"], kwargs["rng"], flat_g)
+        jax.block_until_ready((nat, G))
+        _ = self._cached_solve_jit(G, flat_g)
+        jax.block_until_ready(_)
+
+        if self._line_search:
+            # Grid line search (Sec. 4.1, arXiv:2302.13163):
+            # evaluate total loss at α ∈ {0.5^0, …, 0.5^30} and pick the minimum.
+            # Closed-over constants (captured once at solve-begin):
+            _compiled_fn = kwargs["compiled_constraints_fn"]
+            _frozen = kwargs["frozen"]
+            _static = kwargs["static"]
+            _batchsize = kwargs.get("batchsize")
+            _min_consec = kwargs.get("min_consecutive", 1)
+            _unravel = self._unravel
+            _lid = self._lid
+
+            def _ls_fn(trainable_inner, nat_flat_inner, context_inner, rng_inner):
+                flat_p, _ = jax.flatten_util.ravel_pytree(trainable_inner[_lid])
+
+                def _loss_at_alpha(alpha):
+                    new_p = flat_p - alpha * nat_flat_inner
+                    new_tr = {**trainable_inner, _lid: _unravel(new_p)}
+                    full = eqx.combine(new_tr, _frozen, _static)
+                    full = _paramax.unwrap(full)
+                    residuals = _compiled_fn(
+                        full,
+                        context_inner,
+                        batchsize=_batchsize,
+                        key=rng_inner,
+                        min_consecutive=_min_consec,
+                    )
+                    return jax.numpy.mean(jax.numpy.stack([jax.numpy.mean(r) for r in residuals]))
+
+                steps = 0.5 ** jax.numpy.arange(31, dtype=flat_p.dtype)
+                _, losses = jax.lax.scan(lambda c, a: (c, _loss_at_alpha(a)), None, steps)
+                return steps[jax.numpy.argmin(losses)]
+
+            self._ls_jit = jax.jit(_ls_fn)
+            # Warm up.
+            _ = self._ls_jit(trainable, nat, kwargs["context"], kwargs["rng"])
+            jax.block_until_ready(_)
+
+    def on_before_update(self, *, grads, trainable, context, rng, epoch, **kwargs):
+        if self._gram_and_solve_jit is None or self._unravel is None:
+            return None
+
+        flat_g, _ = jax.flatten_util.ravel_pytree(grads[self._lid])
+
+        if self._G_cache is None or epoch % self._gram_interval == 0:
+            nat_flat, self._G_cache = self._gram_and_solve_jit(trainable, context, rng, flat_g)
+        else:
+            nat_flat = self._cached_solve_jit(self._G_cache, flat_g)
+
+        if self._ls_jit is not None:
+            best_alpha = self._ls_jit(trainable, nat_flat, context, rng)
+            nat_flat = nat_flat * best_alpha
+
+        return {**grads, self._lid: self._unravel(nat_flat)}
+
+
 class callbacks:
     """Factory helpers for built-in adaptive training callbacks.
 
@@ -1610,3 +1858,47 @@ class callbacks:
                 to variables first).  Default ``None`` — all constraints.
         """
         return ResidualStatsCallback(interval=interval, constraints=constraints)
+
+    @staticmethod
+    def engd(
+        gram_terms: list,
+        gram_interval: int = 1,
+        rcond: Optional[float] = None,
+        line_search: bool = False,
+    ) -> "ENGDCallback":
+        """Create an :class:`ENGDCallback` for Energy Natural Gradient Descent.
+
+        Preconditions parameter gradients with the inverse energy Gram matrix
+        :math:`G^{-1}` before the optimizer update, converting standard
+        gradient descent into a Newton-like method that can achieve
+        orders-of-magnitude lower error in far fewer iterations than Adam or
+        L-BFGS (Zeinhofer et al., ICML 2023, Sec. 3, arXiv:2302.13163).
+
+        Requires ``inner_steps=1``, no Bayesian models, and **float64**
+        (``jax.config.update("jax_enable_x64", True)``) for full accuracy.
+        Use ``model.optimizer(optax.sgd(1.0))`` — the natural gradient
+        direction already encodes the correct step scale.
+
+        Args:
+            gram_terms: List of ``(NetworkGradient_expr, weight)`` pairs.
+                Build a :class:`~jno.trace.NetworkGradient` via
+                ``residual.grad(model)`` on the *raw* residual expression
+                (not ``.mse.grad``).  All terms must reference the same model.
+            gram_interval: Recompute G every *n* outer steps; cache between
+                recomputations.  Default ``1`` (recompute every step).
+            rcond: Condition-number cutoff for ``jnp.linalg.lstsq``.
+                ``None`` (default) → machine epsilon (best for float64).
+            line_search: If ``True``, perform a 31-point grid line search
+                :math:`\\alpha \\in \\{0.5^k : k=0,\\ldots,30\\}` each step
+                (Sec. 4.1, arXiv:2302.13163).  Recommended for faithful
+                reproduction of the paper's results.  Use with
+                ``optax.sgd(1.0)``; the selected :math:`\\alpha^*` is
+                folded into the returned gradient so the optimizer applies
+                the full scaled natural gradient step.  Default ``False``.
+        """
+        return ENGDCallback(
+            gram_terms=gram_terms,
+            gram_interval=gram_interval,
+            rcond=rcond,
+            line_search=line_search,
+        )

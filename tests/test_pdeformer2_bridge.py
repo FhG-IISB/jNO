@@ -19,10 +19,26 @@ from __future__ import annotations
 
 import equinox as eqx
 import foundax
+import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _x64_off():
+    """PDEformer/equinox run in float32 by design (the model weights are float32). Pin x64 False
+    *per-test* with save/restore so a co-run FEM module's x64 (enabled earlier in the same process)
+    never leaks in — otherwise the float64 coordinate inputs mismatch the float32 conv weights.
+    Symmetric to the `_x64_off` fixture in test_periodic_parametric_integration.py."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", False)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
 
 import jno
 from jno.architectures.pdeformer2_bridge import (

@@ -9,6 +9,7 @@ import meshio
 import numpy as np
 
 from ..trace import (
+    RegionMask,
     TensorTag,
     TestFunction,
     TrialFunction,
@@ -1471,6 +1472,52 @@ class domain(MeshIOMixin):
             self.avaiable_mesh_tags.append(name)
         return self
 
+    def by_region(self, values, *, default=None):
+        """A coefficient whose value depends on which region a mesh cell is in.
+
+        ``values`` is a ``{region: value}`` mapping; the returned coefficient evaluates, on each cell,
+        to the value of the region that cell's **centroid** lies in. Write a multi-region weak form as a
+        **single** equation over the whole ``interior`` instead of one term per region::
+
+            k = d.by_region({"steel": 16.0, "air": 0.026})     # per-region conductivity
+            Q = d.by_region(heat_source, default=0.0)          # 0 in any unlisted region
+            heat = k * (T.x*s.x + T.y*s.y) - Q * s             # one equation, all regions
+
+        It is *general* -- a value can be any coefficient (a python scalar, a ``jno.fn`` field, or a
+        trainable ``jno.np.parameter``), so the same primitive expresses conductivity, a source, a
+        density, a reaction rate, an elastic modulus, ... and trainable per-region values compose for
+        free (``d.by_region({**k, "air": nu*0.026})``).
+
+        Each region must be a geometry part (``from_regions``) or a ``domain.tag`` predicate. ``default``
+        is the value for cells in no listed region; ``default=None`` (the strict default) requires the
+        regions to cover every value of interest -- a cell in an unlisted region simply contributes ``0``,
+        and an unknown region name raises. Desugars to ``sum_r RegionMask(r) * values[r]`` -- the proven
+        per-region integration path (``tests/test_fem_per_region.py``); ``jno.fem`` logs the expansion.
+        """
+        valid = set(getattr(self, "_source_regions", {}) or {}) | set(getattr(self, "_tag_predicates", {}) or {})
+        unknown = [r for r in values if r not in valid]
+        if unknown:
+            raise ValueError(
+                f"domain.by_region: unknown region(s) {sorted(unknown)}; each key must be a geometry part "
+                f"or a domain.tag predicate. Known regions: {sorted(valid)}."
+            )
+        expr = None
+        for region, value in values.items():
+            term = RegionMask(str(region)) * value
+            expr = term if expr is None else expr + term
+        if expr is None:
+            raise ValueError("domain.by_region: the {region: value} mapping is empty.")
+        if default is not None and default != 0:
+            covered = None
+            for region in values:
+                m = RegionMask(str(region))
+                covered = m if covered is None else covered + m
+            expr = expr + default * (1.0 - covered)  # cells in no listed region get `default`
+        get_logger(__name__).info(
+            f"by_region: per-region coefficient over {len(values)} region(s): {sorted(map(str, values))}"
+        )
+        return expr
+
     def _register_tag_boundary_region(self, name, where):
         """If any **boundary** facets satisfy ``where``, register a ``BoundaryRegion`` for ``name``
         so a ``jno.fem`` term bound to it classifies as a boundary (Dirichlet / Neumann) condition
@@ -2417,6 +2464,7 @@ class domain(MeshIOMixin):
         closure_iters=200,
         occlude=True,
         inward=False,
+        r_min=None,
     ):
         """Build an :class:`~jno.domain.enclosure.Enclosure` from radiating boundary ``tags``.
 
@@ -2441,6 +2489,10 @@ class domain(MeshIOMixin):
                 use when the radiating ``tags`` are the outer walls of a **meshed cavity** (an oven /
                 furnace filled with a transparent fluid) and radiation crosses the meshed interior, so
                 the facing walls see one another. Default ``False`` (normals out of the mesh, vacuum gap).
+            r_min: Axisymmetric only. Near-field floor for the ring view-factor kernel (``R^2 -> R^2 +
+                r_min^2``), which suppresses the spuriously large (>1) view factors that near-coincident
+                or on-axis (``r -> 0``) ring pairs otherwise produce. Defaults to half the median element
+                length (matched to the mesh resolution); pass a value to override.
         """
         from .enclosure import build_enclosure
 
@@ -2456,6 +2508,7 @@ class domain(MeshIOMixin):
             closure_iters=closure_iters,
             occlude=occlude,
             inward=inward,
+            r_min=r_min,
         )
 
     def compute_enclosure_view_factor(self, tags, opaque_tags=None):
