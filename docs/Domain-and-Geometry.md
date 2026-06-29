@@ -364,6 +364,8 @@ For explicit BC surfaces (e.g. an inlet face that is a subset of a boundary), us
 
 `build_mesh` accepts `sizes={"name": h}` as a short spelling of `region_mesh_sizes=`.
 
+Interfaces between named regions are meshed **conformingly**: the two regions sharing an interface always get the same nodes along it (a shared, constrained edge), so heat, flux, and radiation pass across the interface and `boundary_<name>` picks up a single well-defined edge. This holds even when one region (e.g. a complement region such as a meshed gas/air gap built as box-minus-everything) describes the shared edge with extra vertices the neighbour lacks.
+
 #### Custom samplers (mesh-free path only)
 
 When `build_mesh()` is **not** called, interior points are drawn by uniform rejection sampling inside each polygon. Pass a callable to override this per region or globally. The sampler signature is `fn(geometry, n) -> np.ndarray` with shape `(n, 2)`.
