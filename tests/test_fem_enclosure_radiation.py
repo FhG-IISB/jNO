@@ -783,3 +783,67 @@ def test_radiation_coupling_targets_one_field_in_a_multifield_system():
                 w(xc, yc) - w_cold,
             ]
         )
+
+
+def test_radiation_coupling_in_a_transient_solve_reaches_the_steady_coupled_state():
+    """A coupling enters each implicit time step (the transient block, linear here, is promoted to a
+    nonlinear backward-Euler block whose residual carries the coupling). The strongest check that this is
+    correct: a transient radiation-coupled heat solve, marched by the default fem.solve() integrator, must
+    relax to the *steady* radiation-coupled solution (at u_t -> 0 the step residual is exactly the steady
+    coupled residual). Validates that transient coupling runs end-to-end and is physically consistent."""
+    pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
+    from shapely.geometry import Point
+
+    import jno
+
+    sigma = 5.670374419e-8
+    r0, r1, r2, r3 = 0.10, 0.20, 0.25, 0.35
+    k0, eps0, T_hot, T_cold = 20.0, 0.7, 1000.0, 300.0
+    ring = lambda a, b: Point(0, 0).buffer(b, 16).difference(Point(0, 0).buffer(a, 16))  # noqa: E731
+    d = jno.domain(ring(r0, r1).union(ring(r2, r3)), mesh_size=0.45, time=(0.0, 0.05, 26))
+    rad = lambda x, y: jnp.hypot(x, y)  # noqa: E731
+    d.tag("hot", lambda x, y: jnp.abs(rad(x, y) - r0) < 4e-2)
+    d.tag("cold", lambda x, y: jnp.abs(rad(x, y) - r3) < 4e-2)
+    d.tag("inner_gap", lambda x, y: jnp.abs(rad(x, y) - r1) < 4e-2)
+    d.tag("outer_gap", lambda x, y: jnp.abs(rad(x, y) - r2) < 4e-2)
+    xi, yi, ti = d.variable("interior", split=True)
+    xh, yh, _ = d.variable("hot", split=True)
+    xc, yc, _ = d.variable("cold", split=True)
+    ci = d.variable("initial", split=True)
+    gap = d.enclosure(["inner_gap", "outer_gap"])
+    gap.check()
+    F = jnp.asarray(gap.view_factor)
+    eye, s_row = jnp.eye(gap.size), F.sum(axis=1)
+
+    def radiation(wT):  # net grey-body load on the temperature nodes (identical steady or transient)
+        Tk = gap.field(wT)
+        J = jnp.linalg.solve(eye - (1.0 - eps0) * F, eps0 * sigma * Tk**4)
+        return gap.load(s_row * J - F @ J)
+
+    # steady coupled reference (no time derivative -> steady form), direct-solve Newton
+    Tr, sTr = d.fem_symbols(names=("Tr", "sTr"))
+    Tri, sTri = Tr.bind(x=xi, y=yi), sTr.bind(x=xi, y=yi)
+    femS = jno.fem([k0 * (Tri.x * sTri.x + Tri.y * sTri.y), radiation, Tr(xh, yh) - T_hot, Tr(xc, yc) - T_cold])
+    T_steady = np.asarray(_newton_direct(lambda u: femS.operator.residual(u, {}), jnp.full((int(femS.dofs),), 650.0)))
+
+    # transient coupled solve: mass term u_t*v + same conduction + same radiation coupling; IC at T_cold
+    T, sT = d.fem_symbols(names=("T", "sT"))
+    Ti, sTi = T.bind(x=xi, y=yi, t=ti), sT.bind(x=xi, y=yi, t=ti)
+    femT = jno.fem(
+        [
+            Ti.t * sTi + k0 * (Ti.x * sTi.x + Ti.y * sTi.y),
+            radiation,
+            T(xh, yh) - T_hot,
+            T(xc, yc) - T_cold,
+            T(ci[0], ci[1]) - T_cold,
+        ]
+    )
+    assert femT._mode == "transient", "the coupled block must stay a transient block"
+    # non-parametric transient solve() is a FunctionCall trace node; .fn() evaluates the trajectory
+    traj = np.asarray(femT.solve().fn())  # (n_save, n_dofs) from the default backward-Euler integrator
+    T_final = traj[-1]
+
+    # the marched solution left the cold initial state and relaxed onto the steady coupled solution
+    assert T_final.max() > T_cold + 100.0, "transient never heated up"
+    rel = np.abs(T_final - T_steady).max() / (np.abs(T_steady).max() + 1e-9)
+    assert rel < 2e-2, f"transient end state did not reach the steady coupled solution: rel {rel:.3f}"

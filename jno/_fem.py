@@ -1411,13 +1411,10 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
     zeroed on the Dirichlet-pinned DOFs. A *linear* local form is promoted to a nonlinear residual operator
     (so ``fem.solve()`` uses ``newton_krylov``); a *nonlinear* one gains the extra term. A coupling with a
     ``field_key`` acts on that field's DOF sub-block (multifield, e.g. radiation on T in a heat+flow system);
-    without one it acts on the whole vector (single field). Transient coupling still **fails loud**."""
-    if fem_obj._mode == "transient":
-        raise NotImplementedError(
-            "jno.fem: nonlocal Coupling terms are not yet wired for transient forms. Lag the coupling via "
-            "fem.operator per step (operator-splitting), or use the steady form."
-        )
-    if fem_obj._mode not in ("linear", "nonlinear"):
+    without one it acts on the whole vector (single field). For a **transient** form the coupling enters each
+    implicit step: a nonlinear time block gains the term in its residual, a linear one is promoted to a
+    nonlinear (backward-Euler) block -- so e.g. enclosure radiation over a heating cycle solves in-residual."""
+    if fem_obj._mode not in ("linear", "nonlinear", "transient"):
         raise NotImplementedError(f"jno.fem: nonlocal Coupling terms are not supported for mode {fem_obj._mode!r}.")
     n = int(fem_obj.dofs)
     pairs = getattr(domain, "_fem_native_dirichlet_pairs", None) or []
@@ -1450,17 +1447,59 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
             total = total.at[lo:hi].add(jnp.asarray(contrib, dtype=u.dtype).reshape(-1))
         return total if d_dofs is None else total.at[d_dofs].set(0.0)
 
-    op = fem_obj._op
-    rpe = dict(getattr(op, "runtime_parameter_exprs", {}) or {})
-    # Merge in parameters declared on the couplings so they appear in the solve's runtime args (and thus
-    # as trainable inputs of the fem.solve() FunctionCall) -- the trace walk that finds weak-form params
-    # never sees an opaque coupling function. `_collect_runtime_parameter_exprs` keys by name and raises on
-    # a name reused for a different parameter, so a coupling param that also drives the weak form is shared.
+    # Merge parameters declared on the couplings into the operator's runtime params so they appear in the
+    # solve's runtime args (and thus as trainable inputs of the fem.solve() FunctionCall) -- the trace walk
+    # that finds weak-form params never sees an opaque coupling function. `_collect_runtime_parameter_exprs`
+    # keys by name and raises on a name reused for a different parameter, so a param shared with the weak
+    # form is deduped.
     from .utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
 
-    for c in couplings:
-        for p in c.params:
-            _collect_runtime_parameter_exprs(p, rpe)
+    def _merge_coupling_params(base):
+        out = dict(base or {})
+        for c in couplings:
+            for p in c.params:
+                _collect_runtime_parameter_exprs(p, out)
+        return out
+
+    if fem_obj._mode == "transient":
+        # Inject the coupling into the implicit time step. The step prefers the nonlinear payload
+        # (M(t)(u_next-u)/dt + R(u_next,t,args)=0, matrix-free Newton-Krylov), so a nonlinear block just
+        # gains the term; a linear block (M u_dot + A u = c + f) is promoted to that nonlinear (backward-
+        # Euler) form with R(u,t,args) = A(t,args) u - c - f(t,args) + coupling. Periodic transient runs in
+        # a reduced DOF space the coupling cannot address, so it is refused.
+        block = fem_obj._op
+        if getattr(block, "prolongation", None) is not None:
+            raise NotImplementedError("jno.fem: transient Coupling is not supported together with periodic ties.")
+        block.runtime_parameter_exprs = _merge_coupling_params(getattr(block, "runtime_parameter_exprs", {}))
+        if block.is_nonlinear():
+            _base = block.residual
+
+            def _t_residual(u, t, args=None, _b=_base):
+                return jnp.asarray(_b(u, t, args)).reshape(-1) + coupling_residual(u, args)
+
+            block.residual = _t_residual
+        else:  # promote the linear payload -> nonlinear so the coupling enters the backward-Euler step
+            _M, _A, _opfn = block.M, block.A, block.operator_fn
+            _fvfn, _cbias = block.forcing_vector_fn, block.affine_bias
+
+            def _operand(x):
+                return x if hasattr(x, "todense") else jnp.asarray(x)
+
+            def _t_mass(t, args=None, _m=_M):
+                return _m
+
+            def _t_residual(u, t, args=None):
+                u = jnp.asarray(u).reshape(-1)
+                A = _operand(_opfn(t, args or {}) if _opfn is not None else _A)
+                c = 0.0 if _cbias is None else jnp.asarray(_cbias, u.dtype).reshape(-1)
+                f = 0.0 if _fvfn is None else jnp.asarray(_fvfn(t, args or {}), u.dtype).reshape(-1)
+                return (A @ u) - c - f + coupling_residual(u, args)
+
+            block.mass, block.residual = _t_mass, _t_residual
+        return fem_obj
+
+    op = fem_obj._op
+    rpe = _merge_coupling_params(getattr(op, "runtime_parameter_exprs", {}))
     if fem_obj._mode == "linear":
         # local residual R_local(u, args) = A(args) u - b(args)
         def residual(u, args=None, _op=op):

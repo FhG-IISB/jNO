@@ -386,6 +386,39 @@ Validated on two concentric cylinders against the closed-form two-surface series
 emissivity matching finite differences (`tests/test_fem_enclosure_radiation.py`). The dense Jacobian is
 fine for moderate meshes; for large problems, precondition a matrix-free Newton with the conduction solve.
 
+### In-residual coupling (`jno.Coupling`) — implicit, trainable, transient
+
+The bring-your-own-loop above is operator-splitting: you reach into `fem.operator` and march the radiation
+yourself. To instead solve conduction **and** radiation as one implicit system, pass the nonlocal residual
+**in the `jno.fem([...])` list**. A plain function `f(u) -> (n_dofs,)` there is taken as a nonlocal
+*coupling* (weak/Dirichlet terms are trace nodes, never plain callables): `jno.fem` adds it to the assembled
+residual `R(u) = R_local(u) + Σ_k coupling_k(u)`, promoting a linear form to a nonlinear one, and
+`fem.solve()` drives the whole thing with the matrix-free, `custom_root`-differentiable `newton_krylov`:
+
+```python
+def radiation(u):                         # the same radiosity, now a residual contribution
+    Ts = gap.field(u)
+    J  = jnp.linalg.solve(jnp.eye(gap.size) - rho[:, None] * F, eps * SIGMA * (Ts + KELVIN)**4)
+    return gap.load(J - F @ J)             # net flux scattered to nodes
+
+fem  = jno.fem([conduction, radiation, u(xc, yc) - T_COOL])    # radiation is the bare function
+Tsol = fem.solve(u0=T_guess)                                   # conduction + radiation, one implicit solve
+```
+
+(A jitted residual / callable *object* isn't a plain function — wrap it as `jno.Coupling(fn)`, which is also
+how you reach the options below. A stiff/dense coupling may still need a tailored `fem.solve(solve_fn=…)`.)
+
+- **Trainable coupling parameters.** A `jno.np.parameter` in a *weak* term is found by the trace walk, but a
+  coupling is opaque — declare its parameters so they thread through the solve and `crux` recovers them:
+  `jno.Coupling(fn, params=[eps])`, with the residual taking the `{name: value}` dict, `fn(u, p)`.
+- **Multifield.** `jno.Coupling(fn, field_key=T_key)` acts on one field's DOF block (e.g. radiation on `T`
+  in a heat+flow / thermo-mechanical solve); the residual sees and returns that field's sub-vector.
+- **Transient.** The coupling enters each implicit step — a nonlinear time block gains the term, a linear one
+  is promoted to a nonlinear (backward-Euler) block — so enclosure radiation over a heating cycle solves
+  in-residual. (Not combined with periodic ties.)
+
+All four (bare function, `params`, `field_key`, transient) are covered in `tests/test_fem_enclosure_radiation.py`.
+
 Reference: M. F. Modest, *Radiative Heat Transfer*, 3rd ed., Ch. 4–5 (view factors; the net-radiation /
 radiosity method for diffuse-grey enclosures).
 
