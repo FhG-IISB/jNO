@@ -585,15 +585,11 @@ def make_engd_fn(
             N = J_flat.shape[0]
             G = G + (w / N) * (J_flat.T @ J_flat)
         nat_flat_raw = jnp.linalg.lstsq(G, flat_model_grad, rcond=rcond)[0]
-        nat_flat = jnp.where(
-            jnp.any(jnp.isnan(nat_flat_raw)), jnp.zeros_like(nat_flat_raw), nat_flat_raw
-        )
+        nat_flat = jnp.where(jnp.any(jnp.isnan(nat_flat_raw)), jnp.zeros_like(nat_flat_raw), nat_flat_raw)
         return nat_flat, G
 
     def cached_solve_fn(G, flat_model_grad):
         nat_flat_raw = jnp.linalg.lstsq(G, flat_model_grad, rcond=rcond)[0]
-        return jnp.where(
-            jnp.any(jnp.isnan(nat_flat_raw)), jnp.zeros_like(nat_flat_raw), nat_flat_raw
-        )
+        return jnp.where(jnp.any(jnp.isnan(nat_flat_raw)), jnp.zeros_like(nat_flat_raw), nat_flat_raw)
 
     return gram_and_solve_fn, cached_solve_fn

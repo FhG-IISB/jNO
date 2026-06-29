@@ -1542,8 +1542,7 @@ class ENGDCallback(Callback):
 
         if "all_ops" not in kwargs:
             raise RuntimeError(
-                "ENGDCallback requires the solver to pass `all_ops` via "
-                "on_solve_begin (jno >= feat/engd-callback)."
+                "ENGDCallback requires the solver to pass `all_ops` via on_solve_begin (jno >= feat/engd-callback)."
             )
 
         trainable = kwargs["trainable"]
@@ -1600,17 +1599,16 @@ class ENGDCallback(Callback):
                     full = eqx.combine(new_tr, _frozen, _static)
                     full = _paramax.unwrap(full)
                     residuals = _compiled_fn(
-                        full, context_inner, batchsize=_batchsize,
-                        key=rng_inner, min_consecutive=_min_consec,
+                        full,
+                        context_inner,
+                        batchsize=_batchsize,
+                        key=rng_inner,
+                        min_consecutive=_min_consec,
                     )
-                    return jax.numpy.mean(
-                        jax.numpy.stack([jax.numpy.mean(r) for r in residuals])
-                    )
+                    return jax.numpy.mean(jax.numpy.stack([jax.numpy.mean(r) for r in residuals]))
 
-                steps = (0.5 ** jax.numpy.arange(31, dtype=flat_p.dtype))
-                _, losses = jax.lax.scan(
-                    lambda c, a: (c, _loss_at_alpha(a)), None, steps
-                )
+                steps = 0.5 ** jax.numpy.arange(31, dtype=flat_p.dtype)
+                _, losses = jax.lax.scan(lambda c, a: (c, _loss_at_alpha(a)), None, steps)
                 return steps[jax.numpy.argmin(losses)]
 
             self._ls_jit = jax.jit(_ls_fn)
@@ -1625,9 +1623,7 @@ class ENGDCallback(Callback):
         flat_g, _ = jax.flatten_util.ravel_pytree(grads[self._lid])
 
         if self._G_cache is None or epoch % self._gram_interval == 0:
-            nat_flat, self._G_cache = self._gram_and_solve_jit(
-                trainable, context, rng, flat_g
-            )
+            nat_flat, self._G_cache = self._gram_and_solve_jit(trainable, context, rng, flat_g)
         else:
             nat_flat = self._cached_solve_jit(self._G_cache, flat_g)
 

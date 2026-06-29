@@ -76,6 +76,7 @@ def _build_poisson2d(seed: int = 0, hidden_dims: int = 32, num_layers: int = 1):
 
     return net, losses, gram_terms, eval_error
 
+
 # ---------------------------------------------------------------------------
 # Sentinel construction
 # ---------------------------------------------------------------------------

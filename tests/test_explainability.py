@@ -600,9 +600,7 @@ def test_engd_callback_compiles_and_reduces_loss():
     loss_gd = float(stats_g.total_loss)
 
     # ENGD with lr=1 should outperform GD with lr=1e-3 on the same problem.
-    assert loss_engd < loss_gd, (
-        f"ENGD loss {loss_engd:.3e} should be < GD loss {loss_gd:.3e}"
-    )
+    assert loss_engd < loss_gd, f"ENGD loss {loss_engd:.3e} should be < GD loss {loss_gd:.3e}"
     # Loss must be finite.
     assert np.isfinite(loss_engd), f"ENGD loss is not finite: {loss_engd}"
 
@@ -708,7 +706,7 @@ def test_engd_line_search_reduces_loss():
 
     def make_net():
         base = foundax.mlp(in_features=2, hidden_dims=8, num_layers=1, activation=jax.nn.tanh, key=key)
-        scaled = jax.tree_util.tree_map(lambda l: l * 0.1 if eqx.is_array(l) else l, base)
+        scaled = jax.tree_util.tree_map(lambda leaf: leaf * 0.1 if eqx.is_array(leaf) else leaf, base)
         return jnn.nn.wrap(scaled)
 
     net = make_net()
