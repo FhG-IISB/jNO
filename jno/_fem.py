@@ -627,14 +627,19 @@ def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None, periodic
     )
 
 
-def _solve_complex_transient(blocks: Any, save_ts: Any = None) -> Any:
+def _solve_complex_transient(blocks: Any, save_ts: Any = None, periodic: Optional[dict] = None) -> Any:
     """Integrate a complex *transient* system via the real-equivalent block (everything was
     assembled as real systems): ``(M_r + i M_i) u_dot + (A_r + i A_i) u = (c_r + i c_i)`` becomes
     the real ``2N`` system
     ``M_blk u_dot + A_blk u = c_blk`` with ``M_blk=[[M_r,-M_i],[M_i,M_r]]`` (likewise A, c) and
     ``u=[u_r;u_i]``. Backward Euler over the block, then recombine to ``u_r + i u_i``. ``blocks =
     (block_r, block_i)`` are the Re-coeff and Im-coeff real ``SemidiscreteTimeBlock``s. This covers
-    Schrodinger (``i u_t = H u`` -> M_r = 0) since the *block* mass stays non-singular."""
+    Schrodinger (``i u_t = H u`` -> M_r = 0) since the *block* mass stays non-singular.
+
+    With a periodic tie the two blocks arrive already reduced (``P^T M P`` etc., restricted ``state0``)
+    by the same ``P``, so the integration runs in the reduced master-DOF space; each saved slice is then
+    prolonged back ``u = P u_red`` -- real and imaginary parts separately (a real ``P`` would cast a
+    complex vector to its real dtype and drop the imaginary part)."""
 
     def _dn(a):
         return jnp.asarray(a.todense()) if hasattr(a, "todense") else jnp.asarray(a)
@@ -670,7 +675,12 @@ def _solve_complex_transient(blocks: Any, save_ts: Any = None) -> Any:
     traj = jnp.concatenate([w0[None, :], ws], axis=0)  # (n_grid, 2N)
     save_ts = grid if save_ts is None else jnp.asarray(save_ts)
     traj = jax.vmap(lambda col: jnp.interp(save_ts, grid, col), in_axes=1, out_axes=1)(traj)
-    return traj[:, :n] + 1j * traj[:, n:]  # (n_save, N) complex
+    result = traj[:, :n] + 1j * traj[:, n:]  # (n_save, n_red) complex (full N when untied)
+    if periodic is None:
+        return result
+    from .utils.solver.fem_utils import prolong_periodic
+
+    return prolong_periodic(periodic, result.real) + 1j * prolong_periodic(periodic, result.imag)
 
 
 def _is_temporal_value_node(node: Any) -> bool:
@@ -864,7 +874,7 @@ class FEM:
         if self._mode == "complex":
             return _solve_complex_block(self._op, solve_fn, periodic=self._periodic)
         if self._mode == "complex_transient":
-            return _solve_complex_transient(self._op, save_ts=kwargs.get("save_ts"))
+            return _solve_complex_transient(self._op, save_ts=kwargs.get("save_ts"), periodic=self._periodic)
         if self._mode == "linear" and not isinstance(self._op, FemLinearSystem):
             # Non-parametric steady linear. Default: matrix-free Jacobi-preconditioned BiCGStab on the
             # BCOO operator (never densifies -> memory O(nnz); GPU-safe; solves general systems). Pass
@@ -1708,11 +1718,6 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             fem_obj = _wrap_couplings(domain, fem_obj, couplings)
         if not periodic_ties:
             return fem_obj
-        if fem_obj._mode == "complex_transient":
-            raise NotImplementedError(
-                "jno.fem: periodic ties on a complex *transient* problem are not supported yet "
-                "(the reduction must be applied to both the real and imaginary time blocks)."
-            )
         # Single-field transient was already reduced by the dedicated native branch -> reuse its P.
         if periodic_holder:
             fem_obj._periodic = periodic_holder[0]
@@ -2024,7 +2029,6 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         not is_vpinn
         and is_transient
         and _is_complex_form(domain, ir)
-        and not periodic_ties
         and not multifield
         and _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
         and not any(_crp(b) for b in weak_bares)
