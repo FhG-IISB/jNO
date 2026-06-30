@@ -111,6 +111,13 @@ problems whose natural space is *not* H¹. Pick one with the `space=` knob on `f
 | `"RT"` | **H(div)** Raviart–Thomas | edge normal flux `∫ₑ u·n` | mixed Poisson, Darcy, conservation |
 | `"N1E"` | **H(curl)** Nédélec (1st kind) | edge tangential `∫ₑ u·t` | Maxwell, eddy currents |
 | `"P0"` | L² (piecewise constant) | one per cell | the pressure / multiplier of a mixed pair |
+| `"Hermite"` | C⁰ cubic, **vertex value + ∇ DOFs** | `u`, `∂u/∂x`, `∂u/∂y` at vertices (+ centroid) | smooth/gradient-aware fields; the foundation for C¹ elements |
+
+> **Hermite** is the first element with a per-cell **DOF-mixing** transform `M(cell)` (its global
+> derivative DOFs are the physical gradient `∇u` at the vertices). It is **C⁰** (not C¹), so it is *not*
+> a conforming biharmonic element — it de-risks the `M(cell)` / vertex-derivative-DOF machinery that the
+> forthcoming C¹ Bell/Argyris elements reuse. Essential value/derivative BCs through the weak-form DSL are
+> the next step (currently clamp boundary DOFs directly; see `tests/test_fem_hermite.py`).
 
 ```python
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")   # H(div) flux

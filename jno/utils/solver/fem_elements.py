@@ -13,7 +13,9 @@ gradient chain rule. The edge/derivative-DOF families do:
   ``Phi_phys = (1/detJ) J Phi_ref``, ``div Phi_phys = (1/detJ) div Phi_ref``.
 * Nédélec (H(curl)): covariant Piola ``Phi_phys = J^{-T} Phi_ref``,
   ``curl Phi_phys = (1/detJ) curl Phi_ref`` (2-D scalar curl).
-* Argyris (C1): per-cell Kirby ``M(cell)`` on derivative DOFs  *(later)*.
+* Hermite (C0, vertex value + first-derivative DOFs): per-cell ``M(cell)`` DOF-transform
+  (``M = blockdiag(1, J)`` per vertex) -- the first DOF-*mixing* map (see :func:`hermite_M`). The
+  C1 Bell/Argyris elements extend the same machinery to second-derivative + edge-normal DOFs *(later)*.
 
 A per-DOF orientation sign (from :mod:`fem_topology`) multiplies the whole basis
 function so the two cells sharing an edge agree on its sign. The Piola formula and
@@ -191,3 +193,70 @@ def piola_covariant_grad(ref_grads: jnp.ndarray, J: jnp.ndarray, detJ: jnp.ndarr
     K = jnp.linalg.inv(J)
     grad = jnp.einsum("ji,qnjm,ml->qnil", K, ref_grads, K)
     return grad * signs[None, :, None, None]
+
+
+# ---------------------------------------------------------------------------
+# Cubic Hermite (C0, vertex value + first-derivative DOFs) -- the foundation for the
+# derivative-DOF / DOF-mixing transform that C1 elements (Bell/Argyris) build on.
+# ---------------------------------------------------------------------------
+
+
+def hermite_triangle(quad_degree: int = 6) -> ElementSpec:
+    """Cubic Hermite element on the reference triangle, via basix (``ElementFamily.Hermite``, degree 3).
+
+    A *scalar* element with **derivative DOFs**. basix DOF order (verified): per vertex
+    ``(value, ∂/∂ξ₀, ∂/∂ξ₁)`` for vertices 0,1,2, then one interior (centroid value) DOF -> ``n_dof=10``.
+    The reference basis is mapped to a physical cell by the per-cell **DOF-transform** ``M(cell)``
+    (:func:`hermite_M`) -- a DOF-*mixing* matrix (the value-Piola maps only scale each DOF), so the global
+    derivative DOFs are physical-coordinate derivatives ``∂/∂x, ∂/∂y``. Carries ``ref_hess`` so a 4th-order
+    form assembles (note: cubic Hermite is C⁰, so it is non-conforming for biharmonic -- the C¹ Bell/Argyris
+    elements reuse this machinery)."""
+    import basix
+    from basix import CellType, ElementFamily
+
+    from .fem_lagrange import _ref_hessian_from_tab
+
+    elem = basix.create_element(ElementFamily.Hermite, CellType.triangle, 3)
+    qp, qw = basix.make_quadrature(CellType.triangle, quad_degree)
+    tab = elem.tabulate(2, qp)  # (n_blocks, n_quad, n_dof, 1)
+    return ElementSpec(
+        family="Hermite-Tri",
+        n_dof=int(elem.dim),
+        value_size=1,
+        quad_points=np.asarray(qp),
+        quad_weights=np.asarray(qw),
+        ref_values=np.asarray(tab[0]),
+        ref_div=None,
+        ref_grads=np.stack([np.asarray(tab[1]), np.asarray(tab[2])], axis=-1),  # (n_quad, 10, 1, 2)
+        local_edges=(),
+        ref_hess=_ref_hessian_from_tab(tab, 2),  # (n_quad, 10, 1, 2, 2)
+    )
+
+
+def hermite_M(J: jnp.ndarray) -> jnp.ndarray:
+    """Per-cell DOF-transform ``M(cell)`` (10×10) for cubic Hermite.
+
+    Block-diagonal over the three vertices: the value DOF is unchanged and the two first-derivative DOFs
+    transform by the cell Jacobian ``J`` (so a global derivative DOF is ``∂u/∂x``/``∂u/∂y`` at the vertex,
+    not the reference ``∂u/∂ξ``); the interior centroid-value DOF is unchanged. Derived and numerically
+    validated (the derivative block is ``J``, not ``Jᵀ``). The physical basis is ``Φ = M φ̂``."""
+    M = jnp.eye(10, dtype=J.dtype)
+    for vb in (0, 3, 6):  # each vertex block: DOF vb=value, vb+1/vb+2 = ∂ξ₀/∂ξ₁
+        M = M.at[vb + 1 : vb + 3, vb + 1 : vb + 3].set(J)
+    return M
+
+
+def hermite_pushforward(ref_values, ref_grads, ref_hess, J, detJ, signs):
+    """Map the reference Hermite basis to a physical cell: ``Φ = M φ̂`` (value), the chain-ruled physical
+    gradient/Hessian then left-multiplied by ``M`` on the DOF axis. Scalar field -> shapes match nodal
+    Lagrange ``(n_quad, n_dof)`` / ``(…, tdim)`` / ``(…, tdim, tdim)``, so the shared evaluator treats a
+    Hermite field exactly like a scalar Lagrange one (the ``signs`` arg is unused -- Hermite has no edge
+    orientation -- kept for a uniform push-forward signature)."""
+    M = hermite_M(J)
+    K = jnp.linalg.inv(J)
+    phi = jnp.einsum("ab,qb->qa", M, ref_values[..., 0])  # (n_quad, n_dof)
+    dphys = jnp.einsum("qbi,id->qbd", ref_grads[..., 0, :], K)  # reference grad -> physical (chain rule)
+    grad = jnp.einsum("ab,qbd->qad", M, dphys)  # (n_quad, n_dof, tdim)
+    hphys = jnp.einsum("qbij,ia,jc->qbac", ref_hess[..., 0, :, :], K, K)  # Kᵀ H_ref K
+    hess = jnp.einsum("ab,qbij->qaij", M, hphys)  # (n_quad, n_dof, tdim, tdim)
+    return phi, grad, hess

@@ -109,6 +109,8 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
     from ...trace import FemResidualOperator
     from .fem_1d import _apply_dirichlet_rows, _apply_dirichlet_symmetric, _integrate_term
     from .fem_elements import (
+        hermite_pushforward,
+        hermite_triangle,
         nedelec_triangle,
         piola_contravariant,
         piola_contravariant_grad,
@@ -141,16 +143,23 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
                 field_index[f["field_key"]] = len(fields)
                 fields.append(f)
     spaces = [f["space"] for f in fields]
-    if any(s not in ("RT", "N1E", "P0") for s in spaces):
-        raise NotImplementedError(f"jno.fem (non-nodal): supported element spaces are RT, N1E and P0; got {spaces}.")
+    if any(s not in ("RT", "N1E", "P0", "Hermite") for s in spaces):
+        raise NotImplementedError(
+            f"jno.fem (non-nodal): supported element spaces are RT, N1E, P0 and Hermite; got {spaces}."
+        )
+    has_edge = ("RT" in spaces) or ("N1E" in spaces)
+    has_hermite = "Hermite" in spaces
+    if has_edge and has_hermite:
+        raise NotImplementedError("jno.fem (non-nodal): mixing edge (RT/N1E) and Hermite fields is not supported.")
 
-    # --- mesh + edge element(s) + topology. RT (H(div), contravariant Piola) and N1E (H(curl),
-    # covariant Piola) share the edge ordering, topology and global edge DOFs; they differ only in the
-    # push-forward and the per-DOF reference shape data, so one dispatch (edge_ref) serves both. ---
     pts = jnp.asarray(np.asarray(domain.mesh.points))[:, :2]
     cells = np.asarray(domain.mesh.cells_dict["triangle"], dtype=np.int64)
     n_cells = int(cells.shape[0])
+    n_verts = int(pts.shape[0])
     cells_j = jnp.asarray(cells, dtype=jnp.int32)
+
+    # --- edge families (RT/N1E): contravariant/covariant Piola over a shared edge topology (one
+    # ``edge_ref`` dispatch serves both -- same edge DOFs/topology, family-specific push-forward) ---
     edge_ref = {}  # family -> (ref_values, ref_diffop, ref_grads, piola_fn, piola_grad_fn)
     specs = {}
     if "RT" in spaces:
@@ -162,24 +171,54 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
         s = specs["N1E"]
         edge_ref["N1E"] = (s.ref_values, s.ref_curl, s.ref_grads, piola_covariant, piola_covariant_grad)
     edge_ref = {k: tuple(jnp.asarray(a) for a in v[:3]) + v[3:] for k, v in edge_ref.items()}
-    ref_spec = specs.get("RT") or specs.get("N1E") or raviart_thomas_triangle(degree=1, quad_degree=quad_degree)
-    top = build_edge_topology(cells, ref_spec.local_edges)
-    ce = jnp.asarray(top.cell_edges, dtype=jnp.int32)  # (n_cells, 3) global edge ids
-    esigns = jnp.asarray(top.cell_edge_signs.astype(np.float64))  # (n_cells, 3)
+
+    # --- Hermite (C0 vertex value+derivative DOFs): the M(cell) DOF-transform path ---
+    hermite_ref = None
+    if has_hermite:
+        hs = hermite_triangle(quad_degree=max(quad_degree, 6))  # cubic mass needs a degree-6 rule
+        hermite_ref = (jnp.asarray(hs.ref_values), jnp.asarray(hs.ref_grads), jnp.asarray(hs.ref_hess))
+
+    # Shared quadrature: a Hermite problem uses the Hermite rule; an edge/P0 problem uses the edge rule.
+    ref_spec = hs if has_hermite else (specs.get("RT") or specs.get("N1E") or raviart_thomas_triangle(1, quad_degree))
     qp, qw = jnp.asarray(ref_spec.quad_points), jnp.asarray(ref_spec.quad_weights)
     n_quad = int(qw.shape[0])
     ctx = getattr(domain, "context", {}) or {}
 
-    # per-field DOF count (RT/N1E -> n_edges, P0 -> n_cells), block offsets, and per-cell global DOF map
-    ndof = [top.n_edges if s in ("RT", "N1E") else n_cells for s in spaces]
+    # Edge topology only when an edge family is present.
+    if has_edge:
+        top = build_edge_topology(cells, ref_spec.local_edges)
+        ce = jnp.asarray(top.cell_edges, dtype=jnp.int32)  # (n_cells, 3) global edge ids
+        esigns = jnp.asarray(top.cell_edge_signs.astype(np.float64))  # (n_cells, 3)
+        n_edges = int(top.n_edges)
+    else:
+        top, ce, esigns, n_edges = None, None, None, 0
+
+    # Hermite per-cell global DOF map: 3 DOFs per vertex (value, ∂x, ∂y, in basix order) + 1 interior
+    # (centroid) DOF per cell. Continuity is automatic from shared global vertex ids (point functionals --
+    # no edge dedup, no orientation sign; the M(cell) transform takes that role).
+    hermite_cdofs = None
+    if has_hermite:
+        _vdofs = (3 * cells_j[:, :, None] + jnp.arange(3)[None, None, :]).reshape(n_cells, 9)  # (n_cells, 9)
+        _idofs = (3 * n_verts + jnp.arange(n_cells))[:, None]  # (n_cells, 1) interior
+        hermite_cdofs = jnp.concatenate([_vdofs, _idofs], axis=1)  # (n_cells, 10), block-local DOF ids
+
+    def _field_ndof(s):
+        return (3 * n_verts + n_cells) if s == "Hermite" else (n_edges if s in ("RT", "N1E") else n_cells)
+
+    ndof = [_field_ndof(s) for s in spaces]
     offs = [0]
     for n in ndof:
         offs.append(offs[-1] + n)
     total = offs[-1]
-    cdofs = [
-        (offs[i] + ce) if spaces[i] in ("RT", "N1E") else (offs[i] + jnp.arange(n_cells)[:, None])
-        for i in range(len(fields))
-    ]  # (n_cells, 3) for RT/N1E, (n_cells, 1) for P0
+
+    def _field_cdofs(i):
+        if spaces[i] == "Hermite":
+            return offs[i] + hermite_cdofs  # (n_cells, 10)
+        if spaces[i] in ("RT", "N1E"):
+            return offs[i] + ce  # (n_cells, 3)
+        return offs[i] + jnp.arange(n_cells)[:, None]  # (n_cells, 1) P0
+
+    cdofs = [_field_cdofs(i) for i in range(len(fields))]
 
     def _cell_fields(c, u_blocks):
         verts = pts[cells_j[c]]
@@ -187,7 +226,22 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
         detJ = jnp.linalg.det(J)
         per = []
         for i, s in enumerate(spaces):
-            if s in edge_ref:  # RT (contravariant) or N1E (covariant): same edge DOFs, family-specific push-forward
+            if s == "Hermite":  # C0 vertex value+derivative DOFs via the M(cell) DOF-transform
+                rv, rg, rh = hermite_ref
+                phi, grad, hess = hermite_pushforward(rv, rg, rh, J, detJ, None)
+                # Tag "Lagrange": the M(cell) transform is baked into phi/grad/hess, so this SCALAR field's
+                # shape data matches nodal Lagrange and the shared evaluator (value / .x / Hessian) serves
+                # it unchanged. cell_sol = this cell's 10 local DOF values, (10, 1).
+                per.append(
+                    {
+                        "shape_vals": phi,
+                        "shape_grads": grad,
+                        "shape_hess": hess,
+                        "cell_sol": u_blocks[i][cdofs[i][c] - offs[i]][:, None],
+                        "space": "Lagrange",
+                    }
+                )
+            elif s in edge_ref:  # RT (contravariant) or N1E (covariant): same edge DOFs, family-specific push-forward
                 rval, rdop, rgr, pf, pgf = edge_ref[s]
                 phi, _d = pf(rval, rdop, J, detJ, esigns[c])  # (n_quad, 3, 2)
                 grad = pgf(rgr, J, detJ, esigns[c])  # (n_quad, 3, 2, 2)
