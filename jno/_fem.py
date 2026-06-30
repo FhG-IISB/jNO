@@ -570,14 +570,22 @@ def _is_complex_form(domain: Any, ir: Any) -> bool:
     return False
 
 
-def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None) -> Any:
+def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None, periodic: Optional[dict] = None) -> Any:
     """Solve a complex linear FEM system via the real-equivalent block (everything was
     assembled as two *real* systems)::
 
         [[A_r, -A_i], [A_i, A_r]] [u_r; u_i] = [b_r; b_i],     u = u_r + i u_i.
 
-    ``ops = (op_r, op_i)`` are the Re-coeff and Im-coeff real systems (each a raw ``(A, b)``)."""
+    ``ops = (op_r, op_i)`` are the Re-coeff and Im-coeff real systems (each a raw ``(A, b)``).
+
+    A periodic tie reduces *both* legs by the **same** prolongation ``P`` -- Re and Im live on one FE
+    space, so one ``P`` -- before the block is formed: ``A -> P^T A P``, ``b -> P^T b`` on each leg.
+    Because the same ``P`` hits both, ``blkdiag(P, P)^T [[A_r,-A_i],[A_i,A_r]] blkdiag(P, P)`` preserves
+    the real-equivalent structure exactly; the reduced complex solution is prolonged back ``u = P u_red``.
+    The reduction runs while the operator is still BCOO (sparse triplet-remap), then the *smaller*
+    reduced block is densified for ``jnp.block``."""
     from .trace import FemLinearSystem
+    from .utils.solver.fem_utils import prolong_periodic, reduce_matrix_periodic, reduce_vector_periodic
 
     def _ab(op):
         if isinstance(op, FemLinearSystem):
@@ -587,6 +595,10 @@ def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None) -> Any:
                 "forward works under the same real-equivalent block, but is not wired here yet.)"
             )
         A, b = op
+        b = jnp.asarray(b).reshape(-1)
+        if periodic is not None:
+            A = reduce_matrix_periodic(periodic, A)  # P^T A P  (stays sparse if A is BCOO)
+            b = reduce_vector_periodic(periodic, b)  # P^T b
         A = jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)
         return A, jnp.asarray(b).reshape(-1)
 
@@ -596,7 +608,11 @@ def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None) -> Any:
     rhs = jnp.concatenate([b_r, b_i])
     solve_fn = solve_fn or (lambda A, b: jnp.linalg.solve(A, b))
     sol = jnp.asarray(solve_fn(block, rhs))
-    return sol[:n] + 1j * sol[n:]
+    if periodic is None:
+        return sol[:n] + 1j * sol[n:]
+    # Prolong the real and imaginary reduced halves *separately* (real P @ real vector); prolonging the
+    # complex vector directly would cast it to P's real dtype and silently drop the imaginary part.
+    return prolong_periodic(periodic, sol[:n]) + 1j * prolong_periodic(periodic, sol[n:])
 
 
 def _solve_complex_transient(blocks: Any, save_ts: Any = None) -> Any:
@@ -834,7 +850,7 @@ class FEM:
         to choose the real block solver.
         """
         if self._mode == "complex":
-            return _solve_complex_block(self._op, solve_fn)
+            return _solve_complex_block(self._op, solve_fn, periodic=self._periodic)
         if self._mode == "complex_transient":
             return _solve_complex_transient(self._op, save_ts=kwargs.get("save_ts"))
         if self._mode == "linear" and not isinstance(self._op, FemLinearSystem):
@@ -1339,6 +1355,31 @@ def _reduce_transient_block_periodic(block: Any, periodic: dict) -> Any:
     )
 
 
+def reduce_op_periodic(op: Any, mode: str, periodic: dict) -> Any:
+    """Apply the periodic Galerkin reduction ``P`` to a FEM operator, recursing into composite ops.
+
+    One combinator over every :class:`FEM` ``_op`` representation, so a periodic tie composes with each
+    feature without a per-combination branch:
+
+    * ``"transient"`` -- eager reduction of the ``SemidiscreteTimeBlock`` (``P^T M P``, ``P^T A P``,
+      runtime ``operator_fn``/``forcing_vector_fn``, restricted ``state0``) via
+      :func:`_reduce_transient_block_periodic`.
+    * ``"complex"`` / ``"complex_transient"`` -- ``op`` is a ``(re, im)`` tuple of real systems that
+      share **one** FE space, hence **one** ``P``; each leg is reduced with the *same* ``periodic`` so
+      the real-equivalent block ``[[A_r, -A_i], [A_i, A_r]]`` (and its transient analogue) is preserved
+      exactly. (``complex`` legs are raw ``(A, b)``; ``complex_transient`` legs are time blocks.)
+    * ``"linear"`` (a raw ``(A, b)``) and ``"nonlinear"`` (a residual operator) -- returned unchanged;
+      these reduce lazily at solve time in :meth:`FEM.solve` (``P^T A P`` on the BCOO operator, or the
+      ``P^T r(P·)`` residual wrap), which keeps the operator sparse and the residual matrix-free.
+    """
+    if mode in ("complex", "complex_transient"):
+        leg_mode = "transient" if mode == "complex_transient" else "linear"
+        return tuple(reduce_op_periodic(leg, leg_mode, periodic) for leg in op)
+    if mode == "transient":
+        return _reduce_transient_block_periodic(op, periodic)
+    return op
+
+
 class Coupling:
     """A **nonlocal** residual term passed in the ``jno.fem([...])`` list.
 
@@ -1645,10 +1686,10 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             return _wrap_couplings(domain, fem_obj, couplings)
         if not periodic_ties:
             return fem_obj
-        if fem_obj._mode in ("complex", "complex_transient"):
+        if fem_obj._mode == "complex_transient":
             raise NotImplementedError(
-                "jno.fem: periodic ties on complex problems are not supported yet (the real-equivalent "
-                "block would need the reduction applied to both the real and imaginary sub-blocks)."
+                "jno.fem: periodic ties on a complex *transient* problem are not supported yet "
+                "(the reduction must be applied to both the real and imaginary time blocks)."
             )
         if isinstance(fem_obj._op, FemLinearSystem):
             # The reduction is applied on the non-parametric (A, b) branch of FEM.solve; the
@@ -1674,9 +1715,10 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             )
         else:
             periodic = _build_periodic_reduction(domain, periodic_ties, fem_obj.points, cells, ele_order, vec or 1)
-        # A transient block is reduced now (P^T M P, ...); the steady/nonlinear ops reduce lazily in FEM.solve.
-        if fem_obj.is_transient:
-            fem_obj._op = _reduce_transient_block_periodic(fem_obj._op, periodic)
+        # One op-level reduction combinator handles every representation: a transient block is reduced
+        # now (P^T M P, ...) and a complex (re, im) tuple is reduced leg-wise with the same P; steady
+        # linear (A, b) and nonlinear residual ops are returned unchanged and reduce lazily in FEM.solve.
+        fem_obj._op = reduce_op_periodic(fem_obj._op, fem_obj._mode, periodic)
         fem_obj._periodic = periodic
         return fem_obj
 
@@ -1940,7 +1982,6 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         not is_vpinn
         and _is_complex_form(domain, ir)
         and not is_transient
-        and not periodic_ties
         and _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
         and not any(_crp(b) for b in weak_bares)
     ):
