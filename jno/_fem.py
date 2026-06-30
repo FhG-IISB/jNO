@@ -576,7 +576,11 @@ def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None, periodic
 
         [[A_r, -A_i], [A_i, A_r]] [u_r; u_i] = [b_r; b_i],     u = u_r + i u_i.
 
-    ``ops = (op_r, op_i)`` are the Re-coeff and Im-coeff real systems (each a raw ``(A, b)``).
+    ``ops = (op_r, op_i)`` are the Re-coeff and Im-coeff real systems. Each is a raw ``(A, b)`` (forward
+    solve) or a parametric :class:`FemLinearSystem` (the complex *inverse*): when either leg is
+    parametric this returns a differentiable :class:`FunctionCall` trace node instead of an array, so a
+    real ``jno.np.parameter`` recovered through a complex forward solve trains through ``crux`` -- the
+    same real-equivalent block, with ``A(θ), b(θ)`` re-formed and the block re-solved on each call.
 
     A periodic tie reduces *both* legs by the **same** prolongation ``P`` -- Re and Im live on one FE
     space, so one ``P`` -- before the block is formed: ``A -> P^T A P``, ``b -> P^T b`` on each leg.
@@ -584,17 +588,11 @@ def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None, periodic
     the real-equivalent structure exactly; the reduced complex solution is prolonged back ``u = P u_red``.
     The reduction runs while the operator is still BCOO (sparse triplet-remap), then the *smaller*
     reduced block is densified for ``jnp.block``."""
-    from .trace import FemLinearSystem
+    from .trace import FemLinearSystem, FunctionCall
     from .utils.solver.fem_utils import prolong_periodic, reduce_matrix_periodic, reduce_vector_periodic
 
-    def _ab(op):
-        if isinstance(op, FemLinearSystem):
-            raise NotImplementedError(
-                "Complex FEM with a runtime jno.np.parameter (the complex *inverse*) is a follow-on; "
-                "this path is the forward complex solve. (A real parameter recovered through a complex "
-                "forward works under the same real-equivalent block, but is not wired here yet.)"
-            )
-        A, b = op
+    def _leg(op, args):  # -> reduced, densified (A, b) for one Re/Im system
+        A, b = op.evaluate(args) if isinstance(op, FemLinearSystem) else op
         b = jnp.asarray(b).reshape(-1)
         if periodic is not None:
             A = reduce_matrix_periodic(periodic, A)  # P^T A P  (stays sparse if A is BCOO)
@@ -602,17 +600,31 @@ def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None, periodic
         A = jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)
         return A, jnp.asarray(b).reshape(-1)
 
-    (A_r, b_r), (A_i, b_i) = _ab(ops[0]), _ab(ops[1])
-    n = A_r.shape[0]
-    block = jnp.block([[A_r, -A_i], [A_i, A_r]])
-    rhs = jnp.concatenate([b_r, b_i])
-    solve_fn = solve_fn or (lambda A, b: jnp.linalg.solve(A, b))
-    sol = jnp.asarray(solve_fn(block, rhs))
-    if periodic is None:
-        return sol[:n] + 1j * sol[n:]
-    # Prolong the real and imaginary reduced halves *separately* (real P @ real vector); prolonging the
-    # complex vector directly would cast it to P's real dtype and silently drop the imaginary part.
-    return prolong_periodic(periodic, sol[:n]) + 1j * prolong_periodic(periodic, sol[n:])
+    _sf = solve_fn or (lambda A, b: jnp.linalg.solve(A, b))
+
+    def _block_solve(args):
+        (A_r, b_r), (A_i, b_i) = _leg(ops[0], args), _leg(ops[1], args)
+        n = A_r.shape[0]
+        block = jnp.block([[A_r, -A_i], [A_i, A_r]])
+        sol = jnp.asarray(_sf(block, jnp.concatenate([b_r, b_i])))
+        if periodic is None:
+            return sol[:n] + 1j * sol[n:]
+        # Prolong the real and imaginary reduced halves *separately* (real P @ real vector); prolonging
+        # the complex vector directly would cast it to P's real dtype and silently drop the imaginary part.
+        return prolong_periodic(periodic, sol[:n]) + 1j * prolong_periodic(periodic, sol[n:])
+
+    # Forward (non-parametric): solve eagerly. Inverse: one or both legs are a parametric FemLinearSystem
+    # -> return a trace node over the union of their runtime parameters so ∂u/∂θ flows through crux.
+    rpe: dict = {}
+    for op in ops:
+        if isinstance(op, FemLinearSystem):
+            rpe.update(op.runtime_parameter_exprs)
+    if not rpe:
+        return _block_solve(None)
+    names = list(rpe)
+    return FunctionCall(
+        lambda *vals: _block_solve(dict(zip(names, vals))), [rpe[n] for n in names], name="fem_complex_solve"
+    )
 
 
 def _solve_complex_transient(blocks: Any, save_ts: Any = None) -> Any:
@@ -1987,8 +1999,9 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         and _is_complex_form(domain, ir)
         and not is_transient
         and _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
-        and not any(_crp(b) for b in weak_bares)
     ):
+        # A runtime parameter is allowed here (the complex *inverse*): assemble_fem_native then returns
+        # parametric FemLinearSystem legs and _solve_complex_block builds a differentiable trace node.
         from .utils.solver.fem_native import assemble_fem_native
 
         real_bd = {tag: [e.real for e in exprs] for tag, exprs in boundary_terms.items()}
