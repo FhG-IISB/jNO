@@ -51,6 +51,17 @@ u_h = jnp.linalg.solve(fem.A, fem.b)
 * **Bound views** — `ui = u.bind(x=xi, y=yi, t=ti)` ties a symbol to a set of coordinates.
   The value is `ui`; spatial derivatives are `ui.x`, `ui.y`, `ui.z`; the time derivative is
   `ui.t`. (This replaces the old `jno.np.grad(u, xg)` / `u.d(xg)` spelling.)
+* **Second derivatives (4th-order weak forms).** `jno.np.laplacian(ui, [xi, yi])` (the Laplacian `Δu`)
+  and `jno.np.hessian(ui, [xi, yi])` (the full `D²u`) assemble against the element's second shape-function
+  derivatives, so a biharmonic / plate / Cahn–Hilliard form is written directly, e.g.
+  `jno.np.laplacian(ui, [xi, yi]) * jno.np.laplacian(vi, [xi, yi])` for `∫Δu·Δv`. Needs **`order ≥ 2`**
+  (a P1 Hessian is identically zero). Scalar Lagrange fields only; the physical Hessian is the exact
+  affine map `∂²φ/∂x_a∂x_b = K_ia K_jb ∂²φ/∂ξ_i∂ξ_j` (`K = J⁻¹`, no curvature term on the P1 geometry).
+  > **Conformity caveat.** Standard Lagrange is **C⁰**, so `∫Δu·Δv` over P2 is *non-conforming* and does
+  > **not** give a convergent biharmonic discretisation. For a convergent solve use the mixed
+  > (Ciarlet–Raviart) method — two coupled C⁰ fields with `w = Δu`, first derivatives only (see
+  > `tests/test_fem_hessian.py`) — or a forthcoming C¹ element (Argyris/Bell). The shape-Hessian
+  > assembly here is the prerequisite those build on.
 
 ---
 

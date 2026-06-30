@@ -57,6 +57,7 @@ from .fem_facets import _LOCAL_FACES_TET, build_facet_connectivity, compute_face
 from .fem_lagrange import (
     _lagrange_basix,
     identity_pushforward,
+    identity_pushforward_hess,
     lagrange_interp_points,
     lagrange_tet,
     lagrange_triangle,
@@ -454,6 +455,8 @@ def assemble_fem_native(
 
     ref_vals_all = [jnp.asarray(s.ref_values) for s in specs]  # list of (n_quad, n_dof_i, 1)
     ref_grads_all = [jnp.asarray(s.ref_grads) for s in specs]  # list of (n_quad, n_dof_i, 1, dim)
+    # reference Hessians (for 4th-order / biharmonic weak forms); None if a spec doesn't tabulate them
+    ref_hess_all = [None if s.ref_hess is None else jnp.asarray(s.ref_hess) for s in specs]
     cells_f_j = [jnp.asarray(cf, dtype=jnp.int32) for cf in cells_f_all]  # list of (n_cells, n_local_i)
 
     # Per-field cell DOF index arrays: (n_cells, n_local_i * vec_i)
@@ -554,7 +557,10 @@ def assemble_fem_native(
         per = []
         for i in range(len(fields)):
             phi, dphi = identity_pushforward(ref_vals_all[i], ref_grads_all[i], J, detJ)
-            per.append({"shape_vals": phi, "shape_grads": dphi, "cell_sol": cell_sols[i], "space": "Lagrange"})
+            fd = {"shape_vals": phi, "shape_grads": dphi, "cell_sol": cell_sols[i], "space": "Lagrange"}
+            if ref_hess_all[i] is not None:  # physical shape Hessian for 4th-order weak forms
+                fd["shape_hess"] = identity_pushforward_hess(ref_hess_all[i], J)
+            per.append(fd)
 
         return per, xq, meas
 

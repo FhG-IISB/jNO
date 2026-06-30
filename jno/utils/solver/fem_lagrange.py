@@ -53,6 +53,27 @@ def _lagrange_basix(cell_type, degree: int):
     return basix.create_element(ElementFamily.P, cell_type, degree, variant)
 
 
+def _ref_hessian_from_tab(tab: np.ndarray, dim: int) -> np.ndarray:
+    """Symmetric reference Hessian ``(n_quad, n_dof, 1, dim, dim)`` from a basix ``tabulate(2, qp)`` array.
+
+    The second-derivative blocks are addressed by their derivative multi-index via ``basix.index`` (NOT a
+    hardcoded position): entry ``(i, j)`` is the block whose multi-index has a +1 in axes ``i`` and ``j``
+    (e.g. 2D ``(0,0) -> index(2,0)=∂ξ₀²``, ``(0,1) -> index(1,1)=∂ξ₀∂ξ₁``)."""
+    import basix
+
+    nq, nd = int(tab.shape[1]), int(tab.shape[2])
+    H = np.zeros((nq, nd, 1, dim, dim))
+    for i in range(dim):
+        for j in range(i, dim):
+            mi = [0] * dim
+            mi[i] += 1
+            mi[j] += 1
+            blk = np.asarray(tab[basix.index(*mi)])[..., 0]  # (n_quad, n_dof)
+            H[:, :, 0, i, j] = blk
+            H[:, :, 0, j, i] = blk
+    return H
+
+
 def lagrange_interp_points(dim: int, degree: int) -> np.ndarray:
     """Reference interpolation points of the degree-``k`` Lagrange simplex, in basix DOF order
     (vertices, then per-edge, per-face, interior nodes). :func:`fem_utils._promote_to_degree` maps these
@@ -86,7 +107,7 @@ def lagrange_triangle(degree: int, quad_degree: Optional[int] = None) -> Element
     qd = quad_degree if quad_degree is not None else 2 * degree + 1
     elem = _lagrange_basix(CellType.triangle, degree)
     qp, qw = basix.make_quadrature(CellType.triangle, qd)
-    tab = elem.tabulate(1, qp)  # (1 + tdim, n_quad, n_dof, 1)
+    tab = elem.tabulate(2, qp)  # (n_blocks, n_quad, n_dof, 1) -- values, 1st and 2nd reference derivatives
     ref_values = np.asarray(tab[0])  # (n_quad, n_dof, 1)
     # Stack ∂φ/∂ξ₀ (tab[1]) and ∂φ/∂ξ₁ (tab[2]) into the last axis
     ref_grads = np.stack([np.asarray(tab[1]), np.asarray(tab[2])], axis=-1)  # (n_quad, n_dof, 1, 2)
@@ -100,6 +121,7 @@ def lagrange_triangle(degree: int, quad_degree: Optional[int] = None) -> Element
         ref_div=None,
         ref_grads=ref_grads,
         local_edges=BASIX_TRIANGLE_EDGES,
+        ref_hess=_ref_hessian_from_tab(tab, 2),  # (n_quad, n_dof, 1, 2, 2) for 4th-order weak forms
     )
 
 
@@ -123,7 +145,7 @@ def lagrange_tet(degree: int, quad_degree: Optional[int] = None) -> ElementSpec:
     qd = quad_degree if quad_degree is not None else 2 * degree + 1
     elem = _lagrange_basix(CellType.tetrahedron, degree)
     qp, qw = basix.make_quadrature(CellType.tetrahedron, qd)
-    tab = elem.tabulate(1, qp)  # (1 + tdim, n_quad, n_dof, 1)
+    tab = elem.tabulate(2, qp)  # (n_blocks, n_quad, n_dof, 1) -- values, 1st and 2nd reference derivatives
     ref_values = np.asarray(tab[0])  # (n_quad, n_dof, 1)
     ref_grads = np.stack([np.asarray(tab[i]) for i in range(1, 4)], axis=-1)  # (n_quad, n_dof, 1, 3)
     return ElementSpec(
@@ -136,6 +158,7 @@ def lagrange_tet(degree: int, quad_degree: Optional[int] = None) -> ElementSpec:
         ref_div=None,
         ref_grads=ref_grads,
         local_edges=BASIX_TET_EDGES,
+        ref_hess=_ref_hessian_from_tab(tab, 3),  # (n_quad, n_dof, 1, 3, 3) for 4th-order weak forms
     )
 
 
@@ -169,3 +192,25 @@ def identity_pushforward(
     dphi_ref = ref_grads[..., 0, :]  # (n_quad, n_dof, tdim)
     dphi_phys = jnp.einsum("qnd,dD->qnD", dphi_ref, K)  # (n_quad, n_dof, tdim)
     return phi, dphi_phys
+
+
+def identity_pushforward_hess(ref_hess: jnp.ndarray, J: jnp.ndarray) -> jnp.ndarray:
+    """Physical Hessian of a scalar Lagrange basis on an **affine** simplex.
+
+    The geometry is always P1 (straight-sided), so the reference→physical map ``ξ ↦ x`` is affine with a
+    **constant** Jacobian ``J``; thus ``∂²ξ/∂x² ≡ 0`` and the second derivatives transform by the clean
+    chain rule with no curvature term::
+
+        ``∂²φ/∂x_a∂x_b = K_ia K_jb ∂²φ/∂ξ_i∂ξ_j``,   ``K = J⁻¹``.
+
+    Parameters
+    ----------
+    ref_hess : ``(n_quad, n_dof, 1, tdim, tdim)``  reference second derivatives ``∂²φ/∂ξ∂ξ`` (value_size=1).
+    J        : ``(tdim, tdim)``  affine cell Jacobian.
+
+    Returns
+    -------
+    hess_phys : ``(n_quad, n_dof, tdim, tdim)``  physical Hessian ``∂²φ/∂x∂x`` (symmetric).
+    """
+    K = jnp.linalg.inv(J)  # J⁻¹
+    return jnp.einsum("qnij,ia,jb->qnab", ref_hess[..., 0, :, :], K, K)

@@ -50,6 +50,10 @@ class ElementSpec(NamedTuple):
                     lowest-order edge elements), matching :mod:`fem_topology`.
     ``ref_curl``    reference (2-D scalar) curl ``(n_quad, n_dof)`` for H(curl) families
                     (``None`` otherwise).
+    ``ref_hess``    reference second derivatives ``d²(Phi_ref) / d(xi)_i d(xi)_j``,
+                    ``(n_quad, n_dof, value_size, tdim, tdim)`` (symmetric) — used to assemble
+                    4th-order (biharmonic) weak forms via :func:`identity_pushforward_hess`;
+                    ``None`` for families that don't tabulate it.
     """
 
     family: str
@@ -62,6 +66,7 @@ class ElementSpec(NamedTuple):
     ref_grads: Optional[np.ndarray]  # (n_quad, n_dof, value_size, tdim), reference d Phi_k / d xi_m
     local_edges: Tuple[Tuple[int, int], ...]
     ref_curl: Optional[np.ndarray] = None  # (n_quad, n_dof) for H(curl), else None
+    ref_hess: Optional[np.ndarray] = None  # (n_quad, n_dof, value_size, tdim, tdim), reference d²Phi/dxi dxi
 
 
 def raviart_thomas_triangle(degree: int = 1, quad_degree: int = 2) -> ElementSpec:

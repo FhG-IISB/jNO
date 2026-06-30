@@ -781,6 +781,16 @@ def _field_data(local, node):
     return fd["shape_vals"], fd["shape_grads"], fd["cell_sol"]
 
 
+def _field_hess(local, node):
+    """Physical shape-function Hessian ``(n_quad, n_dof, dim, dim)`` for ``node``'s field, or ``None`` if
+    its element does not tabulate second derivatives (only nodal Lagrange does). Mirrors :func:`_field_data`."""
+    fields = local.get("fields")
+    if fields is None:
+        return local.get("shape_hess")
+    key = getattr(node, "field_key", getattr(node, "op_id", None))
+    return fields[local["field_index"][key]].get("shape_hess")
+
+
 def _field_space(local, node):
     """Element family of ``node``'s field (``"Lagrange"`` default).
 
@@ -863,6 +873,7 @@ def _eval_integrand(domain, node, local):
             TestFunction,
             TrialFunction,
             Jacobian,
+            Hessian,
             BinaryOp,
             FunctionCall,
             ModelCall,
@@ -1041,6 +1052,47 @@ def _eval_integrand(domain, node, local):
                 return jnp.einsum("qn...,n->q...", g, cell_sol)  # contract the trial DOFs
 
         raise NotImplementedError("The FEM assembler supports gradients of TrialFunction/TestFunction only.")
+
+    if isinstance(node, Hessian):
+        dims = []
+        for var in node.variables:
+            if not isinstance(var, Variable):
+                raise NotImplementedError(
+                    "The FEM assembler expects Hessian variables to be domain.variable(...) placeholders."
+                )
+            if getattr(var, "axis", None) == "temporal":
+                raise NotImplementedError(
+                    "A temporal second derivative (u_tt) is handled by the second-order-in-time route, "
+                    "not shape-Hessian assembly."
+                )
+            dims.append(var.dim[0])
+        if len(dims) == 0:
+            raise ValueError("Hessian node has no differentiation variables")
+        if not isinstance(node.target, (TestFunction, TrialFunction)):
+            raise NotImplementedError("The FEM assembler supports Hessians of TrialFunction/TestFunction only.")
+        if _field_space(local, node.target) != "Lagrange":
+            raise NotImplementedError("Second derivatives are assembled for nodal Lagrange fields only.")
+        if _value_shape_num_components(getattr(node.target, "value_shape", ())) != 1:
+            raise NotImplementedError("Hessian/Laplacian assembly currently supports scalar fields only.")
+        hess = _field_hess(local, node.target)  # (n_quad, n_dof, dim, dim) physical shape Hessian
+        if hess is None:
+            raise NotImplementedError(
+                "This element does not tabulate second derivatives -- use an order>=2 Lagrange field "
+                "(a P1 Hessian is identically zero)."
+            )
+        da = jnp.asarray(dims)
+        hsub = jnp.take(jnp.take(hess, da, axis=2), da, axis=3)  # (n_quad, n_dof, L, L) over requested dirs
+        is_test = isinstance(node.target, TestFunction)
+        if node.trace:  # Laplacian = sum over the selected diagonal directions
+            lap = jnp.einsum("qnii->qn", hsub)  # (n_quad, n_dof) per-DOF Laplacian
+            if is_test:
+                return lap
+            _, _, cell_sol = _field_data(local, node.target)
+            return jnp.sum(lap[:, :, None] * cell_sol[None, :, :], axis=1)  # (n_quad, 1) trial Laplacian
+        if is_test:
+            return hsub  # (n_quad, n_dof, L, L) per-DOF Hessian (e.g. inner(hessian(u), hessian(v)))
+        _, _, cell_sol = _field_data(local, node.target)
+        return jnp.einsum("qnij,n->qij", hsub, cell_sol[:, 0])  # (n_quad, L, L) trial Hessian
 
     if isinstance(node, BinaryOp):
         a = _eval_integrand(domain, node.left, local)
