@@ -279,18 +279,29 @@ def _native_lagrange_ok(domain: Any, constraints: List[Any], weak_bares: List[An
 
 
 def _element_for(dimension: int, order: int) -> str:
-    """Simplex element type for a ``(dimension, order)`` pair (2D/3D; orders 1, 2)."""
-    et = _ELEMENT_FOR.get((int(dimension), int(order)))
-    if et is None:
-        raise ValueError(
-            f"jno.fem: no built-in element for dimension {dimension}, order {order} "
-            "(supported: 2D/3D at order 1 or 2; pass element_type=... to override)."
-        )
-    return et
+    """Simplex element-type label for a ``(dimension, order)`` pair (2D/3D simplex, any order >= 1).
+
+    Legacy names ``TRI3``/``TRI6``/``TET4``/``TET10`` for orders 1-2; a generic ``TRI-P{k}`` / ``TET-P{k}``
+    for higher order. The native Lagrange assembler keys off the integer ``order`` (the basis and the
+    promoted P{k} node mesh both come from the same basix element), not this string -- the label is only
+    consumed by the VPINN context builder."""
+    key = (int(dimension), int(order))
+    if key in _ELEMENT_FOR:
+        return _ELEMENT_FOR[key]
+    if int(dimension) in (2, 3) and int(order) >= 1:
+        return f"{'TRI' if int(dimension) == 2 else 'TET'}-P{int(order)}"
+    raise ValueError(
+        f"jno.fem: no built-in element for dimension {dimension}, order {order} "
+        "(supported: 2D/3D simplex at order >= 1; pass element_type=... to override)."
+    )
 
 
 def _order_of_element(element_type: str) -> int:
-    return 2 if element_type in _P2_ELEMENTS else 1
+    if element_type in _P2_ELEMENTS:
+        return 2
+    if "-P" in element_type:
+        return int(element_type.split("-P")[1])
+    return 1
 
 
 def _field_keys(constraints: List[Any]) -> List[Any]:
@@ -1083,35 +1094,77 @@ def _periodic_tie_spec(constraint: Any, domain: Any) -> Optional[Tuple[str, str,
     return (master_tag, slave_tag, None, _field_key_of(constraint))
 
 
-def _boundary_facets(points: Any, cells: Any, dim: int, order: int) -> Optional[np.ndarray]:
-    """Boundary facets of the **assembly** mesh as global node-id rows, with higher-order nodes.
+def _ref_interior_facet_dofs(ref_pts: np.ndarray, fv: np.ndarray, dim: int, tol: float = 1e-9) -> List[int]:
+    """Local DOF ids on the facet spanned by reference vertices ``fv`` (beyond the facet's own vertices),
+    **ordered** to match the periodic interpolation convention: the interior nodes of each facet edge in
+    cyclic order (each edge's nodes sorted by position), then the face-interior nodes (3D). For P1/P2 this
+    reproduces the legacy facet layout exactly -- 2D ``[.. , mid_ab]``, 3D ``[.. , mid_ab, mid_bc, mid_ca]``
+    -- which ``_periodic_facet_weights`` relies on; higher orders extend it (per-edge nodes by position)."""
+    ncorner = dim + 1  # element vertex DOFs are 0..dim (basix lists vertices first)
+    cand = list(range(ncorner, len(ref_pts)))
+    edges = [(fv[0], fv[1])] if dim == 2 else [(fv[0], fv[1]), (fv[1], fv[2]), (fv[2], fv[0])]
+    ordered: List[int] = []
+    used: set = set()
+    for a, b in edges:
+        ab = b - a
+        l2 = float(np.dot(ab, ab))
+        on_edge = []
+        for d in cand:
+            ap = ref_pts[d] - a
+            t = float(np.dot(ap, ab) / l2)
+            perp = ap - t * ab
+            if float(np.dot(perp, perp)) < tol * tol * l2 and tol < t < 1.0 - tol:
+                on_edge.append((t, d))
+        for _t, d in sorted(on_edge):
+            ordered.append(d)
+            used.add(d)
+    if dim == 3:  # face-interior nodes: on the facet plane, strictly inside the triangle, not on an edge
+        a, b, c = fv
+        M = np.stack([b - a, c - a], axis=1)  # (3, 2)
+        for d in cand:
+            if d in used:
+                continue
+            st, *_ = np.linalg.lstsq(M, ref_pts[d] - a, rcond=None)
+            s, t = float(st[0]), float(st[1])
+            if float(np.linalg.norm((a + M @ st) - ref_pts[d])) < tol and min(s, t, 1.0 - s - t) >= -tol:
+                ordered.append(d)
+    return ordered
 
-    Vertex sub-connectivity is the first ``dim+1`` columns of ``cells`` (meshio orders vertices
-    first); a facet is a cell edge (2D) / triangular face (3D) of those vertices that appears in
-    exactly **one** cell. For ``order == 2`` each facet's edge midpoints are attached by coordinate
-    (a P2 midpoint sits at the average of its two endpoint vertices) -- convention-light, with no
-    dependence on any higher-order node ordering. Returns ``(n_facets, k)`` with
-    ``k = 2/3`` (2D P1/P2) or ``3/6`` (3D P1/P2)."""
+
+def _boundary_facets(points: Any, cells: Any, dim: int, order: int) -> Optional[np.ndarray]:
+    """Boundary facets of the **assembly** mesh as global node-id rows, including higher-order nodes.
+
+    A facet is a cell edge (2D) / triangular face (3D) of the vertex sub-connectivity (the first
+    ``dim+1`` columns -- basix orders vertices first) that appears in exactly **one** cell. For
+    ``order >= 2`` each facet row also carries the P{order} nodes lying on that facet (edge-interior in
+    2D; edge + face-interior in 3D), found from the reference element -- the local DOFs whose reference
+    interpolation point lies on the corresponding reference facet. Vertices come first in each row (the
+    leading ``dim+1`` columns stay the facet vertices); the remaining columns are the higher-order facet
+    nodes in arbitrary order (consumers use the node set or match by coordinate). Returns
+    ``(n_facets, n_facet_dof)``, or ``None`` for an empty mesh."""
     points = np.asarray(points, dtype=float)
     cells = np.asarray(cells, dtype=int)
     if cells.ndim != 2 or cells.shape[0] == 0:
         return None
+    n_cells = cells.shape[0]
     verts = cells[:, : dim + 1]
     combos = [(0, 1), (1, 2), (2, 0)] if dim == 2 else [(0, 1, 2), (0, 1, 3), (0, 2, 3), (1, 2, 3)]
-    allf = np.concatenate([verts[:, list(c)] for c in combos], axis=0)
+    allf = np.concatenate([verts[:, list(c)] for c in combos], axis=0)  # combo-major: row = combo*n_cells + cell
     _uniq, idx, counts = np.unique(np.sort(allf, axis=1), axis=0, return_index=True, return_counts=True)
-    bverts = allf[idx[counts == 1]]  # boundary facets in original vertex orientation
+    bidx = idx[counts == 1]  # allf row index of each boundary facet (a facet used by exactly one cell)
     if order < 2:
-        return bverts
-    span = float(np.linalg.norm(points.max(0) - points.min(0))) or 1.0
-    scale = span * 1.0e-7
-    keymap = {tuple(np.round(p / scale).astype(np.int64)): i for i, p in enumerate(points)}
+        return allf[bidx]
+    from .utils.solver.fem_lagrange import lagrange_interp_points
 
-    def _mid(a: int, b: int) -> int:
-        return keymap[tuple(np.round(((points[a] + points[b]) / 2.0) / scale).astype(np.int64))]
-
-    edges_of = (lambda f: [(f[0], f[1])]) if dim == 2 else (lambda f: [(f[0], f[1]), (f[1], f[2]), (f[2], f[0])])
-    return np.asarray([list(f) + [_mid(a, b) for a, b in edges_of(f)] for f in bverts], dtype=int)
+    ref_pts = np.asarray(lagrange_interp_points(dim, order))
+    ref_verts = (
+        np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+        if dim == 2
+        else np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]])
+    )
+    facet_dofs = [list(c) + _ref_interior_facet_dofs(ref_pts, ref_verts[list(c)], dim) for c in combos]
+    rows = [cells[int(r) % n_cells, facet_dofs[int(r) // n_cells]] for r in bidx]
+    return np.asarray(rows, dtype=int)
 
 
 def _face_nodes(domain: Any, points: Any, bnodes: Optional[np.ndarray], tag: str) -> Optional[np.ndarray]:
@@ -1857,7 +1910,7 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     # P2->TRI6/TET10); a higher-order field bumps the quadrature for exactness. ----
     if element_type is None:
         element_type = _element_for(domain.dimension, order)
-    quad_degree = max(quad_degree, 2 * _order_of_element(element_type))
+    quad_degree = max(quad_degree, 2 * order)  # factory uses 2*degree+1; bump to the field's order
 
     # ---- build IR with explicit regions, then detect transient vs steady. This is done so the
     # native path can route from the IR alone: split each weak constraint into additive sub-terms
@@ -2410,7 +2463,7 @@ def _assemble_second_order_time(
         )
 
     # ---- quadrature setup (the native assembler owns the FE state; no problem object) ----
-    quad_degree = max(quad_degree, 2 * _order_of_element(_element_for(domain.dimension, order)))
+    quad_degree = max(quad_degree, 2 * order)  # factory uses 2*degree+1; bump to the field's order
 
     # ---- split each volume term by its temporal order: 2 -> mass M2, 1 -> damping C, 0 -> stiffness/load ----
     def _strip(coeff, times):

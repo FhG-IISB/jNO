@@ -41,9 +41,9 @@ u_h = jnp.linalg.solve(fem.A, fem.b)
 * **Domain** — any jNO domain works (`box`, `jno.domain.cube`, a CSG/`gmsh` constructor).
   Add `time=(t0, t1, n_steps)` to make it transient.
 * **Symbols** — `u, phi = d.fem_symbols(value_shape=(), names=("u", "phi"), order=1)`.
-  Use `value_shape=(2,)` for a vector unknown (elasticity, flow velocity), `order=2` for P2
-  (quadratic) elements, `space="RT"`/`"N1E"`/`"P0"` for the non-nodal families (see below), and
-  call `fem_symbols` once per field for coupled systems.
+  Use `value_shape=(2,)` for a vector unknown (elasticity, flow velocity), `order=k` for degree-`k`
+  Lagrange (`order=2` quadratic P2, `order=3` cubic P3, … — any `k ≥ 1`), `space="RT"`/`"N1E"`/`"P0"`
+  for the non-nodal families (see below), and call `fem_symbols` once per field for coupled systems.
 * **Quadrature coordinates** — `d.variable("interior", split=True)` returns the volume
   coordinates; `d.variable("<edge>", split=True)` returns a boundary edge's coordinates. A
   `box` auto-tags `"left"`, `"right"`, `"bottom"`, `"top"` (and `"front"`/`"back"` for a cube);
@@ -489,7 +489,11 @@ Dirichlet problems.
   coordinates needed; pass `p.pin(value)` to set the gauge).
 * **1D and 3D** — a 1D interval or a 3D `cube`/extruded `gmsh` volume use the identical API with
   one fewer / one more coordinate (`ui.z`, `u(xb, yb, zb) - g`, `element_type="TET4"`).
-* **P2 elements** — `order=2` gives quadratic elements; read the solution at `fem.points`.
+* **Higher-order Lagrange** — `order=k` gives degree-`k` elements (P2 quadratic, P3 cubic, P4, … on
+  triangles and tets); the assembly mesh places the element's basix interpolation points on each cell
+  (deduplicated by coordinate, so shared edges/faces stay conforming). Read the solution at `fem.points`.
+  The geometry stays affine-P1 (straight-sided), so on a *curved* boundary the geometric error caps the
+  observed order regardless of `k` — measure high-order convergence on straight-sided/polygonal domains.
 
 ---
 

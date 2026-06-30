@@ -1,16 +1,17 @@
 """Lagrange element factories for the native 2D/3D assembler.
 
 Wraps basix tabulation into :class:`~fem_elements.ElementSpec` for scalar Lagrange
-families (P1, P2) on triangles and tetrahedra, and exposes :func:`identity_pushforward`
-— the isoparametric chain-rule map from reference to physical gradients:
+families (P1, P2, P3, … — any degree) on triangles and tetrahedra, and exposes
+:func:`identity_pushforward` — the isoparametric chain-rule map from reference to physical
+gradients:
 
     ``∂φ/∂x = ∂φ/∂ξ J⁻¹``
 
 This is the Lagrange analogue of the contravariant and covariant Piola maps in
-:mod:`fem_elements`.  The DOF ordering produced by :func:`lagrange_triangle` (degree 2)
-matches the edge-midpoint layout of :func:`fem_utils._promote_to_quadratic` with
-``edge_local = BASIX_TRIANGLE_EDGES``, so a promoted P2 mesh indexes correctly into the
-shape functions.
+:mod:`fem_elements`. The basis is tabulated and the assembly-mesh nodes are placed via the
+**same** basix element (:func:`_lagrange_basix`), so the DOF order of the promoted P{k} mesh
+(:func:`fem_utils._promote_to_degree`, which puts :func:`lagrange_interp_points` on each cell)
+always matches the tabulated shape functions.
 
 References
 ----------
@@ -36,6 +37,33 @@ from .fem_topology import BASIX_TRIANGLE_EDGES
 BASIX_TET_EDGES: Tuple[Tuple[int, int], ...] = ((2, 3), (1, 3), (1, 2), (0, 3), (0, 2), (0, 1))
 
 
+def _lagrange_basix(cell_type, degree: int):
+    """basix Lagrange element of ``degree`` on ``cell_type``.
+
+    Degree > 2 *requires* an explicit Lagrange variant (basix raises ``Lagrange elements of degree > 2
+    need to be given a variant`` otherwise); we use **equispaced** nodes so the interpolation points are
+    the natural ``1/k``-spaced lattice that :func:`fem_utils._promote_to_degree` places on the global
+    mesh. Degree <= 2 keeps the default (``unset``), so P1/P2 are byte-identical to before. The mesh
+    node generator and the basis tabulation BOTH go through this one builder, so their DOF order and
+    node positions always agree."""
+    import basix
+    from basix import ElementFamily, LagrangeVariant
+
+    variant = LagrangeVariant.equispaced if degree > 2 else LagrangeVariant.unset
+    return basix.create_element(ElementFamily.P, cell_type, degree, variant)
+
+
+def lagrange_interp_points(dim: int, degree: int) -> np.ndarray:
+    """Reference interpolation points of the degree-``k`` Lagrange simplex, in basix DOF order
+    (vertices, then per-edge, per-face, interior nodes). :func:`fem_utils._promote_to_degree` maps these
+    through each cell's affine geometry to place the global P{k} mesh nodes; the order matches the basis
+    tabulated by :func:`lagrange_triangle` / :func:`lagrange_tet` (same builder)."""
+    from basix import CellType
+
+    cell = CellType.triangle if dim == 2 else CellType.tetrahedron
+    return np.asarray(_lagrange_basix(cell, degree).points)
+
+
 def lagrange_triangle(degree: int, quad_degree: Optional[int] = None) -> ElementSpec:
     """Lagrange P{degree} element on a reference triangle, tabulated via basix.
 
@@ -51,12 +79,12 @@ def lagrange_triangle(degree: int, quad_degree: Optional[int] = None) -> Element
     Map to physical element data with :func:`identity_pushforward`.
     """
     import basix
-    from basix import CellType, ElementFamily
+    from basix import CellType
 
-    if degree not in (1, 2):
-        raise NotImplementedError(f"lagrange_triangle: degree must be 1 or 2; got {degree}.")
+    if degree < 1:
+        raise ValueError(f"lagrange_triangle: degree must be >= 1; got {degree}.")
     qd = quad_degree if quad_degree is not None else 2 * degree + 1
-    elem = basix.create_element(ElementFamily.P, CellType.triangle, degree)
+    elem = _lagrange_basix(CellType.triangle, degree)
     qp, qw = basix.make_quadrature(CellType.triangle, qd)
     tab = elem.tabulate(1, qp)  # (1 + tdim, n_quad, n_dof, 1)
     ref_values = np.asarray(tab[0])  # (n_quad, n_dof, 1)
@@ -88,12 +116,12 @@ def lagrange_tet(degree: int, quad_degree: Optional[int] = None) -> ElementSpec:
       ``(∂φ/∂ξ₀, ∂φ/∂ξ₁, ∂φ/∂ξ₂)``.
     """
     import basix
-    from basix import CellType, ElementFamily
+    from basix import CellType
 
-    if degree not in (1, 2):
-        raise NotImplementedError(f"lagrange_tet: degree must be 1 or 2; got {degree}.")
+    if degree < 1:
+        raise ValueError(f"lagrange_tet: degree must be >= 1; got {degree}.")
     qd = quad_degree if quad_degree is not None else 2 * degree + 1
-    elem = basix.create_element(ElementFamily.P, CellType.tetrahedron, degree)
+    elem = _lagrange_basix(CellType.tetrahedron, degree)
     qp, qw = basix.make_quadrature(CellType.tetrahedron, qd)
     tab = elem.tabulate(1, qp)  # (1 + tdim, n_quad, n_dof, 1)
     ref_values = np.asarray(tab[0])  # (n_quad, n_dof, 1)

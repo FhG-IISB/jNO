@@ -1580,6 +1580,57 @@ def _promote_to_quadratic(points, cells_p1, edge_local):
     return pts, cells_p2
 
 
+def _promote_to_degree(points, cells_p1, ref_pts):
+    """Promote a linear simplex mesh to a degree-``k`` Lagrange node mesh (P1 -> P{k}, any ``k``).
+
+    ``ref_pts`` are the element's reference interpolation points in **basix DOF order** (shape
+    ``(n_dof, tdim)``; the first ``ncorner`` are the cell vertices). Each cell's nodes are the affine
+    image of ``ref_pts`` through that cell's P1 geometry (a barycentric combination of its vertices);
+    nodes are deduplicated by **physical coordinate** (a scale-aware grid hash). So an edge/face shared
+    by two cells collapses to one global node *regardless of the cells' local orientation* -- for C0
+    Lagrange a DOF is a point value, so coordinate coincidence on a shared entity is exactly the
+    conformity condition (no orientation sign or per-edge node ordering, unlike RT/Nedelec; this is what
+    lets a single midpoint suffice at P2 and a clean generalisation hold at P3+). Original vertices keep
+    ids ``0..nv-1`` (so a P1 field on a P{k} problem is the leading vertex block, e.g. Taylor-Hood
+    pressure). Returns ``(points_k, cells_k)`` with ``cells_k`` columns in the same DOF order as
+    ``ref_pts`` -- hence as the basis tabulated from the same basix element."""
+    points = np.asarray(points, dtype=float)
+    cells_p1 = np.asarray(cells_p1)
+    ref_pts = np.asarray(ref_pts, dtype=float)
+    ncell, ncorner = cells_p1.shape
+    ndof = ref_pts.shape[0]
+    # barycentric weights of each reference point: l0 = 1 - sum(xi), l_i = xi_i
+    bary = np.empty((ndof, ncorner), dtype=float)
+    bary[:, 0] = 1.0 - ref_pts.sum(axis=1)
+    bary[:, 1:] = ref_pts
+    phys = np.einsum("dc,ncg->ndg", bary, points[cells_p1])  # (ncell, ndof, gdim) physical node coords
+    # scale-aware coordinate hash: coincident nodes differ only by FP roundoff (<< tol); distinct nodes
+    # are separated by ~mesh spacing (>> tol).
+    extent = float(np.max(points.max(axis=0) - points.min(axis=0))) if points.shape[0] else 1.0
+    tol = 1e-7 * (extent or 1.0)
+
+    def _key(p):
+        return tuple(np.round(np.asarray(p) / tol).astype(np.int64))
+
+    coord_to_gid: dict = {}
+    out_pts: List[Any] = []
+    for vid in range(points.shape[0]):  # seed with the original vertices so they keep ids 0..nv-1
+        coord_to_gid[_key(points[vid])] = vid
+        out_pts.append(points[vid])
+    cells_k = np.zeros((ncell, ndof), dtype=np.int64)
+    nid = points.shape[0]
+    for c in range(ncell):
+        for d in range(ndof):
+            k = _key(phys[c, d])
+            gid = coord_to_gid.get(k)
+            if gid is None:
+                gid, coord_to_gid[k] = nid, nid
+                out_pts.append(phys[c, d])
+                nid += 1
+            cells_k[c, d] = gid
+    return np.asarray(out_pts), cells_k
+
+
 def _zero_mass_dirichlet_rows(M, bc):
     """Zero a mass matrix's Dirichlet **rows** so ``M u̇ + A u = c`` reads ``u[d]=g``.
 

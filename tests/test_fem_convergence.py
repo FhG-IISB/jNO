@@ -221,7 +221,14 @@ def study_poisson_2d():
         return _true_l2(d, order, _solve_linear(fem), g)
 
     rows = []
-    for order, sizes, el in ((1, [0.2, 0.1, 0.05], "P1"), (2, [0.25, 0.125, 0.0625], "P2")):
+    # P1 O(h^2), P2 O(h^3), P3 O(h^4). High order is pre-asymptotic/noisy on affordable unstructured
+    # meshes (the per-interval rate climbs through the band), and the mass-identity norm hits a
+    # quadrature/cancellation floor below ~1e-5, so P3 uses coarser meshes than P2 and a wider band.
+    for order, sizes, el in (
+        (1, [0.2, 0.1, 0.05], "P1"),
+        (2, [0.25, 0.125, 0.0625], "P2"),
+        (3, [0.5, 0.35, 0.25, 0.18], "P3"),
+    ):
         errs = [solve(h, order) for h in sizes]
         rows.append(Row("Poisson", "2D", "linear", "Dirichlet", "scalar", el, "L2", sizes, errs, order + 1, "elliptic"))
     return rows
@@ -768,6 +775,7 @@ def test_poisson_2d():
     assert np.isclose(M.sum(), 1.0, atol=1e-6), "P1 mass matrix does not integrate to the domain area"
     _assert_row(rows[0], 1.7, 2.4)
     _assert_row(rows[1], 2.6, 3.4)
+    _assert_row(rows[2], 3.0, 4.8)  # P3 O(h^4) -- super-P2 order; pre-asymptotic on coarse meshes -> wide band
 
 
 def test_variable_coeff():

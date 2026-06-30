@@ -54,15 +54,20 @@ from .fem_1d import (
     _region_node_ids,
 )
 from .fem_facets import _LOCAL_FACES_TET, build_facet_connectivity, compute_face_normals
-from .fem_lagrange import BASIX_TET_EDGES, identity_pushforward, lagrange_tet, lagrange_triangle
-from .fem_topology import BASIX_TRIANGLE_EDGES
+from .fem_lagrange import (
+    _lagrange_basix,
+    identity_pushforward,
+    lagrange_interp_points,
+    lagrange_tet,
+    lagrange_triangle,
+)
 from .fem_utils import (
     _cell_region_mask,
     _collect_region_mask_names,
     _gather_temporal_tags,
     _infer_fields,
     _lower_statefield_to_trial,
-    _promote_to_quadratic,
+    _promote_to_degree,
     _test_field_index,
     bcoo_set_dirichlet_rows,
     bcoo_zero_rows,
@@ -104,13 +109,11 @@ def _get_mesh(domain, dim: int, order: int):
     cells_p1 = np.asarray(domain.mesh.cells_dict[meshio_key], dtype=np.int64)
     if order == 1:
         return pts_p1, cells_p1, pts_p1, cells_p1
-    if dim == 2:
-        edge_local = BASIX_TRIANGLE_EDGES
-    elif dim == 3:
-        edge_local = BASIX_TET_EDGES
-    else:
+    if dim not in (2, 3):
         raise NotImplementedError(f"Dimension {dim} not supported by native assembler.")
-    pts_f, cells_f = _promote_to_quadratic(pts_p1, cells_p1, edge_local)
+    # P{order} node mesh: place the element's reference interpolation points (basix DOF order) on each
+    # cell and dedup by coordinate. One code path for P2 and P3+ (the P2 midpoints are the k=2 case).
+    pts_f, cells_f = _promote_to_degree(pts_p1, cells_p1, lagrange_interp_points(dim, order))
     return pts_p1, cells_p1, pts_f, cells_f
 
 
@@ -151,7 +154,7 @@ def _build_face_tables(elem_degree: int, quad_degree: int, dim: int = 2):
       on [0, 1] summing to 1 in 2D; triangle weights summing to 1/2 in 3D).
     """
     import basix
-    from basix import CellType, ElementFamily
+    from basix import CellType
 
     if dim == 2:
         cell, ref_verts, local_faces = CellType.triangle, _REF_TRI_VERTS, _LOCAL_FACES_TRI
@@ -171,7 +174,7 @@ def _build_face_tables(elem_degree: int, quad_degree: int, dim: int = 2):
             ref_qp = va[None] * (1 - xi - eta)[:, None] + vb[None] * xi[:, None] + vc[None] * eta[:, None]
             return ref_qp, np.stack([vb - va, vc - va])  # tangs (2, 3)
 
-    elem = basix.create_element(ElementFamily.P, cell, elem_degree)
+    elem = _lagrange_basix(cell, elem_degree)
     phi_list, dphi_list, qp_list, tang_list = [], [], [], []
     for entry in local_faces:
         ref_qp, tangs = _facet_qp_tangs(entry[:dim])  # entry[:dim] = the facet's vertex local ids
@@ -213,7 +216,8 @@ def build_native_fem_context(domain, *, element_type, quad_degree, vec=1, neuman
     bases.
     """
     dim = int(domain.dimension)
-    order = 2 if element_type in ("TRI6", "TET10") else 1
+    # element-type label -> polynomial order: TRI6/TET10 == P2; generic "TRI-P{k}"/"TET-P{k}" carries k.
+    order = 2 if element_type in ("TRI6", "TET10") else (int(element_type.split("-P")[1]) if "-P" in element_type else 1)
     quad_degree = max(quad_degree, 2 * order)
 
     pts_p1, cells_p1, pts_f, cells_f = _get_mesh(domain, dim, order)
