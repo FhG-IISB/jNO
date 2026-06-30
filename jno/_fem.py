@@ -885,6 +885,11 @@ class FEM:
                 return _solve_linear_matrix_free(A, b)
             A = jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)
             return (solve_fn or (lambda A_, b_: jnp.linalg.solve(A_, b_)))(A, b)
+        if self._mode == "linear" and isinstance(self._op, FemLinearSystem):
+            # Runtime-parametric steady linear: solve A(θ)x=b(θ) as a trace node (∂u/∂θ flows through
+            # solve_fn). A periodic tie reduces per-call inside FemLinearSystem.solve, after A(θ) is
+            # re-formed: u = P · solve(PᵀA(θ)P, Pᵀb(θ)); self._periodic is None for the untied case.
+            return self._op.solve(solve_fn, periodic=self._periodic)
         if self._mode == "nonlinear" and self._periodic is not None:
             # Periodic nonlinear: solve Newton in the reduced space -- r_red(u_red) = P^T r(P u_red) = 0,
             # then prolong u = P u_red (the tie is then satisfied exactly). Wraps the user's solve_fn
@@ -1691,10 +1696,6 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
                 "jno.fem: periodic ties on a complex *transient* problem are not supported yet "
                 "(the reduction must be applied to both the real and imaginary time blocks)."
             )
-        if isinstance(fem_obj._op, FemLinearSystem):
-            # The reduction is applied on the non-parametric (A, b) branch of FEM.solve; the
-            # runtime-parametric FemLinearSystem.solve path would silently ignore it.
-            raise NotImplementedError("jno.fem: periodic ties are not yet supported on runtime-parametric linear problems.")
         # Single-field transient was already reduced by the dedicated native branch -> reuse its P.
         if periodic_holder:
             fem_obj._periodic = periodic_holder[0]
@@ -1942,13 +1943,11 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     # below. ----
     from .utils.solver.parametric_helpers import _contains_runtime_parameter as _crp
 
-    # Native periodic is wired only for the steady, scalar, non-parametric single-field case that
-    # ``_finalize`` reduces (it raises on vector / runtime-parametric, and the transient route pre-
-    # builds the reduction into its own time block). Those periodic sub-cases route to the dedicated
-    # periodic-transient branch below.
-    _native_periodic_ok = not periodic_ties or (
-        not is_transient and (vec or 1) == 1 and not any(_crp(b) for b in weak_bares)
-    )
+    # Native periodic is wired for the steady, scalar single-field case that ``_finalize`` reduces --
+    # both non-parametric (reduced eagerly at solve) and runtime-parametric (reduced per-call inside
+    # FemLinearSystem.solve, after A(θ) is re-formed). Vector and the transient route pre-build the
+    # reduction in their own branches, so they fall through here.
+    _native_periodic_ok = not periodic_ties or (not is_transient and (vec or 1) == 1)
     if (
         not is_vpinn
         and _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)

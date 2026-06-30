@@ -2921,7 +2921,7 @@ class FemLinearSystem:
         b = self.b if self.rhs_fn is None else self.rhs_fn(args)
         return A, b
 
-    def solve(self, solve_fn=None):
+    def solve(self, solve_fn=None, *, periodic=None):
         """Differentiable forward solve ``u = solve_fn(A(θ), b(θ))`` as a trace node.
 
         Returns a :class:`FunctionCall` field. When it is evaluated (e.g. inside
@@ -2944,6 +2944,12 @@ class FemLinearSystem:
         (``jax_enable_x64``) and set the parameter dtype to match — the
         assembly is float64. (``spsolve``'s cuSolver-GPU path can be flaky; pass your own
         ``solve_fn`` if you hit it on GPU.)
+
+        ``periodic`` (a periodic-reduction dict) reduces the system *per call*, after ``A(θ), b(θ)`` are
+        re-formed: ``u = P · solve_fn(PᵀA(θ)P, Pᵀb(θ))``. The reduction must run here (not statically on
+        ``self.A``) because ``operator_fn``/``rhs_fn`` re-evaluate the operator on every ``θ`` -- a static
+        reduction would be silently re-overwritten. The reduction stays sparse (BCOO triplet-remap), so
+        ``∂u/∂θ`` still flows through ``solve_fn`` on the reduced operator.
         """
         if solve_fn is None:
             from ..utils.solver.linear import sparse_lu_solve
@@ -2955,9 +2961,17 @@ class FemLinearSystem:
 
         def _solve(*values):
             A, b = self.evaluate(dict(zip(names, values)))
+            b = jnp.asarray(b).reshape(-1)
+            if periodic is not None:
+                from ..utils.solver.fem_utils import prolong_periodic, reduce_matrix_periodic, reduce_vector_periodic
+
+                A = reduce_matrix_periodic(periodic, A)  # PᵀA(θ)P (stays BCOO when A is BCOO)
+                b = reduce_vector_periodic(periodic, b)  # Pᵀb(θ)
+                A = A if hasattr(A, "todense") else jnp.asarray(A)
+                return prolong_periodic(periodic, solve_fn(A, b))
             # keep a BCOO ``A`` sparse for the sparse solver (only coerce a plain dense operator)
             A = A if hasattr(A, "todense") else jnp.asarray(A)
-            return solve_fn(A, jnp.asarray(b).reshape(-1))
+            return solve_fn(A, b)
 
         return FunctionCall(_solve, params, name="fem_solve")
 
