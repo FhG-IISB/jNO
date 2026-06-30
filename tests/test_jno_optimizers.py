@@ -53,6 +53,9 @@ def test_namespace_is_just_the_optimizers():
         "scale_by_soap",
         "engd",
         "ENGDOptimizer",
+        "md",
+        "md_decouple",
+        "MDOptimizer",
     }
     for factory in (o.ssbroyden, o.ssbfgs, o.soap):
         opt = factory()
