@@ -1683,12 +1683,17 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         the time route's existing context-driven reduction. Single-field, vector, and coupled
         multi-field are all reduced block-wise (P_i^T M[i,j] P_j); complex / runtime-parametric remain out."""
         fem_obj._term_source = (domain, volume_terms)
+        if couplings and periodic_ties and fem_obj.is_transient:
+            # The native periodic *transient* block reduces eagerly into a master-DOF space; the coupling
+            # residual is written in the full nodal space, so the two cannot be composed on that path yet.
+            raise NotImplementedError(
+                "jno.fem: periodic ties combined with a *transient* nonlocal Coupling are not yet supported."
+            )
         if couplings:
-            if periodic_ties:
-                raise NotImplementedError(
-                    "jno.fem: periodic ties combined with nonlocal Coupling terms are not yet supported."
-                )
-            return _wrap_couplings(domain, fem_obj, couplings)
+            # Fold the coupling into the residual FIRST -- a steady local form is promoted to a nonlinear
+            # FemResidualOperator. The periodic reduction below then wraps the *coupled* residual through
+            # the nonlinear Pᵀr(P·) solve path, so a periodic tie + Coupling compose with no extra branch.
+            fem_obj = _wrap_couplings(domain, fem_obj, couplings)
         if not periodic_ties:
             return fem_obj
         if fem_obj._mode == "complex_transient":
