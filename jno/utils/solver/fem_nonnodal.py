@@ -127,12 +127,6 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
         _split_additive_terms,
     )
 
-    if dirichlet_raw:
-        raise NotImplementedError(
-            "jno.fem (non-nodal): nodal Dirichlet is not applicable to RT/N1E; the essential BC is the "
-            "edge trace (u·n for RT, u×n for N1E) -- write it as `dot(u(region), n_region) - g`."
-        )
-
     # --- field layout: RT/N1E (edge DOFs) and/or P0 (cell DOFs) ---
     fields: List[Any] = []
     field_index: dict = {}
@@ -151,6 +145,12 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
     has_hermite = "Hermite" in spaces
     if has_edge and has_hermite:
         raise NotImplementedError("jno.fem (non-nodal): mixing edge (RT/N1E) and Hermite fields is not supported.")
+    if dirichlet_raw and not has_hermite:
+        raise NotImplementedError(
+            "jno.fem (non-nodal): nodal Dirichlet is not applicable to RT/N1E; the essential BC is the "
+            "edge trace (u·n for RT, u×n for N1E) -- write it as `dot(u(region), n_region) - g`. "
+            "(A Hermite field DOES take a nodal value Dirichlet u(region) - g.)"
+        )
 
     pts = jnp.asarray(np.asarray(domain.mesh.points))[:, :2]
     cells = np.asarray(domain.mesh.cells_dict["triangle"], dtype=np.int64)
@@ -311,6 +311,8 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
         if flux_bcs
         else []
     )
+    if has_hermite and dirichlet_raw:  # Hermite value-Dirichlet: pin boundary-vertex value DOFs to g
+        pins = pins + _hermite_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs)
     zeros = jnp.zeros(total)
 
     # === transient: M u̇ + A u = c (mirrors fem_1d._assemble_1d_transient) -- split the temporal term
@@ -466,6 +468,27 @@ def _apply_natural_boundary_terms(b, boundary_terms, domain, field_index, spaces
                 pd = np.asarray(_eval_value_node_at(pd_node, jnp.asarray(xq))).reshape(-1)
                 b[offs[fidx] + eid] += int(top.cell_edge_signs[c, k]) * float(np.sum(gw * pd))  # sign * avg_edge(p_D)
     return jnp.asarray(b)
+
+
+def _hermite_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, offs):
+    """Value-Dirichlet ``(dof, value)`` pins for a Hermite field: pin the **value** DOF (``3·v``) at each
+    boundary vertex of the region to ``g(vertex)``. The two derivative DOFs stay free -- this is a true
+    value BC (the normal/tangential derivatives are natural), the analogue of nodal Lagrange Dirichlet.
+    ``g`` is the Dirichlet value node, evaluated at the vertex coordinate. (A clamped BC -- additionally
+    pinning the gradient DOFs to ``∇g`` -- is a follow-on; needed for optimal rates and the C¹ elements.)"""
+    from ..._fem import _eval_value_node_at
+    from .fem_1d import _region_node_ids
+
+    pins = []
+    for fk, region, _comp, _value, value_node in dirichlet_raw:
+        fidx = field_index.get(fk)
+        if fidx is None or spaces[fidx] != "Hermite":
+            continue
+        for v in _region_node_ids(domain, region):
+            v = int(v)
+            g = jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts_np[v][None, :]))).reshape(-1)
+            pins.append((offs[fidx] + 3 * v, float(g[0])))
+    return pins
 
 
 def _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree):

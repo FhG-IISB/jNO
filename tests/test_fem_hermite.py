@@ -64,6 +64,23 @@ def _hermite_symbols(d):
     return u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
 
 
+_DUMMY = jno.domain.from_array({"_": np.zeros((1, 1))})
+
+
+def _eval(out):
+    """A jno.fem solve to a concrete array: linear is already an array; nonlinear/transient is a trace
+    node (evaluate via a throwaway crux -- the established pattern)."""
+    if isinstance(out, jax.Array):
+        return np.asarray(out)
+    crux = jno.core([out.mean], domain=_DUMMY)
+    return np.asarray(crux.eval([out]))
+
+
+def _value_dofs(arr, nv):
+    """The vertex value DOFs (every 3rd DOF in the vertex block) -- the field values at the vertices."""
+    return np.asarray(arr)[..., 3 * np.arange(nv)]
+
+
 def test_hermite_stiffness_energy_reproduces_cubic():
     """``cᵀK c = ∫|∇u|²`` for the harmonic cubic ``u = x³ − 3xy²`` (⇒ ``∫|∇u|² = 5.6`` on the unit square).
     Exact iff the M(cell) derivative-DOF transform is correct."""
@@ -126,3 +143,76 @@ def test_hermite_poisson_recovers_cubic_exactly():
     sol = np.linalg.solve(K, b)
     rel = float(np.linalg.norm(sol - c_exact) / np.linalg.norm(c_exact))
     assert rel < 1e-9, f"Hermite Poisson did not recover the cubic exactly: rel {rel:.2e}"
+
+
+# ---------------------------------------------------------------------------
+# Real-world stress tests: Hermite combined with other jno.fem features
+# (Dirichlet BC, transient time-stepping, nonlinear Newton) through fem.solve().
+# ---------------------------------------------------------------------------
+
+PI = np.pi
+
+
+def test_hermite_poisson_dsl_dirichlet_converges():
+    """Hermite + DSL value-Dirichlet: -Δu = 2π²sin(πx)sin(πy), u=0 on ∂Ω. The value DOFs converge to the
+    smooth solution under refinement (value-Dirichlet pins boundary-vertex value DOFs; derivatives free)."""
+    errs, hs = [], [0.3, 0.2, 0.13]
+    for ms in hs:
+        d = jno.domain(box(0, 0, 1, 1), mesh_size=ms)
+        xi, yi, _ = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        u, phi = d.fem_symbols(space="Hermite")
+        ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+        f = 2 * PI**2 * jno.np.sin(PI * xi) * jno.np.sin(PI * yi)
+        fem = jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0])
+        pts = np.asarray(d.mesh.points)[:, :2]
+        nv = pts.shape[0]
+        uh = _value_dofs(_eval(fem.solve()).reshape(-1), nv)
+        ue = np.sin(PI * pts[:, 0]) * np.sin(PI * pts[:, 1])
+        errs.append(float(np.linalg.norm(uh - ue) / np.linalg.norm(ue)))
+    assert errs[0] < 0.05, f"coarse Hermite Poisson too inaccurate: {errs[0]:.3e}"
+    assert np.all(np.diff(errs) < 0), f"Hermite Poisson error not decreasing under refinement: {errs}"
+
+
+def test_hermite_transient_heat_decays_to_analytic():
+    """Hermite + transient (a real fem.solve() time-stepping combination): u_t = Δu, u=0 on ∂Ω, IC
+    sin(πx)sin(πy) -> u(t)=exp(-2π²t)·IC. The final-time value DOFs match the analytic decay."""
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.14, time=(0.0, 0.02, 21))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    u, phi = d.fem_symbols(space="Hermite")
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    psi0 = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
+    fem = jno.fem([ui.t * vi + (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - psi0])
+    assert fem.is_transient
+    traj = _eval(fem.solve())  # (n_steps, ndof)
+    pts = np.asarray(d.mesh.points)[:, :2]
+    nv = pts.shape[0]
+    t1 = float(fem.t1)
+    final = _value_dofs(traj[-1], nv)
+    analytic = np.exp(-2 * PI**2 * t1) * np.sin(PI * pts[:, 0]) * np.sin(PI * pts[:, 1])
+    rel = float(np.linalg.norm(final - analytic) / np.linalg.norm(analytic))
+    assert rel < 0.1, f"Hermite transient heat did not match the analytic decay: rel {rel:.3e}"
+    # genuinely decayed from the IC
+    assert np.linalg.norm(final) < 0.7 * np.linalg.norm(_value_dofs(traj[0], nv))
+
+
+def test_hermite_nonlinear_reaction_diffusion_recovers():
+    """Hermite + nonlinear Newton (a real fem.solve() combination): -Δu + u³ = f with manufactured
+    u* = sin(πx)sin(πy), f = 2π²u* + u*³, homogeneous value-Dirichlet. The Newton solve recovers u*."""
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.12)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u, phi = d.fem_symbols(space="Hermite")
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    ss = jno.np.sin(PI * xi) * jno.np.sin(PI * yi)
+    f = 2 * PI**2 * ss + ss**3
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y + (ui * ui * ui) * vi - f * vi, u(xb, yb) - 0.0])
+    assert not fem.is_linear
+    pts = np.asarray(d.mesh.points)[:, :2]
+    nv = pts.shape[0]
+    uh = _value_dofs(_eval(fem.solve()).reshape(-1), nv)
+    ue = np.sin(PI * pts[:, 0]) * np.sin(PI * pts[:, 1])
+    rel = float(np.linalg.norm(uh - ue) / np.linalg.norm(ue))
+    assert rel < 0.03, f"Hermite nonlinear reaction-diffusion did not recover u*: rel {rel:.3e}"

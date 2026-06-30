@@ -116,8 +116,10 @@ problems whose natural space is *not* H¹. Pick one with the `space=` knob on `f
 > **Hermite** is the first element with a per-cell **DOF-mixing** transform `M(cell)` (its global
 > derivative DOFs are the physical gradient `∇u` at the vertices). It is **C⁰** (not C¹), so it is *not*
 > a conforming biharmonic element — it de-risks the `M(cell)` / vertex-derivative-DOF machinery that the
-> forthcoming C¹ Bell/Argyris elements reuse. Essential value/derivative BCs through the weak-form DSL are
-> the next step (currently clamp boundary DOFs directly; see `tests/test_fem_hermite.py`).
+> forthcoming C¹ Bell/Argyris elements reuse. A **value-Dirichlet** `u(region) - g` pins boundary-vertex
+> value DOFs (derivatives free); it composes with the steady, transient, and nonlinear `fem.solve()` paths
+> (see `tests/test_fem_hermite.py` for Poisson / heat / reaction-diffusion). A *clamped* BC (also pinning
+> the gradient DOFs to `∇g`, needed for optimal rates and the C¹ elements) is a follow-on.
 
 ```python
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")   # H(div) flux
