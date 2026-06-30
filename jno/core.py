@@ -2449,6 +2449,16 @@ class core:
                         f"or freeze the model with model.freeze()."
                     )
 
+                # Magnitude–Direction Decoupling sentinel: build the real md_decouple transform and
+                # force the outer LR-scale to 1.0. Its update is the nonlinear reassembly W_new−W,
+                # which scale(lr≠1) would corrupt; the direction LR η_W lives in the base optimizer.
+                # We read fm._opt_fn but never write it back, so re-solving stays idempotent.
+                from .optimizers import MDOptimizer as _MDOptimizer
+
+                if isinstance(opt_fn, _MDOptimizer):
+                    opt_fn = opt_fn.build()
+                    lr_sched = _normalize_lr_sched(LearningRateSchedule(1.0))
+
                 per_model_opts[k] = _build_opt_chain(opt_fn, lr_sched)
                 lr_schedules[k] = lr_sched
 
