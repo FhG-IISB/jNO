@@ -482,8 +482,7 @@ def test_n1e_nonlinear_reaction_solve_converges():
     ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
     fem = jno.fem([inner(ui, vi) + inner(ui, ui) * inner(ui, vi) - (1.0 * vi[0] + 0.5 * vi[1])])
     assert not fem.is_linear and not fem.is_transient  # -> a steady nonlinear residual operator
-    node = fem.solve()  # the user API; dispatches to the Newton solver
-    usol = np.asarray(jno.core([(node * 0.0).mse], domain=d).eval([node])).reshape(-1)
+    usol = np.asarray(fem.solve()).reshape(-1)  # the user API; non-parametric nonlinear -> numeric array
     assert float(jnp.linalg.norm(fem.residual(jnp.asarray(usol)))) < 1e-7  # solved to a root R(u)=0
 
 

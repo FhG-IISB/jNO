@@ -27,11 +27,14 @@ building your own optax chains.
 this package and re-export it below.
 """
 
+from .engd import ENGDOptimizer, engd
 from .md_decouple import MDOptimizer, md, md_decouple
 from .soap import scale_by_soap, soap
 from .ssbroyden import scale_by_ss_quasi_newton, ssbfgs, ssbroyden
 
 __all__ = [
+    "engd",
+    "ENGDOptimizer",
     "ssbroyden",
     "ssbfgs",
     "scale_by_ss_quasi_newton",

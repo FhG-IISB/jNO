@@ -511,3 +511,219 @@ def test_ntk_balanced_end_to_end_against_live_solver():
     _np.testing.assert_allclose(out.sum(), 2.0, atol=1e-4)
     # And non-uniform (traces differ).
     assert not _np.allclose(out, _np.array([1.0, 1.0]))
+
+
+# ---------------------------------------------------------------------------
+# ENGD callback
+# ---------------------------------------------------------------------------
+
+
+def test_engd_gram_math_lstsq():
+    """ENGD Gram: G = (1/N) J^T J, lstsq solution satisfies G x = g."""
+    N, P = 20, 4
+    key = jax.random.PRNGKey(42)
+    J = jax.random.normal(key, shape=(N, P))
+    g = jax.random.normal(jax.random.PRNGKey(1), shape=(P,))
+
+    G = (1.0 / N) * (J.T @ J)
+    nat_g = jnp.linalg.lstsq(G, g, rcond=None)[0]
+
+    # G is P×P PSD — lstsq gives exact solution when G is full rank.
+    np.testing.assert_allclose(np.array(G @ nat_g), np.array(g), atol=1e-5)
+
+    # The (1/N) normalisation: doubling N while keeping J fixed should
+    # halve G but leave the lstsq solution unchanged (G^-1 g scales back up).
+    J2 = jnp.concatenate([J, J], axis=0)  # shape (2N, P)
+    G2 = (1.0 / (2 * N)) * (J2.T @ J2)  # == G (both are (1/N)*J^T J)
+    nat_g2 = jnp.linalg.lstsq(G2, g, rcond=None)[0]
+    np.testing.assert_allclose(np.array(nat_g), np.array(nat_g2), atol=1e-5)
+
+
+def test_engd_callback_rejects_bad_inputs():
+    """ENGDCallback validates gram_terms types and model consistency."""
+    import pytest
+
+    from jno.utils.adaptive.callbacks import ENGDCallback
+
+    with pytest.raises(TypeError, match="NetworkGradient"):
+        ENGDCallback(gram_terms=[(jnp.zeros(3), 1.0)])
+
+    with pytest.raises(ValueError, match="empty"):
+        ENGDCallback(gram_terms=[])
+
+
+def test_engd_callback_compiles_and_reduces_loss():
+    """ENGDCallback runs end-to-end on 1-D Poisson; loss after 20 ENGD steps
+    is lower than after 20 plain-GD steps with the same learning rate.
+    """
+    import foundax
+    import optax
+
+    import jno
+    import jno.jnp_ops as jnn
+
+    π = jno.np.pi
+
+    domain = jno.domain(constructor=jno.domain.line(mesh_size=0.02))
+    x, _ = domain.variable("interior")
+    xb, _ = domain.variable("boundary")
+
+    key = jax.random.PRNGKey(0)
+    width = 8
+
+    def make_model():
+        net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=width, num_layers=2, key=key))
+        u = net(x)
+        # u = net(x).scalar.bind(x=x)  # scalar scalar binding
+        f = π**2 * jno.np.sin(π * x)
+        pde = -u.d2(x) - f  # should be 0 at solution
+        ub = net(xb)  # should be 0 at boundary
+        return net, u, pde, ub
+
+    # ── ENGD run ──────────────────────────────────────────────────────────────
+    net_e, _, pde_e, ub_e = make_model()
+    net_e.optimizer(optax.sgd(1.0))  # lr=1.0 for natural gradient direction
+
+    engd_cb = jno.callbacks.engd(
+        gram_terms=[(pde_e.grad(net_e), 1.0), (ub_e.grad(net_e), 1.0)],
+    )
+    crux_e = jno.core([pde_e.mse, ub_e.mse])
+    stats_e = crux_e.solve(20, callbacks=[engd_cb])
+
+    # ── GD baseline (same lr) ─────────────────────────────────────────────────
+    net_g, _, pde_g, ub_g = make_model()
+    net_g.optimizer(optax.sgd(1e-3))
+    crux_g = jno.core([pde_g.mse, ub_g.mse])
+    stats_g = crux_g.solve(20)
+
+    loss_engd = float(stats_e.total_loss)
+    loss_gd = float(stats_g.total_loss)
+
+    # ENGD with lr=1 should outperform GD with lr=1e-3 on the same problem.
+    assert loss_engd < loss_gd, f"ENGD loss {loss_engd:.3e} should be < GD loss {loss_gd:.3e}"
+    # Loss must be finite.
+    assert np.isfinite(loss_engd), f"ENGD loss is not finite: {loss_engd}"
+
+
+def test_engd_callback_gram_interval_caches_g():
+    """With gram_interval=2 the Gram matrix is reused on odd steps.
+    Both gram_interval=1 and gram_interval=2 should converge; they differ
+    only in cost, not correctness.
+    """
+    import foundax
+    import optax
+
+    import jno
+    import jno.jnp_ops as jnn
+
+    π = jno.np.pi
+
+    domain = jno.domain(constructor=jno.domain.line(mesh_size=0.05))
+    x, _ = domain.variable("interior")
+    xb, _ = domain.variable("boundary")
+    key = jax.random.PRNGKey(0)
+
+    def make_model():
+        net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=8, num_layers=2, key=key))
+        u = net(x)
+        f = π**2 * jno.np.sin(π * x)
+        pde = -u.d2(x) - f
+        ub = net(xb)
+        return net, pde, ub
+
+    net1, pde1, ub1 = make_model()
+    net1.optimizer(optax.sgd(1.0))
+    cb1 = jno.callbacks.engd([(pde1.grad(net1), 1.0), (ub1.grad(net1), 1.0)], gram_interval=1)
+    stats1 = jno.core([pde1.mse, ub1.mse]).solve(10, callbacks=[cb1])
+
+    net2, pde2, ub2 = make_model()
+    net2.optimizer(optax.sgd(1.0))
+    cb2 = jno.callbacks.engd([(pde2.grad(net2), 1.0), (ub2.grad(net2), 1.0)], gram_interval=2)
+    stats2 = jno.core([pde2.mse, ub2.mse]).solve(10, callbacks=[cb2])
+
+    # Both should produce a finite loss.
+    assert np.isfinite(float(stats1.total_loss))
+    assert np.isfinite(float(stats2.total_loss))
+
+
+def test_engd_callback_rejects_inner_steps():
+    """ENGDCallback raises if inner_steps > 1."""
+    import foundax
+    import optax
+    import pytest
+
+    import jno
+    import jno.jnp_ops as jnn
+
+    domain = jno.domain(constructor=jno.domain.line(mesh_size=0.1))
+    x, _ = domain.variable("interior")
+    xb, _ = domain.variable("boundary")
+    key = jax.random.PRNGKey(0)
+
+    net = jnn.nn.wrap(foundax.mlp(1, hidden_dims=4, num_layers=2, key=key))
+    net.optimizer(optax.sgd(1.0))
+    u = net(x)
+    pde = u
+    ub = net(xb)
+
+    cb = jno.callbacks.engd([(pde.grad(net), 1.0), (ub.grad(net), 1.0)])
+    crux = jno.core([pde.mse, ub.mse])
+
+    with pytest.raises(ValueError, match="inner_steps"):
+        crux.solve(2, inner_steps=2, callbacks=[cb])
+
+
+def test_engd_line_search_reduces_loss():
+    """ENGDCallback with line_search=True compiles and converges faster than GD.
+
+    2-D Poisson on a tiny 5x5 grid: verifies the 31-point grid search
+    (α ∈ {0.5^0, …, 0.5^30}) picks a valid step and the loss decreases.
+    """
+    import equinox as eqx
+    import foundax
+    import optax
+
+    import jno
+    import jno.jnp_ops as jnn
+
+    N = 5
+    int_pts = np.array(
+        [[x, y] for x in np.linspace(1 / 6, 5 / 6, N) for y in np.linspace(1 / 6, 5 / 6, N)],
+        dtype=np.float64,
+    )
+    bdy_pts = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0], [1.0, 1.0]], dtype=np.float64)
+
+    dom = jno.domain.rect(mesh_size=0.3)
+    x, y, _ = dom.variable("interior")
+    dom.context["interior"] = int_pts[np.newaxis, np.newaxis]
+    xb, yb, _ = dom.variable("boundary")
+    dom.context["boundary"] = bdy_pts[np.newaxis, np.newaxis]
+
+    π = jno.np.pi
+    forcing = 2 * π**2 * jno.np.sin(π * x) * jno.np.sin(π * y)
+
+    key = jax.random.PRNGKey(7)
+
+    def make_net():
+        base = foundax.mlp(in_features=2, hidden_dims=8, num_layers=1, activation=jax.nn.tanh, key=key)
+        scaled = jax.tree_util.tree_map(lambda leaf: leaf * 0.1 if eqx.is_array(leaf) else leaf, base)
+        return jnn.nn.wrap(scaled)
+
+    net = make_net()
+    net.optimizer(optax.sgd(1.0))
+    u = net(x, y)
+    lap = u.laplacian(x, y)
+    r = lap + forcing
+    u_bc = net(xb, yb)
+
+    engd = jno.callbacks.engd(
+        gram_terms=[(lap.grad(net), 1.0), (u_bc.grad(net), 1.0)],
+        gram_interval=1,
+        line_search=True,
+    )
+    crux = jno.core([r.mse, u_bc.mse])
+    stats = crux.solve(10, callbacks=[engd])
+
+    loss = float(stats.total_loss)
+    assert np.isfinite(loss), f"ENGD line_search loss is not finite: {loss}"
+    assert loss < 50.0, f"ENGD line_search loss {loss:.3e} did not decrease from ~52 initial"

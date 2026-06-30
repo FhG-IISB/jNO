@@ -65,6 +65,61 @@ from .utils import (
 from .utils.config import get_wandb_run, wandb_alert, wandb_commit, wandb_log, wandb_log_model
 
 
+def _expression_involves_model(expr: "Placeholder", lid: int) -> bool:
+    """Return True if any ModelCall in the expression tree has layer_id == lid."""
+    seen: set = set()
+
+    def visit(node) -> bool:
+        nid = id(node)
+        if nid in seen:
+            return False
+        seen.add(nid)
+        if isinstance(node, ModelCall):
+            return node.model.layer_id == lid
+        if isinstance(node, BinaryOp):
+            return visit(node.left) or visit(node.right)
+        if isinstance(node, FunctionCall):
+            return any(visit(a) for a in node.args if isinstance(a, Placeholder))
+        if isinstance(node, OperationDef):
+            return visit(node.expr)
+        # Tracker — walk its inner expression (.expr, not .target)
+        if isinstance(node, Tracker):
+            return visit(node.expr)
+        # Jacobian / Hessian / NetworkGradient — all carry a .target child
+        target = getattr(node, "target", None)
+        if target is not None and isinstance(target, Placeholder):
+            return visit(target)
+        return False
+
+    return visit(expr)
+
+
+def _auto_gram_terms(constraints, fm) -> list:
+    """Build gram_terms from all constraints that involve model *fm*.
+
+    Uses ``FunctionCall.reduces_axis`` (truthy) to strip any axis-reducing
+    wrapper — ``.mse``, ``.mae``, or a user-defined ``jno.np.mean(...)`` —
+    so the raw (vector-valued) residual is passed to ``.grad(fm)``.
+    Tracker constraints are skipped; they are monitoring-only expressions
+    and must not contribute to the energy Gram matrix.
+    """
+    gram_terms = []
+    for expr in constraints:
+        inner = expr.expr if isinstance(expr, OperationDef) else expr
+        # Trackers are monitoring-only — never contribute to the Gram
+        if isinstance(inner, Tracker):
+            continue
+        # Strip any axis-reducing wrapper via FunctionCall.reduces_axis rather
+        # than checking the name string (which would miss custom reductions).
+        if isinstance(inner, FunctionCall) and inner.reduces_axis:
+            raw = inner.args[0]
+        else:
+            raw = inner
+        if _expression_involves_model(raw, fm.layer_id):
+            gram_terms.append((raw.grad(fm), 1.0))
+    return gram_terms
+
+
 def _cpu_device():
     """Return a CPU JAX device.
 
@@ -1769,6 +1824,55 @@ class core:
                             f"but there are only {self.n_constraints} constraints (indices 0–{self.n_constraints - 1})."
                         )
 
+        # ── ENGD optimizer auto-expansion ────────────────────────────────────
+        # Detect ENGDOptimizer sentinels before the _has_before_update_hooks
+        # check below so the injected ENGDCallback is visible to that guard.
+        # We do NOT mutate fm._opt_fn — _engd_opt_overrides is threaded to the
+        # optimizer-build loop so re-calls to solve() stay idempotent.
+        from .optimizers import ENGDOptimizer as _ENGDOptimizer
+        from .utils.adaptive.callbacks import ENGDCallback as _ENGDCallback
+
+        _engd_opt_overrides: Dict[int, Any] = {}
+        for _lid, _fm in self._collect_flax_modules().items():
+            if isinstance(_fm._opt_fn, _ENGDOptimizer):
+                _sentinel = _fm._opt_fn
+                _gts = _sentinel._gram_terms
+                if _gts is None:
+                    _gts = _auto_gram_terms(self.constraints, _fm)
+                if not _gts:
+                    raise ValueError(
+                        f"jno.optimizers.engd: could not auto-detect gram_terms for "
+                        f"model (layer_id={_lid}). Pass gram_terms= explicitly to "
+                        "engd(), or ensure the model appears in at least one loss "
+                        "expression passed to jno.core(...)."
+                    )
+                _cb = _ENGDCallback(
+                    gram_terms=_gts,
+                    gram_interval=_sentinel._gram_interval,
+                    rcond=_sentinel._rcond,
+                    line_search=_sentinel._line_search,
+                )
+                if callbacks is None:
+                    callbacks = [_cb]
+                else:
+                    callbacks = [_cb] + list(callbacks)
+                import optax as _optax_engd
+
+                _engd_opt_overrides[_lid] = _optax_engd.sgd(1.0)
+
+        # Guard: on_before_update hook callbacks (e.g. ENGDCallback).
+        from .utils.adaptive.callbacks import Callback as _Callback
+
+        _has_before_update_hooks = bool(callbacks) and any(
+            type(cb).on_before_update is not _Callback.on_before_update for cb in callbacks
+        )
+        if _has_before_update_hooks and inner_steps > 1:
+            raise ValueError(
+                "on_before_update callbacks (e.g. ENGDCallback) are not "
+                "compatible with inner_steps > 1: the hook cannot fire inside "
+                "the XLA fori_loop. Use inner_steps=1 (the default)."
+            )
+
         # Adaptive resampling metadata
         strategies = getattr(self.domain, "_resampling_strategies", {})
         has_resampling = bool(strategies)
@@ -2439,7 +2543,9 @@ class core:
                         )
             else:
                 # ── Single global optimizer (original behaviour) ──
-                opt_fn = fm._opt_fn
+                # ENGDOptimizer sentinels are replaced by optax.sgd(1.0) here;
+                # the corresponding ENGDCallback was injected earlier in solve().
+                opt_fn = _engd_opt_overrides.get(lid, fm._opt_fn)
                 lr_sched = _normalize_lr_sched(fm._lr if fm._lr is not None else LearningRateSchedule(1e-3))
 
                 if opt_fn is None:
@@ -2474,6 +2580,12 @@ class core:
             _num_chains_global = next(iter(_k_set))
         else:
             _num_chains_global = 1
+
+        if _has_before_update_hooks and bayesian_handles:
+            raise ValueError(
+                "on_before_update callbacks (e.g. ENGDCallback) are not "
+                "compatible with Bayesian models (.bayesian() / .vi())."
+            )
 
         # Initialise optimizer / kernel states and place on mesh.  Each
         # key in ``per_model_opts`` (bare ``"<lid>"``) initialises its
@@ -2843,6 +2955,22 @@ class core:
                 f"= {batchsize * accumulation_steps})"
             )
 
+        # ── 7c. Build split grad/apply for on_before_update hooks (non-accumulation) ──
+        # Not needed for the accumulation path — it already separates grad and apply.
+        if _has_before_update_hooks and not _use_accumulation:
+            _hook_grad_fn = self.make_grad_fn(
+                batchsize=effective_batchsize,
+                frozen=frozen_arrays,
+                static=static,
+                checkpoint_gradients=checkpoint_gradients,
+                min_consecutive=min_consecutive,
+            )
+            _hook_apply_fn = self.make_apply_fn(
+                per_model_opts=per_model_opts,
+                lr_schedules=lr_schedules,
+                group_lr_schedules=group_lr_schedules,
+            )
+
         # Optional: build JIT-compiled tracker function
         has_trackers = len(self.compiled_trackers) > 0
         if has_trackers:
@@ -2962,6 +3090,41 @@ class core:
                         _opt_sharding,  # opt_states
                     ),
                     donate_argnums=(2,),  # donate grads (freshly accumulated)
+                )
+
+            if _has_before_update_hooks and not _use_accumulation:
+                _trainable_sharding = jax.tree_util.tree_map(_leaf_sharding, trainable)
+                _ctx_sharding = jax.tree_util.tree_map(_leaf_sharding, trace_context)
+                _opt_sharding = jax.tree_util.tree_map(_leaf_sharding, opt_states)
+
+                jit_hook_grad = jax.jit(
+                    _hook_grad_fn,
+                    in_shardings=(
+                        _trainable_sharding,
+                        replicated,  # rng
+                        _ctx_sharding,
+                    ),
+                    out_shardings=(
+                        _trainable_sharding,  # grads
+                        replicated,  # rng
+                        replicated,  # total_loss
+                        replicated,  # individual_losses
+                    ),
+                )
+                jit_hook_apply = jax.jit(
+                    _hook_apply_fn,
+                    in_shardings=(
+                        _trainable_sharding,
+                        _opt_sharding,
+                        _trainable_sharding,  # grads
+                        replicated,  # epoch
+                        replicated,  # prev_losses
+                    ),
+                    out_shardings=(
+                        _trainable_sharding,
+                        _opt_sharding,
+                    ),
+                    donate_argnums=(2,),  # donate grads buffer
                 )
 
             if has_trackers:
@@ -3097,6 +3260,17 @@ class core:
                     prev_losses,
                 ).compile()
                 del _zero_grads
+            elif _has_before_update_hooks:
+                _ = jit_hook_grad.lower(trainable, self.rng, trace_context).compile()
+                _zero_grads = jax.tree_util.tree_map(jnp.zeros_like, trainable)
+                _ = jit_hook_apply.lower(
+                    trainable,
+                    opt_states,
+                    _zero_grads,
+                    jax.device_put(jnp.int32(0), replicated),
+                    prev_losses,
+                ).compile()
+                del _zero_grads
             else:
                 _ = jit_step.lower(
                     trainable,
@@ -3138,6 +3312,11 @@ class core:
                     for _ in range(3):
                         _gw, _rw, _, _ = jit_grad(_tw, _rw, trace_context)
                         _tw, _ow = jit_apply(_tw, _ow, _gw, _ew, _pl)
+                    del _gw
+                elif _has_before_update_hooks:
+                    for _ in range(3):
+                        _gw, _rw, _, _ = jit_hook_grad(_tw, _rw, trace_context)
+                        _tw, _ow = jit_hook_apply(_tw, _ow, _gw, _ew, _pl)
                     del _gw
                 else:
                     for _ in range(3):
@@ -3736,6 +3915,20 @@ class core:
                         _acc_total = _acc_total + float(jax.device_get(_micro_loss)) * _inv_accum
                         _acc_losses = _acc_losses + _micro_indiv * _inv_accum
 
+                    # Apply on_before_update hooks to accumulated gradients.
+                    if _has_before_update_hooks:
+                        for _cb in callbacks:
+                            if type(_cb).on_before_update is not _Callback.on_before_update:
+                                _modified = _cb.on_before_update(
+                                    grads=_acc_grads,
+                                    trainable=trainable,
+                                    context=micro_ctx,
+                                    rng=self.rng,
+                                    epoch=outer_epoch,
+                                )
+                                if _modified is not None:
+                                    _acc_grads = _modified
+
                     # Single optimizer update with averaged gradients
                     trainable, opt_states = jit_apply(
                         trainable,
@@ -3769,23 +3962,41 @@ class core:
                     else:
                         context = on_device_context
 
-                    # --- step ---
-                    (
-                        trainable,
-                        opt_states,
-                        self.rng,
-                        epoch_jnp,
-                        total_loss,
-                        individual_losses,
-                        _step_bayesian_info,
-                    ) = jit_step(
-                        trainable,
-                        opt_states,
-                        self.rng,
-                        context,
-                        epoch_jnp,
-                        prev_losses,
-                    )
+                    if _has_before_update_hooks:
+                        # Split path: grad → on_before_update hooks → apply.
+                        _hgrads, self.rng, total_loss, individual_losses = jit_hook_grad(trainable, self.rng, context)
+                        for _cb in callbacks:
+                            if type(_cb).on_before_update is not _Callback.on_before_update:
+                                _modified = _cb.on_before_update(
+                                    grads=_hgrads,
+                                    trainable=trainable,
+                                    context=context,
+                                    rng=self.rng,
+                                    epoch=outer_epoch,
+                                )
+                                if _modified is not None:
+                                    _hgrads = _modified
+                        trainable, opt_states = jit_hook_apply(trainable, opt_states, _hgrads, epoch_jnp, prev_losses)
+                        epoch_jnp = epoch_jnp + jnp.asarray(1, dtype=epoch_jnp.dtype)
+                        _step_bayesian_info: Dict[str, Dict[str, jnp.ndarray]] = {}
+                    else:
+                        # --- step ---
+                        (
+                            trainable,
+                            opt_states,
+                            self.rng,
+                            epoch_jnp,
+                            total_loss,
+                            individual_losses,
+                            _step_bayesian_info,
+                        ) = jit_step(
+                            trainable,
+                            opt_states,
+                            self.rng,
+                            context,
+                            epoch_jnp,
+                            prev_losses,
+                        )
 
                 if not _use_substeps:
                     prev_losses = individual_losses

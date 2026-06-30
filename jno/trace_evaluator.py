@@ -752,8 +752,13 @@ class TraceEvaluator:
         D = logical_shape[1] if len(logical_shape) > 1 else 1
 
         # Jacobian: pytree matching trainable, each leaf L of shape S
-        # becomes shape (*out_shape, *S)  →  (N, D, *S)
-        jac_pytree = jax.jacrev(forward_fn)(trainable)
+        # becomes shape (*out_shape, *S)  →  (N, D, *S).
+        #
+        # Use jacfwd (forward-mode AD) instead of jacrev: jacfwd batches P
+        # JVP passes via vmap internally, giving XLA a single compact program.
+        # jacrev would create N separate VJP traces — catastrophic for large N
+        # or when forward_fn includes high-order spatial derivatives (Laplacian).
+        jac_pytree = jax.jacfwd(forward_fn)(trainable)
 
         # Flatten all param leaves into a single (N, D, P) array, then squeeze D=1
         leaves = jax.tree_util.tree_leaves(jac_pytree)

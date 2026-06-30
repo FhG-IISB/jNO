@@ -337,6 +337,45 @@ def test_enclosure_handle_square_cavity_inward():
         bad.check()
 
 
+def test_enclosure_axisymmetric_r_min_keeps_view_factors_physical():
+    """The axisymmetric ring kernel has a ``1/R^2`` near-field singularity: near-coincident / on-axis
+    ring pairs blow up to F > 1 unless a near-field floor ``r_min`` is applied. ``d.enclosure`` defaults
+    ``r_min`` to half the median element length, keeping the assembled view factors physical (<= 1).
+    Regression for the axisymmetric branch passing ``r_min`` through to the kernel.
+
+    Geometry: two coaxial cylinders in the meridional ``(r, z)`` half-plane (inner r1, outer r2) with a
+    vacuum gap; analytic surface factors are ``F12 = 1`` and ``F21 = r1/r2`` (Modest, Ch. 4)."""
+    import jno
+
+    pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
+    from shapely.geometry import box
+
+    r1, r2, w, H = 0.20, 0.25, 0.03, 1.6  # tall (aspect ~6) so end losses are small and F12 -> 1
+    inner = box(r1 - w, 0.0, r1, H)  # inner solid, gap-facing surface at r = r1
+    outer = box(r2, 0.0, r2 + w, H)  # outer solid, gap-facing surface at r = r2
+    d = jno.domain(inner.union(outer), mesh_size=0.04)
+    d.tag("inner_gap", lambda x, y: np.abs(x - r1) < 1e-2)
+    d.tag("outer_gap", lambda x, y: np.abs(x - r2) < 1e-2)
+
+    gap = d.enclosure(["inner_gap", "outer_gap"], axisymmetric=True)  # r_min defaulted
+    F = np.asarray(gap.view_factor)
+    assert F.max() <= 1.05, f"default r_min must keep axisymmetric view factors physical, got max {F.max():.3f}"
+
+    A = np.asarray(gap.areas)
+    mi, mo = gap.tag_mask("inner_gap"), gap.tag_mask("outer_gap")
+    assert mi.sum() > 0 and mo.sum() > 0
+    F12 = (A[mi, None] * F[np.ix_(mi, mo)]).sum() / A[mi].sum()
+    F21 = (A[mo, None] * F[np.ix_(mo, mi)]).sum() / A[mo].sum()
+    # finite cylinder (aspect ~6): inner surface still sees mostly the outer one, with small end losses
+    assert 0.88 < F12 <= 1.0, f"axisymmetric F12 should be ~1 (small end losses), got {F12:.3f}"
+    assert abs(F21 - r1 / r2) < 6e-2, f"axisymmetric F21 should be ~r1/r2={r1 / r2:.3f}, got {F21:.3f}"
+
+    # The r_min kwarg must be threaded to the kernel: a large near-field floor softens the 1/R^2 kernel
+    # and measurably shrinks every view factor (vs the default floor) — proving it is wired through.
+    soft = np.asarray(d.enclosure(["inner_gap", "outer_gap"], axisymmetric=True, r_min=0.5).view_factor)
+    assert soft.max() < 0.8 * F.max(), f"explicit r_min must soften F (got soft {soft.max():.3f} vs {F.max():.3f})"
+
+
 def test_coupled_conduction_radiation_concentric_cylinders():
     """End-to-end: steady conduction in two solid rings + grey-body radiation across the vacuum gap,
     coupled, matches the closed-form two-surface series solution
@@ -440,3 +479,371 @@ def test_coupled_conduction_radiation_concentric_cylinders():
     g = float(jax.grad(mean_inner_T)(eps1))
     fd = float((mean_inner_T(eps1 + 1e-3) - mean_inner_T(eps1 - 1e-3)) / 2e-3)
     assert np.isfinite(g) and abs(g - fd) / (abs(fd) + 1e-8) < 1.5e-2, f"grad {g:.3f} vs finite-diff {fd:.3f}"
+
+
+def test_radiation_coupling_term_in_jno_fem_matches_analytic():
+    """A user-written radiosity wrapped in ``jno.Coupling`` and passed IN the ``jno.fem([...])`` list folds
+    the nonlocal grey-body load into the residual (promoting the linear conduction form to nonlinear); the
+    coupled conduction+radiation system then reproduces the closed-form concentric-cylinder series solution
+    -- i.e. the term assembles the same physics as the hand-rolled ``A u - b + load(q_rad(u))`` above. The
+    enclosure supplies only the geometry (``field``/``view_factor``/``emissivity``/``load``); the radiosity
+    is the user's, on top of it. A ``jno.np.parameter``
+    (conductivity, here in the form via the operator's runtime args) stays differentiable through it, so it
+    trains through ``jno.core``. (The matrix-free default solver stalls on this penalty-Dirichlet case, so
+    we drive the operator's residual with a direct-solve Newton -- jno imposes no solver.)"""
+    from shapely.geometry import Point
+
+    import jno
+
+    pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
+    from scipy.optimize import fsolve
+
+    def newton(residual, u0, steps=60, tol=1e-9):  # BYO direct-solve Newton (custom_root -> differentiable)
+        f = lambda uu: jnp.asarray(residual(uu)).reshape(-1)  # noqa: E731
+
+        def _solve(fn, x0):
+            def body(s):
+                du = jnp.linalg.solve(jax.jacfwd(fn)(s[0]), -fn(s[0]))
+                return s[0] + du, jnp.linalg.norm(du), s[2] + 1
+
+            return jax.lax.while_loop(lambda s: (s[1] > tol) & (s[2] < steps), body, (x0, jnp.array(1.0, x0.dtype), 0))[0]
+
+        return jax.lax.custom_root(
+            f, jnp.asarray(u0).reshape(-1), _solve, lambda g, y: jnp.linalg.solve(jax.jacfwd(g)(jnp.zeros_like(y)), y)
+        )
+
+    sigma = 5.670374419e-8
+    r0, r1, r2, r3 = 0.10, 0.20, 0.25, 0.35
+    k0, eps1, eps2, T_hot, T_cold = 20.0, 0.8, 0.6, 1000.0, 300.0
+    ring = lambda a, b: Point(0, 0).buffer(b, 16).difference(Point(0, 0).buffer(a, 16))  # noqa: E731
+    d = jno.domain(ring(r0, r1).union(ring(r2, r3)), mesh_size=0.45)
+    rad = lambda x, y: jnp.hypot(x, y)  # noqa: E731
+    d.tag("hot", lambda x, y: jnp.abs(rad(x, y) - r0) < 4e-2)
+    d.tag("cold", lambda x, y: jnp.abs(rad(x, y) - r3) < 4e-2)
+    d.tag("inner_gap", lambda x, y: jnp.abs(rad(x, y) - r1) < 4e-2)
+    d.tag("outer_gap", lambda x, y: jnp.abs(rad(x, y) - r2) < 4e-2)
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    xh, yh, _ = d.variable("hot", split=True)
+    xc, yc, _ = d.variable("cold", split=True)
+    gap = d.enclosure(["inner_gap", "outer_gap"])
+    gap.check()
+    mi, mo = gap.tag_mask("inner_gap"), gap.tag_mask("outer_gap")
+    ar = np.asarray(gap.areas)
+
+    # the user writes the grey-body radiosity on top of the enclosure geometry, then wraps it in a Coupling
+    F = jnp.asarray(gap.view_factor)
+    eps = gap.emissivity({"inner_gap": eps1, "outer_gap": eps2})
+    rho, eye, s_row = 1.0 - eps, jnp.eye(gap.size), F.sum(axis=1)
+
+    def radiation(w):  # net grey-body surface load (n_dofs,) -- pure JAX, differentiable in w
+        Tk = gap.field(w)
+        J = jnp.linalg.solve(eye - rho[:, None] * F, eps * sigma * Tk**4)
+        return gap.load(s_row * J - F @ J)
+
+    # conductivity as a runtime parameter; radiation as a Coupling term in the jno.fem list
+    kp = jno.np.parameter((1,), name="kcond")
+    kp.initialize(jax.nn.initializers.constant(k0))
+    fem = jno.fem(
+        [
+            kp * (ui.x * vi.x + ui.y * vi.y),
+            radiation,  # the bare residual function IS the coupling -- no wrapper needed
+            u(xh, yh) - T_hot,
+            u(xc, yc) - T_cold,
+        ]
+    )
+    assert fem._mode == "nonlinear", "the radiation coupling must promote the linear conduction form to nonlinear"
+    op = fem.operator
+    nd = int(fem.dofs)
+
+    def coupled(kval):  # the coupled solve as a function of the conductivity parameter (via the operator's args)
+        res = lambda w: jnp.asarray(op.residual(w, {"kcond": jnp.atleast_1d(kval)})).reshape(-1)  # noqa: E731
+        return newton(res, jnp.full((nd,), 0.5 * (T_hot + T_cold)))
+
+    T = np.asarray(coupled(k0))
+    assert np.all(np.isfinite(T)) and T.min() > T_cold - 1 and T.max() < T_hot + 1
+    Tsf = np.asarray(gap.field(jnp.asarray(T)))
+    Ts1 = float((Tsf[mi] * ar[mi]).sum() / ar[mi].sum())
+    Ts2 = float((Tsf[mo] * ar[mo]).sum() / ar[mo].sum())
+    D = 1 / eps1 + (r1 / r2) * (1 / eps2 - 1)
+    ts1_a, ts2_a = fsolve(
+        lambda x: [
+            2 * np.pi * k0 * (T_hot - x[0]) / np.log(r1 / r0) - 2 * np.pi * r1 * sigma * (x[0] ** 4 - x[1] ** 4) / D,
+            2 * np.pi * r1 * sigma * (x[0] ** 4 - x[1] ** 4) / D - 2 * np.pi * k0 * (x[1] - T_cold) / np.log(r3 / r2),
+        ],
+        [800.0, 500.0],
+    )
+    assert T_hot > Ts1 > Ts2 > T_cold
+    assert abs(Ts1 - ts1_a) / ts1_a < 1.5e-2 and abs(Ts2 - ts2_a) / ts2_a < 1.5e-2, (
+        f"coupling-term Ts1 {Ts1:.1f}/{ts1_a:.1f}, Ts2 {Ts2:.1f}/{ts2_a:.1f}"
+    )
+
+    # the conductivity parameter is differentiable THROUGH the coupled (conduction+radiation) solve
+    qoi = lambda kv: (gap.field(coupled(kv))[jnp.asarray(mi)]).mean()  # noqa: E731
+    g = float(jax.grad(qoi)(k0))
+    fd = float((qoi(k0 + 1e-2) - qoi(k0 - 1e-2)) / 2e-2)
+    assert np.isfinite(g) and abs(g) > 1e-6 and abs(g - fd) / (abs(fd) + 1e-8) < 3e-2, (
+        f"parameter grad through the radiation coupling {g:.4f} vs FD {fd:.4f}"
+    )
+
+    # a jitted residual is a callable *object*, not a plain function: the bare shorthand cannot see it, so
+    # jno.fem must reject it with a clear "wrap it in jno.Coupling" message rather than fail obscurely later.
+    with pytest.raises(TypeError, match="jno.Coupling"):
+        jno.fem([kp * (ui.x * vi.x + ui.y * vi.y), jax.jit(radiation), u(xh, yh) - T_hot, u(xc, yc) - T_cold])
+    # and wrapping the jitted residual explicitly is accepted (same coupling, just an object callable)
+    femj = jno.fem(
+        [kp * (ui.x * vi.x + ui.y * vi.y), jno.Coupling(jax.jit(radiation)), u(xh, yh) - T_hot, u(xc, yc) - T_cold]
+    )
+    assert femj._mode == "nonlinear"
+
+
+def test_radiation_coupling_parameter_flows_and_is_differentiable():
+    """A ``jno.np.parameter`` that lives only inside a coupling (here the emissivity) is invisible to the
+    weak-form trace walk, so it is declared with ``jno.Coupling(fn, params=[eps])`` and read from the
+    threaded ``{name: value}`` dict. This test checks the two things ``jno.core`` rides on: the parameter
+    appears in the solve's runtime args (so the ``fem.solve()`` FunctionCall lists it as a trainable input),
+    and the coupled solve is differentiable in it (nonzero, FD-consistent) -- i.e. it would calibrate."""
+    pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
+    from shapely.geometry import Point
+
+    import jno
+
+    sigma = 5.670374419e-8
+    r0, r1, r2, r3 = 0.10, 0.20, 0.25, 0.35
+    k0, eps0, T_hot, T_cold = 20.0, 0.7, 1000.0, 300.0
+    ring = lambda a, b: Point(0, 0).buffer(b, 16).difference(Point(0, 0).buffer(a, 16))  # noqa: E731
+    d = jno.domain(ring(r0, r1).union(ring(r2, r3)), mesh_size=0.45)
+    rad = lambda x, y: jnp.hypot(x, y)  # noqa: E731
+    d.tag("hot", lambda x, y: jnp.abs(rad(x, y) - r0) < 4e-2)
+    d.tag("cold", lambda x, y: jnp.abs(rad(x, y) - r3) < 4e-2)
+    d.tag("inner_gap", lambda x, y: jnp.abs(rad(x, y) - r1) < 4e-2)
+    d.tag("outer_gap", lambda x, y: jnp.abs(rad(x, y) - r2) < 4e-2)
+    u, v = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    xh, yh, _ = d.variable("hot", split=True)
+    xc, yc, _ = d.variable("cold", split=True)
+    gap = d.enclosure(["inner_gap", "outer_gap"])
+    gap.check()
+    mi = gap.tag_mask("inner_gap")
+    F = jnp.asarray(gap.view_factor)
+    eye, s_row = jnp.eye(gap.size), F.sum(axis=1)
+
+    # emissivity as a coupling-only trainable parameter, read from the threaded args dict
+    eps = jno.np.parameter((1,), name="eps")
+    eps.initialize(jax.nn.initializers.constant(eps0))
+
+    def radiation(w, p):  # uniform grey emissivity p["eps"]; net radiosity load
+        e = p["eps"].reshape(())
+        J = jnp.linalg.solve(eye - (1.0 - e) * F, e * sigma * gap.field(w) ** 4)
+        return gap.load(s_row * J - F @ J)
+
+    fem = jno.fem(
+        [
+            k0 * (ui.x * vi.x + ui.y * vi.y),
+            jno.Coupling(radiation, params=[eps]),
+            u(xh, yh) - T_hot,
+            u(xc, yc) - T_cold,
+        ]
+    )
+    assert fem._mode == "nonlinear"
+    # the coupling-only parameter reached the solve's runtime args -> it is a trainable input of fem.solve()
+    assert "eps" in fem.operator.runtime_parameter_exprs, "coupling param did not flow into the solve args"
+
+    op, nd = fem.operator, int(fem.dofs)
+
+    def coupled(eps_val):  # direct-solve Newton (penalty-Dirichlet stalls the matrix-free default)
+        res = lambda w: jnp.asarray(op.residual(w, {"eps": jnp.atleast_1d(eps_val)})).reshape(-1)  # noqa: E731
+
+        def _solve(fn, x0):
+            def body(s):
+                du = jnp.linalg.solve(jax.jacfwd(fn)(s[0]), -fn(s[0]))
+                return s[0] + du, jnp.linalg.norm(du), s[2] + 1
+
+            return jax.lax.while_loop(lambda s: (s[1] > 1e-9) & (s[2] < 60), body, (x0, jnp.array(1.0), 0))[0]
+
+        return jax.lax.custom_root(
+            res,
+            jnp.full((nd,), 0.5 * (T_hot + T_cold)),
+            _solve,
+            lambda g, y: jnp.linalg.solve(jax.jacfwd(g)(jnp.zeros_like(y)), y),
+        )
+
+    qoi = lambda e: (gap.field(coupled(e))[jnp.asarray(mi)]).mean()  # noqa: E731
+    g = float(jax.grad(qoi)(eps0))
+    fd = float((qoi(eps0 + 1e-3) - qoi(eps0 - 1e-3)) / 2e-3)
+    # more emissive inner wall radiates more across the gap -> cooler inner surface: grad must be real, < 0
+    assert np.isfinite(g) and g < -1e-6 and abs(g - fd) / (abs(fd) + 1e-8) < 3e-2, (
+        f"coupling-parameter grad through the solve {g:.3f} vs FD {fd:.3f}"
+    )
+
+
+def _newton_direct(res_fn, x0, steps=60, tol=1e-9):
+    """BYO direct-solve Newton (matrix-free default stalls on penalty-Dirichlet)."""
+    f = lambda x: jnp.asarray(res_fn(x)).reshape(-1)  # noqa: E731
+
+    def _solve(fn, y0):
+        def body(s):
+            du = jnp.linalg.solve(jax.jacfwd(fn)(s[0]), -fn(s[0]))
+            return s[0] + du, jnp.linalg.norm(du), s[2] + 1
+
+        return jax.lax.while_loop(lambda s: (s[1] > tol) & (s[2] < steps), body, (y0, jnp.array(1.0), 0))[0]
+
+    return jax.lax.custom_root(
+        f, jnp.asarray(x0).reshape(-1), _solve, lambda g, y: jnp.linalg.solve(jax.jacfwd(g)(jnp.zeros_like(y)), y)
+    )
+
+
+def test_radiation_coupling_targets_one_field_in_a_multifield_system():
+    """A coupling with ``field_key=`` acts on *one* field's DOF block. Build a two-scalar-field system --
+    field T (conduction + a gap-radiation coupling) and an independent Laplace field w -- and check the
+    coupling lands only in T's block: the multifield T-block reproduces the standalone coupled-radiation
+    solve, while the w-block reproduces its own radiation-free Laplace solve (the coupling did not leak)."""
+    pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
+    from shapely.geometry import Point
+
+    import jno
+
+    sigma = 5.670374419e-8
+    r0, r1, r2, r3 = 0.10, 0.20, 0.25, 0.35
+    k0, eps0, T_hot, T_cold, w_hot, w_cold = 20.0, 0.7, 1000.0, 300.0, 5.0, 1.0
+    ring = lambda a, b: Point(0, 0).buffer(b, 16).difference(Point(0, 0).buffer(a, 16))  # noqa: E731
+    d = jno.domain(ring(r0, r1).union(ring(r2, r3)), mesh_size=0.45)
+    rad = lambda x, y: jnp.hypot(x, y)  # noqa: E731
+    d.tag("hot", lambda x, y: jnp.abs(rad(x, y) - r0) < 4e-2)
+    d.tag("cold", lambda x, y: jnp.abs(rad(x, y) - r3) < 4e-2)
+    d.tag("inner_gap", lambda x, y: jnp.abs(rad(x, y) - r1) < 4e-2)
+    d.tag("outer_gap", lambda x, y: jnp.abs(rad(x, y) - r2) < 4e-2)
+    xi, yi, _ = d.variable("interior", split=True)
+    xh, yh, _ = d.variable("hot", split=True)
+    xc, yc, _ = d.variable("cold", split=True)
+    gap = d.enclosure(["inner_gap", "outer_gap"])
+    gap.check()
+    F = jnp.asarray(gap.view_factor)
+    eye, s_row = jnp.eye(gap.size), F.sum(axis=1)
+
+    def radiation(wT):  # net grey-body load on the T field's nodes (same code single- or multi-field)
+        Tk = gap.field(wT)
+        J = jnp.linalg.solve(eye - (1.0 - eps0) * F, eps0 * sigma * Tk**4)
+        return gap.load(s_row * J - F @ J)
+
+    # --- single-field references -----------------------------------------------------------------
+    T, sT = d.fem_symbols(names=("T", "sT"))
+    Ti, sTi = T.bind(x=xi, y=yi), sT.bind(x=xi, y=yi)
+    femT = jno.fem([k0 * (Ti.x * sTi.x + Ti.y * sTi.y), radiation, T(xh, yh) - T_hot, T(xc, yc) - T_cold])
+    T_ref = np.asarray(_newton_direct(lambda u: femT.operator.residual(u, {}), jnp.full((int(femT.dofs),), 650.0)))
+
+    w, sw = d.fem_symbols(names=("w", "sw"))
+    wi, swi = w.bind(x=xi, y=yi), sw.bind(x=xi, y=yi)
+    femW = jno.fem([wi.x * swi.x + wi.y * swi.y, w(xh, yh) - w_hot, w(xc, yc) - w_cold])
+    w_ref = np.asarray(femW.solve())  # linear, radiation-free
+
+    # --- the coupled two-field system: radiation targets the T block via field_key ---------------
+    Tkey = getattr(T, "field_key", None)
+    fem = jno.fem(
+        [
+            k0 * (Ti.x * sTi.x + Ti.y * sTi.y),
+            jno.Coupling(radiation, field_key=Tkey),  # only T's block
+            wi.x * swi.x + wi.y * swi.y,
+            T(xh, yh) - T_hot,
+            T(xc, yc) - T_cold,
+            w(xh, yh) - w_hot,
+            w(xc, yc) - w_cold,
+        ]
+    )
+    assert fem._mode == "nonlinear"
+    fk = list(getattr(d, "_fem_native_field_keys"))
+    offs = list(fem.offsets)
+    iT, iw = fk.index(Tkey), fk.index(getattr(w, "field_key", None))
+    nd = int(fem.dofs)
+    x0 = jnp.zeros((nd,)).at[offs[iT] : offs[iT + 1]].set(650.0).at[offs[iw] : offs[iw + 1]].set(3.0)
+    sol = np.asarray(_newton_direct(lambda u: fem.operator.residual(u, {}), x0))
+    T_blk = sol[offs[iT] : offs[iT + 1]]
+    w_blk = sol[offs[iw] : offs[iw + 1]]
+
+    # the coupling acted on T (matches the standalone coupled solve) and NOT on w (matches plain Laplace)
+    assert np.allclose(T_blk, T_ref, rtol=2e-3, atol=1.0), f"T block off coupled ref: max {np.abs(T_blk - T_ref).max():.2f}"
+    assert np.allclose(w_blk, w_ref, rtol=2e-3, atol=1e-3), (
+        f"w block perturbed by coupling: max {np.abs(w_blk - w_ref).max():.3e}"
+    )
+    # and the radiation genuinely did something to T (so the match above is not a no-op)
+    assert np.abs(T_blk - T_blk.mean()).max() > 50.0
+
+    # a field_key that names no field fails loud rather than silently mis-placing the load
+    with pytest.raises(ValueError, match="not among the fields"):
+        jno.fem(
+            [
+                k0 * (Ti.x * sTi.x + Ti.y * sTi.y),
+                jno.Coupling(radiation, field_key="nope"),
+                wi.x * swi.x + wi.y * swi.y,
+                T(xh, yh) - T_hot,
+                T(xc, yc) - T_cold,
+                w(xh, yh) - w_hot,
+                w(xc, yc) - w_cold,
+            ]
+        )
+
+
+def test_radiation_coupling_in_a_transient_solve_reaches_the_steady_coupled_state():
+    """A coupling enters each implicit time step (the transient block, linear here, is promoted to a
+    nonlinear backward-Euler block whose residual carries the coupling). The strongest check that this is
+    correct: a transient radiation-coupled heat solve, marched by the default fem.solve() integrator, must
+    relax to the *steady* radiation-coupled solution (at u_t -> 0 the step residual is exactly the steady
+    coupled residual). Validates that transient coupling runs end-to-end and is physically consistent."""
+    pytest.importorskip("shapely", reason="shapely required for PolygonDomain")
+    from shapely.geometry import Point
+
+    import jno
+
+    sigma = 5.670374419e-8
+    r0, r1, r2, r3 = 0.10, 0.20, 0.25, 0.35
+    k0, eps0, T_hot, T_cold = 20.0, 0.7, 1000.0, 300.0
+    ring = lambda a, b: Point(0, 0).buffer(b, 16).difference(Point(0, 0).buffer(a, 16))  # noqa: E731
+    d = jno.domain(ring(r0, r1).union(ring(r2, r3)), mesh_size=0.45, time=(0.0, 0.05, 26))
+    rad = lambda x, y: jnp.hypot(x, y)  # noqa: E731
+    d.tag("hot", lambda x, y: jnp.abs(rad(x, y) - r0) < 4e-2)
+    d.tag("cold", lambda x, y: jnp.abs(rad(x, y) - r3) < 4e-2)
+    d.tag("inner_gap", lambda x, y: jnp.abs(rad(x, y) - r1) < 4e-2)
+    d.tag("outer_gap", lambda x, y: jnp.abs(rad(x, y) - r2) < 4e-2)
+    xi, yi, ti = d.variable("interior", split=True)
+    xh, yh, _ = d.variable("hot", split=True)
+    xc, yc, _ = d.variable("cold", split=True)
+    ci = d.variable("initial", split=True)
+    gap = d.enclosure(["inner_gap", "outer_gap"])
+    gap.check()
+    F = jnp.asarray(gap.view_factor)
+    eye, s_row = jnp.eye(gap.size), F.sum(axis=1)
+
+    def radiation(wT):  # net grey-body load on the temperature nodes (identical steady or transient)
+        Tk = gap.field(wT)
+        J = jnp.linalg.solve(eye - (1.0 - eps0) * F, eps0 * sigma * Tk**4)
+        return gap.load(s_row * J - F @ J)
+
+    # steady coupled reference (no time derivative -> steady form), direct-solve Newton
+    Tr, sTr = d.fem_symbols(names=("Tr", "sTr"))
+    Tri, sTri = Tr.bind(x=xi, y=yi), sTr.bind(x=xi, y=yi)
+    femS = jno.fem([k0 * (Tri.x * sTri.x + Tri.y * sTri.y), radiation, Tr(xh, yh) - T_hot, Tr(xc, yc) - T_cold])
+    T_steady = np.asarray(_newton_direct(lambda u: femS.operator.residual(u, {}), jnp.full((int(femS.dofs),), 650.0)))
+
+    # transient coupled solve: mass term u_t*v + same conduction + same radiation coupling; IC at T_cold
+    T, sT = d.fem_symbols(names=("T", "sT"))
+    Ti, sTi = T.bind(x=xi, y=yi, t=ti), sT.bind(x=xi, y=yi, t=ti)
+    femT = jno.fem(
+        [
+            Ti.t * sTi + k0 * (Ti.x * sTi.x + Ti.y * sTi.y),
+            radiation,
+            T(xh, yh) - T_hot,
+            T(xc, yc) - T_cold,
+            T(ci[0], ci[1]) - T_cold,
+        ]
+    )
+    assert femT._mode == "transient", "the coupled block must stay a transient block"
+    # non-parametric transient solve() is a FunctionCall trace node; .fn() evaluates the trajectory
+    traj = np.asarray(femT.solve().fn())  # (n_save, n_dofs) from the default backward-Euler integrator
+    T_final = traj[-1]
+
+    # the marched solution left the cold initial state and relaxed onto the steady coupled solution
+    assert T_final.max() > T_cold + 100.0, "transient never heated up"
+    rel = np.abs(T_final - T_steady).max() / (np.abs(T_steady).max() + 1e-9)
+    assert rel < 2e-2, f"transient end state did not reach the steady coupled solution: rel {rel:.3f}"

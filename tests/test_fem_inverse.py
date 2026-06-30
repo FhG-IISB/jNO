@@ -555,3 +555,91 @@ def test_transient_field_parameter_recovers():
     assert rec.shape[0] == int(k_true.shape[0]), f"expected the full nodal field, got {rec.shape}"
     rel = float(np.linalg.norm(rec - np.asarray(k_true)) / np.linalg.norm(np.asarray(k_true)))
     assert rel < 0.1, f"transient field k(x) recovery rel_L2 {rel:.3e}"
+
+
+# --------------------------------------------------- coupled (multi-field) parametric transient
+# A runtime parameter inside a COUPLED nonlinear transient used to be rejected by
+# _assemble_multifield (NotImplementedError "parametric=True"); the native block already threads
+# scalar parameters through `args`, so the gate now lets the coupled case through.
+
+
+def _coupled_transient_fem(k, *, mesh_size=0.25, time=(0.0, 0.05, 6)):
+    """Two coupled fields u, w with a shared nonlinear reaction k*u*w -- a multi-field, nonlinear,
+    *parametric* transient (the case _assemble_multifield used to reject)."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size, time=time)
+    u, pu = d.fem_symbols(names=("u", "pu"))
+    w, pw = d.fem_symbols(names=("w", "pw"))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, pui = u.bind(x=xi, y=yi, t=ti), pu.bind(x=xi, y=yi, t=ti)
+    wi, pwi = w.bind(x=xi, y=yi, t=ti), pw.bind(x=xi, y=yi, t=ti)
+    u0 = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
+    return d, jno.fem(
+        [
+            ui.t * pui + (ui.x * pui.x + ui.y * pui.y) + k * ui * wi * pui,
+            wi.t * pwi + (wi.x * pwi.x + wi.y * pwi.y) + k * ui * wi * pwi,
+            u(xb, yb) - 0.0,
+            w(xb, yb) - 0.0,
+            u(ci[0], ci[1]) - u0,
+            w(ci[0], ci[1]) - u0,
+        ]
+    )
+
+
+def test_coupled_transient_parametric_recovers():
+    """Multi-field (u, w) NONLINEAR TRANSIENT with a runtime scalar parameter k -- the coupled case
+    _assemble_multifield used to reject with NotImplementedError. Regression: it now assembles
+    natively, and crux.solve differentiates through the coupled backward-Euler scan to recover k
+    from the joint (u, w) trajectory."""
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    k = jno.np.parameter((1,), name="k")
+    _, fem = _coupled_transient_fem(k)
+    assert fem.is_transient and not fem.operator.is_linear()
+    assert list(fem.operator.runtime_parameter_exprs) == ["k"]
+
+    u_obs = _default_transient_integrate(fem.operator, {"k": 1.0}, _grid_ts(fem.operator))  # truth at k=1
+    assert u_obs.ndim == 2 and not bool(jnp.isnan(u_obs).any())
+
+    k.dtype(jnp.float64)
+    k.initialize(jax.nn.initializers.constant(2.0))  # start far from truth = 1
+    k.optimizer(optax.adam(5e-2))
+    crux = jno.core([(fem.solve() - u_obs).mse], domain=_DUMMY)
+    crux.solve(250)
+    rec = float(np.asarray(crux.eval([k])).reshape(-1)[0])
+    assert abs(rec - 2.0) > 0.3, "k did not move -- gradient did not reach it through the coupled integrator"
+    assert abs(rec - 1.0) < TRANSIENT_TOL, f"coupled transient: recovered k={rec:.4f}"
+
+
+# ------------------------------------------------------------------- parameter naming ergonomics
+
+
+def test_unnamed_parameters_get_unique_names():
+    """Two unnamed jno.np.parameter() used to both default to the name 'value' and the assembler
+    rejected the form ("Multiple runtime parameter models use the name 'value'"). Each now gets a
+    unique id-based name, so several unnamed parameters coexist in one weak form."""
+    from jno.utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
+
+    a = jno.np.parameter((1,))
+    b = jno.np.parameter((1,))
+    na, nb = a.model._parameter_name, b.model._parameter_name
+    assert na and nb and na != nb, f"unnamed parameters collide: {na!r} == {nb!r}"
+
+    collected = _collect_runtime_parameter_exprs(a * b)  # a tree containing both -> no collision raise
+    assert sorted(collected) == sorted([na, nb])
+
+
+def test_name_method_sets_parameter_identity():
+    """`.name(label)` on a parameter sets its *solver identity* (_parameter_name), not just a log
+    label -- so jno.np.parameter((1,)).name('k') is equivalent to jno.np.parameter((1,), name='k').
+    On a non-parameter expression `.name()` stays a pure label and must not grow _parameter_name."""
+    from jno.utils.solver.parametric_helpers import _parameter_name
+
+    p = jno.np.parameter((1,)).name("kappa")
+    assert p.model._parameter_name == "kappa"
+    assert _parameter_name(p) == "kappa"
+
+    labelled = (p * 2.0).name("loss")  # a BinaryOp, not a parameter node
+    assert getattr(labelled, "_user_name", None) == "loss"
+    assert not hasattr(labelled, "_parameter_name")

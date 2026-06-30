@@ -47,6 +47,7 @@ k.optimizer(optax.chain(                                 # compose with optax di
 
 | Optimizer | What it is | Reference |
 |---|---|---|
+| `engd()` | Energy Natural Gradient Descent — preconditions with the inverse energy Gram matrix G⁻¹; auto-detects `gram_terms`; compatible with `line_search=True` | Müller & Zeinhofer, *Achieving High Accuracy with PINNs via Energy Natural Gradient Descent*, ICML 2023, arXiv:2302.13163 |
 | `ssbroyden()` / `ssbfgs()` | Self-Scaled Broyden / BFGS quasi-Newton with a zoom line search — strong on smooth PINN / inverse losses | Urbán, Stefanou & Pons, *Unveiling the optimization process of PINNs*, J. Comput. Phys. **523** (2025) 113656 |
 | `soap()` / `scale_by_soap()` | SOAP — Shampoo with Adam in the preconditioner's eigenbasis | Vyas et al., *SOAP: Improving and Stabilizing Shampoo using Adam* (2024), arXiv:2409.11321 |
 | `md()` / `md_decouple()` | Magnitude–Direction Decoupling — a **generic wrapper** that factorizes each weight matrix `W = diag(γ_row) Ŵ diag(γ_col)` into a fixed-norm direction `Ŵ` + learnable per-row/column gains, stepping any optax base optimizer on the direction; removes weight decay / warmup and transfers the LR across width | Hägele, Hernández-Cano, Kosson & Jaggi, *Improving Neural Network Training by Decoupling the Magnitude and Direction of Weight Vectors* (2026), arXiv:2606.25971, Algorithm 2 |
