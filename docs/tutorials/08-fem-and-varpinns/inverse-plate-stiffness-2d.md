@@ -1,15 +1,15 @@
-# Inverse Plate Stiffness — recover a spatially-varying $k(x)$ from a deflection
+# Inverse Plate Stiffness — imaging hidden defects from a deflection
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/08_fem_and_varpinns/inverse_plate_stiffness_2d.py" download>Download .py</a>
 <a class="md-button" href="/jNO/tutorials/08-fem-and-varpinns/">Back to chapter</a>
 </div>
 
-A plate with a hidden defect — a locally stiffer or thinner region — has a spatially varying flexural
+A plate with hidden flaws — a stiff inclusion here, a soft void there — has a spatially varying flexural
 rigidity $k(x)$. Its deflection under a known load obeys $k(x)\,\Delta^2 w = q$. The **inverse** problem: given
-a *measured* deflection $w$, recover the field $k(x)$. This is a genuinely 4th-order field-inversion, and it is
-well posed here: under a uniform load, $\Delta^2 w = q/k > 0$ everywhere, so the deflection is sensitive to $k$
-at every point in the domain.
+only a *measured* deflection $w$, recover the field $k(x)$ and so **locate the defects**. This is a genuinely
+4th-order field-inversion, well posed under a uniform load ($\Delta^2 w = q/k > 0$ everywhere, so the
+deflection is sensitive to $k$ at every point).
 
 It exercises the deepest capabilities of the C¹ stack *together*:
 
@@ -28,27 +28,27 @@ fem = jno.fem([k * (laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi])) - q * vi,
 
 # recover k(x) end-to-end through crux, from a flat wrong guess k = 1
 crux = jno.core([(fem.solve(solver) - w_obs).mse], domain=_DUMMY)
-crux.solve(350)
+crux.solve(200)
 ```
 
 ## Recovery
 
-We plant a stiffer central patch $k^\ast(x) = 1 + 0.6\sin(\pi x)\sin(\pi y)$, generate the clamped-plate
-deflection under a uniform load $q=1$, then hand only that deflection to `crux`, starting from a flat guess
-$k = 1$:
+We plant two Gaussian defects — a **stiff inclusion** ($k>1$) and a **soft void** ($k<1$) at different corners
+— generate the clamped-plate deflection under a uniform load $q=1$, then hand only that deflection to `crux`,
+starting from a flat $k=1$:
 
 ```
-Inverse plate stiffness (Argyris C¹ + P1 field parameter):
-  mesh nodes = 30   recovered k(x) rel-L² error: 2.265e-02
-  k* range [1.000, 1.586]   recovered [0.925, 1.585]
+Inverse plate stiffness — two hidden defects (Argyris C¹ + P1 field parameter):
+  mesh nodes = 118   recovered k(x) rel-L² error: 3.713e-02
+  k* range [0.575, 1.587]   recovered [0.580, 1.569]
 ```
 
-![True k*(x) vs recovered k(x): the stiffer central patch is reconstructed from the deflection to ~2% relative L² error.](/jNO/assets/inverse_plate_stiffness_2d.png)
+![True k*(x) (a red stiff inclusion and a blue soft void), the recovered field reproducing both, and the pointwise recovery error — all on a refined mesh.](/jNO/assets/inverse_plate_stiffness_2d.png)
 
-The hidden stiffness field is recovered to $\sim 2\%$ relative $L^2$ error — the central stiff patch and its
-peak magnitude both come back (recovered max $1.585$ vs. true $1.586$) — in a few seconds. The forward solve
-being a *conforming* $C^1$ biharmonic is what makes the sensitivity of $w$ to $k$ clean enough to invert; the
-same differentiable-solve machinery underlies the [inverse diffusivity](inverse-diffusivity-field.md) and
+Both hidden defects are recovered to $\sim 4\%$ relative $L^2$ error — the stiff inclusion *and* the soft
+void come back at the right locations and magnitudes — from the deflection alone. The forward solve being a
+*conforming* $C^1$ biharmonic is what makes the sensitivity of $w$ to $k$ clean enough to invert; the same
+differentiable-solve machinery underlies the [inverse diffusivity](inverse-diffusivity-field.md) and
 [transient inverse](transient-inverse-heat.md) tutorials, here lifted to a 4th-order operator and a field
 parameter that lives on a different element than the trial.
 
