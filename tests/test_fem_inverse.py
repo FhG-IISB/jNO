@@ -187,6 +187,70 @@ def _hermite_transient_fem(alpha, mesh_size=0.3):
     return jno.fem([weak, u(xb, yb) - 0.0, u(ci[0], ci[1]) - psi0])
 
 
+def test_argyris_field_parameter_operator_matches_coordinate_coeff():
+    """A P1 **field** parameter ``k(x)`` on an Argyris biharmonic (``k·Δu·Δv``): the coefficient is a P1
+    field independent of the C¹ trial, gathered at the mesh vertices and interpolated with P1 shape
+    functions. For a *linear* ``k`` the P1 interpolation is exact, so the field-parameter operator must
+    equal the operator built from the same coordinate-function coefficient — the definitive check that the
+    gather / node-order / interpolation on the non-nodal element is correct."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.35)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    lap = jno.np.laplacian
+    f = 48.0 + 0.0 * xi
+    g = xb**4 + yb**4
+
+    kf, _ = d.fem_symbols()  # a P1 coefficient field, independent of the Argyris trial
+    k = jno.np.parameter(kf, name="k")
+    assert getattr(k.model, "_fem_field", None) == "node"
+    u, phi = d.fem_symbols(space="Argyris")
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    fem = jno.fem([k * (lap(ui, [xi, yi]) * lap(vi, [xi, yi])) - f * vi, u(xb, yb) - g])
+    assert fem.is_linear and list(fem.operator.runtime_parameter_exprs) == ["k"]
+
+    nodes = np.asarray(d.built_mesh.points)[:, :2]
+    k_true = jnp.asarray(0.6 + 0.8 * nodes[:, 0] + 0.5 * nodes[:, 1])  # smooth, positive, LINEAR
+
+    u2, p2 = d.fem_symbols(space="Argyris")
+    ux, vx = u2.bind(x=xi, y=yi), p2.bind(x=xi, y=yi)
+    fem_ref = jno.fem([(0.6 + 0.8 * xi + 0.5 * yi) * (lap(ux, [xi, yi]) * lap(vx, [xi, yi])) - f * vx, u2(xb, yb) - g])
+    dense = lambda A: np.asarray(A.todense() if hasattr(A, "todense") else A)  # noqa: E731
+    A_field, _b = fem.operator.evaluate({"k": k_true})
+    assert np.max(np.abs(dense(A_field) - dense(fem_ref.A))) < 1e-8, "P1 field-param interpolation/gather mismatch"
+
+
+def test_hermite_field_parameter_recovers():
+    """A **field** inverse: recover a spatially-varying coefficient ``k(x)`` in ``-∇·(k∇u) = f`` on a Hermite
+    field, end-to-end through ``crux.solve``. Validates the gradient to the full P1 nodal field through the
+    non-nodal parametric solve (Poisson-like, so well-posed from full-field data — no regularization needed)."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    kf, _ = d.fem_symbols()
+    k = jno.np.parameter(kf, name="k")
+    u, phi = d.fem_symbols(space="Hermite")
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = 2.0 * (xi * (1.0 - xi) + yi * (1.0 - yi))
+    fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
+    assert fem.is_linear and list(fem.operator.runtime_parameter_exprs) == ["k"]
+
+    nodes = np.asarray(d.built_mesh.points)[:, :2]
+    k_true = jnp.asarray(0.6 + 0.8 * nodes[:, 0] + 0.5 * nodes[:, 1])
+    dense = lambda A: A.todense() if hasattr(A, "todense") else A  # noqa: E731
+    A_t, b = fem.operator.evaluate({"k": k_true})
+    u_obs = jnp.linalg.solve(jnp.asarray(dense(A_t)), jnp.asarray(b).reshape(-1))
+
+    k.dtype(jnp.float64)
+    k.initialize(jax.nn.initializers.constant(1.0))
+    k.optimizer(optax.adam(2e-2))
+    solver = lambda A, b: jnp.linalg.solve(jnp.asarray(dense(A)), jnp.asarray(b).reshape(-1))  # noqa: E731
+    crux = jno.core([(fem.solve(solver) - u_obs).mse], domain=_DUMMY)
+    crux.solve(400)
+    rec = np.asarray(crux.eval([k])).reshape(-1)
+    rel = float(np.linalg.norm(rec - np.asarray(k_true)) / np.linalg.norm(np.asarray(k_true)))
+    assert rel < 0.05, f"field parameter k(x) not recovered: rel {rel:.3e}"
+
+
 def test_hermite_transient_inverse_recovers_scalar():
     """A **transient** inverse: recover the diffusivity ``alpha`` from a decay trajectory through the
     non-nodal *parametric time block* — the operator ``A(alpha)`` is re-assembled each step and stays

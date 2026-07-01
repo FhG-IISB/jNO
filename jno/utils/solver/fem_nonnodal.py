@@ -160,22 +160,19 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
             "(A Hermite field DOES take a nodal value Dirichlet u(region) - g.)"
         )
 
-    # --- runtime parameters (inverse problems): collect the parameter name->expr map so the STEADY
-    # assembler can return a *parametric* FemLinearSystem / FemResidualOperator whose operator is
-    # re-assembled at each args and stays differentiable in the parameter (mirrors the native path). The
-    # non-nodal path supports SCALAR parameters only; a nodal field parameter k(x) needs the field's shape
-    # interpolation and is not wired here. ---
+    # --- runtime parameters (inverse problems): collect the parameter name->expr map so the assembler can
+    # return a *parametric* FemLinearSystem / FemResidualOperator / time block whose operator is re-assembled
+    # at each args and stays differentiable in the parameter (mirrors the native path). Both SCALAR parameters
+    # and a spatially-varying **P1 field** parameter k(x) are supported: a field parameter is gathered at the
+    # mesh vertices (`cells[c]`) and interpolated with P1 shape functions at the quad points -- independent of
+    # the non-nodal trial's own DOF layout (the parameter carries its own P1 field via ``_fem_field_domain``). ---
     from .parametric_helpers import _collect_runtime_parameter_exprs, _is_fem_field_parameter
 
     _rt_param_exprs: dict = {}
     for bare in volume_terms:
         _collect_runtime_parameter_exprs(bare, _rt_param_exprs)
     runtime_parameter_tags: Tuple[str, ...] = tuple(sorted(_rt_param_exprs))
-    if any(_is_fem_field_parameter(e) for e in _rt_param_exprs.values()):
-        raise NotImplementedError(
-            "jno.fem (non-nodal): a FEM field parameter k(x) is not supported on non-nodal elements; "
-            "use a scalar runtime parameter for the inverse problem."
-        )
+    _field_param_names = frozenset(n for n, e in _rt_param_exprs.items() if _is_fem_field_parameter(e))
     # A parameter in a boundary (Neumann/Robin) term would silently bake to a constant: the natural-BC load
     # is assembled once, non-differentiably (`_apply_natural_boundary_terms`). Reject it rather than mislead.
     _bdry_param_exprs: dict = {}
@@ -235,6 +232,9 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
     qp, qw = jnp.asarray(ref_spec.quad_points), jnp.asarray(ref_spec.quad_weights)
     n_quad = int(qw.shape[0])
     ctx = getattr(domain, "context", {}) or {}
+    # P1 (linear) shape functions at the quad points -- used ONLY to interpolate a P1 field parameter k(x)
+    # (its 3 mesh-vertex values per cell), independent of the trial element's own basis.
+    p1_shape_vals = jnp.stack([1.0 - qp[:, 0] - qp[:, 1], qp[:, 0], qp[:, 1]], axis=1) if _field_param_names else None
 
     # Edge topology: edge families (RT/N1E) need it for their edge DOFs; Argyris needs it for the global id +
     # orientation of its edge-normal DOFs (Hermite, pure-vertex, does not).
@@ -365,20 +365,28 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
 
         def residual(u_flat, args=None):
             u_blocks = [u_flat[offs[i] : offs[i + 1]] for i in range(len(fields))]
-            # Pack each scalar runtime parameter into volume_vars (steady: no temporal prefix), so the shared
-            # evaluator resolves it via `_runtime_parameter_value_from_internal_vars`. Cell-independent, so it
-            # is a closed-over constant across the vmap. A parameter absent from `args` (e.g. a non-parametric
-            # assembly) packs a zero placeholder; empty when the form has no runtime parameter.
+            # Pack each runtime parameter into volume_vars (steady: no temporal prefix), so the shared evaluator
+            # resolves it via `_runtime_parameter_value_from_internal_vars`. A SCALAR parameter is a single
+            # cell-independent `(1,)` value; a P1 FIELD parameter k(x) is this cell's 3 mesh-vertex values
+            # (gathered at `cells_j[c]`), which the evaluator interpolates with the P1 `shape_vals` supplied in
+            # `local`. A parameter absent from `args` packs a zero placeholder (right width per kind).
             _a = args or {}
-            rt_vars = tuple(
-                jnp.reshape(jnp.asarray(_a.get(name, 0.0), dtype=u_flat.dtype), (-1,))[:1]
+            _zero_field = jnp.zeros((n_verts,), dtype=u_flat.dtype)
+            rt_scalar = {
+                name: jnp.reshape(jnp.asarray(_a.get(name, 0.0), dtype=u_flat.dtype), (-1,))[:1]
                 for name in runtime_parameter_tags
-            )
+                if name not in _field_param_names
+            }
+            field_vals = {name: jnp.asarray(_a.get(name, _zero_field), dtype=u_flat.dtype) for name in _field_param_names}
             R = jnp.zeros(total, dtype=u_flat.dtype)
             for coeff, tfi in typed:
 
-                def _cell(c, e=coeff, _rt=rt_vars):
+                def _cell(c, e=coeff, _sc=rt_scalar, _fv=field_vals):
                     per, xq, meas = _cell_fields(c, u_blocks)
+                    vol_vars = tuple(
+                        (_fv[name][cells_j[c]] if name in _field_param_names else _sc[name])  # field: 3 vertex values
+                        for name in runtime_parameter_tags
+                    )
                     local = {
                         "physical_quad_points": xq,
                         "fields": per,
@@ -388,8 +396,10 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
                         "domain_context": ctx,
                         "temporal_tags": (),
                         "runtime_parameter_tags": runtime_parameter_tags,
-                        "volume_vars": _rt,
+                        "volume_vars": vol_vars,
                     }
+                    if _field_param_names:  # P1 basis to interpolate a field parameter (top-level, param-only key)
+                        local["shape_vals"] = p1_shape_vals
                     return _integrate_term(domain, e, local, qw * meas)  # (ndof of the test field,)
 
                 elem = jax.vmap(_cell)(jnp.arange(n_cells))  # (n_cells, ndof_tfi)
@@ -671,7 +681,9 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
                 A, b = _apply_dirichlet_symmetric(jnp.asarray(A), jnp.asarray(b), pins)
             return A, b
 
-        a0, b0 = _assemble_at({n: 0.0 for n in runtime_parameter_tags})  # static placeholder for `.A` / `.b`
+        # static placeholder for `.A` / `.b` (right width per parameter kind: a field param is (n_verts,))
+        _ph = {n: (jnp.zeros((n_verts,)) if n in _field_param_names else 0.0) for n in runtime_parameter_tags}
+        a0, b0 = _assemble_at(_ph)
         return (
             FemLinearSystem(
                 a0,
