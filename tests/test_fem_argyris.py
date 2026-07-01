@@ -286,3 +286,56 @@ def test_argyris_transient_biharmonic_dissipates():
     # monotone non-increasing energy (allow a tiny numerical slack), and genuine decay from the IC
     assert np.all(np.diff(norms) < 1e-9), f"biharmonic heat flow energy must dissipate, got {norms}"
     assert norms[-1] < 0.999 * norms[0], f"transient did not evolve/decay: {norms[0]:.3e} -> {norms[-1]:.3e}"
+
+
+def test_argyris_dynamic_plate_conserves_energy():
+    """Argyris + **second-order-in-time** (a vibrating Kirchhoff plate): ``w_tt + Δ²w = 0``, clamped, released
+    from rest. The augmented [w, v] block integrates by the trapezoidal (Newmark average-acceleration) rule,
+    which conserves energy for the undamped system — so the discrete energy ``E = ½(vᵀM₂v + wᵀKw)`` stays
+    constant. This is the BC-robust check (a manufactured solution would expose the clamped-BC over-pinning);
+    it validates the non-nodal ``u_tt`` (dynamic plate) path, previously nodal-Lagrange only."""
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.24, time=(0.0, 0.03, 13))
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    u, phi = d.fem_symbols(space="Argyris")
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    w0 = (jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])) ** 2  # a clamped initial deflection, at rest
+    fem = jno.fem([ui.tt * vi + laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi]), u(xb, yb) - 0.0, u(ci[0], ci[1]) - w0])
+    assert fem.is_transient, "a w_tt + Δ²w form must build a (second-order) transient problem"
+
+    def direct_theta(block, args, save_ts):
+        """Trapezoidal θ-method with a DENSE DIRECT solve (the h⁻⁴-conditioned biharmonic defeats the
+        default matrix-free Krylov step, just like Cahn–Hilliard). Factors (M + θΔt A) once."""
+        import jax.numpy as jnp
+        from jax import lax
+
+        M = jnp.asarray(block.M.todense() if hasattr(block.M, "todense") else block.M)
+        A = jnp.asarray(block.A.todense() if hasattr(block.A, "todense") else block.A)
+        c = jnp.zeros((M.shape[0],)) if block.affine_bias is None else jnp.asarray(block.affine_bias).reshape(-1)
+        th, dt = float(block.metadata.get("theta", 1.0)), float(block.dt)
+        lhs, rhs_mat = M + th * dt * A, M - (1.0 - th) * dt * A
+        grid = jnp.asarray(save_ts)
+
+        def step(y, _t):
+            yn = jnp.linalg.solve(lhs, rhs_mat @ y + dt * c)
+            return yn, yn
+
+        _, ys = lax.scan(step, jnp.asarray(block.state0).reshape(-1), grid[1:])
+        return ys
+
+    traj = _eval(fem.solve(direct_theta))  # (n_steps, 2N), state = [w; v]
+
+    # raw mass M₂ and biharmonic stiffness K (fresh space-only symbols) for the discrete energy
+    u2, p2 = d.fem_symbols(space="Argyris")
+    ux, vx = u2.bind(x=xi, y=yi), p2.bind(x=xi, y=yi)
+    M2 = _dense(jno.fem([ux * vx]).A)
+    K = _dense(jno.fem([laplacian(ux, [xi, yi]) * laplacian(vx, [xi, yi])]).A)
+    n = M2.shape[0]
+    assert traj.shape[1] == 2 * n, "second-order state must be the augmented [w; v] of size 2N"
+    w, v = traj[:, :n], traj[:, n:]
+    E = 0.5 * (np.einsum("ki,ij,kj->k", v, M2, v) + np.einsum("ki,ij,kj->k", w, K, w))
+    assert np.all(np.isfinite(E)) and E[0] > 0, "plate energy must be finite and positive"
+    drift = float(np.max(np.abs(E - E[0])) / E[0])
+    assert drift < 1e-3, f"undamped plate energy must be conserved (trapezoidal): drift {drift:.3e}, E={E}"
+    assert float(np.max(np.abs(v))) > 1e-6, "the plate must actually vibrate (nonzero velocity)"

@@ -1823,7 +1823,10 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     # before the 1D / non-nodal / multifield branches, with explicit fail-loud scope guards.
     from .utils.solver.solver_helper import max_temporal_derivative_order as _max_temporal_order
 
-    if any(_max_temporal_order(_bare(c)) >= 2 for c in constraints):
+    # Lagrange u_tt -> the native augmented [u, v] block here. A NON-NODAL (Argyris/Hermite) u_tt is NOT
+    # intercepted: it falls through to the non-nodal branch below, which builds the same augmented block from
+    # its own push-forward assembly / pins / IC-projection (so the C¹ element gets dynamic plates too).
+    if any(_max_temporal_order(_bare(c)) >= 2 for c in constraints) and not (_trial_spaces(constraints) - {"Lagrange"}):
         if periodic_ties:
             raise NotImplementedError("jno.fem: periodic ties on a second-order-in-time problem are not supported yet.")
         if getattr(domain, "dimension", None) == 1:
@@ -1836,8 +1839,6 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
                 "jno.fem: second-order-in-time (u_tt) is single-field only for now; write the coupled "
                 "problem as a first-order system (one velocity field per second-order field)."
             )
-        if _trial_spaces(constraints) - {"Lagrange"}:
-            raise NotImplementedError("jno.fem: second-order-in-time (u_tt) is supported on nodal Lagrange elements only.")
         if any(isinstance(n, RegionMask) for b in volume_terms for n in _walk(b)):
             raise NotImplementedError(
                 "jno.fem per-region integration on a second-order-in-time problem is not wired yet — "

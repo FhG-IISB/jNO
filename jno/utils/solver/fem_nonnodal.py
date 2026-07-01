@@ -426,6 +426,7 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
         from ..._fem import _bare, _essential_spec, _eval_value_node_at, _field_key_of
         from .backend_blocks import SemidiscreteTimeBlock
         from .fem_1d import _apply_dirichlet_transient
+        from .solver_helper import max_temporal_derivative_order as _mto
         from .time_route import _infer_time_window, _strip_temporal_trial_derivative
 
         sub = [_apply_sign(domain, s, t) for bare in volume_terms for s, t in _split_additive_terms(domain, bare)]
@@ -433,6 +434,87 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
         spatial = [t for t in sub if not _contains_temporal_derivative(t)]
         if not temporal:
             raise ValueError("jno.fem (non-nodal): a transient weak form must contain a temporal term, e.g. inner(u.t, v).")
+
+        # === second-order-in-time (u_tt): the augmented first-order block y = [u; v], v = u̇, integrated by
+        #     the trapezoidal (θ=½, energy-conserving) rule — the non-nodal analogue of the native
+        #     _assemble_second_order_time, reusing this path's push-forward mass / pins / IC-projection. ===
+        if max((_mto(t) for t in temporal), default=1) >= 2:
+            if runtime_parameter_tags:
+                raise NotImplementedError(
+                    "jno.fem (non-nodal): a runtime parameter in a second-order-in-time form is not supported."
+                )
+            if len(fields) > 1:
+                raise NotImplementedError("jno.fem (non-nodal): second-order-in-time (u_tt) is single-field only.")
+
+            def _strip_n(t, k):
+                for _ in range(k):
+                    t = _strip_temporal_trial_derivative(t)
+                return t
+
+            M2 = jax.jacfwd(_make_residual([_strip_n(t, 2) for t in temporal if _mto(t) >= 2]))(zeros)  # ∫ü·v ⇒ mass
+            damp = [_strip_n(t, 1) for t in temporal if _mto(t) == 1]  # ∫u̇·v ⇒ damping (optional)
+            Cmat = jax.jacfwd(_make_residual(damp))(zeros) if damp else jnp.zeros((total, total), zeros.dtype)
+            spatial_res2 = _make_residual(spatial)
+            K = jax.jacfwd(spatial_res2)(zeros)  # spatial operator (stiffness)
+            F = -spatial_res2(zeros) + nat_load  # load (natural BC folded in)
+            n = total
+            Z = jnp.zeros((n, n), zeros.dtype)
+            M_aug = jnp.block([[M2, Z], [Z, M2]])
+            A_aug = jnp.block([[Z, -M2], [K, Cmat]])  # M2 u̇ = M2 v ; M2 v̇ + C v + K u = F
+            c_aug = jnp.concatenate([jnp.zeros((n,), zeros.dtype), F])
+            if pins:  # essential BC on the augmented rows: u[d] = g (constant) and v[d] = 0
+                dd = jnp.asarray([p[0] for p in pins], dtype=jnp.int32)
+                dg = jnp.asarray([p[1] for p in pins], dtype=zeros.dtype)
+                M_aug = M_aug.at[dd, :].set(0.0).at[dd + n, :].set(0.0)
+                A_aug = A_aug.at[dd, :].set(0.0).at[dd, dd].set(1.0).at[dd + n, :].set(0.0).at[dd + n, dd + n].set(1.0)
+                c_aug = c_aug.at[dd].set(dg).at[dd + n].set(0.0)
+
+            def _project_onto(u0_node):  # L²-project a value node onto the field DOFs via the mass block M2
+                u0_blocks = [jnp.zeros(offs[i + 1] - offs[i]) for i in range(len(fields))]
+
+                def _ic_cell(cidx):
+                    per, xq, meas = _cell_fields(cidx, u0_blocks)
+                    u0 = jnp.asarray(_eval_value_node_at(u0_node, xq)).reshape(n_quad)
+                    return jnp.einsum("q,qn,q->n", qw * meas, per[0]["shape_vals"], u0)
+
+                loc = (cdofs[0] - offs[0]).reshape(-1)
+                load = jnp.zeros((total,), zeros.dtype).at[loc].add(jax.vmap(_ic_cell)(jnp.arange(n_cells)).reshape(-1))
+                return jnp.linalg.solve(M2, load)
+
+            u0_dofs = jnp.zeros((n,), zeros.dtype)
+            v0_dofs = jnp.zeros((n,), zeros.dtype)  # start from rest unless a velocity IC u̇(0)=v0 is given
+            for ic in ic_residuals:
+                _c, u0_node = _essential_spec(_bare(ic))
+                proj = _project_onto(u0_node)
+                if _mto(_bare(ic)) >= 1:
+                    v0_dofs = proj
+                else:
+                    u0_dofs = proj
+            if pins:  # make the initial state consistent with the essential BC (u[d]=g, v[d]=0)
+                _pd = jnp.asarray([p[0] for p in pins], dtype=jnp.int32)
+                u0_dofs = u0_dofs.at[_pd].set(jnp.asarray([p[1] for p in pins], dtype=zeros.dtype))
+                v0_dofs = v0_dofs.at[_pd].set(0.0)
+            t0, t1, dt = _infer_time_window(domain)
+            return (
+                SemidiscreteTimeBlock(
+                    backend="transient",
+                    mode="implicit",
+                    time_order=2,
+                    spatial_kind="weak_form",
+                    M=M_aug,
+                    A=A_aug,
+                    affine_bias=c_aug,
+                    state0=jnp.concatenate([u0_dofs, v0_dofs]),
+                    t0=t0,
+                    t1=t1,
+                    dt=dt,
+                    eval_context=getattr(domain, "_fem_eval_context", {}) or {},
+                    metadata={"theta": 0.5, "second_order": True},
+                ),
+                "transient",
+                [0, n, 2 * n],
+            )
+
         M = jax.jacfwd(_make_residual([_strip_temporal_trial_derivative(t) for t in temporal]))(zeros)  # block mass
         spatial_res = _make_residual(spatial)
         t0, t1, dt = _infer_time_window(domain)

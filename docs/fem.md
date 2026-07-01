@@ -97,15 +97,17 @@ no term.
 > (Newton), and transient `M u̇ + A u = c` (including nonlinear-transient and the mixed/saddle **DAE**,
 > e.g. transient Darcy); and the differentiable `fem.solve()` for inverse problems.
 >
-> **Supported inverse:** a **steady** inverse problem with a **scalar** runtime parameter in a *volume*
-> term is wired (`fem.solve()` returns a differentiable `FemLinearSystem` / `FemResidualOperator` that
-> re-assembles at each parameter value — so `crux.solve` recovers e.g. a plate stiffness from a deflection).
+> **Supported inverse:** a **scalar** runtime parameter in a *volume* term is wired for **steady and
+> transient** problems (`fem.solve()` returns a differentiable `FemLinearSystem` / `FemResidualOperator` /
+> parametric time block that re-assembles at each parameter value — so `crux.solve` recovers e.g. a plate
+> stiffness from a deflection or a diffusivity from a trajectory). **Second-order-in-time (`u_tt`, a
+> vibrating plate) is supported** on the vertex families too (the augmented `[w, v]` block; a direct θ-solver
+> is recommended for the stiff biharmonic).
 >
 > **Not yet / excluded:** 3-D (the zoo is 2-D only — 3-D uses nodal Lagrange); higher order (lowest
 > RT₀ / N1E₀ only); other families (BDM, second-kind Nédélec, Bell); quad / non-triangular
-> meshes; second-order-in-time (`u_tt`) for the vertex families (nodal Lagrange only); a **transient**
-> inverse, a **field** parameter `k(x)`, or a parameter in a **boundary** term through the non-nodal path
-> (all rejected with a clear error); and a constraint-consistent *algebraic* initial state at `t0` in the
+> meshes; a **field** parameter `k(x)` or a parameter in a **boundary** term through the non-nodal path
+> (both rejected with a clear error); and a constraint-consistent *algebraic* initial state at `t0` in the
 > saddle-DAE transient (the differential field and all `t > 0` values are correct; only the reported `t0`
 > algebraic value is). The **C¹ Argyris** element IS supported (below).
 
@@ -145,10 +147,12 @@ problems whose natural space is *not* H¹. Pick one with the `space=` knob on `f
 > the boundary `∂²u/∂n²` free) is not yet expressible. Composes with the steady, transient and nonlinear
 > `fem.solve()` paths (see
 > `tests/test_fem_argyris.py`: exact biharmonic recovery on an unstructured mesh, convergence, nonlinear
-> `Δ²u + u³ = f`, and the dissipative biharmonic heat flow). A **steady inverse** problem also works — a
-> scalar coefficient in a volume term (e.g. plate stiffness in `α·Δ²u = f`) is recovered by `crux.solve`
-> (`tests/test_fem_inverse.py`). *Not yet:* `u_tt` (second-order-in-time) and *transient* inverse route
-> through the nodal path, which the non-nodal transient assembler is not (both raise a clear error).
+> `Δ²u + u³ = f`, the dissipative biharmonic heat flow, and a **vibrating clamped plate** `w_tt + Δ²w = 0`
+> (the augmented `[w, v]` block, energy-conserving trapezoidal integration — a direct θ-solver for the stiff
+> biharmonic). **Inverse** problems work too — a scalar coefficient in a volume term (plate stiffness in
+> `α·Δ²u = f`, a diffusivity in a transient flow) is recovered by `crux.solve` (`tests/test_fem_inverse.py`),
+> for both steady and transient forms. *Not yet:* a spatially-varying **field** parameter `k(x)` on a
+> non-nodal trial (raises a clear error).
 
 ```python
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")   # H(div) flux
