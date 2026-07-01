@@ -55,6 +55,9 @@ error estimate at ~455 DOFs than a uniform mesh at ~828 DOFs.
 - **The re-entrant corner is pinned** during remeshing (mmg `set_corners`), so the singularity stays
   put and the benchmark is honest.
 - **Scalar P1 only** for now — the estimator asserts one DOF per vertex.
+- **Knowing when to stop:** `AdaptSpec` takes `tol` (stop once the error estimate falls
+  below it), `max_dofs` / `max_iters` (budget caps), and `eps` (stop once the estimate stops
+  improving between rounds) — so the loop refines only until the solution is *good enough*.
 
 ## Full script
 

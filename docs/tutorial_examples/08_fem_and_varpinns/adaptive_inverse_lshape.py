@@ -132,8 +132,15 @@ def run_adaptive(mesh_size=0.2, n_rounds=6, n_opt=250):
         )
         return v
 
+    # eps stops the loop once the recovered kappa stops moving between rounds (with a
+    # patience of 2, so a single flat step does not stop it early); max_iters is the budget
+    # cap. Whichever fires first ends the "refine until the design is good enough" loop.
     hist = run_adaptive_inverse(
-        d, build_inverse, AdaptSpec(theta=0.6, max_iters=n_rounds, refine_factor=1.6), n_opt=n_opt, readout=readout
+        d,
+        build_inverse,
+        AdaptSpec(theta=0.6, max_iters=n_rounds, refine_factor=1.6, eps=0.01),
+        n_opt=n_opt,
+        readout=readout,
     )
     return snaps, hist
 

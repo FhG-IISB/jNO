@@ -350,6 +350,15 @@ class AdaptSpec:
         Stop early once the global error estimate falls below this (optional).
     max_dofs
         Stop once the mesh vertex count reaches this budget (optional).
+    eps
+        Relative-change convergence tolerance: stop once the round's figure of merit
+        stops changing by more than ``eps`` between successive rounds (optional). The
+        figure of merit is the ZZ estimate for the forward driver
+        (:func:`run_adaptive_solve`) and the recovered parameter for the inverse driver
+        (:func:`run_adaptive_inverse`). A **plateau detector** ("the answer has stopped
+        moving as I refine"), not a certified error bound -- the lever for more accuracy
+        is the ``max_dofs`` / ``max_iters`` budget. Requires two consecutive rounds under
+        ``eps`` (patience) so a single flat step does not stop the loop prematurely.
     """
 
     theta: float = 0.5
@@ -357,6 +366,22 @@ class AdaptSpec:
     refine_factor: float = 2.0
     tol: float | None = None
     max_dofs: int | None = None
+    eps: float | None = None
+
+
+# Consecutive rounds that must satisfy ``eps`` before the loop stops on convergence.
+# Two, not one: a single flat step can be a false plateau (e.g. two coarse rounds that
+# barely move the answer before it jumps again), which would stop the loop far too early.
+_EPS_PATIENCE = 2
+
+
+def _rel_change(cur: Any, prev: Any) -> float:
+    """Relative L2 change ``||cur - prev|| / ||cur||`` between two (array-like) values."""
+    c = np.atleast_1d(np.asarray(cur, dtype=float)).reshape(-1)
+    p = np.atleast_1d(np.asarray(prev, dtype=float)).reshape(-1)
+    denom = float(np.linalg.norm(c))
+    diff = float(np.linalg.norm(c - p))
+    return diff / denom if denom > 0.0 else diff
 
 
 def _solve_vertex_values(fem: Any, solve_fn: Any = None, **kwargs: Any) -> np.ndarray:
@@ -394,6 +419,8 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
     history: list[dict] = []
     cur = fem
     u = None
+    prev_est = None
+    n_converged = 0
     for it in range(spec.max_iters):
         u = _solve_vertex_values(cur, solve_fn, **kwargs)
         eta, est = zz_error_indicators(d, u)
@@ -401,10 +428,16 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
         marked = dorfler_mark(eta, spec.theta)
         history.append({"n_dofs": n_dofs, "estimate": est, "n_marked": int(marked.size)})
 
+        # eps: the estimate stopped improving (plateau) for _EPS_PATIENCE rounds
+        if spec.eps is not None and prev_est is not None:
+            n_converged = n_converged + 1 if _rel_change(est, prev_est) < spec.eps else 0
+        prev_est = est
+
         last = it == spec.max_iters - 1
         below_tol = spec.tol is not None and est < spec.tol
         over_budget = spec.max_dofs is not None and n_dofs >= spec.max_dofs
-        if last or below_tol or over_budget or marked.size == 0:
+        plateaued = spec.eps is not None and n_converged >= _EPS_PATIENCE
+        if last or below_tol or over_budget or plateaued or marked.size == 0:
             break
 
         size = size_field_from_marks(d, marked, refine_factor=spec.refine_factor)
@@ -462,12 +495,22 @@ def run_adaptive_inverse(
         To warm-start the next round, reseed inside ``build_inverse`` via
         ``param.initialize(...)`` from the value snapshotted here.
 
+    The loop stops on whichever of ``spec``'s criteria fires first, including ``eps`` --
+    convergence of the recovered parameter: once ``readout`` returns numeric value(s) whose
+    relative change ``||Δθ|| / ||θ||`` stays below ``eps`` for two consecutive rounds, the
+    design is mesh-converged and the loop ends. Setting ``eps`` requires ``readout`` to
+    return the parameter value(s) (array-like), not just a label.
+
     Returns
     -------
     list of dict
         One record per round: ``{n_dofs, estimate, n_marked[, params]}``.
     """
+    if spec.eps is not None and readout is None:
+        raise ValueError("AdaptSpec.eps needs `readout` to return the parameter value(s) to measure convergence.")
     history: list[dict] = []
+    prev_param = None
+    n_converged = 0
     for it in range(spec.max_iters):
         crux, state_op = build_inverse(domain)
         crux.solve(n_opt)  # optimize parameters on the current (frozen) mesh
@@ -488,10 +531,17 @@ def run_adaptive_inverse(
             rec["params"] = readout(crux)
         history.append(rec)
 
+        # eps: the recovered parameter stopped moving (plateau) for _EPS_PATIENCE rounds
+        if spec.eps is not None and prev_param is not None:
+            n_converged = n_converged + 1 if _rel_change(rec["params"], prev_param) < spec.eps else 0
+        if readout is not None:
+            prev_param = rec["params"]
+
         last = it == spec.max_iters - 1
         below_tol = spec.tol is not None and est < spec.tol
         over_budget = spec.max_dofs is not None and n_vert >= spec.max_dofs
-        if last or below_tol or over_budget or marked.size == 0:
+        converged = spec.eps is not None and n_converged >= _EPS_PATIENCE
+        if last or below_tol or over_budget or converged or marked.size == 0:
             break
 
         size = size_field_from_marks(domain, marked, refine_factor=spec.refine_factor)

@@ -44,9 +44,18 @@ def build_inverse(d):
 def readout(crux):                                     # optimized value lives in the crux
     best["k"] = float(np.asarray(crux.eval([kappa])).reshape(-1)[0]); return best["k"]
 
-run_adaptive_inverse(d, build_inverse, AdaptSpec(theta=0.6, max_iters=6, refine_factor=1.6),
+run_adaptive_inverse(d, build_inverse,
+                     AdaptSpec(theta=0.6, max_iters=6, refine_factor=1.6, eps=0.01),
                      n_opt=250, readout=readout)
 ```
+
+`eps` is the **"good enough" stop**: the loop keeps refining until the recovered κ stops
+changing between rounds by more than `eps` (‖Δκ‖/‖κ‖), then ends — so you don't guess a
+round count. It uses a **patience of 2** (two consecutive rounds under `eps`) because a
+single flat step can be a false plateau. Honest framing: this is a *plateau detector* ("κ
+has stopped moving as I refine"), not a certified error bound — the lever for more accuracy
+is the `max_iters` / `max_dofs` budget. `max_iters` remains a hard cap; whichever fires first
+wins.
 
 Refinement is a non-differentiable **outer** Python loop; each `crux.solve` is a fully
 differentiable inverse solve on the currently frozen mesh, so gradients reach `kappa` unchanged. The

@@ -335,6 +335,56 @@ def test_adaptive_inverse_beats_uniform_on_l_shape():
     )
 
 
+def test_adapt_inverse_eps_requires_readout():
+    """eps needs a readout to measure parameter convergence -- guard it explicitly."""
+    d = _l_shape_domain(mesh_size=0.3)
+    with pytest.raises(ValueError, match="readout"):
+        run_adaptive_inverse(d, lambda dd: (None, None), AdaptSpec(max_iters=3, eps=0.01), n_opt=1)
+
+
+def test_adapt_forward_eps_stops_on_plateau():
+    """AdaptSpec.eps stops the forward loop once the error estimate stops improving."""
+    d = _l_shape_domain(mesh_size=0.2)
+    fem = jno.fem(_build_singular_laplace(d))
+    # loose eps: consecutive estimate changes are well under 30%, so the plateau guard
+    # (patience=2) trips within a few rounds instead of running all 15
+    fem.solve(adapt=AdaptSpec(theta=0.6, max_iters=15, refine_factor=1.5, eps=0.3))
+    hist = fem.adapt_history
+    assert 3 <= len(hist) < 15, f"eps did not stop the forward loop early (ran {len(hist)} rounds)"
+
+
+@pytest.mark.slow
+def test_adapt_inverse_eps_stops_on_convergence():
+    """AdaptSpec.eps stops the inverse loop once the recovered parameter stops moving,
+    and the patience=2 guard means the stop reflects two consecutive converged rounds."""
+    dummy = jno.domain.from_array({"_": np.zeros((1, 1))})
+    kappa = _fresh_kappa(0)
+    best: dict = {}
+
+    def build_inverse(dd):
+        if "k" in best:
+            kappa.initialize(jax.nn.initializers.constant(best["k"]))
+        s, w = _corner_obs(dd)
+        fem = _reaction_diffusion_fem(dd, kappa)
+        return jno.core([(w * (fem.solve() - s)).mse], domain=dummy), fem.solve()
+
+    def readout(crux):
+        best["k"] = float(np.asarray(crux.eval([kappa])).reshape(-1)[0])
+        return best["k"]
+
+    d = _l_shape_domain(mesh_size=0.2)
+    hist = run_adaptive_inverse(
+        d, build_inverse, AdaptSpec(theta=0.6, max_iters=12, refine_factor=1.5, eps=0.05), n_opt=150, readout=readout
+    )
+    ks = [h["params"] for h in hist]
+
+    # stopped early on convergence, not the iteration cap
+    assert len(ks) < 12, f"eps did not stop the inverse loop early (ran {len(ks)} rounds)"
+    # the stop is genuine: the last TWO round-to-round changes are both under eps (patience=2)
+    assert abs(ks[-1] - ks[-2]) / abs(ks[-1]) < 0.05
+    assert abs(ks[-2] - ks[-3]) / abs(ks[-2]) < 0.05
+
+
 @pytest.mark.slow
 def test_adaptive_beats_uniform_on_l_shape():
     """Derisk gate: adaptive refinement reaches lower error per DOF than uniform.
