@@ -109,6 +109,8 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
     from ...trace import FemResidualOperator
     from .fem_1d import _apply_dirichlet_rows, _apply_dirichlet_symmetric, _integrate_term
     from .fem_elements import (
+        argyris_pushforward,
+        argyris_triangle,
         hermite_pushforward,
         hermite_triangle,
         nedelec_triangle,
@@ -137,19 +139,54 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
                 field_index[f["field_key"]] = len(fields)
                 fields.append(f)
     spaces = [f["space"] for f in fields]
-    if any(s not in ("RT", "N1E", "P0", "Hermite") for s in spaces):
+    if any(s not in ("RT", "N1E", "P0", "Hermite", "Argyris") for s in spaces):
         raise NotImplementedError(
-            f"jno.fem (non-nodal): supported element spaces are RT, N1E, P0 and Hermite; got {spaces}."
+            f"jno.fem (non-nodal): supported element spaces are RT, N1E, P0, Hermite and Argyris; got {spaces}."
         )
     has_edge = ("RT" in spaces) or ("N1E" in spaces)
     has_hermite = "Hermite" in spaces
-    if has_edge and has_hermite:
-        raise NotImplementedError("jno.fem (non-nodal): mixing edge (RT/N1E) and Hermite fields is not supported.")
-    if dirichlet_raw and not has_hermite:
+    has_argyris = "Argyris" in spaces
+    has_vertex = has_hermite or has_argyris  # vertex-DOF families: the M(cell) DOF-transform path
+    if has_edge and has_vertex:
+        raise NotImplementedError(
+            "jno.fem (non-nodal): mixing edge (RT/N1E) and vertex (Hermite/Argyris) fields is not supported."
+        )
+    if has_hermite and has_argyris:
+        raise NotImplementedError("jno.fem (non-nodal): mixing Hermite and Argyris fields is not supported.")
+    if dirichlet_raw and not has_vertex:
         raise NotImplementedError(
             "jno.fem (non-nodal): nodal Dirichlet is not applicable to RT/N1E; the essential BC is the "
             "edge trace (u·n for RT, u×n for N1E) -- write it as `dot(u(region), n_region) - g`. "
             "(A Hermite field DOES take a nodal value Dirichlet u(region) - g.)"
+        )
+
+    # --- runtime parameters (inverse problems): collect the parameter name->expr map so the STEADY
+    # assembler can return a *parametric* FemLinearSystem / FemResidualOperator whose operator is
+    # re-assembled at each args and stays differentiable in the parameter (mirrors the native path). The
+    # non-nodal path supports SCALAR parameters only; a nodal field parameter k(x) needs the field's shape
+    # interpolation and is not wired here. ---
+    from .parametric_helpers import _collect_runtime_parameter_exprs, _is_fem_field_parameter
+
+    _rt_param_exprs: dict = {}
+    for bare in volume_terms:
+        _collect_runtime_parameter_exprs(bare, _rt_param_exprs)
+    runtime_parameter_tags: Tuple[str, ...] = tuple(sorted(_rt_param_exprs))
+    if any(_is_fem_field_parameter(e) for e in _rt_param_exprs.values()):
+        raise NotImplementedError(
+            "jno.fem (non-nodal): a FEM field parameter k(x) is not supported on non-nodal elements; "
+            "use a scalar runtime parameter for the inverse problem."
+        )
+    # A parameter in a boundary (Neumann/Robin) term would silently bake to a constant: the natural-BC load
+    # is assembled once, non-differentiably (`_apply_natural_boundary_terms`). Reject it rather than mislead.
+    _bdry_param_exprs: dict = {}
+    for _terms in boundary_terms.values():
+        for bare in _terms:
+            _collect_runtime_parameter_exprs(bare, _bdry_param_exprs)
+    if _bdry_param_exprs:
+        raise NotImplementedError(
+            "jno.fem (non-nodal): a runtime parameter in a boundary (Neumann/Robin) term is not supported for "
+            "inverse problems -- the natural-BC load is assembled non-differentiably. Put the parameter in a "
+            "volume term."
         )
 
     pts = jnp.asarray(np.asarray(domain.mesh.points))[:, :2]
@@ -172,26 +209,53 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
         edge_ref["N1E"] = (s.ref_values, s.ref_curl, s.ref_grads, piola_covariant, piola_covariant_grad)
     edge_ref = {k: tuple(jnp.asarray(a) for a in v[:3]) + v[3:] for k, v in edge_ref.items()}
 
-    # --- Hermite (C0 vertex value+derivative DOFs): the M(cell) DOF-transform path ---
+    # --- vertex-DOF families (the M(cell) DOF-transform path): Hermite (C0) and Argyris (C1) ---
     hermite_ref = None
     if has_hermite:
         hs = hermite_triangle(quad_degree=max(quad_degree, 6))  # cubic mass needs a degree-6 rule
         hermite_ref = (jnp.asarray(hs.ref_values), jnp.asarray(hs.ref_grads), jnp.asarray(hs.ref_hess))
+    argyris_ref = None
+    if has_argyris:
+        as_ = argyris_triangle(quad_degree=max(quad_degree, 12))  # quintic mass needs a degree-10+ rule
+        argyris_ref = (
+            jnp.asarray(as_.ref_values),
+            jnp.asarray(as_.ref_grads),
+            jnp.asarray(as_.ref_hess),
+            tuple(jnp.asarray(a) for a in as_.ref_aux),  # (nv_val, nv_grad, nv_hess, ne_grad) for M(cell)
+        )
 
-    # Shared quadrature: a Hermite problem uses the Hermite rule; an edge/P0 problem uses the edge rule.
-    ref_spec = hs if has_hermite else (specs.get("RT") or specs.get("N1E") or raviart_thomas_triangle(1, quad_degree))
+    # Shared quadrature: a vertex-family problem uses its element rule; an edge/P0 problem uses the edge rule.
+    ref_spec = (
+        as_
+        if has_argyris
+        else hs
+        if has_hermite
+        else (specs.get("RT") or specs.get("N1E") or raviart_thomas_triangle(1, quad_degree))
+    )
     qp, qw = jnp.asarray(ref_spec.quad_points), jnp.asarray(ref_spec.quad_weights)
     n_quad = int(qw.shape[0])
     ctx = getattr(domain, "context", {}) or {}
 
-    # Edge topology only when an edge family is present.
-    if has_edge:
+    # Edge topology: edge families (RT/N1E) need it for their edge DOFs; Argyris needs it for the global id +
+    # orientation of its edge-normal DOFs (Hermite, pure-vertex, does not).
+    if has_edge or has_argyris:
         top = build_edge_topology(cells, ref_spec.local_edges)
         ce = jnp.asarray(top.cell_edges, dtype=jnp.int32)  # (n_cells, 3) global edge ids
-        esigns = jnp.asarray(top.cell_edge_signs.astype(np.float64))  # (n_cells, 3)
+        esigns = jnp.asarray(top.cell_edge_signs.astype(np.float64)) if has_edge else None  # (n_cells, 3)
         n_edges = int(top.n_edges)
     else:
         top, ce, esigns, n_edges = None, None, None, 0
+
+    # Argyris edge-normal DOFs: a per-cell, GLOBALLY-oriented physical unit normal per local edge so the two
+    # cells sharing an edge agree on the sign of the normal-derivative DOF. Orientation is fixed by the
+    # canonical (low, high) global vertex pair: n = R90·(P[hi] - P[lo]) = (-(Δy), Δx) (Kirby 2018 / cross-cell C1).
+    argyris_normals = None
+    if has_argyris:
+        _ev = np.asarray(top.edge_vertices)  # (n_edges, 2) canonical (lo, hi)
+        _d = np.asarray(pts)[_ev[:, 1]] - np.asarray(pts)[_ev[:, 0]]  # (n_edges, 2)
+        _en = np.stack([-_d[:, 1], _d[:, 0]], axis=1)  # R90·d per global edge
+        _en = _en / np.linalg.norm(_en, axis=1, keepdims=True)
+        argyris_normals = jnp.asarray(_en[np.asarray(top.cell_edges)])  # (n_cells, 3, 2)
 
     # Hermite per-cell global DOF map: 3 DOFs per vertex (value, ∂x, ∂y, in basix order) + 1 interior
     # (centroid) DOF per cell. Continuity is automatic from shared global vertex ids (point functionals --
@@ -202,8 +266,22 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
         _idofs = (3 * n_verts + jnp.arange(n_cells))[:, None]  # (n_cells, 1) interior
         hermite_cdofs = jnp.concatenate([_vdofs, _idofs], axis=1)  # (n_cells, 10), block-local DOF ids
 
+    # Argyris per-cell global DOF map: 6 DOFs per vertex (value, ∂x, ∂y, ∂xx, ∂xy, ∂yy) over shared global
+    # vertex ids, then 1 normal-derivative DOF per global edge at base ``6·n_verts`` (deduped + sign-consistent
+    # via the edge topology). Continuity of value/derivatives is automatic from shared vertex ids; the
+    # edge-normal DOF is shared through ``cell_edges``.
+    argyris_cdofs = None
+    if has_argyris:
+        _vdofs = (6 * cells_j[:, :, None] + jnp.arange(6)[None, None, :]).reshape(n_cells, 18)  # (n_cells, 18)
+        _edofs = 6 * n_verts + ce  # (n_cells, 3) global edge-DOF ids
+        argyris_cdofs = jnp.concatenate([_vdofs, _edofs], axis=1)  # (n_cells, 21)
+
     def _field_ndof(s):
-        return (3 * n_verts + n_cells) if s == "Hermite" else (n_edges if s in ("RT", "N1E") else n_cells)
+        if s == "Hermite":
+            return 3 * n_verts + n_cells
+        if s == "Argyris":
+            return 6 * n_verts + n_edges
+        return n_edges if s in ("RT", "N1E") else n_cells
 
     ndof = [_field_ndof(s) for s in spaces]
     offs = [0]
@@ -214,6 +292,8 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
     def _field_cdofs(i):
         if spaces[i] == "Hermite":
             return offs[i] + hermite_cdofs  # (n_cells, 10)
+        if spaces[i] == "Argyris":
+            return offs[i] + argyris_cdofs  # (n_cells, 21)
         if spaces[i] in ("RT", "N1E"):
             return offs[i] + ce  # (n_cells, 3)
         return offs[i] + jnp.arange(n_cells)[:, None]  # (n_cells, 1) P0
@@ -238,6 +318,18 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
                         "shape_grads": grad,
                         "shape_hess": hess,
                         "cell_sol": u_blocks[i][cdofs[i][c] - offs[i]][:, None],
+                        "space": "Lagrange",
+                    }
+                )
+            elif s == "Argyris":  # C1 conforming: M(cell) DOF-transform + globally-oriented edge-normal DOFs
+                rv, rg, rh, nodal = argyris_ref
+                phi, grad, hess = argyris_pushforward(rv, rg, rh, J, detJ, argyris_normals[c], nodal)
+                per.append(
+                    {
+                        "shape_vals": phi,
+                        "shape_grads": grad,
+                        "shape_hess": hess,
+                        "cell_sol": u_blocks[i][cdofs[i][c] - offs[i]][:, None],  # this cell's 21 local DOFs
                         "space": "Lagrange",
                     }
                 )
@@ -271,12 +363,21 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
                     raise ValueError("jno.fem (non-nodal): each weak term must contain exactly one test field.")
                 typed.append((coeff, tfi))
 
-        def residual(u_flat):
+        def residual(u_flat, args=None):
             u_blocks = [u_flat[offs[i] : offs[i + 1]] for i in range(len(fields))]
+            # Pack each scalar runtime parameter into volume_vars (steady: no temporal prefix), so the shared
+            # evaluator resolves it via `_runtime_parameter_value_from_internal_vars`. Cell-independent, so it
+            # is a closed-over constant across the vmap. A parameter absent from `args` (e.g. a non-parametric
+            # assembly) packs a zero placeholder; empty when the form has no runtime parameter.
+            _a = args or {}
+            rt_vars = tuple(
+                jnp.reshape(jnp.asarray(_a.get(name, 0.0), dtype=u_flat.dtype), (-1,))[:1]
+                for name in runtime_parameter_tags
+            )
             R = jnp.zeros(total, dtype=u_flat.dtype)
             for coeff, tfi in typed:
 
-                def _cell(c, e=coeff):
+                def _cell(c, e=coeff, _rt=rt_vars):
                     per, xq, meas = _cell_fields(c, u_blocks)
                     local = {
                         "physical_quad_points": xq,
@@ -286,8 +387,8 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
                         "surface": False,
                         "domain_context": ctx,
                         "temporal_tags": (),
-                        "runtime_parameter_tags": (),
-                        "volume_vars": (),
+                        "runtime_parameter_tags": runtime_parameter_tags,
+                        "volume_vars": _rt,
                     }
                     return _integrate_term(domain, e, local, qw * meas)  # (ndof of the test field,)
 
@@ -313,6 +414,10 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
     )
     if has_hermite and dirichlet_raw:  # Hermite value-Dirichlet: pin boundary-vertex value DOFs to g
         pins = pins + _hermite_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs)
+    if has_argyris and dirichlet_raw:  # Argyris clamped BC: pin the full C1 boundary trace of g
+        pins = pins + _argyris_dirichlet_pins(
+            dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs, top, n_verts
+        )
     zeros = jnp.zeros(total)
 
     # === transient: M u̇ + A u = c (mirrors fem_1d._assemble_1d_transient) -- split the temporal term
@@ -373,13 +478,29 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
             state0 = state0.at[offs[fidx] : offs[fidx + 1]].set(block_sol)
         common["state0"] = state0
 
+        pin_dofs = jnp.asarray([p[0] for p in pins], dtype=jnp.int32) if pins else None
         if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in spatial):
             # nonlinear transient: M(t) u̇ + R(u) = 0 (matrix-free Newton-Krylov per step). Natural load
             # folds into R; essential pins are residual rows + zeroed M rows/cols (the 1D pattern).
+            M_nl = M if pin_dofs is None else M.at[pin_dofs, :].set(0.0).at[:, pin_dofs].set(0.0)
+            if runtime_parameter_tags:  # transient inverse: thread args through the residual + its Jacobian
+
+                def res_pt(u, t, args=None):
+                    return _apply_dirichlet_rows(lambda uu: spatial_res(uu, args) - nat_load, pins)(jnp.asarray(u))
+
+                def jac_pt(u, t, args=None):
+                    return jax.jacfwd(lambda uu: res_pt(uu, t, args))(jnp.asarray(u))
+
+                block = SemidiscreteTimeBlock(
+                    mass=lambda t, args=None, _M=M_nl: _M,
+                    residual=res_pt,
+                    jacobian=jac_pt,
+                    runtime_parameter_exprs=dict(_rt_param_exprs),
+                    **common,
+                )
+                return block, "transient", offs
             res_bc = _apply_dirichlet_rows(lambda u: spatial_res(u) - nat_load, pins)
             jac = jax.jacfwd(res_bc)
-            pin_dofs = jnp.asarray([p[0] for p in pins], dtype=jnp.int32) if pins else None
-            M_nl = M if pin_dofs is None else M.at[pin_dofs, :].set(0.0).at[:, pin_dofs].set(0.0)
             block = SemidiscreteTimeBlock(
                 mass=lambda t, args=None, _M=M_nl: _M,
                 residual=lambda u, t, args=None: res_bc(u),
@@ -387,6 +508,37 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
                 **common,
             )
             return block, "transient", offs
+
+        if runtime_parameter_tags:  # linear transient inverse: A(args) re-assembled each step; dense Dirichlet
+            #   row-replacement inside operator_fn (the dense analogue of the native bcoo_set_dirichlet_rows).
+            M_bc = M if pin_dofs is None else M.at[pin_dofs, :].set(0.0).at[:, pin_dofs].set(0.0)
+            c_bias = zeros if pin_dofs is None else zeros.at[pin_dofs].set(jnp.asarray([p[1] for p in pins]))
+            free_mask = (
+                jnp.ones((total,), dtype=zeros.dtype)
+                if pin_dofs is None
+                else jnp.ones((total,), dtype=zeros.dtype).at[pin_dofs].set(0.0)
+            )
+
+            def operator_fn(t, args=None, _d=pin_dofs):
+                A = jax.jacfwd(lambda u: spatial_res(u, args))(zeros)
+                return A if _d is None else A.at[_d, :].set(0.0).at[_d, _d].set(1.0)  # Dirichlet rows -> identity
+
+            def forcing_vector_fn(t, args=None, _mask=free_mask):
+                return _mask * (-spatial_res(zeros, args) + nat_load)  # source on free rows; Dirichlet via the bias
+
+            return (
+                SemidiscreteTimeBlock(
+                    M=M_bc,
+                    operator_fn=operator_fn,
+                    affine_bias=c_bias,
+                    forcing_vector_fn=forcing_vector_fn,
+                    runtime_parameter_exprs=dict(_rt_param_exprs),
+                    metadata={"nonaffine_operator": True},
+                    **common,
+                ),
+                "transient",
+                offs,
+            )
 
         # linear transient: M u̇ + A u = c
         A = jax.jacfwd(spatial_res)(zeros)
@@ -396,22 +548,62 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
 
     residual = _make_residual(volume_terms)
 
-    def full_residual(u_flat):  # the natural BC is a constant load on the RHS: R(u) = assembled(u) - load
-        return residual(u_flat) - nat_load
+    def full_residual(u_flat, args=None):  # the natural BC is a constant load on the RHS: R(u) = assembled(u) - load
+        return residual(u_flat, args) - nat_load
 
     # --- steady nonlinear: a genuinely nonlinear weak term -> a Newton residual operator ---
     if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in volume_terms):
+        if runtime_parameter_tags:  # parametric (inverse): thread args into the residual AND its Jacobian
+
+            def res_p(u, args=None):
+                return _apply_dirichlet_rows(lambda uu: full_residual(uu, args), pins)(jnp.asarray(u))
+
+            def jac_p(u, args=None):
+                return jax.jacfwd(lambda uu: res_p(uu, args))(jnp.asarray(u))
+
+            return (
+                FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_rt_param_exprs)),
+                "nonlinear",
+                offs,
+            )
         res_bc = _apply_dirichlet_rows(full_residual, pins)  # essential pins as residual rows R[d]=u[d]-g
         jac = jax.jacfwd(res_bc)
-        # FemResidualOperator.solve calls residual(u, args)/jacobian(u, args); the non-nodal residual has no
-        # runtime parameters, so accept-and-ignore args (args=None keeps `fem.residual(u)` single-arg too).
+        # FemResidualOperator.solve calls residual(u, args)/jacobian(u, args); non-parametric here, so
+        # accept-and-ignore args (args=None keeps `fem.residual(u)` single-arg too).
         return (
             FemResidualOperator(lambda u, args=None: res_bc(u), lambda u, args=None: jac(u), total),
             "nonlinear",
             offs,
         )
 
-    # --- steady linear: A u = b (byte-identical to before the refactor) ---
+    # --- steady linear parametric (inverse): re-assemble A(args), b(args) each call, kept differentiable in
+    #     the parameter (mirrors the native path); the Dirichlet pins are RE-APPLIED per args. Returns a
+    #     FemLinearSystem so `fem.solve()` gives a differentiable trace node crux can optimise. ---
+    if runtime_parameter_tags:
+        from ...trace import FemLinearSystem
+
+        def _assemble_at(args):
+            A = jax.jacfwd(lambda u: full_residual(u, args))(zeros)
+            b = -full_residual(zeros, args)
+            if pins:
+                A, b = _apply_dirichlet_symmetric(jnp.asarray(A), jnp.asarray(b), pins)
+            return A, b
+
+        a0, b0 = _assemble_at({n: 0.0 for n in runtime_parameter_tags})  # static placeholder for `.A` / `.b`
+        return (
+            FemLinearSystem(
+                a0,
+                b0,
+                operator_fn=lambda args=None: _assemble_at(args)[0],
+                rhs_fn=lambda args=None: _assemble_at(args)[1],
+                runtime_parameter_exprs=dict(_rt_param_exprs),
+                metadata={"nonaffine_operator": True},  # re-assembles at each args; no affine parameter basis
+            ),
+            "linear",
+            offs,
+        )
+
+    # --- steady linear (non-parametric): A u = b (byte-identical to before the refactor) ---
     A = jax.jacfwd(full_residual)(zeros)
     b = -full_residual(zeros)
     if pins:
@@ -488,6 +680,67 @@ def _hermite_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, 
             v = int(v)
             g = jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts_np[v][None, :]))).reshape(-1)
             pins.append((offs[fidx] + 3 * v, float(g[0])))
+    return pins
+
+
+def _argyris_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, offs, top, n_verts):
+    """Essential BC for an Argyris field by pinning the **full C¹ trace of a known field** ``g`` — value,
+    gradient and Hessian at each boundary vertex, plus the normal derivative ``∂g/∂n`` at each boundary-edge
+    midpoint (all of ``g``'s boundary DOFs, taken by **autodiff** of the Dirichlet value node so any smooth
+    ``g(x, y)`` works). For a **manufactured / known** ``g`` this imposes the exact essential data and is the
+    right BC for verification (exact recovery, convergence). The edge-normal pin uses the SAME
+    globally-oriented normal as the assembler so the two incident cells agree.
+
+    Caveat (not the general clamped BVP). Because this pins *every* boundary DOF — including the second
+    derivatives — it imposes more than the physical clamped condition ``u = g, ∂u/∂n = h``: it also fixes the
+    boundary curvature to ``D²g``. For a known/manufactured ``g`` that is correct (the pinned ``D²g`` is the
+    truth), but for a *generic* clamped plate (only ``u`` and ``∂u/∂n`` prescribed, the boundary ``∂²u/∂n²``
+    free) it over-constrains the solution. A true clamped BVP supplying only ``u`` and ``∂u/∂n`` — leaving the
+    normal second derivative free — is **not yet expressible** through this term."""
+    from ..._fem import _eval_value_node_at
+    from .fem_1d import _region_node_ids
+
+    def _g_derivs(value_node, xy):
+        """Scalar ``g`` and its gradient/Hessian at one physical point via autodiff of the value node."""
+
+        def gfun(p):
+            return jnp.asarray(_eval_value_node_at(value_node, p[None, :])).reshape(())
+
+        p = jnp.asarray(xy, dtype=jnp.float64)
+        return float(gfun(p)), np.asarray(jax.grad(gfun)(p)), np.asarray(jax.hessian(gfun)(p))
+
+    cell_edges = np.asarray(top.cell_edges)
+    counts = np.bincount(cell_edges.reshape(-1), minlength=top.n_edges)
+    boundary_edges = {int(e) for e in np.where(counts == 1)[0]}
+
+    pins = []
+    for fk, region, _comp, _value, value_node in dirichlet_raw:
+        fidx = field_index.get(fk)
+        if fidx is None or spaces[fidx] != "Argyris":
+            continue
+        base = offs[fidx]
+        region_nodes = {int(v) for v in _region_node_ids(domain, region)}
+        for v in region_nodes:  # value + gradient + Hessian at boundary vertices
+            g, grad, H = _g_derivs(value_node, pts_np[v])
+            pins += [
+                (base + 6 * v + 0, g),
+                (base + 6 * v + 1, float(grad[0])),
+                (base + 6 * v + 2, float(grad[1])),
+                (base + 6 * v + 3, float(H[0, 0])),
+                (base + 6 * v + 4, float(H[0, 1])),
+                (base + 6 * v + 5, float(H[1, 1])),
+            ]
+        edge_base = base + 6 * n_verts  # ∂g/∂n at boundary-edge midpoints
+        for eid in boundary_edges:
+            va, vb = (int(x) for x in top.edge_vertices[eid])  # canonical (lo, hi)
+            if va not in region_nodes or vb not in region_nodes:
+                continue
+            mid = 0.5 * (pts_np[va] + pts_np[vb])
+            d = pts_np[vb] - pts_np[va]
+            n = np.array([-d[1], d[0]])  # R90·(P[hi] - P[lo]) — the assembler's global orientation
+            n = n / np.linalg.norm(n)
+            _, grad, _ = _g_derivs(value_node, mid)
+            pins.append((edge_base + eid, float(n @ grad)))
     return pins
 
 

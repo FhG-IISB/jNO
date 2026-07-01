@@ -58,10 +58,10 @@ u_h = jnp.linalg.solve(fem.A, fem.b)
   (a P1 Hessian is identically zero). Scalar Lagrange fields only; the physical Hessian is the exact
   affine map `∂²φ/∂x_a∂x_b = K_ia K_jb ∂²φ/∂ξ_i∂ξ_j` (`K = J⁻¹`, no curvature term on the P1 geometry).
   > **Conformity caveat.** Standard Lagrange is **C⁰**, so `∫Δu·Δv` over P2 is *non-conforming* and does
-  > **not** give a convergent biharmonic discretisation. For a convergent solve use the mixed
-  > (Ciarlet–Raviart) method — two coupled C⁰ fields with `w = Δu`, first derivatives only (see
-  > `tests/test_fem_hessian.py`) — or a forthcoming C¹ element (Argyris/Bell). The shape-Hessian
-  > assembly here is the prerequisite those build on.
+  > **not** give a convergent biharmonic discretisation. For a convergent solve use the **C¹ Argyris
+  > element** (`space="Argyris"`, below — the conforming quintic), or the mixed (Ciarlet–Raviart) method —
+  > two coupled C⁰ fields with `w = Δu`, first derivatives only (see `tests/test_fem_hessian.py`). The
+  > shape-Hessian assembly here is the prerequisite both build on.
 
 ---
 
@@ -97,10 +97,17 @@ no term.
 > (Newton), and transient `M u̇ + A u = c` (including nonlinear-transient and the mixed/saddle **DAE**,
 > e.g. transient Darcy); and the differentiable `fem.solve()` for inverse problems.
 >
+> **Supported inverse:** a **steady** inverse problem with a **scalar** runtime parameter in a *volume*
+> term is wired (`fem.solve()` returns a differentiable `FemLinearSystem` / `FemResidualOperator` that
+> re-assembles at each parameter value — so `crux.solve` recovers e.g. a plate stiffness from a deflection).
+>
 > **Not yet / excluded:** 3-D (the zoo is 2-D only — 3-D uses nodal Lagrange); higher order (lowest
-> RT₀ / N1E₀ only); other families (BDM, second-kind Nédélec, **Argyris**/C¹); quad / non-triangular
-> meshes; and a constraint-consistent *algebraic* initial state at `t0` in the saddle-DAE transient
-> (the differential field and all `t > 0` values are correct; only the reported `t0` algebraic value is).
+> RT₀ / N1E₀ only); other families (BDM, second-kind Nédélec, Bell); quad / non-triangular
+> meshes; second-order-in-time (`u_tt`) for the vertex families (nodal Lagrange only); a **transient**
+> inverse, a **field** parameter `k(x)`, or a parameter in a **boundary** term through the non-nodal path
+> (all rejected with a clear error); and a constraint-consistent *algebraic* initial state at `t0` in the
+> saddle-DAE transient (the differential field and all `t > 0` values are correct; only the reported `t0`
+> algebraic value is). The **C¹ Argyris** element IS supported (below).
 
 Beyond nodal Lagrange (P1/P2), `jno.fem` assembles **edge-DOF** families on 2-D triangles — for
 problems whose natural space is *not* H¹. Pick one with the `space=` knob on `fem_symbols`:
@@ -112,6 +119,7 @@ problems whose natural space is *not* H¹. Pick one with the `space=` knob on `f
 | `"N1E"` | **H(curl)** Nédélec (1st kind) | edge tangential `∫ₑ u·t` | Maxwell, eddy currents |
 | `"P0"` | L² (piecewise constant) | one per cell | the pressure / multiplier of a mixed pair |
 | `"Hermite"` | C⁰ cubic, **vertex value + ∇ DOFs** | `u`, `∂u/∂x`, `∂u/∂y` at vertices (+ centroid) | smooth/gradient-aware fields; the foundation for C¹ elements |
+| `"Argyris"` | **C¹** quintic (TUBA-6) | value + `∇u` + `D²u` at vertices, `∂u/∂n` at edge midpoints | conforming **biharmonic** / plate / Cahn–Hilliard |
 
 > **Hermite** is the first element with a per-cell **DOF-mixing** transform `M(cell)` (its global
 > derivative DOFs are the physical gradient `∇u` at the vertices). It is **C⁰** (not C¹), so it is *not*
@@ -120,6 +128,27 @@ problems whose natural space is *not* H¹. Pick one with the `space=` knob on `f
 > value DOFs (derivatives free); it composes with the steady, transient, and nonlinear `fem.solve()` paths
 > (see `tests/test_fem_hermite.py` for Poisson / heat / reaction-diffusion). A *clamped* BC (also pinning
 > the gradient DOFs to `∇g`, needed for optimal rates and the C¹ elements) is a follow-on.
+
+> **Argyris** is the **C¹-conforming** quintic triangle (21 DOF: value, gradient and Hessian at each
+> vertex; the normal derivative at each edge midpoint) — the element for **4th-order PDEs**. Across a shared
+> edge both `u` and `∂u/∂n` are continuous, so `∫Δu·Δv` is now a *convergent* biharmonic discretisation
+> (the conformity caveat above is lifted for this space). basix has no Argyris family, so the reference dual
+> basis is built from the monomials and mapped to each physical cell by the affine-equivalence DOF-transform
+> `M(cell)` (R.C. Kirby, *A general approach to transforming finite elements*, SMAI J. Comput. Math. 4,
+> 2018; the original element is Argyris–Fried–Scharpf 1968). The **globally-oriented edge-normal DOF** is
+> what makes it C¹ on an *unstructured* mesh — the reference-normal reduced-quintic (Bell) is not affine
+> equivalent and fails there. A Dirichlet term `u(region) - g` pins the **full C¹ trace of a known field**
+> `g` (value, gradient and Hessian at boundary vertices; `∂g/∂n` at boundary-edge midpoints) by autodiff of
+> `g` — the right essential BC for **verification with a manufactured `g`** (exact recovery, convergence).
+> Note it pins *all* boundary DOFs including the boundary curvature `D²g`, so it imposes more than the
+> physical clamped condition `u = g, ∂u/∂n = h`; a *generic* clamped BVP (only `u` and `∂u/∂n` prescribed,
+> the boundary `∂²u/∂n²` free) is not yet expressible. Composes with the steady, transient and nonlinear
+> `fem.solve()` paths (see
+> `tests/test_fem_argyris.py`: exact biharmonic recovery on an unstructured mesh, convergence, nonlinear
+> `Δ²u + u³ = f`, and the dissipative biharmonic heat flow). A **steady inverse** problem also works — a
+> scalar coefficient in a volume term (e.g. plate stiffness in `α·Δ²u = f`) is recovered by `crux.solve`
+> (`tests/test_fem_inverse.py`). *Not yet:* `u_tt` (second-order-in-time) and *transient* inverse route
+> through the nodal path, which the non-nodal transient assembler is not (both raise a clear error).
 
 ```python
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")   # H(div) flux

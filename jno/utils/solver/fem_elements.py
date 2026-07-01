@@ -31,7 +31,7 @@ J.-C. Nédélec, *Mixed finite elements in* R^3, Numer. Math. 35 (1980) 315–34
 
 from __future__ import annotations
 
-from typing import NamedTuple, Optional, Tuple
+from typing import Any, NamedTuple, Optional, Tuple
 
 import jax.numpy as jnp
 import numpy as np
@@ -69,6 +69,7 @@ class ElementSpec(NamedTuple):
     local_edges: Tuple[Tuple[int, int], ...]
     ref_curl: Optional[np.ndarray] = None  # (n_quad, n_dof) for H(curl), else None
     ref_hess: Optional[np.ndarray] = None  # (n_quad, n_dof, value_size, tdim, tdim), reference d²Phi/dxi dxi
+    ref_aux: Optional[Any] = None  # element-specific extra reference data (e.g. Argyris nodal tabulations for M(cell))
 
 
 def raviart_thomas_triangle(degree: int = 1, quad_degree: int = 2) -> ElementSpec:
@@ -259,4 +260,193 @@ def hermite_pushforward(ref_values, ref_grads, ref_hess, J, detJ, signs):
     grad = jnp.einsum("ab,qbd->qad", M, dphys)  # (n_quad, n_dof, tdim)
     hphys = jnp.einsum("qbij,ia,jc->qbac", ref_hess[..., 0, :, :], K, K)  # Kᵀ H_ref K
     hess = jnp.einsum("ab,qbij->qaij", M, hphys)  # (n_quad, n_dof, tdim, tdim)
+    return phi, grad, hess
+
+
+# ---------------------------------------------------------------------------
+# Argyris (C¹ conforming, quintic, 21 DOF) — the real conforming biharmonic element.
+#
+# DOFs (per the classical TUBA-6 / Argyris element): at each of the 3 vertices the value, the two
+# first derivatives and the three second derivatives (6 each = 18), plus the normal derivative at each
+# of the 3 edge midpoints (= 3). The edge-normal DOFs are what make the element C¹ on an *unstructured*
+# mesh where the simpler vertex-only reduced-quintic (Bell) fails: the cross-cell normal derivative is
+# pinned by a DOF shared (with a globally consistent normal) by the two incident cells. basix has no
+# Argyris family, so the reference dual basis is built here from the monomials (pure numpy, a constant),
+# and the per-cell physical element uses the affine-equivalence DOF-transform ``M(cell)`` (Kirby 2018) —
+# a true DOF-*mixing* map that, unlike Hermite's ``blockdiag(1, J)``, couples the second-derivative DOFs
+# (``KᵀHK``) and scales the edge-normal DOFs by the *physical* edge normal.
+#
+# References
+# ----------
+# J.H. Argyris, I. Fried, D.W. Scharpf, "The TUBA family of plate elements for the matrix displacement
+#   method", Aeronautical Journal 72 (1968) 701–709 — the original quintic C¹ triangle.
+# R.C. Kirby, "A general approach to transforming finite elements", SMAI J. Comput. Math. 4 (2018)
+#   197–224 — the functional/affine transform ``M[m,k] = ℓ_m^phys(φ̂_k)`` used to map the reference dual
+#   basis to a physical cell while preserving C¹ conformity.
+# ---------------------------------------------------------------------------
+
+# Reference geometry (standard triangle) and edge ordering, shared with the edge topology so DOF k ↔ the
+# global edge id ``cell_edges[c, k]``.
+_ARG_REF_VERTS = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+_ARG_REF_EDGE_MIDS = np.array(
+    [
+        0.5 * (_ARG_REF_VERTS[a] + _ARG_REF_VERTS[b])  # midpoint of reference edge (a, b)
+        for (a, b) in BASIX_TRIANGLE_EDGES  # ((1,2),(0,2),(0,1))
+    ]
+)
+
+
+def _arg_mono_exps() -> Tuple[Tuple[int, int], ...]:
+    """Exponents of the 21 P5 monomials ``x^i y^j`` (``i+j ≤ 5``), ascending total degree."""
+    return tuple((i, total - i) for total in range(6) for i in range(total + 1))
+
+
+_ARG_EXPS = _arg_mono_exps()  # length 21
+
+
+def _arg_mono_value(pt: np.ndarray) -> np.ndarray:
+    x, y = pt
+    return np.array([x**i * y**j for (i, j) in _ARG_EXPS])  # (21,)
+
+
+def _arg_mono_grad(pt: np.ndarray) -> np.ndarray:
+    x, y = pt
+    g = np.zeros((21, 2))
+    for k, (i, j) in enumerate(_ARG_EXPS):
+        g[k, 0] = i * (x ** (i - 1) if i >= 1 else 0.0) * (y**j)
+        g[k, 1] = j * (x**i) * (y ** (j - 1) if j >= 1 else 0.0)
+    return g  # (21, 2) columns ∂x, ∂y
+
+
+def _arg_mono_hess(pt: np.ndarray) -> np.ndarray:
+    x, y = pt
+    H = np.zeros((21, 2, 2))
+    for k, (i, j) in enumerate(_ARG_EXPS):
+        H[k, 0, 0] = i * (i - 1) * (x ** (i - 2) if i >= 2 else 0.0) * (y**j)
+        H[k, 0, 1] = i * j * (x ** (i - 1) if i >= 1 else 0.0) * (y ** (j - 1) if j >= 1 else 0.0)
+        H[k, 1, 0] = H[k, 0, 1]
+        H[k, 1, 1] = j * (j - 1) * (x**i) * (y ** (j - 2) if j >= 2 else 0.0)
+    return H  # (21, 2, 2)
+
+
+def _arg_ref_normals() -> np.ndarray:
+    """Reference unit edge normals (only fix the intermediate reference dual basis; the final physical
+    element is independent of their sign — the physical edge normal is what enters ``M(cell)``)."""
+    out = []
+    for a, b in BASIX_TRIANGLE_EDGES:
+        d = _ARG_REF_VERTS[b] - _ARG_REF_VERTS[a]
+        n = np.array([-d[1], d[0]])  # +90° rotation
+        out.append(n / np.linalg.norm(n))
+    return np.array(out)
+
+
+def _arg_ref_functionals(coeffs: np.ndarray, K: np.ndarray, edge_normals: np.ndarray) -> np.ndarray:
+    """Apply the 21 (physical) Argyris functionals to a field given by its reference-monomial coefficient
+    vector ``coeffs`` (a function of ξ). The physical field is ``φ̂(x) = field(F⁻¹(x))``; chain rule
+    ``∇ₓ = Kᵀ ∇_ξ``, ``Hₓ = Kᵀ H_ξ K``. Vertex functionals at the reference vertices, edge functionals at
+    the reference edge midpoints dotted with the supplied (physical) edge normal. With ``K = I`` and the
+    reference normals this builds the reference dual basis; with the cell ``K`` and physical normals it
+    builds ``M(cell)``."""
+    KT = K.T
+    out = []
+    for v in _ARG_REF_VERTS:
+        val = coeffs @ _arg_mono_value(v)
+        grad = KT @ (_arg_mono_grad(v).T @ coeffs)
+        H = KT @ np.einsum("k,kab->ab", coeffs, _arg_mono_hess(v)) @ K
+        out += [val, grad[0], grad[1], H[0, 0], H[0, 1], H[1, 1]]
+    for mid, n in zip(_ARG_REF_EDGE_MIDS, edge_normals):
+        grad = KT @ (_arg_mono_grad(mid).T @ coeffs)
+        out.append(n @ grad)
+    return np.array(out)
+
+
+def _arg_reference_coeffs() -> np.ndarray:
+    """Reference dual-basis monomial coefficients ``S`` (21×21): ``V_ref[i,j] = ℓ_i(monomial_j)``,
+    ``S = V_ref⁻¹``, so basis ``ψ_k = Σ_p S[p,k] monomial_p`` satisfies ``ℓ_i(ψ_k) = δ_ik``."""
+    refn = _arg_ref_normals()
+    cols = []
+    for j in range(21):
+        ej = np.zeros(21)
+        ej[j] = 1.0
+        cols.append(_arg_ref_functionals(ej, np.eye(2), refn))
+    V_ref = np.column_stack(cols)  # V_ref[:, j] = functionals of monomial j
+    return np.linalg.inv(V_ref)
+
+
+def argyris_triangle(quad_degree: int = 12) -> ElementSpec:
+    """Argyris C¹ quintic triangle (21 DOF), built from the monomials (basix has no Argyris family).
+
+    Returns the reference dual basis ``ψ_k`` (and its gradient/Hessian) tabulated at a quintic-exact
+    triangle quadrature, plus — in ``ref_aux`` — the reference nodal tabulations (value/grad/Hessian at the
+    3 vertices, gradient at the 3 edge midpoints) that :func:`argyris_pushforward` needs to assemble the
+    per-cell DOF-transform ``M(cell)``. ``local_edges = BASIX_TRIANGLE_EDGES`` so the edge-normal DOF ``k``
+    aligns with the global edge ``cell_edges[c, k]``."""
+    import basix
+    from basix import CellType
+
+    S = _arg_reference_coeffs()  # (21, 21)
+    qp, qw = basix.make_quadrature(CellType.triangle, quad_degree)
+    qp = np.asarray(qp)
+    nq = qp.shape[0]
+    rv = np.zeros((nq, 21, 1))
+    rg = np.zeros((nq, 21, 1, 2))
+    rh = np.zeros((nq, 21, 1, 2, 2))
+    for q in range(nq):
+        rv[q, :, 0] = _arg_mono_value(qp[q]) @ S
+        rg[q, :, 0, :] = np.einsum("pl,pk->kl", _arg_mono_grad(qp[q]), S)
+        rh[q, :, 0, :, :] = np.einsum("pab,pk->kab", _arg_mono_hess(qp[q]), S)
+    # reference nodal tabulations of ψ_k for building M(cell)
+    nv_val = np.array([_arg_mono_value(v) @ S for v in _ARG_REF_VERTS])  # (3, 21)
+    nv_grad = np.array([np.einsum("pl,pk->kl", _arg_mono_grad(v), S) for v in _ARG_REF_VERTS])  # (3, 21, 2)
+    nv_hess = np.array([np.einsum("pab,pk->kab", _arg_mono_hess(v), S) for v in _ARG_REF_VERTS])  # (3, 21, 2, 2)
+    ne_grad = np.array([np.einsum("pl,pk->kl", _arg_mono_grad(m), S) for m in _ARG_REF_EDGE_MIDS])  # (3, 21, 2)
+    return ElementSpec(
+        family="Argyris-Tri",
+        n_dof=21,
+        value_size=1,
+        quad_points=qp,
+        quad_weights=np.asarray(qw),
+        ref_values=rv,
+        ref_div=None,
+        ref_grads=rg,
+        local_edges=BASIX_TRIANGLE_EDGES,
+        ref_hess=rh,
+        ref_aux=(nv_val, nv_grad, nv_hess, ne_grad),
+    )
+
+
+def argyris_pushforward(ref_values, ref_grads, ref_hess, J, detJ, edge_normals, nodal):
+    """Map the reference Argyris basis to a physical cell via the affine DOF-transform ``M(cell)``.
+
+    ``M[m,k] = ℓ_m^phys(ψ̂_k)`` applies the 21 *physical* functionals to the mapped reference basis: the
+    vertex value rows are ``ψ_k(ξ_i)``; the gradient rows ``Kᵀ ∇_ξψ_k(ξ_i)``; the Hessian rows the three
+    independent entries of ``Kᵀ H_ξψ_k(ξ_i) K``; the edge rows ``n_e · Kᵀ ∇_ξψ_k(ξ_mid_e)`` with ``n_e``
+    the **physical, globally-oriented** edge normal (the cross-cell C¹ ingredient). The physical basis is
+    ``φ_n = Σ_k C[k,n] ψ̂_k`` with ``C = M⁻¹``; tabulating it at the quad points gives ``shape_vals``,
+    and the chain rule (``∇ₓ = Kᵀ∇_ξ``, ``Hₓ = Kᵀ H_ξ K``) gives ``shape_grads`` / ``shape_hess``. A scalar
+    field → shapes match nodal Lagrange, so the shared evaluator serves it once ``M`` is baked in.
+
+    ``nodal = (nv_val, nv_grad, nv_hess, ne_grad)`` are the reference nodal tabulations from
+    :func:`argyris_triangle`; ``edge_normals`` is the cell's ``(3, 2)`` physical edge normals (one per local
+    edge ``k``, globally oriented)."""
+    nv_val, nv_grad, nv_hess, ne_grad = nodal
+    K = jnp.linalg.inv(J)
+    # M(cell): assemble the 21 functional rows column-blockwise over the basis index k.
+    vg = jnp.einsum("lm,vkl->vkm", K, nv_grad)  # (3,21,2) Kᵀ∇ at each vertex
+    vh = jnp.einsum("pa,vkpq,qb->vkab", K, nv_hess, K)  # (3,21,2,2) Kᵀ H K at each vertex
+    eg = jnp.einsum("lm,ekl->ekm", K, ne_grad)  # (3,21,2) Kᵀ∇ at each edge midpoint
+    en = jnp.einsum("em,ekm->ek", edge_normals, eg)  # (3,21) n_e · Kᵀ∇
+    rows = []
+    for v in range(3):
+        rows += [nv_val[v], vg[v, :, 0], vg[v, :, 1], vh[v, :, 0, 0], vh[v, :, 0, 1], vh[v, :, 1, 1]]
+    for e in range(3):
+        rows.append(en[e])
+    M = jnp.stack(rows, axis=0)  # (21, 21)
+    C = jnp.linalg.inv(M)
+    rv = ref_values[..., 0]  # (n_quad, 21)
+    rg = ref_grads[..., 0, :]  # (n_quad, 21, 2)
+    rh = ref_hess[..., 0, :, :]  # (n_quad, 21, 2, 2)
+    phi = jnp.einsum("qk,kn->qn", rv, C)  # (n_quad, 21)
+    grad = jnp.einsum("qkl,kn,lm->qnm", rg, C, K)  # (n_quad, 21, 2) physical gradient
+    hess = jnp.einsum("qkij,kn,ia,jb->qnab", rh, C, K, K)  # (n_quad, 21, 2, 2) physical Hessian
     return phi, grad, hess
