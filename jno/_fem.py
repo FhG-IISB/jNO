@@ -735,6 +735,8 @@ class FEM:
         self._periodic = None  # periodic-tie reduction (prolongation P), attached by fem()
         self._offsets = offsets  # per-field block offsets for the native non-nodal path (else problem.offset)
         self._term_source = None  # (domain, volume_terms); attached by fem() for the provisional term_kinds accessor
+        self._constraints = None  # original constraint list; attached by fem() for the adaptive driver
+        self._fem_kwargs = {}  # original fem() build options; attached by fem() for the adaptive driver
 
         self._A = self._b = None
         if mode == "linear":
@@ -795,8 +797,17 @@ class FEM:
             return list(self._offsets)
         return getattr(self.problem, "offset", None)
 
-    def solve(self, solve_fn=None, **kwargs) -> Any:
+    def solve(self, solve_fn=None, *, adapt=None, **kwargs) -> Any:
         """Differentiable forward solve as a trace node — the inverse-problem entry.
+
+        Pass ``adapt=AdaptSpec(...)`` to run the **adaptive** loop
+        (``solve -> estimate -> mark -> refine``): the domain is remeshed in place to
+        equidistribute a Zienkiewicz–Zhu error estimate, and this returns the solution
+        on the final adapted mesh. After it returns, this ``FEM`` and its ``domain`` refer
+        to that final mesh, and ``fem.adapt_history`` records the per-round trace. The
+        refinement step is non-differentiable (discrete remeshing); gradients are exact on
+        the frozen final mesh, so a differentiable inverse problem is run *after* adapting.
+        See :class:`jno.utils.solver.fem_adapt.AdaptSpec`.
 
         Delegates to :meth:`FemLinearSystem.solve` (steady linear),
         :meth:`FemResidualOperator.solve` (steady nonlinear), or
@@ -833,6 +844,10 @@ class FEM:
         ``[[A_r,-A_i],[A_i,A_r]]`` (the assembly produces only real systems); pass ``solve_fn=(A, b) -> u``
         to choose the real block solver.
         """
+        if adapt is not None:
+            from .utils.solver.fem_adapt import run_adaptive_solve
+
+            return run_adaptive_solve(self, adapt, solve_fn=solve_fn, **kwargs)
         if self._mode == "complex":
             return _solve_complex_block(self._op, solve_fn)
         if self._mode == "complex_transient":
@@ -1556,6 +1571,13 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     if len(constraints) == 0:
         raise ValueError("jno.fem: no constraints provided.")
 
+    # Keep the user's original constraint list + build options so the adaptive driver
+    # (``FEM.solve(adapt=...)``) can re-assemble the *same* problem after the domain is
+    # remeshed in place -- the constraints reference the domain (not a mesh snapshot),
+    # so re-tracing them picks up the refined mesh automatically.
+    _orig_constraints = list(constraints)
+    _orig_fem_kwargs = {"quad_degree": quad_degree, "element_type": element_type, "vec": vec}
+
     # Gauge pins (`p.pin()`) remove a field's constant null space. Lower each to a single-node
     # Dirichlet `p(node) - value` *before* domain discovery and classification: a GaugePin is a
     # bare marker, not a walkable expression, so it must not reach `_discover_domain` (which walks
@@ -1637,6 +1659,8 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         the time route's existing context-driven reduction. Single-field, vector, and coupled
         multi-field are all reduced block-wise (P_i^T M[i,j] P_j); complex / runtime-parametric remain out."""
         fem_obj._term_source = (domain, volume_terms)
+        fem_obj._constraints = _orig_constraints
+        fem_obj._fem_kwargs = _orig_fem_kwargs
         if couplings:
             if periodic_ties:
                 raise NotImplementedError(

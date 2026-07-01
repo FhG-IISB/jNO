@@ -106,10 +106,15 @@ exclude = '^(build/|jNO\.egg-info/|runs/)'
 # Test/tutorial env extras. matplotlib + diffrax are NOT runtime deps (the library
 # only imports them lazily, inside try/except); they live here so the tutorial suite
 # and the explainability-callback plotting run unmodified in tests.
+#
+# mmgpy (metric-based local remesher) backs the adaptive-FEM loop in
+# jno.utils.solver.fem_adapt. It is imported lazily inside remesh_with_mmg, so the
+# core install stays lean; it only needs to be present in the fem/dev test envs.
 fem = [
     "pyfiglet",
     "diffrax",
     "matplotlib",
+    "mmgpy>=0.16",
 ]
 dev = [
     "pytest-xdist>=3.8.0",
