@@ -1706,6 +1706,12 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         spec = _rotation_bc_spec(c, domain)
         (rotation_bcs.append(spec) if spec is not None else _core_r.append(c))
     constraints = _core_r
+    if rotation_bcs and not (_trial_spaces(constraints) - {"Lagrange"}):
+        raise NotImplementedError(
+            "jno.fem: a rotation BC `u.dn(region) - h` is a 4th-order plate essential BC — it requires a field "
+            "on the Argyris or Morley element (`space='Argyris'`/`'Morley'`), not C⁰ Lagrange (which has no "
+            "normal-derivative DOF)."
+        )
 
     # VPINN: a network trial (``u = net(x, y)`` written into the weak form) makes jno.fem
     # test-project the weak form onto the FE test space -> a trainable residual loss, not an FE

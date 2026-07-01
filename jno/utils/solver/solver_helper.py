@@ -77,6 +77,13 @@ def iter_children(node: Any):
 
     if isinstance(node, NormalDerivative):
         yield node.target
+        # The target is usually a bound field view (`u(x, y)`) that survived un-lowered here (its arithmetic
+        # un-wrapping never fired inside the wrapper); descend its `_expr` so trial/field detection reaches the
+        # underlying field. Confined to this node so no other view is exposed. Region comes from the view's
+        # `_coord_vars` (read off the yielded target itself).
+        inner = getattr(node.target, "_expr", None)
+        if isinstance(inner, Placeholder):
+            yield inner
         return
 
     if isinstance(node, Tracker):
@@ -99,14 +106,6 @@ def iter_children(node: Any):
     if isinstance(node, StateField):
         # StateField wraps the actual symbolic unknown expression.
         yield node.expr
-        return
-
-    inner = getattr(node, "_expr", None)
-    if isinstance(inner, Placeholder):
-        # A bound field view (`u(x, y)` = a typed view over the field's `_expr`) that survived un-lowered
-        # -- e.g. inside a NormalDerivative, where the view's arithmetic un-wrapping never fired. Descend to
-        # the underlying field so trial/field detection reaches it (region comes from the view's _coord_vars).
-        yield inner
         return
 
 

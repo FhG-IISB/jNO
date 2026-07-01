@@ -3338,8 +3338,11 @@ class TestFunction(Placeholder):
         return self.partials(**binding)
 
     def dn(self, *coords, **named):
-        """Normal derivative ``∂φ/∂n`` of the test function on the boundary region carried by ``coords`` —
-        for the natural moment term ``M * phi.dn(region)`` (the moment does work through the rotation)."""
+        """Normal derivative ``∂φ/∂n`` of the test function on the boundary region carried by ``coords``.
+
+        Intended for the natural plate **moment** term ``M * phi.dn(region)`` (the moment does work through the
+        rotation) — note that inhomogeneous natural BCs (prescribed edge moment/shear) are **not yet wired**;
+        the essential rotation BC uses the *trial* form ``u.dn(region) - h``."""
         return NormalDerivative(self(*coords, **named))
 
     def __repr__(self):
