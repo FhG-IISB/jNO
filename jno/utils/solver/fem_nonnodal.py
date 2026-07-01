@@ -778,19 +778,20 @@ def _hermite_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, 
 
 
 def _argyris_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, offs, top, n_verts):
-    """Essential BC for an Argyris field by pinning the **full C¹ trace of a known field** ``g`` — value,
-    gradient and Hessian at each boundary vertex, plus the normal derivative ``∂g/∂n`` at each boundary-edge
-    midpoint (all of ``g``'s boundary DOFs, taken by **autodiff** of the Dirichlet value node so any smooth
-    ``g(x, y)`` works). For a **manufactured / known** ``g`` this imposes the exact essential data and is the
-    right BC for verification (exact recovery, convergence). The edge-normal pin uses the SAME
-    globally-oriented normal as the assembler so the two incident cells agree.
+    """**Proper clamped** essential BC for an Argyris field: impose ``u = g`` AND ``∂u/∂n = ∂g/∂n`` on the
+    boundary while leaving the boundary curvature ``∂²u/∂n²`` **free** (the physical clamped condition — the
+    normal second derivative is a *natural* BC). At each boundary vertex it pins the value and the full
+    gradient; along each boundary edge it pins the tangential-tangential and normal-tangential second
+    derivatives and the edge-midpoint normal derivative, but **not** the normal-normal Hessian DOF. ``g`` and
+    its derivatives are taken by autodiff of the Dirichlet value node, so any smooth ``g(x, y)`` works.
 
-    Caveat (not the general clamped BVP). Because this pins *every* boundary DOF — including the second
-    derivatives — it imposes more than the physical clamped condition ``u = g, ∂u/∂n = h``: it also fixes the
-    boundary curvature to ``D²g``. For a known/manufactured ``g`` that is correct (the pinned ``D²g`` is the
-    truth), but for a *generic* clamped plate (only ``u`` and ``∂u/∂n`` prescribed, the boundary ``∂²u/∂n²``
-    free) it over-constrains the solution. A true clamped BVP supplying only ``u`` and ``∂u/∂n`` — leaving the
-    normal second derivative free — is **not yet expressible** through this term."""
+    On an **axis-aligned** boundary edge the ``(n, t)`` frame is the ``(x, y)`` frame, so ``∂ₙₙ`` is already a
+    single Argyris Hessian DOF (``∂ₓₓ`` on an ``x=const`` edge, ``∂ᵧᵧ`` on a ``y=const`` edge) — proper-clamped
+    simply *skips* that DOF. Pins are collected per boundary edge into a dict keyed by DOF, so a **corner**
+    (two edges skipping different DOFs) is automatically re-pinned on both — the corner is fully clamped, which
+    is the correct, consistent behaviour there. This keeps the whole BC a plain ``(dof, value)`` pin list, so it
+    composes with every solver mode (steady/nonlinear/transient/inverse/dynamic-plate) unchanged. A
+    non-axis-aligned boundary edge would need the ``(n, t)`` rotation (not wired) and is **rejected loudly**."""
     from ..._fem import _eval_value_node_at
     from .fem_1d import _region_node_ids
 
@@ -807,35 +808,46 @@ def _argyris_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, 
     counts = np.bincount(cell_edges.reshape(-1), minlength=top.n_edges)
     boundary_edges = {int(e) for e in np.where(counts == 1)[0]}
 
-    pins = []
+    pins: dict = {}  # dof -> value; a dict unions per-edge Hessian pins so corners auto-full-pin
     for fk, region, _comp, _value, value_node in dirichlet_raw:
         fidx = field_index.get(fk)
         if fidx is None or spaces[fidx] != "Argyris":
             continue
         base = offs[fidx]
+        edge_base = base + 6 * n_verts
         region_nodes = {int(v) for v in _region_node_ids(domain, region)}
-        for v in region_nodes:  # value + gradient + Hessian at boundary vertices
-            g, grad, H = _g_derivs(value_node, pts_np[v])
-            pins += [
-                (base + 6 * v + 0, g),
-                (base + 6 * v + 1, float(grad[0])),
-                (base + 6 * v + 2, float(grad[1])),
-                (base + 6 * v + 3, float(H[0, 0])),
-                (base + 6 * v + 4, float(H[0, 1])),
-                (base + 6 * v + 5, float(H[1, 1])),
-            ]
-        edge_base = base + 6 * n_verts  # ∂g/∂n at boundary-edge midpoints
+        for v in region_nodes:  # value + full gradient at every boundary vertex (∂ₙ = ∂g/∂n, ∂ₜ = ∂g/∂t)
+            g, grad, _H = _g_derivs(value_node, pts_np[v])
+            pins[base + 6 * v + 0] = g
+            pins[base + 6 * v + 1] = float(grad[0])
+            pins[base + 6 * v + 2] = float(grad[1])
         for eid in boundary_edges:
             va, vb = (int(x) for x in top.edge_vertices[eid])  # canonical (lo, hi)
             if va not in region_nodes or vb not in region_nodes:
                 continue
-            mid = 0.5 * (pts_np[va] + pts_np[vb])
-            d = pts_np[vb] - pts_np[va]
-            n = np.array([-d[1], d[0]])  # R90·(P[hi] - P[lo]) — the assembler's global orientation
+            evec = pts_np[vb] - pts_np[va]  # edge tangent
+            atol = 1e-9 * (float(np.linalg.norm(evec)) + 1.0)
+            if abs(evec[0]) < atol:  # edge along y (on x=const) -> normal x -> free ∂ₙₙ = ∂ₓₓ (DOF 6v+3)
+                skip = 3
+            elif abs(evec[1]) < atol:  # edge along x (on y=const) -> normal y -> free ∂ₙₙ = ∂ᵧᵧ (DOF 6v+5)
+                skip = 5
+            else:
+                raise NotImplementedError(
+                    "jno.fem (non-nodal): the proper clamped BC (free boundary curvature) is wired for "
+                    f"axis-aligned boundary edges only; got a boundary edge with tangent {tuple(np.round(evec, 4))}. "
+                    "The general-orientation (n,t)-rotation treatment is not wired -- use an axis-aligned domain."
+                )
+            for v in (va, vb):  # pin the Hessian DOFs EXCEPT the normal-normal one (the free curvature)
+                _g, _grad, H = _g_derivs(value_node, pts_np[v])
+                for k, hval in ((3, H[0, 0]), (4, H[0, 1]), (5, H[1, 1])):
+                    if k != skip:
+                        pins[base + 6 * v + k] = float(hval)
+            mid = 0.5 * (pts_np[va] + pts_np[vb])  # ∂g/∂n at the edge midpoint (the assembler's global normal)
+            n = np.array([-evec[1], evec[0]])
             n = n / np.linalg.norm(n)
-            _, grad, _ = _g_derivs(value_node, mid)
-            pins.append((edge_base + eid, float(n @ grad)))
-    return pins
+            _g, grad, _H = _g_derivs(value_node, mid)
+            pins[edge_base + eid] = float(n @ grad)
+    return list(pins.items())
 
 
 def _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree):

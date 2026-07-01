@@ -142,13 +142,13 @@ problems whose natural space is *not* H¹. Pick one with the `space=` knob on `f
 > `M(cell)` (R.C. Kirby, *A general approach to transforming finite elements*, SMAI J. Comput. Math. 4,
 > 2018; the original element is Argyris–Fried–Scharpf 1968). The **globally-oriented edge-normal DOF** is
 > what makes it C¹ on an *unstructured* mesh — the reference-normal reduced-quintic (Bell) is not affine
-> equivalent and fails there. A Dirichlet term `u(region) - g` pins the **full C¹ trace of a known field**
-> `g` (value, gradient and Hessian at boundary vertices; `∂g/∂n` at boundary-edge midpoints) by autodiff of
-> `g` — the right essential BC for **verification with a manufactured `g`** (exact recovery, convergence).
-> Note it pins *all* boundary DOFs including the boundary curvature `D²g`, so it imposes more than the
-> physical clamped condition `u = g, ∂u/∂n = h`; a *generic* clamped BVP (only `u` and `∂u/∂n` prescribed,
-> the boundary `∂²u/∂n²` free) is not yet expressible. Composes with the steady, transient and nonlinear
-> `fem.solve()` paths (see
+> equivalent and fails there. A Dirichlet term `u(region) - g` imposes the **proper clamped BC** — `u = g`
+> and `∂u/∂n = ∂g/∂n` on the boundary, with the boundary curvature `∂²u/∂n²` left **free** (a natural BC, as
+> a physical clamped plate requires). `g` and its derivatives are taken by autodiff, so any smooth `g(x, y)`
+> works; a corner is automatically fully clamped. This is wired for **axis-aligned boundary edges** (where
+> the `(n,t)` frame is the `(x,y)` frame, so `∂ₙₙ` is a single DOF to skip); a non-axis-aligned boundary edge
+> needs the general `(n,t)` rotation and is **rejected with a clear error**. Composes with the steady,
+> transient and nonlinear `fem.solve()` paths (see
 > `tests/test_fem_argyris.py`: exact biharmonic recovery on an unstructured mesh, convergence, nonlinear
 > `Δ²u + u³ = f`, the dissipative biharmonic heat flow, and a **vibrating clamped plate** `w_tt + Δ²w = 0`
 > (the augmented `[w, v]` block, energy-conserving trapezoidal integration — a direct θ-solver for the stiff

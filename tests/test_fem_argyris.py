@@ -288,6 +288,56 @@ def test_argyris_transient_biharmonic_dissipates():
     assert norms[-1] < 0.999 * norms[0], f"transient did not evolve/decay: {norms[0]:.3e} -> {norms[-1]:.3e}"
 
 
+def test_argyris_clamped_bc_frees_boundary_curvature():
+    """The **proper clamped BC**: `u(region) - g` pins value + ∂u/∂n but leaves the boundary curvature
+    ∂²u/∂n² *free* (a natural BC). Manufactured `u* = sin²(πx)sin²(πy)` is homogeneous-clamped
+    (`u* = ∂u*/∂n = 0` on ∂Ω) but has **nonzero** boundary curvature. So the proper clamped BC converges to
+    `u*`, whereas pinning the *full trace* (`∂²u/∂n² = 0`, the old over-constraint) solves a different,
+    over-stiff problem and does **not** — this is exactly what distinguishes a true clamped plate."""
+
+    def _setup(ms):
+        d = jno.domain(box(0, 0, 1, 1), mesh_size=ms)
+        xi, yi, _ = d.variable("interior", split=True)
+        a = 2 * PI
+        c2x, c2y = jno.np.cos(a * xi), jno.np.cos(a * yi)
+        px, py = (1 - c2x) / 2, (1 - c2y) / 2
+        f = 8 * PI**4 * (c2x * (c2y - py) - px * c2y)  # Δ²(sin²πx·sin²πy)
+        u, phi = d.fem_symbols(space="Argyris")
+        ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+        pts = np.asarray(d.mesh.points)[:, :2]
+        ue = (np.sin(PI * pts[:, 0]) ** 2) * (np.sin(PI * pts[:, 1]) ** 2)
+        return d, xi, yi, u, ui, vi, f, pts, ue
+
+    def _err_proper(ms):  # proper clamped BC via the DSL (frees ∂²u/∂n²)
+        d, xi, yi, u, ui, vi, f, pts, ue = _setup(ms)
+        xb, yb, _ = d.variable("boundary", split=True)
+        fem = jno.fem([laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi]) - f * vi, u(xb, yb) - 0.0])
+        uh = _value_dofs(_eval(fem.solve()).reshape(-1), pts.shape[0])
+        return float(np.linalg.norm(uh - ue) / np.linalg.norm(ue))
+
+    def _err_full_trace(ms):  # manual: pin ALL boundary DOFs to 0 (the old over-constraint, incl. ∂²/∂n²)
+        d, xi, yi, u, ui, vi, f, pts, ue = _setup(ms)
+        fem = jno.fem([laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi]) - f * vi])
+        K, b = _dense(fem.A).copy(), np.asarray(fem.b).reshape(-1).copy()
+        _p, _c, top = _topology(d)
+        nv = pts.shape[0]
+        bverts, bedges = _boundary(pts, top)
+        pinned = [6 * v + k for v in bverts for k in range(6)] + [6 * nv + e for e in bedges]
+        for dof in pinned:
+            K[dof, :] = 0.0
+            K[:, dof] = 0.0
+            K[dof, dof] = 1.0
+            b[dof] = 0.0
+        return float(np.linalg.norm(np.linalg.solve(K, b)[6 * np.arange(nv)] - ue) / np.linalg.norm(ue))
+
+    ep_coarse, ep_fine = _err_proper(0.3), _err_proper(0.2)
+    ef_fine = _err_full_trace(0.2)
+    assert ep_fine < ep_coarse, f"proper clamped must converge to sin²·sin²: {ep_coarse:.3e} -> {ep_fine:.3e}"
+    assert ep_fine < 0.05, f"proper clamped too inaccurate: {ep_fine:.3e}"
+    # the over-constrained full-trace pin solves a DIFFERENT (over-stiff) problem -> clearly larger error
+    assert ef_fine > 3 * ep_fine, f"proper clamped ({ep_fine:.3e}) should clearly beat the full-trace pin ({ef_fine:.3e})"
+
+
 def test_argyris_dynamic_plate_conserves_energy():
     """Argyris + **second-order-in-time** (a vibrating Kirchhoff plate): ``w_tt + Δ²w = 0``, clamped, released
     from rest. The augmented [w, v] block integrates by the trapezoidal (Newmark average-acceleration) rule,
