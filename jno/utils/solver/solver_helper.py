@@ -11,6 +11,7 @@ from ...trace import (
     Jacobian,
     Literal,
     ModelCall,
+    NormalDerivative,
     OperationCall,
     OperationDef,
     Placeholder,
@@ -74,6 +75,10 @@ def iter_children(node: Any):
                 yield v
         return
 
+    if isinstance(node, NormalDerivative):
+        yield node.target
+        return
+
     if isinstance(node, Tracker):
         yield node.expr
         return
@@ -94,6 +99,14 @@ def iter_children(node: Any):
     if isinstance(node, StateField):
         # StateField wraps the actual symbolic unknown expression.
         yield node.expr
+        return
+
+    inner = getattr(node, "_expr", None)
+    if isinstance(inner, Placeholder):
+        # A bound field view (`u(x, y)` = a typed view over the field's `_expr`) that survived un-lowered
+        # -- e.g. inside a NormalDerivative, where the view's arithmetic un-wrapping never fired. Descend to
+        # the underlying field so trial/field detection reaches it (region comes from the view's _coord_vars).
+        yield inner
         return
 
 

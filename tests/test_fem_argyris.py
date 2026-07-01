@@ -200,16 +200,29 @@ def test_argyris_biharmonic_recovers_biharmonic_polynomial_exactly():
 
 
 def test_argyris_clamped_dsl_recovers_exactly():
-    """Argyris + the DSL clamped BC: ``u(boundary) - g`` pins the FULL C¹ trace of ``g`` (value, gradient,
-    Hessian at vertices; ∂g/∂n at edge midpoints) by autodiff of ``g``. With ``g = u* = x⁴+y⁴`` (so the
-    boundary data is exact) the solve recovers ``u*`` exactly — validating the autodiff clamped-BC path."""
+    """Argyris + the **explicit** clamped DSL BC: the deflection ``u(region)-g`` pins the value trace and the
+    rotation ``u.dn(region)-h`` pins ``∂u/∂n``. With ``u* = x⁴+y⁴`` clamped to its exact trace (``∂u*/∂n`` is
+    the constant 0 on the ``x=0``/``y=0`` edges, 4 on ``x=1``/``y=1``) the solve recovers ``u*`` exactly —
+    validating that the value + rotation pins together reproduce a full clamped trace."""
     d = jno.domain(box(0, 0, 1, 1), mesh_size=0.32)
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+    xbo, ybo, _ = d.variable("bottom", split=True)
     ui, vi, u, _phi = _symbols(d, x=xi, y=yi)
     f = 48.0 + 0.0 * xi
-    g = xb**4 + yb**4
-    fem = jno.fem([laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi]) - f * vi, u(xb, yb) - g])
+    fem = jno.fem(
+        [
+            laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi]) - f * vi,
+            u(xb, yb) - (xb**4 + yb**4),  # deflection on the full boundary
+            u.dn(xl, yl) - 0.0,
+            u.dn(xbo, ybo) - 0.0,  # ∂u*/∂n = 0 on x=0 and y=0
+            u.dn(xr, yr) - 4.0,
+            u.dn(xt, yt) - 4.0,  # ∂u*/∂n = 4 on x=1 and y=1
+        ]
+    )
     sol = _eval(fem.solve()).reshape(-1)
     pts = np.asarray(d.mesh.points)[:, :2]
     nv = pts.shape[0]
@@ -308,10 +321,10 @@ def test_argyris_clamped_bc_frees_boundary_curvature():
         ue = (np.sin(PI * pts[:, 0]) ** 2) * (np.sin(PI * pts[:, 1]) ** 2)
         return d, xi, yi, u, ui, vi, f, pts, ue
 
-    def _err_proper(ms):  # proper clamped BC via the DSL (frees ∂²u/∂n²)
+    def _err_proper(ms):  # clamped BC via the DSL: deflection u(reg)-g + rotation u.dn(reg)-h (frees ∂²u/∂n²)
         d, xi, yi, u, ui, vi, f, pts, ue = _setup(ms)
         xb, yb, _ = d.variable("boundary", split=True)
-        fem = jno.fem([laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi]) - f * vi, u(xb, yb) - 0.0])
+        fem = jno.fem([laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi]) - f * vi, u(xb, yb) - 0.0, u.dn(xb, yb) - 0.0])
         uh = _value_dofs(_eval(fem.solve()).reshape(-1), pts.shape[0])
         return float(np.linalg.norm(uh - ue) / np.linalg.norm(ue))
 

@@ -144,12 +144,12 @@ problems whose natural space is *not* H¹. Pick one with the `space=` knob on `f
 > `M(cell)` (R.C. Kirby, *A general approach to transforming finite elements*, SMAI J. Comput. Math. 4,
 > 2018; the original element is Argyris–Fried–Scharpf 1968). The **globally-oriented edge-normal DOF** is
 > what makes it C¹ on an *unstructured* mesh — the reference-normal reduced-quintic (Bell) is not affine
-> equivalent and fails there. A Dirichlet term `u(region) - g` imposes the **proper clamped BC** — `u = g`
-> and `∂u/∂n = ∂g/∂n` on the boundary, with the boundary curvature `∂²u/∂n²` left **free** (a natural BC, as
-> a physical clamped plate requires). `g` and its derivatives are taken by autodiff, so any smooth `g(x, y)`
-> works; a corner is automatically fully clamped. This is wired for **axis-aligned boundary edges** (where
-> the `(n,t)` frame is the `(x,y)` frame, so `∂ₙₙ` is a single DOF to skip); a non-axis-aligned boundary edge
-> needs the general `(n,t)` rotation and is **rejected with a clear error**. Composes with the steady,
+> equivalent and fails there. Its essential BCs are the two plate traces — `u(region) - g` pins the
+> **deflection** and `u.dn(region) - h` pins the **rotation** `∂u/∂n` (see *Plate boundary conditions* below);
+> the boundary curvature `∂²u/∂n²` is always left **free** (a natural BC, as a physical plate requires). These
+> are wired for **axis-aligned boundary edges** (where the `(n,t)` frame is the `(x,y)` frame, so each trace is
+> a single DOF); a non-axis-aligned edge needs the general `(n,t)` rotation and is **rejected with a clear
+> error** (use the Morley element there — any orientation). Composes with the steady,
 > transient and nonlinear `fem.solve()` paths (see
 > `tests/test_fem_argyris.py`: exact biharmonic recovery on an unstructured mesh, convergence, nonlinear
 > `Δ²u + u³ = f`, the dissipative biharmonic heat flow, and a **vibrating clamped plate** `w_tt + Δ²w = 0`
@@ -166,10 +166,28 @@ problems whose natural space is *not* H¹. Pick one with the `space=` knob on `f
 > sharper phase-field crack). **Modelling subtlety:** because it is non-conforming, the biharmonic form must
 > be the **full-Hessian inner product** `inner(hessian(u), hessian(v))` (`∫D²u:D²v`), *not* `∫Δu·Δv` — the
 > Laplacian form is singular for Morley (functions like `xy` have `Δu = 0` but `D²u ≠ 0`, a spurious kernel).
-> A Dirichlet term `u(region) - g` pins the boundary vertex values and edge-normal derivatives to `g` and
-> `∂g/∂n` (the natural Morley clamped/Dirichlet BC — there is no curvature DOF). See `tests/test_fem_morley.py`.
+Its essential BCs are the same two plate traces as Argyris — `u(region) - g` (deflection) and
+> `u.dn(region) - h` (rotation) — but on **any** boundary orientation (Morley's DOFs are already the vertex
+> value and the edge-normal derivative, so no `(n,t)` rotation is needed). See `tests/test_fem_morley.py`.
 > Reference: L.S.D. Morley, *The triangular equilibrium element in the solution of plate bending problems*,
 > Aeronautical Quarterly **19** (1968) 149–169.
+
+> **Plate boundary conditions.** For a 4th-order (plate/biharmonic) field on the Argyris or Morley element the
+> boundary trace has two essential parts you can pin independently — the **deflection** `u(region) - g` and the
+> **rotation** `u.dn(region) - h` (`∂u/∂n = h`) — plus two conjugate **natural** parts (bending moment `M_n`,
+> effective shear `V_n`) that emerge on any trace you *don't* pin. The classical BCs compose from these:
+>
+> | BC | Physics | How to write it (on a region) |
+> |----|---------|-------------------------------|
+> | **Clamped** | `w=0`, `∂w/∂n=0` | `u(reg)-g`, `u.dn(reg)-0` |
+> | **Simply-supported** | `w=0`, `M_n=0` | `u(reg)-g` |
+> | **Guided / sliding** | `∂w/∂n=0`, `V_n=0` | `u.dn(reg)-h` |
+> | **Free** | `M_n=0`, `V_n=0` | *(write neither — natural)* |
+>
+> A free edge (no essential BC) gets the natural `M_n=V_n=0` from the physically-correct **ν-weighted plate
+> energy** `(1-ν)·inner(hessian(u),hessian(v)) + ν·laplacian(u)·laplacian(v)`. Validated against Timoshenko's
+> square-plate coefficients — clamped `w_max = 0.00126 qa⁴/D`, simply-supported `w_max = 0.00406 qa⁴/D`.
+> *(Prescribed nonzero edge moment/shear — inhomogeneous natural BCs — are not yet wired.)*
 
 ```python
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")   # H(div) flux

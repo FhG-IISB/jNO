@@ -62,7 +62,7 @@ def build(mesh_size):
     u, phi = d.fem_symbols(space="Argyris")
     ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
     q = 1.0 + 0.0 * xi  # uniform transverse load
-    fem = jno.fem([k * (laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi])) - q * vi, u(xb, yb) - 0.0])
+    fem = jno.fem([k * (laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi])) - q * vi, u(xb, yb) - 0.0, u.dn(xb, yb) - 0.0])
     return d, k, fem
 
 

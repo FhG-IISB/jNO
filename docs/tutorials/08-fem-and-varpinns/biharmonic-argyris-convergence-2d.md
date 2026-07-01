@@ -26,14 +26,12 @@ fem = jno.fem([laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi]) - f * vi, u(xb,
 sol = fem.solve()
 ```
 
-For an Argyris field the Dirichlet term `u(boundary) - g` imposes the **proper clamped** condition by
-*autodiff* of the known field `g`: it pins the value and gradient (so $u=g$ and $\partial u/\partial n =
-\partial g/\partial n$) and the edge normal-derivative, while leaving the boundary curvature $\partial^2
-u/\partial n^2$ **free** — the physical clamped-plate BC, where the normal–normal second derivative is a
-*natural* condition recovered by the solve. For a **manufactured** solution the pinned value and gradient are
-exact and the freed curvature converges to $\partial^2 u^\ast/\partial n^2$, so the discrete solution still
-converges to $u^\ast$ at the optimal rate. (The companion [clamped Kirchhoff plate](clamped-kirchhoff-plate-2d.md)
-tutorial reads that freed curvature off the solution as the clamp reaction moment.)
+Since $u^\ast=\sin(\pi x)\sin(\pi y)$ vanishes together with $\Delta u^\ast$ on $\partial\Omega$, this is a
+**simply-supported** plate: the deflection Dirichlet `u(boundary) - g` *alone* is the exact essential BC (it
+pins the value; the rotation and the moment $M_n\propto\Delta u$ are the *natural* conditions, satisfied by
+$u^\ast$), so the discrete solution converges to $u^\ast$ at the optimal rate. (A *clamped* plate additionally
+pins the rotation with `u.dn(region)-h`, leaving the boundary curvature free; see the companion
+[clamped Kirchhoff plate](clamped-kirchhoff-plate-2d.md) tutorial.)
 
 ## Order of accuracy
 
@@ -51,17 +49,17 @@ a hand-built field. Solving on a sequence of unstructured meshes recovers exactl
 
 ```
          h    dofs       L2 err   rate   energy err   rate
-    0.5303      97    1.425e-04     --    2.926e-02     --
-    0.4226     165    1.451e-05  10.07    8.879e-03   5.25
-    0.3112     251    2.931e-06   5.23    3.590e-03   2.96
-    0.2021     495    1.967e-07   6.26    6.265e-04   4.04
+    0.5303      97    3.495e-05     --    2.009e-02     --
+    0.4226     165    5.950e-06   7.80    7.180e-03   4.53
+    0.3112     251    2.080e-06   3.43    3.229e-03   2.61
+    0.2021     495    1.277e-07   6.46    5.585e-04   4.07
 
-  least-squares order:  L2 ≈ 6.59  (theory 6)   energy ≈ 3.87  (theory 4)
+  least-squares order:  L2 ≈ 5.59  (theory 6)   energy ≈ 3.61  (theory 4)
 ```
 
 ![Argyris C¹ biharmonic convergence: measured L² and energy errors against the O(h⁶) and O(h⁴) reference slopes.](/jNO/assets/biharmonic_argyris_convergence_2d.png)
 
-The measured orders (energy $\approx 3.87$, $L^2 \approx 6.6$) sit right on the optimal $O(h^4)$ / $O(h^6)$
+The measured orders (energy $\approx 3.6$, $L^2 \approx 5.6$) sit right on the optimal $O(h^4)$ / $O(h^6)$
 theory — the high-order convergence a $C^0$ Hessian assembly **cannot** deliver. The same element composes
 with nonlinear ($\Delta^2 u + u^3 = f$) and transient (the dissipative biharmonic heat flow) solves; see
 `tests/test_fem_argyris.py`.

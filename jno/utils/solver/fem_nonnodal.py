@@ -91,7 +91,9 @@ def assemble_mixed_poisson_rt(
     return A, b, top, spec
 
 
-def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, *, flux_bcs=(), quad_degree=4):
+def assemble_fem_nonnodal(
+    domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, *, flux_bcs=(), rotation_bcs=(), quad_degree=4
+):
     """Native push-forward assembler for non-nodal (RT, ...) fields, driven by the weak-form DSL.
 
     It lowers each weak term, builds a per-cell ``local`` carrying the field's *physical* (push-forward)
@@ -473,16 +475,34 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
         if flux_bcs
         else []
     )
+    # Essential plate BCs compose from two independent traces: the **deflection** ``u(region)-g`` (value)
+    # and the **rotation** ``u.dn(region)-h`` (normal derivative). Clamped = both; simply-supported = value
+    # only; guided = rotation only; free = neither. Value BCs arrive in ``dirichlet_raw``; rotation BCs in
+    # ``rotation_bcs`` (normalised to the same 5-tuple shape, value node = the prescribed ∂u/∂n).
+    _rot_as_dir = [(fk, region, None, None, vn) for (fk, region, vn) in rotation_bcs]
     if has_hermite and dirichlet_raw:  # Hermite value-Dirichlet: pin boundary-vertex value DOFs to g
         pins = pins + _hermite_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs)
-    if has_argyris and dirichlet_raw:  # Argyris clamped BC: pin the full C1 boundary trace of g
+    if has_argyris and dirichlet_raw:  # deflection: pin the boundary value + tangential trace, free the normal
         pins = pins + _argyris_dirichlet_pins(
-            dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs, top, n_verts
+            dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs, top, n_verts, kind="value"
         )
-    if has_morley and dirichlet_raw:  # Morley BC: pin the boundary vertex values + edge-normal derivatives of g
+    if has_argyris and _rot_as_dir:  # rotation ∂u/∂n: pin the normal-derivative DOFs
+        pins = pins + _argyris_dirichlet_pins(
+            _rot_as_dir, domain, field_index, spaces, np.asarray(pts), offs, top, n_verts, kind="rotation"
+        )
+    if has_morley and dirichlet_raw:  # deflection: pin the boundary vertex value DOFs
         pins = pins + _morley_dirichlet_pins(
-            dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs, top, n_verts
+            dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs, top, n_verts, kind="value"
         )
+    if has_morley and _rot_as_dir:  # rotation ∂u/∂n: pin the boundary edge-normal DOFs
+        pins = pins + _morley_dirichlet_pins(
+            _rot_as_dir, domain, field_index, spaces, np.asarray(pts), offs, top, n_verts, kind="rotation"
+        )
+    # Deduplicate by DOF: a corner DOF can be pinned by both the value and the rotation trace (e.g. the
+    # gradient is a tangential DOF for one edge and a normal DOF for the perpendicular one). A repeated pin
+    # would apply the boundary lift twice; collapse to one (consistent value) before enforcement.
+    if pins:
+        pins = list(dict(pins).items())
     zeros = jnp.zeros(total)
 
     # === transient: M u̇ + A u = c (mirrors fem_1d._assemble_1d_transient) -- split the temporal term
@@ -832,17 +852,79 @@ def _hermite_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, 
     return pins
 
 
-def _morley_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, offs, top, n_verts):
-    """Essential BC for a Morley field: pin the **value** at each boundary vertex to ``g`` and the **normal
-    derivative** at each boundary edge midpoint to ``∂g/∂n``. This is the natural Morley clamped/Dirichlet BC
-    (Morley's only DOFs are the vertex value and the edge-normal derivative — there is no curvature DOF, so the
-    over-/free-curvature distinction of the Argyris element does not arise). ``g`` and ``∂g/∂n`` come from
-    autodiff of the Dirichlet value node, so any smooth ``g(x, y)`` works. The edge normal is the same
-    globally-oriented ``n = R90·(P[hi] - P[lo])`` the assembler uses for the edge-normal DOF."""
+def _morley_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, offs, top, n_verts, kind="value"):
+    """Essential BC for a Morley field, one trace at a time (compose for clamped):
+
+    * ``kind="value"`` — the **deflection** ``u(region) - g``: pin the value DOF at each boundary vertex to
+      ``g`` (Morley's non-conforming value trace lives at the vertices). Alone ⇒ simply-supported.
+    * ``kind="rotation"`` — the **rotation** ``u.dn(region) - h``: pin the edge-normal DOF at each boundary
+      edge to the prescribed ``∂u/∂n = h`` (evaluated at the edge midpoint). Alone ⇒ guided.
+
+    Both work on **any** boundary orientation — Morley's DOFs are already the vertex value and the edge-normal
+    derivative, so no ``(n, t)`` rotation is needed (unlike the Argyris element). The stored edge DOF is the
+    derivative along the assembler's globally-oriented normal ``R90·(P[hi]-P[lo])``, so ``h`` (given as the
+    *outward* normal derivative) is multiplied by the per-edge sign relating the two."""
     from ..._fem import _eval_value_node_at
     from .fem_1d import _region_node_ids
 
-    def _g_derivs(value_node, xy):
+    def _val(value_node, xy):
+        return float(jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(xy)[None, :])).reshape(()))
+
+    cell_edges = np.asarray(top.cell_edges)
+    counts = np.bincount(cell_edges.reshape(-1), minlength=top.n_edges)
+    boundary_edges = {int(e) for e in np.where(counts == 1)[0]}
+    cells_arr = np.asarray(domain.mesh.cells_dict["triangle"])
+    edge_cell = {}  # boundary edge -> its single incident cell (for the outward-normal sign)
+    for c in range(cells_arr.shape[0]):
+        for k in range(3):
+            e = int(cell_edges[c, k])
+            if e in boundary_edges:
+                edge_cell[e] = c
+
+    pins = []
+    for fk, region, _comp, _value, value_node in dirichlet_raw:
+        fidx = field_index.get(fk)
+        if fidx is None or spaces[fidx] != "Morley":
+            continue
+        base = offs[fidx]
+        region_nodes = {int(v) for v in _region_node_ids(domain, region)}
+        if kind == "value":
+            for v in region_nodes:  # deflection: value DOF at each boundary vertex
+                pins.append((base + v, _val(value_node, pts_np[v])))
+            continue
+        edge_base = base + n_verts
+        for eid in boundary_edges:  # rotation: edge-normal DOF = (outward sign)·h at the midpoint
+            va, vb = (int(x) for x in top.edge_vertices[eid])
+            if va not in region_nodes or vb not in region_nodes:
+                continue
+            evec = pts_np[vb] - pts_np[va]
+            n_glob = np.array([-evec[1], evec[0]])
+            n_glob = n_glob / np.linalg.norm(n_glob)
+            mid = 0.5 * (pts_np[va] + pts_np[vb])
+            vc = next(int(w) for w in cells_arr[edge_cell[eid]] if int(w) not in (va, vb))
+            sign = 1.0 if float(n_glob @ (mid - pts_np[vc])) > 0 else -1.0  # outward = away from the interior vertex
+            pins.append((edge_base + eid, sign * _val(value_node, mid)))
+    return pins
+
+
+def _argyris_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, offs, top, n_verts, kind="value"):
+    """Essential BC for an Argyris field, one boundary trace at a time (compose for clamped):
+
+    * ``kind="value"`` — the **deflection** ``u(region) - g``: pin the value and the **tangential** derivatives
+      (``∂ₜ``, ``∂ₜₜ``) so ``u = g`` along the edge, while the **normal** derivatives (``∂ₙ``, ``∂ₙₜ``, ``∂ₙₙ``)
+      stay free — i.e. simply-supported. ``g`` and its tangential derivatives come from autodiff of the value.
+    * ``kind="rotation"`` — the **rotation** ``u.dn(region) - h``: pin the normal-derivative DOFs (``∂ₙ`` at the
+      vertices, ``∂ₙₜ``, and the edge-midpoint normal derivative) to the prescribed ``∂u/∂n = h``.
+
+    Compose the two for a clamped edge (``∂ₙₙ`` still left free — the physical clamped plate leaves the boundary
+    curvature as a natural BC). On an **axis-aligned** edge the ``(n, t)`` frame is ``(x, y)`` so each of these
+    is a single Argyris DOF; a non-axis-aligned edge needs the ``(n, t)`` rotation (not wired) and is **rejected
+    loudly**. Pins are dict-unioned per edge, so a corner is consistently pinned by both incident edges. (For
+    Morley — no Hessian DOFs, edge-normal DOF is ``∂ₙ`` — the same two BCs work on *any* orientation.)"""
+    from ..._fem import _eval_value_node_at
+    from .fem_1d import _region_node_ids
+
+    def _derivs(value_node, xy):
         def gfun(p):
             return jnp.asarray(_eval_value_node_at(value_node, p[None, :])).reshape(())
 
@@ -852,62 +934,15 @@ def _morley_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, o
     cell_edges = np.asarray(top.cell_edges)
     counts = np.bincount(cell_edges.reshape(-1), minlength=top.n_edges)
     boundary_edges = {int(e) for e in np.where(counts == 1)[0]}
+    cells_arr = np.asarray(domain.mesh.cells_dict["triangle"])
+    edge_cell = {}  # boundary edge -> single incident cell (for the outward-normal orientation)
+    for c in range(cells_arr.shape[0]):
+        for k in range(3):
+            e = int(cell_edges[c, k])
+            if e in boundary_edges:
+                edge_cell[e] = c
 
-    pins = []
-    for fk, region, _comp, _value, value_node in dirichlet_raw:
-        fidx = field_index.get(fk)
-        if fidx is None or spaces[fidx] != "Morley":
-            continue
-        base = offs[fidx]
-        edge_base = base + n_verts
-        region_nodes = {int(v) for v in _region_node_ids(domain, region)}
-        for v in region_nodes:  # value at each boundary vertex
-            g, _grad = _g_derivs(value_node, pts_np[v])
-            pins.append((base + v, g))
-        for eid in boundary_edges:
-            va, vb = (int(x) for x in top.edge_vertices[eid])  # canonical (lo, hi) -> global normal orientation
-            if va not in region_nodes or vb not in region_nodes:
-                continue
-            evec = pts_np[vb] - pts_np[va]
-            n = np.array([-evec[1], evec[0]])
-            n = n / np.linalg.norm(n)
-            _g, grad = _g_derivs(value_node, 0.5 * (pts_np[va] + pts_np[vb]))  # ∂g/∂n at the edge midpoint
-            pins.append((edge_base + eid, float(n @ grad)))
-    return pins
-
-
-def _argyris_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, offs, top, n_verts):
-    """**Proper clamped** essential BC for an Argyris field: impose ``u = g`` AND ``∂u/∂n = ∂g/∂n`` on the
-    boundary while leaving the boundary curvature ``∂²u/∂n²`` **free** (the physical clamped condition — the
-    normal second derivative is a *natural* BC). At each boundary vertex it pins the value and the full
-    gradient; along each boundary edge it pins the tangential-tangential and normal-tangential second
-    derivatives and the edge-midpoint normal derivative, but **not** the normal-normal Hessian DOF. ``g`` and
-    its derivatives are taken by autodiff of the Dirichlet value node, so any smooth ``g(x, y)`` works.
-
-    On an **axis-aligned** boundary edge the ``(n, t)`` frame is the ``(x, y)`` frame, so ``∂ₙₙ`` is already a
-    single Argyris Hessian DOF (``∂ₓₓ`` on an ``x=const`` edge, ``∂ᵧᵧ`` on a ``y=const`` edge) — proper-clamped
-    simply *skips* that DOF. Pins are collected per boundary edge into a dict keyed by DOF, so a **corner**
-    (two edges skipping different DOFs) is automatically re-pinned on both — the corner is fully clamped, which
-    is the correct, consistent behaviour there. This keeps the whole BC a plain ``(dof, value)`` pin list, so it
-    composes with every solver mode (steady/nonlinear/transient/inverse/dynamic-plate) unchanged. A
-    non-axis-aligned boundary edge would need the ``(n, t)`` rotation (not wired) and is **rejected loudly**."""
-    from ..._fem import _eval_value_node_at
-    from .fem_1d import _region_node_ids
-
-    def _g_derivs(value_node, xy):
-        """Scalar ``g`` and its gradient/Hessian at one physical point via autodiff of the value node."""
-
-        def gfun(p):
-            return jnp.asarray(_eval_value_node_at(value_node, p[None, :])).reshape(())
-
-        p = jnp.asarray(xy, dtype=jnp.float64)
-        return float(gfun(p)), np.asarray(jax.grad(gfun)(p)), np.asarray(jax.hessian(gfun)(p))
-
-    cell_edges = np.asarray(top.cell_edges)
-    counts = np.bincount(cell_edges.reshape(-1), minlength=top.n_edges)
-    boundary_edges = {int(e) for e in np.where(counts == 1)[0]}
-
-    pins: dict = {}  # dof -> value; a dict unions per-edge Hessian pins so corners auto-full-pin
+    pins: dict = {}  # dof -> value; dict-unioned so corners are pinned consistently by both edges
     for fk, region, _comp, _value, value_node in dirichlet_raw:
         fidx = field_index.get(fk)
         if fidx is None or spaces[fidx] != "Argyris":
@@ -915,38 +950,54 @@ def _argyris_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, 
         base = offs[fidx]
         edge_base = base + 6 * n_verts
         region_nodes = {int(v) for v in _region_node_ids(domain, region)}
-        for v in region_nodes:  # value + full gradient at every boundary vertex (∂ₙ = ∂g/∂n, ∂ₜ = ∂g/∂t)
-            g, grad, _H = _g_derivs(value_node, pts_np[v])
-            pins[base + 6 * v + 0] = g
-            pins[base + 6 * v + 1] = float(grad[0])
-            pins[base + 6 * v + 2] = float(grad[1])
         for eid in boundary_edges:
             va, vb = (int(x) for x in top.edge_vertices[eid])  # canonical (lo, hi)
             if va not in region_nodes or vb not in region_nodes:
                 continue
             evec = pts_np[vb] - pts_np[va]  # edge tangent
             atol = 1e-9 * (float(np.linalg.norm(evec)) + 1.0)
-            if abs(evec[0]) < atol:  # edge along y (on x=const) -> normal x -> free ∂ₙₙ = ∂ₓₓ (DOF 6v+3)
-                skip = 3
-            elif abs(evec[1]) < atol:  # edge along x (on y=const) -> normal y -> free ∂ₙₙ = ∂ᵧᵧ (DOF 6v+5)
-                skip = 5
+            if abs(evec[0]) < atol:  # edge along y, on x=const -> normal axis x(0), tangent axis y(1)
+                nax, tax = 0, 1
+            elif abs(evec[1]) < atol:  # edge along x, on y=const -> normal axis y(1), tangent axis x(0)
+                nax, tax = 1, 0
             else:
                 raise NotImplementedError(
-                    "jno.fem (non-nodal): the proper clamped BC (free boundary curvature) is wired for "
-                    f"axis-aligned boundary edges only; got a boundary edge with tangent {tuple(np.round(evec, 4))}. "
-                    "The general-orientation (n,t)-rotation treatment is not wired -- use an axis-aligned domain."
+                    "jno.fem (non-nodal): Argyris essential plate BCs are wired for axis-aligned boundary "
+                    f"edges only; got a boundary edge with tangent {tuple(np.round(evec, 4))}. The general "
+                    "(n,t)-rotation treatment is not wired -- use an axis-aligned domain, or the Morley element "
+                    "(space='Morley'), which supports any orientation."
                 )
-            for v in (va, vb):  # pin the Hessian DOFs EXCEPT the normal-normal one (the free curvature)
-                _g, _grad, H = _g_derivs(value_node, pts_np[v])
-                for k, hval in ((3, H[0, 0]), (4, H[0, 1]), (5, H[1, 1])):
-                    if k != skip:
-                        pins[base + 6 * v + k] = float(hval)
-            mid = 0.5 * (pts_np[va] + pts_np[vb])  # ∂g/∂n at the edge midpoint (the assembler's global normal)
-            n = np.array([-evec[1], evec[0]])
-            n = n / np.linalg.norm(n)
-            _g, grad, _H = _g_derivs(value_node, mid)
-            pins[edge_base + eid] = float(n @ grad)
+            hxx, hyy = 3, 5  # Argyris Hessian DOFs: ∂ₓₓ=3, ∂ₓᵧ=4, ∂ᵧᵧ=5
+            H_tt, H_nt = (hxx if tax == 0 else hyy), 4  # ∂ₜₜ (single DOF), ∂ₙₜ = ∂ₓᵧ
+            g_t, g_n = (1 + tax), (1 + nax)  # gradient DOFs: ∂ₓ=1, ∂ᵧ=2
+            n_glob = np.array([-evec[1], evec[0]]) / np.linalg.norm(evec)  # assembler's edge-DOF normal
+            mid = 0.5 * (pts_np[va] + pts_np[vb])
+            vc = next(int(w) for w in cells_arr[edge_cell[eid]] if int(w) not in (va, vb))
+            n_out = n_glob if float(n_glob @ (mid - pts_np[vc])) > 0 else -n_glob  # outward normal
+            s = float(n_out[nax])  # ±1: outward normal along +/- the normal axis (axis-aligned)
+            for v in (va, vb):
+                val, grad = _derivs(value_node, pts_np[v])
+                if kind == "value":  # pin value + tangential trace (Cartesian DOFs; free the normal ones)
+                    pins[base + 6 * v + 0] = val
+                    pins[base + 6 * v + g_t] = float(grad[tax])
+                    pins[base + 6 * v + H_tt] = _second_tangential(value_node, pts_np[v], tax)
+                else:  # rotation: pin ∂ₙ (= s·h) and ∂ₙₜ (= s·∂ₜh); leave value/tangential/∂ₙₙ free
+                    pins[base + 6 * v + g_n] = s * val
+                    pins[base + 6 * v + H_nt] = s * float(grad[tax])
+            if kind == "rotation":  # edge-midpoint normal derivative along the assembler's global normal
+                hmid, _gmid = _derivs(value_node, mid)
+                pins[edge_base + eid] = float(n_glob @ n_out) * hmid
     return list(pins.items())
+
+
+def _second_tangential(value_node, xy, tax):
+    """``∂²g/∂(tax)²`` at a point via autodiff of the value node (for the Argyris value-BC tangential trace)."""
+    from ..._fem import _eval_value_node_at
+
+    def gfun(p):
+        return jnp.asarray(_eval_value_node_at(value_node, p[None, :])).reshape(())
+
+    return float(np.asarray(jax.hessian(gfun)(jnp.asarray(xy, dtype=jnp.float64)))[tax, tax])
 
 
 def _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree):

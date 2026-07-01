@@ -14,12 +14,15 @@ boundary condition the solve determines, and it is exactly what the Argyris **pr
 ```python
 u, phi = d.fem_symbols(space="Argyris")
 q = 1.0 + 0.0 * xi                                    # uniform pressure, D = 1
-fem = jno.fem([laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi]) - q * vi, u(xb, yb) - 0.0])
+fem = jno.fem([laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi]) - q * vi,
+               u(xb, yb) - 0.0, u.dn(xb, yb) - 0.0])  # clamped = deflection w=0 AND rotation ∂w/∂n=0
 sol = fem.solve(sparse_lu_solve)                      # sparse-direct: O(nnz) memory on the refined mesh
 ```
 
-`u(xb, yb) - 0.0` pins $w$ and $\partial w/\partial n$ but leaves $\partial^2 w/\partial n^2$ free. Pinning the
-full $C^1$ trace would wrongly annihilate the clamp moment and over-stiffen the plate.
+Clamped composes the two essential plate traces — `u(reg)-g` (deflection) and `u.dn(reg)-h` (rotation) — while
+$\partial^2 w/\partial n^2$ is always left free. Dropping the rotation term gives a **simply-supported** plate
+instead (`w_max = 0.00406`); dropping both gives a free edge. See the *Plate boundary conditions* table in the
+[FEM guide](../../fem.md).
 
 ## A real benchmark, not a manufactured solution
 

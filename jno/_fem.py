@@ -39,6 +39,7 @@ from .trace import (
     FemResidualOperator,
     GaugePin,
     ModelCall,
+    NormalDerivative,
     Placeholder,
     RegionMask,
     TestFunction,
@@ -717,6 +718,32 @@ def _normal_flux_spec(constraint: Any, domain: Any) -> Optional[Tuple[Any, str, 
     if not normals:
         return None
     return _field_key_of(constraint), normals[0].tag[2:], value_node
+
+
+def _rotation_bc_spec(constraint: Any, domain: Any) -> Optional[Tuple[Any, str, Any]]:
+    """Recognise an essential **rotation** BC ``u.dn(region) - h`` (``∂u/∂n = h`` on a C¹/Morley plate field)
+    -> ``(field_key, region, value_node)``; ``None`` otherwise.
+
+    The trial side is a :class:`~jno.trace.NormalDerivative` marker and there is no test function (it is
+    essential, not a natural moment term). Peeled before classification (like the RT normal-flux BC): the
+    physical outward normal is recomputed per boundary edge at assembly, so only the region and the
+    prescribed value ``h`` are carried."""
+    bare = _bare(constraint)
+    if getattr(bare, "op", None) != "-" or _contains(bare, TestFunction):
+        return None
+    left, right = getattr(bare, "left", None), getattr(bare, "right", None)
+    if left is None or right is None:
+        return None
+    left_nd, right_nd = isinstance(left, NormalDerivative), isinstance(right, NormalDerivative)
+    if left_nd == right_nd:  # exactly one side is the ∂u/∂n marker
+        return None
+    value_node = right if left_nd else left
+    if _contains(value_node, TrialFunction):  # the prescribed value must not contain the unknown
+        return None
+    support, region = _region_and_support(constraint, domain)
+    if support != "boundary":
+        return None
+    return _field_key_of(constraint), region, value_node
 
 
 # ---------------------------------------------------------------------------
@@ -1671,6 +1698,15 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         (flux_bcs.append(spec) if spec is not None else _core.append(c))
     constraints = _core
 
+    # Essential rotation BCs `u.dn(region) - h` (∂u/∂n on a C¹/Morley plate field) pin the boundary
+    # normal-derivative DOFs at assembly; separated before classification like the normal-flux BC.
+    rotation_bcs: List[Any] = []
+    _core_r: List[Any] = []
+    for c in constraints:
+        spec = _rotation_bc_spec(c, domain)
+        (rotation_bcs.append(spec) if spec is not None else _core_r.append(c))
+    constraints = _core_r
+
     # VPINN: a network trial (``u = net(x, y)`` written into the weak form) makes jno.fem
     # test-project the weak form onto the FE test space -> a trainable residual loss, not an FE
     # system. Detected by a ModelCall; lowered after the shared quadrature setup (see below).
@@ -1866,7 +1902,14 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         from .utils.solver.fem_nonnodal import assemble_fem_nonnodal
 
         op, mode, offsets = assemble_fem_nonnodal(
-            domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, flux_bcs=flux_bcs, quad_degree=quad_degree
+            domain,
+            volume_terms,
+            boundary_terms,
+            dirichlet_raw,
+            ic_residuals,
+            flux_bcs=flux_bcs,
+            rotation_bcs=rotation_bcs,
+            quad_degree=quad_degree,
         )
         return _finalize(FEM(domain=domain, op=op, classification=classification, mode=mode, offsets=offsets))
 

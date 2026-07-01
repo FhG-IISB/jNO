@@ -135,7 +135,7 @@ def main():
     # ================= Part 1: the crack profile (controlled verification) =================
     # Pin d=1 on the left edge (Morley pins the value + ∂d/∂n=0, the smooth-peak condition), no source: d
     # decays as the optimal 1D profile. d=1 on the whole edge ⇒ the solution is x-only, so d-vs-x collapses.
-    fem_p = jno.fem([(Gc / ell) * (di * vi) + reg, dd(xl, yl) - 1.0])
+    fem_p = jno.fem([(Gc / ell) * (di * vi) + reg, dd(xl, yl) - 1.0, dd.dn(xl, yl) - 0.0])  # d=1, ∂d/∂n=0 (smooth peak)
     dprof = np.asarray(fem_p.solve(lu)).reshape(-1)[np.arange(nv)]  # Morley value DOFs = first n_verts entries
     xs = nodes[:, 0]
     p4x, p2x = (1 + xs / ell) * np.exp(-xs / ell), np.exp(-xs / ell)

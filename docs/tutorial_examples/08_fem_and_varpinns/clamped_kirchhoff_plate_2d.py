@@ -53,7 +53,8 @@ def solve_plate(mesh_size):
     u, phi = d.fem_symbols(space="Argyris")
     ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
     q = 1.0 + 0.0 * xi  # uniform transverse pressure
-    fem = jno.fem([laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi]) - q * vi, u(xb, yb) - 0.0])
+    # clamped = deflection w=0 (u(reg)-g) AND rotation ∂w/∂n=0 (u.dn(reg)-h); the boundary curvature stays free
+    fem = jno.fem([laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi]) - q * vi, u(xb, yb) - 0.0, u.dn(xb, yb) - 0.0])
     sol = np.asarray(fem.solve(sparse_lu_solve)).reshape(-1)  # sparse-direct: O(nnz) memory on the fine mesh
     pts = np.asarray(d.mesh.points)[:, :2]
     return d, pts, sol
