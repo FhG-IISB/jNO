@@ -27,9 +27,9 @@ simply supported), the displacement nodal-$L^2$ error at *comparable cost* is:
 
 ```
        h | Argyris dofs      L2 err | mixed dofs      L2 err | Argyris/mixed
-   0.420 |          165   8.828e-06 |        130   1.574e-03 |         178×
-   0.300 |          251   3.419e-06 |        202   7.646e-04 |         224×
-   0.210 |          373   9.248e-07 |        306   3.255e-04 |         352×
+   0.420 |          165   9.140e-06 |        130   1.574e-03 |         172×
+   0.300 |          251   1.992e-06 |        202   7.646e-04 |         384×
+   0.210 |          373   3.731e-07 |        306   3.255e-04 |         872×
 ```
 
 For essentially the same number of degrees of freedom, the conforming $C^1$ element is **two to three

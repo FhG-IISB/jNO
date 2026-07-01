@@ -94,17 +94,28 @@ def assemble_mixed_poisson_rt(
 def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, ic_residuals, *, flux_bcs=(), quad_degree=4):
     """Native push-forward assembler for non-nodal (RT, ...) fields, driven by the weak-form DSL.
 
-    The n-D analogue of :func:`fem_1d.assemble_fem_1d_multifield`: it lowers each weak term, builds a
-    per-cell ``local`` carrying the field's *physical* (push-forward) shape data, and evaluates the term
-    through the shared integrand evaluator (:func:`fem_utils._eval_integrand`, which now has
-    space-guarded RT branches). Returns ``(A, b)`` for the linear system (matrices-only contract).
+    It lowers each weak term, builds a per-cell ``local`` carrying the field's *physical* (push-forward)
+    shape data, and evaluates it through the shared integrand evaluator (:func:`fem_utils._eval_integrand`).
+    Returns ``(op, mode, offsets)``: ``mode`` is ``"linear"`` (``op = (A, b)`` or a parametric
+    :class:`FemLinearSystem`), ``"nonlinear"`` (a :class:`FemResidualOperator`) or ``"transient"`` (a
+    :class:`SemidiscreteTimeBlock`).
 
-    Scope: RT (H(div)) and N1E (H(curl)) edge-DOF fields plus P0 (cell DOFs) -- the H(div)/H(curl) mass /
-    L²-projection, the RT-P0 mixed-Poisson saddle system, the essential normal-flux BC ``u·n = g``
-    (``flux_bcs``, pinned via :func:`_apply_flux_bcs`) and the natural pressure BC ``p = p_D``
-    (``boundary_terms``, via :func:`_apply_natural_boundary_terms`). RT and N1E share the edge topology and
-    DOF map; they differ only in the push-forward (contravariant vs covariant). Dirichlet/IC are not wired;
-    the H(curl) curl-curl operator and the tangential BC ``u·t = g`` come next.
+    Families (``fem_symbols(space=...)``):
+
+    * **Edge DOFs** -- RT (H(div)) and N1E (H(curl)), plus P0 (cell DOFs): the H(div)/H(curl) mass /
+      L²-projection, the RT-P0 mixed-Poisson saddle system, the essential normal-flux BC ``u·n = g``
+      (``flux_bcs``), and the natural pressure BC ``p = p_D``. (The H(curl) curl-curl operator and the
+      tangential BC ``u·t = g`` are still to come.)
+    * **Vertex DOFs** -- Hermite (C⁰, value+∇) and **Argyris (C¹ conforming, for the biharmonic)**: the
+      per-cell ``M(cell)`` DOF-transform path (:func:`fem_elements.hermite_pushforward` /
+      :func:`argyris_pushforward`). Hermite takes a value-Dirichlet; Argyris takes the **proper clamped BC**
+      ``u=g, ∂u/∂n=∂g/∂n`` with free boundary curvature (:func:`_argyris_dirichlet_pins`).
+
+    All families share the solver modes: steady linear/nonlinear, first- and (single-field) **second-order**
+    (``u_tt`` -> augmented ``[u, v]`` block) transient with IC L²-projection, and the differentiable
+    **inverse** path -- a runtime scalar *or* P1 field parameter ``k(x)`` in a volume term is threaded so
+    ``crux.solve`` recovers it (steady and transient). A parameter in a boundary term is rejected (the
+    natural-BC load is non-differentiable).
     """
     from ...trace import FemResidualOperator
     from .fem_1d import _apply_dirichlet_rows, _apply_dirichlet_symmetric, _integrate_term

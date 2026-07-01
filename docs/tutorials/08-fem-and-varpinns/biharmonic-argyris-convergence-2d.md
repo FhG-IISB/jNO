@@ -48,17 +48,17 @@ a hand-built field. Solving on a sequence of unstructured meshes recovers exactl
 
 ```
          h    dofs       L2 err   rate   energy err   rate
-    0.5303      97    1.563e-04     --    2.929e-02     --
-    0.4226     165    1.427e-05  10.55    8.880e-03   5.26
-    0.3112     251    4.611e-06   3.69    3.704e-03   2.86
-    0.2021     495    4.255e-07   5.52    6.369e-04   4.08
+    0.5303      97    1.425e-04     --    2.926e-02     --
+    0.4226     165    1.451e-05  10.07    8.879e-03   5.25
+    0.3112     251    2.931e-06   5.23    3.590e-03   2.96
+    0.2021     495    1.967e-07   6.26    6.265e-04   4.04
 
-  least-squares order:  L2 ≈ 5.78  (theory 6)   energy ≈ 3.85  (theory 4)
+  least-squares order:  L2 ≈ 6.59  (theory 6)   energy ≈ 3.87  (theory 4)
 ```
 
 ![Argyris C¹ biharmonic convergence: measured L² and energy errors against the O(h⁶) and O(h⁴) reference slopes.](/jNO/assets/biharmonic_argyris_convergence_2d.png)
 
-The measured orders (energy $\approx 3.85$, $L^2 \approx 5.78$) sit right on the optimal $O(h^4)$ / $O(h^6)$
+The measured orders (energy $\approx 3.87$, $L^2 \approx 6.6$) sit right on the optimal $O(h^4)$ / $O(h^6)$
 theory — the high-order convergence a $C^0$ Hessian assembly **cannot** deliver. The same element composes
 with nonlinear ($\Delta^2 u + u^3 = f$) and transient (the dissipative biharmonic heat flow) solves; see
 `tests/test_fem_argyris.py`.
