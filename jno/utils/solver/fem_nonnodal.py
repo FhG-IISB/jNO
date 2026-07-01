@@ -801,6 +801,15 @@ def _apply_natural_boundary_terms(b, boundary_terms, domain, field_index, spaces
         region_nodes = {int(n) for n in _region_node_ids(domain, region)}
         for term in terms:
             bare = _bare(term)
+            # prescribed edge-moment `M_n * v.dn(region)` on an Argyris/Morley plate field -> boundary integral
+            mom = _match_plate_moment(bare, field_index, spaces)
+            if mom is not None:
+                b = np.asarray(
+                    _plate_moment_load(
+                        b, mom[1], mom[0], region_nodes, spaces[mom[0]], domain, top, pts_np, offs, boundary, loc
+                    )
+                )
+                continue
             # recognise p_D * (v·n): a product with the test on one side, p_D on the other
             ok = isinstance(bare, BinaryOp) and bare.op == "*"
             if ok and _contains(bare.left, TestFunction) and not _contains(bare.right, TestFunction):
@@ -828,6 +837,111 @@ def _apply_natural_boundary_terms(b, boundary_terms, domain, field_index, spaces
                 xq = pa[None, :] * (1.0 - gp[:, None]) + pb[None, :] * gp[:, None]
                 pd = np.asarray(_eval_value_node_at(pd_node, jnp.asarray(xq))).reshape(-1)
                 b[offs[fidx] + eid] += int(top.cell_edge_signs[c, k]) * float(np.sum(gw * pd))  # sign * avg_edge(p_D)
+    return jnp.asarray(b)
+
+
+def _match_plate_moment(bare, field_index, spaces):
+    """Recognise a prescribed edge-moment term ``M_n * v.dn(region)`` on an Argyris/Morley plate field: a
+    product with the test's **normal derivative** (``v.dn``) on one side and the moment coefficient ``M_n``
+    (no test) on the other. Returns ``(field_index, M_n node)``, or ``None`` if it is not a moment term."""
+    from ..._fem import _contains, _walk
+    from ...trace import BinaryOp, NormalDerivative, TestFunction
+
+    if not (isinstance(bare, BinaryOp) and bare.op == "*"):
+        return None
+    for side, other in ((bare.left, bare.right), (bare.right, bare.left)):
+        has_nd_test = any(isinstance(n, NormalDerivative) for n in _walk(side)) and _contains(side, TestFunction)
+        if has_nd_test and not _contains(other, TestFunction):
+            fkeys = {n.field_key for n in _walk(side) if isinstance(n, TestFunction)}
+            fidx = field_index.get(next(iter(fkeys))) if fkeys else None
+            if fidx is not None and spaces[fidx] in ("Argyris", "Morley"):
+                return fidx, other
+    return None
+
+
+def _plate_moment_load(b, mn_node, fidx, region_nodes, space, domain, top, pts_np, offs, boundary, loc):
+    """Assemble the prescribed edge-**moment** load ``+∮_region M_n (∇v · n_out) ds`` for one Argyris/Morley
+    plate field into the constant natural-BC load ``b``.
+
+    The bending moment is the natural quantity conjugate to the plate **rotation** ``∂v/∂n``: minimising
+    ``½ a(w,w) − ∫ f w − ∮ M_n ∂w/∂n`` adds ``+∮ M_n ∂v/∂n`` to the weak load, and on a straight simply-
+    supported edge (``w=0`` essential) the emergent natural condition is ``Δw = M_n`` (Timoshenko &
+    Woinowsky-Krieger, *Theory of Plates and Shells*, 2nd ed., McGraw-Hill 1959, §2 — edge bending moment).
+    Only ``M_n`` (conjugate to rotation) is wired; the effective Kirchhoff shear ``V_n = Q_n + ∂M_{nt}/∂t``
+    (conjugate to deflection, with corner forces) is **not**. The element basis' physical normal derivative
+    is tabulated at boundary-edge quadrature points via the same ``M(cell)`` push-forward the volume assembly
+    uses (:func:`argyris_pushforward` / :func:`morley_pushforward`), with the reference basis re-tabulated at
+    the edge nodes (one tabulation per local edge, reused across all boundary edges of that orientation)."""
+    from ..._fem import _eval_value_node_at
+    from .fem_1d import _line_quadrature
+    from .fem_elements import (
+        argyris_pushforward,
+        argyris_ref_basis_at,
+        argyris_triangle,
+        morley_pushforward,
+        morley_ref_basis_at,
+        morley_triangle,
+    )
+    from .fem_topology import BASIX_TRIANGLE_EDGES
+
+    # M_n · ∂ₙφ is high-degree on the edge (∂ₙ of a quintic basis is a quartic, ×M_n); use a rule that
+    # integrates it exactly for the common polynomial data (degree 14 -> 8 Gauss nodes, exact to degree 15).
+    gp, gw = (np.asarray(x).reshape(-1) for x in _line_quadrature(14))
+    cells = np.asarray(domain.mesh.cells_dict["triangle"])
+    ev = np.asarray(top.edge_vertices)  # (n_edges, 2) canonical (lo, hi)
+    ce = np.asarray(top.cell_edges)  # (n_cells, 3) global edge ids
+    n_verts = pts_np.shape[0]
+    base = offs[fidx]
+    ref_v = np.array([[0.0, 0.0], [1.0, 0.0], [0.0, 1.0]])
+
+    if space == "Argyris":
+        nodal = tuple(jnp.asarray(a) for a in argyris_triangle().ref_aux)
+        pushf, tabber = argyris_pushforward, argyris_ref_basis_at
+    else:
+        nodal = tuple(jnp.asarray(a) for a in morley_triangle().ref_aux)
+        pushf, tabber = morley_pushforward, morley_ref_basis_at
+    # reference-edge basis tabulations (value+grad at the 1-D edge nodes), one per local edge k, reused below
+    ref_edge_tab = {}
+    for k, (a, bb) in enumerate(BASIX_TRIANGLE_EDGES):
+        ref_pts = ref_v[a][None, :] * (1.0 - gp[:, None]) + ref_v[bb][None, :] * gp[:, None]
+        ref_edge_tab[k] = tabber(np.asarray(ref_pts))
+
+    b = np.asarray(b)
+    for eid in boundary:
+        va, vb = (int(x) for x in ev[eid])
+        if va not in region_nodes or vb not in region_nodes:
+            continue
+        c, k = loc[eid]
+        cverts = pts_np[cells[c]]  # (3, 2)
+        J = np.stack([cverts[1] - cverts[0], cverts[2] - cverts[0]], axis=1)  # columns = edge vectors from v0
+        detJ = float(np.linalg.det(J))
+        # per-cell globally-oriented edge normals for M(cell) (canonical lo->high, matching the volume assembler)
+        _d = pts_np[ev[ce[c], 1]] - pts_np[ev[ce[c], 0]]
+        _en = np.stack([-_d[:, 1], _d[:, 0]], axis=1)
+        cell_normals = jnp.asarray(_en / np.linalg.norm(_en, axis=1, keepdims=True))
+        rv, rg, rh = ref_edge_tab[k]
+        _phi, grad, _h = pushf(rv, rg, rh, jnp.asarray(J), detJ, cell_normals, nodal)
+        grad = np.asarray(grad)  # (nq, ndof, 2) physical gradient of the cell basis at the edge nodes
+        # physical edge nodes via the SAME ref->phys map the push-forward uses (affine): x = v0 + xi @ J.T
+        la, lb = BASIX_TRIANGLE_EDGES[k]
+        pa, pb = pts_np[cells[c][la]], pts_np[cells[c][lb]]
+        xq = pa[None, :] * (1.0 - gp[:, None]) + pb[None, :] * gp[:, None]  # (nq, 2)
+        L = float(np.linalg.norm(pb - pa))
+        # outward normal: R90 of the edge, flipped to point away from the cell's third (opposite) vertex
+        evec = pb - pa
+        n_out = np.array([-evec[1], evec[0]], dtype=float)
+        n_out /= np.linalg.norm(n_out)
+        third = next(int(w) for w in cells[c] if int(w) not in (int(cells[c][la]), int(cells[c][lb])))
+        if float(n_out @ (0.5 * (pa + pb) - pts_np[third])) < 0.0:
+            n_out = -n_out
+        dphi_dn = grad @ n_out  # (nq, ndof)
+        mn = np.asarray(_eval_value_node_at(mn_node, jnp.asarray(xq))).reshape(-1)  # (nq,)
+        contrib = L * np.einsum("q,q,qn->n", gw, mn, dphi_dn)  # ∮ M_n ∂ₙφ over this edge, per cell DOF
+        if space == "Argyris":
+            gdofs = np.concatenate([(6 * cells[c][:, None] + np.arange(6)).reshape(-1), 6 * n_verts + ce[c]])
+        else:
+            gdofs = np.concatenate([cells[c], n_verts + ce[c]])
+        np.add.at(b, np.asarray(int(base) + gdofs, dtype=np.intp), contrib)
     return jnp.asarray(b)
 
 

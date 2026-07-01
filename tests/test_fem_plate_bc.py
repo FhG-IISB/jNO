@@ -116,3 +116,88 @@ def test_argyris_rotation_nonaxis_raises_morley_does_not():
         _solve_clamped("Argyris")
     sol = np.asarray(_solve_clamped("Morley")).reshape(-1)  # Morley: any orientation
     assert np.all(np.isfinite(sol)) and np.abs(sol).max() > 0
+
+
+def _manufactured_moment_relerr(space, mesh_size):
+    """Simply-supported square plate carrying a prescribed edge **moment** ``M_n * v.dn(region)`` for the
+    manufactured ``u* = x(1-x)y(1-y)`` (so ``Δ²u*=8``, ``u*=0`` on ∂Ω ⇒ simply supported, and the natural
+    moment ``M_n = Δu* = -2y(1-y) - 2x(1-x)`` — equal to ``∂ₙₙu*`` on the straight SS edges). Returns the
+    nodal-value relative-``L²`` error against ``u*``."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u, phi = d.fem_symbols(space=space)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = 8.0 + 0.0 * xi
+    Mn = (-2 * yb + 2 * yb**2) + (-2 * xb + 2 * xb**2)  # = Δu* on ∂Ω
+    bih = (
+        lap(ui, [xi, yi]) * lap(vi, [xi, yi])
+        if space == "Argyris"
+        else inner(hess(ui, [xi, yi]), hess(vi, [xi, yi]), n_contract=2)
+    )
+    terms = [bih - f * vi, u(xb, yb) - 0.0, Mn * phi.dn(xb, yb)]  # SS + prescribed edge moment
+    sol = np.asarray(jno.fem(terms).solve(_solve)).reshape(-1)
+    pts = np.asarray(d.mesh.points)[:, :2]
+    nv = pts.shape[0]
+    w = sol[6 * np.arange(nv)] if space == "Argyris" else sol[np.arange(nv)]
+    ustar = pts[:, 0] * (1 - pts[:, 0]) * pts[:, 1] * (1 - pts[:, 1])
+    return float(np.linalg.norm(w - ustar) / np.linalg.norm(ustar))
+
+
+def test_argyris_prescribed_edge_moment_recovers_exactly():
+    """The prescribed edge-moment term ``M_n * v.dn(region)`` (the natural BC conjugate to the plate rotation
+    ``∂w/∂n``) recovers the manufactured biharmonic solution to **machine precision** on Argyris: ``u*`` is a
+    quartic, exactly representable in the C¹ quintic (P5) space, so a correct boundary-moment integral gives an
+    exact Galerkin solution. Validates the ``∮ M_n ∂ₙφ`` assembly (sign, DOF map, edge quadrature) end-to-end."""
+    assert _manufactured_moment_relerr("Argyris", 0.25) < 1e-10
+
+
+def test_prescribed_moment_is_load_bearing():
+    """Control against a silently-dropped moment: WITHOUT the ``M_n * v.dn`` term the *same* simply-supported
+    problem does not reach ``u*`` — the boundary-moment load is exactly what bends the plate. A green
+    'recovery' with the term missing would otherwise pass unnoticed."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u, phi = d.fem_symbols(space="Argyris")
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = 8.0 + 0.0 * xi
+    sol = np.asarray(jno.fem([lap(ui, [xi, yi]) * lap(vi, [xi, yi]) - f * vi, u(xb, yb) - 0.0]).solve(_solve)).reshape(-1)
+    pts = np.asarray(d.mesh.points)[:, :2]
+    nv = pts.shape[0]
+    w = sol[6 * np.arange(nv)]
+    ustar = pts[:, 0] * (1 - pts[:, 0]) * pts[:, 1] * (1 - pts[:, 1])
+    assert np.linalg.norm(w - ustar) / np.linalg.norm(ustar) > 0.1
+
+
+def test_morley_prescribed_edge_moment_converges():
+    """The moment term also assembles on the non-conforming Morley element (full-Hessian form ``∫D²u:D²v``,
+    whose ``∂ₙv``-conjugate natural quantity ``∂ₙₙu`` equals ``Δu*`` on the SS edges). ``u*`` is not in Morley's
+    P2 space, so recovery cannot be exact — but the prescribed-moment solution **converges** to ``u*`` under
+    refinement (Morley ``L²`` is ``O(h²)``)."""
+    e_coarse = _manufactured_moment_relerr("Morley", 0.30)
+    e_fine = _manufactured_moment_relerr("Morley", 0.15)
+    assert e_fine < 0.6 * e_coarse, f"Morley moment must converge: {e_coarse:.3e} -> {e_fine:.3e}"
+    assert e_fine < 0.05
+
+
+def test_morley_prescribed_moment_any_orientation():
+    """The moment load ``∮ M_n ∂ₙφ`` is built from each cell's own geometry (Jacobian, push-forward, outward
+    normal) — no axis-aligned assumption — so it applies on any edge orientation. On the all-slanted diamond
+    (where the Argyris *essential* pin is axis-aligned-only, hence unreachable) a Morley moment load runs finite
+    and moves the plate substantially versus the no-moment control."""
+    diamond = Polygon([(0.5, 0.0), (1.0, 0.5), (0.5, 1.0), (0.0, 0.5)])  # every edge non-axis-aligned
+    d = jno.domain(diamond, mesh_size=0.15)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u, phi = d.fem_symbols(space="Morley")
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = 1.0 + 0.0 * xi
+    bih = inner(hess(ui, [xi, yi]), hess(vi, [xi, yi]), n_contract=2)
+    nv = np.asarray(d.mesh.points).shape[0]
+    w = np.asarray(jno.fem([bih - f * vi, u(xb, yb) - 0.0, (1.0 + 0.0 * xb) * phi.dn(xb, yb)]).solve(_solve)).reshape(-1)[
+        :nv
+    ]
+    w0 = np.asarray(jno.fem([bih - f * vi, u(xb, yb) - 0.0]).solve(_solve)).reshape(-1)[:nv]
+    assert np.all(np.isfinite(w)) and np.abs(w).max() > 1e-4
+    assert np.linalg.norm(w - w0) > np.linalg.norm(w0)  # the prescribed moment dominates this problem

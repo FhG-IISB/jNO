@@ -3340,9 +3340,11 @@ class TestFunction(Placeholder):
     def dn(self, *coords, **named):
         """Normal derivative ``∂φ/∂n`` of the test function on the boundary region carried by ``coords``.
 
-        Intended for the natural plate **moment** term ``M * phi.dn(region)`` (the moment does work through the
-        rotation) — note that inhomogeneous natural BCs (prescribed edge moment/shear) are **not yet wired**;
-        the essential rotation BC uses the *trial* form ``u.dn(region) - h``."""
+        Used for the natural plate **moment** term ``M_n * phi.dn(region)`` — a prescribed edge bending moment,
+        assembled as the boundary load ``∮_region M_n ∂φ/∂n ds`` on the Argyris/Morley plate elements (the
+        moment does work through the plate rotation; see :func:`jno.utils.solver.fem_nonnodal._plate_moment_load`).
+        The conjugate **shear** term (the effective Kirchhoff shear ``V_n``, with corner forces) is not yet
+        wired. The *essential* rotation BC instead uses the *trial* form ``u.dn(region) - h``."""
         return NormalDerivative(self(*coords, **named))
 
     def __repr__(self):

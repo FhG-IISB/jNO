@@ -187,7 +187,17 @@ Its essential BCs are the same two plate traces as Argyris — `u(region) - g` (
 > A free edge (no essential BC) gets the natural `M_n=V_n=0` from the physically-correct **ν-weighted plate
 > energy** `(1-ν)·inner(hessian(u),hessian(v)) + ν·laplacian(u)·laplacian(v)`. Validated against Timoshenko's
 > square-plate coefficients — clamped `w_max = 0.00126 qa⁴/D`, simply-supported `w_max = 0.00406 qa⁴/D`.
-> *(Prescribed nonzero edge moment/shear — inhomogeneous natural BCs — are not yet wired.)*
+>
+> **Prescribed edge moment (inhomogeneous natural BC).** A *nonzero* bending moment `M_n` on an edge is applied
+> as the boundary load `M_n * phi.dn(region)` (the test function's normal derivative) — assembled as
+> `∮_region M_n ∂φ/∂n ds` on the Argyris/Morley elements. It composes with the essential traces: a
+> *moment-loaded simply-supported* edge is `u(reg)-0` **and** `M_n * phi.dn(reg)`. Validated by a manufactured
+> simply-supported plate (`u* = x(1-x)y(1-y)`, `M_n = Δu*`): Argyris recovers `u*` to machine precision (it is a
+> quartic in the P5 space), Morley converges `O(h²)`. The moment integral is built from each cell's own geometry
+> (Jacobian, push-forward, outward normal), so it applies on **any edge orientation** — but note the *essential*
+> Argyris pin is still axis-aligned-only, so on Argyris a moment is reachable only where that pin is; **Morley**
+> carries a prescribed moment on any boundary (verified on a slanted diamond). *(The conjugate **shear** load —
+> the effective Kirchhoff shear `V_n = Q_n + ∂M_{nt}/∂t`, which carries corner forces — is not yet wired.)*
 
 ```python
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")   # H(div) flux

@@ -584,3 +584,34 @@ def morley_pushforward(ref_values, ref_grads, ref_hess, J, detJ, edge_normals, n
     grad = jnp.einsum("qkl,kn,lm->qnm", rg, C, K)  # (n_quad, 6, 2) physical gradient
     hess = jnp.einsum("qkij,kn,ia,jb->qnab", rh, C, K, K)  # (n_quad, 6, 2, 2) physical Hessian
     return phi, grad, hess
+
+
+def argyris_ref_basis_at(ref_pts: np.ndarray):
+    """Tabulate the Argyris reference basis (value + gradient) at arbitrary reference points ``ref_pts``
+    ``(nq, 2)`` — for **boundary-edge** integrals (the natural moment term), where the basis is needed at
+    edge quadrature points rather than the element's volume rule. Returns ``(ref_values, ref_grads, ref_hess)``
+    in the same shapes :func:`argyris_pushforward` consumes (``ref_hess`` is a zero placeholder — the moment
+    term needs only value/gradient)."""
+    S = _arg_reference_coeffs()
+    ref_pts = np.asarray(ref_pts)
+    nq = ref_pts.shape[0]
+    rv = np.zeros((nq, 21, 1))
+    rg = np.zeros((nq, 21, 1, 2))
+    for q in range(nq):
+        rv[q, :, 0] = _arg_mono_value(ref_pts[q]) @ S
+        rg[q, :, 0, :] = np.einsum("pl,pk->kl", _arg_mono_grad(ref_pts[q]), S)
+    return jnp.asarray(rv), jnp.asarray(rg), jnp.zeros((nq, 21, 1, 2, 2))
+
+
+def morley_ref_basis_at(ref_pts: np.ndarray):
+    """Tabulate the Morley reference basis (value + gradient) at arbitrary reference points — see
+    :func:`argyris_ref_basis_at`."""
+    S = _mor_reference_coeffs()
+    ref_pts = np.asarray(ref_pts)
+    nq = ref_pts.shape[0]
+    rv = np.zeros((nq, 6, 1))
+    rg = np.zeros((nq, 6, 1, 2))
+    for q in range(nq):
+        rv[q, :, 0] = _mor_mono_value(ref_pts[q]) @ S
+        rg[q, :, 0, :] = np.einsum("pl,pk->kl", _mor_mono_grad(ref_pts[q]), S)
+    return jnp.asarray(rv), jnp.asarray(rg), jnp.zeros((nq, 6, 1, 2, 2))
