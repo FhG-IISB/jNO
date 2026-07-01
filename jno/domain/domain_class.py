@@ -1624,8 +1624,10 @@ class domain(MeshIOMixin):
         """Locally remesh **in place** to a per-vertex target edge size (metric-based).
 
         ``vertex_size`` is a ``(n_vertices,)`` array giving the desired edge length at
-        each current mesh vertex; the mesh is adapted (via Mmg) so those sizes are
-        equidistributed, refining where they shrink.  Geometric corners are preserved.
+        each current mesh vertex, or an ``(n_vertices, 3)`` **anisotropic** metric tensor
+        (e.g. from ``hessian_metric``) that also orients the refinement; the mesh is adapted
+        (via Mmg) so it is equidistributed, refining where it shrinks.  Geometric corners
+        are preserved.
         Spatial tag predicates (``domain.tag(...)``) survive, so ``jno.fem`` conditions
         bound to a tag resolve geometrically on the new nodes.  Returns ``self``.
 

@@ -102,8 +102,10 @@ def remesh_with_mmg(
     domain
         A meshed 2D ``jno`` domain (``domain.mesh`` a ``meshio.Mesh`` of triangles).
     vertex_size
-        ``(n_vertices,)`` isotropic target edge length at each *current* mesh vertex.
-        Smaller values request local refinement.
+        Either ``(n_vertices,)`` isotropic target edge lengths (smaller = finer), or an
+        ``(n_vertices, 3)`` **anisotropic** metric tensor ``(m11, m12, m22)`` per vertex
+        (e.g. from :func:`hessian_metric`), which additionally sets the *direction* of
+        refinement -- stretched triangles aligned to a directional feature.
     copy
         If ``True`` (default) apply the new mesh to a shallow copy and return it,
         leaving ``domain`` untouched.  If ``False`` remesh ``domain`` **in place**
@@ -140,11 +142,14 @@ def remesh_with_mmg(
 
     pts = np.asarray(domain.mesh.points)[:, :2].astype(np.float64)
     tris = np.asarray(domain.mesh.cells_dict["triangle"]).astype(np.int32)
-    size = np.asarray(vertex_size, dtype=np.float64).reshape(-1)
-    if size.shape[0] != pts.shape[0]:
-        raise ValueError(f"vertex_size has {size.shape[0]} entries but the mesh has {pts.shape[0]} vertices.")
-    if not np.all(size > 0):
-        raise ValueError("vertex_size must be strictly positive.")
+    field = np.asarray(vertex_size, dtype=np.float64)
+
+    # (n,) / (n,1) -> isotropic size; (n,3) -> anisotropic metric tensor (m11, m12, m22)
+    anisotropic = field.ndim == 2 and field.shape[1] == 3
+    if not anisotropic:
+        field = field.reshape(-1)
+    if field.shape[0] != pts.shape[0]:
+        raise ValueError(f"metric field has {field.shape[0]} entries but the mesh has {pts.shape[0]} vertices.")
 
     bedges = _boundary_edges_from_triangles(tris)
     corners = _corner_vertices(pts, bedges)
@@ -157,12 +162,22 @@ def remesh_with_mmg(
     if len(corners):
         m.set_corners(corners)
         m.set_required_vertices(corners)
-    m.set_field("metric", size.reshape(-1, 1))
+
+    if anisotropic:
+        # eigen-sizes of the tensor set the hmin/hmax window; the mmg tensor channel is aniso
+        eig = np.linalg.eigvalsh(np.array([[field[:, 0], field[:, 1]], [field[:, 1], field[:, 2]]]).transpose(2, 0, 1))
+        sizes = 1.0 / np.sqrt(np.clip(eig, 1e-300, None))
+        m.set_field("tensor", field)
+    else:
+        if not np.all(field > 0):
+            raise ValueError("vertex_size must be strictly positive.")
+        sizes = field
+        m.set_field("metric", field.reshape(-1, 1))
 
     if hmin is None:
-        hmin = float(size.min()) * 0.5
+        hmin = float(sizes.min()) * 0.5
     if hmax is None:
-        hmax = float(size.max()) * 2.0
+        hmax = float(sizes.max()) * 2.0
     opts: dict[str, float] = {"hmin": hmin, "hmax": hmax, "hgrad": hgrad, "verbose": verbose}
     if hausd is not None:
         opts["hausd"] = hausd
@@ -240,6 +255,24 @@ def zz_error_indicators(domain: Any, u_vertex: np.ndarray) -> tuple[np.ndarray, 
 
     Reference: Zienkiewicz & Zhu (1987), IJNME 24, 337-357.
     """
+    g_star, g_cell, area, cells = _recover_nodal_gradient(domain, u_vertex)
+
+    # elementwise gap, integrated over the cell (centroid rule: P1 g_cell is exact
+    # there and the centroid value of the P1-recovered field is the vertex mean).
+    g_star_centroid = g_star[cells].mean(axis=1)  # (n_cells, dim)
+    eta2 = area * np.sum((g_star_centroid - g_cell) ** 2, axis=1)  # (n_cells,)
+    eta = np.sqrt(np.maximum(eta2, 0.0))
+    return eta, float(np.sqrt(eta2.sum()))
+
+
+def _recover_nodal_gradient(domain: Any, field: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Patch-recovered (superconvergent) nodal gradient of a P1 ``field``.
+
+    Returns ``(g_star, g_cell, area, cells)``: ``g_star`` is the ``(n_vert, dim)`` recovered
+    nodal gradient (area-weighted average of incident element gradients), ``g_cell`` the raw
+    ``(n_cells, dim)`` elementwise-constant gradient, ``area`` the ``(n_cells,)`` cell areas,
+    and ``cells`` the ``(n_cells, n_local)`` connectivity.
+    """
     from ..._fem import _fe_element_gradient_data
 
     sg, jxw, cells = _fe_element_gradient_data(domain)
@@ -248,29 +281,82 @@ def zz_error_indicators(domain: Any, u_vertex: np.ndarray) -> tuple[np.ndarray, 
     n_cells, _, _, dim = sg.shape
     area = np.asarray(jxw).reshape(n_cells, -1).sum(axis=1)  # (n_cells,)
 
-    u = np.asarray(u_vertex).reshape(-1)
-    if u.shape[0] < int(cells.max()) + 1:
-        raise ValueError("u_vertex is shorter than the mesh vertex count; expected one value per P1 vertex.")
+    f = np.asarray(field).reshape(-1)
+    if f.shape[0] < int(cells.max()) + 1:
+        raise ValueError("field is shorter than the mesh vertex count; expected one value per P1 vertex.")
 
-    # raw (elementwise-constant) gradient of u_h
-    g_cell = np.einsum("cqld,cl->cqd", sg, u[cells]).mean(axis=1)  # (n_cells, dim)
-
-    # recover a nodal gradient g* by area-weighted averaging of incident cells
-    n_vert = u.shape[0]
+    g_cell = np.einsum("cqld,cl->cqd", sg, f[cells]).mean(axis=1)  # (n_cells, dim)
+    n_vert = f.shape[0]
     g_star = np.zeros((n_vert, dim))
-    w = np.zeros(n_vert)
+    wsum = np.zeros(n_vert)
     for lv in range(cells.shape[1]):
         idx = cells[:, lv]
         np.add.at(g_star, idx, area[:, None] * g_cell)
-        np.add.at(w, idx, area)
-    g_star /= np.maximum(w[:, None], 1e-300)
+        np.add.at(wsum, idx, area)
+    g_star /= np.maximum(wsum[:, None], 1e-300)
+    return g_star, g_cell, area, cells
 
-    # elementwise gap, integrated over the cell (centroid rule: P1 g_cell is exact
-    # there and the centroid value of the P1-recovered field is the vertex mean).
-    g_star_centroid = g_star[cells].mean(axis=1)  # (n_cells, dim)
-    eta2 = area * np.sum((g_star_centroid - g_cell) ** 2, axis=1)  # (n_cells,)
-    eta = np.sqrt(np.maximum(eta2, 0.0))
-    return eta, float(np.sqrt(eta2.sum()))
+
+def recover_hessian(domain: Any, u_vertex: np.ndarray) -> np.ndarray:
+    """Recovered nodal Hessian ``(n_vert, dim, dim)`` of a P1 field by *double* gradient
+    recovery: recover the nodal gradient, then recover the gradient of each of its
+    components; symmetrise. The Hessian controls the P1 interpolation error and is the basis
+    of the anisotropic metric (:func:`hessian_metric`)."""
+    g_star, _, _, _ = _recover_nodal_gradient(domain, u_vertex)
+    dim = g_star.shape[1]
+    cols = [_recover_nodal_gradient(domain, g_star[:, k])[0] for k in range(dim)]  # each (n_vert, dim)
+    H = np.stack(cols, axis=1)  # (n_vert, dim, dim): H[:, k, :] = grad of g_star[:, k]
+    return 0.5 * (H + np.transpose(H, (0, 2, 1)))
+
+
+def hessian_metric(
+    domain: Any,
+    u_vertex: np.ndarray,
+    *,
+    target_complexity: float,
+    hmin: float,
+    hmax: float,
+) -> np.ndarray:
+    """Anisotropic metric tensor from the recovered Hessian, for :func:`remesh_with_mmg`.
+
+    Builds, per vertex, the metric ``M = |H|`` (Hessian eigenvectors, absolute eigenvalues),
+    globally scaled so the mesh *complexity* ``∫ sqrt(det M)`` equals ``target_complexity``
+    (≈ the target vertex count), then clamps the edge sizes to ``[hmin, hmax]``. The metric's
+    eigenvectors align triangles with the solution's curvature and its eigenvalues set the
+    size along each -- thin, stretched elements across a directional feature, which resolve
+    it at a fraction of the isotropic cost.
+
+    Returns ``(n_vert, 3)`` symmetric tensors ``(m11, m12, m22)`` (2D only).
+
+    Reference: Alauzet & Loseille, *Metric-based anisotropic mesh adaptation* (2010).
+    """
+    dim = int(domain.dimension)
+    if dim != 2:
+        raise NotImplementedError("hessian_metric currently supports 2D meshes only.")
+
+    H = recover_hessian(domain, u_vertex)  # (n_vert, 2, 2)
+    evals, evecs = np.linalg.eigh(H)  # ascending eigenvalues, orthonormal eigenvectors
+    lam = np.abs(evals)  # |H|: interpolation error ~ |curvature|
+    # floor so det > 0 (a flat direction otherwise gives an infinite size)
+    lam = np.maximum(lam, 1e-12 * lam.max(axis=1, keepdims=True).clip(min=1e-300))
+
+    # normalize complexity: with M = s*|H|, complexity = s^(dim/2) * sum sqrt(det|H|)*area_v.
+    _, _, area_cell, cells = _recover_nodal_gradient(domain, u_vertex)
+    n_vert = H.shape[0]
+    area_v = np.zeros(n_vert)
+    for lv in range(cells.shape[1]):
+        np.add.at(area_v, cells[:, lv], area_cell / cells.shape[1])
+    det_raw = np.sqrt(np.prod(lam, axis=1))  # sqrt(det|H|) per vertex
+    complexity_raw = float(np.sum(det_raw * area_v))
+    s = (target_complexity / max(complexity_raw, 1e-300)) ** (2.0 / dim)
+    lam = s * lam
+
+    # clamp eigenvalues to the size window [hmin, hmax] (size = 1/sqrt(lambda))
+    lam = np.clip(lam, 1.0 / hmax**2, 1.0 / hmin**2)
+
+    # reassemble M = V diag(lam) V^T and pack the symmetric part (m11, m12, m22)
+    M = np.einsum("vij,vj,vkj->vik", evecs, lam, evecs)  # (n_vert, 2, 2)
+    return np.stack([M[:, 0, 0], M[:, 0, 1], M[:, 1, 1]], axis=1)
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +417,18 @@ def size_field_from_marks(domain: Any, marked_cells: np.ndarray, *, refine_facto
     return size
 
 
+def _mean_edge_length(domain: Any) -> float:
+    """Mean triangle-edge length of the current mesh (a size scale for metric clamps)."""
+    dim = int(domain.dimension)
+    pts = np.asarray(domain.mesh.points)[:, :dim]
+    tris = np.asarray(domain.mesh.cells_dict["triangle" if dim == 2 else "tetra"])
+    n_local = tris.shape[1]
+    lengths = [
+        np.linalg.norm(pts[tris[:, a]] - pts[tris[:, b]], axis=1) for a in range(n_local) for b in range(a + 1, n_local)
+    ]
+    return float(np.mean(np.concatenate(lengths)))
+
+
 # ---------------------------------------------------------------------------
 # Driver -- the outer adaptive loop
 # ---------------------------------------------------------------------------
@@ -359,6 +457,13 @@ class AdaptSpec:
         moving as I refine"), not a certified error bound -- the lever for more accuracy
         is the ``max_dofs`` / ``max_iters`` budget. Requires two consecutive rounds under
         ``eps`` (patience) so a single flat step does not stop the loop prematurely.
+    anisotropic
+        If ``True``, refine the forward loop with an :func:`hessian_metric` (stretched
+        elements aligned to the solution's curvature) grown by ``refine_factor``× vertices
+        per round, instead of isotropic ZZ + Dörfler marking. Far fewer DOFs for directional
+        features (layers, fronts); 2D scalar only. ``hmin`` / ``hmax`` bound the edge sizes.
+    hmin, hmax
+        Edge-size window for the anisotropic metric (defaults derive from the mesh).
     """
 
     theta: float = 0.5
@@ -367,6 +472,9 @@ class AdaptSpec:
     tol: float | None = None
     max_dofs: int | None = None
     eps: float | None = None
+    anisotropic: bool = False
+    hmin: float | None = None
+    hmax: float | None = None
 
 
 # Consecutive rounds that must satisfy ``eps`` before the loop stops on convergence.
@@ -425,8 +533,8 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
         u = _solve_vertex_values(cur, solve_fn, **kwargs)
         eta, est = zz_error_indicators(d, u)
         n_dofs = int(np.asarray(d.mesh.points).shape[0])
-        marked = dorfler_mark(eta, spec.theta)
-        history.append({"n_dofs": n_dofs, "estimate": est, "n_marked": int(marked.size)})
+        marked = None if spec.anisotropic else dorfler_mark(eta, spec.theta)
+        history.append({"n_dofs": n_dofs, "estimate": est, "n_marked": None if marked is None else int(marked.size)})
 
         # eps: the estimate stopped improving (plateau) for _EPS_PATIENCE rounds
         if spec.eps is not None and prev_est is not None:
@@ -437,11 +545,21 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
         below_tol = spec.tol is not None and est < spec.tol
         over_budget = spec.max_dofs is not None and n_dofs >= spec.max_dofs
         plateaued = spec.eps is not None and n_converged >= _EPS_PATIENCE
-        if last or below_tol or over_budget or plateaued or marked.size == 0:
+        nothing_marked = marked is not None and marked.size == 0
+        if last or below_tol or over_budget or plateaued or nothing_marked:
             break
 
-        size = size_field_from_marks(d, marked, refine_factor=spec.refine_factor)
-        remesh_with_mmg(d, size, copy=False)  # mutate the domain in place
+        if spec.anisotropic:
+            h_typ = _mean_edge_length(d)
+            hmin = spec.hmin if spec.hmin is not None else h_typ / 50.0
+            hmax = spec.hmax if spec.hmax is not None else h_typ * 2.0
+            metric = hessian_metric(d, u, target_complexity=n_dofs * spec.refine_factor, hmin=hmin, hmax=hmax)
+            # a loose size gradation lets adjacent elements change size fast, which is what
+            # permits the high aspect ratios that make anisotropic adaptation pay off
+            remesh_with_mmg(d, metric, copy=False, hmin=hmin, hmax=hmax, hgrad=3.0)
+        else:
+            size = size_field_from_marks(d, marked, refine_factor=spec.refine_factor)
+            remesh_with_mmg(d, size, copy=False)  # mutate the domain in place
         cur = jno.fem(cons, **kw)  # re-assemble the same problem on the refined mesh
 
     # rebind the caller's FEM to the final adapted state so fem.points / A / b match ``u``

@@ -27,10 +27,18 @@ from jno.utils.solver.fem_adapt import (  # noqa: E402
     AdaptSpec,
     _solve_vertex_values,
     dorfler_mark,
+    hessian_metric,
     remesh_with_mmg,
     run_adaptive_inverse,
     zz_error_indicators,
 )
+
+
+def _mean_aspect_ratio(d):
+    pts = np.asarray(d.mesh.points)[:, :2]
+    tris = np.asarray(d.mesh.cells_dict["triangle"])
+    e = np.stack([np.linalg.norm(pts[tris[:, a]] - pts[tris[:, b]], axis=1) for a, b in [(0, 1), (1, 2), (2, 0)]], axis=1)
+    return float(np.mean(e.max(axis=1) / e.min(axis=1)))
 
 
 def _mod(a, m):
@@ -383,6 +391,60 @@ def test_adapt_inverse_eps_stops_on_convergence():
     # the stop is genuine: the last TWO round-to-round changes are both under eps (patience=2)
     assert abs(ks[-1] - ks[-2]) / abs(ks[-1]) < 0.05
     assert abs(ks[-2] - ks[-3]) / abs(ks[-2]) < 0.05
+
+
+def test_hessian_metric_yields_anisotropic_mesh():
+    """hessian_metric on a thin-layer field produces a stretched (anisotropic) mesh."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06)
+    nodes = np.asarray(d.mesh.points)[:, :2]
+    field = np.tanh((nodes[:, 0] - 0.5) / 0.04)  # thin vertical layer at x=0.5
+
+    metric = hessian_metric(d, field, target_complexity=3.0 * len(nodes), hmin=0.004, hmax=0.2)
+    assert metric.shape == (len(nodes), 3)  # (m11, m12, m22) tensor per vertex
+
+    d.refine(metric, hgrad=3.0)
+    # elements are stretched along the layer, not near-equilateral like an isotropic mesh
+    assert _mean_aspect_ratio(d) > 3.0
+
+
+def _oblique_u(x, y, xp):
+    return xp.tanh((x + y - 1.0) / 0.03)  # thin layer along the x+y=1 diagonal
+
+
+def _oblique_layer_fem(d):
+    """-lap u = f with u = tanh((x+y-1)/eps): an OBLIQUE layer isotropic refinement handles
+    poorly (it must refine a wide diagonal band) but anisotropic resolves with stretched
+    elements aligned to the diagonal."""
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    t = J.tanh((xi + yi - 1.0) / 0.03)
+    f = (4.0 / 0.03**2) * (1.0 - t * t) * t
+    return jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - _oblique_u(xb, yb, J)])
+
+
+@pytest.mark.slow
+def test_anisotropic_adapt_beats_isotropic_on_oblique_layer():
+    """On an oblique layer, anisotropic (Hessian-metric) refinement reaches a far lower
+    error estimate per DOF than isotropic ZZ + Dörfler."""
+    # isotropic gets the LARGER budget; anisotropic still wins with fewer DOFs
+    di = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+    _oblique_layer_fem(di).solve(adapt=AdaptSpec(theta=0.7, max_iters=9, refine_factor=1.7, max_dofs=3000))
+    # fem is rebound to the final mesh; rebuild on the adapted domain for a fresh estimate
+    _, iso_est = zz_error_indicators(di, _solve_vertex_values(_oblique_layer_fem(di)))
+    iso_dofs = len(di.mesh.points)
+
+    da = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+    _oblique_layer_fem(da).solve(adapt=AdaptSpec(anisotropic=True, max_iters=6, refine_factor=1.6, max_dofs=1800))
+    _, aniso_est = zz_error_indicators(da, _solve_vertex_values(_oblique_layer_fem(da)))
+    aniso_dofs = len(da.mesh.points)
+
+    assert _mean_aspect_ratio(da) > 3.0, "anisotropic mesh is not stretched"
+    # fewer DOFs AND a lower error estimate than isotropic given a larger budget (empirically
+    # ~10x lower estimate at fewer DOFs; require the strict "fewer DOFs, lower estimate" win)
+    assert aniso_dofs < iso_dofs, f"anisotropic used {aniso_dofs} dofs, isotropic {iso_dofs}"
+    assert aniso_est < iso_est / 3.0, f"anisotropic est {aniso_est:.3f} not < iso est {iso_est:.3f}/3"
 
 
 @pytest.mark.slow
