@@ -168,6 +168,7 @@ nav:
       - "Why C¹? Argyris vs. Mixed (biharmonic)": tutorials/08-fem-and-varpinns/biharmonic-conforming-vs-mixed-2d.md
       - "Clamped Kirchhoff Plate (free boundary curvature)": tutorials/08-fem-and-varpinns/clamped-kirchhoff-plate-2d.md
       - "Cahn–Hilliard (transient nonlinear 4th-order)": tutorials/08-fem-and-varpinns/cahn-hilliard-2d.md
+      - "Brittle Fracture (4th-order phase-field, coupled)": tutorials/08-fem-and-varpinns/phase-field-fracture-2d.md
       - Transient Heat: tutorials/08-fem-and-varpinns/transient-heat-2d.md
       - Transient via diffrax (custom integrator): tutorials/08-fem-and-varpinns/transient-diffrax-heat-spreader.md
       - Vibrating Membrane (2D wave, 2nd-order time): tutorials/08-fem-and-varpinns/wave-membrane-2d.md
