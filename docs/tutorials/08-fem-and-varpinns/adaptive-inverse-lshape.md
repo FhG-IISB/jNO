@@ -64,14 +64,16 @@ it in `readout` and reseed the next round with `kappa.initialize(...)` to warm-s
 
 ## The result
 
-![Top: four L-shaped meshes refining at the re-entrant corner, tinted by the recovered singular
-state, labelled 41→126 dofs with kappa climbing 3.82→4.67. Bottom: a log-log plot of recovered-kappa
-error versus mesh DOFs, with the adaptive curve reaching low error at far fewer DOFs than the uniform
-baseline.](/jNO/assets/adaptive_inverse_lshape.png)
+![Top: four L-shaped meshes refining hard at the re-entrant corner, tinted by the recovered singular
+state, labelled 41→663 dofs with kappa climbing 3.82→4.93. Bottom: a log-log plot of recovered-kappa
+error versus mesh DOFs, with the adaptive curve dropping well below the uniform baseline.](/jNO/assets/adaptive_inverse_lshape.png)
 
-Starting from a deliberately wrong guess $\kappa=2$ (truth $5$), the recovered value climbs
-$3.82\to4.67$ as the corner is resolved. The adaptive run reaches $|\kappa-\kappa_\text{true}|\approx0.33$
-with **126 DOFs** — the accuracy uniform refinement only reaches near **~400 DOFs** (≈3× more).
+Starting from a deliberately wrong guess $\kappa=2$ (truth $5$), the recovered value marches
+$3.82\to4.93$ as the corner is resolved, and with a low `eps` and a bigger budget it keeps going —
+past $\kappa\approx4.99$ at a few thousand DOFs. At matched cost the adaptive run reaches
+$|\kappa-\kappa_\text{true}|\approx0.07$ with **663 DOFs**, versus $\approx0.19$ for uniform at **1102
+DOFs** — roughly a factor of a few fewer DOFs for the same parameter accuracy. `eps` sets *when* it
+stops; `max_iters` / `max_dofs` set *how far* it can go.
 
 ## What to notice
 

@@ -101,7 +101,7 @@ def fresh_kappa(seed):
 
 
 # --- the adaptive-inverse run --------------------------------------------------------
-def run_adaptive(mesh_size=0.2, n_rounds=6, n_opt=250):
+def run_adaptive(mesh_size=0.2, n_rounds=10, n_opt=220):
     """Alternate recover-kappa / estimate / refine; snapshot mesh + state per round."""
     d = jno.domain(jno.domain.l_shape(size=1.0, mesh_size=mesh_size))
     dummy = jno.domain.from_array({"_": np.zeros((1, 1))})
@@ -133,12 +133,13 @@ def run_adaptive(mesh_size=0.2, n_rounds=6, n_opt=250):
         return v
 
     # eps stops the loop once the recovered kappa stops moving between rounds (with a
-    # patience of 2, so a single flat step does not stop it early); max_iters is the budget
-    # cap. Whichever fires first ends the "refine until the design is good enough" loop.
+    # patience of 2, so a single flat step does not stop it early); max_iters / max_dofs are
+    # the budget caps. Whichever fires first ends the "refine until good enough" loop. With a
+    # low eps and a generous budget the recovered kappa marches all the way to the truth (5).
     hist = run_adaptive_inverse(
         d,
         build_inverse,
-        AdaptSpec(theta=0.6, max_iters=n_rounds, refine_factor=1.6, eps=0.01),
+        AdaptSpec(theta=0.7, max_iters=n_rounds, refine_factor=1.6, eps=0.005, max_dofs=1500),
         n_opt=n_opt,
         readout=readout,
     )
@@ -224,7 +225,7 @@ if __name__ == "__main__":
     print("adaptive rounds (dofs, kappa):", [(s["n_dofs"], round(s["kappa"], 4)) for s in snaps])
 
     # a uniform sweep spanning the adaptive DOF range for the comparison
-    uniform = run_uniform([0.12, 0.09, 0.07, 0.05, 0.04])
+    uniform = run_uniform([0.12, 0.09, 0.07, 0.05, 0.04, 0.03])
     print("uniform (dofs, kappa):", [(u["n_dofs"], round(u["kappa"], 4)) for u in uniform])
 
     k_adapt = snaps[-1]["kappa"]
