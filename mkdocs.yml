@@ -175,6 +175,7 @@ nav:
       - Inverse Diffusivity Field: tutorials/08-fem-and-varpinns/inverse-diffusivity-field.md
       - Inverse Conductivity (L-shape): tutorials/08-fem-and-varpinns/inverse-conductivity-lshape.md
       - Transient Inverse (Rate): tutorials/08-fem-and-varpinns/transient-inverse-heat.md
+      - Adaptive Mesh Refinement (L-shape): tutorials/08-fem-and-varpinns/adaptive-l-shape.md
       - Adaptive Mesh + Inverse Design: tutorials/08-fem-and-varpinns/adaptive-inverse-lshape.md
     - 09 Weights & Biases:
       - W&B Integration: tutorials/09-wandb/wandb-integration.md
