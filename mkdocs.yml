@@ -164,6 +164,9 @@ nav:
       - Bratu (nonlinear combustion): tutorials/08-fem-and-varpinns/bratu-2d.md
       - Ginzburg-Landau (nonlinear vector): tutorials/08-fem-and-varpinns/ginzburg-landau-2d.md
       - Laplacian Eigenmodes (spectral): tutorials/08-fem-and-varpinns/laplacian-eigenmodes-2d.md
+      - "Conforming Biharmonic (Argyris C¹, convergence)": tutorials/08-fem-and-varpinns/biharmonic-argyris-convergence-2d.md
+      - "Why C¹? Argyris vs. Mixed (biharmonic)": tutorials/08-fem-and-varpinns/biharmonic-conforming-vs-mixed-2d.md
+      - "Cahn–Hilliard (transient nonlinear 4th-order)": tutorials/08-fem-and-varpinns/cahn-hilliard-2d.md
       - Transient Heat: tutorials/08-fem-and-varpinns/transient-heat-2d.md
       - Transient via diffrax (custom integrator): tutorials/08-fem-and-varpinns/transient-diffrax-heat-spreader.md
       - Vibrating Membrane (2D wave, 2nd-order time): tutorials/08-fem-and-varpinns/wave-membrane-2d.md
