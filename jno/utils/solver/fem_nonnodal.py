@@ -124,6 +124,8 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
         argyris_triangle,
         hermite_pushforward,
         hermite_triangle,
+        morley_pushforward,
+        morley_triangle,
         nedelec_triangle,
         piola_contravariant,
         piola_contravariant_grad,
@@ -150,15 +152,19 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
                 field_index[f["field_key"]] = len(fields)
                 fields.append(f)
     spaces = [f["space"] for f in fields]
-    if any(s not in ("RT", "N1E", "P0", "Hermite", "Argyris") for s in spaces):
+    if any(s not in ("RT", "N1E", "P0", "Hermite", "Argyris", "Morley") for s in spaces):
         raise NotImplementedError(
-            f"jno.fem (non-nodal): supported element spaces are RT, N1E, P0, Hermite and Argyris; got {spaces}."
+            f"jno.fem (non-nodal): supported element spaces are RT, N1E, P0, Hermite, Argyris and Morley; got {spaces}."
         )
     has_edge = ("RT" in spaces) or ("N1E" in spaces)
     has_hermite = "Hermite" in spaces
     has_argyris = "Argyris" in spaces
-    has_vertex = has_hermite or has_argyris  # vertex-DOF families: the M(cell) DOF-transform path
-    if has_edge and has_vertex:
+    has_morley = "Morley" in spaces  # non-conforming biharmonic (vertex value + edge-normal DOFs)
+    if has_morley and any(s != "Morley" for s in spaces):
+        raise NotImplementedError("jno.fem (non-nodal): a Morley field cannot be mixed with other element families.")
+    # vertex-DOF families (take a nodal/derivative Dirichlet): the M(cell) DOF-transform path
+    has_vertex = has_hermite or has_argyris or has_morley
+    if has_edge and (has_hermite or has_argyris):
         raise NotImplementedError(
             "jno.fem (non-nodal): mixing edge (RT/N1E) and vertex (Hermite/Argyris) fields is not supported."
         )
@@ -231,11 +237,22 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
             jnp.asarray(as_.ref_hess),
             tuple(jnp.asarray(a) for a in as_.ref_aux),  # (nv_val, nv_grad, nv_hess, ne_grad) for M(cell)
         )
+    morley_ref = None
+    if has_morley:
+        ms_ = morley_triangle(quad_degree=max(quad_degree, 4))  # quadratic mass needs a degree-4 rule
+        morley_ref = (
+            jnp.asarray(ms_.ref_values),
+            jnp.asarray(ms_.ref_grads),
+            jnp.asarray(ms_.ref_hess),
+            tuple(jnp.asarray(a) for a in ms_.ref_aux),  # (nv_val, ne_grad) for M(cell)
+        )
 
     # Shared quadrature: a vertex-family problem uses its element rule; an edge/P0 problem uses the edge rule.
     ref_spec = (
         as_
         if has_argyris
+        else ms_
+        if has_morley
         else hs
         if has_hermite
         else (specs.get("RT") or specs.get("N1E") or raviart_thomas_triangle(1, quad_degree))
@@ -247,9 +264,9 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
     # (its 3 mesh-vertex values per cell), independent of the trial element's own basis.
     p1_shape_vals = jnp.stack([1.0 - qp[:, 0] - qp[:, 1], qp[:, 0], qp[:, 1]], axis=1) if _field_param_names else None
 
-    # Edge topology: edge families (RT/N1E) need it for their edge DOFs; Argyris needs it for the global id +
-    # orientation of its edge-normal DOFs (Hermite, pure-vertex, does not).
-    if has_edge or has_argyris:
+    # Edge topology: edge families (RT/N1E) need it for their edge DOFs; Argyris/Morley need it for the global
+    # id + orientation of their edge-normal DOFs (Hermite, pure-vertex, does not).
+    if has_edge or has_argyris or has_morley:
         top = build_edge_topology(cells, ref_spec.local_edges)
         ce = jnp.asarray(top.cell_edges, dtype=jnp.int32)  # (n_cells, 3) global edge ids
         esigns = jnp.asarray(top.cell_edge_signs.astype(np.float64)) if has_edge else None  # (n_cells, 3)
@@ -257,11 +274,11 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
     else:
         top, ce, esigns, n_edges = None, None, None, 0
 
-    # Argyris edge-normal DOFs: a per-cell, GLOBALLY-oriented physical unit normal per local edge so the two
-    # cells sharing an edge agree on the sign of the normal-derivative DOF. Orientation is fixed by the
+    # Argyris/Morley edge-normal DOFs: a per-cell, GLOBALLY-oriented physical unit normal per local edge so the
+    # two cells sharing an edge agree on the sign of the normal-derivative DOF. Orientation is fixed by the
     # canonical (low, high) global vertex pair: n = R90·(P[hi] - P[lo]) = (-(Δy), Δx) (Kirby 2018 / cross-cell C1).
     argyris_normals = None
-    if has_argyris:
+    if has_argyris or has_morley:
         _ev = np.asarray(top.edge_vertices)  # (n_edges, 2) canonical (lo, hi)
         _d = np.asarray(pts)[_ev[:, 1]] - np.asarray(pts)[_ev[:, 0]]  # (n_edges, 2)
         _en = np.stack([-_d[:, 1], _d[:, 0]], axis=1)  # R90·d per global edge
@@ -287,11 +304,20 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
         _edofs = 6 * n_verts + ce  # (n_cells, 3) global edge-DOF ids
         argyris_cdofs = jnp.concatenate([_vdofs, _edofs], axis=1)  # (n_cells, 21)
 
+    # Morley per-cell global DOF map: 1 value DOF per vertex (shared global vertex id) + 1 normal-derivative
+    # DOF per global edge at base ``n_verts``. Local order [v0, v1, v2, e0, e1, e2] matches the M(cell) rows.
+    morley_cdofs = None
+    if has_morley:
+        _edofs = n_verts + ce  # (n_cells, 3) global edge-DOF ids
+        morley_cdofs = jnp.concatenate([cells_j, _edofs], axis=1)  # (n_cells, 6)
+
     def _field_ndof(s):
         if s == "Hermite":
             return 3 * n_verts + n_cells
         if s == "Argyris":
             return 6 * n_verts + n_edges
+        if s == "Morley":
+            return n_verts + n_edges
         return n_edges if s in ("RT", "N1E") else n_cells
 
     ndof = [_field_ndof(s) for s in spaces]
@@ -305,6 +331,8 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
             return offs[i] + hermite_cdofs  # (n_cells, 10)
         if spaces[i] == "Argyris":
             return offs[i] + argyris_cdofs  # (n_cells, 21)
+        if spaces[i] == "Morley":
+            return offs[i] + morley_cdofs  # (n_cells, 6)
         if spaces[i] in ("RT", "N1E"):
             return offs[i] + ce  # (n_cells, 3)
         return offs[i] + jnp.arange(n_cells)[:, None]  # (n_cells, 1) P0
@@ -341,6 +369,18 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
                         "shape_grads": grad,
                         "shape_hess": hess,
                         "cell_sol": u_blocks[i][cdofs[i][c] - offs[i]][:, None],  # this cell's 21 local DOFs
+                        "space": "Lagrange",
+                    }
+                )
+            elif s == "Morley":  # non-conforming biharmonic: M(cell) DOF-transform + globally-oriented edge normal
+                rv, rg, rh, nodal = morley_ref
+                phi, grad, hess = morley_pushforward(rv, rg, rh, J, detJ, argyris_normals[c], nodal)
+                per.append(
+                    {
+                        "shape_vals": phi,
+                        "shape_grads": grad,
+                        "shape_hess": hess,
+                        "cell_sol": u_blocks[i][cdofs[i][c] - offs[i]][:, None],  # this cell's 6 local DOFs
                         "space": "Lagrange",
                     }
                 )
@@ -437,6 +477,10 @@ def assemble_fem_nonnodal(domain, volume_terms, boundary_terms, dirichlet_raw, i
         pins = pins + _hermite_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs)
     if has_argyris and dirichlet_raw:  # Argyris clamped BC: pin the full C1 boundary trace of g
         pins = pins + _argyris_dirichlet_pins(
+            dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs, top, n_verts
+        )
+    if has_morley and dirichlet_raw:  # Morley BC: pin the boundary vertex values + edge-normal derivatives of g
+        pins = pins + _morley_dirichlet_pins(
             dirichlet_raw, domain, field_index, spaces, np.asarray(pts), offs, top, n_verts
         )
     zeros = jnp.zeros(total)
@@ -785,6 +829,50 @@ def _hermite_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, 
             v = int(v)
             g = jnp.asarray(_eval_value_node_at(value_node, jnp.asarray(pts_np[v][None, :]))).reshape(-1)
             pins.append((offs[fidx] + 3 * v, float(g[0])))
+    return pins
+
+
+def _morley_dirichlet_pins(dirichlet_raw, domain, field_index, spaces, pts_np, offs, top, n_verts):
+    """Essential BC for a Morley field: pin the **value** at each boundary vertex to ``g`` and the **normal
+    derivative** at each boundary edge midpoint to ``∂g/∂n``. This is the natural Morley clamped/Dirichlet BC
+    (Morley's only DOFs are the vertex value and the edge-normal derivative — there is no curvature DOF, so the
+    over-/free-curvature distinction of the Argyris element does not arise). ``g`` and ``∂g/∂n`` come from
+    autodiff of the Dirichlet value node, so any smooth ``g(x, y)`` works. The edge normal is the same
+    globally-oriented ``n = R90·(P[hi] - P[lo])`` the assembler uses for the edge-normal DOF."""
+    from ..._fem import _eval_value_node_at
+    from .fem_1d import _region_node_ids
+
+    def _g_derivs(value_node, xy):
+        def gfun(p):
+            return jnp.asarray(_eval_value_node_at(value_node, p[None, :])).reshape(())
+
+        p = jnp.asarray(xy, dtype=jnp.float64)
+        return float(gfun(p)), np.asarray(jax.grad(gfun)(p))
+
+    cell_edges = np.asarray(top.cell_edges)
+    counts = np.bincount(cell_edges.reshape(-1), minlength=top.n_edges)
+    boundary_edges = {int(e) for e in np.where(counts == 1)[0]}
+
+    pins = []
+    for fk, region, _comp, _value, value_node in dirichlet_raw:
+        fidx = field_index.get(fk)
+        if fidx is None or spaces[fidx] != "Morley":
+            continue
+        base = offs[fidx]
+        edge_base = base + n_verts
+        region_nodes = {int(v) for v in _region_node_ids(domain, region)}
+        for v in region_nodes:  # value at each boundary vertex
+            g, _grad = _g_derivs(value_node, pts_np[v])
+            pins.append((base + v, g))
+        for eid in boundary_edges:
+            va, vb = (int(x) for x in top.edge_vertices[eid])  # canonical (lo, hi) -> global normal orientation
+            if va not in region_nodes or vb not in region_nodes:
+                continue
+            evec = pts_np[vb] - pts_np[va]
+            n = np.array([-evec[1], evec[0]])
+            n = n / np.linalg.norm(n)
+            _g, grad = _g_derivs(value_node, 0.5 * (pts_np[va] + pts_np[vb]))  # ∂g/∂n at the edge midpoint
+            pins.append((edge_base + eid, float(n @ grad)))
     return pins
 
 

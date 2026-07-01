@@ -450,3 +450,137 @@ def argyris_pushforward(ref_values, ref_grads, ref_hess, J, detJ, edge_normals, 
     grad = jnp.einsum("qkl,kn,lm->qnm", rg, C, K)  # (n_quad, 21, 2) physical gradient
     hess = jnp.einsum("qkij,kn,ia,jb->qnab", rh, C, K, K)  # (n_quad, 21, 2, 2) physical Hessian
     return phi, grad, hess
+
+
+# ---------------------------------------------------------------------------
+# Morley (non-conforming biharmonic, quadratic, 6 DOF) — the cheapest plate element.
+#
+# DOFs: the value at each of the 3 vertices + the normal derivative at each of the 3 edge midpoints. The
+# Morley triangle is neither C⁰ nor C¹ (value continuous only at vertices, ∂ₙ only at edge midpoints), so it
+# is *non-conforming* for the biharmonic — yet it passes the patch test and converges (energy O(h), L² O(h²)).
+# It is far cheaper than Argyris (6 vs 21 DOF, quadratic vs quintic), so it clears the Argyris construction
+# memory ceiling and enables much finer plate/fracture meshes. It reuses the same monomial dual-basis /
+# ``M(cell)`` machinery: the vertex-value rows are affine-invariant (identity by reference-duality) and the
+# edge-normal rows use the *physical, globally-oriented* edge normal (the same ``argyris_normals`` orientation).
+#
+# References
+# ----------
+# L.S.D. Morley, "The triangular equilibrium element in the solution of plate bending problems", Aeronautical
+#   Quarterly 19 (1968) 149–169 — the original non-conforming plate triangle.
+# P.G. Ciarlet, *The Finite Element Method for Elliptic Problems* (2002), §6 — non-conforming convergence.
+# ---------------------------------------------------------------------------
+
+_MOR_EXPS = tuple((i, total - i) for total in range(3) for i in range(total + 1))  # 6 P2 monomials x^i y^j, i+j≤2
+
+
+def _mor_mono_value(pt: np.ndarray) -> np.ndarray:
+    x, y = pt
+    return np.array([x**i * y**j for (i, j) in _MOR_EXPS])  # (6,)
+
+
+def _mor_mono_grad(pt: np.ndarray) -> np.ndarray:
+    x, y = pt
+    g = np.zeros((6, 2))
+    for k, (i, j) in enumerate(_MOR_EXPS):
+        g[k, 0] = i * (x ** (i - 1) if i >= 1 else 0.0) * (y**j)
+        g[k, 1] = j * (x**i) * (y ** (j - 1) if j >= 1 else 0.0)
+    return g  # (6, 2)
+
+
+def _mor_mono_hess(pt: np.ndarray) -> np.ndarray:
+    x, y = pt
+    H = np.zeros((6, 2, 2))
+    for k, (i, j) in enumerate(_MOR_EXPS):
+        H[k, 0, 0] = i * (i - 1) * (x ** (i - 2) if i >= 2 else 0.0) * (y**j)
+        H[k, 0, 1] = i * j * (x ** (i - 1) if i >= 1 else 0.0) * (y ** (j - 1) if j >= 1 else 0.0)
+        H[k, 1, 0] = H[k, 0, 1]
+        H[k, 1, 1] = j * (j - 1) * (x**i) * (y ** (j - 2) if j >= 2 else 0.0)
+    return H  # (6, 2, 2) — constant across the cell (P2)
+
+
+def _mor_ref_functionals(coeffs: np.ndarray, K: np.ndarray, edge_normals: np.ndarray) -> np.ndarray:
+    """The 6 Morley functionals on a field given by its P2-monomial coefficients: value at the 3 reference
+    vertices + normal derivative (``n·Kᵀ∇``) at the 3 reference edge midpoints. ``K = I`` + reference normals
+    builds the reference dual basis; the cell ``K`` + physical normals builds ``M(cell)``."""
+    KT = K.T
+    out = [coeffs @ _mor_mono_value(v) for v in _ARG_REF_VERTS]  # 3 vertex values (affine-invariant)
+    for mid, n in zip(_ARG_REF_EDGE_MIDS, edge_normals):
+        out.append(n @ (KT @ (_mor_mono_grad(mid).T @ coeffs)))  # ∂/∂n at edge midpoint
+    return np.array(out)  # (6,)
+
+
+def _mor_reference_coeffs() -> np.ndarray:
+    """Reference dual-basis monomial coefficients ``S`` (6×6): ``S = V_ref⁻¹`` with ``V_ref[:,j]`` the 6
+    functionals of monomial ``j``, so ``ψ_k = Σ_p S[p,k] monomial_p`` satisfies ``ℓ_i(ψ_k) = δ_ik``."""
+    refn = _arg_ref_normals()
+    cols = []
+    for j in range(6):
+        ej = np.zeros(6)
+        ej[j] = 1.0
+        cols.append(_mor_ref_functionals(ej, np.eye(2), refn))
+    return np.linalg.inv(np.column_stack(cols))
+
+
+def morley_triangle(quad_degree: int = 4) -> ElementSpec:
+    """Morley non-conforming quadratic triangle (6 DOF), built from the P2 monomials (basix has no Morley).
+
+    Returns the reference dual basis ``ψ_k`` (value/grad/Hessian at a P2-mass-exact quadrature) plus — in
+    ``ref_aux`` — the reference nodal tabulations (``ψ_k`` value at the 3 vertices, gradient at the 3 edge
+    midpoints) that :func:`morley_pushforward` needs for the per-cell ``M(cell)`` transform.
+    ``local_edges = BASIX_TRIANGLE_EDGES`` so the edge-normal DOF ``k`` aligns with global edge
+    ``cell_edges[c, k]``."""
+    import basix
+    from basix import CellType
+
+    S = _mor_reference_coeffs()  # (6, 6)
+    qp, qw = basix.make_quadrature(CellType.triangle, quad_degree)
+    qp = np.asarray(qp)
+    nq = qp.shape[0]
+    rv = np.zeros((nq, 6, 1))
+    rg = np.zeros((nq, 6, 1, 2))
+    rh = np.zeros((nq, 6, 1, 2, 2))
+    for q in range(nq):
+        rv[q, :, 0] = _mor_mono_value(qp[q]) @ S
+        rg[q, :, 0, :] = np.einsum("pl,pk->kl", _mor_mono_grad(qp[q]), S)
+        rh[q, :, 0, :, :] = np.einsum("pab,pk->kab", _mor_mono_hess(qp[q]), S)
+    nv_val = np.array([_mor_mono_value(v) @ S for v in _ARG_REF_VERTS])  # (3, 6) ψ_k at vertices
+    ne_grad = np.array([np.einsum("pl,pk->kl", _mor_mono_grad(m), S) for m in _ARG_REF_EDGE_MIDS])  # (3, 6, 2)
+    return ElementSpec(
+        family="Morley-Tri",
+        n_dof=6,
+        value_size=1,
+        quad_points=qp,
+        quad_weights=np.asarray(qw),
+        ref_values=rv,
+        ref_div=None,
+        ref_grads=rg,
+        local_edges=BASIX_TRIANGLE_EDGES,
+        ref_hess=rh,
+        ref_aux=(nv_val, ne_grad),
+    )
+
+
+def morley_pushforward(ref_values, ref_grads, ref_hess, J, detJ, edge_normals, nodal):
+    """Map the reference Morley basis to a physical cell via the affine DOF-transform ``M(cell)`` (6×6).
+
+    ``M[m,k] = ℓ_m^phys(ψ̂_k)``: the 3 vertex-value rows are ``ψ_k(ξ_v)`` (value is affine-invariant → no
+    ``K``), the 3 edge rows ``n_e · Kᵀ ∇_ξψ_k(ξ_mid_e)`` with ``n_e`` the **physical, globally-oriented** edge
+    normal (so the two cells sharing an edge agree on the normal-derivative DOF sign). The physical basis is
+    ``φ_n = Σ_k C[k,n] ψ̂_k`` with ``C = M⁻¹``; the chain rule (``∇ₓ = Kᵀ∇_ξ``, ``Hₓ = Kᵀ H_ξ K``) gives the
+    physical grad/Hessian. A scalar field → shapes match nodal Lagrange, so the shared evaluator serves it.
+
+    ``nodal = (nv_val, ne_grad)`` are the reference nodal tabulations from :func:`morley_triangle`;
+    ``edge_normals`` is the cell's ``(3, 2)`` physical edge normals (one per local edge ``k``)."""
+    nv_val, ne_grad = nodal
+    K = jnp.linalg.inv(J)
+    eg = jnp.einsum("lm,ekl->ekm", K, ne_grad)  # (3, 6, 2) Kᵀ∇ at each edge midpoint
+    en = jnp.einsum("em,ekm->ek", edge_normals, eg)  # (3, 6) n_e · Kᵀ∇
+    M = jnp.concatenate([jnp.asarray(nv_val), en], axis=0)  # (6, 6): 3 vertex-value rows + 3 edge-normal rows
+    C = jnp.linalg.inv(M)
+    rv = ref_values[..., 0]  # (n_quad, 6)
+    rg = ref_grads[..., 0, :]  # (n_quad, 6, 2)
+    rh = ref_hess[..., 0, :, :]  # (n_quad, 6, 2, 2)
+    phi = jnp.einsum("qk,kn->qn", rv, C)  # (n_quad, 6)
+    grad = jnp.einsum("qkl,kn,lm->qnm", rg, C, K)  # (n_quad, 6, 2) physical gradient
+    hess = jnp.einsum("qkij,kn,ia,jb->qnab", rh, C, K, K)  # (n_quad, 6, 2, 2) physical Hessian
+    return phi, grad, hess

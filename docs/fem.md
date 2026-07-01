@@ -125,6 +125,7 @@ problems whose natural space is *not* H¹. Pick one with the `space=` knob on `f
 | `"P0"` | L² (piecewise constant) | one per cell | the pressure / multiplier of a mixed pair |
 | `"Hermite"` | C⁰ cubic, **vertex value + ∇ DOFs** | `u`, `∂u/∂x`, `∂u/∂y` at vertices (+ centroid) | smooth/gradient-aware fields; the foundation for C¹ elements |
 | `"Argyris"` | **C¹** quintic (TUBA-6) | value + `∇u` + `D²u` at vertices, `∂u/∂n` at edge midpoints | conforming **biharmonic** / plate / Cahn–Hilliard |
+| `"Morley"` | **non-conforming** quadratic (6 DOF) | value at vertices, `∂u/∂n` at edge midpoints | **cheap biharmonic** / plate — scales to fine meshes |
 
 > **Hermite** is the first element with a per-cell **DOF-mixing** transform `M(cell)` (its global
 > derivative DOFs are the physical gradient `∇u` at the vertices). It is **C⁰** (not C¹), so it is *not*
@@ -154,6 +155,19 @@ problems whose natural space is *not* H¹. Pick one with the `space=` knob on `f
 > biharmonic). **Inverse** problems work too — a scalar coefficient (plate stiffness in `α·Δ²u = f`, a
 > diffusivity in a transient flow) *or* a spatially-varying **P1 field** `k(x)` in a volume term is recovered
 > by `crux.solve` (`tests/test_fem_inverse.py`), for both steady and transient forms.
+
+> **Morley** is the **cheapest** biharmonic element (6 DOF: the value at the 3 vertices + the normal
+> derivative at the 3 edge midpoints, quadratic). It is **non-conforming** — neither C⁰ nor C¹ — yet passes
+> the patch test and converges (energy `O(h)`, L² `O(h²)`). It reuses the same `M(cell)` transform and
+> globally-oriented edge-normal DOF as Argyris, but with a quadratic basis and ~3.5× fewer DOF it is far
+> cheaper, so it **clears the Argyris construction memory ceiling** and scales to much finer meshes (e.g. a
+> sharper phase-field crack). **Modelling subtlety:** because it is non-conforming, the biharmonic form must
+> be the **full-Hessian inner product** `inner(hessian(u), hessian(v))` (`∫D²u:D²v`), *not* `∫Δu·Δv` — the
+> Laplacian form is singular for Morley (functions like `xy` have `Δu = 0` but `D²u ≠ 0`, a spurious kernel).
+> A Dirichlet term `u(region) - g` pins the boundary vertex values and edge-normal derivatives to `g` and
+> `∂g/∂n` (the natural Morley clamped/Dirichlet BC — there is no curvature DOF). See `tests/test_fem_morley.py`.
+> Reference: L.S.D. Morley, *The triangular equilibrium element in the solution of plate bending problems*,
+> Aeronautical Quarterly **19** (1968) 149–169.
 
 ```python
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")   # H(div) flux
