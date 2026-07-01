@@ -15,7 +15,7 @@ worth the trouble?*
    ordinary $C^0$ Lagrange (here $P_2$). No $C^1$ element needed, but the auxiliary variable costs accuracy.
 
 ```python
-# conforming: one bilinear form, clamped to the known u*
+# conforming: one bilinear form, simply-supported (deflection-only) to the known u*
 fem = jno.fem([laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi]) - f * vi, u(xb, yb) - g])
 
 # mixed: w = Δu and Δw = f, simply supported u = w = 0 on ∂Ω
@@ -27,9 +27,9 @@ simply supported), the displacement nodal-$L^2$ error at *comparable cost* is:
 
 ```
        h | Argyris dofs      L2 err | mixed dofs      L2 err | Argyris/mixed
-   0.420 |          165   9.140e-06 |        130   1.574e-03 |         172×
-   0.300 |          251   1.992e-06 |        202   7.646e-04 |         384×
-   0.210 |          373   3.731e-07 |        306   3.255e-04 |         872×
+   0.420 |          165   2.558e-06 |        130   1.574e-03 |         615×
+   0.300 |          251   1.173e-06 |        202   7.646e-04 |         652×
+   0.210 |          373   1.636e-07 |        306   3.255e-04 |        1990×
 ```
 
 For essentially the same number of degrees of freedom, the conforming $C^1$ element is **two to three

@@ -46,7 +46,7 @@ def nodal_l2(uh, pts):
 
 
 def solve_argyris(mesh_size):
-    """C¹ conforming: ∫Δu·Δv = ∫f v, clamped to the known u*. Displacement = vertex value DOFs."""
+    """C¹ conforming: ∫Δu·Δv = ∫f v, simply-supported (deflection-only, ``u(bdry)-g``). Displacement = value DOFs."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size)
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
