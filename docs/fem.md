@@ -58,10 +58,12 @@ u_h = jnp.linalg.solve(fem.A, fem.b)
   (a P1 Hessian is identically zero). Scalar Lagrange fields only; the physical Hessian is the exact
   affine map `∂²φ/∂x_a∂x_b = K_ia K_jb ∂²φ/∂ξ_i∂ξ_j` (`K = J⁻¹`, no curvature term on the P1 geometry).
   > **Conformity caveat.** Standard Lagrange is **C⁰**, so `∫Δu·Δv` over P2 is *non-conforming* and does
-  > **not** give a convergent biharmonic discretisation. For a convergent solve use the **C¹ Argyris
-  > element** (`space="Argyris"`, below — the conforming quintic), or the mixed (Ciarlet–Raviart) method —
-  > two coupled C⁰ fields with `w = Δu`, first derivatives only (see `tests/test_fem_hessian.py`). The
-  > shape-Hessian assembly here is the prerequisite both build on.
+  > **not** give a convergent biharmonic discretisation. For a convergent solve use a purpose-built
+  > biharmonic element — the **C¹ Argyris** element (`space="Argyris"`, below — the conforming quintic,
+  > accurate) or the cheaper **non-conforming Morley** element (`space="Morley"`, below — 6 DOF; note it uses
+  > the full-Hessian form `∫D²u:D²v`) — or the mixed (Ciarlet–Raviart) method (two coupled C⁰ fields with
+  > `w = Δu`, first derivatives only; see `tests/test_fem_hessian.py`). The shape-Hessian assembly here is the
+  > prerequisite they build on.
 
 ---
 
