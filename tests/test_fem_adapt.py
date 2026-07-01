@@ -28,6 +28,7 @@ from jno.utils.solver.fem_adapt import (  # noqa: E402
     _solve_vertex_values,
     dorfler_mark,
     remesh_with_mmg,
+    run_adaptive_inverse,
     zz_error_indicators,
 )
 
@@ -242,6 +243,96 @@ def test_differentiable_inverse_on_adapted_mesh():
     rec = float(np.asarray(crux.eval([alpha])[0]).reshape(-1)[0])
     assert abs(rec - 2.0) > 0.5, "parameter did not move -- gradient did not reach it through the adapted mesh"
     assert abs(rec - 1.0) < 0.05, f"recovered alpha={rec:.4f} on adapted mesh"
+
+
+_KAPPA_TRUE = 5.0
+
+
+def _reaction_diffusion_fem(d, kappa):
+    """``-lap u + kappa*u = kappa_true*u_singular`` on the L-shape, Dirichlet ``g = u_singular``.
+
+    Since ``u_singular`` is harmonic, at ``kappa = kappa_true`` the exact solution *is*
+    ``u_singular`` -- a value-singular corner state.  ``kappa`` multiplies the mass
+    (reaction) bilinear term, so it enters through the operator and the inverse solve is
+    differentiable via implicit diff (unlike a parameter in the Dirichlet data)."""
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = _KAPPA_TRUE * _u_singular(xi, yi, J, _mod)
+    return jno.fem(
+        [ui.x * vi.x + ui.y * vi.y + kappa * (ui * vi) - f * vi, u(xb, yb) - _u_singular(xb, yb, J, _mod)],
+        quad_degree=4,
+    )
+
+
+def _corner_obs(d):
+    """Closed-form observations ``u_singular`` at nodes, weighted to the corner (r < 0.2)."""
+    nodes = np.asarray(d.mesh.points)[:, :2]
+    s = jnp.asarray(_u_singular(nodes[:, 0], nodes[:, 1], np, np.mod))
+    r = np.linalg.norm(nodes - (0.5, 0.5), axis=1)
+    return s, jnp.asarray((r < 0.2).astype(np.float64))
+
+
+def _fresh_kappa(seed, init=2.0):
+    k = jno.np.parameter((1,), key=jax.random.PRNGKey(seed), name=f"kappa{seed}")
+    k.initialize(jax.nn.initializers.constant(init))
+    k.dtype(jnp.float64)
+    k.optimizer(optax.adam(1e-1))
+    return k
+
+
+@pytest.mark.slow
+def test_adaptive_inverse_beats_uniform_on_l_shape():
+    """Adaptive mesh refinement wrapped around the inverse solve recovers the parameter
+    more accurately per DOF than uniform refinement -- the *minimal mesh for the recovered
+    design*.
+
+    Each round differentiably recovers ``kappa`` on the current (frozen) mesh, then the ZZ
+    estimator refines the corner where the singular state is under-resolved; the recovered
+    ``kappa`` de-biases toward the truth as the mesh adapts."""
+    dummy = jno.domain.from_array({"_": np.zeros((1, 1))})
+    kappa = _fresh_kappa(0)
+    best: dict = {}
+
+    def build_inverse(dd):
+        if "k" in best:  # warm-start from the previous (coarser) round
+            kappa.initialize(jax.nn.initializers.constant(best["k"]))
+        s, w = _corner_obs(dd)
+        fem = _reaction_diffusion_fem(dd, kappa)
+        return jno.core([(w * (fem.solve() - s)).mse], domain=dummy), fem.solve()
+
+    def readout(crux):
+        v = float(np.asarray(crux.eval([kappa])).reshape(-1)[0])
+        best["k"] = v
+        return v
+
+    d = _l_shape_domain(mesh_size=0.2)
+    hist = run_adaptive_inverse(
+        d, build_inverse, AdaptSpec(theta=0.6, max_iters=5, refine_factor=1.6), n_opt=200, readout=readout
+    )
+    k_adapt = hist[-1]["params"]
+    dof_adapt = hist[-1]["n_dofs"]
+
+    # the inverse moved kappa off its init toward the truth, and the mesh grew monotonically
+    assert abs(k_adapt - _KAPPA_TRUE) < abs(2.0 - _KAPPA_TRUE)
+    assert [h["n_dofs"] for h in hist] == sorted(h["n_dofs"] for h in hist)
+
+    # uniform baseline on a mesh with at LEAST as many DOFs as the adaptive result
+    du = _l_shape_domain(mesh_size=0.09)
+    assert len(du.mesh.points) >= dof_adapt, "uniform baseline must match or exceed the adaptive DOFs"
+    s, w = _corner_obs(du)
+    ku = _fresh_kappa(1)
+    fem_u = _reaction_diffusion_fem(du, ku)
+    cru = jno.core([(w * (fem_u.solve() - s)).mse], domain=dummy)
+    cru.solve(200)
+    k_unif = float(np.asarray(cru.eval([ku])).reshape(-1)[0])
+
+    # minimal mesh: adaptive recovers kappa more accurately with FEWER DOFs than uniform
+    assert abs(k_adapt - _KAPPA_TRUE) < abs(k_unif - _KAPPA_TRUE), (
+        f"adaptive |k-5|={abs(k_adapt - _KAPPA_TRUE):.3f} @ {dof_adapt} dofs did not beat "
+        f"uniform |k-5|={abs(k_unif - _KAPPA_TRUE):.3f} @ {len(du.mesh.points)} dofs"
+    )
 
 
 @pytest.mark.slow

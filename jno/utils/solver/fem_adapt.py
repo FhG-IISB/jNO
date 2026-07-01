@@ -415,3 +415,85 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
     fem.__dict__.update(cur.__dict__)
     fem.adapt_history = history
     return u
+
+
+def run_adaptive_inverse(
+    domain: Any,
+    build_inverse: Any,
+    spec: AdaptSpec,
+    *,
+    n_opt: int,
+    readout: Any = None,
+) -> list[dict]:
+    """Adaptive mesh refinement wrapped around a differentiable inverse solve.
+
+    Alternates, on ``domain`` (refined **in place** each round)::
+
+        optimize parameters  ->  recovered state  ->  ZZ-estimate  ->  Dörfler-mark  ->  refine
+
+    so the final mesh is the minimal one that resolves the *recovered design* -- not merely
+    the forward solution at some fixed guess.  Refinement is a non-differentiable outer
+    Python loop; each inner ``crux.solve`` is a fully differentiable inverse solve on the
+    (currently frozen) mesh, so gradients reach the parameters unchanged.
+
+    Parameters
+    ----------
+    domain
+        The mesh to adapt.  Mutated in place (``domain.refine``) between rounds.
+    build_inverse
+        ``build_inverse(domain) -> (crux, state_op)``.  Rebuilds the inverse problem on the
+        current mesh: ``crux`` is a :func:`jno.core` whose ``.solve(n)`` optimizes the shared
+        ``jno.np`` parameters, and ``state_op`` is the FEM solve op whose value at the
+        optimized parameters is the recovered nodal state (this drives the ZZ estimator).
+        The parameters must be **shared** ``jno.np`` objects created once by the caller and
+        closed over here, so their optimized value carries (warm-starts) into the next round.
+        Scalar / low-dimensional parameters only: a *field* parameter tied to mesh vertices
+        changes shape on remesh and would need solution transfer (not supported here).
+    spec
+        :class:`AdaptSpec` controlling marking (``theta``), the round budget (``max_iters``),
+        the local refinement (``refine_factor``), and optional ``tol`` / ``max_dofs`` stops.
+    n_opt
+        Optimizer steps (``crux.solve(n_opt)``) per round.
+    readout
+        Optional ``readout(crux) -> Any`` called with the just-solved ``crux`` to snapshot
+        the recovered parameter value(s) (e.g. ``crux.eval([kappa])``); stored under
+        ``"params"`` in the returned history.  Optimized values live in the ``crux``
+        instance (they are *not* written back to the ``jno.np`` object), so read them here.
+        To warm-start the next round, reseed inside ``build_inverse`` via
+        ``param.initialize(...)`` from the value snapshotted here.
+
+    Returns
+    -------
+    list of dict
+        One record per round: ``{n_dofs, estimate, n_marked[, params]}``.
+    """
+    history: list[dict] = []
+    for it in range(spec.max_iters):
+        crux, state_op = build_inverse(domain)
+        crux.solve(n_opt)  # optimize parameters on the current (frozen) mesh
+
+        # recovered nodal state at the optimized parameters -> drives the estimator
+        u = np.asarray(crux.eval([state_op])).reshape(-1)
+        n_vert = int(np.asarray(domain.mesh.points).shape[0])
+        if u.shape[0] != n_vert:
+            raise NotImplementedError(
+                "The ZZ estimator currently assumes a scalar P1 state (one DOF per vertex); "
+                f"got {u.shape[0]} values for {n_vert} vertices."
+            )
+
+        eta, est = zz_error_indicators(domain, u)
+        marked = dorfler_mark(eta, spec.theta)
+        rec: dict = {"n_dofs": n_vert, "estimate": est, "n_marked": int(marked.size)}
+        if readout is not None:
+            rec["params"] = readout(crux)
+        history.append(rec)
+
+        last = it == spec.max_iters - 1
+        below_tol = spec.tol is not None and est < spec.tol
+        over_budget = spec.max_dofs is not None and n_vert >= spec.max_dofs
+        if last or below_tol or over_budget or marked.size == 0:
+            break
+
+        size = size_field_from_marks(domain, marked, refine_factor=spec.refine_factor)
+        remesh_with_mmg(domain, size, copy=False)  # mutate the domain in place
+    return history
