@@ -26,11 +26,14 @@ fem = jno.fem([laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi]) - f * vi, u(xb,
 sol = fem.solve()
 ```
 
-For an Argyris field the Dirichlet term `u(boundary) - g` pins the full $C^1$ trace of the **known**
-field $g$ (value, gradient and Hessian at boundary vertices; $\partial g/\partial n$ at edge midpoints) by
-*autodiff* of `g` — the right essential BC for a **manufactured** solution, where the pinned data is exact.
-(It fixes *all* boundary DOFs including the curvature $D^2 g$, so it imposes more than a generic clamped BVP,
-which leaves the boundary $\partial^2 u/\partial n^2$ free; that case is not yet expressible.)
+For an Argyris field the Dirichlet term `u(boundary) - g` imposes the **proper clamped** condition by
+*autodiff* of the known field `g`: it pins the value and gradient (so $u=g$ and $\partial u/\partial n =
+\partial g/\partial n$) and the edge normal-derivative, while leaving the boundary curvature $\partial^2
+u/\partial n^2$ **free** — the physical clamped-plate BC, where the normal–normal second derivative is a
+*natural* condition recovered by the solve. For a **manufactured** solution the pinned value and gradient are
+exact and the freed curvature converges to $\partial^2 u^\ast/\partial n^2$, so the discrete solution still
+converges to $u^\ast$ at the optimal rate. (The companion [clamped Kirchhoff plate](clamped-kirchhoff-plate-2d.md)
+tutorial reads that freed curvature off the solution as the clamp reaction moment.)
 
 ## Order of accuracy
 

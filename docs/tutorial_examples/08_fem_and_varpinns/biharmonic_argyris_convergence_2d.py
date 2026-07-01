@@ -14,10 +14,12 @@ unstructured meshes and measure the empirical convergence *rate* against the a-p
     displacement / L²      ‖u - u_h‖_{L²}    = O(h^{k+1})  = O(h⁶)   (Aubin–Nitsche).
 
 Manufactured solution ``u* = sin(πx) sin(πy)`` on the unit square gives ``Δu* = -2π² u*`` and
-``f = Δ²u* = 4π⁴ u*``. The Dirichlet term ``u(boundary) - u*`` pins the full C¹ trace of the known ``u*``
-(value, gradient and Hessian at boundary vertices; ``∂u*/∂n`` at edge midpoints) by autodiff — the exact
-essential data for this manufactured solution (a generic clamped BVP, with the boundary ``∂²u/∂n²`` free, is
-not yet expressible). Error norms are
+``f = Δ²u* = 4π⁴ u*``. The Dirichlet term ``u(boundary) - u*`` imposes the *proper clamped* condition by
+autodiff of ``u*``: it pins the value, gradient and edge normal-derivative but leaves the boundary curvature
+``∂²u/∂n²`` **free** (a natural BC recovered by the solve). For this manufactured solution the pinned value
+and gradient are exact and the freed curvature converges to ``∂²u*/∂n²``, so ``u_h → u*`` at the optimal rate
+(the companion ``clamped_kirchhoff_plate_2d.py`` reads that freed curvature off as the clamp moment). Error
+norms are
 computed by per-cell Gauss quadrature, reconstructing ``u_h`` and ``Δu_h`` from the solution DOFs with the
 public element functions (``argyris_triangle`` / ``argyris_pushforward``) — i.e. we audit the discrete
 solution itself, not a hand-built field.
