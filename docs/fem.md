@@ -243,9 +243,11 @@ term `p_D * (v[0]*nx + v[1]*ny)`, no essential constraint on the flux. A BC may 
 geometry). All solver modes work — **steady-linear**, **steady-nonlinear** (Newton), and **transient**
 (`M u̇ + A u = c`), including a mixed/saddle transient (a DAE with singular mass, e.g. transient Darcy).
 
-Tutorials: `mixed_poisson_rt_2d.py` (H(div)) and `maxwell_nedelec_2d.py` (H(curl): magnetostatics +
-eddy current). *Scope: lowest-order RT₀ / N1E₀ on 2-D triangular meshes; N1E₀ also on 3-D **tetrahedral**
-meshes (H(curl) mass + curl-curl, for 3-D Maxwell / curl-curl).*
+Tutorials: `mixed_poisson_rt_2d.py` (H(div)), `maxwell_nedelec_2d.py` (H(curl): magnetostatics + eddy
+current), and `maxwell_nedelec_3d.py` (the **3-D PEC cube cavity resonator** — recovers the analytic modes
+`k²=π²(l²+m²+n²)`, spurious-free, converging to `2π²` from below). *Scope: lowest-order RT₀ / N1E₀ on 2-D
+triangular meshes; N1E₀ also on 3-D **tetrahedral** meshes (H(curl) mass + curl-curl + PEC, for 3-D Maxwell
+/ curl-curl and cavity eigenproblems).*
 
 ---
 
