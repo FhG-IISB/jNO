@@ -128,6 +128,7 @@ def assemble_fem_nonnodal(
         hermite_triangle,
         morley_pushforward,
         morley_triangle,
+        nedelec_tet,
         nedelec_triangle,
         piola_contravariant,
         piola_contravariant_grad,
@@ -205,8 +206,23 @@ def assemble_fem_nonnodal(
             "volume term."
         )
 
-    pts = jnp.asarray(np.asarray(domain.mesh.points))[:, :2]
-    cells = np.asarray(domain.mesh.cells_dict["triangle"], dtype=np.int64)
+    # Simplex dimension from the mesh: 2D triangle vs 3D tetrahedron. The edge (RT/N1E) push-forward and
+    # topology are dimension-agnostic; the vertex families (Hermite/Argyris/Morley) and RT are 2D-only, so
+    # in 3D only Nédélec (N1E, edge/H(curl)) is wired -- everything else raises rather than silently mis-map.
+    dim = 3 if "tetra" in domain.mesh.cells_dict else 2
+    if dim == 3 and any(s != "N1E" for s in spaces):
+        raise NotImplementedError(
+            "jno.fem (non-nodal): on a 3D (tetrahedral) mesh only the Nédélec `N1E` element is supported "
+            f"(H(curl), for Maxwell / curl-curl); got spaces {spaces}. RT / P0 / Hermite / Argyris / Morley "
+            "are 2D-triangle only."
+        )
+    if dim == 3 and _field_param_names:
+        raise NotImplementedError(
+            "jno.fem (non-nodal): a field parameter k(x) in a 3D N1E problem is not wired yet "
+            "(the P1 interpolation of the parameter is 2D-triangle only)."
+        )
+    pts = jnp.asarray(np.asarray(domain.mesh.points))[:, :dim]
+    cells = np.asarray(domain.mesh.cells_dict["tetra" if dim == 3 else "triangle"], dtype=np.int64)
     n_cells = int(cells.shape[0])
     n_verts = int(pts.shape[0])
     cells_j = jnp.asarray(cells, dtype=jnp.int32)
@@ -220,10 +236,16 @@ def assemble_fem_nonnodal(
         s = specs["RT"]
         edge_ref["RT"] = (s.ref_values, s.ref_div, s.ref_grads, piola_contravariant, piola_contravariant_grad)
     if "N1E" in spaces:
-        specs["N1E"] = nedelec_triangle(degree=1, quad_degree=quad_degree)
+        specs["N1E"] = (
+            nedelec_tet(degree=1, quad_degree=quad_degree)
+            if dim == 3
+            else nedelec_triangle(degree=1, quad_degree=quad_degree)
+        )
         s = specs["N1E"]
         edge_ref["N1E"] = (s.ref_values, s.ref_curl, s.ref_grads, piola_covariant, piola_covariant_grad)
-    edge_ref = {k: tuple(jnp.asarray(a) for a in v[:3]) + v[3:] for k, v in edge_ref.items()}
+    # ``ref_curl`` is ``None`` for the 3-D tet N1E (its curl is a vector recovered from the physical
+    # gradient, not a tabulated scalar) -- keep it ``None`` through the jnp conversion.
+    edge_ref = {k: tuple(jnp.asarray(a) if a is not None else None for a in v[:3]) + v[3:] for k, v in edge_ref.items()}
 
     # --- vertex-DOF families (the M(cell) DOF-transform path): Hermite (C0) and Argyris (C1) ---
     hermite_ref = None
@@ -343,7 +365,7 @@ def assemble_fem_nonnodal(
 
     def _cell_fields(c, u_blocks):
         verts = pts[cells_j[c]]
-        J = jnp.stack([verts[1] - verts[0], verts[2] - verts[0]], axis=1)
+        J = jnp.stack([verts[k] - verts[0] for k in range(1, dim + 1)], axis=1)  # (dim, dim): 2x2 tri / 3x3 tet
         detJ = jnp.linalg.det(J)
         per = []
         for i, s in enumerate(spaces):
@@ -395,7 +417,7 @@ def assemble_fem_nonnodal(
                 per.append(
                     {
                         "shape_vals": jnp.ones((n_quad, 1)),
-                        "shape_grads": jnp.zeros((n_quad, 1, 2, 2)),
+                        "shape_grads": jnp.zeros((n_quad, 1, dim, dim)),
                         "cell_sol": u_blocks[i][c][None],
                         "space": "P0",
                     }
@@ -471,7 +493,7 @@ def assemble_fem_nonnodal(
         else jnp.zeros(total)
     )
     pins = (
-        _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, np.asarray(pts), offs, n_cells, quad_degree)
+        _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, np.asarray(pts), offs, n_cells, quad_degree, dim=dim)
         if flux_bcs
         else []
     )
@@ -1114,7 +1136,45 @@ def _second_tangential(value_node, xy, tax):
     return float(np.asarray(jax.hessian(gfun)(jnp.asarray(xy, dtype=jnp.float64)))[tax, tax])
 
 
-def _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree):
+def _n1e_tangential_pins_3d(flux_bcs, domain, field_index, spaces, top, offs):
+    """PEC tangential pins ``n × E = 0`` for a **3-D** N1E field: pin every boundary-face edge DOF in the BC
+    region to 0. Boundary faces are the tet faces used by exactly one cell (:func:`build_facet_connectivity`);
+    each contributes its 3 edges, mapped to the global N1E edge id via the edge topology. This is the correct
+    3-D criterion — the 2-D "edge used once" / "both endpoints on the region" tests are wrong on a tet mesh
+    (an interior edge can join two boundary vertices through the volume). Homogeneous PEC only: a nonzero
+    tangential trace ``n × E = g`` raises (its per-edge value ``∫_e g·t`` is a follow-on)."""
+    from ..._fem import _constant_of
+    from .fem_1d import _region_node_ids
+    from .fem_facets import build_facet_connectivity
+
+    cells = np.asarray(domain.mesh.cells_dict["tetra"])
+    fc = build_facet_connectivity(cells, "tetrahedron")
+    edge_id = {(int(a), int(b)): i for i, (a, b) in enumerate(np.asarray(top.edge_vertices))}  # canonical (lo,hi) -> eid
+    pins = []
+    for field_key, region, value_node in flux_bcs:
+        fidx = field_index.get(field_key)
+        if fidx is None or spaces[fidx] != "N1E":
+            raise NotImplementedError(
+                "jno.fem (non-nodal, 3D): the only essential edge-trace BC is the N1E tangential trace `n×E`."
+            )
+        if _constant_of(value_node) != 0.0:
+            raise NotImplementedError(
+                "jno.fem (non-nodal, 3D): only the homogeneous PEC tangential BC `n×E = 0` is wired; a "
+                "prescribed nonzero tangential trace is a follow-on."
+            )
+        region_nodes = {int(n) for n in _region_node_ids(domain, region)}
+        for f in range(fc.n_bfaces):
+            fn = [int(x) for x in fc.face_nodes[f]]
+            if not all(v in region_nodes for v in fn):
+                continue  # this boundary face is not in the BC region
+            for a, b in ((fn[0], fn[1]), (fn[1], fn[2]), (fn[0], fn[2])):
+                eid = edge_id.get((min(a, b), max(a, b)))
+                if eid is not None:
+                    pins.append((offs[fidx] + eid, 0.0))
+    return list(dict(pins).items())  # dedup edges shared by two boundary faces of the region
+
+
+def _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree, *, dim=2):
     """Compute the ``(dof, value)`` boundary pins for essential edge-trace BCs, separated from
     *application* so the same pins can be enforced per solver mode (symmetric elimination for steady
     linear, residual rows for nonlinear, M/A/c rows for transient).
@@ -1132,7 +1192,11 @@ def _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_ce
       Derived geometrically and checked against the (exact) projection of a constant field on every
       boundary edge.
 
-    Boundary edges are the globally single-use edges, filtered to the BC's region by node membership."""
+    Boundary edges are the globally single-use edges, filtered to the BC's region by node membership. In
+    **3-D** (tet mesh) this "single-use / both-endpoints-in-region" criterion is wrong, so the N1E tangential
+    (PEC) pins are computed facet-based via :func:`_n1e_tangential_pins_3d`."""
+    if dim == 3:  # 3-D N1E tangential (PEC) — facet-based boundary edges, not the 2-D single-use rule
+        return _n1e_tangential_pins_3d(flux_bcs, domain, field_index, spaces, top, offs)
     from ..._fem import _eval_value_node_at
     from .fem_1d import _line_quadrature, _region_node_ids
 

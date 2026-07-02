@@ -1795,6 +1795,20 @@ class PolygonDomain(domain):
         # disjointly across source regions in iteration order; any active
         # leftover (no source claims it) is meshed as an unnamed remainder.
         region_parts = self._partition_active_by_source_region()
+        # Conforming interfaces: a shared edge may be described with different
+        # vertices by the two regions that meet on it (e.g. a CSG boolean adds
+        # a vertex mid-edge on one side only). Insert the union of all
+        # partition-boundary vertices into every ring so both sides split the
+        # interface identically (matching gmsh lines) — otherwise the two sides
+        # mesh independently with interleaved nodes and the interface transmits
+        # nothing across it. Superset of the source-edge-endpoint insertion,
+        # which clips to the outer boundary and misses internal interfaces.
+        endpoint_keys = {(round(p[0], 14), round(p[1], 14)) for p in source_endpoints}
+        source_endpoints = list(source_endpoints) + [
+            p
+            for p in self._collect_partition_vertices(region_parts)
+            if (round(p[0], 14), round(p[1], 14)) not in endpoint_keys
+        ]
 
         with pygmsh.geo.Geometry() as geo:
             point_cache: Dict[Tuple[float, float], Any] = {}
@@ -2118,6 +2132,39 @@ class PolygonDomain(domain):
                             seen.add(key)
                             endpoints.append((float(pt[0]), float(pt[1])))
         return endpoints
+
+    def _collect_partition_vertices(
+        self, region_parts: Sequence[Tuple[BaseGeometry, Optional[str]]]
+    ) -> List[Tuple[float, float]]:
+        """Every distinct boundary vertex across all partitioned region pieces.
+
+        Two regions that share an interface may describe it with *different*
+        vertices (e.g. one region's edge is a single segment while the
+        neighbour splits the same span at extra points introduced by a CSG
+        boolean). Emitting each ring independently then produces non-matching
+        gmsh lines on that interface, so gmsh meshes the two sides with their
+        own interleaved nodes — a **non-conforming** interface that transmits
+        neither conduction nor radiation. Inserting this union of vertices into
+        every ring (via :meth:`_ring_coords_with_endpoints`) forces both sides
+        to segment a shared edge identically, so the interface lines coincide
+        in the line cache and the mesh is conforming. Superset of
+        :meth:`_collect_source_edge_endpoints`, which clips to the outer
+        boundary and so cannot see vertices on *internal* interfaces.
+        """
+        seen: set = set()
+        out: List[Tuple[float, float]] = []
+        for part, _name in region_parts:
+            polys = part.geoms if part.geom_type == "MultiPolygon" else [part]
+            for poly in polys:
+                if getattr(poly, "geom_type", "") != "Polygon":
+                    continue
+                for ring in (poly.exterior, *poly.interiors):
+                    for c in ring.coords:
+                        key = (round(float(c[0]), 14), round(float(c[1]), 14))
+                        if key not in seen:
+                            seen.add(key)
+                            out.append((float(c[0]), float(c[1])))
+        return out
 
     def _ring_coords_with_endpoints(
         self,

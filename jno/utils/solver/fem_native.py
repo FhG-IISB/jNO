@@ -515,10 +515,30 @@ def assemble_fem_native(
             _collect_runtime_parameter_exprs(bare, _rt_param_exprs)
     runtime_parameter_tags: Tuple[str, ...] = tuple(sorted(_rt_param_exprs))
     _field_param_names: set = {n for n, expr in _rt_param_exprs.items() if _is_fem_field_parameter(expr)}
+    # A nodal FIELD parameter k(x) interpolates on one field's FE space. Single field -> field 0. For a
+    # coupled (multi-field) problem, associate it with the field whose test function appears in the
+    # term(s) that reference it (e.g. mu(x)*(grad u . grad v) -> the velocity field), so its nodal values
+    # gather/interpolate on THAT field's mesh. All field params must resolve to one field (a single shared
+    # ``shape_vals`` threads the interpolation), else it is rejected.
+    _field_param_field_idx = 0
     if _field_param_names and len(fields) > 1:
-        raise NotImplementedError(
-            "jno.fem (native): a FEM field parameter k(x) is supported on single-field problems only."
-        )
+        from .parametric_helpers import _contains_fem_field_parameter
+
+        _pf_idxs: set = set()
+        for bare in volume_terms:
+            for sign, sub in _split_additive_terms(domain, bare):
+                coeff = _lower_statefield_to_trial(_apply_sign(domain, sign, sub), {})
+                if _contains_fem_field_parameter(coeff):
+                    tfi = _test_field_index(coeff, field_index)
+                    if tfi is not None:
+                        _pf_idxs.add(int(tfi))
+        if len(_pf_idxs) != 1:
+            raise NotImplementedError(
+                "jno.fem (native): a FEM field parameter k(x) on a coupled (multi-field) problem must "
+                "appear in the terms of exactly one field (its nodal values interpolate on that field's "
+                f"FE space); resolved to fields {sorted(_pf_idxs)}."
+            )
+        _field_param_field_idx = _pf_idxs.pop()
 
     # -------------------------------------------------------------------------
     # Surface integration setup
@@ -595,11 +615,12 @@ def assemble_fem_native(
                 # Parameter not supplied for this assembly (e.g. the mass matrix, which references no
                 # parameter): pack a zero placeholder of the right width. It is only ever read back if
                 # the term actually contains the parameter node, in which case args carries its value.
-                pv.append(jnp.zeros((n_local_f[0] if name in _field_param_names else 1,), dtype))
+                pv.append(jnp.zeros((n_local_f[_field_param_field_idx] if name in _field_param_names else 1,), dtype))
                 continue
             flat = jnp.reshape(jnp.asarray(a[name], dtype=dtype), (-1,))
-            # Single-field nodal field parameter -> this cell's local nodal values (field 0).
-            pv.append(flat[cells_f_j[0][c]] if name in _field_param_names else flat[:1])
+            # Nodal field parameter -> this cell's local nodal values on its field's mesh (field 0 for a
+            # single-field problem; the resolved field for a coupled one).
+            pv.append(flat[cells_f_j[_field_param_field_idx][c]] if name in _field_param_names else flat[:1])
         return tv + tuple(pv)
 
     # -------------------------------------------------------------------------
@@ -639,10 +660,10 @@ def assemble_fem_native(
             "trial_vec": vecs[tfi],
         }
         if _field_param_names:
-            # The field parameter's nodal slice is interpolated to the quad points with the field's
-            # shape functions (single-field: field 0). _runtime_parameter_value_from_internal_vars
-            # reads this top-level shape_vals.
-            loc["shape_vals"] = per[0]["shape_vals"]
+            # The field parameter's nodal slice is interpolated to the quad points with its field's shape
+            # functions (field 0 single-field; the resolved field for a coupled problem).
+            # _runtime_parameter_value_from_internal_vars reads this top-level shape_vals.
+            loc["shape_vals"] = per[_field_param_field_idx]["shape_vals"]
         return _integrate_term(domain, coeff, loc, qw_shared * meas)
 
     def _surf_elem_res(fi, local_all, bcoeff, btfi, region, t=0.0, args=None):
@@ -687,7 +708,7 @@ def assemble_fem_native(
             "trial_vec": vecs[btfi],
         }
         if _field_param_names:
-            loc["shape_vals"] = per_f[0]["shape_vals"]
+            loc["shape_vals"] = per_f[_field_param_field_idx]["shape_vals"]
         return _integrate_term(domain, bcoeff, loc, face_w * jac_f)
 
     def _classify_one(coeff, where: str) -> List[Tuple[Any, int]]:

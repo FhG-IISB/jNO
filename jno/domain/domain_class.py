@@ -2048,7 +2048,11 @@ class domain(MeshIOMixin):
 
         Returns:
             For point sets: Tuple of Variable placeholders, one per dimension.
-            For point sets with normals=True: Tuple of variables + normal variables.
+            For point sets with normals=True: with ``split=True``, the flat tuple of coordinate + normal
+                *component* variables ``(x, y, [z], t, nx, ny, [nz])``; with ``split=False`` (the default),
+                the boundary normal as a **single vector** Variable — so it drops straight into vector ops,
+                e.g. ``u.vector.cross(domain.variable(region, normals=True))``. (Coordinates in that case come
+                from a separate ``domain.variable(region)`` / ``split=True`` call.)
             For tensor tags: Single TensorTag placeholder.
         """
 
@@ -2207,6 +2211,14 @@ class domain(MeshIOMixin):
                 )
             if reverse_normals:
                 self.context[f"n_{tag}"] = -self.context[f"n_{tag}"]
+            # ``split`` controls the *shape* of the normal (mirroring the tensor-tag path): ``split=True``
+            # appends the normal's scalar components to the flat ``(x, y, [z], t, nx, ny, [nz])`` tuple;
+            # ``split=False`` (the default) returns the boundary normal as a **single vector** so it drops
+            # straight into vector ops, e.g. ``u.vector.cross(d.variable(region, normals=True))`` — no need
+            # to slice the components out and rebuild them. (Coordinates are still available via
+            # ``d.variable(region, ..., split=True)`` or a plain ``d.variable(region)`` call.)
+            if not split and not view_factor and not return_indices:
+                return Variable(tag=f"n_{tag}", dim=[0, len(self.spatial)], domain=self)
             coord_vars += [Variable(tag=f"n_{tag}", dim=[i, i + 1], domain=self) for i in range(len(self.spatial))]
 
         if view_factor and hasattr(self, "mesh_connectivity"):
