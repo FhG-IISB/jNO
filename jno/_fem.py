@@ -582,14 +582,20 @@ def _is_complex_form(domain: Any, ir: Any) -> bool:
     return False
 
 
-def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None) -> Any:
+def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None, periodic: Optional[dict] = None) -> Any:
     """Solve a complex linear FEM system via the real-equivalent block (everything was
     assembled as two *real* systems)::
 
         [[A_r, -A_i], [A_i, A_r]] [u_r; u_i] = [b_r; b_i],     u = u_r + i u_i.
 
-    ``ops = (op_r, op_i)`` are the Re-coeff and Im-coeff real systems (each a raw ``(A, b)``)."""
+    ``ops = (op_r, op_i)`` are the Re-coeff and Im-coeff real systems (each a raw ``(A, b)``).
+
+    A periodic tie reduces *both* legs by the **same** prolongation ``P`` -- Re and Im live on one FE
+    space, so one ``P`` -- before the block is formed: ``A -> P^T A P``, ``b -> P^T b`` on each leg.
+    Because the same ``P`` hits both, ``blkdiag(P, P)^T [[A_r,-A_i],[A_i,A_r]] blkdiag(P, P)`` preserves
+    the real-equivalent structure exactly; the reduced complex solution is prolonged back ``u = P u_red``."""
     from .trace import FemLinearSystem
+    from .utils.solver.fem_utils import prolong_periodic, reduce_matrix_periodic, reduce_vector_periodic
 
     def _ab(op):
         if isinstance(op, FemLinearSystem):
@@ -599,6 +605,10 @@ def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None) -> Any:
                 "forward works under the same real-equivalent block, but is not wired here yet.)"
             )
         A, b = op
+        b = jnp.asarray(b).reshape(-1)
+        if periodic is not None:
+            A = reduce_matrix_periodic(periodic, A)  # P^T A P  (stays sparse if A is BCOO)
+            b = reduce_vector_periodic(periodic, b)  # P^T b
         A = jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)
         return A, jnp.asarray(b).reshape(-1)
 
@@ -608,7 +618,11 @@ def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None) -> Any:
     rhs = jnp.concatenate([b_r, b_i])
     solve_fn = solve_fn or (lambda A, b: jnp.linalg.solve(A, b))
     sol = jnp.asarray(solve_fn(block, rhs))
-    return sol[:n] + 1j * sol[n:]
+    if periodic is None:
+        return sol[:n] + 1j * sol[n:]
+    # Prolong the real and imaginary reduced halves *separately* (real P @ real vector); prolonging the
+    # complex vector directly would cast it to P's real dtype and silently drop the imaginary part.
+    return prolong_periodic(periodic, sol[:n]) + 1j * prolong_periodic(periodic, sol[n:])
 
 
 def _solve_complex_transient(blocks: Any, save_ts: Any = None) -> Any:
@@ -887,7 +901,7 @@ class FEM:
 
             return run_adaptive_solve(self, adapt, solve_fn=solve_fn, **kwargs)
         if self._mode == "complex":
-            return _solve_complex_block(self._op, solve_fn)
+            return _solve_complex_block(self._op, solve_fn, periodic=self._periodic)
         if self._mode == "complex_transient":
             return _solve_complex_transient(self._op, save_ts=kwargs.get("save_ts"))
         if self._mode == "linear" and not isinstance(self._op, FemLinearSystem):
@@ -1764,10 +1778,10 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             return _wrap_couplings(domain, fem_obj, couplings)
         if not periodic_ties:
             return fem_obj
-        if fem_obj._mode in ("complex", "complex_transient"):
+        if fem_obj._mode == "complex_transient":
             raise NotImplementedError(
-                "jno.fem: periodic ties on complex problems are not supported yet (the real-equivalent "
-                "block would need the reduction applied to both the real and imaginary sub-blocks)."
+                "jno.fem: periodic ties on a complex *transient* problem are not supported yet "
+                "(the reduction must be applied to both the real and imaginary time blocks)."
             )
         if isinstance(fem_obj._op, FemLinearSystem):
             # The reduction is applied on the non-parametric (A, b) branch of FEM.solve; the
@@ -2067,7 +2081,6 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         not is_vpinn
         and _is_complex_form(domain, ir)
         and not is_transient
-        and not periodic_ties
         and _native_lagrange_ok(domain, constraints, weak_bares, periodic_ties)
         and not any(_crp(b) for b in weak_bares)
     ):
