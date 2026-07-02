@@ -583,61 +583,81 @@ def _is_complex_form(domain: Any, ir: Any) -> bool:
     return False
 
 
+def _complex_block_bcoo(A_r: Any, A_i: Any, n: int) -> Any:
+    """Assemble the real-equivalent block ``[[A_r, -A_i], [A_i, A_r]]`` (shape ``2n x 2n``) as one
+    BCOO from the two sparse legs, by placing each sub-block's triplets at its ``n`` offset -- no
+    densification. The four sub-blocks occupy disjoint index ranges, so the result has no duplicate
+    coordinates. ``A_r`` appears at (0,0) and (n,n); ``A_i`` at (n,0) and, negated, at (0,n)."""
+    from jax.experimental import sparse as jsp
+
+    ir, dr = A_r.indices, A_r.data
+    ii, di = A_i.indices, A_i.data
+    off = jnp.asarray([n, n], dtype=ir.dtype)
+    col = jnp.asarray([0, n], dtype=ir.dtype)
+    row = jnp.asarray([n, 0], dtype=ir.dtype)
+    indices = jnp.concatenate([ir, ii + col, ii + row, ir + off], axis=0)  # (0,0),(0,n),(n,0),(n,n)
+    data = jnp.concatenate([dr, -di, di, dr])
+    return jsp.BCOO((data, indices), shape=(2 * n, 2 * n))
+
+
 def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None, periodic: Optional[dict] = None) -> Any:
     """Solve a complex linear FEM system via the real-equivalent block (everything was
     assembled as two *real* systems)::
 
         [[A_r, -A_i], [A_i, A_r]] [u_r; u_i] = [b_r; b_i],     u = u_r + i u_i.
 
-    ``ops = (op_r, op_i)`` are the Re-coeff and Im-coeff real systems. Each is a raw ``(A, b)`` (forward
-    solve) or a parametric :class:`FemLinearSystem` (the complex *inverse*): when either leg is
-    parametric this returns a differentiable :class:`FunctionCall` trace node instead of an array, so a
-    real ``jno.np.parameter`` recovered through a complex forward solve trains through ``crux`` -- the
-    same real-equivalent block, with ``A(θ), b(θ)`` re-formed and the block re-solved on each call.
+    ``ops = (op_r, op_i)`` are the Re-coeff and Im-coeff real systems (each a raw ``(A, b)``).
+
+    The real-equivalent block is itself **sparse** -- ``[[A_r,-A_i],[A_i,A_r]]`` is four sparse
+    sub-blocks -- so by default it is assembled as one BCOO (concatenating the triplets at the right
+    ``n`` offsets) and solved with the same sparse-direct path the real solves use, never densifying
+    (memory ``O(nnz)``; robust on the indefinite Helmholtz block). Pass ``solve_fn=(A, b) -> u`` to
+    use a dense/direct solver instead -- it receives the densified block.
 
     A periodic tie reduces *both* legs by the **same** prolongation ``P`` -- Re and Im live on one FE
     space, so one ``P`` -- before the block is formed: ``A -> P^T A P``, ``b -> P^T b`` on each leg.
     Because the same ``P`` hits both, ``blkdiag(P, P)^T [[A_r,-A_i],[A_i,A_r]] blkdiag(P, P)`` preserves
-    the real-equivalent structure exactly; the reduced complex solution is prolonged back ``u = P u_red``.
-    The reduction runs while the operator is still BCOO (sparse triplet-remap), then the *smaller*
-    reduced block is densified for ``jnp.block``."""
-    from .trace import FemLinearSystem, FunctionCall
+    the real-equivalent structure exactly; the reduced complex solution is prolonged back ``u = P u_red``."""
+    from .trace import FemLinearSystem
     from .utils.solver.fem_utils import prolong_periodic, reduce_matrix_periodic, reduce_vector_periodic
 
-    def _leg(op, args):  # -> reduced, densified (A, b) for one Re/Im system
-        A, b = op.evaluate(args) if isinstance(op, FemLinearSystem) else op
+    def _ab(op):
+        if isinstance(op, FemLinearSystem):
+            raise NotImplementedError(
+                "Complex FEM with a runtime jno.np.parameter (the complex *inverse*) is a follow-on; "
+                "this path is the forward complex solve. (A real parameter recovered through a complex "
+                "forward works under the same real-equivalent block, but is not wired here yet.)"
+            )
+        A, b = op
         b = jnp.asarray(b).reshape(-1)
         if periodic is not None:
             A = reduce_matrix_periodic(periodic, A)  # P^T A P  (stays sparse if A is BCOO)
             b = reduce_vector_periodic(periodic, b)  # P^T b
-        A = jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)
-        return A, jnp.asarray(b).reshape(-1)
+        return A, b  # keep A sparse (BCOO) -- do NOT densify
 
-    _sf = solve_fn or (lambda A, b: jnp.linalg.solve(A, b))
+    (A_r, b_r), (A_i, b_i) = _ab(ops[0]), _ab(ops[1])
+    n = b_r.shape[0]
+    rhs = jnp.concatenate([b_r, b_i])
+    is_sparse = hasattr(A_r, "indices") and hasattr(A_i, "indices")
 
-    def _block_solve(args):
-        (A_r, b_r), (A_i, b_i) = _leg(ops[0], args), _leg(ops[1], args)
-        n = A_r.shape[0]
-        block = jnp.block([[A_r, -A_i], [A_i, A_r]])
-        sol = jnp.asarray(_sf(block, jnp.concatenate([b_r, b_i])))
-        if periodic is None:
-            return sol[:n] + 1j * sol[n:]
-        # Prolong the real and imaginary reduced halves *separately* (real P @ real vector); prolonging
-        # the complex vector directly would cast it to P's real dtype and silently drop the imaginary part.
-        return prolong_periodic(periodic, sol[:n]) + 1j * prolong_periodic(periodic, sol[n:])
+    if solve_fn is not None:
+        # user solver receives the densified block (dense/direct back-compat path)
+        Ar_d = jnp.asarray(A_r.todense() if hasattr(A_r, "todense") else A_r)
+        Ai_d = jnp.asarray(A_i.todense() if hasattr(A_i, "todense") else A_i)
+        sol = jnp.asarray(solve_fn(jnp.block([[Ar_d, -Ai_d], [Ai_d, Ar_d]]), rhs))
+    elif is_sparse:
+        from .utils.solver.linear import sparse_lu_solve
 
-    # Forward (non-parametric): solve eagerly. Inverse: one or both legs are a parametric FemLinearSystem
-    # -> return a trace node over the union of their runtime parameters so ∂u/∂θ flows through crux.
-    rpe: dict = {}
-    for op in ops:
-        if isinstance(op, FemLinearSystem):
-            rpe.update(op.runtime_parameter_exprs)
-    if not rpe:
-        return _block_solve(None)
-    names = list(rpe)
-    return FunctionCall(
-        lambda *vals: _block_solve(dict(zip(names, vals))), [rpe[n] for n in names], name="fem_complex_solve"
-    )
+        sol = sparse_lu_solve(_complex_block_bcoo(A_r, A_i, n), rhs)  # sparse-direct on the 2n block
+    else:
+        Ar_d, Ai_d = jnp.asarray(A_r), jnp.asarray(A_i)  # dense fallback (e.g. 1D / already dense)
+        sol = jnp.linalg.solve(jnp.block([[Ar_d, -Ai_d], [Ai_d, Ar_d]]), rhs)
+
+    if periodic is None:
+        return sol[:n] + 1j * sol[n:]
+    # Prolong the real and imaginary reduced halves *separately* (real P @ real vector); prolonging the
+    # complex vector directly would cast it to P's real dtype and silently drop the imaginary part.
+    return prolong_periodic(periodic, sol[:n]) + 1j * prolong_periodic(periodic, sol[n:])
 
 
 def _solve_complex_transient(blocks: Any, save_ts: Any = None, periodic: Optional[dict] = None) -> Any:
@@ -845,6 +865,8 @@ class FEM:
         self._periodic = None  # periodic-tie reduction (prolongation P), attached by fem()
         self._offsets = offsets  # per-field block offsets for the native non-nodal path (else problem.offset)
         self._term_source = None  # (domain, volume_terms); attached by fem() for the provisional term_kinds accessor
+        self._constraints = None  # original constraint list; attached by fem() for the adaptive driver
+        self._fem_kwargs = {}  # original fem() build options; attached by fem() for the adaptive driver
 
         self._A = self._b = None
         if mode == "linear":
@@ -905,8 +927,17 @@ class FEM:
             return list(self._offsets)
         return getattr(self.problem, "offset", None)
 
-    def solve(self, solve_fn=None, **kwargs) -> Any:
+    def solve(self, solve_fn=None, *, adapt=None, **kwargs) -> Any:
         """Differentiable forward solve as a trace node — the inverse-problem entry.
+
+        Pass ``adapt=AdaptSpec(...)`` to run the **adaptive** loop
+        (``solve -> estimate -> mark -> refine``): the domain is remeshed in place to
+        equidistribute a Zienkiewicz–Zhu error estimate, and this returns the solution
+        on the final adapted mesh. After it returns, this ``FEM`` and its ``domain`` refer
+        to that final mesh, and ``fem.adapt_history`` records the per-round trace. The
+        refinement step is non-differentiable (discrete remeshing); gradients are exact on
+        the frozen final mesh, so a differentiable inverse problem is run *after* adapting.
+        See :class:`jno.utils.solver.fem_adapt.AdaptSpec`.
 
         Delegates to :meth:`FemLinearSystem.solve` (steady linear),
         :meth:`FemResidualOperator.solve` (steady nonlinear), or
@@ -943,6 +974,10 @@ class FEM:
         ``[[A_r,-A_i],[A_i,A_r]]`` (the assembly produces only real systems); pass ``solve_fn=(A, b) -> u``
         to choose the real block solver.
         """
+        if adapt is not None:
+            from .utils.solver.fem_adapt import run_adaptive_solve
+
+            return run_adaptive_solve(self, adapt, solve_fn=solve_fn, **kwargs)
         if self._mode == "complex":
             return _solve_complex_block(self._op, solve_fn, periodic=self._periodic)
         if self._mode == "complex_transient":
@@ -1738,6 +1773,13 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     if len(constraints) == 0:
         raise ValueError("jno.fem: no constraints provided.")
 
+    # Keep the user's original constraint list + build options so the adaptive driver
+    # (``FEM.solve(adapt=...)``) can re-assemble the *same* problem after the domain is
+    # remeshed in place -- the constraints reference the domain (not a mesh snapshot),
+    # so re-tracing them picks up the refined mesh automatically.
+    _orig_constraints = list(constraints)
+    _orig_fem_kwargs = {"quad_degree": quad_degree, "element_type": element_type, "vec": vec}
+
     # Gauge pins (`p.pin()`) remove a field's constant null space. Lower each to a single-node
     # Dirichlet `p(node) - value` *before* domain discovery and classification: a GaugePin is a
     # bare marker, not a walkable expression, so it must not reach `_discover_domain` (which walks
@@ -1834,12 +1876,8 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         the time route's existing context-driven reduction. Single-field, vector, and coupled
         multi-field are all reduced block-wise (P_i^T M[i,j] P_j); complex / runtime-parametric remain out."""
         fem_obj._term_source = (domain, volume_terms)
-        if couplings and periodic_ties and fem_obj.is_transient:
-            # The native periodic *transient* block reduces eagerly into a master-DOF space; the coupling
-            # residual is written in the full nodal space, so the two cannot be composed on that path yet.
-            raise NotImplementedError(
-                "jno.fem: periodic ties combined with a *transient* nonlocal Coupling are not yet supported."
-            )
+        fem_obj._constraints = _orig_constraints
+        fem_obj._fem_kwargs = _orig_fem_kwargs
         if couplings:
             # Fold the coupling into the residual FIRST -- a steady local form is promoted to a nonlinear
             # FemResidualOperator. The periodic reduction below then wraps the *coupled* residual through
@@ -1847,6 +1885,15 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             fem_obj = _wrap_couplings(domain, fem_obj, couplings)
         if not periodic_ties:
             return fem_obj
+        if fem_obj._mode == "complex_transient":
+            raise NotImplementedError(
+                "jno.fem: periodic ties on a complex *transient* problem are not supported yet "
+                "(the reduction must be applied to both the real and imaginary time blocks)."
+            )
+        if isinstance(fem_obj._op, FemLinearSystem):
+            # The reduction is applied on the non-parametric (A, b) branch of FEM.solve; the
+            # runtime-parametric FemLinearSystem.solve path would silently ignore it.
+            raise NotImplementedError("jno.fem: periodic ties are not yet supported on runtime-parametric linear problems.")
         # Single-field transient was already reduced by the dedicated native branch -> reuse its P.
         if periodic_holder:
             fem_obj._periodic = periodic_holder[0]

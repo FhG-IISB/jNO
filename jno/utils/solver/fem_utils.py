@@ -2161,6 +2161,43 @@ def _remap_bcoo(mat, m_row, p_row, m_col, p_col, shape):
     return jsparse.BCOO((rdata, ridx), shape=shape)
 
 
+def _remap_bcoo_weighted(mat, P):
+    """Sparse Galerkin reduction ``P^T mat P`` for an *interpolation* (nonconforming) periodic ``P``
+    -- a few masters per slave, weighted. Generalises :func:`_remap_bcoo` (one master, weight 1) by
+    spreading each ``mat`` triplet ``(r, c, v)`` across the ``D x D`` master pairs of its row and
+    column with the interpolation weights: ``v -> v · w_r[a] · w_c[b]`` at ``(master_r[a], master_c[b])``.
+    Stays sparse (no dense ``n_full × n_full`` intermediate); ``D = max masters/slave`` (small: the
+    nodes of a master facet). Returns ``None`` if ``P``'s indices are not concrete (built under trace),
+    so the caller falls back to the dense product -- the nonconforming reduction is built eagerly."""
+    try:
+        pidx = np.asarray(P.indices)  # concrete only; a tracer raises
+        pdat = np.asarray(P.data)
+    except Exception:
+        return None
+    n_full, n_red = int(mat.shape[0]), int(P.shape[1])
+    rows, cols = pidx[:, 0], pidx[:, 1]
+    order = np.argsort(rows, kind="stable")
+    rows, cols, wts = rows[order], cols[order], pdat[order]
+    if len(rows) == 0:
+        return jsparse.BCOO((jnp.zeros(0), jnp.zeros((0, 2), jnp.int32)), shape=(n_red, n_red))
+    is_new = np.concatenate([[True], rows[1:] != rows[:-1]])
+    slot = np.arange(len(rows)) - np.maximum.accumulate(np.where(is_new, np.arange(len(rows)), 0))
+    D = int(slot.max()) + 1
+    master = np.zeros((n_full, D), np.int64)
+    master[rows, slot] = cols
+    weight = np.zeros((n_full, D), np.float64)
+    weight[rows, slot] = wts
+    master, weight = jnp.asarray(master), jnp.asarray(weight)
+    r, c, v = mat.indices[:, 0], mat.indices[:, 1], mat.data
+    mr, wr, mc, wc = master[r], weight[r], master[c], weight[c]  # (nnz, D)
+    nnz = r.shape[0]
+    a = jnp.broadcast_to(mr[:, :, None], (nnz, D, D)).reshape(-1)
+    b = jnp.broadcast_to(mc[:, None, :], (nnz, D, D)).reshape(-1)
+    data = (v[:, None, None] * wr[:, :, None] * wc[:, None, :]).reshape(-1)
+    idx = jnp.stack([a, b], axis=1).astype(mat.indices.dtype)
+    return jsparse.BCOO((data, idx), shape=(n_red, n_red)).sum_duplicates()
+
+
 def reduce_matrix(P, mat, is_selection=None):
     """Galerkin reduction ``P^T mat P``.
 
@@ -2179,6 +2216,12 @@ def reduce_matrix(P, mat, is_selection=None):
     if hasattr(mat, "indices") and is_selection:
         master, pval = _selection_maps(P, mat.data.dtype)
         return _remap_bcoo(mat, master, pval, master, pval, (int(P.shape[1]), int(P.shape[1])))
+    if hasattr(mat, "indices") and hasattr(P, "indices"):
+        # nonconforming (interpolation) tie: weighted triplet-remap, stays sparse (falls back to the
+        # dense product below only if P was built under trace, which the nonconforming path never is)
+        remapped = _remap_bcoo_weighted(mat, P)
+        if remapped is not None:
+            return remapped
     mat = mat.todense() if hasattr(mat, "todense") else mat
     P = P if hasattr(P, "todense") else jnp.asarray(P)  # keep a BCOO P sparse
     return P.T @ jnp.asarray(mat, P.dtype) @ P

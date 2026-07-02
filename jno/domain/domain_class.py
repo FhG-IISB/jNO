@@ -1622,6 +1622,26 @@ class domain(MeshIOMixin):
             self.mesh_connectivity, msg = self._preprocess_mesh_connectivity(mesh, self.dimension, boundary_indices)
             self.log.info(msg)
 
+    def refine(self, vertex_size, **mmg_options):
+        """Locally remesh **in place** to a per-vertex target edge size (metric-based).
+
+        ``vertex_size`` is a ``(n_vertices,)`` array giving the desired edge length at
+        each current mesh vertex, or an ``(n_vertices, 3)`` **anisotropic** metric tensor
+        (e.g. from ``hessian_metric``) that also orients the refinement; the mesh is adapted
+        (via Mmg) so it is equidistributed, refining where it shrinks.  Geometric corners
+        are preserved.
+        Spatial tag predicates (``domain.tag(...)``) survive, so ``jno.fem`` conditions
+        bound to a tag resolve geometrically on the new nodes.  Returns ``self``.
+
+        This is the mesh-modification primitive behind ``FEM.solve(adapt=...)``; call it
+        directly to apply a hand-built size field.  Requires the optional ``mmgpy``
+        dependency (``pip install mmgpy``).
+        """
+        from ..utils.solver.fem_adapt import remesh_with_mmg
+
+        remesh_with_mmg(self, vertex_size, copy=False, **mmg_options)
+        return self
+
     def _build_simplex_pools(self) -> None:
         """Populate ``self._simplex_pools`` from ``_tag_edges`` / ``_tag_triangles``.
 
