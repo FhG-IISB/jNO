@@ -781,6 +781,16 @@ def _field_data(local, node):
     return fd["shape_vals"], fd["shape_grads"], fd["cell_sol"]
 
 
+def _field_hess(local, node):
+    """Physical shape-function Hessian ``(n_quad, n_dof, dim, dim)`` for ``node``'s field, or ``None`` if
+    its element does not tabulate second derivatives (only nodal Lagrange does). Mirrors :func:`_field_data`."""
+    fields = local.get("fields")
+    if fields is None:
+        return local.get("shape_hess")
+    key = getattr(node, "field_key", getattr(node, "op_id", None))
+    return fields[local["field_index"][key]].get("shape_hess")
+
+
 def _field_space(local, node):
     """Element family of ``node``'s field (``"Lagrange"`` default).
 
@@ -863,6 +873,7 @@ def _eval_integrand(domain, node, local):
             TestFunction,
             TrialFunction,
             Jacobian,
+            Hessian,
             BinaryOp,
             FunctionCall,
             ModelCall,
@@ -1041,6 +1052,47 @@ def _eval_integrand(domain, node, local):
                 return jnp.einsum("qn...,n->q...", g, cell_sol)  # contract the trial DOFs
 
         raise NotImplementedError("The FEM assembler supports gradients of TrialFunction/TestFunction only.")
+
+    if isinstance(node, Hessian):
+        dims = []
+        for var in node.variables:
+            if not isinstance(var, Variable):
+                raise NotImplementedError(
+                    "The FEM assembler expects Hessian variables to be domain.variable(...) placeholders."
+                )
+            if getattr(var, "axis", None) == "temporal":
+                raise NotImplementedError(
+                    "A temporal second derivative (u_tt) is handled by the second-order-in-time route, "
+                    "not shape-Hessian assembly."
+                )
+            dims.append(var.dim[0])
+        if len(dims) == 0:
+            raise ValueError("Hessian node has no differentiation variables")
+        if not isinstance(node.target, (TestFunction, TrialFunction)):
+            raise NotImplementedError("The FEM assembler supports Hessians of TrialFunction/TestFunction only.")
+        if _field_space(local, node.target) != "Lagrange":
+            raise NotImplementedError("Second derivatives are assembled for nodal Lagrange fields only.")
+        if _value_shape_num_components(getattr(node.target, "value_shape", ())) != 1:
+            raise NotImplementedError("Hessian/Laplacian assembly currently supports scalar fields only.")
+        hess = _field_hess(local, node.target)  # (n_quad, n_dof, dim, dim) physical shape Hessian
+        if hess is None:
+            raise NotImplementedError(
+                "This element does not tabulate second derivatives -- use an order>=2 Lagrange field "
+                "(a P1 Hessian is identically zero)."
+            )
+        da = jnp.asarray(dims)
+        hsub = jnp.take(jnp.take(hess, da, axis=2), da, axis=3)  # (n_quad, n_dof, L, L) over requested dirs
+        is_test = isinstance(node.target, TestFunction)
+        if node.trace:  # Laplacian = sum over the selected diagonal directions
+            lap = jnp.einsum("qnii->qn", hsub)  # (n_quad, n_dof) per-DOF Laplacian
+            if is_test:
+                return lap
+            _, _, cell_sol = _field_data(local, node.target)
+            return jnp.sum(lap[:, :, None] * cell_sol[None, :, :], axis=1)  # (n_quad, 1) trial Laplacian
+        if is_test:
+            return hsub  # (n_quad, n_dof, L, L) per-DOF Hessian (e.g. inner(hessian(u), hessian(v)))
+        _, _, cell_sol = _field_data(local, node.target)
+        return jnp.einsum("qnij,n->qij", hsub, cell_sol[:, 0])  # (n_quad, L, L) trial Hessian
 
     if isinstance(node, BinaryOp):
         a = _eval_integrand(domain, node.left, local)
@@ -1578,6 +1630,57 @@ def _promote_to_quadratic(points, cells_p1, edge_local):
             cells_p2[c, ncorner + k] = n
     pts = np.vstack([points, np.asarray(edge_nodes)]) if edge_nodes else points
     return pts, cells_p2
+
+
+def _promote_to_degree(points, cells_p1, ref_pts):
+    """Promote a linear simplex mesh to a degree-``k`` Lagrange node mesh (P1 -> P{k}, any ``k``).
+
+    ``ref_pts`` are the element's reference interpolation points in **basix DOF order** (shape
+    ``(n_dof, tdim)``; the first ``ncorner`` are the cell vertices). Each cell's nodes are the affine
+    image of ``ref_pts`` through that cell's P1 geometry (a barycentric combination of its vertices);
+    nodes are deduplicated by **physical coordinate** (a scale-aware grid hash). So an edge/face shared
+    by two cells collapses to one global node *regardless of the cells' local orientation* -- for C0
+    Lagrange a DOF is a point value, so coordinate coincidence on a shared entity is exactly the
+    conformity condition (no orientation sign or per-edge node ordering, unlike RT/Nedelec; this is what
+    lets a single midpoint suffice at P2 and a clean generalisation hold at P3+). Original vertices keep
+    ids ``0..nv-1`` (so a P1 field on a P{k} problem is the leading vertex block, e.g. Taylor-Hood
+    pressure). Returns ``(points_k, cells_k)`` with ``cells_k`` columns in the same DOF order as
+    ``ref_pts`` -- hence as the basis tabulated from the same basix element."""
+    points = np.asarray(points, dtype=float)
+    cells_p1 = np.asarray(cells_p1)
+    ref_pts = np.asarray(ref_pts, dtype=float)
+    ncell, ncorner = cells_p1.shape
+    ndof = ref_pts.shape[0]
+    # barycentric weights of each reference point: l0 = 1 - sum(xi), l_i = xi_i
+    bary = np.empty((ndof, ncorner), dtype=float)
+    bary[:, 0] = 1.0 - ref_pts.sum(axis=1)
+    bary[:, 1:] = ref_pts
+    phys = np.einsum("dc,ncg->ndg", bary, points[cells_p1])  # (ncell, ndof, gdim) physical node coords
+    # scale-aware coordinate hash: coincident nodes differ only by FP roundoff (<< tol); distinct nodes
+    # are separated by ~mesh spacing (>> tol).
+    extent = float(np.max(points.max(axis=0) - points.min(axis=0))) if points.shape[0] else 1.0
+    tol = 1e-7 * (extent or 1.0)
+
+    def _key(p):
+        return tuple(np.round(np.asarray(p) / tol).astype(np.int64))
+
+    coord_to_gid: dict = {}
+    out_pts: List[Any] = []
+    for vid in range(points.shape[0]):  # seed with the original vertices so they keep ids 0..nv-1
+        coord_to_gid[_key(points[vid])] = vid
+        out_pts.append(points[vid])
+    cells_k = np.zeros((ncell, ndof), dtype=np.int64)
+    nid = points.shape[0]
+    for c in range(ncell):
+        for d in range(ndof):
+            k = _key(phys[c, d])
+            gid = coord_to_gid.get(k)
+            if gid is None:
+                gid, coord_to_gid[k] = nid, nid
+                out_pts.append(phys[c, d])
+                nid += 1
+            cells_k[c, d] = gid
+    return np.asarray(out_pts), cells_k
 
 
 def _zero_mass_dirichlet_rows(M, bc):

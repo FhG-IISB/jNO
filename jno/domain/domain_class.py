@@ -1196,7 +1196,9 @@ class domain(MeshIOMixin):
 
         ``space`` selects the element family: ``"Lagrange"`` (default, nodal) or a non-nodal
         family on triangles — ``"RT"`` (H(div) Raviart-Thomas), ``"N1curl"`` (H(curl) Nedelec),
-        ``"Argyris"`` (C1). Non-nodal families assemble through the native push-forward engine.
+        ``"Hermite"`` (C0 value+gradient), ``"Argyris"`` (C1 conforming biharmonic) or ``"Morley"``
+        (non-conforming biharmonic, cheap: 6 DOF). Non-nodal families assemble through the native
+        push-forward engine.
 
         Examples
         --------

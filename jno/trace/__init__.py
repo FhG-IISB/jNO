@@ -43,6 +43,7 @@ __all__ = [
     "Integral",
     "IntegralTime",
     "Jacobian",
+    "NormalDerivative",
     "TemporalDerivative",
     "NetworkGradient",
     "Noise",
@@ -2750,6 +2751,24 @@ class Jacobian(Placeholder):
         return f"Jacobian({self.target}, [{var_names}])"
 
 
+class NormalDerivative(Placeholder):
+    """The normal derivative ``∂(target)/∂n`` of a field bound to a boundary region.
+
+    A lightweight marker (like the RT normal-flux BC): it carries **no** explicit normal — the physical
+    outward normal is recomputed per boundary edge at assembly. ``target`` is the region-bound field (e.g.
+    ``u(xr, yr)``), so the enclosing constraint's region/trial detection walks through it unchanged. Used for
+    the essential **rotation** BC ``u.dn(region) - h`` (pin ``∂u/∂n``) on the C¹/Morley plate elements, and
+    for the Phase-2 natural moment/shear boundary terms via the test function's ``phi.dn(region)``.
+    """
+
+    def __init__(self, target: "Placeholder"):
+        self.target = target
+        _propagate_weak(self, target)
+
+    def __repr__(self):
+        return f"NormalDerivative({self.target})"
+
+
 class Integral(Placeholder):
     """Mesh-based integral reduction of an expression over its domain region.
 
@@ -3229,6 +3248,16 @@ class TrialFunction(Placeholder):
             raise TypeError(f"{type(self).__name__} must be called with coordinate variables, e.g. u(x, y).")
         return self.partials(**binding)
 
+    def dn(self, *coords, **named):
+        """Normal derivative ``∂u/∂n`` on the boundary region carried by ``coords``.
+
+        For a 4th-order (plate/biharmonic) field on a C¹ (Argyris) or Morley element, this is the second
+        essential boundary trace beside the deflection ``u(region)``: the **rotation**. Use it to write the
+        classical plate BCs — clamped ``u(reg)-g, u.dn(reg)-0``; simply-supported ``u(reg)-g`` alone; guided
+        ``u.dn(reg)-h`` alone; free (write neither). The physical outward normal is recomputed per boundary
+        edge at assembly, so no explicit normal is needed."""
+        return NormalDerivative(self(*coords, **named))
+
     def __repr__(self):
         return f"TrialFunction({self.name}, value_shape={self.value_shape})"
 
@@ -3307,6 +3336,16 @@ class TestFunction(Placeholder):
         if not binding:
             raise TypeError(f"{type(self).__name__} must be called with coordinate variables, e.g. phi(x, y).")
         return self.partials(**binding)
+
+    def dn(self, *coords, **named):
+        """Normal derivative ``∂φ/∂n`` of the test function on the boundary region carried by ``coords``.
+
+        Used for the natural plate **moment** term ``M_n * phi.dn(region)`` — a prescribed edge bending moment,
+        assembled as the boundary load ``∮_region M_n ∂φ/∂n ds`` on the Argyris/Morley plate elements (the
+        moment does work through the plate rotation; see :func:`jno.utils.solver.fem_nonnodal._plate_moment_load`).
+        The conjugate **shear** term (the effective Kirchhoff shear ``V_n``, with corner forces) is not yet
+        wired. The *essential* rotation BC instead uses the *trial* form ``u.dn(region) - h``."""
+        return NormalDerivative(self(*coords, **named))
 
     def __repr__(self):
         return f"TestFunction({self.name}, value_shape={self.value_shape})"

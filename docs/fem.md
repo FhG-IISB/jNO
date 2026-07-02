@@ -41,9 +41,9 @@ u_h = jnp.linalg.solve(fem.A, fem.b)
 * **Domain** — any jNO domain works (`box`, `jno.domain.cube`, a CSG/`gmsh` constructor).
   Add `time=(t0, t1, n_steps)` to make it transient.
 * **Symbols** — `u, phi = d.fem_symbols(value_shape=(), names=("u", "phi"), order=1)`.
-  Use `value_shape=(2,)` for a vector unknown (elasticity, flow velocity), `order=2` for P2
-  (quadratic) elements, `space="RT"`/`"N1E"`/`"P0"` for the non-nodal families (see below), and
-  call `fem_symbols` once per field for coupled systems.
+  Use `value_shape=(2,)` for a vector unknown (elasticity, flow velocity), `order=k` for degree-`k`
+  Lagrange (`order=2` quadratic P2, `order=3` cubic P3, … — any `k ≥ 1`), `space="RT"`/`"N1E"`/`"P0"`
+  for the non-nodal families (see below), and call `fem_symbols` once per field for coupled systems.
 * **Quadrature coordinates** — `d.variable("interior", split=True)` returns the volume
   coordinates; `d.variable("<edge>", split=True)` returns a boundary edge's coordinates. A
   `box` auto-tags `"left"`, `"right"`, `"bottom"`, `"top"` (and `"front"`/`"back"` for a cube);
@@ -51,6 +51,19 @@ u_h = jnp.linalg.solve(fem.A, fem.b)
 * **Bound views** — `ui = u.bind(x=xi, y=yi, t=ti)` ties a symbol to a set of coordinates.
   The value is `ui`; spatial derivatives are `ui.x`, `ui.y`, `ui.z`; the time derivative is
   `ui.t`. (This replaces the old `jno.np.grad(u, xg)` / `u.d(xg)` spelling.)
+* **Second derivatives (4th-order weak forms).** `jno.np.laplacian(ui, [xi, yi])` (the Laplacian `Δu`)
+  and `jno.np.hessian(ui, [xi, yi])` (the full `D²u`) assemble against the element's second shape-function
+  derivatives, so a biharmonic / plate / Cahn–Hilliard form is written directly, e.g.
+  `jno.np.laplacian(ui, [xi, yi]) * jno.np.laplacian(vi, [xi, yi])` for `∫Δu·Δv`. Needs **`order ≥ 2`**
+  (a P1 Hessian is identically zero). Scalar Lagrange fields only; the physical Hessian is the exact
+  affine map `∂²φ/∂x_a∂x_b = K_ia K_jb ∂²φ/∂ξ_i∂ξ_j` (`K = J⁻¹`, no curvature term on the P1 geometry).
+  > **Conformity caveat.** Standard Lagrange is **C⁰**, so `∫Δu·Δv` over P2 is *non-conforming* and does
+  > **not** give a convergent biharmonic discretisation. For a convergent solve use a purpose-built
+  > biharmonic element — the **C¹ Argyris** element (`space="Argyris"`, below — the conforming quintic,
+  > accurate) or the cheaper **non-conforming Morley** element (`space="Morley"`, below — 6 DOF; note it uses
+  > the full-Hessian form `∫D²u:D²v`) — or the mixed (Ciarlet–Raviart) method (two coupled C⁰ fields with
+  > `w = Δu`, first derivatives only; see `tests/test_fem_hessian.py`). The shape-Hessian assembly here is the
+  > prerequisite they build on.
 
 ---
 
@@ -86,10 +99,22 @@ no term.
 > (Newton), and transient `M u̇ + A u = c` (including nonlinear-transient and the mixed/saddle **DAE**,
 > e.g. transient Darcy); and the differentiable `fem.solve()` for inverse problems.
 >
+> **Supported inverse:** a runtime parameter in a *volume* term is wired for **steady and transient**
+> problems — both a **scalar** and a spatially-varying **P1 field** `k(x)` (`fem.solve()` returns a
+> differentiable `FemLinearSystem` / `FemResidualOperator` / parametric time block that re-assembles at each
+> parameter value — so `crux.solve` recovers e.g. a plate stiffness from a deflection, a diffusivity from a
+> trajectory, or a full `k(x)` field). A field parameter is authored as its own P1 symbol,
+> `k = jno.np.parameter(kf)` for `kf, _ = d.fem_symbols()`, and interpolated with P1 shape functions at the
+> mesh vertices — independent of the non-nodal trial's basis. **Second-order-in-time (`u_tt`, a vibrating
+> plate) is supported** on the vertex families too (the augmented `[w, v]` block; a direct θ-solver is
+> recommended for the stiff biharmonic).
+>
 > **Not yet / excluded:** 3-D (the zoo is 2-D only — 3-D uses nodal Lagrange); higher order (lowest
-> RT₀ / N1E₀ only); other families (BDM, second-kind Nédélec, **Argyris**/C¹); quad / non-triangular
-> meshes; and a constraint-consistent *algebraic* initial state at `t0` in the saddle-DAE transient
-> (the differential field and all `t > 0` values are correct; only the reported `t0` algebraic value is).
+> RT₀ / N1E₀ only); other families (BDM, second-kind Nédélec, Bell); quad / non-triangular
+> meshes; a parameter in a **boundary** term through the non-nodal path (rejected — the natural-BC load is
+> assembled non-differentiably); and a constraint-consistent *algebraic* initial state at `t0` in the
+> saddle-DAE transient (the differential field and all `t > 0` values are correct; only the reported `t0`
+> algebraic value is). The **C¹ Argyris** element IS supported (below).
 
 Beyond nodal Lagrange (P1/P2), `jno.fem` assembles **edge-DOF** families on 2-D triangles — for
 problems whose natural space is *not* H¹. Pick one with the `space=` knob on `fem_symbols`:
@@ -100,6 +125,79 @@ problems whose natural space is *not* H¹. Pick one with the `space=` knob on `f
 | `"RT"` | **H(div)** Raviart–Thomas | edge normal flux `∫ₑ u·n` | mixed Poisson, Darcy, conservation |
 | `"N1E"` | **H(curl)** Nédélec (1st kind) | edge tangential `∫ₑ u·t` | Maxwell, eddy currents |
 | `"P0"` | L² (piecewise constant) | one per cell | the pressure / multiplier of a mixed pair |
+| `"Hermite"` | C⁰ cubic, **vertex value + ∇ DOFs** | `u`, `∂u/∂x`, `∂u/∂y` at vertices (+ centroid) | smooth/gradient-aware fields; the foundation for C¹ elements |
+| `"Argyris"` | **C¹** quintic (TUBA-6) | value + `∇u` + `D²u` at vertices, `∂u/∂n` at edge midpoints | conforming **biharmonic** / plate / Cahn–Hilliard |
+| `"Morley"` | **non-conforming** quadratic (6 DOF) | value at vertices, `∂u/∂n` at edge midpoints | **cheap biharmonic** / plate — scales to fine meshes |
+
+> **Hermite** is the first element with a per-cell **DOF-mixing** transform `M(cell)` (its global
+> derivative DOFs are the physical gradient `∇u` at the vertices). It is **C⁰** (not C¹), so it is *not*
+> a conforming biharmonic element — it de-risks the `M(cell)` / vertex-derivative-DOF machinery that the
+> **C¹ Argyris** element (below) reuses. A **value-Dirichlet** `u(region) - g` pins boundary-vertex
+> value DOFs (derivatives free); it composes with the steady, transient, and nonlinear `fem.solve()` paths
+> (see `tests/test_fem_hermite.py` for Poisson / heat / reaction-diffusion).
+
+> **Argyris** is the **C¹-conforming** quintic triangle (21 DOF: value, gradient and Hessian at each
+> vertex; the normal derivative at each edge midpoint) — the element for **4th-order PDEs**. Across a shared
+> edge both `u` and `∂u/∂n` are continuous, so `∫Δu·Δv` is now a *convergent* biharmonic discretisation
+> (the conformity caveat above is lifted for this space). basix has no Argyris family, so the reference dual
+> basis is built from the monomials and mapped to each physical cell by the affine-equivalence DOF-transform
+> `M(cell)` (R.C. Kirby, *A general approach to transforming finite elements*, SMAI J. Comput. Math. 4,
+> 2018; the original element is Argyris–Fried–Scharpf 1968). The **globally-oriented edge-normal DOF** is
+> what makes it C¹ on an *unstructured* mesh — the reference-normal reduced-quintic (Bell) is not affine
+> equivalent and fails there. Its essential BCs are the two plate traces — `u(region) - g` pins the
+> **deflection** and `u.dn(region) - h` pins the **rotation** `∂u/∂n` (see *Plate boundary conditions* below);
+> the boundary curvature `∂²u/∂n²` is always left **free** (a natural BC, as a physical plate requires). These
+> are wired for **axis-aligned boundary edges** (where the `(n,t)` frame is the `(x,y)` frame, so each trace is
+> a single DOF); a non-axis-aligned edge needs the general `(n,t)` rotation and is **rejected with a clear
+> error** (use the Morley element there — any orientation). Composes with the steady,
+> transient and nonlinear `fem.solve()` paths (see
+> `tests/test_fem_argyris.py`: exact biharmonic recovery on an unstructured mesh, convergence, nonlinear
+> `Δ²u + u³ = f`, the dissipative biharmonic heat flow, and a **vibrating clamped plate** `w_tt + Δ²w = 0`
+> (the augmented `[w, v]` block, energy-conserving trapezoidal integration — a direct θ-solver for the stiff
+> biharmonic). **Inverse** problems work too — a scalar coefficient (plate stiffness in `α·Δ²u = f`, a
+> diffusivity in a transient flow) *or* a spatially-varying **P1 field** `k(x)` in a volume term is recovered
+> by `crux.solve` (`tests/test_fem_inverse.py`), for both steady and transient forms.
+
+> **Morley** is the **cheapest** biharmonic element (6 DOF: the value at the 3 vertices + the normal
+> derivative at the 3 edge midpoints, quadratic). It is **non-conforming** — neither C⁰ nor C¹ — yet passes
+> the patch test and converges (energy `O(h)`, L² `O(h²)`). It reuses the same `M(cell)` transform and
+> globally-oriented edge-normal DOF as Argyris, but with a quadratic basis and ~3.5× fewer DOF it is far
+> cheaper, so it **clears the Argyris construction memory ceiling** and scales to much finer meshes (e.g. a
+> sharper phase-field crack). **Modelling subtlety:** because it is non-conforming, the biharmonic form must
+> be the **full-Hessian inner product** `inner(hessian(u), hessian(v))` (`∫D²u:D²v`), *not* `∫Δu·Δv` — the
+> Laplacian form is singular for Morley (functions like `xy` have `Δu = 0` but `D²u ≠ 0`, a spurious kernel).
+Its essential BCs are the same two plate traces as Argyris — `u(region) - g` (deflection) and
+> `u.dn(region) - h` (rotation) — but on **any** boundary orientation (Morley's DOFs are already the vertex
+> value and the edge-normal derivative, so no `(n,t)` rotation is needed). See `tests/test_fem_morley.py`.
+> Reference: L.S.D. Morley, *The triangular equilibrium element in the solution of plate bending problems*,
+> Aeronautical Quarterly **19** (1968) 149–169.
+
+> **Plate boundary conditions.** For a 4th-order (plate/biharmonic) field on the Argyris or Morley element the
+> boundary trace has two essential parts you can pin independently — the **deflection** `u(region) - g` and the
+> **rotation** `u.dn(region) - h` (`∂u/∂n = h`) — plus two conjugate **natural** parts (bending moment `M_n`,
+> effective shear `V_n`) that emerge on any trace you *don't* pin. The classical BCs compose from these:
+>
+> | BC | Physics | How to write it (on a region) |
+> |----|---------|-------------------------------|
+> | **Clamped** | `w=0`, `∂w/∂n=0` | `u(reg)-g`, `u.dn(reg)-0` |
+> | **Simply-supported** | `w=0`, `M_n=0` | `u(reg)-g` |
+> | **Guided / sliding** | `∂w/∂n=0`, `V_n=0` | `u.dn(reg)-h` |
+> | **Free** | `M_n=0`, `V_n=0` | *(write neither — natural)* |
+>
+> A free edge (no essential BC) gets the natural `M_n=V_n=0` from the physically-correct **ν-weighted plate
+> energy** `(1-ν)·inner(hessian(u),hessian(v)) + ν·laplacian(u)·laplacian(v)`. Validated against Timoshenko's
+> square-plate coefficients — clamped `w_max = 0.00126 qa⁴/D`, simply-supported `w_max = 0.00406 qa⁴/D`.
+>
+> **Prescribed edge moment (inhomogeneous natural BC).** A *nonzero* bending moment `M_n` on an edge is applied
+> as the boundary load `M_n * phi.dn(region)` (the test function's normal derivative) — assembled as
+> `∮_region M_n ∂φ/∂n ds` on the Argyris/Morley elements. It composes with the essential traces: a
+> *moment-loaded simply-supported* edge is `u(reg)-0` **and** `M_n * phi.dn(reg)`. Validated by a manufactured
+> simply-supported plate (`u* = x(1-x)y(1-y)`, `M_n = Δu*`): Argyris recovers `u*` to machine precision (it is a
+> quartic in the P5 space), Morley converges `O(h²)`. The moment integral is built from each cell's own geometry
+> (Jacobian, push-forward, outward normal), so it applies on **any edge orientation** — but note the *essential*
+> Argyris pin is still axis-aligned-only, so on Argyris a moment is reachable only where that pin is; **Morley**
+> carries a prescribed moment on any boundary (verified on a slanted diamond). *(The conjugate **shear** load —
+> the effective Kirchhoff shear `V_n = Q_n + ∂M_{nt}/∂t`, which carries corner forces — is not yet wired.)*
 
 ```python
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")   # H(div) flux
@@ -489,7 +587,11 @@ Dirichlet problems.
   coordinates needed; pass `p.pin(value)` to set the gauge).
 * **1D and 3D** — a 1D interval or a 3D `cube`/extruded `gmsh` volume use the identical API with
   one fewer / one more coordinate (`ui.z`, `u(xb, yb, zb) - g`, `element_type="TET4"`).
-* **P2 elements** — `order=2` gives quadratic elements; read the solution at `fem.points`.
+* **Higher-order Lagrange** — `order=k` gives degree-`k` elements (P2 quadratic, P3 cubic, P4, … on
+  triangles and tets); the assembly mesh places the element's basix interpolation points on each cell
+  (deduplicated by coordinate, so shared edges/faces stay conforming). Read the solution at `fem.points`.
+  The geometry stays affine-P1 (straight-sided), so on a *curved* boundary the geometric error caps the
+  observed order regardless of `k` — measure high-order convergence on straight-sided/polygonal domains.
 
 ---
 
