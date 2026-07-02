@@ -11,6 +11,7 @@ from ...trace import (
     Jacobian,
     Literal,
     ModelCall,
+    NormalDerivative,
     OperationCall,
     OperationDef,
     Placeholder,
@@ -72,6 +73,17 @@ def iter_children(node: Any):
         for v in node.variables:
             if isinstance(v, Placeholder):
                 yield v
+        return
+
+    if isinstance(node, NormalDerivative):
+        yield node.target
+        # The target is usually a bound field view (`u(x, y)`) that survived un-lowered here (its arithmetic
+        # un-wrapping never fired inside the wrapper); descend its `_expr` so trial/field detection reaches the
+        # underlying field. Confined to this node so no other view is exposed. Region comes from the view's
+        # `_coord_vars` (read off the yielded target itself).
+        inner = getattr(node.target, "_expr", None)
+        if isinstance(inner, Placeholder):
+            yield inner
         return
 
     if isinstance(node, Tracker):

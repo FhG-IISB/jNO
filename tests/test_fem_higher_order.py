@@ -1,14 +1,14 @@
-"""Higher-order (P2) element coverage for ``jno.fem``.
+"""Higher-order (P2, P3, P4, …) Lagrange element coverage for ``jno.fem``.
 
-jno's domain machinery assumes linear cells, so the
-domain mesh stays P1 and the FEM *assembly* mesh is promoted to P2 (edge-midpoint
-nodes inserted; vertices preserved) only for assembly. A P2 element captures
-quadratics exactly, which P1 cannot — the manufactured ``u = xy`` recovery is the
-check, and it also validates the promotion's node ordering (a wrong ordering gives
-an O(1) error, not machine precision).
+jno's domain machinery assumes linear cells, so the domain mesh stays P1 and the FEM *assembly* mesh is
+promoted to P{order} (the element's basix interpolation points placed on each cell and deduplicated by
+coordinate; vertices preserved) only for assembly. A P{k} element captures polynomials up to degree
+``k`` exactly, which lower orders cannot — the manufactured harmonic-polynomial recovery is the check,
+and it also validates the node generation (a wrong multi-node-edge orientation gives an O(1) error, not
+machine precision).
 
-Order is per-field via ``fem_symbols(order=2)``; the element is inferred from
-``(dimension, order)``. The solution lives on the P2 nodes exposed by ``fem.points``.
+Order is per-field via ``fem_symbols(order=k)``; the element is inferred from ``(dimension, order)``.
+The solution lives on the P{k} nodes exposed by ``fem.points``.
 """
 
 from __future__ import annotations
@@ -76,6 +76,58 @@ def test_p1_cannot_capture_quadratic():
     # xy is bilinear (not affine), so P1 has a real approximation error (~1e-3 here)
     # -- many orders above P2's machine-precision recovery, which is the point.
     assert rel > 1e-5
+
+
+def _poisson_harmonic(order, u_fn, mesh_size=0.34):
+    """-Δu = 0 with Dirichlet u = u_fn on the boundary -> u = u_fn (a harmonic polynomial). A P{order}
+    element captures any polynomial up to degree ``order`` exactly, so a harmonic polynomial of degree
+    ``order`` is recovered to machine precision iff the P{order} node generation is correct (a wrong
+    multi-node-edge orientation would scramble cross-cell continuity and give an O(1) error)."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size)
+    nverts = int(np.asarray(d.mesh.points).shape[0])
+    u, phi = d.fem_symbols(order=order)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y, u(xb, yb) - u_fn(xb, yb)])
+    pts = np.asarray(fem.points)
+    sol = _solve(fem)
+    exact = np.asarray(u_fn(pts[:, 0], pts[:, 1]))
+    return fem, nverts, np.linalg.norm(exact - sol) / np.linalg.norm(exact)
+
+
+def test_p3_recovers_cubic_exactly():
+    # u = Re((x+iy)^3) = x^3 - 3xy^2 is harmonic and cubic. P3 has 2 nodes per edge, so this is the
+    # patch test that catches a wrong edge-node orientation across shared cells.
+    fem, nverts, rel = _poisson_harmonic(3, lambda x, y: x**3 - 3 * x * y**2)
+    assert fem.dofs > nverts  # P3 nodes (vertices + 2/edge + interior) were built
+    assert rel < 1e-9, f"P3 did not recover the cubic exactly: rel={rel:.2e}"
+
+
+def test_p4_recovers_quartic_exactly():
+    # u = Re((x+iy)^4) = x^4 - 6x^2y^2 + y^4 is harmonic and quartic; P4 has 3 nodes per edge + 3 interior.
+    fem, nverts, rel = _poisson_harmonic(4, lambda x, y: x**4 - 6 * x**2 * y**2 + y**4)
+    assert fem.dofs > nverts
+    assert rel < 1e-9, f"P4 did not recover the quartic exactly: rel={rel:.2e}"
+
+
+def test_p3_3d_recovers_cubic_exactly():
+    pytest.importorskip("pygmsh", reason="pygmsh required for cube meshing")
+    # 3D P3 (TET20 via promotion): harmonic cubic u = x^3 - 3x y^2 (independent of z, still harmonic),
+    # recovered exactly -- exercises the tet edge + face node placement.
+    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.6))
+    nverts = int(np.asarray(d.mesh.points).shape[0])
+    u, phi = d.fem_symbols(order=3)
+    co = d.variable("interior", split=True)
+    cb = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=co[0], y=co[1], z=co[2]), phi.bind(x=co[0], y=co[1], z=co[2])
+    bc = u(cb[0], cb[1], cb[2]) - (cb[0] ** 3 - 3 * cb[0] * cb[1] ** 2)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y + ui.z * vi.z, bc])
+    assert fem.dofs > nverts
+    pts = np.asarray(fem.points)
+    sol = _solve(fem)
+    exact = pts[:, 0] ** 3 - 3 * pts[:, 0] * pts[:, 1] ** 2
+    assert np.linalg.norm(exact - sol) / np.linalg.norm(exact) < 1e-9
 
 
 def test_p2_3d_recovers_quadratic_exactly():
