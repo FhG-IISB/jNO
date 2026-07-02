@@ -392,6 +392,56 @@ def test_enclosure_view_factor_after_build_mesh_blocks_through_obstacle():
     assert float(np.sum(dom.context["v_rad_right__rad_left"])) == pytest.approx(0.0)
 
 
+def test_build_mesh_interface_is_conforming_across_internal_interface():
+    """Internal region interfaces must mesh CONFORMINGLY even when a neighbour
+    splits the shared edge at a vertex that lies *off the outer boundary*.
+
+    Furnace-faithful setup: a ``wall`` slab whose left edge x=2 is a single
+    segment (2,0)-(2,3); a ``block`` touching that edge over z in [1,2]; and
+    ``Air`` built as the scene-box minus everything (as a furnace scene does). Air's
+    boundary along x=2 is then split into (2,0)-(2,1) and (2,2)-(2,3) with
+    vertices (2,1)/(2,2) that the wall's single edge lacks. Those vertices sit
+    on an *internal* interface, so ``_collect_source_edge_endpoints`` (which
+    clips to the outer boundary) never sees them -- the wall and Air then emit
+    non-matching gmsh lines on x=2 and mesh it with their own interleaved
+    nodes. Every such edge carries only one triangle, so the interface
+    transmits neither conduction nor radiation. Inserting the union of
+    partition vertices makes both sides split identically. Regression for the
+    furnace wall|air interface that silently sealed the cooling air pocket.
+    """
+    from collections import defaultdict
+
+    from shapely.geometry import Polygon, box
+    from shapely.ops import unary_union
+
+    np.random.seed(7)
+    wall = Polygon([(2, 0), (3, 0), (3, 3), (2, 3)])
+    block = Polygon([(0, 1), (2, 1), (2, 2), (0, 2)])
+    air = box(0, 0, 3, 3).difference(unary_union([wall, block]))
+    dom = jno.domain.csg.from_regions({"wall": wall, "block": block, "Air": air}, time=None)
+    dom.build_mesh(mesh_size=0.4)
+
+    pts = np.asarray(dom.mesh.points)[:, :2]
+    tris = np.asarray(dom.mesh.cells_dict["triangle"])
+    adj: dict = defaultdict(int)
+    for a, b, c in tris:
+        for i, j in ((int(a), int(b)), (int(b), int(c)), (int(c), int(a))):
+            adj[(min(i, j), max(i, j))] += 1
+
+    on_iface = np.where(np.abs(pts[:, 0] - 2.0) < 1e-7)[0]
+    iface = set(on_iface.tolist())
+    iface_edges = [(i, j) for (i, j), n in adj.items() if i in iface and j in iface]
+    assert iface_edges, "expected mesh edges along the x=2 wall|air interface"
+    # conforming <=> every interior interface edge is shared by exactly 2 triangles
+    bad = [e for e in iface_edges if adj[e] != 2]
+    assert not bad, f"non-conforming interface: {len(bad)}/{len(iface_edges)} edge(s) with adjacency != 2"
+
+    # and no two distinct interface nodes are near-coincident (the interleaving
+    # signature of two independently-meshed sides)
+    z = np.sort(pts[on_iface, 1])
+    assert np.all(np.diff(z) > 1e-6), "interleaved near-coincident interface nodes (non-conforming)"
+
+
 def test_three_disjoint_pieces_keep_distinct_interior_tags():
     """Three non-touching squares from from_polygons must mesh as 3 separate
     pieces and keep distinct `interior_<name>` tags."""
