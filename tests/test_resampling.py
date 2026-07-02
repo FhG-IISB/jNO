@@ -518,7 +518,7 @@ def test_boundary_normals_updated_after_resample():
 
     # mesh_size=0.1 → ~40 boundary nodes in pool, working set = 20 → 2× ratio.
     domain = 1 * jno.domain(constructor=jno.domain.rect(mesh_size=0.1))
-    b_vars = domain.variable("boundary", sample=(20, None), normals=True, resampling_strategy=strategy)
+    b_vars = domain.variable("boundary", sample=(20, None), normals=True, split=True, resampling_strategy=strategy)
     xb, yb = b_vars[0], b_vars[1]
 
     xi, yi = domain.variable("interior", sample=(40, None))[:2]

@@ -62,9 +62,14 @@ def _plate_center_deflection(space, clamped, mesh_size=0.06):
 def test_clamped_vs_simply_supported_matches_timoshenko(space):
     """The reason the granular BC exists: `u(reg)-g` alone (simply-supported) must give a *different*, and
     larger, deflection than `u(reg)-g` + `u.dn(reg)-0` (clamped) — each matching Timoshenko's coefficient. A
-    silently-still-clamped value BC would give the two the same answer; this is what a grep cannot catch."""
-    w_clamped = _plate_center_deflection(space, clamped=True)
-    w_simple = _plate_center_deflection(space, clamped=False)
+    silently-still-clamped value BC would give the two the same answer; this is what a grep cannot catch.
+
+    Runs on CPU: the C¹-element assembly at this mesh peaks at ~12 GiB in one dense reduce (the
+    known Argyris memory ceiling), which OOMs 8 GiB GPUs — the pin validates the plate BCs, not
+    GPU capacity."""
+    with jax.default_device(jax.devices("cpu")[0]):
+        w_clamped = _plate_center_deflection(space, clamped=True)
+        w_simple = _plate_center_deflection(space, clamped=False)
     assert abs(w_clamped / 0.00126 - 1.0) < 0.06, f"{space} clamped w_max={w_clamped:.5f} (Timoshenko 0.00126)"
     assert abs(w_simple / 0.00406 - 1.0) < 0.06, f"{space} simply-supported w_max={w_simple:.5f} (Timoshenko 0.00406)"
     assert w_simple > 2.5 * w_clamped, "u(reg)-g alone must FREE the rotation (simply-supported ≠ clamped)"
