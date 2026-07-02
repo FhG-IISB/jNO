@@ -10,7 +10,7 @@ import sys
 
 from . import bayesian, fn, lora, optimizers, precond, solve, trackers
 from . import jnp_ops as np
-from ._fem import Coupling, fem
+from ._fem import Coupling, fem, lag
 from .architectures.models import nn, parameter
 from .core import core
 from .differential_operators import DifferentialOperators

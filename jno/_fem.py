@@ -96,6 +96,37 @@ def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000):
     return _residual_check(A, b, u, "Jacobi-preconditioned BiCGStab")
 
 
+def lag(expr: Any) -> Any:
+    """Mark a weak-form coefficient as **lagged**: frozen within each linearization, updated
+    between iterations — the Picard / fixed-point linearization as first-class API.
+
+    The canonical use is a solution-dependent coefficient whose Newton tangent destroys the
+    linearized system's structure — e.g. a shear-thinning viscosity ``mu_eff(u)`` in a
+    rigid-plastic/non-Newtonian Stokes flow, where full Newton produces a strongly nonsymmetric
+    velocity block that defeats AMG/block preconditioners, while the lagged (Picard) system is a
+    plain symmetric Stokes solve per step::
+
+        mu_eff = k_f / (3 * jno.np.sqrt(2/3 * rate2 + eps0**2))
+        fem = jno.fem([2 * jno.lag(mu_eff) * inner(eps(ui), eps(vi)) - ...])
+        fem.solve(nonlinear=jno.solve.picard(damping=0.7), linear=..., precond=...)
+
+    Mechanically ``lag`` is ``stop_gradient`` on the traced expression, so ``jax.linearize`` of
+    the residual yields the *lagged* operator: :func:`jno.solve.picard` (and plain Newton) then
+    iterate with that linearization automatically. The converged solution is unchanged —
+    ``R(u) = 0`` does not depend on gradient markers.
+
+    **Inverse-problem caveat**: implicit differentiation (``custom_root``) also uses the lagged
+    Jacobian for its tangent/adjoint solve, so gradients of ``fem.solve()`` w.r.t. parameters
+    become the standard "Picard adjoint" approximation — widely used and usually descent-worthy,
+    but not exact. Remove ``lag`` (full Newton) when exact parameter gradients matter more than
+    per-step solvability.
+    """
+    sg = getattr(expr, "stop_gradient", None)
+    if sg is not None and not callable(sg):
+        return sg  # traced view / placeholder: the .stop_gradient property
+    return jax.lax.stop_gradient(expr)  # plain arrays inside hand-written residuals
+
+
 # ---------------------------------------------------------------------------
 # expression helpers
 # ---------------------------------------------------------------------------

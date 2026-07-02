@@ -40,6 +40,7 @@ __all__ = [
     "minres",
     "chebyshev",
     "newton",
+    "picard",
 ]
 
 
@@ -188,20 +189,7 @@ def chebyshev(
     return LinearSolver(_fn, name="chebyshev")
 
 
-def newton(
-    *,
-    rtol: float = 1e-8,
-    atol: float = 1e-8,
-    max_steps: int = 100,
-    inner_tol: float = 1e-10,
-    inner_maxit: int = 2000,
-) -> NonlinearSolver:
-    """Jacobian-free Newton-Krylov -- the (unchanged) nonlinear default, as a configurable slot.
-
-    Wraps :func:`jno.utils.solver.newton_krylov.newton_krylov`: ``J @ v`` from a JVP, inner
-    matrix-free solve (default BiCGStab, or the ``linear=`` slot when given), implicit
-    differentiation via ``lax.custom_root`` so gradients reach parameters without unrolling."""
-
+def _root_driver(name, *, damping, rtol, atol, max_steps, inner_tol, inner_maxit) -> NonlinearSolver:
     def _fn(residual_fn, u0, *, linear_solve):
         from .utils.solver.newton_krylov import newton_krylov
 
@@ -214,6 +202,55 @@ def newton(
             inner_tol=inner_tol,
             inner_maxit=inner_maxit,
             linear_solve=linear_solve,
+            damping=damping,
         )
 
-    return NonlinearSolver(_fn, name="newton")
+    return NonlinearSolver(_fn, name=name)
+
+
+def newton(
+    *,
+    damping: float = 1.0,
+    rtol: float = 1e-8,
+    atol: float = 1e-8,
+    max_steps: int = 100,
+    inner_tol: float = 1e-10,
+    inner_maxit: int = 2000,
+) -> NonlinearSolver:
+    """Jacobian-free Newton-Krylov -- the (unchanged) nonlinear default, as a configurable slot.
+
+    Wraps :func:`jno.utils.solver.newton_krylov.newton_krylov`: ``J @ v`` from a JVP, inner
+    matrix-free solve (default BiCGStab, or the ``linear=`` slot when given), implicit
+    differentiation via ``lax.custom_root`` so gradients reach parameters without unrolling.
+    ``damping < 1`` relaxes each update for strongly nonlinear residuals."""
+    return _root_driver(
+        "newton", damping=damping, rtol=rtol, atol=atol, max_steps=max_steps, inner_tol=inner_tol, inner_maxit=inner_maxit
+    )
+
+
+def picard(
+    *,
+    damping: float = 1.0,
+    rtol: float = 1e-8,
+    atol: float = 1e-8,
+    max_steps: int = 200,
+    inner_tol: float = 1e-10,
+    inner_maxit: int = 2000,
+) -> NonlinearSolver:
+    """Damped Picard (lagged-coefficient / fixed-point) iteration — pair with :func:`jno.lag`.
+
+    Freeze the troublesome solution-dependent coefficients in the weak form with
+    ``jno.lag(...)``; the linearization of the residual is then the *Picard* operator (the
+    lagged system re-solved at each iterate), and this driver iterates it with optional damping.
+    The classic trade: more outer iterations than Newton's quadratic convergence, but each
+    linearized system keeps the structure (symmetry, definiteness) that block preconditioners
+    and multigrid need — e.g. a non-Newtonian Stokes flow whose full-Newton velocity block is
+    strongly nonsymmetric while its Picard block is a plain symmetric Stokes operator.
+
+    Without any ``jno.lag`` marker in the residual this is exactly damped Newton. The default
+    ``max_steps`` is higher than Newton's — linear (not quadratic) convergence. See the
+    ``jno.lag`` docstring for the inverse-problem (Picard-adjoint) caveat.
+    """
+    return _root_driver(
+        "picard", damping=damping, rtol=rtol, atol=atol, max_steps=max_steps, inner_tol=inner_tol, inner_maxit=inner_maxit
+    )

@@ -633,6 +633,26 @@ sol = fem.solve(
 )
 ```
 
+**Picard / lagged coefficients — `jno.lag`.** When a solution-dependent coefficient's Newton
+tangent destroys the linearized system's structure (the classic case: a shear-thinning viscosity
+`μ_eff(u)` in non-Newtonian/rigid-plastic Stokes flow, whose full-Newton velocity block is
+strongly nonsymmetric and defeats AMG/block preconditioners), freeze it with `jno.lag(...)` and
+drive with `jno.solve.picard()`:
+
+```python
+fem = jno.fem([2 * jno.lag(mu_eff) * inner(eps(ui), eps(vi)) - pi * div(vi), ...])
+sol = fem.solve(nonlinear=jno.solve.picard(damping=0.7), linear=jno.solve.fgmres(),
+                precond=jno.precond.triangular(...))
+```
+
+`lag` is `stop_gradient` on the traced expression, so the residual's linearization *is* the
+Picard operator — each outer step re-solves the lagged system (linear convergence, but every
+inner system keeps its symmetry/definiteness); the converged solution is identical to full
+Newton's. Without any `lag` marker, `picard(damping=…)` is exactly damped Newton
+(`jno.solve.newton(damping=…)` spells the same thing). Caveat for inverse problems: implicit
+differentiation then also uses the lagged Jacobian (the standard "Picard adjoint" approximation)
+— drop `lag` when exact parameter gradients matter more than per-step solvability.
+
 **User extension** is duck-typed — a linear solver is any
 `fn(A, b, *, M=None, x0=None) -> x` with `A` a `jno.solve.LinearOperator` (`.mv`, `.T`,
 `.diag()`, `.bcoo`, `.dense()`); a preconditioner is any `ctx -> (v -> M⁻¹v)`:
