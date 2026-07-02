@@ -181,6 +181,9 @@ nav:
       - Inverse Conductivity (L-shape): tutorials/08-fem-and-varpinns/inverse-conductivity-lshape.md
       - Transient Inverse (Rate): tutorials/08-fem-and-varpinns/transient-inverse-heat.md
       - "Inverse Plate Stiffness (4th-order field)": tutorials/08-fem-and-varpinns/inverse-plate-stiffness-2d.md
+      - Adaptive Mesh Refinement (L-shape): tutorials/08-fem-and-varpinns/adaptive-l-shape.md
+      - Adaptive Mesh + Inverse Design: tutorials/08-fem-and-varpinns/adaptive-inverse-lshape.md
+      - Anisotropic Refinement (thin layer): tutorials/08-fem-and-varpinns/anisotropic-layer.md
     - 09 Weights & Biases:
       - W&B Integration: tutorials/09-wandb/wandb-integration.md
     - 10 Bayesian PINNs:
