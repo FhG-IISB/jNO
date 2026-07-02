@@ -113,3 +113,68 @@ def test_3d_nonnodal_only_nedelec_supported():
     ui, vi = u.bind(x=xi, y=yi, z=zi), phi.bind(x=xi, y=yi, z=zi)
     with pytest.raises(NotImplementedError, match="3D"):
         jno.fem([inner(jno.np.hessian(ui, [xi, yi, zi]), jno.np.hessian(vi, [xi, yi, zi]), n_contract=2) - vi]).A
+
+
+def test_pec_tangential_pins_are_boundary_face_edges():
+    """Decisive check for the 3D boundary-edge detection: the PEC BC ``n×E=0`` must pin **exactly** the edges
+    of the boundary FACES (facet connectivity), value 0, with no interior edge touched. This is NOT the 2D
+    "edge used by one cell" set — on a tet mesh most boundary edges are shared by several tets, so that rule
+    would miss them (a wrong-DOF bug that still solves plausibly)."""
+    from jno.utils.solver.fem_facets import build_facet_connectivity
+    from jno.utils.solver.fem_nonnodal import _n1e_tangential_pins_3d
+    from jno.utils.solver.fem_topology import BASIX_TET_EDGES, build_edge_topology
+
+    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.4))
+    cells = np.asarray(d.mesh.cells_dict["tetra"])
+    top = build_edge_topology(cells, BASIX_TET_EDGES)
+    pins = _n1e_tangential_pins_3d([("u", "boundary", 0.0)], d, {"u": 0}, ["N1E"], top, [0])
+    pinned = sorted(int(dof) for dof, _ in pins)
+    assert {float(v) for _, v in pins} == {0.0}  # homogeneous PEC
+
+    fc = build_facet_connectivity(cells, "tetrahedron")
+    eid = {(int(a), int(b)): i for i, (a, b) in enumerate(np.asarray(top.edge_vertices))}
+    truth = set()
+    for f in range(fc.n_bfaces):
+        fn = [int(x) for x in fc.face_nodes[f]]
+        for a, b in ((fn[0], fn[1]), (fn[1], fn[2]), (fn[0], fn[2])):
+            truth.add(eid[(min(a, b), max(a, b))])
+    assert pinned == sorted(truth)  # exactly the boundary-face edges
+
+    counts = np.bincount(np.asarray(top.cell_edges).reshape(-1), minlength=top.n_edges)
+    assert sum(1 for e in truth if counts[e] > 1) > 0  # multi-use boundary edges exist (2D rule would miss them)
+
+
+def _driven_pec_l2_error(mesh_size):
+    """Driven H(curl) problem ``curl-curl + mass`` with a manufactured field ``E* = (sin πy sin πz,
+    sin πx sin πz, sin πx sin πy)`` (zero tangential trace on every cube face), PEC ``n×E=0`` on the whole
+    boundary. Returns ``(n_dof, ‖E_h − E*‖_L²)`` via ``‖E-E*‖² = EᵀME − 2Eᵀb* + ∫|E*|²`` (``∫|E*|²=¾``)."""
+    sin, cos, vec = jno.np.sin, jno.np.cos, jno.np.vector
+    pi = np.pi
+    d = jno.domain(constructor=jno.domain.cube(mesh_size=mesh_size))
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+    c = d.variable("interior", split=True)
+    xi, yi, zi = c[0], c[1], c[2]
+    ui, vi = u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)
+    cu, cv = u.vector.curl(xi, yi, zi), v.vector.curl(xi, yi, zi)
+    sx, sy, sz, cx, cy, cz = sin(pi * xi), sin(pi * yi), sin(pi * zi), cos(pi * xi), cos(pi * yi), cos(pi * zi)
+    Estar = vec(sy * sz, sx * sz, sx * sy)
+    curlE = vec(pi * sx * (cy - cz), pi * sy * (cz - cx), pi * sz * (cx - cy))  # curl E*
+    nb = d.variable("boundary", normals=True, split=True)
+    pec = u.vector.cross(vec(nb[4], nb[5], nb[6]))  # n×E = 0 on the whole boundary
+    driven = [inner(cu, cv) + inner(ui, vi) - inner(curlE, cv) - inner(Estar, vi), pec]
+    solve = lambda A, b: np.linalg.solve(_dense(A), np.asarray(jnp.asarray(b)).reshape(-1))  # noqa: E731
+    M = _dense(jno.fem([inner(ui, vi)]).A)
+    bstar = np.asarray(jnp.asarray(jno.fem([inner(ui, vi) - inner(Estar, vi)]).b)).reshape(-1)
+    E = np.asarray(jno.fem(driven).solve(solve)).reshape(-1)
+    e2 = float(E @ M @ E - 2.0 * (E @ bstar) + 0.75)
+    return E.size, float(np.sqrt(max(e2, 0.0)))
+
+
+def test_pec_driven_problem_converges():
+    """End-to-end (gesture → peel → facet pin → solve): the driven manufactured problem with PEC on the whole
+    boundary recovers ``E*``. ``E*`` is trigonometric (not in N1E₀) so recovery is not exact — but the L²
+    error DECREASES under refinement, validating the PEC BC works in a real coupled solve."""
+    n0, e0 = _driven_pec_l2_error(0.5)
+    n1, e1 = _driven_pec_l2_error(0.25)
+    assert n1 > n0
+    assert e1 < 0.85 * e0, f"PEC driven problem must converge: {e0:.3e} (ndof {n0}) -> {e1:.3e} (ndof {n1})"

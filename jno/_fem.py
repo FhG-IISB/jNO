@@ -37,6 +37,7 @@ import numpy as np
 from .trace import (
     FemLinearSystem,
     FemResidualOperator,
+    FunctionCall,
     GaugePin,
     ModelCall,
     NormalDerivative,
@@ -718,6 +719,39 @@ def _normal_flux_spec(constraint: Any, domain: Any) -> Optional[Tuple[Any, str, 
     if not normals:
         return None
     return _field_key_of(constraint), normals[0].tag[2:], value_node
+
+
+def _tangential_bc_spec(constraint: Any, domain: Any) -> Optional[Tuple[Any, str, Any]]:
+    """Recognise a homogeneous **PEC** tangential BC ``n × u = 0`` (H(curl) N1E, 3-D) -> ``(field_key,
+    region, 0.0)``; ``None`` otherwise.
+
+    The constraint is the cross product of the N1E trial with the region's boundary normal
+    (``u.vector.cross(nvec)``, ``nvec`` built from ``domain.variable(region, normals=True)`` — tag
+    ``n_<region>``), with no test function. Only the **homogeneous** perfect-electric-conductor case
+    (tangential trace zero) is wired; an inhomogeneous ``n × u = g`` (nonzero rhs) is not (returns ``None``,
+    so it falls through rather than silently zeroing). Peeled before classification like the RT normal-flux
+    BC; routed into ``flux_bcs`` where the N1E-3D branch pins every boundary-face edge DOF in the region."""
+    bare = _bare(constraint)
+    if getattr(bare, "op", None) == "-":  # `cross(...) - rhs`: PEC only, so require rhs == 0
+        left, right = getattr(bare, "left", None), getattr(bare, "right", None)
+        if _constant_of(right) == 0.0:
+            bare = _bare(left)
+        elif _constant_of(left) == 0.0:
+            bare = _bare(right)
+        else:
+            return None  # inhomogeneous n×u=g not wired
+    if not (isinstance(bare, FunctionCall) and getattr(bare, "_name", None) == "cross"):
+        return None
+    if _contains(bare, TestFunction) or not _contains(bare, TrialFunction):
+        return None
+    normals = [
+        n
+        for n in _walk(bare)
+        if isinstance(n, Variable) and isinstance(getattr(n, "tag", None), str) and n.tag.startswith("n_")
+    ]
+    if not normals:
+        return None
+    return _field_key_of(constraint), normals[0].tag[2:], 0.0
 
 
 def _rotation_bc_spec(constraint: Any, domain: Any) -> Optional[Tuple[Any, str, Any]]:
@@ -1694,7 +1728,7 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     flux_bcs: List[Any] = []
     _core: List[Any] = []
     for c in constraints:
-        spec = _normal_flux_spec(c, domain)
+        spec = _normal_flux_spec(c, domain) or _tangential_bc_spec(c, domain)  # RT u·n / N1E u×n (incl. 3-D PEC)
         (flux_bcs.append(spec) if spec is not None else _core.append(c))
     constraints = _core
 
