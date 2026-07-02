@@ -40,6 +40,7 @@ __all__ = [
     "prepare_precond",
     "compose_linear_solve_fn",
     "compose_nonlinear_solve_fn",
+    "compose_transient_step_solvers",
 ]
 
 
@@ -366,3 +367,72 @@ def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable
             return solver(op, rhs, M=M)
 
     return lambda residual_fn, u0: nonlinear(residual_fn, u0, linear_solve=inner)
+
+
+def _add_step_operator(M, A, scale):
+    """Form the theta-step operator ``M + scale * A`` once, eagerly.
+
+    Both BCOO: concatenate triplets (duplicates are legal COO — every consumer sums them:
+    matvec, ``matrix_diagonal``, ``sparse_lu_solve``, the AMG CSR conversion). Anything else:
+    dense addition.
+    """
+    if hasattr(M, "todense") and hasattr(A, "todense"):
+        import jax.experimental.sparse as jsp
+
+        data = jnp.concatenate([M.data, scale * A.data])
+        indices = jnp.concatenate([M.indices, A.indices], axis=0)
+        return jsp.BCOO((data, indices), shape=M.shape)
+    dense = lambda x: x.todense() if hasattr(x, "todense") else jnp.asarray(x)
+    return dense(M) + scale * dense(A)
+
+
+def compose_transient_step_solvers(nonlinear, linear, precond, fem, block):
+    """Compose the slots into per-step solvers for the transient integrator.
+
+    Returns ``(linear_step_solve, nonlinear_step_solve)`` (one is ``None``), matching
+    :meth:`SemidiscreteTimeBlock.step`'s injection points:
+
+    * **nonlinear block** — the per-step implicit solve ``G(u_next) = 0`` gets the same
+      composed driver as the steady nonlinear path (``nonlinear=`` slot + matrix-free inner
+      ``linear``/``precond``), so ``picard(damping=…)`` with ``jno.lag`` coefficients works per
+      time step.
+    * **linear block** — the theta-step system ``(M + θ dt A) u_next = rhs`` is what the
+      ``linear`` solver and ``precond`` spec see. When the operator is **time-independent**
+      (``operator_fn is None``) the step matrix is formed once, eagerly, and the preconditioner
+      is materialized **once before the scan** — the AMG hierarchy / auxiliary ``form`` operator
+      is then reused by every step (the whole point of preconditioning a time loop). A
+      time-dependent ``operator_fn(t, args)`` falls back to per-step materialization against a
+      matvec-only operator that still exposes the exact step diagonal (so ``jacobi`` works).
+    """
+    if block.is_nonlinear():
+        return None, compose_nonlinear_solve_fn(nonlinear, linear, precond, fem)
+    if nonlinear is not None:
+        raise ValueError("fem.solve: nonlinear= given, but this transient block is linear (no linearization).")
+
+    if linear is None:
+        from ... import solve as _solve_ns
+
+        solver = _solve_ns.bicgstab()  # the historic per-step default
+    else:
+        solver = linear
+    if precond is not None:
+        prepare_precond(precond, fem)
+
+    # constant-operator fast path: one step matrix, one preconditioner, reused by every step
+    static_op = None
+    static_M = None
+    if block.operator_fn is None and block.A is not None and block.dt is not None:
+        theta = float(block.metadata.get("theta", 1.0)) if block.metadata else 1.0
+        static_op = LinearOperator(_add_step_operator(block.M, block.A, theta * float(block.dt)))
+        if precond is not None:
+            static_M = materialize_precond(precond, PrecondContext(static_op, fem))
+
+    def step_solve(matvec, rhs, x0, diag_fn):
+        if static_op is not None:
+            op, M = static_op, static_M
+        else:
+            op = LinearOperator.from_matvec(matvec, diag_fn=diag_fn, shape=(rhs.shape[0], rhs.shape[0]))
+            M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
+        return solver(op, rhs, M=M, x0=x0)
+
+    return step_solve, None

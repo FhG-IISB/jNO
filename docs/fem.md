@@ -676,9 +676,21 @@ If your callable is pure JAX it inherits `jit`/`vmap`/AD automatically. On the m
 the JVP operator — so `form`, `inner(...)`, `chebyshev`, a pre-built `amg`, and their
 `block_diag`/`triangular` compositions all work (this is the nonlinear-saddle production
 pattern: `nonlinear=picard() + linear=fgmres() + precond=triangular(...)`); only specs that
-need the assembled matrix (`jacobi`, an unbuilt `amg`) raise. Not yet supported (clear errors,
-see `plans/fem-solver-api.md`): slots on **transient** problems, `x0` on **complex** problems,
-and slots combined with `adapt=`.
+need the assembled matrix (`jacobi`, an unbuilt `amg`) raise.
+
+**Transient problems.** The slots configure the *per-step* solves of the default theta-method
+integrator (the bring-your-own `(block, args, save_ts)` contract via `solve_fn=` is unchanged):
+`linear`/`precond` see the step operator `M + θ·dt·A` — when the operator is time-independent
+the step matrix is formed **once** and the preconditioner materialized **once before the time
+loop** (an AMG hierarchy or auxiliary `form` operator is then reused by every step; `jacobi`
+uses the exact step diagonal either way) — and `nonlinear` drives each implicit step of a
+nonlinear block (`picard` + `jno.lag` per step included). Second-order-in-time (`u_tt`) flows
+through the same augmented block unchanged. Each step warm-starts from the previous state
+(so `x0=` is rejected — the initial state is the ICs' job); `lu()` inside the time loop
+re-factorizes per step (JAX's `spsolve` has no factorization cache).
+
+Not yet supported (clear errors, see `plans/fem-solver-api.md`): slots on **complex** /
+complex-transient problems (`x0` on complex included), and slots combined with `adapt=`.
 
 ### Field parameters `k(x)` + regularization
 

@@ -1056,9 +1056,14 @@ class FEM:
         ``precond`` spec is materialized per Newton/Picard linearization against the JVP
         operator — ``form`` / ``inner(...)`` / ``chebyshev`` / pre-built ``amg`` and their
         ``block_diag``/``triangular`` compositions work; ``jacobi`` (needs the assembled
-        diagonal) does not. Not yet supported: slots on transient problems, ``x0`` on complex
-        problems, and slots combined with ``adapt=`` (remeshing invalidates warm starts and
-        cached preconditioner setups — pass ``solve_fn=`` there).
+        diagonal) does not. On a **transient** problem the slots configure the *per-step*
+        solves of the default theta-stepper: ``linear``/``precond`` see the step operator
+        ``M + θ·dt·A`` (materialized once, before the time loop, when the operator is
+        time-independent — an AMG hierarchy / auxiliary form is then reused by every step),
+        ``nonlinear`` drives each implicit step, each step warm-starts from the previous state
+        (``x0`` is rejected — the ICs own the initial state). Not yet supported: slots on
+        complex/complex-transient problems, and slots combined with ``adapt=`` (remeshing
+        invalidates warm starts and cached preconditioner setups — pass ``solve_fn=`` there).
         """
         has_slots = (x0 is not None) or (nonlinear is not None) or (linear is not None) or (precond is not None)
         if adapt is not None:
@@ -1164,11 +1169,30 @@ class FEM:
                 "fem.solve: pass either solve_fn= (the total override) or the solver slots "
                 "(x0/nonlinear/linear/precond), not both."
             )
-        if self._mode in ("transient", "complex_transient"):
+        if self._mode == "complex_transient":
             raise NotImplementedError(
-                "fem.solve solver slots are not threaded into the transient stepper yet -- pass a full "
-                "integrator via solve_fn= (see plans/fem-solver-api.md)."
+                "fem.solve solver slots are not threaded into the complex-transient path yet -- pass a "
+                "full integrator via solve_fn= (see plans/fem-solver-api.md)."
             )
+        if self._mode == "transient":
+            # thread the slots into the default theta-stepper as per-step solvers: the linear
+            # slot/precond see the step operator (M + theta dt A) -- materialized ONCE before the
+            # scan when the operator is time-independent -- and the nonlinear slot drives each
+            # implicit step. The bring-your-own (block, args, save_ts) contract is unchanged.
+            if x0 is not None:
+                raise ValueError(
+                    "fem.solve: x0= on a transient problem -- the initial state comes from the initial "
+                    "conditions, and each step already warm-starts from the previous state."
+                )
+            from .utils.solver.backend_blocks import _default_transient_integrate
+            from .utils.solver.solver_api import compose_transient_step_solvers
+
+            lin_s, nonlin_s = compose_transient_step_solvers(nonlinear, linear, precond, self, self._op)
+
+            def _stepper(block, args, save_ts):
+                return _default_transient_integrate(block, args, save_ts, linear_solve=lin_s, nonlinear_solve=nonlin_s)
+
+            return _stepper, kwargs
         if self._mode == "nonlinear":
             fn = compose_nonlinear_solve_fn(nonlinear, linear, precond, self)
             if x0 is not None:

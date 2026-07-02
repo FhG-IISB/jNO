@@ -223,11 +223,13 @@ def test_jacobi_on_matrix_free_nonlinear_raises():
         fem.solve(nonlinear=jno.solve.newton(), precond=jno.precond.jacobi())
 
 
-def test_transient_slots_raise():
+def test_complex_transient_slots_raise():
+    # plain-transient slots are supported (see test_fem_solver_transient.py); the complex-
+    # transient path still routes around them
     from jno._fem import FEM
 
-    fem = FEM(None, None, [], mode="transient")
-    with pytest.raises(NotImplementedError, match="transient"):
+    fem = FEM(None, None, [], mode="complex_transient")
+    with pytest.raises(NotImplementedError, match="complex-transient"):
         fem.solve(linear=jno.solve.cg())
 
 
