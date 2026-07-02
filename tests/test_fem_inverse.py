@@ -109,6 +109,168 @@ def test_linear_recovers_with_byo_dense_solver():
     assert abs(rec - 1.0) < TOL, f"linear (BYO dense): recovered alpha={rec:.4f}"
 
 
+def _argyris_biharmonic_fem(alpha, mesh_size=0.34):
+    """Parametric conforming biharmonic ``alpha * Δ²u = f`` on the Argyris C¹ element; exact ``u = x⁴+y⁴``
+    at ``alpha=1`` (``f = Δ²(x⁴+y⁴) = 48``), clamped to the manufactured trace. The 4th-order inverse
+    analogue of ``_linear_fem`` -- it exercises the non-nodal *parametric* assembler."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size)
+    u, phi = d.fem_symbols(space="Argyris")
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    lap = jno.np.laplacian
+    f = 48.0 + 0.0 * xi
+    g = xb**4 + yb**4
+    weak = alpha * (lap(ui, [xi, yi]) * lap(vi, [xi, yi])) - f * vi
+    return jno.fem([weak, u(xb, yb) - g])
+
+
+def test_argyris_biharmonic_inverse_recovers_scalar():
+    """A **4th-order** inverse problem: recover the plate stiffness ``alpha`` in ``alpha·Δ²u = f`` from a
+    steady deflection, through the conforming C¹ Argyris element. Validates the non-nodal *parametric* path
+    (a differentiable ``FemLinearSystem`` whose operator re-assembles at each ``alpha``) end-to-end via
+    ``crux.solve`` -- the capability the non-nodal assembler previously lacked."""
+    alpha = _alpha()  # starts at 2.0; truth is 1.0
+    fem = _argyris_biharmonic_fem(alpha)
+    assert fem.is_linear
+    sys = fem.operator
+    assert sys.is_parametric and list(sys.runtime_parameter_exprs) == ["alpha"]
+
+    dense = lambda A: A.todense() if hasattr(A, "todense") else A  # noqa: E731 (the non-nodal operator is dense)
+    A1, b1 = sys.evaluate({"alpha": 1.0})
+    u_obs = jnp.linalg.solve(jnp.asarray(dense(A1)), jnp.asarray(b1).reshape(-1))
+
+    u_node = fem.solve(lambda A, b: jnp.linalg.solve(jnp.asarray(dense(A)), jnp.asarray(b).reshape(-1)))
+    rec = _recover(u_node, alpha, u_obs)
+    assert abs(rec - 2.0) > 0.5, "parameter did not move -- gradient did not reach alpha through the C¹ solve"
+    assert abs(rec - 1.0) < TOL, f"Argyris biharmonic inverse: recovered alpha={rec:.4f}"
+
+
+def test_argyris_nonlinear_biharmonic_parametric_operator():
+    """The non-nodal STEADY-NONLINEAR parametric branch: ``α·Δ²u + u³ = f`` on Argyris builds a parametric
+    ``FemResidualOperator`` whose residual threads ``α``. (A full crux recovery is validated for the linear
+    case above; optimising the ill-conditioned biharmonic Newton–Krylov is impractically slow for a unit
+    test, so here we assert the branch is wired parametrically and ``α`` reaches the residual.)"""
+    alpha = _alpha()
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.4)
+    u, phi = d.fem_symbols(space="Argyris")
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    lap = jno.np.laplacian
+    weak = alpha * (lap(ui, [xi, yi]) * lap(vi, [xi, yi])) + (u * u * u) * phi - (48.0 + 0.0 * xi) * vi
+    fem = jno.fem([weak, u(xb, yb) - (xb**4 + yb**4)])
+    assert not fem.is_linear
+    op = fem.operator
+    assert type(op).__name__ == "FemResidualOperator" and op.is_parametric
+    assert list(op.runtime_parameter_exprs) == ["alpha"]
+    u_test = 0.1 * jnp.ones((int(op.size),), dtype=jnp.float64)
+    r1 = jnp.asarray(op.residual(u_test, {"alpha": 1.0})).reshape(-1)
+    r2 = jnp.asarray(op.residual(u_test, {"alpha": 2.0})).reshape(-1)
+    assert float(jnp.max(jnp.abs(r1 - r2))) > 1e-6, "alpha did not thread into the nonlinear residual"
+
+
+def _hermite_transient_fem(alpha, mesh_size=0.3):
+    """Parametric transient diffusion ``u_t = alpha·Δu`` (weak ``∫u_t v + alpha·∫∇u·∇v``), homogeneous
+    Dirichlet, IC ``sin(πx)sin(πy)`` ⇒ ``u(t) = exp(-alpha·2π²t)·IC``. A Hermite (C⁰) field exercises the
+    non-nodal *parametric time block* (linear, ``operator_fn(t, args)``), well-conditioned so the default
+    integrator's Krylov step converges fast (an Argyris transient inverse works the same way but is slow,
+    like the ill-conditioned biharmonic)."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size, time=(0.0, 0.02, 5))
+    u, phi = d.fem_symbols(space="Hermite")
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    psi0 = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
+    weak = ui.t * vi + alpha * (ui.x * vi.x + ui.y * vi.y)
+    return jno.fem([weak, u(xb, yb) - 0.0, u(ci[0], ci[1]) - psi0])
+
+
+def test_argyris_field_parameter_operator_matches_coordinate_coeff():
+    """A P1 **field** parameter ``k(x)`` on an Argyris biharmonic (``k·Δu·Δv``): the coefficient is a P1
+    field independent of the C¹ trial, gathered at the mesh vertices and interpolated with P1 shape
+    functions. For a *linear* ``k`` the P1 interpolation is exact, so the field-parameter operator must
+    equal the operator built from the same coordinate-function coefficient — the definitive check that the
+    gather / node-order / interpolation on the non-nodal element is correct."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.35)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    lap = jno.np.laplacian
+    f = 48.0 + 0.0 * xi
+    g = xb**4 + yb**4
+
+    kf, _ = d.fem_symbols()  # a P1 coefficient field, independent of the Argyris trial
+    k = jno.np.parameter(kf, name="k")
+    assert getattr(k.model, "_fem_field", None) == "node"
+    u, phi = d.fem_symbols(space="Argyris")
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    fem = jno.fem([k * (lap(ui, [xi, yi]) * lap(vi, [xi, yi])) - f * vi, u(xb, yb) - g])
+    assert fem.is_linear and list(fem.operator.runtime_parameter_exprs) == ["k"]
+
+    nodes = np.asarray(d.built_mesh.points)[:, :2]
+    k_true = jnp.asarray(0.6 + 0.8 * nodes[:, 0] + 0.5 * nodes[:, 1])  # smooth, positive, LINEAR
+
+    u2, p2 = d.fem_symbols(space="Argyris")
+    ux, vx = u2.bind(x=xi, y=yi), p2.bind(x=xi, y=yi)
+    fem_ref = jno.fem([(0.6 + 0.8 * xi + 0.5 * yi) * (lap(ux, [xi, yi]) * lap(vx, [xi, yi])) - f * vx, u2(xb, yb) - g])
+    dense = lambda A: np.asarray(A.todense() if hasattr(A, "todense") else A)  # noqa: E731
+    A_field, _b = fem.operator.evaluate({"k": k_true})
+    assert np.max(np.abs(dense(A_field) - dense(fem_ref.A))) < 1e-8, "P1 field-param interpolation/gather mismatch"
+
+
+def test_hermite_field_parameter_recovers():
+    """A **field** inverse: recover a spatially-varying coefficient ``k(x)`` in ``-∇·(k∇u) = f`` on a Hermite
+    field, end-to-end through ``crux.solve``. Validates the gradient to the full P1 nodal field through the
+    non-nodal parametric solve (Poisson-like, so well-posed from full-field data — no regularization needed)."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    kf, _ = d.fem_symbols()
+    k = jno.np.parameter(kf, name="k")
+    u, phi = d.fem_symbols(space="Hermite")
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = 2.0 * (xi * (1.0 - xi) + yi * (1.0 - yi))
+    fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
+    assert fem.is_linear and list(fem.operator.runtime_parameter_exprs) == ["k"]
+
+    nodes = np.asarray(d.built_mesh.points)[:, :2]
+    k_true = jnp.asarray(0.6 + 0.8 * nodes[:, 0] + 0.5 * nodes[:, 1])
+    dense = lambda A: A.todense() if hasattr(A, "todense") else A  # noqa: E731
+    A_t, b = fem.operator.evaluate({"k": k_true})
+    u_obs = jnp.linalg.solve(jnp.asarray(dense(A_t)), jnp.asarray(b).reshape(-1))
+
+    k.dtype(jnp.float64)
+    k.initialize(jax.nn.initializers.constant(1.0))
+    k.optimizer(optax.adam(2e-2))
+    solver = lambda A, b: jnp.linalg.solve(jnp.asarray(dense(A)), jnp.asarray(b).reshape(-1))  # noqa: E731
+    crux = jno.core([(fem.solve(solver) - u_obs).mse], domain=_DUMMY)
+    crux.solve(400)
+    rec = np.asarray(crux.eval([k])).reshape(-1)
+    rel = float(np.linalg.norm(rec - np.asarray(k_true)) / np.linalg.norm(np.asarray(k_true)))
+    assert rel < 0.05, f"field parameter k(x) not recovered: rel {rel:.3e}"
+
+
+def test_hermite_transient_inverse_recovers_scalar():
+    """A **transient** inverse: recover the diffusivity ``alpha`` from a decay trajectory through the
+    non-nodal *parametric time block* — the operator ``A(alpha)`` is re-assembled each step and stays
+    differentiable through the time-stepping. Validates the transient inverse (previously rejected) for the
+    vertex/edge element families."""
+    from jno.utils.solver.backend_blocks import _block_time_grid, _default_transient_integrate
+
+    alpha = _alpha()  # starts at 2.0; truth is 1.0
+    fem = _hermite_transient_fem(alpha)
+    assert fem.is_transient
+    block = fem.operator
+    assert list(block.runtime_parameter_exprs) == ["alpha"]
+    save_ts = _block_time_grid(block)
+    u_obs = _default_transient_integrate(block, {"alpha": 1.0}, save_ts)  # observed trajectory at the truth
+
+    rec = _recover(fem.solve(), alpha, u_obs, n=150)
+    assert abs(rec - 2.0) > 0.3, "parameter did not move -- gradient did not reach alpha through the time-stepping"
+    assert abs(rec - 1.0) < TOL, f"transient inverse: recovered alpha={rec:.4f}"
+
+
 def test_nonlinear_recovers():
     from jno.utils.solver.newton_krylov import newton_krylov
 

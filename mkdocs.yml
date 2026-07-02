@@ -164,6 +164,11 @@ nav:
       - Bratu (nonlinear combustion): tutorials/08-fem-and-varpinns/bratu-2d.md
       - Ginzburg-Landau (nonlinear vector): tutorials/08-fem-and-varpinns/ginzburg-landau-2d.md
       - Laplacian Eigenmodes (spectral): tutorials/08-fem-and-varpinns/laplacian-eigenmodes-2d.md
+      - "Conforming Biharmonic (Argyris C¹, convergence)": tutorials/08-fem-and-varpinns/biharmonic-argyris-convergence-2d.md
+      - "Why C¹? Argyris vs. Mixed (biharmonic)": tutorials/08-fem-and-varpinns/biharmonic-conforming-vs-mixed-2d.md
+      - "Clamped Kirchhoff Plate (free boundary curvature)": tutorials/08-fem-and-varpinns/clamped-kirchhoff-plate-2d.md
+      - "Cahn–Hilliard (transient nonlinear 4th-order)": tutorials/08-fem-and-varpinns/cahn-hilliard-2d.md
+      - "Brittle Fracture (4th-order phase-field, coupled)": tutorials/08-fem-and-varpinns/phase-field-fracture-2d.md
       - Transient Heat: tutorials/08-fem-and-varpinns/transient-heat-2d.md
       - Transient via diffrax (custom integrator): tutorials/08-fem-and-varpinns/transient-diffrax-heat-spreader.md
       - Vibrating Membrane (2D wave, 2nd-order time): tutorials/08-fem-and-varpinns/wave-membrane-2d.md
@@ -175,6 +180,7 @@ nav:
       - Inverse Diffusivity Field: tutorials/08-fem-and-varpinns/inverse-diffusivity-field.md
       - Inverse Conductivity (L-shape): tutorials/08-fem-and-varpinns/inverse-conductivity-lshape.md
       - Transient Inverse (Rate): tutorials/08-fem-and-varpinns/transient-inverse-heat.md
+      - "Inverse Plate Stiffness (4th-order field)": tutorials/08-fem-and-varpinns/inverse-plate-stiffness-2d.md
       - Adaptive Mesh Refinement (L-shape): tutorials/08-fem-and-varpinns/adaptive-l-shape.md
       - Adaptive Mesh + Inverse Design: tutorials/08-fem-and-varpinns/adaptive-inverse-lshape.md
       - Anisotropic Refinement (thin layer): tutorials/08-fem-and-varpinns/anisotropic-layer.md

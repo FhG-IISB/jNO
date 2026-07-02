@@ -40,18 +40,30 @@ def test_trial_spaces_detects_nonnodal():
     assert _trial_spaces([TrialFunction(space="RT")]) == {"RT"}
 
 
-def test_fem_symbols_threads_space_and_rejects_not_yet_wired_family():
-    # RT is wired through the DSL (see test_fem_nonnodal_dsl); a family not yet implemented must
-    # still error clearly rather than silently assemble a Lagrange system.
+def test_fem_symbols_threads_space_argyris_wired_unknown_family_rejected():
+    # RT and Argyris are wired through the DSL (see test_fem_nonnodal_dsl / test_fem_argyris); a family not
+    # yet implemented must still error clearly rather than silently assemble a Lagrange system.
     pytest.importorskip("pygmsh", reason="pygmsh required for 2D meshing")
+    import numpy as np
     from shapely.geometry import box
 
     import jno
+    from jno.utils.solver.fem_topology import BASIX_TRIANGLE_EDGES, build_edge_topology
 
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.5)
     u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")
     assert u.space == "RT" and v.space == "RT" and u.field_key == v.field_key  # threaded through
-    a, b = d.fem_symbols(names=("a", "b"), space="Argyris")  # C1, not yet wired
     xi, yi, _ = d.variable("interior", split=True)
+
+    # Argyris (C¹) IS wired: a scalar mass form assembles its 21-DOF (6/vertex + 1/edge) system.
+    a, b = d.fem_symbols(names=("a", "b"), space="Argyris")
+    A = jno.fem([a.bind(x=xi, y=yi) * b.bind(x=xi, y=yi)]).A
+    Adense = np.asarray(A.todense() if hasattr(A, "todense") else A)
+    nv = np.asarray(d.mesh.points).shape[0]
+    ne = build_edge_topology(np.asarray(d.mesh.cells_dict["triangle"]), BASIX_TRIANGLE_EDGES).n_edges
+    assert Adense.shape == (6 * nv + ne, 6 * nv + ne), "Argyris ndof = 6*n_vertices + n_edges"
+
+    # a family that is NOT yet wired (e.g. Bell) must still error clearly, not silently assemble Lagrange.
+    p, q = d.fem_symbols(names=("p", "q"), space="Bell")
     with pytest.raises(NotImplementedError):
-        jno.fem([a.bind(x=xi, y=yi) * b.bind(x=xi, y=yi)])
+        jno.fem([p.bind(x=xi, y=yi) * q.bind(x=xi, y=yi)])
