@@ -109,7 +109,17 @@ no term.
 > plate) is supported** on the vertex families too (the augmented `[w, v]` block; a direct θ-solver is
 > recommended for the stiff biharmonic).
 >
-> **Not yet / excluded:** 3-D (the zoo is 2-D only — 3-D uses nodal Lagrange); higher order (lowest
+> **3-D Nédélec (H(curl)) is supported.** On a 3-D **tetrahedral** mesh the first-kind Nédélec `"N1E"`
+> element assembles the H(curl) **mass and curl-curl** forms (`inner(u, v) + inner(u.vector.curl(x,y,z),
+> v.vector.curl(x,y,z))`) — the correct edge discretisation for **Maxwell / eddy currents** (nodal Lagrange
+> gives spurious modes). The covariant push-forward `Φ_phys = J^{-T} Φ_ref` is dimension-agnostic and the
+> (vector) curl is taken from the physical gradient, so `.curl(x, y, z)` assembles directly; the tet-edge
+> orientation is validated by the exact bilinear form `∫|curl u|²` on a multi-tet mesh. On a tet mesh **only
+> N1E is wired** — RT / P0 / Hermite / Argyris / Morley remain 2-D-triangle only and raise. The 3-D
+> tangential BC `n×E = g` and the cavity-eigenvalue benchmark are follow-ons (see below).
+>
+> **Not yet / excluded:** the rest of the zoo in 3-D (RT / C¹ / plate are 2-D only — 3-D otherwise uses
+> nodal Lagrange); the essential tangential BC `n×E = g` on N1E (2-D and 3-D); higher order (lowest
 > RT₀ / N1E₀ only); other families (BDM, second-kind Nédélec, Bell); quad / non-triangular
 > meshes; a parameter in a **boundary** term through the non-nodal path (rejected — the natural-BC load is
 > assembled non-differentiably); and a constraint-consistent *algebraic* initial state at `t0` in the
@@ -208,8 +218,9 @@ jNO assembles these with its own push-forward engine, but the weak form reads li
 any other coupled problem.
 
 **Vector operators** (on a bound vector view): `u.div(x, y)` is the divergence and `u.curl(x, y)` the
-2-D scalar curl `∂uy/∂x − ∂ux/∂y`; after binding, the no-arg `u.div()` / `u.curl()` reuse the bound
-coordinates. (`div` is equivalently `trace(grad(u, [x, y]))`.)
+2-D scalar curl `∂uy/∂x − ∂ux/∂y`; in 3-D `u.curl(x, y, z)` returns the **curl vector** (used for the
+N1E tet curl-curl form). After binding, the no-arg `u.div()` / `u.curl()` reuse the bound coordinates.
+(`div` is equivalently `trace(grad(u, [x, y]))`.)
 
 **Essential (edge-trace) BCs** — the outward normal is `d.variable(region, normals=True, split=True)`:
 
@@ -225,7 +236,8 @@ geometry). All solver modes work — **steady-linear**, **steady-nonlinear** (Ne
 (`M u̇ + A u = c`), including a mixed/saddle transient (a DAE with singular mass, e.g. transient Darcy).
 
 Tutorials: `mixed_poisson_rt_2d.py` (H(div)) and `maxwell_nedelec_2d.py` (H(curl): magnetostatics +
-eddy current). *Scope: lowest-order RT₀ / N1E₀ on 2-D triangular meshes.*
+eddy current). *Scope: lowest-order RT₀ / N1E₀ on 2-D triangular meshes; N1E₀ also on 3-D **tetrahedral**
+meshes (H(curl) mass + curl-curl, for 3-D Maxwell / curl-curl).*
 
 ---
 
