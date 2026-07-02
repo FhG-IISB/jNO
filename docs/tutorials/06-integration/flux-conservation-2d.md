@@ -88,7 +88,7 @@ crux.solve(30_000)
 If you also want to monitor the outward heat flux through the boundary, request normals and compute F·n by hand:
 
 ```python
-x_b, y_b, _, nx, ny = domain.variable("boundary", normals=True)
+x_b, y_b, _, nx, ny = domain.variable("boundary", normals=True, split=True)
 u_b = net(jno.np.concat([x_b, y_b], axis=-1)) * x_b * (1 - x_b) * y_b * (1 - y_b)
 
 # ∫_∂Ω ∂u/∂n ds  —  should equal ∫_Ω ∇²u dV = −∫_Ω f dV by Green's identity

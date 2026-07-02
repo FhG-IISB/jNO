@@ -36,7 +36,7 @@ from typing import Any, NamedTuple, Optional, Tuple
 import jax.numpy as jnp
 import numpy as np
 
-from .fem_topology import BASIX_TRIANGLE_EDGES
+from .fem_topology import BASIX_TET_EDGES, BASIX_TRIANGLE_EDGES
 
 
 class ElementSpec(NamedTuple):
@@ -164,21 +164,53 @@ def nedelec_triangle(degree: int = 1, quad_degree: int = 2) -> ElementSpec:
     )
 
 
+def nedelec_tet(degree: int = 1, quad_degree: int = 2) -> ElementSpec:
+    """Lowest-order (``degree=1``) Nédélec first-kind (edge) element on a **tetrahedron**, via basix.
+
+    N1E(degree 1) on a tet has **6 DOFs**, one tangential moment per edge (in :data:`BASIX_TET_EDGES`
+    order), a 3-vector value (``value_size == 3``) and — unlike the 2-D triangle — a *vector* curl. The
+    physical curl is recovered from the covariant-Piola physical gradient in the assembler (the
+    antisymmetric parts of ``d(Φ_phys)_i/dx_l``), so no scalar ``ref_curl`` is tabulated here
+    (``ref_curl=None``); the value push-forward is the same covariant Piola ``Φ_phys = J^{-T} Φ_ref``
+    (:func:`piola_covariant`), which is dimension-agnostic. The H(curl) counterpart of
+    :func:`nedelec_triangle` for 3-D Maxwell / curl-curl problems."""
+    import basix
+    from basix import CellType, ElementFamily
+
+    elem = basix.create_element(ElementFamily.N1E, CellType.tetrahedron, degree)
+    qp, qw = basix.make_quadrature(CellType.tetrahedron, quad_degree)
+    tab = elem.tabulate(1, qp)  # (1 + tdim, n_quad, n_dof, value_size); tdim = 3
+    ref_values = np.asarray(tab[0])  # (n_quad, n_dof, 3)
+    ref_grads = np.stack([np.asarray(tab[i]) for i in range(1, 4)], axis=-1)  # (n_quad, n_dof, 3, 3)
+    return ElementSpec(
+        family="N1E",
+        n_dof=elem.dim,
+        value_size=elem.value_size,
+        quad_points=np.asarray(qp),
+        quad_weights=np.asarray(qw),
+        ref_values=ref_values,
+        ref_div=None,
+        ref_grads=ref_grads,
+        local_edges=BASIX_TET_EDGES,
+        ref_curl=None,  # 3-D curl is a vector, taken from the physical gradient (not a scalar)
+    )
+
+
 def piola_covariant(
     ref_values: jnp.ndarray, ref_curl: jnp.ndarray, J: jnp.ndarray, detJ: jnp.ndarray, signs: jnp.ndarray
 ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    """Map Nédélec reference data to one physical triangle (covariant Piola + sign).
+    """Map Nédélec reference data to one physical cell (covariant Piola + sign) — **2-D triangle or 3-D tet**.
 
-    ``Phi_phys = J^{-T} Phi_ref`` (preserves the tangential trace); the 2-D scalar curl transforms
-    as ``curl Phi_phys = (1/detJ) curl Phi_ref`` (signed ``detJ``). ``ref_values`` ``(n_quad, n_dof,
-    2)``, ``ref_curl`` ``(n_quad, n_dof)``, ``J`` the ``(2, 2)`` affine Jacobian, ``signs`` the
-    per-DOF edge orientation ``(n_dof,)``. Returns physical ``(values (n_quad, n_dof, 2), curl
-    (n_quad, n_dof))``; the orientation sign multiplies both.
+    ``Phi_phys = J^{-T} Phi_ref`` (preserves the tangential trace); the map is dimension-agnostic (``J`` is
+    ``(d, d)``, ``ref_values`` ``(n_quad, n_dof, d)``). In 2-D the scalar curl transforms as
+    ``curl Phi_phys = (1/detJ) curl Phi_ref`` and is returned as the second output; in 3-D the curl is a
+    *vector* recovered downstream from the physical gradient, so pass ``ref_curl=None`` and the second
+    output is ``None``. ``signs`` is the per-DOF edge orientation ``(n_dof,)``, applied to both outputs.
     """
     K = jnp.linalg.inv(J)  # J^{-1}; the covariant map J^{-T} gives Phi_phys_i = K_ji Phi_ref_j
     s = signs[None, :]  # (1, n_dof)
     values = jnp.einsum("ji,qnj->qni", K, ref_values) * s[:, :, None]
-    curl = ref_curl / detJ * s
+    curl = None if ref_curl is None else ref_curl / detJ * s
     return values, curl
 
 

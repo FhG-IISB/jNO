@@ -112,7 +112,7 @@ boundary_mean = u_b.integrate()
 For flux integrals of the form $\int_{\partial\Omega} \mathbf{F} \cdot \mathbf{n} \, ds$, request boundary normals and compute the dot product explicitly before calling `.integrate()`:
 
 ```python
-x_b, y_b, _, nx, ny = dom.variable("boundary", normals=True)
+x_b, y_b, _, nx, ny = dom.variable("boundary", normals=True, split=True)
 
 u_b = net(jno.np.concat([x_b, y_b], axis=-1))
 
@@ -134,8 +134,8 @@ For domains with named boundary regions, request variables from each group separ
 ```python
 dom = jno.domain(constructor=jno.domain.polygon(...))
 
-x_left,  y_left,  _, nx_l, ny_l = dom.variable("left",  normals=True)
-x_right, y_right, _, nx_r, ny_r = dom.variable("right", normals=True)
+x_left,  y_left,  _, nx_l, ny_l = dom.variable("left",  normals=True, split=True)
+x_right, y_right, _, nx_r, ny_r = dom.variable("right", normals=True, split=True)
 
 flux_left  = (u(x_left,  y_left)  * nx_l).integrate()
 flux_right = (u(x_right, y_right) * nx_r).integrate()
@@ -161,7 +161,7 @@ grads = grad_fn(model)
 ### Boundary flux conservation
 
 ```python
-x_b, y_b, _, nx, ny = dom.variable("boundary", normals=True)
+x_b, y_b, _, nx, ny = dom.variable("boundary", normals=True, split=True)
 u_b = net(jno.np.concat([x_b, y_b], axis=-1))
 
 # Enforce zero net outward flux

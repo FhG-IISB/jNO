@@ -254,7 +254,7 @@ def test_normals_after_build_mesh_point_outward_on_chamber_and_into_hole():
     # Chamber bottom edge (y=0): outward normal has y<0 (points down out of
     # the chamber). Skip the two endpoints because vertex normals there
     # average two perpendicular edges → tangent component dominates.
-    _xb, _yb, _, nx, _ny = dom.variable("boundary_chamber_0", normals=True)
+    _xb, _yb, _, nx, _ny = dom.variable("boundary_chamber_0", normals=True, split=True)
     pts = np.asarray(dom.context[_xb.tag])[0, 0]
     nrm = np.asarray(dom.context[nx.tag])[0, 0]
     interior_mask = (pts[:, 0] > 0.05) & (pts[:, 0] < 1.95)
@@ -263,7 +263,7 @@ def test_normals_after_build_mesh_point_outward_on_chamber_and_into_hole():
 
     # Obstacle bottom edge (y=0.35): outward normal has y>0 (points UP into
     # the obstacle hole, i.e. away from material).
-    _xo, _yo, _, nxo, _nyo = dom.variable("boundary_obstacle_0", normals=True)
+    _xo, _yo, _, nxo, _nyo = dom.variable("boundary_obstacle_0", normals=True, split=True)
     pts_o = np.asarray(dom.context[_xo.tag])[0, 0]
     nrm_o = np.asarray(dom.context[nxo.tag])[0, 0]
     obs_interior = (pts_o[:, 0] > 0.85) & (pts_o[:, 0] < 1.15)

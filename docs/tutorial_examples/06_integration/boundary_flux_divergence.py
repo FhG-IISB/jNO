@@ -16,7 +16,7 @@ LAPLACIAN_INTEGRAL = -8.0  # analytic: (−2π²) · (4/π²) = −8
 # --8<-- [start:setup]
 domain = jno.domain(box(0, 0, 1, 1), mesh_size=0.05, compute_mesh_connectivity=True)
 x, y, _ = domain.variable("interior")
-x_b, y_b, _, nx, ny = domain.variable("boundary", normals=True)
+x_b, y_b, _, nx, ny = domain.variable("boundary", normals=True, split=True)
 
 forcing = 2 * π**2 * jno.np.sin(π * x) * jno.np.sin(π * y)
 # --8<-- [end:setup]
