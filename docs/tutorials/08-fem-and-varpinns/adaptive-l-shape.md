@@ -54,7 +54,10 @@ error estimate at ~455 DOFs than a uniform mesh at ~828 DOFs.
   carrying a fixed fraction of the total.
 - **The re-entrant corner is pinned** during remeshing (mmg `set_corners`), so the singularity stays
   put and the benchmark is honest.
-- **Scalar P1 only** for now — the estimator asserts one DOF per vertex.
+- **Works in 2D and 3D** — the same loop drives isotropic refinement on triangle *and*
+  tetrahedron meshes (`domain.refine` / `FEM.solve(adapt=...)` on a `jno.domain.cube(...)`
+  remeshes via mmg3d, preserving the polyhedral geometry). Scalar P1 for now (one DOF/vertex);
+  anisotropic metrics are 2D-only so far.
 - **Knowing when to stop:** `AdaptSpec` takes `tol` (stop once the error estimate falls
   below it), `max_dofs` / `max_iters` (budget caps), and `eps` (stop once the estimate stops
   improving between rounds) — so the loop refines only until the solution is *good enough*.

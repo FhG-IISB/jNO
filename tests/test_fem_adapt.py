@@ -447,6 +447,61 @@ def test_anisotropic_adapt_beats_isotropic_on_oblique_layer():
     assert aniso_est < iso_est / 3.0, f"anisotropic est {aniso_est:.3f} not < iso est {iso_est:.3f}/3"
 
 
+def _cube(mesh_size=0.35):
+    return jno.domain(constructor=jno.domain.cube(mesh_size=mesh_size))
+
+
+def test_remesh_and_solve_3d_recovers_linear_solution():
+    """3D gate: remesh a tet cube, preserve its geometry, and recover u=x on the new mesh."""
+    d = _cube(0.35)
+    n0 = len(d.mesh.points)
+    d2 = remesh_with_mmg(d, np.full(n0, 0.18))
+    pts = np.asarray(d2.mesh.points)[:, :3]
+
+    assert len(pts) > n0  # refined
+    assert pts.min() > -1e-9 and pts.max() < 1.0 + 1e-9  # geometry preserved (stays in the cube)
+
+    u, phi = d2.fem_symbols()
+    xi, yi, zi, _ = d2.variable("interior", split=True)
+    xb, yb, zb, _ = d2.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi, z=zi), phi.bind(x=xi, y=yi, z=zi)
+    # -lap u = 0 with u = x on the whole boundary => u = x
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y + ui.z * vi.z, u(xb, yb, zb) - xb])
+    sol = _solve_vertex_values(fem)
+    coords = np.asarray(fem.points)[:, :3]
+    err = np.linalg.norm(sol - coords[:, 0]) / np.linalg.norm(coords[:, 0])
+    assert err < 1e-7, f"u=x not recovered on remeshed 3D mesh (rel err {err:.2e})"
+
+
+def _layer_3d_fem(d, eps=0.08):
+    """-lap u = f with u = tanh((x-0.5)/eps): a thin planar layer in the unit cube."""
+    u, phi = d.fem_symbols()
+    xi, yi, zi, _ = d.variable("interior", split=True)
+    xb, yb, zb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi, z=zi), phi.bind(x=xi, y=yi, z=zi)
+    t = J.tanh((xi - 0.5) / eps)
+    f = (2.0 / eps**2) * (1.0 - t * t) * t
+    return jno.fem([ui.x * vi.x + ui.y * vi.y + ui.z * vi.z - f * vi, u(xb, yb, zb) - J.tanh((xb - 0.5) / eps)])
+
+
+@pytest.mark.slow
+def test_adaptive_loop_3d_refines_at_layer():
+    """The 3D adaptive loop (solve -> estimate -> mark -> refine) drives the error estimate
+    down, grows the mesh, and concentrates DOFs at the planar layer."""
+    d = _cube(0.3)
+    fem = _layer_3d_fem(d)
+    fem.solve(adapt=AdaptSpec(theta=0.6, max_iters=4, refine_factor=1.6, max_dofs=2500))
+    hist = fem.adapt_history
+
+    dofs = [h["n_dofs"] for h in hist]
+    ests = [h["estimate"] for h in hist]
+    assert dofs == sorted(dofs) and dofs[-1] > dofs[0]  # mesh grew monotonically
+    assert ests[-1] < ests[0]  # estimate fell as the layer was resolved
+    # refinement concentrated at the layer plane x=0.5
+    pts = np.asarray(d.mesh.points)[:, :3]
+    assert np.mean(np.abs(pts[:, 0] - 0.5) < 0.1) > 0.3
+
+
 @pytest.mark.slow
 def test_adaptive_beats_uniform_on_l_shape():
     """Derisk gate: adaptive refinement reaches lower error per DOF than uniform.

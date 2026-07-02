@@ -47,6 +47,20 @@ def _boundary_edges_from_triangles(tris: np.ndarray) -> np.ndarray:
     return uniq[counts == 1].astype(np.int32)
 
 
+def _boundary_faces_from_tets(tets: np.ndarray) -> np.ndarray:
+    """Return the ``(n_boundary, 3)`` triangular boundary faces of a tetrahedral mesh.
+
+    The 3D analogue of :func:`_boundary_edges_from_triangles`: a triangular facet is on the
+    boundary iff it belongs to exactly one tetrahedron.  Purely topological, so robust for
+    any tet mesh regardless of how its surface was tagged.
+    """
+    tets = np.asarray(tets, dtype=np.int64)
+    faces = np.concatenate([tets[:, [1, 2, 3]], tets[:, [0, 2, 3]], tets[:, [0, 1, 3]], tets[:, [0, 1, 2]]], axis=0)
+    f_sorted = np.sort(faces, axis=1)
+    uniq, counts = np.unique(f_sorted, axis=0, return_counts=True)
+    return uniq[counts == 1].astype(np.int32)
+
+
 def _corner_vertices(points: np.ndarray, bedges: np.ndarray, angle_tol: float = 0.35) -> np.ndarray:
     """Boundary vertices where the boundary turns by more than ``angle_tol`` (radians).
 
@@ -100,7 +114,7 @@ def remesh_with_mmg(
     Parameters
     ----------
     domain
-        A meshed 2D ``jno`` domain (``domain.mesh`` a ``meshio.Mesh`` of triangles).
+        A meshed 2D (triangle) or 3D (tetrahedron) ``jno`` domain.
     vertex_size
         Either ``(n_vertices,)`` isotropic target edge lengths (smaller = finer), or an
         ``(n_vertices, 3)`` **anisotropic** metric tensor ``(m11, m12, m22)`` per vertex
@@ -137,31 +151,46 @@ def remesh_with_mmg(
     import mmgpy  # lazy: optional dependency, only needed for adaptive refinement
 
     dim = int(domain.dimension)
-    if dim != 2:
-        raise NotImplementedError("remesh_with_mmg currently supports 2D (mmg2d) meshes; 3D (mmg3d) is future work.")
+    if dim not in (2, 3):
+        raise NotImplementedError(f"remesh_with_mmg supports 2D/3D simplicial meshes; got dimension {dim}.")
 
-    pts = np.asarray(domain.mesh.points)[:, :2].astype(np.float64)
-    tris = np.asarray(domain.mesh.cells_dict["triangle"]).astype(np.int32)
+    pts = np.asarray(domain.mesh.points)[:, :dim].astype(np.float64)
     field = np.asarray(vertex_size, dtype=np.float64)
 
-    # (n,) / (n,1) -> isotropic size; (n,3) -> anisotropic metric tensor (m11, m12, m22)
-    anisotropic = field.ndim == 2 and field.shape[1] == 3
+    # (n,) / (n,1) -> isotropic size; (n, 3 in 2D / 6 in 3D) -> anisotropic metric tensor
+    n_tensor = 3 if dim == 2 else 6
+    anisotropic = field.ndim == 2 and field.shape[1] == n_tensor
     if not anisotropic:
         field = field.reshape(-1)
+        if not np.all(field > 0):
+            raise ValueError("vertex_size must be strictly positive.")
     if field.shape[0] != pts.shape[0]:
         raise ValueError(f"metric field has {field.shape[0]} entries but the mesh has {pts.shape[0]} vertices.")
+    if anisotropic and dim == 3:
+        raise NotImplementedError("anisotropic (tensor) metrics are 2D-only so far; pass an isotropic size in 3D.")
 
-    bedges = _boundary_edges_from_triangles(tris)
-    corners = _corner_vertices(pts, bedges)
-
-    m = mmgpy.MmgMesh2D()
-    m.set_mesh_size(len(pts), len(tris), 0, len(bedges))
-    m.set_vertices(pts)
-    m.set_triangles(tris)
-    m.set_edges(bedges, np.ones(len(bedges), dtype=np.int32))
-    if len(corners):
-        m.set_corners(corners)
-        m.set_required_vertices(corners)
+    if dim == 2:
+        elems = np.asarray(domain.mesh.cells_dict["triangle"]).astype(np.int32)
+        bfacets = _boundary_edges_from_triangles(elems)
+        corners = _corner_vertices(pts, bfacets)
+        m = mmgpy.MmgMesh2D()
+        m.set_mesh_size(len(pts), len(elems), 0, len(bfacets))
+        m.set_vertices(pts)
+        m.set_triangles(elems)
+        m.set_edges(bfacets, np.ones(len(bfacets), dtype=np.int32))
+        if len(corners):  # pin polygonal corners so the geometry is preserved exactly
+            m.set_corners(corners)
+            m.set_required_vertices(corners)
+    else:
+        elems = np.asarray(domain.mesh.cells_dict["tetra"]).astype(np.int32)
+        bfacets = _boundary_faces_from_tets(elems)
+        m = mmgpy.MmgMesh3D()
+        m.set_mesh_size(len(pts), len(elems), 0, len(bfacets), 0, 0)
+        m.set_vertices(pts)
+        m.set_tetrahedra(elems, np.ones(len(elems), dtype=np.int32))
+        m.set_triangles(bfacets, np.ones(len(bfacets), dtype=np.int32))
+        # mmg3d auto-detects the boundary ridges/corners of a polyhedral surface and keeps
+        # boundary vertices on it, so a polyhedral geometry is preserved without extra marking
 
     if anisotropic:
         # eigen-sizes of the tensor set the hmin/hmax window; the mmg tensor channel is aniso
@@ -169,8 +198,6 @@ def remesh_with_mmg(
         sizes = 1.0 / np.sqrt(np.clip(eig, 1e-300, None))
         m.set_field("tensor", field)
     else:
-        if not np.all(field > 0):
-            raise ValueError("vertex_size must be strictly positive.")
         sizes = field
         m.set_field("metric", field.reshape(-1, 1))
 
@@ -183,35 +210,42 @@ def remesh_with_mmg(
         opts["hausd"] = hausd
     m.remesh(**opts)
 
-    v_out = np.asarray(m.get_vertices())[:, :2]
-    t_out, _ = m.get_triangles_with_refs()
-    e_out, _ = m.get_edges_with_refs()
-    return _domain_from_arrays(domain, v_out, np.asarray(t_out), np.asarray(e_out), copy=copy)
+    v_out = np.asarray(m.get_vertices())[:, :dim]
+    if dim == 2:
+        t_out, _ = m.get_triangles_with_refs()
+        f_out, _ = m.get_edges_with_refs()
+    else:
+        t_out, _ = m.get_tetrahedra_with_refs()
+        f_out, _ = m.get_triangles_with_refs()
+    return _domain_from_arrays(domain, v_out, np.asarray(t_out), np.asarray(f_out), copy=copy)
 
 
-def _domain_from_arrays(template: Any, points2d: np.ndarray, tris: np.ndarray, bedges: np.ndarray, *, copy: bool):
-    """Apply remeshed ``points/triangles/boundary-edges`` to a domain.
+def _domain_from_arrays(template: Any, points: np.ndarray, elems: np.ndarray, bfacets: np.ndarray, *, copy: bool):
+    """Apply remeshed ``points / elements / boundary-facets`` to a domain.
 
-    Builds a ``meshio.Mesh`` carrying ``interior`` (triangles) and ``boundary``
-    (line) cell-sets, then runs it through ``_apply_mesh`` on either a shallow copy
-    of ``template`` (``copy=True``) or ``template`` itself (``copy=False``, in place).
-    Named boundary sub-tags are *not* stored in the mesh -- they re-derive
+    Builds a ``meshio.Mesh`` carrying ``interior`` (triangles in 2D / tetrahedra in 3D) and
+    ``boundary`` (line / triangle) cell-sets, then runs it through ``_apply_mesh`` on either
+    a shallow copy of ``template`` (``copy=True``) or ``template`` itself (``copy=False``, in
+    place).  Named boundary sub-tags are *not* stored in the mesh -- they re-derive
     geometrically from ``template``'s spatial predicates.
     """
     import meshio
 
-    n_pts = points2d.shape[0]
+    points = np.asarray(points, dtype=np.float64)
+    dim = points.shape[1]
+    n_pts = points.shape[0]
     pts3 = np.zeros((n_pts, 3), dtype=np.float64)
-    pts3[:, :2] = points2d
-    tris = np.asarray(tris, dtype=np.int64)
-    bedges = np.asarray(bedges, dtype=np.int64)
+    pts3[:, :dim] = points
+    elems = np.asarray(elems, dtype=np.int64)
+    bfacets = np.asarray(bfacets, dtype=np.int64)
 
-    cells = [("triangle", tris), ("line", bedges)]
-    n_tri, n_edge = len(tris), len(bedges)
+    elem_type, facet_type = ("triangle", "line") if dim == 2 else ("tetra", "triangle")
+    cells = [(elem_type, elems), (facet_type, bfacets)]
+    n_e, n_f = len(elems), len(bfacets)
     empty = np.asarray([], dtype=np.int64)
     cell_sets = {
-        "interior": [np.arange(n_tri, dtype=np.int64), empty],
-        "boundary": [empty, np.arange(n_edge, dtype=np.int64)],
+        "interior": [np.arange(n_e, dtype=np.int64), empty],
+        "boundary": [empty, np.arange(n_f, dtype=np.int64)],
     }
     new_mesh = meshio.Mesh(pts3, cells, cell_sets=cell_sets)
 
@@ -265,27 +299,49 @@ def zz_error_indicators(domain: Any, u_vertex: np.ndarray) -> tuple[np.ndarray, 
     return eta, float(np.sqrt(eta2.sum()))
 
 
+def _p1_element_gradients(domain: Any) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Constant P1 shape-function gradients per simplex, computed geometrically.
+
+    Returns ``(grad, measure, cells)``: ``grad`` is ``(n_cells, dim+1, dim)`` (the gradient of
+    each local barycentric shape function, constant over the element), ``measure`` the
+    ``(n_cells,)`` area (2D) / volume (3D), and ``cells`` the connectivity.  Exact for P1 on
+    triangles and tetrahedra and dimension-general, so the recovery estimator works in both 2D
+    and 3D without the native FEM context.
+    """
+    dim = int(domain.dimension)
+    pts = np.asarray(domain.mesh.points)[:, :dim].astype(np.float64)
+    cells = np.asarray(domain.mesh.cells_dict["triangle" if dim == 2 else "tetra"])
+    v = pts[cells]  # (n_cells, dim+1, dim)
+    edge = v[:, 1:, :] - v[:, :1, :]  # (n_cells, dim, dim): rows are (v_i - v_0), i=1..dim
+    einv = np.linalg.inv(edge)  # column j = grad of barycentric lambda_{j+1}
+    measure = np.abs(np.linalg.det(edge)) / (2.0 if dim == 2 else 6.0)  # simplex volume = |det|/d!
+
+    grad = np.zeros((cells.shape[0], dim + 1, dim))
+    grad[:, 1:, :] = np.transpose(einv, (0, 2, 1))  # grad lambda_i = column (i-1) of E^{-1}
+    grad[:, 0, :] = -grad[:, 1:, :].sum(axis=1)  # lambda_0 = 1 - sum(lambda_i)
+    return grad, measure, cells
+
+
 def _recover_nodal_gradient(domain: Any, field: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Patch-recovered (superconvergent) nodal gradient of a P1 ``field``.
 
-    Returns ``(g_star, g_cell, area, cells)``: ``g_star`` is the ``(n_vert, dim)`` recovered
-    nodal gradient (area-weighted average of incident element gradients), ``g_cell`` the raw
-    ``(n_cells, dim)`` elementwise-constant gradient, ``area`` the ``(n_cells,)`` cell areas,
-    and ``cells`` the ``(n_cells, n_local)`` connectivity.
+    Returns ``(g_star, g_cell, measure, cells)``: ``g_star`` is the ``(n_vert, dim)`` recovered
+    nodal gradient (measure-weighted average of incident element gradients), ``g_cell`` the raw
+    ``(n_cells, dim)`` elementwise-constant gradient, ``measure`` the ``(n_cells,)`` cell
+    areas/volumes, and ``cells`` the ``(n_cells, n_local)`` connectivity.  Works for 2D triangle
+    and 3D tetrahedron P1 meshes.
     """
-    from ..._fem import _fe_element_gradient_data
-
-    sg, jxw, cells = _fe_element_gradient_data(domain)
-    sg = np.asarray(sg)  # (n_cells, n_quad, n_local, dim)
-    cells = np.asarray(cells)  # (n_cells, n_local)
-    n_cells, _, _, dim = sg.shape
-    area = np.asarray(jxw).reshape(n_cells, -1).sum(axis=1)  # (n_cells,)
+    sg, measure, cells = _p1_element_gradients(domain)  # geometric, exact for P1 simplices
+    sg = np.asarray(sg)  # (n_cells, n_local, dim)
+    cells = np.asarray(cells)
+    n_cells, _, dim = sg.shape
+    area = measure  # (n_cells,)
 
     f = np.asarray(field).reshape(-1)
     if f.shape[0] < int(cells.max()) + 1:
         raise ValueError("field is shorter than the mesh vertex count; expected one value per P1 vertex.")
 
-    g_cell = np.einsum("cqld,cl->cqd", sg, f[cells]).mean(axis=1)  # (n_cells, dim)
+    g_cell = np.einsum("cld,cl->cd", sg, f[cells])  # (n_cells, dim): constant P1 gradient
     n_vert = f.shape[0]
     g_star = np.zeros((n_vert, dim))
     wsum = np.zeros(n_vert)
