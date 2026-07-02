@@ -115,11 +115,18 @@ no term.
 > gives spurious modes). The covariant push-forward `Φ_phys = J^{-T} Φ_ref` is dimension-agnostic and the
 > (vector) curl is taken from the physical gradient, so `.curl(x, y, z)` assembles directly; the tet-edge
 > orientation is validated by the exact bilinear form `∫|curl u|²` on a multi-tet mesh. On a tet mesh **only
-> N1E is wired** — RT / P0 / Hermite / Argyris / Morley remain 2-D-triangle only and raise. The 3-D
-> tangential BC `n×E = g` and the cavity-eigenvalue benchmark are follow-ons (see below).
+> N1E is wired** — RT / P0 / Hermite / Argyris / Morley remain 2-D-triangle only and raise.
+>
+> The essential **PEC wall** `n×E = 0` (homogeneous tangential trace) is supported, written
+> `u.vector.cross(nvec)` with `nvec = jno.np.vector(*d.variable(region, normals=True, split=True)[-3:])` — it
+> pins every boundary-face edge DOF of the region (facet-based; the 2-D "edge used once" rule is wrong on a
+> tet, where most boundary edges are shared by several tets). Validated by a driven manufactured Maxwell
+> problem that converges under refinement. An *inhomogeneous* `n×E = g` and the cavity-eigenvalue benchmark
+> (needs a generalized eigensolve) are follow-ons.
 >
 > **Not yet / excluded:** the rest of the zoo in 3-D (RT / C¹ / plate are 2-D only — 3-D otherwise uses
-> nodal Lagrange); the essential tangential BC `n×E = g` on N1E (2-D and 3-D); higher order (lowest
+> nodal Lagrange); the *inhomogeneous* tangential BC `n×E = g` on N1E (the homogeneous PEC case IS wired);
+> higher order (lowest
 > RT₀ / N1E₀ only); other families (BDM, second-kind Nédélec, Bell); quad / non-triangular
 > meshes; a parameter in a **boundary** term through the non-nodal path (rejected — the natural-BC load is
 > assembled non-differentiably); and a constraint-consistent *algebraic* initial state at `t0` in the

@@ -493,7 +493,7 @@ def assemble_fem_nonnodal(
         else jnp.zeros(total)
     )
     pins = (
-        _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, np.asarray(pts), offs, n_cells, quad_degree)
+        _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, np.asarray(pts), offs, n_cells, quad_degree, dim=dim)
         if flux_bcs
         else []
     )
@@ -1136,7 +1136,45 @@ def _second_tangential(value_node, xy, tax):
     return float(np.asarray(jax.hessian(gfun)(jnp.asarray(xy, dtype=jnp.float64)))[tax, tax])
 
 
-def _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree):
+def _n1e_tangential_pins_3d(flux_bcs, domain, field_index, spaces, top, offs):
+    """PEC tangential pins ``n × E = 0`` for a **3-D** N1E field: pin every boundary-face edge DOF in the BC
+    region to 0. Boundary faces are the tet faces used by exactly one cell (:func:`build_facet_connectivity`);
+    each contributes its 3 edges, mapped to the global N1E edge id via the edge topology. This is the correct
+    3-D criterion — the 2-D "edge used once" / "both endpoints on the region" tests are wrong on a tet mesh
+    (an interior edge can join two boundary vertices through the volume). Homogeneous PEC only: a nonzero
+    tangential trace ``n × E = g`` raises (its per-edge value ``∫_e g·t`` is a follow-on)."""
+    from ..._fem import _constant_of
+    from .fem_1d import _region_node_ids
+    from .fem_facets import build_facet_connectivity
+
+    cells = np.asarray(domain.mesh.cells_dict["tetra"])
+    fc = build_facet_connectivity(cells, "tetrahedron")
+    edge_id = {(int(a), int(b)): i for i, (a, b) in enumerate(np.asarray(top.edge_vertices))}  # canonical (lo,hi) -> eid
+    pins = []
+    for field_key, region, value_node in flux_bcs:
+        fidx = field_index.get(field_key)
+        if fidx is None or spaces[fidx] != "N1E":
+            raise NotImplementedError(
+                "jno.fem (non-nodal, 3D): the only essential edge-trace BC is the N1E tangential trace `n×E`."
+            )
+        if _constant_of(value_node) != 0.0:
+            raise NotImplementedError(
+                "jno.fem (non-nodal, 3D): only the homogeneous PEC tangential BC `n×E = 0` is wired; a "
+                "prescribed nonzero tangential trace is a follow-on."
+            )
+        region_nodes = {int(n) for n in _region_node_ids(domain, region)}
+        for f in range(fc.n_bfaces):
+            fn = [int(x) for x in fc.face_nodes[f]]
+            if not all(v in region_nodes for v in fn):
+                continue  # this boundary face is not in the BC region
+            for a, b in ((fn[0], fn[1]), (fn[1], fn[2]), (fn[0], fn[2])):
+                eid = edge_id.get((min(a, b), max(a, b)))
+                if eid is not None:
+                    pins.append((offs[fidx] + eid, 0.0))
+    return list(dict(pins).items())  # dedup edges shared by two boundary faces of the region
+
+
+def _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_cells, quad_degree, *, dim=2):
     """Compute the ``(dof, value)`` boundary pins for essential edge-trace BCs, separated from
     *application* so the same pins can be enforced per solver mode (symmetric elimination for steady
     linear, residual rows for nonlinear, M/A/c rows for transient).
@@ -1154,7 +1192,11 @@ def _flux_bc_pins(flux_bcs, domain, field_index, spaces, top, pts_np, offs, n_ce
       Derived geometrically and checked against the (exact) projection of a constant field on every
       boundary edge.
 
-    Boundary edges are the globally single-use edges, filtered to the BC's region by node membership."""
+    Boundary edges are the globally single-use edges, filtered to the BC's region by node membership. In
+    **3-D** (tet mesh) this "single-use / both-endpoints-in-region" criterion is wrong, so the N1E tangential
+    (PEC) pins are computed facet-based via :func:`_n1e_tangential_pins_3d`."""
+    if dim == 3:  # 3-D N1E tangential (PEC) — facet-based boundary edges, not the 2-D single-use rule
+        return _n1e_tangential_pins_3d(flux_bcs, domain, field_index, spaces, top, offs)
     from ..._fem import _eval_value_node_at
     from .fem_1d import _line_quadrature, _region_node_ids
 
