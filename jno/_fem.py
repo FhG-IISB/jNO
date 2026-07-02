@@ -927,7 +927,7 @@ class FEM:
             return list(self._offsets)
         return getattr(self.problem, "offset", None)
 
-    def solve(self, solve_fn=None, *, adapt=None, **kwargs) -> Any:
+    def solve(self, solve_fn=None, *, adapt=None, x0=None, nonlinear=None, linear=None, precond=None, **kwargs) -> Any:
         """Differentiable forward solve as a trace node — the inverse-problem entry.
 
         Pass ``adapt=AdaptSpec(...)`` to run the **adaptive** loop
@@ -973,11 +973,45 @@ class FEM:
         ``solve()`` returns the complex solution ``u_r + i·u_i`` via the real-equivalent block
         ``[[A_r,-A_i],[A_i,A_r]]`` (the assembly produces only real systems); pass ``solve_fn=(A, b) -> u``
         to choose the real block solver.
+
+        **Solver slots** (callables-only; alternative to ``solve_fn``, which stays the total
+        override — passing both is an error). The solver space factorises into four orthogonal
+        slots; each takes a configured callable from ``jno.solve`` / ``jno.precond`` (or your
+        own with the same contract, see those modules), and every ``None`` keeps today's
+        default::
+
+            fem.solve(
+                x0        = None,                   # warm start (initial guess / iterate)
+                nonlinear = jno.solve.newton(),     # linearization driver (nonlinear mode)
+                linear    = jno.solve.gmres(),      # inner linear solve
+                precond   = jno.precond.jacobi(),   # v -> M^{-1} v spec, materialized per solve
+            )
+
+        The slots compose into a ``solve_fn`` internally, so each dispatch path below keeps its
+        periodic reduction and implicit-differentiation behaviour; slot solvers receive the
+        **BCOO** operator (no densification). Not yet supported: slots on transient problems,
+        ``x0`` on complex problems, ``precond`` on the (matrix-free) nonlinear path, and slots
+        combined with ``adapt=`` (remeshing invalidates warm starts and cached preconditioner
+        setups — pass ``solve_fn=`` there).
         """
+        has_slots = (x0 is not None) or (nonlinear is not None) or (linear is not None) or (precond is not None)
         if adapt is not None:
+            if has_slots:
+                raise NotImplementedError(
+                    "fem.solve: the solver slots (x0/nonlinear/linear/precond) do not compose with "
+                    "adapt= yet — remeshing changes the DOF layout under a warm start and stales "
+                    "cached form/amg preconditioner setups. Pass solve_fn= for the adaptive loop."
+                )
             from .utils.solver.fem_adapt import run_adaptive_solve
 
             return run_adaptive_solve(self, adapt, solve_fn=solve_fn, **kwargs)
+        if has_slots:
+            solve_fn, kwargs = self._compose_slots(
+                solve_fn, x0=x0, nonlinear=nonlinear, linear=linear, precond=precond, kwargs=kwargs
+            )
+            from_slots = True
+        else:
+            from_slots = False
         if self._mode == "complex":
             return _solve_complex_block(self._op, solve_fn, periodic=self._periodic)
         if self._mode == "complex_transient":
@@ -1012,6 +1046,8 @@ class FEM:
                 return prolong_periodic(self._periodic, u_red)
             if solve_fn is None and hasattr(A, "todense"):
                 return _solve_linear_matrix_free(A, b)
+            if from_slots:
+                return solve_fn(A, b)  # slot-composed solvers take the BCOO operator directly
             A = jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)
             return (solve_fn or (lambda A_, b_: jnp.linalg.solve(A_, b_)))(A, b)
         if self._mode == "linear" and isinstance(self._op, FemLinearSystem):
@@ -1052,6 +1088,41 @@ class FEM:
             # flow to crux; with no parameter it is just a forward solve, so evaluate it to an array.
             return self._op.solve(solve_fn, **kwargs).fn()
         return self._op.solve(solve_fn, **kwargs)
+
+    def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, kwargs):
+        """Compose the solver slots into the mode-appropriate ``solve_fn`` (see :meth:`solve`)."""
+        from .utils.solver.solver_api import compose_linear_solve_fn, compose_nonlinear_solve_fn
+
+        if solve_fn is not None:
+            raise ValueError(
+                "fem.solve: pass either solve_fn= (the total override) or the solver slots "
+                "(x0/nonlinear/linear/precond), not both."
+            )
+        if self._mode in ("transient", "complex_transient"):
+            raise NotImplementedError(
+                "fem.solve solver slots are not threaded into the transient stepper yet -- pass a full "
+                "integrator via solve_fn= (see plans/fem-solver-api.md)."
+            )
+        if self._mode == "nonlinear":
+            fn = compose_nonlinear_solve_fn(nonlinear, linear, precond, self)
+            if x0 is not None:
+                if "u0" in kwargs:
+                    raise ValueError("fem.solve: x0= and u0= are the same initial guess; pass one.")
+                kwargs = {**kwargs, "u0": jnp.asarray(x0).reshape(-1)}
+            return fn, kwargs
+        if nonlinear is not None:
+            raise ValueError(f"fem.solve: nonlinear= given, but this problem is {self._mode} (no linearization).")
+        if self._mode == "complex" and x0 is not None:
+            raise NotImplementedError(
+                "fem.solve: x0= on a complex problem is not supported yet (the solve runs on the "
+                "real-equivalent block, an internal layout)."
+            )
+        if self._periodic is not None and x0 is not None:
+            # the solve runs in the periodic-reduced space; restrict the guess to match
+            from .utils.solver.fem_utils import restrict_state_periodic
+
+            x0 = restrict_state_periodic(self._periodic, jnp.asarray(x0).reshape(-1))
+        return compose_linear_solve_fn(linear, precond, x0, self), kwargs
 
     @property
     def points(self):

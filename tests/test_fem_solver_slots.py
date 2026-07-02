@@ -1,0 +1,236 @@
+"""The slot-based solver API: ``fem.solve(x0=, nonlinear=, linear=, precond=)`` composed from the
+callables-only ``jno.solve`` / ``jno.precond`` namespaces (see ``plans/fem-solver-api.md``).
+
+Pins: every shipped linear solver reproduces the historic default on a Poisson system (slot
+solvers receive the BCOO operator -- no densification); ``x0`` warm-starts (exact guess is a
+fixed point); the direct/Krylov contract (``LinearSolver`` rejects ``M`` on direct solvers);
+jit + vmap of the pure-JAX solvers at the contract level; slot composition on the nonlinear
+path (driver + injected inner linear solve) matches the Newton-Krylov default; the parametric
+(inverse) path stays differentiable through slot solvers; and the guard rails (slots xor
+``solve_fn``; transient unsupported; ``precond`` on the matrix-free nonlinear path unsupported).
+"""
+
+from __future__ import annotations
+
+import pytest
+
+pytest.importorskip("shapely", reason="shapely required for the box domain")
+
+import jax  # noqa: E402
+import jax.experimental.sparse as jsp  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
+import numpy as np  # noqa: E402
+from shapely.geometry import box  # noqa: E402
+
+import jno  # noqa: E402
+
+PI = np.pi
+
+
+@pytest.fixture(autouse=True)
+def _x64():
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
+
+def _poisson(mesh_size=0.2):
+    """Poisson with exact solution u = x(1-x)y(1-y); homogeneous Dirichlet."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = 2.0 * (xi * (1.0 - xi) + yi * (1.0 - yi))
+    return jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+
+
+def _nonlinear(mesh_size=0.25):
+    """Reaction-diffusion -lap u + u^3 = f with exact u = sin(pi x) sin(pi y)."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    ss = jno.np.sin(PI * xi) * jno.np.sin(PI * yi)
+    f = 2.0 * PI**2 * ss + ss**3
+    return jno.fem([ui.x * vi.x + ui.y * vi.y + ui**3 * vi - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+
+
+# ---------------------------------------------------------------------------
+# steady linear slots
+# ---------------------------------------------------------------------------
+
+
+def test_linear_slot_solvers_match_default():
+    fem = _poisson()
+    u_ref = np.asarray(fem.solve())
+    for solver, precond in [
+        (jno.solve.cg(), jno.precond.jacobi()),  # SPD system: CG applies
+        (jno.solve.bicgstab(), jno.precond.jacobi()),  # == the historic default, via slots
+        (jno.solve.gmres(), jno.precond.jacobi()),
+        (jno.solve.gmres(), None),
+        (jno.solve.lu(), None),
+        (jno.solve.dense(), None),
+    ]:
+        u = np.asarray(fem.solve(linear=solver, precond=precond))
+        assert np.abs(u - u_ref).max() < 1e-7, f"{solver.name} (precond={precond}) deviates from the default"
+
+
+def test_x0_warm_start():
+    fem = _poisson()
+    u_ref = jnp.asarray(fem.solve())
+    # the exact solution as warm start is a fixed point of a converged Krylov solve
+    u = fem.solve(linear=jno.solve.bicgstab(), precond=jno.precond.jacobi(), x0=u_ref)
+    assert np.abs(np.asarray(u - u_ref)).max() < 1e-12
+    # a pure warm start (all other slots defaulted) also solves
+    u2 = fem.solve(x0=jnp.zeros_like(u_ref))
+    assert np.abs(np.asarray(u2 - u_ref)).max() < 1e-7
+
+
+def test_user_written_slot_callables():
+    """The documented extension contract: bare callables drop into the slots."""
+    fem = _poisson()
+    u_ref = np.asarray(fem.solve())
+
+    def my_linear(A, b, *, M=None, x0=None):  # LinearOperator in, solution out
+        return jnp.linalg.solve(A.dense(), b)
+
+    def my_precond(ctx):  # ctx -> (v -> M^{-1} v)
+        inv = 1.0 / ctx.diag()
+        return lambda v: inv * v
+
+    assert np.abs(np.asarray(fem.solve(linear=my_linear)) - u_ref).max() < 1e-9
+    u = fem.solve(linear=jno.solve.cg(), precond=my_precond)
+    assert np.abs(np.asarray(u) - u_ref).max() < 1e-7
+
+
+# ---------------------------------------------------------------------------
+# contract level: LinearOperator / LinearSolver under jit + vmap
+# ---------------------------------------------------------------------------
+
+
+def _spd(n=24, seed=0):
+    rng = np.random.default_rng(seed)
+    Q = rng.standard_normal((n, n))
+    Ad = Q @ Q.T + n * np.eye(n)
+    return jsp.BCOO.fromdense(jnp.asarray(Ad)), Ad
+
+
+def test_solver_contract_jit_and_vmap():
+    A, Ad = _spd()
+    solver = jno.solve.cg(tol=1e-12)
+    op = jno.solve.LinearOperator(A)
+    b = jnp.asarray(np.random.default_rng(1).standard_normal(Ad.shape[0]))
+    x = jax.jit(lambda bb: solver(op, bb))(b)
+    assert np.allclose(np.asarray(x), np.linalg.solve(Ad, np.asarray(b)), atol=1e-8)
+    B = jnp.stack([b, 2.0 * b, b - 1.0])
+    X = jax.vmap(lambda bb: solver(op, bb))(B)  # shipped Krylov solvers are vmap-native
+    assert np.allclose(np.asarray(X), np.linalg.solve(Ad, np.asarray(B).T).T, atol=1e-8)
+
+
+def test_linear_operator_transpose_and_diag():
+    A, Ad = _spd(n=8, seed=2)
+    op = jno.solve.LinearOperator(A)
+    v = jnp.arange(8, dtype=jnp.float64)
+    assert np.allclose(np.asarray(op.T.mv(v)), Ad.T @ np.asarray(v))
+    assert np.allclose(np.asarray(op.diag()), np.diag(Ad))
+    mv_op = jno.solve.LinearOperator.from_matvec(lambda w: A @ w)
+    assert np.allclose(np.asarray(mv_op.T.mv(v)), Ad.T @ np.asarray(v))  # via jax.linear_transpose
+    with pytest.raises(TypeError):
+        mv_op.diag()
+
+
+# ---------------------------------------------------------------------------
+# nonlinear slots
+# ---------------------------------------------------------------------------
+
+
+def test_nonlinear_slots_match_default():
+    fem = _nonlinear()
+    u_ref = np.asarray(fem.solve())
+    u = np.asarray(fem.solve(nonlinear=jno.solve.newton()))
+    assert np.abs(u - u_ref).max() < 1e-8
+    # inner linear solve injected from the linear slot (adapted to the matrix-free contract)
+    u2 = np.asarray(fem.solve(nonlinear=jno.solve.newton(), linear=jno.solve.bicgstab(tol=1e-12)))
+    assert np.abs(u2 - u_ref).max() < 1e-7
+    # x0 is the Newton initial guess
+    u3 = np.asarray(fem.solve(nonlinear=jno.solve.newton(), x0=jnp.asarray(u_ref)))
+    assert np.abs(u3 - u_ref).max() < 1e-8
+
+
+# ---------------------------------------------------------------------------
+# parametric (inverse) path stays differentiable through slot solvers
+# ---------------------------------------------------------------------------
+
+
+def test_parametric_linear_differentiable_through_slots():
+    import optax
+
+    alpha = jno.np.parameter((1,), key=jax.random.PRNGKey(1), name="alpha")
+    alpha.initialize(jax.nn.initializers.constant(2.0))
+    alpha.dtype(jnp.float64)
+    alpha.optimizer(optax.adam(5e-2))
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = 2.0 * (xi * (1.0 - xi) + yi * (1.0 - yi))
+    fem = jno.fem([alpha * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+
+    u_obs = jnp.asarray(_poisson(mesh_size=0.25).solve())  # alpha_true = 1 data
+    node = fem.solve(linear=jno.solve.cg(tol=1e-12), precond=jno.precond.jacobi())
+    dummy = jno.domain.from_array({"_": np.zeros((1, 1))})
+    crux = jno.core([(node - u_obs).mse], domain=dummy)
+    crux.solve(120)
+    a = float(np.asarray(crux.eval([alpha])).reshape(-1)[0])
+    assert abs(a - 1.0) < 0.05, f"alpha not recovered through slot solvers: {a}"
+
+
+# ---------------------------------------------------------------------------
+# guard rails
+# ---------------------------------------------------------------------------
+
+
+def test_slots_and_solve_fn_are_exclusive():
+    fem = _poisson()
+    with pytest.raises(ValueError, match="not both"):
+        fem.solve(solve_fn=lambda A, b: b, linear=jno.solve.cg())
+
+
+def test_direct_solver_rejects_preconditioner():
+    fem = _poisson()
+    with pytest.raises(ValueError, match="direct solver"):
+        fem.solve(linear=jno.solve.lu(), precond=jno.precond.jacobi())
+
+
+def test_nonlinear_slot_on_linear_problem_raises():
+    fem = _poisson()
+    with pytest.raises(ValueError, match="no linearization"):
+        fem.solve(nonlinear=jno.solve.newton())
+
+
+def test_precond_on_matrix_free_nonlinear_raises():
+    fem = _nonlinear()
+    with pytest.raises(NotImplementedError, match="form-based"):
+        fem.solve(nonlinear=jno.solve.newton(), precond=jno.precond.jacobi())
+
+
+def test_transient_slots_raise():
+    from jno._fem import FEM
+
+    fem = FEM(None, None, [], mode="transient")
+    with pytest.raises(NotImplementedError, match="transient"):
+        fem.solve(linear=jno.solve.cg())
+
+
+def test_x0_u0_conflict_raises():
+    fem = _nonlinear()
+    z = jnp.zeros(4)
+    with pytest.raises(ValueError, match="same initial guess"):
+        fem.solve(x0=z, u0=z)

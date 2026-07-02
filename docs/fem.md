@@ -568,6 +568,47 @@ matrix-free BiCGStab as the iterative alternative; the nonlinear default is a ma
 Newton-Krylov, and the transient default backward-Euler over those. All are implicit-diff, so
 `crux.solve` recovers parameters through them. Bring your own `solve_fn` for anything else.
 
+### Choosing the solver — the slot API (`jno.solve` / `jno.precond`)
+
+Between "accept the default" and "write a full `solve_fn`" sits the **slot API**: the solver
+factorises into four orthogonal slots, each a configured **callable** (never a string) from the
+`jno.solve` / `jno.precond` namespaces — or your own with the same contract. Every `None` keeps
+today's default; `solve_fn=` stays the total override (passing both is an error).
+
+```python
+u = fem.solve(
+    x0        = u_guess,                 # warm start (previous solve, coarse solve, a surrogate…)
+    nonlinear = jno.solve.newton(),      # linearization driver (nonlinear problems)
+    linear    = jno.solve.gmres(),       # inner linear solve: lu / dense / cg / bicgstab / gmres
+    precond   = jno.precond.jacobi(),    # v -> M⁻¹v spec, materialized against the assembled A
+)
+```
+
+Everything shipped is **pure JAX** — `jit`- and `vmap`-native, differentiable (the Krylov
+wrappers sit on `lax.custom_linear_solve`, Newton on `lax.custom_root`) — and *reuses* existing
+implementations (`jax.scipy.sparse.linalg`, `sparse_lu_solve`) rather than duplicating them.
+Slot solvers receive the assembler's **BCOO** operator directly (no densification), and compose
+with the periodic reduction and every parametric/inverse path unchanged. Pick by structure:
+`cg` for SPD (Poisson, elasticity, mass), `bicgstab`/`gmres` for non-symmetric, `lu` for
+indefinite saddle systems (Stokes/Biot — note `lu` has no vmap batching rule; use a Krylov
+solver inside batched solves), `dense` for small systems.
+
+**User extension** is duck-typed — a linear solver is any
+`fn(A, b, *, M=None, x0=None) -> x` with `A` a `jno.solve.LinearOperator` (`.mv`, `.T`,
+`.diag()`, `.bcoo`, `.dense()`); a preconditioner is any `ctx -> (v -> M⁻¹v)`:
+
+```python
+def my_precond(ctx):                      # ctx.A, ctx.diag(), ctx.fem
+    inv = 1.0 / ctx.diag()
+    return lambda v: inv * v
+u = fem.solve(linear=jno.solve.cg(), precond=my_precond)
+```
+
+If your callable is pure JAX it inherits `jit`/`vmap`/AD automatically. Not yet supported (clear
+errors, see `plans/fem-solver-api.md` for the roadmap): slots on **transient** problems, `x0` on
+**complex** problems, and `precond=` on the matrix-free **nonlinear** path (form-based
+preconditioners are the planned route).
+
 ### Field parameters `k(x)` + regularization
 
 `jno.np.parameter(phi)` is a **nodal field** on the trial space — a trainable value per node.
