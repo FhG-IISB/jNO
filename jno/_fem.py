@@ -927,6 +927,37 @@ class FEM:
             return list(self._offsets)
         return getattr(self.problem, "offset", None)
 
+    @property
+    def blocks(self):
+        """Per-field DOF ``slice``s into the flat solution (``None`` without block structure).
+
+        The structural handle block preconditioners build on: ``jno.precond.block_diag`` /
+        ``triangular`` resolve their field arguments to these slices (see ``docs/fem.md``)."""
+        off = self.offsets
+        if off is None:
+            return None
+        return [slice(int(off[i]), int(off[i + 1])) for i in range(len(off) - 1)]
+
+    def block_index(self, field) -> int:
+        """Resolve a trial symbol (or plain index) to its position in :attr:`blocks` /
+        :attr:`offsets` — the field order is first appearance in the ``jno.fem`` constraints."""
+        if isinstance(field, int):
+            return field
+        # the native assembler records the keys in assembly (= offsets) order — snapshotted onto
+        # this FEM at finalize time (the domain attribute is overwritten by any later assembly on
+        # the same domain, e.g. an auxiliary jno.precond.form); the constraint-walk order is only
+        # a fallback for paths that don't set it
+        keys = getattr(self, "_block_field_keys", None) or getattr(self, "_trial_field_keys", None)
+        fk = getattr(field, "field_key", None)
+        if keys is None or fk is None:
+            raise TypeError(
+                "FEM.block_index: cannot resolve this object to a field block — pass the trial "
+                "symbol from d.fem_symbols() (or the integer block index)."
+            )
+        if fk not in keys:
+            raise KeyError(f"FEM.block_index: trial field {getattr(field, 'name', fk)!r} is not part of this system.")
+        return keys.index(fk)
+
     def solve(self, solve_fn=None, *, adapt=None, x0=None, nonlinear=None, linear=None, precond=None, **kwargs) -> Any:
         """Differentiable forward solve as a trace node — the inverse-problem entry.
 
@@ -1949,6 +1980,11 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         fem_obj._term_source = (domain, volume_terms)
         fem_obj._constraints = _orig_constraints
         fem_obj._fem_kwargs = _orig_fem_kwargs
+        # Field-key snapshots for FEM.block_index: the assembler's list is offsets-ordered (and
+        # must be captured NOW — a later assembly on the same domain overwrites the attribute);
+        # the constraint-walk order is the fallback for paths that don't run the native assembler.
+        fem_obj._block_field_keys = list(getattr(domain, "_fem_native_field_keys", None) or ())
+        fem_obj._trial_field_keys = _field_keys(_orig_constraints)
         if couplings:
             # Fold the coupling into the residual FIRST -- a steady local form is promoted to a nonlinear
             # FemResidualOperator. The periodic reduction below then wraps the *coupled* residual through

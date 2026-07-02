@@ -57,26 +57,51 @@ class LinearOperator:
             raise TypeError("Wrap a bare matvec with LinearOperator.from_matvec(fn).")
         self._A = A
         self._mv = None
+        self._t_mv = None
+        self._diag_fn = None
+        self._dense_fn = None
+        self._shape = None
         self._transposed = _transposed
 
     @classmethod
-    def from_matvec(cls, mv: Callable, *, _transposed: bool = False) -> "LinearOperator":
+    def from_matvec(
+        cls,
+        mv: Callable,
+        *,
+        t_mv: Optional[Callable] = None,
+        diag_fn: Optional[Callable] = None,
+        dense_fn: Optional[Callable] = None,
+        shape: Optional[tuple] = None,
+        _transposed: bool = False,
+    ) -> "LinearOperator":
+        """Wrap a bare matvec. Optional hooks upgrade it: ``t_mv`` (transposed matvec — else
+        derived exactly via ``jax.linear_transpose``), ``diag_fn``/``dense_fn`` (else those
+        accessors raise), ``shape`` (else ``None``)."""
         op = cls.__new__(cls)
         op._A = None
         op._mv = mv
+        op._t_mv = t_mv
+        op._diag_fn = diag_fn
+        op._dense_fn = dense_fn
+        op._shape = shape
         op._transposed = _transposed
         return op
 
     @property
     def shape(self):
         if self._A is None:
+            s = self._shape
+        else:
+            s = self._A.shape
+        if s is None:
             return None
-        s = self._A.shape
-        return (s[1], s[0]) if self._transposed else s
+        return (s[1], s[0]) if self._transposed else tuple(s)
 
     def mv(self, v):
         if self._mv is not None:
             if self._transposed:
+                if self._t_mv is not None:
+                    return self._t_mv(v)
                 # transpose of a linear map, via JAX's transposition (exact, not an approximation)
                 (out,) = jax.linear_transpose(self._mv, jnp.zeros_like(v))(v)
                 return out
@@ -90,16 +115,29 @@ class LinearOperator:
     @property
     def T(self) -> "LinearOperator":
         if self._mv is not None:
-            return LinearOperator.from_matvec(self._mv, _transposed=not self._transposed)
+            op = LinearOperator.from_matvec(
+                self._mv,
+                t_mv=self._t_mv,
+                diag_fn=self._diag_fn,
+                dense_fn=self._dense_fn,
+                shape=self._shape,
+                _transposed=not self._transposed,
+            )
+            return op
         return LinearOperator(self._A, _transposed=not self._transposed)
 
     def diag(self):
         if self._A is None:
+            if self._diag_fn is not None:
+                return self._diag_fn()  # a (square) block's diagonal is transpose-invariant
             raise TypeError("LinearOperator.diag(): a matvec-only operator has no assembled diagonal.")
         return matrix_diagonal(self._A)  # transpose shares the diagonal
 
     def dense(self):
         if self._A is None:
+            if self._dense_fn is not None:
+                M = self._dense_fn()
+                return M.T if self._transposed else M
             raise TypeError("LinearOperator.dense(): a matvec-only operator cannot densify.")
         M = self._A.todense() if hasattr(self._A, "todense") else jnp.asarray(self._A)
         return M.T if self._transposed else M
@@ -173,8 +211,16 @@ class PrecondContext:
 
     ``ctx.A`` is the assembled :class:`LinearOperator` (matvec-only on the Jacobian-free
     nonlinear path), ``ctx.fem`` the owning :class:`jno.FEM` (``None`` outside ``fem.solve``),
-    and ``ctx.diag()`` the operator diagonal. Block extraction and auxiliary weak-form assembly
-    arrive with the block-preconditioner phase (see ``plans/fem-solver-api.md``).
+    ``ctx.diag()`` the operator diagonal. For multifield systems ``ctx.blocks`` are the
+    per-field DOF slices (from ``fem.offsets``), ``ctx.block_slice(field)`` resolves a trial
+    symbol (or integer index) to its slice, and ``ctx.sub(i, j=None)`` is the ``(i, j)``
+    sub-operator as a :class:`LinearOperator` — applied through the *full* operator's matvec
+    (embed into block ``j``, extract block ``i``), so it stays sparse/matrix-free; ``diag`` and
+    ``dense`` are exact views for ``i == j`` direct/diagonal inner solvers.
+
+    ``ctx.assemble(terms, quad_degree=...)`` assembles an **auxiliary weak form** with the
+    ordinary ``jno.fem`` machinery and returns its operator — the "preconditioners are weak
+    forms" primitive (weighted mass matrices, low-order proxies, shifted operators).
     """
 
     def __init__(self, A: LinearOperator, fem: Any = None):
@@ -183,6 +229,52 @@ class PrecondContext:
 
     def diag(self):
         return self.A.diag()
+
+    @property
+    def blocks(self):
+        blocks = getattr(self.fem, "blocks", None)
+        if blocks is None:
+            raise TypeError("PrecondContext.blocks: no per-field block structure (single field, or no FEM attached).")
+        return blocks
+
+    def block_slice(self, field) -> slice:
+        if isinstance(field, int):  # plain block index
+            return self.blocks[field]
+        if self.fem is None:
+            raise TypeError("PrecondContext.block_slice: resolving a trial symbol needs the owning FEM.")
+        return self.blocks[self.fem.block_index(field)]
+
+    def sub(self, i, j=None) -> LinearOperator:
+        si = self.block_slice(i)
+        sj = si if j is None else self.block_slice(j)
+        A = self.A
+        n = A.shape[0]
+
+        def _embed(v, s):
+            return jnp.zeros((n,), v.dtype).at[s].set(v)
+
+        mv = lambda v: A.mv(_embed(v, sj))[si]
+        t_mv = lambda v: A.T.mv(_embed(v, si))[sj]
+        diag_fn = (lambda: A.diag()[si]) if sj == si else None
+        dense_fn = lambda: A.dense()[si, sj]
+        ni = si.stop - si.start
+        nj = sj.stop - sj.start
+        return LinearOperator.from_matvec(mv, t_mv=t_mv, diag_fn=diag_fn, dense_fn=dense_fn, shape=(ni, nj))
+
+    def assemble(self, terms, *, quad_degree: int = 2) -> LinearOperator:
+        from ... import fem as _fem_entry
+
+        aux = _fem_entry(list(terms), quad_degree=quad_degree)
+        if not aux.is_linear or aux.is_transient or aux.is_complex:
+            raise ValueError("PrecondContext.assemble: the auxiliary preconditioner form must be steady linear.")
+        A = aux.A
+        if not hasattr(A, "todense"):
+            # small systems may assemble dense; convert NOW (concrete) so a sparse-direct inner
+            # solver stays jit-safe when the applier later runs inside a traced Krylov loop
+            import jax.experimental.sparse as jsp
+
+            A = jsp.BCOO.fromdense(jnp.asarray(A))
+        return LinearOperator(A)
 
 
 def materialize_precond(spec: Any, ctx: PrecondContext) -> Callable:

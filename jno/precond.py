@@ -16,8 +16,10 @@ with differentiable solves. A user spec is any object with ``materialize(ctx)`` 
 
     fem.solve(linear=jno.solve.cg(), precond=my_precond)
 
-Block/Schur composition and form-based (auxiliary weak-form) specs are the next phase -- see
-``plans/fem-solver-api.md``.
+Composition: :func:`block_diag` / :func:`triangular` build block preconditioners over the
+per-field DOF blocks (``fem.blocks``); :func:`form` assembles auxiliary weak-form operators
+("preconditioners as weak forms"); :func:`inner` turns any ``jno.solve`` solver into an
+(inexact) ``M^{-1}`` application.
 """
 
 from __future__ import annotations
@@ -26,7 +28,7 @@ import jax.numpy as jnp
 
 from .utils.solver.solver_api import PrecondContext  # noqa: F401  (re-export for user specs)
 
-__all__ = ["PrecondContext", "jacobi", "chebyshev"]
+__all__ = ["PrecondContext", "jacobi", "chebyshev", "form", "inner", "block_diag", "triangular"]
 
 
 class _Jacobi:
@@ -76,12 +78,183 @@ def jacobi() -> _Jacobi:
     ``vmap``-native, effective on diagonally-dominant (elliptic) systems -- heat, diffusion,
     elasticity. Zero/near-zero diagonals (e.g. the pressure block of a saddle-point system) are
     left unscaled so it never produces ``inf``/``NaN`` -- but it does not *rescue* saddle
-    systems; use ``jno.solve.lu()`` there (block/Schur specs are planned).
+    systems; use ``jno.solve.lu()`` or a :func:`triangular` block/Schur spec there.
 
     ``fem.solve(linear=jno.solve.bicgstab(), precond=jno.precond.jacobi())`` reproduces the
     historic steady-linear default exactly.
     """
     return _Jacobi()
+
+
+class _Form:
+    """Spec assembling an auxiliary weak form as the preconditioner operator; see :func:`form`."""
+
+    def __init__(self, terms, inner_solver, quad_degree):
+        self.terms = list(terms)
+        self.inner = inner_solver
+        self.quad_degree = quad_degree
+        self._op = None  # assembled once; the auxiliary operator is parameter-independent
+
+    def materialize(self, ctx: PrecondContext):
+        if self._op is None:
+            self._op = ctx.assemble(self.terms, quad_degree=self.quad_degree)
+        op = self._op
+        if self.inner is None:
+            from . import solve as _s
+
+            self.inner = _s.lu()
+        solver = self.inner
+        return lambda v: solver(op, v)
+
+    def __repr__(self):
+        return f"jno.precond.form(<{len(self.terms)} terms>, inner={self.inner})"
+
+
+def form(terms, *, inner=None, quad_degree: int = 2) -> _Form:
+    """**Preconditioners as weak forms**: assemble an auxiliary operator ``Â`` from ordinary
+    traced ``jno.fem`` terms and apply ``M^{-1} v = Â^{-1} v`` with ``inner`` (default
+    ``jno.solve.lu()``).
+
+    This is how the classical physics-based preconditioners are written declaratively — in the
+    *same language as the PDE*:
+
+    * a (weighted) **mass matrix** — e.g. the pressure Schur-complement approximation of a
+      Stokes-type saddle system: ``jno.precond.form([w * pi * qi], inner=jno.solve.cg(...))``;
+    * a **local proxy of a nonlocal operator** — assemble only the conduction terms to
+      precondition a conduction+radiation system (the dense view-factor coupling stays in the
+      outer matvec);
+    * a **shifted/damped twin** of an indefinite operator (shifted-Laplacian Helmholtz);
+    * a **low-order proxy** preconditioning a high-order discretisation.
+
+    The auxiliary system is assembled once with the ordinary ``jno.fem`` machinery (cached on
+    the spec — it is parameter-independent) and must be steady linear. Its size must match the
+    (sub-)operator this spec preconditions: a form over one field's symbols preconditions that
+    field's diagonal block inside :func:`block_diag`/:func:`triangular`; a form over all fields
+    preconditions the full system. With an *iterative* ``inner``, drive the outer solve with
+    ``jno.solve.fgmres()`` (flexible preconditioning).
+    """
+    return _Form(terms, inner, quad_degree)
+
+
+class _InnerSolve:
+    """Spec using a configured linear solver as the ``M^{-1}`` application; see :func:`inner`."""
+
+    def __init__(self, solver):
+        self.solver = solver
+
+    def materialize(self, ctx: PrecondContext):
+        solver, op = self.solver, ctx.A
+        return lambda v: solver(op, v)
+
+    def __repr__(self):
+        return f"jno.precond.inner({self.solver})"
+
+
+def inner(solver) -> _InnerSolve:
+    """Use a ``jno.solve`` linear solver as the preconditioner application ``M^{-1} v ≈ A^{-1} v``
+    on whatever operator it is materialized against — the natural way to give a diagonal block of
+    :func:`block_diag`/:func:`triangular` an (inexact) block solve, e.g.
+    ``jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=50))``. With an iterative solver here the
+    outer Krylov must be flexible: ``jno.solve.fgmres()``."""
+    return _InnerSolve(solver)
+
+
+def _pairs_to_appliers(pairs, ctx: PrecondContext):
+    """Resolve ``(field, spec)`` pairs → offsets-ordered ``(slice, applier)`` per diagonal block."""
+    from .utils.solver.solver_api import materialize_precond
+
+    if ctx.fem is None:
+        raise TypeError("Block preconditioners need the owning FEM (use them via fem.solve(precond=...)).")
+    resolved = {}
+    for field, spec in pairs:
+        idx = ctx.fem.block_index(field)
+        if idx in resolved:
+            raise ValueError(f"Block preconditioner: field block {idx} specified twice.")
+        resolved[idx] = spec
+    blocks = ctx.blocks
+    if sorted(resolved) != list(range(len(blocks))):
+        raise ValueError(
+            f"Block preconditioner: got specs for blocks {sorted(resolved)} but the system has "
+            f"{len(blocks)} field blocks — every field needs exactly one (field, spec) pair."
+        )
+    appliers = []
+    for idx in range(len(blocks)):
+        sub_ctx = PrecondContext(ctx.sub(idx), ctx.fem)
+        appliers.append((blocks[idx], materialize_precond(resolved[idx], sub_ctx)))
+    return appliers
+
+
+class _BlockDiag:
+    def __init__(self, pairs):
+        self.pairs = pairs
+
+    def materialize(self, ctx: PrecondContext):
+        appliers = _pairs_to_appliers(self.pairs, ctx)
+
+        def apply(v):
+            out = jnp.zeros_like(v)
+            for s, M in appliers:
+                out = out.at[s].set(M(v[s]))
+            return out
+
+        return apply
+
+    def __repr__(self):
+        return f"jno.precond.block_diag(<{len(self.pairs)} blocks>)"
+
+
+class _Triangular:
+    def __init__(self, pairs):
+        self.pairs = pairs
+
+    def materialize(self, ctx: PrecondContext):
+        appliers = _pairs_to_appliers(self.pairs, ctx)
+        k = len(appliers)
+        subs = {(i, j): ctx.sub(i, j) for i in range(k) for j in range(i + 1, k)}
+
+        def apply(v):
+            # block backward substitution: y_i = M_i^{-1} (v_i - sum_{j>i} A_ij y_j)
+            ys = [None] * k
+            for i in reversed(range(k)):
+                s, M = appliers[i]
+                r = v[s]
+                for j in range(i + 1, k):
+                    r = r - subs[(i, j)].mv(ys[j])
+                ys[i] = M(r)
+            out = jnp.zeros_like(v)
+            for (s, _), y in zip(appliers, ys):
+                out = out.at[s].set(y)
+            return out
+
+        return apply
+
+    def __repr__(self):
+        return f"jno.precond.triangular(<{len(self.pairs)} blocks>)"
+
+
+def block_diag(*pairs) -> _BlockDiag:
+    """Block-**diagonal** preconditioner over the per-field DOF blocks: each ``(field, spec)``
+    pair materializes ``spec`` against that field's diagonal sub-operator (``field`` is the
+    trial symbol from ``d.fem_symbols()``, or the integer block index). Cheaper per application
+    than :func:`triangular` but ignores the coupling blocks — prefer :func:`triangular` for
+    saddle systems."""
+    return _BlockDiag(list(pairs))
+
+
+def triangular(*pairs) -> _Triangular:
+    """Block **upper-triangular** preconditioner ``P = [[Â_1, A_12, …], [0, Â_2, …], …]`` over
+    the per-field blocks — the standard shape for saddle-point systems (Stokes / Taylor–Hood,
+    mixed Poisson, Biot): the last-listed block is solved first, then substituted back through
+    the *actual* off-diagonal coupling matvecs of the assembled operator.
+
+    Each ``(field, spec)`` pair supplies the approximate **diagonal-block inverse** ``Â_i^{-1}``:
+    e.g. ``jno.precond.inner(jno.solve.cg(tol=1e-2))`` (inexact block solve),
+    ``jno.precond.chebyshev(...)`` (polynomial), or ``jno.precond.form([...])`` (auxiliary
+    operator — for Stokes the classic pressure choice is the viscosity-weighted **mass matrix**
+    ``form([(1/mu) * pi * qi])`` as the Schur-complement approximation; Elman, Silvester & Wathen,
+    *Finite Elements and Fast Iterative Solvers*, 2nd ed., OUP 2014, §9.2). With inexact
+    (iterative) block solves the outer Krylov must be flexible: ``jno.solve.fgmres()``."""
+    return _Triangular(list(pairs))
 
 
 def chebyshev(

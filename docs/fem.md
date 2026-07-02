@@ -600,10 +600,38 @@ with the periodic reduction and every parametric/inverse path unchanged. Pick by
 | indefinite, single solve | `lu` | sparse-direct; **no vmap rule** — use a Krylov solver inside batched solves |
 | small systems / coarse blocks | `dense` | LAPACK, vmap-native |
 
-Preconditioner specs so far: `jno.precond.jacobi()` (diagonal) and `jno.precond.chebyshev(degree=…)`
-— a fixed-degree Chebyshev **polynomial** preconditioner (same references as the solver): matvecs
-and AXPYs only, the GPU-era substitute for Gauss-Seidel/ILU smoothing, and a fixed *linear* map so
-it legally preconditions `cg`/`minres`.
+**Preconditioner specs** (declarative — materialized against the assembled operator at solve
+time; a preconditioner never changes the converged solution, only the speed, so specs need no
+gradient path):
+
+* `jno.precond.jacobi()` — diagonal.
+* `jno.precond.chebyshev(degree=…)` — fixed-degree Chebyshev **polynomial** preconditioner
+  (same references as the solver): matvecs and AXPYs only, the GPU-era substitute for
+  Gauss-Seidel/ILU smoothing, and a fixed *linear* map so it legally preconditions `cg`/`minres`.
+* `jno.precond.inner(solver)` — any `jno.solve` solver as the `M⁻¹` application (an inexact
+  block/system solve). Iterative inner ⇒ flexible outer (`fgmres`).
+* `jno.precond.form([...terms], inner=…)` — **preconditioners as weak forms**: assemble an
+  auxiliary operator from ordinary traced terms and invert it as `M⁻¹`. Weighted mass matrices,
+  local proxies of nonlocal (radiation) operators, shifted-Laplacian Helmholtz twins, low-order
+  proxies — written in the same language as the PDE.
+* `jno.precond.block_diag((field, spec), …)` / `jno.precond.triangular((field, spec), …)` —
+  per-field composition over `fem.blocks` (fields are the trial symbols; `fem.block_index`
+  resolves them, offsets-ordered). `triangular` is the standard saddle-point shape: last block
+  solved first, substituted back through the assembled off-diagonal matvecs.
+
+The flagship pattern — Taylor–Hood **Stokes** by FGMRES with an inexact velocity block solve and
+the viscosity-weighted pressure-mass Schur approximation (Elman, Silvester & Wathen, *Finite
+Elements and Fast Iterative Solvers*, 2nd ed., 2014, §9.2) — no densification anywhere:
+
+```python
+sol = fem.solve(
+    linear  = jno.solve.fgmres(tol=1e-10, restart=40),
+    precond = jno.precond.triangular(
+        (u, jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=60))),   # Â⁻¹: inexact CG
+        (p, jno.precond.form([(1.0/mu) * pp * qq], inner=jno.solve.dense())),  # Ŝ ≈ μ⁻¹ M_p
+    ),
+)
+```
 
 **User extension** is duck-typed — a linear solver is any
 `fn(A, b, *, M=None, x0=None) -> x` with `A` a `jno.solve.LinearOperator` (`.mv`, `.T`,

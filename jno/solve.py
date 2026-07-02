@@ -56,8 +56,11 @@ def lu() -> LinearSolver:
     def _fn(op: LinearOperator, b, *, M, x0):
         from .utils.solver.linear import sparse_lu_solve
 
-        A = op.bcoo if op.bcoo is not None else op.dense()
-        return sparse_lu_solve(A, b)
+        if op.bcoo is not None:
+            return sparse_lu_solve(op.bcoo, b)
+        # a dense operator gets the dense direct solve — BCOO.fromdense would need a concrete
+        # nse, which does not exist under jit/vmap tracing
+        return jnp.linalg.solve(op.dense(), b)
 
     return LinearSolver(_fn, name="lu", direct=True, traits={"vmap": "no"})
 
