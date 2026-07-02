@@ -438,7 +438,7 @@ class TestIntegrationMMS2D:
 
             ∮_∂obstacle F·n dS = ∫_obstacle ∇·F dV = 2 · (0.4 · 0.3) = 0.24
 
-        Sign convention: ``dom.variable("boundary_obstacle", normals=True)``
+        Sign convention: ``dom.variable("boundary_obstacle", normals=True, split=True)``
         returns the normal that points *outward from the fluid domain* —
         which is *inward to the obstacle*. The boundary integral with that
         normal therefore comes out **negative**, magnitude ≈ 0.24.
@@ -448,7 +448,7 @@ class TestIntegrationMMS2D:
         error on a coarse rectangular boundary.
         """
         dom = _build_chamber_with_obstacle(mesh_size=0.03)
-        x_b, y_b, _, nx, ny = dom.variable("boundary_obstacle", normals=True)
+        x_b, y_b, _, nx, ny = dom.variable("boundary_obstacle", normals=True, split=True)
 
         # Perimeter is exact (constant integrand on `nodal_ds`).
         perimeter = float(_eval((x_b * 0.0 + 1.0).integrate(), dom))
@@ -467,7 +467,7 @@ class TestIntegrationMMS2D:
         ≈ 6.6% rel err at h=0.04; tolerance 8% gives ~1.2× headroom.
         """
         dom = _build_lshape(mesh_size=0.04)
-        x_b, y_b, _, nx, ny = dom.variable("boundary", normals=True)
+        x_b, y_b, _, nx, ny = dom.variable("boundary", normals=True, split=True)
         flux = float(_eval((x_b * nx + y_b * ny).integrate(), dom))
         assert flux == pytest.approx(6.0, rel=0.08), f"L-shape ∮F·n dS = {flux:.4f}"
 
@@ -508,7 +508,7 @@ class TestGreensFirstIdentity:
         lhs = float(_eval(green_integrand.integrate(), dom))
 
         # Surface side: ∮ u (∇v·n) dS = ∮ u (y nₓ + x nᵧ) dS
-        x_b, y_b, _, nx, ny = dom.variable("boundary", normals=True)
+        x_b, y_b, _, nx, ny = dom.variable("boundary", normals=True, split=True)
         u_b = x_b**2 + y_b**2
         # ∇v on the boundary points: (y, x) evaluated at (x_b, y_b)
         grad_v_dot_n = y_b * nx + x_b * ny
@@ -563,7 +563,7 @@ class TestGreensSecondIdentity:
         lhs = float(_eval(volume_integrand.integrate(), dom))
 
         # Surface side: ∮ (u·(∇v·n) − v·(∇u·n)) dS
-        x_b, y_b, _, nx, ny = dom.variable("boundary", normals=True)
+        x_b, y_b, _, nx, ny = dom.variable("boundary", normals=True, split=True)
         u_b = x_b**2 + y_b**2
         v_b = x_b**3 + y_b**3
         # ∇u·n = 2x·nx + 2y·ny;  ∇v·n = 3x²·nx + 3y²·ny
@@ -596,7 +596,7 @@ class TestDivergenceTheorem3D:
     def test_unit_cube_flux_equals_three_volume(self):
         dom = _build_cube_3d(mesh_size=0.10)
         # Boundary integral of F·n on the cube's surface.
-        x_b, y_b, z_b, _, nx, ny, nz = dom.variable("boundary", normals=True)
+        x_b, y_b, z_b, _, nx, ny, nz = dom.variable("boundary", normals=True, split=True)
         flux = float(_eval((x_b * nx + y_b * ny + z_b * nz).integrate(), dom))
         # Volume = 1 → analytic flux = 3. Observed rel err ≈ 6.8% at h=0.10
         # on the unstructured tetrahedral mesh; threshold 10% gives ~1.5×
@@ -636,7 +636,7 @@ class TestDivergenceTheorem3D:
         Total = 2/3 + 2/3 + 0 + 1 = **7/3**.
         """
         dom = _build_cube_3d(mesh_size=0.10)
-        x_b, _y_b, _z_b, _t, _nx, _ny, _nz = dom.variable("boundary", normals=True)
+        x_b, _y_b, _z_b, _t, _nx, _ny, _nz = dom.variable("boundary", normals=True, split=True)
         result = float(_eval((x_b * x_b).integrate(), dom))
         # 3-D boundary quadrature on unstructured tet meshes is noisier
         # than volume quadrature; threshold 10% matches the existing

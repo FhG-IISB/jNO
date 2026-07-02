@@ -128,7 +128,7 @@ class TestJitCompatibleIntegrals:
 
     def test_2d_boundary_integrals_and_divergence_theorem_under_jit(self, dom_2d):
         """∫_∂Ω 1 ds = 4 (perimeter), ∫_∂Ω x·nₓ + y·nᵧ ds = 2 (div thm), both JIT."""
-        x_b, y_b, _, nx, ny = dom_2d.variable("boundary", normals=True)
+        x_b, y_b, _, nx, ny = dom_2d.variable("boundary", normals=True, split=True)
         perimeter_expr = (x_b * 0.0 + 1.0).integrate()
         flux_expr = (x_b * nx + y_b * ny).integrate()
 
@@ -484,13 +484,13 @@ class TestFluxIntegral:
 
     def test_constant_flux_net_zero(self, dom):
         """F = (1, 0): net flux through closed boundary = 0."""
-        x_b, y_b, _, nx, ny = dom.variable("boundary", normals=True)
+        x_b, y_b, _, nx, ny = dom.variable("boundary", normals=True, split=True)
         result = float(_eval_integral_expr(nx.integrate(), dom))
         assert abs(result) < 0.1
 
     def test_linear_flux_divergence_theorem(self, dom):
         """F = (x, y): ∫_∂Ω F·n ds = ∫_Ω ∇·F dV = 2 × area = 2."""
-        x_b, y_b, _, nx, ny = dom.variable("boundary", normals=True)
+        x_b, y_b, _, nx, ny = dom.variable("boundary", normals=True, split=True)
         expr = (x_b * nx + y_b * ny).integrate()
         result = float(_eval_integral_expr(expr, dom))
         assert abs(result - 2.0) < 0.15

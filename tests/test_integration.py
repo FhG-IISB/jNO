@@ -1054,7 +1054,7 @@ class TestIntegralTimeIntegration:
 # normals=True — boundary normal Variables for flux integrals
 # ======================================================================
 class TestBoundaryNormal:
-    """Tests for domain.variable(normals=True) and boundary flux integrals."""
+    """Tests for domain.variable(normals=True, split=True) and boundary flux integrals."""
 
     def _make_2d_domain(self):
         import jno
@@ -1067,23 +1067,34 @@ class TestBoundaryNormal:
         return jno.domain.line(mesh_size=0.01)
 
     def test_normals_true_2d_returns_extra_vars(self):
-        """2-D mesh: variable(normals=True) returns 5 Variables (x, y, t, nx, ny)."""
+        """2-D mesh: variable(normals=True, split=True) returns 5 Variables (x, y, t, nx, ny)."""
         dom = self._make_2d_domain()
-        result = dom.variable("boundary", normals=True)
+        result = dom.variable("boundary", normals=True, split=True)
         assert len(result) == 5  # x, y, t, nx, ny
 
     def test_normals_true_1d_returns_extra_var(self):
-        """1-D mesh: variable(normals=True) returns 3 Variables (x, t, n)."""
+        """1-D mesh: variable(normals=True, split=True) returns 3 Variables (x, t, n)."""
         dom = self._make_1d_domain()
-        result = dom.variable("right", normals=True)
+        result = dom.variable("right", normals=True, split=True)
         assert len(result) == 3  # x, t, n
+
+    def test_normals_split_false_returns_single_vector(self):
+        """The default (split=False) with normals=True returns the boundary normal as a **single vector**
+        Variable (not the flat tuple) — so it drops straight into vector ops like ``u.vector.cross(nvec)``."""
+        from jno.trace import Variable
+
+        dom = self._make_2d_domain()
+        nvec = dom.variable("boundary", normals=True)  # split=False is the default
+        assert isinstance(nvec, Variable)  # one vector, not a tuple
+        assert nvec.dim == [0, 2]  # spans the 2 normal components (nx, ny)
+        assert dom.variable("boundary", normals=True, split=False) is not None
 
     def test_normal_sign_right_is_positive(self):
         """The outward normal at the right boundary (x=1) is +1."""
         import jno
 
         dom = self._make_1d_domain()
-        x, _, n = dom.variable("right", normals=True)
+        x, _, n = dom.variable("right", normals=True, split=True)
         flux = n.integrate()
         (val,) = jno.core([]).eval([flux], domain=dom)
         assert float(val) > 0, f"Right normal should be positive, got {float(val):.4f}"
@@ -1093,7 +1104,7 @@ class TestBoundaryNormal:
         import jno
 
         dom = self._make_1d_domain()
-        x, _, n = dom.variable("left", normals=True)
+        x, _, n = dom.variable("left", normals=True, split=True)
         flux = n.integrate()
         (val,) = jno.core([]).eval([flux], domain=dom)
         assert float(val) < 0, f"Left normal should be negative, got {float(val):.4f}"
@@ -1103,8 +1114,8 @@ class TestBoundaryNormal:
         import jno
 
         dom = self._make_1d_domain()
-        _, _, nr = dom.variable("right", normals=True)
-        _, _, nl = dom.variable("left", normals=True)
+        _, _, nr = dom.variable("right", normals=True, split=True)
+        _, _, nl = dom.variable("left", normals=True, split=True)
         (vr,) = jno.core([]).eval([nr.integrate()], domain=dom)
         (vl,) = jno.core([]).eval([nl.integrate()], domain=dom)
         assert float(vr) > 0 and float(vl) < 0
@@ -1118,7 +1129,7 @@ class TestBoundaryNormal:
 
         dom = self._make_2d_domain()
         x, y, _ = dom.variable("interior")
-        x_b, y_b, _, nx, ny = dom.variable("boundary", normals=True)
+        x_b, y_b, _, nx, ny = dom.variable("boundary", normals=True, split=True)
 
         u_int = jno.np.sin(jno.np.pi * x) * jno.np.sin(jno.np.pi * y)
         u_bnd = jno.np.sin(jno.np.pi * x_b) * jno.np.sin(jno.np.pi * y_b)
@@ -1138,7 +1149,7 @@ class TestBoundaryNormal:
         """normals=True on a non-boundary tag should raise ValueError, not IndexError."""
         dom = self._make_2d_domain()
         with pytest.raises(ValueError, match="no outward normals found for tag 'interior'"):
-            dom.variable("interior", normals=True)
+            dom.variable("interior", normals=True, split=True)
 
 
 # ───────────────────────────────────────────────────────────────────────────────

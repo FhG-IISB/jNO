@@ -159,8 +159,8 @@ def _driven_pec_l2_error(mesh_size):
     sx, sy, sz, cx, cy, cz = sin(pi * xi), sin(pi * yi), sin(pi * zi), cos(pi * xi), cos(pi * yi), cos(pi * zi)
     Estar = vec(sy * sz, sx * sz, sx * sy)
     curlE = vec(pi * sx * (cy - cz), pi * sy * (cz - cx), pi * sz * (cx - cy))  # curl E*
-    nb = d.variable("boundary", normals=True, split=True)
-    pec = u.vector.cross(vec(nb[4], nb[5], nb[6]))  # n×E = 0 on the whole boundary
+    nvec = d.variable("boundary", normals=True)  # split=False (default): the normal as a single vector
+    pec = u.vector.cross(nvec)  # n×E = 0 on the whole boundary
     driven = [inner(cu, cv) + inner(ui, vi) - inner(curlE, cv) - inner(Estar, vi), pec]
     solve = lambda A, b: np.linalg.solve(_dense(A), np.asarray(jnp.asarray(b)).reshape(-1))  # noqa: E731
     M = _dense(jno.fem([inner(ui, vi)]).A)

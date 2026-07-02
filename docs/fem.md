@@ -118,7 +118,8 @@ no term.
 > N1E is wired** — RT / P0 / Hermite / Argyris / Morley remain 2-D-triangle only and raise.
 >
 > The essential **PEC wall** `n×E = 0` (homogeneous tangential trace) is supported, written
-> `u.vector.cross(nvec)` with `nvec = jno.np.vector(*d.variable(region, normals=True, split=True)[-3:])` — it
+> `u.vector.cross(d.variable(region, normals=True))` — `variable(region, normals=True)` returns the boundary
+> normal as a single vector (its default `split=False`; pass `split=True` for the flat component tuple). It
 > pins every boundary-face edge DOF of the region (facet-based; the 2-D "edge used once" rule is wrong on a
 > tet, where most boundary edges are shared by several tets). Validated by a driven manufactured Maxwell
 > problem that converges under refinement. An *inhomogeneous* `n×E = g` and the cavity-eigenvalue benchmark
