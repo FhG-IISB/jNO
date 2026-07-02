@@ -154,7 +154,7 @@ The `jno.domain` class manages mesh generation, physical group labelling, and sa
         [[0,0],[2,0],[2,1],[1,1],[1,2],[0,2]]
     ).build_mesh(0.07)
     x, y = dom.variable("interior")
-    xb, yb, nx, ny = dom.variable("boundary", normals=True)
+    xb, yb, nx, ny = dom.variable("boundary", normals=True, split=True)
     ```
 
 === "13 · 3-D Torus"
@@ -296,7 +296,7 @@ geo = box(0, 0, 2, 1).difference(Point(1, 0.5).buffer(0.3))
 dom = jno.domain(geo).mesh(0.05)
 
 x, y   = dom.variable("interior")
-xb, yb, nx, ny = dom.variable("boundary", normals=True)
+xb, yb, nx, ny = dom.variable("boundary", normals=True, split=True)
 ```
 
 For a simple polygon, pass a vertex list directly — no shapely import needed:
@@ -509,7 +509,7 @@ x, y, t = domain.variable("interior")
 x, y = domain.variable("interior", (None, None))
 
 # With boundary normals (outward unit normals at each boundary point)
-xb, yb, tb, nx, ny = domain.variable("boundary", normals=True)
+xb, yb, tb, nx, ny = domain.variable("boundary", normals=True, split=True)
 
 # With boundary normals AND view-factor matrix (for radiation problems)
 xb, yb, tb, nx, ny, VF = domain.variable("boundary", normals=True, view_factor=True)

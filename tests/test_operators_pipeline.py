@@ -151,7 +151,7 @@ class TestGreensFirstIdentity3D:
         lhs = _eval_scalar(crux, lhs_expr, dom)
 
         # Surface side: ∮_∂C u (∇v·n) dS with ∇v = (yz, xz, xy).
-        x_b, y_b, z_b, _, nx, ny, nz = dom.variable("boundary", normals=True)
+        x_b, y_b, z_b, _, nx, ny, nz = dom.variable("boundary", normals=True, split=True)
         u_b = x_b**2 + y_b**2 + z_b**2
         grad_v_dot_n = y_b * z_b * nx + x_b * z_b * ny + x_b * y_b * nz
         rhs_expr = (u_b * grad_v_dot_n).integrate()
@@ -198,7 +198,7 @@ class TestGreensSecondIdentity3D:
         lhs_expr = (u_v * v_v.laplacian(x_v, y_v, z_v) - v_v * u_v.laplacian(x_v, y_v, z_v)).integrate()
         lhs = _eval_scalar(crux, lhs_expr, dom)
 
-        x_b, y_b, z_b, _, nx, ny, nz = dom.variable("boundary", normals=True)
+        x_b, y_b, z_b, _, nx, ny, nz = dom.variable("boundary", normals=True, split=True)
         u_b = x_b**2 + y_b**2 + z_b**2
         v_b = x_b**3 + y_b**3 + z_b**3
         grad_u_dot_n = 2.0 * x_b * nx + 2.0 * y_b * ny + 2.0 * z_b * nz

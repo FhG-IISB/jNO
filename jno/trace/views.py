@@ -447,7 +447,11 @@ class VectorView(_DelegatesToPlaceholder):
             cx = self._c(2).expr.d(y) - self._c(1).expr.d(z)
             cy = self._c(0).expr.d(z) - self._c(2).expr.d(x)
             cz = self._c(1).expr.d(x) - self._c(0).expr.d(y)
-            return VectorView(concat([cx, cy, cz]))
+            # Stack the three scalar components onto a NEW last axis (like ``jacobian``), not ``concat``
+            # (concatenate-on-last): for an FEM test function each component is per-DOF ``(n_quad, n_dof)``,
+            # which concat would merge into ``(n_quad, 3·n_dof)``; stacking gives the correct
+            # ``(n_quad, n_dof, 3)`` vector. Identical to concat for 1-D (nodal/network) components.
+            return VectorView(FunctionCall(lambda *cs: jnp.stack(cs, axis=-1), [cx, cy, cz], "stack"))
         raise ValueError("curl requires 2 or 3 spatial variables")
 
     # -- reductions / pairwise --
