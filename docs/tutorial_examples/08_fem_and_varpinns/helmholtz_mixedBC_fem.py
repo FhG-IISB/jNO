@@ -20,7 +20,6 @@ sin, cos = jno.np.sin, jno.np.cos
 exact = lambda x, y: jnp.sin(jnp.pi * x) * (jnp.cos(jnp.pi * y) + y)  # noqa: E731
 flux_right = lambda x, y: -pi * (cos(pi * y) + y)  # u_x at x = 1  # noqa: E731
 flux_top = lambda x, y: sin(pi * x)  # u_y at y = 1  # noqa: E731
-dense = lambda A: jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)  # noqa: E731
 
 d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.22)
 u, phi = d.fem_symbols()
@@ -37,7 +36,7 @@ neumann_right = -flux_right(xr, yr) * phi.bind(x=xr, y=yr)  # natural term -g ph
 neumann_top = -flux_top(xt, yt) * phi.bind(x=xt, y=yt)
 fem = jno.fem([volume, neumann_right, neumann_top, u(xl, yl) - 0.0, u(xbo, ybo) - sin(pi * xbo)], quad_degree=3)
 
-u_fem = jnp.linalg.solve(dense(fem.A), jnp.asarray(fem.b).reshape(-1))
+u_fem = jnp.asarray(fem.solve(linear=jno.solve.lu()))  # indefinite Helmholtz -> sparse-direct slot
 pts = np.asarray(fem.points)
 rel_l2 = float(jnp.linalg.norm(exact(pts[:, 0], pts[:, 1]) - u_fem) / jnp.linalg.norm(exact(pts[:, 0], pts[:, 1])))
 print(f"\n2D Helmholtz, mixed Dirichlet/Neumann via jno.fem: dofs={fem.dofs}  rel_L2={rel_l2:.3e}")

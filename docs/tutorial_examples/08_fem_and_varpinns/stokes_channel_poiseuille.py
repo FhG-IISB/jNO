@@ -12,7 +12,10 @@ exact parabolic profile
 
 so we impose that profile as the velocity boundary data (zero on the walls, parabola at the
 inlet/outlet), pin the pressure at one vertex to remove its constant null space, and recover
-the analytic Poiseuille solution to machine precision.
+the analytic Poiseuille solution to the solver tolerance. The indefinite saddle system is solved
+matrix-free by FGMRES with a block upper-triangular preconditioner: an inexact CG solve on the
+velocity block and a viscosity-weighted pressure mass matrix as the Schur-complement
+approximation.
 """
 
 import jax
@@ -26,7 +29,6 @@ from shapely.geometry import box
 import jno
 
 inner, grad, trace = jno.np.inner, jno.np.grad, jno.np.trace
-dense = lambda A: jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)  # noqa: E731
 G, mu, H, Lx = 1.0, 1.0, 1.0, 4.0
 u_profile = lambda y: (G / (2.0 * mu)) * y * (H - y)  # noqa: E731
 
@@ -50,9 +52,17 @@ fem = jno.fem(
 )
 
 off = fem.offsets  # per-field DOF offsets in the coupled solution vector
-sol = jnp.linalg.solve(dense(fem.A), jnp.asarray(fem.b).reshape(-1))
+sol = jnp.asarray(
+    fem.solve(
+        linear=jno.solve.fgmres(tol=1e-10, restart=40, maxiter=4000),
+        precond=jno.precond.triangular(
+            (u, jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=60))),  # velocity block: inexact CG
+            (p, jno.precond.form([(1.0 / mu) * pp * qq], inner=jno.solve.dense())),  # Schur ~ (1/mu)-weighted pressure mass
+        ),
+    )
+)
 uu = np.asarray(sol[off[0] : off[1]]).reshape(-1, 2)  # velocity (n_vel_nodes, 2)
-pts_v = np.asarray(fem.field_points[0])
+pts_v = np.asarray(fem.field_points[0])  # P2 velocity nodes (snapshotted -- safe after the aux precond assembly)
 rel_ux = float(np.linalg.norm(uu[:, 0] - u_profile(pts_v[:, 1])) / np.linalg.norm(u_profile(pts_v[:, 1])))
 max_uy = float(np.max(np.abs(uu[:, 1])))  # u_y == 0 and u_x x-independent => div u == 0
 print(f"\nStokes Poiseuille channel (Taylor-Hood P2/P1): dofs={fem.dofs}  u_x rel_L2={rel_ux:.3e}  max|u_y|={max_uy:.3e}")

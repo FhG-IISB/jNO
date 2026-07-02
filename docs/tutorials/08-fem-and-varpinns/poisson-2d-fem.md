@@ -20,13 +20,17 @@ coordinates gives the `.x` / `.y` derivatives, and the Dirichlet condition is si
 ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
 f = 2.0 * (xi * (1 - xi) + yi * (1 - yi))
 fem = jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0], quad_degree=3)
-u_fem = jnp.linalg.solve(dense(fem.A), jnp.asarray(fem.b).reshape(-1))
+u_fem = jnp.asarray(fem.solve(linear=jno.solve.cg(), precond=jno.precond.jacobi()))  # SPD -> CG
 ```
 
 ## What to notice
 
 - One call, `jno.fem([...])`, assembles the stiffness `fem.A` and load `fem.b`.
 - Boundary conditions are terms in the same list — no separate BC objects.
+- `fem.solve()` alone would also work (matrix-free Jacobi-BiCGStab on the sparse operator);
+  the **solver slots** pick a structure-appropriate method — CG for this SPD system — without
+  ever densifying. See [Choosing the solver](../../fem.md) for the full `jno.solve` /
+  `jno.precond` namespaces.
 - The solution is audited against the manufactured field $u^\*=x(1-x)y(1-y)$ (rel-$L^2 \approx 8\times10^{-3}$).
 
 ## Full script

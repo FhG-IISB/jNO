@@ -16,8 +16,6 @@ import jax.numpy as jnp
 from shapely.geometry import box
 import jno
 
-dense = lambda A: jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)  # A may be sparse or dense
-
 d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
 u, phi = d.fem_symbols()                                   # trial / test functions
 xi, yi, _ = d.variable("interior", split=True)            # volume quadrature coords
@@ -26,13 +24,14 @@ ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)         # views with .x / .y d
 
 f = 2.0 * (xi * (1 - xi) + yi * (1 - yi))
 fem = jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0])   # weak form + u = 0 on the boundary
-u_h = jnp.linalg.solve(fem.A, fem.b)
+u_h = fem.solve()          # matrix-free default; slots pick anything else (see "Choosing the solver")
 ```
 
 > The flat accessors — `fem.A`, `fem.b`, `fem.M`, `fem.state0`, and `fem.residual(u[, t])` /
-> `fem.jacobian(u[, t])` — return ready-to-use **dense** matrices and **flat** vectors, so no
+> `fem.jacobian(u[, t])` — return ready-to-use **dense** matrices and **flat** vectors for
+> hand-rolled experiments (e.g. `u_h = jnp.linalg.solve(fem.A, fem.b)`), so no
 > `.todense()`/`reshape` is needed. `fem.operator` still exposes the raw sparse (`BCOO`) operator
-> for large problems; the `dense(...)` helper above densifies those (e.g. `fem.operator.A`).
+> for large problems — `fem.solve()` and the solver slots work on that sparse operator directly.
 
 ---
 

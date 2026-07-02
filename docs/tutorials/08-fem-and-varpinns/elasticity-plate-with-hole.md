@@ -34,7 +34,7 @@ weak = lam * trace(eu) * trace(ep) + 2.0 * mu * inner(eu, ep, n_contract=2)
 fem = jno.fem([weak - fx * phi.bind(x=xi, y=yi)[0],
                u(xb, yb)[0] - ux_star(xb, yb),
                u(xb, yb)[1] - uy_star(xb, yb)])
-sol = fem.solve(solve_fn=lambda A, b: lineax.linear_solve(lineax.MatrixLinearOperator(A), b).value)
+sol = fem.solve()   # matrix-free Jacobi-preconditioned BiCGStab default (O(nnz) memory)
 ```
 
 ## The result
@@ -52,7 +52,9 @@ along the pull, contracted across it (Poisson effect).
   independently — exactly the moves you need for real parts.
 - **Vector fields read like the math**: `symgrad`/`trace`/`inner` give $\boldsymbol\varepsilon$ and
   the bilinear form with no index bookkeeping; P2 (`order=2`) avoids shear locking.
-- **Bring your own solver** (`lineax`) through `solve_fn`.
+- **The built-in default solver is enough here**: plain `fem.solve()` runs matrix-free
+  Jacobi-preconditioned BiCGStab; pick another via the slot API (e.g.
+  `fem.solve(linear=jno.solve.cg())` for this SPD system) when the default is not the right fit.
 - **Verified by the method of manufactured solutions:** a known uniaxial-tension field
   $\mathbf u^\*$ (with a sinusoidal perturbation, so the gate is genuinely mesh-convergent rather
   than exactly polynomial) is imposed on the whole boundary and recovered to rel-L2 $\sim7\times10^{-6}$.

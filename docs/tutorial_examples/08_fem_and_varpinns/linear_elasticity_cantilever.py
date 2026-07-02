@@ -22,7 +22,6 @@ E, nu, L, H = 1000.0, 0.3, 10.0, 1.0
 lam, mu = E * nu / (1.0 - nu**2), E / (2.0 * (1.0 + nu))  # plane-stress Lame parameters
 Iz = H**3 / 12.0  # second moment of area (unit thickness)
 inner, symgrad, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
-dense = lambda A: jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)  # noqa: E731
 
 d = jno.domain(box(0.0, 0.0, L, H), mesh_size=0.5)
 u, phi = d.fem_symbols(value_shape=(2,), order=2)  # P2 vector displacement
@@ -36,7 +35,8 @@ weak = lam * trace(eu) * trace(ep) + 2.0 * mu * inner(eu, ep, n_contract=2)
 q = 0.1  # downward shear traction (0, -q) on the tip; total load P = q * H
 traction = -1.0 * inner(jnp.array([0.0, -q]), phi.bind(x=xr, y=yr), n_contract=1)
 fem = jno.fem([weak, u(xl, yl) - (0.0, 0.0), traction])
-sol = jnp.linalg.solve(dense(fem.A), jnp.asarray(fem.b).reshape(-1)).reshape(-1, 2)  # (n_nodes, 2)
+# The slender-beam P2 stiffness matrix is too ill-conditioned for Jacobi-CG in float32 -> sparse-direct slot.
+sol = jnp.asarray(fem.solve(linear=jno.solve.lu())).reshape(-1, 2)  # (n_nodes, 2)
 tip = np.asarray(fem.points)[:, 0] > L - 1e-6
 delta, eb = float(-jnp.mean(sol[tip, 1])), (q * H) * L**3 / (3.0 * E * Iz)
 print(
