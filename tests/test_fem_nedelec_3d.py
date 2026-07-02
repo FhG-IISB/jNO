@@ -178,3 +178,53 @@ def test_pec_driven_problem_converges():
     n1, e1 = _driven_pec_l2_error(0.25)
     assert n1 > n0
     assert e1 < 0.85 * e0, f"PEC driven problem must converge: {e0:.3e} (ndof {n0}) -> {e1:.3e} (ndof {n1})"
+
+
+def _cavity_eigenvalues(mesh_size):
+    """PEC cube cavity: assemble curl-curl ``K`` and mass ``M``, restrict to interior edges (``n×E=0``), and
+    return the nonzero generalized eigenvalues of ``Kx=λMx`` (via a Cholesky-reduced *symmetric* eigenproblem
+    ``L⁻¹KL⁻ᵀ`` so no scipy is needed), with the curl-curl gradient-kernel (λ≈0) filtered out."""
+    from jno.utils.solver.fem_nonnodal import _n1e_tangential_pins_3d
+    from jno.utils.solver.fem_topology import BASIX_TET_EDGES, build_edge_topology
+
+    d = jno.domain(constructor=jno.domain.cube(mesh_size=mesh_size))
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+    c = d.variable("interior", split=True)
+    xi, yi, zi = c[0], c[1], c[2]
+    ui, vi = u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)
+    cu, cv = u.vector.curl(xi, yi, zi), v.vector.curl(xi, yi, zi)
+    K = _dense(jno.fem([inner(cu, cv)]).A)
+    M = _dense(jno.fem([inner(ui, vi)]).A)
+    cells = np.asarray(d.mesh.cells_dict["tetra"])
+    top = build_edge_topology(cells, BASIX_TET_EDGES)
+    pinned = {int(dof) for dof, _ in _n1e_tangential_pins_3d([("u", "boundary", 0.0)], d, {"u": 0}, ["N1E"], top, [0])}
+    interior = [i for i in range(K.shape[0]) if i not in pinned]  # PEC: drop boundary-face edge DOFs
+    Ki, Mi = K[np.ix_(interior, interior)], M[np.ix_(interior, interior)]
+    L = np.linalg.cholesky(Mi)  # Mi SPD; Kx=λMx  ->  (L⁻¹ K L⁻ᵀ) y = λ y
+    Asym = np.linalg.solve(L, np.linalg.solve(L, Ki).T).T
+    w = np.sort(np.linalg.eigvalsh(Asym))
+    return len(interior), w[w > 1.0]  # filter the gradient-field kernel (λ≈0), well below the first mode ~2π²
+
+
+def test_nedelec_tet_cavity_resonator_eigenvalues():
+    """The definitive edge-element validation — the PEC cube cavity eigenproblem ``curl curl E = k² E``.
+    Nédélec (H(curl)) recovers the analytic resonant modes ``k² = π²(l²+m²+n²)``; the lowest is ``k² = 2π²``
+    (3-fold degenerate). Crucially it is **spurious-free**: no fake eigenvalue appears between the
+    gradient-field kernel (``λ≈0``) and the first physical mode — the very failure that rules nodal Lagrange
+    out of Maxwell eigenproblems. The eigenvalues converge to ``2π²`` from below under refinement.
+
+    Reference: cavity resonant wavenumbers for a unit cube, ``k²_{lmn} = π²(l²+m²+n²)`` (Jackson,
+    *Classical Electrodynamics*, waveguides/cavities)."""
+    k2 = 2.0 * np.pi**2  # analytic lowest mode ≈ 19.74
+
+    n_c, w_c = _cavity_eigenvalues(0.4)
+    n_f, w_f = _cavity_eigenvalues(0.25)
+
+    # spurious-free: the first surviving (non-kernel) eigenvalue IS the physical mode near 2π², not something
+    # dragged toward zero. A spurious mode would appear as a much smaller surviving eigenvalue and fail this.
+    assert w_c[0] > 0.6 * k2, f"a low spurious mode appeared: lowest non-kernel λ={w_c[0]:.3f} (2π²={k2:.3f})"
+    # the lowest physical mode is 3-fold degenerate ≈ 2π² (coarse mesh sits below; within ~12%)
+    assert abs(np.mean(w_c[:3]) / k2 - 1.0) < 0.12, f"lowest triplet {np.round(w_c[:3], 2)} not ≈ 2π²={k2:.2f}"
+    # convergence from below toward 2π² under refinement
+    assert w_f[0] > w_c[0], "the lowest mode must rise toward 2π² as the mesh refines (Nédélec converges from below)"
+    assert abs(np.mean(w_f[:3]) / k2 - 1.0) < 0.08, f"finer triplet {np.round(w_f[:3], 2)} not tighter to 2π²"
