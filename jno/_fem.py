@@ -1198,8 +1198,12 @@ class FEM:
         if meshes:
             return jnp.asarray(meshes[0].points)
         # Native Lagrange path (no problem object): the assembler records the DOF coordinates
-        # (vertices + edge midpoints for P2) the flat solution lives on.
-        native_pts = getattr(self.domain, "_fem_native_dof_points", None)
+        # (vertices + edge midpoints for P2) the flat solution lives on. Prefer the snapshot
+        # captured at finalize time — the domain attribute is overwritten by any later assembly
+        # on the same domain (e.g. a jno.precond.form auxiliary operator).
+        native_pts = getattr(self, "_native_dof_points", None)
+        if native_pts is None:
+            native_pts = getattr(self.domain, "_fem_native_dof_points", None)
         if native_pts is not None:
             return jnp.asarray(native_pts)
         if self.mesh is not None:
@@ -1216,7 +1220,10 @@ class FEM:
         meshes = getattr(prob, "mesh", None) if prob is not None else None
         if meshes:
             return [jnp.asarray(m.points) for m in meshes]
-        native_all = getattr(self.domain, "_fem_native_dof_points_all", None)
+        # snapshot first (see .points): the live domain attribute is clobbered by later assemblies
+        native_all = getattr(self, "_native_dof_points_all", None)
+        if native_all is None:
+            native_all = getattr(self.domain, "_fem_native_dof_points_all", None)
         if native_all is not None:
             return [jnp.asarray(p) for p in native_all]
         pts = self.points
@@ -2016,6 +2023,11 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         # the constraint-walk order is the fallback for paths that don't run the native assembler.
         fem_obj._block_field_keys = list(getattr(domain, "_fem_native_field_keys", None) or ())
         fem_obj._trial_field_keys = _field_keys(_orig_constraints)
+        # Same snapshot treatment for the DOF coordinates behind .points / .field_points — an
+        # auxiliary assembly (jno.precond.form) would otherwise clobber them mid-solve.
+        fem_obj._native_dof_points = getattr(domain, "_fem_native_dof_points", None)
+        _all = getattr(domain, "_fem_native_dof_points_all", None)
+        fem_obj._native_dof_points_all = list(_all) if _all is not None else None
         if couplings:
             # Fold the coupling into the residual FIRST -- a steady local form is promoted to a nonlinear
             # FemResidualOperator. The periodic reduction below then wraps the *coupled* residual through

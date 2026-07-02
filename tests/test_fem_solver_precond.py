@@ -88,6 +88,27 @@ def test_stokes_fgmres_triangular_schur():
     assert np.abs(np.asarray(sol2) - u_ref).max() < 1e-6
 
 
+def test_points_survive_aux_assembly():
+    """Regression: fem.points / fem.field_points are snapshots — assembling a jno.precond.form
+    auxiliary operator on the same domain must not clobber them (the raw domain attributes
+    _fem_native_dof_points* ARE overwritten by the aux assembly; the FEM must not care)."""
+    fem, u, p, pp, qq, mu = _stokes(mesh_size=0.35)
+    pts_before = [np.asarray(x) for x in fem.field_points]
+    n_before = np.asarray(fem.points).shape[0]
+    fem.solve(
+        linear=jno.solve.fgmres(tol=1e-8, restart=40, maxiter=4000),
+        precond=jno.precond.triangular(
+            (u, jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=60))),
+            (p, jno.precond.form([(1.0 / mu) * pp * qq], inner=jno.solve.dense())),
+        ),
+    )
+    pts_after = fem.field_points
+    assert len(pts_after) == len(pts_before)
+    for a, b in zip(pts_after, pts_before):
+        assert np.asarray(a).shape == b.shape and np.allclose(np.asarray(a), b)
+    assert np.asarray(fem.points).shape[0] == n_before
+
+
 def test_stokes_block_diag():
     fem, u, p, pp, qq, mu = _stokes()
     u_ref = np.asarray(fem.solve(linear=jno.solve.lu()))
