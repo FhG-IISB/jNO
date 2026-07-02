@@ -36,6 +36,13 @@ import numpy as np
 # local edge k). Kept here so callers don't hard-code it at each use site.
 BASIX_TRIANGLE_EDGES: Tuple[Tuple[int, int], ...] = ((1, 2), (0, 2), (0, 1))
 
+# basix reference edge ordering for a tetrahedron (6 edges): vertex pairs
+# (2,3),(1,3),(1,2),(0,3),(0,2),(0,1), in that order. This is both the P2
+# edge-midpoint DOF order and the lowest-order Nédélec/RT edge-DOF order (DOF k
+# on local edge k). ``build_edge_topology`` uses it to number tet edges globally
+# with a canonical (min,max) orientation shared across the tets meeting an edge.
+BASIX_TET_EDGES: Tuple[Tuple[int, int], ...] = ((2, 3), (1, 3), (1, 2), (0, 3), (0, 2), (0, 1))
+
 
 class EdgeTopology(NamedTuple):
     """Global edge numbering + per-cell orientation for an edge-DOF element.

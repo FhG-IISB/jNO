@@ -27,14 +27,12 @@ import jax.numpy as jnp
 import numpy as np
 
 from .fem_elements import ElementSpec
-from .fem_topology import BASIX_TRIANGLE_EDGES
 
-# Basix edge ordering for a tetrahedron (6 edges, one P2 midpoint DOF each). The order MUST match
-# basix's P2 tetrahedron DOF layout: the 6 edge-midpoint DOFs (after the 4 vertices) sit at the
-# midpoints of vertex pairs (2,3), (1,3), (1,2), (0,3), (0,2), (0,1) -- in that order (read off the
-# basix interpolation points). `_promote_to_quadratic` appends midpoint nodes to each cell in this
-# order, so a mismatch silently scrambles the P2 local DOFs against the tabulated basis.
-BASIX_TET_EDGES: Tuple[Tuple[int, int], ...] = ((2, 3), (1, 3), (1, 2), (0, 3), (0, 2), (0, 1))
+# ``BASIX_TET_EDGES`` (defined in fem_topology) is the basix tetrahedron edge order, which is also
+# the P2 edge-midpoint DOF order: the 6 midpoints (after the 4 vertices) sit at vertex pairs
+# (2,3),(1,3),(1,2),(0,3),(0,2),(0,1). ``_promote_to_quadratic`` appends midpoint nodes in this order,
+# so a mismatch silently scrambles the P2 local DOFs against the tabulated basis.
+from .fem_topology import BASIX_TET_EDGES, BASIX_TRIANGLE_EDGES
 
 
 def _lagrange_basix(cell_type, degree: int):
