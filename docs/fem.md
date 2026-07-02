@@ -618,6 +618,14 @@ gradient path):
   per-field composition over `fem.blocks` (fields are the trial symbols; `fem.block_index`
   resolves them, offsets-ordered). `triangular` is the standard saddle-point shape: last block
   solved first, substituted back through the assembled off-diagonal matvecs.
+* `jno.precond.amg(cycles=…)` — **hybrid algebraic multigrid**: setup once on the host via the
+  *optional* `pyamg` (smoothed aggregation — Vaněk, Mandel & Brezina, *Computing* 56, 1996;
+  PyAMG — Bell et al., *JOSS* 8(87):5495, 2023), applied as a pure-JAX V-cycle with Chebyshev
+  smoothing (Adams et al., *JCP* 188, 2003). The apply is `jit`/`vmap`-native (one frozen
+  hierarchy legitimately serves a whole batch) and exactly linear, so it preconditions
+  `cg`/`minres` too. Mesh-independent convergence ⇒ *the* choice for large elliptic blocks.
+  Inside traced/parametric solves, pre-build eagerly: `spec = jno.precond.amg(); spec.build(fem.A)`.
+  Without pyamg installed everything else works; using `amg` raises a clear install hint.
 
 The flagship pattern — Taylor–Hood **Stokes** by FGMRES with an inexact velocity block solve and
 the viscosity-weighted pressure-mass Schur approximation (Elman, Silvester & Wathen, *Finite

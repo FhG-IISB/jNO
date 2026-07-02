@@ -28,7 +28,7 @@ import jax.numpy as jnp
 
 from .utils.solver.solver_api import PrecondContext  # noqa: F401  (re-export for user specs)
 
-__all__ = ["PrecondContext", "jacobi", "chebyshev", "form", "inner", "block_diag", "triangular"]
+__all__ = ["PrecondContext", "jacobi", "chebyshev", "form", "inner", "block_diag", "triangular", "amg"]
 
 
 class _Jacobi:
@@ -255,6 +255,78 @@ def triangular(*pairs) -> _Triangular:
     *Finite Elements and Fast Iterative Solvers*, 2nd ed., OUP 2014, §9.2). With inexact
     (iterative) block solves the outer Krylov must be flexible: ``jno.solve.fgmres()``."""
     return _Triangular(list(pairs))
+
+
+class _AMG:
+    """Spec for the hybrid (pyamg-setup / pure-JAX-apply) AMG preconditioner; see :func:`amg`."""
+
+    def __init__(self, cycles, max_levels, coarse_size, smoother_degree):
+        self.cycles = cycles
+        self.max_levels = max_levels
+        self.coarse_size = coarse_size
+        self.smoother_degree = smoother_degree
+        self._levels = None
+
+    def build(self, A) -> "_AMG":
+        """Eager one-time setup from a **concrete** operator (BCOO / dense / ``fem.A`` /
+        ``LinearOperator``). Required before use inside traced (jit / vmap / parametric-inverse)
+        solves — pyamg cannot run under a trace; the built hierarchy is then frozen closure data.
+        Returns ``self`` (chainable). Rebuild when the operator values drift far from this one."""
+        from .utils.solver.amg import build_hierarchy
+        from .utils.solver.solver_api import LinearOperator
+
+        if isinstance(A, LinearOperator):
+            A = A.bcoo if A.bcoo is not None else A.dense()
+        self._levels = build_hierarchy(
+            A,
+            max_levels=self.max_levels,
+            coarse_size=self.coarse_size,
+            smoother_degree=self.smoother_degree,
+        )
+        return self
+
+    def materialize(self, ctx: PrecondContext):
+        from .utils.solver.amg import vcycle_apply
+
+        if self._levels is None:
+            A = ctx.A.bcoo if ctx.A.bcoo is not None else ctx.A.dense()
+            self.build(A)  # raises with .build() guidance when A is traced
+        levels, cycles = self._levels, self.cycles
+        A_op = ctx.A
+
+        def apply(r):
+            x = vcycle_apply(levels, r)
+            for _ in range(cycles - 1):
+                x = x + vcycle_apply(levels, r - A_op.mv(x))
+            return x
+
+        return apply
+
+    def __repr__(self):
+        return f"jno.precond.amg(cycles={self.cycles}, built={self._levels is not None})"
+
+
+def amg(*, cycles: int = 1, max_levels: int = 10, coarse_size: int = 100, smoother_degree: int = 3) -> _AMG:
+    """Hybrid **algebraic multigrid**: smoothed-aggregation setup by the optional ``pyamg``
+    (Vaněk, Mandel & Brezina, Computing 56, 1996; Bell et al., JOSS 8(87):5495, 2023), applied as
+    a pure-JAX V-cycle with Chebyshev polynomial smoothing (Adams et al., JCP 188, 2003) — see
+    :mod:`jno.utils.solver.amg`.
+
+    The setup runs **once on the host** (eagerly) and freezes fixed-pattern level operators; the
+    per-application V-cycle is then ``jit``/``vmap``-native and a fixed *linear* map, so it may
+    precondition ``cg``/``minres`` as well as ``bicgstab``/``fgmres``. The mesh-independent
+    convergence of multigrid makes this *the* preconditioner for large elliptic blocks — heat,
+    diffusion, elasticity, the (Picard-lagged) velocity block of a saddle system inside
+    :func:`triangular`.
+
+    Inside traced contexts (jit, vmap, a parametric inverse solve) call ``spec.build(fem.A)``
+    once, eagerly, first; the frozen hierarchy is a legitimate preconditioner while operator
+    values change (speed degrades gracefully, correctness never). pyamg is imported lazily —
+    without it, a clear ``ImportError`` explains the install. On a matvec-only sub-block the
+    matrix is recovered via the (dense) block view — fine for moderate blocks; pass a pre-built
+    spec for very large ones.
+    """
+    return _AMG(cycles, max_levels, coarse_size, smoother_degree)
 
 
 def chebyshev(
