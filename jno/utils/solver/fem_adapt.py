@@ -98,6 +98,28 @@ def _corner_vertices(points: np.ndarray, bedges: np.ndarray, angle_tol: float = 
     return np.asarray(sorted(corners), dtype=np.int32)
 
 
+# Empirical Mmg vertices produced per unit metric-complexity (calibrated on layer problems);
+# used by hessian_metric so its `target_complexity` tracks the actual vertex count per dimension.
+_VERTS_PER_COMPLEXITY = {2: 1.5, 3: 2.2}
+
+
+def _sym_tensor_indices(dim: int) -> list[tuple[int, int]]:
+    """Upper-triangle ``(i, j)`` index pairs for a symmetric ``dim x dim`` tensor, row-major:
+    2D -> [(0,0),(0,1),(1,1)] (3 comps); 3D -> [(0,0),(0,1),(0,2),(1,1),(1,2),(2,2)] (6 comps).
+    This is Mmg's Medit tensor-solution component ordering."""
+    return [(i, j) for i in range(dim) for j in range(i, dim)]
+
+
+def _unpack_sym_tensor(field: np.ndarray, dim: int) -> np.ndarray:
+    """Expand packed upper-triangle metric components ``(n, 3|6)`` to full ``(n, dim, dim)``."""
+    n = field.shape[0]
+    M = np.zeros((n, dim, dim))
+    for k, (i, j) in enumerate(_sym_tensor_indices(dim)):
+        M[:, i, j] = field[:, k]
+        M[:, j, i] = field[:, k]
+    return M
+
+
 def remesh_with_mmg(
     domain: Any,
     vertex_size: np.ndarray,
@@ -166,8 +188,6 @@ def remesh_with_mmg(
             raise ValueError("vertex_size must be strictly positive.")
     if field.shape[0] != pts.shape[0]:
         raise ValueError(f"metric field has {field.shape[0]} entries but the mesh has {pts.shape[0]} vertices.")
-    if anisotropic and dim == 3:
-        raise NotImplementedError("anisotropic (tensor) metrics are 2D-only so far; pass an isotropic size in 3D.")
 
     if dim == 2:
         elems = np.asarray(domain.mesh.cells_dict["triangle"]).astype(np.int32)
@@ -194,7 +214,7 @@ def remesh_with_mmg(
 
     if anisotropic:
         # eigen-sizes of the tensor set the hmin/hmax window; the mmg tensor channel is aniso
-        eig = np.linalg.eigvalsh(np.array([[field[:, 0], field[:, 1]], [field[:, 1], field[:, 2]]]).transpose(2, 0, 1))
+        eig = np.linalg.eigvalsh(_unpack_sym_tensor(field, dim))
         sizes = 1.0 / np.sqrt(np.clip(eig, 1e-300, None))
         m.set_field("tensor", field)
     else:
@@ -382,15 +402,13 @@ def hessian_metric(
     size along each -- thin, stretched elements across a directional feature, which resolve
     it at a fraction of the isotropic cost.
 
-    Returns ``(n_vert, 3)`` symmetric tensors ``(m11, m12, m22)`` (2D only).
+    Returns packed symmetric tensors: ``(n_vert, 3)`` ``(m11, m12, m22)`` in 2D, or
+    ``(n_vert, 6)`` ``(m11, m12, m13, m22, m23, m33)`` in 3D.
 
     Reference: Alauzet & Loseille, *Metric-based anisotropic mesh adaptation* (2010).
     """
     dim = int(domain.dimension)
-    if dim != 2:
-        raise NotImplementedError("hessian_metric currently supports 2D meshes only.")
-
-    H = recover_hessian(domain, u_vertex)  # (n_vert, 2, 2)
+    H = recover_hessian(domain, u_vertex)  # (n_vert, dim, dim)
     evals, evecs = np.linalg.eigh(H)  # ascending eigenvalues, orthonormal eigenvectors
     lam = np.abs(evals)  # |H|: interpolation error ~ |curvature|
     # floor so det > 0 (a flat direction otherwise gives an infinite size)
@@ -404,15 +422,19 @@ def hessian_metric(
         np.add.at(area_v, cells[:, lv], area_cell / cells.shape[1])
     det_raw = np.sqrt(np.prod(lam, axis=1))  # sqrt(det|H|) per vertex
     complexity_raw = float(np.sum(det_raw * area_v))
-    s = (target_complexity / max(complexity_raw, 1e-300)) ** (2.0 / dim)
+    # Mmg produces ~`_VERTS_PER_COMPLEXITY[dim]` vertices per unit metric-complexity
+    # (empirically ~1.5 in 2D, ~2.2 in 3D), so aim for a complexity that yields
+    # `target_complexity` *vertices* -- keeps the DOF budget meaningful in both dimensions.
+    metric_complexity = target_complexity / _VERTS_PER_COMPLEXITY[dim]
+    s = (metric_complexity / max(complexity_raw, 1e-300)) ** (2.0 / dim)
     lam = s * lam
 
     # clamp eigenvalues to the size window [hmin, hmax] (size = 1/sqrt(lambda))
     lam = np.clip(lam, 1.0 / hmax**2, 1.0 / hmin**2)
 
-    # reassemble M = V diag(lam) V^T and pack the symmetric part (m11, m12, m22)
-    M = np.einsum("vij,vj,vkj->vik", evecs, lam, evecs)  # (n_vert, 2, 2)
-    return np.stack([M[:, 0, 0], M[:, 0, 1], M[:, 1, 1]], axis=1)
+    # reassemble M = V diag(lam) V^T and pack its upper triangle (Mmg tensor ordering)
+    M = np.einsum("vij,vj,vkj->vik", evecs, lam, evecs)  # (n_vert, dim, dim)
+    return np.stack([M[:, i, j] for i, j in _sym_tensor_indices(dim)], axis=1)
 
 
 # ---------------------------------------------------------------------------
@@ -517,7 +539,9 @@ class AdaptSpec:
         If ``True``, refine the forward loop with an :func:`hessian_metric` (stretched
         elements aligned to the solution's curvature) grown by ``refine_factor``× vertices
         per round, instead of isotropic ZZ + Dörfler marking. Far fewer DOFs for directional
-        features (layers, fronts); 2D scalar only. ``hmin`` / ``hmax`` bound the edge sizes.
+        features (layers, fronts); 2D and 3D scalar. ``hmin`` / ``hmax`` bound the edge sizes.
+        Metric-based DOF control is approximate, so ``max_dofs`` is honored only loosely here
+        (a round may overshoot it by up to ~1.5x, especially in 3D).
     hmin, hmax
         Edge-size window for the anisotropic metric (defaults derive from the mesh).
     """
@@ -609,7 +633,12 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
             h_typ = _mean_edge_length(d)
             hmin = spec.hmin if spec.hmin is not None else h_typ / 50.0
             hmax = spec.hmax if spec.hmax is not None else h_typ * 2.0
-            metric = hessian_metric(d, u, target_complexity=n_dofs * spec.refine_factor, hmin=hmin, hmax=hmax)
+            # target the vertex count directly (hessian_metric is calibrated per dimension) and
+            # cap it at the DOF budget so a single round cannot blow far past max_dofs
+            target = n_dofs * spec.refine_factor
+            if spec.max_dofs is not None:
+                target = min(target, float(spec.max_dofs))
+            metric = hessian_metric(d, u, target_complexity=target, hmin=hmin, hmax=hmax)
             # a loose size gradation lets adjacent elements change size fast, which is what
             # permits the high aspect ratios that make anisotropic adaptation pay off
             remesh_with_mmg(d, metric, copy=False, hmin=hmin, hmax=hmax, hgrad=3.0)

@@ -35,11 +35,12 @@ fem.solve(adapt=AdaptSpec(anisotropic=True, max_iters=8, refine_factor=1.6, max_
 
 ![Left: an isotropic mesh with a wide band of tiny equal-sided triangles along the diagonal
 (5997 dofs). Middle: an anisotropic mesh with thin stretched triangles hugging the diagonal layer
-and coarse elements elsewhere (2632 dofs). Right: a log-log plot of the ZZ error estimate versus
+and coarse elements elsewhere (709 dofs). Right: a log-log plot of the ZZ error estimate versus
 DOFs, the anisotropic curve far below the isotropic one.](/jNO/assets/anisotropic_layer.png)
 
-The anisotropic mesh reaches a **~8× lower error estimate with ~2.3× fewer DOFs** (2632 vs 5997)
-— its stretched elements align with the layer instead of tiling a band with tiny triangles.
+The anisotropic mesh reaches a **lower error estimate (0.10 vs 0.38) with ~8× fewer DOFs**
+(709 vs 5997) — its stretched elements align with the layer instead of tiling a band with tiny
+triangles. The metric equidistributes to a compact, efficient mesh.
 
 ## What to notice
 
@@ -49,7 +50,9 @@ The anisotropic mesh reaches a **~8× lower error estimate with ~2.3× fewer DOF
 - **The metric is the instruction:** unlike marking (flag cells → halve them), a metric field sets
   a target *size and direction* everywhere; Mmg remeshes to equidistribute it, coarsening smooth
   regions as it refines the layer.
-- **2D scalar P1 only** for now (the Hessian recovery assumes one DOF per vertex).
+- **Works in 2D and 3D** (triangles and tetrahedra) — in 3D the metric is a 6-component tensor
+  and mmg produces stretched *tets*. Scalar P1 (one DOF per vertex); metric-based DOF control is
+  approximate, so `max_dofs` is a soft cap here.
 
 ## Full script
 
