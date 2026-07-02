@@ -121,9 +121,10 @@ def lag(expr: Any) -> Any:
     but not exact. Remove ``lag`` (full Newton) when exact parameter gradients matter more than
     per-step solvability.
     """
-    sg = getattr(expr, "stop_gradient", None)
-    if sg is not None and not callable(sg):
-        return sg  # traced view / placeholder: the .stop_gradient property
+    # views and raw trace nodes expose ``.stop_gradient`` as a *property* (its value — a trace
+    # node — is itself callable, so a callable() test cannot distinguish them from methods)
+    if isinstance(getattr(type(expr), "stop_gradient", None), property):
+        return expr.stop_gradient
     return jax.lax.stop_gradient(expr)  # plain arrays inside hand-written residuals
 
 
@@ -1051,10 +1052,13 @@ class FEM:
 
         The slots compose into a ``solve_fn`` internally, so each dispatch path below keeps its
         periodic reduction and implicit-differentiation behaviour; slot solvers receive the
-        **BCOO** operator (no densification). Not yet supported: slots on transient problems,
-        ``x0`` on complex problems, ``precond`` on the (matrix-free) nonlinear path, and slots
-        combined with ``adapt=`` (remeshing invalidates warm starts and cached preconditioner
-        setups — pass ``solve_fn=`` there).
+        **BCOO** operator (no densification). On the (matrix-free) **nonlinear** path a
+        ``precond`` spec is materialized per Newton/Picard linearization against the JVP
+        operator — ``form`` / ``inner(...)`` / ``chebyshev`` / pre-built ``amg`` and their
+        ``block_diag``/``triangular`` compositions work; ``jacobi`` (needs the assembled
+        diagonal) does not. Not yet supported: slots on transient problems, ``x0`` on complex
+        problems, and slots combined with ``adapt=`` (remeshing invalidates warm starts and
+        cached preconditioner setups — pass ``solve_fn=`` there).
         """
         has_slots = (x0 is not None) or (nonlinear is not None) or (linear is not None) or (precond is not None)
         if adapt is not None:

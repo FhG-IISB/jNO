@@ -671,10 +671,14 @@ def my_precond(ctx):                      # ctx.A, ctx.diag(), ctx.fem
 u = fem.solve(linear=jno.solve.cg(), precond=my_precond)
 ```
 
-If your callable is pure JAX it inherits `jit`/`vmap`/AD automatically. Not yet supported (clear
-errors, see `plans/fem-solver-api.md` for the roadmap): slots on **transient** problems, `x0` on
-**complex** problems, and `precond=` on the matrix-free **nonlinear** path (form-based
-preconditioners are the planned route).
+If your callable is pure JAX it inherits `jit`/`vmap`/AD automatically. On the matrix-free
+**nonlinear** path the `precond` spec is materialized *per Newton/Picard linearization* against
+the JVP operator — so `form`, `inner(...)`, `chebyshev`, a pre-built `amg`, and their
+`block_diag`/`triangular` compositions all work (this is the nonlinear-saddle production
+pattern: `nonlinear=picard() + linear=fgmres() + precond=triangular(...)`); only specs that
+need the assembled matrix (`jacobi`, an unbuilt `amg`) raise. Not yet supported (clear errors,
+see `plans/fem-solver-api.md`): slots on **transient** problems, `x0` on **complex** problems,
+and slots combined with `adapt=`.
 
 ### Field parameters `k(x)` + regularization
 

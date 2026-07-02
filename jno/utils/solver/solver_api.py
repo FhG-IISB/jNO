@@ -37,6 +37,7 @@ __all__ = [
     "NonlinearSolver",
     "PrecondContext",
     "materialize_precond",
+    "prepare_precond",
     "compose_linear_solve_fn",
     "compose_nonlinear_solve_fn",
 ]
@@ -288,6 +289,19 @@ def materialize_precond(spec: Any, ctx: PrecondContext) -> Callable:
     )
 
 
+def prepare_precond(spec: Any, fem: Any) -> None:
+    """Run a spec's eager preparation (optional ``spec.prepare(fem)``) once, at compose time.
+
+    Auxiliary-assembly work (``jno.precond.form``) must happen OUTSIDE any trace: on the
+    matrix-free nonlinear path ``materialize`` runs inside the Newton/Picard ``while_loop``
+    body, where a fresh ``jno.fem`` assembly entangles with the loop tracers (and would
+    re-assemble per re-trace anyway). Specs without a ``prepare`` hook need no eager work.
+    """
+    prep = getattr(spec, "prepare", None)
+    if prep is not None and fem is not None:
+        prep(fem)
+
+
 def compose_linear_solve_fn(linear, precond, x0, fem=None) -> Callable:
     """Compose the linear-mode slots into the classic ``(A, b) -> x`` ``solve_fn`` contract.
 
@@ -300,6 +314,8 @@ def compose_linear_solve_fn(linear, precond, x0, fem=None) -> Callable:
         from ... import solve as _solve_ns
 
         linear = _solve_ns.bicgstab()  # matches the historic matrix-free default
+    if precond is not None:
+        prepare_precond(precond, fem)  # eager auxiliary assembly (safe for traced/parametric solves)
     x0_flat = None if x0 is None else jnp.asarray(x0).reshape(-1)
 
     def composed(A, b):
@@ -313,23 +329,40 @@ def compose_linear_solve_fn(linear, precond, x0, fem=None) -> Callable:
 def compose_nonlinear_solve_fn(nonlinear, linear, precond, fem=None) -> Callable:
     """Compose the nonlinear-mode slots into the ``(residual_fn, u0) -> u`` ``solve_fn`` contract.
 
-    The inner Newton/Picard linear solve is matrix-free (a JVP matvec), so a ``precond=`` spec
-    that needs the assembled matrix cannot be materialized here yet -- form-based preconditioners
-    (assembled auxiliary operators) are the planned route; until then this raises.
+    The inner Newton/Picard linear solve is **matrix-free** -- each outer iteration linearizes
+    the residual into a JVP matvec ``J(u_k) v`` -- so a ``precond=`` spec is materialized *per
+    linearization* against that matvec-only operator (wrapped with the system size, so block
+    slicing and power-iteration bounds work). The same preconditioned solve serves the
+    implicit-differentiation tangent/adjoint solve of ``custom_root``.
+
+    What composes here: ``form`` (auxiliary operators assemble independently -- and are cached,
+    so the assembly happens once even though materialization runs per iteration),
+    ``inner(<krylov>)``, ``chebyshev`` (bounds by power iteration on the JVP), a **pre-built**
+    ``amg`` (``spec.build(A_representative)``), and ``block_diag``/``triangular`` over those.
+    What cannot: specs that need the assembled matrix -- ``jacobi`` (no diagonal on a matvec),
+    an unbuilt ``amg``, ``lu``/``dense`` inner solvers on sub-blocks -- these raise their own
+    targeted errors when materialized.
     """
-    if precond is not None:
-        raise NotImplementedError(
-            "precond= on the matrix-free nonlinear path needs a form-based preconditioner "
-            "(assembled auxiliary operator) -- not implemented yet; see plans/fem-solver-api.md."
-        )
     if nonlinear is None:
         from ... import solve as _solve_ns
 
         nonlinear = _solve_ns.newton()
 
     inner = None
-    if linear is not None:
-        # adapt the linear slot to the driver's matrix-free ``(matvec, rhs) -> x`` inner contract
-        inner = lambda matvec, rhs: linear(LinearOperator.from_matvec(matvec), rhs)
+    if linear is not None or precond is not None:
+        if linear is None:
+            from ... import solve as _solve_ns
+
+            solver = _solve_ns.bicgstab()  # the historic matrix-free inner default
+        else:
+            solver = linear
+        if precond is not None:
+            prepare_precond(precond, fem)  # aux assembly now, NOT inside the traced Newton loop
+
+        def inner(matvec, rhs):
+            n = rhs.shape[0]
+            op = LinearOperator.from_matvec(matvec, shape=(n, n))
+            M = materialize_precond(precond, PrecondContext(op, fem)) if precond is not None else None
+            return solver(op, rhs, M=M)
 
     return lambda residual_fn, u0: nonlinear(residual_fn, u0, linear_solve=inner)

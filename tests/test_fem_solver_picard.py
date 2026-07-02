@@ -77,6 +77,70 @@ def test_picard_without_lag_is_damped_newton():
     assert np.abs(u - u_ref).max() < 1e-8
 
 
+def test_nonlinear_precond_form_full_system():
+    """precond= on the matrix-free nonlinear path: a form-based (assembled auxiliary) operator
+    is materialized per Newton linearization against the JVP operator."""
+    fem = _nonlinear_diffusion(lagged=False)
+    u_ref = np.asarray(fem.solve())
+    d = fem.domain
+    # the linear part of the operator as the auxiliary preconditioner (fresh symbols, same space)
+    w, s = d.fem_symbols(names=("w_aux", "s_aux"))
+    xi, yi, _ = d.variable("interior", split=True)
+    wi, si = w.bind(x=xi, y=yi), s.bind(x=xi, y=yi)
+    spec = jno.precond.form([wi.x * si.x + wi.y * si.y + wi * si], inner=jno.solve.lu(), quad_degree=4)
+    u = np.asarray(fem.solve(nonlinear=jno.solve.newton(), linear=jno.solve.fgmres(tol=1e-10), precond=spec))
+    assert np.abs(u - u_ref).max() < 1e-7
+
+
+def test_nonlinear_stokes_picard_fgmres_triangular():
+    """The production nonlinear-saddle architecture (the cold-rolling / rigid-plastic pattern):
+    velocity-dependent viscosity frozen with jno.lag, driven by Picard, each lagged Stokes system
+    solved by FGMRES with a block upper-triangular preconditioner (inexact CG velocity block +
+    weighted pressure-mass Schur approximation)."""
+    inner_, grad, trace = jno.np.inner, jno.np.grad, jno.np.trace
+    G, H, Lx = 1.0, 1.0, 2.0
+    u_profile = lambda y: (G / 2.0) * y * (H - y)
+    d = jno.domain(box(0.0, 0.0, Lx, H), mesh_size=0.3)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)
+    p, q = d.fem_symbols(names=("p", "q"), order=1)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    gu, gv = grad(u, [xi, yi]), grad(v, [xi, yi])
+    pp, qq = p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+    mu_eff = 1.0 + 0.5 * inner_(gu, gu, n_contract=2)  # shear-dependent viscosity
+    fem = jno.fem(
+        [
+            jno.lag(mu_eff) * inner_(gu, gv, n_contract=2) - pp * trace(gv),
+            -qq * trace(gu),
+            u(xb, yb)[0] - u_profile(yb),
+            u(xb, yb)[1] - 0.0,
+            p.pin(),
+        ]
+    )
+
+    # reference: dense Picard on the same lagged residual (same root, brute-force linear algebra)
+    def dense_picard(rf, u0):
+        w = u0
+        for _ in range(60):
+            J = jax.jacfwd(rf)(w)
+            w = w + jnp.linalg.solve(J, -rf(w))
+            if float(jnp.linalg.norm(rf(w))) < 1e-11:
+                break
+        return w
+
+    u_ref = np.asarray(fem.solve(solve_fn=dense_picard))
+
+    sol = fem.solve(
+        nonlinear=jno.solve.picard(),
+        linear=jno.solve.fgmres(tol=1e-10, restart=40, maxiter=4000),
+        precond=jno.precond.triangular(
+            (u, jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=60))),
+            (p, jno.precond.form([pp * qq], inner=jno.solve.dense())),
+        ),
+    )
+    assert np.abs(np.asarray(sol) - u_ref).max() < 1e-6
+
+
 def test_lag_freezes_gradients_but_not_values():
     # array fallback: values pass through, differentiation sees a constant
     x = jnp.asarray([1.5, -2.0])

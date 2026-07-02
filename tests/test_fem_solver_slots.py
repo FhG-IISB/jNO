@@ -215,9 +215,11 @@ def test_nonlinear_slot_on_linear_problem_raises():
         fem.solve(nonlinear=jno.solve.newton())
 
 
-def test_precond_on_matrix_free_nonlinear_raises():
+def test_jacobi_on_matrix_free_nonlinear_raises():
+    """precond= composes with the nonlinear path (materialized per linearization against the JVP
+    operator) — but jacobi needs the assembled diagonal, which a matvec-only operator lacks."""
     fem = _nonlinear()
-    with pytest.raises(NotImplementedError, match="form-based"):
+    with pytest.raises(TypeError, match="matvec-only"):
         fem.solve(nonlinear=jno.solve.newton(), precond=jno.precond.jacobi())
 
 

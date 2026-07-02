@@ -95,6 +95,14 @@ class _Form:
         self.quad_degree = quad_degree
         self._op = None  # assembled once; the auxiliary operator is parameter-independent
 
+    def prepare(self, fem):
+        """Eager one-time assembly (called at compose time, OUTSIDE any trace — assembling a
+        fresh ``jno.fem`` inside the Newton/Picard ``while_loop`` entangles with loop tracers)."""
+        if self._op is None:
+            from .utils.solver.solver_api import PrecondContext as _Ctx
+
+            self._op = _Ctx(None, fem).assemble(self.terms, quad_degree=self.quad_degree)
+
     def materialize(self, ctx: PrecondContext):
         if self._op is None:
             self._op = ctx.assemble(self.terms, quad_degree=self.quad_degree)
@@ -184,9 +192,20 @@ def _pairs_to_appliers(pairs, ctx: PrecondContext):
     return appliers
 
 
+def _prepare_pairs(pairs, fem):
+    """Recurse the eager-preparation hook into a block composition's child specs."""
+    for _field, spec in pairs:
+        prep = getattr(spec, "prepare", None)
+        if prep is not None:
+            prep(fem)
+
+
 class _BlockDiag:
     def __init__(self, pairs):
         self.pairs = pairs
+
+    def prepare(self, fem):
+        _prepare_pairs(self.pairs, fem)
 
     def materialize(self, ctx: PrecondContext):
         appliers = _pairs_to_appliers(self.pairs, ctx)
@@ -206,6 +225,9 @@ class _BlockDiag:
 class _Triangular:
     def __init__(self, pairs):
         self.pairs = pairs
+
+    def prepare(self, fem):
+        _prepare_pairs(self.pairs, fem)
 
     def materialize(self, ctx: PrecondContext):
         appliers = _pairs_to_appliers(self.pairs, ctx)
