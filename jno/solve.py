@@ -27,7 +27,20 @@ import jax.numpy as jnp
 
 from .utils.solver.solver_api import LinearOperator, LinearSolver, NonlinearSolver, _maybe_residual_check
 
-__all__ = ["LinearOperator", "LinearSolver", "NonlinearSolver", "lu", "dense", "cg", "bicgstab", "gmres", "newton"]
+__all__ = [
+    "LinearOperator",
+    "LinearSolver",
+    "NonlinearSolver",
+    "lu",
+    "dense",
+    "cg",
+    "bicgstab",
+    "gmres",
+    "fgmres",
+    "minres",
+    "chebyshev",
+    "newton",
+]
 
 
 def lu() -> LinearSolver:
@@ -92,6 +105,84 @@ def gmres(*, tol: float = 1e-8, atol: float = 0.0, maxiter: Optional[int] = None
     (e.g. multigrid-with-tolerance) preconditioner a flexible variant (FGMRES) is required --
     planned; see ``plans/fem-solver-api.md``."""
     return _krylov("gmres", tol, atol, maxiter, restart=restart, solve_method="batched")
+
+
+def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str):
+    """Run a raw (non-differentiable) iteration inside ``lax.custom_linear_solve``.
+
+    The differentiability firewall: gradients w.r.t. ``b`` and anything the matvec closes over
+    come from the implicit transpose solve — the loop itself is never differentiated, and the
+    preconditioner needs no gradient path at all. The transpose solve runs the same iteration
+    on ``A^T`` (on ``A`` itself when ``symmetric``), reusing ``M`` (legitimate: a preconditioner
+    only affects convergence speed, never the converged solution).
+    """
+    fwd = lambda _mv, rhs: raw(op.mv, rhs, M=M, x0=x0)
+    rev = fwd if symmetric else (lambda _mv, rhs: raw(op.T.mv, rhs, M=M, x0=None))
+    x = jax.lax.custom_linear_solve(op.mv, b, fwd, transpose_solve=rev, symmetric=symmetric)
+    return _maybe_residual_check(op, b, x, name)
+
+
+def fgmres(*, tol: float = 1e-8, restart: int = 30, maxiter: int = 1000) -> LinearSolver:
+    """Flexible restarted GMRES (Saad 1993, Alg. 2.2; see
+    :func:`jno.utils.solver.krylov.fgmres`) — the outer solver to use when the preconditioner is
+    itself **iterative** (an inner Krylov sweep, a multigrid cycle with a tolerance, a block/Schur
+    recipe with inexact inner solves), which plain GMRES's fixed-``M`` assumption forbids.
+    Memory: two ``(restart, n)`` bases."""
+
+    def _fn(op: LinearOperator, b, *, M, x0):
+        from .utils.solver.krylov import fgmres as _raw
+
+        raw = lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, restart=restart, maxiter=maxiter)
+        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=False, name="fgmres")
+
+    return LinearSolver(_fn, name="fgmres")
+
+
+def minres(*, tol: float = 1e-8, maxiter: int = 2000) -> LinearSolver:
+    """MINRES (Paige & Saunders 1975, §5; see :func:`jno.utils.solver.krylov.minres`) — the
+    Krylov method for **symmetric indefinite** systems: Stokes/Biot saddle points, biharmonic
+    (Argyris/Morley), shifted Helmholtz-like operators. Monotone residual where BiCGStab is
+    erratic; ``O(1)`` memory where GMRES grows with ``restart``. The preconditioner must be
+    symmetric positive definite even when ``A`` is indefinite."""
+
+    def _fn(op: LinearOperator, b, *, M, x0):
+        from .utils.solver.krylov import minres as _raw
+
+        raw = lambda mv, rhs, M, x0: _raw(mv, rhs, M=M, x0=x0, tol=tol, maxiter=maxiter)
+        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="minres")
+
+    return LinearSolver(_fn, name="minres")
+
+
+def chebyshev(
+    *,
+    lmin: Optional[float] = None,
+    lmax: Optional[float] = None,
+    tol: float = 1e-8,
+    maxiter: int = 500,
+    bound_iters: int = 30,
+    lmin_ratio: float = 1.0 / 30.0,
+    safety: float = 1.05,
+) -> LinearSolver:
+    """Chebyshev semi-iteration for **SPD** systems (Golub & Varga 1961; Saad 2003 §12.3,
+    Alg. 12.1; see :func:`jno.utils.solver.krylov.chebyshev_iteration`). Inner-product free —
+    matvecs and AXPYs only, no reductions — so it shines under ``vmap`` and on GPU where CG's
+    dot products serialise. Needs spectrum bounds of ``M^{-1} A``: pass ``lmin``/``lmax`` when
+    known; otherwise ``lmax`` is estimated by ``bound_iters`` power-iteration steps (inflated by
+    ``safety``) and ``lmin = lmin_ratio * lmax`` — a smoother-style default that converges but
+    slower than true bounds; prefer real bounds for a *solver* use."""
+
+    def _fn(op: LinearOperator, b, *, M, x0):
+        from .utils.solver.krylov import chebyshev_iteration, power_iteration_bound
+
+        hi = lmax
+        if hi is None:
+            hi = safety * power_iteration_bound(op.mv, b.shape[0], dtype=b.dtype, iters=bound_iters, M=M)
+        lo = lmin if lmin is not None else lmin_ratio * hi
+        raw = lambda mv, rhs, M, x0: chebyshev_iteration(mv, rhs, lmin=lo, lmax=hi, M=M, x0=x0, tol=tol, maxiter=maxiter)
+        return _firewalled(raw, op, b, M=M, x0=x0, symmetric=True, name="chebyshev")
+
+    return LinearSolver(_fn, name="chebyshev")
 
 
 def newton(

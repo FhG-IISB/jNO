@@ -26,7 +26,7 @@ import jax.numpy as jnp
 
 from .utils.solver.solver_api import PrecondContext  # noqa: F401  (re-export for user specs)
 
-__all__ = ["PrecondContext", "jacobi"]
+__all__ = ["PrecondContext", "jacobi", "chebyshev"]
 
 
 class _Jacobi:
@@ -42,6 +42,33 @@ class _Jacobi:
         return "jno.precond.jacobi()"
 
 
+class _Chebyshev:
+    """Spec for the fixed-degree Chebyshev polynomial preconditioner; see :func:`chebyshev`."""
+
+    def __init__(self, degree, lmin, lmax, lmin_ratio, safety, bound_iters):
+        self.degree = degree
+        self.lmin, self.lmax = lmin, lmax
+        self.lmin_ratio, self.safety, self.bound_iters = lmin_ratio, safety, bound_iters
+
+    def materialize(self, ctx: PrecondContext):
+        from .utils.solver.krylov import chebyshev_apply, power_iteration_bound
+
+        if ctx.A.shape is None and self.lmax is None:
+            raise TypeError(
+                "jno.precond.chebyshev on a matvec-only operator needs explicit spectrum bounds "
+                "(lmin=, lmax=) — there is no assembled matrix to estimate them from."
+            )
+        hi = self.lmax
+        if hi is None:
+            n = ctx.A.shape[0]
+            hi = self.safety * power_iteration_bound(ctx.A.mv, n, iters=self.bound_iters)
+        lo = self.lmin if self.lmin is not None else self.lmin_ratio * hi
+        return lambda v: chebyshev_apply(ctx.A.mv, v, lmin=lo, lmax=hi, degree=self.degree)
+
+    def __repr__(self):
+        return f"jno.precond.chebyshev(degree={self.degree})"
+
+
 def jacobi() -> _Jacobi:
     """Diagonal (Jacobi) preconditioner ``M^{-1} v = v / diag(A)``.
 
@@ -55,3 +82,25 @@ def jacobi() -> _Jacobi:
     historic steady-linear default exactly.
     """
     return _Jacobi()
+
+
+def chebyshev(
+    *,
+    degree: int = 8,
+    lmin: float | None = None,
+    lmax: float | None = None,
+    lmin_ratio: float = 1.0 / 30.0,
+    safety: float = 1.05,
+    bound_iters: int = 30,
+) -> _Chebyshev:
+    """Fixed-degree Chebyshev **polynomial** preconditioner ``M^{-1} = p_degree(A) ≈ A^{-1}``
+    for SPD operators (Saad 2003, §12.3 / Golub & Varga 1961 — the same recurrence as
+    ``jno.solve.chebyshev``, truncated at ``degree`` with no convergence test, which keeps the
+    application a fixed *linear* map so it may precondition CG and MINRES).
+
+    The GPU-era substitute for Gauss-Seidel/ILU smoothing: only matvecs and AXPYs — no
+    reductions, no triangular solves — ``jit``- and ``vmap``-native. Spectrum bounds of ``A``
+    are taken from ``lmin``/``lmax`` when given, else estimated by power iteration (``safety``
+    inflation, ``lmin = lmin_ratio * lmax``).
+    """
+    return _Chebyshev(degree, lmin, lmax, lmin_ratio, safety, bound_iters)

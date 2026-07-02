@@ -589,9 +589,21 @@ wrappers sit on `lax.custom_linear_solve`, Newton on `lax.custom_root`) — and 
 implementations (`jax.scipy.sparse.linalg`, `sparse_lu_solve`) rather than duplicating them.
 Slot solvers receive the assembler's **BCOO** operator directly (no densification), and compose
 with the periodic reduction and every parametric/inverse path unchanged. Pick by structure:
-`cg` for SPD (Poisson, elasticity, mass), `bicgstab`/`gmres` for non-symmetric, `lu` for
-indefinite saddle systems (Stokes/Biot — note `lu` has no vmap batching rule; use a Krylov
-solver inside batched solves), `dense` for small systems.
+
+| structure | solver | notes |
+|---|---|---|
+| SPD (Poisson, elasticity, mass) | `cg` | cheapest per iteration |
+| non-symmetric (advection, SUPG) | `bicgstab` / `gmres` | `bicgstab` == the historic default (with `jacobi()`) |
+| **iterative preconditioner** (inner Krylov, block/Schur with inexact inner solves) | `fgmres` | flexible right preconditioning — Saad, *SIAM J. Sci. Stat. Comput.* 14(2), 1993, Alg. 2.2 |
+| symmetric **indefinite** (Stokes/Biot saddle, biharmonic) | `minres` | monotone residual, `O(1)` memory — Paige & Saunders, *SIAM J. Numer. Anal.* 12(4), 1975 |
+| SPD, batched/GPU-heavy | `chebyshev` | inner-product free (no reductions) — Golub & Varga 1961; Saad, *Iterative Methods*, 2003, §12.3 |
+| indefinite, single solve | `lu` | sparse-direct; **no vmap rule** — use a Krylov solver inside batched solves |
+| small systems / coarse blocks | `dense` | LAPACK, vmap-native |
+
+Preconditioner specs so far: `jno.precond.jacobi()` (diagonal) and `jno.precond.chebyshev(degree=…)`
+— a fixed-degree Chebyshev **polynomial** preconditioner (same references as the solver): matvecs
+and AXPYs only, the GPU-era substitute for Gauss-Seidel/ILU smoothing, and a fixed *linear* map so
+it legally preconditions `cg`/`minres`.
 
 **User extension** is duck-typed — a linear solver is any
 `fn(A, b, *, M=None, x0=None) -> x` with `A` a `jno.solve.LinearOperator` (`.mv`, `.T`,
