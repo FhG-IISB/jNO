@@ -582,6 +582,23 @@ def _is_complex_form(domain: Any, ir: Any) -> bool:
     return False
 
 
+def _complex_block_bcoo(A_r: Any, A_i: Any, n: int) -> Any:
+    """Assemble the real-equivalent block ``[[A_r, -A_i], [A_i, A_r]]`` (shape ``2n x 2n``) as one
+    BCOO from the two sparse legs, by placing each sub-block's triplets at its ``n`` offset -- no
+    densification. The four sub-blocks occupy disjoint index ranges, so the result has no duplicate
+    coordinates. ``A_r`` appears at (0,0) and (n,n); ``A_i`` at (n,0) and, negated, at (0,n)."""
+    from jax.experimental import sparse as jsp
+
+    ir, dr = A_r.indices, A_r.data
+    ii, di = A_i.indices, A_i.data
+    off = jnp.asarray([n, n], dtype=ir.dtype)
+    col = jnp.asarray([0, n], dtype=ir.dtype)
+    row = jnp.asarray([n, 0], dtype=ir.dtype)
+    indices = jnp.concatenate([ir, ii + col, ii + row, ir + off], axis=0)  # (0,0),(0,n),(n,0),(n,n)
+    data = jnp.concatenate([dr, -di, di, dr])
+    return jsp.BCOO((data, indices), shape=(2 * n, 2 * n))
+
+
 def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None, periodic: Optional[dict] = None) -> Any:
     """Solve a complex linear FEM system via the real-equivalent block (everything was
     assembled as two *real* systems)::
@@ -589,6 +606,12 @@ def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None, periodic
         [[A_r, -A_i], [A_i, A_r]] [u_r; u_i] = [b_r; b_i],     u = u_r + i u_i.
 
     ``ops = (op_r, op_i)`` are the Re-coeff and Im-coeff real systems (each a raw ``(A, b)``).
+
+    The real-equivalent block is itself **sparse** -- ``[[A_r,-A_i],[A_i,A_r]]`` is four sparse
+    sub-blocks -- so by default it is assembled as one BCOO (concatenating the triplets at the right
+    ``n`` offsets) and solved with the same sparse-direct path the real solves use, never densifying
+    (memory ``O(nnz)``; robust on the indefinite Helmholtz block). Pass ``solve_fn=(A, b) -> u`` to
+    use a dense/direct solver instead -- it receives the densified block.
 
     A periodic tie reduces *both* legs by the **same** prolongation ``P`` -- Re and Im live on one FE
     space, so one ``P`` -- before the block is formed: ``A -> P^T A P``, ``b -> P^T b`` on each leg.
@@ -609,15 +632,26 @@ def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None, periodic
         if periodic is not None:
             A = reduce_matrix_periodic(periodic, A)  # P^T A P  (stays sparse if A is BCOO)
             b = reduce_vector_periodic(periodic, b)  # P^T b
-        A = jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)
-        return A, jnp.asarray(b).reshape(-1)
+        return A, b  # keep A sparse (BCOO) -- do NOT densify
 
     (A_r, b_r), (A_i, b_i) = _ab(ops[0]), _ab(ops[1])
-    n = A_r.shape[0]
-    block = jnp.block([[A_r, -A_i], [A_i, A_r]])
+    n = b_r.shape[0]
     rhs = jnp.concatenate([b_r, b_i])
-    solve_fn = solve_fn or (lambda A, b: jnp.linalg.solve(A, b))
-    sol = jnp.asarray(solve_fn(block, rhs))
+    is_sparse = hasattr(A_r, "indices") and hasattr(A_i, "indices")
+
+    if solve_fn is not None:
+        # user solver receives the densified block (dense/direct back-compat path)
+        Ar_d = jnp.asarray(A_r.todense() if hasattr(A_r, "todense") else A_r)
+        Ai_d = jnp.asarray(A_i.todense() if hasattr(A_i, "todense") else A_i)
+        sol = jnp.asarray(solve_fn(jnp.block([[Ar_d, -Ai_d], [Ai_d, Ar_d]]), rhs))
+    elif is_sparse:
+        from .utils.solver.linear import sparse_lu_solve
+
+        sol = sparse_lu_solve(_complex_block_bcoo(A_r, A_i, n), rhs)  # sparse-direct on the 2n block
+    else:
+        Ar_d, Ai_d = jnp.asarray(A_r), jnp.asarray(A_i)  # dense fallback (e.g. 1D / already dense)
+        sol = jnp.linalg.solve(jnp.block([[Ar_d, -Ai_d], [Ai_d, Ar_d]]), rhs)
+
     if periodic is None:
         return sol[:n] + 1j * sol[n:]
     # Prolong the real and imaginary reduced halves *separately* (real P @ real vector); prolonging the
