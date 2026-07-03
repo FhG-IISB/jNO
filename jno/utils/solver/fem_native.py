@@ -546,6 +546,19 @@ def assemble_fem_native(
         raise NotImplementedError(
             "jno.fem (native): a neural coefficient on a coupled (multi-field) problem is not supported yet."
         )
+    # Trainable networks join the runtime-parameter exprs as ModelWeights slots: the solve nodes
+    # (FemLinearSystem/FemResidualOperator/SemidiscreteTimeBlock) resolve each to the current module
+    # pytree, which arrives back here in ``args`` and is re-evaluated at the quad points inside the
+    # kernel — keeping ∂solve/∂weights exact through the implicit-diff solvers.
+    if neural_param_names:
+        from ...trace import ModelWeights
+
+        _param_and_neural_exprs: Dict[str, Any] = {
+            **_rt_param_exprs,
+            **{n: ModelWeights(_neural_models[n]) for n in neural_param_names},
+        }
+    else:
+        _param_and_neural_exprs = dict(_rt_param_exprs)
     # A nodal FIELD parameter k(x) interpolates on one field's FE space. Single field -> field 0. For a
     # coupled (multi-field) problem, associate it with the field whose test function appears in the
     # term(s) that reference it (e.g. mu(x)*(grad u . grad v) -> the velocity field), so its nodal values
@@ -1017,14 +1030,6 @@ def assemble_fem_native(
 
     # === transient (Mu̇ + Au = c or M u̇ + R(u) = 0) ===
     if ic_residuals or any(_contains_temporal_derivative(t) for t in all_terms):
-        if neural_all_names:
-            # The non-parametric transient branches assemble with args=None (the operator at t=0, the
-            # forcing per step) — a net there would silently freeze at its initial weights. Fail loud
-            # until the transient threading lands.
-            raise NotImplementedError(
-                "jno.fem (native): a neural coefficient in a transient weak form is not supported yet — "
-                "steady (linear/nonlinear) forms only for now."
-            )
         from ..._fem import _bare, _essential_spec, _eval_value_node_at, _field_key_of
         from .backend_blocks import SemidiscreteTimeBlock
         from .time_route import _infer_time_window, _strip_temporal_trial_derivative
@@ -1038,6 +1043,15 @@ def assemble_fem_native(
             raise ValueError(
                 "jno.fem (native): an initial condition was provided but no temporal term "
                 "(e.g. ``inner(u.t, v)``) was found in the volume weak form."
+            )
+        if neural_param_names and any(_collect_neural_coefficient_exprs(t) for t in temporal):
+            # The mass matrix is assembled ONCE with args=None — a trainable net on the u̇ term
+            # would silently freeze at its initial weights. Fail loud (a frozen net is fine: it
+            # evaluates from its stored module by design; the default collection excludes frozen).
+            raise NotImplementedError(
+                "jno.fem (native): a trainable neural coefficient on the mass (u_t) term is not "
+                "supported — the mass matrix is assembled once, so the net would silently freeze. "
+                "Use it on spatial terms, or .freeze() the network."
             )
 
         mass_terms = [_strip_temporal_trial_derivative(t) for t in temporal]
@@ -1110,7 +1124,7 @@ def assemble_fem_native(
                     mass=lambda t, args=None, _M=M_bc: _M,
                     residual=res_bc,
                     jacobian=jac_bc,
-                    runtime_parameter_exprs=dict(_rt_param_exprs),
+                    runtime_parameter_exprs=dict(_param_and_neural_exprs),
                     **common,
                 ),
                 "transient",
@@ -1120,7 +1134,7 @@ def assemble_fem_native(
         # ---- linear parametric transient: the operator A(t, args) is re-evaluated each step.
         # Row-replacement Dirichlet (rows -> identity, columns kept) needs no args-dependent lift --
         # the coupling to the held Dirichlet value sits on the LHS, the constant g in the affine bias. ----
-        if runtime_parameter_tags:
+        if runtime_parameter_tags or neural_param_names:
             M_bc = M if d_dofs is None else bcoo_zero_rows_cols(M, d_dofs)
             c_bias = zeros if d_dofs is None else zeros.at[d_dofs].set(d_vals)
             free_mask = jnp.ones((total,), dtype=zeros.dtype)
@@ -1140,10 +1154,13 @@ def assemble_fem_native(
                     operator_fn=operator_fn,
                     affine_bias=c_bias,
                     forcing_vector_fn=forcing_vector_fn,
-                    runtime_parameter_exprs=dict(_rt_param_exprs),
+                    runtime_parameter_exprs=dict(_param_and_neural_exprs),
                     # The operator is re-assembled at each (t, args) -- a general (non-affine) operator,
                     # so it covers a parameter inside a nonlinear coefficient (e.g. exp(logk)) too.
-                    metadata={"runtime_parameter_names": list(runtime_parameter_tags), "nonaffine_operator": True},
+                    metadata={
+                        "runtime_parameter_names": list(runtime_parameter_tags) + list(neural_param_names),
+                        "nonaffine_operator": True,
+                    },
                     **common,
                 ),
                 "transient",
@@ -1214,15 +1231,7 @@ def assemble_fem_native(
     # coefficient into the per-cell assembly (no float() cast). The same re-assembly handles affine,
     # non-affine and (scalar) parameters uniformly. ----
     if runtime_parameter_tags or neural_param_names:
-        from ...trace import FemLinearSystem, ModelWeights
-
-        # Trainable networks join the runtime-parameter exprs as ModelWeights slots: the solve
-        # nodes resolve each to the current module pytree, which arrives here in ``args`` and is
-        # re-evaluated at the quad points inside the kernel (keeping ∂solve/∂weights exact).
-        _param_and_neural_exprs = {
-            **_rt_param_exprs,
-            **{n: ModelWeights(_neural_models[n]) for n in neural_param_names},
-        }
+        from ...trace import FemLinearSystem
 
         if nonlinear:
 
@@ -1235,7 +1244,7 @@ def assemble_fem_native(
                 return J if _d is None else bcoo_set_dirichlet_rows(J, _d)
 
             return (
-                FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=_param_and_neural_exprs),
+                FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_param_and_neural_exprs)),
                 "nonlinear",
                 offs,
             )
@@ -1256,7 +1265,7 @@ def assemble_fem_native(
             b0,
             operator_fn=lambda args=None: _assemble_at(args)[0],
             rhs_fn=lambda args=None: _assemble_at(args)[1],
-            runtime_parameter_exprs=_param_and_neural_exprs,
+            runtime_parameter_exprs=dict(_param_and_neural_exprs),
             # The native parametric path re-assembles the operator at each args (it builds no affine
             # parameter basis), so every runtime parameter -- affine or not -- takes the re-assembly route.
             metadata={"nonaffine_operator": True},

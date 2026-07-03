@@ -510,9 +510,116 @@ def test_ku_composes_with_solver_slots():
     assert np.isfinite(val).all()
 
 
+# ==========================================================================
+# transient: neural coefficients in the time stepper
+# ==========================================================================
+
+
+def _transient_setup(mesh_size=0.25, time=(0.0, 0.05, 11)):
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size, time=time)
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    u0 = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
+    return d, u, phi, (xi, yi), (xb, yb), ci, ui, vi, u0
+
+
+def _grid_ts(block):
+    n_steps = int(round((float(block.t1) - float(block.t0)) / float(block.dt)))
+    return jnp.linspace(float(block.t0), float(block.t1), n_steps + 1)
+
+
+def test_transient_net_kx_trajectory_matches_frozen_reference():
+    """Transient heat with a net diffusivity: the parametric per-step re-assembly at the net's
+    stored weights reproduces the frozen (non-parametric) twin's trajectory exactly."""
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    d, u, phi, (xi, yi), (xb, yb), ci, ui, vi, u0 = _transient_setup()
+    net = _mlp_net(key=9)
+    fem = jno.fem([ui.t * vi + (1.0 + net(xi, yi)) * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - u0])
+    assert fem.is_transient
+    (name,) = fem.operator.runtime_parameter_exprs
+    assert isinstance(fem.operator.runtime_parameter_exprs[name], ModelWeights)
+    traj = _default_transient_integrate(fem.operator, {name: net.module}, _grid_ts(fem.operator))
+
+    d2, u2, phi2, (x2, y2), (xb2, yb2), ci2, u2i, v2i, u02 = _transient_setup()
+    net_f = _mlp_net(key=9)  # identical weights
+    net_f.freeze()
+    fem_f = jno.fem(
+        [
+            u2i.t * v2i + (1.0 + net_f(x2, y2)) * (u2i.x * v2i.x + u2i.y * v2i.y),
+            u2(xb2, yb2) - 0.0,
+            u2(ci2[0], ci2[1]) - u02,
+        ]
+    )
+    traj_f = _default_transient_integrate(fem_f.operator, {}, _grid_ts(fem_f.operator))
+    assert traj.shape == traj_f.shape
+    assert float(jnp.max(jnp.abs(traj - traj_f))) < 1e-9
+
+
+def test_transient_neural_kx_recovers_via_crux():
+    """Recover a smooth diffusivity k(x) from a u(t) trajectory with a coordinate MLP trained
+    through the transient ``fem.solve()`` (per-step re-assembly, implicit-diff to the weights) —
+    the neural analogue of the transient nodal-field recovery."""
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    d, u, phi, (xi, yi), (xb, yb), ci, ui, vi, u0 = _transient_setup(mesh_size=0.2)
+    fem_ref = jno.fem(
+        [ui.t * vi + (1.0 + 0.5 * xi + 0.3 * yi) * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - u0]
+    )
+    u_obs = _default_transient_integrate(fem_ref.operator, {}, _grid_ts(fem_ref.operator))
+    assert not bool(jnp.isnan(u_obs).any())
+
+    d2, u2, phi2, (x2, y2), (xb2, yb2), ci2, u2i, v2i, u02 = _transient_setup(mesh_size=0.2)
+    net = _mlp_net(key=10)
+    net.optimizer(optax.adam(1e-2))
+    fem = jno.fem(
+        [u2i.t * v2i + (1.0 + net(x2, y2)) * (u2i.x * v2i.x + u2i.y * v2i.y), u2(xb2, yb2) - 0.0, u2(ci2[0], ci2[1]) - u02]
+    )
+    crux = jno.core([(fem.solve() - u_obs).mse], domain=_DUMMY)
+    crux.solve(300)
+
+    trained = crux.eval([ModelWeights(net)])
+    nodes = np.asarray(d2.built_mesh.points)[:, :2]
+    k_net = 1.0 + np.asarray(trained(jnp.asarray(nodes))).reshape(-1)
+    k_true = 1.0 + 0.5 * nodes[:, 0] + 0.3 * nodes[:, 1]
+    rel = float(np.linalg.norm(k_net - k_true) / np.linalg.norm(k_true))
+    assert rel < 0.1, f"transient neural k(x) recovery rel-err {rel:.3e}"
+
+
+def test_transient_nonlinear_ku_recovers_via_crux():
+    """A constitutive law k(u) in a TRANSIENT form: u_t = div((a + b·u²)∇u). The per-step Newton
+    (implicit backward Euler) carries the net's u-dependence; recover (a, b) from the trajectory
+    through fem.solve()."""
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    d, u, phi, (xi, yi), (xb, yb), ci, ui, vi, u0 = _transient_setup(mesh_size=0.25, time=(0.0, 0.05, 6))
+    fem_ref = jno.fem(
+        [ui.t * vi + (1.0 + 0.5 * ui**2) * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - u0]
+    )
+    u_obs = _default_transient_integrate(fem_ref.operator, {}, _grid_ts(fem_ref.operator))
+
+    d2, u2, phi2, (x2, y2), (xb2, yb2), ci2, u2i, v2i, u02 = _transient_setup(mesh_size=0.25, time=(0.0, 0.05, 6))
+    net = _quad_net(a=1.3, b=0.1)  # start away from the truth (1.0, 0.5)
+    net.optimizer(optax.adam(2e-2))
+    fem = jno.fem([u2i.t * v2i + net(u2i) * (u2i.x * v2i.x + u2i.y * v2i.y), u2(xb2, yb2) - 0.0, u2(ci2[0], ci2[1]) - u02])
+    assert fem.is_transient and not fem.operator.is_linear()
+
+    crux = jno.core([(fem.solve() - u_obs).mse], domain=_DUMMY)
+    crux.solve(250)
+    trained = crux.eval([ModelWeights(net)])
+    u_grid = jnp.linspace(0.0, float(jnp.max(u_obs)), 32)
+    k_learned = np.asarray(trained(u_grid)).reshape(-1)
+    k_true = 1.0 + 0.5 * np.asarray(u_grid) ** 2
+    rel = float(np.linalg.norm(k_learned - k_true) / np.linalg.norm(k_true))
+    assert rel < 0.05, f"transient constitutive-law recovery rel-err {rel:.3e}"
+
+
 def test_scope_guards_fail_loud():
-    """v1 scope limits raise explicit NotImplementedError, never mis-assemble: a net inside a
-    Dirichlet value and a net in a transient form."""
+    """Scope limits raise explicit NotImplementedError, never mis-assemble: a net inside a
+    Dirichlet value and a trainable net on the mass (u_t) term."""
     d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _poisson_setup()
     net = _mlp_net(key=5)
 
@@ -520,19 +627,13 @@ def test_scope_guards_fail_loud():
     with pytest.raises(NotImplementedError, match="Dirichlet"):
         jno.fem([(ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - net(xb, yb)])
 
-    # transient form (fail loud until the transient threading lands)
-    d2 = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3, time=(0.0, 0.02, 5))
-    u2, phi2 = d2.fem_symbols()
-    x2, y2, t2 = d2.variable("interior", split=True)
-    xb2, yb2, _ = d2.variable("boundary", split=True)
-    ci = d2.variable("initial", split=True)
-    u2i, v2i = u2.bind(x=x2, y=y2, t=t2), phi2.bind(x=x2, y=y2, t=t2)
-    psi0 = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
+    # trainable net on the mass term: the mass matrix assembles once -> would silently freeze
+    d2, u2, phi2, (x2, y2), (xb2, yb2), ci, u2i, v2i, psi0 = _transient_setup(mesh_size=0.3, time=(0.0, 0.02, 5))
     net2 = _mlp_net(key=6)
-    with pytest.raises(NotImplementedError, match="transient"):
+    with pytest.raises(NotImplementedError, match="mass"):
         jno.fem(
             [
-                u2i.t * v2i + (1.0 + net2(x2, y2)) * (u2i.x * v2i.x + u2i.y * v2i.y),
+                (1.0 + net2(x2, y2)) * u2i.t * v2i + (u2i.x * v2i.x + u2i.y * v2i.y),
                 u2(xb2, yb2) - 0.0,
                 u2(ci[0], ci[1]) - psi0,
             ]

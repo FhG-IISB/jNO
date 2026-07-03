@@ -2385,9 +2385,15 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             # parameter k(x). A time-varying Dirichlet g(x,t) routes native only for the LINEAR,
             # non-parametric transient (the row-replacement + per-step Dirichlet-lift forcing path);
             # combined with a runtime parameter or a nonlinear residual it is rejected below.
+            from .utils.solver.parametric_helpers import _collect_neural_coefficient_exprs as _cnce
             from .utils.solver.weak_form import _is_obviously_nonlinear_in_unknown as _nlin
 
-            _native_now = not any(_crp(b) for b in weak_bares) and not any(_nlin(domain, b) for b in weak_bares)
+            _native_now = (
+                not any(_crp(b) for b in weak_bares)
+                and not any(_nlin(domain, b) for b in weak_bares)
+                # tv-Dirichlet g(x,t) + a TRAINABLE net: rejected below (frozen nets stay native)
+                and not any(_cnce(b) for b in weak_bares)
+            )
         if _native_now:
             from .utils.solver.fem_native import assemble_fem_native
 

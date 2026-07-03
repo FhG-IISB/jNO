@@ -752,10 +752,17 @@ coordinate-inputs can be mixed (`net(xi, yi, ui)`). Classification is automatic:
 arguments carry the unknown makes the form nonlinear — including a bare reaction term
 `net(u)*v` — while `net(x, y)` keeps the system linear(-parametric).
 
-Current scope: **steady** weak forms (linear k(x) and nonlinear k(u)/k(∇u)) on the native 2D/3D
-Lagrange assembler, single field. Not yet supported (each fails loud): networks inside
-Dirichlet/IC values, transient forms, `complex=True` forms, coupled multi-field problems, 1D, and
-non-nodal (Argyris/Morley/Hermite/RT/Nédélec) elements.
+**Transient forms** work the same way — the per-step operator (or the per-step Newton residual,
+for `net(u)`) re-evaluates the network, so a diffusivity or constitutive law is recovered from a
+`u(t)` trajectory exactly like the scalar/nodal transient inverse below. One exclusion: a
+*trainable* net on the mass (`u_t`) term is rejected (the mass matrix assembles once — the net
+would silently freeze; `.freeze()` it or keep it on spatial terms).
+
+Current scope: steady and transient weak forms (linear k(x) and nonlinear k(u)/k(∇u)) on the
+native 2D/3D Lagrange assembler, single field. Not yet supported (each fails loud): networks
+inside Dirichlet/IC values, on the mass term, `complex=True` forms, time-varying Dirichlet
+`g(x,t)` combined with a trainable net, coupled multi-field problems, 1D, and non-nodal
+(Argyris/Morley/Hermite/RT/Nédélec) elements.
 
 ### Transient inverse
 
