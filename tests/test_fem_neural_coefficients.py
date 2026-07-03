@@ -915,16 +915,38 @@ def test_hermite_neural_kx_recovers_via_crux():
     assert rel < 0.12, f"Hermite neural k(x) recovery rel-err {rel:.3e}"
 
 
-def test_nonnodal_vector_family_guard():
-    """A neural coefficient on the vector edge families (RT/Nédélec) fails loud — a net(u) with a
-    vector-valued trial input is undefined, and a scalar k there is out of v1 scope."""
+def test_rt_scalar_net_matches_coordinate_coeff():
+    """A scalar coordinate net(x) coefficient on a vector H(div) (RT) form — a spatially-varying
+    permeability multiplying the vector mass — assembles the same operator as the scalar
+    coefficient. The net evaluates to a scalar at the quad points, independent of the Piola-pushed
+    vector basis; the gather oracle for the edge families."""
+    from jno.jnp_ops import inner
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.4)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")
+    xi, yi, _ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    net = _const_net(0.7)
+    fem = jno.fem([net(xi, yi) * inner(ui, vi) - inner(vi, vi)])
+    fem_ref = jno.fem([0.7 * inner(ui, vi) - inner(vi, vi)])
+    assert fem.is_linear
+    (name,) = fem.operator.runtime_parameter_exprs
+    A, _ = fem.operator.evaluate({name: net.module})
+    assert np.max(np.abs(_dense(A) - _dense(fem_ref.A))) < 1e-9
+
+
+def test_rt_solution_dependent_net_guard():
+    """A *solution-dependent* net(u) on a vector edge family fails loud — feeding the vector-valued
+    trial into the network is undefined. Only coordinate net(x) is supported there."""
+    from jno.jnp_ops import inner
+
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.5)
     u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")
     xi, yi, _ = d.variable("interior", split=True)
     ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
     net = _mlp_net(key=21)
-    with pytest.raises(NotImplementedError, match="RT|Nédélec|edge"):
-        jno.fem([net(xi, yi) * jno.np.inner(ui, vi) - jno.np.inner(vi, vi)])
+    with pytest.raises(NotImplementedError, match="RT|Nédélec|solution-dependent"):
+        jno.fem([net(ui) * inner(ui, vi) - inner(vi, vi)])
 
 
 def test_nonnodal_trainable_net_in_boundary_term_guard():

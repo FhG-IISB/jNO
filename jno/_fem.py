@@ -2072,14 +2072,20 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
                 "runtime-parameter path at all (scalar and field parameters are unsupported there too)."
             )
         # Non-nodal: the scalar C¹ families (Argyris/Morley/Hermite) thread the network at the quad points
-        # like their P1 field parameter; the vector edge families (RT/Nédélec) are not wired (a net(u) with a
-        # vector-valued trial input is undefined here).
+        # like their P1 field parameter. The vector edge families (RT/Nédélec) accept a *scalar coordinate*
+        # net(x) coefficient (a spatially-varying permeability/permittivity multiplying a vector term), but
+        # a *solution-dependent* net(u) there would feed the vector-valued trial into the network, which is
+        # undefined — reject only that.
         _nonnodal_spaces = _trial_spaces(constraints) - {"Lagrange", "Argyris", "Morley", "Hermite"}
         if _nonnodal_spaces:
-            raise NotImplementedError(
-                "jno.fem: neural coefficients on non-nodal elements are supported on the scalar C¹ families "
-                f"(Argyris/Morley/Hermite) only; not the vector edge families {sorted(_nonnodal_spaces)} (RT/Nédélec)."
-            )
+            from .utils.solver.weak_form import _is_obviously_nonlinear_in_unknown as _nlin_nn
+
+            if any(_contains_network_call(c) and _nlin_nn(domain, _bare(c)) for c in constraints):
+                raise NotImplementedError(
+                    "jno.fem: a solution-dependent neural coefficient net(u) on the vector edge families "
+                    f"(RT/Nédélec, {sorted(_nonnodal_spaces)}) is not supported — a vector-valued trial input to the "
+                    "network is undefined. A scalar coordinate net(x) coefficient is supported."
+                )
 
     multifield = len(_field_keys(constraints)) > 1
     if vec is None and not multifield:
