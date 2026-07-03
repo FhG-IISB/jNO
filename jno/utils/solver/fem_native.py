@@ -515,6 +515,37 @@ def assemble_fem_native(
             _collect_runtime_parameter_exprs(bare, _rt_param_exprs)
     runtime_parameter_tags: Tuple[str, ...] = tuple(sorted(_rt_param_exprs))
     _field_param_names: set = {n for n, expr in _rt_param_exprs.items() if _is_fem_field_parameter(expr)}
+
+    # Neural coefficients (``jno.nn.wrap(net)`` called inside the weak form, e.g. ``net(x,y)*u.dx*v.dx``).
+    # Unlike scalar/nodal parameters they never enter the per-cell ``volume_vars`` — a weight pytree is
+    # cell-independent — the kernel instead re-evaluates the network at the quad points from a
+    # {name: module} table threaded via ``loc["neural_coefficients"]``. TRAINABLE networks arrive
+    # through the runtime ``args`` (a ``ModelWeights`` slot resolved by the trace evaluator to the
+    # crux-recombined module, so ∂solve/∂weights flows); FROZEN (.freeze()d) networks evaluate from
+    # their stored module and keep the system non-parametric.
+    from .parametric_helpers import _collect_neural_coefficient_exprs
+
+    _neural_all_exprs: Dict[str, Any] = {}
+    for bare in volume_terms:
+        _collect_neural_coefficient_exprs(bare, _neural_all_exprs, include_frozen=True)
+    for _exprs in boundary_terms.values():
+        for bare in _exprs:
+            _collect_neural_coefficient_exprs(bare, _neural_all_exprs, include_frozen=True)
+    neural_all_names: Tuple[str, ...] = tuple(sorted(_neural_all_exprs))
+    _neural_models = {n: e.model for n, e in _neural_all_exprs.items()}
+    neural_param_names: Tuple[str, ...] = tuple(
+        sorted(n for n, e in _neural_all_exprs.items() if not bool(getattr(e.model, "_frozen", False)))
+    )
+    _name_clash = set(neural_all_names) & set(runtime_parameter_tags)
+    if _name_clash:
+        raise ValueError(
+            f"jno.fem: neural coefficient and runtime parameter share the name(s) {sorted(_name_clash)}; "
+            "names key the runtime args and must be unique inside one solver block (rename via .name())."
+        )
+    if neural_all_names and len(fields) > 1:
+        raise NotImplementedError(
+            "jno.fem (native): a neural coefficient on a coupled (multi-field) problem is not supported yet."
+        )
     # A nodal FIELD parameter k(x) interpolates on one field's FE space. Single field -> field 0. For a
     # coupled (multi-field) problem, associate it with the field whose test function appears in the
     # term(s) that reference it (e.g. mu(x)*(grad u . grad v) -> the velocity field), so its nodal values
@@ -664,6 +695,10 @@ def assemble_fem_native(
             # functions (field 0 single-field; the resolved field for a coupled problem).
             # _runtime_parameter_value_from_internal_vars reads this top-level shape_vals.
             loc["shape_vals"] = per[_field_param_field_idx]["shape_vals"]
+        if neural_all_names:
+            # Trainable nets ride the runtime args (current crux weights); frozen ones use their
+            # stored module — also the fallback for static assemblies (the .A/.b placeholder).
+            loc["neural_coefficients"] = {n: (args or {}).get(n, _neural_models[n].module) for n in neural_all_names}
         return _integrate_term(domain, coeff, loc, qw_shared * meas)
 
     def _surf_elem_res(fi, local_all, bcoeff, btfi, region, t=0.0, args=None):
@@ -709,6 +744,8 @@ def assemble_fem_native(
         }
         if _field_param_names:
             loc["shape_vals"] = per_f[_field_param_field_idx]["shape_vals"]
+        if neural_all_names:
+            loc["neural_coefficients"] = {n: (args or {}).get(n, _neural_models[n].module) for n in neural_all_names}
         return _integrate_term(domain, bcoeff, loc, face_w * jac_f)
 
     def _classify_one(coeff, where: str) -> List[Tuple[Any, int]]:
@@ -980,6 +1017,14 @@ def assemble_fem_native(
 
     # === transient (Mu̇ + Au = c or M u̇ + R(u) = 0) ===
     if ic_residuals or any(_contains_temporal_derivative(t) for t in all_terms):
+        if neural_all_names:
+            # The non-parametric transient branches assemble with args=None (the operator at t=0, the
+            # forcing per step) — a net there would silently freeze at its initial weights. Fail loud
+            # until the transient threading lands.
+            raise NotImplementedError(
+                "jno.fem (native): a neural coefficient in a transient weak form is not supported yet — "
+                "steady (linear/nonlinear) forms only for now."
+            )
         from ..._fem import _bare, _essential_spec, _eval_value_node_at, _field_key_of
         from .backend_blocks import SemidiscreteTimeBlock
         from .time_route import _infer_time_window, _strip_temporal_trial_derivative
@@ -1168,8 +1213,16 @@ def assemble_fem_native(
     # each call, kept differentiable in args -- the parameter flows as a JAX array through the kernel
     # coefficient into the per-cell assembly (no float() cast). The same re-assembly handles affine,
     # non-affine and (scalar) parameters uniformly. ----
-    if runtime_parameter_tags:
-        from ...trace import FemLinearSystem
+    if runtime_parameter_tags or neural_param_names:
+        from ...trace import FemLinearSystem, ModelWeights
+
+        # Trainable networks join the runtime-parameter exprs as ModelWeights slots: the solve
+        # nodes resolve each to the current module pytree, which arrives here in ``args`` and is
+        # re-evaluated at the quad points inside the kernel (keeping ∂solve/∂weights exact).
+        _param_and_neural_exprs = {
+            **_rt_param_exprs,
+            **{n: ModelWeights(_neural_models[n]) for n in neural_param_names},
+        }
 
         if nonlinear:
 
@@ -1182,7 +1235,7 @@ def assemble_fem_native(
                 return J if _d is None else bcoo_set_dirichlet_rows(J, _d)
 
             return (
-                FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_rt_param_exprs)),
+                FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=_param_and_neural_exprs),
                 "nonlinear",
                 offs,
             )
@@ -1194,13 +1247,16 @@ def assemble_fem_native(
                 A, b = _apply_dirichlet_symmetric(A, b, dirichlet_pairs)
             return A, b
 
-        a0, b0 = _assemble_at({n: 0.0 for n in runtime_parameter_tags})  # static placeholder for .A/.b
+        # Static placeholder for .A/.b: scalar params at 0, networks at their stored weights.
+        a0, b0 = _assemble_at(
+            {n: 0.0 for n in runtime_parameter_tags} | {n: _neural_models[n].module for n in neural_param_names}
+        )
         op = FemLinearSystem(
             a0,
             b0,
             operator_fn=lambda args=None: _assemble_at(args)[0],
             rhs_fn=lambda args=None: _assemble_at(args)[1],
-            runtime_parameter_exprs=dict(_rt_param_exprs),
+            runtime_parameter_exprs=_param_and_neural_exprs,
             # The native parametric path re-assembles the operator at each args (it builds no affine
             # parameter basis), so every runtime parameter -- affine or not -- takes the re-assembly route.
             metadata={"nonaffine_operator": True},

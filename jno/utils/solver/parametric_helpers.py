@@ -15,12 +15,20 @@ Examples:
     k * grad(u) * grad(phi)
     mu * u**3 * phi
 
-Deliberately unsupported for now
---------------------------------
+Deliberately unsupported for now (affine factoring)
+---------------------------------------------------
     exp(raw_k) * weak_term
     (k + c) * weak_term
     k1 * k2 * weak_term
-    neural_coefficient(x) * weak_term
+
+Neural coefficients (``jno.nn.wrap(net)`` called inside a weak form, e.g.
+``net(x, y) * weak_term``) are NOT affine-factored: like nodal FEM field
+parameters they stay inside the integrand and take the re-assembly route.
+This module supplies their detection/collection predicates
+(``_is_neural_coefficient`` / ``_collect_neural_coefficient_exprs``); the
+native assembler threads the weight pytree through the runtime ``args`` and
+the kernel evaluates the network at the quadrature points
+(``fem_utils._eval_integrand``).
 """
 
 import jax.numpy as jnp
@@ -62,6 +70,70 @@ def _contains_fem_field_parameter(node) -> bool:
     if _is_fem_field_parameter(node):
         return True
     return any(_contains_fem_field_parameter(child) for child in (_iter_children(node) or ()))
+
+
+def _is_neural_coefficient(node) -> bool:
+    """True for a *network* ModelCall used as a coefficient (``jno.nn.wrap(net)(x, ...)``).
+
+    Everything that is a ModelCall but not a zero-arg ``jno.np.parameter(...)`` counts: the model
+    is an arbitrary equinox module evaluated at the quadrature points on its (symbolic) arguments.
+    A ``.freeze()``d network is still a neural coefficient — it evaluates through the same kernel
+    branch — but it is excluded from *trainable* collection (see
+    ``_collect_neural_coefficient_exprs``), so an all-frozen system assembles non-parametrically.
+    """
+    return isinstance(node, ModelCall) and not _is_runtime_scalar_parameter(node)
+
+
+def _is_frozen_neural_coefficient(node) -> bool:
+    """A neural coefficient whose model is ``.freeze()``d — a known, non-trainable network."""
+    return _is_neural_coefficient(node) and bool(getattr(node.model, "_frozen", False))
+
+
+def _contains_neural_coefficient(node) -> bool:
+    """Recursively detect a neural coefficient in one trace subtree."""
+    if _is_neural_coefficient(node):
+        return True
+    return any(_contains_neural_coefficient(child) for child in (_iter_children(node) or ()))
+
+
+def _neural_coefficient_name(node: ModelCall) -> str:
+    """Stable public name for one neural coefficient (mirrors ``_parameter_name``)."""
+    name = getattr(node.model, "name", None)
+    if name:
+        return str(name)
+    return f"neural_{node.model.layer_id}"
+
+
+def _collect_neural_coefficient_exprs(node, out=None, *, include_frozen=False):
+    """Collect network ModelCalls (neural coefficients) by public name.
+
+    With the default ``include_frozen=False``, ``.freeze()``d networks are skipped — they are
+    known coefficients, evaluated from their stored weights, and must not make the system
+    parametric. Pass ``include_frozen=True`` to build the kernel's evaluation table, which needs
+    every network (frozen ones evaluate from their stored module). Two *different* models sharing
+    one public name are rejected (the name keys the runtime ``args`` slot).
+    """
+    if out is None:
+        out = {}
+
+    if _is_neural_coefficient(node) and (include_frozen or not _is_frozen_neural_coefficient(node)):
+        name = _neural_coefficient_name(node)
+        previous = out.get(name)
+
+        if previous is not None and getattr(previous, "model", None) is not getattr(node, "model", None):
+            raise ValueError(
+                f"Multiple neural-coefficient models use the name {name!r}. "
+                "Model names must be unique inside one solver block."
+            )
+
+        out[name] = node
+        # Do NOT return: the network's arguments may nest further coefficients (e.g. net2 inside
+        # net1's argument); keep descending.
+
+    for child in _iter_children(node) or ():
+        _collect_neural_coefficient_exprs(child, out, include_frozen=include_frozen)
+
+    return out
 
 
 def _flatten_product(node):

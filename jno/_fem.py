@@ -189,11 +189,15 @@ def _contains(constraint: Any, cls) -> bool:
     return contains_node_type(_bare(constraint), cls)
 
 
-def _contains_network_trial(constraint: Any) -> bool:
-    """True if a constraint embeds a *network* ModelCall (e.g. ``u = net(x, y)``) — the VPINN signal.
+def _contains_network_call(constraint: Any) -> bool:
+    """True if a constraint embeds a *network* ModelCall (``jno.nn.wrap(net)(...)``).
 
-    Excludes zero-arg runtime parameters (``jno.np.parameter(...)``, scalar or FEM field): a weak form with a
-    trainable *coefficient* parameter is an ordinary (runtime-parametric) FE system, not a network-trial VPINN."""
+    Excludes zero-arg runtime parameters (``jno.np.parameter(...)``, scalar or FEM field). A network
+    in a weak form plays one of two roles, disambiguated at the constraint-*set* level (see the
+    ``is_vpinn`` routing in :func:`fem`): it *replaces* the trial (``u = net(x, y)`` — the VPINN
+    signal; no ``TrialFunction`` appears in any weak constraint) or it is a *coefficient*
+    multiplying a genuine trial (``net(x, y) * u.dx * v.dx`` — an assembled, runtime-parametric FE
+    system whose kernel re-evaluates the network at the quadrature points)."""
     from .utils.solver.parametric_helpers import _is_runtime_scalar_parameter
 
     return any(isinstance(n, ModelCall) and not _is_runtime_scalar_parameter(n) for n in _walk(_bare(constraint)))
@@ -2039,10 +2043,36 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             "normal-derivative DOF)."
         )
 
-    # VPINN: a network trial (``u = net(x, y)`` written into the weak form) makes jno.fem
-    # test-project the weak form onto the FE test space -> a trainable residual loss, not an FE
-    # system. Detected by a ModelCall; lowered after the shared quadrature setup (see below).
-    is_vpinn = any(_contains_network_trial(c) for c in constraints)
+    # A network ModelCall in the constraints plays one of two roles, decided at the SET level:
+    #   * VPINN — the network *replaces* the trial (``u = net(x, y)`` written into the weak form):
+    #     no weak (test-carrying) constraint contains a TrialFunction. jno.fem test-projects the
+    #     weak form onto the FE test space -> a trainable residual loss, not an FE system.
+    #   * neural COEFFICIENT — the network multiplies a genuine trial (``net(x,y)*u.dx*v.dx``):
+    #     some weak constraint carries the TrialFunction. The system is assembled as usual and the
+    #     kernel re-evaluates the network at the quadrature points (trainable via the runtime args).
+    _has_network = any(_contains_network_call(c) for c in constraints)
+    _weak_has_real_trial = any(_contains(c, TestFunction) and _contains(c, TrialFunction) for c in constraints)
+    is_vpinn = _has_network and not _weak_has_real_trial
+    has_neural_coeff = _has_network and not is_vpinn
+
+    if has_neural_coeff:
+        # v1 scope for neural coefficients: weak-form (volume/surface integrand) coefficients on the
+        # native 2D/3D Lagrange assembler. Fail loud on everything else rather than mis-assemble.
+        if any(
+            _contains(c, TrialFunction) and not _contains(c, TestFunction) and _contains_network_call(c)
+            for c in constraints
+        ):
+            raise NotImplementedError(
+                "jno.fem: a network inside a Dirichlet/IC value expression (a trial-only constraint) is "
+                "not supported — neural coefficients are weak-form integrand coefficients only."
+            )
+        if getattr(domain, "dimension", None) == 1:
+            raise NotImplementedError("jno.fem: neural coefficients are supported on 2D/3D domains only (no 1D yet).")
+        if _trial_spaces(constraints) - {"Lagrange"}:
+            raise NotImplementedError(
+                "jno.fem: neural coefficients are supported on Lagrange elements only (no non-nodal "
+                "Argyris/Morley/Hermite/RT/Nédélec spaces yet)."
+            )
 
     multifield = len(_field_keys(constraints)) > 1
     if vec is None and not multifield:
@@ -2372,6 +2402,11 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     # ``.imag`` gives two ordinary real systems A_r/b_r and A_i/b_i; FEM.solve() forms
     # ``[[A_r, -A_i], [A_i, A_r]]`` and recombines to a complex ``u``. A complex *inverse* (runtime
     # parameter) and the complex *transient* (Schrodinger) path are handled separately below. ----
+    if has_neural_coeff and _is_complex_form(domain, ir):
+        raise NotImplementedError(
+            "jno.fem: a neural coefficient in a complex (complex=True) weak form is not supported yet."
+        )
+
     if (
         not is_vpinn
         and _is_complex_form(domain, ir)

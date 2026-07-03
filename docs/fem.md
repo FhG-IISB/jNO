@@ -703,6 +703,41 @@ k = jno.np.parameter(phi, name="k")                       # P1 field, one DOF pe
 crux = jno.core([(fem.solve() - u_obs).mse, 1e-3 * k.regularize("h1seminorm").mean], domain=obs)
 ```
 
+### Neural coefficients — `jno.nn.wrap(net)` inside the weak form
+
+A network called inside a weak form is a trainable **coefficient** on an assembled FE system —
+mesh-independent (remeshing never touches the weights), smooth by architecture, and trained
+through the same differentiable `fem.solve()` as any parameter:
+
+```python
+net = jno.nn.wrap(foundax.mlp(2, hidden_dims=16, num_layers=2,
+                              activation=jax.nn.tanh, key=key))
+net.dtype(jnp.float64)                                       # match the f64 assembly
+net.optimizer(optax.adam(1e-2))
+
+# k(x) = 1 + net(x, y): the offset keeps A(θ) nonsingular at the (near-zero) net init
+fem = jno.fem([(1.0 + net(xi, yi)) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
+crux = jno.core([(fem.solve() - u_obs).mse], domain=obs).solve(600)   # trains the weights
+```
+
+The kernel re-evaluates the network at the quadrature points during every re-assembly, so the
+coefficient is *not* interpolated on the mesh (unlike the P1 nodal field above) — it composes
+with scalar/nodal parameters in one weak form, with per-region masks, vector trials, and surface
+(Robin/Neumann) terms. `net.freeze()` makes it a **known** network coefficient (evaluated from
+its stored weights; the system stays non-parametric). The role is decided by the constraints: a
+weak form whose trial is a *real* FE symbol makes the network a coefficient; a network written
+*in place of* the trial is a VPINN (see the VPINN section).
+
+This is the unsupervised coefficient-recovery setting of NN-EUCLID (M. Flaschel, S. Kumar,
+L. De Lorenzis, *NN-EUCLID: Deep-learning hyperelasticity without stress data*, J. Mech. Phys.
+Solids 165 (2022) 105076, §2.2–2.3) and Tartakovsky et al., *Learning Parameters and Constitutive
+Relationships with Physics-Informed Deep Neural Networks* (Water Resour. Res. 56, 2020, §2).
+
+Current scope: **steady** weak forms on the native 2D/3D Lagrange assembler, single field.
+Not yet supported (each fails loud): networks inside Dirichlet/IC values, transient forms,
+`complex=True` forms, coupled multi-field problems, 1D, and non-nodal
+(Argyris/Morley/Hermite/RT/Nédélec) elements.
+
 ### Transient inverse
 
 For a transient form, `fem.solve()` returns the **trajectory** `u(save_ts)` (default: backward

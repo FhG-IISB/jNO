@@ -3122,6 +3122,30 @@ class FemResidualOperator:
         )
 
 
+class ModelWeights(Placeholder):
+    """Evaluates to a :class:`Model`'s *current* equinox module (the live weight pytree).
+
+    A neural **coefficient** in an assembled FEM system (``jno.nn.wrap(net)`` called inside a weak
+    form, e.g. ``net(x, y) * u.dx * v.dx``) must reach the assembly kernel as its *weights*, not as
+    a call result: the kernel re-evaluates the network at the quadrature points itself, so the
+    solver needs the module pytree in its runtime ``args``. ``FemLinearSystem.solve`` (and the
+    nonlinear/transient counterparts) put a ``ModelWeights`` node in the ``fem_solve``
+    FunctionCall's params where a scalar parameter would put its zero-arg ``ModelCall``; the trace
+    evaluator resolves it to ``params[layer_id]`` — the trainable module crux recombines each step
+    — so gradients flow from the solve back into the network's weights.
+    """
+
+    def __init__(self, model: Model):
+        self.model = model
+        # ``target`` lets generic model-discovery walks (e.g. core's active-model scan, which
+        # falls back to ``.target``) reach the underlying Model without a dedicated branch.
+        self.target = model
+        self.op_id = _next_op_id()
+
+    def __repr__(self):
+        return f"ModelWeights({self.model})"
+
+
 class StateField(Placeholder):
     """Internal marker for the primary weak-form unknown.
 

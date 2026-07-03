@@ -1,0 +1,373 @@
+"""Neural coefficients in assembled FEM systems: ``jno.nn.wrap(net)`` called inside a weak form
+(e.g. ``net(x, y) * u.dx * v.dx``) is a trainable *coefficient* on an ordinary FE system — not a
+VPINN trial. The system assembles as usual; the kernel re-evaluates the network at the quadrature
+points, the weights ride the runtime ``args`` as a ``ModelWeights`` slot, and ``crux.solve``
+trains them through the differentiable ``fem.solve()`` (NN-EUCLID-style unsupervised coefficient
+recovery — Flaschel/Kumar/De Lorenzis, JMPS 165 (2022); Tartakovsky et al., WRR 56 (2020)).
+
+Scope locked here (v1): steady weak forms on the native 2D/3D Lagrange assembler, single field.
+The set-level routing rule (a weak constraint carrying a real ``TrialFunction`` means the network
+is a coefficient, not the trial) must not disturb VPINN.
+
+Run with x64 (assembly runs in float64).
+"""
+
+import numpy as np
+import pytest
+
+pytest.importorskip("shapely", reason="shapely required for the box domain")
+pytest.importorskip("foundax", reason="foundax required for the MLP coefficient nets")
+
+import equinox as eqx  # noqa: E402
+import foundax  # noqa: E402
+import jax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
+import optax  # noqa: E402
+from shapely.geometry import box  # noqa: E402
+
+import jno  # noqa: E402
+import jno.jnp_ops as jnn  # noqa: E402
+from jno.trace import ModelWeights  # noqa: E402
+
+PI = np.pi
+
+# The inverse loss has no spatial Variable (the FEM solve is global), so crux needs
+# an explicit domain to drive its loop.
+_DUMMY = jno.domain.from_array({"_": np.zeros((1, 1))})
+
+
+@pytest.fixture(autouse=True)
+def _x64():
+    """FEM assembly/solves run in float64; set x64 per-test with save/restore (the global flag is
+    shared across modules and other suites flip it at import)."""
+    prev = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        yield
+    finally:
+        jax.config.update("jax_enable_x64", prev)
+
+
+class _Const(eqx.Module):
+    """A 'network' that outputs a constant per quad point — the degenerate extreme that must
+    reproduce a scalar-coefficient assembly exactly (and gives a single-leaf gradient check)."""
+
+    c: jnp.ndarray
+
+    def __call__(self, *args):
+        n = jnp.asarray(args[0]).shape[0]
+        return jnp.broadcast_to(self.c.reshape(1, 1), (n, 1))
+
+
+def _const_net(c):
+    net = jno.nn.wrap(_Const(c=jnp.asarray(float(c), dtype=jnp.float64)))
+    net.dtype(jnp.float64)
+    return net
+
+
+def _mlp_net(key=0, hidden=16, layers=2):
+    net = jno.nn.wrap(
+        foundax.mlp(2, hidden_dims=hidden, num_layers=layers, activation=jax.nn.tanh, key=jax.random.PRNGKey(key))
+    )
+    net.dtype(jnp.float64)
+    return net
+
+
+def _poisson_setup(mesh_size=0.25):
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = 2.0 * (xi * (1.0 - xi) + yi * (1.0 - yi))
+    return d, u, phi, (xi, yi), (xb, yb), ui, vi, f
+
+
+def _dense(A):
+    return np.asarray(A.todense() if hasattr(A, "todense") else A)
+
+
+# ==========================================================================
+# routing: coefficient vs VPINN trial
+# ==========================================================================
+
+
+def test_net_coefficient_routes_to_linear_parametric_system():
+    """``net(x,y) * grad u . grad v``: a weak constraint carrying the real TrialFunction makes the
+    network a coefficient — an assembled linear system, parametric in the net's weights (one
+    ModelWeights slot named after the model)."""
+    d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _poisson_setup()
+    net = _mlp_net()
+    fem = jno.fem([net(xi, yi) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+
+    assert fem.is_linear
+    exprs = fem.operator.runtime_parameter_exprs
+    assert len(exprs) == 1
+    (name,) = exprs
+    assert isinstance(exprs[name], ModelWeights)
+    assert fem.operator.metadata.get("nonaffine_operator") is True
+
+
+def test_vpinn_network_trial_routing_unchanged():
+    """A network *replacing* the trial (no TrialFunction in any weak constraint) still routes to
+    VPINN — the set-level disambiguation must not regress the network-trial path."""
+    d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _poisson_setup()
+    u_net = _mlp_net(key=1)(xi, yi)
+    weak = jnn.grad(u_net, xi) * jnn.grad(vi, xi) + jnn.grad(u_net, yi) * jnn.grad(vi, yi) - f * vi
+    pde = jno.fem([weak, u(xb, yb) - 0.0])
+    assert hasattr(pde, "mse") and hasattr(pde, "volume_grad_expr")  # GroupedAssembly, not FEM
+
+
+# ==========================================================================
+# extremes: constant net / zero net reproduce scalar assembly exactly
+# ==========================================================================
+
+
+def test_constant_net_matches_scalar_coefficient_operator():
+    """A net that outputs the constant 0.7 must assemble the SAME operator as the scalar
+    coefficient 0.7 (to solver precision) — pins quad-point evaluation and alignment."""
+    d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _poisson_setup()
+    net = _const_net(0.7)
+    fem = jno.fem([net(xi, yi) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    fem_ref = jno.fem([0.7 * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+
+    (name,) = fem.operator.runtime_parameter_exprs
+    A, b = fem.operator.evaluate({name: net.module})
+    assert np.abs(_dense(A) - _dense(fem_ref.A)).max() < 1e-12
+    assert np.abs(np.asarray(b).reshape(-1) - np.asarray(fem_ref.b).reshape(-1)).max() < 1e-12
+
+
+def test_zero_net_zeroes_its_term():
+    """A zero net in ``(net + 1) * grad u . grad v`` leaves exactly the unit-coefficient system —
+    the additive composition evaluates the net inside the integrand, not as a factored scalar."""
+    d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _poisson_setup()
+    net = _const_net(0.0)
+    fem = jno.fem([(net(xi, yi) + 1.0) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    fem_ref = jno.fem([1.0 * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    (name,) = fem.operator.runtime_parameter_exprs
+    A, _ = fem.operator.evaluate({name: net.module})
+    assert np.abs(_dense(A) - _dense(fem_ref.A)).max() < 1e-12
+
+
+# ==========================================================================
+# frozen networks: known coefficients, non-parametric assembly
+# ==========================================================================
+
+
+def test_frozen_net_assembles_nonparametric_and_matches_unfrozen():
+    """``net.freeze()`` = a KNOWN network coefficient: the system stays non-parametric (eager
+    ``fem.A``) and the matrix equals the unfrozen twin re-assembled at the same weights."""
+    d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _poisson_setup()
+    net_t = _mlp_net(key=2)
+    fem_t = jno.fem([(net_t(xi, yi) + 1.5) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    (name,) = fem_t.operator.runtime_parameter_exprs
+    A_train, _ = fem_t.operator.evaluate({name: net_t.module})
+
+    net_f = _mlp_net(key=2)  # identical weights (same PRNG key)
+    net_f.freeze()
+    fem_f = jno.fem([(net_f(xi, yi) + 1.5) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    assert not getattr(fem_f.operator, "is_parametric", False)  # plain (A, b), solved eagerly
+    assert np.abs(_dense(fem_f.A) - _dense(A_train)).max() < 1e-12
+
+    sol = np.linalg.solve(_dense(fem_f.A), np.asarray(fem_f.b).reshape(-1))
+    assert np.all(np.isfinite(sol))
+
+
+# ==========================================================================
+# composition: scalar param + nodal field + net in ONE weak form
+# ==========================================================================
+
+
+def test_mixed_scalar_nodal_neural_coefficients_compose_and_differentiate():
+    """One weak form carrying all three trainable coefficient kinds — a scalar
+    ``jno.np.parameter``, a nodal field ``jno.np.parameter(phi)``, and a network — collects all
+    three runtime slots, re-assembles, and the solve is differentiable in each."""
+    d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _poisson_setup()
+    alpha = jno.np.parameter((1,), key=jax.random.PRNGKey(1), name="alpha")
+    alpha.initialize(jax.nn.initializers.constant(1.0))
+    alpha.dtype(jnp.float64)
+    k = jno.np.parameter(phi, name="k")
+    k.dtype(jnp.float64)
+    k.initialize(jax.nn.initializers.constant(1.0))
+    net = _mlp_net(key=3)
+
+    weak = alpha * (ui.x * vi.x + ui.y * vi.y) + k * (ui * vi) + (net(xi, yi) + 1.0) * (ui * vi) - f * vi
+    fem = jno.fem([weak, u(xb, yb) - 0.0], quad_degree=3)
+    exprs = fem.operator.runtime_parameter_exprs
+    net_name = next(n for n in exprs if n not in ("alpha", "k"))
+    assert set(exprs) == {"alpha", "k", net_name}
+    assert isinstance(exprs[net_name], ModelWeights)
+
+    n_nodes = int(np.asarray(d.built_mesh.points).shape[0])
+
+    def solve_at(a_val, k_vals, module):
+        A, b = fem.operator.evaluate({"alpha": a_val, "k": k_vals, net_name: module})
+        return jnp.linalg.solve(A.todense(), jnp.asarray(b).reshape(-1))
+
+    a0, k0 = jnp.asarray(1.0), jnp.ones((n_nodes,))
+    loss = lambda a, kv, m: jnp.sum(solve_at(a, kv, m) ** 2)
+    g_a = jax.grad(loss, argnums=0)(a0, k0, net.module)
+    g_k = jax.grad(loss, argnums=1)(a0, k0, net.module)
+    g_m = eqx.filter_grad(lambda m: loss(a0, k0, m))(net.module)
+    g_m_sum = sum(jnp.sum(jnp.abs(x)) for x in jax.tree_util.tree_leaves(g_m) if eqx.is_inexact_array(x))
+    assert abs(float(g_a)) > 0.0
+    assert float(jnp.abs(g_k).sum()) > 0.0
+    assert float(g_m_sum) > 0.0
+
+
+# ==========================================================================
+# per-region masks compose with a net coefficient
+# ==========================================================================
+
+
+def test_region_masked_load_with_net_coefficient():
+    """A region-restricted load ``-net*v`` with a constant-1 net integrates to the region's cell
+    area exactly (like the plain per-region load) — the mask's volume_var slot must not shift when
+    a neural coefficient is present."""
+    disk = lambda x, y: (x - 0.5) ** 2 + (y - 0.5) ** 2 < 0.2**2  # noqa: E731
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.08)
+    d.tag("disk", disk)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xd, yd, _ = d.variable("disk", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    vd = phi.bind(x=xd, y=yd)
+    net = _const_net(1.0)
+
+    fem = jno.fem(
+        [(ui.x * vi.x + ui.y * vi.y), -(net(xd, yd) * vd), u(xb, yb) - 0.0],
+        quad_degree=3,
+    )
+    (name,) = fem.operator.runtime_parameter_exprs
+    _, b = fem.operator.evaluate({name: net.module})
+
+    fem_ref = jno.fem([(ui.x * vi.x + ui.y * vi.y), -(1.0 * vd), u(xb, yb) - 0.0], quad_degree=3)
+    assert np.abs(np.asarray(b).reshape(-1) - np.asarray(fem_ref.b).reshape(-1)).max() < 1e-12
+
+
+# ==========================================================================
+# vector trial and boundary (Robin) terms
+# ==========================================================================
+
+
+def test_vector_elasticity_with_scalar_net_stiffness():
+    """A scalar net multiplying a vector (vec=2) elasticity form: constant-net assembly equals the
+    scalar-coefficient reference."""
+    from jno.jnp_ops import inner, symgrad, trace
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25)
+    u, w = d.fem_symbols(value_shape=(2,), names=("u", "w"))
+    xi, yi = d.variable("interior", split=True)[:2]
+    xb, yb = d.variable("boundary", split=True)[:2]
+    eu, ev = symgrad(u, [xi, yi]), symgrad(w, [xi, yi])
+    vv = w.bind(x=xi, y=yi)
+    net = _const_net(0.8)
+    lam = 1.2
+    weak = lam * trace(eu) * trace(ev) + 2 * net(xi, yi) * inner(eu, ev, n_contract=2) - (1.0 * vv[0] + 0.5 * vv[1])
+    weak_ref = lam * trace(eu) * trace(ev) + 2 * 0.8 * inner(eu, ev, n_contract=2) - (1.0 * vv[0] + 0.5 * vv[1])
+
+    fem = jno.fem([weak, u(xb, yb) - (0.0, 0.0)], quad_degree=2)
+    fem_ref = jno.fem([weak_ref, u(xb, yb) - (0.0, 0.0)], quad_degree=2)
+    (name,) = fem.operator.runtime_parameter_exprs
+    A, _ = fem.operator.evaluate({name: net.module})
+    assert np.abs(_dense(A) - _dense(fem_ref.A)).max() < 1e-11
+
+
+def test_net_in_robin_boundary_term():
+    """A net coefficient inside a surface (Robin) integrand ``net*u*v`` on one edge — exercises the
+    surface-kernel threading; constant net equals the scalar Robin reference."""
+    from jno.jnp_ops import grad, inner
+
+    d = jno.domain(constructor=jno.domain.rect(mesh_size=0.25))
+    u, w = d.fem_symbols(names=("u", "w"))
+    xi, yi = d.variable("interior", split=True)[:2]
+    vv = w.bind(x=xi, y=yi)
+    xr, yr = d.variable("right", split=True)[:2]
+    ur, wr = u.bind(x=xr, y=yr), w.bind(x=xr, y=yr)
+    xl, yl = d.variable("left", split=True)[:2]
+    net = _const_net(2.5)
+
+    cons = [inner(grad(u, [xi, yi]), grad(w, [xi, yi]), n_contract=1) - 1.0 * vv, net(xr, yr) * ur * wr, u(xl, yl) - 0.0]
+    cons_ref = [inner(grad(u, [xi, yi]), grad(w, [xi, yi]), n_contract=1) - 1.0 * vv, 2.5 * ur * wr, u(xl, yl) - 0.0]
+    fem = jno.fem(cons, quad_degree=3)
+    fem_ref = jno.fem(cons_ref, quad_degree=3)
+    (name,) = fem.operator.runtime_parameter_exprs
+    A, _ = fem.operator.evaluate({name: net.module})
+    assert np.abs(_dense(A) - _dense(fem_ref.A)).max() < 1e-12
+
+
+# ==========================================================================
+# the headline: recover k(x) end-to-end through crux
+# ==========================================================================
+
+
+def test_neural_kx_recovers_via_crux():
+    """Recover a smooth diffusivity k(x) = 0.6 + 0.8x + 0.5y with a coordinate MLP trained through
+    the differentiable ``fem.solve()``. The ``1 + net`` offset keeps the operator nonsingular at
+    the (near-zero) net init — same practice as starting the nodal field at k=1."""
+    d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _poisson_setup(mesh_size=0.25)
+
+    fem_ref = jno.fem([(0.6 + 0.8 * xi + 0.5 * yi) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    u_obs = jnp.linalg.solve(jnp.asarray(_dense(fem_ref.A)), jnp.asarray(fem_ref.b).reshape(-1))
+
+    net = _mlp_net(key=0)
+    net.optimizer(optax.adam(1e-2))
+    fem = jno.fem([(1.0 + net(xi, yi)) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+
+    crux = jno.core([(fem.solve() - u_obs).mse], domain=_DUMMY)
+    crux.solve(600)
+
+    trained = crux.eval([ModelWeights(net)])
+    nodes = np.asarray(d.built_mesh.points)[:, :2]
+    k_net = 1.0 + np.asarray(trained(jnp.asarray(nodes))).reshape(-1)
+    k_true = 0.6 + 0.8 * nodes[:, 0] + 0.5 * nodes[:, 1]
+    rel = float(np.linalg.norm(k_net - k_true) / np.linalg.norm(k_true))
+    assert rel < 0.1, f"neural k(x) recovery rel-err {rel:.3e}"
+
+
+# ==========================================================================
+# dtype and scope guards
+# ==========================================================================
+
+
+def test_f32_net_promotes_under_x64():
+    """A plain f32 net (no explicit .dtype opt-in) under x64: assembly stays float64 by promotion
+    and the solve is finite — never a silent downcast of the system."""
+    d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _poisson_setup()
+    net = jno.nn.wrap(foundax.mlp(2, hidden_dims=8, num_layers=2, activation=jax.nn.tanh, key=jax.random.PRNGKey(4)))
+    fem = jno.fem([(1.0 + net(xi, yi)) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    (name,) = fem.operator.runtime_parameter_exprs
+    A, b = fem.operator.evaluate({name: net.module})
+    assert _dense(A).dtype == np.float64
+    sol = np.linalg.solve(_dense(A), np.asarray(b).reshape(-1))
+    assert np.all(np.isfinite(sol))
+
+
+def test_scope_guards_fail_loud():
+    """v1 scope limits raise explicit NotImplementedError, never mis-assemble: a net inside a
+    Dirichlet value and a net in a transient form."""
+    d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _poisson_setup()
+    net = _mlp_net(key=5)
+
+    # net in a Dirichlet value expression
+    with pytest.raises(NotImplementedError, match="Dirichlet"):
+        jno.fem([(ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - net(xb, yb)])
+
+    # transient form (fail loud until the transient threading lands)
+    d2 = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3, time=(0.0, 0.02, 5))
+    u2, phi2 = d2.fem_symbols()
+    x2, y2, t2 = d2.variable("interior", split=True)
+    xb2, yb2, _ = d2.variable("boundary", split=True)
+    ci = d2.variable("initial", split=True)
+    u2i, v2i = u2.bind(x=x2, y=y2, t=t2), phi2.bind(x=x2, y=y2, t=t2)
+    psi0 = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
+    net2 = _mlp_net(key=6)
+    with pytest.raises(NotImplementedError, match="transient"):
+        jno.fem(
+            [
+                u2i.t * v2i + (1.0 + net2(x2, y2)) * (u2i.x * v2i.x + u2i.y * v2i.y),
+                u2(xb2, yb2) - 0.0,
+                u2(ci[0], ci[1]) - psi0,
+            ]
+        )
