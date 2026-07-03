@@ -778,12 +778,20 @@ spatially-varying permeability/permittivity multiplying a vector term); only a s
 non-nodal path assembles a *dense* operator, so a parametric solve wants an explicit dense
 `solve_fn` — `fem.solve(lambda A, b: jnp.linalg.solve(A, b))`.
 
+**Unknown boundary conditions.** A network as a *Dirichlet value* — `u(region) - net(xb, yb)` —
+is a trainable BC *profile*, not a coefficient: it enters the load vector (the Dirichlet lift), not
+the operator. Recover an unknown boundary temperature/flux from the interior response by evaluating
+`net` at the boundary nodes each solve. Supported for a **bare** `net(x)` on a boundary region,
+steady native Lagrange single-field; a compound value (`1 + net(x)`), an initial-condition value,
+or a transient/nonlinear form fails loud.
+
 Current scope: steady/transient/steady-complex on the native 2D/3D Lagrange assembler (single or
-coupled multi-field), and steady scalar C¹ non-nodal (Argyris/Morley/Hermite). Not yet supported
-(each fails loud): networks inside Dirichlet/IC values, solution-dependent `net(u)` on the mass
-(`u_t`) term (a nonlinear mass), k(u) in complex forms, the complex transient, time-varying
-Dirichlet `g(x,t)` with a trainable net, solution-dependent `net(u)` on the vector edge families
-(RT/Nédélec), and 1D domains (the 1D assembler has no runtime-parameter path at all).
+coupled multi-field), steady scalar C¹ non-nodal (Argyris/Morley/Hermite), and a bare `net(x)`
+steady Dirichlet value. Not yet supported (each fails loud): a compound/IC/transient net Dirichlet
+value, solution-dependent `net(u)` on the mass (`u_t`) term (a nonlinear mass), k(u) in complex
+forms, the complex transient, time-varying Dirichlet `g(x,t)` with a trainable net,
+solution-dependent `net(u)` on the vector edge families (RT/Nédélec), and 1D domains (the 1D
+assembler has no runtime-parameter path at all).
 
 ### Transient inverse
 

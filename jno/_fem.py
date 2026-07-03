@@ -797,7 +797,22 @@ def _dirichlet_spec(bare: Any) -> Tuple[Optional[int], Any, Any]:
     ``value_node`` is the raw expression (kept so the transient route can detect/evaluate a
     time-varying ``g(x,t)``)."""
     comp, value_node = _essential_spec(bare)
+    if _is_bare_neural_value_node(value_node):
+        # A trainable BC profile ``u(region) - net(x)``: keep the net node raw and leave ``value`` as a
+        # sentinel -- the native parametric path evaluates ``net(boundary_coords)`` from the runtime args
+        # each solve (``_value_from_node`` would build a stored-weights closure, non-differentiable).
+        return comp, None, value_node
     return comp, _value_from_node(value_node), value_node
+
+
+def _is_bare_neural_value_node(value_node: Any) -> bool:
+    """True if a Dirichlet value node is a *bare* neural coefficient ``net(x)`` (a trainable BC profile).
+
+    Only a bare network call is supported as a trainable Dirichlet value; a compound expression such as
+    ``1 + net(x)`` is rejected up front (it would need a general args-aware value evaluator)."""
+    from .utils.solver.parametric_helpers import _is_neural_coefficient
+
+    return _is_neural_coefficient(_bare(value_node)) if value_node is not None else False
 
 
 def _normal_flux_spec(constraint: Any, domain: Any) -> Optional[Tuple[Any, str, Any]]:
@@ -2056,16 +2071,30 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     has_neural_coeff = _has_network and not is_vpinn
 
     if has_neural_coeff:
-        # v1 scope for neural coefficients: weak-form (volume/surface integrand) coefficients on the
-        # native 2D/3D Lagrange assembler. Fail loud on everything else rather than mis-assemble.
-        if any(
-            _contains(c, TrialFunction) and not _contains(c, TestFunction) and _contains_network_call(c)
+        # A network in a trial-only (essential) constraint is a trainable *Dirichlet value*
+        # ``u(region) - net(x)`` (an unknown boundary profile), NOT an integrand coefficient. It is
+        # supported as a *bare* net on a boundary region, native Lagrange single-field (the parametric
+        # path evaluates ``net(boundary_coords)`` from the runtime args each solve). Everything else --
+        # a compound value ``1+net(x)``, an initial-condition value, non-nodal or multifield -- is rejected.
+        _net_trial_only = [
+            c
             for c in constraints
-        ):
-            raise NotImplementedError(
-                "jno.fem: a network inside a Dirichlet/IC value expression (a trial-only constraint) is "
-                "not supported — neural coefficients are weak-form integrand coefficients only."
-            )
+            if _contains(c, TrialFunction) and not _contains(c, TestFunction) and _contains_network_call(c)
+        ]
+        for c in _net_trial_only:
+            support, _rg = _region_and_support(c, domain)
+            _comp, _val, _vnode = _dirichlet_spec(_bare(c))
+            if support != "boundary" or not _is_bare_neural_value_node(_vnode):
+                raise NotImplementedError(
+                    "jno.fem: a network in an essential (trial-only) constraint must be a *bare* Dirichlet "
+                    "value net(x) on a boundary region — a compound expression (e.g. 1 + net(x)) or an "
+                    "initial-condition value is not supported."
+                )
+        if _net_trial_only:
+            if _trial_spaces(constraints) - {"Lagrange"}:
+                raise NotImplementedError("jno.fem: a net-valued Dirichlet is supported on Lagrange elements only.")
+            if len(_field_keys(constraints)) > 1:
+                raise NotImplementedError("jno.fem: a net-valued Dirichlet is single-field only.")
         if getattr(domain, "dimension", None) == 1:
             raise NotImplementedError(
                 "jno.fem: neural coefficients are not supported on 1D domains — the native 1D assembler has no "

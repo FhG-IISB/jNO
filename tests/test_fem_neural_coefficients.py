@@ -1095,16 +1095,87 @@ def test_nonnodal_trainable_net_in_boundary_term_guard():
         jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, net(xr, yr) * wr, u(xl, yl) - 0.0])
 
 
+# ==========================================================================
+# net-valued Dirichlet: an unknown boundary profile u(region) - net(x)
+# ==========================================================================
+
+
+def test_dirichlet_net_routes_parametric():
+    """``u(boundary) - net(xb, yb)`` (a trial-only constraint) is a trainable Dirichlet *value*, not a
+    coefficient: the system routes to a parametric FemLinearSystem carrying the net's ModelWeights
+    slot, and the operator itself is unchanged (only the load carries the net)."""
+    from jno.trace import FemLinearSystem
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    net = _mlp_net(key=40)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 0.0 * vi, u(xb, yb) - net(xb, yb)], quad_degree=3)
+    assert fem.is_linear and isinstance(fem.operator, FemLinearSystem) and fem.operator.is_parametric
+    (name,) = fem.operator.runtime_parameter_exprs
+    assert isinstance(fem.operator.runtime_parameter_exprs[name], ModelWeights)
+
+
+def test_dirichlet_net_recovers_bc_profile():
+    """The headline: recover an unknown Dirichlet profile g(x) = net(x) from the interior response.
+    Laplace ``∇u·∇v = 0`` with ``u(boundary) - net(xb, yb)`` — u is the harmonic extension of the BC,
+    so the interior data pins the boundary profile. The recovery (∂loss/∂weights actually moves the
+    profile) is the correctness test — an operator-match would pass even if the value froze."""
+
+    def setup(g_node_fn):
+        d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.2)
+        u, phi = d.fem_symbols()
+        xi, yi, _ = d.variable("interior", split=True)
+        xb, yb, _ = d.variable("boundary", split=True)
+        ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+        return d, u, (xb, yb), jno.fem([ui.x * vi.x + ui.y * vi.y - 0.0 * vi, g_node_fn(u, xb, yb)], quad_degree=3)
+
+    _, _, _, fem_ref = setup(lambda u, xb, yb: u(xb, yb) - (0.3 + 0.5 * xb + 0.2 * yb))
+    u_obs = jnp.linalg.solve(jnp.asarray(_dense(fem_ref.A)), jnp.asarray(fem_ref.b).reshape(-1))
+
+    net = _mlp_net(key=41, hidden=16)
+    net.optimizer(optax.adam(1e-2))
+    d, u, (xb, yb), fem = setup(lambda u, xb, yb: u(xb, yb) - net(xb, yb))
+    crux = jno.core([(fem.solve() - u_obs).mse], domain=_DUMMY)
+    crux.solve(400)
+
+    trained = crux.eval([ModelWeights(net)])
+    nodes = np.asarray(d.built_mesh.points)[:, :2]
+    onb = np.isclose(nodes[:, 0], 0) | np.isclose(nodes[:, 0], 1) | np.isclose(nodes[:, 1], 0) | np.isclose(nodes[:, 1], 1)
+    bn = nodes[onb]
+    g_net = np.asarray(trained(jnp.asarray(bn[:, 0:1]), jnp.asarray(bn[:, 1:2]))).reshape(-1)
+    g_true = 0.3 + 0.5 * bn[:, 0] + 0.2 * bn[:, 1]
+    rel = float(np.linalg.norm(g_net - g_true) / np.linalg.norm(g_true))
+    assert rel < 0.1, f"Dirichlet BC profile recovery rel-err {rel:.3e}"
+
+
+def test_dirichlet_net_scope_guards():
+    """Only a *bare* net(x) Dirichlet value on a boundary is supported: a compound value, an
+    initial-condition value, and a transient form each fail loud."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+
+    # compound Dirichlet value 1 + net(x): rejected (needs a general args-aware value evaluator)
+    net = _mlp_net(key=42)
+    with pytest.raises(NotImplementedError, match="bare|compound"):
+        jno.fem([ui.x * vi.x + ui.y * vi.y - 0.0 * vi, u(xb, yb) - (1.0 + net(xb, yb))], quad_degree=3)
+
+    # net as an initial-condition value: rejected
+    d2, u2, phi2, (x2, y2), (xb2, yb2), ci, u2i, v2i, _psi0 = _transient_setup(mesh_size=0.3, time=(0.0, 0.05, 6))
+    net2 = _mlp_net(key=43)
+    with pytest.raises(NotImplementedError, match="bare|initial|transient"):
+        jno.fem([u2i.t * v2i + (u2i.x * v2i.x + u2i.y * v2i.y), u2(xb2, yb2) - 0.0, u2(ci[0], ci[1]) - net2(ci[0], ci[1])])
+
+
 def test_scope_guards_fail_loud():
-    """Scope limits raise explicit NotImplementedError, never mis-assemble: a net inside a
-    Dirichlet value and a solution-dependent net(u) on the mass (u_t) term (a nonlinear mass)."""
-    d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _poisson_setup()
-    net = _mlp_net(key=5)
-
-    # net in a Dirichlet value expression
-    with pytest.raises(NotImplementedError, match="Dirichlet"):
-        jno.fem([(ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - net(xb, yb)])
-
+    """Scope limits raise explicit NotImplementedError, never mis-assemble: a solution-dependent
+    net(u) on the mass (u_t) term (a nonlinear mass). (A *bare* net(x) Dirichlet value IS supported
+    — see test_dirichlet_net_recovers_bc_profile; only compound/IC/transient net values are guarded.)"""
     # net(u) on the mass term = a nonlinear mass C(u)*u_t (the matrix form can't express it). A
     # coordinate net(x) mass coefficient IS supported (see test_mass_net_kx_recovers_via_crux).
     d2, u2, phi2, (x2, y2), (xb2, yb2), ci, u2i, v2i, psi0 = _transient_setup(mesh_size=0.3, time=(0.0, 0.02, 5))
