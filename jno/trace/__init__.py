@@ -2354,7 +2354,11 @@ class ModelCall(Placeholder):
 
     def __init__(self, model: Model, args: list):
         self.model = model
-        self.args = args
+        # Unwrap typed semantic views (``u.bind(...)``, ``ui.x``, …) to their traced Placeholder:
+        # a view delegates via ``__getattr__`` and is NOT a Placeholder subclass, so left wrapped it
+        # would be invisible to every tree walker (linearity/trial detection, coordinate retagging)
+        # and unevaluable by the evaluators — e.g. a constitutive-law coefficient ``net(ui)``.
+        self.args = [a._expr if (not isinstance(a, Placeholder) and hasattr(a, "_expr")) else a for a in args]
         self.op_id = _next_op_id()
 
     def __repr__(self):

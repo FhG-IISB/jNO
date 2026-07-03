@@ -344,6 +344,172 @@ def test_f32_net_promotes_under_x64():
     assert np.all(np.isfinite(sol))
 
 
+# ==========================================================================
+# learned constitutive laws: k(u) / k(∇u) — steady nonlinear
+# (NN-EUCLID-style: Flaschel/Kumar/De Lorenzis, JMPS 165 (2022) §2.2–2.3)
+# ==========================================================================
+
+
+class _Quad(eqx.Module):
+    """'Network' computing exactly k(u) = a + b·u² — lets the nonlinear solve be checked against
+    the symbolically written form with zero training (and gives named-leaf gradient checks)."""
+
+    a: jnp.ndarray
+    b: jnp.ndarray
+
+    def __call__(self, u):
+        return self.a + self.b * jnp.asarray(u) ** 2
+
+
+def _quad_net(a=1.0, b=0.5):
+    net = jno.nn.wrap(_Quad(a=jnp.asarray(float(a)), b=jnp.asarray(float(b))))
+    net.dtype(jnp.float64)
+    return net
+
+
+def _ku_setup(mesh_size=0.25):
+    d, u, phi, (xi, yi), (xb, yb), ui, vi, _ = _poisson_setup(mesh_size)
+    f = 10.0 * jno.np.sin(PI * xi) * jno.np.sin(PI * yi)
+    return d, u, phi, (xi, yi), (xb, yb), ui, vi, f
+
+
+def test_ku_classification():
+    """A net whose args carry the unknown makes the form NONLINEAR — including the bare reaction
+    ``net(u)*v`` that no product rule catches — while a coordinate-input net stays linear."""
+    d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _ku_setup()
+    net = _quad_net()
+    fem = jno.fem([net(ui) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    assert fem._mode == "nonlinear"
+
+    net_r = _quad_net()
+    fem_r = jno.fem([(ui.x * vi.x + ui.y * vi.y) + net_r(ui) * vi - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    assert fem_r._mode == "nonlinear"
+
+    net_x = _mlp_net(key=7)
+    fem_l = jno.fem([(1.0 + net_x(xi, yi)) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    assert fem_l._mode == "linear"
+
+
+def test_ku_forward_matches_symbolic_newton():
+    """The net-coefficient Newton solve equals the symbolically written ``(1 + 0.5u²)∇u·∇v`` Newton
+    solve to machine precision — the net is evaluated inside the residual, its u-dependence enters
+    the element Jacobian through jacfwd."""
+    from jno.utils.solver.newton_krylov import newton_krylov
+
+    d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _ku_setup()
+    net = _quad_net(a=1.0, b=0.5)
+    fem = jno.fem([net(ui) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    fem_sym = jno.fem([(1.0 + 0.5 * ui**2) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+
+    (name,) = fem.operator.runtime_parameter_exprs
+    u_net = newton_krylov(lambda v: fem.operator.residual(v, {name: net.module}), jnp.zeros(fem.operator.size))
+    u_sym = newton_krylov(lambda v: fem_sym.operator(v), jnp.zeros(fem_sym.operator.size))
+    assert float(jnp.max(jnp.abs(u_net - u_sym))) < 1e-10
+    assert float(jnp.linalg.norm(u_sym)) > 0.1  # a genuinely nonzero, nonlinear solution
+
+
+def test_kgradu_form_matches_symbolic():
+    """k(∇u): a net taking the gradient components (p-Laplacian-style ``k = 1 + 0.5|∇u|²``) solves
+    and matches the symbolic reference."""
+    from jno.utils.solver.newton_krylov import newton_krylov
+
+    class _PLap(eqx.Module):
+        b: jnp.ndarray
+
+        def __call__(self, gx, gy):
+            return 1.0 + self.b * (jnp.asarray(gx) ** 2 + jnp.asarray(gy) ** 2)
+
+    d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _ku_setup()
+    net = jno.nn.wrap(_PLap(b=jnp.asarray(0.5)))
+    net.dtype(jnp.float64)
+    fem = jno.fem([net(ui.x, ui.y) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    assert fem._mode == "nonlinear"
+    fem_sym = jno.fem(
+        [(1.0 + 0.5 * (ui.x**2 + ui.y**2)) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3
+    )
+    (name,) = fem.operator.runtime_parameter_exprs
+    u_net = newton_krylov(lambda v: fem.operator.residual(v, {name: net.module}), jnp.zeros(fem.operator.size))
+    u_sym = newton_krylov(lambda v: fem_sym.operator(v), jnp.zeros(fem_sym.operator.size))
+    assert float(jnp.max(jnp.abs(u_net - u_sym))) < 1e-10
+
+
+def test_constant_ku_net_equals_linear_solve():
+    """The degenerate constitutive law k(u) ≡ c must reproduce the plain linear solve (even though
+    the form still classifies nonlinear — Newton just converges to the linear solution)."""
+    from jno.utils.solver.newton_krylov import newton_krylov
+
+    d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _ku_setup()
+    net = _quad_net(a=2.0, b=0.0)
+    fem = jno.fem([net(ui) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    fem_lin = jno.fem([2.0 * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    (name,) = fem.operator.runtime_parameter_exprs
+    u_net = newton_krylov(lambda v: fem.operator.residual(v, {name: net.module}), jnp.zeros(fem.operator.size))
+    u_lin = jnp.linalg.solve(jnp.asarray(_dense(fem_lin.A)), jnp.asarray(fem_lin.b).reshape(-1))
+    assert float(jnp.max(jnp.abs(u_net - u_lin))) < 1e-9
+
+
+def test_ku_gradient_matches_finite_difference():
+    """The implicit-diff gradient (custom_root through Newton) w.r.t. a net weight matches central
+    finite differences — the least-exercised corner (closure-converted module pytree)."""
+    from jno.utils.solver.newton_krylov import newton_krylov
+
+    d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _ku_setup(mesh_size=0.4)
+    net = _quad_net(a=1.0, b=0.5)
+    fem = jno.fem([net(ui) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    (name,) = fem.operator.runtime_parameter_exprs
+
+    def loss_at(b_val):
+        module = _Quad(a=jnp.asarray(1.0), b=jnp.asarray(b_val))
+        uu = newton_krylov(lambda v: fem.operator.residual(v, {name: module}), jnp.zeros(fem.operator.size))
+        return jnp.sum(uu**2)
+
+    g_ad = float(jax.grad(loss_at)(0.5))
+    h = 1e-6
+    g_fd = float((loss_at(0.5 + h) - loss_at(0.5 - h)) / (2 * h))
+    assert abs(g_ad - g_fd) < 1e-5 * max(1.0, abs(g_fd)), f"AD {g_ad} vs FD {g_fd}"
+
+
+def test_ku_recovers_constitutive_law_via_crux():
+    """NN-EUCLID-style unsupervised constitutive learning: observe u from a hidden law
+    k(u) = 1 + 0.5u², train a 1-input MLP ``1 + net(u)`` through the differentiable nonlinear
+    ``fem.solve()``, and check the learned k against the truth on the observed u-range."""
+    from jno.utils.solver.newton_krylov import newton_krylov
+
+    d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _ku_setup(mesh_size=0.25)
+    fem_sym = jno.fem([(1.0 + 0.5 * ui**2) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    u_obs = newton_krylov(lambda v: fem_sym.operator(v), jnp.zeros(fem_sym.operator.size))
+
+    net = jno.nn.wrap(foundax.mlp(1, hidden_dims=16, num_layers=2, activation=jax.nn.tanh, key=jax.random.PRNGKey(8)))
+    net.dtype(jnp.float64)
+    net.optimizer(optax.adam(1e-2))
+    fem = jno.fem([(1.0 + net(ui)) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    assert fem._mode == "nonlinear"
+
+    crux = jno.core([(fem.solve() - u_obs).mse], domain=_DUMMY)
+    crux.solve(600)
+
+    trained = crux.eval([ModelWeights(net)])
+    u_grid = jnp.linspace(0.0, float(jnp.max(u_obs)), 64).reshape(-1, 1)
+    k_learned = 1.0 + np.asarray(trained(u_grid)).reshape(-1)
+    k_true = 1.0 + 0.5 * np.asarray(u_grid).reshape(-1) ** 2
+    rel = float(np.linalg.norm(k_learned - k_true) / np.linalg.norm(k_true))
+    assert rel < 0.05, f"constitutive-law recovery rel-err {rel:.3e}"
+
+
+def test_ku_composes_with_solver_slots():
+    """The nonlinear neural-coefficient solve composes with the slot API
+    (``fem.solve(nonlinear=jno.solve.newton())``) through crux."""
+    d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _ku_setup(mesh_size=0.35)
+    net = _quad_net(a=1.0, b=0.3)
+    net.optimizer(optax.adam(1e-3))
+    fem = jno.fem([net(ui) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    u_node = fem.solve(nonlinear=jno.solve.newton())
+    crux = jno.core([(u_node**2).mse], domain=_DUMMY)
+    crux.solve(3)  # composes and steps without error
+    val = np.asarray(crux.eval([ModelWeights(net)]).b)
+    assert np.isfinite(val).all()
+
+
 def test_scope_guards_fail_loud():
     """v1 scope limits raise explicit NotImplementedError, never mis-assemble: a net inside a
     Dirichlet value and a net in a transient form."""

@@ -733,10 +733,29 @@ L. De Lorenzis, *NN-EUCLID: Deep-learning hyperelasticity without stress data*, 
 Solids 165 (2022) 105076, §2.2–2.3) and Tartakovsky et al., *Learning Parameters and Constitutive
 Relationships with Physics-Informed Deep Neural Networks* (Water Resour. Res. 56, 2020, §2).
 
-Current scope: **steady** weak forms on the native 2D/3D Lagrange assembler, single field.
-Not yet supported (each fails loud): networks inside Dirichlet/IC values, transient forms,
-`complex=True` forms, coupled multi-field problems, 1D, and non-nodal
-(Argyris/Morley/Hermite/RT/Nédélec) elements.
+**Learned constitutive laws — `net(u)`, `net(∇u)`.** A network may also take the *solution* (or
+its derivatives) as input — then it is a material law, not a spatial map, and the form becomes
+nonlinear in `u` (routed to the matrix-free Newton path automatically; the net's `u`-dependence
+enters the element Jacobians through per-element forward AD). This is the NN-EUCLID setting:
+observe `u`, learn the hidden law unsupervised through the residual:
+
+```python
+net = jno.nn.wrap(foundax.mlp(1, hidden_dims=16, num_layers=2,
+                              activation=jax.nn.tanh, key=key)).dtype(jnp.float64)
+# hidden truth k(u) = 1 + 0.5 u²; learn it from a single observed field
+fem = jno.fem([(1.0 + net(ui)) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
+crux = jno.core([(fem.solve() - u_obs).mse], domain=obs).solve(600)
+```
+
+`net(ui.x, ui.y)` (a `k(∇u)` p-Laplacian-type law) works the same way, and solution- and
+coordinate-inputs can be mixed (`net(xi, yi, ui)`). Classification is automatic: a net whose
+arguments carry the unknown makes the form nonlinear — including a bare reaction term
+`net(u)*v` — while `net(x, y)` keeps the system linear(-parametric).
+
+Current scope: **steady** weak forms (linear k(x) and nonlinear k(u)/k(∇u)) on the native 2D/3D
+Lagrange assembler, single field. Not yet supported (each fails loud): networks inside
+Dirichlet/IC values, transient forms, `complex=True` forms, coupled multi-field problems, 1D, and
+non-nodal (Argyris/Morley/Hermite/RT/Nédélec) elements.
 
 ### Transient inverse
 
