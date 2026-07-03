@@ -18,7 +18,6 @@ import jno
 pi, sigma, a_r, a_t = np.pi, 4.0, 2.0, 3.0
 sin = jno.np.sin
 exact = lambda x, y: x * jnp.sin(jnp.pi * y) + y  # noqa: E731
-dense = lambda A: jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)  # noqa: E731
 
 d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.22)
 u, phi = d.fem_symbols()
@@ -35,7 +34,7 @@ robin_right = (a_r * u.bind(x=xr, y=yr) - (sin(pi * yr) + a_r * (sin(pi * yr) + 
 robin_top = (a_t * u.bind(x=xt, y=yt) - (1.0 - pi * xt + a_t)) * phi.bind(x=xt, y=yt)
 fem = jno.fem([volume, robin_right, robin_top, u(xl, yl) - yl, u(xbo, ybo) - 0.0], quad_degree=3)
 
-u_fem = jnp.linalg.solve(dense(fem.A), jnp.asarray(fem.b).reshape(-1))
+u_fem = jnp.asarray(fem.solve())  # default: Jacobi-preconditioned BiCGStab on the sparse operator
 pts = np.asarray(fem.points)
 rel_l2 = float(jnp.linalg.norm(exact(pts[:, 0], pts[:, 1]) - u_fem) / jnp.linalg.norm(exact(pts[:, 0], pts[:, 1])))
 print(f"\nReaction-diffusion, mixed Dirichlet/Robin via jno.fem: dofs={fem.dofs}  rel_L2={rel_l2:.3e}")

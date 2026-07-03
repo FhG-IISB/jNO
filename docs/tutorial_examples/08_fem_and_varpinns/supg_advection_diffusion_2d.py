@@ -21,8 +21,6 @@ import numpy as np
 
 import jno
 
-dense = lambda A: jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)  # noqa: E731
-
 N, NU = 20, 1e-2  # Pe_cell = (1)*(1/N)/(2 NU) = 2.5 >> 1  -> Galerkin oscillates
 dom = jno.domain(constructor=jno.domain.equi_distant_rect(x_range=(0.0, 1.0), y_range=(0.0, 1.0), nx=N, ny=N))
 dom.tag("inflow", lambda x, y: x < 1e-6)
@@ -49,7 +47,8 @@ bcs = [u(xin, yin) - 0.0, u(xout, yout) - 1.0]
 
 def solve(weak):
     fem = jno.fem([weak, *bcs])
-    return jnp.linalg.solve(dense(fem.A), jnp.asarray(fem.b).reshape(-1)), fem
+    # non-symmetric advection operator -> GMRES
+    return jnp.asarray(fem.solve(linear=jno.solve.gmres(), precond=jno.precond.jacobi())), fem
 
 
 u_galerkin, fem_g = solve(galerkin)

@@ -192,7 +192,7 @@ class SemidiscreteTimeBlock:
         """
         return self.mass is not None and self.residual is not None
 
-    def step(self, u, t, dt, args=None, theta=None):
+    def step(self, u, t, dt, args=None, theta=None, *, linear_solve=None, nonlinear_solve=None):
         """Advance the semidiscrete state by one implicit step: ``u(t) -> u(t + dt)``.
 
         The composable one-step primitive behind :func:`_default_transient_integrate` (which is just
@@ -207,6 +207,14 @@ class SemidiscreteTimeBlock:
 
         ``theta`` defaults to ``metadata["theta"]`` (1 backward Euler / 1/2 trapezoidal). Operates in
         the block's (periodic-reduced) DOF space; use :meth:`prolong` for the full nodal field.
+
+        The defaults above are overridable — this is where ``fem.solve``'s solver slots plug in
+        (see ``jno.utils.solver.solver_api.compose_transient_step_solvers``):
+
+        * ``linear_solve(matvec, rhs, x0, diag_fn) -> x`` replaces the theta-step linear solve
+          (``matvec`` applies ``M + theta dt A``; ``diag_fn()`` is its exact diagonal; ``x0`` the
+          previous state as warm start);
+        * ``nonlinear_solve(G, u0) -> u`` replaces the per-step Newton solve.
         """
         import jax
         import jax.numpy as jnp
@@ -228,6 +236,8 @@ class SemidiscreteTimeBlock:
             def G(wn):
                 return (M_t @ (wn - u)) / dt + jnp.asarray(self.residual(wn, t_next, args), dtype).reshape(-1)
 
+            if nonlinear_solve is not None:
+                return nonlinear_solve(G, u)
             return newton_krylov(G, u)
 
         from .linear import matrix_diagonal
@@ -247,6 +257,9 @@ class SemidiscreteTimeBlock:
         f_avg = th * _forcing(t_next) + (1.0 - th) * _forcing(t)
         rhs = M @ u - (1.0 - th) * dt * (A @ u) + dt * c + dt * f_avg
         step_op = lambda wn: M @ wn + th * dt * (A @ wn)  # noqa: E731  the theta-method step operator
+        if linear_solve is not None:
+            # slot-composed per-step solve; the exact step diagonal keeps jacobi-type specs exact
+            return linear_solve(step_op, rhs, u, lambda: matrix_diagonal(M) + th * dt * matrix_diagonal(A))
         # diagonal (Jacobi) preconditioner 1/diag(M + theta dt A); zero diagonals left unscaled
         d = matrix_diagonal(M) + th * dt * matrix_diagonal(A)
         inv = 1.0 / jnp.where(jnp.abs(d) > 1e-30, d, 1.0)
@@ -307,7 +320,7 @@ def _block_time_grid(block):
     return jnp.linspace(t0, t1, n_steps + 1)
 
 
-def _default_transient_integrate(block, args, save_ts):
+def _default_transient_integrate(block, args, save_ts, *, linear_solve=None, nonlinear_solve=None):
     """Default transient integrator: backward Euler at the block's *own* assembled step ``dt``,
     advanced with ``jax.lax.scan`` (reverse-mode differentiable) and sampled at ``save_ts`` by
     linear interpolation, so the integration step is always the assembled ``dt`` and never an
@@ -342,7 +355,9 @@ def _default_transient_integrate(block, args, save_ts):
     theta = float(block.metadata.get("theta", 1.0)) if getattr(block, "metadata", None) else 1.0
 
     def step(w, t_next):
-        wn = block.step(w, t_next - dt, dt, args=args, theta=theta)
+        wn = block.step(
+            w, t_next - dt, dt, args=args, theta=theta, linear_solve=linear_solve, nonlinear_solve=nonlinear_solve
+        )
         return wn, wn
 
     _, ys = jax.lax.scan(step, s0, grid_ts[1:])

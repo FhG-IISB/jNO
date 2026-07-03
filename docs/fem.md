@@ -16,8 +16,6 @@ import jax.numpy as jnp
 from shapely.geometry import box
 import jno
 
-dense = lambda A: jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)  # A may be sparse or dense
-
 d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
 u, phi = d.fem_symbols()                                   # trial / test functions
 xi, yi, _ = d.variable("interior", split=True)            # volume quadrature coords
@@ -26,13 +24,14 @@ ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)         # views with .x / .y d
 
 f = 2.0 * (xi * (1 - xi) + yi * (1 - yi))
 fem = jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0])   # weak form + u = 0 on the boundary
-u_h = jnp.linalg.solve(fem.A, fem.b)
+u_h = fem.solve()          # matrix-free default; slots pick anything else (see "Choosing the solver")
 ```
 
 > The flat accessors — `fem.A`, `fem.b`, `fem.M`, `fem.state0`, and `fem.residual(u[, t])` /
-> `fem.jacobian(u[, t])` — return ready-to-use **dense** matrices and **flat** vectors, so no
+> `fem.jacobian(u[, t])` — return ready-to-use **dense** matrices and **flat** vectors for
+> hand-rolled experiments (e.g. `u_h = jnp.linalg.solve(fem.A, fem.b)`), so no
 > `.todense()`/`reshape` is needed. `fem.operator` still exposes the raw sparse (`BCOO`) operator
-> for large problems; the `dense(...)` helper above densifies those (e.g. `fem.operator.A`).
+> for large problems — `fem.solve()` and the solver slots work on that sparse operator directly.
 
 ---
 
@@ -567,6 +566,131 @@ default (no external dependency): the linear default is a sparse-direct factoris
 matrix-free BiCGStab as the iterative alternative; the nonlinear default is a matrix-free
 Newton-Krylov, and the transient default backward-Euler over those. All are implicit-diff, so
 `crux.solve` recovers parameters through them. Bring your own `solve_fn` for anything else.
+
+### Choosing the solver — the slot API (`jno.solve` / `jno.precond`)
+
+Between "accept the default" and "write a full `solve_fn`" sits the **slot API**: the solver
+factorises into four orthogonal slots, each a configured **callable** (never a string) from the
+`jno.solve` / `jno.precond` namespaces — or your own with the same contract. Every `None` keeps
+today's default; `solve_fn=` stays the total override (passing both is an error).
+
+```python
+u = fem.solve(
+    x0        = u_guess,                 # warm start (previous solve, coarse solve, a surrogate…)
+    nonlinear = jno.solve.newton(),      # linearization driver (nonlinear problems)
+    linear    = jno.solve.gmres(),       # inner linear solve: lu / dense / cg / bicgstab / gmres
+    precond   = jno.precond.jacobi(),    # v -> M⁻¹v spec, materialized against the assembled A
+)
+```
+
+Everything shipped is **pure JAX** — `jit`- and `vmap`-native, differentiable (the Krylov
+wrappers sit on `lax.custom_linear_solve`, Newton on `lax.custom_root`) — and *reuses* existing
+implementations (`jax.scipy.sparse.linalg`, `sparse_lu_solve`) rather than duplicating them.
+Slot solvers receive the assembler's **BCOO** operator directly (no densification), and compose
+with the periodic reduction and every parametric/inverse path unchanged. Pick by structure:
+
+| structure | solver | notes |
+|---|---|---|
+| SPD (Poisson, elasticity, mass) | `cg` | cheapest per iteration |
+| non-symmetric (advection, SUPG) | `bicgstab` / `gmres` | `bicgstab` == the historic default (with `jacobi()`) |
+| **iterative preconditioner** (inner Krylov, block/Schur with inexact inner solves) | `fgmres` | flexible right preconditioning — Saad, *SIAM J. Sci. Stat. Comput.* 14(2), 1993, Alg. 2.2 |
+| symmetric **indefinite** (Stokes/Biot saddle, biharmonic) | `minres` | monotone residual, `O(1)` memory — Paige & Saunders, *SIAM J. Numer. Anal.* 12(4), 1975 |
+| SPD, batched/GPU-heavy | `chebyshev` | inner-product free (no reductions) — Golub & Varga 1961; Saad, *Iterative Methods*, 2003, §12.3 |
+| indefinite, single solve | `lu` | sparse-direct; **no vmap rule** — use a Krylov solver inside batched solves |
+| small systems / coarse blocks | `dense` | LAPACK, vmap-native |
+
+**Preconditioner specs** (declarative — materialized against the assembled operator at solve
+time; a preconditioner never changes the converged solution, only the speed, so specs need no
+gradient path):
+
+* `jno.precond.jacobi()` — diagonal.
+* `jno.precond.chebyshev(degree=…)` — fixed-degree Chebyshev **polynomial** preconditioner
+  (same references as the solver): matvecs and AXPYs only, the GPU-era substitute for
+  Gauss-Seidel/ILU smoothing, and a fixed *linear* map so it legally preconditions `cg`/`minres`.
+* `jno.precond.inner(solver)` — any `jno.solve` solver as the `M⁻¹` application (an inexact
+  block/system solve). Iterative inner ⇒ flexible outer (`fgmres`).
+* `jno.precond.form([...terms], inner=…)` — **preconditioners as weak forms**: assemble an
+  auxiliary operator from ordinary traced terms and invert it as `M⁻¹`. Weighted mass matrices,
+  local proxies of nonlocal (radiation) operators, shifted-Laplacian Helmholtz twins, low-order
+  proxies — written in the same language as the PDE.
+* `jno.precond.block_diag((field, spec), …)` / `jno.precond.triangular((field, spec), …)` —
+  per-field composition over `fem.blocks` (fields are the trial symbols; `fem.block_index`
+  resolves them, offsets-ordered). `triangular` is the standard saddle-point shape: last block
+  solved first, substituted back through the assembled off-diagonal matvecs.
+* `jno.precond.amg(cycles=…)` — **hybrid algebraic multigrid**: setup once on the host via the
+  *optional* `pyamg` (smoothed aggregation — Vaněk, Mandel & Brezina, *Computing* 56, 1996;
+  PyAMG — Bell et al., *JOSS* 8(87):5495, 2023), applied as a pure-JAX V-cycle with Chebyshev
+  smoothing (Adams et al., *JCP* 188, 2003). The apply is `jit`/`vmap`-native (one frozen
+  hierarchy legitimately serves a whole batch) and exactly linear, so it preconditions
+  `cg`/`minres` too. Mesh-independent convergence ⇒ *the* choice for large elliptic blocks.
+  Inside traced/parametric solves, pre-build eagerly: `spec = jno.precond.amg(); spec.build(fem.A)`.
+  Without pyamg installed everything else works; using `amg` raises a clear install hint.
+
+The flagship pattern — Taylor–Hood **Stokes** by FGMRES with an inexact velocity block solve and
+the viscosity-weighted pressure-mass Schur approximation (Elman, Silvester & Wathen, *Finite
+Elements and Fast Iterative Solvers*, 2nd ed., 2014, §9.2) — no densification anywhere:
+
+```python
+sol = fem.solve(
+    linear  = jno.solve.fgmres(tol=1e-10, restart=40),
+    precond = jno.precond.triangular(
+        (u, jno.precond.inner(jno.solve.cg(tol=1e-2, maxiter=60))),   # Â⁻¹: inexact CG
+        (p, jno.precond.form([(1.0/mu) * pp * qq], inner=jno.solve.dense())),  # Ŝ ≈ μ⁻¹ M_p
+    ),
+)
+```
+
+**Picard / lagged coefficients — `jno.lag`.** When a solution-dependent coefficient's Newton
+tangent destroys the linearized system's structure (the classic case: a shear-thinning viscosity
+`μ_eff(u)` in non-Newtonian/rigid-plastic Stokes flow, whose full-Newton velocity block is
+strongly nonsymmetric and defeats AMG/block preconditioners), freeze it with `jno.lag(...)` and
+drive with `jno.solve.picard()`:
+
+```python
+fem = jno.fem([2 * jno.lag(mu_eff) * inner(eps(ui), eps(vi)) - pi * div(vi), ...])
+sol = fem.solve(nonlinear=jno.solve.picard(damping=0.7), linear=jno.solve.fgmres(),
+                precond=jno.precond.triangular(...))
+```
+
+`lag` is `stop_gradient` on the traced expression, so the residual's linearization *is* the
+Picard operator — each outer step re-solves the lagged system (linear convergence, but every
+inner system keeps its symmetry/definiteness); the converged solution is identical to full
+Newton's. Without any `lag` marker, `picard(damping=…)` is exactly damped Newton
+(`jno.solve.newton(damping=…)` spells the same thing). Caveat for inverse problems: implicit
+differentiation then also uses the lagged Jacobian (the standard "Picard adjoint" approximation)
+— drop `lag` when exact parameter gradients matter more than per-step solvability.
+
+**User extension** is duck-typed — a linear solver is any
+`fn(A, b, *, M=None, x0=None) -> x` with `A` a `jno.solve.LinearOperator` (`.mv`, `.T`,
+`.diag()`, `.bcoo`, `.dense()`); a preconditioner is any `ctx -> (v -> M⁻¹v)`:
+
+```python
+def my_precond(ctx):                      # ctx.A, ctx.diag(), ctx.fem
+    inv = 1.0 / ctx.diag()
+    return lambda v: inv * v
+u = fem.solve(linear=jno.solve.cg(), precond=my_precond)
+```
+
+If your callable is pure JAX it inherits `jit`/`vmap`/AD automatically. On the matrix-free
+**nonlinear** path the `precond` spec is materialized *per Newton/Picard linearization* against
+the JVP operator — so `form`, `inner(...)`, `chebyshev`, a pre-built `amg`, and their
+`block_diag`/`triangular` compositions all work (this is the nonlinear-saddle production
+pattern: `nonlinear=picard() + linear=fgmres() + precond=triangular(...)`); only specs that
+need the assembled matrix (`jacobi`, an unbuilt `amg`) raise.
+
+**Transient problems.** The slots configure the *per-step* solves of the default theta-method
+integrator (the bring-your-own `(block, args, save_ts)` contract via `solve_fn=` is unchanged):
+`linear`/`precond` see the step operator `M + θ·dt·A` — when the operator is time-independent
+the step matrix is formed **once** and the preconditioner materialized **once before the time
+loop** (an AMG hierarchy or auxiliary `form` operator is then reused by every step; `jacobi`
+uses the exact step diagonal either way) — and `nonlinear` drives each implicit step of a
+nonlinear block (`picard` + `jno.lag` per step included). Second-order-in-time (`u_tt`) flows
+through the same augmented block unchanged. Each step warm-starts from the previous state
+(so `x0=` is rejected — the initial state is the ICs' job); `lu()` inside the time loop
+re-factorizes per step (JAX's `spsolve` has no factorization cache).
+
+Not yet supported (clear errors, see `plans/fem-solver-api.md`): slots on **complex** /
+complex-transient problems (`x0` on complex included), and slots combined with `adapt=`.
 
 ### Field parameters `k(x)` + regularization
 

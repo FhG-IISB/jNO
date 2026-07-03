@@ -24,7 +24,6 @@ import jno  # noqa: E402
 
 alpha, sigma, MS = 0.20, 4.0, 0.40
 exact = lambda z: z + alpha * jnp.sin(jnp.pi * z)  # noqa: E731
-dense = lambda A: jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)  # noqa: E731
 
 
 def letter_F_3d(depth=1.0, mesh_size=MS):
@@ -75,7 +74,7 @@ volume = ui.x * vi.x + ui.y * vi.y + ui.z * vi.z + sigma * u * vi - f * vi
 top_neumann = -(1.0 - alpha * np.pi) * phi.bind(x=ct[0], y=ct[1], z=ct[2])  # du/dn given on the top face
 fem = jno.fem([volume, top_neumann, u(cb[0], cb[1], cb[2]) - 0.0], element_type="TET4", quad_degree=2)
 
-u_fem = jnp.linalg.solve(dense(fem.A), jnp.asarray(fem.b).reshape(-1))
+u_fem = jnp.asarray(fem.solve(linear=jno.solve.lu()))  # indefinite Helmholtz -> sparse-direct slot
 pts = np.asarray(fem.points)
 rel_l2 = float(jnp.linalg.norm(exact(pts[:, 2]) - u_fem) / jnp.linalg.norm(exact(pts[:, 2])))
 print(f"\n3D F-domain screened Helmholtz via jno.fem: dofs={fem.dofs}  rel_L2={rel_l2:.3e}")

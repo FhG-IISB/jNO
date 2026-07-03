@@ -27,7 +27,7 @@ ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
 fem = jno.fem([k * (laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi])) - q * vi, u(xb, yb) - 0.0])
 
 # recover k(x) end-to-end through crux, from a flat wrong guess k = 1
-crux = jno.core([(fem.solve(solver) - w_obs).mse], domain=_DUMMY)
+crux = jno.core([(fem.solve(linear=jno.solve.dense()) - w_obs).mse], domain=_DUMMY)
 crux.solve(200)
 ```
 
