@@ -15,14 +15,21 @@ setting of NN-EUCLID (Flaschel, Kumar, De Lorenzis, J. Mech. Phys. Solids 165 (2
 §2.2-2.3) and Tartakovsky et al. (Water Resour. Res. 56, 2020, §2).
 """
 
-import foundax
-import jax
-import jax.numpy as jnp
-import numpy as np
-import optax
-from shapely.geometry import box
+import os
 
-import jno
+os.environ["JAX_PLATFORMS"] = "cpu"  # differentiable inverse solve: run on CPU (no GPU contention/OOM)
+
+import jax  # noqa: E402
+
+jax.config.update("jax_enable_x64", True)  # FEM assembly / solves are float64
+
+import foundax  # noqa: E402
+import jax.numpy as jnp  # noqa: E402
+import numpy as np  # noqa: E402
+import optax  # noqa: E402
+from shapely.geometry import box  # noqa: E402
+
+import jno  # noqa: E402
 
 d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
 u, phi = d.fem_symbols()
