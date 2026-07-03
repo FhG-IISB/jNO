@@ -2457,7 +2457,11 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         # rejected: the complex-transient branch unpacks eager (A, b) legs (a parametric leg cannot
         # ride it), and a solution-dependent net makes the legs nonlinear (no complex Newton block).
         if is_transient:
-            raise NotImplementedError("jno.fem: a neural coefficient in a complex *transient* form is not supported yet.")
+            raise NotImplementedError(
+                "jno.fem: a neural coefficient in a complex *transient* form is not supported — the "
+                "complex-transient path has no parametric/inverse route at all (it integrates fixed "
+                "real-equivalent blocks with no runtime args), so this needs that infrastructure built first."
+            )
         from .utils.solver.weak_form import _is_obviously_nonlinear_in_unknown as _nlin_cx
 
         if any(_nlin_cx(domain, b) for b in weak_bares):
