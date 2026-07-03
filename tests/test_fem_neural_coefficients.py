@@ -618,6 +618,27 @@ def test_transient_nonlinear_ku_recovers_via_crux():
     assert rel < 0.05, f"transient constitutive-law recovery rel-err {rel:.3e}"
 
 
+def test_frozen_net_on_mass_term_is_allowed():
+    """A *frozen* (known) net on the mass (u_t) term IS allowed — a known spatially-varying density
+    ρ(x)·u_t: the mass matrix is assembled once from its stored weights, matching the same scalar
+    density's trajectory. Only a *trainable* net on the mass term is guarded (see the scope test)."""
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    def setup(coeff):
+        d, u, phi, (xi, yi), (xb, yb), ci, ui, vi, u0 = _transient_setup(mesh_size=0.25, time=(0.0, 0.05, 6))
+        return d, jno.fem([coeff(xi, yi) * ui.t * vi + (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - u0])
+
+    net = _const_net(1.3)
+    net.freeze()
+    d, fem = setup(lambda x, y: net(x, y))
+    assert fem.is_transient and not getattr(fem.operator, "is_parametric", False)  # known coeff -> non-parametric
+    traj = _default_transient_integrate(fem.operator, {}, _grid_ts(fem.operator))
+
+    _, fem_ref = setup(lambda x, y: 1.3)
+    traj_ref = _default_transient_integrate(fem_ref.operator, {}, _grid_ts(fem_ref.operator))
+    assert float(jnp.max(jnp.abs(traj - traj_ref))) < 1e-12
+
+
 # ==========================================================================
 # complex: a real net coefficient through the real-equivalent block
 # ==========================================================================
