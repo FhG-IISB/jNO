@@ -949,6 +949,83 @@ def test_rt_solution_dependent_net_guard():
         jno.fem([net(ui) * inner(ui, vi) - inner(vi, vi)])
 
 
+def _hermite_transient_setup(coeff_fn, mesh_size=0.3, time=(0.0, 0.05, 6)):
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size, time=time)
+    u, phi = d.fem_symbols(space="Hermite")
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    u0 = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
+    return d, jno.fem([ui.t * vi + coeff_fn(xi, yi) * (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - u0])
+
+
+def test_transient_nonnodal_net_kx_matches_frozen():
+    """A trainable net(x) diffusivity in a Hermite (C¹) TRANSIENT form: the per-step re-assembled
+    operator leg reproduces the frozen (fixed-operator) trajectory, and the trajectory's gradient
+    reaches the net weights through the time-stepping."""
+    from jno.utils.solver.backend_blocks import _block_time_grid, _default_transient_integrate
+
+    net = _mlp_net(key=30, hidden=8)
+    d, fem = _hermite_transient_setup(lambda x, y: 1.0 + net(x, y))
+    assert fem.is_transient
+    (name,) = fem.operator.runtime_parameter_exprs
+    assert isinstance(fem.operator.runtime_parameter_exprs[name], ModelWeights)
+    ts = _block_time_grid(fem.operator)
+    traj = _default_transient_integrate(fem.operator, {name: net.module}, ts)
+
+    net_f = _mlp_net(key=30, hidden=8)  # identical weights
+    net_f.freeze()
+    _, fem_f = _hermite_transient_setup(lambda x, y: 1.0 + net_f(x, y))
+    traj_f = _default_transient_integrate(fem_f.operator, {}, _block_time_grid(fem_f.operator))
+    assert float(jnp.max(jnp.abs(traj - traj_f))) < 1e-8
+
+    def loss(m):
+        return jnp.sum(_default_transient_integrate(fem.operator, {name: m}, ts) ** 2)
+
+    g = eqx.filter_grad(loss)(net.module)
+    gsum = sum(jnp.sum(jnp.abs(x)) for x in jax.tree_util.tree_leaves(g) if eqx.is_inexact_array(x))
+    assert float(gsum) > 0.0
+
+
+def test_transient_nonnodal_neural_kx_recovers_via_crux():
+    """Recover a smooth k(x) from a Hermite transient trajectory through the default `fem.solve()`
+    (the transient integrator solves the dense per-step system directly, so no dense solve_fn
+    override is needed — unlike the steady non-nodal path)."""
+    from jno.utils.solver.backend_blocks import _block_time_grid, _default_transient_integrate
+
+    _, fem_ref = _hermite_transient_setup(lambda x, y: 1.0 + 0.5 * x + 0.3 * y)
+    u_obs = _default_transient_integrate(fem_ref.operator, {}, _block_time_grid(fem_ref.operator))
+
+    net = _mlp_net(key=31, hidden=16)
+    net.optimizer(optax.adam(1e-2))
+    d, fem = _hermite_transient_setup(lambda x, y: 1.0 + net(x, y))
+    crux = jno.core([(fem.solve() - u_obs).mse], domain=_DUMMY)
+    crux.solve(300)
+
+    trained = crux.eval([ModelWeights(net)])
+    nodes = np.asarray(d.built_mesh.points)[:, :2]
+    k_net = 1.0 + np.asarray(trained(jnp.asarray(nodes))).reshape(-1)
+    k_true = 1.0 + 0.5 * nodes[:, 0] + 0.3 * nodes[:, 1]
+    rel = float(np.linalg.norm(k_net - k_true) / np.linalg.norm(k_true))
+    assert rel < 0.12, f"transient non-nodal neural k(x) recovery rel-err {rel:.3e}"
+
+
+def test_transient_nonnodal_mass_net_guard():
+    """A trainable net on the mass (u_t) term of a non-nodal transient form fails loud (the mass
+    block is assembled once) — a frozen one would be fine."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3, time=(0.0, 0.05, 6))
+    u, phi = d.fem_symbols(space="Hermite")
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    u0 = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
+    net2 = _mlp_net(key=33)
+    with pytest.raises(NotImplementedError, match="mass"):
+        jno.fem([(1.0 + net2(xi, yi)) * ui.t * vi + (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - u0])
+
+
 def test_nonnodal_trainable_net_in_boundary_term_guard():
     """On a non-nodal element a *trainable* net in a Neumann/Robin (boundary) term fails loud — the
     natural-BC load is assembled non-differentiably there. (Native folds boundary nets into the

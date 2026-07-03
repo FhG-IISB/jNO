@@ -555,26 +555,27 @@ def assemble_fem_nonnodal(
         from .solver_helper import max_temporal_derivative_order as _mto
         from .time_route import _infer_time_window, _strip_temporal_trial_derivative
 
-        if neural_param_names:
-            # The non-nodal time block builds a fixed mass/operator (or threads only ``_rt_param_exprs``);
-            # a trainable net would silently freeze at its initial weights. Steady non-nodal only for now.
-            raise NotImplementedError(
-                "jno.fem (non-nodal): a trainable neural coefficient in a transient form is not wired yet "
-                "(steady non-nodal only). Use a steady form, or .freeze() the network."
-            )
         sub = [_apply_sign(domain, s, t) for bare in volume_terms for s, t in _split_additive_terms(domain, bare)]
         temporal = [t for t in sub if _contains_temporal_derivative(t)]
         spatial = [t for t in sub if not _contains_temporal_derivative(t)]
         if not temporal:
             raise ValueError("jno.fem (non-nodal): a transient weak form must contain a temporal term, e.g. inner(u.t, v).")
+        if collect_neural_slots(temporal).any_trainable:
+            # The mass block is assembled once (args=None) -- a trainable net on the u̇ term would silently
+            # freeze at its initial weights. Fail loud (a frozen net evaluates from its stored module by design).
+            raise NotImplementedError(
+                "jno.fem (non-nodal): a trainable neural coefficient on the mass (u_t) term is not supported -- "
+                "the mass block is assembled once. Use it on spatial terms, or .freeze() the network."
+            )
 
         # === second-order-in-time (u_tt): the augmented first-order block y = [u; v], v = u̇, integrated by
         #     the trapezoidal (θ=½, energy-conserving) rule — the non-nodal analogue of the native
         #     _assemble_second_order_time, reusing this path's push-forward mass / pins / IC-projection. ===
         if max((_mto(t) for t in temporal), default=1) >= 2:
-            if runtime_parameter_tags:
+            if runtime_parameter_tags or neural_param_names:
                 raise NotImplementedError(
-                    "jno.fem (non-nodal): a runtime parameter in a second-order-in-time form is not supported."
+                    "jno.fem (non-nodal): a runtime parameter or neural coefficient in a second-order-in-time "
+                    "form is not supported."
                 )
             if len(fields) > 1:
                 raise NotImplementedError("jno.fem (non-nodal): second-order-in-time (u_tt) is single-field only.")
@@ -698,7 +699,7 @@ def assemble_fem_nonnodal(
             # nonlinear transient: M(t) u̇ + R(u) = 0 (matrix-free Newton-Krylov per step). Natural load
             # folds into R; essential pins are residual rows + zeroed M rows/cols (the 1D pattern).
             M_nl = M if pin_dofs is None else M.at[pin_dofs, :].set(0.0).at[:, pin_dofs].set(0.0)
-            if runtime_parameter_tags:  # transient inverse: thread args through the residual + its Jacobian
+            if runtime_parameter_tags or neural_param_names:  # transient inverse: thread args through res + jac
 
                 def res_pt(u, t, args=None):
                     return _apply_dirichlet_rows(lambda uu: spatial_res(uu, args) - nat_load, pins)(jnp.asarray(u))
@@ -710,7 +711,7 @@ def assemble_fem_nonnodal(
                     mass=lambda t, args=None, _M=M_nl: _M,
                     residual=res_pt,
                     jacobian=jac_pt,
-                    runtime_parameter_exprs=dict(_rt_param_exprs),
+                    runtime_parameter_exprs=dict(_param_and_neural_exprs),
                     **common,
                 )
                 return block, "transient", offs
@@ -724,8 +725,8 @@ def assemble_fem_nonnodal(
             )
             return block, "transient", offs
 
-        if runtime_parameter_tags:  # linear transient inverse: A(args) re-assembled each step; dense Dirichlet
-            #   row-replacement inside operator_fn (the dense analogue of the native bcoo_set_dirichlet_rows).
+        if runtime_parameter_tags or neural_param_names:  # linear transient inverse: A(args) re-assembled each
+            #   step; dense Dirichlet row-replacement inside operator_fn (dense analogue of bcoo_set_dirichlet_rows).
             M_bc = M if pin_dofs is None else M.at[pin_dofs, :].set(0.0).at[:, pin_dofs].set(0.0)
             c_bias = zeros if pin_dofs is None else zeros.at[pin_dofs].set(jnp.asarray([p[1] for p in pins]))
             free_mask = (
@@ -747,7 +748,7 @@ def assemble_fem_nonnodal(
                     operator_fn=operator_fn,
                     affine_bias=c_bias,
                     forcing_vector_fn=forcing_vector_fn,
-                    runtime_parameter_exprs=dict(_rt_param_exprs),
+                    runtime_parameter_exprs=dict(_param_and_neural_exprs),
                     metadata={"nonaffine_operator": True},
                     **common,
                 ),

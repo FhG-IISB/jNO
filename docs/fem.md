@@ -778,9 +778,9 @@ Current scope: steady/transient/steady-complex on the native 2D/3D Lagrange asse
 coupled multi-field), and steady scalar C¹ non-nodal (Argyris/Morley/Hermite). Not yet supported
 (each fails loud): networks inside Dirichlet/IC values, a *trainable* net on the mass (`u_t`) term
 (a frozen/known one is fine — the mass is assembled once), k(u) in complex forms, the complex
-transient, time-varying Dirichlet `g(x,t)` with a trainable net, transient non-nodal,
-solution-dependent `net(u)` on the vector edge families (RT/Nédélec), and 1D domains (the 1D
-assembler has no runtime-parameter path at all).
+transient, time-varying Dirichlet `g(x,t)` with a trainable net, solution-dependent `net(u)` on
+the vector edge families (RT/Nédélec), and 1D domains (the 1D assembler has no runtime-parameter
+path at all).
 
 ### Transient inverse
 
