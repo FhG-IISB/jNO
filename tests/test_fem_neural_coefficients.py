@@ -303,6 +303,7 @@ def test_net_in_robin_boundary_term():
 # ==========================================================================
 
 
+@pytest.mark.slow
 def test_neural_kx_recovers_via_crux():
     """Recover a smooth diffusivity k(x) = 0.6 + 0.8x + 0.5y with a coordinate MLP trained through
     the differentiable ``fem.solve()``. The ``1 + net`` offset keeps the operator nonsingular at
@@ -470,6 +471,7 @@ def test_ku_gradient_matches_finite_difference():
     assert abs(g_ad - g_fd) < 1e-5 * max(1.0, abs(g_fd)), f"AD {g_ad} vs FD {g_fd}"
 
 
+@pytest.mark.slow
 def test_ku_recovers_constitutive_law_via_crux():
     """NN-EUCLID-style unsupervised constitutive learning: observe u from a hidden law
     k(u) = 1 + 0.5u², train a 1-input MLP ``1 + net(u)`` through the differentiable nonlinear
@@ -560,6 +562,7 @@ def test_transient_net_kx_trajectory_matches_frozen_reference():
     assert float(jnp.max(jnp.abs(traj - traj_f))) < 1e-9
 
 
+@pytest.mark.slow
 def test_transient_neural_kx_recovers_via_crux():
     """Recover a smooth diffusivity k(x) from a u(t) trajectory with a coordinate MLP trained
     through the transient ``fem.solve()`` (per-step re-assembly, implicit-diff to the weights) —
@@ -590,6 +593,7 @@ def test_transient_neural_kx_recovers_via_crux():
     assert rel < 0.1, f"transient neural k(x) recovery rel-err {rel:.3e}"
 
 
+@pytest.mark.slow
 def test_transient_nonlinear_ku_recovers_via_crux():
     """A constitutive law k(u) in a TRANSIENT form: u_t = div((a + b·u²)∇u). The per-step Newton
     (implicit backward Euler) carries the net's u-dependence; recover (a, b) from the trajectory
@@ -670,6 +674,7 @@ def test_mass_net_kx_parametric_matches_frozen():
     assert float(gsum) > 0.0  # gradient reached the net through the mass
 
 
+@pytest.mark.slow
 def test_mass_net_kx_recovers_via_crux():
     """Recover an unknown density ρ(x) on the mass term from a decay trajectory through the
     differentiable transient `fem.solve()` — the headline for the parametric-mass path."""
@@ -740,6 +745,7 @@ def test_complex_constant_net_matches_scalar_forward():
     assert float(np.abs(u_ref.imag).max()) > 0.1  # genuinely complex
 
 
+@pytest.mark.slow
 def test_complex_net_recovers_kappa_via_crux():
     """Recover the (constant) diffusivity κ = 0.8 with a coordinate MLP trained through the
     complex real-equivalent block — ∂u/∂weights flows through the parametric legs."""
@@ -934,6 +940,7 @@ def test_hermite_constitutive_ku_matches_symbolic():
     assert float(jnp.max(jnp.abs(u_net - u_sym))) < 1e-9
 
 
+@pytest.mark.slow
 def test_hermite_neural_kx_recovers_via_crux():
     """End-to-end: recover a smooth k(x) with a coordinate MLP on a Hermite (C¹) element through the
     non-nodal parametric ``fem.solve()`` — proves the ModelWeights threading reaches the non-nodal
@@ -1041,6 +1048,7 @@ def test_transient_nonnodal_net_kx_matches_frozen():
     assert float(gsum) > 0.0
 
 
+@pytest.mark.slow
 def test_transient_nonnodal_neural_kx_recovers_via_crux():
     """Recover a smooth k(x) from a Hermite transient trajectory through the default `fem.solve()`
     (the transient integrator solves the dense per-step system directly, so no dense solve_fn
@@ -1118,6 +1126,7 @@ def test_dirichlet_net_routes_parametric():
     assert isinstance(fem.operator.runtime_parameter_exprs[name], ModelWeights)
 
 
+@pytest.mark.slow
 def test_dirichlet_net_recovers_bc_profile():
     """The headline: recover an unknown Dirichlet profile g(x) = net(x) from the interior response.
     Laplace ``∇u·∇v = 0`` with ``u(boundary) - net(xb, yb)`` — u is the harmonic extension of the BC,

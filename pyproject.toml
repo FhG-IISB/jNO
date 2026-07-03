@@ -156,7 +156,9 @@ ci-test = "pytest -x --tb=short -m 'not slow'"
 # Coverage variant used by .github/workflows/ci.yml — emits coverage.xml
 # for the codecov upload step. Kept separate from `ci-test` so local
 # `pixi run ci-test` stays fast and unannotated.
-ci-test-cov = "pytest -x --tb=short -m 'not slow' --cov=jno --cov-report=xml:coverage.xml --cov-report=term-missing"
+# Runs each test FILE in its own process (memory released between files) so the
+# growing FEM suite does not OOM-kill the CI runner; aggregates coverage.xml.
+ci-test-cov = "bash .github/ci_test_per_file.sh"
 
 [tool.pixi.dependencies]
 pytest = ">=9.0.3,<10"
