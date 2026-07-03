@@ -756,9 +756,11 @@ arguments carry the unknown makes the form nonlinear — including a bare reacti
 for `net(u)`) re-evaluates the network, so a diffusivity or constitutive law is recovered from a
 `u(t)` trajectory exactly like the scalar/nodal transient inverse below. A coordinate `net(x)` on
 the **mass** (`u_t`) term is supported too — an unknown density `ρ(x)·u_t` recovered from a decay
-trajectory: the mass becomes a parametric matrix re-assembled from the weights each step. Only a
-*solution-dependent* `net(u)` on the mass term is rejected — that is a nonlinear mass `C(u)·u_t`,
-which the semidiscrete matrix form cannot express (a frozen net on the mass is always fine).
+trajectory: the mass becomes a parametric matrix re-assembled from the weights each step (via
+`block.mass_fn`; `block.M` stays the static placeholder, so a hand-rolled integrator built off
+`block.M` sees the initial mass, not the parametric one — read `block.mass_fn(t, args)` if you roll
+your own). Only a *solution-dependent* `net(u)` on the mass term is rejected — that is a nonlinear
+mass `C(u)·u_t`, which the semidiscrete matrix form cannot express (a frozen net is always fine).
 
 A real coordinate-input net also composes with **complex** steady forms (a Helmholtz coefficient
 recovered from complex full-field data): the Re/Im legs assemble as parametric systems and the
