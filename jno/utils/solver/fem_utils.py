@@ -1218,7 +1218,7 @@ def _eval_integrand(domain, node, local):
                 return _call_neural_coefficient(node.model, module, arg_vals, local)
         raise NotImplementedError(
             "jno.fem: a neural coefficient (jno.nn.wrap(net) inside the weak form) is supported on "
-            "the native 2D/3D Lagrange assembler (steady/nonlinear/transient, single-field) only — "
+            "the native 2D/3D Lagrange assembler (steady/nonlinear/transient, single or coupled) — "
             "this assembly path does not thread network weights into the kernel yet."
         )
 

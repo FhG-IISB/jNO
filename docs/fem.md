@@ -760,14 +760,16 @@ would silently freeze; `.freeze()` it or keep it on spatial terms).
 
 A real coordinate-input net also composes with **complex** steady forms (a Helmholtz coefficient
 recovered from complex full-field data): the Re/Im legs assemble as parametric systems and the
-real-equivalent block solve stays differentiable in the weights.
+real-equivalent block solve stays differentiable in the weights. And a net coefficient works in a
+**coupled (multi-field)** form — it is evaluated at the shared quadrature points and a trial-input
+`net(u_i)` resolves its own field, so no per-field bookkeeping is needed.
 
 Current scope: steady, transient, and steady-complex weak forms (linear k(x); nonlinear
-k(u)/k(∇u) on real steady/transient forms) on the native 2D/3D Lagrange assembler, single field.
-Not yet supported (each fails loud): networks inside Dirichlet/IC values, on the mass term,
-k(u) in complex forms, the complex transient, time-varying Dirichlet `g(x,t)` combined with a
-trainable net, coupled multi-field problems, 1D, and non-nodal
-(Argyris/Morley/Hermite/RT/Nédélec) elements.
+k(u)/k(∇u) on real steady/transient forms) on the native 2D/3D Lagrange assembler, single or
+coupled multi-field. Not yet supported (each fails loud): networks inside Dirichlet/IC values, on
+the mass term, k(u) in complex forms, the complex transient, time-varying Dirichlet `g(x,t)`
+combined with a trainable net, 1D domains (the 1D assembler has no runtime-parameter path at all),
+and non-nodal (Argyris/Morley/Hermite/RT/Nédélec) elements.
 
 ### Transient inverse
 

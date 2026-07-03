@@ -542,10 +542,10 @@ def assemble_fem_native(
             f"jno.fem: neural coefficient and runtime parameter share the name(s) {sorted(_name_clash)}; "
             "names key the runtime args and must be unique inside one solver block (rename via .name())."
         )
-    if neural_all_names and len(fields) > 1:
-        raise NotImplementedError(
-            "jno.fem (native): a neural coefficient on a coupled (multi-field) problem is not supported yet."
-        )
+    # A neural coefficient needs NO per-field resolution (unlike a nodal FIELD parameter, which
+    # gathers on one field's mesh): the network is evaluated at the shared physical quad points,
+    # and a trial-input ``net(u_i)`` resolves its field through ``_field_data`` (op_id/field_key)
+    # inside the kernel — so a coupled (multi-field) form threads it unchanged.
     # Trainable networks join the runtime-parameter exprs as ModelWeights slots: the solve nodes
     # (FemLinearSystem/FemResidualOperator/SemidiscreteTimeBlock) resolve each to the current module
     # pytree, which arrives back here in ``args`` and is re-evaluated at the quad points inside the

@@ -5,9 +5,10 @@ points, the weights ride the runtime ``args`` as a ``ModelWeights`` slot, and ``
 trains them through the differentiable ``fem.solve()`` (NN-EUCLID-style unsupervised coefficient
 recovery — Flaschel/Kumar/De Lorenzis, JMPS 165 (2022); Tartakovsky et al., WRR 56 (2020)).
 
-Scope locked here (v1): steady weak forms on the native 2D/3D Lagrange assembler, single field.
-The set-level routing rule (a weak constraint carrying a real ``TrialFunction`` means the network
-is a coefficient, not the trial) must not disturb VPINN.
+Coverage: steady/nonlinear/transient/complex on the native 2D/3D Lagrange assembler (single AND
+coupled multi-field), plus scalar C¹ non-nodal elements (Argyris/Morley/Hermite). The set-level
+routing rule (a weak constraint carrying a real ``TrialFunction`` means the network is a
+coefficient, not the trial) must not disturb VPINN.
 
 Run with x64 (assembly runs in float64).
 """
@@ -707,6 +708,81 @@ def test_complex_scope_guards():
                 u(ci[0], ci[1]) - psi0,
             ]
         )
+
+
+# ==========================================================================
+# multi-field (coupled): a neural coefficient needs no per-field resolution
+# ==========================================================================
+
+
+def _coupled_setup(mesh_size=0.12):
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size)
+    nnode = int(np.asarray(d.mesh.points).shape[0])
+    u, v = d.fem_symbols(names=("u", "v"))
+    p, q = d.fem_symbols(names=("p", "q"))
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    pi, qi = p.bind(x=xi, y=yi), q.bind(x=xi, y=yi)
+    g = xi * (1 - xi) * yi * (1 - yi)
+    lg = 2 * (xi * (1 - xi) + yi * (1 - yi))
+    f1, f2 = lg + 2 * g, 2 * lg + g
+    return d, nnode, (u, v, p, q), (xi, yi), (xb, yb), (ui, vi, pi, qi), (f1, f2)
+
+
+def test_multifield_constant_net_matches_scalar_operator():
+    """A constant net on one field's stiffness in a COUPLED (2-field) form assembles the same block
+    operator as the scalar coefficient — the net threads without per-field resolution."""
+    d, nnode, (u, v, p, q), (xi, yi), (xb, yb), (ui, vi, pi, qi), (f1, f2) = _coupled_setup()
+    net = _const_net(0.7)
+
+    def cons(kco):
+        return [
+            kco * (ui.x * vi.x + ui.y * vi.y) + p * vi - f1 * vi,
+            pi.x * qi.x + pi.y * qi.y + u * qi - f2 * qi,
+            u(xb, yb) - 0.0,
+            p(xb, yb) - 0.0,
+        ]
+
+    fem = jno.fem(cons(net(xi, yi)), quad_degree=3)
+    fem_ref = jno.fem(cons(0.7), quad_degree=3)
+    assert fem.is_linear and fem.dofs == 2 * nnode
+    (name,) = fem.operator.runtime_parameter_exprs
+    A, _ = fem.operator.evaluate({name: net.module})
+    assert np.abs(_dense(A) - _dense(fem_ref.A)).max() < 1e-12
+
+
+def test_multifield_nonlinear_net_resolves_correct_field():
+    """A solution-dependent net ``net(u_0)`` in a coupled form must resolve field 0's trial (not
+    field 0 by default) and match the symbolic ``(1 + 0.5 u_0²)`` coupled Newton solve — the
+    definitive per-field-resolution check — with the gradient flowing to the net's weights."""
+    from jno.utils.solver.newton_krylov import newton_krylov
+
+    d, nnode, (u, v, p, q), (xi, yi), (xb, yb), (ui, vi, pi, qi), (f1, f2) = _coupled_setup()
+
+    def cons(kco):
+        return [
+            kco * (ui.x * vi.x + ui.y * vi.y) + p * vi - f1 * vi,
+            pi.x * qi.x + pi.y * qi.y + u * qi - f2 * qi,
+            u(xb, yb) - 0.0,
+            p(xb, yb) - 0.0,
+        ]
+
+    net = _quad_net(a=1.0, b=0.5)
+    fem = jno.fem(cons(net(ui)), quad_degree=3)
+    fem_sym = jno.fem(cons(1.0 + 0.5 * ui**2), quad_degree=3)
+    assert fem._mode == "nonlinear"
+    (name,) = fem.operator.runtime_parameter_exprs
+    u_net = newton_krylov(lambda w: fem.operator.residual(w, {name: net.module}), jnp.zeros(fem.operator.size))
+    u_sym = newton_krylov(lambda w: fem_sym.operator(w), jnp.zeros(fem_sym.operator.size))
+    assert float(jnp.max(jnp.abs(u_net - u_sym))) < 1e-9
+
+    def loss(module):
+        r = lambda w: fem.operator.residual(w, {name: module})
+        return jnp.sum(newton_krylov(r, jnp.zeros(fem.operator.size)) ** 2)
+
+    g = eqx.filter_grad(loss)(net.module)
+    assert abs(float(g.a)) > 0.0 and abs(float(g.b)) > 0.0
 
 
 def test_scope_guards_fail_loud():
