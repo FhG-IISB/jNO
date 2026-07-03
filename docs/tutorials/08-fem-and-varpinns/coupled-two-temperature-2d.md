@@ -42,13 +42,13 @@ fem = jno.fem([
 ])
 ```
 
-## Your own solver — you never call the built-in
+## Pick the solver with the slot API
 
-`fem.solve(solve_fn=...)` takes **your** `(A, b) -> u`. Here it is `lineax`; jno writes no solver:
+`fem.solve(linear=...)` selects the inner linear solver from the `jno.solve` factories. Here the
+single coupled solve goes sparse-direct — LU on the assembled BCOO operator, no densification:
 
 ```python
-import lineax
-sol = fem.solve(solve_fn=lambda A, b: lineax.linear_solve(lineax.MatrixLinearOperator(A), b).value)
+sol = fem.solve(linear=jno.solve.lu())         # sparse-direct on the BCOO operator
 off = fem.problem.offset                       # per-field slices of the coupled vector
 Th_s, Th_f = sol[off[0]:off[1]], sol[off[1]:]
 ```
@@ -69,9 +69,9 @@ $T_s-T_f$ — the local driving force for heat transfer between the phases.
   for the channel, a named `ring` refined independently of the `bulk`.
 - **Multi-field coupling** is just more residual terms; `fem.problem.offset` slices the block
   solution back into per-field vectors.
-- **Bring your own solver** through `solve_fn` (here `lineax`) — and the same hook accepts an
-  `optimistix` Newton (nonlinear) or a `diffrax` stepper (transient). `.solve()`'s default is only a
-  convenience.
+- **Pick the solver with the slot API** — `fem.solve(linear=jno.solve.lu())` for a single
+  sparse-direct solve; `solve_fn=` remains the total override if you want to bring your own
+  `(A, b) -> u`.
 - **Verified by the method of manufactured solutions:** impose a known $T_s^\*,T_f^\*$ on the full
   boundary and recover it — rel-L2 $\sim 3\times10^{-5}$, the standard correctness gate for a FEM
   code.

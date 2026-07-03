@@ -38,7 +38,7 @@ fem = jno.fem([
     u(xb, yb)[1] - 0.0,
     p.pin(),                                              # gauge-fix the pressure null space
 ])
-sol = fem.solve(solve_fn=lambda A, b: lineax.linear_solve(lineax.MatrixLinearOperator(A), b).value)
+sol = fem.solve(linear=jno.solve.lu())   # sparse-direct on the assembled BCOO operator
 ```
 
 ## The result
@@ -57,7 +57,8 @@ downstream — the textbook creeping-flow picture.
   independently of the `bulk`.
 - **Taylor-Hood multiphysics**: a P2 vector velocity and a P1 pressure as two `fem_symbols` fields,
   assembled as one inf-sup-stable block. `fem.problem.offset` slices the velocity back out.
-- **Bring your own solver** (`lineax`) through `solve_fn`.
+- **Pick the solver with the slot API**: `fem.solve(linear=jno.solve.lu())` — sparse-direct on
+  the assembled operator, the right choice for a single indefinite saddle solve (no densification).
 - **Verified by a physical invariant, not an analytic solution.** A centred cylinder makes Stokes
   flow top-bottom symmetric, so $u_x(x,y)=u_x(x,H-y)$ and $u_y(x,y)=-u_y(x,H-y)$; the measured
   symmetry error is $\sim2\times10^{-3}$.

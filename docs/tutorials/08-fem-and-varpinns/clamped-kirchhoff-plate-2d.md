@@ -16,7 +16,7 @@ u, phi = d.fem_symbols(space="Argyris")
 q = 1.0 + 0.0 * xi                                    # uniform pressure, D = 1
 fem = jno.fem([laplacian(ui, [xi, yi]) * laplacian(vi, [xi, yi]) - q * vi,
                u(xb, yb) - 0.0, u.dn(xb, yb) - 0.0])  # clamped = deflection w=0 AND rotation ∂w/∂n=0
-sol = fem.solve(sparse_lu_solve)                      # sparse-direct: O(nnz) memory on the refined mesh
+sol = fem.solve(linear=jno.solve.lu())                # sparse-direct: O(nnz) memory on the refined mesh
 ```
 
 Clamped composes the two essential plate traces — `u(reg)-g` (deflection) and `u.dn(reg)-h` (rotation) — while

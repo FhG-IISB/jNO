@@ -80,7 +80,7 @@ def main():
     k.dtype(jnp.float64)
     k.initialize(jax.nn.initializers.constant(1.0))
     k.optimizer(optax.adam(3e-2))
-    crux = jno.core([(fem.solve(solver) - w_obs).mse], domain=_DUMMY)
+    crux = jno.core([(fem.solve(linear=jno.solve.dense()) - w_obs).mse], domain=_DUMMY)
     crux.solve(200)  # loss plateaus early; 200 steps recovers both defects with budget to spare
     k_rec = np.asarray(crux.eval([k])).reshape(-1)
 

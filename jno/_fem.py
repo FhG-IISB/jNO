@@ -96,6 +96,38 @@ def _solve_linear_matrix_free(A, b, *, tol=1e-8, maxiter=20_000):
     return _residual_check(A, b, u, "Jacobi-preconditioned BiCGStab")
 
 
+def lag(expr: Any) -> Any:
+    """Mark a weak-form coefficient as **lagged**: frozen within each linearization, updated
+    between iterations — the Picard / fixed-point linearization as first-class API.
+
+    The canonical use is a solution-dependent coefficient whose Newton tangent destroys the
+    linearized system's structure — e.g. a shear-thinning viscosity ``mu_eff(u)`` in a
+    rigid-plastic/non-Newtonian Stokes flow, where full Newton produces a strongly nonsymmetric
+    velocity block that defeats AMG/block preconditioners, while the lagged (Picard) system is a
+    plain symmetric Stokes solve per step::
+
+        mu_eff = k_f / (3 * jno.np.sqrt(2/3 * rate2 + eps0**2))
+        fem = jno.fem([2 * jno.lag(mu_eff) * inner(eps(ui), eps(vi)) - ...])
+        fem.solve(nonlinear=jno.solve.picard(damping=0.7), linear=..., precond=...)
+
+    Mechanically ``lag`` is ``stop_gradient`` on the traced expression, so ``jax.linearize`` of
+    the residual yields the *lagged* operator: :func:`jno.solve.picard` (and plain Newton) then
+    iterate with that linearization automatically. The converged solution is unchanged —
+    ``R(u) = 0`` does not depend on gradient markers.
+
+    **Inverse-problem caveat**: implicit differentiation (``custom_root``) also uses the lagged
+    Jacobian for its tangent/adjoint solve, so gradients of ``fem.solve()`` w.r.t. parameters
+    become the standard "Picard adjoint" approximation — widely used and usually descent-worthy,
+    but not exact. Remove ``lag`` (full Newton) when exact parameter gradients matter more than
+    per-step solvability.
+    """
+    # views and raw trace nodes expose ``.stop_gradient`` as a *property* (its value — a trace
+    # node — is itself callable, so a callable() test cannot distinguish them from methods)
+    if isinstance(getattr(type(expr), "stop_gradient", None), property):
+        return expr.stop_gradient
+    return jax.lax.stop_gradient(expr)  # plain arrays inside hand-written residuals
+
+
 # ---------------------------------------------------------------------------
 # expression helpers
 # ---------------------------------------------------------------------------
@@ -614,50 +646,64 @@ def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None, periodic
     (memory ``O(nnz)``; robust on the indefinite Helmholtz block). Pass ``solve_fn=(A, b) -> u`` to
     use a dense/direct solver instead -- it receives the densified block.
 
+    Each leg is a raw ``(A, b)`` (forward solve) or a parametric :class:`FemLinearSystem` (the complex
+    *inverse*): when either leg is parametric this returns a differentiable :class:`FunctionCall` trace
+    node instead of an array, so a real ``jno.np.parameter`` recovered through a complex forward solve
+    trains through ``crux`` -- the same real-equivalent block, with ``A(θ), b(θ)`` re-formed and the
+    block re-solved on each call.
+
     A periodic tie reduces *both* legs by the **same** prolongation ``P`` -- Re and Im live on one FE
     space, so one ``P`` -- before the block is formed: ``A -> P^T A P``, ``b -> P^T b`` on each leg.
     Because the same ``P`` hits both, ``blkdiag(P, P)^T [[A_r,-A_i],[A_i,A_r]] blkdiag(P, P)`` preserves
     the real-equivalent structure exactly; the reduced complex solution is prolonged back ``u = P u_red``."""
-    from .trace import FemLinearSystem
+    from .trace import FemLinearSystem, FunctionCall
     from .utils.solver.fem_utils import prolong_periodic, reduce_matrix_periodic, reduce_vector_periodic
 
-    def _ab(op):
-        if isinstance(op, FemLinearSystem):
-            raise NotImplementedError(
-                "Complex FEM with a runtime jno.np.parameter (the complex *inverse*) is a follow-on; "
-                "this path is the forward complex solve. (A real parameter recovered through a complex "
-                "forward works under the same real-equivalent block, but is not wired here yet.)"
-            )
-        A, b = op
+    def _ab(op, args):
+        A, b = op.evaluate(args) if isinstance(op, FemLinearSystem) else op
         b = jnp.asarray(b).reshape(-1)
         if periodic is not None:
             A = reduce_matrix_periodic(periodic, A)  # P^T A P  (stays sparse if A is BCOO)
             b = reduce_vector_periodic(periodic, b)  # P^T b
         return A, b  # keep A sparse (BCOO) -- do NOT densify
 
-    (A_r, b_r), (A_i, b_i) = _ab(ops[0]), _ab(ops[1])
-    n = b_r.shape[0]
-    rhs = jnp.concatenate([b_r, b_i])
-    is_sparse = hasattr(A_r, "indices") and hasattr(A_i, "indices")
+    def _block_solve(args):
+        (A_r, b_r), (A_i, b_i) = _ab(ops[0], args), _ab(ops[1], args)
+        n = b_r.shape[0]
+        rhs = jnp.concatenate([b_r, b_i])
+        is_sparse = hasattr(A_r, "indices") and hasattr(A_i, "indices")
 
-    if solve_fn is not None:
-        # user solver receives the densified block (dense/direct back-compat path)
-        Ar_d = jnp.asarray(A_r.todense() if hasattr(A_r, "todense") else A_r)
-        Ai_d = jnp.asarray(A_i.todense() if hasattr(A_i, "todense") else A_i)
-        sol = jnp.asarray(solve_fn(jnp.block([[Ar_d, -Ai_d], [Ai_d, Ar_d]]), rhs))
-    elif is_sparse:
-        from .utils.solver.linear import sparse_lu_solve
+        if solve_fn is not None:
+            # user solver receives the densified block (dense/direct back-compat path)
+            Ar_d = jnp.asarray(A_r.todense() if hasattr(A_r, "todense") else A_r)
+            Ai_d = jnp.asarray(A_i.todense() if hasattr(A_i, "todense") else A_i)
+            sol = jnp.asarray(solve_fn(jnp.block([[Ar_d, -Ai_d], [Ai_d, Ar_d]]), rhs))
+        elif is_sparse:
+            from .utils.solver.linear import sparse_lu_solve
 
-        sol = sparse_lu_solve(_complex_block_bcoo(A_r, A_i, n), rhs)  # sparse-direct on the 2n block
-    else:
-        Ar_d, Ai_d = jnp.asarray(A_r), jnp.asarray(A_i)  # dense fallback (e.g. 1D / already dense)
-        sol = jnp.linalg.solve(jnp.block([[Ar_d, -Ai_d], [Ai_d, Ar_d]]), rhs)
+            sol = sparse_lu_solve(_complex_block_bcoo(A_r, A_i, n), rhs)  # sparse-direct on the 2n block
+        else:
+            Ar_d, Ai_d = jnp.asarray(A_r), jnp.asarray(A_i)  # dense fallback (e.g. 1D / already dense)
+            sol = jnp.linalg.solve(jnp.block([[Ar_d, -Ai_d], [Ai_d, Ar_d]]), rhs)
 
-    if periodic is None:
-        return sol[:n] + 1j * sol[n:]
-    # Prolong the real and imaginary reduced halves *separately* (real P @ real vector); prolonging the
-    # complex vector directly would cast it to P's real dtype and silently drop the imaginary part.
-    return prolong_periodic(periodic, sol[:n]) + 1j * prolong_periodic(periodic, sol[n:])
+        if periodic is None:
+            return sol[:n] + 1j * sol[n:]
+        # Prolong the real and imaginary reduced halves *separately* (real P @ real vector); prolonging
+        # the complex vector directly would cast it to P's real dtype and silently drop the imaginary part.
+        return prolong_periodic(periodic, sol[:n]) + 1j * prolong_periodic(periodic, sol[n:])
+
+    # Forward (non-parametric): solve eagerly. Inverse: one or both legs are a parametric FemLinearSystem
+    # -> return a trace node over the union of their runtime parameters so ∂u/∂θ flows through crux.
+    rpe: dict = {}
+    for op in ops:
+        if isinstance(op, FemLinearSystem):
+            rpe.update(op.runtime_parameter_exprs)
+    if not rpe:
+        return _block_solve(None)
+    names = list(rpe)
+    return FunctionCall(
+        lambda *vals: _block_solve(dict(zip(names, vals))), [rpe[n] for n in names], name="fem_complex_solve"
+    )
 
 
 def _solve_complex_transient(blocks: Any, save_ts: Any = None, periodic: Optional[dict] = None) -> Any:
@@ -927,7 +973,38 @@ class FEM:
             return list(self._offsets)
         return getattr(self.problem, "offset", None)
 
-    def solve(self, solve_fn=None, *, adapt=None, **kwargs) -> Any:
+    @property
+    def blocks(self):
+        """Per-field DOF ``slice``s into the flat solution (``None`` without block structure).
+
+        The structural handle block preconditioners build on: ``jno.precond.block_diag`` /
+        ``triangular`` resolve their field arguments to these slices (see ``docs/fem.md``)."""
+        off = self.offsets
+        if off is None:
+            return None
+        return [slice(int(off[i]), int(off[i + 1])) for i in range(len(off) - 1)]
+
+    def block_index(self, field) -> int:
+        """Resolve a trial symbol (or plain index) to its position in :attr:`blocks` /
+        :attr:`offsets` — the field order is first appearance in the ``jno.fem`` constraints."""
+        if isinstance(field, int):
+            return field
+        # the native assembler records the keys in assembly (= offsets) order — snapshotted onto
+        # this FEM at finalize time (the domain attribute is overwritten by any later assembly on
+        # the same domain, e.g. an auxiliary jno.precond.form); the constraint-walk order is only
+        # a fallback for paths that don't set it
+        keys = getattr(self, "_block_field_keys", None) or getattr(self, "_trial_field_keys", None)
+        fk = getattr(field, "field_key", None)
+        if keys is None or fk is None:
+            raise TypeError(
+                "FEM.block_index: cannot resolve this object to a field block — pass the trial "
+                "symbol from d.fem_symbols() (or the integer block index)."
+            )
+        if fk not in keys:
+            raise KeyError(f"FEM.block_index: trial field {getattr(field, 'name', fk)!r} is not part of this system.")
+        return keys.index(fk)
+
+    def solve(self, solve_fn=None, *, adapt=None, x0=None, nonlinear=None, linear=None, precond=None, **kwargs) -> Any:
         """Differentiable forward solve as a trace node — the inverse-problem entry.
 
         Pass ``adapt=AdaptSpec(...)`` to run the **adaptive** loop
@@ -973,11 +1050,53 @@ class FEM:
         ``solve()`` returns the complex solution ``u_r + i·u_i`` via the real-equivalent block
         ``[[A_r,-A_i],[A_i,A_r]]`` (the assembly produces only real systems); pass ``solve_fn=(A, b) -> u``
         to choose the real block solver.
+
+        **Solver slots** (callables-only; alternative to ``solve_fn``, which stays the total
+        override — passing both is an error). The solver space factorises into four orthogonal
+        slots; each takes a configured callable from ``jno.solve`` / ``jno.precond`` (or your
+        own with the same contract, see those modules), and every ``None`` keeps today's
+        default::
+
+            fem.solve(
+                x0        = None,                   # warm start (initial guess / iterate)
+                nonlinear = jno.solve.newton(),     # linearization driver (nonlinear mode)
+                linear    = jno.solve.gmres(),      # inner linear solve
+                precond   = jno.precond.jacobi(),   # v -> M^{-1} v spec, materialized per solve
+            )
+
+        The slots compose into a ``solve_fn`` internally, so each dispatch path below keeps its
+        periodic reduction and implicit-differentiation behaviour; slot solvers receive the
+        **BCOO** operator (no densification). On the (matrix-free) **nonlinear** path a
+        ``precond`` spec is materialized per Newton/Picard linearization against the JVP
+        operator — ``form`` / ``inner(...)`` / ``chebyshev`` / pre-built ``amg`` and their
+        ``block_diag``/``triangular`` compositions work; ``jacobi`` (needs the assembled
+        diagonal) does not. On a **transient** problem the slots configure the *per-step*
+        solves of the default theta-stepper: ``linear``/``precond`` see the step operator
+        ``M + θ·dt·A`` (materialized once, before the time loop, when the operator is
+        time-independent — an AMG hierarchy / auxiliary form is then reused by every step),
+        ``nonlinear`` drives each implicit step, each step warm-starts from the previous state
+        (``x0`` is rejected — the ICs own the initial state). Not yet supported: slots on
+        complex/complex-transient problems, and slots combined with ``adapt=`` (remeshing
+        invalidates warm starts and cached preconditioner setups — pass ``solve_fn=`` there).
         """
+        has_slots = (x0 is not None) or (nonlinear is not None) or (linear is not None) or (precond is not None)
         if adapt is not None:
+            if has_slots:
+                raise NotImplementedError(
+                    "fem.solve: the solver slots (x0/nonlinear/linear/precond) do not compose with "
+                    "adapt= yet — remeshing changes the DOF layout under a warm start and stales "
+                    "cached form/amg preconditioner setups. Pass solve_fn= for the adaptive loop."
+                )
             from .utils.solver.fem_adapt import run_adaptive_solve
 
             return run_adaptive_solve(self, adapt, solve_fn=solve_fn, **kwargs)
+        if has_slots:
+            solve_fn, kwargs = self._compose_slots(
+                solve_fn, x0=x0, nonlinear=nonlinear, linear=linear, precond=precond, kwargs=kwargs
+            )
+            from_slots = True
+        else:
+            from_slots = False
         if self._mode == "complex":
             return _solve_complex_block(self._op, solve_fn, periodic=self._periodic)
         if self._mode == "complex_transient":
@@ -1012,6 +1131,8 @@ class FEM:
                 return prolong_periodic(self._periodic, u_red)
             if solve_fn is None and hasattr(A, "todense"):
                 return _solve_linear_matrix_free(A, b)
+            if from_slots:
+                return solve_fn(A, b)  # slot-composed solvers take the BCOO operator directly
             A = jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)
             return (solve_fn or (lambda A_, b_: jnp.linalg.solve(A_, b_)))(A, b)
         if self._mode == "linear" and isinstance(self._op, FemLinearSystem):
@@ -1053,6 +1174,60 @@ class FEM:
             return self._op.solve(solve_fn, **kwargs).fn()
         return self._op.solve(solve_fn, **kwargs)
 
+    def _compose_slots(self, solve_fn, *, x0, nonlinear, linear, precond, kwargs):
+        """Compose the solver slots into the mode-appropriate ``solve_fn`` (see :meth:`solve`)."""
+        from .utils.solver.solver_api import compose_linear_solve_fn, compose_nonlinear_solve_fn
+
+        if solve_fn is not None:
+            raise ValueError(
+                "fem.solve: pass either solve_fn= (the total override) or the solver slots "
+                "(x0/nonlinear/linear/precond), not both."
+            )
+        if self._mode == "complex_transient":
+            raise NotImplementedError(
+                "fem.solve solver slots are not threaded into the complex-transient path yet -- pass a "
+                "full integrator via solve_fn= (see plans/fem-solver-api.md)."
+            )
+        if self._mode == "transient":
+            # thread the slots into the default theta-stepper as per-step solvers: the linear
+            # slot/precond see the step operator (M + theta dt A) -- materialized ONCE before the
+            # scan when the operator is time-independent -- and the nonlinear slot drives each
+            # implicit step. The bring-your-own (block, args, save_ts) contract is unchanged.
+            if x0 is not None:
+                raise ValueError(
+                    "fem.solve: x0= on a transient problem -- the initial state comes from the initial "
+                    "conditions, and each step already warm-starts from the previous state."
+                )
+            from .utils.solver.backend_blocks import _default_transient_integrate
+            from .utils.solver.solver_api import compose_transient_step_solvers
+
+            lin_s, nonlin_s = compose_transient_step_solvers(nonlinear, linear, precond, self, self._op)
+
+            def _stepper(block, args, save_ts):
+                return _default_transient_integrate(block, args, save_ts, linear_solve=lin_s, nonlinear_solve=nonlin_s)
+
+            return _stepper, kwargs
+        if self._mode == "nonlinear":
+            fn = compose_nonlinear_solve_fn(nonlinear, linear, precond, self)
+            if x0 is not None:
+                if "u0" in kwargs:
+                    raise ValueError("fem.solve: x0= and u0= are the same initial guess; pass one.")
+                kwargs = {**kwargs, "u0": jnp.asarray(x0).reshape(-1)}
+            return fn, kwargs
+        if nonlinear is not None:
+            raise ValueError(f"fem.solve: nonlinear= given, but this problem is {self._mode} (no linearization).")
+        if self._mode == "complex" and x0 is not None:
+            raise NotImplementedError(
+                "fem.solve: x0= on a complex problem is not supported yet (the solve runs on the "
+                "real-equivalent block, an internal layout)."
+            )
+        if self._periodic is not None and x0 is not None:
+            # the solve runs in the periodic-reduced space; restrict the guess to match
+            from .utils.solver.fem_utils import restrict_state_periodic
+
+            x0 = restrict_state_periodic(self._periodic, jnp.asarray(x0).reshape(-1))
+        return compose_linear_solve_fn(linear, precond, x0, self), kwargs
+
     @property
     def points(self):
         """Node coordinates the DOFs live on.
@@ -1065,8 +1240,12 @@ class FEM:
         if meshes:
             return jnp.asarray(meshes[0].points)
         # Native Lagrange path (no problem object): the assembler records the DOF coordinates
-        # (vertices + edge midpoints for P2) the flat solution lives on.
-        native_pts = getattr(self.domain, "_fem_native_dof_points", None)
+        # (vertices + edge midpoints for P2) the flat solution lives on. Prefer the snapshot
+        # captured at finalize time — the domain attribute is overwritten by any later assembly
+        # on the same domain (e.g. a jno.precond.form auxiliary operator).
+        native_pts = getattr(self, "_native_dof_points", None)
+        if native_pts is None:
+            native_pts = getattr(self.domain, "_fem_native_dof_points", None)
         if native_pts is not None:
             return jnp.asarray(native_pts)
         if self.mesh is not None:
@@ -1083,7 +1262,10 @@ class FEM:
         meshes = getattr(prob, "mesh", None) if prob is not None else None
         if meshes:
             return [jnp.asarray(m.points) for m in meshes]
-        native_all = getattr(self.domain, "_fem_native_dof_points_all", None)
+        # snapshot first (see .points): the live domain attribute is clobbered by later assemblies
+        native_all = getattr(self, "_native_dof_points_all", None)
+        if native_all is None:
+            native_all = getattr(self.domain, "_fem_native_dof_points_all", None)
         if native_all is not None:
             return [jnp.asarray(p) for p in native_all]
         pts = self.points
@@ -1878,6 +2060,22 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
         fem_obj._term_source = (domain, volume_terms)
         fem_obj._constraints = _orig_constraints
         fem_obj._fem_kwargs = _orig_fem_kwargs
+        # Field-key snapshots for FEM.block_index: the assembler's list is offsets-ordered (and
+        # must be captured NOW — a later assembly on the same domain overwrites the attribute);
+        # the constraint-walk order is the fallback for paths that don't run the native assembler.
+        fem_obj._block_field_keys = list(getattr(domain, "_fem_native_field_keys", None) or ())
+        fem_obj._trial_field_keys = _field_keys(_orig_constraints)
+        # Same snapshot treatment for the DOF coordinates behind .points / .field_points — an
+        # auxiliary assembly (jno.precond.form) would otherwise clobber them mid-solve.
+        fem_obj._native_dof_points = getattr(domain, "_fem_native_dof_points", None)
+        _all = getattr(domain, "_fem_native_dof_points_all", None)
+        fem_obj._native_dof_points_all = list(_all) if _all is not None else None
+        if couplings and periodic_ties and fem_obj.is_transient:
+            # The native periodic *transient* block reduces eagerly into a master-DOF space; the coupling
+            # residual is written in the full nodal space, so the two cannot be composed on that path yet.
+            raise NotImplementedError(
+                "jno.fem: periodic ties combined with a *transient* nonlocal Coupling are not yet supported."
+            )
         if couplings:
             # Fold the coupling into the residual FIRST -- a steady local form is promoted to a nonlinear
             # FemResidualOperator. The periodic reduction below then wraps the *coupled* residual through
@@ -1885,15 +2083,6 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             fem_obj = _wrap_couplings(domain, fem_obj, couplings)
         if not periodic_ties:
             return fem_obj
-        if fem_obj._mode == "complex_transient":
-            raise NotImplementedError(
-                "jno.fem: periodic ties on a complex *transient* problem are not supported yet "
-                "(the reduction must be applied to both the real and imaginary time blocks)."
-            )
-        if isinstance(fem_obj._op, FemLinearSystem):
-            # The reduction is applied on the non-parametric (A, b) branch of FEM.solve; the
-            # runtime-parametric FemLinearSystem.solve path would silently ignore it.
-            raise NotImplementedError("jno.fem: periodic ties are not yet supported on runtime-parametric linear problems.")
         # Single-field transient was already reduced by the dedicated native branch -> reuse its P.
         if periodic_holder:
             fem_obj._periodic = periodic_holder[0]

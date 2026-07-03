@@ -8,7 +8,8 @@ Taylor-Hood pair (P2 velocity, P1 pressure) coupled in one block:
   meshed finer than the rest of the channel (steep gradients hug the obstacle);
 * a parabolic profile drives the inlet AND the outlet -- exact for *Stokes* flow, which is
   fore-aft symmetric (Re = 0) -- while the walls and the cylinder are no-slip;
-* solved with a bring-your-own dense direct solver via `fem.solve(solve_fn=...)`.
+* solved sparse-direct via the slot API -- `fem.solve(linear=jno.solve.lu())` factorises the
+  assembled BCOO operator (the right pick for a single indefinite saddle solve; no densification).
 
 Verified without an analytic solution by a physical invariant: a centred cylinder makes the Stokes
 flow top-bottom symmetric, so the computed field must satisfy ``u_x(x, y) = u_x(x, H-y)`` and
@@ -26,7 +27,6 @@ jax.config.update("jax_enable_x64", True)  # the assembler builds in float64
 
 from pathlib import Path  # noqa: E402
 
-import jax.numpy as jnp  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 from scipy.interpolate import griddata  # noqa: E402
@@ -63,8 +63,8 @@ fem = jno.fem(
     ]
 )
 
-# bring-your-own solver: a dense direct solve (the default matrix-free Krylov is for large elliptic systems)
-sol = np.asarray(fem.solve(solve_fn=lambda A, b: jnp.linalg.solve(A, b)))
+# slot API: sparse-direct LU on the assembled BCOO operator (indefinite saddle system, single solve)
+sol = np.asarray(fem.solve(linear=jno.solve.lu()))
 off = fem.offsets
 uu = sol[off[0] : off[1]].reshape(-1, 2)  # velocity (n_vel_nodes, 2)
 pts_v = np.asarray(fem.field_points[0])
@@ -76,7 +76,7 @@ UX = np.where(inside, griddata(pts_v, uu[:, 0], (gx, gy), method="linear"), np.n
 UY = np.where(inside, griddata(pts_v, uu[:, 1], (gx, gy), method="linear"), np.nan)
 m = np.isfinite(UX) & np.isfinite(UX[::-1])  # nodes whose mirror is also valid
 sym = float(np.linalg.norm(np.r_[(UX - UX[::-1])[m], (UY + UY[::-1])[m]]) / np.linalg.norm(np.r_[UX[m], UY[m]]))
-print("\nStokes flow past a cylinder (Taylor-Hood P2/P1, dense solve)")
+print("\nStokes flow past a cylinder (Taylor-Hood P2/P1, sparse LU)")
 print(f"  fields={len(off) - 1}  dofs={fem.dofs}  channel/ring mesh = 0.12 / 0.05")  # offsets = [0, n_v, n_v+n_p]
 print(f"  top-bottom symmetry error (should be ~0): {sym:.3e}")
 

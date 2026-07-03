@@ -22,10 +22,12 @@ eu, ep = symgrad(u, [xi, yi]), symgrad(phi, [xi, yi])
 weak = lam * trace(eu) * trace(ep) + 2.0 * mu * inner(eu, ep, n_contract=2)
 traction = -1.0 * inner(jnp.array([0.0, -q]), phi.bind(x=xr, y=yr), n_contract=1)
 fem = jno.fem([weak, u(xl, yl) - (0.0, 0.0), traction])
+sol = jnp.asarray(fem.solve(linear=jno.solve.lu())).reshape(-1, 2)
 ```
 
-The interleaved solution is read with `sol = solve(...).reshape(-1, 2)` (`[:, 0]` = $u_x$,
-`[:, 1]` = $u_y$), aligned with `fem.points`.
+The slender-beam P2 stiffness matrix is too ill-conditioned for a Jacobi-preconditioned Krylov
+solve in float32, so the solve picks the sparse-direct `lu` slot; the interleaved solution is
+read with `.reshape(-1, 2)` (`[:, 0]` = $u_x$, `[:, 1]` = $u_y$), aligned with `fem.points`.
 
 ## What to notice
 

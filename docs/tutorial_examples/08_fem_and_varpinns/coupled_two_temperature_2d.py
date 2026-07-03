@@ -12,8 +12,8 @@ This shows off the FEM solver on the things that matter in practice, not a unit 
   (steep gradients) while the ``bulk`` stays coarse (``build_mesh(..., sizes={"ring": ...})``);
 * genuine multi-field COUPLING -- two ``fem_symbols`` fields with a cross term, assembled as one
   block system;
-* the coupled system is solved with a bring-your-own dense solver (jnp.linalg.solve);
-  you never call jno's built-in solver.
+* the coupled system is solved sparse-direct via the slot API --
+  ``fem.solve(linear=jno.solve.lu())`` factorises the assembled BCOO operator (no densification).
 
 Verified by the method of manufactured solutions (impose a known ``T_s*, T_f*`` on the full
 boundary, recover it): a convergent rel-L2, the standard correctness gate for a FEM code.
@@ -29,7 +29,6 @@ jax.config.update("jax_enable_x64", True)  # the assembler builds in float64
 
 from pathlib import Path  # noqa: E402
 
-import jax.numpy as jnp  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import matplotlib.tri as mtri  # noqa: E402
 import numpy as np  # noqa: E402
@@ -71,8 +70,8 @@ fem = jno.fem(
     ]
 )
 
-# bring-your-own solver: a dense direct solve (the default matrix-free Krylov is for large elliptic systems)
-sol = np.asarray(fem.solve(solve_fn=lambda A, b: jnp.linalg.solve(A, b)))
+# slot API: sparse-direct LU on the assembled BCOO operator (single coupled solve)
+sol = np.asarray(fem.solve(linear=jno.solve.lu()))
 off = fem.offsets  # per-field slices into the coupled solution vector
 Th_s, Th_f = sol[off[0] : off[1]], sol[off[1] :]
 pts = np.asarray(fem.points)
@@ -81,7 +80,7 @@ ref_s = 1 + 0.40 * np.sin(PI * xs / 2) * np.sin(PI * ys)
 ref_f = 1 + 0.25 * np.sin(PI * xs) * np.sin(PI * ys)
 rels = float(np.linalg.norm(Th_s - ref_s) / np.linalg.norm(ref_s))
 relf = float(np.linalg.norm(Th_f - ref_f) / np.linalg.norm(ref_f))
-print("\nCoupled two-temperature model on a plate with a cooling channel (dense solve)")
+print("\nCoupled two-temperature model on a plate with a cooling channel (sparse LU)")
 print(f"  fields={len(off) - 1}  dofs={fem.dofs}  bulk/ring mesh = 0.06 / 0.025")  # offsets = [0, n1, n2]
 print(f"  MMS recovery rel-L2:  T_s={rels:.3e}  T_f={relf:.3e}")
 

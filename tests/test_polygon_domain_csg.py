@@ -57,7 +57,7 @@ def test_boundary_edge_sampling_uses_input_order_and_exact_normals():
     np.random.seed(1)
     dom = jno.domain.csg(SQUARE_A, name="a")
 
-    xb, yb, tb, nx, ny = dom.variable("boundary_a_0", sample=(64, None), normals=True)
+    xb, yb, tb, nx, ny = dom.variable("boundary_a_0", sample=(64, None), normals=True, split=True)
     pts = dom.context[xb.tag][0, 0]
     normals = dom.context[nx.tag][0, 0]
 
@@ -109,7 +109,7 @@ def test_difference_exposes_subtrahend_boundary_as_hole_boundary():
     inner = jno.domain.csg([(0.4, 0.4), (0.6, 0.4), (0.6, 0.6), (0.4, 0.6)], name="hole")
 
     dom = outer - inner
-    xb, yb, tb, nx, ny = dom.variable("boundary_hole_0", sample=(64, None), normals=True)
+    xb, yb, tb, nx, ny = dom.variable("boundary_hole_0", sample=(64, None), normals=True, split=True)
     pts = dom.context[xb.tag][0, 0]
     normals = dom.context[nx.tag][0, 0]
 
