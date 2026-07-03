@@ -785,6 +785,127 @@ def test_multifield_nonlinear_net_resolves_correct_field():
     assert abs(float(g.a)) > 0.0 and abs(float(g.b)) > 0.0
 
 
+# ==========================================================================
+# non-nodal scalar C¹ elements (Argyris / Morley / Hermite)
+# ==========================================================================
+
+
+def test_argyris_constant_net_matches_coordinate_coeff():
+    """Constant-net ≡ the same coordinate-function coefficient on an Argyris biharmonic operator —
+    the definitive gather/interpolation check on a C¹ element (the net is evaluated at the quad
+    points, independent of the Argyris DOF layout). Mirrors the field-parameter Argyris oracle."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.35)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    lap = jno.np.laplacian
+    f = 48.0 + 0.0 * xi
+    g = xb**4 + yb**4
+    net = _const_net(0.7)
+    u, phi = d.fem_symbols(space="Argyris")
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    fem = jno.fem([net(xi, yi) * (lap(ui, [xi, yi]) * lap(vi, [xi, yi])) - f * vi, u(xb, yb) - g])
+    assert fem.is_linear and len(fem.operator.runtime_parameter_exprs) == 1
+
+    u2, p2 = d.fem_symbols(space="Argyris")
+    ux, vx = u2.bind(x=xi, y=yi), p2.bind(x=xi, y=yi)
+    fem_ref = jno.fem([0.7 * (lap(ux, [xi, yi]) * lap(vx, [xi, yi])) - f * vx, u2(xb, yb) - g])
+    (name,) = fem.operator.runtime_parameter_exprs
+    A, _ = fem.operator.evaluate({name: net.module})
+    assert np.max(np.abs(_dense(A) - _dense(fem_ref.A))) < 1e-9
+
+
+def test_morley_constant_net_matches_coordinate_coeff():
+    """Constant-net ≡ coordinate coefficient on the Morley full-Hessian biharmonic (``∫ D²u:D²v``,
+    the correct non-singular form) — the gather oracle on the cheap C¹ element."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    f = 48.0 + 0.0 * xi
+    g = xb**4 + yb**4
+    net = _const_net(0.7)
+    u, phi = d.fem_symbols(space="Morley")
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    Hu, Hv = jno.np.hessian(ui, [xi, yi]), jno.np.hessian(vi, [xi, yi])
+    fem = jno.fem([net(xi, yi) * jno.np.inner(Hu, Hv, n_contract=2) - f * vi, u(xb, yb) - g])
+    u2, p2 = d.fem_symbols(space="Morley")
+    ux, vx = u2.bind(x=xi, y=yi), p2.bind(x=xi, y=yi)
+    Hu2, Hv2 = jno.np.hessian(ux, [xi, yi]), jno.np.hessian(vx, [xi, yi])
+    fem_ref = jno.fem([0.7 * jno.np.inner(Hu2, Hv2, n_contract=2) - f * vx, u2(xb, yb) - g])
+    (name,) = fem.operator.runtime_parameter_exprs
+    A, _ = fem.operator.evaluate({name: net.module})
+    assert np.max(np.abs(_dense(A) - _dense(fem_ref.A))) < 1e-9
+
+
+def test_hermite_constitutive_ku_matches_symbolic():
+    """A constitutive law ``net(u)`` on a Hermite (C¹) element: the form is nonlinear and its
+    Newton solve matches the symbolic ``(1 + 0.3 u²)`` reference — the net's u-dependence enters
+    the element Jacobian through the C¹ push-forward assembly's jacfwd."""
+    from jno.utils.solver.newton_krylov import newton_krylov
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    f = 2.0 * (xi * (1.0 - xi) + yi * (1.0 - yi))
+    net = _quad_net(a=1.0, b=0.3)
+    u, phi = d.fem_symbols(space="Hermite")
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    fem = jno.fem([net(ui) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
+    assert fem._mode == "nonlinear"
+    u2, p2 = d.fem_symbols(space="Hermite")
+    u2i, v2i = u2.bind(x=xi, y=yi), p2.bind(x=xi, y=yi)
+    fem_sym = jno.fem([(1.0 + 0.3 * u2i**2) * (u2i.x * v2i.x + u2i.y * v2i.y) - f * v2i, u2(xb, yb) - 0.0])
+    (name,) = fem.operator.runtime_parameter_exprs
+    u_net = newton_krylov(lambda w: fem.operator.residual(w, {name: net.module}), jnp.zeros(fem.operator.size))
+    u_sym = newton_krylov(lambda w: fem_sym.operator(w), jnp.zeros(fem_sym.operator.size))
+    assert float(jnp.max(jnp.abs(u_net - u_sym))) < 1e-9
+
+
+def test_hermite_neural_kx_recovers_via_crux():
+    """End-to-end: recover a smooth k(x) with a coordinate MLP on a Hermite (C¹) element through the
+    non-nodal parametric ``fem.solve()`` — proves the ModelWeights threading reaches the non-nodal
+    FemLinearSystem and gradients flow to the weights."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    f = 2.0 * (xi * (1.0 - xi) + yi * (1.0 - yi))
+    u, phi = d.fem_symbols(space="Hermite")
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+
+    fem_ref = jno.fem([(0.6 + 0.8 * xi + 0.5 * yi) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
+    u_obs = jnp.linalg.solve(jnp.asarray(_dense(fem_ref.A)), jnp.asarray(fem_ref.b).reshape(-1))
+
+    net = _mlp_net(key=20, hidden=16)
+    net.optimizer(optax.adam(1e-2))
+    fem = jno.fem([(1.0 + net(xi, yi)) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
+    # The non-nodal path assembles a DENSE operator (jacfwd), so use a dense solve_fn — the default
+    # sparse_lu_solve's BCOO-fromdense has a data-dependent nse under crux's jit (same as the
+    # field-parameter Hermite recovery).
+    solver = lambda A, b: jnp.linalg.solve(  # noqa: E731
+        jnp.asarray(A.todense() if hasattr(A, "todense") else A), jnp.asarray(b).reshape(-1)
+    )
+    crux = jno.core([(fem.solve(solver) - u_obs).mse], domain=_DUMMY)
+    crux.solve(400)
+
+    trained = crux.eval([ModelWeights(net)])
+    nodes = np.asarray(d.built_mesh.points)[:, :2]
+    k_net = 1.0 + np.asarray(trained(jnp.asarray(nodes))).reshape(-1)
+    k_true = 0.6 + 0.8 * nodes[:, 0] + 0.5 * nodes[:, 1]
+    rel = float(np.linalg.norm(k_net - k_true) / np.linalg.norm(k_true))
+    assert rel < 0.12, f"Hermite neural k(x) recovery rel-err {rel:.3e}"
+
+
+def test_nonnodal_vector_family_guard():
+    """A neural coefficient on the vector edge families (RT/Nédélec) fails loud — a net(u) with a
+    vector-valued trial input is undefined, and a scalar k there is out of v1 scope."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.5)
+    u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), space="RT")
+    xi, yi, _ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi), v.bind(x=xi, y=yi)
+    net = _mlp_net(key=21)
+    with pytest.raises(NotImplementedError, match="RT|Nédélec|edge"):
+        jno.fem([net(xi, yi) * jno.np.inner(ui, vi) - jno.np.inner(vi, vi)])
+
+
 def test_scope_guards_fail_loud():
     """Scope limits raise explicit NotImplementedError, never mis-assemble: a net inside a
     Dirichlet value and a trainable net on the mass (u_t) term."""

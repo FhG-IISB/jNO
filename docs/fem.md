@@ -764,12 +764,19 @@ real-equivalent block solve stays differentiable in the weights. And a net coeff
 **coupled (multi-field)** form — it is evaluated at the shared quadrature points and a trial-input
 `net(u_i)` resolves its own field, so no per-field bookkeeping is needed.
 
-Current scope: steady, transient, and steady-complex weak forms (linear k(x); nonlinear
-k(u)/k(∇u) on real steady/transient forms) on the native 2D/3D Lagrange assembler, single or
-coupled multi-field. Not yet supported (each fails loud): networks inside Dirichlet/IC values, on
-the mass term, k(u) in complex forms, the complex transient, time-varying Dirichlet `g(x,t)`
-combined with a trainable net, 1D domains (the 1D assembler has no runtime-parameter path at all),
-and non-nodal (Argyris/Morley/Hermite/RT/Nédélec) elements.
+**Non-nodal C¹ elements.** A net coefficient — `k(x)` or a constitutive `k(u)` — also works on the
+scalar C¹ families (`space="Argyris"`/`"Morley"`/`"Hermite"`), e.g. a spatially varying or
+solution-dependent stiffness on a biharmonic plate: the network is evaluated at the quadrature
+points independently of the C¹ trial's DOF layout (the same property the P1 field parameter uses).
+The non-nodal path assembles a *dense* operator, so a parametric solve wants an explicit dense
+`solve_fn` — `fem.solve(lambda A, b: jnp.linalg.solve(A, b))`.
+
+Current scope: steady/transient/steady-complex on the native 2D/3D Lagrange assembler (single or
+coupled multi-field), and steady scalar C¹ non-nodal (Argyris/Morley/Hermite). Not yet supported
+(each fails loud): networks inside Dirichlet/IC values, on the mass term, k(u) in complex forms,
+the complex transient, time-varying Dirichlet `g(x,t)` with a trainable net, transient non-nodal,
+the vector edge families (RT/Nédélec), and 1D domains (the 1D assembler has no runtime-parameter
+path at all).
 
 ### Transient inverse
 

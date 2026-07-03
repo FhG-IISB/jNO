@@ -206,6 +206,45 @@ def assemble_fem_nonnodal(
             "volume term."
         )
 
+    # Neural coefficients (``jno.nn.wrap(net)`` in the weak form) on a non-nodal element: like the native
+    # path, the network is re-evaluated at the quad points and its weights ride the runtime ``args`` as a
+    # ``ModelWeights`` slot (frozen nets evaluate from their stored module and keep the system
+    # non-parametric). The network is independent of the C¹ trial's DOF layout -- exactly the property the
+    # P1 field parameter relies on -- so ``net(x)`` and a constitutive ``net(u)`` both thread unchanged.
+    from .parametric_helpers import _collect_neural_coefficient_exprs
+
+    _neural_all_exprs: dict = {}
+    for bare in volume_terms:
+        _collect_neural_coefficient_exprs(bare, _neural_all_exprs, include_frozen=True)
+    neural_all_names: Tuple[str, ...] = tuple(sorted(_neural_all_exprs))
+    _neural_models = {n: e.model for n, e in _neural_all_exprs.items()}
+    neural_param_names: Tuple[str, ...] = tuple(
+        sorted(n for n, e in _neural_all_exprs.items() if not bool(getattr(e.model, "_frozen", False)))
+    )
+    _bdry_neural: dict = {}
+    for _terms in boundary_terms.values():
+        for bare in _terms:
+            _collect_neural_coefficient_exprs(bare, _bdry_neural)  # trainable only (frozen bakes in fine)
+    if _bdry_neural:
+        raise NotImplementedError(
+            "jno.fem (non-nodal): a trainable neural coefficient in a boundary (Neumann/Robin) term is not "
+            "supported -- the natural-BC load is assembled non-differentiably. Put it in a volume term."
+        )
+    if set(neural_all_names) & set(runtime_parameter_tags):
+        raise ValueError(
+            "jno.fem (non-nodal): a neural coefficient and a runtime parameter share a name; "
+            "names key the runtime args and must be unique (rename via .name())."
+        )
+    if neural_param_names:
+        from ...trace import ModelWeights
+
+        _param_and_neural_exprs: dict = {
+            **_rt_param_exprs,
+            **{n: ModelWeights(_neural_models[n]) for n in neural_param_names},
+        }
+    else:
+        _param_and_neural_exprs = dict(_rt_param_exprs)
+
     # Simplex dimension from the mesh: 2D triangle vs 3D tetrahedron. The edge (RT/N1E) push-forward and
     # topology are dimension-agnostic; the vertex families (Hermite/Argyris/Morley) and RT are 2D-only, so
     # in 3D only Nédélec (N1E, edge/H(curl)) is wired -- everything else raises rather than silently mis-map.
@@ -475,6 +514,12 @@ def assemble_fem_nonnodal(
                     }
                     if _field_param_names:  # P1 basis to interpolate a field parameter (top-level, param-only key)
                         local["shape_vals"] = p1_shape_vals
+                    if neural_all_names:
+                        # Trainable nets ride ``args`` (current crux weights); frozen nets use their stored
+                        # module -- also the fallback for the static (.A/.b placeholder, non-parametric) path.
+                        local["neural_coefficients"] = {
+                            n: (args or {}).get(n, _neural_models[n].module) for n in neural_all_names
+                        }
                     return _integrate_term(domain, e, local, qw * meas)  # (ndof of the test field,)
 
                 elem = jax.vmap(_cell)(jnp.arange(n_cells))  # (n_cells, ndof_tfi)
@@ -536,6 +581,13 @@ def assemble_fem_nonnodal(
         from .solver_helper import max_temporal_derivative_order as _mto
         from .time_route import _infer_time_window, _strip_temporal_trial_derivative
 
+        if neural_param_names:
+            # The non-nodal time block builds a fixed mass/operator (or threads only ``_rt_param_exprs``);
+            # a trainable net would silently freeze at its initial weights. Steady non-nodal only for now.
+            raise NotImplementedError(
+                "jno.fem (non-nodal): a trainable neural coefficient in a transient form is not wired yet "
+                "(steady non-nodal only). Use a steady form, or .freeze() the network."
+            )
         sub = [_apply_sign(domain, s, t) for bare in volume_terms for s, t in _split_additive_terms(domain, bare)]
         temporal = [t for t in sub if _contains_temporal_derivative(t)]
         spatial = [t for t in sub if not _contains_temporal_derivative(t)]
@@ -742,7 +794,7 @@ def assemble_fem_nonnodal(
 
     # --- steady nonlinear: a genuinely nonlinear weak term -> a Newton residual operator ---
     if any(_is_obviously_nonlinear_in_unknown(domain, t) for t in volume_terms):
-        if runtime_parameter_tags:  # parametric (inverse): thread args into the residual AND its Jacobian
+        if runtime_parameter_tags or neural_param_names:  # parametric (inverse): thread args through res + jac
 
             def res_p(u, args=None):
                 return _apply_dirichlet_rows(lambda uu: full_residual(uu, args), pins)(jnp.asarray(u))
@@ -751,7 +803,7 @@ def assemble_fem_nonnodal(
                 return jax.jacfwd(lambda uu: res_p(uu, args))(jnp.asarray(u))
 
             return (
-                FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_rt_param_exprs)),
+                FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_param_and_neural_exprs)),
                 "nonlinear",
                 offs,
             )
@@ -768,7 +820,7 @@ def assemble_fem_nonnodal(
     # --- steady linear parametric (inverse): re-assemble A(args), b(args) each call, kept differentiable in
     #     the parameter (mirrors the native path); the Dirichlet pins are RE-APPLIED per args. Returns a
     #     FemLinearSystem so `fem.solve()` gives a differentiable trace node crux can optimise. ---
-    if runtime_parameter_tags:
+    if runtime_parameter_tags or neural_param_names:
         from ...trace import FemLinearSystem
 
         def _assemble_at(args):
@@ -778,8 +830,10 @@ def assemble_fem_nonnodal(
                 A, b = _apply_dirichlet_symmetric(jnp.asarray(A), jnp.asarray(b), pins)
             return A, b
 
-        # static placeholder for `.A` / `.b` (right width per parameter kind: a field param is (n_verts,))
+        # static placeholder for `.A` / `.b` (right width per parameter kind: a field param is (n_verts,),
+        # a neural coefficient rides its stored module)
         _ph = {n: (jnp.zeros((n_verts,)) if n in _field_param_names else 0.0) for n in runtime_parameter_tags}
+        _ph.update({n: _neural_models[n].module for n in neural_param_names})
         a0, b0 = _assemble_at(_ph)
         return (
             FemLinearSystem(
@@ -787,7 +841,7 @@ def assemble_fem_nonnodal(
                 b0,
                 operator_fn=lambda args=None: _assemble_at(args)[0],
                 rhs_fn=lambda args=None: _assemble_at(args)[1],
-                runtime_parameter_exprs=dict(_rt_param_exprs),
+                runtime_parameter_exprs=dict(_param_and_neural_exprs),
                 metadata={"nonaffine_operator": True},  # re-assembles at each args; no affine parameter basis
             ),
             "linear",

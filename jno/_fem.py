@@ -2067,11 +2067,18 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
                 "not supported — neural coefficients are weak-form integrand coefficients only."
             )
         if getattr(domain, "dimension", None) == 1:
-            raise NotImplementedError("jno.fem: neural coefficients are supported on 2D/3D domains only (no 1D yet).")
-        if _trial_spaces(constraints) - {"Lagrange"}:
             raise NotImplementedError(
-                "jno.fem: neural coefficients are supported on Lagrange elements only (no non-nodal "
-                "Argyris/Morley/Hermite/RT/Nédélec spaces yet)."
+                "jno.fem: neural coefficients are not supported on 1D domains — the native 1D assembler has no "
+                "runtime-parameter path at all (scalar and field parameters are unsupported there too)."
+            )
+        # Non-nodal: the scalar C¹ families (Argyris/Morley/Hermite) thread the network at the quad points
+        # like their P1 field parameter; the vector edge families (RT/Nédélec) are not wired (a net(u) with a
+        # vector-valued trial input is undefined here).
+        _nonnodal_spaces = _trial_spaces(constraints) - {"Lagrange", "Argyris", "Morley", "Hermite"}
+        if _nonnodal_spaces:
+            raise NotImplementedError(
+                "jno.fem: neural coefficients on non-nodal elements are supported on the scalar C¹ families "
+                f"(Argyris/Morley/Hermite) only; not the vector edge families {sorted(_nonnodal_spaces)} (RT/Nédélec)."
             )
 
     multifield = len(_field_keys(constraints)) > 1
