@@ -639,6 +639,59 @@ def test_frozen_net_on_mass_term_is_allowed():
     assert float(jnp.max(jnp.abs(traj - traj_ref))) < 1e-12
 
 
+def _mass_density_setup(rho_fn, mesh_size=0.25, time=(0.0, 0.05, 6)):
+    d, u, phi, (xi, yi), (xb, yb), ci, ui, vi, u0 = _transient_setup(mesh_size=mesh_size, time=time)
+    return d, jno.fem([rho_fn(xi, yi) * ui.t * vi + (ui.x * vi.x + ui.y * vi.y), u(xb, yb) - 0.0, u(ci[0], ci[1]) - u0])
+
+
+def test_mass_net_kx_parametric_matches_frozen():
+    """A trainable coordinate net(x) on the mass (u_t) term — an unknown density ρ(x)·u_t — makes the
+    mass a *parametric matrix* re-assembled from args each step (block.mass_fn). It reproduces the
+    frozen (fixed-mass) trajectory, and the trajectory's gradient flows THROUGH the mass to the net."""
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    net = _mlp_net(key=34, hidden=8)
+    d, fem = _mass_density_setup(lambda x, y: 1.0 + net(x, y))
+    assert fem.operator.mass_fn is not None  # parametric mass
+    (name,) = fem.operator.runtime_parameter_exprs
+    traj = _default_transient_integrate(fem.operator, {name: net.module}, _grid_ts(fem.operator))
+
+    net_f = _mlp_net(key=34, hidden=8)
+    net_f.freeze()
+    _, fem_f = _mass_density_setup(lambda x, y: 1.0 + net_f(x, y))
+    traj_f = _default_transient_integrate(fem_f.operator, {}, _grid_ts(fem_f.operator))
+    assert float(jnp.max(jnp.abs(traj - traj_f))) < 1e-9
+
+    def loss(m):
+        return jnp.sum(_default_transient_integrate(fem.operator, {name: m}, _grid_ts(fem.operator)) ** 2)
+
+    g = eqx.filter_grad(loss)(net.module)
+    gsum = sum(jnp.sum(jnp.abs(x)) for x in jax.tree_util.tree_leaves(g) if eqx.is_inexact_array(x))
+    assert float(gsum) > 0.0  # gradient reached the net through the mass
+
+
+def test_mass_net_kx_recovers_via_crux():
+    """Recover an unknown density ρ(x) on the mass term from a decay trajectory through the
+    differentiable transient `fem.solve()` — the headline for the parametric-mass path."""
+    from jno.utils.solver.backend_blocks import _default_transient_integrate
+
+    _, fem_ref = _mass_density_setup(lambda x, y: 1.0 + 0.5 * x + 0.3 * y)
+    u_obs = _default_transient_integrate(fem_ref.operator, {}, _grid_ts(fem_ref.operator))
+
+    net = _mlp_net(key=35, hidden=16)
+    net.optimizer(optax.adam(1e-2))
+    d, fem = _mass_density_setup(lambda x, y: 1.0 + net(x, y))
+    crux = jno.core([(fem.solve() - u_obs).mse], domain=_DUMMY)
+    crux.solve(400)
+
+    trained = crux.eval([ModelWeights(net)])
+    nodes = np.asarray(d.built_mesh.points)[:, :2]
+    rho_net = 1.0 + np.asarray(trained(jnp.asarray(nodes))).reshape(-1)
+    rho_true = 1.0 + 0.5 * nodes[:, 0] + 0.3 * nodes[:, 1]
+    rel = float(np.linalg.norm(rho_net - rho_true) / np.linalg.norm(rho_true))
+    assert rel < 0.12, f"unknown-density ρ(x) recovery rel-err {rel:.3e}"
+
+
 # ==========================================================================
 # complex: a real net coefficient through the real-equivalent block
 # ==========================================================================
@@ -1044,7 +1097,7 @@ def test_nonnodal_trainable_net_in_boundary_term_guard():
 
 def test_scope_guards_fail_loud():
     """Scope limits raise explicit NotImplementedError, never mis-assemble: a net inside a
-    Dirichlet value and a trainable net on the mass (u_t) term."""
+    Dirichlet value and a solution-dependent net(u) on the mass (u_t) term (a nonlinear mass)."""
     d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _poisson_setup()
     net = _mlp_net(key=5)
 
@@ -1052,13 +1105,14 @@ def test_scope_guards_fail_loud():
     with pytest.raises(NotImplementedError, match="Dirichlet"):
         jno.fem([(ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - net(xb, yb)])
 
-    # trainable net on the mass term: the mass matrix assembles once -> would silently freeze
+    # net(u) on the mass term = a nonlinear mass C(u)*u_t (the matrix form can't express it). A
+    # coordinate net(x) mass coefficient IS supported (see test_mass_net_kx_recovers_via_crux).
     d2, u2, phi2, (x2, y2), (xb2, yb2), ci, u2i, v2i, psi0 = _transient_setup(mesh_size=0.3, time=(0.0, 0.02, 5))
-    net2 = _mlp_net(key=6)
-    with pytest.raises(NotImplementedError, match="mass"):
+    net2 = _quad_net(a=1.0, b=0.5)
+    with pytest.raises(NotImplementedError, match="mass|nonlinear mass"):
         jno.fem(
             [
-                (1.0 + net2(x2, y2)) * u2i.t * v2i + (u2i.x * v2i.x + u2i.y * v2i.y),
+                net2(u2i) * u2i.t * v2i + (u2i.x * v2i.x + u2i.y * v2i.y),
                 u2(xb2, yb2) - 0.0,
                 u2(ci[0], ci[1]) - psi0,
             ]

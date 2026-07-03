@@ -1015,19 +1015,22 @@ def assemble_fem_native(
                 "jno.fem (native): an initial condition was provided but no temporal term "
                 "(e.g. ``inner(u.t, v)``) was found in the volume weak form."
             )
-        if collect_neural_slots(temporal).any_trainable:
-            # The mass matrix is assembled ONCE with args=None — a trainable net on the u̇ term
-            # would silently freeze at its initial weights. Fail loud (a frozen net is fine: it
-            # evaluates from its stored module by design; the default collection excludes frozen).
+        # A trainable net on the u̇ term. A COORDINATE ``net(x)`` (an unknown density ``rho(x)*u_t``) keeps
+        # the mass a *matrix* -- just parametric in the weights -- so it is re-assembled from ``args`` each
+        # step (``mass_fn`` below). A SOLUTION-DEPENDENT ``net(u)`` would make the mass itself nonlinear
+        # (``C(u)*u_t``), which the semidiscrete matrix form cannot express -- reject that.
+        _parametric_mass = collect_neural_slots(temporal).any_trainable
+        if _parametric_mass and any(_is_obviously_nonlinear_in_unknown(domain, t) for t in temporal):
             raise NotImplementedError(
-                "jno.fem (native): a trainable neural coefficient on the mass (u_t) term is not "
-                "supported — the mass matrix is assembled once, so the net would silently freeze. "
-                "Use it on spatial terms, or .freeze() the network."
+                "jno.fem (native): a solution-dependent neural coefficient net(u) on the mass (u_t) term is a "
+                "nonlinear mass C(u)*u_t, which the semidiscrete matrix form cannot express. A coordinate "
+                "net(x) mass coefficient (an unknown density) is supported."
             )
 
         mass_terms = [_strip_temporal_trial_derivative(t) for t in temporal]
         # Mass matrix: volume only (no boundary); spatial residual: volume + boundary
-        M = _make_jacobian(mass_terms)(zeros)
+        _mass_jac = _make_jacobian(mass_terms)
+        M = _mass_jac(zeros)
         spatial_res = _make_residual(spatial, boundary_terms)
         spatial_jac = _make_jacobian(spatial, boundary_terms)
 
@@ -1077,6 +1080,13 @@ def assemble_fem_native(
         d_dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
         d_vals = jnp.asarray([p[1] for p in dirichlet_pairs], dtype=zeros.dtype) if dirichlet_pairs else None
 
+        # Parametric mass ``mass_fn(t, args)`` (unknown density net(x)*u_t): re-assemble M from args each
+        # step with the Dirichlet rows/cols zeroed (a constrained DOF carries no time derivative). ``None``
+        # keeps the static ``M_bc`` for a non-parametric mass.
+        def _mass_cb(t, args=None, _d=d_dofs):
+            Mt = _mass_jac(zeros, t, args)
+            return Mt if _d is None else bcoo_zero_rows_cols(Mt, _d)
+
         nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in spatial)
         if nonlinear:
             # Row-replacement Dirichlet (constant g), threaded through the runtime time t AND the
@@ -1092,7 +1102,7 @@ def assemble_fem_native(
             M_bc = M if d_dofs is None else bcoo_zero_rows_cols(M, d_dofs)
             return (
                 SemidiscreteTimeBlock(
-                    mass=lambda t, args=None, _M=M_bc: _M,
+                    mass=_mass_cb if _parametric_mass else (lambda t, args=None, _M=M_bc: _M),
                     residual=res_bc,
                     jacobian=jac_bc,
                     runtime_parameter_exprs=dict(_param_and_neural_exprs),
@@ -1122,6 +1132,7 @@ def assemble_fem_native(
             return (
                 SemidiscreteTimeBlock(
                     M=M_bc,
+                    mass_fn=_mass_cb if _parametric_mass else None,  # parametric mass (unknown density net(x)*u_t)
                     operator_fn=operator_fn,
                     affine_bias=c_bias,
                     forcing_vector_fn=forcing_vector_fn,

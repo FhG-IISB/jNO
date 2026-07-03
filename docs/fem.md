@@ -754,9 +754,11 @@ arguments carry the unknown makes the form nonlinear — including a bare reacti
 
 **Transient forms** work the same way — the per-step operator (or the per-step Newton residual,
 for `net(u)`) re-evaluates the network, so a diffusivity or constitutive law is recovered from a
-`u(t)` trajectory exactly like the scalar/nodal transient inverse below. One exclusion: a
-*trainable* net on the mass (`u_t`) term is rejected (the mass matrix assembles once — the net
-would silently freeze; `.freeze()` it or keep it on spatial terms).
+`u(t)` trajectory exactly like the scalar/nodal transient inverse below. A coordinate `net(x)` on
+the **mass** (`u_t`) term is supported too — an unknown density `ρ(x)·u_t` recovered from a decay
+trajectory: the mass becomes a parametric matrix re-assembled from the weights each step. Only a
+*solution-dependent* `net(u)` on the mass term is rejected — that is a nonlinear mass `C(u)·u_t`,
+which the semidiscrete matrix form cannot express (a frozen net on the mass is always fine).
 
 A real coordinate-input net also composes with **complex** steady forms (a Helmholtz coefficient
 recovered from complex full-field data): the Re/Im legs assemble as parametric systems and the
@@ -776,11 +778,10 @@ non-nodal path assembles a *dense* operator, so a parametric solve wants an expl
 
 Current scope: steady/transient/steady-complex on the native 2D/3D Lagrange assembler (single or
 coupled multi-field), and steady scalar C¹ non-nodal (Argyris/Morley/Hermite). Not yet supported
-(each fails loud): networks inside Dirichlet/IC values, a *trainable* net on the mass (`u_t`) term
-(a frozen/known one is fine — the mass is assembled once), k(u) in complex forms, the complex
-transient, time-varying Dirichlet `g(x,t)` with a trainable net, solution-dependent `net(u)` on
-the vector edge families (RT/Nédélec), and 1D domains (the 1D assembler has no runtime-parameter
-path at all).
+(each fails loud): networks inside Dirichlet/IC values, solution-dependent `net(u)` on the mass
+(`u_t`) term (a nonlinear mass), k(u) in complex forms, the complex transient, time-varying
+Dirichlet `g(x,t)` with a trainable net, solution-dependent `net(u)` on the vector edge families
+(RT/Nédélec), and 1D domains (the 1D assembler has no runtime-parameter path at all).
 
 ### Transient inverse
 
