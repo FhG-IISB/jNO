@@ -3323,9 +3323,9 @@ class FrozenField(Placeholder):
         self.order = int(getattr(source, "order", 1))
         self.space = str(getattr(source, "space", "Lagrange"))
         self.op_id = _next_op_id()
-        self.field_key = source.field_key            # share the source field's shape data
+        self.field_key = source.field_key  # share the source field's shape data
         self.values = jnp.asarray(values).reshape(-1)  # global nodal vector (scalar field)
-        self.frozen_id = _next_op_id()               # kernel gather-table key
+        self.frozen_id = _next_op_id()  # kernel gather-table key
 
     @property
     def num_components(self) -> int:
