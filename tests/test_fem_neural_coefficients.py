@@ -927,6 +927,22 @@ def test_nonnodal_vector_family_guard():
         jno.fem([net(xi, yi) * jno.np.inner(ui, vi) - jno.np.inner(vi, vi)])
 
 
+def test_nonnodal_trainable_net_in_boundary_term_guard():
+    """On a non-nodal element a *trainable* net in a Neumann/Robin (boundary) term fails loud — the
+    natural-BC load is assembled non-differentiably there. (Native folds boundary nets into the
+    kernel table; the non-nodal path deliberately does not — this pins that divergence.)"""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3)
+    xi, yi, _ = d.variable("interior", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    u, phi = d.fem_symbols(space="Hermite")
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    wr = phi.bind(x=xr, y=yr)
+    net = _mlp_net(key=22)
+    with pytest.raises(NotImplementedError, match="boundary"):
+        jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, net(xr, yr) * wr, u(xl, yl) - 0.0])
+
+
 def test_scope_guards_fail_loud():
     """Scope limits raise explicit NotImplementedError, never mis-assemble: a net inside a
     Dirichlet value and a trainable net on the mass (u_t) term."""

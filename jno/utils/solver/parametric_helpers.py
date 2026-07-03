@@ -31,6 +31,9 @@ the kernel evaluates the network at the quadrature points
 (``fem_utils._eval_integrand``).
 """
 
+from dataclasses import dataclass
+from typing import Any, Dict, Optional, Tuple
+
 import jax.numpy as jnp
 
 from ...trace import BinaryOp, Literal, ModelCall
@@ -134,6 +137,119 @@ def _collect_neural_coefficient_exprs(node, out=None, *, include_frozen=False):
         _collect_neural_coefficient_exprs(child, out, include_frozen=include_frozen)
 
     return out
+
+
+# -----------------------------------------------------------------------------
+# Neural-coefficient mechanism (single source of truth for both assemblers)
+#
+# A neural coefficient reuses the runtime-parameter *infrastructure* (the ``args`` dict,
+# ``FemLinearSystem.operator_fn(args)`` / ``FemResidualOperator`` / ``SemidiscreteTimeBlock``,
+# ``custom_root`` implicit diff). Only three things are specific to a network, and they are the
+# axes along which the mechanism could later change -- so they live here, called identically by the
+# native and non-nodal assemblers rather than copied into each:
+#
+#   1. COLLECT      -- which networks are coefficients, their names, which are trainable
+#                      (``collect_neural_slots``);
+#   2. CRUX DELIVERY -- how a trainable net's weights reach the solve node: a ``ModelWeights`` slot in
+#                      ``runtime_parameter_exprs`` that the trace evaluator resolves to the live module
+#                      (``neural_operator_exprs``);
+#   3. KERNEL TABLE -- how the module reaches the per-cell integrand: a ``{name: module}`` map placed at
+#                      ``local["neural_coefficients"]`` (``neural_local_table``).
+#
+# Swapping the mechanism (e.g. partition-based weights instead of whole-module-by-closure) touches
+# only (2)+(3) here plus the ``ModelWeights`` handler; a network stays user-visible as just
+# ``jno.nn.wrap(net)(...)`` inside a weak form, so no user code or behaviour test moves.
+# -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class NeuralSlots:
+    """The neural coefficients of one solver block. ``all_names`` covers every network (frozen +
+    trainable) whose module the kernel must evaluate; ``param_names`` is the trainable subset that
+    becomes ``ModelWeights`` runtime slots; ``models`` maps each name to its :class:`Model`."""
+
+    all_names: Tuple[str, ...]
+    models: Dict[str, Any]
+    param_names: Tuple[str, ...]
+
+    @property
+    def any(self) -> bool:
+        return bool(self.all_names)
+
+    @property
+    def any_trainable(self) -> bool:
+        return bool(self.param_names)
+
+
+def collect_neural_slots(
+    volume_terms,
+    boundary_terms=None,
+    *,
+    runtime_parameter_tags: Tuple[str, ...] = (),
+    reject_trainable_boundary: bool = False,
+) -> NeuralSlots:
+    """Collect a block's neural coefficients (touch-point 1).
+
+    Volume-term networks (frozen + trainable) are always threaded. ``boundary_terms`` handling is
+    the one place the two assemblers legitimately differ, kept explicit here rather than hidden:
+    ``reject_trainable_boundary=False`` (native) folds boundary networks into the kernel table too;
+    ``True`` (non-nodal, whose natural-BC load is assembled non-differentiably) raises on a trainable
+    boundary net. A network sharing a name with a runtime parameter is rejected (names key ``args``).
+    """
+    exprs: Dict[str, ModelCall] = {}
+    for bare in volume_terms:
+        _collect_neural_coefficient_exprs(bare, exprs, include_frozen=True)
+
+    if boundary_terms:
+        if reject_trainable_boundary:
+            bexprs: Dict[str, ModelCall] = {}
+            for terms in boundary_terms.values():
+                for bare in terms:
+                    _collect_neural_coefficient_exprs(bare, bexprs)  # trainable only
+            if bexprs:
+                raise NotImplementedError(
+                    "jno.fem (non-nodal): a trainable neural coefficient in a boundary (Neumann/Robin) term "
+                    "is not supported -- the natural-BC load is assembled non-differentiably. Put it in a "
+                    "volume term."
+                )
+        else:
+            for terms in boundary_terms.values():
+                for bare in terms:
+                    _collect_neural_coefficient_exprs(bare, exprs, include_frozen=True)
+
+    all_names = tuple(sorted(exprs))
+    if set(all_names) & set(runtime_parameter_tags):
+        raise ValueError(
+            f"jno.fem: a neural coefficient and a runtime parameter share the name(s) "
+            f"{sorted(set(all_names) & set(runtime_parameter_tags))}; names key the runtime args and must be "
+            "unique inside one solver block (rename via .name())."
+        )
+    models = {n: e.model for n, e in exprs.items()}
+    param_names = tuple(sorted(n for n, e in exprs.items() if not bool(getattr(e.model, "_frozen", False))))
+    return NeuralSlots(all_names=all_names, models=models, param_names=param_names)
+
+
+def neural_operator_exprs(rt_param_exprs: Dict[str, Any], slots: NeuralSlots) -> Dict[str, Any]:
+    """Merge trainable networks into ``runtime_parameter_exprs`` as ``ModelWeights`` slots (touch-point 2).
+
+    The result is what an ``FemLinearSystem`` / ``FemResidualOperator`` / ``SemidiscreteTimeBlock`` carries;
+    at solve time the trace evaluator resolves each ``ModelWeights`` to the live (crux-recombined) module,
+    which returns here through ``args`` -- so ``∂solve/∂weights`` flows through the implicit-diff solvers."""
+    if not slots.param_names:
+        return dict(rt_param_exprs)
+    from ...trace import ModelWeights
+
+    return {**rt_param_exprs, **{n: ModelWeights(slots.models[n]) for n in slots.param_names}}
+
+
+def neural_local_table(slots: NeuralSlots, args) -> Optional[Dict[str, Any]]:
+    """The per-cell ``{name: module}`` table for ``local['neural_coefficients']`` (touch-point 3), or
+    ``None`` when the block has no networks. Trainable modules arrive through ``args``; a frozen (or
+    static-placeholder) net falls back to its stored module."""
+    if not slots.all_names:
+        return None
+    a = args or {}
+    return {n: a.get(n, slots.models[n].module) for n in slots.all_names}
 
 
 def _flatten_product(node):

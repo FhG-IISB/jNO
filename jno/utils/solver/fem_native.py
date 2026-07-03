@@ -517,48 +517,19 @@ def assemble_fem_native(
     _field_param_names: set = {n for n, expr in _rt_param_exprs.items() if _is_fem_field_parameter(expr)}
 
     # Neural coefficients (``jno.nn.wrap(net)`` called inside the weak form, e.g. ``net(x,y)*u.dx*v.dx``).
-    # Unlike scalar/nodal parameters they never enter the per-cell ``volume_vars`` — a weight pytree is
-    # cell-independent — the kernel instead re-evaluates the network at the quad points from a
-    # {name: module} table threaded via ``loc["neural_coefficients"]``. TRAINABLE networks arrive
-    # through the runtime ``args`` (a ``ModelWeights`` slot resolved by the trace evaluator to the
-    # crux-recombined module, so ∂solve/∂weights flows); FROZEN (.freeze()d) networks evaluate from
-    # their stored module and keep the system non-parametric.
-    from .parametric_helpers import _collect_neural_coefficient_exprs
+    # Unlike scalar/nodal parameters they never enter the per-cell ``volume_vars`` -- a weight pytree is
+    # cell-independent -- the kernel instead re-evaluates the network at the quad points from the
+    # {name: module} table (``neural_local_table``) threaded via ``loc["neural_coefficients"]``. A neural
+    # coefficient needs NO per-field resolution (unlike a nodal FIELD parameter, which gathers on one
+    # field's mesh): the net is evaluated at the shared physical quad points, and a trial-input
+    # ``net(u_i)`` resolves its field through ``_field_data`` (op_id/field_key) inside the kernel -- so a
+    # coupled (multi-field) form threads it unchanged. The collect / crux-delivery / kernel-table
+    # mechanism lives in ``parametric_helpers`` (shared with the non-nodal assembler).
+    from .parametric_helpers import collect_neural_slots, neural_local_table, neural_operator_exprs
 
-    _neural_all_exprs: Dict[str, Any] = {}
-    for bare in volume_terms:
-        _collect_neural_coefficient_exprs(bare, _neural_all_exprs, include_frozen=True)
-    for _exprs in boundary_terms.values():
-        for bare in _exprs:
-            _collect_neural_coefficient_exprs(bare, _neural_all_exprs, include_frozen=True)
-    neural_all_names: Tuple[str, ...] = tuple(sorted(_neural_all_exprs))
-    _neural_models = {n: e.model for n, e in _neural_all_exprs.items()}
-    neural_param_names: Tuple[str, ...] = tuple(
-        sorted(n for n, e in _neural_all_exprs.items() if not bool(getattr(e.model, "_frozen", False)))
-    )
-    _name_clash = set(neural_all_names) & set(runtime_parameter_tags)
-    if _name_clash:
-        raise ValueError(
-            f"jno.fem: neural coefficient and runtime parameter share the name(s) {sorted(_name_clash)}; "
-            "names key the runtime args and must be unique inside one solver block (rename via .name())."
-        )
-    # A neural coefficient needs NO per-field resolution (unlike a nodal FIELD parameter, which
-    # gathers on one field's mesh): the network is evaluated at the shared physical quad points,
-    # and a trial-input ``net(u_i)`` resolves its field through ``_field_data`` (op_id/field_key)
-    # inside the kernel — so a coupled (multi-field) form threads it unchanged.
-    # Trainable networks join the runtime-parameter exprs as ModelWeights slots: the solve nodes
-    # (FemLinearSystem/FemResidualOperator/SemidiscreteTimeBlock) resolve each to the current module
-    # pytree, which arrives back here in ``args`` and is re-evaluated at the quad points inside the
-    # kernel — keeping ∂solve/∂weights exact through the implicit-diff solvers.
-    if neural_param_names:
-        from ...trace import ModelWeights
-
-        _param_and_neural_exprs: Dict[str, Any] = {
-            **_rt_param_exprs,
-            **{n: ModelWeights(_neural_models[n]) for n in neural_param_names},
-        }
-    else:
-        _param_and_neural_exprs = dict(_rt_param_exprs)
+    _neural = collect_neural_slots(volume_terms, boundary_terms, runtime_parameter_tags=runtime_parameter_tags)
+    neural_param_names, _neural_models = _neural.param_names, _neural.models
+    _param_and_neural_exprs = neural_operator_exprs(_rt_param_exprs, _neural)
     # A nodal FIELD parameter k(x) interpolates on one field's FE space. Single field -> field 0. For a
     # coupled (multi-field) problem, associate it with the field whose test function appears in the
     # term(s) that reference it (e.g. mu(x)*(grad u . grad v) -> the velocity field), so its nodal values
@@ -708,10 +679,9 @@ def assemble_fem_native(
             # functions (field 0 single-field; the resolved field for a coupled problem).
             # _runtime_parameter_value_from_internal_vars reads this top-level shape_vals.
             loc["shape_vals"] = per[_field_param_field_idx]["shape_vals"]
-        if neural_all_names:
-            # Trainable nets ride the runtime args (current crux weights); frozen ones use their
-            # stored module — also the fallback for static assemblies (the .A/.b placeholder).
-            loc["neural_coefficients"] = {n: (args or {}).get(n, _neural_models[n].module) for n in neural_all_names}
+        _nt = neural_local_table(_neural, args)
+        if _nt is not None:  # trainable nets ride args (crux weights); frozen/placeholder -> stored module
+            loc["neural_coefficients"] = _nt
         return _integrate_term(domain, coeff, loc, qw_shared * meas)
 
     def _surf_elem_res(fi, local_all, bcoeff, btfi, region, t=0.0, args=None):
@@ -757,8 +727,9 @@ def assemble_fem_native(
         }
         if _field_param_names:
             loc["shape_vals"] = per_f[_field_param_field_idx]["shape_vals"]
-        if neural_all_names:
-            loc["neural_coefficients"] = {n: (args or {}).get(n, _neural_models[n].module) for n in neural_all_names}
+        _nt = neural_local_table(_neural, args)
+        if _nt is not None:
+            loc["neural_coefficients"] = _nt
         return _integrate_term(domain, bcoeff, loc, face_w * jac_f)
 
     def _classify_one(coeff, where: str) -> List[Tuple[Any, int]]:
@@ -1044,7 +1015,7 @@ def assemble_fem_native(
                 "jno.fem (native): an initial condition was provided but no temporal term "
                 "(e.g. ``inner(u.t, v)``) was found in the volume weak form."
             )
-        if neural_param_names and any(_collect_neural_coefficient_exprs(t) for t in temporal):
+        if collect_neural_slots(temporal).any_trainable:
             # The mass matrix is assembled ONCE with args=None — a trainable net on the u̇ term
             # would silently freeze at its initial weights. Fail loud (a frozen net is fine: it
             # evaluates from its stored module by design; the default collection excludes frozen).

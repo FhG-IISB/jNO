@@ -210,40 +210,17 @@ def assemble_fem_nonnodal(
     # path, the network is re-evaluated at the quad points and its weights ride the runtime ``args`` as a
     # ``ModelWeights`` slot (frozen nets evaluate from their stored module and keep the system
     # non-parametric). The network is independent of the C¹ trial's DOF layout -- exactly the property the
-    # P1 field parameter relies on -- so ``net(x)`` and a constitutive ``net(u)`` both thread unchanged.
-    from .parametric_helpers import _collect_neural_coefficient_exprs
+    # P1 field parameter relies on -- so ``net(x)`` and a constitutive ``net(u)`` both thread unchanged. The
+    # collect / crux-delivery / kernel-table mechanism is shared with the native assembler
+    # (``parametric_helpers``); the non-nodal difference is only the boundary policy: a trainable net in a
+    # natural-BC (Neumann/Robin) term is rejected, since that load is assembled non-differentiably here.
+    from .parametric_helpers import collect_neural_slots, neural_local_table, neural_operator_exprs
 
-    _neural_all_exprs: dict = {}
-    for bare in volume_terms:
-        _collect_neural_coefficient_exprs(bare, _neural_all_exprs, include_frozen=True)
-    neural_all_names: Tuple[str, ...] = tuple(sorted(_neural_all_exprs))
-    _neural_models = {n: e.model for n, e in _neural_all_exprs.items()}
-    neural_param_names: Tuple[str, ...] = tuple(
-        sorted(n for n, e in _neural_all_exprs.items() if not bool(getattr(e.model, "_frozen", False)))
+    _neural = collect_neural_slots(
+        volume_terms, boundary_terms, runtime_parameter_tags=runtime_parameter_tags, reject_trainable_boundary=True
     )
-    _bdry_neural: dict = {}
-    for _terms in boundary_terms.values():
-        for bare in _terms:
-            _collect_neural_coefficient_exprs(bare, _bdry_neural)  # trainable only (frozen bakes in fine)
-    if _bdry_neural:
-        raise NotImplementedError(
-            "jno.fem (non-nodal): a trainable neural coefficient in a boundary (Neumann/Robin) term is not "
-            "supported -- the natural-BC load is assembled non-differentiably. Put it in a volume term."
-        )
-    if set(neural_all_names) & set(runtime_parameter_tags):
-        raise ValueError(
-            "jno.fem (non-nodal): a neural coefficient and a runtime parameter share a name; "
-            "names key the runtime args and must be unique (rename via .name())."
-        )
-    if neural_param_names:
-        from ...trace import ModelWeights
-
-        _param_and_neural_exprs: dict = {
-            **_rt_param_exprs,
-            **{n: ModelWeights(_neural_models[n]) for n in neural_param_names},
-        }
-    else:
-        _param_and_neural_exprs = dict(_rt_param_exprs)
+    neural_param_names, _neural_models = _neural.param_names, _neural.models
+    _param_and_neural_exprs = neural_operator_exprs(_rt_param_exprs, _neural)
 
     # Simplex dimension from the mesh: 2D triangle vs 3D tetrahedron. The edge (RT/N1E) push-forward and
     # topology are dimension-agnostic; the vertex families (Hermite/Argyris/Morley) and RT are 2D-only, so
@@ -514,12 +491,9 @@ def assemble_fem_nonnodal(
                     }
                     if _field_param_names:  # P1 basis to interpolate a field parameter (top-level, param-only key)
                         local["shape_vals"] = p1_shape_vals
-                    if neural_all_names:
-                        # Trainable nets ride ``args`` (current crux weights); frozen nets use their stored
-                        # module -- also the fallback for the static (.A/.b placeholder, non-parametric) path.
-                        local["neural_coefficients"] = {
-                            n: (args or {}).get(n, _neural_models[n].module) for n in neural_all_names
-                        }
+                    _nt = neural_local_table(_neural, args)
+                    if _nt is not None:  # trainable nets ride args (crux weights); frozen/placeholder -> stored
+                        local["neural_coefficients"] = _nt
                     return _integrate_term(domain, e, local, qw * meas)  # (ndof of the test field,)
 
                 elem = jax.vmap(_cell)(jnp.arange(n_cells))  # (n_cells, ndof_tfi)
