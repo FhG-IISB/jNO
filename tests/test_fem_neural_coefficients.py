@@ -617,6 +617,98 @@ def test_transient_nonlinear_ku_recovers_via_crux():
     assert rel < 0.05, f"transient constitutive-law recovery rel-err {rel:.3e}"
 
 
+# ==========================================================================
+# complex: a real net coefficient through the real-equivalent block
+# ==========================================================================
+
+
+def _complex_helmholtz(kappa_expr_fn, mesh_size=0.15):
+    """Complex Helmholtz ``κ(-Δu) + d·u = f`` (all-Neumann), manufactured
+    ``u* = (1+0.5i) cos(πx) cos(πy)`` at κ_true = 0.8 (mirrors test_fem_complex_parametric)."""
+    dom = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size)
+    u, phi = dom.fem_symbols()
+    xi, yi, _ = dom.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    d_coef = 1.0 + 0.3j
+    f = (2 * PI**2 * 0.8 + d_coef) * (1.0 + 0.5j) * jno.np.cos(PI * xi) * jno.np.cos(PI * yi)
+    weak = kappa_expr_fn(xi, yi, ui) * (ui.x * vi.x + ui.y * vi.y) + d_coef * (u * vi) - f * vi
+    return dom, jno.fem([weak])
+
+
+def test_complex_net_yields_parametric_legs_and_node():
+    """A real net coefficient in a complex form: the legs assemble as parametric FemLinearSystems
+    carrying the ModelWeights slot, and solve() is a differentiable trace node."""
+    from jno.trace import FemLinearSystem
+
+    net = _mlp_net(key=11)
+    _, fem = _complex_helmholtz(lambda x, y, u: 1.0 + net(x, y))
+    assert fem.is_complex
+    op_r, _op_i = fem._op
+    assert isinstance(op_r, FemLinearSystem) and op_r.is_parametric
+    (name,) = op_r.runtime_parameter_exprs
+    assert isinstance(op_r.runtime_parameter_exprs[name], ModelWeights)
+    assert not isinstance(fem.solve(), jax.Array)
+
+
+def test_complex_constant_net_matches_scalar_forward():
+    """A constant net (κ ≡ 0.8) through the complex block equals the scalar-κ complex solve —
+    pins the Re/Im-leg kernel evaluation of the net."""
+    _, fem_ref = _complex_helmholtz(lambda x, y, u: 0.8)
+    u_ref = np.asarray(fem_ref.solve()).reshape(-1)
+
+    net = _const_net(-0.2)  # 1 + net ≡ 0.8
+    _, fem = _complex_helmholtz(lambda x, y, u: 1.0 + net(x, y))
+    u_node = fem.solve()
+    crux = jno.core([(u_node - u_ref).mae], domain=_DUMMY)
+    u_par = np.asarray(crux.eval([u_node])).reshape(-1)
+    assert np.allclose(u_par, u_ref, atol=1e-8)
+    assert float(np.abs(u_ref.imag).max()) > 0.1  # genuinely complex
+
+
+def test_complex_net_recovers_kappa_via_crux():
+    """Recover the (constant) diffusivity κ = 0.8 with a coordinate MLP trained through the
+    complex real-equivalent block — ∂u/∂weights flows through the parametric legs."""
+    _, fem_ref = _complex_helmholtz(lambda x, y, u: 0.8)
+    u_ref = np.asarray(fem_ref.solve())
+
+    net = _mlp_net(key=12, hidden=8)
+    net.optimizer(optax.adam(1e-2))
+    dom, fem = _complex_helmholtz(lambda x, y, u: 1.0 + net(x, y))
+    crux = jno.core([(fem.solve() - u_ref).mae], domain=_DUMMY)
+    crux.solve(300)
+
+    trained = crux.eval([ModelWeights(net)])
+    nodes = np.asarray(dom.built_mesh.points)[:, :2]
+    k_net = 1.0 + np.asarray(trained(jnp.asarray(nodes))).reshape(-1)
+    rel = float(np.linalg.norm(k_net - 0.8) / (0.8 * np.sqrt(len(k_net))))
+    assert rel < 0.1, f"complex neural κ recovery rel-err {rel:.3e}"
+
+
+def test_complex_scope_guards():
+    """The two complex compositions that would mis-assemble stay rejected: a solution-dependent
+    net (the legs are linear real-equivalent blocks) and the complex transient."""
+    net = _quad_net()
+    with pytest.raises(NotImplementedError, match="complex"):
+        _complex_helmholtz(lambda x, y, u: net(u))
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.3, time=(0.0, 0.02, 5))
+    u, phi = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), phi.bind(x=xi, y=yi, t=ti)
+    net2 = _mlp_net(key=13)
+    psi0 = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1]) * (1.0 + 0.0j)
+    with pytest.raises(NotImplementedError, match="complex"):
+        jno.fem(
+            [
+                1j * ui.t * vi - (1.0 + net2(xi, yi)) * (ui.x * vi.x + ui.y * vi.y),
+                u(xb, yb) - 0.0,
+                u(ci[0], ci[1]) - psi0,
+            ]
+        )
+
+
 def test_scope_guards_fail_loud():
     """Scope limits raise explicit NotImplementedError, never mis-assemble: a net inside a
     Dirichlet value and a trainable net on the mass (u_t) term."""

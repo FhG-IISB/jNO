@@ -758,10 +758,15 @@ for `net(u)`) re-evaluates the network, so a diffusivity or constitutive law is 
 *trainable* net on the mass (`u_t`) term is rejected (the mass matrix assembles once — the net
 would silently freeze; `.freeze()` it or keep it on spatial terms).
 
-Current scope: steady and transient weak forms (linear k(x) and nonlinear k(u)/k(∇u)) on the
-native 2D/3D Lagrange assembler, single field. Not yet supported (each fails loud): networks
-inside Dirichlet/IC values, on the mass term, `complex=True` forms, time-varying Dirichlet
-`g(x,t)` combined with a trainable net, coupled multi-field problems, 1D, and non-nodal
+A real coordinate-input net also composes with **complex** steady forms (a Helmholtz coefficient
+recovered from complex full-field data): the Re/Im legs assemble as parametric systems and the
+real-equivalent block solve stays differentiable in the weights.
+
+Current scope: steady, transient, and steady-complex weak forms (linear k(x); nonlinear
+k(u)/k(∇u) on real steady/transient forms) on the native 2D/3D Lagrange assembler, single field.
+Not yet supported (each fails loud): networks inside Dirichlet/IC values, on the mass term,
+k(u) in complex forms, the complex transient, time-varying Dirichlet `g(x,t)` combined with a
+trainable net, coupled multi-field problems, 1D, and non-nodal
 (Argyris/Morley/Hermite/RT/Nédélec) elements.
 
 ### Transient inverse

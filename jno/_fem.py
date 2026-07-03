@@ -2409,9 +2409,20 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     # ``[[A_r, -A_i], [A_i, A_r]]`` and recombines to a complex ``u``. A complex *inverse* (runtime
     # parameter) and the complex *transient* (Schrodinger) path are handled separately below. ----
     if has_neural_coeff and _is_complex_form(domain, ir):
-        raise NotImplementedError(
-            "jno.fem: a neural coefficient in a complex (complex=True) weak form is not supported yet."
-        )
+        # A real coordinate-input net in a steady complex form is fine — each Re/Im leg assembles as
+        # a parametric FemLinearSystem and _solve_complex_block builds the differentiable trace node,
+        # exactly like the scalar complex inverse. The two compositions that would mis-assemble stay
+        # rejected: the complex-transient branch unpacks eager (A, b) legs (a parametric leg cannot
+        # ride it), and a solution-dependent net makes the legs nonlinear (no complex Newton block).
+        if is_transient:
+            raise NotImplementedError("jno.fem: a neural coefficient in a complex *transient* form is not supported yet.")
+        from .utils.solver.weak_form import _is_obviously_nonlinear_in_unknown as _nlin_cx
+
+        if any(_nlin_cx(domain, b) for b in weak_bares):
+            raise NotImplementedError(
+                "jno.fem: a solution-dependent neural coefficient (net(u)/net(∇u)) in a complex form "
+                "is not supported yet — complex forms assemble as linear real-equivalent blocks."
+            )
 
     if (
         not is_vpinn
