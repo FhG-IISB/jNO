@@ -3304,6 +3304,53 @@ class TrialFunction(Placeholder):
         return f"TrialFunction({self.name}, value_shape={self.value_shape})"
 
 
+class FrozenField(Placeholder):
+    """A field whose DOFs are *pinned* to a known nodal vector ``values`` (e.g. a
+    precomputed FE solution), produced by ``u.bind(...).freeze(values)``.
+
+    It carries the source field's identity (``field_key`` / ``value_shape`` / ``order``
+    / ``space``) so the kernel finds the right basis, and interpolates ``values`` at the
+    quadrature points -- its value and its gradient ``.x`` / ``.y`` are therefore concrete
+    KNOWN data. Because it is **not** a ``TrialFunction``, it is invisible to the
+    unknown-detection that routes nonlinear solves: a term like
+    ``softplus(net(xi, yi, ui.freeze(u0).x, ui.freeze(u0).y)) * (grad u . grad v)``
+    stays LINEAR in the true unknown ``u`` while conditioning the coefficient on the
+    known field ``u0`` (a predictor-corrector). No gradient flows into ``values``."""
+
+    def __init__(self, source, values):
+        self.name = f"frozen[{getattr(source, 'name', 'u')}]"
+        self.value_shape = tuple(getattr(source, "value_shape", ()))
+        self.order = int(getattr(source, "order", 1))
+        self.space = str(getattr(source, "space", "Lagrange"))
+        self.op_id = _next_op_id()
+        self.field_key = source.field_key            # share the source field's shape data
+        self.values = jnp.asarray(values).reshape(-1)  # global nodal vector (scalar field)
+        self.frozen_id = _next_op_id()               # kernel gather-table key
+
+    @property
+    def num_components(self) -> int:
+        n = 1
+        for s in self.value_shape:
+            n *= int(s)
+        return n
+
+    def _field_view(self):
+        n = len(self.value_shape)
+        if n == 0:
+            return self.scalar
+        if n == 1:
+            return self.vector
+        return self.matrix
+
+    def partials(self, **named_vars):
+        return self._field_view().partials(**named_vars)
+
+    bind = partials
+
+    def __repr__(self):
+        return f"FrozenField(source_key={self.field_key}, ndof={self.values.shape[0]})"
+
+
 class TestFunction(Placeholder):
     """
     Generic variational test function.

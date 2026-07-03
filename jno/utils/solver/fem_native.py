@@ -531,6 +531,29 @@ def assemble_fem_native(
     neural_param_names, _neural_models = _neural.param_names, _neural.models
     _param_and_neural_exprs = neural_operator_exprs(_rt_param_exprs, _neural)
 
+    # Frozen fields (ui.freeze(values)): KNOWN nodal vectors whose value/gradient are delivered at the
+    # quad points (e.g. as neural-coefficient inputs). Collected once; their per-cell nodal slice is a
+    # compile-time constant gathered below and threaded via loc["frozen_fields"].
+    def _collect_frozen_fields(terms):
+        from ...trace import FrozenField
+        from .solver_helper import iter_children
+
+        found: Dict[Any, Any] = {}
+        seen: set = set()
+        stack = list(terms)
+        while stack:
+            n = stack.pop()
+            if id(n) in seen:
+                continue
+            seen.add(id(n))
+            if isinstance(n, FrozenField):
+                found[n.frozen_id] = n
+                continue
+            stack.extend(iter_children(n))
+        return found
+
+    _frozen_nodes = _collect_frozen_fields(list(volume_terms) + list(boundary_terms))
+
     # A trainable DIRICHLET VALUE ``u(region) - net(x)`` (an unknown boundary profile). The net is not an
     # integrand coefficient -- it is evaluated at the boundary NODES to form the Dirichlet lift -- so it is
     # collected here from ``dirichlet_raw`` (a bare net node; the front-end already rejected compound values)
@@ -628,6 +651,18 @@ def assemble_fem_native(
         loc_seg.append(loc_seg[-1] + n_local_f[i] * vecs[i])
     cell_all_dofs = jnp.concatenate(cdofs, axis=1) if len(cdofs) > 1 else cdofs[0]  # (n_cell, n_local_all)
 
+    # Per-cell gather of each frozen field's nodal slice (n_cell, n_local, 1) -- a compile-time constant
+    # (no args threading, no jacfwd tangent), gathered on the frozen field's own FE space via the same
+    # connectivity as the live state, so its shape-gradient contraction matches the trial gradient.
+    _frozen_gathered: Dict[Any, Any] = {}
+    for _fid, _fnode in _frozen_nodes.items():
+        _ffidx = field_index[_fnode.field_key]
+        if vecs[_ffidx] != 1:
+            raise NotImplementedError("ui.freeze(values): only scalar frozen fields are supported.")
+        _fconn = cells_f_j[_ffidx]  # (n_cell, n_local)
+        _fvals = jnp.asarray(_fnode.values).reshape(-1)
+        _frozen_gathered[_fid] = _fvals[_fconn].reshape(_fconn.shape[0], _fconn.shape[1], 1)
+
     def _split_cell_local(local_vals):
         """Split a cell's gathered all-field local vector into per-field ``(n_local_i, vec_i)``."""
         return [local_vals[loc_seg[i] : loc_seg[i + 1]].reshape(n_local_f[i], vecs[i]) for i in range(len(fields))]
@@ -702,6 +737,8 @@ def assemble_fem_native(
         _nt = neural_local_table(_neural, args)
         if _nt is not None:  # trainable nets ride args (crux weights); frozen/placeholder -> stored module
             loc["neural_coefficients"] = _nt
+        if _frozen_gathered:  # known-field (ui.freeze) per-cell nodal slices for this cell
+            loc["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
         return _integrate_term(domain, coeff, loc, qw_shared * meas)
 
     def _surf_elem_res(fi, local_all, bcoeff, btfi, region, t=0.0, args=None):
@@ -750,6 +787,8 @@ def assemble_fem_native(
         _nt = neural_local_table(_neural, args)
         if _nt is not None:
             loc["neural_coefficients"] = _nt
+        if _frozen_gathered:  # known-field (ui.freeze) per-cell nodal slices for the parent cell
+            loc["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
         return _integrate_term(domain, bcoeff, loc, face_w * jac_f)
 
     def _classify_one(coeff, where: str) -> List[Tuple[Any, int]]:

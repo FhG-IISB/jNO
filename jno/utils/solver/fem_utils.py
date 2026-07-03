@@ -21,6 +21,7 @@ from jax.flatten_util import ravel_pytree
 from ...trace import (
     BinaryOp,
     Constant,
+    FrozenField,
     FunctionCall,
     Hessian,
     Jacobian,
@@ -781,6 +782,22 @@ def _field_data(local, node):
     return fd["shape_vals"], fd["shape_grads"], fd["cell_sol"]
 
 
+def _frozen_cell_values(local, node):
+    """This cell's frozen nodal slice ``(n_local, vec)`` for a :class:`FrozenField`.
+
+    The native kernel gathers each frozen field's per-cell nodal values (a compile-time
+    constant -- no ``args`` threading, no ``jacfwd`` tangent) into
+    ``local["frozen_fields"][frozen_id]``; here we just read it back to interpolate the
+    known value / contract the known gradient with the field's shape data."""
+    table = local.get("frozen_fields")
+    if table is None or node.frozen_id not in table:
+        raise NotImplementedError(
+            "A frozen field (ui.freeze(values)) was used in a weak form assembled by a path that does "
+            "not thread frozen fields. It is currently wired for the native steady/linear volume path."
+        )
+    return table[node.frozen_id]
+
+
 def _field_hess(local, node):
     """Physical shape-function Hessian ``(n_quad, n_dof, dim, dim)`` for ``node``'s field, or ``None`` if
     its element does not tabulate second derivatives (only nodal Lagrange does). Mirrors :func:`_field_data`."""
@@ -945,6 +962,7 @@ def _eval_integrand(domain, node, local):
             Variable,
             TestFunction,
             TrialFunction,
+            FrozenField,
             Jacobian,
             Hessian,
             BinaryOp,
@@ -1059,6 +1077,19 @@ def _eval_integrand(domain, node, local):
             return flat_interp
         return _reshape_components_last(flat_interp, value_shape)
 
+    if isinstance(node, FrozenField):
+        # KNOWN field: interpolate its frozen nodal slice at the quad points, exactly like the
+        # TrialFunction value branch but with frozen values instead of the live cell solution.
+        if _field_space(local, node) != "Lagrange":
+            raise NotImplementedError("ui.freeze(values): frozen fields are supported for nodal Lagrange only.")
+        vals, _, _ = _field_data(local, node)
+        fz = _frozen_cell_values(local, node)  # (n_local, vec)
+        flat_interp = jnp.sum(vals[:, :, None] * fz[None, :, :], axis=1)
+        value_shape = getattr(node, "value_shape", ())
+        if len(value_shape) == 0:
+            return flat_interp
+        return _reshape_components_last(flat_interp, value_shape)
+
     if isinstance(node, Jacobian):
         dims = []
         for var in node.variables:
@@ -1086,6 +1117,22 @@ def _eval_integrand(domain, node, local):
             if len(comps) == 1:
                 return comps[0]
             return jnp.stack(comps, axis=-1)
+
+        if isinstance(node.target, FrozenField):
+            # gradient of a KNOWN field: contract the SAME physical shape gradients with the frozen
+            # nodal slice instead of the live cell solution (byte-identical to the TrialFunction case).
+            if _field_space(local, node.target) != "Lagrange":
+                raise NotImplementedError("ui.freeze(values): frozen-field gradients are nodal-Lagrange only.")
+            _, grads, _ = _field_data(local, node.target)
+            fz = _frozen_cell_values(local, node.target)  # (n_local, vec)
+            grad_list = [jnp.sum(grads[:, :, dim0 : dim0 + 1] * fz[None, :, :], axis=1) for dim0 in dims]
+            flat = grad_list[0] if len(dims) == 1 else jnp.stack(grad_list, axis=-1)
+            value_shape = getattr(node.target, "value_shape", ())
+            if len(value_shape) == 0:
+                return flat
+            if len(dims) == 1:
+                return _reshape_components_last(flat, value_shape)
+            return jnp.reshape(flat, flat.shape[:1] + tuple(value_shape) + (len(dims),))
 
         if isinstance(node.target, TrialFunction):
             _, grads, cell_sol = _field_data(local, node.target)

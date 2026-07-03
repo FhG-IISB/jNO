@@ -255,6 +255,21 @@ class ScalarView(_DelegatesToPlaceholder):
     # ``bind`` is a synonym — programming flavour, same semantics.
     bind = partials
 
+    def freeze(self, values) -> "ScalarView":
+        """Pin this field's DOFs to the known nodal array ``values`` (e.g. a precomputed
+        coarse solution). The returned view's value and ``.x`` / ``.y`` give that KNOWN
+        field's value / gradient at the quadrature points — usable as a neural-coefficient
+        input (``net(xi, yi, ui.freeze(u0).x, ui.freeze(u0).y)``) while the weak form stays
+        LINEAR in the live unknown. Coordinate bindings from ``.bind(x=, y=)`` are preserved,
+        so ``.x`` / ``.y`` keep working. See :class:`jno.trace.FrozenField`."""
+        from . import FrozenField
+
+        frozen = FrozenField(self._expr, values)
+        cv = getattr(self, "_coord_vars", None)
+        if cv:
+            return _coords_dispatch(ScalarView(frozen), (), dict(cv))
+        return ScalarView(frozen)
+
     # -- scalar operations --
     def abs(self) -> "ScalarView":
         return ScalarView(FunctionCall(jnp.abs, [self._expr], "abs"))

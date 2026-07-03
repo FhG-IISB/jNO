@@ -1197,3 +1197,52 @@ def test_scope_guards_fail_loud():
                 u2(ci[0], ci[1]) - psi0,
             ]
         )
+
+
+# ==========================================================================
+# frozen fields: ui.freeze(values) as a KNOWN predictor input to a coefficient
+# ==========================================================================
+
+
+def _mlp_net4(key=0, hidden=16, layers=2):
+    """A 4-input MLP: (x, y, d_x u0, d_y u0) -> scalar coefficient."""
+    net = jno.nn.wrap(
+        foundax.mlp(4, hidden_dims=hidden, num_layers=layers, activation=jax.nn.tanh, key=jax.random.PRNGKey(key))
+    )
+    net.dtype(jnp.float64)
+    return net
+
+
+def test_freeze_value_reproduces_the_field():
+    """``ui.freeze(u0)`` interpolates the KNOWN nodal vector u0 at the quad points: its L2 projection
+    back onto the same P1 space is u0 itself (u0 lives in the space), to machine precision."""
+    d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _poisson_setup(mesh_size=0.25)
+    # a known field: solve a plain Poisson problem for u0
+    u0 = np.asarray(jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0], quad_degree=3).solve()).reshape(-1)
+    # mass @ x = integral( freeze(u0) * v )  ->  x = L2 projection of u0 = u0
+    proj = jno.fem([ui * vi - ui.freeze(u0) * vi], quad_degree=3)
+    x = np.asarray(proj.solve(linear=jno.solve.lu())).reshape(-1)  # direct solve -> machine precision
+    assert proj.is_linear
+    assert np.linalg.norm(x - u0) / np.linalg.norm(u0) < 1e-11
+
+
+def test_freeze_gradient_conditioned_coefficient_is_linear_and_trains():
+    """A diffusion coefficient conditioned on a FROZEN predictor gradient,
+    ``kappa = softplus(net(x, y, ui.freeze(u0).x, ui.freeze(u0).y))``, stays LINEAR in the true
+    unknown (the frozen field is known data, not the unknown) and its weights train through the
+    differentiable solve (loss decreases)."""
+    d, u, phi, (xi, yi), (xb, yb), ui, vi, f = _poisson_setup(mesh_size=0.25)
+    u0 = np.asarray(jno.fem([ui.x * vi.x + ui.y * vi.y - f * vi, u(xb, yb) - 0.0], quad_degree=3).solve()).reshape(-1)
+    u_obs = u0.copy()  # target: recover the plain-Poisson solution (correction should shrink to ~0)
+
+    net = _mlp_net4()
+    net.optimizer(optax.adam(3e-3))
+    uk = ui.freeze(u0)
+    kappa = jnn.log1p(jnn.exp(net(xi, yi, uk.x, uk.y) - 4.0))  # softplus, small at init
+    fem = jno.fem([(1.0 + kappa) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
+    assert fem.is_linear, "a frozen-field-conditioned coefficient must keep the system linear"
+
+    crux = jno.core([(fem.solve() - u_obs).mse], domain=_DUMMY)
+    hist = crux.solve(200)
+    losses = np.asarray(hist.total_loss_history)
+    assert losses[-1] < 0.5 * losses[0], "frozen-conditioned coefficient weights should train through the solve"
