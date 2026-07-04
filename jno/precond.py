@@ -26,7 +26,10 @@ from __future__ import annotations
 
 import jax.numpy as jnp
 
-from .utils.solver.solver_api import PrecondContext  # noqa: F401  (re-export for user specs)
+from .utils.solver.solver_api import (  # noqa: F401  (PrecondContext re-exported for user specs)
+    PrecondApplier,
+    PrecondContext,
+)
 
 __all__ = ["PrecondContext", "jacobi", "chebyshev", "form", "inner", "block_diag", "triangular", "amg"]
 
@@ -38,7 +41,7 @@ class _Jacobi:
         d = ctx.diag()
         safe = jnp.where(jnp.abs(d) > 1e-30, d, 1.0)  # zero diagonals (saddle blocks) left unscaled
         inv = 1.0 / safe
-        return lambda v: inv * v
+        return PrecondApplier(lambda v: inv * v)  # diagonal => symmetric => M^T == M
 
     def __repr__(self):
         return "jno.precond.jacobi()"
@@ -65,7 +68,11 @@ class _Chebyshev:
             n = ctx.A.shape[0]
             hi = self.safety * power_iteration_bound(ctx.A.mv, n, iters=self.bound_iters)
         lo = self.lmin if self.lmin is not None else self.lmin_ratio * hi
-        return lambda v: chebyshev_apply(ctx.A.mv, v, lmin=lo, lmax=hi, degree=self.degree)
+        # A^T shares the spectrum of A, so the same [lo, hi] bounds the transpose recurrence.
+        return PrecondApplier(
+            lambda v: chebyshev_apply(ctx.A.mv, v, lmin=lo, lmax=hi, degree=self.degree),
+            lambda v: chebyshev_apply(ctx.A.T.mv, v, lmin=lo, lmax=hi, degree=self.degree),
+        )
 
     def __repr__(self):
         return f"jno.precond.chebyshev(degree={self.degree})"
@@ -112,7 +119,9 @@ class _Form:
 
             self.inner = _s.lu()
         solver = self.inner
-        return lambda v: solver(op, v)
+        # M^{-T} v ~ (Â^{-1})^T v = (Â^T)^{-1} v: run the same inner solver on the transposed
+        # auxiliary operator (for a symmetric Â -- e.g. a mass matrix -- op.T behaves like op).
+        return PrecondApplier(lambda v: solver(op, v), lambda v: solver(op.T, v))
 
     def __repr__(self):
         return f"jno.precond.form(<{len(self.terms)} terms>, inner={self.inner})"
@@ -152,7 +161,9 @@ class _InnerSolve:
 
     def materialize(self, ctx: PrecondContext):
         solver, op = self.solver, ctx.A
-        return lambda v: solver(op, v)
+        # transpose applier solves the transposed (sub-)operator, so a non-symmetric block gets a
+        # correctly-preconditioned adjoint solve (else reverse-mode stalls -- see PrecondApplier).
+        return PrecondApplier(lambda v: solver(op, v), lambda v: solver(op.T, v))
 
     def __repr__(self):
         return f"jno.precond.inner({self.solver})"
@@ -188,7 +199,14 @@ def _pairs_to_appliers(pairs, ctx: PrecondContext):
     appliers = []
     for idx in range(len(blocks)):
         sub_ctx = PrecondContext(ctx.sub(idx), ctx.fem)
-        appliers.append((blocks[idx], materialize_precond(resolved[idx], sub_ctx)))
+        m = materialize_precond(resolved[idx], sub_ctx)
+        # Normalize to a PrecondApplier so the block transpose paths (apply_T) always have `.T`.
+        # A bare-callable block precond (e.g. amg) has no structural transpose, so `.T` reuses M
+        # (M^T := M) — correct (a preconditioner never changes the converged solution), just not
+        # transpose-optimal, exactly the firewall's bare-callable fallback one level down.
+        if not isinstance(m, PrecondApplier):
+            m = PrecondApplier(m)
+        appliers.append((blocks[idx], m))
     return appliers
 
 
@@ -216,7 +234,13 @@ class _BlockDiag:
                 out = out.at[s].set(M(v[s]))
             return out
 
-        return apply
+        def apply_T(v):  # block-diagonal transpose = transpose each independent block
+            out = jnp.zeros_like(v)
+            for s, M in appliers:
+                out = out.at[s].set(M.T(v[s]))
+            return out
+
+        return PrecondApplier(apply, apply_T)
 
     def __repr__(self):
         return f"jno.precond.block_diag(<{len(self.pairs)} blocks>)"
@@ -248,7 +272,23 @@ class _Triangular:
                 out = out.at[s].set(y)
             return out
 
-        return apply
+        def apply_T(v):
+            # transpose of an upper-triangular P is lower-triangular P^T: FORWARD substitution
+            # with transposed diagonal blocks (M_i^T) and transposed couplings ((A_ji)^T = sub(j,i)^T):
+            #   y_i = M_i^{-T} (v_i - sum_{j<i} A_ji^T y_j)
+            ys = [None] * k
+            for i in range(k):
+                s, M = appliers[i]
+                r = v[s]
+                for j in range(i):
+                    r = r - subs[(j, i)].T.mv(ys[j])
+                ys[i] = M.T(r)
+            out = jnp.zeros_like(v)
+            for (s, _), y in zip(appliers, ys):
+                out = out.at[s].set(y)
+            return out
+
+        return PrecondApplier(apply, apply_T)
 
     def __repr__(self):
         return f"jno.precond.triangular(<{len(self.pairs)} blocks>)"
