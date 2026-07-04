@@ -58,6 +58,7 @@ def _plate_center_deflection(space, clamped, mesh_size=0.06):
     return float(w[np.argmin((pts[:, 0] - 0.5) ** 2 + (pts[:, 1] - 0.5) ** 2)])
 
 
+@pytest.mark.slow  # C¹ assembly peaks at ~12 GiB (Argyris ceiling) — OOMs the CI runner; runs on the push gate
 @pytest.mark.parametrize("space", ["Argyris", "Morley"])
 def test_clamped_vs_simply_supported_matches_timoshenko(space):
     """The reason the granular BC exists: `u(reg)-g` alone (simply-supported) must give a *different*, and

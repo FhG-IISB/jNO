@@ -2354,7 +2354,11 @@ class ModelCall(Placeholder):
 
     def __init__(self, model: Model, args: list):
         self.model = model
-        self.args = args
+        # Unwrap typed semantic views (``u.bind(...)``, ``ui.x``, …) to their traced Placeholder:
+        # a view delegates via ``__getattr__`` and is NOT a Placeholder subclass, so left wrapped it
+        # would be invisible to every tree walker (linearity/trial detection, coordinate retagging)
+        # and unevaluable by the evaluators — e.g. a constitutive-law coefficient ``net(ui)``.
+        self.args = [a._expr if (not isinstance(a, Placeholder) and hasattr(a, "_expr")) else a for a in args]
         self.op_id = _next_op_id()
 
     def __repr__(self):
@@ -3122,6 +3126,30 @@ class FemResidualOperator:
         )
 
 
+class ModelWeights(Placeholder):
+    """Evaluates to a :class:`Model`'s *current* equinox module (the live weight pytree).
+
+    A neural **coefficient** in an assembled FEM system (``jno.nn.wrap(net)`` called inside a weak
+    form, e.g. ``net(x, y) * u.dx * v.dx``) must reach the assembly kernel as its *weights*, not as
+    a call result: the kernel re-evaluates the network at the quadrature points itself, so the
+    solver needs the module pytree in its runtime ``args``. ``FemLinearSystem.solve`` (and the
+    nonlinear/transient counterparts) put a ``ModelWeights`` node in the ``fem_solve``
+    FunctionCall's params where a scalar parameter would put its zero-arg ``ModelCall``; the trace
+    evaluator resolves it to ``params[layer_id]`` — the trainable module crux recombines each step
+    — so gradients flow from the solve back into the network's weights.
+    """
+
+    def __init__(self, model: Model):
+        self.model = model
+        # ``target`` lets generic model-discovery walks (e.g. core's active-model scan, which
+        # falls back to ``.target``) reach the underlying Model without a dedicated branch.
+        self.target = model
+        self.op_id = _next_op_id()
+
+    def __repr__(self):
+        return f"ModelWeights({self.model})"
+
+
 class StateField(Placeholder):
     """Internal marker for the primary weak-form unknown.
 
@@ -3274,6 +3302,53 @@ class TrialFunction(Placeholder):
 
     def __repr__(self):
         return f"TrialFunction({self.name}, value_shape={self.value_shape})"
+
+
+class FrozenField(Placeholder):
+    """A field whose DOFs are *pinned* to a known nodal vector ``values`` (e.g. a
+    precomputed FE solution), produced by ``u.bind(...).freeze(values)``.
+
+    It carries the source field's identity (``field_key`` / ``value_shape`` / ``order``
+    / ``space``) so the kernel finds the right basis, and interpolates ``values`` at the
+    quadrature points -- its value and its gradient ``.x`` / ``.y`` are therefore concrete
+    KNOWN data. Because it is **not** a ``TrialFunction``, it is invisible to the
+    unknown-detection that routes nonlinear solves: a term like
+    ``softplus(net(xi, yi, ui.freeze(u0).x, ui.freeze(u0).y)) * (grad u . grad v)``
+    stays LINEAR in the true unknown ``u`` while conditioning the coefficient on the
+    known field ``u0`` (a predictor-corrector). No gradient flows into ``values``."""
+
+    def __init__(self, source, values):
+        self.name = f"frozen[{getattr(source, 'name', 'u')}]"
+        self.value_shape = tuple(getattr(source, "value_shape", ()))
+        self.order = int(getattr(source, "order", 1))
+        self.space = str(getattr(source, "space", "Lagrange"))
+        self.op_id = _next_op_id()
+        self.field_key = source.field_key  # share the source field's shape data
+        self.values = jnp.asarray(values).reshape(-1)  # global nodal vector (scalar field)
+        self.frozen_id = _next_op_id()  # kernel gather-table key
+
+    @property
+    def num_components(self) -> int:
+        n = 1
+        for s in self.value_shape:
+            n *= int(s)
+        return n
+
+    def _field_view(self):
+        n = len(self.value_shape)
+        if n == 0:
+            return self.scalar
+        if n == 1:
+            return self.vector
+        return self.matrix
+
+    def partials(self, **named_vars):
+        return self._field_view().partials(**named_vars)
+
+    bind = partials
+
+    def __repr__(self):
+        return f"FrozenField(source_key={self.field_key}, ndof={self.values.shape[0]})"
 
 
 class TestFunction(Placeholder):

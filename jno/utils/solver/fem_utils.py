@@ -21,6 +21,7 @@ from jax.flatten_util import ravel_pytree
 from ...trace import (
     BinaryOp,
     Constant,
+    FrozenField,
     FunctionCall,
     Hessian,
     Jacobian,
@@ -781,6 +782,22 @@ def _field_data(local, node):
     return fd["shape_vals"], fd["shape_grads"], fd["cell_sol"]
 
 
+def _frozen_cell_values(local, node):
+    """This cell's frozen nodal slice ``(n_local, vec)`` for a :class:`FrozenField`.
+
+    The native kernel gathers each frozen field's per-cell nodal values (a compile-time
+    constant -- no ``args`` threading, no ``jacfwd`` tangent) into
+    ``local["frozen_fields"][frozen_id]``; here we just read it back to interpolate the
+    known value / contract the known gradient with the field's shape data."""
+    table = local.get("frozen_fields")
+    if table is None or node.frozen_id not in table:
+        raise NotImplementedError(
+            "A frozen field (ui.freeze(values)) was used in a weak form assembled by a path that does "
+            "not thread frozen fields. It is currently wired for the native steady/linear volume path."
+        )
+    return table[node.frozen_id]
+
+
 def _field_hess(local, node):
     """Physical shape-function Hessian ``(n_quad, n_dof, dim, dim)`` for ``node``'s field, or ``None`` if
     its element does not tabulate second derivatives (only nodal Lagrange does). Mirrors :func:`_field_data`."""
@@ -852,6 +869,79 @@ def _eval_frozen_coefficient(domain, model, local):
     )
 
 
+def _call_neural_coefficient(model, module, arg_vals, local):
+    """Evaluate one neural coefficient (``jno.nn.wrap(net)`` inside a weak form) at the quad points.
+
+    ``arg_vals`` are the network's arguments already evaluated by ``_eval_integrand`` — coordinate
+    Variables arrive as ``(n_quad, 1)`` slices of the physical quadrature points, an interpolated
+    trial value as ``(n_quad, c)``, its gradient as ``(n_quad, len(dims))`` — so ``k(x)``, ``k(u)``
+    and ``k(∇u)`` all share this call. Everything is normalised to a ``(n_quad, feat)`` batch (the
+    same convention as the point-cloud evaluator ``TraceEvaluator._eval_flax_module_call``, which
+    foundax MLPs concatenate internally), cast to the model's explicit ``.dtype`` opt-in when set,
+    and the network output is returned as ``(n_quad, k)`` — the shape a nodal field parameter
+    returns, so it composes with test-expanded factors via ``_prefix_align`` identically.
+
+    ``module`` is the *current* weight pytree threaded through the runtime ``args`` (a
+    ``ModelWeights`` slot), so under ``jax.jacfwd`` w.r.t. the cell DOFs a trial-dependent argument
+    carries tangents straight through the network — ∂k(u)/∂u enters the element Jacobian
+    automatically — and under the outer training loop the weights are the crux-recombined
+    trainable leaves, so gradients reach the optimizer.
+
+    Neural-coefficient support follows the unsupervised coefficient/constitutive-recovery setting
+    of NN-EUCLID (M. Flaschel, S. Kumar, L. De Lorenzis, "NN-EUCLID: Deep-learning hyperelasticity
+    without stress data", J. Mech. Phys. Solids 165 (2022) 105076, §2.2–2.3) and Tartakovsky et
+    al., "Learning Parameters and Constitutive Relationships with Physics-Informed Deep Neural
+    Networks" (Water Resour. Res. 56, 2020, §2).
+    """
+    n_quad = int(local["physical_quad_points"].shape[0])
+
+    def _as_quad_batch(v):
+        v = jnp.asarray(v)
+        if v.ndim == 0:
+            return jnp.broadcast_to(v.reshape(1, 1), (n_quad, 1))
+        if v.ndim == 1:
+            if v.shape[0] == n_quad:
+                return v.reshape(n_quad, 1)
+            if v.shape[0] == 1:
+                return jnp.broadcast_to(v.reshape(1, 1), (n_quad, 1))
+        if v.ndim == 2 and v.shape[0] == n_quad:
+            return v
+        if v.ndim == 2 and v.shape[0] == 1:
+            return jnp.broadcast_to(v, (n_quad, v.shape[1]))
+        raise NotImplementedError(
+            "jno.fem: a neural coefficient's arguments must be per-quad-point values (coordinates, "
+            f"the trial or its derivatives, scalars); got an argument of shape {v.shape}. A test "
+            "function cannot appear inside a network argument."
+        )
+
+    vals = [_as_quad_batch(v) for v in arg_vals]
+
+    # Mixed precision: honour an explicit Model.dtype() opt-in exactly like the point evaluator —
+    # cast floating inputs so the net computes in its declared dtype; a plain-f32 net under x64
+    # promotes through the surrounding arithmetic instead.
+    compute_dtype = getattr(model, "_dtype", None)
+    if compute_dtype is not None:
+        vals = [
+            v.astype(compute_dtype) if jnp.issubdtype(v.dtype, jnp.floating) and v.dtype != compute_dtype else v
+            for v in vals
+        ]
+
+    out = module(*vals)
+    if hasattr(out, "output"):  # structured foundation-model outputs
+        out = out.output
+    out = jnp.asarray(out)
+    if out.ndim == 0:
+        return jnp.broadcast_to(out.reshape(1, 1), (n_quad, 1))
+    if out.ndim == 1 and out.shape[0] == n_quad:
+        return out.reshape(n_quad, 1)
+    if out.ndim == 2 and out.shape[0] == n_quad:
+        return out
+    raise NotImplementedError(
+        f"jno.fem: a neural coefficient must return one value (or a feature vector) per quadrature "
+        f"point — got output shape {out.shape} for {n_quad} quad points."
+    )
+
+
 def _eval_integrand(domain, node, local):
     """
     Evaluate a jNO symbolic expression inside a local kernel.
@@ -872,6 +962,7 @@ def _eval_integrand(domain, node, local):
             Variable,
             TestFunction,
             TrialFunction,
+            FrozenField,
             Jacobian,
             Hessian,
             BinaryOp,
@@ -986,6 +1077,19 @@ def _eval_integrand(domain, node, local):
             return flat_interp
         return _reshape_components_last(flat_interp, value_shape)
 
+    if isinstance(node, FrozenField):
+        # KNOWN field: interpolate its frozen nodal slice at the quad points, exactly like the
+        # TrialFunction value branch but with frozen values instead of the live cell solution.
+        if _field_space(local, node) != "Lagrange":
+            raise NotImplementedError("ui.freeze(values): frozen fields are supported for nodal Lagrange only.")
+        vals, _, _ = _field_data(local, node)
+        fz = _frozen_cell_values(local, node)  # (n_local, vec)
+        flat_interp = jnp.sum(vals[:, :, None] * fz[None, :, :], axis=1)
+        value_shape = getattr(node, "value_shape", ())
+        if len(value_shape) == 0:
+            return flat_interp
+        return _reshape_components_last(flat_interp, value_shape)
+
     if isinstance(node, Jacobian):
         dims = []
         for var in node.variables:
@@ -1013,6 +1117,22 @@ def _eval_integrand(domain, node, local):
             if len(comps) == 1:
                 return comps[0]
             return jnp.stack(comps, axis=-1)
+
+        if isinstance(node.target, FrozenField):
+            # gradient of a KNOWN field: contract the SAME physical shape gradients with the frozen
+            # nodal slice instead of the live cell solution (byte-identical to the TrialFunction case).
+            if _field_space(local, node.target) != "Lagrange":
+                raise NotImplementedError("ui.freeze(values): frozen-field gradients are nodal-Lagrange only.")
+            _, grads, _ = _field_data(local, node.target)
+            fz = _frozen_cell_values(local, node.target)  # (n_local, vec)
+            grad_list = [jnp.sum(grads[:, :, dim0 : dim0 + 1] * fz[None, :, :], axis=1) for dim0 in dims]
+            flat = grad_list[0] if len(dims) == 1 else jnp.stack(grad_list, axis=-1)
+            value_shape = getattr(node.target, "value_shape", ())
+            if len(value_shape) == 0:
+                return flat
+            if len(dims) == 1:
+                return _reshape_components_last(flat, value_shape)
+            return jnp.reshape(flat, flat.shape[:1] + tuple(value_shape) + (len(dims),))
 
         if isinstance(node.target, TrialFunction):
             _, grads, cell_sol = _field_data(local, node.target)
@@ -1111,7 +1231,12 @@ def _eval_integrand(domain, node, local):
         raise NotImplementedError(f"Unsupported binary operator: {node.op}")
 
     if isinstance(node, ModelCall):
-        from .parametric_helpers import _is_frozen_parameter, _is_runtime_scalar_parameter, _parameter_name
+        from .parametric_helpers import (
+            _is_frozen_parameter,
+            _is_runtime_scalar_parameter,
+            _neural_coefficient_name,
+            _parameter_name,
+        )
 
         if _is_frozen_parameter(node):
             # A .freeze()d (known) coefficient: evaluate its constant / coordinate function at the
@@ -1128,8 +1253,21 @@ def _eval_integrand(domain, node, local):
                     "into InternalVars.volume_vars."
                 )
             return val
-        # Non-parameter ModelCall (e.g. a neural coefficient) -> not handled here.
-        raise NotImplementedError("the kernel cannot evaluate non-parameter ModelCall coefficients yet.")
+        # Neural coefficient (``jno.nn.wrap(net)`` called inside the weak form): the assembler
+        # threads a {name: module} table into ``local`` (trainable modules arrive through the
+        # runtime ``args``; frozen ones fall back to their stored weights) and the network is
+        # (re-)evaluated here on its kernel-evaluated arguments at the quadrature points.
+        neural_modules = local.get("neural_coefficients")
+        if neural_modules is not None:
+            module = neural_modules.get(_neural_coefficient_name(node))
+            if module is not None:
+                arg_vals = [_eval_integrand(domain, a, local) for a in node.args]
+                return _call_neural_coefficient(node.model, module, arg_vals, local)
+        raise NotImplementedError(
+            "jno.fem: a neural coefficient (jno.nn.wrap(net) inside the weak form) is supported on the "
+            "native 2D/3D Lagrange assembler (single or coupled) and the scalar C¹ non-nodal families "
+            "(Argyris/Morley/Hermite) — this assembly path does not thread network weights yet."
+        )
 
     if isinstance(node, FunctionCall):
         args = [_eval_integrand(domain, arg, local) for arg in node.args]

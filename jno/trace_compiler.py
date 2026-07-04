@@ -39,6 +39,7 @@ from .trace import (
     Jacobian,
     Model,
     ModelCall,
+    ModelWeights,
     NetworkGradient,
     OperationCall,
     OperationDef,
@@ -367,6 +368,11 @@ class TraceCompiler:
                 if flax_mod.layer_id not in seen:
                     seen.add(flax_mod.layer_id)
                     layers.append((flax_mod, node.args))
+
+            elif isinstance(node, ModelWeights):
+                # A neural FEM coefficient: the solve node references the model's weights (not a
+                # call), so register the Model itself — that is what makes it trainable.
+                visit(node.model)
 
             elif isinstance(node, Choice):
                 for opt in node.options:
