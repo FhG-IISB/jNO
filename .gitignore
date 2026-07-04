@@ -48,3 +48,5 @@ whitepapers/
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+.coverage
+coverage.xml

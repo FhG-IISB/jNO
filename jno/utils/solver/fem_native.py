@@ -515,6 +515,64 @@ def assemble_fem_native(
             _collect_runtime_parameter_exprs(bare, _rt_param_exprs)
     runtime_parameter_tags: Tuple[str, ...] = tuple(sorted(_rt_param_exprs))
     _field_param_names: set = {n for n, expr in _rt_param_exprs.items() if _is_fem_field_parameter(expr)}
+
+    # Neural coefficients (``jno.nn.wrap(net)`` called inside the weak form, e.g. ``net(x,y)*u.dx*v.dx``).
+    # Unlike scalar/nodal parameters they never enter the per-cell ``volume_vars`` -- a weight pytree is
+    # cell-independent -- the kernel instead re-evaluates the network at the quad points from the
+    # {name: module} table (``neural_local_table``) threaded via ``loc["neural_coefficients"]``. A neural
+    # coefficient needs NO per-field resolution (unlike a nodal FIELD parameter, which gathers on one
+    # field's mesh): the net is evaluated at the shared physical quad points, and a trial-input
+    # ``net(u_i)`` resolves its field through ``_field_data`` (op_id/field_key) inside the kernel -- so a
+    # coupled (multi-field) form threads it unchanged. The collect / crux-delivery / kernel-table
+    # mechanism lives in ``parametric_helpers`` (shared with the non-nodal assembler).
+    from .parametric_helpers import collect_neural_slots, neural_local_table, neural_operator_exprs
+
+    _neural = collect_neural_slots(volume_terms, boundary_terms, runtime_parameter_tags=runtime_parameter_tags)
+    neural_param_names, _neural_models = _neural.param_names, _neural.models
+    _param_and_neural_exprs = neural_operator_exprs(_rt_param_exprs, _neural)
+
+    # Frozen fields (ui.freeze(values)): KNOWN nodal vectors whose value/gradient are delivered at the
+    # quad points (e.g. as neural-coefficient inputs). Collected once; their per-cell nodal slice is a
+    # compile-time constant gathered below and threaded via loc["frozen_fields"].
+    def _collect_frozen_fields(terms):
+        from ...trace import FrozenField
+        from .solver_helper import iter_children
+
+        found: Dict[Any, Any] = {}
+        seen: set = set()
+        stack = list(terms)
+        while stack:
+            n = stack.pop()
+            if id(n) in seen:
+                continue
+            seen.add(id(n))
+            if isinstance(n, FrozenField):
+                found[n.frozen_id] = n
+                continue
+            stack.extend(iter_children(n))
+        return found
+
+    _frozen_nodes = _collect_frozen_fields(list(volume_terms) + list(boundary_terms))
+
+    # A trainable DIRICHLET VALUE ``u(region) - net(x)`` (an unknown boundary profile). The net is not an
+    # integrand coefficient -- it is evaluated at the boundary NODES to form the Dirichlet lift -- so it is
+    # collected here from ``dirichlet_raw`` (a bare net node; the front-end already rejected compound values)
+    # and joins ``_param_and_neural_exprs`` as its own ``ModelWeights`` slot. The lift is (re-)built from the
+    # runtime args in ``_dirichlet_pairs_at`` so ``∂b/∂weights`` flows through the solve.
+    from ..._fem import _bare as _bare_node
+    from ...trace import ModelWeights
+    from .parametric_helpers import _is_neural_coefficient, _neural_coefficient_name
+
+    _dir_net_models: Dict[str, Any] = {}
+    for _fk, _rg, _comp, _val, _vnode in dirichlet_raw:
+        _vn = _bare_node(_vnode) if _vnode is not None else None
+        if _vn is not None and _is_neural_coefficient(_vn):
+            _dir_net_models[_neural_coefficient_name(_vn)] = _vn.model
+    if _dir_net_models:
+        _param_and_neural_exprs = {
+            **_param_and_neural_exprs,
+            **{n: ModelWeights(m) for n, m in _dir_net_models.items()},
+        }
     # A nodal FIELD parameter k(x) interpolates on one field's FE space. Single field -> field 0. For a
     # coupled (multi-field) problem, associate it with the field whose test function appears in the
     # term(s) that reference it (e.g. mu(x)*(grad u . grad v) -> the velocity field), so its nodal values
@@ -593,6 +651,18 @@ def assemble_fem_native(
         loc_seg.append(loc_seg[-1] + n_local_f[i] * vecs[i])
     cell_all_dofs = jnp.concatenate(cdofs, axis=1) if len(cdofs) > 1 else cdofs[0]  # (n_cell, n_local_all)
 
+    # Per-cell gather of each frozen field's nodal slice (n_cell, n_local, 1) -- a compile-time constant
+    # (no args threading, no jacfwd tangent), gathered on the frozen field's own FE space via the same
+    # connectivity as the live state, so its shape-gradient contraction matches the trial gradient.
+    _frozen_gathered: Dict[Any, Any] = {}
+    for _fid, _fnode in _frozen_nodes.items():
+        _ffidx = field_index[_fnode.field_key]
+        if vecs[_ffidx] != 1:
+            raise NotImplementedError("ui.freeze(values): only scalar frozen fields are supported.")
+        _fconn = cells_f_j[_ffidx]  # (n_cell, n_local)
+        _fvals = jnp.asarray(_fnode.values).reshape(-1)
+        _frozen_gathered[_fid] = _fvals[_fconn].reshape(_fconn.shape[0], _fconn.shape[1], 1)
+
     def _split_cell_local(local_vals):
         """Split a cell's gathered all-field local vector into per-field ``(n_local_i, vec_i)``."""
         return [local_vals[loc_seg[i] : loc_seg[i + 1]].reshape(n_local_f[i], vecs[i]) for i in range(len(fields))]
@@ -664,6 +734,11 @@ def assemble_fem_native(
             # functions (field 0 single-field; the resolved field for a coupled problem).
             # _runtime_parameter_value_from_internal_vars reads this top-level shape_vals.
             loc["shape_vals"] = per[_field_param_field_idx]["shape_vals"]
+        _nt = neural_local_table(_neural, args)
+        if _nt is not None:  # trainable nets ride args (crux weights); frozen/placeholder -> stored module
+            loc["neural_coefficients"] = _nt
+        if _frozen_gathered:  # known-field (ui.freeze) per-cell nodal slices for this cell
+            loc["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
         return _integrate_term(domain, coeff, loc, qw_shared * meas)
 
     def _surf_elem_res(fi, local_all, bcoeff, btfi, region, t=0.0, args=None):
@@ -709,6 +784,11 @@ def assemble_fem_native(
         }
         if _field_param_names:
             loc["shape_vals"] = per_f[_field_param_field_idx]["shape_vals"]
+        _nt = neural_local_table(_neural, args)
+        if _nt is not None:
+            loc["neural_coefficients"] = _nt
+        if _frozen_gathered:  # known-field (ui.freeze) per-cell nodal slices for the parent cell
+            loc["frozen_fields"] = {fid: g[c] for fid, g in _frozen_gathered.items()}
         return _integrate_term(domain, bcoeff, loc, face_w * jac_f)
 
     def _classify_one(coeff, where: str) -> List[Tuple[Any, int]]:
@@ -916,6 +996,9 @@ def assemble_fem_native(
             fidx = field_index.get(field_key)
             if fidx is None:
                 continue
+            _vn = _bare_node(value_node) if value_node is not None else None
+            if _vn is not None and _is_neural_coefficient(_vn):
+                continue  # a net-valued Dirichlet is (re-)built per args in _dirichlet_pairs_at
             vt = vecs[fidx]
             pts_all = pts_f_all[fidx]
             for nid in _boundary_node_ids(fidx, region):
@@ -933,6 +1016,32 @@ def assemble_fem_native(
         # Expose the (dof, value) pairs for callers that compose their own system from native blocks
         # (e.g. the second-order-in-time augmented [u, v] block applies them to the 2N system itself).
         domain._fem_native_dirichlet_pairs = pairs
+        return pairs
+
+    def _dirichlet_pairs_at(args):
+        """Dirichlet ``(dof, value)`` pairs with the net-valued profiles evaluated from the runtime
+        ``args`` (an unknown BC ``u(region) - net(x)``): the net is called on the region's boundary-node
+        coordinates, so the value stays a differentiable JAX scalar and ``∂b/∂weights`` flows through the
+        symmetric elimination. Non-net conditions reuse the concrete ``_build_dirichlet_pairs`` values."""
+        a = args or {}
+        pairs = list(_build_dirichlet_pairs())  # concrete (non-net) conditions
+        for field_key, region, comp, value, value_node in dirichlet_raw:
+            fidx = field_index.get(field_key)
+            if fidx is None:
+                continue
+            _vn = _bare_node(value_node) if value_node is not None else None
+            if _vn is None or not _is_neural_coefficient(_vn):
+                continue
+            vt = vecs[fidx]
+            pts_all = np.asarray(pts_f_all[fidx])
+            node_ids = _boundary_node_ids(fidx, region)
+            module = a.get(_neural_coefficient_name(_vn), _vn.model.module)
+            coords = jnp.asarray(pts_all[np.asarray(node_ids, dtype=np.int64)])  # (n_bnodes, dim)
+            n_in = len(_vn.args)  # net(xb, yb[, zb]) -> per-coordinate columns (foundax MLP arity)
+            gvals = jnp.asarray(module(*[coords[:, i : i + 1] for i in range(n_in)])).reshape(-1)
+            for i, nid in enumerate(node_ids):
+                for c in range(vt) if comp is None else [int(comp)]:
+                    pairs.append((offs[fidx] + nid * vt + c, gvals[i]))
         return pairs
 
     def _build_dirichlet_tv_entries():
@@ -980,6 +1089,11 @@ def assemble_fem_native(
 
     # === transient (Mu̇ + Au = c or M u̇ + R(u) = 0) ===
     if ic_residuals or any(_contains_temporal_derivative(t) for t in all_terms):
+        if _dir_net_models:
+            raise NotImplementedError(
+                "jno.fem: a net-valued Dirichlet u(region) - net(x) in a *transient* form is not supported yet "
+                "(the Dirichlet lift is assembled once). Use a steady form."
+            )
         from ..._fem import _bare, _essential_spec, _eval_value_node_at, _field_key_of
         from .backend_blocks import SemidiscreteTimeBlock
         from .time_route import _infer_time_window, _strip_temporal_trial_derivative
@@ -994,10 +1108,22 @@ def assemble_fem_native(
                 "jno.fem (native): an initial condition was provided but no temporal term "
                 "(e.g. ``inner(u.t, v)``) was found in the volume weak form."
             )
+        # A trainable net on the u̇ term. A COORDINATE ``net(x)`` (an unknown density ``rho(x)*u_t``) keeps
+        # the mass a *matrix* -- just parametric in the weights -- so it is re-assembled from ``args`` each
+        # step (``mass_fn`` below). A SOLUTION-DEPENDENT ``net(u)`` would make the mass itself nonlinear
+        # (``C(u)*u_t``), which the semidiscrete matrix form cannot express -- reject that.
+        _parametric_mass = collect_neural_slots(temporal).any_trainable
+        if _parametric_mass and any(_is_obviously_nonlinear_in_unknown(domain, t) for t in temporal):
+            raise NotImplementedError(
+                "jno.fem (native): a solution-dependent neural coefficient net(u) on the mass (u_t) term is a "
+                "nonlinear mass C(u)*u_t, which the semidiscrete matrix form cannot express. A coordinate "
+                "net(x) mass coefficient (an unknown density) is supported."
+            )
 
         mass_terms = [_strip_temporal_trial_derivative(t) for t in temporal]
         # Mass matrix: volume only (no boundary); spatial residual: volume + boundary
-        M = _make_jacobian(mass_terms)(zeros)
+        _mass_jac = _make_jacobian(mass_terms)
+        M = _mass_jac(zeros)
         spatial_res = _make_residual(spatial, boundary_terms)
         spatial_jac = _make_jacobian(spatial, boundary_terms)
 
@@ -1047,6 +1173,13 @@ def assemble_fem_native(
         d_dofs = jnp.asarray([p[0] for p in dirichlet_pairs], dtype=jnp.int32) if dirichlet_pairs else None
         d_vals = jnp.asarray([p[1] for p in dirichlet_pairs], dtype=zeros.dtype) if dirichlet_pairs else None
 
+        # Parametric mass ``mass_fn(t, args)`` (unknown density net(x)*u_t): re-assemble M from args each
+        # step with the Dirichlet rows/cols zeroed (a constrained DOF carries no time derivative). ``None``
+        # keeps the static ``M_bc`` for a non-parametric mass.
+        def _mass_cb(t, args=None, _d=d_dofs):
+            Mt = _mass_jac(zeros, t, args)
+            return Mt if _d is None else bcoo_zero_rows_cols(Mt, _d)
+
         nonlinear = any(_is_obviously_nonlinear_in_unknown(domain, t) for t in spatial)
         if nonlinear:
             # Row-replacement Dirichlet (constant g), threaded through the runtime time t AND the
@@ -1062,10 +1195,10 @@ def assemble_fem_native(
             M_bc = M if d_dofs is None else bcoo_zero_rows_cols(M, d_dofs)
             return (
                 SemidiscreteTimeBlock(
-                    mass=lambda t, args=None, _M=M_bc: _M,
+                    mass=_mass_cb if _parametric_mass else (lambda t, args=None, _M=M_bc: _M),
                     residual=res_bc,
                     jacobian=jac_bc,
-                    runtime_parameter_exprs=dict(_rt_param_exprs),
+                    runtime_parameter_exprs=dict(_param_and_neural_exprs),
                     **common,
                 ),
                 "transient",
@@ -1075,7 +1208,7 @@ def assemble_fem_native(
         # ---- linear parametric transient: the operator A(t, args) is re-evaluated each step.
         # Row-replacement Dirichlet (rows -> identity, columns kept) needs no args-dependent lift --
         # the coupling to the held Dirichlet value sits on the LHS, the constant g in the affine bias. ----
-        if runtime_parameter_tags:
+        if runtime_parameter_tags or neural_param_names:
             M_bc = M if d_dofs is None else bcoo_zero_rows_cols(M, d_dofs)
             c_bias = zeros if d_dofs is None else zeros.at[d_dofs].set(d_vals)
             free_mask = jnp.ones((total,), dtype=zeros.dtype)
@@ -1092,13 +1225,17 @@ def assemble_fem_native(
             return (
                 SemidiscreteTimeBlock(
                     M=M_bc,
+                    mass_fn=_mass_cb if _parametric_mass else None,  # parametric mass (unknown density net(x)*u_t)
                     operator_fn=operator_fn,
                     affine_bias=c_bias,
                     forcing_vector_fn=forcing_vector_fn,
-                    runtime_parameter_exprs=dict(_rt_param_exprs),
+                    runtime_parameter_exprs=dict(_param_and_neural_exprs),
                     # The operator is re-assembled at each (t, args) -- a general (non-affine) operator,
                     # so it covers a parameter inside a nonlinear coefficient (e.g. exp(logk)) too.
-                    metadata={"runtime_parameter_names": list(runtime_parameter_tags), "nonaffine_operator": True},
+                    metadata={
+                        "runtime_parameter_names": list(runtime_parameter_tags) + list(neural_param_names),
+                        "nonaffine_operator": True,
+                    },
                     **common,
                 ),
                 "transient",
@@ -1168,10 +1305,15 @@ def assemble_fem_native(
     # each call, kept differentiable in args -- the parameter flows as a JAX array through the kernel
     # coefficient into the per-cell assembly (no float() cast). The same re-assembly handles affine,
     # non-affine and (scalar) parameters uniformly. ----
-    if runtime_parameter_tags:
+    if runtime_parameter_tags or neural_param_names or _dir_net_models:
         from ...trace import FemLinearSystem
 
         if nonlinear:
+            if _dir_net_models:
+                raise NotImplementedError(
+                    "jno.fem: a net-valued Dirichlet u(region) - net(x) on a *nonlinear* form is not wired yet "
+                    "(the row-replacement Dirichlet uses a static value). Use a linear form."
+                )
 
             def res_p(u, args=None, _d=s_d_dofs, _g=s_d_vals):
                 R = residual(jnp.asarray(u), 0.0, args)
@@ -1182,7 +1324,7 @@ def assemble_fem_native(
                 return J if _d is None else bcoo_set_dirichlet_rows(J, _d)
 
             return (
-                FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_rt_param_exprs)),
+                FemResidualOperator(res_p, jac_p, total, runtime_parameter_exprs=dict(_param_and_neural_exprs)),
                 "nonlinear",
                 offs,
             )
@@ -1190,17 +1332,24 @@ def assemble_fem_native(
         def _assemble_at(args):
             A = jacobian(zeros, 0.0, args)
             b = -residual(zeros, 0.0, args)
-            if dirichlet_pairs:
-                A, b = _apply_dirichlet_symmetric(A, b, dirichlet_pairs)
+            # a net-valued Dirichlet re-forms the lift from args each call; otherwise the static pairs.
+            pairs = _dirichlet_pairs_at(args) if _dir_net_models else dirichlet_pairs
+            if pairs:
+                A, b = _apply_dirichlet_symmetric(A, b, pairs)
             return A, b
 
-        a0, b0 = _assemble_at({n: 0.0 for n in runtime_parameter_tags})  # static placeholder for .A/.b
+        # Static placeholder for .A/.b: scalar params at 0, networks (coefficient + Dirichlet) at stored weights.
+        a0, b0 = _assemble_at(
+            {n: 0.0 for n in runtime_parameter_tags}
+            | {n: _neural_models[n].module for n in neural_param_names}
+            | {n: m.module for n, m in _dir_net_models.items()}
+        )
         op = FemLinearSystem(
             a0,
             b0,
             operator_fn=lambda args=None: _assemble_at(args)[0],
             rhs_fn=lambda args=None: _assemble_at(args)[1],
-            runtime_parameter_exprs=dict(_rt_param_exprs),
+            runtime_parameter_exprs=dict(_param_and_neural_exprs),
             # The native parametric path re-assembles the operator at each args (it builds no affine
             # parameter basis), so every runtime parameter -- affine or not -- takes the re-assembly route.
             metadata={"nonaffine_operator": True},

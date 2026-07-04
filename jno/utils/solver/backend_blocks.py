@@ -144,6 +144,11 @@ class SemidiscreteTimeBlock:
     # For the heat inverse example:
     #     A(t, args) = A0 + args["nu"] * K
     operator_fn: Optional[Callable] = None
+    # Optional runtime callback for a PARAMETRIC MASS ``mass_fn(t, args) -> M(t, args)`` on the *linear*
+    # path (e.g. an unknown density ``rho(x)*u_t`` recovered from a trajectory). ``M`` stays as the static
+    # placeholder (``.M`` / ``represents_linear``); when ``mass_fn`` is set the step re-assembles the mass
+    # from ``args`` each step, so ``∂/∂args`` flows through the mass as well as the operator.
+    mass_fn: Optional[Callable] = None
     # Diagnostic payload generated during symbolic lowering.
     runtime_parameter_exprs: Dict[str, Any] = field(default_factory=dict)
     operator_basis: Dict[str, Any] = field(default_factory=dict)
@@ -243,7 +248,9 @@ class SemidiscreteTimeBlock:
         from .linear import matrix_diagonal
 
         th = theta if theta is not None else (float(self.metadata.get("theta", 1.0)) if self.metadata else 1.0)
-        M = _operand(self.M)
+        # A parametric mass (``mass_fn``) is re-assembled from ``args`` each step (unknown-density inverse);
+        # otherwise the static ``self.M``.
+        M = _operand(self.mass_fn(t_next, args) if self.mass_fn is not None else self.M)
         n = M.shape[0]
         c = jnp.zeros((n,), dtype) if self.affine_bias is None else jnp.asarray(self.affine_bias, dtype).reshape(-1)
         A = _operand(self.operator_fn(t_next, args) if self.operator_fn is not None else self.A)

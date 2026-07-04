@@ -178,6 +178,8 @@ nav:
       - Additive Manufacturing (laser thermo-mechanics): tutorials/08-fem-and-varpinns/am-laser-thermomechanics-2d.md
       - Poroelastic Consolidation (Biot): tutorials/08-fem-and-varpinns/poroelastic-consolidation-2d.md
       - Inverse Diffusivity Field: tutorials/08-fem-and-varpinns/inverse-diffusivity-field.md
+      - Inverse Neural Diffusivity: tutorials/08-fem-and-varpinns/inverse-neural-diffusivity-2d.md
+      - Learn Constitutive Law k(T): tutorials/08-fem-and-varpinns/learn-constitutive-law-2d.md
       - Inverse Conductivity (L-shape): tutorials/08-fem-and-varpinns/inverse-conductivity-lshape.md
       - Transient Inverse (Rate): tutorials/08-fem-and-varpinns/transient-inverse-heat.md
       - "Inverse Plate Stiffness (4th-order field)": tutorials/08-fem-and-varpinns/inverse-plate-stiffness-2d.md

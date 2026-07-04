@@ -703,6 +703,96 @@ k = jno.np.parameter(phi, name="k")                       # P1 field, one DOF pe
 crux = jno.core([(fem.solve() - u_obs).mse, 1e-3 * k.regularize("h1seminorm").mean], domain=obs)
 ```
 
+### Neural coefficients — `jno.nn.wrap(net)` inside the weak form
+
+A network called inside a weak form is a trainable **coefficient** on an assembled FE system —
+mesh-independent (remeshing never touches the weights), smooth by architecture, and trained
+through the same differentiable `fem.solve()` as any parameter:
+
+```python
+net = jno.nn.wrap(foundax.mlp(2, hidden_dims=16, num_layers=2,
+                              activation=jax.nn.tanh, key=key))
+net.dtype(jnp.float64)                                       # match the f64 assembly
+net.optimizer(optax.adam(1e-2))
+
+# k(x) = 1 + net(x, y): the offset keeps A(θ) nonsingular at the (near-zero) net init
+fem = jno.fem([(1.0 + net(xi, yi)) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
+crux = jno.core([(fem.solve() - u_obs).mse], domain=obs).solve(600)   # trains the weights
+```
+
+The kernel re-evaluates the network at the quadrature points during every re-assembly, so the
+coefficient is *not* interpolated on the mesh (unlike the P1 nodal field above) — it composes
+with scalar/nodal parameters in one weak form, with per-region masks, vector trials, and surface
+(Robin/Neumann) terms. `net.freeze()` makes it a **known** network coefficient (evaluated from
+its stored weights; the system stays non-parametric). The role is decided by the constraints: a
+weak form whose trial is a *real* FE symbol makes the network a coefficient; a network written
+*in place of* the trial is a VPINN (see the VPINN section).
+
+This is the unsupervised coefficient-recovery setting of NN-EUCLID (M. Flaschel, S. Kumar,
+L. De Lorenzis, *NN-EUCLID: Deep-learning hyperelasticity without stress data*, J. Mech. Phys.
+Solids 165 (2022) 105076, §2.2–2.3) and Tartakovsky et al., *Learning Parameters and Constitutive
+Relationships with Physics-Informed Deep Neural Networks* (Water Resour. Res. 56, 2020, §2).
+
+**Learned constitutive laws — `net(u)`, `net(∇u)`.** A network may also take the *solution* (or
+its derivatives) as input — then it is a material law, not a spatial map, and the form becomes
+nonlinear in `u` (routed to the matrix-free Newton path automatically; the net's `u`-dependence
+enters the element Jacobians through per-element forward AD). This is the NN-EUCLID setting:
+observe `u`, learn the hidden law unsupervised through the residual:
+
+```python
+net = jno.nn.wrap(foundax.mlp(1, hidden_dims=16, num_layers=2,
+                              activation=jax.nn.tanh, key=key)).dtype(jnp.float64)
+# hidden truth k(u) = 1 + 0.5 u²; learn it from a single observed field
+fem = jno.fem([(1.0 + net(ui)) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
+crux = jno.core([(fem.solve() - u_obs).mse], domain=obs).solve(600)
+```
+
+`net(ui.x, ui.y)` (a `k(∇u)` p-Laplacian-type law) works the same way, and solution- and
+coordinate-inputs can be mixed (`net(xi, yi, ui)`). Classification is automatic: a net whose
+arguments carry the unknown makes the form nonlinear — including a bare reaction term
+`net(u)*v` — while `net(x, y)` keeps the system linear(-parametric).
+
+**Transient forms** work the same way — the per-step operator (or the per-step Newton residual,
+for `net(u)`) re-evaluates the network, so a diffusivity or constitutive law is recovered from a
+`u(t)` trajectory exactly like the scalar/nodal transient inverse below. A coordinate `net(x)` on
+the **mass** (`u_t`) term is supported too — an unknown density `ρ(x)·u_t` recovered from a decay
+trajectory: the mass becomes a parametric matrix re-assembled from the weights each step (via
+`block.mass_fn`; `block.M` stays the static placeholder, so a hand-rolled integrator built off
+`block.M` sees the initial mass, not the parametric one — read `block.mass_fn(t, args)` if you roll
+your own). Only a *solution-dependent* `net(u)` on the mass term is rejected — that is a nonlinear
+mass `C(u)·u_t`, which the semidiscrete matrix form cannot express (a frozen net is always fine).
+
+A real coordinate-input net also composes with **complex** steady forms (a Helmholtz coefficient
+recovered from complex full-field data): the Re/Im legs assemble as parametric systems and the
+real-equivalent block solve stays differentiable in the weights. And a net coefficient works in a
+**coupled (multi-field)** form — it is evaluated at the shared quadrature points and a trial-input
+`net(u_i)` resolves its own field, so no per-field bookkeeping is needed.
+
+**Non-nodal elements.** A net coefficient — `k(x)` or a constitutive `k(u)` — also works on the
+scalar C¹ families (`space="Argyris"`/`"Morley"`/`"Hermite"`), e.g. a spatially varying or
+solution-dependent stiffness on a biharmonic plate: the network is evaluated at the quadrature
+points independently of the C¹ trial's DOF layout (the same property the P1 field parameter uses).
+On the vector edge families (`"RT"`/`"N1E"`) a *scalar coordinate* `net(x)` coefficient works too (a
+spatially-varying permeability/permittivity multiplying a vector term); only a solution-dependent
+`net(u)` there is unsupported, since a vector-valued trial input to the network is undefined. The
+non-nodal path assembles a *dense* operator, so a parametric solve wants an explicit dense
+`solve_fn` — `fem.solve(lambda A, b: jnp.linalg.solve(A, b))`.
+
+**Unknown boundary conditions.** A network as a *Dirichlet value* — `u(region) - net(xb, yb)` —
+is a trainable BC *profile*, not a coefficient: it enters the load vector (the Dirichlet lift), not
+the operator. Recover an unknown boundary temperature/flux from the interior response by evaluating
+`net` at the boundary nodes each solve. Supported for a **bare** `net(x)` on a boundary region,
+steady native Lagrange single-field; a compound value (`1 + net(x)`), an initial-condition value,
+or a transient/nonlinear form fails loud.
+
+Current scope: steady/transient/steady-complex on the native 2D/3D Lagrange assembler (single or
+coupled multi-field), steady scalar C¹ non-nodal (Argyris/Morley/Hermite), and a bare `net(x)`
+steady Dirichlet value. Not yet supported (each fails loud): a compound/IC/transient net Dirichlet
+value, solution-dependent `net(u)` on the mass (`u_t`) term (a nonlinear mass), k(u) in complex
+forms, the complex transient, time-varying Dirichlet `g(x,t)` with a trainable net,
+solution-dependent `net(u)` on the vector edge families (RT/Nédélec), and 1D domains (the 1D
+assembler has no runtime-parameter path at all).
+
 ### Transient inverse
 
 For a transient form, `fem.solve()` returns the **trajectory** `u(save_ts)` (default: backward

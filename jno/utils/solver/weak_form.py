@@ -33,6 +33,7 @@ from ...trace import (
     Hessian,
     Jacobian,
     Literal,
+    ModelCall,
     Placeholder,
     StateField,
     TestFunction,
@@ -666,6 +667,13 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
 
     if isinstance(expr, (Jacobian, Hessian)):
         return _is_obviously_nonlinear_in_unknown(domain, expr.target)
+
+    if isinstance(expr, ModelCall):
+        # A network is a generically nonlinear map of its inputs: a learned constitutive law
+        # ``net(u)`` / ``net(∇u)`` makes the form nonlinear in the unknown even in an otherwise
+        # linear term (e.g. the bare reaction ``net(u)*v``, which no product rule above catches);
+        # a coordinate-input coefficient ``net(x, y)`` stays linear.
+        return any(_contains_unknown_symbol(domain, a) for a in expr.args if isinstance(a, Placeholder))
 
     return False
 

@@ -20,6 +20,7 @@ from .trace import (
     Jacobian,
     Literal,
     ModelCall,
+    ModelWeights,
     NetworkGradient,
     Noise,
     OperationCall,
@@ -299,6 +300,7 @@ class TraceEvaluator:
         (BinaryOp, "_eval_binary_op"),
         (OperationCall, "_eval_operation_call"),
         (ModelCall, "_eval_flax_module_call"),
+        (ModelWeights, "_eval_model_weights"),
         (TunableModule, "_eval_tunable_module"),
         (TunableModuleCall, "_eval_tunable_module_call"),
         (Choice, "_eval_choice"),
@@ -480,6 +482,16 @@ class TraceEvaluator:
             return expr.fn(*args, key=ctx.key, **kwargs)
         else:
             return expr.fn(*args, **kwargs)
+
+    def _eval_model_weights(self, expr, ctx):
+        """Resolve a ``ModelWeights`` node to the model's *current* module pytree.
+
+        Under ``crux.solve`` this is the live trainable module (``self.params`` is
+        ``eqx.combine(trainable, frozen, static)`` rebuilt each step), so gradients of anything
+        computed from it — e.g. a FEM solve that re-assembles with these weights — reach the
+        optimizer. Outside training (eager evaluation) it falls back to the stored module.
+        """
+        return self.params.get(expr.model.layer_id, expr.model.module)
 
     def _eval_binary_op(self, expr, ctx):
         left = self._dispatch(expr.left, ctx)

@@ -11,6 +11,7 @@ from ...trace import (
     Jacobian,
     Literal,
     ModelCall,
+    ModelWeights,
     NormalDerivative,
     OperationCall,
     OperationDef,
@@ -55,6 +56,10 @@ def iter_children(node: Any):
         for a in node.args:
             if isinstance(a, Placeholder):
                 yield a
+        return
+
+    if isinstance(node, ModelWeights):
+        # Leaf: references a Model's weight pytree, wraps no traced sub-expression.
         return
 
     if isinstance(node, OperationDef):

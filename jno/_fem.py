@@ -189,11 +189,15 @@ def _contains(constraint: Any, cls) -> bool:
     return contains_node_type(_bare(constraint), cls)
 
 
-def _contains_network_trial(constraint: Any) -> bool:
-    """True if a constraint embeds a *network* ModelCall (e.g. ``u = net(x, y)``) — the VPINN signal.
+def _contains_network_call(constraint: Any) -> bool:
+    """True if a constraint embeds a *network* ModelCall (``jno.nn.wrap(net)(...)``).
 
-    Excludes zero-arg runtime parameters (``jno.np.parameter(...)``, scalar or FEM field): a weak form with a
-    trainable *coefficient* parameter is an ordinary (runtime-parametric) FE system, not a network-trial VPINN."""
+    Excludes zero-arg runtime parameters (``jno.np.parameter(...)``, scalar or FEM field). A network
+    in a weak form plays one of two roles, disambiguated at the constraint-*set* level (see the
+    ``is_vpinn`` routing in :func:`fem`): it *replaces* the trial (``u = net(x, y)`` — the VPINN
+    signal; no ``TrialFunction`` appears in any weak constraint) or it is a *coefficient*
+    multiplying a genuine trial (``net(x, y) * u.dx * v.dx`` — an assembled, runtime-parametric FE
+    system whose kernel re-evaluates the network at the quadrature points)."""
     from .utils.solver.parametric_helpers import _is_runtime_scalar_parameter
 
     return any(isinstance(n, ModelCall) and not _is_runtime_scalar_parameter(n) for n in _walk(_bare(constraint)))
@@ -793,7 +797,22 @@ def _dirichlet_spec(bare: Any) -> Tuple[Optional[int], Any, Any]:
     ``value_node`` is the raw expression (kept so the transient route can detect/evaluate a
     time-varying ``g(x,t)``)."""
     comp, value_node = _essential_spec(bare)
+    if _is_bare_neural_value_node(value_node):
+        # A trainable BC profile ``u(region) - net(x)``: keep the net node raw and leave ``value`` as a
+        # sentinel -- the native parametric path evaluates ``net(boundary_coords)`` from the runtime args
+        # each solve (``_value_from_node`` would build a stored-weights closure, non-differentiable).
+        return comp, None, value_node
     return comp, _value_from_node(value_node), value_node
+
+
+def _is_bare_neural_value_node(value_node: Any) -> bool:
+    """True if a Dirichlet value node is a *bare* neural coefficient ``net(x)`` (a trainable BC profile).
+
+    Only a bare network call is supported as a trainable Dirichlet value; a compound expression such as
+    ``1 + net(x)`` is rejected up front (it would need a general args-aware value evaluator)."""
+    from .utils.solver.parametric_helpers import _is_neural_coefficient
+
+    return _is_neural_coefficient(_bare(value_node)) if value_node is not None else False
 
 
 def _normal_flux_spec(constraint: Any, domain: Any) -> Optional[Tuple[Any, str, Any]]:
@@ -2039,10 +2058,63 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             "normal-derivative DOF)."
         )
 
-    # VPINN: a network trial (``u = net(x, y)`` written into the weak form) makes jno.fem
-    # test-project the weak form onto the FE test space -> a trainable residual loss, not an FE
-    # system. Detected by a ModelCall; lowered after the shared quadrature setup (see below).
-    is_vpinn = any(_contains_network_trial(c) for c in constraints)
+    # A network ModelCall in the constraints plays one of two roles, decided at the SET level:
+    #   * VPINN — the network *replaces* the trial (``u = net(x, y)`` written into the weak form):
+    #     no weak (test-carrying) constraint contains a TrialFunction. jno.fem test-projects the
+    #     weak form onto the FE test space -> a trainable residual loss, not an FE system.
+    #   * neural COEFFICIENT — the network multiplies a genuine trial (``net(x,y)*u.dx*v.dx``):
+    #     some weak constraint carries the TrialFunction. The system is assembled as usual and the
+    #     kernel re-evaluates the network at the quadrature points (trainable via the runtime args).
+    _has_network = any(_contains_network_call(c) for c in constraints)
+    _weak_has_real_trial = any(_contains(c, TestFunction) and _contains(c, TrialFunction) for c in constraints)
+    is_vpinn = _has_network and not _weak_has_real_trial
+    has_neural_coeff = _has_network and not is_vpinn
+
+    if has_neural_coeff:
+        # A network in a trial-only (essential) constraint is a trainable *Dirichlet value*
+        # ``u(region) - net(x)`` (an unknown boundary profile), NOT an integrand coefficient. It is
+        # supported as a *bare* net on a boundary region, native Lagrange single-field (the parametric
+        # path evaluates ``net(boundary_coords)`` from the runtime args each solve). Everything else --
+        # a compound value ``1+net(x)``, an initial-condition value, non-nodal or multifield -- is rejected.
+        _net_trial_only = [
+            c
+            for c in constraints
+            if _contains(c, TrialFunction) and not _contains(c, TestFunction) and _contains_network_call(c)
+        ]
+        for c in _net_trial_only:
+            support, _rg = _region_and_support(c, domain)
+            _comp, _val, _vnode = _dirichlet_spec(_bare(c))
+            if support != "boundary" or not _is_bare_neural_value_node(_vnode):
+                raise NotImplementedError(
+                    "jno.fem: a network in an essential (trial-only) constraint must be a *bare* Dirichlet "
+                    "value net(x) on a boundary region — a compound expression (e.g. 1 + net(x)) or an "
+                    "initial-condition value is not supported."
+                )
+        if _net_trial_only:
+            if _trial_spaces(constraints) - {"Lagrange"}:
+                raise NotImplementedError("jno.fem: a net-valued Dirichlet is supported on Lagrange elements only.")
+            if len(_field_keys(constraints)) > 1:
+                raise NotImplementedError("jno.fem: a net-valued Dirichlet is single-field only.")
+        if getattr(domain, "dimension", None) == 1:
+            raise NotImplementedError(
+                "jno.fem: neural coefficients are not supported on 1D domains — the native 1D assembler has no "
+                "runtime-parameter path at all (scalar and field parameters are unsupported there too)."
+            )
+        # Non-nodal: the scalar C¹ families (Argyris/Morley/Hermite) thread the network at the quad points
+        # like their P1 field parameter. The vector edge families (RT/Nédélec) accept a *scalar coordinate*
+        # net(x) coefficient (a spatially-varying permeability/permittivity multiplying a vector term), but
+        # a *solution-dependent* net(u) there would feed the vector-valued trial into the network, which is
+        # undefined — reject only that.
+        _nonnodal_spaces = _trial_spaces(constraints) - {"Lagrange", "Argyris", "Morley", "Hermite"}
+        if _nonnodal_spaces:
+            from .utils.solver.weak_form import _is_obviously_nonlinear_in_unknown as _nlin_nn
+
+            if any(_contains_network_call(c) and _nlin_nn(domain, _bare(c)) for c in constraints):
+                raise NotImplementedError(
+                    "jno.fem: a solution-dependent neural coefficient net(u) on the vector edge families "
+                    f"(RT/Nédélec, {sorted(_nonnodal_spaces)}) is not supported — a vector-valued trial input to the "
+                    "network is undefined. A scalar coordinate net(x) coefficient is supported."
+                )
 
     multifield = len(_field_keys(constraints)) > 1
     if vec is None and not multifield:
@@ -2355,9 +2427,15 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             # parameter k(x). A time-varying Dirichlet g(x,t) routes native only for the LINEAR,
             # non-parametric transient (the row-replacement + per-step Dirichlet-lift forcing path);
             # combined with a runtime parameter or a nonlinear residual it is rejected below.
+            from .utils.solver.parametric_helpers import _collect_neural_coefficient_exprs as _cnce
             from .utils.solver.weak_form import _is_obviously_nonlinear_in_unknown as _nlin
 
-            _native_now = not any(_crp(b) for b in weak_bares) and not any(_nlin(domain, b) for b in weak_bares)
+            _native_now = (
+                not any(_crp(b) for b in weak_bares)
+                and not any(_nlin(domain, b) for b in weak_bares)
+                # tv-Dirichlet g(x,t) + a TRAINABLE net: rejected below (frozen nets stay native)
+                and not any(_cnce(b) for b in weak_bares)
+            )
         if _native_now:
             from .utils.solver.fem_native import assemble_fem_native
 
@@ -2372,6 +2450,26 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
     # ``.imag`` gives two ordinary real systems A_r/b_r and A_i/b_i; FEM.solve() forms
     # ``[[A_r, -A_i], [A_i, A_r]]`` and recombines to a complex ``u``. A complex *inverse* (runtime
     # parameter) and the complex *transient* (Schrodinger) path are handled separately below. ----
+    if has_neural_coeff and _is_complex_form(domain, ir):
+        # A real coordinate-input net in a steady complex form is fine — each Re/Im leg assembles as
+        # a parametric FemLinearSystem and _solve_complex_block builds the differentiable trace node,
+        # exactly like the scalar complex inverse. The two compositions that would mis-assemble stay
+        # rejected: the complex-transient branch unpacks eager (A, b) legs (a parametric leg cannot
+        # ride it), and a solution-dependent net makes the legs nonlinear (no complex Newton block).
+        if is_transient:
+            raise NotImplementedError(
+                "jno.fem: a neural coefficient in a complex *transient* form is not supported — the "
+                "complex-transient path has no parametric/inverse route at all (it integrates fixed "
+                "real-equivalent blocks with no runtime args), so this needs that infrastructure built first."
+            )
+        from .utils.solver.weak_form import _is_obviously_nonlinear_in_unknown as _nlin_cx
+
+        if any(_nlin_cx(domain, b) for b in weak_bares):
+            raise NotImplementedError(
+                "jno.fem: a solution-dependent neural coefficient (net(u)/net(∇u)) in a complex form "
+                "is not supported yet — complex forms assemble as linear real-equivalent blocks."
+            )
+
     if (
         not is_vpinn
         and _is_complex_form(domain, ir)
