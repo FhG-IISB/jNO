@@ -1,0 +1,120 @@
+"""Finite-difference PDE solver — the strong-form sibling of :func:`jno.fem`.
+
+Write the **strong-form residual** ``R(u)`` (``u`` is the nodal field) with the FD operators in this
+module; :func:`fdm` folds in Dirichlet BCs and hands the residual straight to the ``jno.solve``
+**nonlinear driver** — the *same* Newton–Krylov + implicit-``custom_root`` machinery :func:`jno.fem`
+uses, so **linear and nonlinear** problems are handled uniformly (a linear residual converges in one
+Newton step). Collocation at the mesh nodes means no quadrature, no test functions, no mass matrix
+(so it is leaner than the weak-form assembler).
+
+Because the residual is a plain differentiable function of the DOFs and the solve differentiates
+through ``custom_root``, gradients to parameters inside it (a source, a coefficient field,
+``jno.nn.wrap`` net) flow through — so ``jno.fdm`` composes into ``jno.core`` for inverse problems,
+exactly like ``jno.fem.solve()``.
+
+v1 scope: scalar, steady, 2-D triangular mesh, Dirichlet BCs (linear + nonlinear residuals).
+Neumann/Robin, periodic, transient (method-of-lines, ``M = I``), and a structured-grid stencil backend
+are planned extensions (see ``plans/fdm-solver.md``).
+"""
+
+from __future__ import annotations
+
+import jax.numpy as jnp
+import numpy as np
+
+from . import solve as _solve
+from .differential_operators import DifferentialOperators as _D
+
+__all__ = ["fdm", "laplacian", "gradient"]
+
+
+def _mesh(domain):
+    mc = domain.mesh_connectivity
+    dim = int(getattr(domain, "dimension", 2))
+    pts = jnp.asarray(np.asarray(mc["points"])[:, :dim])
+    if dim != 2:
+        raise NotImplementedError("jno.fdm: only 2-D triangular meshes are supported in v1.")
+    return pts, jnp.asarray(mc["triangles"])
+
+
+def laplacian(u, domain, method: str = "cotangent"):
+    """FD Laplacian ``Δu`` of the nodal field ``u`` on the domain's mesh. ``method="cotangent"``
+    (symmetric, accurate — CG-compatible) or ``"gradient_of_gradient"`` / ``"lsq_of_gradient"``."""
+    pts, tris = _mesh(domain)
+    return _D.compute_fd_laplacian_2d_simple(u, pts, tris, dims=(0, 1), method=method)
+
+
+def gradient(u, domain):
+    """FD gradient ``∇u`` of the nodal field ``u`` — shape ``(N, 2)``."""
+    pts, tris = _mesh(domain)
+    return _D.compute_fd_gradient_2d_simple(u, pts, tris, dims=(0, 1))
+
+
+class FDMSystem:
+    """A finite-difference discretization built from a strong-form residual + Dirichlet BCs.
+
+    ``residual(u_dofs) -> R_at_nodes`` must be a differentiable function of the nodal DOF vector, zero
+    at the PDE solution (e.g. ``lambda u: -jno.fdm.laplacian(u, d) - f``). ``dirichlet`` maps a
+    boundary-region tag to a value (scalar, or a coordinate function ``g(x, y)``)."""
+
+    def __init__(self, domain, residual, dirichlet=None):
+        self.domain = domain
+        self.residual = residual
+        self.dirichlet = dict(dirichlet or {})
+        self._N = int(np.asarray(domain.mesh_connectivity["points"]).shape[0])
+
+    @property
+    def points(self):
+        """DOF (mesh-node) coordinates, shape ``(N, dim)``."""
+        pts, _ = _mesh(self.domain)
+        return pts
+
+    def _region_nodes(self, tag):
+        reg = getattr(self.domain, "_boundary_registry", {}).get(tag)
+        if reg is not None and "point_indices" in reg and len(reg["point_indices"]) > 0:
+            return np.asarray(reg["point_indices"], dtype=int)
+        return np.asarray(self.domain.mesh_connectivity["boundary_indices"], dtype=int)  # whole boundary
+
+    def _dirichlet_mask_values(self):
+        pts = np.asarray(self.points)
+        mask = np.zeros(self._N, dtype=bool)
+        vals = np.zeros(self._N)
+        for tag, g in self.dirichlet.items():
+            idx = self._region_nodes(tag)
+            mask[idx] = True
+            vals[idx] = g(*[pts[idx, k] for k in range(pts.shape[1])]) if callable(g) else float(g)
+        return jnp.asarray(mask), jnp.asarray(vals)
+
+    def solve(self, nonlinear=None, x0=None):
+        """Solve the system by reusing the ``jno.solve`` nonlinear driver — the SAME Newton–Krylov +
+        implicit-``custom_root`` machinery ``jno.fem`` uses. Handles **linear and nonlinear** residuals
+        uniformly (a linear residual converges in one Newton step), fully matrix-free.
+
+        The Dirichlet condition is folded into the residual (boundary rows become ``u - g``), so the
+        driver drives boundary nodes to the data and interior nodes to the PDE solution. Gradients to
+        parameters captured in ``residual`` (source, coefficient field, ``jno.nn.wrap`` net) flow
+        through ``custom_root``, so ``jno.fdm`` composes into ``jno.core`` for inverse problems.
+
+        Args:
+            nonlinear: nonlinear driver slot (default :func:`jno.solve.newton`); its inner
+                matrix-free Krylov step + implicit-diff tangent solve use the driver's default.
+            x0: initial guess (default zeros).
+        """
+        bmask, bvals = self._dirichlet_mask_values()
+
+        def residual_with_bc(u):
+            return jnp.where(bmask, u - bvals, self.residual(u))  # Dirichlet rows: u - g
+
+        driver = nonlinear or _solve.newton()
+        u0 = jnp.zeros(self._N) if x0 is None else jnp.asarray(x0)
+        return driver(residual_with_bc, u0)
+
+
+def fdm(domain, residual, dirichlet=None) -> FDMSystem:
+    """Build a finite-difference system from a strong-form residual + Dirichlet BCs — the strong-form
+    sibling of :func:`jno.fem`. See :class:`FDMSystem`."""
+    return FDMSystem(domain, residual, dirichlet)
+
+
+fdm.laplacian = laplacian  # convenience: jno.fdm.laplacian(u, domain)
+fdm.gradient = gradient
