@@ -149,7 +149,9 @@ def test_domain_unknown_is_valued_nodal_field():
 
 
 def test_constraint_list_poisson():
-    """fem-style authoring: jno.fdm([-Δu - f, u(xb,yb) - 0]) with u = domain.unknown()."""
+    """fem-style authoring: jno.fdm([-Δu - f, u(xb,yb) - 0]) with u = domain.unknown(). No `scheme=`
+    anywhere — a nodal field's `.d`/`.d2` default to finite differences (autodiff is meaningless on a
+    discrete field), so `ui.d2(x)` is the FD second derivative."""
     import jno.jnp_ops as jnn
 
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06)
@@ -159,9 +161,8 @@ def test_constraint_list_poisson():
     exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
     u = d.unknown()
     ui = u.bind(x=x, y=y)
-    sch = "finite_difference"
     f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
-    sol = jno.fdm([-ui.d2(x, scheme=sch) - ui.d2(y, scheme=sch) - f, u(xb, yb) - 0.0]).solve()
+    sol = jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(xb, yb) - 0.0]).solve()  # no scheme= → FD by default
     assert float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact)) < 3e-2
 
 
