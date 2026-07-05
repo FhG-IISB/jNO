@@ -17,10 +17,12 @@ u(xi, yi) - u0])`` authored with ``u = domain.unknown()`` exactly as ``jno.fem([
 initial condition is *found from the constraints* (never a config flag) and ``t_span``/step-count are
 inferred from ``domain.time`` — and a low-level **function form** (:class:`FDMSystem`).
 
-v1 scope: scalar, 2-D triangular mesh, Dirichlet BCs (linear + nonlinear residuals), and **transient**
-problems by method-of-lines (``M = I``; a unit-coefficient ``u.t`` term, e.g. ``ui.t - νΔu``).
-Neumann/Robin, periodic, a general ``u.t`` mass coefficient, and a structured-grid stencil backend are
-planned extensions (see ``plans/fdm-solver.md``).
+v1 scope: scalar, 2-D triangular mesh, Dirichlet BCs, **steady Neumann** flux ``ui.d(n, scheme) - h``
+(``∇u·n = h``; corner nodes fall back to the PDE residual), and **transient** problems by
+method-of-lines (``M = I``; a unit-coefficient ``u.t`` term, e.g. ``ui.t - νΔu``) — all with linear +
+nonlinear residuals. Robin ``ui.d(n) + α(u - u∞)``, transient Neumann, periodic, a general ``u.t`` mass
+coefficient, and a structured-grid stencil backend are planned extensions (see ``plans/fdm-solver.md``).
+A pure-Neumann problem (no Dirichlet node) is singular (solution up to a constant) and is solved as-is.
 """
 
 from __future__ import annotations
@@ -50,10 +52,13 @@ def laplacian(u, domain, method: str = "cotangent"):
     return _D.compute_fd_laplacian_2d_simple(u, pts, tris, dims=(0, 1), method=method)
 
 
-def gradient(u, domain):
-    """FD gradient ``∇u`` of the nodal field ``u`` — shape ``(N, 2)``."""
+def gradient(u, domain, method: str = "area_weighted"):
+    """FD gradient ``∇u`` of the nodal field ``u`` — shape ``(N, 2)``. ``method`` selects the stencil
+    (``"area_weighted"`` default, ``"uniform"``, ``"inverse_distance"``, ``"least_squares"``)."""
     pts, tris = _mesh(domain)
-    return _D.compute_fd_gradient_2d_simple(u, pts, tris, dims=(0, 1))
+    gx = _D.compute_fd_gradient_2d_simple(u, pts, tris, 0, method=method)
+    gy = _D.compute_fd_gradient_2d_simple(u, pts, tris, 1, method=method)
+    return jnp.stack([gx, gy], axis=1)
 
 
 class FDMSystem:
@@ -231,25 +236,50 @@ def _zero_temporal(node):
     return node
 
 
+def _normal_jacobian(node):
+    """The normal-derivative node ``ui.d(n, scheme)`` (a :class:`Jacobian` w.r.t. a normal Variable —
+    tag ``n_<region>``, from ``domain.variable(region, normals=True)``) inside ``node``, or ``None``.
+    Its presence marks a Neumann/Robin (flux) condition; its ``.scheme`` is the FD stencil to honour."""
+    from .trace import Jacobian
+
+    n = _unwrap(node)
+    if isinstance(n, Jacobian) and any(str(getattr(v, "tag", "")).startswith("n_") for v in getattr(n, "variables", [])):
+        return n
+    for c in _iter(n):
+        found = _normal_jacobian(c)
+        if found is not None:
+            return found
+    return None
+
+
 class _TraceFDM:
     """Finite-difference system authored as a fem-style constraint list with ``u = domain.unknown()``:
     ``jno.fdm([-u.d2(x) - u.d2(y) - f, u(xb, yb) - g]).solve()``. Constraints are classified by the
     region their coordinate variables carry — the ``interior`` → the strong-form PDE residual, a
-    boundary tag → a Dirichlet condition ``u(region) - g``, and the ``initial`` region → the initial
-    condition ``u(initial) - u0`` (exactly as in :func:`jno.fem`). A problem is **transient** iff it
-    carries an initial condition; ``t_span`` and the step count are then inferred from ``domain.time``
-    (never passed as args) and the system marches with the same method-of-lines stepper :func:`jno.fem`
-    uses. The one config that stays on the object it describes is the FD **stencil** per operator
-    (``u.d2(x, scheme=...)``)."""
+    boundary tag → a Dirichlet condition ``u(region) - g``, the ``initial`` region → the initial
+    condition ``u(initial) - u0`` (exactly as in :func:`jno.fem`), and a **normal derivative**
+    ``ui.d(n, scheme) - h`` (``n = domain.variable(region, normals=True)``) → a Neumann flux row
+    ``∇u·n = h`` at that edge's nodes. (Neumann is authored differently from :func:`jno.fem`, where it
+    is a *natural* weak term ``h·v`` — the strong form has no test function, so the flux is imposed
+    directly.) A problem is **transient** iff it carries an initial condition; ``t_span`` and the step
+    count are then inferred from ``domain.time`` (never passed as args) and the system marches with the
+    same method-of-lines stepper :func:`jno.fem` uses. The one config that stays on the object it
+    describes is the FD **stencil** per operator (``u.d2(x, scheme=...)``, ``ui.d(n, scheme=...)``)."""
 
     def __init__(self, constraints):
         self.unknown = _find_unknown(constraints)
         self.domain = self.unknown._fem_field_domain
         self._N = int(np.asarray(self.domain.mesh_connectivity["points"]).shape[0])
         self._pts = jnp.asarray(np.asarray(self.domain.mesh_connectivity["points"])[:, : self.domain.dimension])
-        self._pde, self._dirichlet, self._ic = [], [], []
+        self._pde, self._dirichlet, self._neumann, self._ic = [], [], [], []
         boundary_tags = set(getattr(self.domain, "_boundary_registry", {}).keys()) | {"boundary"}
         for c in constraints:
+            # A normal derivative `ui.d(n, ...)` marks a Neumann/Robin flux row — check it FIRST, because
+            # the field is bound to the interior coords (so `_region_tag` is ambiguous); the region comes
+            # from the normal variable's tag instead (`n_right` → `right`), via `_neumann_region`.
+            if _normal_jacobian(c) is not None:
+                self._neumann.append(c)
+                continue
             tag = _region_tag(c)
             if isinstance(tag, str) and tag == "initial":
                 self._ic.append(c)
@@ -276,6 +306,12 @@ class _TraceFDM:
             raise ValueError(
                 "jno.fdm([...]): the PDE residual has a time derivative `u.t` but no initial condition — "
                 "add `u(xi, yi) - u0` (with `xi, yi = domain.variable('initial', split=True)`)."
+            )
+        if self._neumann and self._transient:
+            raise ValueError(
+                "jno.fdm([...]): Neumann/Robin flux conditions on a transient problem are not supported in v1 "
+                "(a flux node keeps its mass row, unlike a pinned Dirichlet node). Use a steady problem, or "
+                "impose the flux as a Dirichlet condition."
             )
 
     def _region_nodes(self, tag):
@@ -316,24 +352,95 @@ class _TraceFDM:
 
         return residual_fn
 
+    def _eval_g(self, g_node, idx):
+        """Evaluate a value node ``g`` (constant or coordinate expression) at the nodes ``idx``."""
+        from ._fem import _eval_value_node_at
+
+        if isinstance(g_node, (int, float)):
+            return jnp.full((idx.shape[0],), float(g_node))
+        return jnp.asarray(_eval_value_node_at(g_node, np.asarray(self._pts)[idx])).reshape(-1)
+
     def _condition_value(self, constraint, idx):
         """Value ``g`` of an affine condition ``u(region) - g`` (Dirichlet or IC), evaluated at the
         region's nodes ``idx`` — reused for both boundary conditions and the initial state."""
-        from ._fem import _eval_value_node_at
-
         inner = _unwrap(constraint)
         g_node = 0.0
         if getattr(inner, "op", None) == "-":  # u(region) - g  →  g is the side without the unknown
             g_node = inner.right if _contains_unknown(inner.left, self.unknown) else inner.left
-        if isinstance(g_node, (int, float)):
-            return jnp.full((idx.shape[0],), float(g_node))
-        return jnp.asarray(_eval_value_node_at(g_node, np.asarray(self._pts)[idx])).reshape(-1)
+        return self._eval_g(g_node, idx)
 
     def _dirichlet_rows(self):
         rows = []
         for c in self._dirichlet:
             idx = self._region_nodes(_region_tag(c))
             rows.append((jnp.asarray(idx), self._condition_value(c, idx)))
+        return rows
+
+    def _node_normals(self, region):
+        """Unit outward normals for the **smooth-edge** nodes of ``region``, aligned to those nodes.
+
+        Computed from the mesh **boundary segments** (``mesh_connectivity["boundary_edges"]``): each
+        segment's exact perpendicular is averaged over the (two) segments meeting at a node, so an
+        axis-aligned edge yields an exact ``(±1, 0)`` / ``(0, ±1)`` — much cleaner than the domain's
+        smoothed per-point normal, which bleeds a tangential component near corners and would spoil the
+        flux. Outward orientation is taken (sign only) from ``domain.variable(region, normals=True)``.
+
+        A **corner** node averages two differently-oriented segment normals, so the averaged magnitude
+        drops (≈0.71 at a right angle): the outward normal is undefined there, so corners are **dropped**
+        from the flux row and keep their interior PDE residual (give a corner an explicit Dirichlet
+        condition if it needs one). Returns ``(kept_node_indices, unit_n)``."""
+        dim = self.domain.dimension
+        pts = np.asarray(self._pts)
+        edges = np.asarray(self.domain.mesh_connectivity["boundary_edges"], dtype=int)  # (E, 2) node pairs
+        tang = pts[edges[:, 1]] - pts[edges[:, 0]]
+        seg_n = np.stack([tang[:, 1], -tang[:, 0]], axis=1)  # 2-D perpendicular of each segment
+        seg_n /= np.linalg.norm(seg_n, axis=1, keepdims=True) + 1e-30
+        node_n = np.zeros((self._N, dim))
+        cnt = np.zeros(self._N)
+        for e, (i, j) in enumerate(edges):
+            node_n[i] += seg_n[e]
+            node_n[j] += seg_n[e]
+            cnt[i] += 1
+            cnt[j] += 1
+        node_n /= np.maximum(cnt, 1)[:, None]  # average incident segment normals (unit on a flat edge)
+
+        self.domain.variable(region, normals=True, split=True)  # domain's (oriented) normals for the sign
+        bpts = np.asarray(self.domain.context[region]).reshape(-1, dim)
+        dom_n = np.asarray(self.domain.context[f"n_{region}"]).reshape(-1, dim)
+        idx = np.asarray(self._region_nodes(region), dtype=int)
+        order = [int(np.argmin(np.sum((bpts - p) ** 2, axis=1))) for p in pts[idx]]
+        raw = node_n[idx]
+        flip = np.sum(raw * dom_n[order], axis=1) < 0  # orient outward to match the domain normal
+        raw[flip] *= -1
+        smooth = np.linalg.norm(raw, axis=1) > 0.9  # a corner has averaged magnitude ≈0.71 ≪ 1 → drop it
+        idx, raw = idx[smooth], raw[smooth]
+        n = raw / (np.linalg.norm(raw, axis=1, keepdims=True) + 1e-30)
+        return idx, jnp.asarray(n)
+
+    def _neumann_rows(self):
+        """Flux rows for Neumann conditions ``ui.d(n, scheme) - h``: the region's node indices, unit
+        normals, the FD stencil (from the normal ``Jacobian``'s ``scheme``), and ``h`` at those nodes.
+        v1 supports the pure-flux form (unit coefficient, ``-h`` on the value side); Robin
+        ``ui.d(n) + α(u - u∞)`` and non-unit coefficients are future work — an unrecognized structure
+        raises rather than silently assuming ``h = 0``."""
+        rows = []
+        for c in self._neumann:
+            jac = _normal_jacobian(c)
+            nvar = next(v for v in jac.variables if str(getattr(v, "tag", "")).startswith("n_"))
+            region = nvar.tag[len("n_") :]  # `n_right` → `right`
+            idx, nrm = self._node_normals(region)
+            inner = _unwrap(c)
+            if getattr(inner, "op", None) != "-" or not (
+                _normal_jacobian(inner.left) is not None and _normal_jacobian(inner.right) is None
+            ):
+                raise ValueError(
+                    "jno.fdm([...]): a Neumann condition must be written `ui.d(n, scheme) - h` (the normal "
+                    "derivative minus the prescribed flux). Robin `ui.d(n) + α*(u - u∞)` and non-unit "
+                    f"coefficients are not supported in v1. Got: {inner!r}."
+                )
+            _, grad_method, _ = _D.parse_fd_scheme(getattr(jac, "scheme", "finite_difference"))
+            h = self._eval_g(inner.right, np.asarray(idx))
+            rows.append((jnp.asarray(idx), nrm, grad_method or "area_weighted", h))
         return rows
 
     def _initial_state(self):
@@ -361,9 +468,16 @@ class _TraceFDM:
 
         residual_fn = self._pde_residual_fn()
         rows = self._dirichlet_rows()
+        flux_rows = self._neumann_rows()
 
         def residual_with_bc(u):
             r = residual_fn(u)
+            # Neumann first (flux row `∇u·n - h`), then Dirichlet — a node shared by both (a corner)
+            # resolves to the essential Dirichlet value.
+            for idx, nrm, method, h in flux_rows:
+                grad = gradient(u, self.domain, method=method)  # (N, 2), differentiable
+                flux = jnp.sum(grad[idx] * nrm, axis=1)
+                r = r.at[idx].set(flux - h)
             for idx, gvals in rows:
                 r = r.at[idx].set(u[idx] - gvals)
             return r

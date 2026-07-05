@@ -216,3 +216,80 @@ def test_constraint_list_transient_requires_ic():
     ui = u.bind(x=x, y=y, t=t)
     with pytest.raises(ValueError, match="no initial condition"):
         jno.fdm([ui.t - 0.05 * (ui.d2(x, scheme="finite_difference") + ui.d2(y, scheme="finite_difference"))])
+
+
+# ==========================================================================
+# constraint-list Neumann flux BCs (ui.d(n, scheme) - h; n = domain.variable(reg, normals=True))
+# ==========================================================================
+
+
+def _mixed_dirichlet_neumann(mesh_size, exact_fn, du_dn_right):
+    """Solve -Δu = 0 with Dirichlet on left/bottom/top (u = exact) and Neumann ∂u/∂n = h on the right
+    edge, authored fem-style: the flux is `ui.d(n, scheme) - h` with n = domain.variable(reg, normals=True).
+    Returns rel-L2 vs the (harmonic) exact solution."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=mesh_size)
+    p = _nodes(d)
+    exact = exact_fn(p[:, 0], p[:, 1])
+    x, y, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+    nr = d.variable("right", normals=True)  # single outward-normal Variable for the right edge
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    sch = "finite_difference"
+    sol = jno.fdm(
+        [
+            -ui.d2(x, scheme=sch) - ui.d2(y, scheme=sch),  # -Δu = 0 (harmonic exact)
+            u(xl, yl) - exact_fn(xl, yl),  # Dirichlet left
+            u(xb, yb) - exact_fn(xb, yb),  # Dirichlet bottom
+            u(xt, yt) - exact_fn(xt, yt),  # Dirichlet top
+            ui.d(nr, scheme=sch) - du_dn_right,  # Neumann right: ∂u/∂n = h
+        ]
+    ).solve()
+    return float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact))
+
+
+def test_neumann_linear_exact():
+    """u = x + 2y is linear ⇒ the FD gradient and Laplacian are exact ⇒ mixed D+N recovers it to solver
+    tolerance. This pins the flux-row correctness (normal orientation, unit-normalization, ∇u·n = h)."""
+    err = _mixed_dirichlet_neumann(0.1, lambda x, y: x + 2 * y, du_dn_right=1.0)  # ∂u/∂n = ∂u/∂x = 1 on x=1
+    assert err < 1e-4, f"linear mixed D+N should be near-exact, got {err}"
+
+
+def test_neumann_convergence_harmonic():
+    """u = x² − y² is harmonic (−Δu = 0), ∂u/∂n = 2x = 2 on the right edge. The boundary-flux stencil
+    is O(h), so the error decreases under refinement."""
+    errs = [_mixed_dirichlet_neumann(h, lambda x, y: x**2 - y**2, du_dn_right=2.0) for h in (0.1, 0.06, 0.035)]
+    assert errs[0] > errs[1] > errs[2], f"not converging: {errs}"
+    assert errs[2] < 5e-3
+
+
+def test_neumann_rejects_malformed_and_transient():
+    """v1 guards: an unrecognized flux structure (here the flux on the wrong side, `h - ui.d(n)`, which a
+    Robin/`+` form would also hit) raises rather than silently assuming h=0, and a Neumann flux on a
+    transient problem raises."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15)
+    x, y, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    nr = d.variable("right", normals=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    sch = "finite_difference"
+    with pytest.raises(ValueError, match="Robin|not supported"):
+        jno.fdm([-ui.d2(x, scheme=sch) - ui.d2(y, scheme=sch), u(xl, yl) - 0.0, 1.0 - ui.d(nr, scheme=sch)]).solve()
+
+    dt = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15, time=(0.0, 0.5, 50))
+    xt, yt, tt = dt.variable("interior", split=True)
+    xit, yit, _ = dt.variable("initial", split=True)
+    nrt = dt.variable("right", normals=True)
+    ut = dt.unknown()
+    uit = ut.bind(x=xt, y=yt, t=tt)
+    with pytest.raises(ValueError, match="Neumann.*transient|transient.*not supported"):
+        jno.fdm(
+            [
+                uit.t - 0.05 * (uit.d2(xt, scheme=sch) + uit.d2(yt, scheme=sch)),
+                ut(xit, yit) - 0.0,
+                uit.d(nrt, scheme=sch) - 1.0,
+            ]
+        )
