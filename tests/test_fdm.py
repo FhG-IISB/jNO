@@ -99,47 +99,31 @@ def test_nonlinear_reaction_diffusion():
     assert float(np.linalg.norm(u - exact) / np.linalg.norm(exact)) < 1e-2
 
 
-def test_transient_heat_2d_domain_driven():
-    """Domain-driven `.solve()`: time from `domain.time`, IC from `initial` — no explicit time args
-    (reads like jno.fem). u_t = ν Δu → exact e^(−2νπ²t)·sin(πx)sin(πy)."""
+def test_transient_heat_2d():
+    """u_t = ν Δu, u₀ = sin(πx)sin(πy), homogeneous Dirichlet → e^(−2νπ²t)·sin(πx)sin(πy).
+    solve_transient reuses jno.fem's SemidiscreteTimeBlock stepper (no new time-integration code)."""
     nu, T = 0.05, 0.5
-    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06, time=(0.0, T, 201))
-    p = _nodes(d)
-    sys = jno.fdm(
-        d,
-        residual=lambda u: -nu * jno.fdm.laplacian(u, d),
-        dirichlet={"boundary": 0.0},
-        initial=lambda x, y: np.sin(np.pi * x) * np.sin(np.pi * y),
-    )
-    traj = np.asarray(sys.solve())  # steady-vs-transient inferred from the domain
-    exact = np.exp(-2 * nu * np.pi**2 * T) * np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
-    assert traj.shape == (201, p.shape[0])  # domain.time n_points
-    assert float(np.linalg.norm(traj[-1] - exact) / np.linalg.norm(exact)) < 1e-2
-
-
-def test_transient_explicit_form_still_works():
-    """The explicit `solve_transient(u0, t_span, nsteps)` form (no `time=` domain) still works."""
-    nu, T = 0.05, 0.5
-    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.08)
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06)
     p = _nodes(d)
     u0 = jnp.asarray(np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]))
     sys = jno.fdm(d, residual=lambda u: -nu * jno.fdm.laplacian(u, d), dirichlet={"boundary": 0.0})
     traj = np.asarray(sys.solve_transient(u0, (0.0, T), 200))
     exact = np.exp(-2 * nu * np.pi**2 * T) * np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    assert traj.shape == (201, p.shape[0])
     assert float(np.linalg.norm(traj[-1] - exact) / np.linalg.norm(exact)) < 1e-2
 
 
 def test_transient_differentiable_for_inverse():
-    """The domain-driven transient `.solve()` differentiates w.r.t. a parameter (diffusivity)."""
+    """The transient march differentiates w.r.t. a parameter (diffusivity) — time-dependent inverse."""
     T = 0.5
-    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.08, time=(0.0, T, 201))
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.08)
     p = _nodes(d)
+    u0 = jnp.asarray(np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]))
     target = jnp.asarray(np.exp(-2 * 0.05 * np.pi**2 * T) * np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]))
-    u0 = lambda x, y: np.sin(np.pi * x) * np.sin(np.pi * y)  # noqa: E731
 
     def loss(nu):
-        s = jno.fdm(d, residual=lambda u: -nu * jno.fdm.laplacian(u, d), dirichlet={"boundary": 0.0}, initial=u0)
-        return jnp.mean((s.solve()[-1] - target) ** 2)
+        s = jno.fdm(d, residual=lambda u: -nu * jno.fdm.laplacian(u, d), dirichlet={"boundary": 0.0})
+        return jnp.mean((s.solve_transient(u0, (0.0, T), 200)[-1] - target) ** 2)
 
     g = float(jax.grad(loss)(0.05))
     assert np.isfinite(g)

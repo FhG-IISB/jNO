@@ -55,27 +55,15 @@ class FDMSystem:
 
     ``residual(u_dofs) -> R_at_nodes`` must be a differentiable function of the nodal DOF vector, zero
     at the PDE solution (e.g. ``lambda u: -jno.fdm.laplacian(u, d) - f``). ``dirichlet`` maps a
-    boundary-region tag to a value (scalar, or a coordinate function ``g(x, y)``). ``initial`` is the
-    time-dependent IC (a nodal array or a coordinate function ``u0(x, y)``); with it, a domain that
-    carries a ``time=(t0, t1, n)`` axis makes ``.solve()`` march in time (method of lines)."""
+    boundary-region tag to a value (scalar, or a coordinate function ``g(x, y)``). For a time-dependent
+    domain (``time=(t0, t1, n)``), ``.solve(u0)`` marches in time from the initial state ``u0`` — the
+    IC is explicit data to the march, never a constructor config flag."""
 
-    def __init__(self, domain, residual, dirichlet=None, initial=None):
+    def __init__(self, domain, residual, dirichlet=None):
         self.domain = domain
         self.residual = residual
         self.dirichlet = dict(dirichlet or {})
-        self.initial = initial
         self._N = int(np.asarray(domain.mesh_connectivity["points"]).shape[0])
-
-    def _initial_state(self):
-        if self.initial is None:
-            raise ValueError(
-                "jno.fdm: a time-dependent domain (time=...) needs an initial condition — "
-                "pass initial=<nodal array or u0(x, y[, z])>."
-            )
-        if callable(self.initial):
-            pts = np.asarray(self.points)
-            return jnp.asarray(self.initial(*[pts[:, k] for k in range(pts.shape[1])]))
-        return jnp.asarray(self.initial).reshape(-1)
 
     @property
     def points(self):
@@ -99,33 +87,16 @@ class FDMSystem:
             vals[idx] = g(*[pts[idx, k] for k in range(pts.shape[1])]) if callable(g) else float(g)
         return jnp.asarray(mask), jnp.asarray(vals)
 
-    def solve(self, nonlinear=None, x0=None, *, save_ts=None):
-        """Single entry — **steady or transient, inferred from the domain** (like ``jno.fem.solve()``).
+    def solve(self, nonlinear=None, x0=None):
+        """Solve the steady system, reusing the SAME ``jno.solve`` Newton–Krylov + implicit-``custom_root``
+        machinery ``jno.fem`` uses (linear and nonlinear uniformly; a linear residual converges in one
+        step; fully matrix-free). Dirichlet is folded into the residual (boundary rows become ``u - g``).
+        Gradients to parameters in ``residual`` flow through ``custom_root``, so ``jno.fdm`` composes
+        into ``jno.core`` for inverse problems.
 
-        If the domain carries a ``time=(t0, t1, n)`` axis, ``.solve()`` marches in time (method of
-        lines): ``t_span``/``dt`` come from ``domain.time`` (via ``_infer_time_window``) and the IC from
-        ``initial`` — no explicit time args. Otherwise it solves the steady system.
-
-        Both paths reuse the SAME ``jno.solve`` Newton–Krylov + implicit-``custom_root`` machinery
-        ``jno.fem`` uses (linear and nonlinear handled uniformly; a linear residual converges in one
-        step; fully matrix-free). Dirichlet is folded into the residual (boundary rows become
-        ``u - g``); the transient path additionally reuses ``jno.fem``'s ``SemidiscreteTimeBlock``
-        stepper. Gradients to parameters in ``residual`` flow through ``custom_root``, so ``jno.fdm``
-        composes into ``jno.core`` for (time-dependent) inverse problems.
-
-        Args:
-            nonlinear: nonlinear driver slot (default :func:`jno.solve.newton`) — steady path only.
-            x0: initial guess for the steady solve (default zeros).
-            save_ts: transient sample times (default: the ``domain.time`` grid).
+        Transient problems march with :meth:`solve_transient`; the fem-style constraint-list authoring
+        (``u(initial) - u0`` as a constraint) is the planned high-level path (see ``plans/fdm-solver.md``).
         """
-        from .utils.solver.time_route import _infer_time_window
-
-        if getattr(self.domain, "time", None) is not None:
-            t0, t1, dt = _infer_time_window(self.domain)
-            if dt is None:
-                raise ValueError("jno.fdm transient: domain.time must have n_points >= 2.")
-            return self._march(self._initial_state(), t0, t1, dt, save_ts)
-
         bmask, bvals = self._dirichlet_mask_values()
 
         def residual_with_bc(u):
@@ -169,11 +140,10 @@ class FDMSystem:
         return _default_transient_integrate(block, {}, ts)
 
 
-def fdm(domain, residual, dirichlet=None, initial=None) -> FDMSystem:
+def fdm(domain, residual, dirichlet=None) -> FDMSystem:
     """Build a finite-difference system from a strong-form residual + Dirichlet BCs — the strong-form
-    sibling of :func:`jno.fem`. Pass ``initial=`` for a transient problem on a ``time=``-carrying
-    domain (``.solve()`` then marches in time). See :class:`FDMSystem`."""
-    return FDMSystem(domain, residual, dirichlet, initial)
+    sibling of :func:`jno.fem`. See :class:`FDMSystem`."""
+    return FDMSystem(domain, residual, dirichlet)
 
 
 fdm.laplacian = laplacian  # convenience: jno.fdm.laplacian(u, domain)
