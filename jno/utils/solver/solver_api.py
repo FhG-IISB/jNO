@@ -35,6 +35,7 @@ __all__ = [
     "LinearOperator",
     "LinearSolver",
     "NonlinearSolver",
+    "PrecondApplier",
     "PrecondContext",
     "materialize_precond",
     "prepare_precond",
@@ -42,6 +43,37 @@ __all__ = [
     "compose_nonlinear_solve_fn",
     "compose_transient_step_solvers",
 ]
+
+
+class PrecondApplier:
+    """A preconditioner application ``v -> M^{-1} v`` that also carries its **transpose** applier
+    ``.T`` (``v -> M^{-T} v``).
+
+    The reverse pass of a differentiable solve preconditions ``A^T`` and must use ``M^T``, not
+    ``M``: a preconditioner never changes the converged solution, so reusing ``M`` is *correct*,
+    but for a non-symmetric ``M`` (block-triangular Schur, ILU, ...) ``M`` approximates ``A^{-1}``
+    and is near-useless for ``A^T`` -- the adjoint Krylov solve then runs almost unpreconditioned
+    and dominates reverse-mode cost. Preconditioner specs build the transpose applier structurally
+    (transpose each block, swap the substitution direction, transpose the coupling matvecs), which
+    ``jax.linear_transpose`` cannot do through inner iterative/direct sub-solves.
+
+    ``fwd`` is the forward applier; ``t`` the transpose applier, or ``None`` for a **symmetric**
+    preconditioner (Jacobi, an SPD auxiliary form) -- then ``.T`` is the applier itself. A bare
+    callable preconditioner (no ``.T``) still works: callers fall back to reusing ``M``.
+    """
+
+    __slots__ = ("_fwd", "_t")
+
+    def __init__(self, fwd, t=None):
+        self._fwd = fwd
+        self._t = t
+
+    def __call__(self, v):
+        return self._fwd(v)
+
+    @property
+    def T(self) -> "PrecondApplier":
+        return self if self._t is None else PrecondApplier(self._t, self._fwd)
 
 
 class LinearOperator:

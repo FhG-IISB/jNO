@@ -25,7 +25,13 @@ from typing import Optional
 import jax
 import jax.numpy as jnp
 
-from .utils.solver.solver_api import LinearOperator, LinearSolver, NonlinearSolver, _maybe_residual_check
+from .utils.solver.solver_api import (
+    LinearOperator,
+    LinearSolver,
+    NonlinearSolver,
+    PrecondApplier,
+    _maybe_residual_check,
+)
 
 __all__ = [
     "LinearOperator",
@@ -121,7 +127,18 @@ def _firewalled(raw, op: LinearOperator, b, *, M, x0, symmetric: bool, name: str
     only affects convergence speed, never the converged solution).
     """
     fwd = lambda _mv, rhs: raw(op.mv, rhs, M=M, x0=x0)
-    rev = fwd if symmetric else (lambda _mv, rhs: raw(op.T.mv, rhs, M=M, x0=None))
+    if symmetric:
+        rev = fwd
+    else:
+        # The reverse pass solves A^T y = v and MUST be preconditioned by M^T, not M: a
+        # preconditioner never changes the converged solution, but for a non-symmetric M
+        # (block-triangular Schur, ILU) M approximates A^{-1} and is near-useless for A^T, so the
+        # adjoint Krylov solve runs almost unpreconditioned -- orders of magnitude more iterations
+        # than the forward (empirically ~90x the forward step for a Taylor-Hood Navier-Stokes
+        # step). jno.precond appliers carry a structural transpose (PrecondApplier.T); a bare
+        # callable preconditioner has none, so we fall back to reusing M (correct, maybe slow).
+        M_T = M.T if isinstance(M, PrecondApplier) else M
+        rev = lambda _mv, rhs: raw(op.T.mv, rhs, M=M_T, x0=None)
     x = jax.lax.custom_linear_solve(op.mv, b, fwd, transpose_solve=rev, symmetric=symmetric)
     return _maybe_residual_check(op, b, x, name)
 
