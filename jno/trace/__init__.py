@@ -2374,6 +2374,18 @@ class ModelCall(Placeholder):
 
     bind = partials
 
+    def __call__(self, *coords, **named):
+        """For a **nodal-field unknown** (``domain.unknown()``), ``u(xb, yb)`` is sugar for
+        ``u.bind(x=xb, y=yb)`` — the region-restricted form used to write fem-identical BCs / IC
+        (``u(xb, yb) - g``, ``u(x0, y0) - u0``); the region is carried by the coordinate variables'
+        tags, exactly as for a fem :class:`TrialFunction`. Any other ``ModelCall`` falls back to the
+        expression-reparameterization call (:meth:`Placeholder.__call__`)."""
+        if getattr(self.model, "_fem_field", None) == "node" and coords and all(isinstance(c, Variable) for c in coords):
+            binding = {axis: c for axis, c in zip(("x", "y", "z"), coords)}
+            binding.update(named)
+            return self.partials(**binding)
+        return super().__call__(*coords, **named)
+
     # ── proxied helpers (delegate to Model) ─────────────
 
     def dont_show(self):
