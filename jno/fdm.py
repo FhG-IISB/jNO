@@ -109,6 +109,55 @@ class FDMSystem:
         u0 = jnp.zeros(self._N) if x0 is None else jnp.asarray(x0)
         return driver(residual_with_bc, u0)
 
+    def solve_transient(self, u0, t_span, nsteps, *, save_ts=None):
+        """Method-of-lines transient solve of ``u̇ = 𝒩(u)`` with ``𝒩(u) = -residual(u)`` (so the SAME
+        residual serves steady and transient — the steady state is ``𝒩(u)=0``). Reuses jNO's
+        solver-agnostic :class:`SemidiscreteTimeBlock` + backward-Euler ``lax.scan`` integrator (the
+        stepper ``jno.fem`` transient uses), so no new time-stepping code — and it is ``custom_root``
+        differentiable, extending the inverse-problem story to time-dependent problems.
+
+        Collocation gives a trivial mass ``M = I`` (leaner than FEM); Dirichlet nodes carry a zero mass
+        row so they stay pinned at their value each step. Autonomous residuals only in v1 (no explicit
+        ``t`` / time-varying source yet).
+
+        Args:
+            u0: initial nodal field, shape ``(N,)``.
+            t_span: ``(t0, t1)``.
+            nsteps: number of backward-Euler steps (the integration ``dt = (t1-t0)/nsteps``).
+            save_ts: times to sample (default: the step grid).
+
+        Returns:
+            Trajectory ``u(save_ts)``, shape ``(len(save_ts), N)``.
+        """
+        import jax.experimental.sparse as jsparse
+
+        from .utils.solver.backend_blocks import (
+            SemidiscreteTimeBlock,
+            _block_time_grid,
+            _default_transient_integrate,
+        )
+
+        bmask, bvals = self._dirichlet_mask_values()
+        N = self._N
+        mvec = jnp.where(bmask, 0.0, 1.0)  # mass 0 on Dirichlet rows → those DOFs stay fixed at g
+        diag = jnp.stack([jnp.arange(N), jnp.arange(N)], axis=1)
+        M = jsparse.BCOO((mvec, diag), shape=(N, N))
+
+        def residual(wn, t, args):  # M u̇ + residual = 0  →  interior u̇ = -R = 𝒩;  boundary wn = g
+            return jnp.where(bmask, wn - bvals, self.residual(wn))
+
+        t0, t1 = float(t_span[0]), float(t_span[1])
+        block = SemidiscreteTimeBlock(
+            mass=lambda t, args: M,
+            residual=residual,
+            state0=jnp.asarray(u0),
+            t0=t0,
+            t1=t1,
+            dt=(t1 - t0) / int(nsteps),
+        )
+        ts = _block_time_grid(block) if save_ts is None else jnp.asarray(save_ts)
+        return _default_transient_integrate(block, {}, ts)
+
 
 def fdm(domain, residual, dirichlet=None) -> FDMSystem:
     """Build a finite-difference system from a strong-form residual + Dirichlet BCs — the strong-form

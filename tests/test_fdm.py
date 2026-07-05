@@ -97,3 +97,34 @@ def test_nonlinear_reaction_diffusion():
     sys = jno.fdm(d, residual=lambda u: -jno.fdm.laplacian(u, d) + u**3 - f, dirichlet={"boundary": 0.0})
     u = np.asarray(sys.solve()).reshape(-1)
     assert float(np.linalg.norm(u - exact) / np.linalg.norm(exact)) < 1e-2
+
+
+def test_transient_heat_2d():
+    """u_t = ν Δu, u₀ = sin(πx)sin(πy), homogeneous Dirichlet → exact e^(−2νπ²t)·sin(πx)sin(πy).
+    solve_transient reuses jno.fem's SemidiscreteTimeBlock stepper — no new time-integration code."""
+    nu, T = 0.05, 0.5
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06)
+    p = _nodes(d)
+    u0 = jnp.asarray(np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]))
+    sys = jno.fdm(d, residual=lambda u: -nu * jno.fdm.laplacian(u, d), dirichlet={"boundary": 0.0})
+    traj = np.asarray(sys.solve_transient(u0, t_span=(0.0, T), nsteps=200))
+    exact = np.exp(-2 * nu * np.pi**2 * T) * np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    assert traj.shape == (201, p.shape[0])
+    assert float(np.linalg.norm(traj[-1] - exact) / np.linalg.norm(exact)) < 1e-2
+
+
+def test_transient_differentiable_for_inverse():
+    """The transient solve differentiates w.r.t. a parameter (diffusivity) — time-dependent inverse."""
+    T = 0.5
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.08)
+    p = _nodes(d)
+    u0 = jnp.asarray(np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]))
+    target = jnp.asarray(np.exp(-2 * 0.05 * np.pi**2 * T) * np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]))
+
+    def loss(nu):
+        s = jno.fdm(d, residual=lambda u: -nu * jno.fdm.laplacian(u, d), dirichlet={"boundary": 0.0})
+        return jnp.mean((s.solve_transient(u0, (0.0, T), 200)[-1] - target) ** 2)
+
+    g = float(jax.grad(loss)(0.05))
+    assert np.isfinite(g)
+    assert float(loss(0.05)) < float(loss(0.07)), "true diffusivity should beat an off value"
