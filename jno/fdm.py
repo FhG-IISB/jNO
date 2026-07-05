@@ -12,9 +12,15 @@ through ``custom_root``, gradients to parameters inside it (a source, a coeffici
 ``jno.nn.wrap`` net) flow through — so ``jno.fdm`` composes into ``jno.core`` for inverse problems,
 exactly like ``jno.fem.solve()``.
 
-v1 scope: scalar, steady, 2-D triangular mesh, Dirichlet BCs (linear + nonlinear residuals).
-Neumann/Robin, periodic, transient (method-of-lines, ``M = I``), and a structured-grid stencil backend
-are planned extensions (see ``plans/fdm-solver.md``).
+Two front-ends: a **fem-style constraint list** (preferred) — ``jno.fdm([residual, u(xb, yb) - g,
+u(xi, yi) - u0])`` authored with ``u = domain.unknown()`` exactly as ``jno.fem([...])``, where the
+initial condition is *found from the constraints* (never a config flag) and ``t_span``/step-count are
+inferred from ``domain.time`` — and a low-level **function form** (:class:`FDMSystem`).
+
+v1 scope: scalar, 2-D triangular mesh, Dirichlet BCs (linear + nonlinear residuals), and **transient**
+problems by method-of-lines (``M = I``; a unit-coefficient ``u.t`` term, e.g. ``ui.t - νΔu``).
+Neumann/Robin, periodic, a general ``u.t`` mass coefficient, and a structured-grid stencil backend are
+planned extensions (see ``plans/fdm-solver.md``).
 """
 
 from __future__ import annotations
@@ -189,36 +195,101 @@ def _contains_unknown(node, model):
 
 def _region_tag(constraint):
     cv = getattr(constraint, "_coord_vars", None) or {}
-    tags = {v.tag for v in cv.values()}
+    tags = {v.tag for v in cv.values() if getattr(v, "axis", None) != "temporal"}  # spatial region only
     return next(iter(tags)) if len(tags) == 1 else (tags or {None})
+
+
+def _has_temporal(node):
+    """Does the expression contain a strong-form time derivative ``u.t`` (:class:`TemporalDerivative`)?"""
+    from .trace import TemporalDerivative
+
+    n = _unwrap(node)
+    if isinstance(n, TemporalDerivative):
+        return True
+    return any(_has_temporal(c) for c in _iter(n))
+
+
+def _zero_temporal(node):
+    """Strong-form method-of-lines split: drop the ``u.t`` (:class:`TemporalDerivative`) terms, leaving
+    the **spatial** residual ``R_spatial``. The semidiscrete form ``M u̇ + R_spatial = 0`` (collocation
+    ⇒ ``M = I``) then reads ``u̇ = -R_spatial`` — e.g. ``u.t - νΔu`` ⟶ ``-νΔu`` ⟹ ``u̇ = νΔu``. This
+    mirrors fem's :func:`_strip_temporal_trial_derivative` (which folds ``d/dt(u)·φ`` into the mass
+    operator); here ``M = I`` carries ``u̇`` so the term is dropped outright. v1 assumes a **unit
+    coefficient** on ``u.t`` (the standard ``u.t - 𝒩(u)`` form); a general mass coefficient is future work."""
+    from .trace import BinaryOp, FunctionCall, Hessian, Jacobian, Literal, Placeholder, TemporalDerivative
+
+    if isinstance(node, TemporalDerivative):
+        return Literal(0.0)
+    if isinstance(node, BinaryOp):
+        return BinaryOp(node.op, _zero_temporal(node.left), _zero_temporal(node.right))
+    if isinstance(node, FunctionCall):
+        return node.copy_with_args([_zero_temporal(a) if isinstance(a, Placeholder) else a for a in node.args])
+    if isinstance(node, Jacobian):
+        return Jacobian(_zero_temporal(node.target), node.variables, node.scheme)
+    if isinstance(node, Hessian):
+        return Hessian(_zero_temporal(node.target), node.variables, node.scheme, node.trace)
+    return node
 
 
 class _TraceFDM:
     """Finite-difference system authored as a fem-style constraint list with ``u = domain.unknown()``:
     ``jno.fdm([-u.d2(x) - u.d2(y) - f, u(xb, yb) - g]).solve()``. Constraints are classified by the
-    region their coordinate variables carry — interior → the strong-form PDE residual, a boundary tag
-    → a Dirichlet condition ``u(region) - g``."""
+    region their coordinate variables carry — the ``interior`` → the strong-form PDE residual, a
+    boundary tag → a Dirichlet condition ``u(region) - g``, and the ``initial`` region → the initial
+    condition ``u(initial) - u0`` (exactly as in :func:`jno.fem`). A problem is **transient** iff it
+    carries an initial condition; ``t_span`` and the step count are then inferred from ``domain.time``
+    (never passed as args) and the system marches with the same method-of-lines stepper :func:`jno.fem`
+    uses. The one config that stays on the object it describes is the FD **stencil** per operator
+    (``u.d2(x, scheme=...)``)."""
 
     def __init__(self, constraints):
         self.unknown = _find_unknown(constraints)
         self.domain = self.unknown._fem_field_domain
         self._N = int(np.asarray(self.domain.mesh_connectivity["points"]).shape[0])
         self._pts = jnp.asarray(np.asarray(self.domain.mesh_connectivity["points"])[:, : self.domain.dimension])
-        self._pde, self._dirichlet = [], []
+        self._pde, self._dirichlet, self._ic = [], [], []
         boundary_tags = set(getattr(self.domain, "_boundary_registry", {}).keys()) | {"boundary"}
         for c in constraints:
             tag = _region_tag(c)
-            (self._dirichlet if isinstance(tag, str) and tag in boundary_tags else self._pde).append(c)
+            if isinstance(tag, str) and tag == "initial":
+                self._ic.append(c)
+            elif isinstance(tag, str) and tag in boundary_tags:
+                self._dirichlet.append(c)
+            else:
+                self._pde.append(c)
         if not self._pde:
-            raise ValueError("jno.fdm([...]): no interior PDE residual found (only boundary conditions).")
+            raise ValueError("jno.fdm([...]): no interior PDE residual found (only boundary/initial conditions).")
+        self._transient = bool(self._ic)
+        pde_has_dt = any(_has_temporal(c) for c in self._pde)
+        if self._transient:
+            if not (getattr(self.domain, "_is_time_dependent", False) and self.domain.time is not None):
+                raise ValueError(
+                    "jno.fdm([...]): an initial condition `u(initial) - u0` requires a time-dependent domain "
+                    "— build it with `jno.domain(..., time=(t0, t1, n_steps))`."
+                )
+            if not pde_has_dt:
+                raise ValueError(
+                    "jno.fdm([...]): an initial condition was given but the PDE residual has no time derivative "
+                    "`u.t` — add the `u.t` term (e.g. `ui.t - nu*(ui.d2(x) + ui.d2(y))`)."
+                )
+        elif pde_has_dt:
+            raise ValueError(
+                "jno.fdm([...]): the PDE residual has a time derivative `u.t` but no initial condition — "
+                "add `u(xi, yi) - u0` (with `xi, yi = domain.variable('initial', split=True)`)."
+            )
 
     def _region_nodes(self, tag):
+        if tag == "initial":
+            return np.arange(self._N, dtype=int)  # the IC is the whole spatial field at t=t0
         reg = getattr(self.domain, "_boundary_registry", {}).get(tag)
         if reg is not None and len(reg.get("point_indices", [])) > 0:
             return np.asarray(reg["point_indices"], dtype=int)
         return np.asarray(self.domain.mesh_connectivity["boundary_indices"], dtype=int)
 
-    def _pde_residual_fn(self):
+    def _pde_residual_fn(self, *, spatial=False):
+        """Differentiable residual over the nodal DOF vector, collocated at the mesh nodes. With
+        ``spatial=True`` the ``u.t`` terms are dropped (:func:`_zero_temporal`) to give the
+        method-of-lines spatial residual ``R_spatial`` for the semidiscrete march."""
         import equinox as eqx
 
         from .trace_evaluator import TraceEvaluator
@@ -227,8 +298,15 @@ class _TraceFDM:
         for c in self._pde[1:]:
             expr = expr + c
         expr = _unwrap(expr)
-        tags = {v.tag for c in self._pde for v in (getattr(c, "_coord_vars", None) or {}).values()}
-        context = {t: self._pts for t in tags}  # collocate every term at the mesh nodes
+        if spatial:
+            expr = _zero_temporal(expr)
+        spatial_tags = {  # collocate every spatial term at the mesh nodes (temporal tags carry no field)
+            v.tag
+            for c in self._pde
+            for v in (getattr(c, "_coord_vars", None) or {}).values()
+            if getattr(v, "axis", None) != "temporal"
+        }
+        context = {t: self._pts for t in spatial_tags}
         lid, base = self.unknown.layer_id, self.unknown.module
 
         def residual_fn(dofs):
@@ -238,28 +316,49 @@ class _TraceFDM:
 
         return residual_fn
 
-    def _dirichlet_rows(self):
+    def _condition_value(self, constraint, idx):
+        """Value ``g`` of an affine condition ``u(region) - g`` (Dirichlet or IC), evaluated at the
+        region's nodes ``idx`` — reused for both boundary conditions and the initial state."""
         from ._fem import _eval_value_node_at
 
+        inner = _unwrap(constraint)
+        g_node = 0.0
+        if getattr(inner, "op", None) == "-":  # u(region) - g  →  g is the side without the unknown
+            g_node = inner.right if _contains_unknown(inner.left, self.unknown) else inner.left
+        if isinstance(g_node, (int, float)):
+            return jnp.full((idx.shape[0],), float(g_node))
+        return jnp.asarray(_eval_value_node_at(g_node, np.asarray(self._pts)[idx])).reshape(-1)
+
+    def _dirichlet_rows(self):
         rows = []
         for c in self._dirichlet:
             idx = self._region_nodes(_region_tag(c))
-            inner = _unwrap(c)
-            g_node = 0.0
-            if getattr(inner, "op", None) == "-":  # u(region) - g  →  g is the side without the unknown
-                g_node = inner.right if _contains_unknown(inner.left, self.unknown) else inner.left
-            gvals = (
-                jnp.full((idx.shape[0],), float(g_node))
-                if isinstance(g_node, (int, float))
-                else jnp.asarray(_eval_value_node_at(g_node, np.asarray(self._pts)[idx])).reshape(-1)
-            )
-            rows.append((jnp.asarray(idx), gvals))
+            rows.append((jnp.asarray(idx), self._condition_value(c, idx)))
         return rows
 
+    def _initial_state(self):
+        """Initial nodal state ``u0`` (shape ``(N,)``) from the ``u(initial) - u0`` condition(s), the
+        same way :func:`jno.fem` reads its IC — the IC is data found from the constraints, never a flag."""
+        u0 = jnp.zeros(self._N)
+        allnodes = np.arange(self._N, dtype=int)
+        for c in self._ic:
+            idx = self._region_nodes(_region_tag(c))  # "initial" → all nodes
+            vals = self._condition_value(c, idx)
+            u0 = u0.at[jnp.asarray(idx if len(idx) else allnodes)].set(vals)
+        return u0
+
     def solve(self, nonlinear=None, x0=None):
-        """Solve the strong-form system — Dirichlet rows fold into the residual (``u - g`` on the region),
-        the interior is the PDE residual; handed to the same ``jno.solve`` Newton–Krylov + ``custom_root``
-        machinery ``jno.fem`` uses (linear/nonlinear uniform, differentiable for inverse problems)."""
+        """Solve the strong-form system. **Steady** problems fold the Dirichlet rows into the residual
+        (``u - g`` on the region) and hand it to the same ``jno.solve`` Newton–Krylov + ``custom_root``
+        machinery ``jno.fem`` uses (linear/nonlinear uniform, differentiable for inverse problems).
+        **Transient** problems (an ``u(initial) - u0`` condition is present) march by method-of-lines —
+        ``t_span`` and the step count come from ``domain.time`` and the initial state from the IC — and
+        return the trajectory (``(n_save, N)``); ``x0`` is rejected (the IC owns the initial state)."""
+        if self._transient:
+            if x0 is not None:
+                raise ValueError("jno.fdm([...]): x0= is rejected for a transient problem — the IC owns the state.")
+            return self._march(nonlinear=nonlinear)
+
         residual_fn = self._pde_residual_fn()
         rows = self._dirichlet_rows()
 
@@ -272,6 +371,50 @@ class _TraceFDM:
         driver = nonlinear or _solve.newton()
         u0 = jnp.zeros(self._N) if x0 is None else jnp.asarray(x0)
         return driver(residual_with_bc, u0)
+
+    def _march(self, *, nonlinear=None, save_ts=None):
+        """Method-of-lines march of ``u̇ = -R_spatial(u)`` reusing jNO's solver-agnostic
+        :class:`SemidiscreteTimeBlock` + backward-Euler ``lax.scan`` integrator (no new time-stepping
+        code, ``custom_root`` differentiable). ``M = I`` on interior nodes; Dirichlet nodes carry a zero
+        mass row so they stay pinned at ``g``. ``t_span``/``dt`` are inferred from ``domain.time``."""
+        import jax.experimental.sparse as jsparse
+
+        from .utils.solver.backend_blocks import (
+            SemidiscreteTimeBlock,
+            _block_time_grid,
+            _default_transient_integrate,
+        )
+        from .utils.solver.time_route import _infer_time_window
+
+        t0, t1, dt = _infer_time_window(self.domain)
+        if dt is None:
+            raise ValueError("jno.fdm([...]): domain.time must specify n_steps >= 2 for a transient march.")
+
+        rows = self._dirichlet_rows()
+        bmask = np.zeros(self._N, dtype=bool)
+        bvals = np.zeros(self._N)
+        for idx, gv in rows:
+            bmask[np.asarray(idx)] = True
+            bvals[np.asarray(idx)] = np.asarray(gv)
+        bmask, bvals = jnp.asarray(bmask), jnp.asarray(bvals)
+
+        spatial_res = self._pde_residual_fn(spatial=True)
+        diag = jnp.stack([jnp.arange(self._N), jnp.arange(self._N)], axis=1)
+        M = jsparse.BCOO((jnp.where(bmask, 0.0, 1.0), diag), shape=(self._N, self._N))  # 0 mass on Dirichlet rows
+
+        def residual(wn, t, args):  # M u̇ + R_spatial = 0  →  interior u̇ = -R_spatial;  boundary wn = g
+            return jnp.where(bmask, wn - bvals, spatial_res(wn))
+
+        block = SemidiscreteTimeBlock(
+            mass=lambda t, args: M,
+            residual=residual,
+            state0=self._initial_state(),
+            t0=float(t0),
+            t1=float(t1),
+            dt=float(dt),
+        )
+        ts = _block_time_grid(block) if save_ts is None else jnp.asarray(save_ts)
+        return _default_transient_integrate(block, {}, ts)
 
 
 def fdm(constraints_or_domain, residual=None, dirichlet=None):

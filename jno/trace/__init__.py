@@ -2369,7 +2369,15 @@ class ModelCall(Placeholder):
         """Bind named coordinate Variables for attribute-style / ``.d`` derivatives — the SAME idiom as
         the fem trial from :meth:`fem_symbols` (``u.bind(x=x, y=y).d2(x)``, ``ui.x``) and the PINN field
         ``net(x).scalar.bind(x=x)``. Lets a valued field (``jno.np.parameter``/``domain.unknown()``) be
-        authored exactly like a fem symbol."""
+        authored exactly like a fem symbol.
+
+        A **nodal field** (``domain.unknown()`` / ``jno.np.parameter(<fem symbol>)``) is a mesh-shaped
+        output whose coordinates are not network inputs, so it binds through the :class:`FieldView`
+        path — the SAME view the fem trial uses. That makes ``.t`` a genuine :class:`TemporalDerivative`
+        (not a lexical spatial partial), so the strong form reads identically to the weak form
+        (``ui.t - nu*(ui.d2(x) + ui.d2(y))``)."""
+        if getattr(self.model, "_fem_field", None) == "node":
+            return self.field.partials(**named_vars)
         return self.scalar.partials(**named_vars)
 
     bind = partials

@@ -177,3 +177,42 @@ def test_constraint_list_inhomogeneous_dirichlet():
     sch = "finite_difference"
     sol = jno.fdm([-ui.d2(x, scheme=sch) - ui.d2(y, scheme=sch) + 4.0, u(xb, yb) - (xb**2 + yb**2)]).solve()
     assert float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact)) < 1e-2
+
+
+def test_constraint_list_transient_heat():
+    """fem-style transient authoring: the IC is a `u(xi, yi) - u0` constraint (NOT a config arg), and
+    t_span/step-count come from domain.time. u_t = ν Δu with homogeneous Dirichlet → e^(−2νπ²t)·u0."""
+    import jno.jnp_ops as jnn
+
+    nu, T = 0.05, 0.5
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06, time=(0.0, T, 200))
+    p = _nodes(d)
+    x, y, t = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("initial", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    sch = "finite_difference"
+    traj = np.asarray(
+        jno.fdm(
+            [
+                ui.t - nu * (ui.d2(x, scheme=sch) + ui.d2(y, scheme=sch)),  # u_t = ν Δu
+                u(xb, yb) - 0.0,  # Dirichlet
+                u(xi, yi) - jnn.sin(np.pi * xi) * jnn.sin(np.pi * yi),  # IC
+            ]
+        ).solve()
+    )
+    exact = np.exp(-2 * nu * np.pi**2 * T) * np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    assert traj.shape[1] == p.shape[0]
+    assert float(np.linalg.norm(traj[-1] - exact) / np.linalg.norm(exact)) < 2e-2
+
+
+def test_constraint_list_transient_requires_ic():
+    """Guard: a `u.t` term in the PDE with no `u(initial) - u0` condition is a clear ValueError
+    (the IC is found from the constraints the same way jno.fem does it, never a config flag)."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15, time=(0.0, 0.5, 50))
+    x, y, t = d.variable("interior", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, t=t)
+    with pytest.raises(ValueError, match="no initial condition"):
+        jno.fdm([ui.t - 0.05 * (ui.d2(x, scheme="finite_difference") + ui.d2(y, scheme="finite_difference"))])
