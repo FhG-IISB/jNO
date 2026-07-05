@@ -141,3 +141,39 @@ def test_domain_unknown_is_valued_nodal_field():
     assert hasattr(u, "d") and hasattr(u, "d2")  # supports strong-form derivatives (u.d(x), u.d2(x))
     ui = u.bind(x=x, y=y)  # .bind like fem symbols (u.bind(x=xi, y=yi))
     assert hasattr(ui, "x") and hasattr(ui, "d2")  # bound view supports fem-style authoring
+
+
+# ==========================================================================
+# constraint-list front-end (fem-style: jno.fdm([...]) with u = domain.unknown())
+# ==========================================================================
+
+
+def test_constraint_list_poisson():
+    """fem-style authoring: jno.fdm([-Δu - f, u(xb,yb) - 0]) with u = domain.unknown()."""
+    import jno.jnp_ops as jnn
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    p = _nodes(d)
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    sch = "finite_difference"
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    sol = jno.fdm([-ui.d2(x, scheme=sch) - ui.d2(y, scheme=sch) - f, u(xb, yb) - 0.0]).solve()
+    assert float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact)) < 3e-2
+
+
+def test_constraint_list_inhomogeneous_dirichlet():
+    """u = x²+y², -Δu = -4, with inhomogeneous Dirichlet g(x,y)=x²+y² as a constraint (validates g-eval)."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.05)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    p = _nodes(d)
+    exact = p[:, 0] ** 2 + p[:, 1] ** 2
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    sch = "finite_difference"
+    sol = jno.fdm([-ui.d2(x, scheme=sch) - ui.d2(y, scheme=sch) + 4.0, u(xb, yb) - (xb**2 + yb**2)]).solve()
+    assert float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact)) < 1e-2

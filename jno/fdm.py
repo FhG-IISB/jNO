@@ -140,10 +140,152 @@ class FDMSystem:
         return _default_transient_integrate(block, {}, ts)
 
 
-def fdm(domain, residual, dirichlet=None) -> FDMSystem:
-    """Build a finite-difference system from a strong-form residual + Dirichlet BCs — the strong-form
-    sibling of :func:`jno.fem`. See :class:`FDMSystem`."""
-    return FDMSystem(domain, residual, dirichlet)
+# ============================================================================
+# Trace-based constraint-list front-end — authored like jno.fem, with u = domain.unknown()
+# ============================================================================
+
+
+def _unwrap(node):
+    return getattr(node, "_expr", node)  # view -> underlying Placeholder
+
+
+def _iter(node):
+    from .utils.solver.solver_helper import iter_children
+
+    return iter_children(node) or ()
+
+
+def _find_unknown(constraints):
+    """The single ``domain.unknown()`` field (a nodal-field-parameter ModelCall's Model) in the list."""
+    from .trace import ModelCall
+
+    models = {}
+
+    def walk(n):
+        n = _unwrap(n)
+        if isinstance(n, ModelCall) and getattr(n.model, "_fem_field", None) == "node":
+            models[n.model.layer_id] = n.model
+        for c in _iter(n):
+            walk(c)
+
+    for c in constraints:
+        walk(c)
+    if len(models) != 1:
+        raise ValueError(
+            f"jno.fdm([...]): expected exactly one domain.unknown() field in the constraints, found "
+            f"{len(models)}. Author the strong form with a single `u = domain.unknown()`."
+        )
+    return next(iter(models.values()))
+
+
+def _contains_unknown(node, model):
+    from .trace import ModelCall
+
+    n = _unwrap(node)
+    if isinstance(n, ModelCall) and n.model is model:
+        return True
+    return any(_contains_unknown(c, model) for c in _iter(n))
+
+
+def _region_tag(constraint):
+    cv = getattr(constraint, "_coord_vars", None) or {}
+    tags = {v.tag for v in cv.values()}
+    return next(iter(tags)) if len(tags) == 1 else (tags or {None})
+
+
+class _TraceFDM:
+    """Finite-difference system authored as a fem-style constraint list with ``u = domain.unknown()``:
+    ``jno.fdm([-u.d2(x) - u.d2(y) - f, u(xb, yb) - g]).solve()``. Constraints are classified by the
+    region their coordinate variables carry — interior → the strong-form PDE residual, a boundary tag
+    → a Dirichlet condition ``u(region) - g``."""
+
+    def __init__(self, constraints):
+        self.unknown = _find_unknown(constraints)
+        self.domain = self.unknown._fem_field_domain
+        self._N = int(np.asarray(self.domain.mesh_connectivity["points"]).shape[0])
+        self._pts = jnp.asarray(np.asarray(self.domain.mesh_connectivity["points"])[:, : self.domain.dimension])
+        self._pde, self._dirichlet = [], []
+        boundary_tags = set(getattr(self.domain, "_boundary_registry", {}).keys()) | {"boundary"}
+        for c in constraints:
+            tag = _region_tag(c)
+            (self._dirichlet if isinstance(tag, str) and tag in boundary_tags else self._pde).append(c)
+        if not self._pde:
+            raise ValueError("jno.fdm([...]): no interior PDE residual found (only boundary conditions).")
+
+    def _region_nodes(self, tag):
+        reg = getattr(self.domain, "_boundary_registry", {}).get(tag)
+        if reg is not None and len(reg.get("point_indices", [])) > 0:
+            return np.asarray(reg["point_indices"], dtype=int)
+        return np.asarray(self.domain.mesh_connectivity["boundary_indices"], dtype=int)
+
+    def _pde_residual_fn(self):
+        import equinox as eqx
+
+        from .trace_evaluator import TraceEvaluator
+
+        expr = self._pde[0]
+        for c in self._pde[1:]:
+            expr = expr + c
+        expr = _unwrap(expr)
+        tags = {v.tag for c in self._pde for v in (getattr(c, "_coord_vars", None) or {}).values()}
+        context = {t: self._pts for t in tags}  # collocate every term at the mesh nodes
+        lid, base = self.unknown.layer_id, self.unknown.module
+
+        def residual_fn(dofs):
+            mod = eqx.tree_at(lambda m: m.value, base, jnp.asarray(dofs).astype(base.value.dtype))
+            ev = TraceEvaluator(params={lid: mod})
+            return jnp.asarray(ev.evaluate(expr, context=context, var_bindings={})).reshape(-1)
+
+        return residual_fn
+
+    def _dirichlet_rows(self):
+        from ._fem import _eval_value_node_at
+
+        rows = []
+        for c in self._dirichlet:
+            idx = self._region_nodes(_region_tag(c))
+            inner = _unwrap(c)
+            g_node = 0.0
+            if getattr(inner, "op", None) == "-":  # u(region) - g  →  g is the side without the unknown
+                g_node = inner.right if _contains_unknown(inner.left, self.unknown) else inner.left
+            gvals = (
+                jnp.full((idx.shape[0],), float(g_node))
+                if isinstance(g_node, (int, float))
+                else jnp.asarray(_eval_value_node_at(g_node, np.asarray(self._pts)[idx])).reshape(-1)
+            )
+            rows.append((jnp.asarray(idx), gvals))
+        return rows
+
+    def solve(self, nonlinear=None, x0=None):
+        """Solve the strong-form system — Dirichlet rows fold into the residual (``u - g`` on the region),
+        the interior is the PDE residual; handed to the same ``jno.solve`` Newton–Krylov + ``custom_root``
+        machinery ``jno.fem`` uses (linear/nonlinear uniform, differentiable for inverse problems)."""
+        residual_fn = self._pde_residual_fn()
+        rows = self._dirichlet_rows()
+
+        def residual_with_bc(u):
+            r = residual_fn(u)
+            for idx, gvals in rows:
+                r = r.at[idx].set(u[idx] - gvals)
+            return r
+
+        driver = nonlinear or _solve.newton()
+        u0 = jnp.zeros(self._N) if x0 is None else jnp.asarray(x0)
+        return driver(residual_with_bc, u0)
+
+
+def fdm(constraints_or_domain, residual=None, dirichlet=None):
+    """Finite-difference PDE solver — the strong-form sibling of :func:`jno.fem`.
+
+    **Constraint-list form** (fem-style, preferred): ``jno.fdm([residual, u(xb, yb) - g])`` authored with
+    ``u = domain.unknown()`` and strong-form derivatives (``u.d2(x, scheme=...)``). Constraints are
+    classified by region (interior → PDE residual, boundary → Dirichlet).
+
+    **Function form** (low-level): ``jno.fdm(domain, residual=lambda u: ..., dirichlet={region: g})`` —
+    a plain differentiable residual over the nodal DOF vector; see :class:`FDMSystem`."""
+    if isinstance(constraints_or_domain, (list, tuple)):
+        return _TraceFDM(list(constraints_or_domain))
+    return FDMSystem(constraints_or_domain, residual, dirichlet)
 
 
 fdm.laplacian = laplacian  # convenience: jno.fdm.laplacian(u, domain)
