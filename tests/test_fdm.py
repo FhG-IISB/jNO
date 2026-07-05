@@ -132,9 +132,12 @@ def test_transient_differentiable_for_inverse():
 
 def test_domain_unknown_is_valued_nodal_field():
     """`domain.unknown()` → a valued P1 nodal field sized to the mesh (the strong-form counterpart to
-    the symbolic `fem_symbols()` trial); supports strong-form derivatives."""
+    the symbolic `fem_symbols()` trial); supports strong-form derivatives and `.bind()` like a fem trial."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
     n_nodes = _nodes(d).shape[0]
+    x, y, _ = d.variable("interior", split=True)
     u = d.unknown()
     assert u.model.module.value.shape == (n_nodes,)  # one DOF per mesh node
     assert hasattr(u, "d") and hasattr(u, "d2")  # supports strong-form derivatives (u.d(x), u.d2(x))
+    ui = u.bind(x=x, y=y)  # .bind like fem symbols (u.bind(x=xi, y=yi))
+    assert hasattr(ui, "x") and hasattr(ui, "d2")  # bound view supports fem-style authoring

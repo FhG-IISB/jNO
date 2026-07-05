@@ -2365,6 +2365,15 @@ class ModelCall(Placeholder):
         args_str = ", ".join(str(a) for a in self.args)
         return f"{self.model}({args_str})"
 
+    def partials(self, **named_vars):
+        """Bind named coordinate Variables for attribute-style / ``.d`` derivatives — the SAME idiom as
+        the fem trial from :meth:`fem_symbols` (``u.bind(x=x, y=y).d2(x)``, ``ui.x``) and the PINN field
+        ``net(x).scalar.bind(x=x)``. Lets a valued field (``jno.np.parameter``/``domain.unknown()``) be
+        authored exactly like a fem symbol."""
+        return self.scalar.partials(**named_vars)
+
+    bind = partials
+
     # ── proxied helpers (delegate to Model) ─────────────
 
     def dont_show(self):
