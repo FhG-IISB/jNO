@@ -1234,6 +1234,24 @@ class domain(MeshIOMixin):
         """Advanced helper for explicit FEM-only authoring."""
         return TrialFunction(name=name, value_shape=value_shape, order=order)
 
+    def unknown(self, value_shape=(), name="u"):
+        """The discrete **unknown solution field** on this domain's mesh — a *valued* P1 nodal field
+        for strong-form / collocation methods (``jno.fdm``, …), the counterpart to the *symbolic*
+        trial from :meth:`fem_symbols`.
+
+        Where ``fem_symbols()`` gives an abstract weak-form ``TrialFunction`` (valued only during FE
+        assembly), ``unknown()`` gives a field whose DOFs *are* the unknown, so it supports strong-form
+        derivatives (``u.d2(x, scheme=...)``) and is the object a strong-form solver solves for::
+
+            u = domain.unknown()
+            jno.fdm([-u.d2(x) - u.d2(y) - f, u(xb, yb) - g]).solve()
+        """
+        from ..architectures.models import parameter
+
+        sym = TrialFunction(name=name, value_shape=value_shape, order=1)
+        sym._domain = self  # so parameter() sizes a P1 nodal field to this mesh's DOFs
+        return parameter(sym)
+
     def _register_variational_sample(
         self,
         sample_tag: str,

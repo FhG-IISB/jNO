@@ -144,3 +144,13 @@ def test_transient_differentiable_for_inverse():
     g = float(jax.grad(loss)(0.05))
     assert np.isfinite(g)
     assert float(loss(0.05)) < float(loss(0.07)), "true diffusivity should beat an off value"
+
+
+def test_domain_unknown_is_valued_nodal_field():
+    """`domain.unknown()` → a valued P1 nodal field sized to the mesh (the strong-form counterpart to
+    the symbolic `fem_symbols()` trial); supports strong-form derivatives."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+    n_nodes = _nodes(d).shape[0]
+    u = d.unknown()
+    assert u.model.module.value.shape == (n_nodes,)  # one DOF per mesh node
+    assert hasattr(u, "d") and hasattr(u, "d2")  # supports strong-form derivatives (u.d(x), u.d2(x))
