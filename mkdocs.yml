@@ -104,6 +104,7 @@ nav:
   - Inverse Problems: inverse-problems.md
   - Save, Load and Configuration: Save-Load-and-Configuration.md
   - Finite Element Method: fem.md
+  - Finite Difference Method: fdm.md
   - Foundation Models: foundation_models/index.md
   - Tutorials:
     - 01 Basics:
@@ -186,6 +187,11 @@ nav:
       - Adaptive Mesh Refinement (L-shape): tutorials/08-fem-and-varpinns/adaptive-l-shape.md
       - Adaptive Mesh + Inverse Design: tutorials/08-fem-and-varpinns/adaptive-inverse-lshape.md
       - Anisotropic Refinement (thin layer): tutorials/08-fem-and-varpinns/anisotropic-layer.md
+    - 09 Finite Difference Method:
+      - Poisson 2D: tutorials/09-fdm/poisson-2d-fdm.md
+      - Mixed Boundary Conditions: tutorials/09-fdm/mixed-bc-fdm.md
+      - Transient Heat 2D: tutorials/09-fdm/heat-2d-fdm.md
+      - Differentiable Inverse: tutorials/09-fdm/inverse-source-fdm.md
     - 09 Weights & Biases:
       - W&B Integration: tutorials/09-wandb/wandb-integration.md
     - 10 Bayesian PINNs:
