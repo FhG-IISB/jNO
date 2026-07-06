@@ -2980,8 +2980,8 @@ class FemLinearSystem:
         ``crux.solve``), any runtime parameters ``θ`` are resolved to their current
         values, :meth:`evaluate` forms ``A(θ), b(θ)``, and ``solve_fn`` solves them.
         Gradients flow back to the parameters through ``solve_fn`` — so an inverse
-        problem is just ``crux([(fem.solve() - u_obs).mse], domain=...)`` where
-        ``fem = jno.fem([...])`` (see ``docs/inverse-problems.md``).
+        problem is just ``crux([(fem.solve() - u_obs).mse])`` where ``fem = jno.fem([...])``
+        (the domain is inferred from the solve node; see ``docs/inverse-problems.md``).
 
         ``solve_fn`` is **your** solver: any ``(A, b) -> u`` callable. jNO writes no
         solver code and imposes no library — the default is the differentiable sparse-direct

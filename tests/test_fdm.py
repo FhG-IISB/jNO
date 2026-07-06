@@ -379,7 +379,8 @@ def test_constraint_list_inverse_via_crux():
     node = jno.fdm([-ui.d2(x) - ui.d2(y) - s * f_base, u(xb, yb) - 0.0]).solve()
     assert isinstance(node, FunctionCall), "a trainable parameter must make .solve() a deferred crux node"
 
-    crux = jno.core([(node - observed).mse], domain=jno.domain.from_array({"_": np.zeros((1, 1))}))
+    crux = jno.core([(node - observed).mse])  # NO domain= — jno.core infers it from the solve node's graph
+    assert crux.domain is d, "jno.core must infer the domain from the solve node in the graph"
     crux.solve(120)
     rec = float(np.asarray(crux.eval([s])).reshape(-1)[0])
     assert abs(rec - 1.0) < 2e-2, f"crux did not recover the source amplitude: s={rec:.4f}"

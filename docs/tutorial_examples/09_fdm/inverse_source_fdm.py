@@ -37,7 +37,7 @@ s.dtype(jnp.float64)
 s.initialize(jax.nn.initializers.constant(2.5))  # deliberately wrong start
 s.optimizer(optax.adam(1e-1))
 solve = jno.fdm([-ui.d2(x) - ui.d2(y) - s * f_base, u(xb, yb) - 0.0]).solve()  # a differentiable trace node
-crux = jno.core([(solve - observed).mse], domain=jno.domain.from_array({"_": np.zeros((1, 1))}))
+crux = jno.core([(solve - observed).mse])  # domain inferred from the graph — no explicit domain= needed
 crux.solve(150)
 
 rec = float(np.asarray(crux.eval([s])).reshape(-1)[0])  # the recovered amplitude (do NOT index [0] on a field)

@@ -1043,7 +1043,7 @@ class FEM:
 
             alpha = jno.np.parameter((1,), name="alpha")
             fem = jno.fem([alpha * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
-            crux = jno.core([(fem.solve() - u_obs).mse], domain=obs_domain)
+            crux = jno.core([(fem.solve() - u_obs).mse])   # domain inferred from the solve node
             crux.solve(n)                      # recovers alpha
 
         ``solve_fn`` is **your** solver (jNO writes none):
@@ -1098,6 +1098,17 @@ class FEM:
         complex/complex-transient problems, and slots combined with ``adapt=`` (remeshing
         invalidates warm starts and cached preconditioner setups — pass ``solve_fn=`` there).
         """
+        result = self._solve_dispatch(
+            solve_fn, adapt=adapt, x0=x0, nonlinear=nonlinear, linear=linear, precond=precond, **kwargs
+        )
+        if isinstance(result, Placeholder):
+            # Tag the solve node with its domain so jno.core can infer the domain straight from the graph
+            # (a data-misfit inverse `jno.core([(fem.solve() - u_obs).mse])` needs no explicit `domain=`).
+            result._domain = self.domain
+        return result
+
+    def _solve_dispatch(self, solve_fn=None, *, adapt=None, x0=None, nonlinear=None, linear=None, precond=None, **kwargs):
+        """Mode dispatch for :meth:`solve` — returns the solution array or a differentiable trace node."""
         has_slots = (x0 is not None) or (nonlinear is not None) or (linear is not None) or (precond is not None)
         if adapt is not None:
             if has_slots:

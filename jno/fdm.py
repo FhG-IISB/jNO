@@ -605,7 +605,9 @@ class _TraceFDM:
             }
             return self._steady_solve(nonlinear=nonlinear, x0=x0, extra_params=extra)
 
-        return FunctionCall(_solve, param_nodes, name="fdm_solve")
+        node = FunctionCall(_solve, param_nodes, name="fdm_solve")
+        node._domain = self.domain  # so jno.core infers the domain from the graph (no explicit domain= needed)
+        return node
 
     def _march(self, *, nonlinear=None, save_ts=None):
         """Method-of-lines march of ``u̇ = -R_spatial(u)`` reusing jNO's solver-agnostic

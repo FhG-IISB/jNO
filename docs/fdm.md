@@ -163,7 +163,7 @@ s.optimizer(optax.adam(1e-1))
 u = d.unknown(); ui = u.bind(x=x, y=y)
 
 solve = jno.fdm([-ui.d2(x) - ui.d2(y) - s * f_base, u(xb, yb) - 0.0]).solve()   # a trace node
-crux  = jno.core([(solve - u_obs).mse], domain=jno.domain.from_array({"_": np.zeros((1, 1))}))
+crux  = jno.core([(solve - u_obs).mse])          # domain inferred from the graph
 crux.solve(150)                                  # recovers s from the observation
 ```
 

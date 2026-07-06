@@ -172,8 +172,6 @@ def _infer_domain_from_constraints(constraints: List[Placeholder]):
     Raises ``ValueError`` if zero (no Variables at all) or more than one
     distinct domain is found — the caller must then pass ``domain=`` explicitly.
     """
-    from .trace import TensorTag, Variable
-
     domains: list = []  # preserve insertion order for nicer error messages
     seen_domains: set = set()
     seen_nodes: set = set()
@@ -182,11 +180,14 @@ def _infer_domain_from_constraints(constraints: List[Placeholder]):
         if node is None or id(node) in seen_nodes:
             return
         seen_nodes.add(id(node))
-        if isinstance(node, (Variable, TensorTag)):
-            d = getattr(node, "_domain", None)
-            if d is not None and id(d) not in seen_domains:
-                seen_domains.add(id(d))
-                domains.append(d)
+        # Any node may carry a domain: a Variable/TensorTag records the domain it was sampled from, and
+        # a solve node (e.g. `fem.solve()` / `jno.fdm([...]).solve()`) records the domain it discretizes,
+        # so a pure data-misfit loss `(solve() - obs).mse` — whose Variables are hidden inside the solve —
+        # still resolves its domain from the graph, with no explicit `domain=` needed.
+        d = getattr(node, "_domain", None)
+        if d is not None and id(d) not in seen_domains:
+            seen_domains.add(id(d))
+            domains.append(d)
         # Generic descent: visit every instance attribute that holds a
         # Placeholder (or a list/dict of them).  This covers GroupedAssembly
         # and any future Placeholder subclass without enumerating attr names.
