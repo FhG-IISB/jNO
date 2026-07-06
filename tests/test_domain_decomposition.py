@@ -452,3 +452,47 @@ def test_couple_via_jno_core():
     equiv = float(np.linalg.norm(sol - mono) / np.linalg.norm(mono))
     assert equiv < 1e-5, f"jno.core coupling must reproduce the monolithic solve, got {equiv:.2e}"
     assert float(np.linalg.norm(sol - exact) / np.linalg.norm(exact)) < 3e-2
+
+
+@pytest.mark.slow
+def test_couple_fem_fdm_line_via_jno_core():
+    """Heterogeneous FDM+FEM on a NON-overlapping single interface line, through the public entry.
+
+    The FEM region and FDM region *partition* the mesh (`domain.region(...)`), meeting only at the line
+    x=0.5 — no overlap. `jno.core([femL, fdmR]).solve()` infers the line and couples by Dirichlet-Neumann
+    (the FDM side supplies interface values, the FEM side consumes the interface flux) with no hand-rolled
+    loop, reproducing the MMS solution u* = sin(pi x) sin(pi y). This is the coupling written in jno
+    syntax — the delta over the overlapping FDM+FDM case above is: FEM subdomain + a single line + flux."""
+    import jno.jnp_ops as jnn
+    from jno.dd import couple
+
+    regL, regR = box(0.0, 0.0, 0.5, 1.0), box(0.5, 0.0, 1.0, 1.0)  # partition, meet at x=0.5
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0))
+    d.region("L", regL)
+    d.region("R", regR)
+    d.build_mesh(mesh_size=0.05)
+    p = np.asarray(d.mesh_connectivity["points"])[:, :2]
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+
+    xL, yL, _ = d.variable("L", split=True)
+    xR, yR, _ = d.variable("R", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+
+    def f(x, y):
+        return 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+
+    uf, vf = d.fem_symbols()
+    uif, vif = uf.bind(x=xL, y=yL), vf.bind(x=xL, y=yL)
+    femL = jno.fem([uif.x * vif.x + uif.y * vif.y - f(xL, yL) * vif, uf(xb, yb) - 0.0])  # FEM on L (Neumann side)
+    u = d.unknown()
+    uiR = u.bind(x=xR, y=yR)
+    fdmR = jno.fdm([-uiR.d2(xR) - uiR.d2(yR) - f(xR, yR), u(xb, yb) - 0.0])  # FDM on R (Dirichlet side)
+    assert femL.region == "L" and fdmR.region == "R"  # regions inferred from the weak-form / PDE coords
+
+    # the driver must pick the line (non-overlapping) mode and expose a real interface
+    _, info = couple([(femL, regL), (fdmR, regR)]).solve(return_info=True)
+    assert info["mode"] == "line-DN" and info["gamma_nodes"] > 0
+
+    sol = np.asarray(jno.core([femL, fdmR]).solve()).reshape(-1)  # public entry, no hand-rolled coupling
+    rel = float(np.linalg.norm(sol - exact) / np.linalg.norm(exact))
+    assert rel < 5e-2, f"jno.core line coupling must match the MMS solution, got {rel:.2e}"

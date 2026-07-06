@@ -1317,6 +1317,50 @@ class FEM:
             raise AttributeError(f"FEM is {self._mode}; .b is only for a steady linear problem (see .operator / .M).")
         return _as_flat(self._b)
 
+    # -- domain-decomposition coupling (`jno.core([...])`): the region this subdomain owns + a pinned solve --
+    def _dd_region(self):
+        # The weak-form coordinates are retagged for quadrature, so read the region from `classification`
+        # (`"volume@A"`), which `_region_and_support` already resolved correctly.
+        src = getattr(self.domain, "_source_regions", {}) or {}
+        regions = {
+            cl.split("@", 1)[1]
+            for cl in (self.classification or [])
+            if isinstance(cl, str) and "@" in cl and cl.split("@", 1)[1] in src
+        }
+        return (next(iter(regions)), src[next(iter(regions))]) if len(regions) == 1 else (None, None)
+
+    @property
+    def region(self):
+        """The named sub-region this FEM problem owns (from its weak-form coordinates), or ``None``."""
+        return self._dd_region()[0]
+
+    @property
+    def region_geometry(self):
+        """The shapely geometry of :attr:`region`, or ``None`` — used by ``jno.core([...])`` coupling."""
+        return self._dd_region()[1]
+
+    def pinned_solver(self, node_ids, *, nonlinear=None):
+        """A reusable ``f(values) -> field`` that solves the linear system with ``node_ids`` pinned to
+        ``values`` (row-replacement) — the interface Dirichlet data a coupled Schwarz step supplies. The
+        (fixed) matrix is prefactored once; each iteration only re-solves against a new right-hand side.
+        The dense LU runs on the host (robust: the GPU ``cuSolver`` dense path can be flaky)."""
+        import numpy as _np
+        import scipy.linalg as _sla
+
+        a = _np.asarray(self.A).copy()
+        b = _np.asarray(self.b).reshape(-1)
+        pin = _np.asarray(node_ids, dtype=int)
+        a[pin, :] = 0.0
+        a[pin, pin] = 1.0  # row-replacement: pinned rows → identity (columns kept)
+        lu = _sla.lu_factor(a)  # factor once; the interface pin only changes the RHS across iterations
+
+        def solve(values):
+            rhs = b.copy()
+            rhs[pin] = _np.asarray(values).reshape(-1)
+            return _sla.lu_solve(lu, rhs)
+
+        return solve
+
     # -- nonlinear residual / Jacobian (steady and transient) --
     @property
     def residual(self):
