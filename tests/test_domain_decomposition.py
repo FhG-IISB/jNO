@@ -558,6 +558,44 @@ def test_normal_derivative_evaluates_as_flux_value():
 
 
 @pytest.mark.slow
+def test_material_interface_via_overlap_and_kx():
+    """A **material interface** (different conductivity each side) done the robust way: don't couple *on*
+    the jump. Instead let the FEM subdomain carry the discontinuity via a spatially-varying ``k(x)`` (FEM
+    handles a jump exactly when it lands on a mesh line), and overlap the two subdomains in the *uniform*
+    region so plain **overlapping-Schwarz value exchange** couples them — no one-sided flux recovery.
+
+    kL=1, kR=3 bar with the outer boundary held at the analytic profile; the interface value at x=0.5 is
+    the material kink ``kL/(kL+kR) = 0.25`` (a uniform-k / naive coupling would give the symmetric 0.5)."""
+    import jno.jnp_ops as jnn
+    from jno.dd import couple
+
+    kL, kR = 1.0, 3.0
+    a, b = 2 * kR / (kL + kR), 2 * kL / (kL + kR)  # analytic slopes: u = 1-a·x (left), u = b·(1-x) (right)
+    boxA, boxB = box(0.0, 0.0, 0.6, 1.0), box(0.5, 0.0, 1.0, 1.0)  # FEM covers the jump; overlap [0.5,0.6] uniform kR
+    d = jno.domain(boxA.union(boxB), mesh_size=0.05)
+    p = np.asarray(d.mesh_connectivity["points"])[:, :2]
+    on = np.abs(p[:, 0] - 0.5) < 1e-6
+
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+
+    def g(x, y):  # outer boundary = analytic material profile (the kink is interior)
+        return jnn.where(x <= 0.5, 1 - a * x, b * (1 - x))
+
+    kx = jnn.where(xi < 0.5, kL, kR)  # the material jump lives in the COEFFICIENT field
+    uf, vf = d.fem_symbols()
+    uif, vif = uf.bind(x=xi, y=yi), vf.bind(x=xi, y=yi)
+    femA = jno.fem([kx * (uif.x * vif.x + uif.y * vif.y), uf(xb, yb) - g(xb, yb)])  # ∫ k(x) ∇u·∇v
+    u = d.unknown()
+    uiB = u.bind(x=xi, y=yi)
+    fdmB = jno.fdm([-kR * (uiB.d2(xi) + uiB.d2(yi)), u(xb, yb) - g(xb, yb)])  # uniform kR (smooth region)
+
+    sol = np.asarray(couple([(femA, boxA), (fdmB, boxB)]).solve(max_iter=200)).reshape(-1)
+    iface_val = float(np.mean(sol[on]))
+    assert abs(iface_val - kL / (kL + kR)) < 0.03, f"material kink should be {kL / (kL + kR):.2f}, got {iface_val:.3f}"
+
+
+@pytest.mark.slow
 def test_couple_with_declared_interface_conditions():
     """The coupling written FULLY in jNO syntax — subdomain solves PLUS the interface conditions in the
     same ``jno.core([...])`` list, using the auto-created ``interface_L_R`` tag and its normal:
