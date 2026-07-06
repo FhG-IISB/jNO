@@ -393,16 +393,24 @@ class _TraceFDM:
         return residual_fn
 
     def _trainable_params(self):
-        """Trainable ``jno.np.parameter`` fields in the constraints **other than the unknown** — the
-        inverse parameters (a source amplitude, a diffusivity, …). Returns ``{layer_id: ModelCall}``;
-        their presence makes :meth:`solve` return a deferred ``crux``-drivable node."""
+        """**Trainable** ``jno.np.parameter`` fields in the constraints — a parameter with an attached
+        optimizer (``.optimizer(...)``, i.e. ``model._opt_fn is not None``) that is not the unknown: the
+        inverse parameters (a source amplitude, a diffusivity, …). Their presence makes :meth:`solve`
+        return a deferred ``crux``-drivable node. A parameter **without** an optimizer is *data* — a
+        known nodal field (e.g. a neighbour's field in a coupled solve) — so it stays an eager solve and
+        is gathered as a value by :meth:`_eval_g`. Returns ``{layer_id: ModelCall}``."""
         from .trace import ModelCall
 
         found = {}
 
         def walk(n):
             n = _unwrap(n)
-            if isinstance(n, ModelCall) and getattr(n.model, "_is_parameter", False) and n.model is not self.unknown:
+            if (
+                isinstance(n, ModelCall)
+                and getattr(n.model, "_is_parameter", False)
+                and n.model is not self.unknown
+                and getattr(n.model, "_opt_fn", None) is not None  # trainable ⇔ has an optimizer
+            ):
                 found[n.model.layer_id] = n
             for c in _iter(n):
                 walk(c)
@@ -412,11 +420,18 @@ class _TraceFDM:
         return found
 
     def _eval_g(self, g_node, idx):
-        """Evaluate a value node ``g`` (constant or coordinate expression) at the nodes ``idx``."""
+        """Value ``g`` at the nodes ``idx`` — a constant, a coordinate expression, or a **known nodal
+        field** (a ``jno.np.parameter`` / ``domain.unknown()`` carrying data, e.g. a neighbour's current
+        field in a coupled solve), in which case its per-node values are gathered at ``idx``."""
         from ._fem import _eval_value_node_at
+        from .trace import ModelCall
 
+        idx = np.asarray(idx, dtype=int)
         if isinstance(g_node, (int, float)):
             return jnp.full((idx.shape[0],), float(g_node))
+        inner = _unwrap(g_node)
+        if isinstance(inner, ModelCall) and getattr(inner.model, "_is_parameter", False):
+            return jnp.asarray(inner.model.module.value).reshape(-1)[jnp.asarray(idx)]  # nodal data → gather
         return jnp.asarray(_eval_value_node_at(g_node, np.asarray(self._pts)[idx])).reshape(-1)
 
     def _condition_value(self, constraint, idx):

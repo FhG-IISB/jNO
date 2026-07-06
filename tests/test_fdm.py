@@ -384,3 +384,30 @@ def test_constraint_list_inverse_via_crux():
     crux.solve(120)
     rec = float(np.asarray(crux.eval([s])).reshape(-1)[0])
     assert abs(rec - 1.0) < 2e-2, f"crux did not recover the source amplitude: s={rec:.4f}"
+
+
+def test_dirichlet_value_from_nodal_field():
+    """A Dirichlet value can be a **known nodal field** (a `jno.np.parameter` carrying data, no
+    optimizer) — its per-node values are gathered at the boundary. This is the symbolic path a coupled
+    /domain-decomposition solve uses to pin a region to a neighbour's field (no raw arrays). Because the
+    field has no optimizer it is data, so `.solve()` stays eager (not a deferred crux node).
+    u = x²+y², -Δu = -4, Dirichlet = the field on ∂Ω."""
+    import equinox as eqx
+
+    from jno.trace import FunctionCall
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    p = _nodes(d)
+    n = p.shape[0]
+    exact = p[:, 0] ** 2 + p[:, 1] ** 2
+
+    g = jno.np.parameter((n,), name="g")  # a nodal data-field (no optimizer)
+    g.model.module = eqx.tree_at(lambda m: m.value, g.model.module, jnp.asarray(exact))
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    sol = jno.fdm([-ui.d2(x) - ui.d2(y) + 4.0, u(xb, yb) - g]).solve()
+
+    assert not isinstance(sol, FunctionCall), "a data-field Dirichlet value must stay an eager solve"
+    assert float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact)) < 1e-2
