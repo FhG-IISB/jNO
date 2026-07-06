@@ -623,6 +623,59 @@ class PolygonDomain(domain):
             "points": points,
         }
 
+    def _register_interface_tags(self) -> None:
+        """Auto-register ``interface_<A>_<B>`` tags — the line where two source regions meet — as
+        first-class boundary tags, alongside ``boundary``/``interior``/``initial``. The user writes
+        interface conditions on them like any other constraint (``uA(interface_A_B) - uB(interface_A_B)``
+        for value continuity, ``kA*uA.dn(interface_A_B) - kB*uB.dn(interface_A_B)`` for flux/material
+        continuity); ``jno.core`` reads any constraint referencing an ``interface_*`` tag as a coupling
+        condition. Registered at ``build_mesh`` (the interface nodes need the mesh). Order-insensitive:
+        ``interface_B_A`` is an alias for the same nodes and normal."""
+        if not hasattr(self, "_interface_pairs"):
+            self._interface_pairs: Dict[str, Tuple[str, str]] = {}
+        names = list(self._source_regions)
+        for i in range(len(names)):
+            for j in range(i + 1, len(names)):
+                na, nb = names[i], names[j]
+                shared = _as_line_geometry(
+                    self._source_regions[na].boundary.intersection(self._source_regions[nb].boundary)
+                )
+                if shared.is_empty or shared.length <= _GEOM_TOL:
+                    continue  # regions are disjoint or meet only at a point — no interface line
+                canon = f"interface_{na}_{nb}"
+                # normal_geometry = region A → `.dn(interface_A_B)` is the outward-from-A normal derivative
+                self._register_boundary_tag(canon, shared, normal_geometry=self._source_regions[na])
+                # `_register_boundary_tag` seeds point_indices from the line's 2 endpoints; the mesh-node
+                # remapping already ran (this is called after `_apply_mesh`), so resolve the actual mesh
+                # nodes ON the interface line here and store them so the front-ends pin the whole line.
+                mesh_pts = np.asarray(self.mesh_connectivity["points"])[:, :2]
+                tol = max(self._estimate_polygon_tol(shared), 1e-7)
+                try:  # vectorized (shapely >= 2.0)
+                    import shapely as _sh
+
+                    dist = np.asarray(_sh.distance(shared, _sh.points(mesh_pts)))
+                    node_ids = np.where(dist < tol)[0].astype(int)
+                except (ImportError, AttributeError):
+                    node_ids = np.array(
+                        [i for i, q in enumerate(mesh_pts) if shared.distance(Point(float(q[0]), float(q[1]))) < tol],
+                        dtype=int,
+                    )
+                self._boundary_registry[canon]["point_indices"] = node_ids
+                self._boundary_registry[canon]["points"] = mesh_pts[node_ids]
+                self._interface_pairs[canon] = (na, nb)
+                alias = f"interface_{nb}_{na}"  # same nodes + same normal, written the other way round
+                for reg in (
+                    self._polygon_tags,
+                    self._polygon_boundary_segments,
+                    self._polygon_boundary_normal_geometries,
+                    self._boundary_regions,
+                    self._boundary_registry,
+                ):
+                    if canon in reg:
+                        reg[alias] = reg[canon]
+                self._interface_pairs[alias] = (nb, na)
+                self.avaiable_mesh_tags.append(alias)
+
     def add_boundary_segments(
         self,
         tag: str,
@@ -1951,6 +2004,10 @@ class PolygonDomain(domain):
         # mesh-backed domain uses in __init__, rather than a parallel mechanism.
         if self._is_time_dependent and self.time is not None:
             self._add_time_dimension(self.time[0], self.time[1], int(self.time[2]))
+
+        # Interface tags between adjacent source regions (`interface_<A>_<B>`) — first-class, like
+        # `boundary`/`interior`; the user writes interface conditions on them and jno.core reads them.
+        self._register_interface_tags()
 
         if self._verbose:
             n_pts = int(np.asarray(mesh.points).shape[0])

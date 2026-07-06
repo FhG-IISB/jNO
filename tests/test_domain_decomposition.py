@@ -454,6 +454,30 @@ def test_couple_via_jno_core():
     assert float(np.linalg.norm(sol - exact) / np.linalg.norm(exact)) < 3e-2
 
 
+def test_interface_tags_autocreated():
+    """`domain.region(A) + region(B) + build_mesh` auto-creates first-class `interface_<A>_<B>` tags —
+    the line where the two regions meet — alongside `boundary`/`interior`/`initial`. They resolve to the
+    shared line's mesh nodes, so the user writes interface conditions on them like any other constraint
+    (`uA(interface_A_B) - uB(interface_A_B)`, `k*uA.dn(...) - ...`), and jno.core spots interface
+    conditions by the tag. Order-insensitive: `interface_B_A` is an alias for the same nodes."""
+    regL, regR = box(0.0, 0.0, 0.5, 1.0), box(0.5, 0.0, 1.0, 1.0)  # partition, meet at x=0.5
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0))
+    d.region("L", regL)
+    d.region("R", regR)
+    d.build_mesh(mesh_size=0.1)
+
+    assert "interface_L_R" in d.avaiable_mesh_tags and "interface_R_L" in d.avaiable_mesh_tags
+    assert d._interface_pairs["interface_L_R"] == ("L", "R")
+    assert d._interface_pairs["interface_R_L"] == ("R", "L")  # order-insensitive alias
+
+    p = np.asarray(d.mesh_connectivity["points"])[:, :2]
+    on_line = set(np.where(np.abs(p[:, 0] - 0.5) < 1e-6)[0].tolist())
+    ids = {int(i) for i in d._boundary_registry["interface_L_R"]["point_indices"]}
+    assert ids == on_line and len(ids) > 2, "interface tag must resolve to EVERY mesh node on the shared line"
+    alias_ids = {int(i) for i in d._boundary_registry["interface_R_L"]["point_indices"]}
+    assert alias_ids == on_line, "the reversed-order alias must resolve to the same nodes"
+
+
 @pytest.mark.slow
 def test_couple_fem_fdm_line_via_jno_core():
     """Heterogeneous FDM+FEM on a NON-overlapping single interface line, through the public entry.
