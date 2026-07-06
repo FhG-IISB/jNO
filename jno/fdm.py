@@ -332,6 +332,7 @@ class _TraceFDM:
     describes is the FD **stencil** per operator (``u.d2(x, scheme=...)``, ``ui.d(n, scheme=...)``)."""
 
     def __init__(self, constraints):
+        self._constraints = list(constraints)  # kept verbatim so a coupled solve can re-author with an interface pin
         self.unknown = _find_unknown(constraints)
         self.domain = self.unknown._fem_field_domain
         self._N = int(np.asarray(self.domain.mesh_connectivity["points"]).shape[0])
@@ -604,10 +605,12 @@ class _TraceFDM:
             return self._parametric_node(trainable, nonlinear=nonlinear, x0=x0)
         return self._steady_solve(nonlinear=nonlinear, x0=x0)
 
-    def _steady_solve(self, *, nonlinear=None, x0=None, extra_params=None):
+    def _steady_solve(self, *, nonlinear=None, x0=None, extra_params=None, extra_pins=None):
         """The eager steady solve: fold the flux and Dirichlet rows into the residual and hand it to the
         ``jno.solve`` Newton–Krylov driver. ``extra_params`` carries the current values of any trainable
-        ``jno.np.parameter`` (from :meth:`_parametric_node`); it is empty for a plain forward solve."""
+        ``jno.np.parameter`` (from :meth:`_parametric_node`). ``extra_pins`` is an ``(idx, values)`` pair
+        of nodes pinned to given values on top of the authored BCs — the interface pin a coupled /
+        domain-decomposition Schwarz step applies (:meth:`solve_pinned`)."""
         residual_fn = self._pde_residual_fn(extra_params=extra_params)
         rows = self._dirichlet_rows()
         flux_rows = self._flux_rows(extra_params)
@@ -623,6 +626,9 @@ class _TraceFDM:
                 b = v0(u)
                 a = v1(u) - b
                 r = r.at[idx].set(a[idx] * flux + b[idx])
+            if extra_pins is not None:  # interface pin (a coupled subdomain's complement) — before the
+                pidx, pvals = extra_pins  # authored Dirichlet, so the physical outer BC still wins on ∂Ω
+                r = r.at[pidx].set(u[pidx] - pvals)
             for idx, gvals in rows:
                 r = r.at[idx].set(u[idx] - gvals)
             return r
@@ -630,6 +636,45 @@ class _TraceFDM:
         driver = nonlinear or _solve.newton()
         u0 = jnp.zeros(self._N) if x0 is None else jnp.asarray(x0)
         return driver(residual_with_bc, u0)
+
+    def pinned_solver(self, node_ids, *, nonlinear=None):
+        """A **reusable** ``f(values) -> field`` that solves the subdomain with ``node_ids`` pinned to
+        ``values`` (the interface Dirichlet data from a neighbour) on top of the authored BCs. Built
+        ONCE and JIT-compiled, so the Newton solve compiles a single time and is reused across Schwarz
+        iterations — a fresh per-call closure would recompile every step and exhaust device memory."""
+        import jax
+
+        residual_fn = self._pde_residual_fn()
+        rows = self._dirichlet_rows()
+        flux_rows = self._flux_rows()
+        pin_idx = jnp.asarray(node_ids)
+        driver = nonlinear or _solve.newton()
+
+        @jax.jit
+        def solve(values):
+            pv = jnp.asarray(values)
+
+            def residual_with_bc(u):
+                r = residual_fn(u)
+                for idx, nrm, method, v0, v1 in flux_rows:
+                    grad = gradient(u, self.domain, method=method)
+                    flux = jnp.sum(grad[idx] * nrm, axis=1)
+                    b = v0(u)
+                    a = v1(u) - b
+                    r = r.at[idx].set(a[idx] * flux + b[idx])
+                r = r.at[pin_idx].set(u[pin_idx] - pv)  # interface pin — before the authored Dirichlet
+                for idx, gvals in rows:
+                    r = r.at[idx].set(u[idx] - gvals)
+                return r
+
+            return driver(residual_with_bc, jnp.zeros(self._N))
+
+        return solve
+
+    def solve_pinned(self, node_ids, values, *, nonlinear=None):
+        """One-shot: solve with ``node_ids`` pinned to ``values`` (see :meth:`pinned_solver`, which the
+        Schwarz driver builds once and reuses)."""
+        return self.pinned_solver(node_ids, nonlinear=nonlinear)(values)
 
     def _parametric_node(self, trainable, *, nonlinear=None, x0=None):
         """When the constraints carry a trainable ``jno.np.parameter`` (an inverse parameter), return the

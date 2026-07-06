@@ -385,3 +385,34 @@ def test_heterogeneous_fem_fdm_real_api_coupling():
 
     assert jump < 2e-2, f"real-API FEM+FDM Schwarz did not converge (jump={jump:.2e})"
     assert float(np.linalg.norm(u_dd - exact) / np.linalg.norm(exact)) < 3e-2
+
+
+@pytest.mark.slow
+def test_couple_driver_reproduces_monolithic():
+    """The `jno.dd.couple([...]).solve()` driver automates the overlapping Schwarz: each subdomain is a
+    `jno.fdm([...])` (its PDE + outer BCs) plus the shapely region it owns; the driver infers each
+    complement, exchanges Dirichlet data with the neighbour (`pinned_solver`, built once + JIT-reused),
+    and iterates to tolerance — reproducing the monolithic single-mesh solve. Marked slow (Schwarz loop)."""
+
+    import jno.jnp_ops as jnn
+    from jno.dd import couple
+
+    b1, b2 = box(0.0, 0.0, 0.6, 1.0), box(0.4, 0.0, 1.0, 1.0)
+    d = jno.domain(b1.union(b2), mesh_size=0.06)
+    p = np.asarray(d.mesh_connectivity["points"])[:, :2]
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+
+    a = jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(xb, yb) - 0.0])  # subdomain problems: PDE + outer BC
+    b = jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(xb, yb) - 0.0])
+    mono = np.asarray(jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(xb, yb) - 0.0]).solve()).reshape(-1)
+
+    sol, info = couple([(a, b1), (b, b2)]).solve(tol=1e-7, max_iter=60, return_info=True)
+    assert info["overlap_jump"] < 1e-6, f"driver did not converge: {info}"
+    equiv = float(np.linalg.norm(np.asarray(sol) - mono) / np.linalg.norm(mono))
+    assert equiv < 1e-5, f"coupled driver must reproduce the monolithic solve, got {equiv:.2e}"
+    assert float(np.linalg.norm(np.asarray(sol) - exact) / np.linalg.norm(exact)) < 3e-2
