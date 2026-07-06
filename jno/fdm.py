@@ -17,12 +17,15 @@ u(xi, yi) - u0])`` authored with ``u = domain.unknown()`` exactly as ``jno.fem([
 initial condition is *found from the constraints* (never a config flag) and ``t_span``/step-count are
 inferred from ``domain.time`` — and a low-level **function form** (:class:`FDMSystem`).
 
-v1 scope: scalar, 2-D triangular mesh, Dirichlet BCs, **steady Neumann** flux ``ui.d(n, scheme) - h``
-(``∇u·n = h``; corner nodes fall back to the PDE residual), and **transient** problems by
-method-of-lines (``M = I``; a unit-coefficient ``u.t`` term, e.g. ``ui.t - νΔu``) — all with linear +
-nonlinear residuals. Robin ``ui.d(n) + α(u - u∞)``, transient Neumann, periodic, a general ``u.t`` mass
-coefficient, and a structured-grid stencil backend are planned extensions (see ``plans/fdm-solver.md``).
-A pure-Neumann problem (no Dirichlet node) is singular (solution up to a constant) and is solved as-is.
+v1 scope: scalar, 2-D triangular mesh, and **any mix** of steady boundary conditions — Dirichlet
+``u(region) - g``, and **any flux BC affine in the normal derivative** ``∂u/∂n`` written with that
+edge's boundary tags: Neumann ``ur.d(n) - h``, Robin ``ur.d(n) + α(u - u∞)``, a coordinate-coefficient
+``κ(x)·ur.d(n)``, either sign (``ur = u.bind(x=xr, y=yr)``, ``n = domain.variable(region, normals=True)``;
+corner nodes fall back to the PDE residual). Plus **transient** problems by method-of-lines (``M = I``;
+a unit-coefficient ``u.t`` term, e.g. ``ui.t - νΔu``) — all with linear + nonlinear residuals. Transient
+flux BCs, periodic, a general ``u.t`` mass coefficient, and a structured-grid stencil backend are planned
+extensions (see ``plans/fdm-solver.md``). A pure-Neumann problem (no Dirichlet node) is singular
+(solution up to a constant) and is solved as-is.
 """
 
 from __future__ import annotations
@@ -252,16 +255,50 @@ def _normal_jacobian(node):
     return None
 
 
+def _is_normal_jacobian(node):
+    from .trace import Jacobian
+
+    return isinstance(node, Jacobian) and any(
+        str(getattr(v, "tag", "")).startswith("n_") for v in getattr(node, "variables", [])
+    )
+
+
+def _set_normal(node, val):
+    """Replace the normal-derivative node ``ui.d(n, ...)`` with the constant ``val``, leaving the rest of
+    the constraint intact. Evaluating the result at ``val = 0`` and ``val = 1`` recovers, for a condition
+    ``F(∂u/∂n) = a·∂u/∂n + b`` affine in the flux, the intercept ``b = F(0)`` and slope ``a = F(1) - F(0)``
+    — so **any** flux BC (Neumann ``∂u/∂n - h``, Robin ``∂u/∂n + α(u - u∞)``, a coordinate-coefficient
+    ``κ(x)·∂u/∂n``, either sign) is handled by ``a·(∇u·n) + b`` without parsing its structure."""
+    from .trace import BinaryOp, FunctionCall, Hessian, Jacobian, Literal, Placeholder
+
+    if _is_normal_jacobian(node):
+        return Literal(float(val))
+    if isinstance(node, BinaryOp):
+        return BinaryOp(node.op, _set_normal(node.left, val), _set_normal(node.right, val))
+    if isinstance(node, FunctionCall):
+        return node.copy_with_args([_set_normal(a, val) if isinstance(a, Placeholder) else a for a in node.args])
+    if isinstance(node, Jacobian):
+        return Jacobian(_set_normal(node.target, val), node.variables, node.scheme)
+    if isinstance(node, Hessian):
+        return Hessian(_set_normal(node.target, val), node.variables, node.scheme, node.trace)
+    return node
+
+
 class _TraceFDM:
     """Finite-difference system authored as a fem-style constraint list with ``u = domain.unknown()``:
     ``jno.fdm([-u.d2(x) - u.d2(y) - f, u(xb, yb) - g]).solve()``. Constraints are classified by the
     region their coordinate variables carry — the ``interior`` → the strong-form PDE residual, a
     boundary tag → a Dirichlet condition ``u(region) - g``, the ``initial`` region → the initial
-    condition ``u(initial) - u0`` (exactly as in :func:`jno.fem`), and a **normal derivative**
-    ``ui.d(n, scheme) - h`` (``n = domain.variable(region, normals=True)``) → a Neumann flux row
-    ``∇u·n = h`` at that edge's nodes. (Neumann is authored differently from :func:`jno.fem`, where it
-    is a *natural* weak term ``h·v`` — the strong form has no test function, so the flux is imposed
-    directly.) A problem is **transient** iff it carries an initial condition; ``t_span`` and the step
+    condition ``u(initial) - u0`` (exactly as in :func:`jno.fem`), and a **flux condition** carrying a
+    normal derivative ``ur.d(n)`` (``n = domain.variable(region, normals=True)``, the field bound to the
+    edge's tags ``ur = u.bind(x=xr, y=yr)``) → a boundary row at that edge's nodes. Any condition
+    **affine in** ``∂u/∂n`` is handled — Neumann ``ur.d(n) - h``, Robin ``ur.d(n) + α(u - u∞)``, a
+    coordinate coefficient ``κ(x)·ur.d(n)`` — by writing the row as ``a·(∇u·n) + b`` with the two-probe
+    coefficients ``a = F(1) - F(0)``, ``b = F(0)`` (:meth:`_flux_value_fn`); no structural parsing, so
+    the whole edge equation is written with that edge's boundary tags. (Flux BCs are authored differently
+    from :func:`jno.fem`, where a Neumann is a *natural* weak term ``h·v`` — the strong form has no test
+    function, so the flux is imposed directly.) A problem is **transient** iff it carries an initial
+    condition; ``t_span`` and the step
     count are then inferred from ``domain.time`` (never passed as args) and the system marches with the
     same method-of-lines stepper :func:`jno.fem` uses. The one config that stays on the object it
     describes is the FD **stencil** per operator (``u.d2(x, scheme=...)``, ``ui.d(n, scheme=...)``)."""
@@ -417,30 +454,56 @@ class _TraceFDM:
         n = raw / (np.linalg.norm(raw, axis=1, keepdims=True) + 1e-30)
         return idx, jnp.asarray(n)
 
-    def _neumann_rows(self):
-        """Flux rows for Neumann conditions ``ui.d(n, scheme) - h``: the region's node indices, unit
-        normals, the FD stencil (from the normal ``Jacobian``'s ``scheme``), and ``h`` at those nodes.
-        v1 supports the pure-flux form (unit coefficient, ``-h`` on the value side); Robin
-        ``ui.d(n) + α(u - u∞)`` and non-unit coefficients are future work — an unrecognized structure
-        raises rather than silently assuming ``h = 0``."""
+    def _flux_value_fn(self, constraint, val):
+        """Evaluate the flux constraint over ALL nodes with the normal derivative ``∂u/∂n`` pinned to the
+        constant ``val`` (:func:`_set_normal`) — everything else (the field value ``u``, ``α``, ``u∞``,
+        coordinate coefficients) evaluates normally against the nodal DOFs. Two such evaluations
+        (``val = 0`` and ``val = 1``) give the affine decomposition of the boundary condition in the flux."""
+        import equinox as eqx
+
+        from .trace_evaluator import TraceEvaluator
+
+        expr = _set_normal(_unwrap(constraint), val)
+        spatial_tags = {  # every spatial term collocates at the mesh nodes; the normal tag is gone now
+            v.tag
+            for v in (getattr(constraint, "_coord_vars", None) or {}).values()
+            if getattr(v, "axis", None) != "temporal" and not str(getattr(v, "tag", "")).startswith("n_")
+        }
+        context = {t: self._pts for t in spatial_tags}
+        lid, base = self.unknown.layer_id, self.unknown.module
+
+        def value_fn(dofs):
+            mod = eqx.tree_at(lambda m: m.value, base, jnp.asarray(dofs).astype(base.value.dtype))
+            ev = TraceEvaluator(params={lid: mod})
+            out = jnp.asarray(ev.evaluate(expr, context=context, var_bindings={})).reshape(-1)
+            return jnp.broadcast_to(out, (self._N,)) if out.shape[0] == 1 else out  # a constant `-h` → per-node
+
+        return value_fn
+
+    def _flux_rows(self):
+        """Rows for **any** flux boundary condition affine in ``∂u/∂n`` — Neumann ``ui.d(n) - h``, Robin
+        ``ui.d(n) + α(u - u∞)``, a coordinate-coefficient ``κ(x)·ui.d(n)``, either sign. Writes the whole
+        edge equation with that edge's boundary tags (``xr, yr, nr = domain.variable(region, ...)``). Per
+        row: node indices, unit normals, the FD stencil, and the two-probe value functions ``F(0)`` and
+        ``F(1)`` (see :meth:`_flux_value_fn`) — the residual is ``(F(1) - F(0))·(∇u·n) + F(0)``. A
+        condition that is **not** affine in ``∂u/∂n`` (a third probe ``F(2)`` disagrees) raises."""
         rows = []
+        probe = jnp.zeros(self._N)
         for c in self._neumann:
             jac = _normal_jacobian(c)
             nvar = next(v for v in jac.variables if str(getattr(v, "tag", "")).startswith("n_"))
             region = nvar.tag[len("n_") :]  # `n_right` → `right`
             idx, nrm = self._node_normals(region)
-            inner = _unwrap(c)
-            if getattr(inner, "op", None) != "-" or not (
-                _normal_jacobian(inner.left) is not None and _normal_jacobian(inner.right) is None
-            ):
-                raise ValueError(
-                    "jno.fdm([...]): a Neumann condition must be written `ui.d(n, scheme) - h` (the normal "
-                    "derivative minus the prescribed flux). Robin `ui.d(n) + α*(u - u∞)` and non-unit "
-                    f"coefficients are not supported in v1. Got: {inner!r}."
-                )
             _, grad_method, _ = _D.parse_fd_scheme(getattr(jac, "scheme", "finite_difference"))
-            h = self._eval_g(inner.right, np.asarray(idx))
-            rows.append((jnp.asarray(idx), nrm, grad_method or "area_weighted", h))
+            v0, v1 = self._flux_value_fn(c, 0.0), self._flux_value_fn(c, 1.0)
+            f0, f1, f2 = v0(probe), v1(probe), self._flux_value_fn(c, 2.0)(probe)
+            if not bool(jnp.allclose(f2 - f0, 2.0 * (f1 - f0), atol=1e-6)):
+                raise ValueError(
+                    "jno.fdm([...]): a flux boundary condition must be affine in the normal derivative "
+                    "∂u/∂n — e.g. Neumann `ui.d(n) - h` or Robin `ui.d(n) + α*(u - u∞)`. A condition "
+                    "nonlinear in ∂u/∂n is not supported."
+                )
+            rows.append((jnp.asarray(idx), nrm, grad_method or "area_weighted", v0, v1))
         return rows
 
     def _initial_state(self):
@@ -468,16 +531,19 @@ class _TraceFDM:
 
         residual_fn = self._pde_residual_fn()
         rows = self._dirichlet_rows()
-        flux_rows = self._neumann_rows()
+        flux_rows = self._flux_rows()
 
         def residual_with_bc(u):
             r = residual_fn(u)
-            # Neumann first (flux row `∇u·n - h`), then Dirichlet — a node shared by both (a corner)
-            # resolves to the essential Dirichlet value.
-            for idx, nrm, method, h in flux_rows:
+            # Flux rows first (`a·(∇u·n) + b`, with a = F(1)-F(0), b = F(0) — Neumann/Robin/etc.), then
+            # Dirichlet: a node shared by both (a corner touching a Dirichlet edge) resolves to the
+            # essential Dirichlet value.
+            for idx, nrm, method, v0, v1 in flux_rows:
                 grad = gradient(u, self.domain, method=method)  # (N, 2), differentiable
-                flux = jnp.sum(grad[idx] * nrm, axis=1)
-                r = r.at[idx].set(flux - h)
+                flux = jnp.sum(grad[idx] * nrm, axis=1)  # ∇u·n at the edge nodes
+                b = v0(u)
+                a = v1(u) - b
+                r = r.at[idx].set(a[idx] * flux + b[idx])
             for idx, gvals in rows:
                 r = r.at[idx].set(u[idx] - gvals)
             return r

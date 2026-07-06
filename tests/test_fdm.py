@@ -266,19 +266,78 @@ def test_neumann_convergence_harmonic():
     assert errs[2] < 5e-3
 
 
-def test_neumann_rejects_malformed_and_transient():
-    """v1 guards: an unrecognized flux structure (here the flux on the wrong side, `h - ui.d(n)`, which a
-    Robin/`+` form would also hit) raises rather than silently assuming h=0, and a Neumann flux on a
-    transient problem raises."""
-    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15)
+def test_robin_linear_exact():
+    """Robin ∂u/∂n + α(u − u∞) = 0 on the right edge, α=1, u∞=2: for u = x this reads 1 + (1 − 2) = 0.
+    The whole edge equation is written with that edge's boundary tags (`ur = u.bind(x=xr, y=yr)`) — no
+    mixing with the interior. Linear ⇒ recovered to solver tolerance, pinning the two-probe
+    (a·∇u·n + b) coefficient extraction and the boundary field-value evaluation."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+    p = _nodes(d)
+    exact = p[:, 0]  # u = x
     x, y, _ = d.variable("interior", split=True)
     xl, yl, _ = d.variable("left", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+    xr, yr, _ = d.variable("right", split=True)
     nr = d.variable("right", normals=True)
     u = d.unknown()
     ui = u.bind(x=x, y=y)
-    sch = "finite_difference"
-    with pytest.raises(ValueError, match="Robin|not supported"):
-        jno.fdm([-ui.d2(x, scheme=sch) - ui.d2(y, scheme=sch), u(xl, yl) - 0.0, 1.0 - ui.d(nr, scheme=sch)]).solve()
+    ur = u.bind(x=xr, y=yr)  # edge-bound field for the flux + value terms of the Robin condition
+    sol = jno.fdm(
+        [
+            -ui.d2(x) - ui.d2(y),  # −Δu = 0
+            u(xl, yl) - xl,
+            u(xb, yb) - xb,
+            u(xt, yt) - xt,  # Dirichlet on three edges
+            ur.d(nr) + 1.0 * (ur - 2.0),  # Robin on the right: ∂u/∂n + (u − 2) = 0
+        ]
+    ).solve()
+    assert float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact)) < 1e-4
+
+
+def test_mixed_dirichlet_neumann_robin():
+    """Any mix of BCs composes: Dirichlet (left, top), Neumann (bottom), Robin (right), all on u = x.
+    Reports the corner error honestly — the flux/flux corner falls back to the PDE (exact for a linear
+    field here)."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+    p = _nodes(d)
+    exact = p[:, 0]  # u = x
+    x, y, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    nb = d.variable("bottom", normals=True)
+    xr, yr, _ = d.variable("right", split=True)
+    nr = d.variable("right", normals=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    urb = u.bind(x=xb, y=yb)
+    ur = u.bind(x=xr, y=yr)
+    sol = jno.fdm(
+        [
+            -ui.d2(x) - ui.d2(y),  # −Δu = 0
+            u(xl, yl) - xl,  # Dirichlet left
+            u(xt, yt) - xt,  # Dirichlet top
+            urb.d(nb) - 0.0,  # Neumann bottom: ∂u/∂n = −∂u/∂y = 0
+            ur.d(nr) + 1.0 * (ur - 2.0),  # Robin right
+        ]
+    ).solve()
+    assert float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact)) < 1e-3
+
+
+def test_flux_rejects_nonaffine_and_transient():
+    """Guards: a flux BC nonlinear in ∂u/∂n (here `(∂u/∂n)² − 1`) raises rather than silently returning a
+    secant, and a flux BC on a transient problem raises."""
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15)
+    x, y, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    nr = d.variable("right", normals=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    ur = u.bind(x=xr, y=yr)
+    with pytest.raises(ValueError, match="affine"):
+        jno.fdm([-ui.d2(x) - ui.d2(y), u(xl, yl) - 0.0, ur.d(nr) * ur.d(nr) - 1.0]).solve()
 
     dt = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.15, time=(0.0, 0.5, 50))
     xt, yt, tt = dt.variable("interior", split=True)
@@ -289,8 +348,8 @@ def test_neumann_rejects_malformed_and_transient():
     with pytest.raises(ValueError, match="Neumann.*transient|transient.*not supported"):
         jno.fdm(
             [
-                uit.t - 0.05 * (uit.d2(xt, scheme=sch) + uit.d2(yt, scheme=sch)),
+                uit.t - 0.05 * (uit.d2(xt) + uit.d2(yt)),
                 ut(xit, yit) - 0.0,
-                uit.d(nrt, scheme=sch) - 1.0,
+                uit.d(nrt) - 1.0,
             ]
         )
