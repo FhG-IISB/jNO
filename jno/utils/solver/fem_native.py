@@ -119,7 +119,26 @@ def _get_mesh(domain, dim: int, order: int):
 
 
 def _region_node_ids_from_pts(domain, region: str, pts_all: np.ndarray) -> List[int]:
-    """Node ids in ``pts_all`` satisfying the location function for ``region``."""
+    """Node ids in ``pts_all`` for ``region`` — a **geometric interior sub-region**
+    (``domain.region(name, polygon)``) by point-in-polygon, else the region's location function.
+
+    A shapely polygon is not jax-traceable, so an interior sub-region cannot go through the jax
+    ``_make_tag_location_fn`` path below; it is resolved here in numpy. This is what lets a subdomain
+    solve (domain decomposition) restrict/pin on a named sub-region."""
+    ptags = getattr(domain, "_polygon_tags", {})
+    if region in ptags and ptags[region][0] == "interior":
+        pts = np.asarray(pts_all)
+        try:
+            from shapely import contains_xy  # vectorized (shapely >= 2.0.2)
+
+            hits = np.asarray(contains_xy(ptags[region][1].buffer(1e-9), pts[:, 0], pts[:, 1]))
+        except (ImportError, AttributeError):
+            from shapely.geometry import Point
+
+            g = ptags[region][1].buffer(1e-9)
+            hits = np.array([g.contains(Point(float(q[0]), float(q[1]))) for q in pts])
+        return list(np.where(hits.reshape(-1))[0])
+
     loc = domain._make_tag_location_fn(region)
     if loc is None:
         raise ValueError(f"jno.fem (native): region {region!r} has no location function.")
