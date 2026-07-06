@@ -86,16 +86,28 @@ def _is_fem(prob):
     return hasattr(prob, "A") and hasattr(prob, "b")
 
 
+def _classify_interfaces(interface_conditions):
+    """Summarise the interface conditions declared in the constraint list (each recognised by referencing
+    an ``interface_*`` tag). ``count`` is the number of declared conditions. Splitting them into flux vs
+    value needs the interface normal to survive view arithmetic (``uA.d(n) - uB.d(n)`` currently drops it
+    from the walkable trace) — deferred to the material-``k`` flux-weighting step."""
+    return {"count": len(list(interface_conditions or []))}
+
+
 class _Coupled:
     """A coupled domain-decomposition problem: subdomains + their regions, solved by the inferred method."""
 
-    def __init__(self, subdomains):
+    def __init__(self, subdomains, interface_conditions=None):
         if len(subdomains) != 2:
             raise NotImplementedError(
                 "jno.dd: only 2 subdomains are supported for now (the complement of one is the other); "
                 "N-subdomain coupling pins each complement to the combined field of all the others."
             )
         self._subdomains = list(subdomains)
+        # Interface conditions declared in the constraint list (value `uA(iface)-uB(iface)` / flux
+        # `k*uA.d(n)-...`). Currently they DECLARE the coupling the line-DN already enforces (value +
+        # flux continuity); recognising them makes the coupling authored, not just inferred.
+        self._interfaces = _classify_interfaces(interface_conditions)
 
     def solve(self, *, tol: float = 1e-7, max_iter: int = 400, return_info: bool = False):
         """Solve the coupled problem; return the combined nodal field. The coupling method (line
@@ -194,7 +206,13 @@ class _Coupled:
         combined = np.where(own_N, uN, uD)
         combined[gamma] = lam
         if return_info:
-            return combined, {"iterations": it, "interface_step": step, "gamma_nodes": int(len(gamma)), "mode": "line-DN"}
+            return combined, {
+                "iterations": it,
+                "interface_step": step,
+                "gamma_nodes": int(len(gamma)),
+                "mode": "line-DN",
+                "interfaces": self._interfaces,
+            }
         return combined
 
     # -- overlapping: a 2-D strip, overlapping Schwarz (value exchange) ----------------------------
@@ -221,16 +239,23 @@ class _Coupled:
 
         combined = np.where(masks[0], sols[0], sols[1])
         if return_info:
-            return combined, {"iterations": iters, "overlap_jump": jump, "mode": "overlap-Schwarz"}
+            return combined, {
+                "iterations": iters,
+                "overlap_jump": jump,
+                "mode": "overlap-Schwarz",
+                "interfaces": self._interfaces,
+            }
         return combined
 
 
-def couple(subdomains):
+def couple(subdomains, interface_conditions=None):
     """Couple subdomain problems by domain decomposition on a shared mesh.
 
     ``subdomains``: a list of ``(problem, region)`` pairs, where ``problem`` is a subdomain solve
     (``jno.fdm([...])`` / ``jno.fem([...])``) authored with its PDE + outer boundary conditions, and
-    ``region`` is the shapely geometry it owns. The interface is inferred from the regions: a single line
-    (partitioning tags) is coupled by Dirichlet-Neumann, an overlap by Schwarz. ``.solve()`` returns the
-    combined nodal field. The user-facing surface is ``jno.core([...])``, which builds this automatically."""
-    return _Coupled(subdomains)
+    ``region`` is the shapely geometry it owns. ``interface_conditions``: optional residuals declaring the
+    coupling in jNO syntax (value ``uA(iface)-uB(iface)`` / flux ``k*uA.d(n)-...`` on an ``interface_*``
+    tag). The interface is inferred from the regions: a single line (partitioning tags) is coupled by
+    Dirichlet-Neumann, an overlap by Schwarz. ``.solve()`` returns the combined nodal field. The
+    user-facing surface is ``jno.core([...])``, which builds this automatically."""
+    return _Coupled(subdomains, interface_conditions)

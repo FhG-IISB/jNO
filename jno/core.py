@@ -226,13 +226,50 @@ def _infer_domain_from_constraints(constraints: List[Placeholder]):
     )
 
 
+def _references_interface(node):
+    """True if a constraint's trace references an ``interface_*`` / ``n_interface_*`` tag — i.e. it is an
+    interface *condition* (value ``uA(iface)-uB(iface)`` or flux ``k*uA.d(n)-...``), not a subdomain solve."""
+    seen: set = set()
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if id(n) in seen:
+            continue
+        seen.add(id(n))
+        tag = getattr(n, "tag", None)
+        if isinstance(tag, str) and (tag.startswith("interface_") or tag.startswith("n_interface_")):
+            return True
+        e = getattr(n, "_expr", None)
+        if e is not None:
+            stack.append(e)
+        args = getattr(n, "args", None)
+        if args:
+            stack.extend(a for a in args if a is not None)
+        variables = getattr(n, "variables", None)  # Jacobian/Hessian stash the diff variable(s) here
+        if variables:
+            stack.extend(v for v in variables if v is not None)
+        cv = getattr(n, "_coord_vars", None)  # `.bind(x=xif, y=yif)` stashes coords here, not in the trace
+        if isinstance(cv, dict):
+            stack.extend(cv.values())
+    return False
+
+
 def _detect_subdomains(constraints):
-    """If every item is a subdomain solve problem carrying a named region — a ``jno.fdm([...])`` /
-    ``jno.fem([...])`` whose PDE coordinates live on a ``domain.region(name, poly)`` — return them so
-    ``jno.core`` couples them by overlapping Schwarz instead of running PINN training; else ``None`` (a
-    normal loss/PINN core). Duck-typed: a subdomain exposes ``region_geometry`` and ``pinned_solver``."""
-    subs = [c for c in constraints if getattr(c, "region_geometry", None) is not None and hasattr(c, "pinned_solver")]
-    return subs if (len(subs) >= 2 and len(subs) == len(constraints)) else None
+    """If the list is a domain-decomposition problem — ≥2 subdomain solves (a ``jno.fdm([...])`` /
+    ``jno.fem([...])`` whose PDE coordinates live on a ``domain.region(name, poly)``) plus optional
+    **interface-condition** residuals — return ``(subdomains, interface_conditions)``; else ``None`` (a
+    normal loss/PINN core). Subdomains are duck-typed (``region_geometry`` + ``pinned_solver``); interface
+    conditions are residuals referencing an ``interface_*`` tag (value ``uA(iface)-uB(iface)`` / flux
+    ``k*uA.d(n)-...``), the coupling declared in the same jNO constraint syntax as everything else."""
+    subs, ifaces, other = [], [], []
+    for c in constraints:
+        if getattr(c, "region_geometry", None) is not None and hasattr(c, "pinned_solver"):
+            subs.append(c)
+        elif _references_interface(c):
+            ifaces.append(c)
+        else:
+            other.append(c)
+    return (subs, ifaces) if (len(subs) >= 2 and not other) else None
 
 
 def _active_model_lids(exprs):
@@ -429,8 +466,10 @@ class core:
         # Domain-decomposition coupling: `jno.core([A, B, ...])` where each item is a subdomain solve
         # (`jno.fdm([...])` carrying a named region via `domain.region(...)`) — couple by overlapping
         # Schwarz instead of PINN training. `.solve()` delegates to the coupling driver.
-        self._dd_subdomains = _detect_subdomains(constraints)
-        if self._dd_subdomains is not None:
+        _detected = _detect_subdomains(constraints)
+        self._dd_subdomains = None
+        if _detected is not None:
+            self._dd_subdomains, self._dd_interfaces = _detected
             self.domain = self._dd_subdomains[0].domain
             self.models = {}
             return
@@ -1759,9 +1798,10 @@ class core:
         if getattr(self, "_dd_subdomains", None) is not None:
             from .dd import couple
 
-            return couple([(s, s.region_geometry) for s in self._dd_subdomains]).solve(
-                tol=1e-7, max_iter=int(epochs) if epochs and epochs != 1000 else 400
-            )
+            return couple(
+                [(s, s.region_geometry) for s in self._dd_subdomains],
+                interface_conditions=getattr(self, "_dd_interfaces", None),
+            ).solve(tol=1e-7, max_iter=int(epochs) if epochs and epochs != 1000 else 400)
 
         from contextlib import nullcontext
 

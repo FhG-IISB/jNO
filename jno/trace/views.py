@@ -231,7 +231,16 @@ class ScalarView(_DelegatesToPlaceholder):
         return self._rewrap(self._expr.stop_gradient)
 
     def d(self, v, scheme: str = "automatic_differentiation") -> "ScalarView":
-        """``∂self/∂v`` — same view type."""
+        """``∂self/∂v`` — same view type.
+
+        ``v`` may be a coordinate Variable (``∂self/∂x``) or a boundary/interface **normal** from
+        ``domain.variable(tag, normals=True)``, in which case this is the normal derivative ``∂self/∂n``
+        (the assembler resolves the flux ``∇self·n``). So an interface flux / material condition reads
+        with the same ``.d`` as a plain derivative::
+
+            n = domain.variable("interface_A_B", normals=True)
+            kA * uA.d(n) - kB * uB.d(n)          # flux continuity across the interface
+        """
         return self._rewrap(self._expr.d(v, scheme=scheme))
 
     def d2(self, v, scheme: str = "automatic_differentiation") -> "ScalarView":

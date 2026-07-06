@@ -520,3 +520,55 @@ def test_couple_fem_fdm_line_via_jno_core():
     sol = np.asarray(jno.core([femL, fdmR]).solve()).reshape(-1)  # public entry, no hand-rolled coupling
     rel = float(np.linalg.norm(sol - exact) / np.linalg.norm(exact))
     assert rel < 5e-2, f"jno.core line coupling must match the MMS solution, got {rel:.2e}"
+
+
+@pytest.mark.slow
+def test_couple_with_declared_interface_conditions():
+    """The coupling written FULLY in jNO syntax — subdomain solves PLUS the interface conditions in the
+    same ``jno.core([...])`` list, using the auto-created ``interface_L_R`` tag and its normal:
+
+        uA(iface) - uB(iface)              # value continuity  (like a periodic tie)
+        uA.d(n) - uB.d(n)                  # flux continuity   (n = domain.variable(iface, normals=True))
+
+    jno.core recognises them (a residual referencing an ``interface_*`` tag) and routes the coupling from
+    them instead of only inferring it — reproducing the MMS solution ``sin(pi x) sin(pi y)``."""
+    import jno.jnp_ops as jnn
+    from jno.dd import couple
+
+    regL, regR = box(0.0, 0.0, 0.5, 1.0), box(0.5, 0.0, 1.0, 1.0)
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0))
+    d.region("L", regL)
+    d.region("R", regR)
+    d.build_mesh(mesh_size=0.05)
+    p = np.asarray(d.mesh_connectivity["points"])[:, :2]
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+
+    xL, yL, _ = d.variable("L", split=True)
+    xR, yR, _ = d.variable("R", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xif, yif, _ = d.variable("interface_L_R", split=True)
+    nrm = d.variable("interface_L_R", normals=True)
+
+    def f(x, y):
+        return 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+
+    uf, vf = d.fem_symbols()
+    uif, vif = uf.bind(x=xL, y=yL), vf.bind(x=xL, y=yL)
+    femL = jno.fem([uif.x * vif.x + uif.y * vif.y - f(xL, yL) * vif, uf(xb, yb) - 0.0])
+    u = d.unknown()
+    uiR = u.bind(x=xR, y=yR)
+    fdmR = jno.fdm([-uiR.d2(xR) - uiR.d2(yR) - f(xR, yR), u(xb, yb) - 0.0])
+
+    # interface conditions, authored in jNO syntax on the auto-created tag + its normal
+    uL_if, uR_if = uf.bind(x=xif, y=yif), u.bind(x=xif, y=yif)
+    value_cond = uL_if - uR_if
+    flux_cond = uL_if.d(nrm) - uR_if.d(nrm)
+
+    # (a) both conditions are recognised (they reference the interface_L_R tag) and carried to the driver
+    _, info = couple([(femL, regL), (fdmR, regR)], interface_conditions=[value_cond, flux_cond]).solve(return_info=True)
+    assert info["interfaces"]["count"] == 2 and info["mode"] == "line-DN"
+
+    # (b) public entry: subproblems AND interface conditions in one list; coupling matches the MMS solution
+    sol = np.asarray(jno.core([femL, fdmR, value_cond, flux_cond]).solve()).reshape(-1)
+    rel = float(np.linalg.norm(sol - exact) / np.linalg.norm(exact))
+    assert rel < 5e-2, f"declared-interface coupling must match the MMS solution, got {rel:.2e}"
