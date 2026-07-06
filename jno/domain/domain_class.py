@@ -425,6 +425,7 @@ class domain(MeshIOMixin):
         algorithm: Optional[int] = None,
         time: Optional[Tuple[float, float, int]] = None,
         compute_mesh_connectivity: Optional[bool] = None,
+        keep_orphan_nodes: bool = False,
         **_ignored_kwargs,
     ):
         """
@@ -502,6 +503,10 @@ class domain(MeshIOMixin):
             time=time,
             compute_mesh_connectivity=compute_mesh_connectivity,
         )
+        # Drop mesh nodes that belong to no cell (gmsh geometry-construction points — arc/circle
+        # centres, spline control points — surface as isolated vertices, giving zero rows in the
+        # assembled operator). Off by default via keep_orphan_nodes=True. Applied in _apply_mesh.
+        self._keep_orphan_nodes = keep_orphan_nodes
 
         # Generate or load mesh / npz point cloud tags
         if isinstance(constructor, str):
@@ -1603,6 +1608,46 @@ class domain(MeshIOMixin):
         self.dimension = explicit_dim
         self.ds = ds
 
+    def _drop_orphan_nodes(self, mesh):
+        """Compact out mesh points that support no finite element (mesh hygiene).
+
+        gmsh routinely emits geometry-construction points -- circle/arc centres, spline control
+        points -- as isolated 0-D ``vertex`` cells. Such a node supports no basis function: it sits
+        in the DOF vector as a zero row/column, making the assembled operator singular. The correct
+        fix is to remove it (not to pin it). So: keep only the >=1-D cell blocks (line/triangle/tetra
+        -- the ones FEM assembles over), drop the 0-D ``vertex``/``point`` blocks, and compact any
+        node then left unreferenced. Renumbering is transparent to boundary regions -- physical
+        groups / ``cell_sets`` index *cells*, and a dropped node was in none of the kept ones.
+        Returns the mesh unchanged when there is nothing to remove.
+        """
+        import meshio
+
+        pts = np.asarray(getattr(mesh, "points", None))
+        if pts is None or pts.size == 0 or not mesh.cells:
+            return mesh
+        keep_blocks = [i for i, cb in enumerate(mesh.cells) if cb.type not in ("vertex", "point")]
+        fem_cells = [mesh.cells[i] for i in keep_blocks]
+        if not fem_cells:
+            return mesh
+        used = np.unique(np.concatenate([np.asarray(cb.data).reshape(-1) for cb in fem_cells]))
+        if used.size == len(pts) and len(keep_blocks) == len(mesh.cells):
+            return mesh  # every node supports an element and there are no 0-D blocks -> nothing to do
+        keep = np.sort(used.astype(np.int64))
+        remap = np.full(len(pts), -1, dtype=np.int64)
+        remap[keep] = np.arange(len(keep), dtype=np.int64)
+        cells = [meshio.CellBlock(cb.type, remap[np.asarray(cb.data)]) for cb in fem_cells]
+        # cell_sets / cell_data are lists parallel to mesh.cells -> keep only the surviving blocks
+        sub = lambda d: {k: [v[i] for i in keep_blocks] for k, v in (d or {}).items()}
+        point_data = {k: np.asarray(v)[keep] for k, v in (mesh.point_data or {}).items()}
+        n_dropped = len(pts) - len(keep)
+        if n_dropped:
+            self.log.info(f"Dropped {n_dropped} orphan mesh node(s) (geometry-construction points, no element)")
+        return meshio.Mesh(
+            pts[keep], cells,
+            cell_sets=sub(mesh.cell_sets), cell_data=sub(mesh.cell_data),
+            field_data=mesh.field_data, point_data=point_data,
+        )
+
     def _apply_mesh(self, mesh) -> None:
         """Run the post-mesh pipeline on a freshly attached mesh.
 
@@ -1614,6 +1659,8 @@ class domain(MeshIOMixin):
         if mesh is None:
             boundary_indices = np.asarray([], dtype=np.int64)
         else:
+            if not getattr(self, "_keep_orphan_nodes", False):
+                mesh = self._drop_orphan_nodes(mesh)
             self.mesh = mesh
             boundary_indices = self._extract_points_from_mesh(mesh)
             self._build_simplex_pools()
