@@ -353,3 +353,33 @@ def test_flux_rejects_nonaffine_and_transient():
                 uit.d(nrt) - 1.0,
             ]
         )
+
+
+def test_constraint_list_inverse_via_crux():
+    """A trainable jno.np.parameter in the constraint list makes jno.fdm([...]).solve() a deferred trace
+    node (like fem.solve()) that composes into jno.core — recover a source amplitude from an observed
+    field through crux + the parameter's attached optimizer (never a hand-rolled jax.grad loop)."""
+    import optax
+
+    import jno.jnp_ops as jnn
+    from jno.trace import FunctionCall
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    f_base = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    observed = jnp.asarray(jno.fdm([-ui.d2(x) - ui.d2(y) - 1.0 * f_base, u(xb, yb) - 0.0]).solve()).reshape(-1)
+
+    s = jno.np.parameter((1,), name="s")
+    s.dtype(jnp.float64)
+    s.initialize(jax.nn.initializers.constant(2.5))
+    s.optimizer(optax.adam(1e-1))
+    node = jno.fdm([-ui.d2(x) - ui.d2(y) - s * f_base, u(xb, yb) - 0.0]).solve()
+    assert isinstance(node, FunctionCall), "a trainable parameter must make .solve() a deferred crux node"
+
+    crux = jno.core([(node - observed).mse], domain=jno.domain.from_array({"_": np.zeros((1, 1))}))
+    crux.solve(120)
+    rec = float(np.asarray(crux.eval([s])).reshape(-1)[0])
+    assert abs(rec - 1.0) < 2e-2, f"crux did not recover the source amplitude: s={rec:.4f}"

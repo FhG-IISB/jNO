@@ -359,10 +359,12 @@ class _TraceFDM:
             return np.asarray(reg["point_indices"], dtype=int)
         return np.asarray(self.domain.mesh_connectivity["boundary_indices"], dtype=int)
 
-    def _pde_residual_fn(self, *, spatial=False):
+    def _pde_residual_fn(self, *, spatial=False, extra_params=None):
         """Differentiable residual over the nodal DOF vector, collocated at the mesh nodes. With
         ``spatial=True`` the ``u.t`` terms are dropped (:func:`_zero_temporal`) to give the
-        method-of-lines spatial residual ``R_spatial`` for the semidiscrete march."""
+        method-of-lines spatial residual ``R_spatial`` for the semidiscrete march. ``extra_params``
+        (``{layer_id: module}``) injects the current value of any **trainable** ``jno.np.parameter`` in
+        the residual — how a ``crux``-driven inverse reaches the solve (see :meth:`_parametric_node`)."""
         import equinox as eqx
 
         from .trace_evaluator import TraceEvaluator
@@ -384,10 +386,30 @@ class _TraceFDM:
 
         def residual_fn(dofs):
             mod = eqx.tree_at(lambda m: m.value, base, jnp.asarray(dofs).astype(base.value.dtype))
-            ev = TraceEvaluator(params={lid: mod})
+            params = {lid: mod, **(extra_params or {})}
+            ev = TraceEvaluator(params=params)
             return jnp.asarray(ev.evaluate(expr, context=context, var_bindings={})).reshape(-1)
 
         return residual_fn
+
+    def _trainable_params(self):
+        """Trainable ``jno.np.parameter`` fields in the constraints **other than the unknown** — the
+        inverse parameters (a source amplitude, a diffusivity, …). Returns ``{layer_id: ModelCall}``;
+        their presence makes :meth:`solve` return a deferred ``crux``-drivable node."""
+        from .trace import ModelCall
+
+        found = {}
+
+        def walk(n):
+            n = _unwrap(n)
+            if isinstance(n, ModelCall) and getattr(n.model, "_is_parameter", False) and n.model is not self.unknown:
+                found[n.model.layer_id] = n
+            for c in _iter(n):
+                walk(c)
+
+        for c in self._pde + self._dirichlet + self._neumann + self._ic:
+            walk(c)
+        return found
 
     def _eval_g(self, g_node, idx):
         """Evaluate a value node ``g`` (constant or coordinate expression) at the nodes ``idx``."""
@@ -454,11 +476,12 @@ class _TraceFDM:
         n = raw / (np.linalg.norm(raw, axis=1, keepdims=True) + 1e-30)
         return idx, jnp.asarray(n)
 
-    def _flux_value_fn(self, constraint, val):
+    def _flux_value_fn(self, constraint, val, extra_params=None):
         """Evaluate the flux constraint over ALL nodes with the normal derivative ``∂u/∂n`` pinned to the
         constant ``val`` (:func:`_set_normal`) — everything else (the field value ``u``, ``α``, ``u∞``,
         coordinate coefficients) evaluates normally against the nodal DOFs. Two such evaluations
-        (``val = 0`` and ``val = 1``) give the affine decomposition of the boundary condition in the flux."""
+        (``val = 0`` and ``val = 1``) give the affine decomposition of the boundary condition in the flux.
+        ``extra_params`` injects trainable-parameter values, as in :meth:`_pde_residual_fn`."""
         import equinox as eqx
 
         from .trace_evaluator import TraceEvaluator
@@ -474,13 +497,13 @@ class _TraceFDM:
 
         def value_fn(dofs):
             mod = eqx.tree_at(lambda m: m.value, base, jnp.asarray(dofs).astype(base.value.dtype))
-            ev = TraceEvaluator(params={lid: mod})
+            ev = TraceEvaluator(params={lid: mod, **(extra_params or {})})
             out = jnp.asarray(ev.evaluate(expr, context=context, var_bindings={})).reshape(-1)
             return jnp.broadcast_to(out, (self._N,)) if out.shape[0] == 1 else out  # a constant `-h` → per-node
 
         return value_fn
 
-    def _flux_rows(self):
+    def _flux_rows(self, extra_params=None):
         """Rows for **any** flux boundary condition affine in ``∂u/∂n`` — Neumann ``ui.d(n) - h``, Robin
         ``ui.d(n) + α(u - u∞)``, a coordinate-coefficient ``κ(x)·ui.d(n)``, either sign. Writes the whole
         edge equation with that edge's boundary tags (``xr, yr, nr = domain.variable(region, ...)``). Per
@@ -495,8 +518,8 @@ class _TraceFDM:
             region = nvar.tag[len("n_") :]  # `n_right` → `right`
             idx, nrm = self._node_normals(region)
             _, grad_method, _ = _D.parse_fd_scheme(getattr(jac, "scheme", "finite_difference"))
-            v0, v1 = self._flux_value_fn(c, 0.0), self._flux_value_fn(c, 1.0)
-            f0, f1, f2 = v0(probe), v1(probe), self._flux_value_fn(c, 2.0)(probe)
+            v0, v1 = self._flux_value_fn(c, 0.0, extra_params), self._flux_value_fn(c, 1.0, extra_params)
+            f0, f1, f2 = v0(probe), v1(probe), self._flux_value_fn(c, 2.0, extra_params)(probe)
             if not bool(jnp.allclose(f2 - f0, 2.0 * (f1 - f0), atol=1e-6)):
                 raise ValueError(
                     "jno.fdm([...]): a flux boundary condition must be affine in the normal derivative "
@@ -529,9 +552,18 @@ class _TraceFDM:
                 raise ValueError("jno.fdm([...]): x0= is rejected for a transient problem — the IC owns the state.")
             return self._march(nonlinear=nonlinear)
 
-        residual_fn = self._pde_residual_fn()
+        trainable = self._trainable_params()
+        if trainable:
+            return self._parametric_node(trainable, nonlinear=nonlinear, x0=x0)
+        return self._steady_solve(nonlinear=nonlinear, x0=x0)
+
+    def _steady_solve(self, *, nonlinear=None, x0=None, extra_params=None):
+        """The eager steady solve: fold the flux and Dirichlet rows into the residual and hand it to the
+        ``jno.solve`` Newton–Krylov driver. ``extra_params`` carries the current values of any trainable
+        ``jno.np.parameter`` (from :meth:`_parametric_node`); it is empty for a plain forward solve."""
+        residual_fn = self._pde_residual_fn(extra_params=extra_params)
         rows = self._dirichlet_rows()
-        flux_rows = self._flux_rows()
+        flux_rows = self._flux_rows(extra_params)
 
         def residual_with_bc(u):
             r = residual_fn(u)
@@ -551,6 +583,29 @@ class _TraceFDM:
         driver = nonlinear or _solve.newton()
         u0 = jnp.zeros(self._N) if x0 is None else jnp.asarray(x0)
         return driver(residual_with_bc, u0)
+
+    def _parametric_node(self, trainable, *, nonlinear=None, x0=None):
+        """When the constraints carry a trainable ``jno.np.parameter`` (an inverse parameter), return the
+        solve as a **trace node** instead of an array — exactly as ``fem.solve()`` does — so it composes
+        into ``jno.core``: ``jno.core([(jno.fdm([...]).solve() - u_obs).mse])`` with the parameter's
+        attached optimizer recovers it. At each ``crux`` step the parameter node resolves to its current
+        value, the solve re-runs (differentiably, through ``custom_root``), and the gradient flows back."""
+        import equinox as eqx
+
+        from .trace import FunctionCall
+
+        lids = list(trainable)
+        param_nodes = [trainable[lid] for lid in lids]  # the parameter ModelCalls -> FunctionCall args
+        modules = {lid: trainable[lid].model.module for lid in lids}
+
+        def _solve(*values):  # values = the parameters' current (crux-trained) values
+            extra = {
+                lid: eqx.tree_at(lambda m: m.value, modules[lid], jnp.asarray(v).astype(modules[lid].value.dtype))
+                for lid, v in zip(lids, values)
+            }
+            return self._steady_solve(nonlinear=nonlinear, x0=x0, extra_params=extra)
+
+        return FunctionCall(_solve, param_nodes, name="fdm_solve")
 
     def _march(self, *, nonlinear=None, save_ts=None):
         """Method-of-lines march of ``u̇ = -R_spatial(u)`` reusing jNO's solver-agnostic

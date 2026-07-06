@@ -152,22 +152,25 @@ transient residuals are handled the same way (the march reuses the Newton driver
 
 ## Differentiable inverse problems
 
-The solve differentiates through `custom_root`, so `jax.grad` flows to any parameter that appears in
-the constraint list — a source amplitude, a diffusivity, a `jno.nn.wrap` network. `jno.fdm` therefore
-composes into gradient-based inversion exactly like `fem.solve()` — the whole solve is still the one
-entry, `jno.fdm([...]).solve()`:
+When the constraint list carries a **trainable** `jno.np.parameter` — a source amplitude, a
+diffusivity, a `jno.nn.wrap` network — `jno.fdm([...]).solve()` returns a differentiable **trace node**
+(not an array), exactly as `fem.solve()` does. It therefore composes straight into `jno.core`: put the
+solve inside a data-misfit loss and let the parameter's attached optimizer recover it.
 
 ```python
-def solve_scale(s):                                    # a differentiable solve parameterized by s
-    u = d.unknown(); ui = u.bind(x=x, y=y)
-    return jno.fdm([-ui.d2(x) - ui.d2(y) - s * f_base, u(xb, yb) - 0.0]).solve()
+s = jno.np.parameter((1,), name="s")            # the unknown to recover
+s.optimizer(optax.adam(1e-1))
+u = d.unknown(); ui = u.bind(x=x, y=y)
 
-grad_s = jax.grad(lambda s: jnp.mean((solve_scale(s) - observed) ** 2))
+solve = jno.fdm([-ui.d2(x) - ui.d2(y) - s * f_base, u(xb, yb) - 0.0]).solve()   # a trace node
+crux  = jno.core([(solve - u_obs).mse], domain=jno.domain.from_array({"_": np.zeros((1, 1))}))
+crux.solve(150)                                  # recovers s from the observation
 ```
 
-The `jno.solve` Newton–Krylov + `custom_root` machinery (the same one `jno.fem` uses) handles linear
-and nonlinear residuals uniformly — a linear residual converges in one Newton step — and provides the
-implicit gradient with no adjoint code.
+At each `crux` step the parameter node resolves to its current value, the solve re-runs
+(differentiably, through the `jno.solve` Newton–Krylov `custom_root`), and the gradient flows back to
+the optimizer — no adjoint code. With **no** trainable parameter, `.solve()` returns the solution
+array eagerly, as in every section above.
 
 ---
 
