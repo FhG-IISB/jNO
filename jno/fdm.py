@@ -217,6 +217,34 @@ def _has_temporal(node):
     return any(_has_temporal(c) for c in _iter(n))
 
 
+def _has_unknown_derivative(node, unknown):
+    """Does the expression contain a **derivative of the unknown** (a Jacobian/Hessian/TemporalDerivative
+    whose target is the unknown)? This is what distinguishes a **PDE** residual from a value-only
+    **pinning** condition ``u(region) - g`` (Dirichlet / IC / sub-region pin) — the strong-form analogue
+    of the fem "does it contain the test function?" rule."""
+    from .trace import Hessian, Jacobian, TemporalDerivative
+
+    n = _unwrap(node)
+    if isinstance(n, (Jacobian, Hessian, TemporalDerivative)) and _contains_unknown(getattr(n, "target", None), unknown):
+        return True
+    return any(_has_unknown_derivative(c, unknown) for c in _iter(n))
+
+
+def _mesh_nodes_in(pts, geom):
+    """Indices of the mesh nodes ``pts`` inside a shapely region ``geom`` — resolves a geometric region
+    (registered via ``domain.region(name, geom)``) to a node subset for pinning/solving on a subdomain."""
+    from shapely.geometry import Point
+
+    g = geom.buffer(1e-9)
+    try:  # vectorized fast path (shapely >= 2.0.2), fall back to per-point containment
+        import shapely
+
+        mask = np.asarray(shapely.contains_xy(g, np.asarray(pts)[:, 0], np.asarray(pts)[:, 1]))
+    except (ImportError, AttributeError):
+        mask = np.array([g.contains(Point(float(q[0]), float(q[1]))) for q in np.asarray(pts)])
+    return np.nonzero(mask)[0].astype(int)
+
+
 def _zero_temporal(node):
     """Strong-form method-of-lines split: drop the ``u.t`` (:class:`TemporalDerivative`) terms, leaving
     the **spatial** residual ``R_spatial``. The semidiscrete form ``M u̇ + R_spatial = 0`` (collocation
@@ -309,23 +337,24 @@ class _TraceFDM:
         self._N = int(np.asarray(self.domain.mesh_connectivity["points"]).shape[0])
         self._pts = jnp.asarray(np.asarray(self.domain.mesh_connectivity["points"])[:, : self.domain.dimension])
         self._pde, self._dirichlet, self._neumann, self._ic = [], [], [], []
-        boundary_tags = set(getattr(self.domain, "_boundary_registry", {}).keys()) | {"boundary"}
         for c in constraints:
-            # A normal derivative `ui.d(n, ...)` marks a Neumann/Robin flux row — check it FIRST, because
-            # the field is bound to the interior coords (so `_region_tag` is ambiguous); the region comes
-            # from the normal variable's tag instead (`n_right` → `right`), via `_neumann_region`.
+            # Classify by structure (not by which region tag), so a value-only pin works on ANY region —
+            # a boundary edge OR a geometric sub-region (`domain.region(name, geom)`, used by coupled /
+            # domain-decomposition solves to pin a subdomain's complement to a neighbour's field):
+            #   * a normal derivative `ui.d(n, ...)`           → a Neumann/Robin flux row (check first);
+            #   * a derivative of the unknown (Laplacian, u.t) → the PDE residual;
+            #   * the `initial` region, value-only            → the initial condition;
+            #   * otherwise (value-only, affine in u)          → a Dirichlet pin on its region.
             if _normal_jacobian(c) is not None:
                 self._neumann.append(c)
-                continue
-            tag = _region_tag(c)
-            if isinstance(tag, str) and tag == "initial":
-                self._ic.append(c)
-            elif isinstance(tag, str) and tag in boundary_tags:
-                self._dirichlet.append(c)
-            else:
+            elif _has_unknown_derivative(c, self.unknown):
                 self._pde.append(c)
+            elif _region_tag(c) == "initial":
+                self._ic.append(c)
+            else:
+                self._dirichlet.append(c)
         if not self._pde:
-            raise ValueError("jno.fdm([...]): no interior PDE residual found (only boundary/initial conditions).")
+            raise ValueError("jno.fdm([...]): no PDE residual found (a term with a derivative of the unknown).")
         self._transient = bool(self._ic)
         pde_has_dt = any(_has_temporal(c) for c in self._pde)
         if self._transient:
@@ -357,6 +386,9 @@ class _TraceFDM:
         reg = getattr(self.domain, "_boundary_registry", {}).get(tag)
         if reg is not None and len(reg.get("point_indices", [])) > 0:
             return np.asarray(reg["point_indices"], dtype=int)
+        ptags = getattr(self.domain, "_polygon_tags", {})  # a geometric sub-region (domain.region(...))
+        if tag in ptags and ptags[tag][0] == "interior":
+            return _mesh_nodes_in(np.asarray(self._pts), ptags[tag][1])
         return np.asarray(self.domain.mesh_connectivity["boundary_indices"], dtype=int)
 
     def _pde_residual_fn(self, *, spatial=False, extra_params=None):

@@ -237,3 +237,62 @@ def test_heterogeneous_fem_pinn_coupling():
 
     assert best_jump < 5e-2, f"FEM+PINN coupling did not converge the interface (best jump={best_jump:.2e})"
     assert best_rel < 6e-2, f"coupled FEM+PINN field must be a valid few-% solution, got rel-L2={best_rel:.2e}"
+
+
+@pytest.mark.slow
+def test_overlapping_schwarz_via_real_fdm_api():
+    """The coupling through the **real `jno.fdm([...]).solve()` API** (not hand-rolled newton): each
+    subdomain is a genuine FDM solve that pins its complement — a geometric sub-region `domain.region(...)`
+    — to the neighbour's field (a symbolic nodal data-field, updated in place each iteration). The
+    overlapping Schwarz still reproduces the monolithic single-mesh solve. This is the crystallization of
+    the FDM coupling side: `domain.region` node-subsets + symbolic nodal-field Dirichlet values compose
+    into a real subdomain solve. Marked slow (an iterative loop of real solves)."""
+    import equinox as eqx
+    import jax.numpy as jnp
+
+    import jno.jnp_ops as jnn
+
+    b1, b2 = box(0.0, 0.0, 0.6, 1.0), box(0.4, 0.0, 1.0, 1.0)
+    d = jno.domain(b1.union(b2), mesh_size=0.07)
+    d.region("notA", b2.difference(b1))  # A's complement (B-only), a geometric interior sub-region
+    d.region("notB", b1.difference(b2))  # B's complement (A-only)
+    p = np.asarray(d.mesh_connectivity["points"])[:, :2]
+    n = p.shape[0]
+    in_a, in_b = _region_mask(p, b1), _region_mask(p, b2)
+    overlap = in_a & in_b
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xna, yna, _ = d.variable("notA", split=True)
+    xnb, ynb, _ = d.variable("notB", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+
+    field_b, field_a = jno.np.parameter((n,)), jno.np.parameter((n,))  # neighbour data-fields (no optimizer)
+
+    def set_field(g, vals):
+        g.model.module = eqx.tree_at(lambda m: m.value, g.model.module, jnp.asarray(vals))
+
+    # BUILD ONCE — each subdomain pins its complement to the (in-place-updated) neighbour field
+    solve_a = jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(xna, yna) - field_b, u(xb, yb) - 0.0])
+    solve_b = jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(xnb, ynb) - field_a, u(xb, yb) - 0.0])
+    u_mono = np.asarray(jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(xb, yb) - 0.0]).solve()).reshape(-1)
+
+    u_a = u_b = np.zeros(n)
+    jump = np.inf
+    for _ in range(40):
+        set_field(field_b, u_b)
+        u_a = np.asarray(solve_a.solve()).reshape(-1)  # re-solve, neighbour field updated in place
+        set_field(field_a, u_a)
+        u_b = np.asarray(solve_b.solve()).reshape(-1)
+        jump = float(np.max(np.abs(u_a[overlap] - u_b[overlap])))
+        if jump < 1e-6:
+            break
+    u_dd = np.where(in_a, u_a, u_b)
+
+    assert jump < 1e-6, f"real-API Schwarz did not converge (jump={jump:.2e})"
+    equiv = float(np.linalg.norm(u_dd - u_mono) / np.linalg.norm(u_mono))
+    assert equiv < 1e-5, f"real-API coupled solve must match the monolithic solve, got {equiv:.2e}"
+    assert float(np.linalg.norm(u_dd - exact) / np.linalg.norm(exact)) < 3e-2
