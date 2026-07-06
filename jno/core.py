@@ -226,6 +226,18 @@ def _infer_domain_from_constraints(constraints: List[Placeholder]):
     )
 
 
+def _detect_subdomains(constraints):
+    """If every item is a subdomain solve problem carrying a named region — a ``jno.fdm([...])`` whose
+    PDE coordinates live on a ``domain.region(name, poly)`` — return them so ``jno.core`` couples them by
+    overlapping Schwarz instead of running PINN training; else ``None`` (a normal loss/PINN core)."""
+    try:
+        from .fdm import _TraceFDM
+    except Exception:
+        return None
+    subs = [c for c in constraints if isinstance(c, _TraceFDM) and getattr(c, "region_geometry", None) is not None]
+    return subs if (len(subs) >= 2 and len(subs) == len(constraints)) else None
+
+
 def _active_model_lids(exprs):
     """Return layer_ids of Model nodes reachable without crossing stop_gradient.
 
@@ -416,6 +428,15 @@ class core:
         """
         self.log = get_logger()
         self.constraints: List[Placeholder] = constraints
+
+        # Domain-decomposition coupling: `jno.core([A, B, ...])` where each item is a subdomain solve
+        # (`jno.fdm([...])` carrying a named region via `domain.region(...)`) — couple by overlapping
+        # Schwarz instead of PINN training. `.solve()` delegates to the coupling driver.
+        self._dd_subdomains = _detect_subdomains(constraints)
+        if self._dd_subdomains is not None:
+            self.domain = self._dd_subdomains[0].domain
+            self.models = {}
+            return
 
         # An empty-constraint core is eval-only (no training); its domain is
         # supplied per call to eval(). Only infer a domain when constraints
@@ -1735,6 +1756,15 @@ class core:
         Returns:
             statistics: Training history with ``.plot()`` convenience.
         """
+        # Domain-decomposition coupling: the constraints are subdomain solve problems, not losses —
+        # couple them by overlapping Schwarz (no PINN training). `epochs` maps to the max iteration count.
+        if getattr(self, "_dd_subdomains", None) is not None:
+            from .dd import couple
+
+            return couple([(s, s.region_geometry) for s in self._dd_subdomains]).solve(
+                tol=1e-7, max_iter=int(epochs) if epochs and epochs != 1000 else 100
+            )
+
         from contextlib import nullcontext
 
         from jax._src import profiler as _jax_profiler

@@ -416,3 +416,39 @@ def test_couple_driver_reproduces_monolithic():
     equiv = float(np.linalg.norm(np.asarray(sol) - mono) / np.linalg.norm(mono))
     assert equiv < 1e-5, f"coupled driver must reproduce the monolithic solve, got {equiv:.2e}"
     assert float(np.linalg.norm(np.asarray(sol) - exact) / np.linalg.norm(exact)) < 3e-2
+
+
+@pytest.mark.slow
+def test_couple_via_jno_core():
+    """The public entry: `jno.core([A, B]).solve()` where A, B are `jno.fdm([...])` subdomain problems
+    whose PDE coordinates live on named regions (`domain.region(...)`). jno.core detects the subdomain
+    solves, infers each region from the coords, and couples them by overlapping Schwarz — reproducing the
+    monolithic single-mesh solve. No `jno.dd`, no `couple`, no explicit regions — just `jno.core`."""
+
+    import jno.jnp_ops as jnn
+
+    b1, b2 = box(0.0, 0.0, 0.6, 1.0), box(0.4, 0.0, 1.0, 1.0)
+    d = jno.domain(b1.union(b2), mesh_size=0.06)
+    d.region("A", b1)
+    d.region("B", b2)
+    p = np.asarray(d.mesh_connectivity["points"])[:, :2]
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    xa, ya, _ = d.variable("A", split=True)
+    xb2, yb2, _ = d.variable("B", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xi, yi, _ = d.variable("interior", split=True)
+    u = d.unknown()
+    aa, ab, ui = u.bind(x=xa, y=ya), u.bind(x=xb2, y=yb2), u.bind(x=xi, y=yi)
+    fa = 2 * np.pi**2 * jnn.sin(np.pi * xa) * jnn.sin(np.pi * ya)
+    fb = 2 * np.pi**2 * jnn.sin(np.pi * xb2) * jnn.sin(np.pi * yb2)
+    fi = 2 * np.pi**2 * jnn.sin(np.pi * xi) * jnn.sin(np.pi * yi)
+
+    a = jno.fdm([-aa.d2(xa) - aa.d2(ya) - fa, u(xb, yb) - 0.0])  # PDE on region A
+    b = jno.fdm([-ab.d2(xb2) - ab.d2(yb2) - fb, u(xb, yb) - 0.0])  # PDE on region B
+    assert a.region == "A" and b.region == "B"  # regions inferred from the PDE coords
+    mono = np.asarray(jno.fdm([-ui.d2(xi) - ui.d2(yi) - fi, u(xb, yb) - 0.0]).solve()).reshape(-1)
+
+    sol = np.asarray(jno.core([a, b]).solve())  # the public entry couples the subdomains
+    equiv = float(np.linalg.norm(sol - mono) / np.linalg.norm(mono))
+    assert equiv < 1e-5, f"jno.core coupling must reproduce the monolithic solve, got {equiv:.2e}"
+    assert float(np.linalg.norm(sol - exact) / np.linalg.norm(exact)) < 3e-2

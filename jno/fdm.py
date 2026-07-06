@@ -380,6 +380,22 @@ class _TraceFDM:
                 "(a flux node keeps its mass row, unlike a pinned Dirichlet node). Use a steady problem, or "
                 "impose the flux as a Dirichlet condition."
             )
+        # The sub-domain this problem owns, if its PDE coordinates carry a named region
+        # (`domain.region(name, poly)`). Used by `jno.core([...])` to couple subdomains automatically.
+        self.region, self.region_geometry = self._pde_region()
+
+    def _pde_region(self):
+        """``(region_tag, geometry)`` of the named sub-region carried by the PDE's coordinate variables
+        (from ``domain.region(name, poly)``), or ``(None, None)`` for a whole-domain problem."""
+        src = getattr(self.domain, "_source_regions", {}) or {}
+        tags = {
+            v.tag
+            for c in self._pde
+            for v in (getattr(c, "_coord_vars", None) or {}).values()
+            if getattr(v, "axis", None) != "temporal"
+        }
+        named = [t for t in tags if t in src]
+        return (named[0], src[named[0]]) if len(named) == 1 else (None, None)
 
     def _region_nodes(self, tag):
         if tag == "initial":
