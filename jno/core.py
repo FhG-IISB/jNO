@@ -239,15 +239,14 @@ def _references_interface(node):
         tag = getattr(n, "tag", None)
         if isinstance(tag, str) and (tag.startswith("interface_") or tag.startswith("n_interface_")):
             return True
-        e = getattr(n, "_expr", None)
-        if e is not None:
-            stack.append(e)
-        args = getattr(n, "args", None)
-        if args:
-            stack.extend(a for a in args if a is not None)
-        variables = getattr(n, "variables", None)  # Jacobian/Hessian stash the diff variable(s) here
-        if variables:
-            stack.extend(v for v in variables if v is not None)
+        for attr in ("_expr", "left", "right", "operand"):  # views + binary/unary ops
+            c = getattr(n, attr, None)
+            if c is not None:
+                stack.append(c)
+        for attr in ("args", "variables"):  # op children + Jacobian diff-vars (a normal lives here)
+            seq = getattr(n, attr, None)
+            if seq:
+                stack.extend(a for a in seq if a is not None)
         cv = getattr(n, "_coord_vars", None)  # `.bind(x=xif, y=yif)` stashes coords here, not in the trace
         if isinstance(cv, dict):
             stack.extend(cv.values())

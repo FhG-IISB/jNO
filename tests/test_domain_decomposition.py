@@ -564,9 +564,10 @@ def test_couple_with_declared_interface_conditions():
     value_cond = uL_if - uR_if
     flux_cond = uL_if.d(nrm) - uR_if.d(nrm)
 
-    # (a) both conditions are recognised (they reference the interface_L_R tag) and carried to the driver
+    # (a) both conditions are recognised (they reference the interface_L_R tag) and CLASSIFIED: the flux
+    # condition carries a normal derivative (u.d(n)) even after the view subtraction; the value one does not.
     _, info = couple([(femL, regL), (fdmR, regR)], interface_conditions=[value_cond, flux_cond]).solve(return_info=True)
-    assert info["interfaces"]["count"] == 2 and info["mode"] == "line-DN"
+    assert info["interfaces"] == {"count": 2, "flux": 1, "value": 1} and info["mode"] == "line-DN"
 
     # (b) public entry: subproblems AND interface conditions in one list; coupling matches the MMS solution
     sol = np.asarray(jno.core([femL, fdmR, value_cond, flux_cond]).solve()).reshape(-1)

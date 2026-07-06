@@ -86,12 +86,43 @@ def _is_fem(prob):
     return hasattr(prob, "A") and hasattr(prob, "b")
 
 
+def _iter_nodes(root):
+    """DFS over a trace node and all its children — views (``_expr``), binary/unary ops (``left``/``right``/
+    ``operand``), function/operation nodes (``args``), derivative nodes (``variables`` — where a ``Jacobian``
+    stashes the differentiation Variable, incl. a normal), and ``.bind`` coordinates (``_coord_vars``)."""
+    seen: set = set()
+    stack = [root]
+    while stack:
+        n = stack.pop()
+        if id(n) in seen:
+            continue
+        seen.add(id(n))
+        yield n
+        for attr in ("_expr", "left", "right", "operand"):
+            c = getattr(n, attr, None)
+            if c is not None:
+                stack.append(c)
+        for attr in ("args", "variables"):
+            seq = getattr(n, attr, None)
+            if seq:
+                stack.extend(c for c in seq if c is not None)
+        cv = getattr(n, "_coord_vars", None)
+        if isinstance(cv, dict):
+            stack.extend(cv.values())
+
+
+def _references_normal(node):
+    """True if an interface condition contains a NORMAL derivative (references an ``n_interface_*`` tag) —
+    a **flux** condition ``k*uA.d(n)-...``; a value condition ``uA(iface)-uB(iface)`` does not."""
+    return any(isinstance(getattr(n, "tag", None), str) and n.tag.startswith("n_interface_") for n in _iter_nodes(node))
+
+
 def _classify_interfaces(interface_conditions):
-    """Summarise the interface conditions declared in the constraint list (each recognised by referencing
-    an ``interface_*`` tag). ``count`` is the number of declared conditions. Splitting them into flux vs
-    value needs the interface normal to survive view arithmetic (``uA.d(n) - uB.d(n)`` currently drops it
-    from the walkable trace) — deferred to the material-``k`` flux-weighting step."""
-    return {"count": len(list(interface_conditions or []))}
+    """Split the declared interface conditions (each referencing an ``interface_*`` tag) into **flux**
+    (carries a normal derivative ``.d(n)``) vs **value**; the split drives which exchange the driver uses."""
+    conds = list(interface_conditions or [])
+    flux = sum(1 for c in conds if _references_normal(c))
+    return {"count": len(conds), "flux": flux, "value": len(conds) - flux}
 
 
 class _Coupled:
