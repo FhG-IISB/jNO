@@ -522,6 +522,41 @@ def test_couple_fem_fdm_line_via_jno_core():
     assert rel < 5e-2, f"jno.core line coupling must match the MMS solution, got {rel:.2e}"
 
 
+def test_normal_derivative_evaluates_as_flux_value():
+    """`u.d(n)` (with `n = domain.variable(region, normals=True)`) now EVALUATES to the pointwise flux
+    value `∇u·n` — the value form (distinct from the affine BC-assembly decomposition). This is what lets
+    an interface residual be *evaluated* at interface nodes given a computed nodal field (the basis of a
+    general interface solve). With u = x², at the vertical interface x=0.5 with outward normal (1,0),
+    `∂u/∂n = 2x = 1.0`."""
+    import equinox as eqx
+    import jax.numpy as jnp
+
+    from jno.dd import _element_partition
+    from jno.trace_evaluator import TraceEvaluator
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 0.6))
+    d.region("L", box(0.0, 0.0, 0.5, 0.6))
+    d.region("R", box(0.5, 0.0, 1.0, 0.6))
+    d.build_mesh(mesh_size=0.05)
+    p = np.asarray(d.mesh_connectivity["points"])[:, :2]
+    tris = np.asarray(d.mesh_connectivity["triangles"]).astype(int)
+    _, gamma = _element_partition(p, tris, box(0.0, 0.0, 0.5, 0.6))
+
+    xif, yif, _ = d.variable("interface_L_R", split=True)
+    nrm = d.variable("interface_L_R", normals=True)
+    u = d.unknown()
+    expr = getattr(u.bind(x=xif, y=yif).d(nrm), "_expr")  # the raw Jacobian(u, [n]) trace node
+    mod = eqx.tree_at(lambda m: m.value, u.model.module, jnp.asarray(p[:, 0] ** 2))  # inject u = x^2
+    ctxt = {  # eval context: interface points + interface normals
+        "interface_L_R": jnp.asarray(p[gamma]),
+        "n_interface_L_R": jnp.tile(jnp.array([1.0, 0.0]), (len(gamma), 1)),
+    }
+    out = np.asarray(TraceEvaluator(params={u.model.layer_id: mod}).evaluate(expr, context=ctxt, var_bindings={})).reshape(
+        -1
+    )
+    assert np.max(np.abs(out - 1.0)) < 0.02, f"u.d(n) must evaluate to the flux 2x·nx = 1.0 at x=0.5, got {out.mean():.3f}"
+
+
 @pytest.mark.slow
 def test_couple_with_declared_interface_conditions():
     """The coupling written FULLY in jNO syntax — subdomain solves PLUS the interface conditions in the
