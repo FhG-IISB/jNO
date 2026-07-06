@@ -206,7 +206,9 @@ def chebyshev(
     return LinearSolver(_fn, name="chebyshev")
 
 
-def _root_driver(name, *, damping, rtol, atol, max_steps, inner_tol, inner_maxit) -> NonlinearSolver:
+def _root_driver(
+    name, *, damping, rtol, atol, max_steps, inner_tol, inner_maxit, line_search, ls_max, ls_c
+) -> NonlinearSolver:
     def _fn(residual_fn, u0, *, linear_solve):
         from .utils.solver.newton_krylov import newton_krylov
 
@@ -220,6 +222,9 @@ def _root_driver(name, *, damping, rtol, atol, max_steps, inner_tol, inner_maxit
             inner_maxit=inner_maxit,
             linear_solve=linear_solve,
             damping=damping,
+            line_search=line_search,
+            ls_max=ls_max,
+            ls_c=ls_c,
         )
 
     return NonlinearSolver(_fn, name=name)
@@ -233,15 +238,29 @@ def newton(
     max_steps: int = 100,
     inner_tol: float = 1e-10,
     inner_maxit: int = 2000,
+    line_search: bool = False,
+    ls_max: int = 25,
+    ls_c: float = 1e-4,
 ) -> NonlinearSolver:
     """Jacobian-free Newton-Krylov -- the (unchanged) nonlinear default, as a configurable slot.
 
     Wraps :func:`jno.utils.solver.newton_krylov.newton_krylov`: ``J @ v`` from a JVP, inner
     matrix-free solve (default BiCGStab, or the ``linear=`` slot when given), implicit
     differentiation via ``lax.custom_root`` so gradients reach parameters without unrolling.
-    ``damping < 1`` relaxes each update for strongly nonlinear residuals."""
+    ``damping < 1`` relaxes each update for strongly nonlinear residuals; ``line_search=True`` adds
+    residual-norm Armijo backtracking (up to ``ls_max`` halvings, sufficient-decrease constant
+    ``ls_c``) so a stiff problem converges without hand-tuning ``damping``."""
     return _root_driver(
-        "newton", damping=damping, rtol=rtol, atol=atol, max_steps=max_steps, inner_tol=inner_tol, inner_maxit=inner_maxit
+        "newton",
+        damping=damping,
+        rtol=rtol,
+        atol=atol,
+        max_steps=max_steps,
+        inner_tol=inner_tol,
+        inner_maxit=inner_maxit,
+        line_search=line_search,
+        ls_max=ls_max,
+        ls_c=ls_c,
     )
 
 
@@ -253,6 +272,9 @@ def picard(
     max_steps: int = 200,
     inner_tol: float = 1e-10,
     inner_maxit: int = 2000,
+    line_search: bool = False,
+    ls_max: int = 25,
+    ls_c: float = 1e-4,
 ) -> NonlinearSolver:
     """Damped Picard (lagged-coefficient / fixed-point) iteration — pair with :func:`jno.lag`.
 
@@ -265,9 +287,22 @@ def picard(
     strongly nonsymmetric while its Picard block is a plain symmetric Stokes operator.
 
     Without any ``jno.lag`` marker in the residual this is exactly damped Newton. The default
-    ``max_steps`` is higher than Newton's — linear (not quadratic) convergence. See the
-    ``jno.lag`` docstring for the inverse-problem (Picard-adjoint) caveat.
+    ``max_steps`` is higher than Newton's — linear (not quadratic) convergence. ``line_search=True``
+    adds residual-norm Armijo backtracking (up to ``ls_max`` halvings, sufficient-decrease constant
+    ``ls_c``): essential when the lagged operator's step overshoots from a stiff initial state (a
+    rigid-plastic cold start whose effective viscosity spans orders of magnitude), where fixed
+    damping alone either diverges or crawls. See the ``jno.lag`` docstring for the inverse-problem
+    (Picard-adjoint) caveat.
     """
     return _root_driver(
-        "picard", damping=damping, rtol=rtol, atol=atol, max_steps=max_steps, inner_tol=inner_tol, inner_maxit=inner_maxit
+        "picard",
+        damping=damping,
+        rtol=rtol,
+        atol=atol,
+        max_steps=max_steps,
+        inner_tol=inner_tol,
+        inner_maxit=inner_maxit,
+        line_search=line_search,
+        ls_max=ls_max,
+        ls_c=ls_c,
     )
