@@ -141,6 +141,35 @@ def test_nonlinear_stokes_picard_fgmres_triangular():
     assert np.abs(np.asarray(sol) - u_ref).max() < 1e-6
 
 
+def test_line_search_rescues_divergent_fixed_step():
+    """A stiff residual where a full fixed step overshoots to a non-finite iterate, but
+    residual-norm Armijo backtracking (``line_search=True``) finds a safe step and converges.
+
+    ``f(u) = exp(u) - 1`` (root ``u = 0``). From ``u0 = -8`` the Jacobian ``exp(u)`` is tiny, so the
+    Newton step is ~ +3000: the fixed full step lands at ``exp(3000) = inf`` and never recovers,
+    while the line search halves the step until the residual actually decreases."""
+    from jno.utils.solver.newton_krylov import newton_krylov
+
+    f = lambda u: jnp.exp(u) - 1.0
+    diag_solve = lambda mv, rhs: rhs / mv(jnp.ones_like(rhs))  # exact 1x1 (diagonal) inner solve
+    u0 = jnp.array([-8.0])
+
+    u_fixed = newton_krylov(f, u0, linear_solve=diag_solve, damping=1.0, line_search=False, max_steps=50)
+    assert not np.isfinite(np.asarray(u_fixed)).all()  # fixed full step diverges
+
+    u_ls = newton_krylov(f, u0, linear_solve=diag_solve, damping=1.0, line_search=True, max_steps=200)
+    assert np.isfinite(np.asarray(u_ls)).all()
+    assert np.abs(np.asarray(u_ls)).max() < 1e-6  # converged to the root
+
+
+def test_picard_line_search_matches_reference():
+    """``line_search=True`` reaches the same root as full Newton (globalization changes the path to
+    the solution, never the solution) through the public ``jno.solve.picard`` slot."""
+    u_ref = np.asarray(_nonlinear_diffusion(lagged=False).solve())
+    u_ls = np.asarray(_nonlinear_diffusion(lagged=True).solve(nonlinear=jno.solve.picard(line_search=True)))
+    assert np.abs(u_ls - u_ref).max() < 1e-7
+
+
 def test_lag_freezes_gradients_but_not_values():
     # array fallback: values pass through, differentiation sees a constant
     x = jnp.asarray([1.5, -2.0])

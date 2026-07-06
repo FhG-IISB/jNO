@@ -70,6 +70,9 @@ def newton_krylov(
     inner_maxit=2000,
     linear_solve=None,
     damping=1.0,
+    line_search=False,
+    ls_max=25,
+    ls_c=1e-4,
 ):
     """Root-find ``residual_fn(u) = 0`` from guess ``u0``; differentiable w.r.t. any value
     ``residual_fn`` closes over. Drop-in for the ``(residual_fn, u0) -> u`` solver contract.
@@ -81,12 +84,36 @@ def newton_krylov(
     ``damping`` scales each update ``u += damping * delta`` (0 < damping <= 1): a fixed
     relaxation that trades steps for robustness on strongly nonlinear residuals. With
     ``jno.lag``-frozen coefficients in the residual the linearization is the *Picard* operator
-    and this loop is the damped Picard iteration (see :func:`jno.solve.picard`)."""
+    and this loop is the damped Picard iteration (see :func:`jno.solve.picard`).
+
+    ``line_search`` enables adaptive backtracking (a residual-norm Armijo globalization) on top of
+    the fixed ``damping``: each step tries ``alpha = damping`` and halves it (up to ``ls_max``
+    times) until ``||f(u + alpha*delta)|| <= (1 - ls_c*alpha)*||f(u)||``. Fixed damping alone can
+    overshoot and diverge on stiff residuals (e.g. a rigid-plastic cold start where the effective
+    viscosity spans several orders of magnitude); backtracking finds a safe step automatically, so
+    the same driver converges without hand-tuning ``damping``. Off by default (behaviour unchanged).
+    The line search is a bounded ``jax.lax.while_loop`` -- differentiability is untouched, since the
+    implicit-diff tangent solve depends only on the converged root, not the path taken to it."""
     # residual functions can hand back a plain numpy array for concrete inputs; coerce so the
     # jax.lax.custom_root primitive only ever sees JAX values.
     f0 = lambda u: jnp.asarray(residual_fn(u)).reshape(-1)
     u0 = jnp.asarray(u0).reshape(-1)
     inner = linear_solve or (lambda mv, rhs: _linsolve(mv, rhs, tol=inner_tol, maxit=inner_maxit))
+
+    def _backtrack(f, u, delta, rn):
+        """First ``alpha`` in ``damping * 0.5^i`` meeting residual-norm Armijo; else the last (tiny)."""
+
+        def cond(s):
+            _a, accepted, it = s
+            return (~accepted) & (it < ls_max)
+
+        def step(s):
+            a, _acc, it = s
+            accepted = jnp.linalg.norm(f(u + a * delta)) <= (1.0 - ls_c * a) * rn
+            return jnp.where(accepted, a, 0.5 * a), accepted, it + 1
+
+        a, _acc, _it = jax.lax.while_loop(cond, step, (jnp.asarray(damping, u.dtype), False, 0))
+        return a
 
     def solve(f, x0):
         r0n = jnp.linalg.norm(f(x0))
@@ -99,7 +126,8 @@ def newton_krylov(
             u, _r, k = state
             ru, jvp = jax.linearize(f, u)  # ru = f(u); jvp(v) = J @ v, reused across inner iters
             delta = inner(jvp, -ru)
-            u = u + damping * delta
+            alpha = _backtrack(f, u, delta, jnp.linalg.norm(ru)) if line_search else damping
+            u = u + alpha * delta
             return u, f(u), k + 1
 
         u, _r, _k = jax.lax.while_loop(cond, body, (x0, f(x0), 0))
