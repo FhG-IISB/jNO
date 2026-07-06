@@ -548,7 +548,14 @@ class PolygonDomain(domain):
                 kind is None and where.geom_type in {"Polygon", "MultiPolygon"} and where.area > _GEOM_TOL
             )
             if as_interior:
-                self._register_interior_tag(name, _as_polygonal_geometry(where))
+                geom = _as_polygonal_geometry(where)
+                self._register_interior_tag(name, geom)
+                # Register as a source region so the FEM front-end recognises it as a genuine sub-domain:
+                # a volume term on it (`RegionMask`) integrates over its cells, and a trial-only
+                # `u(name) - g` pins its node set (a volumetric hard constraint) — the mechanism a
+                # subdomain / domain-decomposition solve uses. (`_register_interior_tag` alone only tags
+                # it for sampling.)
+                self._source_regions[name] = geom
             else:
                 self._register_boundary_tag(name, _as_line_geometry(where))
             return self

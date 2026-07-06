@@ -296,3 +296,92 @@ def test_overlapping_schwarz_via_real_fdm_api():
     equiv = float(np.linalg.norm(u_dd - u_mono) / np.linalg.norm(u_mono))
     assert equiv < 1e-5, f"real-API coupled solve must match the monolithic solve, got {equiv:.2e}"
     assert float(np.linalg.norm(u_dd - exact) / np.linalg.norm(exact)) < 3e-2
+
+
+def test_fem_dirichlet_on_named_sub_region():
+    """FEM building block for domain decomposition: a trial-only `u(region) - g` on a **named interior
+    sub-region** (`domain.region(name, polygon)`) pins that region's whole node set — with either a
+    constant/coordinate value OR a **nodal data-field** (a `jno.np.parameter` carrying a neighbour's
+    field, gathered by node index). Laplace with a central sub-region pinned; the pin must be exact."""
+    import equinox as eqx
+    import jax.numpy as jnp
+
+    from jno.trace import FunctionCall
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06)
+    sub = box(0.3, 0.3, 0.7, 0.7)  # strictly interior
+    d.region("B", sub)
+    p = np.asarray(d.mesh_connectivity["points"])[:, :2]
+    n = p.shape[0]
+    in_b = _region_mask(p, sub)
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    x_sub, y_sub, _ = d.variable("B", split=True)
+    u, phi = d.fem_symbols()
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+
+    # (a) constant value on the sub-region
+    sol = np.asarray(jno.fem([ui.x * vi.x + ui.y * vi.y, u(x_sub, y_sub) - 1.0, u(xb, yb) - 0.0]).solve()).reshape(-1)
+    assert np.max(np.abs(sol[in_b] - 1.0)) < 1e-10, "constant sub-region pin must be exact"
+
+    # (b) nodal-field value on the sub-region (a neighbour's field, no optimizer → data → eager solve)
+    known = np.sin(3 * p[:, 0]) + p[:, 1]
+    g = jno.np.parameter((n,))
+    g.model.module = eqx.tree_at(lambda m: m.value, g.model.module, jnp.asarray(known))
+    sol_b = jno.fem([ui.x * vi.x + ui.y * vi.y, u(x_sub, y_sub) - g, u(xb, yb) - 0.0]).solve()
+    assert not isinstance(sol_b, FunctionCall), "a data-field Dirichlet value must stay an eager solve"
+    assert np.max(np.abs(np.asarray(sol_b).reshape(-1)[in_b] - known[in_b])) < 1e-10, "field pin must gather exactly"
+
+
+@pytest.mark.slow
+def test_heterogeneous_fem_fdm_real_api_coupling():
+    """FEM+FDM coupling through the **real solver APIs** on both sides: the FEM subdomain is authored as
+    `jno.fem([weak, u(sub_region) - neighbour, u(boundary) - 0]).solve()` (whole-mesh assembly, complement
+    pinned to a nodal neighbour field, rebuilt per iteration), the FDM subdomain likewise via `jno.fdm`.
+    The overlapping Schwarz converges to the analytic solution. This is the crystallization of the FEM
+    coupling side — the FDM side is proven in `test_overlapping_schwarz_via_real_fdm_api`. Marked slow
+    (heterogeneous Schwarz + per-iteration FEM re-assembly)."""
+    import equinox as eqx
+    import jax.numpy as jnp
+
+    import jno.jnp_ops as jnn
+
+    b1, b2 = box(0.0, 0.0, 0.6, 1.0), box(0.4, 0.0, 1.0, 1.0)
+    d = jno.domain(b1.union(b2), mesh_size=0.06)
+    d.region("notA", b2.difference(b1))
+    d.region("notB", b1.difference(b2))
+    p = np.asarray(d.mesh_connectivity["points"])[:, :2]
+    n = p.shape[0]
+    in_a, in_b = _region_mask(p, b1), _region_mask(p, b2)
+    overlap = in_a & in_b
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+
+    x, y, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    xna, yna, _ = d.variable("notA", split=True)
+    xnb, ynb, _ = d.variable("notB", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y)
+    f = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
+    uf, vf = d.fem_symbols()
+    uif, vif = uf.bind(x=x, y=y), vf.bind(x=x, y=y)
+
+    def field(vals):
+        g = jno.np.parameter((n,))
+        g.model.module = eqx.tree_at(lambda m: m.value, g.model.module, jnp.asarray(vals))
+        return g
+
+    u_a = u_b = np.zeros(n)
+    jump = np.inf
+    for _ in range(60):
+        u_a = np.asarray(jno.fdm([-ui.d2(x) - ui.d2(y) - f, u(xna, yna) - field(u_b), u(xb, yb) - 0.0]).solve()).reshape(-1)
+        u_b = np.asarray(
+            jno.fem([uif.x * vif.x + uif.y * vif.y - f * vif, uf(xnb, ynb) - field(u_a), uf(xb, yb) - 0.0]).solve()
+        ).reshape(-1)
+        jump = float(np.max(np.abs(u_a[overlap] - u_b[overlap])))
+        if jump < 1e-2:
+            break
+    u_dd = np.where(in_a, u_a, u_b)
+
+    assert jump < 2e-2, f"real-API FEM+FDM Schwarz did not converge (jump={jump:.2e})"
+    assert float(np.linalg.norm(u_dd - exact) / np.linalg.norm(exact)) < 3e-2

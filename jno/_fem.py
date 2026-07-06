@@ -2236,10 +2236,17 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
                 boundary_terms.setdefault(region, []).append(bare)
                 classification.append(f"surface@{region}")
         elif has_trial:
-            if support != "boundary":
+            # A trial-only residual is a Dirichlet pin `u(region) - g`. It lives on a boundary region,
+            # the 'initial' region (IC), OR a **named interior sub-region** (`domain.region(name, poly)`,
+            # keyed in `_source_regions`) — pinning that region's whole node set, a volumetric hard
+            # constraint used by subdomain / domain-decomposition solves. The default whole-domain
+            # `volume` is still rejected (that signals a forgotten test function).
+            is_subregion_pin = support == "volume" and region in (getattr(domain, "_source_regions", {}) or {})
+            if support != "boundary" and not is_subregion_pin:
                 raise ValueError(
                     "jno.fem: a residual with the trial but no test function must live on a boundary "
-                    "region (Dirichlet) or the 'initial' region (IC). Got a volume region — did you forget the test function?"
+                    "region (Dirichlet), the 'initial' region (IC), or a named interior sub-region "
+                    "(domain.region(...)). Got the whole-domain volume — did you forget the test function?"
                 )
             comp, value, value_node = _dirichlet_spec(_bare(c))
             fk = _field_key_of(c)
