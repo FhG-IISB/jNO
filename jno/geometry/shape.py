@@ -1,0 +1,124 @@
+"""``Shape`` -- a friendly, immutable geometry build-plan over gmsh-OpenCASCADE.
+
+A ``Shape`` records *what to build*, not a mesh: primitive leaves combined by boolean
+operators (``-`` cut, ``|`` fuse, ``&`` intersect) and dimension transitions
+(``.extrude``). It touches gmsh only inside :meth:`build` (delegated to
+:mod:`jno.geometry.emit`), so authoring and the naming/selection algebra stay
+pure-Python and testable without a mesher.
+
+Mesh size rides on the shape it describes (``size=`` / :meth:`sized`) -- config on the
+term it describes, not a global argument on ``jno.domain``. Primitives auto-name their
+boundaries (``left/right/top/bottom``, ``arc``, extrude caps ``front/back``); you select
+and merge afterwards with :meth:`edge` (by auto-name) and :meth:`edges_from` (by the
+primitive a boundary came from), combining with ``|``.
+"""
+
+from __future__ import annotations
+
+import itertools
+from dataclasses import dataclass, field
+from typing import Callable, FrozenSet, Tuple, Union
+
+from .primitives import Box, Disk, Rect
+
+# Unique, identity-stable key per primitive leaf, for provenance (``edges_from``).
+_LEAF_KEYS = itertools.count()
+
+Size = Union[float, Callable[..., float], None]
+
+
+@dataclass(frozen=True)
+class Selector:
+    """A set-valued reference to boundary entities: by auto-name and/or by provenance key.
+
+    Returned by :meth:`Shape.edge` / :meth:`Shape.edges_from`; combined with ``|``.
+    Resolved against a built mesh's classified boundary (name + originating leaf key).
+    """
+
+    names: FrozenSet[str] = frozenset()
+    keys: FrozenSet[int] = frozenset()
+
+    def __or__(self, other: "Selector") -> "Selector":
+        return Selector(self.names | other.names, self.keys | other.keys)
+
+    def matches(self, key: int, local_name: str) -> bool:
+        return local_name in self.names or key in self.keys
+
+
+@dataclass(frozen=True)
+class Shape:
+    """An immutable geometry build-plan. Operators return new shapes."""
+
+    _node: tuple
+    dim: int
+    _size: Size = field(default=None, compare=False)
+
+    # ----- primitive constructors ------------------------------------------------
+    @classmethod
+    def rect(cls, x0: float, y0: float, x1: float, y1: float, size: Size = None) -> "Shape":
+        return cls(("leaf", Rect(x0, y0, x1, y1), next(_LEAF_KEYS)), 2, size)
+
+    @classmethod
+    def disk(cls, cx: float, cy: float, r: float, size: Size = None) -> "Shape":
+        return cls(("leaf", Disk(cx, cy, r), next(_LEAF_KEYS)), 2, size)
+
+    @classmethod
+    def box(cls, x0: float, y0: float, z0: float, x1: float, y1: float, z1: float, size: Size = None) -> "Shape":
+        return cls(("leaf", Box(x0, y0, z0, x1, y1, z1), next(_LEAF_KEYS)), 3, size)
+
+    # ----- boolean operators -----------------------------------------------------
+    def __sub__(self, other: "Shape") -> "Shape":
+        return Shape(("cut", self, other), self.dim, self._size)
+
+    def __or__(self, other: "Shape") -> "Shape":
+        return Shape(("fuse", self, other), self.dim, self._size)
+
+    def __and__(self, other: "Shape") -> "Shape":
+        return Shape(("inter", self, other), self.dim, self._size)
+
+    # ----- transforms ------------------------------------------------------------
+    def extrude(self, height: float) -> "Shape":
+        if self.dim != 2:
+            raise ValueError("extrude requires a 2-D shape")
+        return Shape(("extrude", self, float(height)), 3, self._size)
+
+    def sized(self, size: Size) -> "Shape":
+        """Return a copy of this shape with its target mesh size set (scalar or ``f(x,y,z)``)."""
+        return Shape(self._node, self.dim, size)
+
+    # ----- introspection (pure; used by emit + selection) ------------------------
+    def leaves(self) -> Tuple[Tuple[object, Size, int], ...]:
+        """Flat ``(primitive, size, key)`` list of every primitive in the plan."""
+        node = self._node
+        kind = node[0]
+        if kind == "leaf":
+            prim, key = node[1], node[2]
+            return ((prim, self._size, key),)
+        if kind in ("cut", "fuse", "inter"):
+            return node[1].leaves() + node[2].leaves()
+        if kind == "extrude":
+            return node[1].leaves()
+        raise ValueError(f"unknown node kind {kind!r}")
+
+    def keys(self) -> FrozenSet[int]:
+        return frozenset(k for _, _, k in self.leaves())
+
+    # ----- boundary selection ----------------------------------------------------
+    def edge(self, name: str) -> Selector:
+        """Select boundary entities carrying auto-name ``name`` (``"top"``, ``"left"``, ...)."""
+        return Selector(names=frozenset({name}))
+
+    def edges_from(self, sub: "Shape") -> Selector:
+        """Select boundary entities that originate from the primitive(s) in ``sub``."""
+        return Selector(keys=sub.keys())
+
+    # ----- realization -----------------------------------------------------------
+    def build(self):
+        """Mesh this shape -> ``(meshio.Mesh, dim, ds)``. Imports gmsh lazily."""
+        from .emit import build as _build
+
+        return _build(self)
+
+    def __call__(self, geo=None):
+        # Callable-constructor compatibility (jno.domain runs constructor()).
+        return self.build()
