@@ -596,6 +596,51 @@ def test_material_interface_via_overlap_and_kx():
 
 
 @pytest.mark.slow
+def test_overlap_through_jno_core_rebuilds_region_local_fem():
+    """Overlap coupling of a REGION-TAGGED FEM straight through ``jno.core([...])``. A region-tagged FEM
+    (needed so ``jno.core`` can detect it as a subdomain) assembles region-local (``RegionMask``), which
+    can't reconcile an overlap band — its artificial boundary reaches no neighbour cells. The driver
+    rebuilds it WHOLE-MESH (keeping the region label) so overlapping Schwarz closes. Verified on the
+    material interface (``k(x)`` carries the jump): the interface value is the kink ``kL/(kL+kR) = 0.25``."""
+    import jno.jnp_ops as jnn
+
+    kL, kR = 1.0, 3.0
+    a, b = 2 * kR / (kL + kR), 2 * kL / (kL + kR)
+    boxA, boxB = box(0.0, 0.0, 0.6, 1.0), box(0.5, 0.0, 1.0, 1.0)
+    d = jno.domain(boxA.union(boxB), mesh_size=0.05)
+    d.region("A", boxA)
+    d.region("B", boxB)  # node-subset labels over the single union mesh (overlap kept)
+    p = np.asarray(d.mesh_connectivity["points"])[:, :2]
+    on = np.abs(p[:, 0] - 0.5) < 1e-6
+
+    xA, yA, _ = d.variable("A", split=True)
+    xB, yB, _ = d.variable("B", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+
+    def g(x, y):
+        return jnn.where(x <= 0.5, 1 - a * x, b * (1 - x))
+
+    kx = jnn.where(xA < 0.5, kL, kR)
+    uf, vf = d.fem_symbols()
+    uif, vif = uf.bind(x=xA, y=yA), vf.bind(x=xA, y=yA)  # ← region-tagged → RegionMask (region-local + detectable)
+    femA = jno.fem([kx * (uif.x * vif.x + uif.y * vif.y), uf(xb, yb) - g(xb, yb)])
+    u = d.unknown()
+    uiB = u.bind(x=xB, y=yB)
+    fdmB = jno.fdm([-kR * (uiB.d2(xB) + uiB.d2(yB)), u(xb, yb) - g(xb, yb)])
+
+    assert femA.region == "A" and fdmB.region == "B"  # detectable by jno.core
+    wm = femA._as_whole_mesh()
+    assert wm.region == "A"  # the whole-mesh rebuild keeps the region label
+    assert (np.abs(np.asarray(wm.A)).sum(1) > 1e-12).sum() > (np.abs(np.asarray(femA.A)).sum(1) > 1e-12).sum()  # more rows
+
+    sol = np.asarray(jno.core([femA, fdmB]).solve(epochs=250)).reshape(-1)  # detect → overlap → whole-mesh rebuild
+    iface = float(np.mean(sol[on]))
+    assert abs(iface - kL / (kL + kR)) < 0.04, (
+        f"jno.core overlap (rebuilt) should give ~{kL / (kL + kR):.2f}, got {iface:.3f}"
+    )
+
+
+@pytest.mark.slow
 def test_couple_with_declared_interface_conditions():
     """The coupling written FULLY in jNO syntax — subdomain solves PLUS the interface conditions in the
     same ``jno.core([...])`` list, using the auto-created ``interface_L_R`` tag and its normal:

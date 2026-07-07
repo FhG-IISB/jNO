@@ -248,6 +248,11 @@ class _Coupled:
 
     # -- overlapping: a 2-D strip, overlapping Schwarz (value exchange) ----------------------------
     def _solve_overlap(self, probs, geoms, *, tol, max_iter, return_info=False):
+        # A region-tagged FEM (needed so `jno.core` can detect it) assembles region-local (RegionMask),
+        # which can't reconcile an overlap band — its artificial boundary reaches no neighbour cells. Rebuild
+        # any such subdomain WHOLE-MESH (one cheap re-assemble + factorization, reused across all iterations)
+        # so complement-pinning closes the overlap; the region label is preserved for the masks.
+        probs = [p._as_whole_mesh() if (_is_fem(p) and getattr(p, "region", None) is not None) else p for p in probs]
         dom = probs[0].domain
         dim = int(getattr(dom, "dimension", 2))
         pts = np.asarray(dom.mesh_connectivity["points"])[:, :dim]

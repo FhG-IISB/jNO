@@ -1339,6 +1339,15 @@ class FEM:
         """The shapely geometry of :attr:`region`, or ``None`` — used by ``jno.core([...])`` coupling."""
         return self._dd_region()[1]
 
+    def _as_whole_mesh(self):
+        """Rebuild this region-tagged FEM with WHOLE-MESH assembly (no ``RegionMask``) while keeping its
+        region label. A region-local matrix can't reconcile an overlapping-Schwarz band (its artificial
+        boundary reaches no neighbour cells), so the overlap driver swaps in this whole-mesh rebuild. One
+        extra assemble + factorization, reused across every iteration — cheap next to the Schwarz loop."""
+        if not getattr(self, "_constraints", None):
+            return self
+        return fem(self._constraints, _dd_overlap=True, **(getattr(self, "_fem_kwargs", None) or {}))
+
     def pinned_solver(self, node_ids, *, nonlinear=None):
         """A reusable ``f(values) -> field`` that solves the linear system with ``node_ids`` pinned to
         ``values`` (row-replacement) — the interface Dirichlet data a coupled Schwarz step supplies. The
@@ -2001,7 +2010,14 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
 # ---------------------------------------------------------------------------
 # the driver
 # ---------------------------------------------------------------------------
-def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] = None, vec: Optional[int] = None) -> FEM:
+def fem(
+    constraints: Any,
+    *,
+    quad_degree: int = 2,
+    element_type: Optional[str] = None,
+    vec: Optional[int] = None,
+    _dd_overlap: bool = False,
+) -> FEM:
     """Assemble a flat list of traced residuals into an :class:`FEM`.
 
     Parameters
@@ -2269,10 +2285,13 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             _retag_coords_for_quadrature(c, support, region)
             bare = _bare(c)
             if support == "volume":
-                if region != "volume":
+                if region != "volume" and not _dd_overlap:
                     # Sub-domain term: multiply by the region's per-cell indicator so it integrates over
                     # that region's cells only. Stays a plain volume term (whole-mesh quadrature); the
                     # RegionMask zeroes the integrand outside the region (resolved in the assembly kernel).
+                    # ``_dd_overlap`` skips this: a region-local matrix can't couple in an overlapping-Schwarz
+                    # step (its artificial boundary reaches no neighbour cells), so the overlap driver rebuilds
+                    # the FEM WHOLE-MESH while keeping the ``volume@{region}`` label below (still detectable).
                     bare = RegionMask(region) * bare
                 volume_terms.append(bare)
                 classification.append("volume" if region == "volume" else f"volume@{region}")
