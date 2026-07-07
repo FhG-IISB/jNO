@@ -5,6 +5,8 @@ that ``jno.domain`` consumes, per-shape graded sizing, and -- the assertion that
 the shared adjacent-element normal fix -- correct outward normals on a concave arc.
 """
 
+import math
+
 import numpy as np
 import pytest
 
@@ -162,3 +164,41 @@ def test_sphere_concave_dimple_outward_normals():
     toward_center /= np.linalg.norm(toward_center, axis=1, keepdims=True) + 1e-30
     # material is the box outside the sphere -> outward points toward the carved sphere centre
     assert np.min(np.sum(n * toward_center, axis=1)) > 0.0
+
+
+# ------------------------------------------------------------------------ revolve
+_Y = ((0, 0, 0), (0, 1, 0))  # y-axis through the origin
+
+
+def test_half_donut_tube_and_caps():
+    """A disk revolved 180deg about the y-axis: tube 'arc' + two flat end caps 'back'/'front'."""
+    mesh, dim, _ds = Shape.disk(2.0, 0.0, 0.6, size=0.25).revolve(*_Y, angle=math.pi).build()
+    assert dim == 3
+    s = _sets(mesh)
+    assert {"arc", "back", "front"} <= set(s)
+    assert s["arc"] + s["back"] + s["front"] == s["boundary"]
+    assert s["back"] > 0 and s["front"] > 0
+
+
+def test_full_torus_meshes_via_split_fallback():
+    """A full (2pi) detached solid of revolution meshes (two-halves fallback) with no caps."""
+    mesh, dim, _ds = Shape.disk(2.0, 0.0, 0.6).revolve(*_Y, angle=2 * math.pi).build()
+    assert dim == 3
+    s = _sets(mesh)
+    assert s["arc"] == s["boundary"]  # closed tube, no end caps
+    assert "back" not in s and "front" not in s
+
+
+def test_cone_from_revolved_triangle():
+    """A triangle touching the axis revolved 2pi -> a cone (single-sweep, no split needed)."""
+    mesh, dim, _ds = Shape.polygon([(0, 0), (1, 0), (0, 2)]).revolve(*_Y, angle=2 * math.pi).build()
+    assert dim == 3
+    s = _sets(mesh)
+    assert s.get("e0", 0) > 0 and s.get("e1", 0) > 0  # base + slant
+
+
+def test_revolve_requires_2d_and_supported_axis():
+    with pytest.raises(ValueError):
+        Shape.box(0, 0, 0, 1, 1, 1).revolve(*_Y, angle=math.pi)
+    with pytest.raises(NotImplementedError):  # z-axis not supported
+        Shape.disk(2, 0, 0.5).revolve((0, 0, 0), (0, 0, 1), math.pi).build()

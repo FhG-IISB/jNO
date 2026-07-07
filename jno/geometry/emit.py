@@ -14,6 +14,7 @@ model it added.
 from __future__ import annotations
 
 import itertools
+import math
 from typing import Dict, List, Optional, Tuple
 
 from .naming import classify_boundary
@@ -26,31 +27,50 @@ _TET = 4
 _LINE = 1
 
 
-def _emit_node(node, occ):
-    """Recursively build the OCC entities for a plan node; return a list of dimtags."""
+def _emit_node(node, occ, split_full=False):
+    """Recursively build the OCC entities for a plan node; return a list of dimtags.
+
+    ``split_full`` builds a full (2pi) revolve as two fused half-sweeps -- used only as a retry
+    when the single-sweep periodic surface cannot be meshed (see :func:`build`).
+    """
     kind = node[0]
     if kind == "leaf":
         return [node[1].build(occ)]
-    if kind == "cut":
-        a = _emit_node(node[1]._node, occ)
-        b = _emit_node(node[2]._node, occ)
-        out, _ = occ.cut(a, b)
-        return out
-    if kind == "fuse":
-        a = _emit_node(node[1]._node, occ)
-        b = _emit_node(node[2]._node, occ)
-        out, _ = occ.fuse(a, b)
-        return out
-    if kind == "inter":
-        a = _emit_node(node[1]._node, occ)
-        b = _emit_node(node[2]._node, occ)
-        out, _ = occ.intersect(a, b)
+    if kind in ("cut", "fuse", "inter"):
+        a = _emit_node(node[1]._node, occ, split_full)
+        b = _emit_node(node[2]._node, occ, split_full)
+        op = {"cut": occ.cut, "fuse": occ.fuse, "inter": occ.intersect}[kind]
+        out, _ = op(a, b)
         return out
     if kind == "extrude":
-        base = _emit_node(node[1]._node, occ)
+        base = _emit_node(node[1]._node, occ, split_full)
         ext = occ.extrude(base, 0.0, 0.0, node[2])
         return [dt for dt in ext if dt[0] == 3]
+    if kind == "revolve":
+        base = _emit_node(node[1]._node, occ, split_full)
+        ap, ad, ang = node[2], node[3], node[4]
+        if split_full and abs(ang - 2.0 * math.pi) < 1e-9:
+            # A detached full solid of revolution makes a periodic surface gmsh cannot mesh;
+            # build it as two half-sweeps fused (each non-periodic, shared seam removed).
+            other = occ.copy(base)
+            h1 = [dt for dt in occ.revolve(base, *ap, *ad, math.pi) if dt[0] == 3]
+            h2 = [dt for dt in occ.revolve(other, *ap, *ad, -math.pi) if dt[0] == 3]
+            out, _ = occ.fuse(h1, h2)
+            return out
+        rev = occ.revolve(base, *ap, *ad, ang)
+        return [dt for dt in rev if dt[0] == 3]
     raise ValueError(f"unknown node kind {kind!r}")
+
+
+def _has_full_revolve(node) -> bool:
+    kind = node[0]
+    if kind == "revolve":
+        return abs(node[4] - 2.0 * math.pi) < 1e-9 or _has_full_revolve(node[1]._node)
+    if kind in ("cut", "fuse", "inter"):
+        return _has_full_revolve(node[1]._node) or _has_full_revolve(node[2]._node)
+    if kind == "extrude":
+        return _has_full_revolve(node[1]._node)
+    return False
 
 
 def _apply_size_fields(dim: int, leaves, labels: Dict[int, Tuple[int, str]]) -> Optional[float]:
@@ -134,8 +154,7 @@ def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]]):
     return meshio.Mesh(points=coords, cells=cells, cell_sets=cell_sets)
 
 
-def build(shape):
-    """Mesh ``shape`` -> ``(meshio.Mesh, dim, ds)``."""
+def _build_once(shape, split_full):
     import gmsh
 
     started = not gmsh.isInitialized()
@@ -145,12 +164,18 @@ def build(shape):
     gmsh.model.add(f"jno_shape_{next(_MODEL_SEQ)}")
     try:
         occ = gmsh.model.occ
-        _emit_node(shape._node, occ)
+        _emit_node(shape._node, occ, split_full)
         occ.synchronize()
         dim = shape.dim
-        dz = shape._node[2] if shape._node[0] == "extrude" else None
+        top = shape._node
+        if top[0] == "extrude":
+            transform = ("extrude", top[2])
+        elif top[0] == "revolve":
+            transform = ("revolve", top[2], top[3], top[4])
+        else:
+            transform = None
         leaves = shape.leaves()
-        labels = classify_boundary(dim, leaves, dz)
+        labels = classify_boundary(dim, leaves, transform)
         ds = _apply_size_fields(dim, leaves, labels)
         gmsh.model.mesh.generate(dim)
         mesh = _to_meshio(dim, labels)
@@ -159,3 +184,18 @@ def build(shape):
         gmsh.model.remove()
         if started:
             gmsh.finalize()
+
+
+def build(shape):
+    """Mesh ``shape`` -> ``(meshio.Mesh, dim, ds)``.
+
+    A single-sweep full (2pi) revolve of a *detached* profile makes a periodic surface gmsh
+    cannot mesh, while an axis-touching profile (a cone) meshes fine that way -- so we try the
+    single sweep first and only fall back to the two-halves construction if meshing fails.
+    """
+    try:
+        return _build_once(shape, split_full=False)
+    except Exception as exc:  # noqa: BLE001 - narrow retry on the periodic-surface mesher failure
+        if "periodic" in str(exc).lower() and _has_full_revolve(shape._node):
+            return _build_once(shape, split_full=True)
+        raise

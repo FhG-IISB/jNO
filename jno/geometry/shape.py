@@ -16,6 +16,7 @@ primitive a boundary came from), combining with ``|``.
 from __future__ import annotations
 
 import itertools
+import math
 from dataclasses import dataclass, field
 from typing import Callable, FrozenSet, Tuple, Union
 
@@ -100,6 +101,31 @@ class Shape:
             raise ValueError("extrude requires a 2-D shape")
         return Shape(("extrude", self, float(height)), 3, self._size)
 
+    def revolve(self, axis_point, axis_dir, angle: float = 2.0 * math.pi) -> "Shape":
+        """Sweep a 2-D shape around an axis by ``angle`` radians into a 3-D solid.
+
+        ``angle == 2*pi`` gives a full solid of revolution; a partial angle gives a wedge
+        or half-donut (revolve a disk offset from the axis by ``pi``). The profile lies in
+        the z=0 plane on the positive-radius side; the axis must be the x- or y-axis through
+        the origin (the common axisymmetric case) -- other axes raise at build time. Swept
+        faces inherit the profile edge's auto-name (``arc``, ``e0``, ...); a partial sweep
+        adds ``back``/``front`` end caps.
+        """
+        if self.dim != 2:
+            raise ValueError("revolve requires a 2-D shape")
+        ap = tuple(float(c) for c in axis_point)
+        ad = tuple(float(c) for c in axis_dir)
+        # Validate the axis up front: an unsupported axis (e.g. z, perpendicular to the profile)
+        # is a degenerate zero-volume sweep that hangs OCC rather than erroring cleanly.
+        at_origin = all(abs(c) < 1e-9 for c in ap)
+        x_on, y_on, z_on = (abs(ad[0]) > 1e-9, abs(ad[1]) > 1e-9, abs(ad[2]) > 1e-9)
+        if not (at_origin and not z_on and (x_on != y_on)):
+            raise NotImplementedError(
+                "revolve currently supports the x- or y-axis through the origin (axisymmetric); "
+                f"got axis_point={ap}, axis_dir={ad}."
+            )
+        return Shape(("revolve", self, ap, ad, float(angle)), 3, self._size)
+
     def sized(self, size: Size) -> "Shape":
         """Return a copy of this shape with its target mesh size set (scalar or ``f(x,y,z)``)."""
         return Shape(self._node, self.dim, size)
@@ -114,7 +140,7 @@ class Shape:
             return ((prim, self._size, key),)
         if kind in ("cut", "fuse", "inter"):
             return node[1].leaves() + node[2].leaves()
-        if kind == "extrude":
+        if kind in ("extrude", "revolve"):
             return node[1].leaves()
         raise ValueError(f"unknown node kind {kind!r}")
 

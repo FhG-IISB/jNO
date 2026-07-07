@@ -15,7 +15,8 @@ primitives.
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Tuple
+import math
+from typing import Dict, Tuple
 
 # Reserved provenance keys for extrusion caps (belong to no primitive leaf).
 _CAP_BACK = -1
@@ -36,38 +37,102 @@ def _sample_point(bdim: int, tag: int):
     return np.asarray(gmsh.model.getValue(2, tag, [u, v]), dtype=float)
 
 
-def _classify_point(p, leaves, dim: int, extrude_dz: Optional[float], tol: float = 1e-6):
-    x, y, z = float(p[0]), float(p[1]), float(p[2])
-    if dim == 3 and extrude_dz is not None:
-        if abs(z) < tol:
-            return (_CAP_BACK, "back")
-        if abs(z - extrude_dz) < tol:
-            return (_CAP_FRONT, "front")
-        # Lateral face: inherit the base curve's name via the 2-D predicate at (x, y).
-        for prim, _size, key in leaves:
-            name = prim.classify(x, y, 0.0)
-            if name is not None:
-                return (key, name)
-        return None
+def _first_leaf(leaves, px: float, py: float, pz: float):
     for prim, _size, key in leaves:
-        name = prim.classify(x, y, z)
+        name = prim.classify(px, py, pz)
         if name is not None:
             return (key, name)
     return None
 
 
-def classify_boundary(dim: int, leaves, extrude_dz: Optional[float]) -> Dict[int, Tuple[int, str]]:
+def _is_y_axis(axis_point, axis_dir):
+    ax, ay, az = axis_dir
+    return all(abs(c) < 1e-9 for c in axis_point) and abs(ay) > 1e-9 and abs(ax) < 1e-9 and abs(az) < 1e-9
+
+
+def _revolve_profile_coords(p, axis_point, axis_dir):
+    """Map a swept 3-D point to its ``(profile_x, profile_y)`` meridian coords.
+
+    The 2-D profile lives in the z=0 plane on the positive-radius side; a revolved point keeps
+    its meridian coords, so classifying against the profile primitives reuses their 2-D
+    predicates. Only the x- or y-axis through the origin is supported (raises otherwise).
+    """
+    X, Y, Z = float(p[0]), float(p[1]), float(p[2])
+    ax, ay, az = axis_dir
+    at_origin = all(abs(c) < 1e-9 for c in axis_point)
+    if _is_y_axis(axis_point, axis_dir):
+        return math.hypot(X, Z), Y  # profile x=radius, y=height
+    if at_origin and abs(ax) > 1e-9 and abs(ay) < 1e-9 and abs(az) < 1e-9:  # x-axis
+        return X, math.hypot(Y, Z)  # profile x=along-axis, y=radius
+    raise NotImplementedError(
+        f"revolve currently supports the x- or y-axis through the origin; got axis_point={axis_point}, axis_dir={axis_dir}."
+    )
+
+
+def _rotate_about_axis(X, Y, Z, y_axis, s):
+    c, sn = math.cos(s), math.sin(s)
+    if y_axis:  # rotate about +y
+        return X * c + Z * sn, Y, -X * sn + Z * c
+    return X, Y * c - Z * sn, Y * sn + Z * c  # rotate about +x
+
+
+def _on_profile_plane(p, axis_point, axis_dir, tol):
+    """True if ``p`` lies on the original profile: the z=0 plane on the positive-radius side."""
+    X, Y, Z = float(p[0]), float(p[1]), float(p[2])
+    if abs(Z) >= tol:
+        return False
+    return (X > 0.0) if _is_y_axis(axis_point, axis_dir) else (Y > 0.0)
+
+
+def _on_end_cap(p, axis_point, axis_dir, angle, tol):
+    """True if ``p`` lies on the swept-end cap: rotating it back by the sweep lands on the profile.
+
+    Wrap-free (no ``atan2``): the start cap is the profile plane; the end cap is that plane
+    rotated by the sweep angle, so un-rotating by +/-angle returns it to the profile. This
+    distinguishes the two caps even when they share the z=0 plane (a half-turn).
+    """
+    y_axis = _is_y_axis(axis_point, axis_dir)
+    for s in (angle, -angle):
+        if _on_profile_plane(_rotate_about_axis(p[0], p[1], p[2], y_axis, s), axis_point, axis_dir, tol):
+            return True
+    return False
+
+
+def _classify_point(p, leaves, dim: int, transform, tol: float = 1e-6):
+    x, y, z = float(p[0]), float(p[1]), float(p[2])
+    if transform is not None and transform[0] == "extrude":
+        dz = transform[1]
+        if abs(z) < tol:
+            return (_CAP_BACK, "back")
+        if abs(z - dz) < tol:
+            return (_CAP_FRONT, "front")
+        return _first_leaf(leaves, x, y, 0.0)  # lateral face inherits its base curve's name
+    if transform is not None and transform[0] == "revolve":
+        _kind, ap, ad, angle = transform
+        if abs(angle - 2.0 * math.pi) > tol:  # partial sweep -> flat end caps
+            if _on_profile_plane(p, ap, ad, tol):  # start cap: the original profile
+                return (_CAP_BACK, "back")
+            if _on_end_cap(p, ap, ad, angle, tol):  # end cap: profile rotated by the sweep
+                return (_CAP_FRONT, "front")
+        px, py = _revolve_profile_coords(p, ap, ad)
+        return _first_leaf(leaves, px, py, 0.0)  # swept face inherits its profile edge's name
+    return _first_leaf(leaves, x, y, z)
+
+
+def classify_boundary(dim: int, leaves, transform) -> Dict[int, Tuple[int, str]]:
     """``{entity_tag: (leaf_key, local_name)}`` for every classified boundary entity.
 
     Requires the OCC model to be synchronized. ``dim`` is the model dimension; boundary
-    entities are queried at ``dim - 1``.
+    entities are queried at ``dim - 1``. ``transform`` describes the dimension transition that
+    produced a 3-D solid from a 2-D plan (``("extrude", dz)`` / ``("revolve", pt, dir, angle)``)
+    or is ``None`` for a plain 2-D plan or a native 3-D primitive.
     """
     import gmsh
 
     bdim = dim - 1
     out: Dict[int, Tuple[int, str]] = {}
     for _edim, tag in gmsh.model.getEntities(bdim):
-        label = _classify_point(_sample_point(bdim, tag), leaves, dim, extrude_dz)
+        label = _classify_point(_sample_point(bdim, tag), leaves, dim, transform)
         if label is not None:
             out[tag] = label
     return out
