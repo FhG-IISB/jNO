@@ -13,13 +13,13 @@ couples the subdomain solves — no ``on=`` argument, no hand-written interface 
 The mode is detected from the regions' intersection (area > 0 → overlap, else line). See
 ``plans/heterogeneous-domain-decomposition.md``.
 
-The **overlap** coupling runs in JAX (the subdomain solves and the Schwarz exchange), so the combined
-field is a JAX array; when a subdomain carries a trainable ``jno.np.parameter`` the coupled solve is a
-differentiable trace node whose gradient reaches the parameter through ``jax.lax.custom_root`` (implicit
-differentiation of the converged fixed point — no unrolled sweeps), giving differentiable **inverse**
-domain decomposition. The geometry/partition bookkeeping (region masks, interface lines, edge lengths)
-stays host-side ``numpy`` — it runs once and is never differentiated. The **line** Dirichlet-Neumann
-mode is still a host-side forward solve.
+**Both** couplings run in JAX (the subdomain solves and the interface exchange), so the combined field
+is a JAX array; when a subdomain carries a trainable ``jno.np.parameter`` the coupled solve is a
+differentiable trace node whose gradient reaches the parameter through ``jax.lax.custom_root`` — implicit
+differentiation of the converged fixed point (the Schwarz iterate for overlap, the Dirichlet-Neumann
+iterate for a line), never unrolling the sweeps — giving differentiable **inverse** domain decomposition.
+The geometry/partition bookkeeping (region masks, interface lines, edge lengths) stays host-side
+``numpy`` — it runs once and is never differentiated.
 """
 
 from __future__ import annotations
@@ -289,6 +289,195 @@ def _schwarz_forward_eager(solve0, solve1, mask0, c0, c1, overlap, n, *, tol, ma
     return U, it, jump
 
 
+# ---------------------------------------------------------------------------
+# differentiable line Dirichlet-Neumann (JAX)
+#
+# The subdomains meet at a single interface line Γ (no overlap). The FEM side is the **Neumann** side
+# (Γ is a free DOF that carries the interface flux load); the other side is the **Dirichlet** side (Γ
+# pinned to the interface values). One sweep Φ(U): the Dirichlet side solves with Γ pinned to U|Γ, its
+# interface flux is recovered (FEM reaction ``(A u - b)|Γ`` / FDM ``(∇u·n)·ℓ``), the Neumann side solves
+# with that flux, and the two are combined. The coupled solution is the fixed point ``U = Φ(U)``.
+# Differentiable via ``jax.lax.custom_root``: the forward relaxes only the interface component (matching
+# the numpy driver's convergence), and the tangent solve of ``(I - Φ')`` is a matrix-free BiCGStab —
+# so a trainable parameter (e.g. a FEM coefficient) reaches the loss through the converged fixed point.
+# The FDM interface flux is *two-sided* (its gradient stencil at Γ reaches into the Neumann region), so
+# the fixed-point variable is the full field, not only Γ.
+# ---------------------------------------------------------------------------
+
+
+def _fem_theta(prob, param_values):
+    """Map a FEM subdomain's resolved parameter values to the ``{name: value}`` dict ``evaluate`` wants."""
+    names, _ = _fem_param_specs(prob)
+    return {nm: v for nm, v in zip(names, param_values)}
+
+
+def _fem_ab(prob, theta):
+    """Dense ``A(θ), b(θ)`` of a FEM subdomain — re-assembled (``FemLinearSystem.evaluate``) when
+    parametric, else the fixed assembled system. The dense operator is what the small DD line solves use."""
+    import jax.numpy as jnp
+
+    from .trace import FemLinearSystem
+
+    op = prob._op
+    A, b = op.evaluate(theta or None) if isinstance(op, FemLinearSystem) else op
+    A = jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)
+    return A, jnp.asarray(b).reshape(-1)
+
+
+def _fdm_extra_params(prob, param_values):
+    """Build the ``{layer_id: module}`` value injection ``_steady_solve(extra_params=...)`` wants from an
+    FDM subdomain's resolved parameter values (the same mechanism ``fdm.solve()`` uses for an inverse)."""
+    import equinox as eqx
+    import jax.numpy as jnp
+
+    lids, _, modules = _fdm_param_specs(prob)
+    return {
+        lid: eqx.tree_at(lambda m: m.value, modules[lid], jnp.asarray(v).astype(modules[lid].value.dtype))
+        for lid, v in zip(lids, param_values)
+    }
+
+
+def _line_geometry(probs, geoms):
+    """Host-side line-DN geometry (runs once, never differentiated): the interface nodes ``gamma``, the
+    Neumann/Dirichlet sides (``ni``/``di`` — FEM is Neumann), each region's node set, the empty
+    (non-region) rows, the interface nodal edge-lengths ``ell`` and unit normal ``nrm``."""
+    dom = probs[0].domain
+    dim = int(getattr(dom, "dimension", 2))
+    pts = np.asarray(dom.mesh_connectivity["points"])[:, :dim]
+    tris = np.asarray(dom.mesh_connectivity["triangles"]).astype(int)
+    n = pts.shape[0]
+    region_nodes, gamma = _element_partition(pts, tris, geoms[0])
+    fem_flags = [_is_fem(p) for p in probs]
+    if not any(fem_flags):
+        raise NotImplementedError(
+            "jno.core line coupling needs at least one jno.fem subdomain (the Neumann side that consumes "
+            "the interface flux). Two jno.fdm subdomains sharing a line would need an FDM Neumann flux "
+            "condition (not in v1) — give them an overlap for value-exchange instead."
+        )
+    ni = fem_flags.index(True)  # Neumann side = a FEM subdomain
+    di = 1 - ni  # Dirichlet side = the other subdomain
+    mask_N = np.zeros(n, bool)
+    mask_N[region_nodes[ni]] = True
+    return {
+        "dom": dom,
+        "n": n,
+        "gamma": gamma,
+        "Nint": np.setdiff1d(region_nodes[ni], gamma),  # Neumann interior (fed to the Dirichlet solve)
+        "nonN": np.setdiff1d(np.arange(n), region_nodes[ni]),  # empty rows of the region-local Neumann matrix
+        "nonD": np.setdiff1d(np.arange(n), region_nodes[di]),
+        "ell": _interface_edge_lengths(pts, tris, gamma),
+        "nrm": _interface_normal(pts, gamma, geoms[ni]),  # Dirichlet outward normal = into the Neumann region
+        "mask_N": mask_N,  # nodes owned by the Neumann side (incl. gamma)
+        "ni": ni,
+        "di": di,
+    }
+
+
+def _line_dn_map(fem_prob, other_prob, geo, fem_vals, other_vals):
+    """Build the differentiable one-sweep map ``Φ(U) -> new combined field`` for given resolved parameters
+    (``fem_vals`` for the Neumann FEM, ``other_vals`` for the Dirichlet side)."""
+    import jax.numpy as jnp
+
+    from .fdm import gradient as _grad
+
+    gam, nonn = jnp.asarray(geo["gamma"]), jnp.asarray(geo["nonN"])
+    nint, maskN = jnp.asarray(geo["Nint"]), jnp.asarray(geo["mask_N"])
+    ellg, nrmj = jnp.asarray(geo["ell"][geo["gamma"]]), jnp.asarray(geo["nrm"])
+    dom = geo["dom"]
+
+    # Neumann (FEM) side: A(θ) region-local, empty rows pinned to identity, gamma a FREE DOF whose row
+    # takes the interface flux load. Assembled ONCE per build (θ is fixed within a solve).
+    AN, bN = _fem_ab(fem_prob, _fem_theta(fem_prob, fem_vals))
+    AN_pin = AN.at[nonn].set(0.0).at[nonn, nonn].set(1.0, unique_indices=True)
+    bN_pin = bN.at[nonn].set(0.0, unique_indices=True)
+
+    def neumann_solve(flux):
+        return jnp.linalg.solve(AN_pin, bN_pin.at[gam].add(-flux))  # Neumann load = -(flux out of Dirichlet)
+
+    if _is_fem(other_prob):  # Dirichlet side is FEM → exact consistent reaction flux (same basis)
+        nonDj = jnp.asarray(geo["nonD"])
+        pinD = jnp.asarray(np.union1d(geo["nonD"], geo["gamma"]).astype(int))
+        AD, bD = _fem_ab(other_prob, _fem_theta(other_prob, other_vals))
+        AD_pin = AD.at[pinD].set(0.0).at[pinD, pinD].set(1.0, unique_indices=True)
+
+        def dirichlet_solve(lam, U):
+            return jnp.linalg.solve(AD_pin, bD.at[nonDj].set(0.0).at[gam].set(lam))
+
+        def dirichlet_flux(uD):
+            return (AD @ uD - bD)[gam]
+    else:  # Dirichlet side is FDM → pointwise strong-form flux, consistent nodal load via edge-length
+        extra = _fdm_extra_params(other_prob, other_vals)
+
+        def dirichlet_solve(lam, U):
+            pins = jnp.concatenate([gam, nint])  # pin gamma to lambda + the Neumann interior to its field
+            vals = jnp.concatenate([jnp.asarray(lam), U[nint]])
+            return jnp.asarray(other_prob._steady_solve(extra_params=extra or None, extra_pins=(pins, vals))).reshape(-1)
+
+        def dirichlet_flux(uD):
+            return (_grad(uD, dom)[gam] @ nrmj) * ellg
+
+    def phi(U):
+        uD = dirichlet_solve(U[gam], U)
+        uN = neumann_solve(dirichlet_flux(uD))
+        return jnp.where(maskN, uN, uD)  # gamma ∈ Nnodes → the Neumann interface value
+
+    return phi
+
+
+def _line_dn_custom_root(phi, geo, *, tol, max_iter, theta):
+    """Converge ``U = Φ(U)`` and return it, **differentiable** via ``jax.lax.custom_root``. Forward:
+    relax only the interface component (the numpy driver's iteration). Residual: ``f0(U) = U - Φ(U)``."""
+    import jax
+    import jax.numpy as jnp
+
+    from .utils.solver.newton_krylov import bicgstab
+
+    gam, n = jnp.asarray(geo["gamma"]), geo["n"]
+    f0 = lambda U: U - phi(U)
+
+    def forward(_f, U0):
+        def cond(s):
+            _U, r, k = s
+            return (r > tol) & (k < max_iter)
+
+        def body(s):
+            U, _r, k = s
+            p = phi(U)
+            un = p.at[gam].set((1.0 - theta) * U[gam] + theta * p[gam])  # relax the interface only
+            return un, jnp.max(jnp.abs(un - U)), k + 1
+
+        U, _r, _k = jax.lax.while_loop(cond, body, (U0, jnp.asarray(jnp.inf), 0))
+        return U
+
+    bicg = lambda mv, rr: bicgstab(mv, rr, tol=1e-11, maxit=10000)
+    tangent = lambda g, y: jax.lax.custom_linear_solve(g, y, bicg, transpose_solve=bicg)
+    return jax.lax.custom_root(f0, jnp.zeros(n), forward, tangent)
+
+
+def _line_dn_forward_eager(phi, geo, *, tol, max_iter, theta):
+    """Host-controlled DN relaxation for the plain (no trainable parameter) forward solve — JAX sweep
+    (jit'd once), Python convergence check. Returns ``(U, iters, interface_step)``."""
+    import jax
+    import jax.numpy as jnp
+
+    gam, n = jnp.asarray(geo["gamma"]), geo["n"]
+
+    @jax.jit
+    def sweep(U):
+        p = phi(U)
+        un = p.at[gam].set((1.0 - theta) * U[gam] + theta * p[gam])
+        return un, jnp.max(jnp.abs(un - U))
+
+    U = jnp.zeros(n)
+    step, it = float("inf"), 0
+    for it in range(1, max_iter + 1):
+        U, s = sweep(U)
+        step = float(s)
+        if step < tol:
+            break
+    return U, it, step
+
+
 class _Coupled:
     """A coupled domain-decomposition problem: subdomains + their regions, solved by the inferred method."""
 
@@ -316,106 +505,39 @@ class _Coupled:
 
     # -- non-overlapping: a single interface line, Dirichlet-Neumann -------------------------------
     def _solve_line(self, probs, geoms, *, tol, max_iter, theta=0.5, return_info=False):
-        import scipy.linalg as sla
+        geo = _line_geometry(probs, geoms)  # host-side partition/interface bookkeeping (runs once)
+        fem, other = probs[geo["ni"]], probs[geo["di"]]  # FEM = Neumann side, the other = Dirichlet side
 
-        # Line Dirichlet-Neumann is a host-side forward solve (no custom_root node). Fail LOUD on a
-        # trainable parameter rather than silently returning a numpy array with the parameter baked in
-        # at its initial value (which would never train through jno.core). Overlap → differentiable.
-        if any(_subdomain_param_nodes(p) for p in probs):
-            raise NotImplementedError(
-                "jno.dd line (Dirichlet-Neumann) coupling is forward-only: a trainable jno.np.parameter "
-                "in a non-overlapping subdomain is not differentiable yet — the coupled solve returns a "
-                "plain array, so the parameter would silently never train. Give the subdomains an OVERLAP "
-                "(the parametric coupled solve is then a differentiable node), or keep trainable "
-                "parameters out of a line-coupled problem."
-            )
-        dom = probs[0].domain
-        dim = int(getattr(dom, "dimension", 2))
-        pts = np.asarray(dom.mesh_connectivity["points"])[:, :dim]
-        tris = np.asarray(dom.mesh_connectivity["triangles"]).astype(int)
-        n = pts.shape[0]
-        region_nodes, gamma = _element_partition(pts, tris, geoms[0])
+        # Trainable parameters across the subdomains. If any, the coupled solve is a differentiable node
+        # (∂u/∂θ through the DN fixed point via custom_root); the values arrive in this order at solve time.
+        counts = [len(_subdomain_param_nodes(p)) for p in probs]
+        param_nodes = [nd for p in probs for nd in _subdomain_param_nodes(p)]
+        offs = np.cumsum([0] + counts)
 
-        fem_flags = [_is_fem(p) for p in probs]
-        if not any(fem_flags):
-            raise NotImplementedError(
-                "jno.core line coupling needs at least one jno.fem subdomain (the Neumann side that "
-                "consumes the interface flux). Two jno.fdm subdomains sharing a line would need an FDM "
-                "Neumann flux condition (not in v1) — give them an overlap for value-exchange instead."
-            )
-        ni = fem_flags.index(True)  # Neumann side = a FEM subdomain
-        di = 1 - ni  # Dirichlet side = the other subdomain
-        fem, other = probs[ni], probs[di]
-        Nnodes, Dnodes = region_nodes[ni], region_nodes[di]
-        Nint = np.setdiff1d(Nnodes, gamma)  # Neumann-region interior (fed to the Dirichlet solve)
-        nonN = np.setdiff1d(np.arange(n), Nnodes)  # empty rows of the region-local FEM matrix
-        ell = _interface_edge_lengths(pts, tris, gamma)
-        nrm = _interface_normal(pts, gamma, geoms[ni])  # Dirichlet outward normal = into Neumann region
+        def _split(values):
+            sub = [list(values[offs[i] : offs[i + 1]]) for i in range(2)]
+            return sub[geo["ni"]], sub[geo["di"]]  # (Neumann FEM values, Dirichlet-side values)
 
-        # Neumann (FEM) solver: pin the empty non-region rows; Gamma is a FREE DOF carrying the flux load.
-        AN = np.asarray(fem.A).copy()
-        bN = np.asarray(fem.b).reshape(-1)
-        AN[nonN, :] = 0.0
-        AN[nonN, nonN] = 1.0
-        luN = sla.lu_factor(AN)
+        if param_nodes:
+            from .trace import FunctionCall
 
-        # Dirichlet-side solver (pin Gamma to lambda + the Neumann interior to its current field), built once.
-        if _is_fem(other):
-            AD = np.asarray(other.A).copy()
-            bD = np.asarray(other.b).reshape(-1)
-            nonD = np.setdiff1d(np.arange(n), Dnodes)
-            pinD = np.union1d(nonD, gamma).astype(int)
-            AD2 = AD.copy()
-            AD2[pinD, :] = 0.0
-            AD2[pinD, pinD] = 1.0
-            luD = sla.lu_factor(AD2)
+            def _run(*values):
+                fem_vals, other_vals = _split(list(values))
+                phi = _line_dn_map(fem, other, geo, fem_vals, other_vals)
+                return _line_dn_custom_root(phi, geo, tol=tol, max_iter=max_iter, theta=theta)
 
-            def dirichlet_solve(lam, uN):
-                rhs = bD.copy()
-                rhs[nonD] = 0.0
-                rhs[gamma] = lam
-                return sla.lu_solve(luD, rhs)
+            node = FunctionCall(_run, param_nodes, name="dd_line_solve")
+            node._domain = geo["dom"]  # so jno.core infers the domain from the graph
+            return node
 
-            def dirichlet_flux(uD):  # exact consistent reaction (same basis) -> nodal flux out of D
-                return (AD @ uD - bD)[gamma]
-        else:
-            from .fdm import gradient as _grad
-
-            dsolve = other.pinned_solver(np.concatenate([gamma, Nint]).astype(int))
-
-            def dirichlet_solve(lam, uN):
-                return np.asarray(dsolve(np.concatenate([np.asarray(lam), uN[Nint]]))).reshape(-1)
-
-            def dirichlet_flux(uD):  # pointwise strong-form flux -> consistent nodal load via edge-length
-                g = np.asarray(_grad(uD, dom))
-                return (g[gamma] @ nrm) * ell[gamma]
-
-        lam = np.zeros(len(gamma))
-        uN = np.zeros(n)
-        uD = np.zeros(n)
-        step = np.inf
-        it = 0
-        for it in range(1, max_iter + 1):
-            uD = dirichlet_solve(lam, uN)
-            flux = dirichlet_flux(uD)
-            rhs = bN.copy()
-            rhs[nonN] = 0.0
-            rhs[gamma] = rhs[gamma] - flux  # Neumann load = -(flux out of the Dirichlet region)
-            uN = sla.lu_solve(luN, rhs)
-            new = (1 - theta) * lam + theta * uN[gamma]
-            step = float(np.max(np.abs(new - lam))) if len(gamma) else 0.0
-            lam = new
-            if step < tol:
-                break
-
-        own_N = np.isin(np.arange(n), Nnodes) & ~np.isin(np.arange(n), gamma)
-        combined = np.where(own_N, uN, uD)
-        combined[gamma] = lam
+        # Plain forward (no trainable parameter): host-controlled DN relaxation over the JAX sweep.
+        phi = _line_dn_map(fem, other, geo, [], [])
+        combined, it, step = _line_dn_forward_eager(phi, geo, tol=tol, max_iter=max_iter, theta=theta)
         if return_info:
             return combined, {
                 "iterations": it,
                 "interface_step": step,
-                "gamma_nodes": int(len(gamma)),
+                "gamma_nodes": int(len(geo["gamma"])),
                 "mode": "line-DN",
                 "interfaces": self._interfaces,
             }

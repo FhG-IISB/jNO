@@ -649,32 +649,114 @@ def test_overlap_coupled_solve_differentiable_in_fem_coefficient():
     assert abs(g - fd) / (abs(fd) + 1e-12) < 1e-2, f"custom_root gradient must match FD: autodiff={g:.6e}, fd={fd:.6e}"
 
 
-def test_line_coupling_rejects_trainable_parameter():
-    """Line (Dirichlet-Neumann) coupling is a forward-only host solve: a trainable ``jno.np.parameter``
-    must FAIL LOUD, not silently return an array with the parameter frozen at its initial value (which
-    would never train through ``jno.core`` — no gradient path). The differentiable route is an overlap
-    (``test_overlap_coupled_solve_differentiable_in_fem_coefficient``)."""
+@pytest.mark.slow
+def test_line_dn_coupled_solve_differentiable_in_fem_coefficient():
+    """Differentiable **line** Dirichlet-Neumann coupling: with a trainable conductivity ``kc`` in the
+    FEM (Neumann-side) weak form, ``couple([femL, fdmR]).solve()`` on a non-overlapping partition returns
+    a differentiable node, and ``∂(coupled field)/∂kc`` — which flows through the converged DN fixed point
+    via ``jax.lax.custom_root`` (no unrolled sweeps) — matches finite differences. The coefficient is
+    re-assembled into the Neumann matrix ``A(θ)`` each solve; the FDM side supplies the interface flux.
+    This makes an inverse problem trainable on the *sharp-interface* (non-overlapping) coupling too."""
+    import jax
+
     from jno.dd import couple
+    from jno.trace import FunctionCall
 
     regL, regR = box(0.0, 0.0, 0.5, 1.0), box(0.5, 0.0, 1.0, 1.0)  # partition, meet at x=0.5 (no overlap → line)
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0))
     d.region("L", regL)
     d.region("R", regR)
-    d.build_mesh(mesh_size=0.1)
+    d.build_mesh(mesh_size=0.09)
+    p = np.asarray(d.mesh_connectivity["points"])[:, :2]
+    on = jnp.asarray(np.abs(p[:, 0] - 0.5) < 1e-6)  # interface line nodes (matching mesh → x=0.5 exact)
+    n_on = float(np.asarray(on).sum())
+    assert n_on > 0
+
+    xL, yL, _ = d.variable("L", split=True)
+    xR, yR, _ = d.variable("R", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    fsrc = 20.0
+
+    kc = jno.np.parameter((1,), name="kc")  # trainable coefficient in the FEM (Neumann) subdomain
+    uf, vf = d.fem_symbols()
+    uif, vif = uf.bind(x=xL, y=yL), vf.bind(x=xL, y=yL)
+    femL = jno.fem([kc * (uif.x * vif.x + uif.y * vif.y) - fsrc * vif, uf(xb, yb) - 0.0])
+    u = d.unknown()
+    uiR = u.bind(x=xR, y=yR)
+    fdmR = jno.fdm([-uiR.d2(xR) - uiR.d2(yR) - fsrc, u(xb, yb) - 0.0])
+
+    node = couple([(femL, regL), (fdmR, regR)]).solve(tol=1e-9, max_iter=600)
+    assert isinstance(node, FunctionCall), "a trainable coefficient must make the line coupled solve a node"
+    assert getattr(node, "_domain", None) is d
+
+    def functional(kc_val):  # mean coupled field on the interface line — a smooth functional of kc
+        U = node.fn(kc_val)
+        return jnp.sum(jnp.where(on, U, 0.0)) / n_on
+
+    g = float(jax.grad(lambda t: functional(t))(jnp.array([1.2]))[0])
+    eps = 1e-4
+    fd = (float(functional(jnp.array([1.2 + eps]))) - float(functional(jnp.array([1.2 - eps])))) / (2 * eps)
+    assert abs(g) > 1e-3, f"the FEM coefficient must influence the coupled field (got |g|={abs(g):.2e})"
+    assert abs(g - fd) / (abs(fd) + 1e-12) < 1e-2, f"custom_root DN gradient must match FD: autodiff={g:.6e}, fd={fd:.6e}"
+
+
+def test_line_dn_fem_fem_reaction_flux_forward_and_gradient():
+    """FEM(Neumann) + FEM(Dirichlet) line coupling — exercises the **reaction-flux** Dirichlet branch
+    (``(A u - b)|Γ``, distinct from the FDM ``∇u·n`` branch every other line test uses), for both the
+    plain forward and the differentiable node. FEM+FEM Dirichlet-Neumann is well-conditioned (converges in
+    a handful of sweeps), so this is the fast line test that also guards the gradient path.
+
+    (a) forward at k=1 reproduces the MMS ``sin(πx)sin(πy)``; (b) a trainable coefficient makes the coupled
+    solve a differentiable node whose ``∂/∂k`` (through the DN fixed point, ``custom_root``) matches FD."""
+    import jax
+
+    import jno.jnp_ops as jnn
+    from jno.dd import couple
+    from jno.trace import FunctionCall
+
+    regL, regR = box(0.0, 0.0, 0.5, 1.0), box(0.5, 0.0, 1.0, 1.0)  # partition, meet at x=0.5 (line)
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0))
+    d.region("L", regL)
+    d.region("R", regR)
+    d.build_mesh(mesh_size=0.08)
+    p = np.asarray(d.mesh_connectivity["points"])[:, :2]
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1])
+    on = jnp.asarray(np.abs(p[:, 0] - 0.5) < 1e-6)
+    n_on = float(np.asarray(on).sum())
+
     xL, yL, _ = d.variable("L", split=True)
     xR, yR, _ = d.variable("R", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
 
-    kL = jno.np.parameter((1,), name="kL")  # a trainable coefficient in the FEM (line) subdomain
-    uf, vf = d.fem_symbols()
-    uif, vif = uf.bind(x=xL, y=yL), vf.bind(x=xL, y=yL)
-    femL = jno.fem([kL * (uif.x * vif.x + uif.y * vif.y) - vif, uf(xb, yb) - 0.0])
-    u = d.unknown()
-    uiR = u.bind(x=xR, y=yR)
-    fdmR = jno.fdm([-uiR.d2(xR) - uiR.d2(yR) - 1.0, u(xb, yb) - 0.0])
+    def f(x, y):
+        return 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
 
-    with pytest.raises(NotImplementedError, match="forward-only"):
-        couple([(femL, regL), (fdmR, regR)]).solve()
+    uf, vf = d.fem_symbols()
+    uifR, vifR = uf.bind(x=xR, y=yR), vf.bind(x=xR, y=yR)
+    femR = jno.fem([uifR.x * vifR.x + uifR.y * vifR.y - f(xR, yR) * vifR, uf(xb, yb) - 0.0])  # Dirichlet side
+
+    # (a) forward: fixed k=1 (eager path, reaction-flux Dirichlet) reproduces the MMS field
+    uifL, vifL = uf.bind(x=xL, y=yL), vf.bind(x=xL, y=yL)
+    femL1 = jno.fem([uifL.x * vifL.x + uifL.y * vifL.y - f(xL, yL) * vifL, uf(xb, yb) - 0.0])  # Neumann side
+    sol, info = couple([(femL1, regL), (femR, regR)]).solve(return_info=True)
+    assert info["mode"] == "line-DN"
+    rel = float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact))
+    assert rel < 5e-2, f"FEM+FEM line (reaction flux) must match the MMS field, got rel-L2={rel:.2e}"
+
+    # (b) gradient: a trainable coefficient in the Neumann FEM → differentiable node, FD-matched
+    kc = jno.np.parameter((1,), name="kc")
+    femLk = jno.fem([kc * (uifL.x * vifL.x + uifL.y * vifL.y) - f(xL, yL) * vifL, uf(xb, yb) - 0.0])
+    node = couple([(femLk, regL), (femR, regR)]).solve(tol=1e-9, max_iter=200)
+    assert isinstance(node, FunctionCall)
+
+    def functional(kc_val):
+        return jnp.sum(jnp.where(on, node.fn(kc_val), 0.0)) / n_on
+
+    g = float(jax.grad(lambda t: functional(t))(jnp.array([1.1]))[0])
+    eps = 1e-4
+    fd = (float(functional(jnp.array([1.1 + eps]))) - float(functional(jnp.array([1.1 - eps])))) / (2 * eps)
+    assert abs(g) > 1e-3, f"the FEM coefficient must influence the coupled field (got |g|={abs(g):.2e})"
+    assert abs(g - fd) / (abs(fd) + 1e-12) < 1e-2, f"FEM+FEM DN gradient must match FD: autodiff={g:.6e}, fd={fd:.6e}"
 
 
 @pytest.mark.slow
