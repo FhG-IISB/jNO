@@ -1661,9 +1661,12 @@ class domain(MeshIOMixin):
         if n_dropped:
             self.log.info(f"Dropped {n_dropped} orphan mesh node(s) (geometry-construction points, no element)")
         return meshio.Mesh(
-            pts[keep], cells,
-            cell_sets=sub(mesh.cell_sets), cell_data=sub(mesh.cell_data),
-            field_data=mesh.field_data, point_data=point_data,
+            pts[keep],
+            cells,
+            cell_sets=sub(mesh.cell_sets),
+            cell_data=sub(mesh.cell_data),
+            field_data=mesh.field_data,
+            point_data=point_data,
         )
 
     def _apply_mesh(self, mesh) -> None:
