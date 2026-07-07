@@ -12,6 +12,14 @@ couples the subdomain solves — no ``on=`` argument, no hand-written interface 
 
 The mode is detected from the regions' intersection (area > 0 → overlap, else line). See
 ``plans/heterogeneous-domain-decomposition.md``.
+
+The **overlap** coupling runs in JAX (the subdomain solves and the Schwarz exchange), so the combined
+field is a JAX array; when a subdomain carries a trainable ``jno.np.parameter`` the coupled solve is a
+differentiable trace node whose gradient reaches the parameter through ``jax.lax.custom_root`` (implicit
+differentiation of the converged fixed point — no unrolled sweeps), giving differentiable **inverse**
+domain decomposition. The geometry/partition bookkeeping (region masks, interface lines, edge lengths)
+stays host-side ``numpy`` — it runs once and is never differentiated. The **line** Dirichlet-Neumann
+mode is still a host-side forward solve.
 """
 
 from __future__ import annotations
@@ -125,6 +133,162 @@ def _classify_interfaces(interface_conditions):
     return {"count": len(conds), "flux": flux, "value": len(conds) - flux}
 
 
+# ---------------------------------------------------------------------------
+# differentiable overlapping Schwarz (JAX)
+#
+# The forward coupling runs in JAX (subdomain solves + array ops), so the combined field is a JAX
+# array. When a subdomain carries a trainable ``jno.np.parameter`` (an inverse parameter — e.g. a
+# conductivity ``k`` in a FEM weak form) the coupled solve is returned as a differentiable trace node
+# and the gradient reaches the parameter through ``jax.lax.custom_root``: the implicit function theorem
+# differentiates the *converged* Schwarz fixed point without unrolling the sweeps (the truncated-sweep
+# gradient would be wrong for Schwarz's slow convergence). This mirrors ``fem.solve()`` / ``fdm.solve()``
+# — an array for a plain forward solve, a node for a parametric one — so ``jno.core([(couple([...]).
+# solve() - u_obs).mse])`` recovers a parameter *through* the coupling (differentiable inverse DD).
+# ---------------------------------------------------------------------------
+
+
+def _fem_param_specs(prob):
+    """``(names, nodes)`` of a FEM subdomain's runtime (trainable) parameters — empty for a
+    non-parametric FEM. The names key ``FemLinearSystem.evaluate`` (re-assembling ``A(θ), b(θ)`` in the
+    autodiff graph); the nodes are the trace ``Placeholder``s that become the coupled node's args."""
+    from .trace import FemLinearSystem
+
+    op = prob._op
+    if isinstance(op, FemLinearSystem) and op.is_parametric:
+        names = list(op.runtime_parameter_exprs)
+        return names, [op.runtime_parameter_exprs[nm] for nm in names]
+    return [], []
+
+
+def _fdm_param_specs(prob):
+    """``(lids, nodes, modules)`` of an FDM subdomain's trainable parameters — empty for a
+    non-parametric FDM. ``lids``/``modules`` feed ``_steady_solve(extra_params=...)`` (the same value
+    injection ``fdm.solve()`` uses for an inverse parameter)."""
+    trainable = prob._trainable_params() if hasattr(prob, "_trainable_params") else {}
+    lids = list(trainable)
+    return lids, [trainable[lid] for lid in lids], {lid: trainable[lid].model.module for lid in lids}
+
+
+def _subdomain_param_nodes(prob):
+    """The trace nodes of a subdomain's trainable parameters (FEM or FDM) — the coupled node's args."""
+    return (_fem_param_specs(prob) if _is_fem(prob) else _fdm_param_specs(prob))[1]
+
+
+def _make_pinned_solver(prob, pin_idx, param_values):
+    """A differentiable ``values -> full nodal field`` pinned solve for one subdomain, closing over that
+    subdomain's resolved parameter values ``param_values`` (the crux-current arrays, in the order of
+    :func:`_subdomain_param_nodes`).
+
+    * **FEM**: re-assemble ``A(θ), b(θ)`` (``FemLinearSystem.evaluate`` — the same re-assembly
+      ``fem.solve()`` differentiates through), row-pin the interface nodes and solve the dense system
+      (``jnp.linalg.solve``; the DD meshes are small and the pinned stiffness is dense-direct's job — a
+      matrix-free Krylov breaks down on it). Differentiable in ``θ`` and the pinned ``values``.
+    * **FDM**: ``_steady_solve(extra_params=θ, extra_pins=(pin, values))`` — the same Newton-Krylov +
+      ``custom_root`` solve ``jno.fdm`` uses, differentiable in ``θ`` and ``values``."""
+    import jax.numpy as jnp
+
+    from .trace import FemLinearSystem
+
+    pin = jnp.asarray(pin_idx)
+
+    if _is_fem(prob):
+        op = prob._op
+        names, _ = _fem_param_specs(prob)
+        theta = {nm: v for nm, v in zip(names, param_values)}
+
+        def solve(values):
+            if isinstance(op, FemLinearSystem):
+                A, b = op.evaluate(theta or None)
+            else:
+                A, b = op  # non-parametric (A_bcoo, b)
+            A = jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A)
+            b = jnp.asarray(b).reshape(-1)
+            A = A.at[pin].set(0.0).at[pin, pin].set(1.0)  # row-replacement: pinned rows -> identity
+            rhs = b.at[pin].set(jnp.asarray(values))
+            return jnp.linalg.solve(A, rhs)
+
+        return solve
+
+    # FDM
+    import equinox as eqx
+
+    lids, _, modules = _fdm_param_specs(prob)
+    extra = {
+        lid: eqx.tree_at(lambda m: m.value, modules[lid], jnp.asarray(v).astype(modules[lid].value.dtype))
+        for lid, v in zip(lids, param_values)
+    }
+
+    def solve(values):
+        return jnp.asarray(prob._steady_solve(extra_params=extra or None, extra_pins=(pin, jnp.asarray(values)))).reshape(
+            -1
+        )
+
+    return solve
+
+
+def _schwarz_multiplicative(solve0, solve1, mask0, c0, c1, U):
+    """One multiplicative Schwarz sweep of the combined field ``U``: subdomain 0 solves with its
+    complement ``c0`` pinned to ``U``, subdomain 1 then solves with its complement ``c1`` pinned to the
+    *fresh* subdomain-0 field; combine on ``mask0`` (owned by 0, incl. the overlap). Returns ``(u0, u1,
+    U_new)``."""
+    import jax.numpy as jnp
+
+    u0 = solve0(U[c0])
+    u1 = solve1(u0[c1])
+    return u0, u1, jnp.where(mask0, u0, u1)
+
+
+def _schwarz_custom_root(solve0, solve1, mask0, c0, c1, n, *, tol, max_iter):
+    """Converge the overlapping-Schwarz combined field and return it, **differentiable** via
+    ``jax.lax.custom_root``. Forward: multiplicative sweeps (fast). Residual for the implicit diff: the
+    additive map ``f0(U) = U - where(mask0, solve0(U[c0]), solve1(U[c1]))`` — it shares the same fixed
+    point (so ``f0(U*) = 0``) and its Jacobian ``(I - G')`` is well-conditioned (Schwarz is a
+    contraction), so the tangent solve is a matrix-free BiCGStab."""
+    import jax
+    import jax.numpy as jnp
+
+    from .utils.solver.newton_krylov import bicgstab
+
+    mask0, c0, c1 = jnp.asarray(mask0), jnp.asarray(c0), jnp.asarray(c1)
+
+    def f0(U):
+        return U - jnp.where(mask0, solve0(U[c0]), solve1(U[c1]))
+
+    def forward(_f, U0):
+        def cond(s):
+            _U, r, k = s
+            return (r > tol) & (k < max_iter)
+
+        def body(s):
+            U, _r, k = s
+            _u0, _u1, Un = _schwarz_multiplicative(solve0, solve1, mask0, c0, c1, U)
+            return Un, jnp.max(jnp.abs(Un - U)), k + 1
+
+        U, _r, _k = jax.lax.while_loop(cond, body, (U0, jnp.asarray(jnp.inf), 0))
+        return U
+
+    bicg = lambda mv, rr: bicgstab(mv, rr, tol=1e-11, maxit=10000)
+    tangent = lambda g, y: jax.lax.custom_linear_solve(g, y, bicg, transpose_solve=bicg)
+    return jax.lax.custom_root(f0, jnp.zeros(n), forward, tangent)
+
+
+def _schwarz_forward_eager(solve0, solve1, mask0, c0, c1, overlap, n, *, tol, max_iter):
+    """Host-controlled multiplicative Schwarz for the plain (no trainable parameter) forward solve —
+    the JAX counterpart of the old numpy loop: JAX subdomain solves + array ops, a Python convergence
+    check (the iteration control is not differentiated). Returns ``(U, iters, overlap_jump)``."""
+    import jax.numpy as jnp
+
+    mask0j, c0j, c1j, ovj = jnp.asarray(mask0), jnp.asarray(c0), jnp.asarray(c1), jnp.asarray(overlap)
+    U = jnp.zeros(n)
+    jump, it = float("inf"), 0
+    for it in range(1, max_iter + 1):
+        u0, u1, U = _schwarz_multiplicative(solve0, solve1, mask0j, c0j, c1j, U)
+        jump = float(jnp.max(jnp.abs(u0[ovj] - u1[ovj]))) if overlap.any() else 0.0
+        if jump < tol:
+            break
+    return U, it, jump
+
+
 class _Coupled:
     """A coupled domain-decomposition problem: subdomains + their regions, solved by the inferred method."""
 
@@ -154,6 +318,17 @@ class _Coupled:
     def _solve_line(self, probs, geoms, *, tol, max_iter, theta=0.5, return_info=False):
         import scipy.linalg as sla
 
+        # Line Dirichlet-Neumann is a host-side forward solve (no custom_root node). Fail LOUD on a
+        # trainable parameter rather than silently returning a numpy array with the parameter baked in
+        # at its initial value (which would never train through jno.core). Overlap → differentiable.
+        if any(_subdomain_param_nodes(p) for p in probs):
+            raise NotImplementedError(
+                "jno.dd line (Dirichlet-Neumann) coupling is forward-only: a trainable jno.np.parameter "
+                "in a non-overlapping subdomain is not differentiable yet — the coupled solve returns a "
+                "plain array, so the parameter would silently never train. Give the subdomains an OVERLAP "
+                "(the parametric coupled solve is then a differentiable node), or keep trainable "
+                "parameters out of a line-coupled problem."
+            )
         dom = probs[0].domain
         dim = int(getattr(dom, "dimension", 2))
         pts = np.asarray(dom.mesh_connectivity["points"])[:, :dim]
@@ -250,8 +425,8 @@ class _Coupled:
     def _solve_overlap(self, probs, geoms, *, tol, max_iter, return_info=False):
         # A region-tagged FEM (needed so `jno.core` can detect it) assembles region-local (RegionMask),
         # which can't reconcile an overlap band — its artificial boundary reaches no neighbour cells. Rebuild
-        # any such subdomain WHOLE-MESH (one cheap re-assemble + factorization, reused across all iterations)
-        # so complement-pinning closes the overlap; the region label is preserved for the masks.
+        # any such subdomain WHOLE-MESH (one cheap re-assemble, reused across all iterations) so
+        # complement-pinning closes the overlap; the region label is preserved for the masks.
         probs = [p._as_whole_mesh() if (_is_fem(p) and getattr(p, "region", None) is not None) else p for p in probs]
         dom = probs[0].domain
         dim = int(getattr(dom, "dimension", 2))
@@ -260,20 +435,43 @@ class _Coupled:
         masks = [_region_mask(pts, g) for g in geoms]
         complements = [np.where(~m)[0].astype(int) for m in masks]
         overlap = masks[0] & masks[1]
-        sols = [np.zeros(n), np.zeros(n)]
-        solvers = [probs[i].pinned_solver(complements[i]) for i in range(2)]
+        mask0 = masks[0]  # owned by subdomain 0 (includes the overlap)
 
-        jump = np.inf
-        iters = 0
-        for iters in range(1, max_iter + 1):
-            for i in range(2):
-                neighbour = sols[1 - i]
-                sols[i] = np.asarray(solvers[i](neighbour[complements[i]])).reshape(-1)
-            jump = float(np.max(np.abs(sols[0][overlap] - sols[1][overlap]))) if overlap.any() else 0.0
-            if jump < tol:
-                break
+        # Trainable parameters across the subdomains (a FEM coefficient / an FDM parameter). If any, the
+        # coupled solve is a differentiable node (below); the values arrive in this order at solve time.
+        counts = [len(_subdomain_param_nodes(p)) for p in probs]
+        param_nodes = [nd for p in probs for nd in _subdomain_param_nodes(p)]
 
-        combined = np.where(masks[0], sols[0], sols[1])
+        def _solvers(values):
+            """Build the two differentiable pinned solvers, handing each subdomain its own parameters."""
+            solvers, off = [], 0
+            for i, p in enumerate(probs):
+                solvers.append(_make_pinned_solver(p, complements[i], values[off : off + counts[i]]))
+                off += counts[i]
+            return solvers
+
+        if param_nodes:
+            # Parametric: return a differentiable trace node (∂u/∂θ flows through custom_root, so
+            # `jno.core([(couple([...]).solve() - u_obs).mse])` recovers θ *through* the coupling).
+            from .trace import FunctionCall
+
+            def _run(*values):
+                s0, s1 = _solvers(list(values))
+                return _schwarz_custom_root(s0, s1, mask0, complements[0], complements[1], n, tol=tol, max_iter=max_iter)
+
+            node = FunctionCall(_run, param_nodes, name="dd_solve")
+            node._domain = dom  # so jno.core infers the domain from the graph
+            return node
+
+        # Plain forward (no trainable parameter): host-controlled Schwarz over the JAX subdomain solves.
+        # jit each solver so it compiles ONCE and is reused across sweeps (safe here — no parameter
+        # tracers are closed over; the parametric branch above must NOT jit, or the θ-gradient is lost).
+        import jax
+
+        s0, s1 = (jax.jit(s) for s in _solvers([]))
+        combined, iters, jump = _schwarz_forward_eager(
+            s0, s1, mask0, complements[0], complements[1], overlap, n, tol=tol, max_iter=max_iter
+        )
         if return_info:
             return combined, {
                 "iterations": iters,
@@ -292,6 +490,19 @@ def couple(subdomains, interface_conditions=None):
     ``region`` is the shapely geometry it owns. ``interface_conditions``: optional residuals declaring the
     coupling in jNO syntax (value ``uA(iface)-uB(iface)`` / flux ``k*uA.d(n)-...`` on an ``interface_*``
     tag). The interface is inferred from the regions: a single line (partitioning tags) is coupled by
-    Dirichlet-Neumann, an overlap by Schwarz. ``.solve()`` returns the combined nodal field. The
-    user-facing surface is ``jno.core([...])``, which builds this automatically."""
+    Dirichlet-Neumann, an overlap by Schwarz.
+
+    ``.solve()`` returns the combined nodal field as a JAX array — **or**, when a subdomain carries a
+    trainable ``jno.np.parameter`` and the regions overlap, a differentiable trace node (exactly as
+    ``fem.solve()`` / ``fdm.solve()`` do). The gradient reaches the parameter through the converged
+    Schwarz fixed point (``jax.lax.custom_root``), so a differentiable **inverse** domain-decomposition
+    problem is just::
+
+        kL   = jno.np.parameter((1,), name="kL")        # coefficient to recover
+        femA = jno.fem([kL * (ui.x*vi.x + ui.y*vi.y) - f*vi, ...])
+        node = jno.dd.couple([(femA, boxA), (fdmB, boxB)]).solve()
+        jno.core([(node - u_obs).mse]).solve(epochs)    # recovers kL THROUGH the coupling
+
+    The user-facing surface for the plain forward coupling is ``jno.core([...])``, which builds this
+    automatically."""
     return _Coupled(subdomains, interface_conditions)

@@ -596,6 +596,88 @@ def test_material_interface_via_overlap_and_kx():
 
 
 @pytest.mark.slow
+def test_overlap_coupled_solve_differentiable_in_fem_coefficient():
+    """The differentiable-DD payoff, and the discriminator for a *correct* implicit-diff (not merely a
+    forward that runs): with a **trainable conductivity ``kL``** in the FEM subdomain's weak form,
+    ``couple([...]).solve()`` returns a differentiable trace node (like ``fem.solve()``), and
+    ``∂(coupled field)/∂kL`` — which flows through the *converged* Schwarz fixed point via
+    ``jax.lax.custom_root`` (no unrolled sweeps) — matches finite differences. A parameter in the FEM
+    **coefficient** (re-assembled into ``A(θ)`` each solve) is the case a source-only gradient would
+    silently miss, so it is the one asserted here. This is what makes an inverse domain-decomposition
+    problem (recover a coefficient *through* the coupling) trainable via ``crux``.
+
+    Homogeneous Dirichlet + a constant source, so the interface field scales with ``1/k`` (genuinely
+    ``kL``-dependent); FEM (region A, ``k(x)`` carries ``kL`` on the left) overlaps FDM (region B)."""
+    import jax
+
+    import jno.jnp_ops as jnn
+    from jno.dd import couple
+    from jno.trace import FunctionCall
+
+    kR, fsrc = 3.0, 10.0
+    boxA, boxB = box(0.0, 0.0, 0.6, 1.0), box(0.5, 0.0, 1.0, 1.0)  # overlap x∈[0.5,0.6]
+    d = jno.domain(boxA.union(boxB), mesh_size=0.08)
+    p = np.asarray(d.mesh_connectivity["points"])[:, :2]
+    in_a, in_b = _region_mask(p, boxA), _region_mask(p, boxB)
+    overlap = jnp.asarray(in_a & in_b)
+    ov_count = float((in_a & in_b).sum())
+
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+
+    kL = jno.np.parameter((1,), name="kL")  # trainable coefficient (the inverse parameter)
+    kx = jnn.where(xi < 0.5, kL, kR)  # jump carried by k(x); kL lives in the bilinear form → A(θ)
+    uf, vf = d.fem_symbols()
+    uif, vif = uf.bind(x=xi, y=yi), vf.bind(x=xi, y=yi)
+    femA = jno.fem([kx * (uif.x * vif.x + uif.y * vif.y) - fsrc * vif, uf(xb, yb) - 0.0])
+    u = d.unknown()
+    uiB = u.bind(x=xi, y=yi)
+    fdmB = jno.fdm([-kR * (uiB.d2(xi) + uiB.d2(yi)) - fsrc, u(xb, yb) - 0.0])
+
+    node = couple([(femA, boxA), (fdmB, boxB)]).solve(tol=1e-9, max_iter=300)
+    assert isinstance(node, FunctionCall), "a trainable coefficient must make the coupled solve a differentiable node"
+    assert getattr(node, "_domain", None) is d, "the coupled node must carry its domain for jno.core"
+
+    def functional(kL_val):  # mean coupled field over the overlap band — a smooth functional of the field
+        U = node.fn(kL_val)  # the differentiable coupled solve at this coefficient value
+        return jnp.sum(jnp.where(overlap, U, 0.0)) / ov_count
+
+    g = float(jax.grad(lambda t: functional(t))(jnp.array([1.5]))[0])
+    eps = 1e-4
+    fd = (float(functional(jnp.array([1.5 + eps]))) - float(functional(jnp.array([1.5 - eps])))) / (2 * eps)
+    assert abs(g) > 1e-3, f"the FEM coefficient must actually influence the coupled field (got |g|={abs(g):.2e})"
+    assert abs(g - fd) / (abs(fd) + 1e-12) < 1e-2, f"custom_root gradient must match FD: autodiff={g:.6e}, fd={fd:.6e}"
+
+
+def test_line_coupling_rejects_trainable_parameter():
+    """Line (Dirichlet-Neumann) coupling is a forward-only host solve: a trainable ``jno.np.parameter``
+    must FAIL LOUD, not silently return an array with the parameter frozen at its initial value (which
+    would never train through ``jno.core`` — no gradient path). The differentiable route is an overlap
+    (``test_overlap_coupled_solve_differentiable_in_fem_coefficient``)."""
+    from jno.dd import couple
+
+    regL, regR = box(0.0, 0.0, 0.5, 1.0), box(0.5, 0.0, 1.0, 1.0)  # partition, meet at x=0.5 (no overlap → line)
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0))
+    d.region("L", regL)
+    d.region("R", regR)
+    d.build_mesh(mesh_size=0.1)
+    xL, yL, _ = d.variable("L", split=True)
+    xR, yR, _ = d.variable("R", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+
+    kL = jno.np.parameter((1,), name="kL")  # a trainable coefficient in the FEM (line) subdomain
+    uf, vf = d.fem_symbols()
+    uif, vif = uf.bind(x=xL, y=yL), vf.bind(x=xL, y=yL)
+    femL = jno.fem([kL * (uif.x * vif.x + uif.y * vif.y) - vif, uf(xb, yb) - 0.0])
+    u = d.unknown()
+    uiR = u.bind(x=xR, y=yR)
+    fdmR = jno.fdm([-uiR.d2(xR) - uiR.d2(yR) - 1.0, u(xb, yb) - 0.0])
+
+    with pytest.raises(NotImplementedError, match="forward-only"):
+        couple([(femL, regL), (fdmR, regR)]).solve()
+
+
+@pytest.mark.slow
 def test_overlap_through_jno_core_rebuilds_region_local_fem():
     """Overlap coupling of a REGION-TAGGED FEM straight through ``jno.core([...])``. A region-tagged FEM
     (needed so ``jno.core`` can detect it as a subdomain) assembles region-local (``RegionMask``), which
