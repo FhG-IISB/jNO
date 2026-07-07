@@ -116,3 +116,49 @@ def test_domain_regions_and_outward_arc_normals():
     to_center /= np.linalg.norm(to_center, axis=1, keepdims=True) + 1e-30
     # outward (toward centre of the carved disk) for every arc node -- no inward flips
     assert np.min(np.sum(n * to_center, axis=1)) > 0.0
+
+
+# --------------------------------------------------------------- more primitives
+def _sets(mesh):
+    return {k: sum(len(a) for a in v) for k, v in mesh.cell_sets.items() if sum(len(a) for a in v)}
+
+
+def test_polygon_edges_auto_named():
+    """An L-shaped polygon meshes with one auto-named region per segment (e0..e5)."""
+    mesh, dim, _ds = Shape.polygon([(0, 0), (2, 0), (2, 1), (1, 1), (1, 2), (0, 2)]).build()
+    assert dim == 2
+    s = _sets(mesh)
+    edges = [f"e{i}" for i in range(6)]
+    assert all(e in s for e in edges)
+    assert sum(s[e] for e in edges) == s["boundary"]
+
+
+def test_cylinder_arbitrary_axis_faces():
+    """A cylinder on the x-axis names lateral 'side' and the two caps 'bottom'/'top'."""
+    mesh, dim, _ds = Shape.cylinder(0, 0, 0, 5, 0, 0, 1.0).build()
+    assert dim == 3 and mesh.cells[0].type == "tetra"
+    s = _sets(mesh)
+    assert {"side", "top", "bottom"} <= set(s)
+    assert s["side"] + s["top"] + s["bottom"] == s["boundary"]
+
+
+def test_box_minus_cylinder_drilled_hole():
+    """A through-hole keeps the six box faces and adds the cylinder wall 'side'."""
+    mesh, dim, _ds = (Shape.box(0, 0, 0, 4, 4, 1) - Shape.cylinder(2, 2, -0.5, 0, 0, 2, 0.5)).build()
+    s = _sets(mesh)
+    assert {"left", "right", "front", "back", "top", "bottom", "side"} <= set(s)
+    assert s["side"] > 0  # the drilled wall
+
+
+def test_sphere_concave_dimple_outward_normals():
+    """box - sphere (a spherical dimple): every 'surface' normal points out of the material."""
+    import jno
+
+    c = np.array([1.0, 1.0, 2.0])
+    d = jno.domain(Shape.box(0, 0, 0, 2, 2, 2) - Shape.sphere(c[0], c[1], c[2], 0.7, size=0.15))
+    n = np.asarray(d.normals_by_tag["surface"])
+    pts = d.points[d.tag_indices["surface"]]
+    toward_center = c - pts
+    toward_center /= np.linalg.norm(toward_center, axis=1, keepdims=True) + 1e-30
+    # material is the box outside the sphere -> outward points toward the carved sphere centre
+    assert np.min(np.sum(n * toward_center, axis=1)) > 0.0

@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import ClassVar, Optional
+from typing import ClassVar, Optional, Tuple
 
 # How close a boundary point must be to an analytic curve/surface to lie "on" it.
 TOL = 1e-6
@@ -103,4 +103,90 @@ class Box:
             return "bottom"
         if abs(z - self.z1) < tol:
             return "top"
+        return None
+
+
+@dataclass(frozen=True)
+class Polygon:
+    """Arbitrary 2-D polygon from ordered vertices; edges auto-named ``e0, e1, ...``."""
+
+    points: Tuple[Tuple[float, float], ...]
+    dim: ClassVar[int] = 2
+
+    def build(self, occ):
+        tags = [occ.addPoint(px, py, 0.0) for px, py in self.points]
+        n = len(tags)
+        lines = [occ.addLine(tags[i], tags[(i + 1) % n]) for i in range(n)]
+        loop = occ.addCurveLoop(lines)
+        return (2, occ.addPlaneSurface([loop]))
+
+    def classify(self, x: float, y: float, z: float = 0.0, tol: float = TOL) -> Optional[str]:
+        pts = self.points
+        n = len(pts)
+        for i in range(n):
+            ax, ay = pts[i]
+            bx, by = pts[(i + 1) % n]
+            vx, vy = bx - ax, by - ay
+            wx, wy = x - ax, y - ay
+            seglen = math.hypot(vx, vy)
+            if seglen < tol:
+                continue
+            # perpendicular distance to the edge line, then parameter along it
+            if abs(vx * wy - vy * wx) / seglen < tol:
+                t = (wx * vx + wy * vy) / (seglen * seglen)
+                if -tol <= t <= 1.0 + tol:
+                    return f"e{i}"
+        return None
+
+
+@dataclass(frozen=True)
+class Cylinder:
+    """Right circular cylinder: base centre ``(x,y,z)``, axis vector ``(dx,dy,dz)``, radius ``r``.
+
+    Faces: lateral ``side``, and the two flat caps ``bottom`` (base) / ``top`` (axis end).
+    """
+
+    x: float
+    y: float
+    z: float
+    dx: float
+    dy: float
+    dz: float
+    r: float
+    dim: ClassVar[int] = 3
+
+    def build(self, occ):
+        return (3, occ.addCylinder(self.x, self.y, self.z, self.dx, self.dy, self.dz, self.r))
+
+    def classify(self, x: float, y: float, z: float, tol: float = TOL) -> Optional[str]:
+        alen = math.sqrt(self.dx**2 + self.dy**2 + self.dz**2)
+        ux, uy, uz = self.dx / alen, self.dy / alen, self.dz / alen
+        wx, wy, wz = x - self.x, y - self.y, z - self.z
+        t = wx * ux + wy * uy + wz * uz  # axial coordinate in [0, alen]
+        perp = math.sqrt(max(wx * wx + wy * wy + wz * wz - t * t, 0.0))
+        if abs(t) < tol and perp < self.r + tol:
+            return "bottom"
+        if abs(t - alen) < tol and perp < self.r + tol:
+            return "top"
+        if abs(perp - self.r) < tol:
+            return "side"
+        return None
+
+
+@dataclass(frozen=True)
+class Sphere:
+    """Sphere centred ``(cx,cy,cz)`` radius ``r``; single face ``surface``."""
+
+    cx: float
+    cy: float
+    cz: float
+    r: float
+    dim: ClassVar[int] = 3
+
+    def build(self, occ):
+        return (3, occ.addSphere(self.cx, self.cy, self.cz, self.r))
+
+    def classify(self, x: float, y: float, z: float, tol: float = TOL) -> Optional[str]:
+        if abs(math.sqrt((x - self.cx) ** 2 + (y - self.cy) ** 2 + (z - self.cz) ** 2) - self.r) < tol:
+            return "surface"
         return None

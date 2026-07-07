@@ -19,7 +19,7 @@ import itertools
 from dataclasses import dataclass, field
 from typing import Callable, FrozenSet, Tuple, Union
 
-from .primitives import Box, Disk, Rect
+from .primitives import Box, Cylinder, Disk, Polygon, Rect, Sphere
 
 # Unique, identity-stable key per primitive leaf, for provenance (``edges_from``).
 _LEAF_KEYS = itertools.count()
@@ -65,6 +65,24 @@ class Shape:
     @classmethod
     def box(cls, x0: float, y0: float, z0: float, x1: float, y1: float, z1: float, size: Size = None) -> "Shape":
         return cls(("leaf", Box(x0, y0, z0, x1, y1, z1), next(_LEAF_KEYS)), 3, size)
+
+    @classmethod
+    def polygon(cls, points, size: Size = None) -> "Shape":
+        """Arbitrary 2-D polygon from ordered ``(x, y)`` vertices; edges auto-named ``e0, e1, ...``."""
+        pts = tuple((float(px), float(py)) for px, py in points)
+        return cls(("leaf", Polygon(pts), next(_LEAF_KEYS)), 2, size)
+
+    @classmethod
+    def cylinder(
+        cls, x: float, y: float, z: float, dx: float, dy: float, dz: float, r: float, size: Size = None
+    ) -> "Shape":
+        """Right cylinder: base centre ``(x,y,z)``, axis vector ``(dx,dy,dz)``, radius ``r``."""
+        return cls(("leaf", Cylinder(x, y, z, dx, dy, dz, r), next(_LEAF_KEYS)), 3, size)
+
+    @classmethod
+    def sphere(cls, cx: float, cy: float, cz: float, r: float, size: Size = None) -> "Shape":
+        """Sphere centred ``(cx,cy,cz)`` radius ``r``."""
+        return cls(("leaf", Sphere(cx, cy, cz, r), next(_LEAF_KEYS)), 3, size)
 
     # ----- boolean operators -----------------------------------------------------
     def __sub__(self, other: "Shape") -> "Shape":
