@@ -37,12 +37,19 @@ def _sample_point(bdim: int, tag: int):
     return np.asarray(gmsh.model.getValue(2, tag, [u, v]), dtype=float)
 
 
-def _first_leaf(leaves, px: float, py: float, pz: float):
-    for prim, _size, key in leaves:
-        name = prim.classify(px, py, pz)
-        if name is not None:
-            return (key, name)
-    return None
+def _rotate_point(x, y, z, axis_point, axis_dir, angle):
+    """Rotate a point about the axis through ``axis_point`` with direction ``axis_dir`` by ``angle``."""
+    px, py, pz = axis_point
+    n = math.sqrt(axis_dir[0] ** 2 + axis_dir[1] ** 2 + axis_dir[2] ** 2) or 1.0
+    ux, uy, uz = axis_dir[0] / n, axis_dir[1] / n, axis_dir[2] / n
+    vx, vy, vz = x - px, y - py, z - pz
+    c, s = math.cos(angle), math.sin(angle)
+    dot = ux * vx + uy * vy + uz * vz
+    cx, cy, cz = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx  # u x v
+    rx = vx * c + cx * s + ux * dot * (1.0 - c)  # Rodrigues rotation
+    ry = vy * c + cy * s + uy * dot * (1.0 - c)
+    rz = vz * c + cz * s + uz * dot * (1.0 - c)
+    return rx + px, ry + py, rz + pz
 
 
 def _is_y_axis(axis_point, axis_dir):
@@ -98,41 +105,59 @@ def _on_end_cap(p, axis_point, axis_dir, angle, tol):
     return False
 
 
-def _classify_point(p, leaves, dim: int, transform, tol: float = 1e-6):
-    x, y, z = float(p[0]), float(p[1]), float(p[2])
-    if transform is not None and transform[0] == "extrude":
-        dz = transform[1]
+def _classify(node, x: float, y: float, z: float, tol: float = 1e-6):
+    """Classify a boundary point by walking the build-plan into each node's local frame.
+
+    Each node transforms the point into its child's frame and recurses: undo a translate/rotate,
+    project a lateral extrude point to the base plane (caps short-circuit), take meridian coords
+    through a revolve (caps short-circuit), try both sides of a boolean, and finally a primitive.
+    Returns ``(leaf_key, local_name)`` or ``None``. This composes for arbitrary nesting.
+    """
+    kind = node[0]
+    if kind == "leaf":
+        name = node[1].classify(x, y, z)
+        return (node[2], name) if name is not None else None
+    if kind in ("cut", "fuse", "inter"):
+        return _classify(node[1]._node, x, y, z, tol) or _classify(node[2]._node, x, y, z, tol)
+    if kind == "translate":
+        dx, dy, dz = node[2]
+        return _classify(node[1]._node, x - dx, y - dy, z - dz, tol)
+    if kind == "rotate":
+        lx, ly, lz = _rotate_point(x, y, z, node[2], node[3], -node[4])  # undo the rotation
+        return _classify(node[1]._node, lx, ly, lz, tol)
+    if kind == "extrude":
+        dz = node[2]
         if abs(z) < tol:
             return (_CAP_BACK, "back")
         if abs(z - dz) < tol:
             return (_CAP_FRONT, "front")
-        return _first_leaf(leaves, x, y, 0.0)  # lateral face inherits its base curve's name
-    if transform is not None and transform[0] == "revolve":
-        _kind, ap, ad, angle = transform
+        return _classify(node[1]._node, x, y, 0.0, tol)  # lateral face -> base plane
+    if kind == "revolve":
+        ap, ad, angle = node[2], node[3], node[4]
         if abs(angle - 2.0 * math.pi) > tol:  # partial sweep -> flat end caps
-            if _on_profile_plane(p, ap, ad, tol):  # start cap: the original profile
+            if _on_profile_plane((x, y, z), ap, ad, tol):
                 return (_CAP_BACK, "back")
-            if _on_end_cap(p, ap, ad, angle, tol):  # end cap: profile rotated by the sweep
+            if _on_end_cap((x, y, z), ap, ad, angle, tol):
                 return (_CAP_FRONT, "front")
-        px, py = _revolve_profile_coords(p, ap, ad)
-        return _first_leaf(leaves, px, py, 0.0)  # swept face inherits its profile edge's name
-    return _first_leaf(leaves, x, y, z)
+        px, py = _revolve_profile_coords((x, y, z), ap, ad)
+        return _classify(node[1]._node, px, py, 0.0, tol)  # swept face -> profile meridian
+    return None
 
 
-def classify_boundary(dim: int, leaves, transform) -> Dict[int, Tuple[int, str]]:
+def classify_boundary(dim: int, shape) -> Dict[int, Tuple[int, str]]:
     """``{entity_tag: (leaf_key, local_name)}`` for every classified boundary entity.
 
-    Requires the OCC model to be synchronized. ``dim`` is the model dimension; boundary
-    entities are queried at ``dim - 1``. ``transform`` describes the dimension transition that
-    produced a 3-D solid from a 2-D plan (``("extrude", dz)`` / ``("revolve", pt, dir, angle)``)
-    or is ``None`` for a plain 2-D plan or a native 3-D primitive.
+    Requires the OCC model to be synchronized. Boundary entities are queried at ``dim - 1``;
+    each sample point is classified by walking ``shape``'s build-plan (:func:`_classify`), so
+    names survive booleans, dimension transitions, and rigid transforms at any nesting depth.
     """
     import gmsh
 
     bdim = dim - 1
     out: Dict[int, Tuple[int, str]] = {}
     for _edim, tag in gmsh.model.getEntities(bdim):
-        label = _classify_point(_sample_point(bdim, tag), leaves, dim, transform)
+        p = _sample_point(bdim, tag)
+        label = _classify(shape._node, float(p[0]), float(p[1]), float(p[2]))
         if label is not None:
             out[tag] = label
     return out

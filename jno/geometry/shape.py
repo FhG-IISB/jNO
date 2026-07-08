@@ -126,6 +126,19 @@ class Shape:
             )
         return Shape(("revolve", self, ap, ad, float(angle)), 3, self._size)
 
+    def translate(self, vector) -> "Shape":
+        """Move the shape by ``vector`` (2- or 3-component). Boundary names are preserved."""
+        v = tuple(float(c) for c in vector)
+        if len(v) == 2:
+            v = (v[0], v[1], 0.0)
+        return Shape(("translate", self, v), self.dim, self._size)
+
+    def rotate(self, axis_point, axis_dir, angle: float) -> "Shape":
+        """Rotate ``angle`` radians about the axis through ``axis_point`` along ``axis_dir``."""
+        ap = tuple(float(c) for c in axis_point)
+        ad = tuple(float(c) for c in axis_dir)
+        return Shape(("rotate", self, ap, ad, float(angle)), self.dim, self._size)
+
     def sized(self, size: Size) -> "Shape":
         """Return a copy of this shape with its target mesh size set (scalar or ``f(x,y,z)``)."""
         return Shape(self._node, self.dim, size)
@@ -140,7 +153,7 @@ class Shape:
             return ((prim, self._size, key),)
         if kind in ("cut", "fuse", "inter"):
             return node[1].leaves() + node[2].leaves()
-        if kind in ("extrude", "revolve"):
+        if kind in ("extrude", "revolve", "translate", "rotate"):
             return node[1].leaves()
         raise ValueError(f"unknown node kind {kind!r}")
 

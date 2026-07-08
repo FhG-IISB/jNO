@@ -59,6 +59,14 @@ def _emit_node(node, occ, split_full=False):
             return out
         rev = occ.revolve(base, *ap, *ad, ang)
         return [dt for dt in rev if dt[0] == 3]
+    if kind == "translate":
+        ent = _emit_node(node[1]._node, occ, split_full)
+        occ.translate(ent, *node[2])
+        return ent
+    if kind == "rotate":
+        ent = _emit_node(node[1]._node, occ, split_full)
+        occ.rotate(ent, *node[2], *node[3], node[4])
+        return ent
     raise ValueError(f"unknown node kind {kind!r}")
 
 
@@ -68,7 +76,7 @@ def _has_full_revolve(node) -> bool:
         return abs(node[4] - 2.0 * math.pi) < 1e-9 or _has_full_revolve(node[1]._node)
     if kind in ("cut", "fuse", "inter"):
         return _has_full_revolve(node[1]._node) or _has_full_revolve(node[2]._node)
-    if kind == "extrude":
+    if kind in ("extrude", "translate", "rotate"):
         return _has_full_revolve(node[1]._node)
     return False
 
@@ -167,15 +175,8 @@ def _build_once(shape, split_full):
         _emit_node(shape._node, occ, split_full)
         occ.synchronize()
         dim = shape.dim
-        top = shape._node
-        if top[0] == "extrude":
-            transform = ("extrude", top[2])
-        elif top[0] == "revolve":
-            transform = ("revolve", top[2], top[3], top[4])
-        else:
-            transform = None
         leaves = shape.leaves()
-        labels = classify_boundary(dim, leaves, transform)
+        labels = classify_boundary(dim, shape)
         ds = _apply_size_fields(dim, leaves, labels)
         gmsh.model.mesh.generate(dim)
         mesh = _to_meshio(dim, labels)

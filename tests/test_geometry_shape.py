@@ -237,3 +237,31 @@ def test_path_revolve_makes_sphere():
     pts = d.points[d.tag_indices["dome"]]
     radial = pts / (np.linalg.norm(pts, axis=1, keepdims=True) + 1e-30)  # outward = radial at origin
     assert np.min(np.sum(n * radial, axis=1)) > 0.0  # all dome normals point outward
+
+
+# --------------------------------------------------------- transforms (rotate/translate)
+def test_translate_preserves_names_and_position():
+    """A translated box keeps its six face-names; the +x face moves with it."""
+    mesh, dim, _ds = Shape.box(0, 0, 0, 1, 1, 1).translate((5, 0, 0)).build()
+    s = _sets(mesh)
+    assert {"left", "right", "top", "bottom", "front", "back"} <= set(s)
+    tri, pts = np.asarray(mesh.cells[1].data), mesh.points
+    rx = pts[tri[mesh.cell_sets["right"][1]]].mean(1)[:, 0].mean()
+    assert abs(rx - 6.0) < 1e-6  # the +x face moved from x=1 to x=6
+
+
+def test_rotate_preserves_face_names():
+    """A 90deg-rotated box is no longer axis-aligned -- names survive only via the
+    transform-aware classifier (un-rotating the query point back into the box frame)."""
+    mesh, dim, _ds = Shape.box(0, 0, 0, 2, 1, 1).rotate((0, 0, 0), (0, 0, 1), math.pi / 2).build()
+    s = _sets(mesh)
+    assert {"left", "right", "top", "bottom", "front", "back"} <= set(s)
+
+
+def test_transform_composes_with_boolean_and_normals():
+    """Names + outward normals survive a boolean followed by a translate."""
+    import jno
+
+    d = jno.domain((Shape.box(0, 0, 0, 4, 4, 1) - Shape.cylinder(2, 2, -1, 0, 0, 3, 0.5)).translate((10, 10, 0)))
+    assert {"side", "top", "left"} <= set(d.avaiable_mesh_tags)  # hole wall + faces survive the move
+    assert np.asarray(d.normals_by_tag["top"]).mean(0)[2] > 0.5  # top face still points +z
