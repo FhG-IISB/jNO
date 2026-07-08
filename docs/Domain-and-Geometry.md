@@ -9,7 +9,7 @@ import jno
 from jno import Shape
 
 solid = (Shape.rect(0, 0, 4, 1) - Shape.disk(2, 1, 0.4)).extrude(0.6)   # a strip under a roll
-d = jno.domain(solid)
+d = solid.domain()                                                      # one-liner; == jno.domain(solid)
 
 x, y, z, t = d.variable("interior")                                     # coords (+ a trailing time coord t)
 xb, yb, zb, tb, nx, ny, nz = d.variable("top", normals=True, split=True)  # a named boundary + outward normals
@@ -176,5 +176,7 @@ xb, yb, zb, tb, nx, ny, nz = d.variable("top", normals=True, split=True)   # bou
 `variable` always returns a trailing time coordinate `t` (a constant for steady domains), so a 3-D
 domain unpacks as `(x, y, z, t)`. Time-dependent domains take `time=(t0, t1, n)`; `variable("initial")`
 is the `t=0` slice. Multiply a
-domain by an integer `B` (`B * jno.domain(...)`) to replicate it across `B` operator-learning samples.
-`d.plot("domain.png")` renders the mesh, regions, and normals.
+domain by an integer `B` (`B * jno.domain(...)`, or `B * shape.domain()`) to replicate it across `B`
+operator-learning samples. `shape.domain(**kwargs)` forwards the *domain* arguments (`time=`, `sample=`,
+`name=`, …) — but not a constructor or `mesh_size`, since size lives on the shape — so a full domain is
+one line. `d.plot("domain.png")` renders the mesh, regions, and normals.

@@ -382,3 +382,25 @@ def test_size_scalar_on_composite_caps_globally():
     n0 = base.build()[0].cells[0].data.shape[0]
     mesh1, _dim, ds = capped.build()
     assert ds == 0.15 and mesh1.cells[0].data.shape[0] > 3 * n0
+
+
+# --------------------------------------------------------------- Shape.domain() one-liner
+def test_domain_one_liner():
+    """Shape.domain() builds a jno.domain (forwarding kwargs) as a one-liner + composes with batching."""
+    import jno
+
+    d = Shape.rect(0, 0, 1, 1, size=0.3).domain()
+    assert type(d).__name__ == "domain"
+
+    # a full FEM solve straight off the one-liner
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - 1.0 * vi, u(xb, yb) - 0.0])
+    assert fem.dofs > 0 and np.asarray(fem.solve()).shape == (fem.dofs,)
+
+    # time= forwards to jno.domain (transient -> has an initial slice); batching binds after .domain()
+    dt = Shape.rect(0, 0, 1, 1, size=0.3).domain(time=(0.0, 1.0, 5))
+    assert dt.variable("initial", split=True) is not None
+    assert type(8 * Shape.rect(0, 0, 1, 1, size=0.3).domain()).__name__ == "domain"

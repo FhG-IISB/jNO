@@ -222,3 +222,16 @@ class Shape:
     def __call__(self, geo=None):
         # Callable-constructor compatibility (jno.domain runs constructor()).
         return self.build()
+
+    def domain(self, **kwargs):
+        """Build a ``jno.domain`` from this shape as a one-liner.
+
+        Forwards the *domain* keyword arguments (``time=``, ``sample=``, ``name=``, ...) to
+        ``jno.domain`` -- but **not** a constructor or ``mesh_size``: the mesh size lives on the
+        shape itself (via ``size=`` / :meth:`sized`). So ``Shape.rect(0, 0, 1, 1, size=0.1).domain()``
+        replaces ``jno.domain(Shape.rect(0, 0, 1, 1, size=0.1))``, and batching still composes as
+        ``B * Shape.rect(...).domain()``.
+        """
+        import jno
+
+        return jno.domain(self, **kwargs)
