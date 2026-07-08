@@ -73,3 +73,9 @@ $\propto \sum g(d)\,\psi^+\,\mathrm{area}$, so its *shape* is meaningful rather 
     Francfort, J.-J. Marigo, *The variational approach to fracture*, J. Elasticity **91** (2008) 5–148 —
     alternate minimization. C. Miehe, M. Hofacker, F. Welschinger, CMAME **199** (2010) 2765–2778 — the
     tension/compression (spectral) split.
+
+## Full script
+
+```python
+--8<-- "tutorial_examples/08_fem_and_varpinns/phase_field_fracture_2d.py:code"
+```
