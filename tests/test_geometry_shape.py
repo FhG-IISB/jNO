@@ -340,3 +340,22 @@ def test_array_requires_one_mode():
         Shape.disk(0, 0, 0.2).array(3)  # neither step nor about
     with pytest.raises(ValueError):
         Shape.disk(0, 0, 0.2).array(3, step=(1, 0, 0), about=((0, 0, 0), (0, 0, 1)))  # both
+
+
+# ---------------------------------------------- richer d.tag(f(x, n, name)) predicate
+def test_tag_facet_predicate_normal_name_and_backcompat():
+    """d.tag(name, f(x, n, name)) selects boundary facets by coords + outward normal + current name;
+    the classic f(x, y, z) predicate is unaffected."""
+    import jno
+
+    d = jno.domain(Shape.box(0, 0, 0, 2, 2, 1))
+    d.tag("east", lambda x, n, name: n[:, 0] > 0.9)  # by outward normal -> the +x face
+    assert "east" in d.avaiable_mesh_tags
+    assert np.asarray(d.normals_by_tag["east"]).mean(0)[0] > 0.9  # points +x
+
+    # inclusion + exclusion in one predicate: vertical side walls (not top/bottom/boundary)
+    d.tag("sides", lambda x, n, name: (name != "top") & (name != "bottom") & (name != "boundary"))
+    assert np.abs(np.asarray(d.normals_by_tag["sides"])[:, 2]).mean() < 0.1  # walls point sideways
+
+    d.tag("plain", lambda x, y, z: x < 0.1)  # classic coord predicate still routes the old way
+    assert "plain" in d.avaiable_mesh_tags
