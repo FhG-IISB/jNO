@@ -22,7 +22,7 @@ pi_val = float(jnp.pi)
 f = jno.np.sin(π * x) - x / pi_val
 
 # ── Model ──────────────────────────────────────────────────────────────────────
-net = jno.nn.wrap(
+net = jno.nn(
     foundax.mlp(
         in_features=1,
         hidden_dims=64,

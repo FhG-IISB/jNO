@@ -30,14 +30,13 @@ import matplotlib.animation as animation  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 from scipy.interpolate import griddata  # noqa: E402
-from shapely.geometry import box  # noqa: E402
 
 import jno  # noqa: E402
 
 inner, grad, trace = jno.np.inner, jno.np.grad, jno.np.trace
 nu = 0.005  # Re = U L / nu = 1 * 1 / 0.005 = 200
 
-d = jno.domain(box(0, 0, 1, 1), mesh_size=0.045, time=(0.0, 8.0, 33))
+d = jno.domain(jno.Shape.rect(0, 0, 1, 1, size=0.045), time=(0.0, 8.0, 33))
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)  # P2 velocity
 p, q = d.fem_symbols(names=("p", "q"), order=1)  # P1 pressure
 xi, yi, ti = d.variable("interior", split=True)

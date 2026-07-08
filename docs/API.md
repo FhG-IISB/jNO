@@ -6,7 +6,7 @@ looks wrong, fix the docstring — not this file.
 
 For conceptual prose (what these objects *are* and *why* they exist),
 see the [Getting Started](Getting-Started.md) guide and the
-[Concepts](Glossary.md) page.
+[Concepts](concepts.md) page.
 
 ---
 
@@ -57,7 +57,7 @@ sampling, and tensor tags.
 
 ## Neural-network controls
 
-`jno.nn.wrap` lifts a plain Equinox / foundax module into a jNO
+`jno.nn` lifts a plain Equinox / foundax module into a jNO
 `Model` so it can participate in the trace and accept per-model
 optimisers, masks, LoRA, freezing, and so on.
 

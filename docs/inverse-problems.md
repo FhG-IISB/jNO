@@ -46,7 +46,7 @@ Call `.regularize(kind, ...)` on the field itself. It returns an **unreduced poi
 Penalises rapid spatial variation. Good default for smooth physical fields.
 
 ```python
-k = jno.nn.wrap(k_net)(x, y)
+k = jno.nn(k_net)(x, y)
 reg = k.regularize('smooth', x, y)
 
 crux = jno.core([pde.mse, data.mse, reg.mean])
@@ -102,8 +102,7 @@ with `k.regularize("h1seminorm" | "l2" | "tv" | "nonneg" | "bounded")` — the s
 method, assembled FE-exact on the element space for a nodal-parameter field. For a **transient**
 weak form, `fem.solve()` returns the trajectory
 `u(save_ts)`, so a rate constant is recovered from a time series. Worked examples:
-[hidden diffusivity field](tutorials/08-fem-and-varpinns/inverse-diffusivity-field.md) and
-[transient rate](tutorials/08-fem-and-varpinns/transient-inverse-heat.md).
+[hidden diffusivity field](tutorials/08-fem-and-varpinns/inverse-diffusivity-field.md).
 
 ---
 
@@ -115,7 +114,7 @@ weak form, `fem.solve()` returns the trajectory
 import equinox as eqx, jax
 
 # Constrain only the output layer weights — e.g. for a monotone final projection
-k_net = jno.nn.wrap(k_mlp)
+k_net = jno.nn(k_mlp)
 all_false = jax.tree_util.tree_map(lambda _: False, k_net.module)
 output_mask = eqx.tree_at(lambda m: m.output_layer.weight, all_false, True)
 k_net.mask(output_mask).constrain(jax.nn.softplus)   # output layer only
@@ -145,7 +144,7 @@ Under the hood, jNO wraps each selected leaf with [`paramax.Parameterize`](https
     For physically-constrained **field outputs** (diffusivity, viscosity, density), the simplest and most reliable approach is an **output-level transform** using `jno.fn`:
 
     ```python
-    k_raw = jno.nn.wrap(k_mlp)   # unconstrained weights — full network expressivity
+    k_raw = jno.nn(k_mlp)   # unconstrained weights — full network expressivity
     k_raw.optimizer(optax.adam(1e-3))
     k = jno.fn.exp(k_raw(x, y))  # field is always > 0 by construction
     ```
@@ -193,10 +192,10 @@ key = jax.random.PRNGKey(0)
 k1, k2 = jax.random.split(key)
 
 # k > 0 enforced via exp output transform (full network expressivity preserved)
-k_raw = jno.nn.wrap(foundax.mlp(in_features=1, output_dim=1, hidden_dims=16, num_layers=2, key=k1))
+k_raw = jno.nn(foundax.mlp(in_features=1, output_dim=1, hidden_dims=16, num_layers=2, key=k1))
 k_raw.optimizer(optax.adam(1e-3))
 
-u_net = jno.nn.wrap(foundax.mlp(in_features=1, output_dim=1, hidden_dims=32, num_layers=3, key=k2))
+u_net = jno.nn(foundax.mlp(in_features=1, output_dim=1, hidden_dims=32, num_layers=3, key=k2))
 u_net.optimizer(optax.adam(1e-3))
 
 k = jno.fn.exp(k_raw(x))        # always > 0 by construction

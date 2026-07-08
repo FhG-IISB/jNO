@@ -61,7 +61,7 @@ Exact solution: $u(x) = \sin(\pi x) / \pi^2$.
 domain = jno.domain.line(mesh_size=0.1)
 x, _ = domain.variable("interior")
 
-u_net = jno.nn.wrap(
+u_net = jno.nn(
     foundax.mlp(in_features=1, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(0))
 ).optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.5, end_value=1e-5)))
 

@@ -20,7 +20,7 @@ _f = domain.variable("_f")
 _u = domain.variable("_u")
 
 # ── Model ────────────────────────────────────────────────────────────────────
-u = jno.nn.wrap(
+u = jno.nn(
     foundax.fno2d(
         in_features=1,
         hidden_channels=16,

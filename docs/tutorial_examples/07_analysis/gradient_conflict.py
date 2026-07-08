@@ -19,7 +19,7 @@ xb, _ = domain.variable("boundary")
 u_exact = jno.np.sin(π * x) / π**2
 
 # ── Network with hard-enforced BCs ─────────────────────────────────────────────
-u_net = jno.nn.wrap(
+u_net = jno.nn(
     foundax.mlp(
         in_features=1,
         hidden_dims=32,

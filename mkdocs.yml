@@ -10,6 +10,8 @@ theme:
   name: material
   logo: assets/logo.svg
   favicon: assets/favicon.svg
+  features:
+    - navigation.top
 
 plugins:
   - search
@@ -69,20 +71,22 @@ nav:
   - Home: index.md
   - Installation: Installation.md
   - Getting Started: Getting-Started.md
-  - API Reference: API.md
-  - Concepts: Glossary.md
   - Getting to Know jNO:
+    - Concepts: concepts.md
     - Domain and Geometry: Domain-and-Geometry.md
     - Operators:
       - Differential Operators: Differential-Operators.md
       - Integral Operators: operators/integral.md
       - jno.numpy Reference: operators/numpy-reference.md
-    - Hyperparameter Tuning: Hyperparameter-Tuning.md
     - Miscellaneous:
       - Overview: misc.md
       - Weights & Biases: misc/wandb.md
-  - Training:
+      - Glossary: Glossary.md
+      - Hyperparameter Tuning: Hyperparameter-Tuning.md
+      - Save, Load and Configuration: Save-Load-and-Configuration.md
+  - PINN & NN Training:
     - Overview: training/index.md
+    - Models: foundation_models/index.md
     - Schedules, Resampling & Callbacks:
       - Schedules: adaptive/schedules.md
       - Adaptive Resampling: adaptive/resampling.md
@@ -93,6 +97,7 @@ nav:
       - Evaluation: training/evaluation.md
       - Explainability: training/explainability.md
     - Bayesian Sampling: training/bayesian.md
+    - Inverse Problems: inverse-problems.md
     - Model Controls:
       - Overview: model-controls/index.md
       - Mask & Freeze: model-controls/mask-freeze.md
@@ -101,119 +106,41 @@ nav:
       - Initialize, Dtype & Tune: model-controls/initialize-dtype-tune.md
       - Diagnostics: model-controls/diagnostics.md
       - IREE Deployment: model-controls/iree.md
-  - Inverse Problems: inverse-problems.md
-  - Save, Load and Configuration: Save-Load-and-Configuration.md
-  - Finite Element Method: fem.md
-  - Finite Difference Method: fdm.md
-  - Foundation Models: foundation_models/index.md
+  - Traditional Solvers:
+    - Finite Element Method: fem.md
+    - Finite Difference Method: fdm.md
   - Tutorials:
-    - 01 Basics:
+    - PINN:
       - Laplace 1D: tutorials/01-basics/laplace-1d.md
-      - Poisson 1D: tutorials/01-basics/poisson-1d.md
-      - Biharmonic 1D: tutorials/01-basics/biharmonic-1d.md
-    - 02 Elliptic:
-      - Anisotropic Poisson 2D: tutorials/02-elliptic/anisotropic-poisson-2d.md
-      - Diffusion-Reaction 1D: tutorials/02-elliptic/diffusion-reaction-1d.md
-      - Helmholtz 2D: tutorials/02-elliptic/helmholtz-2d.md
-      - Mixed-Boundary Poisson 2D: tutorials/02-elliptic/mixed-boundary-poisson-2d.md
       - Variable-Coefficient Poisson 2D: tutorials/02-elliptic/variable-coefficient-poisson-2d.md
-    - 03 Parabolic:
-      - Heat 1D: tutorials/03-parabolic/heat-1d.md
-      - Heat 2D: tutorials/03-parabolic/heat-2d.md
-      - Reaction-Diffusion 2D: tutorials/03-parabolic/reaction-diffusion-2d.md
       - Allen-Cahn 2D: tutorials/03-parabolic/allen-cahn-2d.md
-    - 04 Hyperbolic:
-      - Advection-Diffusion 1D: tutorials/04-hyperbolic/advection-diffusion-1d.md
       - Burgers Viscous 1D: tutorials/04-hyperbolic/burgers-viscous-1d.md
-      - Convection-Reaction-Diffusion 2D: tutorials/04-hyperbolic/convection-reaction-diffusion-2d.md
-      - Telegraph 1D: tutorials/04-hyperbolic/telegraph-1d.md
-      - Wave 1D: tutorials/04-hyperbolic/wave-1d.md
-    - 05 Coupled and Inverse:
-      - Coupled Elliptic 2D: tutorials/05-coupled-and-inverse/coupled-elliptic-2d.md
-      - Coupled Parabolic 2D: tutorials/05-coupled-and-inverse/coupled-parabolic-2d.md
       - Inverse Parameter: tutorials/05-coupled-and-inverse/inverse-parameter.md
-      - Surrogate Inversion: tutorials/05-coupled-and-inverse/surrogate-inversion.md
-      - HyCo Poisson 1D: tutorials/05-coupled-and-inverse/hyco-poisson-1d.md
-    - 06 Integration:
-      - Flux Conservation 2D: tutorials/06-integration/flux-conservation-2d.md
       - Fredholm Integral Equation: tutorials/06-integration/fredholm-integral-equation.md
-      - Fredholm Non-Separable Kernel: tutorials/06-integration/fredholm-nonseparable.md
-      - Integro-Differential Equation: tutorials/06-integration/integro-differential.md
-    - 07 Analysis:
       - Gradient Conflict: tutorials/07-analysis/gradient-conflict.md
-    - 07 Stochastic:
       - Fokker-Planck 2D: tutorials/07-stochastic/fokker-planck-2d.md
-      - Stochastic Forcing 2D: tutorials/07-stochastic/stochastic-forcing-2d.md
-    - 08 Finite Element Method:
-      - Poisson 2D: tutorials/08-fem-and-varpinns/poisson-2d-fem.md
-      - Variational PINN (Poisson): tutorials/08-fem-and-varpinns/vpinn-poisson-2d.md
-      - Stationary Allen-Cahn: tutorials/08-fem-and-varpinns/stationary-allen-cahn-fem.md
-      - Reaction-Diffusion (Robin BC): tutorials/08-fem-and-varpinns/diffusion-reaction-robin-bc.md
-      - Helmholtz (Mixed BC): tutorials/08-fem-and-varpinns/helmholtz-mixed-bc-fem.md
-      - Helmholtz 3D (F-domain): tutorials/08-fem-and-varpinns/helmholtz-3d.md
-      - Helmholtz + PML (complex): tutorials/08-fem-and-varpinns/helmholtz-pml-2d.md
-      - 2D Schrödinger Wave Packet: tutorials/08-fem-and-varpinns/schrodinger-wavepacket-2d.md
-      - 2D Maxwell (complex vector E): tutorials/08-fem-and-varpinns/maxwell-2d-vector.md
-      - Linear Elasticity (Cantilever): tutorials/08-fem-and-varpinns/linear-elasticity-cantilever.md
-      - "Elasticity: Plate with a Hole": tutorials/08-fem-and-varpinns/elasticity-plate-with-hole.md
-      - Stokes Channel (Poiseuille): tutorials/08-fem-and-varpinns/stokes-channel-poiseuille.md
-      - Stokes Flow Past a Cylinder: tutorials/08-fem-and-varpinns/stokes-flow-around-cylinder.md
-      - Navier-Stokes Lid-Driven Cavity: tutorials/08-fem-and-varpinns/navier-stokes-cavity-2d.md
-      - Kovasznay Flow (analytic Navier-Stokes): tutorials/08-fem-and-varpinns/kovasznay-flow-2d.md
-      - Coupled Multiphysics (Two-Temperature): tutorials/08-fem-and-varpinns/coupled-two-temperature-2d.md
-      - Rayleigh–Bénard (heat + flow): tutorials/08-fem-and-varpinns/rayleigh-benard-2d.md
-      - Bratu (nonlinear combustion): tutorials/08-fem-and-varpinns/bratu-2d.md
-      - Ginzburg-Landau (nonlinear vector): tutorials/08-fem-and-varpinns/ginzburg-landau-2d.md
-      - Laplacian Eigenmodes (spectral): tutorials/08-fem-and-varpinns/laplacian-eigenmodes-2d.md
-      - "Conforming Biharmonic (Argyris C¹, convergence)": tutorials/08-fem-and-varpinns/biharmonic-argyris-convergence-2d.md
-      - "Why C¹? Argyris vs. Mixed (biharmonic)": tutorials/08-fem-and-varpinns/biharmonic-conforming-vs-mixed-2d.md
-      - "Clamped Kirchhoff Plate (free boundary curvature)": tutorials/08-fem-and-varpinns/clamped-kirchhoff-plate-2d.md
-      - "Cahn–Hilliard (transient nonlinear 4th-order)": tutorials/08-fem-and-varpinns/cahn-hilliard-2d.md
-      - "Brittle Fracture (4th-order phase-field, coupled)": tutorials/08-fem-and-varpinns/phase-field-fracture-2d.md
-      - Transient Heat: tutorials/08-fem-and-varpinns/transient-heat-2d.md
-      - Transient via diffrax (custom integrator): tutorials/08-fem-and-varpinns/transient-diffrax-heat-spreader.md
-      - Vibrating Membrane (2D wave, 2nd-order time): tutorials/08-fem-and-varpinns/wave-membrane-2d.md
-      - Ringing Cantilever (elastodynamics + modal): tutorials/08-fem-and-varpinns/elastodynamics-cantilever-2d.md
-      - Conduction + Enclosure Radiation (concentric cylinders): tutorials/08-fem-and-varpinns/enclosure-radiation-concentric-cylinders.md
-      - Heated Box (conduction + convection + radiation): tutorials/08-fem-and-varpinns/oven-convection-radiation-2d.md
-      - Additive Manufacturing (laser thermo-mechanics): tutorials/08-fem-and-varpinns/am-laser-thermomechanics-2d.md
-      - Poroelastic Consolidation (Biot): tutorials/08-fem-and-varpinns/poroelastic-consolidation-2d.md
-      - Inverse Diffusivity Field: tutorials/08-fem-and-varpinns/inverse-diffusivity-field.md
-      - Inverse Neural Diffusivity: tutorials/08-fem-and-varpinns/inverse-neural-diffusivity-2d.md
-      - Learn Constitutive Law k(T): tutorials/08-fem-and-varpinns/learn-constitutive-law-2d.md
-      - Inverse Conductivity (L-shape): tutorials/08-fem-and-varpinns/inverse-conductivity-lshape.md
-      - Transient Inverse (Rate): tutorials/08-fem-and-varpinns/transient-inverse-heat.md
-      - "Inverse Plate Stiffness (4th-order field)": tutorials/08-fem-and-varpinns/inverse-plate-stiffness-2d.md
-      - Adaptive Mesh Refinement (L-shape): tutorials/08-fem-and-varpinns/adaptive-l-shape.md
-      - Adaptive Mesh + Inverse Design: tutorials/08-fem-and-varpinns/adaptive-inverse-lshape.md
-      - Anisotropic Refinement (thin layer): tutorials/08-fem-and-varpinns/anisotropic-layer.md
-    - 09 Finite Difference Method:
-      - Poisson 2D: tutorials/09-fdm/poisson-2d-fdm.md
-      - Mixed Boundary Conditions: tutorials/09-fdm/mixed-bc-fdm.md
-      - Transient Heat 2D: tutorials/09-fdm/heat-2d-fdm.md
-      - Differentiable Inverse: tutorials/09-fdm/inverse-source-fdm.md
-    - 09 Weights & Biases:
-      - W&B Integration: tutorials/09-wandb/wandb-integration.md
-    - 10 Bayesian PINNs:
-      - Overview: tutorials/10-bayesian-pinns/index.md
-      - Forward Noisy Poisson 1D: tutorials/10-bayesian-pinns/forward-noisy-poisson-1d.md
-      - Inverse Multi-Coefficient: tutorials/10-bayesian-pinns/inverse-multi-coefficient.md
-      - Inverse Reaction Coefficient: tutorials/10-bayesian-pinns/inverse-reaction-coefficient.md
-      - Inverse ODE Decay: tutorials/10-bayesian-pinns/inverse-ode-decay.md
-      - Inverse Surrogate w/ Uncertainty: tutorials/10-bayesian-pinns/inverse-surrogate-uncertainty.md
-      - Inverse FEM Diffusivity: tutorials/10-bayesian-pinns/inverse-fem-diffusivity.md
-      - BNN Regression: tutorials/10-bayesian-pinns/bnn-regression.md
-      - Multi-chain NUTS: tutorials/10-bayesian-pinns/multichain-nuts.md
-      - VI BNN Regression: tutorials/10-bayesian-pinns/vi-bnn-regression.md
-      - Masked BNN Head: tutorials/10-bayesian-pinns/masked-bnn-head.md
-      - Pathfinder Warm-Start: tutorials/10-bayesian-pinns/pathfinder-init.md
-      - Laplace Warm-Start: tutorials/10-bayesian-pinns/laplace-init.md
-      - SVGD Warm-Start: tutorials/10-bayesian-pinns/svgd-init.md
-      - Pattern B BNN Head: tutorials/10-bayesian-pinns/pattern-b-bnn-head.md
-    - 11 Operator Learning:
+    - Operator Learning:
       - Overview: tutorials/11-operator-learning/index.md
       - DeepONet — parametric Poisson 2D: tutorials/11-operator-learning/deeponet-poisson-2d.md
       - FNO2D — supervised Poisson 2D: tutorials/11-operator-learning/fno-poisson-2d.md
-      - U-Net 2D — supervised Poisson 2D: tutorials/11-operator-learning/unet-poisson-2d.md
-      - FieldView — physics-informed FNO: tutorials/11-operator-learning/field-view-physics.md
-      - FieldView — wave-equation PINN audit: tutorials/11-operator-learning/field-view-wave-equation.md
+    - FEM:
+      - Poisson 2D: tutorials/08-fem-and-varpinns/poisson-2d-fem.md
+      - Variational PINN (Poisson): tutorials/08-fem-and-varpinns/vpinn-poisson-2d.md
+      - Helmholtz + PML (complex): tutorials/08-fem-and-varpinns/helmholtz-pml-2d.md
+      - Linear Elasticity (Cantilever): tutorials/08-fem-and-varpinns/linear-elasticity-cantilever.md
+      - Navier-Stokes Lid-Driven Cavity: tutorials/08-fem-and-varpinns/navier-stokes-cavity-2d.md
+      - "Rayleigh–Bénard (heat + flow)": tutorials/08-fem-and-varpinns/rayleigh-benard-2d.md
+      - "Brittle Fracture (4th-order phase-field, coupled)": tutorials/08-fem-and-varpinns/phase-field-fracture-2d.md
+      - Vibrating Membrane (2D wave, 2nd-order time): tutorials/08-fem-and-varpinns/wave-membrane-2d.md
+      - Inverse Diffusivity Field: tutorials/08-fem-and-varpinns/inverse-diffusivity-field.md
+      - Adaptive Mesh Refinement (L-shape): tutorials/08-fem-and-varpinns/adaptive-l-shape.md
+      - 2D Maxwell (complex vector E): tutorials/08-fem-and-varpinns/maxwell-2d-vector.md
+    - FDM:
+      - Poisson 2D: tutorials/09-fdm/poisson-2d-fdm.md
+      - Heat 2D: tutorials/09-fdm/heat-2d-fdm.md
+      - Mixed BC: tutorials/09-fdm/mixed-bc-fdm.md
+      - Inverse Source: tutorials/09-fdm/inverse-source-fdm.md
+    - Bayesian:
+      - Overview: tutorials/10-bayesian-pinns/index.md
+      - Bayesian Inverse Coefficient: tutorials/10-bayesian-pinns/bayesian-inverse-coefficient.md
+  - API Reference: API.md

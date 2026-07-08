@@ -37,7 +37,7 @@ source = exp(-t) * S * coeff + exp(-3 * t) * S**3
 The model learns a field over space and time while respecting the chosen boundary handling.
 
 ```python
-net = jno.nn.wrap(
+net = jno.nn(
     foundax.deeponet(
         n_sensors=1, coord_dim=2, n_outputs=1,
         n_layers=3, basis_functions=64, hidden_dim=40,

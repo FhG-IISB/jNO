@@ -1,4 +1,4 @@
-"""07 — 2-D Fokker–Planck on a disc  (shapely + RAD resampling + residual tracker)"""
+"""07 — 2-D Fokker–Planck on a disc  (Shape + RAD resampling + residual tracker)"""
 
 from pathlib import Path
 
@@ -6,7 +6,6 @@ import foundax
 import jax
 import jax.numpy as jnp
 import optax
-from shapely.geometry import Point
 
 import jno
 
@@ -14,7 +13,7 @@ import jno
 
 # --8<-- [start:setup]
 # Disc of radius 3 centred at the origin — captures the Gaussian's effective support.
-domain = jno.domain(Point(0, 0).buffer(3.0), mesh_size=0.25)
+domain = jno.domain(jno.Shape.disk(0, 0, 3.0, size=0.25))
 x, y, _ = domain.variable("interior")
 xb, yb, _ = domain.variable("boundary")
 
@@ -23,7 +22,7 @@ p_exact_bc = jno.np.exp(-(xb**2 + yb**2)) / π
 # --8<-- [end:setup]
 
 # --8<-- [start:residual]
-net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=64, num_layers=5, key=jax.random.PRNGKey(0)))
+net = jno.nn(foundax.mlp(in_features=2, hidden_dims=64, num_layers=5, key=jax.random.PRNGKey(0)))
 net.optimizer(optax.adam(optax.exponential_decay(1e-3, 2000, 0.5, end_value=1e-5)))
 
 p = net(x, y).scalar.bind(x=x, y=y)

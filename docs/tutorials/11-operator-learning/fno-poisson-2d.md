@@ -28,7 +28,7 @@ _u = domain.variable("_u")
 ## Step 2: FNO2D Architecture
 
 ```python
-u = jno.nn.wrap(
+u = jno.nn(
     foundax.fno2d(
         in_features=1,
         hidden_channels=16,

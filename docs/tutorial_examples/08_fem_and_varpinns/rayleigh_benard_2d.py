@@ -38,14 +38,13 @@ import matplotlib.animation as animation  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import matplotlib.tri as mtri  # noqa: E402
 import numpy as np  # noqa: E402
-from shapely.geometry import box  # noqa: E402
 
 import jno  # noqa: E402
 
 Pr, Ra = 1.0, 1.0e4  # Prandtl, Rayleigh (Ra >> Ra_c ~ 1708 -> vigorous convection)
 Lx, Ly = 2.0, 1.0  # a wide-ish pot -> a pair of counter-rotating rolls
 
-d = jno.domain(box(0, 0, Lx, Ly), mesh_size=0.11, time=(0.0, 0.3, 2))
+d = jno.domain(jno.Shape.rect(0, 0, Lx, Ly, size=0.11), time=(0.0, 0.3, 2))
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)  # P2 velocity
 p, q = d.fem_symbols(names=("p", "q"), order=1)  # P1 pressure
 T, sT = d.fem_symbols(names=("T", "sT"), order=1)  # P1 temperature

@@ -11,7 +11,7 @@ x, _ = domain.variable("interior")
 
 u_exact = x
 
-net = jno.nn.wrap(foundax.mlp(in_features=1, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(0)))
+net = jno.nn(foundax.mlp(in_features=1, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(0)))
 net.optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.5, end_value=1e-5)))
 
 u = (x + x * (1 - x) * net(x)).scalar.bind(x=x)

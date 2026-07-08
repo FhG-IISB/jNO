@@ -14,11 +14,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from shapely.geometry import box
 
 import jno
 
-d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+d = jno.domain(jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1))
 u, phi = d.fem_symbols()
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)

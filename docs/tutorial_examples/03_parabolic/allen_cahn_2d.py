@@ -20,7 +20,7 @@ u_exact = jno.np.exp(-t) * S
 source = jno.np.exp(-t) * S * (2 * ε**2 * π**2 - 2) + jno.np.exp(-3 * t) * S**3
 
 # Network with hard Dirichlet BCs in space; t is fed via the trunk input.
-net = jno.nn.wrap(
+net = jno.nn(
     foundax.deeponet(
         n_sensors=1,
         coord_dim=2,

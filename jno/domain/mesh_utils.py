@@ -294,8 +294,8 @@ class MeshUtils:
     def get_boundary_normals(mesh, k=8):
         points = mesh.points
         if "tetra" in mesh.cells_dict:
-            boundary_elements = MeshUtils._get_boundary_elements(mesh.cells_dict["tetra"], "tetra")
-            return MeshUtils._compute_normals_from_boundary_faces(points, boundary_elements)
+            bfaces, bapex = MeshUtils._boundary_faces_with_apex(mesh.cells_dict["tetra"])
+            return MeshUtils._compute_normals_from_boundary_faces(points, bfaces, apex_points=points[bapex])
         elif "triangle" in mesh.cells_dict:
             boundary_elements = MeshUtils._get_boundary_elements(mesh.cells_dict["triangle"], "triangle")
             actual_dim = 2
@@ -306,22 +306,46 @@ class MeshUtils:
         return MeshUtils._compute_normals_pca(points, boundary_indices, actual_dim, k, mesh=mesh)
 
     @staticmethod
-    def _compute_normals_from_boundary_faces(points, boundary_faces):
+    def _boundary_faces_with_apex(tetra_cells):
+        """Boundary faces of a tetrahedral mesh, each with the apex of its owning element.
+
+        A boundary face is shared by exactly one tetrahedron; that tet's fourth vertex (the
+        one not on the face) is the ``apex``. Returns ``(faces, apex)`` where ``faces`` are
+        node triples and ``apex`` the per-face opposite-vertex node index -- enough to orient
+        each face outward exactly (away from the apex), for any geometry incl. concave ones.
+        """
+        cells = np.asarray(tetra_cells, dtype=np.int64)
+        specs = ([0, 1, 2], 3), ([0, 1, 3], 2), ([0, 2, 3], 1), ([1, 2, 3], 0)
+        faces = np.vstack([cells[:, list(tri)] for tri, _ in specs])
+        apex = np.concatenate([cells[:, a] for _, a in specs])
+        keys = np.sort(faces, axis=1)
+        _uniq, inv, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
+        boundary = counts[inv.ravel()] == 1
+        return faces[boundary], apex[boundary]
+
+    @staticmethod
+    def _compute_normals_from_boundary_faces(points, boundary_faces, apex_points=None):
         """Compute robust 3D boundary vertex normals from boundary triangle faces.
 
-        Face normals are oriented outward using the global mesh centroid and then
-        accumulated per vertex (area-weighted via unnormalized face normals).
+        When ``apex_points`` is given -- one point per face, the opposite vertex of the single
+        volume element that owns that face -- each face normal is oriented to point *away* from
+        that vertex. This is exact for any geometry, including concave boundaries (a roll
+        contact arc, an L-shape, a T-junction). Without it, faces are oriented by the global
+        mesh centroid, which is valid only for convex / star-shaped domains and is kept as a
+        fallback for callers that have no volume connectivity. Normals are accumulated per
+        vertex (area-weighted via unnormalized face normals).
         """
         pts = np.asarray(points[:, :3], dtype=np.float64)
         faces = np.asarray(boundary_faces, dtype=np.int64)
         if faces.size == 0:
             return np.zeros((0, 3), dtype=np.float64), np.array([], dtype=np.int64)
 
+        apex = None if apex_points is None else np.asarray(apex_points[:, :3], dtype=np.float64)
         centroid = np.mean(pts, axis=0)
         vnorm = np.zeros_like(pts)
         eps = 1e-20
 
-        for f in faces:
+        for k, f in enumerate(faces):
             i0, i1, i2 = int(f[0]), int(f[1]), int(f[2])
             p0, p1, p2 = pts[i0], pts[i1], pts[i2]
 
@@ -332,7 +356,9 @@ class MeshUtils:
                 continue
 
             fc = (p0 + p1 + p2) / 3.0
-            if np.dot(n, fc - centroid) < 0.0:
+            # Outward = away from the owning element's apex (exact); else away from centroid.
+            ref = centroid if apex is None else apex[k]
+            if np.dot(n, fc - ref) < 0.0:
                 n = -n
 
             vnorm[i0] += n

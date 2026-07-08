@@ -3,7 +3,6 @@
 import foundax
 import jax
 import optax
-from shapely.geometry import box
 
 import jno
 
@@ -12,14 +11,14 @@ N_SAMPLES = 50
 EPOCHS = 2_000
 
 # ── Parametric domain — replicate one mesh across N_SAMPLES random k values ──
-dom = N_SAMPLES * jno.domain(box(0, 0, 2, 1), mesh_size=0.05)
+dom = N_SAMPLES * jno.domain(jno.Shape.rect(0, 0, 2, 1, size=0.05))
 x, y, _ = dom.variable("interior")
 
 k_values = jax.random.uniform(KEY, shape=(N_SAMPLES, 1, 1), minval=0.5, maxval=1.5)
 k = dom.variable("k", k_values)
 
 # ── Network ──────────────────────────────────────────────────────────────────
-net = jno.nn.wrap(
+net = jno.nn(
     foundax.deeponet(
         n_sensors=1,  # branch input is the scalar k
         coord_dim=2,  # trunk input is (x, y)

@@ -27,7 +27,7 @@ x, _ = domain.variable("interior")
 The boundary values are non-zero (`u(0)=0`, `u(1)=1`), so the multiplicative `x(1-x)` trick alone won't enforce them. Instead, use a **linear interpolant + correction** ansatz:
 
 ```python
-u_net = jno.nn.wrap(
+u_net = jno.nn(
     foundax.mlp(in_features=1, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(0))
 ).optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.5, end_value=1e-5)))
 
@@ -58,7 +58,6 @@ history = crux.solve(5000)
 ## What To Notice
 
 - The non-homogeneous BCs require an ansatz that **adds** to a satisfying solution rather than just multiplying. The general recipe is `u = boundary_lift(x) + zero_at_boundary(x) * net(x)`.
-- For more interesting Poisson-style problems with a non-zero forcing, see [Poisson 1D](poisson-1d.md) — same domain, but adds a soft-BC pattern with `scheme="finite_difference"`.
 - This is a *trivial* PDE in the sense that the exact solution is in the trial-space class; jNO is being asked to confirm convergence, not discover anything new.
 
 <div class="hero-actions" markdown>

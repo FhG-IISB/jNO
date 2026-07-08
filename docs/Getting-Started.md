@@ -1,92 +1,97 @@
 # Getting Started
 
-This page is the fastest path from installation to a first PDE solve with jNO.
+The fastest path from a fresh install to a first PDE solve. Complete
+[Installation](Installation.md) first, then build the example up one step at a time.
 
-Before you begin, complete setup in [Installation](Installation.md).
+We solve a **2-D Poisson** problem on the unit square with a physics-informed network (PINN):
 
-## End-to-End Example
+$$-\nabla^2 u = 2\pi^2 \sin(\pi x)\sin(\pi y), \quad u\big|_{\partial\Omega}=0
+\quad\Rightarrow\quad u^\ast = \sin(\pi x)\sin(\pi y).$$
 
-The example below solves a **parametric 2-D Poisson equation** with a random diffusion coefficient $k$:
+---
 
-$$-\nabla \cdot (k \, \nabla u) = 1, \quad u\big|_{\partial\Omega} = 0, \quad k \sim \mathcal{U}(0.5, 1.5)$$
+## 1. Set up a run
 
-It uses a [DeepONet](foundation_models/index.md) to learn the solution operator — mapping any realisation of $k$ to the corresponding field $u$ — and demonstrates the full jNO pipeline: domain setup, operator network, hard boundary enforcement, checkpointing, and inference on a finer test mesh.
-
-```python
-import jno
-import jax
-import optax
-import foundax
-
-dir = jno.setup("./runs/test")
-
-# Domain: 500 random realisations of k, mesh spacing 0.05 on [0,2]×[0,1]
-dom = 500 * jno.domain.rect(mesh_size=0.05, x_range=(0, 2), y_range=(0, 1))
-x, y, _ = dom.variable("interior")
-xb, yb, _ = dom.variable("boundary")
-
-random_k = jax.random.uniform(jax.random.PRNGKey(0), shape=(500, 1, 1), minval=0.5, maxval=1.5)
-k = dom.variable("k", random_k)
-
-# Neural network: DeepONet maps (k, coords) → u
-fx = foundax.deeponet(
-    n_sensors=1, coord_dim=2,
-    basis_functions=32, hidden_dim=128,
-    activation=jax.numpy.tanh,
-)
-net = jno.nn.wrap(fx)
-net.optimizer(optax.adam(
-    learning_rate=optax.schedules.cosine_decay_schedule(
-        init_value=1e-3, decay_steps=20_000, alpha=1e-5
-    )
-))
-
-# Hard boundary enforcement via output transformation (u = 0 on ∂Ω automatically)
-u = net(k, jno.np.concat([x, y], axis=-1)) * x * (2 - x) * y * (1 - y)
-pde = k * (u.dd(x) + u.dd(y)) + 1.0  # PDE residual
-
-# Checkpoint every 5000 epochs, keep the best 3 by total loss
-cb = jno.callbacks.checkpoint(save_interval_epochs=5000, best_fn=lambda m: m["total_loss"])
-
-# Compile → train → save
-crux = jno.core(constraints=[pde.mse])
-crux.print_shapes()
-crux.solve(epochs=20_000, batchsize=32, callbacks=[cb]).plot(f"{dir}/training.png")
-jno.save(crux, f"{dir}/model.pkl")
-
-# Inference on a finer mesh with new k values
-tst_dom = 16 * jno.domain.rect(mesh_size=0.01, x_range=(0, 2), y_range=(0, 1))
-tst_dom.variable("k", jax.random.uniform(jax.random.PRNGKey(1), shape=(16, 1, 1), minval=0.1, maxval=1.9))
-
-pred, x_t, y_t, k_t = crux.eval([u, x, y, k], domain=tst_dom)
-print(pred.shape, x_t.shape, y_t.shape, k_t.shape)
-```
-
-## Recommended Path
-
-1. Run the example above (or a tutorial from `docs/tutorial_examples/`).
-2. Learn domain construction in [Domain and Geometry](Domain-and-Geometry.md).
-3. Configure optimization in [Training](training/index.md).
-4. Control trainability in [Model Controls](model-controls/index.md).
-5. Explore model families in [Foundation Models](foundation_models/index.md).
-
-## Project Setup Helper
-
-`jno.setup()` initializes logging and returns a run directory in one call:
+`jno.setup()` initialises logging and returns a run directory in one call.
 
 ```python
-dire = jno.setup("./runs/my_experiment")
+import jno, jax, optax, foundax
+
+run = jno.setup("./runs/getting-started")
 ```
 
-## Understanding Output
+## 2. Define the domain
 
-During training, jNO prints progress per epoch:
+A [domain](Domain-and-Geometry.md) holds the geometry and the points sampled on it. `variable(...)`
+returns the coordinates of a named region (`"interior"`, `"boundary"`, …); a domain is a source of
+(effectively infinite) collocation points for a PINN.
+
+```python
+dom = jno.domain.rect(mesh_size=0.04, x_range=(0, 1), y_range=(0, 1))
+x, y, _ = dom.variable("interior")     # interior collocation coordinates
+```
+
+## 3. Create a network
+
+Every [model](foundation_models/index.md) comes from **foundax** and is wrapped with `jno.nn(...)` to
+gain jNO's training controls. Attach an [optimizer](training/index.md) (schedules, LoRA, freezing, …
+all chain off the model):
+
+```python
+net = jno.nn(foundax.mlp(2, hidden_dims=64, num_layers=4, key=jax.random.PRNGKey(0)))
+net.optimizer(optax.adam(1e-3))
+```
+
+## 4. Write the PDE residual
+
+Call the network on the coordinates and take derivatives with the [differential
+operators](Differential-Operators.md) — here the concise `u.dd(x)` (second derivative). Multiplying by
+`x(1-x)y(1-y)` makes the ansatz vanish on `∂Ω`, so the Dirichlet BC is enforced **exactly** with no loss
+term:
+
+```python
+import jno.numpy as jnn
+
+pi = jnn.pi
+u = net(jnn.concat([x, y], axis=-1)) * x * (1 - x) * y * (1 - y)   # hard u = 0 on ∂Ω
+f = 2 * pi**2 * jnn.sin(pi * x) * jnn.sin(pi * y)
+pde = u.dd(x) + u.dd(y) + f                                        # −∇²u = f  ⇒  residual = ∇²u + f
+```
+
+## 5. Solve
+
+A [`jno.core`](training/index.md) collects the constraints (here the single PDE residual, driven to
+zero in mean-square) and `solve()` trains through them:
+
+```python
+crux = jno.core([pde.mse])
+crux.solve(epochs=10_000).plot(f"{run}/training.png")
+jno.save(crux, f"{run}/model.pkl")
+```
+
+During training jNO prints one line per print-interval — `L` is the total loss, `C0, C1, …` the
+per-constraint losses:
 
 ```text
-Epoch  1000/20000| L: 1.2345e-03 | C0: 1.1000e-03
+Epoch  1000/10000 | L: 1.2345e-03 | C0: 1.2345e-03
 ```
 
-- `L` — total weighted loss.
-- `C0`, `C1`, … — per-constraint losses.
-- `T0`, `T1`, … — tracker values (when trackers are enabled).
+## 6. Evaluate the prediction
 
+[Evaluate](training/evaluation.md) the trained model on its own output — on a finer mesh if you like:
+
+```python
+pred, xt, yt = crux.eval([u, x, y], domain=jno.domain.rect(mesh_size=0.01))
+print(pred.shape)                       # the learned field, sampled on the fine mesh
+```
+
+---
+
+## Where to go next
+
+- **Geometry** — build real shapes (CSG, curved boundaries, mesh density): [Domain & Geometry](Domain-and-Geometry.md).
+- **Operators** — every derivative / integral you can write into a residual: [Differential Operators](Differential-Operators.md).
+- **Training** — schedules, resampling, callbacks, parallelism: [PINN & NN Training](training/index.md).
+- **Model controls** — freeze, mask, LoRA, dtype, tuning: [Model Controls](model-controls/index.md).
+- **Traditional solvers** — assemble and solve a weak form: [Finite Element Method](fem.md).
+- **Tutorials** — worked end-to-end examples (PINN, operator learning, FEM, Bayesian): [Tutorials](tutorials/01-basics/laplace-1d.md).

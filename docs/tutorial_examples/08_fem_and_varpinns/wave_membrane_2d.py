@@ -21,7 +21,6 @@ discrete energy E = ½ vᵀM v + ½ uᵀK u is conserved (a drum does not lose e
 
 import jax.numpy as jnp
 import numpy as np
-from shapely.geometry import box
 
 import jno
 
@@ -33,7 +32,7 @@ OMEGA = C * PI * np.sqrt(2.0)  # fundamental modal frequency
 PERIOD = 2.0 * PI / OMEGA  # = √2 / C
 
 # One full period, resolved with 120 steps; a moderate mesh keeps the example quick.
-d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.08, time=(0.0, float(PERIOD), 120))
+d = jno.domain(jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.08), time=(0.0, float(PERIOD), 120))
 u, phi = d.fem_symbols()
 xi, yi, ti = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)

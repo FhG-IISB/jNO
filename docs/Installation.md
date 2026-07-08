@@ -7,8 +7,12 @@ Requires Python 3.11–3.13.
 ## PyPI
 
 ```bash
-pip install "jax-neural-operators[fem]"
+pip install jax-neural-operators
 ```
+
+The finite-element assembler additionally needs `fenics-basix` (imports as `basix`) —
+`pip install jax-neural-operators fenics-basix`, or use the pixi `fem` environment below
+(which pulls it in).
 
 GPU support is included by default — `jax-neural-operators` depends on
 `jax[cuda]>=0.10.1,<0.11`, so a standard `pip install` already pulls a
@@ -22,7 +26,7 @@ package index *before* installing jNO:
 ```bash
 # CUDA 12 example
 pip install --upgrade "jax[cuda12]>=0.10.1,<0.11"
-pip install "jax-neural-operators[fem]"
+pip install jax-neural-operators
 ```
 
 To pin a different JAX version locally for an experiment, see the

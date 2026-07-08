@@ -140,7 +140,7 @@ print(f"Best configuration: {crux.best_config}")
 Attach tunable options **directly to individual models** with `.tune()`. This allows each model in a multi-model problem to have its own independently-tuned configuration.
 
 ```python
-backbone = jnn.nn.mlp(2, hidden_dims=32, num_layers=3, key=key2)(x, y)
+backbone = jno.nn(foundax.mlp(2, hidden_dims=32, num_layers=3, key=key2))
 
 backbone.tune(
     freeze=[True, False],                # try frozen vs trainable

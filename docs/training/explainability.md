@@ -2,12 +2,12 @@
 
 A family of trackers that give insight into what is happening inside the training loop. They work by differentiating through the constraint functions after each outer step, or by directly inspecting the residuals, independently of the gradient updates that drive training. Results are stored as numpy arrays on the tracker object and, when a W&B run is active, pushed automatically to your dashboard.
 
-Each tracker registers itself in `on_solve_begin` — called once after the initial JIT compilation — and pre-compiles its JAX function against the current parameter shapes. The first call at `epoch % interval == 0` therefore runs a pre-warmed XLA kernel with no recompilation overhead. Internally, the three gradient trackers share a single `jacrev`-based function that computes the full gradient matrix $G \in \mathbb{R}^{N \times P}$ where $N$ is the number of constraints and $P$ the number of (selected) parameters.
+Each tracker pre-compiles its JAX function once (in `on_solve_begin`, after the initial JIT) so a fire at
+`epoch % interval == 0` runs a pre-warmed kernel. The gradient trackers share one `jacrev`-based function
+computing the full gradient matrix $G \in \mathbb{R}^{N \times P}$ ($N$ constraints, $P$ selected parameters).
 
-Trackers are surfaced under two equivalent namespaces:
-
-- **`jno.trackers.*`** — preferred; matches the tracker mental model and ships factories that mirror `jno.callbacks.*` 1-for-1.
-- **`jno.callbacks.*`** — the historical entry point; remains supported. Both return the same classes.
+Trackers are surfaced under two equivalent namespaces returning the same classes: **`jno.trackers.*`**
+(preferred) and **`jno.callbacks.*`** (the historical entry point, still supported).
 
 ---
 
