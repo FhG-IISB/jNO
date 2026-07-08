@@ -70,7 +70,7 @@ crux.solve(epochs=20_000, batchsize=32)
 
 - **One network, one training run, 500 PDE solutions.** After convergence, `crux.eval(u)` returns the solution field for every sampled `k` without any retraining.
 - **Branch/trunk factorisation** is the operator-learning interpretation of "separation of variables in parameter space". It's cheap to scale (the trunk is the same for all samples), which makes DeepONet much faster than training one PINN per `k`.
-- **Pure PDE-residual training.** No solution data is supplied — the network learns from physics alone. Compare with the [FNO](fno-poisson-2d.md) and [U-Net](unet-poisson-2d.md) tutorials, which use a precomputed `(f, u)` dataset.
+- **Pure PDE-residual training.** No solution data is supplied — the network learns from physics alone. Compare with the [FNO](fno-poisson-2d.md) tutorials, which use a precomputed `(f, u)` dataset.
 
 <div class="hero-actions" markdown>
 <a class="md-button md-button--primary" href="/jNO/tutorial_examples/11_operator_learning/deeponet_poisson_2d.py" download>Download full script</a>

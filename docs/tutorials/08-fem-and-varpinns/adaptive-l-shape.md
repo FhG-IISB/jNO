@@ -36,8 +36,7 @@ for _ in range(n_rounds):
 
 Refinement is an **outer** Python loop — the mesh is a static argument to the assembler, so
 `domain.refine` mutates the domain in place and re-calling `jno.fem(constraints)` reassembles on the
-new mesh automatically. Differentiability is exact on the *frozen* adapted mesh (see the
-[adaptive-inverse tutorial](adaptive-inverse-lshape.md)), not through the discrete refinement.
+new mesh automatically. Differentiability is exact on the *frozen* adapted mesh, not through the discrete refinement.
 
 ## The result
 
