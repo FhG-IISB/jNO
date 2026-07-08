@@ -13,8 +13,8 @@ Three coupled fields -- velocity ``u`` (P2), pressure ``p`` (P1), temperature ``
 a single ``jno.fem([...])``. The coupling is genuinely two-way: **buoyancy** ``Pr*Ra*T`` feeds heat
 into the momentum balance (a linear cross term), and **advection** ``u.grad T`` feeds the flow into the
 heat balance (a product of two *different* unknowns -> nonlinear). The whole system routes through the
-coupled nonlinear Newton path; we march it in time with our own backward-Euler + Newton stepper (the
-Navier-Stokes-cavity pattern) and watch the rolls grow from rest.
+coupled nonlinear Newton path; ``fem.solve()`` marches it in time internally -- backward-Euler + Newton
+at the domain's time step -- and we watch the rolls grow from rest.
 
 Boundary/initial conditions for the pot: **no-slip** walls (``u=0``), a **hot floor / cold lid** with
 the conductive profile held on the walls (``T = 1 - y``), and the fluid starting **at rest** from the
@@ -33,7 +33,6 @@ jax.config.update("jax_enable_x64", True)  # the assembler builds in float64
 
 from pathlib import Path  # noqa: E402
 
-import jax.numpy as jnp  # noqa: E402
 import matplotlib.animation as animation  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import matplotlib.tri as mtri  # noqa: E402
@@ -43,8 +42,10 @@ import jno  # noqa: E402
 
 Pr, Ra = 1.0, 1.0e4  # Prandtl, Rayleigh (Ra >> Ra_c ~ 1708 -> vigorous convection)
 Lx, Ly = 2.0, 1.0  # a wide-ish pot -> a pair of counter-rotating rolls
+dt, nsteps, nframes = 0.009, 26, 13  # integration step / count -> fem.solve() reads dt from the domain
+#                                      time grid below (stop ~when the rolls establish, no static tail)
 
-d = jno.domain(jno.Shape.rect(0, 0, Lx, Ly, size=0.11), time=(0.0, 0.3, 2))
+d = jno.domain(jno.Shape.rect(0, 0, Lx, Ly, size=0.11), time=(0.0, nsteps * dt, nsteps + 1))
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)  # P2 velocity
 p, q = d.fem_symbols(names=("p", "q"), order=1)  # P1 pressure
 T, sT = d.fem_symbols(names=("T", "sT"), order=1)  # P1 temperature
@@ -84,24 +85,15 @@ fem = jno.fem(
 )
 assert fem.is_transient and not fem.is_linear, "Boussinesq convection is transient + nonlinear"
 off = fem.offsets
-M, dt, nsteps, nframes = fem.M, 0.009, 26, 13  # stop ~when the rolls establish (no static tail)
 print(f"\n2D Rayleigh-Benard pot (Ra={Ra:g}, Pr={Pr:g}): dofs={fem.dofs}, steps={nsteps}")
 
-# bring-your-own implicit integrator: backward Euler + Newton  ((M/dt + dR/du) du = -G).
-# fem.residual / fem.jacobian are already jitted, so each step is fast after the first.
-w = fem.state0
-frames, save_every = [np.asarray(w)], max(1, nsteps // nframes)
-for step in range(nsteps):
-    w_prev, t_next = w, (step + 1) * dt
-    for _ in range(8):  # Newton
-        G = M @ (w - w_prev) / dt + fem.residual(w, t_next)
-        dw = jnp.linalg.solve(M / dt + fem.jacobian(w, t_next), -G)
-        w = w + dw
-        if float(jnp.linalg.norm(dw)) < 1e-8:
-            break
-    if (step + 1) % save_every == 0:
-        frames.append(np.asarray(w))
-frames = np.stack(frames)
+# fem.solve() marches the coupled nonlinear system itself -- backward Euler + Newton per step over the
+# domain's time grid -- and returns a differentiable trace node; evaluate the forward trajectory (one
+# full DOF vector per step, row 0 = the rest initial state) through a minimal crux.
+sol = fem.solve()
+traj = np.asarray(jno.core([sol.mse]).eval([sol]))  # (nsteps + 1, dofs)
+save_every = max(1, nsteps // nframes)
+frames = traj[::save_every]  # subsample rows for the animation (row 0 = rest, then every save_every)
 
 pts_v = np.asarray(fem.field_points[0])  # P2 velocity nodes
 pts_T = np.asarray(fem.field_points[2])  # P1 temperature nodes

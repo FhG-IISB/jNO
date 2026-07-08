@@ -29,14 +29,15 @@ k_true = 1.0 + 0.8 * np.exp(
     -((nodes[:, 0] - 0.5) ** 2 + (nodes[:, 1] - 0.5) ** 2) / (2 * 0.12**2)
 )  # background + inclusion
 
-# One parametric assembly: generate clean full-field data by evaluating it at the true k ...
-k = jno.np.parameter(phi, name="k")
-fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
-A_true, b = fem.operator.evaluate({"k": jnp.asarray(k_true)})
-A_true = A_true.todense() if hasattr(A_true, "todense") else jnp.asarray(A_true)  # operator is BCOO
-u_obs = jnp.linalg.solve(A_true, jnp.asarray(b).reshape(-1))
+# Generate clean full-field data with one forward solve at the true k -- a known coefficient
+# frozen from its coordinate function, so it is a plain non-parametric fem.solve() (no manual solve).
+k_fn = lambda x, y: 1.0 + 0.8 * jnp.exp(-((x - 0.5) ** 2 + (y - 0.5) ** 2) / (2 * 0.12**2))  # noqa: E731
+k_known = jno.np.parameter(phi).initialize(k_fn).freeze()
+u_obs = jnp.asarray(jno.fem([k_known * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3).solve())
 
 # ... then recover k(x) from u_obs through the differentiable solve + an H1 smoothness prior.
+k = jno.np.parameter(phi, name="k")
+fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
 k.dtype(jnp.float64)
 k.initialize(jax.nn.initializers.constant(1.0))  # start from a uniform field
 k.optimizer(optax.adam(2e-2))

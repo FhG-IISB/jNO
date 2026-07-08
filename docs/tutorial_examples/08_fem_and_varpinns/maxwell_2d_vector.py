@@ -81,8 +81,7 @@ fem = jno.fem(
     quad_degree=6,
 )
 
-A = jno.np.asarray(fem.A.todense()) if hasattr(fem.A, "todense") else jno.np.asarray(fem.A)
-sol = np.asarray(np.linalg.solve(np.asarray(A), np.asarray(fem.b).reshape(-1)))
+sol = np.asarray(fem.solve()).reshape(-1)  # the differentiable steady solve (complex = coupled real fields)
 off = np.asarray(fem.offsets)
 pts = np.asarray(fem.field_points[0])
 n = int(off[1])

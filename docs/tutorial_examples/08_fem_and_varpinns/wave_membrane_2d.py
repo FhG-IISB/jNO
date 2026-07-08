@@ -47,22 +47,14 @@ v0 = ui0.t - 0.0  # released from rest (note: velocity IC binds the initial-slic
 fem = jno.fem([weak, u(xb, yb) - 0.0, u0, v0])
 assert fem.is_transient and fem.is_linear
 
-# --- march in time with the trapezoidal (θ=½) rule on the augmented block M ẏ + A y = c ---
-#   (M + ½dt A) y_next = (M − ½dt A) y + dt c        [θ=½: energy-conserving]
-# Do NOT use backward Euler (M + dt A) here -- it damps the wave (see the module docstring).
-M, A = dense(fem.M), dense(fem.operator.A)
-c_vec = np.zeros(M.shape[0]) if fem.operator.affine_bias is None else np.asarray(fem.operator.affine_bias).reshape(-1)
-dt = float(fem.dt)
-N = fem.offsets[1]  # state is y = [u; v]; displacement is the first N entries
-lhs = M + 0.5 * dt * A
-rhs_op = M - 0.5 * dt * A
-
-y = np.asarray(fem.state0)
-traj = [y[:N].copy()]
-for _ in range(round((fem.t1 - fem.t0) / dt)):
-    y = np.linalg.solve(lhs, rhs_op @ y + dt * c_vec)
-    traj.append(y[:N].copy())
-traj = np.asarray(traj)  # (n_steps+1, N) displacement history
+# --- solve: fem.solve() integrates the augmented block with the energy-conserving
+#     trapezoidal (θ=½) rule *internally* -- no hand-rolled time stepping. (Backward Euler would
+#     damp the wave; that is why the transient solver uses θ=½ for a second-order block.)
+#     fem.solve() is a differentiable trace node; evaluate the forward trajectory through a crux.
+N = fem.offsets[1]  # state is y = [u; v]; displacement is the first N entries, velocity the last N
+sol = fem.solve()
+state = np.asarray(jno.core([sol.mse]).eval([sol]))  # (n_steps, 2N) trajectory of y = [u; v]
+traj, V = state[:, :N], state[:, N:]  # displacement and velocity histories (v = u_t, exact)
 ts = np.linspace(fem.t0, fem.t1, traj.shape[0])
 
 # --- verify against the analytic standing wave + energy conservation ---
@@ -72,8 +64,8 @@ u_center = traj[:, ci]
 u_exact = np.sin(PI * pts[ci, 0]) * np.sin(PI * pts[ci, 1]) * np.cos(OMEGA * ts)
 rel = np.linalg.norm(u_center - u_exact) / np.linalg.norm(u_exact)
 
-M_uu, K_uu = M[:N, :N], A[N:, :N]  # mass and stiffness blocks of the augmented system
-V = np.gradient(traj, ts, axis=0)  # velocity ~ d/dt of the displacement history
+M_full, A_full = dense(fem.M), dense(fem.operator.A)
+M_uu, K_uu = M_full[:N, :N], A_full[N:, :N]  # mass and stiffness blocks of the augmented system
 energy = 0.5 * np.einsum("ti,ij,tj->t", V, M_uu, V) + 0.5 * np.einsum("ti,ij,tj->t", traj, K_uu, traj)
 amp = np.linalg.norm(traj[-1]) / np.linalg.norm(traj[0])
 
