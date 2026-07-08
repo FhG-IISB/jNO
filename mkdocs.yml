@@ -11,7 +11,6 @@ theme:
   logo: assets/logo.svg
   favicon: assets/favicon.svg
   features:
-    - navigation.expand   # auto-expand nav sections (incl. Tutorials)
     - navigation.top
 
 plugins:
