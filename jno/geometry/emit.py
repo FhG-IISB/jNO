@@ -101,42 +101,81 @@ def _has_full_revolve(node) -> bool:
     return False
 
 
-def _apply_size_fields(dim: int, leaves, labels: Dict[int, Tuple[int, str]]) -> Optional[float]:
-    """Per-shape size -> gmsh Distance+Threshold fields, combined via Min. Returns ``ds``.
+def _plan_sizes(shape):
+    """Every ``size`` attached anywhere in the plan (dedup by identity)."""
+    seen, out = set(), []
 
-    A leaf's ``size`` sizes the mesh near the boundary it owns (kept region *or* the arc a
-    subtracted disk carves). Callable sizes are deferred; scalars only for now.
+    def walk(sh):
+        s = sh._size
+        if s is not None and id(s) not in seen:
+            seen.add(id(s))
+            out.append(s)
+        node = sh._node
+        kind = node[0]
+        if kind in ("cut", "fuse", "inter"):
+            walk(node[1])
+            walk(node[2])
+        elif kind in ("extrude", "revolve", "translate", "rotate", "fillet", "sweep"):
+            walk(node[1])
+
+    walk(shape)
+    return out
+
+
+def _apply_size_fields(dim: int, leaves, labels: Dict[int, Tuple[int, str]], shape) -> Optional[float]:
+    """Turn per-shape ``size`` into gmsh mesh-size controls. Returns a representative ``ds``.
+
+    Three kinds compose: a **scalar on a primitive** -> a Distance+Threshold field that refines the
+    band around that shape's boundary; a **callable ``f(x,y,z)``** anywhere -> a ``setSizeCallback``
+    that refines by position (the general 'denser here' knob); a **scalar on the whole shape**
+    (``(a-b).sized(0.05)``) -> a global size cap. All combine via ``min``.
     """
     import gmsh
 
-    sized = [(key, s) for _prim, s, key in leaves if isinstance(s, (int, float))]
-    if not sized:
-        return None
-    background = max(s for _k, s in sized)
     field = gmsh.model.mesh.field
-    key_prop = "CurvesList" if dim == 2 else "SurfacesList"
+    sized = [(key, s) for _prim, s, key in leaves if isinstance(s, (int, float))]
     thresholds: List[int] = []
-    for key, s in sized:
-        ents = [float(tag) for tag, (k, _n) in labels.items() if k == key]
-        if not ents:
-            continue
-        dist = field.add("Distance")
-        field.setNumbers(dist, key_prop, ents)
-        th = field.add("Threshold")
-        field.setNumber(th, "InField", dist)
-        field.setNumber(th, "SizeMin", float(s))
-        field.setNumber(th, "SizeMax", float(background))
-        field.setNumber(th, "DistMin", float(s))
-        field.setNumber(th, "DistMax", float(10.0 * s))
-        thresholds.append(th)
-    if thresholds:
-        mn = field.add("Min")
-        field.setNumbers(mn, "FieldsList", [float(t) for t in thresholds])
-        field.setAsBackgroundMesh(mn)
+    if sized:
+        background = max(s for _k, s in sized)
+        key_prop = "CurvesList" if dim == 2 else "SurfacesList"
+        for key, s in sized:
+            ents = [float(tag) for tag, (k, _n) in labels.items() if k == key]
+            if not ents:
+                continue
+            dist = field.add("Distance")
+            field.setNumbers(dist, key_prop, ents)
+            th = field.add("Threshold")
+            field.setNumber(th, "InField", dist)
+            field.setNumber(th, "SizeMin", float(s))
+            field.setNumber(th, "SizeMax", float(background))
+            field.setNumber(th, "DistMin", float(s))
+            field.setNumber(th, "DistMax", float(10.0 * s))
+            thresholds.append(th)
+        if thresholds:
+            mn = field.add("Min")
+            field.setNumbers(mn, "FieldsList", [float(t) for t in thresholds])
+            field.setAsBackgroundMesh(mn)
+
+    callables = [s for s in _plan_sizes(shape) if callable(s)]
+    if callables:
+        fns = tuple(callables)
+
+        def _size_cb(cdim, ctag, x, y, z, lc, _fns=fns):
+            return float(min([lc] + [float(f(x, y, z)) for f in _fns]))
+
+        gmsh.model.mesh.setSizeCallback(_size_cb)
+
+    top = shape._size if isinstance(shape._size, (int, float)) else None
+    if top is not None:
+        gmsh.option.setNumber("Mesh.MeshSizeMax", float(top))
+
+    if thresholds or callables or top is not None:
         gmsh.option.setNumber("Mesh.MeshSizeExtendFromBoundary", 0)
         gmsh.option.setNumber("Mesh.MeshSizeFromPoints", 0)
         gmsh.option.setNumber("Mesh.MeshSizeFromCurvature", 0)
-    return float(min(s for _k, s in sized))
+
+    scalars = [s for _k, s in sized] + ([top] if top is not None else [])
+    return float(min(scalars)) if scalars else None
 
 
 def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]]):
@@ -197,7 +236,7 @@ def _build_once(shape, split_full):
         dim = shape.dim
         leaves = shape.leaves()
         labels = classify_boundary(dim, shape)
-        ds = _apply_size_fields(dim, leaves, labels)
+        ds = _apply_size_fields(dim, leaves, labels, shape)
         gmsh.model.mesh.generate(dim)
         mesh = _to_meshio(dim, labels)
         return mesh, dim, ds

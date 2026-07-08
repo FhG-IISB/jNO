@@ -359,3 +359,26 @@ def test_tag_facet_predicate_normal_name_and_backcompat():
 
     d.tag("plain", lambda x, y, z: x < 0.1)  # classic coord predicate still routes the old way
     assert "plain" in d.avaiable_mesh_tags
+
+
+# ---------------------------------------------------------------- mesh-size control
+def test_size_callable_grades_by_position():
+    """A callable size f(x,y,z) refines by position (denser where it is smaller)."""
+    graded = (Shape.rect(0, 0, 4, 1) - Shape.disk(2, 1, 0.4)).extrude(0.6).sized(lambda x, y, z: 0.03 + 0.12 * x)
+    mesh, _dim, _ds = graded.build()
+    cells = np.asarray(mesh.cells[0].data)
+    cx = mesh.points[cells].mean(1)[:, 0]
+
+    def mean_edge(sub):
+        return float(np.linalg.norm(mesh.points[sub[:, 0]] - mesh.points[sub[:, 1]], axis=1).mean())
+
+    assert mean_edge(cells[cx < 1]) < 0.5 * mean_edge(cells[cx > 3])  # left (small size) clearly denser
+
+
+def test_size_scalar_on_composite_caps_globally():
+    """.sized(scalar) on a composite sets a global size cap (denser than the default)."""
+    base = (Shape.rect(0, 0, 4, 1) - Shape.disk(2, 1, 0.4)).extrude(0.6)
+    capped = (Shape.rect(0, 0, 4, 1) - Shape.disk(2, 1, 0.4)).sized(0.15).extrude(0.6)
+    n0 = base.build()[0].cells[0].data.shape[0]
+    mesh1, _dim, ds = capped.build()
+    assert ds == 0.15 and mesh1.cells[0].data.shape[0] > 3 * n0

@@ -94,6 +94,20 @@ The second form selects **boundary facets** by position, orientation, and existi
 and exclusion in one predicate. `n` is the outward normal (boundary only), `name` each facet's
 current region.
 
+### Mesh density
+
+Control element size by attaching `size=` to a shape — gmsh's mesh-size fields do the work
+(a Distance+Threshold field near a shape, a size callback for `f(x,y,z)`), combined by `min`:
+
+```python
+Shape.disk(2, 1, 0.4, size=0.02)               # fine in the band around this shape's boundary
+(strip - roll).sized(0.05)                      # a global size cap for the whole shape
+solid.sized(lambda x, y, z: 0.03 + 0.10 * y)    # graded: denser where the function is smaller
+```
+
+So "denser in a region" = give a small `size=` to the shape covering it, or a callable that is small
+there.
+
 ---
 
 ## Worked examples
