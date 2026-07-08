@@ -1,18 +1,17 @@
-"""02 — 2-D variable-coefficient Poisson  (shapely domain + named partials + tracker)"""
+"""02 — 2-D variable-coefficient Poisson  (Shape domain + named partials + tracker)"""
 
 from pathlib import Path
 
 import foundax
 import jax
 import optax
-from shapely.geometry import box
 
 import jno
 
 π = jno.np.pi
 
 # --8<-- [start:setup]
-domain = jno.domain(box(0, 0, 1, 1), mesh_size=0.05)
+domain = jno.domain(jno.Shape.rect(0, 0, 1, 1, size=0.05))
 x, y, _ = domain.variable("interior")
 
 κ = 1 + x + y

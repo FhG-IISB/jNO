@@ -38,7 +38,6 @@ from pathlib import Path  # noqa: E402
 import matplotlib.pyplot as plt  # noqa: E402
 import matplotlib.tri as mtri  # noqa: E402
 import numpy as np  # noqa: E402
-from shapely.geometry import box  # noqa: E402
 
 import jno  # noqa: E402
 
@@ -50,7 +49,7 @@ k2 = KR + 1j * KI  # the complex coefficient, written as a plain Python complex
 E_r = lambda X, Y: (pi * sin(pi * X) * cos(pi * Y), -pi * cos(pi * X) * sin(pi * Y))  # noqa: E731
 E_i = lambda X, Y: (2 * pi * sin(2 * pi * X) * cos(2 * pi * Y), -2 * pi * cos(2 * pi * X) * sin(2 * pi * Y))  # noqa: E731
 
-d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06)
+d = jno.domain(jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.06))
 E, v = d.fem_symbols(value_shape=(2,), names=("E", "v"), order=2, complex=True)  # a P2 COMPLEX vector field + its test
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)

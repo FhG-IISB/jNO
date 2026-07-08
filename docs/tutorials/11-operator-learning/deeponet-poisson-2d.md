@@ -21,7 +21,7 @@ Multiplying a domain by an integer `B` replicates it across `B` independent samp
 
 ```python
 N_SAMPLES = 500
-dom = N_SAMPLES * jno.domain.rect(mesh_size=0.05, x_range=(0, 2), y_range=(0, 1))
+dom = N_SAMPLES * jno.domain(jno.Shape.rect(0, 0, 2, 1, size=0.05))
 x, y, _ = dom.variable("interior")
 
 k_values = jax.random.uniform(jax.random.PRNGKey(0), shape=(N_SAMPLES, 1, 1), minval=0.5, maxval=1.5)

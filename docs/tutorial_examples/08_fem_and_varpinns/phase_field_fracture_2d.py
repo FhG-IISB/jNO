@@ -43,7 +43,6 @@ import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import matplotlib.tri as mtri
 import numpy as np
-from shapely.geometry import box
 
 import jno
 
@@ -57,7 +56,7 @@ lam, mu = E * nu / ((1 + nu) * (1 - 2 * nu)), E / (2 * (1 + nu))
 Gc, ell, eta = 2.0e-3, 0.08, 1e-3
 h = 0.04
 
-d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=h)
+d = jno.domain(jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=h))
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("bottom", split=True)
 xt, yt, _ = d.variable("top", split=True)

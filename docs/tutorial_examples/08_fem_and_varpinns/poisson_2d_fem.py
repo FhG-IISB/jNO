@@ -13,13 +13,12 @@ SPD system: ``fem.solve(linear=jno.solve.cg(), precond=jno.precond.jacobi())`` -
 
 import jax.numpy as jnp
 import numpy as np
-from shapely.geometry import box
 
 import jno
 
 exact = lambda x, y: x * (1 - x) * y * (1 - y)  # noqa: E731
 
-d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.18)
+d = jno.domain(jno.Shape.rect(0, 0, 1, 1, size=0.18))
 u, phi = d.fem_symbols()
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)

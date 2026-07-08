@@ -159,7 +159,9 @@ d = jno.domain("part.msh")     # .msh / .vtk / .med … built anywhere (gmsh, CA
 d = jno.domain.from_array({"interior": interior_coords, "boundary": boundary_coords})
 ```
 
-Shapely geometries and vertex lists are also accepted (`jno.domain(box(...))`); see the shapely docs.
+**Shorthand constructors** for simple axis-aligned domains — including **1-D**, which `Shape`
+doesn't cover: `jno.domain.line(...)`, `jno.domain.rect(...)`, `jno.domain.cube(...)`. (Shapely
+geometries and vertex lists are also still accepted.)
 
 ---
 
