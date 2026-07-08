@@ -1,579 +1,164 @@
 # Domain & Geometry
 
-The `jno.domain` class manages mesh generation, physical group labelling, and sampling of collocation points. It wraps [pygmsh](https://github.com/nschloe/pygmsh) for mesh generation and [meshio](https://github.com/nschloe/meshio) for I/O.
-
----
-
-## Domain Gallery
-
-16 meshed domains illustrating the full range of `jno.domain` construction paths — 12 two-dimensional and 4 three-dimensional. Coloured fills show interior sub-regions (`variable("interior_<name>")`); coloured edges/faces show boundary segments (`variable("boundary_<name>")`).
-
-![Domain gallery — 16 meshed domains (12 × 2-D, 4 × 3-D)](assets/domain_showcase.png)
-
-=== "1 · Rectangle with 3 holes"
-
-    ```python
-    from shapely.geometry import box, Point
-    geo = box(0, 0, 3, 1.5)
-    geo = geo.difference(Point(0.5, 0.75).buffer(0.22))
-    geo = geo.difference(Point(1.5, 0.38).buffer(0.18))
-    geo = geo.difference(Point(2.45, 1.1).buffer(0.28))
-    dom = jno.domain(geo).build_mesh(0.07)
-    x, y = dom.variable("interior")
-    xb, yb = dom.variable("boundary")
-    ```
-
-=== "2 · Crescent (lune)"
-
-    ```python
-    from shapely.geometry import Point
-    big   = Point(0, 0).buffer(1.0, resolution=80)
-    small = Point(0.42, 0.18).buffer(0.75, resolution=80)
-    dom = jno.domain(big.difference(small)).build_mesh(0.05)
-    ```
-
-=== "3 · Wavy channel"
-
-    ```python
-    import numpy as np
-    from shapely.geometry import Polygon
-    x = np.linspace(0, 4 * np.pi, 120)
-    top = list(zip(x,        0.55 + 0.22 * np.sin(x)))
-    bot = list(zip(x[::-1], -0.55 + 0.22 * np.sin(x[::-1] + np.pi / 2.5)))
-    dom = jno.domain(Polygon(top + bot), mesh_size=0.12)
-    ```
-
-=== "4 · 8-pointed star"
-
-    ```python
-    import numpy as np
-    from shapely.geometry import Polygon
-    n = 8
-    angles = np.linspace(0, 2 * np.pi, 2 * n, endpoint=False)
-    radii  = [1.0 if i % 2 == 0 else 0.45 for i in range(2 * n)]
-    pts    = [(r * np.cos(a), r * np.sin(a)) for r, a in zip(radii, angles)]
-    dom = jno.domain(Polygon(pts)).build_mesh(0.06)
-    ```
-
-=== "5 · Three-region pipe"
-
-    ```python
-    from shapely.geometry import box
-    dom = jno.domain({
-        "inlet":  box(0.0, 0.15, 0.8, 0.85),
-        "pipe":   box(0.8, 0.35, 2.2, 0.65),
-        "outlet": box(2.2, 0.05, 3.0, 0.95),
-    }).build_mesh(0.08, sizes={"pipe": 0.025})
-    x_in, y_in = dom.variable("interior_inlet")
-    x_p,  y_p  = dom.variable("interior_pipe")
-    x_out,y_out = dom.variable("interior_outlet")
-    xb_in, yb_in = dom.variable("boundary_inlet")    # inlet face
-    xb_out,yb_out = dom.variable("boundary_outlet")  # outlet face
-    ```
-
-=== "6 · T-junction"
-
-    ```python
-    from shapely.geometry import box
-    dom = jno.domain({
-        "stem": box(0.38, 0.00, 0.62, 0.82),
-        "bar":  box(0.00, 0.82, 1.00, 1.06),
-    }).build_mesh(0.05)
-    x_stem, y_stem = dom.variable("interior_stem")
-    x_bar,  y_bar  = dom.variable("interior_bar")
-    ```
-
-=== "7 · Concentric solid / fluid / wall"
-
-    ```python
-    from shapely.geometry import box, Point
-    solid = Point(0, 0).buffer(0.22, resolution=40)
-    fluid = Point(0, 0).buffer(0.52, resolution=64).difference(solid)
-    wall  = box(-0.78, -0.78, 0.78, 0.78).difference(
-                Point(0, 0).buffer(0.52, resolution=64))
-    dom = jno.domain(
-        {"solid": solid, "fluid": fluid, "wall": wall}
-    ).build_mesh(0.07, sizes={"solid": 0.015, "fluid": 0.025})
-    x_s, y_s = dom.variable("interior_solid")
-    x_f, y_f = dom.variable("interior_fluid")
-    x_w, y_w = dom.variable("interior_wall")
-    xb, yb   = dom.variable("boundary_wall")   # outer square boundary
-    ```
-
-=== "8 · Named CSG arithmetic"
-
-    ```python
-    from shapely.geometry import box
-    left  = jno.domain(box(0, 0, 0.5, 1), name="left")
-    right = jno.domain(box(0.5, 0, 1, 1), name="right")
-    dom   = (left + right).build_mesh(0.05)
-    x_l, y_l = dom.variable("interior_left")
-    x_r, y_r = dom.variable("interior_right")
-    xb_l, yb_l = dom.variable("boundary_left")
-    xb_r, yb_r = dom.variable("boundary_right")
-    ```
-
-=== "9 · Annular sector"
-
-    ```python
-    from shapely.geometry import box, Point
-    first_q = box(0, 0, 1.05, 1.05)
-    sector  = Point(0, 0).buffer(1.0, resolution=80).intersection(first_q)
-    inner   = Point(0, 0).buffer(0.38, resolution=40)
-    dom = jno.domain(sector.difference(inner)).build_mesh(0.05)
-    ```
-
-=== "10 · Horseshoe (C-shape)"
-
-    ```python
-    from shapely.geometry import box, Point
-    outer = Point(0, 0).buffer(1.0, resolution=80)
-    inner = Point(0, 0).buffer(0.52, resolution=80)
-    clip  = box(-1.1, -1.1, 1.1, 0.08)
-    dom = jno.domain(outer.difference(inner).difference(clip)).build_mesh(0.05)
-    ```
-
-=== "11 · Gear (8 notches + hub)"
-
-    ```python
-    import numpy as np
-    from shapely.geometry import Point
-    gear = Point(0, 0).buffer(1.0, resolution=128)
-    for i in range(8):
-        a = 2 * np.pi * i / 8
-        gear = gear.difference(
-            Point(np.cos(a) * 0.80, np.sin(a) * 0.80).buffer(0.23, resolution=12))
-    gear = gear.difference(Point(0, 0).buffer(0.22, resolution=48))
-    dom = jno.domain(gear).build_mesh(0.05)
-    ```
-
-=== "12 · L-shape (vertex list)"
-
-    ```python
-    dom = jno.domain(
-        [[0,0],[2,0],[2,1],[1,1],[1,2],[0,2]]
-    ).build_mesh(0.07)
-    x, y = dom.variable("interior")
-    xb, yb, nx, ny = dom.variable("boundary", normals=True, split=True)
-    ```
-
-=== "13 · 3-D Torus"
-
-    ```python
-    import gmsh, meshio, os, tempfile
-
-    def constructor(geo):
-        # geo is a pygmsh.geo.Geometry — gmsh is already initialised.
-        # We use the OCC kernel directly and return a meshio.Mesh so that
-        # jno bypasses geo.generate_mesh() entirely.
-        gmsh.option.setNumber("Mesh.CharacteristicLengthMax", 0.12)
-        gmsh.model.occ.addTorus(0, 0, 0, 1.0, 0.35)   # major r=1.0, tube r=0.35
-        gmsh.model.occ.synchronize()
-        vols  = [t for _, t in gmsh.model.getEntities(3)]
-        surfs = [t for _, t in gmsh.model.getEntities(2)]
-        gmsh.model.addPhysicalGroup(3, vols, name="interior")
-        gmsh.model.addPhysicalGroup(2, surfs, name="boundary")
-        gmsh.model.mesh.generate(3)
-        with tempfile.NamedTemporaryFile(suffix=".msh", delete=False) as f:
-            fname = f.name
-        gmsh.write(fname)
-        mesh = meshio.read(fname); os.unlink(fname)
-        return mesh, 3, 0.12
-
-    dom = jno.domain(constructor=constructor)
-    x, y, z = dom.variable("interior")
-    xb, yb, zb = dom.variable("boundary")
-    ```
-
-=== "14 · 3-D Sphere with 3 bores"
-
-    ```python
-    import gmsh, meshio, os, tempfile
-
-    def constructor(geo):
-        gmsh.option.setNumber("Mesh.CharacteristicLengthMax", 0.09)
-        s = gmsh.model.occ.addSphere(0, 0, 0, 1.0)
-        cuts = []
-        for dx, dy, dz in [(2.2, 0, 0), (0, 2.2, 0), (0, 0, 2.2)]:
-            cuts.append((3, gmsh.model.occ.addCylinder(
-                -dx/2, -dy/2, -dz/2, dx, dy, dz, 0.28)))
-        gmsh.model.occ.cut([(3, s)], cuts)
-        gmsh.model.occ.synchronize()
-        vols  = [t for _, t in gmsh.model.getEntities(3)]
-        surfs = [t for _, t in gmsh.model.getEntities(2)]
-        gmsh.model.addPhysicalGroup(3, vols, name="interior")
-        gmsh.model.addPhysicalGroup(2, surfs, name="boundary")
-        gmsh.model.mesh.generate(3)
-        with tempfile.NamedTemporaryFile(suffix=".msh", delete=False) as f:
-            fname = f.name
-        gmsh.write(fname)
-        mesh = meshio.read(fname); os.unlink(fname)
-        return mesh, 3, 0.09
-
-    dom = jno.domain(constructor=constructor)
-    x, y, z = dom.variable("interior")
-    xb, yb, zb = dom.variable("boundary")
-    ```
-
-=== "15 · 3-D 4-way pipe junction"
-
-    ```python
-    import gmsh, meshio, numpy as np, os, tempfile
-
-    def constructor(geo):
-        gmsh.option.setNumber("Mesh.CharacteristicLengthMax", 0.09)
-        s = gmsh.model.occ.addSphere(0, 0, 0, 0.38)
-        pieces = [(3, s)]
-        for i in range(3):                        # 3 horizontal arms at 120°
-            angle = 2 * np.pi * i / 3
-            dx, dy = 0.90 * np.cos(angle), 0.90 * np.sin(angle)
-            pieces.append((3, gmsh.model.occ.addCylinder(0, 0, 0, dx, dy, 0, 0.24)))
-        pieces.append((3, gmsh.model.occ.addCylinder(0, 0, 0, 0, 0, 1.0, 0.24)))
-        gmsh.model.occ.fuse([pieces[0]], pieces[1:])
-        gmsh.model.occ.synchronize()
-        vols  = [t for _, t in gmsh.model.getEntities(3)]
-        surfs = [t for _, t in gmsh.model.getEntities(2)]
-        gmsh.model.addPhysicalGroup(3, vols, name="interior")
-        gmsh.model.addPhysicalGroup(2, surfs, name="boundary")
-        gmsh.model.mesh.generate(3)
-        with tempfile.NamedTemporaryFile(suffix=".msh", delete=False) as f:
-            fname = f.name
-        gmsh.write(fname)
-        mesh = meshio.read(fname); os.unlink(fname)
-        return mesh, 3, 0.09
-
-    dom = jno.domain(constructor=constructor)
-    x, y, z = dom.variable("interior")
-    xb, yb, zb = dom.variable("boundary")
-    ```
-
-=== "16 · 3-D Octahedral molecule"
-
-    ```python
-    import gmsh, meshio, os, tempfile
-
-    def constructor(geo):
-        gmsh.option.setNumber("Mesh.CharacteristicLengthMax", 0.10)
-        s0 = gmsh.model.occ.addSphere(0, 0, 0, 0.42)
-        pieces = [(3, s0)]
-        for pos in [(0.75,0,0),(-0.75,0,0),(0,0.75,0),(0,-0.75,0),(0,0,0.75),(0,0,-0.75)]:
-            pieces.append((3, gmsh.model.occ.addSphere(*pos, 0.28)))
-        gmsh.model.occ.fuse([pieces[0]], pieces[1:])
-        gmsh.model.occ.synchronize()
-        vols  = [t for _, t in gmsh.model.getEntities(3)]
-        surfs = [t for _, t in gmsh.model.getEntities(2)]
-        gmsh.model.addPhysicalGroup(3, vols, name="interior")
-        gmsh.model.addPhysicalGroup(2, surfs, name="boundary")
-        gmsh.model.mesh.generate(3)
-        with tempfile.NamedTemporaryFile(suffix=".msh", delete=False) as f:
-            fname = f.name
-        gmsh.write(fname)
-        mesh = meshio.read(fname); os.unlink(fname)
-        return mesh, 3, 0.10
-
-    dom = jno.domain(constructor=constructor)
-    x, y, z = dom.variable("interior")
-    xb, yb, zb = dom.variable("boundary")
-    ```
-
----
-
-## Constructing a domain
-
-For **2-D problems**, the recommended path is `jno.domain(geo)` — define your geometry with [shapely](https://shapely.readthedocs.io/) CSG arithmetic, call `.build_mesh()`, and you have a fully meshed domain that supports `.integrate()` and FD derivatives. For **3-D geometry**, PML absorbing layers, or cases that need raw gmsh control, use a [built-in named constructor](#2-built-in-named-constructors) or a [custom constructor](#3-custom-constructor-advanced-3-d) instead.
-
-### 1. `jno.domain` — shapely → gmsh (2-D, recommended)
-
-#### Basic usage
-
-Pass any shapely geometry as the first argument. Two auto-generated tags are always available: `"interior"` (all interior points) and `"boundary"` (the outer boundary):
+`jno.domain` holds a meshed geometry, its named regions, and the collocation points sampled on
+them. Build the geometry with the **`Shape`** DSL (gmsh-OpenCASCADE), load a mesh file, or pass a
+point cloud.
 
 ```python
 import jno
-from shapely.geometry import box, Point
+from jno import Shape
 
-geo = box(0, 0, 2, 1).difference(Point(1, 0.5).buffer(0.3))
-dom = jno.domain(geo).mesh(0.05)
+solid = (Shape.rect(0, 0, 4, 1) - Shape.disk(2, 1, 0.4)).extrude(0.6)   # a strip under a roll
+d = jno.domain(solid)
 
-x, y   = dom.variable("interior")
-xb, yb, nx, ny = dom.variable("boundary", normals=True, split=True)
+x, y, z, t = d.variable("interior")                                     # coords (+ a trailing time coord t)
+xb, yb, zb, tb, nx, ny, nz = d.variable("top", normals=True, split=True)  # a named boundary + outward normals
 ```
 
-For a simple polygon, pass a vertex list directly — no shapely import needed:
+---
 
-```python
-dom = jno.domain([[0,0],[1,0],[1,0.5],[0.5,1],[0,1]]).mesh(0.05)
-```
+## The `Shape` DSL
 
-Add `mesh_size=` for a one-liner when no per-region refinement is needed:
+A `Shape` is an immutable build-plan: make **primitives**, combine them with **boolean operators**,
+reshape with **transforms**, then hand the result to `jno.domain`. Every call returns a new shape.
 
-```python
-dom = jno.domain(geo, mesh_size=0.05)
-```
+### Primitives
 
-#### CSG arithmetic and named regions
+Each takes an optional `size=` (target element size near it).
 
-When you construct each piece as a named region, jno tracks the names through arithmetic. That lets you sample sub-regions by name and refine each independently at mesh time — which is not possible if you compose everything in shapely first and pass a single anonymous geometry.
-
-Pass a `dict` of named regions directly, or use `name=` when building a single piece:
-
-```python
-from shapely.geometry import box, Point
-
-fluid_geo = box(0, 0, 1, 1).difference(Point(0.5, 0.5).buffer(0.2))
-solid_geo = Point(0.5, 0.5).buffer(0.2)
-
-dom = jno.domain({
-    "fluid": fluid_geo,
-    "solid": solid_geo,
-}).build_mesh(0.08, sizes={"solid": 0.01})
-
-x_f, y_f = dom.variable("interior_fluid")      # fluid sub-region only
-x_s, y_s = dom.variable("interior_solid")      # solid sub-region only
-xb, yb   = dom.variable("boundary_solid")      # fluid-solid interface
-```
-
-You can also apply CSG operators directly on `jno.domain` instances — the source-region registry is merged and preserved on every operation:
-
-| Operator | Method | Effect |
-|---|---|---|
-| `a + b` or `a \| b` | `.union(b)` | union |
-| `a - b` | `.difference(b)` | A minus B |
-| `a & b` | `.intersection(b)` | overlap only |
-| `a ^ b` | `.symmetric_difference(b)` | XOR |
-
-```python
-left  = jno.domain(box(0, 0, 0.5, 1), name="left")
-right = jno.domain(box(0.5, 0, 1, 1), name="right")
-
-dom = (left + right).build_mesh(0.05)
-x_l, y_l = dom.variable("interior_left")
-x_r, y_r = dom.variable("interior_right")
-```
-
-Auto-generated tags for a domain with named regions:
-
-| Tag | Contents |
+| Primitive | Auto-named boundaries |
 |---|---|
-| `"interior"` | all interior points |
-| `"boundary"` | full outer boundary |
-| `"interior_<name>"` | interior of the named sub-region |
-| `"boundary_<name>"` | edges of the named sub-region |
+| `Shape.rect(x0, y0, x1, y1)` | `left` `right` `top` `bottom` |
+| `Shape.disk(cx, cy, r)` | `arc` |
+| `Shape.polygon(points)` | `e0 e1 … eN` (one per edge) |
+| `Shape.box(x0, y0, z0, x1, y1, z1)` | `left right top bottom front back` |
+| `Shape.cylinder(x, y, z, dx, dy, dz, r)` | `side` `top` `bottom` (any axis) |
+| `Shape.sphere(cx, cy, cz, r)` | `surface` |
+| `Path(…).face()` | per-segment (see [Contours](#contours-with-arcs)) |
 
-For explicit BC surfaces (e.g. an inlet face that is a subset of a boundary), use `.add_boundary_segments(tag, segments)` to register a named edge set.
+`interior` (the area/volume) and `boundary` (all of it) are always present.
 
-`build_mesh` accepts `sizes={"name": h}` as a short spelling of `region_mesh_sizes=`.
-
-Interfaces between named regions are meshed **conformingly**: the two regions sharing an interface always get the same nodes along it (a shared, constrained edge), so heat, flux, and radiation pass across the interface and `boundary_<name>` picks up a single well-defined edge. This holds even when one region (e.g. a complement region such as a meshed gas/air gap built as box-minus-everything) describes the shared edge with extra vertices the neighbour lacks.
-
-#### Custom samplers (mesh-free path only)
-
-When `build_mesh()` is **not** called, interior points are drawn by uniform rejection sampling inside each polygon. Pass a callable to override this per region or globally. The sampler signature is `fn(geometry, n) -> np.ndarray` with shape `(n, 2)`.
+### Combine
 
 ```python
-import numpy as np
-from shapely.geometry import box
-
-def grid_sampler(geometry, n):
-    """Uniform grid instead of random points."""
-    minx, miny, maxx, maxy = geometry.bounds
-    side = int(np.ceil(np.sqrt(n)))
-    xs = np.linspace(minx, maxx, side)
-    ys = np.linspace(miny, maxy, side)
-    xx, yy = np.meshgrid(xs, ys)
-    pts = np.column_stack([xx.ravel(), yy.ravel()])
-    # filter to inside and return exactly n
-    from shapely import contains_xy
-    mask = contains_xy(geometry, pts[:, 0], pts[:, 1])
-    return pts[mask][:n]
-
-# Single-region: sampler= applies to all interior tags
-dom = jno.domain(box(0, 0, 1, 1), sampler=grid_sampler)
-x, y, _ = dom.variable("interior", (256, None))
-
-# Multi-region: samplers= sets a different strategy per named region
-dom = jno.domain({
-    "fluid": box(0, 0, 1, 1).difference(box(0.3, 0.3, 0.7, 0.7)),
-    "solid": box(0.3, 0.3, 0.7, 0.7),
-}, samplers={"solid": grid_sampler})   # fluid uses the default, solid uses grid
+a - b     # cut         a | b     # fuse         a & b     # intersect
 ```
 
-You can also override the sampler for a single `variable()` call:
-```python
-x, y, _ = dom.variable("interior_solid", (256, grid_sampler))
-```
+### Transforms
 
-### 2. Built-in named constructors
+| Transform | Meaning |
+|---|---|
+| `.extrude(h)` | sweep a 2-D shape straight up into 3-D |
+| `.revolve(axis_point, axis_dir, angle=2π)` | rotate a 2-D profile about an axis (x- or y-axis through the origin); a partial angle gives a wedge/half-donut |
+| `.sweep(path)` | sweep a 2-D profile along a smooth `Path` (bent pipe) |
+| `.array(n, step=v)` / `.array(n, about=(pt, dir), angle=2π)` | `n` fused copies — linear or polar |
+| `.translate(v)` · `.rotate(axis_point, axis_dir, angle)` | place/orient (names are preserved) |
+| `.fillet(radius, where=None)` | round edges; `where=f(x,y,z)` selects them by midpoint |
+| `.sized(size)` | set the target mesh size (scalar or `f(x,y,z)`) |
 
-For standard shapes, jno ships named constructors under `jno.domain.*`. Pass one to `jno.domain(constructor=...)` — this is the recommended route for 1-D problems, 3-D boxes, and PML layers:
+`extrude` is a special case of `sweep`; `revolve` is a distinct rotation. Mesh size lives on the
+**shape** it describes, not on `jno.domain`.
 
-```python
-dom = jno.domain(constructor=jno.domain.rect(x_range=(0,1), y_range=(0,1), mesh_size=0.05))
-```
+### Contours with arcs
 
-| Constructor | Dim | Signature | Physical groups |
-|---|---|---|---|
-| `line` | 1D | `line(x_range, mesh_size)` | `interior`, `left`, `right`, `boundary` |
-| `rect` | 2D | `rect(x_range, y_range, mesh_size)` | `interior`, `boundary`, `bottom`, `top`, `left`, `right` |
-| `equi_distant_rect` | 2D | `equi_distant_rect(x_range, y_range, nx, ny)` — structured | same as `rect` |
-| `disk` | 2D | `disk(center, radius, mesh_size, num_points)` | `interior`, `boundary` |
-| `l_shape` | 2D | `l_shape(size, mesh_size, separate_boundary=False)` | `interior`, `boundary` (+ per-side when `separate_boundary=True`) |
-| `rectangle_with_hole` | 2D | `rectangle_with_hole(outer_size, hole_size, mesh_size, ...)` | `interior`, `boundary`, hole sides |
-| `rectangle_with_holes` | 2D | `rectangle_with_holes(outer_size, holes=[{...}], mesh_size, ...)` | `interior`, `boundary`, `hole_boundary` (+ per-hole groups) |
-| `rect_pml` | 2D | `rect_pml(..., pml_thickness_top, pml_thickness_bottom)` | + `pml_top`, `pml_bottom` — wave-equation absorbing layers |
-| `cube` | 3D | `cube(x_range, y_range, z_range, mesh_size)` | `interior`, `boundary`, 6 face groups |
-
-Per-constructor quirks live in the docstrings — reach them with `help(jno.domain.rect_pml)` and friends.
-
-### 3. Custom constructor (advanced / 3-D)
-
-Pass any callable as `constructor=`. It is called with a `pygmsh.geo.Geometry` context object (`geo`) which has already called `gmsh.initialize()`.
-
-**2-D — pygmsh geo kernel** (points, lines, surfaces):
+`Path` chains `line_to`/`arc_to` segments (points are 3-D, `z` defaults to 0); `.face()` closes it
+into a 2-D shape. This is the general 2-D generator — a diameter plus a semicircular arc revolves
+into a sphere:
 
 ```python
-def my_geometry(mesh_size=0.1):
-    def constructor(geo):
-        p0 = geo.add_point([0, 0], mesh_size=mesh_size)
-        # ... add lines, surfaces, physical groups ...
-        geo.add_physical(surface, "interior")
-        geo.add_physical(lines, "boundary")
-        return geo, 2, mesh_size
-    return constructor
+from jno import Path
 
-dom = jno.domain(constructor=my_geometry(mesh_size=0.05))
-```
-
-**3-D — gmsh OCC kernel** (spheres, tori, boolean ops):
-
-Because `gmsh` is already initialised when the constructor runs, you can call `gmsh.model.occ.*` directly and return a `meshio.Mesh` — jno will use it as-is without re-meshing:
-
-```python
-import gmsh, meshio, os, tempfile
-
-def constructor(geo):
-    gmsh.option.setNumber("Mesh.CharacteristicLengthMax", 0.12)
-    gmsh.model.occ.addTorus(0, 0, 0, 1.0, 0.35)
-    gmsh.model.occ.synchronize()
-    vols  = [t for _, t in gmsh.model.getEntities(3)]
-    surfs = [t for _, t in gmsh.model.getEntities(2)]
-    gmsh.model.addPhysicalGroup(3, vols, name="interior")
-    gmsh.model.addPhysicalGroup(2, surfs, name="boundary")
-    gmsh.model.mesh.generate(3)
-    with tempfile.NamedTemporaryFile(suffix=".msh", delete=False) as f:
-        fname = f.name
-    gmsh.write(fname)
-    mesh = meshio.read(fname); os.unlink(fname)
-    return mesh, 3, 0.12
-
-dom = jno.domain(constructor=constructor)
-x, y, z = dom.variable("interior")
-xb, yb, zb = dom.variable("boundary")
-```
-
-Boolean operations (`cut`, `fuse`, `intersect`) work the same way — see the gallery tabs 13–16 for complete sphere-with-bores, pipe-junction, and molecule examples.
-
-### 4. Pre-meshed file
-
-Load a `.msh`, `.vtk`, `.med`, … file directly — physical groups become `.variable(tag)` keys:
-
-```python
-dom = jno.domain('./mesh.msh')
-```
-
-### 5. Point cloud — `jno.domain.from_array`
-
-When the points are already known (sensor coordinates, observation grids, externally generated meshes), skip geometry entirely:
-
-```python
-import numpy as np
-
-dom = jno.domain.from_array({"obs": sensor_coords})
-
-dom = jno.domain.from_array({
-    "interior_sensors": interior_coords,
-    "boundary_sensors": boundary_coords,
-})
-```
-
-**Trade-off:** no mesh, no `.integrate()`, no FD.
-
----
-
-## Sampling Variables
-
-```python
-from jax import numpy as jnp
-# Unpack spatial coordinates and (if time is set) a time variable
-x, y, t = domain.variable("interior")
-
-# Slice a specific coordinate range [0, None] means "all"
-x, y = domain.variable("interior", (None, None))
-
-# With boundary normals (outward unit normals at each boundary point)
-xb, yb, tb, nx, ny = domain.variable("boundary", normals=True, split=True)
-
-# With boundary normals AND view-factor matrix (for radiation problems)
-xb, yb, tb, nx, ny, VF = domain.variable("boundary", normals=True, view_factor=True)
-
-# Inject point data (sensor or observation locations)
-xs, ys = domain.variable("sensor", 0.5 * jnp.ones((2, 1, 2)), point_data=True, split=True)
-
-# Attach a tensor (e.g., spatially-varying PDE parameter, one row per batch sample)
-k = domain.variable("k", jnp.array([[1.0], [2.0], [3.0]]))  # (B, 1)
-```
-
----
-
-## Time-Dependent Problems
-
-```python
-domain = jno.domain(
-    constructor=jno.domain.rect(mesh_size=0.05),
-    time=(t_start, t_end, n_steps),
-)
-
-x, y, t   = domain.variable("interior")   # interior + time
-x0, y0, t0 = domain.variable("initial")   # initial slice (t=0)
-```
-
-The solver automatically uses `jax.lax.scan` over time steps.
-
----
-
-## Operator Learning (Multiple Batch Samples)
-
-Multiply a domain by an integer `B` to replicate it across `B` independent batch samples. This is the standard setup for learning a PDE solution operator over a family of parameters.
-
-```python
-domain = 40 * jno.domain(constructor=jno.domain.rect(mesh_size=0.05))
-
-# Attach B×4 parameter vectors
-theta = ...  # shape (B, 4)
-θ = domain.variable("θ", theta)
-```
-
----
-
-## Mesh Connectivity (for Finite Differences and Finite Elements)
-
-Some schemes (e.g., `scheme="finite_difference"` in `jnn.grad`) require mesh topology to be pre-processed. `jno.domain(geo).build_mesh()` does this automatically. For the pygmsh constructor path, pass `compute_mesh_connectivity=True` explicitly:
-
-```python
-domain = jno.domain(
-    constructor=jno.domain.rect(mesh_size=0.05),
-    compute_mesh_connectivity=True,
+sphere = (
+    Path(0, -1)
+    .line_to(0, 1, name="axis")            # the diameter, on the revolve axis
+    .arc_to(0, -1, through=(1, 0), name="dome")   # a semicircular arc (3-point arc)
+    .face()
+    .revolve((0, 0, 0), (0, 1, 0))         # -> a sphere; the "dome" arc names its surface
 )
 ```
 
----
+An open `Path` is instead a **sweep trajectory**. Segments may be `name=`'d as you draw them; the name
+flows onto the swept face. A sharp `line_to→line_to` corner is rejected (round it with `arc_to`).
 
-## Visualisation
+### Naming & selection
+
+Primitives auto-name their boundaries (table above); rename, merge, or carve regions afterwards with
+`d.tag`, which accepts:
 
 ```python
-jno.domain.rect(x_range=(0,1), y_range=(0,1), mesh_size=0.1) # Create a domain (e.g., rectangle)
-domain.variable("interior") # Set variables to trigger mesh generation
-domain.plot("domain.png")   # saves a figure with mesh, boundaries, and normals
+d.tag("inlet",  lambda x, y, z: x < 1e-6)                       # a coordinate predicate
+d.tag("outlet", lambda x, n, name: (n[:, 0] > 0.9) & (name != "left"))  # coords + outward normal + current name
 ```
 
+The second form selects **boundary facets** by position, orientation, and existing name — inclusion
+and exclusion in one predicate. `n` is the outward normal (boundary only), `name` each facet's
+current region.
 
+---
+
+## Worked examples
+
+=== "Bolt-circle plate"
+
+    ```python
+    holes = Shape.disk(3, 0, 0.3).array(6, about=((0, 0, 0), (0, 0, 1)))   # 6 holes in a ring
+    d = jno.domain((Shape.rect(-5, -5, 5, 5) - holes).extrude(0.4))
+    ```
+
+=== "Filleted, drilled bracket"
+
+    ```python
+    part = (Shape.box(0, 0, 0, 8, 4, 1) - Shape.cylinder(2, 2, -1, 0, 0, 3, 0.5)) \
+        .fillet(0.2, where=lambda x, y, z: z > 0.9)                          # round the top edges
+    d = jno.domain(part)
+    ```
+
+=== "Bent pipe (sweep)"
+
+    ```python
+    pipe = Shape.disk(0, 0, 0.4).sweep(Path(0, 0, 0).arc_to(2, 0, 2, through=(0.6, 0, 1.4)))
+    d = jno.domain(pipe)
+    ```
+
+=== "Graded roll-gap"
+
+    ```python
+    strip = Shape.rect(0, 0, 4, 1, size=0.1)          # coarse in the bulk
+    roll  = Shape.disk(2, 1, 0.4, size=0.02)          # fine near the contact arc
+    d = jno.domain((strip - roll).extrude(0.6))       # the carved arc is auto-named "arc"
+    xc, yc, zc, tc, nx, ny, nz = d.variable("arc", normals=True, split=True)   # contact points + normals
+    ```
+
+---
+
+## Other domain sources
+
+**Pre-meshed file** — physical-group names become region tags:
+
+```python
+d = jno.domain("part.msh")     # .msh / .vtk / .med … built anywhere (gmsh, CAD, …)
+```
+
+**Point cloud** — coordinates you already have (no mesh, so no `.integrate()`/FD):
+
+```python
+d = jno.domain.from_array({"interior": interior_coords, "boundary": boundary_coords})
+```
+
+Shapely geometries and vertex lists are also accepted (`jno.domain(box(...))`); see the shapely docs.
+
+---
+
+## Sampling, time, and batching
+
+```python
+x, y, z, t = d.variable("interior")                        # all interior mesh nodes
+x, y, z, t = d.variable("interior", sample=(500, None))    # 500 sampled points
+xb, yb, zb, tb, nx, ny, nz = d.variable("top", normals=True, split=True)   # boundary + outward normals
+```
+
+`variable` always returns a trailing time coordinate `t` (a constant for steady domains), so a 3-D
+domain unpacks as `(x, y, z, t)`. Time-dependent domains take `time=(t0, t1, n)`; `variable("initial")`
+is the `t=0` slice. Multiply a
+domain by an integer `B` (`B * jno.domain(...)`) to replicate it across `B` operator-learning samples.
+`d.plot("domain.png")` renders the mesh, regions, and normals.
