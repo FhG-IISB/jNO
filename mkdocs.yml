@@ -10,6 +10,9 @@ theme:
   name: material
   logo: assets/logo.svg
   favicon: assets/favicon.svg
+  features:
+    - navigation.expand   # auto-expand nav sections (incl. Tutorials)
+    - navigation.top
 
 plugins:
   - search
@@ -69,20 +72,22 @@ nav:
   - Home: index.md
   - Installation: Installation.md
   - Getting Started: Getting-Started.md
-  - API Reference: API.md
-  - Concepts: Glossary.md
   - Getting to Know jNO:
+    - Concepts: concepts.md
     - Domain and Geometry: Domain-and-Geometry.md
     - Operators:
       - Differential Operators: Differential-Operators.md
       - Integral Operators: operators/integral.md
       - jno.numpy Reference: operators/numpy-reference.md
-    - Hyperparameter Tuning: Hyperparameter-Tuning.md
     - Miscellaneous:
       - Overview: misc.md
       - Weights & Biases: misc/wandb.md
-  - Training:
+      - Glossary: Glossary.md
+      - Hyperparameter Tuning: Hyperparameter-Tuning.md
+      - Save, Load and Configuration: Save-Load-and-Configuration.md
+  - PINN & NN Training:
     - Overview: training/index.md
+    - Models: foundation_models/index.md
     - Schedules, Resampling & Callbacks:
       - Schedules: adaptive/schedules.md
       - Adaptive Resampling: adaptive/resampling.md
@@ -93,6 +98,7 @@ nav:
       - Evaluation: training/evaluation.md
       - Explainability: training/explainability.md
     - Bayesian Sampling: training/bayesian.md
+    - Inverse Problems: inverse-problems.md
     - Model Controls:
       - Overview: model-controls/index.md
       - Mask & Freeze: model-controls/mask-freeze.md
@@ -101,28 +107,23 @@ nav:
       - Initialize, Dtype & Tune: model-controls/initialize-dtype-tune.md
       - Diagnostics: model-controls/diagnostics.md
       - IREE Deployment: model-controls/iree.md
-  - Inverse Problems: inverse-problems.md
-  - Save, Load and Configuration: Save-Load-and-Configuration.md
-  - Finite Element Method: fem.md
-  - Foundation Models: foundation_models/index.md
+  - Traditional Solvers:
+    - Finite Element Method: fem.md
   - Tutorials:
-    - 01 Basics:
+    - PINN:
       - Laplace 1D: tutorials/01-basics/laplace-1d.md
-    - 02 Elliptic:
       - Variable-Coefficient Poisson 2D: tutorials/02-elliptic/variable-coefficient-poisson-2d.md
-    - 03 Parabolic:
       - Allen-Cahn 2D: tutorials/03-parabolic/allen-cahn-2d.md
-    - 04 Hyperbolic:
       - Burgers Viscous 1D: tutorials/04-hyperbolic/burgers-viscous-1d.md
-    - 05 Coupled and Inverse:
       - Inverse Parameter: tutorials/05-coupled-and-inverse/inverse-parameter.md
-    - 06 Integration:
       - Fredholm Integral Equation: tutorials/06-integration/fredholm-integral-equation.md
-    - 07 Analysis:
       - Gradient Conflict: tutorials/07-analysis/gradient-conflict.md
-    - 07 Stochastic:
       - Fokker-Planck 2D: tutorials/07-stochastic/fokker-planck-2d.md
-    - 08 Finite Element Method:
+    - Operator Learning:
+      - Overview: tutorials/11-operator-learning/index.md
+      - DeepONet — parametric Poisson 2D: tutorials/11-operator-learning/deeponet-poisson-2d.md
+      - FNO2D — supervised Poisson 2D: tutorials/11-operator-learning/fno-poisson-2d.md
+    - FEM:
       - Poisson 2D: tutorials/08-fem-and-varpinns/poisson-2d-fem.md
       - Variational PINN (Poisson): tutorials/08-fem-and-varpinns/vpinn-poisson-2d.md
       - Helmholtz + PML (complex): tutorials/08-fem-and-varpinns/helmholtz-pml-2d.md
@@ -134,10 +135,7 @@ nav:
       - Inverse Diffusivity Field: tutorials/08-fem-and-varpinns/inverse-diffusivity-field.md
       - Adaptive Mesh Refinement (L-shape): tutorials/08-fem-and-varpinns/adaptive-l-shape.md
       - 2D Maxwell (complex vector E): tutorials/08-fem-and-varpinns/maxwell-2d-vector.md
-    - 10 Bayesian PINNs:
+    - Bayesian:
       - Overview: tutorials/10-bayesian-pinns/index.md
       - Bayesian Inverse Coefficient: tutorials/10-bayesian-pinns/bayesian-inverse-coefficient.md
-    - 11 Operator Learning:
-      - Overview: tutorials/11-operator-learning/index.md
-      - DeepONet — parametric Poisson 2D: tutorials/11-operator-learning/deeponet-poisson-2d.md
-      - FNO2D — supervised Poisson 2D: tutorials/11-operator-learning/fno-poisson-2d.md
+  - API Reference: API.md
