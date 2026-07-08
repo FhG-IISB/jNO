@@ -50,7 +50,7 @@ Each status badge links to the tutorial (or, where no dedicated tutorial exists,
 | FEM / Variational PINNs | [✅ stable](tutorials/08-fem-and-varpinns/poisson-2d-fem.md) | Nodal TRI3 / TRI6 / QUAD4 weak-form assembly; **experimental** Raviart–Thomas / Nédélec edge elements ([H(div)/H(curl)](fem.md), 2-D) — see [known limitations](fem.md#known-limitations) |
 | Adaptive resampling (RAD, RARD, CR3, R3, pinnfluence) | [✅ stable](adaptive/resampling.md) | See [Adaptive Resampling](adaptive/resampling.md) |
 | Stochastic PDEs and noise nodes (gaussian / uniform / laplace) | [✅ stable](tutorials/07-stochastic/fokker-planck-2d.md) | Fokker–Planck, stochastic forcing |
-| Bayesian PINNs (NUTS, HMC, MALA, SGLD, SGHMC, VI) | [✅ stable](tutorials/10-bayesian-pinns/index.md) | 14 worked tutorials — see [Bayesian Sampling](training/bayesian.md) |
+| Bayesian PINNs (NUTS, HMC, MALA, SGLD, SGHMC, VI) | [✅ stable](tutorials/10-bayesian-pinns/index.md) | see [Bayesian Sampling](training/bayesian.md) |
 | Parameter-efficient fine-tuning (LoRA, DoRA, rsLoRA, PiSSA, VeRA, LoKr, OFT, IA3) | [✅ stable](model-controls/lora.md) | Chain `.lora(...)` on any wrapped model |
 | Training explainability (gradient conflict, NTK, Hessian, loss landscape, input sensitivity, residual stats) | [✅ stable](tutorials/07-analysis/gradient-conflict.md) | See [Explainability](training/explainability.md) |
 | Foundation-model integration ([foundax](https://github.com/FhG-IISB/foundax) MLPs, transformers, DeepONet, FNO, PROSE) | [✅ stable](foundation_models/index.md) | Wrap any Equinox module via `jno.nn.wrap(...)` |
@@ -58,7 +58,7 @@ Each status badge links to the tutorial (or, where no dedicated tutorial exists,
 | W&B logging + Orbax checkpointing | ✅ stable | |
 | IREE / MLIR compiled inference for deployment | [✅ stable](model-controls/iree.md) | |
 | Hyperparameter / architecture search | [🟡 beta](Hyperparameter-Tuning.md) | Grid + Nevergrad |
-| Multi-physics coupling | [🟡 beta](tutorials/08-fem-and-varpinns/rayleigh-benard-2d.md) | HyCo Poisson tutorial; broader patterns developing |
+| Multi-physics coupling | [✅ stable](tutorials/08-fem-and-varpinns/rayleigh-benard-2d.md) | Rayleigh–Bénard, Boussinesq, poroelastic — all via jno.fem |
 
 ---
 
