@@ -54,10 +54,11 @@
   margin-top: 0.8rem;
 }
 
-/* Wide layout: fill the viewport, narrow left nav, no content cap. */
+/* Cap the content width so pages keep a left/right margin on wide screens
+   (material auto-centres .md-grid), with a slightly narrower left nav. */
 @media screen and (min-width: 76.25em) {
   .md-grid {
-    max-width: 100%;
+    max-width: 72rem;
   }
 
   .md-sidebar--primary {
