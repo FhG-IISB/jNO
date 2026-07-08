@@ -190,3 +190,103 @@ class Sphere:
         if abs(math.sqrt((x - self.cx) ** 2 + (y - self.cy) ** 2 + (z - self.cz) ** 2) - self.r) < tol:
             return "surface"
         return None
+
+
+def _on_line(a, b, x, y, tol):
+    """True if (x, y) lies on the segment a->b."""
+    ax, ay = a
+    bx, by = b
+    vx, vy = bx - ax, by - ay
+    seglen = math.hypot(vx, vy)
+    if seglen < tol:
+        return False
+    wx, wy = x - ax, y - ay
+    if abs(vx * wy - vy * wx) / seglen > tol:  # perpendicular distance to the line
+        return False
+    t = (wx * vx + wy * vy) / (seglen * seglen)  # parameter along the segment
+    return -tol <= t <= 1.0 + tol
+
+
+def _circumcenter(a, b, c):
+    """Centre of the circle through three 2-D points, or None if collinear."""
+    ax, ay = a
+    bx, by = b
+    cx, cy = c
+    d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+    if abs(d) < 1e-14:
+        return None
+    a2, b2, c2 = ax * ax + ay * ay, bx * bx + by * by, cx * cx + cy * cy
+    ux = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d
+    uy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d
+    return (ux, uy)
+
+
+def _on_arc(a, through, b, x, y, tol):
+    """True if (x, y) lies on the circular arc a->through->b (3-point arc)."""
+    centre = _circumcenter(a, through, b)
+    if centre is None:
+        return False
+    cx, cy = centre
+    r = math.hypot(a[0] - cx, a[1] - cy)
+    if abs(math.hypot(x - cx, y - cy) - r) > tol:  # on the supporting circle?
+        return False
+    two_pi = 2.0 * math.pi
+
+    def rel(px, py):  # angle from the centre, measured from a, in [0, 2pi)
+        return (math.atan2(py - cy, px - cx) - math.atan2(a[1] - cy, a[0] - cx)) % two_pi
+
+    d_e, d_t, d_q = rel(*b), rel(*through), rel(x, y)
+    atol = 1e-6
+    # if `through` is reached before `b` going CCW, the arc is [a, b] CCW; else its complement
+    return (d_q <= d_e + atol) if d_t <= d_e else (d_q >= d_e - atol)
+
+
+@dataclass(frozen=True)
+class Contour:
+    """A closed 2-D contour of line and arc segments (generalises :class:`Polygon`).
+
+    ``segments`` is a tuple of ``("line", (ex, ey), name)`` and ``("arc", (ex, ey), (tx, ty),
+    name)`` entries walked from ``start``; it auto-closes back to ``start``. Each segment's
+    boundary auto-names to ``name`` (or ``e0, e1, ...``). Revolving a contour reuses these
+    predicates in meridian coords, so e.g. a diameter + semicircular arc revolves into a sphere.
+    """
+
+    start: Tuple[float, float]
+    segments: Tuple[tuple, ...]
+    dim: ClassVar[int] = 2
+
+    def _effective(self):
+        segs = list(self.segments)
+        last = segs[-1][1] if segs else self.start
+        if math.hypot(last[0] - self.start[0], last[1] - self.start[1]) > 1e-9:
+            segs.append(("line", self.start, None))  # auto-close
+        return segs
+
+    def build(self, occ):
+        p_start = occ.addPoint(self.start[0], self.start[1], 0.0)
+        prev = p_start
+        curves = []
+        for seg in self._effective():
+            end = seg[1]
+            closing = math.hypot(end[0] - self.start[0], end[1] - self.start[1]) < 1e-9
+            pe = p_start if closing else occ.addPoint(end[0], end[1], 0.0)
+            if seg[0] == "line":
+                curves.append(occ.addLine(prev, pe))
+            else:
+                thru = seg[2]
+                pt = occ.addPoint(thru[0], thru[1], 0.0)
+                curves.append(occ.addCircleArc(prev, pt, pe, center=False))
+            prev = pe
+        loop = occ.addCurveLoop(curves)
+        return (2, occ.addPlaneSurface([loop]))
+
+    def classify(self, x: float, y: float, z: float = 0.0, tol: float = TOL) -> Optional[str]:
+        prev = self.start
+        for i, seg in enumerate(self._effective()):
+            end = seg[1]
+            name = seg[-1] if isinstance(seg[-1], str) else f"e{i}"
+            hit = _on_line(prev, end, x, y, tol) if seg[0] == "line" else _on_arc(prev, seg[2], end, x, y, tol)
+            if hit:
+                return name
+            prev = end
+        return None

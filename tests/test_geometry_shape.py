@@ -10,7 +10,7 @@ import math
 import numpy as np
 import pytest
 
-from jno.geometry import Shape
+from jno.geometry import Path, Shape
 
 gmsh = pytest.importorskip("gmsh", reason="gmsh-OCC required for the Shape mesher")
 
@@ -202,3 +202,38 @@ def test_revolve_requires_2d_and_supported_axis():
         Shape.box(0, 0, 0, 1, 1, 1).revolve(*_Y, angle=math.pi)
     with pytest.raises(NotImplementedError):  # z-axis not supported
         Shape.disk(2, 0, 0.5).revolve((0, 0, 0), (0, 0, 1), math.pi).build()
+
+
+# ---------------------------------------------------------------- Path (contours)
+def test_path_line_and_arc_face():
+    """A half-disk from a diameter (line) + a semicircular arc; segments name the boundary."""
+    half = Path(0, -1).line_to(0, 1, name="diameter").arc_to(0, -1, through=(1, 0), name="dome").face()
+    mesh, dim, _ds = half.build()
+    assert dim == 2
+    s = _sets(mesh)
+    assert {"diameter", "dome"} <= set(s)
+    assert s["diameter"] + s["dome"] == s["boundary"]
+
+
+def test_path_extrude_named_segments():
+    """Contour segment names flow onto the swept lateral faces of an extruded D-prism."""
+    dshape = Path(-1, 0).line_to(1, 0, name="flat").arc_to(-1, 0, through=(0, 1), name="round").face()
+    mesh, dim, _ds = dshape.extrude(0.5).build()
+    assert dim == 3
+    s = _sets(mesh)
+    assert {"flat", "round", "front", "back"} <= set(s)
+    assert s["flat"] + s["round"] + s["front"] + s["back"] == s["boundary"]
+
+
+def test_path_revolve_makes_sphere():
+    """A half-disk (diameter on the axis) revolved 2pi is a sphere with the 'dome' arc named."""
+    import jno
+
+    half = Path(0, -1).line_to(0, 1, name="diameter").arc_to(0, -1, through=(1, 0), name="dome").face()
+    d = jno.domain(half.revolve((0, 0, 0), (0, 1, 0), 2 * math.pi))
+    assert d.dimension == 3
+    assert "dome" in d.avaiable_mesh_tags
+    n = np.asarray(d.normals_by_tag["dome"])
+    pts = d.points[d.tag_indices["dome"]]
+    radial = pts / (np.linalg.norm(pts, axis=1, keepdims=True) + 1e-30)  # outward = radial at origin
+    assert np.min(np.sum(n * radial, axis=1)) > 0.0  # all dome normals point outward
