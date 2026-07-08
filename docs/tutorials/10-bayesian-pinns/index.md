@@ -1,14 +1,18 @@
 # Bayesian PINNs
 
 A worked example of Bayesian Physics-Informed Neural Networks
-(B-PINNs) in jNO.  Training is driven through `crux.solve()` using
-jNO's per-parameter `.bayesian(...)` (MCMC) or `.vi(...)` (variational)
-configurator, which attaches a blackjax inference algorithm to scalar
-PDE coefficients, model weights, or inverted inputs.
+(B-PINNs) in jNO: recovering an unknown PDE coefficient from noisy data
+with a **calibrated** posterior.  Training is driven through
+`crux.solve()` using jNO's per-parameter `.bayesian(...)` (MCMC) or
+`.vi(...)` (variational) configurator, which attaches a blackjax
+inference algorithm to scalar PDE coefficients, model weights, or
+inverted inputs.
 
-The tutorial trains an **entire MLP via Bayesian sampling** (no optax):
-[Tutorial 01](./forward-noisy-poisson-1d.md) treats the MLP as a
-*PINN* with a PDE residual constraint.
+[Tutorial 01](./bayesian-inverse-coefficient.md) fits a neural
+surrogate to noisy field observations, then **freezes** it and runs
+NUTS on a single reaction coefficient — a fixed-target posterior whose
+90% credible interval covers the truth, with R-hat ≈ 1 across four
+chains.
 
 All chains are built on the [blackjax MCMC
 library](https://github.com/blackjax-devs/blackjax) — NUTS, HMC,
@@ -20,7 +24,7 @@ reference for the `.bayesian()` integration live in
 
 | # | File | What it shows | Reference |
 |---|---|---|---|
-| 01 | [`forward_noisy_poisson_1d`](./forward-noisy-poisson-1d.md) | Forward-UQ B-PINN: SGLD over MLP weights for the 1-D Poisson with noisy boundary data — prediction bands that widen in data-sparse regions. | Yang et al. 2021 §3.2.1 |
+| 01 | [`bayesian_inverse_coefficient`](./bayesian-inverse-coefficient.md) | Bayesian inverse PINN: freeze a neural surrogate, then NUTS on an unknown reaction coefficient `k` — a calibrated posterior (90% CI covers the truth, R-hat ≈ 1, ESS ≈ 600). | Yang et al. 2021; Hoffman & Gelman 2014 |
 
 ## When to use a neural surrogate (and when not to)
 
@@ -39,15 +43,14 @@ Two patterns avoid the moving-target problem:
   analytical Poisson reference), plug it directly into the likelihood
   and let NUTS sample a **fixed-target** posterior over the coefficient.
   Hyperparameters then affect chain efficiency only, not the target.
-* **Two-stage via `substeps=`.**  When the surrogate is genuinely
-  needed (the PDE has no tractable closed form), use jNO's
-  `substeps=[([surrogate-constraints], n_train), ([pde-constraint], 1)]`
-  with `.stop_gradient` on the surrogate in the PDE-residual term.
-  Substep 0 trains the surrogate (`n_train` steps); substep 1 runs one
-  NUTS proposal with the surrogate frozen.  The 20:1 ratio (or higher)
-  approximates an idealised two-stage where the surrogate fully
-  converges before sampling.  The substep machinery is wired and
-  tested for this pattern.
+* **Train, then freeze.**  Fit the surrogate to convergence with optax,
+  call `u_net.freeze()`, and sample the coefficient against the now-**fixed**
+  forward map — the fixed target makes window adaptation well-defined and the
+  posterior cleanly calibrated (this is what Tutorial 01 does).  For a surrogate
+  that must keep training *alongside* sampling, jNO's
+  `substeps=[([surrogate], n_train), ([residual], 1)]` interleaves the two —
+  substep 0 trains the surrogate, substep 1 runs one NUTS proposal with the
+  surrogate `stop_gradient`-ed.
 
 ## How to read the chain output
 
@@ -76,11 +79,5 @@ A "good" B-PINN result looks like:
   *B-PINNs: Bayesian physics-informed neural networks for forward and
   inverse PDE problems with noisy data.*
   Journal of Computational Physics, 425, 109913.
-- Linka, K., Schäfer, A., Meng, X., Zou, Z., Karniadakis, G. E., & Kuhl,
-  E. (2022).  *Bayesian Physics-Informed Neural Networks for real-world
-  nonlinear dynamical systems.*  Computer Methods in Applied Mechanics
-  and Engineering, 402, 115346.
 - Hoffman, M. D., & Gelman, A. (2014).  *The No-U-Turn Sampler.*
   Journal of Machine Learning Research, 15(1), 1593-1623.
-- Welling, M., & Teh, Y. W. (2011).  *Bayesian Learning via Stochastic
-  Gradient Langevin Dynamics.*  ICML 2011, 681-688.

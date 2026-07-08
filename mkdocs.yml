@@ -136,7 +136,7 @@ nav:
       - 2D Maxwell (complex vector E): tutorials/08-fem-and-varpinns/maxwell-2d-vector.md
     - 10 Bayesian PINNs:
       - Overview: tutorials/10-bayesian-pinns/index.md
-      - Forward Noisy Poisson 1D: tutorials/10-bayesian-pinns/forward-noisy-poisson-1d.md
+      - Bayesian Inverse Coefficient: tutorials/10-bayesian-pinns/bayesian-inverse-coefficient.md
     - 11 Operator Learning:
       - Overview: tutorials/11-operator-learning/index.md
       - DeepONet — parametric Poisson 2D: tutorials/11-operator-learning/deeponet-poisson-2d.md
