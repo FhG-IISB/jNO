@@ -34,7 +34,7 @@ fx = foundax.deeponet(
     basis_functions=32, hidden_dim=128,
     activation=jax.numpy.tanh,
 )
-net = jno.nn.wrap(fx)
+net = jno.nn(fx)
 net.optimizer(optax.adam(
     learning_rate=optax.schedules.cosine_decay_schedule(
         init_value=1e-3, decay_steps=20_000, alpha=1e-5

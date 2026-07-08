@@ -584,14 +584,14 @@ k = jno.np.parameter(phi, name="k")                       # P1 field, one DOF pe
 crux = jno.core([(fem.solve() - u_obs).mse, 1e-3 * k.regularize("h1seminorm").mean], domain=obs)
 ```
 
-### Neural coefficients — `jno.nn.wrap(net)` inside the weak form
+### Neural coefficients — `jno.nn(net)` inside the weak form
 
 A network called inside a weak form is a trainable **coefficient** on an assembled FE system —
 mesh-independent (remeshing never touches the weights), smooth by architecture, and trained through the
 same differentiable `fem.solve()` as any parameter:
 
 ```python
-net = jno.nn.wrap(foundax.mlp(2, hidden_dims=16, num_layers=2,
+net = jno.nn(foundax.mlp(2, hidden_dims=16, num_layers=2,
                               activation=jax.nn.tanh, key=key))
 net.dtype(jnp.float64)                                       # match the f64 assembly
 net.optimizer(optax.adam(1e-2))
@@ -613,7 +613,7 @@ derivatives) as input — then it is a material law, not a spatial map, and the 
 unsupervised through the residual:
 
 ```python
-net = jno.nn.wrap(foundax.mlp(1, hidden_dims=16, num_layers=2,
+net = jno.nn(foundax.mlp(1, hidden_dims=16, num_layers=2,
                               activation=jax.nn.tanh, key=key)).dtype(jnp.float64)
 # hidden truth k(u) = 1 + 0.5 u²; learn it from a single observed field
 fem = jno.fem([(1.0 + net(ui)) * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])

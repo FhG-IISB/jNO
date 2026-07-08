@@ -54,7 +54,7 @@ u_obs = jnp.asarray(np.sin(π * x_np) + SIGMA_U * rng.normal(size=x_np.shape))
 f_known = (LAMBDA * π**2 + K_TRUE) * jno.np.sin(π * x)
 
 # ══ Phase 1 — deterministic neural surrogate fit to the noisy data ═════════════
-u_net = jno.nn.wrap(foundax.mlp(1, output_dim=1, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(0)))
+u_net = jno.nn(foundax.mlp(1, output_dim=1, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(0)))
 u_net.optimizer(optax.adam(2e-3))
 
 u_field = u_net(x) * x * (1 - x)  # hard u(0)=u(1)=0 Dirichlet BCs

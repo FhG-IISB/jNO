@@ -57,7 +57,7 @@ sampling, and tensor tags.
 
 ## Neural-network controls
 
-`jno.nn.wrap` lifts a plain Equinox / foundax module into a jNO
+`jno.nn` lifts a plain Equinox / foundax module into a jNO
 `Model` so it can participate in the trace and accept per-model
 optimisers, masks, LoRA, freezing, and so on.
 

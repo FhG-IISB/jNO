@@ -47,7 +47,7 @@ disambiguation.
 ### Model controls
 
 The collection of per-parameter knobs set on a network wrapped via
-`jno.nn.wrap(...)` — `optimizer`, `lr`, `freeze` / `unfreeze`, `mask`,
+`jno.nn(...)` — `optimizer`, `lr`, `freeze` / `unfreeze`, `mask`,
 `lora`, `dtype`, `constrain`, `initialize`. Chain `.mask(M)` before any
 of these to scope the next call to a parameter subset. Full reference
 and worked examples in [Model Controls](model-controls/index.md).
@@ -131,5 +131,5 @@ balancers live under `jno.fn.adaptive.*` (ReLoBRaLo, SoftAdapt, etc.).
 A pretrained neural operator whose weights are stored in
 [foundax](https://github.com/FhG-IISB/foundax). Examples: PDEformer-2,
 generic DeepONet/FNO templates. Fine-tuned inside a jNO trace via
-`jno.nn.wrap(pretrained_module)` and the standard `model.optimizer` /
+`jno.nn(pretrained_module)` and the standard `model.optimizer` /
 `model.lora` controls.

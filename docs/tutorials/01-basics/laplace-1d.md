@@ -27,7 +27,7 @@ x, _ = domain.variable("interior")
 The boundary values are non-zero (`u(0)=0`, `u(1)=1`), so the multiplicative `x(1-x)` trick alone won't enforce them. Instead, use a **linear interpolant + correction** ansatz:
 
 ```python
-u_net = jno.nn.wrap(
+u_net = jno.nn(
     foundax.mlp(in_features=1, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(0))
 ).optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.5, end_value=1e-5)))
 

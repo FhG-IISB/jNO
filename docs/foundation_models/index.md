@@ -1,22 +1,25 @@
-# Foundation Models
+# Models
 
-jNO uses [**foundax**](https://fhg-iisb.github.io/foundax/) as its model library. All architectures — from simple MLPs to Fourier Neural Operators to large pretrained foundation models — come from foundax and are wrapped with `jno.nn.wrap` to gain jNO's training controls.
+jNO ships **no model zoo of its own**. Every model — from a simple MLP to a Fourier Neural Operator
+to a large pretrained foundation model — comes from [**foundax**](https://fhg-iisb.github.io/foundax/),
+jNO's model library, and is wrapped with `jno.nn(...)` to gain jNO's training controls (optimizer,
+schedules, freeze / mask / LoRA, dtype, diagnostics).
 
-**Full architecture reference, constructor signatures, and pretrained model docs live at:**  
-**[https://fhg-iisb.github.io/foundax/](https://fhg-iisb.github.io/foundax/)**
+**Full architecture reference, constructor signatures, and pretrained checkpoints live in the foundax
+docs:** **[https://fhg-iisb.github.io/foundax/](https://fhg-iisb.github.io/foundax/)**
 
 ---
 
 ## Wrapping a model
 
-`jno.nn.wrap` accepts any [Equinox](https://docs.kidger.site/equinox/) module. foundax models are Equinox modules, but you can wrap your own `eqx.Module` in exactly the same way — see [Model Controls](../model-controls/index.md#quick-start) for a custom model example.
+`jno.nn` accepts any [Equinox](https://docs.kidger.site/equinox/) module. foundax models are Equinox modules, but you can wrap your own `eqx.Module` in exactly the same way — see [Model Controls](../model-controls/index.md#quick-start) for a custom model example.
 
 ```python
 import foundax
 import jno
 import optax
 
-net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=64, num_layers=4,
+net = jno.nn(foundax.mlp(in_features=2, hidden_dims=64, num_layers=4,
                                key=jax.random.PRNGKey(0)))
 net.optimizer(optax.adam(1e-3))
 ```

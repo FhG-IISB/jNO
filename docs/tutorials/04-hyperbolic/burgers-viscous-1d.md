@@ -51,7 +51,7 @@ x0, t0 = vars_bot[0], vars_bot[1]
 An MLP with 2 inputs `(x, t)` takes both coordinates directly. The `x*(1-x)` factor hard-encodes the Dirichlet BCs `u(0,t) = u(1,t) = 0`.
 
 ```python
-net = jno.nn.wrap(foundax.mlp(2, hidden_dims=64, num_layers=4, key=jax.random.PRNGKey(3)))
+net = jno.nn(foundax.mlp(2, hidden_dims=64, num_layers=4, key=jax.random.PRNGKey(3)))
 net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=1e-3, warmup_steps=1, decay_steps=10, end_value=1e-5)))
 
 u = net(x, t) * x * (1 - x)

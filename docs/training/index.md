@@ -36,7 +36,7 @@ v_net.optimizer(optax.adamw).scale(lrs.warmup_cosine(5000, 500, 1e-3, 1e-4))
 `model.optimizer()` returns `self` for chaining:
 
 ```python
-u_net = jno.nn.mlp(2, key=key).optimizer(optax.adam).scale(lrs(1e-3))
+u_net = jno.nn(foundax.mlp(2, key=key)).optimizer(optax.adam(1e-3))
 ```
 
 ### After `core.load()`

@@ -19,7 +19,7 @@ u_exact = jno.np.sin(π * x) * jno.np.sin(π * y)
 # --8<-- [end:setup]
 
 # --8<-- [start:residual]
-net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(13)))
+net = jno.nn(foundax.mlp(in_features=2, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(13)))
 net.optimizer(optax.adam(optax.exponential_decay(1e-3, 1000, 0.5, end_value=1e-5)))
 
 # Multiplicative hard BC — the x(1-x)y(1-y) factor's derivatives flow through.

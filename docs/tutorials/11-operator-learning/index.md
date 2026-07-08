@@ -12,4 +12,4 @@ The two architecture tutorials showcase **two foundax architectures** on the **s
 | [DeepONet — parametric Poisson](deeponet-poisson-2d.md) | `foundax.deeponet` | PDE-residual | Branch/trunk decomposition; the canonical operator-learning architecture |
 | [FNO2D — supervised Poisson](fno-poisson-2d.md) | `foundax.fno2d` | Data-driven | Spectral convolutions in Fourier space; resolution-independent in principle |
 
-Both plug into the same `jno.nn.wrap(...)` interface, so the rest of your training pipeline (callbacks, schedules, checkpointing, evaluation) is identical. Foundation models (PROSE, Poseidon, PDEformer-2) plug in the same way but are out of scope here — see the [Foundation Models](../../foundation_models/index.md) page for the fine-tuning workflow.
+Both plug into the same `jno.nn(...)` interface, so the rest of your training pipeline (callbacks, schedules, checkpointing, evaluation) is identical. Foundation models (PROSE, Poseidon, PDEformer-2) plug in the same way but are out of scope here — see the [Models](../../foundation_models/index.md) page for the fine-tuning workflow.

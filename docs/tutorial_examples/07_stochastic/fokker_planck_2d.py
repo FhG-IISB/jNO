@@ -22,7 +22,7 @@ p_exact_bc = jno.np.exp(-(xb**2 + yb**2)) / π
 # --8<-- [end:setup]
 
 # --8<-- [start:residual]
-net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=64, num_layers=5, key=jax.random.PRNGKey(0)))
+net = jno.nn(foundax.mlp(in_features=2, hidden_dims=64, num_layers=5, key=jax.random.PRNGKey(0)))
 net.optimizer(optax.adam(optax.exponential_decay(1e-3, 2000, 0.5, end_value=1e-5)))
 
 p = net(x, y).scalar.bind(x=x, y=y)

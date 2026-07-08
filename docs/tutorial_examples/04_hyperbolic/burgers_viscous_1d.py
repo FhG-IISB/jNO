@@ -20,7 +20,7 @@ u_exact = jno.np.exp(-t) * jno.np.sin(π * x)
 source = jno.np.exp(-t) * (ν * π**2 - 1) * jno.np.sin(π * x) + (π / 2) * jno.np.exp(-2 * t) * jno.np.sin(2 * π * x)
 
 # ── Network  (hard Dirichlet BCs via the x(1-x) factor) ──────────────────────
-net = jno.nn.wrap(
+net = jno.nn(
     foundax.deeponet(
         n_sensors=1,
         coord_dim=1,

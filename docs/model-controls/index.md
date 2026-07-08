@@ -5,10 +5,10 @@ This page documents the model-control API in jNO 0.2.1.
 The recommended style is:
 
 - build a model with `foundax` (`fx.mlp`, `fx.fno2d`, `fx.poseidon.T`, ...) **or write your own `equinox.Module`**
-- wrap it with `jno.nn.wrap(...)`
+- wrap it with `jno.nn(...)`
 - apply model controls on the wrapped `Model`
 
-`jno.nn.wrap` accepts any [Equinox](https://docs.kidger.site/equinox/) module — foundax models are Equinox modules, but so is anything you write yourself using `eqx.Module`. The full set of training controls (optimizer, freeze, LoRA, masks, dtype, diagnostics) is available regardless of where the model comes from.
+`jno.nn` accepts any [Equinox](https://docs.kidger.site/equinox/) module — foundax models are Equinox modules, but so is anything you write yourself using `eqx.Module`. The full set of training controls (optimizer, freeze, LoRA, masks, dtype, diagnostics) is available regardless of where the model comes from.
 
 ## Quick Start
 
@@ -19,7 +19,7 @@ import jno
 from jno import LearningRateSchedule as lrs
 
 # foundax model
-net = jno.nn.wrap(
+net = jno.nn(
     fx.mlp(in_features=2, output_dim=1, hidden_dims=64, num_layers=3),
     name="u_net",
 )
@@ -39,13 +39,13 @@ class MyNet(eqx.Module):
         h = jax.nn.tanh(self.layers[0](jnp.stack([x, y])))
         return self.layers[1](h)
 
-custom_net = jno.nn.wrap(MyNet(jax.random.PRNGKey(0)))
+custom_net = jno.nn(MyNet(jax.random.PRNGKey(0)))
 custom_net.optimizer(optax.adam(1e-3))
 ```
 
 ## Available Methods
 
-`Model` (returned by `jno.nn.wrap(...)`) supports:
+`Model` (returned by `jno.nn(...)`) supports:
 
 - `dont_show()`
 - `summary()`

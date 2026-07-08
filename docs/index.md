@@ -53,7 +53,7 @@ Each status badge links to the tutorial (or, where no dedicated tutorial exists,
 | Bayesian PINNs (NUTS, HMC, MALA, SGLD, SGHMC, VI) | [✅ stable](tutorials/10-bayesian-pinns/index.md) | see [Bayesian Sampling](training/bayesian.md) |
 | Parameter-efficient fine-tuning (LoRA, DoRA, rsLoRA, PiSSA, VeRA, LoKr, OFT, IA3) | [✅ stable](model-controls/lora.md) | Chain `.lora(...)` on any wrapped model |
 | Training explainability (gradient conflict, NTK, Hessian, loss landscape, input sensitivity, residual stats) | [✅ stable](tutorials/07-analysis/gradient-conflict.md) | See [Explainability](training/explainability.md) |
-| Foundation-model integration ([foundax](https://github.com/FhG-IISB/foundax) MLPs, transformers, DeepONet, FNO, PROSE) | [✅ stable](foundation_models/index.md) | Wrap any Equinox module via `jno.nn.wrap(...)` |
+| Foundation-model integration ([foundax](https://github.com/FhG-IISB/foundax) MLPs, transformers, DeepONet, FNO, PROSE) | [✅ stable](foundation_models/index.md) | Wrap any Equinox module via `jno.nn(...)` |
 | Hybrid data + model parallelism | [✅ stable](training/parallelism.md) | `core(mesh=(batch, model))` |
 | W&B logging + Orbax checkpointing | ✅ stable | |
 | IREE / MLIR compiled inference for deployment | [✅ stable](model-controls/iree.md) | |

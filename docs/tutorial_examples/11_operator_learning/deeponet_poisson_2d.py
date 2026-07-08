@@ -18,7 +18,7 @@ k_values = jax.random.uniform(KEY, shape=(N_SAMPLES, 1, 1), minval=0.5, maxval=1
 k = dom.variable("k", k_values)
 
 # ── Network ──────────────────────────────────────────────────────────────────
-net = jno.nn.wrap(
+net = jno.nn(
     foundax.deeponet(
         n_sensors=1,  # branch input is the scalar k
         coord_dim=2,  # trunk input is (x, y)

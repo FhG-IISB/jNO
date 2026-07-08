@@ -56,7 +56,7 @@ f = jno.np.sin(π * x) - x / pi_val
 ## Step 3: Build the model
 
 ```python
-net = jno.nn.wrap(
+net = jno.nn(
     foundax.mlp(in_features=1, hidden_dims=64, num_layers=4,
                 activation=jax.nn.tanh, key=jax.random.PRNGKey(0))
 )

@@ -35,7 +35,7 @@ k = dom.variable("k", k_values)
 The branch input is the scalar `k` (a "function evaluated at one sensor"); the trunk input is the query coordinate `(x, y)`. The output is the dot product of the two encoded vectors:
 
 ```python
-net = jno.nn.wrap(
+net = jno.nn(
     foundax.deeponet(
         n_sensors=1,         # branch input dimensionality
         coord_dim=2,         # trunk input dimensionality

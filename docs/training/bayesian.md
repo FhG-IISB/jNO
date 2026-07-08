@@ -133,8 +133,8 @@ for the posterior summary on nonlinear outputs).
 Different parameters use different update rules in one `crux.solve()`:
 
 ```python
-encoder = jno.nn.wrap(foundax.mlp(2, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(0)))
-head    = jno.nn.wrap(foundax.mlp(1, hidden_dims=32, num_layers=1, key=jax.random.PRNGKey(1)))
+encoder = jno.nn(foundax.mlp(2, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(0)))
+head    = jno.nn(foundax.mlp(1, hidden_dims=32, num_layers=1, key=jax.random.PRNGKey(1)))
 
 encoder.optimizer(optax.adam(1e-3))                          # point estimate
 head.bayesian(blackjax.sgld, step_size=1e-5)                 # SGLD chain
@@ -153,7 +153,7 @@ dom = jno.domain(constructor=jno.domain.line(mesh_size=0.01))
 x, _  = dom.variable("interior")
 xb, _ = dom.variable("boundary")
 
-net = jno.nn.wrap(foundax.mlp(1, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(0)))
+net = jno.nn(foundax.mlp(1, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(0)))
 net.bayesian(blackjax.sgld, step_size=1e-5, warmup=2000, keep=1000)
 
 u    = net(x)
@@ -413,7 +413,7 @@ When a wandb run is active, per-Bayesian-model statistics are logged at the prin
 | `posterior/<name>/mean_acceptance_rate`      | Running mean MH acceptance rate (NUTS / HMC / MALA)                |
 | `posterior/<name>/mean_energy`               | Running mean Hamiltonian energy (NUTS / HMC only)                  |
 
-`<name>` comes from the `name=` of `jno.np.parameter(...)` / `jno.nn.wrap(..., name=...)`. Multi-leaf
+`<name>` comes from the `name=` of `jno.np.parameter(...)` / `jno.nn(..., name=...)`. Multi-leaf
 modules (MLPs) get only the chain length — use arviz against `model.posterior_samples` for per-leaf stats.
 
 !!! warning "Memory"

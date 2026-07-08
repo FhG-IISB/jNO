@@ -110,7 +110,7 @@ import numpy as np
 domain = jno.domain(constructor=jno.domain.rect(mesh_size=0.05))
 x, y, _ = domain.variable("interior")
 
-net = jno.nn.wrap(foundax.mlp(in_features=2, hidden_dims=64, num_layers=4,
+net = jno.nn(foundax.mlp(in_features=2, hidden_dims=64, num_layers=4,
                                key=jax.random.PRNGKey(0)))
 net.optimizer(optax.adam(1e-3))
 
