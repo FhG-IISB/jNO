@@ -294,3 +294,24 @@ def test_fillet_outward_normals_via_domain():
 
     d = jno.domain(Shape.box(0, 0, 0, 2, 2, 2).fillet(0.4))
     assert np.asarray(d.normals_by_tag["top"]).mean(0)[2] > 0.9  # flat top still points +z
+
+
+# ------------------------------------------------------------------------- sweep
+def test_sweep_line_makes_a_pipe():
+    """Sweeping a disk profile along a straight path makes a (cylindrical) solid."""
+    mesh, dim, _ds = Shape.disk(0, 0, 0.3).sweep(Path(0, 0, 0).line_to(0, 0, 3)).build()
+    assert dim == 3 and mesh.cells[0].data.shape[0] > 0
+    assert set(_sets(mesh)) == {"interior", "boundary"}  # general sweep -> interior + boundary only
+
+
+def test_sweep_arc_makes_a_bent_pipe():
+    """Sweeping along a smooth arc makes a bent pipe (meshes without hanging)."""
+    bent = Shape.disk(0, 0, 0.3).sweep(Path(0, 0, 0).arc_to(2, 0, 2, through=(0.6, 0, 1.4)))
+    mesh, dim, _ds = bent.build()
+    assert dim == 3 and mesh.cells[0].data.shape[0] > 0
+
+
+def test_sweep_sharp_corner_is_rejected():
+    """A sharp line->line corner self-intersects the swept profile -- reject up front, never hang."""
+    with pytest.raises(ValueError):
+        Shape.disk(0, 0, 0.3).sweep(Path(0, 0, 0).line_to(0, 0, 3).line_to(3, 0, 3))

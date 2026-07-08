@@ -139,6 +139,18 @@ class Shape:
         ad = tuple(float(c) for c in axis_dir)
         return Shape(("rotate", self, ap, ad, float(angle)), self.dim, self._size)
 
+    def sweep(self, path) -> "Shape":
+        """Sweep this 2-D profile along an open :class:`~jno.geometry.path.Path` trajectory.
+
+        The path must be smooth (line and arc segments); a sharp line->line corner is rejected
+        up front (it self-intersects the swept profile). Naming degrades to ``interior`` +
+        ``boundary`` for a general sweep -- carve regions afterwards with ``d.tag(predicate)``.
+        """
+        if self.dim != 2:
+            raise ValueError("sweep requires a 2-D profile")
+        path._check_sweepable()
+        return Shape(("sweep", self, path), 3, self._size)
+
     def fillet(self, radius: float, where=None) -> "Shape":
         """Round the solid's edges by ``radius``.
 
@@ -162,7 +174,7 @@ class Shape:
             return ((prim, self._size, key),)
         if kind in ("cut", "fuse", "inter"):
             return node[1].leaves() + node[2].leaves()
-        if kind in ("extrude", "revolve", "translate", "rotate", "fillet"):
+        if kind in ("extrude", "revolve", "translate", "rotate", "fillet", "sweep"):
             return node[1].leaves()
         raise ValueError(f"unknown node kind {kind!r}")
 

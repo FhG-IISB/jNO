@@ -67,6 +67,11 @@ def _emit_node(node, occ, split_full=False):
         ent = _emit_node(node[1]._node, occ, split_full)
         occ.rotate(ent, *node[2], *node[3], node[4])
         return ent
+    if kind == "sweep":
+        profile = _emit_node(node[1]._node, occ, split_full)  # [(2, tag)]
+        wire = node[2]._wire(occ)
+        pipe = occ.addPipe(profile, wire)
+        return [dt for dt in pipe if dt[0] == 3]
     if kind == "fillet":
         import gmsh
 
@@ -91,7 +96,7 @@ def _has_full_revolve(node) -> bool:
         return abs(node[4] - 2.0 * math.pi) < 1e-9 or _has_full_revolve(node[1]._node)
     if kind in ("cut", "fuse", "inter"):
         return _has_full_revolve(node[1]._node) or _has_full_revolve(node[2]._node)
-    if kind in ("extrude", "translate", "rotate", "fillet"):
+    if kind in ("extrude", "translate", "rotate", "fillet", "sweep"):
         return _has_full_revolve(node[1]._node)
     return False
 

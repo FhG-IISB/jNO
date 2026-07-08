@@ -128,6 +128,8 @@ def _classify(node, x: float, y: float, z: float, tol: float = 1e-6):
     if kind == "fillet":
         # rounded blend faces match no flat predicate -> fall into `boundary`; flat faces keep names
         return _classify(node[1]._node, x, y, z, tol)
+    if kind == "sweep":
+        return None  # general sweep -> interior + boundary only (carve with d.tag afterwards)
     if kind == "extrude":
         dz = node[2]
         if abs(z) < tol:
