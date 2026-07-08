@@ -67,6 +67,21 @@ def _emit_node(node, occ, split_full=False):
         ent = _emit_node(node[1]._node, occ, split_full)
         occ.rotate(ent, *node[2], *node[3], node[4])
         return ent
+    if kind == "fillet":
+        import gmsh
+
+        vols = _emit_node(node[1]._node, occ, split_full)
+        radius, where = node[2], node[3]
+        occ.synchronize()  # incremental sync so we can query the solid's edges
+        faces = gmsh.model.getBoundary(vols, combined=False, oriented=False, recursive=False)
+        edges = gmsh.model.getBoundary(faces, combined=False, oriented=False, recursive=False)
+        etags = sorted({abs(t) for d, t in edges if d == 1})
+        if where is not None:
+            etags = [t for t in etags if where(*occ.getCenterOfMass(1, t))]
+        if not etags:
+            return vols
+        out = occ.fillet([t for d, t in vols if d == 3], etags, [radius])
+        return out
     raise ValueError(f"unknown node kind {kind!r}")
 
 
@@ -76,7 +91,7 @@ def _has_full_revolve(node) -> bool:
         return abs(node[4] - 2.0 * math.pi) < 1e-9 or _has_full_revolve(node[1]._node)
     if kind in ("cut", "fuse", "inter"):
         return _has_full_revolve(node[1]._node) or _has_full_revolve(node[2]._node)
-    if kind in ("extrude", "translate", "rotate"):
+    if kind in ("extrude", "translate", "rotate", "fillet"):
         return _has_full_revolve(node[1]._node)
     return False
 

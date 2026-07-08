@@ -265,3 +265,32 @@ def test_transform_composes_with_boolean_and_normals():
     d = jno.domain((Shape.box(0, 0, 0, 4, 4, 1) - Shape.cylinder(2, 2, -1, 0, 0, 3, 0.5)).translate((10, 10, 0)))
     assert {"side", "top", "left"} <= set(d.avaiable_mesh_tags)  # hole wall + faces survive the move
     assert np.asarray(d.normals_by_tag["top"]).mean(0)[2] > 0.5  # top face still points +z
+
+
+# ---------------------------------------------------------------------- fillet
+def test_fillet_all_edges_keeps_flat_faces():
+    """Rounding all edges keeps the six flat faces named; blend faces fall into 'boundary'."""
+    mesh, dim, _ds = Shape.box(0, 0, 0, 2, 2, 1).fillet(0.3).build()
+    assert dim == 3 and mesh.cells[0].data.shape[0] > 0
+    s = _sets(mesh)
+    flat = sum(s.get(f, 0) for f in ("left", "right", "top", "bottom", "front", "back"))
+    assert {"left", "right", "top", "bottom", "front", "back"} <= set(s)
+    assert 0 < flat < s["boundary"]  # blend faces exist, sitting only in 'boundary'
+
+
+def test_fillet_predicate_and_after_boolean():
+    """A predicate rounds a subset of edges, and fillet composes after a boolean (mid-build sync)."""
+    mesh, dim, _ds = (
+        (Shape.box(0, 0, 0, 4, 4, 1) - Shape.cylinder(2, 2, -1, 0, 0, 3, 0.5))
+        .fillet(0.15, where=lambda x, y, z: z > 0.9)
+        .build()
+    )
+    assert dim == 3 and mesh.cells[0].data.shape[0] > 0
+    assert "side" in _sets(mesh)  # the drilled hole wall survives the fillet
+
+
+def test_fillet_outward_normals_via_domain():
+    import jno
+
+    d = jno.domain(Shape.box(0, 0, 0, 2, 2, 2).fillet(0.4))
+    assert np.asarray(d.normals_by_tag["top"]).mean(0)[2] > 0.9  # flat top still points +z

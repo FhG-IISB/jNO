@@ -139,6 +139,15 @@ class Shape:
         ad = tuple(float(c) for c in axis_dir)
         return Shape(("rotate", self, ap, ad, float(angle)), self.dim, self._size)
 
+    def fillet(self, radius: float, where=None) -> "Shape":
+        """Round the solid's edges by ``radius``.
+
+        ``where=f(x, y, z)`` selects which edges to round by their midpoint (default: all
+        edges). The rounded blend faces are unnamed (they fall into ``boundary``); the flat
+        faces keep their names.
+        """
+        return Shape(("fillet", self, float(radius), where), self.dim, self._size)
+
     def sized(self, size: Size) -> "Shape":
         """Return a copy of this shape with its target mesh size set (scalar or ``f(x,y,z)``)."""
         return Shape(self._node, self.dim, size)
@@ -153,7 +162,7 @@ class Shape:
             return ((prim, self._size, key),)
         if kind in ("cut", "fuse", "inter"):
             return node[1].leaves() + node[2].leaves()
-        if kind in ("extrude", "revolve", "translate", "rotate"):
+        if kind in ("extrude", "revolve", "translate", "rotate", "fillet"):
             return node[1].leaves()
         raise ValueError(f"unknown node kind {kind!r}")
 

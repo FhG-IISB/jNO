@@ -125,6 +125,9 @@ def _classify(node, x: float, y: float, z: float, tol: float = 1e-6):
     if kind == "rotate":
         lx, ly, lz = _rotate_point(x, y, z, node[2], node[3], -node[4])  # undo the rotation
         return _classify(node[1]._node, lx, ly, lz, tol)
+    if kind == "fillet":
+        # rounded blend faces match no flat predicate -> fall into `boundary`; flat faces keep names
+        return _classify(node[1]._node, x, y, z, tol)
     if kind == "extrude":
         dz = node[2]
         if abs(z) < tol:
