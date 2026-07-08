@@ -149,6 +149,9 @@ class Shape:
         if self.dim != 2:
             raise ValueError("sweep requires a 2-D profile")
         path._check_sweepable()
+        h = path._as_extrude()
+        if h is not None:
+            return self.extrude(h)  # a straight vertical sweep IS an extrude -- reuse its rich naming
         return Shape(("sweep", self, path), 3, self._size)
 
     def array(self, n: int, step=None, about=None, angle: float = 2.0 * math.pi) -> "Shape":

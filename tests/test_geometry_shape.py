@@ -297,11 +297,11 @@ def test_fillet_outward_normals_via_domain():
 
 
 # ------------------------------------------------------------------------- sweep
-def test_sweep_line_makes_a_pipe():
-    """Sweeping a disk profile along a straight path makes a (cylindrical) solid."""
+def test_sweep_vertical_line_dispatches_to_extrude():
+    """A straight vertical sweep IS an extrude -- it reuses the rich naming (caps + lateral 'arc')."""
     mesh, dim, _ds = Shape.disk(0, 0, 0.3).sweep(Path(0, 0, 0).line_to(0, 0, 3)).build()
     assert dim == 3 and mesh.cells[0].data.shape[0] > 0
-    assert set(_sets(mesh)) == {"interior", "boundary"}  # general sweep -> interior + boundary only
+    assert {"front", "back", "arc"} <= set(_sets(mesh))  # extrude-quality names, not just boundary
 
 
 def test_sweep_arc_makes_a_bent_pipe():

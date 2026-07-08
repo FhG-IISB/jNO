@@ -76,6 +76,16 @@ class Path:
             prev = end
         return occ.addWire(curves)
 
+    def _as_extrude(self):
+        """If this path is a single straight vertical line from z=0, return its height (== an
+        extrude); else None. Lets ``sweep`` reuse the extrude engine's rich face-naming."""
+        if len(self._segs) != 1 or self._segs[0][0] != "line":
+            return None
+        s, end = self._start, self._segs[0][1]
+        if abs(s[2]) < 1e-9 and abs(end[0] - s[0]) < 1e-9 and abs(end[1] - s[1]) < 1e-9 and end[2] > 1e-9:
+            return end[2]
+        return None
+
     def _check_sweepable(self):
         """Reject a sharp line->line corner: sweeping a profile round it self-intersects and hangs."""
         if not self._segs:
