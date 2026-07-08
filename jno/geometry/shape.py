@@ -151,6 +151,25 @@ class Shape:
         path._check_sweepable()
         return Shape(("sweep", self, path), 3, self._size)
 
+    def array(self, n: int, step=None, about=None, angle: float = 2.0 * math.pi) -> "Shape":
+        """``n`` fused copies of this shape: a **linear** array (``step=`` vector between copies)
+        or a **polar** array (``about=(axis_point, axis_dir)`` spread over ``angle``).
+
+        Pure composition over translate/rotate/fuse -- e.g. a bolt-circle of holes is
+        ``plate - Shape.disk(R, 0, r).array(8, about=((0,0,0),(0,0,1)))``.
+        """
+        if n < 1:
+            raise ValueError("array needs n >= 1")
+        if (step is None) == (about is None):
+            raise ValueError("array needs exactly one of step= (linear) or about= (polar)")
+        out = self
+        for k in range(1, n):
+            if step is not None:
+                out = out | self.translate(tuple(k * float(c) for c in step))
+            else:
+                out = out | self.rotate(about[0], about[1], k * angle / n)
+        return out
+
     def fillet(self, radius: float, where=None) -> "Shape":
         """Round the solid's edges by ``radius``.
 

@@ -315,3 +315,28 @@ def test_sweep_sharp_corner_is_rejected():
     """A sharp line->line corner self-intersects the swept profile -- reject up front, never hang."""
     with pytest.raises(ValueError):
         Shape.disk(0, 0, 0.3).sweep(Path(0, 0, 0).line_to(0, 0, 3).line_to(3, 0, 3))
+
+
+# ------------------------------------------------------------------------- array
+def test_array_linear():
+    """A linear array fuses n copies spaced by `step` (pure translate/fuse composition)."""
+    mesh, dim, _ds = Shape.disk(0, 0, 0.2).array(3, step=(1, 0, 0)).build()
+    assert dim == 2
+    tri = np.asarray(mesh.cells[0].data)
+    cx = mesh.points[tri].mean(1)[:, 0]
+    assert cx.min() < 0.3 and cx.max() > 1.7  # cells span all three disks (x ~ 0, 1, 2)
+
+
+def test_array_polar_bolt_circle():
+    """A polar array makes a ring of holes: plate - disk.array(n, about=axis)."""
+    holes = Shape.disk(3, 0, 0.3).array(6, about=((0, 0, 0), (0, 0, 1)))
+    mesh, dim, _ds = (Shape.rect(-5, -5, 5, 5) - holes).extrude(0.4).build()
+    assert dim == 3 and mesh.cells[0].data.shape[0] > 0
+    assert "arc" in _sets(mesh)  # the six hole walls
+
+
+def test_array_requires_one_mode():
+    with pytest.raises(ValueError):
+        Shape.disk(0, 0, 0.2).array(3)  # neither step nor about
+    with pytest.raises(ValueError):
+        Shape.disk(0, 0, 0.2).array(3, step=(1, 0, 0), about=((0, 0, 0), (0, 0, 1)))  # both
