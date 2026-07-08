@@ -10,8 +10,9 @@ Requires Python 3.11–3.13.
 pip install jax-neural-operators
 ```
 
-The finite-element assembler additionally needs `basix` — `pip install jax-neural-operators basix`,
-or use the pixi `fem` environment below (which pulls it in).
+The finite-element assembler additionally needs `fenics-basix` (imports as `basix`) —
+`pip install jax-neural-operators fenics-basix`, or use the pixi `fem` environment below
+(which pulls it in).
 
 GPU support is included by default — `jax-neural-operators` depends on
 `jax[cuda]>=0.10.1,<0.11`, so a standard `pip install` already pulls a
