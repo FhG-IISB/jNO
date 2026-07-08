@@ -6,7 +6,7 @@ looks wrong, fix the docstring — not this file.
 
 For conceptual prose (what these objects *are* and *why* they exist),
 see the [Getting Started](Getting-Started.md) guide and the
-[Concepts](Glossary.md) page.
+[Concepts](concepts.md) page.
 
 ---
 

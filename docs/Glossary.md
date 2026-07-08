@@ -1,7 +1,8 @@
-# Concepts
+# Glossary
 
 Short definitions for jNO-specific terminology that appears repeatedly
-across the docs. Linked from the [Home page](index.md).
+across the docs. For the narrative overview of how these fit together,
+see [Concepts](concepts.md).
 
 ---
 
