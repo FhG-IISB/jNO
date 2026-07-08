@@ -16,12 +16,11 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp  # noqa: E402
 import numpy as np  # noqa: E402
 import optax  # noqa: E402
-from shapely.geometry import box  # noqa: E402
 
 import jno  # noqa: E402
 import jno.jnp_ops as jnn  # noqa: E402
 
-d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.08)
+d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.08).domain()
 x, y, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
 f_base = 2 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y)
@@ -35,7 +34,10 @@ observed = jnp.asarray(jno.fdm([-ui.d2(x) - ui.d2(y) - 1.0 * f_base, u(xb, yb) -
 s = jno.np.parameter((1,), name="s")
 s.dtype(jnp.float64)
 s.initialize(jax.nn.initializers.constant(2.5))  # deliberately wrong start
-s.optimizer(optax.adam(1e-1))
+# A single, well-scaled scalar over a convex (quadratic) misfit: plain gradient descent converges
+# straight to the minimum. Adam's per-parameter moment adaptation is counter-productive here — it
+# oscillates and can settle at a spurious fixed point away from the true amplitude.
+s.optimizer(optax.sgd(1.0))
 solve = jno.fdm([-ui.d2(x) - ui.d2(y) - s * f_base, u(xb, yb) - 0.0]).solve()  # a differentiable trace node
 crux = jno.core([(solve - observed).mse])  # domain inferred from the graph — no explicit domain= needed
 crux.solve(150)
