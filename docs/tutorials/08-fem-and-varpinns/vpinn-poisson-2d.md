@@ -48,7 +48,7 @@ interior only and the network converges.
 
 ![VPINN solution and pointwise error vs the analytic solution](/jNO/assets/vpinn_poisson_2d.png)
 
-The trained network matches the analytic $x(1-x)y(1-y)$ to rel-$L^2 \approx 2\times10^{-3}$.
+The trained network matches the analytic $x(1-x)y(1-y)$ to rel-$L^2 \approx 7\times10^{-4}$.
 
 ## What to notice
 

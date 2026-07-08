@@ -1,3 +1,4 @@
+# --8<-- [start:code]
 """12 - A 2D "pot heated from below": Rayleigh-Benard convection (heat + fluid flow, fully coupled).
 
 Heat a layer of fluid from below and it does not just conduct -- above a critical temperature
@@ -31,11 +32,7 @@ import jax
 
 jax.config.update("jax_enable_x64", True)  # the assembler builds in float64
 
-from pathlib import Path  # noqa: E402
-
-import matplotlib.animation as animation  # noqa: E402
-import matplotlib.pyplot as plt  # noqa: E402
-import matplotlib.tri as mtri  # noqa: E402
+import matplotlib.tri as mtri  # noqa: E402  (used by the convective-flux verification below)
 import numpy as np  # noqa: E402
 
 import jno  # noqa: E402
@@ -45,7 +42,7 @@ Lx, Ly = 2.0, 1.0  # a wide-ish pot -> a pair of counter-rotating rolls
 dt, nsteps, nframes = 0.009, 26, 13  # integration step / count -> fem.solve() reads dt from the domain
 #                                      time grid below (stop ~when the rolls establish, no static tail)
 
-d = jno.domain(jno.Shape.rect(0, 0, Lx, Ly, size=0.11), time=(0.0, nsteps * dt, nsteps + 1))
+d = jno.Shape.rect(0, 0, Lx, Ly, size=0.11).domain(time=(0.0, nsteps * dt, nsteps + 1))
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)  # P2 velocity
 p, q = d.fem_symbols(names=("p", "q"), order=1)  # P1 pressure
 T, sT = d.fem_symbols(names=("T", "sT"), order=1)  # P1 temperature
@@ -108,8 +105,14 @@ Tvel = np.asarray(mtri.LinearTriInterpolator(triT, Tf[-1])(pts_v[:, 0], pts_v[:,
 conv_flux = float(np.nanmean(vel[-1, :, 1] * Tvel))
 print(f"  convection onset: max|u| {umax0:.3f} (rest) -> {umaxF:.2f}  |  convective heat flux <u_y T> = {conv_flux:+.3f}")
 assert umaxF > 1.0 and conv_flux > 0.0, "expected convection to develop with upward heat transport"
+# --8<-- [end:code]
 
 # ---- animate the computed temperature with the computed velocity arrows -> GIF ----
+from pathlib import Path  # noqa: E402
+
+import matplotlib.animation as animation  # noqa: E402
+import matplotlib.pyplot as plt  # noqa: E402
+
 step_q = max(1, len(pts_v) // 110)  # subsample arrows so the field stays visible
 qscale = max(umaxF, 1.0) / 0.09  # fixed scale (data units): the fastest arrow spans ~0.09 of the box
 fig, ax = plt.subplots(figsize=(8.2, 4.4))

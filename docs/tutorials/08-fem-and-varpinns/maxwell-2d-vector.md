@@ -69,5 +69,5 @@ finite-element solution**, nothing painted in.
 ## Full script
 
 ```python
---8<-- "tutorial_examples/08_fem_and_varpinns/maxwell_2d_vector.py"
+--8<-- "tutorial_examples/08_fem_and_varpinns/maxwell_2d_vector.py:code"
 ```

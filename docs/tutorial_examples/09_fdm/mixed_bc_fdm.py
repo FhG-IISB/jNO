@@ -19,11 +19,10 @@ import jax
 jax.config.update("jax_enable_x64", True)
 
 import numpy as np  # noqa: E402
-from shapely.geometry import box  # noqa: E402
 
 import jno  # noqa: E402
 
-d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.05)
+d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.05).domain()
 x, y, _ = d.variable("interior", split=True)
 xbo, ybo, _ = d.variable("bottom", split=True)
 xl, yl, _ = d.variable("left", split=True)

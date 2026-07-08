@@ -15,13 +15,12 @@ import jax
 jax.config.update("jax_enable_x64", True)
 
 import numpy as np  # noqa: E402
-from shapely.geometry import box  # noqa: E402
 
 import jno  # noqa: E402
 import jno.jnp_ops as jnn  # noqa: E402
 
 nu, T = 0.05, 0.5
-d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06, time=(0.0, T, 200))
+d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.06).domain(time=(0.0, T, 200))
 x, y, t = d.variable("interior", split=True)  # note the temporal Variable t
 xb, yb, _ = d.variable("boundary", split=True)
 xi, yi, _ = d.variable("initial", split=True)  # the t = t0 slice

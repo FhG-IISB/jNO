@@ -22,7 +22,7 @@ lam, mu = E * nu / (1.0 - nu**2), E / (2.0 * (1.0 + nu))  # plane-stress Lame pa
 Iz = H**3 / 12.0  # second moment of area (unit thickness)
 inner, symgrad, trace = jno.np.inner, jno.np.symgrad, jno.np.trace
 
-d = jno.domain(jno.Shape.rect(0.0, 0.0, L, H, size=0.5))
+d = jno.Shape.rect(0.0, 0.0, L, H, size=0.5).domain()
 u, phi = d.fem_symbols(value_shape=(2,), order=2)  # P2 vector displacement
 xi, yi, _ = d.variable("interior", split=True)
 xl, yl, _ = d.variable("left", split=True)  # clamped root

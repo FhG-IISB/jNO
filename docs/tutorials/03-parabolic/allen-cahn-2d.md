@@ -19,10 +19,7 @@ The exact solution is substituted into the PDE to derive a forcing term that mak
 eps = 0.1
 T_end = 1.0
 
-domain = jno.domain(
-    constructor=jno.domain.rect(mesh_size=0.05),
-    time=(0, T_end, 4),
-)
+domain = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain(time=(0, T_end, 4))
 x, y, t = domain.variable("interior")
 
 S = sin(π * x) * sin(π * y)

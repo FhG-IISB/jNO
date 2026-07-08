@@ -13,7 +13,7 @@ import jno
 
 # --8<-- [start:setup]
 # Disc of radius 3 centred at the origin — captures the Gaussian's effective support.
-domain = jno.domain(jno.Shape.disk(0, 0, 3.0, size=0.25))
+domain = jno.Shape.disk(0, 0, 3.0, size=0.25).domain()
 x, y, _ = domain.variable("interior")
 xb, yb, _ = domain.variable("boundary")
 

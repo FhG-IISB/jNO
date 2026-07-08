@@ -1,3 +1,4 @@
+# --8<-- [start:code]
 """Variational PINN (VPINN): the trial is a **neural network**, the test functions are the **FE
 basis**. ``jno.fem`` detects the network trial written into the weak form and test-projects it onto
 the FE test space -- a trainable residual loss, trained through ``jno.core``. No ``init_fem``, no
@@ -10,26 +11,18 @@ on the boundary, so their (irreducible ``∂u/∂n``-flux) residual is masked --
 minimum is not the PDE solution and training would diverge from it.
 """
 
-import os
+import foundax
+import jax  # (jax.nn / jax.random for the network)
+import numpy as np
+import optax
 
-os.environ["MPLBACKEND"] = "Agg"
-
-from pathlib import Path  # noqa: E402
-
-import foundax  # noqa: E402
-import jax  # noqa: E402  (jax.nn / jax.random for the network)
-import matplotlib.pyplot as plt  # noqa: E402
-import matplotlib.tri as mtri  # noqa: E402
-import numpy as np  # noqa: E402
-import optax  # noqa: E402
-
-import jno  # noqa: E402
-import jno.jnp_ops as jnn  # noqa: E402
+import jno
+import jno.jnp_ops as jnn
 
 jax.config.update("jax_enable_x64", True)  # the assembler builds in float64
 
 # ---- domain, network trial, weak form -------------------------------------------------------
-dom = jno.domain(constructor=jno.domain.rect(mesh_size=0.07))
+dom = jno.Shape.rect(0, 0, 1, 1, size=0.07).domain()
 u, phi = dom.fem_symbols()
 xi, yi, _ = dom.variable("interior", split=True)
 xb, yb, _ = dom.variable("boundary", split=True)
@@ -50,7 +43,7 @@ crux = jno.core([pde.mse], domain=dom)
 crux.solve(2500)
 
 # ---- verify the trained network against the analytic solution (on a fresh grid) ------------
-test_dom = jno.domain(constructor=jno.domain.rect(mesh_size=0.04))
+test_dom = jno.Shape.rect(0, 0, 1, 1, size=0.04).domain()
 xt, yt, _ = test_dom.variable("interior", split=True)
 exact_expr = xt * (1 - xt) * yt * (1 - yt)
 pred = np.asarray(crux.eval([net(xt, yt) * exact_expr], domain=test_dom)).reshape(-1)
@@ -58,7 +51,18 @@ exact = np.asarray(crux.eval([exact_expr], domain=test_dom)).reshape(-1)
 rel = float(np.linalg.norm(pred - exact) / np.linalg.norm(exact))
 print(f"  trained VPINN vs analytic x(1-x)y(1-y):  rel-L2 = {rel:.3e}")
 
+assert rel < 1e-2, f"VPINN did not solve Poisson: rel-L2={rel:.3e}"
+# --8<-- [end:code]
+
 # ---- plot the learned field and the error (the actual computed prediction) ------------------
+import os  # noqa: E402
+
+os.environ["MPLBACKEND"] = "Agg"
+from pathlib import Path  # noqa: E402
+
+import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.tri as mtri  # noqa: E402
+
 pts = np.asarray(test_dom.mesh.points)[:, :2]
 tri = mtri.Triangulation(pts[:, 0], pts[:, 1])
 fig, ax = plt.subplots(1, 2, figsize=(9.6, 4.2))
@@ -73,5 +77,3 @@ for a, tp in zip(ax, (tp0, tp1)):
     a.set_yticks([])
 fig.tight_layout()
 fig.savefig(Path(__file__).parents[2] / "assets" / "vpinn_poisson_2d.png", dpi=90)
-
-assert rel < 1e-2, f"VPINN did not solve Poisson: rel-L2={rel:.3e}"

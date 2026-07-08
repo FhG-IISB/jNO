@@ -1,3 +1,4 @@
+# --8<-- [start:code]
 """11 - Time-harmonic 2D Maxwell (in-plane vector E field) with a genuine complex FEM field.
 
 Frequency-domain Maxwell for the in-plane electric field ``E = (Ex, Ey)`` (TE polarisation) is the
@@ -25,18 +26,10 @@ genuinely complex ``k^2`` -- curl(curl E_r)=2*pi^2 E_r, curl(curl E_i)=8*pi^2 E_
 the *computed* field (no invented structure).
 """
 
-import os
-
-os.environ["MPLBACKEND"] = "Agg"
-
 import jax
 
 jax.config.update("jax_enable_x64", True)  # the coupled real system is float64
 
-from pathlib import Path  # noqa: E402
-
-import matplotlib.pyplot as plt  # noqa: E402
-import matplotlib.tri as mtri  # noqa: E402
 import numpy as np  # noqa: E402
 
 import jno  # noqa: E402
@@ -49,7 +42,7 @@ k2 = KR + 1j * KI  # the complex coefficient, written as a plain Python complex
 E_r = lambda X, Y: (pi * sin(pi * X) * cos(pi * Y), -pi * cos(pi * X) * sin(pi * Y))  # noqa: E731
 E_i = lambda X, Y: (2 * pi * sin(2 * pi * X) * cos(2 * pi * Y), -2 * pi * cos(2 * pi * X) * sin(2 * pi * Y))  # noqa: E731
 
-d = jno.domain(jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.06))
+d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.06).domain()
 E, v = d.fem_symbols(value_shape=(2,), names=("E", "v"), order=2, complex=True)  # a P2 COMPLEX vector field + its test
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
@@ -97,8 +90,17 @@ rel = float(np.linalg.norm(np.concatenate([E_re - ex_re, E_im - ex_im])) / np.li
 print("\n2D vector Maxwell (curl-curl, complex k^2) via a complex=True FEM field")
 print(f"  4 real DOF/node, {fem.dofs} DOFs total;  L2 rel error vs manufactured E: {rel:.2e}")
 assert rel < 2e-3, f"manufactured Maxwell not recovered: {rel:.2e}"
+# --8<-- [end:code]
 
 # ---- render the actual computed field (|E| and the Re(E) vectors) -- no invented structure ----
+import os  # noqa: E402
+
+os.environ["MPLBACKEND"] = "Agg"
+from pathlib import Path  # noqa: E402
+
+import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.tri as mtri  # noqa: E402
+
 tris = np.asarray(fem.domain.built_mesh.cells_dict["triangle"])
 triang = mtri.Triangulation(pts[:, 0], pts[:, 1], tris)
 Emag = np.sqrt((E_re**2 + E_im**2).sum(1))  # |E| = sqrt(|Ex|^2 + |Ey|^2)

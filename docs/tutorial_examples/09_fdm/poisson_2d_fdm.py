@@ -16,12 +16,11 @@ import jax
 jax.config.update("jax_enable_x64", True)  # the strong-form solve accumulates in float64
 
 import numpy as np  # noqa: E402
-from shapely.geometry import box  # noqa: E402
 
 import jno  # noqa: E402
 import jno.jnp_ops as jnn  # noqa: E402
 
-d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.06)
+d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.06).domain()
 x, y, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
 u = d.unknown()  # valued P1 nodal field (strong-form counterpart of fem_symbols())

@@ -1,3 +1,4 @@
+# --8<-- [start:code]
 """Brittle fracture — 4th-order phase-field on the cheap Morley element (coupled multiphysics).
 
 A cracking solid minimizes elastic energy + fracture (crack-surface) energy. The variational phase-field
@@ -30,9 +31,7 @@ M. Hofacker, F. Welschinger, CMAME **199** (2010) 2765–2778 — the tension/co
 """
 
 import os
-from pathlib import Path
 
-os.environ.setdefault("MPLBACKEND", "Agg")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")  # stiff biharmonic direct solves — CPU dodges GPU cuSolver OOM
 
 import jax
@@ -40,8 +39,6 @@ import jax
 jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
-import matplotlib.pyplot as plt
-import matplotlib.tri as mtri
 import numpy as np
 
 import jno
@@ -56,7 +53,7 @@ lam, mu = E * nu / ((1 + nu) * (1 - 2 * nu)), E / (2 * (1 + nu))
 Gc, ell, eta = 2.0e-3, 0.08, 1e-3
 h = 0.04
 
-d = jno.domain(jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=h))
+d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=h).domain()
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("bottom", split=True)
 xt, yt, _ = d.variable("top", split=True)
@@ -174,8 +171,15 @@ def main():
     assert fronts[-1] > fronts[0] + 0.3, f"the crack must propagate across: front {fronts[0]:.2f}→{fronts[-1]:.2f}"
     assert (dvals > 0.5).sum() > 2 * int(notch.sum()), "damage must localize into a growing crack band"
     assert fd[-1, 1] < 0.7 * fd[:, 1].max(), "the specimen must soften (reaction drops after the peak)"
+    # --8<-- [end:code]
 
     # --- figure: crack profile | propagated (sharp) crack | force–displacement ---
+    os.environ.setdefault("MPLBACKEND", "Agg")  # noqa: E402
+    from pathlib import Path  # noqa: E402
+
+    import matplotlib.pyplot as plt  # noqa: E402
+    import matplotlib.tri as mtri  # noqa: E402
+
     fig = plt.figure(figsize=(13.5, 4.0))
     ax0 = fig.add_subplot(1, 3, 1)
     rr = np.linspace(0, 0.5, 200)

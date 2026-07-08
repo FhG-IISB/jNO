@@ -17,7 +17,7 @@ import optax
 
 import jno
 
-d = jno.domain(jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1))
+d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).domain()
 u, phi = d.fem_symbols()
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)

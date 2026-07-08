@@ -1,3 +1,4 @@
+# --8<-- [start:code]
 """09 - 2D Helmholtz with a Perfectly Matched Layer (PML), via jno's complex FEM.
 
 A point source radiates outward; a PML frame absorbs the outgoing wave with no reflection, so the
@@ -15,18 +16,10 @@ The script also renders the field (the actual computed solution): the outgoing w
 the PML, versus the reflecting cavity without it.
 """
 
-import os
-
-os.environ["MPLBACKEND"] = "Agg"
-
 import jax
 
 jax.config.update("jax_enable_x64", True)  # the real-equivalent block is float64
 
-from pathlib import Path  # noqa: E402
-
-import matplotlib.pyplot as plt  # noqa: E402
-import matplotlib.tri as mtri  # noqa: E402
 import numpy as np  # noqa: E402
 
 import jno  # noqa: E402
@@ -37,7 +30,7 @@ relu = lambda z: jno.np.maximum(z, 0.0)  # noqa: E731
 
 def solve_pml(sigma0):
     """Complex PML Helmholtz at absorber strength sigma0 (sigma0 = 0 -> no PML, u=0 cavity)."""
-    d = jno.domain(jno.Shape.rect(0.0, 0.0, L, L, size=0.022))
+    d = jno.Shape.rect(0.0, 0.0, L, L, size=0.022).domain()
     u, phi = d.fem_symbols()
     xi, yi, _ = d.variable("interior", split=True)
     xb, yb, _ = d.variable("boundary", split=True)
@@ -55,7 +48,6 @@ fem, u_pml = solve_pml(40.0)
 _, u_strong = solve_pml(60.0)  # 1.5x absorber -> physical core must be unchanged
 _, u_off = solve_pml(0.0)  # no PML: the wave reflects off the walls
 pts = np.asarray(fem.points)
-tris = np.asarray(fem.domain.built_mesh.cells_dict["triangle"])
 
 core = (pts[:, 0] > w) & (pts[:, 0] < L - w) & (pts[:, 1] > w) & (pts[:, 1] < L - w)
 sigma_insens = float(np.linalg.norm(u_pml[core] - u_strong[core]) / np.linalg.norm(u_pml[core]))
@@ -63,7 +55,20 @@ print("\n2D Helmholtz + PML via complex jno.fem")
 print(f"  complex solve: dofs={fem.dofs}  dtype={u_pml.dtype}")
 print(f"  PML reflection-free (sigma-insensitivity rel-L2, 40 vs 60): {sigma_insens:.3e}")
 
+assert fem.is_complex and np.iscomplexobj(u_pml) and not bool(np.isnan(u_pml).any())
+assert sigma_insens < 1e-2, f"PML not reflection-free: {sigma_insens:.3e}"
+# --8<-- [end:code]
+
 # ---- render the actual computed field (no invented structure) ----
+import os  # noqa: E402
+
+os.environ["MPLBACKEND"] = "Agg"
+from pathlib import Path  # noqa: E402
+
+import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.tri as mtri  # noqa: E402
+
+tris = np.asarray(fem.domain.built_mesh.cells_dict["triangle"])
 triang = mtri.Triangulation(pts[:, 0], pts[:, 1], tris)
 wave = float(np.percentile(np.abs(np.real(u_pml)), 88))  # clip so the wavefronts show past the source peak
 fig, ax = plt.subplots(1, 3, figsize=(15, 4.6))
@@ -85,6 +90,3 @@ for a, (title, field, cmap, (vmn, vmx)) in zip(ax, panels):
 fig.suptitle(f"2D Helmholtz + PML (k={k:g}; point source at centre; dashed = PML interface)", fontsize=11)
 fig.tight_layout()
 fig.savefig(Path(__file__).parents[2] / "assets" / "helmholtz_pml_2d.png", dpi=130, bbox_inches="tight")  # docs/assets
-
-assert fem.is_complex and np.iscomplexobj(u_pml) and not bool(np.isnan(u_pml).any())
-assert sigma_insens < 1e-2, f"PML not reflection-free: {sigma_insens:.3e}"

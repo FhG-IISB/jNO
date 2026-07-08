@@ -1,3 +1,4 @@
+# --8<-- [start:code]
 r"""Adaptive mesh refinement on the L-shape, driven by the simple ``jno`` API.
 
 Starting from a *coarse* uniform mesh, we repeatedly
@@ -77,6 +78,9 @@ def run_adaptive(mesh_size=0.3, n_rounds=6, theta=0.6, refine_factor=1.7):
             break
         d.refine(size_field_from_marks(d, marked, refine_factor=refine_factor))
     return snapshots
+
+
+# --8<-- [end:code]
 
 
 # --- rendering -----------------------------------------------------------------------

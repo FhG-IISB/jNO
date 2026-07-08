@@ -11,7 +11,7 @@ N_SAMPLES = 50
 EPOCHS = 2_000
 
 # ── Parametric domain — replicate one mesh across N_SAMPLES random k values ──
-dom = N_SAMPLES * jno.domain(jno.Shape.rect(0, 0, 2, 1, size=0.05))
+dom = N_SAMPLES * jno.Shape.rect(0, 0, 2, 1, size=0.05).domain()
 x, y, _ = dom.variable("interior")
 
 k_values = jax.random.uniform(KEY, shape=(N_SAMPLES, 1, 1), minval=0.5, maxval=1.5)

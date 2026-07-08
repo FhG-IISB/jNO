@@ -10,9 +10,8 @@ import jno
 ε = 0.1
 T_end = 1.0
 
-# Time-dependent rectangle (jno.domain.rect produces the time-extended sampler;
-# PolygonDomain doesn't yet support the ``time=`` axis).
-domain = jno.domain.rect(mesh_size=0.05, time=(0, T_end, 4))
+# Time-dependent unit square: the Shape one-liner forwards ``time=`` to the domain.
+domain = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain(time=(0, T_end, 4))
 x, y, t = domain.variable("interior")
 
 S = jno.np.sin(π * x) * jno.np.sin(π * y)

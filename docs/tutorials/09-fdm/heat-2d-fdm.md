@@ -17,7 +17,7 @@ flag. The time window and step count come from `domain.time = (t0, t1, n)`, and 
 the time derivative:
 
 ```python
-d = jno.domain(box(0, 0, 1, 1), mesh_size=0.06, time=(0.0, 0.5, 200))
+d = jno.Shape.rect(0, 0, 1, 1, size=0.06).domain(time=(0.0, 0.5, 200))
 x, y, t   = d.variable("interior", split=True)     # temporal Variable t
 xi, yi, _ = d.variable("initial",  split=True)     # the t = t0 slice
 ui = u.bind(x=x, y=y, t=t)

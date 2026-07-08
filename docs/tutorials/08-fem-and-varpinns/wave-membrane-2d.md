@@ -25,22 +25,23 @@ fem  = jno.fem([weak, u(xb, yb) - 0.0,
                 ui0.t - 0.0])                               # velocity IC (at rest)
 ```
 
-## Step with θ=½, not backward Euler
+## `fem.solve()` steps with θ=½, not backward Euler
 
-The assembled block is the usual transient block (`fem.M`, `fem.operator.A`, `fem.state0`), with
-state $y=[u;v]$ of size $2N$ — split with `fem.offsets` (`[0, N, 2N]`). **Unlike** the parabolic
-(first-order) case, integrate with the energy-conserving **trapezoidal rule** (θ=½); plain backward
-Euler would spuriously damp the membrane:
+The augmented block has state $y=[u;v]$ of size $2N$ — split with `fem.offsets` (`[0, N, 2N]`).
+`fem.solve()` integrates it itself with the energy-conserving **trapezoidal rule** (θ=½) — **not**
+plain backward Euler, which (unlike the parabolic first-order case) would spuriously damp an undamped
+membrane. For a transient solve the result is a differentiable *trace node*, so we read the trajectory
+(one $y$ per step) through a minimal crux and split it into displacement and velocity:
 
 ```python
-M, A = dense(fem.M), dense(fem.operator.A)
-lhs, rhs = M + 0.5 * dt * A, M - 0.5 * dt * A        # θ=½: (M+½dtA) y⁺ = (M−½dtA) y
-y = np.asarray(fem.state0)
-for _ in range(n_steps):
-    y = np.linalg.solve(lhs, rhs @ y)
+N   = fem.offsets[1]                                 # y = [u; v]; first N = displacement
+sol = fem.solve()                                    # θ=½ trapezoidal stepping, done inside
+state = np.asarray(jno.core([sol.mse]).eval([sol]))  # (n_steps, 2N) trajectory of y = [u; v]
+traj, V = state[:, :N], state[:, N:]                 # displacement and velocity histories
 ```
 
-(Or call `fem.solve()`, which applies θ=½ for you.)
+The energy check $E=\tfrac12 v^\top M v+\tfrac12 u^\top K u$ still pulls the mass/stiffness blocks
+straight from `fem.M` and `fem.operator.A`.
 
 ## What to notice
 

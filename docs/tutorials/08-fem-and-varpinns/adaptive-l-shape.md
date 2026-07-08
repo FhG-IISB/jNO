@@ -64,5 +64,5 @@ error estimate at ~455 DOFs than a uniform mesh at ~828 DOFs.
 ## Full script
 
 ```python
---8<-- "tutorial_examples/08_fem_and_varpinns/adaptive_l_shape.py"
+--8<-- "tutorial_examples/08_fem_and_varpinns/adaptive_l_shape.py:code"
 ```

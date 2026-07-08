@@ -11,7 +11,7 @@ import jno
 π = jno.np.pi
 
 # --8<-- [start:setup]
-domain = jno.domain(jno.Shape.rect(0, 0, 1, 1, size=0.05))
+domain = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain()
 x, y, _ = domain.variable("interior")
 
 κ = 1 + x + y
