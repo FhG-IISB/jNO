@@ -40,13 +40,13 @@ class LossPrinter(Callback):
 crux.solve(10_000, callbacks=[LossPrinter(every=500)])
 ```
 
-Hooks you don't need can simply be omitted — the base class supplies no-op defaults. The built-in callbacks below all subclass `Callback` themselves; they are convenience helpers, not the only thing the system supports.
+Hooks you don't need can simply be omitted — the base class supplies no-op defaults.
 
 ---
 
 ## Built-in callbacks
 
-For the common cases, jno ships these out of the box. Each is a `jno.callbacks.*` factory that returns a pre-configured `Callback` instance.
+Each is a `jno.callbacks.*` factory that returns a pre-configured `Callback` instance.
 
 ### Early Stopping
 
@@ -172,8 +172,6 @@ crux = jno.core([pde.mse, bc.mse])
 crux.solve(500)
 ```
 
-`jno.core.solve()` detects the `ENGDOptimizer` sentinel, builds `gram_terms` from every constraint that involves the model, injects `optax.sgd(1.0)` as the update transform, and prepends an `ENGDCallback` — all without any extra boilerplate.
-
 **Manual form — `jno.callbacks.engd()` (full control over `gram_terms`):**
 
 ```python
@@ -193,7 +191,7 @@ crux = jno.core([pde.mse, bc.mse])
 crux.solve(500, callbacks=[engd])
 ```
 
-**Grid line search (`line_search=True`):** Reproduces the paper's headline accuracy by searching over α ∈ {0.5⁰, …, 0.5³⁰} each iteration to find the optimal step size.  This is the recommended setting for faithful reproduction of §4.1 results: the energy Gram is initially ill-conditioned, making the natural-gradient *direction* correct but its *magnitude* unreliable.  The line search removes the need for manual step-size tuning.  Use `optax.sgd(1.0)` — the selected α is folded into the returned gradient:
+**Grid line search (`line_search=True`):** This is the recommended setting for faithful reproduction of §4.1 results: the energy Gram is initially ill-conditioned, making the natural-gradient *direction* correct but its *magnitude* unreliable.  Use `optax.sgd(1.0)` — the selected α is folded into the returned gradient:
 
 ```python
 engd = jno.callbacks.engd(
