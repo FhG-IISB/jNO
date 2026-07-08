@@ -103,7 +103,7 @@ method, assembled FE-exact on the element space for a nodal-parameter field. For
 weak form, `fem.solve()` returns the trajectory
 `u(save_ts)`, so a rate constant is recovered from a time series. Worked examples:
 [hidden diffusivity field](tutorials/08-fem-and-varpinns/inverse-diffusivity-field.md) and
-[transient rate](tutorials/08-fem-and-varpinns/transient-inverse-heat.md).
+[transient rate](tutorials/08-fem-and-varpinns/inverse-diffusivity-field.md).
 
 ---
 

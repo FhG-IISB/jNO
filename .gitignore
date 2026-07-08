@@ -50,3 +50,4 @@ whitepapers/
 !.pixi/config.toml
 .coverage
 coverage.xml
+_tutorials_archive/

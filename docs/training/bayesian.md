@@ -372,14 +372,14 @@ class _BayesianInitializer:
 
 | Slot | Algorithm | Notes |
 |---|---|---|
-| `jno.bayesian.pathfinder(...)` | blackjax pathfinder | This release.  See [Tutorial 11](../tutorials/10-bayesian-pinns/pathfinder-init.md). |
-| `jno.bayesian.laplace(...)` | MAP via optax + `jax.hessian` (diagonal or full) | This release.  See [Tutorial 12](../tutorials/10-bayesian-pinns/laplace-init.md).  MacKay 1992 §6; Daxberger et al. 2021 §2. |
-| `jno.bayesian.svgd(...)` | blackjax svgd | This release.  See [Tutorial 13](../tutorials/10-bayesian-pinns/svgd-init.md).  K particles → K chain inits.  Liu & Wang 2016 §3. |
+| `jno.bayesian.pathfinder(...)` | blackjax pathfinder | This release.  See [Tutorial 11](../tutorials/10-bayesian-pinns/index.md). |
+| `jno.bayesian.laplace(...)` | MAP via optax + `jax.hessian` (diagonal or full) | This release.  See [Tutorial 12](../tutorials/10-bayesian-pinns/index.md).  MacKay 1992 §6; Daxberger et al. 2021 §2. |
+| `jno.bayesian.svgd(...)` | blackjax svgd | This release.  See [Tutorial 13](../tutorials/10-bayesian-pinns/index.md).  K particles → K chain inits.  Liu & Wang 2016 §3. |
 | `jno.bayesian.map(...)` | Fixed-step optax warm-start | Future.  No IMM output; user keeps step_size. |
-| User-written subclass | anything that fits the contract | See [Tutorial 11](../tutorials/10-bayesian-pinns/pathfinder-init.md). |
+| User-written subclass | anything that fits the contract | See [Tutorial 11](../tutorials/10-bayesian-pinns/index.md). |
 
 A worked example lives at
-[Tutorial 11](../tutorials/10-bayesian-pinns/pathfinder-init.md).
+[Tutorial 11](../tutorials/10-bayesian-pinns/index.md).
 
 ## Multiple chains
 
@@ -448,7 +448,7 @@ and want a hard failure if the chain layout doesn't carry them
 (catches bugs where you thought you had 4 chains but `posterior_samples`
 came back as `(1, N, *param)`).
 
-See [Tutorial 08](../tutorials/10-bayesian-pinns/multichain-nuts.md)
+See [Tutorial 08](../tutorials/10-bayesian-pinns/index.md)
 for a worked end-to-end example.
 
 ## Per-step kernel diagnostics — `model.posterior_diagnostics`
@@ -617,7 +617,7 @@ a.vi(
     still correct.  Available on both Pattern A (global) and Pattern
     B/D (masked) configurators.
 
-    See [Tutorial 09](../tutorials/10-bayesian-pinns/vi-bnn-regression.md)
+    See [Tutorial 09](../tutorials/10-bayesian-pinns/index.md)
     for a worked end-to-end example.
 
 ### Diagnostics caveat
@@ -662,7 +662,7 @@ the mask are constant.  `crux.eval([net(x)], samples="auto")`,
 special case for masked solves.
 
 A worked example lives at
-[Tutorial 10](../tutorials/10-bayesian-pinns/masked-bnn-head.md).
+[Tutorial 10](../tutorials/10-bayesian-pinns/index.md).
 
 ### What's supported
 
@@ -673,7 +673,7 @@ A worked example lives at
   `.optimizer(...)` on the same model.  Body is Adam-trained; head is
   MCMC-sampled.  **K=1 and K>1 both supported**: for K>1 the body's
   gradient is computed at the chain-0 representative head (SAEM
-  simplification).  Tutorial: [T14](../tutorials/10-bayesian-pinns/pattern-b-bnn-head.md).
+  simplification).  Tutorial: [T14](../tutorials/10-bayesian-pinns/index.md).
 
   !!! warning "Pattern B + K>1 — SAEM chain-0 representative"
       When ``num_chains>1`` with Pattern B, only one of the K head
@@ -782,7 +782,7 @@ step dispatch.
   the API expects the forward to be expressible as a jNO Placeholder
   expression.  For those cases use blackjax directly with jNO supplying
   the differentiable forward; see [Inverse FEM
-  Diffusivity](../tutorials/10-bayesian-pinns/inverse-fem-diffusivity.md)
+  Diffusivity](../tutorials/10-bayesian-pinns/index.md)
   for the pattern.
 
 ## Combining with `substeps=`
