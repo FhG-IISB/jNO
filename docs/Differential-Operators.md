@@ -60,6 +60,31 @@ lap = jnn.laplacian(u, [x, y], scheme="finite_difference:cotangent")
 
 ---
 
+## Concise object syntax
+
+Every traced expression carries **derivative methods**, so you can write derivatives inline without
+reaching for `jnn` — the scheme rides on the call:
+
+```python
+u_x  = u.d(x)                                 # ∂u/∂x   (a Jacobian) — same as jnn.grad(u, x)
+u_xx = u.dd(x)                                # ∂²u/∂x² (a Hessian)  — same as jnn.hessian(u, [x])
+u_x  = u.d(x, scheme="finite_difference")     # the scheme is an argument on the object
+```
+
+**FEM weak forms — `.bind` then `.x`.** A finite-element trial/test symbol is bound to a set of
+quadrature coordinates *once*, after which its spatial and time derivatives read as plain attributes:
+
+```python
+ui = u.bind(x=xi, y=yi, t=ti)                 # bind the symbol to coordinates
+ui.x, ui.y, ui.z                              # spatial derivatives (∂u/∂x, ∂u/∂y, ∂u/∂z)
+ui.t                                          # time derivative
+```
+
+`u.bind(...)` is specific to FEM symbols (a plain network output uses `u.d(x)` above); it is the
+spelling used throughout the [Finite Element Method](fem.md) weak-form language.
+
+---
+
 ## Differentiation
 
 ### Gradient (first derivative)
