@@ -6,14 +6,6 @@ All strategies are available via the `jno.sampler` factory class.
 
 ---
 
-## Why Adaptive Resampling?
-
-Standard PINNs fix collocation points at the start of training. In problems with sharp gradients, boundary layers, or discontinuities, a uniform distribution of points is inefficient — many points may lie in well-solved, low-error regions while the challenging parts receive too few points.
-
-Adaptive strategies periodically replace a fraction of points based on some criterion (residual, gradient, influence), concentrating them where the network struggles.
-
----
-
 ## Build your own strategy
 
 Any subclass of `ResamplingStrategy` is a valid strategy — override one abstract method:
@@ -48,8 +40,6 @@ x, y = domain.variable(
     resampling_strategy=TopResidual(resample_every=100, resample_fraction=0.2, start_epoch=1000),
 )
 ```
-
-The built-in strategies below all subclass `ResamplingStrategy` themselves — they are common patterns shipped for convenience, not the only thing the system supports.
 
 ---
 
