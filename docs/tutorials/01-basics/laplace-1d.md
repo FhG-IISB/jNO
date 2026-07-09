@@ -18,9 +18,12 @@ Exact solution: `u(x) = x` (the straight line between the two boundary values).
 ## Step 1: Create the Domain
 
 ```python
-domain = jno.domain.line(mesh_size=0.1)
+domain = jno.Path(0.0, 0.0).line_to(1.0, 0.0).curve(size=0.1).domain()  # x in [0, 1]
 x, _ = domain.variable("interior")
 ```
+
+The `Path` DSL builds the 1-D interval as a curve; its endpoints are reachable as
+`domain.variable("left" / "right" / "boundary")`.
 
 ## Step 2: Build the Network with a Non-Homogeneous Hard Ansatz
 
@@ -55,6 +58,12 @@ crux = jno.core([pde.mse])
 history = crux.solve(5000)
 ```
 
+## Result
+
+![Left: jNO prediction over-plotted on the exact line u=x. Right: relative L2 error vs collocation-point count on log-log axes.](/jNO/assets/laplace_1d.png)
+
+The hard-BC ansatz reproduces the exact line to rel-$L^2 \approx 9\times10^{-6}$ (left). Because the exact solution lives in the trial space, the residual error here is training-limited rather than discretization-limited; re-solving at 5, 10, 20 and 40 collocation points still shows it falling from $2.2\times10^{-5}$ to $3.6\times10^{-6}$ (right).
+
 ## What To Notice
 
 - The non-homogeneous BCs require an ansatz that **adds** to a satisfying solution rather than just multiplying. The general recipe is `u = boundary_lift(x) + zero_at_boundary(x) * net(x)`.
@@ -68,5 +77,5 @@ history = crux.solve(5000)
 ## Script Snippet
 
 ```python
---8<-- "tutorial_examples/01_basics/laplace_1d.py"
+--8<-- "tutorial_examples/01_basics/laplace_1d.py:code"
 ```

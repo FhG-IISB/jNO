@@ -67,6 +67,16 @@ crux    = jno.core([pde.mse, ini.mse])
 history = crux.solve(5000)
 ```
 
+## Result
+
+![Time-lapse of the jNO field u(x,y,t) decaying from t=0 to t=1 on a fixed colour scale.](/jNO/assets/allen_cahn_2d.gif)
+
+The network's own field is evaluated on a finer time grid and animated above; the single central bump decays like $e^{-t}$, as the manufactured solution prescribes.
+
+![Three panels at t=1: jNO field, exact e^-t sin(pi x) sin(pi y), and their signed error.](/jNO/assets/allen_cahn_2d.png)
+
+At the final time the prediction matches the manufactured solution to rel-$L^2 \approx 1.5\times10^{-3}$ (signed-error panel, right, centered at 0).
+
 ## What To Notice
 
 - Nonlinear reaction terms are easy to express once the field is available symbolically.
@@ -81,5 +91,5 @@ history = crux.solve(5000)
 ## Script Snippet
 
 ```python
---8<-- "tutorial_examples/03_parabolic/allen_cahn_2d.py"
+--8<-- "tutorial_examples/03_parabolic/allen_cahn_2d.py:code"
 ```
