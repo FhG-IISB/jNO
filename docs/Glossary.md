@@ -51,7 +51,7 @@ The collection of per-parameter knobs set on a network wrapped via
 `jno.nn(...)` — `optimizer`, `lr`, `freeze` / `unfreeze`, `mask`,
 `lora`, `dtype`, `constrain`, `initialize`. Chain `.mask(M)` before any
 of these to scope the next call to a parameter subset. Full reference
-and worked examples in [Model Controls](model-controls/index.md).
+and worked examples in [Operations → Part B](operations.md#part-b-operations-that-require-trainable-parameters).
 
 ### Mesh (overloaded)
 

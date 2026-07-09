@@ -66,6 +66,12 @@ extra_javascript:
 
 not_in_nav: |
   /Docker.md
+  /Differential-Operators.md
+  /operators/integral.md
+  /model-controls/index.md
+  /model-controls/mask-freeze.md
+  /model-controls/initialize-dtype-tune.md
+  /model-controls/diagnostics.md
 
 nav:
   - Home: index.md
@@ -74,10 +80,8 @@ nav:
   - Getting to Know jNO:
     - Concepts: concepts.md
     - Domain and Geometry: Domain-and-Geometry.md
-    - Operators:
-      - Differential Operators: Differential-Operators.md
-      - Integral Operators: operators/integral.md
-      - jno.numpy Reference: operators/numpy-reference.md
+    - Operations: operations.md
+    - jno.numpy Reference: operators/numpy-reference.md
     - Miscellaneous:
       - Overview: misc.md
       - Weights & Biases: misc/wandb.md
@@ -98,13 +102,9 @@ nav:
       - Explainability: training/explainability.md
     - Bayesian Sampling: training/bayesian.md
     - Inverse Problems: inverse-problems.md
-    - Model Controls:
-      - Overview: model-controls/index.md
-      - Mask & Freeze: model-controls/mask-freeze.md
-      - LoRA: model-controls/lora.md
+    - Advanced Model Controls:
       - Optimizer & LR: model-controls/optimizer-lr.md
-      - Initialize, Dtype & Tune: model-controls/initialize-dtype-tune.md
-      - Diagnostics: model-controls/diagnostics.md
+      - LoRA: model-controls/lora.md
       - IREE Deployment: model-controls/iree.md
   - Traditional Solvers:
     - Finite Element Method: fem.md

@@ -12,7 +12,7 @@ docs:** **[https://fhg-iisb.github.io/foundax/](https://fhg-iisb.github.io/found
 
 ## Wrapping a model
 
-`jno.nn` accepts any [Equinox](https://docs.kidger.site/equinox/) module. foundax models are Equinox modules, but you can wrap your own `eqx.Module` in exactly the same way — see [Model Controls](../model-controls/index.md#quick-start) for a custom model example.
+`jno.nn` accepts any [Equinox](https://docs.kidger.site/equinox/) module. foundax models are Equinox modules, but you can wrap your own `eqx.Module` in exactly the same way — see [Operations → Part B](../operations.md#part-b-operations-that-require-trainable-parameters) for a custom model example.
 
 ```python
 import foundax
@@ -24,7 +24,7 @@ net = jno.nn(foundax.mlp(in_features=2, hidden_dims=64, num_layers=4,
 net.optimizer(optax.adam(1e-3))
 ```
 
-Once wrapped, all jNO model controls are available: freeze, masks, LoRA, dtype conversion, and diagnostics. See [Model Controls](../model-controls/index.md).
+Once wrapped, all jNO model controls are available: freeze, masks, LoRA, dtype conversion, and diagnostics. See [Operations → Part B](../operations.md#part-b-operations-that-require-trainable-parameters).
 
 ---
 

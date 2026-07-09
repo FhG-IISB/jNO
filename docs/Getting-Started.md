@@ -45,7 +45,7 @@ net.optimizer(optax.adam(1e-3))
 ## 4. Write the PDE residual
 
 Call the network on the coordinates and take derivatives with the [differential
-operators](Differential-Operators.md) — here the concise `u.dd(x)` (second derivative). Multiplying by
+operators](operations.md#differentiation) — here the concise `u.dd(x)` (second derivative). Multiplying by
 `x(1-x)y(1-y)` makes the ansatz vanish on `∂Ω`, so the Dirichlet BC is enforced **exactly** with no loss
 term:
 
@@ -90,8 +90,8 @@ print(pred.shape)                       # the learned field, sampled on the fine
 ## Where to go next
 
 - **Geometry** — build real shapes (CSG, curved boundaries, mesh density): [Domain & Geometry](Domain-and-Geometry.md).
-- **Operators** — every derivative / integral you can write into a residual: [Differential Operators](Differential-Operators.md).
+- **Operators** — every derivative / integral you can write into a residual: [Operations](operations.md#differentiation).
 - **Training** — schedules, resampling, callbacks, parallelism: [PINN & NN Training](training/index.md).
-- **Model controls** — freeze, mask, LoRA, dtype, tuning: [Model Controls](model-controls/index.md).
+- **Model controls** — freeze, mask, LoRA, dtype, tuning: [Operations → Part B](operations.md#part-b-operations-that-require-trainable-parameters).
 - **Traditional solvers** — assemble and solve a weak form: [Finite Element Method](fem.md).
 - **Tutorials** — worked end-to-end examples (PINN, operator learning, FEM, Bayesian): [Tutorials](tutorials/01-basics/laplace-1d.md).
