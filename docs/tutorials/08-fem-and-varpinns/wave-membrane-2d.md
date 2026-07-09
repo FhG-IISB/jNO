@@ -25,22 +25,23 @@ fem  = jno.fem([weak, u(xb, yb) - 0.0,
                 ui0.t - 0.0])                               # velocity IC (at rest)
 ```
 
-## Step with θ=½, not backward Euler
+## `fem.solve()` steps with θ=½, not backward Euler
 
-The assembled block is the usual transient block (`fem.M`, `fem.operator.A`, `fem.state0`), with
-state $y=[u;v]$ of size $2N$ — split with `fem.offsets` (`[0, N, 2N]`). **Unlike** the parabolic
-(first-order) case, integrate with the energy-conserving **trapezoidal rule** (θ=½); plain backward
-Euler would spuriously damp the membrane:
+The augmented block has state $y=[u;v]$ of size $2N$ — split with `fem.offsets` (`[0, N, 2N]`).
+`fem.solve()` integrates it itself with the energy-conserving **trapezoidal rule** (θ=½) — **not**
+plain backward Euler, which (unlike the parabolic first-order case) would spuriously damp an undamped
+membrane. For a transient solve the result is a differentiable *trace node*, so we read the trajectory
+(one $y$ per step) through a minimal crux and split it into displacement and velocity:
 
 ```python
-M, A = dense(fem.M), dense(fem.operator.A)
-lhs, rhs = M + 0.5 * dt * A, M - 0.5 * dt * A        # θ=½: (M+½dtA) y⁺ = (M−½dtA) y
-y = np.asarray(fem.state0)
-for _ in range(n_steps):
-    y = np.linalg.solve(lhs, rhs @ y)
+N   = fem.offsets[1]                                 # y = [u; v]; first N = displacement
+sol = fem.solve()                                    # θ=½ trapezoidal stepping, done inside
+state = np.asarray(jno.core([sol.mse]).eval([sol]))  # (n_steps, 2N) trajectory of y = [u; v]
+traj, V = state[:, :N], state[:, N:]                 # displacement and velocity histories
 ```
 
-(Or call `fem.solve()`, which applies θ=½ for you.)
+The energy check $E=\tfrac12 v^\top M v+\tfrac12 u^\top K u$ still pulls the mass/stiffness blocks
+straight from `fem.M` and `fem.operator.A`.
 
 ## What to notice
 
@@ -50,8 +51,18 @@ for _ in range(n_steps):
 - The amplitude after one period is conserved ($\approx 1$) — the trapezoidal rule does not bleed
   energy from an undamped wave (Newmark average-acceleration; Newmark 1959).
 
+## Result
+
+![Animation of the membrane displacement over one period on a symmetric red-blue scale, the fundamental mode oscillating between positive and negative.](/jNO/assets/wave_membrane_2d.gif)
+
+The fundamental mode swings between its positive and negative extremes and back over one period, on a colour scale held fixed and symmetric across every frame.
+
+![Line plot of the centre-node displacement from jNO versus the analytic cosine over one period; the two curves overlap.](/jNO/assets/wave_membrane_2d.png)
+
+The centre antinode tracks the analytic standing wave $\sin(\pi x)\sin(\pi y)\cos(\omega t)$ to rel-$L^2\approx1.2\times10^{-2}$ over the full period, and the amplitude is conserved ($\approx1$) — the trapezoidal ($\theta=\tfrac12$) rule does not bleed energy from the undamped drum.
+
 ## Full script
 
 ```python
---8<-- "tutorial_examples/08_fem_and_varpinns/wave_membrane_2d.py"
+--8<-- "tutorial_examples/08_fem_and_varpinns/wave_membrane_2d.py:code"
 ```

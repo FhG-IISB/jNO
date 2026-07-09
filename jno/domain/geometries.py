@@ -61,20 +61,37 @@ def _order_from_top_right(vertices):
 class Geometries:
     @staticmethod
     def line(x_range=(0, 1), mesh_size=0.1):
-        """Create a 1D line domain."""
+        """Create a 1D line domain.
+
+        Built directly as a two-block ``meshio.Mesh`` (a ``line`` volume block + a
+        ``vertex`` boundary block for the two endpoints), rather than via pygmsh: a
+        pygmsh 0-D *point* physical group round-trips to a malformed scalar
+        ``cell_set`` with no vertex block, so ``variable("left"/"right"/"boundary")``
+        could not resolve. The explicit two-block form is exactly the contract
+        ``_extract_points_from_mesh`` consumes (endpoints named ``left``/``right``).
+        """
 
         def constructor(geo):
-            x0, x1 = x_range
-            p0 = geo.add_point([x0, 0], mesh_size=mesh_size)
-            p1 = geo.add_point([x1, 0], mesh_size=mesh_size)
-            line = geo.add_line(p0, p1)
+            import meshio
 
-            geo.add_physical(line, "interior")
-            geo.add_physical([p0], "left")
-            geo.add_physical([p1], "right")
-            geo.add_physical([p0, p1], "boundary")
-
-            return geo, 1, mesh_size
+            x0, x1 = float(x_range[0]), float(x_range[1])
+            n = max(int(round(abs(x1 - x0) / float(mesh_size))), 1)  # number of segments
+            xs = np.linspace(x0, x1, n + 1)
+            points = np.column_stack([xs, np.zeros_like(xs), np.zeros_like(xs)])
+            lines = np.column_stack([np.arange(n), np.arange(1, n + 1)]).astype(np.int64)
+            verts = np.array([[0], [n]], dtype=np.int64)  # the two endpoint nodes
+            empty = np.array([], dtype=np.int64)
+            mesh = meshio.Mesh(
+                points=points,
+                cells=[("line", lines), ("vertex", verts)],
+                cell_sets={
+                    "interior": [np.arange(n, dtype=np.int64), empty.copy()],
+                    "left": [empty.copy(), np.array([0], dtype=np.int64)],
+                    "right": [empty.copy(), np.array([1], dtype=np.int64)],
+                    "boundary": [empty.copy(), np.array([0, 1], dtype=np.int64)],
+                },
+            )
+            return mesh, 1, mesh_size
 
         return constructor
 

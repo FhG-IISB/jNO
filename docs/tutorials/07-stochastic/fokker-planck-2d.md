@@ -85,11 +85,19 @@ The domain is centred at $(0, 0)$ so the Gaussian peak sits at the domain centre
 
 Three losses compete: PDE residual, normalization, and noisy boundary data. The solver balances them using its built-in loss weighting.
 
+The optimizer is an `optax.chain` that prepends `optax.clip_by_global_norm(1.0)` to the Adam step — global-norm gradient clipping caps the occasional huge gradient spikes from the stiff advection–diffusion residual so a single bad batch can't destabilise training.
+
 ```python
 --8<-- "tutorial_examples/07_stochastic/fokker_planck_2d.py:solve"
 ```
 
 ---
+
+## Result
+
+![Three panels on the disc: computed stationary density p(x,y) in cividis peaking at ~0.32 at the origin, the analytic Gaussian e^-(x^2+y^2)/pi on the same scale, and their signed difference in red-blue centred at zero with amplitude ~6e-3.](/jNO/assets/fokker_planck_2d.png)
+
+The network's stationary density (left) matches the analytic Ornstein-Uhlenbeck Gaussian $p^\infty=e^{-(x^2+y^2)}/\pi$ (centre) to rel-$L^2\approx2.5\times10^{-2}$, recovering the correct peak height $1/\pi\approx0.318$. The signed error (right) is at the $10^{-3}$ level and concentrated near the sharp central peak.
 
 ## What to Notice
 
@@ -103,7 +111,7 @@ Three losses compete: PDE residual, normalization, and noisy boundary data. The 
 ## Full Script
 
 ```python
---8<-- "tutorial_examples/07_stochastic/fokker_planck_2d.py"
+--8<-- "tutorial_examples/07_stochastic/fokker_planck_2d.py:code"
 ```
 
 <div class="hero-actions" markdown>

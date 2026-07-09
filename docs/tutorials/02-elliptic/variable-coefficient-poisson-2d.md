@@ -40,6 +40,12 @@ The residual → core → solve workflow is unchanged from the constant-coeffici
 --8<-- "tutorial_examples/02_elliptic/variable_coefficient_poisson_2d.py:solve"
 ```
 
+## Result
+
+![Three panels: the jNO field u, the exact sin(pi x) sin(pi y), and their signed pointwise error.](/jNO/assets/variable_coefficient_poisson_2d.png)
+
+Evaluated on the mesh nodes, the trained network reproduces the manufactured solution to rel-$L^2 \approx 1.1\times10^{-3}$; the signed-error panel (right, centered at 0) shows the residual sits around $10^{-3}$ and is largest in the interior, well away from the hard-enforced boundary.
+
 ## What to notice
 
 - `u.grad(x, y)` returns a `VectorView`; multiplying by the scalar `kappa` preserves the view type (`Placeholder × VectorView → VectorView`), so the chain `kappa * u.grad(x, y) → .div(x, y)` reads exactly like the math `∇·(κ∇u)`.
@@ -54,5 +60,5 @@ The residual → core → solve workflow is unchanged from the constant-coeffici
 ## Full script
 
 ```python
---8<-- "tutorial_examples/02_elliptic/variable_coefficient_poisson_2d.py"
+--8<-- "tutorial_examples/02_elliptic/variable_coefficient_poisson_2d.py:code"
 ```

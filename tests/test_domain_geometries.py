@@ -31,6 +31,23 @@ def test_geometry_shortcut_routes_domain_kwargs():
     assert dom.mesh_connectivity is None
 
 
+def test_line_domain_exposes_named_endpoints():
+    """jno.domain.line must resolve left/right/boundary at the interval ends.
+
+    Regression: the pygmsh 1-D path emitted a malformed single-block mesh (scalar
+    point cell_sets, no vertex block), so variable('left'/'right'/'boundary') raised.
+    """
+    import numpy as np
+
+    dom = jno.domain(constructor=jno.domain.line(x_range=(0.0, 1.0), mesh_size=0.1))
+    assert dom.dimension == 1
+    for tag in ("interior", "left", "right", "boundary"):
+        dom.variable(tag)  # must not raise
+    assert np.allclose(np.asarray(dom._mesh_pool["left"]).reshape(-1), [0.0])
+    assert np.allclose(np.asarray(dom._mesh_pool["right"]).reshape(-1), [1.0])
+    assert np.allclose(np.sort(np.asarray(dom._mesh_pool["boundary"]).reshape(-1)), [0.0, 1.0])
+
+
 @pytest.mark.parametrize(
     ("shape_name", "expected_parameters"),
     [

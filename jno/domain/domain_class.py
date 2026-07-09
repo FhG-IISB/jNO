@@ -31,6 +31,52 @@ def _scalar_float(value: Any) -> float:
     return float(arr.item())
 
 
+def _is_facet_predicate(where) -> bool:
+    """True if ``where`` is a richer boundary-facet predicate ``f(x, n, name)`` (by param names)."""
+    import inspect
+
+    try:
+        params = list(inspect.signature(where).parameters)
+    except (ValueError, TypeError):
+        return False
+    return len(params) == 3 and params[1] in ("n", "normal", "normals") and params[2] in ("name", "names")
+
+
+def _facet_normals(ents, dim):
+    """Outward unit normal per boundary facet (``ents`` is ``(E, k, dim)`` facet-vertex coords).
+
+    Geometric normal oriented away from the boundary centroid -- a reasonable orientation for a
+    *selection* predicate (rough on strongly concave boundaries).
+    """
+    ents = np.asarray(ents, dtype=float)
+    ctr = ents.reshape(-1, dim).mean(axis=0)
+    out = np.zeros((len(ents), dim), dtype=float)
+    for i, f in enumerate(ents):
+        if dim == 2:
+            t = f[1] - f[0]
+            n = np.array([t[1], -t[0]])
+        else:
+            n = np.cross(f[1] - f[0], f[2] - f[0])
+        n = n / (np.linalg.norm(n) + 1e-30)
+        if np.dot(n, f.mean(axis=0) - ctr) < 0.0:
+            n = -n
+        out[i] = n
+    return out
+
+
+def _facet_current_names(boundary_regions, mid):
+    """Each facet centroid's current region name (the specific named region containing it, else
+    ``"boundary"``)."""
+    names = np.array(["boundary"] * len(mid), dtype=object)
+    for tag, region in boundary_regions.items():
+        if tag == "boundary":
+            continue
+        for i, p in enumerate(mid):
+            if names[i] == "boundary" and region.contains(p):
+                names[i] = tag
+    return names
+
+
 class domain(MeshIOMixin):
     """
     Mesh-based domain class for defining computational domains and sampling collocation points.
@@ -1239,6 +1285,24 @@ class domain(MeshIOMixin):
         """Advanced helper for explicit FEM-only authoring."""
         return TrialFunction(name=name, value_shape=value_shape, order=order)
 
+    def unknown(self, value_shape=(), name="u"):
+        """The discrete **unknown solution field** on this domain's mesh — a *valued* P1 nodal field
+        for strong-form / collocation methods (``jno.fdm``, …), the counterpart to the *symbolic*
+        trial from :meth:`fem_symbols`.
+
+        Where ``fem_symbols()`` gives an abstract weak-form ``TrialFunction`` (valued only during FE
+        assembly), ``unknown()`` gives a field whose DOFs *are* the unknown, so it supports strong-form
+        derivatives (``u.d2(x, scheme=...)``) and is the object a strong-form solver solves for::
+
+            u = domain.unknown()
+            jno.fdm([-u.d2(x) - u.d2(y) - f, u(xb, yb) - g]).solve()
+        """
+        from ..architectures.models import parameter
+
+        sym = TrialFunction(name=name, value_shape=value_shape, order=1)
+        sym._domain = self  # so parameter() sizes a P1 nodal field to this mesh's DOFs
+        return parameter(sym)
+
     def _register_variational_sample(
         self,
         sample_tag: str,
@@ -1458,6 +1522,9 @@ class domain(MeshIOMixin):
             # an untagged outlet edge is left as a natural (do-nothing) outflow
         """
         self._tag_predicates = getattr(self, "_tag_predicates", {})
+        if callable(where) and _is_facet_predicate(where):
+            # Richer boundary-facet predicate f(x, n, name): coords + outward normal + current name.
+            return self._tag_by_facet(name, where)
         if not callable(where):  # accept a shapely geometry
             geom = where
 
@@ -1475,6 +1542,52 @@ class domain(MeshIOMixin):
         geom = getattr(self, "_active_geometry", None)
         if poly_tags is not None and geom is not None and name not in poly_tags:
             poly_tags[name] = ("interior", geom)
+        if name not in self.avaiable_mesh_tags:
+            self.avaiable_mesh_tags.append(name)
+        return self
+
+    def _tag_by_facet(self, name, where):
+        """Name a boundary subset by a richer predicate ``f(x, n, name)``: facet centroids,
+        outward facet normals, and each facet's current region name (in/exclude in one predicate).
+
+        Additive path (only for facet predicates): selects boundary facets and registers a
+        ``BoundaryRegion`` + sampling pool + per-tag normals, so ``variable(name, normals=True)``
+        and a ``jno.fem`` BC bound to ``name`` work. Needs a meshed boundary.
+        """
+        full = self._boundary_regions.get("boundary")
+        dim = self.dimension
+        ents = None if full is None else (full.edges if dim == 2 else full.triangles)
+        if ents is None or len(ents) == 0:
+            raise ValueError(f"tag({name!r}): a facet predicate f(x, n, name) needs a meshed boundary.")
+        ents = np.asarray(ents)  # (E, k, dim) facet-vertex coordinates
+        mid = ents.mean(axis=1)  # (E, dim) facet centroids
+        nrm = _facet_normals(ents, dim)  # (E, dim) outward facet normals (geometric)
+        names = _facet_current_names(self._boundary_regions, mid)  # (E,) each facet's current name
+        keep = np.asarray(where(mid, nrm, names)).reshape(-1).astype(bool)
+        if not keep.any():
+            raise ValueError(f"tag({name!r}): the facet predicate f(x, n, name) selected no boundary facets.")
+        sub, sub_n = ents[keep], nrm[keep]
+        bpts = np.unique(sub.reshape(-1, sub.shape[-1])[:, :dim], axis=0)
+        self._boundary_regions[name] = BoundaryRegion(
+            tag=name,
+            dim=dim,
+            points=bpts,
+            edges=sub if dim == 2 else None,
+            triangles=sub if dim == 3 else None,
+            tol=full.tol,
+        )
+        self._mesh_pool[name] = bpts
+        # per-point outward normals for variable(name, normals=True): average the facet normals at each point
+        acc = {}
+        for f, fn in zip(sub, sub_n):
+            for v in f:
+                key = tuple(np.round(v[:dim], 9))
+                a = acc.get(key)
+                acc[key] = fn if a is None else a + fn
+        pn = np.array([acc[tuple(np.round(p[:dim], 9))] for p in bpts])
+        pn = pn / (np.linalg.norm(pn, axis=1, keepdims=True) + 1e-30)
+        self.normals_by_tag[name] = pn
+        self.tag_indices[name] = np.arange(len(bpts))
         if name not in self.avaiable_mesh_tags:
             self.avaiable_mesh_tags.append(name)
         return self
@@ -1625,7 +1738,11 @@ class domain(MeshIOMixin):
         pts = np.asarray(getattr(mesh, "points", None))
         if pts is None or pts.size == 0 or not mesh.cells:
             return mesh
-        keep_blocks = [i for i, cb in enumerate(mesh.cells) if cb.type not in ("vertex", "point")]
+        # In a 1-D domain the boundary *is* its endpoint vertices, so the 0-D block is a real
+        # boundary region (named left/right), not a construction-point orphan -- keep it. Only in
+        # >=2-D are stray vertex/point cells the singular geometry-construction points to drop.
+        drop_types = () if getattr(self, "dimension", None) == 1 else ("vertex", "point")
+        keep_blocks = [i for i, cb in enumerate(mesh.cells) if cb.type not in drop_types]
         fem_cells = [mesh.cells[i] for i in keep_blocks]
         if not fem_cells:
             return mesh
@@ -1643,9 +1760,12 @@ class domain(MeshIOMixin):
         if n_dropped:
             self.log.info(f"Dropped {n_dropped} orphan mesh node(s) (geometry-construction points, no element)")
         return meshio.Mesh(
-            pts[keep], cells,
-            cell_sets=sub(mesh.cell_sets), cell_data=sub(mesh.cell_data),
-            field_data=mesh.field_data, point_data=point_data,
+            pts[keep],
+            cells,
+            cell_sets=sub(mesh.cell_sets),
+            cell_data=sub(mesh.cell_data),
+            field_data=mesh.field_data,
+            point_data=point_data,
         )
 
     def _apply_mesh(self, mesh) -> None:

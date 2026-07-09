@@ -61,7 +61,7 @@ Exact solution: $u(x) = \sin(\pi x) / \pi^2$.
 domain = jno.domain.line(mesh_size=0.1)
 x, _ = domain.variable("interior")
 
-u_net = jno.nn.wrap(
+u_net = jno.nn(
     foundax.mlp(in_features=1, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(0))
 ).optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.5, end_value=1e-5)))
 
@@ -93,20 +93,17 @@ J = u.grad(u_net.mask(output_mask))
 Wrap the cosine similarity calculation in a plain JAX function and use `jnn.function` to lift it into the symbolic graph, then attach it as a non-loss tracker:
 
 ```python
-from jno.numpy import tracker
-
 def _cos_sim_halves(J):
-    N   = J.shape[0]
-    mid = N // 2
+    mid = J.shape[0] // 2
     g_left  = J[:mid].mean(axis=0)
     g_right = J[mid:].mean(axis=0)
     denom = jnp.linalg.norm(g_left) * jnp.linalg.norm(g_right) + 1e-12
     return jnp.dot(g_left, g_right) / denom
 
-cos_tracker = tracker(jno.np.function(_cos_sim_halves, [J]), interval=200)
+cos_tracker = jno.np.function(_cos_sim_halves, [J]).tracker(200)
 ```
 
-`interval=200` means it is evaluated and logged every 200 epochs without contributing to the gradient.
+`.tracker(200)` means it is evaluated and logged every 200 epochs without contributing to the gradient.
 
 ---
 
@@ -171,6 +168,55 @@ The **effective rank** (participation ratio) tells you how many independent lear
 
 ---
 
+## Step 6: Scale Analysis — Units and Non-Dimensionalization
+
+Gradient conflict has a twin: **scale conflict**. When the additive terms of a *single* residual differ in magnitude by orders, the loss is ill-conditioned no matter how well the collocation points align. `jno.units` exposes that structure: annotate the coordinates and the field with `.unit(...)` / `.scale(...)`, and it audits dimensional consistency and reports — then rewrites away — the dimensionless group each term carries (the Fourier / Péclet-type numbers you would otherwise derive by hand).
+
+Take a **thin, anisotropic** domain ($L_x = 1$, $L_y = \tfrac{1}{20}$). Geometry *alone* drives the two diffusion terms of the Laplacian $u_{xx} + u_{yy}$ to very different scales — no material coefficient required:
+
+```python
+Lx, Ly, U = 1.0, 0.05, 3.0
+adom = jno.Shape.rect(0.0, 0.0, Lx, Ly, size=0.1).domain()
+ax, ay, _ = adom.variable("interior", split=True)
+ax = ax.unit("m").scale(Lx)          # characteristic length along x
+ay = ay.unit("m").scale(Ly)          # 20× shorter characteristic length along y
+au = jno.nn(foundax.mlp(in_features=2, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(1)))(ax, ay)
+au = au.unit("K").scale(U)           # the field carries a temperature scale U
+aniso = au.d2(ax) + au.d2(ay)        # anisotropic Laplacian — two terms in ONE residual
+```
+
+**Phase A — audit and report.** `jno.units.check` confirms both terms share a unit ($\text{K}\cdot\text{m}^{-2}$); `jno.units.nondimensionalize` gives each term's dimensionless magnitude $\pi_i = S_i / S_\text{ref}$:
+
+```python
+assert not jno.units.check(aniso).warnings            # dimensionally consistent
+terms = jno.units.nondimensionalize(aniso).residuals[0].terms
+scale_sep = terms[1].pi / terms[0].pi                 # → 400.0  = (Lx/Ly)²
+```
+
+The two terms differ by **400×** — exactly $(L_x/L_y)^2$. That is the "losses at different scales" that stalls plain gradient descent, surfaced *before* you ever train.
+
+**Phase B — the transform.** `jno.units.rescale` rewrites the residual into its $O(1)$ dimensionless form: the hidden 400× separation resurfaces as an *explicit* leading coefficient, and the returned `Rescaler` maps coordinates onto the unit domain and a solution back to physical units ($u_\text{physical} = U \cdot \hat u$):
+
+```python
+transformed, rescaler = jno.units.rescale(aniso)
+rdom = rescaler.rescaled_domain(adom)          # same problem, coordinates rescaled to O(1)
+# ...  jno.core([transformed.mse], domain=rdom).solve(...)  # train the well-scaled problem
+u_physical = rescaler.to_physical(u_hat)       # map the O(1) field back to physical units
+```
+
+!!! note "What `jno.units` operates on"
+    `nondimensionalize` / `rescale` act on the **additive terms within one residual** ($\pi_i = S_i / S_\text{ref}$) — they extract the Fourier / Péclet numbers, not a ratio between two *separate* losses. Today only coordinates and the network output are annotatable through the public API; a bare material coefficient (e.g. a diffusivity $\alpha$) has no public `.unit` hook yet, so the demonstrated scale separation is purely geometric.
+
+---
+
+## Result
+
+![Left: the trained network's solution lies on the exact sin(πx)/π² curve (rel L² ≈ 3×10⁻⁴). Right: the Neural Tangent Kernel eigenvalue spectrum decays over ~14 orders of magnitude, an effective rank near 1 — the ill-conditioning that makes some spatial modes converge far slower than others.](/jNO/assets/gradient_conflict.png)
+
+The trained network matches the analytic $\sin(\pi x)/\pi^2$ to rel-$L^2\approx3\times10^{-4}$ (left). The **NTK eigenvalue spectrum** (right) is the model's own $K=JJ^\top$ after training: it collapses over ~14 orders of magnitude to an effective rank near 1, so a handful of modes dominate learning while the rest are almost frozen — the quantitative face of the gradient conflict.
+
+---
+
 ## What To Notice
 
 - The cosine similarity **during training** lets you catch gradient conflict early — long before the loss plateaus.
@@ -187,5 +233,5 @@ The **effective rank** (participation ratio) tells you how many independent lear
 ## Script Snippet
 
 ```python
---8<-- "tutorial_examples/07_analysis/gradient_conflict.py"
+--8<-- "tutorial_examples/07_analysis/gradient_conflict.py:code"
 ```

@@ -40,8 +40,8 @@ energy   = T.t·s + (u·∇T)·s + ∇T·∇s                                # a
 fem = jno.fem([momentum, continuity, energy, *walls, *initial_condition])
 ```
 
-We march it implicitly (backward-Euler + Newton per step — the Navier–Stokes-cavity pattern) and watch
-the rolls grow from rest.
+`fem.solve()` marches it implicitly (backward-Euler + Newton per step, internally) and returns the
+forward trajectory; we watch the rolls grow from rest.
 
 ## A pot: no-slip walls, hot floor, cold lid
 
@@ -76,5 +76,5 @@ solution** — nothing painted in.
 ## Full script
 
 ```python
---8<-- "tutorial_examples/08_fem_and_varpinns/rayleigh_benard_2d.py"
+--8<-- "tutorial_examples/08_fem_and_varpinns/rayleigh_benard_2d.py:code"
 ```

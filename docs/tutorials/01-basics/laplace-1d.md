@@ -18,16 +18,19 @@ Exact solution: `u(x) = x` (the straight line between the two boundary values).
 ## Step 1: Create the Domain
 
 ```python
-domain = jno.domain.line(mesh_size=0.1)
+domain = jno.Path(0.0, 0.0).line_to(1.0, 0.0).curve(size=0.1).domain()  # x in [0, 1]
 x, _ = domain.variable("interior")
 ```
+
+The `Path` DSL builds the 1-D interval as a curve; its endpoints are reachable as
+`domain.variable("left" / "right" / "boundary")`.
 
 ## Step 2: Build the Network with a Non-Homogeneous Hard Ansatz
 
 The boundary values are non-zero (`u(0)=0`, `u(1)=1`), so the multiplicative `x(1-x)` trick alone won't enforce them. Instead, use a **linear interpolant + correction** ansatz:
 
 ```python
-u_net = jno.nn.wrap(
+u_net = jno.nn(
     foundax.mlp(in_features=1, hidden_dims=32, num_layers=3, key=jax.random.PRNGKey(0))
 ).optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.5, end_value=1e-5)))
 
@@ -55,10 +58,15 @@ crux = jno.core([pde.mse])
 history = crux.solve(5000)
 ```
 
+## Result
+
+![Left: jNO prediction over-plotted on the exact line u=x. Right: relative L2 error vs collocation-point count on log-log axes.](/jNO/assets/laplace_1d.png)
+
+The hard-BC ansatz reproduces the exact line to rel-$L^2 \approx 9\times10^{-6}$ (left). Because the exact solution lives in the trial space, the residual error here is training-limited rather than discretization-limited; re-solving at 5, 10, 20 and 40 collocation points still shows it falling from $2.2\times10^{-5}$ to $3.6\times10^{-6}$ (right).
+
 ## What To Notice
 
 - The non-homogeneous BCs require an ansatz that **adds** to a satisfying solution rather than just multiplying. The general recipe is `u = boundary_lift(x) + zero_at_boundary(x) * net(x)`.
-- For more interesting Poisson-style problems with a non-zero forcing, see [Poisson 1D](poisson-1d.md) — same domain, but adds a soft-BC pattern with `scheme="finite_difference"`.
 - This is a *trivial* PDE in the sense that the exact solution is in the trial-space class; jNO is being asked to confirm convergence, not discover anything new.
 
 <div class="hero-actions" markdown>
@@ -69,5 +77,5 @@ history = crux.solve(5000)
 ## Script Snippet
 
 ```python
---8<-- "tutorial_examples/01_basics/laplace_1d.py"
+--8<-- "tutorial_examples/01_basics/laplace_1d.py:code"
 ```

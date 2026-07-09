@@ -1,3 +1,4 @@
+# --8<-- [start:code]
 """Brittle fracture — 4th-order phase-field on the cheap Morley element (coupled multiphysics).
 
 A cracking solid minimizes elastic energy + fracture (crack-surface) energy. The variational phase-field
@@ -30,9 +31,7 @@ M. Hofacker, F. Welschinger, CMAME **199** (2010) 2765–2778 — the tension/co
 """
 
 import os
-from pathlib import Path
 
-os.environ.setdefault("MPLBACKEND", "Agg")
 os.environ.setdefault("JAX_PLATFORMS", "cpu")  # stiff biharmonic direct solves — CPU dodges GPU cuSolver OOM
 
 import jax
@@ -40,10 +39,7 @@ import jax
 jax.config.update("jax_enable_x64", True)
 
 import jax.numpy as jnp
-import matplotlib.pyplot as plt
-import matplotlib.tri as mtri
 import numpy as np
-from shapely.geometry import box
 
 import jno
 
@@ -57,7 +53,7 @@ lam, mu = E * nu / ((1 + nu) * (1 - 2 * nu)), E / (2 * (1 + nu))
 Gc, ell, eta = 2.0e-3, 0.08, 1e-3
 h = 0.04
 
-d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=h)
+d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=h).domain()
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("bottom", split=True)
 xt, yt, _ = d.variable("top", split=True)
@@ -131,84 +127,86 @@ def solve_d(H_vals):
     return jnp.linalg.solve(dense(A), jnp.asarray(b).reshape(-1))
 
 
-def main():
-    # ================= Part 1: the crack profile (controlled verification) =================
-    # Pin d=1 on the left edge (Morley pins the value + ∂d/∂n=0, the smooth-peak condition), no source: d
-    # decays as the optimal 1D profile. d=1 on the whole edge ⇒ the solution is x-only, so d-vs-x collapses.
-    fem_p = jno.fem([(Gc / ell) * (di * vi) + reg, dd(xl, yl) - 1.0, dd.dn(xl, yl) - 0.0])  # d=1, ∂d/∂n=0 (smooth peak)
-    dprof = np.asarray(fem_p.solve(lu)).reshape(-1)[np.arange(nv)]  # Morley value DOFs = first n_verts entries
-    xs = nodes[:, 0]
-    p4x, p2x = (1 + xs / ell) * np.exp(-xs / ell), np.exp(-xs / ell)
-    e4 = float(np.sqrt(np.mean((dprof - p4x) ** 2)))
-    e2 = float(np.sqrt(np.mean((dprof - p2x) ** 2)))
+# ================= Part 1: the crack profile (controlled verification) =================
+# Pin d=1 on the left edge (Morley pins the value + ∂d/∂n=0, the smooth-peak condition), no source: d
+# decays as the optimal 1D profile. d=1 on the whole edge ⇒ the solution is x-only, so d-vs-x collapses.
+fem_p = jno.fem([(Gc / ell) * (di * vi) + reg, dd(xl, yl) - 1.0, dd.dn(xl, yl) - 0.0])  # d=1, ∂d/∂n=0 (smooth peak)
+dprof = np.asarray(fem_p.solve(lu)).reshape(-1)[np.arange(nv)]  # Morley value DOFs = first n_verts entries
+xs = nodes[:, 0]
+p4x, p2x = (1 + xs / ell) * np.exp(-xs / ell), np.exp(-xs / ell)
+e4 = float(np.sqrt(np.mean((dprof - p4x) ** 2)))
+e2 = float(np.sqrt(np.mean((dprof - p2x) ** 2)))
 
-    # ================= Part 2: propagating crack (coupled alternate minimization) =================
-    notch = (nodes[:, 0] < 0.3) & (np.abs(nodes[:, 1] - 0.5) < 0.9 * h)  # short single-edge notch
-    Hhist = np.where(notch, 1e2, 0.0)
-    dvals = np.clip(np.asarray(solve_d(jnp.asarray(Hhist)))[np.arange(nv)], 0.0, 1.0)
-    loads = np.linspace(0.03, 0.14, 9)
-    fd, fronts, snaps = [], [], []
-    for delta in loads:
-        for _ in range(3):
-            u_hat = np.asarray(solve_e(jnp.asarray((1 - dvals) ** 2 + eta))).reshape(-1, 2)
-            psi_c = psi_cellwise(u_hat)
-            Hhist = np.maximum(Hhist, delta**2 * scatter_max_to_vertices(psi_c))
-            dvals = np.clip(np.asarray(solve_d(jnp.asarray(Hhist)))[np.arange(nv)], 0.0, 1.0)
-        gd_c = (1 - dvals[cells].mean(1)) ** 2 + eta
-        fd.append((delta, 2.0 * delta * float(np.sum(gd_c * psi_c * cell_area))))  # reaction ∝ dΠ/dδ
-        fronts.append(nodes[dvals > 0.5, 0].max())
-        snaps.append(dvals.copy())
-    fd = np.array(fd)
-    icross = next((i for i, f in enumerate(fronts) if f >= 0.95), len(fronts) - 1)  # first fully-spanned frame
-    d_show = snaps[icross]
+# ================= Part 2: propagating crack (coupled alternate minimization) =================
+notch = (nodes[:, 0] < 0.3) & (np.abs(nodes[:, 1] - 0.5) < 0.9 * h)  # short single-edge notch
+Hhist = np.where(notch, 1e2, 0.0)
+dvals = np.clip(np.asarray(solve_d(jnp.asarray(Hhist)))[np.arange(nv)], 0.0, 1.0)
+loads = np.linspace(0.03, 0.14, 9)
+fd, fronts, snaps = [], [], []
+for delta in loads:
+    for _ in range(3):
+        u_hat = np.asarray(solve_e(jnp.asarray((1 - dvals) ** 2 + eta))).reshape(-1, 2)
+        psi_c = psi_cellwise(u_hat)
+        Hhist = np.maximum(Hhist, delta**2 * scatter_max_to_vertices(psi_c))
+        dvals = np.clip(np.asarray(solve_d(jnp.asarray(Hhist)))[np.arange(nv)], 0.0, 1.0)
+    gd_c = (1 - dvals[cells].mean(1)) ** 2 + eta
+    fd.append((delta, 2.0 * delta * float(np.sum(gd_c * psi_c * cell_area))))  # reaction ∝ dΠ/dδ
+    fronts.append(nodes[dvals > 0.5, 0].max())
+    snaps.append(dvals.copy())
+fd = np.array(fd)
+icross = next((i for i, f in enumerate(fronts) if f >= 0.95), len(fronts) - 1)  # first fully-spanned frame
+d_show = snaps[icross]
 
-    print("\n4th-order phase-field fracture (Morley, non-conforming):")
-    print(f"  mesh nv={nv} nc={nc}  damage-dofs={fem_d.dofs}  ℓ={ell}  h/ℓ={h / ell:.2f}   (Argyris OOMs at this mesh)")
-    print(f"  Part 1  crack profile: RMS vs 4th-order={e4:.3f}  vs 2nd-order={e2:.3f}  ({e2 / e4:.1f}× better)")
-    print(f"  Part 2  crack front x: {fronts[0]:.2f} → {fronts[-1]:.2f}  ({(dvals > 0.5).sum()}/{nv} damaged)")
-    print(
-        f"          peak reaction {fd[:, 1].max():.3e} at δ={fd[fd[:, 1].argmax(), 0]:.3f};  final {fd[-1, 1]:.3e} (softening)"
-    )
+print("\n4th-order phase-field fracture (Morley, non-conforming):")
+print(f"  mesh nv={nv} nc={nc}  damage-dofs={fem_d.dofs}  ℓ={ell}  h/ℓ={h / ell:.2f}   (Argyris OOMs at this mesh)")
+print(f"  Part 1  crack profile: RMS vs 4th-order={e4:.3f}  vs 2nd-order={e2:.3f}  ({e2 / e4:.1f}× better)")
+print(f"  Part 2  crack front x: {fronts[0]:.2f} → {fronts[-1]:.2f}  ({(dvals > 0.5).sum()}/{nv} damaged)")
+print(
+    f"          peak reaction {fd[:, 1].max():.3e} at δ={fd[fd[:, 1].argmax(), 0]:.3f};  final {fd[-1, 1]:.3e} (softening)"
+)
 
-    # --- asserts: profile matches the 4th-order shape; crack propagates + localizes + softens ---
-    assert e4 < 0.05 and e4 < 0.4 * e2, f"crack profile must match the 4th-order shape: {e4:.3f} vs {e2:.3f}"
-    assert fronts[-1] > fronts[0] + 0.3, f"the crack must propagate across: front {fronts[0]:.2f}→{fronts[-1]:.2f}"
-    assert (dvals > 0.5).sum() > 2 * int(notch.sum()), "damage must localize into a growing crack band"
-    assert fd[-1, 1] < 0.7 * fd[:, 1].max(), "the specimen must soften (reaction drops after the peak)"
+# --- asserts: profile matches the 4th-order shape; crack propagates + localizes + softens ---
+assert e4 < 0.05 and e4 < 0.4 * e2, f"crack profile must match the 4th-order shape: {e4:.3f} vs {e2:.3f}"
+assert fronts[-1] > fronts[0] + 0.3, f"the crack must propagate across: front {fronts[0]:.2f}→{fronts[-1]:.2f}"
+assert (dvals > 0.5).sum() > 2 * int(notch.sum()), "damage must localize into a growing crack band"
+assert fd[-1, 1] < 0.7 * fd[:, 1].max(), "the specimen must soften (reaction drops after the peak)"
+# --8<-- [end:code]
 
-    # --- figure: crack profile | propagated (sharp) crack | force–displacement ---
-    fig = plt.figure(figsize=(13.5, 4.0))
-    ax0 = fig.add_subplot(1, 3, 1)
-    rr = np.linspace(0, 0.5, 200)
-    ax0.plot(rr, (1 + rr / ell) * np.exp(-rr / ell), "-", color="k", lw=2, label="4th-order $(1+r/\\ell)e^{-r/\\ell}$")
-    ax0.plot(rr, np.exp(-rr / ell), "--", color="#888", lw=1.5, label="2nd-order $e^{-r/\\ell}$ (kink)")
-    o = np.argsort(xs)
-    ax0.plot(xs[o], dprof[o], "o", color="#c0392b", ms=2.5, label="computed (Morley)")
-    ax0.set_xlabel("distance from crack  r")
-    ax0.set_ylabel("damage d")
-    ax0.set_xlim(0, 0.5)
-    ax0.set_title(f"crack profile (RMS {e4:.0e})")
-    ax0.legend(fontsize=7.5)
-    ax1 = fig.add_subplot(1, 3, 2)
-    tri = mtri.Triangulation(nodes[:, 0], nodes[:, 1], cells)
-    tcf = ax1.tricontourf(tri, d_show, levels=np.linspace(0, 1, 21), cmap="inferno")
-    ax1.set_aspect("equal")
-    ax1.set_title(f"sharp crack, nv={nv} (δ={loads[icross]:.2f})")
-    fig.colorbar(tcf, ax=ax1, shrink=0.85, label="d")
-    ax2 = fig.add_subplot(1, 3, 3)
-    ax2.plot(fd[:, 0], fd[:, 1], "o-", color="#2471a3")
-    ipk = fd[:, 1].argmax()
-    ax2.plot(fd[ipk, 0], fd[ipk, 1], "*", color="#c0392b", ms=13, label="peak (crack advances)")
-    ax2.set_xlabel("applied displacement δ")
-    ax2.set_ylabel("reaction force  (∝, energy-based)")
-    ax2.set_title("force–displacement (brittle)")
-    ax2.legend(fontsize=8)
-    fig.tight_layout()
-    fig.savefig(Path(__file__).parents[2] / "assets" / "phase_field_fracture_2d.png", dpi=130, bbox_inches="tight")
+# --- figure: crack profile | propagated (sharp) crack | force–displacement ---
+os.environ.setdefault("MPLBACKEND", "Agg")  # noqa: E402
+from pathlib import Path  # noqa: E402
 
-    print("\nOK: the cheap non-conforming Morley element captures the smooth 4th-order profile and, at a fine")
-    print("    mesh the conforming element cannot reach, drives a sharp crack with the correct brittle response.")
+import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.tri as mtri  # noqa: E402
 
+fig = plt.figure(figsize=(13.5, 4.0))
+ax0 = fig.add_subplot(1, 3, 1)
+rr = np.linspace(0, 0.5, 200)
+ax0.plot(rr, (1 + rr / ell) * np.exp(-rr / ell), "-", color="k", lw=2, label="4th-order $(1+r/\\ell)e^{-r/\\ell}$")
+ax0.plot(rr, np.exp(-rr / ell), "--", color="#888", lw=1.5, label="2nd-order $e^{-r/\\ell}$ (kink)")
+o = np.argsort(xs)
+ax0.plot(xs[o], dprof[o], "o", color="#c0392b", ms=2.5, label="computed (Morley)")
+ax0.set_xlabel("distance from crack  r")
+ax0.set_ylabel("damage d")
+ax0.set_xlim(0, 0.5)
+ax0.set_title(f"crack profile (RMS {e4:.0e})")
+ax0.legend(fontsize=7.5)
+ax1 = fig.add_subplot(1, 3, 2)
+tri = mtri.Triangulation(nodes[:, 0], nodes[:, 1], cells)
+tcf = ax1.tricontourf(tri, d_show, levels=np.linspace(0, 1, 21), cmap="inferno")
+ax1.set_aspect("equal")
+ax1.set_title(f"sharp crack, nv={nv} (δ={loads[icross]:.2f})")
+fig.colorbar(tcf, ax=ax1, shrink=0.85, label="d")
+ax2 = fig.add_subplot(1, 3, 3)
+ax2.plot(fd[:, 0], fd[:, 1], "o-", color="#2471a3")
+ipk = fd[:, 1].argmax()
+ax2.plot(fd[ipk, 0], fd[ipk, 1], "*", color="#c0392b", ms=13, label="peak (crack advances)")
+ax2.set_xlabel("applied displacement δ")
+ax2.set_ylabel("reaction force  (∝, energy-based)")
+ax2.set_title("force–displacement (brittle)")
+ax2.legend(fontsize=8)
+fig.tight_layout()
+fig.savefig(Path(__file__).parents[2] / "assets" / "phase_field_fracture_2d.png", dpi=130, bbox_inches="tight")
 
-if __name__ == "__main__":
-    main()
+print("\nOK: the cheap non-conforming Morley element captures the smooth 4th-order profile and, at a fine")
+print("    mesh the conforming element cannot reach, drives a sharp crack with the correct brittle response.")

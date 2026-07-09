@@ -1,3 +1,4 @@
+# --8<-- [start:code]
 """09 - Vibrating membrane: the 2-D wave equation (second-order in time) via ``jno.fem``.
 
 A square drum head clamped on all four edges, plucked into the fundamental mode and released:
@@ -21,7 +22,6 @@ discrete energy E = ½ vᵀM v + ½ uᵀK u is conserved (a drum does not lose e
 
 import jax.numpy as jnp
 import numpy as np
-from shapely.geometry import box
 
 import jno
 
@@ -33,7 +33,7 @@ OMEGA = C * PI * np.sqrt(2.0)  # fundamental modal frequency
 PERIOD = 2.0 * PI / OMEGA  # = √2 / C
 
 # One full period, resolved with 120 steps; a moderate mesh keeps the example quick.
-d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.08, time=(0.0, float(PERIOD), 120))
+d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.08).domain(time=(0.0, float(PERIOD), 120))
 u, phi = d.fem_symbols()
 xi, yi, ti = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
@@ -48,22 +48,14 @@ v0 = ui0.t - 0.0  # released from rest (note: velocity IC binds the initial-slic
 fem = jno.fem([weak, u(xb, yb) - 0.0, u0, v0])
 assert fem.is_transient and fem.is_linear
 
-# --- march in time with the trapezoidal (θ=½) rule on the augmented block M ẏ + A y = c ---
-#   (M + ½dt A) y_next = (M − ½dt A) y + dt c        [θ=½: energy-conserving]
-# Do NOT use backward Euler (M + dt A) here -- it damps the wave (see the module docstring).
-M, A = dense(fem.M), dense(fem.operator.A)
-c_vec = np.zeros(M.shape[0]) if fem.operator.affine_bias is None else np.asarray(fem.operator.affine_bias).reshape(-1)
-dt = float(fem.dt)
-N = fem.offsets[1]  # state is y = [u; v]; displacement is the first N entries
-lhs = M + 0.5 * dt * A
-rhs_op = M - 0.5 * dt * A
-
-y = np.asarray(fem.state0)
-traj = [y[:N].copy()]
-for _ in range(round((fem.t1 - fem.t0) / dt)):
-    y = np.linalg.solve(lhs, rhs_op @ y + dt * c_vec)
-    traj.append(y[:N].copy())
-traj = np.asarray(traj)  # (n_steps+1, N) displacement history
+# --- solve: fem.solve() integrates the augmented block with the energy-conserving
+#     trapezoidal (θ=½) rule *internally* -- no hand-rolled time stepping. (Backward Euler would
+#     damp the wave; that is why the transient solver uses θ=½ for a second-order block.)
+#     fem.solve() is a differentiable trace node; evaluate the forward trajectory through a crux.
+N = fem.offsets[1]  # state is y = [u; v]; displacement is the first N entries, velocity the last N
+sol = fem.solve()
+state = np.asarray(jno.core([sol.mse]).eval([sol]))  # (n_steps, 2N) trajectory of y = [u; v]
+traj, V = state[:, :N], state[:, N:]  # displacement and velocity histories (v = u_t, exact)
 ts = np.linspace(fem.t0, fem.t1, traj.shape[0])
 
 # --- verify against the analytic standing wave + energy conservation ---
@@ -73,8 +65,8 @@ u_center = traj[:, ci]
 u_exact = np.sin(PI * pts[ci, 0]) * np.sin(PI * pts[ci, 1]) * np.cos(OMEGA * ts)
 rel = np.linalg.norm(u_center - u_exact) / np.linalg.norm(u_exact)
 
-M_uu, K_uu = M[:N, :N], A[N:, :N]  # mass and stiffness blocks of the augmented system
-V = np.gradient(traj, ts, axis=0)  # velocity ~ d/dt of the displacement history
+M_full, A_full = dense(fem.M), dense(fem.operator.A)
+M_uu, K_uu = M_full[:N, :N], A_full[N:, :N]  # mass and stiffness blocks of the augmented system
 energy = 0.5 * np.einsum("ti,ij,tj->t", V, M_uu, V) + 0.5 * np.einsum("ti,ij,tj->t", traj, K_uu, traj)
 amp = np.linalg.norm(traj[-1]) / np.linalg.norm(traj[0])
 
@@ -86,3 +78,49 @@ print(f"  amplitude after one period ||u(T)|| / ||u(0)|| = {amp:.4f}   (≈ 1: e
 assert rel < 0.05, f"membrane does not track the analytic standing wave: rel L2 = {rel:.4f}"
 assert 0.95 < amp < 1.05, f"amplitude not conserved over a period: {amp:.4f}"  # θ=½, not backward Euler
 assert abs(energy[len(energy) // 2] / energy[1] - 1.0) < 0.05, "discrete energy should be conserved"
+# --8<-- [end:code]
+
+# ---- solution figures: (a) GIF of the membrane displacement over one period,
+#      (b) centre-node predicted-vs-analytic PNG ----
+from pathlib import Path  # noqa: E402
+
+import matplotlib.animation as animation  # noqa: E402
+import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.tri as mtri  # noqa: E402
+
+plt.rcParams.update(
+    {"savefig.dpi": 150, "savefig.bbox": "tight", "axes.titleweight": "bold", "axes.titlesize": 10, "figure.dpi": 120}
+)
+assets = Path(__file__).parents[2] / "assets"
+
+# (a) animate the computed displacement field with a symmetric colour scale fixed across frames.
+tri = mtri.Triangulation(pts[:, 0], pts[:, 1])
+A = float(np.max(np.abs(traj)))  # symmetric amplitude, shared by every frame
+stride = max(1, traj.shape[0] // 40)  # ~40 frames over the period
+frames = range(0, traj.shape[0], stride)
+figA, axA = plt.subplots(figsize=(5.2, 4.6))
+tpc = axA.tripcolor(tri, traj[0], cmap="RdBu_r", shading="gouraud", vmin=-A, vmax=A)
+figA.colorbar(tpc, ax=axA, shrink=0.85, label="displacement $u$")
+axA.set_aspect("equal")
+axA.set_axis_off()
+
+
+def _frame(j):
+    tpc.set_array(traj[j])
+    axA.set_title(f"vibrating membrane  t = {ts[j]:.3f} / {PERIOD:.3f}")
+    return (tpc,)
+
+
+ani = animation.FuncAnimation(figA, _frame, frames=list(frames), interval=80, blit=False)
+ani.save(assets / "wave_membrane_2d.gif", writer="pillow", fps=12, dpi=84)
+
+# (b) centre antinode: computed trajectory vs the analytic standing wave cos(omega t).
+figB, axB = plt.subplots(figsize=(6.5, 4))
+axB.plot(ts, u_center, label="jNO (centre node)")
+axB.plot(ts, u_exact, "--", label=r"analytic $\cos(\omega t)$")
+axB.set_xlabel("time $t$")
+axB.set_ylabel("centre displacement")
+axB.set_title(f"centre antinode vs analytic  (rel-$L^2$={rel:.1e})")
+axB.legend()
+axB.grid(True, alpha=0.3)
+figB.savefig(assets / "wave_membrane_2d.png")

@@ -50,5 +50,5 @@ wave reflects and resonates. Right: $|u|$, decaying into the absorbing frame.
 ## Full script
 
 ```python
---8<-- "tutorial_examples/08_fem_and_varpinns/helmholtz_pml_2d.py"
+--8<-- "tutorial_examples/08_fem_and_varpinns/helmholtz_pml_2d.py:code"
 ```
