@@ -19,10 +19,7 @@ The exact solution is substituted into the PDE to derive a forcing term that mak
 eps = 0.1
 T_end = 1.0
 
-domain = jno.domain(
-    constructor=jno.domain.rect(mesh_size=0.05),
-    time=(0, T_end, 4),
-)
+domain = jno.Shape.rect(0, 0, 1, 1, size=0.05).domain(time=(0, T_end, 4))
 x, y, t = domain.variable("interior")
 
 S = sin(π * x) * sin(π * y)
@@ -34,17 +31,17 @@ source = exp(-t) * S * coeff + exp(-3 * t) * S**3
 
 ## Step 2: Set Up the Space-Time Network
 
-The model learns a field over space and time while respecting the chosen boundary handling.
+The model learns a field over space and time while respecting the chosen boundary handling. The optimizer is scaled by `jno.fn.adaptive.dlrs`, a loss-adaptive dynamic learning-rate scheduler that shrinks the step when the stiff Allen-Cahn interface stalls the loss and grows it when the loss can still descend.
 
 ```python
-net = jno.nn.wrap(
+net = jno.nn(
     foundax.deeponet(
         n_sensors=1, coord_dim=2, n_outputs=1,
         n_layers=3, basis_functions=64, hidden_dim=40,
         key=jax.random.PRNGKey(42),
     )
 )
-net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=1e-3, warmup_steps=1, decay_steps=500, end_value=1e-5)))
+net.optimizer(optax.adam(1)).scale(jno.fn.adaptive.dlrs(lr0=1e-3, window=10))
 
 xy = jno.np.concat([x, y])
 u  = net(t, xy) * x * (1 - x) * y * (1 - y)
@@ -70,6 +67,16 @@ crux    = jno.core([pde.mse, ini.mse])
 history = crux.solve(5000)
 ```
 
+## Result
+
+![Time-lapse of the jNO field u(x,y,t) decaying from t=0 to t=1 on a fixed colour scale.](/jNO/assets/allen_cahn_2d.gif)
+
+The network's own field is evaluated on a finer time grid and animated above; the single central bump decays like $e^{-t}$, as the manufactured solution prescribes.
+
+![Three panels at t=1: jNO field, exact e^-t sin(pi x) sin(pi y), and their signed error.](/jNO/assets/allen_cahn_2d.png)
+
+At the final time the prediction matches the manufactured solution to rel-$L^2 \approx 1.5\times10^{-3}$ (signed-error panel, right, centered at 0).
+
 ## What To Notice
 
 - Nonlinear reaction terms are easy to express once the field is available symbolically.
@@ -84,5 +91,5 @@ history = crux.solve(5000)
 ## Script Snippet
 
 ```python
---8<-- "tutorial_examples/03_parabolic/allen_cahn_2d.py"
+--8<-- "tutorial_examples/03_parabolic/allen_cahn_2d.py:code"
 ```

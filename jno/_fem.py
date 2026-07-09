@@ -1043,7 +1043,7 @@ class FEM:
 
             alpha = jno.np.parameter((1,), name="alpha")
             fem = jno.fem([alpha * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0])
-            crux = jno.core([(fem.solve() - u_obs).mse], domain=obs_domain)
+            crux = jno.core([(fem.solve() - u_obs).mse])   # domain inferred from the solve node
             crux.solve(n)                      # recovers alpha
 
         ``solve_fn`` is **your** solver (jNO writes none):
@@ -1098,6 +1098,17 @@ class FEM:
         complex/complex-transient problems, and slots combined with ``adapt=`` (remeshing
         invalidates warm starts and cached preconditioner setups — pass ``solve_fn=`` there).
         """
+        result = self._solve_dispatch(
+            solve_fn, adapt=adapt, x0=x0, nonlinear=nonlinear, linear=linear, precond=precond, **kwargs
+        )
+        if isinstance(result, Placeholder):
+            # Tag the solve node with its domain so jno.core can infer the domain straight from the graph
+            # (a data-misfit inverse `jno.core([(fem.solve() - u_obs).mse])` needs no explicit `domain=`).
+            result._domain = self.domain
+        return result
+
+    def _solve_dispatch(self, solve_fn=None, *, adapt=None, x0=None, nonlinear=None, linear=None, precond=None, **kwargs):
+        """Mode dispatch for :meth:`solve` — returns the solution array or a differentiable trace node."""
         has_slots = (x0 is not None) or (nonlinear is not None) or (linear is not None) or (precond is not None)
         if adapt is not None:
             if has_slots:
@@ -1305,6 +1316,59 @@ class FEM:
         if self._mode != "linear":
             raise AttributeError(f"FEM is {self._mode}; .b is only for a steady linear problem (see .operator / .M).")
         return _as_flat(self._b)
+
+    # -- domain-decomposition coupling (`jno.core([...])`): the region this subdomain owns + a pinned solve --
+    def _dd_region(self):
+        # The weak-form coordinates are retagged for quadrature, so read the region from `classification`
+        # (`"volume@A"`), which `_region_and_support` already resolved correctly.
+        src = getattr(self.domain, "_source_regions", {}) or {}
+        regions = {
+            cl.split("@", 1)[1]
+            for cl in (self.classification or [])
+            if isinstance(cl, str) and "@" in cl and cl.split("@", 1)[1] in src
+        }
+        return (next(iter(regions)), src[next(iter(regions))]) if len(regions) == 1 else (None, None)
+
+    @property
+    def region(self):
+        """The named sub-region this FEM problem owns (from its weak-form coordinates), or ``None``."""
+        return self._dd_region()[0]
+
+    @property
+    def region_geometry(self):
+        """The shapely geometry of :attr:`region`, or ``None`` — used by ``jno.core([...])`` coupling."""
+        return self._dd_region()[1]
+
+    def _as_whole_mesh(self):
+        """Rebuild this region-tagged FEM with WHOLE-MESH assembly (no ``RegionMask``) while keeping its
+        region label. A region-local matrix can't reconcile an overlapping-Schwarz band (its artificial
+        boundary reaches no neighbour cells), so the overlap driver swaps in this whole-mesh rebuild. One
+        extra assemble + factorization, reused across every iteration — cheap next to the Schwarz loop."""
+        if not getattr(self, "_constraints", None):
+            return self
+        return fem(self._constraints, _dd_overlap=True, **(getattr(self, "_fem_kwargs", None) or {}))
+
+    def pinned_solver(self, node_ids, *, nonlinear=None):
+        """A reusable ``f(values) -> field`` that solves the linear system with ``node_ids`` pinned to
+        ``values`` (row-replacement) — the interface Dirichlet data a coupled Schwarz step supplies. The
+        (fixed) matrix is prefactored once; each iteration only re-solves against a new right-hand side.
+        The dense LU runs on the host (robust: the GPU ``cuSolver`` dense path can be flaky)."""
+        import numpy as _np
+        import scipy.linalg as _sla
+
+        a = _np.asarray(self.A).copy()
+        b = _np.asarray(self.b).reshape(-1)
+        pin = _np.asarray(node_ids, dtype=int)
+        a[pin, :] = 0.0
+        a[pin, pin] = 1.0  # row-replacement: pinned rows → identity (columns kept)
+        lu = _sla.lu_factor(a)  # factor once; the interface pin only changes the RHS across iterations
+
+        def solve(values):
+            rhs = b.copy()
+            rhs[pin] = _np.asarray(values).reshape(-1)
+            return _sla.lu_solve(lu, rhs)
+
+        return solve
 
     # -- nonlinear residual / Jacobian (steady and transient) --
     @property
@@ -1946,7 +2010,14 @@ def _wrap_couplings(domain: Any, fem_obj: "FEM", couplings: List["Coupling"]) ->
 # ---------------------------------------------------------------------------
 # the driver
 # ---------------------------------------------------------------------------
-def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] = None, vec: Optional[int] = None) -> FEM:
+def fem(
+    constraints: Any,
+    *,
+    quad_degree: int = 2,
+    element_type: Optional[str] = None,
+    vec: Optional[int] = None,
+    _dd_overlap: bool = False,
+) -> FEM:
     """Assemble a flat list of traced residuals into an :class:`FEM`.
 
     Parameters
@@ -2214,10 +2285,13 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
             _retag_coords_for_quadrature(c, support, region)
             bare = _bare(c)
             if support == "volume":
-                if region != "volume":
+                if region != "volume" and not _dd_overlap:
                     # Sub-domain term: multiply by the region's per-cell indicator so it integrates over
                     # that region's cells only. Stays a plain volume term (whole-mesh quadrature); the
                     # RegionMask zeroes the integrand outside the region (resolved in the assembly kernel).
+                    # ``_dd_overlap`` skips this: a region-local matrix can't couple in an overlapping-Schwarz
+                    # step (its artificial boundary reaches no neighbour cells), so the overlap driver rebuilds
+                    # the FEM WHOLE-MESH while keeping the ``volume@{region}`` label below (still detectable).
                     bare = RegionMask(region) * bare
                 volume_terms.append(bare)
                 classification.append("volume" if region == "volume" else f"volume@{region}")
@@ -2225,10 +2299,17 @@ def fem(constraints: Any, *, quad_degree: int = 2, element_type: Optional[str] =
                 boundary_terms.setdefault(region, []).append(bare)
                 classification.append(f"surface@{region}")
         elif has_trial:
-            if support != "boundary":
+            # A trial-only residual is a Dirichlet pin `u(region) - g`. It lives on a boundary region,
+            # the 'initial' region (IC), OR a **named interior sub-region** (`domain.region(name, poly)`,
+            # keyed in `_source_regions`) — pinning that region's whole node set, a volumetric hard
+            # constraint used by subdomain / domain-decomposition solves. The default whole-domain
+            # `volume` is still rejected (that signals a forgotten test function).
+            is_subregion_pin = support == "volume" and region in (getattr(domain, "_source_regions", {}) or {})
+            if support != "boundary" and not is_subregion_pin:
                 raise ValueError(
                     "jno.fem: a residual with the trial but no test function must live on a boundary "
-                    "region (Dirichlet) or the 'initial' region (IC). Got a volume region — did you forget the test function?"
+                    "region (Dirichlet), the 'initial' region (IC), or a named interior sub-region "
+                    "(domain.region(...)). Got the whole-domain volume — did you forget the test function?"
                 )
             comp, value, value_node = _dirichlet_spec(_bare(c))
             fk = _field_key_of(c)

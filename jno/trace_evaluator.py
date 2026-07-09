@@ -834,6 +834,66 @@ class TraceEvaluator:
             raise ValueError(f"Choice index {idx} out of range for '{expr.name}'")
         return self._dispatch(expr.options[idx], ctx)
 
+    def _eval_normal_derivative(self, target, normal_var, scheme, ctx):
+        """``∇(target)·n`` at the eval points, where ``normal_var`` is a boundary/interface normal
+        (tag ``n_<region>``). The full spatial FD gradient of ``target`` is computed over the mesh and
+        dotted with the node normals — the pointwise value of the normal flux. Requires both the normals
+        (``ctx.context['n_<region>']``) and the points (``ctx.context['<region>']``) to be present."""
+        # The normal Variable's tag may carry a trailing component suffix (``n_interface_L_R_0``) while
+        # the eval context holds the base tags (``n_interface_L_R`` normals, ``interface_L_R`` points),
+        # so match the normals key by prefix.
+        ntag = normal_var.tag
+        normal_key = next(
+            (k for k in ctx.context if isinstance(k, str) and k.startswith("n_") and str(ntag).startswith(k)), None
+        )
+        coord_tag = normal_key[2:] if normal_key is not None else ntag[2:]
+        if normal_key is None or coord_tag not in ctx.context:
+            have = sorted(k for k in ctx.context if not str(k).startswith("__"))
+            raise KeyError(
+                f"normal-derivative eval needs the normals ('n_<region>') and points ('<region>') for "
+                f"'{ntag}' in the context; have {have}."
+            )
+        normals = jnp.asarray(ctx.context[normal_key])
+        points = jnp.asarray(ctx.context[coord_tag])
+        domain = getattr(normal_var, "_domain", None)
+        if domain is None or getattr(domain, "mesh_connectivity", None) is None:
+            raise ValueError("normal-derivative eval requires the normal variable to carry a mesh domain.")
+        mesh_points = jnp.asarray(domain.mesh_connectivity["points"])
+        mesh_dim = int(domain.mesh_connectivity["dimension"])
+
+        # nodal values of the target over the WHOLE mesh (FD stencils need the full field, not just the
+        # interface nodes), then map the gradient back to the requested points.
+        full_ctx = self._EvalCtx(
+            {**ctx.context, coord_tag: mesh_points}, ctx.var_bindings, ctx.key, active_region=ctx.active_region
+        )
+        u_full = jnp.asarray(self._dispatch(target, full_ctx)).reshape(-1)
+
+        sch = scheme if str(scheme).startswith("finite_difference") else "finite_difference"
+        _, grad_method, _ = DifferentialOperators.parse_fd_scheme(sch)
+        if mesh_dim == 1:
+            grads = [
+                DifferentialOperators.compute_fd_gradient_1d_simple(
+                    u_full, mesh_points, domain.mesh_connectivity["lines"], method=grad_method
+                )
+            ]
+        elif mesh_dim == 2:
+            cells = domain.mesh_connectivity["triangles"]
+            grads = [
+                DifferentialOperators.compute_fd_gradient_2d_simple(u_full, mesh_points, cells, i, method=grad_method)
+                for i in range(2)
+            ]
+        else:
+            cells = domain.mesh_connectivity["tetrahedra"]
+            grads = [
+                DifferentialOperators.compute_fd_gradient_3d_simple(u_full, mesh_points, cells, i, method=grad_method)
+                for i in range(3)
+            ]
+        grad_full = jnp.stack([jnp.asarray(g).reshape(-1) for g in grads], axis=-1)  # (N_mesh, D)
+        pts2d = points.reshape(-1, points.shape[-1])
+        grad_at = self._map_mesh_to_sampled(mesh_points, pts2d, grad_full)  # (N_pts, D)
+        n = normals.reshape(-1, normals.shape[-1])
+        return jnp.sum(grad_at * n, axis=-1)  # (N_pts,)
+
     def _eval_jacobian(self, expr, ctx):
         """Evaluate Jacobian (first-order derivatives).
 
@@ -915,6 +975,22 @@ class TraceEvaluator:
         first_var = variables[0]
         bound_var = ctx.var_bindings.get(id(first_var), first_var)
         first_axis = getattr(bound_var, "axis", "spatial")
+
+        # ── Normal derivative: ``u.d(n)`` where ``n`` is a boundary/interface normal ──
+        # (tag ``n_<region>`` from ``domain.variable(region, normals=True)``, a vector). Returns the
+        # pointwise flux value ``∇(target)·n`` — distinct from the affine BC-assembly decomposition —
+        # so an interface condition like ``k*uA.d(n) - k*uB.d(n)`` can be *evaluated* at the interface
+        # nodes given each subdomain's computed nodal field (the coupling residual for an interface solve).
+        _ndim = getattr(bound_var, "dim", None)
+        if (
+            len(variables) == 1
+            and isinstance(getattr(bound_var, "tag", None), str)
+            and bound_var.tag.startswith("n_")
+            and isinstance(_ndim, (list, tuple))
+            and len(_ndim) == 2
+            and (_ndim[1] - _ndim[0]) >= 2  # a normal is a vector; a coordinate spans one component
+        ):
+            return self._eval_normal_derivative(target, bound_var, scheme, ctx)
 
         # ── Temporal derivative ──
         if first_axis == "temporal":

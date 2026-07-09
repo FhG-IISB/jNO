@@ -26,21 +26,15 @@ fem = jno.fem([momentum, -qq*trace(gu), ...lid + no-slip + IC...])
 assert fem.is_transient and not fem.is_linear                  # transient + nonlinear + coupled
 ```
 
-## Bring your own implicit stepper (backward Euler + Newton)
+## `fem.solve()` does the implicit stepping
 
-`fem` hands back the semidiscrete pieces as ready-to-use JAX arrays — `fem.M` (dense mass),
-`fem.state0`, and `fem.residual(w, t)` / `fem.jacobian(w, t)` (flat residual, dense Jacobian) — so we
-step it implicitly with a Newton solve per step (the Jacobian is `M/Δt + ∂R/∂u`), which converges
-quadratically:
+`fem.solve()` integrates the nonlinear transient system itself — **backward Euler with a Newton solve
+per step** — and returns the differentiable forward trajectory. For a transient solve the result is a
+*trace node*, so we read the concrete trajectory (one DOF vector per time step) through a minimal crux:
 
 ```python
-M, w = fem.M, fem.state0                          # dense mass + initial state, ready to use
-for step in range(nsteps):                       # backward Euler
-    w_prev = w
-    for _ in range(8):                            # Newton
-        G  = M @ (w - w_prev)/dt + fem.residual(w, t_next)
-        dw = jnp.linalg.solve(M/dt + fem.jacobian(w, t_next), -G)
-        w  = w + dw
+sol  = fem.solve()                                   # the implicit stepping happens inside
+traj = np.asarray(jno.core([sol.mse]).eval([sol]))   # (n_steps, dofs) over the time grid
 ```
 
 ## The result
@@ -58,8 +52,8 @@ textbook cavity structure.
 - **Navier–Stokes works now.** The convective term used to be silently misclassified as linear; it
   is detected as nonlinear, so the convection is actually solved (Taylor–Hood P2/P1, autodiff
   Jacobian). Steady and transient both work.
-- **Bring your own integrator** again — here backward Euler + Newton on the block's
-  `mass`/`residual`/`jacobian`. The Newton iteration converges quadratically.
+- **No hand-rolled stepping** — `fem.solve()` does the backward-Euler + Newton implicit stepping
+  internally; you just read the returned trajectory.
 - **Verified by physics:** the flow reaches steady state (the last frames stop changing) and shows a
   genuine recirculation — the centre-line $u_x$ is $+$ near the lid and $-$ near the floor.
 
@@ -74,5 +68,5 @@ shown here is the prerequisite for all of that.
 ## Full script
 
 ```python
---8<-- "tutorial_examples/08_fem_and_varpinns/navier_stokes_cavity_2d.py"
+--8<-- "tutorial_examples/08_fem_and_varpinns/navier_stokes_cavity_2d.py:code"
 ```

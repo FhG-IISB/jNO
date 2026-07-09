@@ -1,3 +1,4 @@
+# --8<-- [start:code]
 """Transient incompressible **Navier-Stokes** in 2D: the lid-driven cavity, the canonical viscous-flow
 benchmark. The fluid starts at rest; the top lid is set impulsively in motion and drives a
 recirculating vortex that spins up and settles to steady state.
@@ -6,9 +7,9 @@ recirculating vortex that spins up and settles to steady state.
 
 The point of this example is the **convective term** ``(u.grad)u`` -- written as ``inner(grad u, u)``.
 That is the unknown contracted with itself (a genuine nonlinearity), so ``jno.fem`` routes the whole
-system to its nonlinear coupled operator and the Jacobian comes from autodiff. We bring our own
-implicit time stepper: **backward Euler + Newton** on the mass / residual / jacobian that ``jno.fem``
-exposes for the transient system.
+system to its nonlinear coupled operator and the Jacobian comes from autodiff. ``fem.solve()`` does
+the implicit time stepping internally -- **backward Euler + Newton** per step on the mass / residual /
+jacobian of the transient system -- and returns the differentiable forward trajectory.
 
 Inf-sup-stable Taylor-Hood elements (P2 velocity, P1 pressure); all-Dirichlet (a regularised moving
 lid + no-slip walls), so no outflow boundary is needed.
@@ -16,28 +17,20 @@ lid + no-slip walls), so no outflow boundary is needed.
 
 import os
 
-os.environ["MPLBACKEND"] = "Agg"
 os.environ.setdefault("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.6")  # play nice on a shared GPU
 
 import jax
 
 jax.config.update("jax_enable_x64", True)  # the assembler builds in float64
 
-from pathlib import Path  # noqa: E402
-
-import jax.numpy as jnp  # noqa: E402
-import matplotlib.animation as animation  # noqa: E402
-import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
-from scipy.interpolate import griddata  # noqa: E402
-from shapely.geometry import box  # noqa: E402
 
 import jno  # noqa: E402
 
 inner, grad, trace = jno.np.inner, jno.np.grad, jno.np.trace
 nu = 0.005  # Re = U L / nu = 1 * 1 / 0.005 = 200
 
-d = jno.domain(box(0, 0, 1, 1), mesh_size=0.045, time=(0.0, 8.0, 33))
+d = jno.Shape.rect(0, 0, 1, 1, size=0.045).domain(time=(0.0, 8.0, 33))
 u, v = d.fem_symbols(value_shape=(2,), names=("u", "v"), order=2)  # P2 velocity
 p, q = d.fem_symbols(names=("p", "q"), order=1)  # P1 pressure
 xi, yi, ti = d.variable("interior", split=True)
@@ -62,36 +55,35 @@ fem = jno.fem(
 )
 assert fem.is_transient and not fem.is_linear, "transient Navier-Stokes must be nonlinear"
 off = fem.offsets
-M, dt = fem.M, float(fem.dt)
 print(f"\nTransient Navier-Stokes lid-driven cavity (Re={1 / nu:.0f}): dofs={fem.dofs}")
 
-# bring-your-own implicit integrator: backward Euler + Newton  ((M/dt + dR/du) du = -G)
-nsteps, nframes = round((float(fem.t1) - float(fem.t0)) / dt), 32
-w = fem.state0
-frames, save_every = [np.asarray(w)], max(1, nsteps // nframes)
-for step in range(nsteps):
-    w_prev, t_next = w, (step + 1) * dt
-    for _ in range(8):  # Newton
-        G = M @ (w - w_prev) / dt + fem.residual(w, t_next)
-        J = M / dt + fem.jacobian(w, t_next)
-        dw = jnp.linalg.solve(J, -G)
-        w = w + dw
-        if float(jnp.linalg.norm(dw)) < 1e-9:
-            break
-    if (step + 1) % save_every == 0:
-        frames.append(np.asarray(w))
-frames = np.stack(frames)
-settle = float(np.linalg.norm(frames[-1] - frames[-2]) / np.linalg.norm(frames[-1]))
+# fem.solve() does the implicit time stepping internally (backward Euler + Newton per step) and
+# returns a differentiable trace node; evaluate the forward trajectory through a minimal crux.
+sol = fem.solve()
+traj = np.asarray(jno.core([sol.mse]).eval([sol]))  # (n_steps, dofs) over the domain time grid
+ts = np.linspace(float(fem.t0), float(fem.t1), traj.shape[0])  # sample time of each trajectory row
+settle = float(np.linalg.norm(traj[-1] - traj[-2]) / np.linalg.norm(traj[-1]))
 
 pts_v = np.asarray(fem.field_points[0])
-vel = frames[:, off[0] : off[1]].reshape(frames.shape[0], -1, 2)  # (frame, n_vel_nodes, 2)
+vel = traj[:, off[0] : off[1]].reshape(traj.shape[0], -1, 2)  # (frame, n_vel_nodes, 2)
 uxN = vel[-1, :, 0]  # steady x-velocity, for the recirculation check
 cl = np.abs(pts_v[:, 0] - 0.5) < 0.06  # near the vertical centre-line
 top = uxN[cl & (pts_v[:, 1] > 0.7)].mean()  # driven by the lid -> u_x > 0
 bot = uxN[cl & (pts_v[:, 1] < 0.3)].mean()  # return flow -> u_x < 0
 print(f"  steady by final frame: {settle:.3e}  |  centre-line u_x  top={top:+.3f}  bottom={bot:+.3f} (recirculation)")
 
-# ---- animate the spinning-up vortex: streamlines coloured by speed -> a GIF ----
+assert settle < 2e-2, f"flow not at steady state by the final frame: {settle:.3e}"
+assert top > 0.1 and bot < -0.02, f"expected a recirculating vortex (u_x top>0, bottom<0): top={top:.3f} bot={bot:.3f}"
+# --8<-- [end:code]
+
+# ---- figure: animate the spinning-up vortex as streamlines coloured by speed -> a GIF ----
+os.environ["MPLBACKEND"] = "Agg"
+from pathlib import Path  # noqa: E402
+
+import matplotlib.animation as animation  # noqa: E402
+import matplotlib.pyplot as plt  # noqa: E402
+from scipy.interpolate import griddata  # noqa: E402
+
 gx, gy = np.meshgrid(np.linspace(0, 1, 90), np.linspace(0, 1, 90))
 fig, ax = plt.subplots(figsize=(5.6, 5.4))
 
@@ -106,11 +98,8 @@ def _frame(j):
     ax.set_ylim(0, 1)
     ax.set_xticks([])
     ax.set_yticks([])
-    ax.set_title(f"lid-driven cavity, Re=200 — t = {j * save_every * dt:.1f}", fontsize=11)
+    ax.set_title(f"lid-driven cavity, Re=200 — t = {ts[j]:.1f}", fontsize=11)
 
 
 ani = animation.FuncAnimation(fig, _frame, frames=vel.shape[0], interval=110, blit=False)
 ani.save(Path(__file__).parents[2] / "assets" / "navier_stokes_cavity_2d.gif", writer="pillow", fps=9, dpi=85)
-
-assert settle < 2e-2, f"flow not at steady state by the final frame: {settle:.3e}"
-assert top > 0.1 and bot < -0.02, f"expected a recirculating vortex (u_x top>0, bottom<0): top={top:.3f} bot={bot:.3f}"

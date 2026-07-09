@@ -2365,6 +2365,35 @@ class ModelCall(Placeholder):
         args_str = ", ".join(str(a) for a in self.args)
         return f"{self.model}({args_str})"
 
+    def partials(self, **named_vars):
+        """Bind named coordinate Variables for attribute-style / ``.d`` derivatives — the SAME idiom as
+        the fem trial from :meth:`fem_symbols` (``u.bind(x=x, y=y).d2(x)``, ``ui.x``) and the PINN field
+        ``net(x).scalar.bind(x=x)``. Lets a valued field (``jno.np.parameter``/``domain.unknown()``) be
+        authored exactly like a fem symbol.
+
+        A **nodal field** (``domain.unknown()`` / ``jno.np.parameter(<fem symbol>)``) is a mesh-shaped
+        output whose coordinates are not network inputs, so it binds through the :class:`FieldView`
+        path — the SAME view the fem trial uses. That makes ``.t`` a genuine :class:`TemporalDerivative`
+        (not a lexical spatial partial), so the strong form reads identically to the weak form
+        (``ui.t - nu*(ui.d2(x) + ui.d2(y))``)."""
+        if getattr(self.model, "_fem_field", None) == "node":
+            return self.field.partials(**named_vars)
+        return self.scalar.partials(**named_vars)
+
+    bind = partials
+
+    def __call__(self, *coords, **named):
+        """For a **nodal-field unknown** (``domain.unknown()``), ``u(xb, yb)`` is sugar for
+        ``u.bind(x=xb, y=yb)`` — the region-restricted form used to write fem-identical BCs / IC
+        (``u(xb, yb) - g``, ``u(x0, y0) - u0``); the region is carried by the coordinate variables'
+        tags, exactly as for a fem :class:`TrialFunction`. Any other ``ModelCall`` falls back to the
+        expression-reparameterization call (:meth:`Placeholder.__call__`)."""
+        if getattr(self.model, "_fem_field", None) == "node" and coords and all(isinstance(c, Variable) for c in coords):
+            binding = {axis: c for axis, c in zip(("x", "y", "z"), coords)}
+            binding.update(named)
+            return self.partials(**binding)
+        return super().__call__(*coords, **named)
+
     # ── proxied helpers (delegate to Model) ─────────────
 
     def dont_show(self):
@@ -2951,8 +2980,8 @@ class FemLinearSystem:
         ``crux.solve``), any runtime parameters ``θ`` are resolved to their current
         values, :meth:`evaluate` forms ``A(θ), b(θ)``, and ``solve_fn`` solves them.
         Gradients flow back to the parameters through ``solve_fn`` — so an inverse
-        problem is just ``crux([(fem.solve() - u_obs).mse], domain=...)`` where
-        ``fem = jno.fem([...])`` (see ``docs/inverse-problems.md``).
+        problem is just ``crux([(fem.solve() - u_obs).mse])`` where ``fem = jno.fem([...])``
+        (the domain is inferred from the solve node; see ``docs/inverse-problems.md``).
 
         ``solve_fn`` is **your** solver: any ``(A, b) -> u`` callable. jNO writes no
         solver code and imposes no library — the default is the differentiable sparse-direct

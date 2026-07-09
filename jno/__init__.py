@@ -15,6 +15,8 @@ from .architectures.models import nn, parameter
 from .core import core
 from .differential_operators import DifferentialOperators
 from .domain import domain
+from .fdm import fdm
+from .geometry import Path, Shape
 from .integration_operators import IntegrationOperators
 from .noise import noise
 from .trace import (
@@ -113,8 +115,11 @@ __all__ = [
     "core",
     "sampler",
     "domain",
+    "Shape",
+    "Path",
     "do",
     "fem",
+    "fdm",
     "AdaptSpec",
     "Coupling",
     "Model",

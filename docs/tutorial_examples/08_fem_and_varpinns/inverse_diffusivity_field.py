@@ -1,3 +1,4 @@
+# --8<-- [start:code]
 """09 - Inverse problem: recover a hidden diffusivity field k(x) through a differentiable FEM solve.
 
     Forward:  -div(k(x) grad u) = f,   u = 0 on the boundary,   with unknown k(x) > 0.
@@ -14,11 +15,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from shapely.geometry import box
 
 import jno
 
-d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.1)
+d = jno.Shape.rect(0.0, 0.0, 1.0, 1.0, size=0.1).domain()
 u, phi = d.fem_symbols()
 xi, yi, _ = d.variable("interior", split=True)
 xb, yb, _ = d.variable("boundary", split=True)
@@ -30,14 +30,15 @@ k_true = 1.0 + 0.8 * np.exp(
     -((nodes[:, 0] - 0.5) ** 2 + (nodes[:, 1] - 0.5) ** 2) / (2 * 0.12**2)
 )  # background + inclusion
 
-# One parametric assembly: generate clean full-field data by evaluating it at the true k ...
-k = jno.np.parameter(phi, name="k")
-fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
-A_true, b = fem.operator.evaluate({"k": jnp.asarray(k_true)})
-A_true = A_true.todense() if hasattr(A_true, "todense") else jnp.asarray(A_true)  # operator is BCOO
-u_obs = jnp.linalg.solve(A_true, jnp.asarray(b).reshape(-1))
+# Generate clean full-field data with one forward solve at the true k -- a known coefficient
+# frozen from its coordinate function, so it is a plain non-parametric fem.solve() (no manual solve).
+k_fn = lambda x, y: 1.0 + 0.8 * jnp.exp(-((x - 0.5) ** 2 + (y - 0.5) ** 2) / (2 * 0.12**2))  # noqa: E731
+k_known = jno.np.parameter(phi).initialize(k_fn).freeze()
+u_obs = jnp.asarray(jno.fem([k_known * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3).solve())
 
 # ... then recover k(x) from u_obs through the differentiable solve + an H1 smoothness prior.
+k = jno.np.parameter(phi, name="k")
+fem = jno.fem([k * (ui.x * vi.x + ui.y * vi.y) - f * vi, u(xb, yb) - 0.0], quad_degree=3)
 k.dtype(jnp.float64)
 k.initialize(jax.nn.initializers.constant(1.0))  # start from a uniform field
 k.optimizer(optax.adam(2e-2))
@@ -53,3 +54,35 @@ print(
     f"\nInverse diffusivity field: nodes={k_true.shape[0]}  k(x) rel_L2={rel:.3e}  peak rec/true={rec.max():.3f}/{k_true.max():.3f}"
 )
 assert rel < 0.1
+# --8<-- [end:code]
+
+# ---- solution figure: true k(x) | recovered k(x) | error, plus the recovered-vs-true fit ----
+from pathlib import Path  # noqa: E402
+
+import matplotlib.pyplot as plt  # noqa: E402
+
+plt.rcParams.update(
+    {"savefig.dpi": 150, "savefig.bbox": "tight", "axes.titleweight": "bold", "axes.titlesize": 10, "figure.dpi": 120}
+)
+
+x, y = nodes[:, 0], nodes[:, 1]
+vlo, vhi = float(min(k_true.min(), rec.min())), float(max(k_true.max(), rec.max()))  # shared scale
+klevels = np.linspace(vlo, vhi, 21)  # identical level set -> identical colourbars on both k panels
+diff = rec - k_true
+m = float(np.max(np.abs(diff)))
+
+fig, ax = plt.subplots(1, 3, figsize=(13, 4))
+c0 = ax[0].tricontourf(x, y, k_true, levels=klevels, cmap="cividis", extend="both")
+ax[0].set_title("true $k(x)$")
+fig.colorbar(c0, ax=ax[0], shrink=0.8)
+c1 = ax[1].tricontourf(x, y, rec, levels=klevels, cmap="cividis", extend="both")
+ax[1].set_title(f"recovered $k(x)$  (rel-$L^2$={rel:.1e})")
+fig.colorbar(c1, ax=ax[1], shrink=0.8)
+c2 = ax[2].tricontourf(x, y, diff, levels=np.linspace(-m, m, 21), cmap="RdBu_r", extend="both")
+ax[2].set_title(r"error  $k_{\rm rec}-k_{\rm true}$")
+fig.colorbar(c2, ax=ax[2], shrink=0.8)
+for a in ax:
+    a.set_aspect("equal")
+    a.set_axis_off()
+fig.tight_layout()
+fig.savefig(Path(__file__).parents[2] / "assets" / "inverse_diffusivity_field.png")

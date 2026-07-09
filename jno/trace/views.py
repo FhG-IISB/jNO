@@ -231,7 +231,16 @@ class ScalarView(_DelegatesToPlaceholder):
         return self._rewrap(self._expr.stop_gradient)
 
     def d(self, v, scheme: str = "automatic_differentiation") -> "ScalarView":
-        """``∂self/∂v`` — same view type."""
+        """``∂self/∂v`` — same view type.
+
+        ``v`` may be a coordinate Variable (``∂self/∂x``) or a boundary/interface **normal** from
+        ``domain.variable(tag, normals=True)``, in which case this is the normal derivative ``∂self/∂n``
+        (the assembler resolves the flux ``∇self·n``). So an interface flux / material condition reads
+        with the same ``.d`` as a plain derivative::
+
+            n = domain.variable("interface_A_B", normals=True)
+            kA * uA.d(n) - kB * uB.d(n)          # flux continuity across the interface
+        """
         return self._rewrap(self._expr.d(v, scheme=scheme))
 
     def d2(self, v, scheme: str = "automatic_differentiation") -> "ScalarView":
@@ -1734,6 +1743,32 @@ class FieldViewWithPartials(ScalarView):
         object.__setattr__(new, "_coord_vars", cv)
         object.__setattr__(new, "_spatial_coords", sc)
         return new
+
+    # ------------------------------------------------------------------
+    # Method-style derivatives — default scheme
+    # ------------------------------------------------------------------
+    # A **nodal parameter** field (``domain.unknown()`` / ``jno.np.parameter(<fem symbol>)``) is a
+    # discrete field on the mesh: autodiff w.r.t. a coordinate is meaningless, so its ``.d``/``.d2``
+    # default to finite differences — ``ui.d2(x)`` is the FD second derivative, no ``scheme=`` needed.
+    # For a neural-operator FieldView the default stays autodiff so the existing AD-on-FD guard keeps
+    # forcing an explicit ``scheme="finite_difference"`` (see ``TestFieldViewADGuard``).
+
+    def _default_deriv_scheme(self) -> str:
+        expr = object.__getattribute__(self, "_expr")
+        model = getattr(expr, "model", None)
+        return "finite_difference" if getattr(model, "_fem_field", None) == "node" else "automatic_differentiation"
+
+    def d(self, v, scheme: str | None = None) -> "ScalarView":
+        """``∂self/∂v`` — finite differences by default for a nodal field (pass ``scheme=`` to override)."""
+        return self._rewrap(self._expr.d(v, scheme=scheme or self._default_deriv_scheme()))
+
+    def d2(self, v, scheme: str | None = None) -> "ScalarView":
+        """``∂²self/∂v²`` — finite differences by default for a nodal field."""
+        return self._rewrap(self._expr.d2(v, scheme=scheme or self._default_deriv_scheme()))
+
+    def dd(self, v, w=None, scheme: str | None = None) -> "ScalarView":
+        """Mixed second derivative ``∂²self/∂v∂w`` — finite differences by default for a nodal field."""
+        return self._rewrap(self._expr.dd(v, w, scheme=scheme or self._default_deriv_scheme()))
 
     # ------------------------------------------------------------------
     # Attribute access — derivative sequence parsing

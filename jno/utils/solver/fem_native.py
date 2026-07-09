@@ -119,7 +119,26 @@ def _get_mesh(domain, dim: int, order: int):
 
 
 def _region_node_ids_from_pts(domain, region: str, pts_all: np.ndarray) -> List[int]:
-    """Node ids in ``pts_all`` satisfying the location function for ``region``."""
+    """Node ids in ``pts_all`` for ``region`` — a **geometric interior sub-region**
+    (``domain.region(name, polygon)``) by point-in-polygon, else the region's location function.
+
+    A shapely polygon is not jax-traceable, so an interior sub-region cannot go through the jax
+    ``_make_tag_location_fn`` path below; it is resolved here in numpy. This is what lets a subdomain
+    solve (domain decomposition) restrict/pin on a named sub-region."""
+    ptags = getattr(domain, "_polygon_tags", {})
+    if region in ptags and ptags[region][0] == "interior":
+        pts = np.asarray(pts_all)
+        try:
+            from shapely import contains_xy  # vectorized (shapely >= 2.0.2)
+
+            hits = np.asarray(contains_xy(ptags[region][1].buffer(1e-9), pts[:, 0], pts[:, 1]))
+        except (ImportError, AttributeError):
+            from shapely.geometry import Point
+
+            g = ptags[region][1].buffer(1e-9)
+            hits = np.array([g.contains(Point(float(q[0]), float(q[1]))) for q in pts])
+        return list(np.where(hits.reshape(-1))[0])
+
     loc = domain._make_tag_location_fn(region)
     if loc is None:
         raise ValueError(f"jno.fem (native): region {region!r} has no location function.")
@@ -969,6 +988,12 @@ def assemble_fem_native(
         from ..._fem import _boundary_facets
 
         pts_all = np.asarray(pts_f_all[fidx])
+        # A named interior SUB-REGION (`domain.region(name, poly)`) pins its WHOLE node set (interior +
+        # boundary), by point-in-polygon — not just its boundary nodes (which is empty for an interior
+        # region and would silently drop the pin). This is the subdomain / domain-decomposition pin.
+        ptags = getattr(domain, "_polygon_tags", {})
+        if region in (getattr(domain, "_source_regions", {}) or {}) and ptags.get(region, (None,))[0] == "interior":
+            return list(_region_node_ids_from_pts(domain, region, pts_all))
         bf = _boundary_facets(pts_all, np.asarray(cells_f_all[fidx]), dim, fields[fidx]["order"])
         if bf is None:
             return list(_region_node_ids_from_pts(domain, region, pts_all))
@@ -990,6 +1015,7 @@ def assemble_fem_native(
 
     def _build_dirichlet_pairs() -> List[Tuple[int, float]]:
         from ..._fem import _eval_value_node_at
+        from ...trace import ModelCall
 
         pairs: List[Tuple[int, float]] = []
         for field_key, region, comp, value, value_node in dirichlet_raw:
@@ -997,13 +1023,26 @@ def assemble_fem_native(
             if fidx is None:
                 continue
             _vn = _bare_node(value_node) if value_node is not None else None
-            if _vn is not None and _is_neural_coefficient(_vn):
+            # A nodal DATA-field value (a `jno.np.parameter` carrying a field with NO optimizer — e.g. a
+            # neighbour's field in a coupled/domain-decomposition solve) → gather its per-node values by
+            # node index. Checked before the neural-coefficient branch so a bare data-field is a value,
+            # not a runtime net profile.
+            _field_vals = None
+            if (
+                isinstance(_vn, ModelCall)
+                and getattr(_vn.model, "_is_parameter", False)
+                and getattr(_vn.model, "_opt_fn", None) is None
+            ):
+                _field_vals = np.asarray(_vn.model.module.value).reshape(-1)
+            elif _vn is not None and _is_neural_coefficient(_vn):
                 continue  # a net-valued Dirichlet is (re-)built per args in _dirichlet_pairs_at
             vt = vecs[fidx]
             pts_all = pts_f_all[fidx]
             for nid in _boundary_node_ids(fidx, region):
                 p = np.asarray(pts_all[nid])
-                if value_node is not None:
+                if _field_vals is not None:
+                    g = float(_field_vals[nid])
+                elif value_node is not None:
                     raw = _eval_value_node_at(value_node, jnp.asarray(p)[None])
                     g = float(jnp.asarray(raw).reshape(-1)[0])
                 elif callable(value):

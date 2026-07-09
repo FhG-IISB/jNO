@@ -172,8 +172,6 @@ def _infer_domain_from_constraints(constraints: List[Placeholder]):
     Raises ``ValueError`` if zero (no Variables at all) or more than one
     distinct domain is found — the caller must then pass ``domain=`` explicitly.
     """
-    from .trace import TensorTag, Variable
-
     domains: list = []  # preserve insertion order for nicer error messages
     seen_domains: set = set()
     seen_nodes: set = set()
@@ -182,11 +180,14 @@ def _infer_domain_from_constraints(constraints: List[Placeholder]):
         if node is None or id(node) in seen_nodes:
             return
         seen_nodes.add(id(node))
-        if isinstance(node, (Variable, TensorTag)):
-            d = getattr(node, "_domain", None)
-            if d is not None and id(d) not in seen_domains:
-                seen_domains.add(id(d))
-                domains.append(d)
+        # Any node may carry a domain: a Variable/TensorTag records the domain it was sampled from, and
+        # a solve node (e.g. `fem.solve()` / `jno.fdm([...]).solve()`) records the domain it discretizes,
+        # so a pure data-misfit loss `(solve() - obs).mse` — whose Variables are hidden inside the solve —
+        # still resolves its domain from the graph, with no explicit `domain=` needed.
+        d = getattr(node, "_domain", None)
+        if d is not None and id(d) not in seen_domains:
+            seen_domains.add(id(d))
+            domains.append(d)
         # Generic descent: visit every instance attribute that holds a
         # Placeholder (or a list/dict of them).  This covers GroupedAssembly
         # and any future Placeholder subclass without enumerating attr names.
@@ -223,6 +224,51 @@ def _infer_domain_from_constraints(constraints: List[Placeholder]):
         f"Cannot infer domain: constraints reference {len(domains)} distinct "
         f"domains ({domains!r}). All constraints must share a single domain."
     )
+
+
+def _references_interface(node):
+    """True if a constraint's trace references an ``interface_*`` / ``n_interface_*`` tag — i.e. it is an
+    interface *condition* (value ``uA(iface)-uB(iface)`` or flux ``k*uA.d(n)-...``), not a subdomain solve."""
+    seen: set = set()
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if id(n) in seen:
+            continue
+        seen.add(id(n))
+        tag = getattr(n, "tag", None)
+        if isinstance(tag, str) and (tag.startswith("interface_") or tag.startswith("n_interface_")):
+            return True
+        for attr in ("_expr", "left", "right", "operand"):  # views + binary/unary ops
+            c = getattr(n, attr, None)
+            if c is not None:
+                stack.append(c)
+        for attr in ("args", "variables"):  # op children + Jacobian diff-vars (a normal lives here)
+            seq = getattr(n, attr, None)
+            if seq:
+                stack.extend(a for a in seq if a is not None)
+        cv = getattr(n, "_coord_vars", None)  # `.bind(x=xif, y=yif)` stashes coords here, not in the trace
+        if isinstance(cv, dict):
+            stack.extend(cv.values())
+    return False
+
+
+def _detect_subdomains(constraints):
+    """If the list is a domain-decomposition problem — ≥2 subdomain solves (a ``jno.fdm([...])`` /
+    ``jno.fem([...])`` whose PDE coordinates live on a ``domain.region(name, poly)``) plus optional
+    **interface-condition** residuals — return ``(subdomains, interface_conditions)``; else ``None`` (a
+    normal loss/PINN core). Subdomains are duck-typed (``region_geometry`` + ``pinned_solver``); interface
+    conditions are residuals referencing an ``interface_*`` tag (value ``uA(iface)-uB(iface)`` / flux
+    ``k*uA.d(n)-...``), the coupling declared in the same jNO constraint syntax as everything else."""
+    subs, ifaces, other = [], [], []
+    for c in constraints:
+        if getattr(c, "region_geometry", None) is not None and hasattr(c, "pinned_solver"):
+            subs.append(c)
+        elif _references_interface(c):
+            ifaces.append(c)
+        else:
+            other.append(c)
+    return (subs, ifaces) if (len(subs) >= 2 and not other) else None
 
 
 def _active_model_lids(exprs):
@@ -415,6 +461,17 @@ class core:
         """
         self.log = get_logger()
         self.constraints: List[Placeholder] = constraints
+
+        # Domain-decomposition coupling: `jno.core([A, B, ...])` where each item is a subdomain solve
+        # (`jno.fdm([...])` carrying a named region via `domain.region(...)`) — couple by overlapping
+        # Schwarz instead of PINN training. `.solve()` delegates to the coupling driver.
+        _detected = _detect_subdomains(constraints)
+        self._dd_subdomains = None
+        if _detected is not None:
+            self._dd_subdomains, self._dd_interfaces = _detected
+            self.domain = self._dd_subdomains[0].domain
+            self.models = {}
+            return
 
         # An empty-constraint core is eval-only (no training); its domain is
         # supplied per call to eval(). Only infer a domain when constraints
@@ -1734,6 +1791,17 @@ class core:
         Returns:
             statistics: Training history with ``.plot()`` convenience.
         """
+        # Domain-decomposition coupling: the constraints are subdomain solve problems, not losses —
+        # couple them by the inferred method (line Dirichlet-Neumann or overlapping Schwarz), no PINN
+        # training. `epochs` maps to the coupling iteration cap (line DN needs a few hundred).
+        if getattr(self, "_dd_subdomains", None) is not None:
+            from .dd import couple
+
+            return couple(
+                [(s, s.region_geometry) for s in self._dd_subdomains],
+                interface_conditions=getattr(self, "_dd_interfaces", None),
+            ).solve(tol=1e-7, max_iter=int(epochs) if epochs and epochs != 1000 else 400)
+
         from contextlib import nullcontext
 
         from jax._src import profiler as _jax_profiler
