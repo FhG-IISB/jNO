@@ -31,8 +31,14 @@ rec = np.asarray(crux.eval([k])).reshape(-1)     # the recovered field (do not i
 - `k.regularize(...)` (`h1seminorm`/`l2`/`tv`/`nonneg`/`bounded`) is the FE-exact prior; the
   inclusion is recovered to rel-$L^2 \approx 6\times10^{-2}$ (the prior smooths its peak slightly).
 
+## Result
+
+![Left: the true diffusivity field with a Gaussian inclusion. Middle: the recovered field on a shared colour scale. Right: the signed difference between recovered and true fields.](/jNO/assets/inverse_diffusivity_field.png)
+
+The differentiable solve recovers the hidden high-conductivity inclusion (middle) from the measured response, matching the true field (left) to rel-$L^2\approx6\times10^{-2}$; the residual (right) shows the H1 prior smooths the peak of the inclusion slightly.
+
 ## Full script
 
 ```python
---8<-- "tutorial_examples/08_fem_and_varpinns/inverse_diffusivity_field.py"
+--8<-- "tutorial_examples/08_fem_and_varpinns/inverse_diffusivity_field.py:code"
 ```

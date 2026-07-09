@@ -1,3 +1,4 @@
+# --8<-- [start:code]
 """09 - Vibrating membrane: the 2-D wave equation (second-order in time) via ``jno.fem``.
 
 A square drum head clamped on all four edges, plucked into the fundamental mode and released:
@@ -77,3 +78,49 @@ print(f"  amplitude after one period ||u(T)|| / ||u(0)|| = {amp:.4f}   (≈ 1: e
 assert rel < 0.05, f"membrane does not track the analytic standing wave: rel L2 = {rel:.4f}"
 assert 0.95 < amp < 1.05, f"amplitude not conserved over a period: {amp:.4f}"  # θ=½, not backward Euler
 assert abs(energy[len(energy) // 2] / energy[1] - 1.0) < 0.05, "discrete energy should be conserved"
+# --8<-- [end:code]
+
+# ---- solution figures: (a) GIF of the membrane displacement over one period,
+#      (b) centre-node predicted-vs-analytic PNG ----
+from pathlib import Path  # noqa: E402
+
+import matplotlib.animation as animation  # noqa: E402
+import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.tri as mtri  # noqa: E402
+
+plt.rcParams.update(
+    {"savefig.dpi": 150, "savefig.bbox": "tight", "axes.titleweight": "bold", "axes.titlesize": 10, "figure.dpi": 120}
+)
+assets = Path(__file__).parents[2] / "assets"
+
+# (a) animate the computed displacement field with a symmetric colour scale fixed across frames.
+tri = mtri.Triangulation(pts[:, 0], pts[:, 1])
+A = float(np.max(np.abs(traj)))  # symmetric amplitude, shared by every frame
+stride = max(1, traj.shape[0] // 40)  # ~40 frames over the period
+frames = range(0, traj.shape[0], stride)
+figA, axA = plt.subplots(figsize=(5.2, 4.6))
+tpc = axA.tripcolor(tri, traj[0], cmap="RdBu_r", shading="gouraud", vmin=-A, vmax=A)
+figA.colorbar(tpc, ax=axA, shrink=0.85, label="displacement $u$")
+axA.set_aspect("equal")
+axA.set_axis_off()
+
+
+def _frame(j):
+    tpc.set_array(traj[j])
+    axA.set_title(f"vibrating membrane  t = {ts[j]:.3f} / {PERIOD:.3f}")
+    return (tpc,)
+
+
+ani = animation.FuncAnimation(figA, _frame, frames=list(frames), interval=80, blit=False)
+ani.save(assets / "wave_membrane_2d.gif", writer="pillow", fps=12, dpi=84)
+
+# (b) centre antinode: computed trajectory vs the analytic standing wave cos(omega t).
+figB, axB = plt.subplots(figsize=(6.5, 4))
+axB.plot(ts, u_center, label="jNO (centre node)")
+axB.plot(ts, u_exact, "--", label=r"analytic $\cos(\omega t)$")
+axB.set_xlabel("time $t$")
+axB.set_ylabel("centre displacement")
+axB.set_title(f"centre antinode vs analytic  (rel-$L^2$={rel:.1e})")
+axB.legend()
+axB.grid(True, alpha=0.3)
+figB.savefig(assets / "wave_membrane_2d.png")

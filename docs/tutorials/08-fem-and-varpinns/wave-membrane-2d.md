@@ -51,8 +51,18 @@ straight from `fem.M` and `fem.operator.A`.
 - The amplitude after one period is conserved ($\approx 1$) — the trapezoidal rule does not bleed
   energy from an undamped wave (Newmark average-acceleration; Newmark 1959).
 
+## Result
+
+![Animation of the membrane displacement over one period on a symmetric red-blue scale, the fundamental mode oscillating between positive and negative.](/jNO/assets/wave_membrane_2d.gif)
+
+The fundamental mode swings between its positive and negative extremes and back over one period, on a colour scale held fixed and symmetric across every frame.
+
+![Line plot of the centre-node displacement from jNO versus the analytic cosine over one period; the two curves overlap.](/jNO/assets/wave_membrane_2d.png)
+
+The centre antinode tracks the analytic standing wave $\sin(\pi x)\sin(\pi y)\cos(\omega t)$ to rel-$L^2\approx1.2\times10^{-2}$ over the full period, and the amplitude is conserved ($\approx1$) — the trapezoidal ($\theta=\tfrac12$) rule does not bleed energy from the undamped drum.
+
 ## Full script
 
 ```python
---8<-- "tutorial_examples/08_fem_and_varpinns/wave_membrane_2d.py"
+--8<-- "tutorial_examples/08_fem_and_varpinns/wave_membrane_2d.py:code"
 ```

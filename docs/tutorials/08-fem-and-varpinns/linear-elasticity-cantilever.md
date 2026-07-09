@@ -36,8 +36,14 @@ read with `.reshape(-1, 2)` (`[:, 0]` = $u_x$, `[:, 1]` = $u_y$), aligned with `
 - The tip deflection matches Euler-Bernoulli $\delta=PL^3/3EI$ to ~1% (a slender-beam
   approximation; Timoshenko & Goodier, *Theory of Elasticity*).
 
+## Result
+
+![Top: the cantilever mesh deformed under the tip load (displacement exaggerated x2) coloured by displacement magnitude, with the undeformed outline behind it. Bottom: bar chart comparing the FEM tip deflection to the Euler-Bernoulli value.](/jNO/assets/linear_elasticity_cantilever.png)
+
+The tip bends downward under the end shear (top, displacement shown $\times2$ for visibility, coloured by $|u|$). The computed tip deflection is $0.4031$ against the Euler-Bernoulli prediction $0.4000$ — a ratio of $1.008$, i.e. the P2 solve matches slender-beam theory to $\sim1\%$.
+
 ## Full script
 
 ```python
---8<-- "tutorial_examples/08_fem_and_varpinns/linear_elasticity_cantilever.py"
+--8<-- "tutorial_examples/08_fem_and_varpinns/linear_elasticity_cantilever.py:code"
 ```

@@ -1,3 +1,4 @@
+# --8<-- [start:code]
 """06 - Linear-elastic cantilever beam under an end load (vector FEM) via ``jno.fem``.
 
 Isotropic plane-stress elasticity on a slender beam (length L = 10, height H = 1) clamped at
@@ -42,3 +43,37 @@ print(
     f"\nCantilever (P2 elasticity): dofs={fem.dofs}  FEM tip={delta:.4f}  Euler-Bernoulli={eb:.4f}  ratio={delta / eb:.3f}"
 )
 assert fem.is_linear and abs(delta - eb) / eb < 0.05  # matches beam theory to ~1%
+# --8<-- [end:code]
+
+# ---- solution figure: deformed shape coloured by |u| | FEM vs Euler-Bernoulli tip deflection ----
+from pathlib import Path  # noqa: E402
+
+import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.tri as mtri  # noqa: E402
+
+plt.rcParams.update(
+    {"savefig.dpi": 150, "savefig.bbox": "tight", "axes.titleweight": "bold", "axes.titlesize": 10, "figure.dpi": 120}
+)
+
+pts = np.asarray(fem.points)  # P2 node coords, aligned with sol
+umag = np.linalg.norm(sol, axis=1)  # displacement magnitude per node
+SCALE = 2.0  # deformation exaggeration (labelled) -- tip deflection ~0.4 on a height-1 beam
+tri_ref = mtri.Triangulation(pts[:, 0], pts[:, 1])  # connectivity from the reference config
+tri_def = mtri.Triangulation(pts[:, 0] + SCALE * sol[:, 0], pts[:, 1] + SCALE * sol[:, 1], tri_ref.triangles)
+
+fig, ax = plt.subplots(2, 1, figsize=(11, 6), gridspec_kw={"height_ratios": [2, 1]})
+ax[0].triplot(tri_ref, color="0.75", lw=0.4)  # undeformed outline (reference mesh)
+tp = ax[0].tripcolor(tri_def, umag, cmap="cividis", shading="gouraud")
+fig.colorbar(tp, ax=ax[0], shrink=0.85, label=r"$|u|$")
+ax[0].set_title(rf"deformed cantilever (displacement $\times{SCALE:g}$) coloured by $|u|$;  dofs={fem.dofs}")
+ax[0].set_aspect("equal")
+ax[0].set_axis_off()
+
+ax[1].bar(["FEM (P2)", "Euler-Bernoulli"], [delta, eb], color=["#3b6fb6", "#b6b6b6"], width=0.5)
+ax[1].set_ylabel("tip deflection")
+ax[1].set_title(rf"tip deflection: FEM {delta:.4f} vs EB {eb:.4f}  (ratio {delta / eb:.3f})")
+for i, v in enumerate([delta, eb]):
+    ax[1].text(i, v, f"{v:.4f}", ha="center", va="bottom", fontsize=9)
+ax[1].margins(y=0.2)
+fig.tight_layout()
+fig.savefig(Path(__file__).parents[2] / "assets" / "linear_elasticity_cantilever.png")

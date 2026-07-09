@@ -1,3 +1,4 @@
+# --8<-- [start:code]
 """09 - Inverse problem: recover a hidden diffusivity field k(x) through a differentiable FEM solve.
 
     Forward:  -div(k(x) grad u) = f,   u = 0 on the boundary,   with unknown k(x) > 0.
@@ -53,3 +54,35 @@ print(
     f"\nInverse diffusivity field: nodes={k_true.shape[0]}  k(x) rel_L2={rel:.3e}  peak rec/true={rec.max():.3f}/{k_true.max():.3f}"
 )
 assert rel < 0.1
+# --8<-- [end:code]
+
+# ---- solution figure: true k(x) | recovered k(x) | error, plus the recovered-vs-true fit ----
+from pathlib import Path  # noqa: E402
+
+import matplotlib.pyplot as plt  # noqa: E402
+
+plt.rcParams.update(
+    {"savefig.dpi": 150, "savefig.bbox": "tight", "axes.titleweight": "bold", "axes.titlesize": 10, "figure.dpi": 120}
+)
+
+x, y = nodes[:, 0], nodes[:, 1]
+vlo, vhi = float(min(k_true.min(), rec.min())), float(max(k_true.max(), rec.max()))  # shared scale
+klevels = np.linspace(vlo, vhi, 21)  # identical level set -> identical colourbars on both k panels
+diff = rec - k_true
+m = float(np.max(np.abs(diff)))
+
+fig, ax = plt.subplots(1, 3, figsize=(13, 4))
+c0 = ax[0].tricontourf(x, y, k_true, levels=klevels, cmap="cividis", extend="both")
+ax[0].set_title("true $k(x)$")
+fig.colorbar(c0, ax=ax[0], shrink=0.8)
+c1 = ax[1].tricontourf(x, y, rec, levels=klevels, cmap="cividis", extend="both")
+ax[1].set_title(f"recovered $k(x)$  (rel-$L^2$={rel:.1e})")
+fig.colorbar(c1, ax=ax[1], shrink=0.8)
+c2 = ax[2].tricontourf(x, y, diff, levels=np.linspace(-m, m, 21), cmap="RdBu_r", extend="both")
+ax[2].set_title(r"error  $k_{\rm rec}-k_{\rm true}$")
+fig.colorbar(c2, ax=ax[2], shrink=0.8)
+for a in ax:
+    a.set_aspect("equal")
+    a.set_axis_off()
+fig.tight_layout()
+fig.savefig(Path(__file__).parents[2] / "assets" / "inverse_diffusivity_field.png")
