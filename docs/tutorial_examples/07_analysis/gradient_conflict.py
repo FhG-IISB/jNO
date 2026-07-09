@@ -10,15 +10,14 @@ import jno
 
 π = jno.np.pi
 
-# ── Domain ─────────────────────────────────────────────────────────────────────
+# ── Domain (hard-BC ansatz ⇒ no boundary sampling needed) ──────────────────────
 domain = jno.domain.line(mesh_size=0.001)
 x, _ = domain.variable("interior")
-xb, _ = domain.variable("boundary")
 
 # ── Exact solution (for validation only, not used in training) ─────────────────
 u_exact = jno.np.sin(π * x) / π**2
 
-# ── Network with hard-enforced BCs ─────────────────────────────────────────────
+# ── Network with a hard-enforced Dirichlet BC:  u(0) = u(1) = 0 ────────────────
 u_net = jno.nn(
     foundax.mlp(
         in_features=1,
@@ -26,30 +25,33 @@ u_net = jno.nn(
         num_layers=3,
         key=jax.random.PRNGKey(0),
     )
-).optimizer(optax.adam(optax.exponential_decay(1e-3, 10, 0.5, end_value=1e-5)))
+).optimizer(optax.adam(1e-3))
 
-u = u_net(x)
-u_xx = u.d2(x)
-pde = -u_xx - jno.np.sin(π * x)  # residual — should be 0
-
-
-ub = u_net(xb)
+u = u_net(x) * x * (1 - x)  # ansatz vanishes at x=0 and x=1
+pde = -u.d2(x) - jno.np.sin(π * x)  # residual — should be 0
 
 # ── In-training cosine similarity tracker ─────────────────────────────────────
 # Build a boolean mask selecting only the output-layer weight matrix.
 # This makes the Jacobian fast to compute — P_out_weight ≪ P_total.
-all_false = jax.tree_util.tree_map(lambda _: False, u_net.params)
+all_false = jax.tree_util.tree_map(lambda _: False, u_net.module)
 output_mask = eqx.tree_at(lambda m: m.output_layer.weight, all_false, True)
 
-# Symbolic Jacobian restricted to the masked parameters.
-# J shape at eval time: (N, P_out_weight)
-J1 = pde.mse.grad(u_net.mask(output_mask))
-J2 = ub.mse.grad(u_net.mask(output_mask))
+# Symbolic Jacobian restricted to the masked parameters; shape (N, P_out) at eval.
+J = u.grad(u_net.mask(output_mask))
 
-cos_tracker = jno.np.dot(J1, J2).tracker(100)
+
+# Cosine similarity between the LEFT and RIGHT halves of the domain: do the two
+# regions push the shared parameters the same way, or fight each other?
+def _cos_sim_halves(J):
+    mid = J.shape[0] // 2
+    g_left, g_right = J[:mid].mean(0), J[mid:].mean(0)
+    return jnp.dot(g_left, g_right) / (jnp.linalg.norm(g_left) * jnp.linalg.norm(g_right) + 1e-12)
+
+
+cos_tracker = jno.np.function(_cos_sim_halves, [J]).tracker(200)  # logged every 200 epochs
 
 # ── Solve ──────────────────────────────────────────────────────────────────────
-crux = jno.core([pde.mse, ub.mse, cos_tracker])
+crux = jno.core([pde.mse, cos_tracker])
 crux.solve(5000)
 
 _u, _u_exact = crux.eval([u, u_exact])
@@ -57,22 +59,14 @@ rel_l2 = float(jnp.linalg.norm(_u - _u_exact) / (jnp.linalg.norm(_u_exact) + 1e-
 print(f"Relative L² error: {rel_l2:.3e}")
 assert rel_l2 < 1e-1, f"solution error too large: {rel_l2:.3e}"
 
-# ── Post-training: gradient alignment between PDE and BC loss ─────────────────
+# ── Post-training: final cosine similarity (left vs right halves) ─────────────
 # crux.eval([single_expr]) returns the raw array without a batch dimension.
-[g_pde] = crux.eval([J1])  # (P_out_weight,) — gradient of PDE loss
-[g_bc] = crux.eval([J2])  # (P_out_weight,) — gradient of BC  loss
-cos_sim = float(jnp.dot(g_pde, g_bc) / (jnp.linalg.norm(g_pde) * jnp.linalg.norm(g_bc) + 1e-12))
-print("\nGradient alignment (PDE vs BC, output-layer params)")
-print(f"  dot(g_pde, g_bc) = {float(jnp.dot(g_pde, g_bc)):.4f}")
-print(f"  cos_sim          = {cos_sim:.4f}")
-if cos_sim > 0.5:
-    print("  → Strongly aligned: PDE and BC losses reinforce each other.")
-elif cos_sim > 0:
-    print("  → Weakly aligned: compatible but partially independent.")
-else:
-    print("  → Conflict: PDE and BC losses are pulling parameters in opposite directions!")
-
-assert cos_sim > -1.0, f"cos_sim out of range: {cos_sim:.4f}"
+[J_sparse] = crux.eval([J])  # (N, P_out_weight)
+mid = J_sparse.shape[0] // 2
+g_left, g_right = J_sparse[:mid].mean(0), J_sparse[mid:].mean(0)
+cos_sim = float(jnp.dot(g_left, g_right) / (jnp.linalg.norm(g_left) * jnp.linalg.norm(g_right) + 1e-12))
+print(f"\ncos_sim (left vs right halves) = {cos_sim:.4f}")
+assert -1.0 <= cos_sim <= 1.0, f"cos_sim out of range: {cos_sim:.4f}"
 
 # ── Post-training: full Jacobian + Neural Tangent Kernel ──────────────────────
 # Clear the output-layer mask so we get the full (N, P_total) Jacobian.
@@ -92,3 +86,48 @@ print(f"  λ_max        = {float(eigvals[0]):.4f}")
 print(f"  λ_min        = {float(eigvals[-1]):.4f}")
 print(f"  Eff. rank    = {eff_rank:.2f}  (trace² / ‖K‖²_F)")
 print(f"  Cond. number = {cond:.1f}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Scale analysis: units & non-dimensionalization  (jno.units)
+# ───────────────────────────────────────────────────────────────────────────────
+# Gradient conflict has a twin — *scale* conflict. When the additive terms of ONE
+# residual differ in magnitude by orders, the loss is ill-conditioned no matter how
+# well the collocation points align. jno.units makes that structure explicit: you
+# annotate the coordinates and the field with .unit(...)/.scale(...), and it (A)
+# audits dimensional consistency and (B) reports — and rewrites away — the
+# dimensionless group each term carries (the Fourier/Péclet-type numbers you would
+# otherwise derive by hand).
+
+# A thin, anisotropic domain (Lx=1, Ly=1/20). Geometry ALONE puts the two diffusion
+# terms of the Laplacian at very different scales — no material coefficient needed.
+Lx, Ly, U = 1.0, 0.05, 3.0
+adom = jno.Shape.rect(0.0, 0.0, Lx, Ly, size=0.1).domain()
+ax, ay, _ = adom.variable("interior", split=True)
+ax = ax.unit("m").scale(Lx)  # characteristic length along x
+ay = ay.unit("m").scale(Ly)  # 20× shorter characteristic length along y
+au = jno.nn(foundax.mlp(in_features=2, hidden_dims=8, num_layers=2, key=jax.random.PRNGKey(1)))(ax, ay)
+au = au.unit("K").scale(U)  # the field carries a temperature scale U
+aniso = au.d2(ax) + au.d2(ay)  # anisotropic Laplacian — two terms in ONE residual
+
+# Phase A — audit + report. check() confirms both terms share a unit (K·m⁻²);
+# nondimensionalize() gives each term's dimensionless magnitude πᵢ = Sᵢ / S_ref.
+audit = jno.units.check(aniso)
+assert not audit.warnings, f"dimensional inconsistency: {audit.warnings}"
+terms = jno.units.nondimensionalize(aniso).residuals[0].terms
+scale_sep = terms[1].pi / terms[0].pi
+print("\nScale analysis (anisotropic Laplacian)")
+print(f"  term units       = {[str(t.unit) for t in terms]}")
+print(f"  dimensionless πᵢ  = {[round(t.pi, 2) for t in terms]}")
+print(f"  scale separation = {scale_sep:.0f}×   (= (Lx/Ly)² = {(Lx / Ly) ** 2:.0f})")
+assert abs(scale_sep - (Lx / Ly) ** 2) < 1e-6
+
+# Phase B — the transform. rescale() rewrites the residual to its O(1) dimensionless
+# form: the hidden scale separation resurfaces as an explicit leading coefficient,
+# and the returned Rescaler maps coordinates to the unit domain and a solution back
+# to physical units (u_physical = U · û). This is the non-dimensionalization itself,
+# and `transformed` is an ordinary residual you can hand to jno.core on rescaler's
+# rescaled_domain(adom).
+transformed, rescaler = jno.units.rescale(aniso)
+print(f"  rescaler         = {rescaler}")
+assert rescaler.field_scale == U
+assert float(rescaler.to_physical(1.0)) == U  # û = 1 ↦ U in physical units
