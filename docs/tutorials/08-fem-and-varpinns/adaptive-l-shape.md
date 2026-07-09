@@ -40,8 +40,8 @@ new mesh automatically. Differentiability is exact on the *frozen* adapted mesh,
 
 ## The result
 
-![Filmstrip of the L-shape mesh refining round by round with the singular solution beside it; elements
-concentrate sharply at the re-entrant corner while the error estimate falls.](/jNO/assets/adaptive_l_shape.gif)
+![The final adapted L-shape mesh with elements concentrated at the re-entrant corner, the singular
+solution beside it, and the Zienkiewicz–Zhu error estimate falling as dofs are added.](/jNO/assets/adaptive_l_shape.png)
 
 The Zienkiewicz–Zhu indicator concentrates ~13× at the corner, and the adaptive run reaches a lower
 error estimate at ~455 DOFs than a uniform mesh at ~828 DOFs.
