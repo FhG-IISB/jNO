@@ -9,6 +9,15 @@ The strong-form counterpart of the [Poisson FEM primer](../08-fem-and-varpinns/p
 $-\Delta u = f$ on the unit square with $u = 0$ on the boundary, solved through `jno.fdm`. Instead of a
 weak form, the strong residual is collocated at the mesh nodes with finite-difference stencils.
 
+## Result
+
+![Left: the jno.fdm solution u on the unit square (a smooth sine bump). Middle: the signed error u minus the analytic sin(pi x)sin(pi y). Right: a log-log mesh-refinement study of the relative L2 error versus mean element size.](/jNO/assets/poisson_2d_fdm.png)
+
+The `jno.fdm` field matches the manufactured $u^\* = \sin(\pi x)\sin(\pi y)$ to
+rel-$L^2 \approx 1.7\times10^{-2}$ on this mesh, and re-solving at four mesh sizes shows the error
+falling at second order (fitted slope $\approx 2.07$, right) — the expected rate for the
+finite-difference Laplacian.
+
 ## The constraint list
 
 `u = domain.unknown()` is a valued nodal field — the strong-form counterpart of `fem_symbols()`.
@@ -38,5 +47,5 @@ sol = jno.fdm([
 ## Full script
 
 ```python
---8<-- "tutorial_examples/09_fdm/poisson_2d_fdm.py"
+--8<-- "tutorial_examples/09_fdm/poisson_2d_fdm.py:code"
 ```
