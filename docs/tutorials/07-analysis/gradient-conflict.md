@@ -205,7 +205,7 @@ u_physical = rescaler.to_physical(u_hat)       # map the O(1) field back to phys
 ```
 
 !!! note "What `jno.units` operates on"
-    `nondimensionalize` / `rescale` act on the **additive terms within one residual** ($\pi_i = S_i / S_\text{ref}$) — they extract the Fourier / Péclet numbers, not a ratio between two *separate* losses. Today only coordinates and the network output are annotatable; a bare material coefficient (e.g. a diffusivity $\alpha$) has no `.unit` hook yet, so the demonstrated scale separation is purely geometric.
+    `nondimensionalize` / `rescale` act on the **additive terms within one residual** ($\pi_i = S_i / S_\text{ref}$) — they extract the Fourier / Péclet numbers, not a ratio between two *separate* losses. Today only coordinates and the network output are annotatable through the public API; a bare material coefficient (e.g. a diffusivity $\alpha$) has no public `.unit` hook yet, so the demonstrated scale separation is purely geometric.
 
 ---
 
