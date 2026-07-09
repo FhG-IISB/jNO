@@ -93,6 +93,12 @@ The optimizer is an `optax.chain` that prepends `optax.clip_by_global_norm(1.0)`
 
 ---
 
+## Result
+
+![Three panels on the disc: computed stationary density p(x,y) in cividis peaking at ~0.32 at the origin, the analytic Gaussian e^-(x^2+y^2)/pi on the same scale, and their signed difference in red-blue centred at zero with amplitude ~6e-3.](/jNO/assets/fokker_planck_2d.png)
+
+The network's stationary density (left) matches the analytic Ornstein-Uhlenbeck Gaussian $p^\infty=e^{-(x^2+y^2)}/\pi$ (centre) to rel-$L^2\approx2.5\times10^{-2}$, recovering the correct peak height $1/\pi\approx0.318$. The signed error (right) is at the $10^{-3}$ level and concentrated near the sharp central peak.
+
 ## What to Notice
 
 - **Noise on observations, not the physics.** The Fokker-Planck residual is deterministic; only the boundary data carries noise.  This mirrors the real-world setting where the governing equation is known but measurements are uncertain.
@@ -105,7 +111,7 @@ The optimizer is an `optax.chain` that prepends `optax.clip_by_global_norm(1.0)`
 ## Full Script
 
 ```python
---8<-- "tutorial_examples/07_stochastic/fokker_planck_2d.py"
+--8<-- "tutorial_examples/07_stochastic/fokker_planck_2d.py:code"
 ```
 
 <div class="hero-actions" markdown>

@@ -85,6 +85,12 @@ crux = jno.core([residual.mse])
 crux.solve(EPOCHS)
 ```
 
+## Result
+
+![Left: the network's computed u(x) (solid) overlaid on the analytic sin(pi x) (dashed) on [0,1]; right: pointwise absolute error on a log scale, mostly between 1e-6 and 1e-4.](/jNO/assets/fredholm_integral_equation.png)
+
+The trained network reproduces the analytic solution $u^*(x)=\sin(\pi x)$ to rel-$L^2\approx1.0\times10^{-4}$; the pointwise error (right) stays below $\sim10^{-4}$ across the interval. No convergence panel is shown: the accuracy here is optimisation-limited (a PINN), not discretisation-limited, so a mesh-refinement sweep would not be meaningful.
+
 ## What to notice
 
 - **No boundary conditions are needed.** The integral equation is posed on the interior only; boundary values emerge naturally from the trained solution.
@@ -95,7 +101,7 @@ crux.solve(EPOCHS)
 ## Script
 
 ```python
---8<-- "tutorial_examples/06_integration/fredholm_integral_equation.py"
+--8<-- "tutorial_examples/06_integration/fredholm_integral_equation.py:code"
 ```
 
 <div class="hero-actions" markdown>

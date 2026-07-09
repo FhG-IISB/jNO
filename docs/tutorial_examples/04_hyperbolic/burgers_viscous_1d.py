@@ -1,3 +1,4 @@
+# --8<-- [start:code]
 """04 — 1-D viscous Burgers equation  (manufactured solution)"""
 
 import foundax
@@ -11,7 +12,7 @@ import jno
 T_end = 1.0
 
 # ── Domain (1-D space × time) ─────────────────────────────────────────────────
-domain = jno.domain.line(mesh_size=0.1, time=(0, T_end, 4))
+domain = jno.Path(0.0, 0.0).line_to(1.0, 0.0).curve(size=0.1).domain(time=(0, T_end, 4))
 # RAD adaptive resampling concentrates collocation points at the steep moving front.
 x, t = domain.variable(
     "interior",
@@ -60,3 +61,49 @@ crux.solve(5000)
 _u, _u_exact = crux.eval([u, u_exact])
 rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_exact) + 1e-8))
 assert rel_l2 < 1e-1, f"relative L2 error too large: {rel_l2:.3e}"
+# --8<-- [end:code]
+print(f"Relative L2 error: {rel_l2:.4e}   (manufactured u = e^-t sin(pi x))")
+
+# ── Figure: predicted vs manufactured solution at the 4 time levels ───────────
+# Each time level is one DeepONet input sample (n_sensors=1, branch input = t).
+# Evaluate the trained network on a finer x-grid via a domain override.
+import matplotlib  # noqa: E402
+
+matplotlib.use("Agg")
+from pathlib import Path  # noqa: E402
+
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+
+plt.rcParams.update(
+    {"savefig.dpi": 150, "savefig.bbox": "tight", "axes.titleweight": "bold", "axes.titlesize": 10, "figure.dpi": 120}
+)
+
+fine = jno.Path(0.0, 0.0).line_to(1.0, 0.0).curve(size=0.02).domain(time=(0, T_end, 4))
+_xg, _tg, _ug, _ueg = crux.eval([x, t, u, u_exact], domain=fine, min_consecutive=4)
+_xg = np.asarray(_xg).reshape(4, -1)  # (n_t, n_x)
+_ug = np.asarray(_ug).reshape(4, -1)
+_ueg = np.asarray(_ueg).reshape(4, -1)
+_tlvl = np.asarray(_tg).reshape(4)
+order = np.argsort(_xg[0])
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+colors = plt.cm.viridis(np.linspace(0.1, 0.85, 4))
+for k in range(4):
+    xs = _xg[k][order]
+    axes[0].plot(xs, _ug[k][order], color=colors[k], label=f"t={_tlvl[k]:.2f}")
+    axes[0].plot(xs, _ueg[k][order], "--", color=colors[k], lw=1)
+    axes[1].plot(xs, np.abs(_ug[k][order] - _ueg[k][order]), color=colors[k], label=f"t={_tlvl[k]:.2f}")
+axes[0].plot([], [], "k-", label="jNO")
+axes[0].plot([], [], "k--", label="exact")
+axes[0].set_xlabel("x")
+axes[0].set_ylabel("u(x, t)")
+axes[0].set_title("predicted vs manufactured solution")
+axes[0].legend(fontsize=8, ncol=2)
+axes[1].set_xlabel("x")
+axes[1].set_ylabel("|u − u_exact|")
+axes[1].set_title(f"pointwise error (rel-L2 = {rel_l2:.2e})")
+axes[1].set_yscale("log")
+axes[1].legend(fontsize=8)
+axes[1].grid(True, which="both", alpha=0.3)
+fig.savefig(Path(__file__).parents[2] / "assets" / "burgers_viscous_1d.png")

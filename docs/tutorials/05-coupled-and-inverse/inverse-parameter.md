@@ -52,6 +52,12 @@ _a, _b, _c = crux.eval([a, b, c])
 print(f"Recovered parameters: a={_a[0]:.3f}, b={_b[0]:.3f}, c={_c[0]:.3f}")
 ```
 
+## Result
+
+![Left: bar chart of recovered vs true coefficients a=3.14, b=-2.71, c=42.00; right: the fitted field a sin + b cos + c x(1-x) overlaid exactly on the target data across x in [0,1].](/jNO/assets/inverse_parameter.png)
+
+The optimiser recovers all three coefficients to essentially machine precision — $a=3.140$, $b=-2.710$, $c=42.000$ (rel-$L^2$ of $\sim10^{-6}$ each) — and the resulting field lies on top of the target data (right).
+
 ## What To Notice
 
 - jNO can optimize more than neural fields.
@@ -74,5 +80,5 @@ For field identification (recovering a spatially-varying `k(x,y)` rather than a 
 ## Script Snippet
 
 ```python
---8<-- "tutorial_examples/05_coupled_and_inverse/inverse_parameter.py"
+--8<-- "tutorial_examples/05_coupled_and_inverse/inverse_parameter.py:code"
 ```

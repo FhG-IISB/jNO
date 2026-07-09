@@ -1,3 +1,4 @@
+# --8<-- [start:code]
 """06 — Fredholm integral equation of the second kind"""
 
 from pathlib import Path
@@ -12,7 +13,7 @@ import jno
 π = jno.np.pi
 
 # ── Domain ─────────────────────────────────────────────────────────────────────
-domain = jno.domain.line(mesh_size=0.01)
+domain = jno.Path(0.0, 0.0).line_to(1.0, 0.0).curve(size=0.01).domain()
 x, _ = domain.variable("interior")
 
 domain.summary()
@@ -71,3 +72,40 @@ with open(results_file, "a") as f_out:
     f_out.write(f"06_integration/fredholm_integral_equation.py | epochs={EPOCHS} | rel_L2={rel_l2:.6e}\n")
 
 assert rel_l2 < 0.05, f"Relative L2 error too large: {rel_l2:.3e}"
+# --8<-- [end:code]
+
+# ── Figure: computed solution vs analytic u*(x) = sin(pi x) + pointwise error ─
+# (No convergence panel: this is a PINN, so the error is optimisation-limited,
+#  not discretisation-limited — a mesh-refinement line would be meaningless.)
+import matplotlib  # noqa: E402
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+
+plt.rcParams.update(
+    {"savefig.dpi": 150, "savefig.bbox": "tight", "axes.titleweight": "bold", "axes.titlesize": 10, "figure.dpi": 120}
+)
+
+_x = np.asarray(crux.eval([x])).ravel()
+_up = np.asarray(u_pred).ravel()
+_ur = np.asarray(u_ref).ravel()
+order = np.argsort(_x)
+
+fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+axes[0].plot(_x[order], _up[order], color="#4c72b0", label="jNO")
+axes[0].plot(_x[order], _ur[order], "--", color="k", label=r"exact  $\sin(\pi x)$")
+axes[0].set_xlabel("x")
+axes[0].set_ylabel("u(x)")
+axes[0].set_title("computed vs analytic solution")
+axes[0].legend(fontsize=9)
+axes[0].grid(True, alpha=0.3)
+
+axes[1].plot(_x[order], np.abs(_up[order] - _ur[order]), color="#c44e52")
+axes[1].set_xlabel("x")
+axes[1].set_ylabel("|u − u*|")
+axes[1].set_title(f"pointwise error (rel-L2 = {rel_l2:.2e})")
+axes[1].set_yscale("log")
+axes[1].grid(True, which="both", alpha=0.3)
+
+fig.savefig(Path(__file__).parents[2] / "assets" / "fredholm_integral_equation.png")

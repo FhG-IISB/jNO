@@ -1,3 +1,4 @@
+# --8<-- [start:code]
 """07 — 2-D Fokker–Planck on a disc  (Shape + RAD resampling + residual tracker)"""
 
 from pathlib import Path
@@ -66,3 +67,40 @@ with open(results_file, "a") as f:
 # --8<-- [start:assert]
 assert rel_l2 < 3e-1, f"relative L2 error too large: {rel_l2:.3e}"
 # --8<-- [end:assert]
+# --8<-- [end:code]
+
+# ── Figure: computed density vs analytic Gaussian + error, on the disc ────────
+import matplotlib  # noqa: E402
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+
+plt.rcParams.update(
+    {"savefig.dpi": 150, "savefig.bbox": "tight", "axes.titleweight": "bold", "axes.titlesize": 10, "figure.dpi": 120}
+)
+
+_xn, _yn, _pn, _pe = crux.eval([x, y, p, p_exact])
+_xn = np.asarray(_xn).ravel()
+_yn = np.asarray(_yn).ravel()
+_pn = np.asarray(_pn).ravel()
+_pe = np.asarray(_pe).ravel()
+_err = _pn - _pe
+
+fig, axes = plt.subplots(1, 3, figsize=(13, 4))
+vmax = max(float(_pn.max()), float(_pe.max()))
+im0 = axes[0].tripcolor(_xn, _yn, np.clip(_pn, 0.0, None), cmap="cividis", vmin=0.0, vmax=vmax, shading="gouraud")
+axes[0].set_title("computed density  p(x, y)")
+fig.colorbar(im0, ax=axes[0], shrink=0.8)
+im1 = axes[1].tripcolor(_xn, _yn, _pe, cmap="cividis", vmin=0.0, vmax=vmax, shading="gouraud")
+axes[1].set_title(r"analytic  $e^{-(x^2+y^2)}/\pi$")
+fig.colorbar(im1, ax=axes[1], shrink=0.8)
+elim = float(np.abs(_err).max())
+im2 = axes[2].tripcolor(_xn, _yn, _err, cmap="RdBu_r", vmin=-elim, vmax=elim, shading="gouraud")
+axes[2].set_title(f"error  (rel-L2 = {rel_l2:.2e})")
+fig.colorbar(im2, ax=axes[2], shrink=0.8)
+for ax in axes:
+    ax.set_aspect("equal")
+    ax.set_axis_off()
+
+fig.savefig(Path(__file__).parents[2] / "assets" / "fokker_planck_2d.png")
