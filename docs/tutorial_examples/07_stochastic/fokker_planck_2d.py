@@ -23,7 +23,15 @@ p_exact_bc = jno.np.exp(-(xb**2 + yb**2)) / π
 
 # --8<-- [start:residual]
 net = jno.nn(foundax.mlp(in_features=2, hidden_dims=64, num_layers=5, key=jax.random.PRNGKey(0)))
-net.optimizer(optax.adam(optax.exponential_decay(1e-3, 2000, 0.5, end_value=1e-5)))
+# optax.chain: global-norm clipping in front of Adam — the stiff advection–diffusion
+# residual produces occasional huge gradient spikes; clipping caps their global norm so
+# a single bad batch can't blow up the Adam step and destabilise training.
+net.optimizer(
+    optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(optax.exponential_decay(1e-3, 2000, 0.5, end_value=1e-5)),
+    )
+)
 
 p = net(x, y).scalar.bind(x=x, y=y)
 prob_flux = jno.np.vector(x * p, y * p)  # OU drift flux as a VectorView

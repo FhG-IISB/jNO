@@ -31,7 +31,7 @@ source = exp(-t) * S * coeff + exp(-3 * t) * S**3
 
 ## Step 2: Set Up the Space-Time Network
 
-The model learns a field over space and time while respecting the chosen boundary handling.
+The model learns a field over space and time while respecting the chosen boundary handling. The optimizer is scaled by `jno.fn.adaptive.dlrs`, a loss-adaptive dynamic learning-rate scheduler that shrinks the step when the stiff Allen-Cahn interface stalls the loss and grows it when the loss can still descend.
 
 ```python
 net = jno.nn(
@@ -41,7 +41,7 @@ net = jno.nn(
         key=jax.random.PRNGKey(42),
     )
 )
-net.optimizer(optax.adam(optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=1e-3, warmup_steps=1, decay_steps=500, end_value=1e-5)))
+net.optimizer(optax.adam(1)).scale(jno.fn.adaptive.dlrs(lr0=1e-3, window=10))
 
 xy = jno.np.concat([x, y])
 u  = net(t, xy) * x * (1 - x) * y * (1 - y)

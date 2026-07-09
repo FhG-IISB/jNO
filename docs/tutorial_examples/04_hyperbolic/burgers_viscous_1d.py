@@ -12,7 +12,11 @@ T_end = 1.0
 
 # ── Domain (1-D space × time) ─────────────────────────────────────────────────
 domain = jno.domain.line(mesh_size=0.1, time=(0, T_end, 4))
-x, t = domain.variable("interior")
+# RAD adaptive resampling concentrates collocation points at the steep moving front.
+x, t = domain.variable(
+    "interior",
+    resampling_strategy=jno.sampler.rad(resample_every=200, resample_fraction=0.2, start_epoch=500, k=10),
+)
 x0, t0 = domain.variable("initial")
 
 # ── Manufactured solution + source term ──────────────────────────────────────

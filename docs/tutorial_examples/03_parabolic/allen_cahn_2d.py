@@ -30,11 +30,10 @@ net = jno.nn(
         key=jax.random.PRNGKey(42),
     )
 )
-net.optimizer(
-    optax.adam(
-        optax.warmup_cosine_decay_schedule(init_value=0.0, peak_value=1e-3, warmup_steps=1, decay_steps=500, end_value=1e-5)
-    )
-)
+# Loss-adaptive LR: the DLRS schedule raises/lowers the step size from the recent loss
+# slope, so training slows when the stiff ε-thin Allen–Cahn interface makes the loss
+# stagnate and speeds up when it can descend — no hand-tuned decay curve required.
+net.optimizer(optax.adam(1)).scale(jno.fn.adaptive.dlrs(lr0=1e-3, window=10))
 
 xy = jno.np.concat([x, y])
 # Bind names so partials read like the math:  u.t, u.xx, u.yy, u.xy, ...

@@ -77,6 +77,7 @@ rel_l2 = float(jax.numpy.linalg.norm(_u - _u_exact) / (jax.numpy.linalg.norm(_u_
 
 ## What To Notice
 
+- **Adaptive resampling**: the `interior` variable is sampled with `jno.sampler.rad(...)`, so after the warm-up phase RAD progressively relocates interior collocation points toward the steep, high-residual moving front.
 - The nonlinear term `u u_x` creates residuals that are largest near `x = 0.5` (the maximum of `sin(πx)`). After the warm-up phase, RAD progressively moves interior points toward that region.
 - The **pool-to-sample ratio** (8×) is what gives RAD room to relocate points. A ratio below 2× leaves too few candidates to draw from.
 - The initial-condition boundary (`t = 0`, sampled via `"bottom"`) is kept fixed — only interior points are resampled.
