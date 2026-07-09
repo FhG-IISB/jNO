@@ -28,6 +28,8 @@ def _sample_point(bdim: int, tag: int):
     import gmsh
     import numpy as np
 
+    if bdim == 0:  # a geometric point (the boundary of a 1-D domain): its coordinate is the sample
+        return np.asarray(gmsh.model.getValue(0, tag, []), dtype=float)
     lo, hi = gmsh.model.getParametrizationBounds(bdim, tag)
     if bdim == 1:
         t = lo[0] + 0.5 * (hi[0] - lo[0])

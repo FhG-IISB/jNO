@@ -1738,7 +1738,11 @@ class domain(MeshIOMixin):
         pts = np.asarray(getattr(mesh, "points", None))
         if pts is None or pts.size == 0 or not mesh.cells:
             return mesh
-        keep_blocks = [i for i, cb in enumerate(mesh.cells) if cb.type not in ("vertex", "point")]
+        # In a 1-D domain the boundary *is* its endpoint vertices, so the 0-D block is a real
+        # boundary region (named left/right), not a construction-point orphan -- keep it. Only in
+        # >=2-D are stray vertex/point cells the singular geometry-construction points to drop.
+        drop_types = () if getattr(self, "dimension", None) == 1 else ("vertex", "point")
+        keep_blocks = [i for i, cb in enumerate(mesh.cells) if cb.type not in drop_types]
         fem_cells = [mesh.cells[i] for i in keep_blocks]
         if not fem_cells:
             return mesh

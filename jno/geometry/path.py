@@ -60,6 +60,23 @@ class Path:
         )
         return _shape.Shape(("leaf", Contour(start2, segs2), next(_shape._LEAF_KEYS)), 2, size)
 
+    def curve(self, size=None):
+        """Return this *open* path as a 1-D :class:`~jno.geometry.shape.Shape` (a curve domain).
+
+        The 1-D sibling of :meth:`face`: ``face`` closes the contour into a 2-D region, ``curve``
+        keeps it open as a 1-D manifold. The two overall endpoints are named ``left`` (start) and
+        ``right`` (final end) -- so ``jno.Path(0, 0).line_to(1, 0).curve(size=0.01).domain()`` is a
+        unit interval whose ends you reach via ``d.variable("left"/"right"/"boundary")``. Segments
+        keep their 3-D points, so ``arc_to`` gives a curved 1-D manifold and multiple segments a
+        polyline (intermediate junctions are interior).
+        """
+        from . import shape as _shape
+        from .primitives import Curve
+
+        if not self._segs:
+            raise ValueError("curve() needs at least one segment -- call .line_to(...) / .arc_to(...) first")
+        return _shape.Shape(("leaf", Curve(self._start, self._segs), next(_shape._LEAF_KEYS)), 1, size)
+
     # ----- trajectory use (for profile.sweep) -----------------------------------
     def _wire(self, occ):
         """Build the open OCC wire of this path's segments (for sweeping)."""

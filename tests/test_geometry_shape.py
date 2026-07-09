@@ -404,3 +404,46 @@ def test_domain_one_liner():
     dt = Shape.rect(0, 0, 1, 1, size=0.3).domain(time=(0.0, 1.0, 5))
     assert dt.variable("initial", split=True) is not None
     assert type(8 * Shape.rect(0, 0, 1, 1, size=0.3).domain()).__name__ == "domain"
+
+
+# --------------------------------------------------------------------------- 1-D curve
+def test_curve_classify_pure_no_gmsh():
+    """Curve.classify names the two overall ends; polyline junctions stay interior (no gmsh)."""
+    from jno.geometry.primitives import Curve
+
+    c = Curve((0.0, 0.0, 0.0), (("line", (1.0, 0.0, 0.0), None),))
+    assert c.dim == 1
+    assert c.classify(0.0, 0.0, 0.0) == "left"
+    assert c.classify(1.0, 0.0, 0.0) == "right"
+    assert c.classify(0.5, 0.0, 0.0) is None
+    poly = Curve((0.0, 0.0, 0.0), (("line", (1.0, 0.0, 0.0), None), ("line", (2.0, 0.0, 0.0), None)))
+    assert poly.classify(1.0, 0.0, 0.0) is None  # the junction is interior
+    assert poly.classify(0.0, 0.0, 0.0) == "left" and poly.classify(2.0, 0.0, 0.0) == "right"
+
+
+def test_curve_needs_a_segment():
+    with pytest.raises(ValueError):
+        Path(0.0, 0.0).curve()
+
+
+def test_path_curve_1d_mesh_blocks_and_sets():
+    """An open line path meshes to a 1-D domain: line volume block + vertex boundary block."""
+    sh = Path(0.0, 0.0).line_to(1.0, 0.0).curve(size=0.25)
+    assert sh.dim == 1
+    mesh, dim, _ds = sh.build()
+    assert dim == 1
+    assert [cb.type for cb in mesh.cells] == ["line", "vertex"]
+    assert {"interior", "left", "right", "boundary"} <= set(mesh.cell_sets)
+    # boundary = exactly the two endpoint vertices
+    assert int(sum(np.asarray(a).size for a in mesh.cell_sets["boundary"])) == 2
+
+
+def test_curve_domain_named_endpoints():
+    """.domain() exposes interior + named endpoints at the right coordinates (the 1-D BC fix:
+    the endpoint vertex block must survive orphan-node dropping)."""
+    d = Path(2.0, 0.0).line_to(5.0, 0.0).curve(size=0.25).domain()  # offset interval, not [0,1]
+    assert d.dimension == 1
+    assert {"interior", "left", "right", "boundary"} <= set(d._mesh_pool)
+    assert np.allclose(np.asarray(d._mesh_pool["left"]).reshape(-1), [2.0])
+    assert np.allclose(np.asarray(d._mesh_pool["right"]).reshape(-1), [5.0])
+    assert np.allclose(np.sort(np.asarray(d._mesh_pool["boundary"]).reshape(-1)), [2.0, 5.0])

@@ -242,6 +242,50 @@ def _on_arc(a, through, b, x, y, tol):
 
 
 @dataclass(frozen=True)
+class Curve:
+    """An open 1-D contour of line/arc segments -- a 1-D domain (an interval or polyline).
+
+    The 1-D sibling of :class:`Contour`: where ``Contour`` closes into a 2-D region, ``Curve``
+    stays open as a 1-D manifold. ``segments`` walks from ``start`` (3-D points); the two overall
+    ends are the boundary (auto-named ``left`` = start, ``right`` = final end), while any
+    intermediate junctions are *interior* to the 1-D manifold. A single ``("line", ...)`` gives a
+    plain interval; ``arc`` segments give a curved 1-D manifold.
+    """
+
+    start: Tuple[float, float, float]
+    segments: Tuple[tuple, ...]
+    dim: ClassVar[int] = 1
+
+    def _end(self):
+        return self.segments[-1][1]
+
+    def build(self, occ):
+        p0 = occ.addPoint(*self.start)
+        prev = p0
+        curves = []
+        for seg in self.segments:
+            end = seg[1]
+            pe = occ.addPoint(*end)
+            if seg[0] == "line":
+                curves.append((1, occ.addLine(prev, pe)))
+            else:  # ("arc", end, through, name) -- 3-point circular arc
+                pt = occ.addPoint(*seg[2])
+                curves.append((1, occ.addCircleArc(prev, pt, pe, center=False)))
+            prev = pe
+        # 1-D uses no booleans, so returning the first curve suffices: the remaining curves are
+        # already in the model (chained through shared points) and get meshed by generate(1).
+        return curves[0]
+
+    def classify(self, x: float, y: float, z: float = 0.0, tol: float = TOL) -> Optional[str]:
+        s, e = self.start, self._end()
+        if math.dist((x, y, z), s) < tol:
+            return "left"
+        if math.dist((x, y, z), e) < tol:
+            return "right"
+        return None  # an intermediate junction of a polyline is interior, not boundary
+
+
+@dataclass(frozen=True)
 class Contour:
     """A closed 2-D contour of line and arc segments (generalises :class:`Polygon`).
 

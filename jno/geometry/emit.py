@@ -25,6 +25,7 @@ _MODEL_SEQ = itertools.count()
 _TRI = 2
 _TET = 4
 _LINE = 1
+_POINT = 15  # 1-node point element (the boundary block of a 1-D domain)
 
 
 def _emit_node(node, occ, split_full=False):
@@ -137,7 +138,7 @@ def _apply_size_fields(dim: int, leaves, labels: Dict[int, Tuple[int, str]], sha
     thresholds: List[int] = []
     if sized:
         background = max(s for _k, s in sized)
-        key_prop = "CurvesList" if dim == 2 else "SurfacesList"
+        key_prop = {1: "PointsList", 2: "CurvesList", 3: "SurfacesList"}[dim]
         for key, s in sized:
             ents = [float(tag) for tag, (k, _n) in labels.items() if k == key]
             if not ents:
@@ -188,8 +189,12 @@ def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]]):
     coords = np.asarray(coords, dtype=float).reshape(-1, 3)
     index = {int(t): i for i, t in enumerate(node_tags)}
 
-    vtype, npv, vblock = (_TET, 4, "tetra") if dim == 3 else (_TRI, 3, "triangle")
-    btype, npb, bblock = (_TRI, 3, "triangle") if dim == 3 else (_LINE, 2, "line")
+    if dim == 1:
+        vtype, npv, vblock = _LINE, 2, "line"
+        btype, npb, bblock = _POINT, 1, "vertex"  # boundary of a 1-D domain = its two endpoints
+    else:
+        vtype, npv, vblock = (_TET, 4, "tetra") if dim == 3 else (_TRI, 3, "triangle")
+        btype, npb, bblock = (_TRI, 3, "triangle") if dim == 3 else (_LINE, 2, "line")
 
     _vtags, vnodes = gmsh.model.mesh.getElementsByType(vtype)
     vcells = np.asarray([index[int(t)] for t in vnodes], dtype=np.int64).reshape(-1, npv)
@@ -199,6 +204,10 @@ def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]]):
     by_name: Dict[str, List[np.ndarray]] = {}
     for _edim, etag in gmsh.model.getEntities(bdim):
         label = labels.get(etag)
+        # A 1-D polyline's intermediate junctions are interior points (unnamed) -- they must not
+        # land in the boundary block. Higher-dim unnamed facets stay boundary (just unnamed).
+        if dim == 1 and label is None:
+            continue
         etypes, _etags, enodes = gmsh.model.mesh.getElements(bdim, etag)
         for et, en in zip(etypes, enodes):
             if et != btype:
