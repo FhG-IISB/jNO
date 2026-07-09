@@ -209,6 +209,14 @@ u_physical = rescaler.to_physical(u_hat)       # map the O(1) field back to phys
 
 ---
 
+## Result
+
+![Left: the trained network's solution lies on the exact sin(πx)/π² curve (rel L² ≈ 3×10⁻⁴). Right: the Neural Tangent Kernel eigenvalue spectrum decays over ~14 orders of magnitude, an effective rank near 1 — the ill-conditioning that makes some spatial modes converge far slower than others.](/jNO/assets/gradient_conflict.png)
+
+The trained network matches the analytic $\sin(\pi x)/\pi^2$ to rel-$L^2\approx3\times10^{-4}$ (left). The **NTK eigenvalue spectrum** (right) is the model's own $K=JJ^\top$ after training: it collapses over ~14 orders of magnitude to an effective rank near 1, so a handful of modes dominate learning while the rest are almost frozen — the quantitative face of the gradient conflict.
+
+---
+
 ## What To Notice
 
 - The cosine similarity **during training** lets you catch gradient conflict early — long before the loss plateaus.
@@ -225,5 +233,5 @@ u_physical = rescaler.to_physical(u_hat)       # map the O(1) field back to phys
 ## Script Snippet
 
 ```python
---8<-- "tutorial_examples/07_analysis/gradient_conflict.py"
+--8<-- "tutorial_examples/07_analysis/gradient_conflict.py:code"
 ```

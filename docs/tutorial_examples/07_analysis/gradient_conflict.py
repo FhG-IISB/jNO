@@ -1,3 +1,4 @@
+# --8<-- [start:code]
 """07 — Gradient and sensitivity analysis with u.grad(net)"""
 
 import equinox as eqx
@@ -11,7 +12,7 @@ import jno
 π = jno.np.pi
 
 # ── Domain (hard-BC ansatz ⇒ no boundary sampling needed) ──────────────────────
-domain = jno.domain.line(mesh_size=0.001)
+domain = jno.Path(0.0, 0.0).line_to(1.0, 0.0).curve(size=0.001).domain()  # the unit interval
 x, _ = domain.variable("interior")
 
 # ── Exact solution (for validation only, not used in training) ─────────────────
@@ -131,3 +132,35 @@ transformed, rescaler = jno.units.rescale(aniso)
 print(f"  rescaler         = {rescaler}")
 assert rescaler.field_scale == U
 assert float(rescaler.to_physical(1.0)) == U  # û = 1 ↦ U in physical units
+# --8<-- [end:code]
+
+# --- figure: the trained solution vs exact, and the NTK eigenvalue spectrum ---
+import matplotlib.pyplot as plt  # noqa: E402
+import numpy as np  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+plt.rcParams.update(
+    {"savefig.dpi": 150, "savefig.bbox": "tight", "axes.titleweight": "bold", "axes.titlesize": 10, "figure.dpi": 120}
+)
+# The network's OWN output on the interior, and the analytic solution, sorted for a clean line.
+_xg, _u, _ue = (np.asarray(a).reshape(-1) for a in crux.eval([x, u, u_exact]))
+order = np.argsort(_xg)
+_ntk = np.asarray(eigvals)  # the NTK spectrum computed above (descending, clipped >= 0)
+
+fig, ax = plt.subplots(1, 2, figsize=(10.5, 4.0))
+ax[0].plot(_xg[order], _u[order], color="#0072B2", lw=2.2, label="jNO (trained)")
+ax[0].plot(_xg[order], _ue[order], "--", color="0.25", lw=1.4, label=r"exact  $\sin(\pi x)/\pi^2$")
+ax[0].set_title(f"solution   ·   rel $L^2$ = {rel_l2:.1e}")
+ax[0].set_xlabel("x")
+ax[0].set_ylabel("u")
+ax[0].legend(frameon=False)
+ax[0].grid(True, alpha=0.25, ls="--")
+pos = _ntk[_ntk > 0]
+ax[1].semilogy(np.arange(1, pos.size + 1), pos, "o-", ms=3, color="#D55E00")
+ax[1].set_title(f"NTK spectrum   ·   eff. rank {eff_rank:.2f},  κ ≈ {cond:.0e}")
+ax[1].set_xlabel("index")
+ax[1].set_ylabel(r"eigenvalue $\lambda_i(K)$")
+ax[1].grid(True, which="both", alpha=0.25, ls="--")
+fig.suptitle(f"Gradient/NTK analysis — left/right cos-sim = {cos_sim:.2f}", fontweight="bold")
+fig.tight_layout()
+fig.savefig(Path(__file__).parents[2] / "assets" / "gradient_conflict.png")
