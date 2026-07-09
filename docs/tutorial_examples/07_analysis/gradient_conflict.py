@@ -135,9 +135,10 @@ assert float(rescaler.to_physical(1.0)) == U  # û = 1 ↦ U in physical units
 # --8<-- [end:code]
 
 # --- figure: the trained solution vs exact, and the NTK eigenvalue spectrum ---
+from pathlib import Path  # noqa: E402
+
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
-from pathlib import Path  # noqa: E402
 
 plt.rcParams.update(
     {"savefig.dpi": 150, "savefig.bbox": "tight", "axes.titleweight": "bold", "axes.titlesize": 10, "figure.dpi": 120}
