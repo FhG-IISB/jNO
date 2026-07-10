@@ -274,6 +274,11 @@ def _domain_from_arrays(template: Any, points: np.ndarray, elems: np.ndarray, bf
     for attr in list(vars(target)):
         if attr.startswith("_fem_native") or attr in ("_fem_assembly_cache", "_integral_weight_cache"):
             delattr(target, attr)
+    # Drop the OLD mesh's predicate-tag state (boundary regions / indices / normals / pools /
+    # context) so a re-tag re-derives it cleanly on the new mesh; stale surface-tag state otherwise
+    # corrupts re-assembled Neumann/Robin/absorbing terms (predicates in `_tag_predicates` are kept).
+    if hasattr(target, "_reset_custom_tag_state"):
+        target._reset_custom_tag_state()
     target._apply_mesh(new_mesh)
     return target
 
