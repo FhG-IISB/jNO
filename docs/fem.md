@@ -139,7 +139,12 @@ problems whose natural space is *not* H¹. Pick one with the `space=` knob on `f
 > memory ceiling** and scales to much finer meshes. **Modelling subtlety:** because it is non-conforming,
 > the biharmonic form must be the **full-Hessian inner product** `inner(hessian(u), hessian(v))` (`∫D²u:D²v`),
 > *not* `∫Δu·Δv` — the Laplacian form is singular for Morley (`xy` has `Δu = 0` but `D²u ≠ 0`, a spurious
-> kernel). Its two plate traces `u(region) - g` and `u.dn(region) - h` work on **any** boundary orientation
+> kernel). Its two plate traces `u(region) - g` and `u.dn(region) - h` work on **any** boundary orientation.
+> **Periodic ties** compose too — `u(top) - u(bottom)` ties the vertex-value *and* the edge-normal-derivative
+> DOFs across a matched (conforming) boundary pair, so a y-periodic biharmonic solve recovers a manufactured
+> `sin(πx)sin(2πy)` at the optimal L² rate (`tests/test_fem_morley.py::test_morley_periodic_biharmonic_convergence`);
+> the reduction requires **conforming** periodic boundaries (matching vertices/edges) and is Morley-only for now —
+> the other C¹ families (Argyris, Hermite) raise a clear `NotImplementedError`
 > (Morley, *Aeronautical Quarterly* **19**, 1968; `tests/test_fem_morley.py`).
 
 > **Plate boundary conditions.** For a 4th-order (plate/biharmonic) field the boundary trace has two

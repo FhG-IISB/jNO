@@ -1655,6 +1655,62 @@ def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, cells: 
     return build_periodic_prolongation(points, pairs, faces, vec=vec, facets=facets)
 
 
+def _build_periodic_reduction_nonnodal(domain: Any, ties: List[Any], offsets: Any) -> dict:
+    """Periodic reduction for **non-nodal C¹** fields (Morley) — a DOF-level prolongation the node-based
+    builder can't produce. Uses the C¹ topology the non-nodal assembler stashed on the domain: value
+    DOFs tie by vertex, edge normal-derivative DOFs tie by boundary edge with the geometric sign.
+    Every field is the same Morley element (mixing is rejected at assembly), so one per-field ``P`` is
+    built and block-concatenated. Raises loudly for families not yet supported."""
+    from .utils.solver.fem_utils import build_periodic_prolongation_nonnodal
+
+    topo = getattr(domain, "_fem_nonnodal_topology", None)
+    if topo is None:
+        raise NotImplementedError(
+            "jno.fem: periodic ties on this non-nodal element are not supported — the assembler stashed "
+            "no C¹ edge topology (only Morley/Argyris carry the edge-normal DOFs the periodic tie needs)."
+        )
+    if topo["family"] != "Morley":
+        raise NotImplementedError(
+            f"jno.fem: periodic ties are implemented for the **Morley** C¹ element; periodic "
+            f"{topo['family']!r} (with extra per-vertex derivative DOFs whose periodic signs are not yet "
+            "wired) is not supported. Use space='Morley', or open an issue."
+        )
+    n_verts, n_edges = int(topo["n_verts"]), int(topo["n_edges"])
+    vpts = np.asarray(topo["vertex_points"])
+    ev = np.asarray(topo["edge_vertices"])
+
+    pairs = [(master, slave) for (master, slave, _comp, _fk) in ties]
+    vtags: dict = {}
+    etags: dict = {}
+    for tag in {t for (m, s, _c, _fk) in ties for t in (m, s)}:
+        f = _face_nodes(domain, vpts, None, tag)
+        if f is None or np.asarray(f).size == 0:
+            raise ValueError(f"jno.fem periodic (non-nodal C¹): boundary tag {tag!r} has no mesh vertices.")
+        vids = np.asarray(f, dtype=int).reshape(-1)
+        vtags[tag] = vids
+        vset = set(int(v) for v in vids)
+        # a global edge is on the boundary tag iff BOTH its canonical vertices are on that tag
+        etags[tag] = np.asarray([e for e in range(n_edges) if int(ev[e, 0]) in vset and int(ev[e, 1]) in vset], dtype=int)
+
+    red = build_periodic_prolongation_nonnodal(
+        n_verts,
+        n_edges,
+        vpts,
+        np.asarray(topo["edge_midpoints"]),
+        np.asarray(topo["edge_normals"]),
+        vtags,
+        etags,
+        pairs,
+    )
+    n_fields = len(offsets) - 1
+    blocks, off_full, off_red = [], [0], [0]
+    for _ in range(n_fields):
+        blocks.append({"P": red["P"], "kept": red["kept_nodes"], "vec": 1, "is_selection": red["is_selection"]})
+        off_full.append(off_full[-1] + red["n_full"])
+        off_red.append(off_red[-1] + red["n_red"])
+    return {"blocks": blocks, "off_full": off_full, "off_red": off_red, "n_full": off_full[-1], "n_red": off_red[-1]}
+
+
 def _build_periodic_reduction_multifield(
     domain: Any, ties: List[Any], points: Any, cells: Any, ele_order: int, offsets: Any
 ) -> dict:
@@ -2240,7 +2296,10 @@ def fem(
             # (``None`` for the native 1D route, which falls back to flat-chain facets on points).
             cells = getattr(domain, "_fem_native_assembly_cells", None)
             ele_order = int(getattr(domain, "_fem_native_assembly_order", 1))
-        if multifield:
+        if getattr(domain, "_fem_nonnodal_topology", None) is not None:
+            # non-nodal C¹ (Morley): DOF-level reduction (value + signed edge-derivative ties)
+            periodic = _build_periodic_reduction_nonnodal(domain, periodic_ties, fem_obj.offsets)
+        elif multifield:
             periodic = _build_periodic_reduction_multifield(
                 domain, periodic_ties, fem_obj.points, cells, ele_order, fem_obj.offsets
             )

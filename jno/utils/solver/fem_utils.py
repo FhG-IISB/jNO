@@ -2219,6 +2219,122 @@ def build_periodic_prolongation(
     }
 
 
+def build_periodic_prolongation_nonnodal(
+    n_verts: int,
+    n_edges: int,
+    vertex_points: np.ndarray,
+    edge_midpoints: np.ndarray,
+    edge_normals: np.ndarray,
+    vtags: Dict[str, np.ndarray],
+    etags: Dict[str, np.ndarray],
+    pairs: Sequence[Tuple[str, str]],
+    *,
+    tol: float | None = None,
+) -> Dict[str, object]:
+    """DOF-level periodic prolongation for a **Morley** (C¹ non-nodal) field.
+
+    Morley DOFs: one *value* DOF per vertex at ids ``[0, n_verts)``; one *normal-derivative* DOF per
+    global edge at ids ``[n_verts, n_verts + n_edges)``. The node-based ``build_periodic_prolongation``
+    can't represent this (it assumes DOFs = points × components). Here the two DOF blocks are tied
+    separately and block-diagonally combined:
+
+    * **value DOFs** — tie by vertex coordinate, weight ``+1`` (delegated to the nodal builder on the
+      vertex points, so corners / transitive chains are handled identically to Lagrange);
+    * **edge normal-derivative DOFs** — tie boundary-edge → boundary-edge by *midpoint*, weight
+      ``sign(n_slave · n_master)`` where each edge's normal is its globally-oriented reference normal
+      (``fem_nonnodal``: ``n = R90·(P[hi] − P[lo])``). For axis-aligned periodic boundaries this dot is
+      ``±1`` — the tie **sign is derived from geometry, not assumed** (and gated by an MMS test).
+
+    Non-conforming periodic boundaries (a slave edge with no transverse-matching master edge) raise a
+    clear error rather than silently mis-coupling (mortar interpolation of derivative DOFs is out of
+    scope). Returns the same dict shape as :func:`build_periodic_prolongation`.
+    """
+    import jax.experimental.sparse as jsparse
+
+    # --- value-DOF block: reuse the nodal builder on the vertex points (weight +1) ---
+    vred = build_periodic_prolongation(np.asarray(vertex_points, dtype=np.float64), pairs, vtags, vec=1, tol=tol)
+    Pv = vred["P"]
+    n_vred = int(vred["n_red"])
+    vkept = np.asarray(vred["kept_nodes"], dtype=np.int64)
+
+    # --- edge-derivative block: signed boundary-edge ties by midpoint ---
+    emid = np.asarray(edge_midpoints, dtype=np.float64).reshape(n_edges, -1)
+    enrm = np.asarray(edge_normals, dtype=np.float64).reshape(n_edges, -1)
+    span = float(np.linalg.norm(emid.max(0) - emid.min(0))) if n_edges else 1.0
+    etol = tol if tol is not None else max(span, 1.0) * 1.0e-6
+    e_slave_master: Dict[int, Tuple[int, float]] = {}
+    for mtag, stag in pairs:
+        me = np.asarray(etags.get(mtag, []), dtype=int).reshape(-1)
+        se = np.asarray(etags.get(stag, []), dtype=int).reshape(-1)
+        if me.size == 0 or se.size == 0:
+            continue
+        mp, sp = emid[me], emid[se]
+        axis = int(np.argmax(np.abs(mp.mean(0) - sp.mean(0))))
+        trans = [d for d in range(mp.shape[1]) if d != axis]
+        d2 = np.sum((sp[:, None, :][:, :, trans] - mp[None, :, :][:, :, trans]) ** 2, axis=-1)
+        nn = d2.argmin(1)
+        dist = np.sqrt(d2[np.arange(len(se)), nn])
+        for kk, sid in enumerate(se):
+            if dist[kk] > etol:
+                raise ValueError(
+                    f"jno.fem periodic (non-nodal C¹): slave edge {int(sid)} on {stag!r} has no "
+                    f"transverse-matching master edge on {mtag!r} (nearest {dist[kk]:.3e} > tol {etol:.3e}). "
+                    "Periodic C¹ needs a conforming (matching) periodic boundary; non-matching edge "
+                    "coupling (mortar interpolation of derivative DOFs) is not supported."
+                )
+            mid = int(me[nn[kk]])
+            dot = float(np.dot(enrm[int(sid)], enrm[mid]))
+            e_slave_master[int(sid)] = (mid, 1.0 if dot >= 0.0 else -1.0)
+
+    def _resolve_edge(e: int) -> Tuple[int, float]:
+        seen: set = set()
+        sign = 1.0
+        while e in e_slave_master:
+            if e in seen:
+                raise ValueError(f"jno.fem periodic (non-nodal C¹): cyclic edge tie at edge {e}.")
+            seen.add(e)
+            e, s = e_slave_master[e]
+            sign *= s
+        return e, sign
+
+    ekept = [e for e in range(n_edges) if e not in e_slave_master]
+    e_red_idx = {e: r for r, e in enumerate(ekept)}
+    n_ered = len(ekept)
+
+    # --- combined DOF-level BCOO  [[Pv, 0], [0, Pe]]  (edge rows/cols offset past the value block) ---
+    Pv_idx = np.asarray(Pv.indices)
+    Pv_dat = np.asarray(Pv.data)
+    rows = list(Pv_idx[:, 0])
+    cols = list(Pv_idx[:, 1])
+    data = list(Pv_dat)
+    for e in range(n_edges):
+        m, sign = _resolve_edge(e)
+        rows.append(n_verts + e)
+        cols.append(n_vred + e_red_idx[m])
+        data.append(sign)
+    n_full = n_verts + n_edges
+    n_red = n_vred + n_ered
+    P = jsparse.BCOO(
+        (
+            jnp.asarray(np.asarray(data, dtype=np.float64)),
+            jnp.asarray(np.stack([np.asarray(rows, dtype=np.int64), np.asarray(cols, dtype=np.int64)], axis=1)),
+        ),
+        shape=(n_full, n_red),
+    )
+    kept = np.concatenate([vkept, n_verts + np.asarray(ekept, dtype=np.int64)]) if n_ered else vkept
+    return {
+        "P": P,
+        "P_node": P,
+        "kept_nodes": kept,
+        "slave_to_master": {},
+        "n_full": n_full,
+        "n_red": n_red,
+        "vec": 1,
+        # signed edge ties (weight −1) are not a 0/1 selection -> take the general PᵀAP reduce path.
+        "is_selection": bool(np.all(np.abs(np.asarray(data)) == 1.0) and np.all(np.asarray(data) >= 0.0)),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Sparse (BCOO) Dirichlet row/column operations
 #
