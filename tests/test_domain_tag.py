@@ -184,3 +184,70 @@ def test_tag_interior_region_keeps_no_normals():
     d.tag("blob", lambda x, y: (x - 0.5) ** 2 + (y - 0.5) ** 2 < 0.2**2)  # interior disk, off the boundary
     with pytest.raises(ValueError, match="no outward normals"):
         d.variable("blob", normals=True, split=True)
+
+
+# --------------------------------------------------------------------------------------------------
+# variable(name, where=predicate): define a region AND fetch its coordinates in one call. `tag`
+# stays chainable (returns self); the predicate is forwarded to it, then variable returns the coords.
+# --------------------------------------------------------------------------------------------------
+
+
+def test_variable_where_registers_tag_and_returns_coords_3d():
+    """``variable("xlo", where=pred)`` on a 3D box tags the region (predicate lands in
+    ``_tag_predicates``) and returns the split coordinate tuple ``(x, y, z, t)`` -- one call for what
+    used to be ``tag`` + ``variable``."""
+    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.4))
+    ret = d.variable("xlo", where=lambda x, y, z: x < 1e-6)
+    assert isinstance(ret, tuple) and len(ret) == 4, "3D coordinate tag must return (x, y, z, t)"
+    assert "xlo" in d._tag_predicates, "where= must register the tag exactly like tag()"
+    assert "xlo" in d._boundary_regions, "the tagged face must become a boundary region"
+
+
+def test_variable_where_matches_tag_then_variable_end_to_end():
+    """``variable(where=)`` is exactly ``tag`` followed by ``variable``: the same mixed-BC Poisson
+    solve, built each way, must give the identical field. (Discriminating: a wrong region/predicate
+    forwarding would move the Dirichlet nodes and change the solution.)"""
+
+    def solve(use_where):
+        d = jno.domain(box(0, 0, 1, 1), mesh_size=0.12)
+        u, phi = d.fem_symbols()
+        xi, yi, _ = d.variable("interior", split=True)
+        if use_where:
+            xh, yh, _ = d.variable("hot", where=lambda x, y: x < 1e-6)
+            xc, yc, _ = d.variable("cold", where=lambda x, y: x > 1 - 1e-6)
+        else:
+            d.tag("hot", lambda x, y: x < 1e-6)
+            d.tag("cold", lambda x, y: x > 1 - 1e-6)
+            xh, yh, _ = d.variable("hot", split=True)
+            xc, yc, _ = d.variable("cold", split=True)
+        ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+        fem = jno.fem([ui.x * vi.x + ui.y * vi.y, u(xh, yh) - 1.0, u(xc, yc) - 0.0])
+        return np.asarray(fem.solve())
+
+    a, b = solve(True), solve(False)
+    assert a.shape == b.shape
+    assert np.linalg.norm(a - b) / (np.linalg.norm(b) + 1e-30) < 1e-10, "where= must match tag()+variable() exactly"
+
+
+def test_variable_where_accepts_shapely_geometry():
+    """``where=`` accepts a shapely geometry (like ``tag``), returning the region's coords."""
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.2)
+    xd, yd, _ = d.variable("blob", where=box(0.3, 0.3, 0.7, 0.7))
+    assert "blob" in d._tag_predicates
+
+
+def test_variable_where_composes_with_normals():
+    """``where=`` composes with ``normals=True``: define a face and get its outward normal in one
+    call. On the right edge of the unit square that normal is (+1, 0)."""
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.34)
+    d.variable("myright", where=lambda x, y: x > 1 - 1e-6, normals=True, split=True)
+    n = np.asarray(d.context["n_myright"]).reshape(-1, 2)
+    assert np.allclose(np.linalg.norm(n, axis=1), 1.0)
+    np.testing.assert_allclose(n, np.broadcast_to((1.0, 0.0), n.shape), atol=1e-9)
+
+
+def test_tag_still_returns_self_for_chaining():
+    """The pre-existing contract is unchanged: ``tag`` returns the domain (chainable), never coords --
+    the coordinate-returning convenience lives only on ``variable(where=)``."""
+    d = jno.domain(box(0, 0, 1, 1), mesh_size=0.3)
+    assert d.tag("a", lambda x, y: x < 1e-6) is d

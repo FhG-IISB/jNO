@@ -1515,7 +1515,12 @@ class domain(MeshIOMixin):
 
         Only the **spatial** coordinates are passed to ``where`` (never time): a region is the same
         at every time level of a time-dependent domain. A shapely geometry may be passed instead of
-        a callable. Returns ``self`` (chainable). Example::
+        a callable. Returns ``self`` (chainable). To name a region *and* grab its coordinates in one
+        line, pass the predicate straight to :meth:`variable` instead::
+
+            xl, yl, zl, _ = dom.variable("left", where=lambda x, y, z: x < 1e-6)
+
+        Example::
 
             dom.tag("inlet",    lambda x, y: x < 1e-6)            # boundary subset -> Dirichlet there
             dom.tag("cylinder", lambda x, y: (x-0.8)**2 + (y-0.5)**2 < 0.21**2)
@@ -2136,6 +2141,7 @@ class domain(MeshIOMixin):
         split: bool = False,
         return_indices: Literal[False] = False,
         time_value: Optional[float] = None,
+        where=None,
     ) -> "tuple[Variable, ...]": ...
 
     @overload
@@ -2151,6 +2157,7 @@ class domain(MeshIOMixin):
         split: bool = False,
         return_indices: bool = False,
         time_value: Optional[float] = None,
+        where=None,
     ) -> Any: ...
     @property
     def cell_size(self):
@@ -2187,12 +2194,19 @@ class domain(MeshIOMixin):
         split: bool = False,
         return_indices=False,
         time_value: Optional[float] = None,
+        where=None,
     ) -> Any:
         """Create Variable placeholders for a tagged point set or tensor.
 
         Args:
             tag: Name of the point set (e.g., 'interior', 'boundary')
                  or tensor tag (e.g., 'diffusivity')
+            where: Optional spatial predicate ``f(x, y[, z]) -> bool`` (or a shapely geometry).
+                 When given, the region ``tag`` is defined on the fly -- exactly as
+                 :meth:`tag` would -- and then its coordinates are returned, so naming a
+                 region and grabbing its coords is a single call::
+
+                     xl, yl, zl, _ = dom.variable("left", where=lambda x, y, z: x < 1e-6)
             sample: Optional sampling specification for this tag:
                     - (n_samples, sampler) tuple to trigger sampling
                     - np.ndarray / jnp.ndarray to register a tensor tag
@@ -2222,6 +2236,10 @@ class domain(MeshIOMixin):
                 from a separate ``domain.variable(region)`` / ``split=True`` call.)
             For tensor tags: Single TensorTag placeholder.
         """
+
+        # Define-and-fetch: a predicate names the region here, then we return its coordinates.
+        if where is not None:
+            self.tag(tag, where)
 
         # Optional sampling / tensor-tag attachment
         if sample is not None:

@@ -94,6 +94,13 @@ The second form selects **boundary facets** by position, orientation, and existi
 and exclusion in one predicate. `n` is the outward normal (boundary only), `name` each facet's
 current region.
 
+To name a region **and** grab its coordinates in one line, pass the predicate straight to
+`variable` (it forwards to `tag`, then returns the split coords):
+
+```python
+xl, yl, zl, _ = d.variable("left", where=lambda x, y, z: x < 1e-6)   # tag AND bind in one call
+```
+
 ### Mesh density
 
 Control element size by attaching `size=` to a shape — gmsh's mesh-size fields do the work
