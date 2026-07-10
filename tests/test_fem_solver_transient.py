@@ -84,6 +84,44 @@ def test_nonlinear_transient_slots_match_default():
     assert np.abs(sol - ref).max() < 1e-8
 
 
+def test_nonlinear_transient_inverse_through_slots():
+    """Reverse-mode adjoint through a NONLINEAR transient inverse with a *slot* inner solver.
+
+    Regression for the transient-nonlinear adjoint: each per-step Newton solve reuses the inner
+    linear solver as ``custom_root``'s implicit-diff tangent/adjoint solve. A raw slot solver
+    (``jno.solve.gmres``) has no transpose rule of its own, so *chaining* these solves through the
+    time-march ``lax.scan`` used to raise ``NotImplementedError`` in JAX's ``custom_linear_solve``
+    transpose rule. ``newton_krylov`` now firewalls the slot in ``custom_linear_solve`` with an
+    explicit ``A^T`` transpose solve, so the transient nonlinear gradient reaches the parameter and
+    recovers it (steady nonlinear + linear transient already worked; this covers their intersection).
+    """
+    import optax
+
+    alpha = jno.np.parameter((1,), key=jax.random.PRNGKey(1), name="alpha")
+    alpha.initialize(jax.nn.initializers.constant(2.0))  # start far from truth = 1
+    alpha.dtype(jnp.float64)
+    alpha.optimizer(optax.adam(5e-2))
+
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25, time=(0.0, 0.2, 11))
+    u, v = d.fem_symbols()
+    xi, yi, ti = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ci = d.variable("initial", split=True)
+    ui, vi = u.bind(x=xi, y=yi, t=ti), v.bind(x=xi, y=yi, t=ti)
+    ic = jno.np.sin(PI * ci[0]) * jno.np.sin(PI * ci[1])
+    # NONLINEAR reaction alpha*u^3 -> each step is a Newton solve (backward-Euler custom_root)
+    fem = jno.fem([ui.t * vi + ui.x * vi.x + ui.y * vi.y + alpha * ui**3 * vi, u(xb, yb) - 0.0, u(ci[0], ci[1]) - ic])
+    assert not fem.is_linear
+    u_obs = jnp.asarray(_heat(nonlinear=True, mesh_size=0.25, time=(0.0, 0.2, 11)).solve().fn())  # alpha_true = 1
+
+    node = fem.solve(nonlinear=jno.solve.newton(), linear=jno.solve.gmres(maxiter=2000))
+    dummy = jno.domain.from_array({"_": np.zeros((1, 1))})
+    crux = jno.core([(node - u_obs).mse], domain=dummy)
+    crux.solve(120)
+    a = float(np.asarray(crux.eval([alpha])).reshape(-1)[0])
+    assert abs(a - 1.0) < 0.05, f"alpha not recovered through transient NONLINEAR slot adjoint: {a}"
+
+
 def test_second_order_time_slots():
     """The u_tt (wave) path builds an augmented [u, v] linear block — the slots apply unchanged."""
     d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.25, time=(0.0, 0.3, 31))
