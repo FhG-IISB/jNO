@@ -44,7 +44,9 @@ u_h = fem.solve()          # matrix-free default; slots pick anything else (see 
 * **Quadrature coordinates** — `d.variable("interior", split=True)` returns the volume
   coordinates; `d.variable("<edge>", split=True)` returns a boundary edge's coordinates. A
   `Shape.rect` auto-tags `"left"`, `"right"`, `"bottom"`, `"top"` (and `"front"`/`"back"` for a box);
-  `"boundary"` is the whole boundary and `"initial"` the `t = t0` slice.
+  `"boundary"` is the whole boundary and `"initial"` the `t = t0` slice. To define a custom region
+  and fetch its coordinates in one call, pass a predicate: `d.variable("port", where=lambda x, y: x < 1e-6)`
+  tags `"port"` (exactly as `d.tag` would) and returns its split coordinates.
 * **Bound views** — `ui = u.bind(x=xi, y=yi, t=ti)` ties a symbol to a set of coordinates.
   The value is `ui`; spatial derivatives are `ui.x`, `ui.y`, `ui.z`; the time derivative is `ui.t`.
 * **Second derivatives (4th-order weak forms).** `jno.np.laplacian(ui, [xi, yi])` (the Laplacian `Δu`)

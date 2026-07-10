@@ -1499,6 +1499,7 @@ class PolygonDomain(domain):
         split: bool = False,
         return_indices: Literal[False] = False,
         time_value: Optional[float] = None,
+        where=None,
     ) -> "tuple[Variable, ...]": ...
 
     @overload
@@ -1514,6 +1515,7 @@ class PolygonDomain(domain):
         split: bool = False,
         return_indices: bool = False,
         time_value: Optional[float] = None,
+        where=None,
     ) -> Any: ...
 
     def variable(
@@ -1528,7 +1530,11 @@ class PolygonDomain(domain):
         split: bool = False,
         return_indices=False,
         time_value: Optional[float] = None,
+        where=None,
     ) -> Any:
+        # Define-and-fetch: a predicate names the region here, then we return its coordinates.
+        if where is not None:
+            self.tag(tag, where)
         polygon_tag = self._is_polygon_tag(tag)
         if view_factor and polygon_tag:
             kind, _ = self._polygon_tags[tag]
