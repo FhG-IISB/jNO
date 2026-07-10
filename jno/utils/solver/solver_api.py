@@ -296,19 +296,45 @@ class PrecondContext:
         return LinearOperator.from_matvec(mv, t_mv=t_mv, diag_fn=diag_fn, dense_fn=dense_fn, shape=(ni, nj))
 
     def assemble(self, terms, *, quad_degree: int = 2) -> LinearOperator:
+        import jax.experimental.sparse as jsp
+
         from ... import fem as _fem_entry
 
         aux = _fem_entry(list(terms), quad_degree=quad_degree)
-        if not aux.is_linear or aux.is_transient or aux.is_complex:
-            raise ValueError("PrecondContext.assemble: the auxiliary preconditioner form must be steady linear.")
-        A = aux.A
-        if not hasattr(A, "todense"):
+        # steady linear, real (mode "linear") OR complex (mode "complex"); transient/nonlinear rejected
+        if aux.is_transient or not (aux.is_linear or aux.is_complex):
+            raise ValueError(
+                "PrecondContext.assemble: the auxiliary preconditioner form must be steady linear (real or complex)."
+            )
+
+        def _bcoo(A):
             # small systems may assemble dense; convert NOW (concrete) so a sparse-direct inner
             # solver stays jit-safe when the applier later runs inside a traced Krylov loop
-            import jax.experimental.sparse as jsp
+            if hasattr(A, "indices"):
+                return A
+            return jsp.BCOO.fromdense(jnp.asarray(A.todense() if hasattr(A, "todense") else A))
 
-            A = jsp.BCOO.fromdense(jnp.asarray(A))
-        return LinearOperator(A)
+        if aux.is_complex:
+            # A COMPLEX auxiliary operator (e.g. the shifted-Laplacian twin of a complex Helmholtz)
+            # must precondition the outer complex solve's 2n real-equivalent system, so assemble it as
+            # the same block ``[[Mr,-Mi],[Mi,Mr]]`` (2n x 2n) from the form's two real/imag legs.
+            if getattr(aux, "_periodic", None) is not None:
+                raise NotImplementedError(
+                    "PrecondContext.assemble: a complex auxiliary form with periodic ties is not supported "
+                    "(the outer P-reduction is not mirrored onto the preconditioner block)."
+                )
+            from ..._fem import _complex_block_bcoo
+
+            legs = aux.operator  # ((A_r, b_r), (A_i, b_i)); a preconditioner form is parameter-independent
+            if not (isinstance(legs, tuple) and len(legs) == 2 and all(isinstance(leg, tuple) for leg in legs)):
+                raise NotImplementedError(
+                    "PrecondContext.assemble: expected two eager (A, b) complex legs "
+                    "(a parametric complex preconditioner form is not supported)."
+                )
+            A_r, A_i = _bcoo(legs[0][0]), _bcoo(legs[1][0])
+            return LinearOperator(_complex_block_bcoo(A_r, A_i, A_r.shape[0]))
+
+        return LinearOperator(_bcoo(aux.A))
 
 
 def materialize_precond(spec: Any, ctx: PrecondContext) -> Callable:

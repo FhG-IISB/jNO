@@ -188,6 +188,44 @@ def test_form_full_system_preconditioner():
     assert spec._op is op_first
 
 
+def test_form_precond_accepts_complex_shifted_laplacian():
+    """A COMPLEX auxiliary operator -- the shifted-Laplacian twin of a complex Helmholtz -- now
+    assembles as the matching ``2n`` real-equivalent block ``[[Mr,-Mi],[Mi,Mr]]`` and preconditions
+    the complex solve. On an indefinite Helmholtz, ``gmres + form(shifted)`` converges to the
+    sparse-direct reference (before the fix this raised "must be steady linear")."""
+    from jno.utils.solver.linear import sparse_lu_solve
+
+    k = 2 * np.pi
+    d = jno.domain(box(0.0, 0.0, 1.0, 1.0), mesh_size=0.05)
+    u, phi = d.fem_symbols()
+    xi, yi, _ = d.variable("interior", split=True)
+    xb, yb, _ = d.variable("boundary", split=True)
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    src = jno.np.exp(-(((xi - 0.5) ** 2 + (yi - 0.5) ** 2) / (2 * 0.1**2)))
+    fem = jno.fem([ui.x * vi.x + ui.y * vi.y - (k**2 + 2j) * (u * vi) - src * vi, u(xb, yb) - 0.0])
+    assert fem.is_complex
+    u_ref = np.asarray(fem.solve(solve_fn=sparse_lu_solve))
+
+    shifted = [ui.x * vi.x + ui.y * vi.y - (k**2 + 1j * 0.5 * k**2) * (u * vi), u(xb, yb) - 0.0]  # damped twin
+    sol = np.asarray(
+        fem.solve(
+            linear=jno.solve.gmres(tol=1e-10, maxiter=500, restart=60),
+            precond=jno.precond.form(shifted, inner=jno.solve.lu()),
+        )
+    )
+    assert np.iscomplexobj(sol)
+    rel = float(np.linalg.norm(sol - u_ref) / np.linalg.norm(u_ref))
+    assert rel < 1e-6, f"complex shifted-Laplacian preconditioned solve must match the direct reference: {rel:.2e}"
+
+
+def test_form_precond_still_rejects_nonlinear_aux():
+    """The steady-linear guard still holds: a nonlinear auxiliary form is rejected (the complex
+    branch widened the guard to steady-linear real *or* complex, not to nonlinear/transient)."""
+    fem, ui, vi = _poisson()
+    with pytest.raises(ValueError, match="steady linear"):
+        fem.solve(linear=jno.solve.fgmres(), precond=jno.precond.form([ui.x * vi.x + (ui * ui) * vi]))
+
+
 def test_inner_spec_full_system():
     fem, *_ = _poisson()
     u_ref = np.asarray(fem.solve())
