@@ -313,8 +313,11 @@ def zz_error_indicators(domain: Any, u_vertex: np.ndarray) -> tuple[np.ndarray, 
 
     # elementwise gap, integrated over the cell (centroid rule: P1 g_cell is exact
     # there and the centroid value of the P1-recovered field is the vertex mean).
+    # For a COMPLEX field ``u_vertex`` the gradient gap is complex and the energy-norm error uses
+    # its modulus: ``|g* - grad u_h|^2``. Since ``|x|^2 == x^2`` for reals, this stays exact in the
+    # real case -- so one indicator drives refinement for real and complex (Helmholtz) fields alike.
     g_star_centroid = g_star[cells].mean(axis=1)  # (n_cells, dim)
-    eta2 = area * np.sum((g_star_centroid - g_cell) ** 2, axis=1)  # (n_cells,)
+    eta2 = area * np.sum(np.abs(g_star_centroid - g_cell) ** 2, axis=1)  # (n_cells,), real
     eta = np.sqrt(np.maximum(eta2, 0.0))
     return eta, float(np.sqrt(eta2.sum()))
 
@@ -361,9 +364,9 @@ def _recover_nodal_gradient(domain: Any, field: np.ndarray) -> tuple[np.ndarray,
     if f.shape[0] < int(cells.max()) + 1:
         raise ValueError("field is shorter than the mesh vertex count; expected one value per P1 vertex.")
 
-    g_cell = np.einsum("cld,cl->cd", sg, f[cells])  # (n_cells, dim): constant P1 gradient
+    g_cell = np.einsum("cld,cl->cd", sg, f[cells])  # (n_cells, dim): constant P1 gradient (complex if f is)
     n_vert = f.shape[0]
-    g_star = np.zeros((n_vert, dim))
+    g_star = np.zeros((n_vert, dim), dtype=g_cell.dtype)  # keep complex gradients intact (don't drop Im)
     wsum = np.zeros(n_vert)
     for lv in range(cells.shape[1]):
         idx = cells[:, lv]
@@ -573,15 +576,27 @@ def _rel_change(cur: Any, prev: Any) -> float:
 
 
 def _solve_vertex_values(fem: Any, solve_fn: Any = None, **kwargs: Any) -> np.ndarray:
-    """Solve ``fem`` and return the P1 nodal solution as a plain ``(n_vertices,)`` array."""
+    """Solve ``fem`` and return the nodal solution at the mesh vertices as a plain
+    ``(n_vertices,)`` array -- complex-valued if the form is complex.
+
+    Scalar P1 returns all DOFs; a higher-order scalar field (e.g. P2/TET10) returns its **vertex**
+    DOFs (the first ``n_vertices`` entries, which are nodal), which drive the ZZ estimator. Vector /
+    multifield problems are rejected -- refine on a scalar readout instead."""
+    from jno._fem import _infer_vec  # local import: fem_adapt is loaded lazily by the domain
+
     sol = np.asarray(fem.solve(solve_fn, **kwargs)).reshape(-1)
     n_vert = int(np.asarray(fem.domain.mesh.points).shape[0])
-    if sol.shape[0] != n_vert:
+    vec = _infer_vec(fem._constraints) if getattr(fem, "_constraints", None) else 1
+    if vec != 1:
         raise NotImplementedError(
-            "The ZZ estimator currently assumes a scalar P1 field (one DOF per vertex); "
-            f"got {sol.shape[0]} DOFs for {n_vert} vertices."
+            f"The ZZ estimator supports a scalar field; got a vector field (vec={vec}). "
+            "Refine per component or on a scalar readout instead."
         )
-    return sol
+    if sol.shape[0] == n_vert:
+        return sol
+    if sol.shape[0] > n_vert:
+        return sol[:n_vert]  # higher-order scalar: the first n_vert DOFs are the vertex (nodal) values
+    raise NotImplementedError(f"got {sol.shape[0]} DOFs for {n_vert} vertices (fewer than one per vertex).")
 
 
 def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwargs: Any) -> np.ndarray:
@@ -630,6 +645,11 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
             break
 
         if spec.anisotropic:
+            if np.iscomplexobj(u):
+                raise NotImplementedError(
+                    "anisotropic (Hessian-metric) adaptation is real-only; use isotropic ZZ "
+                    "(AdaptSpec(anisotropic=False)) for a complex field."
+                )
             h_typ = _mean_edge_length(d)
             hmin = spec.hmin if spec.hmin is not None else h_typ / 50.0
             hmax = spec.hmax if spec.hmax is not None else h_typ * 2.0
@@ -645,6 +665,13 @@ def run_adaptive_solve(fem: Any, spec: AdaptSpec, *, solve_fn: Any = None, **kwa
         else:
             size = size_field_from_marks(d, marked, refine_factor=spec.refine_factor)
             remesh_with_mmg(d, size, copy=False)  # mutate the domain in place
+        # Re-materialize custom coordinate-predicate tags on the refreshed mesh so that
+        # surface-integral terms -- Neumann / Robin / absorbing boundary conditions -- re-derive on
+        # the new boundary facets. (Dirichlet already re-resolves geometrically via its location
+        # function; without this the flux terms reference stale nodes and silently vanish, leaving a
+        # homogeneous problem after the first remesh.)
+        for _name, _pred in list(getattr(d, "_tag_predicates", {}).items()):
+            d.tag(_name, _pred)
         cur = jno.fem(cons, **kw)  # re-assemble the same problem on the refined mesh
 
     # rebind the caller's FEM to the final adapted state so fem.points / A / b match ``u``
