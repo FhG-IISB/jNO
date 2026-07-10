@@ -324,6 +324,19 @@ def assemble_fem_nonnodal(
         _en = np.stack([-_d[:, 1], _d[:, 0]], axis=1)  # R90·d per global edge
         _en = _en / np.linalg.norm(_en, axis=1, keepdims=True)
         argyris_normals = jnp.asarray(_en[np.asarray(top.cell_edges)])  # (n_cells, 3, 2)
+        # Stash the C¹ topology the periodic (non-nodal) prolongation builder needs: Morley value DOFs
+        # live at the mesh vertices, its normal-derivative DOFs at the global edges (midpoint + oriented
+        # normal ``_en``). Read back in ``_fem._build_periodic_reduction_nonnodal`` when ties are present.
+        _pts_np = np.asarray(pts)
+        domain._fem_nonnodal_topology = {
+            "n_verts": int(_pts_np.shape[0]),
+            "n_edges": int(n_edges),
+            "vertex_points": _pts_np,
+            "edge_vertices": _ev,
+            "edge_midpoints": 0.5 * (_pts_np[_ev[:, 0]] + _pts_np[_ev[:, 1]]),
+            "edge_normals": _en,
+            "family": "Morley" if has_morley else ("Argyris" if has_argyris else "Hermite"),
+        }
 
     # Hermite per-cell global DOF map: 3 DOFs per vertex (value, ∂x, ∂y, in basix order) + 1 interior
     # (centroid) DOF per cell. Continuity is automatic from shared global vertex ids (point functionals --
@@ -680,8 +693,12 @@ def assemble_fem_nonnodal(
                 phi = per[fidx]["shape_vals"]
                 u0 = jnp.asarray(_eval_value_node_at(u0_node, xq))
                 if phi.ndim == 3:  # RT/N1E vector basis (n_quad, n_dof, vsize): ∫ u0·Φ
-                    return jnp.einsum("q,qnc,qc->n", qw * meas, phi, u0.reshape(n_quad, -1))
-                return jnp.einsum("q,qn,q->n", qw * meas, phi, u0.reshape(n_quad))  # P0 scalar basis: ∫ u0 q
+                    u0 = jnp.broadcast_to(
+                        u0.reshape(-1) if u0.size == 1 else u0.reshape(n_quad, -1), (n_quad, phi.shape[-1])
+                    )
+                    return jnp.einsum("q,qnc,qc->n", qw * meas, phi, u0)
+                # scalar basis ∫ u0 q — broadcast so a *constant* IC (shape (1,)) fills all n_quad points
+                return jnp.einsum("q,qn,q->n", qw * meas, phi, jnp.broadcast_to(u0.reshape(-1), (n_quad,)))
 
             local = (cdofs[fidx] - offs[fidx]).reshape(-1)  # field-local DOFs (ce for RT/N1E, cell index for P0)
             load = jnp.zeros(offs[fidx + 1] - offs[fidx]).at[local].add(jax.vmap(_ic_cell)(jnp.arange(n_cells)).reshape(-1))

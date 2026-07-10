@@ -164,3 +164,146 @@ def test_morley_laplacian_form_is_singular_full_hessian_is_not():
     fem_hes = jno.fem([jno.np.inner(Hu, Hv, n_contract=2) - f * vi, u(xb, yb) - g])
     assert np.linalg.cond(dense(fem_lap.A)) > 1e20, "the Laplacian form should be (near-)singular for Morley"
     assert np.linalg.cond(dense(fem_hes.A)) < 1e12, "the full-Hessian form should be well-conditioned"
+
+
+@pytest.mark.slow  # non-nodal C¹ assembly at n=24 peaks at ~3 GiB in one sparse reduce — OOMs 8 GiB GPUs
+def test_morley_periodic_biharmonic_convergence():
+    """Periodic-in-y biharmonic ``Δ²u = f`` on the non-nodal (C¹-ish) Morley element — the regression that pins
+    the **edge-derivative periodic tie sign**. The DOF-level periodic prolongation must tie both the vertex value
+    DOFs and the edge-normal-derivative DOFs across the matched top/bottom boundary; the edge block carries a
+    ``sign(n_slave·n_master)`` weight, and a flipped sign gives a wrong solution.
+
+    The manufactured ``u* = sin(πx) sin(2πy)`` is periodic in y (period 1) and has ``∂ᵧu = 2π cos(2πy) sin(πx)``
+    NON-ZERO and EQUAL at y=0 and y=1 — so the tie genuinely couples the normal-derivative DOFs and a wrong sign
+    (which would force ``∂ᵧu(top) = −∂ᵧu(bottom)``) fails to recover it. The x-walls are clamped to the exact
+    trace. Recovery at the optimal Morley L² rate ≈ 2 confirms the tie sign. ``Δ²[sin(πx)sin(2πy)] = 25π⁴ u*``.
+
+    Runs on CPU: the non-nodal assembly at the finer mesh peaks at ~3 GiB in one sparse reduce, which OOMs
+    8 GiB GPUs — the pin validates the periodic tie sign, not GPU capacity."""
+    import jax.numpy as jnp
+
+    sin = jno.np.sin
+    solver = lambda A, b: jnp.linalg.solve(  # noqa: E731
+        jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A), jnp.asarray(b).reshape(-1)
+    )
+
+    errs, hs = [], []
+    with jax.default_device(jax.devices("cpu")[0]):
+        for n in (12, 24):
+            d = jno.domain.equi_distant_rect(x_range=(0.0, 1.0), y_range=(0.0, 1.0), nx=n, ny=n)
+            xi, yi, _ = d.variable("interior", split=True)
+            xl, yl, _ = d.variable("left", split=True)
+            xr, yr, _ = d.variable("right", split=True)
+            xt, yt, _ = d.variable("top", split=True)
+            xb, yb, _ = d.variable("bottom", split=True)
+            u, phi = d.fem_symbols(space="Morley")
+            ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+            f = 25 * PI**4 * sin(PI * xi) * sin(2 * PI * yi)
+            Hu, Hv = jno.np.hessian(ui, [xi, yi]), jno.np.hessian(vi, [xi, yi])
+            fem = jno.fem(
+                [
+                    jno.np.inner(Hu, Hv, n_contract=2) - f * vi,
+                    u(xl, yl) - sin(PI * xl) * sin(2 * PI * yl),  # clamped x-walls to the exact trace (value + ∂ₙ)
+                    u(xr, yr) - sin(PI * xr) * sin(2 * PI * yr),
+                    u(xt, yt) - u(xb, yb),  # periodic in y — ties value AND edge-normal-derivative DOFs
+                ]
+            )
+            assert fem.is_linear
+            sol = np.asarray(fem.solve(solver)).reshape(-1)
+            pts = np.asarray(d.mesh.points)[:, :2]
+            nv = pts.shape[0]
+            uh = sol[np.arange(nv)]  # Morley value DOFs
+            ue = np.sin(PI * pts[:, 0]) * np.sin(2 * PI * pts[:, 1])
+            errs.append(_l2(uh, ue))
+            hs.append(1.0 / n)
+
+    rate = np.log(errs[0] / errs[1]) / np.log(hs[0] / hs[1])
+    assert errs[-1] < 0.05 and errs[-1] < errs[0], f"periodic Morley biharmonic must converge: {errs}"
+    assert rate > 1.5, f"L² order must be near the non-conforming optimum 2 (wrong tie sign breaks this): {rate}"
+
+
+@pytest.mark.slow  # two non-nodal C¹ fields — assembly peaks at ~6 GiB, OOMs 8 GiB GPUs
+def test_morley_periodic_multifield_decoupled_convergence():
+    """Two DECOUPLED periodic biharmonic Morley fields with DIFFERENT manufactured solutions — the regression
+    that pins the **per-field block-concatenation** (one periodic prolongation ``P`` per field). If a tie is
+    applied to the wrong field's DOF block, or a block is mis-offset, one field fails to converge.
+
+    ``ψ* = sin(πx)sin(2πy)`` (``Δ²ψ*=25π⁴ψ*``) and ``φ* = sin(2πx)sin(2πy)`` (``Δ²φ*=64π⁴φ*``) — both periodic
+    in y, both clamped-x to their exact trace, NO coupling. Both must recover at the Morley L² rate ≈ 2. Runs on
+    CPU: two C¹ fields peak at ~6 GiB in the sparse reduce, which OOMs 8 GiB GPUs."""
+    import jax.numpy as jnp
+
+    sin = jno.np.sin
+    solver = lambda A, b: jnp.linalg.solve(  # noqa: E731
+        jnp.asarray(A.todense()) if hasattr(A, "todense") else jnp.asarray(A), jnp.asarray(b).reshape(-1)
+    )
+
+    eps, eph, hs = [], [], []
+    with jax.default_device(jax.devices("cpu")[0]):
+        for n in (12, 24):
+            d = jno.domain.equi_distant_rect(x_range=(0.0, 1.0), y_range=(0.0, 1.0), nx=n, ny=n)
+            xi, yi, _ = d.variable("interior", split=True)
+            xl, yl, _ = d.variable("left", split=True)
+            xr, yr, _ = d.variable("right", split=True)
+            xt, yt, _ = d.variable("top", split=True)
+            xb, yb, _ = d.variable("bottom", split=True)
+            psi, vps = d.fem_symbols(names=("psi", "vps"), space="Morley")
+            phi, vph = d.fem_symbols(names=("phi", "vph"), space="Morley")
+            pib, vpi = psi.bind(x=xi, y=yi), vps.bind(x=xi, y=yi)
+            fib, vfi = phi.bind(x=xi, y=yi), vph.bind(x=xi, y=yi)
+            fps = 25 * PI**4 * sin(PI * xi) * sin(2 * PI * yi)
+            fph = 64 * PI**4 * sin(2 * PI * xi) * sin(2 * PI * yi)
+            H = jno.np.hessian
+            fem = jno.fem(
+                [
+                    jno.np.inner(H(pib, [xi, yi]), H(vpi, [xi, yi]), n_contract=2) - fps * vpi,  # field 0: ψ
+                    jno.np.inner(H(fib, [xi, yi]), H(vfi, [xi, yi]), n_contract=2) - fph * vfi,  # field 1: φ (decoupled)
+                    psi(xl, yl) - sin(PI * xl) * sin(2 * PI * yl),  # ψ clamped-x to exact trace
+                    psi(xr, yr) - sin(PI * xr) * sin(2 * PI * yr),
+                    phi(xl, yl) - sin(2 * PI * xl) * sin(2 * PI * yl),  # φ clamped-x to exact trace
+                    phi(xr, yr) - sin(2 * PI * xr) * sin(2 * PI * yr),
+                    psi(xt, yt) - psi(xb, yb),  # periodic-y on BOTH fields
+                    phi(xt, yt) - phi(xb, yb),
+                ]
+            )
+            assert fem.is_linear
+            sol = np.asarray(fem.solve(solver)).reshape(-1)
+            off = fem.offsets
+            pts = np.asarray(d.mesh.points)[:, :2]
+            nv = pts.shape[0]
+            ups = np.sin(PI * pts[:, 0]) * np.sin(2 * PI * pts[:, 1])
+            uph = np.sin(2 * PI * pts[:, 0]) * np.sin(2 * PI * pts[:, 1])
+            eps.append(_l2(sol[off[0] : off[0] + nv], ups))  # field-0 value DOFs
+            eph.append(_l2(sol[off[1] : off[1] + nv], uph))  # field-1 value DOFs
+            hs.append(1.0 / n)
+
+    rps = np.log(eps[0] / eps[1]) / np.log(hs[0] / hs[1])
+    rph = np.log(eph[0] / eph[1]) / np.log(hs[0] / hs[1])
+    assert eps[-1] < 0.05 and rps > 1.5, f"ψ field must recover (per-field block): errs={eps} rate={rps}"
+    assert eph[-1] < 0.05 and rph > 1.5, f"φ field must recover (no block bleed): errs={eph} rate={rph}"
+
+
+def test_morley_periodic_rejects_argyris_and_nonconforming():
+    """Fail-loud guards (constraint: never fail silently). Periodic ties on the non-nodal path are Morley-only:
+    the C¹ **Argyris** element (extra per-vertex derivative DOFs whose periodic signs are not wired) raises a
+    clear ``NotImplementedError`` at assembly rather than silently mis-tying."""
+    sin = jno.np.sin
+    d = jno.domain.equi_distant_rect(x_range=(0.0, 1.0), y_range=(0.0, 1.0), nx=6, ny=6)
+    xi, yi, _ = d.variable("interior", split=True)
+    xl, yl, _ = d.variable("left", split=True)
+    xr, yr, _ = d.variable("right", split=True)
+    xt, yt, _ = d.variable("top", split=True)
+    xb, yb, _ = d.variable("bottom", split=True)
+    u, phi = d.fem_symbols(space="Argyris")
+    ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+    f = 25 * PI**4 * sin(PI * xi) * sin(2 * PI * yi)
+    Hu, Hv = jno.np.hessian(ui, [xi, yi]), jno.np.hessian(vi, [xi, yi])
+    with pytest.raises(NotImplementedError, match="[Mm]orley"):
+        jno.fem(
+            [
+                jno.np.inner(Hu, Hv, n_contract=2) - f * vi,
+                u(xl, yl) - sin(PI * xl) * sin(2 * PI * yl),
+                u(xr, yr) - sin(PI * xr) * sin(2 * PI * yr),
+                u(xt, yt) - u(xb, yb),  # periodic-y on Argyris -> must raise, not silently mis-tie
+            ]
+        )
