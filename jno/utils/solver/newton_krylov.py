@@ -98,7 +98,22 @@ def newton_krylov(
     # jax.lax.custom_root primitive only ever sees JAX values.
     f0 = lambda u: jnp.asarray(residual_fn(u)).reshape(-1)
     u0 = jnp.asarray(u0).reshape(-1)
-    inner = linear_solve or (lambda mv, rhs: _linsolve(mv, rhs, tol=inner_tol, maxit=inner_maxit))
+    # The inner solve serves BOTH the Newton step AND ``custom_root``'s implicit-diff
+    # tangent/adjoint solve (``tangent_solve`` below), so it must be reverse-transposable. The
+    # default ``_linsolve`` already wraps BiCGStab in ``custom_linear_solve`` with a transpose rule.
+    # A slot solver (e.g. ``jno.solve.gmres``) is a *raw* Krylov call with no transpose rule of its
+    # own; used as ``tangent_solve`` unwrapped, it differentiates in isolation (steady) but breaks when
+    # such solves are *chained* -- e.g. a transient time-march of Newton steps -- because JAX then tries
+    # to transpose its ``custom_linear_solve`` w.r.t. the operator and raises NotImplementedError. So we
+    # firewall the slot the same way: wrap it in ``custom_linear_solve`` with an explicit transpose
+    # solve that runs the *same* solver on ``A^T`` (custom_linear_solve hands ``transpose_solve`` the
+    # transposed matvec). This makes the adjoint well-defined for every inner solver, not just the
+    # default -- the fix is at the single point where transposability is actually required.
+    if linear_solve is None:
+        inner = lambda mv, rhs: _linsolve(mv, rhs, tol=inner_tol, maxit=inner_maxit)
+    else:
+        _slot = linear_solve
+        inner = lambda mv, rhs: jax.lax.custom_linear_solve(mv, rhs, _slot, transpose_solve=_slot)
 
     def _backtrack(f, u, delta, rn):
         """First ``alpha`` in ``damping * 0.5^i`` meeting residual-norm Armijo; else the last (tiny)."""
