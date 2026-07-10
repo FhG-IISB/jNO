@@ -142,6 +142,60 @@ def test_adaptive_preserves_robin_source_across_remesh():
     assert float(np.abs(sol).mean()) > 0.3, f"the Robin source must survive remesh (|u| mean={np.abs(sol).mean():.3f})"
 
 
+def test_absorbing_source_survives_repeated_remesh():
+    """Regression for the stale-tag bug: on remesh, jNO must drop the OLD mesh's predicate-tag state
+    so a re-tag re-derives the absorbing/source boundary cleanly. Otherwise stale surface-tag state
+    corrupts the re-assembled Robin term and the driven field collapses after the first remesh --
+    which silently breaks any field-parameter adaptive inverse-design loop that remeshes then rebuilds.
+
+    A homogeneous absorbing box launched by a unit wave keeps ``|u| ~ O(1)`` across several remeshes;
+    before the fix it collapsed (~0.25) after the first."""
+    from jno.utils.solver.fem_adapt import remesh_with_mmg
+
+    k = 2 * np.pi
+    L = 3.0
+    faces = {
+        "bottom": lambda x, y: y < 1e-6,
+        "top": lambda x, y: y > L - 1e-6,
+        "left": lambda x, y: x < 1e-6,
+        "right": lambda x, y: x > L - 1e-6,
+    }
+
+    def amp(d):
+        u, phi = d.fem_symbols()
+        xi, yi, _ = d.variable("interior", split=True)
+        bx, by, _ = d.variable("bottom", split=True)
+        tx, ty, _ = d.variable("top", split=True)
+        lx, ly, _ = d.variable("left", split=True)
+        rx, ry, _ = d.variable("right", split=True)
+        ui, vi = u.bind(x=xi, y=yi), phi.bind(x=xi, y=yi)
+        ub, vb = u.bind(x=bx, y=by), phi.bind(x=bx, y=by)
+        ut, vt = u.bind(x=tx, y=ty), phi.bind(x=tx, y=ty)
+        ul, vl = u.bind(x=lx, y=ly), phi.bind(x=lx, y=ly)
+        ur, vr = u.bind(x=rx, y=ry), phi.bind(x=rx, y=ry)
+        fem = jno.fem(
+            [
+                ui.x * vi.x + ui.y * vi.y - k**2 * (u * vi),
+                -(1j * k * ub - 2j * k) * vb,  # bottom: launch a unit wave + absorb
+                -(1j * k * ut) * vt,
+                -(1j * k * ul) * vl,
+                -(1j * k * ur) * vr,  # non-reflecting frame
+            ]
+        )
+        return float(np.abs(np.asarray(fem.solve(solve_fn=sparse_lu_solve))).mean())
+
+    d = jno.domain(box(0, 0, L, L), mesh_size=0.14)
+    for nm, pr in faces.items():
+        d.tag(nm, pr)
+    assert amp(d) > 0.5, "the driven absorbing box should have |u| ~ O(1) before remeshing"
+    for _ in range(3):  # remesh (drops stale tag state) -> re-tag via predicates (the real-path pattern)
+        remesh_with_mmg(d, np.full(np.asarray(d.built_mesh.points).shape[0], 0.11), copy=False)
+        for nm, pr in list(getattr(d, "_tag_predicates", {}).items()):
+            d.tag(nm, pr)
+        a = amp(d)
+        assert a > 0.5, f"the absorbing source must survive remesh (|u| mean {a:.3f}); stale-tag regression"
+
+
 def test_adaptive_rejects_vector_field():
     """A vector field has no scalar ZZ indicator -> a clear error, not a wrong slice."""
     d = jno.domain(box(0, 0, 1, 1), mesh_size=0.2)

@@ -1794,6 +1794,34 @@ class domain(MeshIOMixin):
             self.mesh_connectivity, msg = self._preprocess_mesh_connectivity(mesh, self.dimension, boundary_indices)
             self.log.info(msg)
 
+    def _reset_custom_tag_state(self) -> None:
+        """Drop the **mesh-dependent** state of predicate-tagged regions so a re-tag on a freshly
+        attached mesh re-derives them cleanly instead of layering onto stale entries from the old
+        mesh. Called on remesh (see ``_domain_from_arrays``): the spatial predicates
+        (``_tag_predicates``) are KEPT so callers re-materialize via ``tag(name, pred)``.
+
+        Without this, re-tagging a surface region (Neumann / Robin / absorbing) on top of its stale
+        boundary-region entry corrupts the assembled flux term -- e.g. an absorbing box's source
+        collapses after the first remesh -- which silently breaks any field-parameter adaptive
+        inverse-design loop.
+        """
+        names = set(getattr(self, "_tag_predicates", {}))
+        if not names:
+            return
+        for attr in ("_boundary_regions", "tag_indices", "normals_by_tag", "_mesh_pool"):
+            store = getattr(self, attr, None)
+            if isinstance(store, dict):
+                for n in names:
+                    store.pop(n, None)
+        ctx = getattr(self, "context", None)
+        if isinstance(ctx, dict):
+            for n in names:
+                ctx.pop(n, None)
+                ctx.pop(f"n_{n}", None)
+        amt = getattr(self, "avaiable_mesh_tags", None)
+        if isinstance(amt, list):
+            self.avaiable_mesh_tags = [t for t in amt if t not in names]
+
     def refine(self, vertex_size, **mmg_options):
         """Locally remesh **in place** to a per-vertex target edge size (metric-based).
 
