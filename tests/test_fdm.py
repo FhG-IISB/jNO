@@ -411,3 +411,71 @@ def test_dirichlet_value_from_nodal_field():
 
     assert not isinstance(sol, FunctionCall), "a data-field Dirichlet value must stay an eager solve"
     assert float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact)) < 1e-2
+
+
+# ==========================================================================
+# 3-D tetrahedral meshes (interior operators — Tier 1)
+# ==========================================================================
+
+
+def _nodes3(d):
+    return np.asarray(d.mesh_connectivity["points"])[:, :3]
+
+
+def _cube(mesh_size):
+    """Unit cube meshed by jno.Shape (gmsh tets) — no shapely."""
+    return jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=mesh_size).domain()
+
+
+def _poisson3d(mesh_size, method="gradient_of_gradient"):
+    """-Δu = f on [0,1]³, u=0 on ∂Ω, exact u = sin(πx)sin(πy)sin(πz) ⇒ f = 3π²u. Returns rel-L2 error."""
+    d = _cube(mesh_size)
+    p = _nodes3(d)
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]) * np.sin(np.pi * p[:, 2])
+    f = jnp.asarray(3 * np.pi**2 * exact)
+    sys = jno.fdm(d, residual=lambda u: -jno.fdm.laplacian(u, d, method=method) - f, dirichlet={"boundary": 0.0})
+    u = np.asarray(sys.solve()).reshape(-1)
+    return float(np.linalg.norm(u - exact) / np.linalg.norm(exact))
+
+
+def test_gradient_3d_shape():
+    """The FD gradient on a tet mesh is (N, 3) — the flux dot-product ∇u·n stays dimension-agnostic."""
+    d = _cube(0.25)
+    g = jno.fdm.gradient(jnp.asarray(_nodes3(d)[:, 0]), d)  # ∇x = (1,0,0)
+    assert g.shape == (_nodes3(d).shape[0], 3)
+
+
+def test_poisson_3d_dirichlet():
+    assert _poisson3d(0.1) < 0.2
+
+
+def test_poisson_3d_convergence_under_refinement():
+    """Refining the tet mesh reduces the FD error — Tier-1 consistency in 3-D. The gradient-of-gradient
+    Laplacian is only first-order (no cotangent Laplace-Beltrami on tets), so the absolute error is
+    larger than the 2-D case and accuracy leans on refinement — but it converges monotonically."""
+    errs = [_poisson3d(h) for h in (0.20, 0.14, 0.10)]
+    assert errs[0] > errs[1] > errs[2], f"not monotonically converging: {errs}"
+    assert errs[2] < 0.2
+
+
+def test_laplacian_3d_cotangent_aliases_grad_of_grad():
+    """A tet mesh has no cotangent stencil, so `method="cotangent"` (the default) aliases to
+    `"gradient_of_gradient"` rather than raising — the two give the identical solve."""
+    assert abs(_poisson3d(0.14, method="cotangent") - _poisson3d(0.14, method="gradient_of_gradient")) < 1e-12
+
+
+def test_constraint_list_poisson_3d():
+    """fem-style authoring in 3-D: jno.fdm([-u.d2(x)-u.d2(y)-u.d2(z)-f, u(xb,yb,zb)-0]). `split=True`
+    yields (x, y, z, t) on a 3-D domain — the trailing coord is temporal."""
+    import jno.jnp_ops as jnn
+
+    d = _cube(0.14)
+    x, y, z, _ = d.variable("interior", split=True)
+    xb, yb, zb, _ = d.variable("boundary", split=True)
+    p = _nodes3(d)
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]) * np.sin(np.pi * p[:, 2])
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, z=z)
+    f = 3 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y) * jnn.sin(np.pi * z)
+    sol = jno.fdm([-ui.d2(x) - ui.d2(y) - ui.d2(z) - f, u(xb, yb, zb) - 0.0]).solve()
+    assert float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact)) < 0.35

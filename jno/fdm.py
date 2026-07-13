@@ -17,7 +17,12 @@ u(xi, yi) - u0])`` authored with ``u = domain.unknown()`` exactly as ``jno.fem([
 initial condition is *found from the constraints* (never a config flag) and ``t_span``/step-count are
 inferred from ``domain.time`` — and a low-level **function form** (:class:`FDMSystem`).
 
-v1 scope: scalar, 2-D triangular mesh, and **any mix** of steady boundary conditions — Dirichlet
+Scope: scalar fields on a **2-D triangular or 3-D tetrahedral mesh**. The interior operators
+(``jno.fdm.laplacian`` / ``jno.fdm.gradient``, and the constraint-list ``u.d2(x)+u.d2(y)+u.d2(z)``
+authoring) dispatch on ``domain.dimension``; a tet mesh has no cotangent Laplace-Beltrami, so its
+Laplacian is the first-order ``gradient_of_gradient`` double-difference (accuracy leans on
+refinement). Flux BCs and geometric sub-regions are 2-D for now (3-D face-normal flux and 3-D
+containment are the next extensions). In 2-D, **any mix** of steady boundary conditions — Dirichlet
 ``u(region) - g``, and **any flux BC affine in the normal derivative** ``∂u/∂n`` written with that
 edge's boundary tags: Neumann ``ur.d(n) - h``, Robin ``ur.d(n) + α(u - u∞)``, a coordinate-coefficient
 ``κ(x)·ur.d(n)``, either sign (``ur = u.bind(x=xr, y=yr)``, ``n = domain.variable(region, normals=True)``;
@@ -40,27 +45,45 @@ __all__ = ["fdm", "laplacian", "gradient"]
 
 
 def _mesh(domain):
+    """``(points, cells)`` for the domain — 2-D triangles or 3-D tetrahedra, dispatched on
+    ``domain.dimension``. 1-D is not exposed here (``jno.fdm`` is a 2-D/3-D collocation solver)."""
     mc = domain.mesh_connectivity
     dim = int(getattr(domain, "dimension", 2))
     pts = jnp.asarray(np.asarray(mc["points"])[:, :dim])
-    if dim != 2:
-        raise NotImplementedError("jno.fdm: only 2-D triangular meshes are supported in v1.")
-    return pts, jnp.asarray(mc["triangles"])
+    if dim == 2:
+        return pts, jnp.asarray(mc["triangles"])
+    if dim == 3:
+        return pts, jnp.asarray(mc["tetrahedra"])
+    raise NotImplementedError("jno.fdm: only 2-D triangular and 3-D tetrahedral meshes are supported.")
 
 
 def laplacian(u, domain, method: str = "cotangent"):
-    """FD Laplacian ``Δu`` of the nodal field ``u`` on the domain's mesh. ``method="cotangent"``
-    (symmetric, accurate — CG-compatible) or ``"gradient_of_gradient"`` / ``"lsq_of_gradient"``."""
-    pts, tris = _mesh(domain)
-    return _D.compute_fd_laplacian_2d_simple(u, pts, tris, dims=(0, 1), method=method)
+    """FD Laplacian ``Δu`` of the nodal field ``u`` on the domain's mesh. In 2-D ``method="cotangent"``
+    (symmetric, accurate — CG-compatible) or ``"gradient_of_gradient"`` / ``"lsq_of_gradient"``. A
+    tetrahedral mesh has **no cotangent Laplace-Beltrami**, so the 3-D operator is the
+    ``"gradient_of_gradient"`` double-difference (``"cotangent"`` is accepted as that alias, and is the
+    default): it is first-order and noisier than the 2-D cotangent stencil, so 3-D accuracy leans on
+    mesh refinement. (``"lsq_of_gradient"`` is unstable for the *second* derivative on tetrahedra —
+    the nested least-squares amplifies — and is not recommended in 3-D.)"""
+    pts, cells = _mesh(domain)
+    dim = int(getattr(domain, "dimension", 2))
+    if dim == 3:
+        method = "gradient_of_gradient" if method == "cotangent" else method
+        return _D.compute_fd_laplacian_3d_simple(u, pts, cells, dims=(0, 1, 2), method=method)
+    return _D.compute_fd_laplacian_2d_simple(u, pts, cells, dims=(0, 1), method=method)
 
 
 def gradient(u, domain, method: str = "area_weighted"):
-    """FD gradient ``∇u`` of the nodal field ``u`` — shape ``(N, 2)``. ``method`` selects the stencil
-    (``"area_weighted"`` default, ``"uniform"``, ``"inverse_distance"``, ``"least_squares"``)."""
-    pts, tris = _mesh(domain)
-    gx = _D.compute_fd_gradient_2d_simple(u, pts, tris, 0, method=method)
-    gy = _D.compute_fd_gradient_2d_simple(u, pts, tris, 1, method=method)
+    """FD gradient ``∇u`` of the nodal field ``u`` — shape ``(N, dim)``. ``method`` selects the stencil
+    (``"area_weighted"`` default, ``"uniform"``, ``"inverse_distance"``, ``"least_squares"``); the same
+    names apply on a 2-D triangular or 3-D tetrahedral mesh."""
+    pts, cells = _mesh(domain)
+    dim = int(getattr(domain, "dimension", 2))
+    if dim == 3:
+        comps = [_D.compute_fd_gradient_3d_simple(u, pts, cells, d, method=method) for d in range(3)]
+        return jnp.stack(comps, axis=1)
+    gx = _D.compute_fd_gradient_2d_simple(u, pts, cells, 0, method=method)
+    gy = _D.compute_fd_gradient_2d_simple(u, pts, cells, 1, method=method)
     return jnp.stack([gx, gy], axis=1)
 
 
