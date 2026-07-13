@@ -479,3 +479,23 @@ def test_constraint_list_poisson_3d():
     f = 3 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y) * jnn.sin(np.pi * z)
     sol = jno.fdm([-ui.d2(x) - ui.d2(y) - ui.d2(z) - f, u(xb, yb, zb) - 0.0]).solve()
     assert float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact)) < 0.35
+
+
+def test_mesh_nodes_in_3d_shape_box():
+    """Keystone 3-D containment: `jno.fdm._mesh_nodes_in` resolves a `jno.Shape.box` sub-region to the
+    exact tetrahedral-mesh node subset via the analytic 3-D `Shape.contains` — the production path both
+    `_TraceFDM._region_nodes` and `jno.dd._region_mask` route through to turn a geometric sub-region into
+    a node set. This is what shapely could never do (it is 2-D only). (Wiring such a region into a *3-D
+    coupled solve* additionally needs region-tag support on the base 3-D domain — a separate feature.)"""
+    from jno.fdm import _mesh_nodes_in
+
+    d = _cube(0.12)
+    p = _nodes3(d)
+    core = jno.Shape.box(0.3, 0.3, 0.3, 0.7, 0.7, 0.7)
+    idx = _mesh_nodes_in(p, core)
+    # resolves exactly the analytic 3-D containment ...
+    assert np.array_equal(np.sort(idx), np.sort(np.nonzero(core.contains(p))[0]))
+    # ... which is the hand-checkable "all three coords in [0.3, 0.7]" box (inclusive within tol)
+    hand = np.nonzero(np.all((p >= 0.3 - 1e-9) & (p <= 0.7 + 1e-9), axis=1))[0]
+    assert np.array_equal(np.sort(idx), np.sort(hand))
+    assert len(idx) > 0, "the central box must capture interior tet nodes"

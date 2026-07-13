@@ -254,17 +254,20 @@ def _has_unknown_derivative(node, unknown):
 
 
 def _mesh_nodes_in(pts, geom):
-    """Indices of the mesh nodes ``pts`` inside a shapely region ``geom`` — resolves a geometric region
-    (registered via ``domain.region(name, geom)``) to a node subset for pinning/solving on a subdomain."""
-    from shapely.geometry import Point
+    """Indices of the mesh nodes ``pts`` inside a geometric region ``geom`` (registered via
+    ``domain.region(name, region)``) — resolves the region to a node subset for pinning/solving on a
+    subdomain. A ``jno.Shape`` uses the analytic, shapely-free :meth:`Shape.contains` (2-D and 3-D — the
+    primary path); a shapely geometry falls back to shapely (2-D mesh-conforming regions in
+    ``polygon_domain``, which stay shapely by scope)."""
+    from .geometry import Shape
 
-    g = geom.buffer(1e-9)
-    try:  # vectorized fast path (shapely >= 2.0.2), fall back to per-point containment
+    p = np.asarray(pts)
+    if isinstance(geom, Shape):
+        mask = np.asarray(geom.contains(p[:, : geom.dim]))
+    else:
         import shapely
 
-        mask = np.asarray(shapely.contains_xy(g, np.asarray(pts)[:, 0], np.asarray(pts)[:, 1]))
-    except (ImportError, AttributeError):
-        mask = np.array([g.contains(Point(float(q[0]), float(q[1]))) for q in np.asarray(pts)])
+        mask = np.asarray(shapely.contains_xy(geom.buffer(1e-9), p[:, 0], p[:, 1]))
     return np.nonzero(mask)[0].astype(int)
 
 
