@@ -3362,8 +3362,15 @@ class TrialFunction(Placeholder):
         Positional coordinates bind to ``x`` / ``y`` / ``z`` in order; extra
         keyword bindings (e.g. ``t=...``) pass through. ``u(x, y)`` is sugar for
         ``u.bind(x=x, y=y)`` so the same gesture works as in a PINN (``net(x)``).
+
+        A **temporal** variable passed positionally is dropped, not bound: the region
+        already carries the time (``"initial"`` is the t=0 slice; a boundary region spans
+        every step), and there is no spatial axis for it to occupy. This is what makes
+        ``u(*dom.variable(tag))`` safe — ``dom.variable`` hands back ``(x, y, t)``, and
+        without the filter the ``t`` would silently bind to ``z``.
         """
-        binding = {axis: c for axis, c in zip(("x", "y", "z"), coords)}
+        spatial = [c for c in coords if getattr(c, "axis", "spatial") != "temporal"]
+        binding = {axis: c for axis, c in zip(("x", "y", "z"), spatial)}
         binding.update(named)
         if not binding:
             raise TypeError(f"{type(self).__name__} must be called with coordinate variables, e.g. u(x, y).")
@@ -3498,8 +3505,12 @@ class TestFunction(Placeholder):
         Positional coordinates bind to ``x`` / ``y`` / ``z`` in order; extra
         keyword bindings pass through. ``phi(x, y)`` is sugar for
         ``phi.bind(x=x, y=y)``.
+
+        As for the trial function, a **temporal** variable passed positionally is dropped
+        rather than bound to a spatial axis — the region carries the time.
         """
-        binding = {axis: c for axis, c in zip(("x", "y", "z"), coords)}
+        spatial = [c for c in coords if getattr(c, "axis", "spatial") != "temporal"]
+        binding = {axis: c for axis, c in zip(("x", "y", "z"), spatial)}
         binding.update(named)
         if not binding:
             raise TypeError(f"{type(self).__name__} must be called with coordinate variables, e.g. phi(x, y).")
