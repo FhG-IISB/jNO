@@ -277,7 +277,17 @@ def _active_model_lids(exprs):
     Used by substep training to determine which models have non-zero gradient
     potential for a given subset of constraints.
     """
-    active: set = set()
+    return set(_reachable_models(exprs))
+
+
+def _reachable_models(exprs) -> Dict[int, Any]:
+    """Map ``layer_id -> Model`` for every Model reachable without crossing stop_gradient.
+
+    The model objects themselves (not just their ids) are what ``Placeholder.eval()``
+    needs, to tell a frozen parameter (safe: baked into the assembly as a constant)
+    from a trainable one (unsafe: its trained weights live in the core that trained it).
+    """
+    active: dict = {}
     seen: set = set()
 
     def _walk(node):
@@ -288,13 +298,13 @@ def _active_model_lids(exprs):
         if isinstance(node, FunctionCall) and node.fn is jax.lax.stop_gradient:
             return
         if isinstance(node, ModelCall):
-            active.add(node.model.layer_id)
+            active[node.model.layer_id] = node.model
             for arg in node.args:
                 if isinstance(arg, Placeholder):
                     _walk(arg)
             return
         if isinstance(node, Model):
-            active.add(node.layer_id)
+            active[node.layer_id] = node
             return
         if isinstance(node, BinaryOp):
             _walk(node.left)

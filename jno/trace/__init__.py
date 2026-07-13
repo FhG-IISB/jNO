@@ -554,6 +554,56 @@ class Placeholder:
     def T(self) -> FunctionCall:
         return FunctionCall(lambda x: x.T, [self], "transpose", True)
 
+    def eval(self, domain=None):
+        """Eagerly evaluate this node and return the array — no ``jno.core`` boilerplate.
+
+        The domain is taken from the graph (a ``fem.solve()`` node records the domain it
+        discretizes, a ``Variable`` the domain it was sampled from), so the common case is
+        just::
+
+            u = jno.fem([...]).solve()
+            arr = u.eval()                  # instead of jno.core([u]).eval(u)
+
+        Pass ``domain=`` to re-sample the expression's ``Variable``\\s on a *different*
+        domain — e.g. a finer grid to plot a trained network on::
+
+            arr = (net(x, y)).eval(domain=finer)
+
+        This re-samples points; it does **not** re-discretize. A ``fem.solve()`` node owns
+        the mesh it was assembled on, so ``domain=`` is rejected there (it would otherwise
+        silently hand back the original coarse solve) — rebuild the ``jno.fem`` on the new
+        domain instead.
+
+        **Trainable parameters are rejected.** A trained parameter's weights live in the
+        ``core`` that trained it; evaluating here would spin up a fresh core, re-run the
+        initializers, and silently return the value at the *initial guess*. Read those back
+        through the core that owns them — ``crux.eval(node)``. Frozen parameters are fine:
+        they are baked into the assembly as constants.
+        """
+        import jno
+
+        from ..core import _infer_domain_from_constraints, _reachable_models
+
+        trainable = [m for m in _reachable_models([self]).values() if not getattr(m, "_frozen", False)]
+        if trainable:
+            labels = ", ".join(sorted(getattr(m, "_parameter_name", None) or f"layer_{m.layer_id}" for m in trainable))
+            raise ValueError(
+                f"Placeholder.eval(): the graph contains trainable parameter(s) [{labels}], whose trained "
+                "weights live in the core that trained them — a fresh core would re-initialize them and "
+                "silently return the initial guess. Use `crux.eval(node)` on the core that trained them "
+                "(or `.freeze()` the parameter to bake its current value in)."
+            )
+
+        own = getattr(self, "_domain", None)
+        if domain is not None and own is not None and domain is not own:
+            raise ValueError(
+                "Placeholder.eval(domain=...): this node is a solve node — it owns the mesh it was "
+                "assembled on, so a different domain cannot re-discretize it (you would silently get the "
+                "original solve back). Rebuild the `jno.fem([...])` on the new domain and solve that."
+            )
+        dom = domain if domain is not None else _infer_domain_from_constraints([self])
+        return jno.core([self], domain=dom).eval(self, domain=dom)
+
     # ------------------------------------------------------------------
     # Native complex-dtype helpers (work on jnp.complex64/complex128)
     # ------------------------------------------------------------------
