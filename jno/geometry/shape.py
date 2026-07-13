@@ -20,7 +20,29 @@ import math
 from dataclasses import dataclass, field
 from typing import Callable, FrozenSet, Tuple, Union
 
+import numpy as np
+
 from .primitives import Box, Cylinder, Disk, Polygon, Rect, Sphere
+
+
+def _node_contains(node, pts, tol):
+    """Analytic point membership over the CSG tree — leaves + cut/fuse/inter, no gmsh."""
+    kind = node[0]
+    if kind == "leaf":
+        return np.asarray(node[1].contains(pts, tol), dtype=bool)
+    if kind == "cut":
+        return _node_contains(node[1]._node, pts, tol) & ~_node_contains(node[2]._node, pts, tol)
+    if kind == "fuse":
+        return _node_contains(node[1]._node, pts, tol) | _node_contains(node[2]._node, pts, tol)
+    if kind == "inter":
+        return _node_contains(node[1]._node, pts, tol) & _node_contains(node[2]._node, pts, tol)
+    raise NotImplementedError(
+        f"Shape.contains supports the analytic CSG subset — primitive leaves combined by "
+        f"'-'/'|'/'&' (cut/fuse/inter); a {kind!r} solid (extrude/revolve/sweep/fillet/translate/"
+        f"rotate) has no closed-form point membership. Tag that region another way, or add its "
+        f"inverse transform here."
+    )
+
 
 # Unique, identity-stable key per primitive leaf, for provenance (``edges_from``).
 _LEAF_KEYS = itertools.count()
@@ -202,6 +224,19 @@ class Shape:
 
     def keys(self) -> FrozenSet[int]:
         return frozenset(k for _, _, k in self.leaves())
+
+    def contains(self, points, tol: float = 1e-9):
+        """Boolean mask over ``points`` (shape ``(N, dim)``): which lie inside this shape.
+
+        Analytic CSG membership evaluated host-side with numpy — primitive leaves combined by ``-``
+        (cut), ``|`` (fuse), ``&`` (inter) — so it needs no gmsh and works in 2-D and 3-D alike. This is
+        the shapely-free point-in-region test that resolves a geometric ``domain.region(name, shape)`` to
+        a mesh-node subset for a subdomain / domain-decomposition solve. Inclusive within ``tol`` (the
+        analogue of shapely's ``buffer(1e-9)``), so nodes exactly on a face count as inside. A shape
+        carrying a non-CSG transform (``extrude``/``revolve``/``sweep``/``fillet``/``translate``/
+        ``rotate``) has no closed-form membership and raises :class:`NotImplementedError`."""
+        pts = np.asarray(points, dtype=float)
+        return _node_contains(self._node, pts, float(tol))
 
     # ----- boundary selection ----------------------------------------------------
     def edge(self, name: str) -> Selector:
