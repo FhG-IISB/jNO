@@ -106,8 +106,9 @@ def _build_periodic_problem(dx=0.4):
 # Inference (no fmmax needed)
 # ------------------------------------------------------------------------------------
 def test_infer_spec_from_periodic_problem():
-    constraints, eps = _build_periodic_problem()
-    rc = jno.rcwa(constraints, eps, orders=100, wavelength=WL, grid=16, nz=33)
+    """Everything — period, layers, permittivity AND wavelength — inferred from the constraint list."""
+    constraints, _ = _build_periodic_problem()
+    rc = jno.rcwa(constraints, orders=100, grid=16, nz=33)  # no eps, no wavelength
     s = rc.spec
     # periodicity + period from the Floquet ties
     assert abs(s.period[0] - 2.4) < 1e-6 and abs(s.period[1] - 2.4) < 1e-6
@@ -116,26 +117,33 @@ def test_infer_spec_from_periodic_problem():
     assert len(s.layers) == 3, [ly[0] for ly in s.layers]
     assert s.layers[0][0] == INF and s.layers[-1][0] == INF
     assert abs(s.layers[1][0] - 0.35) < 0.12, s.layers[1][0]
-    # patterned layer eps at rho=0 -> 1 + 0.5*(EMAX-1) = 3.5; ambients are air
+    # relative permittivity recovered: patterned layer -> 3.5 at rho=0; ambients are vacuum (1.0)
     assert abs(float(np.real(s.layers[1][1]).max()) - 3.5) < 0.05
-    assert abs(float(np.real(s.layers[0][1]).max()) - 1.0) < 0.05
+    assert abs(float(np.real(s.layers[0][1]).max()) - 1.0) < 0.02
+    # wavelength inferred from the vacuum superstrate (k0 = 2*pi -> lambda = 1)
+    assert abs(s.wavelength - 1.0) < 1e-3
     # normally-incident source read off the bottom face
     assert s.k_in == (0.0, 0.0)
-    assert s.wavelength == WL
     assert s.source_face in ("bottom", "top")
+
+
+def test_explicit_wavelength_override():
+    constraints, _ = _build_periodic_problem()
+    rc = jno.rcwa(constraints, orders=100, wavelength=WL, grid=16, nz=33)
+    assert abs(rc.spec.wavelength - WL) < 1e-9
 
 
 def test_non_periodic_problem_raises():
     """A finite aperture (absorbing side walls, no ties) must be rejected, never silently periodicised."""
-    constraints, eps = _build_periodic_problem()
+    constraints, _ = _build_periodic_problem()
     non_periodic = constraints[:3]  # drop the two periodic ties
     with pytest.raises(jno.RcwaError, match="periodic"):
-        jno.rcwa(non_periodic, eps, orders=100, wavelength=WL, grid=16, nz=33)
+        jno.rcwa(non_periodic, orders=100, grid=16, nz=33)
 
 
 def test_bad_problem_type_raises():
     with pytest.raises(jno.RcwaError, match="constraint list"):
-        jno.rcwa(42, None, orders=10, wavelength=WL)
+        jno.rcwa(42, orders=10)
 
 
 # ------------------------------------------------------------------------------------
@@ -207,8 +215,8 @@ def test_engine_requires_assume_periodic():
 @needs_fmmax
 def test_infer_and_solve_end_to_end():
     """The full path: infer from the periodic problem, then solve — energy must be conserved."""
-    constraints, eps = _build_periodic_problem()
-    rc = jno.rcwa(constraints, eps, orders=100, wavelength=WL, grid=32, nz=33)
+    constraints, _ = _build_periodic_problem()
+    rc = jno.rcwa(constraints, orders=100, grid=32, nz=33)
     sol = rc.solve()
     T, R = sol.efficiency("T"), sol.efficiency("R")
     assert T + R <= 1.0 + 5e-3 and T >= 0 and R >= 0

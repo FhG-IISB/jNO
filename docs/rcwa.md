@@ -18,12 +18,11 @@ pip install jax-neural-operators[rcwa]      # or:  pixi run -e rcwa ...
 ## The front door — infer the problem from a jNO constraint list
 
 Hand `jno.rcwa` the **same constraint list you would give [`jno.fem`](fem.md)** (or an already-built
-`FEM`) together with the permittivity expression `eps`; it reads everything else out of the traced
-problem:
+`FEM`). Nothing else is required — it reads everything out of the traced problem:
 
 ```python
-rc  = jno.rcwa(constraints, eps, orders=300, wavelength=1.0)
-sol = rc.solve()                 # period, layers, ambients, source, incidence all inferred
+rc  = jno.rcwa(constraints, orders=300)
+sol = rc.solve()                 # period, layers, permittivity, wavelength, incidence all inferred
 sol.efficiency("T")              # transmitted power fraction
 sol.order(+1, 0)                 # a specific diffraction order
 
@@ -36,16 +35,16 @@ What is inferred from the problem, and from where:
 |---|---|
 | **periodicity + period `(Px,Py)`** | the Floquet ties `u(left)-u(right)`, `u(front)-u(back)` — **absent ⇒ raise**, never assumed |
 | **super/substrate ambients** | the two z-normal radiation faces |
-| **layer stack** | `eps` sampled along z, then grouped by [`detect_layers`](#layer-detection) |
+| **permittivity** | the `K0²·ε` coefficient recovered from the scalar Helmholtz volume term, sampled along z, then grouped by [`detect_layers`](#layer-detection) |
+| **wavelength / `k0`** | the coefficient's value in the vacuum superstrate (`k0 = √coeff`); pass `wavelength=` to override |
 | **incident wave** (lit face + angle `k_in`) | the assembled forcing `b` — a constant-phase source ⇒ normal incidence |
 
-Two arguments stay explicit, on purpose:
-
-- **`eps`** — isolating one coefficient sub-tree from an *assembled* weak form is not supported yet, so
-  the permittivity expression is passed directly (you already hold it — it is the design variable).
-  Because it is the same traced `eps`, its dependence on a trainable `jno.np.parameter` carries through,
-  so inverse design flows unchanged.
-- **`wavelength`** — a bare-float `k0` is not an identifiable node in the trace, so `λ` is passed in.
+The permittivity is recovered by splitting the volume weak form `∇u·∇v − K0²·ε·u·v`: the stiffness
+summands carry trial/test inside `Jacobian` nodes, the mass summand carries them as bare values, so
+dropping the `u·v` factor leaves `K0²·ε`. Because it is the same traced coefficient, its dependence on
+a trainable `jno.np.parameter` carries through, so inverse design flows unchanged. Only `orders` (a
+numerical truncation choice) is genuinely the user's; `wavelength` is an optional override for the case
+where no ambient is vacuum.
 
 Because RCWA solves the *infinitely periodic* problem, a finite aperture (absorbing side walls, no
 ties) is **rejected** rather than silently periodicised — exactly the difference between a supercell
@@ -95,7 +94,9 @@ a-Si). Correctness is checked against the analytic Fresnel/transfer-matrix trans
 
 - an `as_precond` path so RCWA can serve as the layered-background preconditioner `M⁻¹ = A₀⁻¹` for the
   large 3-D FEM complex-Helmholtz solve, once the FEM↔grid transfer is wired;
-- auto-inference of `eps` (a general `eps.at(coords)` primitive) and of `k0`, so both become optional.
+- a differentiable sampling path (currently the permittivity is evaluated on the grid with the
+  parameter's current value; threading the gradient through would let RCWA drive inverse design directly);
+- support beyond the scalar isotropic Helmholtz volume term (vector/anisotropic media).
 
 ## References
 

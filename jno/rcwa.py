@@ -8,19 +8,18 @@ canonical case — this is far cheaper than a full 3-D volumetric solve.
 Two entry points, both on `jno.rcwa`:
 
 * **From a jNO problem (the front door).** Hand it the same constraint list you would give
-  :func:`jno.fem` (or the already-built ``FEM``) together with the permittivity expression ``eps``;
-  RCWA reads the rest out of the traced problem::
+  :func:`jno.fem` (or the already-built ``FEM``) — nothing else is required::
 
-      rc  = jno.rcwa(constraints, eps, orders=300, wavelength=1.0)
-      sol = rc.solve()                     # period, layers, ambients, source, incidence all inferred
+      rc  = jno.rcwa(constraints, orders=300)
+      sol = rc.solve()                     # everything inferred from the traced problem
       rc.spec                              # the inferred RcwaSpec (available without fmmax)
 
   Inferred from the problem: **periodicity + period** (from the Floquet ties — absent ⇒ raise, never
-  assumed), the **super/substrate ambients** (the z-normal radiation faces), the **layer stack**
-  (``eps`` sampled along z, then :func:`detect_layers`), and the **incident wave** (illuminated face +
-  transverse angle ``k_in``, read from the assembled forcing). ``eps`` is passed explicitly because
-  isolating one coefficient sub-tree from an assembled weak form is not supported yet; ``wavelength``
-  is passed because a bare-float ``k0`` is not an identifiable node in the trace.
+  assumed), the **super/substrate ambients** (the z-normal radiation faces), the **permittivity**
+  (the ``K0**2*eps`` coefficient recovered from the scalar Helmholtz volume term, sampled along z and
+  grouped by :func:`detect_layers`), the **wavelength** (``k0`` from the vacuum superstrate, or pass
+  ``wavelength=`` to override), and the **incident wave** (illuminated face + transverse angle
+  ``k_in``, read from the assembled forcing).
 
 * **Explicit layers (the backend).** :class:`Rcwa` takes a hand-built ``[(thickness, eps), ...]`` stack;
   this is what the front door constructs internally.
@@ -386,27 +385,98 @@ def _param_zeros(femobj, eps):
     return out
 
 
-def _eval_eps_nodes(eps, domain, params):
-    """Evaluate the eps expression at every mesh node (where nodal parameters align)."""
+def _eval_expr_nodes(node, domain):
+    """Evaluate a coefficient expression at every mesh node (nodal parameters use their current value)."""
     import jax.numpy as jnp
 
     from jno.trace import Variable
     from jno.trace_evaluator import TraceEvaluator
 
     node_coords = jnp.asarray(np.asarray(domain.points))
-    table = {}
-    for mc in _model_calls(eps):
-        m = mc.model
-        mod = m.module
-        name = getattr(m, "_parameter_name", None)
-        if name is not None and name in params:
-            import equinox as eqx
-
-            mod = eqx.tree_at(lambda mm: mm.value, mod, jnp.asarray(params[name]))
-        table[m.layer_id] = mod
-    tags = {v.tag for v in _walk_nodes(eps) if isinstance(v, Variable)}
+    table = {mc.model.layer_id: mc.model.module for mc in _model_calls(node)}
+    tags = {v.tag for v in _walk_nodes(node) if isinstance(v, Variable)}
     ctx = {t: node_coords for t in tags} if tags else {}
-    return np.asarray(TraceEvaluator(table).evaluate(eps, context=ctx)).reshape(-1)
+    return np.asarray(TraceEvaluator(table).evaluate(node, context=ctx)).reshape(-1)
+
+
+# --- recover the permittivity coefficient (K0^2 * eps) from the volume weak form ------------------
+def _add_split(node, sign=1, out=None):
+    """Flatten a tree of +/- into signed additive summands."""
+    from jno.trace import BinaryOp
+
+    if out is None:
+        out = []
+    if isinstance(node, BinaryOp) and node.op in ("+", "-"):
+        _add_split(node.left, sign, out)
+        _add_split(node.right, sign if node.op == "+" else -sign, out)
+    else:
+        out.append((sign, node))
+    return out
+
+
+def _mul_factors(node, out=None):
+    """Flatten a product tree into its multiplicative factors."""
+    from jno.trace import BinaryOp
+
+    if out is None:
+        out = []
+    if isinstance(node, BinaryOp) and node.op == "*":
+        _mul_factors(node.left, out)
+        _mul_factors(node.right, out)
+    else:
+        out.append(node)
+    return out
+
+
+def _volume_constraint(femobj):
+    cls = list(getattr(femobj, "classification", []))
+    cons = list(getattr(femobj, "_constraints", []))
+    vols = [c for c, k in zip(cons, cls) if k == "volume"]
+    if len(vols) != 1:
+        raise RcwaError(
+            f"expected exactly one volume weak-form term, found {len(vols)} (classification={cls}); "
+            "RCWA infers the permittivity from a single scalar Helmholtz volume term."
+        )
+    return vols[0]
+
+
+def _extract_permittivity_coeff(volume_term):
+    """Pull the value-channel (mass) coefficient ``K0**2 * eps`` out of a scalar Helmholtz volume term.
+
+    A Helmholtz volume form is ``grad(u).grad(v) - K0**2 * eps * (u*v)``: the stiffness summands carry
+    trial/test inside ``Jacobian`` nodes, while the mass summand carries them as bare TrialFunction /
+    TestFunction values. We split additively, find the summand with bare trial x test, and drop those
+    two factors — what remains is ``K0**2 * eps``.
+    """
+    import functools
+    import operator
+
+    from jno.trace import TestFunction, TrialFunction
+
+    expr = getattr(volume_term, "expr", volume_term)
+    mass = []
+    for _sign, summand in _add_split(expr):
+        fac = _mul_factors(summand)
+        tv = [f for f in fac if isinstance(f, TrialFunction)]
+        te = [f for f in fac if isinstance(f, TestFunction)]
+        if not (tv and te):
+            continue  # stiffness / other channel
+        for f in tv + te:
+            if getattr(f, "value_shape", ()) != ():
+                raise RcwaError(
+                    "RCWA infers permittivity from a SCALAR Helmholtz term, but this field is "
+                    f"vector/tensor (value_shape={f.value_shape}). Scalar problems only for now."
+                )
+        coeff_factors = [f for f in fac if not isinstance(f, (TrialFunction, TestFunction))]
+        if not coeff_factors:
+            raise RcwaError("mass term has no coefficient factor; cannot recover permittivity.")
+        mass.append(functools.reduce(operator.mul, coeff_factors))
+    if not mass:
+        raise RcwaError(
+            "could not find a K0^2*eps*(u*v) mass term in the volume weak form; RCWA needs a scalar "
+            "Helmholtz term. If the permittivity is authored unusually, isolate it as a named coefficient."
+        )
+    return functools.reduce(operator.add, mass)
 
 
 def _sample_grid(domain, eps_nodes, grid, nz, period, z_range):
@@ -494,24 +564,28 @@ class _RcwaProblem:
         return eng.solve()
 
 
-def rcwa(problem, eps, *, orders, wavelength, grid=64, nz=64, slices=None, formulation="JONES_DIRECT_FOURIER"):
-    """Infer and build an RCWA problem from a jNO constraint list (or built ``FEM``) plus ``eps``.
+def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, formulation="JONES_DIRECT_FOURIER"):
+    """Infer and build an RCWA problem from a jNO constraint list (or built ``FEM``).
+
+    Everything is read out of the traced problem: **periodicity + period** (Floquet ties — absent ⇒
+    raise), the **super/substrate ambients**, the **permittivity** (the ``K0**2*eps`` coefficient
+    recovered from the scalar Helmholtz volume term, sampled along z), the **wavelength** (``k0`` from
+    the vacuum superstrate, unless ``wavelength`` is given), and the **incident wave** (illuminated face
+    + transverse angle ``k_in``, from the assembled forcing).
 
     Parameters
     ----------
     problem:
         The same constraint list you would pass to :func:`jno.fem`, or an already-built ``FEM``.
-    eps:
-        The permittivity expression (the traced coefficient, may depend on a trainable parameter).
     orders:
         Fourier truncation for the modal solve.
     wavelength:
-        Free-space wavelength (same length unit as the geometry). Passed explicitly — a bare-float
-        ``k0`` is not an identifiable node in the trace.
+        Free-space wavelength (same length unit as the geometry). Optional — inferred from the
+        superstrate (assumed vacuum) when omitted. Pass it to override or if no ambient is vacuum.
     grid, nz:
         Transverse resolution and number of z-samples used to detect the layer stack.
     slices:
-        Staircase a continuously-varying ``eps`` into this many layers instead of raising.
+        Staircase a continuously-varying permittivity into this many layers instead of raising.
 
     Returns
     -------
@@ -525,24 +599,38 @@ def rcwa(problem, eps, *, orders, wavelength, grid=64, nz=64, slices=None, formu
     pts = np.asarray(domain.points)
     z_range = (float(pts[:, 2].min()), float(pts[:, 2].max()))
 
-    params = _param_zeros(femobj, eps)
-    eps_nodes = _eval_eps_nodes(eps, domain, params)
-    if np.iscomplexobj(eps_nodes) and np.max(np.abs(eps_nodes.imag)) < 1e-9:
-        eps_nodes = eps_nodes.real.astype(complex)
-    E, zs = _sample_grid(domain, eps_nodes, grid, nz, period, z_range)
-    layers = detect_layers(E, zs, slices=slices)
+    # permittivity coefficient K0^2 * eps, recovered from the volume weak form (no assembly, no eps arg)
+    coeff_node = _extract_permittivity_coeff(_volume_constraint(femobj))
+    coeff_nodes = _eval_expr_nodes(coeff_node, domain)
+    if np.iscomplexobj(coeff_nodes) and np.max(np.abs(coeff_nodes.imag)) < 1e-9:
+        coeff_nodes = coeff_nodes.real.astype(complex)
+    C, zs = _sample_grid(domain, coeff_nodes, grid, nz, period, z_range)
+    coeff_layers = detect_layers(C, zs, slices=slices)
 
     face_z, k_in = _source_kin(femobj, domain)
-    source_face = (
-        bottom
-        if abs(face_z - _region_centroid(domain, bottom)[2]) < abs(face_z - _region_centroid(domain, top)[2])
-        else top
-    )
+    source_at_bottom = abs(face_z - _region_centroid(domain, bottom)[2]) < abs(face_z - _region_centroid(domain, top)[2])
+    source_face = bottom if source_at_bottom else top
+
+    # orient so the incident (source-side) ambient is layers[0] = superstrate
+    if not source_at_bottom:
+        coeff_layers = list(reversed(coeff_layers))
+    # k0 from the superstrate (vacuum ⇒ coeff = k0^2), unless wavelength is given
+    super_coeff = float(np.real(coeff_layers[0][1]).mean())
+    if wavelength is not None:
+        k0 = 2 * np.pi / float(wavelength)
+    elif super_coeff <= 0:
+        raise RcwaError(
+            "cannot infer wavelength: the superstrate permittivity coefficient is non-positive; pass wavelength=."
+        )
+    else:
+        k0 = float(np.sqrt(super_coeff))
+    k0sq = k0 * k0
+    layers = [(t, np.asarray(e) / k0sq) for t, e in coeff_layers]  # relative permittivity
 
     spec = RcwaSpec(
         period=period,
         layers=layers,
-        wavelength=float(wavelength),
+        wavelength=2 * np.pi / k0,
         k_in=k_in,
         source_face=source_face,
         ambient_faces=(bottom, top),
