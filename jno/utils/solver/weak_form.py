@@ -639,6 +639,7 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
         linearish = {
             "inner",
             "dot",
+            "cross",  # n×u is linear in u (the normal is a constant); the genuine bilinear case is caught below
             "reshape",
             "transpose",
             "getitem",
