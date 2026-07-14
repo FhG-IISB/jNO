@@ -278,11 +278,18 @@ class Rcwa:
         ex = fm.generate_expansion(lv, approximate_num_terms=self.orders)
         nt = ex.num_terms
 
+        def _grid(g):
+            g = jnp.asarray(g) + 0j  # jax-native so a permittivity grid flows -> differentiable in ε
+            return jnp.full((1, 1), g) if g.ndim == 0 else g
+
         def solve_layer(e):
-            eg = jnp.asarray(e) + 0j  # jax-native: a jax permittivity grid flows -> differentiable in eps
-            if eg.ndim == 0:
-                eg = jnp.full((1, 1), eg)
-            return fm.eigensolve_isotropic_media(jnp.asarray(wl), kin, lv, eg, ex, formulation=self.formulation)
+            # anisotropic layer: e = (ε_xx, ε_xy, ε_yx, ε_yy, ε_zz) grids -> fmmax's anisotropic eigensolve
+            if isinstance(e, tuple) and len(e) == 5:
+                exx, exy, eyx, eyy, ezz = (_grid(c) for c in e)
+                return fm.eigensolve_anisotropic_media(
+                    jnp.asarray(wl), kin, lv, exx, exy, eyx, eyy, ezz, ex, formulation=self.formulation
+                )
+            return fm.eigensolve_isotropic_media(jnp.asarray(wl), kin, lv, _grid(e), ex, formulation=self.formulation)
 
         layers = [solve_layer(e) for _, e in layers_spec]
         thick = [jnp.asarray(1.0 if t is None or t == np.inf else t) for t, _ in layers_spec]
@@ -519,12 +526,29 @@ def _extract_permittivity_coeff(volume_term):
             isinstance(a0, TestFunction) and isinstance(a1, TrialFunction)
         )
 
+    def _mass_matvec_matrix(f):  # inner(M @ u, v) with bare trial/test -> the tensor node M (anisotropic ε̂)
+        if not (isinstance(f, FunctionCall) and getattr(f, "_name", None) == "inner" and len(f.args) == 2):
+            return None
+
+        def _mv(x):  # matvec(M, u) with a bare trial -> M
+            if isinstance(x, FunctionCall) and getattr(x, "_name", None) == "matvec" and len(x.args) == 2:
+                return x.args[0] if isinstance(x.args[1], TrialFunction) else None
+            return None
+
+        a0, a1 = f.args
+        if (m := _mv(a0)) is not None and isinstance(a1, TestFunction):
+            return m
+        if (m := _mv(a1)) is not None and isinstance(a0, TestFunction):
+            return m
+        return None
+
     expr = getattr(volume_term, "expr", volume_term)
     mass = []
     for _sign, summand in _add_split(expr):
         fac = _mul_factors(summand)
         tv = [f for f in fac if isinstance(f, TrialFunction)]
         te = [f for f in fac if isinstance(f, TestFunction)]
+        matvec_f = next((f for f in fac if _mass_matvec_matrix(f) is not None), None)
         if tv and te:  # scalar Helmholtz mass: bare u * v
             if any(getattr(f, "value_shape", ()) != () for f in tv + te):
                 raise RcwaError(
@@ -532,6 +556,8 @@ def _extract_permittivity_coeff(volume_term):
                     "(a vector curl-curl form) rather than a raw component product."
                 )
             coeff_factors = [f for f in fac if not isinstance(f, (TrialFunction, TestFunction))]
+        elif matvec_f is not None:  # anisotropic Maxwell mass: inner(ε̂ @ u, v) -> coeff = (scalars) · ε̂
+            coeff_factors = [f for f in fac if f is not matvec_f] + [_mass_matvec_matrix(matvec_f)]
         elif any(_bare_mass_inner(f) for f in fac):  # vector Maxwell mass: inner(u, v)
             coeff_factors = [f for f in fac if not _bare_mass_inner(f)]
         else:
@@ -661,8 +687,27 @@ def _sample_grid_direct(coeff_node, grid, nz, period, z_range, params=None):
     zs = np.linspace(z_range[0], z_range[1], nz)
     GX, GY, GZ = np.meshgrid(xs, ys, zs, indexing="ij")
     pts = np.stack([GX.ravel(), GY.ravel(), GZ.ravel()], 1)
-    vals = np.asarray(_eval_coeff_points(coeff_node, pts, params or {})).reshape(grid, grid, nz)
+    vals = np.asarray(_eval_coeff_points(coeff_node, pts, params or {}))
+    if vals.ndim >= 3 and vals.shape[-2:] == (3, 3):  # anisotropic ε̂ -> layer-detect on the xx component
+        vals = vals[..., 0, 0]
+    vals = vals.reshape(grid, grid, nz)
     return np.moveaxis(vals, 2, 0).astype(complex), zs  # -> (nz, grid, grid)
+
+
+def _coeff_is_tensor(coeff_node, period, z_range, params):
+    """True if the permittivity coefficient is a 3×3 tensor (anisotropic ε̂) rather than a scalar — decided
+    by evaluating it once at a representative cell point and checking the value shape."""
+    pt = np.array([[period[0] * 0.5, period[1] * 0.5, 0.5 * (z_range[0] + z_range[1])]])
+    v = np.asarray(_eval_coeff_points(coeff_node, pt, params or {}))
+    return v.ndim >= 3 and v.shape[-2:] == (3, 3)
+
+
+def _tensor_components(coeff_node, period, grid, zmid, params, k0sq):
+    """The 5 relative-permittivity component grids (ε_xx, ε_xy, ε_yx, ε_yy, ε_zz) fmmax needs, sampled on the
+    unit-cell grid at height ``zmid`` from the K0²·ε̂ tensor coefficient (divided by k0²)."""
+    T = jnp.reshape(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmid), params), (grid, grid, 3, 3))
+    T = T / k0sq
+    return (T[..., 0, 0], T[..., 0, 1], T[..., 1, 0], T[..., 1, 1], T[..., 2, 2])
 
 
 def _sample_grid(domain, eps_nodes, grid, nz, period, z_range):
@@ -940,6 +985,7 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
     # (e.g. a K0 parameter that must be non-zero for the source to exist).
     cparams = _param_values(femobj, coeff_node)
     cparams.update({k: jnp.asarray(v) for k, v in (params or {}).items()})
+    is_aniso = _coeff_is_tensor(coeff_node, period, z_range, cparams)  # 3×3 ε̂ vs scalar ε
     if _has_nodal_field(coeff_node):  # per-node design field -> interpolate off the mesh
         coeff_nodes = _eval_expr_nodes(coeff_node, domain)
         if np.iscomplexobj(coeff_nodes) and np.max(np.abs(coeff_nodes.imag)) < 1e-9:
@@ -969,7 +1015,13 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
     else:
         k0 = float(np.sqrt(super_coeff))
     k0sq = k0 * k0
-    layers = [(t, np.asarray(e) / k0sq) for t, e in coeff_layers]  # relative permittivity
+    if is_aniso:  # relative-permittivity TENSOR per layer: (ε_xx, ε_xy, ε_yx, ε_yy, ε_zz)
+        layers = [
+            (t, tuple(np.asarray(c) for c in _tensor_components(coeff_node, period, grid, zm, cparams, k0sq)))
+            for (t, _), zm in zip(coeff_layers, zmids)
+        ]
+    else:
+        layers = [(t, np.asarray(e) / k0sq) for t, e in coeff_layers]  # relative permittivity (scalar)
 
     # differentiable re-sampling: re-evaluate the permittivity coefficient at each layer's representative z
     # from a parameter dict, so a design (jno.np.parameter) flows through the solve. Re-deriving the WHOLE
@@ -1006,12 +1058,24 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
 
             return {k: (gather(v) if k in nodal_names else jnp.asarray(v)) for k, v in params.items()}
 
-        sup = jnp.mean(jnp.real(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmids[0]), at(0))))
-        k0 = jnp.sqrt(sup)
-        out = []
-        for li, (thick, zmid) in enumerate(zip(thicks, zmids)):
-            cvals = jnp.reshape(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmid), at(li)), (grid, grid))
-            out.append((thick, jnp.real(cvals) / (k0 * k0)))
+        if is_aniso:  # k0 from the superstrate's xx (isotropic vacuum ⇒ xx = k0²); tensor components per layer
+            sup_xx = jnp.reshape(
+                _eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmids[0]), at(0)), (grid, grid, 3, 3)
+            )
+            k0 = jnp.sqrt(jnp.mean(jnp.real(sup_xx[..., 0, 0])))
+            out = [
+                (thick, _tensor_components(coeff_node, period, grid, zmid, at(li), k0 * k0))
+                for li, (thick, zmid) in enumerate(zip(thicks, zmids))
+            ]
+        else:
+            sup = jnp.mean(jnp.real(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmids[0]), at(0))))
+            k0 = jnp.sqrt(sup)
+            out = []
+            for li, (thick, zmid) in enumerate(zip(thicks, zmids)):
+                cvals = jnp.reshape(
+                    _eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmid), at(li)), (grid, grid)
+                )
+                out.append((thick, jnp.real(cvals) / (k0 * k0)))
         kin = _kin_from_source(src_coeff, period, src_z, params) if src_coeff is not None else jnp.asarray(k_in)
         return out, 2 * jnp.pi / k0, kin
 
