@@ -640,6 +640,8 @@ def _is_obviously_nonlinear_in_unknown(domain, expr):
             "inner",
             "dot",
             "cross",  # n×u is linear in u (the normal is a constant); the genuine bilinear case is caught below
+            "matvec",  # M @ u (anisotropic ε·E) and A @ B are linear in the unknown when the matrix is a coefficient
+            "matmul",
             "reshape",
             "transpose",
             "getitem",
