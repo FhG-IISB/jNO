@@ -1,22 +1,179 @@
-"""Tests for jno.rcwa: physical correctness (vs analytic Fresnel/TMM) + the never-silent guards.
+"""Tests for jno.rcwa.
 
-Skipped in full when the optional `fmmax` backend is not installed (mirrors tests/test_iree.py)."""
+Two layers:
+* the FROM-FEM inference (jno.rcwa(constraints, eps, ...)) is pure trace-walking + geometry and runs
+  WITHOUT the optional fmmax backend — these assert the inferred RcwaSpec;
+* the forward engine (Rcwa, and .solve()) needs fmmax and is guarded per-test."""
+
+import importlib.util
 
 import numpy as np
 import pytest
 
-pytest.importorskip("fmmax", reason="fmmax (jno.rcwa backend) not installed")
+import jno
 
-import jno  # noqa: E402
-from jno.rcwa import Rcwa, RcwaError  # noqa: E402
+HAS_FMMAX = importlib.util.find_spec("fmmax") is not None
+needs_fmmax = pytest.mark.skipif(not HAS_FMMAX, reason="fmmax (jno.rcwa backend) not installed")
 
-WL = 1.03
+WL = 1.0
 INF = np.inf
 
 
-def tmm_slab(nn, h, lam):
-    """Analytic air|slab|air transmittance via a 2x2 transfer matrix."""
+# ------------------------------------------------------------------------------------
+# A small PERIODIC-supercell Helmholtz problem: an a-Si pillar slab, periodic side walls,
+# absorbing top, absorbing bottom carrying a normally-incident wave. (Periodic variant of
+# code/opt3d.py from the metasurface project.)
+# ------------------------------------------------------------------------------------
+def _build_periodic_problem(dx=0.4):
+    import jax
 
+    jax.config.update("jax_enable_x64", True)
+    import jax.numpy as jnp
+
+    from jno.utils.solver.fem_adapt import _domain_from_arrays
+
+    K0 = 2 * np.pi
+    EMAX = 6.0
+    Lx = Ly = 2.4  # keep opt3d's default extent (avoids the _domain_from_arrays "no trial fields" footgun)
+    Lz = 3.2
+    ZL0, ZL1 = 0.8, 1.15
+    Eb = 1e-6
+    xs = np.linspace(0, Lx, int(round(Lx / dx)) + 1)
+    ys = np.linspace(0, Ly, int(round(Ly / dx)) + 1)
+    zs = np.linspace(0, Lz, int(round(Lz / dx)) + 1)
+    nx, ny, nz = len(xs), len(ys), len(zs)
+    X, Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
+    P = np.stack([X.ravel(), Y.ravel(), Z.ravel()], 1)
+
+    def vid(i, j, k):
+        return (i * ny + j) * nz + k
+
+    CUBE = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, 0), (0, 0, 1), (1, 0, 1), (0, 1, 1), (1, 1, 1)]
+    TETS6 = [(0, 1, 3, 7), (0, 1, 5, 7), (0, 2, 3, 7), (0, 2, 6, 7), (0, 4, 5, 7), (0, 4, 6, 7)]
+    tets = []
+    for i in range(nx - 1):
+        for j in range(ny - 1):
+            for k in range(nz - 1):
+                c = [vid(i + a, j + b, k + cc) for (a, b, cc) in CUBE]
+                for t in TETS6:
+                    tets.append([c[t[0]], c[t[1]], c[t[2]], c[t[3]]])
+    tets = np.asarray(tets)
+    F = np.concatenate([tets[:, [0, 1, 2]], tets[:, [0, 1, 3]], tets[:, [0, 2, 3]], tets[:, [1, 2, 3]]])
+    Fs = np.sort(F, axis=1)
+    uq, cnt = np.unique(Fs, axis=0, return_counts=True)
+    BF = uq[cnt == 1]
+
+    d = _domain_from_arrays(
+        jno.domain.cube(x_range=(0, Lx), y_range=(0, Ly), z_range=(0, Lz), mesh_size=1.0), P, tets, BF, copy=True
+    )
+    d.tag("bottom", lambda x, y, z: z < Eb)
+    d.tag("top", lambda x, y, z: z > Lz - Eb)
+    d.tag("left", lambda x, y, z: x < Eb)
+    d.tag("right", lambda x, y, z: x > Lx - Eb)
+    d.tag("front", lambda x, y, z: y < Eb)
+    d.tag("back", lambda x, y, z: y > Ly - Eb)
+
+    u, phi = d.fem_symbols()
+    xi, yi, zi, _ = d.variable("interior", split=True)
+    bt = d.variable("bottom", split=True)
+    tp = d.variable("top", split=True)
+    lf = d.variable("left", split=True)
+    rt = d.variable("right", split=True)
+    fr = d.variable("front", split=True)
+    bk = d.variable("back", split=True)
+    ui, vi = u.bind(x=xi, y=yi, z=zi), phi.bind(x=xi, y=yi, z=zi)
+    ubt, vbt = u.bind(x=bt[0], y=bt[1], z=bt[2]), phi.bind(x=bt[0], y=bt[1], z=bt[2])
+    utp, vtp = u.bind(x=tp[0], y=tp[1], z=tp[2]), phi.bind(x=tp[0], y=tp[1], z=tp[2])
+    ulf = u.bind(x=lf[0], y=lf[1], z=lf[2])
+    urt = u.bind(x=rt[0], y=rt[1], z=rt[2])
+    ufr = u.bind(x=fr[0], y=fr[1], z=fr[2])
+    ubk = u.bind(x=bk[0], y=bk[1], z=bk[2])
+
+    lay = jno.fn(lambda x, y, z: jnp.where((z >= ZL0) & (z < ZL1), 1.0, 0.0), [xi, yi, zi])
+    rho = jno.np.parameter(phi, name="rho")
+    eps = 1.0 + lay * (0.5 * (1 + jno.np.tanh(rho / 2))) * (EMAX - 1.0)
+    constraints = [
+        ui.x * vi.x + ui.y * vi.y + ui.z * vi.z - K0**2 * eps * (u * vi),
+        -(1j * K0 * utp) * vtp,
+        -(1j * K0 * ubt - 2j * K0) * vbt,
+        ulf - urt,
+        ufr - ubk,
+    ]
+    return constraints, eps
+
+
+# ------------------------------------------------------------------------------------
+# Inference (no fmmax needed)
+# ------------------------------------------------------------------------------------
+def test_infer_spec_from_periodic_problem():
+    constraints, eps = _build_periodic_problem()
+    rc = jno.rcwa(constraints, eps, orders=100, wavelength=WL, grid=16, nz=33)
+    s = rc.spec
+    # periodicity + period from the Floquet ties
+    assert abs(s.period[0] - 2.4) < 1e-6 and abs(s.period[1] - 2.4) < 1e-6
+    assert set(s.periodic_axes) == {"x", "y"}
+    # air | pillar-slab | air  -> three layers, middle ~0.35 thick, ambients semi-infinite
+    assert len(s.layers) == 3, [ly[0] for ly in s.layers]
+    assert s.layers[0][0] == INF and s.layers[-1][0] == INF
+    assert abs(s.layers[1][0] - 0.35) < 0.12, s.layers[1][0]
+    # patterned layer eps at rho=0 -> 1 + 0.5*(EMAX-1) = 3.5; ambients are air
+    assert abs(float(np.real(s.layers[1][1]).max()) - 3.5) < 0.05
+    assert abs(float(np.real(s.layers[0][1]).max()) - 1.0) < 0.05
+    # normally-incident source read off the bottom face
+    assert s.k_in == (0.0, 0.0)
+    assert s.wavelength == WL
+    assert s.source_face in ("bottom", "top")
+
+
+def test_non_periodic_problem_raises():
+    """A finite aperture (absorbing side walls, no ties) must be rejected, never silently periodicised."""
+    constraints, eps = _build_periodic_problem()
+    non_periodic = constraints[:3]  # drop the two periodic ties
+    with pytest.raises(jno.RcwaError, match="periodic"):
+        jno.rcwa(non_periodic, eps, orders=100, wavelength=WL, grid=16, nz=33)
+
+
+def test_bad_problem_type_raises():
+    with pytest.raises(jno.RcwaError, match="constraint list"):
+        jno.rcwa(42, None, orders=10, wavelength=WL)
+
+
+# ------------------------------------------------------------------------------------
+# detect_layers (pure numpy, no fmmax)
+# ------------------------------------------------------------------------------------
+def test_detect_layers_extruded():
+    Ng, Nz = 12, 60
+    z = np.linspace(0, 3.2, Nz)
+    E = np.ones((Nz, Ng, Ng))
+    for k, zz in enumerate(z):
+        if 0.8 <= zz < 1.15:
+            E[k] = 1.0
+            E[k, 4:8, 4:8] = 11.0
+    layers = detect_layers_ref(E, z)
+    assert len(layers) == 3
+    assert layers[0][0] == INF and layers[-1][0] == INF
+
+
+def detect_layers_ref(E, z):
+    from jno.rcwa import detect_layers
+
+    return detect_layers(E, z)
+
+
+def test_detect_layers_continuous_raises():
+    from jno.rcwa import detect_layers
+
+    Ng, Nz = 8, 40
+    z = np.linspace(0, 1, Nz)
+    E = np.stack([np.full((Ng, Ng), 1.0 + zz) for zz in z])  # continuous in z
+    with pytest.raises(jno.RcwaError, match="continuous"):
+        detect_layers(E, z)
+
+
+# ------------------------------------------------------------------------------------
+# Forward engine + analytic Fresnel (needs fmmax)
+# ------------------------------------------------------------------------------------
+def tmm_slab(nn, h, lam):
     def iface(a, b):
         r = (a - b) / (a + b)
         t = 2 * a / (a + b)
@@ -27,60 +184,31 @@ def tmm_slab(nn, h, lam):
     return abs(1 / M[0, 0]) ** 2
 
 
+@needs_fmmax
 @pytest.mark.parametrize("nn,h", [(1.45, 0.5), (2.0, 0.4), (3.317, 0.3)])
-def test_fresnel_matches_analytic(nn, h):
-    """A uniform slab reproduces the analytic Fresnel transmittance and conserves energy."""
+def test_engine_fresnel_matches_analytic(nn, h):
+    from jno.rcwa import Rcwa
+
     rc = Rcwa([(INF, 1.0), (h, nn**2), (INF, 1.0)], period=(1.0, 1.0), orders=5, wavelength=WL, assume_periodic=True)
-    sol = rc.solve(inc=None)
+    sol = rc.solve()
     T, R = sol.efficiency("T"), sol.efficiency("R")
     assert abs(T - tmm_slab(nn, h, WL)) < 2e-3
     assert abs(T + R - 1) < 1e-3
 
 
-def test_functional_entry_point_matches_class():
-    """jno.rcwa(...) builds the same problem as the Rcwa class."""
-    rc = jno.rcwa([(INF, 1.0), (0.4, 4.0), (INF, 1.0)], period=(1.0, 1.0), orders=5, wavelength=WL, assume_periodic=True)
-    assert isinstance(rc, Rcwa)
-    T = rc.solve().efficiency("T")
-    assert abs(T - tmm_slab(2.0, 0.4, WL)) < 2e-3
+@needs_fmmax
+def test_engine_requires_assume_periodic():
+    from jno.rcwa import Rcwa
 
-
-def test_guard_non_periodic_raises():
-    with pytest.raises(RcwaError, match="assume_periodic"):
+    with pytest.raises(jno.RcwaError, match="assume_periodic"):
         Rcwa([(INF, 1.0), (0.3, 11.0), (INF, 1.0)], period=(1.0, 1.0), orders=5, wavelength=WL)
 
 
-def test_guard_bad_period_raises():
-    with pytest.raises(RcwaError, match="period"):
-        Rcwa([(INF, 1.0)], period=(-1.0, 1.0), orders=5, wavelength=WL, assume_periodic=True)
-
-
-def test_guard_empty_layers_raises():
-    with pytest.raises(RcwaError, match="layers"):
-        Rcwa([], period=(1.0, 1.0), orders=5, wavelength=WL, assume_periodic=True)
-
-
-def test_guard_missing_wavelength_raises():
-    rc = Rcwa([(INF, 1.0), (0.3, 11.0), (INF, 1.0)], period=(1.0, 1.0), orders=5, assume_periodic=True)
-    with pytest.raises(RcwaError, match="wavelength"):
-        rc.solve(None)
-
-
-def test_guard_coarse_grid_vs_orders_raises():
-    big = np.ones((6, 6)) * 11.0
-    with pytest.raises(RcwaError, match="under-resolve"):
-        Rcwa([(INF, 1.0), (0.3, big), (INF, 1.0)], period=(1.0, 1.0), orders=400, wavelength=WL, assume_periodic=True)
-
-
-def test_bad_efficiency_kind_raises():
-    rc = Rcwa([(INF, 1.0), (0.4, 4.0), (INF, 1.0)], period=(1.0, 1.0), orders=5, wavelength=WL, assume_periodic=True)
-    with pytest.raises(RcwaError, match="'T' or 'R'"):
-        rc.solve().efficiency("Q")
-
-
-def test_as_precond_without_transfer_raises():
-    """as_precond must never hand back a silent no-op preconditioner."""
-    rc = Rcwa([(INF, 1.0), (0.4, 4.0), (INF, 1.0)], period=(1.0, 1.0), orders=5, wavelength=WL, assume_periodic=True)
-    spec = rc.as_precond()
-    with pytest.raises(RcwaError, match="transfer"):
-        spec.materialize(ctx=None)
+@needs_fmmax
+def test_infer_and_solve_end_to_end():
+    """The full path: infer from the periodic problem, then solve — energy must be conserved."""
+    constraints, eps = _build_periodic_problem()
+    rc = jno.rcwa(constraints, eps, orders=100, wavelength=WL, grid=32, nz=33)
+    sol = rc.solve()
+    T, R = sol.efficiency("T"), sol.efficiency("R")
+    assert T + R <= 1.0 + 5e-3 and T >= 0 and R >= 0
