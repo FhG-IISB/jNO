@@ -75,7 +75,12 @@ def _solid_polygon_visibility(domain, elem_tag, mids, normals, length):
     """Element-to-element visibility using the clean solid geometry: element *i* sees *j* iff the segment
     between their midpoints (nudged into the medium along the element normals) does not pass through any
     opaque solid region's interior. Uses ``domain._source_regions`` (the exact polygons), so it is immune
-    to mesh-classification slivers; correct for axisymmetric since a solid ring blocks every azimuth."""
+    to mesh-classification slivers. Exact for a genuinely 2-D (planar) enclosure. For an axisymmetric
+    enclosure this straight-line test is only the ``phi = 0`` (same-meridian) slice of the true 3-D
+    occlusion -- see :func:`_solid_polygon_visibility_3d`, which callers should use instead when
+    ``axisymmetric=True``; a solid ring does NOT block every azimuth in general (the true 3-D chord
+    between two rings bows closer to the axis than this flat projection as the azimuthal offset grows,
+    so a same-meridian block/non-block verdict does not transfer to other azimuths)."""
     from shapely.geometry import LineString
     from shapely.ops import unary_union
     from shapely.prepared import prep
@@ -100,6 +105,268 @@ def _solid_polygon_visibility(domain, elem_tag, mids, normals, length):
                     vis = 0.0
             vm[i, j] = vm[j, i] = vis
     return vm
+
+
+def _min_solid_thickness(geoms, hi: float) -> float:
+    """Thickness of the THINNEST opaque solid = 2 x its largest inscribed circle, by bisection on
+    ``buffer(-d)``. This is the length scale the chord-vs-solid test must resolve, and it is set by the
+    GEOMETRY (a 0.5 mm seed disc), not by the mesh -- which is exactly why neither the crossing-length
+    tolerance nor the sampling stride may be scaled to the element size."""
+    w = hi
+    for g in geoms:
+        lo, up = 0.0, float(min(g.bounds[2] - g.bounds[0], g.bounds[3] - g.bounds[1])) * 0.5 + 1e-12
+        for _ in range(24):  # bisect the largest d with a non-empty erosion = the inscribed radius
+            d = 0.5 * (lo + up)
+            if g.buffer(-d).is_empty:
+                up = d
+            else:
+                lo = d
+        w = min(w, 2.0 * lo)
+    return max(w, 1e-9)
+
+
+class _SolidSDF:
+    """Signed-distance field of the opaque-solid union on the ``(r, z)`` meridian (negative inside).
+
+    Exists to make the chord-vs-solid test both CORRECT and affordable, via sphere tracing (below).
+
+    Fixed-stride sampling of a chord cannot do that job: the stride has to be shorter than the thinnest
+    solid or the chord steps straight over it, and in a real furnace that ratio is brutal (a 0.5 mm seed
+    disc against ~500 mm chords needs ~3000 samples per chord, over ~650k pairs x n_phi azimuths). And a
+    missed wall is not a benign inaccuracy -- it is occlusion that silently does not happen, so the ray
+    passes THROUGH a solid, inflating F and pushing row sums past the physical bound of 1. Measured on the
+    cg furnace, a 16-sample chord test wrongly called 12% of all *visible* pairs visible.
+
+    A distance field fixes both at once: you may safely advance by the distance to the nearest solid,
+    because nothing can be hit within it. Steps are therefore LARGE in open space and shrink automatically
+    as a wall is approached -- and, crucially, a feature can never be skipped, whatever its size. That is
+    a correctness guarantee that no fixed stride can give.
+
+    This works because the solids are bodies of REVOLUTION: the 3-D distance from a point to a revolved
+    solid equals the 2-D distance from ``(r, z)`` to its meridian polygon, so one 2-D field serves the
+    full 3-D query.
+
+    Reference: J. C. Hart, "Sphere tracing: a geometric method for the antialiased ray tracing of implicit
+    surfaces", The Visual Computer 12 (1996) 527-545.
+    """
+
+    def __init__(self, union, bounds, cell: float, pad: float):
+        from scipy.ndimage import distance_transform_edt
+        from shapely.vectorized import contains as _vcontains
+
+        # The grid must span every point a CHORD can visit, not merely the solid's own bounding box: a
+        # query outside the grid is clamped to its edge, so a field sized to the solid alone reports a
+        # tiny clearance everywhere outside it, and the march then crawls and never arrives. `bounds` is
+        # therefore the union of the solid extent and the radiating elements' extent (a chord's meridian
+        # track stays inside the latter: rho(t) <= max(r_i, r_j) and z(t) lies between z_i and z_j).
+        r0 = min(union.bounds[0], bounds[0], 0.0) - pad  # include the axis: rho(t) can reach 0
+        z0 = min(union.bounds[1], bounds[1]) - pad
+        r1 = max(union.bounds[2], bounds[2]) + pad
+        z1 = max(union.bounds[3], bounds[3]) + pad
+        self.cell = float(cell)
+        self.r0, self.z0 = r0, z0
+        nr = int(np.ceil((r1 - r0) / cell)) + 1
+        nz = int(np.ceil((z1 - z0) / cell)) + 1
+        gr = r0 + (np.arange(nr) + 0.5) * cell
+        gz = z0 + (np.arange(nz) + 0.5) * cell
+        RR, ZZ = np.meshgrid(gr, gz, indexing="ij")
+        occ = np.asarray(_vcontains(union, RR.ravel(), ZZ.ravel())).reshape(nr, nz)
+        # signed: +distance to the solid outside it, -depth inside it
+        d_out = distance_transform_edt(~occ) * cell
+        d_in = distance_transform_edt(occ) * cell
+        self.sdf = (d_out - d_in).astype(np.float64)
+        self.nr, self.nz = nr, nz
+
+    def signed(self, r, z):
+        """Signed distance at ``(r, z)``. The grid spans the whole chord-reachable region, so a query can
+        only fall outside it by round-off; such points are far from any solid, hence a large clearance."""
+        fr = (r - self.r0) / self.cell
+        fz = (z - self.z0) / self.cell
+        ir = fr.astype(np.int32)
+        iz = fz.astype(np.int32)
+        ok = (ir >= 0) & (ir < self.nr) & (iz >= 0) & (iz < self.nz)
+        np.clip(ir, 0, self.nr - 1, out=ir)
+        np.clip(iz, 0, self.nz - 1, out=iz)
+        return np.where(ok, self.sdf[ir, iz], np.inf)
+
+
+def _chord_blocked(sdf, ri, zi, rj, zj, cphi, sphi, depth, max_iter=160):
+    r"""Sphere-trace the 3-D chord between two ring points; True where it penetrates a solid by ``depth``.
+
+    The chord runs from ``(ri, phi=0, zi)`` to ``(rj, phi, zj)`` in 3-D; its meridian track is
+    ``rho(t) = |(1-t) P_i + t P_j|_{xy}``, ``z(t) = (1-t) z_i + t z_j``. March ``t`` forward by the
+    clearance to the (eroded) solid at the current point, converted to a step in ``t`` via the chord's
+    true 3-D length. Because a step never exceeds the distance to the nearest solid, the march CANNOT
+    jump over one -- unlike a fixed stride, which silently skips anything thinner than itself.
+
+    Blocking is a **depth** criterion (``sdf < -depth``), not a crossing-length one: a chord that merely
+    grazes along a solid's own face never gets deep, while one that truly passes through the thinnest wall
+    reaches ``w/2`` at its mid-plane. Depth is also the right invariant for the endpoints, which sit ON
+    radiating surfaces (``sdf ~ 0``) and so are never mistaken for a crossing -- no nudging required.
+
+    **The grazing trap.** Sphere tracing converges only geometrically when a ray runs nearly PARALLEL to a
+    surface: if the clearance shrinks by a fraction ``k`` of the distance travelled, the march needs
+    ``~log(eps)/log(1-k)`` steps. On the cg furnace a chord skimming the 0.5 mm seed disc has ``k ~ 0.016``
+    -- over 400 steps. Capping the iteration count and then treating the survivors as VISIBLE silently
+    un-blocks every such ray, which is a hot-to-cold short circuit between surfaces that cannot see each
+    other at all (it connected the crucible's inner cavity to the outer walls THROUGH 30 mm of solid seed).
+    So rays that do not converge are NOT given a free pass: they fall back to a dense scan of whatever is
+    left of the chord. That is expensive per ray, but only a small minority ever get there.
+
+    Arrays broadcast over any leading shape; the endpoints may differ per element pair and per azimuth.
+    """
+    # broadcast endpoints AND azimuths together: the caller may vary phi per pair (graded rule) or hold
+    # it fixed across a whole (i, j) block (uniform rule), so neither shape may be resolved on its own.
+    ri, zi, rj, zj, cphi, sphi = np.broadcast_arrays(ri, zi, rj, zj, cphi, sphi)
+    # 3-D endpoints: P_i on the phi = 0 meridian, P_j rotated by phi
+    xj, yj = rj * cphi, rj * sphi
+    dx, dy, dz = xj - ri, yj, zj - zi
+    L = np.sqrt(dx * dx + dy * dy + dz * dz)
+    Lsafe = np.maximum(L, 1e-300)
+
+    def probe(tt, RI=None, ZI=None, DX=None, DY=None, DZ=None):
+        """sdf clearance (eroded by `depth`) at chord parameter tt, on the full array or a subset."""
+        RI = ri if RI is None else RI
+        ZI = zi if ZI is None else ZI
+        DX = dx if DX is None else DX
+        DY = dy if DY is None else DY
+        DZ = dz if DZ is None else DZ
+        x = RI + tt * DX
+        y = tt * DY
+        z = ZI + tt * DZ
+        return sdf.signed(np.sqrt(x * x + y * y), z) + depth
+
+    t = np.zeros(ri.shape, dtype=np.float64)
+    blocked = np.zeros(ri.shape, dtype=bool)
+    active = L > 1e-12
+    min_step = 0.5 * sdf.cell / Lsafe  # never stall: always advance at least half a cell
+    for _ in range(max_iter):
+        if not active.any():
+            break
+        g = probe(t)
+        hit = active & (g <= 0.0)
+        blocked |= hit
+        active &= ~hit
+        t = np.where(active, t + np.maximum(g / Lsafe, min_step), t)
+        active &= t < 1.0
+
+    # Rays still alive here never resolved -- they are grazing. Scan whatever is left of THEIR chords
+    # densely rather than declaring them visible. Operate on the compressed subset only: these are a tiny
+    # minority, and touching the whole array here would cost ~L/cell full-array probes (minutes, not ms).
+    idx = np.flatnonzero(active.ravel())
+    if idx.size:
+        f = lambda a: np.broadcast_to(a, ri.shape).ravel()[idx]  # noqa: E731
+        RI, ZI, DX, DY, DZ = f(ri), f(zi), f(dx), f(dy), f(dz)
+        t0 = t.ravel()[idx]
+        step = sdf.cell / np.maximum(f(L), 1e-300)  # never step past one cell -> cannot skip a feature
+        n_dense = int(min(np.ceil(1.0 / max(float(step.min()), 1e-12)), 20000))
+        hit_sub = np.zeros(idx.size, dtype=bool)
+        for s in range(1, n_dense + 1):
+            tt = np.minimum(t0 + s * step, 1.0)
+            hit_sub |= probe(tt, RI, ZI, DX, DY, DZ) <= 0.0
+            if (tt >= 1.0).all():
+                break
+        bl = blocked.ravel()
+        bl[idx] |= hit_sub
+        blocked = bl.reshape(ri.shape)
+    return blocked
+
+
+def _chord_test_setup(geoms, union, r, z):
+    """Build the signed-distance field and the penetration depth that counts as a block.
+
+    ``cell`` must resolve the THINNEST solid (``w/8``) -- never the mesh. Scaling the chord test to the
+    element size (as the legacy straight-line test's ``tol`` does) is a trap: a solid thinner than the
+    tolerance can then NEVER register as a block, at any sampling density. The cg furnace hits exactly
+    that, with a 0.5 mm seed disc against ~1.2 mm elements. It is also capped against the domain span, so a
+    geometry whose only solid is thick does not end up with an absurdly coarse field.
+
+    ``depth`` is the penetration that counts as opaque, and it must be a small NUMERICAL tolerance -- a
+    couple of raster cells -- not a fraction of the wall thickness. Testing ``sdf < -depth`` erodes every
+    solid by ``depth``, so a depth tied to the thinnest wall would gouge huge chunks out of THICK ones and
+    let grazing rays sail through them (it put the analytic concentric-cylinder ``F22`` at 0.506 vs 0.429).
+    Two cells is the floor: the rasterised ``sdf`` can read up to ~1 cell negative for a point sitting
+    exactly ON a surface, and every chord endpoint does exactly that -- a smaller depth would report every
+    element as blocking itself.
+    """
+    w = _min_solid_thickness(geoms, hi=float(max(np.ptp(r), np.ptp(z))))
+    span = float(np.hypot(np.ptp(r), np.ptp(z))) + 2.0 * float(np.max(r))
+    cell = min(w / 8.0, span / 4000.0)
+    bounds = (float(np.min(r)), float(np.min(z)), float(np.max(r)), float(np.max(z)))
+    sdf = _SolidSDF(union, bounds, cell=cell, pad=8.0 * cell)
+    return sdf, 2.0 * cell
+
+
+def _solid_polygon_visibility_3d(domain, elem_tag, P, length, phi, n_seg: int = 0):
+    r"""Point-to-point visibility **per azimuth** for the true 3-D ray between axisymmetric rings.
+
+    ``P`` is an ``(M, 2)`` array of ``(r, z)`` points -- pass the kernel's own quadrature points
+    (:meth:`MeshUtils.meridional_quad_points`) so the shadow boundary is resolved *within* an element,
+    not just element midpoints (which makes a partially-shadowed element all-or-nothing).
+
+    Point *i* sits at azimuth 0 (WLOG, by the enclosure's rotational symmetry); point *j* sits at
+    azimuth ``phi``. The straight 3-D chord between them collapses EXACTLY onto a curve in the
+    ``(r, z)`` meridian half-plane:
+
+    .. math::
+        \rho(t,\phi) = \sqrt{(1-t)^2 r_i^2 + 2t(1-t)r_i r_j\cos\phi + t^2 r_j^2},
+        \qquad z(t) = (1-t)z_i + t z_j
+
+    which reduces to the straight ``r_i -> r_j`` segment :func:`_solid_polygon_visibility` tests exactly
+    at ``phi = 0``, and bows strictly closer to the axis than that flat projection for any ``phi != 0``
+    (``rho(t,\phi)^2 - r_proj(t)^2 = 2t(1-t)r_i r_j(\cos\phi - 1) <= 0``). Occlusion at that azimuth is
+    then: does this curve penetrate an opaque solid?
+
+    Answered by SPHERE TRACING against a signed-distance field (:class:`_SolidSDF`,
+    :func:`_chord_blocked`) rather than by sampling the chord at a fixed stride. A fixed stride has to be
+    shorter than the thinnest solid or it steps clean over it -- and on this geometry that means thousands
+    of samples per chord. Marching by the distance to the nearest solid instead takes LARGE steps through
+    open space and small ones only near a wall, and can never skip a feature of any size.
+
+    The endpoints are used **un-nudged**: the straight-line test nudges them off the surface along the
+    element normals, which is harmless for a straight segment but here would pull both endpoints radially
+    inward and make the curved chord bow spuriously close to the axis -- systematically over-reporting
+    occlusion (caught against the analytic concentric-cylinder ``F22 = 1 - r1/r2``). No nudge is needed:
+    the depth criterion already ignores endpoints lying ON their own radiating surface.
+
+    Visibility is EVEN in ``phi`` (the chord depends on the azimuth only through ``cos phi`` and, in
+    ``rho``, ``sin^2 phi``), so only the half-grid is computed and the rest mirrored.
+
+    ``n_seg`` is accepted and ignored; it is a vestige of the fixed-stride implementation.
+
+    Returns an ``(M, M, len(phi))`` bool array (True = visible/unblocked at that azimuth); the self-pair
+    is excluded at every azimuth.
+    """
+    from shapely.ops import unary_union
+
+    P = np.asarray(P, dtype=np.float64)
+    M = P.shape[0]
+    phi = np.asarray(phi, dtype=np.float64)
+    n_phi = phi.shape[0]
+    regions = getattr(domain, "_source_regions", {}) or {}
+    geoms = [regions[s] for s in sorted(set(map(str, elem_tag))) if s in regions]
+    vis = np.ones((M, M, n_phi), dtype=bool)
+    if geoms:
+        union = unary_union(geoms)
+        r, z = P[:, 0], P[:, 1]
+        sdf, depth = _chord_test_setup(geoms, union, r, z)
+        # phi and 2*pi - phi give the same chord -> compute the half-grid, mirror the rest.
+        half = [k for k in range(n_phi) if phi[k] <= np.pi + 1e-12]
+        for k in half:
+            c, s = float(np.cos(phi[k])), float(np.sin(phi[k]))
+            v = np.empty((M, M), dtype=bool)
+            for a in range(0, M, 128):  # row-chunked to bound the march's working set
+                b = min(a + 128, M)
+                v[a:b] = ~_chord_blocked(sdf, r[a:b, None], z[a:b, None], r[None, :], z[None, :], c, s, depth)
+            vis[:, :, k] = v
+            vis[:, :, (n_phi - k) % n_phi] = v  # phi -> 2*pi - phi
+    # NOTE: the self-pair (i == i) is deliberately NOT forced to False. In an axisymmetric enclosure a
+    # point at azimuth 0 and "itself" at azimuth phi are DIFFERENT physical points on the same ring, and
+    # on a concave surface they genuinely exchange radiation -- that is real energy, not a degenerate
+    # self-view (verified by Monte-Carlo: it is exactly the deficit that makes the row sums fall short).
+    # It still costs nothing at phi = 0, where the chord degenerates to a point and the kernel's cosines
+    # vanish identically.
+    return vis
 
 
 class Enclosure:
@@ -212,6 +479,185 @@ class Enclosure:
         return f"Enclosure({self.tags}, {kind}, {self.size} elements, closure={c:.1e}, reciprocity={r:.1e})"
 
 
+def _pair_min_distance(e0: np.ndarray, e1: np.ndarray, ns: int = 5) -> np.ndarray:
+    """Approximate min distance between every pair of meridional segments, by sampling ``ns`` points on
+    each (error < h/(2*ns), and this only *selects* which pairs get refined -- refining a few extra is
+    harmless, so an approximation is fine)."""
+    m = e0.shape[0]
+    t = ((np.arange(ns) + 0.5) / ns)[None, :, None]
+    P = (e0[:, None, :] + t * (e1 - e0)[:, None, :]).reshape(m * ns, 2)
+    D = np.linalg.norm(P[:, None, :] - P[None, :, :], axis=-1)
+    return D.reshape(m, ns, m, ns).min(axis=(1, 3))
+
+
+def _graded_phi_rule(phi_c: np.ndarray, n_int: int, n_gl: int):
+    r"""Per-pair azimuthal quadrature on ``[0, pi]``, GRADED toward ``phi = 0``.
+
+    The ring kernel's azimuthal integrand has a peak at ``phi = 0`` of width ``phi_c ~ d/r`` (``d`` = the
+    3-D separation of the two surface points, ``r`` = their radius), because
+    ``R^2(phi) ~ d^2 + r^2 phi^2``. A uniform ``n_phi`` rule with ``dphi >> phi_c`` samples the peak's
+    crest and multiplies it by a step far wider than the peak -- overshooting the integral by ``~dphi/phi_c``.
+    That is the entire "corner artifact": two surfaces meeting in a sub-millimetre wedge have
+    ``phi_c ~ 1e-3`` while ``dphi ~ 6e-2``, and the view factor comes out several times too large.
+
+    So: composite Gauss-Legendre on intervals ``[0, phi_c]`` then GEOMETRICALLY spaced out to ``pi``,
+    which resolves the peak at whatever width it happens to have. Integrating on ``[0, pi]`` (and doubling)
+    is exact: the integrand is even in ``phi`` -- ``R^2``, both cosines and the occlusion chord all depend
+    on ``phi`` only through ``cos phi`` and ``sin^2 phi``.
+
+    Returns ``(phi, w)``, each ``(n_pairs, (n_int + 1) * n_gl)``.
+    """
+    gx, gw = np.polynomial.legendre.leggauss(n_gl)
+    phi_c = np.clip(np.asarray(phi_c, dtype=np.float64), 1e-7, 0.5 * np.pi)[:, None]
+    k = np.arange(n_int + 1)[None, :]
+    # breakpoints: 0, phi_c, then geometric phi_c -> pi
+    geo = phi_c * (np.pi / phi_c) ** (k / n_int)  # (n_pairs, n_int+1);  geo[:,0]=phi_c, geo[:,-1]=pi
+    b = np.concatenate([np.zeros_like(phi_c), geo], axis=1)  # (n_pairs, n_int+2)
+    lo, hi = b[:, :-1], b[:, 1:]  # (n_pairs, n_int+1)
+    mid, half = 0.5 * (lo + hi), 0.5 * (hi - lo)
+    phi = (mid[:, :, None] + half[:, :, None] * gx[None, None, :]).reshape(phi_c.shape[0], -1)
+    w = (half[:, :, None] * gw[None, None, :]).reshape(phi_c.shape[0], -1)
+    return phi, w
+
+
+def _refine_near_pairs(
+    F,
+    e0,
+    e1,
+    normals,
+    domain,
+    elem_tag,
+    n_phi,
+    *,
+    n_sub=4,
+    n_gl=4,
+    n_int=14,
+    n_gl_phi=6,
+    k_azim=3.0,
+    k_merid=3.0,
+    n_seg=256,
+    chunk=96,
+    log=None,
+):
+    """Recompute NEAR element pairs (and the diagonal) with adaptive quadrature; return the corrected F.
+
+    The vectorised kernel uses a uniform ``n_phi`` azimuthal rule and ``n_quad`` meridional Gauss points.
+    Both fail for near-touching pairs (see :func:`_graded_phi_rule`), which is what forces the ``r_min``
+    near-field fudge and leaves raw row sums well above the physical bound of 1. Here every pair that the
+    base rule cannot resolve --
+
+        azimuthally:  2*pi/n_phi  >  (d/r) / k_azim        (the peak is narrower than one step)
+        meridionally: max(h_i,h_j) > d / k_merid           (the elements are big compared to their gap)
+
+    -- is recomputed with a graded azimuthal rule and a composite meridional rule, with NO ``r_min``
+    softening. The self-pair (i == i) is always refined: a ring's own azimuthal self-view is the most
+    singular pair there is (d -> 0).
+
+    Exchange is computed in its symmetric form ``G_ij = A_i F_ij`` and split back, so reciprocity is exact
+    by construction. Occlusion is evaluated per pair per refined azimuth on the element midpoints, by the
+    same 3-D chord test as :func:`_solid_polygon_visibility_3d`.
+    """
+    from shapely.ops import unary_union
+
+    F = np.array(F, dtype=np.float64, copy=True)
+    m = e0.shape[0]
+    mids = 0.5 * (e0 + e1)
+    length = np.linalg.norm(e1 - e0, axis=1)
+
+    # --- which pairs can the base rule not resolve? ---
+    D = _pair_min_distance(e0, e1)
+    r_ref = np.maximum(np.maximum(mids[:, 0][:, None], mids[:, 0][None, :]), 1e-9)
+    h = np.maximum(length[:, None], length[None, :])
+    dphi = 2.0 * np.pi / n_phi
+    need = (D < k_azim * dphi * r_ref) | (D < k_merid * h)
+    np.fill_diagonal(need, True)  # the ring self-view: the ultimate near pair
+    iu, ju = np.where(np.triu(need))
+    if log:
+        log(
+            f"near-field: refining {len(iu)} of {m * (m + 1) // 2} unordered pairs "
+            f"({100 * len(iu) / (m * (m + 1) / 2):.1f}%)"
+        )
+
+    regions = getattr(domain, "_source_regions", {}) or {}
+    geoms = [regions[s] for s in sorted(set(map(str, elem_tag))) if s in regions]
+    union = unary_union(geoms) if geoms else None
+    # Occlusion by sphere tracing against a signed-distance field (see _chord_test_setup / _chord_blocked):
+    # scaled to the thinnest SOLID, not to the mesh, and unable to step over a feature of any size.
+    sdf = depth = None
+    if union is not None:
+        sdf, depth = _chord_test_setup(geoms, union, mids[:, 0], mids[:, 1])
+
+    # --- composite meridional rule on each element: n_sub sub-intervals x n_gl Gauss points ---
+    gx, gw = np.polynomial.legendre.leggauss(n_gl)
+    sub = (np.arange(n_sub) / n_sub)[:, None]
+    s_loc = (sub + (gx[None, :] + 1.0) * 0.5 / n_sub).reshape(-1)  # (Q,) in [0,1]
+    w_loc = np.tile(gw * 0.5 / n_sub, n_sub)  # (Q,) sums to 1
+    h_sub = length / (n_sub * n_gl)  # finest resolved meridional scale
+
+    for c0 in range(0, len(iu), chunk):
+        ii, jj = iu[c0 : c0 + chunk], ju[c0 : c0 + chunk]
+        n = ii.size
+
+        # quadrature points on each element of the pair
+        def qpts(idx):
+            p = e0[idx][:, None, :] + s_loc[None, :, None] * (e1 - e0)[idx][:, None, :]  # (n, Q, 2)
+            w = w_loc[None, :] * length[idx][:, None]  # (n, Q) meridional ds
+            return p[:, :, 0], p[:, :, 1], w
+
+        rq, zq, wq = qpts(ii)
+        rp, zp, wp = qpts(jj)
+        nq, np_ = normals[ii], normals[jj]  # (n, 2) each
+        aq, ap = rq * wq, rp * wp  # ring-area weights (2*pi cancels)
+
+        # graded azimuthal rule sized to THIS pair's peak width phi_c = d/r
+        d_eff = np.maximum(D[ii, jj], np.maximum(h_sub[ii], h_sub[jj]))
+        phi, wphi = _graded_phi_rule(d_eff / r_ref[ii, jj], n_int, n_gl_phi)  # (n, NP)
+        NP = phi.shape[1]
+        cphi, sphi = np.cos(phi), np.sin(phi)
+
+        # occlusion per (pair, azimuth), on the element midpoints -- sphere-traced, same test as the base
+        vis = np.ones((n, NP), dtype=np.float64)
+        if sdf is not None:
+            vis = (
+                ~_chord_blocked(
+                    sdf,
+                    mids[ii, 0][:, None],
+                    mids[ii, 1][:, None],
+                    mids[jj, 0][:, None],
+                    mids[jj, 1][:, None],
+                    cphi,
+                    sphi,
+                    depth,
+                )
+            ).astype(np.float64)
+
+        # ring kernel at every (quad_i, quad_j, phi)
+        RQ = rq[:, :, None, None]
+        ZQ = zq[:, :, None, None]
+        RP = rp[:, None, :, None]
+        ZP = zp[:, None, :, None]
+        C = cphi[:, None, None, :]
+        S = sphi[:, None, None, :]
+        dx = RP * C - RQ
+        dy = RP * S
+        dz = ZP - ZQ
+        R2 = dx * dx + dy * dy + dz * dz
+        R = np.sqrt(R2 + 1e-300)
+        cos_q = np.maximum(0.0, (nq[:, 0][:, None, None, None] * dx + nq[:, 1][:, None, None, None] * dz) / R)
+        cos_p = np.maximum(
+            0.0, -(np_[:, 0][:, None, None, None] * (dx * C + dy * S) + np_[:, 1][:, None, None, None] * dz) / R
+        )
+        K = cos_q * cos_p / (np.pi * R2 + 1e-300)  # (n, Q, Q, NP)
+        # azimuthal integral over [0, 2pi) = 2 * integral over [0, pi]  (the integrand is even in phi)
+        Iqp = 2.0 * np.einsum("nqpf,nf->nqp", K, wphi * vis)
+        G = np.einsum("nq,nqp,np->n", aq, Iqp, ap)  # symmetric exchange, = A_i F_ij / (2*pi)
+
+        Aq, Ap = aq.sum(axis=1), ap.sum(axis=1)  # = A_i/(2*pi), A_j/(2*pi)
+        F[ii, jj] = G / Aq
+        F[jj, ii] = G / Ap  # reciprocity exact by construction
+    return F
+
+
 def _classify_triangles(domain, triangles: np.ndarray, pts: np.ndarray) -> np.ndarray:
     """Region name (from ``domain._source_regions``) containing each triangle's centroid, else ``None``.
 
@@ -275,6 +721,7 @@ def build_enclosure(
     occlude: bool = True,
     inward: bool = False,
     r_min: Optional[float] = None,
+    near_field: bool = True,
 ) -> Enclosure:
     """Assemble an :class:`Enclosure` from radiating ``tags`` on a meshed 2D / axisymmetric domain.
 
@@ -292,9 +739,18 @@ def build_enclosure(
       ``medium_tags`` region; normals point out of the solid into the medium. This is the common furnace
       case where every region is meshed.
 
-    ``r_min`` (axisymmetric only) softens the ring kernel's near-field ``1/R^2`` singularity; it defaults
-    to half the median element length, which keeps near-coincident and on-axis (``r -> 0``) view factors
-    physical (<= 1). Pass an explicit value to override.
+    ``near_field`` (axisymmetric only, default on) recomputes the element pairs that the uniform ``n_phi``
+    azimuthal rule cannot resolve — near-touching surfaces, e.g. two parts meeting in a narrow wedge, and
+    every element's own ring self-view — with a graded azimuthal quadrature sized to each pair's peak (see
+    :func:`_refine_near_pairs`). WITHOUT it, such pairs overshoot by roughly ``dphi / (d/r)``: a
+    sub-millimetre gap at ~100 mm radius is off by several times, driving row sums far above the physical
+    bound of 1. It costs a one-off build-time pass over the near pairs (typically a few % of all pairs).
+
+    ``r_min`` (axisymmetric only) softens the ring kernel's near-field ``1/R^2`` singularity. It defaults
+    to **0 when** ``near_field`` **is on** (the refinement resolves the near field properly, so no fudge is
+    needed) and to half the median element length otherwise — that legacy default is itself a ~12% error on
+    the analytic concentric-cylinder factors, because it is sized to mask the near-field failure rather
+    than to fix it. Pass an explicit value to override either way.
     """
     if isinstance(tags, str):
         tags = [tags]
@@ -417,17 +873,40 @@ def build_enclosure(
         vm = 1.0 - np.eye(elem_nodes.shape[0])  # diagnostic: no occlusion (all mutually visible)
     elif medium_tags is not None:
         # Interface mode: occlude with the CLEAN solid polygons (a ray is blocked iff it passes through
-        # a solid interior in the (r,z) meridian). Correct for axisymmetric (a solid ring blocks all
-        # azimuths) and immune to the mesh-sliver artefacts that the element-edge occluder suffers.
-        vm = _solid_polygon_visibility(domain, elem_tag_arr, mids, normals, length)
+        # a solid interior), immune to the mesh-sliver artefacts that the element-edge occluder suffers.
+        if axisymmetric:
+            # Per-azimuth occlusion (see _solid_polygon_visibility_3d): a same-meridian (phi=0) verdict
+            # does not transfer to other azimuths for a general solid of revolution, so this checks the
+            # true 3-D chord at every azimuth the exchange kernel integrates over.
+            #
+            # Evaluated at element MIDPOINTS, not at the kernel's quadrature points. Resolving visibility
+            # per quadrature point is ~10x more expensive (n_quad^2 more chord tests) and, measured
+            # against the analytic concentric-cylinder factors, changes nothing (F12/F21/F22 and the row
+            # sums agree to 3 decimals) -- the shadow boundary is smooth in azimuth, which is where it is
+            # already resolved to n_phi. The kernel still ACCEPTS quadrature-resolved visibility if a
+            # caller wants it (see get_view_factor_axisymmetric_element).
+            phi_occ = np.linspace(0.0, 2.0 * np.pi, n_phi, endpoint=False)
+            vm = _solid_polygon_visibility_3d(domain, elem_tag_arr, mids, length, phi_occ)
+        else:
+            vm = _solid_polygon_visibility(domain, elem_tag_arr, mids, normals, length)
     else:
         vm = _element_visibility(mids, own_edge, occ0, occ1)
 
     if axisymmetric:
-        # Near-field 1/R^2 floor: without it, near-coincident ring pairs (and the on-axis r->0 elements)
-        # produce spuriously large (>1) view factors. Default to half the median element length, matching
-        # the element size — callers can override via ``r_min``.
-        rmin = 0.5 * float(np.median(length)) if r_min is None else float(r_min)
+        # The near-field refinement is applied ONLY in interface mode. It re-derives occlusion from the
+        # solid polygons (domain._source_regions, keyed by the element tags), which is exactly the
+        # interface-mode occluder model. In BOUNDARY mode the tags are surface names ("inner_gap"), not
+        # region names, so that lookup would come back empty and the refinement would silently drop
+        # occlusion altogether -- worse than the artifact it fixes. Boundary mode therefore keeps the
+        # legacy behaviour (uniform azimuthal rule + the r_min floor), and with it the known limitation
+        # that its occlusion (_element_visibility) is a meridian-only test reused across all azimuths.
+        refine = bool(near_field) and medium_tags is not None
+
+        # r_min is a near-field 1/R^2 FLOOR -- a fudge that caps the kernel for near-coincident rings.
+        # Where the refinement runs, the near pairs are integrated properly instead, so no floor is needed
+        # (and any nonzero floor is then a pure bias): default it to 0. Otherwise keep the legacy
+        # 0.5*median(length), which masks the overshoot at the cost of a ~12% systematic error.
+        rmin = (0.0 if refine else 0.5 * float(np.median(length))) if r_min is None else float(r_min)
         F = MeshUtils.get_view_factor_axisymmetric_element(
             jnp.asarray(e0),
             jnp.asarray(e1),
@@ -438,6 +917,8 @@ def build_enclosure(
             r_min=rmin,
         )
         areas = 2.0 * np.pi * mids[:, 0] * length  # ring areas
+        if refine:
+            F = jnp.asarray(_refine_near_pairs(np.asarray(F), e0, e1, normals, domain, elem_tag_arr, n_phi))
     else:
         F = MeshUtils.get_view_factor_2d_element(
             jnp.asarray(e0), jnp.asarray(e1), jnp.asarray(normals), jnp.asarray(vm), n_quad=n_quad
