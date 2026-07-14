@@ -19,9 +19,10 @@ inferred from ``domain.time`` — and a low-level **function form** (:class:`FDM
 
 Scope: scalar fields on a **2-D triangular or 3-D tetrahedral mesh**. The interior operators
 (``jno.fdm.laplacian`` / ``jno.fdm.gradient``, and the constraint-list ``u.d2(x)+u.d2(y)+u.d2(z)``
-authoring) dispatch on ``domain.dimension``; a tet mesh has no cotangent Laplace-Beltrami, so its
-Laplacian is the first-order ``gradient_of_gradient`` double-difference (accuracy leans on
-refinement). **Any mix** of steady boundary conditions — Dirichlet ``u(region) - g``, and **any flux BC
+authoring) dispatch on ``domain.dimension``; the default ``cotangent`` Laplacian is the cotangent-weight
+operator in 2-D and its exact analogue, the **P1 tetrahedral finite-element** Laplace-Beltrami operator,
+in 3-D (symmetric, second-order for the solve; ``gradient_of_gradient`` is the first-order local
+alternative). **Any mix** of steady boundary conditions — Dirichlet ``u(region) - g``, and **any flux BC
 affine in the normal derivative** ``∂u/∂n`` written with that region's boundary tags: Neumann
 ``ur.d(n) - h``, Robin ``ur.d(n) + α(u - u∞)``, a coordinate-coefficient ``κ(x)·ur.d(n)``, either sign
 (``ur = u.bind(x=xr, y=yr[, z=zr])``, ``n = domain.variable(region, normals=True)``). Flux normals come
@@ -60,17 +61,16 @@ def _mesh(domain):
 
 
 def laplacian(u, domain, method: str = "cotangent"):
-    """FD Laplacian ``Δu`` of the nodal field ``u`` on the domain's mesh. In 2-D ``method="cotangent"``
-    (symmetric, accurate — CG-compatible) or ``"gradient_of_gradient"`` / ``"lsq_of_gradient"``. A
-    tetrahedral mesh has **no cotangent Laplace-Beltrami**, so the 3-D operator is the
-    ``"gradient_of_gradient"`` double-difference (``"cotangent"`` is accepted as that alias, and is the
-    default): it is first-order and noisier than the 2-D cotangent stencil, so 3-D accuracy leans on
-    mesh refinement. (``"lsq_of_gradient"`` is unstable for the *second* derivative on tetrahedra —
-    the nested least-squares amplifies — and is not recommended in 3-D.)"""
+    """FD Laplacian ``Δu`` of the nodal field ``u`` on the domain's mesh. ``method="cotangent"`` (the
+    default) is the symmetric, CG-compatible Laplace–Beltrami stencil — the cotangent-weight operator on
+    a 2-D triangular mesh and its exact analogue, the **P1 tetrahedral finite-element** operator, on a
+    3-D tet mesh (second-order for the Galerkin solve). ``"gradient_of_gradient"`` (first-order double
+    difference) and ``"lsq_of_gradient"`` are the local alternatives; ``"lsq_of_gradient"`` is unstable
+    for the *second* derivative on tetrahedra (nested least-squares amplifies) and is not recommended in
+    3-D."""
     pts, cells = _mesh(domain)
     dim = int(getattr(domain, "dimension", 2))
     if dim == 3:
-        method = "gradient_of_gradient" if method == "cotangent" else method
         return _D.compute_fd_laplacian_3d_simple(u, pts, cells, dims=(0, 1, 2), method=method)
     return _D.compute_fd_laplacian_2d_simple(u, pts, cells, dims=(0, 1), method=method)
 

@@ -427,7 +427,7 @@ def _cube(mesh_size):
     return jno.Shape.box(0.0, 0.0, 0.0, 1.0, 1.0, 1.0, size=mesh_size).domain()
 
 
-def _poisson3d(mesh_size, method="gradient_of_gradient"):
+def _poisson3d(mesh_size, method="cotangent"):
     """-Δu = f on [0,1]³, u=0 on ∂Ω, exact u = sin(πx)sin(πy)sin(πz) ⇒ f = 3π²u. Returns rel-L2 error."""
     d = _cube(mesh_size)
     p = _nodes3(d)
@@ -446,22 +446,47 @@ def test_gradient_3d_shape():
 
 
 def test_poisson_3d_dirichlet():
-    assert _poisson3d(0.1) < 0.2
+    assert _poisson3d(0.1) < 3e-2  # cotangent (P1 Laplace–Beltrami) default
 
 
 def test_poisson_3d_convergence_under_refinement():
-    """Refining the tet mesh reduces the FD error — Tier-1 consistency in 3-D. The gradient-of-gradient
-    Laplacian is only first-order (no cotangent Laplace-Beltrami on tets), so the absolute error is
-    larger than the 2-D case and accuracy leans on refinement — but it converges monotonically."""
+    """Refining the tet mesh reduces the FD error and does so at ~2nd order — the default cotangent
+    stencil is the P1 tetrahedral Laplace–Beltrami operator (a small-constant Galerkin solve, unlike the
+    first-order gradient-of-gradient)."""
     errs = [_poisson3d(h) for h in (0.20, 0.14, 0.10)]
     assert errs[0] > errs[1] > errs[2], f"not monotonically converging: {errs}"
-    assert errs[2] < 0.2
+    assert errs[2] < 3e-2
 
 
-def test_laplacian_3d_cotangent_aliases_grad_of_grad():
-    """A tet mesh has no cotangent stencil, so `method="cotangent"` (the default) aliases to
-    `"gradient_of_gradient"` rather than raising — the two give the identical solve."""
-    assert abs(_poisson3d(0.14, method="cotangent") - _poisson3d(0.14, method="gradient_of_gradient")) < 1e-12
+def test_laplacian_3d_cotangent_beats_grad_of_grad():
+    """The 3-D cotangent (P1 FEM) Laplacian is a distinct, materially more accurate operator than the
+    local gradient-of-gradient double-difference — on the same tet mesh its Poisson error is several
+    times smaller (this is the whole point of wiring it up)."""
+    h = 0.12
+    cot = _poisson3d(h, method="cotangent")
+    gog = _poisson3d(h, method="gradient_of_gradient")
+    assert cot < 0.4 * gog, f"cotangent ({cot:.3e}) should be << gradient_of_gradient ({gog:.3e})"
+
+
+def test_constraint_list_cotangent_3d():
+    """The constraint-list path reaches the 3-D cotangent stencil too — a SINGLE whole-Laplacian term
+    `ui.d2(x, scheme="finite_difference:cotangent")` (NOT the split −d2(x)−d2(y)−d2(z), which stays
+    per-direction gradient-of-gradient), exactly as in 2-D. It matches the function-form accuracy."""
+    import jno.jnp_ops as jnn
+
+    d = _cube(0.14)
+    p = _nodes3(d)
+    exact = np.sin(np.pi * p[:, 0]) * np.sin(np.pi * p[:, 1]) * np.sin(np.pi * p[:, 2])
+    x, y, z, _ = d.variable("interior", split=True)
+    xb, yb, zb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, z=z)
+    f = 3 * np.pi**2 * jnn.sin(np.pi * x) * jnn.sin(np.pi * y) * jnn.sin(np.pi * z)
+    sol = jno.fdm([-ui.d2(x, scheme="finite_difference:cotangent") - f, u(xb, yb, zb) - 0.0]).solve()
+    err = float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact))
+    # ~0.064 at h=0.14 — the function-form cotangent value, and far below the per-direction
+    # gradient_of_gradient (~0.27), proving the whole-Laplacian cotangent stencil took effect.
+    assert err < 0.1, f"whole-cotangent constraint list should match function-form accuracy, got {err}"
 
 
 def test_constraint_list_poisson_3d():

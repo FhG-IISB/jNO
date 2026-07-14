@@ -67,9 +67,9 @@ The built-in stencils (parsed from the scheme string) are:
 
 The `cotangent` Laplacian is the most accurate and is symmetric; the gradient methods trade accuracy
 for locality. The scheme stays on the operator it describes — `ui.d2(x, scheme=…)` — so different
-terms in the same residual can use different stencils. (`cotangent` is a **2-D** stencil; a
-tetrahedral mesh has no cotangent Laplace–Beltrami, so in 3-D the Laplacian is `gradient_of_gradient`
-— see [3-D tetrahedral meshes](#3-d-tetrahedral-meshes).)
+terms in the same residual can use different stencils. (`cotangent` is the accurate default in 2-D
+**and** 3-D — the cotangent-weight operator on triangles, and its exact analogue the P1 finite-element
+Laplace–Beltrami operator on tetrahedra; see [3-D tetrahedral meshes](#3-d-tetrahedral-meshes).)
 
 ---
 
@@ -204,12 +204,14 @@ A cube from `jno.Shape.box` auto-names its six faces `left/right/front/back/bott
 conditions work per face exactly as in 2-D — bind to the face and take the normal derivative
 (`nr = d.variable("right", normals=True)`, then `ui.d(nr) - h` or `ur.d(nr) + alpha*(ur - u_inf)`).
 
-!!! note "3-D accuracy"
-    A tetrahedral mesh has no cotangent Laplace–Beltrami stencil, so the 3-D Laplacian is the
-    first-order `gradient_of_gradient` double-difference (`lsq_of_gradient` is unstable for a *second*
-    derivative on tets — the nested least-squares amplifies — and is not recommended in 3-D). It
-    converges under refinement but is coarser than the 2-D cotangent stencil, so 3-D accuracy leans on
-    mesh refinement.
+!!! note "3-D Laplacian stencil"
+    The default `cotangent` Laplacian is the **P1 tetrahedral finite-element** (Laplace–Beltrami)
+    operator — the exact 3-D analogue of the 2-D cotangent weights — so it is symmetric and second-order
+    for the Galerkin solve. `gradient_of_gradient` (first-order, local) is the alternative;
+    `lsq_of_gradient` is unstable for a *second* derivative on tets (the nested least-squares amplifies)
+    and is not recommended in 3-D. As in 2-D, the whole-Laplacian `cotangent` stencil **cannot be split**
+    across directions — write it as the single term `ui.d2(x, scheme="finite_difference:cotangent")`,
+    not summed; the plain `−d2(x) − d2(y) − d2(z)` uses the per-direction `gradient_of_gradient`.
 
 ---
 
@@ -224,7 +226,7 @@ the analytic, shapely-free [`Shape.contains`](shape.md) — in 2-D **and** 3-D.
 
 **Planned:** transient flux boundary conditions (a flux node keeps `M = 1`, unlike a pinned Dirichlet
 node); periodic boundaries; a general `u.t` mass coefficient; a structured-grid stencil backend; 1-D
-meshes; a higher-order (cotangent-equivalent) 3-D Laplacian. Authoring a `jno.Shape` sub-region
+meshes. Authoring a `jno.Shape` sub-region
 through `domain.region(name, shape)` + `d.variable`, and 3-D coupled solves, additionally need
 region-tag support on the base 3-D domain (a separate 3-D domain-decomposition feature). A pure-Neumann
 problem (no Dirichlet node anywhere) is singular — the solution is defined only up to an additive
