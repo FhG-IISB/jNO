@@ -324,6 +324,14 @@ def test_broadband_spectrum_and_wavelength_gradient():
     fd = (float(T(1.0 + h)) - float(T(1.0 - h))) / (2 * h)
     assert abs(g - fd) < 5e-2, f"dT/dlambda autodiff {g} vs finite-diff {fd}"
 
+    # angle-resolved: k_in is a differentiable knob too (oblique incidence)
+    def T_angle(kx):
+        return rc.solve(k_in=jnp.array([kx, 0.0])).efficiency("T")
+
+    ga = float(jax.grad(T_angle)(1.0))
+    fda = (float(T_angle(1.0 + h)) - float(T_angle(1.0 - h))) / (2 * h)
+    assert abs(ga - fda) < 5e-2, f"dT/dk_in autodiff {ga} vs finite-diff {fda}"
+
 
 @needs_fmmax
 def test_infer_and_solve_end_to_end():

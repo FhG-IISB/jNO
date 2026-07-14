@@ -273,7 +273,7 @@ class Rcwa:
                 "layer's eigenmodes and is never defaulted."
             )
         layers_spec = self.layers_spec if layers is None else layers
-        kin = np.asarray(self.k_in if k_in is None else k_in, float)
+        kin = jnp.asarray(self.k_in if k_in is None else k_in, float)  # jax -> incidence angle is differentiable
         lv = fm.LatticeVectors(u=np.array([self.period[0], 0.0]), v=np.array([0.0, self.period[1]]))
         ex = fm.generate_expansion(lv, approximate_num_terms=self.orders)
         nt = ex.num_terms
@@ -671,19 +671,21 @@ class _RcwaProblem:
             assume_periodic=True,
         )
 
-    def solve(self, params=None, wavelength=None):
+    def solve(self, params=None, wavelength=None, k_in=None):
         """Build the fmmax engine and solve.
 
         Pass ``params={name: value}`` (JAX values for the trainable ``jno.np.parameter`` coefficients) to
-        get a **differentiable** solve: the permittivity is re-sampled from those values and the whole
-        modal solve traces, so ``jax.grad`` of a ``sol.efficiency(...)`` objective flows to the design.
+        get a **differentiable** solve: the permittivity AND the wavelength are re-derived from those
+        values and the whole modal solve traces, so ``jax.grad`` of a ``sol.efficiency(...)`` objective
+        flows to the design.
 
         Pass ``wavelength`` to override the inferred one -- sweep it for a **broadband / dispersion**
-        response (the transverse wavevector ``k_in`` is held fixed, i.e. fixed-momentum dispersion). The
-        result is differentiable in the wavelength too."""
+        response. Pass ``k_in=(kx, ky)`` to set the transverse wavevector -- sweep it for an
+        **angle-resolved** response. Both are differentiable (``jax.grad`` in wavelength / incidence angle
+        flows too)."""
         eng = self._engine()
         if params is None:
-            return eng.solve(wavelength=wavelength)
+            return eng.solve(wavelength=wavelength, k_in=k_in)
         if self._resample is None:
             raise RcwaError(
                 "differentiable solve(params=...) needs the analytic re-sampling path, which is only built "
@@ -691,7 +693,7 @@ class _RcwaProblem:
                 "permittivity; differentiable nodal re-sampling is not implemented yet."
             )
         layers, wl = self._resample(params)  # eps AND wavelength re-derived from the parameters
-        return eng.solve(layers=layers, wavelength=wavelength if wavelength is not None else wl)
+        return eng.solve(layers=layers, wavelength=wavelength if wavelength is not None else wl, k_in=k_in)
 
 
 def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, params=None, formulation="JONES_DIRECT_FOURIER"):
