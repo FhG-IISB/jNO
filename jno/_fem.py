@@ -638,24 +638,34 @@ def _value_from_node(node: Any) -> Any:
     return const if const is not None else _coord_value_fn(node)
 
 
+def _node_has_complex_literal(node: Any) -> bool:
+    """True if a single trace node carries a complex-valued constant (a user-written ``1j``)."""
+    for attr in ("value", "val", "data", "constant"):
+        v = getattr(node, attr, None)
+        if v is None:
+            continue
+        try:
+            if jnp.iscomplexobj(jnp.asarray(v)):
+                return True
+        except Exception:  # not array-like; ignore
+            continue
+    return False
+
+
+def _bares_have_complex_coeff(bares: Any) -> bool:
+    """True if any raw weak-form bare contains a complex literal. The complex constant survives
+    lowering unchanged, so walking the raw bares is equivalent to :func:`_is_complex_form` but works
+    *before* the lowered ``ir`` is built (used to route the non-nodal path)."""
+    return any(_node_has_complex_literal(n) for b in bares for n in _walk(b))
+
+
 def _is_complex_form(domain: Any, ir: Any) -> bool:
     """True if any lowered term's expression contains a complex constant — the signal to route a
     (steady, linear) weak form through the real-equivalent complex solver instead of the plain real
     assembly. We walk the tree for a complex-valued literal (a user-written ``1j``) rather than
     evaluating, because the lowered coeff embeds the (non-evaluable) trial/test channel."""
     del domain
-    for term in ir.terms:
-        for node in _walk(term.coeff):
-            for attr in ("value", "val", "data", "constant"):
-                v = getattr(node, attr, None)
-                if v is None:
-                    continue
-                try:
-                    if jnp.iscomplexobj(jnp.asarray(v)):
-                        return True
-                except Exception:  # not array-like; ignore
-                    continue
-    return False
+    return any(_node_has_complex_literal(node) for term in ir.terms for node in _walk(term.coeff))
 
 
 def _complex_block_bcoo(A_r: Any, A_i: Any, n: int) -> Any:
@@ -2508,6 +2518,63 @@ def fem(
     # the shared integrand evaluator (which carries space-guarded branches for the physical basis).
     if _trial_spaces(constraints) - {"Lagrange"}:
         from .utils.solver.fem_nonnodal import assemble_fem_nonnodal
+
+        # ---- complex non-nodal (RT/Nédélec/Argyris): the Re/Im coefficient split, assembled by the
+        # non-nodal push-forward assembler. The basis is real, so ``Re(c·T) = Re(c)·T``: wrapping each
+        # term in ``.real``/``.imag`` gives two ordinary real systems A_r/A_i, and FEM.solve() forms
+        # ``[[A_r,-A_i],[A_i,A_r]]`` (``mode="complex"`` → _solve_complex_block), recombining to a complex
+        # ``u`` — needed for time-harmonic Maxwell (complex ε, the ``i k₀`` impedance BC). Without this the
+        # plain real assembler would SILENTLY cast the imaginary part away, so the unwired compositions
+        # (transient/parametric/nonlinear) raise rather than mislead. ----
+        _nn_bares = volume_terms + [e for exprs in boundary_terms.values() for e in exprs]
+        if _bares_have_complex_coeff(_nn_bares):
+            from .utils.solver.parametric_helpers import _contains_runtime_parameter as _crp_nn
+            from .utils.solver.weak_form import _contains_temporal_derivative as _ctd_nn
+            from .utils.solver.weak_form import _is_obviously_nonlinear_in_unknown as _nlin_nn
+
+            if any(_ctd_nn(b) for b in _nn_bares):
+                raise NotImplementedError(
+                    "jno.fem: a complex non-nodal (RT/Nédélec/Argyris) *transient* form is not wired — only "
+                    "the steady linear complex form is. (The real assembler would silently drop the imaginary "
+                    "part, so this raises instead.)"
+                )
+            if has_neural_coeff or any(_crp_nn(b) for b in _nn_bares):
+                raise NotImplementedError(
+                    "jno.fem: a complex non-nodal *parametric/inverse* form (runtime parameter or neural "
+                    "coefficient) is not wired — the steady linear forward complex form is. (Raises rather than "
+                    "silently dropping the imaginary part.)"
+                )
+            if any(_nlin_nn(domain, b) for b in _nn_bares):
+                raise NotImplementedError(
+                    "jno.fem: a complex non-nodal *nonlinear* form is not wired — complex forms assemble as "
+                    "linear real-equivalent blocks. (Raises rather than silently dropping the imaginary part.)"
+                )
+            real_bd = {tag: [e.real for e in exprs] for tag, exprs in boundary_terms.items()}
+            imag_bd = {tag: [e.imag for e in exprs] for tag, exprs in boundary_terms.items()}
+            domain._fem_problem = None
+            op_r, _mr, offsets = assemble_fem_nonnodal(
+                domain,
+                [b.real for b in volume_terms],
+                real_bd,
+                dirichlet_raw,
+                [],
+                flux_bcs=flux_bcs,
+                rotation_bcs=rotation_bcs,
+                quad_degree=quad_degree,
+            )
+            op_i, _mi, _oi = assemble_fem_nonnodal(
+                domain,
+                [b.imag for b in volume_terms],
+                imag_bd,
+                dirichlet_raw,
+                [],
+                flux_bcs=flux_bcs,
+                rotation_bcs=rotation_bcs,
+                quad_degree=quad_degree,
+            )
+            return _finalize(
+                FEM(domain=domain, op=(op_r, op_i), classification=classification, mode="complex", offsets=offsets)
+            )
 
         op, mode, offsets = assemble_fem_nonnodal(
             domain,
