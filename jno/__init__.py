@@ -19,6 +19,7 @@ from .fdm import fdm
 from .geometry import Path, Shape
 from .integration_operators import IntegrationOperators
 from .noise import noise
+from .rcwa import Rcwa, RcwaError, rcwa
 from .trace import (
     Assembly,
     FemLinearSystem,
@@ -120,6 +121,9 @@ __all__ = [
     "do",
     "fem",
     "fdm",
+    "rcwa",
+    "Rcwa",
+    "RcwaError",
     "AdaptSpec",
     "Coupling",
     "Model",
