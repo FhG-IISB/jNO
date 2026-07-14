@@ -302,8 +302,28 @@ def view_factor(F: Union["Placeholder", jnp.ndarray]) -> ViewFactorOp:
     return ViewFactorOp(F)
 
 
+def _align_temporal(items):
+    """Broadcast a bare temporal variable onto the spatial point axis before concatenating.
+
+    ``dom.variable(tag)`` hands back spatial coords carrying a points axis, but ``t`` as a
+    *scalar* per time slice (it reads ``context["__time__"]``). Concatenating them raises
+    nothing — the scalar is broadcast — but on a domain with two or more spatial dimensions it
+    builds a graph that is pathologically slow to compile, with no error to point at. Feeding a
+    PINN/DeepONet trunk ``concat([x, y, t])`` is the usual way in.
+
+    Doing the broadcast here, on the trace (``t + 0*x``), is what users otherwise have to
+    remember to write by hand.
+    """
+    axes = [getattr(i, "axis", None) for i in items]
+    if "temporal" not in axes or "spatial" not in axes:
+        return items
+    ref = next(i for i, a in zip(items, axes) if a == "spatial")
+    return [(i + 0.0 * ref) if a == "temporal" else i for i, a in zip(items, axes)]
+
+
 def concat(items, axis: int = -1) -> FunctionCall:
     """Concatenate placeholders along an axis (always axis=-1 at eval time)."""
+    items = _align_temporal(items)
 
     def _fn(*args):
         expanded = []
