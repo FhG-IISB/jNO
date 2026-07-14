@@ -515,6 +515,45 @@ def _constant_of(node: Any) -> Optional[float]:
         return None
 
 
+def _scalar_const(node: Any) -> Optional[complex]:
+    """Complex-aware scalar extraction from a constant/Literal node (returns None if not a scalar)."""
+    for attr in ("value", "val", "data", "constant"):
+        if hasattr(node, attr):
+            v = getattr(node, attr)
+            try:
+                if np.ndim(v) != 0:
+                    return None
+                return complex(v)
+            except (TypeError, ValueError):
+                return None
+    try:
+        return complex(node)
+    except (TypeError, ValueError):
+        return None
+
+
+def _tie_phase(bare: Any) -> Optional[complex]:
+    """The Bloch phase of a tie ``u(A) - phase*u(B)``: ``1`` for plain periodic, a complex scalar for a
+    quasi-periodic (Bloch) tie, or ``None`` when the relation is not a valid tie (anti-periodic, etc.).
+
+    The slave side (left) must be a bare trial; the master side (right) is a bare trial (phase 1) or a
+    constant-scalar times a bare trial (the Bloch factor ``e^{i k·L}``)."""
+    if getattr(bare, "op", None) != "-":
+        return None
+    left, right = bare.left, bare.right
+    if getattr(left, "op", None) in {"+", "-", "*", "/"}:  # slave side must be a bare trial
+        return None
+    rop = getattr(right, "op", None)
+    if rop is None:
+        return 1.0 + 0.0j  # plain periodic  u(A) - u(B)
+    if rop == "*":  # Bloch  c*u(B) (either factor order), c a constant scalar
+        for a, b in ((right.left, right.right), (right.right, right.left)):
+            c = _scalar_const(a)
+            if c is not None and getattr(b, "op", None) is None:
+                return c
+    return None
+
+
 def _component_index_of(node: Any) -> Optional[int]:
     """If ``node`` is a single component of the trial (``u[..., i]``), return ``i``.
 
@@ -663,15 +702,30 @@ def _solve_complex_block(ops: Any, solve_fn: Optional[Callable] = None, periodic
     from .trace import FemLinearSystem, FunctionCall
     from .utils.solver.fem_utils import prolong_periodic, reduce_matrix_periodic, reduce_vector_periodic
 
-    def _ab(op, args):
+    bloch = bool(periodic is not None and periodic.get("is_bloch", False))
+
+    def _ab(op, args, conj=False):
         A, b = op.evaluate(args) if isinstance(op, FemLinearSystem) else op
         b = jnp.asarray(b).reshape(-1)
         if periodic is not None:
-            A = reduce_matrix_periodic(periodic, A)  # P^T A P  (stays sparse if A is BCOO)
-            b = reduce_vector_periodic(periodic, b)  # P^T b
+            A = reduce_matrix_periodic(periodic, A, conj=conj)  # P^T A P (P^H when Bloch); stays sparse
+            b = reduce_vector_periodic(periodic, b, conj=conj)  # P^T b (P^H when Bloch)
         return A, b  # keep A sparse (BCOO) -- do NOT densify
 
+    def _bloch_solve(args):
+        # Bloch/quasi-periodic: P is complex, so the reduced operator A_c = P^H (A_r + i A_i) P mixes
+        # Re/Im and cannot be split into independent legs. Reduce Hermitian, form the complex reduced
+        # operator, solve it directly (reduced cell is small), and prolong with the complex P.
+        (A_r, b_r), (A_i, b_i) = _ab(ops[0], args, conj=True), _ab(ops[1], args, conj=True)
+        to_d = lambda M: jnp.asarray(M.todense() if hasattr(M, "todense") else M)
+        A_c = to_d(A_r) + 1j * to_d(A_i)
+        b_c = jnp.asarray(b_r) + 1j * jnp.asarray(b_i)
+        u_red = jnp.linalg.solve(A_c, b_c)
+        return prolong_periodic(periodic, u_red)
+
     def _block_solve(args):
+        if bloch:
+            return _bloch_solve(args)
         (A_r, b_r), (A_i, b_i) = _ab(ops[0], args), _ab(ops[1], args)
         n = b_r.shape[0]
         rhs = jnp.concatenate([b_r, b_i])
@@ -1475,16 +1529,15 @@ def _periodic_tie_spec(constraint: Any, domain: Any) -> Optional[Tuple[str, str,
     tie = getattr(constraint, "_periodic_tie", None)
     if tie is None:
         return None
-    # The trace stamps `_periodic_tie` on *any* trial-trial combination with clashing coords; only a
-    # plain `u(A) - u(B)` (bare trial sides, no scaling, not `+`) is a tie. Reject the rest loudly
-    # rather than silently mis-reading e.g. `u(A)+u(B)` (anti-periodic) or `2*u(A)-u(B)` as periodic.
+    # The trace stamps `_periodic_tie` on *any* trial-trial combination with clashing coords. A valid
+    # tie is `u(A) - u(B)` (plain periodic) or `u(A) - c*u(B)` with a constant scalar `c` (Bloch /
+    # quasi-periodic, `c = e^{i k·L}`). Reject the rest loudly (e.g. `u(A)+u(B)` anti-periodic).
     bare = _bare(constraint)
-    if getattr(bare, "op", None) != "-" or any(
-        getattr(side, "op", None) in {"+", "-", "*", "/"} for side in (bare.left, bare.right)
-    ):
+    phase = _tie_phase(bare)
+    if phase is None:
         raise ValueError(
-            "jno.fem: a periodic tie must be `u(A) - u(B)` with bare trial sides (no scaling, no `+`). "
-            "Anti-periodic or scaled relations between two boundaries are not supported."
+            "jno.fem: a periodic tie must be `u(A) - u(B)` (periodic) or `u(A) - c*u(B)` with a constant "
+            "scalar `c` (Bloch/quasi-periodic). Anti-periodic (`+`) or non-scalar relations are not supported."
         )
     slave_tag, master_tag = tie
     breg = getattr(domain, "_boundary_regions", {})
@@ -1495,7 +1548,7 @@ def _periodic_tie_spec(constraint: Any, domain: Any) -> Optional[Tuple[str, str,
             f"jno.fem: a periodic tie `u(A) - u(B)` must connect two distinct boundary regions; "
             f"got {slave_tag!r} and {master_tag!r} (known boundary tags: {sorted(breg)})."
         )
-    return (master_tag, slave_tag, None, _field_key_of(constraint))
+    return (master_tag, slave_tag, None, _field_key_of(constraint), phase)
 
 
 def _ref_interior_facet_dofs(ref_pts: np.ndarray, fv: np.ndarray, dim: int, tol: float = 1e-9) -> List[int]:
@@ -1622,7 +1675,7 @@ def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, cells: 
     # that case loudly rather than silently under-identify the corners and mis-solve.
     if len(ties) > 1:
         preds = getattr(domain, "_tag_predicates", {})
-        missing = sorted({t for (m, s, _c, _fk) in ties for t in (m, s) if t not in preds})
+        missing = sorted({t for (m, s, *_ignore) in ties for t in (m, s) if t not in preds})
         if missing:
             raise NotImplementedError(
                 "jno.fem: multidirectional periodicity requires each periodic face to be defined via "
@@ -1635,24 +1688,26 @@ def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, cells: 
     bfacets = _boundary_facets(points, cells, dim, ele_order) if cells is not None else None
     bnodes = np.unique(bfacets) if bfacets is not None and bfacets.size else None
 
-    pairs = [(master, slave) for (master, slave, _comp, _fk) in ties]
+    pairs = [(master, slave) for (master, slave, *_ignore) in ties]
+    # Bloch phase per pair (``e^{i k·L}``); 1.0 = plain periodic (the ties may be 4-tuples pre-Bloch).
+    phases = [complex(t[4]) if len(t) > 4 else 1.0 + 0.0j for t in ties]
     faces: dict = {}
-    for master, slave, _comp, _fk in ties:
+    for master, slave, *_ignore in ties:
         for tag in (master, slave):
             if tag not in faces and (f := _face_nodes(domain, points, bnodes, tag)) is not None:
                 faces[tag] = f
 
     facets: dict = {}
     if bfacets is not None and bfacets.size:
-        for master, _slave, _comp, _fk in ties:
+        for master, _slave, *_ignore in ties:
             fn = set(np.asarray(faces.get(master, np.empty(0, int))).tolist())
             keep = np.array([set(row.tolist()).issubset(fn) for row in bfacets], dtype=bool)
             if keep.any():
                 facets[master] = bfacets[keep]
     else:  # native 1D / no assembly cells -> flat-chain fallback
-        facets = {m: ff for (m, _s, _c, _fk) in ties if (ff := _chain_facets(points, faces.get(m, ()))) is not None}
+        facets = {m: ff for (m, _s, *_ignore) in ties if (ff := _chain_facets(points, faces.get(m, ()))) is not None}
 
-    return build_periodic_prolongation(points, pairs, faces, vec=vec, facets=facets)
+    return build_periodic_prolongation(points, pairs, faces, vec=vec, facets=facets, phases=phases)
 
 
 def _build_periodic_reduction_nonnodal(domain: Any, ties: List[Any], offsets: Any) -> dict:

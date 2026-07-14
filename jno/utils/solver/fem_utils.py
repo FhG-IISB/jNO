@@ -2049,6 +2049,7 @@ def build_periodic_prolongation(
     vec: int = 1,
     tol: float | None = None,
     facets: Dict[str, np.ndarray] | None = None,
+    phases: Sequence[complex] | None = None,
 ) -> Dict[str, object]:
     """Build the node-level periodic prolongation matrix ``P``.
 
@@ -2093,16 +2094,22 @@ def build_periodic_prolongation(
     pts = np.asarray(points, dtype=np.float64)
     n_nodes = pts.shape[0]
     facets = facets or {}
+    if phases is None:
+        phases = [1.0] * len(pairs)
+    # Bloch/quasi-periodic: a non-unit phase makes P complex; a plain periodic cell keeps P real 0/1
+    # so the fast (selection) reduction path is untouched.
+    is_bloch = any(abs(complex(p) - 1.0) > 1e-12 for p in phases)
 
     if tol is None:
         span = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
         tol = max(span, 1.0) * 1.0e-6
 
-    # slave -> master node (exact 0/1 tie); slave -> [(master node, weight)] (interpolated tie).
+    # slave -> master node (exact tie, weight = Bloch phase); slave -> [(master node, weight)] (interp).
     slave_to_master: Dict[int, int] = {}
+    slave_phase: Dict[int, complex] = {}
     slave_interp: Dict[int, List[Tuple[int, float]]] = {}
 
-    for master_tag, slave_tag in pairs:
+    for (master_tag, slave_tag), ph in zip(pairs, phases):
         if master_tag not in tag_indices or slave_tag not in tag_indices:
             raise KeyError(
                 f"Periodic pair ({master_tag!r}, {slave_tag!r}) refers to a tag "
@@ -2129,8 +2136,9 @@ def build_periodic_prolongation(
         for k, sid in enumerate(s_ids):
             if m_ids.size and dist[k] <= tol:  # conforming: exact node-to-node (corners land here too)
                 slave_to_master[int(sid)] = int(m_ids[nn[k]])
+                slave_phase[int(sid)] = complex(ph)
                 continue
-            # non-matching: tie to the master facet by interpolation
+            # non-matching: tie to the master facet by interpolation (weights scaled by the Bloch phase)
             w = _periodic_facet_weights(s_trans[k], facets.get(master_tag), pts, transverse) if facets else None
             if w is None:
                 raise ValueError(
@@ -2139,7 +2147,7 @@ def build_periodic_prolongation(
                     "connectivity was supplied for interpolation. Pass `facets=` (unstructured) or use a "
                     "conforming mesh."
                 )
-            slave_interp[int(sid)] = w
+            slave_interp[int(sid)] = [(int(m), complex(ph) * wt) for (m, wt) in w]
 
     slave_set = set(slave_to_master) | set(slave_interp)
 
@@ -2148,7 +2156,9 @@ def build_periodic_prolongation(
     # several directions, and an interpolation can land on a master edge whose endpoint is itself a
     # slave — so resolve every slave **transitively** to kept (master) nodes. This handles any number
     # of periodic directions (e.g. a doubly-periodic cell) with a single general mechanism.
-    raw: Dict[int, List[Tuple[int, float]]] = {sid: [(m, 1.0)] for sid, m in slave_to_master.items()}
+    raw: Dict[int, List[Tuple[int, complex]]] = {
+        sid: [(m, slave_phase.get(sid, 1.0))] for sid, m in slave_to_master.items()
+    }
     raw.update({sid: list(ws) for sid, ws in slave_interp.items()})
     resolved: Dict[int, Dict[int, float]] = {}
 
@@ -2179,13 +2189,13 @@ def build_periodic_prolongation(
 
     rows: List[int] = []
     cols: List[int] = []
-    data: List[float] = []
+    data: List[complex] = []
     for i in range(n_nodes):
         if i in slave_set:
             for kept_node, weight in _expand(i, frozenset()).items():
                 rows.append(i)
                 cols.append(reduced_index[kept_node])
-                data.append(float(weight))
+                data.append(weight if is_bloch else float(np.real(weight)))
         else:
             rows.append(i)
             cols.append(reduced_index[i])
@@ -2196,7 +2206,7 @@ def build_periodic_prolongation(
 
     rows_a = np.asarray(rows, dtype=np.int64)
     cols_a = np.asarray(cols, dtype=np.int64)
-    data_a = np.asarray(data, dtype=np.float64)
+    data_a = np.asarray(data, dtype=np.complex128 if is_bloch else np.float64)
     if vec > 1:  # kron(P_node, I_vec): each node entry -> vec component entries
         comp = np.arange(vec, dtype=np.int64)
         rows_a = (rows_a[:, None] * vec + comp[None, :]).reshape(-1)
@@ -2216,6 +2226,9 @@ def build_periodic_prolongation(
         # whether P is a one-master-per-slave selection (conforming) -> the sparse remap reduction is
         # exact; computed once here (eager, concrete P) so the reduce path never inspects P under trace.
         "is_selection": _is_selection(P),
+        # Bloch/quasi-periodic: P is complex, so the reduction is Hermitian (P^H A P) and the reduced
+        # complex system can't be split into independent real/imag legs.
+        "is_bloch": bool(is_bloch),
     }
 
 
@@ -2415,8 +2428,9 @@ def _remap_bcoo(mat, m_row, p_row, m_col, p_col, shape):
     return jsparse.BCOO((rdata, ridx), shape=shape)
 
 
-def _remap_bcoo_weighted(mat, P):
-    """Sparse Galerkin reduction ``P^T mat P`` for an *interpolation* (nonconforming) periodic ``P``
+def _remap_bcoo_weighted(mat, P, conj=False):
+    """Sparse Galerkin reduction ``P^T mat P`` (or ``P^H mat P`` when ``conj``) for an *interpolation*
+    (nonconforming) periodic ``P``
     -- a few masters per slave, weighted. Generalises :func:`_remap_bcoo` (one master, weight 1) by
     spreading each ``mat`` triplet ``(r, c, v)`` across the ``D x D`` master pairs of its row and
     column with the interpolation weights: ``v -> v · w_r[a] · w_c[b]`` at ``(master_r[a], master_c[b])``.
@@ -2439,11 +2453,13 @@ def _remap_bcoo_weighted(mat, P):
     D = int(slot.max()) + 1
     master = np.zeros((n_full, D), np.int64)
     master[rows, slot] = cols
-    weight = np.zeros((n_full, D), np.float64)
+    weight = np.zeros((n_full, D), np.complex128 if np.iscomplexobj(pdat) else np.float64)
     weight[rows, slot] = wts
     master, weight = jnp.asarray(master), jnp.asarray(weight)
     r, c, v = mat.indices[:, 0], mat.indices[:, 1], mat.data
     mr, wr, mc, wc = master[r], weight[r], master[c], weight[c]  # (nnz, D)
+    if conj:  # P^H mat P conjugates the row (left) weights
+        wr = jnp.conj(wr)
     nnz = r.shape[0]
     a = jnp.broadcast_to(mr[:, :, None], (nnz, D, D)).reshape(-1)
     b = jnp.broadcast_to(mc[:, None, :], (nnz, D, D)).reshape(-1)
@@ -2452,8 +2468,9 @@ def _remap_bcoo_weighted(mat, P):
     return jsparse.BCOO((data, idx), shape=(n_red, n_red)).sum_duplicates()
 
 
-def reduce_matrix(P, mat, is_selection=None):
-    """Galerkin reduction ``P^T mat P``.
+def reduce_matrix(P, mat, is_selection=None, conj=False):
+    """Galerkin reduction ``P^T mat P`` (or the Hermitian ``P^H mat P`` when ``conj`` — for a complex
+    Bloch/quasi-periodic ``P``, where the left factor must be conjugated).
 
     When ``mat`` is BCOO and ``P`` is a BCOO *selection* (conforming/structured tie, one master per
     slave — e.g. the doubly-periodic PEB) the reduction remaps ``mat``'s triplets to their master
@@ -2467,24 +2484,32 @@ def reduce_matrix(P, mat, is_selection=None):
     ``None`` (a direct/eager call) it is computed once here."""
     if is_selection is None:
         is_selection = _is_selection(P)
+    _dt = lambda x: x.data.dtype if hasattr(x, "data") else np.asarray(x).dtype  # noqa: E731
+    pdtype = np.result_type(_dt(P), _dt(mat))
     if hasattr(mat, "indices") and is_selection:
-        master, pval = _selection_maps(P, mat.data.dtype)
-        return _remap_bcoo(mat, master, pval, master, pval, (int(P.shape[1]), int(P.shape[1])))
+        master, pval = _selection_maps(P, pdtype)
+        prow = jnp.conj(pval) if conj else pval  # P^H remap conjugates the row (left) factor
+        return _remap_bcoo(mat, master, prow, master, pval, (int(P.shape[1]), int(P.shape[1])))
     if hasattr(mat, "indices") and hasattr(P, "indices"):
         # nonconforming (interpolation) tie: weighted triplet-remap, stays sparse (falls back to the
         # dense product below only if P was built under trace, which the nonconforming path never is)
-        remapped = _remap_bcoo_weighted(mat, P)
+        remapped = _remap_bcoo_weighted(mat, P, conj=conj)
         if remapped is not None:
             return remapped
     mat = mat.todense() if hasattr(mat, "todense") else mat
-    P = P if hasattr(P, "todense") else jnp.asarray(P)  # keep a BCOO P sparse
-    return P.T @ jnp.asarray(mat, P.dtype) @ P
+    Pd = jnp.asarray(P.todense() if hasattr(P, "todense") else P, pdtype)
+    left = jnp.conj(Pd).T if conj else Pd.T
+    return left @ jnp.asarray(mat, pdtype) @ Pd
 
 
-def reduce_vector(P, vec):
-    """Reduce a full-space load/bias vector via ``P^T vec`` (dense or BCOO ``P``)."""
-    P = P if hasattr(P, "todense") else jnp.asarray(P)
-    return P.T @ jnp.asarray(vec, P.dtype).reshape(-1)
+def reduce_vector(P, vec, conj=False):
+    """Reduce a full-space load/bias vector via ``P^T vec`` (or ``P^H vec`` when ``conj``)."""
+    Pd = P if hasattr(P, "todense") else jnp.asarray(P)
+    left = (jnp.conj(Pd).T if conj else Pd.T) if not hasattr(Pd, "indices") else None
+    if left is not None:
+        return left @ jnp.asarray(vec, Pd.dtype).reshape(-1)
+    Pc = jsparse.BCOO((jnp.conj(Pd.data), Pd.indices), shape=Pd.shape) if conj else Pd
+    return Pc.T @ jnp.asarray(vec, Pc.dtype).reshape(-1)
 
 
 def restrict_state(P, state_full, kept_nodes, vec: int = 1):
@@ -2545,8 +2570,8 @@ def _periodic_blocks(periodic):
     return block, np.array([0, nf]), np.array([0, nr])
 
 
-def reduce_matrix_periodic(periodic, mat):
-    """``P^T mat P`` for a single- or multi-field periodic reduction.
+def reduce_matrix_periodic(periodic, mat, conj=False):
+    """``P^T mat P`` (or Hermitian ``P^H mat P`` when ``conj``) for a single- or multi-field reduction.
 
     When ``mat`` and every field's ``P_i`` are BCOO, the whole blocked reduction
     ``reduced[i,j] = P_i^T mat[i,j] P_j`` is one global triplet-remap (the per-field offsets are
@@ -2559,39 +2584,50 @@ def reduce_matrix_periodic(periodic, mat):
         return b["is_selection"] if b.get("is_selection") is not None else _is_selection(b["P"])
 
     if len(blocks) == 1:
-        return reduce_matrix(blocks[0]["P"], mat, is_selection=_sel(blocks[0]))  # fast path == single-field
+        return reduce_matrix(blocks[0]["P"], mat, is_selection=_sel(blocks[0]), conj=conj)  # single-field
     if hasattr(mat, "indices") and all(_sel(b) for b in blocks):
         n_full, n_red = int(off_f[-1]), int(off_r[-1])
+        pdtype = np.result_type(*[b["P"].data.dtype for b in blocks], mat.data.dtype)
         gmaster = jnp.zeros(n_full, mat.indices.dtype)
-        gpval = jnp.zeros(n_full, mat.data.dtype)
+        gpval = jnp.zeros(n_full, pdtype)
         for i, b in enumerate(blocks):
             Pi = b["P"]
             full_local = Pi.indices[:, 0]  # field-i local full DOF
             gmaster = gmaster.at[int(off_f[i]) + full_local].set(
                 (int(off_r[i]) + Pi.indices[:, 1]).astype(mat.indices.dtype)
             )
-            gpval = gpval.at[int(off_f[i]) + full_local].set(jnp.asarray(Pi.data, mat.data.dtype))
-        return _remap_bcoo(mat, gmaster, gpval, gmaster, gpval, (n_red, n_red))
+            gpval = gpval.at[int(off_f[i]) + full_local].set(jnp.asarray(Pi.data, pdtype))
+        prow = jnp.conj(gpval) if conj else gpval
+        return _remap_bcoo(mat, gmaster, prow, gmaster, gpval, (n_red, n_red))
     mat = jnp.asarray(mat.todense()) if hasattr(mat, "todense") else jnp.asarray(mat)
-    out = jnp.zeros((int(off_r[-1]), int(off_r[-1])), mat.dtype)
-    _sp = lambda P: P if hasattr(P, "todense") else jnp.asarray(P, mat.dtype)  # keep BCOO sparse  # noqa: E731
+    pdtype = np.result_type(
+        *[np.asarray(b["P"].todense() if hasattr(b["P"], "todense") else b["P"]).dtype for b in blocks], mat.dtype
+    )
+    out = jnp.zeros((int(off_r[-1]), int(off_r[-1])), pdtype)
+    _sp = lambda P: P if hasattr(P, "todense") else jnp.asarray(P, pdtype)  # keep BCOO sparse  # noqa: E731
     for i, bi in enumerate(blocks):
         Pi = _sp(bi["P"])
+        left = (jnp.conj(Pi).T if conj else Pi.T) if not hasattr(Pi, "indices") else Pi.T
         for j, bj in enumerate(blocks):
             Pj = _sp(bj["P"])
-            blk = mat[off_f[i] : off_f[i + 1], off_f[j] : off_f[j + 1]]
-            out = out.at[off_r[i] : off_r[i + 1], off_r[j] : off_r[j + 1]].set(Pi.T @ blk @ Pj)
+            blk = jnp.asarray(mat[off_f[i] : off_f[i + 1], off_f[j] : off_f[j + 1]], pdtype)
+            out = out.at[off_r[i] : off_r[i + 1], off_r[j] : off_r[j + 1]].set(left @ blk @ Pj)
     return out
 
 
-def reduce_vector_periodic(periodic, vec):
-    """``P^T vec`` for a single- or multi-field periodic reduction (per-field block)."""
+def reduce_vector_periodic(periodic, vec, conj=False):
+    """``P^T vec`` (or ``P^H vec`` when ``conj``) for a single- or multi-field reduction (per-field block)."""
     blocks, off_f, _ = _periodic_blocks(periodic)
     if len(blocks) == 1:
-        return reduce_vector(blocks[0]["P"], vec)
+        return reduce_vector(blocks[0]["P"], vec, conj=conj)
     vec = jnp.asarray(vec).reshape(-1)
     _sp = lambda P: P if hasattr(P, "todense") else jnp.asarray(P, vec.dtype)  # keep BCOO sparse  # noqa: E731
-    return jnp.concatenate([_sp(b["P"]).T @ vec[off_f[i] : off_f[i + 1]] for i, b in enumerate(blocks)])
+    out = []
+    for i, b in enumerate(blocks):
+        Pi = _sp(b["P"])
+        Pc = jsparse.BCOO((jnp.conj(Pi.data), Pi.indices), shape=Pi.shape) if (conj and hasattr(Pi, "indices")) else Pi
+        out.append(Pc.T @ vec[off_f[i] : off_f[i + 1]])
+    return jnp.concatenate(out)
 
 
 def restrict_state_periodic(periodic, state):
