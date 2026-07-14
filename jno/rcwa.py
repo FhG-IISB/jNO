@@ -498,17 +498,26 @@ def _volume_constraint(femobj):
 
 
 def _extract_permittivity_coeff(volume_term):
-    """Pull the value-channel (mass) coefficient ``K0**2 * eps`` out of a scalar Helmholtz volume term.
+    """Pull the value-channel (mass) coefficient ``K0**2 * eps`` out of a Helmholtz / Maxwell volume term.
 
-    A Helmholtz volume form is ``grad(u).grad(v) - K0**2 * eps * (u*v)``: the stiffness summands carry
-    trial/test inside ``Jacobian`` nodes, while the mass summand carries them as bare TrialFunction /
-    TestFunction values. We split additively, find the summand with bare trial x test, and drop those
-    two factors — what remains is ``K0**2 * eps``.
-    """
+    SCALAR Helmholtz ``grad(u).grad(v) - K0**2 * eps * (u*v)``: the stiffness summands carry trial/test
+    inside ``Jacobian`` nodes, the mass summand carries them as bare TrialFunction / TestFunction values.
+    VECTOR Maxwell ``inner(curl u, curl v) - K0**2 * eps * inner(u, v)``: the curl-curl summand carries
+    trial/test inside ``curl`` FunctionCalls, the mass summand as a bare ``inner(u, v)``. Either way we
+    split additively, find the mass summand, and drop the trial/test factor(s) — what remains is
+    ``K0**2 * eps`` (scalar ε only for now; anisotropic ε is a follow-on)."""
     import functools
     import operator
 
-    from jno.trace import TestFunction, TrialFunction
+    from jno.trace import FunctionCall, TestFunction, TrialFunction
+
+    def _bare_mass_inner(f):  # inner(u, v) with the trial & test *bare* (the vector Maxwell mass term)
+        if not (isinstance(f, FunctionCall) and getattr(f, "_name", None) == "inner" and len(f.args) == 2):
+            return False
+        a0, a1 = f.args
+        return (isinstance(a0, TrialFunction) and isinstance(a1, TestFunction)) or (
+            isinstance(a0, TestFunction) and isinstance(a1, TrialFunction)
+        )
 
     expr = getattr(volume_term, "expr", volume_term)
     mass = []
@@ -516,22 +525,24 @@ def _extract_permittivity_coeff(volume_term):
         fac = _mul_factors(summand)
         tv = [f for f in fac if isinstance(f, TrialFunction)]
         te = [f for f in fac if isinstance(f, TestFunction)]
-        if not (tv and te):
-            continue  # stiffness / other channel
-        for f in tv + te:
-            if getattr(f, "value_shape", ()) != ():
+        if tv and te:  # scalar Helmholtz mass: bare u * v
+            if any(getattr(f, "value_shape", ()) != () for f in tv + te):
                 raise RcwaError(
-                    "RCWA infers permittivity from a SCALAR Helmholtz term, but this field is "
-                    f"vector/tensor (value_shape={f.value_shape}). Scalar problems only for now."
+                    "RCWA sees a bare vector trial×test product; author the Maxwell mass as inner(u, v) "
+                    "(a vector curl-curl form) rather than a raw component product."
                 )
-        coeff_factors = [f for f in fac if not isinstance(f, (TrialFunction, TestFunction))]
+            coeff_factors = [f for f in fac if not isinstance(f, (TrialFunction, TestFunction))]
+        elif any(_bare_mass_inner(f) for f in fac):  # vector Maxwell mass: inner(u, v)
+            coeff_factors = [f for f in fac if not _bare_mass_inner(f)]
+        else:
+            continue  # stiffness / curl-curl / other channel
         if not coeff_factors:
             raise RcwaError("mass term has no coefficient factor; cannot recover permittivity.")
         mass.append(functools.reduce(operator.mul, coeff_factors))
     if not mass:
         raise RcwaError(
-            "could not find a K0^2*eps*(u*v) mass term in the volume weak form; RCWA needs a scalar "
-            "Helmholtz term. If the permittivity is authored unusually, isolate it as a named coefficient."
+            "could not find a K0^2*eps mass term in the volume weak form (scalar u*v or vector inner(u,v)); "
+            "RCWA needs a Helmholtz/Maxwell term. If ε is authored unusually, isolate it as a named coefficient."
         )
     return functools.reduce(operator.add, mass)
 
@@ -545,6 +556,12 @@ def _contains_trial(node):
     from jno.trace import TrialFunction
 
     return any(isinstance(n, TrialFunction) for n in _walk_nodes(node))
+
+
+def _contains_test(node):
+    from jno.trace import TestFunction
+
+    return any(isinstance(n, TestFunction) for n in _walk_nodes(node))
 
 
 def _product_terms(factors, sign=1):
@@ -569,12 +586,34 @@ def _extract_source_coeff(term):
     test factor, distribute the coefficient into additive terms, and keep those with no trial. Returns the
     source expression (an evaluable coefficient), or None if the term carries no forcing (e.g. a purely
     absorbing boundary ``-i k0 u v``)."""
-    from jno.trace import TestFunction
+    from jno.trace import FunctionCall, TestFunction
+
+    def _vector_load_source(f):  # a factor `inner(g, n×v)` (trial-free g) -> the source g; else None
+        if not (isinstance(f, FunctionCall) and getattr(f, "_name", None) == "inner" and len(f.args) == 2):
+            return None
+        a0, a1 = f.args
+
+        def _cross_test(x):
+            return isinstance(x, FunctionCall) and getattr(x, "_name", None) == "cross" and _contains_test(x)
+
+        if _cross_test(a0) and not (_contains_trial(a1) or _contains_test(a1)):
+            return a1
+        if _cross_test(a1) and not (_contains_trial(a0) or _contains_test(a0)):
+            return a0
+        return None
 
     expr = getattr(term, "expr", term)
     parts = []
     for tsign, summand in _add_split(expr):
         fac = _mul_factors(summand)
+        # vector Maxwell incident source: a factor inner(g, n×v); source = (other factors) · g
+        vinner = next((f for f in fac if _vector_load_source(f) is not None), None)
+        if vinner is not None:
+            part = _vector_load_source(vinner)
+            for cf in (f for f in fac if f is not vinner):
+                part = cf * part
+            parts.append((tsign, part))
+            continue
         if not any(isinstance(f, TestFunction) for f in fac):
             continue
         rest = [f for f in fac if not isinstance(f, TestFunction)]
@@ -592,14 +631,21 @@ def _extract_source_coeff(term):
 
 def _kin_from_source(src_coeff, period, z0, params):
     """Transverse wavevector k_in = ∇⊥(phase) of the incident wave, read from the source coefficient by a
-    small phase difference across the illuminated face -- differentiable in a source ANGLE parameter."""
+    small phase difference across the illuminated face -- differentiable in a source ANGLE parameter.
+
+    Works for a scalar source (Helmholtz) and a VECTOR source (Maxwell, ``inner(g, n×v)``): a plane wave is
+    ``E_inc·e^{i k⊥·r}``, so every component carries the same transverse phase — read it off the dominant
+    component (avoids the N1E edge-sign corruption that a b-based read suffers)."""
     dx, dy = period[0] * 1e-3, period[1] * 1e-3
     x0, y0 = period[0] * 0.5, period[1] * 0.5
-    base = _eval_coeff_points(src_coeff, np.array([[x0, y0, z0]]), params).reshape(())
-    sx = _eval_coeff_points(src_coeff, np.array([[x0 + dx, y0, z0]]), params).reshape(())
-    sy = _eval_coeff_points(src_coeff, np.array([[x0, y0 + dy, z0]]), params).reshape(())
-    kx = jnp.angle(sx / base) / dx
-    ky = jnp.angle(sy / base) / dy
+
+    def _ev(pt):
+        return jnp.reshape(_eval_coeff_points(src_coeff, np.array([pt]), params), (-1,))
+
+    base, sx, sy = _ev([x0, y0, z0]), _ev([x0 + dx, y0, z0]), _ev([x0, y0 + dy, z0])
+    i = jnp.argmax(jnp.abs(base))  # dominant component (index 0 for a scalar source)
+    kx = jnp.angle(sx[i] / base[i]) / dx
+    ky = jnp.angle(sy[i] / base[i]) / dy
     return jnp.stack([kx, ky])
 
 
@@ -640,6 +686,26 @@ def _sample_grid(domain, eps_nodes, grid, nz, period, z_range):
     return E, zs
 
 
+def _source_dof_coords(domain, n_dof):
+    """Coordinates the flat solution/forcing DOFs live on: mesh vertices for a nodal (Lagrange) field,
+    or edge midpoints for a Nédélec (N1E) edge field, whose DOFs are edges — so the source-face detection
+    reads the right positions for a vector Maxwell problem."""
+    pts = np.asarray(domain.points)
+    if n_dof == len(pts):
+        return pts  # nodal (scalar Helmholtz)
+    from jno.utils.solver.fem_topology import BASIX_TET_EDGES, BASIX_TRIANGLE_EDGES, build_edge_topology
+
+    dim = getattr(domain, "dimension", 3)
+    cells = np.asarray(domain.mesh.cells_dict["tetra" if dim == 3 else "triangle"])
+    topo = build_edge_topology(cells, BASIX_TET_EDGES if dim == 3 else BASIX_TRIANGLE_EDGES)
+    if topo.n_edges == n_dof:  # N1E edge DOFs -> edge midpoints
+        return pts[np.asarray(topo.edge_vertices)].mean(axis=1)
+    raise RcwaError(
+        f"cannot map the {n_dof} forcing DOFs to coordinates (mesh has {len(pts)} vertices, "
+        f"{topo.n_edges} edges); RCWA source-face detection supports nodal (Lagrange) and N1E fields."
+    )
+
+
 def _source_kin(femobj, domain, params=None):
     """Read the illuminated face and transverse wavevector k_in from the assembled forcing b.
     ``params`` overrides trainable-parameter values used when assembling (e.g. a K0/source parameter)."""
@@ -664,7 +730,7 @@ def _source_kin(femobj, domain, params=None):
             "no source/forcing found in the problem: nothing to illuminate the cell with. Author an "
             "incident wave (e.g. an inhomogeneous absorbing boundary carrying the incoming field)."
         )
-    pts = np.asarray(domain.points)
+    pts = _source_dof_coords(domain, len(b))
     zc = pts[nz, 2]
     face_z = np.median(zc)
     if np.ptp(zc) > 1e-6 * (pts[:, 2].max() - pts[:, 2].min() + 1e-30) + 1e-9:
@@ -929,6 +995,8 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
         (sc for c in getattr(femobj, "_constraints", []) if (sc := _extract_source_coeff(c)) is not None), None
     )
     src_z = float(_region_centroid(domain, source_face)[2])
+    if src_coeff is not None:  # the source field's phase is the robust k_in (a b-based read is edge-sign-
+        k_in = tuple(float(x) for x in _kin_from_source(src_coeff, period, src_z, cparams))  # corrupted for N1E)
 
     def resample(params):
         def at(li):  # parameter values for layer li: nodal fields barycentrically interpolated, scalars as-is
