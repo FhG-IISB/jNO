@@ -84,6 +84,30 @@ def test_complex_incident_lands_in_the_imag_leg():
     np.testing.assert_allclose(_arr(b_i), 2.0 * k0 * b_ref, atol=1e-8)  # Im leg: 2 k0 · load
 
 
+def test_combined_absorbing_plus_incident_on_one_face():
+    """A single boundary entry may combine the absorbing mass and the incident load —
+    ``i k₀·inner(n×u,n×v) + 2 i k₀·inner(g,n×v)`` — and the additive split routes the bilinear part into A
+    and the trial-free part into b (equal to authoring them as two separate entries)."""
+    d = jno.domain(constructor=jno.domain.cube(mesh_size=0.5))
+    d.tag("top", lambda x, y, z: z > 1.0 - 1e-6)
+    k0 = 2.0
+    u, v = d.fem_symbols(value_shape=(3,), names=("u", "v"), space="N1E")
+    c = d.variable("interior", split=True)
+    xi, yi, zi = c[0], c[1], c[2]
+    ui, vi = u.bind(x=xi, y=yi, z=zi), v.bind(x=xi, y=yi, z=zi)
+    nt = d.variable("top", normals=True)
+    ct = d.variable("top", split=True)
+    tu, tv = u.vector.cross(nt), v.vector.cross(nt)
+    g = vec(1.0 + 0.0 * ct[0], 0.0 * ct[1], 0.0 * ct[2])
+
+    combined = jno.fem([inner(ui, vi), 1j * k0 * inner(tu, tv) + 2j * k0 * inner(g, tv)])
+    separate = jno.fem([inner(ui, vi), 1j * k0 * inner(tu, tv), 2j * k0 * inner(g, tv)])
+    (Ar_c, br_c), (Ai_c, bi_c) = combined._op
+    (Ar_s, br_s), (Ai_s, bi_s) = separate._op
+    np.testing.assert_allclose(_dense(Ai_c), _dense(Ai_s), atol=1e-9)  # same surface mass into A_i
+    np.testing.assert_allclose(_arr(bi_c), _arr(bi_s), atol=1e-9)  # same incident load into b_i
+
+
 def test_driven_maxwell_end_to_end_solves():
     """Integration of commits 1–3: a FULL driven time-harmonic Maxwell problem — curl-curl − k₀²·mass
     volume, the i·k₀ impedance absorbing BC on the whole boundary, and a plane-wave incident source on the

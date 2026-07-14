@@ -521,20 +521,33 @@ def assemble_fem_nonnodal(
     # into A). The only bilinear surface term wired is the N1E tangential-trace mass `c·inner(n×u, n×v)`
     # (the impedance / first-order absorbing Maxwell BC): split it off and assemble it into the stiffness.
     from ..._fem import _bare as _bare_nn
+    from ...trace import FunctionCall as _FC
+    from ...trace import Literal as _Lit
 
     # A weak boundary term is one of: an N1E tangential-trace surface MASS `c·inner(n×u, n×v)` (bilinear →
     # into A, the impedance/absorbing BC); an N1E incident LOAD `inner(g, n×v)` (trial-free → into b, the
-    # source); or an RT pressure load `p·(v·n)` (→ into b). Classify each so the right assembler handles it.
+    # source); or an RT pressure load `p·(v·n)` (→ into b). Split each term additively and classify each
+    # summand, so a combined `i k₀·inner(n×u,n×v) + 2 i k₀·inner(g,n×v)` (absorbing + incident on one face)
+    # is routed correctly. The complex leg wraps the whole term as `real(…)`/`imag(…)` and `.real` does NOT
+    # distribute over `+`, so peel that wrapper first, split inside, then re-wrap each summand.
+    def _signed(x, sign):  # fold a −1 summand sign into the extracted coefficient/source
+        return (_Lit(-1.0) if x is None else (-1.0) * x) if sign < 0 else x
+
     pressure_terms, surface_terms, incident_terms = {}, {}, {}
     for region, terms in (boundary_terms or {}).items():
         for t in terms:
             bt = _bare_nn(t)
-            if (mass := _n1e_surface_mass_spec(bt)) is not None:
-                surface_terms.setdefault(region, []).append(mass[0])
-            elif (load := _n1e_surface_load_spec(bt)) is not None:
-                incident_terms.setdefault(region, []).append(load[0])
-            else:
-                pressure_terms.setdefault(region, []).append(t)
+            wrap, inner_expr = None, bt
+            if isinstance(bt, _FC) and getattr(bt, "_name", None) in ("real", "imag") and len(bt.args) == 1:
+                wrap, inner_expr = bt._name, bt.args[0]
+            for sign, sub in _split_additive_terms(domain, inner_expr):
+                sub_w = sub if wrap is None else (sub.real if wrap == "real" else sub.imag)
+                if (mass := _n1e_surface_mass_spec(sub_w)) is not None:
+                    surface_terms.setdefault(region, []).append(_signed(mass[0], sign))
+                elif (load := _n1e_surface_load_spec(sub_w)) is not None:
+                    incident_terms.setdefault(region, []).append(_signed(load[0], sign))
+                else:
+                    pressure_terms.setdefault(region, []).append(_apply_sign(domain, sign, sub_w))
     nat_load = (
         _apply_natural_boundary_terms(
             jnp.zeros(total), pressure_terms, domain, field_index, spaces, top, np.asarray(pts), offs, n_cells, quad_degree
