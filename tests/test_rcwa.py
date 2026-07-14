@@ -301,6 +301,74 @@ def test_parameter_anywhere_wavelength_and_eps_flow():
 
 
 @needs_fmmax
+def test_incidence_angle_source_parameter_is_differentiable():
+    """An incidence ANGLE written as a jno.np.parameter in the source (its transverse phase) flows:
+    rc.solve() is a trace node over it, and jax.grad matches finite-difference -- read from the graph, no
+    solve args."""
+    import equinox as eqx
+    import jax
+    import jax.numpy as jnp
+
+    from jno.trace_evaluator import TraceEvaluator
+
+    P0, Lz = 0.6, 3.2
+    d = jno.domain(jno.Shape.box(0, 0, 0, P0, P0, Lz, size=0.2))
+    e = 1e-6
+    for nm, f in [
+        ("left", lambda x, y, z: x < e),
+        ("right", lambda x, y, z: x > P0 - e),
+        ("front", lambda x, y, z: y < e),
+        ("back", lambda x, y, z: y > P0 - e),
+        ("bottom", lambda x, y, z: z < e),
+        ("top", lambda x, y, z: z > Lz - e),
+    ]:
+        d.tag(nm, f)
+    u, phi = d.fem_symbols()
+    xi, yi, zi, _ = d.variable("interior", split=True)
+    ui, vi = u.bind(x=xi, y=yi, z=zi), phi.bind(x=xi, y=yi, z=zi)
+
+    def fc(nm):
+        c = d.variable(nm, split=True)
+        return c, u.bind(x=c[0], y=c[1], z=c[2]), phi.bind(x=c[0], y=c[1], z=c[2])
+
+    cb, ubt, vbt = fc("bottom")
+    _ct, utp, vtp = fc("top")
+    _cl, ul, _ = fc("left")
+    _cr, ur, _ = fc("right")
+    _cf, uf, _ = fc("front")
+    _ck, ubk, _ = fc("back")
+    K0 = 2 * jnp.pi
+    kx = jno.np.parameter((), name="kx").initialize(jax.nn.initializers.constant(1.0))  # incidence angle in source
+    ind = jno.fn(
+        lambda x, y, z: jnp.where(((x - 0.3) ** 2 + (y - 0.3) ** 2 < 0.18**2) & (z >= 0.8) & (z < 1.15), 6.0, 1.0),
+        [xi, yi, zi],
+    )
+    src = jno.np.exp(1j * kx * cb[0])  # the incident transverse phase -- a TRACE expression, not a jno.fn
+    cons = [
+        ui.x * vi.x + ui.y * vi.y + ui.z * vi.z - K0**2 * ind * (u * vi),
+        -(1j * K0 * utp) * vtp,
+        -(1j * K0 * ubt - 2j * K0 * src) * vbt,
+        ul - ur,
+        uf - ubk,
+    ]
+    rc = jno.rcwa(cons, orders=40, grid=32, nz=40, params={"kx": 1.0})
+    assert "kx" in rc._rpe
+
+    node = rc.solve().efficiency("T")  # trace node over the angle parameter
+    mc = rc._rpe["kx"]
+    mod0 = mc.model.module
+
+    def T(v):
+        mod = eqx.tree_at(lambda m: m.value, mod0, jnp.asarray(v))
+        return TraceEvaluator({mc.model.layer_id: mod}).evaluate(node)
+
+    g = float(jax.grad(T)(1.0))
+    h = 1e-2
+    fd = (float(T(1.0 + h)) - float(T(1.0 - h))) / (2 * h)
+    assert abs(g - fd) < 5e-3, f"dT/dkx autodiff {g} vs finite-diff {fd}"
+
+
+@needs_fmmax
 def test_free_form_nodal_density_is_differentiable():
     """A per-node (topology-optimisation) density — jno.np.parameter(<symbol>) — flows: solve() is a trace
     node over the whole nodal field, and jax.grad w.r.t. it matches a directional finite-difference."""

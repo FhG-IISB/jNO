@@ -541,6 +541,68 @@ def _has_nodal_field(node):
     return any(getattr(mc.model, "_fem_field", None) == "node" for mc in _model_calls(node))
 
 
+def _contains_trial(node):
+    from jno.trace import TrialFunction
+
+    return any(isinstance(n, TrialFunction) for n in _walk_nodes(node))
+
+
+def _product_terms(factors, sign=1):
+    """Expand a product of factors (some of which may be additive sums) into signed additive terms."""
+    import functools
+    import operator
+
+    from jno.trace import BinaryOp
+
+    for i, f in enumerate(factors):
+        if isinstance(f, BinaryOp) and f.op in ("+", "-"):
+            rest = factors[:i] + factors[i + 1 :]
+            terms = []
+            for s2, summ in _add_split(f):
+                terms += _product_terms(rest + [summ], sign * s2)
+            return terms
+    return [(sign, functools.reduce(operator.mul, factors) if factors else 1.0)]
+
+
+def _extract_source_coeff(term):
+    """The trial-free (forcing) part of a boundary term ``coeff*v`` -- i.e. the incident wave. Peel the
+    test factor, distribute the coefficient into additive terms, and keep those with no trial. Returns the
+    source expression (an evaluable coefficient), or None if the term carries no forcing (e.g. a purely
+    absorbing boundary ``-i k0 u v``)."""
+    from jno.trace import TestFunction
+
+    expr = getattr(term, "expr", term)
+    parts = []
+    for tsign, summand in _add_split(expr):
+        fac = _mul_factors(summand)
+        if not any(isinstance(f, TestFunction) for f in fac):
+            continue
+        rest = [f for f in fac if not isinstance(f, TestFunction)]
+        for psign, part in _product_terms(rest, tsign):
+            if not _contains_trial(part):
+                parts.append((psign, part))
+    if not parts:
+        return None
+    total = None
+    for psign, part in parts:
+        t = part if psign > 0 else (-1.0) * part
+        total = t if total is None else total + t
+    return total
+
+
+def _kin_from_source(src_coeff, period, z0, params):
+    """Transverse wavevector k_in = ∇⊥(phase) of the incident wave, read from the source coefficient by a
+    small phase difference across the illuminated face -- differentiable in a source ANGLE parameter."""
+    dx, dy = period[0] * 1e-3, period[1] * 1e-3
+    x0, y0 = period[0] * 0.5, period[1] * 0.5
+    base = _eval_coeff_points(src_coeff, np.array([[x0, y0, z0]]), params).reshape(())
+    sx = _eval_coeff_points(src_coeff, np.array([[x0 + dx, y0, z0]]), params).reshape(())
+    sy = _eval_coeff_points(src_coeff, np.array([[x0, y0 + dy, z0]]), params).reshape(())
+    kx = jnp.angle(sx / base) / dx
+    ky = jnp.angle(sy / base) / dy
+    return jnp.stack([kx, ky])
+
+
 def _sample_grid_direct(coeff_node, grid, nz, period, z_range, params=None):
     """Evaluate an analytic coefficient expression directly on the RCWA grid (exact, no mesh noise).
 
@@ -706,12 +768,12 @@ class _RcwaProblem:
         )
 
     def _solve_at(self, params):
-        """Concrete solve at explicit parameter values (JAX) -- re-derives eps AND wavelength from them."""
+        """Concrete solve at explicit parameter values (JAX) -- re-derives eps, wavelength AND k_in."""
         eng = self._engine()
         if not params or self._resample is None:
             return eng.solve()
-        layers, wl = self._resample(params)
-        return eng.solve(layers=layers, wavelength=wl)
+        layers, wl, kin = self._resample(params)
+        return eng.solve(layers=layers, wavelength=wl, k_in=kin)
 
     def solve(self, params=None, wavelength=None, k_in=None):
         """Solve.
@@ -737,8 +799,12 @@ class _RcwaProblem:
                 "for an analytic permittivity (no per-node field). This problem uses a nodal-field "
                 "permittivity; differentiable nodal re-sampling is not implemented yet."
             )
-        layers, wl = self._resample(params)
-        return eng.solve(layers=layers, wavelength=wavelength if wavelength is not None else wl, k_in=k_in)
+        layers, wl, kin = self._resample(params)
+        return eng.solve(
+            layers=layers,
+            wavelength=wavelength if wavelength is not None else wl,
+            k_in=k_in if k_in is not None else kin,
+        )
 
 
 def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, params=None, formulation="JONES_DIRECT_FOURIER"):
@@ -833,6 +899,13 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
         tree = cKDTree(np.asarray(domain.points))
         nearest = [np.asarray(tree.query(_cell_grid_at_z(period, grid, zm))[1]) for zm in zmids]
 
+    # the illuminated boundary term's forcing -> lets an incidence-ANGLE parameter in the source flow
+    # (its transverse phase gradient IS k_in); None when the source has no angle to read.
+    src_coeff = next(
+        (sc for c in getattr(femobj, "_constraints", []) if (sc := _extract_source_coeff(c)) is not None), None
+    )
+    src_z = float(_region_centroid(domain, source_face)[2])
+
     def resample(params):
         def at(li):  # parameter values for layer li: nodal fields gathered to the grid, scalars as-is
             return {k: (jnp.asarray(v)[nearest[li]] if k in nodal_names else jnp.asarray(v)) for k, v in params.items()}
@@ -843,7 +916,8 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
         for li, (thick, zmid) in enumerate(zip(thicks, zmids)):
             cvals = jnp.reshape(_eval_coeff_points(coeff_node, _cell_grid_at_z(period, grid, zmid), at(li)), (grid, grid))
             out.append((thick, jnp.real(cvals) / (k0 * k0)))
-        return out, 2 * jnp.pi / k0
+        kin = _kin_from_source(src_coeff, period, src_z, params) if src_coeff is not None else jnp.asarray(k_in)
+        return out, 2 * jnp.pi / k0, kin
 
     # the trainable jno.np.parameter(s) the permittivity depends on -> solve() returns trace nodes over
     # them (crux threads the values), so the parameterised constraint list is differentiable with no solve
@@ -852,7 +926,9 @@ def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, param
     from jno.utils.solver.parametric_helpers import _collect_runtime_parameter_exprs
 
     rpe = {}
-    _collect_runtime_parameter_exprs(coeff_node, rpe)
+    _collect_runtime_parameter_exprs(coeff_node, rpe)  # eps / wavelength parameters
+    if src_coeff is not None:
+        _collect_runtime_parameter_exprs(src_coeff, rpe)  # an incidence-angle parameter in the source
 
     spec = RcwaSpec(
         period=period,
