@@ -2570,6 +2570,69 @@ def _periodic_blocks(periodic):
     return block, np.array([0, nf]), np.array([0, nr])
 
 
+def build_periodic_prolongation_n1e(n_edges, edge_midpoints, edge_dirs, etags, pairs, phases=None, tol=None):
+    """DOF-level periodic (Floquet/Bloch) prolongation for a lowest-order Nédélec (N1E) edge field.
+
+    Each edge carries one tangential-moment DOF. A slave-face edge ties to the master-face edge at the same
+    transverse position; the tie weight is the Bloch phase times an orientation **sign** (+1 if the two
+    edges point the same way along their lo→hi canonical direction, −1 if opposed — the tangential moment
+    flips with the edge orientation). Corner edges shared by two periodic faces are tied twice; the chain is
+    resolved to a single retained master DOF. Returns a legacy single-field prolongation dict."""
+    mid = np.asarray(edge_midpoints, dtype=np.float64)
+    dirs = np.asarray(edge_dirs, dtype=np.float64)
+    if phases is None:
+        phases = [1.0] * len(pairs)
+    is_bloch = any(abs(complex(p) - 1.0) > 1e-12 for p in phases)
+    if tol is None:
+        span = float(np.linalg.norm(mid.max(axis=0) - mid.min(axis=0)))
+        tol = max(span, 1.0) * 1.0e-6
+
+    s2m: Dict[int, int] = {}  # slave edge -> master edge
+    weight: Dict[int, complex] = {}  # slave edge -> tie weight (orientation sign × Bloch phase)
+    for (mtag, stag), ph in zip(pairs, phases):
+        me, se = np.asarray(etags[mtag], dtype=int), np.asarray(etags[stag], dtype=int)
+        if me.size == 0 or se.size == 0:
+            raise ValueError(f"periodic N1E: boundary tag {mtag!r}/{stag!r} has no edges to tie.")
+        mm, sm = mid[me], mid[se]
+        axis = int(np.argmax(np.abs(mm.mean(axis=0) - sm.mean(axis=0))))  # periodic axis = largest mean gap
+        tr = [d for d in range(mid.shape[1]) if d != axis]
+        mt, st = mm[:, tr], sm[:, tr]
+        d2 = np.sum((st[:, None, :] - mt[None, :, :]) ** 2, axis=-1)
+        nn = np.argmin(d2, axis=1)
+        dist = np.sqrt(d2[np.arange(len(se)), nn])
+        for k, s in enumerate(se):
+            if dist[k] > tol:
+                raise ValueError(
+                    f"periodic N1E: slave edge {int(s)} has no transverse master match "
+                    f"(nearest {dist[k]:.2e} > tol {tol:.2e}); a conforming periodic mesh is required."
+                )
+            m = int(me[nn[k]])
+            sign = 1.0 if float(dirs[int(s)] @ dirs[m]) >= 0.0 else -1.0
+            s2m[int(s)], weight[int(s)] = m, sign * complex(ph)
+
+    slaves = set(s2m)
+    kept = np.array([e for e in range(n_edges) if e not in slaves], dtype=int)
+    col = {int(e): j for j, e in enumerate(kept)}
+    P = np.zeros((n_edges, len(kept)), dtype=(np.complex128 if is_bloch else np.float64))
+    for j, e in enumerate(kept):
+        P[e, j] = 1.0
+    for s in slaves:  # resolve a possibly-chained tie (corner edge tied via two faces) to a kept master
+        m, w = s2m[s], weight[s]
+        while m in s2m:
+            w *= weight[m]
+            m = s2m[m]
+        P[s, col[m]] = w if is_bloch else w.real  # non-Bloch weight is a real ±1 sign
+    return {
+        "P": jnp.asarray(P),
+        "kept_nodes": kept,
+        "vec": 1,
+        "is_selection": False,  # ±1 signs (and complex phases) → not a pure 0/1 selection
+        "is_bloch": is_bloch,
+        "n_full": int(n_edges),
+        "n_red": int(len(kept)),
+    }
+
+
 def reduce_matrix_periodic(periodic, mat, conj=False):
     """``P^T mat P`` (or Hermitian ``P^H mat P`` when ``conj``) for a single- or multi-field reduction.
 

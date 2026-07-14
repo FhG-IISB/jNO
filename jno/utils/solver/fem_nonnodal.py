@@ -338,6 +338,22 @@ def assemble_fem_nonnodal(
             "family": "Morley" if has_morley else ("Argyris" if has_argyris else "Hermite"),
         }
 
+    # N1E (H(curl) edge) topology for periodic (Floquet/Bloch) ties: each DOF is one edge's tangential
+    # moment, so a periodic tie matches boundary edges across faces (by midpoint) with an orientation sign
+    # (the lo→hi edge direction). Read back in ``_fem._build_periodic_reduction_n1e`` when ties are present.
+    if "N1E" in spaces and top is not None:
+        _evn = np.asarray(top.edge_vertices)
+        _ptsn = np.asarray(pts)
+        domain._fem_nonnodal_topology = {
+            "n_verts": int(_ptsn.shape[0]),
+            "n_edges": int(n_edges),
+            "vertex_points": _ptsn,
+            "edge_vertices": _evn,
+            "edge_midpoints": 0.5 * (_ptsn[_evn[:, 0]] + _ptsn[_evn[:, 1]]),
+            "edge_dirs": _ptsn[_evn[:, 1]] - _ptsn[_evn[:, 0]],  # lo→hi direction (sets the tangential sign)
+            "family": "N1E",
+        }
+
     # Hermite per-cell global DOF map: 3 DOFs per vertex (value, ∂x, ∂y, in basix order) + 1 interior
     # (centroid) DOF per cell. Continuity is automatic from shared global vertex ids (point functionals --
     # no edge dedup, no orientation sign; the M(cell) transform takes that role).

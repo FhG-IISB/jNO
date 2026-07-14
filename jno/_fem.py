@@ -1720,6 +1720,48 @@ def _build_periodic_reduction(domain: Any, ties: List[Any], points: Any, cells: 
     return build_periodic_prolongation(points, pairs, faces, vec=vec, facets=facets, phases=phases)
 
 
+def _build_periodic_reduction_n1e(domain: Any, ties: List[Any], offsets: Any) -> dict:
+    """Periodic (Floquet/Bloch) reduction for a **Nédélec N1E** edge field — a DOF-level edge prolongation.
+    Each DOF is one edge's tangential moment, so a tie matches boundary edges across the periodic faces (by
+    midpoint) with an orientation sign and the Bloch phase. Uses the edge topology the non-nodal assembler
+    stashed. Every field is the same N1E element, so one per-field ``P`` is built and block-concatenated."""
+    from .utils.solver.fem_utils import build_periodic_prolongation_n1e
+
+    topo = domain._fem_nonnodal_topology
+    n_edges = int(topo["n_edges"])
+    vpts = np.asarray(topo["vertex_points"])
+    ev = np.asarray(topo["edge_vertices"])
+    emid = np.asarray(topo["edge_midpoints"])
+    edir = np.asarray(topo["edge_dirs"])
+
+    pairs = [(master, slave) for (master, slave, *_rest) in ties]
+    phases = [(t[4] if len(t) > 4 and t[4] is not None else 1.0) for t in ties]  # Bloch phase (e^{iφ}) per tie
+    etags: dict = {}
+    for tag in {t for tie in ties for t in tie[:2]}:
+        f = _face_nodes(domain, vpts, None, tag)
+        if f is None or np.asarray(f).size == 0:
+            raise ValueError(f"jno.fem periodic (N1E): boundary tag {tag!r} has no mesh vertices.")
+        vset = set(int(v) for v in np.asarray(f, dtype=int).reshape(-1))
+        # a global edge is on the boundary tag iff BOTH its canonical vertices are on that tag
+        etags[tag] = np.asarray([e for e in range(n_edges) if int(ev[e, 0]) in vset and int(ev[e, 1]) in vset], dtype=int)
+
+    red = build_periodic_prolongation_n1e(n_edges, emid, edir, etags, pairs, phases)
+    n_fields = len(offsets) - 1
+    blocks, off_full, off_red = [], [0], [0]
+    for _ in range(n_fields):
+        blocks.append({"P": red["P"], "kept": red["kept_nodes"], "vec": 1, "is_selection": red["is_selection"]})
+        off_full.append(off_full[-1] + red["n_full"])
+        off_red.append(off_red[-1] + red["n_red"])
+    return {
+        "blocks": blocks,
+        "off_full": off_full,
+        "off_red": off_red,
+        "n_full": off_full[-1],
+        "n_red": off_red[-1],
+        "is_bloch": red["is_bloch"],
+    }
+
+
 def _build_periodic_reduction_nonnodal(domain: Any, ties: List[Any], offsets: Any) -> dict:
     """Periodic reduction for **non-nodal C¹** fields (Morley) — a DOF-level prolongation the node-based
     builder can't produce. Uses the C¹ topology the non-nodal assembler stashed on the domain: value
@@ -2214,6 +2256,17 @@ def fem(
 
     domain = _discover_domain(constraints)
 
+    # Nédélec (N1E) periodic ties need a CONFORMING periodic mesh — the per-edge DOFs must line up
+    # one-to-one across the tied faces, which gmsh's default unstructured mesh does not guarantee. Infer
+    # this from the constraint list: when periodic ties are present on an N1E field, re-mesh the (Shape-
+    # backed) domain once with gmsh setPeriodic on the tied face pairs. No `periodic=` arg — driven purely
+    # by the periodic conditions the user already authored. (Nodal fields tie by interpolation and need no
+    # re-mesh, so this is gated on N1E.)
+    if "N1E" in _trial_spaces(constraints) and hasattr(domain, "_remesh_periodic"):
+        _pairs = [(s[0], s[1]) for c in constraints if (s := _periodic_tie_spec(c, domain)) is not None]
+        if _pairs:
+            domain._remesh_periodic(_pairs)
+
     # Periodic ties `u(A) - u(B)` are enforced by algebraic reduction (a prolongation P that
     # eliminates the slave-face DOFs), not by assembly. Separate them out *before* the weak/Dirichlet
     # classification (`_region_and_support` would otherwise reject a residual that spans two regions).
@@ -2361,7 +2414,11 @@ def fem(
             # (``None`` for the native 1D route, which falls back to flat-chain facets on points).
             cells = getattr(domain, "_fem_native_assembly_cells", None)
             ele_order = int(getattr(domain, "_fem_native_assembly_order", 1))
-        if getattr(domain, "_fem_nonnodal_topology", None) is not None:
+        _nonnodal_topo = getattr(domain, "_fem_nonnodal_topology", None)
+        if _nonnodal_topo is not None and _nonnodal_topo.get("family") == "N1E":
+            # Nédélec N1E (H(curl) edge): DOF-level edge prolongation (Floquet/Bloch, with orientation sign)
+            periodic = _build_periodic_reduction_n1e(domain, periodic_ties, fem_obj.offsets)
+        elif _nonnodal_topo is not None:
             # non-nodal C¹ (Morley): DOF-level reduction (value + signed edge-derivative ties)
             periodic = _build_periodic_reduction_nonnodal(domain, periodic_ties, fem_obj.offsets)
         elif multifield:

@@ -230,7 +230,35 @@ def _to_meshio(dim: int, labels: Dict[int, Tuple[int, str]]):
     return meshio.Mesh(points=coords, cells=cells, cell_sets=cell_sets)
 
 
-def _build_once(shape, split_full):
+def _apply_periodic(dim, labels, periodic):
+    """gmsh ``setPeriodic`` for each ``(master_name, slave_name)`` boundary-face pair: mesh the slave face
+    as a *translated copy* of the master so opposite boundaries mesh identically (conforming) — required
+    for edge-element (Nédélec) periodic ties, whose per-edge DOFs must line up one-to-one across the cell.
+    The translation is read from the face bounding-box centroids; a pair whose faces aren't both present is
+    skipped (nothing to tie)."""
+    import gmsh
+    import numpy as np
+
+    bdim = dim - 1
+    by_name: dict = {}
+    for etag, lab in labels.items():
+        if lab is not None:
+            by_name.setdefault(lab[1], []).append(int(etag))
+
+    def _centroid(tags):
+        bb = np.array([gmsh.model.getBoundingBox(bdim, t) for t in tags])  # (n, 6): (xlo,ylo,zlo,xhi,yhi,zhi)
+        return 0.5 * (bb[:, :3].min(axis=0) + bb[:, 3:].max(axis=0))
+
+    for master, slave in periodic:
+        m_tags, s_tags = by_name.get(master, []), by_name.get(slave, [])
+        if not m_tags or not s_tags:
+            continue
+        t = _centroid(s_tags) - _centroid(m_tags)  # translation master -> slave
+        affine = [1, 0, 0, t[0], 0, 1, 0, t[1], 0, 0, 1, t[2], 0, 0, 0, 1]  # row-major 4×4
+        gmsh.model.mesh.setPeriodic(bdim, s_tags, m_tags, affine)
+
+
+def _build_once(shape, split_full, periodic=None):
     import gmsh
 
     started = not gmsh.isInitialized()
@@ -246,6 +274,8 @@ def _build_once(shape, split_full):
         leaves = shape.leaves()
         labels = classify_boundary(dim, shape)
         ds = _apply_size_fields(dim, leaves, labels, shape)
+        if periodic:  # make named opposite faces conform (edge-element periodic ties need it)
+            _apply_periodic(dim, labels, periodic)
         gmsh.model.mesh.generate(dim)
         mesh = _to_meshio(dim, labels)
         return mesh, dim, ds
@@ -255,16 +285,19 @@ def _build_once(shape, split_full):
             gmsh.finalize()
 
 
-def build(shape):
+def build(shape, periodic=None):
     """Mesh ``shape`` -> ``(meshio.Mesh, dim, ds)``.
 
-    A single-sweep full (2pi) revolve of a *detached* profile makes a periodic surface gmsh
-    cannot mesh, while an axis-touching profile (a cone) meshes fine that way -- so we try the
-    single sweep first and only fall back to the two-halves construction if meshing fails.
+    ``periodic`` is an optional list of ``(master_name, slave_name)`` boundary-face pairs meshed conforming
+    (via :func:`_apply_periodic`) so opposite faces line up — needed for Nédélec edge periodic ties.
+
+    A single-sweep full (2pi) revolve of a *detached* profile makes a periodic surface gmsh cannot mesh,
+    while an axis-touching profile (a cone) meshes fine that way -- so we try the single sweep first and
+    only fall back to the two-halves construction if meshing fails.
     """
     try:
-        return _build_once(shape, split_full=False)
+        return _build_once(shape, split_full=False, periodic=periodic)
     except Exception as exc:  # noqa: BLE001 - narrow retry on the periodic-surface mesher failure
         if "periodic" in str(exc).lower() and _has_full_revolve(shape._node):
-            return _build_once(shape, split_full=True)
+            return _build_once(shape, split_full=True, periodic=periodic)
         raise
