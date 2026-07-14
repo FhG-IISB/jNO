@@ -675,22 +675,26 @@ class _RcwaProblem:
             assume_periodic=True,
         )
 
-    def solve(self, params=None):
+    def solve(self, params=None, wavelength=None):
         """Build the fmmax engine and solve.
 
         Pass ``params={name: value}`` (JAX values for the trainable ``jno.np.parameter`` coefficients) to
         get a **differentiable** solve: the permittivity is re-sampled from those values and the whole
-        modal solve traces, so ``jax.grad`` of a ``sol.efficiency(...)`` objective flows to the design."""
+        modal solve traces, so ``jax.grad`` of a ``sol.efficiency(...)`` objective flows to the design.
+
+        Pass ``wavelength`` to override the inferred one -- sweep it for a **broadband / dispersion**
+        response (the transverse wavevector ``k_in`` is held fixed, i.e. fixed-momentum dispersion). The
+        result is differentiable in the wavelength too."""
         eng = self._engine()
         if params is None:
-            return eng.solve()
+            return eng.solve(wavelength=wavelength)
         if self._resample is None:
             raise RcwaError(
                 "differentiable solve(params=...) needs the analytic re-sampling path, which is only built "
                 "for an analytic permittivity (no per-node field). This problem uses a nodal-field "
                 "permittivity; differentiable nodal re-sampling is not implemented yet."
             )
-        return eng.solve(layers=self._resample(params))
+        return eng.solve(layers=self._resample(params), wavelength=wavelength)
 
 
 def rcwa(problem, *, orders, wavelength=None, grid=64, nz=64, slices=None, formulation="JONES_DIRECT_FOURIER"):

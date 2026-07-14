@@ -242,6 +242,31 @@ def test_efficiency_is_differentiable_in_the_design():
 
 
 @needs_fmmax
+def test_broadband_spectrum_and_wavelength_gradient():
+    """Sweeping wavelength gives a dispersion curve; T is differentiable in wavelength (matches FD)."""
+    import jax
+    import jax.numpy as jnp
+
+    from jno.rcwa import Rcwa
+
+    P, r, th, ng = 0.6, 0.18, 0.5, 32
+    xs = (np.arange(ng) + 0.5) / ng * P
+    X, Y = np.meshgrid(xs, xs, indexing="ij")
+    E = jnp.asarray(np.where((X - P / 2) ** 2 + (Y - P / 2) ** 2 < r**2, 6.0, 1.0))
+    rc = Rcwa([(INF, 1.0), (th, E), (INF, 1.0)], period=(P, P), orders=40, wavelength=1.0, assume_periodic=True)
+
+    def T(wl):
+        return rc.solve(wavelength=wl).efficiency("T")
+
+    spec = [float(T(wl)) for wl in (0.9, 1.0, 1.2)]
+    assert max(spec) - min(spec) > 0.1, f"expected a dispersive response, got {spec}"  # not flat
+    g = float(jax.grad(T)(1.0))
+    h = 1e-2
+    fd = (float(T(1.0 + h)) - float(T(1.0 - h))) / (2 * h)
+    assert abs(g - fd) < 5e-2, f"dT/dlambda autodiff {g} vs finite-diff {fd}"
+
+
+@needs_fmmax
 def test_infer_and_solve_end_to_end():
     """The full path: infer from the periodic problem, then solve — energy must be conserved."""
     constraints, _ = _build_periodic_problem()
