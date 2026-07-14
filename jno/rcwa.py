@@ -134,9 +134,10 @@ def detect_layers(E, z, tol=1e-3, slices=None):
 # The forward engine (explicit layers) — the fmmax backend the front door constructs.
 # =====================================================================================
 class _Sol:
-    def __init__(self, fm, s, layers, expansion, nt, Pin, wavelength):
+    def __init__(self, fm, s, layers, expansion, nt, Pin, wavelength, thick=None, period=None):
         self._fm, self._s, self._layers, self._ex = fm, s, layers, expansion
         self._nt, self._Pin, self._wl = nt, Pin, wavelength
+        self._thick, self._period = thick, period
         self._fwd = np.zeros((2 * nt, 1), complex)
 
     def _flux(self, amps, layer, backward=False):
@@ -170,6 +171,29 @@ class _Sol:
             ).reshape(-1)
         )
         return float(tf[i] + tf[i + self._nt]) / self._Pin
+
+    def field(self, y_frac=0.5, nx=80, density=40.0):
+        """Reconstruct the real-space electric field on a vertical (x–z) slice at ``y = y_frac·Py``.
+
+        Returns ``(intensity, extent, layer_z)``: ``intensity`` = ``|E|²`` of shape ``(nz, nx)`` (z
+        vertical, x horizontal) for ``imshow``; ``extent`` = ``[0, Px, z_min, z_max]``; ``layer_z`` = the
+        z-interfaces between layers (to annotate the patterned slab). Needs the finite ambient
+        thickness recorded at solve time (semi-infinite ambients are shown as unit-thick slabs)."""
+        fm = self._fm
+        if self._thick is None:
+            raise RcwaError("field() needs the layer thicknesses; call .solve() (which records them).")
+        znum = [max(4, int(round(float(t) * density))) for t in self._thick]
+        smi = fm.stack_s_matrices_interior(self._layers, self._thick)
+        amps = fm.stack_amplitudes_interior(smi, self._fwd, np.zeros_like(self._fwd))
+        efield, _h, (x, y, z) = fm.stack_fields_3d(amps, self._layers, self._thick, znum, grid_shape=(nx, nx))
+        E = np.asarray(efield)  # (3, nx, ny, nz, 1)
+        inten = np.sum(np.abs(E) ** 2, axis=0)[..., 0]  # (nx, ny, nz)
+        yv = np.asarray(y)
+        j = int(np.argmin(np.abs(yv[0, :] - y_frac * self._period[1])))
+        slab = inten[:, j, :].T  # (nz, nx): z vertical, x horizontal
+        zc = np.asarray(z).reshape(-1)
+        layer_z = list(np.cumsum([float(t) for t in self._thick]))[:-1]
+        return slab, [0.0, float(self._period[0]), float(zc.min()), float(zc.max())], layer_z
 
 
 class Rcwa:
@@ -255,7 +279,7 @@ class Rcwa:
             raise RcwaError("no forward-propagating incident mode in the superstrate; check wavelength/period.")
         fwd = np.zeros((2 * nt, 1), complex)
         fwd[idx, 0] = 1.0
-        sol = _Sol(fm, s, layers, ex, nt, Pin, wl)
+        sol = _Sol(fm, s, layers, ex, nt, Pin, wl, thick=thick, period=self.period)
         sol._fwd = fwd
         T, R = sol.efficiency("T"), sol.efficiency("R")
         if not (np.isfinite(T) and np.isfinite(R)):
