@@ -21,12 +21,14 @@ Scope: scalar fields on a **2-D triangular or 3-D tetrahedral mesh**. The interi
 (``jno.fdm.laplacian`` / ``jno.fdm.gradient``, and the constraint-list ``u.d2(x)+u.d2(y)+u.d2(z)``
 authoring) dispatch on ``domain.dimension``; a tet mesh has no cotangent Laplace-Beltrami, so its
 Laplacian is the first-order ``gradient_of_gradient`` double-difference (accuracy leans on
-refinement). Flux BCs and geometric sub-regions are 2-D for now (3-D face-normal flux and 3-D
-containment are the next extensions). In 2-D, **any mix** of steady boundary conditions — Dirichlet
-``u(region) - g``, and **any flux BC affine in the normal derivative** ``∂u/∂n`` written with that
-edge's boundary tags: Neumann ``ur.d(n) - h``, Robin ``ur.d(n) + α(u - u∞)``, a coordinate-coefficient
-``κ(x)·ur.d(n)``, either sign (``ur = u.bind(x=xr, y=yr)``, ``n = domain.variable(region, normals=True)``;
-corner nodes fall back to the PDE residual). Plus **transient** problems by method-of-lines (``M = I``;
+refinement). **Any mix** of steady boundary conditions — Dirichlet ``u(region) - g``, and **any flux BC
+affine in the normal derivative** ``∂u/∂n`` written with that region's boundary tags: Neumann
+``ur.d(n) - h``, Robin ``ur.d(n) + α(u - u∞)``, a coordinate-coefficient ``κ(x)·ur.d(n)``, either sign
+(``ur = u.bind(x=xr, y=yr[, z=zr])``, ``n = domain.variable(region, normals=True)``). Flux normals come
+from the mesh boundary **segments in 2-D** (a corner node — undefined normal — falls back to the PDE
+residual) and boundary **faces in 3-D** (each oriented outward exactly via its owning tet's apex, so a
+flat face gives an exact axis normal, no corner heuristic). Plus **transient** problems by
+method-of-lines (``M = I``;
 a unit-coefficient ``u.t`` term, e.g. ``ui.t - νΔu``) — all with linear + nonlinear residuals. Transient
 flux BCs, periodic, a general ``u.t`` mass coefficient, and a structured-grid stencil backend are planned
 extensions (see ``plans/fdm-solver.md``). A pure-Neumann problem (no Dirichlet node) is singular
@@ -526,19 +528,25 @@ class _TraceFDM:
         return rows
 
     def _node_normals(self, region):
-        """Unit outward normals for the **smooth-edge** nodes of ``region``, aligned to those nodes.
+        """Unit outward normals for the flux nodes of ``region``, aligned to those nodes.
 
-        Computed from the mesh **boundary segments** (``mesh_connectivity["boundary_edges"]``): each
-        segment's exact perpendicular is averaged over the (two) segments meeting at a node, so an
+        **2-D** — computed from the mesh **boundary segments** (``mesh_connectivity["boundary_edges"]``):
+        each segment's exact perpendicular is averaged over the (two) segments meeting at a node, so an
         axis-aligned edge yields an exact ``(±1, 0)`` / ``(0, ±1)`` — much cleaner than the domain's
         smoothed per-point normal, which bleeds a tangential component near corners and would spoil the
-        flux. Outward orientation is taken (sign only) from ``domain.variable(region, normals=True)``.
-
-        A **corner** node averages two differently-oriented segment normals, so the averaged magnitude
+        flux. Outward orientation is taken (sign only) from ``domain.variable(region, normals=True)``. A
+        **corner** node averages two differently-oriented segment normals, so the averaged magnitude
         drops (≈0.71 at a right angle): the outward normal is undefined there, so corners are **dropped**
         from the flux row and keep their interior PDE residual (give a corner an explicit Dirichlet
-        condition if it needs one). Returns ``(kept_node_indices, unit_n)``."""
+        condition if it needs one).
+
+        **3-D** — see :meth:`_node_normals_3d`: the region's boundary triangles are oriented outward
+        exactly via each face's owning-tet apex, so no corner heuristic is needed.
+
+        Returns ``(kept_node_indices, unit_n)``."""
         dim = self.domain.dimension
+        if dim == 3:
+            return self._node_normals_3d(region)
         pts = np.asarray(self._pts)
         edges = np.asarray(self.domain.mesh_connectivity["boundary_edges"], dtype=int)  # (E, 2) node pairs
         tang = pts[edges[:, 1]] - pts[edges[:, 0]]
@@ -565,6 +573,28 @@ class _TraceFDM:
         idx, raw = idx[smooth], raw[smooth]
         n = raw / (np.linalg.norm(raw, axis=1, keepdims=True) + 1e-30)
         return idx, jnp.asarray(n)
+
+    def _node_normals_3d(self, region):
+        """Outward unit normals for the boundary-face nodes of ``region`` on a **tetrahedral** mesh.
+
+        The region's boundary triangles — the mesh boundary faces (a face shared by exactly one tet)
+        whose three vertices are all tagged ``region`` — are extracted from the tet connectivity
+        (:meth:`MeshUtils._boundary_faces_with_apex`). Each face normal is oriented outward **exactly**
+        via its owning tet's apex, then area-weighted and averaged per node
+        (:meth:`MeshUtils._compute_normals_from_boundary_faces`), so a flat face gives an exact axis
+        normal and a curved region an accurate one. Restricting to the region's **own** faces keeps a
+        region-edge node's normal consistent (all contributing faces are coplanar for a flat face), so —
+        unlike the 2-D path — no corner-dropping is needed. Returns ``(node_indices, unit_n)``."""
+        from .domain.mesh_utils import MeshUtils
+
+        pts = np.asarray(self._pts)
+        tets = np.asarray(self.domain.mesh_connectivity["tetrahedra"], dtype=int)
+        bfaces, bapex = MeshUtils._boundary_faces_with_apex(tets)
+        region_nodes = np.asarray(self._region_nodes(region), dtype=int)
+        on_region = np.isin(bfaces, region_nodes).all(axis=1)  # a face lies on the region ⟺ all 3 verts tagged
+        rfaces, rapex = bfaces[on_region], bapex[on_region]
+        n, idx = MeshUtils._compute_normals_from_boundary_faces(pts, rfaces, apex_points=pts[rapex])
+        return np.asarray(idx, dtype=int), jnp.asarray(n)
 
     def _flux_value_fn(self, constraint, val, extra_params=None):
         """Evaluate the flux constraint over ALL nodes with the normal derivative ``∂u/∂n`` pinned to the
@@ -660,8 +690,8 @@ class _TraceFDM:
         def residual_with_bc(u):
             r = residual_fn(u)
             # Flux rows first (`a·(∇u·n) + b`, with a = F(1)-F(0), b = F(0) — Neumann/Robin/etc.), then
-            # Dirichlet: a node shared by both (a corner touching a Dirichlet edge) resolves to the
-            # essential Dirichlet value.
+            # Dirichlet: a node carrying both (a 2-D corner, or a 3-D edge where a flux face meets a
+            # Dirichlet face) resolves to the essential Dirichlet value — the Dirichlet row is set last.
             for idx, nrm, method, v0, v1 in flux_rows:
                 grad = gradient(u, self.domain, method=method)  # (N, 2), differentiable
                 flux = jnp.sum(grad[idx] * nrm, axis=1)  # ∇u·n at the edge nodes

@@ -67,7 +67,9 @@ The built-in stencils (parsed from the scheme string) are:
 
 The `cotangent` Laplacian is the most accurate and is symmetric; the gradient methods trade accuracy
 for locality. The scheme stays on the operator it describes — `ui.d2(x, scheme=…)` — so different
-terms in the same residual can use different stencils.
+terms in the same residual can use different stencils. (`cotangent` is a **2-D** stencil; a
+tetrahedral mesh has no cotangent Laplace–Beltrami, so in 3-D the Laplacian is `gradient_of_gradient`
+— see [3-D tetrahedral meshes](#3-d-tetrahedral-meshes).)
 
 ---
 
@@ -116,10 +118,14 @@ jno.fdm([
 !!! note "How flux BCs differ from `jno.fem`"
     In `jno.fem` a Neumann condition is a *natural* weak term `h·v` carrying the test function. The
     strong form has no test function, so the flux is imposed **directly** on the boundary node's
-    equation. The normal is computed from the mesh boundary segments (exact on axis-aligned edges).
-    A **corner** node shared by two flux edges has no single outward normal, so it falls back to the
-    interior PDE residual — give such a corner an explicit Dirichlet value if it needs anchoring. A
-    condition that is *not* affine in `∂u/∂n` raises rather than returning a wrong answer.
+    equation. In **2-D** the normal is computed from the mesh boundary segments (exact on axis-aligned
+    edges), and a **corner** node shared by two flux edges has no single outward normal, so it falls
+    back to the interior PDE residual — give such a corner an explicit Dirichlet value if it needs
+    anchoring. In **3-D** the normal comes from the region's boundary **faces**, each oriented outward
+    exactly via its owning tetrahedron's apex (a flat face gives an exact axis normal), so face-edge
+    nodes keep their flux row; where a flux face meets a Dirichlet face, the Dirichlet value wins (its
+    row is applied last). A condition that is *not* affine in `∂u/∂n` raises rather than returning a
+    wrong answer.
 
 ---
 
@@ -174,14 +180,52 @@ array eagerly, as in every section above.
 
 ---
 
+## 3-D tetrahedral meshes
+
+Everything above dispatches on `domain.dimension`: give `jno.fdm` a **3-D tetrahedral** domain and the
+same constraint list solves in 3-D. Build the mesh with [`jno.Shape`](shape.md) — a box, sphere,
+cylinder, or any boolean combination — and add the third coordinate:
+
+```python
+d = jno.Shape.box(0, 0, 0, 1, 1, 1, size=0.1).domain()
+x, y, z, _   = d.variable("interior", split=True)          # note the z coordinate
+xb, yb, zb, _ = d.variable("boundary", split=True)
+u  = d.unknown()
+ui = u.bind(x=x, y=y, z=z)
+
+f = 3.0 * np.pi**2 * jnn.sin(np.pi*x) * jnn.sin(np.pi*y) * jnn.sin(np.pi*z)
+sol = jno.fdm([
+    -ui.d2(x) - ui.d2(y) - ui.d2(z) - f,                   # -Delta u = f on the cube
+    u(xb, yb, zb) - 0.0,                                   # Dirichlet u = 0
+]).solve()
+```
+
+A cube from `jno.Shape.box` auto-names its six faces `left/right/front/back/bottom/top`, so **flux**
+conditions work per face exactly as in 2-D — bind to the face and take the normal derivative
+(`nr = d.variable("right", normals=True)`, then `ui.d(nr) - h` or `ur.d(nr) + alpha*(ur - u_inf)`).
+
+!!! note "3-D accuracy"
+    A tetrahedral mesh has no cotangent Laplace–Beltrami stencil, so the 3-D Laplacian is the
+    first-order `gradient_of_gradient` double-difference (`lsq_of_gradient` is unstable for a *second*
+    derivative on tets — the nested least-squares amplifies — and is not recommended in 3-D). It
+    converges under refinement but is coarser than the 2-D cotangent stencil, so 3-D accuracy leans on
+    mesh refinement.
+
+---
+
 ## Scope and limitations
 
-**Supported (v1):** scalar fields on a 2-D triangular mesh; any mix of steady Dirichlet and
-flux (Neumann / Robin / coordinate-coefficient, affine in `∂u/∂n`) boundary conditions; transient
-problems by the method of lines (`M = I`, unit-coefficient `u.t`); linear and nonlinear residuals;
-differentiable inverse problems.
+**Supported:** scalar fields on a **2-D triangular or 3-D tetrahedral** mesh; any mix of steady
+Dirichlet and flux (Neumann / Robin / coordinate-coefficient, affine in `∂u/∂n`) boundary conditions,
+in 2-D and 3-D; transient problems by the method of lines (`M = I`, unit-coefficient `u.t`); linear
+and nonlinear residuals; differentiable inverse problems. A geometric sub-region for a subdomain /
+domain-decomposition solve (`jno.dd.couple([(problem, region)])`) resolves to a mesh-node subset via
+the analytic, shapely-free [`Shape.contains`](shape.md) — in 2-D **and** 3-D.
 
 **Planned:** transient flux boundary conditions (a flux node keeps `M = 1`, unlike a pinned Dirichlet
 node); periodic boundaries; a general `u.t` mass coefficient; a structured-grid stencil backend; 1-D
-and 3-D meshes. A pure-Neumann problem (no Dirichlet node anywhere) is singular — the solution is
-defined only up to an additive constant — and is solved as-is.
+meshes; a higher-order (cotangent-equivalent) 3-D Laplacian. Authoring a `jno.Shape` sub-region
+through `domain.region(name, shape)` + `d.variable`, and 3-D coupled solves, additionally need
+region-tag support on the base 3-D domain (a separate 3-D domain-decomposition feature). A pure-Neumann
+problem (no Dirichlet node anywhere) is singular — the solution is defined only up to an additive
+constant — and is solved as-is.

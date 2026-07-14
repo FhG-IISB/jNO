@@ -499,3 +499,94 @@ def test_mesh_nodes_in_3d_shape_box():
     hand = np.nonzero(np.all((p >= 0.3 - 1e-9) & (p <= 0.7 + 1e-9), axis=1))[0]
     assert np.array_equal(np.sort(idx), np.sort(hand))
     assert len(idx) > 0, "the central box must capture interior tet nodes"
+
+
+# ---- 3-D flux BCs (Neumann / Robin on a face — Tier 2) ----
+
+
+def test_node_normals_3d_face_is_axis():
+    """The 3-D flux normals of a cube face are the exact outward axis normal — apex orientation +
+    coplanar averaging give (+1,0,0) on the right face and (0,0,1) on the top, for every face node."""
+    from jno.fdm import _TraceFDM
+
+    d = _cube(0.2)
+    x, y, z, _ = d.variable("interior", split=True)
+    xb, yb, zb, _ = d.variable("boundary", split=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, z=z)
+    sysm = _TraceFDM([-ui.d2(x) - ui.d2(y) - ui.d2(z), u(xb, yb, zb) - 0.0])  # a valid system to reach the method
+    for face, axis in (("right", [1.0, 0.0, 0.0]), ("top", [0.0, 0.0, 1.0]), ("front", [0.0, -1.0, 0.0])):
+        idx, n = sysm._node_normals(face)
+        assert len(idx) > 0
+        assert np.allclose(np.asarray(n), np.array(axis), atol=1e-9), f"{face} normal off: {np.asarray(n)[0]}"
+
+
+def _cube_mixed_flux_3d(mesh_size, exact_fn, du_dn_right):
+    """-Δu = 0 on the cube, Dirichlet u = exact on five faces, Neumann ∂u/∂n = h on the right face
+    (x=1). Returns rel-L2 vs the exact solution."""
+    d = _cube(mesh_size)
+    p = _nodes3(d)
+    exact = exact_fn(p[:, 0], p[:, 1], p[:, 2])
+    x, y, z, _ = d.variable("interior", split=True)
+    nr = d.variable("right", normals=True)  # outward normal on the right face (x=1)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, z=z)
+    cons = [-ui.d2(x) - ui.d2(y) - ui.d2(z), ui.d(nr) - du_dn_right]
+    for face in ("left", "front", "back", "bottom", "top"):
+        xf, yf, zf, _ = d.variable(face, split=True)
+        cons.append(u(xf, yf, zf) - exact_fn(xf, yf, zf))  # Dirichlet on the other five faces
+    sol = jno.fdm(cons).solve()
+    return float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact))
+
+
+def test_neumann_3d_linear_exact():
+    """u = x + 2y − z is linear ⇒ the tet FD gradient/Laplacian are exact ⇒ mixed Dirichlet+Neumann on
+    the cube recovers it. Right face (x=1) carries ∂u/∂n = ∂u/∂x = 1. Pins the 3-D flux row: apex-
+    oriented face normals, unit-normalization, ∇u·n = h."""
+    err = _cube_mixed_flux_3d(0.2, lambda x, y, z: x + 2 * y - z, du_dn_right=1.0)
+    assert err < 1e-3, f"linear 3-D mixed D+N should be near-exact, got {err}"
+
+
+def test_robin_3d_linear_exact():
+    """Robin ∂u/∂n + α(u − u∞) = 0 on the right face, α=1, u∞=2: for u = x this reads 1 + (1 − 2) = 0.
+    The whole face equation is written with that face's tags (ur = u.bind(x=xr,y=yr,z=zr)) — pins the
+    two-probe (a·∇u·n + b) extraction and the boundary value evaluation in 3-D."""
+    d = _cube(0.2)
+    p = _nodes3(d)
+    exact = p[:, 0]  # u = x
+    x, y, z, _ = d.variable("interior", split=True)
+    xr, yr, zr, _ = d.variable("right", split=True)
+    nr = d.variable("right", normals=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, z=z)
+    ur = u.bind(x=xr, y=yr, z=zr)  # face-bound field for the flux + value terms of the Robin condition
+    cons = [-ui.d2(x) - ui.d2(y) - ui.d2(z), ur.d(nr) + 1.0 * (ur - 2.0)]
+    for face in ("left", "front", "back", "bottom", "top"):
+        xf, yf, zf, _ = d.variable(face, split=True)
+        cons.append(u(xf, yf, zf) - xf)  # Dirichlet u = x
+    sol = jno.fdm(cons).solve()
+    assert float(np.linalg.norm(np.asarray(sol).reshape(-1) - exact) / np.linalg.norm(exact)) < 1e-3
+
+
+def test_flux_dirichlet_shared_edge_precedence_3d():
+    """A right-face (Neumann) node that also lies on an adjacent Dirichlet face gets BOTH a flux row and
+    a Dirichlet row. The assembly applies Dirichlet last, so Dirichlet wins (the well-posed choice — the
+    3-D flux path keeps region-edge nodes rather than dropping them, unlike a 2-D corner). Use an
+    inconsistent flux (∂u/∂n = 3 while Dirichlet pins u = x) and confirm the shared right-face edge nodes
+    take the Dirichlet value x = 1, not the flux-driven value."""
+    d = _cube(0.25)
+    p = _nodes3(d)
+    x, y, z, _ = d.variable("interior", split=True)
+    nr = d.variable("right", normals=True)
+    u = d.unknown()
+    ui = u.bind(x=x, y=y, z=z)
+    cons = [-ui.d2(x) - ui.d2(y) - ui.d2(z), ui.d(nr) - 3.0]  # deliberately inconsistent flux on the right
+    for face in ("left", "front", "back", "bottom", "top"):
+        xf, yf, zf, _ = d.variable(face, split=True)
+        cons.append(u(xf, yf, zf) - xf)  # Dirichlet u = x
+    sol = np.asarray(jno.fdm(cons).solve()).reshape(-1)
+    on_right = np.isclose(p[:, 0], 1.0)
+    on_adj = np.isclose(p[:, 1], 0) | np.isclose(p[:, 1], 1) | np.isclose(p[:, 2], 0) | np.isclose(p[:, 2], 1)
+    shared = on_right & on_adj  # right-face nodes shared with an adjacent Dirichlet face
+    assert shared.sum() > 0, "expected right-face edge nodes shared with adjacent faces"
+    assert np.max(np.abs(sol[shared] - 1.0)) < 1e-9, "Dirichlet must win at a shared flux/Dirichlet edge node"
